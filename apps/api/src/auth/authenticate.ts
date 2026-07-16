@@ -54,7 +54,8 @@ export async function authenticate(req: Request, env: Env): Promise<Principal | 
   }
   const now = Date.now();
   const versionHeader = req.headers.get("x-rbox-version");
-  const lastSeenVersion = versionHeader !== null && versionHeader.length <= RBOX_VERSION_MAX_LENGTH && RBOX_VERSION_RE.test(versionHeader)
+  const versionValid = versionHeader !== null && versionHeader.length <= RBOX_VERSION_MAX_LENGTH && RBOX_VERSION_RE.test(versionHeader);
+  const lastSeenVersion = versionValid
     ? versionHeader
     : null;
   const lastSeenStale = !row.last_seen_at || now - row.last_seen_at > LAST_SEEN_THROTTLE_MS;
@@ -62,11 +63,11 @@ export async function authenticate(req: Request, env: Env): Promise<Principal | 
   // but keep a 60s floor: during an upgrade window a mixed-version daemon+CLI pair
   // on one device would otherwise ping-pong the version on EVERY request.
   const versionChanged =
-    versionHeader !== null &&
+    versionValid &&
     lastSeenVersion !== row.last_seen_version &&
     (!row.last_seen_at || now - row.last_seen_at > VERSION_CHANGE_MIN_MS);
   if (lastSeenStale || versionChanged) {
-    const nextVersion = versionHeader === null ? row.last_seen_version : lastSeenVersion;
+    const nextVersion = versionValid ? lastSeenVersion : row.last_seen_version;
     await dirDb(env)
       .prepare("UPDATE devices SET last_seen_at = ?, last_seen_version = ? WHERE token_hash = ?")
       .bind(now, nextVersion, hash)

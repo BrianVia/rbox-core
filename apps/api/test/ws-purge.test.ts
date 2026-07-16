@@ -45,7 +45,7 @@ async function seed(accountId: string, workspaceId: string, projectId: string, s
 
 async function counts(workspaceId: string): Promise<WsPurgeCounts> {
   const n = async (table: string) => Number((await db().prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE workspace_id = ?`).bind(workspaceId).first<{ n: number }>())!.n);
-  return { commits: await n("commits"), manifests: await n("manifests"), workspace_keys: await n("workspace_keys"), workspaces: await n("workspaces") };
+  return { commits: await n("commits"), manifests: await n("manifests"), device_sync_state: await n("device_sync_state"), workspace_keys: await n("workspace_keys"), workspaces: await n("workspaces") };
 }
 
 async function body<T>(response: Response): Promise<T> {
@@ -91,6 +91,10 @@ describe("adminPurgeWorkspace", () => {
     const ws = "ws_purge_full";
     await seed(account.accountId, ws, "alpha", [sha("full-a")]);
     await seed(account.accountId, ws, "beta", [sha("full-b")]);
+    await db().batch([
+      db().prepare("INSERT INTO device_sync_state(device_id,workspace_id,project_id,binding_id,file_seq,repos_total,repos_deferred,oldest_deferral_age_ms,deferral_reasons,reported_at) VALUES ('dev_a',?,'alpha','0000000000000001',1,0,0,NULL,'',1)").bind(ws),
+      db().prepare("INSERT INTO device_sync_state(device_id,workspace_id,project_id,binding_id,file_seq,repos_total,repos_deferred,oldest_deferral_age_ms,deferral_reasons,reported_at) VALUES ('dev_a',?,'beta','0000000000000002',1,0,0,NULL,'',1)").bind(ws),
+    ]);
     const purged: string[] = [];
     let result: { done: boolean };
     do {
@@ -98,7 +102,7 @@ describe("adminPurgeWorkspace", () => {
       expect(res.status).toBe(200);
       result = await body(res);
     } while (!result.done);
-    expect(await counts(ws)).toEqual({ commits: 0, manifests: 0, workspace_keys: 0, workspaces: 0 });
+    expect(await counts(ws)).toEqual({ commits: 0, manifests: 0, device_sync_state: 0, workspace_keys: 0, workspaces: 0 });
     expect(new Set(purged)).toEqual(new Set([`${ws}/alpha`, `${ws}/beta`]));
     expect((await adminPurgeWorkspace(env as Env, ws, { purgeWorkspace: async () => true })).status).toBe(404);
   });
@@ -125,7 +129,7 @@ describe("adminPurgeWorkspace", () => {
 
     let result = first;
     while (!result.done) result = await body(await adminPurgeWorkspace(env as Env, ws, { purgeWorkspace: dep }));
-    expect(await counts(ws)).toEqual({ commits: 0, manifests: 0, workspace_keys: 0, workspaces: 0 });
+    expect(await counts(ws)).toEqual({ commits: 0, manifests: 0, device_sync_state: 0, workspace_keys: 0, workspaces: 0 });
     expect(new Set(purged)).toEqual(new Set(projects.map((project) => `${ws}/${project}`)));
   });
 
@@ -138,7 +142,7 @@ describe("adminPurgeWorkspace", () => {
     expect(res.status).toBe(200);
     const result = await body<{ deleted: WsPurgeCounts; done: boolean }>(res);
     expect(result.done).toBe(false);
-    expect(result.deleted).toEqual({ commits: 0, manifests: 0, workspace_keys: 0, workspaces: 0 });
+    expect(result.deleted).toEqual({ commits: 0, manifests: 0, device_sync_state: 0, workspace_keys: 0, workspaces: 0 });
     expect(await counts(ws)).toEqual(before);
   });
 
@@ -150,8 +154,8 @@ describe("adminPurgeWorkspace", () => {
 
     const failed = await body<{ deleted: WsPurgeCounts; done: boolean }>(await adminPurgeWorkspace(env as Env, ws, { rowCap: 4, purgeWorkspace: async () => false }));
     expect(failed.done).toBe(false);
-    expect(failed.deleted).toEqual({ commits: 0, manifests: 0, workspace_keys: 0, workspaces: 0 });
-    expect(await counts(ws)).toEqual({ commits: 10, manifests: 10, workspace_keys: 2, workspaces: 1 });
+    expect(failed.deleted).toEqual({ commits: 0, manifests: 0, device_sync_state: 0, workspace_keys: 0, workspaces: 0 });
+    expect(await counts(ws)).toEqual({ commits: 10, manifests: 10, device_sync_state: 0, workspace_keys: 2, workspaces: 1 });
 
     const p1 = await body<{ deleted: WsPurgeCounts; done: boolean }>(await adminPurgeWorkspace(env as Env, ws, { rowCap: 4, purgeWorkspace: ok }));
     expect(p1.deleted.commits).toBe(4);
@@ -178,8 +182,8 @@ describe("adminPurgeWorkspace", () => {
 
     const res = await adminPurgeWorkspace(env as Env, wsA, { purgeWorkspace: async () => true });
     expect((await body<{ done: boolean }>(res)).done).toBe(true);
-    expect(await counts(wsA)).toEqual({ commits: 0, manifests: 0, workspace_keys: 0, workspaces: 0 });
-    expect(await counts(wsB)).toEqual({ commits: 1, manifests: 1, workspace_keys: 2, workspaces: 1 });
+    expect(await counts(wsA)).toEqual({ commits: 0, manifests: 0, device_sync_state: 0, workspace_keys: 0, workspaces: 0 });
+    expect(await counts(wsB)).toEqual({ commits: 1, manifests: 1, device_sync_state: 0, workspace_keys: 2, workspaces: 1 });
     expect(Number((await db().prepare("SELECT COUNT(*) AS n FROM blobs WHERE sha256 = ?").bind(shared).first<{ n: number }>())!.n)).toBe(1);
     expect(Number((await db().prepare("SELECT COUNT(*) AS n FROM blob_refs WHERE sha256 = ?").bind(shared).first<{ n: number }>())!.n)).toBe(2);
     expect(Number((await db().prepare("SELECT COUNT(*) AS n FROM accounts WHERE id IN (?, ?)").bind(a.accountId, b.accountId).first<{ n: number }>())!.n)).toBe(2);

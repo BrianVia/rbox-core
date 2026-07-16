@@ -216,6 +216,8 @@ export async function driveAccountDeletion(env: Env, accountId: string, nowMs: n
   const acct = await data.prepare("SELECT stripe_customer_id, stripe_subscription_id FROM accounts WHERE id = ?").bind(accountId).first<{ stripe_customer_id: string | null; stripe_subscription_id: string | null }>();
   const clerkRows = await dirDb(env).prepare("SELECT clerk_user_id FROM clerk_users WHERE account_id = ?").bind(accountId).all<{ clerk_user_id: string }>();
   const clerkIds = (clerkRows.results ?? []).map((r) => r.clerk_user_id);
+  const deviceRows = await dirDb(env).prepare("SELECT device_id FROM devices WHERE account_id = ?").bind(accountId).all<{ device_id: string }>();
+  const deviceIds = (deviceRows.results ?? []).map((r) => r.device_id);
 
   const stripeOk = await deps.purgeStripe(env, acct?.stripe_subscription_id ?? null, acct?.stripe_customer_id ?? null);
   let clerkOk = true;
@@ -317,7 +319,7 @@ export async function driveAccountDeletion(env: Env, accountId: string, nowMs: n
   if (moreWs) return releaseAndProgress(env, accountId, leaseToken);
 
   // 6. D1 finish — every remaining account-scoped table in one atomic batch (accounts last).
-  await finishD1(env, accountId, clerkIds, nowMs);
+  await finishD1(env, accountId, clerkIds, deviceIds, nowMs);
   return "done";
 }
 
@@ -343,7 +345,7 @@ async function releaseAndProgress(env: Env, accountId: string, leaseToken: strin
  *  account_link_*). Each statement is built via its plane helper; the batch runs on the
  *  account-data binding (the data erasure is the headline). One atomic write at N=1; under real
  *  sharding §6a splits it into a dirDb directory-purge + a dbFor(shard) data-purge. */
-async function finishD1(env: Env, accountId: string, clerkIds: string[], nowMs: number): Promise<void> {
+async function finishD1(env: Env, accountId: string, clerkIds: string[], deviceIds: string[], nowMs: number): Promise<void> {
   const a = accountId;
   const data = dbFor(env, a); // account-data plane
   const dir = dirDb(env); // directory plane
@@ -357,6 +359,11 @@ async function finishD1(env: Env, accountId: string, clerkIds: string[], nowMs: 
     data.prepare("DELETE FROM workspace_keys WHERE account_id = ?").bind(a),
     data.prepare("DELETE FROM rosters WHERE account_id = ?").bind(a),
     data.prepare("DELETE FROM account_key_states WHERE account_id = ?").bind(a),
+    // Device ownership is directory-plane, so use the scoped prefetch and erase
+    // these data-plane rows before the directory DELETE FROM devices below.
+    ...chunked(deviceIds, IN_CHUNK).map((ids) =>
+      data.prepare(`DELETE FROM device_sync_state WHERE device_id IN (${ids.map(() => "?").join(",")})`).bind(...ids),
+    ),
     // directory plane:
     dir.prepare("DELETE FROM pairing_tokens WHERE account_id = ?").bind(a),
     dir.prepare("DELETE FROM device_auth WHERE account_id = ?").bind(a),

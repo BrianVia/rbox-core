@@ -10,6 +10,7 @@ const IN_CHUNK = 80; // SQLite bound-variable safety for `... IN (?,?,…)` (sam
 export interface WsPurgeCounts {
   commits: number;
   manifests: number;
+  device_sync_state: number;
   workspace_keys: number;
   workspaces: number;
 }
@@ -27,15 +28,16 @@ interface OwnerRow { account_id: string | null }
 interface PairRow { workspace_id: string; project_id: string }
 interface CountRow { n: number }
 
-const zeroCounts = (): WsPurgeCounts => ({ commits: 0, manifests: 0, workspace_keys: 0, workspaces: 0 });
+const zeroCounts = (): WsPurgeCounts => ({ commits: 0, manifests: 0, device_sync_state: 0, workspace_keys: 0, workspaces: 0 });
 const allZero = (counts: WsPurgeCounts): boolean => Object.values(counts).every((n) => n === 0);
 
-/** The four per-table counts, plus (optionally, in the SAME one-subrequest batch) the
+/** The five per-table counts, plus (optionally, in the SAME one-subrequest batch) the
  *  ORDER BY'd page of distinct (workspace, project) pairs the real purge processes. */
 async function readWorkspaceState(db: D1Database, workspaceId: string, withPairs: boolean): Promise<{ counts: WsPurgeCounts; pairs: PairRow[] }> {
   const statements = [
     db.prepare("SELECT COUNT(*) AS n FROM commits WHERE workspace_id = ?").bind(workspaceId),
     db.prepare("SELECT COUNT(*) AS n FROM manifests WHERE workspace_id = ?").bind(workspaceId),
+    db.prepare("SELECT COUNT(*) AS n FROM device_sync_state WHERE workspace_id = ?").bind(workspaceId),
     db.prepare("SELECT COUNT(*) AS n FROM workspace_keys WHERE workspace_id = ?").bind(workspaceId),
     db.prepare("SELECT COUNT(*) AS n FROM workspaces WHERE workspace_id = ?").bind(workspaceId),
   ];
@@ -45,16 +47,17 @@ async function readWorkspaceState(db: D1Database, workspaceId: string, withPairs
         .prepare(`SELECT workspace_id, project_id FROM workspaces WHERE workspace_id = ?
           UNION SELECT workspace_id, project_id FROM commits WHERE workspace_id = ?
           UNION SELECT workspace_id, project_id FROM manifests WHERE workspace_id = ?
+          UNION SELECT workspace_id, project_id FROM device_sync_state WHERE workspace_id = ?
           ORDER BY workspace_id, project_id
           LIMIT ?`)
-        .bind(workspaceId, workspaceId, workspaceId, WS_PURGE_PAIR_BATCH),
+        .bind(workspaceId, workspaceId, workspaceId, workspaceId, WS_PURGE_PAIR_BATCH),
     );
   }
   const results = await db.batch(statements);
   const count = (index: number): number => Number((results[index]?.results?.[0] as CountRow | undefined)?.n ?? 0);
   return {
-    counts: { commits: count(0), manifests: count(1), workspace_keys: count(2), workspaces: count(3) },
-    pairs: withPairs ? ((results[4]?.results ?? []) as PairRow[]) : [],
+    counts: { commits: count(0), manifests: count(1), device_sync_state: count(2), workspace_keys: count(3), workspaces: count(4) },
+    pairs: withPairs ? ((results[5]?.results ?? []) as PairRow[]) : [],
   };
 }
 
@@ -117,6 +120,10 @@ export async function adminPurgeWorkspace(env: Env, workspaceId: string, opts: W
       db.prepare(`DELETE FROM manifests WHERE rowid IN (SELECT rowid FROM manifests WHERE workspace_id = ? AND project_id IN (${ph}) LIMIT ?)`).bind(workspaceId, ...projects, rowCap),
     );
     kinds.push("commits", "manifests");
+  }
+  for (const pair of page) {
+    statements.push(db.prepare("DELETE FROM device_sync_state WHERE workspace_id = ? AND project_id = ?").bind(pair.workspace_id, pair.project_id));
+    kinds.push("device_sync_state");
   }
   statements.push(db.prepare("DELETE FROM workspace_keys WHERE rowid IN (SELECT rowid FROM workspace_keys WHERE workspace_id = ? LIMIT ?)").bind(workspaceId, rowCap));
   kinds.push("workspace_keys");

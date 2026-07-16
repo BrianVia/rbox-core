@@ -1,7 +1,7 @@
 import type { Env } from "../env.js";
 import { json } from "../util.js";
 import { audit, type Principal } from "../authz.js";
-import { dirDb } from "../db.js";
+import { dbFor, dirDb } from "../db.js";
 
 // GET /v1/auth/devices  (authed) -> device list, SCOPED to the caller's account.
 export async function listDevices(env: Env, self: Principal): Promise<Response> {
@@ -33,6 +33,13 @@ export async function revokeDevice(env: Env, self: Principal, deviceId: string):
   const res = await dirDb(env)
     .prepare("UPDATE devices SET revoked = 1 WHERE device_id = ? AND account_id = ? AND revoked = 0 AND (device_id = ? OR ? = 1)")
     .bind(deviceId, self.accountId, self.deviceId, privileged)
+    .run();
+  // The in-statement guard makes cleanup cross-account safe and retry-safe when
+  // the device was already revoked by an earlier attempt.
+  await dbFor(env, self.accountId)
+    .prepare(`DELETE FROM device_sync_state WHERE device_id = ?1
+      AND EXISTS (SELECT 1 FROM devices WHERE device_id = ?1 AND account_id = ?2 AND revoked = 1)`)
+    .bind(deviceId, self.accountId)
     .run();
   if ((res.meta.changes ?? 0) === 1) {
     await audit(env, self, deviceId === self.deviceId ? "device.revoke.self" : "device.revoke", deviceId);
