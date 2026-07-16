@@ -5,6 +5,24 @@ All notable changes to rbox are recorded here. The format follows
 `v*` git tags that trigger the CLI release build.
 
 ## [Unreleased]
+## [1.6.5] — 2026-07-16 — the fleet phones home (design 120)
+
+### Added
+- **Product telemetry** (design 120): the daemon now ships privacy-safe product-health
+  samples to your rbox server — propagation lag (delivery→apply), first-publish timings,
+  upload-lane wire vitals, crypto-pool capability, and safety events (mass-delete breaker,
+  scan faults). Counts, timings, and fixed enums only; never paths, hashes, or free-form
+  strings — enforced server-side by a hard validator.
+- **Fleet sync-state reporting**: each daemon upserts its current git-plane position
+  (repos managed/deferred, oldest deferral age, reason classes) so a dashboard can catch a
+  stranded repo without touching the machine. Uses the exact projection `rbox git deferrals`
+  uses — the dashboard and the device can never disagree.
+- `RBOX_TELEMETRY=0` disables all of it (checked at both enqueue and flush; telemetry goes
+  to the operator's own worker, never a third party).
+
+### Fixed
+- An invalid `x-rbox-version` header can no longer blank a device's recorded binary version.
+
 ## [1.6.4] — 2026-07-15 — logs that rotate, deferrals you can see and fix
 
 ### Added
