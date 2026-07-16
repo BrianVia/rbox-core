@@ -5,6 +5,27 @@ All notable changes to rbox are recorded here. The format follows
 `v*` git tags that trigger the CLI release build.
 
 ## [Unreleased]
+## [1.6.8] — 2026-07-16 — zombie branches rest in peace
+
+### Fixed
+- **Followers now prune stale side branches** (design 130). When you squash-merge a PR
+  and delete the branch, every follower deletes its copy too — safely. Deletion is
+  gated by a publisher-authored tombstone chain plus a compare-and-swap provenance
+  check, so a branch with unpushed local commits, an active checkout, or any doubt at
+  all is left alone (with the reason logged). A deleted branch's proven tip stays
+  recoverable for 90 days under `refs/rbox-recovery/`. This retires the "83 zombie
+  branches" class of clutter without ever risking real work.
+
+### Changed
+- **Second-device setup answers its own questions** (design 134, from real user
+  feedback). The setup wizard now says exactly where a pairing token comes from
+  (`rbox pair` on an already-set-up machine — never the dashboard, because it carries
+  your encryption key) and distinguishes it from the browser confirmation code (which
+  authorizes but carries no encryption). Every successful login/pairing now points to
+  the next step: `rbox setup` → "Sync an existing workspace". The dashboard's link and
+  CLI-login pages explain code-vs-token, `/devices` gained an "Add another machine"
+  card, and the dashboard links to the docs throughout.
+
 ## [1.6.7] — 2026-07-16 — a first sync you can predict
 
 ### Changed
