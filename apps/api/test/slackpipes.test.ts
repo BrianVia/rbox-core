@@ -78,6 +78,18 @@ describe("pingSlackpipes — never throws, self-gates on config", () => {
     expect(signalTimeouts).toEqual([PING_TIMEOUT_MS]);
   });
 
+  test("fleet alerts route to the alerts channel", async () => {
+    const calls: Call[] = [];
+    await pingSlackpipes(pingEnv(), "fleet_alert", "fleet warning", {
+      fetch: async (input, init) => {
+        calls.push({ url: String(input), body: init?.body ? JSON.parse(String(init.body)) : undefined });
+        return new Response("ok", { status: 200 });
+      },
+      timeoutSignal: () => new AbortController().signal,
+    });
+    expect(calls).toEqual([{ url: ALERTS, body: { text: "fleet warning" } }]);
+  });
+
   test("derives alerts from the business URL's final path segment when the override is unset", async () => {
     const calls: Call[] = [];
     const business = "https://hook.test/team/rbox?token=opaque#fragment";

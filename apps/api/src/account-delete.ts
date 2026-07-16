@@ -364,6 +364,9 @@ async function finishD1(env: Env, accountId: string, clerkIds: string[], deviceI
     ...chunked(deviceIds, IN_CHUNK).map((ids) =>
       data.prepare(`DELETE FROM device_sync_state WHERE device_id IN (${ids.map(() => "?").join(",")})`).bind(...ids),
     ),
+    ...chunked(deviceIds, IN_CHUNK).map((ids) =>
+      data.prepare(`DELETE FROM alert_state WHERE device_id IN (${ids.map(() => "?").join(",")})`).bind(...ids),
+    ),
     // directory plane:
     dir.prepare("DELETE FROM pairing_tokens WHERE account_id = ?").bind(a),
     dir.prepare("DELETE FROM device_auth WHERE account_id = ?").bind(a),

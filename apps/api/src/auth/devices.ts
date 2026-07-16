@@ -41,10 +41,11 @@ export async function revokeDevice(env: Env, self: Principal, deviceId: string):
     .bind(deviceId, self.accountId)
     .first<{ revoked: number }>();
   if (row?.revoked === 1) {
-    await dbFor(env, self.accountId)
-      .prepare("DELETE FROM device_sync_state WHERE device_id = ?")
-      .bind(deviceId)
-      .run();
+    const data = dbFor(env, self.accountId);
+    await data.batch([
+      data.prepare("DELETE FROM device_sync_state WHERE device_id = ?").bind(deviceId),
+      data.prepare("DELETE FROM alert_state WHERE device_id = ?").bind(deviceId),
+    ]);
   }
   if ((res.meta.changes ?? 0) === 1) {
     await audit(env, self, deviceId === self.deviceId ? "device.revoke.self" : "device.revoke", deviceId);

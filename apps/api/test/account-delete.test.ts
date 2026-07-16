@@ -199,6 +199,8 @@ describe("hard purge — enumeration + dedup safety + isolation", () => {
       db().prepare("INSERT INTO notification_deliveries (token_hash, recipient_user_id, recipient_clerk_id, idempotency_key) VALUES (?, ?, ?, 'ik')").bind(`th_${A.accountId}`, A.ownerUserId, clerkA),
       db().prepare("INSERT INTO device_sync_state(device_id,workspace_id,project_id,binding_id,file_seq,repos_total,repos_deferred,oldest_deferral_age_ms,deferral_reasons,reported_at) VALUES (?, 'ws_a', 'root', '0000000000000001', 1, 0, 0, NULL, '', ?)").bind(A.deviceId, now),
       db().prepare("INSERT INTO device_sync_state(device_id,workspace_id,project_id,binding_id,file_seq,repos_total,repos_deferred,oldest_deferral_age_ms,deferral_reasons,reported_at) VALUES (?, 'ws_b', 'root', '0000000000000002', 1, 0, 0, NULL, '', ?)").bind(B.deviceId, now),
+      db().prepare("INSERT INTO alert_state(condition,device_id,incident_started_at,last_notified_at) VALUES ('reporting_stopped',?,?,?)").bind(A.deviceId, now, now),
+      db().prepare("INSERT INTO alert_state(condition,device_id,incident_started_at,last_notified_at) VALUES ('reporting_stopped',?,?,?)").bind(B.deviceId, now, now),
     ]);
 
     // Tombstone A, then move purge_after into the past so we can drive at real `now` (keeps
@@ -230,6 +232,8 @@ describe("hard purge — enumeration + dedup safety + isolation", () => {
     expect(await count("SELECT COUNT(*) AS n FROM manifests WHERE workspace_id = 'ws_a'")).toBe(0);
     expect(await count("SELECT COUNT(*) AS n FROM device_sync_state WHERE device_id = ?", A.deviceId)).toBe(0);
     expect(await count("SELECT COUNT(*) AS n FROM device_sync_state WHERE device_id = ?", B.deviceId)).toBe(1);
+    expect(await count("SELECT COUNT(*) AS n FROM alert_state WHERE device_id = ?", A.deviceId)).toBe(0);
+    expect(await count("SELECT COUNT(*) AS n FROM alert_state WHERE device_id = ?", B.deviceId)).toBe(1);
     expect(await count("SELECT COUNT(*) AS n FROM upload_parts WHERE upload_id = ?", upId)).toBe(0);
     expect(await count("SELECT COUNT(*) AS n FROM notification_deliveries WHERE token_hash = ?", `th_${A.accountId}`)).toBe(0);
     expect(await count("SELECT COUNT(*) AS n FROM account_link_events WHERE clerk_user_id = ?", clerkA)).toBe(0);

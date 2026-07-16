@@ -86,6 +86,17 @@ describe("DELETE /v1/admin/workspace/:id", () => {
 });
 
 describe("adminPurgeWorkspace", () => {
+  test("purges an alert-only orphan pair", async () => {
+    const ws = "ws_purge_alert_orphan";
+    await db().prepare("INSERT INTO alert_state(condition,device_id,workspace_id,project_id,binding_id,incident_started_at,last_notified_at) VALUES ('drift','dev_orphan',?,'root','cccccccccccccccc',1,1)").bind(ws).run();
+    const purged: string[] = [];
+    const res = await adminPurgeWorkspace(env as Env, ws, { purgeWorkspace: async (_env, w, p) => (purged.push(`${w}/${p}`), true) });
+    expect(res.status).toBe(200);
+    expect(await body<{ done: boolean }>(res)).toMatchObject({ done: true });
+    expect(purged).toEqual([`${ws}/root`]);
+    expect(await db().prepare("SELECT 1 FROM alert_state WHERE workspace_id = ?").bind(ws).first()).toBeNull();
+  });
+
   test("fully purges every pair and becomes not found", async () => {
     const account = await bootstrap("ws-purge-full");
     const ws = "ws_purge_full";
@@ -94,6 +105,8 @@ describe("adminPurgeWorkspace", () => {
     await db().batch([
       db().prepare("INSERT INTO device_sync_state(device_id,workspace_id,project_id,binding_id,file_seq,repos_total,repos_deferred,oldest_deferral_age_ms,deferral_reasons,reported_at) VALUES ('dev_a',?,'alpha','0000000000000001',1,0,0,NULL,'',1)").bind(ws),
       db().prepare("INSERT INTO device_sync_state(device_id,workspace_id,project_id,binding_id,file_seq,repos_total,repos_deferred,oldest_deferral_age_ms,deferral_reasons,reported_at) VALUES ('dev_a',?,'beta','0000000000000002',1,0,0,NULL,'',1)").bind(ws),
+      db().prepare("INSERT INTO alert_state(condition,device_id,workspace_id,project_id,binding_id,incident_started_at,last_notified_at) VALUES ('drift','dev_a',?,'alpha','0000000000000001',1,1)").bind(ws),
+      db().prepare("INSERT INTO alert_state(condition,device_id,workspace_id,project_id,binding_id,incident_started_at,last_notified_at) VALUES ('drift','dev_a',?,'beta','0000000000000002',1,1)").bind(ws),
     ]);
     const purged: string[] = [];
     let result: { done: boolean };
@@ -103,6 +116,7 @@ describe("adminPurgeWorkspace", () => {
       result = await body(res);
     } while (!result.done);
     expect(await counts(ws)).toEqual({ commits: 0, manifests: 0, device_sync_state: 0, workspace_keys: 0, workspaces: 0 });
+    expect(await db().prepare("SELECT 1 FROM alert_state WHERE workspace_id = ?").bind(ws).first()).toBeNull();
     expect(new Set(purged)).toEqual(new Set([`${ws}/alpha`, `${ws}/beta`]));
     expect((await adminPurgeWorkspace(env as Env, ws, { purgeWorkspace: async () => true })).status).toBe(404);
   });
