@@ -467,14 +467,16 @@ async function buildSnapshot(args: {
   }
 }
 
+const HUMAN_LOCAL_ONLY_CAP = 50;
+
 function printShow(show: GitResolveShow, write: (line: string) => void): void {
   const checkout = show.incomingCheckout.kind === "branch" ? `branch ${show.incomingCheckout.label}` : "detached checkout";
   write(`${show.repo}: incoming ${checkout}`);
   write(`  oracle: ${show.oracle}; index: ${show.index}; operation state: ${show.operationState}; stash: ${show.stash}`);
   if (show.localOnlyCommits.length === 0) write("  local-only commits: none");
   else {
-    for (const commit of show.localOnlyCommits.slice(0, 50)) write(`  local-only ${commit.labels.join(", ")}: ${commit.subject}`);
-    if (show.localOnlyCommits.length > 50) write(`  …and ${show.localOnlyCommits.length - 50} more local-only commits`);
+    for (const commit of show.localOnlyCommits.slice(0, HUMAN_LOCAL_ONLY_CAP)) write(`  local-only ${commit.labels.join(", ")}: ${commit.subject}`);
+    if (show.localOnlyCommits.length > HUMAN_LOCAL_ONLY_CAP) write(`  …and ${show.localOnlyCommits.length - HUMAN_LOCAL_ONLY_CAP} more local-only commits`);
   }
   for (const d of show.deferrals) write(`  ${d.lane} deferred (${d.reason}) since ${d.deferredSince}${d.bytesChanged ? "; working bytes changed" : ""}`);
   write(`  snapshot: ${show.snapshot}`);

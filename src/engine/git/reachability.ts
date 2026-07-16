@@ -64,18 +64,21 @@ export function incomingOwnershipRoots(section: GitSection, imported: ImportedSc
   return [...roots].sort();
 }
 
+function hasShallowFile(commonDir: string): Promise<boolean | undefined> {
+  return fs.access(path.join(commonDir, "shallow")).then(() => true, (error: NodeJS.ErrnoException) => error.code === "ENOENT" ? false : undefined);
+}
+
 async function shallow(repoDir: string): Promise<boolean | undefined> {
   const ctx = await repoCtx(repoDir);
   if (!ctx) return undefined;
-  return fs.access(path.join(ctx.commonDir, "shallow")).then(() => true, (error: NodeJS.ErrnoException) => error.code === "ENOENT" ? false : undefined);
+  return hasShallowFile(ctx.commonDir);
 }
 
-/** One validating Git probe for the batch, preserving legacy shallow markers. */
+/** repoCtx costs two rev-parses, while the batch budget allows one validating subprocess. */
 async function batchedShallow(repoDir: string): Promise<boolean | undefined> {
   try {
     const commonDir = await git(repoDir, ["rev-parse", "--git-common-dir"], { env: graphEnv });
-    return fs.access(path.join(path.resolve(repoDir, commonDir), "shallow"))
-      .then(() => true, (error: NodeJS.ErrnoException) => error.code === "ENOENT" ? false : undefined);
+    return hasShallowFile(path.resolve(repoDir, commonDir));
   } catch {
     return undefined;
   }
@@ -128,7 +131,7 @@ async function legacyPartition(repoDir: string, tips: readonly string[], roots: 
   return result;
 }
 
-/** Batched equivalent of tipOwnedByIncoming for show-me's reflog-sized candidate set. */
+/** Every per-tip status and marker MUST equal tipOwnedByIncoming's answer: legacyPartition is the semantic oracle, and every fallback preserves it. */
 export async function partitionOwnedByIncoming(repoDir: string, tips: readonly string[], roots: readonly string[]): Promise<PartitionedOwnership[]> {
   const isShallow = await batchedShallow(repoDir);
   if (isShallow !== false) {
@@ -141,11 +144,12 @@ export async function partitionOwnedByIncoming(repoDir: string, tips: readonly s
   try {
     const raw = await gitRaw(repoDir, ["cat-file", "--batch-check=%(objectname) %(objecttype)"], {
       env: graphEnv,
-      stdin: inputs.map((oid) => `${oid}^{commit}\n`).join(""),
+      stdin: inputs.map((oid) => `${oid}^{commit}`).join("\n") + "\n",
     });
     const lines = raw.split("\n");
     if (lines.at(-1) === "") lines.pop();
     if (lines.length !== inputs.length) return legacyPartition(repoDir, tips, roots);
+    // Duplicate raw OIDs and distinct tags peeling to one commit make any OID-keyed map wrong; position is the only correct key.
     records = lines.map((line) => {
       const match = /^([0-9a-f]{40}) commit$/.exec(line);
       return match ? { commit: match[1]! } : {};
@@ -181,7 +185,7 @@ export async function partitionOwnedByIncoming(repoDir: string, tips: readonly s
   try {
     await gitRaw(repoDir, ["rev-list", "--stdin"], {
       env: graphEnv,
-      stdin: rootRecords.map((record) => record.commit!).join("\n") + (rootRecords.length ? "\n" : ""),
+      stdin: rootRecords.map((record) => record.commit!).join("\n") + "\n",
       onStdoutChunk: (chunk) => {
         pending += chunk;
         const lines = pending.split("\n");
