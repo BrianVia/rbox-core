@@ -10,6 +10,7 @@ import {
   indexIdentityV2,
   markCheckoutJournalPublished,
   noDropProof,
+  ORIG_HEAD_CHANGED_AT_CHECKOUT_BOUNDARY,
   probeReceiverEquivalence,
   receiverEquivalentCollisionNames,
   receiverEquivalentPath,
@@ -35,6 +36,7 @@ import {
 import { hashFile } from "../../engine/hash.js";
 import { pruneStaleScratchRefs } from "../../engine/git/pins.js";
 import { listRefs, readAllRefs, readOpState } from "../../engine/git/refs.js";
+import { OP_STATE_CLASSIFICATION, OP_STATE_DIRS, OP_STATE_FILES, type OpStateRoot } from "../../engine/manifest-validate.js";
 import {
   clearIndexResolveUndo,
   getGitArtifact,
@@ -54,6 +56,12 @@ import type {
   RepoRecordInput,
 } from "../config.js";
 import { intentSettled, savePublishedRepoIntent, type PublishedRepoIntentDisposition } from "../sync-state.js";
+import {
+  origHeadPreservationFailureLine,
+  preserveOrigHead,
+  pruneOrigHeadRecoveryRefs,
+  type OrigHeadPreservation,
+} from "./orig-head.js";
 import { gitIncomingKey, sectionOpState } from "./shared.js";
 
 const refEquivalenceWarnings = new Set<string>();
@@ -174,12 +182,26 @@ interface LiveMetadata {
   indexPresent: boolean;
   indexProjection?: string;
   opState: Record<string, string>;
+  opStateRootsPresent: readonly OpStateRoot[];
+}
+
+interface BreadcrumbMismatch {
+  rel: OpStateRoot;
+  live: string | null;
+  base: string | null;
+  incoming: string | null;
+}
+
+function opStateRootOf(rel: string): OpStateRoot {
+  return rel.split("/")[0] as OpStateRoot;
 }
 
 interface CheckoutClassification {
   safe: boolean;
   reason?: GitDeferralReason;
   detail?: string;
+  breadcrumbMismatches: BreadcrumbMismatch[];
+  breadcrumbWaived: boolean;
 }
 
 export async function checkoutJournalBinding(stream: string, stateNonce: string, ctx: RepoCtx): Promise<CheckoutJournalBinding> {
@@ -309,8 +331,15 @@ async function readLive(ctx: RepoCtx): Promise<LiveMetadata | undefined> {
       throw error;
     });
     const indexProjection = indexPresent ? await indexIdentityV2(ctx.repoDir, indexPath) : undefined;
-    const opState = await readOpState(ctx.gitDir, hashFile);
-    return { headContent, currentRef, currentTip, refs, indexPresent, indexProjection, opState };
+    const opStateRoots = [...OP_STATE_FILES, ...OP_STATE_DIRS] as const;
+    const [opState, opStateRootsPresent] = await Promise.all([
+      readOpState(ctx.gitDir, hashFile),
+      Promise.all(opStateRoots.map(async (rel) => fs.lstat(path.join(ctx.gitDir, rel)).then(
+        () => rel,
+        (error: NodeJS.ErrnoException) => error.code === "ENOENT" ? undefined : Promise.reject(error),
+      ))).then((entries) => entries.filter((rel): rel is OpStateRoot => rel !== undefined)),
+    ]);
+    return { headContent, currentRef, currentTip, refs, indexPresent, indexProjection, opState, opStateRootsPresent };
   } catch {
     return undefined;
   }
@@ -333,9 +362,11 @@ async function classifyCheckout(args: {
   boundary: boolean;
   checkoutRefReason?: GitDeferralReason;
   checkoutRefDetail?: string;
+  heldRefs: GitPartialApply["heldRefs"];
 }): Promise<CheckoutClassification> {
   const reasons = new Set<GitDeferralReason>();
   const details: string[] = [];
+  const breadcrumbMismatches: BreadcrumbMismatch[] = [];
   const oracle = args.boundary ? await args.opts.oracle.reproveRepo(args.opts.relPath) : await args.opts.oracle.proveRepo(args.opts.relPath);
   if (oracle.kind === "mismatch") { reasons.add("local-edits"); details.push("working tree differs from applied manifest"); }
   else if (oracle.kind === "indeterminate") { reasons.add("unreadable"); details.push(oracle.why); }
@@ -368,8 +399,13 @@ async function classifyCheckout(args: {
     for (const rel of new Set([...Object.keys(live.opState), ...Object.keys(baseOp), ...Object.keys(incomingOp)])) {
       const value = live.opState[rel] ?? null;
       if (value !== (baseOp[rel] ?? null) && value !== (incomingOp[rel] ?? null)) {
-        reasons.add("local-operation");
-        details.push(`operation state differs at ${rel}`);
+        const root = opStateRootOf(rel);
+        if (OP_STATE_CLASSIFICATION[root] === "breadcrumb") {
+          breadcrumbMismatches.push({ rel: root, live: value, base: baseOp[rel] ?? null, incoming: incomingOp[rel] ?? null });
+        } else {
+          reasons.add("local-operation");
+          details.push(`operation state differs at ${rel}`);
+        }
       }
     }
 
@@ -402,9 +438,26 @@ async function classifyCheckout(args: {
     reasons.add(args.checkoutRefReason);
     details.push(args.checkoutRefDetail ?? "incoming checkout ref could not be published safely");
   }
+  const liveInProgress = live !== undefined && (
+    Object.keys(live.opState).some((rel) => OP_STATE_CLASSIFICATION[opStateRootOf(rel)] === "in-progress")
+    || live.opStateRootsPresent.some((rel) => OP_STATE_CLASSIFICATION[rel] === "in-progress")
+  );
+  const breadcrumbWaived = !args.opts.manualResolution
+    && breadcrumbMismatches.length > 0
+    && reasons.size === 0
+    && !liveInProgress
+    && Object.keys(args.heldRefs).length === 0;
+  // Convert once before manual reason deletion so take-theirs can explicitly
+  // waive local-operation. Presence gates only the automatic waiver.
+  if (breadcrumbMismatches.length > 0 && !breadcrumbWaived) {
+    reasons.add("local-operation");
+    for (const mismatch of breadcrumbMismatches) details.push(`operation state differs at ${mismatch.rel}`);
+  }
   for (const reason of args.opts.manualResolution?.waivedReasons ?? []) reasons.delete(reason);
   const reason = firstReason(reasons);
-  return reason ? { safe: false, reason, detail: details.join("; ") } : { safe: true };
+  return reason
+    ? { safe: false, reason, detail: details.join("; "), breadcrumbMismatches, breadcrumbWaived: false }
+    : { safe: true, breadcrumbMismatches, breadcrumbWaived };
 }
 
 async function ensureStashReflog(repoDir: string, oid: string): Promise<void> {
@@ -737,8 +790,22 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
       boundary: false,
       checkoutRefReason: refProgress.checkoutRefReason,
       checkoutRefDetail: refProgress.checkoutRefDetail,
+      heldRefs: progress.heldRefs,
     });
     if (!first.safe) return { status: "defer", reason: first.reason!, detail: first.detail ?? "checkout follow proof failed", ...progress };
+
+    let origHeadPreservation: OrigHeadPreservation | undefined;
+    if (first.breadcrumbWaived) {
+      try {
+        const mismatch = first.breadcrumbMismatches.length === 1 ? first.breadcrumbMismatches[0] : undefined;
+        const origHeadMismatch = mismatch?.rel === "ORIG_HEAD" ? { ...mismatch, rel: "ORIG_HEAD" as const } : undefined;
+        if (!origHeadMismatch) throw new Error("unexpected breadcrumb waiver shape");
+        origHeadPreservation = await preserveOrigHead(opts, origHeadMismatch);
+      } catch (error) {
+        opts.log?.(origHeadPreservationFailureLine(opts.relPath, error));
+        return { status: "defer", reason: "local-operation", detail: "operation state differs at ORIG_HEAD", ...progress };
+      }
+    }
 
     const refUpdates: CheckoutRefUpdate[] = [];
     const postHeadRefUpdates: CheckoutRefUpdate[] = [];
@@ -746,6 +813,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
     const refReservations: Array<{ ref: string; expectedOid: string }> = [];
     const extraTransactionLines: string[] = [];
     const expectedRefs: Record<string, string> = {};
+    if (origHeadPreservation?.transactionLine) extraTransactionLines.push(origHeadPreservation.transactionLine);
     if (liveBefore.currentRef) {
       const oldOid = liveBefore.currentTip;
       const newOid = effective.refs[liveBefore.currentRef];
@@ -808,7 +876,9 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
     const oldOp = Object.fromEntries(Object.keys(liveBefore.opState).map((rel) => [rel, true as const]));
     const newOp = sectionOpState(opts.incoming);
     const intended = await opts.makeIntended(postProgress);
+    const journalId = `${Date.now()}-${crypto.randomBytes(8).toString("hex")}`;
     const journal: CheckoutJournal<FollowIntended> = {
+      journalId,
       phase: "intent",
       incomingKey: gitIncomingKey(opts.incoming),
       incomingSection: opts.incoming,
@@ -835,7 +905,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
     });
     opts.crashAt?.("after-journal-write");
 
-    let boundaryFailure: CheckoutClassification | undefined;
+    let boundaryFailure: Pick<CheckoutClassification, "safe" | "reason" | "detail"> | undefined;
     const noteBoundaryFailure = (reason: GitDeferralReason, detail: string): void => {
       const chosen = firstReason(new Set([...(boundaryFailure?.reason ? [boundaryFailure.reason] : []), reason]));
       if (!boundaryFailure || chosen === reason) boundaryFailure = { safe: false, reason, detail };
@@ -848,8 +918,10 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
       refReservations,
       head,
       extraTransactionLines,
-      plannedGraphRoots: roots,
+      plannedGraphRoots: [...roots, ...(origHeadPreservation?.recoveryOid ? [origHeadPreservation.recoveryOid] : [])],
       opState: staged.opState,
+      ...(origHeadPreservation ? { origHeadLock: { journalId, expectedOldBytes: origHeadPreservation.expectedOldBytes } } : {}),
+      ...(origHeadPreservation?.malformedRawBytes ? { malformedOrigHeadPreserved: true as const } : {}),
     }, {
       capabilityProbe: opts.capabilityProbe,
       capabilitySupported: true,
@@ -883,8 +955,17 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
           boundary: true,
           checkoutRefReason: refProgress.checkoutRefReason,
           checkoutRefDetail: refProgress.checkoutRefDetail,
+          heldRefs: progress.heldRefs,
         });
         if (!proof.safe) boundaryFailure = proof;
+        if (!opts.manualResolution && proof.breadcrumbMismatches.length > 0 && !origHeadPreservation) {
+          noteBoundaryFailure("local-operation", "operation state differs at ORIG_HEAD");
+          return false;
+        }
+        if (origHeadPreservation && (!proof.breadcrumbWaived || proof.breadcrumbMismatches.length !== 1 || proof.breadcrumbMismatches[0]?.rel !== "ORIG_HEAD")) {
+          noteBoundaryFailure("local-operation", "operation state differs at ORIG_HEAD");
+          return false;
+        }
         if (!sameIncarnation) { noteBoundaryFailure("unreadable", "repository incarnation changed at checkout boundary"); return false; }
         if (!live) { noteBoundaryFailure("unreadable", "git metadata became unreadable"); return false; }
         const boundaryOwned = await branchesCheckedOutElsewhere(opts.ctx);
@@ -926,17 +1007,24 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
       const reason: GitDeferralReason = result.status === "unsupported" ? "unsupported"
         : /became busy/.test(result.reason) ? "git-busy"
         : /connectivity/.test(result.reason) ? "artifact"
+        : result.reason === ORIG_HEAD_CHANGED_AT_CHECKOUT_BOUNDARY ? "local-operation"
         : boundaryFailure?.reason ?? "other";
       return {
         status: "defer",
         reason,
-        detail: boundaryFailure?.detail ?? result.reason,
+        detail: result.reason === ORIG_HEAD_CHANGED_AT_CHECKOUT_BOUNDARY ? "operation state differs at ORIG_HEAD" : boundaryFailure?.detail ?? result.reason,
         ...progress,
       };
     }
     await markCheckoutJournalPublished(opts.workspaceRoot, opts.relPath);
     if (opts.manualResolution && effective.refs["refs/stash"]) await ensureStashReflog(opts.ctx.repoDir, effective.refs["refs/stash"]!);
     opts.crashAt?.("after-published-flip");
+    if (origHeadPreservation) {
+      if (origHeadPreservation.recoveryRef && origHeadPreservation.discriminator) {
+        await pruneOrigHeadRecoveryRefs(opts.ctx.repoDir, origHeadPreservation.discriminator, origHeadPreservation.recoveryRef).catch(() => {});
+      }
+      opts.log?.(`git-sync: adopted stale ORIG_HEAD breadcrumb for ${opts.relPath} (old value preserved at ${origHeadPreservation.recoveryLocation})`);
+    }
     return { status: "followed", ...postProgress };
   } finally {
     await staged.cleanup();

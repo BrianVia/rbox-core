@@ -169,6 +169,7 @@ export {
   ownershipAwareGitBusy,
   setCheckoutCapabilityProbeForTests,
   resetCheckoutCapabilityProbeCacheForTests,
+  ORIG_HEAD_CHANGED_AT_CHECKOUT_BOUNDARY,
   type CheckoutRefUpdate,
   type CheckoutHeadUpdate,
   type CheckoutPlan,

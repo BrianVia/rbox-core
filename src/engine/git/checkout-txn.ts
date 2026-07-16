@@ -1,11 +1,13 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import { promisify } from "node:util";
 import { hashBytes } from "../hash.js";
-import { cleanGitEnv, clearIndexResolveUndo, git, moveFileAtomic, walkFiles, ZERO_OID, type RepoCtx } from "./shared.js";
+import { fsyncDirectory } from "../fsutil.js";
+import { cleanGitEnv, clearIndexResolveUndo, git, moveFileAtomic, readRegularFileNoFollow, walkFiles, ZERO_OID, type RepoCtx } from "./shared.js";
 import { readOpState, pruneEmptyOpStateDirs } from "./refs.js";
 import { updateCheckoutJournal, type CheckoutJournal } from "./journal.js";
 
@@ -36,6 +38,13 @@ export interface CheckoutPlan {
   extraTransactionLines?: string[];
   plannedGraphRoots: string[];
   opState: Array<{ rel: string; tmp: string }>;
+  /** Automatic ORIG_HEAD breadcrumb adoption only. The journal sidecar already
+   * owns this id; exact old bytes (including absence) are rechecked under Git's
+   * pseudo-ref lock before the boundary proof. */
+  origHeadLock?: { journalId: string; expectedOldBytes: Uint8Array | null };
+  /** Narrow raw-forensics arm: refs/* still validates via show-ref, while fsck
+   * skips pseudo-ref parsing so malformed preserved ORIG_HEAD alone can heal. */
+  malformedOrigHeadPreserved?: true;
   /** Refs read by HEAD but not mutated in this transaction. Their ordinary
    * ref lock is held across the boundary proof and commit. */
   refReservations?: Array<{ ref: string; expectedOid: string }>;
@@ -68,6 +77,8 @@ export type CommitCheckoutResult =
   | { status: "committed" }
   | { status: "defer"; reason: string; journalIntact?: true }
   | { status: "unsupported"; reason: string };
+
+export const ORIG_HEAD_CHANGED_AT_CHECKOUT_BOUNDARY = "ORIG_HEAD changed at checkout boundary";
 
 export type CheckoutCapabilityProbe = (gitVersion: string) => Promise<boolean>;
 export type CheckoutTransactionCapabilityStatus = "supported" | "git-missing" | "version-unavailable" | "probe-failed" | "unsupported";
@@ -245,13 +256,25 @@ export async function checkoutTransactionSupported(repoDir: string, probe?: Chec
   return (await checkoutTransactionCapability(repoDir, probe)).status === "supported";
 }
 
-async function defaultConnectivityProof(repoDir: string, roots: readonly string[]): Promise<boolean> {
+async function defaultConnectivityProof(repoDir: string, roots: readonly string[], malformedOrigHeadPreserved: boolean): Promise<boolean> {
   if (roots.length === 0) return true;
   try {
     await exec("git", ["-C", repoDir, "rev-list", "--quiet", ...roots, "--"], { env: cleanGitEnv({ GIT_NO_LAZY_FETCH: "1" }), maxBuffer: 16 * 1024 * 1024 });
     // fsck is deliberately pre-commit (r2 F4); there is no post-commit broad
     // rollback that could clobber a human commit.
-    await exec("git", ["-C", repoDir, "fsck", "--connectivity-only", "--no-dangling", ...roots], { env: cleanGitEnv({ GIT_NO_LAZY_FETCH: "1" }), maxBuffer: 16 * 1024 * 1024 });
+    if (malformedOrigHeadPreserved) {
+      // Keep ordinary refs/* validation exact. Only pseudo-ref parsing is
+      // bypassed, and only after malformed ORIG_HEAD bytes were quarantined.
+      try {
+        await exec("git", ["-C", repoDir, "show-ref"], { env: cleanGitEnv({ GIT_NO_LAZY_FETCH: "1" }), maxBuffer: 16 * 1024 * 1024 });
+      } catch (error) {
+        // show-ref uses 1 for a valid empty ref database; malformed refs are 128.
+        if ((error as { code?: unknown }).code !== 1) throw error;
+      }
+      await exec("git", ["-C", repoDir, "fsck", "--connectivity-only", "--no-dangling", "--no-references", ...roots], { env: cleanGitEnv({ GIT_NO_LAZY_FETCH: "1" }), maxBuffer: 16 * 1024 * 1024 });
+    } else {
+      await exec("git", ["-C", repoDir, "fsck", "--connectivity-only", "--no-dangling", ...roots], { env: cleanGitEnv({ GIT_NO_LAZY_FETCH: "1" }), maxBuffer: 16 * 1024 * 1024 });
+    }
     return true;
   } catch {
     return false;
@@ -425,7 +448,46 @@ function activeJournalLockPaths(journal: CheckoutJournal): string[] {
 async function journalLocksRemain(journal: CheckoutJournal | undefined): Promise<boolean> {
   if (!journal) return false;
   for (const abs of activeJournalLockPaths(journal)) if (await lockToken(abs)) return true;
+  const origHeadLock = await readRegularFileNoFollow(path.join(journal.binding.gitDirReal, "ORIG_HEAD.lock"));
+  if (origHeadLock?.bytes.equals(Buffer.from(journal.journalId))) return true;
   return false;
+}
+
+async function acquireOrigHeadLock(ctx: RepoCtx, journalId: string): Promise<OwnedGitLock> {
+  const lockPath = path.join(ctx.gitDir, "ORIG_HEAD.lock");
+  const tmp = path.join(ctx.gitDir, `ORIG_HEAD.lock.tmp-${crypto.randomBytes(8).toString("hex")}`);
+  let handle: fs.FileHandle | undefined;
+  try {
+    handle = await fs.open(tmp, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+    await handle.writeFile(journalId);
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await fs.link(tmp, lockPath);
+    await fsyncDirectory(ctx.gitDir);
+    const token = await lockToken(lockPath);
+    if (!token) throw new Error("could not identify owned ORIG_HEAD.lock");
+    return token;
+  } finally {
+    await handle?.close().catch(() => {});
+    await fs.rm(tmp, { force: true }).catch(() => {});
+  }
+}
+
+async function releaseOrigHeadLock(ctx: RepoCtx, journalId: string, token: OwnedGitLock | undefined): Promise<void> {
+  if (!token) return;
+  const live = await readRegularFileNoFollow(token.path);
+  if (!live || live.token.dev !== token.dev || live.token.ino !== token.ino || !live.bytes.equals(Buffer.from(journalId))) {
+    throw new Error("ORIG_HEAD.lock ownership changed before release");
+  }
+  await fs.rm(token.path, { force: true });
+  await fsyncDirectory(ctx.gitDir);
+}
+
+async function origHeadEquals(ctx: RepoCtx, expected: Uint8Array | null): Promise<boolean> {
+  const live = await readRegularFileNoFollow(path.join(ctx.gitDir, "ORIG_HEAD"));
+  if (live === undefined || expected === null) return live === undefined && expected === null;
+  return live.bytes.equals(Buffer.from(expected));
 }
 
 async function restoreOpStateWithCrash(ctx: RepoCtx, desired: Array<{ rel: string; tmp: string }>, crashAt?: CommitCheckoutOptions["crashAt"]): Promise<void> {
@@ -460,10 +522,22 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
   let indexToken: OwnedGitLock | undefined;
   let headHandle: fs.FileHandle | undefined;
   let headToken: OwnedGitLock | undefined;
+  let origHeadToken: OwnedGitLock | undefined;
+  let origHeadCleanupDurabilityPending = false;
   const reservationHandles: fs.FileHandle[] = [];
   const reservationTokens: OwnedGitLock[] = [];
   let refsCommitted = false;
   const indexLock = path.join(ctx.gitDir, "index.lock");
+  const releasePlannedOrigHeadLock = async (): Promise<void> => {
+    if (!origHeadToken) return;
+    // Stays true if unlink or its directory fsync fails. The caller must retain
+    // journal.id even when the path currently appears absent: power loss could
+    // resurrect an unlink whose directory update was not durable.
+    origHeadCleanupDurabilityPending = true;
+    await releaseOrigHeadLock(ctx, plan.origHeadLock?.journalId ?? "", origHeadToken);
+    origHeadToken = undefined;
+    origHeadCleanupDurabilityPending = false;
+  };
   try {
     let candidate: Buffer | undefined;
     let indexHash: string | undefined;
@@ -478,7 +552,10 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
       await updateCheckoutJournal(opts.journal.workspaceRoot, opts.journal.relPath, opts.journal.value);
     }
 
-    if (!(await (opts.connectivityProof ?? defaultConnectivityProof)(ctx.repoDir, plan.plannedGraphRoots))) return { status: "defer", reason: "planned graph connectivity proof failed" };
+    const connected = opts.connectivityProof
+      ? await opts.connectivityProof(ctx.repoDir, plan.plannedGraphRoots)
+      : await defaultConnectivityProof(ctx.repoDir, plan.plannedGraphRoots, plan.malformedOrigHeadPreserved === true);
+    if (!connected) return { status: "defer", reason: "planned graph connectivity proof failed" };
     try { opts.crashAt?.("after-connectivity-proof"); } catch (error) { throw new InjectedCheckoutCrash(error); }
 
     const locksBeforePrepare = new Map<string, string>();
@@ -528,6 +605,11 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
       await updateCheckoutJournal(opts.journal.workspaceRoot, opts.journal.relPath, opts.journal.value);
     }
 
+    if (plan.origHeadLock) {
+      if (!opts.journal || opts.journal.value.journalId !== plan.origHeadLock.journalId) throw new Error("ORIG_HEAD lock plan lacks matching journal ownership");
+      origHeadToken = await acquireOrigHeadLock(ctx, plan.origHeadLock.journalId);
+    }
+
     if (plan.head.kind === "symbolic" && plan.head.newTarget === plan.head.oldTarget) {
       // Git forbids putting HEAD and its unchanged referent in one transaction.
       // Updating the checked-out referent nevertheless makes update-ref prepare
@@ -549,6 +631,7 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
 
     const owned: OwnedGitLock[] = [
       indexToken,
+      ...(origHeadToken ? [origHeadToken] : []),
       ...reservationTokens,
       ...primaryIntent.locks.flatMap((lock) => lock.token ? [{ path: lock.path, ...lock.token }] : []),
     ];
@@ -560,8 +643,9 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
     }
     const proofContext: SecondProofContext = { ownedLocks: owned, busy: () => ownershipAwareGitBusy(ctx, owned) };
     const becameBusy = await proofContext.busy();
-    const secondProofPassed = !becameBusy && await opts.secondProof(proofContext);
-    if (becameBusy || !secondProofPassed) {
+    const breadcrumbChanged = plan.origHeadLock ? !(await origHeadEquals(ctx, plan.origHeadLock.expectedOldBytes)) : false;
+    const secondProofPassed = !becameBusy && !breadcrumbChanged && await opts.secondProof(proofContext);
+    if (becameBusy || breadcrumbChanged || !secondProofPassed) {
       await tx.abort();
       tx = undefined;
       await postHeadTx?.abort();
@@ -573,8 +657,11 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
       reservationHandles.length = 0;
       for (const token of reservationTokens) await fs.rm(token.path, { force: true }).catch(() => {});
       reservationTokens.length = 0;
-      const reason = becameBusy ? "git became busy at checkout boundary" : "checkout boundary proof changed";
-      return await journalLocksRemain(opts.journal?.value) ? { status: "defer", reason, journalIntact: true } : { status: "defer", reason };
+      await releasePlannedOrigHeadLock();
+      const reason = becameBusy ? "git became busy at checkout boundary"
+        : breadcrumbChanged ? ORIG_HEAD_CHANGED_AT_CHECKOUT_BOUNDARY
+        : "checkout boundary proof changed";
+      return origHeadCleanupDurabilityPending || await journalLocksRemain(opts.journal?.value) ? { status: "defer", reason, journalIntact: true } : { status: "defer", reason };
     }
 
     const branchSwitchTarget = plan.head.kind === "symbolic" && plan.head.newTarget !== plan.head.oldTarget ? plan.head.newTarget : undefined;
@@ -655,6 +742,7 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
     }
     try { opts.crashAt?.("after-index-publish"); } catch (error) { throw new InjectedCheckoutCrash(error); }
     await restoreOpStateWithCrash(ctx, plan.opState, opts.crashAt);
+    await releasePlannedOrigHeadLock();
     await headHandle?.close();
     headHandle = undefined;
     if (headToken) await fs.rm(headToken.path, { force: true });
@@ -674,9 +762,10 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
       if (headToken) await fs.rm(headToken.path, { force: true }).catch(() => {});
       for (const handle of reservationHandles) await handle.close().catch(() => {});
       for (const token of reservationTokens) await fs.rm(token.path, { force: true }).catch(() => {});
+      await releasePlannedOrigHeadLock().catch(() => {});
       if (error instanceof InjectedCheckoutCrash) throw error.cause;
       const reason = error instanceof Error ? error.message : "checkout transaction failed";
-      return await journalLocksRemain(opts.journal?.value) ? { status: "defer", reason, journalIntact: true } : { status: "defer", reason };
+      return origHeadCleanupDurabilityPending || await journalLocksRemain(opts.journal?.value) ? { status: "defer", reason, journalIntact: true } : { status: "defer", reason };
     }
     // After ref commit, never call unconditional restoreLocal (r2 F4). The
     // durable journal's old/new arbitration is the only repair authority.
@@ -687,6 +776,9 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
     if (headToken) await fs.rm(headToken.path, { force: true }).catch(() => {});
     for (const handle of reservationHandles) await handle.close().catch(() => {});
     for (const token of reservationTokens) await fs.rm(token.path, { force: true }).catch(() => {});
+    // After ref commit, an incomplete staged op-state publication keeps the
+    // pseudo-ref fence for journal recovery. Successful publication already
+    // released it immediately above.
     if (error instanceof InjectedCheckoutCrash) throw error.cause;
     if (error instanceof JournalArbitrationDefer) return { status: "defer", reason: error.message, journalIntact: true };
     throw error;

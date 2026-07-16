@@ -76,8 +76,12 @@ async function capture(): Promise<GitSection> {
 
 const manifest = (section: GitSection): Manifest => ({ generatedAt: "", files: [], manifestSchema: 2, gitRepos: { repo: section } });
 
-async function fixture(opts: { branchSwitch?: boolean } = {}) {
-  await commit(sender, "base\n", "base");
+async function fixture(opts: { branchSwitch?: boolean; syncedOperationAndBreadcrumb?: boolean } = {}) {
+  const baseTip = await commit(sender, "base\n", "base");
+  if (opts.syncedOperationAndBreadcrumb) {
+    await fs.writeFile(path.join(sender, ".git", "MERGE_HEAD"), `${baseTip}\n`);
+    await fs.writeFile(path.join(sender, ".git", "ORIG_HEAD"), `${baseTip}\n`);
+  }
   if (opts.branchSwitch) await git(sender, "branch", "next");
   const base = await capture();
   const emptyState: SyncState = {
@@ -90,12 +94,22 @@ async function fixture(opts: { branchSwitch?: boolean } = {}) {
   expect(applied.gitRepos?.repo).toEqual(base);
   await fs.writeFile(path.join(receiver, "tracked.txt"), "base\n");
 
+  if (opts.syncedOperationAndBreadcrumb) await fs.rm(path.join(sender, ".git", "MERGE_HEAD"), { force: true });
   if (opts.branchSwitch) await git(sender, "checkout", "-q", "next");
-  await commit(sender, "incoming\n", "incoming");
+  const incomingTip = await commit(sender, "incoming\n", "incoming");
+  if (opts.syncedOperationAndBreadcrumb) {
+    await fs.writeFile(path.join(sender, ".git", "MERGE_HEAD"), `${baseTip}\n`);
+    await fs.writeFile(path.join(sender, ".git", "ORIG_HEAD"), `${incomingTip}\n`);
+  }
   const incoming = await capture();
 
+  if (opts.syncedOperationAndBreadcrumb) await fs.rm(path.join(receiver, ".git", "MERGE_HEAD"), { force: true });
   await commit(receiver, "local\n", "local-only");
   const localTip = await git(receiver, "rev-parse", "HEAD");
+  if (opts.syncedOperationAndBreadcrumb) {
+    await fs.writeFile(path.join(receiver, ".git", "MERGE_HEAD"), `${baseTip}\n`);
+    await fs.writeFile(path.join(receiver, ".git", "ORIG_HEAD"), `${localTip}\n`);
+  }
   await git(receiver, "branch", "local-topic");
   const state: SyncState = {
     stream: syncStreamId(cfg),
@@ -520,6 +534,20 @@ test("take-theirs quarantines, pins, follows, and clears pending resolution stat
   expect(saved.deferrals?.apply).toBeUndefined();
   const quarantineRoot = path.join(root, ".rbox", "git-quarantine");
   expect((await fs.readdir(path.join(quarantineRoot, (await fs.readdir(quarantineRoot))[0]!))).some((name) => name.endsWith(".bundle"))).toBe(true);
+});
+
+test("design 126: confirmed take-theirs remains authorized with synced operation state and a breadcrumb mismatch", async () => {
+  const { incoming } = await fixture({ syncedOperationAndBreadcrumb: true });
+  const showLines: string[] = [];
+  const current = await show(showLines);
+  const lines: string[] = [];
+
+  expect(await gitResolveCmd(root, receiver, "take-theirs", { json: true, confirm: current.snapshot }, deps(lines))).toBe(0);
+  expect(JSON.parse(lines.at(-1)!)).toMatchObject({ status: "resolved", verb: "take-theirs" });
+  expect(await fs.readFile(path.join(receiver, ".git", "MERGE_HEAD"), "utf8")).toBe(`${await git(sender, "rev-parse", "HEAD~1")}\n`);
+  const incomingOrig = await fs.readFile(path.join(sender, ".git", "ORIG_HEAD"), "utf8");
+  expect(await fs.readFile(path.join(receiver, ".git", "ORIG_HEAD"), "utf8")).toBe(incomingOrig);
+  expect(repoRecordsForState(await loadState(root, syncStreamId(cfg))).repo?.pending).toBeUndefined();
 });
 
 test("take-theirs rejects a stale confirmation before quarantine when a ref moves", async () => {

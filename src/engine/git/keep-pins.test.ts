@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { LocalBlobStore } from "../blobstore.js";
+import { decryptFileToPath } from "../crypto.js";
 import { captureGitState } from "./capture.js";
 import { gitIdentity } from "./identity.js";
 import { pinDisplaced, prepareDisplacedRefPins, prepareKeepPins, type KeepPinOrigins } from "./keep-pins.js";
@@ -142,4 +143,22 @@ test("recovery namespace is excluded from syncable refs, capture, and ordinary i
   expect(section).toBeDefined();
   expect(section?.refs["refs/heads/main"]).toBe(oid);
   expect(Object.keys(section?.refs ?? {}).some((ref) => ref.startsWith("refs/rbox-local/"))).toBe(false);
+});
+
+test("design 126 capture bundles never advertise recovery refs while syncable refs remain", async () => {
+  const oid = await commit("capture.txt", "capture\n");
+  await runGit(repo, "tag", "syncable-tag", oid);
+  await runGit(repo, "update-ref", "refs/rbox-recovery/orig-head/primary/1700000000000-deadbeef", oid);
+  const store = new LocalBlobStore(path.join(tmp, "bundle-store"));
+  const section = await captureGitState(repo, store, KEK, { workspaceRoot: tmp });
+  if (!section) throw new Error("capture returned no section");
+  const ciphertext = path.join(tmp, "captured-bundle.enc");
+  const bundle = path.join(tmp, "captured.bundle");
+  await fs.writeFile(ciphertext, await store.get(section.bundleEncSha));
+  await decryptFileToPath(ciphertext, KEK, section.bundleSha, bundle, { comp: section.bundleComp, payloadSha: section.bundlePayloadSha });
+  const advertised = await runGit(repo, "bundle", "list-heads", bundle);
+
+  expect(advertised).toContain("refs/heads/main");
+  expect(advertised).toContain("refs/tags/syncable-tag");
+  expect(advertised).not.toContain("refs/rbox-recovery/");
 });

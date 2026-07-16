@@ -1,5 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import crypto from "node:crypto";
+import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -47,6 +48,28 @@ export function setGitSpawnObserver(observer: ((root: string, args: readonly str
 
 export const HEX40 = /^[0-9a-f]{40}$/;
 export const ZERO_OID = "0".repeat(40);
+
+export interface RegularFileRead {
+  bytes: Buffer;
+  token: { path: string; dev: number; ino: number };
+}
+
+/** Read a regular file through an O_NOFOLLOW handle and return the opened inode
+ * identity alongside its exact bytes. Missing paths are the sole soft result. */
+export async function readRegularFileNoFollow(abs: string): Promise<RegularFileRead | undefined> {
+  let handle: fs.FileHandle | undefined;
+  try {
+    handle = await fs.open(abs, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const stat = await handle.stat();
+    if (!stat.isFile()) throw new Error(`non-regular Git file: ${abs}`);
+    return { bytes: await handle.readFile(), token: { path: path.resolve(abs), dev: stat.dev, ino: stat.ino } };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
 
 /** Remove repository-routing variables inherited from hooks/wrappers. */
 export function cleanGitEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
