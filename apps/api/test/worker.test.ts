@@ -1902,6 +1902,7 @@ describe("release distribution (design 14)", () => {
     await env.rbox_releases.put("releases/version.json", '{"version":"0.0.2"}');
     await env.rbox_releases.put("releases/version.json.sig", "sig-bytes");
     await env.rbox_releases.put("releases/install.sh", "#!/bin/sh\n");
+    await env.rbox_releases.put("releases/changelog.md", "# Changelog\n\n## [0.0.2]\n");
     await env.rbox_releases.put("releases/rbox-linux-x64", "LATEST-BIN");
     await env.rbox_releases.put("releases/rbox-darwin-arm64", "LATEST-DARWIN");
     await env.rbox_releases.put("releases/v0.0.2/rbox-linux-x64", "VERSIONED-BIN");
@@ -1965,6 +1966,14 @@ describe("release distribution (design 14)", () => {
     expect(await res.text()).toBe("#!/bin/sh\n");
   });
 
+  test("/changelog.md streams the published Markdown with a short cache", async () => {
+    const res = await SELF.fetch(`${BASE}/changelog.md`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("text/markdown; charset=utf-8");
+    expect(res.headers.get("cache-control")).toBe("public, max-age=300, stale-while-revalidate=60");
+    expect(await res.text()).toBe("# Changelog\n\n## [0.0.2]\n");
+  });
+
   test("versioned binary is immutable-cached; latest alias is short-cached without SWR", async () => {
     const versioned = await releaseGateway("/bin/v1.2.3/rbox-darwin-arm64");
     expect(versioned.status).toBe(200);
@@ -2026,6 +2035,7 @@ describe("routeTemplate privacy masking", () => {
     [`/v1/admin/account/acct_11223344/plan`, "/v1/admin/account/:id/plan"],
     [`/v1/keys/workspace/ws_zzz999`, "/v1/keys/workspace/:ws"],
     [`/bin/v0.1.2/rbox-darwin-arm64`, "/bin/:ver/:bin"],
+    ["/changelog.md", "/changelog.md"],
     ["/health", "/health"], // static vocabulary is untouched
     // A project literally NAMED after a vocab word must still be masked (the project
     // id is user-chosen) — positional masking beats the allowlist for the proj slot.

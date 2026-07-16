@@ -38,7 +38,11 @@ build + `wrangler pages deploy` → **`rbox-app` / `app.rbox.to`**, gated on the
 
 ## CLI binaries — GitHub Actions on `v*` tags
 
-`.github/workflows/release.yml`: build/sign/publish the `rbox` binaries to R2.
+`.github/workflows/release.yml`: build/sign/publish the `rbox` binaries to R2,
+then upload the tagged checkout's `CHANGELOG.md` to
+`rbox-releases/releases/changelog.md` and trigger the `rbox-home` Pages deploy
+hook. The API exposes the source at `https://api.rbox.to/changelog.md`; Astro
+renders it at `https://rbox.to/changelog/` during that rebuild.
 
 Release flow: bump `package.json` version + `CHECKED_IN_RBOX_VERSION`
 (`src/cli/version.ts`, first quoted string is read by the workflow's
@@ -54,11 +58,25 @@ existing pull-only setting. It reports all workspace outcomes and exits
 non-zero if any live runtime cannot be restarted safely.
 Update `CHANGELOG.md` per release.
 
+The tag version must be the first released heading after `[Unreleased]` or the
+release fails. Publish workflows are serialized and refuse to replace a newer
+live manifest. If publication fails while the one-day `rbox-dist` artifact is
+available, rerun the publish job. Later, publish from the exact protected tag.
+For changelog-only recovery:
+
+```sh
+bunx wrangler@4.107.0 r2 object put rbox-releases/releases/changelog.md \
+  --file=CHANGELOG.md --content-type='text/markdown; charset=utf-8' --remote
+curl --fail --silent --show-error --request POST "$RBOX_HOME_DEPLOY_HOOK" >/dev/null
+```
+
 ## Secrets (GitHub repo)
 
 - `CLOUDFLARE_DEPLOY_TOKEN` — Workers Scripts:Edit + Cloudflare Pages:Edit
   (+ Account:Read); used by `deploy-web.yml`.
 - `CLOUDFLARE_API_TOKEN` — R2-only; used by `release.yml`.
+- `RBOX_HOME_DEPLOY_HOOK` — secret Cloudflare Pages deploy-hook URL for the
+  `rbox-home` `main` branch; used by `release.yml` after changelog publication.
 - Keep them DISTINCT (least privilege). The account id is hard-coded in the
   workflows (not a secret).
 

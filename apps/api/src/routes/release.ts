@@ -41,6 +41,11 @@ export async function releaseRoutes({ req, env, exports, url, seg }: RouteCtx): 
     if (limited) return limited;
     return exports.CachedReleases.fetch(req);
   }
+  if (url.pathname === "/changelog.md" && req.method === "GET") {
+    const limited = await releaseLimited();
+    if (limited) return limited;
+    return exports.CachedReleases.fetch(req);
+  }
   // The signed release manifest + its detached signature (no-cache; `rbox upgrade`
   // verifies the signature against an embedded key before trusting it). Keep the
   // manifest JSON shape aligned with scripts/release.ts; install.sh greps the
@@ -73,6 +78,17 @@ export async function cachedReleaseResponse(url: URL, env: Env): Promise<Respons
     const obj = await env.rbox_releases.get("releases/install.sh");
     if (!obj) return releaseNotFound();
     return new Response(obj.body, { headers: SHELL_HEADERS });
+  }
+
+  if (url.pathname === "/changelog.md") {
+    const obj = await env.rbox_releases.get("releases/changelog.md");
+    if (!obj) return releaseNotFound();
+    return new Response(obj.body, {
+      headers: {
+        "content-type": "text/markdown; charset=utf-8",
+        "cache-control": "public, max-age=300, stale-while-revalidate=60",
+      },
+    });
   }
 
   const seg = url.pathname.split("/").filter(Boolean);
