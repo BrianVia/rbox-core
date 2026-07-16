@@ -1,12 +1,13 @@
 # §130 — Follower stale-side-branch hygiene
 
-> **Status: 🚧 DESIGN v9 — 2026-07-16.**
+> **Status: 🚧 DESIGN v10 — 2026-07-16.**
 >
-> **Review history.** Eight adversarial review rounds established the mechanisms in this
-> document. v9 is a clean-room coherence rewrite: it removes the inline review archaeology
-> and the abandoned writer-prevention design, preserves the agreed publisher and
-> follower protocols, and adds the final P-repair transaction for ref or reflog movement
-> after a crash.
+> **Review history.** Nine adversarial review rounds established the mechanisms in this
+> document. v10 preserves the v9 protocol and closes its remaining provenance and
+> implementability gaps: every durable proof is bound to one state lineage and logical
+> repository, old or legacy positive BASE cannot launder a user recreation, settled
+> absence proofs compact without losing their authority, P-repair is bounded and fully
+> retryable, and the BASE composer is total over the existing Git-section lanes.
 >
 > Field record: the Mac rbox-core replica accumulated **83 local-only commits across dozens
 > of stale side branches**. Every branch had been squash-merged and deleted on the publisher.
@@ -135,6 +136,45 @@ keeps today's hold, which is the safe direction. Worst-case wire size is approxi
 
 ## Follower state model
 
+### Lineage and logical-repository binding
+
+Proof refs live in a common object/ref store, but the authority they record belongs to one
+logical `RepoRecord`. Linked worktrees can share that store, and two workspace roots can
+point at it, so a refname keyed only by branch name is unsafe. Every A/P/K/Q and absence
+archive below is therefore bound to both a repository identity and a state lineage.
+
+`RepoIdentityV1` has these fields, in this exact order:
+
+1. the validated POSIX `RepoRecord` key (`.` or its canonical relative path);
+2. repository kind, the ASCII literal `dir` or `pointer`;
+3. `worktreeId`, `gitDirReal`, and `commonDirReal` from the existing
+   `CheckoutJournalBinding` (`follow.ts:207-214`, `journal.ts:9-15`); and
+4. the common-directory `dev`, `ino`, and nanosecond birthtime, each as an unsigned
+   decimal ASCII integer, from the same bigint `stat` used by
+   `config-lane.ts:88-104`; unavailable/non-positive birthtime uses the existing
+   ASCII `0` sentinel.
+
+Its canonical byte encoding is ASCII `rbox-repo-identity-v1\0`, followed by each field as
+an unsigned 64-bit big-endian byte length and that many UTF-8 bytes. Existing path
+validation and `realpath` happen before encoding; there is no further Unicode, case, slash,
+or locale normalization. `repositoryIdentityHash` is SHA-256 of those bytes.
+
+The state lineage encoding is ASCII `rbox-lineage-v1\0`, followed by the same
+length-delimited encoding of `workspaceRootReal`, `SyncState.stream`, the 32-hex
+`stateNonce`, and the complete `RepoIdentityV1` bytes. `lineageHash` is its SHA-256.
+A legacy or degraded state without a nonce cannot author or retire these artifacts; it can
+only carry BASE and hold. Including the physical incarnation prevents a replacement repo at
+the same path from inheriting proof, while the record key distinguishes logical records
+that intentionally share a common dir.
+
+All payloads repeat `lineageHash` and `repositoryIdentityHash`, and their namespaces include
+`lineageHash`. A reader validates namespace, payload, current state lineage, repository
+identity, branch hash, and direct target as one unit. An artifact for another lineage or
+logical record never overlays or advances this record's BASE. A valid foreign artifact for
+the same branch in the same common dir is a mutation veto until its owning lineage settles
+or is sealed; artifacts for unrelated branches are ignored. Malformed, colliding, or
+unclassifiable artifacts hard-hold the common-dir group.
+
 ### Logical BASE and the absence invariant
 
 For every syncable branch `R`:
@@ -149,12 +189,12 @@ manufacture one.
 
 The durable artifact is:
 
-`A(R) = refs/rbox-local/base-absent/v1/<sha256(UTF-8 R)>`
+`A(R) = refs/rbox-local/base-absent/v2/<lineageHash>/<sha256(UTF-8 R)>`
 
 Before preparing the ref transaction, rbox writes a blob `M` containing RFC 8785
 canonical JSON:
 
-`{"priorOid":"<L>","ref":"<R>","v":1}`
+`{"lineageHash":"<64hex>","priorOid":"<L>","ref":"<R>","repositoryIdentityHash":"<64hex>","v":2}`
 
 A valid `A(R)` is a direct ref to that blob, with the exact schema, an in-scope branch
 ref, a 40-hex `priorOid`, and a namespace suffix equal to the hash of `ref`.
@@ -172,15 +212,37 @@ overlays all valid A artifacts first, removing their refs from logical BASE. A v
 over stale serialized presence; an invalid A is never ignored into presence. An A target,
 timestamp, generation, or incoming tombstone is never matched to authorize or retire it.
 
+Positive branch BASE also carries provenance. `RepoRecord.branchBaseOrigins` is an exact
+map for `refs/heads/*` only:
+
+```ts
+type BranchBaseOrigin =
+  | { v: 1; oid: string; lineageHash: string; kind: "pull-p"; episode: string }
+  | { v: 1; oid: string; lineageHash: string; kind: "publisher-ack";
+      sourceSeq: number; incomingKey: string }
+  | { v: 1; oid: string; lineageHash: string; kind: "manual"; episode: string }
+```
+
+An origin is usable only when its key is R, its OID equals `base.refs[R]`, and its lineage
+is current. Exact P settlement and P-repair write `pull-p`; an accepted push ACK may write
+`publisher-ack` only for a value this device actually captured and committed; confirmed
+manual mutation writes `manual`. The composer changes the BASE member and origin together.
+Carry retains a matching origin, absence removes it, and a changed/missing/mismatched origin
+makes that positive BASE `legacy-untrusted`. Migration, equality observation, the
+already-converged shortcut, legacy map folding, and old writers can neither create nor
+upgrade provenance. Tombstone authorization requires a usable positive origin in addition
+to live and BASE equality. Thus an old writer that drops the map causes a hold, while one
+that preserves a stale map cannot bind it to a different OID.
+
 ### Present-transition artifact
 
 A separate short-lived artifact proves rbox transitions that end present:
 
-`P(R) = refs/rbox-local/base-present/v1/<sha256(UTF-8 R)>`
+`P(R) = refs/rbox-local/base-present/v2/<lineageHash>/<sha256(UTF-8 R)>`
 
 Its target blob is canonical JSON:
 
-`{"episode":"<128-bit hex>","nextOid":"<N>","priorOid":"<L-or-null>","ref":"<R>","v":1}`
+`{"episode":"<128-bit hex>","lineageHash":"<64hex>","nextOid":"<N>","priorOid":"<L-or-null>","ref":"<R>","repositoryIdentityHash":"<64hex>","v":2}`
 
 It uses the same direct-ref, exact-schema, branch-scope, OID, and hash-suffix validation as
 A. `P(R)` is created expected-absent in the same ref transaction as every rbox branch
@@ -193,25 +255,28 @@ create or update that may advance pull BASE. The transaction forces a reflog ent
 The same transaction creates one episode-scoped reachability ref for each non-null OID
 named by P:
 
-`K(P,slot) = refs/rbox-local/base-present-keep/v1/<sha256(R)>/<episode>/<prior|next>`.
+`K(P,slot) = refs/rbox-local/base-present-keep/v2/<lineageHash>/<sha256(R)>/<episode>/<prior|next>`.
 
 Each K directly targets its OID and is excluded from capture and identity. K keeps P's
 evidence available across user or old-binary movement, reflog truncation, and GC. A
 standing P is invalid unless every required K exists at the exact OID. Exact settlement
-deletes P and K only after BASE is durable. P-repair atomically creates permanent
-human-origin pins for both referenced OIDs before deleting P and K. Rollback journals carry
+deletes P and K only after BASE is durable. P-repair durably creates permanent human-origin
+pins in its prior pin-only phase before deleting P and K. Rollback journals carry
 the exact K targets and delete them in every inverse that deletes P. At two K refs per P,
 the 256-P cap also bounds this namespace at 512 refs.
 
-Only one P may stand for a ref. Another transition must first settle or repair it.
-P is crash authorship only: it never matches a tombstone and never authorizes BASE absence.
+Only one P may stand for a ref **within a lineage**. Any foreign P for the same R is a
+hard mutation veto, so another record cannot recover, retire, or compose from it. Another
+transition in the owning lineage must first settle or repair its P. P is crash authorship
+only: it never matches a tombstone and never authorizes BASE absence.
 
 ### Prevalidated attestation map
 
 After strict wire validation and before ref-plane planning, apply orchestration builds one
 immutable attestation map keyed by branch ref and tombstoned OID. Each entry is bound to the
 exact `gitIncomingKey` and contains the direct live OID, logical BASE OID, validated
-A/P/K disposition, and the D2-revalidated pending evidence used to derive it.
+positive-origin disposition, owning-lineage A/Z/P/K disposition, same-branch foreign
+artifact scan, and the D2-revalidated pending evidence used to derive it.
 `publishRefPlane` consumes this map; it never reparses raw tombstone or partial state.
 
 Invalid wire input produces no partial attestations. A stale, mismatched, indirect, or
@@ -241,12 +306,53 @@ and raw whole-state persistence outside this function are forbidden by structura
   BASE member or overwrite a later third positive value; and
 - `migration` may import legacy positive state but may not remove a present member.
 
-For every member of `keys(previous.refs) ∪ keys(candidate.refs)`, in canonical refname
-order, unchanged presence is retained; a pull addition or change requires a valid P witness;
-and present→absent requires locked `R` absence plus valid `A(R)`. Missing,
-malformed, stale, or mismatched proof retains the previous member, keeps the incoming section
-pending, and returns a typed hard hold. `publisher-ack` may add or advance present
-members but retains omissions. Candidate non-ref fields follow their existing lane rules.
+The proof rules are expressly limited to `refs/heads/*`. For each branch in
+`keys(previous.refs) ∪ keys(candidate.refs)`, canonical refname order, unchanged presence
+and its matching positive origin are retained; a pull addition or change requires a valid
+current-lineage P witness; and present→absent requires locked R absence plus the exact
+current-lineage A or settled-absence entry. A publisher ACK may add or advance a branch
+only with a new `publisher-ack` origin and retains omissions. Migration may import a
+positive member only as `legacy-untrusted`. Missing, malformed, foreign, stale, or
+mismatched proof retains the previous member, keeps the incoming section pending, and
+returns a typed hard hold.
+
+The rest of the section is total and deliberately preserves today's whole-section lane
+semantics rather than inventing hybrids:
+
+- For a dir repo, `refs/tags/*` and `refs/stash` use the existing generic expected-old safe-ref
+  publication; all-scope omission may delete them. Stash additionally protects every stash
+  reflog OID and creates/repairs its reflog. For a pointer repo, effective refs contain only
+  `refs/heads/*` and omission never deletes (`follow.ts:482-489,529-675`). Tags and stash
+  never require or produce A/P, and they never satisfy branch provenance.
+- If any ref is held or checkout remains pending, persisted BASE carries **all** previous
+  tags/stash and all previous non-ref fields: `head`, the complete index artifact tuple plus
+  `indexTree`, `opState`, `config`, `refScope`, `generatedAt`, `bundleSha`,
+  `bundleEncSha`, `bundleCipherSize`, compression/payload fields, and `packChain`.
+  The whole incoming section remains `pending`. Exact safe physical changes live only in
+  `partial.appliedRefs`; `checkoutPending:false` says the incoming HEAD/index/op-state were
+  journal-published; config completion lives in the config lane. Retry reconstructs the
+  previous logical identity with `withoutRboxAuthoredRefs` (`apply.ts:25-52,767-779`).
+- With no held ref and a completed checkout, candidate tags/stash and every non-ref field
+  advance wholesale. This is the current `base: held ? baseSec : remoteSec` intended-record
+  contract and outcome packing (`apply.ts:910-940,984-1000`). The legacy clean path has the
+  same old-whole-BASE plus pending on a hold, incoming-whole-BASE on success behavior
+  (`apply.ts:1051-1087`).
+- Config remains independently retryable. A config failure carries `configBase` and its
+  partial marker; unchanged/already-converged Git may still advance the incoming section
+  while the config lane retries (`apply.ts:606-617,724-759`).
+- Bundle and pack-chain fields describe artifact families, not independently composable
+  values. A mixed outcome keeps the entire prior family in BASE and the entire incoming
+  family in pending; a terminal outcome replaces the family wholesale. Incoming staging
+  and pack import do not by themselves advance it (`follow.ts:220-286,740-806`).
+
+On push, pending is carried byte-for-byte and suppresses capture (`plan.ts:566-576`). Other
+carry paths retain the whole BASE, except the independently owned config projection
+(`plan.ts:270-385,441-453,507-513,579-607,671-715`). Fresh capture replaces the whole
+capture family, with incremental capture only appending the prior pack links
+(`plan.ts:741-754`, `shared.ts:219-237`). After commit, a pending repo retains its old
+whole BASE; otherwise the committed section advances wholesale (`plan.ts:797-813`,
+`push.ts:661-682`). These rules cover every field in `GitSection` and are compile-time
+exhaustive when that interface grows.
 
 `lockedProof` means a prepared Git ref transaction, not an in-process mutex. It locks
 every affected R and A/P/K ref in bytewise order. Absence verifies `R` absent and
@@ -256,11 +362,8 @@ reservation are also verified. The state-generation CAS runs while the Git locks
 prepared. State failure aborts the ref transaction and leaves P/K; state success commits
 the transaction.
 
-The global order is:
-
-`workspace mutex → common dirs by canonical real path → refs by bytewise name → state lock`.
-
-No state writer may acquire a Git proof lock in the reverse order.
+The exact global order and P-repair's additional locks are specified below; no state writer
+may acquire a Git proof or origin lock in reverse order.
 
 ### Complete BASE-writer retrofit
 
@@ -286,7 +389,12 @@ retrofit all of these existing sites:
   `src/cli/sync-state.ts`):** legacy-to-record folding, records-to-manifest
   serialization, packet installation, generic state save, source record construction,
   record-to-input copy, legacy reconstruction, and opaque journal-lane replacement/retry.
-  `StateSource` names its authority and carries the proof result. Raw `saveState`
+  Concretely this includes `config.ts:336-374,379-466,566-600`,
+  `sync-state.ts:102-223,225-291`, and the published-intent merge/save at
+  `sync-state.ts:320-457`; that merge composes BASE rather than replace-copying its
+  apply fields. `StateSource` carries `repoProofs[relPath]`, whose closed per-repo value
+  contains per-branch authority/witnesses: one pull packet can mix carry, A, P, and repair
+  outcomes across and within repos, so a scalar packet authority is forbidden. Raw `saveState`
   is private to fresh non-Git initialization and refuses state containing Git BASE or repo
   records. Structural tests forbid any other whole-state persistence API or direct
   state-file write.
@@ -305,8 +413,26 @@ retrofit all of these existing sites:
   artifact protocol below and never manufacture empty branch BASE.
 - **Manual resolution (`src/cli/git-cmd.ts`):** the current wholesale
   `base: incoming` assignment is replaced by the per-ref manual protocol.
-- **Publisher ACK source (`src/cli/sync/push.ts`):** the post-commit source is tagged
-  `publisher-ack`, never generic pull authority.
+- **All four production state sources:** pull's mixed apply/global source
+  (`src/cli/sync/pull.ts:258-286`), push's deferral-only save
+  (`src/cli/sync/push.ts:452-469`), push's no-op bookkeeping save
+  (`push.ts:509-523`), and accepted post-commit ACK (`push.ts:665-682`). The first has
+  per-repo/per-branch proof; both bookkeeping sources are carry-only; only the fourth is
+  `publisher-ack` and may create publisher positive origins.
+
+State construction coverage alone is insufficient. Every production mutation of a
+syncable branch routes through a typed branch-transition planner/executor that requires
+lineage, logical BASE effect, and A/P/K/settled-absence plan, and returns the exact committed
+witness. Rollback consumes its typed inverse. The allowlisted sites are non-current safe
+refs (`follow.ts:605-675`), current-ref checkout plans (`follow.ts:817-874`), low-level
+checkout command construction/commit (`engine/git/checkout-txn.ts:315-350,567-730`), legacy
+engine create/update/delete (`engine/git/apply.ts:466-575`), clean wipe
+(`engine/git/quarantine.ts:60-76`), legacy snapshot restore
+(`engine/git/rollback.ts:26-50`), and journal old/new arbitration
+(`engine/git/journal.ts:419-441`). Raw `update-ref` remains allowlisted only for
+non-syncable scratch, conflict, keep, and protocol refs. Structural tests fixture every
+site and reject a new command capable of naming `refs/heads/*` without a typed plan and
+inverse.
 
 The files-first path may emit empty Git only for true genesis: no BASE, advertised,
 pending, A/P/K, or repository record may exist. Otherwise it enters the same carry and
@@ -321,9 +447,11 @@ branch at live `L` is authorized for deletion only if all of the following hold:
 
 1. the prevalidated attestation map contains `refTombstones[R]` entry `oid=L`;
 2. logical `BASE[R]` is **present** and equals that same `L`;
-3. `A(R)` and `P(R)` are absent and no orphan or mismatched K exists;
-4. the hard ownership proof is otherwise determinate and stable; and
-5. `R` is neither the current ref nor owned by a sibling worktree.
+3. `branchBaseOrigins[R]` is usable, current-lineage positive provenance for L;
+4. the owning lineage's A/settled-absence entry and P are absent, no orphan or
+   mismatched K exists, and no active foreign A/P/K/settled-absence entry names R;
+5. the hard ownership proof is otherwise determinate and stable; and
+6. `R` is neither the current ref nor owned by a sibling worktree.
 
 Authorization is evaluated after receiver-equivalence ambiguity, forced prior holds,
 sibling-worktree ownership, indeterminate proofs, reflog stability, busy state, and CAS
@@ -376,42 +504,40 @@ inverses are:
   `{delete R N, delete P expected-P, delete K* expected}`; and
 - `{create P, create K*, create R N, delete A M}` →
   `{delete R N, delete P expected-P, delete K* expected, create A M}`.
+- `{create P, create K*, create R N, update Z Znext Zprior}` →
+  `{delete R N, delete P expected-P, delete K* expected, update Z Zprior Znext}`; and
+- when removing R's last settled leaf,
+  `{create P, create K*, create R N, delete Z Zprior}` →
+  `{delete R N, delete P expected-P, delete K* expected, create Z Zprior}`.
 
 Existing pins remain conservatively over-protective. If any inverse CAS fails, rollback
-does not claim restoration and recovery hard-holds. Destructive wipe helpers may not mutate
-a branch outside this wrapper.
+does not claim restoration and recovery hard-holds. Journals carry both predecessor and
+successor Z targets/tree OIDs, so recovery never rebuilds a tree from current state.
+Destructive wipe helpers may not mutate a branch outside this wrapper.
 
 ### Re-advertisement and A retirement
 
 When logical BASE omits R and incoming advertises `R=N`, normal follow performs an
-expected-absent create. If A exists, that same transaction creates P and deletes A by exact
-target. Merely observing `live==incoming` is insufficient: a user-created occupant,
-even at N, causes the create CAS to fail, leaves A in place, and holds. N need not equal
-`A.priorOid`.
+expected-absent create. If a live A exists, that transaction creates P/K, creates R=N, and
+compare-deletes A. If the absence was already compacted, it creates P/K and R while
+CAS-updating the settled-absence tree to remove R's exact leaf. Merely observing
+`live==incoming` is insufficient: a user-created or old-binary-created occupant, even at
+N, fails expected-absent creation, leaves the absence authority in place, and holds. N need
+not equal the recorded prior OID.
 
-A retires only inside a protocol-capable v8-or-newer transaction that establishes a
-present result. This includes the expected-absent create and the returning-capable-reader
-revalidation path after an old binary legitimately applied a re-advertised ref while A
-stood. Tombstone expiry, generation change, observation, state rewrite, and old binaries
-never retire A.
+A or its settled entry retires only inside a capable transaction that **actually
+establishes presence**: the expected-absent create above, or an explicitly confirmed manual
+CAS that quarantines and pins the exact occupant while creating P/K. Tombstone expiry,
+generation change, equality observation, already-converged apply, positive legacy state,
+migration, state rewrite, and old binaries never retire absence authority. There is no
+automatic returning-reader revalidation path.
 
-That returning-reader path is an explicit **present revalidation transaction**, not an
-already-converged shortcut. Because A still makes logical BASE absent, it requires a
-positive serialized BASE candidate `RepoRecord.base[R]=N` written by the old apply,
-validated incoming `R=N`, locked live `R=N`, exact `A(R)=M`, P absent,
-stable reflog evidence, and every ordinary hard gate. Its prepared ref transaction contains
-`verify R N + verify P(R) absent + delete A(R) M`. A is fully validated before
-preparation, and the delete's expected target is its sole in-transaction A check. While
-those locks remain prepared, `pull-ref-transaction` authority state-CASes that positive serialized
-candidate and the revalidation receipt; A continues to overlay it until the ref transaction
-commits. State failure aborts and retains A. State success commits the exact A deletion,
-which exposes the already-persisted N as logical BASE at that linearization point. A crash
-before ref commit therefore retries with A still blocking, while a crash after commit sees
-the durable receipt and A absent. The planner then restarts from fresh observations.
-
-This path deliberately resolves the same-OID old-writer/user-recreation ambiguity without
-deleting anything. A later tombstone is a new decision and must pass fresh live, positive
-BASE, attestation, preservation, and hard-gate proofs.
+This is intentionally conservative when an old binary legitimately applied a
+re-advertisement. The operator may delete the occupant and let expected-absent creation
+retry, or confirm `take-theirs`; automatic code cannot distinguish that event from a user's
+same-OID recreation. Consequently the g1/g2/g3 laundering walk stops at g2: A/settled
+absence still overlays the old writer's `BASE=T`, the old positive has no usable origin,
+and g3 cannot consume a tombstone.
 
 ### Exact P recovery
 
@@ -419,7 +545,9 @@ While P stands, stale serialized BASE is unavailable for tombstone authorization
 recovery prepares locks for R, P, and K, validates their exact targets, and requires live
 `R=N` plus the top reflog entry with the exact episode and old/new values. The
 CAS-protected BASE must still be P's pre-state or already N. It then materializes
-`BASE[R]=N` by state CAS and compare-deletes P and K by expected target. A third
+`BASE[R]=N` plus its exact `pull-p` origin by state CAS and compare-deletes P and K
+by expected target. Already-N without the matching origin repairs the origin only while
+the exact P proof still stands. A third
 positive BASE, or unexpected absence for a present `priorOid`, is later state and
 routes through P-repair even when R and its reflog still match.
 
@@ -439,64 +567,226 @@ Exact recovery can fail after a crash because a user or old binary moved, delete
 recreated R, advanced or truncated its reflog, performed `N→U→N`, or wrote a later
 protected BASE shape. A structurally valid P must not become a permanent artifact wedge.
 
-When failure is specifically a locked live-ref, top-reflog, or protected-BASE-shape
-mismatch, v9 executes
-`p-repair` under the same workspace/common-dir/ref/state lock order. It:
+When failure is specifically a locked live-ref, reflog, or protected-BASE-shape mismatch,
+v10 executes `p-repair`. It first enumerates the current observation set
 
-1. revalidates P at its exact target, verifies the current R value or absence, verifies A
-   absent, and re-reads and fingerprints the reflog while the relevant locks are prepared;
-2. writes and durably fsyncs a canonical quarantine blob of at most 8 KiB containing the P
-   ref and target, canonical P payload, current live and logical-BASE observations, reflog
-   fingerprint and top entry, state generation, incoming key, canonical repair timestamp,
-   and mismatch reason; its direct recovery ref is
-   `Q(P) = refs/rbox-recovery/base-present/v1/<lineage-hash>/<sha256(R)>/<episode>`,
-   where `lineage-hash` is SHA-256 over the workspace, stream/incarnation, and
-   canonical repository identity with length-delimited fields;
-3. creates permanent `human` keep pins for every non-null OID named by P
-   (`priorOid` and `nextOid`);
-4. computes BASE from the state protected by that CAS: if BASE still equals
-   `P.priorOid` (including absent for `priorOid:null`), materialize
-   `P.nextOid`; if BASE already equals `nextOid`, leave it unchanged; if BASE is
-   absent when `priorOid` was present, or is any third positive value, preserve that
-   later state rather than regress or invent provenance;
-5. replaces P-bound partial progress with a terminal `p-repaired` receipt naming Q
-   and the chosen BASE disposition. For a multi-ref or checkout journal, only that member is
-   superseded; every unrelated member and the journal's published/rollback state is
-   preserved, and recovery never attempts the obsolete P inverse;
-6. runs the state-generation CAS through `p-repair` authority with that BASE result
-   and typed receipt; and
-7. atomically creates Q at the quarantine blob expected-absent, creates the
-   deterministically named permanent keep pins, and compare-deletes P and every K by
-   expected target in the prepared ref transaction.
+`Sobs = {P.priorOid when non-null, P.nextOid, live R when present} ∪ {every non-zero old/new OID in R's complete reflog}`.
 
-Unavailable referenced objects, malformed or colliding P, contradictory live A+P,
-indeterminate reads, busy locks, and preservation failures are corruption or operational
-holds, not movement repair. Any quarantine, pin, state-CAS, or expected-target failure
-leaves P authoritative and the operation retries or hard-holds.
+Because origin preparation precedes the ref/state transaction, an aborted earlier attempt
+may already have added the exact repair origin to other OIDs. Let `Sprior` be every valid
+sidecar OID key already carrying `(ref=Q(P), episode=P.episode)`, and define cumulative
+`Skeep = Sobs ∪ Sprior`. The entire reflog is read as bytes, every member of Skeep must
+exist, and every member receives or retains a permanent pin. This deliberately does not
+apply reachability filtering: post-P
+reflog-only U in `N→U→N` is human evidence and must survive truncation and GC. The
+reflog bytes and Sobs are re-read under the final lock boundary while the locked sidecar
+reconstructs Sprior; any difference, missing cumulative member, or
+unpreservable object leaves P/K intact.
 
-The prepared lock set contains R, A, P, K, Q, and every permanent keep ref in the global
-bytewise order.
-It also holds the common-dir reflog-maintenance lock for R. The reflog fingerprint is
-compared again immediately before commit, so concurrent reflog expiry or direct replacement
-aborts with P intact just like a ref movement.
+#### Bounded Q record
 
-The steps are crash-idempotent. An unreferenced quarantine blob or pin origin written
-before an aborted ref transaction is harmless over-protection. A crash after state CAS but
-before ref commit leaves P and retries. After ref commit, Q, quarantine data, and pins are
-durable and P/K are absent. Q is excluded from capture, live identity, and authorization and
-is retained with its recovery lineage for forensic/manual recovery. The lineage/ref/episode
-name is deterministic; a pre-existing Q while the exact P still stands is an artifact
-contradiction and hard-holds rather than overwriting forensic state.
+`Q(P)` is the deterministic direct ref
+
+`refs/rbox-recovery/base-present/v2/<lineageHash>/<sha256(UTF-8 R)>/<episode>`.
+
+It targets RFC 8785 canonical JSON with this exact closed schema:
+
+```ts
+type ByteProjection = {
+  bytes: number;          // full source byte count, safe unsigned integer
+  sha256: string;         // full source bytes
+  prefixB64: string;      // base64 of at most the field cap's first bytes
+  truncated: boolean;     // exactly bytes > cap
+};
+
+type PRepairQ = {
+  v: 1;
+  kind: "p-repair";
+  lineageHash: string;
+  repositoryIdentityHash: string;
+  p: {
+    artifactRef: ByteProjection;       // cap 384 source bytes
+    artifactOid: string;
+    payload: {
+      v: 2;
+      lineageHash: string;
+      repositoryIdentityHash: string;
+      ref: ByteProjection;             // cap 768 UTF-8 bytes
+      episode: string;
+      priorOid: string | null;
+      nextOid: string;
+    };
+    payloadBytes: number;
+    payloadSha256: string;
+  };
+  observed: {
+    liveOid: string | null;
+    baseOid: string | null;             // serialized RepoRecord.base.refs[R]
+    repoGen: number;
+    stateRevision: number;
+    incomingKey: string | null;
+    reflog: {
+      bytes: number;
+      entries: number;
+      sha256: string;
+      top: ByteProjection | null;       // cap 2,048 raw bytes
+    };
+  };
+  preserved: { count: number; oidsSha256: string };
+  repair: {
+    at: string;                         // canonical UTC RFC 3339 milliseconds
+    reason: "live-mismatch" | "reflog-mismatch" | "base-shape-mismatch";
+    baseDisposition: "advance-prior-to-next" | "already-next" |
+      "preserve-absent" | "preserve-third";
+  };
+};
+```
+
+Every hash and OID has its ordinary exact lowercase-hex width; episode is 32 lowercase hex;
+counters are non-negative safe integers. If mismatches coexist, `repair.reason` uses the
+fixed priority `base-shape-mismatch > live-mismatch > reflog-mismatch`.
+`payloadSha256` covers the full canonical P blob bytes. `oidsSha256` covers sorted unique
+Skeep as concatenated decoded 20-byte OIDs, not textual
+JSON. Base64 prevents JSON escaping from expanding arbitrary reflog bytes. Projection
+prefixes stop only at the byte cap; the full byte count, full hash, and `truncated` flag
+preserve oversized-valid-content evidence. With all prefixes maximal, canonical Q is below
+8,192 bytes; construction has no data-dependent field outside these caps. A valid moved P
+is therefore always quarantinable. A max-fixture byte-count test is normative.
+
+#### Existing keep-pin model and repair origin
+
+Permanent refs retain their existing deterministic, content-addressed name:
+
+`refs/rbox-local/keep/<oid>`.
+
+There are no lineage-named permanent pin refs. The shared
+`<commonDir>/rbox-keep-origins.json` remains
+`Record<oid, KeepPinOrigin[]>`, where the actual model is
+`{ref,episode,time,class}` (`keep-pins.ts:12-31,66-105`). For every OID in Skeep, repair merges:
+
+```ts
+{ ref: Q(P), episode: P.episode, time: originTime, class: "human" }
+```
+
+Existing merge identity is exact `(ref, episode)` and human promotion is monotonic; retry
+retains that OID's stored time when the exact origin already exists, otherwise
+`originTime = Q.repair.at`. Time is diagnostic and receipt validation checks only ref,
+episode, and class. The implementation adds a strict,
+bounded sidecar parser, locked filter/rewrite support, and a lower-level create-only pin
+helper. Repair first commits the idempotent **pin-only** transaction for every Skeep OID,
+then merges and fsyncs the origins. This reverses current `prepareKeepPins`' internal order
+only for repair: a crash in the gap leaves a reachable, possibly originless pin, never an
+origin whose post-P object can be GC'd. Such a pin is harmless over-protection and is
+diagnosed and is never automatically deleted; future pin sweep/cleanup must take the
+common-dir and sidecar locks. Provenance
+is still durable before the destructive P retirement. The final repair transaction verifies
+the exact keep refs rather than first creating them. A lineage
+cleanup removes only origins whose `ref` has that lineage's strict Q prefix and whose
+episode syntax is valid, including origins for evicted Q metadata; it compare-deletes a
+content pin only when no origin of either class remains.
+
+#### Repair, receipt, and BASE disposition
+
+After the Q bytes and pin origins are durable, repair computes BASE from the exact
+CAS-protected serialized `RepoRecord.base.refs[R]`; while P stands this observed member is
+not independently usable logical BASE. Prior value (including absent for `priorOid:null`) advances to
+`nextOid` with a `pull-p` origin; already-next retains or repairs that same origin; an
+unexpected absence or third positive is preserved without provenance invention. It replaces
+only the P-bound partial/journal member with a bounded `p-repaired` receipt. Unrelated
+members and published/rollback state stay intact, and recovery never attempts the obsolete
+P inverse.
+
+The receipt contains the exact lineage/repository/ref/episode, P ref+target, every K
+ref+target, Q ref+target, the complete bounded `PRepairQ` value, the exact origin identity,
+Skeep count/hash, reflog byte count/hash, chosen BASE disposition, and
+`eviction:null | { qRef:string; targetOid:string }`. When the Q cap requires eviction,
+that field freezes the oldest `(Q.repair.at, refname)` victim and exact expected target
+before the state CAS. Keeping Q's bounded value
+in state is required: after state CAS but before Q ref creation, GC may collect an otherwise
+unreferenced Q blob; retry rewrites the canonical bytes and verifies the same object OID.
+The receipt remains until ref-side completion is observed.
+
+After the pin-only transaction, repair reacquires/revalidates the current R/reflog view and
+extends cumulative Skeep if necessary. Any extension loops back through pin-only creation,
+then origin merge+fsync, then revalidation; final preparation begins only when a complete
+iteration leaves Sobs/Skeep unchanged. While the final Git transaction remains prepared,
+`p-repair` generation-CASes that BASE and receipt. It then atomically creates Q
+expected-absent, verifies every content-addressed keep ref, and compare-deletes P and every K. Unavailable objects,
+malformed/colliding/foreign P, contradictory A/P, indeterminate reads, or preservation
+failure are holds, not movement repair.
+
+#### Exact lock order
+
+The current code already has these nested orders: workspace sync mutex
+(`sync-mutex.ts:122-170`) → per-common-dir in-process `chainLock` keyed by resolved path
+(`apply.ts:1114-1140`) → checkout prepared Git locks → explicit ref reservations →
+`ORIG_HEAD.lock` → `index.lock` (`checkout-txn.ts:560-645`). A branch-switch primary
+commit then releases its prepared locks before acquiring the arbitration `HEAD.lock` and
+the exceptional post-HEAD ref transaction (`checkout-txn.ts:677-730`). Separately, partial
+persistence takes sorted ref locks → `<state>.lock` (`apply.ts:1197-1247`,
+`config.ts:415-460`). `config.lock` is a standalone transaction under the workspace/common
+prefix and is released before any proof-boundary lock is acquired
+(`config-txn.ts:354-390`). The in-process queue is not a cross-workspace lock, but it is
+still an earlier lock class.
+
+The normative global order is:
+
+1. workspace sync mutex;
+2. per-common-dir in-process `chainLock`, with nested/multi-dir acquisitions in canonical
+   common-dir realpath byte order;
+3. durable `<commonDir>/rbox-operation.lock` locks in that same order, using the existing
+   owned-marker/reaping implementation; every A/P/K/Q/Z or shared-origin mutator takes it;
+4. optional per-R reflog-maintenance locks in bytewise R order at
+   `<commonDir>/rbox-locks/reflog/v1/<sha256(UTF-8 R)>.lock`;
+5. optional `<commonDir>/rbox-keep-origins.json.lock`;
+6. the primary prepared Git transaction's ref, symref/HEAD, packed-ref, reflog, protocol,
+   and content-pin locks, commands supplied in bytewise refname order;
+7. checkout-only explicit unchanged-ref reservation locks in bytewise refname order;
+8. checkout-only `ORIG_HEAD.lock`;
+9. checkout-only `index.lock`;
+10. workspace `<state>.lock`.
+
+P-repair uses 1→6 for its pin-only transaction, then 1→6→10 for its final prepared
+transaction; it never acquires checkout classes 7–9. Ordinary checkout uses 1→3→6→7→8→9
+and never acquires state while those checkout locks stand. After the primary commit, the
+documented Git compatibility exception acquires branch-switch `HEAD.lock` and then the
+post-HEAD ref transaction while reservations/index remain; these two are a separate
+checkout phase, never coexist with class 6 or state, and no other path may copy that
+inversion. Checkout releases all such locks before partial persistence reacquires class-6
+sorted ref locks and then state. `config.lock` never nests with classes 4–10.
+
+Release is reverse within each phase; no holder of a later class may acquire an earlier
+one except the named post-HEAD compatibility phase. All rbox reflog expiry/rewrite takes
+class 4. Prepared R.lock excludes ordinary Git reflog expiry; the final byte fingerprint
+detects a hostile direct filesystem replacement.
+
+#### Idempotent retry matrix
+
+| Durable observation | Required action |
+|---|---|
+| No receipt; P/K exact; Q absent | Recompute repair. Unreferenced Q blobs or already-merged exact origins are harmless over-protection. |
+| Ref prepare or state CAS rejected | Abort the ref transaction; P/K remain authority; reload. |
+| Matching accepted receipt; P/K exact; Q absent; live/reflog still match; frozen eviction victim is present at its exact target (or eviction is null) | This is the state-CAS-success/ref-commit-crash case. Recreate Q bytes from the receipt, enumerate sidecar keys with the exact `(Q ref,P episode)` origin, verify Skeep count/hash, revalidate A/R/P/K and the victim, then commit the **same ref-side transaction** without recomposing BASE or changing time. |
+| Matching accepted receipt; P/K exact; Q absent; live/reflog changed | Remain in repair: compute and pin cumulative Skeep, build a new bounded Q, and generation-CAS replace **only** the receipt. BASE is already next/preserved and cannot regress. Retry until one stable receipt commits; older origins remain included harmless over-protection. |
+| Matching receipt; Q exact; P/K absent; all keep refs exact; frozen eviction victim absent (or eviction null) | Commit completed. Compact terminal bookkeeping and restart from disk. |
+| Commit outcome unknown | Inspect under the same locks; only one of the preceding two complete shapes is accepted. |
+| Q and P coexist without the matching accepted receipt, wrong Q target, partial K retirement, missing/wrong keep ref, origin-set hash mismatch, or a mixed/wrong eviction-victim shape | Artifact contradiction; hard-hold. Never overwrite forensic state. |
+| Q exists and P is absent but an old writer dropped the receipt | Q proves preservation, not BASE movement. Restore only bounded terminal bookkeeping when binding and targets validate, preserve current BASE, and restart. |
+| Q absent, P absent, no matching receipt | Corruption hold. |
+
+After success the old plan, attestation map, and snapshots are discarded and evaluation
+restarts. P-repair itself never supplies tombstone attestation. P is historical authority
+only when BASE is still its exact pre-state; a later positive BASE is never overwritten.
 
 Q is capped at **256 records per active lineage**. Before adding the 257th, the same
-transaction expected-target-deletes the oldest valid Q by `(repairedAt, refname)`.
+transaction expected-target-deletes the oldest valid Q by `(Q.repair.at, refname)`.
 Its permanent human pins remain, so eviction drops forensic metadata rather than object
 recovery. Eviction is warned and counted by `doctor`. Deleting a whole retired lineage
 locks and validates that lineage's Q prefix, expected-target-deletes all remaining Q refs in
-canonical order, independently enumerates the same lineage-hash repair-pin origin prefix,
-and removes only those origins; objects with another origin stay pinned. Active-lineage
-repair-pin origins otherwise do not age, so their potentially unbounded object-graph cost
-is diagnosed rather than hidden.
+canonical order, then filters the shared sidecar by the same strict internal Q prefix and
+episode grammar. Objects with another origin stay pinned. Active-lineage repair-pin origins
+otherwise do not age, so their potentially unbounded object-graph cost is diagnosed rather
+than hidden.
 
 After success, the entire old plan, attestation map, partial witness, and ref/reflog
 snapshots are discarded. Locks are released and normal evaluation restarts from disk and
@@ -515,13 +805,14 @@ than a P-artifact wedge.
 ### Crash reconstruction and partial progress
 
 Before a deletion transaction commits, no A exists and BASE cannot become absent. After it
-commits, A alone reconstructs logical absence, the locked expected-absence reservation, and
+commits, A reconstructs logical absence, the locked expected-absence reservation, and
 the transition even if the process died before partial state, the checkout journal, or the
 state CAS, and even if the tombstone later expired or was evicted.
 
 If serialized BASE still contains R, this unmaterialized committed transition reconstructs
 `tombstone-pruned-this-cycle` exactly once. Once the locked state CAS materializes the
-absence, later cycles do not raise the same-cycle veto merely because A remains.
+absence, later cycles do not raise the same-cycle veto merely because A or its compacted Z
+leaf remains.
 
 `GitPartialApply.appliedRefs` may record
 `{kind:"absent", artifactOid:M}` or
@@ -529,7 +820,7 @@ absence, later cycles do not raise the same-cycle veto merely because A remains.
 `{kind:"direct"}` is valid only for unchanged equality. These records are
 pending-key-bound, D2-revalidated hints. Raw or prevalidated partial presence never
 establishes BASE provenance or authorizes a tombstone, and the hints may be rebuilt from
-A/P.
+A/Z/P.
 
 ### Value-incarnation boundary
 
@@ -553,7 +844,8 @@ can never satisfy follower provenance. A local `repoAbsent` or existing
 outbound capture, and ordinary equality decisions.
 
 Publisher ACK produces two outputs: exact committed wire state goes to `advertised`;
-BASE admits present additions and advances but retains every omitted ref. This prevents
+BASE admits present additions and advances with exact `publisher-ack` origins but retains
+every omitted ref and its matching origin. This prevents
 resurrection and repeat re-supersession without claiming an unperformed deletion.
 Reappearance clears suppression only through normal apply or capture. Active-lineage record
 GC never removes the BASE anchor, even when `.git` is gone.
@@ -577,51 +869,161 @@ valid A retains it.
 
 Incoming presence from logical absence normally uses expected-absent create. If a confirmed
 user occupant blocks it, manual authority may CAS-update or delete that exact snapshotted
-value while atomically deleting A and creating P; quarantine and pins preserve what was
-displaced. Incoming presence from present likewise creates P around the expected-old update.
+value while atomically deleting A or the exact Z leaf and creating P; quarantine and pins
+preserve what was displaced. Incoming presence from present likewise creates P around the
+expected-old update. P settlement records `pull-p`; a manual no-P terminal decision records
+the exact `manual` origin.
 Any snapshot, reflog, A/P/K, sibling-worktree, or CAS mismatch aborts without BASE change.
 Only the mandatory composer lands the journal result.
 
 ## Artifact lifecycle, reset, and diagnostics
 
-A survives ordinary state saves and tombstone expiry. It retires only through a successful
-present transaction. P normally survives until exact present BASE materialization, and a
-valid moved P survives until P-repair has quarantined and pinned it. K has exactly P's
-lifetime; Q has the bounded recovery-lineage lifetime above. All artifact namespaces are
-common-dir state, excluded from capture and identity, and scanned by ref rather than by
-loose blob contents. Blobs written before failed ref transactions are unreachable
-non-authority and ordinary Git GC may collect them.
+A survives ordinary state saves and tombstone expiry until serialized absence is durable.
+It then compacts into the owning lineage's settled-absence ledger:
 
-A common dir may contain at most **4,096 A refs**, **256 P refs**, **512 P-lifetime K
-refs**, and **256 Q refs per active lineage**. At an A/P/K cap, a new transition hard-holds
-before mutation; those live proof artifacts are never evicted. Q alone uses its safe
-metadata-eviction rule. `doctor` reports all counts, repair-pin origin counts and
-bounded lexicographic examples; the daemon emits one bounded warning per boot.
+`Z = refs/rbox-local/base-absent-settled/v1/<lineageHash>`.
 
-Reset, rebind, and stream-mismatch freshening scan every in-workspace common dir. They first
-settle an exactly recoverable P or run P-repair for a valid moved P, then rescan state and
-artifacts. They never raw-delete P. Any remaining A, P, malformed artifact, unpreservable
-repair, orphan or mismatched K, or published checkout journal refuses reset; degraded and fence-free reset are
-forbidden.
+Z directly targets an immutable Git tree. Its root contains `meta`, a canonical JSON blob
+`{"count":<n>,"lineageHash":"<64hex>","repositoryIdentityHash":"<64hex>","v":1}`,
+and one exact A-payload blob at
+`entries/<first-two-refHash-hex>/<remaining-62-hex>`. Names, modes, object types, count,
+payload lineage, ref hash, and duplicate/collision absence are all validated. Point lookup
+is by ref hash; the leaf's full R resolves hash collisions. The blob records OIDs as text,
+so Z does not keep commits reachable.
 
-When none remain, reset atomically renames the complete old state to a read-only,
-nonce-addressed lineage archive and creates a distinct stream/incarnation. Repair
-quarantine remains associated with the recovery/archive lineage and its keep pins remain
-reachable. Archives never participate in authorization and may be deleted only as whole
-retired lineages. An old executable can still rewrite state without observing these rules;
-the next capable reader rediscovers A/P/K and fails closed or repairs P.
+After the state CAS has removed R from serialized BASE and its origin map, a new Z tree is
+built and one ref transaction CAS-creates/updates Z while compare-deleting A. A crash leaves
+either A or the Z leaf, never neither. Logical absence is their union. Re-advertisement
+builds the successor Z tree without that leaf and atomically creates P/K/R while
+CAS-updating or deleting Z. Old immutable trees become ordinary unreachable GC material.
+Thus the **4,096 A cap bounds only unsettled crash artifacts**, not lifetime deletions;
+normal settlement compacts immediately and the 4,097th sequential prune remains available.
+
+P normally survives until exact positive BASE and origin materialization; a valid moved P
+survives until P-repair has quarantined and pinned it. K has exactly P's lifetime. Q has the
+bounded recovery-lineage lifetime above. All namespaces are excluded from capture and
+identity. A common dir may contain at most **4,096 unsettled A refs**, **256 P refs**,
+**512 P-lifetime K refs**, **one active Z per logical lineage/repository**, and **256 Q refs
+per active lineage**. A/P/K caps refuse before mutation without eviction. `doctor` reports
+active and foreign counts, Z entry counts/tree OIDs, repair-origin counts and bounded
+lexicographic examples; the daemon emits one bounded warning per boot.
+
+Reset, rebind, and stream-mismatch freshening use the same lock order and recover a standing
+reset journal before any ordinary state load. They settle or P-repair every valid P,
+compact every valid A into Z, and refuse malformed artifacts, orphan/mismatched K,
+unpreservable repair, or published checkout journals. Valid settled absence is no longer a
+reset refusal. Degraded or fence-free reset is forbidden.
+
+The journal path is `<root>/.rbox/state/reset-v1.json`; candidates live at
+`.rbox/state/reset-candidates/<id>.json`, and the exact old state archive is
+`.rbox/state/lineages/<oldStateNonce>/<oldStateSha256>.json`. The journal is a no-follow,
+atomically written+fsynced file with this exact bounded schema:
+
+```ts
+type ResetJournalV1 = {
+  v: 1;
+  id: string; // 32 lowercase hex
+  phase: "prepared" | "ready" | "installed" | "z-retired";
+  createdAt: string;
+  old: {
+    stream: string;
+    stateNonce: string;
+    stateRevision: number;
+    stateSha256: string; // exact pre-reset state.json bytes
+    z: Array<{
+      lineageHash: string;
+      repositoryIdentityHash: string;
+      repositoryIdentity: {
+        relPath: string; kind: "dir" | "pointer";
+        worktreeId: string; gitDirReal: string; commonDirReal: string;
+        dev: string; ino: string; birthtime: string;
+      };
+      activeRef: string;
+      targetOid: string;
+      recoveryRef: string;
+    }>;
+  };
+  next: {
+    stream: string;
+    stateNonce: string;
+    stateRevision: number;
+    stateSha256: string;
+    state: {
+      stream: string;
+      stateNonce: string;
+      stateRevision: number;
+      lastSyncedSequence: 0;
+      lastSyncedManifest: { generatedAt: ""; files: [] };
+      repoRecords: {};
+      telemetryBindingId?: string;
+    };
+  };
+};
+```
+
+Hashes/OIDs/nonces have their ordinary exact widths; timestamps and counters use the Q
+rules. Z entries are sorted by `(activeRef,targetOid)` and bounded by the 256-repository
+limit. `recoveryRef` is exactly
+`refs/rbox-recovery/base-absent/v1/<lineageHash>/<targetOid>`. The candidate/archive paths
+are derived from validated journal fields, never accepted from JSON. A recorded common-dir
+path is used only after its complete `RepoIdentityV1` re-encodes to the recorded hash and
+its realpath/stat incarnation still matches. The next-state bytes are RFC 8785 canonical
+JSON plus one LF; `next.stateSha256` covers those exact bytes, while the old hash covers the
+pre-existing raw bytes verbatim. A journal with an
+unknown field, bad ownership marker, unsafe path derivation, duplicate Z ref, or mismatched
+hash is a reset-corruption hold and is never overwritten.
+
+The cutover is:
+
+1. Under all locks, verify exact old state bytes/stream/nonce/generation, repository
+   identities, Z targets, and absence-shaped BASE. Construct the small exact `next.state`
+   with a fresh nonce (preserving `telemetryBindingId` when present), hash it, and fsync the
+   `prepared` journal before changing refs or active state.
+2. Write/fsync the exact next-state candidate; copy the exact old bytes expected-absent to
+   the hash-addressed archive (an existing byte-identical file is idempotent); and create
+   every recovery Z ref expected-absent or verify its exact target. Revalidate old state and
+   active Z, then fsync phase `ready`.
+3. Atomically rename the candidate **over** `.rbox/state.json` and fsync `.rbox`; there is
+   no missing-state window. Fsync phase `installed`, then write the matching
+   `state-incarnation.json` marker.
+4. Revalidate the exact new state/marker and every active/recovery Z pair, compare-delete
+   the journal-listed active Z refs, fsync phase `z-retired`, then delete the journal and
+   candidate directory entry durably.
+
+Recovery is deterministic:
+
+| Phase/observation | Recovery action |
+|---|---|
+| `prepared`, active state exactly old | Regenerate/verify candidate, archive, and recovery Z copies; if all exact, advance to `ready`. |
+| `prepared`, active state differs from old | No cutover was authorized in this phase. Preserve the intervening state and every active Z, quarantine any candidate, retain forensic copies, clear the journal, and restart from fresh observations. |
+| `ready`, candidate exists and active state changed | Cutover did not occur. Apply the same preserve/quarantine/restart action. |
+| `ready`, candidate exists, active state exactly old | Perform the atomic replacement and advance to `installed`. |
+| `ready`, candidate absent | Rename committed before the phase fsync. Recreate exact next bytes from `journal.next.state`, install/verify them, and advance to `installed`; an old-binary rewrite after the rename is archived but cannot cancel the confirmed reset. |
+| `installed`, active state missing/old/other | Reinstall exact bounded `next.state`, then repair/verify the incarnation marker. Never expose or compose from the intervening bytes. |
+| `installed`, active state and marker exact; each active Z is either exact-present or absent | Per common dir, compare-delete the exact-present remainder; exact-absent entries are already retired. Advance only when all are absent. |
+| `z-retired`, active Z absent and recovery copies exact | Delete journal; reset is complete. |
+| Candidate/archive/recovery ref has a wrong target, active Z has a wrong target, or one common-dir transaction has a physically impossible mixed result | Corruption hold; preserve all bytes/refs and report exact paths/targets. |
+
+Thus a crash before cutover keeps old Z authoritative; a forensic-Z copy committed before
+cutover is harmless. A crash after the atomic replacement is recognizable by the missing
+candidate even if an old binary rewrites or recreates active state before phase fsync. A
+cutover never retires Z until exact new state and marker are durable. Recovery-namespace
+Z/Q is forensic only and does not veto the new lineage. Any other active foreign A/Z/P/K
+for R remains a physical-mutation veto. Whole retired-lineage deletion removes its state
+archive and recovery metadata together, then uses the shared-origin filter above; shared
+pin origins survive.
 
 ## §126 interaction
 
-Expected absences and their exact A targets are carried into checkout reservations and
-verified under the ref locks at §126's second proof. An absence is a reserved fact, not an
-unchecked gap. A next-cycle recreation between the initial snapshot and locked proof
-therefore cannot race a stale-breadcrumb waiver.
+Expected absences and their exact A targets or Z tree/leaf targets are carried into checkout
+reservations and verified under the ref locks at §126's second proof. An absence is a
+reserved fact, not an unchecked gap. A next-cycle recreation between the initial snapshot
+and locked proof therefore cannot race a stale-breadcrumb waiver.
 
 A tombstone prune vetoes breadcrumb healing in the same cycle. After a crash, A plus stale
-serialized BASE reconstructs that veto once. After BASE materializes the absence, A does not
-veto every later cycle; the next cycle may heal with both absence and A verified under
-locks.
+serialized BASE reconstructs that veto once. After BASE materializes the absence, A or Z
+does not veto every later cycle; the next cycle may heal with both absence and A/Z verified
+under locks.
 
 Both §126 proofs, §130, logging, and tests use one closed enum,
 `BreadcrumbVetoGate`, and one total order, `BREADCRUMB_VETO_ORDER`:
@@ -648,34 +1050,37 @@ boot:
 An old standalone binary can execute directly and write refs or state. Safety comes from
 what a capable reader refuses to infer:
 
-1. Tombstone authorization always requires positive, present-and-equal BASE. BASE absence
-   never authorizes anything, so an old binary's inability to create A can only preserve a
-   hold.
-2. A live A blocks tombstone authorization for that ref regardless of surrounding state.
+1. Tombstone authorization requires positive, present-and-equal BASE **and** a matching
+   current-lineage positive origin. Equality or legacy state alone never authorizes.
+2. A live A or active Z leaf blocks tombstone authorization for that ref regardless of surrounding state.
    Old binaries neither create nor touch `refs/rbox-local/*`.
-3. A retires only in a v8-or-newer transaction that establishes or revalidates a present
-   result.
+3. Absence authority retires only in a capable transaction that expected-absent creates a
+   present result, or by explicit confirmed manual CAS; it is never revalidated from old
+   positive state.
 4. A live P blocks use of serialized BASE until a capable reader settles exact recovery or
-   v9 quarantines and retires a moved P through P-repair.
+   v10 quarantines and retires a moved P through P-repair.
 5. Old readers ignore the unknown wire fields. Capable readers strictly validate container
    shape, `refs/heads/*` grammar, 40-hex OIDs, canonical timestamps, caps, duplicate
    OIDs, strictly increasing per-ref generations, and the safe-integer high-water mark
    before building any attestation.
 6. An old writer may drop tombstone chains and the high-water mark at any time. This loses
-   authorization and causes holds; it cannot create authorization.
+   authorization and causes holds; it cannot create authorization. Dropping
+   `branchBaseOrigins` likewise converts positives to legacy-untrusted.
 
-The required v8→old→v8 walk is:
+The required capable→old→capable walk is:
 
-- v8 prunes `R=T`, atomically creating A and making logical BASE absent;
+- capable rbox prunes `R=T`, atomically creating A and making logical BASE absent;
 - during the old interval, the binary may leave R absent, legitimately re-apply a
   publisher re-advertisement and record `R=T, BASE=T`, rewrite state, or coexist with
   a user recreation;
-- returning v8 sees A and cannot delete R, regardless of the positive state around it;
-- its normal present revalidation transaction may then retire A; and
-- a later tombstone must earn fresh live equality, fresh positive BASE equality, and all
-  hard gates again.
+- returning capable rbox sees A/Z and cannot delete R or auto-retire absence, regardless of
+  the positive state around it;
+- expected-absent creation can proceed only after the occupant is absent; otherwise explicit
+  manual confirmation is required; and
+- a later tombstone requires a fresh usable positive origin as well as live/BASE equality
+  and every hard gate.
 
-If the old interval moves refs, reflogs, or state while P stands, returning v9 performs
+If the old interval moves refs, reflogs, or state while P stands, returning v10 performs
 exact recovery when possible and P-repair otherwise. It never treats the old interval as
 write-free and never derives deletion authority from ambiguity.
 
@@ -699,21 +1104,29 @@ write-free and never derives deletion authority from ambiguity.
 ### BASE, composer, and repository state
 
 - Structural tests permit BASE construction only in `composeRepoBase` and fixture
-  every enumerated `apply.ts`, `follow.ts`, `config.ts`,
-  `sync-state.ts`, `plan.ts`, `git-cmd.ts`, push-ACK, and
-  `ensureTelemetryBindingId` site. A new direct assignment, raw state write, or
-  unhandled authority member fails.
+  every enumerated `apply.ts`, `follow.ts`, `config.ts`, `sync-state.ts`, `plan.ts`,
+  `git-cmd.ts`, all four pull/push `StateSource` constructors, published-intent merge,
+  push ACK, and telemetry site. AST fixtures cover every branch mutation and inverse in
+  engine apply/quarantine/checkout/journal/rollback. A new direct assignment, raw state
+  write, unproved `refs/heads/*` command, or unhandled authority member fails.
 - Cross previous `{R1=L1,R2=L2}` with absent/same/changed candidates and
-  valid/missing/malformed/mismatched A/P. Only locked absence+A removes a member; only P
-  advances pull presence; publisher ACK never removes; refusal retains prior and pending.
-  A valid R1 prune composes beside an unrelated held R2.
+  valid/missing/malformed/mismatched A/Z/P and positive origins. Only locked absence+A/Z
+  removes a member; only P, publisher ACK, or manual authority creates a usable positive
+  origin; publisher ACK never removes; refusal retains prior and pending. Migration,
+  equality, and old-state positives remain legacy-untrusted. A valid R1 prune composes
+  beside an unrelated held R2.
+- Total field matrix: dir versus pointer; branch versus tag versus stash; generic tag
+  expected-old behavior; stash reflog preservation/publication; current branch through the
+  checkout journal; side-ref hold before and after successful checkout; config failure;
+  no-hold success; pending push carry. Mixed outcomes retain the complete previous
+  non-branch/non-ref/bundle family in BASE and exact incoming whole section in pending;
+  terminal outcomes advance it wholesale.
 - Race every proof→state boundary, fail the state CAS, and stress multi-repo lock ordering.
   Pins and P retirement commit only with their intended transaction.
-- Present revalidation after an old-writer apply exercises exact R/A/P verifies, state CAS,
-  A deletion, every crash boundary, and concurrent R/A/state movement. Execute the literal
-  valid stdin shape `verify R + verify P-absent + delete A expected`, with no duplicate
-  A command. A overlay hides the serialized candidate before commit and exposes it only
-  after exact A deletion. It never deletes R; a later tombstone must pass a fresh proof.
+- Old-writer re-advertisement with `live=BASE=N` while A/Z stands always holds; no automatic
+  verify/delete-A transaction exists. Only a capable expected-absent create/P transaction
+  or confirmed manual CAS retires absence. Exercise old writers that drop the origin map,
+  preserve a stale matching-OID origin, or change BASE while preserving a stale origin.
 - Repository suppression matrix: remote omission, missing local directory, structural
   drop, `syncGit:false`, missing-dir push, and publisher ACK retain BASE anchors,
   update only advertised, suppress the wire projection, do not resurrect, and do not
@@ -721,13 +1134,16 @@ write-free and never derives deletion authority from ambiguity.
 
 ### Authorization, preservation, and branch transactions
 
-- Exact live+tombstone+present BASE equality through the prevalidated map authorizes;
-  BASE mismatch, A/P/K inconsistency, coincidental same-OID local ref, stale map, or partial state
-  alone holds.
+- Exact live+tombstone+present BASE+usable-origin equality through the prevalidated map
+  authorizes; BASE/origin mismatch, A/Z/P/K inconsistency, coincidental same-OID local ref,
+  stale map, or partial state alone holds.
 - Ambiguity, forced hold, sibling ownership, indeterminate proof, unstable reflog, busy
   state, and current ref are never waived; only `local-commits` may be bypassed.
 - Atomic delete creates pins+A and deletes expected R together. Inject every CAS failure
   and crash boundary. Exercise every deletion plane and every exact rollback inverse.
+- Re-advertisement from a non-final and final Z leaf journals exact predecessor/successor
+  tree targets; force clean/checkout rollback and verify its CAS inverse restores Z while
+  deleting R/P/K. Crash before, during, and after each inverse commit.
 - Rewrite adoption `T→N` creates P around expected-old CAS. After settled BASE=N, a
   user return to T holds.
 - Reflog `T→U→T` between proofs aborts; stable reflog-only U receives a permanent
@@ -752,19 +1168,26 @@ write-free and never derives deletion authority from ambiguity.
 - Interleave outstanding P with `N→L`, `N→U→N`, delete/recreate-N, extra or
   truncated reflog entries, and old-binary ref/state writes. Exact matches recover; valid
   movement takes P-repair.
-- Execute v8→old→v8 with the old interval leaving absence, legitimately applying the
+- Execute capable→old→capable with the old interval leaving absence, legitimately applying the
   re-advertised value, user recreation, BASE/state rewrite, and tombstone/high-water
-  truncation. A always blocks ambiguous deletion; returning capable evaluation only
-  over-refuses or revalidates.
+  truncation. A/Z always blocks ambiguous deletion; returning capable evaluation never
+  auto-revalidates old positive BASE.
+- Two logical records and two workspace roots share one common dir. Distinct relPath,
+  stream, nonce, worktree identity, or repository replacement produce distinct lineage
+  hashes. B's P cannot advance A's BASE, and A's tombstone cannot mutate R while B has an
+  active A/Z/P/K. Namespace/payload/hash collisions hard-hold.
 
 ### P-repair
 
 - For both present→present and absent→present P shapes, cover moved, deleted,
   delete/recreate-same, `N→U→N`, extra-reflog, and truncated-reflog cases.
-- Verify the quarantine contains the exact P target/payload and locked live, BASE, reflog,
-  state-generation, incoming-key, and mismatch observations; `priorOid` and
-  `nextOid` are reachable through K from P creation and receive permanent pins before
-  expected-target P/K retirement.
+- Verify Q contains the exact fixed P fields, full payload hash, bounded ref/reflog byte
+  projections, locked live/BASE/state/incoming observations, and Skeep count/hash. Maximal
+  384/768/2,048-byte prefixes, a much longer valid ref, and arbitrary reflog bytes always
+  serialize at or below 8,192 bytes with correct truncation/full hashes.
+- For `N→U→N` and longer post-P histories, every reflog old/new OID plus live and P
+  endpoints receives `refs/rbox-local/keep/<oid>` and the exact shared-sidecar human origin
+  before P/K retirement. Truncate reflog and run GC afterward; U remains reachable.
 - Assert the BASE disposition table: pre-state `priorOid` or null lands
   `nextOid`; already-next is unchanged; third-positive or unexpected absence is
   preserved. Current N then converges normally, current U becomes an ordinary live/BASE
@@ -779,32 +1202,57 @@ write-free and never derives deletion authority from ambiguity.
   ref commit, and pre-replan. Concurrent R/P/reflog/state movement leaves P; retries are
   idempotent and do not duplicate pins. Race reflog expiry/direct replacement immediately
   before commit. A contradictory pre-existing Q hard-holds.
+- Acquisition tracing asserts all classes and each permitted path-specific subsequence of
+  workspace→chain→operation→reflog→origin→Git→reservation→ORIG_HEAD→index→state,
+  including that checkout releases index before later ref→state persistence. Assert the
+  isolated HEAD/post-HEAD phase, reverse release, multi-common-dir sorting, and rejection
+  of every unlisted inversion.
+- Crash after the pin-only transaction before origin fsync and again after origin fsync;
+  expire the reflog and run GC before retry. Every Skeep object, including post-P U,
+  remains reachable; the first shape is diagnosed as safe originless over-protection.
+- Move R and append a new reflog-only OID between origin fsync and final prepare; repair
+  loops through pin-only+origin again and prepares only after Sobs/Skeep stabilizes.
+- Specifically crash after state CAS with a matching receipt while P/K stand and Q is
+  absent, run GC, reconstruct Q bytes from the receipt, and finish the exact transaction.
+  Then repeat with post-CAS `N→U`, `N→U→N`, and reflog expiry: refresh only the
+  receipt/Skeep/Q under generation CAS, never regress BASE, and finish once stable. Include
+  an aborted S1 attempt followed by truncation/new S2 and verify Q commits the cumulative
+  origin set rather than wedging on prior over-protection. Inspect
+  every valid/invalid row of the retry matrix.
 - Multi-ref clean/checkout journal: repair one moved-P member into a typed
   `p-repaired` receipt while another member still recovers or rolls back. The
   journal remains published, its unrelated members remain intact, and reset cannot bypass
   it.
-- Move R, truncate/expire its reflog, run Git GC, and only then return v9. K keeps every
+- Move R, truncate/expire its reflog, run Git GC, and only then return v10. K keeps every
   P-referenced OID available, so repair still pins, quarantines, and retires without an
   artifact wedge. Missing or mismatched K is corruption, not this movement case.
 - Fill Q to 256, repair once more, and verify deterministic expected-target eviction of the
-  oldest Q while its permanent pins remain. Whole-lineage deletion removes the exact Q
-  prefix and only its lineage repair-pin origins; shared origins remain.
+  oldest Q while its permanent pins remain. Crash after receipt CAS and inspect
+  new-Q/victim pre-commit, post-commit, and every mixed target shape. Whole-lineage deletion
+  removes the exact Q prefix and only its lineage repair-pin origins; shared origins remain.
 - Missing referenced object, malformed/colliding P, A+P contradiction, and preservation
   failure remain fail-closed and are distinguished from repairable movement.
 - Manual resolution settles or repairs P, takes a fresh confirmation snapshot, and catches
   a second-proof race. Reset/rebind/freshening settles or repairs valid P and rescans, but
-  still refuses A, malformed P, unpreservable P, and published checkout journals.
+  compacts valid A, and still refuses malformed A/Z/P, unpreservable P, and published
+  checkout journals.
 
 ### §126, lifecycle, and diagnostics
 
 - Tombstone prune plus breadcrumb mismatch in one cycle defers; the next cycle heals with
-  absence and A verified under locks. A crash reconstructs the veto once, not forever.
+  absence and A/Z verified under locks. A crash reconstructs the veto once, not forever.
 - Table-test every `BreadcrumbVetoGate` at both proof sites and in the logger; assert
   the total order verbatim and compile-fail an unranked enum member.
-- Artifact caps 4,096 A / 256 P / 512 K refuse before mutation without proof eviction; Q
-  caps at 256 per active lineage using metadata-only eviction. Orphan blobs GC; settled A
-  persists and settled P/K retire; Q and repair-pin diagnostics and once-per-boot logs are
-  bounded.
+- Artifact caps 4,096 unsettled A / 256 P / 512 K refuse before mutation without proof
+  eviction; Q caps at 256 per active lineage using metadata-only eviction. Settle A→Z at
+  every crash boundary, prune 4,097 sequential branches, remove a Z leaf during
+  expected-absent recreation, and validate corrupt tree/leaf/count cases.
+- Reset/rebind crash at every journal phase: valid A compacts, recovery Z preserves old
+  absence provenance, new lineage never consumes it, active foreign artifacts veto, and
+  whole-lineage cleanup removes only matching shared origins. Cover candidate/archive
+  absent, exact, and wrong-hash states; forensic Z before cutover; atomic replacement before
+  phase fsync; old-binary active-state writes before and after replacement; marker lag; and
+  per-common-dir partial Z retirement using every recovery-matrix row.
 - Same-OID tests distinguish pre-snapshot movement with missing/present reflog from
   post-P movement. Reflog-only work remains reachable.
 - Manual incoming present/absent × live present/absent × A/P present/absent verifies
