@@ -6,7 +6,8 @@ Canonical record of how each rbox surface ships. Referenced from `CLAUDE.md`
 ## Branch model and production promotion
 
 - **`main` is the integration branch.** PRs merge to `main` when CI is green.
-  Nothing deploys from pushes or merges to `main`.
+  No production surface deploys from `main`; the DEV API Workers Builds
+  integration does deploy automatically from it.
 - **`production` is the deployed branch.** After verifying the candidate in
   dev, fast-forward the `production` branch to the commit at `main`:
   `git push origin main:production`.
@@ -16,33 +17,44 @@ Canonical record of how each rbox surface ships. Referenced from `CLAUDE.md`
 The `production` branch already exists on origin. Promotions are deliberately
 explicit; do not commit directly to it or let it diverge from `main`.
 
-## API worker (`apps/api`) — Cloudflare Workers Builds (git integration)
+## API worker (`apps/api`) — GitHub Actions (production)
 
-Deploys are handled by **Cloudflare's Workers Builds git integration**
-(connected in the Cloudflare dash; configured by the founder), NOT GitHub
-Actions — the old `deploy-api.yml` was removed 2026-07-03.
+`.github/workflows/deploy-api.yml` deploys production on pushes to
+`production` touching `apps/api/**` (or the workflow itself), with a manual
+dispatch option restricted to the `production` ref. It first runs
+`bun run typecheck` and `bun run test:api`. Only after that gate passes does it
+run, in order from `apps/api`:
 
-Workers Builds config (dash-only; production-branch change founder-applied):
+1. `npx wrangler d1 migrations apply rbox-prod-db --remote --env production`
+2. `npx wrangler deploy --env production`
+3. `npx wrangler versions upload --env production`
+
+GitHub Actions stops on the first failing step, so migrations never run before
+tests pass, deployment never runs before migrations succeed, and version
+upload never runs before deployment succeeds. Migration filenames are
+append-only; never rename applied ones (`apps/api/migrations/README.md`).
+
+The former **production** Cloudflare Workers Builds git integration is
+**DISCONNECTED** in the Cloudflare dashboard by the founder. It must remain
+disconnected so one promotion cannot race or duplicate the GitHub workflow.
+
+## API worker (`apps/api`) — Cloudflare Workers Builds (DEV)
+
+The DEV Workers Builds integration remains connected in the Cloudflare
+dashboard and watches `main`. Every merge to `main` automatically deploys DEV,
+using this founder-managed configuration:
 
 | Setting | Value |
 |---|---|
-| Root directory | `apps/api` |
-| Build watch paths | `apps/api/**` |
-| Production branch | `production` |
-| Build command | `npx wrangler d1 migrations apply rbox-prod-db --remote --env production` |
-| Deploy command | `npx wrangler deploy --env production` |
-| Version command | `npx wrangler versions upload --env production` |
+| Root directory | `./apps/api` |
+| Watched branch | `main` |
+| Build command | `npx wrangler d1 migrations apply rbox-dev-db --remote` |
+| Deploy command | `npx wrangler deploy` |
+| Version command | `npx wrangler versions upload` |
 
-Consequences:
-
-- **Prod D1 migrations auto-apply only when a promotion to `production`
-  touches `apps/api/**`** — new migration files ship as part of that promotion.
-  Migration filenames are append-only; never rename applied ones
-  (`apps/api/migrations/README.md`).
-- The **dev DB (`rbox-dev-db`) has no such hook** — apply dev migrations
-  manually: `cd apps/api && npx wrangler d1 migrations apply rbox-dev-db --remote`.
-- **Workers Builds runs no tests** — PR CI (`ci.yml`: typecheck + full test
-  suites) and dev verification must succeed before promotion.
+Workers Builds runs no tests. PR CI remains the pre-merge gate, and the
+production workflow repeats typecheck plus the API Worker suite before any
+production mutation.
 
 ## Web dashboard (`apps/web`) — GitHub Actions
 
@@ -87,8 +99,8 @@ curl --fail --silent --show-error --request POST "$RBOX_HOME_DEPLOY_HOOK" >/dev/
 
 ## Secrets (GitHub repo)
 
-- `CLOUDFLARE_DEPLOY_TOKEN` — Workers Scripts:Edit + Cloudflare Pages:Edit
-  (+ Account:Read); used by `deploy-web.yml`.
+- `CLOUDFLARE_DEPLOY_TOKEN` — Workers Scripts:Edit + D1:Edit + Cloudflare
+  Pages:Edit (+ Account:Read); used by `deploy-api.yml` and `deploy-web.yml`.
 - `CLOUDFLARE_API_TOKEN` — R2-only; used by `release.yml`.
 - `RBOX_HOME_DEPLOY_HOOK` — secret Cloudflare Pages deploy-hook URL for the
   `rbox-home` `main` branch; used by `release.yml` after changelog publication.
@@ -97,16 +109,17 @@ curl --fail --silent --show-error --request POST "$RBOX_HOME_DEPLOY_HOOK" >/dev/
 
 ## Dev-first rule
 
-Before promoting `main` to `production`, deploy worker changes to **dev** and
-verify them:
-`cd apps/api && npx wrangler deploy` → `rbox-dev-api`. Run the dashboard
-locally against the dev worker (`cd apps/web && npm run dev` uses
+Every merge to `main` automatically runs the DEV Workers Builds migration,
+deploy, and version commands above. Before promoting `main` to `production`,
+wait for that DEV deployment and verify `rbox-dev-api`. Run the dashboard
+locally against it (`cd apps/web && npm run dev` uses
 `.env.development` → `rbox-dev-api.brian-via.workers.dev` + dev Clerk
 `cosmic-phoenix-51`). **Never point local UI builds at the prod API** —
 `npm run build` bakes in prod + `pk_live` and is only for the Pages deploy.
 When the candidate is verified and CI is green, promote it explicitly with
-`git push origin main:production`; production deploys and prod D1 migration
-application happen from that branch update, not from the merge to `main`.
+`git push origin main:production`; the test-gated production migration,
+deployment, and version upload happen from that branch update, not from the
+merge to `main`.
 
 `rbox-admin` may adopt this integration/deployed-branch split in the future;
 it is not part of the current pipeline change.
