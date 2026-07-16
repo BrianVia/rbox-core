@@ -120,9 +120,9 @@ keeps its documented substring defense (its JSON shape is unstable). `rigVolumes
 
 Scenario code, `Device`, `resetGuests`, run-artifact layout, prod-refusal, network naming
 (`rig-net` — `docker network create` is drop-in), sequential FAST_SUITE execution, the
-mount-source worktree-identity recreation logic, and the `rig down` before `up` rule after
-image/create-arg changes (now ALSO after `--runner` changes; enforced by the hash change
-above rather than operator memory).
+mount-source worktree-identity recreation logic, and the `rig down` before `up` rule becomes UNNECESSARY for
+create-arg changes (the spec label recreates automatically); runner switches need nothing —
+each runtime's containers live in its own namespace.
 
 ## Tests
 
