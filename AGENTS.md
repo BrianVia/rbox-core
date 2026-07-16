@@ -35,9 +35,11 @@ line in the same PR.**
 **How every surface ships (API worker / web dashboard / CLI binaries), the
 Workers Builds dash config, prod-migration auto-apply, secrets, and the
 dev-first rule live in `docs/DEPLOYMENTS.md` — read it before deploying or
-merging anything that touches `apps/api/**`.** Key trap: a merge to `main`
-ships prod automatically, and prod D1 migrations auto-apply as part of the
-Workers Builds build command.
+promoting anything that touches `apps/api/**`.** `main` deploys DEV through
+Workers Builds but no production surface. After dev verification and green CI,
+explicitly fast-forward `main` to the deployed `production` branch. The
+test-gated `deploy-api.yml` workflow applies prod D1 migrations before the
+production deploy during that promotion.
 
 **Support diagnostics:** `rbox doctor` / opt-in report upload (`POST /v1/diagnostics`), incl. how to retrieve reports from D1+R2 — see `docs/diagnostics.md`.
 

@@ -281,7 +281,8 @@ Rollout order:
 5. Keep both kill switches for at least one stable CLI/API release.
 
 No merge touching `apps/api/**` proceeds without the dev-first deployment and
-fleet validation in `docs/DEPLOYMENTS.md`; merge to `main` ships production.
+fleet validation in `docs/DEPLOYMENTS.md`; after merging to integration-only
+`main`, explicitly promote the verified candidate to `production`.
 
 ## Validation plan
 

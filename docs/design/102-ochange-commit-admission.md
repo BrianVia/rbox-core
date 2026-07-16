@@ -763,8 +763,9 @@ and rollback is a var flip, not a redeploy.
 2. **Soak in shadow** until §7 gate 7 (zero divergence) holds over `N_SOAK`/
    `T_SOAK`.
 3. **Flip dev to `enforce`**; confirm §7 gates 1–6, 8, 9 on dev. Soak.
-4. **Prod**: merge to `main` (auto-deploys) with the var **defaulting `off`**; flip
-   prod `shadow`, soak with the divergence gate on prod traffic, then `enforce`.
+4. **Prod**: merge to `main`, then explicitly promote the verified candidate to
+   `production` with the var **defaulting `off`**; flip prod `shadow`, soak with
+   the divergence gate on prod traffic, then `enforce`.
    The full-validation path stays in code as the permanent fallback (§3.5) after
    `enforce`.
 

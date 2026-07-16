@@ -369,7 +369,8 @@ reading `blobGet` end-to-end — the only non-D1 side effect it has is telemetry
 Validate on the **dev** worker `rbox-dev-api` — real Cloudflare D1/R2/DO, the only place the
 latency/contention this change targets actually shows up (local Miniflare has ~0 network latency
 and would hide it). The dev deploy is a **separate, manual** step — **do NOT push to `main` to
-test**: push-to-`main` auto-deploys *prod* (`deploy-api.yml`).
+test**: `main` is integration-only; production deploys from explicit
+`production` branch updates.
 
 ```bash
 # on a branch/worktree with the change (server + the client binary — this IS a protocol change):
@@ -382,7 +383,8 @@ bun build --compile --target=bun-darwin-arm64 \
 - **Compare base vs head back-to-back** so dev's shared-instance noise cancels.
 - **Success metric = the Target above:** read the §25 server split (`d1Ms`/`r2Ms`/`d1Calls` per
   `blob.get`) directly — the grant path should show `d1Calls=0` and `d1Ms≈0`.
-- Only merge to `main` (→ prod) once proven on dev **and** the client+server ship is coordinated.
+- Merge only after dev proof, then explicitly promote `main` to `production`
+  once the client+server ship is coordinated.
 
 ---
 

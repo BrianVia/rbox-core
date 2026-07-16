@@ -54,12 +54,14 @@ measured wins are logged in [`perf-improvements.md`](perf-improvements.md).
 The control plane is benchmarked against the **dev** worker `rbox-dev-api` — real
 Cloudflare D1/R2/DO. That's deliberate: the cost we optimize (per-blob D1 round-trips)
 is latency/contention-bound and only shows up on real D1; local Miniflare has ~0 network
-latency and hides it. **The dev deploy is a separate, manual step — never push to `main`
-to test a server change**: push-to-`main` auto-deploys *prod* (via Cloudflare Workers
-Builds' git integration).
+latency and hides it. Merges to `main` automatically deploy DEV through Workers
+Builds. **Wait for and verify that deployment before promoting server changes to
+`production`**; the production update runs the test-gated GitHub Actions deploy.
+An intentional pre-merge A/B benchmark is the exception: deploy each candidate
+manually to DEV so both measurements use the same remote environment.
 
 ```bash
-# on a branch/worktree with the server change (+ rebuild the CLI if it's a protocol change):
+# pre-merge benchmark only (+ rebuild the CLI if it's a protocol change):
 cd apps/api && bunx wrangler deploy                  # → rbox-dev-api ONLY (prod untouched)
 bun scripts/bench/push-sweep.ts --bin /tmp/rbox \
   --remote https://rbox-dev-api.brian-via.workers.dev --conc 8,16,32,64
@@ -67,7 +69,8 @@ bun scripts/bench/push-sweep.ts --bin /tmp/rbox \
 
 Compare base vs head **back-to-back** (deploy baseline → sweep → deploy change → sweep) so
 dev's shared-instance noise cancels — relative deltas hold even though absolute dev numbers
-wander vs prod. Only merge to `main` (→ prod) once it's proven on dev. For an isolated,
+wander vs prod. Merge proven changes to `main`, then explicitly promote the green candidate
+to `production`. For an isolated,
 repeatable target, add a dedicated `[env.bench]` (`rbox-bench-api` + throwaway
 `rbox-bench-db`/`-blobs`) and point `--remote` at it. Each server-side design doc
 (`docs/design/23`–`27`) carries this same loop with its own success metric.
