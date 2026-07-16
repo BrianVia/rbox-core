@@ -20,10 +20,13 @@ import { Device } from "./lib/device.js";
 import { resolveBootstrapSecret, resolvePlatformSecret } from "./lib/account.js";
 import { RunCapture } from "./lib/capture.js";
 import { renderReportMd } from "./lib/report.js";
+import { deleteImageHashRecord, readImageHashRecord, writeImageHashRecord } from "./lib/image-hash-records.js";
+import { formatBytes, trimRunDirectories, trimWorkloadCache } from "./lib/gc.js";
+import { assessDiskHeadroom, assessDockerInfo, assessRootlessPolicy, mayRunDockerDoctorProbes } from "./lib/doctor.js";
 import { waitForConvergence, waitForPath } from "./lib/waiters.js";
 import { ensureWorkloadDir, resolveWorkloadTar } from "./lib/workload.js";
 import { FAST_SUITE, getScenario, scenarioNames } from "./scenarios/index.js";
-import { finalizeReport, renderReportTable, type RigCtx, type Scenario, type ScenarioReport } from "./scenarios/types.js";
+import { finalizeReport, renderReportTable, skipReport, type RigCtx, type Scenario, type ScenarioReport } from "./scenarios/types.js";
 
 const REPO_ROOT = path.resolve(fileURLToPath(import.meta.url), "../../.."); // scripts/rig/rig.ts → repo root
 const RIG_DIR = path.join(REPO_ROOT, "scripts", "rig");
@@ -56,13 +59,14 @@ function parseArgs(argv: string[]): Args {
 const USAGE = `rig — design-56 test bench
 
 usage:
-  rig doctor                          host preflight (read-only)
+  rig doctor [--runner container|docker]  host/runtime preflight
   rig up [--api-url <url>]            build image + start rig-dev-a/b
   rig run <scenario> [--keep-account] run one scenario
   rig run all                         run the FAST suite (fresh account each; exit 1 if any FAIL)
   rig run conductor-initial-sync [--workload-tar <path>]   real-workload scale (explicit-only)
   rig watch [--api-url <url>]          live interleaved tail: [A]/[B] guests + [srv] wrangler
   rig down [--all]                    tear down containers + network (--all: +image +volumes)
+  rig gc                              scoped rig artifact + cache reclamation
 
 scenarios: ${scenarioNames().join(", ")}
 suite:     ${FAST_SUITE.join(", ")}
@@ -78,20 +82,12 @@ function currentImageHash(): string {
   });
 }
 
-function storedImageHash(): string | undefined {
-  try {
-    return fs.readFileSync(HASH_FILE, "utf8").trim();
-  } catch {
-    return undefined;
-  }
-}
-
-async function ensureImage(): Promise<void> {
+async function ensureImage(): Promise<string> {
   const want = currentImageHash();
   const present = await C.imageExists(NAMES.image);
-  if (present && storedImageHash() === want) {
+  if (present && readImageHashRecord(HASH_FILE, C.runnerName()) === want) {
     console.log(`image ${NAMES.image} present + current (${want})`);
-    return;
+    return want;
   }
   console.log(`building ${NAMES.image} (${present ? "stale" : "missing"} → ${want})…`);
   await C.buildImage({
@@ -100,9 +96,9 @@ async function ensureImage(): Promise<void> {
     contextDir: REPO_ROOT,
     labels: { "rig.hash": want },
   });
-  fs.mkdirSync(RUNS_DIR, { recursive: true });
-  fs.writeFileSync(HASH_FILE, want);
+  writeImageHashRecord(HASH_FILE, C.runnerName(), want);
   console.log(`built ${NAMES.image}`);
+  return want;
 }
 
 // ── up ──────────────────────────────────────────────────────────────────────────
@@ -110,15 +106,11 @@ async function ensureImage(): Promise<void> {
 /** Idempotent: build if stale, create the network + both containers if absent,
  *  (re)start them. Re-running with everything present just reports state. */
 async function ensureUp(apiUrl: string): Promise<void> {
-  const status = await C.systemStatus();
-  if (!status.healthy) {
-    console.log("container system not running → `container system start`…");
-    await C.systemStart();
-    const recheck = await C.systemStatus();
-    if (!recheck.healthy) throw new Error(`container system unhealthy after start:\n${recheck.raw}`);
-  }
-
-  await ensureImage();
+  await C.ensureRuntimeReady();
+  const trimmed = trimRunDirectories(RUNS_DIR);
+  if (trimmed.entries) console.log(`trimmed ${trimmed.entries} old rig runs (${formatBytes(trimmed.bytes)})`);
+  const currentHash = await ensureImage();
+  await C.assessRuntimeResourcePolicy(NAMES.image);
 
   if (!(await C.networkExists(NAMES.network))) {
     console.log(`creating network ${NAMES.network}`);
@@ -130,21 +122,31 @@ async function ensureUp(apiUrl: string): Promise<void> {
     { source: path.join(REPO_ROOT, "scripts"), target: GUEST.scriptsMount, readonly: true },
   ];
   for (const name of [NAMES.a, NAMES.b]) {
+    const spec: C.CreateSpec = { name, image: NAMES.image, imageHash: currentHash, network: NAMES.network, cpus: DEV_CPUS, memory: DEV_MEMORY, mounts, env: { RBOX_API: apiUrl } };
     let exists = await C.containerExists(name);
     if (exists && !(await C.containerHasMounts(name, mounts))) {
       console.log(`${name} belongs to another checkout (stale bind mounts) → recreating`);
       await C.deleteContainer(name);
       exists = false;
     }
+    if (exists && !(await C.containerHasSpec(name, spec))) {
+      console.log(`${name} create specification changed → recreating`);
+      await C.deleteContainer(name);
+      exists = false;
+    }
     if (!exists) {
       console.log(`creating ${name}`);
-      // Explicit tini PID 1: Apple `container` does not honor the image ENTRYPOINT,
-      // and a bare sleep-infinity PID 1 never reaps orphans — dead daemons linger as
-      // zombies that still pass pid-liveness lock probes and wedge every later sync.
-      await C.createContainer({ name, image: NAMES.image, network: NAMES.network, cpus: DEV_CPUS, memory: DEV_MEMORY, mounts, env: { RBOX_API: apiUrl }, cmd: ["/usr/bin/tini", "--", "sleep", "infinity"] });
+      await C.createContainer(spec);
     }
     await C.startContainer(name);
     console.log(`${name} up`);
+  }
+  // Rebuild retags the old image, but Docker cannot remove that now-dangling ID
+  // until every container referencing it has been recreated by the spec guard.
+  // Sweep on every up, not only the rebuilding invocation, so a transient failed
+  // deletion remains discoverable and is retried next time.
+  for (const dangling of await C.removeDanglingRigImages()) {
+    console.log(`removed dangling rig image ${dangling.id} (${dangling.size})`);
   }
 }
 
@@ -240,7 +242,9 @@ async function executeScenario(
   capture.start();
 
   let report: ScenarioReport;
-  try {
+  if (C.runtimeMarkers().includes("rootless-unvalidated") && scenario.name === "daemon-idle-cpu") {
+    report = skipReport(scenario.name, "resource-budget scenario skipped: rootless-unvalidated");
+  } else try {
     report = await scenario.run(ctx);
   } catch (e) {
     // A scenario should catch its own step errors, but never let an escape crash the
@@ -250,7 +254,8 @@ async function executeScenario(
     report = finalizeReport({ scenario: scenario.name, startedAt: now, finishedAt: now, steps: [{ name: "run", ok: false, ms: 0, detail: String(e) }], assertions: [] });
   }
 
-  fs.writeFileSync(path.join(runDir, "report.json"), JSON.stringify(report, null, 2));
+  const persistedReport = { ...report, runner: C.runnerName(), ...(C.runtimeMarkers().length ? { markers: [...C.runtimeMarkers()] } : {}) };
+  fs.writeFileSync(path.join(runDir, "report.json"), JSON.stringify(persistedReport, null, 2));
 
   let captureSummary;
   try {
@@ -259,8 +264,10 @@ async function executeScenario(
     // finish() is already best-effort internally; this only guards a truly unexpected
     // escape so report rendering still happens.
     log(`capture.finish() error (non-fatal): ${e instanceof Error ? e.message : String(e)}`);
-    captureSummary = { statsA: { skipped: "capture aborted" }, statsB: { skipped: "capture aborted" }, tail: { skipped: "capture aborted" }, ae: { skipped: "capture aborted" }, artifacts: [] as string[] };
+    captureSummary = { runner: C.runnerName(), markers: [...C.runtimeMarkers()], statsA: { skipped: "capture aborted" }, statsB: { skipped: "capture aborted" }, tail: { skipped: "capture aborted" }, ae: { skipped: "capture aborted" }, artifacts: [] as string[] };
   }
+
+  captureSummary.markers = [...C.runtimeMarkers()];
 
   fs.writeFileSync(path.join(runDir, "report.md"), renderReportMd(report, captureSummary));
 
@@ -344,6 +351,7 @@ async function prepareConductorWorkload(apiUrl: string, flags: Record<string, st
   await C.createContainer({
     name: NAMES.a,
     image: NAMES.image,
+    imageHash: currentImageHash(),
     network: NAMES.network,
     cpus: DEV_CPUS,
     memory: DEV_MEMORY,
@@ -353,7 +361,6 @@ async function prepareConductorWorkload(apiUrl: string, flags: Record<string, st
       { source: staged.dir, target: GUEST.workloadMount, readonly: true },
     ],
     env: { RBOX_API: apiUrl },
-    cmd: ["/usr/bin/tini", "--", "sleep", "infinity"],
   });
   await C.startContainer(NAMES.a);
 }
@@ -369,14 +376,35 @@ async function down(all: boolean): Promise<void> {
   if (await C.networkDelete(NAMES.network)) removed.push(`network ${NAMES.network}`);
   if (all) {
     if (await C.imageDelete(NAMES.image)) removed.push(`image ${NAMES.image}`);
-    for (const v of await C.rigVolumes()) if (await C.volumeDelete(v)) removed.push(`volume ${v}`);
+    for (const volume of await C.listRigVolumes()) {
+      if (await C.volumeDelete(volume.name)) removed.push(`volume ${volume.name}`);
+    }
+    for (const image of await C.rigDanglingImages()) if (await C.imageDelete(image.id)) removed.push(`dangling image ${image.id} (${image.size})`);
     try {
-      fs.rmSync(HASH_FILE, { force: true });
+      deleteImageHashRecord(HASH_FILE, C.runnerName());
     } catch {
       /* best-effort */
     }
   }
   console.log(removed.length ? `removed:\n  ${removed.join("\n  ")}` : "nothing to remove (already clean)");
+}
+
+async function gc(): Promise<void> {
+  await C.ensureRuntimeReady();
+  const images = await C.rigDanglingImages();
+  let removedImages = 0;
+  const reclaimedImageSizes: string[] = [];
+  for (const image of images) if (await C.imageDelete(image.id)) { removedImages++; reclaimedImageSizes.push(image.size); }
+  const volumes = await C.listRigVolumes();
+  let removedVolumes = 0;
+  const reclaimedVolumeSizes: string[] = [];
+  for (const volume of volumes) if (await C.volumeDelete(volume.name)) { removedVolumes++; reclaimedVolumeSizes.push(volume.size); }
+  const runs = trimRunDirectories(RUNS_DIR);
+  const cache = trimWorkloadCache(path.join(os.homedir(), ".cache", "rbox-rig", "workloads"));
+  console.log(`rig gc: ${removedImages} dangling images (${reclaimedImageSizes.join(", ") || "0 B"})`);
+  console.log(`rig gc: ${removedVolumes} rig volumes (${reclaimedVolumeSizes.join(", ") || "0 B"})`);
+  console.log(`rig gc: ${runs.entries} old runs (${formatBytes(runs.bytes)})`);
+  console.log(`rig gc: ${cache.entries} workload-cache entries (${formatBytes(cache.bytes)})`);
 }
 
 // ── watch ─────────────────────────────────────────────────────────────────────
@@ -389,8 +417,8 @@ async function watch(apiUrl: string): Promise<number> {
   const handles: C.StreamHandle[] = [];
   const emit = (prefix: string) => (line: string) => console.log(`${prefix} ${line}`);
 
-  handles.push(C.spawnStream(["container", "logs", "--follow", NAMES.a], { onStdout: emit("[A]"), onStderr: emit("[A]") }));
-  handles.push(C.spawnStream(["container", "logs", "--follow", NAMES.b], { onStdout: emit("[B]"), onStderr: emit("[B]") }));
+  handles.push(C.streamContainerLogs(NAMES.a, { onStdout: emit("[A]"), onStderr: emit("[A]") }));
+  handles.push(C.streamContainerLogs(NAMES.b, { onStdout: emit("[B]"), onStderr: emit("[B]") }));
   handles.push(
     C.spawnStream(["bunx", "wrangler", "tail", "rbox-dev-api", "--format", "pretty"], {
       cwd: path.join(REPO_ROOT, "apps", "api"),
@@ -432,26 +460,81 @@ async function doctor(apiUrl: string): Promise<number> {
   const add = (label: string, ok: boolean, detail: string, fix?: string) => checks.push({ label, ok, detail, fix });
   const advise = (label: string, ok: boolean, detail: string) => checks.push({ label, ok, detail, advisory: true });
 
-  // macOS >= 26
-  try {
-    const ver = (await C.spawnHost(["sw_vers", "-productVersion"], { allowFail: true })).stdout.trim();
-    const major = Number(ver.split(".")[0]);
-    add("macOS >= 26", Number.isFinite(major) && major >= 26, ver || "unknown", "upgrade macOS (container needs macOS 26+ for container-to-container networking)");
-  } catch {
-    add("macOS >= 26", false, "sw_vers failed");
+  if (C.runnerName() === "apple-container") {
+    try {
+      const ver = (await C.spawnHost(["sw_vers", "-productVersion"], { allowFail: true })).stdout.trim();
+      const major = Number(ver.split(".")[0]);
+      add("macOS >= 26", Number.isFinite(major) && major >= 26, ver || "unknown", "upgrade macOS (container needs macOS 26+ for container-to-container networking)");
+    } catch { add("macOS >= 26", false, "sw_vers failed"); }
+    const arch = (await C.spawnHost(["uname", "-m"], { allowFail: true })).stdout.trim();
+    add("arch arm64", arch === "arm64", arch || "unknown", "the rig targets arm64 (Apple silicon) guests");
+    const ver = await C.version();
+    add("container CLI present", ver.length > 0, ver || "not found", "brew install container   # Apple container runtime");
+    const sys = await C.systemStatus();
+    add("container system running", sys.healthy, sys.healthy ? "healthy" : sys.raw || "not running", "container system start");
+    const cacheDir = path.join(os.homedir(), ".cache", "rbox-rig", "workloads");
+    fs.mkdirSync(RUNS_DIR, { recursive: true }); fs.mkdirSync(cacheDir, { recursive: true });
+    const disk = await C.spawnHost(["df", "-Pk", RUNS_DIR, cacheDir], { allowFail: true });
+    const diskAssessment = assessDiskHeadroom(disk.exitCode === 0 ? disk.stdout : (disk.stderr || disk.stdout), disk.exitCode);
+    add("runs/cache disk headroom", diskAssessment.ok, diskAssessment.detail, "run `bun run rig gc`");
+  } else {
+    let dockerLocal = false;
+    try {
+      const endpoint = await C.dockerEndpoint();
+      dockerLocal = mayRunDockerDoctorProbes(endpoint);
+      add("Docker context is local", dockerLocal, endpoint || "unknown", "select a local unix-socket Docker context; remote daemons cannot resolve checkout bind paths");
+    } catch (e) { add("Docker context is local", false, e instanceof Error ? e.message : String(e)); }
+    let info: C.DockerInfo | undefined;
+    let dockerInfoError: string | undefined;
+    let dockerDiskOk = false;
+    try {
+      info = await C.dockerInfo();
+      const capability = assessDockerInfo(info);
+      add("Docker server capabilities", capability.ok, capability.detail, "enable Docker memory and CPU quota support");
+    } catch (e) {
+      dockerInfoError = e instanceof Error ? e.message : String(e);
+      add("Docker server capabilities", false, dockerInfoError, "start Docker and check local socket permissions");
+    }
+    if (dockerLocal && info && typeof info.DockerRootDir === "string" && info.DockerRootDir !== "") {
+      const cacheDir = path.join(os.homedir(), ".cache", "rbox-rig", "workloads");
+      fs.mkdirSync(RUNS_DIR, { recursive: true }); fs.mkdirSync(cacheDir, { recursive: true });
+      const disk = await C.spawnHost(["df", "-Pk", info.DockerRootDir, RUNS_DIR, cacheDir], { allowFail: true });
+      const diskAssessment = assessDiskHeadroom(disk.exitCode === 0 ? disk.stdout : (disk.stderr || disk.stdout), disk.exitCode);
+      dockerDiskOk = diskAssessment.ok;
+      add("Docker/runs/cache disk headroom", diskAssessment.ok, diskAssessment.detail,
+        "run `bun run rig gc`; if Docker build cache dominates, inspect it and choose `docker builder prune` manually");
+      advise("Docker builder cache size", true, await C.dockerBuilderDiskUsage());
+    } else {
+      add("Docker/runs/cache disk space", false,
+        dockerLocal ? dockerInfoError ?? "DockerRootDir unavailable" : "refused for remote Docker context");
+    }
+    let dockerProbeOk = false;
+    try {
+      if (!dockerLocal) throw new Error("refused for remote Docker context");
+      if (!(await C.imageExists(NAMES.image))) {
+        if (!dockerDiskOk) throw new Error("probe image absent and disk-headroom gate failed; refusing to build");
+        const hash = currentImageHash();
+        console.log(`doctor: building scoped probe image ${NAMES.image} (${hash})…`);
+        const built = await C.ensureImagePresent({ tag: NAMES.image, dockerfile: path.join(RIG_DIR, "Dockerfile"), contextDir: REPO_ROOT, labels: { "rig.hash": hash } });
+        if (built) writeImageHashRecord(HASH_FILE, C.runnerName(), hash);
+      }
+      const probe = await C.runDockerDoctorProbe(REPO_ROOT);
+      dockerProbeOk = probe.exitCode === 0;
+      add("Docker bind/network probe", probe.exitCode === 0, probe.exitCode === 0 ? "read-only checkout bind + outbound DNS passed" : (probe.stderr || probe.stdout).trim(), "check bind policy and daemon networking, then re-run doctor");
+    } catch (e) { add("Docker bind/network probe", false, e instanceof Error ? e.message : String(e)); }
+    if (dockerLocal && info && C.dockerIsRootless(info)) {
+      let limitsProbeOk = false;
+      try {
+        await C.assessRuntimeResourcePolicy(NAMES.image);
+        limitsProbeOk = !C.runtimeMarkers().includes("rootless-unvalidated");
+      } catch { /* assessment below remains rootless-unvalidated */ }
+      const policy = assessRootlessPolicy(info, limitsProbeOk);
+      advise("rootless resource-limit policy", policy.ok, policy.detail);
+    } else if (dockerLocal && info) {
+      const policy = assessRootlessPolicy(info, dockerProbeOk);
+      advise("rootless resource-limit policy", policy.ok, policy.detail);
+    } else advise("rootless resource-limit policy", false, dockerLocal ? "docker info unavailable" : "refused for remote Docker context");
   }
-
-  // arm64
-  const arch = (await C.spawnHost(["uname", "-m"], { allowFail: true })).stdout.trim();
-  add("arch arm64", arch === "arm64", arch || "unknown", "the rig targets arm64 (Apple silicon) guests");
-
-  // container binary + version
-  const ver = await C.version();
-  add("container CLI present", ver.length > 0, ver || "not found", "brew install container   # Apple container runtime");
-
-  // container system healthy
-  const sys = await C.systemStatus();
-  add("container system running", sys.healthy, sys.healthy ? "healthy" : sys.raw || "not running", "container system start");
 
   // bun on host
   const bun = (await C.spawnHost(["bun", "--version"], { allowFail: true })).stdout.trim();
@@ -510,6 +593,8 @@ async function main(): Promise<number> {
     return cmd === undefined ? 2 : 0;
   }
 
+  C.configureRunner(flags.runner);
+
   // Prod-URL refusal happens inside resolveConfig, before any container is created.
   switch (cmd) {
     case "doctor":
@@ -531,6 +616,9 @@ async function main(): Promise<number> {
       return watch(resolveConfig(process.env, flags, REPO_ROOT).apiUrl);
     case "down":
       await down(flags.all === "true");
+      return 0;
+    case "gc":
+      await gc();
       return 0;
     default:
       console.error(`rig: unknown command ${JSON.stringify(cmd)}\n`);

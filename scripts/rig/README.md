@@ -4,7 +4,8 @@ Two ephemeral Linux devices, a throwaway account, real onboarding + convergence
 against the **dev** worker — so a change can be validated before it ships, on data
 that looks like a working machine, without risking one. This is the stability net
 that the 2026-07-01 mass-delete and the 2026-07-02 conflict storm were found *by
-bleeding on*. Full design: [`docs/design/56-test-bench.md`](../../docs/design/56-test-bench.md).
+bleeding on*. Full designs: [`docs/design/56-test-bench.md`](../../docs/design/56-test-bench.md)
+and [`docs/design/131-rig-runtime-backends.md`](../../docs/design/131-rig-runtime-backends.md).
 
 **P0 delivers:** `doctor` / `up` / `run onboard-smoke` / `down`, the device image,
 `source` CLI mode, and the `onboard-smoke` PR gate. Prod is refused before any
@@ -12,8 +13,9 @@ container starts; every resource the rig creates is namespaced `rig-*`.
 
 ## Requirements
 
-- macOS 26+ on Apple silicon (arm64) — container-to-container networking needs it.
-- [Apple `container`](https://github.com/apple/container) v1.0.0 (`brew install container`).
+- macOS 26+ on Apple silicon with [Apple `container`](https://github.com/apple/container)
+  v1.0.0, or Linux with a local Docker 24+ daemon. Remote Docker contexts are refused
+  because the daemon must resolve this checkout's bind paths.
 - `bun` on the host.
 - A dev bootstrap secret: env `RBOX_DEV_BOOTSTRAP`, or a line
   `RBOX_DEV_BOOTSTRAP_SECRET=<secret>` in `dev-keys.local.secret` at the repo root.
@@ -24,7 +26,9 @@ The secret file is gitignored; in a worktree the rig also probes the primary
 checkout. Secret values are never printed.
 
 Run `bun run rig doctor` first — it checks all of the above and prints fix-it
-commands. It never mutates anything.
+commands. On a clean Docker host it builds the scoped rig image, then creates and removes
+one namespaced transient container to prove read-only binds, resource limits, and daemon
+networking actually work.
 
 ## Usage
 
@@ -34,10 +38,16 @@ bun run rig up                  # build the device image + start rig-dev-a / rig
 bun run rig run onboard-smoke   # the PR gate: bootstrap → init → pair → join → push/pull → assert
 bun run rig down                # stop+delete containers + network
 bun run rig down --all          # also delete the rig-device image + rig-* volumes
+bun run rig gc                  # scoped dangling artifacts + old runs/workload cache
 ```
 
-Flags: `--api-url <url>` (overrides `RBOX_API`; prod is always refused),
+Flags: `--runner container|docker` (overrides `RBOX_RIG_RUNNER`, then the platform
+default), `--api-url <url>` (overrides `RBOX_API`; prod is always refused),
 `--keep-account` (skip the per-run `DELETE /v1/account` teardown), `--all` (see above).
+
+The rig labels Docker-owned resources `rig=1`; cleanup never invokes a global Docker
+prune. `up` retains the newest 30 run directories, and `gc` also enforces the workload
+50 GiB cache cap. Doctor hard-fails below 20 GiB free and reports Docker builder-cache usage.
 
 ### What `onboard-smoke` does
 
@@ -61,7 +71,7 @@ Flags: `--api-url <url>` (overrides `RBOX_API`; prod is always refused),
 Each run writes `scripts/rig/runs/<yyyymmdd-hhmmss>-<scenario>/` (gitignored):
 
 - `run.log` — every step + assertion, timestamped.
-- `report.json` — steps (with durations), assertions (pass/fail), scenario verdict.
+- `report.json` — runner, steps (with durations), assertions, and scenario verdict.
 
 Exit code: `0` PASS, `1` FAIL, `2` usage/unknown scenario.
 
@@ -69,7 +79,8 @@ Exit code: `0` PASS, `1` FAIL, `2` usage/unknown scenario.
 
 - `rig.ts` — entry; hand-rolled arg parse; `doctor` / `up` / `run` / `down`.
 - `lib/config.ts` — names/paths, `assertNotProd` (the prod rail), URL + image-hash resolvers. **Pure.**
-- `lib/container.ts` — the **only** module that spawns `container` (+ host probes for `doctor`).
+- `lib/container.ts` — the **only** module that spawns Apple `container` or Docker
+  (+ host probes for `doctor`); owns backend argv/parsing and runtime readiness.
 - `lib/device.ts` — a `Device` handle: `rbox` / `exec` / `readFile` / `writeFile` / `seedCorpus`.
 - `lib/convergence.ts` — in-guest `find`+`sha256sum` tree fingerprint; A-vs-B compare (excl `.rbox/`). Pure builders/parsers.
 - `lib/account.ts` — bootstrap-secret resolution (redacted) + host-side account teardown.

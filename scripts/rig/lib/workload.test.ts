@@ -27,9 +27,12 @@ test("ensureWorkloadDir: atomic staging — cache hit on 2nd call, .rbox strippe
     expect(fs.readFileSync(path.join(first.dir, "workspaces", "proj", "a.txt"), "utf8")).toBe("hello");
     expect(fs.existsSync(path.join(first.dir, "workspaces", ".rbox"))).toBe(false); // stripped
     expect(fs.readdirSync(cache).filter((e) => e.startsWith(".tmp-"))).toEqual([]); // orphan cleared
+    const old = new Date(1_000_000);
+    fs.utimesSync(first.dir, old, old);
     const second = await ensureWorkloadDir(tar, cache, () => {});
     expect(second.cached).toBe(true);
     expect(second.dir).toBe(first.dir);
+    expect(fs.statSync(first.dir).mtimeMs).toBeGreaterThan(old.getTime()); // cache hit refreshes LRU
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

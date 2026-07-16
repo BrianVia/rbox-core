@@ -70,14 +70,18 @@ export const daemonIdleCpu: Scenario = {
         `  BUDGETS (provisional): mean<${IDLE_BUDGETS.meanCpuPctMax}% peak<${IDLE_BUDGETS.peakCpuPctMax}% daemon-rss<${IDLE_BUDGETS.daemonPeakRssMbMax}MB`
       );
       const line = (label: string, x: IdleAssessment, rss: number | undefined) =>
-        `${label}: mean ${x.meanCpuPct.toFixed(2)}% · peak ${x.peakCpuPct.toFixed(2)}% · daemon rss ${rss?.toFixed(1) ?? "?"}MB (guest mem ${x.peakMemMB.toFixed(1)}MB, context) · ${x.samples} samples/${x.spanSeconds.toFixed(0)}s`;
+        `${label}: mean ${x.meanCpuPct.toFixed(2)}% · peak gate ${x.peakCpuStatistic} ${x.peakCpuPct.toFixed(2)}% (raw max ${x.rawMaxCpuPct.toFixed(2)}%) · daemon rss ${rss?.toFixed(1) ?? "?"}MB (guest mem ${x.peakMemMB.toFixed(1)}MB, context) · ${x.samples} samples/${x.spanSeconds.toFixed(0)}s`;
       ctx.log(`  ${line("rig-dev-a", a, rssA)}`);
       ctx.log(`  ${line("rig-dev-b", b, rssB)}`);
 
       for (const [label, x, rss] of [["A", a, rssA], ["B", b, rssB]] as const) {
         rec.assert(`[${label}] sufficient idle samples`, x.samples >= MIN_SOAK_SAMPLES, `${x.samples} samples`);
         rec.assert(`[${label}] mean CPU% < ${IDLE_BUDGETS.meanCpuPctMax}`, x.meanCpuPct < IDLE_BUDGETS.meanCpuPctMax, `${x.meanCpuPct.toFixed(2)}%`);
-        rec.assert(`[${label}] peak CPU% < ${IDLE_BUDGETS.peakCpuPctMax}`, x.peakCpuPct < IDLE_BUDGETS.peakCpuPctMax, `${x.peakCpuPct.toFixed(2)}%`);
+        rec.assert(
+          `[${label}] peak CPU% < ${IDLE_BUDGETS.peakCpuPctMax}`,
+          x.peakCpuPct < IDLE_BUDGETS.peakCpuPctMax,
+          `gate ${x.peakCpuStatistic} ${x.peakCpuPct.toFixed(2)}% (raw max ${x.rawMaxCpuPct.toFixed(2)}%)`
+        );
         rec.assert(
           `[${label}] daemon peak RSS < ${IDLE_BUDGETS.daemonPeakRssMbMax}MB`,
           rss !== undefined && rss < IDLE_BUDGETS.daemonPeakRssMbMax,

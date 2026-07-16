@@ -23,6 +23,7 @@ export function isSkipped<T>(v: Skippable<T>): v is { skipped: string } {
 }
 
 type Raw = Record<string, unknown>;
+export type CanonicalStatsSample = import("./container.js").StatsSample;
 
 /** First finite numeric value among the given keys (accepts numeric strings). */
 function num(o: Raw, ...keys: string[]): number | undefined {
@@ -48,19 +49,31 @@ export interface StatSummary {
  * but re-baselines; a single-sample series yields zero CPU (no interval to measure).
  * PURE.
  */
-export function summarizeStats(samples: Array<Raw & { ts?: unknown }>): StatSummary {
+export function summarizeStats(samples: Array<(Raw & { ts?: unknown }) | CanonicalStatsSample>): StatSummary {
   let peakMem = 0;
   let coreSeconds = 0;
   let peakPct = 0;
   let prevCpu: number | undefined;
   let prevWallUsec: number | undefined;
   for (const s of samples) {
-    const mem = num(s, "memoryUsageBytes", "memory_usage_bytes", "memoryUsage");
+    const raw = s as Raw;
+    const mem = "memBytes" in s && typeof s.memBytes === "number" ? s.memBytes : num(raw, "memoryUsageBytes", "memory_usage_bytes", "memoryUsage");
     if (mem !== undefined) peakMem = Math.max(peakMem, mem);
-    const cpu = num(s, "cpuUsageUsec", "cpu_usage_usec", "cpuUsage");
+    const canonicalCpu = "cpu" in s && s.cpu && typeof s.cpu === "object"
+      ? s.cpu as CanonicalStatsSample["cpu"]
+      : undefined;
+    const cpu = canonicalCpu?.kind === "cumulative-usec" ? canonicalCpu.usec : num(raw, "cpuUsageUsec", "cpu_usage_usec", "cpuUsage");
     const tsMs = Date.parse(String(s.ts));
     const wallUsec = Number.isFinite(tsMs) ? tsMs * 1000 : undefined;
-    if (cpu !== undefined && wallUsec !== undefined) {
+    if (canonicalCpu?.kind === "instant-percent" && wallUsec !== undefined) {
+      peakPct = Math.max(peakPct, canonicalCpu.pct);
+      if (prevWallUsec !== undefined) {
+        const dWall = wallUsec - prevWallUsec;
+        if (dWall > 0) coreSeconds += (canonicalCpu.pct / 100) * (dWall / 1e6);
+      }
+      prevCpu = undefined;
+      prevWallUsec = wallUsec;
+    } else if (cpu !== undefined && wallUsec !== undefined) {
       if (prevCpu !== undefined && prevWallUsec !== undefined) {
         const dCpu = cpu - prevCpu;
         const dWall = wallUsec - prevWallUsec;
@@ -229,6 +242,8 @@ export function summarizeServerMetrics(rows: AeRow[]): ServerMetricsSummary {
 // ── capture summary (consumed by report rendering) ───────────────────────────
 
 export interface CaptureSummary {
+  runner: C.RunnerName;
+  markers?: string[];
   statsA: Skippable<StatSummary>;
   statsB: Skippable<StatSummary>;
   tail: Skippable<TailSummary>;
@@ -303,23 +318,20 @@ export class RunCapture {
   }
 
   private async sampleStatsOnce(): Promise<void> {
-    const ts = new Date().toISOString();
     try {
-      const raw = await C.containerStats([this.deps.names.a, this.deps.names.b]);
-      const list = (Array.isArray(raw) ? raw : [raw]).filter((o): o is Raw => typeof o === "object" && o !== null);
-      this.appendStatSample("a", this.deps.names.a, list, ts, 0);
-      this.appendStatSample("b", this.deps.names.b, list, ts, 1);
+      const samples = await C.containerStats([this.deps.names.a, this.deps.names.b]);
+      this.appendStatSample("a", this.deps.names.a, samples);
+      this.appendStatSample("b", this.deps.names.b, samples);
     } catch (e) {
       if (!this.statsSkipped) this.statsSkipped = msg(e);
     }
   }
 
-  /** Append the object matching `name` (or positional fallback) to stats-<x>.jsonl. */
-  private appendStatSample(label: "a" | "b", name: string, list: Raw[], ts: string, positional: number): void {
-    let match = list.find((o) => JSON.stringify(o).includes(name));
-    if (!match && list.length === 2) match = list[positional];
+  /** Append the canonical object whose typed name exactly matches the device. */
+  private appendStatSample(label: "a" | "b", name: string, list: C.StatsSample[]): void {
+    const match = list.find((o) => o.name === name);
     if (!match) return;
-    fs.appendFileSync(this.p(`stats-${label}.jsonl`), JSON.stringify({ ts, ...match }) + "\n");
+    fs.appendFileSync(this.p(`stats-${label}.jsonl`), JSON.stringify(match) + "\n");
   }
 
   private async stopStatsSampler(): Promise<void> {
@@ -393,7 +405,7 @@ export class RunCapture {
     const statsB = this.summarizeStatsFile("b");
     const tail = this.summarizeTailChannel();
     const artifacts = this.listArtifacts();
-    return { statsA, statsB, tail, ae, artifacts };
+    return { runner: C.runnerName(), statsA, statsB, tail, ae, artifacts };
   }
 
   private summarizeStatsFile(label: "a" | "b"): Skippable<StatSummary> {

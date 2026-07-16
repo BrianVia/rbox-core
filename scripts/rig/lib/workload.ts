@@ -64,6 +64,8 @@ export async function ensureWorkloadDir(tarPath: string, cacheRoot: string, log:
   const dir = path.join(cacheRoot, workloadDirName(sha8));
 
   if (fs.existsSync(dir)) {
+    const now = new Date();
+    fs.utimesSync(dir, now, now); // LRU touch for scoped `rig gc` cache eviction.
     log(`workload cache ${dir} present (cache hit) — reusing`);
     return { dir, sha8, cached: true };
   }
