@@ -34,6 +34,16 @@ export interface PRepairStateSnapshot {
   baseOid: string | null;
 }
 
+/** Facts observed inside the prepared P→Q ref transaction. Possession of this
+ * value means artifact validation and pin verification both completed while
+ * the live branch and reflog were locked. */
+export interface PRepairLockedObservation {
+  liveOid: string | null;
+  reflogSha256: string;
+  artifactsValidated: true;
+  keepRefsVerified: true;
+}
+
 export interface PRepairStatePort {
   readonly stateLockIdentity: string;
   read(): Promise<PRepairStateSnapshot>;
@@ -43,6 +53,7 @@ export interface PRepairStatePort {
     expected: PRepairStateSnapshot;
     nextBaseOid: string | null;
     receipt: PRepairReceipt;
+    lockedObservation: PRepairLockedObservation;
   }): Promise<"accepted" | "rejected">;
   /** Accepted-receipt/live-change row: generation-CAS only the receipt. */
   replaceReceipt?(input: { expected: PRepairStateSnapshot; prior: PRepairReceipt; next: PRepairReceipt }): Promise<"accepted" | "rejected">;
@@ -81,6 +92,24 @@ export type PRepairResumeResult =
   | { status: "restart"; receipt: PRepairReceipt; discard: "plan-attestations-snapshots" }
   | { status: "refresh-receipt" }
   | { status: "hold"; reason: string };
+
+/** Bound hostile ref/reflog churn while operation, reflog, and origin locks are
+ * held. Exhaustion returns before state composition or P/K retirement. */
+export const MAX_P_REPAIR_STABILIZATION_ATTEMPTS = 8;
+
+class PRepairRetryError extends Error {
+  constructor(readonly retryReason: Extract<PRepairAttemptResult, { status: "retry" }>["reason"], message: string) {
+    super(message);
+    this.name = "PRepairRetryError";
+  }
+}
+
+class PRepairObservationMovedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PRepairObservationMovedError";
+  }
+}
 
 export interface PRepairObservation {
   liveOid: string | null;
@@ -294,7 +323,7 @@ export async function runPRepairAttempt(input: PRepairAttemptInput): Promise<PRe
     });
 
     let stable: PRepairObservation | undefined;
-    for (;;) {
+    for (let attempt = 0; attempt < MAX_P_REPAIR_STABILIZATION_ATTEMPTS; attempt++) {
       const before = await observePRepair(input.repoDir, payload, provisional.ref);
       await pinRepairObjectsFirst(input.repoDir, before.skeep);
       await input.crashAt?.("after-pin-only");
@@ -302,6 +331,12 @@ export async function runPRepairAttempt(input: PRepairAttemptInput): Promise<PRe
       await input.crashAt?.("after-origin-fsync");
       const after = await observePRepair(input.repoDir, payload, provisional.ref);
       if (sameObservation(before, after)) { stable = after; break; }
+    }
+    if (!stable) {
+      return {
+        status: "hold",
+        reason: `P-repair observation did not stabilize after ${MAX_P_REPAIR_STABILIZATION_ATTEMPTS} attempts`,
+      };
     }
 
     const state = await input.state.read();
@@ -339,23 +374,34 @@ export async function runPRepairAttempt(input: PRepairAttemptInput): Promise<PRe
 
     await runPreparedUpdateRefTransaction(input.repoDir, finalLines(receipt, stable.skeep), async () => {
       await input.crashAt?.("after-ref-prepare");
-      if (!(await input.validateArtifacts())) throw new Error("P-repair artifact proof moved");
+      if (!(await input.validateArtifacts())) throw new PRepairRetryError("observation-moved", "P-repair artifact proof moved");
       const locked = await observePRepair(input.repoDir, payload, built.ref);
-      if (!sameObservation(stable!, locked) || !(await verifyRepairKeepRefs(input.repoDir, stable!.skeep))
-        || skeepHash(locked.skeep).oidsSha256 !== receipt.skeep.oidsSha256) throw new Error("P-repair observation moved");
+      const keepRefsVerified = await verifyRepairKeepRefs(input.repoDir, stable!.skeep);
+      if (!sameObservation(stable!, locked) || !keepRefsVerified
+        || skeepHash(locked.skeep).oidsSha256 !== receipt.skeep.oidsSha256) {
+        throw new PRepairRetryError("observation-moved", "P-repair observation moved");
+      }
       const accepted = await withProtocolLockClass("state", input.state.stateLockIdentity, () =>
-        input.state.cas({ expected: state, nextBaseOid: disposedBase(payload, state.baseOid), receipt }));
-      if (accepted !== "accepted") throw new Error("P-repair state CAS rejected");
+        input.state.cas({
+          expected: state,
+          nextBaseOid: disposedBase(payload, state.baseOid),
+          receipt,
+          lockedObservation: {
+            liveOid: locked.liveOid,
+            reflogSha256: hashBytes(locked.reflogBytes),
+            artifactsValidated: true,
+            keepRefsVerified: true,
+          },
+        }));
+      if (accepted !== "accepted") throw new PRepairRetryError("state-cas-rejected", "P-repair state CAS rejected");
       await input.crashAt?.("after-state-cas");
     }, { reflogMessage: `rbox p-repair ${payload.episode}` });
     await input.crashAt?.("after-ref-commit");
     await input.crashAt?.("before-restart");
     return { status: "restart", receipt, discard: "plan-attestations-snapshots" };
   } catch (error) {
-    const message = String(error);
-    if (message.includes("state CAS rejected")) return { status: "retry", reason: "state-cas-rejected" };
-    if (message.includes("observation moved") || message.includes("proof moved")) return { status: "retry", reason: "observation-moved" };
-    return { status: "hold", reason: message };
+    if (error instanceof PRepairRetryError) return { status: "retry", reason: error.retryReason };
+    return { status: "hold", reason: String(error) };
   }
 }
 
@@ -440,12 +486,12 @@ export async function resumeAcceptedPRepair(input: {
         nextOid: payload.nextOid,
       }, receipt.q.ref);
       if (!sameObservation(observed, locked) || !(await verifyRepairKeepRefs(input.repoDir, locked.skeep))) {
-        throw new Error("accepted receipt observation moved");
+        throw new PRepairObservationMovedError("accepted receipt observation moved");
       }
     }, { reflogMessage: `rbox p-repair ${receipt.episode}` });
     return { status: "restart", receipt, discard: "plan-attestations-snapshots" };
   } catch (error) {
-    if (String(error).includes("observation moved")) return { status: "refresh-receipt" };
+    if (error instanceof PRepairObservationMovedError) return { status: "refresh-receipt" };
     return { status: "hold", reason: String(error) };
   }
 }

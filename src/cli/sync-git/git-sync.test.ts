@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { pull, push, pushManifest, sync, type SyncDeps } from "../sync.js";
-import { loadState, repoRecordsForState, saveState, type SyncState, type WorkspaceConfig } from "../config.js";
+import { loadState, repoRecordsForState, saveStateUnsafeLegacyOrTest, type SyncState, type WorkspaceConfig } from "../config.js";
 import { BlobShaMismatchError, type CommitResult, type SyncRemote } from "../remote.js";
 import { buildIgnoreMatcher, captureGitState, gitIdentity, gitIdentityKey, gitPreflight, gitSectionBlobRefs, gitSectionNewestLink, MAX_PACK_CHAIN, scanManifest, setGitSpawnObserver, type BlobStore, type FileEntry, type GitSection, type Manifest } from "../../engine/index.js";
 import {
@@ -854,7 +854,7 @@ test("design 53: length and byte compaction triggers publish full bundles", asyn
   let sA = await st(rootA);
   const lenBase = sA.lastSyncedManifest.gitRepos!["rLen"]!;
   const maxLinks = Array.from({ length: MAX_PACK_CHAIN - 1 }, () => gitSectionNewestLink(lenBase));
-  await saveState(rootA, {
+  await saveStateUnsafeLegacyOrTest(rootA, {
     ...sA,
     lastSyncedManifest: { ...sA.lastSyncedManifest, manifestSchema: 3, gitRepos: { rLen: { ...lenBase, packChain: maxLinks } } },
   });
@@ -868,7 +868,7 @@ test("design 53: length and byte compaction triggers publish full bundles", asyn
   await push(rootA, cfgA, depsA);
   sA = await st(rootA);
   const byteBase = sA.lastSyncedManifest.gitRepos!["rByte"]!;
-  await saveState(rootA, {
+  await saveStateUnsafeLegacyOrTest(rootA, {
     ...sA,
     lastSyncedManifest: { ...sA.lastSyncedManifest, gitRepos: { ...sA.lastSyncedManifest.gitRepos, rByte: { ...byteBase, bundleCipherSize: 1 } } },
   });
@@ -913,7 +913,7 @@ test("design 53: missing receiver link defers, then heals when sender recompacts
 
   const sA = await st(rootA);
   const maxLinks = Array.from({ length: MAX_PACK_CHAIN - 1 }, () => gitSectionNewestLink(chained));
-  await saveState(rootA, {
+  await saveStateUnsafeLegacyOrTest(rootA, {
     ...sA,
     lastSyncedManifest: { ...sA.lastSyncedManifest, manifestSchema: 3, gitRepos: { r: { ...chained, packChain: maxLinks } } },
   });
@@ -1009,7 +1009,7 @@ test("design 68 V11: a skip-eligible pointer with an EXISTING captured base is C
   const wtSection = await captureGitState(W, remote.blobStore(), KEK);
   expect(wtSection!.refScope).toBe("scoped");
   const s0 = await st(rootA);
-  await saveState(rootA, { ...s0, lastSyncedManifest: { ...s0.lastSyncedManifest, manifestSchema: 2, gitRepos: { wt: wtSection! } } });
+  await saveStateUnsafeLegacyOrTest(rootA, { ...s0, lastSyncedManifest: { ...s0.lastSyncedManifest, manifestSchema: 2, gitRepos: { wt: wtSection! } } });
 
   await push(rootA, cfgA, depsA);
   const m = (await remote.latest()).manifest;
@@ -1033,7 +1033,7 @@ test("design 68 §3.3 + 422: a forced skip-eligible pointer recaptures instead o
   const wtSection = await captureGitState(W, remote.blobStore(), KEK);
   expect(wtSection!.refScope).toBe("scoped");
   const s0 = await st(rootA);
-  await saveState(rootA, { ...s0, lastSyncedManifest: { ...s0.lastSyncedManifest, manifestSchema: 2, gitRepos: { wt: wtSection! } } });
+  await saveStateUnsafeLegacyOrTest(rootA, { ...s0, lastSyncedManifest: { ...s0.lastSyncedManifest, manifestSchema: 2, gitRepos: { wt: wtSection! } } });
 
   remote.deleteBlob(wtSection!.bundleEncSha); // first attempt 422s on the carried pointer base
   await fs.writeFile(path.join(rootA, "note.txt"), "forces a commit\n");
@@ -1438,7 +1438,7 @@ test("remote absence while partial: absence supersedes pending+partial [v6] — 
     heldRefs: {},
     configApplied: true,
   };
-  await saveState(rootB, partialState);
+  await saveStateUnsafeLegacyOrTest(rootB, partialState);
   await fs.rm(lock);
   await fs.rm(a, { recursive: true, force: true });
   await push(rootA, cfgA, depsA); // A deletes the repo
@@ -1971,7 +1971,7 @@ test("gitDivergenceCount honors needsResolution suppression before preflight (co
   // identity equals the recorded conflict-time value, so status must read 0 —
   // and the suppression must be honored BEFORE preflight, matching the planner.
   const state = await st(rootA);
-  await saveState(rootA, { ...state, gitNeedsResolution: { proj1: gitIdentityKey(await gitIdentity(p1)) } });
+  await saveStateUnsafeLegacyOrTest(rootA, { ...state, gitNeedsResolution: { proj1: gitIdentityKey(await gitIdentity(p1)) } });
   expect(await gitDivergenceCount(rootA, cfgA, await st(rootA), matcher)).toBe(0);
 
   // The user touches the repo → identity leaves the checkpoint → republish is
@@ -2335,7 +2335,7 @@ test("design 83: trusted warm plan is zero-spawn and uses cached parentRel for p
   const { W } = await makeInTreeMainWithWorktree();
   const wtSection = (await captureGitState(W, remote.blobStore(), KEK))!;
   const s0 = await st(rootA);
-  await saveState(rootA, { ...s0, lastSyncedManifest: { ...s0.lastSyncedManifest, manifestSchema: 2, gitRepos: { wt: wtSection } } });
+  await saveStateUnsafeLegacyOrTest(rootA, { ...s0, lastSyncedManifest: { ...s0.lastSyncedManifest, manifestSchema: 2, gitRepos: { wt: wtSection } } });
   await push(rootA, cfgA, depsA);
 
   await fs.rm(divergenceCachePath(rootA), { force: true });

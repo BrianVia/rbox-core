@@ -116,6 +116,10 @@ describe("design 130 all-to-all authoring and the final boundary", () => {
     expect(exempt.sections.repo).toBe(pending);
     expect(JSON.stringify(exempt.sections.repo)).toBe(JSON.stringify(pending));
     expect(exempt.sections.repo?.refTombstones).toBeUndefined();
+    const clonedPending = structuredClone(pending);
+    const cloned = normalizeOutgoingGitSections({ repo: clonedPending }, { repo: pending }, { repo: advertised }, at(2));
+    expect(cloned.sections.repo).toBe(pending);
+    expect(cloned.sections.repo?.refTombstones).toBeUndefined();
     const resumed = normalizeOutgoingGitSections({ repo: pending }, {}, { repo: advertised }, at(2));
     expect(resumed.sections.repo).not.toBe(pending);
     expect(resumed.sections.repo?.refTombstones?.[ref]).toEqual([entry(1, 1, at(2))]);

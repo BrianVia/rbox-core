@@ -11,7 +11,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { filesFirstFlagEnabled, push, type SyncDeps } from "./sync.js";
-import { loadState, saveState, syncStreamId, type WorkspaceConfig } from "./config.js";
+import { loadState, saveStateUnsafeLegacyOrTest, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { BlobShaMismatchError, type CommitResult, type SyncRemote } from "./remote.js";
 import { PhaseReport, gitSectionBlobRefs, type BlobStore, type FileEntry, type Manifest } from "../engine/index.js";
 import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
@@ -204,7 +204,7 @@ test("flag ON but stream-mismatch (rebind, even nonzero persisted seq): git capt
   // Design 130, "Artifact lifecycle, reset, and diagnostics" forbids a
   // fence-free reset. Persist a capable DIFFERENT-stream lineage; loadState
   // transactionally replaces it with seq 0 and marks the result as a rebind.
-  await saveState(root, {
+  await saveStateUnsafeLegacyOrTest(root, {
     stream: "http://x::ws_OTHER::root",
     stateNonce: "a".repeat(32),
     stateRevision: 4,

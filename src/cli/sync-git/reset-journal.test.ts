@@ -26,7 +26,7 @@ import {
   type ResetJournalV1,
   type ResetZEntry,
 } from "../reset-journal.js";
-import { loadState, resetSyncState, saveState, type SyncState } from "../config.js";
+import { loadState, resetSyncState, saveStateUnsafeLegacyOrTest, type SyncState } from "../config.js";
 import { acquireWorkspaceSyncMutex, releaseWorkspaceSyncMutex } from "../sync-mutex.js";
 
 const exec = promisify(execFile);
@@ -259,7 +259,7 @@ describe("design 130 reset preflight holds", () => {
     const repo = path.join(root, "repo");
     await fs.mkdir(repo, { recursive: true });
     await git(repo, "init", "-q");
-    await saveState(root, {
+    await saveStateUnsafeLegacyOrTest(root, {
       ...oldState(),
       repoRecords: { repo: { repoGen: 1, sourceSeq: 1 } },
     });
@@ -322,7 +322,7 @@ describe("design 130 reset A/P lifecycle", () => {
     await fs.writeFile(path.join(repo, "tracked"), "next\n");
     await git(repo, "commit", "-qam", "next");
     const next = await git(repo, "rev-parse", "HEAD");
-    await saveState(root, {
+    await saveStateUnsafeLegacyOrTest(root, {
       ...oldState(),
       lastSyncedManifest: { generatedAt: "old", files: [], gitRepos: { repo: section(prior) } },
       repoRecords: { repo: { repoGen: 1, sourceSeq: 1, base: section(prior) } },

@@ -68,6 +68,9 @@ export interface SecondProofContext {
 export interface CommitCheckoutOptions<TIntended = unknown> {
   connectivityProof?: (repoDir: string, roots: readonly string[]) => Promise<boolean>;
   secondProof: (context: SecondProofContext) => Promise<boolean>;
+  /** Branch-switch compatibility phase: proof run after the post-HEAD ref
+   * transaction has prepared its locks and before it commits. */
+  postHeadSecondProof?: () => Promise<boolean>;
   journal?: { workspaceRoot: string; relPath: string; value: CheckoutJournal<TIntended> };
   crashAt?: (point: "after-connectivity-proof" | "after-prepare" | "after-index-lock" | "after-head-commit" | "after-ref-commit" | "before-index-publish" | "after-index-publish" | "mid-op-state") => void;
   /** Test seam for the real failure mode where Git dies after prepare: ok. */
@@ -722,6 +725,11 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
         const intent = opts.journal.value.expectedNew.preparedTransactions?.find((entry) => entry.id === "post-head");
         if (intent) await observePreparedLockTokens(intent);
         await updateCheckoutJournal(opts.journal.workspaceRoot, opts.journal.relPath, opts.journal.value);
+      }
+      if (opts.postHeadSecondProof && !(await opts.postHeadSecondProof())) {
+        await postHeadTx.abort();
+        postHeadTx = undefined;
+        throw new JournalArbitrationDefer("post-HEAD branch proof changed");
       }
       await postHeadTx.commit();
       postHeadTx = undefined;

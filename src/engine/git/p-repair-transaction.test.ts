@@ -6,7 +6,13 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { prepareBasePresentArtifact, readBasePresentArtifact } from "./base-artifacts.js";
 import { parseKeepPinOrigins, runUpdateRefTransaction } from "./keep-pins.js";
-import { inspectLockedPRepairReceipt, reflogObservation, resumeLockedAcceptedPRepair, runLockedPRepairAttempt } from "./p-repair-transaction.js";
+import {
+  inspectLockedPRepairReceipt,
+  MAX_P_REPAIR_STABILIZATION_ATTEMPTS,
+  reflogObservation,
+  resumeLockedAcceptedPRepair,
+  runLockedPRepairAttempt,
+} from "./p-repair-transaction.js";
 import { setProtocolLockTraceForTests, type ProtocolLockTraceEvent } from "./protocol-locks.js";
 
 const Z = "0".repeat(40);
@@ -69,6 +75,65 @@ test("§130 moved-P walk pins cumulative evidence, CASes BASE, creates Q, and re
     let baseOid: string | null = prior;
     let acceptedReceipt: unknown;
     let extended: string | undefined;
+
+    let stabilizationStateReads = 0;
+    let churns = 0;
+    const exhausted = await runLockedPRepairAttempt({
+      repoDir: repo,
+      p: read.artifact,
+      repairAt: "2026-07-16T12:00:00.000Z",
+      mismatches: { live: true, reflog: false, baseShape: false },
+      crashAt: async (point) => {
+        if (point === "after-origin-fsync") {
+          churns++;
+          await commit(`stabilization-churn-${churns}`);
+        }
+      },
+      validateArtifacts: async () => (await readBasePresentArtifact(repo, binding, "refs/heads/main")).status === "valid",
+      state: {
+        stateLockIdentity: path.join(tmp, "state.lock"),
+        read: async () => { stabilizationStateReads++; return { repoGen: 0, stateRevision: 0, incomingKey: "incoming", baseOid }; },
+        cas: async () => { throw new Error("state CAS must not run after stabilization exhaustion"); },
+      },
+    });
+    expect(exhausted).toEqual({
+      status: "hold",
+      reason: `P-repair observation did not stabilize after ${MAX_P_REPAIR_STABILIZATION_ATTEMPTS} attempts`,
+    });
+    expect(churns).toBe(MAX_P_REPAIR_STABILIZATION_ATTEMPTS);
+    expect(stabilizationStateReads).toBe(0);
+    expect(baseOid).toBe(prior);
+    expect(await git("rev-parse", "--verify", prepared.ref)).toBe(prepared.targetOid);
+    expect(await git("for-each-ref", "--format=%(refname)", `refs/rbox-recovery/base-present/v2/${binding.lineageHash}`)).toBe("");
+
+    const coincidentalAttemptMessage = await runLockedPRepairAttempt({
+      repoDir: repo,
+      p: read.artifact,
+      repairAt: "2026-07-16T12:00:00.000Z",
+      mismatches: { live: true, reflog: false, baseShape: false },
+      validateArtifacts: async () => { throw new Error("P-repair state CAS rejected in an unrelated validator"); },
+      state: {
+        stateLockIdentity: path.join(tmp, "state.lock"),
+        read: async () => ({ repoGen: 0, stateRevision: 0, incomingKey: "incoming", baseOid }),
+        cas: async () => "accepted",
+      },
+    });
+    expect(coincidentalAttemptMessage.status).toBe("hold");
+
+    const rejected = await runLockedPRepairAttempt({
+      repoDir: repo,
+      p: read.artifact,
+      repairAt: "2026-07-16T12:00:00.000Z",
+      mismatches: { live: true, reflog: false, baseShape: false },
+      validateArtifacts: async () => (await readBasePresentArtifact(repo, binding, "refs/heads/main")).status === "valid",
+      state: {
+        stateLockIdentity: path.join(tmp, "state.lock"),
+        read: async () => ({ repoGen: 0, stateRevision: 0, incomingKey: "incoming", baseOid }),
+        cas: async () => "rejected",
+      },
+    });
+    expect(rejected).toEqual({ status: "retry", reason: "state-cas-rejected" });
+
     const trace: ProtocolLockTraceEvent[] = [];
     setProtocolLockTraceForTests((event) => trace.push(event));
     const attempt = await runLockedPRepairAttempt({
@@ -92,6 +157,14 @@ test("§130 moved-P walk pins cumulative evidence, CASes BASE, creates Q, and re
     expect(await git("rev-parse", "--verify", prepared.ref)).toBe(prepared.targetOid);
     const durable = acceptedReceipt as Extract<typeof attempt, { status: "restart" }>["receipt"];
     await expect(git("rev-parse", "--verify", durable.q.ref)).rejects.toThrow();
+    setProtocolLockTraceForTests(undefined);
+    const coincidentalResumeMessage = await resumeLockedAcceptedPRepair({
+      repoDir: repo,
+      receipt: durable,
+      validateArtifacts: async () => { throw new Error("accepted receipt observation moved in an unrelated validator"); },
+    });
+    expect(coincidentalResumeMessage.status).toBe("hold");
+    setProtocolLockTraceForTests((event) => trace.push(event));
     const result = await resumeLockedAcceptedPRepair({
       repoDir: repo,
       receipt: durable,
@@ -113,7 +186,6 @@ test("§130 moved-P walk pins cumulative evidence, CASes BASE, creates Q, and re
     expect(trace.map((event) => `${event.action}:${event.class}`)).toEqual([
       "acquire:operation", "acquire:reflog", "acquire:origin",
       "acquire:git", "release:git",
-      "acquire:git", "release:git",
       "acquire:git", "acquire:state", "release:state", "release:git",
       "release:origin", "release:reflog", "release:operation",
       "acquire:operation", "acquire:reflog", "acquire:origin",
@@ -126,7 +198,7 @@ test("§130 moved-P walk pins cumulative evidence, CASes BASE, creates Q, and re
     setProtocolLockTraceForTests(undefined);
     await fs.rm(tmp, { recursive: true, force: true });
   }
-});
+}, 20_000);
 
 test.each([
   "after-pin-only",
@@ -136,7 +208,7 @@ test.each([
   "after-state-cas",
   "after-ref-commit",
   "before-restart",
-] as const)("§130 P-repair crash matrix: %s has only the reviewed durable shape", async (crashPoint) => {
+] as const)("§130 P-repair crash matrix: %s has only a protocol-valid durable shape", async (crashPoint) => {
   const exec = promisify(execFile);
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), `rbox-p-repair-${crashPoint}-`));
   const repo = path.join(tmp, "repo");

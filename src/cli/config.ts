@@ -20,6 +20,7 @@ import {
   carryRepoBaseProof,
   composeRepoBase,
   migrationRepoBaseProof,
+  recordOriginLineage,
   type BranchBaseOrigin,
   type RepoBaseProof,
   type SafeRefWitness,
@@ -451,7 +452,7 @@ function mapFromRecords<T>(records: Record<string, RepoRecord>, pick: (record: R
 
 export function stateFromRepoRecords(state: SyncState, records: Record<string, RepoRecord>): SyncState {
   const normalized: Record<string, RepoRecord> = Object.fromEntries(Object.entries(records).map(([relPath, record]) => {
-    const lineageHash = Object.values(record.branchBaseOrigins ?? {})[0]?.lineageHash ?? "legacy-untrusted";
+    const lineageHash = recordOriginLineage(record.branchBaseOrigins) ?? "legacy-untrusted";
     const proof = carryRepoBaseProof(lineageHash);
     const composed = composeRepoBase(
       { base: record.base, branchBaseOrigins: record.branchBaseOrigins },
@@ -733,9 +734,34 @@ export async function loadState(
   return state;
 }
 
-export async function saveState(root: string, state: SyncState): Promise<void> {
+function stateContainsGitPersistence(state: SyncState): boolean {
+  return Object.keys(state.lastSyncedManifest.gitRepos ?? {}).length > 0
+    || Object.keys(state.repoRecords ?? {}).length > 0
+    || Object.keys(state.gitPendingRemote ?? {}).length > 0
+    || Object.keys(state.gitReposRemoved ?? {}).length > 0
+    || Object.keys(state.gitNeedsResolution ?? {}).length > 0
+    || Object.keys(state.gitDeferrals ?? {}).length > 0
+    || Object.keys(state.gitPartial ?? {}).length > 0;
+}
+
+async function writeWholeStateUnsafe(root: string, state: SyncState): Promise<void> {
   await fs.mkdir(path.join(root, RBOX_DIR), { recursive: true });
   await writeFileAtomic(statePath(root), JSON.stringify(state, null, 2));
+}
+
+/** Fresh, non-Git initialization only. Git BASE and every repository sidecar are
+ * generation-CAS state and must be persisted with applyStateSavePacket(). */
+export async function saveState(root: string, state: SyncState): Promise<void> {
+  if (stateContainsGitPersistence(state)) {
+    throw new Error("saveState refuses Git BASE or repository records; use the transactional state composer");
+  }
+  await writeWholeStateUnsafe(root, state);
+}
+
+/** Explicit compatibility/test escape hatch. Production calls are restricted by
+ * base-composer-structure.test.ts to the legacy fallback in sync-state.ts. */
+export async function saveStateUnsafeLegacyOrTest(root: string, state: SyncState): Promise<void> {
+  await writeWholeStateUnsafe(root, state);
 }
 
 /** Initialize the telemetry binding identity under the same lock as transactional state writes. */

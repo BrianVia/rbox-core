@@ -70,6 +70,8 @@ export interface ApplyBranchTransitionInput {
   afterOid: string | null;
   /** Prepared keep-pin commands which must commit atomically with A/P/K and R. */
   extraTransactionLines: readonly string[];
+  /** Complete reflog bytes observed while preparing displacement pins. */
+  expectedReflogFingerprint?: string;
 }
 
 export interface ApplyBranchTransitionResult {
@@ -81,6 +83,17 @@ export interface ApplyBranchTransitionResult {
   witness?:
     | { kind: "absent"; ref: string; priorOid: string; lineageHash: string; repositoryIdentityHash: string; artifactRef: string; artifactOid: string; source: "a" | "z" }
     | { kind: "present"; ref: string; priorOid: string | null; nextOid: string; lineageHash: string; repositoryIdentityHash: string; artifactRef: string; artifactOid: string; episode: string };
+  /** Opaque receipt facts returned only by the committed prepared transaction. */
+  lockedProof?: {
+    liveOid: string | null;
+    witness: NonNullable<ApplyBranchTransitionResult["witness"]>;
+    reflogEpisode?: string;
+    artifactsClear: boolean;
+    ownershipStable: boolean;
+    reflogStable: boolean;
+    currentRef: boolean;
+    siblingOwned: boolean;
+  };
 }
 
 export interface ApplyBranchTransitionAdapter {
@@ -512,6 +525,7 @@ export async function applyGitState(
         const oldOid = boundaryRefs[ref] ?? ZERO_OID;
         if (ref.startsWith("refs/heads/") && oldOid !== sha && opts.branchTransitions) {
           let extraTransactionLines: string[] = [];
+          let expectedReflogFingerprint: string | undefined;
           if (oldOid !== ZERO_OID) {
             const ff = await tipOwnedByIncoming(repoDir, oldOid, [sha]);
             if (ff.status === "indeterminate") {
@@ -532,6 +546,7 @@ export async function applyGitState(
                 continue;
               }
               extraTransactionLines = pins.transactionLines;
+              expectedReflogFingerprint = pins.reflogFingerprint;
             }
           }
           try {
@@ -541,6 +556,7 @@ export async function applyGitState(
               beforeOid: oldOid === ZERO_OID ? null : oldOid,
               afterOid: sha,
               extraTransactionLines,
+              ...(expectedReflogFingerprint ? { expectedReflogFingerprint } : {}),
             });
             committedBranchTransitions.push(committed);
             boundaryRefs[ref] = sha;
@@ -667,6 +683,7 @@ export async function applyGitState(
                 beforeOid: oldOid,
                 afterOid: null,
                 extraTransactionLines: pins.transactionLines,
+                expectedReflogFingerprint: pins.reflogFingerprint,
               });
               committedBranchTransitions.push(committed);
             } else {

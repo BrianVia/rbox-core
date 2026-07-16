@@ -18,6 +18,7 @@ import { runUpdateRefTransaction } from "../../engine/git/keep-pins.js";
 import {
   carryRepoBaseProof,
   composeRepoBase,
+  recordOriginLineage,
   type RepoBaseProof,
   type RepoBaseLockedProof,
 } from "./base-composer.js";
@@ -280,6 +281,8 @@ opts: {
     degradedMutex?: boolean;
     capabilityProbe?: CheckoutCapabilityProbe;
     crashAt?: (point: FollowCrashPoint) => void;
+    /** Test seam for a reflog-only move after pin enumeration. */
+    afterBranchPinsPrepared?: (ref: string) => void | Promise<void>;
     warningSink?: (message: string) => void;
   } = {}
 ): Promise<GitPullOutcome> {
@@ -599,7 +602,7 @@ opts: {
         delete applied[rel];
         glog(`git-sync removed ${rel} (remote deleted; local .git untouched)`);
       }
-      const retainedLineage = Object.values(records[rel]?.branchBaseOrigins ?? {})[0]?.lineageHash ?? "legacy-untrusted";
+      const retainedLineage = recordOriginLineage(records[rel]?.branchBaseOrigins) ?? "legacy-untrusted";
       repoProofs[rel] = carryRepoBaseProof(retainedLineage);
       if (dotGit) {
         // Resurrection guard [v2, B4]: the leftover's identity at removal. On a BUSY
@@ -795,6 +798,7 @@ opts: {
     const kek = cfg.kek!; // guaranteed by the fail-closed gate above
     const recordedPartial = records[rel]?.partial;
     let forcedHeldRefs: GitPartialApply["heldRefs"] | undefined;
+    const d2RejectedRefs = new Set<string>();
     let divergenceId = localId;
     if (recordedPartial && localId && pend && gitIncomingKey(pend) === recordedPartial.incomingKey) {
       if (await partialRefsStillMatch(repoDir, recordedPartial)) {
@@ -806,6 +810,7 @@ opts: {
             : recordedPartial,
         );
       } else {
+        for (const ref of Object.keys(recordedPartial.appliedRefs)) d2RejectedRefs.add(ref);
         forcedHeldRefs = Object.fromEntries(Object.keys(recordedPartial.appliedRefs).map((ref) => [ref, "local-commits" as const]));
         partial[rel] = null;
       }
@@ -903,7 +908,7 @@ opts: {
       // a pre-conflict safe-ref phase made physical progress.
       if (baseSec) applied[rel] = baseSec; else delete applied[rel];
       pending[rel] = remoteSec;
-      const retainedLineage = Object.values(records[rel]?.branchBaseOrigins ?? {})[0]?.lineageHash ?? "legacy-untrusted";
+      const retainedLineage = recordOriginLineage(records[rel]?.branchBaseOrigins) ?? "legacy-untrusted";
       repoProofs[rel] = carryRepoBaseProof(retainedLineage);
       partial[rel] = progress
         ? partialFrom({ ...progress, configApplied }, true)
@@ -944,6 +949,7 @@ opts: {
       let protocolResult = await prepareFollowerBranchProtocol({
         workspaceRoot: root, relPath: rel, state, ctx, record: records[rel], base: baseSec,
         incoming: remoteSec, liveRefs: await readAllRefs(repoDir),
+        ...(d2RejectedRefs.size ? { d2RejectedRefs } : {}),
       });
       if (protocolResult.status === "hold") {
         await defer(protocolResult.reason, "artifact");
@@ -1046,6 +1052,7 @@ opts: {
         protocolResult = await prepareFollowerBranchProtocol({
           workspaceRoot: root, relPath: rel, state, ctx, record: records[rel], base: baseSec,
           incoming: remoteSec, liveRefs: await readAllRefs(repoDir),
+          ...(d2RejectedRefs.size ? { d2RejectedRefs } : {}),
         });
         if (protocolResult.status === "hold") {
           await defer(protocolResult.reason, "artifact");
@@ -1057,16 +1064,7 @@ opts: {
         return { result: "deferred", commonDirGroup };
       }
       const proofFor = (progress: FollowProgress, checkoutComplete: boolean): RepoBaseProof => {
-        const branches: RepoBaseLockedProof["branches"] = Object.fromEntries(Object.entries(progress.branchWitnesses ?? {}).map(([ref, witness]) => [ref, {
-          liveOid: witness.kind === "present" ? witness.nextOid : null,
-          witness,
-          ...(witness.kind === "present" ? { reflogEpisode: witness.episode } : {}),
-          artifactsClear: true,
-          ownershipStable: true,
-          reflogStable: true,
-          currentRef: false,
-          siblingOwned: false,
-        }]));
+        const branches: RepoBaseLockedProof["branches"] = { ...(progress.branchLockedProofs ?? {}) };
         const safeRefs: RepoBaseLockedProof["safeRefs"] = Object.fromEntries(Object.entries(progress.safeRefWitnesses ?? {}).map(([ref, witness]) => [ref, {
           liveOid: witness.afterOid,
           witness,
@@ -1154,6 +1152,7 @@ opts: {
         crashAt: opts.crashAt,
         log: glog,
         forcedHeldRefs,
+        afterBranchPinsPrepared: opts.afterBranchPinsPrepared,
       });
       if (follow.derivedBaseIndexProjection) idxProj[rel] = follow.derivedBaseIndexProjection;
       if (follow.status === "legacy") return legacyConflict(follow.reason, follow);
@@ -1165,6 +1164,36 @@ opts: {
           setDeferral(rel, "apply", "conflict", incomingKey, await checkoutOf(repoDir));
           markCheckpointReproof(rel);
           return { result: "unchanged", commonDirGroup };
+        }
+        // Deferred checkout has historically kept serialized BASE unchanged even
+        // when earlier ref phases made physical progress. The sole exception is
+        // a crash-reconstructed owning A: it must consume its stale BASE member
+        // once so the §126 veto does not recur forever. Narrow the proof to those
+        // absences; do not accidentally publish unrelated pre-checkout progress.
+        const reconstructed = [...protocolResult.protocol.unmaterializedAbsenceRefs]
+          .filter((ref) => follow.appliedRefs[ref]?.kind === "absent"
+            && follow.branchWitnesses?.[ref]?.kind === "absent"
+            && follow.branchLockedProofs?.[ref] !== undefined);
+        if (reconstructed.length > 0) {
+          const only = new Set(reconstructed);
+          const absenceProgress: FollowProgress = {
+            appliedRefs: Object.fromEntries(Object.entries(follow.appliedRefs).filter(([ref]) => only.has(ref))),
+            heldRefs: follow.heldRefs,
+            configApplied: false,
+            branchWitnesses: Object.fromEntries(Object.entries(follow.branchWitnesses ?? {}).filter(([ref]) => only.has(ref))),
+            branchLockedProofs: Object.fromEntries(Object.entries(follow.branchLockedProofs ?? {}).filter(([ref]) => only.has(ref))),
+            safeRefWitnesses: {},
+          };
+          const deferredProof = proofFor(absenceProgress, false);
+          const deferredComposed = composeRepoBase(
+            { base: baseSec, branchBaseOrigins: records[rel]?.branchBaseOrigins },
+            { base: remoteSec },
+            deferredProof.authority,
+            deferredProof.lockedProof,
+          );
+          repoProofs[rel] = deferredProof;
+          if (deferredComposed.base) applied[rel] = deferredComposed.base; else delete applied[rel];
+          if (deferredComposed.branchBaseOrigins) branchBaseOrigins[rel] = deferredComposed.branchBaseOrigins;
         }
         pending[rel] = remoteSec;
         partial[rel] = partialFrom(follow, true);
@@ -1279,14 +1308,16 @@ opts: {
           afterOid: input.afterOid,
           logicalBaseOid,
           extraTransactionLines: input.extraTransactionLines,
+          ...(input.expectedReflogFingerprint ? { expectedReflogFingerprint: input.expectedReflogFingerprint } : {}),
         });
-        await commitPlannedBranchTransition(plan);
+        const committed = await commitPlannedBranchTransition(plan);
         return {
           ref: plan.ref,
           beforeOid: plan.beforeOid,
           afterOid: plan.afterOid,
           inverseLines: plan.inverseLines,
-          witness: plan.witness,
+          witness: committed.witness,
+          lockedProof: committed.lockedProof,
         };
       },
       rollback: async (_ctx, transition) => {
@@ -1360,16 +1391,10 @@ opts: {
             effectiveRefScope: wipeLeftover ? "all" : remoteSec.refScope,
             checkoutComplete: true,
             incomingKey: incomingKey!,
-            branches: Object.fromEntries(Object.entries(branchWitnesses).map(([ref, witness]) => [ref, {
-              liveOid: witness.kind === "present" ? witness.nextOid : null,
-              witness,
-              ...(witness.kind === "present" ? { reflogEpisode: witness.episode } : {}),
-              artifactsClear: true,
-              ownershipStable: true,
-              reflogStable: true,
-              currentRef: false,
-              siblingOwned: false,
-            }])),
+            branches: Object.fromEntries(Object.entries(res.branchTransitions ?? {})
+              .flatMap(([ref, transition]) => transition.witness && transition.lockedProof
+                ? [[ref, transition.lockedProof] as const]
+                : [])),
             safeRefs: Object.fromEntries(Object.entries(safeRefWitnesses).map(([ref, witness]) => [ref, {
               liveOid: witness.afterOid,
               witness,
@@ -1548,6 +1573,19 @@ export async function withRevalidatedGitPartialApplies<T>(
       requested.set(lockPath, rels);
     }
   }
+  for (const [rel, proof] of Object.entries(outcome.repoProofs ?? {})) {
+    if (proof.authority.kind !== "pull-ref-transaction" && proof.authority.kind !== "journal-recovery") continue;
+    const ctx = await repoCtxFromDisk(repoDirOf(root, rel)).catch(() => undefined);
+    if (!ctx) continue;
+    const commonDir = path.resolve(ctx.commonDir);
+    for (const witness of Object.values(proof.authority.branchWitnesses)) {
+      const lockPath = path.resolve(commonDir, `${witness.artifactRef}.lock`);
+      if (!lockPath.startsWith(`${commonDir}${path.sep}`)) throw new Error(`artifact lock escaped common dir for ${rel}:${witness.ref}`);
+      const rels = requested.get(lockPath) ?? new Set<string>();
+      rels.add(rel);
+      requested.set(lockPath, rels);
+    }
+  }
   const held: Array<{ lockPath: string; handle: Awaited<ReturnType<typeof fs.open>> }> = [];
   try {
     for (const [lockPath, rels] of [...requested.entries()].sort(([a], [b]) => a.localeCompare(b))) {
@@ -1560,6 +1598,28 @@ export async function withRevalidatedGitPartialApplies<T>(
       }
     }
     await revalidateGitPartialApplies(root, state, outcome);
+    for (const [rel, proof] of Object.entries(outcome.repoProofs ?? {})) {
+      if (proof.authority.kind !== "pull-ref-transaction" && proof.authority.kind !== "journal-recovery") continue;
+      const ctx = await repoCtxFromDisk(repoDirOf(root, rel));
+      if (!ctx) throw new Error(`branch proof repository disappeared for ${rel}`);
+      const live = await readAllRefs(ctx.repoDir);
+      for (const [ref, witness] of Object.entries(proof.authority.branchWitnesses)) {
+        const locked = proof.lockedProof.branches[ref];
+        const terminal = witness.kind === "present" ? witness.nextOid : null;
+        if (!locked || locked.liveOid !== terminal || (live[ref] ?? null) !== terminal) {
+          throw new Error(`branch proof terminal moved for ${rel}:${ref}`);
+        }
+        if (witness.kind === "absent" && witness.source === "a") {
+          const artifact = await readBaseAbsentArtifact(ctx.repoDir, {
+            lineageHash: witness.lineageHash,
+            repositoryIdentityHash: witness.repositoryIdentityHash,
+          }, ref);
+          if (artifact.status !== "valid" || artifact.artifact.targetOid !== witness.artifactOid) {
+            throw new Error(`branch absence artifact moved for ${rel}:${ref}`);
+          }
+        }
+      }
+    }
     const saved = await save();
     for (const rel of outcome.publishedJournals ?? []) await clearFollowJournal(root, rel, outcome.journalCrashAt);
     return saved;

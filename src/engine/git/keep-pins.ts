@@ -15,6 +15,31 @@ import {
 } from "./protocol-locks.js";
 
 const execFileAsync = promisify(execFile);
+const sweptPreparedTxnDirs = new Set<string>();
+const PREPARED_TXN_SWEEP_LIMIT = 256;
+
+/** Best-effort boot/use-time cleanup for FIFOs left by hard-killed prepared
+ * transactions. Exact names, dead PIDs, FIFO type, and a directory bound keep
+ * this cleanup disjoint from refs/state and from live transactions. */
+export async function sweepStalePreparedTransactionFifos(commonDir: string): Promise<void> {
+  const resolved = path.resolve(commonDir);
+  if (sweptPreparedTxnDirs.has(resolved)) return;
+  sweptPreparedTxnDirs.add(resolved);
+  const entries = await fs.readdir(resolved, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries.slice(0, PREPARED_TXN_SWEEP_LIMIT)) {
+    const match = /^\.rbox-prepared-txn-(\d+)-[0-9a-f]{12}$/.exec(entry.name);
+    if (!match || !entry.isFIFO()) continue;
+    const pid = Number(match[1]);
+    if (!Number.isSafeInteger(pid) || pid <= 0 || pid === process.pid) continue;
+    try {
+      process.kill(pid, 0);
+      continue;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EPERM") continue;
+    }
+    await fs.rm(path.join(resolved, entry.name), { force: true }).catch(() => {});
+  }
+}
 
 export { enumerateRefReflogOids } from "./shared.js";
 
@@ -34,7 +59,7 @@ export interface PreparedKeepPins {
 }
 
 export type PrepareDisplacedPinsResult =
-  | ({ status: "prepared" } & PreparedKeepPins)
+  | ({ status: "prepared"; reflogFingerprint: string } & PreparedKeepPins)
   | { status: "indeterminate"; oid: string; marker: string };
 
 export const keepPinRef = (oid: string) => `refs/rbox-local/keep/${oid}`;
@@ -173,6 +198,7 @@ async function runPreparedUpdateRefTransactionUnlocked(
   if (lines.length === 0) return;
   const ctx = await repoCtx(repoDir);
   if (!ctx) throw new Error("repository unavailable while preparing ref transaction");
+  await sweepStalePreparedTransactionFifos(ctx.commonDir);
   const fifoPath = path.join(ctx.commonDir, `.rbox-prepared-txn-${process.pid}-${crypto.randomBytes(6).toString("hex")}`);
   await execFileAsync("mkfifo", [fifoPath]);
   // Bun does not incrementally deliver a child-process stdin pipe to
@@ -218,8 +244,12 @@ async function runPreparedUpdateRefTransactionUnlocked(
     return closed!.code;
   };
   try {
-    await fifo.write(["start", ...lines, "prepare", ""].join("\n"));
-    await waitFor("prepare: ok");
+    await fifo.write(["start", "option no-deref", ...lines, "prepare", ""].join("\n"));
+    try {
+      await waitFor("prepare: ok");
+    } catch (error) {
+      throw new PreparedRefTransactionPrepareError(String((error as Error)?.message ?? error));
+    }
     try {
       await afterPrepare();
     } catch (error) {
@@ -237,6 +267,16 @@ async function runPreparedUpdateRefTransactionUnlocked(
   } finally {
     await fifo.close().catch(() => {});
     await fs.rm(fifoPath, { force: true }).catch(() => {});
+  }
+}
+
+/** Git rejected a prepared transaction before the locked proof callback ran.
+ * Callers may treat this closed phase as expected ref movement without parsing
+ * Git's platform/version-dependent diagnostics. */
+export class PreparedRefTransactionPrepareError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PreparedRefTransactionPrepareError";
   }
 }
 
@@ -607,6 +647,7 @@ async function prepareDisplacedRefPinsUnlocked(
   origin: KeepPinOrigin,
 ): Promise<PrepareDisplacedPinsResult> {
   const displaced: string[] = [];
+  const reflogFingerprint = (await readRefReflogFingerprint(repoDir, ref)).sha256;
   // The live tip is a displacement candidate in its own right, not only the
   // reflog entries: with reflogs disabled or pruned (core.logAllRefUpdates=false,
   // fresh-materialized stores) the enumeration below is empty, and deleting the
@@ -619,7 +660,7 @@ async function prepareDisplacedRefPinsUnlocked(
     if (proof.status === "indeterminate") return { status: "indeterminate", oid, marker: proof.marker };
     if (proof.status === "unowned") displaced.push(oid);
   }
-  return { status: "prepared", ...(await prepareKeepPins(repoDir, displaced, origin)) };
+  return { status: "prepared", reflogFingerprint, ...(await prepareKeepPins(repoDir, displaced, origin)) };
 }
 
 export function prepareDisplacedRefPins(

@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 import { accumulateRecoveryPage, pull, push, pushManifest, stampManifestSchemaForCommit, sync, type SyncDeps } from "../sync.js";
 import { missingBlobsChunked } from "../sync-recovery.js";
 import type { WorkspaceConfig } from "../config.js";
-import { loadState, saveState, syncStreamId } from "../config.js";
+import { loadState, saveStateUnsafeLegacyOrTest, syncStreamId } from "../config.js";
 import { BlobRetryLaterError, BlobShaMismatchError, type CommitOptions, type CommitResult, type LatestOptions, type SyncRemote } from "../remote.js";
 import {
   buildIgnoreMatcher,
@@ -1141,7 +1141,7 @@ test("design 72: purge push refuses if a known repo becomes unevaluable after th
   await exec("git", ["-C", repo, "add", "-f", "tracked.txt"]);
 
   const stale = await remote.seedEntry("hidden/drop.txt", "stale\n");
-  await saveState(root, {
+  await saveStateUnsafeLegacyOrTest(root, {
     stream: syncStreamId(cfg),
     lastSyncedSequence: 0,
     lastSyncedManifest: { generatedAt: "", files: [stale], manifestSchema: 2, gitRepos: { hidden: fakeGitSection() } },
@@ -1173,7 +1173,7 @@ test("design 72: purge with respectGitignore off still preserves tracked files u
   await push(root, cfg, deps(remote));
 
   const st = await loadState(root, syncStreamId(cfg));
-  await saveState(root, {
+  await saveStateUnsafeLegacyOrTest(root, {
     ...st,
     lastSyncedManifest: { ...st.lastSyncedManifest, manifestSchema: 2, gitRepos: { repo: fakeGitSection() } },
   });
@@ -1297,7 +1297,7 @@ test("design 74 phase 0: pull reports git-apply repo timings and commonDir group
   const gitRepos = { repoA: fakeGitSection(), repoB: fakeGitSection() };
   remote.injectCommit([], gitRepos);
   cfg = { ...cfg, syncGit: true };
-  await saveState(root, {
+  await saveStateUnsafeLegacyOrTest(root, {
     stream: syncStreamId(cfg),
     lastSyncedSequence: remote.headSeq(),
     lastSyncedManifest: { generatedAt: "", files: [], manifestSchema: 2, gitRepos },

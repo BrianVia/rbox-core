@@ -68,7 +68,17 @@ test("§130 state port advances BASE through composer and mutates only the P-bou
   const port = createPRepairStatePort({ root, stream: "stream", relPath: "repo", repoKind: "dir", effectiveRefScope: "all", p });
   const before = await port.read();
   const first = receipt("2026-07-16T12:00:00.000Z");
-  expect(await port.cas({ expected: before, nextBaseOid: NEXT, receipt: first })).toBe("accepted");
+  expect(await port.cas({
+    expected: before,
+    nextBaseOid: NEXT,
+    receipt: first,
+    lockedObservation: {
+      liveOid: first.q.value.observed.liveOid,
+      reflogSha256: first.reflog.sha256,
+      artifactsValidated: true,
+      keepRefsVerified: true,
+    },
+  })).toBe("accepted");
   let saved = (await loadRawState(root))!.repoRecords!.repo!;
   expect(saved.base?.refs[REF]).toBe(NEXT);
   expect(saved.base?.refs["refs/tags/keep"]).toBe(PRIOR);

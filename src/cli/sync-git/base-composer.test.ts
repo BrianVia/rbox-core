@@ -72,7 +72,7 @@ const lockedBranch = (witness: BranchTransitionWitness) => ({
 });
 
 describe("design 130 mandatory BASE composer", () => {
-  test("closed authority union has exactly all seven reviewed members", () => {
+  test("closed authority union has exactly all seven members", () => {
     const kinds = [
       "pull-ref-transaction", "pull-carry", "journal-recovery", "publisher-ack", "manual", "p-repair", "migration",
     ] as const satisfies readonly ComposeRepoBaseAuthority["kind"][];
@@ -115,12 +115,11 @@ describe("design 130 mandatory BASE composer", () => {
     expect(held.base?.refs[add]).toBe(U);
   });
 
-  test("missing, stale, or mismatched positive origins remain legacy-untrusted without widening authority", () => {
+  test("missing or OID-mismatched origins are dropped while stale-lineage metadata survives carry", () => {
     const ref = "refs/heads/main";
     for (const origin of [
       undefined,
       { v: 1 as const, oid: N, lineageHash: LIN, kind: "manual" as const, episode: "8".repeat(32) },
-      { v: 1 as const, oid: L, lineageHash: "f".repeat(64), kind: "manual" as const, episode: "7".repeat(32) },
     ]) {
       const result = composeRepoBase(
         { base: section({ [ref]: L }), ...(origin ? { branchBaseOrigins: { [ref]: origin } } : {}) },
@@ -131,6 +130,14 @@ describe("design 130 mandatory BASE composer", () => {
       expect(result.base?.refs[ref]).toBe(L);
       expect(result.branchBaseOrigins?.[ref]).toBeUndefined();
     }
+    const stale = { v: 1 as const, oid: L, lineageHash: "f".repeat(64), kind: "manual" as const, episode: "7".repeat(32) };
+    const carried = composeRepoBase(
+      { base: section({ [ref]: L }), branchBaseOrigins: { [ref]: stale } },
+      { base: section({ [ref]: L }, "same") },
+      { kind: "pull-carry", lineageHash: LIN },
+      locked(),
+    );
+    expect(carried.branchBaseOrigins?.[ref]).toEqual(stale);
   });
 
   test("mixed outcome retains the entire previous non-branch and artifact family", () => {

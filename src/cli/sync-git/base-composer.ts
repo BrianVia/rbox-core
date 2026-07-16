@@ -173,13 +173,34 @@ function sameSafeWitness(left: SafeRefWitness | undefined, right: SafeRefWitness
   return left !== undefined && right !== undefined && JSON.stringify(left) === JSON.stringify(right);
 }
 
-function usableOrigin(origin: BranchBaseOrigin | undefined, refOid: string, lineageHash: string): origin is BranchBaseOrigin {
-  if (origin === undefined || origin.v !== 1 || origin.oid !== refOid || origin.lineageHash !== lineageHash
+/** Persistence/carry validity is deliberately weaker than authorization
+ * validity. An unchanged BASE member retains any well-formed origin bound to
+ * that OID, including a stale-lineage origin; the live-lineage attestation
+ * check is what decides whether that retained metadata is usable authority. */
+export function branchBaseOriginMatches(origin: BranchBaseOrigin | undefined, refOid: string): origin is BranchBaseOrigin {
+  if (origin === undefined || origin.v !== 1 || origin.oid !== refOid
     || !HEX40.test(origin.oid) || !HEX64.test(origin.lineageHash)) return false;
   if (origin.kind === "publisher-ack") {
     return Number.isSafeInteger(origin.sourceSeq) && origin.sourceSeq >= 0 && origin.incomingKey.length > 0;
   }
-  return EPISODE.test(origin.episode);
+  return (origin.kind === "pull-p" || origin.kind === "manual") && EPISODE.test(origin.episode);
+}
+
+/** Diagnostic/carry lineage hint only. Mixed or malformed stored provenance is
+ * never collapsed by object iteration order. */
+export function recordOriginLineage(origins: Readonly<Record<string, BranchBaseOrigin>> | undefined): string | undefined {
+  const entries = Object.entries(origins ?? {});
+  if (entries.length === 0) return undefined;
+  const lineages = new Set<string>();
+  for (const [ref, origin] of entries) {
+    if (!isBranch(ref) || !branchBaseOriginMatches(origin, origin.oid)) return undefined;
+    lineages.add(origin.lineageHash);
+  }
+  return lineages.size === 1 ? lineages.values().next().value : undefined;
+}
+
+function usableOrigin(origin: BranchBaseOrigin | undefined, refOid: string, lineageHash: string): origin is BranchBaseOrigin {
+  return branchBaseOriginMatches(origin, refOid) && origin.lineageHash === lineageHash;
 }
 
 function pullOrigin(witness: Extract<BranchTransitionWitness, { kind: "present" }>): BranchBaseOrigin {
@@ -414,7 +435,7 @@ export function composeRepoBase(
 
     if (after !== null) {
       composedBranchRefs[ref] = after;
-      if (!origin && before === after && usableOrigin(priorOrigin, after, identity.lineageHash)) origin = priorOrigin;
+      if (!origin && before === after && branchBaseOriginMatches(priorOrigin, after)) origin = priorOrigin;
       if (origin) origins[ref] = origin;
     }
   }

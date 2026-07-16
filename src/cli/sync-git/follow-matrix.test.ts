@@ -18,7 +18,7 @@ import {
 } from "../../engine/index.js";
 import { readOpState } from "../../engine/git/refs.js";
 import { hashFile } from "../../engine/hash.js";
-import { loadState, repoRecordsForState, saveState, type SyncState, type WorkspaceConfig } from "../config.js";
+import { loadState, repoRecordsForState, saveStateUnsafeLegacyOrTest, type SyncState, type WorkspaceConfig } from "../config.js";
 import { orderedRepoDeferralUpdates, saveStateSource } from "../sync-state.js";
 import { applyGitSections, withRevalidatedGitPartialApplies } from "./apply.js";
 import { gitIncomingKey } from "./shared.js";
@@ -157,7 +157,7 @@ async function buildTemplate(topology: Topology): Promise<Template> {
     () => {},
   );
   expect(materialized.gitRepos?.[REL]).toEqual(base);
-  await saveState(root, stateWith(base));
+  await saveStateUnsafeLegacyOrTest(root, stateWith(base));
 
   const incoming = {} as Record<0 | 1, GitSection>;
   const expectedBytes = { 0: "two\n", 1: `incoming-${topology}\n` } as Record<0 | 1, string>;
@@ -311,7 +311,7 @@ describe("design 116 generated disposition matrix", () => {
         const opBefore = await readOpState(path.join(repo, ".git"), hashFile);
         const shouldFollow = !c.humanDirt && !c.localCommits && !c.localStash;
         const initialState = stateWith(template.base);
-        await saveState(root, initialState);
+        await saveStateUnsafeLegacyOrTest(root, initialState);
         const first = await applyIncoming(root, initialState, incoming, realOracle(root, expectedBytes));
         const incomingHeadRef = /^ref:\s*(refs\/\S+)/.exec(incoming.head)?.[1];
         const incomingTip = incomingHeadRef ? incoming.refs[incomingHeadRef]! : incoming.head.trim();

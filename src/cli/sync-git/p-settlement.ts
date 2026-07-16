@@ -1,6 +1,7 @@
 import path from "node:path";
 import {
   basePresentKeepRef,
+  PreparedRefTransactionPrepareError,
   readBasePresentArtifact,
   readRefReflogFingerprint,
   runPreparedUpdateRefTransaction,
@@ -28,6 +29,13 @@ export type ExactPSettlementResult =
   | { status: "settled"; state: SyncState; ref: string }
   | { status: "moved"; reason: "live" | "reflog" | "base-shape" }
   | { status: "hold"; reason: string };
+
+class PSettlementMovementError extends Error {
+  constructor(readonly movement: Extract<ExactPSettlementResult, { status: "moved" }>["reason"], message: string) {
+    super(message);
+    this.name = "PSettlementMovementError";
+  }
+}
 
 function witnessFor(p: PreparedProtocolRef<BasePresentPayload>): Extract<BranchTransitionWitness, { kind: "present" }> {
   return {
@@ -93,13 +101,17 @@ export async function settleExactPresentArtifact(input: {
           const locked = await readBasePresentArtifact(input.ctx.repoDir, input.binding, payload.ref);
           if (locked.status !== "valid" || locked.artifact.targetOid !== input.p.targetOid) throw new Error("P/K moved at exact settlement boundary");
           const reflog = await readRefReflogFingerprint(input.ctx.repoDir, payload.ref);
-          if (reflog.sha256 !== initialReflog.sha256 || !exactEpisodeTop(reflog.bytes, payload)) throw new Error("P reflog moved at exact settlement boundary");
+          if (reflog.sha256 !== initialReflog.sha256 || !exactEpisodeTop(reflog.bytes, payload)) {
+            throw new PSettlementMovementError("reflog", "P reflog moved at exact settlement boundary");
+          }
           const fresh = await loadRawState(input.root);
           if (!fresh || fresh.stream !== input.stream) throw new Error("P settlement state lineage changed");
           const record = repoRecordsForState(fresh)[input.relPath];
           if (!record?.base) throw new Error("P settlement BASE disappeared");
           const before = record.base.refs[payload.ref] ?? null;
-          if (before !== payload.priorOid && before !== payload.nextOid) throw new Error("P settlement BASE is a later value");
+          if (before !== payload.priorOid && before !== payload.nextOid) {
+            throw new PSettlementMovementError("base-shape", "P settlement BASE is a later value");
+          }
           const witness = witnessFor(input.p);
           const refs = { ...record.base.refs, [payload.ref]: payload.nextOid };
           const proof: RepoBaseProof = {
@@ -146,9 +158,8 @@ export async function settleExactPresentArtifact(input: {
     });
   } catch (error) {
     const reason = String((error as Error)?.message ?? error);
-    if (/reflog moved/.test(reason)) return { status: "moved", reason: "reflog" };
-    if (/BASE is a later value/.test(reason)) return { status: "moved", reason: "base-shape" };
-    if (/verify|reference.*changed|cannot lock/i.test(reason)) return { status: "moved", reason: "live" };
+    if (error instanceof PSettlementMovementError) return { status: "moved", reason: error.movement };
+    if (error instanceof PreparedRefTransactionPrepareError) return { status: "moved", reason: "live" };
     return { status: "hold", reason };
   }
 }

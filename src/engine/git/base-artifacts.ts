@@ -124,7 +124,8 @@ export function settledAbsenceRef(binding: ArtifactBinding): string {
 
 function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
   const actual = Object.keys(value).sort();
-  return actual.length === keys.length && actual.every((key, index) => key === [...keys].sort()[index]);
+  const expected = [...keys].sort();
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {

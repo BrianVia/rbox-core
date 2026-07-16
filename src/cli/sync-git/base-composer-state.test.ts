@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { GitSection } from "../../engine/index.js";
-import { ensureCapableStateLineage, loadRawState, saveState, type RepoRecord, type SyncState } from "../config.js";
+import { ensureCapableStateLineage, loadRawState, saveStateUnsafeLegacyOrTest, type RepoRecord, type SyncState } from "../config.js";
 import { composeStateSavePacket } from "../sync-state.js";
 import type { BranchTransitionWitness, RepoBaseProof } from "./base-composer.js";
 
@@ -87,7 +87,7 @@ test("true genesis is durably fenced before Git mutation while an existing legac
     expect((await loadRawState(root))?.stateNonce).toBe(capable.stateNonce);
 
     const legacy: SyncState = { stream: "stream", lastSyncedSequence: 1, lastSyncedManifest: { generatedAt: "old", files: [] } };
-    await saveState(legacyRoot, legacy);
+    await saveStateUnsafeLegacyOrTest(legacyRoot, legacy);
     const held = await ensureCapableStateLineage(legacyRoot, legacy);
     expect(held.stateNonce).toBeUndefined();
     expect((await loadRawState(legacyRoot))?.stateNonce).toBeUndefined();

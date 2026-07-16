@@ -17,6 +17,7 @@ import {
   type BranchArtifactDisposition,
   type TombstoneAttestationMap,
 } from "./tombstone-attestation.js";
+import type { BranchTransitionWitness } from "./base-composer.js";
 
 export interface FollowerBranchProtocol {
   binding: ArtifactBinding;
@@ -26,6 +27,12 @@ export interface FollowerBranchProtocol {
   attestations: TombstoneAttestationMap;
   artifacts: Record<string, BranchArtifactDisposition>;
   presentArtifacts: Array<PreparedProtocolRef<BasePresentPayload>>;
+  /** A/Z proves a committed absence that stale serialized BASE has not yet
+   * materialized. This is a one-cycle breadcrumb-waiver veto, never deletion
+   * or BASE authority. */
+  unmaterializedAbsenceRefs: ReadonlySet<string>;
+  /** Exact owning A receipts available for crash reconstruction. */
+  absenceWitnesses: Readonly<Record<string, Extract<BranchTransitionWitness, { kind: "absent" }>>>;
 }
 
 export type FollowerBranchProtocolResult =
@@ -46,6 +53,8 @@ export async function prepareFollowerBranchProtocol(input: {
   base?: GitSection;
   incoming: GitSection;
   liveRefs: Readonly<Record<string, string>>;
+  /** Refs whose persisted D2 partial evidence failed exact live revalidation. */
+  d2RejectedRefs?: ReadonlySet<string>;
 }): Promise<FollowerBranchProtocolResult> {
   if (!/^[0-9a-f]{32}$/.test(input.state.stateNonce ?? "")) return { status: "hold", reason: "state lineage has no capable nonce" };
   try {
@@ -70,12 +79,24 @@ export async function prepareFollowerBranchProtocol(input: {
 
     const logicalBaseRefs = { ...(input.base?.refs ?? {}) };
     const artifacts: Record<string, BranchArtifactDisposition> = {};
+    const absenceWitnesses: Record<string, Extract<BranchTransitionWitness, { kind: "absent" }>> = {};
     const disposition = (ref: string): BranchArtifactDisposition => artifacts[ref] ??= {
       absence: "absent", present: "absent", keeps: "clear", settledAbsence: "absent",
     };
     for (const entry of scan.absent) if (entry.status === "valid") {
-      delete logicalBaseRefs[entry.artifact.payload.ref];
-      disposition(entry.artifact.payload.ref).absence = "valid-owning";
+      const payload = entry.artifact.payload;
+      delete logicalBaseRefs[payload.ref];
+      disposition(payload.ref).absence = "valid-owning";
+      absenceWitnesses[payload.ref] = {
+        kind: "absent",
+        ref: payload.ref,
+        priorOid: payload.priorOid,
+        lineageHash: payload.lineageHash,
+        repositoryIdentityHash: payload.repositoryIdentityHash,
+        artifactRef: entry.artifact.ref,
+        artifactOid: entry.artifact.targetOid,
+        source: "a",
+      };
     }
     for (const entry of scan.present) if (entry.status === "valid") {
       disposition(entry.artifact.payload.ref).present = "valid-owning";
@@ -94,7 +115,7 @@ export async function prepareFollowerBranchProtocol(input: {
 
     const incomingKey = gitIncomingKey(input.incoming);
     const pendingEvidence = Object.fromEntries(Object.keys(input.incoming.refTombstones ?? {}).map((ref) => [
-      ref, { incomingKey, d2Revalidated: true },
+      ref, { incomingKey, d2Revalidated: input.d2RejectedRefs?.has(ref) !== true },
     ]));
     const attestations = buildTombstoneAttestations({
       section: input.incoming,
@@ -106,6 +127,11 @@ export async function prepareFollowerBranchProtocol(input: {
       artifacts,
       pendingEvidence,
     });
+    const serializedBaseRefs = input.base?.refs ?? {};
+    const unmaterializedAbsenceRefs = new Set(Object.keys(serializedBaseRefs).filter((ref) => {
+      const item = artifacts[ref];
+      return item?.absence === "valid-owning" || item?.settledAbsence === "valid-owning";
+    }));
     return {
       status: "ready",
       protocol: {
@@ -116,6 +142,8 @@ export async function prepareFollowerBranchProtocol(input: {
         attestations,
         artifacts,
         presentArtifacts: scan.present.flatMap((entry) => entry.status === "valid" ? [entry.artifact] : []),
+        unmaterializedAbsenceRefs,
+        absenceWitnesses,
       },
     };
   } catch (error) {

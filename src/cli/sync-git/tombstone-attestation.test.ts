@@ -21,7 +21,7 @@ function build(overrides: Partial<Parameters<typeof buildTombstoneAttestations>[
   return buildTombstoneAttestations({
     section: section(), incomingKey: key, lineageHash: L,
     liveRefs: { [ref]: T }, logicalBaseRefs: { [ref]: T },
-    origins: { [ref]: { v: 1, oid: T, lineageHash: L, kind: "pull-p", episode: "e" } },
+    origins: { [ref]: { v: 1, oid: T, lineageHash: L, kind: "pull-p", episode: "e".repeat(32) } },
     artifacts: { [ref]: clear }, pendingEvidence: { [ref]: { incomingKey: key, d2Revalidated: true } },
     ...overrides,
   });

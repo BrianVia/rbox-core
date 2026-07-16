@@ -114,8 +114,11 @@ export function createPRepairStatePort(input: PRepairStatePortInput): PRepairSta
       if (!record) throw new Error("P-repair RepoRecord unavailable");
       return snapshot(counter(state.stateRevision), record, witness.ref);
     },
-    async cas({ expected, nextBaseOid, receipt }) {
+    async cas({ expected, nextBaseOid, receipt, lockedObservation }) {
       parsePRepairReceipt(receipt);
+      if (lockedObservation.liveOid !== receipt.q.value.observed.liveOid
+        || lockedObservation.reflogSha256 !== receipt.reflog.sha256
+        || !lockedObservation.artifactsValidated || !lockedObservation.keepRefsVerified) return "rejected";
       const state = await loadRawState(input.root);
       if (!state || state.stream !== input.stream) return "rejected";
       const records = repoRecordsForState(state);
@@ -152,7 +155,7 @@ export function createPRepairStatePort(input: PRepairStatePortInput): PRepairSta
           checkoutComplete: false,
           branches: {
             [witness.ref]: {
-              liveOid: receipt.q.value.observed.liveOid,
+              liveOid: lockedObservation.liveOid,
               witness,
               artifactsClear: true,
               ownershipStable: true,

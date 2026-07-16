@@ -1,5 +1,5 @@
 import { validateGitSection, type GitSection } from "../../engine/index.js";
-import type { BranchBaseOrigin } from "./base-composer.js";
+import { branchBaseOriginMatches, type BranchBaseOrigin } from "./base-composer.js";
 
 export type ArtifactDisposition = "absent" | "valid-owning" | "active-foreign" | "invalid";
 
@@ -53,6 +53,7 @@ function originDisposition(
 ): TombstoneAttestation["origin"] {
   if (!origin) return "missing";
   if (origin.oid !== oid) return "oid-mismatch";
+  if (!branchBaseOriginMatches(origin, oid)) return "missing";
   if (origin.lineageHash !== lineageHash) return "lineage-mismatch";
   return "usable";
 }

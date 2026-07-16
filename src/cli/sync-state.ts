@@ -14,7 +14,7 @@ import {
   loadRawState,
   MAX_LEGACY_GIT_SIDECAR_REPOS,
   repoRecordsForState,
-  saveState,
+  saveStateUnsafeLegacyOrTest,
   stateFromRepoRecords,
   type FileOnlyManifest,
   type GlobalManifestMeta,
@@ -302,7 +302,7 @@ export async function saveStateSource(
 ): Promise<SyncState> {
   if (options.forceLegacy) {
     const next = legacyState(initialSnapshot, source);
-    await saveState(root, next);
+    await saveStateUnsafeLegacyOrTest(root, next);
     return next;
   }
   const apply = options.apply ?? applyStateSavePacket;
@@ -312,13 +312,13 @@ export async function saveStateSource(
     if (result.status === "accepted") return result.state;
     if (result.status === "unsupported") {
       const next = legacyState(snapshot, source);
-      await saveState(root, next);
+      await saveStateUnsafeLegacyOrTest(root, next);
       return next;
     }
     if (result.status === "busy") throw new Error(`sync state busy (${result.detail})`);
     if (result.status === "rejected" && result.reason === "stream" && options.allowLegacyStreamReplacement) {
       const next = legacyState(snapshot, source);
-      await saveState(root, next);
+      await saveStateUnsafeLegacyOrTest(root, next);
       return next;
     }
     if (result.reason === "stream" || result.reason === "nonce" || result.reason === "owner-lost") {
@@ -486,7 +486,7 @@ export async function savePublishedRepoIntent(
       const records = repoRecordsForState(currentSnapshot);
       records[relPath] = { ...merged, repoGen: current.repoGen + 1 };
       const next = stateFromRepoRecords(currentSnapshot, records);
-      await saveState(root, next);
+      await saveStateUnsafeLegacyOrTest(root, next);
       return { state: next, disposition: superseded ? "superseded" : "landed" };
     }
     const result = await applyStateSavePacket(root, {

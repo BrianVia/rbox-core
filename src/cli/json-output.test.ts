@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { HashCache, type Manifest } from "../engine/index.js";
-import { saveConfig, saveState, syncStreamId, type WorkspaceConfig } from "./config.js";
+import { saveConfig, saveStateUnsafeLegacyOrTest, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { accountStatus } from "./account-cmd.js";
 import { flushAccountProfileWrites } from "./account-profile.js";
 import { listDevices, keyStatus } from "./auth-cmd.js";
@@ -76,7 +76,7 @@ async function saveStatusWorkspace(overrides: Partial<WorkspaceConfig> = {}): Pr
     ...overrides,
   };
   await saveConfig(tmp, cfg);
-  await saveState(tmp, {
+  await saveStateUnsafeLegacyOrTest(tmp, {
     stream: syncStreamId(cfg),
     lastSyncedSequence: 10,
     lastSyncedManifest: { generatedAt: "", files: [] },

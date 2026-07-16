@@ -11,7 +11,10 @@ import {
   type ArtifactBinding,
 } from "../../engine/index.js";
 import type { GitPartialApply } from "../config.js";
-import type { BranchTransitionWitness } from "./base-composer.js";
+import { branchesCheckedOutElsewhere } from "../../engine/git/apply.js";
+import { readAllRefs } from "../../engine/git/refs.js";
+import { readHead, repoCtx } from "../../engine/git/shared.js";
+import type { BranchTransitionWitness, LockedBranchProof } from "./base-composer.js";
 
 const HEX40 = /^[0-9a-f]{40}$/;
 const ZERO_OID = "0".repeat(40);
@@ -29,6 +32,13 @@ export interface PlannedBranchTransition {
   reflogMessage?: string;
   expectedReflogFingerprint?: string;
   settledAbsenceRetirement?: { ref: string; priorTargetOid: string; nextTargetOid: string | null };
+  /** HEAD bytes are reserved by this transaction unless checkout owns HEAD. */
+  headReservation?: { content: string; currentRef: boolean };
+}
+
+export interface CommittedBranchTransition {
+  witness: BranchTransitionWitness;
+  lockedProof: LockedBranchProof & { witness: BranchTransitionWitness };
 }
 
 export interface PlanBranchTransitionInput {
@@ -41,11 +51,13 @@ export interface PlanBranchTransitionInput {
   extraTransactionLines?: readonly string[];
   episode?: string;
   expectedReflogFingerprint?: string;
+  /** Checkout transactions reserve/mutate HEAD themselves. */
+  reserveHead?: boolean;
 }
 
 function sortedUniqueLines(lines: readonly string[]): string[] {
   const parsed = lines.map((line) => {
-    const match = /^(?:create|update|delete|verify) (\S+)(?: |$)/.exec(line);
+    const match = /^(?:create|update|delete|verify|symref-verify) (\S+)(?: |$)/.exec(line);
     if (!match) throw new Error(`invalid branch transition command: ${line}`);
     return { line, ref: match[1]! };
   });
@@ -55,6 +67,28 @@ function sortedUniqueLines(lines: readonly string[]): string[] {
     refs.add(item.ref);
   }
   return parsed.sort((a, b) => Buffer.compare(Buffer.from(a.ref), Buffer.from(b.ref))).map(({ line }) => line);
+}
+
+async function reserveNonRacingHead(
+  repoDir: string,
+  ref: string,
+  enabled: boolean,
+): Promise<{ lines: string[]; reservation?: PlannedBranchTransition["headReservation"] }> {
+  if (!enabled) return { lines: [] };
+  const ctx = await repoCtx(repoDir);
+  if (!ctx) throw new Error("repository unavailable while reserving HEAD");
+  const content = await readHead(ctx);
+  if (content.startsWith("ref: ")) {
+    const target = content.slice(5);
+    // Updating HEAD's current referent already reserves HEAD.lock; Git rejects
+    // an additional symref-verify in that exact shape.
+    return {
+      lines: target === ref ? [] : [`symref-verify HEAD ${target}`],
+      reservation: { content, currentRef: target === ref },
+    };
+  }
+  if (!HEX40.test(content)) throw new Error("unreadable detached HEAD while planning branch transition");
+  return { lines: [`verify HEAD ${content}`], reservation: { content, currentRef: false } };
 }
 
 /**
@@ -69,7 +103,8 @@ export async function planBranchTransition(input: PlanBranchTransitionInput): Pr
   }
   if (input.beforeOid === input.afterOid) throw new Error("branch transition is a no-op");
   if (input.logicalBaseOid !== input.beforeOid) throw new Error("branch transition does not match logical BASE pre-state");
-  const extra = [...(input.extraTransactionLines ?? [])];
+  const head = await reserveNonRacingHead(input.repoDir, input.ref, input.reserveHead !== false);
+  const extra = [...(input.extraTransactionLines ?? []), ...head.lines];
 
   if (input.afterOid === null) {
     if (input.beforeOid === null) throw new Error("cannot delete an absent branch");
@@ -89,6 +124,7 @@ export async function planBranchTransition(input: PlanBranchTransitionInput): Pr
       witness,
       partial: { kind: "absent", artifactOid: artifact.targetOid },
       ...(input.expectedReflogFingerprint ? { expectedReflogFingerprint: input.expectedReflogFingerprint } : {}),
+      ...(head.reservation ? { headReservation: head.reservation } : {}),
     };
   }
 
@@ -139,6 +175,7 @@ export async function planBranchTransition(input: PlanBranchTransitionInput): Pr
     reflogMessage: episode,
     ...(settledAbsenceRetirement ? { settledAbsenceRetirement } : {}),
     ...(input.expectedReflogFingerprint ? { expectedReflogFingerprint: input.expectedReflogFingerprint } : {}),
+    ...(head.reservation ? { headReservation: head.reservation } : {}),
   };
 }
 
@@ -153,6 +190,8 @@ export interface PlanManualBranchTransitionInput {
   logicalBaseOid: string | null;
   extraTransactionLines?: readonly string[];
   episode?: string;
+  expectedReflogFingerprint?: string;
+  reserveHead?: boolean;
 }
 
 /**
@@ -166,7 +205,8 @@ export async function planManualBranchTransition(input: PlanManualBranchTransiti
   for (const value of [input.physicalBeforeOid, input.afterOid, input.logicalBaseOid]) {
     if (value !== null && !HEX40.test(value)) throw new Error("invalid manual branch transition OID");
   }
-  const extra = [...(input.extraTransactionLines ?? [])];
+  const head = await reserveNonRacingHead(input.repoDir, input.ref, input.reserveHead !== false);
+  const extra = [...(input.extraTransactionLines ?? []), ...head.lines];
 
   if (input.afterOid === null) {
     // A confirmed deletion of a local-only branch does not change BASE, but it
@@ -192,6 +232,8 @@ export async function planManualBranchTransition(input: PlanManualBranchTransiti
       inverseLines: sortedUniqueLines([inversePhysical, `delete ${artifact.ref} ${artifact.targetOid}`]),
       witness,
       partial: { kind: "absent", artifactOid: artifact.targetOid },
+      ...(input.expectedReflogFingerprint ? { expectedReflogFingerprint: input.expectedReflogFingerprint } : {}),
+      ...(head.reservation ? { headReservation: head.reservation } : {}),
     };
   }
 
@@ -244,19 +286,49 @@ export async function planManualBranchTransition(input: PlanManualBranchTransiti
     partial: { kind: "present", oid: input.afterOid, artifactOid: artifact.targetOid, episode },
     reflogMessage: episode,
     ...(settledAbsenceRetirement ? { settledAbsenceRetirement } : {}),
+    ...(input.expectedReflogFingerprint ? { expectedReflogFingerprint: input.expectedReflogFingerprint } : {}),
+    ...(head.reservation ? { headReservation: head.reservation } : {}),
   };
 }
 
 export async function commitPlannedBranchTransition(
   plan: PlannedBranchTransition,
   lockedSecondProof: () => Promise<void> = async () => {},
-): Promise<BranchTransitionWitness> {
+): Promise<CommittedBranchTransition> {
+  if (!plan.headReservation) throw new Error("standalone branch transition lacks a reserved HEAD observation");
+  let lockedObservation: Omit<LockedBranchProof, "liveOid" | "witness" | "reflogEpisode" | "artifactsClear" | "reflogStable"> | undefined;
   await runPreparedUpdateRefTransaction(plan.repoDir, plan.lines, async () => {
     if (plan.expectedReflogFingerprint) {
       const locked = await readRefReflogFingerprint(plan.repoDir, plan.ref);
       if (locked.sha256 !== plan.expectedReflogFingerprint) throw new Error("branch reflog changed at prepared transaction boundary");
     }
+    const ctx = await repoCtx(plan.repoDir);
+    if (!ctx) throw new Error("repository disappeared at prepared transaction boundary");
+    const [refs, owned, head] = await Promise.all([
+      readAllRefs(plan.repoDir),
+      branchesCheckedOutElsewhere(ctx),
+      readHead(ctx),
+    ]);
+    if ((refs[plan.ref] ?? null) !== plan.beforeOid) throw new Error("branch changed at prepared transaction boundary");
+    if (head !== plan.headReservation!.content) throw new Error("HEAD changed at prepared transaction boundary");
+    if (owned.has(plan.ref)) throw new Error("branch became sibling-owned at prepared transaction boundary");
     await lockedSecondProof();
+    lockedObservation = {
+      ownershipStable: true,
+      currentRef: plan.headReservation!.currentRef,
+      siblingOwned: false,
+    };
   }, plan.reflogMessage ? { reflogMessage: plan.reflogMessage } : {});
-  return plan.witness;
+  if (!lockedObservation) throw new Error("branch transaction committed without locked observations");
+  return {
+    witness: plan.witness,
+    lockedProof: {
+      liveOid: plan.afterOid,
+      witness: plan.witness,
+      ...(plan.witness.kind === "present" ? { reflogEpisode: plan.witness.episode } : {}),
+      artifactsClear: true,
+      reflogStable: true,
+      ...lockedObservation,
+    },
+  };
 }

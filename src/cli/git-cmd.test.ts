@@ -7,7 +7,7 @@ import { promisify } from "node:util";
 import { LocalBlobStore, buildIgnoreMatcher, captureGitState, setGitSpawnObserver, type GitSection, type Manifest } from "../engine/index.js";
 import { checkoutJournalDir } from "../engine/git/journal.js";
 import { repoCtx } from "../engine/git/shared.js";
-import { loadState, repoRecordsForState, saveState, syncStreamId, type SyncState, type WorkspaceConfig } from "./config.js";
+import { loadState, repoRecordsForState, saveStateUnsafeLegacyOrTest, syncStreamId, type SyncState, type WorkspaceConfig } from "./config.js";
 import { gitDeferralsCmd, gitResolveCmd, safeResolveText, type GitResolveShow } from "./git-cmd.js";
 import { applyGitSections, settleCommittedBranchArtifacts } from "./sync-git/apply.js";
 import { commitPlannedBranchTransition, planBranchTransition } from "./sync-git/branch-transition.js";
@@ -106,7 +106,7 @@ async function fixture(opts: { branchSwitch?: boolean; syncedOperationAndBreadcr
       ...(applied.branchBaseOrigins?.repo ? { branchBaseOrigins: applied.branchBaseOrigins.repo } : {}),
     } },
   };
-  await saveState(root, initial);
+  await saveStateUnsafeLegacyOrTest(root, initial);
   await settleCommittedBranchArtifacts(root, initial, applied);
   await fs.writeFile(path.join(receiver, "tracked.txt"), "base\n");
 
@@ -152,7 +152,7 @@ async function fixture(opts: { branchSwitch?: boolean; syncedOperationAndBreadcr
       },
     },
   };
-  await saveState(root, state);
+  await saveStateUnsafeLegacyOrTest(root, state);
   return { base, incoming, localTip };
 }
 
@@ -567,7 +567,7 @@ test("take-theirs composes a stable side branch with no P into a manual origin",
   const record = state.repoRecords!.repo!;
   record.base = { ...record.base!, refs: { ...record.base!.refs, "refs/heads/topic": baseOid } };
   record.pending = { ...record.pending!, refs: { ...record.pending!.refs, "refs/heads/topic": nextOid } };
-  await saveState(root, state);
+  await saveStateUnsafeLegacyOrTest(root, state);
 
   const current = await show([]);
   expect(await gitResolveCmd(root, receiver, "take-theirs", { json: true, confirm: current.snapshot }, deps([]))).toBe(0);
@@ -586,7 +586,7 @@ test("take-theirs verifies an already-absent branch and creates A before removin
   record.base = { ...record.base!, refs: { ...record.base!.refs, "refs/heads/gone": prior } };
   record.pending = { ...record.pending!, refs: { ...record.pending!.refs } };
   delete record.pending.refs["refs/heads/gone"];
-  await saveState(root, state);
+  await saveStateUnsafeLegacyOrTest(root, state);
 
   const current = await show([]);
   expect(await gitResolveCmd(root, receiver, "take-theirs", { json: true, confirm: current.snapshot }, deps([]))).toBe(0);
@@ -607,7 +607,7 @@ test("take-theirs P-repairs a moved standing episode, invalidates the old confir
   const stored = state.repoRecords!.repo!;
   stored.base = { ...stored.base!, refs: { ...stored.base!.refs, "refs/heads/topic": prior } };
   stored.pending = { ...stored.pending!, refs: { ...stored.pending!.refs, "refs/heads/topic": next } };
-  await saveState(root, state);
+  await saveStateUnsafeLegacyOrTest(root, state);
   const record = repoRecordsForState(await loadState(root, syncStreamId(cfg))).repo!;
   const ctx = await repoCtx(receiver);
   const prepared = await prepareFollowerBranchProtocol({
@@ -725,7 +725,7 @@ test("resolve maps missing incoming state and unknown exceptions to closed codes
   await fixture();
   const state = await loadState(root, syncStreamId(cfg));
   if (state.repoRecords) delete state.repoRecords.repo;
-  await saveState(root, state);
+  await saveStateUnsafeLegacyOrTest(root, state);
   const missing: string[] = [];
   expect(await gitResolveCmd(root, receiver, "show-me", { json: true }, deps(missing))).toBe(1);
   expect(JSON.parse(missing.at(-1)!)).toMatchObject({ code: "no-incoming", message: "no deferred incoming Git state is available for this repository" });

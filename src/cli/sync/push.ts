@@ -27,7 +27,7 @@ import {
   planGitSections,
   nextDeferral,
 } from "../sync-git.js";
-import { carryRepoBaseProof, type RepoBaseProof } from "../sync-git/base-composer.js";
+import { carryRepoBaseProof, recordOriginLineage, type RepoBaseProof } from "../sync-git/base-composer.js";
 import { assertSyncMutex, workspaceSyncMutexDegraded } from "../sync-mutex.js";
 import { changedSidecarRepoKeys, observedRepoKeys, orderedDeferralUpdates, saveStateSource, type GitDeferralUpdates, type OrderedGitDeferralUpdates } from "../sync-state.js";
 import { beginFirstPublishTiming, finishFirstPublishStats, firstPublishMeasurementLive, firstPublishMeasurementToken, firstPublishTiming, formatFirstPublishStats } from "../upload-lane-timing.js";
@@ -409,7 +409,7 @@ async function runPushAttempt(
   const carryProofsFor = (snapshot: typeof state, relPaths: readonly string[]): Record<string, RepoBaseProof> => {
     const records = repoRecordsForState(snapshot);
     return Object.fromEntries(relPaths.map((relPath) => {
-      const lineageHash = Object.values(records[relPath]?.branchBaseOrigins ?? {})[0]?.lineageHash
+      const lineageHash = recordOriginLineage(records[relPath]?.branchBaseOrigins)
         ?? gitPlan.publisherAckBindings?.[relPath]?.lineageHash
         ?? "legacy-untrusted";
       return [relPath, carryRepoBaseProof(lineageHash)];
@@ -712,7 +712,7 @@ async function runPushAttempt(
         },
       };
       else {
-        const retainedLineage = Object.values(ackRecords[relPath]?.branchBaseOrigins ?? {})[0]?.lineageHash
+        const retainedLineage = recordOriginLineage(ackRecords[relPath]?.branchBaseOrigins)
           ?? binding?.lineageHash
           ?? "legacy-untrusted";
         repoProofs[relPath] = carryRepoBaseProof(retainedLineage);

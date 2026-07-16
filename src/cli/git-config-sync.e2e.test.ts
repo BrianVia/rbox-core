@@ -16,7 +16,7 @@ import {
   type Manifest,
 } from "../engine/index.js";
 import type { GitConfigRunner } from "../engine/git/config-txn.js";
-import { loadState, saveState, syncStreamId, type SyncState, type WorkspaceConfig } from "./config.js";
+import { loadState, saveStateUnsafeLegacyOrTest, syncStreamId, type SyncState, type WorkspaceConfig } from "./config.js";
 import type { CommitResult, SyncRemote } from "./remote.js";
 import {
   applyGitSections,
@@ -474,7 +474,7 @@ test("§11 E2E: pointer historical all-base carry is normalized; scoped→standa
 
   // Start a clean stream for the actual cross-shape loop. A pointer authors SCOPED
   // Git without config, B materializes it as standalone, then B authors ALL+config.
-  await saveState(rootA, {
+  await saveStateUnsafeLegacyOrTest(rootA, {
     stream: syncStreamId(cfgA),
     stateNonce: "a".repeat(32),
     lastSyncedSequence: 0,
@@ -550,7 +550,7 @@ test("§11 E2E: concurrent daemon/CLI process saves preserve newer-source atomic
     lastSyncedManifest: { generatedAt: "zero", files: [] },
     repoRecords: {},
   };
-  await saveState(rootA, initial);
+  await saveStateUnsafeLegacyOrTest(rootA, initial);
   const worker = path.join(tmp, "state-save-worker.ts");
   const configModule = path.join(import.meta.dir, "config.ts");
   const syncStateModule = path.join(import.meta.dir, "sync-state.ts");

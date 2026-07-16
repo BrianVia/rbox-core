@@ -5,6 +5,7 @@ import {
   type GitRefTombstone,
   type GitSection,
 } from "../../engine/index.js";
+import { gitIncomingKey } from "./shared.js";
 
 export const REF_TOMBSTONE_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
 
@@ -176,8 +177,9 @@ export function normalizeOutgoingGitSections(
   const findings: Array<{ relPath: string; finding: TombstoneNormalizationFinding }> = [];
   for (const relPath of Object.keys(outgoing).sort(bytewise)) {
     const section = outgoing[relPath]!;
-    if (pending[relPath] === section) {
-      sections[relPath] = section;
+    const pendingSection = pending[relPath];
+    if (pendingSection !== undefined && gitIncomingKey(pendingSection) === gitIncomingKey(section)) {
+      sections[relPath] = pendingSection;
       continue;
     }
     const normalized = normalizePublishedGitSection(advertised[relPath], section, now);
