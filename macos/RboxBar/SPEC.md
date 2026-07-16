@@ -47,7 +47,7 @@ README.md
   Whatever works and builds is fine; the runtime must find `RGlyph` via `.module` and the
   bundle script must find the icns.
 
-## Status file schema (authoritative — from src/cli/ambient-status.ts & populate-marker.ts)
+## Status file schema (authoritative — from src/cli/daemon/ambient-status.ts & populate-marker.ts)
 Runtime dir: `${RBOX_HOME or ~}/.rbox/daemons/<workspaceKey>/`. Files:
 
 `daemon.status.json` (AmbientDaemonStatusV1):

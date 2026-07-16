@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { writeFileAtomic } from "../engine/fsutil.js";
-import { daemonRuntimeDir, daemonStatusPath } from "./rbox-paths.js";
+import { writeFileAtomic } from "../../engine/fsutil.js";
+import { daemonRuntimeDir, daemonStatusPath } from "../rbox-paths.js";
 import type { AmbientDaemonStatusV1 } from "./ambient-status.js";
 
 export interface SaveAmbientDaemonStatusOptions {

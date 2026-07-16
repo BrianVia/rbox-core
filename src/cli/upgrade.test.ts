@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { createPrivateKey, generateKeyPairSync, sign as nodeSign, createPublicKey } from "node:crypto";
 import { parseSemver, semverGt } from "./semver.js";
-import { releaseSigningInput, verifyAndParseManifest } from "./upgrade-cmd.js";
+import { releaseSigningInput, verifyAndParseManifest } from "./release-verify.js";
 import { RELEASE_KEYS } from "./release-key.js";
 import { fromB64url, toB64url } from "../engine/e2ee/index.js";
 

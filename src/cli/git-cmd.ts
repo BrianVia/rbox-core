@@ -45,7 +45,7 @@ import {
 } from "./sync-git/follow.js";
 import { checkoutLabel, gitIncomingKey, repoDirOf, sectionOpState } from "./sync-git/shared.js";
 import { ageBucket, hasGitResolutionIncoming, projectGitDeferralRepos, sanitizeTerminalText, type GitDeferralRepoProjection } from "./status-view.js";
-import { serializeGitDeferralLanes } from "./git-deferral-json.js";
+import { serializeGitDeferralLanes } from "./sync-git/git-deferral-json.js";
 import { shQuote } from "./shell-quote.js";
 import { RBOX_VERSION } from "./version.js";
 

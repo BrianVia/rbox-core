@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { hashBytes, hashFile, statsStableAcrossHash, writeFileAtomic, type FileEntry, type Manifest, type WatchEvent } from "../engine/index.js";
-import { RBOX_DIR } from "./config.js";
+import { hashBytes, hashFile, statsStableAcrossHash, writeFileAtomic, type FileEntry, type Manifest, type WatchEvent } from "../../engine/index.js";
+import { RBOX_DIR } from "../config.js";
 
 export const AUDIT_SETTLE_MS = 4_000;
 export const AUDIT_EVENT_CAP = 10_000;

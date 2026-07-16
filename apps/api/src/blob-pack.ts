@@ -6,14 +6,13 @@ import {
   type PackDirEntry,
   parsePack,
 } from "../../../src/engine/blob-pack.js";
-import { readBytesCapped } from "./commit-envelope.js";
 import { wouldExceedCapAggregate } from "./billing.js";
 import { dbFor } from "./db.js";
 import { batchedInLookup, IN_LIST_CHUNK, STMTS_PER_BATCH } from "./d1-batch.js";
 import { emit, emitPackPutPhases, startOp, type Op, type PackPutPhaseTimings } from "./metrics.js";
 import { mintReceipt } from "./receipts.js";
 import { usesReceipts } from "./blob-protocol.js";
-import { json, logErr, SHA256_HEX_RE, sha256Hex, toHex } from "./util.js";
+import { json, logErr, packKey, readBytesCapped, SHA256_HEX_RE, sha256Hex, toHex } from "./util.js";
 
 export const PACK_ORPHAN_GRACE_MS = 13 * 3600_000;
 const INVENTORY_ROWS_PER_STATEMENT = 24; // 24*4 + 2 = 98 bound params, under D1's 100
@@ -30,7 +29,6 @@ const TOMBSTONE_CURSOR_KEY = "pack_tombstone_cursor";
  * for this change and in the design doc's rollout section. */
 export const PACK_ROLLBACK_FLOOR = "unset — record the first deployed Workers version id containing this reader";
 
-export const packKey = (packId: string): string => `packs/v1/${packId}`;
 export const packAcceptEnabled = (env: Env): boolean => env.RBOX_BLOB_PACK_ACCEPT === "1";
 export type PackGcMode = "off" | "shadow" | "mark" | "execute";
 export const packGcMode = (env: Env): PackGcMode => {

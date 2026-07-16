@@ -8,11 +8,8 @@ import {
   applyGitState,
   buildIgnoreMatcher,
   captureGitState,
-  decryptFileToPath,
   encryptFileToTemp,
-  normalizeSymbolicHeadCasing,
   GitCaptureDeferredError,
-  gitCaptureScratchRoot,
   gitSectionNewestLink,
   gitSectionTips,
   gitIdentity,
@@ -22,14 +19,15 @@ import {
   preserveGitConflict,
   scanManifest,
   setGitSpawnObserver,
-  sweepStaleGitCaptureDirs,
   validateGitSection,
   type BlobStore,
-  type GitArtifactRef,
   type GitSection,
 } from "./index.js";
+import { decryptFileToPath } from "./crypto.js";
+import { gitCaptureScratchRoot, normalizeSymbolicHeadCasing, sweepStaleGitCaptureDirs } from "./git/capture.js";
 import { indexTreeOf } from "./git/identity.js";
 import { repoCtx } from "./git/shared.js";
+import type { GitArtifactRef } from "./types.js";
 
 const exec = promisify(execFile);
 const cleanGitEnv = (extra: NodeJS.ProcessEnv = {}) =>

@@ -61,7 +61,7 @@ test.skipIf(skipCompiled)(
       [
         `import fs from "node:fs"; import os from "node:os"; import path from "node:path";`,
         `import { buildIgnoreMatcher } from "./src/engine/index.js";`,
-        `import { startWatcher } from "./src/cli/watcher.js";`,
+        `import { startWatcher } from "./src/cli/daemon/watcher.js";`,
         `const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),"csmoke-")));`,
         `let got = false;`,
         `const w = await startWatcher(root, buildIgnoreMatcher(root), (e) => { for (const ev of e) if (ev.relPath === "x.txt") got = true; }, { debounceMs: 30 });`,

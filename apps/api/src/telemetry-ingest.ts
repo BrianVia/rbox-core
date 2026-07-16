@@ -1,7 +1,7 @@
 import type { Env } from "./env.js";
 import type { Principal } from "./authz.js";
 import { authorizeWorkspace } from "./authz.js";
-import { readBodyCapped } from "./commit-envelope.js";
+import { readBodyCapped } from "./util.js";
 import { dbFor } from "./db.js";
 import { isRecord } from "./diagnostics.js";
 import { rateLimited } from "./ratelimit.js";

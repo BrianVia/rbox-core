@@ -30,8 +30,8 @@ import { formatUpdateAvailableLine, readUpdateCheckState } from "./update-check.
 import { shortWorkspaceId } from "./workspace-picker.js";
 import { readFreshPopulateStatus } from "./populate-status.js";
 import { readLockingHealth, type LockingHealth } from "./sync-mutex.js";
-import { readAmbientDaemonStatusRecord, validDaemonVersion } from "./ambient-status.js";
-import { serializeGitDeferralLanes } from "./git-deferral-json.js";
+import { readAmbientDaemonStatusRecord, validDaemonVersion } from "./daemon/ambient-status.js";
+import { serializeGitDeferralLanes } from "./sync-git/git-deferral-json.js";
 
 interface StatusAccountJson {
   plan: string | null;

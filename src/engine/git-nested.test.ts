@@ -9,7 +9,6 @@ import {
   assertGitTargetWithinRoot,
   buildIgnoreMatcher,
   captureGitState,
-  decideDirBundleAllArgs,
   discoverGitRepos,
   encryptFileToTemp,
   gitIdentity,
@@ -26,6 +25,7 @@ import {
   type FileEntry,
   type GitSection,
 } from "./index.js";
+import { decideDirBundleAllArgs } from "./git/capture.js";
 
 const exec = promisify(execFile);
 const TEST_GIT_ENV = {

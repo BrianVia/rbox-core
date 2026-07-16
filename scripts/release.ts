@@ -14,8 +14,7 @@
 import { createHash, createPrivateKey, createPublicKey, sign as edSign } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { releaseSigningInput } from "../src/cli/upgrade-cmd.js";
-import { verifyReleaseArtifacts } from "../src/cli/release-verify.js";
+import { releaseSigningInput, verifyReleaseArtifacts } from "../src/cli/release-verify.js";
 import { RELEASE_KEYS } from "../src/cli/release-key.js";
 import { buildCryptoWorkerBundle } from "./build-crypto-worker.js";
 

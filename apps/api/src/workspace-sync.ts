@@ -1,5 +1,5 @@
 import type { Env } from "./env.js";
-import { ctEqual, json, logErr, SHA256_HEX_RE as SHA_RE } from "./util.js";
+import { ctEqual, json, logErr, readBodyCapped, SHA256_HEX_RE as SHA_RE } from "./util.js";
 import { emit as emitMetric, emitDelta, emitRedeemPhases, startOp, type MetricEvent } from "./metrics.js";
 import {
   validateCommitRefs,
@@ -20,7 +20,6 @@ import {
   MAX_COMMIT_BODY,
   MAX_COMMIT_SPAN,
   MAX_REQUEST_BODY,
-  readBodyCapped,
   orderChainFirst,
   readRefMode,
   unsatisfiedBlobsBody,

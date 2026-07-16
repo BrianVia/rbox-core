@@ -1,25 +1,25 @@
 import fs from "node:fs";
 import path from "node:path";
-import { daemonPidPath, daemonStatusPath } from "./rbox-paths.js";
-import type { DaemonActivity } from "./activity.js";
-import type { TransferPhase } from "./transfer-progress.js";
-import { syncStreamId, type RepoRecord, type WorkspaceConfig } from "./config.js";
+import { daemonPidPath, daemonStatusPath } from "../rbox-paths.js";
+import type { DaemonActivity } from "../activity.js";
+import type { TransferPhase } from "../transfer-progress.js";
+import { syncStreamId, type RepoRecord, type WorkspaceConfig } from "../config.js";
 import {
   gitDeferralReasonPresentation,
   isKnownGitDeferralReason,
   projectGitDeferralRepos,
   type GitDeferralRemediationClass,
-} from "./status-view.js";
-import { parseSemver } from "./semver.js";
+} from "../status-view.js";
+import { parseSemver } from "../semver.js";
 import {
   AMBIENT_STATUS_STALE_MS,
   hasFreshPopulateHeartbeat,
   isProcessAlive,
   parsePopulateStatus,
   populateStatusPath,
-} from "./populate-marker.js";
+} from "../populate-marker.js";
 
-export { AMBIENT_STATUS_HEARTBEAT_MS, AMBIENT_STATUS_STALE_MS } from "./populate-marker.js";
+export { AMBIENT_STATUS_HEARTBEAT_MS, AMBIENT_STATUS_STALE_MS } from "../populate-marker.js";
 
 export type AmbientDaemonState = "synced" | "syncing" | "attention" | "paused";
 export type AmbientAttentionReason = "halt" | "out-of-storage" | "watcher-degraded" | "ownership-lost" | "unknown-error";

@@ -1,4 +1,4 @@
-import { readBodyCapped } from "./commit-envelope.js";
+import { readBodyCapped } from "./util.js";
 import type { Env } from "./env.js";
 import { emit, OpSpan } from "./metrics.js";
 import { dbFor } from "./db.js";

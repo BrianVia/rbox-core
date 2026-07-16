@@ -1,4 +1,4 @@
-# CODEMAP — sync-engine module ownership
+# CODEMAP — module ownership
 
 One line per module: what it OWNS, what it must NEVER own. This is the
 structure map design 113 (§6) exists to produce — specs cite these lines
@@ -7,9 +7,9 @@ instead of re-deriving structure from line numbers.
 **Maintenance rule (AGENTS.md):** any PR that adds a module under these
 trees, or changes what a module owns, updates its line here in the same PR.
 
-Scope: the sync engine — `src/cli/sync*`, `src/cli/daemon*`,
+Scope: the API Worker and sync engine — `apps/api/src/`, `src/cli/sync*`, `src/cli/daemon*`,
 `src/cli/e2ee-remote*`, `src/cli/remote/`, `src/cli/publish-pipeline/`,
-`src/engine/`. Command files (`src/cli/*-cmd.ts`), dispatch, and UI helpers
+`src/cli/telemetry/`, `src/engine/`. Command files (`src/cli/*-cmd.ts`), dispatch, and UI helpers
 are deliberately not mapped.
 
 Barrels (`sync.ts`, `sync-git.ts`, `daemon.ts`, `crypto-pool.ts`,
@@ -20,6 +20,31 @@ plain re-export. Internal modules never import their own barrel.
 Files marked **§2.7** are named exceptions to the <600-line rule (single
 closure/class over shared mutable state); carving them is a phase-B design
 with its own review, never a move.
+
+## `apps/api/src/` — API server Worker
+
+```
+apps/api/src/worker.ts — Worker entrypoint: fetch/scheduled/queue plumbing, ordered route dispatch, credential fast paths, route-template telemetry, token-kind gates, and CORS; exports WorkspaceSync/CachedReleases. Never: per-domain endpoint logic.
+apps/api/src/routes/ — ordered thin HTTP method/path matchers over RouteCtx; delegates authenticated/public requests to domain modules. Never: domain policy, persistence, or protocol implementation.
+apps/api/src/auth.ts + apps/api/src/auth/ — authentication/device lifecycle: bearer authentication, device/PAT minting, bootstrap, device-code, pairing, device/API-key/account-surface operations; auth.ts is the compatibility barrel. Never: route dispatch, billing, or E2EE key-material semantics.
+apps/api/src/{billing,stripe,clerk,clerk-signin,plans}.ts — account commerce/identity integration: plan/quota policy, Stripe checkout/portal/webhooks/account repointing, Clerk JWT/web-session/user lifecycle, and sign-in-method projection. Never: blob storage or sync admission.
+apps/api/src/blob*.ts + apps/api/src/pack-gc.ts — blob storage plane: single/multipart/batch/pack protocols, receipts-aware R2 reads/writes, pack inventory/tombstones, and pack garbage collection. Never: manifest/commit admission or account authentication.
+apps/api/src/commit*.ts — commit-admission leaves: envelope parsing and ref-mode validation, sorted-refset delta/shadow classification, and quota/receipt/reference accounting. Never: Durable Object sequencing, route dispatch, or blob transfer.
+apps/api/src/{account-delete,account-link,retention}.ts — account lifecycle: link/unlink/status, deletion grace and durable purge driving, and plan-based retention pruning. Never: authentication credential mechanics, billing-provider internals, or blob protocol serving.
+apps/api/src/telemetry-ingest.ts — bounded fail-closed client telemetry and fleet sync-state envelope validation/normalization into low-cardinality Analytics Engine records. Never: client sync behavior or fleet alert policy.
+apps/api/src/fleet-alerts.ts — persisted fleet drift/reporting-stopped alert evaluation, notification/resolution/renotification, and stale-alert pruning. Never: sync-state ingestion or sync decisions.
+apps/api/src/metrics.ts — privacy-bounded server observability: operation spans, D1/R2/DO timings, commit/redeem/pack/batch phase records, and Analytics Engine emission. Never: feature/domain policy or raw identifiers in dimensions.
+apps/api/src/util.ts — dependency-light Worker helpers: JSON responses, SHA/key formatting, constant-time comparison, hashing/HMAC, chunking, capped-body reads, and blob/pack/manifest object keys. Never: domain policy or persistence.
+apps/api/src/db.ts — the single D1 routing seam between account-data (dbFor) and pre-account directory (dirDb) planes. Never: SQL queries or domain decisions.
+```
+
+### Sanctioned cross-package protocol modules
+
+The API Worker runtime's deliberate cross-package import boundary is limited to
+`src/engine/{refset,pat-token,blob-pack,manifest-chain,manifest-validate,sha256-stream}.ts`.
+All six modules are pinned in `apps/api/tsconfig.json`'s `include` as shared
+wire-protocol code, not a layering violation. Any Worker import beyond this list
+requires an explicit ownership/layering decision.
 
 ## `src/cli/sync/` — sync drivers (pull-then-push cycle)
 
@@ -42,6 +67,7 @@ src/cli/sync-git/plan.ts             — push planner: planGitSections (§2.7 �
 src/cli/sync-git/apply.ts            — pull-side git materialization: applyGitSections, receiver-equivalent repo-key admission, apply metrics, config-lane transactions, conflict preservation, quarantine ordering. Never: planning policy.
 src/cli/sync-git/follow.ts           — design-116/126 checkout orchestration: artifact/index-equivalence staging guards, all-guard and breadcrumb-waiver classification, independent safe-ref publication, journaled checkout commit/recovery adapters. Never: ORIG_HEAD preservation mechanics, D4a journal/reachability/index/pin mechanics, or state-file persistence.
 src/cli/sync-git/orig-head.ts        — design-126 ORIG_HEAD preservation mechanics: exact no-follow read, valid-object recovery-ref planning/pruning, malformed-byte durable quarantine, worktree discriminator. Never: waiver eligibility/classification, journal/checkout commit, or state persistence.
+src/cli/sync-git/git-deferral-json.ts — stable JSON projection of per-repo git deferral lanes, episode timestamps/ages, byte-change flag, and checkout shape for status/git commands. Never: deferral policy, persistence, or rendering.
 src/cli/sync-git/config-lane.ts      — config-lane capture model + receiver: CachedLocalCfg, gitConfigHash, shouldPublishGitConfig, readLocalGitConfig, configReceiver, sameConfigShape. Never: fingerprinting, apply transactions.
 src/cli/sync-git/fingerprint.ts      — divergence fingerprint construction: stat/tree/index tokenization, racy-clean trust, GIT_FINGERPRINT_VERSION derivation (version MUST stay adjacent to the token code it versions — design 113 §8). Never: cache persistence, probing.
 src/cli/sync-git/divergence-cache.ts — divergence cache schema/persistence + probe build/classify/write/refresh. Never: fingerprint token construction.
@@ -56,6 +82,20 @@ src/cli/daemon/daemon.ts     — RboxDaemon (§2.7 — one state machine: pump s
 src/cli/daemon/policy.ts     — daemon policy, pure: DaemonChainRepairPolicy, classifyWatcherError, TrustState/worseTrust, daemonConsumesWakeup, Wants, cadence/retrust/WS constants, reconnectDelayMs/nextSafetyDelay/jitter. Never: class state, I/O.
 src/cli/daemon/render.ts     — daemon log-line rendering: scanStatsLine, summarizeActions, path cleaning. Format strings are load-bearing. Never: state, decisions, sink ownership.
 src/cli/daemon/logger.ts     — per-daemon synchronous dated-log ownership: append/rollover, crash-channel pointers/fallback, unlink recovery, and filename-date retention. Never: daemon sync state or reader/follow policy.
+src/cli/daemon/ambient-status.ts — ambient daemon/prompt status contracts, validation, projection, and rendering over persisted runtime records. Never: writing daemon status or driving daemon state.
+src/cli/daemon/ambient-status-writer.ts — best-effort atomic persistence/removal of ambient daemon status records. Never: status projection, rendering, or daemon decisions.
+src/cli/daemon/watcher.ts    — native/chokidar watcher adapter, ignore filtering, and settled-event batching. Never: daemon trust/retry policy or sync decisions.
+src/cli/daemon/watcher-selftest.ts — compiled-release watcher and I/O-priority smoke probe with machine-readable exit codes. Never: production daemon orchestration.
+src/cli/daemon/drift-audit.ts — watcher-drift measurement contracts, persistence, candidate diff/coverage/continuity classification, and bounded pending resolution. Never: scan scheduling, watcher trust policy, or telemetry emission.
+```
+
+## `src/cli/telemetry/` — opt-out operational telemetry
+
+```
+src/cli/telemetry/contract.ts — client/server telemetry wire schemas, numeric/enum domains, corpus buckets, fleet sync-state contract, and RBOX_TELEMETRY enablement. Never: queueing, transport, or measurement.
+src/cli/telemetry/queue.ts — best-effort bounded in-memory sample coalescing/rings, single-flight flush, backoff, rejection/drop handling, and TelemetryRecorder/Transport contracts. Never: producing measurements or sync-state summaries.
+src/cli/telemetry/sync-state.ts — privacy-bounded fleet sync-state projection plus daemon change/heartbeat reporting with stable binding identity and serialized best-effort sends. Never: alert evaluation or sync-state mutation.
+src/cli/telemetry/lane-accumulator.ts — AsyncLocalStorage-scoped per-push upload-lane byte/time/op accumulation and completion samples. Never: upload scheduling, transport selection, or network I/O.
 ```
 
 ## `src/cli/` — sync-adjacent singles

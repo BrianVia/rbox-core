@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { HashCache, scanManifest } from "../engine/index.js";
 import { classifyWatcherError, nextSafetyDelay, RboxDaemon } from "./daemon.js";
-import { continuityBroken, diffForDrift, horizonClass, loadDriftAudit, mergePending, saveDriftAudit, type DriftCandidate } from "./drift-audit.js";
+import { continuityBroken, diffForDrift, horizonClass, loadDriftAudit, mergePending, saveDriftAudit, type DriftCandidate } from "./daemon/drift-audit.js";
 
 const FLOOR = 60_000;
 const CAP = 300_000;

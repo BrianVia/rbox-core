@@ -8,9 +8,9 @@ import {
   LocalBlobStore,
   reconcile,
   scanManifest,
-  uploadManifestBlobs,
   type Manifest,
 } from "./index.js";
+import { uploadManifestBlobs } from "./apply.js";
 
 // Two working trees (A, B) sharing one blob store == two machines syncing
 // through a remote. We drive the real engine end-to-end and assert on the

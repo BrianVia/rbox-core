@@ -1,7 +1,7 @@
 import { bytes32ToHex, REFSET_HEADER, REFSET_REC } from "../../../src/engine/refset.js";
+import { DIVERGENCE_SAMPLE } from "./metrics.js";
 
 export const FENCE_SET_MAX = 50_000; // design 102 §7.1
-export const DIVERGENCE_SAMPLE = 16; // design 102 §7.1
 export const DELTA_MAX_REFS = 250_000; // design 102 §3.5A.3 (== FOLD_MAX_REFS)
 
 export interface DeltaResult {

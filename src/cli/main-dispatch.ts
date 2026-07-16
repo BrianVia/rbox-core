@@ -496,7 +496,7 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
     case "__watcher-selftest": {
       // Hidden: release-CI self-check (design §41 §6). Proves the native watcher loads
       // from THIS (compiled) binary on this OS/arch and delivers an event. Not in help.
-      const { watcherSelfTest } = await import("./watcher-selftest.js");
+      const { watcherSelfTest } = await import("./daemon/watcher-selftest.js");
       process.exit(await watcherSelfTest(positional[0]));
       break;
     }

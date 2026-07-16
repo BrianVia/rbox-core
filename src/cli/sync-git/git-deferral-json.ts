@@ -1,4 +1,4 @@
-import type { GitDeferral } from "./config.js";
+import type { GitDeferral } from "../config.js";
 
 export interface GitDeferralLaneJson {
   repo: string;

@@ -16,6 +16,44 @@ export const chunked = <T>(xs: T[], n: number): T[][] => {
   return out;
 };
 
+// Read a request body fully but ABORT past `maxBytes` (counted on raw bytes, not the spoofable
+// Content-Length). Returns raw bytes, an empty Uint8Array for an empty body, or null if it exceeds
+// the cap.
+export async function readBytesCapped(req: Request, maxBytes: number): Promise<Uint8Array | null> {
+  if (!req.body) return new Uint8Array(0);
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) {
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => {});
+        return null;
+      }
+      chunks.push(value);
+    }
+  }
+  if (chunks.length === 0) return new Uint8Array(0);
+  if (chunks.length === 1) return chunks[0]!;
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    out.set(c, off);
+    off += c.byteLength;
+  }
+  return out;
+}
+
+// Text wrapper over the byte-preserving capped reader above.
+export async function readBodyCapped(req: Request, maxBytes: number): Promise<string | null> {
+  const bytes = await readBytesCapped(req, maxBytes);
+  if (bytes === null) return null;
+  return new TextDecoder().decode(bytes);
+}
+
 export function logErr(event: string, e: unknown): void {
   console.error(JSON.stringify({ event, errorClass: errClass(e) }));
 }
@@ -27,6 +65,8 @@ export function json(data: unknown, status = 200, headers?: Record<string, strin
 export function blobKey(sha: string): string {
   return `blobs/sha256/${sha.slice(0, 2)}/${sha}`;
 }
+
+export const packKey = (packId: string): string => `packs/v1/${packId}`;
 
 export function toHex(bytes: Uint8Array): string {
   let out = "";

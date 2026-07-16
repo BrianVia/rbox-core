@@ -1,7 +1,56 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { verifyAndParseManifest, type Manifest } from "./upgrade-cmd.js";
+import { fromB64url, utf8, verify } from "../engine/e2ee/index.js";
+import { RELEASE_KEYS } from "./release-key.js";
+
+const DOMAIN = "rbox-release/v1\n"; // signature domain separator
+
+export interface Artifact {
+  sha256: string;
+  path: string; // R2 key under releases/, e.g. "v0.0.2/rbox-linux-x64"
+}
+export interface Manifest {
+  version: string;
+  keyId: string;
+  artifacts: Record<string, Artifact>;
+  releasedAt?: string;
+}
+
+/** The signed preimage: the domain tag prepended to the EXACT manifest bytes. The
+ *  signer (CI) signs this; the client verifies over the same bytes (design 14 U3'). */
+export function releaseSigningInput(manifestBytes: Uint8Array): Uint8Array {
+  return new Uint8Array([...utf8(DOMAIN), ...manifestBytes]);
+}
+
+/**
+ * Verify the detached signature over the RAW manifest bytes against the embedded
+ * keyring, then parse. Throws on unknown key id or bad signature — the ONLY way to
+ * obtain a trusted Manifest. Parsing happens after the verify passes (we read the
+ * untrusted keyId only to select which embedded key to check against).
+ */
+export function verifyAndParseManifest(manifestBytes: Uint8Array, sigBytes: Uint8Array): Manifest {
+  const tampered = "refusing to upgrade (possible tampered update channel)";
+  let manifest: Manifest;
+  try {
+    manifest = JSON.parse(new TextDecoder().decode(manifestBytes)) as Manifest;
+  } catch {
+    throw new Error(`release manifest is not valid JSON — ${tampered}`);
+  }
+  const key = RELEASE_KEYS.find((k) => k.keyId === manifest.keyId);
+  if (!key) throw new Error(`release manifest names an unknown signing key (${manifest.keyId}) — refusing`);
+  // A tampered channel may serve a malformed (non-b64url) signature; treat any
+  // decode/verify failure as the same security refusal rather than leaking a
+  // low-level "invalid characters" decode error to the user.
+  let ok = false;
+  try {
+    ok = verify(fromB64url(key.pubKey), releaseSigningInput(manifestBytes), fromB64url(new TextDecoder().decode(sigBytes).trim()));
+  } catch {
+    ok = false;
+  }
+  if (!ok) throw new Error(`release signature did not verify — ${tampered}`);
+  return manifest;
+}
 
 /**
  * The single gate every publish path MUST pass through (design §41). Reads
