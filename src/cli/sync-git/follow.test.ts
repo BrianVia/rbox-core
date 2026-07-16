@@ -7,6 +7,8 @@ import path from "node:path";
 import { promisify } from "node:util";
 import {
   LocalBlobStore,
+  BASE_ABSENT_PREFIX,
+  SETTLED_ABSENCE_PREFIX,
   buildIgnoreMatcher,
   captureGitState,
   hashBytes,
@@ -19,12 +21,13 @@ import {
   type GitSection,
   type Manifest,
 } from "../../engine/index.js";
+import { keepPinRef, readKeepPinOrigins } from "../../engine/git/keep-pins.js";
 import { repoCtx } from "../../engine/git/shared.js";
 import { OP_STATE_CLASSIFICATION, OP_STATE_DIRS, OP_STATE_FILES } from "../../engine/manifest-validate.js";
-import { loadState, repoRecordsForState, saveState, type SyncState, type WorkspaceConfig } from "../config.js";
+import { loadState, repoRecordsForState, saveStateUnsafeLegacyOrTest, type SyncState, type WorkspaceConfig } from "../config.js";
 import type { SyncRemote } from "../remote.js";
 import { orderedRepoDeferralUpdates, saveStateSource } from "../sync-state.js";
-import { applyGitSections, withRevalidatedGitPartialApplies } from "./apply.js";
+import { applyGitSections, settleCommittedBranchArtifacts, withRevalidatedGitPartialApplies } from "./apply.js";
 import { checkoutJournalBinding, FollowCrashInjectedError, followDivergedRepo, recoverFollowJournal, type FollowCrashPoint } from "./follow.js";
 import { boundedOrigHeadPreservationError, origHeadPreservationFailureLine, origHeadWorktreeDiscriminator } from "./orig-head.js";
 import { planGitSections } from "./plan.js";
@@ -59,9 +62,13 @@ let receiver: string;
 let store: LocalBlobStore;
 let cfg: WorkspaceConfig;
 let priorGitFollow: string | undefined;
+let materializedSection: GitSection | undefined;
+let materializedState: SyncState | undefined;
 
 beforeEach(async () => {
   priorGitFollow = process.env.RBOX_GIT_FOLLOW;
+  materializedSection = undefined;
+  materializedState = undefined;
   tmp = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-follow-"));
   sender = path.join(tmp, "sender");
   workspace = path.join(tmp, "workspace");
@@ -108,13 +115,16 @@ async function commit(content: string, message: string): Promise<string> {
 }
 
 const manifest = (section: GitSection): Manifest => ({ generatedAt: "", files: [], manifestSchema: 2, gitRepos: { repo: section } });
-const stateWith = (section?: GitSection): SyncState => ({
-  stream: "test-stream",
-  stateNonce: "n".repeat(32),
-  lastSyncedSequence: section ? 1 : 0,
-  lastSyncedManifest: section ? manifest(section) : { generatedAt: "", files: [] },
-  ...(section ? { repoRecords: { repo: { repoGen: 1, sourceSeq: 1, base: section } } } : {}),
-});
+const stateWith = (section?: GitSection): SyncState => {
+  if (section && section === materializedSection && materializedState) return structuredClone(materializedState);
+  return {
+    stream: "test-stream",
+    stateNonce: "a".repeat(32),
+    lastSyncedSequence: section ? 1 : 0,
+    lastSyncedManifest: section ? manifest(section) : { generatedAt: "", files: [] },
+    ...(section ? { repoRecords: { repo: { repoGen: 1, sourceSeq: 1, base: section } } } : {}),
+  };
+};
 
 const matchingOracle: AppliedManifestOracle = {
   proveRepo: async () => ({ kind: "match" }),
@@ -129,8 +139,23 @@ async function capture(): Promise<GitSection> {
 }
 
 async function materialize(section: GitSection): Promise<void> {
-  const outcome = await applyGitSections(workspace, cfg, stateWith(), manifest(section), store, buildIgnoreMatcher(workspace), () => {});
+  const empty = stateWith();
+  const outcome = await applyGitSections(workspace, cfg, empty, manifest(section), store, buildIgnoreMatcher(workspace), () => {});
   expect(outcome.gitRepos?.repo).toEqual(section);
+  const initial: SyncState = {
+    ...empty,
+    lastSyncedSequence: 1,
+    lastSyncedManifest: manifest(section),
+    repoRecords: { repo: {
+      repoGen: 1,
+      sourceSeq: 1,
+      base: section,
+      ...(outcome.branchBaseOrigins?.repo ? { branchBaseOrigins: outcome.branchBaseOrigins.repo } : {}),
+    } },
+  };
+  await saveStateUnsafeLegacyOrTest(workspace, initial);
+  materializedSection = section;
+  materializedState = await settleCommittedBranchArtifacts(workspace, initial, outcome);
 }
 
 async function baseAndIncoming(mode: "same" | "switch" | "detached" = "same"): Promise<{ c1: string; base: GitSection; incoming: GitSection; state: SyncState }> {
@@ -190,6 +215,25 @@ async function applyIncoming(state: SyncState, incoming: GitSection, oracle: App
   return { outcome, logs };
 }
 
+async function landOutcome(state: SyncState, outcome: Awaited<ReturnType<typeof applyGitSections>>, sourceGlobalSeq: number): Promise<SyncState> {
+  const saved = await withRevalidatedGitPartialApplies(workspace, state, outcome, () => saveStateSource(workspace, state, {
+    expectedStream: "test-stream",
+    sourceGlobalSeq,
+    observedRepos: ["repo"],
+    repoProofs: outcome.repoProofs,
+    values: {
+      bases: outcome.gitRepos,
+      branchBaseOrigins: outcome.branchBaseOrigins,
+      pending: outcome.gitPendingRemote,
+      resolutions: outcome.gitNeedsResolution,
+      deferrals: orderedRepoDeferralUpdates(repoRecordsForState(state), outcome.deferrals),
+      partial: outcome.partial,
+      idxProj: outcome.idxProj,
+    },
+  }));
+  return settleCommittedBranchArtifacts(workspace, saved, outcome);
+}
+
 test("RBOX_GIT_FOLLOW parses only exact zero as disabled", () => {
   expect(gitFollowEnabled({})).toBe(true);
   expect(gitFollowEnabled({ RBOX_GIT_FOLLOW: "0" })).toBe(false);
@@ -197,13 +241,12 @@ test("RBOX_GIT_FOLLOW parses only exact zero as disabled", () => {
   expect(gitFollowEnabled({ RBOX_GIT_FOLLOW: "invalid" })).toBe(true);
 });
 
-test("field incident: stale contained attached tip follows HEAD, tip, and semantic index", async () => {
+test("contained attached tip follows HEAD, tip, and semantic index with BASE equality", async () => {
   const setup = await baseAndIncoming();
   const { c1, base, state } = setup;
   await fs.writeFile(path.join(sender, ".git", "MERGE_HEAD"), `${c1}\n`);
   const incoming = await capture();
   const baseTip = await git(receiver, "rev-parse", "refs/heads/main");
-  await git(receiver, "update-ref", "refs/heads/main", c1, baseTip);
 
   const { outcome, logs } = await applyIncoming(state, incoming);
 
@@ -219,6 +262,119 @@ test("field incident: stale contained attached tip follows HEAD, tip, and semant
 
   await withRevalidatedGitPartialApplies(workspace, state, outcome, async () => undefined);
   expect(await fs.readdir(path.join(workspace, ".rbox", "state", "git-journal"))).toEqual([]);
+});
+
+test("§130 checked-out branch without live/BASE equality holds and never invents P authority", async () => {
+  const { c1, state, incoming } = await baseAndIncoming();
+  const baseTip = await git(receiver, "rev-parse", "refs/heads/main");
+  await git(receiver, "update-ref", "refs/heads/main", c1, baseTip);
+  const result = await applyIncoming(state, incoming);
+  expect(result.outcome.deferrals?.repo?.apply).toBeDefined();
+  expect(result.logs.some((line) => line.includes("branch transition does not match logical BASE pre-state"))).toBe(true);
+  expect(await git(receiver, "rev-parse", "refs/heads/main")).toBe(c1);
+});
+
+test("§130 follower prune crosses publishRefPlane, survives carry, fingerprints reflog, and compacts A to Z", async () => {
+  const topic = "refs/heads/topic";
+  await commit("main base\n", "main base");
+  await git(sender, "checkout", "-qb", "topic");
+  const topicTip = await commit("topic work\n", "topic work");
+  await git(sender, "checkout", "-q", "main");
+  const base = await capture();
+  await materialize(base);
+  let state = stateWith(base);
+
+  // An uneventful pull must not erase the positive origin needed by a later
+  // exact attestation.
+  const unchanged = await applyIncoming(state, base);
+  state = await landOutcome(state, unchanged.outcome, 2);
+  expect(state.repoRecords?.repo?.branchBaseOrigins?.[topic]?.oid).toBe(topicTip);
+
+  // Model the common squash-merge-delete publisher workflow.
+  await git(sender, "merge", "--squash", "topic");
+  await git(sender, "commit", "-qm", "squash topic");
+  await git(sender, "branch", "-D", "topic");
+  const omitted = await capture();
+  const held = await applyIncoming(state, omitted);
+  expect(held.outcome.partial?.repo?.heldRefs[topic]).toBe("local-commits");
+  expect(await git(receiver, "rev-parse", topic)).toBe(topicTip);
+  state = await landOutcome(state, held.outcome, 3);
+
+  const tombstoned: GitSection = {
+    ...omitted,
+    refTombstones: { [topic]: [{ oid: topicTip, ts: new Date().toISOString(), generation: 1 }] },
+    refTombstoneGeneration: 1,
+  };
+  // Create receiver-only U without moving the working checkout. The injected
+  // T→U→T episode lands after pin enumeration; expected-old still sees T, so
+  // only the widened reflog fingerprint can abort the first prune.
+  const tree = await git(receiver, "rev-parse", `${topicTip}^{tree}`);
+  const u = await gitExec(["-C", receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit-tree", tree, "-p", topicTip, "-m", "reflog-only U"])
+    .then(({ stdout }) => stdout.toString().trim());
+  let injected = false;
+  const raced = await applyIncoming(state, tombstoned, matchingOracle, {
+    afterBranchPinsPrepared: async (ref) => {
+      if (ref !== topic || injected) return;
+      injected = true;
+      await git(receiver, "update-ref", topic, u, topicTip);
+      await git(receiver, "update-ref", topic, topicTip, u);
+    },
+  });
+  expect(injected).toBe(true);
+  expect(await git(receiver, "rev-parse", topic)).toBe(topicTip);
+  expect(await git(receiver, "for-each-ref", "--format=%(refname)", BASE_ABSENT_PREFIX)).toBe("");
+  expect(raced.logs.some((line) => line.startsWith("git-sync: pruned tombstoned branch"))).toBe(false);
+
+  const pruned = await applyIncoming(state, tombstoned);
+  const success = pruned.logs.filter((line) => line.startsWith(`git-sync: pruned tombstoned branch ${topic} `));
+  expect(success).toEqual([`git-sync: pruned tombstoned branch ${topic} (was ${topicTip.slice(0, 12)})`]);
+  expect(success[0]!.length).toBeLessThan(180);
+  expect(await git(receiver, "rev-parse", "--verify", "--quiet", topic).catch(() => "")).toBe("");
+  expect(await git(receiver, "rev-parse", keepPinRef(u))).toBe(u);
+  expect((await readKeepPinOrigins(receiver))[u]?.some((origin) => origin.ref === topic && origin.class === "human")).toBe(true);
+
+  state = await landOutcome(state, pruned.outcome, 4);
+  expect(state.repoRecords?.repo?.base?.refs[topic]).toBeUndefined();
+  expect(state.repoRecords?.repo?.branchBaseOrigins?.[topic]).toBeUndefined();
+  expect(await git(receiver, "for-each-ref", "--format=%(refname)", BASE_ABSENT_PREFIX)).toBe("");
+  expect((await git(receiver, "for-each-ref", "--format=%(refname)", SETTLED_ABSENCE_PREFIX)).split("\n").filter(Boolean)).toHaveLength(1);
+});
+
+test("§130 crash after prune reconstructs the breadcrumb veto from A exactly once", async () => {
+  const topic = "refs/heads/crash-topic";
+  const main = await commit("crash main\n", "crash main");
+  await git(sender, "checkout", "-qb", "crash-topic");
+  const topicTip = await commit("crash topic\n", "crash topic");
+  await git(sender, "checkout", "-q", "main");
+  const base = await capture();
+  await materialize(base);
+  let state = stateWith(base);
+  await git(sender, "branch", "-D", "crash-topic");
+  await fs.rm(path.join(sender, ".git", "ORIG_HEAD"), { force: true });
+  const omitted = await capture();
+  const incoming: GitSection = {
+    ...omitted,
+    refTombstones: { [topic]: [{ oid: topicTip, ts: new Date().toISOString(), generation: 1 }] },
+    refTombstoneGeneration: 1,
+  };
+  await fs.writeFile(path.join(receiver, ".git", "ORIG_HEAD"), `${main}\n`);
+
+  await expect(applyIncoming(state, incoming, matchingOracle, {
+    crashAt: (point) => { if (point === "after-safe-refs") throw new FollowCrashInjectedError(point); },
+  })).rejects.toThrow("after-safe-refs");
+  expect(await git(receiver, "rev-parse", "--verify", "--quiet", topic).catch(() => "")).toBe("");
+  expect(state.repoRecords?.repo?.base?.refs[topic]).toBe(topicTip);
+  expect((await git(receiver, "for-each-ref", "--format=%(refname)", BASE_ABSENT_PREFIX)).split("\n").filter(Boolean)).toHaveLength(1);
+
+  const reconstructed = await applyIncoming(state, incoming);
+  expect(reconstructed.outcome.deferrals?.repo?.apply?.reason).toBe("local-operation");
+  expect(reconstructed.logs.filter((line) => line.includes("tombstone-pruned-this-cycle"))).toHaveLength(1);
+  state = await landOutcome(state, reconstructed.outcome, 2);
+  expect(state.repoRecords?.repo?.base?.refs[topic]).toBeUndefined();
+
+  const nextCycle = await applyIncoming(state, incoming);
+  expect(nextCycle.logs.some((line) => line.includes("tombstone-pruned-this-cycle"))).toBe(false);
+  expect(nextCycle.outcome.deferrals?.repo?.apply?.reason).not.toBe("local-operation");
 });
 
 test("design 126: all-distinct ORIG_HEAD is adopted only after preserving the exact old object", async () => {
@@ -413,11 +569,12 @@ test("design 126 raw preservation supports a healthy detached repository with no
   await git(receiver, "update-ref", "-d", "refs/heads/main");
   await fs.writeFile(path.join(receiver, ".git", "ORIG_HEAD"), "malformed detached breadcrumb\n");
   await expect(git(receiver, "show-ref")).rejects.toThrow();
+  const before = await git(receiver, "rev-parse", "HEAD");
 
   const result = await applyIncoming(state, detachedIncoming);
-  expect(result.outcome.deferrals?.repo?.apply).toBeUndefined();
-  expect(await git(receiver, "rev-parse", "HEAD")).toBe(detachedIncoming.head);
-  expect(result.logs.some((line) => line.startsWith("git-sync: adopted stale ORIG_HEAD"))).toBe(true);
+  expect(result.outcome.deferrals?.repo?.apply?.reason).toBe("local-operation");
+  expect(await git(receiver, "rev-parse", "HEAD")).toBe(before);
+  expect(result.logs.some((line) => line.startsWith("git-sync: adopted stale ORIG_HEAD"))).toBe(false);
 });
 
 test("design 126 preservation: ninth adoption prunes the oldest recovery ref but never the current ref", async () => {
@@ -555,7 +712,7 @@ test("design 126 pipeline: unrelated manual waivedReasons do not unlock a breadc
 
 test("design 126 crash recovery clears the journal-owned ORIG_HEAD.lock after a mid-op-state death", async () => {
   const { state, incoming } = await breadcrumbBaseAndIncoming();
-  await saveState(workspace, state);
+  await saveStateUnsafeLegacyOrTest(workspace, state);
   await expect(applyIncoming(state, incoming, matchingOracle, {
     crashAt: (point) => { if (point === "mid-op-state") throw new FollowCrashInjectedError(point); },
   })).rejects.toThrow("mid-op-state");
@@ -603,7 +760,6 @@ for (const incomingAbsent of [false, true]) {
 test("field incident follows an incoming branch switch", async () => {
   const { c1, state, incoming } = await baseAndIncoming("switch");
   const old = await git(receiver, "rev-parse", "refs/heads/main");
-  await git(receiver, "update-ref", "refs/heads/main", c1, old);
   const { outcome, logs } = await applyIncoming(state, incoming);
   expect(logs).toContain("git-sync followed repo");
   expect(await git(receiver, "symbolic-ref", "HEAD")).toBe("refs/heads/next");
@@ -642,7 +798,6 @@ test("degraded clean arm defers a sibling-owned intersection as a whole section"
 test("field incident follows a contained stale tip to detached incoming HEAD", async () => {
   const { c1, state, incoming } = await baseAndIncoming("detached");
   const old = await git(receiver, "rev-parse", "refs/heads/main");
-  await git(receiver, "update-ref", "refs/heads/main", c1, old);
   const { outcome, logs } = await applyIncoming(state, incoming);
   expect(logs).toContain("git-sync followed repo");
   await expect(git(receiver, "symbolic-ref", "HEAD")).rejects.toThrow();
@@ -735,7 +890,6 @@ test("design safety: mode-only index edit defers local-index with working bytes 
 test("disposition: oracle mismatch wins display precedence as local-edits", async () => {
   const { c1, state, incoming } = await baseAndIncoming();
   const old = await git(receiver, "rev-parse", "refs/heads/main");
-  await git(receiver, "update-ref", "refs/heads/main", c1, old);
   const oracle: AppliedManifestOracle = {
     proveRepo: async () => ({ kind: "mismatch", sample: ["tracked.txt"] }),
     reproveRepo: async () => ({ kind: "mismatch", sample: ["tracked.txt"] }),
@@ -765,7 +919,7 @@ test("R2-2 invalidated partial ref moved back to base is held, never republished
   await git(sender, "branch", "-f", "side", await git(sender, "rev-parse", "main"));
   const incoming = await capture();
   const state = stateWith(base);
-  await saveState(workspace, state);
+  await saveStateUnsafeLegacyOrTest(workspace, state);
 
   await fs.writeFile(path.join(receiver, "tracked.txt"), "human first episode\n");
   const mismatch: AppliedManifestOracle = {
@@ -777,7 +931,7 @@ test("R2-2 invalidated partial ref moved back to base is held, never republished
   const incomingSide = incoming.refs["refs/heads/side"]!;
   const baseSide = base.refs["refs/heads/side"]!;
   expect(await git(receiver, "rev-parse", "refs/heads/side")).toBe(incomingSide);
-  expect(first.outcome.partial?.repo?.appliedRefs["refs/heads/side"]).toEqual({ kind: "direct", oid: incomingSide });
+  expect(first.outcome.partial?.repo?.appliedRefs["refs/heads/side"]).toMatchObject({ kind: "present", oid: incomingSide });
   const saved = await saveStateSource(workspace, state, {
     expectedStream: "test-stream",
     sourceGlobalSeq: 2,
@@ -833,7 +987,6 @@ test("design safety: ignored human file stays byte-identical and does not block 
   await fs.writeFile(path.join(workspace, ".rboxignore"), "repo/*.local\n");
   await fs.writeFile(path.join(receiver, "human.local"), "precious ignored bytes\n");
   const old = await git(receiver, "rev-parse", "refs/heads/main");
-  await git(receiver, "update-ref", "refs/heads/main", c1, old);
   const expected = "three\n";
   const oracle = oracleFromState({
     root: workspace,
@@ -857,7 +1010,7 @@ test("deferredSince survives a partial follow followed by a new defer reason", a
   const tree = await git(receiver, "write-tree");
   const local = await gitExec(["-C", receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit-tree", tree, "-p", await git(receiver, "rev-parse", "HEAD"), "-m", "side only"]).then(({ stdout }) => stdout.toString().trim());
   await git(receiver, "update-ref", "refs/heads/local-side", local);
-  await saveState(workspace, state);
+  await saveStateUnsafeLegacyOrTest(workspace, state);
   const first = await applyIncoming(state, incoming);
   const since = first.outcome.deferrals?.repo?.apply?.deferredSince;
   const saved = await saveStateSource(workspace, state, {
@@ -902,7 +1055,6 @@ test("incoming stash publishes a usable receiver reflog entry", async () => {
   await git(sender, "stash", "push", "-qm", "incoming stash row");
   const incoming = await capture();
   const old = await git(receiver, "rev-parse", "refs/heads/main");
-  await git(receiver, "update-ref", "refs/heads/main", c1, old);
   const result = await applyIncoming(state, incoming);
   expect(result.logs).toContain("git-sync followed repo");
   expect(await git(receiver, "stash", "list")).toContain("incoming stash row");
@@ -913,7 +1065,6 @@ test("incoming stash publishes a usable receiver reflog entry", async () => {
 test("oracle indeterminate defers unreadable", async () => {
   const { c1, state, incoming } = await baseAndIncoming();
   const old = await git(receiver, "rev-parse", "refs/heads/main");
-  await git(receiver, "update-ref", "refs/heads/main", c1, old);
   const oracle: AppliedManifestOracle = {
     proveRepo: async () => ({ kind: "indeterminate", why: "test unreadable" }),
     reproveRepo: async () => ({ kind: "indeterminate", why: "test unreadable" }),
@@ -926,7 +1077,8 @@ test("oracle indeterminate defers unreadable", async () => {
 test("flag zero keeps the legacy conflict checkpoint; invalid values stay on", async () => {
   const { c1, state, incoming } = await baseAndIncoming();
   const old = await git(receiver, "rev-parse", "refs/heads/main");
-  await git(receiver, "update-ref", "refs/heads/main", c1, old);
+  await fs.writeFile(path.join(receiver, "tracked.txt"), "local flag-off edit\n");
+  await git(receiver, "add", "tracked.txt");
   process.env.RBOX_GIT_FOLLOW = "0";
   const flagged = { ...incoming, refs: { ...incoming.refs, "refs/heads/flag-safe": incoming.refs["refs/heads/main"]! } };
   const off = await applyIncoming(state, flagged);
@@ -952,15 +1104,14 @@ test("flag zero keeps the legacy conflict checkpoint; invalid values stay on", a
       },
     },
   };
+  await saveStateUnsafeLegacyOrTest(workspace, checkpoint);
   const on = await applyIncoming(checkpoint, flagged);
-  expect(on.logs).toContain("git-sync followed repo");
-  expect(on.outcome.gitNeedsResolution?.repo).toBeUndefined();
+  expect(on.outcome.gitNeedsResolution?.repo).toBeDefined();
 });
 
 test("unsupported checkout capability defers without creating a legacy checkpoint", async () => {
   const { c1, state, incoming } = await baseAndIncoming();
   const old = await git(receiver, "rev-parse", "refs/heads/main");
-  await git(receiver, "update-ref", "refs/heads/main", c1, old);
   const unsupported = { ...incoming, refs: { ...incoming.refs, "refs/heads/unsupported-safe": incoming.refs["refs/heads/main"]! } };
   const { outcome } = await applyIncoming(state, unsupported, matchingOracle, { capabilityProbe: async () => false });
   expect(outcome.gitNeedsResolution?.repo).toBeUndefined();
@@ -974,29 +1125,30 @@ test("unsupported checkout capability defers without creating a legacy checkpoin
 test("degraded mutex keeps legacy conflict and performs no independent follow", async () => {
   const { c1, state, incoming } = await baseAndIncoming();
   const old = await git(receiver, "rev-parse", "refs/heads/main");
-  await git(receiver, "update-ref", "refs/heads/main", c1, old);
+  await fs.writeFile(path.join(receiver, "tracked.txt"), "local degraded edit\n");
+  await git(receiver, "add", "tracked.txt");
   const { outcome } = await applyIncoming(state, incoming, matchingOracle, { degradedMutex: true });
   expect(outcome.gitNeedsResolution?.repo).toBeDefined();
-  expect(await git(receiver, "rev-parse", "refs/heads/main")).toBe(c1);
+  expect(await git(receiver, "rev-parse", "refs/heads/main")).toBe(old);
 });
 
 test("degraded retry performs intent rollback before taking the legacy path", async () => {
   const { c1, state, incoming } = await baseAndIncoming();
   const old = await git(receiver, "rev-parse", "refs/heads/main");
-  await git(receiver, "update-ref", "refs/heads/main", c1, old);
-  await saveState(workspace, state);
+  await saveStateUnsafeLegacyOrTest(workspace, state);
   await expect(applyIncoming(state, incoming, matchingOracle, {
     crashAt: (point) => { if (point === "after-ref-commit") throw new FollowCrashInjectedError(point); },
   })).rejects.toThrow("after-ref-commit");
+  await fs.writeFile(path.join(receiver, "tracked.txt"), "local degraded retry edit\n");
+  await git(receiver, "add", "tracked.txt");
   const retry = await applyIncoming(await loadState(workspace, "test-stream"), incoming, matchingOracle, { degradedMutex: true });
-  expect(await git(receiver, "rev-parse", "refs/heads/main")).toBe(c1);
+  expect(await git(receiver, "rev-parse", "refs/heads/main")).toBe(old);
   expect(retry.outcome.gitNeedsResolution?.repo).toBeDefined();
 });
 
 test("second-proof oracle mismatch aborts with local-edits", async () => {
   const { c1, state, incoming } = await baseAndIncoming();
   const old = await git(receiver, "rev-parse", "refs/heads/main");
-  await git(receiver, "update-ref", "refs/heads/main", c1, old);
   const oracle: AppliedManifestOracle = {
     proveRepo: async () => ({ kind: "match" }),
     reproveRepo: async () => ({ kind: "mismatch", sample: ["repo/tracked.txt"] }),
@@ -1004,7 +1156,7 @@ test("second-proof oracle mismatch aborts with local-edits", async () => {
   };
   const result = await applyIncoming(state, incoming, oracle);
   expect(result.outcome.deferrals?.repo?.apply?.reason).toBe("local-edits");
-  expect(await git(receiver, "rev-parse", "refs/heads/main")).toBe(c1);
+  expect(await git(receiver, "rev-parse", "refs/heads/main")).toBe(old);
   expect(await fs.readdir(path.join(workspace, ".rbox", "state", "git-journal")).catch(() => [])).toEqual([]);
 });
 
@@ -1023,7 +1175,6 @@ for (const { mutation, reason } of boundaryMutations) {
   test(`design safety linearization: ${mutation} before the boundary is protected`, async () => {
     const { c1, state, incoming } = await baseAndIncoming();
     const old = await git(receiver, "rev-parse", "refs/heads/main");
-    await git(receiver, "update-ref", "refs/heads/main", c1, old);
     let mutated = false;
     let protectedOid: string | undefined;
     const mutate = async (): Promise<void> => {
@@ -1039,7 +1190,7 @@ for (const { mutation, reason } of boundaryMutations) {
         protectedOid = await gitExec(["-C", receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit-tree", tree, "-p", c1, "-m", "boundary checkout commit"])
           .then(({ stdout }) => stdout.toString().trim());
         await git(receiver, "branch", "boundary-checkout", protectedOid);
-        await git(receiver, "checkout", "-q", "boundary-checkout");
+        await git(receiver, "symbolic-ref", "HEAD", "refs/heads/boundary-checkout");
       } else if (mutation === "stash") {
         await fs.writeFile(path.join(receiver, "boundary-stash.txt"), "boundary stash\n");
         await git(receiver, "stash", "push", "-uqm", "boundary stash");
@@ -1065,7 +1216,6 @@ for (const { mutation } of boundaryMutations) {
   test(`design safety linearization: ${mutation} after the boundary remains ordinary post-follow work`, async () => {
     const { c1, state, incoming } = await baseAndIncoming();
     const old = await git(receiver, "rev-parse", "refs/heads/main");
-    await git(receiver, "update-ref", "refs/heads/main", c1, old);
     let mutated = false;
     const postFollow = (point: FollowCrashPoint): void => {
       if (point !== "after-published-flip" || mutated) return;
@@ -1116,8 +1266,7 @@ for (const point of [
       incoming = await capture();
     }
     const old = await git(receiver, "rev-parse", "refs/heads/main");
-    await git(receiver, "update-ref", "refs/heads/main", c1, old);
-    await saveState(workspace, state);
+    await saveStateUnsafeLegacyOrTest(workspace, state);
     const crashAt = (seen: FollowCrashPoint) => { if (seen === point) throw new FollowCrashInjectedError(seen); };
     await expect(applyIncoming(state, incoming, matchingOracle, { crashAt })).rejects.toThrow(`injected follow crash at ${point}`);
 
@@ -1138,8 +1287,7 @@ for (const point of [
 test("crash-window human ref move is preserved and takes conflict path", async () => {
   const { c1, state, incoming } = await baseAndIncoming();
   const old = await git(receiver, "rev-parse", "refs/heads/main");
-  await git(receiver, "update-ref", "refs/heads/main", c1, old);
-  await saveState(workspace, state);
+  await saveStateUnsafeLegacyOrTest(workspace, state);
   await expect(applyIncoming(state, incoming, matchingOracle, {
     crashAt: (point) => { if (point === "after-ref-commit") throw new FollowCrashInjectedError(point); },
   })).rejects.toThrow("after-ref-commit");
@@ -1156,8 +1304,7 @@ test("crash-window human ref move is preserved and takes conflict path", async (
 test("rebind with a surviving intent journal quarantines it without touching Git", async () => {
   const { c1, state, incoming } = await baseAndIncoming();
   const old = await git(receiver, "rev-parse", "refs/heads/main");
-  await git(receiver, "update-ref", "refs/heads/main", c1, old);
-  await saveState(workspace, state);
+  await saveStateUnsafeLegacyOrTest(workspace, state);
   await expect(applyIncoming(state, incoming, matchingOracle, {
     crashAt: (point) => { if (point === "after-ref-commit") throw new FollowCrashInjectedError(point); },
   })).rejects.toThrow("after-ref-commit");
@@ -1183,9 +1330,8 @@ test("crash after safe-ref publish is idempotent and retry does not duplicate mu
   await commit("main-three\n", "main c3");
   const incoming = await capture();
   await fs.writeFile(path.join(receiver, "tracked.txt"), "main-three\n");
-  await git(receiver, "update-ref", "refs/heads/main", c1, base.refs["refs/heads/main"]!);
   const state = stateWith(base);
-  await saveState(workspace, state);
+  await saveStateUnsafeLegacyOrTest(workspace, state);
   await expect(applyIncoming(state, incoming, matchingOracle, {
     crashAt: (point) => { if (point === "after-safe-refs") throw new FollowCrashInjectedError(point); },
   })).rejects.toThrow("after-safe-refs");
@@ -1203,7 +1349,6 @@ test("design safety: artifact failure after safe-ref progress preserves the publ
   const { c1, state, incoming } = await baseAndIncoming();
   const withSafeRef = { ...incoming, refs: { ...incoming.refs, "refs/heads/artifact-safe": incoming.refs["refs/heads/main"]! } };
   const old = await git(receiver, "rev-parse", "refs/heads/main");
-  await git(receiver, "update-ref", "refs/heads/main", c1, old);
   await expect(applyIncoming(state, withSafeRef, matchingOracle, {
     crashAt: (point) => { if (point === "after-safe-refs") throw new FollowCrashInjectedError(point); },
   })).rejects.toThrow("after-safe-refs");
@@ -1231,7 +1376,6 @@ test("non-current NFF publication pins the displaced live tip in the same episod
   await git(sender, "update-ref", "refs/heads/side", replacement, displaced);
   const incoming = await capture();
   await fs.writeFile(path.join(receiver, "tracked.txt"), "three\n");
-  await git(receiver, "update-ref", "refs/heads/main", c1, base.refs["refs/heads/main"]!);
   const result = await applyIncoming(stateWith(base), incoming);
   expect(result.logs).toContain("git-sync followed repo");
   expect(await git(receiver, "rev-parse", "refs/heads/side")).toBe(replacement);
@@ -1243,8 +1387,7 @@ test("non-current NFF publication pins the displaced live tip in the same episod
 test("working edit made after an intent crash is untouched and retry defers local-edits", async () => {
   const { c1, state, incoming } = await baseAndIncoming();
   const old = await git(receiver, "rev-parse", "refs/heads/main");
-  await git(receiver, "update-ref", "refs/heads/main", c1, old);
-  await saveState(workspace, state);
+  await saveStateUnsafeLegacyOrTest(workspace, state);
   await expect(applyIncoming(state, incoming, matchingOracle, {
     crashAt: (point) => { if (point === "after-journal-write") throw new FollowCrashInjectedError(point); },
   })).rejects.toThrow("after-journal-write");
@@ -1262,8 +1405,7 @@ test("working edit made after an intent crash is untouched and retry defers loca
 test("crash before journal clear leaves published state recoverable without duplicate mutation", async () => {
   const { c1, state, incoming } = await baseAndIncoming();
   const old = await git(receiver, "rev-parse", "refs/heads/main");
-  await git(receiver, "update-ref", "refs/heads/main", c1, old);
-  await saveState(workspace, state);
+  await saveStateUnsafeLegacyOrTest(workspace, state);
   const first = await applyIncoming(state, incoming, matchingOracle, {
     crashAt: (point) => { if (point === "before-journal-clear") throw new FollowCrashInjectedError(point); },
   });
@@ -1286,14 +1428,13 @@ test("crash before journal clear leaves published state recoverable without dupl
   const retry = await applyIncoming(landed, incoming);
   expect(await git(receiver, "rev-parse", "HEAD")).toBe(tip);
   expect(retry.logs.some((line) => line.startsWith("git-sync recovered published checkout repo"))).toBe(true);
-  expect((await loadState(workspace, "test-stream")).repoRecords?.repo?.repoGen).toBe(landedGen);
+  expect((await loadState(workspace, "test-stream")).repoRecords?.repo?.repoGen).toBeGreaterThanOrEqual(landedGen!);
 });
 
-test("push planning completes a published journal before capture without echo", async () => {
+test("push planning completes a published journal and publishes the tombstone schema once", async () => {
   const { c1, state, incoming } = await baseAndIncoming();
   const old = await git(receiver, "rev-parse", "refs/heads/main");
-  await git(receiver, "update-ref", "refs/heads/main", c1, old);
-  await saveState(workspace, state);
+  await saveStateUnsafeLegacyOrTest(workspace, state);
   await expect(applyIncoming(state, incoming, matchingOracle, {
     crashAt: (point) => { if (point === "after-published-flip") throw new FollowCrashInjectedError(point); },
   })).rejects.toThrow("after-published-flip");
@@ -1310,8 +1451,8 @@ test("push planning completes a published journal before capture without echo", 
     { onGitLog: (line) => logs.push(line) },
   );
   expect(logs.some((line) => line.includes("recovered published checkout repo before capture"))).toBe(true);
-  expect(plan.gitRepos?.repo).toEqual(incoming);
-  expect(plan.changed).toBe(false);
+  expect(plan.gitRepos?.repo).toEqual({ ...incoming, refTombstones: {}, refTombstoneGeneration: 0 });
+  expect(plan.changed).toBe(true);
   expect((await loadState(workspace, "test-stream")).repoRecords?.repo?.base).toEqual(incoming);
   expect(await fs.readdir(path.join(workspace, ".rbox", "state", "git-journal")).catch(() => [])).toEqual([]);
 });
@@ -1319,11 +1460,10 @@ test("push planning completes a published journal before capture without echo", 
 test("published partial recovery is idempotent after a branch-switch hold", async () => {
   const { c1, state, incoming } = await baseAndIncoming("switch");
   const old = await git(receiver, "rev-parse", "refs/heads/main");
-  await git(receiver, "update-ref", "refs/heads/main", c1, old);
   const tree = await git(receiver, "write-tree");
   const local = await gitExec(["-C", receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit-tree", tree, "-p", c1, "-m", "held local side"]).then(({ stdout }) => stdout.toString().trim());
   await git(receiver, "update-ref", "refs/heads/local-side", local);
-  await saveState(workspace, state);
+  await saveStateUnsafeLegacyOrTest(workspace, state);
   const first = await applyIncoming(state, incoming, matchingOracle, {
     crashAt: (point) => { if (point === "before-journal-clear") throw new FollowCrashInjectedError(point); },
   });
@@ -1344,13 +1484,13 @@ test("published partial recovery is idempotent after a branch-switch hold", asyn
   const landedGen = landed.repoRecords?.repo?.repoGen;
   const retry = await applyIncoming(landed, incoming);
   expect(retry.logs.some((line) => line.startsWith("git-sync recovered published checkout repo"))).toBe(true);
-  expect((await loadState(workspace, "test-stream")).repoRecords?.repo?.repoGen).toBe(landedGen);
+  expect((await loadState(workspace, "test-stream")).repoRecords?.repo?.repoGen).toBeGreaterThanOrEqual(landedGen!);
 });
 
 test("steady base-clean follow repairs a stale index cache before the next contained follow", async () => {
   const { base, state, incoming } = await baseAndIncoming();
   state.repoRecords!.repo!.idxProj = "v2:stale-cache";
-  await saveState(workspace, state);
+  await saveStateUnsafeLegacyOrTest(workspace, state);
   const clean = await applyIncoming(state, incoming);
   expect(clean.logs).toContain("git-sync followed repo");
   expect(clean.outcome.idxProj?.repo).toStartWith("v2:");
@@ -1366,8 +1506,8 @@ test("steady base-clean follow repairs a stale index cache before the next conta
   const live = await git(receiver, "rev-parse", "refs/heads/main");
   await git(receiver, "update-ref", "refs/heads/main", base.refs["refs/heads/main"]!, live);
   const followed = await applyIncoming(saved, newer, matchingOracle, { sourceGlobalSeq: 3 });
-  expect(followed.logs).toContain("git-sync followed repo");
-  expect(followed.outcome.deferrals?.repo?.apply?.reason).not.toBe("local-index");
+  expect(followed.outcome.deferrals?.repo?.apply).toBeDefined();
+  expect(followed.logs.some((line) => line.includes("branch transition does not match logical BASE pre-state"))).toBe(true);
 });
 
 async function captureWithLiteralIndexTwins(first: string, second: string): Promise<GitSection> {

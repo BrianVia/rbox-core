@@ -8,7 +8,7 @@ import {
   applyStateSavePacket,
   loadState,
   manifestFromMeta,
-  saveState,
+  saveStateUnsafeLegacyOrTest,
   validManifestMeta,
   type GlobalManifestMeta,
   type SyncState,
@@ -45,7 +45,7 @@ describe("validManifestMeta", () => {
 
 describe("manifest metadata packet semantics", () => {
   test("accepted globals replace or clear metadata; stale globals preserve it", async () => {
-    await saveState(root, state());
+    await saveStateUnsafeLegacyOrTest(root, state());
     const accepted = composeStateSavePacket(state(), { expectedStream: stream, sourceGlobalSeq: 2, globalManifest: { generatedAt: "two", files: [] }, manifestMeta: meta, observedRepos: [], values: {} });
     expect((await applyStateSavePacket(root, accepted, { lock: lock() })).status).toBe("accepted");
     expect((await loadState(root, stream)).manifestMeta).toEqual(meta);
@@ -63,7 +63,7 @@ describe("manifest metadata packet semantics", () => {
     const initial = state();
     initial.lastSyncedSequence = 4;
     initial.repoRecords = { r: { repoGen: 2, sourceSeq: 4, base: section("c") } };
-    await saveState(root, initial);
+    await saveStateUnsafeLegacyOrTest(root, initial);
     const staleGlobal = { expectedStream: stream, expectedNonce: nonce, sourceGlobalSeq: 3, global: { manifest: { generatedAt: "old", files: [] } }, repos: [] };
     expect(await applyStateSavePacket(root, staleGlobal, { lock: lock() })).toMatchObject({ status: "rejected", reason: "global-sequence" });
     const badRepo = { expectedStream: stream, expectedNonce: nonce, sourceGlobalSeq: 5, global: { manifest: { generatedAt: "new", files: [] }, manifestMeta: undefined }, repos: [{ relPath: "r", expectedRepoGen: 1, newRecord: { sourceSeq: 5 } }] };
@@ -74,14 +74,14 @@ describe("manifest metadata packet semantics", () => {
   test("repo-only base changes and retained newer records preserve metadata", async () => {
     const initial = state();
     initial.repoRecords = { r: { repoGen: 0, sourceSeq: 1, base: section("c") } };
-    await saveState(root, initial);
+    await saveStateUnsafeLegacyOrTest(root, initial);
     const changed = composeStateSavePacket(initial, { expectedStream: stream, sourceGlobalSeq: 2, observedRepos: ["r"], values: { bases: { r: section("e") } } });
     await applyStateSavePacket(root, changed, { lock: lock() });
     expect((await loadState(root, stream)).manifestMeta).toEqual(meta);
 
     const newer = state();
     newer.repoRecords = { r: { repoGen: 0, sourceSeq: 5, base: section("c") } };
-    await saveState(root, newer);
+    await saveStateUnsafeLegacyOrTest(root, newer);
     const retained = composeStateSavePacket(newer, { expectedStream: stream, sourceGlobalSeq: 2, observedRepos: ["r"], values: { bases: { r: section("e") } } });
     await applyStateSavePacket(root, retained, { lock: lock() });
     expect((await loadState(root, stream)).manifestMeta).toEqual(meta);

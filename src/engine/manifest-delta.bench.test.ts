@@ -1,6 +1,8 @@
 import { expect, test } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 type Result = { maxRssKb: number; wallMs?: number; residentKb?: number; manifestBytesKb?: number };
 const run = (mode: string): Result => {
@@ -12,41 +14,40 @@ const run = (mode: string): Result => {
 };
 
 const runFold = (): Promise<{ result: Result; peakDeltaKb: number }> => new Promise((resolve, reject) => {
-  const child = spawn(process.execPath, [new URL("./manifest-delta.bench-helper.ts", import.meta.url).pathname, "fold"],
-    { stdio: ["pipe", "pipe", "pipe"] });
+  const readyDir = mkdtempSync(join(tmpdir(), "rbox-manifest-fold-"));
+  const readyPath = join(readyDir, "ready.json");
+  const releasePath = join(readyDir, "release");
+  const child = spawn(process.execPath, [new URL("./manifest-delta.bench-helper.ts", import.meta.url).pathname, "fold", readyPath, releasePath],
+    { stdio: ["ignore", "pipe", "pipe"] });
   let stdout = "";
   let stderr = "";
   let baselineKb: number | undefined;
   let peakKb = 0;
-  let released = false;
   child.stdout.setEncoding("utf8");
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk) => { stderr += chunk; });
   const sample = (): void => {
-    if (!child.pid || baselineKb === undefined) return;
+    if (baselineKb === undefined) {
+      try {
+        baselineKb = (JSON.parse(readFileSync(readyPath, "utf8")) as Result & { ready: true }).residentKb!;
+        peakKb = baselineKb;
+        writeFileSync(releasePath, "go\n");
+      } catch { return; }
+    }
+    if (!child.pid) return;
     try {
       const status = readFileSync(`/proc/${child.pid}/status`, "utf8");
       const resident = Number(/^VmRSS:\s+(\d+)\s+kB$/m.exec(status)?.[1]);
       if (Number.isFinite(resident)) peakKb = Math.max(peakKb, resident);
     } catch { /* The process may have exited between the timer and the read. */ }
   };
-  const timer = setInterval(sample, 1);
-  child.stdout.on("data", (chunk: string) => {
-    stdout += chunk;
-    if (!released) {
-      const line = stdout.split("\n").find((candidate) => candidate.includes('"ready":true'));
-      if (line) {
-        baselineKb = (JSON.parse(line) as Result & { ready: true }).residentKb!;
-        peakKb = baselineKb;
-        released = true;
-        child.stdin.end("go\n");
-      }
-    }
-  });
+  const timer = setInterval(sample, 10);
+  child.stdout.on("data", (chunk: string) => { stdout += chunk; });
   child.on("error", reject);
   child.on("exit", (code) => {
     clearInterval(timer);
     sample();
+    rmSync(readyDir, { recursive: true, force: true });
     if (code !== 0) return reject(new Error(`benchmark child fold failed: ${stderr}`));
     const line = stdout.trim().split("\n").at(-1);
     if (!line || baselineKb === undefined) return reject(new Error("benchmark child fold produced no result"));

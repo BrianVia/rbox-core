@@ -25,7 +25,7 @@ import { bootstrapOnto, cfgFor as harnessCfg, FakeServer, remoteFor as harnessRe
 import { CommitRejectedError } from "./remote.js";
 import { formatLatestTimings, pull, push, pushManifest } from "./sync.js";
 import { repairChain } from "./chain-repair.js";
-import { loadState, manifestFromMeta, saveState, syncStreamId, validManifestMeta, type WorkspaceConfig } from "./config.js";
+import { loadState, manifestFromMeta, saveStateUnsafeLegacyOrTest, syncStreamId, validManifestMeta, type WorkspaceConfig } from "./config.js";
 import { saveStateSource } from "./sync-state.js";
 
 const exec = promisify(execFile);
@@ -400,7 +400,7 @@ test("R6 writer carrying a pending repo preserves evidence and emits consecutive
     const section = state.lastSyncedManifest.gitRepos!.repo!;
     state.gitPendingRemote = { repo: section };
     state.repoRecords = { ...(state.repoRecords ?? {}), repo: { ...(state.repoRecords?.repo ?? { repoGen: 0, sourceSeq: 1 }), pending: section } };
-    await saveState(root, state);
+    await saveStateUnsafeLegacyOrTest(root, state);
 
     await fs.unlink(path.join(root, "link-0299"));
     await fs.symlink(`../changed/${hex(299)}`, path.join(root, "link-0299"));
@@ -433,7 +433,7 @@ test("context-invalid reconstructed writer evidence fails to a snapshot without 
     };
     state.manifestMeta = { ...state.manifestMeta!, gitRepos: { [collidingPath]: section } };
     expect(validManifestMeta(state.manifestMeta)).toBeDefined();
-    await saveState(root, state);
+    await saveStateUnsafeLegacyOrTest(root, state);
     const changed = path.join(root, "partition", "0299");
     await fs.unlink(changed);
     await fs.symlink("../context-invalid-change", changed);
@@ -876,7 +876,7 @@ test("cold chain walk fails closed on hostile signed lists, links, and delta has
         chain: [], chainBytes: 0, snapshotBytes: 123,
         gitRepos: {},
       };
-      await saveState(root, before);
+      await saveStateUnsafeLegacyOrTest(root, before);
       await expect(pull(root, cfg, { remote: peer })).rejects.toBeInstanceOf(ManifestChainError);
       expect((await loadState(root, syncStreamId(cfg))).manifestMeta).toEqual(before.manifestMeta);
       expect(await fs.readFile(path.join(root, "must-survive.txt"), "utf8")).toBe("local bytes");
@@ -1028,7 +1028,7 @@ test("R9 pre-round-3 metadata cold-walks once, upgrades, and re-engages evidence
     const preUpgrade = await loadState(root, syncStreamId(cfg));
     const { gitRepos: _gitRepos, ...preR3Meta } = preUpgrade.manifestMeta!;
     preUpgrade.manifestMeta = preR3Meta as typeof preUpgrade.manifestMeta;
-    await saveState(root, preUpgrade);
+    await saveStateUnsafeLegacyOrTest(root, preUpgrade);
     expect(validManifestMeta((await loadState(root, syncStreamId(cfg))).manifestMeta)).toBeUndefined();
 
     const target: Manifest = { ...base, generatedAt: "r9-target", files: base.files.map((f, i) => i === 9 ? { ...f, mode: 0o755 } : f) };

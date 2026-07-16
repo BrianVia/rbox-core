@@ -21,6 +21,7 @@ export {
   applyGitSections,
   revalidateGitPartialApplies,
   withRevalidatedGitPartialApplies,
+  settleCommittedBranchArtifacts,
   formatGitApplyMetrics,
   type GitPullOutcome,
   type GitApplyRunKind,

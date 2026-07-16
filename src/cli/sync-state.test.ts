@@ -11,7 +11,7 @@ import {
   MAX_LEGACY_GIT_SIDECAR_REPOS,
   repoRecordsForState,
   resetSyncState,
-  saveState,
+  saveStateUnsafeLegacyOrTest,
   type RepoRecord,
   type StateSavePacket,
   type SyncState,
@@ -113,7 +113,7 @@ describe("design 93 §6 transactional unit", () => {
     };
     const initial = baseState({ r: { repoGen: 1, ...previous } });
     const concurrent = baseState({ r: { repoGen: 2, ...previous, cfgApplied: "newer-config", deferrals: { apply: oldApply, capture } } });
-    await saveState(root, concurrent);
+    await saveStateUnsafeLegacyOrTest(root, concurrent);
     const recovered = await savePublishedRepoIntent(root, initial, "r", {
       relPath: "r", expectedRepoGen: 1, previousRecord: previous, record: intended,
     });
@@ -145,7 +145,7 @@ describe("design 93 §6 transactional unit", () => {
       deferrals: { apply: conflict },
     };
     const initial = baseState({ r: { repoGen: 3, ...previous } });
-    await saveState(root, initial);
+    await saveStateUnsafeLegacyOrTest(root, initial);
 
     const recovered = await savePublishedRepoIntent(root, initial, "r", {
       relPath: "r",
@@ -193,7 +193,7 @@ describe("design 93 §6 transactional unit", () => {
     const concurrent = baseState({
       r: { ...previous, repoGen: 4, deferrals: { apply: refreshedConflict } },
     });
-    await saveState(root, concurrent);
+    await saveStateUnsafeLegacyOrTest(root, concurrent);
 
     const recovered = await savePublishedRepoIntent(root, initial, "r", {
       relPath: "r",
@@ -222,7 +222,7 @@ describe("design 93 §6 transactional unit", () => {
     const previous = { sourceSeq: 4, base: section("incoming"), deferrals: { apply: previousDeferral } };
     const initial = baseState({ r: { repoGen: 3, ...previous } });
     const concurrent = baseState({ r: { repoGen: 4, sourceSeq: 4, base: section("incoming"), deferrals: { apply: refreshed } } });
-    await saveState(root, concurrent);
+    await saveStateUnsafeLegacyOrTest(root, concurrent);
 
     const recovered = await savePublishedRepoIntent(root, initial, "r", {
       relPath: "r",
@@ -243,7 +243,7 @@ describe("design 93 §6 transactional unit", () => {
     const initial = baseState({ r: { repoGen: 1, ...previous } });
     const concurrent = baseState({ r: { repoGen: 2, sourceSeq: 9, base: section("old") } });
     concurrent.lastSyncedSequence = 9;
-    await saveState(root, concurrent);
+    await saveStateUnsafeLegacyOrTest(root, concurrent);
 
     const recovered = await savePublishedRepoIntent(root, initial, "r", {
       relPath: "r",
@@ -274,7 +274,7 @@ describe("design 93 §6 transactional unit", () => {
     const previous = { sourceSeq: 4, base: section("old"), deferrals: { apply: previousDeferral } };
     const initial = baseState({ r: { repoGen: 3, ...previous } });
     const concurrent = baseState({ r: { repoGen: 4, sourceSeq: 4, base: section("old"), deferrals: { apply: newerEpisode } } });
-    await saveState(root, concurrent);
+    await saveStateUnsafeLegacyOrTest(root, concurrent);
 
     const recovered = await savePublishedRepoIntent(root, initial, "r", {
       relPath: "r",
@@ -287,7 +287,7 @@ describe("design 93 §6 transactional unit", () => {
     expect(recovered.state.repoRecords?.r).toEqual(concurrent.repoRecords?.r);
   });
 
-  test("identity degradation forces the legacy save/reset path and strips config-lane fences", async () => {
+  test("identity degradation permits legacy save but design 130 forbids fence-free reset", async () => {
     const unavailable: LockIdentitySource = {
       current: async () => { throw new Error("no identity source"); },
       probe: async () => ({ status: "unknown" }),
@@ -342,10 +342,11 @@ describe("design 93 §6 transactional unit", () => {
       partial,
     });
 
-    await resetSyncState(root, "next-stream", syncMutex);
-    const reset = await loadState(root, "next-stream");
-    expect(reset.stateNonce).toBeUndefined();
-    expect(reset.repoRecords).toBeUndefined();
+    await expect(resetSyncState(root, "next-stream", syncMutex)).rejects.toThrow("non-degraded workspace fence");
+    const preserved = await loadState(root, stream);
+    expect(preserved.stateNonce).toBeUndefined();
+    expect(preserved.repoRecords).toBeUndefined();
+    expect(preserved.lastSyncedManifest.gitRepos?.r).toEqual(section("next"));
     await releaseWorkspaceSyncMutex(syncMutex);
   });
 
@@ -372,7 +373,7 @@ describe("design 93 §6 transactional unit", () => {
   });
 
   test("file-only global candidate rebuilds gitRepos solely from records", async () => {
-    await saveState(root, baseState({ r: { repoGen: 0, sourceSeq: 0, base: section("old") } }));
+    await saveStateUnsafeLegacyOrTest(root, baseState({ r: { repoGen: 0, sourceSeq: 0, base: section("old") } }));
     const packet = composeStateSavePacket(baseState({ r: { repoGen: 0, sourceSeq: 0, base: section("old") } }), {
       expectedStream: stream,
       sourceGlobalSeq: 1,
@@ -393,13 +394,13 @@ describe("design 93 §6 transactional unit", () => {
     const older: StateSource = { expectedStream: stream, sourceGlobalSeq: 1, globalManifest: manifest("one"), observedRepos: ["r"], values: { bases: { r: section("base") }, pending: { r: section("pending-old") } } };
     const newer: StateSource = { expectedStream: stream, sourceGlobalSeq: 2, globalManifest: manifest("two"), observedRepos: ["r"], values: { bases: { r: section("success") } } };
 
-    await saveState(root, initial);
+    await saveStateUnsafeLegacyOrTest(root, initial);
     await saveStateSource(root, initial, older);
     await saveStateSource(root, initial, newer);
     expect(repoRecordsForState(await loadState(root, stream)).r?.pending).toBeUndefined();
     expect(repoRecordsForState(await loadState(root, stream)).r?.base).toEqual(section("success"));
 
-    await saveState(root, initial);
+    await saveStateUnsafeLegacyOrTest(root, initial);
     await saveStateSource(root, initial, newer);
     await saveStateSource(root, initial, older);
     const reverse = repoRecordsForState(await loadState(root, stream)).r!;
@@ -413,7 +414,7 @@ describe("design 93 §6 transactional unit", () => {
     const success: StateSource = { expectedStream: stream, sourceGlobalSeq: 2, globalManifest: manifest("two"), observedRepos: ["r"], values: { bases: { r: section("success") } } };
     const pending: StateSource = { expectedStream: stream, sourceGlobalSeq: 3, globalManifest: manifest("three"), observedRepos: ["r"], values: { bases: { r: section("success") }, pending: { r: section("pending-new") } } };
     for (const order of [[success, pending], [pending, success]]) {
-      await saveState(root, initial);
+      await saveStateUnsafeLegacyOrTest(root, initial);
       await saveStateSource(root, initial, order[0]!);
       await saveStateSource(root, initial, order[1]!);
       const record = repoRecordsForState(await loadState(root, stream)).r!;
@@ -425,7 +426,7 @@ describe("design 93 §6 transactional unit", () => {
   test("repoGen prevents value ABA", async () => {
     const episode = { lane: "apply" as const, deferredSince: "2026-01-01T00:00:00.000Z", reasonSince: "2026-01-01T00:00:00.000Z", lastSeen: "2026-01-01T00:00:00.000Z", reason: "conflict" as const };
     const initial = baseState({ r: { repoGen: 0, sourceSeq: 0, base: section("A"), deferrals: { apply: episode }, partial: { incomingKey: "a", checkoutPending: false, appliedRefs: {}, heldRefs: {}, configApplied: true } } });
-    await saveState(root, initial);
+    await saveStateUnsafeLegacyOrTest(root, initial);
     const delayed: StateSavePacket = { expectedStream: stream, expectedNonce: nonce, sourceGlobalSeq: 1, repos: [{ relPath: "r", expectedRepoGen: 0, newRecord: { sourceSeq: 1, base: section("delayed") } }] };
     const toB = { ...delayed, repos: [{ relPath: "r", expectedRepoGen: 0, newRecord: { sourceSeq: 1, base: section("B"), deferrals: { apply: episode }, partial: { incomingKey: "b", checkoutPending: false, appliedRefs: {}, heldRefs: {}, configApplied: true } } }] };
     expect((await applyStateSavePacket(root, toB, { lock: lock() })).status).toBe("accepted");
@@ -441,7 +442,7 @@ describe("design 93 §6 transactional unit", () => {
     const current = baseState({ x: { repoGen: 0, sourceSeq: 2, base: section("new-x") }, y: { repoGen: 0, sourceSeq: 0, base: section("y") } });
     current.lastSyncedSequence = 2;
     current.lastSyncedManifest = manifest("two", { x: section("new-x"), y: section("y") });
-    await saveState(root, current);
+    await saveStateUnsafeLegacyOrTest(root, current);
     const stale: StateSavePacket = {
       expectedStream: stream,
       expectedNonce: nonce,
@@ -459,7 +460,7 @@ describe("design 93 §6 transactional unit", () => {
   test("source atomicity rejects global when a repo CAS fails and repos when global is stale", async () => {
     const initial = baseState({ r: { repoGen: 1, sourceSeq: 1, base: section("base") } });
     initial.lastSyncedSequence = 1;
-    await saveState(root, initial);
+    await saveStateUnsafeLegacyOrTest(root, initial);
     const badRepo: StateSavePacket = { expectedStream: stream, expectedNonce: nonce, sourceGlobalSeq: 2, global: { manifest: manifest("two") }, repos: [{ relPath: "r", expectedRepoGen: 0, newRecord: { sourceSeq: 2, base: section("bad") } }] };
     expect(await applyStateSavePacket(root, badRepo, { lock: lock() })).toMatchObject({ status: "rejected", reason: "repo-generation" });
     expect((await loadState(root, stream)).lastSyncedSequence).toBe(1);
@@ -475,7 +476,7 @@ describe("design 93 §6 transactional unit", () => {
       b: { repoGen: 0, sourceSeq: 5, base: section("b") },
     });
     initial.lastSyncedSequence = 5;
-    await saveState(root, initial);
+    await saveStateUnsafeLegacyOrTest(root, initial);
     const values = { bases: { a: section("a"), b: section("b") }, removed: {} };
     expect(changedSidecarRepoKeys(initial, values)).toEqual(["a"]);
     await saveStateSource(root, initial, { expectedStream: stream, sourceGlobalSeq: 5, observedRepos: ["a"], values });
@@ -487,7 +488,7 @@ describe("design 93 §6 transactional unit", () => {
 
   test("stream and nonce mismatches reject the whole packet", async () => {
     const initial = baseState({ r: { repoGen: 0, sourceSeq: 0, base: section("base") } });
-    await saveState(root, initial);
+    await saveStateUnsafeLegacyOrTest(root, initial);
     const packet = composeStateSavePacket(initial, { expectedStream: stream, sourceGlobalSeq: 1, globalManifest: manifest("one"), observedRepos: ["r"], values: { bases: { r: section("next") } } });
     expect(await applyStateSavePacket(root, { ...packet, expectedStream: "other" }, { lock: lock() })).toMatchObject({ status: "rejected", reason: "stream" });
     expect(await applyStateSavePacket(root, { ...packet, expectedNonce: "b".repeat(32) }, { lock: lock() })).toMatchObject({ status: "rejected", reason: "nonce" });
@@ -496,7 +497,7 @@ describe("design 93 §6 transactional unit", () => {
 
   test("legacy sentinel matches only nonce-less state and first save installs nonce", async () => {
     const legacy = { ...baseState(), stateNonce: undefined };
-    await saveState(root, legacy);
+    await saveStateUnsafeLegacyOrTest(root, legacy);
     const packet = composeStateSavePacket(legacy, { expectedStream: stream, sourceGlobalSeq: 1, globalManifest: manifest("one"), observedRepos: [], values: {} });
     expect(packet.expectedNonce).toBe("legacy");
     expect((await applyStateSavePacket(root, packet, { lock: lock() })).status).toBe("accepted");
@@ -507,7 +508,7 @@ describe("design 93 §6 transactional unit", () => {
 
   test("same-binding reset regenerates nonce and delayed packet rejects", async () => {
     const initial = baseState();
-    await saveState(root, initial);
+    await saveStateUnsafeLegacyOrTest(root, initial);
     const delayed = composeStateSavePacket(initial, { expectedStream: stream, sourceGlobalSeq: 1, globalManifest: manifest("one"), observedRepos: [], values: {} });
     const syncMutex = await acquireWorkspaceSyncMutex(root, "cli", { lock: lock(), attempts: 1 });
     await resetSyncState(root, stream, syncMutex);
@@ -518,7 +519,7 @@ describe("design 93 §6 transactional unit", () => {
   });
 
   test("A→B→A reset changes nonce and daemon iteration revalidation detects it", async () => {
-    await saveState(root, baseState());
+    await saveStateUnsafeLegacyOrTest(root, baseState());
     const mutexA = await acquireWorkspaceSyncMutex(root, "cli", { lock: lock(), attempts: 1 });
     await resetSyncState(root, "stream-B", mutexA);
     await resetSyncState(root, stream, mutexA);
@@ -528,11 +529,11 @@ describe("design 93 §6 transactional unit", () => {
     expect(await daemonBindingMatches(root, stream, expectedStateNonce(rebound))).toBe(true);
   });
 
-  test("observedRepoKeys includes explicit observed absence", () => {
+  test("observedRepoKeys includes explicit observed absence without manufacturing branch BASE absence", () => {
     const state = baseState({ absentNow: { repoGen: 1, sourceSeq: 1, base: section("old") } });
     expect(observedRepoKeys(state, {}, {})).toEqual(["absentNow"]);
     const packet = composeStateSavePacket(state, { expectedStream: stream, sourceGlobalSeq: 2, observedRepos: observedRepoKeys(state, {}, {}), values: {} });
-    expect(packet.repos[0]?.newRecord.base).toBeUndefined();
+    expect(packet.repos[0]?.newRecord.base).toEqual(section("old"));
   });
 
   test("a rejected packet recomputes in-operation, bounded to three attempts", async () => {
@@ -708,17 +709,17 @@ describe("design 93 §6 transactional unit", () => {
     expect(packet.repos[0]?.newRecord.partial).toBeUndefined();
   });
 
-  test("reset disposes git journal directory and shell deferral sidecar", async () => {
-    await saveState(root, baseState());
+  test("reset refuses an unbound checkout journal and preserves all reset sidecars", async () => {
+    await saveStateUnsafeLegacyOrTest(root, baseState());
     const journal = path.join(root, ".rbox", "state", "git-journal");
     const shell = path.join(root, ".rbox", "state", "shell.deferrals");
     await fs.mkdir(journal, { recursive: true });
     await fs.writeFile(path.join(journal, "entry"), "x");
     await fs.writeFile(shell, "v1\n");
     const mutex = await acquireWorkspaceSyncMutex(root, "cli", { lock: lock(), attempts: 1 });
-    await resetSyncState(root, stream, mutex);
+    await expect(resetSyncState(root, stream, mutex)).rejects.toThrow("unbound or unreadable checkout journal");
     await releaseWorkspaceSyncMutex(mutex);
-    expect(await fs.stat(journal).catch(() => undefined)).toBeUndefined();
-    expect(await fs.stat(shell).catch(() => undefined)).toBeUndefined();
+    expect(await fs.readFile(path.join(journal, "entry"), "utf8")).toBe("x");
+    expect(await fs.readFile(shell, "utf8")).toBe("v1\n");
   });
 });

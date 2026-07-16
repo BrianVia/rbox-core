@@ -1,5 +1,6 @@
 import type { FileEntry, Manifest } from "./types.js";
 import { canonicalManifestHashStreaming, decodeEnvelope, encodeDeltaEnvelope, foldDelta } from "./manifest-delta.js";
+import { existsSync, writeFileSync } from "node:fs";
 
 const mode = process.argv[2];
 const hex = (n: number): string => n.toString(16).padStart(64, "0");
@@ -26,8 +27,17 @@ const target: Manifest = { ...base, generatedAt: "bench-target", files: base.fil
 const baseHash = canonicalManifestHashStreaming(base);
 const encoded = await encodeDeltaEnvelope(base, target, { baseEncSha: "a".repeat(64), baseManifestHash: baseHash, compress: false });
 if (mode === "fold") {
-  console.log(JSON.stringify({ ready: true, residentKb: Math.ceil(process.memoryUsage().rss / 1024) }));
-  await new Promise<void>((resolve) => process.stdin.once("data", () => resolve()));
+  const ready = JSON.stringify({ ready: true, residentKb: Math.ceil(process.memoryUsage().rss / 1024) });
+  // Bun can buffer a piped stdout line while this child is paused on stdin,
+  // deadlocking the benchmark parent before the measured fold starts. The
+  // optional file is a readiness transport only; results remain on stdout.
+  if (process.argv[3] && process.argv[4]) {
+    writeFileSync(process.argv[3], ready);
+    while (!existsSync(process.argv[4])) await new Promise((resolve) => setTimeout(resolve, 5));
+  } else {
+    console.log(ready);
+    await new Promise<void>((resolve) => process.stdin.once("data", () => resolve()));
+  }
 }
 const start = performance.now();
 const decoded = await decodeEnvelope(encoded.bytes);

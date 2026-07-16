@@ -1016,6 +1016,12 @@ export class RboxDaemon {
       if (e instanceof CommitRejectedError && e.stillBlocked) {
         this.pushTerminalBlocked = true;
         this.logTerminalPushBlocked(e.fingerprint);
+        // The attempt may have established the capable state lineage before the
+        // remote repeated its terminal refusal. Adopt that durable nonce just as
+        // the normal completion path does, or the next pump mistakes our own
+        // initialization for an idle rebind and stops the daemon.
+        const durableState = await this.loadSyncBase();
+        this.emitDurableGitDeferrals(durableState);
         return;
       }
       throw e;

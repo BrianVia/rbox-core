@@ -20,11 +20,70 @@ export const MAX_PACK_CHAIN = 8;
 /** Bound on `gitRepos` entries — raise-on-measurement; a LOUD error at the boundary, never a
  *  silent drop (§30's lesson; design 43 §2). */
 export const MAX_GIT_REPOS = 256;
+export const MAX_REF_TOMBSTONES_PER_REF = 16;
+export const MAX_REF_TOMBSTONES_PER_REPO = 512;
 
 const SHA_RE = /^[0-9a-f]{64}$/;
 const HEX40 = /^[0-9a-f]{40}$/;
 const utf8 = new TextEncoder();
 const isNonNegativeInteger = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v >= 0;
+const isNonNegativeSafeInteger = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
+
+/** Pure check-ref-format subset for the only namespace design 130 admits. */
+function validTombstoneBranchRef(ref: string): boolean {
+  if (!ref.startsWith("refs/heads/")) return false;
+  const tail = ref.slice("refs/heads/".length);
+  if (!tail || tail.startsWith("/") || tail.endsWith("/") || tail.endsWith(".")) return false;
+  if (tail.includes("//") || tail.includes("..") || tail.includes("@{")) return false;
+  if (/[\x00-\x20\x7f~^:?*\[\\]/.test(tail)) return false;
+  return tail.split("/").every((part) => part.length > 0 && !part.startsWith(".") && !part.endsWith(".lock"));
+}
+
+const canonicalUtcMilliseconds = (value: unknown): value is string => {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) return false;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
+};
+
+/** Strict reader-side validation for the optional design-130 wire fields. Their joint
+ * absence is the skew-compatible old-writer shape; once either is present, both fields
+ * and the complete bounded container must be valid before an attestation can be built. */
+export function validateRefTombstones(section: Record<string, unknown>): { ok: true } | { ok: false; reason: string } {
+  const raw = section.refTombstones;
+  const generation = section.refTombstoneGeneration;
+  if (raw === undefined && generation === undefined) return { ok: true };
+  if (raw === undefined || generation === undefined) return { ok: false, reason: "incomplete ref tombstone fields" };
+  const chains = asRecord(raw);
+  if (!chains) return { ok: false, reason: "bad refTombstones" };
+  if (!isNonNegativeSafeInteger(generation)) return { ok: false, reason: "bad refTombstoneGeneration" };
+  let total = 0;
+  let maximum = 0;
+  for (const [ref, value] of Object.entries(chains)) {
+    if (!validTombstoneBranchRef(ref)) return { ok: false, reason: `bad tombstone ref ${ref}` };
+    if (!Array.isArray(value) || value.length === 0) return { ok: false, reason: `bad tombstone chain ${ref}` };
+    if (value.length > MAX_REF_TOMBSTONES_PER_REF) return { ok: false, reason: `tombstone chain ${ref} exceeds ${MAX_REF_TOMBSTONES_PER_REF}` };
+    total += value.length;
+    if (total > MAX_REF_TOMBSTONES_PER_REPO) return { ok: false, reason: `refTombstones exceeds ${MAX_REF_TOMBSTONES_PER_REPO}` };
+    const seen = new Set<string>();
+    let priorGeneration = 0;
+    for (const item of value) {
+      const entry = asRecord(item);
+      if (!entry || Object.keys(entry).sort().join(",") !== "generation,oid,ts") return { ok: false, reason: `bad tombstone entry ${ref}` };
+      if (typeof entry.oid !== "string" || !HEX40.test(entry.oid)) return { ok: false, reason: `bad tombstone oid ${ref}` };
+      if (seen.has(entry.oid)) return { ok: false, reason: `duplicate tombstone oid ${ref}` };
+      seen.add(entry.oid);
+      if (!canonicalUtcMilliseconds(entry.ts)) return { ok: false, reason: `bad tombstone timestamp ${ref}` };
+      if (!isNonNegativeSafeInteger(entry.generation) || entry.generation === 0 || entry.generation <= priorGeneration) {
+        return { ok: false, reason: `bad tombstone generation ${ref}` };
+      }
+      priorGeneration = entry.generation;
+      maximum = Math.max(maximum, entry.generation);
+    }
+  }
+  if (generation < maximum) return { ok: false, reason: "refTombstoneGeneration below retained entry" };
+  if (generation === 0 && total !== 0) return { ok: false, reason: "zero refTombstoneGeneration with non-empty chains" };
+  return { ok: true };
+}
 
 /** A relative POSIX path that cannot escape the root or smuggle control bytes. */
 export function isSafeRelPath(p: unknown): p is string {
@@ -300,6 +359,8 @@ export function validateGitSection(input: unknown): { ok: boolean; reason?: stri
   }
   const headBranch = /^ref: (refs\/heads\/\S+)$/.exec(s.head.trim())?.[1];
   if (headBranch && refs[headBranch] === undefined) return { ok: false, reason: `HEAD branch ${headBranch} not in refs` };
+  const tombstones = validateRefTombstones(s);
+  if (!tombstones.ok) return tombstones;
   const opState = s.opState == null ? {} : asRecord(s.opState);
   if (!opState) return { ok: false, reason: "bad opState" };
   for (const [rel, ref] of Object.entries(opState)) {

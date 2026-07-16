@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import {
@@ -12,6 +13,13 @@ import {
   type BlobStore,
   type CheckoutCapabilityProbe,
   type GitSection,
+  settleBaseAbsentArtifact,
+  inspectLockedPRepairReceipt,
+  persistPRepairTerminal,
+  readBasePresentArtifact,
+  refreshLockedAcceptedPRepair,
+  resumeLockedAcceptedPRepair,
+  runLockedPRepairAttempt,
 } from "../engine/index.js";
 import { enumerateRefReflogOids, pinDisplaced } from "../engine/git/keep-pins.js";
 import { quarantineLocal } from "../engine/git/quarantine.js";
@@ -44,6 +52,10 @@ import {
   type FollowProgress,
 } from "./sync-git/follow.js";
 import { checkoutLabel, gitIncomingKey, repoDirOf, sectionOpState } from "./sync-git/shared.js";
+import { composeRepoBase, type ManualBranchDecision, type RepoBaseLockedProof, type RepoBaseProof } from "./sync-git/base-composer.js";
+import { prepareFollowerBranchProtocol, type FollowerBranchProtocol } from "./sync-git/follower-protocol.js";
+import { settleExactPresentArtifact } from "./sync-git/p-settlement.js";
+import { createPRepairStatePort, createPRepairStatePortFromReceipt } from "./sync-git/p-repair-state.js";
 import { ageBucket, hasGitResolutionIncoming, projectGitDeferralRepos, sanitizeTerminalText, type GitDeferralRepoProjection } from "./status-view.js";
 import { serializeGitDeferralLanes } from "./sync-git/git-deferral-json.js";
 import { shQuote } from "./shell-quote.js";
@@ -577,6 +589,126 @@ async function recoverFirst(root: string, rel: string, ctx: RepoCtx | undefined,
   return { state };
 }
 
+type ManualProtocolPreflight =
+  | { status: "ready"; state: SyncState; record: RepoRecord; incoming: GitSection; protocol: FollowerBranchProtocol }
+  | { status: "hold"; reason: string };
+
+/** A confirmation snapshot is never taken while exact P authority stands. */
+async function preflightManualPresentArtifacts(args: {
+  root: string;
+  rel: string;
+  ctx: RepoCtx;
+  state: SyncState;
+  incoming?: GitSection;
+}): Promise<ManualProtocolPreflight> {
+  let state = args.state;
+  for (let pass = 0; pass < 8; pass++) {
+    const record = repoRecordsForState(state)[args.rel];
+    const incoming = args.incoming ?? incomingFor(record);
+    if (!record || !incoming) return { status: "hold", reason: "deferred incoming state disappeared during manual preflight" };
+    let compacted = false;
+    for (const [ref, receipt] of Object.entries(record.partial?.pRepaired ?? {})) {
+      const inspected = await inspectLockedPRepairReceipt(args.ctx.repoDir, receipt);
+      if (inspected.action === "compact-and-restart") {
+        const port = createPRepairStatePortFromReceipt({
+          root: args.root, stream: state.stream, relPath: args.rel, repoKind: args.ctx.kind,
+          effectiveRefScope: record.base?.refScope ?? incoming.refScope, receipt,
+        });
+        const snapshot = await port.read();
+        if (await persistPRepairTerminal(port, "compact", snapshot, receipt) !== "accepted") {
+          return { status: "hold", reason: `P-repair terminal receipt CAS rejected for ${ref}` };
+        }
+        state = await loadState(args.root, state.stream);
+        compacted = true;
+        break;
+      }
+      if (inspected.action === "corruption-hold" || inspected.action === "artifact-contradiction-hold") {
+        return { status: "hold", reason: `P-repair terminal inspection refused ${ref}: ${inspected.action}` };
+      }
+    }
+    if (compacted) continue;
+    const liveRefs = await readAllRefs(args.ctx.repoDir);
+    const prepared = await prepareFollowerBranchProtocol({
+      workspaceRoot: args.root, relPath: args.rel, state, ctx: args.ctx, record,
+      base: record.base, incoming, liveRefs,
+    });
+    if (prepared.status === "hold") return prepared;
+    for (const ref of new Set([...Object.keys(record.base?.refs ?? {}), ...Object.keys(incoming.refs), ...Object.keys(liveRefs)])) {
+      if (!ref.startsWith("refs/heads/")) continue;
+      const changesProtectedBase = (record.base?.refs[ref] ?? null) !== (incoming.refs[ref] ?? null);
+      const changesPhysicalRef = (liveRefs[ref] ?? null) !== (incoming.refs[ref] ?? null);
+      const disposition = prepared.protocol.artifacts[ref];
+      const foreign = disposition?.absence === "active-foreign" || disposition?.present === "active-foreign"
+        || disposition?.settledAbsence === "active-foreign" || disposition?.keeps === "mismatched";
+      if (foreign && (changesProtectedBase || changesPhysicalRef)) {
+        return { status: "hold", reason: `foreign BASE artifact vetoes confirmed mutation of ${ref}` };
+      }
+    }
+    const p = prepared.protocol.presentArtifacts[0];
+    if (!p) return { status: "ready", state, record, incoming, protocol: prepared.protocol };
+    const exact = await settleExactPresentArtifact({
+      root: args.root, stream: state.stream, state, relPath: args.rel, ctx: args.ctx,
+      binding: prepared.protocol.binding, p,
+    });
+    if (exact.status === "settled") { state = exact.state; continue; }
+    if (exact.status === "absent") {
+      const reloaded = await loadState(args.root, state.stream);
+      state = reloaded;
+      continue;
+    }
+    if (exact.status === "moved") {
+      const port = createPRepairStatePort({
+        root: args.root, stream: state.stream, relPath: args.rel, repoKind: args.ctx.kind,
+        effectiveRefScope: record.base?.refScope ?? incoming.refScope, p,
+      });
+      const disposition = prepared.protocol.artifacts[p.payload.ref];
+      const validateArtifacts = async (): Promise<boolean> => {
+        const fresh = await readBasePresentArtifact(args.ctx.repoDir, prepared.protocol.binding, p.payload.ref);
+        return fresh.status === "valid" && fresh.artifact.targetOid === p.targetOid
+          && disposition?.present === "valid-owning" && disposition.keeps === "exact"
+          && disposition.absence === "absent" && disposition.settledAbsence === "absent";
+      };
+      const accepted = record.partial?.pRepaired?.[p.payload.ref];
+      const repaired = accepted
+        ? await resumeLockedAcceptedPRepair({ repoDir: args.ctx.repoDir, receipt: accepted, validateArtifacts }).then(async (resumed) =>
+            resumed.status === "refresh-receipt"
+              ? refreshLockedAcceptedPRepair({
+                  repoDir: args.ctx.repoDir, p, state: port, repairAt: new Date().toISOString(), acceptedReceipt: accepted,
+                  mismatches: { live: exact.reason === "live", reflog: exact.reason === "reflog", baseShape: exact.reason === "base-shape" },
+                  validateArtifacts,
+                })
+              : resumed.status === "restart" ? { status: "restart" as const } : { status: "hold" as const, reason: resumed.reason })
+        : await runLockedPRepairAttempt({
+            repoDir: args.ctx.repoDir, p, state: port, repairAt: new Date().toISOString(),
+            mismatches: { live: exact.reason === "live", reflog: exact.reason === "reflog", baseShape: exact.reason === "base-shape" },
+            validateArtifacts,
+          });
+      if (repaired.status === "hold") return { status: "hold", reason: repaired.reason };
+      state = await loadState(args.root, state.stream);
+      continue;
+    }
+    return { status: "hold", reason: exact.reason };
+  }
+  return { status: "hold", reason: "P settlement did not stabilize before confirmation" };
+}
+
+async function settleCommittedManualPresentArtifacts(args: {
+  root: string;
+  rel: string;
+  ctx: RepoCtx;
+  state: SyncState;
+  incoming: GitSection;
+}): Promise<{ state: SyncState; error?: string }> {
+  const preflight = await preflightManualPresentArtifacts({ ...args, incoming: args.incoming });
+  if (preflight.status === "hold") return { state: args.state, error: preflight.reason };
+  for (const [ref, disposition] of Object.entries(preflight.protocol.artifacts)) {
+    if (disposition.absence === "valid-owning") {
+      await settleBaseAbsentArtifact(args.ctx.repoDir, preflight.protocol.binding, ref);
+    }
+  }
+  return { state: preflight.state };
+}
+
 export async function gitResolveCmd(
   root: string,
   repoArg: string,
@@ -625,11 +757,23 @@ export async function gitResolveCmd(
     }
 
     await assertGitTargetWithinRoot(root, rel);
-    const record = repoRecordsForState(state)[rel];
-    const incoming = incomingFor(record);
+    let record = repoRecordsForState(state)[rel];
+    let incoming = incomingFor(record);
     if (!record || !incoming || !env.cfg.kek) {
       emit({ status: "refused", verb, repo: rel, code: "no-incoming", message: "no deferred incoming Git state is available for this repository" }, json, deps, root);
       return 1;
+    }
+    let branchProtocol: FollowerBranchProtocol | undefined;
+    if (verb === "take-theirs") {
+      const preflight = await preflightManualPresentArtifacts({ root, rel, ctx, state });
+      if (preflight.status === "hold") {
+        emit({ status: "refused", verb, repo: rel, code: "artifact", message: preflight.reason }, json, deps, root);
+        return 1;
+      }
+      state = preflight.state;
+      record = preflight.record;
+      incoming = preflight.incoming;
+      branchProtocol = preflight.protocol;
     }
     let progressTimer: ReturnType<typeof setInterval> | undefined;
     let progressStarted = 0;
@@ -700,8 +844,85 @@ export async function gitResolveCmd(
     let intended: FollowIntended | undefined;
     let boundaryMismatch = false;
     const previousRecord: RepoRecordInput = inputRecord(record);
+    const manualEpisode = crypto.randomBytes(16).toString("hex");
     const makeIntended = (progress: FollowProgress): FollowIntended => {
-      const next: RepoRecordInput = { ...previousRecord, sourceSeq: Math.max(record.sourceSeq, state.lastSyncedSequence), base: incoming };
+      if (!branchProtocol) throw new Error("manual lineage proof unavailable");
+      const branchDecisions: Record<string, ManualBranchDecision> = {};
+      const branches: Record<string, RepoBaseLockedProof["branches"][string]> = {};
+      for (const [ref, witness] of Object.entries(progress.branchWitnesses ?? {})) {
+        branchDecisions[ref] = {
+          kind: "artifact",
+          beforeBaseOid: branchProtocol.logicalBaseRefs[ref] ?? null,
+          witness,
+        };
+        branches[ref] = {
+          liveOid: witness.kind === "present" ? witness.nextOid : null,
+          witness,
+          ...(witness.kind === "present" ? { reflogEpisode: witness.episode } : {}),
+          artifactsClear: true,
+          ownershipStable: true,
+          reflogStable: true,
+          currentRef: false,
+          siblingOwned: false,
+        };
+      }
+      for (const [ref, terminal] of Object.entries(progress.manualBranchTerminals ?? {})) {
+        branchDecisions[ref] = {
+          kind: "no-p", beforeOid: terminal.beforeBaseOid, afterOid: terminal.afterOid, episode: manualEpisode,
+        };
+        branches[ref] = {
+          liveOid: terminal.afterOid,
+          artifactsClear: true,
+          ownershipStable: true,
+          reflogStable: true,
+          currentRef: false,
+          siblingOwned: false,
+        };
+      }
+      const safeRefs: RepoBaseLockedProof["safeRefs"] = Object.fromEntries(
+        Object.entries(progress.safeRefWitnesses ?? {}).map(([ref, witness]) => [ref, {
+          liveOid: witness.afterOid,
+          witness,
+          ...(ref === "refs/stash" && witness.afterOid !== null ? { stashReflogReady: true } : {}),
+        }]),
+      );
+      const baseProof: RepoBaseProof = {
+        authority: {
+          kind: "manual",
+          lineageHash: branchProtocol.lineageHash,
+          repositoryIdentityHash: branchProtocol.repositoryIdentityHash,
+          incomingKey: gitIncomingKey(incoming),
+          episode: manualEpisode,
+          snapshotId: snapshot.public.snapshot,
+          stateGeneration: record.repoGen,
+          branchDecisions,
+          safeRefWitnesses: progress.safeRefWitnesses ?? {},
+        },
+        lockedProof: {
+          repoKind: ctx.kind,
+          effectiveRefScope: incoming.refScope,
+          checkoutComplete: true,
+          incomingKey: gitIncomingKey(incoming),
+          stateGeneration: record.repoGen,
+          snapshotId: snapshot.public.snapshot,
+          freshConfirmation: true,
+          branches,
+          safeRefs,
+        },
+      };
+      const composed = composeRepoBase(
+        { base: record.base, branchBaseOrigins: record.branchBaseOrigins },
+        { base: incoming },
+        baseProof.authority,
+        baseProof.lockedProof,
+      );
+      if (composed.disposition !== "terminal") throw new Error("manual BASE proof is incomplete");
+      const next: RepoRecordInput = {
+        ...previousRecord,
+        sourceSeq: Math.max(record.sourceSeq, state.lastSyncedSequence),
+        ...(composed.base ? { base: composed.base } : {}),
+        ...(composed.branchBaseOrigins ? { branchBaseOrigins: composed.branchBaseOrigins } : {}),
+      };
       delete next.pending;
       delete next.resolutionKey;
       delete next.partial;
@@ -710,7 +931,7 @@ export async function gitResolveCmd(
       delete deferrals.apply;
       if (Object.keys(deferrals).length) next.deferrals = deferrals; else delete next.deferrals;
       if (progress.incomingIndexProjection !== undefined) next.idxProj = progress.incomingIndexProjection;
-      intended = { record: next, expectedRepoGen: record.repoGen, relPath: rel, previousRecord };
+      intended = { record: next, expectedRepoGen: record.repoGen, relPath: rel, previousRecord, baseProof };
       return intended;
     };
     const confirmedIdentity = JSON.stringify(snapshot.identity);
@@ -726,6 +947,7 @@ export async function gitResolveCmd(
       oracle: snapshot.oracle,
       record,
       binding,
+      branchProtocol,
       followEnabled: true,
       makeIntended,
       capabilityProbe: deps.capabilityProbe,
@@ -764,6 +986,8 @@ export async function gitResolveCmd(
     if (Object.keys(follow.heldRefs).length || !intended) throw new Error("manual resolution published an incomplete checkout");
     const landed = await recoverAndLandFollowJournal(root, rel, binding, state);
     if (landed.recovery.status !== "keep") throw new Error("published checkout journal could not be recovered");
+    const pSettled = await settleCommittedManualPresentArtifacts({ root, rel, ctx, state: landed.state, incoming });
+    if (pSettled.error) throw new Error(pSettled.error);
     emit({ status: "resolved", verb, repo: rel, snapshot: snapshot.public.snapshot, quarantine }, json, deps, root);
     return 0;
   }, deps.mutexOptions);

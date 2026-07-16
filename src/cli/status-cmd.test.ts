@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { saveConfig, saveState, syncStreamId, type WorkspaceConfig } from "./config.js";
+import { saveConfig, saveStateUnsafeLegacyOrTest, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { populateStatusPath, type PopulateStatusV1 } from "./populate-status.js";
 import { statusCmdWithDeps, type StatusCmdDeps } from "./status-cmd.js";
 import { lockingHealthPath } from "./sync-mutex.js";
@@ -90,7 +90,7 @@ function cleanScanDeps(): StatusCmdDeps {
 async function saveDeferralState(): Promise<void> {
   const older = new Date(NOW - 15 * 86400_000).toISOString();
   const tied = new Date(NOW - 2 * 86400_000).toISOString();
-  await saveState(root, {
+  await saveStateUnsafeLegacyOrTest(root, {
     stream: syncStreamId(cfg),
     lastSyncedSequence: 7,
     lastSyncedManifest: { generatedAt: new Date(NOW - 20_000).toISOString(), files: [] },
@@ -253,7 +253,7 @@ test("status renders initial sync progress instead of sequence-zero local change
 });
 
 test("status does not suppress local changes for a fresh populate marker on an advanced baseline", async () => {
-  await saveState(root, {
+  await saveStateUnsafeLegacyOrTest(root, {
     stream: syncStreamId(cfg),
     lastSyncedSequence: 7,
     lastSyncedManifest: { generatedAt: new Date(NOW - 10_000).toISOString(), files: [] },
@@ -323,7 +323,7 @@ test("status renders durable lanes oldest-first with reason precedence and safe 
 
 test("degraded legacy deferral reload retains status reason and age", async () => {
   const deferredSince = new Date(NOW - 15 * 86400_000).toISOString();
-  await saveState(root, {
+  await saveStateUnsafeLegacyOrTest(root, {
     stream: syncStreamId(cfg),
     lastSyncedSequence: 7,
     lastSyncedManifest: { generatedAt: new Date(NOW - 20_000).toISOString(), files: [] },
@@ -517,7 +517,7 @@ test("live ambient record without daemonVersion renders pre-1.6.3 skew", async (
 
 test("one repo with multiple lanes renders one repo-level line and count", async () => {
   const at = new Date(NOW - 86_400_000).toISOString();
-  await saveState(root, {
+  await saveStateUnsafeLegacyOrTest(root, {
     stream: syncStreamId(cfg),
     lastSyncedSequence: 7,
     lastSyncedManifest: { generatedAt: at, files: [] },

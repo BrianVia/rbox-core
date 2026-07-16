@@ -89,6 +89,10 @@ export function gitIncomingKey(section: GitSection): string {
     opState: sortedRecord(section.opState, (artifact) => artifact.sha),
     config: sortedRecord(section.config, (values) => [...values]),
     refScope: section.refScope,
+    refTombstones: sortedRecord(section.refTombstones, (entries) => [...entries]
+      .sort((a, b) => a.generation - b.generation || (a.oid < b.oid ? -1 : a.oid > b.oid ? 1 : 0))
+      .map(({ oid, ts, generation }) => ({ oid, ts, generation }))),
+    refTombstoneGeneration: section.refTombstoneGeneration,
     bundleSha: section.bundleSha,
     packChain: (section.packChain ?? []).map((link) => link.sha),
   };

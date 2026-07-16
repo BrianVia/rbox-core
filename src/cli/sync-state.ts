@@ -2,13 +2,19 @@ import type { GitSection, Manifest } from "../engine/index.js";
 import { isDeepStrictEqual } from "node:util";
 import type { ConfigStatToken } from "../engine/git/config-txn.js";
 import {
+  composeRepoBase,
+  migrationRepoBaseProof,
+  type BranchBaseOrigin,
+  type RepoBaseProof,
+} from "./sync-git/base-composer.js";
+import {
   applyStateSavePacket,
   DEFERRAL_LANES,
   expectedStateNonce,
   loadRawState,
   MAX_LEGACY_GIT_SIDECAR_REPOS,
   repoRecordsForState,
-  saveState,
+  saveStateUnsafeLegacyOrTest,
   stateFromRepoRecords,
   type FileOnlyManifest,
   type GlobalManifestMeta,
@@ -42,6 +48,13 @@ export function configLaneState(record: ConfigLaneState): ConfigLaneState {
 
 export interface RepoStateValues {
   bases?: Record<string, GitSection>;
+  /** Explicit publisher ACK lane. A section installs the exact committed wire value;
+   * null records acknowledged wire absence; omission preserves the existing lane. */
+  advertised?: Record<string, GitSection | null>;
+  /** Complete publisher/apply suppression projection when present. Missing
+   * entries clear repoAbsent; omitting the map preserves the current lane. */
+  repoAbsent?: Record<string, true>;
+  branchBaseOrigins?: Record<string, Record<string, BranchBaseOrigin>>;
   pending?: Record<string, GitSection>;
   removed?: Record<string, string>;
   resolutions?: Record<string, string>;
@@ -67,6 +80,8 @@ export interface StateSource {
   /** Every repo observed by the source, including equal and absent outcomes. */
   observedRepos: Iterable<string>;
   values: RepoStateValues;
+  /** Closed, per-repository BASE authority. One packet may mix authority kinds. */
+  repoProofs?: Record<string, RepoBaseProof>;
   /** ACK-only authorship. Missing entries must not stamp unrelated repos. */
   authoredCfgHashByRepo?: Record<string, string>;
 }
@@ -180,9 +195,28 @@ function sourceRecord(source: StateSource, relPath: string, current: RepoRecord)
     return retained;
   }
   const lane = source.values.configLane?.[relPath] ?? current;
+  const hasAdvertisedValue = Object.prototype.hasOwnProperty.call(source.values.advertised ?? {}, relPath);
+  const advertisedValue = source.values.advertised?.[relPath];
+  const proof = source.repoProofs?.[relPath] ?? migrationRepoBaseProof();
+  const composed = composeRepoBase(
+    { base: current.base, branchBaseOrigins: current.branchBaseOrigins },
+    {
+      base: source.values.bases?.[relPath],
+      branchBaseOrigins: source.values.branchBaseOrigins?.[relPath],
+    },
+    proof.authority,
+    proof.lockedProof,
+  );
   const next = stampConfigAck({
     sourceSeq: source.sourceGlobalSeq,
-    ...(source.values.bases?.[relPath] === undefined ? {} : { base: source.values.bases[relPath] }),
+    ...(composed.base === undefined ? {} : { base: composed.base }),
+    ...(composed.branchBaseOrigins === undefined ? {} : { branchBaseOrigins: composed.branchBaseOrigins }),
+    ...(hasAdvertisedValue
+      ? (advertisedValue === null ? {} : { advertised: advertisedValue })
+      : (current.advertised === undefined ? {} : { advertised: current.advertised })),
+    ...(source.values.repoAbsent === undefined
+      ? (current.repoAbsent === true ? { repoAbsent: true as const } : {})
+      : (source.values.repoAbsent[relPath] === true ? { repoAbsent: true as const } : {})),
     ...(source.values.pending?.[relPath] === undefined ? {} : { pending: source.values.pending[relPath] }),
     ...(source.values.removed?.[relPath] === undefined ? {} : { removedKey: source.values.removed[relPath] }),
     ...(source.values.resolutions?.[relPath] === undefined ? {} : { resolutionKey: source.values.resolutions[relPath] }),
@@ -195,6 +229,9 @@ function sourceRecord(source: StateSource, relPath: string, current: RepoRecord)
       ? (current.idxProj === undefined ? {} : { idxProj: current.idxProj })
       : source.values.idxProj[relPath] === null ? {} : { idxProj: source.values.idxProj[relPath] }),
   }, source.authoredCfgHashByRepo?.[relPath]);
+  if (composed.disposition === "pending" && source.values.bases?.[relPath] && next.pending === undefined) {
+    next.pending = source.values.bases[relPath];
+  }
   return next;
 }
 
@@ -207,6 +244,7 @@ export function composeStateSavePacket(snapshot: SyncState, source: StateSource)
       relPath,
       expectedRepoGen: current.repoGen,
       newRecord: sourceRecord(source, relPath, current),
+      baseProof: source.repoProofs?.[relPath] ?? migrationRepoBaseProof(),
     };
   });
   return {
@@ -264,7 +302,7 @@ export async function saveStateSource(
 ): Promise<SyncState> {
   if (options.forceLegacy) {
     const next = legacyState(initialSnapshot, source);
-    await saveState(root, next);
+    await saveStateUnsafeLegacyOrTest(root, next);
     return next;
   }
   const apply = options.apply ?? applyStateSavePacket;
@@ -274,13 +312,13 @@ export async function saveStateSource(
     if (result.status === "accepted") return result.state;
     if (result.status === "unsupported") {
       const next = legacyState(snapshot, source);
-      await saveState(root, next);
+      await saveStateUnsafeLegacyOrTest(root, next);
       return next;
     }
     if (result.status === "busy") throw new Error(`sync state busy (${result.detail})`);
     if (result.status === "rejected" && result.reason === "stream" && options.allowLegacyStreamReplacement) {
       const next = legacyState(snapshot, source);
-      await saveState(root, next);
+      await saveStateUnsafeLegacyOrTest(root, next);
       return next;
     }
     if (result.reason === "stream" || result.reason === "nonce" || result.reason === "owner-lost") {
@@ -296,6 +334,9 @@ export function observedRepoKeys(state: SyncState, manifestGit?: Record<string, 
     ...Object.keys(repoRecordsForState(state)),
     ...Object.keys(manifestGit ?? {}),
     ...Object.keys(values.bases ?? {}),
+    ...Object.keys(values.advertised ?? {}),
+    ...Object.keys(values.repoAbsent ?? {}),
+    ...Object.keys(values.branchBaseOrigins ?? {}),
     ...Object.keys(values.pending ?? {}),
     ...Object.keys(values.removed ?? {}),
     ...Object.keys(values.resolutions ?? {}),
@@ -325,13 +366,13 @@ export async function savePublishedRepoIntent(
   root: string,
   snapshot: SyncState,
   relPath: string,
-  intended: { record: RepoRecordInput; expectedRepoGen: number; relPath: string; previousRecord?: RepoRecordInput },
+  intended: { record: RepoRecordInput; expectedRepoGen: number; relPath: string; previousRecord?: RepoRecordInput; baseProof?: RepoBaseProof },
   options: { forceLegacy?: boolean } = {},
 ): Promise<PublishedRepoIntentResult> {
   if (intended.relPath !== relPath) throw new Error("published journal relPath mismatch");
   const select = (record: RepoRecordInput | undefined, fields: readonly (keyof RepoRecordInput)[]): object =>
     Object.fromEntries(fields.map((field) => [field, record?.[field]]));
-  const applyFields = ["base", "pending", "removedKey", "resolutionKey", "partial", "idxProj"] as const;
+  const applyFields = ["base", "branchBaseOrigins", "pending", "repoAbsent", "removedKey", "resolutionKey", "partial", "idxProj"] as const;
   const configFields = ["cfgSynced", "cfgApplied", "cfgToken", "cfgShape"] as const;
   const replace = (target: RepoRecordInput, desired: RepoRecordInput, fields: readonly (keyof RepoRecordInput)[]): void => {
     for (const field of fields) {
@@ -426,6 +467,17 @@ export async function savePublishedRepoIntent(
     }
     if (Object.keys(deferrals).length) merged.deferrals = deferrals; else delete merged.deferrals;
     merged.sourceSeq = Math.max(currentInput.sourceSeq, intended.record.sourceSeq);
+    const baseProof = intended.baseProof ?? migrationRepoBaseProof();
+    const composed = composeRepoBase(
+      { base: currentInput.base, branchBaseOrigins: currentInput.branchBaseOrigins },
+      { base: merged.base, branchBaseOrigins: merged.branchBaseOrigins },
+      baseProof.authority,
+      baseProof.lockedProof,
+    );
+    if (composed.base === undefined) delete merged.base; else merged.base = composed.base;
+    if (composed.branchBaseOrigins === undefined) delete merged.branchBaseOrigins;
+    else merged.branchBaseOrigins = composed.branchBaseOrigins;
+    if (composed.disposition === "pending" && intended.record.base && merged.pending === undefined) merged.pending = intended.record.base;
     if (isDeepStrictEqual(currentInput, merged)) {
       return { state: currentSnapshot, disposition: superseded ? "superseded" : "already-semantic" };
     }
@@ -434,14 +486,14 @@ export async function savePublishedRepoIntent(
       const records = repoRecordsForState(currentSnapshot);
       records[relPath] = { ...merged, repoGen: current.repoGen + 1 };
       const next = stateFromRepoRecords(currentSnapshot, records);
-      await saveState(root, next);
+      await saveStateUnsafeLegacyOrTest(root, next);
       return { state: next, disposition: superseded ? "superseded" : "landed" };
     }
     const result = await applyStateSavePacket(root, {
       expectedStream: currentSnapshot.stream,
       expectedNonce: expectedStateNonce(currentSnapshot),
       sourceGlobalSeq: merged.sourceSeq,
-      repos: [{ relPath, expectedRepoGen: current.repoGen, newRecord: merged }],
+      repos: [{ relPath, expectedRepoGen: current.repoGen, newRecord: merged, baseProof }],
     });
     if (result.status === "accepted") {
       return { state: result.state, disposition: superseded ? "superseded" : "landed" };
@@ -464,6 +516,7 @@ export function changedSidecarRepoKeys(state: SyncState, values: RepoStateValues
   const keys = new Set([
     ...Object.keys(records),
     ...Object.keys(values.pending ?? {}),
+    ...Object.keys(values.repoAbsent ?? {}),
     ...Object.keys(values.removed ?? {}),
     ...Object.keys(values.resolutions ?? {}),
     ...Object.keys(values.deferrals ?? {}),
@@ -473,6 +526,7 @@ export function changedSidecarRepoKeys(state: SyncState, values: RepoStateValues
   return [...keys].filter((relPath) => {
     const record = records[relPath];
     return !same(record?.pending, values.pending?.[relPath])
+      || (values.repoAbsent !== undefined && record?.repoAbsent !== values.repoAbsent[relPath])
       || record?.removedKey !== values.removed?.[relPath]
       || record?.resolutionKey !== values.resolutions?.[relPath]
       || (values.deferrals?.[relPath] !== undefined && !same(mergeDeferrals(record?.deferrals, values.deferrals[relPath]), record?.deferrals))

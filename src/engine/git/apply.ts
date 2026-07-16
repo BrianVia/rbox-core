@@ -57,6 +57,50 @@ export interface ApplyGitResult {
   /** Refs the pointer-target namespace/ownership filter refused to publish
    *  (design 43 §7 [v3/v4]) — surfaced so the caller can log them. */
   filteredRefs?: string[];
+  /** Exact §130 branch witnesses committed by the clean/legacy engine path. */
+  branchTransitions?: Record<string, ApplyBranchTransitionResult>;
+  /** Exact expected-old witnesses for committed tag/stash mutations. */
+  safeRefTransitions?: Record<string, { kind: "safe-ref"; proof: "expected-old-transaction"; beforeOid: string | null; afterOid: string | null }>;
+}
+
+export interface ApplyBranchTransitionInput {
+  ctx: RepoCtx;
+  ref: string;
+  beforeOid: string | null;
+  afterOid: string | null;
+  /** Prepared keep-pin commands which must commit atomically with A/P/K and R. */
+  extraTransactionLines: readonly string[];
+  /** Complete reflog bytes observed while preparing displacement pins. */
+  expectedReflogFingerprint?: string;
+}
+
+export interface ApplyBranchTransitionResult {
+  ref: string;
+  beforeOid: string | null;
+  afterOid: string | null;
+  inverseLines: string[];
+  /** Absent only for a typed clean-wipe deletion whose logical BASE was already absent. */
+  witness?:
+    | { kind: "absent"; ref: string; priorOid: string; lineageHash: string; repositoryIdentityHash: string; artifactRef: string; artifactOid: string; source: "a" | "z" }
+    | { kind: "present"; ref: string; priorOid: string | null; nextOid: string; lineageHash: string; repositoryIdentityHash: string; artifactRef: string; artifactOid: string; episode: string };
+  /** Opaque receipt facts returned only by the committed prepared transaction. */
+  lockedProof?: {
+    liveOid: string | null;
+    witness: NonNullable<ApplyBranchTransitionResult["witness"]>;
+    reflogEpisode?: string;
+    artifactsClear: boolean;
+    ownershipStable: boolean;
+    reflogStable: boolean;
+    currentRef: boolean;
+    siblingOwned: boolean;
+  };
+}
+
+export interface ApplyBranchTransitionAdapter {
+  /** Plans and commits one complete A/P/K + branch expected-old transaction. */
+  commit(input: ApplyBranchTransitionInput): Promise<ApplyBranchTransitionResult>;
+  /** Commits the exact inverse returned by commit. A failure is a hard rollback failure. */
+  rollback(ctx: RepoCtx, result: ApplyBranchTransitionResult): Promise<void>;
 }
 
 /** Branches (full refname → linked-worktree display name) checked out by a DIFFERENT,
@@ -197,6 +241,10 @@ export async function applyGitState(
     afterGitMutate?: () => Promise<void>;
     chainTimings?: GitChainTimings;
     warningSink?: (message: string) => void;
+    /** Required by production callers for every refs/heads create/update/delete. */
+    branchTransitions?: ApplyBranchTransitionAdapter;
+    /** Clean leftover materialization deletes every local ref, even for scoped input. */
+    cleanWipeRefs?: boolean;
   } = {}
 ): Promise<ApplyGitResult> {
   const v = validateGitSection(section);
@@ -233,7 +281,7 @@ export async function applyGitState(
         }
       }
     }
-    deleteAbsent = section.refScope === "all";
+    deleteAbsent = section.refScope === "all" || opts.cleanWipeRefs === true;
     // Design 116: classify every existing store so receiver-equivalent refnames
     // are caught before a destructive wipe; absent sibling worktrees otherwise
     // reduce to the cheap exact-ref scan.
@@ -378,6 +426,15 @@ export async function applyGitState(
 
     const hadHead = await gitOk(repoDir, ["rev-parse", "--verify", "HEAD"]);
     const snap = await snapshotLocal(ctx);
+    const committedBranchTransitions: ApplyBranchTransitionResult[] = [];
+    const safeRefTransitions: NonNullable<ApplyGitResult["safeRefTransitions"]> = {};
+    const rollbackCommittedBranches = async (): Promise<void> => {
+      if (committedBranchTransitions.length === 0) return;
+      if (!opts.branchTransitions) throw new Error("typed branch rollback adapter missing");
+      for (const transition of [...committedBranchTransitions].reverse()) {
+        await opts.branchTransitions.rollback(ctx!, transition);
+      }
+    };
 
     // Quarantine local committed+staged state first — fail closed if we can't (§9 [v5]:
     // bundle with capture-grade pinning PLUS index/op-state copies).
@@ -466,6 +523,48 @@ export async function applyGitState(
       // Publish refs per the scope-gated rules (see doc comment).
       for (const [ref, sha] of Object.entries(publishRefs)) {
         const oldOid = boundaryRefs[ref] ?? ZERO_OID;
+        if (ref.startsWith("refs/heads/") && oldOid !== sha && opts.branchTransitions) {
+          let extraTransactionLines: string[] = [];
+          let expectedReflogFingerprint: string | undefined;
+          if (oldOid !== ZERO_OID) {
+            const ff = await tipOwnedByIncoming(repoDir, oldOid, [sha]);
+            if (ff.status === "indeterminate") {
+              hold(ref, `ancestry-${ff.marker}`);
+              continue;
+            }
+            if (ff.status === "unowned") {
+              const durable = { ...boundaryRefs, [ref]: sha };
+              const pins = await prepareDisplacementPins(
+                repoDir,
+                ref,
+                oldOid,
+                Object.values(durable),
+                humanDisplacementOrigin(ref, section),
+              );
+              if (pins.status === "indeterminate") {
+                hold(ref, `reflog-${pins.marker}`);
+                continue;
+              }
+              extraTransactionLines = pins.transactionLines;
+              expectedReflogFingerprint = pins.reflogFingerprint;
+            }
+          }
+          try {
+            const committed = await opts.branchTransitions.commit({
+              ctx,
+              ref,
+              beforeOid: oldOid === ZERO_OID ? null : oldOid,
+              afterOid: sha,
+              extraTransactionLines,
+              ...(expectedReflogFingerprint ? { expectedReflogFingerprint } : {}),
+            });
+            committedBranchTransitions.push(committed);
+            boundaryRefs[ref] = sha;
+          } catch (error) {
+            hold(ref, boundaryOwned.get(ref) ?? `artifact-${String((error as Error)?.message ?? error)}`);
+          }
+          continue;
+        }
         if (oldOid !== ZERO_OID && oldOid !== sha) {
           // Review R2-8: replacing an existing ref is classified by the
           // complete graph walk used by the follow plane. A non-FF update
@@ -495,6 +594,9 @@ export async function applyGitState(
                 `update ${ref} ${sha} ${oldOid}`,
               ]);
               boundaryRefs[ref] = sha;
+              if (!ref.startsWith("refs/heads/")) safeRefTransitions[ref] = {
+                kind: "safe-ref", proof: "expected-old-transaction", beforeOid: oldOid, afterOid: sha,
+              };
             } catch {
               hold(ref, boundaryOwned.get(ref) ?? "concurrent-update");
             }
@@ -510,6 +612,10 @@ export async function applyGitState(
           try {
             await git(repoDir, ["update-ref", "--create-reflog", "-m", subject, ref, sha, oldOid]);
             boundaryRefs[ref] = sha;
+            if (!ref.startsWith("refs/heads/") && oldOid !== sha) safeRefTransitions[ref] = {
+              kind: "safe-ref", proof: "expected-old-transaction",
+              beforeOid: oldOid === ZERO_OID ? null : oldOid, afterOid: sha,
+            };
           } catch {
             hold(ref, boundaryOwned.get(ref) ?? "concurrent-update");
           }
@@ -517,6 +623,10 @@ export async function applyGitState(
           try {
             await git(repoDir, ["update-ref", ref, sha, oldOid]);
             boundaryRefs[ref] = sha;
+            if (!ref.startsWith("refs/heads/") && oldOid !== sha) safeRefTransitions[ref] = {
+              kind: "safe-ref", proof: "expected-old-transaction",
+              beforeOid: oldOid === ZERO_OID ? null : oldOid, afterOid: sha,
+            };
           } catch {
             hold(ref, boundaryOwned.get(ref) ?? "concurrent-update");
           }
@@ -566,7 +676,22 @@ export async function applyGitState(
             continue;
           }
           try {
-            await runUpdateRefTransaction(repoDir, [...pins.transactionLines, `delete ${ref} ${oldOid}`]);
+            if (ref.startsWith("refs/heads/") && opts.branchTransitions) {
+              const committed = await opts.branchTransitions.commit({
+                ctx,
+                ref,
+                beforeOid: oldOid,
+                afterOid: null,
+                extraTransactionLines: pins.transactionLines,
+                expectedReflogFingerprint: pins.reflogFingerprint,
+              });
+              committedBranchTransitions.push(committed);
+            } else {
+              await runUpdateRefTransaction(repoDir, [...pins.transactionLines, `delete ${ref} ${oldOid}`]);
+              if (!ref.startsWith("refs/heads/")) safeRefTransitions[ref] = {
+                kind: "safe-ref", proof: "expected-old-transaction", beforeOid: oldOid, afterOid: null,
+              };
+            }
             delete boundaryRefs[ref];
           } catch {
             hold(ref, "concurrent-update");
@@ -587,7 +712,15 @@ export async function applyGitState(
       if (!(await gitOk(repoDir, ["fsck", "--connectivity-only", "--no-dangling"]))) {
         // ROLLBACK (fresh target: removing the .git we created IS the rollback)
         if (createdGit) await removeFreshGit();
-        else await restoreLocal(ctx, snap, ctx.kind === "pointer" ? new Set(Object.keys(eligiblePublishRefs)) : undefined);
+        else {
+          await rollbackCommittedBranches();
+          await restoreLocal(
+            ctx,
+            snap,
+            ctx.kind === "pointer" ? new Set(Object.keys(eligiblePublishRefs)) : undefined,
+            new Set(committedBranchTransitions.map((transition) => transition.ref)),
+          );
+        }
         return { applied: false, reason: "post-apply fsck failed — rolled back", conflictBundle, filteredRefs: filteredRefs.length ? filteredRefs : undefined };
       }
       // Must remain LAST inside the mutation boundary. A pre-commit throw follows
@@ -597,7 +730,24 @@ export async function applyGitState(
     } catch (e) {
       // ROLLBACK on any mutation error (fresh target: remove the .git we created)
       if (createdGit) await removeFreshGit();
-      else await restoreLocal(ctx, snap, ctx.kind === "pointer" ? new Set(Object.keys(eligiblePublishRefs)) : undefined).catch(() => {});
+      else {
+        try {
+          await rollbackCommittedBranches();
+          await restoreLocal(
+            ctx,
+            snap,
+            ctx.kind === "pointer" ? new Set(Object.keys(eligiblePublishRefs)) : undefined,
+            new Set(committedBranchTransitions.map((transition) => transition.ref)),
+          );
+        } catch (rollbackError) {
+          return {
+            applied: false,
+            reason: `apply failed and typed branch rollback hard-held: ${(rollbackError as Error)?.message ?? rollbackError}`,
+            conflictBundle,
+            filteredRefs: filteredRefs.length ? filteredRefs : undefined,
+          };
+        }
+      }
       return { applied: false, reason: `apply failed — rolled back: ${(e as Error)?.message ?? e}`, conflictBundle, filteredRefs: filteredRefs.length ? filteredRefs : undefined };
     } finally {
       await cleanupIncoming();
@@ -607,6 +757,10 @@ export async function applyGitState(
       conflictBundle,
       heldRefs: heldRefs.size ? Object.fromEntries(heldRefs) : undefined,
       filteredRefs: filteredRefs.length ? filteredRefs : undefined,
+      branchTransitions: committedBranchTransitions.length
+        ? Object.fromEntries(committedBranchTransitions.map((transition) => [transition.ref, transition]))
+        : undefined,
+      safeRefTransitions: Object.keys(safeRefTransitions).length ? safeRefTransitions : undefined,
     };
   } finally {
     await cleanupIncoming();

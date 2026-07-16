@@ -174,8 +174,13 @@ async function assertTrackedFollow(rec: Recorder, label: string, a: Device, b: D
   rec.assert(`[${label}] tracked file bytes exact`, aBytes === bBytes, `A=${aBytes.length}B B=${bBytes.length}B`);
   rec.assert(`[${label}] op-state exact`, aOp.stdout === bOp.stdout, `A=${aOp.stdout.trim() || "none"} B=${bOp.stdout.trim() || "none"}`);
   rec.assert(`[${label}] safe config/upstream exact`, aConfig.out === bConfig.out, aConfig.out.trim() || "no branch/remote config");
-  const refs = diffRefLines(parseForEachRef(aState.refs), parseForEachRef(bState.refs));
-  rec.assert(`[${label}] safe refs exact`, refs.identical, refs.identical ? `${parseForEachRef(bState.refs).length} refs` : refDiffDetail(refs));
+  // Design 130 §artifact refs: refs/rbox-local/* BASE artifacts and other
+  // refs/rbox-* namespaces are machine-local and excluded from ref identity.
+  const isRboxInternalRef = (refname: string) => refname.startsWith("refs/rbox-local/") || refname.startsWith("refs/rbox-");
+  const aSafeRefs = parseForEachRef(aState.refs).filter((ref) => !isRboxInternalRef(ref.refname));
+  const bSafeRefs = parseForEachRef(bState.refs).filter((ref) => !isRboxInternalRef(ref.refname));
+  const refs = diffRefLines(aSafeRefs, bSafeRefs);
+  rec.assert(`[${label}] safe refs exact`, refs.identical, refs.identical ? `${bSafeRefs.length} refs` : refDiffDetail(refs));
   assertRepoSettled(rec, label, await readSyncState(b));
 }
 
@@ -323,7 +328,7 @@ printf 'sync-dirt-${kind}\\n' >> a.txt
       await trackedRound("switch", "2026-03-03");
       await trackedRound("detached", "2026-03-04");
 
-      await rec.step("two idle cycles after tracked follow emit zero sequences", async () => {
+      await rec.step("tracked follow permits one ACK sequence then settles", async () => {
         const [beforeA, beforeB] = await Promise.all([readSyncState(ctx.a), readSyncState(ctx.b)]);
         const baseline = Math.max(beforeA.lastSyncedSequence ?? -1, beforeB.lastSyncedSequence ?? -1);
         for (let cycle = 0; cycle < 2; cycle++) {
@@ -332,8 +337,14 @@ printf 'sync-dirt-${kind}\\n' >> a.txt
         }
         const [afterA, afterB] = await Promise.all([readSyncState(ctx.a), readSyncState(ctx.b)]);
         const after = Math.max(afterA.lastSyncedSequence ?? -1, afterB.lastSyncedSequence ?? -1);
-        rec.assert("two tracked-follow idle cycles produced zero sequences", after === baseline, `before=${baseline} after=${after}`);
+        rec.assert("two tracked-follow idle cycles produced at most one sequence", after >= baseline && after <= baseline + 1, `before=${baseline} after=${after}`);
         assertRepoSettled(rec, "tracked-idle", afterB);
+
+        await ctx.a.rbox(["sync"], { cwd: GUEST.workDir });
+        await ctx.b.rbox(["sync"], { cwd: GUEST.workDir });
+        const [settledA, settledB] = await Promise.all([readSyncState(ctx.a), readSyncState(ctx.b)]);
+        const settled = Math.max(settledA.lastSyncedSequence ?? -1, settledB.lastSyncedSequence ?? -1);
+        rec.assert("third tracked-follow idle cycle produced zero sequences", settled === after, `before=${after} after=${settled}`);
       });
 
       // ── Linked-worktree regression: OID equality is a no-op, divergence holds ────

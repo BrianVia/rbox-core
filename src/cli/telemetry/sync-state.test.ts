@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { ensureTelemetryBindingId, loadState, saveState, type SyncState } from "../config.js";
+import { ensureTelemetryBindingId, loadState, saveStateUnsafeLegacyOrTest, type SyncState } from "../config.js";
 import { buildSyncStateSummary, SyncStateReporter } from "./sync-state.js";
 
 const manifest = { generatedAt: "", files: [] };
@@ -28,7 +28,7 @@ test("summary uses repo projection and emits explicit null when no repo is defer
 test("binding id is generated once and persisted in local state.json", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-telemetry-state-"));
   try {
-    await saveState(root, { stream: "s", lastSyncedSequence: 0, lastSyncedManifest: manifest });
+    await saveStateUnsafeLegacyOrTest(root, { stream: "s", lastSyncedSequence: 0, lastSyncedManifest: manifest });
     const random = () => Buffer.from("0011223344556677", "hex");
     const first = await ensureTelemetryBindingId(root, "s", random);
     const second = await ensureTelemetryBindingId(root, "s", () => Buffer.from("ffffffffffffffff", "hex"));
@@ -46,7 +46,7 @@ test("binding id adopts legacy unstamped state without changing its sync baselin
       lastSyncedManifest: { generatedAt: "legacy", files: [{ path: "kept.txt", hash: "abc", size: 3 }] },
       repoRecords: { repo: { repoGen: 4, sourceSeq: 11 } },
     };
-    await saveState(root, legacy);
+    await saveStateUnsafeLegacyOrTest(root, legacy);
     const result = await ensureTelemetryBindingId(root, "s", () => Buffer.from("0011223344556677", "hex"));
     expect(result.state).toEqual({ ...legacy, telemetryBindingId: "0011223344556677" });
     expect(JSON.parse(await fs.readFile(path.join(root, ".rbox", "state.json"), "utf8"))).toEqual({
@@ -60,7 +60,7 @@ test("binding id adopts legacy unstamped state without changing its sync baselin
 test("binding id rejects a mismatched stream without modifying state.json", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-telemetry-state-mismatch-"));
   try {
-    await saveState(root, { stream: "old", lastSyncedSequence: 7, lastSyncedManifest: manifest });
+    await saveStateUnsafeLegacyOrTest(root, { stream: "old", lastSyncedSequence: 7, lastSyncedManifest: manifest });
     const file = path.join(root, ".rbox", "state.json");
     const before = await fs.readFile(file);
     await expect(ensureTelemetryBindingId(root, "new", () => Buffer.from("0011223344556677", "hex"))).rejects.toThrow(
@@ -86,7 +86,7 @@ test("reporter gates unchanged ticks despite advancing age and still sends a hea
   let calls = 0;
   try {
     const state: SyncState = { stream: "s", lastSyncedSequence: 1, lastSyncedManifest: manifest, repoRecords: {} };
-    await saveState(root, state);
+    await saveStateUnsafeLegacyOrTest(root, state);
     const reporter = new SyncStateReporter(root, { remoteWorkspaceId: "ws", projectId: "p", remoteUrl: "http://x" }, {
       postJson: async () => { calls++; return new Response('{"accepted":1,"dropped":0}', { status: 202 }); },
     }, () => {}, () => now);

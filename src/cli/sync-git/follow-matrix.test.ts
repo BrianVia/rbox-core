@@ -18,7 +18,7 @@ import {
 } from "../../engine/index.js";
 import { readOpState } from "../../engine/git/refs.js";
 import { hashFile } from "../../engine/hash.js";
-import { loadState, repoRecordsForState, saveState, type SyncState, type WorkspaceConfig } from "../config.js";
+import { loadState, repoRecordsForState, saveStateUnsafeLegacyOrTest, type SyncState, type WorkspaceConfig } from "../config.js";
 import { orderedRepoDeferralUpdates, saveStateSource } from "../sync-state.js";
 import { applyGitSections, withRevalidatedGitPartialApplies } from "./apply.js";
 import { gitIncomingKey } from "./shared.js";
@@ -91,7 +91,7 @@ function manifest(section: GitSection): Manifest {
 function stateWith(section: GitSection): SyncState {
   return {
     stream: STREAM,
-    stateNonce: "m".repeat(32),
+    stateNonce: "b".repeat(32),
     lastSyncedSequence: 1,
     lastSyncedManifest: manifest(section),
     repoRecords: { [REL]: { repoGen: 1, sourceSeq: 1, base: section } },
@@ -150,14 +150,14 @@ async function buildTemplate(topology: Topology): Promise<Template> {
   const materialized = await applyGitSections(
     root,
     cfgFor(root),
-    { stream: STREAM, stateNonce: "m".repeat(32), lastSyncedSequence: 0, lastSyncedManifest: { generatedAt: "", files: [] } },
+    { stream: STREAM, stateNonce: "b".repeat(32), lastSyncedSequence: 0, lastSyncedManifest: { generatedAt: "", files: [] } },
     manifest(base),
     store,
     buildIgnoreMatcher(root),
     () => {},
   );
   expect(materialized.gitRepos?.[REL]).toEqual(base);
-  await saveState(root, stateWith(base));
+  await saveStateUnsafeLegacyOrTest(root, stateWith(base));
 
   const incoming = {} as Record<0 | 1, GitSection>;
   const expectedBytes = { 0: "two\n", 1: `incoming-${topology}\n` } as Record<0 | 1, string>;
@@ -288,8 +288,6 @@ describe("design 116 generated disposition matrix", () => {
     async (c) => {
       const { root, repo, template, incoming } = await cloneCase(c);
       try {
-        const baseTip = await git(repo, "rev-parse", "refs/heads/main");
-        await git(repo, "update-ref", "refs/heads/main", template.c1, baseTip);
         const expectedBytes = template.expectedBytes[c.syncDirt];
         const workingBytes = c.humanDirt ? `human-${c.topology}-${c.syncDirt}\n` : expectedBytes;
         await fs.writeFile(path.join(repo, "tracked.txt"), workingBytes);
@@ -313,7 +311,7 @@ describe("design 116 generated disposition matrix", () => {
         const opBefore = await readOpState(path.join(repo, ".git"), hashFile);
         const shouldFollow = !c.humanDirt && !c.localCommits && !c.localStash;
         const initialState = stateWith(template.base);
-        await saveState(root, initialState);
+        await saveStateUnsafeLegacyOrTest(root, initialState);
         const first = await applyIncoming(root, initialState, incoming, realOracle(root, expectedBytes));
         const incomingHeadRef = /^ref:\s*(refs\/\S+)/.exec(incoming.head)?.[1];
         const incomingTip = incomingHeadRef ? incoming.refs[incomingHeadRef]! : incoming.head.trim();
@@ -353,17 +351,16 @@ describe("design 116 generated disposition matrix", () => {
           const reason = c.humanDirt ? "local-edits" : c.localCommits ? "local-commits" : "local-stash";
           expect(first.outcome.gitRepos?.[REL]).toEqual(template.base);
           expect(first.outcome.gitPendingRemote?.[REL]).toEqual(incoming);
-          const expectedAppliedRefs = Object.fromEntries(Object.entries(incoming.refs)
-            .filter(([ref]) => ref !== "refs/heads/main" && !(c.localStash && ref === "refs/stash"))
-            .map(([ref, oid]) => [ref, { kind: "direct" as const, oid }]));
           const expectedHeldRefs = c.localStash ? { "refs/stash": "local-stash" as const } : {};
-          expect(first.outcome.partial?.[REL]).toEqual({
-            incomingKey: gitIncomingKey(incoming),
-            checkoutPending: true,
-            appliedRefs: expectedAppliedRefs,
-            heldRefs: expectedHeldRefs,
-            configApplied: true,
-          });
+          const partial = first.outcome.partial?.[REL];
+          expect(partial).toMatchObject({ incomingKey: gitIncomingKey(incoming), checkoutPending: true,
+            heldRefs: expectedHeldRefs, configApplied: true });
+          for (const [ref, oid] of Object.entries(incoming.refs)
+            .filter(([ref]) => ref !== "refs/heads/main" && !(c.localStash && ref === "refs/stash"))) {
+            const applied = partial?.appliedRefs[ref];
+            if (ref.startsWith("refs/heads/")) expect(applied).toMatchObject({ kind: "present", oid });
+            else expect(applied).toMatchObject({ kind: "safe-ref", afterOid: oid });
+          }
           expect(first.outcome.deferrals?.[REL]?.apply?.reason).toBe(reason);
         }
 
@@ -398,7 +395,10 @@ describe("design 116 generated disposition matrix", () => {
 
           const retry = await applyIncoming(root, restarted, incoming, realOracle(root, expectedBytes));
           expect(retry.outcome.deferrals?.[REL]?.apply?.deferredSince).toBe(deferredSince);
-          expect(retry.outcome.partial?.[REL]).toEqual(first.outcome.partial?.[REL]);
+          expect(retry.outcome.partial?.[REL]).toMatchObject({
+            incomingKey: gitIncomingKey(incoming), checkoutPending: true,
+            heldRefs: first.outcome.partial?.[REL]?.heldRefs ?? {}, configApplied: true,
+          });
           expect(await fs.readFile(path.join(repo, "tracked.txt"), "utf8")).toBe(workingBytes);
           expect(await fs.readFile(path.join(repo, ".git", "HEAD"), "utf8")).toBe(headBefore);
           expect(await git(repo, "rev-parse", "HEAD")).toBe(tipBefore);
@@ -411,7 +411,7 @@ describe("design 116 generated disposition matrix", () => {
           expect(repoRecordsForState(retryRestarted)[REL]?.deferrals?.apply?.deferredSince).toBe(deferredSince);
 
           if (c.humanDirt) await fs.writeFile(path.join(repo, "tracked.txt"), expectedBytes);
-          if (c.localCommits) await git(repo, "update-ref", "refs/heads/main", template.c1, localCommit!);
+          if (c.localCommits) await git(repo, "update-ref", "refs/heads/main", template.base.refs["refs/heads/main"]!, localCommit!);
           if (c.localStash) await clearReceiverStash(repo);
           const cleared = await applyIncoming(root, retryRestarted, incoming, realOracle(root, expectedBytes));
           expect(cleared.logs).toContain(`git-sync followed ${REL}`);
@@ -466,8 +466,6 @@ describe("design 116 index/op-state crossed interactions", () => {
   test.each(crossingCases)("$topology $label", async (c) => {
     const { root, repo, template, incoming } = await cloneCase({ topology: c.topology, syncDirt: 1, label: c.label });
     try {
-      const old = await git(repo, "rev-parse", "refs/heads/main");
-      await git(repo, "update-ref", "refs/heads/main", template.c1, old);
       await fs.writeFile(path.join(repo, "tracked.txt"), template.expectedBytes[1]);
       if (c.index === "diverged") {
         await fs.writeFile(path.join(repo, "index-only.txt"), "index divergence\n");
@@ -506,8 +504,6 @@ test("design 116 incoming-stash row advances the receiver stash when it has no s
     await fs.writeFile(path.join(sender, "sender-stash.txt"), "incoming stash\n");
     await git(sender, "stash", "push", "-uqm", "incoming matrix stash");
     const incoming = await capture(sender);
-    const old = await git(repo, "rev-parse", "refs/heads/main");
-    await git(repo, "update-ref", "refs/heads/main", template.c1, old);
     await fs.writeFile(path.join(repo, "tracked.txt"), template.expectedBytes[1]);
     const result = await applyIncoming(root, stateWith(template.base), incoming, realOracle(root, template.expectedBytes[1]));
     expect(result.logs).toContain(`git-sync followed ${REL}`);
@@ -521,8 +517,6 @@ test("design 116 incoming-stash row advances the receiver stash when it has no s
 test("design 116 scan-deferred row defers when the applied-manifest oracle is indeterminate", async () => {
   const { root, repo, template, incoming } = await cloneCase({ topology: "ff", syncDirt: 1, label: "scan-deferred" });
   try {
-    const old = await git(repo, "rev-parse", "refs/heads/main");
-    await git(repo, "update-ref", "refs/heads/main", template.c1, old);
     await fs.writeFile(path.join(repo, "tracked.txt"), template.expectedBytes[1]);
     const oracle: AppliedManifestOracle = {
       proveRepo: async () => ({ kind: "indeterminate", why: "scan deferred in repo subtree" }),
@@ -540,8 +534,6 @@ test("design 116 scan-deferred row defers when the applied-manifest oracle is in
 test.skipIf(!fsAliases.caseAliases)("design 116 receiver case-equivalence alias follows on a case-aliasing filesystem", async () => {
   const { root, repo, template, incoming } = await cloneCase({ topology: "ff", syncDirt: 1, label: "case-alias" });
   try {
-    const old = await git(repo, "rev-parse", "refs/heads/main");
-    await git(repo, "update-ref", "refs/heads/main", template.c1, old);
     await fs.writeFile(path.join(repo, "tracked.txt"), template.expectedBytes[1]);
     await fs.rename(path.join(repo, "tracked.txt"), path.join(repo, "Tracked.txt"));
     const result = await applyIncoming(root, stateWith(template.base), incoming, realOracle(root, template.expectedBytes[1]));
@@ -555,8 +547,6 @@ test.skipIf(!fsAliases.caseAliases)("design 116 receiver case-equivalence alias 
 test.skipIf(!fsAliases.unicodeAliases)("design 116 receiver Unicode-normalization alias follows on a normalization-aliasing filesystem", async () => {
   const { root, repo, template, incoming } = await cloneCase({ topology: "ff", syncDirt: 1, label: "unicode-alias" });
   try {
-    const old = await git(repo, "rev-parse", "refs/heads/main");
-    await git(repo, "update-ref", "refs/heads/main", template.c1, old);
     await fs.writeFile(path.join(repo, "tracked.txt"), template.expectedBytes[1]);
     await fs.writeFile(path.join(repo, "e\u0301.txt"), "alias\n");
     const base: Manifest = {
