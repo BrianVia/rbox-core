@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import {
@@ -32,9 +33,11 @@ import {
   prepareDisplacementPins,
   runUpdateRefTransaction,
 } from "../../engine/git/keep-pins.js";
-import { hashFile } from "../../engine/hash.js";
+import { fsyncDirectory } from "../../engine/fsutil.js";
+import { hashBytes, hashFile } from "../../engine/hash.js";
 import { pruneStaleScratchRefs } from "../../engine/git/pins.js";
 import { listRefs, readAllRefs, readOpState } from "../../engine/git/refs.js";
+import { OP_STATE_CLASSIFICATION, OP_STATE_DIRS, OP_STATE_FILES, type OpStateRoot } from "../../engine/manifest-validate.js";
 import {
   clearIndexResolveUndo,
   getGitArtifact,
@@ -174,12 +177,22 @@ interface LiveMetadata {
   indexPresent: boolean;
   indexProjection?: string;
   opState: Record<string, string>;
+  opStateRootsPresent: readonly OpStateRoot[];
+}
+
+interface BreadcrumbMismatch {
+  rel: Extract<OpStateRoot, "ORIG_HEAD">;
+  live: string | null;
+  base: string | null;
+  incoming: string | null;
 }
 
 interface CheckoutClassification {
   safe: boolean;
   reason?: GitDeferralReason;
   detail?: string;
+  breadcrumbMismatches: BreadcrumbMismatch[];
+  breadcrumbWaived: boolean;
 }
 
 export async function checkoutJournalBinding(stream: string, stateNonce: string, ctx: RepoCtx): Promise<CheckoutJournalBinding> {
@@ -309,8 +322,15 @@ async function readLive(ctx: RepoCtx): Promise<LiveMetadata | undefined> {
       throw error;
     });
     const indexProjection = indexPresent ? await indexIdentityV2(ctx.repoDir, indexPath) : undefined;
-    const opState = await readOpState(ctx.gitDir, hashFile);
-    return { headContent, currentRef, currentTip, refs, indexPresent, indexProjection, opState };
+    const opStateRoots = [...OP_STATE_FILES, ...OP_STATE_DIRS] as const;
+    const [opState, opStateRootsPresent] = await Promise.all([
+      readOpState(ctx.gitDir, hashFile),
+      Promise.all(opStateRoots.map(async (rel) => fs.lstat(path.join(ctx.gitDir, rel)).then(
+        () => rel,
+        (error: NodeJS.ErrnoException) => error.code === "ENOENT" ? undefined : Promise.reject(error),
+      ))).then((entries) => entries.filter((rel): rel is OpStateRoot => rel !== undefined)),
+    ]);
+    return { headContent, currentRef, currentTip, refs, indexPresent, indexProjection, opState, opStateRootsPresent };
   } catch {
     return undefined;
   }
@@ -333,9 +353,11 @@ async function classifyCheckout(args: {
   boundary: boolean;
   checkoutRefReason?: GitDeferralReason;
   checkoutRefDetail?: string;
+  heldRefs: GitPartialApply["heldRefs"];
 }): Promise<CheckoutClassification> {
   const reasons = new Set<GitDeferralReason>();
   const details: string[] = [];
+  const breadcrumbMismatches: BreadcrumbMismatch[] = [];
   const oracle = args.boundary ? await args.opts.oracle.reproveRepo(args.opts.relPath) : await args.opts.oracle.proveRepo(args.opts.relPath);
   if (oracle.kind === "mismatch") { reasons.add("local-edits"); details.push("working tree differs from applied manifest"); }
   else if (oracle.kind === "indeterminate") { reasons.add("unreadable"); details.push(oracle.why); }
@@ -368,8 +390,13 @@ async function classifyCheckout(args: {
     for (const rel of new Set([...Object.keys(live.opState), ...Object.keys(baseOp), ...Object.keys(incomingOp)])) {
       const value = live.opState[rel] ?? null;
       if (value !== (baseOp[rel] ?? null) && value !== (incomingOp[rel] ?? null)) {
-        reasons.add("local-operation");
-        details.push(`operation state differs at ${rel}`);
+        const root = rel.split("/")[0] as OpStateRoot;
+        if (OP_STATE_CLASSIFICATION[root] === "breadcrumb") {
+          breadcrumbMismatches.push({ rel: "ORIG_HEAD", live: value, base: baseOp[rel] ?? null, incoming: incomingOp[rel] ?? null });
+        } else {
+          reasons.add("local-operation");
+          details.push(`operation state differs at ${rel}`);
+        }
       }
     }
 
@@ -402,9 +429,30 @@ async function classifyCheckout(args: {
     reasons.add(args.checkoutRefReason);
     details.push(args.checkoutRefDetail ?? "incoming checkout ref could not be published safely");
   }
+  if (args.opts.manualResolution) {
+    for (const mismatch of breadcrumbMismatches) {
+      reasons.add("local-operation");
+      details.push(`operation state differs at ${mismatch.rel}`);
+    }
+  }
   for (const reason of args.opts.manualResolution?.waivedReasons ?? []) reasons.delete(reason);
+  const liveInProgress = live !== undefined && (
+    Object.keys(live.opState).some((rel) => OP_STATE_CLASSIFICATION[rel.split("/")[0] as OpStateRoot] === "in-progress")
+    || live.opStateRootsPresent.some((rel) => OP_STATE_CLASSIFICATION[rel] === "in-progress")
+  );
+  const breadcrumbWaived = !args.opts.manualResolution
+    && breadcrumbMismatches.length > 0
+    && reasons.size === 0
+    && !liveInProgress
+    && Object.keys(args.heldRefs).length === 0;
+  if (breadcrumbMismatches.length > 0 && !args.opts.manualResolution && !breadcrumbWaived) {
+    reasons.add("local-operation");
+    for (const mismatch of breadcrumbMismatches) details.push(`operation state differs at ${mismatch.rel}`);
+  }
   const reason = firstReason(reasons);
-  return reason ? { safe: false, reason, detail: details.join("; ") } : { safe: true };
+  return reason
+    ? { safe: false, reason, detail: details.join("; "), breadcrumbMismatches, breadcrumbWaived: false }
+    : { safe: true, breadcrumbMismatches, breadcrumbWaived };
 }
 
 async function ensureStashReflog(repoDir: string, oid: string): Promise<void> {
@@ -657,6 +705,125 @@ function expectedHead(section: GitSection): string {
   return section.head.endsWith("\n") ? section.head : `${section.head}\n`;
 }
 
+interface OrigHeadPreservation {
+  expectedOldBytes: Buffer | null;
+  recoveryLocation: string;
+  recoveryRef?: string;
+  recoveryOid?: string;
+  transactionLine?: string;
+  discriminator?: string;
+  malformedRawBytes?: true;
+}
+
+const ORIG_HEAD_FORENSIC_CAP = 64 * 1024;
+
+async function readOrigHeadExact(gitDir: string): Promise<Buffer | null> {
+  let handle: fs.FileHandle | undefined;
+  try {
+    handle = await fs.open(path.join(gitDir, "ORIG_HEAD"), constants.O_RDONLY | constants.O_NOFOLLOW);
+    return await handle.readFile();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+async function ensurePlainDirectory(abs: string): Promise<boolean> {
+  try {
+    await fs.mkdir(abs, { mode: 0o700 });
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    const stat = await fs.lstat(abs);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`unsafe recovery directory: ${abs}`);
+    return false;
+  }
+}
+
+function boundedOrigHeadForensics(bytes: Buffer): Buffer {
+  if (bytes.length <= ORIG_HEAD_FORENSIC_CAP) return bytes;
+  const marker = Buffer.from(`\n[rbox: ORIG_HEAD truncated from ${bytes.length} bytes at ${ORIG_HEAD_FORENSIC_CAP}-byte cap]\n`);
+  return Buffer.concat([bytes.subarray(0, ORIG_HEAD_FORENSIC_CAP - marker.length), marker]);
+}
+
+async function quarantineOrigHeadBytes(workspaceRoot: string, relPath: string, bytes: Buffer): Promise<string> {
+  const rboxDir = path.join(workspaceRoot, ".rbox");
+  const quarantineDir = path.join(rboxDir, "git-quarantine");
+  const repoDir = path.join(quarantineDir, hashBytes(Buffer.from(relPath)).slice(0, 16));
+  const rboxCreated = await ensurePlainDirectory(rboxDir);
+  const quarantineCreated = await ensurePlainDirectory(quarantineDir);
+  const repoCreated = await ensurePlainDirectory(repoDir);
+  const dest = path.join(repoDir, `orig-head-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.bytes`);
+  let handle: fs.FileHandle | undefined;
+  let created = false;
+  try {
+    handle = await fs.open(dest, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+    created = true;
+    await handle.writeFile(boundedOrigHeadForensics(bytes));
+    await handle.sync();
+  } catch (error) {
+    if (created) await fs.rm(dest, { force: true }).catch(() => {});
+    throw error;
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+  // The file entry lives in repoDir, so that directory is always flushed. If
+  // ancestors were created, continue bottom-up through the first old ancestor.
+  await fsyncDirectory(repoDir);
+  if (repoCreated) await fsyncDirectory(quarantineDir);
+  if (quarantineCreated) await fsyncDirectory(rboxDir);
+  if (rboxCreated) await fsyncDirectory(workspaceRoot);
+  return dest;
+}
+
+export async function origHeadWorktreeDiscriminator(ctx: RepoCtx): Promise<string> {
+  const [gitDirReal, commonDirReal] = await Promise.all([fs.realpath(ctx.gitDir), fs.realpath(ctx.commonDir)]);
+  return gitDirReal === commonDirReal ? "primary" : `wt-${hashBytes(Buffer.from(gitDirReal)).slice(0, 12)}`;
+}
+
+async function preserveOrigHead(
+  opts: FollowOptions,
+  mismatch: BreadcrumbMismatch,
+): Promise<OrigHeadPreservation> {
+  const bytes = await readOrigHeadExact(opts.ctx.gitDir);
+  if ((bytes === null ? null : hashBytes(bytes)) !== mismatch.live) throw new Error("ORIG_HEAD changed before preservation");
+  if (bytes === null) return { expectedOldBytes: null, recoveryLocation: "no prior ORIG_HEAD value" };
+
+  const oid = bytes.toString("utf8").trim();
+  if (/^[0-9a-f]{40}$/.test(oid) && await git(opts.ctx.repoDir, ["cat-file", "-e", oid]).then(() => true, () => false)) {
+    const discriminator = await origHeadWorktreeDiscriminator(opts.ctx);
+    const recoveryRef = `refs/rbox-recovery/orig-head/${discriminator}/${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
+    return {
+      expectedOldBytes: bytes,
+      recoveryLocation: recoveryRef,
+      recoveryRef,
+      recoveryOid: oid,
+      transactionLine: `create ${recoveryRef} ${oid}`,
+      discriminator,
+    };
+  }
+
+  const recoveryLocation = await quarantineOrigHeadBytes(opts.workspaceRoot, opts.relPath, bytes);
+  return { expectedOldBytes: bytes, recoveryLocation, malformedRawBytes: true };
+}
+
+async function pruneOrigHeadRecoveryRefs(repoDir: string, discriminator: string, currentRef: string): Promise<void> {
+  const prefix = `refs/rbox-recovery/orig-head/${discriminator}`;
+  const entries = (await listRefs(repoDir, prefix)).flatMap((ref) => {
+    const match = /\/(\d+)-([0-9a-f]+)$/.exec(ref);
+    return match ? [{ ref, timestamp: Number(match[1]) }] : [];
+  }).sort((a, b) => a.timestamp - b.timestamp || a.ref.localeCompare(b.ref));
+  let remove = Math.max(0, entries.length - 8);
+  for (const entry of entries) {
+    if (remove === 0) break;
+    if (entry.ref === currentRef) continue;
+    await git(repoDir, ["update-ref", "-d", entry.ref]);
+    remove--;
+  }
+}
+
 export async function followDivergedRepo(opts: FollowOptions): Promise<FollowResult> {
   const valid = validateGitSection(opts.incoming);
   const emptyProgress: FollowProgress = { appliedRefs: {}, heldRefs: {}, configApplied: true };
@@ -737,8 +904,20 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
       boundary: false,
       checkoutRefReason: refProgress.checkoutRefReason,
       checkoutRefDetail: refProgress.checkoutRefDetail,
+      heldRefs: progress.heldRefs,
     });
     if (!first.safe) return { status: "defer", reason: first.reason!, detail: first.detail ?? "checkout follow proof failed", ...progress };
+
+    let origHeadPreservation: OrigHeadPreservation | undefined;
+    if (first.breadcrumbWaived) {
+      try {
+        const mismatch = first.breadcrumbMismatches.length === 1 ? first.breadcrumbMismatches[0] : undefined;
+        if (!mismatch || mismatch.rel !== "ORIG_HEAD") throw new Error("unexpected breadcrumb waiver shape");
+        origHeadPreservation = await preserveOrigHead(opts, mismatch);
+      } catch {
+        return { status: "defer", reason: "local-operation", detail: "operation state differs at ORIG_HEAD", ...progress };
+      }
+    }
 
     const refUpdates: CheckoutRefUpdate[] = [];
     const postHeadRefUpdates: CheckoutRefUpdate[] = [];
@@ -746,6 +925,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
     const refReservations: Array<{ ref: string; expectedOid: string }> = [];
     const extraTransactionLines: string[] = [];
     const expectedRefs: Record<string, string> = {};
+    if (origHeadPreservation?.transactionLine) extraTransactionLines.push(origHeadPreservation.transactionLine);
     if (liveBefore.currentRef) {
       const oldOid = liveBefore.currentTip;
       const newOid = effective.refs[liveBefore.currentRef];
@@ -808,7 +988,9 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
     const oldOp = Object.fromEntries(Object.keys(liveBefore.opState).map((rel) => [rel, true as const]));
     const newOp = sectionOpState(opts.incoming);
     const intended = await opts.makeIntended(postProgress);
+    const journalId = `${Date.now()}-${crypto.randomBytes(8).toString("hex")}`;
     const journal: CheckoutJournal<FollowIntended> = {
+      journalId,
       phase: "intent",
       incomingKey: gitIncomingKey(opts.incoming),
       incomingSection: opts.incoming,
@@ -835,7 +1017,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
     });
     opts.crashAt?.("after-journal-write");
 
-    let boundaryFailure: CheckoutClassification | undefined;
+    let boundaryFailure: Pick<CheckoutClassification, "safe" | "reason" | "detail"> | undefined;
     const noteBoundaryFailure = (reason: GitDeferralReason, detail: string): void => {
       const chosen = firstReason(new Set([...(boundaryFailure?.reason ? [boundaryFailure.reason] : []), reason]));
       if (!boundaryFailure || chosen === reason) boundaryFailure = { safe: false, reason, detail };
@@ -848,8 +1030,10 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
       refReservations,
       head,
       extraTransactionLines,
-      plannedGraphRoots: roots,
+      plannedGraphRoots: [...roots, ...(origHeadPreservation?.recoveryOid ? [origHeadPreservation.recoveryOid] : [])],
       opState: staged.opState,
+      ...(origHeadPreservation ? { origHeadLock: { journalId, expectedOldBytes: origHeadPreservation.expectedOldBytes } } : {}),
+      ...(origHeadPreservation?.malformedRawBytes ? { malformedOrigHeadPreserved: true as const } : {}),
     }, {
       capabilityProbe: opts.capabilityProbe,
       capabilitySupported: true,
@@ -883,8 +1067,13 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
           boundary: true,
           checkoutRefReason: refProgress.checkoutRefReason,
           checkoutRefDetail: refProgress.checkoutRefDetail,
+          heldRefs: progress.heldRefs,
         });
         if (!proof.safe) boundaryFailure = proof;
+        if (origHeadPreservation && (!proof.breadcrumbWaived || proof.breadcrumbMismatches.length !== 1 || proof.breadcrumbMismatches[0]?.rel !== "ORIG_HEAD")) {
+          noteBoundaryFailure("local-operation", "operation state differs at ORIG_HEAD");
+          return false;
+        }
         if (!sameIncarnation) { noteBoundaryFailure("unreadable", "repository incarnation changed at checkout boundary"); return false; }
         if (!live) { noteBoundaryFailure("unreadable", "git metadata became unreadable"); return false; }
         const boundaryOwned = await branchesCheckedOutElsewhere(opts.ctx);
@@ -926,17 +1115,24 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
       const reason: GitDeferralReason = result.status === "unsupported" ? "unsupported"
         : /became busy/.test(result.reason) ? "git-busy"
         : /connectivity/.test(result.reason) ? "artifact"
+        : /ORIG_HEAD changed/.test(result.reason) ? "local-operation"
         : boundaryFailure?.reason ?? "other";
       return {
         status: "defer",
         reason,
-        detail: boundaryFailure?.detail ?? result.reason,
+        detail: /ORIG_HEAD changed/.test(result.reason) ? "operation state differs at ORIG_HEAD" : boundaryFailure?.detail ?? result.reason,
         ...progress,
       };
     }
     await markCheckoutJournalPublished(opts.workspaceRoot, opts.relPath);
     if (opts.manualResolution && effective.refs["refs/stash"]) await ensureStashReflog(opts.ctx.repoDir, effective.refs["refs/stash"]!);
     opts.crashAt?.("after-published-flip");
+    if (origHeadPreservation) {
+      if (origHeadPreservation.recoveryRef && origHeadPreservation.discriminator) {
+        await pruneOrigHeadRecoveryRefs(opts.ctx.repoDir, origHeadPreservation.discriminator, origHeadPreservation.recoveryRef).catch(() => {});
+      }
+      opts.log?.(`git-sync: adopted stale ORIG_HEAD breadcrumb for ${opts.relPath} (old value preserved at ${origHeadPreservation.recoveryLocation})`);
+    }
     return { status: "followed", ...postProgress };
   } finally {
     await staged.cleanup();

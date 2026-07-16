@@ -20,13 +20,16 @@ import {
   type Manifest,
 } from "../../engine/index.js";
 import { repoCtx } from "../../engine/git/shared.js";
+import { OP_STATE_CLASSIFICATION, OP_STATE_DIRS, OP_STATE_FILES } from "../../engine/manifest-validate.js";
 import { loadState, repoRecordsForState, saveState, type SyncState, type WorkspaceConfig } from "../config.js";
 import type { SyncRemote } from "../remote.js";
 import { orderedRepoDeferralUpdates, saveStateSource } from "../sync-state.js";
 import { applyGitSections, withRevalidatedGitPartialApplies } from "./apply.js";
-import { checkoutJournalBinding, FollowCrashInjectedError, recoverFollowJournal, type FollowCrashPoint } from "./follow.js";
+import { checkoutJournalBinding, FollowCrashInjectedError, followDivergedRepo, origHeadWorktreeDiscriminator, recoverFollowJournal, type FollowCrashPoint } from "./follow.js";
 import { planGitSections } from "./plan.js";
-import { configCredentialSkipLogged, configInvalidSkipLogged, configOwnershipSkipLogged, gitFollowEnabled, repoEquivalenceWarningLogged } from "./shared.js";
+import { gitFingerprint, gitFingerprintRun } from "./fingerprint.js";
+import { fingerprintHitProbe, type GitDivergenceCache } from "./divergence-cache.js";
+import { configCredentialSkipLogged, configInvalidSkipLogged, configOwnershipSkipLogged, gitFollowEnabled, gitIncomingKey, repoEquivalenceWarningLogged } from "./shared.js";
 
 const exec = promisify(execFile);
 const TEST_GIT_ENV = {
@@ -142,6 +145,39 @@ async function baseAndIncoming(mode: "same" | "switch" | "detached" = "same"): P
   return { c1, base, incoming, state: stateWith(base) };
 }
 
+async function breadcrumbBaseAndIncoming(opts: { markerRel?: string; incomingAbsent?: boolean } = {}): Promise<{
+  c1: string; c2: string; c3: string; base: GitSection; incoming: GitSection; state: SyncState;
+}> {
+  const c1 = await commit("one\n", "breadcrumb-c1");
+  const c2 = await commit("two\n", "breadcrumb-c2");
+  await fs.writeFile(path.join(sender, ".git", "ORIG_HEAD"), `${c1}\n`);
+  let markerBytes: string | undefined;
+  if (opts.markerRel) {
+    markerBytes = opts.markerRel === "AUTO_MERGE" ? `${await git(sender, "rev-parse", `${c1}^{tree}`)}\n`
+      : ["MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"].includes(opts.markerRel) ? `${c1}\n`
+      : `synced ${opts.markerRel}\n`;
+    await fs.mkdir(path.dirname(path.join(sender, ".git", opts.markerRel)), { recursive: true });
+    await fs.writeFile(path.join(sender, ".git", opts.markerRel), markerBytes);
+  }
+  const base = await capture();
+  if (opts.markerRel) {
+    const top = opts.markerRel.split("/")[0]!;
+    await fs.rm(path.join(sender, ".git", top), { recursive: opts.markerRel.includes("/"), force: true });
+  }
+  await materialize(base);
+  const c3 = await commit("three\n", "breadcrumb-c3");
+  if (opts.markerRel) {
+    await fs.mkdir(path.dirname(path.join(sender, ".git", opts.markerRel)), { recursive: true });
+    await fs.writeFile(path.join(sender, ".git", opts.markerRel), markerBytes!);
+  }
+  if (opts.incomingAbsent) await fs.rm(path.join(sender, ".git", "ORIG_HEAD"), { force: true });
+  else await fs.writeFile(path.join(sender, ".git", "ORIG_HEAD"), `${c2}\n`);
+  const incoming = await capture();
+  await fs.writeFile(path.join(receiver, "tracked.txt"), "three\n");
+  await fs.writeFile(path.join(receiver, ".git", "ORIG_HEAD"), `${c3}\n`);
+  return { c1, c2, c3, base, incoming, state: stateWith(base) };
+}
+
 async function applyIncoming(state: SyncState, incoming: GitSection, oracle: AppliedManifestOracle = matchingOracle, extra: Parameters<typeof applyGitSections>[7] = {}) {
   const logs: string[] = [];
   const outcome = await applyGitSections(workspace, cfg, state, manifest(incoming), store, buildIgnoreMatcher(workspace), (line) => logs.push(line), {
@@ -183,6 +219,353 @@ test("field incident: stale contained attached tip follows HEAD, tip, and semant
   await withRevalidatedGitPartialApplies(workspace, state, outcome, async () => undefined);
   expect(await fs.readdir(path.join(workspace, ".rbox", "state", "git-journal"))).toEqual([]);
 });
+
+test("design 126: all-distinct ORIG_HEAD is adopted only after preserving the exact old object", async () => {
+  const { c2, c3, state, incoming } = await breadcrumbBaseAndIncoming();
+  const result = await applyIncoming(state, incoming);
+
+  expect(result.outcome.deferrals?.repo?.apply).toBeUndefined();
+  expect(await fs.readFile(path.join(receiver, ".git", "ORIG_HEAD"), "utf8")).toBe(`${c2}\n`);
+  const refs = (await git(receiver, "for-each-ref", "--format=%(refname)", "refs/rbox-recovery/orig-head/primary")).split("\n").filter(Boolean);
+  expect(refs).toHaveLength(1);
+  expect(await git(receiver, "rev-parse", refs[0]!)).toBe(c3);
+  const adoption = result.logs.filter((line) => line.startsWith("git-sync: adopted stale ORIG_HEAD breadcrumb for repo"));
+  expect(adoption).toEqual([`git-sync: adopted stale ORIG_HEAD breadcrumb for repo (old value preserved at ${refs[0]})`]);
+});
+
+const breadcrumbDirtyGuards = [
+  ["local edit", "local-edits", async () => ({
+    proveRepo: async () => ({ kind: "mismatch" as const, sample: ["repo/tracked.txt"] }),
+    reproveRepo: async () => ({ kind: "mismatch" as const, sample: ["repo/tracked.txt"] }),
+    receiptHash: () => undefined,
+  })],
+  ["index divergence", "local-index", async () => {
+    await fs.writeFile(path.join(receiver, "guard-index.txt"), "guard\n");
+    await git(receiver, "add", "guard-index.txt");
+  }],
+  ["receiver-only commit", "local-commits", async () => {
+    await git(receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "guard local commit");
+  }],
+  ["stash", "local-stash", async () => {
+    await fs.writeFile(path.join(receiver, "guard-stash.txt"), "guard\n");
+    await git(receiver, "stash", "push", "-uqm", "guard stash");
+  }],
+  ["MERGE_HEAD mismatch", "local-operation", async () => {
+    await fs.writeFile(path.join(receiver, ".git", "MERGE_HEAD"), `${"f".repeat(40)}\n`);
+  }],
+  ["unreadable tip", "unreadable", async () => {
+    await fs.writeFile(path.join(receiver, ".git", "HEAD"), "ref: refs/heads/missing\n");
+  }],
+] as const;
+
+for (const [label, expectedReason, dirty] of breadcrumbDirtyGuards) {
+  test(`design 126: breadcrumb plus ${label} still defers with truthful detail`, async () => {
+    const { c3, state, incoming } = await breadcrumbBaseAndIncoming();
+    const result = await dirty();
+    if (label === "stash") await fs.writeFile(path.join(receiver, ".git", "ORIG_HEAD"), `${c3}\n`);
+    const applied = await applyIncoming(state, incoming, result && "proveRepo" in result ? result : matchingOracle);
+    expect(applied.outcome.deferrals?.repo?.apply?.reason).toBe(label === "local edit" || label === "index divergence" ? expectedReason : "local-operation");
+    expect(applied.logs.some((line) => line.includes("operation state differs at ORIG_HEAD"))).toBe(true);
+    expect(applied.logs.some((line) => line.startsWith("git-sync: adopted stale ORIG_HEAD"))).toBe(false);
+  });
+}
+
+const inProgressFiles = OP_STATE_FILES.filter((rel) => OP_STATE_CLASSIFICATION[rel] === "in-progress");
+test("design 126 classification map covers every op-state root exactly", () => {
+  expect(Object.keys(OP_STATE_CLASSIFICATION).sort()).toEqual([...OP_STATE_FILES, ...OP_STATE_DIRS].sort());
+  expect(OP_STATE_CLASSIFICATION.ORIG_HEAD).toBe("breadcrumb");
+  expect(inProgressFiles).toHaveLength(OP_STATE_FILES.length - 1);
+});
+
+test("design 126 worktree discriminator is primary or a stable per-gitdir hash", async () => {
+  const commonDir = path.join(tmp, "discriminator-common");
+  const linkedA = path.join(commonDir, "worktrees", "a");
+  const linkedB = path.join(commonDir, "worktrees", "b");
+  await fs.mkdir(linkedA, { recursive: true });
+  await fs.mkdir(linkedB, { recursive: true });
+  const fake = (gitDir: string, common: string) => ({ gitDir, commonDir: common, repoDir: receiver, kind: "pointer" as const });
+  expect(await origHeadWorktreeDiscriminator(fake(commonDir, commonDir))).toBe("primary");
+  const a = await origHeadWorktreeDiscriminator(fake(linkedA, commonDir));
+  const b = await origHeadWorktreeDiscriminator(fake(linkedB, commonDir));
+  expect(a).toBe(`wt-${hashBytes(Buffer.from(await fs.realpath(linkedA))).slice(0, 12)}`);
+  expect(b).toMatch(/^wt-[0-9a-f]{12}$/);
+  expect(b).not.toBe(a);
+});
+
+for (const rel of inProgressFiles) {
+  test(`design 126 presence gate: equal live ${rel} vetoes breadcrumb adoption`, async () => {
+    const { c3, state, incoming } = await breadcrumbBaseAndIncoming({ markerRel: rel });
+    const result = await applyIncoming(state, incoming);
+    expect(result.outcome.deferrals?.repo?.apply?.reason).toBe("local-operation");
+    expect(result.logs.some((line) => line.includes("operation state differs at ORIG_HEAD"))).toBe(true);
+    expect(await fs.readFile(path.join(receiver, ".git", "ORIG_HEAD"), "utf8")).toBe(`${c3}\n`);
+  });
+}
+
+for (const dir of OP_STATE_DIRS) {
+  test(`design 126 presence gate: equal live ${dir}/ descendant vetoes breadcrumb adoption`, async () => {
+    const { state, incoming } = await breadcrumbBaseAndIncoming({ markerRel: `${dir}/state` });
+    const result = await applyIncoming(state, incoming);
+    expect(result.outcome.deferrals?.repo?.apply?.reason).toBe("local-operation");
+    expect(result.logs.some((line) => line.includes("operation state differs at ORIG_HEAD"))).toBe(true);
+  });
+
+  test(`design 126 presence gate: empty live ${dir}/ vetoes breadcrumb adoption`, async () => {
+    const { state, incoming } = await breadcrumbBaseAndIncoming();
+    await fs.mkdir(path.join(receiver, ".git", dir), { recursive: true });
+    const result = await applyIncoming(state, incoming);
+    expect(result.outcome.deferrals?.repo?.apply?.reason).toBe("local-operation");
+    expect(await fs.stat(path.join(receiver, ".git", dir)).then((stat) => stat.isDirectory())).toBe(true);
+  });
+}
+
+test("design 126 presence gate treats a dangling op-state directory symlink as present", async () => {
+  const { state, incoming } = await breadcrumbBaseAndIncoming();
+  const marker = path.join(receiver, ".git", "rebase-merge");
+  await fs.symlink("missing-rebase-state", marker);
+  const result = await applyIncoming(state, incoming);
+  expect(result.outcome.deferrals?.repo?.apply?.reason).toBe("local-operation");
+  expect(await fs.readlink(marker)).toBe("missing-rebase-state");
+});
+
+test("design 126 preservation: receiver-only commit U survives breadcrumb adoption", async () => {
+  const { state, incoming } = await breadcrumbBaseAndIncoming();
+  await git(receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "commit U");
+  const commitU = await git(receiver, "rev-parse", "HEAD");
+  await git(receiver, "reset", "--hard", state.repoRecords!.repo!.base!.refs["refs/heads/main"]!);
+  await fs.writeFile(path.join(receiver, "tracked.txt"), "three\n");
+
+  const result = await applyIncoming(state, incoming);
+  expect(result.outcome.deferrals?.repo?.apply).toBeUndefined();
+  const refs = (await git(receiver, "for-each-ref", "--format=%(refname)", "refs/rbox-recovery/orig-head/primary")).split("\n").filter(Boolean);
+  expect(refs).toHaveLength(1);
+  expect(await git(receiver, "rev-parse", refs[0]!)).toBe(commitU);
+  await expect(git(receiver, "cat-file", "-e", `${commitU}^{commit}`)).resolves.toBe("");
+});
+
+test("design 126 preservation: malformed ORIG_HEAD is quarantined as capped raw bytes", async () => {
+  const { state, incoming } = await breadcrumbBaseAndIncoming();
+  const hostile = Buffer.alloc(70 * 1024, 0x78);
+  await fs.writeFile(path.join(receiver, ".git", "ORIG_HEAD"), hostile);
+
+  const result = await applyIncoming(state, incoming);
+  expect(result.outcome.deferrals?.repo?.apply).toBeUndefined();
+  const repoHash = hashBytes(Buffer.from("repo")).slice(0, 16);
+  const qDir = path.join(workspace, ".rbox", "git-quarantine", repoHash);
+  const names = await fs.readdir(qDir);
+  expect(names).toHaveLength(1);
+  expect(names[0]).toMatch(/^orig-head-\d+-[0-9a-f]+\.bytes$/);
+  const saved = await fs.readFile(path.join(qDir, names[0]!));
+  expect(saved).toHaveLength(64 * 1024);
+  expect(saved.toString("utf8")).toContain("[rbox: ORIG_HEAD truncated from 71680 bytes at 65536-byte cap]");
+  expect(result.logs.some((line) => line.includes(path.join(qDir, names[0]!)))).toBe(true);
+});
+
+test("design 126 raw preservation fails closed on a symlinked quarantine repo directory", async () => {
+  const { state, incoming } = await breadcrumbBaseAndIncoming();
+  await fs.writeFile(path.join(receiver, ".git", "ORIG_HEAD"), "malformed breadcrumb\n");
+  const repoHash = hashBytes(Buffer.from("repo")).slice(0, 16);
+  const quarantineRoot = path.join(workspace, ".rbox", "git-quarantine");
+  const outside = path.join(tmp, "outside-quarantine");
+  await fs.mkdir(quarantineRoot, { recursive: true });
+  await fs.mkdir(outside);
+  await fs.symlink(outside, path.join(quarantineRoot, repoHash));
+
+  const result = await applyIncoming(state, incoming);
+  expect(result.outcome.deferrals?.repo?.apply?.reason).toBe("local-operation");
+  expect(await fs.readdir(outside)).toEqual([]);
+  expect(result.logs.some((line) => line.startsWith("git-sync: adopted stale ORIG_HEAD"))).toBe(false);
+});
+
+test("design 126 raw preservation never masks a malformed ordinary ref", async () => {
+  const { state, incoming } = await breadcrumbBaseAndIncoming();
+  await fs.writeFile(path.join(receiver, ".git", "ORIG_HEAD"), "malformed breadcrumb\n");
+  await fs.mkdir(path.join(receiver, ".git", "refs", "heads"), { recursive: true });
+  await fs.writeFile(path.join(receiver, ".git", "refs", "heads", "bad-side"), "garbage\n");
+
+  const result = await applyIncoming(state, incoming);
+  expect(result.outcome.deferrals?.repo?.apply).toBeDefined();
+  expect(result.logs.some((line) => line.startsWith("git-sync: adopted stale ORIG_HEAD"))).toBe(false);
+  expect(await fs.readFile(path.join(receiver, ".git", "refs", "heads", "bad-side"), "utf8")).toBe("garbage\n");
+});
+
+test("design 126 raw preservation supports a healthy detached repository with no refs", async () => {
+  const { state, incoming } = await breadcrumbBaseAndIncoming();
+  const detachedIncoming: GitSection = { ...incoming, head: incoming.refs["refs/heads/main"]!, refs: {} };
+  await git(receiver, "checkout", "-q", "--detach", state.repoRecords!.repo!.base!.refs["refs/heads/main"]!);
+  await git(receiver, "update-ref", "-d", "refs/heads/main");
+  await fs.writeFile(path.join(receiver, ".git", "ORIG_HEAD"), "malformed detached breadcrumb\n");
+  await expect(git(receiver, "show-ref")).rejects.toThrow();
+
+  const result = await applyIncoming(state, detachedIncoming);
+  expect(result.outcome.deferrals?.repo?.apply).toBeUndefined();
+  expect(await git(receiver, "rev-parse", "HEAD")).toBe(detachedIncoming.head);
+  expect(result.logs.some((line) => line.startsWith("git-sync: adopted stale ORIG_HEAD"))).toBe(true);
+});
+
+test("design 126 preservation: ninth adoption prunes the oldest recovery ref but never the current ref", async () => {
+  const { c1, state, incoming } = await breadcrumbBaseAndIncoming();
+  const future = Date.now() + 60_000;
+  for (let n = 1; n <= 8; n++) await git(receiver, "update-ref", `refs/rbox-recovery/orig-head/primary/${future + n}-deadbeef`, c1);
+  for (let n = 1; n <= 3; n++) await git(receiver, "update-ref", `refs/rbox-recovery/orig-head/wt-aaaaaaaaaaaa/${n}000-deadbeef`, c1);
+
+  const result = await applyIncoming(state, incoming);
+  expect(result.outcome.deferrals?.repo?.apply).toBeUndefined();
+  const refs = (await git(receiver, "for-each-ref", "--format=%(refname)", "refs/rbox-recovery/orig-head/primary")).split("\n").filter(Boolean);
+  expect(refs).toHaveLength(8);
+  expect(refs.some((ref) => ref.endsWith(`/${future + 1}-deadbeef`))).toBe(false);
+  const current = result.logs.find((line) => line.startsWith("git-sync: adopted stale ORIG_HEAD"))?.match(/at (refs\/[^)]+)\)/)?.[1];
+  expect(current).toBeDefined();
+  expect(refs).toContain(current!);
+  expect((await git(receiver, "for-each-ref", "--format=%(refname)", "refs/rbox-recovery/orig-head/wt-aaaaaaaaaaaa")).split("\n").filter(Boolean)).toHaveLength(3);
+});
+
+test("design 126 preservation: incoming absence deletes ORIG_HEAD only after preserving it", async () => {
+  const { c3, state, incoming } = await breadcrumbBaseAndIncoming({ incomingAbsent: true });
+  const result = await applyIncoming(state, incoming);
+  await expect(fs.access(path.join(receiver, ".git", "ORIG_HEAD"))).rejects.toThrow();
+  const recoveryRef = (await git(receiver, "for-each-ref", "--format=%(refname)", "refs/rbox-recovery/orig-head/primary")).trim();
+  expect(await git(receiver, "rev-parse", recoveryRef)).toBe(c3);
+  expect(result.logs.filter((line) => line.startsWith("git-sync: adopted stale ORIG_HEAD"))).toHaveLength(1);
+});
+
+test("design 126 pipeline: heldRefs vetoes a provisional breadcrumb waiver", async () => {
+  const { c3, state, incoming } = await breadcrumbBaseAndIncoming();
+  const tree = await git(receiver, "write-tree");
+  const local = await gitExec(["-C", receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit-tree", tree, "-p", await git(receiver, "rev-parse", "HEAD"), "-m", "held side"])
+    .then(({ stdout }) => stdout.toString().trim());
+  await git(receiver, "update-ref", "refs/heads/local-side", local);
+  const result = await applyIncoming(state, incoming);
+  expect(result.outcome.deferrals?.repo?.apply?.reason).toBe("local-operation");
+  expect(result.outcome.partial?.repo?.heldRefs["refs/heads/local-side"]).toBe("local-commits");
+  expect(await fs.readFile(path.join(receiver, ".git", "ORIG_HEAD"), "utf8")).toBe(`${c3}\n`);
+  expect(result.logs.some((line) => line.startsWith("git-sync: adopted stale ORIG_HEAD"))).toBe(false);
+});
+
+test("design 126 pipeline: an invalidated design-116 applied-ref marker remains held and vetoes adoption", async () => {
+  const c1 = await commit("one\n", "partial-c1");
+  const c2 = await commit("two\n", "partial-c2");
+  await git(sender, "branch", "side", c1);
+  await fs.writeFile(path.join(sender, ".git", "ORIG_HEAD"), `${c1}\n`);
+  const base = await capture();
+  await materialize(base);
+  const c3 = await commit("three\n", "partial-c3");
+  await git(sender, "branch", "-f", "side", c3);
+  await fs.writeFile(path.join(sender, ".git", "ORIG_HEAD"), `${c2}\n`);
+  const incoming = await capture();
+  await fs.writeFile(path.join(receiver, "tracked.txt"), "three\n");
+  await fs.writeFile(path.join(receiver, ".git", "ORIG_HEAD"), `${c3}\n`);
+  const state = stateWith(base);
+  state.gitPendingRemote = { repo: incoming };
+  state.repoRecords!.repo!.pending = incoming;
+  state.repoRecords!.repo!.partial = {
+    incomingKey: gitIncomingKey(incoming), checkoutPending: true,
+    appliedRefs: { "refs/heads/side": { kind: "direct", oid: incoming.refs["refs/heads/side"]! } },
+    heldRefs: {}, configApplied: true,
+  };
+
+  const result = await applyIncoming(state, incoming);
+  expect(result.outcome.partial?.repo?.heldRefs["refs/heads/side"]).toBe("local-commits");
+  expect(result.outcome.deferrals?.repo?.apply?.reason).toBe("local-operation");
+  expect(await git(receiver, "rev-parse", "refs/heads/side")).toBe(base.refs["refs/heads/side"]);
+  expect(await fs.readFile(path.join(receiver, ".git", "ORIG_HEAD"), "utf8")).toBe(`${c3}\n`);
+  expect(result.logs.some((line) => line.startsWith("git-sync: adopted stale ORIG_HEAD"))).toBe(false);
+});
+
+test("design 126 pipeline: boundary re-proof veto leaves no adoption or log", async () => {
+  const { c3, state, incoming } = await breadcrumbBaseAndIncoming();
+  const oracle: AppliedManifestOracle = {
+    proveRepo: async () => ({ kind: "match" }),
+    reproveRepo: async () => ({ kind: "mismatch", sample: ["repo/tracked.txt"] }),
+    receiptHash: () => "receipt",
+  };
+  const result = await applyIncoming(state, incoming, oracle);
+  expect(result.outcome.deferrals?.repo?.apply?.reason).toBe("local-edits");
+  expect(await fs.readFile(path.join(receiver, ".git", "ORIG_HEAD"), "utf8")).toBe(`${c3}\n`);
+  expect(await git(receiver, "for-each-ref", "--format=%(refname)", "refs/rbox-recovery/orig-head/primary")).toBe("");
+  expect(result.logs.some((line) => line.startsWith("git-sync: adopted stale ORIG_HEAD"))).toBe(false);
+});
+
+test("design 126 pipeline: unrelated manual waivedReasons do not unlock a breadcrumb mismatch", async () => {
+  const { state, incoming } = await breadcrumbBaseAndIncoming();
+  const ctx = await repoCtx(receiver);
+  if (!ctx) throw new Error("receiver context missing");
+  const logs: string[] = [];
+  const result = await followDivergedRepo({
+    workspaceRoot: workspace,
+    relPath: "repo",
+    ctx,
+    base: state.repoRecords!.repo!.base,
+    incoming,
+    store,
+    kek: KEK,
+    oracle: matchingOracle,
+    record: state.repoRecords!.repo,
+    binding: await checkoutJournalBinding(state.stream, state.stateNonce!, ctx),
+    followEnabled: true,
+    capabilityProbe: async () => true,
+    log: (line) => logs.push(line),
+    makeIntended: () => ({ record: { sourceSeq: 2, base: incoming }, expectedRepoGen: 1, relPath: "repo" }),
+    manualResolution: {
+      snapshotId: "manual-negative",
+      waivedReasons: ["local-edits"],
+      protectedOids: [],
+      secondProof: async () => true,
+    },
+  });
+  expect(result.status).toBe("defer");
+  if (result.status !== "defer") throw new Error("expected defer");
+  expect(result.reason).toBe("local-operation");
+  expect(result.detail).toContain("operation state differs at ORIG_HEAD");
+  expect(logs.some((line) => line.startsWith("git-sync: adopted stale ORIG_HEAD"))).toBe(false);
+});
+
+test("design 126 crash recovery clears the journal-owned ORIG_HEAD.lock after a mid-op-state death", async () => {
+  const { state, incoming } = await breadcrumbBaseAndIncoming();
+  await saveState(workspace, state);
+  await expect(applyIncoming(state, incoming, matchingOracle, {
+    crashAt: (point) => { if (point === "mid-op-state") throw new FollowCrashInjectedError(point); },
+  })).rejects.toThrow("mid-op-state");
+  const lockPath = path.join(receiver, ".git", "ORIG_HEAD.lock");
+  const lockId = await fs.readFile(lockPath, "utf8");
+  const journalRoot = path.join(workspace, ".rbox", "state", "git-journal");
+  const journalDir = path.join(journalRoot, (await fs.readdir(journalRoot))[0]!);
+  expect(await fs.readFile(path.join(journalDir, "journal.id"), "utf8")).toBe(lockId);
+
+  const retry = await applyIncoming(await loadState(workspace, "test-stream"), incoming);
+  expect(retry.outcome.deferrals?.repo?.apply).toBeUndefined();
+  await expect(fs.access(lockPath)).rejects.toThrow();
+});
+
+test("design 126 bookkeeping: successful waiver clears an existing local-operation episode", async () => {
+  const { base, state, incoming } = await breadcrumbBaseAndIncoming();
+  state.repoRecords!.repo!.deferrals = { apply: {
+    lane: "apply", reason: "local-operation", subjectKey: "old-breadcrumb", reproof: true,
+    deferredSince: "2026-07-12T00:00:00.000Z", reasonSince: "2026-07-12T00:00:00.000Z", lastSeen: "2026-07-12T00:00:00.000Z",
+  } };
+  state.repoRecords!.repo!.pending = incoming;
+  state.repoRecords!.repo!.base = base;
+  const result = await applyIncoming(state, incoming);
+  expect(result.outcome.deferrals?.repo?.apply).toBeNull();
+  expect(result.outcome.gitPendingRemote?.repo).toBeUndefined();
+});
+
+for (const incomingAbsent of [false, true]) {
+  test(`design 126 fingerprint: adopted ORIG_HEAD ${incomingAbsent ? "deletion" : "replacement"} invalidates the op-state fingerprint`, async () => {
+    const { state, incoming } = await breadcrumbBaseAndIncoming({ incomingAbsent });
+    const before = await gitFingerprint(gitFingerprintRun("per-decision"), workspace, "repo");
+    const cache: GitDivergenceCache = { repos: new Map([["repo", {
+      fingerprint: before.hash, writtenAtMs: Date.now() + 10_000, identityKey: "warm",
+      kind: "dir", probe: { busy: false, preflightOk: true, identityKey: "warm" },
+    }]]), dirty: false };
+    expect((await fingerprintHitProbe(gitFingerprintRun("per-decision"), workspace, "repo", cache, "dir", false)).status).toBe("hit");
+    const result = await applyIncoming(state, incoming);
+    expect(result.outcome.deferrals?.repo?.apply).toBeUndefined();
+    const after = await gitFingerprint(gitFingerprintRun("per-decision"), workspace, "repo");
+    expect(after.hash).not.toBe(before.hash);
+    expect((await fingerprintHitProbe(gitFingerprintRun("per-decision"), workspace, "repo", cache, "dir", false)).status).toBe("miss");
+  });
+}
 
 test("field incident follows an incoming branch switch", async () => {
   const { c1, state, incoming } = await baseAndIncoming("switch");

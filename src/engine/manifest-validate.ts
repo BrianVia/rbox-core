@@ -166,8 +166,38 @@ export function validateManifest(m: unknown): ValidationResult {
 
 // Op-state paths (relative to the resolved gitdir) that let you continue a paused
 // operation. AUTO_MERGE: git >= 2.38's ort merge writes it (design 43 §5 [v2, minor]).
-export const OP_STATE_FILES = ["MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "ORIG_HEAD", "MERGE_MSG", "AUTO_MERGE"];
-export const OP_STATE_DIRS = ["rebase-merge", "rebase-apply", "sequencer"];
+export const OP_STATE_FILES = ["MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "ORIG_HEAD", "MERGE_MSG", "AUTO_MERGE"] as const;
+export const OP_STATE_DIRS = ["rebase-merge", "rebase-apply", "sequencer"] as const;
+
+export type OpStateRoot = typeof OP_STATE_FILES[number] | typeof OP_STATE_DIRS[number];
+export type OpStateClassification = "breadcrumb" | "in-progress";
+
+/** Explicit by design: a newly-added op-state root must not silently inherit a
+ * safety classification. The `satisfies` constraint makes omission a typecheck
+ * failure, while `as const` preserves the individually-reviewed literals. */
+export const OP_STATE_CLASSIFICATION = {
+  MERGE_HEAD: "in-progress",
+  REBASE_HEAD: "in-progress",
+  CHERRY_PICK_HEAD: "in-progress",
+  REVERT_HEAD: "in-progress",
+  ORIG_HEAD: "breadcrumb",
+  MERGE_MSG: "in-progress",
+  AUTO_MERGE: "in-progress",
+  "rebase-merge": "in-progress",
+  "rebase-apply": "in-progress",
+  sequencer: "in-progress",
+} as const satisfies Record<OpStateRoot, OpStateClassification>;
+
+/** Compile-only negative case: extending the op-state universe without adding
+ * a classification must remain an error. Kept in an uncalled function so the
+ * root `tsc --noEmit` gate exercises the failure contract directly. */
+function opStateClassificationExhaustivenessTypecheckOnly(): void {
+  type HypotheticalFutureRoot = OpStateRoot | "UNCLASSIFIED_FUTURE_ROOT";
+  // @ts-expect-error UNCLASSIFIED_FUTURE_ROOT deliberately has no map entry.
+  const incomplete: Record<HypotheticalFutureRoot, OpStateClassification> = OP_STATE_CLASSIFICATION;
+  void incomplete;
+}
+void opStateClassificationExhaustivenessTypecheckOnly;
 
 /** Only these ref namespaces sync. NOT refs/remotes (machine-local origins),
  *  refs/notes, refs/replace, or refs/rbox-* (our internal scratch). */
@@ -273,7 +303,7 @@ export function validateGitSection(input: unknown): { ok: boolean; reason?: stri
   const opState = s.opState == null ? {} : asRecord(s.opState);
   if (!opState) return { ok: false, reason: "bad opState" };
   for (const [rel, ref] of Object.entries(opState)) {
-    const okRel = OP_STATE_FILES.includes(rel) || OP_STATE_DIRS.some((d) => rel.startsWith(`${d}/`));
+    const okRel = (OP_STATE_FILES as readonly string[]).includes(rel) || OP_STATE_DIRS.some((d) => rel.startsWith(`${d}/`));
     if (!okRel || rel.includes("..") || rel.includes("\0") || rel.startsWith("/")) return { ok: false, reason: `bad opState ${rel}` };
     if (!validArtifactRef(ref)) return { ok: false, reason: `bad opState ref ${rel}` };
   }

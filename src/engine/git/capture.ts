@@ -244,12 +244,12 @@ export async function captureGitState(repoDir: string, store: BlobStore, kek: Bu
         : [...Object.keys(refs), ...pins.refs]; // current branch (if any) + pins; detached HEAD rides its pin
     const basisTips = [...new Set(opts.basis?.tips ?? [])].filter((tip) => /^[0-9a-f]{40}$/.test(tip)).sort();
     try {
-      await git(repoDir, ["bundle", "create", bundlePath, ...bundleArgs, ...basisTips.map((tip) => `^${tip}`)]);
+      await git(repoDir, ["bundle", "create", bundlePath, "--exclude=refs/rbox-*", ...bundleArgs, ...basisTips.map((tip) => `^${tip}`)]);
     } catch (e) {
       if (basisTips.length === 0) throw e;
       opts.onBasisFallback?.((e as Error)?.message ?? String(e));
       await fs.rm(bundlePath, { force: true }).catch(() => {});
-      await git(repoDir, ["bundle", "create", bundlePath, ...bundleArgs]);
+      await git(repoDir, ["bundle", "create", bundlePath, "--exclude=refs/rbox-*", ...bundleArgs]);
     }
 
     // 4. §28: ENCRYPT each staged artifact under the workspace KEK, upload the CIPHERTEXT by

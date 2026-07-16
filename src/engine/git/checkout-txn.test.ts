@@ -100,6 +100,7 @@ async function checkoutJournal(expectedHead = "ref: refs/heads/main\n"): Promise
     worktreeId: "main",
   };
   const journal: CheckoutJournal<{ snapshot: string }> = {
+    journalId: `1700000000000-${"b".repeat(16)}`,
     phase: "intent",
     incomingKey: "incoming",
     incomingSection: {
@@ -230,6 +231,51 @@ test("second-proof failure aborts the prepared transaction and owned index lock"
   expect(await git(repo, "rev-parse", "refs/heads/main")).toBe(oldOid);
   expect(await fs.readFile(path.join(ctx.gitDir, "index"))).toEqual(oldIndex);
   expect(await fs.stat(path.join(ctx.gitDir, "index.lock")).then(() => true, () => false)).toBe(false);
+});
+
+test("design 126 atomically-owned ORIG_HEAD.lock fences the second proof and releases after op-state publication", async () => {
+  const oldOrig = Buffer.from(`${oldOid}\n`);
+  await fs.writeFile(path.join(ctx.gitDir, "ORIG_HEAD"), oldOrig);
+  const { journal } = await checkoutJournal();
+  let sawOwnedContent = false;
+  const result = await commitCheckout(ctx, plan(await candidateFor(newOid), {
+    origHeadLock: { journalId: journal.journalId, expectedOldBytes: oldOrig },
+  }), {
+    capabilityProbe: supported,
+    journal: { workspaceRoot: root, relPath: "repo", value: journal },
+    secondProof: async ({ ownedLocks, busy }) => {
+      const lock = path.join(ctx.gitDir, "ORIG_HEAD.lock");
+      sawOwnedContent = (await fs.readFile(lock, "utf8")) === journal.journalId
+        && ownedLocks.some((token) => token.path === lock);
+      expect(await busy()).toBe(false);
+      return true;
+    },
+  });
+
+  expect(result.status).toBe("committed");
+  expect(sawOwnedContent).toBe(true);
+  await expect(fs.access(path.join(ctx.gitDir, "ORIG_HEAD.lock"))).rejects.toThrow();
+  await expect(fs.access(path.join(ctx.gitDir, "ORIG_HEAD"))).rejects.toThrow();
+});
+
+test("design 126 exact breadcrumb equality aborts before a value nobody preserved can be adopted", async () => {
+  const preserved = Buffer.from(`${oldOid}\n`);
+  await fs.writeFile(path.join(ctx.gitDir, "ORIG_HEAD"), Buffer.from(`${newOid}\n`));
+  const { journal } = await checkoutJournal();
+  let secondProofCalled = false;
+  const result = await commitCheckout(ctx, plan(await candidateFor(newOid), {
+    extraTransactionLines: [`create refs/rbox-recovery/orig-head/primary/1-deadbeef ${oldOid}`],
+    origHeadLock: { journalId: journal.journalId, expectedOldBytes: preserved },
+  }), {
+    capabilityProbe: supported,
+    journal: { workspaceRoot: root, relPath: "repo", value: journal },
+    secondProof: async () => { secondProofCalled = true; return true; },
+  });
+
+  expect(result).toMatchObject({ status: "defer", reason: "ORIG_HEAD changed at checkout boundary" });
+  expect(secondProofCalled).toBe(false);
+  await expect(git(repo, "rev-parse", "--verify", "refs/rbox-recovery/orig-head/primary/1-deadbeef")).rejects.toThrow();
+  await expect(fs.access(path.join(ctx.gitDir, "ORIG_HEAD.lock"))).rejects.toThrow();
 });
 
 test("ref-commit crash leaves the ref advanced and journal recovery restores old coherence", async () => {
