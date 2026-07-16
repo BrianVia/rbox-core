@@ -348,7 +348,7 @@ async function route(req: Request, env: Env, executionCtx: ExecutionContext & { 
  * Exported for tests — this privacy contract is load-bearing for the whole layer.
  */
 const ROUTE_VOCAB = new Set([
-  "v1", "health", "install.sh", "agent.sh", "version", "version.sig", "bin",
+  "v1", "health", "install.sh", "agent.sh", "changelog.md", "version", "version.sig", "bin",
   "auth", "device", "start", "poll", "bootstrap", "approve", "devices", "revoke", "pair", "create", "redeem",
   "billing", "checkout", "portal", "stripe", "webhook", "web", "session",
   "account", "usage", "admin", "gc", "plan", "overview", "delta-soak", "workspaces", "diagnostics", "pack-tombstones", "resweep",

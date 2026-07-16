@@ -16,6 +16,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { releaseSigningInput, verifyReleaseArtifacts } from "../src/cli/release-verify.js";
 import { RELEASE_KEYS } from "../src/cli/release-key.js";
+import { semverGt } from "../src/cli/semver.js";
 import { buildCryptoWorkerBundle } from "./build-crypto-worker.js";
 
 const ROOT = path.resolve(import.meta.dir, "..");
@@ -56,6 +57,12 @@ const keyId = process.env.RBOX_RELEASE_KEY_ID ?? RELEASE_KEYS[0]!.keyId;
 const tag = `v${version}`;
 const dist = path.join(ROOT, "dist");
 
+const changelog = fs.readFileSync(path.join(ROOT, "CHANGELOG.md"), "utf8");
+const firstReleased = changelog.match(/^## \[(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\]/m)?.[1];
+if (firstReleased !== version) {
+  throw new Error(`CHANGELOG.md newest release is ${firstReleased ?? "missing"}, expected ${version}`);
+}
+
 function sh(cmd: string[]): void {
   const r = Bun.spawnSync(cmd, { cwd: ROOT, stdout: "inherit", stderr: "inherit" });
   if (r.exitCode !== 0) throw new Error(`command failed: ${cmd.join(" ")}`);
@@ -76,6 +83,17 @@ function uploadRelease(): void {
   const WRANGLER = "wrangler@4.107.0"; // keep in lockstep with the root devDependency pin
   const put = (key: string, file: string, ct: string) =>
     sh(["bunx", WRANGLER, "r2", "object", "put", `rbox-releases/${key}`, `--file=${path.join(dist, file)}`, `--content-type=${ct}`, "--remote"]);
+  const liveManifest = () => {
+    const got = Bun.spawnSync(["bunx", WRANGLER, "r2", "object", "get", "rbox-releases/releases/version.json", "--pipe", "--remote"], { cwd: ROOT });
+    if (got.exitCode !== 0) throw new Error("could not read the live release manifest — refusing mutable publication");
+    const parsed = JSON.parse(got.stdout.toString()) as { version?: unknown };
+    if (typeof parsed.version !== "string") throw new Error("live release manifest has no valid version");
+    return parsed.version;
+  };
+  const before = liveManifest();
+  if (semverGt(before, version)) {
+    throw new Error(`live release ${before} is newer than candidate ${version} — refusing rollback`);
+  }
   for (const [key, a] of Object.entries(m.artifacts)) {
     put(`releases/${a.path}`, key, "application/octet-stream"); // immutable versioned (e.g. releases/v0.5.0/rbox-linux-x64)
     put(`releases/${key}`, key, "application/octet-stream"); // mutable latest alias (releases/rbox-linux-x64)
@@ -89,6 +107,9 @@ function uploadRelease(): void {
   console.log("[release] fetch-back sha verify OK");
   put("releases/version.json", "version.json", "application/json");
   put("releases/version.json.sig", "version.json.sig", "text/plain");
+  const after = liveManifest();
+  if (after !== version) throw new Error(`live release changed to ${after}; refusing to publish changelog for ${version}`);
+  put("releases/changelog.md", "../CHANGELOG.md", "text/markdown; charset=utf-8");
   console.log(`[release] published ${tag}`);
 }
 

@@ -24,6 +24,12 @@ on:
 permissions:
   contents: read
 
+# Only one workflow may mutate the live release objects at a time. A lower
+# version is also rejected against the live manifest by scripts/release.ts.
+concurrency:
+  group: release-publish
+  cancel-in-progress: false
+
 jobs:
   # 1) BUILD — cross-compile + sign all 3 binaries (darwin-arm64, linux-x64, linux-arm64)
   #    on one host, but DO NOT upload. Each embeds its own native @parcel/watcher.node
@@ -151,3 +157,9 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: bun scripts/release.ts "${GITHUB_REF_NAME#v}" --upload-only
+      - name: Rebuild the public changelog page
+        env:
+          RBOX_HOME_DEPLOY_HOOK: ${{ secrets.RBOX_HOME_DEPLOY_HOOK }}
+        run: |
+          test -n "$RBOX_HOME_DEPLOY_HOOK" || { echo "::error::RBOX_HOME_DEPLOY_HOOK is not configured"; exit 1; }
+          curl --fail --silent --show-error --max-time 15 --request POST "$RBOX_HOME_DEPLOY_HOOK" >/dev/null
