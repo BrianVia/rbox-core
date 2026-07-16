@@ -1,13 +1,12 @@
 # §130 — Follower stale-side-branch hygiene
 
-> **Status: 🚧 DESIGN v10 — 2026-07-16.**
+> **Status: 🚧 DESIGN v11 — 2026-07-16.**
 >
-> **Review history.** Nine adversarial review rounds established the mechanisms in this
-> document. v10 preserves the v9 protocol and closes its remaining provenance and
-> implementability gaps: every durable proof is bound to one state lineage and logical
-> repository, old or legacy positive BASE cannot launder a user recreation, settled
-> absence proofs compact without losing their authority, P-repair is bounded and fully
-> retryable, and the BASE composer is total over the existing Git-section lanes.
+> **Review history.** Ten adversarial review rounds established the mechanisms in this
+> document. v11 preserves the v10 protocol and closes the final composer-contract gap:
+> mixed outcomes now carry exact create/update/delete witnesses for syncable non-branch
+> refs, including crash reconstruction, and the closed authority union includes confirmed
+> no-P manual settlement. A/P and positive branch provenance remain branch-only.
 >
 > Field record: the Mac rbox-core replica accumulated **83 local-only commits across dozens
 > of stale side branches**. Every branch had been squash-merged and deleted on the publisher.
@@ -294,13 +293,20 @@ Direct BASE construction, whole-section assignment, member deletion, legacy-map 
 and raw whole-state persistence outside this function are forbidden by structural tests.
 `authority` is a closed union:
 
-- `pull-ref-transaction` carries exact A/P witnesses and locked live/reflog facts;
+- `pull-ref-transaction` carries exact branch A/P witnesses, exact non-branch safe-ref
+  witnesses, and locked live/reflog facts;
 - `pull-carry` may retain ref members and change permitted non-ref fields, but may not
   change a ref member;
 - `journal-recovery` carries the journal's exact transaction witnesses rather than
   trusting its intended section;
 - `publisher-ack` may add or advance present members this device advertised, but may
   not remove them;
+- `manual` carries the freshly confirmed snapshot, the locked second proof, and the exact
+  per-ref terminal decision. It may land only that confirmed candidate. Branch absence
+  still requires A/Z; a branch transition that created P still settles through P; and an
+  already-terminal positive branch with positive previous BASE, for which the confirmed
+  episode performed no ref mutation, receives a new `manual` origin rather than invented P
+  authority;
 - `p-repair` may retire a quarantined P episode and materialize only the exact
   historically proved P transition under the pre-state rule below; it may never remove a
   BASE member or overwrite a later third positive value; and
@@ -316,6 +322,43 @@ positive member only as `legacy-untrusted`. Missing, malformed, foreign, stale, 
 mismatched proof retains the previous member, keeps the incoming section pending, and
 returns a typed hard hold.
 
+Syncable non-branch refs use a distinct witness which is never valid for
+`refs/heads/*`:
+
+```ts
+type SafeRefWitness =
+  | { kind: "safe-ref"; proof: "expected-old-transaction";
+      beforeOid: string | null; afterOid: string | null }
+  | { kind: "safe-ref"; proof: "locked-terminal-observation";
+      afterOid: string | null }
+```
+
+The map key is the refname. It must be `refs/tags/*` or `refs/stash` in a dir repo and be
+admitted by the repo's effective scope. Non-null OIDs are strict 40-hex values. An
+`expected-old-transaction` witness is returned only after the generic update-ref
+transaction commits one exact non-no-op shape: absent→`afterOid` create,
+`beforeOid`→`afterOid` expected-old update, or `beforeOid`→absent expected-old delete.
+`beforeOid` is the locked live expected-old value, which need not equal previous BASE;
+`afterOid` must equal the candidate member, and the two endpoints must differ.
+
+A `locked-terminal-observation` verifies the candidate OID or absence under the D2 ref
+reservation and exists so retry can reconstruct a mutation that crashed after Git commit
+but before partial persistence without inventing its unknowable expected-old value. It is
+valid only while the same `incomingKey`, previous BASE projection, candidate member, and
+terminal live value all match. Thus create, change, and delete are all expressible,
+including `afterOid:null`; a user move away from the terminal value invalidates the witness
+and holds. A pending-key-identical, D2-valid transaction witness is retained across retries
+instead of being downgraded to a later equality observation. For `refs/stash`, either form
+with a present `afterOid` also requires successful idempotent reflog verification/repair
+before it is accepted; an absent terminal verifies ref absence, while the preservation gate
+has already pinned displaced reflog OIDs.
+
+This is the typed form of today's generic safe-ref loop: after the hold/ambiguity and
+preservation gates it emits `update`, `create`, or `delete` with the exact expected old
+value (`src/cli/sync-git/follow.ts:605-675`). Tags/stash never create or consume A/P/K,
+never receive `BranchBaseOrigin`, and a `SafeRefWitness` can neither authorize a branch
+BASE change nor satisfy tombstone provenance.
+
 The rest of the section is total and deliberately preserves today's whole-section lane
 semantics rather than inventing hybrids:
 
@@ -329,9 +372,12 @@ semantics rather than inventing hybrids:
   `indexTree`, `opState`, `config`, `refScope`, `generatedAt`, `bundleSha`,
   `bundleEncSha`, `bundleCipherSize`, compression/payload fields, and `packChain`.
   The whole incoming section remains `pending`. Exact safe physical changes live only in
-  `partial.appliedRefs`; `checkoutPending:false` says the incoming HEAD/index/op-state were
-  journal-published; config completion lives in the config lane. Retry reconstructs the
-  previous logical identity with `withoutRboxAuthoredRefs` (`apply.ts:25-52,767-779`).
+  `partial.appliedRefs`; for each non-branch `safe-ref` key, retry overlays the member from
+  previous BASE (including its absence) when reconstructing the previous logical identity.
+  The transaction's `beforeOid` is physical CAS evidence, not necessarily logical BASE.
+  `checkoutPending:false` says the incoming
+  HEAD/index/op-state were journal-published; config completion lives in the config lane.
+  Retry uses `withoutRboxAuthoredRefs` (`apply.ts:25-52,767-779`).
 - With no held ref and a completed checkout, candidate tags/stash and every non-ref field
   advance wholesale. This is the current `base: held ? baseSec : remoteSec` intended-record
   contract and outcome packing (`apply.ts:910-940,984-1000`). The legacy clean path has the
@@ -355,12 +401,21 @@ whole BASE; otherwise the committed section advances wholesale (`plan.ts:797-813
 exhaustive when that interface grows.
 
 `lockedProof` means a prepared Git ref transaction, not an in-process mutex. It locks
-every affected R and A/P/K ref in bytewise order. Absence verifies `R` absent and
+every affected R, safe ref, and A/P/K ref in bytewise order. Absence verifies `R` absent and
 `A(R)=M`. Exact P recovery verifies `R=N` and the exact P/K targets, with their
 retirement committing only after the state CAS. Unchanged refs participating in a
 reservation are also verified. The state-generation CAS runs while the Git locks remain
 prepared. State failure aborts the ref transaction and leaves P/K; state success commits
 the transaction.
+
+For a non-branch safe ref whose generic update-ref transaction already committed, the
+prepared settlement transaction is verify-only: it reserves the ref and verifies the exact
+`afterOid` or absence during the BASE state CAS. State failure releases that reservation
+but does not claim to undo the earlier Git commit; previous BASE, pending, and any persisted
+transaction witness remain retryable. State success advances the terminal whole-section
+lane and discards the witness. The crash-rebuilt terminal-observation form uses the same
+verify-only boundary. A no-P manual branch decision likewise verifies exact locked live N
+through its state CAS.
 
 The exact global order and P-repair's additional locks are specified below; no state writer
 may acquire a Git proof or origin lock in reverse order.
@@ -376,7 +431,8 @@ retrofit all of these existing sites:
   `journal-recovery` and never trusts `record.base` alone.
 - **Pull repository absence and shortcuts (`apply.ts`):** remote-repository omission,
   unchanged-section advance, already-converged advance, and legacy-conflict composition.
-  An already-converged changed value without P holds.
+  An already-converged changed branch value without P or confirmed `manual` authority
+  holds; an admitted non-branch value uses the exact `safe-ref` terminal witness above.
 - **Pull intended and success records (`apply.ts`):** journal RepoRecord construction,
   the current held-vs-remote BASE choice, successful-follow input carry and assignment, and
   clean/legacy success assignment. Mixed-ref results compose per ref; no success assigns an
@@ -384,7 +440,9 @@ retrofit all of these existing sites:
 - **Ref mutation and recovery (`src/cli/sync-git/follow.ts`):** safe-ref equality,
   deletion and update planning; pre-journal safe-ref publication; current-ref delete/update
   construction; intended-record capture; and journal recovery/landing. Every mutation
-  returns its exact witness; equality observation returns none.
+  returns its exact witness. Unchanged present equality may return only `direct`; admitted
+  non-branch create/update/delete returns `safe-ref`, and crash retry may rebuild it only
+  from the locked terminal observation. Branch mutation returns only A/P witnesses.
 - **State folding and install (`src/cli/config.ts` and
   `src/cli/sync-state.ts`):** legacy-to-record folding, records-to-manifest
   serialization, packet installation, generic state save, source record construction,
@@ -393,8 +451,9 @@ retrofit all of these existing sites:
   `sync-state.ts:102-223,225-291`, and the published-intent merge/save at
   `sync-state.ts:320-457`; that merge composes BASE rather than replace-copying its
   apply fields. `StateSource` carries `repoProofs[relPath]`, whose closed per-repo value
-  contains per-branch authority/witnesses: one pull packet can mix carry, A, P, and repair
-  outcomes across and within repos, so a scalar packet authority is forbidden. Raw `saveState`
+  contains per-ref authority/witnesses: one pull packet can mix carry, A, P, non-branch
+  safe-ref, manual, and repair outcomes across and within repos, so a scalar packet
+  authority is forbidden. Raw `saveState`
   is private to fresh non-Git initialization and refuses state containing Git BASE or repo
   records. Structural tests forbid any other whole-state persistence API or direct
   state-file write.
@@ -412,7 +471,7 @@ retrofit all of these existing sites:
   missing-state/incarnation construction, and legacy and transactional reset paths use the
   artifact protocol below and never manufacture empty branch BASE.
 - **Manual resolution (`src/cli/git-cmd.ts`):** the current wholesale
-  `base: incoming` assignment is replaced by the per-ref manual protocol.
+  `base: incoming` assignment is replaced by the per-ref `manual` authority protocol.
 - **All four production state sources:** pull's mixed apply/global source
   (`src/cli/sync/pull.ts:258-286`), push's deferral-only save
   (`src/cli/sync/push.ts:452-469`), push's no-op bookkeeping save
@@ -568,7 +627,7 @@ recreated R, advanced or truncated its reflog, performed `N→U→N`, or wrote a
 protected BASE shape. A structurally valid P must not become a permanent artifact wedge.
 
 When failure is specifically a locked live-ref, reflog, or protected-BASE-shape mismatch,
-v10 executes `p-repair`. It first enumerates the current observation set
+v11 executes `p-repair`. It first enumerates the current observation set
 
 `Sobs = {P.priorOid when non-null, P.nextOid, live R when present} ∪ {every non-zero old/new OID in R's complete reflog}`.
 
@@ -816,11 +875,20 @@ leaf remains.
 
 `GitPartialApply.appliedRefs` may record
 `{kind:"absent", artifactOid:M}` or
-`{kind:"present", oid:N, artifactOid:P, episode}`.
-`{kind:"direct"}` is valid only for unchanged equality. These records are
-pending-key-bound, D2-revalidated hints. Raw or prevalidated partial presence never
-establishes BASE provenance or authorizes a tombstone, and the hints may be rebuilt from
-A/Z/P.
+`{kind:"present", oid:N, artifactOid:P, episode}` for branches, and either
+`SafeRefWitness` form above for admitted tags/stash. The A/P forms are invalid for a
+non-branch ref; `safe-ref` is invalid for a branch. `{kind:"direct"}` is valid only for
+unchanged present equality and is observation-only: it cannot stand for a BASE-changing
+transition. Existing symbolic equality remains observation-only as well.
+
+All records are pending-key-bound, D2-revalidated hints. A valid persisted
+`expected-old-transaction` safe-ref witness survives a retry that now observes direct
+equality. If the process crashed before persisting it, retry may construct only the
+`locked-terminal-observation` form, never a fictional `beforeOid`. Raw or prevalidated
+partial presence never establishes branch BASE provenance or authorizes a tombstone. A/Z/P
+may rebuild only branch hints; the locked terminal rule may rebuild only non-branch hints.
+No witness changes BASE by itself: a mixed outcome keeps previous BASE and pending, while
+terminal composition consumes the typed witnesses and advances the whole candidate lane.
 
 ### Value-incarnation boundary
 
@@ -855,6 +923,13 @@ GC never removes the BASE anchor, even when `.git` is gone.
 `take-theirs` retains snapshot confirmation, quarantine, permanent human pins, and the
 locked second proof. It never writes wholesale BASE.
 
+The composer's `manual` authority is bound to the episode, `snapshotId`, `incomingKey`,
+candidate, state generation, fresh confirmation, locked second-proof receipt, and exact
+per-ref witnesses. It is single-use. Once the second proof succeeds, the checkout journal
+records that bounded receipt; recovery derives only `journal-recovery` from the recorded
+decision. A crash before the receipt is durable requires a fresh snapshot and confirmation,
+not inference from live equality.
+
 Preflight first settles an exactly recoverable P or performs P-repair for a valid moved P.
 It then discards the old confirmation context, takes a new snapshot, and obtains or
 revalidates confirmation against that snapshot. If P appears or changes during the second
@@ -872,7 +947,14 @@ user occupant blocks it, manual authority may CAS-update or delete that exact sn
 value while atomically deleting A or the exact Z leaf and creating P; quarantine and pins
 preserve what was displaced. Incoming presence from present likewise creates P around the
 expected-old update. P settlement records `pull-p`; a manual no-P terminal decision records
-the exact `manual` origin.
+the exact `manual` origin. That no-P case is limited to a positive branch whose freshly
+confirmed candidate already equals locked live R, whose previous logical BASE is also
+positive, and for which the episode performs no branch mutation. It revalidates reflog,
+ownership, lineage artifacts, state generation, and the absence of any owning or foreign
+A/Z/P/K contradiction. It may replace that positive BASE member and origin, but cannot
+cross logical absence, remove a member, infer absence, retire A/Z, bypass P, or be reused by
+another incoming key. Manual tag/stash create/update/delete uses only
+`SafeRefWitness`; it never creates A/P or any branch origin.
 Any snapshot, reflog, A/P/K, sibling-worktree, or CAS mismatch aborts without BASE change.
 Only the mandatory composer lands the journal result.
 
@@ -1058,7 +1140,7 @@ what a capable reader refuses to infer:
    present result, or by explicit confirmed manual CAS; it is never revalidated from old
    positive state.
 4. A live P blocks use of serialized BASE until a capable reader settles exact recovery or
-   v10 quarantines and retires a moved P through P-repair.
+   v11 quarantines and retires a moved P through P-repair.
 5. Old readers ignore the unknown wire fields. Capable readers strictly validate container
    shape, `refs/heads/*` grammar, 40-hex OIDs, canonical timestamps, caps, duplicate
    OIDs, strictly increasing per-ref generations, and the safe-integer high-water mark
@@ -1080,7 +1162,7 @@ The required capable→old→capable walk is:
 - a later tombstone requires a fresh usable positive origin as well as live/BASE equality
   and every hard gate.
 
-If the old interval moves refs, reflogs, or state while P stands, returning v10 performs
+If the old interval moves refs, reflogs, or state while P stands, returning v11 performs
 exact recovery when possible and P-repair otherwise. It never treats the old interval as
 write-free and never derives deletion authority from ambiguity.
 
@@ -1121,6 +1203,19 @@ write-free and never derives deletion authority from ambiguity.
   no-hold success; pending push carry. Mixed outcomes retain the complete previous
   non-branch/non-ref/bundle family in BASE and exact incoming whole section in pending;
   terminal outcomes advance it wholesale.
+- Cross `safe-ref` create/update/delete for a tag and stash, including `beforeOid:null` and
+  `afterOid:null`; persisted transaction versus crash-rebuilt locked-terminal proof; direct
+  equality never standing for a change; prior transaction proof surviving later equality;
+  and stash reflog repair on retry. Wrong ref class/scope, pending key, candidate, live
+  value/absence, before/after shape, or malformed OID holds. Reject A/P on tag/stash,
+  `safe-ref` on a branch, and every non-branch witness for a pointer repo. Identity retry
+  overlays previous BASE rather than transaction `beforeOid`.
+- Exhaust the closed authority union, including `manual`. A no-P manual positive requires
+  positive previous BASE, the fresh snapshot, and locked terminal branch equality, and
+  writes a matching `manual` origin; it cannot cross absence, remove BASE, retire A/Z,
+  bypass P, cross incoming keys, or survive a
+  state-generation/artifact/ownership/reflog race. Crash before its journal receipt requires
+  reconfirmation; exact journal recovery is single-use.
 - Race every proof→state boundary, fail the state CAS, and stress multi-repo lock ordering.
   Pins and P retirement commit only with their intended transaction.
 - Old-writer re-advertisement with `live=BASE=N` while A/Z stands always holds; no automatic
@@ -1161,6 +1256,22 @@ write-free and never derives deletion authority from ambiguity.
 - A crash matrix kills after safe refs and before partial, journal, and state writes. A
   alone reconstructs logical absence, reservation, and the one-time veto after tombstone
   expiry or eviction. Invalid A hard-holds.
+- Mixed non-branch/manual walk: start a dir repo with previous BASE
+  `{topic:L, v1:T0, old:TD, stash:S0}`, no `v2`, and incoming
+  `{topic:N, v1:T1, v2:T2, stash:S1}` with `old` omitted. Let live `topic=N` be an
+  already-terminal user value that lacks P and therefore holds branch BASE. The generic
+  safe-ref path expected-old updates `v1`, creates `v2`, deletes `old`, updates stash, and
+  repairs its reflog; then crash after those Git commits but before partial persistence.
+  Restart under the same incoming key: locked terminal observations prove
+  `T1/T2/absent/S1`, retry overlays `T0/absent/TD/S0` from previous BASE, persists the four
+  safe-ref hints, retains the entire old BASE family, and keeps incoming pending while the
+  branch still holds. `take-theirs` then takes a fresh snapshot and locked second proof;
+  because `topic=N` is stable and no P or branch mutation exists, the new `manual`
+  authority lands `BASE[topic]=N` with a manual episode origin. With no hold and checkout
+  complete, terminal composition advances tags/stash and the non-ref family wholesale and
+  drops pending/partial. Assert live=BASE=incoming, no A/P/K or branch origin exists for any
+  tag/stash, and the sole new branch origin is `manual`. Race any non-branch terminal or the
+  branch after its respective proof: settlement aborts and resnapshots rather than wedging.
 - Exact P recovery covers present `L→N`, absent→N, and ordinary create at every
   prepare/commit/state/retirement boundary, with distinct pre-state and
   post-state/pre-retirement assertions. Exact R/reflog plus a third-positive or unexpected
@@ -1223,7 +1334,7 @@ write-free and never derives deletion authority from ambiguity.
   `p-repaired` receipt while another member still recovers or rolls back. The
   journal remains published, its unrelated members remain intact, and reset cannot bypass
   it.
-- Move R, truncate/expire its reflog, run Git GC, and only then return v10. K keeps every
+- Move R, truncate/expire its reflog, run Git GC, and only then return v11. K keeps every
   P-referenced OID available, so repair still pins, quarantines, and retires without an
   artifact wedge. Missing or mismatched K is corruption, not this movement case.
 - Fill Q to 256, repair once more, and verify deterministic expected-target eviction of the
