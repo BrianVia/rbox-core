@@ -182,7 +182,7 @@ src/engine/e2ee/session.ts        — top-level E2EE orchestration composing all
 ## `src/engine/git/` — git-native repo state capture/apply
 
 ```
-src/engine/git/shared.ts      — dependency root for git/*: git spawn wrappers (git/gitRaw/gitOk/gitWithIndexFile), RepoCtx/detectGitKind, generic reflog reads, worktree listing, importGitPackChain, gitSectionTips/BlobRefs/PackLinks, GitChainTimings. Never: policy.
+src/engine/git/shared.ts      — dependency root for git/*: git spawn wrappers (git/gitRaw/gitOk/gitWithIndexFile, including stdin + non-retaining streamed stdout), RepoCtx/detectGitKind, generic reflog reads, worktree listing, importGitPackChain, gitSectionTips/BlobRefs/PackLinks, GitChainTimings. Never: policy.
 src/engine/git/preflight.ts   — decides whether a repo's shape is syncable (dir vs pointer, worktrees, alternates, submodule superprojects, busy-check): gitPreflight, isGitBusy (structural vs transient refusal). Never: capture or apply.
 src/engine/git/identity.ts    — stable plaintext-only identity of a repo's git state for change detection (gitIdentity, projectIdentity, gitIdentityKey), scope-aware. Never: the stored GitSection shape (types.ts).
 src/engine/git/capture.ts     — git-native state capture (design 43): history bundles, index/HEAD/op-state snapshot, stable change identity, scratch-dir rooting/sweep, GitCaptureDeferredError. Owns "what to upload for a repo this cycle". Never: apply.
@@ -196,7 +196,7 @@ src/engine/git/lockfile.ts    — generic cross-process advisory lockfile with l
 src/engine/git/config-sync.ts — pure (node-free, bundles into Worker) grammar/projection/canonicalization for git config sync (design 93): allowlisted keys, canonicalizeGitConfig, credential/value safety. Never: I/O.
 src/engine/git/config-txn.ts  — transactional on-disk git config read/write: lockfile-guarded atomic apply, fault classification, orphan sweep. The stateful counterpart to config-sync.ts. Never: the grammar.
 src/engine/git/index-identity.ts — semantic GitIndexIdentityV2 projection from a private index copy. Never: follow authorization or live-index mutation.
-src/engine/git/reachability.ts — fail-closed incoming-ownership/no-drop graph proofs plus full stash-reflog enumeration. Never: ref mutation or follow policy.
+src/engine/git/reachability.ts — fail-closed single-tip and batched incoming-ownership/no-drop graph proofs plus full stash-reflog enumeration. Never: ref mutation or follow policy.
 src/engine/git/journal.ts      — durable two-phase checkout journal write/mark/clear, prepared-lock ownership recovery, and old/new/third-value arbitration. Never: CLI state interpretation or checkout planning.
 src/engine/git/checkout-txn.ts — prepared expected-old ref transaction + journaled ref/HEAD/index-lock checkout commit and capability/boundary proof protocol. Never: classifier policy or state saving.
 src/engine/git/keep-pins.ts    — content-addressed recovery pins, reflog-displacement discovery, and pre-displacement provenance sidecar. Never: retention policy or ref-plane classification.

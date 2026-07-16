@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { GitSection } from "../types.js";
-import { enumerateRefReflogOids, HEX40, git, headBranchOf, repoCtx } from "./shared.js";
+import { enumerateRefReflogOids, HEX40, git, gitRaw, headBranchOf, repoCtx } from "./shared.js";
 
 export interface ImportedScratchNamespace {
   /** Imported scratch names are deliberately not ownership roots. */
@@ -14,6 +14,13 @@ export type OwnershipProof =
   | { status: "owned" }
   | { status: "unowned" }
   | { status: "indeterminate"; marker: "shallow-store" | "missing-object" | "walk-error" };
+
+export interface PartitionedOwnership {
+  tip: string;
+  /** Peeled commit identity, available after a successful batch-check. */
+  commit?: string;
+  proof: OwnershipProof;
+}
 
 export type NoDropProof =
   | { status: "proven" }
@@ -63,6 +70,17 @@ async function shallow(repoDir: string): Promise<boolean | undefined> {
   return fs.access(path.join(ctx.commonDir, "shallow")).then(() => true, (error: NodeJS.ErrnoException) => error.code === "ENOENT" ? false : undefined);
 }
 
+/** One validating Git probe for the batch, preserving legacy shallow markers. */
+async function batchedShallow(repoDir: string): Promise<boolean | undefined> {
+  try {
+    const commonDir = await git(repoDir, ["rev-parse", "--git-common-dir"], { env: graphEnv });
+    return fs.access(path.join(path.resolve(repoDir, commonDir), "shallow"))
+      .then(() => true, (error: NodeJS.ErrnoException) => error.code === "ENOENT" ? false : undefined);
+  } catch {
+    return undefined;
+  }
+}
+
 async function peelAndVerify(repoDir: string, roots: readonly string[]): Promise<{ commits: string[] } | { marker: "missing-object" | "walk-error" }> {
   const commits: string[] = [];
   try {
@@ -82,22 +100,105 @@ async function peelAndVerify(repoDir: string, roots: readonly string[]): Promise
   }
 }
 
-export async function tipOwnedByIncoming(repoDir: string, tip: string, roots: readonly string[]): Promise<OwnershipProof> {
+async function tipOwnedByIncomingDetailed(repoDir: string, tip: string, roots: readonly string[]): Promise<PartitionedOwnership> {
   const isShallow = await shallow(repoDir);
-  if (isShallow !== false) return { status: "indeterminate", marker: isShallow ? "shallow-store" : "walk-error" };
+  if (isShallow !== false) return { tip, proof: { status: "indeterminate", marker: isShallow ? "shallow-store" : "walk-error" } };
   const graph = await peelAndVerify(repoDir, [tip, ...roots]);
-  if ("marker" in graph) return { status: "indeterminate", marker: graph.marker };
+  if ("marker" in graph) return { tip, proof: { status: "indeterminate", marker: graph.marker } };
   const [tipCommit, ...rootCommits] = graph.commits;
-  if (!tipCommit) return { status: "indeterminate", marker: "missing-object" };
+  if (!tipCommit) return { tip, proof: { status: "indeterminate", marker: "missing-object" } };
   for (const root of rootCommits) {
     try {
       await git(repoDir, ["merge-base", "--is-ancestor", tipCommit, root!], { env: graphEnv });
-      return { status: "owned" };
+      return { tip, commit: tipCommit, proof: { status: "owned" } };
     } catch (error) {
-      if (errorCode(error) !== 1) return { status: "indeterminate", marker: errorCode(error) === 128 ? "missing-object" : "walk-error" };
+      if (errorCode(error) !== 1) return { tip, proof: { status: "indeterminate", marker: errorCode(error) === 128 ? "missing-object" : "walk-error" } };
     }
   }
-  return { status: "unowned" };
+  return { tip, commit: tipCommit, proof: { status: "unowned" } };
+}
+
+export async function tipOwnedByIncoming(repoDir: string, tip: string, roots: readonly string[]): Promise<OwnershipProof> {
+  return (await tipOwnedByIncomingDetailed(repoDir, tip, roots)).proof;
+}
+
+async function legacyPartition(repoDir: string, tips: readonly string[], roots: readonly string[]): Promise<PartitionedOwnership[]> {
+  const result: PartitionedOwnership[] = [];
+  for (const tip of tips) result.push(await tipOwnedByIncomingDetailed(repoDir, tip, roots));
+  return result;
+}
+
+/** Batched equivalent of tipOwnedByIncoming for show-me's reflog-sized candidate set. */
+export async function partitionOwnedByIncoming(repoDir: string, tips: readonly string[], roots: readonly string[]): Promise<PartitionedOwnership[]> {
+  const isShallow = await batchedShallow(repoDir);
+  if (isShallow !== false) {
+    const marker = isShallow ? "shallow-store" : "walk-error";
+    return tips.map((tip) => ({ tip, proof: { status: "indeterminate", marker } }));
+  }
+
+  const inputs = [...tips, ...roots];
+  let records: Array<{ commit?: string }>;
+  try {
+    const raw = await gitRaw(repoDir, ["cat-file", "--batch-check=%(objectname) %(objecttype)"], {
+      env: graphEnv,
+      stdin: inputs.map((oid) => `${oid}^{commit}\n`).join(""),
+    });
+    const lines = raw.split("\n");
+    if (lines.at(-1) === "") lines.pop();
+    if (lines.length !== inputs.length) return legacyPartition(repoDir, tips, roots);
+    records = lines.map((line) => {
+      const match = /^([0-9a-f]{40}) commit$/.exec(line);
+      return match ? { commit: match[1]! } : {};
+    });
+  } catch {
+    return legacyPartition(repoDir, tips, roots);
+  }
+
+  const tipRecords = records.slice(0, tips.length);
+  const rootRecords = records.slice(tips.length);
+  if (rootRecords.some((record) => !record?.commit)) {
+    return tips.map((tip, index) => ({
+      tip,
+      ...(tipRecords[index]?.commit ? { commit: tipRecords[index]!.commit } : {}),
+      proof: { status: "indeterminate", marker: "missing-object" },
+    }));
+  }
+
+  const commits = records.flatMap((record) => record.commit ? [record.commit] : []);
+  try {
+    if (commits.length > 0) await git(repoDir, ["rev-list", "--quiet", "--stdin"], {
+      env: graphEnv,
+      stdin: commits.join("\n") + "\n",
+    });
+  } catch {
+    // Recover exact per-tip markers and preserve independence after any corrupt walk.
+    return legacyPartition(repoDir, tips, roots);
+  }
+
+  const candidateCommits = new Set(tipRecords.flatMap((record) => record?.commit ? [record.commit] : []));
+  const ownedCommits = new Set<string>();
+  let pending = "";
+  try {
+    await gitRaw(repoDir, ["rev-list", "--stdin"], {
+      env: graphEnv,
+      stdin: rootRecords.map((record) => record.commit!).join("\n") + (rootRecords.length ? "\n" : ""),
+      onStdoutChunk: (chunk) => {
+        pending += chunk;
+        const lines = pending.split("\n");
+        pending = lines.pop() ?? "";
+        for (const oid of lines) if (candidateCommits.has(oid)) ownedCommits.add(oid);
+      },
+    });
+    if (pending && candidateCommits.has(pending)) ownedCommits.add(pending);
+  } catch {
+    return legacyPartition(repoDir, tips, roots);
+  }
+
+  return tips.map((tip, index) => {
+    const commit = tipRecords[index]?.commit;
+    if (!commit) return { tip, proof: { status: "indeterminate", marker: "missing-object" } };
+    return { tip, commit, proof: { status: ownedCommits.has(commit) ? "owned" : "unowned" } };
+  });
 }
 
 export async function noDropProof(

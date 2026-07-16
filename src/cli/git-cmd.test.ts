@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { LocalBlobStore, buildIgnoreMatcher, captureGitState, type GitSection, type Manifest } from "../engine/index.js";
+import { LocalBlobStore, buildIgnoreMatcher, captureGitState, setGitSpawnObserver, type GitSection, type Manifest } from "../engine/index.js";
 import { checkoutJournalDir } from "../engine/git/journal.js";
 import { loadState, repoRecordsForState, saveState, syncStreamId, type SyncState, type WorkspaceConfig } from "./config.js";
 import { gitDeferralsCmd, gitResolveCmd, safeResolveText, type GitResolveShow } from "./git-cmd.js";
@@ -57,6 +57,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  setGitSpawnObserver(undefined);
   await fs.rm(tmp, { recursive: true, force: true });
 });
 
@@ -154,6 +155,172 @@ test("show-me snapshot is stable and JSON exposes no commit OIDs", async () => {
   expect(first.deferrals[0]?.ageSeconds).toBe(3600);
   const withoutSnapshot = JSON.stringify(first).replace(first.snapshot, "");
   expect(withoutSnapshot).not.toMatch(/\b[0-9a-f]{40}\b/);
+});
+
+test("show-me batches subjects and keeps progress exclusively on stderr", async () => {
+  await fixture();
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  const commands: string[][] = [];
+  setGitSpawnObserver((_root, args) => commands.push([...args]));
+  expect(await gitResolveCmd(root, receiver, "show-me", {}, deps(stdout, {
+    stdout: (line) => stdout.push(line),
+    stderr: (line) => stderr.push(line),
+  }))).toBe(0);
+  const snapshotLine = stdout.at(-1)!;
+  expect(snapshotLine).toMatch(/^  snapshot: [0-9a-f]{64}$/);
+  expect(stdout).toEqual([
+    "repo: incoming branch main",
+    "  oracle: dirty; index: diverged; operation state: matches-incoming; stash: clean",
+    "  local-only heads/local-topic, heads/local-topic reflog, heads/main, heads/main reflog: local-only",
+    "  apply deferred (local-commits) since 2026-07-13T00:00:00.000Z",
+    snapshotLine,
+  ]);
+  expect(stderr).toEqual([
+    "show-me: staging incoming bundle…",
+    "show-me: proving ownership of 2 candidates…",
+    "show-me: 1 local-only commits found",
+  ]);
+  const logs = commands.filter((args) => args[0] === "log");
+  expect(logs).toHaveLength(1);
+  expect(logs[0]).toContain("--stdin");
+  expect(logs.some((args) => args.includes("-1"))).toBe(false);
+});
+
+test("show-me JSON stdout remains byte-for-byte on the existing exhaustive contract", async () => {
+  await fixture();
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "show-me", { json: true }, deps(stdout, {
+    stdout: (line) => stdout.push(line), stderr: (line) => stderr.push(line),
+  }))).toBe(0);
+  expect(stdout).toHaveLength(1);
+  const parsed = JSON.parse(stdout[0]!) as GitResolveShow;
+  expect(stdout[0]).toBe(JSON.stringify({
+    status: "show-me",
+    repo: "repo",
+    incomingCheckout: { kind: "branch", label: "main" },
+    localOnlyCommits: [{
+      labels: ["heads/local-topic", "heads/local-topic reflog", "heads/main", "heads/main reflog"],
+      subject: "local-only",
+    }],
+    oracle: "dirty",
+    index: "diverged",
+    operationState: "matches-incoming",
+    stash: "clean",
+    deferrals: [{ lane: "apply", reason: "local-commits", deferredSince: "2026-07-13T00:00:00.000Z", ageSeconds: 3600 }],
+    snapshot: parsed.snapshot,
+  }));
+  expect(stderr).toHaveLength(3);
+});
+
+test("show-me preserves subjects after ownership-stream fallback and trims each batched subject like legacy", async () => {
+  await fixture();
+  await git(receiver, "-c", "user.email=resolve@example.invalid", "-c", "user.name=resolve", "commit", "--amend", "-qm", "  spaced subject  ");
+  let failed = false;
+  setGitSpawnObserver((_root, args) => {
+    if (!failed && args[0] === "rev-list" && args.includes("--stdin") && !args.includes("--quiet")) {
+      failed = true;
+      throw new Error("forced ownership stream failure");
+    }
+  });
+  const lines: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "show-me", { json: true }, deps(lines))).toBe(0);
+  const shown = JSON.parse(lines.at(-1)!) as GitResolveShow;
+  expect(shown.localOnlyCommits.some((entry) => entry.subject === "spaced subject")).toBe(true);
+  expect(shown.localOnlyCommits.some((entry) => entry.subject === "unreadable commit")).toBe(false);
+});
+
+test("show-me JSON is exhaustive while only human local-only presentation is capped", async () => {
+  const { localTip } = await fixture();
+  const subjectOids = new Map<string, string>([["local-only", localTip]]);
+  for (let i = 0; i < 51; i++) {
+    const subject = `local-${String(i).padStart(3, "0")}`;
+    subjectOids.set(subject, await commit(receiver, `${subject}\n`, subject));
+  }
+
+  const jsonOut: string[] = [];
+  const jsonErr: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "show-me", { json: true }, deps(jsonOut, {
+    stdout: (line) => jsonOut.push(line), stderr: (line) => jsonErr.push(line),
+  }))).toBe(0);
+  expect(jsonOut).toHaveLength(1);
+  const full = JSON.parse(jsonOut[0]!) as GitResolveShow;
+  expect(full.localOnlyCommits).toHaveLength(52);
+  expect(Object.keys(full).sort()).toEqual([
+    "deferrals", "incomingCheckout", "index", "localOnlyCommits", "operationState", "oracle", "repo", "snapshot", "stash", "status",
+  ]);
+  expect(jsonErr).toEqual([
+    "show-me: staging incoming bundle…",
+    "show-me: proving ownership of 53 candidates…",
+    "show-me: 52 local-only commits found",
+  ]);
+
+  const humanOut: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "show-me", {}, deps(humanOut, {
+    stdout: (line) => humanOut.push(line), stderr: () => {},
+  }))).toBe(0);
+  expect(humanOut.filter((line) => line.startsWith("  local-only "))).toHaveLength(50);
+  expect(humanOut).toContain("  …and 2 more local-only commits");
+
+  const hiddenSubject = full.localOnlyCommits.slice(50).map((entry) => entry.subject).find((subject) => subjectOids.has(subject));
+  expect(hiddenSubject).toBeDefined();
+  const takeOut: string[] = [];
+  const takeErr: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "take-theirs", { json: true, confirm: full.snapshot }, deps(takeOut, {
+    stdout: (line) => takeOut.push(line), stderr: (line) => takeErr.push(line),
+  }))).toBe(0);
+  const hiddenOid = subjectOids.get(hiddenSubject!)!;
+  expect(await git(receiver, "rev-parse", `refs/rbox-local/keep/${hiddenOid}`)).toBe(hiddenOid);
+  expect(takeErr).toEqual([]);
+});
+
+test("show-me heartbeat timers are cleared in finally", async () => {
+  await fixture();
+  const stderr: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "show-me", { json: true }, deps([], {
+    stderr: (line) => stderr.push(line), progressIntervalMs: 1,
+  }))).toBe(0);
+  expect(stderr.some((line) => /^show-me: still working \(\d+s\)$/.test(line))).toBe(true);
+  const atReturn = stderr.length;
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  expect(stderr).toHaveLength(atReturn);
+});
+
+test("show-me heartbeat timers are cleared when a phase transition throws", async () => {
+  await fixture();
+  const stderr: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "show-me", { json: true }, deps([], {
+    progressIntervalMs: 1,
+    stderr: (line) => {
+      if (line.startsWith("show-me: proving")) throw new Error("progress sink failed");
+      stderr.push(line);
+    },
+  }))).toBe(1);
+  const atReturn = stderr.length;
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  expect(stderr).toHaveLength(atReturn);
+});
+
+test("500 synthetic reflog candidates use one batched proof instead of per-tip Git calls", async () => {
+  await fixture();
+  const logPath = path.join(receiver, ".git", "logs", "refs", "heads", "main");
+  const fake = Array.from({ length: 500 }, (_, i) => {
+    const oldOid = (i + 1).toString(16).padStart(40, "0");
+    const newOid = (i + 2).toString(16).padStart(40, "0");
+    return `${oldOid} ${newOid} rbox <rbox@local> 0 +0000\tsynthetic`;
+  }).join("\n");
+  await fs.appendFile(logPath, `\n${fake}\n`);
+  const commands: string[][] = [];
+  setGitSpawnObserver((_root, args) => commands.push([...args]));
+  expect(await gitResolveCmd(root, receiver, "show-me", { json: true }, deps([]))).toBe(0);
+  expect(commands.filter((args) => args[0] === "cat-file")).toHaveLength(1);
+  expect(commands.filter((args) => args[0] === "merge-base")).toHaveLength(0);
+  expect(commands.filter((args) => args[0] === "log" && args.includes("--stdin"))).toHaveLength(1);
+  const batchedFamilies = commands.filter((args) => args[0] === "cat-file"
+    || (args[0] === "rev-list" && args.includes("--stdin"))
+    || (args[0] === "log" && args.includes("--stdin")));
+  expect(batchedFamilies.map((args) => args[0])).toEqual(["cat-file", "rev-list", "rev-list", "log"]);
 });
 
 test("git deferrals renders empty human and JSON forms", async () => {
