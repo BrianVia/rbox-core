@@ -15,6 +15,7 @@ const report = finalizeReport({
 });
 
 const fullCapture: CaptureSummary = {
+  runner: "docker",
   statsA: { peakMemMB: 210.5, cpuCoreSecondsTotal: 4.2, peakCpuPct: 180.4, samples: 12 },
   statsB: { peakMemMB: 190.1, cpuCoreSecondsTotal: 3.1, peakCpuPct: 95.0, samples: 12 },
   tail: { total: 40, errors: 0, waf403s: 0 },
@@ -23,6 +24,7 @@ const fullCapture: CaptureSummary = {
 };
 
 const skippedCapture: CaptureSummary = {
+  runner: "apple-container",
   statsA: { skipped: "no stats samples captured" },
   statsB: { skipped: "no stats samples captured" },
   tail: { skipped: "wrangler tail exited early (code 1)" },

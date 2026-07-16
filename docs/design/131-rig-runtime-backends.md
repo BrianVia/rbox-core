@@ -124,6 +124,29 @@ mount-source worktree-identity recreation logic, and the `rig down` before `up` 
 create-arg changes (the spec label recreates automatically); runner switches need nothing —
 each runtime's containers live in its own namespace.
 
+### Disk hygiene (founder addendum, 2026-07-16 — this host was once filled to 760 GB by
+### GH-runner containers leaking ~13 GB/day; the rig must be leak-proof by construction)
+
+- **Everything the rig creates carries a `rig=1` label** (containers, image builds, network,
+  volumes) — one namespace for scoped cleanup. **Global prunes (`docker system prune`,
+  unscoped `builder prune`) are FORBIDDEN** — this is a shared machine running other Docker
+  workloads.
+- `ensureImage`: after a successful rebuild to a new hash, the superseded rig image is
+  deleted (today only `down --all` deletes it — rebuild generations would otherwise
+  accumulate as dangling layers forever).
+- `rig down --all` additionally prunes dangling rig-labeled images.
+- New **`rig gc`** subcommand: reports and reclaims — dangling rig-labeled images/volumes,
+  `runs/` directories beyond the newest 30 (also auto-trimmed at `rig up`), workload-cache
+  entries LRU beyond a size cap — printing reclaimed sizes.
+- Doctor gains a **disk-headroom hard gate**: < 20 GB free in `DockerRootDir` (or the runs
+  dir / workload cache filesystems) → FAIL with a fix-it naming `rig gc` and, for build
+  cache the rig cannot safely scope, the manual `docker builder prune` the operator can
+  choose to run. Doctor also REPORTS builder-cache size so growth is visible before it
+  hurts.
+- Acceptance additions: after the full FAST_SUITE + `down --all`, `docker images` shows no
+  rig-labeled dangling images and `docker system df` deltas for volumes/containers
+  attributable to the rig are zero; `rig gc` on a dirtied state reclaims and reports.
+
 ## Tests
 
 - Unit (no daemon needed): verb-mapping table per backend (argv golden per call); inspect

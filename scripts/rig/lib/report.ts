@@ -39,6 +39,8 @@ export function renderReportMd(report: ScenarioReport, capture: CaptureSummary):
   const out: string[] = [];
 
   out.push(`# ${report.scenario} — ${verdict}`, "");
+  out.push(`- runner: ${capture.runner}`);
+  for (const marker of capture.markers ?? []) out.push(`- marker: ${marker}`);
   if (report.skipReason) out.push(`- skipped: ${report.skipReason}`);
   out.push(`- started: ${report.startedAt}`);
   out.push(`- finished: ${report.finishedAt}`);
