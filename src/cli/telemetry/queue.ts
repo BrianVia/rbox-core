@@ -1,4 +1,10 @@
-import { TELEMETRY_SAMPLE_SCHEMAS, type TelemetryEnvelope, type TelemetrySample } from "./contract.js";
+import {
+  TELEMETRY_BATCH_CAP,
+  TELEMETRY_SAMPLE_SCHEMAS,
+  telemetryEnabled,
+  type TelemetryEnvelope,
+  type TelemetrySample,
+} from "./contract.js";
 
 export interface TelemetryTransport {
   postJson(path: string, body: unknown, opts?: { signal?: AbortSignal; retries?: number }): Promise<Response>;
@@ -9,7 +15,6 @@ export interface TelemetryRecorder {
 }
 
 type Family = TelemetrySample["kind"];
-const enabled = (): boolean => process.env.RBOX_TELEMETRY !== "0";
 
 export class TelemetryQueue implements TelemetryRecorder {
   private readonly safety = new Map<Extract<TelemetrySample, { kind: "safety_event" }>["eventType"], number>();
@@ -33,7 +38,7 @@ export class TelemetryQueue implements TelemetryRecorder {
   }
 
   record(sample: TelemetrySample): void {
-    if (!enabled()) return;
+    if (!telemetryEnabled()) return;
     try {
       switch (sample.kind) {
         case "safety_event":
@@ -54,7 +59,7 @@ export class TelemetryQueue implements TelemetryRecorder {
   }
 
   private async flushOnce(signal?: AbortSignal): Promise<void> {
-    if (!enabled() || this.empty) return;
+    if (!telemetryEnabled() || this.empty) return;
     if (this.now() < this.blockedUntil) return;
     const samples: TelemetrySample[] = [];
     for (const [eventType, count] of this.safety) samples.push({
@@ -64,13 +69,18 @@ export class TelemetryQueue implements TelemetryRecorder {
     });
     if (this.capability) samples.push(this.capability);
     samples.push(...this.firstPublish, ...this.uploadLane, ...this.propagation);
-    samples.length = Math.min(samples.length, 64);
+    samples.length = Math.min(samples.length, TELEMETRY_BATCH_CAP);
     const envelope: TelemetryEnvelope = { v: 1, samples };
     let response: Response;
     try {
       response = await this.transport.postJson("/v1/telemetry", envelope, { retries: 0, ...(signal ? { signal } : {}) });
     } catch { return; }
     if (response.status === 429) { this.blockedUntil = this.now() + 240_000; return; }
+    if (response.status >= 400 && response.status <= 499) {
+      this.removeAccepted(samples);
+      try { this.log(`telemetry discarded ${samples.length} sample(s) rejected with HTTP ${response.status}`); } catch {}
+      return;
+    }
     if (response.status !== 202) return;
     this.removeAccepted(samples);
     try {

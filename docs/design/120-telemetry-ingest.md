@@ -179,7 +179,7 @@ Enforcement structure (review round 1, F6 — the table must be *provably* the o
 Drop observability (F7 — silent drops would make "missing telemetry" ambiguous, the exact
 ambiguity the cockpit exists to resolve): the server emits a low-cardinality counter point
 (`client.telemetry.drops`, `blob2=dropReason` ∈ `unknown_kind|unknown_field|bad_number|bad_enum|
-batch_cap|body_cap`, `double1=count`) per request with nonzero drops; the daemon logs nonzero
+batch_cap|body_cap|bad_state|unauthorized`, `double1=count`) per request with nonzero drops; the daemon logs nonzero
 `dropped` counts (bounded, no payload echo).
 
 Exact wire contract (round 2 — protocol errors vs sample drops are distinct):
@@ -313,7 +313,7 @@ on-device via `rbox git deferrals` (§124), which is the tool built for it.
 | `client.upload_lane` | `transport, bytes, uploadMs, opCount, fillVersion` | `[mbps, bytes, uploadMs, opCount]` (`mbps` **server-computed** = `8*bytes/(uploadMs/1000)/1e6`, 0 when `uploadMs==0`) | `blob2=transport` (`batch\|pack\|single`), `blob3=fillVersion` (`v1\|v2`) |
 | `client.capability` | `workerExecutions` | `[workerExecutions]` | — |
 | `client.safety_event` | `eventType, count` | `[count]` | `blob2=eventType` (`mass_delete_breaker\|scan_fault`) |
-| `client.telemetry.drops` | — (server-emitted only) | `[count]` | `blob2=dropReason` (6-value enum, §D2) |
+| `client.telemetry.drops` | — (server-emitted only) | `[count]` | `blob2=dropReason` (8-value enum, §D2) |
 
 Round-2 revisions to this table:
 

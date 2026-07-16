@@ -23,10 +23,10 @@ export async function listDevices(env: Env, self: Principal): Promise<Response> 
  * Authorization is an ATOMIC guarded UPDATE (no SELECT-then-write race): any role
  * may revoke ITS OWN device; only owner/admin may revoke ANOTHER device in the
  * account. `device_id` is globally unique (migration 0013), so the WHERE matches at
- * most one row. A `changes==0` outcome is then disambiguated by a follow-up READ
- * (purely to pick the status code — it never gates the write): unknown-in-my-account
- * → 404 (uniform with cross-account, no enumeration leak), already-revoked →
- * idempotent 200, otherwise insufficient role → 403.
+ * most one row. A follow-up directory-plane READ authorizes retry-safe data-plane
+ * cleanup and, when `changes==0`, chooses the response: unknown-in-my-account → 404
+ * (uniform with cross-account, no enumeration leak), already-revoked → idempotent
+ * 200, otherwise insufficient role → 403.
  */
 export async function revokeDevice(env: Env, self: Principal, deviceId: string): Promise<Response> {
   const privileged = self.role === "owner" || self.role === "admin" ? 1 : 0;
@@ -34,22 +34,23 @@ export async function revokeDevice(env: Env, self: Principal, deviceId: string):
     .prepare("UPDATE devices SET revoked = 1 WHERE device_id = ? AND account_id = ? AND revoked = 0 AND (device_id = ? OR ? = 1)")
     .bind(deviceId, self.accountId, self.deviceId, privileged)
     .run();
-  // The in-statement guard makes cleanup cross-account safe and retry-safe when
-  // the device was already revoked by an earlier attempt.
-  await dbFor(env, self.accountId)
-    .prepare(`DELETE FROM device_sync_state WHERE device_id = ?1
-      AND EXISTS (SELECT 1 FROM devices WHERE device_id = ?1 AND account_id = ?2 AND revoked = 1)`)
+  // Read authorization state from the directory plane, then clean up on the
+  // account's data plane. An already-revoked authorized retry still cleans up.
+  const row = await dirDb(env)
+    .prepare("SELECT revoked FROM devices WHERE device_id = ? AND account_id = ?")
     .bind(deviceId, self.accountId)
-    .run();
+    .first<{ revoked: number }>();
+  if (row?.revoked === 1) {
+    await dbFor(env, self.accountId)
+      .prepare("DELETE FROM device_sync_state WHERE device_id = ?")
+      .bind(deviceId)
+      .run();
+  }
   if ((res.meta.changes ?? 0) === 1) {
     await audit(env, self, deviceId === self.deviceId ? "device.revoke.self" : "device.revoke", deviceId);
     return json({ ok: true, revoked: 1 });
   }
   // changes==0: choose the response without leaking cross-account existence.
-  const row = await dirDb(env)
-    .prepare("SELECT revoked FROM devices WHERE device_id = ? AND account_id = ?")
-    .bind(deviceId, self.accountId)
-    .first<{ revoked: number }>();
   if (!row) return json({ error: "not_found" }, 404); // no such device in MY account (== cross-account)
   if (row.revoked === 1) return json({ ok: true, revoked: 0 }); // already revoked → idempotent, no audit spam
   return json({ error: "forbidden", message: "insufficient role to revoke another device" }, 403);

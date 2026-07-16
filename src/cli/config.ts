@@ -579,7 +579,11 @@ export async function ensureTelemetryBindingId(
   if (acquired.status !== "acquired") throw new Error(`sync state telemetry lock unavailable (${busyDetail(acquired)})`);
   try {
     const raw = await loadRawState(root);
-    const current = raw?.stream === stream ? raw : freshState(stream);
+    if (!raw) throw new Error("sync state is absent; refusing to manufacture a telemetry binding baseline");
+    if (raw.stream !== undefined && raw.stream !== stream) {
+      throw new Error(`sync state belongs to stream ${raw.stream}, not ${stream}; refusing to overwrite it`);
+    }
+    const current = raw;
     if (typeof current.telemetryBindingId === "string" && BINDING_ID_RE.test(current.telemetryBindingId)) {
       return { state: current, bindingId: current.telemetryBindingId };
     }

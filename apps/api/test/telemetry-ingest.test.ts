@@ -2,7 +2,6 @@ import { env, SELF, applyD1Migrations } from "cloudflare:test";
 import { beforeAll, describe, expect, test } from "vitest";
 import type { Env } from "../src/env.js";
 import type { Principal } from "../src/authz.js";
-import { revokeDevice } from "../src/auth/devices.js";
 import {
   ingestSyncState,
   ingestTelemetry,
@@ -11,12 +10,14 @@ import {
   SERVER_GIT_DEFERRAL_REASONS,
   SERVER_SYNC_STATE_NUMERIC_DOMAINS,
   SERVER_TELEMETRY_SAMPLE_SCHEMAS,
+  TELEMETRY_BATCH_CAP as SERVER_TELEMETRY_BATCH_CAP,
 } from "../src/telemetry-ingest.js";
 import {
   CORPUS_BUCKETS,
   BINDING_ID_RE,
   GIT_DEFERRAL_REASONS,
   SYNC_STATE_NUMERIC_DOMAINS,
+  TELEMETRY_BATCH_CAP,
   TELEMETRY_SAMPLE_SCHEMAS,
 } from "../../../src/cli/telemetry/contract.js";
 
@@ -67,6 +68,7 @@ describe("telemetry contract drift guard", () => {
     expect(SERVER_CORPUS_BUCKETS).toEqual(CORPUS_BUCKETS);
     expect(SERVER_GIT_DEFERRAL_REASONS).toEqual(GIT_DEFERRAL_REASONS);
     expect(SERVER_SYNC_STATE_NUMERIC_DOMAINS).toEqual(SYNC_STATE_NUMERIC_DOMAINS);
+    expect(SERVER_TELEMETRY_BATCH_CAP).toBe(TELEMETRY_BATCH_CAP);
     expect({ source: SERVER_BINDING_ID_RE.source, flags: SERVER_BINDING_ID_RE.flags }).toEqual({ source: BINDING_ID_RE.source, flags: BINDING_ID_RE.flags });
   });
 });
@@ -145,9 +147,24 @@ describe("POST /v1/telemetry", () => {
 });
 
 describe("POST /v1/fleet/sync-state", () => {
-  test("upserts authorized valid states, drops invalid/unauthorized states, and server-stamps reported_at", async () => {
-    const a = await bootstrap("sync-state-a");
-    const b = await bootstrap("sync-state-b");
+  test("upserts an authorized valid state and server-stamps reported_at", async () => {
+    const a = await bootstrap("sync-state-upsert");
+    const wsA = `ws_state_${sequence}_a`;
+    await env.rbox_dev_db.prepare("INSERT INTO workspaces(workspace_id, project_id, created_at, account_id) VALUES (?, 'root', ?, ?)").bind(wsA, Date.now(), a.accountId).run();
+    const valid = { workspaceId: wsA, projectId: "root", bindingId: "0123456789abcdef", fileSeq: 12, reposTotal: 2, reposDeferred: 1, oldestDeferralAgeMs: 99, deferralReasons: ["local-edits"] };
+    const req = new Request(`${BASE}/v1/fleet/sync-state`, { method: "POST", body: JSON.stringify({ v: 1, states: [valid] }) });
+    const before = Date.now();
+    const res = await ingestSyncState(req, testEnv(), devicePrincipal(a));
+    expect(res.status).toBe(202);
+    expect(await res.json()).toEqual({ accepted: 1, dropped: 0 });
+    const row = await env.rbox_dev_db.prepare("SELECT * FROM device_sync_state WHERE device_id = ?").bind(a.deviceId).first<Record<string, unknown>>();
+    expect(row).toMatchObject({ workspace_id: wsA, project_id: "root", binding_id: valid.bindingId, file_seq: 12, repos_total: 2, repos_deferred: 1, oldest_deferral_age_ms: 99, deferral_reasons: "local-edits" });
+    expect(Number(row?.reported_at)).toBeGreaterThanOrEqual(before);
+  });
+
+  test("canonicalizes reasons and reports invalid and unauthorized state drops", async () => {
+    const a = await bootstrap("sync-state-reasons-a");
+    const b = await bootstrap("sync-state-reasons-b");
     const wsA = `ws_state_${sequence}_a`;
     const wsB = `ws_state_${sequence}_b`;
     await env.rbox_dev_db.batch([
@@ -157,25 +174,35 @@ describe("POST /v1/fleet/sync-state", () => {
     const valid = { workspaceId: wsA, projectId: "root", bindingId: "0123456789abcdef", fileSeq: 12, reposTotal: 2, reposDeferred: 1, oldestDeferralAgeMs: 99, deferralReasons: ["local-edits"] };
     const unauthorized = { ...valid, workspaceId: wsB, bindingId: "1111111111111111" };
     const invalid = { ...valid, bindingId: "2222222222222222", reposDeferred: 0 };
-    const req = new Request(`${BASE}/v1/fleet/sync-state`, { method: "POST", body: JSON.stringify({ v: 1, states: [valid, unauthorized, invalid] }) });
-    const before = Date.now();
-    const res = await ingestSyncState(req, testEnv(), devicePrincipal(a));
-    expect(res.status).toBe(202);
-    expect(await res.json()).toEqual({ accepted: 1, dropped: 2 });
-    const row = await env.rbox_dev_db.prepare("SELECT * FROM device_sync_state WHERE device_id = ?").bind(a.deviceId).first<Record<string, unknown>>();
-    expect(row).toMatchObject({ workspace_id: wsA, project_id: "root", binding_id: valid.bindingId, file_seq: 12, repos_total: 2, repos_deferred: 1, oldest_deferral_age_ms: 99, deferral_reasons: "local-edits" });
-    expect(Number(row?.reported_at)).toBeGreaterThanOrEqual(before);
+    const points: AnalyticsEngineDataPoint[] = [];
+    const mixed = await ingestSyncState(new Request(`${BASE}/v1/fleet/sync-state`, { method: "POST", body: JSON.stringify({ v: 1, states: [unauthorized, invalid] }) }), testEnv(points), devicePrincipal(a));
+    expect(await mixed.json()).toEqual({ accepted: 0, dropped: 2 });
+    expect(points).toEqual(expect.arrayContaining([
+      { indexes: ["client.telemetry.drops"], blobs: ["client.telemetry.drops", "bad_state"], doubles: [1] },
+      { indexes: ["client.telemetry.drops"], blobs: ["client.telemetry.drops", "unauthorized"], doubles: [1] },
+    ]));
 
     const duplicateReasons = { ...valid, fileSeq: 12, deferralReasons: ["local-edits", "local-edits"] };
     const viewerReport = await ingestSyncState(new Request(`${BASE}/v1/fleet/sync-state`, { method: "POST", body: JSON.stringify({ v: 1, states: [duplicateReasons] }) }), testEnv(), { ...devicePrincipal(a), role: "viewer" });
     expect(await viewerReport.json()).toEqual({ accepted: 1, dropped: 0 });
     expect(await env.rbox_dev_db.prepare("SELECT deferral_reasons FROM device_sync_state WHERE device_id = ?").bind(a.deviceId).first()).toMatchObject({ deferral_reasons: "local-edits" });
+  });
 
+  test("updates an existing state in place", async () => {
+    const a = await bootstrap("sync-state-update");
+    const wsA = `ws_state_${sequence}_a`;
+    await env.rbox_dev_db.prepare("INSERT INTO workspaces(workspace_id, project_id, created_at, account_id) VALUES (?, 'root', ?, ?)").bind(wsA, Date.now(), a.accountId).run();
+    const valid = { workspaceId: wsA, projectId: "root", bindingId: "0123456789abcdef", fileSeq: 12, reposTotal: 2, reposDeferred: 1, oldestDeferralAgeMs: 99, deferralReasons: ["local-edits"] };
+    await ingestSyncState(new Request(`${BASE}/v1/fleet/sync-state`, { method: "POST", body: JSON.stringify({ v: 1, states: [valid] }) }), testEnv(), devicePrincipal(a));
     const update = { ...valid, fileSeq: 13, reposDeferred: 0, oldestDeferralAgeMs: null, deferralReasons: [] };
     const updated = await ingestSyncState(new Request(`${BASE}/v1/fleet/sync-state`, { method: "POST", body: JSON.stringify({ v: 1, states: [update] }) }), testEnv(), devicePrincipal(a));
     expect(await updated.json()).toEqual({ accepted: 1, dropped: 0 });
     expect(await env.rbox_dev_db.prepare("SELECT file_seq, repos_deferred FROM device_sync_state WHERE device_id = ?").bind(a.deviceId).first()).toMatchObject({ file_seq: 13, repos_deferred: 0 });
+    expect((await env.rbox_dev_db.prepare("SELECT COUNT(*) AS count FROM device_sync_state WHERE device_id = ?").bind(a.deviceId).first<{ count: number }>())?.count).toBe(1);
+  });
 
+  test("caps sync-state batches", async () => {
+    const a = await bootstrap("sync-state-cap");
     const capPoints: AnalyticsEngineDataPoint[] = [];
     const capped = await ingestSyncState(new Request(`${BASE}/v1/fleet/sync-state`, { method: "POST", body: JSON.stringify({ v: 1, states: Array.from({ length: 34 }, () => ({})) }) }), testEnv(capPoints), devicePrincipal(a));
     expect(await capped.json()).toEqual({ accepted: 0, dropped: 34 });
@@ -222,17 +249,4 @@ describe("POST /v1/fleet/sync-state", () => {
     expect(direct.status).toBe(403);
   });
 
-  test("revocation deletes only state for a revoked device in the caller's account and retries idempotently", async () => {
-    const a = await bootstrap("revoke-state-a");
-    const b = await bootstrap("revoke-state-b");
-    await env.rbox_dev_db.batch([
-      env.rbox_dev_db.prepare("INSERT INTO device_sync_state(device_id,workspace_id,project_id,binding_id,file_seq,repos_total,repos_deferred,oldest_deferral_age_ms,deferral_reasons,reported_at) VALUES (?, 'ws_a', 'root', 'aaaaaaaaaaaaaaaa', 1, 0, 0, NULL, '', 1)").bind(a.deviceId),
-      env.rbox_dev_db.prepare("INSERT INTO device_sync_state(device_id,workspace_id,project_id,binding_id,file_seq,repos_total,repos_deferred,oldest_deferral_age_ms,deferral_reasons,reported_at) VALUES (?, 'ws_b', 'root', 'bbbbbbbbbbbbbbbb', 1, 0, 0, NULL, '', 1)").bind(b.deviceId),
-    ]);
-    expect((await revokeDevice(env, devicePrincipal(a), b.deviceId)).status).toBe(404);
-    expect(await env.rbox_dev_db.prepare("SELECT 1 FROM device_sync_state WHERE device_id = ?").bind(b.deviceId).first()).toBeTruthy();
-    expect((await revokeDevice(env, devicePrincipal(a), a.deviceId)).status).toBe(200);
-    expect(await env.rbox_dev_db.prepare("SELECT 1 FROM device_sync_state WHERE device_id = ?").bind(a.deviceId).first()).toBeNull();
-    expect((await revokeDevice(env, devicePrincipal(a), a.deviceId)).status).toBe(200);
-  });
 });

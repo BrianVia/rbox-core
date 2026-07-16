@@ -58,6 +58,10 @@ export interface PackConfig {
   minActivationBytes: number;
 }
 
+export function fillVersion(): "v1" | "v2" {
+  return process.env.RBOX_BATCH_FILL === "v1" ? "v1" : "v2";
+}
+
 export function packUploadEnabled(): boolean {
   return process.env.RBOX_BLOB_PACK === "1";
 }
@@ -77,7 +81,7 @@ export function uploadBatchConfig(): BatchConfig {
   // Default ON (founder call 2026-07-13, single-user fleet — same as files-first):
   // fill-v2 + 64-record batches ship live; RBOX_BATCH_FILL=v1 is the kill switch
   // (the server cap is already 64 on both envs, and the 400 latch guards skew).
-  const fill = process.env.RBOX_BATCH_FILL === "v1" ? "v1" : "v2";
+  const fill = fillVersion();
   return readBatchConfig(
     ["RBOX_UPLOAD_SLOTS", "RBOX_BATCH_PUT_SLOTS"],
     DEFAULT_BATCH_PUT_SLOTS,

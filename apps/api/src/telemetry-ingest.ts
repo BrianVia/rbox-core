@@ -8,10 +8,11 @@ import { rateLimited } from "./ratelimit.js";
 import { json } from "./util.js";
 
 const BODY_CAP_BYTES = 32 * 1024;
-const TELEMETRY_BATCH_CAP = 64;
+export const TELEMETRY_BATCH_CAP = 64;
 const SYNC_STATE_BATCH_CAP = 32;
 
-type DropReason = "unknown_kind" | "unknown_field" | "bad_number" | "bad_enum" | "batch_cap" | "body_cap";
+/** Low-cardinality drops enum: unknown_kind|unknown_field|bad_number|bad_enum|batch_cap|body_cap|bad_state|unauthorized. */
+type DropReason = "unknown_kind" | "unknown_field" | "bad_number" | "bad_enum" | "batch_cap" | "body_cap" | "bad_state" | "unauthorized";
 type JsonRecord = Record<string, unknown>;
 interface NumericDomain { readonly min: number; readonly max: number; readonly integer: boolean }
 interface NumberField extends NumericDomain { readonly field: string }
@@ -21,7 +22,10 @@ interface SampleSchema { readonly numbers: readonly NumberField[]; readonly enum
 const MS = { min: 0, max: 604_800_000, integer: true } as const;
 const COUNT = { min: 0, max: 10_000_000, integer: true } as const;
 
-/** Runtime duplicate of the client contract. A test imports both copies and prevents drift. */
+/** Runtime duplicate of the client contract. A test imports both copies and prevents drift.
+ * Field declaration order IS the positional AE doubles order and feeds normalizeSample
+ * positional reads (wireNumbers[2], the upload_lane destructure) and cockpit dashboard
+ * SQL. Append only; never reorder. */
 export const SERVER_TELEMETRY_SAMPLE_SCHEMAS = {
   propagation: {
     numbers: [{ field: "deliveryToApplyMs", ...MS }],
@@ -261,15 +265,18 @@ export async function ingestSyncState(req: Request, env: Env, p: Principal): Pro
   emitDrop(env, "batch_cap", dropped);
   const reportedAt = Date.now();
   const db = dbFor(env, p.accountId);
+  const reasons = new Map<DropReason, number>();
   for (const raw of opened.items.slice(0, SYNC_STATE_BATCH_CAP)) {
     const state = validateSyncState(raw);
     if (!state) {
       dropped++;
+      reasons.set("bad_state", (reasons.get("bad_state") ?? 0) + 1);
       continue;
     }
     const authorized = await authorizeWorkspace(env, p, state.workspaceId, state.projectId, false);
     if (!authorized.ok) {
       dropped++;
+      reasons.set("unauthorized", (reasons.get("unauthorized") ?? 0) + 1);
       continue;
     }
     await db.prepare(
@@ -289,5 +296,6 @@ export async function ingestSyncState(req: Request, env: Env, p: Principal): Pro
     ).run();
     accepted++;
   }
+  for (const [reason, count] of reasons) emitDrop(env, reason, count);
   return json({ accepted, dropped }, 202);
 }

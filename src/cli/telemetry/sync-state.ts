@@ -1,9 +1,7 @@
 import { ensureTelemetryBindingId, repoRecordsForState, type GitDeferralReason, type SyncState as LocalSyncState, type WorkspaceConfig } from "../config.js";
 import { projectGitDeferralRepos } from "../status-view.js";
-import { SYNC_STATE_NUMERIC_DOMAINS, type SyncState, type SyncStateEnvelope } from "./contract.js";
+import { SYNC_STATE_NUMERIC_DOMAINS, telemetryEnabled, type SyncState, type SyncStateEnvelope } from "./contract.js";
 import type { TelemetryTransport } from "./queue.js";
-
-const enabled = (): boolean => process.env.RBOX_TELEMETRY !== "0";
 
 export function buildSyncStateSummary(
   cfg: Pick<WorkspaceConfig, "remoteWorkspaceId" | "projectId">,
@@ -36,7 +34,7 @@ export function buildSyncStateSummary(
     reposTotal: Object.keys(records).length,
     reposDeferred: projected.length,
     oldestDeferralAgeMs,
-    deferralReasons: [...reasons].sort().slice(0, 15),
+    deferralReasons: [...reasons].sort(),
   };
 }
 
@@ -61,12 +59,12 @@ export class SyncStateReporter {
   heartbeat(state: LocalSyncState): void { this.enqueue(state, true); }
 
   private enqueue(state: LocalSyncState, force: boolean): void {
-    if (!enabled()) return;
+    if (!telemetryEnabled()) return;
     this.chain = this.chain.then(() => this.send(state, force)).catch(() => {});
   }
 
   private async send(state: LocalSyncState, force: boolean): Promise<void> {
-    if (!enabled()) return;
+    if (!telemetryEnabled()) return;
     try {
       this.bindingId ??= (await ensureTelemetryBindingId(this.root, state.stream)).bindingId;
       const records = repoRecordsForState(state);

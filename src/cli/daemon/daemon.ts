@@ -117,6 +117,10 @@ const LOCK_STARVATION_MS = 15 * 60_000;
 const LOCK_STARVATION_MAX_BYTES = 4 * 1024;
 const MUTEX_BACKOFF_TIERS = [250, 500, 1_000, 2_000, 4_000, 8_000, 16_000, 30_000] as const;
 const MUTEX_EARLY_REPROBE_MS = 2_000;
+const TELEMETRY_FLUSH_MS = 120_000;
+const CAPABILITY_INITIAL_DELAY_MS = 5 * 60_000;
+const CAPABILITY_INTERVAL_MS = 6 * 60 * 60_000;
+const SYNC_STATE_HEARTBEAT_MS = 60 * 60_000;
 
 export interface LockStarvationEpisode {
   holderKey: string;
@@ -1341,7 +1345,7 @@ export class RboxDaemon {
   private startTelemetryTimers(): void {
     this.telemetryFlushTimer = setInterval(() => {
       if (!this.stopped && !this.telemetry.empty) void this.telemetry.flush(AbortSignal.timeout(1500)).catch(() => {});
-    }, 120_000);
+    }, TELEMETRY_FLUSH_MS);
     this.telemetryFlushTimer.unref?.();
     const capability = () => {
       if (!this.stopped) this.telemetry.record({ kind: "capability", workerExecutions: cryptoPoolStatus().workerExecutions });
@@ -1349,13 +1353,13 @@ export class RboxDaemon {
     this.capabilityInitialTimer = setTimeout(() => {
       capability();
       if (this.stopped) return;
-      this.capabilityTimer = setInterval(capability, 6 * 60 * 60_000);
+      this.capabilityTimer = setInterval(capability, CAPABILITY_INTERVAL_MS);
       this.capabilityTimer.unref?.();
-    }, 5 * 60_000);
+    }, CAPABILITY_INITIAL_DELAY_MS);
     this.capabilityInitialTimer.unref?.();
     this.syncStateHeartbeatTimer = setInterval(() => {
       if (!this.stopped && this.syncBase) this.syncStateReporter.heartbeat(this.syncBase);
-    }, 60 * 60_000);
+    }, SYNC_STATE_HEARTBEAT_MS);
     this.syncStateHeartbeatTimer.unref?.();
   }
 

@@ -38,6 +38,48 @@ test("binding id is generated once and persisted in local state.json", async () 
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
 
+test("binding id adopts legacy unstamped state without changing its sync baseline", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-telemetry-state-legacy-"));
+  try {
+    const legacy: SyncState = {
+      lastSyncedSequence: 12,
+      lastSyncedManifest: { generatedAt: "legacy", files: [{ path: "kept.txt", hash: "abc", size: 3 }] },
+      repoRecords: { repo: { repoGen: 4, sourceSeq: 11 } },
+    };
+    await saveState(root, legacy);
+    const result = await ensureTelemetryBindingId(root, "s", () => Buffer.from("0011223344556677", "hex"));
+    expect(result.state).toEqual({ ...legacy, telemetryBindingId: "0011223344556677" });
+    expect(JSON.parse(await fs.readFile(path.join(root, ".rbox", "state.json"), "utf8"))).toEqual({
+      ...legacy,
+      telemetryBindingId: "0011223344556677",
+    });
+    expect(result.state.stream).toBeUndefined();
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
+test("binding id rejects a mismatched stream without modifying state.json", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-telemetry-state-mismatch-"));
+  try {
+    await saveState(root, { stream: "old", lastSyncedSequence: 7, lastSyncedManifest: manifest });
+    const file = path.join(root, ".rbox", "state.json");
+    const before = await fs.readFile(file);
+    await expect(ensureTelemetryBindingId(root, "new", () => Buffer.from("0011223344556677", "hex"))).rejects.toThrow(
+      "sync state belongs to stream old, not new",
+    );
+    expect(await fs.readFile(file)).toEqual(before);
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
+test("binding id rejects an absent sync state without creating one", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-telemetry-state-absent-"));
+  try {
+    await expect(ensureTelemetryBindingId(root, "s", () => Buffer.from("0011223344556677", "hex"))).rejects.toThrow(
+      "sync state is absent",
+    );
+    await expect(fs.readFile(path.join(root, ".rbox", "state.json"))).rejects.toMatchObject({ code: "ENOENT" });
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
 test("reporter gates unchanged ticks despite advancing age and still sends a heartbeat", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-telemetry-report-"));
   let now = 10_000;

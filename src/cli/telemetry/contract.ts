@@ -14,8 +14,16 @@ export const FILL_VERSIONS = ["v1", "v2"] as const;
 export type FillVersion = (typeof FILL_VERSIONS)[number];
 export const SAFETY_EVENT_TYPES = ["mass_delete_breaker", "scan_fault"] as const;
 export type SafetyEventType = (typeof SAFETY_EVENT_TYPES)[number];
+export const TELEMETRY_BATCH_CAP = 64;
+
+export function telemetryEnabled(): boolean {
+  return process.env.RBOX_TELEMETRY !== "0";
+}
 
 /** The client/server wire schema. Derived values (corpusBucket and mbps) are deliberately absent. */
+// Constraint: field declaration order IS the positional AE doubles order and feeds
+// normalizeSample positional reads (wireNumbers[2], the upload_lane destructure) and
+// cockpit dashboard SQL. Append only; never reorder.
 export const TELEMETRY_SAMPLE_SCHEMAS = {
   propagation: {
     numbers: { deliveryToApplyMs: MS_DOMAIN },

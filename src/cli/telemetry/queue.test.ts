@@ -49,4 +49,27 @@ describe("TelemetryQueue", () => {
     await queue.flush();
     expect(calls).toBe(2);
   });
+
+  test("discards samples rejected with a permanent 4xx response", async () => {
+    const logs: string[] = [];
+    const queue = new TelemetryQueue(
+      { postJson: async () => new Response("{}", { status: 400 }) },
+      (line) => logs.push(line),
+    );
+    queue.record({ kind: "capability", workerExecutions: 1 });
+
+    await queue.flush();
+
+    expect(queue.empty).toBe(true);
+    expect(logs).toEqual(["telemetry discarded 1 sample(s) rejected with HTTP 400"]);
+  });
+
+  test("retains samples after a server error", async () => {
+    const queue = new TelemetryQueue({ postJson: async () => new Response("{}", { status: 500 }) });
+    queue.record({ kind: "capability", workerExecutions: 1 });
+
+    await queue.flush();
+
+    expect(queue.empty).toBe(false);
+  });
 });
