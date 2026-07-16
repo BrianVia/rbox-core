@@ -197,6 +197,8 @@ describe("hard purge — enumeration + dedup safety + isolation", () => {
       db().prepare("INSERT INTO diagnostics_reports (id, account_id, device_id, created_at, expires_at, r2_key, status, bytes, sha256) VALUES ('diag_del', ?, ?, ?, ?, ?, 'stored', 15, ?)").bind(A.accountId, A.deviceId, now, now + 30 * 24 * 60 * 60 * 1000, diagKey, sha("diag")),
       db().prepare("INSERT INTO device_notifications (token_hash, device_id, account_id, event, created_at) VALUES (?, ?, ?, 'pair', ?)").bind(`th_${A.accountId}`, A.deviceId, A.accountId, now),
       db().prepare("INSERT INTO notification_deliveries (token_hash, recipient_user_id, recipient_clerk_id, idempotency_key) VALUES (?, ?, ?, 'ik')").bind(`th_${A.accountId}`, A.ownerUserId, clerkA),
+      db().prepare("INSERT INTO device_sync_state(device_id,workspace_id,project_id,binding_id,file_seq,repos_total,repos_deferred,oldest_deferral_age_ms,deferral_reasons,reported_at) VALUES (?, 'ws_a', 'root', '0000000000000001', 1, 0, 0, NULL, '', ?)").bind(A.deviceId, now),
+      db().prepare("INSERT INTO device_sync_state(device_id,workspace_id,project_id,binding_id,file_seq,repos_total,repos_deferred,oldest_deferral_age_ms,deferral_reasons,reported_at) VALUES (?, 'ws_b', 'root', '0000000000000002', 1, 0, 0, NULL, '', ?)").bind(B.deviceId, now),
     ]);
 
     // Tombstone A, then move purge_after into the past so we can drive at real `now` (keeps
@@ -226,6 +228,8 @@ describe("hard purge — enumeration + dedup safety + isolation", () => {
     // Joined tables for A purged.
     expect(await count("SELECT COUNT(*) AS n FROM commits WHERE workspace_id = 'ws_a'")).toBe(0);
     expect(await count("SELECT COUNT(*) AS n FROM manifests WHERE workspace_id = 'ws_a'")).toBe(0);
+    expect(await count("SELECT COUNT(*) AS n FROM device_sync_state WHERE device_id = ?", A.deviceId)).toBe(0);
+    expect(await count("SELECT COUNT(*) AS n FROM device_sync_state WHERE device_id = ?", B.deviceId)).toBe(1);
     expect(await count("SELECT COUNT(*) AS n FROM upload_parts WHERE upload_id = ?", upId)).toBe(0);
     expect(await count("SELECT COUNT(*) AS n FROM notification_deliveries WHERE token_hash = ?", `th_${A.accountId}`)).toBe(0);
     expect(await count("SELECT COUNT(*) AS n FROM account_link_events WHERE clerk_user_id = ?", clerkA)).toBe(0);

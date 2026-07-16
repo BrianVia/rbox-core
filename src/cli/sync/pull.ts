@@ -37,7 +37,8 @@ export async function scanManifestForPush(root: string, cfg: WorkspaceConfig, de
   const state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg), deps.warningSink));
   const scanStats = report.enabled ? deps.scanStats : undefined;
   const scanDeferred = new Set<string>();
-  const deferErrnos = deps.warningSink ? makeDeferErrnoReporter(deps.warningSink) : makeDeferErrnoReporter();
+  const scanFault = () => deps.telemetry?.record({ kind: "safety_event", eventType: "scan_fault", count: 1 });
+  const deferErrnos = deps.warningSink ? makeDeferErrnoReporter(deps.warningSink, scanFault) : makeDeferErrnoReporter(undefined, scanFault);
   const scanT0 = Date.now();
   let local = await report.phase("scan", () => scanManifest(root, matcherForState(root, cfg, state, { purgeSafety: purgeIgnored }), cache, scanTick(deps), undefined, scanStats, scanDeferred, undefined, dircache, "pruned", deferErrnos.onErrno, deps.warningSink));
   deferErrnos.flush();
@@ -111,7 +112,8 @@ export async function applyPulledManifest(
   // deletion). Feeding base-carried entries into reconcile would instead let a
   // remote delete plan a disk delete against an unreadable path (design 108).
   const scanDeferred = new Set<string>();
-  const deferErrnos = deps.warningSink ? makeDeferErrnoReporter(deps.warningSink) : makeDeferErrnoReporter();
+  const scanFault = () => deps.telemetry?.record({ kind: "safety_event", eventType: "scan_fault", count: 1 });
+  const deferErrnos = deps.warningSink ? makeDeferErrnoReporter(deps.warningSink, scanFault) : makeDeferErrnoReporter(undefined, scanFault);
   const scanT0 = Date.now();
   const local = await report.phase("scan", () => scanManifest(root, matcher, cache, scanTick(deps), undefined, scanStats, scanDeferred, undefined, dircache, "pruned", deferErrnos.onErrno, deps.warningSink));
   deferErrnos.flush();
@@ -154,6 +156,7 @@ export async function applyPulledManifest(
   const plannedDeletes = all.reduce((n, a) => n + (a.kind === "delete" ? 1 : 0), 0);
   const baseFiles = state.lastSyncedManifest.files.length;
   if (!deps.allowMassDelete && plannedDeletes >= MASS_DELETE_MIN_FILES && plannedDeletes * 2 >= baseFiles) {
+    deps.telemetry?.record({ kind: "safety_event", eventType: "mass_delete_breaker", count: 1 });
     throw new Error(
       `pull would delete ${plannedDeletes} of ${baseFiles} tracked files — refusing (mass-delete guard). ` +
         `If this deletion is intentional, run \`${deps.massDeleteHint ?? "rbox pull --allow-mass-delete"}\` to apply it once.`

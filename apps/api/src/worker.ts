@@ -45,6 +45,7 @@ import { packGcMode, sweepUploadingPacks } from "./blob-pack.js";
 import { diagnosticsRoutes } from "./routes/diagnostics.js";
 import { syncRoutes } from "./routes/sync.js";
 import { runPackGc } from "./pack-gc.js";
+import { ingestSyncState, ingestTelemetry } from "./telemetry-ingest.js";
 export { WorkspaceSync } from "./workspace-sync.js";
 
 export class CachedReleases extends WorkerEntrypoint<Env> {
@@ -312,6 +313,8 @@ async function route(req: Request, env: Env, executionCtx: ExecutionContext & { 
   }
 
   // ---- AUTHED groups (Principal-scoped, under the §1.1 gate) ----
+  if (req.method === "POST" && eq(seg, ["v1", "telemetry"])) return ingestTelemetry(req, env, p);
+  if (req.method === "POST" && eq(seg, ["v1", "fleet", "sync-state"])) return ingestSyncState(req, env, p);
   if ((r = await authDeviceRoutes(ctx, p))) return r;
   if ((r = await billingRoutes(ctx, p))) return r;
   if ((r = await accountRoutes(ctx, p))) return r;
@@ -346,6 +349,7 @@ const ROUTE_VOCAB = new Set([
   "keys", "api", "roster", "admit", "keystate", "workspace",
   "blobs", "blob-batch", "blob-pack", "check", "get", "put", "multipart", "part", "complete",
   "ws", "proj", "manifests", "latest", "connect", "commits", "versions", "roots", "prune",
+  "telemetry", "fleet", "sync-state",
 ]);
 export function routeTemplate(pathname: string): string {
   const parts = pathname.split("/");

@@ -20,6 +20,7 @@ import {
   type Manifest,
   type WatchEvent,
   ManifestChainError,
+  cryptoPoolStatus,
   writeFileAtomic,
 } from "../../engine/index.js";
 import type { Action } from "../../engine/reconcile.js";
@@ -102,6 +103,8 @@ import {
 } from "./policy.js";
 import { cleanPath, LOG_PATHS_MAX, scanStatsLine, summarizeActions } from "./render.js";
 import { RotatingDaemonLogger, type DaemonLogSink } from "./logger.js";
+import { TelemetryQueue } from "../telemetry/queue.js";
+import { SyncStateReporter } from "../telemetry/sync-state.js";
 
 type RboxBarAmbientStatus = AmbientDaemonStatusV1 & {
   fileCount: number;
@@ -114,6 +117,10 @@ const LOCK_STARVATION_MS = 15 * 60_000;
 const LOCK_STARVATION_MAX_BYTES = 4 * 1024;
 const MUTEX_BACKOFF_TIERS = [250, 500, 1_000, 2_000, 4_000, 8_000, 16_000, 30_000] as const;
 const MUTEX_EARLY_REPROBE_MS = 2_000;
+const TELEMETRY_FLUSH_MS = 120_000;
+const CAPABILITY_INITIAL_DELAY_MS = 5 * 60_000;
+const CAPABILITY_INTERVAL_MS = 6 * 60 * 60_000;
+const SYNC_STATE_HEARTBEAT_MS = 60 * 60_000;
 
 export interface LockStarvationEpisode {
   holderKey: string;
@@ -261,6 +268,8 @@ interface OpenDriftAudit {
  */
 export class RboxDaemon {
   private readonly api: RboxApi;
+  private readonly telemetry: TelemetryQueue;
+  private readonly syncStateReporter: SyncStateReporter;
   private matcher: IgnoreMatcher; // rebuilt when .gitignore/.rboxignore changes
   private cache!: HashCache;
   private manifest: Manifest = { generatedAt: "", files: [] };
@@ -284,6 +293,10 @@ export class RboxDaemon {
   private safetyTimer?: ReturnType<typeof setTimeout>;
   private deepTimer?: ReturnType<typeof setInterval>;
   private updateCheckTimer?: ReturnType<typeof setInterval>;
+  private telemetryFlushTimer?: ReturnType<typeof setInterval>;
+  private capabilityInitialTimer?: ReturnType<typeof setTimeout>;
+  private capabilityTimer?: ReturnType<typeof setInterval>;
+  private syncStateHeartbeatTimer?: ReturnType<typeof setInterval>;
   /** Current safety-scan delay (60s floor, backs off to 5m while idle — design 49). */
   private safetyDelay = SAFETY_SYNC_MS;
   /** Watcher events seen since the last safety tick — churn pins the scan to its floor. */
@@ -393,6 +406,8 @@ export class RboxDaemon {
     this.log = opts.log ?? ((message) => console.log(`${new Date().toISOString()} ${message}`));
     this.onStopped = opts.onStopped;
     this.api = new RboxApi(cfg.remoteUrl, cfg.token, cfg.remoteWorkspaceId, cfg.projectId, this.log);
+    this.telemetry = new TelemetryQueue(this.api, this.log);
+    this.syncStateReporter = new SyncStateReporter(root, cfg, this.api, this.log);
     this.matcher = buildIgnoreMatcher(root, { respectGitignore: cfg.respectGitignore === true });
     this.bootId = opts.bootId ?? process.env[DAEMON_BOOT_ID_ENV] ?? crypto.randomBytes(16).toString("hex");
     this.pullOnly = opts.pullOnly === true;
@@ -433,6 +448,7 @@ export class RboxDaemon {
     if (this.stopped) return;
     this.startActivityHeartbeat();
     this.startAmbientStatusHeartbeat();
+    this.startTelemetryTimers();
     // Seed the push log's sequence memory so the first no-op push (re-publishing
     // nothing) isn't logged as an advance.
     const initialState = await this.loadSyncBase();
@@ -619,6 +635,10 @@ export class RboxDaemon {
     for (const audit of this.openDriftAudits) if (audit.timer) clearTimeout(audit.timer);
     this.openDriftAudits.clear();
     if (this.updateCheckTimer) clearInterval(this.updateCheckTimer);
+    if (this.telemetryFlushTimer) clearInterval(this.telemetryFlushTimer);
+    if (this.capabilityInitialTimer) clearTimeout(this.capabilityInitialTimer);
+    if (this.capabilityTimer) clearInterval(this.capabilityTimer);
+    if (this.syncStateHeartbeatTimer) clearInterval(this.syncStateHeartbeatTimer);
     this.stopActivityHeartbeat();
     this.stopAmbientStatusHeartbeat();
     for (const timer of this.writeFinishRetryTimers) clearTimeout(timer);
@@ -639,6 +659,7 @@ export class RboxDaemon {
     // skipped (the loop re-checks `stopped`). Without this, `rbox start`'s stale-
     // daemon restart could interrupt a mutation mid-flight.
     await this.pumpRun.catch(() => {});
+    await this.telemetry.flush(AbortSignal.timeout(1500)).catch(() => {});
     await this.activityWrite.catch(() => {}); // flush the final sidecar record (best-effort)
     await this.cache?.save(this.root).catch(() => {});
     await this.writePausedAmbientStatus().catch(() => {});
@@ -832,7 +853,8 @@ export class RboxDaemon {
                 if (this.activity.outOfStorage) this.outOfStorageProbeArmed = true;
                 this.requestPush();
               } else if (op === "pull") {
-                const notifyLatencyMs = this.notifyPullPendingAt !== undefined ? Date.now() - this.notifyPullPendingAt : undefined;
+                const notifyPendingAt = this.notifyPullPendingAt;
+                const notifyLatencyMs = notifyPendingAt !== undefined ? Date.now() - notifyPendingAt : undefined;
                 this.notifyPullPendingAt = undefined;
                 // §6: the standalone metric event fires at dequeue — measured latency is recorded
                 // even if the pull below fails (the pull-line token then simply never prints).
@@ -840,7 +862,7 @@ export class RboxDaemon {
                 const catchUpGeneration = this.pendingCatchUpGeneration;
                 this.pendingCatchUpGeneration = undefined;
                 try {
-                  await this.doPull(syncMutex, notifyLatencyMs);
+                  await this.doPull(syncMutex, notifyLatencyMs, notifyPendingAt);
                 } catch (e) {
                   // A failed catch-up pull must not orphan its generation: restore it so the eventual
                   // healing pull (backstop / next frame) can still mark the socket caught up.
@@ -861,6 +883,7 @@ export class RboxDaemon {
                 }
               }
               this.maybeClearWatcherUnsettledAfterOp(op, opWatcherGeneration);
+              if (this.syncBase) this.syncStateReporter.afterSyncTick(this.syncBase);
             } finally {
               this.activePumpOp = undefined;
               this.activeProgressPath = undefined;
@@ -987,6 +1010,7 @@ export class RboxDaemon {
         onProgress: (done, total, phase, detail, bytes) => this.onTransferProgress(done, total, phase, detail, bytes), // design 45 + 88: progress plus local status path
         onPullApplied: (a) => this.recordPullApplied(a), // design 45: the 409-recovery pull mutates the tree too
         onTypeFlip: (rel) => this.noteTypeFlip(rel), // design 50: 409-recovery pull can evict a dir too
+        telemetry: this.telemetry,
       });
     } catch (e) {
       if (e instanceof CommitRejectedError && e.stillBlocked) {
@@ -1167,7 +1191,7 @@ export class RboxDaemon {
     this.writeFinishRetryTimers.add(timer);
   }
 
-  private async doPull(syncMutex: WorkspaceSyncMutex, notifyLatencyMs?: number): Promise<void> {
+  private async doPull(syncMutex: WorkspaceSyncMutex, notifyLatencyMs?: number, notifyPendingAt?: number): Promise<void> {
     if (this.e2ee.remote instanceof E2eeRemote) {
       const pin = await this.e2ee.remote.loadVerifiedPin();
       this.chainRepairPolicy.assertHeadAllowed(pin);
@@ -1188,6 +1212,7 @@ export class RboxDaemon {
       onProgress: (done, total, phase, detail, bytes) => this.onTransferProgress(done, total, phase, detail, bytes), // design 45 + 88
       onPullApplied: (a) => this.recordPullApplied(a),
       onTypeFlip: (rel) => this.noteTypeFlip(rel), // design 50 §3: forensic line + conflict count
+      telemetry: this.telemetry,
     };
     let actions: Action[];
     try {
@@ -1211,6 +1236,9 @@ export class RboxDaemon {
         : outcome.actions;
     }
     this.chainRepairPolicy.clear();
+    if (notifyPendingAt !== undefined) {
+      this.telemetry.record({ kind: "propagation", deliveryToApplyMs: Math.max(0, Date.now() - notifyPendingAt) });
+    }
     report?.logSummaryTo((line) =>
       this.log(notifyLatencyMs !== undefined ? `${line} notify_latency_ms=${notifyLatencyMs}` : line),
     );
@@ -1312,6 +1340,27 @@ export class RboxDaemon {
     if (!this.ambientStatusHeartbeatTimer) return;
     clearInterval(this.ambientStatusHeartbeatTimer);
     this.ambientStatusHeartbeatTimer = undefined;
+  }
+
+  private startTelemetryTimers(): void {
+    this.telemetryFlushTimer = setInterval(() => {
+      if (!this.stopped && !this.telemetry.empty) void this.telemetry.flush(AbortSignal.timeout(1500)).catch(() => {});
+    }, TELEMETRY_FLUSH_MS);
+    this.telemetryFlushTimer.unref?.();
+    const capability = () => {
+      if (!this.stopped) this.telemetry.record({ kind: "capability", workerExecutions: cryptoPoolStatus().workerExecutions });
+    };
+    this.capabilityInitialTimer = setTimeout(() => {
+      capability();
+      if (this.stopped) return;
+      this.capabilityTimer = setInterval(capability, CAPABILITY_INTERVAL_MS);
+      this.capabilityTimer.unref?.();
+    }, CAPABILITY_INITIAL_DELAY_MS);
+    this.capabilityInitialTimer.unref?.();
+    this.syncStateHeartbeatTimer = setInterval(() => {
+      if (!this.stopped && this.syncBase) this.syncStateReporter.heartbeat(this.syncBase);
+    }, SYNC_STATE_HEARTBEAT_MS);
+    this.syncStateHeartbeatTimer.unref?.();
   }
 
   private markLocalUnsettledFromWatchEvent(): void {
@@ -1731,7 +1780,9 @@ export class RboxDaemon {
     const priorProbe = probeOn ? await loadScanProbe(this.root) : undefined;
     const probe = probeOn ? createScanProbe(priorProbe) : undefined;
     const dircache = scanPruneEnabled() ? await DirCache.load(this.root) : undefined;
-    const deferErrnos = makeDeferErrnoReporter(this.log);
+    const deferErrnos = makeDeferErrnoReporter(this.log, () => {
+      try { this.telemetry.record({ kind: "safety_event", eventType: "scan_fault", count: 1 }); } catch {}
+    });
     const fresh = await scanManifest(this.root, this.matcher, cache, undefined, undefined, scanStats, deferred, probe, dircache, mode,
       deferErrnos.onErrno, this.log);
     deferErrnos.flush();

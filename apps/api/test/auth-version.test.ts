@@ -86,7 +86,7 @@ describe("authenticated CLI version tracking", () => {
     expect(row.last_seen_version).toBe("3.4.5");
   });
 
-  test("strict validation accepts the specified edge and clears malformed-present values", async () => {
+  test("strict validation accepts the specified edge and preserves the stored version for malformed-present values", async () => {
     const a = await bootstrap("version-validation");
     const recent = Date.now() - 90_000; // past the 60s change floor
 
@@ -105,7 +105,7 @@ describe("authenticated CLI version tracking", () => {
     for (const value of malformed) {
       await setSeen(a.deviceId, recent, "9.9.9");
       expect((await request(a.token, value)).status).toBe(200);
-      expect((await seen(a.deviceId)).last_seen_version, value).toBeNull();
+      expect((await seen(a.deviceId)).last_seen_version, value).toBe("9.9.9");
     }
   });
 });

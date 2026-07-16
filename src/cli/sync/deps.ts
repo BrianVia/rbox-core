@@ -12,6 +12,7 @@ import type { SyncRemote } from "../remote.js";
 import type { EncryptAndUploadOptions } from "../sync-recovery.js";
 import type { WorkspaceSyncMutex } from "../sync-mutex.js";
 import type { TransferProgress } from "../transfer-progress.js";
+import type { TelemetryRecorder } from "../telemetry/queue.js";
 
 type CurrentWriteContext = {
   kek: Uint8Array;
@@ -27,6 +28,8 @@ type WriteContextProvider = SyncRemote & { currentKek?: () => Promise<CurrentWri
  * deps object flows through pull/push/pushManifest/sync and its bounded retry loop.
  */
 export interface SyncDeps {
+  /** Best-effort daemon-owned product telemetry. Record implementations must never throw. */
+  telemetry?: TelemetryRecorder;
   /** Held once by the named top-level owner. Nested pull/push/retry operations
    * inherit this exact handle and must never reacquire the workspace mutex. */
   syncMutex?: WorkspaceSyncMutex;

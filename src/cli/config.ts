@@ -7,6 +7,7 @@ import { writeFileAtomic } from "../engine/fsutil.js";
 import { acquireLock, type AcquireLockOptions } from "../engine/git/lockfile.js";
 import type { ConfigStatToken } from "../engine/git/config-txn.js";
 import { acquireWorkspaceSyncMutex, assertSyncMutex, releaseWorkspaceSyncMutex, workspaceSyncMutexDegraded, type WorkspaceSyncMutex } from "./sync-mutex.js";
+import { BINDING_ID_RE } from "./telemetry/contract.js";
 
 function isENOENT(e: unknown): boolean {
   return (e as NodeJS.ErrnoException)?.code === "ENOENT";
@@ -129,6 +130,8 @@ export interface SyncState {
   stateNonce?: string;
   /** Monotonic whole-state write revision (diagnostic/defense-in-depth only). */
   stateRevision?: number;
+  /** Opaque local-root identity for aggregate fleet sync-state upserts. Never synced. */
+  telemetryBindingId?: string;
   /** Generation-CAS records. These are authoritative for gitRepos and all local
    * per-repo sidecars once present; legacy physical maps are folded in on read. */
   repoRecords?: Record<string, RepoRecord>;
@@ -563,6 +566,38 @@ export async function loadState(root: string, stream: string, warningSink: (line
 export async function saveState(root: string, state: SyncState): Promise<void> {
   await fs.mkdir(path.join(root, RBOX_DIR), { recursive: true });
   await writeFileAtomic(statePath(root), JSON.stringify(state, null, 2));
+}
+
+/** Initialize the telemetry binding identity under the same lock as transactional state writes. */
+export async function ensureTelemetryBindingId(
+  root: string,
+  stream: string,
+  randomBytes: (size: number) => Buffer = crypto.randomBytes,
+): Promise<{ state: SyncState; bindingId: string }> {
+  await fs.mkdir(path.join(root, RBOX_DIR), { recursive: true });
+  const acquired = await acquireLock(stateLockPath(root));
+  if (acquired.status !== "acquired") throw new Error(`sync state telemetry lock unavailable (${busyDetail(acquired)})`);
+  try {
+    const raw = await loadRawState(root);
+    if (!raw) throw new Error("sync state is absent; refusing to manufacture a telemetry binding baseline");
+    if (raw.stream !== undefined && raw.stream !== stream) {
+      throw new Error(`sync state belongs to stream ${raw.stream}, not ${stream}; refusing to overwrite it`);
+    }
+    const current = raw;
+    if (typeof current.telemetryBindingId === "string" && BINDING_ID_RE.test(current.telemetryBindingId)) {
+      return { state: current, bindingId: current.telemetryBindingId };
+    }
+    const bindingId = randomBytes(8).toString("hex");
+    const next: SyncState = { ...current, telemetryBindingId: bindingId };
+    let owner = true;
+    await writeFileAtomic(statePath(root), JSON.stringify(next, null, 2), {
+      beforeRename: async () => (owner = await acquired.lock.isOwner()),
+    });
+    if (!owner) throw new Error("sync state telemetry lock ownership was lost");
+    return { state: next, bindingId };
+  } finally {
+    await acquired.lock.release();
+  }
 }
 
 /** Discard the local sync baseline (used when a root is REBOUND to a different

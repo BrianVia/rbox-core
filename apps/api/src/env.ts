@@ -209,4 +209,6 @@ export interface Env {
   RL_RELEASE: RateLimitBinding;
   /** Shared per-IP budget across the credential-minting edges (pair/redeem + link/start). */
   RL_LINK_PAIR: RateLimitBinding;
+  /** Shared per-device budget for telemetry samples and fleet sync-state reports. */
+  RL_TELEMETRY: RateLimitBinding;
 }

@@ -6,6 +6,7 @@ import { putBlobFile } from "../blobs.js";
 import { BlobRetryLaterError, BlobShaMismatchError, isRetryLater } from "../errors.js";
 import { DOWNLOAD_IDLE_MS, SMALL_CONTROL_TIMEOUT_MS } from "../resilient.js";
 import { firstPublishAuthDispatchStart, firstPublishAuthSettle, firstPublishTiming, firstPublishUploadEnd, firstPublishUploadStart, LANE_TIMING, recordUploadDispatch, uploadLaneTiming, type UploadDispatchReason } from "../../upload-lane-timing.js";
+import { recordLaneSettlement } from "../../telemetry/lane-accumulator.js";
 import { SingleGate, UploadSlotArbiter, batchRecordsCeiling, latchBatchRecordsCeiling, uploadDisabled, disableUploadForProcess, incrementDispatchCount, packUploadDisabled } from "./gate.js";
 import { uploadBatchConfig, packUploadConfig, BATCH_RECORDS_FLOOR, FILL_ABSOLUTE_MS, FILL_QUIET_MS, FLUSH_DELAY_MS, SINGLE_UPLOAD_FALLBACK_CONCURRENCY, type BatchConfig, type PackConfig } from "./config.js";
 import { BlobPackUploader } from "./pack-uploader.js";
@@ -272,7 +273,7 @@ export class BlobBatchUploader {
         return;
       }
       armIdle();
-      const queueCutoffMs = LANE_TIMING ? performance.now() : 0;
+      const queueCutoffMs = performance.now();
       incrementDispatchCount();
       this.ctx.maybeRefreshUploadGrant();
       firstPublishUploadStart();
@@ -335,7 +336,8 @@ export class BlobBatchUploader {
         await this.fallbackAll(pending);
         return;
       }
-      const httpMs = LANE_TIMING ? performance.now() - queueCutoffMs : 0;
+      const httpMs = performance.now() - queueCutoffMs;
+      recordLaneSettlement("batch", body.bytes.byteLength, httpMs);
       for (const result of parsed) {
         const group = pending.get(result.sha256);
         if (!group) continue;
@@ -463,10 +465,12 @@ export class BlobBatchUploader {
     onBytes: ByteProgressCallback | undefined,
     queueMs: number
   ): Promise<void> {
-    const t0 = LANE_TIMING ? performance.now() : 0;
+    const t0 = performance.now();
     await this.gatedPutFile(sha, srcPath, size, uploadsDir, onBytes);
+    const uploadMs = performance.now() - t0;
+    recordLaneSettlement("single", size, uploadMs);
     if (LANE_TIMING) {
-      uploadLaneTiming.uploadMs += performance.now() - t0;
+      uploadLaneTiming.uploadMs += uploadMs;
       uploadLaneTiming.queueMs += queueMs;
       uploadLaneTiming.blobs++;
       uploadLaneTiming.bytes += size;
