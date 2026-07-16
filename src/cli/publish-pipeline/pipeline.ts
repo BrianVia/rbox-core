@@ -73,6 +73,7 @@ export interface PublishPipelineArgs {
   deferred: Set<string>;
   retryLater: Set<string>;
   uploadsDir: string;
+  warningSink?: (line: string) => void;
 }
 
 export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ needsUpload: Set<string> }> {
@@ -278,7 +279,7 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
       finally { encryptSettlements.delete(dispatched); }
     } catch (error) {
       disk.release(reservation);
-      if (isDeferrableChurn(error, file.path)) {
+      if (isDeferrableChurn(error, file.path, args.warningSink)) {
         args.deferred.add(file.path);
         args.onProgress?.(++encDone, args.toEncrypt.length, "encrypt", file.path);
         return;
@@ -385,7 +386,7 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
           try { encrypted = await promise; } finally { encryptSettlements.delete(promise); }
         } catch (retryError) {
           disk.release(reservation);
-          if (isDeferrableChurn(retryError, file.path)) { byteTracker.defer(file.path); emitUpload(file); return null; }
+          if (isDeferrableChurn(retryError, file.path, args.warningSink)) { byteTracker.defer(file.path); emitUpload(file); return null; }
           throw retryError;
         }
         disk.reconcile(reservation, encrypted.cipherSize);

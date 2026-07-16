@@ -119,6 +119,62 @@ const GIT_APPLY_RESULT_ABBR: Record<GitApplyRepoResult, string> = {
   skipped: "s",
 };
 
+const GIT_APPLY_REPO_EXEMPLAR_CAP = 8;
+
+interface GitApplyDistribution {
+  p50: number;
+  p95: number;
+  max: number;
+}
+
+function gitApplyDistribution(values: number[]): GitApplyDistribution {
+  if (values.length === 0) return { p50: 0, p95: 0, max: 0 };
+  const sorted = [...values].sort((a, b) => a - b);
+  const rank = (percentile: number) => sorted[Math.ceil(percentile * sorted.length) - 1]!;
+  return { p50: rank(0.5), p95: rank(0.95), max: sorted[sorted.length - 1]! };
+}
+
+function formatGitApplyDistribution(name: string, values: number[]): string {
+  const distribution = gitApplyDistribution(values);
+  return `${name} p50=${Math.round(distribution.p50)} p95=${Math.round(distribution.p95)} max=${Math.round(distribution.max)}`;
+}
+
+function gitApplyRepoExemplars(repoTimings: GitApplyRepoTiming[]): GitApplyRepoTiming[] {
+  if (process.env.RBOX_DEBUG) return repoTimings;
+  if (repoTimings.length <= GIT_APPLY_REPO_EXEMPLAR_CAP) {
+    return [...repoTimings].sort((a, b) => a.index - b.index);
+  }
+
+  const byWall = [...repoTimings].sort((a, b) => b.wallMs - a.wallMs || a.index - b.index);
+  const byQueue = [...repoTimings].sort((a, b) => b.queueMs - a.queueMs || a.index - b.index);
+  const selected = new Map<number, GitApplyRepoTiming>();
+  const add = (timing: GitApplyRepoTiming | undefined): void => {
+    if (timing && selected.size < GIT_APPLY_REPO_EXEMPLAR_CAP) selected.set(timing.index, timing);
+  };
+
+  add(byWall[0]);
+  add(byQueue[0]);
+  for (const timing of [...repoTimings].sort((a, b) => a.index - b.index)) {
+    if (timing.result !== "unchanged") add(timing);
+  }
+
+  let wallIndex = 0;
+  let queueIndex = 0;
+  const addNext = (ranked: GitApplyRepoTiming[], cursor: number): number => {
+    while (cursor < ranked.length && selected.has(ranked[cursor]!.index)) cursor += 1;
+    add(ranked[cursor]);
+    return cursor + 1;
+  };
+  while (selected.size < GIT_APPLY_REPO_EXEMPLAR_CAP) {
+    const sizeBefore = selected.size;
+    wallIndex = addNext(byWall, wallIndex);
+    if (selected.size < GIT_APPLY_REPO_EXEMPLAR_CAP) queueIndex = addNext(byQueue, queueIndex);
+    if (selected.size === sizeBefore) break;
+  }
+
+  return [...selected.values()].sort((a, b) => a.index - b.index);
+}
+
 function finishGitApplyMetrics(
   metrics: GitApplyMetrics | undefined,
   commonDirGroups: Map<string, number> | undefined
@@ -140,7 +196,7 @@ export function formatGitApplyMetrics(metrics: GitApplyMetrics): string {
     .filter(([, n]) => n > 0)
     .map(([k, n]) => `${k}=${n}`)
     .join(",");
-  const repoBits = metrics.repoTimings
+  const repoBits = gitApplyRepoExemplars(metrics.repoTimings)
     .map((t) => {
       const group = t.commonDirGroup === undefined ? "" : `g${t.commonDirGroup}`;
       const chain = t.chain && t.chain.chainLength > 0
@@ -149,7 +205,22 @@ export function formatGitApplyMetrics(metrics: GitApplyMetrics): string {
       return `i${t.index}q${t.queueMs}w${t.wallMs}${GIT_APPLY_RESULT_ABBR[t.result]}${group}${chain}`;
     })
     .join(",");
-  return `mode=${metrics.runKind} repos=${metrics.repos} commonDirs=${metrics.commonDirGroups} results=${resultBits || "none"} repoMs=${repoBits || "none"}`;
+  const distributions = [
+    formatGitApplyDistribution("queueMs", metrics.repoTimings.map((timing) => timing.queueMs)),
+    formatGitApplyDistribution("wallMs", metrics.repoTimings.map((timing) => timing.wallMs)),
+  ];
+  const chainTimings = metrics.repoTimings
+    .map((timing) => timing.chain)
+    .filter((chain): chain is GitChainTimings => chain !== undefined && chain.chainLength > 0);
+  if (chainTimings.length > 0) {
+    distributions.push(
+      formatGitApplyDistribution("fetchDecryptMs", chainTimings.map((chain) => chain.fetchDecryptMs)),
+      formatGitApplyDistribution("bundleVerifyMs", chainTimings.map((chain) => chain.bundleVerifyMs)),
+      formatGitApplyDistribution("gitImportMs", chainTimings.map((chain) => chain.gitImportMs)),
+      formatGitApplyDistribution("indexOpStateMs", chainTimings.map((chain) => chain.indexOpStateMs)),
+    );
+  }
+  return `mode=${metrics.runKind} repos=${metrics.repos} commonDirs=${metrics.commonDirGroups} results=${resultBits || "none"} ${distributions.join(" ")} repoMs=${repoBits || "none"}`;
 }
 
 /**
@@ -192,6 +263,7 @@ opts: {
     degradedMutex?: boolean;
     capabilityProbe?: CheckoutCapabilityProbe;
     crashAt?: (point: FollowCrashPoint) => void;
+    warningSink?: (message: string) => void;
   } = {}
 ): Promise<GitPullOutcome> {
   const baseRepos = { ...(state.lastSyncedManifest.gitRepos ?? {}) };
@@ -973,6 +1045,7 @@ opts: {
           }
           : {}),
         ...(chainTimings ? { chainTimings } : {}),
+        ...(opts.warningSink ? { warningSink: opts.warningSink } : {}),
       }
     );
     if (res.applied) {

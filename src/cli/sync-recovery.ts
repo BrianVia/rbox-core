@@ -85,6 +85,7 @@ export interface EncryptAndUploadOptions {
   recoverAddresses?: ReadonlySet<string>;
   /** Recovery accumulation overflowed, so audit the complete refset. */
   forceFullAudit?: boolean;
+  warningSink?: (line: string) => void;
 }
 
 const DEFAULT_ENCRYPT_CACHE_FLUSH_MS = 10_000;
@@ -202,7 +203,8 @@ export async function encryptAndUpload(
         deferred,
         retryLater,
         uploadsDir: path.join(root, ".rbox", "state", "uploads"),
-      }));
+        ...(options.warningSink ? { warningSink: options.warningSink } : {}),
+      }), options.warningSink);
       needsUpload = result.needsUpload;
     } else {
     const runCryptoAndUpload = async (pool: CryptoPool | undefined): Promise<void> => {
@@ -252,7 +254,7 @@ export async function encryptAndUpload(
           // not a push-fatal error: one vanished file must never kill a 126k-file
           // push. Defer it — deferManifest carries the base entry (or omits a
           // never-synced one) and the next scan sees the deletion for real.
-          if (isDeferrableChurn(err, f.path)) {
+          if (isDeferrableChurn(err, f.path, options.warningSink)) {
             deferred.add(f.path);
             onProgress?.(++enc, toEncrypt.length, "encrypt", f.path);
             return;
@@ -379,7 +381,7 @@ export async function encryptAndUpload(
             if (LANE_TIMING) uploadLaneTiming.encryptMs += performance.now() - t0;
           } catch (err) {
             // Source churn defers instead of mutating the scanned manifest tuple.
-            if (isDeferrableChurn(err, f.path)) {
+            if (isDeferrableChurn(err, f.path, options.warningSink)) {
               byteTracker.defer(f.path);
               emitUploadProgress(f.path);
               return null;
@@ -493,7 +495,7 @@ export async function encryptAndUpload(
     };
 
     if (options.encryptFileToTemp === undefined) {
-      await withCryptoPool(kek, cfg.keyEpoch, toEncrypt.length, async (pool) => runCryptoAndUpload(pool));
+      await withCryptoPool(kek, cfg.keyEpoch, toEncrypt.length, async (pool) => runCryptoAndUpload(pool), options.warningSink);
     } else {
       await runCryptoAndUpload(undefined);
     }
@@ -531,7 +533,8 @@ export function deferManifest(local: Manifest, base: Manifest, deferred: Set<str
 /** Operator-facing summary for deferred files: the count always (so the push clearly
  *  reports partial progress); the churning paths only under RBOX_DEBUG (noisier, and
  *  lower-signal than the count). */
-export function reportDeferred(deferred: Set<string>): void {
-  console.error(`rbox: ${deferred.size} file(s) still changing — deferred, will sync once they settle`);
-  if (process.env.RBOX_DEBUG) console.error(`rbox: deferred paths: ${[...deferred].sort().join(", ")}`);
+export function reportDeferred(deferred: Set<string>, sink?: (line: string) => void): void {
+  const output = sink ?? console.error;
+  output(`rbox: ${deferred.size} file(s) still changing — deferred, will sync once they settle`);
+  if (process.env.RBOX_DEBUG) output(`rbox: deferred paths: ${[...deferred].sort().join(", ")}`);
 }

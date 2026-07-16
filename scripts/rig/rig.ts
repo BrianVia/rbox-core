@@ -138,7 +138,10 @@ async function ensureUp(apiUrl: string): Promise<void> {
     }
     if (!exists) {
       console.log(`creating ${name}`);
-      await C.createContainer({ name, image: NAMES.image, network: NAMES.network, cpus: DEV_CPUS, memory: DEV_MEMORY, mounts, env: { RBOX_API: apiUrl } });
+      // Explicit tini PID 1: Apple `container` does not honor the image ENTRYPOINT,
+      // and a bare sleep-infinity PID 1 never reaps orphans — dead daemons linger as
+      // zombies that still pass pid-liveness lock probes and wedge every later sync.
+      await C.createContainer({ name, image: NAMES.image, network: NAMES.network, cpus: DEV_CPUS, memory: DEV_MEMORY, mounts, env: { RBOX_API: apiUrl }, cmd: ["/usr/bin/tini", "--", "sleep", "infinity"] });
     }
     await C.startContainer(name);
     console.log(`${name} up`);
@@ -350,6 +353,7 @@ async function prepareConductorWorkload(apiUrl: string, flags: Record<string, st
       { source: staged.dir, target: GUEST.workloadMount, readonly: true },
     ],
     env: { RBOX_API: apiUrl },
+    cmd: ["/usr/bin/tini", "--", "sleep", "infinity"],
   });
   await C.startContainer(NAMES.a);
 }

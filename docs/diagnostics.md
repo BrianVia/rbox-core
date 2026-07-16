@@ -1,8 +1,8 @@
 # Diagnostics — `rbox doctor` and the opt-in support report
 
 Design 56 §10 P3. Two codex design rounds (5 BLOCKERs closed) + adversarial impl
-review. The support flow this replaces: eyeballing `~/.rbox/daemons/<key>/daemon.log`
-and pasting chunks into Slack.
+review. The support flow this replaces: eyeballing files under
+`~/.rbox/daemons/<key>/` and pasting chunks into Slack.
 
 ## For users
 
@@ -37,8 +37,9 @@ any diagnostic data leaves the machine:
 when design 51 ships.)
 
 **What the report contains** (JSON, client-capped ≤ 512 KiB): rbox/bun version +
-platform, the doctor checklist results, the last 64 KiB of this workspace's
-`daemon.log`, whitelisted counts-only sync counters (`metrics.json`, including
+platform, the doctor checklist results, bounded tails merged from this workspace's
+daily operational log, concurrent crash sink, and any legacy in-workspace source,
+whitelisted counts-only sync counters (`metrics.json`, including
 the integer `lockStarved` episode count), daemon heartbeat/halt state
 (`activity.json`), and workspace shape (file count + total bytes). Never file
 contents, lock markers, UUIDs, holder keys, tokens, or the private starvation

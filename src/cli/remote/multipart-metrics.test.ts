@@ -1,12 +1,5 @@
-import { afterEach, describe, expect, test } from "bun:test";
-import {
-  MultipartMetrics,
-  readMultipartServerTimings,
-  resetMultipartMetricsSinkForTests,
-  setMultipartMetricsSink,
-} from "./multipart-metrics.js";
-
-afterEach(() => resetMultipartMetricsSinkForTests());
+import { describe, expect, test } from "bun:test";
+import { MultipartMetrics, readMultipartServerTimings } from "./multipart-metrics.js";
 
 describe("readMultipartServerTimings", () => {
   const valid = { totalMs: 100, assembleMs: 20, rereadPutMs: 70, accountingMs: 10 };
@@ -31,7 +24,7 @@ describe("readMultipartServerTimings", () => {
 
 describe("MultipartMetrics", () => {
   test("aggregates walls and gaps using nearest-rank percentiles", () => {
-    const metrics = new MultipartMetrics(true);
+    const metrics = new MultipartMetrics(true, () => {});
     for (const ms of [50, 10, 40, 20, 30]) metrics.recordPartWall(ms);
     for (const ms of [4, 1, 3, 2]) metrics.recordGap(ms);
     metrics.setParts(5);
@@ -52,15 +45,14 @@ describe("MultipartMetrics", () => {
   });
 
   test("empty samples produce zero aggregates", () => {
-    const timings = new MultipartMetrics(true).toTimings();
+    const timings = new MultipartMetrics(true, () => {}).toTimings();
     expect(timings.partWall).toEqual({ p50: 0, p95: 0, max: 0, sum: 0 });
     expect(timings.gap).toEqual({ p50: 0, p95: 0, max: 0, sum: 0 });
   });
 
   test("disabled instances accumulate nothing and never emit", () => {
     const lines: string[] = [];
-    setMultipartMetricsSink((line) => lines.push(line));
-    const metrics = new MultipartMetrics(false);
+    const metrics = new MultipartMetrics(false, (line) => lines.push(line));
     metrics.recordPartWall(10);
     metrics.recordGap(3);
     metrics.addRetries(4);

@@ -80,7 +80,7 @@ export interface GuestActivity {
 }
 
 /**
- * Classify a daemon.log body into its watcher mode (design 56 §9: "if the guest
+ * Classify the combined daemon streams into their watcher mode (design 56 §9: "if the guest
  * watcher degrades to polling, that's FINE — log the mode"). Native @parcel/watcher
  * announces plain `rbox daemon ready`; the fallback logs `live watch unavailable …
  * degrading to periodic scan` / `periodic-scan mode`. PURE.
@@ -89,6 +89,37 @@ export function daemonWatcherMode(log: string): "native" | "polling" | "unknown"
   if (/live watch unavailable|periodic-scan mode|periodic scan every/i.test(log)) return "polling";
   if (/rbox daemon ready/i.test(log)) return "native";
   return "unknown";
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+/**
+ * Build the guest-side collector shared by watcher classification and run-artifact
+ * capture. Each runtime contributes calendar-valid daily files in filename order,
+ * followed by its concurrent crash sink; source markers keep the channels distinct.
+ */
+export function daemonLogHarvestScript(rboxHome: string): string {
+  const daemons = shellQuote(`${rboxHome}/daemons`);
+  return [
+    `for dir in ${daemons}/*; do`,
+    `  [ -d "$dir" ] || continue`,
+    `  find "$dir" -maxdepth 1 -type f -name 'daemon-????-??-??.log' -print | LC_ALL=C sort | while IFS= read -r f; do`,
+    `    base=${"$(basename \"$f\")"}`,
+    `    day=${"${base#daemon-}"}; day=${"${day%.log}"}`,
+    `    case "$base" in daemon-[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].log) ;; *) continue ;; esac`,
+    `    [ "$(date -u -d "$day" +%F 2>/dev/null)" = "$day" ] || continue`,
+    `    printf '\\342\\224\\200\\342\\224\\200 %s \\342\\224\\200\\342\\224\\200\\n' "$f"`,
+    `    cat "$f"`,
+    `  done`,
+    `  crash="$dir/daemon.log"`,
+    `  if [ -f "$crash" ]; then`,
+    `    printf '\\342\\224\\200\\342\\224\\200 %s (crash sink) \\342\\224\\200\\342\\224\\200\\n' "$crash"`,
+    `    cat "$crash"`,
+    `  fi`,
+    `done`,
+  ].join("\n");
 }
 
 export class Device {
@@ -283,13 +314,14 @@ export class Device {
   }
 
   /**
-   * Concatenate every `<rboxHome>/daemons/*​/daemon.log` in the guest (design 45
-   * runtime dir). The startup line records the watcher mode — native (`rbox daemon
+   * Concatenate every valid daily stream plus the crash sink in each guest runtime.
+   * The daily files are read in calendar order. The startup line records the watcher
+   * mode — native (`rbox daemon
    * ready`) vs the polling fallback (`… periodic scan every 60s` / `periodic-scan
    * mode`); {@link daemonWatcherMode} classifies it. Best-effort → "" on any failure.
    */
   async readDaemonLogs(rboxHome: string): Promise<string> {
-    const script = `for f in ${rboxHome}/daemons/*/daemon.log; do [ -f "$f" ] && cat "$f"; done`;
+    const script = daemonLogHarvestScript(rboxHome);
     const r = await this.exec(["sh", "-c", script], { allowFail: true });
     return r.exitCode === 0 ? r.stdout : "";
   }

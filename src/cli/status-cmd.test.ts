@@ -6,7 +6,7 @@ import { saveConfig, saveState, syncStreamId, type WorkspaceConfig } from "./con
 import { populateStatusPath, type PopulateStatusV1 } from "./populate-status.js";
 import { statusCmdWithDeps, type StatusCmdDeps } from "./status-cmd.js";
 import { lockingHealthPath } from "./sync-mutex.js";
-import { daemonLogPath } from "./rbox-paths.js";
+import { daemonDatedLogPath } from "./rbox-paths.js";
 import { main } from "./main-dispatch.js";
 
 const OLD_ENV = { ...process.env };
@@ -213,8 +213,8 @@ test("status exposes a durable starvation warning without holder details", async
   await fs.writeFile(path.join(root, ".rbox", "state", "lock-starvation.json"), JSON.stringify({
     holderKey: "a".repeat(64), firstSeenAt: NOW - 900_000, warnedAt: NOW,
   }));
-  await fs.mkdir(path.dirname(daemonLogPath(root)), { recursive: true });
-  await fs.writeFile(daemonLogPath(root), `${new Date(NOW).toISOString()} lock starved: reason=foreign age=15m\n`);
+  await fs.mkdir(path.dirname(daemonDatedLogPath(root, new Date(NOW))), { recursive: true });
+  await fs.writeFile(daemonDatedLogPath(root, new Date(NOW)), `${new Date(NOW).toISOString()} lock starved: reason=foreign age=15m\n`);
   const json = JSON.parse(await captureStatus({ json: true })) as any;
   expect(json.locking).toEqual({ status: "starved", reason: "foreign", path: ".rbox/state/sync.lock" });
   expect(JSON.stringify(json.locking)).not.toContain("a".repeat(64));

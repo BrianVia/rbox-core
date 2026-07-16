@@ -54,7 +54,9 @@ export async function untrack(opts: UntrackOptions): Promise<void> {
     if (!exited) {
       if (force) {
         forceKill(daemon.pid);
-        await waitForExit(daemon.pid, KILL_TIMEOUT_MS);
+        if (!(await waitForExit(daemon.pid, KILL_TIMEOUT_MS))) {
+          throw new Error("daemon exit could not be confirmed after SIGKILL — runtime retained");
+        }
       } else {
         throw new Error("daemon still running — stop it and retry (or pass --force to kill it)");
       }

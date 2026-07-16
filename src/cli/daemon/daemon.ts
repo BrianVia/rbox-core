@@ -1,5 +1,6 @@
 import os from "node:os";
 import crypto from "node:crypto";
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import { constants } from "node:fs";
 import path from "node:path";
@@ -99,7 +100,8 @@ import {
   WS_PING_MS,
   WS_PONG_DEADLINE_DEFAULT_MS,
 } from "./policy.js";
-import { cleanPath, log, LOG_PATHS_MAX, scanStatsLine, summarizeActions } from "./render.js";
+import { cleanPath, LOG_PATHS_MAX, scanStatsLine, summarizeActions } from "./render.js";
+import { RotatingDaemonLogger, type DaemonLogSink } from "./logger.js";
 
 type RboxBarAmbientStatus = AmbientDaemonStatusV1 & {
   fileCount: number;
@@ -370,6 +372,8 @@ export class RboxDaemon {
   private readonly wsReliabilityDisabled: boolean;
   private readonly pongDeadlineMs: number;
   private readonly backstopMs: number;
+  private readonly log: DaemonLogSink;
+  private readonly onStopped?: () => void;
 
   /** `e2ee` is the E2EE sync transport (deps.remote) — every push/pull goes
    *  through it so the daemon syncs encrypted, exactly like the one-shot commands. */
@@ -382,9 +386,13 @@ export class RboxDaemon {
       pullOnly?: boolean;
       acquireSyncMutex?: (root: string) => Promise<DaemonMutexResult>;
       now?: () => number;
+      log?: DaemonLogSink;
+      onStopped?: () => void;
     } = {},
   ) {
-    this.api = new RboxApi(cfg.remoteUrl, cfg.token, cfg.remoteWorkspaceId, cfg.projectId);
+    this.log = opts.log ?? ((message) => console.log(`${new Date().toISOString()} ${message}`));
+    this.onStopped = opts.onStopped;
+    this.api = new RboxApi(cfg.remoteUrl, cfg.token, cfg.remoteWorkspaceId, cfg.projectId, this.log);
     this.matcher = buildIgnoreMatcher(root, { respectGitignore: cfg.respectGitignore === true });
     this.bootId = opts.bootId ?? process.env[DAEMON_BOOT_ID_ENV] ?? crypto.randomBytes(16).toString("hex");
     this.pullOnly = opts.pullOnly === true;
@@ -409,12 +417,12 @@ export class RboxDaemon {
       /* setpriority may be denied; not fatal */
     }
     // ...and the DISK race too (design 49): macOS throttle tier / linux BE-7.
-    log(`io priority: ${lowerIoPriority()}`);
+    this.log(`io priority: ${lowerIoPriority()}`);
 
     this.cache = await HashCache.load(this.root);
     this.metrics = await loadMetrics(this.root);
     this.lockStarvationEpisode = await readLockStarvationEpisode(this.root);
-    log(`rbox daemon starting: ${this.root} → workspace ${this.cfg.remoteWorkspaceId} (device ${this.cfg.deviceId})${this.pullOnly ? " [pull-only]" : ""}`);
+    this.log(`rbox daemon starting: ${this.root} → workspace ${this.cfg.remoteWorkspaceId} (device ${this.cfg.deviceId})${this.pullOnly ? " [pull-only]" : ""}`);
     // Record the binding so `rbox start` can tell a live daemon from a STALE one
     // (bound to a workspace this root was since re-initialized away from).
     if (!(await this.writeStartupBinding())) return;
@@ -451,7 +459,7 @@ export class RboxDaemon {
     this.startBackstop();
     this.startUpdateChecks();
 
-    log(this.watcher ? "rbox daemon ready" : "rbox daemon ready (periodic-scan mode; no live watch)");
+    this.log(this.watcher ? "rbox daemon ready" : "rbox daemon ready (periodic-scan mode; no live watch)");
   }
 
   /**
@@ -490,7 +498,7 @@ export class RboxDaemon {
               // only healer — sit backed off at 5m. Sync itself is unaffected. An
               // already-armed backed-off timer is pulled forward too —
               // the flag alone would wait out the remaining timeout.
-              if (this.watcherHealthy) log(`watcher error: ${err.message} — safety scan pinned to its ${Math.round(SAFETY_SYNC_MS / 1000)}s floor`);
+              if (this.watcherHealthy) this.log(`watcher error: ${err.message} — safety scan pinned to its ${Math.round(SAFETY_SYNC_MS / 1000)}s floor`);
               this.watcherHealthy = false;
               for (const audit of this.openDriftAudits) audit.watcherHealthy = false;
               this.watcherDegraded = true;
@@ -513,7 +521,7 @@ export class RboxDaemon {
               return;
             }
             if (classifyWatcherError(err.message) === "fatal") {
-              log(`watcher error (fatal): ${err.message} — permanent un-trust`);
+              this.log(`watcher error (fatal): ${err.message} — permanent un-trust`);
               this.setTrustState("fused", "fatal error");
             } else {
               const now = Date.now();
@@ -522,12 +530,12 @@ export class RboxDaemon {
               this.lastTransientDropMs = now;
               const d = this.transientDropTimestamps.length;
               if (d >= RETRUST_FUSE_DROPS) {
-                log(`watcher trust FUSED: ${d} transient drops within ${RETRUST_DROP_WINDOW_MS}ms — reverting to permanent un-trust (safety-scan-only)`);
+                this.log(`watcher trust FUSED: ${d} transient drops within ${RETRUST_DROP_WINDOW_MS}ms — reverting to permanent un-trust (safety-scan-only)`);
                 this.setTrustState("fused", `fuse ${d}/${RETRUST_FUSE_DROPS}`);
               } else {
                 this.recoveryHoldMs = Math.min(SAFETY_SYNC_MS * 2 ** (d - 1), RETRUST_HOLD_MAX_MS);
-                if (this.trustState === "trusted") log(`watcher error (transient overflow): ${err.message} — safety scan pinned; recovering`);
-                log(`retrust drop: window=${d}/${RETRUST_FUSE_DROPS} wouldFuse=n hold=${this.recoveryHoldMs}ms`);
+                if (this.trustState === "trusted") this.log(`watcher error (transient overflow): ${err.message} — safety scan pinned; recovering`);
+                this.log(`retrust drop: window=${d}/${RETRUST_FUSE_DROPS} wouldFuse=n hold=${this.recoveryHoldMs}ms`);
                 this.setTrustState("suspect", `transient drop ${d}`);
               }
             }
@@ -538,7 +546,7 @@ export class RboxDaemon {
       );
       this.watcherSessionId = crypto.randomBytes(16).toString("hex");
     } catch (e) {
-      log(`live watch unavailable: ${e instanceof Error ? e.message : String(e)} — degrading to periodic scan every ${Math.round(SAFETY_SYNC_MS / 1000)}s`);
+      this.log(`live watch unavailable: ${e instanceof Error ? e.message : String(e)} — degrading to periodic scan every ${Math.round(SAFETY_SYNC_MS / 1000)}s`);
       this.watcherDegraded = true;
       this.writeAmbientStatus();
     }
@@ -634,7 +642,10 @@ export class RboxDaemon {
     await this.activityWrite.catch(() => {}); // flush the final sidecar record (best-effort)
     await this.cache?.save(this.root).catch(() => {});
     await this.writePausedAmbientStatus().catch(() => {});
-    log("rbox daemon stopped");
+    if (firstStop) {
+      this.log("rbox daemon stopped");
+      this.onStopped?.();
+    }
   }
 
   // ---- single-flight pump --------------------------------------------------
@@ -658,7 +669,7 @@ export class RboxDaemon {
   }
 
   private async loadSyncBase(): Promise<SyncState> {
-    const state = await loadState(this.root, syncStreamId(this.cfg));
+    const state = await loadState(this.root, syncStreamId(this.cfg), this.log);
     this.syncBase = state;
     return state;
   }
@@ -747,7 +758,7 @@ export class RboxDaemon {
     const age = Math.max(0, now - episode.firstSeenAt);
     if (age < LOCK_STARVATION_MS) return;
     if (episode.warnedAt === undefined) {
-      log(`lock starved: reason=${reason} age=${lockStarvationAgeBucket(age)}`);
+      this.log(`lock starved: reason=${reason} age=${lockStarvationAgeBucket(age)}`);
       episode = { ...episode, warnedAt: now };
       this.lockStarvationEpisode = episode;
       await saveLockStarvationEpisode(this.root, episode);
@@ -781,23 +792,23 @@ export class RboxDaemon {
         if (acquired.status === "contended") {
           // Do not clear want[op]: contention must requeue, never consume, this tick.
           await this.observeLockContention(acquired).catch(() => {
-            log("lock starvation state unavailable");
+            this.log("lock starvation state unavailable");
           });
           const backoff = this.mutexDelay(acquired.holderKey);
-          if (backoff.shouldLog) log(`pump op ${op}: sync busy; re-queued (backoff ${backoff.delayMs}ms)`);
+          if (backoff.shouldLog) this.log(`pump op ${op}: sync busy; re-queued (backoff ${backoff.delayMs}ms)`);
           await this.waitForMutexBackoff(backoff.delayMs);
           continue;
         }
         this.resetMutexBackoff();
         await this.clearLockStarvationEpisode().catch(() => {
-          log("lock starvation state unavailable");
+          this.log("lock starvation state unavailable");
         });
         const syncMutex = acquired.handle;
         try {
           const binding = this.syncBase ?? await this.loadSyncBase();
           const bindingMatches = await daemonBindingMatches(this.root, syncStreamId(this.cfg), expectedStateNonce(binding));
           if (!bindingMatches) {
-            log("daemon binding changed while idle (stream/state nonce mismatch) — stopping before mutation");
+            this.log("daemon binding changed while idle (stream/state nonce mismatch) — stopping before mutation");
             this.stopped = true;
             break;
           }
@@ -825,7 +836,7 @@ export class RboxDaemon {
                 this.notifyPullPendingAt = undefined;
                 // §6: the standalone metric event fires at dequeue — measured latency is recorded
                 // even if the pull below fails (the pull-line token then simply never prints).
-                if (notifyLatencyMs !== undefined) log(`notify_latency_ms=${notifyLatencyMs}`);
+                if (notifyLatencyMs !== undefined) this.log(`notify_latency_ms=${notifyLatencyMs}`);
                 const catchUpGeneration = this.pendingCatchUpGeneration;
                 this.pendingCatchUpGeneration = undefined;
                 try {
@@ -903,7 +914,7 @@ export class RboxDaemon {
             const shouldLogRepeat = this.errRepeat === 1 || this.errRepeat % 10 === 0;
             if (e instanceof QuotaExceededError) {
               const visibleChanged = this.recordOutOfStorage(e, op);
-              if (shouldLogRepeat) log(`pump op quota: ${msg}${this.errRepeat > 1 ? ` (x${this.errRepeat})` : ""}`);
+              if (shouldLogRepeat) this.log(`pump op quota: ${msg}${this.errRepeat > 1 ? ` (x${this.errRepeat})` : ""}`);
               if (visibleChanged || shouldLogRepeat) this.writeActivity();
               await sleep(jitter(1000));
               continue;
@@ -919,7 +930,7 @@ export class RboxDaemon {
                 ...(e.fingerprint ? { terminal: { fingerprint: e.fingerprint } } : {}),
               };
               if (shouldLogRepeat) {
-                log(`pump op blocked: ${msg}${this.errRepeat > 1 ? ` (x${this.errRepeat})` : ""}`);
+                this.log(`pump op blocked: ${msg}${this.errRepeat > 1 ? ` (x${this.errRepeat})` : ""}`);
                 this.writeActivity();
               }
               await sleep(jitter(1000));
@@ -932,7 +943,7 @@ export class RboxDaemon {
             this.activeProgressPath = undefined;
             this.activity.halt = { at: new Date().toISOString(), reason: msg, count: this.errRepeat, op };
             if (shouldLogRepeat) {
-              log(`pump op error: ${msg}${this.errRepeat > 1 ? ` (x${this.errRepeat})` : ""}`);
+              this.log(`pump op error: ${msg}${this.errRepeat > 1 ? ` (x${this.errRepeat})` : ""}`);
               this.writeActivity();
             }
             await sleep(jitter(1000)); // brief backoff so a persistent error can't hot-loop
@@ -971,7 +982,7 @@ export class RboxDaemon {
         blockedFingerprint,
         onCommitConflict: () => this.bumpConflict("commit"),
         report,
-        onGitLog: log, // design 43 §10: capture/carry/defer/remove forensics in the daemon log
+        onGitLog: this.log, // design 43 §10: capture/carry/defer/remove forensics in the daemon log
         onGitDeferralsSaved: (state) => this.observeDurableGitState(state),
         onProgress: (done, total, phase, detail, bytes) => this.onTransferProgress(done, total, phase, detail, bytes), // design 45 + 88: progress plus local status path
         onPullApplied: (a) => this.recordPullApplied(a), // design 45: the 409-recovery pull mutates the tree too
@@ -996,7 +1007,7 @@ export class RboxDaemon {
         res.deferred && res.deferred.length > 0
           ? `; deferred ${res.deferred.length}: ${res.deferred.slice(0, LOG_PATHS_MAX).map(cleanPath).join(" ")}`
           : "";
-      log(`push: published sequence ${res.sequence} (${res.manifest.files.length} files${deferredNote})`);
+      this.log(`push: published sequence ${res.sequence} (${res.manifest.files.length} files${deferredNote})`);
     }
     this.lastLoggedSeq = res.sequence;
     if (res.committed) {
@@ -1020,7 +1031,7 @@ export class RboxDaemon {
     this.emitDurableGitDeferrals(durableState);
     this.metrics.syncs += 1;
     await saveMetrics(this.root, this.metrics);
-    report?.logSummaryTo(log); // Explicit metrics opt-out is silent. By default even a
+    report?.logSummaryTo(this.log); // Explicit metrics opt-out is silent. By default even a
     // no-op tick logs its state-load/git-plan cost — intentional since design 82 §4 (the
     // invisible steady-state cost is exactly what that design instruments).
   }
@@ -1035,7 +1046,7 @@ export class RboxDaemon {
     if (!fingerprint || this.lastTerminalBlockFingerprint === fingerprint) return;
     this.lastTerminalBlockFingerprint = fingerprint;
     const reason = this.activity.halt?.reason ?? "push is blocked";
-    log(`push blocked: ${reason} — change the workspace or raise limits`);
+    this.log(`push blocked: ${reason} — change the workspace or raise limits`);
   }
 
   private recordOutOfStorage(e: QuotaExceededError, op: keyof Wants): boolean {
@@ -1172,7 +1183,7 @@ export class RboxDaemon {
       cache: this.cache,
       syncMutex,
       report,
-      onGitLog: log,
+      onGitLog: this.log,
       onGitDeferralsSaved: (state) => this.observeDurableGitState(state),
       onProgress: (done, total, phase, detail, bytes) => this.onTransferProgress(done, total, phase, detail, bytes), // design 45 + 88
       onPullApplied: (a) => this.recordPullApplied(a),
@@ -1201,7 +1212,7 @@ export class RboxDaemon {
     }
     this.chainRepairPolicy.clear();
     report?.logSummaryTo((line) =>
-      log(notifyLatencyMs !== undefined ? `${line} notify_latency_ms=${notifyLatencyMs}` : line),
+      this.log(notifyLatencyMs !== undefined ? `${line} notify_latency_ms=${notifyLatencyMs}` : line),
     );
     const fileConflicts = actions.filter((a) => a.kind === "conflict").length;
     if (fileConflicts > 0) {
@@ -1251,7 +1262,7 @@ export class RboxDaemon {
 
   private emitDurableGitDeferrals(state: SyncState | undefined, now = Date.now()): void {
     if (!state) return;
-    for (const line of durableGitDeferralLines(state, this.gitDeferralLogSeen, now)) log(line);
+    for (const line of durableGitDeferralLines(state, this.gitDeferralLogSeen, now)) this.log(line);
   }
 
   /** Runs synchronously after the authoritative state save, before later network
@@ -1365,7 +1376,7 @@ export class RboxDaemon {
       audit.watcherHealthy = false;
       audit.trustState = worseTrust(audit.trustState, next);
     }
-    log(`watcher trust ${this.trustState} (${reason})`);
+    this.log(`watcher trust ${this.trustState} (${reason})`);
   }
 
   private resetSuspectEpisodeState(): void {
@@ -1567,7 +1578,7 @@ export class RboxDaemon {
   private beginOwnershipWindDown(reason: string): void {
     if (this.ownershipWindDownStarted || this.stopped) return;
     this.ownershipWindDownStarted = true;
-    log(`daemon ownership lost: ${reason} — draining and stopping`);
+    this.log(`daemon ownership lost: ${reason} — draining and stopping`);
     setTimeout(() => void this.stop(), 0);
   }
 
@@ -1582,7 +1593,7 @@ export class RboxDaemon {
   private noteTypeFlip(relPath: string): void {
     // Fires for BOTH eviction shapes: an obstructing directory (→ trash) and an
     // obstructing ancestor file (→ visible conflict copy) — word it generically.
-    log(`pull type-flip conflict: ${cleanPath(relPath)} — local obstruction moved aside (see rbox trash / conflict copies)`);
+    this.log(`pull type-flip conflict: ${cleanPath(relPath)} — local obstruction moved aside (see rbox trash / conflict copies)`);
     this.typeFlipsSincePull++;
   }
 
@@ -1590,7 +1601,7 @@ export class RboxDaemon {
    *  409-recovery pull inside pushManifest). Forensic log line + status trail: this
    *  is the record that answers "did sync change/delete my files?" after the fact. */
   private recordPullApplied(actions: Action[]): void {
-    log(`pull applied: ${summarizeActions(actions)}`);
+    this.log(`pull applied: ${summarizeActions(actions)}`);
     let writes = 0;
     let deletes = 0;
     let conflicts = 0;
@@ -1649,7 +1660,7 @@ export class RboxDaemon {
     const stats = createScanStats();
     const started = Date.now();
     const { deferred, coverage } = await this.replaceManifestFromScan(this.cache, this.manifest, stats, "safety scan", "pruned");
-    if (metricsEnabled()) log(scanStatsLine("safety scan", stats, Date.now() - started, deferred.size));
+    if (metricsEnabled()) this.log(scanStatsLine("safety scan", stats, Date.now() - started, deferred.size));
     this.lastSafetyCompletedMs = Date.now();
     this.pruneCache();
     return { coverage, errorGenAtStart };
@@ -1683,7 +1694,7 @@ export class RboxDaemon {
     }
     const { freshManifest, deferred, coverage } = scanResult;
     this.rulesChangedSinceDeepScan = false;
-    if (metricsEnabled()) log(scanStatsLine("deep scan", stats, Date.now() - scanStartMs, deferred.size));
+    if (metricsEnabled()) this.log(scanStatsLine("deep scan", stats, Date.now() - scanStartMs, deferred.size));
     this.cache = fresh; // replace cache with freshly-verified truth (already tight)
     audit.candidates = diffForDrift(priorManifest, freshManifest, {
       firstSeenAtMs: scanStartMs, eventGenAtScan, bootId: this.bootId,
@@ -1704,7 +1715,7 @@ export class RboxDaemon {
     // a pump error. `.active`/young-batch protection (B3) lives in pruneTrash itself.
     void pruneTrash(this.root, trashConfig(this.cfg))
       .then((r) => {
-        if (r.removedBatches) log(`trash pruned: ${r.removedBatches} batch${r.removedBatches === 1 ? "" : "es"}, ${r.freedBytes} bytes freed`);
+        if (r.removedBatches) this.log(`trash pruned: ${r.removedBatches} batch${r.removedBatches === 1 ? "" : "es"}, ${r.freedBytes} bytes freed`);
       })
       .catch(() => {});
     return { coverage, errorGenAtStart };
@@ -1720,18 +1731,18 @@ export class RboxDaemon {
     const priorProbe = probeOn ? await loadScanProbe(this.root) : undefined;
     const probe = probeOn ? createScanProbe(priorProbe) : undefined;
     const dircache = scanPruneEnabled() ? await DirCache.load(this.root) : undefined;
-    const deferErrnos = makeDeferErrnoReporter(log);
+    const deferErrnos = makeDeferErrnoReporter(this.log);
     const fresh = await scanManifest(this.root, this.matcher, cache, undefined, undefined, scanStats, deferred, probe, dircache, mode,
-      deferErrnos.onErrno);
+      deferErrnos.onErrno, this.log);
     deferErrnos.flush();
     await dircache?.save(this.root);
     this.manifest = deferred.size > 0 ? deferManifest(fresh, previous, deferred) : fresh;
     if (deferred.size > 0) this.scheduleWriteFinishRetry(deferred);
     if (probe) {
       const summary = probe.summary();
-      log(`scan probe: dirs=${summary.dirs} eligible=${summary.eligible} eligibleReaddirMs=${summary.eligibleReaddirMs} totalReaddirMs=${summary.totalReaddirMs} projectedDircacheBytes=${summary.projectedDircacheBytes} probeOverheadMs=${summary.probeOverheadMs}`);
+      this.log(`scan probe: dirs=${summary.dirs} eligible=${summary.eligible} eligibleReaddirMs=${summary.eligibleReaddirMs} totalReaddirMs=${summary.totalReaddirMs} projectedDircacheBytes=${summary.projectedDircacheBytes} probeOverheadMs=${summary.probeOverheadMs}`);
       // Measurement only — a probe sidecar write failure must never fail the scan op.
-      await saveScanProbe(this.root, scanStartMs, probe).catch((e) => log(`scan probe sidecar write failed: ${errCode(e)}`));
+      await saveScanProbe(this.root, scanStartMs, probe).catch((e) => this.log(`scan probe sidecar write failed: ${errCode(e)}`));
     }
     // Coverage originates HERE — the function that invokes the tree walker. It is
     // read from the DIRCACHE (the component that made the pruning decision), never
@@ -1757,7 +1768,7 @@ export class RboxDaemon {
       } catch (e) {
         if (!this.driftSaveFailedLogged) {
           this.driftSaveFailedLogged = true;
-          log(`drift audit sidecar write failed (measurement only, sync unaffected): ${errCode(e)}`);
+          this.log(`drift audit sidecar write failed (measurement only, sync unaffected): ${errCode(e)}`);
         }
       }
     });
@@ -1852,10 +1863,10 @@ export class RboxDaemon {
         this.openDriftAudits.delete(audit); // window closed — atomically with the pending update
         return before !== 0 || state.pending.length !== 0 || resolved.lateCovered !== 0 || resolved.coveredAmbiguous !== 0;
       });
-      log(`deep-scan drift: candidates=${audit.candidates.length} survivors=${survivorCount} pendingHeld=${pendingHeld} confirmed=${confirmed} confirmedQuiescent=${confirmedQuiescent} late-covered=${resolved.lateCovered} covered-ambiguous=${resolved.coveredAmbiguous} unattributable=${unattributable} racing=${racing} reverted=${reverted} quiescent=${quiescent ? "y" : "n"} watcherHealthy=${audit.watcherHealthy ? "y" : "n"}${retrustEnabled() ? ` trustState=${audit.trustState}` : ""} errorGen=${audit.errorGen} sinceSafetyMs=${audit.sinceSafetyMs} rawEvents=${audit.rawEvents.length} rulesChanged=${audit.rulesChanged ? "y" : "n"} maxDriftAgeMs=${maxDriftAgeMs}`);
+      this.log(`deep-scan drift: candidates=${audit.candidates.length} survivors=${survivorCount} pendingHeld=${pendingHeld} confirmed=${confirmed} confirmedQuiescent=${confirmedQuiescent} late-covered=${resolved.lateCovered} covered-ambiguous=${resolved.coveredAmbiguous} unattributable=${unattributable} racing=${racing} reverted=${reverted} quiescent=${quiescent ? "y" : "n"} watcherHealthy=${audit.watcherHealthy ? "y" : "n"}${retrustEnabled() ? ` trustState=${audit.trustState}` : ""} errorGen=${audit.errorGen} sinceSafetyMs=${audit.sinceSafetyMs} rawEvents=${audit.rawEvents.length} rulesChanged=${audit.rulesChanged ? "y" : "n"} maxDriftAgeMs=${maxDriftAgeMs}`);
     } catch (e) {
       this.openDriftAudits.delete(audit);
-      log(`drift audit failed (measurement only, sync unaffected): ${errCode(e)}`);
+      this.log(`drift audit failed (measurement only, sync unaffected): ${errCode(e)}`);
     }
   }
 
@@ -1895,7 +1906,7 @@ export class RboxDaemon {
     this.cfg = { ...this.cfg, respectGitignore: loaded.respectGitignore };
     this.rebuildMatcher(await this.loadSyncBase());
     if (wasRespecting !== (this.cfg.respectGitignore === true)) {
-      log(`workspace config reloaded: respectGitignore ${this.cfg.respectGitignore === true ? "on" : "off"}`);
+      this.log(`workspace config reloaded: respectGitignore ${this.cfg.respectGitignore === true ? "on" : "off"}`);
     }
   }
 
@@ -1945,8 +1956,8 @@ export class RboxDaemon {
     };
     this.writeWsActivity();
     this.wsReconnects++;
-    log(`ws_reconnect reason=${reason} count=${this.wsReconnects}`);
-    if (reason === "error") log("ws error");
+    this.log(`ws_reconnect reason=${reason} count=${this.wsReconnects}`);
+    if (reason === "error") this.log("ws error");
     return true;
   }
 
@@ -2054,7 +2065,7 @@ export class RboxDaemon {
   private onPongDeadline(ws: WebSocket): void {
     if (this.stopped || this.ws !== ws) return;
     this.wsHalfOpenDetected++;
-    log(`ws half-open detected — no frame in ${Math.round(this.pongDeadlineMs / 1000)}s; cycling socket (ws_half_open_detected=${this.wsHalfOpenDetected})`);
+    this.log(`ws half-open detected — no frame in ${Math.round(this.pongDeadlineMs / 1000)}s; cycling socket (ws_half_open_detected=${this.wsHalfOpenDetected})`);
     if (!this.markWsDisconnected(ws, "timeout")) return;
     try {
       ws.close();
@@ -2082,7 +2093,7 @@ export class RboxDaemon {
   private onBackstopTick(): void {
     if (this.stopped || this.backstopMs <= 0) return;
     this.wsBackstopPulls++;
-    log(`ws backstop pull (ws_backstop_pull=${this.wsBackstopPulls})`);
+    this.log(`ws backstop pull (ws_backstop_pull=${this.wsBackstopPulls})`);
     this.request("pull");
     this.scheduleNextBackstop();
   }
@@ -2108,7 +2119,7 @@ export class RboxDaemon {
       };
       ws = new BunWebSocket(url, { headers: { Authorization: `Bearer ${this.cfg.token}` } });
     } catch (e) {
-      log(`ws connect failed: ${e instanceof Error ? e.message : String(e)}`);
+      this.log(`ws connect failed: ${e instanceof Error ? e.message : String(e)}`);
       this.scheduleReconnect();
       return;
     }
@@ -2117,7 +2128,7 @@ export class RboxDaemon {
     ws.addEventListener("open", () => {
       if (this.ws !== ws) return;
       this.reconnectAttempt = 0;
-      log("ws connected");
+      this.log("ws connected");
       const generation = this.markWsOpen(ws);
       this.pendingCatchUpGeneration = generation;
       this.request("pull"); // catch up on anything missed while disconnected
@@ -2148,17 +2159,34 @@ export class RboxDaemon {
 
 /** Run the daemon until SIGTERM/SIGINT. Used by the hidden `__daemon-run` command. */
 export async function runDaemon(root: string): Promise<void> {
-  const { cfg, deps } = await buildAuthedRemote(root); // E2EE transport + injected KEK
-  await loadState(root, syncStreamId(cfg)); // surfaces corrupt-state errors loudly before we go live
-  const daemon = new RboxDaemon(root, cfg, deps, { pullOnly: process.env.RBOX_DAEMON_PULL_ONLY === "1" });
+  const logger = new RotatingDaemonLogger(root, () => new Date(), fsSync);
+  const bootId = logger.bootId;
+  logger.boot();
+  let daemon: RboxDaemon | undefined;
+  let finish!: () => void;
+  const stopped = new Promise<void>((resolve) => { finish = resolve; });
   const shutdown = async () => {
-    await daemon.stop();
-    process.exit(0);
+    try { await daemon?.stop(); } finally { finish(); }
   };
-  process.on("SIGTERM", shutdown);
-  process.on("SIGINT", shutdown);
-  await daemon.start();
-  // start() returns after initial convergence; timers/watcher/ws keep the loop alive.
+  try {
+    const { cfg, deps } = await buildAuthedRemote(root, Date.now, logger.log); // E2EE transport + injected KEK
+    await loadState(root, syncStreamId(cfg), logger.log); // surfaces corrupt-state errors loudly before we go live
+    daemon = new RboxDaemon(root, cfg, { ...deps, onGitLog: logger.log, warningSink: logger.log }, {
+      bootId,
+      pullOnly: process.env.RBOX_DAEMON_PULL_ONLY === "1",
+      log: logger.log,
+      onStopped: finish,
+    });
+    process.once("SIGTERM", shutdown);
+    process.once("SIGINT", shutdown);
+    await daemon.start();
+    await stopped;
+  } finally {
+    process.removeListener("SIGTERM", shutdown);
+    process.removeListener("SIGINT", shutdown);
+    if (daemon) await daemon.stop().catch(() => {});
+    logger.close();
+  }
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));

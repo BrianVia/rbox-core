@@ -52,7 +52,7 @@ export async function provisionPair(ctx: RigCtx, rec: Recorder, opts: ProvisionO
   // 1. A: bootstrap login (secret via env expansion, never argv).
   await rec.step("[A] login --bootstrap", async () => {
     await ctx.a.rboxShell(
-      `bun ${GUEST.cliEntry} login --bootstrap "$RIG_BOOT" --remote "$RBOX_API" --no-interactive`,
+      `bun ${GUEST.cliEntry} login --bootstrap "$RIG_BOOT" --remote "$RBOX_API"`,
       { env: { RIG_BOOT: ctx.bootstrapSecret }, redact: [ctx.bootstrapSecret] }
     );
   });
@@ -105,7 +105,7 @@ export async function provisionPair(ctx: RigCtx, rec: Recorder, opts: ProvisionO
 
   // 6. B: redeem the pairing token (token via env, never argv).
   await rec.step("[B] login (redeem pair)", async () => {
-    await ctx.b.rboxShell(`bun ${GUEST.cliEntry} login --remote "$RBOX_API" --no-interactive`, {
+    await ctx.b.rboxShell(`bun ${GUEST.cliEntry} login --remote "$RBOX_API"`, {
       env: { RBOX_PAIR_TOKEN: pairToken },
       redact: [pairToken],
     });
@@ -144,7 +144,7 @@ function hasHeartbeat(contents: string | undefined): boolean {
 /**
  * Start the background-sync daemon on BOTH devices and wait until each has written
  * its first activity.json heartbeat (design 45), then read + record the watcher mode
- * from each daemon.log (native @parcel/watcher vs the polling fallback — both are
+ * from each daemon's combined dated streams (native @parcel/watcher vs the polling fallback — both are
  * acceptable; design 56 §9 wants the mode logged, not the mechanism asserted).
  * Records a `[X] daemon heartbeat` step per device that FAILS if no heartbeat lands
  * within {@link DAEMON_READY_TIMEOUT_MS}.

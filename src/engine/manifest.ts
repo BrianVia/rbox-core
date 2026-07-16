@@ -120,13 +120,14 @@ export async function scanManifest(
   mode: "pruned" | "unpruned" = "unpruned",
   /** Optional privacy-safe reporter for deferred per-file IO faults. Receives only
    *  the errno string, never a path. */
-  onDeferErrno?: (code: string) => void
+  onDeferErrno?: (code: string) => void,
+  warningSink?: (line: string) => void,
 ): Promise<Manifest> {
   const scanStartMs = Date.now();
   if (!dircache) {
     const files: FileEntry[] = [];
     if (scanStats) { scanStats.dircacheOutcome = "off"; scanStats.dirsReusedFromCache = 0; }
-    const ctx = makeWalkCtx({ root, matcher, cache, mode: "off", scanStartMs, scanStats, deferred, dirProbe, onProgress, onGitRepo, onDeferErrno });
+    const ctx = makeWalkCtx({ root, matcher, cache, mode: "off", scanStartMs, scanStats, deferred, dirProbe, onProgress, onGitRepo, onDeferErrno, warningSink });
     await runWalk(ctx, "", files);
     sortManifestFiles(files, scanStats);
     return { generatedAt: new Date().toISOString(), files };
@@ -153,7 +154,7 @@ export async function scanManifest(
   for (let attempt = 0; ; attempt++) {
     files = [];
     winningStats = createScanStats();
-    winningCtx = makeWalkCtx({ root, matcher, cache, dircache, mode: effectiveMode, scanStartMs, scanStats: winningStats, deferred, dirProbe, onProgress, onGitRepo, onDeferErrno, priorRuleFiles });
+    winningCtx = makeWalkCtx({ root, matcher, cache, dircache, mode: effectiveMode, scanStartMs, scanStats: winningStats, deferred, dirProbe, onProgress, onGitRepo, onDeferErrno, warningSink, priorRuleFiles });
     if (effectiveMode === "unpruned") dircache.dropTable();
     try {
       await runWalk(winningCtx, "", files);
@@ -225,6 +226,7 @@ interface WalkCtxOptions {
   onProgress?: (discovered: number) => void;
   onGitRepo?: (repo: DiscoveredGitRepo) => void;
   onDeferErrno?: (code: string) => void;
+  warningSink?: (line: string) => void;
   priorRuleFiles?: Set<string>;
 }
 
@@ -239,7 +241,7 @@ function makeWalkCtx(o: WalkCtxOptions): WalkCtx {
   return {
     root: o.root, matcher: o.matcher, cache: o.cache, dircache: o.dircache, mode: o.mode,
     scanStartMs: o.scanStartMs, scanStats: o.scanStats, deferred: o.deferred, dirProbe: o.dirProbe,
-    onDiscover, onGitRepo: o.onGitRepo, onDeferErrno: o.onDeferErrno, priorRuleFiles: o.priorRuleFiles ?? new Set(), observedRuleFiles: new Set(),
+    onDiscover, onGitRepo: o.onGitRepo, onDeferErrno: o.onDeferErrno, warningSink: o.warningSink, priorRuleFiles: o.priorRuleFiles ?? new Set(), observedRuleFiles: new Set(),
   };
 }
 
@@ -451,6 +453,7 @@ interface WalkCtx {
   onDiscover?: () => void;
   onGitRepo?: (repo: DiscoveredGitRepo) => void;
   onDeferErrno?: (code: string) => void;
+  warningSink?: (line: string) => void;
   priorRuleFiles: Set<string>;
   observedRuleFiles: Set<string>;
 }
@@ -498,7 +501,7 @@ async function walk(
   } else {
     if (scanBulkEnabled() && !ctx.dirProbe && bulkWalkSupported()) {
       const t0 = ctx.scanStats ? Date.now() : 0;
-      const bulk = bulkWalkDir(absDir);
+      const bulk = bulkWalkDir(absDir, ctx.warningSink);
       if (bulk !== null) {
         children = bulk.map(({ name, type }) => ({ name, type }));
         bulkStats = new Map(bulk.flatMap((child) => child.type === "file" && child.stat ? [[child.name, child.stat]] : []));

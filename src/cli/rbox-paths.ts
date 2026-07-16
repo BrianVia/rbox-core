@@ -43,5 +43,7 @@ const daemonHome = () => rboxDir();
 export const daemonRuntimeDir = (root: string): string => path.join(daemonHome(), "daemons", workspaceKey(root));
 export const daemonStatusPath = (root: string): string => path.join(daemonRuntimeDir(root), "daemon.status.json");
 export const daemonPidPath = (root: string): string => path.join(daemonRuntimeDir(root), "daemon.pid");
-export const daemonLogPath = (root: string): string => path.join(daemonRuntimeDir(root), "daemon.log");
+export const daemonCrashLogPath = (root: string): string => path.join(daemonRuntimeDir(root), "daemon.log");
+export const daemonDatedLogBasename = (date: Date): string => `daemon-${date.toISOString().slice(0, 10)}.log`;
+export const daemonDatedLogPath = (root: string, date: Date): string => path.join(daemonRuntimeDir(root), daemonDatedLogBasename(date));
 export const daemonBoundPath = (root: string): string => path.join(daemonRuntimeDir(root), "workspace.bound");

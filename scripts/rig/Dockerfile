@@ -9,8 +9,13 @@ FROM docker.io/library/ubuntu:24.04
 # and package.json declares no engines.bun, so this pins to the version in use.
 ARG BUN_VERSION=1.3.5
 
+# git >= 2.46 (transactional symref-update) is a product floor since design 118;
+# ubuntu 24.04 ships 2.43, so pull git from the git-core PPA like the fleet does.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl git unzip \
+    && apt-get install -y --no-install-recommends ca-certificates curl gnupg software-properties-common \
+    && add-apt-repository -y ppa:git-core/ppa \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends git unzip tini \
     && rm -rf /var/lib/apt/lists/*
 
 # Official installer, pinned. BUN_INSTALL=/usr/local → bun lands on PATH at /usr/local/bin.
@@ -24,5 +29,8 @@ WORKDIR /app
 COPY package.json bun.lock ./
 RUN bun install --frozen-lockfile
 
-# Long-lived guest; all real work happens via `container exec`.
+# Long-lived guest; all real work happens via `container exec`. tini as PID 1
+# reaps orphaned daemons — a bare `sleep infinity` PID 1 leaves dead daemons as
+# zombies, which still pass pid-liveness lock probes and wedge every later sync.
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["sleep", "infinity"]

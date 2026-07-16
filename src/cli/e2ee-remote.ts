@@ -682,8 +682,8 @@ export class E2eeRemote implements SyncRemote {
     // but unapplied head advances the anti-rollback pin only, so it must pull first.
     if ((pin?.commitSeq ?? 0) !== parentSequence) {
       // Distinguish local apply lag before reusing the conflict retry path.
-      process.stderr.write(
-        `rbox: local state lags the verified head (applied ${parentSequence}, seen ${pin?.commitSeq ?? 0}) — pulling before push\n`
+      (this.ctx.warningSink ?? ((line) => process.stderr.write(`${line}\n`)))(
+        `rbox: local state lags the verified head (applied ${parentSequence}, seen ${pin?.commitSeq ?? 0}) — pulling before push`
       );
       return { conflict: true, head: pin?.commitSeq ?? 0 };
     }

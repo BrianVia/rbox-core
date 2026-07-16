@@ -5,18 +5,13 @@ import os from "node:os";
 import path from "node:path";
 import { RemoteContext } from "./context.js";
 import { startFakeMultipartServer } from "./multipart-fake-server.js";
-import {
-  readMultipartServerTimings,
-  resetMultipartMetricsSinkForTests,
-  setMultipartMetricsSink,
-} from "./multipart-metrics.js";
+import { readMultipartServerTimings } from "./multipart-metrics.js";
 import { putBlobMultipart } from "./multipart.js";
 
 const METRIC_SHAPE = /^rbox multipart parts=\d+ bytes=\d+ partWall p50=\d+ p95=\d+ max=\d+ sum=\d+ms gap p50=\d+ p95=\d+ max=\d+ sum=\d+ms complete=\d+ms retries=\d+ reinit=\d+(?: srv total=\d+ assemble=\d+ reread=\d+ acct=\d+)?$/;
 const previousMetricsEnv = process.env.RBOX_METRICS;
 
 afterEach(() => {
-  resetMultipartMetricsSinkForTests();
   if (previousMetricsEnv === undefined) delete process.env.RBOX_METRICS;
   else process.env.RBOX_METRICS = previousMetricsEnv;
 });
@@ -37,9 +32,8 @@ describe("multipart client instrumentation", () => {
     const blob = await makeBlob(24 * 1024 * 1024);
     const server = await startFakeMultipartServer({ partSize: 8 * 1024 * 1024, partLatencyMs: 1 });
     const lines: string[] = [];
-    setMultipartMetricsSink((line) => lines.push(line));
     try {
-      const ctx = new RemoteContext(server.baseUrl, "test-token", "test-workspace", "test-project");
+      const ctx = new RemoteContext(server.baseUrl, "test-token", "test-workspace", "test-project", (line) => lines.push(line));
       await putBlobMultipart(ctx, blob.sha, blob.file, 24 * 1024 * 1024);
 
       expect(lines).toHaveLength(1);
@@ -70,9 +64,8 @@ describe("multipart client instrumentation", () => {
     const blob = await makeBlob(32);
     const server = await startFakeMultipartServer({ partSize: 16, includeServerTimings: false });
     const lines: string[] = [];
-    setMultipartMetricsSink((line) => lines.push(line));
     try {
-      await putBlobMultipart(new RemoteContext(server.baseUrl, "token", "workspace", "project"), blob.sha, blob.file, 32);
+      await putBlobMultipart(new RemoteContext(server.baseUrl, "token", "workspace", "project", (line) => lines.push(line)), blob.sha, blob.file, 32);
       expect(lines).toHaveLength(1);
       expect(lines[0]).toMatch(METRIC_SHAPE);
       expect(lines[0]).not.toContain(" srv ");
@@ -88,9 +81,8 @@ describe("multipart client instrumentation", () => {
     const blob = await makeBlob(32);
     const server = await startFakeMultipartServer({ partSize: 16 });
     const lines: string[] = [];
-    setMultipartMetricsSink((line) => lines.push(line));
     try {
-      await putBlobMultipart(new RemoteContext(server.baseUrl, "token", "workspace", "project"), blob.sha, blob.file, 32);
+      await putBlobMultipart(new RemoteContext(server.baseUrl, "token", "workspace", "project", (line) => lines.push(line)), blob.sha, blob.file, 32);
       expect(lines).toEqual([]);
       expect(server.stats.completedParts).toBe(2);
     } finally {
@@ -104,9 +96,8 @@ describe("multipart client instrumentation", () => {
     const blob = await makeBlob(32);
     const server = await startFakeMultipartServer({ partSize: 16, failPartOnce: 1 });
     const lines: string[] = [];
-    setMultipartMetricsSink((line) => lines.push(line));
     try {
-      await putBlobMultipart(new RemoteContext(server.baseUrl, "token", "workspace", "project"), blob.sha, blob.file, 32);
+      await putBlobMultipart(new RemoteContext(server.baseUrl, "token", "workspace", "project", (line) => lines.push(line)), blob.sha, blob.file, 32);
       expect(lines).toHaveLength(1);
       expect(lines[0]).toContain("retries=1");
       expect(server.stats.transientFailures).toBe(1);

@@ -56,6 +56,7 @@ export interface ApplyOptions {
   /** Fired once per type-flip resolved at apply (obstructing dir evicted, or an
    *  ancestor file moved aside). The daemon logs it and counts `lastPull.conflicts`. */
   onTypeFlip?: (relPath: string) => void;
+  warningSink?: (line: string) => void;
 }
 
 /**
@@ -193,7 +194,7 @@ export async function applyActions(
       } finally {
         if (measured) addWritePoolMs(performance.now() - poolT0);
       }
-    });
+    }, opts.warningSink);
   } finally {
     // Deletes (after the pool) and prepared-temp cleanup deliberately stay outside
     // both intervals. They are ~0 on a fresh join; apply wall is the denominator,

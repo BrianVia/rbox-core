@@ -87,6 +87,7 @@ export interface E2eeContext {
   secrets: DeviceSecrets;
   /** Injected clock for grant-expiry checks (Date.now in prod). */
   now: () => number;
+  warningSink?: (line: string) => void;
 }
 
 export interface CurrentWriteKek {

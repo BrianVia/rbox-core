@@ -5,7 +5,7 @@ import { buildIgnoreMatcher, checkoutTransactionCapability, cryptoPoolStatus, Ma
 import { loadActivity, type DaemonActivity } from "./activity.js";
 import { loadConfig, loadState, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { loadCredentials, type Credentials } from "./credentials.js";
-import { currentWorkspaceId, daemonBindingStatus, daemonLogPaths, readDaemonBindingRecord } from "./daemon-control.js";
+import { currentWorkspaceId, daemonBindingStatus, readDaemonBindingRecord, readMergedDaemonLogTail } from "./daemon-control.js";
 import { enrolledDeviceId, loadDevice } from "./e2ee-keystore.js";
 import { loadMetrics, type SyncMetrics } from "./metrics.js";
 import { promptConfirm } from "./prompt.js";
@@ -478,31 +478,8 @@ export async function collectDoctorContext(root: string): Promise<DoctorContext>
   };
 }
 
-async function readTailBytes(file: string, maxBytes: number): Promise<string | undefined> {
-  try {
-    const fd = await fsp.open(file, "r");
-    try {
-      const { size } = await fd.stat();
-      const len = Math.min(size, maxBytes);
-      const buf = Buffer.alloc(len);
-      const offset = size - len;
-      await fd.read(buf, 0, len, offset);
-      if (offset === 0) return buf.toString("utf8");
-      // This byte window begins mid-record, and raw Git errors can forge both
-      // newlines and timestamp-shaped prefixes. No text delimiter can prove a
-      // later physical line is a real daemon record, so omit the tail entirely.
-      return "";
-    } finally {
-      await fd.close();
-    }
-  } catch {
-    return undefined;
-  }
-}
-
 async function daemonLogTail(root: string): Promise<string> {
-  const paths = daemonLogPaths(root);
-  return (await readTailBytes(paths.primary, DAEMON_LOG_TAIL_BYTES)) ?? (await readTailBytes(paths.legacy, DAEMON_LOG_TAIL_BYTES)) ?? "";
+  return readMergedDaemonLogTail(root, DAEMON_LOG_TAIL_BYTES);
 }
 
 function pickMetrics(m: SyncMetrics): MetricsSection {

@@ -140,7 +140,7 @@ export async function getBlobToFile(ctx: RemoteContext, sha256: string, destPath
       if (attempt > 0) {
         // A recovered mismatch is a real field event (transport corrupted bytes and the
         // re-fetch healed it) — make it visible instead of silently succeeding.
-        process.stderr.write(`rbox: blob ${sha256.slice(0, 12)}… download integrity recovered after ${attempt} retr${attempt === 1 ? "y" : "ies"}\n`);
+        ctx.warningSink(`rbox: blob ${sha256.slice(0, 12)}… download integrity recovered after ${attempt} retr${attempt === 1 ? "y" : "ies"}`);
       }
       return;
     } catch (e) {

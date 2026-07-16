@@ -59,10 +59,10 @@ export async function classifyCacheHit(root: string, file: FileEntry): Promise<"
   }
 }
 
-export function isDeferrableChurn(error: unknown, relPath: string): boolean {
+export function isDeferrableChurn(error: unknown, relPath: string, warningSink: (line: string) => void = console.error): boolean {
   if (hasErrorCode(error, "ENOENT")) return true;
   if (!isSourceChangedError(error)) return false;
-  console.error(`rbox: ${relPath} changed during encryption — deferred`);
+  warningSink(`rbox: ${relPath} changed during encryption — deferred`);
   return true;
 }
 

@@ -34,12 +34,12 @@ export async function scanManifestForPush(root: string, cfg: WorkspaceConfig, de
   const report = deps.report ?? PhaseReport.disabled("push");
   const { cache, save } = await withCache(root, deps.cache);
   const { dircache, save: dircacheSave } = await withDircache(root, deps.dircache);
-  const state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg)));
+  const state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg), deps.warningSink));
   const scanStats = report.enabled ? deps.scanStats : undefined;
   const scanDeferred = new Set<string>();
-  const deferErrnos = makeDeferErrnoReporter();
+  const deferErrnos = deps.warningSink ? makeDeferErrnoReporter(deps.warningSink) : makeDeferErrnoReporter();
   const scanT0 = Date.now();
-  let local = await report.phase("scan", () => scanManifest(root, matcherForState(root, cfg, state, { purgeSafety: purgeIgnored }), cache, scanTick(deps), undefined, scanStats, scanDeferred, undefined, dircache, "pruned", deferErrnos.onErrno));
+  let local = await report.phase("scan", () => scanManifest(root, matcherForState(root, cfg, state, { purgeSafety: purgeIgnored }), cache, scanTick(deps), undefined, scanStats, scanDeferred, undefined, dircache, "pruned", deferErrnos.onErrno, deps.warningSink));
   deferErrnos.flush();
   const scanWallMs = Date.now() - scanT0;
   if (scanDeferred.size > 0) local = deferManifest(local, state.lastSyncedManifest, scanDeferred);
@@ -62,7 +62,7 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
   const report = deps.report ?? PhaseReport.disabled("pull");
   deps = withReportScanStats(deps, report);
   const api = deps.remote ?? apiFor(cfg);
-  const state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg)));
+  const state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg), deps.warningSink));
   const validatedMeta = validManifestMeta(state.manifestMeta);
   const fastPullEnabled = process.env.RBOX_MDE_FAST_PULL === "1";
   const fastFoldBase = fastPullEnabled && validatedMeta
@@ -97,7 +97,7 @@ export async function applyPulledManifest(
   const v = validateManifest(remote);
   if (!v.ok) throw new Error(`refusing to apply invalid remote manifest: ${v.error}`);
 
-  const state = input.state ?? await report.phase("state-load", () => loadState(root, syncStreamId(cfg)));
+  const state = input.state ?? await report.phase("state-load", () => loadState(root, syncStreamId(cfg), deps.warningSink));
   const { cache, save } = await withCache(root, deps.cache);
   const { dircache, save: dircacheSave } = await withDircache(root, deps.dircache);
   const matcher = matcherForState(root, cfg, state);
@@ -111,9 +111,9 @@ export async function applyPulledManifest(
   // deletion). Feeding base-carried entries into reconcile would instead let a
   // remote delete plan a disk delete against an unreadable path (design 108).
   const scanDeferred = new Set<string>();
-  const deferErrnos = makeDeferErrnoReporter();
+  const deferErrnos = deps.warningSink ? makeDeferErrnoReporter(deps.warningSink) : makeDeferErrnoReporter();
   const scanT0 = Date.now();
-  const local = await report.phase("scan", () => scanManifest(root, matcher, cache, scanTick(deps), undefined, scanStats, scanDeferred, undefined, dircache, "pruned", deferErrnos.onErrno));
+  const local = await report.phase("scan", () => scanManifest(root, matcher, cache, scanTick(deps), undefined, scanStats, scanDeferred, undefined, dircache, "pruned", deferErrnos.onErrno, deps.warningSink));
   deferErrnos.flush();
   const scanWallMs = Date.now() - scanT0;
   if (report.enabled) {
@@ -172,6 +172,7 @@ export async function applyPulledManifest(
     keyEpoch: input.keyEpoch ?? cfg.keyEpoch,
     trash: batch,
     onTypeFlip: deps.onTypeFlip,
+    warningSink: deps.warningSink,
     onProgress: deps.onProgress ? (done: number, total: number) => deps.onProgress!(done, total, "download") : undefined,
   };
   let actions: Action[] = [];
@@ -200,7 +201,7 @@ export async function applyPulledManifest(
   }
   {
     const lane = laneTimingSummary();
-    if (lane) process.stderr.write(`${lane}\n`);
+    if (lane) (deps.warningSink ?? ((line) => process.stderr.write(`${line}\n`)))(lane);
   }
   if (report.enabled) {
     const writeActions = actions.filter((a): a is Extract<Action, { kind: "write" }> => a.kind === "write");
@@ -242,6 +243,7 @@ export async function applyPulledManifest(
       onProgress: deps.onGitProgress,
       disableConfigLane: workspaceSyncMutexDegraded(deps.syncMutex),
       degradedMutex: workspaceSyncMutexDegraded(deps.syncMutex),
+      warningSink: deps.warningSink,
       sourceGlobalSeq: sequence,
     })
   );

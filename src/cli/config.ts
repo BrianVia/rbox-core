@@ -533,7 +533,7 @@ export async function saveConfig(root: string, cfg: WorkspaceConfig): Promise<vo
  * binding. A legacy state file with no stamp is adopted as-is (it predates the
  * stamp; every save since writes one).
  */
-export async function loadState(root: string, stream: string): Promise<SyncState> {
+export async function loadState(root: string, stream: string, warningSink: (line: string) => void = console.error): Promise<SyncState> {
   const fresh = freshState(stream);
   let raw: string;
   try {
@@ -550,7 +550,7 @@ export async function loadState(root: string, stream: string): Promise<SyncState
   const state = parseState(raw, statePath(root));
   if (state.stream === undefined) return { ...state, stream }; // pre-stamp legacy: adopt
   if (state.stream !== stream) {
-    console.error(
+    warningSink(
       `sync state at ${statePath(root)} belongs to stream ${state.stream}, ` +
         `not ${stream} — starting from a fresh baseline (files on disk untouched).`
     );
