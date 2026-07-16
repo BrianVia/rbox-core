@@ -22,6 +22,7 @@
 	let error = $state('');
 	let busy = $state(false);
 	let poller: ReturnType<typeof setInterval> | null = null;
+	const DOCS_URL = 'https://rbox.to/docs';
 
 	requireAuth(); // not signed in → /
 
@@ -90,6 +91,11 @@
 	title="Link your CLI account"
 	description="Connect the rbox account on your machines to this web login, so the dashboard manages your real devices, workspaces, and billing."
 />
+
+<p class="mb-4 text-sm text-muted-foreground">
+	This dashboard-link code only connects your web login; it is not a device confirmation code or pairing token.
+	<a href={DOCS_URL} class="ml-1 font-medium text-primary underline-offset-4 hover:underline">Read the rbox docs</a>
+</p>
 
 {#if error}
 	<Callout class="mb-4">{error}</Callout>

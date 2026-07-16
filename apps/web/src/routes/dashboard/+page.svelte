@@ -121,6 +121,7 @@
 	// what's shown.
 	const INSTALL_CMD = 'curl -fsSL https://rbox.to/install.sh | sh';
 	const SETUP_CMD = 'rbox setup';
+	const DOCS_URL = 'https://rbox.to/docs';
 
 	const plan = $derived((usage?.plan as Tier) ?? 'none');
 	const noPlan = $derived(plan === 'none');
@@ -251,6 +252,12 @@
 						</Button>
 				</Step>
 			</ol>
+			<a
+				href={DOCS_URL}
+				class="mt-5 inline-flex text-xs font-medium text-primary underline-offset-4 hover:underline"
+			>
+				Read the rbox docs
+			</a>
 		</div>
 	</details>
 

@@ -249,11 +249,7 @@ async function stepAccount(remote: string): Promise<StepAccountResult> {
   // Existing account.
   const method = await promptSelect<"pair" | "browser" | "approve">({
     message: "How do you want to authorize this machine?",
-    choices: [
-      { name: "Paste a pairing token", value: "pair", description: "from `rbox pair` — fewest steps, also enrolls encryption" },
-      { name: "Sign in via browser", value: "browser", description: "opens app.rbox.to to approve — no second terminal needed" },
-      { name: "Approve a code", value: "approve", description: "this machine shows a code you approve elsewhere" },
-    ],
+    choices: AUTHORIZATION_CHOICES,
   });
 
   if (authorizePath(method) === "pair-token") {
@@ -321,6 +317,16 @@ export function authorizePath(method: "pair" | "browser" | "approve"): "pair-tok
   return method === "pair" ? "pair-token" : "device-code";
 }
 
+export const PAIRING_TOKEN_SOURCE_DESCRIPTION =
+  "run `rbox pair` in a terminal on an already-set-up machine — never shown in the dashboard because it carries your encryption key";
+export const APPROVE_CODE_DESCRIPTION =
+  "this machine shows a confirmation code you approve elsewhere — different from a pairing token: it authorizes but does not carry encryption";
+export const AUTHORIZATION_CHOICES = [
+  { name: "Paste a pairing token", value: "pair", description: PAIRING_TOKEN_SOURCE_DESCRIPTION },
+  { name: "Sign in via browser", value: "browser", description: "opens app.rbox.to to approve — no second terminal needed" },
+  { name: "Approve a code", value: "approve", description: APPROVE_CODE_DESCRIPTION },
+] as const;
+
 /** Resolve enrollment for an authorized-but-unenrolled machine (device-code login
  *  authorizes but can't carry the key). Returns true once enrolled (flow continues),
  *  false if the user defers or provides no input. Offered both freshly after a
@@ -328,8 +334,8 @@ export function authorizePath(method: "pair" | "browser" | "approve"): "pair-tok
 type ExistingEnrollmentMethod = "pair" | "recover" | "later";
 type EnrollmentMethod = "genesis" | ExistingEnrollmentMethod;
 
-const EXISTING_ENROLLMENT_CHOICES = [
-  { name: "Paste a pairing token", value: "pair", description: "from `rbox pair` on an already-enrolled machine" },
+export const EXISTING_ENROLLMENT_CHOICES = [
+  { name: "Paste a pairing token", value: "pair", description: PAIRING_TOKEN_SOURCE_DESCRIPTION },
   { name: "Recover with my 24-word phrase", value: "recover" },
   { name: "I'll do this later", value: "later", description: "re-run `rbox setup` once you've paired or recovered" },
 ] as const;

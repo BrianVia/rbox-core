@@ -27,8 +27,13 @@ const MAX_LOGIN_BACKOFF_MS = 60_000;
 const NO_KIT: RecoveryKitOptions = { kit: false };
 export const EXISTING_ACCOUNT_ENROLLMENT_MESSAGE =
   "account already set up — enroll this machine with `rbox pair` from an enrolled machine, or run `rbox key recover`.";
-const DEVICE_CODE_ENROLLMENT_NOTE =
-  "note: device-code login authorized this machine, but encryption is not enrolled. Run `rbox pair` on an enrolled machine or `rbox key recover`.";
+export const WORKSPACE_SYNC_NEXT_STEP =
+  'Run `rbox setup` and choose "Sync an existing workspace" to get your existing folder syncing here.';
+const DEVICE_CODE_ENROLLMENT_NOTE = [
+  "note: device-code login authorized this machine, but encryption is not enrolled.",
+  "1. Run `rbox pair` on an enrolled machine or `rbox key recover`.",
+  `2. ${WORKSPACE_SYNC_NEXT_STEP}`,
+].join("\n");
 const GENESIS_COMMAND = "rbox key genesis --yes";
 const HEADLESS_GENESIS_COMMAND_NOTE = `note: no encryption keys yet — run \`${GENESIS_COMMAND}\` to set up this first machine.`;
 const ENCRYPTION_ENROLLED_MESSAGE = "encryption enrolled — this workspace will be end-to-end encrypted.";
@@ -141,6 +146,12 @@ interface DeviceCodePostApprovalDeps {
   writeStderr?: (text: string) => void;
 }
 
+export type DeviceCodePostApprovalResult = "existing-keys" | "headless-command" | "declined" | "enrolled" | "already-setup";
+
+export function deviceCodeLoginShouldPrintWorkspaceStep(result: DeviceCodePostApprovalResult): boolean {
+  return result !== "existing-keys" && result !== "already-setup";
+}
+
 function assertValidDeviceCodeApproval(p: { accountId?: string; deviceId?: string }): asserts p is { accountId: string; deviceId: string } {
   if (!p.accountId || !p.deviceId) throw new Error("malformed approval response from server — run `rbox login` again");
 }
@@ -150,7 +161,7 @@ export async function handleDeviceCodePostApprovalEncryption(
   creds: { accountId: string; deviceId: string },
   kitOpts: RecoveryKitOptions = NO_KIT,
   deps: DeviceCodePostApprovalDeps = {}
-): Promise<"existing-keys" | "headless-command" | "declined" | "enrolled" | "already-setup"> {
+): Promise<DeviceCodePostApprovalResult> {
   const writeStderr = deps.writeStderr ?? ((text: string) => process.stderr.write(text));
   const checkInteractive = deps.isInteractive ?? isInteractive;
   const confirm = deps.promptConfirm ?? promptConfirm;
@@ -202,6 +213,7 @@ export async function login(remoteUrl: string, bootstrapSecret?: string, bootstr
     } else {
       console.error(EXISTING_ACCOUNT_ENROLLMENT_MESSAGE);
     }
+    console.log(WORKSPACE_SYNC_NEXT_STEP);
     return;
   }
 
@@ -252,7 +264,14 @@ export async function login(remoteUrl: string, bootstrapSecret?: string, bootstr
         assertValidDeviceCodeApproval(p);
         await saveCredentials({ token: p.token, deviceId: p.deviceId, remoteUrl, accountId: p.accountId });
         console.log(`device authorized: ${p.deviceId}`);
-        await handleDeviceCodePostApprovalEncryption(new RboxApi(remoteUrl, p.token, "", ""), { accountId: p.accountId, deviceId: p.deviceId }, kitOpts);
+        const enrollment = await handleDeviceCodePostApprovalEncryption(
+          new RboxApi(remoteUrl, p.token, "", ""),
+          { accountId: p.accountId, deviceId: p.deviceId },
+          kitOpts
+        );
+        if (deviceCodeLoginShouldPrintWorkspaceStep(enrollment)) {
+          console.log(WORKSPACE_SYNC_NEXT_STEP);
+        }
         return;
       }
       if (p.status === "expired" || p.status === "not_found") throw new Error("authorization expired — run `rbox login` again");
@@ -382,9 +401,13 @@ export async function pairCreate(): Promise<void> {
 
 /** Redeem a split-secret pairing token → device credential + E2EE enrollment.
  *  The full token is read from a prompt/stdin (never argv) and never logged. */
+export function pairingRedemptionSuccessMessages(deviceId: string): readonly [string, string] {
+  return [`device authorized + encryption enrolled: ${deviceId}`, WORKSPACE_SYNC_NEXT_STEP];
+}
+
 export async function redeemPair(remoteUrl: string, pairToken: string, label?: string): Promise<void> {
   const { deviceId } = await enrollViaPairing(remoteUrl, pairToken.trim(), Date.now(), label);
-  console.log(`device authorized + encryption enrolled: ${deviceId}`);
+  for (const message of pairingRedemptionSuccessMessages(deviceId)) console.log(message);
 }
 
 interface PairingTokenInputDeps {

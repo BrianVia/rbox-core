@@ -4,11 +4,14 @@ import os from "node:os";
 import path from "node:path";
 import {
   handleDeviceCodePostApprovalEncryption,
+  deviceCodeLoginShouldPrintWorkspaceStep,
   login,
   logout,
+  pairingRedemptionSuccessMessages,
   readPairingTokenInteractive,
   recoverCmd,
   runGenesisEnrollment,
+  WORKSPACE_SYNC_NEXT_STEP,
 } from "./auth-cmd.js";
 import { accountProfilePath, flushAccountProfileWrites, scheduleAccountProfileWrite } from "./account-profile.js";
 import { saveCredentials } from "./credentials.js";
@@ -77,6 +80,13 @@ test("pairing token input drains stdin when non-interactive", async () => {
   });
   expect(token).toBe("stdin-token");
   expect(prompted).toBe(false);
+});
+
+test("pairing redemption success chains to the existing-workspace setup step", () => {
+  expect(pairingRedemptionSuccessMessages("dev_new")).toEqual([
+    "device authorized + encryption enrolled: dev_new",
+    WORKSPACE_SYNC_NEXT_STEP,
+  ]);
 });
 
 test("key recover requires login before reading the recovery phrase", async () => {
@@ -303,6 +313,81 @@ describe("device-code approval validation", () => {
   });
 });
 
+test("device-code login leaves the shared workspace step to the enrolled-elsewhere note", async () => {
+  installImmediateTimers();
+  const output: string[] = [];
+  const errors: string[] = [];
+  const priorWrite = process.stderr.write;
+  console.log = (...args: unknown[]) => void output.push(args.map(String).join(" "));
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    errors.push(String(chunk));
+    return true;
+  }) as typeof process.stderr.write;
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = String(input);
+    if (url.endsWith("/v1/auth/device/start")) {
+      return new Response(JSON.stringify({ deviceCode: "dc_success", userCode: "AAAA-BBBB", interval: 0, expiresIn: 60 }));
+    }
+    if (url.endsWith("/v1/auth/device/poll")) {
+      return new Response(JSON.stringify({ status: "approved", token: "tok", deviceId: "dev_success", accountId: "acct_success" }));
+    }
+    if (url.endsWith("/v1/keys/account")) return new Response(JSON.stringify(ACCOUNT_KEYS));
+    throw new Error(`unexpected fetch: ${url}`);
+  }) as typeof fetch;
+
+  try {
+    await login("https://api.test");
+  } finally {
+    process.stderr.write = priorWrite;
+  }
+
+  expect(output).toContain("device authorized: dev_success");
+  expect(output).not.toContain(WORKSPACE_SYNC_NEXT_STEP);
+  expect(errors.join("").match(new RegExp(WORKSPACE_SYNC_NEXT_STEP.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"))).toHaveLength(1);
+});
+
+test("device-code login assigns the shared workspace step to exactly one output owner", () => {
+  const results = [
+    "existing-keys",
+    "headless-command",
+    "declined",
+    "enrolled",
+    "already-setup",
+  ] as const;
+  expect(results.map((result) => [result, deviceCodeLoginShouldPrintWorkspaceStep(result)])).toEqual([
+    ["existing-keys", false],
+    ["headless-command", true],
+    ["declined", true],
+    ["enrolled", true],
+    ["already-setup", false],
+  ]);
+});
+
+test("bootstrap login success prints the shared workspace step", async () => {
+  const output: string[] = [];
+  const errors: string[] = [];
+  console.log = (...args: unknown[]) => void output.push(args.map(String).join(" "));
+  const priorError = console.error;
+  console.error = (...args: unknown[]) => void errors.push(args.map(String).join(" "));
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = String(input);
+    if (url.endsWith("/v1/auth/device/bootstrap")) {
+      return new Response(JSON.stringify({ token: "tok", deviceId: "dev_bootstrap", accountId: "acct_bootstrap" }));
+    }
+    if (url.endsWith("/v1/keys/account")) return new Response(JSON.stringify(ACCOUNT_KEYS));
+    throw new Error(`unexpected fetch: ${url}`);
+  }) as typeof fetch;
+
+  try {
+    await login("https://api.test", "bootstrap-secret");
+  } finally {
+    console.error = priorError;
+  }
+
+  expect(output.filter((line) => line === WORKSPACE_SYNC_NEXT_STEP)).toHaveLength(1);
+  expect(errors).toContain("account already set up — enroll this machine with `rbox pair` from an enrolled machine, or run `rbox key recover`.");
+});
+
 describe("device-code post-approval encryption handling", () => {
   test("existing keys prints the device-code pair/recover note", async () => {
     const api = new FakeGenesisApi([ACCOUNT_KEYS]);
@@ -319,6 +404,9 @@ describe("device-code post-approval encryption handling", () => {
     expect(err.join("")).toContain("device-code login authorized this machine");
     expect(err.join("")).toContain("`rbox pair`");
     expect(err.join("")).toContain("`rbox key recover`");
+    expect(err.join("")).toBe(
+      `note: device-code login authorized this machine, but encryption is not enrolled.\n1. Run \`rbox pair\` on an enrolled machine or \`rbox key recover\`.\n2. ${WORKSPACE_SYNC_NEXT_STEP}\n`
+    );
   });
 
   test("keyless non-TTY prints the explicit genesis command and mints nothing", async () => {
