@@ -23,7 +23,7 @@ import { logErr } from "./util.js";
  */
 
 export type SlackChannel = "business" | "alerts";
-export type SlackpipesEvent = "signup" | "subscription" | "payment_failed" | "churn";
+export type SlackpipesEvent = "signup" | "subscription" | "payment_failed" | "churn" | "fleet_alert";
 
 export const PING_TIMEOUT_MS = 5_000;
 export const PING_RETRY_DELAY_MS = 1_000;
@@ -50,7 +50,7 @@ function webhookFor(env: Env, channel: SlackChannel): string | undefined {
 }
 
 function channelFor(event: SlackpipesEvent): SlackChannel {
-  return event === "payment_failed" ? "alerts" : "business";
+  return event === "payment_failed" || event === "fleet_alert" ? "alerts" : "business";
 }
 
 type SendOutcome = { configured: false } | { configured: true; ok: true } | { configured: true; ok: false; error: unknown };

@@ -46,6 +46,7 @@ import { diagnosticsRoutes } from "./routes/diagnostics.js";
 import { syncRoutes } from "./routes/sync.js";
 import { runPackGc } from "./pack-gc.js";
 import { ingestSyncState, ingestTelemetry } from "./telemetry-ingest.js";
+import { evaluateFleetAlerts } from "./fleet-alerts.js";
 export { WorkspaceSync } from "./workspace-sync.js";
 
 export class CachedReleases extends WorkerEntrypoint<Env> {
@@ -138,6 +139,11 @@ export default {
         }
       }
       return;
+    }
+    try {
+      await evaluateFleetAlerts(env, event.scheduledTime);
+    } catch (e) {
+      logErr("scheduled_fleet_alerts_failed", e);
     }
     try {
       // Retention precedes Phase 1 (a just-pruned version's now-unreachable refs become

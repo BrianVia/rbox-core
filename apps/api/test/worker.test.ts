@@ -1853,14 +1853,22 @@ describe("worker integration (real DO + D1 + R2)", () => {
     await env.rbox_dev_db.batch([
       env.rbox_dev_db.prepare("INSERT INTO device_sync_state(device_id,workspace_id,project_id,binding_id,file_seq,repos_total,repos_deferred,oldest_deferral_age_ms,deferral_reasons,reported_at) VALUES (?, 'ws_a', 'root', 'aaaaaaaaaaaaaaaa', 1, 0, 0, NULL, '', 1)").bind(target),
       env.rbox_dev_db.prepare("INSERT INTO device_sync_state(device_id,workspace_id,project_id,binding_id,file_seq,repos_total,repos_deferred,oldest_deferral_age_ms,deferral_reasons,reported_at) VALUES (?, 'ws_b', 'root', 'bbbbbbbbbbbbbbbb', 1, 0, 0, NULL, '', 1)").bind(b.deviceId),
+      env.rbox_dev_db.prepare("INSERT INTO alert_state(condition,device_id,incident_started_at,last_notified_at) VALUES ('reporting_stopped',?,1,1)").bind(target),
+      env.rbox_dev_db.prepare("INSERT INTO alert_state(condition,device_id,incident_started_at,last_notified_at) VALUES ('reporting_stopped',?,1,1)").bind(b.deviceId),
     ]);
     expect((await revoke(a.token, b.deviceId)).status).toBe(404);
     expect(await env.rbox_dev_db.prepare("SELECT 1 FROM device_sync_state WHERE device_id = ?").bind(b.deviceId).first()).toBeTruthy();
     expect((await revoke(a.token, target)).status).toBe(200);
     expect(await env.rbox_dev_db.prepare("SELECT 1 FROM device_sync_state WHERE device_id = ?").bind(target).first()).toBeNull();
-    await env.rbox_dev_db.prepare("INSERT INTO device_sync_state(device_id,workspace_id,project_id,binding_id,file_seq,repos_total,repos_deferred,oldest_deferral_age_ms,deferral_reasons,reported_at) VALUES (?, 'ws_a', 'root', 'aaaaaaaaaaaaaaaa', 1, 0, 0, NULL, '', 1)").bind(target).run();
+    expect(await env.rbox_dev_db.prepare("SELECT 1 FROM alert_state WHERE device_id = ?").bind(target).first()).toBeNull();
+    expect(await env.rbox_dev_db.prepare("SELECT 1 FROM alert_state WHERE device_id = ?").bind(b.deviceId).first()).toBeTruthy();
+    await env.rbox_dev_db.batch([
+      env.rbox_dev_db.prepare("INSERT INTO device_sync_state(device_id,workspace_id,project_id,binding_id,file_seq,repos_total,repos_deferred,oldest_deferral_age_ms,deferral_reasons,reported_at) VALUES (?, 'ws_a', 'root', 'aaaaaaaaaaaaaaaa', 1, 0, 0, NULL, '', 1)").bind(target),
+      env.rbox_dev_db.prepare("INSERT INTO alert_state(condition,device_id,incident_started_at,last_notified_at) VALUES ('reporting_stopped',?,1,1)").bind(target),
+    ]);
     expect((await revoke(a.token, target)).status).toBe(200);
     expect(await env.rbox_dev_db.prepare("SELECT 1 FROM device_sync_state WHERE device_id = ?").bind(target).first()).toBeNull();
+    expect(await env.rbox_dev_db.prepare("SELECT 1 FROM alert_state WHERE device_id = ?").bind(target).first()).toBeNull();
   });
 
   // ── Design 22 §4.3: unlink ALSO kills the caller's live web session ───────

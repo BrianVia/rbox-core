@@ -9,6 +9,13 @@ export const errClass = (e: unknown): string => (e instanceof Error ? e.name : t
 /** Structured, metadata-safe error log. The ONLY way to log an error on a path that
  *  touches user metadata (workspace/project/commit/body/device binds): name the event
  *  + its error class, never the raw message/stack (privacy ban-list, design §5). */
+/** Split into runs of at most n — the SQLite bound-variable safety idiom for `IN (?,?,…)`. */
+export const chunked = <T>(xs: T[], n: number): T[][] => {
+  const out: T[][] = [];
+  for (let i = 0; i < xs.length; i += n) out.push(xs.slice(i, i + n));
+  return out;
+};
+
 export function logErr(event: string, e: unknown): void {
   console.error(JSON.stringify({ event, errorClass: errClass(e) }));
 }

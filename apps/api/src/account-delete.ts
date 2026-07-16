@@ -1,6 +1,6 @@
 import type { Env } from "./env.js";
 import { audit, type Principal } from "./authz.js";
-import { ctEqual, json, logErr } from "./util.js";
+import { ctEqual, json, logErr, chunked } from "./util.js";
 import { dbFor, dirDb } from "./db.js";
 import { purgeStripeForAccount } from "./stripe.js";
 import { deleteClerkUser } from "./clerk.js";
@@ -110,12 +110,6 @@ export async function purgeWorkspaceDO(env: Env, ws: string, proj: string): Prom
 }
 
 export const REAL_PURGE_DEPS: PurgeDeps = { purgeStripe: purgeStripeForAccount, deleteClerk: deleteClerkUser, purgeWorkspace: purgeWorkspaceDO, purgeUpload: purgeUploadR2, purgeDiagnostic: purgeDiagnosticR2 };
-
-export const chunked = <T>(xs: T[], n: number): T[][] => {
-  const out: T[][] = [];
-  for (let i = 0; i < xs.length; i += n) out.push(xs.slice(i, i + n));
-  return out;
-};
 
 // ── DELETE /v1/account (owner-only, confirmation-gated) ──────────────────────
 
@@ -363,6 +357,9 @@ async function finishD1(env: Env, accountId: string, clerkIds: string[], deviceI
     // these data-plane rows before the directory DELETE FROM devices below.
     ...chunked(deviceIds, IN_CHUNK).map((ids) =>
       data.prepare(`DELETE FROM device_sync_state WHERE device_id IN (${ids.map(() => "?").join(",")})`).bind(...ids),
+    ),
+    ...chunked(deviceIds, IN_CHUNK).map((ids) =>
+      data.prepare(`DELETE FROM alert_state WHERE device_id IN (${ids.map(() => "?").join(",")})`).bind(...ids),
     ),
     // directory plane:
     dir.prepare("DELETE FROM pairing_tokens WHERE account_id = ?").bind(a),
