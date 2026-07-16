@@ -7,7 +7,7 @@ import crypto from "node:crypto";
 import { promisify } from "node:util";
 import { hashBytes } from "../hash.js";
 import { fsyncDirectory } from "../fsutil.js";
-import { cleanGitEnv, clearIndexResolveUndo, git, moveFileAtomic, walkFiles, ZERO_OID, type RepoCtx } from "./shared.js";
+import { cleanGitEnv, clearIndexResolveUndo, git, moveFileAtomic, readRegularFileNoFollow, walkFiles, ZERO_OID, type RepoCtx } from "./shared.js";
 import { readOpState, pruneEmptyOpStateDirs } from "./refs.js";
 import { updateCheckoutJournal, type CheckoutJournal } from "./journal.js";
 
@@ -77,6 +77,8 @@ export type CommitCheckoutResult =
   | { status: "committed" }
   | { status: "defer"; reason: string; journalIntact?: true }
   | { status: "unsupported"; reason: string };
+
+export const ORIG_HEAD_CHANGED_AT_CHECKOUT_BOUNDARY = "ORIG_HEAD changed at checkout boundary";
 
 export type CheckoutCapabilityProbe = (gitVersion: string) => Promise<boolean>;
 export type CheckoutTransactionCapabilityStatus = "supported" | "git-missing" | "version-unavailable" | "probe-failed" | "unsupported";
@@ -451,21 +453,6 @@ async function journalLocksRemain(journal: CheckoutJournal | undefined): Promise
   return false;
 }
 
-async function readRegularFileNoFollow(abs: string): Promise<{ bytes: Buffer; token: OwnedGitLock } | undefined> {
-  let handle: fs.FileHandle | undefined;
-  try {
-    handle = await fs.open(abs, constants.O_RDONLY | constants.O_NOFOLLOW);
-    const stat = await handle.stat();
-    if (!stat.isFile()) throw new Error(`non-regular Git file: ${abs}`);
-    return { bytes: await handle.readFile(), token: { path: path.resolve(abs), dev: stat.dev, ino: stat.ino } };
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-    throw error;
-  } finally {
-    await handle?.close().catch(() => {});
-  }
-}
-
 async function acquireOrigHeadLock(ctx: RepoCtx, journalId: string): Promise<OwnedGitLock> {
   const lockPath = path.join(ctx.gitDir, "ORIG_HEAD.lock");
   const tmp = path.join(ctx.gitDir, `ORIG_HEAD.lock.tmp-${crypto.randomBytes(8).toString("hex")}`);
@@ -672,7 +659,7 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
       reservationTokens.length = 0;
       await releasePlannedOrigHeadLock();
       const reason = becameBusy ? "git became busy at checkout boundary"
-        : breadcrumbChanged ? "ORIG_HEAD changed at checkout boundary"
+        : breadcrumbChanged ? ORIG_HEAD_CHANGED_AT_CHECKOUT_BOUNDARY
         : "checkout boundary proof changed";
       return origHeadCleanupDurabilityPending || await journalLocksRemain(opts.journal?.value) ? { status: "defer", reason, journalIntact: true } : { status: "defer", reason };
     }

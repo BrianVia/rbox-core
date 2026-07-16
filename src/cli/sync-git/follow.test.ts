@@ -25,7 +25,8 @@ import { loadState, repoRecordsForState, saveState, type SyncState, type Workspa
 import type { SyncRemote } from "../remote.js";
 import { orderedRepoDeferralUpdates, saveStateSource } from "../sync-state.js";
 import { applyGitSections, withRevalidatedGitPartialApplies } from "./apply.js";
-import { checkoutJournalBinding, FollowCrashInjectedError, followDivergedRepo, origHeadWorktreeDiscriminator, recoverFollowJournal, type FollowCrashPoint } from "./follow.js";
+import { checkoutJournalBinding, FollowCrashInjectedError, followDivergedRepo, recoverFollowJournal, type FollowCrashPoint } from "./follow.js";
+import { boundedOrigHeadPreservationError, origHeadPreservationFailureLine, origHeadWorktreeDiscriminator } from "./orig-head.js";
 import { planGitSections } from "./plan.js";
 import { gitFingerprint, gitFingerprintRun } from "./fingerprint.js";
 import { fingerprintHitProbe, type GitDivergenceCache } from "./divergence-cache.js";
@@ -292,6 +293,17 @@ test("design 126 worktree discriminator is primary or a stable per-gitdir hash",
   expect(b).not.toBe(a);
 });
 
+test("design 126 preservation errors are single-line and bounded", () => {
+  const message = boundedOrigHeadPreservationError(new Error(`first\nsecond\u0085${"x".repeat(700)}`));
+  expect(message).not.toMatch(/[\r\n\t]/);
+  expect([...message].length).toBeLessThanOrEqual(512);
+  expect(message).toStartWith("first second ");
+  expect(message).toEndWith("…");
+  const line = origHeadPreservationFailureLine(`repo\nforged\u200b${"r".repeat(700)}`, new Error("denied\r\nnext"));
+  expect(line).not.toMatch(/[\p{Cc}\p{Cf}]/u);
+  expect([...line].length).toBeLessThanOrEqual(1100);
+});
+
 for (const rel of inProgressFiles) {
   test(`design 126 presence gate: equal live ${rel} vetoes breadcrumb adoption`, async () => {
     const { c3, state, incoming } = await breadcrumbBaseAndIncoming({ markerRel: rel });
@@ -363,7 +375,8 @@ test("design 126 preservation: malformed ORIG_HEAD is quarantined as capped raw 
 
 test("design 126 raw preservation fails closed on a symlinked quarantine repo directory", async () => {
   const { state, incoming } = await breadcrumbBaseAndIncoming();
-  await fs.writeFile(path.join(receiver, ".git", "ORIG_HEAD"), "malformed breadcrumb\n");
+  const malformed = "malformed breadcrumb\n";
+  await fs.writeFile(path.join(receiver, ".git", "ORIG_HEAD"), malformed);
   const repoHash = hashBytes(Buffer.from("repo")).slice(0, 16);
   const quarantineRoot = path.join(workspace, ".rbox", "git-quarantine");
   const outside = path.join(tmp, "outside-quarantine");
@@ -374,6 +387,10 @@ test("design 126 raw preservation fails closed on a symlinked quarantine repo di
   const result = await applyIncoming(state, incoming);
   expect(result.outcome.deferrals?.repo?.apply?.reason).toBe("local-operation");
   expect(await fs.readdir(outside)).toEqual([]);
+  expect(await fs.readFile(path.join(receiver, ".git", "ORIG_HEAD"), "utf8")).toBe(malformed);
+  const preservationFailures = result.logs.filter((line) => line.startsWith("git-sync: ORIG_HEAD preservation failed for repo: "));
+  expect(preservationFailures).toHaveLength(1);
+  expect(preservationFailures[0]).not.toMatch(/[\r\n]/);
   expect(result.logs.some((line) => line.startsWith("git-sync: adopted stale ORIG_HEAD"))).toBe(false);
 });
 
@@ -481,6 +498,22 @@ test("design 126 pipeline: boundary re-proof veto leaves no adoption or log", as
   };
   const result = await applyIncoming(state, incoming, oracle);
   expect(result.outcome.deferrals?.repo?.apply?.reason).toBe("local-edits");
+  expect(await fs.readFile(path.join(receiver, ".git", "ORIG_HEAD"), "utf8")).toBe(`${c3}\n`);
+  expect(await git(receiver, "for-each-ref", "--format=%(refname)", "refs/rbox-recovery/orig-head/primary")).toBe("");
+  expect(result.logs.some((line) => line.startsWith("git-sync: adopted stale ORIG_HEAD"))).toBe(false);
+});
+
+test("design 126 boundary mismatch first appearing after the initial proof is never adopted unpreserved", async () => {
+  const { c1, c3, state, incoming } = await breadcrumbBaseAndIncoming();
+  await fs.writeFile(path.join(receiver, ".git", "ORIG_HEAD"), `${c1}\n`);
+
+  const result = await applyIncoming(state, incoming, matchingOracle, {
+    crashAt: (point) => {
+      if (point === "after-index-lock") fsSync.writeFileSync(path.join(receiver, ".git", "ORIG_HEAD"), `${c3}\n`);
+    },
+  });
+
+  expect(result.outcome.deferrals?.repo?.apply?.reason).toBe("local-operation");
   expect(await fs.readFile(path.join(receiver, ".git", "ORIG_HEAD"), "utf8")).toBe(`${c3}\n`);
   expect(await git(receiver, "for-each-ref", "--format=%(refname)", "refs/rbox-recovery/orig-head/primary")).toBe("");
   expect(result.logs.some((line) => line.startsWith("git-sync: adopted stale ORIG_HEAD"))).toBe(false);

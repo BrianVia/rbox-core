@@ -67,6 +67,50 @@ export async function fsyncDirectory(dir: string): Promise<void> {
   }
 }
 
+/** Create a plain-directory chain without following a symlink at any existing
+ * component. Returns the directories created by this call for durability
+ * publication by {@link fsyncCreatedDirectoryAncestors}. */
+export async function ensureDirectoryChain(abs: string, description = "directory"): Promise<Set<string>> {
+  const missing: string[] = [];
+  let probe = path.resolve(abs);
+  for (;;) {
+    try {
+      const stat = await fs.lstat(probe);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`unsafe ${description}: ${probe}`);
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      missing.push(probe);
+      const parent = path.dirname(probe);
+      if (parent === probe) throw new Error(`${description} has no existing ancestor: ${abs}`);
+      probe = parent;
+    }
+  }
+  const created = new Set<string>();
+  for (const dir of missing.reverse()) {
+    try {
+      await fs.mkdir(dir, { mode: 0o700 });
+      created.add(dir);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      const stat = await fs.lstat(dir);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`unsafe ${description}: ${dir}`);
+    }
+  }
+  return created;
+}
+
+/** Publish each newly-created child entry bottom-up through the first ancestor
+ * that predated {@link ensureDirectoryChain}. */
+export async function fsyncCreatedDirectoryAncestors(dir: string, created: ReadonlySet<string>): Promise<void> {
+  let child = path.resolve(dir);
+  while (created.has(child)) {
+    const parent = path.dirname(child);
+    await fsyncDirectory(parent);
+    child = parent;
+  }
+}
+
 /** Refuse to operate on a path whose real parent escapes the workspace — e.g. a
  *  synced symlink `foo -> /etc` followed by a file entry `foo/passwd`. Static
  *  manifest validation can't catch this (it's runtime FS state), so this is the

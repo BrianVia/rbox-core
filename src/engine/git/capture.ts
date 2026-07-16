@@ -28,6 +28,7 @@ export class GitCaptureDeferredError extends Error {
 }
 
 const WORKTREE_AWARE_CAPTURE_REASON = "git >= 2.15 required for worktree-aware capture";
+const RBOX_INTERNAL_REFS_EXCLUDE = "--exclude=refs/rbox-*";
 const GITCAP_STALE_MS = 24 * 60 * 60 * 1000;
 const GITCAP_OWNER_PID = "owner.pid";
 let supportsSingleWorktreeCache: boolean | undefined;
@@ -244,12 +245,12 @@ export async function captureGitState(repoDir: string, store: BlobStore, kek: Bu
         : [...Object.keys(refs), ...pins.refs]; // current branch (if any) + pins; detached HEAD rides its pin
     const basisTips = [...new Set(opts.basis?.tips ?? [])].filter((tip) => /^[0-9a-f]{40}$/.test(tip)).sort();
     try {
-      await git(repoDir, ["bundle", "create", bundlePath, "--exclude=refs/rbox-*", ...bundleArgs, ...basisTips.map((tip) => `^${tip}`)]);
+      await git(repoDir, ["bundle", "create", bundlePath, RBOX_INTERNAL_REFS_EXCLUDE, ...bundleArgs, ...basisTips.map((tip) => `^${tip}`)]);
     } catch (e) {
       if (basisTips.length === 0) throw e;
       opts.onBasisFallback?.((e as Error)?.message ?? String(e));
       await fs.rm(bundlePath, { force: true }).catch(() => {});
-      await git(repoDir, ["bundle", "create", bundlePath, "--exclude=refs/rbox-*", ...bundleArgs]);
+      await git(repoDir, ["bundle", "create", bundlePath, RBOX_INTERNAL_REFS_EXCLUDE, ...bundleArgs]);
     }
 
     // 4. §28: ENCRYPT each staged artifact under the workspace KEK, upload the CIPHERTEXT by

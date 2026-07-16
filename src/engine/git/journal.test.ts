@@ -126,6 +126,21 @@ function makeJournal<T>(args: {
   };
 }
 
+async function writtenJournal<T>(intended: T): Promise<{
+  oldOid: string;
+  oldHead: string;
+  index: Buffer;
+  journal: CheckoutJournal<T>;
+  journalPath: string;
+}> {
+  const { oldOid } = await history();
+  const oldHead = await fs.readFile(path.join(gitDir, "HEAD"), "utf8");
+  const index = await fs.readFile(path.join(gitDir, "index"));
+  const journal = makeJournal({ oldOid, oldHead, expectedHead: oldHead, expectedRefs: { "refs/heads/main": oldOid }, expectedIndex: index, intended });
+  const journalPath = await writeCheckoutJournal(root, "repo", journal, { indexPath: path.join(gitDir, "index"), gitDir });
+  return { oldOid, oldHead, index, journal, journalPath };
+}
+
 test("intent recovery restores exact index, nested op-state, attached ref/HEAD, and wiped refs", async () => {
   const { oldOid, newOid } = await history();
   await runGit(repo, "tag", "pre-wipe", oldOid);
@@ -318,11 +333,7 @@ test("corrupt old-index copy defers before mutation and leaves the journal intac
 
 for (const exit of ["rollback", "published", "binding-mismatch", "corrupt"] as const) {
   test(`design 126 recovery removes an exactly-owned ORIG_HEAD.lock on the ${exit} exit`, async () => {
-    const { oldOid } = await history();
-    const oldHead = await fs.readFile(path.join(gitDir, "HEAD"), "utf8");
-    const index = await fs.readFile(path.join(gitDir, "index"));
-    const journal = makeJournal({ oldOid, oldHead, expectedHead: oldHead, expectedRefs: { "refs/heads/main": oldOid }, expectedIndex: index, intended: exit });
-    const journalPath = await writeCheckoutJournal(root, "repo", journal, { indexPath: path.join(gitDir, "index"), gitDir });
+    const { journal, journalPath } = await writtenJournal(exit);
     expect(await fs.readFile(path.join(journalPath, "journal.id"), "utf8")).toBe(journal.journalId);
     if (exit === "published") await markCheckoutJournalPublished(root, "repo");
     if (exit === "corrupt") await fs.writeFile(path.join(journalPath, "journal.json"), "{not json\n");
@@ -335,11 +346,7 @@ for (const exit of ["rollback", "published", "binding-mismatch", "corrupt"] as c
 }
 
 test("design 126 recovery never removes a foreign ORIG_HEAD.lock", async () => {
-  const { oldOid } = await history();
-  const oldHead = await fs.readFile(path.join(gitDir, "HEAD"), "utf8");
-  const index = await fs.readFile(path.join(gitDir, "index"));
-  const journal = makeJournal({ oldOid, oldHead, expectedHead: oldHead, expectedRefs: { "refs/heads/main": oldOid }, expectedIndex: index, intended: "foreign" });
-  await writeCheckoutJournal(root, "repo", journal, { indexPath: path.join(gitDir, "index"), gitDir });
+  const { journal } = await writtenJournal("foreign");
   await fs.writeFile(path.join(gitDir, "ORIG_HEAD.lock"), "foreign-owner");
 
   expect((await recoverJournal(root, "repo", binding)).status).toBe("rolled-back");
@@ -347,11 +354,7 @@ test("design 126 recovery never removes a foreign ORIG_HEAD.lock", async () => {
 });
 
 test("design 126 recovery retains pre-journalId checkout-journal compatibility", async () => {
-  const { oldOid } = await history();
-  const oldHead = await fs.readFile(path.join(gitDir, "HEAD"), "utf8");
-  const index = await fs.readFile(path.join(gitDir, "index"));
-  const journal = makeJournal({ oldOid, oldHead, expectedHead: oldHead, expectedRefs: { "refs/heads/main": oldOid }, expectedIndex: index, intended: "legacy" });
-  const journalPath = await writeCheckoutJournal(root, "repo", journal, { indexPath: path.join(gitDir, "index"), gitDir });
+  const { journalPath } = await writtenJournal("legacy");
   const legacy = JSON.parse(await fs.readFile(path.join(journalPath, "journal.json"), "utf8"));
   delete legacy.journalId;
   await fs.writeFile(path.join(journalPath, "journal.json"), `${JSON.stringify(legacy)}\n`);
@@ -360,29 +363,61 @@ test("design 126 recovery retains pre-journalId checkout-journal compatibility",
   expect((await recoverJournal(root, "repo", binding)).status).toBe("rolled-back");
 });
 
-for (const sidecarFault of ["missing", "mismatch"] as const) {
-  test(`design 126 recovery removes a JSON-owned lock but defers on a ${sidecarFault} sidecar`, async () => {
-    const { oldOid } = await history();
-    const oldHead = await fs.readFile(path.join(gitDir, "HEAD"), "utf8");
-    const index = await fs.readFile(path.join(gitDir, "index"));
-    const journal = makeJournal({ oldOid, oldHead, expectedHead: oldHead, expectedRefs: { "refs/heads/main": oldOid }, expectedIndex: index, intended: sidecarFault });
-    const journalPath = await writeCheckoutJournal(root, "repo", journal, { indexPath: path.join(gitDir, "index"), gitDir });
-    if (sidecarFault === "missing") await fs.rm(path.join(journalPath, "journal.id"));
-    else await fs.writeFile(path.join(journalPath, "journal.id"), `1700000000000-${"c".repeat(16)}`);
-    await fs.writeFile(path.join(gitDir, "ORIG_HEAD.lock"), journal.journalId);
+test("design 126 write crash after journal.id but before journal.json is not a permanent strand", async () => {
+  const { journal, journalPath } = await writtenJournal("sidecar-only");
+  await fs.rm(path.join(journalPath, "journal.json"));
+  await fs.writeFile(path.join(gitDir, "ORIG_HEAD.lock"), journal.journalId);
 
-    expect((await recoverJournal(root, "repo", binding)).status).toBe("defer");
-    await expect(fs.access(path.join(gitDir, "ORIG_HEAD.lock"))).rejects.toThrow();
-    expect(await fs.access(journalPath).then(() => true, () => false)).toBe(true);
+  expect(await recoverJournal(root, "repo", binding)).toEqual({ status: "none" });
+  await expect(fs.access(path.join(gitDir, "ORIG_HEAD.lock"))).rejects.toThrow();
+});
+
+test("design 126 clear crash after journal.id unlink keeps published JSON authoritative", async () => {
+  const intended = { crashWindow: "json-only" };
+  const { journal, journalPath } = await writtenJournal(intended);
+  await markCheckoutJournalPublished(root, "repo");
+  await fs.rm(path.join(journalPath, "journal.id"));
+  await fs.writeFile(path.join(gitDir, "ORIG_HEAD.lock"), journal.journalId);
+
+  expect(await recoverJournal(root, "repo", binding)).toEqual({
+    status: "keep",
+    intended,
+    incomingKey: "incoming-key-1",
+    journalPath,
   });
-}
+  await expect(fs.access(path.join(gitDir, "ORIG_HEAD.lock"))).rejects.toThrow();
+});
+
+test("design 126 missing sidecar does not strand parseable intent arbitration", async () => {
+  const { journal, journalPath } = await writtenJournal("missing");
+  await fs.rm(path.join(journalPath, "journal.id"));
+  await fs.writeFile(path.join(gitDir, "ORIG_HEAD.lock"), journal.journalId);
+
+  expect((await recoverJournal(root, "repo", binding)).status).toBe("rolled-back");
+  await expect(fs.access(path.join(gitDir, "ORIG_HEAD.lock"))).rejects.toThrow();
+});
+
+test("design 126 invalid sidecar does not override parseable JSON arbitration", async () => {
+  const { journal, journalPath } = await writtenJournal("invalid");
+  await fs.writeFile(path.join(journalPath, "journal.id"), "not-a-journal-id\n");
+  await fs.writeFile(path.join(gitDir, "ORIG_HEAD.lock"), journal.journalId);
+
+  expect((await recoverJournal(root, "repo", binding)).status).toBe("rolled-back");
+  await expect(fs.access(path.join(gitDir, "ORIG_HEAD.lock"))).rejects.toThrow();
+});
+
+test("design 126 two valid mismatched ownership ids remain fail-closed", async () => {
+  const { journal, journalPath } = await writtenJournal("mismatch");
+  await fs.writeFile(path.join(journalPath, "journal.id"), `1700000000000-${"c".repeat(16)}`);
+  await fs.writeFile(path.join(gitDir, "ORIG_HEAD.lock"), journal.journalId);
+
+  expect((await recoverJournal(root, "repo", binding)).status).toBe("defer");
+  await expect(fs.access(path.join(gitDir, "ORIG_HEAD.lock"))).rejects.toThrow();
+  expect(await fs.access(journalPath).then(() => true, () => false)).toBe(true);
+});
 
 test("design 126 sidecar mismatch never removes a lock matching only the foreign sidecar id", async () => {
-  const { oldOid } = await history();
-  const oldHead = await fs.readFile(path.join(gitDir, "HEAD"), "utf8");
-  const index = await fs.readFile(path.join(gitDir, "index"));
-  const journal = makeJournal({ oldOid, oldHead, expectedHead: oldHead, expectedRefs: { "refs/heads/main": oldOid }, expectedIndex: index, intended: "mismatch-foreign" });
-  const journalPath = await writeCheckoutJournal(root, "repo", journal, { indexPath: path.join(gitDir, "index"), gitDir });
+  const { journal, journalPath } = await writtenJournal("mismatch-foreign");
   const foreignSidecarId = `1700000000000-${"d".repeat(16)}`;
   await fs.writeFile(path.join(journalPath, "journal.id"), foreignSidecarId);
   await fs.writeFile(path.join(gitDir, "ORIG_HEAD.lock"), foreignSidecarId);

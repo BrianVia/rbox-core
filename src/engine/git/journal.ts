@@ -2,9 +2,9 @@ import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { hashBytes, hashFile } from "../hash.js";
-import { fsyncDirectory, writeFileAtomic } from "../fsutil.js";
+import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory, writeFileAtomic } from "../fsutil.js";
 import type { GitSection } from "../types.js";
-import { exists, git, ZERO_OID } from "./shared.js";
+import { exists, git, readRegularFileNoFollow, ZERO_OID } from "./shared.js";
 import { pruneEmptyOpStateDirs, readAllRefs } from "./refs.js";
 
 export interface CheckoutJournalBinding {
@@ -97,49 +97,10 @@ function safeRel(rel: string): boolean {
 
 async function durableAtomic(abs: string, data: string | Uint8Array): Promise<void> {
   const parent = path.dirname(abs);
-  const created = await ensureDirectoryChain(parent);
+  const created = await ensureDirectoryChain(parent, "journal directory");
   await writeFileAtomic(abs, data);
   await fsyncDirectory(parent);
   await fsyncCreatedDirectoryAncestors(parent, created);
-}
-
-async function ensureDirectoryChain(abs: string): Promise<Set<string>> {
-  const missing: string[] = [];
-  let probe = path.resolve(abs);
-  for (;;) {
-    try {
-      const stat = await fs.lstat(probe);
-      if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`unsafe journal directory: ${probe}`);
-      break;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      missing.push(probe);
-      const parent = path.dirname(probe);
-      if (parent === probe) throw new Error(`journal directory has no existing ancestor: ${abs}`);
-      probe = parent;
-    }
-  }
-  const created = new Set<string>();
-  for (const dir of missing.reverse()) {
-    try {
-      await fs.mkdir(dir, { mode: 0o700 });
-      created.add(dir);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      const stat = await fs.lstat(dir);
-      if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`unsafe journal directory: ${dir}`);
-    }
-  }
-  return created;
-}
-
-async function fsyncCreatedDirectoryAncestors(dir: string, created: ReadonlySet<string>): Promise<void> {
-  let child = path.resolve(dir);
-  while (created.has(child)) {
-    const parent = path.dirname(child);
-    await fsyncDirectory(parent);
-    child = parent;
-  }
 }
 
 /** r2 F1/F2: publish byte-exact rollback material before the intent marker. */
@@ -153,7 +114,7 @@ export async function writeCheckoutJournal<T>(
   if (!/^\d+-[0-9a-f]+$/.test(journal.journalId)) throw new Error("invalid checkout journal id");
   const dir = checkoutJournalDir(workspaceRoot, relPath);
   await fs.rm(dir, { recursive: true, force: true });
-  const journalDirectoriesCreated = await ensureDirectoryChain(path.join(dir, "old-op"));
+  const journalDirectoriesCreated = await ensureDirectoryChain(path.join(dir, "old-op"), "journal directory");
   if (journal.old.indexPresent) {
     const bytes = await fs.readFile(sources.indexPath);
     journal.old.indexHash = hashBytes(bytes);
@@ -233,18 +194,8 @@ function lockPathIsBound(abs: string, binding: CheckoutJournalBinding): boolean 
 }
 
 async function readLock(abs: string): Promise<{ bytes: Buffer; dev: number; ino: number } | undefined> {
-  try {
-    const handle = await fs.open(abs, "r");
-    try {
-      const stat = await handle.stat();
-      return { bytes: await handle.readFile(), dev: stat.dev, ino: stat.ino };
-    } finally {
-      await handle.close();
-    }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-    throw error;
-  }
+  const live = await readRegularFileNoFollow(abs);
+  return live ? { bytes: live.bytes, dev: live.token.dev, ino: live.token.ino } : undefined;
 }
 
 type JournalOwnershipIdRead = { status: "absent" | "invalid" } | { status: "valid"; journalId: string };
@@ -364,17 +315,17 @@ export async function recoverJournal<T = unknown>(
     // Corrupt JSON cannot name an owner. The independently durable sidecar is
     // the only exact cleanup authority available on this exit.
     if (ownership.status === "valid") await recoverOrigHeadLock(ownership.journalId, [binding]);
-    if ((error as NodeJS.ErrnoException).code === "ENOENT" && ownership.status === "absent") return { status: "none" };
+    // journal.id is published first, while checkout locking starts only after
+    // writeCheckoutJournal returns. A sidecar-only ENOENT is therefore a
+    // pre-lock write crash, not a journal that can require arbitration.
+    if ((error as NodeJS.ErrnoException).code === "ENOENT" && ownership.status !== "invalid") return { status: "none" };
     return { status: "defer", reason: "unreadable or corrupt journal", journalPath: dir };
   }
   const journalId = (journal as { journalId?: string }).journalId;
   if (journalId === undefined) {
     // Upgrade compatibility: pre-design-126 journals cannot own this new lock
     // and retain their established rollback/published recovery semantics.
-    if (ownership.status !== "absent") {
-      if (ownership.status === "valid") await recoverOrigHeadLock(ownership.journalId, [binding, journal.binding]);
-      return { status: "defer", reason: "unexpected ownership sidecar on legacy checkout journal", journalPath: dir };
-    }
+    if (ownership.status === "valid") await recoverOrigHeadLock(ownership.journalId, [binding, journal.binding]);
   } else {
     if (ownership.status === "valid" && ownership.journalId !== journalId) {
       // Parseable JSON identifies the recovered journal. A mismatched sidecar
@@ -383,9 +334,6 @@ export async function recoverJournal<T = unknown>(
       return { status: "defer", reason: "checkout journal ownership sidecar mismatch", journalPath: dir };
     }
     await recoverOrigHeadLock(journalId, [binding, journal.binding]);
-    if (ownership.status !== "valid") {
-      return { status: "defer", reason: "unreadable or corrupt checkout journal ownership sidecar", journalPath: dir };
-    }
   }
   if (!bindingsEqual(journal.binding, binding)) return { status: "binding-mismatch", quarantinePath: await retireJournal(workspaceRoot, relPath) };
   if (journal.phase === "published") return { status: "keep", intended: journal.intended, incomingKey: journal.incomingKey, journalPath: dir };
