@@ -12,6 +12,7 @@
 
 	let { data } = $props();
 	const code = $derived(data.code);
+	const DOCS_URL = 'https://rbox.to/docs';
 
 	// loading  → looking the code up
 	// confirm  → pending code; show the device asking + the Approve button
@@ -70,6 +71,10 @@
 	description="A device running `rbox login` is asking to sign in to your rbox account. Confirm it here."
 />
 
+<a href={DOCS_URL} class="mb-4 inline-flex text-xs font-medium text-primary underline-offset-4 hover:underline">
+	Read the rbox docs
+</a>
+
 {#if error && phase !== 'error'}
 	<Callout class="mb-4">{error}</Callout>
 {/if}
@@ -94,6 +99,10 @@
 			— it should match the one shown in your terminal.
 		</p>
 		<p class="mt-3 text-sm text-muted-foreground">
+			This confirmation code is different from a pairing token: it authorizes the device, while
+			a pairing token also carries encryption.
+		</p>
+		<p class="mt-2 text-sm text-muted-foreground">
 			Approving authorizes this device to reach your account. It does <em>not</em> unlock your
 			encrypted files — you'll still finish pairing on the device itself.
 		</p>

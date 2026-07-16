@@ -33,6 +33,7 @@
 	let loading = $state(true);
 	let revoking = $state<string | null>(null);
 	let confirmId = $state<string | null>(null);
+	const DOCS_URL = 'https://rbox.to/docs';
 
 	requireAuth(); // not signed in → /
 
@@ -125,6 +126,17 @@
 	title="Devices & workspaces"
 	description="The machines connected to your account and the workspaces they sync."
 />
+
+<div class="mb-6 rounded-lg border border-border bg-card px-4 py-3.5">
+	<p class="text-sm font-medium">Add another machine</p>
+	<p class="mt-1 text-sm text-muted-foreground">
+		In a terminal on an enrolled machine, run <code class="rounded bg-muted px-1 py-0.5">rbox pair</code>.
+		On the new machine, run <code class="rounded bg-muted px-1 py-0.5">rbox connect</code> and paste the token.
+	</p>
+	<a href={DOCS_URL} class="mt-2 inline-flex text-xs font-medium text-primary underline-offset-4 hover:underline">
+		Read the rbox docs
+	</a>
+</div>
 
 <!-- ── Devices ─────────────────────────────────────────────────────────────── -->
 <section class="mb-10">

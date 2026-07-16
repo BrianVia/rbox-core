@@ -10,6 +10,10 @@ import {
   startSyncActions,
   START_SYNC_CHOICES,
   SETUP_GITIGNORE_CHOICES,
+  PAIRING_TOKEN_SOURCE_DESCRIPTION,
+  APPROVE_CODE_DESCRIPTION,
+  AUTHORIZATION_CHOICES,
+  EXISTING_ENROLLMENT_CHOICES,
   runSetup,
   writeEnrolledSkipNotice,
 } from "./setup-cmd.js";
@@ -121,6 +125,25 @@ test("authorize routing: browser and approve are both the device-code grant; onl
   expect(authorizePath("browser")).toBe("device-code");
 });
 
+test("authorization choices distinguish pairing tokens from confirmation codes", () => {
+  expect(PAIRING_TOKEN_SOURCE_DESCRIPTION).toBe(
+    "run `rbox pair` in a terminal on an already-set-up machine — never shown in the dashboard because it carries your encryption key"
+  );
+  expect(APPROVE_CODE_DESCRIPTION).toBe(
+    "this machine shows a confirmation code you approve elsewhere — different from a pairing token: it authorizes but does not carry encryption"
+  );
+  expect(AUTHORIZATION_CHOICES).toEqual([
+    { name: "Paste a pairing token", value: "pair", description: PAIRING_TOKEN_SOURCE_DESCRIPTION },
+    { name: "Sign in via browser", value: "browser", description: "opens app.rbox.to to approve — no second terminal needed" },
+    { name: "Approve a code", value: "approve", description: APPROVE_CODE_DESCRIPTION },
+  ]);
+  expect(EXISTING_ENROLLMENT_CHOICES[0]).toEqual({
+    name: "Paste a pairing token",
+    value: "pair",
+    description: PAIRING_TOKEN_SOURCE_DESCRIPTION,
+  });
+});
+
 test("resolveEnrollment: keyless account renders the first-machine choice and runs genesis", async () => {
   let choices: Array<{ name: string; value: string; description?: string }> = [];
   let genesisCalls = 0;
@@ -173,7 +196,7 @@ test("resolveEnrollment: existing key world keeps the current three choices and 
 
   expect(ok).toBe(false);
   expect(choices).toEqual([
-    { name: "Paste a pairing token", value: "pair", description: "from `rbox pair` on an already-enrolled machine" },
+    { name: "Paste a pairing token", value: "pair", description: PAIRING_TOKEN_SOURCE_DESCRIPTION },
     { name: "Recover with my 24-word phrase", value: "recover" },
     { name: "I'll do this later", value: "later", description: "re-run `rbox setup` once you've paired or recovered" },
   ]);

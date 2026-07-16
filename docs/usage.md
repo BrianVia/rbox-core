@@ -240,6 +240,10 @@ today gated by the existing per-device `noDrift` field in `workspace.json`.
 
 ## 8. Devices & account
 
+Use a pairing token to authorize another machine and carry its encryption key, a
+device confirmation code to authorize a login without carrying encryption, or a
+dashboard account-link code to connect your web login for management and billing.
+
 ```bash
 rbox pair                      # mint a token to add another machine (~2 steps)
 echo <token> | rbox connect    # redeem it on the new machine
