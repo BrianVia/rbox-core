@@ -228,10 +228,14 @@ wtest("SCALE (design §41): monorepo-shaped tree — ready fast, memory flat, no
     for (let f = 0; f < 20; f++) fs.writeFileSync(path.join(dir, `i${f}.js`), "module.exports={};\n");
   }
 
+  Bun.gc(true);
+  const rssBefore = process.memoryUsage.rss();
   const { settled, readyMs } = await watch(root);
 
   expect(readyMs).toBeLessThan(10_000); // chokidar took ~330 s on the real corpus
-  expect(process.memoryUsage.rss()).toBeLessThan(300 * 1024 * 1024); // vs ~11 GB
+  // Delta, not absolute: the guard is "memory flat across the watch" (vs chokidar's ~11 GB
+  // on the real corpus). An absolute whole-process bound is suite-order-fragile.
+  expect(process.memoryUsage.rss() - rssBefore).toBeLessThan(300 * 1024 * 1024);
 
   // A create DEEP under an existing node_modules must produce ZERO events — the native
   // `**/node_modules/**` subtree prune keeps children off the JS hot path (finding 3).
