@@ -29,6 +29,7 @@ import { assertSyncMutex, workspaceSyncMutexDegraded } from "../sync-mutex.js";
 import { changedSidecarRepoKeys, observedRepoKeys, orderedDeferralUpdates, saveStateSource, type GitDeferralUpdates, type OrderedGitDeferralUpdates } from "../sync-state.js";
 import { beginFirstPublishTiming, finishFirstPublishStats, firstPublishMeasurementLive, firstPublishMeasurementToken, firstPublishTiming, formatFirstPublishStats } from "../upload-lane-timing.js";
 import { type SyncDeps, withReportScanStats, withCache, withDircache, refreshWriteContext } from "./deps.js";
+import { withPushLaneAccumulator } from "../telemetry/lane-accumulator.js";
 import { formatCommitTimings, formatScanStats, scanDetailsOf } from "./format.js";
 import { apiFor, MAX_ATTEMPTS, NO_GIT_FORCE, pushMassDeleteTrips, makeDeferErrnoReporter, defaultBackoff, filesFirstFlagEnabled, matcherForState, plaintextBytesOf, fileCountOf, scanTick } from "./policy.js";
 import { pull, scanManifestForPush } from "./pull.js";
@@ -60,7 +61,8 @@ export async function push(
   const matcher = matcherForState(root, cfg, state, { purgeSafety: purgeIgnored });
   const scanStats = report.enabled ? deps.scanStats : undefined;
   const scanDeferred = new Set<string>();
-  const deferErrnos = deps.warningSink ? makeDeferErrnoReporter(deps.warningSink) : makeDeferErrnoReporter();
+  const scanFault = () => deps.telemetry?.record({ kind: "safety_event", eventType: "scan_fault", count: 1 });
+  const deferErrnos = deps.warningSink ? makeDeferErrnoReporter(deps.warningSink, scanFault) : makeDeferErrnoReporter(undefined, scanFault);
   const scanT0 = Date.now();
   let local = await report.phase("scan", () => scanManifest(root, matcher, cache, scanTick(deps), undefined, scanStats, scanDeferred, undefined, dircache, "pruned", deferErrnos.onErrno, deps.warningSink));
   deferErrnos.flush();
@@ -188,6 +190,19 @@ export interface PushManifestOptions {
 }
 
 export async function pushManifest(
+  root: string,
+  cfg: WorkspaceConfig,
+  local: Manifest,
+  deps: SyncDeps = {},
+  options: PushManifestOptions = {}
+): Promise<PushResult> {
+  return withPushLaneAccumulator(
+    () => pushManifestInner(root, cfg, local, deps, options),
+    (samples) => { for (const sample of samples) { try { deps.telemetry?.record(sample); } catch {} } },
+  );
+}
+
+async function pushManifestInner(
   root: string,
   cfg: WorkspaceConfig,
   local: Manifest,
@@ -523,6 +538,7 @@ async function runPushAttempt(
   // daemon never consents, so a runaway wipe halts background push instead of publishing.
   const pushDeletes = filesDiff.deleted.length;
   if (!deps.allowMassDeletePush && pushMassDeleteTrips(pushDeletes, appliedBase.files.length)) {
+    try { deps.telemetry?.record({ kind: "safety_event", eventType: "mass_delete_breaker", count: 1 }); } catch {}
     throw new Error(
       `push would delete ${pushDeletes} of ${appliedBase.files.length} tracked files — refusing (mass-delete guard). ` +
         `If this deletion is intentional, run \`${deps.massDeleteHint ?? "rbox push --allow-mass-delete"}\` ` +
@@ -669,7 +685,18 @@ async function runPushAttempt(
     // success KPI, and a retry never double-appends. finishFirstPublishStats disables
     // the singleton (even when it returns no stats), so the finally below no-ops here.
     const firstPublish = finishFirstPublishStats();
-    if (firstPublish) report.recordDetails("upload", { firstPublish }, formatFirstPublishStats(firstPublish));
+    if (firstPublish) {
+      report.recordDetails("upload", { firstPublish }, formatFirstPublishStats(firstPublish));
+      try {
+        deps.telemetry?.record({
+          kind: "first_publish",
+          timeToFilesSyncedMs: firstPublish.timeToFilesSyncedMs,
+          pushWallMs: report.toJSON().wallMs,
+          fileCount: fileCountOf(committed),
+          uniqueBlobs: report.blobs,
+        });
+      } catch {}
+    }
 
     if (deferred.size > 0) reportDeferred(deferred, deps.warningSink);
     return { done: true, result: { sequence: res.sequence!, manifest: committed, deferred: [...deferred], retryLater: [...retryLater], committed: true, ...(gitPlan.filesFirstDeferred ? { gitDeferred: true } : {}) } };

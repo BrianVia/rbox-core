@@ -34,12 +34,16 @@ export function pushMassDeleteTrips(
   return deletes >= min && deletes * 100 >= pct * baseCount;
 }
 
-export function makeDeferErrnoReporter(sink: (line: string) => void = (l) => console.error(`rbox: ${l}`)): { onErrno: (code: string) => void; flush: () => void } {
+export function makeDeferErrnoReporter(
+  sink: (line: string) => void = (l) => console.error(`rbox: ${l}`),
+  onFault?: () => void,
+): { onErrno: (code: string) => void; flush: () => void } {
   const counts = new Map<string, number>();
   return {
     onErrno: (code) => counts.set(code, (counts.get(code) ?? 0) + 1),
     flush: () => {
       if (counts.size === 0) return;
+      try { onFault?.(); } catch { /* observability cannot fail a scan */ }
       const total = [...counts.values()].reduce((sum, count) => sum + count, 0);
       const tally = [...counts].sort(([a], [b]) => a.localeCompare(b)).map(([code, count]) => `${code}×${count}`).join(", ");
       const body = `scan deferred ${total} file(s) on IO fault (${tally})`;

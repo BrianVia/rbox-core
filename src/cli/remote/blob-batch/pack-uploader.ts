@@ -12,6 +12,7 @@ import { BlobRetryLaterError, isRetryLater } from "../errors.js";
 import { transferTimeoutMs } from "../resilient.js";
 import { fileStream } from "../stream.js";
 import { LANE_TIMING, recordPackBuilt, recordPackFallback, recordPackSent, uploadLaneTiming, type PackFallbackReason } from "../../upload-lane-timing.js";
+import { recordLaneSettlement } from "../../telemetry/lane-accumulator.js";
 import { PACK_FILL_ABSOLUTE_MS, PACK_FILL_QUIET_MS, packUploadConfig, type PackConfig } from "./config.js";
 import { disablePackUploadForProcess, onPackUploadDisabled, packUploadDisabled, type UploadSlotArbiter } from "./gate.js";
 import { buildPack, type BuiltPack } from "./packer.js";
@@ -254,6 +255,7 @@ export class BlobPackUploader {
       const pack = built;
       const packId = randomBytes(16).toString("hex");
       const uploadT0 = performance.now();
+      let uploadMs = 0;
       let res: Response;
       try {
         res = await this.ctx.fetch(`${this.ctx.baseUrl}/v1/blob-pack/put`, () => ({
@@ -273,7 +275,7 @@ export class BlobPackUploader {
           signal: controller.signal,
         });
       } finally {
-        const uploadMs = performance.now() - uploadT0;
+        uploadMs = performance.now() - uploadT0;
         recordPackSent(uploadMs);
         const uploadShareMs = uploadMs / Math.max(1, groups.length);
         for (const group of groups) group.uploadMs = uploadShareMs;
@@ -303,6 +305,7 @@ export class BlobPackUploader {
       const bySha = new Map(parsed.map((record) => [record.sha256, record]));
       const hasMissingResult = groups.some((group) => group.owner === "pack" && !bySha.has(group.sha));
       if (hasMissingResult) recordPackFallback("parse_error");
+      else recordLaneSettlement("pack", pack.totalBytes, uploadMs);
       for (const group of groups) {
         const result = bySha.get(group.sha);
         if (!result) this.transferGroup(group);

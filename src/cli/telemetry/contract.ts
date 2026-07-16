@@ -9,7 +9,7 @@ export interface NumericDomain {
 const MS_DOMAIN = { min: 0, max: 604_800_000, integer: true } as const;
 const COUNT_DOMAIN = { min: 0, max: 10_000_000, integer: true } as const;
 export const TRANSPORTS = ["batch", "pack", "single"] as const;
-export type TelemetryTransport = (typeof TRANSPORTS)[number];
+export type LaneTransport = (typeof TRANSPORTS)[number];
 export const FILL_VERSIONS = ["v1", "v2"] as const;
 export type FillVersion = (typeof FILL_VERSIONS)[number];
 export const SAFETY_EVENT_TYPES = ["mass_delete_breaker", "scan_fault"] as const;
@@ -85,7 +85,7 @@ export const BINDING_ID_RE = /^[0-9a-f]{16}$/;
 
 export interface PropagationSample { kind: "propagation"; deliveryToApplyMs: number }
 export interface FirstPublishSample { kind: "first_publish"; timeToFilesSyncedMs: number; pushWallMs: number; fileCount: number; uniqueBlobs: number }
-export interface UploadLaneSample { kind: "upload_lane"; transport: TelemetryTransport; bytes: number; uploadMs: number; opCount: number; fillVersion: FillVersion }
+export interface UploadLaneSample { kind: "upload_lane"; transport: LaneTransport; bytes: number; uploadMs: number; opCount: number; fillVersion: FillVersion }
 export interface CapabilitySample { kind: "capability"; workerExecutions: number }
 export interface SafetyEventSample { kind: "safety_event"; eventType: SafetyEventType; count: number }
 export type TelemetrySample = PropagationSample | FirstPublishSample | UploadLaneSample | CapabilitySample | SafetyEventSample;

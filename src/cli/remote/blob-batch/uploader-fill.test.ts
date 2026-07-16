@@ -9,6 +9,7 @@ import { FILL_ABSOLUTE_MS, FILL_QUIET_MS } from "./config.js";
 import { resetBatchBlobStateForTests } from "./gate.js";
 import { setUploaderClockForTests } from "./uploader.js";
 import { BATCH_FRAME_HEADER_BYTES, BATCH_STATUS_BIT } from "./wire.js";
+import { withPushLaneAccumulator } from "../../telemetry/lane-accumulator.js";
 
 const ENV_KEYS = [
   "RBOX_BATCH_FILL", "RBOX_BATCH_RECORDS", "RBOX_UPLOAD_SLOTS",
@@ -104,6 +105,15 @@ afterEach(async () => {
 });
 
 describe("BlobBatchUploader fill policy", () => {
+  test("telemetry counts a successful batch HTTP settlement once", async () => {
+    process.env.RBOX_BATCH_RECORDS = "1";
+    let samples: unknown[] = [];
+    await withPushLaneAccumulator(async () => uploadWave(api(), await files(1, "telemetry", 40)), (value) => { samples = value; });
+    expect(samples).toHaveLength(1);
+    expect(samples[0]).toMatchObject({ kind: "upload_lane", transport: "batch", opCount: 1 });
+    expect((samples[0] as { bytes: number }).bytes).toBeGreaterThan(40);
+  });
+
   test("v1 classifies full, fixed-timer, idle-tail, and byte-full dispatches", async () => {
     process.env.RBOX_BATCH_FILL = "v1"; // kill switch: this test exercises the legacy policy
     process.env.RBOX_UPLOAD_SLOTS = "1";

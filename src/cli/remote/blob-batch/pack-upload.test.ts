@@ -19,6 +19,7 @@ import { UploadSlotArbiter, onPackUploadDisabled, packUploadDisabled, resetBatch
 import { BlobPackUploader } from "./pack-uploader.js";
 import { buildPack } from "./packer.js";
 import { BlobBatchUploader } from "./uploader.js";
+import { withPushLaneAccumulator } from "../../telemetry/lane-accumulator.js";
 
 const ENV_KEYS = [
   "RBOX_BLOB_PACK", "RBOX_PACK_STREAMS", "RBOX_PACK_CUTOFF_BYTES",
@@ -73,6 +74,20 @@ afterEach(async () => {
 });
 
 describe("client pack writer", () => {
+  test("telemetry counts a successful pack HTTP settlement once", async () => {
+    enablePacks();
+    process.env.RBOX_PACK_TARGET_BYTES = String(64 * 1024);
+    const uploader = makeUploader();
+    const members = await makeFiles(16, 4096, "telemetry-pack");
+    let samples: unknown[] = [];
+    await withPushLaneAccumulator(
+      async () => { await Promise.all(members.map((m) => uploader.putFile(m.sha, m.path, m.size, tmpDir))); },
+      (value) => { samples = value; },
+    );
+    expect(samples).toHaveLength(1);
+    expect(samples[0]).toMatchObject({ kind: "upload_lane", transport: "pack", opCount: 1 });
+  });
+
   test("is default-off and preserves ordinary batch dispatch", async () => {
     process.env.RBOX_BATCH_RECORDS = "1";
     const uploader = makeUploader();
