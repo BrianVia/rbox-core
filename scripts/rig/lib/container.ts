@@ -280,14 +280,10 @@ export async function assessRuntimeResourcePolicy(image: string): Promise<void> 
 
 export async function runDockerDoctorProbe(repoRoot: string): Promise<RunResult> {
   if (backend().name !== "docker") throw new Error("Docker probe requested for Apple backend");
-  const name = `rig-doctor-${process.pid}`;
-  try {
-    const created = await run(["create", "--name", name, "--label", "rig=1", "--network", "bridge", "--mount", serializeMount({ source: repoRoot, target: "/checkout", readonly: true }, "docker"), NAMES.image, "sh", "-c", "test -r /checkout/package.json && getent hosts example.com >/dev/null"], { allowFail: true, timeoutMs: 30_000 });
-    if (created.exitCode !== 0) return created;
-    return run(["start", "--attach", name], { allowFail: true, timeoutMs: 30_000 });
-  } finally {
-    await run(["rm", "--force", name], { allowFail: true, timeoutMs: 10_000 });
-  }
+  // Anonymous single-shot `run --rm`: no name to collide with a stale probe container
+  // (a named create/start/rm triplet raced the daemon's auto-remove in the field), and
+  // the daemon owns cleanup even if we time out.
+  return run(["run", "--rm", "--label", "rig=1", "--network", "bridge", "--mount", serializeMount({ source: repoRoot, target: "/checkout", readonly: true }, "docker"), NAMES.image, "sh", "-c", "test -r /checkout/package.json && getent hosts example.com >/dev/null"], { allowFail: true, timeoutMs: 30_000 });
 }
 
 const appleBackend: RunnerBackend = {
