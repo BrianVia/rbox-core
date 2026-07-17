@@ -51,12 +51,14 @@ const HEAVY_WEIGHTS: Record<string, number> = {
   "src/engine/e2ee/e2ee-e2e.test.ts": 1.5,
 };
 
-const SPLIT_FILES: Record<string, { parts: number; weight: number; partWeights?: number[] }> = {
+const SPLIT_FILES: Record<string, { parts: number; weight: number; partWeights?: number[]; maxPartsPerShard?: number }> = {
   // Measured on main CI: git-sync is ~36s and git-nested is ~3.7s as single files,
   // so a file-only partition cannot hit the <=30s target. Split by test names
   // discovered from the source at runtime; the guard verifies every discovered
   // test name in these files is covered exactly once.
-  "src/cli/sync-git/git-sync.test.ts": { parts: 12, weight: 36.4, partWeights: [3.1, 4.2, 2.1, 4.1, 2.6, 4, 3.6, 1.9, 3.2, 3, 1.7, 2.9] },
+  // Packing four buckets into one Bun process can exhaust this suite's shared
+  // hook budget, so keep the measured weights and cap each shard at three.
+  "src/cli/sync-git/git-sync.test.ts": { parts: 12, weight: 36.4, partWeights: [3.1, 4.2, 2.1, 4.1, 2.6, 4, 3.6, 1.9, 3.2, 3, 1.7, 2.9], maxPartsPerShard: 3 },
   "src/engine/git-nested.test.ts": { parts: 4, weight: 3.7, partWeights: [1, 0.7, 1.1, 0.9] },
 };
 const DEFAULT_WEIGHT = 0.5;
@@ -165,11 +167,15 @@ function partition(units: TestUnit[], shardCount: number): Shard[] {
     .sort((a, b) => b.unit.weight - a.unit.weight || a.hash - b.hash || a.unit.label.localeCompare(b.unit.label));
 
   for (const entry of ordered) {
-    let target = 0;
-    for (let i = 1; i < shards.length; i++) {
+    const split = entry.unit.files.length === 1 ? SPLIT_FILES[entry.unit.files[0]!] : undefined;
+    const canAdd = (shard: Shard) => !split?.maxPartsPerShard
+      || shard.units.filter((unit) => unit.files[0] === entry.unit.files[0]).length < split.maxPartsPerShard;
+    let target = shards.findIndex(canAdd);
+    if (target < 0) throw new Error(`cannot place ${entry.unit.label}: maxPartsPerShard is too small`);
+    for (let i = target + 1; i < shards.length; i++) {
       const shard = shards[i]!;
       const best = shards[target]!;
-      if (shard.weight < best.weight || (shard.weight === best.weight && i < target)) {
+      if (canAdd(shard) && (shard.weight < best.weight || (shard.weight === best.weight && i < target))) {
         target = i;
       }
     }
