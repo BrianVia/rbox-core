@@ -2,8 +2,9 @@ import { afterEach, describe, expect, test } from "bun:test";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import {
-  assertDevRemote, assertMachineHome, assertNoAncestorWorkspace, childFailure, DEV_API, envPrefix, isolatedEnv,
-  desiredRootsHost, isCanonicalChild, machineLabel, normalizedBootstrapEnv, parseFreshArgs,
+  assertDevRemote, assertMachineHome, assertNoAncestorWorkspace, childFailure, containerBootstrapLoginCommand,
+  createWorkspaceFixture, DEV_API, envPrefix, hostBootstrapLoginArgs, isolatedEnv, listWorkspaceIds,
+  desiredRootsHost, isCanonicalChild, machineLabel, normalizedBootstrapEnv, parseFreshArgs, storedWorkspaceCredentials,
   rboxSpawnOptions, readRegularFile, safeId, UX_ROOT, withFailureCleanup,
 } from "./fresh-machine.js";
 
@@ -12,11 +13,13 @@ afterEach(async () => { await Promise.all(cleanup.splice(0).map((p) => fsp.rm(p,
 
 describe("fresh-machine argument parsing", () => {
   test("parses create, destroy, and list", () => {
-    expect(parseFreshArgs(["create", "--name", "a", "--enrolled", "--run-id", "walk_1"])).toEqual({ command: "create", name: "a", enrolled: true, runId: "walk_1", host: false });
+    expect(parseFreshArgs(["create", "--name", "a", "--enrolled", "--run-id", "walk_1"])).toEqual({ command: "create", name: "a", enrolled: true, plan: "solo", runId: "walk_1", host: false });
     expect(parseFreshArgs(["destroy", "--run-id", "walk", "--name", "a"])).toEqual({ command: "destroy", runId: "walk", name: "a", host: false });
     expect(parseFreshArgs(["list"])).toEqual({ command: "list", host: false });
-    expect(parseFreshArgs(["create", "--name", "a", "--host"])).toMatchObject({ command: "create", host: true });
+    expect(parseFreshArgs(["create", "--name", "a", "--host"])).toMatchObject({ command: "create", enrolled: false, plan: "none", host: true });
     expect(parseFreshArgs(["list", "--host"])).toEqual({ command: "list", host: true });
+    expect(parseFreshArgs(["workspaces", "--run-id", "walk", "--name", "a"])).toEqual({ command: "workspaces", runId: "walk", name: "a", host: false });
+    expect(parseFreshArgs(["workspaces-create", "--host", "--run-id", "walk", "--name", "a", "--label", "Never pushed"])).toEqual({ command: "workspaces-create", runId: "walk", name: "a", label: "Never pushed", host: true });
   });
 
   test.each([
@@ -26,7 +29,32 @@ describe("fresh-machine argument parsing", () => {
     [["create", "--wat"], "unknown option"],
     [["destroy", "--name", "a"], "requires --run-id"],
     [["list", "--name", "a"], "unknown option"],
+    [["create", "--name", "a", "--plan", "solo"], "requires --enrolled"],
+    [["create", "--name", "a", "--enrolled", "--plan", "team"], "solo, pro, or none"],
+    [["workspaces", "--run-id", "walk"], "requires --name"],
+    [["workspaces-create", "--run-id", "walk", "--name", "a"], "requires --label"],
   ] as const)("rejects invalid argv %#", (argv, message) => expect(() => parseFreshArgs([...argv])).toThrow(message));
+});
+
+test("enrolled plan matrix is identical on host and container command paths", () => {
+  for (const host of [false, true]) {
+    const target = host ? ["--host"] : [];
+    expect(parseFreshArgs(["create", "--name", "a", "--enrolled", ...target])).toMatchObject({ enrolled: true, plan: "solo", host });
+    expect(parseFreshArgs(["create", "--name", "a", "--enrolled", "--plan", "solo", ...target])).toMatchObject({ plan: "solo", host });
+    expect(parseFreshArgs(["create", "--name", "a", "--enrolled", "--plan", "pro", ...target])).toMatchObject({ plan: "pro", host });
+    expect(parseFreshArgs(["create", "--name", "a", "--enrolled", "--plan", "none", ...target])).toMatchObject({ plan: "none", host });
+    expect(() => parseFreshArgs(["create", "--name", "a", "--plan", "none", ...target])).toThrow("requires --enrolled");
+  }
+
+  expect(hostBootstrapLoginArgs("secret", "ux-walk-a", "solo")).toEqual([
+    "login", "--bootstrap", "secret", "--label", "ux-walk-a", "--remote", DEV_API, "--plan", "solo",
+  ]);
+  expect(hostBootstrapLoginArgs("secret", "ux-walk-a", "none")).not.toContain("--plan");
+  expect(containerBootstrapLoginCommand("ux-walk-a", "pro")).toEqual([
+    "sh", "-c", 'exec rbox login --bootstrap "$RBOX_UX_BOOTSTRAP" "$@"', "ux-login",
+    "--label", "ux-walk-a", "--remote", DEV_API, "--plan", "pro",
+  ]);
+  expect(containerBootstrapLoginCommand("ux-walk-a", "none")).not.toContain("--plan");
 });
 
 test("safe ids produce attributed labels and reject path syntax", () => {
@@ -39,6 +67,44 @@ test("only the exact DEV API is accepted", () => {
   for (const remote of ["https://api.rbox.to", "https://rbox-prod-api.brian-via.workers.dev", `${DEV_API}/`, "http://localhost:8787"]) {
     expect(() => assertDevRemote(remote)).toThrow("refusing non-DEV");
   }
+});
+
+test("workspace helpers authenticate, paginate, and use stable result contracts", async () => {
+  const requests: Array<{ url: string; init?: RequestInit }> = [];
+  const pages = [
+    { workspaces: [{ workspaceId: "ws_one" }], nextCursor: "next/page" },
+    { workspaces: [{ workspaceId: "ws_two" }], nextCursor: null },
+  ];
+  const ids = await listWorkspaceIds(DEV_API, "device-token", async (input, init) => {
+    requests.push({ url: String(input), init });
+    return Response.json(pages.shift());
+  });
+  expect(ids).toEqual(["ws_one", "ws_two"]);
+  expect(requests).toHaveLength(2);
+  expect(requests[0]!.init?.headers).toEqual({ authorization: "Bearer device-token" });
+  expect(new URL(requests[0]!.url).searchParams.get("limit")).toBe("100");
+  expect(new URL(requests[1]!.url).searchParams.get("cursor")).toBe("next/page");
+
+  let createdRequest: { url: string; init?: RequestInit } | undefined;
+  const workspaceId = await createWorkspaceFixture(DEV_API, "device-token", "Never pushed / ☃", async (input, init) => {
+    createdRequest = { url: String(input), init };
+    return Response.json({ workspaceId: "ws_fresh" });
+  });
+  expect(workspaceId).toBe("ws_fresh");
+  expect(createdRequest!.init).toMatchObject({ method: "POST", headers: { authorization: "Bearer device-token" } });
+  expect(new URL(createdRequest!.url).searchParams.get("project")).toBe("root");
+  expect(new URL(createdRequest!.url).searchParams.get("name")).toBe("Never pushed / ☃");
+});
+
+test("workspace helpers derive authority from stored DEV credentials and guard before fetch", async () => {
+  expect(storedWorkspaceCredentials(JSON.stringify({ remoteUrl: DEV_API, token: "device-token" }))).toEqual({ remote: DEV_API, token: "device-token" });
+  expect(() => storedWorkspaceCredentials(JSON.stringify({ remoteUrl: "https://api.rbox.to", token: "device-token" }))).toThrow("refusing non-DEV");
+
+  let fetched = false;
+  const shouldNotFetch = async (): Promise<Response> => { fetched = true; return Response.json({}); };
+  await expect(listWorkspaceIds("https://api.rbox.to", "device-token", shouldNotFetch)).rejects.toThrow("refusing non-DEV");
+  await expect(createWorkspaceFixture("https://api.rbox.to", "device-token", "label", shouldNotFetch)).rejects.toThrow("refusing non-DEV");
+  expect(fetched).toBeFalse();
 });
 
 test("isolated environment forces machine state and removes ambient authority", () => {

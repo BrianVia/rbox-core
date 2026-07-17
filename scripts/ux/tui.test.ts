@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { DEV_API } from "./fresh-machine.js";
 import {
-  assertDirectDevRbox, containerTmuxPlan, keyTmuxArgs, parseTuiArgs, renderCommand, shellQuote,
+  assertDirectDevRbox, containerTmuxPlan, keyTmuxArgs, parseTuiArgs, pasteBuffer, renderCommand, shellQuote,
   stripTrailingBlankLines, tmuxStartArgs, waitForStable,
 } from "./tui.js";
 
@@ -9,6 +9,8 @@ describe("tui argument parsing", () => {
   test("parses every command and defaults", () => {
     expect(parseTuiArgs(["start", "--host", "--session", "s", "--home", "/tmp/rbox-ux/r/a", "--", "rbox", "setup"])).toEqual({ command: "start", session: "s", home: "/tmp/rbox-ux/r/a", cols: 100, rows: 30, child: ["rbox", "setup"], host: true });
     expect(parseTuiArgs(["keys", "--host", "--session", "s", "--slow", "hello", "Enter"])).toEqual({ command: "keys", session: "s", keys: ["hello", "Enter"], slow: true, host: true });
+    expect(parseTuiArgs(["paste-buffer", "--host", "--session", "s"])).toEqual({ command: "paste-buffer", session: "s", host: true });
+    expect(parseTuiArgs(["paste-buffer", "--run-id", "walk", "--session", "s"])).toEqual({ command: "paste-buffer", session: "s", host: false, runId: "walk" });
     expect(parseTuiArgs(["screen", "--host", "--session", "s", "--strip"])).toEqual({ command: "screen", session: "s", strip: true, host: true });
     expect(parseTuiArgs(["wait-idle", "--host", "--session", "s", "--timeout", "4"])).toEqual({ command: "wait-idle", session: "s", timeout: 4, host: true });
     expect(parseTuiArgs(["stop", "--host", "--session", "s"])).toEqual({ command: "stop", session: "s", host: true });
@@ -67,6 +69,25 @@ test("tmux start plan fixes geometry, cwd, DEV env, and empty scrubbed values", 
 test("named keys and text use distinct tmux modes", () => {
   expect(keyTmuxArgs("s", "Enter")).toEqual(["send-keys", "-t", "s", "--", "Enter"]);
   expect(keyTmuxArgs("s", "hello; $()")).toEqual(["send-keys", "-t", "s", "-l", "--", "hello; $()"]);
+});
+
+test("paste-buffer round-trips through stdin and never places the value in argv", async () => {
+  const secret = "pair-secret with spaces; $() and ☃";
+  const invocations: Array<{ argv: string[]; stdin?: string }> = [];
+  let buffer = ""; let pane = "";
+  await pasteBuffer("walk", secret, async (argv, stdin) => {
+    invocations.push({ argv, ...(stdin === undefined ? {} : { stdin }) });
+    if (argv[0] === "load-buffer") buffer = stdin ?? "";
+    else if (argv[0] === "paste-buffer") pane += buffer;
+    return "";
+  });
+  expect(pane).toBe(secret);
+  expect(invocations).toEqual([
+    { argv: ["load-buffer", "-b", "rbox-walk", "-"], stdin: secret },
+    { argv: ["paste-buffer", "-d", "-b", "rbox-walk", "-t", "walk"] },
+  ]);
+  expect(invocations.flatMap((call) => call.argv)).not.toContain(secret);
+  expect(JSON.stringify(invocations.map((call) => call.argv))).not.toContain(secret);
 });
 
 test("strip removes only trailing blank lines", () => {
