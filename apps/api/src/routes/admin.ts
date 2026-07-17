@@ -3,7 +3,7 @@ import { json, logErr } from "../util.js";
 import { isPlatform } from "../authz.js";
 import { retentionPrune } from "../retention.js";
 import { phase1Audit, runPhase1 } from "../gc-phase1.js";
-import { ADMIN_PURGE_DEADLINE_MS, gcAudit, gcMark, gcPurge } from "../versions.js";
+import { ADMIN_PURGE_DEADLINE_MS, gcAudit, gcHealth, gcMark, gcPurge } from "../versions.js";
 import { adminOverview, fetchDeltaSoak } from "../admin.js";
 import { adminSetPlan } from "../billing.js";
 import { multipartInventory } from "../multipart-inventory.js";
@@ -128,6 +128,10 @@ export async function adminRootsInspect(env: Env, url: URL): Promise<Response> {
  * (defense in depth; NOT the rbox bearer) — so these routes sit BEFORE authenticate().
  */
 export async function adminRoutes({ req, env, url, seg }: RouteCtx): Promise<Response | null> {
+  if (req.method === "GET" && eq(seg, ["v1", "admin", "gc"]) && url.searchParams.get("phase") === "health") {
+    if (!isPlatform(req, env)) return json({ error: "not_found" }, 404);
+    return gcHealth(env);
+  }
   if (req.method === "GET" && eq(seg, ["v1", "admin", "roots-inspect"])) {
     if (!isPlatform(req, env)) return json({ error: "not_found" }, 404);
     return adminRootsInspect(env, url);
