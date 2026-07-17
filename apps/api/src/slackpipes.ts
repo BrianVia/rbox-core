@@ -172,12 +172,17 @@ export function formatNewAccount(o: NewAccountPing): string {
   return bits.length ? `${base} — ${bits.join(" · ")}` : base;
 }
 
-/** A new tenant was created (CLI bootstrap OR web first-login provisioning). */
+/** A new tenant was created (CLI bootstrap OR web first-login provisioning).
+ *  DEV deployments never ping: dev-API signups are rig/CI/UX-walkthrough traffic,
+ *  not customers — founder decision 2026-07-16. Only prod onboarding reaches the
+ *  business channel (and the absent-RBOX_ENV degrade-to-dev rule keeps a
+ *  misconfigured worker silent rather than noisy). */
 export function pingNewAccount(
   ctx: WaitUntilContext,
   env: Env,
   o: { accountId: string; origin: string; email?: string | null; signInMethod?: string | null; plan?: string | null },
 ): void {
+  if (envTag(env) === "dev") return;
   schedulePing(ctx, pingSlackpipes(env, "signup", formatNewAccount({ ...o, env: envTag(env) })));
 }
 

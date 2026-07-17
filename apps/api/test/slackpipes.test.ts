@@ -331,11 +331,12 @@ describe("pingNewAccount — reads the deploy-env tag off env.RBOX_ENV", () => {
     );
   });
 
-  test("absent RBOX_ENV degrades to the dev tag (dev is never mislabeled prod)", async () => {
+  test("dev deployments are suppressed entirely — no signup ping for RBOX_ENV=dev or absent", async () => {
     const calls: Call[] = [];
     recordFetch(calls);
-    pingNewAccount(testCtx, pingEnv({ RBOX_ENV: undefined }), { accountId: "acct_dev", origin: "bootstrap" });
-    expect((calls[0]!.body as { text: string }).text).toBe(":seedling: New rbox account onboarded — `acct_dev` (bootstrap, dev)");
+    pingNewAccount(testCtx, pingEnv({ RBOX_ENV: "dev" }), { accountId: "acct_dev", origin: "bootstrap" });
+    pingNewAccount(testCtx, pingEnv({ RBOX_ENV: undefined }), { accountId: "acct_dev2", origin: "bootstrap" });
+    expect(calls).toHaveLength(0);
   });
 
   test("a throwing waitUntil never escapes or adds logs beyond the failed ping operations", async () => {
@@ -350,7 +351,7 @@ describe("pingNewAccount — reads the deploy-env tag off env.RBOX_ENV", () => {
     globalThis.fetch = (async () => {
       throw new TypeError("network down");
     }) as typeof fetch;
-    expect(() => pingNewAccount(throwingCtx, pingEnv(), { accountId: "acct_fail", origin: "web" })).not.toThrow();
+    expect(() => pingNewAccount(throwingCtx, pingEnv({ RBOX_ENV: "prod" }), { accountId: "acct_fail", origin: "web" })).not.toThrow();
     await pending;
     // One business-operation failure plus one terminal synthetic-alert failure;
     // the throwing registration itself contributes no third log.
