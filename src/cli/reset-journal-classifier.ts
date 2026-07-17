@@ -13,6 +13,7 @@ export interface PrefixDisposition {
 
 export interface ResetPhysicalObservation {
   phase: ResetPhase;
+  archiveBaseline: "absent" | "exact";
   active: StateDisposition;
   candidate: NextArtifactDisposition;
   archive: OldArtifactDisposition;
@@ -22,7 +23,7 @@ export interface ResetPhysicalObservation {
 }
 
 export type ResetPhysicalRowId =
-  | "P0" | "P1" | "P2" | `P3.${number}`
+  | "P0" | "P0A" | "P1" | "P2" | `P3.${number}`
   | "R0" | "R1" | "R2"
   | "I0" | "I1" | "I2" | `I3.${number}`
   | "Z0";
@@ -43,8 +44,9 @@ export function classifyResetPhysicalSignature(observation: ResetPhysicalObserva
   const { phase, active, candidate, archive, marker, recoveryRefs: recovery, activeRefGroups: groups } = observation;
   if (recovery.kind !== "prefix" || groups.kind !== "prefix") return undefined;
   if (phase === "prepared" && active === "old" && preMarker(marker) && prefix(groups, 0)) {
-    if (candidate === "absent" && archive === "absent" && prefix(recovery, 0)) return { ids: ["P0"], observation };
-    if (candidate === "next" && archive === "absent" && prefix(recovery, 0)) return { ids: ["P1"], observation };
+    if (candidate === "absent" && archive === "absent" && observation.archiveBaseline === "absent" && prefix(recovery, 0)) return { ids: ["P0"], observation };
+    if (candidate === "absent" && archive === "old" && observation.archiveBaseline === "exact" && prefix(recovery, 0)) return { ids: ["P0A"], observation };
+    if (candidate === "next" && archive === "absent" && observation.archiveBaseline === "absent" && prefix(recovery, 0)) return { ids: ["P1"], observation };
     if (candidate === "next" && archive === "old") {
       if (prefix(recovery, 0)) return { ids: ["P2"], observation };
       if (recovery.count > 0 && recovery.count <= recovery.total) return { ids: [`P3.${recovery.count}`], observation };

@@ -7,12 +7,13 @@ import {
 
 const p = (count: number, total = 2) => ({ kind: "prefix" as const, count, total });
 const base: ResetPhysicalObservation = {
-  phase: "prepared", active: "old", candidate: "absent", archive: "absent", marker: "absent",
+  phase: "prepared", archiveBaseline: "absent", active: "old", candidate: "absent", archive: "absent", marker: "absent",
   recoveryRefs: p(0), activeRefGroups: p(0),
 };
 
 const rows: Array<[ResetPhysicalRowId, ResetPhysicalObservation]> = [
   ["P0", base],
+  ["P0A", { ...base, archiveBaseline: "exact", archive: "old" }],
   ["P1", { ...base, candidate: "next" }],
   ["P2", { ...base, candidate: "next", archive: "old" }],
   ["P3.1", { ...base, candidate: "next", archive: "old", recoveryRefs: p(1) }],
@@ -64,8 +65,11 @@ describe("design 138 normative correlated reset rows", () => {
     expect(classifyResetPhysicalSignature({ ...base, marker: "other" })).toBeUndefined();
   });
 
-  test("prepared archive-present/candidate-absent and arbitrary ref bitmaps are never legal", () => {
+  test("prepared archive-present/candidate-absent requires an authenticated exact baseline", () => {
     expect(classifyResetPhysicalSignature({ ...base, archive: "old" })).toBeUndefined();
+    expect(classifyResetPhysicalSignature({ ...base, archiveBaseline: "exact", archive: "old" })?.ids).toEqual(["P0A"]);
+    expect(classifyResetPhysicalSignature({ ...base, archiveBaseline: "exact", archive: "absent" })).toBeUndefined();
+    expect(classifyResetPhysicalSignature({ ...base, archiveBaseline: "exact", candidate: "next", archive: "absent" })).toBeUndefined();
     expect(classifyResetPhysicalSignature({ ...base, candidate: "next", archive: "old", recoveryRefs: { kind: "other", count: 1, total: 2 } })).toBeUndefined();
   });
 

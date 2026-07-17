@@ -69,7 +69,7 @@ interface ResetJournalBody {
   id: string;
   phase: ResetPhase;
   createdAt: string;
-  old: { stream: string; stateNonce: string; stateRevision: number; stateSha256: string; z: ResetZEntry[] };
+  old: { stream: string; stateNonce: string; stateRevision: number; stateSha256: string; archiveBaseline: "absent" | "exact"; z: ResetZEntry[] };
   next: { stream: string; stateNonce: string; stateRevision: number; stateSha256: string; state: ResetNextState };
 }
 
@@ -144,12 +144,14 @@ function validateIdentity(value: unknown): RepoIdentityV1 {
   return typed;
 }
 
-function validateBody(journal: Record<string, unknown>): ResetJournalBody {
+function validateBody(journal: Record<string, unknown>, requireArchiveBaseline: boolean): ResetJournalBody {
   if (typeof journal.id !== "string" || !HEX32.test(journal.id) || !["prepared", "ready", "installed", "z-retired"].includes(journal.phase as string) || !canonicalTime(journal.createdAt)) throw corruption("bad reset journal envelope");
   const old = record(journal.old);
   const next = record(journal.next);
-  if (!old || !exact(old, ["stream", "stateNonce", "stateRevision", "stateSha256", "z"]) || !bounded(old.stream)
+  const oldKeys = ["stream", "stateNonce", "stateRevision", "stateSha256", ...(requireArchiveBaseline ? ["archiveBaseline"] : []), "z"];
+  if (!old || !exact(old, oldKeys) || !bounded(old.stream)
     || typeof old.stateNonce !== "string" || !HEX32.test(old.stateNonce) || !counter(old.stateRevision) || typeof old.stateSha256 !== "string" || !HEX64.test(old.stateSha256) || !Array.isArray(old.z) || old.z.length > MAX_Z) throw corruption("bad old reset state");
+  if (requireArchiveBaseline && old.archiveBaseline !== "absent" && old.archiveBaseline !== "exact") throw corruption("bad old reset archive baseline");
   const z: ResetZEntry[] = [];
   const seenActive = new Set<string>();
   const seenRecovery = new Set<string>();
@@ -178,7 +180,7 @@ function validateBody(journal: Record<string, unknown>): ResetJournalBody {
   if (sha256(canonicalLine(state)) !== next.stateSha256) throw corruption("next state hash mismatch");
   return {
     id: journal.id, phase: journal.phase as ResetPhase, createdAt: journal.createdAt as string,
-    old: { ...old as unknown as ResetJournalBody["old"], z },
+    old: { ...old as unknown as ResetJournalBody["old"], archiveBaseline: requireArchiveBaseline ? old.archiveBaseline as "absent" | "exact" : "absent", z },
     next: { ...next as unknown as ResetJournalBody["next"], state: state as unknown as ResetNextState },
   };
 }
@@ -186,7 +188,7 @@ function validateBody(journal: Record<string, unknown>): ResetJournalBody {
 export function validateResetJournalV1(value: unknown): ResetJournalV1 {
   const journal = record(value);
   if (!journal || !exact(journal, ["v", "id", "phase", "createdAt", "old", "next"]) || journal.v !== 1) throw corruption("bad reset journal v1 envelope");
-  return { v: 1, ...validateBody(journal) };
+  return { v: 1, ...validateBody(journal, false) };
 }
 
 export function validateResetJournalV2(value: unknown): ResetJournalV2 {
@@ -196,7 +198,7 @@ export function validateResetJournalV2(value: unknown): ResetJournalV2 {
   if (!authorization || !exact(authorization, ["version", "authorizedNextStream", "consentKind", "mintedAtRevision"])
     || authorization.version !== 2 || !bounded(authorization.authorizedNextStream)
     || !["setup-rebind", "setup-create"].includes(authorization.consentKind as string) || !counter(authorization.mintedAtRevision)) throw corruption("bad reset authorization witness");
-  const body = validateBody(journal);
+  const body = validateBody(journal, true);
   const typed = authorization as unknown as ResetJournalAuthorization;
   if (typed.authorizedNextStream !== body.next.stream) throw corruption("reset authorization witness does not bind the journal destination");
   return { v: 2, authorization: typed, ...body };
@@ -239,8 +241,12 @@ async function expectedAbsentOrExact(file: string, bytes: Uint8Array): Promise<v
 }
 
 async function readRef(entry: ResetZEntry, ref: string): Promise<string | undefined> {
-  const out = (await gitRaw(entry.repositoryIdentity.commonDirReal, ["rev-parse", "--verify", "--quiet", ref]).catch(() => "")).trim();
-  return HEX40.test(out) ? out : undefined;
+  try {
+    return (await gitRaw(entry.repositoryIdentity.commonDirReal, ["rev-parse", "--verify", "--quiet", ref])).trim();
+  } catch (error) {
+    if ((error as { code?: unknown }).code === 1) return undefined;
+    throw error;
+  }
 }
 
 async function verifyIdentity(entry: ResetZEntry): Promise<void> {
@@ -255,31 +261,38 @@ function prefixDisposition(values: readonly boolean[]): PrefixDisposition {
 }
 
 async function observeRefs(entries: readonly ResetZEntry[]): Promise<{ recovery: PrefixDisposition; activeGroups: PrefixDisposition }> {
-  try {
-    const recoveryPresent: boolean[] = [];
-    for (const entry of entries) {
-      await verifyIdentity(entry);
-      const value = await readRef(entry, entry.recoveryRef);
-      if (value !== undefined && value !== entry.targetOid) return { recovery: { kind: "other", count: 0, total: entries.length }, activeGroups: { kind: "other", count: 0, total: 0 } };
-      recoveryPresent.push(value === entry.targetOid);
-    }
-    const groups = new Map<string, ResetZEntry[]>();
-    for (const entry of entries) groups.set(entry.repositoryIdentity.commonDirReal, [...(groups.get(entry.repositoryIdentity.commonDirReal) ?? []), entry]);
-    const retired: boolean[] = [];
-    for (const commonDir of [...groups.keys()].sort()) {
-      const dispositions: boolean[] = [];
-      for (const entry of groups.get(commonDir)!) {
-        const value = await readRef(entry, entry.activeRef);
-        if (value !== undefined && value !== entry.targetOid) return { recovery: prefixDisposition(recoveryPresent), activeGroups: { kind: "other", count: 0, total: groups.size } };
-        dispositions.push(value === undefined);
-      }
-      if (new Set(dispositions).size > 1) return { recovery: prefixDisposition(recoveryPresent), activeGroups: { kind: "other", count: 0, total: groups.size } };
-      retired.push(dispositions[0] ?? false);
-    }
-    return { recovery: prefixDisposition(recoveryPresent), activeGroups: prefixDisposition(retired) };
-  } catch {
-    return { recovery: { kind: "other", count: 0, total: entries.length }, activeGroups: { kind: "other", count: 0, total: new Set(entries.map((entry) => entry.repositoryIdentity.commonDirReal)).size } };
+  const recoveryPresent: boolean[] = [];
+  for (const entry of entries) {
+    await verifyIdentity(entry);
+    const value = await readRef(entry, entry.recoveryRef);
+    if (value !== undefined && value !== entry.targetOid) return { recovery: { kind: "other", count: 0, total: entries.length }, activeGroups: { kind: "other", count: 0, total: 0 } };
+    recoveryPresent.push(value === entry.targetOid);
   }
+  const groups = new Map<string, ResetZEntry[]>();
+  for (const entry of entries) groups.set(entry.repositoryIdentity.commonDirReal, [...(groups.get(entry.repositoryIdentity.commonDirReal) ?? []), entry]);
+  const retired: boolean[] = [];
+  for (const commonDir of [...groups.keys()].sort()) {
+    const dispositions: boolean[] = [];
+    for (const entry of groups.get(commonDir)!) {
+      const value = await readRef(entry, entry.activeRef);
+      if (value !== undefined && value !== entry.targetOid) return { recovery: prefixDisposition(recoveryPresent), activeGroups: { kind: "other", count: 0, total: groups.size } };
+      dispositions.push(value === undefined);
+    }
+    if (new Set(dispositions).size > 1) return { recovery: prefixDisposition(recoveryPresent), activeGroups: { kind: "other", count: 0, total: groups.size } };
+    retired.push(dispositions[0] ?? false);
+  }
+  return { recovery: prefixDisposition(recoveryPresent), activeGroups: prefixDisposition(retired) };
+}
+
+async function exactRecoveryRefs(entries: readonly ResetZEntry[]): Promise<ResetZEntry[]> {
+  const existing: ResetZEntry[] = [];
+  for (const entry of entries) {
+    await verifyIdentity(entry);
+    const value = await readRef(entry, entry.recoveryRef);
+    if (value !== undefined && value !== entry.targetOid) throw corruption(`wrong recovery Z target ${entry.recoveryRef}`);
+    if (value === entry.targetOid) existing.push(entry);
+  }
+  return existing;
 }
 
 function stateDisposition(hash: string | undefined, journal: ResetJournalV2): StateDisposition {
@@ -319,6 +332,7 @@ async function observePhysical(root: string, journal: ResetJournalV2): Promise<R
   ]);
   return {
     phase: journal.phase,
+    archiveBaseline: journal.old.archiveBaseline,
     active: stateDisposition(activeHash, journal), candidate: nextDisposition(candidateHash, journal), archive: oldDisposition(archiveHash, journal), marker,
     recoveryRefs: refs.recovery, activeRefGroups: refs.activeGroups,
     activeHash, candidateHash, archiveHash, artifactPaths: paths,
@@ -424,7 +438,7 @@ export async function recoverResetJournalUnderHeldFence(
 
   if (journal.phase === "prepared") {
     const rowId = inspection.row.ids[0]!;
-    if (rowId === "P0") {
+    if (rowId === "P0" || rowId === "P0A") {
       await expectedAbsentOrExact(candidatePath, nextBytes);
       await hooks.crashAt?.("after-candidate-create");
     }
@@ -539,18 +553,35 @@ export async function beginResetJournal(
   const journal: ResetJournalV2 = {
     v: 2, id, phase: "prepared", createdAt: now, authorization,
     old: {
-      stream: oldState.stream, stateNonce: oldState.stateNonce!, stateRevision: oldState.stateRevision!, stateSha256: sha256(oldBytes),
+      stream: oldState.stream, stateNonce: oldState.stateNonce!, stateRevision: oldState.stateRevision!, stateSha256: sha256(oldBytes), archiveBaseline: "absent",
       z: [...z].sort((a, b) => a.activeRef.localeCompare(b.activeRef) || a.targetOid.localeCompare(b.targetOid)),
     },
     next: { stream: nextStream, stateNonce: nonce, stateRevision: nextState.stateRevision, stateSha256: sha256(canonicalLine(nextState)), state: nextState },
   };
-  const [activeHash, candidateHash, archiveHash, marker, refs] = await Promise.all([
+  const [activeHash, candidateHash, archiveHash, marker, refs, existingRecoveryRefs] = await Promise.all([
     boundedHash(activeStatePath(root)), boundedHash(resetCandidatePath(root, id)), boundedHash(resetArchivePath(root, journal.old.stateNonce, journal.old.stateSha256)),
-    markerDisposition(resetIncarnationPath(root), journal), observeRefs(journal.old.z),
+    markerDisposition(resetIncarnationPath(root), journal), observeRefs(journal.old.z), exactRecoveryRefs(journal.old.z),
   ]);
-  if (activeHash !== journal.old.stateSha256 || candidateHash !== undefined || archiveHash !== undefined || !["old", "absent"].includes(marker)
-    || refs.recovery.kind !== "prefix" || refs.recovery.count !== 0 || refs.activeGroups.kind !== "prefix" || refs.activeGroups.count !== 0) {
+  if (activeHash !== journal.old.stateSha256 || candidateHash !== undefined
+    || (archiveHash !== undefined && archiveHash !== journal.old.stateSha256) || !["old", "absent"].includes(marker)
+    || refs.activeGroups.kind !== "prefix" || refs.activeGroups.count !== 0) {
     throw new Error("reset refused: physical state does not satisfy the normalized P0 initiation invariant");
+  }
+  journal.old.archiveBaseline = archiveHash === journal.old.stateSha256 ? "exact" : "absent";
+  // Recovery refs are deterministic and can survive an operator quarantine.
+  // Normalize only exact-target refs before publishing the new journal; a wrong
+  // target was rejected above and is never rewritten. The canonical archive is
+  // durable provenance, so exact bytes are adopted as the P0A baseline instead.
+  for (let index = 0; index < existingRecoveryRefs.length; index++) {
+    const entry = existingRecoveryRefs[index]!;
+    await hooks.crashAt?.(`before-recovery-ref-normalize-${index + 1}`);
+    await verifyIdentity(entry);
+    await gitRaw(entry.repositoryIdentity.commonDirReal, ["update-ref", "-d", entry.recoveryRef, entry.targetOid]);
+  }
+  const normalizedRefs = await observeRefs(journal.old.z);
+  if (normalizedRefs.recovery.kind !== "prefix" || normalizedRefs.recovery.count !== 0
+    || normalizedRefs.activeGroups.kind !== "prefix" || normalizedRefs.activeGroups.count !== 0) {
+    throw new Error("reset refused: recovery refs did not normalize to the P0 initiation invariant");
   }
   await writeJournal(root, journal);
   await hooks.crashAt?.("after-prepared");

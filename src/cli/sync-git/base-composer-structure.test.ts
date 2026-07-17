@@ -105,7 +105,7 @@ test("design 130 raw update-ref command sites are a closed allowlist", async () 
     && ["git", "gitRaw", "spawn"].includes(site.callee ?? "")
     && site.arguments?.some((argument) => argument.includes("update-ref")) === true);
   expect(counts(sites)).toEqual({
-    "src/cli/reset-journal.ts": 2,
+    "src/cli/reset-journal.ts": 3,
     "src/cli/sync-git/follow.ts": 1,
     "src/cli/sync-git/orig-head.ts": 1,
     "src/engine/git/apply.ts": 3,

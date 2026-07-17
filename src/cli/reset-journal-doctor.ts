@@ -148,11 +148,23 @@ async function quarantineStandingJournal(root: string): Promise<void> {
       if (typed.observation.artifactPaths?.archive && await boundedHash(typed.observation.artifactPaths.archive)) {
         artifacts.push({ kind: "archive", absolutePath: typed.observation.artifactPaths.archive, cleanup: "preserve" });
       }
+      const recoveryRefs = typed.observation.recoveryRefs;
+      const activeRefGroups = typed.observation.activeRefGroups;
+      const isRestorablePrefix = (value: unknown): value is { kind: "prefix"; count: number; total: number } => {
+        if (!value || typeof value !== "object") return false;
+        const disposition = value as { kind?: unknown; count?: unknown; total?: unknown };
+        return disposition.kind === "prefix" && Number.isSafeInteger(disposition.count)
+          && Number.isSafeInteger(disposition.total) && Number(disposition.count) >= 0
+          && Number(disposition.count) <= Number(disposition.total);
+      };
+      if (!isRestorablePrefix(recoveryRefs) || !isRestorablePrefix(activeRefGroups)) {
+        throw new Error("reset ref preconditions could not be safely observed; retry the command");
+      }
       const bundle = await quarantineResetUnderFence(root, {
         scope: "transaction", phase: typed.journal.phase!, activeStateSha256: typed.observation.activeHash,
         recoveredStateSha256: typed.journal.next?.stateSha256,
         markerPrecondition: String(typed.observation.marker),
-        refPreconditions: JSON.stringify({ recovery: typed.observation.recoveryRefs, active: typed.observation.activeRefGroups }),
+        refPreconditions: JSON.stringify({ recovery: recoveryRefs, active: activeRefGroups }),
         artifacts,
       });
       console.log(`reset transaction quarantined at ${bundle}; deterministic recovery refs and the canonical lineage archive were preserved`);

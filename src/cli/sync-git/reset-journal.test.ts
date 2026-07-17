@@ -14,7 +14,7 @@ import {
   readBaseAbsentArtifact,
   readBasePresentArtifact,
 } from "../../engine/git/base-artifacts.js";
-import { gitRaw } from "../../engine/git/shared.js";
+import { gitRaw, setGitSpawnObserver } from "../../engine/git/shared.js";
 import {
   beginResetJournal,
   inspectResetJournal,
@@ -27,9 +27,11 @@ import {
   validateResetJournalV2,
   type ResetZEntry,
 } from "../reset-journal.js";
-import { loadState, resetSyncState, saveStateUnsafeLegacyOrTest, type SyncState } from "../config.js";
+import { loadState, resetSyncState, saveConfig, saveStateUnsafeLegacyOrTest, type SyncState } from "../config.js";
 import { acquireWorkspaceSyncMutex, releaseWorkspaceSyncMutex } from "../sync-mutex.js";
 import { mintSetupExistingConsent } from "../reset-consent.js";
+import { resetJournalDoctorCmd } from "../reset-journal-doctor.js";
+import { readResetQuarantineBundle, resetQuarantineRoot } from "../reset-quarantine.js";
 
 const exec = promisify(execFile);
 let root = "";
@@ -114,7 +116,8 @@ describe("design 130 reset-v1 strict schema", () => {
       version: 2, authorizedNextStream: "new-stream", consentKind: "setup-rebind", mintedAtRevision: 7,
     });
     const { authorization: _authorization, ...legacyBody } = v2 as typeof v2 & { authorization: unknown };
-    await fs.writeFile(resetJournalPath(root), JSON.stringify({ ...legacyBody, v: 1 }));
+    const { archiveBaseline: _archiveBaseline, ...legacyOld } = legacyBody.old;
+    await fs.writeFile(resetJournalPath(root), JSON.stringify({ ...legacyBody, v: 1, old: legacyOld }));
     expect(await inspectResetJournal(root, "old-stream")).toMatchObject({ status: "halt", reason: expect.stringContaining("legacy") });
     await expect(recoverResetJournal(root, "old-stream")).rejects.toThrow("legacy reset journal");
   });
@@ -261,13 +264,15 @@ async function zFixture(repo: string, relPath: string, lineageByte: string): Pro
 }
 
 describe("design 138 normalized P0 initiation invariant", () => {
-  test("pre-existing archive is refused before journal publication", async () => {
+  test("a byte-exact pre-existing archive is adopted as the recorded P0A baseline", async () => {
     const hash = crypto.createHash("sha256").update(oldBytes()).digest("hex");
     const archive = resetArchivePath(root, oldState().stateNonce!, hash);
     await fs.mkdir(path.dirname(archive), { recursive: true });
     await fs.writeFile(archive, oldBytes());
-    await expect(begin()).rejects.toThrow("normalized P0 initiation invariant");
-    await expect(fs.access(resetJournalPath(root))).rejects.toThrow();
+    await begin();
+    expect(await inspectResetJournal(root, "old-stream")).toMatchObject({ status: "recoverable", row: { ids: ["P0A"] } });
+    expect(await recoverResetJournal(root, "old-stream")).toBe("complete");
+    expect(await fs.readFile(archive)).toEqual(oldBytes());
   });
 
   test("a stale incarnation marker is refused rather than blessed", async () => {
@@ -277,12 +282,135 @@ describe("design 138 normalized P0 initiation invariant", () => {
     await expect(fs.access(resetJournalPath(root))).rejects.toThrow();
   });
 
-  test("pre-existing recovery refs are refused so every journal starts at R0", async () => {
+  test("exact-target pre-existing recovery refs are normalized to R0 before publication", async () => {
     const entry = await zFixture(path.join(root, "repo-init"), "repo-init", "d");
     await git(path.join(root, "repo-init"), "update-ref", entry.recoveryRef, entry.targetOid);
-    await expect(begin([entry])).rejects.toThrow("normalized P0 initiation invariant");
+    await begin([entry]);
+    expect(await git(path.join(root, "repo-init"), "rev-parse", "--verify", "--quiet", entry.recoveryRef).catch(() => "absent")).toBe("absent");
+    expect(await inspectResetJournal(root, "old-stream")).toMatchObject({
+      status: "recoverable", row: { ids: ["P0"] }, observation: { recoveryRefs: { kind: "prefix", count: 0, total: 1 } },
+    });
+    expect(await recoverResetJournal(root, "old-stream")).toBe("complete");
+  });
+
+  test("ref normalization revalidates repository identity immediately before deletion", async () => {
+    const repo = path.join(root, "repo-normalize-race");
+    const moved = path.join(root, "repo-normalize-race-old");
+    const entry = await zFixture(repo, "repo-normalize-race", "9");
+    await git(repo, "update-ref", entry.recoveryRef, entry.targetOid);
+    let replaced = false;
+    await expect(beginResetJournal(root, "new-stream", oldBytes(), oldState(), [entry], {
+      version: 2, authorizedNextStream: "new-stream", consentKind: "setup-rebind", mintedAtRevision: 7,
+    }, {
+      randomBytes: random,
+      now,
+      crashAt: async (point) => {
+        if (point !== "before-recovery-ref-normalize-1") return;
+        replaced = true;
+        await fs.rename(repo, moved);
+        await fs.mkdir(repo);
+        await git(repo, "init", "-q");
+        const replacementTarget = await git(repo, "hash-object", "-w", "-t", "tree", "/dev/null");
+        expect(replacementTarget).toBe(entry.targetOid);
+        await git(repo, "update-ref", entry.activeRef, replacementTarget);
+        await git(repo, "update-ref", entry.recoveryRef, replacementTarget);
+      },
+    })).rejects.toThrow("repository incarnation changed");
+    expect(replaced).toBe(true);
+    expect(await git(repo, "rev-parse", "--verify", entry.recoveryRef)).toBe(entry.targetOid);
     await expect(fs.access(resetJournalPath(root))).rejects.toThrow();
   });
+
+  test("wrong archive bytes and wrong recovery targets remain initiation holds", async () => {
+    const hash = crypto.createHash("sha256").update(oldBytes()).digest("hex");
+    const archive = resetArchivePath(root, oldState().stateNonce!, hash);
+    await fs.mkdir(path.dirname(archive), { recursive: true });
+    await fs.writeFile(archive, "wrong");
+    await expect(begin()).rejects.toThrow("normalized P0 initiation invariant");
+    await fs.rm(archive);
+    const entry = await zFixture(path.join(root, "repo-wrong-ref"), "repo-wrong-ref", "e");
+    const otherFile = path.join(root, "wrong-target");
+    await fs.writeFile(otherFile, "wrong target");
+    const other = await git(path.join(root, "repo-wrong-ref"), "hash-object", "-w", otherFile);
+    await git(path.join(root, "repo-wrong-ref"), "update-ref", entry.recoveryRef, other);
+    await expect(begin([entry])).rejects.toThrow("wrong recovery Z target");
+    await expect(fs.access(resetJournalPath(root))).rejects.toThrow();
+  });
+});
+
+test("a transient ref-read error at quarantine is not serialized and the bundle still restores", async () => {
+  const stream = "https://observe.test::ws-observe::root";
+  const observedState: SyncState = { ...oldState(), stream };
+  await saveConfig(root, {
+    schema: "e2ee/v1", remoteUrl: "https://observe.test", remoteWorkspaceId: "ws-observe", projectId: "root",
+    rootPath: root, deviceId: "dev-observe", token: "", encrypted: true,
+  });
+  await saveStateUnsafeLegacyOrTest(root, observedState);
+  const entry = await zFixture(path.join(root, "transient-read"), "transient-read", "f");
+  const observedBytes = await fs.readFile(stateFile());
+  await beginResetJournal(root, "next-observe", observedBytes, observedState, [entry], {
+    version: 2, authorizedNextStream: "next-observe", consentKind: "setup-rebind", mintedAtRevision: 7,
+  }, { randomBytes: random, now });
+  await expect(recoverResetJournal(root, stream, { crashAt: (point) => {
+    if (point === "after-ready") throw new Error(point);
+  } })).rejects.toThrow("after-ready");
+
+  let injected = 0;
+  setGitSpawnObserver((_repo, args) => {
+    if (injected < 2 && args[0] === "rev-parse") {
+      injected++;
+      throw new Error("transient ref observation failure");
+    }
+  });
+  try {
+    expect(await inspectResetJournal(root, stream)).toMatchObject({
+      status: "halt", reason: expect.stringContaining("transient ref observation failure"),
+    });
+    await resetJournalDoctorCmd(root, { quarantine: true });
+  } finally {
+    setGitSpawnObserver(undefined);
+  }
+  expect(injected).toBe(2);
+  const [bundleId] = await fs.readdir(resetQuarantineRoot(root));
+  expect(bundleId).toBeDefined();
+  const manifest = await readResetQuarantineBundle(root, path.join(resetQuarantineRoot(root), bundleId!));
+  expect(JSON.parse(manifest!.refPreconditions)).toEqual({
+    recovery: { kind: "prefix", count: 1, total: 1 },
+    active: { kind: "prefix", count: 0, total: 1 },
+  });
+  expect(manifest!.refPreconditions).not.toContain("transient ref observation failure");
+
+  await resetJournalDoctorCmd(root, { restore: bundleId });
+  expect(await inspectResetJournal(root, stream)).toMatchObject({ status: "recoverable" });
+  expect(await recoverResetJournal(root, stream)).toBe("complete");
+});
+
+test("doctor refuses aggregate other ref observations instead of making them restorable", async () => {
+  const stream = "https://wrong-ref.test::ws-wrong-ref::root";
+  const observedState: SyncState = { ...oldState(), stream };
+  await saveConfig(root, {
+    schema: "e2ee/v1", remoteUrl: "https://wrong-ref.test", remoteWorkspaceId: "ws-wrong-ref", projectId: "root",
+    rootPath: root, deviceId: "dev-wrong-ref", token: "", encrypted: true,
+  });
+  await saveStateUnsafeLegacyOrTest(root, observedState);
+  const repo = path.join(root, "doctor-wrong-ref");
+  const entry = await zFixture(repo, "doctor-wrong-ref", "8");
+  const observedBytes = await fs.readFile(stateFile());
+  await beginResetJournal(root, "next-wrong-ref", observedBytes, observedState, [entry], {
+    version: 2, authorizedNextStream: "next-wrong-ref", consentKind: "setup-rebind", mintedAtRevision: 7,
+  }, { randomBytes: random, now });
+  await expect(recoverResetJournal(root, stream, { crashAt: (point) => {
+    if (point === "after-ready") throw new Error(point);
+  } })).rejects.toThrow("after-ready");
+  const otherFile = path.join(root, "doctor-other-target");
+  await fs.writeFile(otherFile, "other");
+  const other = await git(repo, "hash-object", "-w", otherFile);
+  await git(repo, "update-ref", entry.recoveryRef, other, entry.targetOid);
+
+  await expect(resetJournalDoctorCmd(root, { quarantine: true }))
+    .rejects.toThrow("reset ref preconditions could not be safely observed");
+  expect(await fs.readdir(resetQuarantineRoot(root)).catch(() => [])).toEqual([]);
+  expect(await fs.lstat(resetJournalPath(root)).then((stat) => stat.isFile())).toBe(true);
 });
 
 describe("design 138 physical write-boundary recovery", () => {

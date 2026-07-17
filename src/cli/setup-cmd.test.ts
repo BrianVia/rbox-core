@@ -29,8 +29,11 @@ import { resolveKeyedWorkspace, ensureKeyedTargetDir, persistKeyedCredentials } 
 import type { AccountKeysDTO } from "./e2ee-remote.js";
 import { promptPath } from "./prompt.js";
 import { NetworkError, WORKSPACE_MINT_RERUN_HINT } from "./remote/errors.js";
-import { saveConfig, StreamMismatchError } from "./config.js";
+import { loadRawState, loadState, resetSyncState, saveConfig, StreamMismatchError } from "./config.js";
 import { inspectResetConsent, type ResetConsentWitness } from "./reset-consent.js";
+import { beginResetJournal, recoverResetJournal, resetArchivePath, resetJournalPath } from "./reset-journal.js";
+import { resetJournalDoctorCmd } from "./reset-journal-doctor.js";
+import { createHash } from "node:crypto";
 
 const ACCOUNT_KEYS: AccountKeysDTO = { recoveryWrap: null, recoveryWrapId: null, rosters: [], keyStates: [], devices: [] };
 
@@ -529,6 +532,54 @@ test("existing-workspace rebind confirmation supplies a narrowed witness to runI
       } as never
     );
     expect(result.kind).toBe("completed");
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("v2 transaction quarantine composes end to end with the next setup rebind", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-setup-quarantine-rebind-"));
+  const oldStream = "https://api.test::ws_old::root";
+  const nextStream = "https://api.test::ws_new::root";
+  try {
+    await writeBoundSetupRoot(root);
+    const oldState = await loadRawState(root);
+    expect(oldState).toBeDefined();
+    const oldBytes = await fs.readFile(path.join(root, ".rbox", "state.json"));
+    const oldHash = createHash("sha256").update(oldBytes).digest("hex");
+    const archive = resetArchivePath(root, oldState!.stateNonce!, oldHash);
+    await beginResetJournal(root, "quarantined-next", oldBytes, oldState!, [], {
+      version: 2, authorizedNextStream: "quarantined-next", consentKind: "setup-rebind", mintedAtRevision: 4,
+    }, {
+      now: () => new Date("2026-07-17T12:00:00.000Z"),
+      randomBytes: (size) => Buffer.alloc(size, 0x33),
+    });
+    await expect(recoverResetJournal(root, oldStream, { crashAt: (point) => {
+      if (point === "after-ready") throw new Error(point);
+    } })).rejects.toThrow("after-ready");
+    await resetJournalDoctorCmd(root, { quarantine: true });
+    expect(await fs.lstat(resetJournalPath(root)).catch(() => undefined)).toBeUndefined();
+    expect(await fs.readFile(archive)).toEqual(oldBytes);
+
+    const result = await stepWorkspace(
+      { cwd: root, defaultRemote: "https://api.test" },
+      { preselectedKind: "existing", header: "Workspace" },
+      {
+        loadCredentials: async () => ({ token: "tok", remoteUrl: "https://api.test" }),
+        promptWorkspacePick: async () => ({ kind: "picked", pick: { workspaceId: "ws_new" } }),
+        promptPath: async () => root,
+        loadConfigIfPresent: async () => ({ remoteUrl: "https://api.test", remoteWorkspaceId: "ws_old", projectId: "root" }),
+        promptConfirm: async () => true,
+        runInit: async (_flags, initOpts) => {
+          await resetSyncState(root, nextStream, undefined, initOpts.resetConsent);
+          return { workspaceId: "ws_new", deviceId: "dev_new", root };
+        },
+        writeStderr: () => undefined,
+      } as never,
+    );
+    expect(result.kind).toBe("completed");
+    expect(await loadState(root, nextStream)).toMatchObject({ stream: nextStream, stateRevision: 5 });
+    expect(await fs.lstat(resetJournalPath(root)).catch(() => undefined)).toBeUndefined();
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }

@@ -185,3 +185,27 @@ test("poisoned startup arms handles once, skips the direct scan, and heal does n
     if (previousHome === undefined) delete process.env.RBOX_HOME; else process.env.RBOX_HOME = previousHome;
   }
 });
+
+test("startup mutex contention queues both the initial pull and full scan", async () => {
+  const previousWs = process.env.RBOX_DAEMON_WS_DISABLED;
+  const previousReliability = process.env.RBOX_DAEMON_WS_RELIABILITY_DISABLED;
+  const previousHome = process.env.RBOX_HOME;
+  process.env.RBOX_DAEMON_WS_DISABLED = "1";
+  process.env.RBOX_DAEMON_WS_RELIABILITY_DISABLED = "1";
+  process.env.RBOX_HOME = path.join(root, "contention-runtime");
+  const d = new RboxDaemon(root, cfg, {} as never, {
+    pullOnly: true,
+    acquireSyncMutex: async () => ({ status: "contended", holderKey: "test-holder", blockerKind: "live" }),
+  }) as unknown as HaltInternals;
+  let queued: HaltInternals["want"] | undefined;
+  d.pump = async () => { queued = { ...d.want }; };
+  try {
+    await d.start();
+    expect(queued).toMatchObject({ pull: true, fullScan: true });
+  } finally {
+    await d.stop();
+    if (previousWs === undefined) delete process.env.RBOX_DAEMON_WS_DISABLED; else process.env.RBOX_DAEMON_WS_DISABLED = previousWs;
+    if (previousReliability === undefined) delete process.env.RBOX_DAEMON_WS_RELIABILITY_DISABLED; else process.env.RBOX_DAEMON_WS_RELIABILITY_DISABLED = previousReliability;
+    if (previousHome === undefined) delete process.env.RBOX_HOME; else process.env.RBOX_HOME = previousHome;
+  }
+});

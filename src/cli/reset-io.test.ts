@@ -51,14 +51,18 @@ describe("design 138 bounded reset I/O", () => {
     await fs.writeFile(file, "1234");
     await fs.writeFile(replacement, "abcd");
     let replaced = false;
-    await expect(boundedStream(file, 16, () => {}, {
+    const read = boundedStream(file, 16, () => {}, {
       chunkBytes: 2,
       onChunk: async () => {
         if (replaced) return;
         replaced = true;
         await fs.rename(replacement, file);
       },
-    })).rejects.toThrow("changed while reading");
+    });
+    await expect(read).rejects.toMatchObject({
+      kind: "identity-race",
+      message: expect.stringContaining("changed while reading"),
+    });
   });
 
   test("streaming hash, byte equality, file equality, and copy do not need whole-source reads", async () => {

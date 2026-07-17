@@ -26,6 +26,7 @@ import {
   type StateSavePacket,
   type SyncState,
 } from "./config.js";
+import { ResetCorruptionError } from "./reset-io.js";
 
 export type ConfigLaneState = Pick<RepoRecordInput, "cfgSynced" | "cfgApplied" | "cfgToken" | "cfgShape">;
 /** Planner-facing lane results. Persistence converts these to ordered
@@ -546,9 +547,8 @@ export async function daemonBindingMatches(root: string, expectedStream: string,
       // State publication is an atomic rename and some writers intentionally do
       // not own the workspace mutex. A bounded reader may straddle that rename;
       // retry the complete identity-checked observation, never the same handle.
-      const transientIdentityRace = error instanceof Error
-        && error.message.startsWith("reset-corruption: reset file changed")
-        && error.message.endsWith(`${root}/.rbox/state.json`);
+      const transientIdentityRace = error instanceof ResetCorruptionError
+        && error.kind === "identity-race";
       if (!transientIdentityRace || attempt >= 2) throw error;
       await new Promise<void>((resolve) => setTimeout(resolve, 0));
     }

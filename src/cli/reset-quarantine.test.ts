@@ -42,7 +42,7 @@ async function fixture(scope: "journal-only" | "transaction" = "transaction") {
     phase: "prepared",
     createdAt: "2026-07-17T12:00:00.000Z",
     authorization: { version: 2, authorizedNextStream: "next-stream", consentKind: "setup-rebind", mintedAtRevision: 0 },
-    old: { stream: "old-stream", stateNonce: "a".repeat(32), stateRevision: 0, stateSha256: digest(Buffer.from("old-state\n")), z: [] },
+    old: { stream: "old-stream", stateNonce: "a".repeat(32), stateRevision: 0, stateSha256: digest(Buffer.from("old-state\n")), archiveBaseline: "absent", z: [] },
     next: { stream: "next-stream", stateNonce: "b".repeat(32), stateRevision: 0, stateSha256: digest(candidateBytes), state: nextState },
   })), Buffer.from("\n")]);
   await fs.writeFile(journal, journalBytes);

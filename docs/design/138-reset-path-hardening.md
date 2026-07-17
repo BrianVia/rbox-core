@@ -111,7 +111,7 @@ legal combination row: active state (absent | exact-old | exact-new |
 other, streaming hash), incarnation marker (absent | old | new | other —
 including the ordinary-CAS-removed state, `config.ts:563-568`),
 candidate/archive presence+hash AS A PAIR (archive-present/candidate-
-absent is illegal in `prepared`), RECOVERY refs separately from ACTIVE
+absent is legal only for the journal-authenticated exact-archive baseline), RECOVERY refs separately from ACTIVE
 refs (recovery refs may be a PREFIX subset within a common directory —
 they are created one at a time, `reset-journal.ts:196-205,272-285`), and
 active-ref retirement per common-directory GROUP (groups retire
@@ -150,6 +150,9 @@ candidate/archive pair is not recoverable.
   active state `absent` or `other`.
 - Candidate `N` means the exact canonical next-state bytes.  Archive `O` means
   bytes whose streaming SHA-256 is exactly `journal.old.stateSha256`.
+- `archiveBaseline=exact` means initiation observed those exact archive bytes
+  before publication and recorded that fact in the journal. `P0A` is legal only
+  with that witness; an archive appearing beside an `absent` baseline is not.
 - Marker `MO` / `MN` means a schema-exact marker whose semantic tuple is
   exactly `{stream,stateNonce,stateRevision}` from `journal.old` /
   `journal.next`.  This is semantic equality, not serialization equality:
@@ -186,12 +189,13 @@ candidate/archive pair is not recoverable.
 | Window id and durable boundary | Journal phase on disk | Active state | Candidate | Archive | Marker | Recovery refs | Active refs per common-dir group | Recovery action for a match |
 |---|---|---|---|---|---|---|---|---|
 | **P0 — prepared journal published**, before the first recovery artifact write (`src/cli/reset-journal.ts:391-392`) | `prepared` | `O` | absent | absent | `Mpre` | `R0` | `A0` | old: **roll-forward step candidate-create** at `:278`; next: **complete-retirement from candidate-create** |
+| **P0A — prepared journal adopts a pre-existing exact canonical archive** (`archiveBaseline=exact`) | `prepared` | `O` | absent | `O` | `Mpre` | `R0` | `A0` | old: **roll-forward step candidate-create**, then skip the already-satisfied archive copy; next: **complete-retirement from candidate-create** |
 | **P1 — candidate created** (`src/cli/reset-journal.ts:278`, durable helper `:163-170`) | `prepared` | `O` | `N` | absent | `Mpre` | `R0` | `A0` | old: **roll-forward step archive-create** at `:279-280`; next: **complete-retirement from archive-create** |
 | **P2 — archive created** (`src/cli/reset-journal.ts:279-280`, durable helper `:163-170`) | `prepared` | `O` | `N` | `O` | `Mpre` | `R0` | `A0` | old: **roll-forward step recovery-ref `E1`**, or ready-phase write if `n=0`; next: **complete-retirement from that step** |
 | **P3.k — recovery ref `Ek` updated**, one row for every `1 ≤ k ≤ n` (`src/cli/reset-journal.ts:196-205`, called at `:281`) | `prepared` | `O` | `N` | `O` | `Mpre` | `Rk` | `A0` | old: **roll-forward step recovery-ref `E(k+1)`** if `k<n`, otherwise ready-phase write; next: **complete-retirement from that step** |
 | **R0 — ready phase written** (`src/cli/reset-journal.ts:285`, phase write `:235-239`) | `ready` | `O` | `N` | `O` | `Mpre` | `Rn` | `A0` | old: **roll-forward step candidate→active rename** at `:299-300`; next: **complete-retirement from candidate→active rename** |
-| **R1 — candidate→active rename durably reached** (`src/cli/reset-journal.ts:299-301`) | `ready` | `N` | absent | `O` | `Mpre` | `Rn` | `A0` | old: **install from ACTIVE (already exact-new): proceed to installed-phase write; do NOT re-create the candidate** — then durably unlink any resurrected rename-source (fsync destination parent BEFORE source unlink, then source parent) **and only AFTER the source-parent fsync returns may the installed-phase write be published** (Round-7: publishing `installed` before source absence is durable re-opens the resurrection window under the installed signature); next: **complete-retirement, same unlink-durable-before-phase-write rule** |
-| **R2 — ready candidate re-created on recovery** (`src/cli/reset-journal.ts:297`, durable helper `:163-170`) | `ready` | `N` | `N` | `O` | `Mpre` | `Rn` | `A0` | old: **candidate→active rename with dual-parent durability** (fsync destination parent, unlink source, fsync source parent) — **installed-phase write strictly after the source-parent fsync returns**; next: **complete-retirement via the same discipline, same ordering** |
+| **R1 — candidate→active rename observed with candidate absent** | `ready` | `N` | absent | `O` | `Mpre` | `Rn` | `A0` | old: active is already exact-new; **fsync the active parent, remove candidate with absent-success semantics, fsync the candidate parent, then publish `installed`**; never re-create or rename the candidate. next: **complete-retirement with the identical physical ordering** |
+| **R2 — ready candidate re-created or resurrected** | `ready` | `N` | `N` | `O` | `Mpre` | `Rn` | `A0` | old: revalidate active and candidate as exact-new, **fsync the active parent, durably unlink the redundant candidate, fsync the candidate parent, then publish `installed`**; never rename it over active. next: **complete-retirement from that unlink with the identical ordering** |
 | **I0 — installed phase written** (`src/cli/reset-journal.ts:302`, phase write `:235-239`) | `installed` | `N` | absent | `O` | `Mpre` | `Rn` | `A0` | old: **roll-forward step state exactness check/repair** at `:305-310`; next: **complete-retirement from that check** |
 | **I1 — state check/repair completed** (`src/cli/reset-journal.ts:305-310`) | `installed` | `N` | absent | `O` | `Mpre` | `Rn` | `A0` | old: **roll-forward step marker-write** at `:311-316`; next: **complete-retirement from marker-write** |
 | **I2 — marker written** (`src/cli/reset-journal.ts:311-316`) | `installed` | `N` | absent | `O` | `MN` | `Rn` | `A0` | old: **roll-forward step retire group `D1`**, or z-retired phase write if `m=0`; next: **complete-retirement from that step** |
@@ -229,12 +233,11 @@ encounter signatures that this table correctly classifies as ambiguous.
    ref (`:201-204`).  Quarantine intentionally preserves deterministic recovery
    refs and the canonical archive.  A later journal can therefore begin with an
    exact archive while candidate is absent, or with an arbitrary bitmap of
-   exact recovery refs.  F1c explicitly makes prepared
-   archive-present/candidate-absent illegal and requires prefix semantics, so v2
-   initiation must, before journal publication, either normalize/refuse those
-   dispositions or durably record an initial archive/ref bitmap and expand this
-   table around that authenticated baseline.  A bare `Rk` claim is exhaustive
-   only with that invariant.
+   exact recovery refs.  Initiation records a byte-exact pre-existing archive as
+   `archiveBaseline=exact`, admitting only `P0A`, while exact-target recovery
+   refs are re-derivable and are old-value-CAS deleted back to `R0` before
+   publication. Wrong archive bytes or wrong ref targets refuse. A bare `Rk`
+   claim is exhaustive only with that invariant.
 3. **Marker absence is legal, but CAS publication/removal is not one durable
    transaction.**  CAS publishes state at `src/cli/config.ts:563-565` and then
    removes the marker at `:567` without a parent-directory fsync.  A crash can

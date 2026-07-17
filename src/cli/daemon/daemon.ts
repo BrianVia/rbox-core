@@ -481,6 +481,7 @@ export class RboxDaemon {
     } else {
       // Startup contention is not a recovery halt. Queue the startup scan; its
       // eventual pump iteration will pass through the same boundary.
+      this.want.pull = true;
       this.want.fullScan = true;
     }
 

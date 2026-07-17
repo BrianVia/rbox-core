@@ -17,11 +17,19 @@ export const RESET_PARSE_SAFETY_FACTOR = 2;
 export const RESET_PARSE_EXPANSION_MULTIPLIER =
   RESET_PARSE_MEASURED_MULTIPLIER * RESET_PARSE_SAFETY_FACTOR;
 
+export type ResetCorruptionKind = "corruption" | "identity-race";
+
+export interface ResetCorruptionOptions extends ErrorOptions {
+  kind?: ResetCorruptionKind;
+}
+
 export class ResetCorruptionError extends Error {
   readonly code = "RESET_CORRUPTION";
-  constructor(message: string, options?: ErrorOptions) {
+  readonly kind: ResetCorruptionKind;
+  constructor(message: string, options?: ResetCorruptionOptions) {
     super(`reset-corruption: ${message}`, options);
     this.name = "ResetCorruptionError";
+    this.kind = options?.kind ?? "corruption";
   }
 }
 
@@ -65,8 +73,8 @@ function sameIdentity(a: BoundedIdentity, b: BoundedIdentity): boolean {
   return a.dev === b.dev && a.ino === b.ino;
 }
 
-function unsafe(file: string, detail: string): ResetCorruptionError {
-  return new ResetCorruptionError(`${detail} ${file}`);
+function unsafe(file: string, detail: string, kind: ResetCorruptionKind = "corruption"): ResetCorruptionError {
+  return new ResetCorruptionError(`${detail} ${file}`, { kind });
 }
 
 /**
@@ -100,7 +108,7 @@ export async function boundedStream(
   }
   try {
     const opened = identity(await handle.stat());
-    if (!sameIdentity(before, opened) || before.size !== opened.size) throw unsafe(file, "reset file changed before read");
+    if (!sameIdentity(before, opened) || before.size !== opened.size) throw unsafe(file, "reset file changed before read", "identity-race");
     const chunkBytes = options.chunkBytes ?? 64 * 1024;
     if (!Number.isSafeInteger(chunkBytes) || chunkBytes <= 0) throw new RangeError("bounded stream chunk size must be a positive safe integer");
     const buffer = Buffer.allocUnsafe(Math.min(chunkBytes, Math.max(1, cap + 1)));
@@ -119,14 +127,16 @@ export async function boundedStream(
     try {
       afterPathStat = await fs.lstat(file);
     } catch (error) {
-      if (absent(error)) throw unsafe(file, "reset file disappeared while reading");
+      if (absent(error)) throw unsafe(file, "reset file disappeared while reading", "identity-race");
       throw error;
     }
     const afterPath = identity(afterPathStat);
-    if (!afterPathStat.isFile() || afterPathStat.isSymbolicLink()
-      || !sameIdentity(opened, afterHandle) || !sameIdentity(opened, afterPath)
+    if (!afterPathStat.isFile() || afterPathStat.isSymbolicLink()) {
+      throw unsafe(file, "unsafe non-regular reset file after read");
+    }
+    if (!sameIdentity(opened, afterHandle) || !sameIdentity(opened, afterPath)
       || afterHandle.size !== opened.size || afterPath.size !== opened.size || bytesRead !== opened.size) {
-      throw unsafe(file, "reset file changed while reading");
+      throw unsafe(file, "reset file changed while reading", "identity-race");
     }
     return { identity: opened, bytesRead };
   } finally {
@@ -143,8 +153,7 @@ export async function boundedRead(file: string, cap: number, options: BoundedStr
       const result = await boundedStream(file, cap, (chunk) => { chunks.push(Buffer.from(chunk)); }, options);
       return result ? Buffer.concat(chunks, result.bytesRead) : undefined;
     } catch (error) {
-      const changed = error instanceof ResetCorruptionError
-        && /changed|disappeared/.test(error.message);
+      const changed = error instanceof ResetCorruptionError && error.kind === "identity-race";
       if (!changed || attempt >= retries) throw error;
     }
   }
