@@ -85,6 +85,7 @@ export { scanBaseArtifacts, type BaseArtifactScan, type ForeignBaseArtifactScanE
 export {
   PROTOCOL_LOCK_ORDER,
   heldProtocolLocks,
+  assertProtocolLockHeld,
   setProtocolLockTraceForTests,
   withProtocolLockClass,
   withPostHeadCompatibilityException,
@@ -94,6 +95,8 @@ export {
   withReflogMaintenanceLocks,
   withKeepOriginsLock,
   withRepoProtocolLocks,
+  withRepositoryRecoveryFence,
   type ProtocolLockClass,
   type ProtocolLockTraceEvent,
+  type RepositoryProtocolFenceRequest,
 } from "./git/protocol-locks.js";

@@ -23,14 +23,14 @@
  */
 import os from "node:os";
 import fs from "node:fs/promises";
-import { GITIGNORE_CHOICES, continueInitWithPrecreatedWorkspace, runInit } from "./init-cmd.js";
+import { GITIGNORE_CHOICES, continueInitWithPrecreatedWorkspace, preflightInitRebind, runInit } from "./init-cmd.js";
 import { collapseHome, interpretWorkspaceNameAnswer } from "./init-plan.js";
 import { EXISTING_ACCOUNT_ENROLLMENT_MESSAGE, login, redeemPair, runGenesisEnrollment } from "./auth-cmd.js";
 import { enrollViaPrevalidatedRecovery, PairingTokenShapeError, parsePairingToken } from "./e2ee-client.js";
 import { phraseToRk } from "../engine/e2ee/index.js";
 import { enableAutostart, startDaemonAndRecordDesired } from "./autostart-cmd.js";
 import { loadCredentials } from "./credentials.js";
-import { loadConfigIfPresent } from "./config.js";
+import { loadConfigIfPresent, loadRawState, syncStreamId } from "./config.js";
 import { hasDevice } from "./e2ee-keystore.js";
 import { createRemoteWorkspace, RboxApi } from "./remote.js";
 import { promptWorkspacePick } from "./workspace-picker.js";
@@ -47,6 +47,12 @@ import {
   workspaceSyncMutexDegraded,
   type WorkspaceSyncMutex,
 } from "./sync-mutex.js";
+import {
+  createWorkspaceWithConsent,
+  mintSetupCreateConsent,
+  mintSetupExistingConsent,
+  type ResetConsentWitness,
+} from "./reset-consent.js";
 
 /** Map a workspace decision to the exact `runInit` flags (the populate-sync runs
  *  inside runInit: push for a new workspace, pull+push for a join). */
@@ -546,6 +552,7 @@ interface StepWorkspaceDeps {
   promptWorkspacePick?: typeof promptWorkspacePick;
   loadCredentials?: typeof loadCredentials;
   loadConfigIfPresent?: typeof loadConfigIfPresent;
+  loadRawState?: typeof loadRawState;
   stat?: typeof fs.stat;
   mkdir?: typeof fs.mkdir;
   acquireMutex?: typeof acquireWorkspaceSyncMutex;
@@ -570,6 +577,7 @@ export async function stepWorkspace(
   const pickWorkspace = deps.promptWorkspacePick ?? promptWorkspacePick;
   const readCredentials = deps.loadCredentials ?? loadCredentials;
   const probeConfig = deps.loadConfigIfPresent ?? loadConfigIfPresent;
+  const readRawState = deps.loadRawState ?? loadRawState;
   const stat = deps.stat ?? fs.stat;
   const mkdir = deps.mkdir ?? fs.mkdir;
   const acquireMutex = deps.acquireMutex ?? acquireWorkspaceSyncMutex;
@@ -605,10 +613,45 @@ export async function stepWorkspace(
 
     const dir = await askPath({ message: "Which directory should rbox sync?", default: opts.cwd, cwd: opts.cwd });
     writeStderr(`${e.dim(`will sync: ${dir}`)}\n`);
+    let resetConsent: ResetConsentWitness | undefined;
     const flags = workspaceFlags({ kind: "join", root: dir, workspace, name });
     if (setupOpts.noSync) flags["no-sync"] = "true";
     try {
-      const outcome = await executeInit(flags, { cwd: opts.cwd, defaultRemote: opts.defaultRemote, summary: false, guidedSetup: true });
+      const bound = await probeConfig(dir);
+      const raw = await readRawState(dir);
+      const remoteUrl = creds?.remoteUrl ?? opts.defaultRemote;
+      const nextStream = syncStreamId({ remoteUrl, remoteWorkspaceId: workspace, projectId: "root" });
+      const oldStream = raw?.stream ?? (bound ? syncStreamId(bound) : undefined);
+      if (oldStream && oldStream !== nextStream) {
+        const label = bound
+          ? (bound.name ? `${bound.name} (${bound.remoteWorkspaceId})` : bound.remoteWorkspaceId)
+          : oldStream;
+        writeStderr(`${e.yellow("⚠")}  This directory already syncs to workspace ${e.cyan(label)}.\n`);
+        const rebind = await confirm({
+          message: `Rebind it to workspace ${workspace}? (files on disk are untouched; sync history starts fresh)`,
+          default: false,
+        });
+        if (!rebind) {
+          writeStderr(`${e.dim("keeping the existing workspace; no local sync state was changed.")}\n`);
+          return { kind: "menu" };
+        }
+        resetConsent = mintSetupExistingConsent({
+          root: dir,
+          observedOldStream: oldStream,
+          observedOldNonce: raw?.stateNonce,
+          mintedAtRevision: Number.isSafeInteger(raw?.stateRevision) ? raw!.stateRevision! : 0,
+          remoteUrl,
+          workspaceId: workspace,
+          projectId: "root",
+        });
+      }
+      const outcome = await executeInit(flags, {
+        cwd: opts.cwd,
+        defaultRemote: opts.defaultRemote,
+        summary: false,
+        guidedSetup: true,
+        resetConsent,
+      });
       return outcome ? { kind: "completed", outcome } : { kind: "terminal" };
     } catch (error) {
       writeStderr(`${e.yellow(error instanceof Error ? error.message : String(error))}\n`);
@@ -645,15 +688,22 @@ export async function stepWorkspace(
     }
 
     let bound: Awaited<ReturnType<typeof loadConfigIfPresent>>;
+    let raw: Awaited<ReturnType<typeof loadRawState>>;
     try {
       bound = await probeConfig(dir);
+      raw = await readRawState(dir);
     } catch (error) {
       writeStderr(`${e.yellow(error instanceof Error ? error.message : String(error))}\n`);
       continue;
     }
-    if (bound) {
-      const label = bound.name ? `${bound.name} (${bound.remoteWorkspaceId})` : bound.remoteWorkspaceId;
+    let resetConsent: ResetConsentWitness | undefined;
+    const oldStream = raw?.stream ?? (bound ? syncStreamId(bound) : undefined);
+    if (oldStream) {
+      const label = bound
+        ? (bound.name ? `${bound.name} (${bound.remoteWorkspaceId})` : bound.remoteWorkspaceId)
+        : oldStream;
       writeStderr(`${e.yellow("⚠")}  This directory already syncs to workspace ${e.cyan(label)}.\n`);
+      const remoteUrl = (await readCredentials())?.remoteUrl ?? opts.defaultRemote;
       const rebind = await confirm({
         message: "Create a brand-new workspace for it anyway? (files on disk are untouched; sync history starts fresh)",
         default: false,
@@ -664,6 +714,14 @@ export async function stepWorkspace(
         );
         return { kind: "menu" };
       }
+      resetConsent = mintSetupCreateConsent({
+        root: dir,
+        observedOldStream: oldStream,
+        observedOldNonce: raw?.stateNonce,
+        mintedAtRevision: Number.isSafeInteger(raw?.stateRevision) ? raw!.stateRevision! : 0,
+        remoteUrl,
+        projectId: "root",
+      });
     }
 
     let syncMutex: WorkspaceSyncMutex;
@@ -701,9 +759,28 @@ export async function stepWorkspace(
       if (!creds) throw new Error("login did not produce a credential — aborting setup");
       let workspaceId: string;
       try {
-        workspaceId = await createWorkspace(creds.remoteUrl ?? opts.defaultRemote, creds.token, "root", name);
-        if (typeof workspaceId !== "string" || workspaceId.trim() === "") {
-          throw new Error(`workspace create returned no usable id — ${WORKSPACE_MINT_RERUN_HINT}`);
+        await preflightInitRebind({
+          root: dir,
+          remoteUrl: creds.remoteUrl ?? opts.defaultRemote,
+          workspace: { kind: "new", project: "root", name },
+        }, resetConsent);
+        const create = async (): Promise<string> => {
+          const id = await createWorkspace(creds.remoteUrl ?? opts.defaultRemote, creds.token, "root", name);
+          if (typeof id !== "string" || id.trim() === "") {
+            throw new Error(`workspace create returned no usable id — ${WORKSPACE_MINT_RERUN_HINT}`);
+          }
+          return id;
+        };
+        if (resetConsent) {
+          const created = await createWorkspaceWithConsent(
+            resetConsent,
+            { remoteUrl: creds.remoteUrl ?? opts.defaultRemote, projectId: "root", name },
+            create,
+          );
+          workspaceId = created.workspaceId;
+          resetConsent = created.witness;
+        } else {
+          workspaceId = await create();
         }
       } catch (error) {
         // NetworkError already carries the required unknown-outcome wording. Every
@@ -720,7 +797,7 @@ export async function stepWorkspace(
         const outcome = await continueInit(
           flags,
           { cwd: opts.cwd, defaultRemote: opts.defaultRemote, summary: false, guidedSetup: true },
-          { workspaceId, syncMutex }
+          { workspaceId, syncMutex, resetConsent }
         );
         if (outcome) return { kind: "completed", outcome };
         throw new Error("initial setup returned without completing");

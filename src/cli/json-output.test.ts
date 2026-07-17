@@ -300,7 +300,8 @@ test("status fallback re-reads state before scanning after local base mismatch",
         tmp,
         { json: true },
         statusDeps({
-          daemonBindingStatus: () => {
+          daemonBindingStatus: () => ({ alive: { running: true, pid: 1234, bootId: "boot-live" }, bound: "ws_status_fast", stale: false }),
+          readLockingHealth: async () => {
             if (!rewroteState) {
               rewroteState = true;
               fsSync.writeFileSync(
@@ -312,7 +313,7 @@ test("status fallback re-reads state before scanning after local base mismatch",
                 })
               );
             }
-            return { alive: { running: true, pid: 1234, bootId: "boot-live" }, bound: "ws_status_fast", stale: false };
+            return { status: "ok" };
           },
           scanManifest: async () => ({ generatedAt: new Date(STATUS_NOW).toISOString(), files: [file] }),
         })

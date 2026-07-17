@@ -69,6 +69,7 @@ export {
   commitProtocolRefTransaction,
   PROTOCOL_LOCK_ORDER,
   heldProtocolLocks,
+  assertProtocolLockHeld,
   setProtocolLockTraceForTests,
   withProtocolLockClass,
   withPostHeadCompatibilityException,
@@ -78,6 +79,7 @@ export {
   withReflogMaintenanceLocks,
   withKeepOriginsLock,
   withRepoProtocolLocks,
+  withRepositoryRecoveryFence,
   type ApplyGitResult,
   type ApplyBranchTransitionInput,
   type ApplyBranchTransitionResult,
@@ -105,6 +107,7 @@ export {
   type ForeignBaseArtifactScanEntry,
   type ProtocolLockClass,
   type ProtocolLockTraceEvent,
+  type RepositoryProtocolFenceRequest,
 } from "./git-state.js";
 export { discoverGitRepos, type DiscoveredGitRepo } from "./git-discover.js";
 export {

@@ -5,13 +5,15 @@ import {
   MAX_GIT_REPOS, MAX_MANIFEST_DELTA_CHAIN, readManifestChain, validateGitRepos,
   SETTLED_ABSENCE_PREFIX, artifactBinding, checkoutJournalDir, readSettledAbsence, readStateLineageV1, recoverJournal,
   repositoryIdentityForContext, repoCtxFromDisk, scanBaseArtifacts, settleBaseAbsentArtifact,
-  withCommonDirOperationLocks, withProtocolLockClass, readBasePresentArtifact, runLockedPRepairAttempt,
+  repositoryIdentityHash,
+  withRepositoryRecoveryFence, readBasePresentArtifact, runLockedPRepairAttempt,
   resumeLockedAcceptedPRepair, refreshLockedAcceptedPRepair,
   type GitSection, type Manifest,
 } from "../engine/index.js";
 import { ENCRYPT_ADDRESS_CACHE_REL } from "../engine/encrypt-address-cache.js";
-import { writeFileAtomic } from "../engine/fsutil.js";
-import { acquireLock, type AcquireLockOptions } from "../engine/git/lockfile.js";
+import { fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
+import { acquireLock, type AcquireLockOptions, type OwnedLock } from "../engine/git/lockfile.js";
+import { assertProtocolLockHeld } from "../engine/git/protocol-locks.js";
 import { gitRaw } from "../engine/git/shared.js";
 import type { ConfigStatToken } from "../engine/git/config-txn.js";
 import type { PRepairReceipt } from "../engine/git/p-repair.js";
@@ -26,9 +28,23 @@ import {
   type SafeRefWitness,
 } from "./sync-git/base-composer.js";
 import { BINDING_ID_RE } from "./telemetry/contract.js";
-import { beginResetJournal, readResetJournal, recoverResetJournal, type ResetZEntry } from "./reset-journal.js";
+import { beginResetJournal, readResetJournal, recoverResetJournal, type ResetJournalAuthorization, type ResetZEntry } from "./reset-journal.js";
+import {
+  RESET_MATERIALIZED_BYTE_LIMIT,
+  assertResetParseAdmission,
+  boundedJsonRead,
+  boundedRead,
+  parseResetJsonBytes,
+} from "./reset-io.js";
 import { createPRepairStatePort } from "./sync-git/p-repair-state.js";
 import { settleExactPresentArtifact } from "./sync-git/p-settlement.js";
+import {
+  RebindConsentRequiredError,
+  consumeResetConsent,
+  inspectResetConsent,
+  type ResetConsentInspection,
+  type ResetConsentWitness,
+} from "./reset-consent.js";
 
 function isENOENT(e: unknown): boolean {
   return (e as NodeJS.ErrnoException)?.code === "ENOENT";
@@ -311,6 +327,9 @@ export type StateSaveResult =
 
 export interface StateSaveOptions {
   lock?: AcquireLockOptions;
+  /** Complete-reset fence already owns both the protocol state class and the
+   * physical state lock. The writer must assert and reuse it, never re-enter. */
+  heldLock?: OwnedLock;
 }
 
 export const RBOX_DIR = ".rbox";
@@ -327,6 +346,23 @@ const stateIncarnationPath = (root: string) => path.join(root, RBOX_DIR, "state"
 const freshState = (stream: string): SyncState => ({ stream, lastSyncedSequence: 0, lastSyncedManifest: EMPTY_MANIFEST });
 const streamMismatchFreshStates = new WeakSet<SyncState>();
 export const stateWasStreamMismatch = (state: SyncState): boolean => streamMismatchFreshStates.has(state);
+
+/** A caller selected a different manifest stream than the durable baseline. */
+export class StreamMismatchError extends Error {
+  readonly name = "StreamMismatchError";
+
+  constructor(
+    readonly root: string,
+    readonly expectedStream: string,
+    readonly observedStream: string,
+    readonly source: "state" | "incarnation-marker",
+  ) {
+    super(
+      `sync state at ${source === "state" ? statePath(root) : stateIncarnationPath(root)} belongs to stream ${observedStream}, ` +
+      `not ${expectedStream}; refusing to reset local sync history without setup confirmation`,
+    );
+  }
+}
 
 async function hasResetLineageArchive(root: string): Promise<boolean> {
   const archiveRoot = path.join(root, RBOX_DIR, "state", "lineages");
@@ -345,45 +381,24 @@ async function hasResetLineageArchive(root: string): Promise<boolean> {
   return false;
 }
 
-function parseState(raw: string, file: string): SyncState {
-  try {
-    return JSON.parse(raw) as SyncState;
-  } catch {
-    throw new Error(
-      `Corrupt sync state at ${file}. Refusing to reset to an empty base ` +
-        `(that would force a destructive reconcile). Inspect the file, or delete it to ` +
-        `intentionally re-baseline from scratch.`
-    );
-  }
-}
-
 /** Raw state load for the transactional writer. Unlike loadState, this never
  * hides a stream mismatch by manufacturing a fresh baseline. */
 export async function loadRawState(root: string): Promise<SyncState | undefined> {
-  try {
-    return parseState(await fs.readFile(statePath(root), "utf8"), statePath(root));
-  } catch (error) {
-    if (isENOENT(error)) {
-      try {
-        const marker = JSON.parse(await fs.readFile(stateIncarnationPath(root), "utf8")) as {
-          stream?: unknown; stateNonce?: unknown; stateRevision?: unknown;
-        };
-        if (typeof marker.stream === "string" && typeof marker.stateNonce === "string") {
-          return {
-            ...freshState(marker.stream),
-            stateNonce: marker.stateNonce,
-            stateRevision: validCounter(marker.stateRevision),
-            repoRecords: {},
-          };
-        }
-        throw new Error(`Corrupt sync state incarnation at ${stateIncarnationPath(root)}`);
-      } catch (markerError) {
-        if (isENOENT(markerError)) return undefined;
-        throw markerError;
-      }
-    }
-    throw error;
+  const state = await boundedJsonRead<SyncState>(statePath(root));
+  if (state) return state;
+  const marker = await boundedJsonRead<{
+    stream?: unknown; stateNonce?: unknown; stateRevision?: unknown;
+  }>(stateIncarnationPath(root), 512 * 1024);
+  if (!marker) return undefined;
+  if (typeof marker.stream === "string" && typeof marker.stateNonce === "string") {
+    return {
+      ...freshState(marker.stream),
+      stateNonce: marker.stateNonce,
+      stateRevision: validCounter(marker.stateRevision),
+      repoRecords: {},
+    };
   }
+  throw new Error(`Corrupt sync state incarnation at ${stateIncarnationPath(root)}`);
 }
 
 function validCounter(value: unknown): number {
@@ -499,11 +514,22 @@ function busyDetail(result: Exclude<Awaited<ReturnType<typeof acquireLock>>, { s
  * no global or per-repo member lands unless every precondition succeeds. */
 export async function applyStateSavePacket(root: string, packet: StateSavePacket, options: StateSaveOptions = {}): Promise<StateSaveResult> {
   await fs.mkdir(path.join(root, RBOX_DIR), { recursive: true });
-  const acquired = await acquireLock(stateLockPath(root), options.lock);
-  if (acquired.status === "unsupported") return { status: "unsupported", error: acquired.error };
-  if (acquired.status === "error") return { status: "busy", detail: String(acquired.error) };
-  if (acquired.status === "held") return { status: "busy", detail: busyDetail(acquired) };
-  const lock = acquired.lock;
+  let lock: OwnedLock;
+  let releaseLock = false;
+  if (options.heldLock) {
+    assertProtocolLockHeld("state", path.resolve(statePath(root)));
+    if (path.resolve(options.heldLock.path) !== path.resolve(stateLockPath(root))) {
+      throw new Error("held state lock does not match the workspace state path");
+    }
+    lock = options.heldLock;
+  } else {
+    const acquired = await acquireLock(stateLockPath(root), options.lock);
+    if (acquired.status === "unsupported") return { status: "unsupported", error: acquired.error };
+    if (acquired.status === "error") return { status: "busy", detail: String(acquired.error) };
+    if (acquired.status === "held") return { status: "busy", detail: busyDetail(acquired) };
+    lock = acquired.lock;
+    releaseLock = true;
+  }
   try {
     const raw = await loadRawState(root);
     const loaded = raw ?? freshState(packet.expectedStream);
@@ -564,10 +590,15 @@ export async function applyStateSavePacket(root: string, packet: StateSavePacket
       beforeRename: async () => (owner = await lock.isOwner()),
     });
     if (!owner) return { status: "rejected", reason: "owner-lost", state: current };
-    await fs.rm(stateIncarnationPath(root), { force: true }).catch(() => {});
+    const markerExisted = await fs.lstat(stateIncarnationPath(root)).then(() => true, (error) => {
+      if (isENOENT(error)) return false;
+      throw error;
+    });
+    await fs.rm(stateIncarnationPath(root), { force: true });
+    if (markerExisted) await fsyncDirectory(path.dirname(stateIncarnationPath(root)));
     return { status: "accepted", state: next };
   } finally {
-    await lock.release();
+    if (releaseLock) await lock.release();
   }
 }
 
@@ -686,11 +717,10 @@ export async function saveConfig(root: string, cfg: WorkspaceConfig): Promise<vo
  * surprise. We refuse and surface it instead.
  *
  * A baseline stamped with a DIFFERENT stream (see {@link syncStreamId}) describes
- * another manifest stream. Before returning anything, load routes that mismatch
- * through reset-v1 so the fresh base is durable, fenced, and has retired the old
- * lineage safely. This makes a rebound root pull-without-deleting and
- * push-everything. A legacy state file with no stamp is adopted as-is (it predates
- * the stamp; every save since writes one).
+ * another manifest stream and is never reset by this read API. Every caller gets
+ * a typed refusal; only setup's confirmed reset path may replace the lineage. A
+ * legacy state file with no stamp is adopted as-is (it predates the stamp; every
+ * save since writes one).
  */
 export async function loadState(
   root: string,
@@ -708,40 +738,22 @@ export async function loadState(
     assertSyncMutex(recoveryMutex, root);
     if (workspaceSyncMutexDegraded(recoveryMutex)) throw new Error("reset journal recovery requires a non-degraded workspace fence");
     try {
-      await recoverResetJournal(root);
+      await recoverResetJournal(root, stream);
     } finally {
       if (releaseRecoveryMutex) await releaseWorkspaceSyncMutex(recoveryMutex);
     }
   }
   const fresh = freshState(stream);
-  let raw: string;
-  try {
-    raw = await fs.readFile(statePath(root), "utf8");
-  } catch (e) {
-    if (isENOENT(e)) {
-      const reset = await loadRawState(root);
-      if (!reset) return fresh;
-      if (reset.stream === stream) return reset;
-      return fresh;
-    }
-    throw e;
-  }
-  const state = parseState(raw, statePath(root));
+  const activePresent = await fs.lstat(statePath(root)).then(() => true, (error) => {
+    if (isENOENT(error)) return false;
+    throw error;
+  });
+  const loaded = await loadRawState(root);
+  if (!loaded) return fresh;
+  const state = loaded;
   if (state.stream === undefined) return { ...state, stream }; // pre-stamp legacy: adopt
   if (state.stream !== stream) {
-    warningSink(
-      `sync state at ${statePath(root)} belongs to stream ${state.stream}, ` +
-        `not ${stream} — installing a fresh fenced baseline (files on disk untouched).`
-    );
-    await resetSyncState(root, stream, heldMutex);
-    const reset = await loadRawState(root);
-    if (!reset || reset.stream !== stream) throw new Error("sync state reset did not install the requested stream");
-    // Design 130, "Complete BASE-writer retrofit": a reset/rebind is not true
-    // genesis even though its new lineage has an empty materialized BASE. Keep
-    // that provenance on the returned object so files-first cannot emit empty
-    // Git for a stream-mismatch freshening.
-    streamMismatchFreshStates.add(reset);
-    return reset;
+    throw new StreamMismatchError(root, stream, state.stream, activePresent ? "state" : "incarnation-marker");
   }
   // reset-v1's hash-addressed old-lineage archive is durable evidence that a
   // seq-0 state came from rebind/freshening rather than true genesis. Re-mark
@@ -815,35 +827,62 @@ export async function ensureTelemetryBindingId(
   }
 }
 
-async function withPreparedResetArtifacts<T>(
-  root: string,
-  state: SyncState,
-  finish: (state: SyncState, stateBytes: Buffer, z: ResetZEntry[]) => Promise<T>,
-): Promise<T> {
-  if (!state.stream || !state.stateNonce) throw new Error("reset refused: state lacks a fenced lineage");
-  const repos: Array<{
-    relPath: string;
-    repoDir: string;
-    ctx: NonNullable<Awaited<ReturnType<typeof repoCtxFromDisk>>>;
-    identity: Awaited<ReturnType<typeof repositoryIdentityForContext>>;
-    binding: ReturnType<typeof artifactBinding>;
-  }> = [];
+interface ResetRepositoryDescriptor {
+  relPath: string;
+  repoDir: string;
+  ctx: NonNullable<Awaited<ReturnType<typeof repoCtxFromDisk>>>;
+  identity: Awaited<ReturnType<typeof repositoryIdentityForContext>>;
+  branchRefs: string[];
+}
+
+/** Read-only repository inventory used to choose the complete fence. A later
+ * state-lineage recheck under that fence rejects any raced state before the
+ * first preparation mutation. */
+async function inspectResetRepositories(root: string, state: SyncState): Promise<ResetRepositoryDescriptor[]> {
+  const repos: ResetRepositoryDescriptor[] = [];
   for (const [relPath, record] of Object.entries(repoRecordsForState(state)).sort(([a], [b]) => a < b ? -1 : 1)) {
     const repoDir = relPath === "." ? root : path.join(root, ...relPath.split("/"));
     const ctx = await repoCtxFromDisk(repoDir);
-    const branchMembers = Object.keys(record.base?.refs ?? {}).filter((ref) => ref.startsWith("refs/heads/"));
+    const branchRefs = Object.keys(record.base?.refs ?? {}).filter((ref) => ref.startsWith("refs/heads/")).sort();
     if (!ctx) {
-      if (branchMembers.length || Object.keys(record.branchBaseOrigins ?? {}).length) throw new Error(`reset refused: repository identity unavailable for ${relPath}`);
+      if (branchRefs.length || Object.keys(record.branchBaseOrigins ?? {}).length) throw new Error(`reset refused: repository identity unavailable for ${relPath}`);
       continue;
     }
     const worktreeId = await fs.realpath(ctx.repoDir).catch(() => path.resolve(ctx.repoDir));
     const identity = await repositoryIdentityForContext(relPath, ctx, worktreeId);
-    const lineage = await readStateLineageV1(root, state.stream, state.stateNonce, identity);
-    const binding = artifactBinding(lineage);
-    repos.push({ relPath, repoDir, ctx, identity, binding });
+    repos.push({ relPath, repoDir, ctx, identity, branchRefs });
   }
+  return repos;
+}
 
-  return withCommonDirOperationLocks(repos.map((repo) => repo.identity.commonDirReal), async () => {
+async function assertResetMarkerNormalized(root: string, state: SyncState): Promise<void> {
+  if (!state.stream || !state.stateNonce) return; // legacy migration removes it
+  const marker = await boundedJsonRead<Record<string, unknown>>(stateIncarnationPath(root), 512 * 1024);
+  if (!marker) return;
+  const keys = Object.keys(marker).sort().join("\0");
+  if (keys !== ["stateNonce", "stateRevision", "stream"].sort().join("\0")
+    || marker.stream !== state.stream || marker.stateNonce !== state.stateNonce
+    || marker.stateRevision !== state.stateRevision) {
+    throw new Error("reset refused: stale or foreign state incarnation marker");
+  }
+}
+
+async function prepareResetArtifactsUnderFence<T>(
+  root: string,
+  state: SyncState,
+  descriptors: readonly ResetRepositoryDescriptor[],
+  heldStateLock: OwnedLock,
+  finish: (state: SyncState, stateBytes: Buffer, z: ResetZEntry[]) => Promise<T>,
+): Promise<T> {
+  if (!state.stream || !state.stateNonce) throw new Error("reset refused: state lacks a fenced lineage");
+  const stateStream = state.stream;
+  const stateNonce = state.stateNonce;
+  const repos = await Promise.all(descriptors.map(async ({ relPath, repoDir, ctx, identity }) => {
+    const lineage = await readStateLineageV1(root, stateStream, stateNonce, identity);
+    const binding = artifactBinding(lineage);
+    return { relPath, repoDir, ctx, identity, binding };
+  }));
+  {
     let currentState = state;
     const knownLineagesByCommonDir = new Map<string, Set<string>>();
     for (const repo of repos) {
@@ -873,15 +912,12 @@ async function withPreparedResetArtifacts<T>(
         if (!checkoutStat.isFile() || checkoutStat.isSymbolicLink() || checkoutStat.size > 512 * 1024) {
           throw new Error(`reset refused: unsafe or oversized checkout journal for ${relPath}`);
         }
-        const handle = await fs.open(checkoutPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
         try {
-          const raw = JSON.parse((await handle.readFile()).toString("utf8")) as { phase?: unknown };
+          const raw = await boundedJsonRead<{ phase?: unknown }>(checkoutPath, 512 * 1024);
           if (raw?.phase === "published") throw new Error(`reset refused: published checkout journal for ${relPath}`);
         } catch (error) {
           if (String(error).includes("published checkout journal")) throw error;
           throw new Error(`reset refused: unreadable or corrupt checkout journal for ${relPath}`);
-        } finally {
-          await handle.close();
         }
       }
     }
@@ -914,7 +950,7 @@ async function withPreparedResetArtifacts<T>(
         const p = item.artifact;
         const exact = await settleExactPresentArtifact({
           root, stream: state.stream, state: currentState, relPath: repo.relPath,
-          ctx: repo.ctx, binding: repo.binding, p,
+          ctx: repo.ctx, binding: repo.binding, p, stateSaveOptions: { heldLock: heldStateLock },
         });
         if (exact.status === "hold") throw new Error(`reset refused: unpreservable P for ${repo.relPath}: ${exact.reason}`);
         if (exact.status === "settled") {
@@ -934,7 +970,7 @@ async function withPreparedResetArtifacts<T>(
         if (!record) throw new Error(`reset refused: RepoRecord disappeared while repairing P for ${repo.relPath}`);
         const port = createPRepairStatePort({
           root, stream: state.stream, relPath: repo.relPath, repoKind: repo.ctx.kind,
-          effectiveRefScope: record.base?.refScope ?? "all", p,
+          effectiveRefScope: record.base?.refScope ?? "all", p, stateSaveOptions: { heldLock: heldStateLock },
         });
         const validateArtifacts = async (): Promise<boolean> => {
           const freshP = await readBasePresentArtifact(repo.repoDir, repo.binding, p.payload.ref);
@@ -1025,13 +1061,15 @@ async function withPreparedResetArtifacts<T>(
     const journalRoot = path.join(root, RBOX_DIR, "state", "git-journal");
     const remaining = await fs.readdir(journalRoot).catch((error) => isENOENT(error) ? [] : Promise.reject(error));
     if (remaining.length > 0) throw new Error(`reset refused: unbound or unreadable checkout journal entries remain at ${journalRoot}`);
-    const stateBytes = await fs.readFile(statePath(root));
-    const finalState = parseState(stateBytes.toString("utf8"), statePath(root));
+    const stateBytes = await boundedRead(statePath(root), RESET_MATERIALIZED_BYTE_LIMIT);
+    if (!stateBytes) throw new Error("reset refused: active state disappeared during artifact preflight");
+    assertResetParseAdmission(stateBytes.byteLength);
+    const finalState = parseResetJsonBytes<SyncState>(stateBytes, statePath(root));
     if (finalState.stream !== state.stream || finalState.stateNonce !== state.stateNonce) {
       throw new Error("reset refused: state lineage changed during artifact preflight");
     }
     return finish(finalState, stateBytes, entries.sort((a, b) => a.activeRef < b.activeRef ? -1 : a.activeRef > b.activeRef ? 1 : a.targetOid < b.targetOid ? -1 : 1));
-  });
+  }
 }
 
 /** Discard the local sync baseline (used when a root is REBOUND to a different
@@ -1041,7 +1079,39 @@ async function withPreparedResetArtifacts<T>(
  *  the activity record AND the design-46 `shell.line` prompt sidecar both describe
  *  the OLD binding's halt/trail and must not render under the new one.
  *  Missing files = already reset. */
-export async function resetSyncState(root: string, nextStream: string, heldMutex?: WorkspaceSyncMutex): Promise<void> {
+export interface ResetSyncStateHooks {
+  /** Test-only barrier seam under the complete fence, before consent
+   * consumption or any reset preparation mutation. */
+  afterFencedRecheck?: () => void | Promise<void>;
+}
+
+export async function resetSyncState(
+  root: string,
+  nextStream: string,
+  heldMutex?: WorkspaceSyncMutex,
+  resetConsent?: ResetConsentWitness,
+  hooks: ResetSyncStateHooks = {},
+): Promise<void> {
+  if (!nextStream) throw new Error("reset refused: next stream is empty");
+
+  // Pure capability validity happens before mkdir, locking, or recovery. It is
+  // deliberately repeated under the complete repository fence below.
+  const initialState = await loadRawState(root);
+  const initialConfig = await loadConfig(root).catch(() => undefined);
+  const initialOldStream = initialState?.stream ?? (initialConfig ? syncStreamId(initialConfig) : undefined);
+  let consentInspection: Readonly<ResetConsentInspection> | undefined;
+  if (initialOldStream !== undefined || initialState !== undefined || initialConfig !== undefined) {
+    if (!resetConsent || initialOldStream === undefined) throw new RebindConsentRequiredError(root);
+    consentInspection = inspectResetConsent(resetConsent);
+    if (consentInspection.root !== path.resolve(root)
+      || consentInspection.observedOldStream !== initialOldStream
+      || consentInspection.observedOldNonce !== initialState?.stateNonce
+      || consentInspection.mintedAtRevision !== validCounter(initialState?.stateRevision)
+      || consentInspection.nextStream !== nextStream) throw new RebindConsentRequiredError(root);
+  } else if (resetConsent) {
+    throw new RebindConsentRequiredError(root);
+  }
+
   let owned = heldMutex;
   let releaseOwned = false;
   if (!owned) {
@@ -1050,75 +1120,138 @@ export async function resetSyncState(root: string, nextStream: string, heldMutex
   }
   assertSyncMutex(owned, root);
   try {
-    await fs.mkdir(path.join(root, RBOX_DIR), { recursive: true });
     if (workspaceSyncMutexDegraded(owned)) throw new Error("sync state reset requires a non-degraded workspace fence");
 
-    // Recover a prior reset before observing ordinary state. Merely probing the
-    // state lock is insufficient: unsupported/fence-free filesystems are a hard refusal.
-    const fence = await acquireLock(stateLockPath(root));
-    if (fence.status !== "acquired") throw new Error(`sync state reset lock unavailable (${busyDetail(fence)})`);
-    await fence.lock.release();
-    await recoverResetJournal(root);
-
-    let oldBytes: Buffer;
-    try { oldBytes = await fs.readFile(statePath(root)); } catch (error) {
-      if (!isENOENT(error)) throw error;
-      // A truly absent baseline has no old lineage or Z to retire. Install a fenced
-      // genesis directly; this is initialization, not a present→absent BASE reset.
-      const genesis: SyncState = {
-        stream: nextStream,
-        stateNonce: crypto.randomBytes(16).toString("hex"),
-        stateRevision: 0,
-        lastSyncedSequence: 0,
-        lastSyncedManifest: EMPTY_MANIFEST,
-        repoRecords: {},
-      };
-      await saveState(root, genesis);
-      await fs.mkdir(path.dirname(stateIncarnationPath(root)), { recursive: true });
-      await writeFileAtomic(stateIncarnationPath(root), JSON.stringify({ stream: genesis.stream, stateNonce: genesis.stateNonce, stateRevision: 0 }, null, 2));
-      oldBytes = Buffer.alloc(0);
+    // Finish only an independently authorized standing transaction. A legacy
+    // or foreign journal halts before fresh reset preparation begins.
+    const initialRecoveryStream = initialConfig ? syncStreamId(initialConfig) : initialOldStream;
+    if (await readResetJournal(root)) {
+      if (!initialRecoveryStream) throw new Error("reset recovery halted: durable config stream is unavailable");
+      await recoverResetJournal(root, initialRecoveryStream);
     }
-    if (oldBytes.length > 0) {
-      let prior = parseState(oldBytes.toString("utf8"), statePath(root));
-      // Design 130 requires the legacy reset entry point to use the same
-      // artifact/journal protocol, while a nonce-less state itself may only
-      // carry BASE. First perform a no-op migration under the state CAS: it
-      // adopts the old binding's stream, routes legacy BASE through migration
-      // composition, and installs the nonce/revision needed by reset-v1.
-      if (prior.stateNonce === undefined) {
-        const legacyStream = prior.stream ?? await loadConfig(root).then(syncStreamId).catch(() => undefined);
-        if (!legacyStream) throw new Error("sync state reset requires the legacy binding stream");
-        const migrated = await applyStateSavePacket(root, {
-          expectedStream: legacyStream,
-          expectedNonce: "legacy",
-          sourceGlobalSeq: validCounter(prior.lastSyncedSequence),
-          repos: [],
-        });
-        if (migrated.status !== "accepted") {
-          const detail = migrated.status === "rejected" ? migrated.reason
-            : migrated.status === "busy" ? migrated.detail
-              : migrated.status;
-          throw new Error(`sync state legacy reset migration failed (${detail})`);
-        }
-        oldBytes = await fs.readFile(statePath(root));
-        prior = parseState(oldBytes.toString("utf8"), statePath(root));
-      }
-      if (!prior.stream || !prior.stateNonce || !Number.isSafeInteger(prior.stateRevision)) throw new Error("sync state reset requires a fenced state lineage");
-      await withPreparedResetArtifacts(root, prior, async (preparedState, preparedBytes, z) => {
-        await withProtocolLockClass("state", path.resolve(statePath(root)), async () => {
-          const acquired = await acquireLock(stateLockPath(root));
-          if (acquired.status !== "acquired") throw new Error(`sync state reset lock unavailable (${busyDetail(acquired)})`);
-          try {
-            const revalidated = await fs.readFile(statePath(root));
-            if (!revalidated.equals(preparedBytes)) throw new Error("sync state changed before reset journal preparation");
-            if (!(await acquired.lock.isOwner())) throw new Error("sync state reset lock ownership was lost");
-            await beginResetJournal(root, nextStream, preparedBytes, preparedState, z);
-          } finally {
-            await acquired.lock.release();
+
+    const observedState = await loadRawState(root);
+    const descriptors = observedState ? await inspectResetRepositories(root, observedState) : [];
+    const requests = descriptors.map((repo) => ({
+      commonDir: repo.identity.commonDirReal,
+      reflogRefs: repo.branchRefs,
+      origins: true,
+    }));
+    let recoveryCallerStream: string | undefined;
+
+    await withRepositoryRecoveryFence(requests, path.resolve(statePath(root)), async () => {
+      const acquired = await acquireLock(stateLockPath(root));
+      if (acquired.status !== "acquired") throw new Error(`sync state reset lock unavailable (${busyDetail(acquired)})`);
+      try {
+        // Requests were necessarily discovered before acquiring their common-dir
+        // locks. Re-resolve every checkout under those locks and refuse if a
+        // replacement now points at an unlocked repository incarnation.
+        for (const descriptor of descriptors) {
+          const currentCtx = await repoCtxFromDisk(descriptor.repoDir);
+          if (!currentCtx) throw new Error(`reset refused: repository identity changed for ${descriptor.relPath}`);
+          const worktreeId = await fs.realpath(currentCtx.repoDir).catch(() => path.resolve(currentCtx.repoDir));
+          const currentIdentity = await repositoryIdentityForContext(descriptor.relPath, currentCtx, worktreeId);
+          if (repositoryIdentityHash(currentIdentity) !== repositoryIdentityHash(descriptor.identity)) {
+            throw new Error(`reset refused: repository identity changed for ${descriptor.relPath}`);
           }
+        }
+        let prior = await loadRawState(root);
+        const freshConfig = await loadConfig(root).catch(() => undefined);
+        const fencedOldStream = prior?.stream ?? (freshConfig ? syncStreamId(freshConfig) : undefined);
+        if (consentInspection) {
+          if (!prior && !freshConfig) throw new Error("reset refused: confirmed old lineage disappeared before the fence");
+          if (fencedOldStream !== consentInspection.observedOldStream
+            || prior?.stateNonce !== consentInspection.observedOldNonce
+            || validCounter(prior?.stateRevision) !== consentInspection.mintedAtRevision) {
+            throw new Error("reset refused: state lineage changed after confirmation");
+          }
+        } else if (prior || freshConfig) {
+          throw new RebindConsentRequiredError(root);
+        }
+
+        await hooks.afterFencedRecheck?.();
+        const barrierState = await loadRawState(root);
+        const barrierConfig = await loadConfig(root).catch(() => undefined);
+        if ((barrierState?.stream ?? (barrierConfig ? syncStreamId(barrierConfig) : undefined)) !== fencedOldStream
+          || barrierState?.stateNonce !== prior?.stateNonce
+          || validCounter(barrierState?.stateRevision) !== validCounter(prior?.stateRevision)) {
+          throw new Error("reset refused: state lineage changed before journal publication");
+        }
+        prior = barrierState;
+
+        if (prior) await assertResetMarkerNormalized(root, prior);
+
+        let authorization: ResetJournalAuthorization | undefined;
+        if (consentInspection && resetConsent) {
+          const consumed = consumeResetConsent(resetConsent, {
+            root,
+            observedOldStream: consentInspection.observedOldStream,
+            observedOldNonce: consentInspection.observedOldNonce,
+            nextStream,
+          });
+          authorization = {
+            version: 2,
+            authorizedNextStream: nextStream,
+            consentKind: consumed.consentKind,
+            mintedAtRevision: consumed.mintedAtRevision,
+          };
+        }
+
+        if (!prior) {
+          const genesis: SyncState = {
+            stream: nextStream,
+            stateNonce: crypto.randomBytes(16).toString("hex"),
+            stateRevision: 0,
+            lastSyncedSequence: 0,
+            lastSyncedManifest: EMPTY_MANIFEST,
+            repoRecords: {},
+          };
+          await writeFileAtomic(statePath(root), JSON.stringify(genesis, null, 2));
+          await writeFileAtomic(stateIncarnationPath(root), JSON.stringify({
+            stream: genesis.stream, stateNonce: genesis.stateNonce, stateRevision: 0,
+          }, null, 2));
+          recoveryCallerStream = nextStream;
+          return;
+        }
+        if (!authorization) throw new RebindConsentRequiredError(root);
+
+        // Legacy-lineage migration is itself behind the fenced witness recheck
+        // and reuses the already-held physical state lock.
+        if (prior.stateNonce === undefined) {
+          const legacyStream = prior.stream ?? fencedOldStream;
+          if (!legacyStream) throw new Error("sync state reset requires the legacy binding stream");
+          const migrated = await applyStateSavePacket(root, {
+            expectedStream: legacyStream,
+            expectedNonce: "legacy",
+            sourceGlobalSeq: validCounter(prior.lastSyncedSequence),
+            repos: [],
+          }, { heldLock: acquired.lock });
+          if (migrated.status !== "accepted") {
+            const detail = migrated.status === "rejected" ? migrated.reason
+              : migrated.status === "busy" ? migrated.detail : migrated.status;
+            throw new Error(`sync state legacy reset migration failed (${detail})`);
+          }
+          prior = migrated.state;
+        }
+        if (!prior.stream || !prior.stateNonce || !Number.isSafeInteger(prior.stateRevision)) {
+          throw new Error("sync state reset requires a fenced state lineage");
+        }
+        recoveryCallerStream = prior.stream;
+        await prepareResetArtifactsUnderFence(root, prior, descriptors, acquired.lock, async (preparedState, preparedBytes, z) => {
+          const revalidated = await boundedRead(statePath(root), RESET_MATERIALIZED_BYTE_LIMIT);
+          if (!revalidated) throw new Error("sync state disappeared before reset journal preparation");
+          if (!revalidated.equals(preparedBytes)) throw new Error("sync state changed before reset journal preparation");
+          if (!(await acquired.lock.isOwner())) throw new Error("sync state reset lock ownership was lost");
+          await beginResetJournal(root, nextStream, preparedBytes, preparedState, z, authorization!);
         });
-      });
-      await recoverResetJournal(root);
+      } finally {
+        await acquired.lock.release();
+      }
+    });
+
+    if (await readResetJournal(root)) {
+      if (!recoveryCallerStream) throw new Error("reset recovery halted: old stream is unavailable");
+      await recoverResetJournal(root, recoveryCallerStream);
     }
 
     for (const p of [
@@ -1129,13 +1262,11 @@ export async function resetSyncState(root: string, nextStream: string, heldMutex
     ]) {
       try {
         await fs.rm(p, { recursive: true });
-      } catch (e) {
-        if (!isENOENT(e)) throw e;
+      } catch (error) {
+        if (!isENOENT(error)) throw error;
       }
     }
   } finally {
-    if (releaseOwned) {
-      await releaseWorkspaceSyncMutex(owned);
-    }
+    if (releaseOwned) await releaseWorkspaceSyncMutex(owned);
   }
 }

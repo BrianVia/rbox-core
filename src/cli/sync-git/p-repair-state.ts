@@ -5,6 +5,7 @@ import {
   repoRecordsForState,
   statePath,
   type RepoRecord,
+  type StateSaveOptions,
 } from "../config.js";
 import type { BasePresentPayload, PreparedProtocolRef } from "../../engine/git/base-artifacts.js";
 import { parsePRepairReceipt, type PRepairReceipt } from "../../engine/git/p-repair.js";
@@ -20,6 +21,8 @@ export interface PRepairStatePortInput {
   repoKind: "dir" | "pointer";
   effectiveRefScope: GitRefScope;
   p: PreparedProtocolRef<BasePresentPayload>;
+  /** Reset's complete repository fence owns the physical state lock. */
+  stateSaveOptions?: StateSaveOptions;
 }
 
 export type PRepairReceiptStatePortInput = Omit<PRepairStatePortInput, "p"> & { receipt: PRepairReceipt };
@@ -102,7 +105,7 @@ export function createPRepairStatePort(input: PRepairStatePortInput): PRepairSta
         newRecord: { ...withoutGeneration, partial },
         baseProof: proof,
       }],
-    });
+    }, input.stateSaveOptions);
     return result.status === "accepted" ? "accepted" : "rejected";
   };
   return {
@@ -178,7 +181,7 @@ export function createPRepairStatePort(input: PRepairStatePortInput): PRepairSta
           newRecord: { ...withoutGeneration, base: { ...record.base, refs }, partial },
           baseProof: proof,
         }],
-      });
+      }, input.stateSaveOptions);
       return result.status === "accepted" ? "accepted" : "rejected";
     },
     replaceReceipt: ({ expected, prior, next }) => receiptOnly(expected, "replace", next, prior),

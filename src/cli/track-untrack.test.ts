@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { track } from "./track-cmd.js";
 import { untrack } from "./untrack-cmd.js";
-import { findRoot, loadConfig } from "./config.js";
+import { findRoot, loadConfig, saveConfig } from "./config.js";
 import { daemonRuntimeDir } from "./daemon-control.js";
 import { desiredStatePath } from "./autostart-cmd.js";
 
@@ -149,52 +149,80 @@ test("untrack honors an interactive 'no' (confirm returns false) and changes not
   await fs.access(path.join(root, ".rbox", "workspace.json")); // exists (throws if missing)
 });
 
-// ── design 44 §2: track rebind resets the sync baseline ─────────────────────
+// ── design 138 F1a: track is bind-only, never a consent boundary ────────────
 
-test("re-tracking a DIFFERENT workspace resets the baseline (even a legacy unstamped one) and keeps the device id", async () => {
-  const { cfg: first } = await track(dir, { workspace: "ws_old" }, "https://api.test");
-
-  // Design 130, "Complete BASE-writer retrofit" requires the legacy reset path
-  // to enter the artifact protocol. The nonce-less old state is first fenced by
-  // a carry-only migration, then reset-v1 atomically installs the new lineage.
+test("re-tracking a DIFFERENT workspace refuses without changing config or baseline", async () => {
+  await track(dir, { workspace: "ws_old" }, "https://api.test");
   const statePath = path.join(dir, ".rbox", "state.json");
   await fs.writeFile(
     statePath,
     JSON.stringify({ lastSyncedSequence: 9, lastSyncedManifest: { generatedAt: "", files: [{ path: "old.txt", type: "file", sha256: "x", size: 1, mode: 420, mtimeMs: 1 }] } })
   );
+  const beforeState = await fs.readFile(statePath, "utf8");
+  const beforeConfig = await fs.readFile(path.join(dir, ".rbox", "workspace.json"), "utf8");
+  await expect(track(dir, { workspace: "ws_new" }, "https://api.test")).rejects.toThrow(/without setup confirmation/);
+  expect(await fs.readFile(statePath, "utf8")).toBe(beforeState);
+  expect(await fs.readFile(path.join(dir, ".rbox", "workspace.json"), "utf8")).toBe(beforeConfig);
 
-  const { cfg: rebound } = await track(dir, { workspace: "ws_new" }, "https://api.test");
-  expect(rebound.remoteWorkspaceId).toBe("ws_new");
-  expect(rebound.deviceId).toBe(first.deviceId); // rebinding must not mint a new device
-  const reset = JSON.parse(await fs.readFile(statePath, "utf8"));
-  expect(reset).toMatchObject({
-    stream: "https://api.test::ws_new::root",
-    stateRevision: 2,
-    lastSyncedSequence: 0,
-    lastSyncedManifest: { generatedAt: "", files: [] },
-    repoRecords: {},
+  // Re-tracking the SAME workspace remains a harmless config refresh.
+  await track(dir, { workspace: "ws_old" }, "https://api.test");
+  expect(await fs.readFile(statePath, "utf8")).toBe(beforeState);
+});
+
+test("track create-new refuses an existing binding before attempting remote creation", async () => {
+  await track(dir, { workspace: "ws_old" }, "https://api.test");
+  await expect(track(dir, { "no-interactive": "true" }, "https://api.test")).rejects.toThrow(/without setup confirmation/);
+  expect(JSON.parse(await fs.readFile(path.join(dir, ".rbox", "workspace.json"), "utf8"))).toMatchObject({
+    remoteWorkspaceId: "ws_old",
   });
-  expect(reset.stateNonce).toMatch(/^[0-9a-f]{32}$/);
-  expect(JSON.parse(await fs.readFile(path.join(dir, ".rbox", "state", "state-incarnation.json"), "utf8"))).toEqual({
-    stream: reset.stream,
-    stateNonce: reset.stateNonce,
-    stateRevision: reset.stateRevision,
-  });
-  const lineageDirs = await fs.readdir(path.join(dir, ".rbox", "state", "lineages"));
-  expect(lineageDirs).toHaveLength(1);
-  const archives = await fs.readdir(path.join(dir, ".rbox", "state", "lineages", lineageDirs[0]!));
-  expect(archives).toHaveLength(1);
-  const archived = JSON.parse(await fs.readFile(path.join(dir, ".rbox", "state", "lineages", lineageDirs[0]!, archives[0]!), "utf8"));
-  expect(archived).toMatchObject({
+});
+
+test("track refuses a foreign state lineage even when workspace config is absent", async () => {
+  const statePath = path.join(dir, ".rbox", "state.json");
+  await fs.mkdir(path.dirname(statePath), { recursive: true });
+  const bytes = JSON.stringify({
     stream: "https://api.test::ws_old::root",
-    stateRevision: 1,
-    lastSyncedSequence: 9,
-    repoRecords: {},
+    stateNonce: "0123456789abcdef0123456789abcdef",
+    stateRevision: 2,
+    lastSyncedSequence: 1,
+    lastSyncedManifest: { generatedAt: "", files: [] },
   });
-  expect(archived.stateNonce).toBe(lineageDirs[0]);
+  await fs.writeFile(statePath, bytes);
+  await expect(track(dir, { workspace: "ws_new" }, "https://api.test")).rejects.toThrow(/without setup confirmation/);
+  expect(await fs.readFile(statePath, "utf8")).toBe(bytes);
+  await expect(fs.access(path.join(dir, ".rbox", "workspace.json"))).rejects.toThrow();
+});
 
-  // Re-tracking the SAME workspace keeps an existing baseline untouched.
-  await fs.writeFile(statePath, JSON.stringify({ ...reset, lastSyncedSequence: 3 }));
-  await track(dir, { workspace: "ws_new" }, "https://api.test");
-  expect(JSON.parse(await fs.readFile(statePath, "utf8")).lastSyncedSequence).toBe(3);
+test("track rechecks lineage under the mutex instead of waiving a raced rebind from a stale snapshot", async () => {
+  await track(dir, { workspace: "ws_A" }, "https://api.test");
+  const statePath = path.join(dir, ".rbox", "state.json");
+  const state = (workspaceId: string) => JSON.stringify({
+    stream: `https://api.test::${workspaceId}::root`,
+    stateNonce: "0123456789abcdef0123456789abcdef",
+    stateRevision: 2,
+    lastSyncedSequence: 1,
+    lastSyncedManifest: { generatedAt: "", files: [] },
+  });
+  await fs.writeFile(statePath, state("ws_A"));
+
+  await expect(track(dir, {}, "https://api.test", {
+    isInteractive: () => true,
+    promptSelect: async () => "existing",
+    promptWorkspacePick: async () => {
+      await saveConfig(dir, {
+        schema: "e2ee/v1",
+        remoteWorkspaceId: "ws_B",
+        projectId: "root",
+        deviceId: "dev_B",
+        rootPath: dir,
+        remoteUrl: "https://api.test",
+        token: "",
+      });
+      await fs.writeFile(statePath, state("ws_B"));
+      return { workspaceId: "ws_A" };
+    },
+  })).rejects.toThrow(/without setup confirmation/);
+
+  expect((await loadConfig(dir)).remoteWorkspaceId).toBe("ws_B");
+  expect(JSON.parse(await fs.readFile(statePath, "utf8")).stream).toBe("https://api.test::ws_B::root");
 });

@@ -9,11 +9,12 @@
  * creating — `--no-interactive` (or a non-TTY) keeps the unattended create-new path.
  */
 import path from "node:path";
-import { loadConfig, resetSyncState, saveConfig, syncStreamId, type WorkspaceConfig } from "./config.js";
+import { loadConfig, loadRawState, saveConfig, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { style } from "./style.js";
 import { withWorkspaceSyncMutex } from "./sync-mutex.js";
 import { enrolledDeviceId } from "./e2ee-keystore.js";
 import { resolveWorkspaceDeviceId } from "./init-plan.js";
+import { RebindConsentRequiredError } from "./reset-consent.js";
 
 export interface TrackResult {
   cfg: WorkspaceConfig;
@@ -45,6 +46,9 @@ export async function track(
   const projectId = flags.project ?? "root";
   const { loadCredentials } = await import("./credentials.js");
   const creds = await (deps.loadCredentials ?? loadCredentials)();
+  const initialPrev = await loadConfig(root).catch(() => undefined);
+  const initialState = await loadRawState(root);
+  const initialStream = initialState?.stream ?? (initialPrev ? syncStreamId(initialPrev) : undefined);
 
   // New workspace → create it server-side (ownership at creation, M7). Joining an
   // existing one (--workspace) requires the caller's account to own it; that's
@@ -78,11 +82,17 @@ export async function track(
     }
 
     if (!workspaceId) {
+      if (initialStream) throw new RebindConsentRequiredError(root);
       // Create-new — also the non-interactive default. Needs a login.
       const { createRemoteWorkspace } = await import("./remote.js");
       if (!creds) throw new Error("run `rbox login` before creating a workspace");
       workspaceId = await (deps.createRemoteWorkspace ?? createRemoteWorkspace)(remoteUrl, creds.token, projectId, flags.name);
     }
+  }
+
+  const selectedStream = syncStreamId({ remoteUrl, remoteWorkspaceId: workspaceId, projectId });
+  if (initialStream && initialStream !== selectedStream) {
+    throw new RebindConsentRequiredError(root);
   }
 
   // REBIND (design 44 §2): if this root was already bound to a DIFFERENT workspace,
@@ -94,6 +104,11 @@ export async function track(
   const nextStream = syncStreamId({ remoteUrl, remoteWorkspaceId: workspaceId, projectId });
   const cfg = await withWorkspaceSyncMutex(root, async (syncMutex): Promise<WorkspaceConfig> => {
     const prev = await loadConfig(root).catch(() => undefined);
+    const currentState = await loadRawState(root);
+    const currentStream = currentState?.stream ?? (prev ? syncStreamId(prev) : undefined);
+    if (currentStream && currentStream !== nextStream) {
+      throw new RebindConsentRequiredError(root);
+    }
     const next: WorkspaceConfig = {
       schema: "e2ee/v1", // full end-to-end encryption (design 12) — the only mode
       remoteWorkspaceId: workspaceId,
@@ -116,16 +131,7 @@ export async function track(
       // no round-trip (manual-id / --workspace entry has none → status falls back to id).
       ...(pickedName ? { name: pickedName } : {}),
     };
-    if (prev && syncStreamId(prev) !== nextStream) {
-      await resetSyncState(root, nextStream, syncMutex);
-      await saveConfig(root, next);
-      console.error(
-        `${style.yellow("!")} this directory was bound to workspace ${prev.remoteWorkspaceId} — ` +
-          `rebinding to ${workspaceId}. Local sync baseline reset; files on disk untouched.`
-      );
-    } else {
-      await saveConfig(root, next);
-    }
+    await saveConfig(root, next);
     return next;
   });
   return { cfg, root };

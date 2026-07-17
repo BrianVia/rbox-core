@@ -8,6 +8,7 @@ import { statusCmdWithDeps, type StatusCmdDeps } from "./status-cmd.js";
 import { lockingHealthPath } from "./sync-mutex.js";
 import { daemonDatedLogPath } from "./rbox-paths.js";
 import { main } from "./main-dispatch.js";
+import { writeResetHaltHealth } from "./reset-health.js";
 
 const OLD_ENV = { ...process.env };
 const NOW = Date.parse("2026-07-08T12:00:00Z");
@@ -191,6 +192,32 @@ async function captureDispatch(args: string[]): Promise<string> {
     process.stdout.write = oldWrite;
   }
 }
+
+test("reset-journal halt renders text and JSON without dereferencing state", async () => {
+  const journal = path.join(root, ".rbox", "state", "reset-v1.json");
+  await fs.mkdir(path.dirname(journal), { recursive: true });
+  await fs.writeFile(journal, "{malformed");
+  const text = await captureStatus({});
+  expect(text).toContain("sync halted: a state-recovery record can't be processed");
+  expect(text).toContain("Files on disk are untouched");
+  expect(text).toContain("rbox doctor reset-journal");
+  const json = JSON.parse(await captureStatus({ json: true }));
+  expect(json).toMatchObject({ halted: true, daemon: { running: false } });
+  expect(json.reason).toContain("malformed reset journal JSON");
+  expect(json.local).toBeUndefined();
+  expect(json.remote).toBeUndefined();
+});
+
+test("stale daemon halt record with no journal renders recovering and remains read-only", async () => {
+  await writeResetHaltHealth(root, {
+    reason: "old halt",
+    journalIdentity: "a".repeat(64),
+    haltedAt: "2026-07-17T12:00:00.000Z",
+  });
+  const json = JSON.parse(await captureStatus({ json: true }));
+  expect(json).toMatchObject({ halted: true, reason: "recovering" });
+  expect(await fs.lstat(path.join(root, ".rbox", "state", "health-halt.json"))).toBeDefined();
+});
 
 test("status text and JSON expose only closed locking health", async () => {
   await fs.mkdir(path.dirname(lockingHealthPath(root)), { recursive: true });

@@ -20,6 +20,7 @@ import {
   repoRecordsForState,
   statePath,
   type RepoRecordInput,
+  type StateSaveOptions,
   type SyncState,
 } from "../config.js";
 import type { BranchTransitionWitness, RepoBaseProof } from "./base-composer.js";
@@ -83,6 +84,8 @@ export async function settleExactPresentArtifact(input: {
   ctx: RepoCtx;
   binding: ArtifactBinding;
   p: PreparedProtocolRef<BasePresentPayload>;
+  /** Reset's complete repository fence owns the physical state lock. */
+  stateSaveOptions?: StateSaveOptions;
 }): Promise<ExactPSettlementResult> {
   const payload = input.p.payload;
   const currentRecord = repoRecordsForState(input.state)[input.relPath];
@@ -149,7 +152,7 @@ export async function settleExactPresentArtifact(input: {
               expectedNonce: expectedStateNonce(fresh),
               sourceGlobalSeq: fresh.lastSyncedSequence,
               repos: [{ relPath: input.relPath, expectedRepoGen: record.repoGen, newRecord: next, baseProof: proof }],
-            }));
+            }, input.stateSaveOptions));
           if (saved.status !== "accepted") throw new Error("P settlement state CAS rejected");
           stateAfter = await loadRawState(input.root) ?? undefined;
         }, { reflogMessage: `rbox p-settle ${payload.episode}` });

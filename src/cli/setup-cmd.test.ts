@@ -29,6 +29,11 @@ import { resolveKeyedWorkspace, ensureKeyedTargetDir, persistKeyedCredentials } 
 import type { AccountKeysDTO } from "./e2ee-remote.js";
 import { promptPath } from "./prompt.js";
 import { NetworkError, WORKSPACE_MINT_RERUN_HINT } from "./remote/errors.js";
+import { loadRawState, loadState, resetSyncState, saveConfig, StreamMismatchError } from "./config.js";
+import { inspectResetConsent, type ResetConsentWitness } from "./reset-consent.js";
+import { beginResetJournal, recoverResetJournal, resetArchivePath, resetJournalPath } from "./reset-journal.js";
+import { resetJournalDoctorCmd } from "./reset-journal-doctor.js";
+import { createHash } from "node:crypto";
 
 const ACCOUNT_KEYS: AccountKeysDTO = { recoveryWrap: null, recoveryWrapId: null, rosters: [], keyStates: [], devices: [] };
 
@@ -364,6 +369,266 @@ function baseCreateDeps(root: string, overrides: Record<string, unknown> = {}) {
     ...overrides,
   } as never;
 }
+
+async function writeBoundSetupRoot(root: string): Promise<void> {
+  await saveConfig(root, {
+    schema: "e2ee/v1",
+    remoteUrl: "https://api.test",
+    remoteWorkspaceId: "ws_old",
+    projectId: "root",
+    rootPath: root,
+    deviceId: "dev_old",
+    token: "",
+  });
+  await fs.writeFile(path.join(root, ".rbox", "state.json"), JSON.stringify({
+    stream: "https://api.test::ws_old::root",
+    stateNonce: "0123456789abcdef0123456789abcdef",
+    stateRevision: 4,
+    lastSyncedSequence: 3,
+    lastSyncedManifest: { generatedAt: "old", files: [] },
+  }));
+}
+
+test("create rebind mints Stage A at confirm, narrows Stage B under the held mutex, and hands it off", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-setup-consent-"));
+  const events: string[] = [];
+  const writes: string[] = [];
+  try {
+    await writeBoundSetupRoot(root);
+    const bound = {
+      remoteUrl: "https://api.test",
+      remoteWorkspaceId: "ws_old",
+      projectId: "root",
+      rootPath: root,
+      deviceId: "dev_old",
+      token: "",
+    };
+    const result = await stepWorkspace(
+      { cwd: root, defaultRemote: "https://api.test" },
+      { preselectedKind: "new", header: "Workspace" },
+      baseCreateDeps(root, {
+        loadConfigIfPresent: async () => bound,
+        loadRawState: async () => {
+          events.push("read-lineage");
+          return {
+            stream: "https://api.test::ws_old::root",
+            stateNonce: "0123456789abcdef0123456789abcdef",
+            stateRevision: 4,
+            lastSyncedSequence: 3,
+            lastSyncedManifest: { generatedAt: "old", files: [] },
+          };
+        },
+        promptConfirm: async () => { events.push("confirm"); return true; },
+        acquireMutex: async () => { events.push("acquire"); return fakeMutex(root); },
+        createWorkspace: async () => { events.push("create"); return "ws_new"; },
+        continueInit: async (_flags: unknown, _opts: unknown, continuation: { resetConsent?: ResetConsentWitness }) => {
+          events.push("continue");
+          expect(inspectResetConsent(continuation.resetConsent!)).toMatchObject({
+            nextStream: "https://api.test::ws_new::root",
+            consentKind: "setup-create",
+          });
+          return { workspaceId: "ws_new", deviceId: "dev", root };
+        },
+        writeStderr: (text: string) => void writes.push(text),
+      })
+    );
+    expect(result.kind, writes.join("")).toBe("completed");
+    expect(events).toEqual(["read-lineage", "confirm", "acquire", "create", "continue"]);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("marker-only lineage reaches create confirmation and receives an authorized witness", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-setup-marker-consent-"));
+  let confirms = 0;
+  let creates = 0;
+  try {
+    await fs.mkdir(path.join(root, ".rbox", "state"), { recursive: true });
+    await fs.writeFile(path.join(root, ".rbox", "state", "state-incarnation.json"), JSON.stringify({
+      stream: "https://api.test::ws_old::root",
+      stateNonce: "0123456789abcdef0123456789abcdef",
+      stateRevision: 4,
+    }));
+    const result = await stepWorkspace(
+      { cwd: root, defaultRemote: "https://api.test" },
+      { preselectedKind: "new", header: "Workspace" },
+      baseCreateDeps(root, {
+        promptConfirm: async () => { confirms++; return true; },
+        createWorkspace: async () => { creates++; return "ws_new"; },
+        continueInit: async (_flags: unknown, _opts: unknown, continuation: { resetConsent?: ResetConsentWitness }) => {
+          expect(inspectResetConsent(continuation.resetConsent!)).toMatchObject({
+            nextStream: "https://api.test::ws_new::root",
+            consentKind: "setup-create",
+          });
+          return { workspaceId: "ws_new", deviceId: "dev", root };
+        },
+      })
+    );
+    expect(result.kind).toBe("completed");
+    expect(confirms).toBe(1);
+    expect(creates).toBe(1);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("create rebind lineage change after confirm refuses before the remote POST", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-setup-consent-race-"));
+  let creates = 0;
+  let releases = 0;
+  const previousExit = process.exitCode;
+  try {
+    await writeBoundSetupRoot(root);
+    const result = await stepWorkspace(
+      { cwd: root, defaultRemote: "https://api.test" },
+      { preselectedKind: "new", header: "Workspace" },
+      baseCreateDeps(root, {
+        loadConfigIfPresent: async () => ({ remoteUrl: "https://api.test", remoteWorkspaceId: "ws_old", projectId: "root" }),
+        acquireMutex: async () => {
+          await fs.writeFile(path.join(root, ".rbox", "state.json"), JSON.stringify({
+            stream: "https://api.test::ws_old::root",
+            stateNonce: "fedcba9876543210fedcba9876543210",
+            stateRevision: 5,
+            lastSyncedSequence: 4,
+            lastSyncedManifest: { generatedAt: "raced", files: [] },
+          }));
+          return fakeMutex(root);
+        },
+        createWorkspace: async () => { creates++; return "ws_never"; },
+        releaseMutex: async () => { releases++; },
+      })
+    );
+    expect(result).toEqual({ kind: "terminal" });
+    expect(creates).toBe(0);
+    expect(releases).toBe(1);
+  } finally {
+    process.exitCode = previousExit;
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("existing-workspace rebind confirmation supplies a narrowed witness to runInit", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-setup-existing-consent-"));
+  try {
+    await writeBoundSetupRoot(root);
+    const result = await stepWorkspace(
+      { cwd: root, defaultRemote: "https://api.test" },
+      { preselectedKind: "existing", header: "Workspace" },
+      {
+        loadCredentials: async () => ({ token: "tok", remoteUrl: "https://api.test" }),
+        promptWorkspacePick: (async () => ({ kind: "picked", pick: { workspaceId: "ws_new" } })) as never,
+        promptPath: async () => root,
+        loadConfigIfPresent: async () => ({ remoteUrl: "https://api.test", remoteWorkspaceId: "ws_old", projectId: "root" }),
+        promptConfirm: async () => true,
+        runInit: async (_flags, initOpts) => {
+          expect(inspectResetConsent(initOpts.resetConsent!)).toMatchObject({
+            nextStream: "https://api.test::ws_new::root",
+            consentKind: "setup-rebind",
+          });
+          return { workspaceId: "ws_new", deviceId: "dev", root };
+        },
+        writeStderr: () => undefined,
+      } as never
+    );
+    expect(result.kind).toBe("completed");
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("v2 transaction quarantine composes end to end with the next setup rebind", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-setup-quarantine-rebind-"));
+  const oldStream = "https://api.test::ws_old::root";
+  const nextStream = "https://api.test::ws_new::root";
+  try {
+    await writeBoundSetupRoot(root);
+    const oldState = await loadRawState(root);
+    expect(oldState).toBeDefined();
+    const oldBytes = await fs.readFile(path.join(root, ".rbox", "state.json"));
+    const oldHash = createHash("sha256").update(oldBytes).digest("hex");
+    const archive = resetArchivePath(root, oldState!.stateNonce!, oldHash);
+    await beginResetJournal(root, "quarantined-next", oldBytes, oldState!, [], {
+      version: 2, authorizedNextStream: "quarantined-next", consentKind: "setup-rebind", mintedAtRevision: 4,
+    }, {
+      now: () => new Date("2026-07-17T12:00:00.000Z"),
+      randomBytes: (size) => Buffer.alloc(size, 0x33),
+    });
+    await expect(recoverResetJournal(root, oldStream, { crashAt: (point) => {
+      if (point === "after-ready") throw new Error(point);
+    } })).rejects.toThrow("after-ready");
+    await resetJournalDoctorCmd(root, { quarantine: true });
+    expect(await fs.lstat(resetJournalPath(root)).catch(() => undefined)).toBeUndefined();
+    expect(await fs.readFile(archive)).toEqual(oldBytes);
+
+    const result = await stepWorkspace(
+      { cwd: root, defaultRemote: "https://api.test" },
+      { preselectedKind: "existing", header: "Workspace" },
+      {
+        loadCredentials: async () => ({ token: "tok", remoteUrl: "https://api.test" }),
+        promptWorkspacePick: async () => ({ kind: "picked", pick: { workspaceId: "ws_new" } }),
+        promptPath: async () => root,
+        loadConfigIfPresent: async () => ({ remoteUrl: "https://api.test", remoteWorkspaceId: "ws_old", projectId: "root" }),
+        promptConfirm: async () => true,
+        runInit: async (_flags, initOpts) => {
+          await resetSyncState(root, nextStream, undefined, initOpts.resetConsent);
+          return { workspaceId: "ws_new", deviceId: "dev_new", root };
+        },
+        writeStderr: () => undefined,
+      } as never,
+    );
+    expect(result.kind).toBe("completed");
+    expect(await loadState(root, nextStream)).toMatchObject({ stream: nextStream, stateRevision: 5 });
+    expect(await fs.lstat(resetJournalPath(root)).catch(() => undefined)).toBeUndefined();
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("declined existing-workspace rebind returns to the Step-2 menu without calling init", async () => {
+  let initCalls = 0;
+  const result = await stepWorkspace(
+    { cwd: "/join", defaultRemote: "https://api.test" },
+    { preselectedKind: "existing", header: "Workspace" },
+    {
+      loadCredentials: async () => ({ token: "tok", remoteUrl: "https://api.test" }),
+      promptWorkspacePick: (async () => ({ kind: "picked", pick: { workspaceId: "ws_new" } })) as never,
+      promptPath: async () => "/join",
+      loadConfigIfPresent: async () => ({ remoteUrl: "https://api.test", remoteWorkspaceId: "ws_old", projectId: "root" }),
+      loadRawState: async () => ({ stream: "https://api.test::ws_old::root" }),
+      promptConfirm: async () => false,
+      runInit: async () => { initCalls++; return undefined; },
+      writeStderr: () => undefined,
+    } as never
+  );
+  expect(result).toEqual({ kind: "menu" });
+  expect(initCalls).toBe(0);
+});
+
+test("post-runInit StreamMismatchError is rendered and remains terminal", async () => {
+  const writes: string[] = [];
+  const previousExit = process.exitCode;
+  try {
+    const result = await stepWorkspace(
+      { cwd: "/join", defaultRemote: "https://api.test" },
+      { preselectedKind: "existing", header: "Workspace" },
+      {
+        loadCredentials: async () => ({ token: "tok", remoteUrl: "https://api.test" }),
+        promptWorkspacePick: (async () => ({ kind: "picked", pick: { workspaceId: "ws_new" } })) as never,
+        promptPath: async () => "/join",
+        loadConfigIfPresent: async () => undefined,
+        loadRawState: async () => undefined,
+        runInit: async () => { throw new StreamMismatchError("/join", "new", "old", "state"); },
+        writeStderr: (text: string) => void writes.push(text),
+      } as never
+    );
+    expect(result).toEqual({ kind: "terminal" });
+    expect(process.exitCode).toBe(1);
+    expect(writes.join("")).toContain("refusing to reset local sync history without setup confirmation");
+  } finally {
+    process.exitCode = previousExit;
+  }
+});
 
 test("setup path site uses retrying promptPath and injected cwd resolution", async () => {
   const answers = ["~somebody/project", "relative/project"];

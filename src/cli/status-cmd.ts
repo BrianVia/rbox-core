@@ -32,6 +32,8 @@ import { readFreshPopulateStatus } from "./populate-status.js";
 import { readLockingHealth, type LockingHealth } from "./sync-mutex.js";
 import { readAmbientDaemonStatusRecord, validDaemonVersion } from "./daemon/ambient-status.js";
 import { serializeGitDeferralLanes } from "./sync-git/git-deferral-json.js";
+import { inspectResetJournalSafety } from "./reset-halt-inspection.js";
+import { readResetHaltHealth } from "./reset-health.js";
 
 interface StatusAccountJson {
   plan: string | null;
@@ -261,15 +263,46 @@ export async function statusCmdWithDeps(
   deps: StatusCmdDeps = defaultStatusDeps
 ): Promise<StatusCmdResult> {
   const creds = await loadCredentials().catch(() => undefined);
-  const accountSummaryP = opts.json ? Promise.resolve(null) : fetchAccountSummary();
   const rawCfg = await loadConfig(root);
   const cfg = { ...rawCfg, remoteUrl: creds?.remoteUrl ?? rawCfg.remoteUrl };
-  let state = await loadState(root, syncStreamId(cfg));
-
   const daemonBinding = deps.daemonBindingStatus(root, cfg.remoteWorkspaceId);
   const alive = daemonBinding.alive;
   const daemonStale = daemonBinding.stale;
   const bg = { running: alive.running && !daemonStale, pid: alive.pid };
+
+  // Design 138 F2b: this branch precedes every loadState/state-dependent
+  // section. The classifier and health reader are both read-only; a direct
+  // status invocation can therefore explain an unsafe standing transaction
+  // without helping the daemon mutate its side-file.
+  const [resetInspection, resetHealth] = await Promise.all([
+    inspectResetJournalSafety(root, syncStreamId(cfg)),
+    readResetHaltHealth(root),
+  ]);
+  const resetDegraded = resetInspection.status === "halt" || resetHealth !== undefined;
+  if (resetDegraded) {
+    const reason = resetInspection.status === "halt" ? resetInspection.reason : "recovering";
+    if (opts.json) {
+      emitJson({
+        workspace: { id: cfg.remoteWorkspaceId, name: cfg.name ?? null, root },
+        halted: true,
+        reason,
+        daemon: { running: bg.running, pid: bg.pid ?? null },
+      });
+      return { daemonRunning: bg.running };
+    }
+    const wsLabel = cfg.name
+      ? `${style.cyan(cfg.name)} ${style.dim("@")} ${root} ${style.dim(`(${shortWorkspaceId(cfg.remoteWorkspaceId)})`)}`
+      : `${style.cyan(cfg.remoteWorkspaceId)} ${style.dim("@")} ${root}`;
+    console.log(`${style.bold("workspace")} ${wsLabel} ${style.dim(`· rbox ${RBOX_VERSION}`)}`);
+    console.log(`  ${style.yellow(`sync halted: a state-recovery record can't be processed (${reason}). Files on disk are untouched; run \`rbox doctor reset-journal\`.`)}`);
+    console.log(`  ${style.dim("background sync:")} ${daemonStale
+      ? style.yellow(`running but bound to a previous workspace (pid ${alive.pid})`)
+      : bg.running ? style.green(`running (pid ${bg.pid})`) : style.yellow("stopped")}`);
+    return { daemonRunning: bg.running };
+  }
+
+  const accountSummaryP = opts.json ? Promise.resolve(null) : fetchAccountSummary();
+  let state = await loadState(root, syncStreamId(cfg));
 
   const activityP = daemonStale ? Promise.resolve(undefined) : loadActivity(root);
   const trashP = trashStats(root).catch(() => undefined);

@@ -105,6 +105,9 @@ import { cleanPath, LOG_PATHS_MAX, scanStatsLine, summarizeActions } from "./ren
 import { RotatingDaemonLogger, type DaemonLogSink } from "./logger.js";
 import { TelemetryQueue } from "../telemetry/queue.js";
 import { SyncStateReporter } from "../telemetry/sync-state.js";
+import { inspectResetJournalSafety } from "../reset-halt-inspection.js";
+import { clearResetHaltHealth, readResetHaltHealth, writeResetHaltHealth } from "../reset-health.js";
+import { RESET_RECOVERY_RETRY_MS, ResetHaltLogGate } from "./reset-halt-policy.js";
 
 type RboxBarAmbientStatus = AmbientDaemonStatusV1 & {
   fileCount: number;
@@ -274,6 +277,12 @@ export class RboxDaemon {
   private cache!: HashCache;
   private manifest: Manifest = { generatedAt: "", files: [] };
   private syncBase?: SyncState;
+  private resetLifecycle: "ready" | "halted" | "recovering" | "bootstrapping" = "ready";
+  private resetRetryTimer?: ReturnType<typeof setTimeout>;
+  private nextResetRetryAt = Number.NEGATIVE_INFINITY;
+  private resetHaltIdentity?: string;
+  private resetHaltReason?: string;
+  private readonly resetHaltLogGate = new ResetHaltLogGate();
   private pendingEvents: WatchEvent[] = [];
 
   private watcher?: Watcher;
@@ -449,33 +458,44 @@ export class RboxDaemon {
     this.startActivityHeartbeat();
     this.startAmbientStatusHeartbeat();
     this.startTelemetryTimers();
-    // Seed the push log's sequence memory so the first no-op push (re-publishing
-    // nothing) isn't logged as an advance.
-    const initialState = await this.loadSyncBase();
-    // Seed the in-memory manifest with the last-synced base BEFORE the first scan so a
-    // heartbeat firing during the scan window diffs base-vs-base (clean) — never
-    // empty-vs-base, which would report a phantom full-tree deletion in `rbox status`
-    // (the 2026-07-12 near-miss: an EACCES-aborted first scan left this.manifest empty
-    // and every heartbeat wrote "126,557 deleted"). Fix 1 stops the abort; this stops
-    // the phantom count even if a future scan-fatal throws here.
-    this.manifest = initialState.lastSyncedManifest;
-    this.lastLoggedSeq = initialState.lastSyncedSequence;
-    this.rebuildMatcher(initialState);
-
-    // Initial convergence: full scan, then a real pull+push cycle.
-    await this.replaceManifestFromScan(this.cache, initialState.lastSyncedManifest, undefined, undefined, "pruned");
-    this.pruneCache();
-    await this.cache.save(this.root);
-    this.want.pull = true;
-    this.requestPush();
-    await this.pump();
+    // The direct startup scan is an operation too. Acquire the same mutex and
+    // execute the universal journal boundary before loadState or scan work.
+    const startupMutex = await this.acquireSyncMutexFn(this.root);
+    if (startupMutex.status === "acquired") {
+      try {
+        if (await this.resetOperationBoundary(startupMutex.handle)) {
+          const boundaryBootstrapped = this.syncBase !== undefined;
+          const initialState = this.syncBase ?? await this.loadSyncBase(startupMutex.handle);
+          if (boundaryBootstrapped || await this.bootstrapAgreement(initialState)) {
+            if (!boundaryBootstrapped) this.seedFromState(initialState);
+            await this.replaceManifestFromScan(this.cache, initialState.lastSyncedManifest, undefined, undefined, "pruned");
+            this.pruneCache();
+            await this.cache.save(this.root);
+            this.want.pull = true;
+            if (!this.pullOnly) this.want.push = true;
+          }
+        }
+      } finally {
+        await releaseWorkspaceSyncMutex(startupMutex.handle);
+      }
+    } else {
+      // Startup contention is not a recovery halt. Queue the startup scan; its
+      // eventual pump iteration will pass through the same boundary.
+      this.want.pull = true;
+      this.want.fullScan = true;
+    }
 
     if (!this.pullOnly) await this.startLiveWatch();
     this.maybeConnect();
     this.startBackstop();
     this.startUpdateChecks();
 
-    this.log(this.watcher ? "rbox daemon ready" : "rbox daemon ready (periodic-scan mode; no live watch)");
+    if (this.resetLifecycle === "ready") {
+      await this.pump();
+      this.log(this.watcher ? "rbox daemon ready" : "rbox daemon ready (periodic-scan mode; no live watch)");
+    } else {
+      this.log("rbox daemon live but sync halted pending reset-journal recovery");
+    }
   }
 
   /**
@@ -493,12 +513,14 @@ export class RboxDaemon {
         this.root,
         this.matcher,
         (events) => {
+          if (this.resetLifecycle !== "ready") return;
           this.noteChurn();
           this.pendingEvents.push(...events);
           this.request("push");
         },
         {
           onRawEvent: (event) => {
+            if (this.resetLifecycle !== "ready") return;
             this.noteChurn();
             this.markLocalUnsettledFromWatchEvent();
             for (const audit of this.openDriftAudits) {
@@ -632,6 +654,7 @@ export class RboxDaemon {
     if (firstStop) await this.writePausedAmbientStatusImmediate().catch(() => {});
     if (this.safetyTimer) clearTimeout(this.safetyTimer);
     if (this.deepTimer) clearInterval(this.deepTimer);
+    if (this.resetRetryTimer) clearTimeout(this.resetRetryTimer);
     for (const audit of this.openDriftAudits) if (audit.timer) clearTimeout(audit.timer);
     this.openDriftAudits.clear();
     if (this.updateCheckTimer) clearInterval(this.updateCheckTimer);
@@ -686,13 +709,106 @@ export class RboxDaemon {
       this.signalMutexEarlyReprobe();
     }
     this.writeAmbientStatus();
+    if (this.resetLifecycle !== "ready" && this.now() < this.nextResetRetryAt) return;
     void this.pump();
   }
 
-  private async loadSyncBase(): Promise<SyncState> {
-    const state = await loadState(this.root, syncStreamId(this.cfg), this.log);
+  private async loadSyncBase(heldMutex?: WorkspaceSyncMutex): Promise<SyncState> {
+    const state = await loadState(this.root, syncStreamId(this.cfg), this.log, heldMutex);
     this.syncBase = state;
     return state;
+  }
+
+  private seedFromState(state: SyncState): void {
+    this.syncBase = state;
+    this.manifest = state.lastSyncedManifest;
+    this.lastLoggedSeq = state.lastSyncedSequence;
+    this.rebuildMatcher(state);
+  }
+
+  private scheduleResetRetry(): void {
+    if (this.stopped || this.resetRetryTimer) return;
+    const delay = Math.max(0, this.nextResetRetryAt - this.now());
+    this.resetRetryTimer = setTimeout(() => {
+      this.resetRetryTimer = undefined;
+      if (this.stopped) return;
+      this.nextResetRetryAt = this.now();
+      this.want.fullScan = true;
+      void this.pump();
+    }, delay);
+    this.resetRetryTimer.unref?.();
+  }
+
+  private async enterResetHalt(reason: string, journalIdentity?: string): Promise<void> {
+    const identity = journalIdentity ?? this.resetHaltIdentity ?? "0".repeat(64);
+    const changed = this.resetLifecycle !== "halted" || this.resetHaltIdentity !== identity || this.resetHaltReason !== reason;
+    this.resetLifecycle = "halted";
+    this.resetHaltIdentity = identity;
+    this.resetHaltReason = reason;
+    this.nextResetRetryAt = this.now() + RESET_RECOVERY_RETRY_MS;
+    if (changed) {
+      await writeResetHaltHealth(this.root, {
+        reason,
+        journalIdentity: identity,
+        haltedAt: new Date(this.now()).toISOString(),
+      });
+    }
+    if (this.resetHaltLogGate.shouldLog(reason, this.now())) this.log(`sync halted: reset journal cannot be processed (${reason})`);
+    this.scheduleResetRetry();
+  }
+
+  private async bootstrapAgreement(state: SyncState): Promise<boolean> {
+    const bootStream = syncStreamId(this.cfg);
+    const fresh = await loadConfig(this.root);
+    const freshStream = syncStreamId(fresh);
+    const nonce = expectedStateNonce(state);
+    const activeAgrees = state.stream === bootStream && await daemonBindingMatches(this.root, state.stream, nonce);
+    if (freshStream !== bootStream || !activeAgrees) {
+      await this.enterResetHalt("daemon boot binding, durable config, and recovered active state do not agree", this.resetHaltIdentity);
+      return false;
+    }
+    return true;
+  }
+
+  /** Called only while the workspace sync mutex is held. Returns true exactly
+   * when scan/pull/push work may proceed. */
+  private async resetOperationBoundary(heldMutex?: WorkspaceSyncMutex): Promise<boolean> {
+    const inspection = await inspectResetJournalSafety(this.root, syncStreamId(this.cfg));
+    const persisted = await readResetHaltHealth(this.root);
+    if (inspection.status === "halt") {
+      await this.enterResetHalt(inspection.reason, inspection.journalIdentityHash);
+      return false;
+    }
+    if (inspection.status === "recoverable") this.resetLifecycle = "recovering";
+    if (inspection.status === "recoverable" || this.resetLifecycle !== "ready" || persisted) {
+      this.resetLifecycle = "recovering";
+      let state: SyncState;
+      try {
+        // loadState owns the classifier-gated forward-recovery implementation.
+        state = await this.loadSyncBase(heldMutex);
+      } catch (error) {
+        await this.enterResetHalt(error instanceof Error ? error.message : String(error), inspection.status === "recoverable" ? inspection.journalIdentityHash : undefined);
+        return false;
+      }
+      const after = await inspectResetJournalSafety(this.root, syncStreamId(this.cfg));
+      if (after.status !== "none") {
+        if (after.status === "halt") await this.enterResetHalt(after.reason, after.journalIdentityHash);
+        else await this.enterResetHalt("reset journal recovery did not reach a terminal state", after.journalIdentityHash);
+        return false;
+      }
+      if (!await this.bootstrapAgreement(state)) return false;
+      this.resetLifecycle = "bootstrapping";
+      this.seedFromState(state);
+      this.resetLifecycle = "ready";
+      this.resetHaltIdentity = undefined;
+      this.resetHaltReason = undefined;
+      this.nextResetRetryAt = Number.NEGATIVE_INFINITY;
+      if (this.resetRetryTimer) clearTimeout(this.resetRetryTimer);
+      this.resetRetryTimer = undefined;
+      await clearResetHaltHealth(this.root);
+      this.log("reset journal healed; background sync bootstrapped");
+    }
+    return true;
   }
 
   private startUpdateChecks(): void {
@@ -826,6 +942,7 @@ export class RboxDaemon {
         });
         const syncMutex = acquired.handle;
         try {
+          if (!await this.resetOperationBoundary(syncMutex)) break;
           const binding = this.syncBase ?? await this.loadSyncBase();
           const bindingMatches = await daemonBindingMatches(this.root, syncStreamId(this.cfg), expectedStateNonce(binding));
           if (!bindingMatches) {
@@ -2054,6 +2171,7 @@ export class RboxDaemon {
 
   private handleWsMessageData(data: string, from?: WebSocket): void {
     if (from !== undefined && this.ws !== from) return;
+    if (this.resetLifecycle !== "ready") return;
     if (this.ws) this.armPongDeadline(this.ws);
     if (data === "pong") {
       this.refreshWsAtThrottled();
@@ -2188,7 +2306,7 @@ export class RboxDaemon {
       this.log("ws connected");
       const generation = this.markWsOpen(ws);
       this.pendingCatchUpGeneration = generation;
-      this.request("pull"); // catch up on anything missed while disconnected
+      if (this.resetLifecycle === "ready") this.request("pull"); // catch up on anything missed while disconnected
       this.scheduleNextBackstop();
     });
     ws.addEventListener("message", (ev: MessageEvent) => {
@@ -2227,7 +2345,6 @@ export async function runDaemon(root: string): Promise<void> {
   };
   try {
     const { cfg, deps } = await buildAuthedRemote(root, Date.now, logger.log); // E2EE transport + injected KEK
-    await loadState(root, syncStreamId(cfg), logger.log); // surfaces corrupt-state errors loudly before we go live
     daemon = new RboxDaemon(root, cfg, { ...deps, onGitLog: logger.log, warningSink: logger.log }, {
       bootId,
       pullOnly: process.env.RBOX_DAEMON_PULL_ONLY === "1",

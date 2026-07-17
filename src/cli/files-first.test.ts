@@ -198,12 +198,11 @@ test("flag ON but NO file diff (git-only): files-first bypassed, git-first singl
 });
 
 // ── 4. rebind excluded: a stream-mismatch state never files-first ───────────
-test("flag ON but stream-mismatch (rebind, even nonzero persisted seq): git captured INLINE", async () => {
+test("flag ON but stream-mismatch refuses before files-first or git capture", async () => {
   process.env.RBOX_FILES_FIRST = "1";
   await repoWithFile();
-  // Design 130, "Artifact lifecycle, reset, and diagnostics" forbids a
-  // fence-free reset. Persist a capable DIFFERENT-stream lineage; loadState
-  // transactionally replaces it with seq 0 and marks the result as a rebind.
+  // Design 138 makes every loadState mismatch a hard refusal. Only setup may
+  // authorize the destructive rebind transaction.
   await saveStateUnsafeLegacyOrTest(root, {
     stream: "http://x::ws_OTHER::root",
     stateNonce: "a".repeat(32),
@@ -214,10 +213,8 @@ test("flag ON but stream-mismatch (rebind, even nonzero persisted seq): git capt
   });
   expect(syncStreamId(cfg)).toBe(STREAM); // sanity: our stream differs from the persisted one
 
-  const r = await push(root, cfg, deps);
-  expect(r.committed).toBe(true);
-  expect(r.gitDeferred).toBeFalsy(); // rebind → ordinary path, git inline
-  expect(gitKeys(remote.manifestAt(r.sequence))).toEqual(["repo"]);
+  await expect(push(root, cfg, deps)).rejects.toThrow("refusing to reset local sync history without setup confirmation");
+  expect(remote.manifestAt(1)).toBeUndefined();
 });
 
 // ── 5. starvation fallback: all files churn → fallback fires once, git attaches ─
