@@ -74,7 +74,11 @@ remain tag-driven and are unaffected by the branch promotion model.
 Release flow: bump `package.json` version + `CHECKED_IN_RBOX_VERSION`
 (`src/cli/version.ts`, first quoted string is read by the workflow's
 consistency gate), commit `release: vX.Y.Z — …` on main, run
-`bun scripts/ux/regress.ts` before tagging, tag `v*`, push.
+`bun scripts/ux/regress.ts`, push `main`, and wait
+for that exact SHA's main CI run to pass. Then tag that commit `v*` and push the
+tag. A simultaneous main+tag push is safe, but the release runner waits for the
+exact-SHA main CI verdict before installing build dependencies or receiving the
+step-scoped signing key. PR merge-preview results never qualify.
 Fleet upgrade after the run goes green:
 `curl -fsSL https://rbox.to/install.sh | sh` then `rbox stop && rbox start`
 (run from inside the workspace; binary at `~/.rbox/bin/rbox`).
@@ -97,6 +101,11 @@ bunx wrangler@4.107.0 r2 object put rbox-releases/releases/changelog.md \
   --file=CHANGELOG.md --content-type='text/markdown; charset=utf-8' --remote
 curl --fail --silent --show-error --request POST "$RBOX_HOME_DEPLOY_HOOK" >/dev/null
 ```
+
+The release publisher uploads and fetch-verifies immutable versioned binaries
+concurrently, then updates latest aliases, `install.sh`, manifest, and detached
+signature sequentially. Any immutable transfer or hash failure prevents all
+mutable channel changes.
 
 ## Secrets (GitHub repo)
 

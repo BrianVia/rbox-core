@@ -5,8 +5,8 @@
  *   2. compile the standalone binaries for each target
  *   3. sha256 each; assemble version.json (with immutable versioned paths)
  *   4. sign version.json with RBOX_RELEASE_PRIVATE_KEY (env) → version.json.sig
- *   5. upload binaries (versioned + latest alias) + install.sh + manifest + sig to
- *      the rbox-releases R2 bucket via wrangler, then fetch-back-verify the shas
+ *   5. upload and fetch-verify immutable binaries, then publish latest aliases,
+ *      install.sh, manifest, signature, and changelog to the rbox-releases bucket
  *
  * Usage: bun scripts/release.ts <version> [--targets=linux-x64,darwin-arm64] [--no-upload]
  * Env:   RBOX_RELEASE_PRIVATE_KEY (Ed25519 pkcs8 b64url), RBOX_RELEASE_KEY_ID
@@ -18,6 +18,7 @@ import { releaseSigningInput, verifyReleaseArtifacts } from "../src/cli/release-
 import { RELEASE_KEYS } from "../src/cli/release-key.js";
 import { semverGt } from "../src/cli/semver.js";
 import { buildCryptoWorkerBundle } from "./build-crypto-worker.js";
+import { publishReleaseObjects, wranglerReleaseStore } from "./release-publish.js";
 
 const ROOT = path.resolve(import.meta.dir, "..");
 // Intel Macs (darwin-x64) are intentionally unsupported — Apple Silicon + Linux only.
@@ -42,7 +43,7 @@ function arg(name: string): string | undefined {
   return a ? a.slice(name.length + 3) : undefined;
 }
 
-function main(): void {
+async function main(): Promise<void> {
 const version = process.argv[2];
 if (!version || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) {
   console.error("usage: bun scripts/release.ts <version> [--targets=...] [--no-upload | --upload-only]");
@@ -76,13 +77,12 @@ const sha256File = (p: string) => createHash("sha256").update(fs.readFileSync(p)
  * manifest), so NO caller — split `--upload-only` or single-shot — can reach an upload with
  * unverified bytes (design §41). Fetch-back-verifies the shas before the manifest goes live.
  */
-function uploadRelease(): void {
+async function uploadRelease(): Promise<void> {
   const m = verifyReleaseArtifacts(dist, version); // throws on missing/forged/wrong-key/tampered
   console.log(`[release] signature verified (keyId ${m.keyId}); publishing ${Object.keys(m.artifacts).length} artifacts`);
   // Pin wrangler to an exact version so the publish step can't pull a surprise "latest".
   const WRANGLER = "wrangler@4.107.0"; // keep in lockstep with the root devDependency pin
-  const put = (key: string, file: string, ct: string) =>
-    sh(["bunx", WRANGLER, "r2", "object", "put", `rbox-releases/${key}`, `--file=${path.join(dist, file)}`, `--content-type=${ct}`, "--remote"]);
+  const store = wranglerReleaseStore({ cwd: ROOT, wrangler: WRANGLER });
   const liveManifest = () => {
     const got = Bun.spawnSync(["bunx", WRANGLER, "r2", "object", "get", "rbox-releases/releases/version.json", "--pipe", "--remote"], { cwd: ROOT });
     if (got.exitCode !== 0) throw new Error("could not read the live release manifest — refusing mutable publication");
@@ -94,29 +94,18 @@ function uploadRelease(): void {
   if (semverGt(before, version)) {
     throw new Error(`live release ${before} is newer than candidate ${version} — refusing rollback`);
   }
-  for (const [key, a] of Object.entries(m.artifacts)) {
-    put(`releases/${a.path}`, key, "application/octet-stream"); // immutable versioned (e.g. releases/v0.5.0/rbox-linux-x64)
-    put(`releases/${key}`, key, "application/octet-stream"); // mutable latest alias (releases/rbox-linux-x64)
-  }
-  put("releases/install.sh", "../scripts/install.sh", "text/x-shellscript");
-  for (const [name, a] of Object.entries(m.artifacts)) {
-    const got = Bun.spawnSync(["bunx", WRANGLER, "r2", "object", "get", `rbox-releases/releases/${a.path}`, "--pipe", "--remote"], { cwd: ROOT });
-    if (got.exitCode !== 0) throw new Error(`fetch-back failed for ${name}`);
-    if (createHash("sha256").update(got.stdout).digest("hex") !== a.sha256) throw new Error(`fetch-back sha mismatch for ${name} — refusing to publish manifest`);
-  }
-  console.log("[release] fetch-back sha verify OK");
-  put("releases/version.json", "version.json", "application/json");
-  put("releases/version.json.sig", "version.json.sig", "text/plain");
+  await publishReleaseObjects({ manifest: m, dist, store });
   const after = liveManifest();
   if (after !== version) throw new Error(`live release changed to ${after}; refusing to publish changelog for ${version}`);
-  put("releases/changelog.md", "../CHANGELOG.md", "text/markdown; charset=utf-8");
+  await store.put("releases/changelog.md", path.join(dist, "../CHANGELOG.md"), "text/markdown; charset=utf-8");
+  console.log("[release] channel activation and changelog publication OK");
   console.log(`[release] published ${tag}`);
 }
 
 // PUBLISH-ONLY path: the build+smoke jobs already produced + signed + smoke-tested dist/;
 // upload those exact bytes. uploadRelease() re-verifies the signature before anything ships.
 if (uploadOnly) {
-  uploadRelease();
+  await uploadRelease();
   process.exit(0);
 }
 
@@ -127,7 +116,7 @@ console.log(`[release] version.ts → ${version}`);
 // 2. compile each target.
 // The native @parcel/watcher binding is per-platform and its npm package is os/cpu-gated,
 // so a single (Ubuntu) build host would only have its own by default. Force-install ALL
-// four with `--os=* --cpu=*` so every target can embed its correct `.node` deterministically
+// three with `--os=* --cpu=*` so every target can embed its correct `.node` deterministically
 // (design §41 §6). release.yml passes the same flags on the frozen install; this repeats it
 // so `bun scripts/release.ts` works standalone too.
 console.log("[release] ensuring all-platform @parcel/watcher bindings are present");
@@ -190,7 +179,7 @@ if (noUpload) {
 
 // 5. upload to rbox-releases (default single-shot local path). uploadRelease() re-reads and
 //    re-verifies the just-signed version.json before uploading — same gate as --upload-only.
-uploadRelease();
+await uploadRelease();
 }
 
-if (import.meta.main) main();
+if (import.meta.main) await main();

@@ -1,6 +1,6 @@
-# PR CI — the merge gate. Runs the same test+typecheck the release build runs
-# (design 14), PLUS the apps/api Worker suite the release build skips, on every PR
-# and on main. Catches regressions BEFORE merge, not at release time.
+# PR/main CI — the merge and release gate. The release workflow requires a
+# successful run for the exact tagged SHA from a push to main (design 150), so it
+# does not duplicate this suite before signing.
 name: CI
 
 on:
