@@ -5,6 +5,42 @@ All notable changes to rbox are recorded here. The format follows
 `v*` git tags that trigger the CLI release build.
 
 ## [Unreleased]
+## [1.7.0] — 2026-07-17 — consent before reset, recovery at scale
+
+### Changed
+- **rbox never resets a workspace without showing you exactly what changes**
+  (design 138). Rebinding to a different remote stream now walks through an
+  explicit two-stage consent: you confirm the specific workspace you're
+  leaving and the specific one you're joining — identified by their remote
+  ids, not just names — and the confirmation you gave is cryptographically
+  tied to that exact pair. A stale or replayed confirmation is refused.
+- **`rbox track` and keyed setup refuse to silently adopt a mismatched
+  stream.** Where an old version might have proceeded, the CLI now stops and
+  explains which workspace the directory actually belongs to. (Breaking
+  change for scripts that relied on the silent path.)
+
+### Fixed
+- **Crash-safe reset and recovery.** If the machine dies mid-reset, the next
+  start picks up from a journal that records what was authorized and how far
+  it got: quarantines resume instead of restarting, archives are copied (never
+  moved) until the restore is fully published, and a damaged journal halts the
+  daemon into a guided `rbox doctor reset-journal` flow instead of guessing.
+- **Corrupt or oversized state can no longer wedge the daemon.** State reads
+  are byte-bounded with a memory admission gate, and the daemon heals through
+  an explicit halted → recovering → ready cycle with a three-way agreement
+  check between boot, config, and state before serving.
+- **RboxBar finds the rbox binary when launched from Raycast or the Dock.**
+  GUI launches don't inherit your shell PATH; the menu bar app now probes the
+  standard install location (`~/.rbox/bin/rbox`) first.
+
+### Internal
+- Git burn-in suite (design 141): fifteen live-rig cells covering submodules,
+  LFS, Unicode/case-folding, shallow and partial clones, and in-progress
+  merge/rebase/cherry-pick/bisect — 494 assertions, all green, with the two
+  known engine gaps documented and pinned.
+- Storage-truth measurement tooling (designs 142–144): read-only prod
+  decomposition of account storage into active/history/reclaimable classes.
+
 ## [1.6.9] — 2026-07-17 — the wizard forgives your typos
 
 ### Fixed
