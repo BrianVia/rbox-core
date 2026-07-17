@@ -201,7 +201,7 @@ describe("new-device email — skipped vs failed (fail loud, never silently drop
     const boot = await bootstrap("notify-nobinding");
     await linkOwnerEmail(boot.accountId, boot.ownerUserId, "user_clerk_nb", "nb@example.com");
     const dev = await redeemPairDevice(boot, "x");
-    const r = await processNotification(env, dev.tokenHash); // env has no EMAIL binding
+    const r = await processNotification(Object.assign({}, env, { EMAIL: undefined }) as Env, dev.tokenHash);
     expect(r.failed).toBe(1);
     const d = (await deliveries(dev.tokenHash))[0]!;
     expect(d.status).toBe("failed");
