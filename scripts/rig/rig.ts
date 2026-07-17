@@ -19,6 +19,7 @@ import { DEFAULT_DEV_API, GUEST, imageHash, NAMES, resolveConfig } from "./lib/c
 import { Device } from "./lib/device.js";
 import { deleteAccount, readCredentials, resolveBootstrapSecret, resolvePlatformSecret } from "./lib/account.js";
 import { RunCapture } from "./lib/capture.js";
+import { assignMainExit, reportExit } from "./lib/exit-code.js";
 import { renderReportMd } from "./lib/report.js";
 import { deleteImageHashRecord, readImageHashRecord, writeImageHashRecord } from "./lib/image-hash-records.js";
 import { formatBytes, trimRunDirectories, trimWorkloadCache } from "./lib/gc.js";
@@ -303,11 +304,6 @@ async function executeScenario(
   console.log("\n" + table);
   console.log(`\nreport: ${path.join(runDir, "report.md")}`);
   return report;
-}
-
-/** Exit code for a report: PASS/SKIP → 0, FAIL → 1. */
-function reportExit(report: ScenarioReport): number {
-  return report.verdict === "FAIL" ? 1 : 0;
 }
 
 async function runScenario(name: string, apiUrl: string, flags: Record<string, string>): Promise<number> {
@@ -654,11 +650,6 @@ async function main(): Promise<number> {
   }
 }
 
-main()
-  .then((code) => {
-    process.exitCode = code;
-  })
-  .catch((e) => {
-    console.error(`rig: ${e instanceof Error ? e.message : e}`);
-    process.exitCode = 1;
-  });
+await assignMainExit(main, (error) => {
+  console.error(`rig: ${error instanceof Error ? error.message : error}`);
+});

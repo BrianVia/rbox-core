@@ -11,6 +11,7 @@
 import { GUEST } from "../lib/config.js";
 import { deleteAccount, grantProPlan, readCredentials } from "../lib/account.js";
 import { daemonWatcherMode, type Device } from "../lib/device.js";
+import type { RunResult } from "../lib/container.js";
 import { waitForPath } from "../lib/waiters.js";
 import type { Recorder } from "./harness.js";
 import type { RigCtx } from "./types.js";
@@ -37,7 +38,11 @@ export interface ProvisionOpts {
 
 export interface ProvisionResult {
   /** The remote workspace id A created (B joined it). */
-  workspaceId: string;
+  readonly workspaceId: string;
+  /** Immutable first-sync surfaces: init --new publishes/attaches implicitly. */
+  readonly initA: Readonly<RunResult>;
+  /** init --workspace pulls/applies implicitly, even when opts.pull is false. */
+  readonly initB: Readonly<RunResult>;
 }
 
 export function rigLoginArgv(side: "a" | "b", scenarioName: string, bootstrap = false): string[] {
@@ -47,6 +52,29 @@ export function rigLoginArgv(side: "a" | "b", scenarioName: string, bootstrap = 
 function rigLoginShell(side: "a" | "b", scenarioName: string, bootstrap = false): string {
   const argv = rigLoginArgv(side, scenarioName, bootstrap);
   return argv.map((arg) => arg.startsWith("$") ? `"${arg}"` : arg).join(" ");
+}
+
+/** Exact CLI surfaces of a dropped/erroring live-API round trip during setup. */
+const PROVISION_TRANSIENT = /HTTP 5\d\d\)|rbox: The operation timed out\./;
+
+/**
+ * Run an `init` provisioning call with a single recorded retry when the live
+ * API drops the request (HTTP 5xx / CLI timeout). Provisioning is fixture
+ * setup, not the contract under test; the retry unbinds the half-initialized
+ * directory and re-runs the identical command against the same fresh account.
+ * Any other failure — or a failed retry — still throws and aborts the step.
+ */
+async function initWithTransientRetry(device: Device, log: (line: string) => void, argv: string[]): Promise<RunResult> {
+  const run = () => device.rbox(argv, { cwd: GUEST.workDir });
+  try {
+    return await run();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!PROVISION_TRANSIENT.test(message)) throw error;
+    log(`  transient provisioning failure — retrying once after unbind`);
+    await device.exec(["rm", "-rf", `${GUEST.workDir}/.rbox`], { allowFail: true });
+    return await run();
+  }
 }
 
 /**
@@ -91,13 +119,14 @@ export async function provisionPair(ctx: RigCtx, rec: Recorder, opts: ProvisionO
   }
 
   // 3. A: create the workspace, read its id from the on-disk binding.
-  const workspaceId = await rec.step("[A] init --new", async () => {
-    await ctx.a.rbox(["init", "--new", "--no-interactive", "--remote", ctx.apiUrl, ...(opts.initFlags ?? [])], { cwd: GUEST.workDir });
+  const initialized = await rec.step("[A] init --new", async () => {
+    const result = await initWithTransientRetry(ctx.a, ctx.log, ["init", "--new", "--no-interactive", "--remote", ctx.apiUrl, ...(opts.initFlags ?? [])]);
     const cfg = JSON.parse(await ctx.a.readFile(`${GUEST.workDir}/.rbox/workspace.json`)) as { remoteWorkspaceId?: string };
     if (!cfg.remoteWorkspaceId) throw new Error("workspace.json missing remoteWorkspaceId");
     ctx.log(`  workspace ${cfg.remoteWorkspaceId}`);
-    return cfg.remoteWorkspaceId;
+    return { workspaceId: cfg.remoteWorkspaceId, result };
   });
+  const { workspaceId } = initialized;
 
   // 4. A: push (throttled).
   if (doPush) {
@@ -121,13 +150,14 @@ export async function provisionPair(ctx: RigCtx, rec: Recorder, opts: ProvisionO
   });
 
   // 7. B: join the workspace + pull (throttled).
-  await rec.step(doPull ? "[B] init --workspace + pull" : "[B] init --workspace", async () => {
+  const initB = await rec.step(doPull ? "[B] init --workspace + pull" : "[B] init --workspace", async () => {
     await ctx.b.mkdirp(GUEST.workDir);
-    await ctx.b.rbox(["init", "--workspace", workspaceId, "--no-interactive", "--remote", ctx.apiUrl, ...(opts.initFlags ?? [])], { cwd: GUEST.workDir });
+    const result = await initWithTransientRetry(ctx.b, ctx.log, ["init", "--workspace", workspaceId, "--no-interactive", "--remote", ctx.apiUrl, ...(opts.initFlags ?? [])]);
     if (doPull) await ctx.b.rbox(["pull"], { cwd: GUEST.workDir, env: { RBOX_DOWNLOAD_CONCURRENCY: CONCURRENCY } });
+    return result;
   });
 
-  return { workspaceId };
+  return { workspaceId, initA: initialized.result, initB };
 }
 
 /** How long to wait for a freshly-started daemon to write its first activity.json

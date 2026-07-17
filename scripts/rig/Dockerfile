@@ -15,7 +15,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl gnupg software-properties-common \
     && add-apt-repository -y ppa:git-core/ppa \
     && apt-get update \
-    && apt-get install -y --no-install-recommends git tmux unzip tini \
+    && apt-get install -y --no-install-recommends git git-lfs tmux unzip tini \
     && rm -rf /var/lib/apt/lists/*
 
 # Official installer, pinned. BUN_INSTALL=/usr/local → bun lands on PATH at /usr/local/bin.
