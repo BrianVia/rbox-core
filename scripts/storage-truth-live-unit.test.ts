@@ -110,6 +110,21 @@ describe("storage-truth live adapter unit", () => {
     expect(urls[0]!.pathname).toBe("/client/v4/accounts/account/r2/buckets/bucket%20name/objects");
   });
 
+  test("R2 REST treats an omitted result_info as the non-truncated final page", async () => {
+    const bucket = new RestR2("bucket", {
+      accountId: "account", apiToken: "token", apiBase: "https://cf.test/client/v4",
+      fetch: (async () => response({
+        success: true,
+        result: [{ key: "blobs/sha256/z", size: 5, last_modified: "2026-07-17T12:02:00Z" }],
+      })) as typeof fetch,
+    });
+    const page = await bucket.list({ prefix: "blobs/sha256/", limit: 1 });
+    expect(page).toEqual({
+      objects: [{ key: "blobs/sha256/z", size: 5, uploaded: "2026-07-17T12:02:00Z" }],
+      truncated: false,
+    });
+  });
+
   test("R2 REST get keeps key slashes literal and maps raw object metadata", async () => {
     let requested = "";
     const bytes = new Uint8Array([1, 2, 3]);

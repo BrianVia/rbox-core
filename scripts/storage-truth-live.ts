@@ -251,8 +251,10 @@ export class RestR2 implements ReadOnlyR2 {
     const raw = await jsonResponse(response, "R2 list");
     if (!raw || typeof raw !== "object" || (raw as { success?: unknown }).success !== true
       || !Array.isArray((raw as { result?: unknown }).result)) throw new Error(apiErrorReason(raw, "invalid R2 list response"));
-    const info = (raw as { result_info?: unknown }).result_info;
-    if (!info || typeof info !== "object") throw new Error("invalid R2 list pagination");
+    // Cloudflare omits result_info entirely on a final page; absent means
+    // not truncated. Present-but-malformed is still a hard error.
+    const info = (raw as { result_info?: unknown }).result_info ?? {};
+    if (typeof info !== "object") throw new Error("invalid R2 list pagination");
     const truncated = (info as { is_truncated?: unknown }).is_truncated === true;
     const cursor = (info as { cursor?: unknown }).cursor;
     if (truncated && (typeof cursor !== "string" || cursor.length === 0)) throw new Error("truncated R2 page omitted cursor");
