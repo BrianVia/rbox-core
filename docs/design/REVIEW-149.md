@@ -305,3 +305,183 @@ v4 derivation delegated with these rulings binding; round 4 fresh-eyes
 review follows. Convergence note: rounds 1→3 moved structure→mechanism→
 concurrency/algorithm; remaining risk is now localized to Unit C's
 marginal-release query cost and A's honesty framing — both bounded.
+
+## Round 4
+
+Fresh-eyes scope: v4, all round-3 findings/rulings, the deployed readers and
+DO paths, the exact C2 DDL/query shape in SQLite, the current production
+workflow, and `docs/DEPLOYMENTS.md`. I reproduced the marginal query's
+`EXPLAIN QUERY PLAN` against the proposed tables and indexes rather than
+inferring its access path from the index names.
+
+1. **BLOCKER — the split encoding declarations still have a scalar override,
+   so the two compatibility axes are not independent.** The wire fields and
+   ordinary floor matrix are now a coherent cross-product
+   (`docs/design/149-storage-economics.md:239-280`), but `override:true`
+   bypasses every relied-on floor/lowered-generation test (`:282-287`). A
+   manifest-only force-on therefore also bypasses a floor-driven refset check:
+   for example, `RBOX_MDE_SNAPSHOT=1` plus unset `RBOX_REFSET_DELTA` may pin
+   snapshot + refset-delta, then admit the refset delta after `refsetDelta`
+   lowers because the manifest override disables both tests. The converse
+   holds for refset-only force-on plus a floor-driven manifest. That is not the
+   independent operator intent promised at `:313-322`, and it can produce the
+   self-account compatibility break this protocol exists to prevent. Use
+   per-axis overrides (or force the non-overridden axis to raw/full). Also
+   specify the result or rejection of the presently contradictory
+   `RBOX_MDE_SNAPSHOT=0` + `RBOX_MDE_DELTA=1`; current code makes delta imply
+   snapshot (`src/cli/e2ee-remote.ts:73-80`), while v4 calls `0` a force-raw
+   kill switch. This is a real admission/flag-matrix gap, not editorial.
+
+2. **BLOCKER — the account-wide pre-batch re-probe is still a TOCTOU check,
+   not a fence.** The Worker reads the D1 workspace set, then probes up to 64
+   independent DOs serially before dispatching `/prune`
+   (`149:928-946`). Nothing prevents already-probed non-target W2 from
+   committing or retention-pruning while later probes run. W1 then accepts the
+   prune because the proposed DO transaction validates only W1's local pin
+   (`149:1027-1047`); current commit and prune isolation is likewise local to
+   one WorkspaceSync object (`apps/api/src/workspace-sync.ts:669-695,
+   1125-1143`). Workspace create/delete has the same window after the set
+   query. The fair-use lease excludes another enforcer, not ordinary workspace
+   mutations. A concrete bad schedule is set read → W2 pin matches → W2 head
+   moves → W1 pin matches → W1 prune commits from now-stale account totals.
+   Repeating the probe before every batch does not close that interval. The
+   target mutation must validate an authoritative account-wide generation
+   covering set/head/floor/index mutations, or use equivalent serialization.
+
+3. **BLOCKER — `release(T)` is semantically correct but still not an
+   executable bounded query against C2.** The candidate index supports the
+   `(account,epoch,workspace,project,head,sequence)` cut and the SHA index can
+   support a same-SHA anti-join (`149:739-756,963-991`). The anti-join correctly
+   excludes a SHA surviving in a later target sequence, another workspace, or
+   any head. `release(T)` is genuinely nondecreasing: enlarging the cut can
+   only move memberships from outside to inside it, so a released SHA cannot
+   become unreleased; binary search is logically valid. But the physical work
+   is not bounded by the 500-sequence cap. C2 permits a 250,000-ref sequence to
+   span ticks (`:823-852`), while C3 may scan a 500-sequence cut up to ten times
+   in one enforcement tick (`:880-886,992-1001`); there is no membership-row,
+   rows-read, temp-B-tree, or query-time cap/checkpoint. On the exact empty C2
+   schema, SQLite planned the candidate through
+   `idx_fairuse_roots_candidate` plus `USE TEMP B-TREE FOR DISTINCT`, and chose
+   that same index for the correlated anti-join with only
+   `(account_id=?,epoch=?)` rather than the SHA index. The SQL has no
+   `INDEXED BY`/statistics contract, so the required access path is not
+   deterministic. Add a bounded/pre-aggregated per-SHA release structure or a
+   resumable row-work budget, and pin/test the anti-join access path. Merely
+   limiting query count is not a resource bound; D1 query execution shares the
+   Worker CPU/memory envelope.
+
+4. **MAJOR — the fold table adds correctly, but it is not a worst-case isolate
+   bound.** The stated sum is exact:
+   `2*10,000,018 + 8MiB + 1MiB + 1MiB + 18,000,000 = 48,485,796 B`, which is
+   below 48 MiB (50,331,648 B) and leaves substantial room under the current
+   128 MB per-isolate limit. The semaphore, however, is released immediately
+   after an inline mode is decoded (`149:477-485`), and the compact streaming
+   representation is promised only for the sidecar path (`:486-492`). The
+   deployed decoder explicitly allows an 8 MB request whose `JSON.parse` heap
+   expands to roughly 40–60 MB (`apps/api/src/commit-envelope.ts:17-26`). That
+   inline request can remain live through accounting while a roots/admission/
+   fair-use fold acquires the semaphore; several inline requests can also
+   overlap across DO instances. The 18 MB allowance therefore cannot make the
+   48.5 MB table isolate-wide. Hold the shared gate until every commit-mode
+   allocation is released, or give all modes a compact representation plus an
+   explicit concurrency bound. Cloudflare's limit is per isolate, not per
+   invocation ([Workers limits](https://developers.cloudflare.com/workers/platform/limits/)).
+
+5. **MAJOR — the ordinary rollout follows the branch model, but the asserted
+   no-rollback deployment gate is not executable yet.** Separate `main`
+   merges, automatic dev deploy/verification, green CI, and explicit
+   `main:production` fast-forwards at `149:1228-1258` agree with
+   `docs/DEPLOYMENTS.md:6-35,111-123`; migration-before-Worker and later tagged
+   CLI releases are ordered correctly. But `149:1072-1076` also says the deploy
+   job records minimum roots format 2 and refuses an old codec after any RSD1.
+   The current job only tests, applies migrations, deploys, and uploads a
+   version (`.github/workflows/deploy-api.yml:69-90`). V4 defines neither the
+   durable record, candidate-generation comparison, nor the stage-4 workflow
+   and `DEPLOYMENTS.md` update. A forward revert on `main` is still a valid
+   fast-forward promotion, so the branch model does not supply this guard.
+   Specify and include the production gate before treating rollback
+   prohibition as enforced.
+
+### Verified resolved round-3 points
+
+- **Mixed-process stickiness is resolved.** A capable contact cannot clear or
+  refresh any incapability timestamp; only another incapable contact refreshes
+  it, and expiry is after 24 hours (`149:122-138`). That directly covers the
+  shared-`deviceId` daemon/CLI case in
+  `apps/api/src/auth/authenticate.ts:61-68,77`. I found no remaining capable
+  clear path within the accepted 24-hour boundary.
+- **Additive roots responses are wire-compatible in the specified transition.**
+  `carrierSha` keeps its deployed meaning and `chain` is additive
+  (`149:590-595`). The deployed GC and storage-truth readers tolerate unknown
+  row fields and continue reading `carrierSha`
+  (`apps/api/src/versions.ts:32-47,88-114`;
+  `scripts/storage-truth-live.ts:298-315,500-529`). They do not root/fold RSD1
+  ancestors untouched, but v4 correctly deploys and verifies upgraded readers
+  before changing pagination or permitting any RSD1 writer (`149:597-614,
+  656-668,1238-1249`).
+- **The marginal-release set logic and monotonicity are resolved**, subject to
+  finding 3's execution bound/access-path blocker. **The memory arithmetic is
+  resolved**, subject to finding 4's concurrent-live-allocation gap.
+
+### Editorial only
+
+- `149:329-330` repeats the `pull/sync` bullet prefix, and `149:1084-1086`
+  repeats the C4 “NO change” sentence. These are stale duplicate lines, not
+  design defects.
+- Rollout step 3 says “deploy” the storage-truth reader (`149:1238-1240`), but
+  that reader is an operational script rather than a production surface in
+  `docs/DEPLOYMENTS.md`. “Land and run/verify” would be more precise; this does
+  not change rollout ordering.
+
+**VERDICT: CHANGES-REQUIRED.** Round-3 findings 1 and 5 are resolved, and the
+core release-set math is correct. The independent override matrix, the
+account-wide mutation fence, and the marginal query's bounded execution are
+still blocking; isolate-wide memory concurrency and the production rollback
+gate also need specification before implementation.
+
+## Round 4 rulings (orchestrator)
+
+1. ACCEPT — override becomes PER-AXIS: `manifestOverride?:true` /
+   `refsetOverride?:true`, each bypassing only its own axis's floor tests;
+   the other axis remains floor-checked. Contradiction rule pinned:
+   `RBOX_MDE_SNAPSHOT="0"` is the emergency kill switch and WINS —
+   it forces manifest raw AND disables delta regardless of
+   `RBOX_MDE_DELTA` (documented; a warning logs the ignored flag).
+2. ACCEPT-MODIFIED — no cross-DO serialization exists by architectural
+   choice, and building one for this pass is disproportionate. Instead the
+   claimed invariant is honestly weakened and documented as product
+   semantics: under concurrent account mutation, fair-use enforcement may
+   OVERSHOOT by at most ONE batch (≤500 sequences of the single oldest
+   workspace, never a head, always within the retention window). The
+   pre-batch re-probe bounds staleness to seconds; oldest-first means
+   overshoot lands on the least-valuable history. The design must state
+   this bound in C1 (invariant section) and in the user-facing surface
+   text. The reviewer's stronger fence is recorded as a rejected
+   alternative with rationale.
+3. ACCEPT — add per-epoch materialized per-SHA release structure:
+   `fairuse_sha_last(account,epoch,sha256 PK, last_ws, last_proj,
+   last_seq, in_head INTEGER)` maintained during materialization
+   (last retained reachability per sha). `release(T)` becomes a bounded
+   range aggregation over `fairuse_sha_last` (sha released iff
+   `in_head=0 AND last_ws=:W AND last_proj=:P AND last_seq<=:T`), with
+   `INDEXED BY` pins, an explicit rows-read budget per query, and a
+   resumable checkpoint if the budget trips. Binary search unchanged.
+4. ACCEPT — the admission semaphore is held from decode until commit
+   accounting releases every mode allocation (not just fold); inline
+   modes get the same compact parsed representation or count against an
+   explicit concurrent-inline bound stated in the memory table.
+5. ACCEPT — the no-rollback gate is specified executably: migration 0029
+   adds `meta_deploy_floor(key PK, value)`; the production deploy job
+   gains a step that reads the candidate's supported roots-format
+   generation and refuses when below the recorded floor; the record is
+   written by the same job after a successful RSD1-era deploy. SEAM NOTE:
+   deploy-api.yml is currently owned by design 150 (GHA revamp, codex
+   thread) — the workflow step lands via a 150-coordinated PR after a
+   joint seam review; 149 pins the contract, not the YAML.
+6. Editorials (duplicate bullet prefix, duplicate C4 sentence,
+   "deploy"→"land and run/verify" for the script reader): fix all three.
+
+Convergence: round 4 verified 2 of round-3's blockers resolved outright
+and the math/memory cores correct. v5 is a bounded delta (per-axis
+override, honest overshoot semantics, sha_last structure, semaphore
+lifetime, deploy-gate spec). Round 5 should be checkable to ALIGNED.
