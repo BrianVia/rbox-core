@@ -1,4 +1,4 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { WorkspaceSync } from "../src/workspace-sync.js";
 import { fakeDoSql } from "./helpers/fake-do-sql.js";
 
@@ -12,18 +12,21 @@ if (!("WebSocketRequestResponsePair" in globalThis)) {
   });
 }
 
-function fakeCtx(kv: Map<string, unknown>, sql = fakeDoSql(), failTransaction?: () => boolean): DurableObjectState {
+interface StorageWrites { kv: number; transactions: number; alarms: number }
+
+function fakeCtx(kv: Map<string, unknown>, sql = fakeDoSql(), failTransaction?: () => boolean, writes?: StorageWrites): DurableObjectState {
   let alarm: number | null = null;
   return {
     storage: {
       sql,
       kv: {
         get: (key: string) => kv.get(key),
-        put: (key: string, value: unknown) => kv.set(key, value),
-        delete: (key: string) => kv.delete(key),
+        put: (key: string, value: unknown) => { if (writes) writes.kv++; return kv.set(key, value); },
+        delete: (key: string) => { if (writes) writes.kv++; return kv.delete(key); },
         list: () => new Map(),
       },
       transactionSync: (fn: () => void) => {
+        if (writes) writes.transactions++;
         const kvBefore = new Map(kv);
         const droppedBefore = new Map(sql.__dropped);
         const rootsBefore = new Map(sql.__seqRoots);
@@ -36,7 +39,7 @@ function fakeCtx(kv: Map<string, unknown>, sql = fakeDoSql(), failTransaction?: 
         }
       },
       getAlarm: () => alarm,
-      setAlarm: (at: number) => { alarm = at; },
+      setAlarm: (at: number) => { if (writes) writes.alarms++; alarm = at; },
     },
     getWebSockets: () => [],
     setWebSocketAutoResponse: () => {},
@@ -309,6 +312,150 @@ describe("WorkspaceSync retained-roots index", () => {
     const body = await res.json() as { droppedPage: string[]; nextSha?: string };
     expect(body.droppedPage).toHaveLength(20_000);
     expect(body.nextSha).toBe(body.droppedPage.at(-1));
+  });
+});
+
+describe("design 142 read-only retained-roots inspection", () => {
+  test("keyset-pages every roots stream under one triple and performs zero DO writes", async () => {
+    const kv = new Map<string, unknown>([
+      ["head", { sequence: 3, commitHash: sha("c") }],
+      ["pruneFloor", 0],
+      ["index_state", "ready"],
+      ["index_synced_seq", 1],
+      ["index_generation", 9],
+      ["seq:1", signed(1, { inline: [sha("a")] })],
+      ["seq:2", signed(2, { inline: [sha("b")] })],
+      ["seq:3", signed(3, { inline: [sha("d")] }, [sha("7")])],
+    ]);
+    const baseSql = fakeDoSql({
+      dropped: [{ sha256: sha("e"), last_seq: 1 }, { sha256: sha("f"), last_seq: 2 }],
+      seqRoots: [
+        { seq: 1, manifest_sha: sha("1"), carrier_sha: null },
+        { seq: 2, manifest_sha: sha("2"), carrier_sha: sha("8") },
+      ],
+    });
+    let sqlWrites = 0;
+    const sql = {
+      ...baseSql,
+      exec(query: string, ...bindings: unknown[]) {
+        if (!query.trimStart().toLowerCase().startsWith("select ")) sqlWrites++;
+        return baseSql.exec(query, ...bindings);
+      },
+    };
+    const writes: StorageWrites = { kv: 0, transactions: 0, alarms: 0 };
+    const sync = new WorkspaceSync(fakeCtx(kv, sql, undefined, writes), {} as never);
+    const beforeKv = structuredClone([...kv.entries()]);
+    const beforeDropped = structuredClone([...sql.__dropped.entries()]);
+    const beforeSeqRoots = structuredClone([...sql.__seqRoots.entries()]);
+
+    const first = await sync.fetch(new Request("https://do/roots-inspect?ws=ws_1&proj=root&limit=1"));
+    expect(first.status).toBe(200);
+    const p1 = await first.json() as Record<string, unknown>;
+    expect(p1).toMatchObject({
+      head: 3, pruneFloor: 0, indexGeneration: 9, indexSyncedSeq: 1,
+      droppedPage: [{ sha: sha("e"), lastSeq: 1 }], nextSha: sha("e"),
+      seqRootsPage: [{ seq: 1, manifestSha: sha("1") }], nextSeq: 1,
+      gapPage: [{ seq: 1, manifestSha: sha("1"), inlineRefs: [sha("a")] }], nextGapSeq: 1,
+    });
+
+    const second = await sync.fetch(new Request(`https://do/roots-inspect?ws=ws_1&proj=root&limit=1&fromSha=${sha("e")}&fromSeq=1&fromGapSeq=1&pinHead=3&pinFloor=0&pinGen=9`));
+    expect(second.status).toBe(200);
+    const p2 = await second.json() as Record<string, unknown>;
+    expect(p2).toMatchObject({
+      droppedPage: [{ sha: sha("f"), lastSeq: 2 }],
+      seqRootsPage: [{ seq: 2, manifestSha: sha("2"), carrierSha: sha("8") }],
+      gapPage: [{ seq: 2, manifestSha: sha("2"), inlineRefs: [sha("b")] }], nextGapSeq: 2,
+    });
+    expect(p2).not.toHaveProperty("nextSha");
+    expect(p2).not.toHaveProperty("nextSeq");
+
+    const third = await sync.fetch(new Request("https://do/roots-inspect?ws=ws_1&proj=root&limit=1&fromSha=done&fromSeq=done&fromGapSeq=2&pinHead=3&pinFloor=0&pinGen=9"));
+    expect(third.status).toBe(200);
+    expect(await third.json()).toMatchObject({
+      droppedPage: [], seqRootsPage: [],
+      gapPage: [{ seq: 3, manifestSha: sha("3"), inlineRefs: [sha("d")], chainRefs: [sha("7")] }],
+    });
+
+    expect(writes).toEqual({ kv: 0, transactions: 0, alarms: 0 });
+    expect(sqlWrites).toBe(0);
+    expect([...kv.entries()]).toEqual(beforeKv);
+    expect([...sql.__dropped.entries()]).toEqual(beforeDropped);
+    expect([...sql.__seqRoots.entries()]).toEqual(beforeSeqRoots);
+  });
+
+  test.each([
+    ["head", "pinHead=2&pinFloor=0&pinGen=9"],
+    ["floor", "pinHead=3&pinFloor=1&pinGen=9"],
+    ["generation", "pinHead=3&pinFloor=0&pinGen=8"],
+  ])("rejects a stale %s pin without a storage write", async (_dimension, pins) => {
+    const kv = new Map<string, unknown>([
+      ["head", { sequence: 3, commitHash: sha("c") }], ["pruneFloor", 0],
+      ["index_state", "ready"], ["index_synced_seq", 3], ["index_generation", 9],
+      ["seq:3", signed(3, { inline: [] })],
+    ]);
+    const writes: StorageWrites = { kv: 0, transactions: 0, alarms: 0 };
+    const sync = new WorkspaceSync(fakeCtx(kv, fakeDoSql(), undefined, writes), {} as never);
+    const res = await sync.fetch(new Request(`https://do/roots-inspect?${pins}`));
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: "snapshot_changed" });
+    expect(writes).toEqual({ kv: 0, transactions: 0, alarms: 0 });
+  });
+
+  test("reports a cold object unavailable without bootstrapping SQL, KV, or alarms", async () => {
+    const kv = new Map<string, unknown>();
+    const writes: StorageWrites = { kv: 0, transactions: 0, alarms: 0 };
+    let sqlCalls = 0;
+    const sql = { exec: () => { sqlCalls++; throw new Error("SQL must not be touched"); } };
+    const sync = new WorkspaceSync(fakeCtx(kv, sql as ReturnType<typeof fakeDoSql>, undefined, writes), {} as never);
+    const res = await sync.fetch(new Request("https://do/roots-inspect?ws=cold&proj=root"));
+    expect(res.status).toBe(503);
+    expect(await res.json()).toEqual({ error: "index_unavailable", reason: "uninitialized" });
+    expect(sqlCalls).toBe(0);
+    expect(writes).toEqual({ kv: 0, transactions: 0, alarms: 0 });
+    expect(kv.size).toBe(0);
+  });
+
+  test("fails an incomplete raw-gap page closed without repairing or writing", async () => {
+    const kv = new Map<string, unknown>([
+      ["head", { sequence: 2, commitHash: sha("c") }], ["pruneFloor", 0],
+      ["index_state", "ready"], ["index_synced_seq", 1], ["index_generation", 4],
+      // seq:1 deliberately absent
+    ]);
+    const writes: StorageWrites = { kv: 0, transactions: 0, alarms: 0 };
+    const sync = new WorkspaceSync(fakeCtx(kv, fakeDoSql(), undefined, writes), {} as never);
+    const res = await sync.fetch(new Request("https://do/roots-inspect"));
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ error: "roots_incomplete" });
+    expect(writes).toEqual({ kv: 0, transactions: 0, alarms: 0 });
+  });
+
+  test("reports missing inspection tables without trying to create them", async () => {
+    const kv = new Map<string, unknown>([
+      ["head", { sequence: 0, commitHash: "0".repeat(64) }], ["pruneFloor", 0],
+      ["index_state", "ready"], ["index_synced_seq", 0], ["index_generation", 0],
+    ]);
+    const writes: StorageWrites = { kv: 0, transactions: 0, alarms: 0 };
+    const queries: string[] = [];
+    const sql = {
+      __dropped: new Map(), __seqRoots: new Map(),
+      exec(query: string) { queries.push(query); throw new Error("no such table: dropped_index"); },
+    };
+    const logged: string[] = [];
+    const consoleError = vi.spyOn(console, "error").mockImplementation((line) => { logged.push(String(line)); });
+    try {
+      const sync = new WorkspaceSync(fakeCtx(kv, sql as unknown as ReturnType<typeof fakeDoSql>, undefined, writes), {} as never);
+      const res = await sync.fetch(new Request("https://do/roots-inspect"));
+      expect(res.status).toBe(503);
+      expect(await res.json()).toEqual({ error: "index_unavailable", reason: "storage_unreadable" });
+      expect(queries).toHaveLength(1);
+      expect(queries[0]!.trimStart().toLowerCase().startsWith("select ")).toBe(true);
+      expect(writes).toEqual({ kv: 0, transactions: 0, alarms: 0 });
+      expect(logged).toHaveLength(1);
+      expect(JSON.parse(logged[0]!)).toEqual({ event: "roots_inspect_sql_failed", errorClass: "Error" });
+      expect(logged[0]).not.toContain("no such table");
+    } finally {
+      consoleError.mockRestore();
+    }
   });
 });
 

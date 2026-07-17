@@ -29,6 +29,10 @@ import {
 import { acceptConnection, broadcast as wsBroadcast } from "./ws-fanout.js";
 
 const ROOTS_PAGE_LIMIT = 20_000;
+// A raw gap commit may itself contain a large inline refset. Keep inspection pages
+// to one sequence so the Phase-0 disk-backed reader never receives the entire live
+// gap in one response (the mutating-bootstrap /roots compatibility path is unchanged).
+const ROOTS_INSPECT_GAP_PAGE_LIMIT = 1;
 const ROOTS_OUTER_MAX_REFS = 3_000_000;
 const GAP_MAX = 8;
 const FOLD_MAX_REFS = 250_000;
@@ -130,6 +134,14 @@ export class WorkspaceSync {
     // purges without mis-parsing the action segment (the §3 wedge). deleteAll needs no ws/proj.
     if (req.method === "POST" && url.pathname === "/purge") return this.purge();
     if (req.method === "POST" && url.pathname === "/repair") return this.repair(req, url.searchParams.get("ws") ?? "", url.searchParams.get("proj") ?? "");
+
+    // Design 142 Phase 0: fixed, slash-safe, STRICTLY READ-ONLY inspection. This is
+    // deliberately before ensureBootstrap: a cold/legacy DO must be reported as
+    // unavailable, never initialized/migrated, and no index alarm may be armed.
+    if (url.pathname === "/roots-inspect") {
+      if (req.method !== "GET") return json({ error: "not_found" }, 404);
+      return this.rootsInspect(url);
+    }
 
     // SERVER-INTERNAL roots/prune (design 37 §4f follow-up): the GC reachability scan and the
     // retention prune address the DO from D1, where project_id may contain "/". A positional
@@ -1000,6 +1012,113 @@ export class WorkspaceSync {
       head, pruneFloor: floor, indexGeneration: generation, indexSyncedSeq: synced, gap,
       droppedPage, ...(droppedRows.length > limit ? { nextSha: droppedPage[droppedPage.length - 1] } : {}),
       seqRootsPage, ...(seqRows.length > limit ? { nextSeq: seqRootsPage[seqRootsPage.length - 1]!.seq } : {}),
+    });
+  }
+
+  /**
+   * Design 142 Phase-0 roots reader. Unlike /roots, this method must remain safe to
+   * call on an object that has never bootstrapped: storage reads and SELECTs only,
+   * with three independently keyset-paged streams pinned to every retained-root
+   * mutation dimension (head, prune floor, index generation).
+   *
+   * The live raw gap is sequence-paged separately. A sequence is the smallest safe
+   * unit because an external sidecar is represented by one descriptor and an inline
+   * commit is one signed/validated storage value; limiting it to one sequence keeps
+   * the response bounded without inventing a cursor inside an immutable envelope.
+   */
+  private rootsInspect(url: URL): Response {
+    if (url.searchParams.has("rebuild")) return json({ error: "read_only" }, 400);
+
+    const rawHead = this.ctx.storage.kv.get("head");
+    if (!isStoredHead(rawHead)) return json({ error: "index_unavailable", reason: "uninitialized" }, 503);
+    const head = rawHead.sequence;
+    const floorRaw = this.ctx.storage.kv.get("pruneFloor");
+    const generationRaw = this.ctx.storage.kv.get("index_generation");
+    const syncedRaw = this.ctx.storage.kv.get("index_synced_seq");
+    const state = this.ctx.storage.kv.get("index_state");
+    const floor = floorRaw === undefined ? 0 : Number(floorRaw);
+    const generation = Number(generationRaw);
+    const synced = Number(syncedRaw);
+    if (state !== "ready" || head < 0 || !Number.isInteger(floor) || floor < 0 || floor > head || !Number.isInteger(generation) || generation < 0 || !Number.isInteger(synced) || synced < floor || synced > head) {
+      return json({ error: "index_unavailable", reason: state === "building" || state === "lagging" ? state : "uninitialized" }, 503);
+    }
+    if (head - synced > GAP_MAX) return json({ error: "index_unavailable", reason: "lagging" }, 503);
+
+    const pins = [url.searchParams.get("pinHead"), url.searchParams.get("pinFloor"), url.searchParams.get("pinGen")];
+    if (pins.some((x) => x !== null) && (pins.some((x) => x === null) || Number(pins[0]) !== head || Number(pins[1]) !== floor || Number(pins[2]) !== generation)) {
+      return json({ error: "snapshot_changed" }, 409);
+    }
+
+    const requested = Number(url.searchParams.get("limit") ?? ROOTS_PAGE_LIMIT);
+    const limit = Number.isFinite(requested) ? Math.max(1, Math.min(ROOTS_PAGE_LIMIT, Math.trunc(requested))) : ROOTS_PAGE_LIMIT;
+    const fromSha = url.searchParams.get("fromSha") ?? "";
+    const fromSeqRaw = url.searchParams.get("fromSeq") ?? "";
+    const fromGapSeqRaw = url.searchParams.get("fromGapSeq") ?? "";
+    const numericCursor = (raw: string): number | null => {
+      if (raw === "") return null;
+      const value = Number(raw);
+      return Number.isInteger(value) && value >= 0 ? value : Number.NaN;
+    };
+    const fromSeq = fromSeqRaw === "done" ? null : numericCursor(fromSeqRaw);
+    const fromGapSeq = fromGapSeqRaw === "done" ? null : numericCursor(fromGapSeqRaw);
+    if ((fromSeqRaw !== "done" && Number.isNaN(fromSeq)) || (fromGapSeqRaw !== "done" && Number.isNaN(fromGapSeq))) {
+      return json({ error: "bad_cursor" }, 400);
+    }
+
+    let droppedRows: SqlRow[];
+    let seqRows: SqlRow[];
+    try {
+      droppedRows = fromSha === "done" ? [] : this.sql().exec(
+        "SELECT sha256,last_seq FROM dropped_index WHERE last_seq > ? AND sha256 > ? ORDER BY sha256 LIMIT ?",
+        floor, fromSha, limit + 1,
+      ).toArray();
+      seqRows = fromSeqRaw === "done" ? [] : this.sql().exec(
+        "SELECT seq,manifest_sha,carrier_sha FROM seq_roots WHERE seq > ? AND seq <= ? AND seq > ? ORDER BY seq LIMIT ?",
+        floor, head, fromSeq ?? floor, limit + 1,
+      ).toArray();
+    } catch (e) {
+      // A legacy object can have KV head/index evidence but lack the SQLite tables.
+      // Do not create them here; the measurement reports it as unavailable.
+      logErr("roots_inspect_sql_failed", e);
+      return json({ error: "index_unavailable", reason: "storage_unreadable" }, 503);
+    }
+    const droppedPage = droppedRows.slice(0, limit).map((r) => ({ sha: String(r.sha256), lastSeq: Number(r.last_seq) }));
+    const seqRootsPage = seqRows.slice(0, limit).map((r) => ({
+      seq: Number(r.seq), manifestSha: String(r.manifest_sha), ...(r.carrier_sha == null ? {} : { carrierSha: String(r.carrier_sha) }),
+    }));
+
+    const gapPage: Array<Record<string, unknown>> = [];
+    if (fromGapSeqRaw !== "done") {
+      const firstGapSeq = Math.max(1, synced);
+      const cursor = fromGapSeq ?? firstGapSeq - 1;
+      const start = Math.max(firstGapSeq, cursor + 1);
+      const end = Math.min(head, start + ROOTS_INSPECT_GAP_PAGE_LIMIT - 1);
+      for (let s = start; s <= end; s++) {
+        try {
+          const raw = this.ctx.storage.kv.get(`seq:${s}`) as string | undefined;
+          if (!raw) return json({ error: "roots_incomplete", message: `retained gap at seq ${s}` }, 409);
+          const sc = JSON.parse(raw) as SignedCommit;
+          const cb = JSON.parse(sc.body) as CommitBodyView;
+          const mode = readRefMode(cb);
+          if (!mode || typeof cb.encManifestSha !== "string") return json({ error: "roots_incomplete", message: `unreadable refs at seq ${s}` }, 409);
+          const chainRefs = readManifestChain(cb.manifestChain, cb.encManifestSha);
+          if (chainRefs === null) return json({ error: "roots_incomplete", message: `unreadable refs at seq ${s}` }, 409);
+          if (mode.kind === "inline") {
+            gapPage.push({ seq: s, manifestSha: cb.encManifestSha, inlineRefs: mode.refShas, ...(chainRefs.length ? { chainRefs } : {}) });
+          } else {
+            gapPage.push({ seq: s, manifestSha: cb.encManifestSha, carrierSha: mode.sidecarSha, sidecar: { sha: mode.sidecarSha, count: mode.count, size: mode.totalBytes }, ...(chainRefs.length ? { chainRefs } : {}) });
+          }
+        } catch {
+          return json({ error: "roots_incomplete", message: `unreadable refs at seq ${s}` }, 409);
+        }
+      }
+    }
+    const lastGapSeq = gapPage.length ? Number(gapPage.at(-1)!.seq) : null;
+    return json({
+      head, pruneFloor: floor, indexGeneration: generation, indexSyncedSeq: synced,
+      droppedPage, ...(droppedRows.length > limit ? { nextSha: droppedPage.at(-1)!.sha } : {}),
+      seqRootsPage, ...(seqRows.length > limit ? { nextSeq: seqRootsPage.at(-1)!.seq } : {}),
+      gapPage, ...(lastGapSeq !== null && lastGapSeq < head ? { nextGapSeq: lastGapSeq } : {}),
     });
   }
 

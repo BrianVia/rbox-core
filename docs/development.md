@@ -5,10 +5,34 @@ bun install
 bun run typecheck          # tsc (root) + tsc (apps/api)
 bun run test               # engine + client tests (bun:test, scoped to ./src/)
 bun run test:api           # Worker integration tests (Miniflare/workerd: D1+R2+DO)
-bun run test:all           # both suites
+bun run test:storage-truth # Phase-0 storage-truth runner tests
+bun run test:all           # src + storage-truth runner + Worker API suites
 ```
 
 The control plane deploys with `wrangler deploy` from `apps/api/`. Secrets (`RBOX_BOOTSTRAP_SECRET`, `RBOX_PLATFORM_SECRET`, and later `STRIPE_*`) are Wrangler secrets — never committed.
+
+## Storage-truth measurement
+
+The Phase-0 runner is read-only but uses live remote D1/R2 bindings and the
+platform-gated deployed API route. Production is the default; select `dev` and
+provide its API URL explicitly when measuring development. Reuse the same spool
+directory to resume from its last transactionally committed page.
+
+```bash
+RBOX_PLATFORM_SECRET="$RBOX_PLATFORM_SECRET" \
+  bun scripts/storage-truth.ts \
+  --account acct_example \
+  --adapter ./scripts/storage-truth-live.ts \
+  --spool .storage-truth-spool/acct_example
+
+RBOX_STORAGE_TRUTH_ENV=dev \
+RBOX_STORAGE_TRUTH_API=https://rbox-dev-api.example.workers.dev \
+RBOX_PLATFORM_SECRET="$RBOX_PLATFORM_SECRET" \
+  bun scripts/storage-truth.ts \
+  --account acct_example \
+  --adapter ./scripts/storage-truth-live.ts \
+  --spool .storage-truth-spool/dev-acct_example
+```
 
 ## Benchmarking
 
