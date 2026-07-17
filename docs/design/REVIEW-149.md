@@ -104,3 +104,99 @@ Target: `docs/design/149-storage-economics.md`
 Interim note: the v1.7.1 snapshot default-flip (PR #309) intentionally uses
 the manual device-inventory + kill-switch path and is NOT gated on Unit A;
 findings 1–2 are about the durable mechanism that replaces that manual check.
+
+## Round 2
+
+1. **BLOCKER — F1 is still unresolved: A1 still derives safety from the telemetry row and cannot represent mixed processes.** V2 says the DO recomputes from recent device rows and treats only a NULL/unparseable `last_seen_version` as incapable (`docs/design/149-storage-economics.md:69-77`). A headerless request, however, refreshes `last_seen_at` while preserving a previously capable version; a different version is suppressed for 60 seconds; and the update is best-effort (`apps/api/src/auth/authenticate.ts:56-75`; the exact headerless/mixed behavior is pinned at `apps/api/test/auth-version.test.ts:59-65,78-86`). One device row cannot express the minimum of a new CLI and an old daemon that remain live concurrently. Nor does the Worker currently forward a request-current device/kind/capability fact to the DO: reads pass the request through and writes add only account/epoch (`apps/api/src/routes/sync.ts:28-45`). Consequently an incapable headerless process can still look capable, and A4's claim that its contact necessarily lowers floors is false (`149:118-122`). This needs request-current evidence plus sticky/per-process incapable state (and fail-closed failure semantics), not another recomputation of `last_seen_version`.
+
+2. **BLOCKER — F2's pre-encoding pin does not exist on direct push.** V2 says the client already shares a key/head DO round trip on both paths (`docs/design/149-storage-economics.md:81-93`), but direct `push` does not pull (`src/cli/sync/push.ts:48-64`). Its write setup calls `currentKek`, which reads account keys and the workspace KEK (`src/cli/e2ee-remote.ts:111-120,886-929`) through D1 key routes, not WorkspaceSync (`apps/api/src/routes/keys.ts:12-25`). Immediately before encoding, `commit` refreshes those keys and reads the local pin (`src/cli/e2ee-remote.ts:661-690`); it uploads the sidecar and encrypted manifest before its first DO contact, the commit POST (`:703-720,789-806`). Full sync happens to call `/latest` through pull (`src/cli/sync/sync.ts:17-18`), direct push does not. A real pre-encode DO handshake, or a capability response spliced into a route every write attempt actually calls, is required.
+
+3. **BLOCKER — the DO cannot enforce A2 because the signed body does not declare the manifest encoding.** A2 adds `capabilityGen` but asks admission to inspect “the commit's encoding class,” while A3 also permits a force-on override (`docs/design/149-storage-economics.md:81-103`). Raw-v0 and snapshots are both chain-free encrypted manifest blobs (`src/cli/e2ee-remote.ts:783-787`). The signed commit exposes an encrypted manifest SHA and optional `manifestChain`, but no raw/snapshot/delta class or override (`src/engine/e2ee/commit.ts:35-60,123-145`); the Worker sees only those fields and opaque ciphertext and never verifies the signature (`apps/api/src/commit-envelope.ts:4-10,45-64`). Because legacy raw must “always admit” (`149:89-90`), admitting the indistinguishable class also admits a stale snapshot. This is already a rollout problem, not only a future schema problem: the v1.7.1 change makes snapshot writing default-on but sends neither the generation nor an encoding declaration (`git show b3259f7:src/cli/e2ee-remote.ts:78-86,790-803`). The new server must either admit that indistinguishable snapshot after a floor drops, or reject a released client that cannot re-pin/re-encode and treats 409 as ordinary conflict. Add a signed, canonical encoding declaration, a validated override policy, an explicit legacy-absence rule, and a legacy-writer transition.
+
+4. **MAJOR — F5 is only partial, and A1 has no bounded query contract.** The population is stated as `kind = 'device'` and then says `api_key` counts as a device (`docs/design/149-storage-economics.md:69-75`), but API keys are stored as `kind='api_key'` and are full E2EE sync principals (`apps/api/src/auth/api-keys.ts:45-55`; `apps/api/src/worker.ts:421-439`). No minimum version is given for any of `mdeSnapshot`, `mdeDelta`, or `refsetDelta`, so strict semver comparison alone cannot compute the three floors. Finally, credentials live on the directory plane while the DO belongs to the account-data plane (`apps/api/src/db.ts:13-25`), and the available device index is `(account_id, expires_at, created_at)`, not the proposed kind/revoked/last-seen predicate (`apps/api/migrations/0015_device_management.sql:3-13`). V2 must define `kind IN ('device','api_key')`, the three version constants, the Worker-to-DO forwarding/failure contract, and an indexed bounded recomputation (or materialized account capability) before the every-contact budget claim is credible.
+
+5. **BLOCKER — F6's two identities are conceptually separated, but B1 is not a canonical wire contract.** `carrierSha` depends on exact envelope bytes, yet `magic + strict-JSON header + body` defines neither a header length/delimiter nor exact binary encodings for added `(sha,size)` records and removed SHAs; it is also unclear whether `chain` includes the current carrier (`docs/design/149-storage-economics.md:133-145`). The current format is byte-exact down to magic, u32 count, 40-byte records, and no trailing bytes (`src/engine/refset.ts:1-17,25-27,45-60`). V2 also duplicates `resultSha` between header and signed descriptor without requiring equality, and moves `count`/`totalBytes` into the header without saying whether they remain signed and cross-checked (today all three descriptor fields are signed and validated at `src/engine/e2ee/commit.ts:24-33,90-99`). Specify framing, canonical full/delta bodies, exact chain membership/order, every cross-field equality, and golden vectors.
+
+6. **BLOCKER — F8 remains a claimed invariant; B3 does not integrate with the roots index or its pagination.** The shipped `seq_roots` table has one `carrier_sha` per sequence, both fold paths write one value, and sweep deletes by sequence (`apps/api/src/workspace-sync.ts:200-203,772-820,844-847`). `/roots` and `/roots-inspect` likewise emit one carrier (`:982-988,1075-1088`), and the collector roots only that value (`apps/api/src/versions.ts:90-109`). B3 merely says “stores ... FULL sidecar chain” (`docs/design/149-storage-economics.md:163-171`) without a schema migration/backfill, normalized rows versus bounded JSON choice, atomic fold/subcursor rules, raw-gap representation, sweep/cascade rules, or consumer changes. A naive 16-carrier expansion under the existing 20,000-sequence page limit (`workspace-sync.ts:31`) can produce over 20 MB of hashes before JSON overhead. Until storage and composite pagination are specified, advancing a floor can still strand an ancestor.
+
+7. **MAJOR — F9's per-parent entitlement check omits the publication/GC fence and recovery semantics.** The existing prefetch gate proves only entitled + present before R2 access (`apps/api/src/sidecar.ts:100-137`). Safe publication additionally runs every referenced address through `validateCommitRefs`, which excludes per-account prune candidates and active delete intents so accounting re-grants/unmarks them (`apps/api/src/commit-accounting.ts:91-145,204-218`). B2 says each parent is entitlement-gated but never adds every parent carrier to that accounting union (`docs/design/149-storage-economics.md:149-160`; the current union is at `apps/api/src/workspace-sync.ts:578-580`). It also maps any fold failure to `bad_sidecar`, losing today's 422 missing/unentitled versus 400 corrupt distinction (`apps/api/src/sidecar.ts:124-137`) and gives the writer no “parent vanished, re-anchor full” response. Parent carriers need the full candidate/delete fence and typed recovery path.
+
+8. **MAJOR — F7/F10's bounded fold and restart/second-device base state are incomplete.** B2 asserts at most `16 × 6MB` (`docs/design/149-storage-economics.md:149-156`), but admission permits 250,000 refs and the current full encoding is `18 + 40*count`, about 10 MB (`apps/api/src/commit-accounting.ts:43-48`; `src/engine/refset.ts:45-49`). The half-full rule can still require roughly a 10 MB anchor plus fifteen ~5 MB deltas, with no object-size preallocation gate, streaming algorithm, cumulative-chain byte cap, CPU/subrequest budget, or roots-gap budget. B4 says to persist parent/depth/chain beside manifest metadata (`149:173-181`), but normal clients do not fetch refset sidecars, the signed descriptor does not expose depth/chain, and the existing verified persisted slot contains only manifest evidence (`src/cli/config.ts:177-220`). V2 never explains how a pulling second device obtains, authenticates, and atomically saves sidecar base evidence. “Missing → full” is safe, but does not fulfill the accepted verified second-device/restart mechanism.
+
+9. **BLOCKER — F11 is not resolved: the proposed ledger cannot perform resumable active/history classification.** C2 claims the existing DO endpoints serve per-root indexed head membership (`docs/design/149-storage-economics.md:201-217`), but `/roots-inspect` only pages `dropped_index`, per-sequence manifest/current-carrier rows, and a raw head gap; it accepts no SHA membership query (`apps/api/src/workspace-sync.ts:1068-1122`). The shipped runner obtains membership by durably materializing `workspace_scans`, `stream_state`, and a `roots` relation, atomically checkpointing each stream (`scripts/storage-truth.ts:251-263,389-439`), then querying that relation for every entitlement (`:448-468`). `fairuse_scans(... pins_json, cursor, active_bytes, history_bytes ...)` has neither per-workspace/per-stream cursors nor a root-membership table (`149:203-205`), and therefore cannot resume the roots × entitlement join or delete the right partial materialization after pin churn. “Same caps as Phase 1” names only an entitlement-page analogy, not a root/workspace-page, D1-statement, CPU, or subrequest budget; even capturing every workspace pin needs a checkpointed phase. A single cursor plus aggregates is not sufficient schema.
+
+10. **BLOCKER — completion is not fenced to mutation; the lease and per-invocation bound are labels rather than mechanics.** C2 allows pruning from any completed epoch (`docs/design/149-storage-economics.md:216-217`) but C3 never revalidates its saved triples before each floor move, while `/prune` accepts only a floor and checks no scan epoch/pins (`apps/api/src/workspace-sync.ts:1128-1143`). A commit or index/floor change immediately after scan completion therefore leaves enforcement acting on stale classification. The lease declaration has no primary key/unique constraint, conditional acquire/takeover SQL, renewal, fencing token, or owner/expiry guard around ledger writes and `/prune` (`149:203-205,219-241`); compare the shipped GC lease's value-CAS takeover, renewal, and mutation guard (`apps/api/src/versions.ts:247-289,308-336`). Finally, eight calls do not bound DO work: “bounded step” has no numeric maximum, and one current call synchronously loops across every sequence to the target (`workspace-sync.ts:1139-1142`). F15 remains unresolved; specify a max floor delta and holder+epoch CAS on every state transition and prune.
+
+11. **MAJOR — F18's no-prune-before-B3 rule is still rollout convention, not structural ordering.** V2 says fair-use “never prunes” an uncovered format because B3 ships first, then enables enforcement before writers (`docs/design/149-storage-economics.md:242-244,279-288`). Neither the scan/lease schema nor `/prune` carries a roots schema version, per-sequence coverage marker, minimum safe floor, or enforcement kill switch; `/prune` is format-blind (`apps/api/src/workspace-sync.ts:1128-1143`). Thus partial deployment, rollback, incomplete backfill, or an independently invoked retention prune can violate the invariant. Gate floor movement on an authoritative roots-format/coverage generation inside the DO. The broad deployment direction—server codec/rooting before writers—is otherwise sound.
+
+12. **MINOR — F17 still lacks a durable status lifecycle.** The promised API exposes `lastCompletedEpochAt` and `pruningActive` (`docs/design/149-storage-economics.md:253-257`), but `fairuse_scans` has `started_at` and generic `state`, no completion timestamp or defined active/clear transition (`:203-205`). Define which epoch supplies displayed totals, when pruning becomes active, and when it clears after convergence, grace, plan change, aborted pins, or an enforcement kill switch.
+
+### Verified round-1 resolutions
+
+- F3's historical floor is corrected to v1.1.0 and the 30-day exclusion is explicitly a product ruling, although the required founder sign-off is still external to this review (`docs/design/149-storage-economics.md:105-117`). F4's pull/push/orphan outcomes are substantially present; the existing 409 path is only implicit (commit maps it to conflict and push pulls at `src/cli/remote/commits.ts:316-320`; `src/cli/sync/push.ts:278-287`).
+- F12, F13, F14, and F16 are resolved in prose: fair-use skips locked accounts during live grace, the floor-adjusted account-global formula is consistent, missing mirror timestamps fail closed, and the grace stamp is retained while reads are qualified (`docs/design/149-storage-economics.md:194-199,223-251`). F19's cited code anchors and measurement digest are present (`:9-36,299-309`).
+- F1/F2/F5 remain unresolved or partial (findings 1-4); F6-F10 remain partial/unresolved (findings 5-8); F11/F15/F17/F18 remain unresolved or partial (findings 9-12). The resolved grace/formula/order prose does not compensate for the missing executable scan and fencing model.
+
+**VERDICT: CHANGES-REQUIRED.**
+
+## Round 2 rulings (orchestrator)
+
+ALL 12 ACCEPTED — every finding verified against code; none overruled.
+Direction for v3 (executable-level completeness):
+
+1. A1 evidence: Worker forwards a request-current capability fact
+   {kind, version|absent} to the DO on every authenticated contact; the DO
+   keeps sticky per-principal incapable state (headerless/mixed process ⇒
+   incapable until a versioned contact from that principal); forwarding
+   failure ⇒ treat contact as incapable (fail closed).
+2. Pre-encode pin: capability {gen, floors} is spliced into the keys route
+   response (the one round-trip every write path provably makes) AND
+   /latest; commit admission requires a gen. No new client round-trip.
+3. Signed encoding declaration: commit body gains a canonical `encoding`
+   field (raw|snapshot|delta|sidecar-delta) + optional `override:true`;
+   absence ⇒ legacy rule = admit as raw-or-snapshot (v1.7.1 fleet) until a
+   floor-off event, after which legacy-absent commits still admit but log;
+   the gate can therefore never brick a released client. Founder fleets
+   using force-on set override, which admits regardless of floors.
+4. Population `kind IN ('device','api_key')`; three version-floor
+   constants pinned (mdeSnapshot=1.1.0, mdeDelta=1.1.0, refsetDelta=first
+   release shipping B readers); directory-plane query served by a new
+   covering index (append-only migration) + Worker-side capability
+   summary forwarded to the DO (account-plane never queries directory).
+5. B1 framing: exact byte layout (magic, u32 header length, canonical
+   JSON header, fixed-width binary body records), chain excludes current
+   carrier, header resultSha/count/totalBytes MUST equal signed
+   descriptor fields (cross-checked both places), golden vectors table.
+6. B3 schema: new normalized `seq_root_chains(seq, ord, carrier_sha)`
+   rows + migration/backfill; sweep deletes by seq; /roots pagination
+   emits (seq, chain) pages under a byte budget; collector roots the
+   union. No JSON blobs.
+7. Parent carriers join the validateCommitRefs accounting union
+   (candidate/delete fence identical to data refs); fold failures keep
+   the 422 missing/unentitled vs 400 corrupt split; new typed
+   `sidecar_parent_gone` 422 ⇒ writer re-anchors full.
+8. Budgets: cumulative chain-byte cap (32 MiB), per-fold subrequest and
+   CPU budget stated; writer base evidence: second device reconstructs
+   from the signed descriptor chain on first sidecar-bearing pull and
+   persists it in the same verified slot schema as manifest evidence
+   (schema extension specified).
+9. C2 ledger: adopt the 142 runner's shape in D1 — per-workspace stream
+   cursors table + materialized root-membership table + scan-epoch
+   checkpoint rows; explicit per-tick budgets (pages, statements,
+   subrequests); pin capture is itself a checkpointed phase.
+10. Fencing: fairuse_leases gets PK + value-CAS acquire/renew/takeover
+    (mirror versions.ts GC lease); /prune gains optional {scanEpoch,
+    pins, maxDelta} body — DO validates pins at prune time and rejects
+    stale epochs; max floor delta per call = 500 sequences.
+11. Structural ordering: DO stores a roots-format coverage generation;
+    floor movement (fair-use AND retention) refuses to cross a sequence
+    whose chain rows predate the required generation unless coverage
+    backfill for it is complete; enforcement kill switch env on the
+    Worker.
+12. Ledger lifecycle: completed_at column; displayed totals = latest
+    completed epoch; pruningActive set on first floor move of an epoch,
+    cleared on convergence, grace entry, plan change, or kill switch.
+
+v3 drafting of the mechanical sections (DDL, framing, vectors, budgets)
+is delegated; rulings above are the spec for that derivation. Round 3
+goes to a fresh reviewer against v3.
