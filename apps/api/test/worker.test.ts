@@ -1,5 +1,5 @@
 import { env, SELF, applyD1Migrations, createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
-import { beforeAll, beforeEach, describe, expect, test } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
 import { createHash } from "node:crypto";
 import { bootstrap as bootstrapRoute, mintDevice } from "../src/auth.js";
 import { CachedReleases, routeTemplate } from "../src/worker.js";
@@ -565,39 +565,56 @@ describe("worker integration (real DO + D1 + R2)", () => {
   }
   const clerkStates = new Map<string, MockClerkState>();
   const clerkFetches = new Map<string, number>();
+  const stripeCalls: { path: string; method: string; body: string }[] = [];
+  const priceCalls: { path: string; method: string }[] = [];
 
   beforeAll(async () => {
     const pair = await crypto.subtle.generateKey({ name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" }, true, ["sign", "verify"]);
     priv = pair.privateKey;
     const jwk = (await crypto.subtle.exportKey("jwk", pair.publicKey)) as JsonWebKey & { kid?: string; use?: string; alg?: string };
     jwk.kid = KID; jwk.use = "sig"; jwk.alg = "RS256";
-    const { fetchMock } = await import("cloudflare:test");
-    fetchMock.activate();
-    fetchMock.disableNetConnect();
-    fetchMock.get("https://clerk.test").intercept({ path: "/.well-known/jwks.json" }).reply(200, JSON.stringify({ keys: [jwk] })).persist();
-    // Clerk Backend API (email verification): every sub verified EXCEPT "user_unverified".
-    fetchMock
-      .get("https://api.clerk.com")
-      .intercept({ path: /^\/v1\/users\//, method: "GET" })
-      .reply((opts: { path: string }) => {
-        const sub = decodeURIComponent(opts.path.split("/").pop() ?? "");
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const request = new Request(input, init);
+      const url = new URL(request.url);
+
+      if (request.method === "GET" && url.origin === ISS && url.pathname === "/.well-known/jwks.json") {
+        return Response.json({ keys: [jwk] });
+      }
+
+      // Clerk Backend API (email verification): every sub verified EXCEPT "user_unverified".
+      if (request.method === "GET" && url.origin === "https://api.clerk.com" && url.pathname.startsWith("/v1/users/")) {
+        const sub = decodeURIComponent(url.pathname.split("/").pop() ?? "");
         clerkFetches.set(sub, (clerkFetches.get(sub) ?? 0) + 1);
         const state = clerkStates.get(sub) ?? { updatedAt: 100 };
-        if (state.responseStatus) return { statusCode: state.responseStatus, data: "{}" };
+        if (state.responseStatus) return Response.json({}, { status: state.responseStatus });
         const status = state.emailStatus ?? (sub === "user_unverified" ? "unverified" : "verified");
-        return {
-          statusCode: 200,
-          data: JSON.stringify({
-            primary_email_address_id: "e1",
-            email_addresses: [{ id: "e1", email_address: "owner@example.com", verification: { status } }],
-            external_accounts: state.externalAccounts ?? [],
-            password_enabled: state.passwordEnabled ?? false,
-            updated_at: state.updatedAt,
-          }),
-        };
-      })
-      .persist();
+        return Response.json({
+          primary_email_address_id: "e1",
+          email_addresses: [{ id: "e1", email_address: "owner@example.com", verification: { status } }],
+          external_accounts: state.externalAccounts ?? [],
+          password_enabled: state.passwordEnabled ?? false,
+          updated_at: state.updatedAt,
+        });
+      }
+
+      if (url.origin === "https://api.stripe.com" && request.method === "GET" && url.pathname.startsWith("/v1/prices")) {
+        priceCalls.push({ path: `${url.pathname}${url.search}`, method: request.method });
+        return Response.json({ data: [{ id: "price_test" }] });
+      }
+
+      if (url.origin === "https://api.stripe.com" && request.method === "POST" && url.pathname.startsWith("/v1/")) {
+        const path = `${url.pathname}${url.search}`;
+        const body = new TextDecoder().decode(await request.arrayBuffer());
+        stripeCalls.push({ path, method: request.method, body });
+        if (url.pathname.startsWith("/v1/checkout/sessions")) return Response.json({ url: "https://checkout.stripe.test/cs_test_123" });
+        return Response.json({ id: "obj_test" }); // subscriptions/customers PATCH echo
+      }
+
+      throw new Error(`Unexpected outbound request: ${request.method} ${request.url}`);
+    });
   });
+
+  afterAll(() => vi.restoreAllMocks());
 
   async function signJwt(payload: Record<string, unknown>, opts: { alg?: string; kid?: string } = {}): Promise<string> {
     const header = { alg: opts.alg ?? "RS256", kid: opts.kid ?? KID, typ: "JWT" };
@@ -1403,29 +1420,8 @@ describe("worker integration (real DO + D1 + R2)", () => {
   // (b) makes outbound Stripe calls. The miniflare binding has STRIPE_SECRET ABSENT
   // (so the 501-gate test elsewhere stays valid) and mutating env.STRIPE_SECRET does
   // NOT reach the SELF worker, so we drive the EXPORTED functions directly with the
-  // test env (where the mutation IS visible) and mock Stripe via fetchMock. D1, the
+  // test env (where the mutation IS visible) and mock Stripe via global fetch. D1, the
   // Clerk JWKS mock, and the webhook (via SELF) are all real.
-  const stripeCalls: { path: string; method: string; body: string }[] = [];
-  const priceCalls: { path: string; method: string }[] = [];
-  beforeAll(async () => {
-    const { fetchMock } = await import("cloudflare:test");
-    const pool = fetchMock.get("https://api.stripe.com");
-    pool
-      .intercept({ path: /^\/v1\/prices/, method: "GET" })
-      .reply((o: { path: string; method: string }) => {
-        priceCalls.push({ path: o.path, method: o.method });
-        return { statusCode: 200, data: JSON.stringify({ data: [{ id: "price_test" }] }) };
-      })
-      .persist();
-    pool
-      .intercept({ path: /^\/v1\//, method: "POST" })
-      .reply((o: { path: string; method: string; body?: unknown }) => {
-        stripeCalls.push({ path: o.path, method: o.method, body: String(o.body ?? "") });
-        if (o.path.startsWith("/v1/checkout/sessions")) return { statusCode: 200, data: JSON.stringify({ url: "https://checkout.stripe.test/cs_test_123" }) };
-        return { statusCode: 200, data: JSON.stringify({ id: "obj_test" }) }; // subscriptions/customers PATCH echo
-      })
-      .persist();
-  });
   // Run `fn` with STRIPE_SECRET present (restored after) and a fresh call log.
   async function withStripe<T>(fn: () => Promise<T>): Promise<T> {
     (env as { STRIPE_SECRET?: string }).STRIPE_SECRET = "sk_test_dummy";

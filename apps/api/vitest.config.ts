@@ -1,5 +1,6 @@
-import { defineWorkersConfig, readD1Migrations } from "@cloudflare/vitest-pool-workers/config";
+import { cloudflareTest, readD1Migrations } from "@cloudflare/vitest-pool-workers";
 import { readdirSync } from "node:fs";
+import { defineConfig } from "vitest/config";
 
 // wrangler tracks applied migrations BY FILENAME in every environment's
 // d1_migrations table, so filenames are append-only: renaming an applied file
@@ -31,48 +32,46 @@ function assertMigrationNumbering(dir: string): void {
 
 // Real DO + D1 + R2 bindings via workerd (Miniflare). D1 migrations are read at
 // config time and applied per-test against the local D1 (see test/setup).
-export default defineWorkersConfig(async () => {
-  assertMigrationNumbering("./migrations");
-  const migrations = await readD1Migrations("./migrations");
-  return {
-    cacheDir: "../../.cache/vitest/apps-api",
-    test: {
-      // Shared self-hosted CI runners contend heavily; vitest's 5s default flakes
-      // healthy tests under that load. 15s still catches real hangs.
-      testTimeout: 15_000,
-      poolOptions: {
-        workers: {
-          // Tests bootstrap unique accounts, so per-test storage isolation isn't
-          // needed — and disabling it avoids the stacked-storage teardown assert
-          // that D1+DO trip. One worker keeps the shared D1/R2 deterministic.
-          isolatedStorage: false,
-          singleWorker: true,
-          wrangler: { configPath: "./wrangler.jsonc" },
-          miniflare: {
-            bindings: {
-              RBOX_ENV: "dev",
-              RBOX_BOOTSTRAP_SECRET: "test-bootstrap-secret",
-              RBOX_ALLOW_BOOTSTRAP_PLAN: "1",
-              RBOX_PLATFORM_SECRET: "test-platform-secret",
-              // Webhook secret set (so we can test signed delivery) but STRIPE_SECRET
-              // deliberately ABSENT (so checkout/portal exercise the 501 gate).
-              STRIPE_WEBHOOK_SECRET: "whsec_test_secret",
-              CLERK_ISSUER: "https://clerk.test",
-              CLERK_JWKS_URL: "https://clerk.test/.well-known/jwks.json",
-              CLERK_ALLOWED_ORIGINS: "https://app.test",
-              CLERK_SECRET_KEY: "sk_test_clerk_dummy",
-              RBOX_RECEIPT_KEY: "test-receipt-key-at-least-32-bytes-long-xx",
-              RBOX_GRANT_KEY: "test-grant-key-at-least-32-bytes-long-xxxxx",
-              RBOX_BLOB_PACK_ACCEPT: "1",
-              RBOX_BLOB_PACK_GC: "1",
-              // Design 103: allow the full Workers suite to exercise early rejection.
-              ...(process.env.RBOX_COMMIT_EARLY_REJECT ? { RBOX_COMMIT_EARLY_REJECT: process.env.RBOX_COMMIT_EARLY_REJECT } : {}),
-              ...(process.env.RBOX_COMMIT_DELTA_ADMISSION ? { RBOX_COMMIT_DELTA_ADMISSION: process.env.RBOX_COMMIT_DELTA_ADMISSION } : {}),
-              TEST_MIGRATIONS: migrations,
-            },
+export default defineConfig({
+  cacheDir: "../../.cache/vitest/apps-api",
+  plugins: [
+    cloudflareTest(async () => {
+      assertMigrationNumbering("./migrations");
+      const migrations = await readD1Migrations("./migrations");
+      return {
+        wrangler: { configPath: "./wrangler.jsonc" },
+        miniflare: {
+          bindings: {
+            RBOX_ENV: "dev",
+            RBOX_BOOTSTRAP_SECRET: "test-bootstrap-secret",
+            RBOX_ALLOW_BOOTSTRAP_PLAN: "1",
+            RBOX_PLATFORM_SECRET: "test-platform-secret",
+            // Webhook secret set (so we can test signed delivery) but STRIPE_SECRET
+            // deliberately ABSENT (so checkout/portal exercise the 501 gate).
+            STRIPE_WEBHOOK_SECRET: "whsec_test_secret",
+            CLERK_ISSUER: "https://clerk.test",
+            CLERK_JWKS_URL: "https://clerk.test/.well-known/jwks.json",
+            CLERK_ALLOWED_ORIGINS: "https://app.test",
+            CLERK_SECRET_KEY: "sk_test_clerk_dummy",
+            RBOX_RECEIPT_KEY: "test-receipt-key-at-least-32-bytes-long-xx",
+            RBOX_GRANT_KEY: "test-grant-key-at-least-32-bytes-long-xxxxx",
+            RBOX_BLOB_PACK_ACCEPT: "1",
+            RBOX_BLOB_PACK_GC: "1",
+            // Design 103: allow the full Workers suite to exercise early rejection.
+            ...(process.env.RBOX_COMMIT_EARLY_REJECT ? { RBOX_COMMIT_EARLY_REJECT: process.env.RBOX_COMMIT_EARLY_REJECT } : {}),
+            ...(process.env.RBOX_COMMIT_DELTA_ADMISSION ? { RBOX_COMMIT_DELTA_ADMISSION: process.env.RBOX_COMMIT_DELTA_ADMISSION } : {}),
+            TEST_MIGRATIONS: migrations,
           },
         },
-      },
-    },
-  };
+      };
+    }),
+  ],
+  test: {
+    // Shared CI runners can contend heavily; 15s still catches real hangs.
+    testTimeout: 15_000,
+    // Files share D1/R2 state inside one process. CI parallelism comes from
+    // separate --shard jobs, each with its own workerd and storage.
+    maxWorkers: 1,
+    isolate: false,
+  },
 });
