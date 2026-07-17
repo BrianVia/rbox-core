@@ -22,7 +22,15 @@ export type ProtocolLockClass = keyof typeof PROTOCOL_LOCK_ORDER;
 export type ProtocolLockTraceEvent = { action: "acquire" | "release"; class: ProtocolLockClass; identity: string; depth: number; postHeadException: boolean };
 
 interface HeldClass { class: ProtocolLockClass; identity: string }
-interface LockContext { held: HeldClass[]; postHeadException: boolean; postHeadGitUsed: boolean }
+interface LockContext {
+  held: HeldClass[];
+  postHeadException: boolean;
+  postHeadGitUsed: boolean;
+  /** A recovery fence owns the complete physical Git lock plane. Nested
+   * prepared transactions must use that plane rather than starting a second
+   * logical Git phase after the state lock. */
+  coveredClasses: Set<ProtocolLockClass>;
+}
 
 const context = new AsyncLocalStorage<LockContext>();
 let traceSink: ((event: ProtocolLockTraceEvent) => void) | undefined;
@@ -61,7 +69,7 @@ function ensureAcquisitionAllowed(store: LockContext, lockClass: ProtocolLockCla
 
 async function withinContext<T>(fn: (store: LockContext) => Promise<T>): Promise<T> {
   const existing = context.getStore();
-  return existing ? fn(existing) : context.run({ held: [], postHeadException: false, postHeadGitUsed: false }, () => fn(context.getStore()!));
+  return existing ? fn(existing) : context.run({ held: [], postHeadException: false, postHeadGitUsed: false, coveredClasses: new Set() }, () => fn(context.getStore()!));
 }
 
 async function withAcquiredClass<T>(
@@ -71,6 +79,7 @@ async function withAcquiredClass<T>(
   fn: () => Promise<T>,
 ): Promise<T> {
   return withinContext(async (store) => {
+    if (store.coveredClasses.has(lockClass)) return fn();
     const exact = store.held.find((held) => held.class === lockClass && held.identity === identity);
     if (exact) return fn();
     ensureAcquisitionAllowed(store, lockClass, identity);
@@ -91,6 +100,26 @@ async function withAcquiredClass<T>(
     } catch (error) { failure ??= error; }
     if (failure !== undefined) throw failure;
     return result as T;
+  });
+}
+
+export function assertProtocolLockHeld(lockClass: ProtocolLockClass, identity?: string): void {
+  const store = context.getStore();
+  if (!store || (!store.coveredClasses.has(lockClass)
+    && !store.held.some((held) => held.class === lockClass && (identity === undefined || held.identity === identity)))) {
+    throw new Error(`required held protocol lock is missing: ${lockClass}${identity === undefined ? "" : ` (${identity})`}`);
+  }
+}
+
+async function withCoveredClasses<T>(lockClasses: readonly ProtocolLockClass[], fn: () => Promise<T>): Promise<T> {
+  return withinContext(async (store) => {
+    const added = lockClasses.filter((lockClass) => !store.coveredClasses.has(lockClass));
+    for (const lockClass of added) store.coveredClasses.add(lockClass);
+    try {
+      return await fn();
+    } finally {
+      for (const lockClass of added.reverse()) store.coveredClasses.delete(lockClass);
+    }
   });
 }
 
@@ -170,7 +199,7 @@ export async function withReflogMaintenanceLocks<T>(commonDir: string, refs: rea
   const ordered = [...new Set(refs)].sort(byteCompare);
   const acquireAt = (index: number): Promise<T> => index === ordered.length
     ? fn()
-    : withDurableClass("reflog", ordered[index]!, reflogMaintenanceLockPath(real, ordered[index]!), () => acquireAt(index + 1), options);
+    : withDurableClass("reflog", `${real}\0${ordered[index]!}`, reflogMaintenanceLockPath(real, ordered[index]!), () => acquireAt(index + 1), options);
   return acquireAt(0);
 }
 
@@ -190,4 +219,52 @@ export async function withRepoProtocolLocks<T>(
   return withCommonDirOperationLocks([ctx.commonDir], () =>
     withReflogMaintenanceLocks(ctx.commonDir, request.reflogRefs ?? [], () =>
       request.origins ? withKeepOriginsLock(ctx.commonDir, fn, options) : fn(), options), options);
+}
+
+export interface RepositoryProtocolFenceRequest {
+  commonDir: string;
+  reflogRefs?: readonly string[];
+  origins?: boolean;
+}
+
+/** Complete reset/recovery repository fence. The caller already owns the
+ * workspace mutex. Every repository class is acquired globally before state,
+ * so helpers running inside the callback may safely reuse their ordinary
+ * wrappers: exact durable classes are already held and nested Git phases are
+ * covered by the encompassing phase. */
+export async function withRepositoryRecoveryFence<T>(
+  requests: readonly RepositoryProtocolFenceRequest[],
+  stateIdentity: string,
+  fn: () => Promise<T>,
+  options?: AcquireLockOptions,
+): Promise<T> {
+  const normalized = new Map<string, { refs: Set<string>; origins: boolean }>();
+  for (const request of requests) {
+    const real = await fs.realpath(request.commonDir);
+    const current = normalized.get(real) ?? { refs: new Set<string>(), origins: false };
+    for (const ref of request.reflogRefs ?? []) current.refs.add(ref);
+    current.origins ||= request.origins === true;
+    normalized.set(real, current);
+  }
+  const commonDirs = [...normalized.keys()].sort(byteCompare);
+  const acquireReflogs = (index: number, next: () => Promise<T>): Promise<T> => {
+    if (index === commonDirs.length) return next();
+    const commonDir = commonDirs[index]!;
+    return withReflogMaintenanceLocks(commonDir, [...normalized.get(commonDir)!.refs], () => acquireReflogs(index + 1, next), options);
+  };
+  const originDirs = commonDirs.filter((commonDir) => normalized.get(commonDir)!.origins);
+  const acquireOrigins = (index: number, next: () => Promise<T>): Promise<T> => index === originDirs.length
+    ? next()
+    : withKeepOriginsLock(originDirs[index]!, () => acquireOrigins(index + 1, next), options);
+  const coveredRepositoryClasses = ["git", "reservation", "orig-head", "index"] as const;
+  const acquireClassPlanes = (classIndex: number, dirIndex: number): Promise<T> => {
+    if (classIndex === coveredRepositoryClasses.length) {
+      return withCoveredClasses(coveredRepositoryClasses, () => withProtocolLockClass("state", stateIdentity, fn));
+    }
+    if (dirIndex === commonDirs.length) return acquireClassPlanes(classIndex + 1, 0);
+    const lockClass = coveredRepositoryClasses[classIndex]!;
+    return withProtocolLockClass(lockClass, commonDirs[dirIndex]!, () => acquireClassPlanes(classIndex, dirIndex + 1));
+  };
+  return withCommonDirOperationLocks(commonDirs, () =>
+    acquireReflogs(0, () => acquireOrigins(0, () => acquireClassPlanes(0, 0))), options);
 }

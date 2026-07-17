@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 import { accumulateRecoveryPage, pull, push, pushManifest, stampManifestSchemaForCommit, sync, type SyncDeps } from "../sync.js";
 import { missingBlobsChunked } from "../sync-recovery.js";
 import type { WorkspaceConfig } from "../config.js";
-import { loadState, saveStateUnsafeLegacyOrTest, syncStreamId } from "../config.js";
+import { loadState, saveStateUnsafeLegacyOrTest, StreamMismatchError, syncStreamId } from "../config.js";
 import { BlobRetryLaterError, BlobShaMismatchError, type CommitOptions, type CommitResult, type LatestOptions, type SyncRemote } from "../remote.js";
 import {
   buildIgnoreMatcher,
@@ -1359,7 +1359,7 @@ test("§35: with no report, the sync path is unaffected (disabled fallback recor
 // pull read every baseline file as "remotely deleted" and wiped the local tree.
 // These tests pin the two independent layers that each prevent a recurrence.
 
-test("REBIND regression: a root rebound to a new EMPTY workspace pulls without deleting, then publishes the full tree", async () => {
+test("REBIND regression: changing config alone cannot reset or reconcile an old baseline", async () => {
   const remoteOld = new FakeRemote();
   await write("a.txt", "aaa\n");
   await write("b.txt", "bbb\n");
@@ -1369,20 +1369,13 @@ test("REBIND regression: a root rebound to a new EMPTY workspace pulls without d
   // exactly what `setup → create new workspace` does over an already-synced dir.
   const cfgNew: WorkspaceConfig = { ...cfg, remoteWorkspaceId: "ws_new" };
   const remoteNew = new FakeRemote();
-  const actions = await pull(root, cfgNew, deps(remoteNew));
-  expect(actions.filter((a) => a.kind === "delete")).toHaveLength(0); // NEVER deletes
+  await expect(pull(root, cfgNew, deps(remoteNew))).rejects.toBeInstanceOf(StreamMismatchError);
   expect(await read("a.txt")).toBe("aaa\n");
   expect(await read("b.txt")).toBe("bbb\n");
-
-  // And the first push to the new workspace is a REAL publish of everything.
-  const { sequence, committed } = await push(root, cfgNew, deps(remoteNew));
-  expect(committed).toBe(true);
-  expect(sequence).toBe(1);
-  const published = (await remoteNew.latest()).manifest.files.map((f) => f.path).sort();
-  expect(published).toEqual(["a.txt", "b.txt"]);
+  expect((await remoteNew.latest()).sequence).toBe(0);
 });
 
-test("state ownership: another workspace's baseline reads as fresh; same workspace kept; legacy unstamped adopted", async () => {
+test("state ownership: another workspace's baseline throws; same workspace kept; legacy unstamped adopted", async () => {
   const remote = new FakeRemote();
   await write("a.txt", "aaa\n");
   await push(root, cfg, deps(remote)); // stamps workspaceId: ws_t at seq 1
@@ -1390,9 +1383,8 @@ test("state ownership: another workspace's baseline reads as fresh; same workspa
   expect((await loadState(root, syncStreamId(cfg))).lastSyncedSequence).toBe(1); // kept
   const statePath = path.join(root, ".rbox", "state.json");
   const original = JSON.parse(await fs.readFile(statePath, "utf8"));
-  const foreign = await loadState(root, syncStreamId({ ...cfg, remoteWorkspaceId: "ws_other" })); // mismatch → no baseline
-  expect(foreign.lastSyncedSequence).toBe(0);
-  expect(foreign.lastSyncedManifest.files).toHaveLength(0);
+  await expect(loadState(root, syncStreamId({ ...cfg, remoteWorkspaceId: "ws_other" }))).rejects.toBeInstanceOf(StreamMismatchError);
+  expect(JSON.parse(await fs.readFile(statePath, "utf8"))).toEqual(original);
 
   // Legacy state file written before the stamp existed: adopted as-is.
   const legacy = original;

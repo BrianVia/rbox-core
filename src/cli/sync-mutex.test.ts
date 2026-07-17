@@ -163,13 +163,17 @@ describe("design 93 §6 complete caller disposition drift gate", () => {
 
   test("daemon acquires before consuming want and revalidates stream+nonce", async () => {
     const source = await fs.readFile(path.join(sourceRoot, "cli", "daemon", "daemon.ts"), "utf8");
-    const acquire = source.indexOf("await this.acquireSyncMutexFn(this.root)");
+    const pumpLoop = source.indexOf("private async pumpLoop");
+    const acquire = source.indexOf("await this.acquireSyncMutexFn(this.root)", pumpLoop);
+    const resetBoundary = source.indexOf("await this.resetOperationBoundary(syncMutex)", acquire);
     const revalidate = source.indexOf("await daemonBindingMatches", acquire);
     const consume = source.indexOf("this.want[op] = false", acquire);
     expect(acquire).toBeGreaterThan(0);
+    expect(resetBoundary).toBeGreaterThan(acquire);
     expect(revalidate).toBeGreaterThan(acquire);
+    expect(revalidate).toBeGreaterThan(resetBoundary);
     expect(consume).toBeGreaterThan(revalidate);
-    expect(source.indexOf("continue;", acquire)).toBeLessThan(revalidate);
+    expect(source.indexOf("continue;", acquire)).toBeLessThan(resetBoundary);
   });
 
   test("purge recomputes after confirmation under the mutex", async () => {

@@ -537,7 +537,22 @@ export function changedSidecarRepoKeys(state: SyncState, values: RepoStateValues
 /** Daemon iteration-start binding fence. Unlike loadState, this inspects the raw
  * stream and nonce so a reset/rebind while the daemon idles cannot be hidden. */
 export async function daemonBindingMatches(root: string, expectedStream: string, expectedNonce: string): Promise<boolean> {
-  const raw = await loadRawState(root);
+  let raw: SyncState | undefined;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      raw = await loadRawState(root);
+      break;
+    } catch (error) {
+      // State publication is an atomic rename and some writers intentionally do
+      // not own the workspace mutex. A bounded reader may straddle that rename;
+      // retry the complete identity-checked observation, never the same handle.
+      const transientIdentityRace = error instanceof Error
+        && error.message.startsWith("reset-corruption: reset file changed")
+        && error.message.endsWith(`${root}/.rbox/state.json`);
+      if (!transientIdentityRace || attempt >= 2) throw error;
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+  }
   if (!raw) return expectedNonce === "legacy";
   const rawStream = raw.stream ?? expectedStream; // pre-stream legacy adoption
   return rawStream === expectedStream && expectedStateNonce(raw) === expectedNonce;

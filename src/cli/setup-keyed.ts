@@ -2,11 +2,13 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { runInit } from "./init-cmd.js";
 import { startDaemonAndRecordDesired } from "./autostart-cmd.js";
-import { materializeAgentKey } from "./agent-key-bundle.js";
+import { decodeAgentKeyBundle, materializeAgentKey } from "./agent-key-bundle.js";
 import { saveCredentials } from "./credentials.js";
 import { fetchAccountWorkspaces, type AccountWorkspace } from "./workspace-picker.js";
 import { stderrStyle as e } from "./style.js";
 import { readStdinTrimmed } from "./read-stdin.js";
+import { loadConfig, loadRawState, syncStreamId } from "./config.js";
+import { RebindConsentRequiredError } from "./reset-consent.js";
 
 interface ResolvedWorkspace {
   workspaceId: string;
@@ -73,12 +75,22 @@ export async function persistKeyedCredentials(
 export async function runKeyedSetup(cwd: string, defaultRemote: string, flags: Record<string, string>): Promise<void> {
   const workspaceArg = flags.workspace;
   if (!workspaceArg || workspaceArg === "true") throw new Error("--workspace requires a name or id");
-  const materialized = await materializeAgentKey(await readKeyBundle(flags), { remoteUrlFallback: defaultRemote });
-  const remoteUrl = materialized.remoteUrl ?? defaultRemote;
-  await persistKeyedCredentials(materialized, remoteUrl);
-  const workspaces = await fetchAccountWorkspaces(remoteUrl, materialized.token);
+  const rawBundle = await readKeyBundle(flags);
+  const decoded = decodeAgentKeyBundle(rawBundle);
+  const remoteUrl = decoded.remoteUrl ?? defaultRemote;
+  const workspaces = await fetchAccountWorkspaces(remoteUrl, decoded.bearer);
   const picked = resolveKeyedWorkspace(workspaceArg, workspaces);
   const target = path.resolve(cwd, flags.dir && flags.dir !== "true" ? flags.dir : defaultTargetSlug(picked));
+  const prev = await loadConfig(target).catch(() => undefined);
+  const raw = await loadRawState(target);
+  const nextStream = syncStreamId({ remoteUrl, remoteWorkspaceId: picked.workspaceId, projectId: picked.projectId });
+  const priorStream = raw?.stream ?? (prev ? syncStreamId(prev) : undefined);
+  if (priorStream && priorStream !== nextStream) throw new RebindConsentRequiredError(target);
+
+  // Materializing the shared key writes the local keystore and environment, so
+  // it deliberately follows the rebind refusal above.
+  const materialized = await materializeAgentKey(rawBundle, { remoteUrlFallback: defaultRemote });
+  await persistKeyedCredentials(materialized, remoteUrl);
   await ensureKeyedTargetDir(target, flags.force === "true");
 
   const outcome = await runInit(

@@ -29,6 +29,7 @@ import {
   type StateSource,
 } from "./sync-state.js";
 import { acquireWorkspaceSyncMutex, releaseWorkspaceSyncMutex, workspaceSyncMutexDegraded } from "./sync-mutex.js";
+import { mintSetupExistingConsent } from "./reset-consent.js";
 
 const stream = "https://api.test::ws_93::root";
 const nonce = "a".repeat(32);
@@ -62,6 +63,17 @@ const baseState = (records: Record<string, RepoRecord> = {}): SyncState => ({
   lastSyncedSequence: 0,
   lastSyncedManifest: { generatedAt: "zero", files: [] },
   repoRecords: records,
+});
+
+const resetConsent = (
+  next: { remoteUrl: string; workspaceId: string; projectId: string },
+  observed: Pick<SyncState, "stream" | "stateNonce" | "stateRevision"> = baseState(),
+) => mintSetupExistingConsent({
+  root,
+  observedOldStream: observed.stream!,
+  observedOldNonce: observed.stateNonce,
+  mintedAtRevision: observed.stateRevision ?? 0,
+  ...next,
 });
 
 beforeEach(async () => {
@@ -342,7 +354,9 @@ describe("design 93 §6 transactional unit", () => {
       partial,
     });
 
-    await expect(resetSyncState(root, "next-stream", syncMutex)).rejects.toThrow("non-degraded workspace fence");
+    await expect(resetSyncState(root, "https://api.test::ws_next::root", syncMutex, resetConsent({
+      remoteUrl: "https://api.test", workspaceId: "ws_next", projectId: "root",
+    }, restarted))).rejects.toThrow("non-degraded workspace fence");
     const preserved = await loadState(root, stream);
     expect(preserved.stateNonce).toBeUndefined();
     expect(preserved.repoRecords).toBeUndefined();
@@ -511,7 +525,9 @@ describe("design 93 §6 transactional unit", () => {
     await saveStateUnsafeLegacyOrTest(root, initial);
     const delayed = composeStateSavePacket(initial, { expectedStream: stream, sourceGlobalSeq: 1, globalManifest: manifest("one"), observedRepos: [], values: {} });
     const syncMutex = await acquireWorkspaceSyncMutex(root, "cli", { lock: lock(), attempts: 1 });
-    await resetSyncState(root, stream, syncMutex);
+    await resetSyncState(root, stream, syncMutex, resetConsent({
+      remoteUrl: "https://api.test", workspaceId: "ws_93", projectId: "root",
+    }, initial));
     await releaseWorkspaceSyncMutex(syncMutex);
     const reset = await loadState(root, stream);
     expect(reset.stateNonce).not.toBe(nonce);
@@ -521,8 +537,14 @@ describe("design 93 §6 transactional unit", () => {
   test("A→B→A reset changes nonce and daemon iteration revalidation detects it", async () => {
     await saveStateUnsafeLegacyOrTest(root, baseState());
     const mutexA = await acquireWorkspaceSyncMutex(root, "cli", { lock: lock(), attempts: 1 });
-    await resetSyncState(root, "stream-B", mutexA);
-    await resetSyncState(root, stream, mutexA);
+    const streamB = "https://api.test::ws_B::root";
+    await resetSyncState(root, streamB, mutexA, resetConsent({
+      remoteUrl: "https://api.test", workspaceId: "ws_B", projectId: "root",
+    }));
+    const stateB = await loadState(root, streamB);
+    await resetSyncState(root, stream, mutexA, resetConsent({
+      remoteUrl: "https://api.test", workspaceId: "ws_93", projectId: "root",
+    }, stateB));
     await releaseWorkspaceSyncMutex(mutexA);
     expect(await daemonBindingMatches(root, stream, nonce)).toBe(false);
     const rebound = await loadState(root, stream);
@@ -717,7 +739,9 @@ describe("design 93 §6 transactional unit", () => {
     await fs.writeFile(path.join(journal, "entry"), "x");
     await fs.writeFile(shell, "v1\n");
     const mutex = await acquireWorkspaceSyncMutex(root, "cli", { lock: lock(), attempts: 1 });
-    await expect(resetSyncState(root, stream, mutex)).rejects.toThrow("unbound or unreadable checkout journal");
+    await expect(resetSyncState(root, stream, mutex, resetConsent({
+      remoteUrl: "https://api.test", workspaceId: "ws_93", projectId: "root",
+    }))).rejects.toThrow("unbound or unreadable checkout journal");
     await releaseWorkspaceSyncMutex(mutex);
     expect(await fs.readFile(path.join(journal, "entry"), "utf8")).toBe("x");
     expect(await fs.readFile(shell, "utf8")).toBe("v1\n");

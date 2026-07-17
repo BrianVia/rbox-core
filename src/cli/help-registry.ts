@@ -503,12 +503,14 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "doctor",
     group: "BILLING & MAINTENANCE",
     summary: "check workspace health; optionally upload a support report",
-    usage: "rbox doctor [--report] [--diagnostics] [--yes] [--path <dir>]",
+    usage: "rbox doctor [reset-journal] [--report | --quarantine | --restore <bundle>] [--path <dir>]",
     flags: [
       { flag: "--report", desc: "build and print the support report locally" },
       { flag: "--diagnostics", desc: "with --report, upload the report to rbox support (stored unencrypted for 30 days)" },
       { flag: "--yes", desc: "skip the upload consent prompt; required with --report --diagnostics in non-interactive mode (alias: -y)" },
       { flag: "--path <dir>", desc: "workspace root; use when running outside the workspace" },
+      { flag: "--quarantine", desc: "with reset-journal, preserve and remove an unsafe standing journal" },
+      { flag: "--restore <bundle>", desc: "with reset-journal, restore a committed quarantine bundle" },
     ],
   },
   {

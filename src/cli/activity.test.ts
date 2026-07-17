@@ -143,7 +143,7 @@ test("resetSyncState clears the sidecar too — a rebind must not inherit the ol
   await saveShellLine(root, "v1 100 halt - - - - old-ws"); // design 46: the prompt sidecar joins the reset
   const shellLine = path.join(root, ".rbox", "state", "shell.line");
   expect(await fs.readFile(shellLine, "utf8")).toContain("halt"); // present before reset
-  await resetSyncState(root);
+  await resetSyncState(root, "activity-test-stream");
   expect(await loadActivity(root)).toBeUndefined();
   await expect(fs.access(shellLine)).rejects.toThrow(); // shell.line removed too
 });

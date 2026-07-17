@@ -320,8 +320,15 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
       const report = flags.report === "true";
       const diagnostics = flags.diagnostics === "true";
       if (diagnostics && !report) throw new Error("--diagnostics uploads the support report — combine it with --report: rbox doctor --report --diagnostics");
-      const { doctorCmd } = await import("./doctor-cmd.js");
       const root = await resolvePathFlagRoot(flags.path);
+      if (positional[0] === "reset-journal") {
+        if (report || diagnostics) throw new Error("reset-journal rescue cannot be combined with support-report flags");
+        const { resetJournalDoctorCmd } = await import("./reset-journal-doctor.js");
+        await resetJournalDoctorCmd(root, { quarantine: flags.quarantine === "true", restore: flags.restore });
+        break;
+      }
+      if (flags.quarantine === "true" || flags.restore !== undefined) throw new Error("--quarantine/--restore require `rbox doctor reset-journal`");
+      const { doctorCmd } = await import("./doctor-cmd.js");
       await doctorCmd(root, { report, yes: flags.yes === "true", diagnostics });
       break;
     }

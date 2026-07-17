@@ -97,7 +97,7 @@ test("design 130 raw whole-state APIs cannot be aliased into new production site
     "src/cli/sync-state.ts": 5,
   });
   const guarded = await sweep(/\bsaveState\b/g);
-  expect(counts(guarded)).toEqual({ "src/cli/config.ts": 3 });
+  expect(counts(guarded)).toEqual({ "src/cli/config.ts": 2 });
 });
 
 test("design 130 raw update-ref command sites are a closed allowlist", async () => {

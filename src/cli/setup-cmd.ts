@@ -28,7 +28,7 @@ import { EXISTING_ACCOUNT_ENROLLMENT_MESSAGE, login, redeemPair, runGenesisEnrol
 import { enrollViaRecovery } from "./e2ee-client.js";
 import { enableAutostart, startDaemonAndRecordDesired } from "./autostart-cmd.js";
 import { loadCredentials } from "./credentials.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, loadRawState, syncStreamId } from "./config.js";
 import { hasDevice } from "./e2ee-keystore.js";
 import { RboxApi } from "./remote.js";
 import { promptWorkspacePick } from "./workspace-picker.js";
@@ -38,6 +38,11 @@ import { checkoutUrl, type BillingCadence, type SubscribePlan } from "./subscrib
 import { openAndShow } from "./browser-open.js";
 import { hasKeyInput, runKeyedSetup } from "./setup-keyed.js";
 import { getIdentity, identityText } from "./account-profile.js";
+import {
+  mintSetupCreateConsent,
+  mintSetupExistingConsent,
+  type ResetConsentWitness,
+} from "./reset-consent.js";
 
 /** Map a workspace decision to the exact `runInit` flags (the populate-sync runs
  *  inside runInit: push for a new workspace, pull+push for a join). */
@@ -435,11 +440,11 @@ async function stepWorkspace(
 
   let workspace: string | undefined;
   let name: string | undefined;
+  const creds = await loadCredentials();
   if (choice === "existing") {
     // Pick-by-name from the account's synced workspaces (degrades to a manual id
     // prompt when offline / no creds / empty account). The picked name is cached
     // locally so `rbox status` shows it with no round-trip.
-    const creds = await loadCredentials();
     const picked = await promptWorkspacePick({ baseUrl: creds?.remoteUrl ?? opts.defaultRemote, token: creds?.token });
     if (!picked) {
       process.stderr.write(e.yellow("no workspace selected — re-run `rbox setup` when you're ready.\n"));
@@ -450,26 +455,42 @@ async function stepWorkspace(
   }
   const dir = await promptInput({ message: "Which directory should rbox sync?", default: opts.cwd });
 
-  // REBIND GUARD (design 44): creating a NEW workspace over a directory that already
-  // syncs to one is almost never what the user wants (the 2026-07-01 incident: a
-  // re-run of setup to name a workspace created a second, empty one). Make the
-  // consequence explicit and default to NO.
-  if (choice === "new") {
-    const bound = await loadConfig(dir).catch(() => undefined);
-    if (bound) {
-      const label = bound.name ? `${bound.name} (${bound.remoteWorkspaceId})` : bound.remoteWorkspaceId;
-      process.stderr.write(`${e.yellow("⚠")}  This directory already syncs to workspace ${e.cyan(label)}.\n`);
-      const rebind = await promptConfirm({
-        message: "Create a brand-new workspace for it anyway? (files on disk are untouched; sync history starts fresh)",
-        default: false,
-      });
-      if (!rebind) {
-        process.stderr.write(
-          `${e.dim(`keeping the existing workspace. To sync it in the background run \`rbox start\`; to sync this directory to a different existing workspace, re-run setup and choose "Sync an existing workspace".`)}\n`
-        );
-        return undefined;
-      }
+  // The only rebind authorization boundary. Both create-new and selecting a
+  // different existing workspace carry the same local-history consequence.
+  // Mint Stage A here, before any create POST; the optional display name is
+  // intentionally prompted later and is not part of the stream-selecting tuple.
+  const bound = await loadConfig(dir).catch(() => undefined);
+  const remoteUrl = creds?.remoteUrl ?? opts.defaultRemote;
+  const oldStream = bound ? syncStreamId(bound) : undefined;
+  const intendedExistingStream = choice === "existing" && workspace
+    ? syncStreamId({ remoteUrl, remoteWorkspaceId: workspace, projectId: "root" })
+    : undefined;
+  let resetConsent: ResetConsentWitness | undefined;
+  if (bound && (choice === "new" || intendedExistingStream !== oldStream)) {
+    const label = bound.name ? `${bound.name} (${bound.remoteWorkspaceId})` : bound.remoteWorkspaceId;
+    process.stderr.write(`${e.yellow("⚠")}  This directory already syncs to workspace ${e.cyan(label)}.\n`);
+    const rebind = await promptConfirm({
+      message: choice === "new"
+        ? "Create a brand-new workspace for it anyway? (files on disk are untouched; sync history starts fresh)"
+        : `Rebind it to workspace ${workspace}? (files on disk are untouched; sync history starts fresh)`,
+      default: false,
+    });
+    if (!rebind) {
+      process.stderr.write(`${e.dim("keeping the existing workspace; no local sync state was changed.")}\n`);
+      return undefined;
     }
+    const raw = await loadRawState(dir);
+    const common = {
+      root: dir,
+      observedOldStream: raw?.stream ?? oldStream!,
+      observedOldNonce: raw?.stateNonce,
+      mintedAtRevision: Number.isSafeInteger(raw?.stateRevision) ? raw!.stateRevision! : 0,
+      remoteUrl,
+      projectId: "root",
+    };
+    resetConsent = choice === "new"
+      ? mintSetupCreateConsent(common)
+      : mintSetupExistingConsent({ ...common, workspaceId: workspace! });
   }
 
   // Opt-in, server-visible workspace name — offered ONLY when creating (the row is
@@ -499,7 +520,7 @@ async function stepWorkspace(
     choice === "new" ? { kind: "new", root: dir, name, respectGitignore } : { kind: "join", root: dir, workspace, name }
   );
   if (setupOpts.noSync) flags["no-sync"] = "true";
-  return runInit(flags, { cwd: opts.cwd, defaultRemote: opts.defaultRemote, summary: false });
+  return runInit(flags, { cwd: opts.cwd, defaultRemote: opts.defaultRemote, summary: false, resetConsent });
 }
 
 function printSummary(workspaceId: string, deviceId: string): void {

@@ -10,7 +10,7 @@ import os from "node:os";
 import path from "node:path";
 import { loadCredentials, type Credentials } from "./credentials.js";
 import { createRemoteWorkspace } from "./remote.js";
-import { loadConfig, resetSyncState, saveConfig, syncStreamId, type WorkspaceConfig } from "./config.js";
+import { loadConfig, loadRawState, resetSyncState, saveConfig, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
 import { enrolledDeviceId, hasDevice } from "./e2ee-keystore.js";
 import { login } from "./auth-cmd.js";
@@ -25,6 +25,12 @@ import { promptWorkspacePick } from "./workspace-picker.js";
 import { recoveryKitOptionsFromFlags, type RecoveryKitOptions } from "./recovery-kit.js";
 import { createPopulateStatusWriter } from "./populate-status.js";
 import { acquireWorkspaceSyncMutex, releaseWorkspaceSyncMutex } from "./sync-mutex.js";
+import {
+  RebindConsentRequiredError,
+  createWorkspaceWithConsent,
+  inspectResetConsentIntent,
+  type ResetConsentWitness,
+} from "./reset-consent.js";
 
 /**
  * Gather the missing init inputs interactively (all widgets render on stderr, so
@@ -114,7 +120,7 @@ export interface InitOutcome {
 
 export async function runInit(
   flags: Record<string, string>,
-  opts: { cwd: string; defaultRemote: string; summary?: boolean }
+  opts: { cwd: string; defaultRemote: string; summary?: boolean; resetConsent?: ResetConsentWitness }
 ): Promise<InitOutcome | undefined> {
   const creds = await loadCredentials();
   const interactive = process.stdin.isTTY === true && flags["no-interactive"] !== "true";
@@ -129,17 +135,55 @@ export async function runInit(
     process.exitCode = 1;
     return undefined;
   }
+  await preflightInitRebind(plan, opts.resetConsent);
   return executeInitPlan(plan, gathered.bootstrap, {
     summary: opts.summary !== false,
     recoveryKit: recoveryKitOptionsFromFlags(gathered),
     newDevice: gathered["new-device"] === "true",
+    resetConsent: opts.resetConsent,
   });
+}
+
+/**
+ * Refuse direct/scripted init rebinds before login, workspace creation, mutex
+ * acquisition, or local writes. Setup is the sole caller that supplies a
+ * witness minted by its consequence prompt.
+ */
+export async function preflightInitRebind(plan: InitPlan, consent?: ResetConsentWitness): Promise<void> {
+  const prev = await loadConfig(plan.root).catch(() => undefined);
+  const raw = await loadRawState(plan.root);
+  const oldStream = raw?.stream ?? (prev ? syncStreamId(prev) : undefined);
+  if (!oldStream) return;
+  const nextKnown = plan.workspace.kind === "join"
+    ? syncStreamId({ remoteUrl: plan.remoteUrl, remoteWorkspaceId: plan.workspace.id, projectId: plan.workspace.project })
+    : undefined;
+  if (nextKnown === oldStream) return;
+  if (!consent) throw new RebindConsentRequiredError(plan.root);
+
+  const inspected = inspectResetConsentIntent(consent);
+  const observedOldNonce = raw?.stateNonce;
+  const observedRevision = Number.isSafeInteger(raw?.stateRevision) ? raw!.stateRevision! : 0;
+  const intentMatches = plan.workspace.kind === "new"
+    ? inspected.intent.kind === "create"
+      && inspected.intent.remoteUrl === plan.remoteUrl
+      && inspected.intent.projectId === plan.workspace.project
+    : inspected.intent.kind === "existing"
+      && inspected.intent.remoteUrl === plan.remoteUrl
+      && inspected.intent.workspaceId === plan.workspace.id
+      && inspected.intent.projectId === plan.workspace.project;
+  if (inspected.root !== path.resolve(plan.root)
+    || inspected.observedOldStream !== oldStream
+    || inspected.observedOldNonce !== observedOldNonce
+    || inspected.mintedAtRevision !== observedRevision
+    || !intentMatches) {
+    throw new RebindConsentRequiredError(plan.root);
+  }
 }
 
 async function executeInitPlan(
   plan: InitPlan,
   bootstrapSecret: string | undefined,
-  opts: { summary: boolean; recoveryKit: RecoveryKitOptions; newDevice: boolean }
+  opts: { summary: boolean; recoveryKit: RecoveryKitOptions; newDevice: boolean; resetConsent?: ResetConsentWitness }
 ): Promise<InitOutcome | undefined> {
   // 1. Auth: bootstrap-login works headlessly (one-shot secret); device-code is
   //    interactive-only. "have" needs nothing. Never start device-code in CI.
@@ -157,10 +201,19 @@ async function executeInitPlan(
   let workspaceId: string;
   const ws = spinner(plan.workspace.kind === "new" ? "creating workspace" : "joining workspace");
   try {
-    workspaceId =
-      plan.workspace.kind === "new"
+    if (plan.workspace.kind === "new" && opts.resetConsent) {
+      const created = await createWorkspaceWithConsent(
+        opts.resetConsent,
+        { remoteUrl: plan.remoteUrl, projectId: plan.workspace.project, name: plan.workspace.name },
+        () => createRemoteWorkspace(plan.remoteUrl, creds.token, plan.workspace.project, plan.workspace.name),
+      );
+      workspaceId = created.workspaceId;
+      opts.resetConsent = created.witness;
+    } else {
+      workspaceId = plan.workspace.kind === "new"
         ? await createRemoteWorkspace(plan.remoteUrl, creds.token, plan.workspace.project, plan.workspace.name)
         : plan.workspace.id;
+    }
     ws.succeed(`workspace ${style.cyan(workspaceId)}`);
   } catch (e) {
     ws.fail("workspace setup failed");
@@ -187,11 +240,14 @@ async function executeInitPlan(
     });
     const nextStream = syncStreamId({ remoteUrl: plan.remoteUrl, remoteWorkspaceId: workspaceId, projectId: plan.workspace.project });
     if (prev && syncStreamId(prev) !== nextStream) {
-      await resetSyncState(plan.root, nextStream, syncMutex);
-      process.stderr.write(
-        `${stderrStyle.yellow("!")} this directory was bound to workspace ${prev.remoteWorkspaceId} — ` +
-          `rebinding to ${workspaceId}. Local sync baseline reset; files on disk untouched.\n`
-      );
+      const active = await loadRawState(plan.root);
+      if (active?.stream !== nextStream) {
+        await resetSyncState(plan.root, nextStream, syncMutex, opts.resetConsent);
+        process.stderr.write(
+          `${stderrStyle.yellow("!")} this directory was bound to workspace ${prev.remoteWorkspaceId} — ` +
+            `rebinding to ${workspaceId}. Local sync baseline reset; files on disk untouched.\n`
+        );
+      }
     }
     const cfg: WorkspaceConfig = {
       schema: "e2ee/v1", // full end-to-end encryption (design 12) — the only mode
