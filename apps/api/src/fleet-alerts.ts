@@ -2,7 +2,7 @@ import type { Env } from "./env.js";
 import { dbFor, dirDb } from "./db.js";
 import { chunked } from "./util.js";
 import { sanitizeLabel } from "./notify.js";
-import { pingSlackpipes } from "./slackpipes.js";
+import { envTag, pingSlackpipes } from "./slackpipes.js";
 
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
@@ -122,6 +122,11 @@ async function labelsFor(env: Env, deviceIds: string[]): Promise<Map<string, str
 }
 
 async function send(env: Env, text: string): Promise<void> {
+  // DEV deployments never page: dev fleet devices are rig/CI/UX-walkthrough
+  // ephemera, so drift/reporting-stopped alerts there are noise — founder
+  // decision 2026-07-16 (same rule as new-account pings). Incident bookkeeping
+  // in alert_state still runs so re-enabling later starts from true state.
+  if (envTag(env) === "dev") return;
   const label = env.RBOX_ENV_LABEL?.trim();
   await pingSlackpipes(env, "fleet_alert", label ? `[${label}] ${text}` : text);
 }

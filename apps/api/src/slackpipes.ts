@@ -139,7 +139,7 @@ function schedulePing(ctx: WaitUntilContext, ping: Promise<boolean>): void {
 
 /** The deploy-env tag for observability pings — dev vs prod (see env.RBOX_ENV).
  *  Absent/misconfigured degrades to "dev" so dev traffic is never mislabeled prod. */
-function envTag(env: Env): "dev" | "prod" {
+export function envTag(env: Env): "dev" | "prod" {
   return env.RBOX_ENV === "prod" ? "prod" : "dev";
 }
 
