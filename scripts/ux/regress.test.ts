@@ -41,13 +41,13 @@ function oneStep(status: FlowDefinition["status"] = "pass", enrolled = false): F
   return defineFlow({ name: `one-step-${status}`, status, machines: [{ name: "a", enrolled }], steps: [{ on: "a", exec: ["status"] }] });
 }
 
-test("flow catalog names all eleven flows with five pass and six pending statuses", async () => {
+test("flow catalog names all eleven flows, all pass (live-validated 2026-07-18 full regress run)", async () => {
   const flows = await loadFlows();
   expect(flows.map((flow) => [flow.name, flow.status])).toEqual([
-    ["declined-rebind-menu", "pending-137"], ["empty-id-navigation", "pending-137"], ["empty-join-copy", "pending-137"],
+    ["declined-rebind-menu", "pass"], ["empty-id-navigation", "pass"], ["empty-join-copy", "pass"],
     ["fresh-setup-to-handoff", "pass"], ["front-door", "pass"], ["gitignore-default", "pass"],
-    ["malformed-token-reprompt", "pending-137"], ["pairing-second-device", "pass"], ["status-healthy", "pass"],
-    ["tilde-expansion", "pending-137"], ["typo-no-phantom", "pending-137"],
+    ["malformed-token-reprompt", "pass"], ["pairing-second-device", "pass"], ["status-healthy", "pass"],
+    ["tilde-expansion", "pass"], ["typo-no-phantom", "pass"],
   ]);
 });
 
@@ -70,6 +70,34 @@ test("waitFor timeout attaches the final screen", async () => {
   ] });
   const result = await runFlow(flow, "timeout-run", fakeHarness({ waitIdle: async () => "loading-0", screen: async () => `loading-${++capture}` }));
   expect(result.outcome).toBe("FAIL"); expect(result.error).toContain("final screen:\nloading-");
+});
+
+test("assertNotStdout checks only command stdout and names the forbidden fragment", async () => {
+  const flow = defineFlow({
+    name: "negative-stdout", status: "pass", machines: [{ name: "a", enrolled: false }],
+    steps: [{ on: "a", exec: ["status"], assertNotStdout: [/secret-[0-9]+/] }],
+  });
+  const stderrOnly = await runFlow(flow, "negative-stderr", fakeHarness({
+    exec: async () => ({ stdout: "safe\n", stderr: "secret-123\n", exitCode: 0 }),
+  }));
+  expect(stderrOnly.outcome).toBe("PASS");
+  const matched = await runFlow(flow, "negative-match", fakeHarness({
+    exec: async () => ({ stdout: "prefix secret-456 suffix\n", stderr: "", exitCode: 0 }),
+  }));
+  expect(matched.outcome).toBe("FAIL");
+  expect(matched.error).toContain("stdout matched forbidden fragment /secret-[0-9]+/");
+  expect(matched.error).not.toContain("prefix");
+  expect(matched.error).not.toContain("suffix");
+
+  const guestFlow = defineFlow({
+    name: "negative-guest-stdout", status: "pass", machines: [{ name: "a", enrolled: false }],
+    steps: [{ on: "a", guest: "inspect", assertNotStdout: [/forbidden guest/] }],
+  });
+  const guestMatched = await runFlow(guestFlow, "negative-guest", fakeHarness({
+    guest: async () => ({ stdout: "forbidden guest\n", stderr: "", exitCode: 0 }),
+  }));
+  expect(guestMatched.outcome).toBe("FAIL");
+  expect(guestMatched.error).toContain("stdout matched forbidden fragment /forbidden guest/");
 });
 
 describe("outcome and exit-code truth table", () => {

@@ -9,6 +9,7 @@ import { lockingHealthPath } from "./sync-mutex.js";
 import { daemonDatedLogPath } from "./rbox-paths.js";
 import { main } from "./main-dispatch.js";
 import { writeResetHaltHealth } from "./reset-health.js";
+import { RBOX_VERSION } from "./version.js";
 
 const OLD_ENV = { ...process.env };
 const NOW = Date.parse("2026-07-08T12:00:00Z");
@@ -143,7 +144,14 @@ async function saveDeferralState(): Promise<void> {
   });
 }
 
-async function captureStatus(opts: { json?: boolean }): Promise<string> {
+async function captureStatus(opts: { json?: boolean; verbose?: boolean; git?: boolean }): Promise<string> {
+  return captureStatusWithDeps(opts, cleanScanDeps());
+}
+
+async function captureStatusWithDeps(
+  opts: { json?: boolean; verbose?: boolean; git?: boolean },
+  statusDeps: StatusCmdDeps
+): Promise<string> {
   const lines: string[] = [];
   let stdout = "";
   const oldLog = console.log;
@@ -154,7 +162,7 @@ async function captureStatus(opts: { json?: boolean }): Promise<string> {
     return true;
   }) as typeof process.stdout.write;
   try {
-    await statusCmdWithDeps(root, opts, cleanScanDeps());
+    await statusCmdWithDeps(root, opts, statusDeps);
   } finally {
     console.log = oldLog;
     process.stdout.write = oldWrite;
@@ -187,7 +195,7 @@ async function captureDispatch(args: string[]): Promise<string> {
   } finally {
     process.argv = previousArgv;
     process.chdir(previousCwd);
-    process.exitCode = previousExitCode;
+    process.exitCode = previousExitCode ?? 0;
     console.log = oldLog;
     process.stdout.write = oldWrite;
   }
@@ -197,7 +205,10 @@ test("reset-journal halt renders text and JSON without dereferencing state", asy
   const journal = path.join(root, ".rbox", "state", "reset-v1.json");
   await fs.mkdir(path.dirname(journal), { recursive: true });
   await fs.writeFile(journal, "{malformed");
-  const text = await captureStatus({});
+  const brief = await captureStatus({});
+  expect(brief).toContain("sync halted to protect recovery state · rbox doctor reset-journal");
+  expect(brief).not.toContain("malformed reset journal");
+  const text = await captureStatus({ verbose: true });
   expect(text).toContain("sync halted: a state-recovery record can't be processed");
   expect(text).toContain("Files on disk are untouched");
   expect(text).toContain("rbox doctor reset-journal");
@@ -222,7 +233,7 @@ test("stale daemon halt record with no journal renders recovering and remains re
 test("status text and JSON expose only closed locking health", async () => {
   await fs.mkdir(path.dirname(lockingHealthPath(root)), { recursive: true });
   await fs.writeFile(lockingHealthPath(root), JSON.stringify({ status: "degraded-unlocked", reason: "identity-unavailable" }));
-  const text = await captureStatus({});
+  const text = await captureStatus({ verbose: true });
   const lockingLine = text.split("\n").find((line) => line.includes("locking:")) ?? "";
   expect(lockingLine).toContain("locking: degraded-unlocked: identity-unavailable (.rbox/state/sync.lock)");
   expect(lockingLine).not.toContain(root);
@@ -267,7 +278,7 @@ test("status renders initial sync progress instead of sequence-zero local change
   const oldLog = console.log;
   console.log = (...args: unknown[]) => void lines.push(args.map(String).join(" "));
   try {
-    await statusCmdWithDeps(root, {}, deps());
+    await statusCmdWithDeps(root, { verbose: true }, deps());
   } finally {
     console.log = oldLog;
   }
@@ -303,7 +314,7 @@ test("status does not suppress local changes for a fresh populate marker on an a
   const oldLog = console.log;
   console.log = (...args: unknown[]) => void lines.push(args.map(String).join(" "));
   try {
-    await statusCmdWithDeps(root, {}, scanDeps());
+    await statusCmdWithDeps(root, { verbose: true }, scanDeps());
   } finally {
     console.log = oldLog;
   }
@@ -324,7 +335,7 @@ test("status renders the design-93 indeterminate config lane and never reports z
   const oldLog = console.log;
   console.log = (...args: unknown[]) => void lines.push(args.map(String).join(" "));
   try {
-    await statusCmdWithDeps(root, {}, d);
+    await statusCmdWithDeps(root, { verbose: true }, d);
   } finally {
     console.log = oldLog;
   }
@@ -336,7 +347,7 @@ test("status renders the design-93 indeterminate config lane and never reports z
 
 test("status renders durable lanes oldest-first with reason precedence and safe checkout labels", async () => {
   await saveDeferralState();
-  const out = await captureStatus({});
+  const out = await captureStatus({ verbose: true });
   expect(out).toContain("git-sync: 0 repos synced · 3 deferred");
   expect(out).not.toContain("✓ in sync");
   const lines = out.split("\n").filter((line) => line.includes("git deferred"));
@@ -345,6 +356,19 @@ test("status renders durable lanes oldest-first with reason precedence and safe 
     "    git deferred 1d: local edits on branch release/0.9 (alpha) (working files changed since)",
     "    git deferred 1d: git busy on checkout unavailable (beta)",
   ]);
+  expect(out).not.toContain("0123456789abcdef");
+});
+
+test("status --git aggregate and detail use one consistent repo projection", async () => {
+  await saveDeferralState();
+  const out = await captureStatus({ git: true });
+  expect(out).toContain("⚠ 3 git repos need attention (oldest: 14 days) · rbox status --git");
+  const details = out.split("\n").filter((line) => line.includes("git deferred "));
+  expect(details).toHaveLength(3);
+  expect(details[0]).toContain("local commits on detached checkout (zeta)");
+  expect(details[1]).toContain("local edits on branch release/0.9 (alpha)");
+  expect(details[2]).toContain("git busy on checkout unavailable (beta)");
+  expect(out).toContain("Stop Git mutation, then let normal sync retry.");
   expect(out).not.toContain("0123456789abcdef");
 });
 
@@ -366,7 +390,7 @@ test("degraded legacy deferral reload retains status reason and age", async () =
       },
     },
   });
-  const out = await captureStatus({});
+  const out = await captureStatus({ verbose: true });
   expect(out).toContain("git-sync: 0 repos synced · 1 deferred");
   expect(out).toContain("git deferred 14d: needs Git >= 2.46 transactional symref-update; found git version");
 });
@@ -464,7 +488,7 @@ test("typed divergence seam deferrals gate health even when local detail records
   const oldLog = console.log;
   console.log = (...args: unknown[]) => void lines.push(args.map(String).join(" "));
   try {
-    await statusCmdWithDeps(root, {}, d);
+    await statusCmdWithDeps(root, { verbose: true }, d);
   } finally {
     console.log = oldLog;
   }
@@ -494,6 +518,90 @@ test("status returns the effective daemon state in text and json modes", async (
   }
 });
 
+test("default suppresses real legacy daemon/history/footer facts while --verbose retains them", async () => {
+  const d = cleanScanDeps();
+  d.daemonBindingStatus = () => ({ alive: { running: true, pid: 1234, bootId: "boot_status" }, bound: cfg.remoteWorkspaceId, stale: false });
+  d.readDaemonPidRecord = () => ({ present: true });
+  await fs.mkdir(path.join(root, ".rbox", "state"), { recursive: true });
+  await fs.writeFile(path.join(root, ".rbox", "state", "activity.json"), JSON.stringify({
+    at: new Date(NOW).toISOString(),
+    lastPush: { at: new Date(NOW - 60_000).toISOString(), files: 3, sequence: 7 },
+  }));
+  const brief = await captureStatusWithDeps({}, d);
+  const verbose = await captureStatusWithDeps({ verbose: true }, d);
+  for (const fragment of ["background sync:", "locking:", "last push:", "device dev_status", "sequence 0", "files on disk"]) {
+    expect(brief).not.toContain(fragment);
+    expect(verbose).toContain(fragment);
+  }
+  expect(brief).toContain("syncing normally");
+});
+
+test("status --verbose preserves the complete legacy text golden byte for byte", async () => {
+  expect(await captureStatus({ verbose: true })).toBe([
+    `workspace ws_status @ ${root} · rbox ${RBOX_VERSION}`,
+    "  ✓ in sync — 0 files",
+    "  background sync: stopped",
+    "  locking: ok (.rbox/state/sync.lock)",
+    "  device dev_status · sequence 0 · 0 files on disk",
+    "account not signed in (run `rbox login`)",
+  ].join("\n"));
+});
+
+test("JSON adds optional top-level haltReason and otherwise keeps the detailed path", async () => {
+  const d = cleanScanDeps();
+  d.daemonBindingStatus = () => ({ alive: { running: true, pid: 1234, bootId: "boot_status" }, bound: cfg.remoteWorkspaceId, stale: false });
+  d.readDaemonPidRecord = () => ({ present: true });
+  const activityPath = path.join(root, ".rbox", "state", "activity.json");
+  await fs.mkdir(path.dirname(activityPath), { recursive: true });
+  await fs.writeFile(activityPath, JSON.stringify({ at: new Date(NOW).toISOString() }));
+  const healthy = JSON.parse(await captureStatusWithDeps({ json: true }, d));
+  expect(healthy.haltReason).toBeUndefined();
+  await fs.writeFile(activityPath, JSON.stringify({
+    at: new Date(NOW).toISOString(),
+    halt: { at: new Date(NOW).toISOString(), reason: "private raw daemon reason", count: 1, op: "push", typedReason: { kind: "body-too-large" } },
+  }));
+  const halted = JSON.parse(await captureStatusWithDeps({ json: true }, d));
+  expect(halted).toEqual({ ...healthy, health: "halt", haltReason: "private raw daemon reason" });
+});
+
+test("all conflicting status presentation flag pairs are rejected", async () => {
+  for (const opts of [
+    { json: true, verbose: true },
+    { json: true, git: true },
+    { verbose: true, git: true },
+  ]) {
+    await expect(statusCmdWithDeps(root, opts, cleanScanDeps())).rejects.toThrow("choose only one status presentation flag");
+  }
+});
+
+test("CLI dispatch rejects every conflicting presentation pair after boolean flag parsing", async () => {
+  const previousArgv = process.argv;
+  const previousExitCode = process.exitCode;
+  const previousWrite = process.stderr.write;
+  try {
+    for (const args of [
+      ["status", "--json", "--verbose"],
+      ["status", "--json", "--git"],
+      ["status", "--verbose", "--git"],
+    ]) {
+      let stderr = "";
+      process.argv = [process.execPath, "rbox", ...args];
+      process.exitCode = 0;
+      process.stderr.write = ((chunk: string | Uint8Array) => {
+        stderr += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+        return true;
+      }) as typeof process.stderr.write;
+      await main({ now: () => new Date(NOW) });
+      expect(process.exitCode).toBe(1);
+      expect(stderr).toContain("choose only one status presentation flag: --json, --verbose, or --git");
+    }
+  } finally {
+    process.argv = previousArgv;
+    process.exitCode = previousExitCode ?? 0;
+    process.stderr.write = previousWrite;
+  }
+});
+
 test("live daemon version skew is closed in text and JSON; stopped records are ignored", async () => {
   const d = cleanScanDeps();
   d.daemonBindingStatus = () => ({ alive: { running: true, pid: 1234, bootId: "boot_status" }, bound: cfg.remoteWorkspaceId, stale: false });
@@ -509,7 +617,7 @@ test("live daemon version skew is closed in text and JSON; stopped records are i
   const stdout: string[] = [];
   process.stdout.write = ((chunk: string | Uint8Array) => { stdout.push(String(chunk)); return true; }) as typeof process.stdout.write;
   try {
-    await statusCmdWithDeps(root, {}, d);
+    await statusCmdWithDeps(root, { verbose: true }, d);
     expect(logs.join("\n")).toContain("daemon v1.6.1, CLI v");
     expect(logs.join("\n")).toContain("restart: rbox stop && rbox start");
     await statusCmdWithDeps(root, { json: true }, d);
@@ -535,7 +643,7 @@ test("live ambient record without daemonVersion renders pre-1.6.3 skew", async (
   const oldLog = console.log;
   console.log = (...parts) => void logs.push(parts.join(" "));
   try {
-    await statusCmdWithDeps(root, {}, d);
+    await statusCmdWithDeps(root, { verbose: true }, d);
   } finally {
     console.log = oldLog;
   }
@@ -559,7 +667,7 @@ test("one repo with multiple lanes renders one repo-level line and count", async
       },
     },
   });
-  const out = await captureStatus({});
+  const out = await captureStatus({ verbose: true });
   expect(out).toContain("1 git repo deferred");
   expect(out).toContain("git-sync: 0 repos synced · 1 deferred");
   const rows = out.split("\n").filter((line) => line.includes("git deferred "));

@@ -28,8 +28,8 @@ test("round-trips the full record", async () => {
     },
     lastPush: { at: "2026-07-02T11:58:00.000Z", files: 3, sequence: 78 },
     lastPull: { at: "2026-07-02T11:57:00.000Z", writes: 2, deletes: 1, conflicts: 0 },
-    active: { at: "2026-07-02T12:00:00.000Z", phase: "upload", done: 1, total: 3, bytesDone: 512, bytesTotal: 1024 },
-    halt: { at: "2026-07-02T11:00:00.000Z", reason: "mass-delete guard", count: 2, op: "pull", terminal: { fingerprint: "sidecar-sha" } },
+    active: { at: "2026-07-02T12:00:00.000Z", phase: "upload", done: 1, total: 3, detail: "repo", bytesDone: 512, bytesTotal: 1024 },
+    halt: { at: "2026-07-02T11:00:00.000Z", reason: "mass-delete guard", count: 2, op: "pull", typedReason: { kind: "mass-delete", op: "pull" }, terminal: { fingerprint: "sidecar-sha" } },
     outOfStorage: { at: "2026-07-02T11:30:00.000Z", kind: "storage", used: 2147483648, cap: 2147483648 },
     local: {
       at: "2026-07-02T12:00:02.000Z",
@@ -78,6 +78,17 @@ test("malformed nested slots are dropped individually, never handed to render (c
     })
   );
   expect(await loadActivity(root)).toEqual({ at, lastPull: { at, writes: 1, deletes: 0, conflicts: 0 } });
+});
+
+test("malformed typed halt classifications are dropped without classifying raw strings", async () => {
+  const p = path.join(root, ".rbox", "state", "activity.json");
+  await fs.mkdir(path.dirname(p), { recursive: true });
+  const at = "2026-07-02T12:00:00.000Z";
+  await fs.writeFile(p, JSON.stringify({
+    at,
+    halt: { at, reason: "pull mass-delete guard too_many_refs", count: 1, op: "pull", typedReason: { kind: "mass-delete", op: "fullScan" } },
+  }));
+  expect(await loadActivity(root)).toEqual({ at, halt: { at, reason: "pull mass-delete guard too_many_refs", count: 1, op: "pull" } });
 });
 
 test("malformed local slot is dropped alone", async () => {

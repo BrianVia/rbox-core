@@ -7,7 +7,10 @@ export interface AccountProfile {
   accountId: string;
   email: string | null;
   signInMethod: string | null;
+  plan: string | null;
 }
+
+type AccountProfileWrite = Omit<AccountProfile, "plan"> & { plan?: string | null };
 
 const CONTROL_CHAR = /[\u0000-\u001f\u007f-\u009f]/;
 export const accountProfilePath = (): string => path.join(rboxDir(), "account-profile.json");
@@ -23,8 +26,12 @@ export function validateProfile(value: unknown): AccountProfile | undefined {
   const accountId = identityField(candidate.accountId);
   const email = candidate.email === null ? null : identityField(candidate.email);
   const signInMethod = candidate.signInMethod === null ? null : identityField(candidate.signInMethod);
-  if (!accountId || (candidate.email !== null && !email) || (candidate.signInMethod !== null && !signInMethod)) return undefined;
-  return { accountId, email, signInMethod };
+  const plan = candidate.plan == null ? null : identityField(candidate.plan);
+  if (!accountId
+    || (candidate.email !== null && !email)
+    || (candidate.signInMethod !== null && !signInMethod)
+    || (candidate.plan != null && !plan)) return undefined;
+  return { accountId, email, signInMethod, plan };
 }
 
 function parseProfile(raw: string): AccountProfile | undefined {
@@ -53,7 +60,7 @@ async function persistAccountProfile(profile: AccountProfile): Promise<void> {
 let profileOperations: Promise<void> = Promise.resolve();
 
 /** Queue a failure-absorbing cache write without delaying the caller's result. */
-export function scheduleAccountProfileWrite(profile: AccountProfile): void {
+export function scheduleAccountProfileWrite(profile: AccountProfileWrite): void {
   const normalized = validateProfile(profile);
   if (!normalized) return;
   profileOperations = profileOperations.then(() => persistAccountProfile(normalized)).catch(() => {});

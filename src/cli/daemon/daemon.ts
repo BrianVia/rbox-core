@@ -28,7 +28,7 @@ import { renderShellDeferrals, renderShellLine, saveActivity, saveShellDeferrals
 import { expectedStateNonce, loadConfig, loadState, repoRecordsForState, syncStreamId, trashConfig, type SyncState, type WorkspaceConfig } from "../config.js";
 import { pruneTrash } from "../../engine/trash.js";
 import { DAEMON_BOOT_ID_ENV, readDaemonPidRecord, recordDaemonBinding } from "../daemon-control.js";
-import { makeDeferErrnoReporter, pull, pushManifest, type SyncDeps } from "../sync.js";
+import { MassDeleteGuardError, makeDeferErrnoReporter, pull, pushManifest, type SyncDeps } from "../sync.js";
 import { deferManifest } from "../sync-recovery.js";
 import type { TransferPhase, TransferProgressBytes } from "../transfer-progress.js";
 import { buildAuthedRemote } from "../e2ee-client.js";
@@ -1062,11 +1062,23 @@ export class RboxDaemon {
             if (e instanceof CommitRejectedError) {
               this.activity.active = undefined;
               this.activeProgressPath = undefined;
+              let typedReason: NonNullable<DaemonActivity["halt"]>["typedReason"];
+              switch (e.reason) {
+                case "too_many_refs":
+                  typedReason = { kind: "too-many-refs" };
+                  break;
+                case "body_too_large":
+                  typedReason = { kind: "body-too-large" };
+                  break;
+                default:
+                  typedReason = undefined;
+              }
               this.activity.halt = {
                 at: new Date().toISOString(),
                 reason: msg,
                 count: this.errRepeat,
                 op,
+                ...(typedReason ? { typedReason } : {}),
                 ...(e.fingerprint ? { terminal: { fingerprint: e.fingerprint } } : {}),
               };
               if (shouldLogRepeat) {
@@ -1081,7 +1093,13 @@ export class RboxDaemon {
             // indicator anywhere but this log. Persisted on the log-line schedule.
             this.activity.active = undefined;
             this.activeProgressPath = undefined;
-            this.activity.halt = { at: new Date().toISOString(), reason: msg, count: this.errRepeat, op };
+            this.activity.halt = {
+              at: new Date().toISOString(),
+              reason: msg,
+              count: this.errRepeat,
+              op,
+              ...(e instanceof MassDeleteGuardError ? { typedReason: { kind: "mass-delete" as const, op: e.op } } : {}),
+            };
             if (shouldLogRepeat) {
               this.log(`pump op error: ${msg}${this.errRepeat > 1 ? ` (x${this.errRepeat})` : ""}`);
               this.writeActivity();
@@ -1821,6 +1839,7 @@ export class RboxDaemon {
       phase,
       done,
       total,
+      ...(detail !== undefined ? { detail } : {}),
       ...(bytes ? { bytesDone: bytes.bytesDone, ...(bytes.bytesTotal !== undefined ? { bytesTotal: bytes.bytesTotal } : {}) } : {}),
     };
     this.writeActivity();

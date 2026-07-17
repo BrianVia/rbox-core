@@ -29,11 +29,12 @@ export async function accountLink(code: string): Promise<void> {
   console.log(`\nFinish in your rbox dashboard: approve the pending request for this account to complete the link.`);
 }
 
-/** The shape of `GET /v1/account/status`. `plan` is best-effort — an older API that
- *  predates the plan field is treated as no active plan rather than a hard failure. */
+/** The shape of `GET /v1/account/status`. `plan` is best-effort: absence from an
+ * older API stays distinguishable for the brief, while the legacy detail renderer
+ * continues to display it as no active plan. */
 export interface AccountStatus {
   accountId: string;
-  plan: string;
+  plan?: string;
   graceUntil?: number | null;
   readOnly?: boolean;
   /** Whether a web (Clerk) login manages this account. */
@@ -49,7 +50,7 @@ function accountStatusFromResponse(body: unknown): AccountStatus {
   return {
     accountId: value.accountId,
     linked: !!value.linked,
-    plan: value.plan ?? "none",
+    ...(typeof value.plan === "string" ? { plan: value.plan } : {}),
     ...(email ? { email } : {}),
     ...(signInMethod ? { signInMethod } : {}),
   };
@@ -77,7 +78,12 @@ export async function fetchAccountSummary(timeoutMs = 3500): Promise<AccountSumm
     });
     if (!res.ok) return { state: "unavailable" };
     const status = accountStatusFromResponse(await res.json());
-    scheduleAccountProfileWrite({ accountId: status.accountId, email: status.email ?? null, signInMethod: status.signInMethod ?? null });
+    scheduleAccountProfileWrite({
+      accountId: status.accountId,
+      email: status.email ?? null,
+      signInMethod: status.signInMethod ?? null,
+      plan: status.plan ?? null,
+    });
     return { state: "ok", status };
   } catch {
     // Offline, DNS failure, timeout/abort, malformed body — all degrade to the same
@@ -121,7 +127,12 @@ export async function accountStatus(opts: { json?: boolean } = {}): Promise<void
   const res = await fetch(`${c.remoteUrl}/v1/account/status`, { headers: { authorization: `Bearer ${c.token}` } });
   if (!res.ok) throw await friendlyHttpError(res, "account status");
   const status = accountStatusFromResponse(await res.json());
-  scheduleAccountProfileWrite({ accountId: status.accountId, email: status.email ?? null, signInMethod: status.signInMethod ?? null });
+  scheduleAccountProfileWrite({
+    accountId: status.accountId,
+    email: status.email ?? null,
+    signInMethod: status.signInMethod ?? null,
+    plan: status.plan ?? null,
+  });
   const { accountId, linked, plan, email, signInMethod } = status;
   if (opts.json) {
     const usage = await fetch(`${c.remoteUrl}/v1/account/usage`, { headers: { authorization: `Bearer ${c.token}` } });

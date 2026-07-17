@@ -29,7 +29,7 @@ import { assertSyncMutex, workspaceSyncMutexDegraded } from "../sync-mutex.js";
 import { observedRepoKeys, orderedRepoDeferralUpdates, saveStateSource } from "../sync-state.js";
 import { type SyncDeps, withReportScanStats, withCache, withDircache } from "./deps.js";
 import { formatLatestTimings, formatScanStats, scanDetailsOf, formatApplyStats } from "./format.js";
-import { apiFor, makeDeferErrnoReporter, MASS_DELETE_MIN_FILES, matcherForState, plaintextBytesOf, fileCountOf, scanTick } from "./policy.js";
+import { apiFor, makeDeferErrnoReporter, MASS_DELETE_MIN_FILES, MassDeleteGuardError, matcherForState, plaintextBytesOf, fileCountOf, scanTick } from "./policy.js";
 
 export async function scanManifestForPush(root: string, cfg: WorkspaceConfig, deps: SyncDeps, purgeIgnored = false): Promise<Manifest> {
   const report = deps.report ?? PhaseReport.disabled("push");
@@ -171,7 +171,7 @@ export async function applyPulledManifest(
   const baseFiles = state.lastSyncedManifest.files.length;
   if (!deps.allowMassDelete && plannedDeletes >= MASS_DELETE_MIN_FILES && plannedDeletes * 2 >= baseFiles) {
     deps.telemetry?.record({ kind: "safety_event", eventType: "mass_delete_breaker", count: 1 });
-    throw new Error(
+    throw new MassDeleteGuardError("pull",
       `pull would delete ${plannedDeletes} of ${baseFiles} tracked files — refusing (mass-delete guard). ` +
         `If this deletion is intentional, run \`${deps.massDeleteHint ?? "rbox pull --allow-mass-delete"}\` to apply it once.`
     );

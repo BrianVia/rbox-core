@@ -5,6 +5,7 @@ export interface MachineSpec {
 
 interface Assertions {
   assertStdout?: RegExp[];
+  assertNotStdout?: RegExp[];
   assertStderr?: RegExp[];
   expectExit?: number;
 }
@@ -28,7 +29,7 @@ export interface FlowDefinition {
 }
 
 const STEP_KEYS = ["exec", "guest", "tui", "keys", "typeVar", "waitFor", "assertScreen", "pollUntil", "captureVar"] as const;
-const ASSERTION_KEYS = new Set(["on", "assertStdout", "assertStderr", "expectExit"]);
+const ASSERTION_KEYS = new Set(["on", "assertStdout", "assertNotStdout", "assertStderr", "expectExit"]);
 
 function objectAt(value: unknown, at: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${at} must be an object`);
@@ -90,6 +91,7 @@ function validateStep(value: unknown, index: number, machines: Set<string>, sess
     if (kind === "exec") argvAt(step.exec, `${at}.exec`, true);
     else stringAt(step.guest, `${at}.guest`);
     if (step.assertStdout !== undefined) regexArrayAt(step.assertStdout, `${at}.assertStdout`);
+    if (step.assertNotStdout !== undefined) regexArrayAt(step.assertNotStdout, `${at}.assertNotStdout`);
     if (step.assertStderr !== undefined) regexArrayAt(step.assertStderr, `${at}.assertStderr`);
     if (step.expectExit !== undefined && (!Number.isInteger(step.expectExit) || Number(step.expectExit) < 0)) throw new Error(`${at}.expectExit must be a non-negative integer`);
   } else if (kind === "tui") {

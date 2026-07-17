@@ -62,6 +62,7 @@ export interface DaemonActivity {
     phase: TransferPhase;
     done: number;
     total: number;
+    detail?: string;
     bytesDone?: number;
     bytesTotal?: number;
   };
@@ -74,6 +75,12 @@ export interface DaemonActivity {
     reason: string;
     count: number;
     op: "pull" | "push" | "fullScan" | "deepScan";
+    /** Producer-authored classification. Missing/invalid legacy values are
+     * deliberately unknown; readers never classify the raw reason string. */
+    typedReason?:
+      | { kind: "mass-delete"; op: "pull" | "push" }
+      | { kind: "too-many-refs" }
+      | { kind: "body-too-large" };
     terminal?: { fingerprint: string };
   };
   /** Quota exhaustion blocks pushes, but it is soft state: halt still wins. */
@@ -153,7 +160,13 @@ export async function loadActivity(root: string): Promise<DaemonActivity | undef
     }
     const act = raw.active;
     if (act && typeof act.at === "string" && isTransferPhase(act.phase) && num(act.done) && num(act.total)) {
-      a.active = { at: act.at, phase: act.phase, done: act.done, total: act.total };
+      a.active = {
+        at: act.at,
+        phase: act.phase,
+        done: act.done,
+        total: act.total,
+        ...(typeof act.detail === "string" ? { detail: act.detail } : {}),
+      };
       if (
         uint(act.bytesDone) &&
         (act.bytesTotal === undefined || (positiveInt(act.bytesTotal) && act.bytesDone <= act.bytesTotal))
@@ -170,6 +183,13 @@ export async function loadActivity(root: string): Promise<DaemonActivity | undef
         reason: halt.reason,
         count: halt.count,
         op: halt.op,
+        ...(halt.typedReason?.kind === "mass-delete" && (halt.typedReason.op === "pull" || halt.typedReason.op === "push")
+          ? { typedReason: { kind: "mass-delete" as const, op: halt.typedReason.op } }
+          : halt.typedReason?.kind === "too-many-refs"
+            ? { typedReason: { kind: "too-many-refs" as const } }
+            : halt.typedReason?.kind === "body-too-large"
+              ? { typedReason: { kind: "body-too-large" as const } }
+              : {}),
         ...(terminal && typeof terminal.fingerprint === "string" && terminal.fingerprint.length > 0
           ? { terminal: { fingerprint: terminal.fingerprint } }
           : {}),

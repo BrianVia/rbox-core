@@ -8,8 +8,8 @@ describe("flow schema", () => {
     expect(() => defineFlow({
       name: "schema-smoke", status: "pass", machines: machine,
       steps: [
-        { on: "a", exec: [] },
-        { on: "a", guest: "true" },
+        { on: "a", exec: [], assertNotStdout: [/forbidden/] },
+        { on: "a", guest: "true", assertNotStdout: [/forbidden/] },
         { on: "a", pollUntil: { exec: ["status"], pattern: /running/, timeout: 1 } },
         { on: "a", captureVar: { name: "VALUE", pattern: /(running)/ } },
         { on: "a", tui: "setup" },
@@ -19,6 +19,17 @@ describe("flow schema", () => {
         { on: "a", assertScreen: [/ready/], assertNotScreen: [/broken/] },
       ],
     })).not.toThrow();
+  });
+
+  test("assertNotStdout is command-only and must be a non-empty RegExp array", () => {
+    expect(() => defineFlow({
+      name: "bad-negative", status: "pass", machines: machine,
+      steps: [{ on: "a", exec: [], assertNotStdout: [] }],
+    })).toThrow("assertNotStdout must be a non-empty RegExp array");
+    expect(() => defineFlow({
+      name: "bad-negative-kind", status: "pass", machines: machine,
+      steps: [{ on: "a", tui: "setup", assertNotStdout: [/x/] } as never],
+    })).toThrow("unknown field \"assertNotStdout\"");
   });
 
   test.each([
