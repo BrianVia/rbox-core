@@ -200,3 +200,108 @@ Direction for v3 (executable-level completeness):
 v3 drafting of the mechanical sections (DDL, framing, vectors, budgets)
 is delegated; rulings above are the spec for that derivation. Round 3
 goes to a fresh reviewer against v3.
+
+## Round 3
+
+Fresh-eyes scope: the v3 working copy as present at review completion,
+including the in-flight scheduler/backfill/kill-switch clarifications. I
+checked every cited code range, applied every current migration to an
+in-memory SQLite database, executed the proposed Unit-A index/query and
+Unit-C DDL against that real schema, traced both public and internal route
+shapes, and compared the resource budgets with the deployed Wrangler config
+and current Workers limits.
+
+1. **BLOCKER — A1 still cannot represent the mixed-process case it was introduced to solve.** `capability_principals` has one row per `principal_id`, and a valid versioned contact clears a prior sticky incapable observation for that principal (`docs/design/149-storage-economics.md:97-103,120-129`). The real old-daemon/new-CLI case shares one authenticated `deviceId`; the existing auth code calls that case out explicitly (`apps/api/src/auth/authenticate.ts:61-68,77`; `apps/api/src/authz.ts:7-15`). An old/headerless daemon can mark the row incapable, the new CLI can immediately overwrite it and publish under raised floors, and the still-running old daemon then lowers the floor only after an unreadable head exists. Putting recompute and admission in the head transaction orders contacts, but does not preserve concurrently live reader observations. Use a process/session observation identity or retain incapable observations for a bounded window that a different process cannot clear.
+
+2. **MAJOR — A2 is a cooperative compatibility policy, not an enforceable encoding admission boundary.** Raw and snapshot manifests both have an empty chain before being encrypted (`src/cli/e2ee-remote.ts:751-755,783-788`; `src/engine/e2ee/session.ts:168-202`), and the DO neither decrypts nor verifies the signature (`apps/api/src/workspace-sync.ts:105-109`; `apps/api/src/commit-envelope.ts:45-64`). It therefore cannot distinguish `encoding:"raw"` from `encoding:"snapshot"`; it can validate only the declaration and visible chain/descriptor shape. The permanent absent-encoding path also bypasses generation and every floor for any caller, not just v1.7.1, and a structurally valid nonempty manifest chain can ride that path. This is not a new cross-account privilege—the authenticated client already controls its own opaque signed data—but it can break other devices in the account, which is precisely the compatibility objective. State this trust boundary explicitly and stop claiming that the actual raw/snapshot class is structurally verified; if omission is meant only for released clients, define the strongest honest transition check available.
+
+3. **MAJOR — the single `encoding` field cannot express independent manifest and refset choices.** `raw` forbids an RSD delta, while `sidecar-delta` defines an empty-chain manifest as snapshot and requires the snapshot floor (`149:221-240`). Thus the supported `RBOX_MDE_SNAPSHOT="0"` force-raw kill switch can coexist with a floor-enabled refset-delta writer but has no valid declaration (`149:264-272`; the second manifest flag seam is real at `src/cli/sync/push.ts:629-636`). Split this into manifest and refset encoding fields, or specify that force-raw also disables/reanchors refset deltas. As written, the two independently advertised controls cannot both be honored.
+
+4. **MAJOR — capability contact atomicity is not integrated with the shipped early-stale path.** Production enables `RBOX_COMMIT_EARLY_REJECT=1` (`apps/api/wrangler.jsonc:102-106,184`). The DO can return from `earlyStaleReject` at `apps/api/src/workspace-sync.ts:501-517,565,640`, before the authoritative transaction at `:669-695`. V3 says every authenticated workspace contact updates capability state and that a commit's contact/recompute/check shares the head-CAS transaction (`149:120-135`), but a stale commit cannot satisfy both statements on this path. Specify whether the fast path is removed, or perform a capability transaction before it and a second final capability check in the head CAS. The cited CAS range `workspace-sync.ts:680-710` is also inaccurate; the transaction is `:669-695`.
+
+5. **BLOCKER — B3 replaces `/roots` fields and pagination in a way that deployed collectors silently under-root.** V3 changes sequence entries from `carrierSha` to `chain` and changes the four-page assumption (`149:466-479`). The deployed GC reads only `carrierSha` and aborts after four sequence-root pages (`apps/api/src/versions.ts:25-30,76-79,91-109`); the deployed storage-truth adapter also ignores `chain` and requires `carrierSha === sidecar.sha` for gap expansion (`scripts/storage-truth-live.ts:298-315,514-529`). During a rolling server deploy an old collector can therefore omit every historical sidecar carrier, or fail closed merely because byte-bounded pages exceed four. Make `chain` additive while retaining `carrierSha`, deploy collectors that accept the new field/page caps first, and only then permit RSD1 writers.
+
+6. **MAJOR — B2's 250,000-ref arithmetic exceeds the real commit ceiling.** `MAX_REFS_PER_COMMIT=250000` bounds the complete accounted union, not data refs alone (`apps/api/src/commit-accounting.ts:43-48`). Current sidecar admission already checks `mode.count + 2 carriers + manifestChain.length` (`apps/api/src/workspace-sync.ts:556-564`), and B adds up to 15 parent carriers (`149:373-381,401-406`). A reconstructed set of 250,000 data refs is therefore necessarily over the existing limit. Define the data cap as `250000 - unique(non-data refs)`, or deliberately raise the global limit and re-budget every downstream batch.
+
+7. **MAJOR — the fold budget does not bound peak isolate memory or concurrent admission folds.** The 32 MiB cumulative carrier limit is not a heap bound (`149:399-413`). One admission may simultaneously retain the up-to-8 MiB parsed request (`apps/api/src/commit-envelope.ts:16-26`), carrier/canonical buffers, 250,000 SHA strings and merge state, and the downstream validation arrays/sets (`apps/api/src/commit-accounting.ts:103-145`). Different DO instances can run admission folds concurrently in one isolate; the existing roots fold already uses an isolate-wide guard specifically because two 250k set pairs are unsafe (`apps/api/src/workspace-sync.ts:736-744`). Wrangler config sets no special limit, while Workers memory is fixed at 128 MiB. Specify a peak-memory accounting model, buffer-release/streaming representation, and an isolate-wide admission-fold gate. The stated 17 fold subrequests and 500 ms CPU ceiling otherwise fit the current paid-plan limits ([Cloudflare Workers limits](https://developers.cloudflare.com/workers/platform/limits/)).
+
+8. **MAJOR — coverage backfill is now checkpointed, but rollout completion and FK replacement ordering are not executable.** The revised cursor/chunk/final proof makes publication conservative (`149:449-459`), but rollout step 3 requires every active DO to *report* generation 2 without defining a route/response field or a driver over the authoritative D1 workspace set (`149:873-875`). Existing `/roots-inspect` intentionally runs before bootstrap and cannot migrate a cold object (`apps/api/src/workspace-sync.ts:138-166,1018-1033`). Also, current folds use `INSERT OR REPLACE` on `seq_roots` (`:772-820`); with the proposed `ON DELETE CASCADE`, SQLite replacement deletes existing child rows. Require a status/backfill endpoint and enumerator, and require parent replacement before child re-insertion (or a non-delete UPSERT plus unconditional child-first cleanup). Merely testing a foreign-key-off fallback does not fix ordering under foreign keys.
+
+9. **BLOCKER — C2/C3 have no account-wide fence from a completed scan to mutation.** Verification is sliced across ticks, so an early-verified workspace can change before the epoch becomes complete (`149:650-676`). `/prune` carries and revalidates only the target DO's local pin (`149:742-767`); another workspace can change the account-global active/history totals and bound while the unchanged target still accepts a prune derived from stale totals. The capture cursor also never proves workspace-set equality, so a workspace created after its keyset position is absent from both membership and terminal verification. Target-local pin CAS is sound but insufficient for an account-global invariant. Add an authoritative account-wide workspace/roots generation covering creation and every head/floor/index mutation, or an equivalent mutation fence.
+
+10. **BLOCKER — C2 cannot checkpoint or budget materialization inside one allowed sidecar.** The ledger stores only an endpoint-level `roots_cursor`, while B3 says a sequence is never split across pages (`149:577-606,650-705`; B3 at `:466-471`). One head sidecar may reconstruct 250,000 data refs and an RSD chain may require 16 R2 GETs plus up to 500 ms pure fold CPU (`149:401-407`). C2 nevertheless promises one carrier read, at most 600 membership rows, and 25 ms CPU per materialization tick (`149:682-688`). The current inspector must expand the head sidecar to discover active data refs (`scripts/storage-truth-live.ts:519-529`); normalized carrier roots alone are not enough. Add a durable within-sequence/carrier-record cursor and a fold continuation representation, then budget all parent GETs and inserts. The revised 11-row/statement packing is valid, but it does not solve the missing inner cursor.
+
+11. **BLOCKER — C3 never derives safe floor targets from account-global unique-byte excess.** The ledger classifies unique entitlement bytes globally, while enforcement specifies only timestamp ordering and a maximum 500-sequence floor delta (`149:661-665,724-737`). It gives no algorithm for the marginal bytes released by a candidate floor, SHAs shared across sequences/workspaces, how a 500-sequence batch stops before a different workspace's older candidate, or when the current completed epoch is too stale to issue another of the eight prune calls. The retention precedent cannot fill this gap; it simply selects a timestamp cutoff and `MAX(sequence)` (`apps/api/src/retention.ts:60-81`). Consequently neither exact oldest-first behavior nor the required synthetic-45x convergence result is derivable. Define the candidate SQL/state machine and whether every floor movement is followed by a new stable scan before another movement.
+
+12. **MAJOR — plan invalidation is not serialized against the scan lease.** Scan writes are guarded by the unchanged exact lease value (`149:708-718`), while plan writers are only required to write `invalidated_plan` in their D1 plan-change batch (`149:825-831`). They do not revoke/CAS the lease, so an in-flight holder can subsequently advance a cursor or overwrite status under its still-valid lease. Current plan writes are ordinary independent updates (`apps/api/src/billing.ts:145-163`; `apps/api/src/stripe.ts:213-242`). Revoke or rotate the lease in the plan-change transaction, and predicate every scan transition on both the expected status and plan snapshot.
+
+### Verified round-3 claims
+
+- Every current migration plus the proposed Unit-C DDL executes successfully in SQLite. The Unit-A query uses real `devices` columns and `EXPLAIN QUERY PLAN` selects the proposed covering partial index. `0029_storage_economics.sql` is the next migration after the real `0028` tail.
+- Direct push really refreshes account keys before encoding, and the proposed query parameters are additive to the exact current `/v1/keys/account` body (`src/cli/e2ee-remote.ts:661-671,886-892`; `apps/api/src/keys.ts:80-104`). The two `/latest` shapes and best-effort grant splice are also correctly described (`apps/api/src/workspace-sync.ts:1187-1193`; `apps/api/src/routes/sync.ts:57-75`).
+- B1's framing, two authenticated identities, cross-field equality rules, and legacy-full interpretation are mechanically coherent. B3's revised cursor-based backfill is crash-conservative; finding 8 concerns how it is driven/reported and ordered with FK replacement, not its final-proof direction.
+- The fair-use lease's exact-value acquire/renew/release contract is at least as strong as the shipped GC precedent (`apps/api/src/versions.ts:247-289,308-336`). The optional `/prune` fields preserve the existing `{floor}` retention caller (`apps/api/src/retention.ts:73-86`), and both fixed and positional routes reach the same central prune method (`apps/api/src/workspace-sync.ts:152-157,180-183`), so the stated coverage check can protect both retention and fair-use.
+- Rollout steps 1-3 fit the branch model only as three separate `main` merges/dev verifications/explicit production fast-forwards: production applies D1 migrations before deploying the Worker, and CLI readers remain tag-released later (`docs/DEPLOYMENTS.md:6-35,41-57,65-87,111-123`). Finding 5 blocks step 3 as currently shaped; finding 8 blocks its completion criterion.
+
+**VERDICT: CHANGES-REQUIRED.**
+
+## Round 3 rulings (orchestrator)
+
+ALL 12 ACCEPTED. Binding v4 directions:
+
+1. Sticky incapable observations are NOT cleared by capable contacts (no
+   process identity exists behind one deviceId); they expire only after
+   `CAP_STICKY_HOURS = 24` without a new incapable contact. Cost accepted:
+   a mixed device holds floors down ≤24h after its daemon upgrades.
+2. Reframe A2 honestly: a cooperative compatibility protocol for
+   well-behaved clients, NOT a security boundary (the client owns its own
+   opaque data; the harm model is self-account cross-device breakage).
+   Absent-encoding legacy: admit; when chain nonempty, admit + log
+   (`legacy_chain_commit`) — the only such writers are known force-on
+   fleets. Drop every claim of structural raw/snapshot verification.
+3. Split the declaration: `manifestEncoding: raw|snapshot|delta` and
+   `refsetEncoding: full|delta`, independent floors per field; force-raw
+   manifest + delta refset is now expressible. Matrix rewritten.
+4. Fast path: capability contact/observation updates run in their own
+   small transaction BEFORE earlyStaleReject; the authoritative floor/gen
+   check runs inside the head-CAS transaction (`:669-695` — anchor
+   corrected). A commit rejected early has still recorded observations.
+5. `/roots` + `/roots-inspect`: `chain` is ADDITIVE; `carrierSha` remains
+   and keeps its exact meaning; page caps unchanged until collectors that
+   understand `chain` + byte-bounded paging are deployed AND verified;
+   only then may RSD1 writers enable. Rollout table updated accordingly.
+6. Data-ref cap = `250000 − unique(non-data refs incl. all parent
+   carriers + manifestChain)`; computed at encode time client-side and
+   revalidated at admission. No global limit raise.
+7. Peak-memory model added: streaming fold with per-buffer release,
+   isolate-wide admission-fold semaphore (mirror the roots-fold guard at
+   workspace-sync.ts:736-744), stated worst-case ≤48 MiB per isolate with
+   one fold in flight.
+8. New platform-admin `GET/POST /v1/admin/roots-coverage` (status +
+   backfill kick, D1-enumerated over workspaces; bootstraps cold DOs);
+   `seq_roots` writes become non-delete UPSERT + explicit child-first
+   chain-row replacement in the same transaction (no reliance on FK
+   replace semantics).
+9. Account-wide fence: before EACH prune batch, enforcement re-probes
+   every workspace pin triple + the account workspace SET (one bounded
+   DO probe per workspace, `FAIRUSE_MAX_WORKSPACES = 64` fail-closed
+   above); any drift aborts the epoch. Workspace-set equality is part of
+   epoch completion AND pre-batch validation.
+10. Ledger gains a within-sequence fold cursor
+    (`materialize_cursor: {seq, carrierOrd, pageToken}`) and per-tick
+    budgets include parent GETs; one oversized sequence may span ticks.
+11. Floor-target algorithm specified: candidate floor moves are derived
+    from the ledger membership table by exact marginal-release query
+    (bytes whose ONLY retained reachability is via sequences ≤ candidate
+    in this workspace); ONE floor move per workspace per completed
+    epoch, then a fresh scan epoch before any further movement.
+    Convergence for the 45× test is multi-epoch by design; bound stated
+    (≤ ceil(excess/batch-release) epochs, test uses small corpus).
+12. Plan-change writers rotate the fair-use lease value in the same D1
+    batch as the plan write; every scan/prune transition predicates on
+    (lease value, status, plan snapshot).
+
+v4 derivation delegated with these rulings binding; round 4 fresh-eyes
+review follows. Convergence note: rounds 1→3 moved structure→mechanism→
+concurrency/algorithm; remaining risk is now localized to Unit C's
+marginal-release query cost and A's honesty framing — both bounded.
