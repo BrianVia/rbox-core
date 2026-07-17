@@ -25,7 +25,7 @@ import { blobGetWithVerifiedGrant, usesReceipts } from "./blobs.js";
 import { runPhase1 } from "./gc-phase1.js";
 import { retentionPrune } from "./retention.js";
 import { runFairUseObservation } from "./fairuse.js";
-import { gcMark, gcPurge } from "./versions.js";
+import { emitGcHealthWarning, gcMark, gcPurge } from "./versions.js";
 import { sweepDiagnostics } from "./diagnostics.js";
 import { json, logErr, SHA256_HEX_RE } from "./util.js";
 import { startOp } from "./metrics.js";
@@ -120,6 +120,7 @@ export default {
       } catch (e) {
         logErr("scheduled_gc_mark_failed", e);
       }
+      await emitGcHealthWarning(env);
       return;
     }
     if (hour === GC_PURGE_UTC_HOUR) {
@@ -139,6 +140,7 @@ export default {
           logErr("scheduled_pack_gc_failed", e);
         }
       }
+      await emitGcHealthWarning(env);
       return;
     }
     try {
@@ -205,6 +207,7 @@ export default {
         logErr("scheduled_pack_uploading_sweep_failed", e);
       }
     }
+    await emitGcHealthWarning(env);
   },
 
   /**

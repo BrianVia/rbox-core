@@ -51,6 +51,20 @@ interface PackGcBody {
   error?: string;
 }
 
+interface CanonicalGcPurgeBody {
+  purged?: number;
+  opened?: number;
+  unwound?: number;
+  ok?: boolean;
+  budgetExceeded?: boolean;
+}
+
+async function canonicalGcPurgeBody(response: Response): Promise<CanonicalGcPurgeBody> {
+  const body = await response.json() as CanonicalGcPurgeBody;
+  expect(body.ok === false || body.budgetExceeded === true).toBe(false);
+  return body;
+}
+
 beforeAll(async () => applyD1Migrations(env.rbox_dev_db, env.TEST_MIGRATIONS));
 
 beforeEach(async () => {
@@ -818,7 +832,7 @@ describe("design 114 §7.3 fence release gates", () => {
     expect(await db().prepare("SELECT 1 FROM pack_gc_candidates WHERE pack_id=?").bind(pack.id).first()).toBeNull();
     const sha = pack.entries[0]!.sha256;
     await db().prepare("INSERT INTO gc_candidates(sha256,kind,marked_at,deleting_at) VALUES(?,'blob',?,?)").bind(sha, NOW - 2 * DAY, NOW - INTENT_QUIESCENCE_MS - 1).run();
-    expect(await (await gcPurge(env, LOGICAL_GRACE_MS, { nowMs: NOW, clock: () => NOW, owner: nextId("pin-logical") })).json()).toMatchObject({ purged: 1 });
+    expect(await canonicalGcPurgeBody(await gcPurge(env, LOGICAL_GRACE_MS, { nowMs: NOW, clock: () => NOW, owner: nextId("pin-logical") }))).toMatchObject({ purged: 1 });
     expect(await runAt(NOW + 1)).toMatchObject({ opened: 1, deleted: 0 });
     expect(await runAt(NOW + 1 + PACK_INTENT_QUIESCENCE_MS + 1)).toMatchObject({ deleted: 1 });
   });
@@ -841,7 +855,7 @@ describe("design 114 §7.3 fence release gates", () => {
       } as unknown as R2Bucket,
     } as Env;
     const response = await gcPurge(noR2, LOGICAL_GRACE_MS, { nowMs: NOW, clock: () => NOW, owner: nextId("logical") });
-    expect(await response.json()).toMatchObject({ purged: 1 });
+    expect(await canonicalGcPurgeBody(response)).toMatchObject({ purged: 1 });
     expect(bucketCalls).toBe(0);
     expect(await db().prepare("SELECT 1 FROM blob_locations WHERE sha256=?").bind(sha).first()).toBeNull();
     expect(await db().prepare("SELECT 1 FROM blobs WHERE sha256=?").bind(sha).first()).toBeNull();
@@ -880,7 +894,7 @@ describe("design 114 §7.3 fence release gates", () => {
       { nowMs: NOW, clock: () => NOW, owner: "stale-holder" },
     );
     expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({ purged: 0 });
+    expect(await canonicalGcPurgeBody(response)).toMatchObject({ purged: 0 });
     expect(intercepted).toBe(true);
     expect(await db().prepare("SELECT 1 FROM blob_locations WHERE sha256=?").bind(sha).first()).not.toBeNull();
     expect(await db().prepare("SELECT 1 FROM blobs WHERE sha256=?").bind(sha).first()).not.toBeNull();
@@ -899,7 +913,7 @@ describe("design 114 §7.3 fence release gates", () => {
     await db().prepare("INSERT INTO blob_refs(account_id,sha256,granted_at) VALUES(?,?,?)").bind(accountId, sha, NOW).run();
     await db().prepare("INSERT INTO gc_candidates(sha256,kind,marked_at,deleting_at) VALUES(?,'blob',?,?)").bind(sha, NOW - 2 * DAY, NOW - INTENT_QUIESCENCE_MS - 1).run();
     const response = await gcPurge(env, LOGICAL_GRACE_MS, { nowMs: NOW, clock: () => NOW, owner: nextId("logical-resurrect") });
-    expect(await response.json()).toMatchObject({ purged: 0, unwound: 1 });
+    expect(await canonicalGcPurgeBody(response)).toMatchObject({ purged: 0, unwound: 1 });
     expect(await db().prepare("SELECT 1 FROM gc_candidates WHERE sha256=?").bind(sha).first()).toBeNull();
     expect(await db().prepare("SELECT 1 FROM blob_locations WHERE sha256=?").bind(sha).first()).not.toBeNull();
     expect(await env.rbox_dev_blobs.head(packKey(pack.id))).not.toBeNull();
@@ -915,7 +929,7 @@ describe("design 114 §7.3 fence release gates", () => {
     await db().prepare("INSERT INTO blob_ref_candidates(account_id,sha256,marked_at) VALUES(?,?,?)").bind(accountId, sha, NOW - DAY).run();
     await db().prepare("INSERT INTO gc_candidates(sha256,kind,marked_at,deleting_at) VALUES(?,'blob',?,?)").bind(sha, NOW - 2 * DAY, NOW - INTENT_QUIESCENCE_MS - 1).run();
     const purge = await gcPurge(env, LOGICAL_GRACE_MS, { nowMs: NOW, clock: () => NOW, owner: nextId("phase1-stale") });
-    expect(await purge.json()).toMatchObject({ purged: 0 });
+    expect(await canonicalGcPurgeBody(purge)).toMatchObject({ purged: 0 });
     expect(await db().prepare("SELECT 1 FROM blob_locations WHERE sha256=?").bind(sha).first()).not.toBeNull();
     expect(await env.rbox_dev_blobs.head(packKey(pack.id))).not.toBeNull();
 
@@ -1434,7 +1448,7 @@ describe("design 114 §7.3 fence release gates", () => {
             db().prepare("DELETE FROM blob_refs WHERE account_id=? AND sha256=?").bind(accountId, cycleSha),
           ]);
           await db().prepare("INSERT OR REPLACE INTO gc_candidates(sha256,kind,marked_at,deleting_at) VALUES(?,'blob',?,?)").bind(cycleSha, tick - 2 * DAY, tick - INTENT_QUIESCENCE_MS - 1).run();
-          expect(await (await gcPurge(env, LOGICAL_GRACE_MS, { nowMs: tick, clock: () => tick, owner: nextId("history-logical") })).json()).toMatchObject({ purged: 1 });
+          expect(await canonicalGcPurgeBody(await gcPurge(env, LOGICAL_GRACE_MS, { nowMs: tick, clock: () => tick, owner: nextId("history-logical") }))).toMatchObject({ purged: 1 });
           active.delete(cycleSha);
           retired = true;
         } else if (action === "gc_mark") {

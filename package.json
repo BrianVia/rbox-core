@@ -9,10 +9,10 @@
   "description": "rbox sync engine (Phase 1: locally-testable core)",
   "scripts": {
     "dev:install": "bun scripts/dev-install.ts",
-    "test": "bun test ./src/",
+    "test": "bun test ./src/ ./scripts/gc-drain.test.ts",
     "test:api": "cd apps/api && vitest run",
     "test:storage-truth": "bun test ./scripts/storage-truth.test.ts ./scripts/storage-truth-live-unit.test.ts ./scripts/storage-truth-live.test.ts",
-    "test:all": "bun test ./src/ && bun run test:storage-truth && cd apps/api && vitest run",
+    "test:all": "bun test ./src/ ./scripts/gc-drain.test.ts && bun run test:storage-truth && cd apps/api && vitest run",
     "typecheck": "mkdir -p .cache/tsbuildinfo && tsc --noEmit --incremental --tsBuildInfoFile .cache/tsbuildinfo/root.tsbuildinfo && tsc -p apps/api --noEmit --incremental --tsBuildInfoFile .cache/tsbuildinfo/apps-api.tsbuildinfo",
     "typecheck:rig": "tsc -p scripts/rig/tsconfig.json",
     "gate:dl-integrity": "bun scripts/dl-integrity-gate.ts",

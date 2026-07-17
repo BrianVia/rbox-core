@@ -440,7 +440,10 @@ describe("server-internal DO addressing is slash-safe (finding B)", () => {
       rbox_dev_blobs: {},
       WORKSPACE_SYNC: { idFromName: (name: string) => ({ name }), get: () => ({ fetch: async (url: string) => (captured.push(new URL(url)), Response.json({ head: 0, pruneFloor: 0, indexGeneration: 0, gap: [], droppedPage: [], seqRootsPage: [] })) }) },
     } as unknown as Env;
-    await gcPurge(fakeEnv, 0);
+    const purgeResponse = await gcPurge(fakeEnv, 0);
+    const purgeBody = await purgeResponse.json() as { purged: number; opened: number; ok?: boolean; budgetExceeded?: boolean };
+    expect(purgeBody).toMatchObject({ purged: 0, opened: 0 });
+    expect(purgeBody.ok === false || purgeBody.budgetExceeded === true).toBe(false);
     const roots = captured.find((u) => u.pathname === "/roots");
     expect(roots).toBeDefined(); // fixed path — NOT /v1/ws/ws_b/proj/nested/dir/project/roots (which 404s)
     expect(roots!.searchParams.get("ws")).toBe("ws_b");
