@@ -24,6 +24,7 @@ import { blobBatchGetWithVerifiedGrant, blobBatchPutWithVerifiedGrant, type Batc
 import { blobGetWithVerifiedGrant, usesReceipts } from "./blobs.js";
 import { runPhase1 } from "./gc-phase1.js";
 import { retentionPrune } from "./retention.js";
+import { runFairUseObservation } from "./fairuse.js";
 import { gcMark, gcPurge } from "./versions.js";
 import { sweepDiagnostics } from "./diagnostics.js";
 import { json, logErr, SHA256_HEX_RE } from "./util.js";
@@ -155,6 +156,13 @@ export default {
       await retentionPrune(env);
     } catch (e) {
       logErr("scheduled_retention_failed", e); // no raw message (touches account/workspace metadata)
+    }
+    try {
+      // Design 149 rollout step 1: durable observation only. This runner never
+      // dispatches /prune; it snapshots roots and records a stable ledger epoch.
+      await runFairUseObservation(env);
+    } catch (e) {
+      logErr("scheduled_fairuse_scan_failed", e);
     }
     try {
       // §33 Phase 1: per-account entitlement prune (closes the design 30 §3 / 07b §d

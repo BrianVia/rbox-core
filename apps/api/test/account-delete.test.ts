@@ -202,6 +202,22 @@ describe("hard purge — enumeration + dedup safety + isolation", () => {
       db().prepare("INSERT INTO alert_state(condition,device_id,incident_started_at,last_notified_at) VALUES ('reporting_stopped',?,?,?)").bind(A.deviceId, now, now),
       db().prepare("INSERT INTO alert_state(condition,device_id,incident_started_at,last_notified_at) VALUES ('reporting_stopped',?,?,?)").bind(B.deviceId, now, now),
     ]);
+    await db().batch([
+      db().prepare(`INSERT INTO fairuse_scans(account_id,epoch,status,plan_snapshot,roots_format_generation,workspace_set_snapshot,started_at,updated_at)
+        VALUES(?,1,'materialize_roots','{}',1,'[]',?,?)`).bind(A.accountId, now, now),
+      db().prepare(`INSERT INTO fairuse_workspace_streams(account_id,epoch,workspace_id,project_id,pin_head,pin_floor,pin_generation,
+        pin_roots_format_generation,updated_at) VALUES(?,1,'ws_a','root',1,0,1,1,?)`).bind(A.accountId, now),
+      db().prepare(`INSERT INTO fairuse_root_membership(account_id,epoch,workspace_id,project_id,sha256,head,sequence)
+        VALUES(?,1,'ws_a','root',?,1,1)`).bind(A.accountId, shaOrphan),
+      db().prepare(`INSERT INTO fairuse_sha_last(account_id,epoch,sha256,last_ws,last_proj,last_seq,in_head)
+        VALUES(?,1,?,'ws_a','root',1,1)`).bind(A.accountId, shaOrphan),
+      db().prepare(`INSERT INTO fairuse_materialize_refs(account_id,epoch,workspace_id,project_id,sequence,sha256,size_bytes)
+        VALUES(?,1,'ws_a','root',1,?,20)`).bind(A.accountId, shaOrphan),
+      db().prepare("INSERT INTO fairuse_leases(account_id,value) VALUES(?,'lease')").bind(A.accountId),
+      // A's queue row already exists from creation-site seeding — refresh it the way production does.
+      db().prepare("INSERT INTO fairuse_account_queue(account_id,next_run_at,reason,updated_at) VALUES(?,?,'test',?) ON CONFLICT(account_id) DO UPDATE SET next_run_at=excluded.next_run_at, reason=excluded.reason, updated_at=excluded.updated_at").bind(A.accountId, now, now),
+      db().prepare("INSERT OR REPLACE INTO meta_deploy_floor(key,value) VALUES('roots_format_generation','1')"),
+    ]);
 
     // Tombstone A, then move purge_after into the past so we can drive at real `now` (keeps
     // gc_candidates.marked_at aligned with the real clock for the gcPurge step below).
@@ -218,6 +234,9 @@ describe("hard purge — enumeration + dedup safety + isolation", () => {
       "device_auth WHERE account_id", "pairing_tokens WHERE account_id", "uploads WHERE account_id",
       "workspaces WHERE account_id", "clerk_users WHERE account_id", "device_notifications WHERE account_id",
       "account_notify_prefs WHERE account_id", "audit_log WHERE account_id", "blob_ref_candidates WHERE account_id",
+      "fairuse_materialize_refs WHERE account_id", "fairuse_root_membership WHERE account_id",
+      "fairuse_sha_last WHERE account_id", "fairuse_workspace_streams WHERE account_id",
+      "fairuse_scans WHERE account_id", "fairuse_leases WHERE account_id", "fairuse_account_queue WHERE account_id",
       "diagnostics_reports WHERE account_id",
     ];
     for (const t of tablesByAccount) {
@@ -238,6 +257,7 @@ describe("hard purge — enumeration + dedup safety + isolation", () => {
     expect(await count("SELECT COUNT(*) AS n FROM notification_deliveries WHERE token_hash = ?", `th_${A.accountId}`)).toBe(0);
     expect(await count("SELECT COUNT(*) AS n FROM account_link_events WHERE clerk_user_id = ?", clerkA)).toBe(0);
     expect(await count("SELECT COUNT(*) AS n FROM account_link_codes WHERE clerk_user_id = ?", clerkA)).toBe(0);
+    expect(await count("SELECT COUNT(*) AS n FROM meta_deploy_floor WHERE key = 'roots_format_generation'")).toBe(1);
 
     // Per-upload staging object: deleted FAIL-CLOSED (R2 confirmed) before the uploads row.
     expect(await env.rbox_dev_blobs.get(`staging/${shaOrphan}/x`)).toBeNull();
@@ -447,6 +467,83 @@ describe("server-internal DO addressing is slash-safe (finding B)", () => {
     const prune = captured.find((u) => u.pathname === "/prune");
     expect(prune).toBeDefined();
     expect(prune!.searchParams.get("proj")).toBe("deep/nest/proj");
+  });
+
+  test("retention prunes a paid plan with a live stale grace stamp", async () => {
+    const now = Date.now();
+    let floorReads = 0;
+    let pruneCalls = 0;
+    const fakeDb = {
+      prepare(sql: string) {
+        return {
+          bind: () => fakeDb.prepare(sql),
+          all: async () => ({
+            results: /FROM workspaces w JOIN/i.test(sql)
+              ? [{ ws: "ws_paid", proj: "root", acct: "acct_paid", plan: "pro", grace_until: now + 60_000 }]
+              : [],
+          }),
+          first: async () => {
+            if (!/FROM commits/i.test(sql)) return null;
+            floorReads++;
+            return { floor: 5 };
+          },
+          run: async () => ({ meta: {} }),
+        };
+      },
+    };
+    const fakeEnv = {
+      rbox_dev_db: fakeDb,
+      WORKSPACE_SYNC: {
+        idFromName: (name: string) => ({ name }),
+        get: () => ({ fetch: async () => (pruneCalls++, Response.json({ pruned: 5, pruneFloor: 5 })) }),
+      },
+    } as unknown as Env;
+
+    const body = (await (await retentionPrune(fakeEnv, now)).json()) as { inGrace: number; pruned: number };
+    expect({ floorReads, pruneCalls, inGrace: body.inGrace, pruned: body.pruned }).toEqual({
+      floorReads: 1,
+      pruneCalls: 1,
+      inGrace: 0,
+      pruned: 5,
+    });
+  });
+
+  test("retention preserves a locked account within live grace", async () => {
+    const now = Date.now();
+    let floorReads = 0;
+    let pruneCalls = 0;
+    const fakeDb = {
+      prepare(sql: string) {
+        return {
+          bind: () => fakeDb.prepare(sql),
+          all: async () => ({
+            results: /FROM workspaces w JOIN/i.test(sql)
+              ? [{ ws: "ws_locked", proj: "root", acct: "acct_locked", plan: "none", grace_until: now + 60_000 }]
+              : [],
+          }),
+          first: async () => {
+            if (/FROM commits/i.test(sql)) floorReads++;
+            return { floor: 5 };
+          },
+          run: async () => ({ meta: {} }),
+        };
+      },
+    };
+    const fakeEnv = {
+      rbox_dev_db: fakeDb,
+      WORKSPACE_SYNC: {
+        idFromName: (name: string) => ({ name }),
+        get: () => ({ fetch: async () => (pruneCalls++, Response.json({ pruned: 5, pruneFloor: 5 })) }),
+      },
+    } as unknown as Env;
+
+    const body = (await (await retentionPrune(fakeEnv, now)).json()) as { inGrace: number; pruned: number };
+    expect({ floorReads, pruneCalls, inGrace: body.inGrace, pruned: body.pruned }).toEqual({
+      floorReads: 0,
+      pruneCalls: 0,
+      inGrace: 1,
+      pruned: 0,
+    });
   });
 });
 

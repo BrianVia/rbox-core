@@ -4,6 +4,7 @@ import { PLANS, planFor } from "./plans.js";
 import { audit, entitledSubset, isEntitled, type Principal } from "./authz.js";
 import { isOverCapAbort } from "./auth.js";
 import { dbFor } from "./db.js";
+import { fairUseQueueStatement } from "./fairuse.js";
 
 /** Downgrade grace window (design 13): paid→locked preserves all version history
  *  for this long before locked-state retention resumes. */
@@ -127,11 +128,25 @@ export async function usage(env: Env, p: Principal): Promise<Response> {
   const a = await account(env, p.accountId);
   const limits = planFor(a.plan);
   const cap = limits.storageBytes + a.extra;
+  const [workspaces, fairUseEpoch] = await Promise.all([
+    countWorkspaces(env, p.accountId),
+    dbFor(env, p.accountId).prepare(
+      `SELECT active_bytes,history_bytes,bound_bytes,completed_at,pruning_active
+       FROM fairuse_scans WHERE account_id=? AND completed_at IS NOT NULL
+       ORDER BY completed_at DESC,epoch DESC LIMIT 1`,
+    ).bind(p.accountId).first<{
+      active_bytes: number;
+      history_bytes: number;
+      bound_bytes: number;
+      completed_at: number;
+      pruning_active: number;
+    }>(),
+  ]);
   return json({
     plan: a.plan,
     usedBytes: a.used,
     storageCap: cap === Infinity ? null : cap,
-    workspaces: await countWorkspaces(env, p.accountId),
+    workspaces,
     workspaceCap: limits.workspaces === Infinity ? null : limits.workspaces,
     retentionDays: limits.retentionDays,
     // Downgrade grace (design 13): graceUntil set on a paid→locked transition; while
@@ -139,6 +154,15 @@ export async function usage(env: Env, p: Principal): Promise<Response> {
     // any new upload is blocked (used+size<=cap is the grant predicate).
     graceUntil: a.graceUntil,
     readOnly: cap !== Infinity && a.used >= cap,
+    fairUse: {
+      activeBytes: fairUseEpoch ? Number(fairUseEpoch.active_bytes) : null,
+      historyBytes: fairUseEpoch ? Number(fairUseEpoch.history_bytes) : null,
+      bound: fairUseEpoch ? Number(fairUseEpoch.bound_bytes) : null,
+      lastCompletedEpochAt: fairUseEpoch ? Number(fairUseEpoch.completed_at) : null,
+      // Rollout step 1 is observe-only even if a future-schema row was seeded.
+      pruningActive: false,
+      overshoot: { maxBatches: 1, maxSequences: 500 },
+    },
   });
 }
 
@@ -150,16 +174,22 @@ export async function adminSetPlan(env: Env, accountId: string, plan: string, ex
     // Paid→locked downgrade gets the same grace stamp as the webhook path (design 13
     // G7): same CASE predicate (only on a real paid→locked transition, never re-extend
     // an unexpired window) + clear extras. extraGB is ignored when downgrading.
-    const r = await dbFor(env, accountId)
-      .prepare("UPDATE accounts SET plan = 'none', extra_storage_bytes = 0, grace_until = CASE WHEN plan <> 'none' AND (grace_until IS NULL OR grace_until < ?) THEN ? ELSE grace_until END WHERE id = ?")
-      .bind(nowMs, nowMs + GRACE_PERIOD_MS, accountId)
-      .run();
+    const db = dbFor(env, accountId);
+    const [r] = await db.batch([
+      db.prepare("UPDATE accounts SET plan = 'none', extra_storage_bytes = 0, grace_until = CASE WHEN plan <> 'none' AND (grace_until IS NULL OR grace_until < ?) THEN ? ELSE grace_until END WHERE id = ?")
+        .bind(nowMs, nowMs + GRACE_PERIOD_MS, accountId),
+      fairUseQueueStatement(db, accountId, nowMs, "plan_changed"),
+    ]);
     await audit(env, null, "account.set_plan", `${accountId}:none`, accountId);
-    return json({ ok: true, accountId, plan: "none", changed: r.meta.changes });
+    return json({ ok: true, accountId, plan: "none", changed: r?.meta.changes ?? 0 });
   }
-  const r = await dbFor(env, accountId).prepare("UPDATE accounts SET plan = ?, extra_storage_bytes = ? WHERE id = ?").bind(plan, extra, accountId).run();
+  const db = dbFor(env, accountId);
+  const [r] = await db.batch([
+    db.prepare("UPDATE accounts SET plan = ?, extra_storage_bytes = ? WHERE id = ?").bind(plan, extra, accountId),
+    fairUseQueueStatement(db, accountId, nowMs, "plan_changed"),
+  ]);
   await audit(env, null, "account.set_plan", `${accountId}:${plan}`, accountId);
-  return json({ ok: true, accountId, plan, changed: r.meta.changes });
+  return json({ ok: true, accountId, plan, changed: r?.meta.changes ?? 0 });
 }
 
 /* Stripe (DEFERRED — needs STRIPE_SECRET + product/price IDs): checkout/portal/

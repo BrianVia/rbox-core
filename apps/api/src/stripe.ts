@@ -5,6 +5,7 @@ import { PLAN_LOOKUP_KEYS, PURCHASABLE_PLANS, planForLookupKey, type BillingCade
 import { GRACE_PERIOD_MS } from "./billing.js";
 import { dbFor, dirDb } from "./db.js";
 import { pingChurn, pingNewSubscription, pingPaymentFailed } from "./slackpipes.js";
+import { fairUseQueueStatement } from "./fairuse.js";
 
 /**
  * Stripe billing (M10) — Checkout + Customer Portal + signature-verified webhook,
@@ -213,21 +214,25 @@ async function applyStripeEvent(env: Env, event: { type: string; data: { object:
         // active/trialing → the purchased plan. Leave grace_until untouched (it's
         // only read when locked; clearing it would let a cancel re-grant in-window — G6).
         const plan = planForLookupKey(lookupKey) ?? "none";
-        const upd = await dbFor(env, accountId)
-          .prepare("UPDATE accounts SET plan = ?, stripe_customer_id = ?, stripe_subscription_id = ? WHERE id = ? AND reclaimed_at IS NULL AND (stripe_customer_id IS NULL OR stripe_customer_id = ?)")
-          .bind(plan, obj.customer, obj.id, accountId, obj.customer)
-          .run();
+        const db = dbFor(env, accountId);
+        const [upd] = await db.batch([
+          db.prepare("UPDATE accounts SET plan = ?, stripe_customer_id = ?, stripe_subscription_id = ? WHERE id = ? AND reclaimed_at IS NULL AND (stripe_customer_id IS NULL OR stripe_customer_id = ?)")
+            .bind(plan, obj.customer, obj.id, accountId, obj.customer),
+          fairUseQueueStatement(db, accountId, nowMs, "plan_changed"),
+        ]);
         // §32 Tier 1 business ping (best-effort, never throws) — only on the INITIAL
         // subscription, not every renewal `subscription.updated`, AND only when the
         // write actually transitioned a row. A late webhook for a reclaimed/CAS-guarded
         // shell no-ops the UPDATE (changes == 0) → no FALSE "new subscription" alert.
-        if (event.type === "customer.subscription.created" && (upd.meta.changes ?? 0) > 0) pingNewSubscription(ctx, env, { accountId, plan });
+        if (event.type === "customer.subscription.created" && (upd?.meta.changes ?? 0) > 0) pingNewSubscription(ctx, env, { accountId, plan });
       } else {
         // non-paying (past_due/unpaid/canceled-but-not-deleted) → locked + grace + clear extras.
-        await dbFor(env, accountId)
-          .prepare(`UPDATE accounts SET plan = 'none', extra_storage_bytes = 0, stripe_customer_id = ?, stripe_subscription_id = ?, grace_until = ${graceCase()} WHERE id = ? AND reclaimed_at IS NULL AND (stripe_customer_id IS NULL OR stripe_customer_id = ?)`)
-          .bind(obj.customer, obj.id, nowMs, nowMs + GRACE_PERIOD_MS, accountId, obj.customer)
-          .run();
+        const db = dbFor(env, accountId);
+        await db.batch([
+          db.prepare(`UPDATE accounts SET plan = 'none', extra_storage_bytes = 0, stripe_customer_id = ?, stripe_subscription_id = ?, grace_until = ${graceCase()} WHERE id = ? AND reclaimed_at IS NULL AND (stripe_customer_id IS NULL OR stripe_customer_id = ?)`)
+            .bind(obj.customer, obj.id, nowMs, nowMs + GRACE_PERIOD_MS, accountId, obj.customer),
+          fairUseQueueStatement(db, accountId, nowMs, "plan_changed"),
+        ]);
       }
       break;
     }
@@ -241,6 +246,9 @@ async function applyStripeEvent(env: Env, event: { type: string; data: { object:
           .prepare(`UPDATE accounts SET plan = 'none', extra_storage_bytes = 0, stripe_subscription_id = NULL, grace_until = ${graceCase()} WHERE stripe_customer_id = ? AND stripe_subscription_id = ?`)
           .bind(nowMs, nowMs + GRACE_PERIOD_MS, obj.customer, obj.id)
           .run();
+        if ((del.meta.changes ?? 0) > 0 && obj.metadata?.account_id) {
+          await fairUseQueueStatement(dbFor(env, obj.metadata.account_id), obj.metadata.account_id, nowMs, "plan_changed").run();
+        }
         // §32 Tier 1 churn ping (best-effort) — only when this delete actually
         // downgraded an account; a stale/duplicate delete that matches no live row
         // (changes == 0) must not emit a FALSE churn alert.
@@ -365,6 +373,8 @@ export async function repointBillingToAccount(env: Env, shellId: string, destId:
            AND EXISTS (SELECT 1 FROM accounts WHERE id = ? AND stripe_subscription_id = ?)`
       )
       .bind(nowMs, shellId, shell.sub, destId, shell.sub),
+    fairUseQueueStatement(dbFor(env, destId), destId, nowMs, "plan_changed"),
+    fairUseQueueStatement(dbFor(env, shellId), shellId, nowMs, "plan_changed"),
   ]);
 
   // Post-batch verify: only report success if X holds EXACTLY our {customer, sub}

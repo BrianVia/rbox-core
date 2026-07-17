@@ -2,6 +2,7 @@ import type { Env } from "./env.js";
 import { ctEqual, json } from "./util.js";
 import { dbFor } from "./db.js";
 import { batchedInLookup } from "./d1-batch.js";
+import { fairUseQueueStatement } from "./fairuse.js";
 
 /** The authenticated caller: a device, its account, user, and role. */
 export interface Principal {
@@ -93,10 +94,13 @@ export async function createWorkspace(env: Env, p: Principal, projectId: string,
   if (p.role === "viewer") return json({ error: "forbidden" }, 403);
   const ws = `ws_${crypto.randomUUID().replace(/-/g, "")}`; // high-entropy, unguessable
   const cleanName = sanitizeWorkspaceName(name);
-  await dbFor(env, p.accountId)
-    .prepare("INSERT INTO workspaces (workspace_id, project_id, account_id, created_at, name) VALUES (?, ?, ?, ?, ?)")
-    .bind(ws, projectId, p.accountId, Date.now(), cleanName)
-    .run();
+  const now = Date.now();
+  const db = dbFor(env, p.accountId);
+  await db.batch([
+    db.prepare("INSERT INTO workspaces (workspace_id, project_id, account_id, created_at, name) VALUES (?, ?, ?, ?, ?)")
+      .bind(ws, projectId, p.accountId, now, cleanName),
+    fairUseQueueStatement(db, p.accountId, now, "workspace_created"),
+  ]);
   await audit(env, p, "workspace.create", ws);
   return json({ workspaceId: ws, projectId, name: cleanName });
 }

@@ -46,6 +46,9 @@ export default defineConfig({
             RBOX_BOOTSTRAP_SECRET: "test-bootstrap-secret",
             RBOX_ALLOW_BOOTSTRAP_PLAN: "1",
             RBOX_PLATFORM_SECRET: "test-platform-secret",
+            // Production/dev rollout keeps history mutation disabled; tests opt
+            // into retention so its grace/floor behavior remains exercised.
+            RBOX_HISTORY_PRUNE_DISABLED: "0",
             // Webhook secret set (so we can test signed delivery) but STRIPE_SECRET
             // deliberately ABSENT (so checkout/portal exercise the 501 gate).
             STRIPE_WEBHOOK_SECRET: "whsec_test_secret",
