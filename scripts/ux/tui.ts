@@ -98,11 +98,15 @@ export function assertDirectDevRbox(command: string[]): void {
 
 export function renderCommand(argv: string[]): string { return `exec ${argv.map(shellQuote).join(" ")}`; }
 
+export function renderRetainedCommand(argv: string[]): string {
+  return `tmux set-option -p -t "$TMUX_PANE" remain-on-exit on && ${renderCommand(argv)}`;
+}
+
 export function tmuxStartArgs(session: string, home: string, cols: number, rows: number, child: string[]): string[] {
   const env: Record<string, string> = { HOME: home, RBOX_HOME: home, RBOX_API: DEV_API, RBOX_API_QUIET: "1", RBOX_APP: "" };
   for (const key of SCRUBBED_ENV) if (!(key in env)) env[key] = "";
   const injected = Object.entries(env).flatMap(([key, value]) => ["-e", `${key}=${value}`]);
-  return ["new-session", "-d", "-E", "-s", session, "-x", String(cols), "-y", String(rows), "-c", home, ...injected, "--", renderCommand(child)];
+  return ["new-session", "-d", "-E", "-s", session, "-x", String(cols), "-y", String(rows), "-c", home, ...injected, "--", renderRetainedCommand(child)];
 }
 
 async function tmuxHost(args: string[], capture = false): Promise<string> {
@@ -160,8 +164,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     const result = await waitForStable(args.timeout, { capture: () => invoke(["capture-pane", "-p", "-t", args.session], true), sleep: Bun.sleep, now: Date.now }); printScreen(result.screen);
     if (!result.stable) throw new Error(`screen did not become idle within ${args.timeout}s`);
   } else {
-    // A session whose child already exited (e.g. after C-c) is gone — that is
-    // a successful stop, not an error; teardown chains must keep going.
+    // Retained dead panes normally keep the session available to kill. If another
+    // teardown already removed it, stop is still successful so chains keep going.
     try { await invoke(["kill-session", "-t", args.session]); }
     catch (error) { process.stderr.write(`session already stopped: ${error instanceof Error ? error.message : String(error)}\n`); }
   }

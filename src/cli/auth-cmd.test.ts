@@ -5,6 +5,7 @@ import path from "node:path";
 import {
   handleDeviceCodePostApprovalEncryption,
   deviceCodeLoginShouldPrintWorkspaceStep,
+  deviceApprovalUrl,
   login,
   logout,
   pairingRedemptionSuccessMessages,
@@ -87,6 +88,45 @@ test("pairing redemption success chains to the existing-workspace setup step", (
     "device authorized + encryption enrolled: dev_new",
     WORKSPACE_SYNC_NEXT_STEP,
   ]);
+});
+
+test("wizard pairing success suppresses the standalone workspace next step", () => {
+  expect(pairingRedemptionSuccessMessages("dev_new", "wizard")).toEqual([
+    "device authorized + encryption enrolled: dev_new",
+  ]);
+  expect(pairingRedemptionSuccessMessages("dev_new", "standalone")).toContain(WORKSPACE_SYNC_NEXT_STEP);
+});
+
+test("RBOX_PAIR_TOKEN redemption inherits login's explicit presentation context", async () => {
+  const previous = process.env.RBOX_PAIR_TOKEN;
+  process.env.RBOX_PAIR_TOKEN = "pair-token";
+  try {
+    for (const presentation of ["wizard", "standalone"] as const) {
+      const seen: string[] = [];
+      await login("https://api.test", undefined, undefined, { kit: false }, "machine", presentation, {
+        redeemPair: async (_remote, token, label, context) => {
+          expect(token).toBe("pair-token");
+          expect(label).toBe("machine");
+          seen.push(context);
+        },
+      });
+      expect(seen).toEqual([presentation]);
+    }
+  } finally {
+    if (previous === undefined) delete process.env.RBOX_PAIR_TOKEN;
+    else process.env.RBOX_PAIR_TOKEN = previous;
+  }
+});
+
+test("empty RBOX_APP falls back to the full production approval URL", () => {
+  const previous = process.env.RBOX_APP;
+  process.env.RBOX_APP = "";
+  try {
+    expect(deviceApprovalUrl("AAAA-BBBB")).toBe("https://app.rbox.to/cli-login?code=AAAA-BBBB");
+  } finally {
+    if (previous === undefined) delete process.env.RBOX_APP;
+    else process.env.RBOX_APP = previous;
+  }
 });
 
 test("key recover requires login before reading the recovery phrase", async () => {

@@ -33,6 +33,46 @@ export function newAgentId(): string {
   return `agent_${toB64url(randomBytes(16))}`;
 }
 
+const PAIR_TOKEN_ID_RE = /^[A-Za-z0-9_-]{16,64}$/;
+const PAIR_TOKEN_PREFIX = "rbox-pair_";
+
+export interface ParsedPairingToken {
+  /** Preserve the prefixed/raw token exactly as supplied for server compatibility. */
+  redeemToken: string;
+  tokenSecret: Uint8Array;
+}
+
+export class PairingTokenShapeError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PairingTokenShapeError";
+  }
+}
+
+/** The shared secret decoder used by both the local wizard gate and redemption. */
+export function decodePairingSecret(encoded: string): Uint8Array {
+  return fromB64url(encoded);
+}
+
+/** Pure, single-source grammar for current, raw, and legacy pairing tokens. */
+export function parsePairingToken(fullToken: string): ParsedPairingToken {
+  const parts = fullToken.split(".");
+  if (parts.length !== 2 || !parts[0] || !parts[1]) {
+    throw new PairingTokenShapeError("malformed pairing token (expected `rbox-pair_<id>.<secret>`)");
+  }
+  const redeemToken = parts[0];
+  const tokenId = redeemToken.startsWith(PAIR_TOKEN_PREFIX) ? redeemToken.slice(PAIR_TOKEN_PREFIX.length) : redeemToken;
+  if (!PAIR_TOKEN_ID_RE.test(tokenId)) throw new PairingTokenShapeError("malformed pairing token (invalid redeem id)");
+  let tokenSecret: Uint8Array;
+  try {
+    tokenSecret = decodePairingSecret(parts[1]);
+  } catch (error) {
+    throw new PairingTokenShapeError(`malformed pairing token (${error instanceof Error ? error.message : "invalid secret encoding"})`);
+  }
+  if (tokenSecret.length !== 32) throw new PairingTokenShapeError("malformed pairing token (secret must be 32 bytes)");
+  return { redeemToken, tokenSecret };
+}
+
 async function pairingRedeemError(res: Response): Promise<Error> {
   if (res.status === 409) {
     const body = (await res.json().catch(() => ({}))) as { error?: string; cap?: unknown; plan?: unknown };
@@ -121,11 +161,7 @@ async function admitWithRetry(api: RboxApi, deviceId: string, initial: RedeemRes
 
 /** Connect this machine via a split-secret pairing token (D3/D4/D7). */
 export async function enrollViaPairing(remoteUrl: string, fullToken: string, now: number, label?: string): Promise<{ accountId: string; deviceId: string }> {
-  const dot = fullToken.lastIndexOf(".");
-  if (dot < 1) throw new Error("malformed pairing token (expected `rbox-pair_<id>.<secret>`)");
-  const redeemToken = fullToken.slice(0, dot);
-  const tokenSecret = fromB64url(fullToken.slice(dot + 1));
-  if (tokenSecret.length !== 32) throw new Error("malformed pairing token (secret must be 32 bytes)");
+  const { redeemToken, tokenSecret } = parsePairingToken(fullToken);
 
   const res = await fetch(`${remoteUrl}/v1/auth/pair/redeem`, {
     method: "POST",
@@ -159,6 +195,11 @@ export async function enrollViaPairing(remoteUrl: string, fullToken: string, now
 /** Recover this machine from the phrase (D10): needs an existing device credential
  *  (the caller logged in first); RK unlocks MK + RSK to self-admit. */
 export async function enrollViaRecovery(phrase: string, now: number): Promise<{ accountId: string; deviceId: string }> {
+  return enrollViaPrevalidatedRecovery(await phraseToRk(phrase), now);
+}
+
+/** Recovery continuation for callers that already passed the local BIP39 gate. */
+export async function enrollViaPrevalidatedRecovery(rk: Uint8Array, now: number): Promise<{ accountId: string; deviceId: string }> {
   const creds = await loadCredentials();
   if (!creds?.accountId) throw new Error("`rbox key recover` needs an account login first — run `rbox login` (web/device-code), then recover.");
   const api = new RboxApi(creds.remoteUrl, creds.token, "", "");
@@ -168,7 +209,6 @@ export async function enrollViaRecovery(phrase: string, now: number): Promise<{ 
   assertSignedAccountId(creds.accountId, account.currentRoster.accountId);
   if (!dto.recoveryWrap) throw new Error("no recovery wrap stored for this account");
 
-  const rk = await phraseToRk(phrase);
   const recoveryWrap = JSON.parse(dto.recoveryWrap) as Wrap;
   // A recovered device is a FRESH roster principal — never reuse the credential's
   // deviceId (it may already be an entry, e.g. recovering on the same machine that

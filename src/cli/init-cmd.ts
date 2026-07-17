@@ -10,7 +10,7 @@ import os from "node:os";
 import path from "node:path";
 import { loadCredentials, type Credentials } from "./credentials.js";
 import { createRemoteWorkspace } from "./remote.js";
-import { loadConfig, resetSyncState, saveConfig, syncStreamId, type WorkspaceConfig } from "./config.js";
+import { loadConfig, loadConfigIfPresent, resetSyncState, saveConfig, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
 import { enrolledDeviceId, hasDevice } from "./e2ee-keystore.js";
 import { login } from "./auth-cmd.js";
@@ -20,25 +20,35 @@ import { resolveInitPlan, resolveWorkspaceDeviceId, isInitError, collapseHome, i
 import { style, stderrStyle, fail } from "./style.js";
 import { spinner } from "./spinner.js";
 import { progressLabel } from "./status-view.js";
-import { promptSelect, promptInput } from "./prompt.js";
+import { promptSelect, promptInput, promptPath } from "./prompt.js";
 import { promptWorkspacePick } from "./workspace-picker.js";
 import { recoveryKitOptionsFromFlags, type RecoveryKitOptions } from "./recovery-kit.js";
 import { createPopulateStatusWriter } from "./populate-status.js";
-import { acquireWorkspaceSyncMutex, releaseWorkspaceSyncMutex } from "./sync-mutex.js";
+import { acquireWorkspaceSyncMutex, assertSyncMutex, releaseWorkspaceSyncMutex, type WorkspaceSyncMutex } from "./sync-mutex.js";
 
 /**
  * Gather the missing init inputs interactively (all widgets render on stderr, so
  * `rbox init > out.txt` never pollutes stdout). Callers gate this on a TTY —
  * inquirer requires one. `ctx` carries the creds/remote the join picker needs.
  */
-async function promptMissing(
+export async function promptMissing(
   flags: Record<string, string>,
   cwd: string,
-  ctx: { creds: Credentials | undefined; defaultRemote: string }
+  ctx: {
+    creds: Credentials | undefined;
+    defaultRemote: string;
+    promptPath?: typeof promptPath;
+    promptSelect?: typeof promptSelect;
+    promptInput?: typeof promptInput;
+    promptWorkspacePick?: typeof promptWorkspacePick;
+  }
 ): Promise<Record<string, string>> {
   const next = { ...flags };
+  const select = ctx.promptSelect ?? promptSelect;
+  const input = ctx.promptInput ?? promptInput;
+  const pickWorkspace = ctx.promptWorkspacePick ?? promptWorkspacePick;
   if (next.new !== "true" && !next.workspace) {
-    const choice = await promptSelect<"new" | "join">({
+    const choice = await select<"new" | "join">({
       message: "New workspace, or join an existing one?",
       choices: [
         { name: "Create a new workspace", value: "new" },
@@ -47,7 +57,7 @@ async function promptMissing(
     });
     if (choice === "join") {
       // Pick by name (degrades to a manual id prompt offline / no creds / empty).
-      const picked = await promptWorkspacePick({ baseUrl: ctx.creds?.remoteUrl ?? ctx.defaultRemote, token: ctx.creds?.token });
+      const picked = await pickWorkspace({ baseUrl: ctx.creds?.remoteUrl ?? ctx.defaultRemote, token: ctx.creds?.token, mode: "legacy" });
       // Backing out of the picker (blank manual entry) falls through as a NEW
       // workspace — mirrors the old "[new]" default when nothing was entered.
       if (picked) {
@@ -58,12 +68,11 @@ async function promptMissing(
     }
   }
   if (!next.project) {
-    const ans = (await promptInput({ message: "Project id", default: "root" })).trim();
+    const ans = (await input({ message: "Project id", default: "root" })).trim();
     if (ans) next.project = ans;
   }
   if (!next.root) {
-    const ans = (await promptInput({ message: "Sync which directory?", default: cwd })).trim();
-    if (ans) next.root = ans;
+    next.root = await (ctx.promptPath ?? promptPath)({ message: "Sync which directory?", default: cwd, cwd });
   }
   // Workspace name — offered on a TTY only when CREATING. `--name` is the scripted
   // opt-in and, when present (next.name != null), skips this whole block. Skipped
@@ -79,11 +88,11 @@ async function promptMissing(
     // Single optional input: the suggestion is the default, so a bare ENTER names the
     // workspace by its directory (what the old confirm→input two-step did on default+
     // ENTER); "-" is the documented skip (the old confirm's "n" path — keeps it private).
-    const ans = interpretWorkspaceNameAnswer(await promptInput({ message: `Workspace name (Enter accepts, "-" for none)`, default: suggestion }));
+    const ans = interpretWorkspaceNameAnswer(await input({ message: `Workspace name (Enter accepts, "-" for none)`, default: suggestion }));
     if (ans) next.name = ans;
   }
   if (!next.workspace && next["respect-gitignore"] == null) {
-    next["respect-gitignore"] = await promptSelect<"false" | "true">({
+    next["respect-gitignore"] = await select<"false" | "true">({
       message: "How should rbox handle gitignored files?",
       choices: GITIGNORE_CHOICES,
     });
@@ -112,9 +121,24 @@ export interface InitOutcome {
   root: string;
 }
 
+export const GUIDED_GENESIS_PULL_NOTICE = "nothing was available to pull — this workspace had no prior snapshot";
+
+export function guidedGenesisPullNotice(guidedSetup: boolean, initialRemoteSequence: number): string | undefined {
+  return guidedSetup && initialRemoteSequence === 0 ? GUIDED_GENESIS_PULL_NOTICE : undefined;
+}
+
+export function writeGuidedGenesisPullNotice(
+  guidedSetup: boolean,
+  initialRemoteSequence: number,
+  writeStderr: (text: string) => void = (text) => process.stderr.write(text)
+): void {
+  const notice = guidedGenesisPullNotice(guidedSetup, initialRemoteSequence);
+  if (notice) writeStderr(`${stderrStyle.dim(notice)}\n`);
+}
+
 export async function runInit(
   flags: Record<string, string>,
-  opts: { cwd: string; defaultRemote: string; summary?: boolean }
+  opts: { cwd: string; defaultRemote: string; summary?: boolean; guidedSetup?: boolean }
 ): Promise<InitOutcome | undefined> {
   const creds = await loadCredentials();
   const interactive = process.stdin.isTTY === true && flags["no-interactive"] !== "true";
@@ -133,13 +157,74 @@ export async function runInit(
     summary: opts.summary !== false,
     recoveryKit: recoveryKitOptionsFromFlags(gathered),
     newDevice: gathered["new-device"] === "true",
+    guidedSetup: opts.guidedSetup === true,
   });
+}
+
+export interface PrecreatedWorkspaceContinuation {
+  workspaceId: string;
+  syncMutex: WorkspaceSyncMutex;
+}
+
+interface PrecreatedContinuationDeps {
+  loadCredentials?: typeof loadCredentials;
+  releaseMutex?: typeof releaseWorkspaceSyncMutex;
+  executePlan?: typeof executeInitPlan;
+}
+
+/** Adopt setup's precreated workspace id + held mutex; never mints or acquires. */
+export function adoptPrecreatedWorkspaceResources(
+  plan: InitPlan,
+  continuation: PrecreatedWorkspaceContinuation
+): { workspaceId: string; syncMutex: WorkspaceSyncMutex; ownsSyncMutex: boolean } {
+  if (plan.workspace.kind !== "new") throw new Error("precreated workspace continuation requires a new-workspace plan");
+  assertSyncMutex(continuation.syncMutex, plan.root);
+  return { workspaceId: continuation.workspaceId, syncMutex: continuation.syncMutex, ownsSyncMutex: false };
+}
+
+/**
+ * Continue a genuinely-new init using setup's already-minted id and held mutex.
+ * Calling this function transfers mutex ownership; its outer finally releases it
+ * exactly once, including invalid-plan, root-mismatch, success, and failure exits.
+ */
+export async function continueInitWithPrecreatedWorkspace(
+  flags: Record<string, string>,
+  opts: { cwd: string; defaultRemote: string; summary?: boolean; guidedSetup?: boolean },
+  continuation: PrecreatedWorkspaceContinuation,
+  deps: PrecreatedContinuationDeps = {}
+): Promise<InitOutcome | undefined> {
+  try {
+    const creds = await (deps.loadCredentials ?? loadCredentials)();
+    const plan = resolveInitPlan({ flags, cwd: opts.cwd, creds, interactive: false, defaultRemote: opts.defaultRemote });
+    if (isInitError(plan)) {
+      fail(plan.message);
+      process.stderr.write(`${stderrStyle.dim("try:")} ${plan.headlessHint}\n`);
+      process.exitCode = 1;
+      return undefined;
+    }
+    if (plan.workspace.kind !== "new") throw new Error("precreated workspace continuation requires a new-workspace plan");
+    assertSyncMutex(continuation.syncMutex, plan.root);
+    return await (deps.executePlan ?? executeInitPlan)(
+      plan,
+      flags.bootstrap,
+      {
+        summary: opts.summary !== false,
+        recoveryKit: recoveryKitOptionsFromFlags(flags),
+        newDevice: flags["new-device"] === "true",
+        guidedSetup: opts.guidedSetup === true,
+      },
+      continuation
+    );
+  } finally {
+    await (deps.releaseMutex ?? releaseWorkspaceSyncMutex)(continuation.syncMutex);
+  }
 }
 
 async function executeInitPlan(
   plan: InitPlan,
   bootstrapSecret: string | undefined,
-  opts: { summary: boolean; recoveryKit: RecoveryKitOptions; newDevice: boolean }
+  opts: { summary: boolean; recoveryKit: RecoveryKitOptions; newDevice: boolean; guidedSetup: boolean },
+  continuation?: PrecreatedWorkspaceContinuation
 ): Promise<InitOutcome | undefined> {
   // 1. Auth: bootstrap-login works headlessly (one-shot secret); device-code is
   //    interactive-only. "have" needs nothing. Never start device-code in CI.
@@ -155,12 +240,18 @@ async function executeInitPlan(
   }
   // 2. Workspace: create (new) or adopt the id (join — first sync validates access).
   let workspaceId: string;
+  let syncMutex!: WorkspaceSyncMutex;
+  let ownsSyncMutex!: boolean;
   const ws = spinner(plan.workspace.kind === "new" ? "creating workspace" : "joining workspace");
   try {
-    workspaceId =
-      plan.workspace.kind === "new"
+    if (continuation) {
+      ({ workspaceId, syncMutex, ownsSyncMutex } = adoptPrecreatedWorkspaceResources(plan, continuation));
+    } else {
+      workspaceId = plan.workspace.kind === "new"
         ? await createRemoteWorkspace(plan.remoteUrl, creds.token, plan.workspace.project, plan.workspace.name)
         : plan.workspace.id;
+      ownsSyncMutex = true;
+    }
     ws.succeed(`workspace ${style.cyan(workspaceId)}`);
   } catch (e) {
     ws.fail("workspace setup failed");
@@ -169,7 +260,7 @@ async function executeInitPlan(
 
   // Init/setup owns one mutex across the complete rebind/reset + first-sync
   // decision, mutation, and state-save interval. Nested pull/push calls inherit it.
-  const syncMutex = await acquireWorkspaceSyncMutex(plan.root, "cli");
+  if (!continuation) syncMutex = await acquireWorkspaceSyncMutex(plan.root, "cli");
   let deviceId!: string;
   try {
     // 3. Write the per-device binding (token injected at runtime, never persisted).
@@ -178,7 +269,12 @@ async function executeInitPlan(
     //    it reads every old file as remotely deleted (the 2026-07-01 mass-delete
     //    incident). Reset the baseline explicitly (loadState also guards via the
     //    stream stamp; this keeps the on-disk state truthful) and say so.
-    const prev = await loadConfig(plan.root).catch(() => undefined);
+    // Setup-create already made a typed rebind probe and needs later local faults to
+    // surface as known-id continuation failures. Ordinary/scripted init preserves
+    // its legacy best-effort probe semantics.
+    const prev = continuation
+      ? await loadConfigIfPresent(plan.root)
+      : await loadConfig(plan.root).catch(() => undefined);
     deviceId = resolveWorkspaceDeviceId({
       forceNew: opts.newDevice,
       prevDeviceId: prev?.deviceId,
@@ -289,7 +385,7 @@ async function executeInitPlan(
           sp.update(progressLabel(phase, done, total, detail, bytes));
           populate.update(done, total, phase, bytes);
         };
-        const { pulled, pushedSequence } = await sync(plan.root, authed, deps);
+        const { pulled, pushedSequence, initialRemoteSequence } = await sync(plan.root, authed, deps);
         sp.stop();
         const conflicts = pulled.filter((a) => a.kind === "conflict");
         const writes = pulled.filter((a) => a.kind === "write").length;
@@ -297,6 +393,7 @@ async function executeInitPlan(
           `${style.bold("synced")}: ${style.green(`${writes} pulled`)}, ${conflicts.length ? style.red(`${conflicts.length} conflict(s)`) : style.dim("0 conflict(s)")} ${style.sym.arrow} sequence ${style.cyan(String(pushedSequence))}`
         );
         for (const c of conflicts) console.log(`  ${style.sym.warn} ${style.yellow(c.path ?? "?")} ${style.dim(`(local kept as ${c.keepLocalAs})`)}`);
+        writeGuidedGenesisPullNotice(opts.guidedSetup, initialRemoteSequence);
       } catch (e) {
         sp.fail("initial sync failed");
         throw e;
@@ -325,7 +422,7 @@ async function executeInitPlan(
       }
     }
   } finally {
-    await releaseWorkspaceSyncMutex(syncMutex);
+    if (ownsSyncMutex) await releaseWorkspaceSyncMutex(syncMutex);
   }
 
   // 6. Done — show how to bring another machine online (unless the caller, e.g.
