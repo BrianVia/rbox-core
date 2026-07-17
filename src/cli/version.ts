@@ -1,6 +1,6 @@
 /** The checked-in package version. The release workflow's consistency gate reads
  *  the first quoted string in this file, so keep this literal first. */
-const CHECKED_IN_RBOX_VERSION = "1.7.1";
+const CHECKED_IN_RBOX_VERSION = "1.7.2";
 
 declare const __RBOX_DEV_VERSION__: string | undefined;
 
@@ -14,4 +14,3 @@ export function resolveRboxVersion(definedVersion: string | undefined): string {
  *  In a source checkout it stays the package.json version. Dev builds pass
  *  __RBOX_DEV_VERSION__ via `bun build --compile --define`. */
 export const RBOX_VERSION = resolveRboxVersion(typeof __RBOX_DEV_VERSION__ === "string" ? __RBOX_DEV_VERSION__ : undefined);
-

@@ -5,6 +5,14 @@ All notable changes to rbox are recorded here. The format follows
 `v*` git tags that trigger the CLI release build.
 
 ## [Unreleased]
+## [1.7.2] — 2026-07-17 — faster releases, same gates
+
+### Internal
+- Release builds now reuse the exact squash commit's successful main CI verdict
+  instead of rerunning the same suite a third time. Immutable release uploads
+  and verification run concurrently; signing, native smoke tests, rollback
+  protection, and sequential channel activation remain unchanged.
+
 ## [1.7.1] — 2026-07-17 — your sync history stops eating your storage
 
 ### Changed
