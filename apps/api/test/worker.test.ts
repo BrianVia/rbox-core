@@ -1180,7 +1180,9 @@ describe("worker integration (real DO + D1 + R2)", () => {
     // diagnostics_reports blocks fail-closed: only DEVICE principals can create reports, so a
     // "web shell" holding one is not the empty shell the destructive reclaim assumes.
     const COVERED = ["account_keys", "device_keys", "rosters", "account_key_states", "workspace_keys", "devices", "workspaces", "blob_refs", "uploads", "pairing_tokens", "device_auth", "clerk_users", "memberships", "device_notifications", "diagnostics_reports", "api_keys"];
-    const EXPECTED_CLEANED = ["users", "account_notify_prefs", "blob_ref_candidates"]; // shell-owned rows DELETEd on reclaim (not blockers); blob_ref_candidates = §33 transient GC marker
+    // shell-owned rows DELETEd on reclaim (not blockers); blob_ref_candidates = §33 transient
+    // GC marker; fairuse_* = design 149's derived scan ledger (rebuildable, cleaned on reclaim)
+    const EXPECTED_CLEANED = ["users", "account_notify_prefs", "blob_ref_candidates", "fairuse_scans", "fairuse_workspace_streams", "fairuse_root_membership", "fairuse_sha_last", "fairuse_materialize_refs", "fairuse_leases", "fairuse_account_queue"];
     // append-only forensic log (§3.4) + the design-37 deletion ledger — operational rows, never
     // reclaim state (a tombstoned account is already access-dead and gets hard-purged, not
     // link-reclaimed), so neither blocks reclaim.

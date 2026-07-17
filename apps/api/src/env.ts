@@ -49,6 +49,9 @@ export interface Env {
   /** Design 95 Phase-2 cron kill switch. Defaults to "1" in every deployed env;
    *  the platform-admin drain remains available while scheduled purge is disabled. */
   RBOX_GC_PURGE_DISABLED?: string;
+  /** Design 149 history-mutation rollout switch. Exact "1" disables retention
+   * and future fair-use floor dispatch while observe-only ledger scans continue. */
+  RBOX_HISTORY_PRUNE_DISABLED?: string;
   /** Design 103 Part A. When "1", the commit DO runs a cheap synchronous
    *  parent/epoch preflight (before sidecar/D1 I/O) and early-returns the same
    *  409 the final CAS would. Unset/"0" → today's behavior (no early return).

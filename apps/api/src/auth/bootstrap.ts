@@ -5,6 +5,7 @@ import { dbFor, dirDb } from "../db.js";
 import { pingNewAccount } from "../slackpipes.js";
 import { randomHex } from "./shared.js";
 import { mintDevice } from "./mint.js";
+import { fairUseQueueStatement } from "../fairuse.js";
 
 type BootstrapPlan = "solo" | "pro";
 
@@ -30,10 +31,12 @@ export async function bootstrap(req: Request, env: Env, ctx: Pick<ExecutionConte
   const userId = `user_${randomHex(8)}`;
   // origin='bootstrap' marks this as a crypto-anchored account (design 21 §3.2) — never
   // auto-reclaimable. cap_bytes is the materialized §23 hard-cap (kept in sync by the trigger).
-  await dbFor(env, accountId)
-    .prepare("INSERT INTO accounts (id, name, plan, origin, created_at, cap_bytes) VALUES (?, ?, ?, 'bootstrap', ?, ?)")
-    .bind(accountId, body.accountName ?? "account", plan, now, capBytesFor(plan))
-    .run();
+  const accountDb = dbFor(env, accountId);
+  await accountDb.batch([
+    accountDb.prepare("INSERT INTO accounts (id, name, plan, origin, created_at, cap_bytes) VALUES (?, ?, ?, 'bootstrap', ?, ?)")
+      .bind(accountId, body.accountName ?? "account", plan, now, capBytesFor(plan)),
+    fairUseQueueStatement(accountDb, accountId, now, "account_created"),
+  ]);
   // users/memberships are directory-plane (authenticate JOINs memberships, §32 §2).
   await dirDb(env).prepare("INSERT INTO users (id, account_id, created_at) VALUES (?, ?, ?)").bind(userId, accountId, now).run();
   await dirDb(env).prepare("INSERT INTO memberships (account_id, user_id, role) VALUES (?, ?, 'owner')").bind(accountId, userId).run();

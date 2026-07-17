@@ -6,6 +6,7 @@ import { isUniqueViolation, randomHex } from "./auth.js";
 import { repointBillingToAccount } from "./stripe.js";
 import { dbFor, dirDb } from "./db.js";
 import { ipKey, rateLimited } from "./ratelimit.js";
+import { fairUseQueueStatement } from "./fairuse.js";
 
 /**
  * Web↔CLI account linking (design 21). A two-phase bind attaches a live Clerk
@@ -245,7 +246,17 @@ export async function confirmLink(req: Request, env: Env, nowMs: number): Promis
       // alongside a blob_refs row (a COVERED blocker → br>0 fails judgeReclaimable), so this
       // is defensive (no-op on a truly-reclaimable shell), but clean it like the other shell
       // artifacts so no orphan GC marker survives reclaim. account-data plane (shell's shard).
-      dbFor(env, shell).prepare(`DELETE FROM blob_ref_candidates WHERE account_id = ? AND ${orphan}`).bind(shell, shell)
+      dbFor(env, shell).prepare(`DELETE FROM blob_ref_candidates WHERE account_id = ? AND ${orphan}`).bind(shell, shell),
+      // Design 149 §C2: the observe-only scan ledger is derived, rebuildable state —
+      // cleaned on reclaim like blob_ref_candidates, never a reclaim blocker. The
+      // replacement account is re-queued at its own insert site (unlinkAccount).
+      dbFor(env, shell).prepare(`DELETE FROM fairuse_materialize_refs WHERE account_id = ? AND ${orphan}`).bind(shell, shell),
+      dbFor(env, shell).prepare(`DELETE FROM fairuse_root_membership WHERE account_id = ? AND ${orphan}`).bind(shell, shell),
+      dbFor(env, shell).prepare(`DELETE FROM fairuse_sha_last WHERE account_id = ? AND ${orphan}`).bind(shell, shell),
+      dbFor(env, shell).prepare(`DELETE FROM fairuse_workspace_streams WHERE account_id = ? AND ${orphan}`).bind(shell, shell),
+      dbFor(env, shell).prepare(`DELETE FROM fairuse_scans WHERE account_id = ? AND ${orphan}`).bind(shell, shell),
+      dbFor(env, shell).prepare(`DELETE FROM fairuse_leases WHERE account_id = ? AND ${orphan}`).bind(shell, shell),
+      dbFor(env, shell).prepare(`DELETE FROM fairuse_account_queue WHERE account_id = ? AND ${orphan}`).bind(shell, shell)
     );
   }
   try {
@@ -351,6 +362,7 @@ export async function unlinkAccount(env: Env, p: Principal, nowMs: number): Prom
     // a 0 here would disable accounts_cap_guard (§30 codex BLOCKER 5). The 0016 AFTER INSERT
     // trigger is the catch-all backstop; this keeps the intent visible at the insert site.
     dbFor(env, newAcct).prepare("INSERT INTO accounts (id, name, plan, origin, created_at, cap_bytes) VALUES (?, 'web', 'none', 'web', ?, ?)").bind(newAcct, nowMs, 1),
+    fairUseQueueStatement(dbFor(env, newAcct), newAcct, nowMs, "account_created"),
     dirDb(env).prepare("INSERT INTO users (id, account_id, created_at) VALUES (?, ?, ?)").bind(newUser, newAcct, nowMs),
     dirDb(env).prepare("INSERT INTO memberships (account_id, user_id, role) VALUES (?, ?, 'owner')").bind(newAcct, newUser),
     dirDb(env).prepare("UPDATE clerk_users SET account_id = ?, user_id = ? WHERE clerk_user_id = ? AND account_id = ?").bind(newAcct, newUser, map.clerk_user_id, p.accountId),

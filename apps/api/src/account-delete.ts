@@ -388,6 +388,15 @@ async function finishD1(env: Env, accountId: string, clerkIds: string[], deviceI
     // markers (some referencing the blob_refs rows we just removed). Same treatment as the
     // account-link reclaim path (account-link.ts).
     data.prepare("DELETE FROM blob_ref_candidates WHERE account_id = ?").bind(a),
+    // Design 149 observe-only scan ledger. Child/working relations precede the
+    // epoch row; scheduler and deploy-floor metadata are global and survive.
+    data.prepare("DELETE FROM fairuse_materialize_refs WHERE account_id = ?").bind(a),
+    data.prepare("DELETE FROM fairuse_root_membership WHERE account_id = ?").bind(a),
+    data.prepare("DELETE FROM fairuse_sha_last WHERE account_id = ?").bind(a),
+    data.prepare("DELETE FROM fairuse_workspace_streams WHERE account_id = ?").bind(a),
+    data.prepare("DELETE FROM fairuse_scans WHERE account_id = ?").bind(a),
+    data.prepare("DELETE FROM fairuse_leases WHERE account_id = ?").bind(a),
+    data.prepare("DELETE FROM fairuse_account_queue WHERE account_id = ?").bind(a),
     data.prepare("DELETE FROM uploads WHERE account_id = ?").bind(a),
     data.prepare("DELETE FROM workspaces WHERE account_id = ?").bind(a),
     data.prepare("DELETE FROM diagnostics_reports WHERE account_id = ?").bind(a),
