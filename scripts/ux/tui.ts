@@ -10,6 +10,7 @@ interface Target { host: boolean; runId?: string }
 export type TuiArgs =
   | ({ command: "start"; session: string; home: string; cols: number; rows: number; child: string[] } & Target)
   | ({ command: "keys"; session: string; keys: string[]; slow: boolean } & Target)
+  | ({ command: "paste-buffer"; session: string } & Target)
   | ({ command: "screen"; session: string; strip: boolean } & Target)
   | ({ command: "wait-idle"; session: string; timeout: number } & Target)
   | ({ command: "stop"; session: string } & Target);
@@ -68,6 +69,11 @@ export function parseTuiArgs(argv: string[]): TuiArgs {
     if (!p.positional.length) usage("keys requires at least one key or text token");
     return { command, session: sessionName(p.map.get("--session")), keys: p.positional, slow: p.map.has("--slow"), ...target(p.map) };
   }
+  if (command === "paste-buffer") {
+    const p = parsedOptions(rest, new Set(commonValues), new Set(["--host"]));
+    if (p.positional.length) usage(`unexpected argument: ${p.positional[0]}`);
+    return { command, session: sessionName(p.map.get("--session")), ...target(p.map) };
+  }
   if (command === "screen") {
     const p = parsedOptions(rest, new Set(commonValues), new Set(["--strip", "--host"]));
     if (p.positional.length) usage(`unexpected argument: ${p.positional[0]}`);
@@ -109,8 +115,8 @@ export function tmuxStartArgs(session: string, home: string, cols: number, rows:
   return ["new-session", "-d", "-E", "-s", session, "-x", String(cols), "-y", String(rows), "-c", home, ...injected, "--", renderRetainedCommand(child)];
 }
 
-async function tmuxHost(args: string[], capture = false): Promise<string> {
-  const child = Bun.spawn(["tmux", ...args], { stdout: "pipe", stderr: "pipe" });
+async function tmuxHost(args: string[], capture = false, stdin?: string): Promise<string> {
+  const child = Bun.spawn(["tmux", ...args], { stdin: stdin === undefined ? "ignore" : new TextEncoder().encode(stdin), stdout: "pipe", stderr: "pipe" });
   const [stdout] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).arrayBuffer()]);
   const exit = await child.exited; if (exit !== 0) throw new Error(`tmux ${args[0] ?? "command"} failed (exit ${exit}); child output suppressed`);
   return capture ? stdout : "";
@@ -122,9 +128,9 @@ export function containerTmuxPlan(runId: string, args: string[], home?: string):
   return { name: uxContainerName(id), cmd: ["tmux", ...args], ...(home ? { home, env: containerRboxEnv(home) } : {}) };
 }
 
-async function tmuxContainer(runId: string, args: string[], capture = false, home?: string): Promise<string> {
+async function tmuxContainer(runId: string, args: string[], capture = false, home?: string, stdin?: string): Promise<string> {
   const plan = containerTmuxPlan(runId, args, home);
-  const result = await execUx(runId, plan.cmd, { home: plan.home, env: plan.env, allowFail: true });
+  const result = await execUx(runId, plan.cmd, { home: plan.home, env: plan.env, stdin, allowFail: true });
   if (result.exitCode !== 0) throw new Error(`tmux ${args[0] ?? "command"} failed (exit ${result.exitCode}); child output suppressed`);
   return capture ? result.stdout : "";
 }
@@ -149,16 +155,30 @@ async function sendKeys(args: Extract<TuiArgs, { command: "keys" }>, invoke: (ar
   }
 }
 
+export async function pasteBuffer(
+  session: string,
+  value: string,
+  invoke: (argv: string[], stdin?: string) => Promise<string>,
+): Promise<void> {
+  const buffer = `rbox-${session}`;
+  await invoke(["load-buffer", "-b", buffer, "-"], value);
+  await invoke(["paste-buffer", "-d", "-b", buffer, "-t", session]);
+}
+
 function printScreen(screen: string): void { process.stdout.write(screen.endsWith("\n") ? screen : `${screen}\n`); }
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {
   const args = parseTuiArgs(argv); const mode = executionMode(args.host); if (mode === "container") configureUxRuntime();
-  const invoke = (tmuxArgs: string[], capture = false, home?: string) => mode === "host" ? tmuxHost(tmuxArgs, capture) : tmuxContainer(args.runId!, tmuxArgs, capture, home);
+  const invoke = (tmuxArgs: string[], capture = false, home?: string, stdin?: string) => mode === "host" ? tmuxHost(tmuxArgs, capture, stdin) : tmuxContainer(args.runId!, tmuxArgs, capture, home, stdin);
   if (args.command === "start") {
     const home = mode === "host" ? await assertMachineHome(args.home) : (assertGuestMachineHome(args.home, args.runId), args.home);
     if (mode === "host") await assertNoAncestorWorkspace(home);
     await invoke(tmuxStartArgs(args.session, home, args.cols, args.rows, args.child), false, mode === "container" ? home : undefined);
   } else if (args.command === "keys") await sendKeys(args, (tmuxArgs) => invoke(tmuxArgs));
+  else if (args.command === "paste-buffer") {
+    const value = await new Response(Bun.stdin.stream()).text();
+    await pasteBuffer(args.session, value, (tmuxArgs, stdin) => invoke(tmuxArgs, false, undefined, stdin));
+  }
   else if (args.command === "screen") printScreen(args.strip ? stripTrailingBlankLines(await invoke(["capture-pane", "-p", "-t", args.session], true)) : await invoke(["capture-pane", "-p", "-t", args.session], true));
   else if (args.command === "wait-idle") {
     const result = await waitForStable(args.timeout, { capture: () => invoke(["capture-pane", "-p", "-t", args.session], true), sleep: Bun.sleep, now: Date.now }); printScreen(result.screen);

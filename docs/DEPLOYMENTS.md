@@ -73,7 +73,8 @@ remain tag-driven and are unaffected by the branch promotion model.
 
 Release flow: bump `package.json` version + `CHECKED_IN_RBOX_VERSION`
 (`src/cli/version.ts`, first quoted string is read by the workflow's
-consistency gate), commit `release: vX.Y.Z — …` on main, tag `v*`, push.
+consistency gate), commit `release: vX.Y.Z — …` on main, run
+`bun scripts/ux/regress.ts` before tagging, tag `v*`, push.
 Fleet upgrade after the run goes green:
 `curl -fsSL https://rbox.to/install.sh | sh` then `rbox stop && rbox start`
 (run from inside the workspace; binary at `~/.rbox/bin/rbox`).

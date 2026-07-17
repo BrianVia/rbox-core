@@ -75,6 +75,9 @@ harness is the keyboard and screen.
 ## Per-flow protocol
 
 1. Mint machines (`--enrolled` for `a` where the scenario needs an owner).
+   Enrolled creation defaults to the `solo` plan; inherit that default unless
+   the scenario explicitly needs a planless account, in which case pass
+   `--plan none`. Never pass `--plan` without `--enrolled`.
 2. Before EVERY keystroke: write one line of expectation ("I expect this menu
    to tell me where the token comes from").
 3. Act only on what the captured screen says. Reading rbox source or docs is
