@@ -73,10 +73,17 @@ const EMPTY_MANIFEST: Manifest = { generatedAt: "", files: [] };
 /** Design 84's rollout flags form a capability LATTICE, not independent axes:
  *  C2 (delta) implies C1 (snapshot envelopes) implies meta collection. Encoded
  *  once here — flag reads stay point-of-use per repo convention, the derived
- *  implication does not. */
+ *  implication does not.
+ *
+ *  Snapshot writing is DEFAULT-ON since v1.7.1: Phase B readers have shipped
+ *  in every release since v1.1.0 and the live device inventory was verified
+ *  ≥ that floor before the flip (2026-07-17). RBOX_MDE_SNAPSHOT=0 is the
+ *  kill-switch for a fleet that must write raw-v0 for a lagging reader; the
+ *  design-149 minReaderVersion gate replaces this manual check before wider
+ *  distribution. Delta remains opt-in until its own default flip. */
 function mdeWriteCaps(): { delta: boolean; snapshot: boolean } {
   const delta = process.env.RBOX_MDE_DELTA === "1";
-  return { delta, snapshot: delta || process.env.RBOX_MDE_SNAPSHOT === "1" };
+  return { delta, snapshot: delta || process.env.RBOX_MDE_SNAPSHOT !== "0" };
 }
 
 export function blobRefsForManifest(manifest: Manifest): Array<{ encSha: string; size: number }> | null {
