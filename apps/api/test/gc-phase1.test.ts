@@ -504,12 +504,33 @@ describe("§33 per-account fail-closed (one broken DO must not reclaim another a
     await expect(perAccountReachable(envBroken, "bad")).rejects.toThrow();
     expect([...(await perAccountReachable(envBroken, "good"))]).toEqual([]);
 
+    const successLog = vi.spyOn(console, "log").mockImplementation(() => {});
     const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       const res = (await runPhase1(envBroken, HOUR, NOW).then((r) => r.json())) as { processed: number; failed: number; marked: number };
       expect(res).toMatchObject({ processed: 1, failed: 1, marked: 1 });
-      expect(errorLog).toHaveBeenCalledWith(expect.stringContaining('"event":"phase1_account_failed"'));
+      const outcomes = [...successLog.mock.calls, ...errorLog.mock.calls]
+        .map(([line]) => JSON.parse(String(line)) as Record<string, unknown>);
+      expect(outcomes).toHaveLength(2); // exactly one structured outcome per account/pass
+      expect(successLog).toHaveBeenCalledTimes(1);
+      expect(errorLog).toHaveBeenCalledTimes(1);
+      expect(outcomes).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          event: "phase1_account_outcome", outcome: "success", reachable: 0,
+          reachableCap: 750_000, reachableRemaining: 750_000, marked: 1,
+        }),
+        expect.objectContaining({
+          event: "phase1_account_outcome", outcome: "fail_closed", errorClass: "Error",
+        }),
+      ]));
+      for (const outcome of outcomes) {
+        expect(outcome.accountKey).toMatch(/^[0-9a-f]{16}$/);
+        expect(JSON.stringify(outcome)).not.toContain('"good"');
+        expect(JSON.stringify(outcome)).not.toContain('"bad"');
+      }
+      expect(new Set(outcomes.map((outcome) => outcome.accountKey)).size).toBe(2);
     } finally {
+      successLog.mockRestore();
       errorLog.mockRestore();
     }
 

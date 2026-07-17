@@ -1,5 +1,5 @@
 import { eq, type RouteCtx } from "./shared.js";
-import { json } from "../util.js";
+import { json, logErr } from "../util.js";
 import { isPlatform } from "../authz.js";
 import { retentionPrune } from "../retention.js";
 import { phase1Audit, runPhase1 } from "../gc-phase1.js";
@@ -10,14 +10,124 @@ import { multipartInventory } from "../multipart-inventory.js";
 import { adminPurgeWorkspace } from "../ws-purge.js";
 import { packGcMode, packTombstones, resweepPackTombstones } from "../blob-pack.js";
 import { runPackGc } from "../pack-gc.js";
+import { dbFor } from "../db.js";
+import type { Env } from "../env.js";
+
+interface InspectDroppedRow { sha: string; lastSeq: number }
+interface InspectSeqRootRow { seq: number; manifestSha: string; carrierSha?: string }
+interface InspectGapRow {
+  seq: number;
+  manifestSha: string;
+  carrierSha?: string;
+  inlineRefs?: string[];
+  chainRefs?: string[];
+  sidecar?: { sha: string; count: number; size: number };
+}
+interface InspectPage {
+  droppedPage: InspectDroppedRow[];
+  seqRootsPage: InspectSeqRootRow[];
+  gapPage: InspectGapRow[];
+  [key: string]: unknown;
+}
+
+const ROOTS_INSPECT_FORWARD_PARAMS = [
+  "fromSha", "fromSeq", "fromGapSeq", "pinHead", "pinFloor", "pinGen", "limit",
+] as const;
+
+/**
+ * Platform-only forwarding surface for the strictly read-only DO inspection path.
+ * Workspace/project stay in QUERY parameters so a project id containing "/" cannot
+ * be mistaken for route structure. Only the inspection cursor/pin vocabulary crosses
+ * the Worker→DO boundary; in particular, the mutating `/roots?rebuild=1` control does not.
+ *
+ * Retention currently derives its cutoff from the best-effort D1 `commits.created_at`
+ * mirror (`retention.ts`). Return the same timestamps as a sequence-keyed map alongside
+ * the unchanged DO page. A missing mirror row is explicit unavailability, never silently
+ * "not expired".
+ */
+export async function adminRootsInspect(env: Env, url: URL): Promise<Response> {
+  const ws = url.searchParams.get("ws") ?? "";
+  const proj = url.searchParams.get("proj") ?? "";
+  if (!ws || !proj) return json({ error: "bad_request", message: "ws and proj are required" }, 400);
+
+  const q = new URLSearchParams();
+  for (const name of ROOTS_INSPECT_FORWARD_PARAMS) {
+    const value = url.searchParams.get(name);
+    if (value !== null) q.set(name, value);
+  }
+  const id = env.WORKSPACE_SYNC.idFromName(`${ws}/${proj}`);
+  const inspectUrl = `https://do/roots-inspect${q.size ? `?${q}` : ""}`;
+  const inspected = await env.WORKSPACE_SYNC.get(id).fetch(inspectUrl, { method: "GET" });
+  if (!inspected.ok) return inspected;
+
+  let page: InspectPage;
+  try {
+    page = await inspected.json() as InspectPage;
+  } catch (e) {
+    logErr("roots_inspect_response_failed", e);
+    return json({ error: "index_unavailable", reason: "invalid_response" }, 503);
+  }
+  if (!Array.isArray(page.droppedPage) || !Array.isArray(page.seqRootsPage) || !Array.isArray(page.gapPage)) {
+    return json({ error: "index_unavailable", reason: "invalid_response" }, 503);
+  }
+
+  const sequences = [...new Set([
+    ...page.droppedPage.map((row) => Number(row.lastSeq)),
+    ...page.seqRootsPage.map((row) => Number(row.seq)),
+    ...page.gapPage.map((row) => Number(row.seq)),
+  ])];
+  if (sequences.some((seq) => !Number.isInteger(seq) || seq < 1)) {
+    return json({ error: "index_unavailable", reason: "invalid_response" }, 503);
+  }
+  if (sequences.length === 0) return json({ ...page, createdAtBySequence: {} });
+
+  try {
+    // Account-data lookup by secondary key is an explicit N=1 fan-out seam, matching
+    // the existing retention/global-GC callers until account sharding is introduced.
+    const owner = await dbFor(env, "")
+      .prepare("SELECT account_id FROM workspaces WHERE workspace_id = ? AND project_id = ?")
+      .bind(ws, proj)
+      .first<{ account_id: string }>();
+    if (!owner?.account_id) return json({ error: "timestamp_unavailable", missingSequences: sequences }, 503);
+
+    const times = new Map<number, number>();
+    const rows = await dbFor(env, owner.account_id)
+      .prepare(
+        "SELECT sequence,created_at FROM commits WHERE workspace_id = ? AND project_id = ? " +
+        "AND sequence IN (SELECT CAST(value AS INTEGER) FROM json_each(?))"
+      )
+      .bind(ws, proj, JSON.stringify(sequences))
+      .all<{ sequence: number; created_at: number }>();
+    for (const row of rows.results ?? []) {
+      const sequence = Number(row.sequence);
+      const createdAt = row.created_at == null ? Number.NaN : Number(row.created_at);
+      if (Number.isInteger(sequence) && Number.isFinite(createdAt) && createdAt > 0) times.set(sequence, createdAt);
+    }
+    const missing = sequences.filter((seq) => !times.has(seq));
+    if (missing.length > 0) {
+      return json({ error: "timestamp_unavailable", missingSequences: missing }, 503);
+    }
+    return json({
+      ...page,
+      createdAtBySequence: Object.fromEntries(sequences.map((sequence) => [String(sequence), times.get(sequence)!])),
+    });
+  } catch (e) {
+    logErr("roots_inspect_timestamp_failed", e);
+    return json({ error: "timestamp_unavailable", reason: "storage_unreadable" }, 503);
+  }
+}
 
 /**
  * Platform-admin surfaces. `gc`, `workspace/:id`, `account/:id/plan`, and the read-only
- * `multipart-inventory` require the PLATFORM secret (isPlatform); `overview` is
+ * `multipart-inventory` / `roots-inspect` require the PLATFORM secret (isPlatform); `overview` is
  * gated by a Cloudflare Access JWT + email allow-list INSIDE adminOverview
  * (defense in depth; NOT the rbox bearer) — so these routes sit BEFORE authenticate().
  */
 export async function adminRoutes({ req, env, url, seg }: RouteCtx): Promise<Response | null> {
+  if (req.method === "GET" && eq(seg, ["v1", "admin", "roots-inspect"])) {
+    if (!isPlatform(req, env)) return json({ error: "not_found" }, 404);
+    return adminRootsInspect(env, url);
+  }
   if (req.method === "GET" && eq(seg, ["v1", "admin", "delta-soak"])) {
     if (!isPlatform(req, env)) return json({ error: "not_found" }, 404);
     if (!env.CF_ANALYTICS_TOKEN || !env.CF_ACCOUNT_ID) return json({ error: "analytics_unavailable" }, 503);

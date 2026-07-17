@@ -126,3 +126,7 @@ jobs:
       - name: Test — apps/api (Workers)
         if: matrix.kind == 'checks-api'
         run: cd apps/api && npx vitest run
+
+      - name: Test — storage truth runner
+        if: matrix.kind == 'checks-api'
+        run: bun run test:storage-truth

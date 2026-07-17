@@ -1,7 +1,7 @@
 import type { Env } from "./env.js";
-import { json, logErr } from "./util.js";
+import { errClass, json, sha256Hex } from "./util.js";
 import { isOverCapAbort } from "./auth.js";
-import { reachableFromWorkspaces } from "./versions.js";
+import { MAX_UNIQUE_ROOTS, reachableFromWorkspaces } from "./versions.js";
 import { dbFor } from "./db.js";
 
 // Max rows per multi-row INSERT so bound params stay within D1's ≤100/statement limit
@@ -293,6 +293,9 @@ export async function runPhase1(env: Env, graceMs: number, nowMs: number = Date.
   const totals = { marked: 0, purged: 0, released: 0, resurrected: 0, condemned: 0 };
   for (const a of accts.results ?? []) {
     const accountId = a.id;
+    // Stable enough to correlate one account's future passes during an incident,
+    // without placing the raw account id in logs.
+    const accountKey = (await sha256Hex(accountId)).slice(0, 16);
     try {
       const reachable = await perAccountReachable(env, accountId); // fail-closed per account
       const db = dbFor(env, accountId);
@@ -305,11 +308,24 @@ export async function runPhase1(env: Env, graceMs: number, nowMs: number = Date.
       totals.resurrected += p.resurrected;
       totals.condemned += p.condemned;
       processed++;
+      console.log(JSON.stringify({
+        event: "phase1_account_outcome",
+        accountKey,
+        outcome: "success",
+        reachable: reachable.size,
+        reachableCap: MAX_UNIQUE_ROOTS,
+        reachableRemaining: MAX_UNIQUE_ROOTS - reachable.size,
+        marked: m.marked,
+        purged: p.purged,
+        released: p.released,
+        resurrected: p.resurrected,
+        condemned: p.condemned,
+      }));
     } catch (e) {
-      // Per-account fail-closed: one broken DO / transient error aborts only this
-      // account (no raw message — touches account/blob metadata). Retried next run.
+      // Exactly one outcome line per account/pass. Keep the stable pseudonymous key
+      // and error class, but never the raw account id, exception message, or stack.
       failed++;
-      logErr("phase1_account_failed", e);
+      console.error(JSON.stringify({ event: "phase1_account_outcome", accountKey, outcome: "fail_closed", errorClass: errClass(e) }));
     }
   }
   return json({ ok: true, accounts: accts.results?.length ?? 0, processed, failed, ...totals });

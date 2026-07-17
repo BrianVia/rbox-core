@@ -8,8 +8,7 @@ export interface PlanLimits {
   workspaces: number;
   projects: number;
   /** Days of version history retained. 0 = current state only (no history) — locked
-   *  accounts. NOTE: not yet ENFORCED — surfaced via /v1/account/usage but no
-   *  plan-driven prune runs it yet (see docs/design/06-versions-gc.md). */
+   *  accounts. Enforced by the scheduled authoritative-DO retention pass (design 66). */
   retentionDays: number;
   manifestBytes: number;
   /** Max durable (non-expiring) device credentials per account (design 64 §3.2). Ephemeral
