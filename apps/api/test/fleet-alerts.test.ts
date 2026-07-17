@@ -33,7 +33,7 @@ afterEach(() => {
 });
 
 function alertEnv(extra: Partial<Env> = {}): Env {
-  return { ...env, RBOX_ENV_LABEL: undefined, SLACKPIPES_WEBHOOK_URL: undefined, SLACKPIPES_ALERTS_WEBHOOK_URL: "https://hook.test/alerts", ...extra } as Env;
+  return { ...env, RBOX_ENV: "prod", RBOX_ENV_LABEL: undefined, SLACKPIPES_WEBHOOK_URL: undefined, SLACKPIPES_ALERTS_WEBHOOK_URL: "https://hook.test/alerts", ...extra } as Env;
 }
 
 function capture(status = 200): string[] {
@@ -100,8 +100,17 @@ describe("evaluateFleetAlerts state machine", () => {
   test("prefixes outbound messages with the configured environment label", async () => {
     const messages = capture();
     await sync();
-    await evaluateFleetAlerts(alertEnv({ RBOX_ENV_LABEL: "dev" }), NOW);
-    expect(messages).toEqual([expect.stringMatching(/^\[dev\] ⚠️ drift:/)]);
+    await evaluateFleetAlerts(alertEnv({ RBOX_ENV_LABEL: "staging" }), NOW);
+    expect(messages).toEqual([expect.stringMatching(/^\[staging\] ⚠️ drift:/)]);
+  });
+
+  test("dev deployments never page — sends suppressed, incident state still recorded", async () => {
+    const messages = capture();
+    await sync();
+    await evaluateFleetAlerts(alertEnv({ RBOX_ENV: "dev", RBOX_ENV_LABEL: "dev" }), NOW);
+    expect(messages).toEqual([]);
+    const row = await alertEnv().rbox_dev_db.prepare("SELECT COUNT(*) AS n FROM alert_state WHERE resolved_at IS NULL").first<{ n: number }>();
+    expect(row?.n).toBeGreaterThan(0);
   });
 
   test("renders bare outbound messages when the environment label is absent", async () => {
