@@ -33,6 +33,9 @@ export async function resolveAccountPlan(_env: Env, _accountId: string, storedPl
  * so the current version always survives regardless of the window.
  */
 export async function retentionPrune(env: Env, nowMs: number = Date.now()): Promise<Response> {
+  if (env.RBOX_HISTORY_PRUNE_DISABLED === "1") {
+    return json({ ok: true, disabled: true, workspaces: 0, inGrace: 0, pruned: 0, perWorkspace: [] });
+  }
   // §32 FLAG: retention enumerates `workspaces × accounts` across ALL accounts — an
   // account-data-plane CROSS-SHARD fan-out (design 32 §6c, daily cron fans out over
   // liveShards). Account-less at N=1 (the one shard); the per-workspace floor query below
@@ -48,14 +51,14 @@ export async function retentionPrune(env: Env, nowMs: number = Date.now()): Prom
   let inGrace = 0;
   const perWorkspace: Array<{ ws: string; proj: string; floor: number; pruned: number }> = [];
   for (const r of rows.results ?? []) {
+    const plan = await resolveAccountPlan(env, r.acct, r.plan);
     // Downgrade grace (design 13): while grace_until is in the future, retain ALL
     // history — skip pruning entirely. Only consulted when locked; paid plans keep
     // their own retentionDays regardless.
-    if (r.grace_until != null && nowMs < r.grace_until) {
+    if (plan === "none" && r.grace_until != null && nowMs < r.grace_until) {
       inGrace++;
       continue;
     }
-    const plan = await resolveAccountPlan(env, r.acct, r.plan);
     const days = planFor(plan).retentionDays;
     // The highest sequence whose commit is OLDER than the retention window is the
     // prune floor (everything ≤ floor is past retention). days=0 → cutoff = now →
