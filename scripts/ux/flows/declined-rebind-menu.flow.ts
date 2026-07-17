@@ -2,7 +2,7 @@ import { defineFlow } from "../flow.js";
 
 export default defineFlow({
   name: "declined-rebind-menu",
-  status: "pending-137",
+  status: "pass",
   machines: [{ name: "a", enrolled: true }],
   steps: [
     { on: "a", guest: "mkdir -p existing" },

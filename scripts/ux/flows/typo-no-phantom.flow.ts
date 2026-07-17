@@ -2,7 +2,7 @@ import { defineFlow } from "../flow.js";
 
 export default defineFlow({
   name: "typo-no-phantom",
-  status: "pending-137",
+  status: "pass",
   machines: [{ name: "a", enrolled: true }],
   steps: [
     { on: "a", tui: "setup" },

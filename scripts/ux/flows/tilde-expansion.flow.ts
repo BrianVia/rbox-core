@@ -2,7 +2,7 @@ import { defineFlow } from "../flow.js";
 
 export default defineFlow({
   name: "tilde-expansion",
-  status: "pending-137",
+  status: "pass",
   machines: [{ name: "a", enrolled: true }],
   steps: [
     { on: "a", guest: "mkdir -p proj" },
@@ -21,8 +21,10 @@ export default defineFlow({
       guest: "test -d '/tmp/rbox-ux/{{RUN_ID}}/{{MACHINE}}/proj' && ! test -e '/tmp/rbox-ux/{{RUN_ID}}/{{MACHINE}}/~'",
     },
     {
+      // status resolves the workspace from cwd, so the bound-root proof must run
+      // from inside proj — the machine exec prefix pins cwd to HOME.
       on: "a",
-      exec: ["status"],
+      guest: "cd '/tmp/rbox-ux/{{RUN_ID}}/{{MACHINE}}/proj' && rbox status",
       assertStdout: [/^workspace\s+.*@\s+\/tmp\/rbox-ux\/[^/\s]+\/a\/proj(?:\s|$)/m],
     },
   ],

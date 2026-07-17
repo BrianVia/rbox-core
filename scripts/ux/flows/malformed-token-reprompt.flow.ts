@@ -2,7 +2,7 @@ import { defineFlow } from "../flow.js";
 
 export default defineFlow({
   name: "malformed-token-reprompt",
-  status: "pending-137",
+  status: "pass",
   machines: [{ name: "a", enrolled: false }],
   steps: [
     { on: "a", tui: "setup" },
