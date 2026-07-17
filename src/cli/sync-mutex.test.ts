@@ -157,7 +157,7 @@ describe("design 93 §6 complete caller disposition drift gate", () => {
     expect(pushSource).not.toContain("acquireWorkspaceSyncMutex");
     expect(syncSource).not.toContain("acquireWorkspaceSyncMutex");
     expect(pushSource).toContain("await pull(root, cfg, deps)");
-    expect(syncSource).toContain("const pulled = await pull(root, cfg, deps)");
+    expect(syncSource).toContain("await pullWithMetadata(root, cfg, deps)");
     expect(syncSource).toContain("await push(root, cfg, deps)");
   });
 

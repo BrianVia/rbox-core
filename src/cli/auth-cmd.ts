@@ -29,11 +29,15 @@ export const EXISTING_ACCOUNT_ENROLLMENT_MESSAGE =
   "account already set up — enroll this machine with `rbox pair` from an enrolled machine, or run `rbox key recover`.";
 export const WORKSPACE_SYNC_NEXT_STEP =
   'Run `rbox setup` and choose "Sync an existing workspace" to get your existing folder syncing here.';
-const DEVICE_CODE_ENROLLMENT_NOTE = [
-  "note: device-code login authorized this machine, but encryption is not enrolled.",
-  "1. Run `rbox pair` on an enrolled machine or `rbox key recover`.",
-  `2. ${WORKSPACE_SYNC_NEXT_STEP}`,
-].join("\n");
+const DEVICE_CODE_NOTE_HEADER = "note: device-code login authorized this machine, but encryption is not enrolled.";
+const DEVICE_CODE_ENROLL_STEP = "Run `rbox pair` on an enrolled machine or `rbox key recover`.";
+/** Wizard mode omits the workspace step (the wizard itself chains there — design
+ *  137 R1) and drops the numbering so a single instruction reads as one. */
+export function deviceCodeEnrollmentNote(presentation: "standalone" | "wizard"): string {
+  return presentation === "wizard"
+    ? `${DEVICE_CODE_NOTE_HEADER}\n${DEVICE_CODE_ENROLL_STEP}`
+    : `${DEVICE_CODE_NOTE_HEADER}\n1. ${DEVICE_CODE_ENROLL_STEP}\n2. ${WORKSPACE_SYNC_NEXT_STEP}`;
+}
 const GENESIS_COMMAND = "rbox key genesis --yes";
 const HEADLESS_GENESIS_COMMAND_NOTE = `note: no encryption keys yet — run \`${GENESIS_COMMAND}\` to set up this first machine.`;
 const ENCRYPTION_ENROLLED_MESSAGE = "encryption enrolled — this workspace will be end-to-end encrypted.";
@@ -144,6 +148,7 @@ interface DeviceCodePostApprovalDeps {
   promptConfirm?: typeof promptConfirm;
   runGenesisEnrollment?: typeof runGenesisEnrollment;
   writeStderr?: (text: string) => void;
+  presentation?: AuthPresentationContext;
 }
 
 export type DeviceCodePostApprovalResult = "existing-keys" | "headless-command" | "declined" | "enrolled" | "already-setup";
@@ -166,8 +171,9 @@ export async function handleDeviceCodePostApprovalEncryption(
   const checkInteractive = deps.isInteractive ?? isInteractive;
   const confirm = deps.promptConfirm ?? promptConfirm;
   const enroll = deps.runGenesisEnrollment ?? runGenesisEnrollment;
+  const enrollmentNote = deviceCodeEnrollmentNote(deps.presentation === "wizard" ? "wizard" : "standalone");
   if (await api.getAccountKeys()) {
-    writeStderr(`${DEVICE_CODE_ENROLLMENT_NOTE}\n`);
+    writeStderr(`${enrollmentNote}\n`);
     return "existing-keys";
   }
 
@@ -187,17 +193,35 @@ export async function handleDeviceCodePostApprovalEncryption(
     console.log(ENCRYPTION_ENROLLED_MESSAGE);
     return "enrolled";
   }
-  writeStderr(`${DEVICE_CODE_ENROLLMENT_NOTE}\n`);
+  writeStderr(`${enrollmentNote}\n`);
   return "already-setup";
 }
 
 /** `rbox login [--bootstrap <secret>] [--plan <solo|pro>] [--label <text>]` — obtain a per-device token. */
-export async function login(remoteUrl: string, bootstrapSecret?: string, bootstrapPlan?: string, kitOpts: RecoveryKitOptions = NO_KIT, requestedLabel?: string): Promise<void> {
+export type AuthPresentationContext = "standalone" | "wizard";
+
+export function deviceApprovalUrl(userCode: string): string {
+  return `${process.env.RBOX_APP || PROD_WEB}/cli-login?code=${userCode}`;
+}
+
+interface LoginDeps {
+  redeemPair?: typeof redeemPair;
+}
+
+export async function login(
+  remoteUrl: string,
+  bootstrapSecret?: string,
+  bootstrapPlan?: string,
+  kitOpts: RecoveryKitOptions = NO_KIT,
+  requestedLabel?: string,
+  presentation: AuthPresentationContext = "standalone",
+  deps: LoginDeps = {}
+): Promise<void> {
   const label = requestedLabel?.trim() || os.hostname();
   // Headless pairing: redeem a token from the env (never argv — it's a bearer).
   const envPair = process.env.RBOX_PAIR_TOKEN;
   if (envPair) {
-    await redeemPair(remoteUrl, envPair, label);
+    await (deps.redeemPair ?? redeemPair)(remoteUrl, envPair, label, presentation);
     return;
   }
   if (bootstrapSecret) {
@@ -213,7 +237,7 @@ export async function login(remoteUrl: string, bootstrapSecret?: string, bootstr
     } else {
       console.error(EXISTING_ACCOUNT_ENROLLMENT_MESSAGE);
     }
-    console.log(WORKSPACE_SYNC_NEXT_STEP);
+    if (presentation === "standalone") console.log(WORKSPACE_SYNC_NEXT_STEP);
     return;
   }
 
@@ -223,7 +247,7 @@ export async function login(remoteUrl: string, bootstrapSecret?: string, bootstr
   // approve from any browser (laptop/phone, need not be this machine — the SSH case),
   // while keeping the terminal-to-terminal path for those who prefer it. Read RBOX_APP
   // at the call site so a test/override set after import still wins.
-  const approveUrl = `${process.env.RBOX_APP ?? PROD_WEB}/cli-login?code=${start.userCode}`;
+  const approveUrl = deviceApprovalUrl(start.userCode);
   console.log(`\nTo authorize this device, visit:\n`);
   console.log(`    ${approveUrl}\n`);
   console.log(`    (or run \`rbox device approve ${start.userCode}\` on an already-signed-in machine)`);
@@ -267,9 +291,10 @@ export async function login(remoteUrl: string, bootstrapSecret?: string, bootstr
         const enrollment = await handleDeviceCodePostApprovalEncryption(
           new RboxApi(remoteUrl, p.token, "", ""),
           { accountId: p.accountId, deviceId: p.deviceId },
-          kitOpts
+          kitOpts,
+          { presentation }
         );
-        if (deviceCodeLoginShouldPrintWorkspaceStep(enrollment)) {
+        if (presentation === "standalone" && deviceCodeLoginShouldPrintWorkspaceStep(enrollment)) {
           console.log(WORKSPACE_SYNC_NEXT_STEP);
         }
         return;
@@ -401,13 +426,20 @@ export async function pairCreate(): Promise<void> {
 
 /** Redeem a split-secret pairing token → device credential + E2EE enrollment.
  *  The full token is read from a prompt/stdin (never argv) and never logged. */
-export function pairingRedemptionSuccessMessages(deviceId: string): readonly [string, string] {
-  return [`device authorized + encryption enrolled: ${deviceId}`, WORKSPACE_SYNC_NEXT_STEP];
+export function pairingRedemptionSuccessMessages(deviceId: string, presentation: AuthPresentationContext = "standalone"): readonly string[] {
+  return presentation === "wizard"
+    ? [`device authorized + encryption enrolled: ${deviceId}`]
+    : [`device authorized + encryption enrolled: ${deviceId}`, WORKSPACE_SYNC_NEXT_STEP];
 }
 
-export async function redeemPair(remoteUrl: string, pairToken: string, label?: string): Promise<void> {
+export async function redeemPair(
+  remoteUrl: string,
+  pairToken: string,
+  label?: string,
+  presentation: AuthPresentationContext = "standalone"
+): Promise<void> {
   const { deviceId } = await enrollViaPairing(remoteUrl, pairToken.trim(), Date.now(), label);
-  for (const message of pairingRedemptionSuccessMessages(deviceId)) console.log(message);
+  for (const message of pairingRedemptionSuccessMessages(deviceId, presentation)) console.log(message);
 }
 
 interface PairingTokenInputDeps {

@@ -32,6 +32,8 @@ gate-artifacts/
 
 # rig test-bench run artifacts (design 56) — logs, reports, cached image hash
 scripts/rig/runs/
+# TUI regression-gate run artifacts (design 140)
+scripts/ux/runs/
 scripts/ux/.smoke-transcript.txt
 # Session-local artifacts — never commit (a git add -A once swept 400k lines of
 # agent worktrees + local scratch into a release commit, 2026-07-13).

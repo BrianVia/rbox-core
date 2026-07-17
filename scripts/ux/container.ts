@@ -202,11 +202,11 @@ export async function startUxContainerForTeardown(runId: string): Promise<{ plan
   return state;
 }
 
-export async function execUx(runId: string, cmd: string[], options: { home?: string; env?: Record<string, string>; allowFail?: boolean; allowStale?: boolean; redact?: string[] } = {}): Promise<C.RunResult> {
+export async function execUx(runId: string, cmd: string[], options: { home?: string; env?: Record<string, string>; stdin?: string; allowFail?: boolean; allowStale?: boolean; redact?: string[] } = {}): Promise<C.RunResult> {
   const state = await uxContainerState(runId);
   if (!state) throw new Error(`UX container is not running: ${uxContainerName(runId)}`);
   if (state.ownership !== "match" && !options.allowStale) throw new Error(`UX container specification is stale: recreate ${state.plan.name} after fresh-machine destroy`);
-  return C.exec({ name: state.plan.name, cmd, cwd: options.home, env: options.env, allowFail: options.allowFail, redact: options.redact });
+  return C.exec({ name: state.plan.name, cmd, cwd: options.home, env: options.env, stdin: options.stdin, allowFail: options.allowFail, redact: options.redact });
 }
 
 export async function destroyUxContainer(runId: string): Promise<void> {

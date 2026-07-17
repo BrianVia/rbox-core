@@ -12,12 +12,15 @@ import { assertNoAncestorWorkspace, DEV_API, executionMode, isolatedEnv, safeId,
 
 export { assertNoAncestorWorkspace, DEV_API, executionMode, isolatedEnv, safeId, SCRUBBED_ENV, UX_ROOT } from "./lib.js";
 
+export type BootstrapPlan = "solo" | "pro" | "none";
 export type FreshArgs =
-  | { command: "create"; name: string; enrolled: boolean; runId?: string; host: boolean }
+  | { command: "create"; name: string; enrolled: boolean; plan: BootstrapPlan; runId?: string; host: boolean }
   | { command: "destroy"; runId: string; name?: string; host: boolean }
-  | { command: "list"; host: boolean };
+  | { command: "list"; host: boolean }
+  | { command: "workspaces"; runId: string; name: string; host: boolean }
+  | { command: "workspaces-create"; runId: string; name: string; label: string; host: boolean };
 function failUsage(message: string): never {
-  throw new Error(`${message}\nusage: fresh-machine.ts create --name <name> [--enrolled] [--run-id <id>] [--host] | destroy --run-id <id> [--name <name>] [--host] | list [--host]`);
+  throw new Error(`${message}\nusage: fresh-machine.ts create --name <name> [--enrolled [--plan <solo|pro|none>]] [--run-id <id>] [--host] | destroy --run-id <id> [--name <name>] [--host] | list [--host] | workspaces --run-id <id> --name <name> [--host] | workspaces-create --run-id <id> --name <name> --label <label> [--host]`);
 }
 export function machineLabel(runId: string, name: string): string {
   return `ux-${safeId("run id", runId)}-${safeId("machine name", name)}`;
@@ -44,16 +47,31 @@ export function parseFreshArgs(argv: string[]): FreshArgs {
     return { command, host: o.has("--host") };
   }
   if (command === "create") {
-    const o = options(rest, new Set(["--name", "--enrolled", "--run-id", "--host"]), new Set(["--enrolled", "--host"]));
+    const o = options(rest, new Set(["--name", "--enrolled", "--plan", "--run-id", "--host"]), new Set(["--enrolled", "--host"]));
     const name = o.get("--name"); if (!name) failUsage("create requires --name");
     const runId = o.get("--run-id");
-    return { command, name: safeId("machine name", name), enrolled: o.has("--enrolled"), host: o.has("--host"), ...(runId ? { runId: safeId("run id", runId) } : {}) };
+    const enrolled = o.has("--enrolled"); const rawPlan = o.get("--plan");
+    if (rawPlan !== undefined && !enrolled) failUsage("--plan requires --enrolled");
+    if (rawPlan !== undefined && rawPlan !== "solo" && rawPlan !== "pro" && rawPlan !== "none") failUsage("--plan must be solo, pro, or none");
+    const plan: BootstrapPlan = enrolled ? (rawPlan as BootstrapPlan | undefined) ?? "solo" : "none";
+    return { command, name: safeId("machine name", name), enrolled, plan, host: o.has("--host"), ...(runId ? { runId: safeId("run id", runId) } : {}) };
   }
   if (command === "destroy") {
     const o = options(rest, new Set(["--run-id", "--name", "--host"]), new Set(["--host"]));
     const runId = o.get("--run-id"); if (!runId) failUsage("destroy requires --run-id");
     const name = o.get("--name");
     return { command, runId: safeId("run id", runId), host: o.has("--host"), ...(name ? { name: safeId("machine name", name) } : {}) };
+  }
+  if (command === "workspaces" || command === "workspaces-create") {
+    const allowed = command === "workspaces" ? new Set(["--run-id", "--name", "--host"]) : new Set(["--run-id", "--name", "--label", "--host"]);
+    const o = options(rest, allowed, new Set(["--host"]));
+    const runId = o.get("--run-id"); if (!runId) failUsage(`${command} requires --run-id`);
+    const name = o.get("--name"); if (!name) failUsage(`${command} requires --name`);
+    if (command === "workspaces-create") {
+      const label = o.get("--label"); if (!label) failUsage("workspaces-create requires --label");
+      return { command, runId: safeId("run id", runId), name: safeId("machine name", name), label, host: o.has("--host") };
+    }
+    return { command, runId: safeId("run id", runId), name: safeId("machine name", name), host: o.has("--host") };
   }
   return failUsage(command ? `unknown command: ${command}` : "missing command");
 }
@@ -113,13 +131,28 @@ function resolveSecret(): string {
   return resolveBootstrapSecret(repoRoot, { env: normalizedBootstrapEnv(process.env), readFile: (file) => { try { return fs.readFileSync(file, "utf8"); } catch { return undefined; } } });
 }
 
+export function bootstrapPlanArgs(plan: BootstrapPlan): string[] {
+  return plan === "none" ? [] : ["--plan", plan];
+}
+
+export function hostBootstrapLoginArgs(secret: string, label: string, plan: BootstrapPlan): string[] {
+  return ["login", "--bootstrap", secret, "--label", label, "--remote", DEV_API, ...bootstrapPlanArgs(plan)];
+}
+
+export function containerBootstrapLoginCommand(label: string, plan: BootstrapPlan): string[] {
+  return [
+    "sh", "-c", 'exec rbox login --bootstrap "$RBOX_UX_BOOTSTRAP" "$@"', "ux-login",
+    "--label", label, "--remote", DEV_API, ...bootstrapPlanArgs(plan),
+  ];
+}
+
 async function createHost(args: Extract<FreshArgs, { command: "create" }>, runId: string): Promise<void> {
   await ensureRoot(); const runDir = path.join(UX_ROOT, runId); await fsp.mkdir(runDir, { recursive: true, mode: 0o700 });
   if ((await fsp.lstat(runDir)).isSymbolicLink()) throw new Error(`run directory may not be a symlink: ${runDir}`);
   const home = path.join(runDir, args.name); await fsp.mkdir(home, { mode: 0o700 }); await assertMachineHome(home); await assertNoAncestorWorkspace(home);
   if (args.enrolled) await withFailureCleanup(async () => {
     const secret = resolveSecret();
-    await runHostRbox(home, ["login", "--bootstrap", secret, "--label", machineLabel(runId, args.name), "--remote", DEV_API], "DEV bootstrap login");
+    await runHostRbox(home, hostBootstrapLoginArgs(secret, machineLabel(runId, args.name), args.plan), "DEV bootstrap login");
     await runHostRbox(home, ["key", "genesis", "--yes"], "key genesis");
   }, () => teardownHost(home));
   process.stdout.write(`HOME=${home}\n${envPrefix(home)} …\n`);
@@ -131,7 +164,7 @@ async function createContainer(args: Extract<FreshArgs, { command: "create" }>, 
   await execUx(runId, ["mkdir", "-m", "700", "--", home]);
   if (args.enrolled) await withFailureCleanup(async () => {
     const secret = resolveSecret();
-    const login = await execUx(runId, ["sh", "-c", 'exec rbox login --bootstrap "$RBOX_UX_BOOTSTRAP" --label "$1" --remote "$2"', "ux-login", machineLabel(runId, args.name), DEV_API], { home, env: { ...containerRboxEnv(home), RBOX_UX_BOOTSTRAP: secret }, allowFail: true, redact: [secret] });
+    const login = await execUx(runId, containerBootstrapLoginCommand(machineLabel(runId, args.name), args.plan), { home, env: { ...containerRboxEnv(home), RBOX_UX_BOOTSTRAP: secret }, allowFail: true, redact: [secret] });
     if (login.exitCode !== 0) throw childFailure("DEV bootstrap login", login.exitCode);
     await runGuestRbox(runId, home, ["key", "genesis", "--yes"], "key genesis");
   }, () => teardownGuest(runId, home));
@@ -166,6 +199,66 @@ function safeWarning(error: unknown): void {
   let message = error instanceof Error ? error.message : String(error);
   message = redactSecret(redactSecret(message, process.env.RBOX_DEV_BOOTSTRAP), process.env.RBOX_DEV_BOOTSTRAP_SECRET);
   process.stderr.write(`warning: ${message}\n`);
+}
+
+type FetchFn = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
+
+export function storedWorkspaceCredentials(raw: string): { remote: string; token: string } {
+  const parsed = JSON.parse(raw) as { remoteUrl?: unknown };
+  const remote = typeof parsed.remoteUrl === "string" ? parsed.remoteUrl : "missing credential remote";
+  assertDevRemote(remote);
+  return { remote, token: readCredentials(raw).token };
+}
+
+export async function listWorkspaceIds(remote: string, token: string, fetchFn: FetchFn = fetch): Promise<string[]> {
+  assertDevRemote(remote);
+  const ids: string[] = []; let cursor: string | null = null;
+  do {
+    const url = new URL("/v1/account/workspaces", remote);
+    url.searchParams.set("limit", "100");
+    if (cursor) url.searchParams.set("cursor", cursor);
+    const response = await fetchFn(url, { headers: { authorization: `Bearer ${token}` } });
+    if (!response.ok) throw new Error(`workspace list failed (HTTP ${response.status}); response body suppressed`);
+    const body = await response.json() as { workspaces?: unknown; nextCursor?: unknown };
+    if (!Array.isArray(body.workspaces) || !body.workspaces.every((row) => row && typeof row === "object" && typeof (row as { workspaceId?: unknown }).workspaceId === "string")) {
+      throw new Error("workspace list returned an invalid response");
+    }
+    ids.push(...body.workspaces.map((row) => (row as { workspaceId: string }).workspaceId));
+    if (body.nextCursor !== null && body.nextCursor !== undefined && typeof body.nextCursor !== "string") throw new Error("workspace list returned an invalid cursor");
+    cursor = typeof body.nextCursor === "string" && body.nextCursor ? body.nextCursor : null;
+  } while (cursor);
+  return ids;
+}
+
+export async function createWorkspaceFixture(remote: string, token: string, label: string, fetchFn: FetchFn = fetch): Promise<string> {
+  assertDevRemote(remote);
+  const url = new URL("/v1/workspaces", remote);
+  url.searchParams.set("project", "root");
+  url.searchParams.set("name", label);
+  const response = await fetchFn(url, { method: "POST", headers: { authorization: `Bearer ${token}` } });
+  if (!response.ok) throw new Error(`workspace create failed (HTTP ${response.status}); response body suppressed`);
+  const body = await response.json() as { workspaceId?: unknown };
+  if (typeof body.workspaceId !== "string" || !body.workspaceId) throw new Error("workspace create returned an invalid response");
+  return body.workspaceId;
+}
+
+async function workspaceCredentialsForMachine(args: { runId: string; name: string }, mode: "host" | "container"): Promise<{ remote: string; token: string }> {
+  const home = mode === "host" ? await assertMachineHome(path.join(UX_ROOT, args.runId, args.name)) : guestMachineHome(args.runId, args.name);
+  const file = mode === "host"
+    ? await readRegularFile(path.join(home, ".rbox", "credentials.json"))
+    : (await execUx(args.runId, ["cat", "--", path.posix.join(home, ".rbox", "credentials.json")], { allowFail: true })).stdout;
+  return storedWorkspaceCredentials(file);
+}
+
+async function runWorkspaceHelper(args: Extract<FreshArgs, { command: "workspaces" | "workspaces-create" }>, mode: "host" | "container"): Promise<void> {
+  const creds = await workspaceCredentialsForMachine(args, mode);
+  if (args.command === "workspaces") {
+    const ids = await listWorkspaceIds(creds.remote, creds.token);
+    process.stdout.write(`count=${ids.length}\n${ids.map((id) => `${id}\n`).join("")}`);
+  } else {
+    const workspaceId = await createWorkspaceFixture(creds.remote, creds.token, args.label);
+    process.stdout.write(`workspaceId=${workspaceId}\n`);
+  }
 }
 
 async function teardownHost(home: string): Promise<void> {
@@ -238,6 +331,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   if (mode === "container") configureUxRuntime();
   if (args.command === "create") { const runId = args.runId ?? randomBytes(4).toString("hex"); await (mode === "host" ? createHost(args, runId) : createContainer(args, runId)); }
   else if (args.command === "destroy") await (mode === "host" ? destroyHost(args) : destroyContainer(args));
+  else if (args.command === "workspaces" || args.command === "workspaces-create") await runWorkspaceHelper(args, mode);
   else if (mode === "host") await listHost(); else { const listed = await listUxContainers(); if (listed) process.stdout.write(`${listed}\n`); }
 }
 

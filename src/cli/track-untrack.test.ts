@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { track } from "./track-cmd.js";
 import { untrack } from "./untrack-cmd.js";
-import { findRoot, loadConfig } from "./config.js";
+import { findRoot, loadConfig, saveConfig } from "./config.js";
 import { daemonRuntimeDir } from "./daemon-control.js";
 import { desiredStatePath } from "./autostart-cmd.js";
 
@@ -191,4 +191,38 @@ test("track refuses a foreign state lineage even when workspace config is absent
   await expect(track(dir, { workspace: "ws_new" }, "https://api.test")).rejects.toThrow(/without setup confirmation/);
   expect(await fs.readFile(statePath, "utf8")).toBe(bytes);
   await expect(fs.access(path.join(dir, ".rbox", "workspace.json"))).rejects.toThrow();
+});
+
+test("track rechecks lineage under the mutex instead of waiving a raced rebind from a stale snapshot", async () => {
+  await track(dir, { workspace: "ws_A" }, "https://api.test");
+  const statePath = path.join(dir, ".rbox", "state.json");
+  const state = (workspaceId: string) => JSON.stringify({
+    stream: `https://api.test::${workspaceId}::root`,
+    stateNonce: "0123456789abcdef0123456789abcdef",
+    stateRevision: 2,
+    lastSyncedSequence: 1,
+    lastSyncedManifest: { generatedAt: "", files: [] },
+  });
+  await fs.writeFile(statePath, state("ws_A"));
+
+  await expect(track(dir, {}, "https://api.test", {
+    isInteractive: () => true,
+    promptSelect: async () => "existing",
+    promptWorkspacePick: async () => {
+      await saveConfig(dir, {
+        schema: "e2ee/v1",
+        remoteWorkspaceId: "ws_B",
+        projectId: "root",
+        deviceId: "dev_B",
+        rootPath: dir,
+        remoteUrl: "https://api.test",
+        token: "",
+      });
+      await fs.writeFile(statePath, state("ws_B"));
+      return { workspaceId: "ws_A" };
+    },
+  })).rejects.toThrow(/without setup confirmation/);
+
+  expect((await loadConfig(dir)).remoteWorkspaceId).toBe("ws_B");
+  expect(JSON.parse(await fs.readFile(statePath, "utf8")).stream).toBe("https://api.test::ws_B::root");
 });

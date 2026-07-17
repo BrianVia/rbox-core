@@ -5,6 +5,35 @@ All notable changes to rbox are recorded here. The format follows
 `v*` git tags that trigger the CLI release build.
 
 ## [Unreleased]
+## [1.6.9] — 2026-07-17 — the wizard forgives your typos
+
+### Fixed
+- **`~/paths` work in the setup wizard** (design 137). Typing `~/proj` at the
+  directory prompt now means your home directory instead of creating a literal
+  folder named `~`. Unsupported forms like `~user/…` explain themselves and ask
+  again.
+- **A typo can no longer create a workspace you didn't want.** The wizard shows
+  the resolved absolute path before anything happens, asks before creating a
+  directory that doesn't exist, and doesn't touch the server until the local
+  side is confirmed and locked. If something fails after a workspace was
+  created, you get its id and the exact way to resume — never a mystery orphan.
+- **Mistakes keep you in the wizard.** Bad paths and malformed pairing tokens
+  re-prompt (tokens are checked locally before any network call); a mistyped
+  24-word recovery phrase is caught offline; blank input navigates back;
+  declining "create a new workspace anyway?" returns to the menu with your
+  sign-in intact. A used-up token now says to mint a fresh one on your other
+  machine.
+
+### Changed
+- Clearer first-run copy: joining a workspace nobody has pushed to says
+  "nothing was available to pull" instead of "0 pulled, 0 conflict(s)"; the
+  workspace-id prompt says where to find the id; the sign-up prompt no longer
+  doubles as a mystery masked-secret field; the approve screen always shows
+  the full URL; the authorize menu points lost-device users at recovery.
+- Releases are now gated by a deterministic TUI regression suite that drives
+  the real wizard in containers — the six defects above are permanently
+  guarded by it.
+
 ## [1.6.8] — 2026-07-16 — zombie branches rest in peace
 
 ### Fixed

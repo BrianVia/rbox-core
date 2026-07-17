@@ -1,7 +1,7 @@
 export { pushMassDeleteTrips, makeDeferErrnoReporter, filesFirstFlagEnabled } from "./sync/policy.js";
 export { formatLatestTimings, formatApplyStats } from "./sync/format.js";
 export { type SyncDeps } from "./sync/deps.js";
-export { scanManifestForPush, pull, applyPulledManifest } from "./sync/pull.js";
+export { scanManifestForPush, pull, pullWithMetadata, applyPulledManifest } from "./sync/pull.js";
 export {
   push,
   pushManifest,
