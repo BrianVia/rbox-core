@@ -5,6 +5,18 @@ All notable changes to rbox are recorded here. The format follows
 `v*` git tags that trigger the CLI release build.
 
 ## [Unreleased]
+## [1.7.1] — 2026-07-17 — your sync history stops eating your storage
+
+### Changed
+- **Every sync now stores a compressed snapshot of your workspace index
+  instead of a full raw copy — about 24× smaller.** For active workspaces
+  this was the dominant storage cost: each sync stored a complete
+  multi-megabyte index even when almost nothing changed, and version
+  history kept every copy. New syncs write the compact format; existing
+  history is unaffected and remains fully readable. All supported rbox
+  versions (v1.1.0+) read both formats. Set `RBOX_MDE_SNAPSHOT=0` to
+  temporarily restore the old format if you run a pre-v1.1.0 device.
+
 ## [1.7.0] — 2026-07-17 — consent before reset, recovery at scale
 
 ### Changed
