@@ -17,6 +17,8 @@
  */
 import { select, input, confirm, password, search } from "@inquirer/prompts";
 import { ExitPromptError } from "@inquirer/core";
+import os from "node:os";
+import path from "node:path";
 
 const STDERR = { output: process.stderr } as const;
 const CANCEL_EXIT = 130; // SIGINT convention; matches the retired readSecret
@@ -60,3 +62,42 @@ export const promptInput = (cfg: Parameters<typeof input>[0]) => run(input(cfg, 
 export const promptConfirm = (cfg: Parameters<typeof confirm>[0]) => run(confirm(cfg, STDERR));
 /** mask:false = no echo, matching the old raw-mode readSecret (bearer secrets). */
 export const promptPassword = (cfg: Parameters<typeof password>[0]) => run(password({ mask: false, ...cfg }, STDERR));
+
+export class UnsupportedPathError extends Error {
+  constructor() {
+    super("~user paths aren't supported — use an absolute path");
+    this.name = "UnsupportedPathError";
+  }
+}
+
+/** Expand the complete leading-tilde grammar accepted by interactive path prompts. */
+export function expandUserPath(raw: string, home = os.homedir()): string {
+  if (raw === "~") return home;
+  if (raw.startsWith("~/")) return path.join(home, raw.slice(2));
+  if (raw.startsWith("~")) throw new UnsupportedPathError();
+  return raw;
+}
+
+type PromptInput = typeof promptInput;
+
+/** Prompt for an interactive path, resolving it against the caller's injected cwd. */
+export async function promptPath(opts: {
+  message: string;
+  default?: string;
+  cwd: string;
+  /** Test/embedding seams; production callers use the shared prompt and stderr. */
+  input?: PromptInput;
+  writeStderr?: (text: string) => void;
+}): Promise<string> {
+  const ask = opts.input ?? promptInput;
+  const writeStderr = opts.writeStderr ?? ((text: string) => process.stderr.write(text));
+  for (;;) {
+    const raw = (await ask({ message: opts.message, ...(opts.default !== undefined ? { default: opts.default } : {}) })).trim();
+    try {
+      return path.resolve(opts.cwd, expandUserPath(raw));
+    } catch (error) {
+      if (!(error instanceof UnsupportedPathError)) throw error;
+      writeStderr(`${error.message}\n`);
+    }
+  }
+}

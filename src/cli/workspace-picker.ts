@@ -122,6 +122,39 @@ export interface WorkspacePick {
   name?: string;
 }
 
+export type WorkspaceListResult =
+  | { kind: "listed"; rows: AccountWorkspace[] }
+  | { kind: "empty" }
+  | { kind: "failed" };
+
+export type SetupWorkspacePickResult =
+  | { kind: "picked"; pick: WorkspacePick }
+  | { kind: "back" }
+  | { kind: "empty-account" };
+
+/** Presentation-free account-workspace fetch layer. */
+export async function fetchWorkspaceList(opts: {
+  baseUrl: string;
+  token?: string;
+  fetchWorkspaces?: typeof fetchAccountWorkspaces;
+}): Promise<WorkspaceListResult> {
+  if (!opts.token) return { kind: "failed" };
+  try {
+    const rows = sortWorkspacesForPick(await (opts.fetchWorkspaces ?? fetchAccountWorkspaces)(opts.baseUrl, opts.token));
+    return rows.length ? { kind: "listed", rows } : { kind: "empty" };
+  } catch {
+    return { kind: "failed" };
+  }
+}
+
+interface WorkspacePickerDeps {
+  fetchList?: typeof fetchWorkspaceList;
+  promptInput?: (typeof import("./prompt.js"))["promptInput"];
+  promptSelect?: (typeof import("./prompt.js"))["promptSelect"];
+  promptSearch?: (typeof import("./prompt.js"))["promptSearch"];
+  writeStderr?: (text: string) => void;
+}
+
 /**
  * Pick a workspace to track from the account's synced list, by NAME — the
  * "paste an id" replacement. The ONLY picker fn that touches inquirer.
@@ -136,23 +169,52 @@ export interface WorkspacePick {
  *
  * Callers MUST gate on `isInteractive()` — inquirer requires a TTY.
  */
+export function promptWorkspacePick(opts: {
+  baseUrl: string;
+  token?: string;
+  nowMs?: number;
+  mode: "setup";
+  deps?: WorkspacePickerDeps;
+}): Promise<SetupWorkspacePickResult>;
+export function promptWorkspacePick(opts: {
+  baseUrl: string;
+  token?: string;
+  nowMs?: number;
+  mode: "legacy";
+  deps?: WorkspacePickerDeps;
+}): Promise<WorkspacePick | undefined>;
 export async function promptWorkspacePick(opts: {
   baseUrl: string;
   token?: string;
   nowMs?: number;
-}): Promise<WorkspacePick | undefined> {
+  mode: "setup" | "legacy";
+  deps?: WorkspacePickerDeps;
+}): Promise<SetupWorkspacePickResult | WorkspacePick | undefined> {
   const nowMs = opts.nowMs ?? Date.now();
-  const { promptInput, promptSelect, promptSearch } = await import("./prompt.js");
+  const prompts = await import("./prompt.js");
+  const promptInput = opts.deps?.promptInput ?? prompts.promptInput;
+  const promptSelect = opts.deps?.promptSelect ?? prompts.promptSelect;
+  const promptSearch = opts.deps?.promptSearch ?? prompts.promptSearch;
+  const writeStderr = opts.deps?.writeStderr ?? ((text: string) => process.stderr.write(text));
+  const outcome = await (opts.deps?.fetchList ?? fetchWorkspaceList)({ baseUrl: opts.baseUrl, token: opts.token });
 
-  let sorted: AccountWorkspace[] = [];
-  if (opts.token) {
-    try {
-      sorted = sortWorkspacesForPick(await fetchAccountWorkspaces(opts.baseUrl, opts.token));
-    } catch {
-      // offline / non-2xx → fall through to manual entry (graceful degradation).
+  if (outcome.kind === "failed") {
+    if (opts.mode === "setup") {
+      writeStderr("can't list workspaces right now\n");
+      const pick = await setupManualEntry(promptInput);
+      return pick ? { kind: "picked", pick } : { kind: "back" };
     }
+    return legacyManualEntry(promptInput);
   }
-  if (sorted.length === 0) return manualEntry(promptInput);
+  if (outcome.kind === "empty") {
+    if (opts.mode === "setup") {
+      writeStderr("no workspaces on this account yet\n");
+      return { kind: "empty-account" };
+    }
+    return legacyManualEntry(promptInput);
+  }
+
+  const sorted = outcome.rows;
 
   const choices = buildWorkspaceChoices(sorted, nowMs);
   let chosen: string;
@@ -167,19 +229,36 @@ export async function promptWorkspacePick(opts: {
       source: (term) => [...filterWorkspaceChoices(choices, term), MANUAL_CHOICE],
     });
   }
-  if (chosen === MANUAL) return manualEntry(promptInput);
+  if (chosen === MANUAL) {
+    if (opts.mode === "setup") {
+      const pick = await setupManualEntry(promptInput);
+      return pick ? { kind: "picked", pick } : { kind: "back" };
+    }
+    return legacyManualEntry(promptInput);
+  }
   // Carry the picked workspace's server name so callers cache the label locally.
-  return { workspaceId: chosen, name: sorted.find((w) => w.workspaceId === chosen)?.name ?? undefined };
+  const pick = { workspaceId: chosen, name: sorted.find((w) => w.workspaceId === chosen)?.name ?? undefined };
+  return opts.mode === "setup" ? { kind: "picked", pick } : pick;
 }
 
 /** The kept manual-id fallback: cross-account / already-known ids. Blank → undefined.
  *  No name is known this way (status falls back to the id). Takes `promptInput` from
  *  the lazily-imported wrapper so this module stays inquirer-free until
  *  `promptWorkspacePick` actually runs. */
-async function manualEntry(
+async function legacyManualEntry(
   promptInput: (typeof import("./prompt.js"))["promptInput"]
 ): Promise<WorkspacePick | undefined> {
   const id = (await promptInput({ message: "Workspace id to sync" })).trim();
+  return id ? { workspaceId: id } : undefined;
+}
+
+/** Setup-only two-blank navigation. Nonblank ids remain a one-shot server join. */
+async function setupManualEntry(
+  promptInput: (typeof import("./prompt.js"))["promptInput"]
+): Promise<WorkspacePick | undefined> {
+  let id = (await promptInput({ message: "Workspace id to sync (find it with `rbox list` on an enrolled machine)" })).trim();
+  if (id) return { workspaceId: id };
+  id = (await promptInput({ message: "Enter a workspace id, or leave blank again to go back" })).trim();
   return id ? { workspaceId: id } : undefined;
 }
 

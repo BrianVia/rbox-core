@@ -1192,10 +1192,26 @@ test("sync = pull then push in one call", async () => {
   const remote = new FakeRemote();
   remote.injectCommit([await remote.seedEntry("r.txt", "remote\n")]);
   await write("local.txt", "local\n");
-  const { pulled, pushedSequence } = await sync(root, cfg, deps(remote));
+  const { pulled, pushedSequence, initialRemoteSequence } = await sync(root, cfg, deps(remote));
   expect(pulled.some((a) => a.kind === "write")).toBe(true); // pulled r.txt
   expect(await read("r.txt")).toBe("remote\n");
   expect(pushedSequence).toBe(remote.headSeq()); // pushed local.txt on top
+  expect(initialRemoteSequence).toBe(1);
+});
+
+test("sync preserves pull-time sequence zero even when the same cycle pushes", async () => {
+  const remote = new FakeRemote();
+  await write("local-genesis.txt", "local\n");
+  const result = await sync(root, cfg, deps(remote));
+  expect(result.initialRemoteSequence).toBe(0);
+  expect(result.pushedSequence).toBeGreaterThan(0);
+});
+
+test("empty manifest at a nonzero sequence is not classified as genesis", async () => {
+  const remote = new FakeRemote();
+  remote.injectCommit([]);
+  const result = await sync(root, cfg, deps(remote));
+  expect(result.initialRemoteSequence).toBe(1);
 });
 
 // ── §35 phase metrics: an enabled report is populated across the real phases ──
