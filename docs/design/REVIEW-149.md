@@ -485,3 +485,93 @@ Convergence: round 4 verified 2 of round-3's blockers resolved outright
 and the math/memory cores correct. v5 is a bounded delta (per-axis
 override, honest overshoot semantics, sha_last structure, semaphore
 lifetime, deploy-gate spec). Round 5 should be checkable to ALIGNED.
+
+## Round 5
+
+Fresh-eyes scope: v5, all round-4 findings and rulings, the exact proposed
+SQLite schema/query, the current commit decoder and isolate guard, the
+v1.1.0 tag and design-84 Phase-B reader contract, and the production deploy
+workflow.
+
+1. **The per-axis declaration/override matrix is resolved.** New writers send
+   both actual declarations together; the admission table independently
+   evaluates manifest and refset floors, and each override bypasses only its
+   own axis. Raw/full overrides and partial declarations reject. A complete
+   enumeration of the manifest tri-state flags is defined: snapshot `0` wins
+   against every delta value and emits raw/no override (with the pinned warning
+   when delta is `1`); otherwise delta `1` selects delta eligibility with a
+   manifest override, snapshot `1` selects snapshot when delta is not forced,
+   delta `0` disables only delta, and unset values remain floor-driven. The
+   independent three-state refset flag composes with every manifest result,
+   including raw plus refset delta (`149:242-341`).
+
+2. **The bounded-overshoot product semantics are resolved.** C1 states the
+   exact quiescent bound and the concurrent-mutation exception: one extra
+   batch, at most 500 non-head sequences, from the single globally oldest
+   eligible workspace and within the retained plan window; success retires the
+   epoch (`149:701-718`). C3 repeats the mechanical bound and records the
+   stronger account-wide generation/lock as a rejected alternative with its
+   architectural rationale (`149:1037-1051`). C5 exposes the same policy in
+   the API and CLI text (`149:1246-1256`).
+
+3. **The materialized release query is resolved in the executable sense.**
+   `fairuse_sha_last` has the required epoch/SHA primary key and a release index
+   whose equality prefix ends immediately before `(last_seq,sha256)`
+   (`149:800-813`). Reproducing `EXPLAIN QUERY PLAN` against the exact DDL and
+   migrations yields a covering search on
+   `idx_fairuse_sha_last_release`, a covering point search on
+   `sqlite_autoindex_blob_refs_1`, and a point search on
+   `sqlite_autoindex_blobs_1`; there is no scan, DISTINCT, or temporary B-tree.
+   The 2,001-row outer limit plus the pinned point probes remains below the
+   8,192 rows-read ceiling, and the checkpoint/empty-page protocol makes
+   multi-tick evaluation exact (`149:1073-1117`). During materialization, each
+   membership page, the same page's `fairuse_sha_last` upserts, working-set
+   deletion, and cursor advance commit atomically. Membership is monotone
+   within an epoch, `in_head` only ORs, prior non-head ordering evidence is
+   recovered by an exact primary-key point lookup, and abort cleanup removes
+   both relations. A crash therefore cannot expose a release-relevant
+   `sha_last` row stale relative to the epoch membership (`149:886-956`).
+
+4. **The semaphore lifetime and 128-MiB accounting are resolved.** The one
+   isolate-wide semaphore is acquired before decoding every commit mode and is
+   held until accounting and every request allocation are released; inline
+   mode has no early-release path, and all exits clean up in one `finally`
+   (`149:498-519`). The sidecar sum is exactly 48,485,796 B (<48 MiB), the
+   inline sum is 28,485,760 B (<28 MiB), aggregate gated concurrency is one,
+   and the sidecar worst case leaves about 79.7 MiB below the 128-MiB isolate
+   ceiling (`149:521-537`).
+
+5. **The deploy-floor contract and design-150 seam are resolved.** Migration
+   0029 defines `meta_deploy_floor`; absent, malformed, candidate-source,
+   pre-deploy comparison, post-success monotone advancement, readback, and
+   failed-deploy behavior are all specified (`149:846-856,1205-1231`). The
+   workflow edit is explicitly owned by design 150 and must land through a
+   coordinated seam review rather than an independent 149 edit
+   (`149:1233-1237,1430-1435`). This is an executable downgrade guard under the
+   repository's trusted deployment-workflow boundary; removing the guard
+   itself would be a deployment-policy change, not an ordinary codec rollback.
+
+**Default-on cadence sanity check:** no reader-capability asymmetry requires a
+later delta floor. Design 84 says pre-B readers understand neither an envelope
+snapshot nor a delta and also cannot accept a chain-bearing signed body because
+`parseCommit` runs on every pull (`84:1061-1070`). Phase B explicitly gives all
+clients the full snapshot/delta envelope reader, chain fold/list verification,
+and `manifestChain` parsing before any wire change (`84:1075-1083`). The
+v1.1.0 tag contains that parser and shared decode path, including history and
+restore, and later readers retain it. Therefore both manifest classes really
+share the v1.1.0 reader floor; graduating snapshot and delta together behind
+the same floor introduces no uncovered reader.
+
+### Editorial only — fix in place, non-blocking
+
+- In A3, replace “delta `1` forces delta” with “delta `1` forces delta
+  eligibility”; explicitly say that design-84 no-base/economic fallback emits
+  its actual `snapshot` declaration with `manifestOverride:true`.
+- In C2, say that the prior-evidence point lookup is skipped or treated as
+  absent when the stored inert tuple is head-only.
+- Remove the duplicated `WHERE account_id=? ORDER BY ... LIMIT 65` sentence at
+  the start of the checkpoint machine (`149:874-878`).
+
+**VERDICT: ALIGNED.** All five round-4 substantive items are resolved in the
+code-checked sense. The same-release default-on cadence is covered by the
+fleet-wide Phase-B reader floor, and no new load-bearing defect was found.

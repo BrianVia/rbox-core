@@ -328,8 +328,10 @@ axis or axes. The gate can never brick the released fleet.
   kill switch and wins over every other manifest flag: it forces raw and
   disables delta even when `RBOX_MDE_DELTA="1"`. That contradictory pair is
   accepted, logs warning `mde_delta_ignored_snapshot_kill_switch`, and sends no
-  manifest override. Otherwise `RBOX_MDE_DELTA="1"` forces delta (and therefore
-  snapshot) with `manifestOverride:true`; `RBOX_MDE_SNAPSHOT="1"` with delta
+  manifest override. Otherwise `RBOX_MDE_DELTA="1"` forces delta ELIGIBILITY
+  (and therefore snapshot) with `manifestOverride:true` — design 84's
+  no-base/economic fallback still emits its actual `snapshot` declaration
+  (with `manifestOverride:true`) when it degrades; `RBOX_MDE_SNAPSHOT="1"` with delta
   not force-on emits snapshot with `manifestOverride:true`; delta `"0"`
   disables delta without disabling a snapshot; and each unset flag is
   floor-driven unless the other manifest flag has selected a forced class.
@@ -871,10 +873,10 @@ previously absent accounts nor requeueing scans performs an unbounded
 
 The checkpoint machine is exact:
 
-1. Epoch allocation first reads the authoritative account workspace set with
-   `WHERE account_id=? ORDER BY created_at,workspace_id,project_id LIMIT 65`.
-   `FAIRUSE_MAX_WORKSPACES=64`; row 65 fails closed with
-   `fairuse_workspace_limit` and no complete/prunable epoch. Otherwise the
+1. Epoch allocation first reads the authoritative account workspace set
+   (query defined in C3's selector, `FAIRUSE_MAX_WORKSPACES=64`); row 65
+   fails closed with `fairuse_workspace_limit` and no complete/prunable
+   epoch. Otherwise the
    exact ordered tuple list, not merely its count or hash, is stored as
    canonical `workspace_set_snapshot`. `capture_pins` then walks that saved
    list in slices of eight. One D1 batch inserts each stream row with DO
@@ -913,7 +915,8 @@ The checkpoint machine is exact:
    timestamped membership (then by workspace/project/sequence), conservatively
    making that SHA unreleasable in this epoch. Because the compact last row
    does not duplicate timestamps, its upsert recovers the prior
-   `committed_at,timestamp_gap` with an exact correlated point lookup into
+   `committed_at,timestamp_gap` (skipped — treated as absent — when the
+   stored inert tuple is head-only) with an exact correlated point lookup into
    `fairuse_root_membership INDEXED BY
    sqlite_autoindex_fairuse_root_membership_1` using the stored
    account/epoch/SHA/last-workspace/last-project/`head=0`/last-sequence tuple,
