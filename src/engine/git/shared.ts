@@ -485,7 +485,11 @@ export async function importGitPackChain(
       throw new Error(`bundle verify failed for git pack link ${i}`);
     }
     await addTimedMs(timings, "gitImportMs", async () => {
-      await git(repoDir, ["fetch", "--no-tags", bundlePath, `+refs/*:${incomingNs}/*`], { maxBuffer: 64 * 1024 * 1024 });
+      // --no-recurse-submodules: a bundle import is a LOCAL artifact operation. Without
+      // it, git may recursively fetch configured submodules' real remotes (network I/O,
+      // child-ref mutation) when the target repo has active submodules — observed on
+      // git 2.54 with an adopted standalone child (design 154 round-2 CRITICAL).
+      await git(repoDir, ["fetch", "--no-tags", "--no-recurse-submodules", bundlePath, `+refs/*:${incomingNs}/*`], { maxBuffer: 64 * 1024 * 1024 });
     });
     imported++;
   };
