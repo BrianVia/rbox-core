@@ -1,6 +1,6 @@
 import type { Env } from "./env.js";
 import type { Principal } from "./authz.js";
-import { json, sha256Hex } from "./util.js";
+import { cappedJson, exactObject, json, sha256Hex, utf8Bytes } from "./util.js";
 import { verifyClerkJWT } from "./clerk.js";
 import { isUniqueViolation, randomHex } from "./auth.js";
 import { repointBillingToAccount } from "./stripe.js";
@@ -24,6 +24,36 @@ const LINK_TTL_MS = 10 * 60 * 1000; // aligns with PAIR_TTL_MS
 const LINK_ACTIVE_CAP = 5; // max in-flight (uncommitted, unexpired) codes per Clerk id
 const LINK_PREFIX = "rbox-link_"; // human-recognizable; stripped before hashing
 const CODE_RE = /^[A-Za-z0-9_-]{43}$/; // base64url(32 random bytes) = 256 bits
+const JWT_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
+export const LINK_START_MAX_BYTES = 128 * 1024;
+export const LINK_CONFIRM_MAX_BYTES = 128 * 1024;
+export const LINK_REDEEM_MAX_BYTES = 1024;
+
+export function validateLinkStartBody(value: unknown): { clerkToken: string } | null {
+  return exactObject(value, ["clerkToken"])
+    && typeof value.clerkToken === "string"
+    && utf8Bytes(value.clerkToken) <= 16_384
+    && JWT_RE.test(value.clerkToken)
+    ? { clerkToken: value.clerkToken }
+    : null;
+}
+
+export function validateLinkConfirmBody(value: unknown): { clerkToken: string; pollKey: string } | null {
+  return exactObject(value, ["clerkToken", "pollKey"])
+    && typeof value.clerkToken === "string"
+    && utf8Bytes(value.clerkToken) <= 16_384
+    && JWT_RE.test(value.clerkToken)
+    && typeof value.pollKey === "string"
+    && /^plk_[0-9a-f]{32}$/.test(value.pollKey)
+    ? { clerkToken: value.clerkToken, pollKey: value.pollKey }
+    : null;
+}
+
+export function validateLinkRedeemBody(value: unknown): { code: string } | null {
+  if (!exactObject(value, ["code"]) || typeof value.code !== "string") return null;
+  const code = value.code.startsWith(LINK_PREFIX) ? value.code.slice(LINK_PREFIX.length) : value.code;
+  return CODE_RE.test(code) ? { code: value.code } : null;
+}
 
 // The link code is 256 bits of base64url entropy (§5.3); `randomHex`/`isUniqueViolation`
 // are shared with auth.ts (the canonical id-minting + D1 error helpers).
@@ -44,8 +74,9 @@ export async function startLink(req: Request, env: Env, nowMs: number): Promise<
   const limited = await rateLimited(env.RL_LINK_PAIR, `lp:${ipKey(req)}`);
   if (limited) return limited;
   if (!env.CLERK_ISSUER) return json({ error: "web_auth_not_configured" }, 501);
-  const body = (await req.json().catch(() => ({}))) as { clerkToken?: unknown };
-  if (typeof body.clerkToken !== "string") return json({ error: "unauthorized" }, 401);
+  const parsed = await cappedJson(req, { maxBytes: LINK_START_MAX_BYTES }, validateLinkStartBody);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.value;
   const claims = await verifyClerkJWT(env, body.clerkToken, Math.floor(nowMs / 1000));
   if (!claims) return json({ error: "unauthorized" }, 401);
   const c = claims.sub;
@@ -137,8 +168,9 @@ interface CodeRow {
  *  Phase 2: read-side pre-checks → one self-guarded atomic batch → post-verify. */
 export async function confirmLink(req: Request, env: Env, nowMs: number): Promise<Response> {
   if (!env.CLERK_ISSUER) return json({ error: "web_auth_not_configured" }, 501);
-  const body = (await req.json().catch(() => ({}))) as { clerkToken?: unknown; pollKey?: unknown };
-  if (typeof body.clerkToken !== "string" || typeof body.pollKey !== "string") return json({ error: "unauthorized" }, 401);
+  const parsed = await cappedJson(req, { maxBytes: LINK_CONFIRM_MAX_BYTES }, validateLinkConfirmBody);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.value;
   const claims = await verifyClerkJWT(env, body.clerkToken, Math.floor(nowMs / 1000));
   if (!claims) return json({ error: "unauthorized" }, 401);
   const c = claims.sub;

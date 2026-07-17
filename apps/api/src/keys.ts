@@ -1,5 +1,5 @@
 import type { Env } from "./env.js";
-import { json } from "./util.js";
+import { exactObject, json, utf8Bytes } from "./util.js";
 import type { Principal } from "./authz.js";
 import { dbFor } from "./db.js";
 
@@ -15,14 +15,63 @@ import { dbFor } from "./db.js";
  */
 
 const MAX_FIELD = 64 * 1024; // 64KB per opaque TEXT field — generous for wraps/envelopes
+export const KEY_BOOTSTRAP_MAX_BYTES = 4 * 1024 * 1024;
+export const KEY_DEVICE_MAX_BYTES = 2 * 1024 * 1024;
+export const KEY_ROSTER_MAX_BYTES = 512 * 1024;
+export const KEY_ADMIT_MAX_BYTES = 2 * 1024 * 1024;
+export const KEY_STATE_MAX_BYTES = 512 * 1024;
+export const KEY_WORKSPACE_MAX_BYTES = 1024 * 1024;
 
 /** A bounded opaque string field, or null if missing/oversized/non-string. */
 function str(v: unknown): string | null {
-  return typeof v === "string" && v.length > 0 && v.length <= MAX_FIELD ? v : null;
+  return typeof v === "string" && v.length > 0 && utf8Bytes(v) <= MAX_FIELD ? v : null;
 }
 /** A non-negative safe integer, or null. */
 function nat(v: unknown): number | null {
   return typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= Number.MAX_SAFE_INTEGER ? v : null;
+}
+
+export function validateKeyBootstrapBody(value: unknown): Record<string, unknown> | null {
+  if (!exactObject(value, ["recoveryWrap", "recoveryWrapId", "genesisRoster", "genesisKeyState", "device"])) return null;
+  if (!str(value.recoveryWrap) || !str(value.recoveryWrapId) || !str(value.genesisRoster) || !str(value.genesisKeyState)) return null;
+  if (!exactObject(value.device, ["deviceId", "sigPubKey", "encPubKey", "mkWrap"])) return null;
+  return str(value.device.deviceId) && str(value.device.sigPubKey) && str(value.device.encPubKey) && str(value.device.mkWrap) ? value : null;
+}
+
+export function validateKeyDeviceBody(value: unknown): Record<string, unknown> | null {
+  if (!exactObject(value, ["deviceId", "sigPubKey", "encPubKey", "mkWrap"])) return null;
+  return str(value.deviceId) && str(value.sigPubKey) && str(value.encPubKey) && str(value.mkWrap) ? value : null;
+}
+
+export function validateKeyRosterBody(value: unknown): Record<string, unknown> | null {
+  return exactObject(value, ["version", "signed"]) && nat(value.version) !== null && !!str(value.signed) ? value : null;
+}
+
+export function validateKeyAdmitBody(value: unknown): Record<string, unknown> | null {
+  if (!exactObject(value, ["device", "roster"])) return null;
+  if (!exactObject(value.device, ["deviceId", "sigPubKey", "encPubKey", "mkWrap"])) return null;
+  if (!exactObject(value.roster, ["version", "signed"])) return null;
+  return str(value.device.deviceId)
+    && str(value.device.sigPubKey)
+    && str(value.device.encPubKey)
+    && str(value.device.mkWrap)
+    && nat(value.roster.version) !== null
+    && str(value.roster.signed)
+    ? value
+    : null;
+}
+
+export function validateKeyStateBody(value: unknown): Record<string, unknown> | null {
+  return exactObject(value, ["accountEpoch", "signed"]) && nat(value.accountEpoch) !== null && !!str(value.signed) ? value : null;
+}
+
+export function validateWorkspaceKeyBody(value: unknown): Record<string, unknown> | null {
+  return exactObject(value, ["workspaceId", "keyEpoch", "kekWrap"])
+    && !!str(value.workspaceId)
+    && nat(value.keyEpoch) !== null
+    && !!str(value.kekWrap)
+    ? value
+    : null;
 }
 
 /** Does this workspace belong to the caller's account? (account-scoped authz.) */

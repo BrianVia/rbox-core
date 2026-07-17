@@ -83,7 +83,7 @@ export function sanitizeWorkspaceName(raw: string | null | undefined, max = MAX_
   if (raw == null) return null;
   // eslint-disable-next-line no-control-regex -- strip C0/C1 control chars (incl. \n\r\t)
   const cleaned = raw.replace(/[\u0000-\u001f\u007f-\u009f]/g, "").trim();
-  return cleaned ? cleaned.slice(0, max) : null;
+  return cleaned ? [...cleaned].slice(0, max).join("") : null;
 }
 
 /** POST /v1/workspaces — create a workspace OWNED by the caller's account, with a

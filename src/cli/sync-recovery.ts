@@ -306,9 +306,7 @@ export async function encryptAndUpload(
     }
     const missingT0 = LANE_TIMING ? performance.now() : 0;
     const statsMissingT0 = firstPublishTiming.enabled ? performance.now() : 0;
-    const missing = new Set(await report.phase("missing", () =>
-      fullAudit ? missingBlobsChunked(api, encShas) : api.missingBlobs(encShas)
-    ));
+    const missing = new Set(await report.phase("missing", () => missingBlobsChunked(api, encShas)));
     if (firstPublishTiming.enabled) {
       const uniqueChecked = new Set(encShas);
       firstPublishTiming.stats.missingCheckWallMs = Math.max(0, Math.round(performance.now() - statsMissingT0));

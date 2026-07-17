@@ -50,6 +50,36 @@ async function createKey(
 }
 
 describe("agent/API sync keys", () => {
+  test("API-key display fields apply UTF-8 truncation before code-point-safe sanitization", async () => {
+    const a = await bootstrap("apikey-display-truncation", { plan: "pro" });
+    const token = createPatToken();
+    const deviceId = `agent_${randomUUID().replace(/-/g, "")}`;
+    const label = `${"a".repeat(598)}😀tail`;
+    const displayPrefix = `${"a".repeat(79)}😀😀`;
+    const response = await SELF.fetch(`${BASE}/v1/keys/api`, {
+      method: "POST",
+      headers: authed(a.token, { "content-type": "application/json" }),
+      body: JSON.stringify({
+        tokenHash: sha(token),
+        deviceId,
+        expiresAt: Date.now() + 60_000,
+        label,
+        displayPrefix,
+        enrolled: true,
+      }),
+    });
+    expect(response.status).toBe(200);
+    const row = await env.rbox_dev_db
+      .prepare("SELECT d.label, k.display_prefix FROM devices d JOIN api_keys k ON k.token_hash = d.token_hash WHERE d.device_id = ?")
+      .bind(deviceId)
+      .first<{ label: string; display_prefix: string }>();
+    // label: 600 B UTF-8 truncation (598 a's survive; emoji+tail dropped) → existing
+    // 200-code-unit sanitizer → 200 a's. display_prefix: 80-code-unit sanitizer keeps
+    // 79 a's + one emoji (second emoji dropped, no surrogate split).
+    expect(row?.label).toBe("a".repeat(200));
+    expect(row?.display_prefix).toBe(`${"a".repeat(79)}😀`);
+  });
+
   test("PAT recognizer accepts valid PATs, rejects malformed/bad checksum, and leaves 64-hex device tokens working", async () => {
     const a = await bootstrap("apikey-recognizer", { plan: "pro" });
     const made = await createKey(a.token);
@@ -68,7 +98,7 @@ describe("agent/API sync keys", () => {
     expect((await SELF.fetch(`${BASE}/v1/keys/admit`, { method: "POST", headers: authed(made.token, { "content-type": "application/json" }), body: "{}" })).status).toBe(400);
 
     await env.rbox_dev_db.prepare("UPDATE devices SET kind = NULL WHERE device_id = ?").bind(a.deviceId).run();
-    expect((await SELF.fetch(`${BASE}/v1/auth/pair/create`, { method: "POST", headers: authed(a.token) })).status).toBe(200);
+    expect((await SELF.fetch(`${BASE}/v1/auth/pair/create`, { method: "POST", headers: authed(a.token, { "content-type": "application/json" }), body: "{}" })).status).toBe(200);
 
     const web = await createWebSession(env as Env, a.accountId, a.userId);
     await env.rbox_dev_db.prepare("UPDATE devices SET kind = NULL WHERE device_id = ?").bind(web.deviceId).run();

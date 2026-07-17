@@ -30,9 +30,9 @@ export const STMTS_PER_BATCH = 34;
  * group are handed to `onRows` as they arrive; the CALLER builds its result from the
  * original `keys` order (never DB row order), so dispatch order is invisible.
  *
- * `/v1/blobs/check` has NO cap on key count, so the prepared-statement objects are built
- * ONE GROUP AT A TIME (bounded memory) — the cheap 80-key string slices are fine, an
- * unbounded up-front array of statements is not.
+ * The helper deliberately has no total key cap (callers own their protocol limit;
+ * `/v1/blobs/check` validates at most 250,000). Prepared-statement objects are built
+ * ONE GROUP AT A TIME (bounded memory), never as an up-front array.
  *
  * `db.batch()` is transactional/ordered and rolls back on failure, so a query error
  * bubbles to the Worker boundary exactly as the prior serial `await` did (no try/catch).

@@ -69,7 +69,17 @@ describe("worker integration (real DO + D1 + R2)", () => {
     expect(await accountPlanRow(a.accountId)).toEqual({ plan: "pro", capBytes: capBytesFor("pro") });
   });
 
-  test("bootstrap rejects non-dev-bench plans when the dev gate is enabled", async () => {
+  test("a structurally valid wrong bootstrap secret retains the semantic 401", async () => {
+    const res = await SELF.fetch(`${BASE}/v1/auth/device/bootstrap`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ secret: "wrong-secret", accountName: "not-created" }),
+    });
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ error: "unauthorized" });
+  });
+
+  test("bootstrap rejects plans outside the exact solo/pro shape", async () => {
     for (const plan of ["team", "garbage"]) {
       const res = await SELF.fetch(`${BASE}/v1/auth/device/bootstrap`, {
         method: "POST",
@@ -77,11 +87,11 @@ describe("worker integration (real DO + D1 + R2)", () => {
         body: JSON.stringify({ secret: "test-bootstrap-secret", accountName: `acct-bootstrap-bad-${plan}`, plan }),
       });
       expect(res.status).toBe(400);
-      expect(await res.json()).toEqual({ error: "bad_plan" });
+      expect(await res.json()).toEqual({ error: "bad_request_shape" });
     }
   });
 
-  test("bootstrap ignores any requested plan when the dev gate is disabled", async () => {
+  test("bootstrap rejects a structurally invalid plan even when the semantic dev gate is disabled", async () => {
     const res = await bootstrapRoute(
       new Request(`${BASE}/v1/auth/device/bootstrap`, {
         method: "POST",
@@ -90,9 +100,8 @@ describe("worker integration (real DO + D1 + R2)", () => {
       }),
       { ...env, RBOX_ALLOW_BOOTSTRAP_PLAN: undefined }
     );
-    expect(res.status).toBe(200);
-    const a = (await res.json()) as { accountId: string };
-    expect(await accountPlanRow(a.accountId)).toEqual({ plan: "none", capBytes: capBytesFor("none") });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: "bad_request_shape" });
   });
 
   test("blob entitlement: PUT grants, GET works; a different account 404s the same sha", async () => {
@@ -306,7 +315,7 @@ describe("worker integration (real DO + D1 + R2)", () => {
 
   // ── pairing tokens (M10) ─────────────────────────────────────────────────
 
-  const pairCreate = (token: string) => SELF.fetch(`${BASE}/v1/auth/pair/create`, { method: "POST", headers: authed(token) });
+  const pairCreate = (token: string) => SELF.fetch(`${BASE}/v1/auth/pair/create`, { method: "POST", headers: authed(token, { "content-type": "application/json" }), body: "{}" });
   const pairRedeem = (pair: string) =>
     SELF.fetch(`${BASE}/v1/auth/pair/redeem`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token: pair, label: "new-machine" }) });
 
@@ -332,6 +341,28 @@ describe("worker integration (real DO + D1 + R2)", () => {
     expect(((await usage.json()) as { plan: string }).plan).toBe("none");
   });
 
+  test("pair labels truncate on UTF-8 and code-point boundaries without splitting astral characters", async () => {
+    const a = await bootstrap("acct-pair-label-truncation");
+    const redeemWith = async (label: string) => {
+      const { token: pair } = (await (await pairCreate(a.token)).json()) as { token: string };
+      const response = await SELF.fetch(`${BASE}/v1/auth/pair/redeem`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token: pair, label }),
+      });
+      expect(response.status).toBe(200);
+      const { deviceId } = (await response.json()) as { deviceId: string };
+      return env.rbox_dev_db.prepare("SELECT label FROM devices WHERE device_id = ?").bind(deviceId).first<{ label: string }>();
+    };
+
+    // Two-stage: UTF-8 truncate to 600 B (drops the emoji+tail without splitting the
+    // emoji, leaving 598 a's) THEN the preserved 200-code-point display sanitizer → 200 a's.
+    expect((await redeemWith(`${"a".repeat(598)}😀tail`))?.label).toBe("a".repeat(200));
+    // Code-point safety: 199 a's + 2 emoji is under both caps by bytes but the
+    // 200-code-point cap keeps 199 a's + exactly one emoji, never a split surrogate.
+    expect((await redeemWith(`${"a".repeat(199)}😀😀`))?.label).toBe(`${"a".repeat(199)}😀`);
+  });
+
   test("pairing token is SINGLE-USE (second redeem → 401)", async () => {
     const a = await bootstrap("acct-pair-once");
     const { token: pair } = (await (await pairCreate(a.token)).json()) as { token: string };
@@ -339,8 +370,8 @@ describe("worker integration (real DO + D1 + R2)", () => {
     expect((await pairRedeem(pair)).status).toBe(401); // already consumed
   });
 
-  test("malformed / unknown pairing token → 401", async () => {
-    expect((await pairRedeem("rbox-pair_not-hex")).status).toBe(401);
+  test("malformed pairing token → 400; well-formed unknown token → 401", async () => {
+    expect((await pairRedeem("rbox-pair_not-hex")).status).toBe(400);
     expect((await pairRedeem(`rbox-pair_${"a".repeat(64)}`)).status).toBe(401); // well-formed but unknown
   });
 
@@ -749,8 +780,19 @@ describe("worker integration (real DO + D1 + R2)", () => {
     expect((await webExchange(tampered)).status).toBe(401);
   });
 
-  test("alg:none → 401 (algorithm-confusion guard)", async () => {
-    expect((await webExchange(await signJwt(claims({ sub: "u_none" }), { alg: "none" }))).status).toBe(401);
+  test("alg:none with an empty signature segment → 400 (malformed shape, design 151 Unit 2)", async () => {
+    // signJwt(alg:none) yields `h.p.` — the third segment is empty, so the JWT
+    // fails cappedJson's three-nonempty-base64url-segments shape check before
+    // verifyClerkJWT runs. Still rejected; the status is the declared shape 400.
+    expect((await webExchange(await signJwt(claims({ sub: "u_none" }), { alg: "none" }))).status).toBe(400);
+  });
+
+  test("alg:none with a nonempty forged signature → 401 (algorithm-confusion guard still fires)", async () => {
+    // A shape-VALID alg:none token (three nonempty segments) passes shape parsing
+    // and must be rejected by the semantic RS256 pin at clerk.ts:80.
+    const none = await signJwt(claims({ sub: "u_none_sig" }), { alg: "none" });
+    const shapeValid = `${none}Zm9yZ2Vk`; // append a nonempty base64url signature
+    expect((await webExchange(shapeValid)).status).toBe(401);
   });
 
   test("wrong issuer → 401", async () => {
@@ -1087,7 +1129,7 @@ describe("worker integration (real DO + D1 + R2)", () => {
 
   test("kind-gate: a DURABLE token passes exactly where the web token is blocked", async () => {
     const a = await bootstrap("acct-gate-durable");
-    expect((await SELF.fetch(`${BASE}/v1/auth/pair/create`, { method: "POST", headers: authed(a.token) })).status).toBe(200);
+    expect((await SELF.fetch(`${BASE}/v1/auth/pair/create`, { method: "POST", headers: authed(a.token, { "content-type": "application/json" }), body: "{}" })).status).toBe(200);
     expect((await SELF.fetch(`${BASE}/v1/workspaces?project=root`, { method: "POST", headers: authed(a.token) })).status).toBe(200);
   });
 
@@ -1280,7 +1322,7 @@ describe("worker integration (real DO + D1 + R2)", () => {
     const good = await freshJwt("user_link_jwtgate");
     const tampered = good.slice(0, -4) + (good.slice(-4) === "AAAA" ? "BBBB" : "AAAA");
     expect((await SELF.fetch(`${BASE}/v1/account/link/start`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ clerkToken: tampered }) })).status).toBe(401);
-    expect((await SELF.fetch(`${BASE}/v1/account/link/confirm`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ clerkToken: tampered, pollKey: "plk_x" }) })).status).toBe(401);
+    expect((await SELF.fetch(`${BASE}/v1/account/link/confirm`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ clerkToken: tampered, pollKey: `plk_${"a".repeat(32)}` }) })).status).toBe(401);
   });
 
   test("single-use: a second redeem of a consumed code → 401; an expired code → 401", async () => {

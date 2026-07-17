@@ -1,6 +1,8 @@
 import { env, SELF, applyD1Migrations } from "cloudflare:test";
 import { beforeAll, beforeEach, describe, expect, test } from "vitest";
 import { createHash } from "node:crypto";
+import { blobsCheck } from "../src/blobs.js";
+import type { Env } from "../src/env.js";
 
 // §30 — the push preflight (POST /v1/blobs/check) batches its per-80-sha IN-list D1
 // reads via db.batch() (see src/d1-batch.ts) instead of one serial round-trip per chunk.
@@ -67,6 +69,31 @@ const HAVE_IDX = [100, 3000, 5500]; // group 0, 1, 2 — present+entitled, non-c
 const CAND_IDX = [200, 3100, 5550]; // group 0, 1, 2 — present+entitled BUT prune-marked → missing
 
 describe("§30 blobsCheck batched dispatch — receipts path", () => {
+  test("accepts 250,000 items below 16 MiB, rejects 250,001 and invalid items", async () => {
+    const a = await bootstrap("bcb-unit2-boundary");
+    const repeated = sha("unit2-boundary");
+    const atLimit = Array(250_000).fill(repeated) as string[];
+    const wire = JSON.stringify({ shas: atLimit });
+    expect(new TextEncoder().encode(wire).byteLength).toBe(16_750_010);
+    expect(await check(a.token, atLimit, RCPT)).toEqual([repeated]);
+
+    const tooMany = await SELF.fetch(`${BASE}/v1/blobs/check`, {
+      method: "POST",
+      headers: authed(a.token, RCPT),
+      body: JSON.stringify({ shas: Array(250_001).fill(repeated) }),
+    });
+    expect(tooMany.status).toBe(400);
+    expect(await tooMany.json()).toEqual({ error: "bad_request_shape" });
+
+    const invalid = await SELF.fetch(`${BASE}/v1/blobs/check`, {
+      method: "POST",
+      headers: authed(a.token, RCPT),
+      body: JSON.stringify({ shas: [repeated, "not-a-sha"] }),
+    });
+    expect(invalid.status).toBe(400);
+    expect(await invalid.json()).toEqual({ error: "bad_request_shape" });
+  });
+
   test("preserves ordered `missing` across ≥3 db.batch() groups, with the candidate NOT-EXISTS barrier intact", async () => {
     const a = await bootstrap("bcb-rcpt");
     for (const i of HAVE_IDX) await seedPresentEntitled(a.accountId, ALL[i]);
@@ -132,5 +159,39 @@ describe("§30 blobsCheck batched dispatch — legacy (non-receipts) path", () =
     for (const i of CONDEMNED_IDX) expect(missing).toContain(ALL[i]);
     for (const i of PRUNE_IDX) expect(missing).toContain(ALL[i]);
     for (const i of UNENTITLED_IDX) expect(missing).toContain(ALL[i]);
+  });
+
+  test("duplicate amplification uses the same legacy D1 statement count as one occurrence", async () => {
+    const a = await bootstrap("bcb-legacy-dedup");
+    const missingSha = sha("duplicate-amplification");
+    const run = async (shas: string[]) => {
+      let statements = 0;
+      const countedDb = new Proxy(env.rbox_dev_db, {
+        get(target, property, receiver) {
+          if (property === "batch") {
+            return async (batch: D1PreparedStatement[]) => {
+              statements += batch.length;
+              return target.batch(batch);
+            };
+          }
+          const value = Reflect.get(target, property, receiver);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      const handlerEnv = { ...env, rbox_dev_db: countedDb } as Env;
+      const response = await blobsCheck(
+        new Request(`${BASE}/v1/blobs/check`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ shas }) }),
+        handlerEnv,
+        a.accountId,
+      );
+      expect(response.status).toBe(200);
+      return { statements, body: await response.json() };
+    };
+
+    const one = await run([missingSha]);
+    const many = await run(Array(10_000).fill(missingSha));
+    expect(many.statements).toBe(one.statements);
+    expect(many.body).toEqual(one.body);
+    expect(many.body).toEqual({ missing: [missingSha] });
   });
 });

@@ -107,6 +107,20 @@ concurrently, then updates latest aliases, `install.sh`, manifest, and detached
 signature sequentially. Any immutable transfer or hash failure prevents all
 mutable channel changes.
 
+## Oversized Stripe webhook recovery
+
+`POST /v1/stripe/webhook` is bounded by `RBOX_STRIPE_WEBHOOK_MAX_BYTES` (default
+1 MiB). Its overflow anomaly is only a notification; the sender-controlled
+Content-Length and incomplete counted bytes are never evidence for raising the
+cap. After Stripe-side corroboration that a legitimate event exceeded the
+bound, raise the positive integer through the existing Wrangler environment
+configuration, deploy that configuration, and manually resend the event from
+the Stripe dashboard within Stripe's 15-day manual resend window.
+
+There is no local replay, fetch-by-id, reconciliation, or admin endpoint for
+this flow. Use Stripe's existing dashboard resend after the configuration is
+deployed.
+
 ## Secrets (GitHub repo)
 
 - `CLOUDFLARE_DEPLOY_TOKEN` — Workers Scripts:Edit + D1:Edit + Cloudflare

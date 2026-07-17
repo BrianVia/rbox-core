@@ -1,6 +1,6 @@
 import { eq, type RouteCtx } from "./shared.js";
-import { json } from "../util.js";
-import { accountStatus, confirmLink, linkStatus, redeemLink, startLink, unlinkAccount } from "../account-link.js";
+import { cappedJson, json } from "../util.js";
+import { accountStatus, confirmLink, LINK_REDEEM_MAX_BYTES, linkStatus, redeemLink, startLink, unlinkAccount, validateLinkRedeemBody } from "../account-link.js";
 import { accountDevices, accountWorkspaces } from "../auth.js";
 import { countWorkspaces, planLimitsFor, usage } from "../billing.js";
 import { createWorkspace, type Principal } from "../authz.js";
@@ -26,8 +26,9 @@ export async function accountRoutes({ req, env, url, seg }: RouteCtx, p: Princip
   if (req.method === "GET" && eq(seg, ["v1", "account", "workspaces"])) return accountWorkspaces(env, p, url);
   // Account linking — AUTHED rbox-bearer routes (under the §1.1 web-token gate).
   if (req.method === "POST" && eq(seg, ["v1", "account", "link", "redeem"])) {
-    const b = (await req.json().catch(() => ({}))) as { code?: unknown };
-    return redeemLink(env, p, typeof b.code === "string" ? b.code : "");
+    const parsed = await cappedJson(req, { maxBytes: LINK_REDEEM_MAX_BYTES }, validateLinkRedeemBody);
+    if (!parsed.ok) return parsed.response;
+    return redeemLink(env, p, parsed.value.code);
   }
   if (req.method === "POST" && eq(seg, ["v1", "account", "unlink"])) return unlinkAccount(env, p, Date.now());
   if (req.method === "GET" && eq(seg, ["v1", "account", "status"])) return accountStatus(env, p);

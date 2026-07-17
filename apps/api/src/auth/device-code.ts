@@ -1,5 +1,5 @@
 import type { Env } from "../env.js";
-import { json } from "../util.js";
+import { cappedJson, exactObject, isWellFormed, json, objectWithKeys, truncateUtf8 } from "../util.js";
 import type { Principal } from "../authz.js";
 import { clientGeo, clientIp } from "../notify.js";
 import { dbFor, dirDb } from "../db.js";
@@ -11,6 +11,9 @@ const AUTH_TTL_MS = 10 * 60 * 1000;
 const POLL_INTERVAL_S = 5;
 const USER_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no ambiguous 0/O/1/I
 const DEVICE_CODE_HEX_RE = /^[0-9a-f]+$/;
+export const DEVICE_START_MAX_BYTES = 8 * 1024;
+export const DEVICE_POLL_MAX_BYTES = 1024;
+export const DEVICE_APPROVE_MAX_BYTES = 1024;
 
 function randomUserCode(): string {
   const b = new Uint8Array(8);
@@ -19,12 +22,38 @@ function randomUserCode(): string {
   return `${c.slice(0, 4)}-${c.slice(4)}`;
 }
 
+export function validateDeviceStartBody(value: unknown): { label?: string } | null {
+  if (!objectWithKeys(value, ["label"])) return null;
+  if (value.label === undefined) return {};
+  if (typeof value.label !== "string" || !isWellFormed(value.label)) return null;
+  return { label: truncateUtf8(value.label, 600) };
+}
+
+export function validateDevicePollBody(value: unknown): { deviceCode: string } | null {
+  return exactObject(value, ["deviceCode"])
+    && typeof value.deviceCode === "string"
+    && value.deviceCode.length === TOKEN_BYTES * 2
+    && DEVICE_CODE_HEX_RE.test(value.deviceCode)
+    ? { deviceCode: value.deviceCode }
+    : null;
+}
+
+export function validateDeviceApproveBody(value: unknown): { userCode: string } | null {
+  return exactObject(value, ["userCode"])
+    && typeof value.userCode === "string"
+    && /^[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$/i.test(value.userCode)
+    ? { userCode: value.userCode }
+    : null;
+}
+
 // POST /v1/auth/device/start { label } -> { deviceCode, userCode, interval, expiresIn }
 export async function startDeviceAuth(req: Request, env: Env): Promise<Response> {
   // Per-IP burst cap before the unconditional D1 insert.
   const limited = await rateLimited(env.RL_DEVICE_START, `ds:${ipKey(req)}`);
   if (limited) return limited;
-  const body = (await req.json().catch(() => ({}))) as { label?: string };
+  const parsed = await cappedJson(req, { maxBytes: DEVICE_START_MAX_BYTES }, validateDeviceStartBody);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.value;
   const deviceCode = randomHex(TOKEN_BYTES);
   const deviceId = `dev_${randomHex(DEVICE_ID_BYTES)}`; // proposed id; mint is the real uniqueness gate
   const now = Date.now();
@@ -47,10 +76,9 @@ export async function startDeviceAuth(req: Request, env: Env): Promise<Response>
 
 // POST /v1/auth/device/poll { deviceCode } -> { status, token? }
 export async function pollDeviceAuth(req: Request, env: Env): Promise<Response> {
-  const body = (await req.json().catch(() => ({}))) as { deviceCode?: string };
-  if (typeof body.deviceCode !== "string" || body.deviceCode.length !== TOKEN_BYTES * 2 || !DEVICE_CODE_HEX_RE.test(body.deviceCode)) {
-    return json({ error: "bad_request" }, 400);
-  }
+  const parsed = await cappedJson(req, { maxBytes: DEVICE_POLL_MAX_BYTES }, validateDevicePollBody);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.value;
   // Reject malformed codes before limiter/D1 work. Valid-shaped polls hit both
   // the spray-floor IP bucket and the per-code fairness bucket.
   const ipLimited = await rateLimited(env.RL_DEVICE_POLL_IP, `dpi:${ipKey(req)}`);
@@ -118,8 +146,9 @@ export async function pollDeviceAuth(req: Request, env: Env): Promise<Response> 
 
 // POST /v1/auth/device/approve { userCode }  (authed) — the new device joins the approver's account.
 export async function approveDeviceAuth(req: Request, env: Env, approver: Principal): Promise<Response> {
-  const body = (await req.json().catch(() => ({}))) as { userCode?: string };
-  if (typeof body.userCode !== "string") return json({ error: "bad_request" }, 400);
+  const parsed = await cappedJson(req, { maxBytes: DEVICE_APPROVE_MAX_BYTES }, validateDeviceApproveBody);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.value;
   const res = await dirDb(env)
     .prepare("UPDATE device_auth SET status = 'approved', account_id = ?, user_id = ? WHERE user_code = ? AND status = 'pending' AND expires_at > ?")
     .bind(approver.accountId, approver.userId, body.userCode.toUpperCase(), Date.now())

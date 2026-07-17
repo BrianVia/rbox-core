@@ -2,7 +2,7 @@ import type { Env } from "../env.js";
 import { audit, sanitizeWorkspaceName, type Principal } from "../authz.js";
 import { dirDb } from "../db.js";
 import { isUniqueViolation } from "./shared.js";
-import { json, SHA256_HEX_RE } from "../util.js";
+import { isWellFormed, json, objectWithKeys, SHA256_HEX_RE, truncateUtf8, utf8Bytes } from "../util.js";
 import { revokeDevice } from "./devices.js";
 import { readPlan } from "./mint.js";
 import { isPaidPlan } from "../plans.js";
@@ -12,6 +12,18 @@ const API_KEY_CAP = 5;
 const DEVICE_ID_RE = /^[A-Za-z0-9_-]{8,96}$/;
 const DISPLAY_PREFIX_MAX = 80;
 const LABEL_MAX = 200;
+export const API_KEY_CREATE_MAX_BYTES = 8 * 1024;
+
+export function validateApiKeyBody(value: unknown): Record<string, unknown> | null {
+  if (!objectWithKeys(value, ["tokenHash", "deviceId", "expiresAt", "displayPrefix", "label", "enrolled"], ["tokenHash", "deviceId", "expiresAt", "displayPrefix"])) return null;
+  if (typeof value.tokenHash !== "string" || !SHA256_HEX_RE.test(value.tokenHash)) return null;
+  if (typeof value.deviceId !== "string" || !DEVICE_ID_RE.test(value.deviceId)) return null;
+  if (typeof value.expiresAt !== "number" || !Number.isInteger(value.expiresAt)) return null;
+  if (typeof value.displayPrefix !== "string" || !isWellFormed(value.displayPrefix) || utf8Bytes(value.displayPrefix) > 240) return null;
+  if (value.label !== undefined && (typeof value.label !== "string" || !isWellFormed(value.label))) return null;
+  if (value.enrolled !== undefined && typeof value.enrolled !== "boolean") return null;
+  return { ...value, ...(value.label === undefined ? {} : { label: truncateUtf8(value.label, 600) }) };
+}
 
 function subscribeRequired(): Response {
   return json({ error: "subscription_required", message: "agent keys require an active plan — run `rbox subscribe`" }, 403);
