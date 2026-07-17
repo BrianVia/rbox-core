@@ -1,5 +1,5 @@
 import type { Env } from "../env.js";
-import { json, logErr, sha256Hex } from "../util.js";
+import { cappedJson, isWellFormed, json, logErr, objectWithKeys, sha256Hex, truncateCodePoints, truncateUtf8, utf8Bytes } from "../util.js";
 import type { Principal } from "../authz.js";
 import { clientGeo, clientIp } from "../notify.js";
 import { dbFor, dirDb } from "../db.js";
@@ -16,6 +16,24 @@ const PAIR_TOKEN_ID_RE = /^[A-Za-z0-9_-]{16,64}$/;
 const PAIR_TTL_MS = 10 * 60 * 1000;
 const PAIR_ACTIVE_CAP = 5; // max outstanding (unconsumed, unexpired) per account
 const PAIR_PREFIX = "rbox-pair_"; // human-recognizable; stripped before hashing
+export const PAIR_CREATE_MAX_BYTES = 1024 * 1024;
+export const PAIR_REDEEM_MAX_BYTES = 8 * 1024;
+
+export function validatePairCreateBody(value: unknown): { mkWrap?: string; admissionGrant?: string; tokenId?: string } | null {
+  if (!objectWithKeys(value, ["mkWrap", "admissionGrant", "tokenId"])) return null;
+  if (value.mkWrap !== undefined && (typeof value.mkWrap !== "string" || utf8Bytes(value.mkWrap) > 65_536)) return null;
+  if (value.admissionGrant !== undefined && (typeof value.admissionGrant !== "string" || utf8Bytes(value.admissionGrant) > 65_536)) return null;
+  if (value.tokenId !== undefined && (typeof value.tokenId !== "string" || !PAIR_TOKEN_ID_RE.test(value.tokenId))) return null;
+  return value as { mkWrap?: string; admissionGrant?: string; tokenId?: string };
+}
+
+export function validatePairRedeemBody(value: unknown): { token: string; label?: string } | null {
+  if (!objectWithKeys(value, ["token", "label"], ["token"]) || typeof value.token !== "string") return null;
+  const tokenId = value.token.startsWith(PAIR_PREFIX) ? value.token.slice(PAIR_PREFIX.length) : value.token;
+  if (!PAIR_TOKEN_ID_RE.test(tokenId)) return null;
+  if (value.label !== undefined && (typeof value.label !== "string" || !isWellFormed(value.label))) return null;
+  return { token: value.token, ...(value.label === undefined ? {} : { label: truncateUtf8(value.label, 600) }) };
+}
 
 /**
  * POST /v1/auth/pair/create — AUTHENTICATED. Mint a short-lived, single-use
@@ -44,9 +62,11 @@ export async function createPairToken(req: Request, env: Env, p: Principal): Pro
   if (!member) return json({ error: "forbidden", message: "pairing requires a user membership" }, 403);
 
   // Optional opaque E2EE admission material (bounded; stored verbatim, never parsed).
-  const body = (await req.json().catch(() => ({}))) as { mkWrap?: unknown; admissionGrant?: unknown; tokenId?: unknown };
-  const mkWrap = typeof body.mkWrap === "string" && body.mkWrap.length <= 64 * 1024 ? body.mkWrap : null;
-  const admissionGrant = typeof body.admissionGrant === "string" && body.admissionGrant.length <= 64 * 1024 ? body.admissionGrant : null;
+  const parsed = await cappedJson(req, { maxBytes: PAIR_CREATE_MAX_BYTES }, validatePairCreateBody);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.value;
+  const mkWrap = body.mkWrap ?? null;
+  const admissionGrant = body.admissionGrant ?? null;
 
   // C6: adopt the client tokenId if supplied (validated), else mint one server-side.
   // Either way the row is keyed by sha256(<tokenId>) so redeem stays a single lookup.
@@ -88,13 +108,14 @@ export async function redeemPairToken(req: Request, env: Env): Promise<Response>
   // Shared per-IP burst cap on the credential-minting edge before D1 work.
   const limited = await rateLimited(env.RL_LINK_PAIR, `lp:${ipKey(req)}`);
   if (limited) return limited;
-  const body = (await req.json().catch(() => ({}))) as { token?: string; label?: string };
-  const raw = typeof body.token === "string" ? body.token : "";
+  const parsed = await cappedJson(req, { maxBytes: PAIR_REDEEM_MAX_BYTES }, validatePairRedeemBody);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.value;
+  const raw = body.token;
   const token = raw.startsWith(PAIR_PREFIX) ? raw.slice(PAIR_PREFIX.length) : raw;
   // Accept both a client tokenId (C6) and a legacy 64-hex token — both stored as
   // sha256(<id>), so one lookup covers both. Bound the format before hashing.
-  if (!PAIR_TOKEN_ID_RE.test(token)) return json({ error: "unauthorized" }, 401);
-  const label = (typeof body.label === "string" ? body.label : "paired").slice(0, 200);
+  const label = truncateCodePoints(body.label ?? "paired", 200);
   const hash = await sha256Hex(token);
   const now = Date.now();
 

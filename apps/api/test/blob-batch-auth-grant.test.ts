@@ -227,7 +227,7 @@ describe("§109 upload grants (default on when RBOX_AUTH_GRANT is unset)", () =>
     expect(offSuccessPoints.filter((p) => p.indexes?.[0] === "blob.batchPut").map((p) => p.blobs?.[2])).toEqual(["ok"]);
     expect(offSuccessPoints.some((p) => p.indexes?.[0] === "blob.batchPut.auth")).toBe(false);
 
-    const check = await blobsCheck(new Request(`${BASE}/v1/blobs/check`, { method: "POST", headers: { "content-type": "application/json", ...receipts }, body: JSON.stringify({ shas: [] }) }), { ...env, RBOX_AUTH_GRANT: "0" } as Env, /^[0-9a-f]{64}$/, "acct");
+    const check = await blobsCheck(new Request(`${BASE}/v1/blobs/check`, { method: "POST", headers: { "content-type": "application/json", ...receipts }, body: JSON.stringify({ shas: [] }) }), { ...env, RBOX_AUTH_GRANT: "0" } as Env, "acct");
     expect(await check.json()).toEqual({ missing: [] });
   });
 

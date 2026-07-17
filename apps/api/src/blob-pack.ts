@@ -296,9 +296,18 @@ export async function blobPackPut(req: Request, env: Env, accountId: string): Pr
     return done("bad_request", json({ error: "bad_request" }, 400));
   }
 
+  const read = await timed("parseMs", () => readBytesCapped(req, PACK_MAX_BODY_BYTES));
+  if (read.kind === "overflow") return done("too_large", json({ error: "bad_request" }, 400));
+  if (read.kind === "error") {
+    // A mid-body disconnect (common on large pack PUTs) must still complete op
+    // accounting before the error propagates — otherwise this whole failure class
+    // silently vanishes from the pack-put outcome metric. The rethrow is
+    // spec-mandated (Unit 2 reader mapping); the metric is not sacrificed for it.
+    done("read_error", json({ error: "bad_request" }, 400));
+    throw read.error;
+  }
   try {
-    const body = await timed("parseMs", () => readBytesCapped(req, PACK_MAX_BODY_BYTES));
-    if (body === null) return done("too_large", json({ error: "bad_request" }, 400));
+    const body = read.bytes;
     bodyBytes = body.byteLength;
     if (await timed("hashMs", () => sha256Hex(body)) !== packSha) return done("pack_sha_mismatch", json({ error: "pack_sha_mismatch" }, 400));
 

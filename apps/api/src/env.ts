@@ -131,6 +131,8 @@ export interface Env {
   STRIPE_SECRET?: string;
   /** Stripe webhook signing secret (whsec_…). Wrangler secret; webhook 400s without it. */
   STRIPE_WEBHOOK_SECRET?: string;
+  /** Raw Stripe webhook cap. Positive base-10 safe integer; invalid/absent defaults to 1 MiB. */
+  RBOX_STRIPE_WEBHOOK_MAX_BYTES?: string;
   /** Base URL for checkout success/cancel redirects (e.g. https://rbox.to). */
   RBOX_APP_URL?: string;
   /** Clerk web auth (M11). Issuer = https://<frontend-api>; /v1/web/session 501s

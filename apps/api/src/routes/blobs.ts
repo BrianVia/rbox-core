@@ -10,7 +10,7 @@ import type { Principal } from "../authz.js";
  */
 export async function blobsRoutes({ req, env, seg }: RouteCtx, p: Principal): Promise<Response | null> {
   // POST /v1/blobs/check — entitlement-scoped to the caller's account.
-  if (req.method === "POST" && eq(seg, ["v1", "blobs", "check"])) return blobsCheck(req, env, SHA_RE, p.accountId);
+  if (req.method === "POST" && eq(seg, ["v1", "blobs", "check"])) return blobsCheck(req, env, p.accountId);
 
   // /v1/blobs/:sha[...] — all entitlement-gated by p.accountId.
   if (seg[0] === "v1" && seg[1] === "blobs" && seg.length >= 3) {

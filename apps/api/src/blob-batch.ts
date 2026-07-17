@@ -206,9 +206,10 @@ async function readBatchPutRequest(req: Request, maxRecords: number): Promise<
   | { ok: false; response: Response }
   | { ok: false; tooManyRecords: number }
 > {
-  const raw = await readBytesCapped(req, MAX_BATCH_BODY_BYTES);
-  if (raw === null) return { ok: false, response: json({ error: "bad_request", message: "request body too large" }, 400) };
-  const parsed = parseBatchPutFrames(raw, maxRecords);
+  const read = await readBytesCapped(req, MAX_BATCH_BODY_BYTES);
+  if (read.kind === "overflow") return { ok: false, response: json({ error: "bad_request", message: "request body too large" }, 400) };
+  if (read.kind === "error") throw read.error;
+  const parsed = parseBatchPutFrames(read.bytes, maxRecords);
   if (!parsed.ok) {
     if ("tooManyRecords" in parsed) return parsed;
     return { ok: false, response: json({ error: "bad_request", message: parsed.message }, 400) };

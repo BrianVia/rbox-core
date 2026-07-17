@@ -1,5 +1,5 @@
 import type { Env } from "./env.js";
-import { json } from "./util.js";
+import { cappedJson, exactObject, json, utf8Bytes } from "./util.js";
 import { capBytesFor } from "./plans.js";
 import { AccountGoneError, createWebSession } from "./auth.js";
 import { refreshOwnerEmail } from "./notify.js";
@@ -109,10 +109,18 @@ function randomId(prefix: string, bytes: number): string {
 }
 
 /** POST /v1/web/session { token } — PUBLIC. Verify Clerk JWT → rbox web session. */
+export const WEB_SESSION_MAX_BYTES = 128 * 1024;
+export function validateWebSessionBody(value: unknown): { token: string } | null {
+  if (!exactObject(value, ["token"]) || typeof value.token !== "string") return null;
+  if (utf8Bytes(value.token) > 16_384 || !/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value.token)) return null;
+  return { token: value.token };
+}
+
 export async function webSession(req: Request, env: Env, nowMs: number, ctx: Pick<ExecutionContext, "waitUntil">): Promise<Response> {
   if (!env.CLERK_ISSUER) return json({ error: "web_auth_not_configured" }, 501);
-  const body = (await req.json().catch(() => ({}))) as { token?: string };
-  if (typeof body.token !== "string") return json({ error: "unauthorized" }, 401);
+  const parsed = await cappedJson(req, { maxBytes: WEB_SESSION_MAX_BYTES }, validateWebSessionBody);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.value;
   const claims = await verifyClerkJWT(env, body.token, Math.floor(nowMs / 1000));
   if (!claims) return json({ error: "unauthorized" }, 401);
   const sub = claims.sub;

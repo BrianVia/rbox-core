@@ -1,5 +1,5 @@
 import type { Env } from "./env.js";
-import { blobKey, json } from "./util.js";
+import { blobKey, cappedJson, exactObject, json, SHA256_HEX_RE } from "./util.js";
 import { entitledSubset, isEntitled } from "./authz.js";
 import { grantEntitlementWithQuota, wouldExceedCap } from "./billing.js";
 import { emitCompletePhases, startOp } from "./metrics.js";
@@ -12,6 +12,12 @@ import { packedLocation, readPackedExtent } from "./blob-pack.js";
 import { usesReceipts } from "./blob-protocol.js";
 
 export { UPLOAD_RECEIPTS_V1, usesReceipts } from "./blob-protocol.js";
+export const BLOBS_CHECK_MAX_BYTES = 16 * 1024 * 1024;
+
+export function validateBlobsCheckBody(value: unknown): { shas: string[] } | null {
+  if (!exactObject(value, ["shas"]) || !Array.isArray(value.shas) || value.shas.length > 250_000) return null;
+  return value.shas.every((sha): sha is string => typeof sha === "string" && SHA256_HEX_RE.test(sha)) ? { shas: value.shas } : null;
+}
 
 /** §23.2 — clients on the receipts protocol send this header; PUT then becomes
  *  ~R2-only (staging write + receipt, ZERO D1). Absent → legacy per-PUT grant path
@@ -117,11 +123,14 @@ export function partSizeFor(size: number): number {
 // entitled (M7) AND not a GC candidate (M6). An unentitled caller is always told
 // "missing" → it must upload (which grants entitlement); it never learns whether
 // the platform already has another account's content.
-export async function blobsCheck(req: Request, env: Env, shaRe: RegExp, accountId: string): Promise<Response> {
+export async function blobsCheck(req: Request, env: Env, accountId: string): Promise<Response> {
   const op = startOp(env, "blob.check");
   const db = dbFor(op.env, accountId);
-  const body = (await req.json()) as { shas?: unknown };
-  const shas = Array.isArray(body.shas) ? body.shas.filter((s): s is string => typeof s === "string" && shaRe.test(s)) : [];
+  // validateBlobsCheckBody already enforces SHA256_HEX_RE on every item (and the
+  // 250k count cap), so the shape contract has a single owner — no second pass here.
+  const parsed = await cappedJson(req, { maxBytes: BLOBS_CHECK_MAX_BYTES }, validateBlobsCheckBody);
+  if (!parsed.ok) return parsed.response;
+  const shas = parsed.value.shas;
   const uniq = [...new Set(shas)];
 
   // §23.3 — receipts clients: "have it" = entitled AND canonical-present (blobs.present=1).
@@ -178,7 +187,7 @@ export async function blobsCheck(req: Request, env: Env, shaRe: RegExp, accountI
   // it reads as missing (one query, no separate pass — the barrier can't be forgotten).
   await batchedInLookup<{ sha256: string }>(
     db,
-    shas,
+    uniq,
     (chunk) =>
       db
         .prepare(`SELECT sha256 FROM blobs WHERE sha256 IN (${chunk.map(() => "?").join(",")})
@@ -194,7 +203,7 @@ export async function blobsCheck(req: Request, env: Env, shaRe: RegExp, accountI
   );
   await batchedInLookup<{ sha256: string }>(
     db,
-    shas,
+    uniq,
     (chunk) => db.prepare(`SELECT sha256 FROM gc_candidates WHERE sha256 IN (${chunk.map(() => "?").join(",")})`).bind(...chunk),
     (rows) => {
       for (const r of rows) condemned.add(r.sha256);

@@ -872,6 +872,35 @@ test("missingBlobsChunked splits checks at 50,000 and unions missing results", a
   expect(new Set(missing)).toEqual(new Set(expected));
 });
 
+test("non-full-audit recovery chunks every blobs/check call at 50,000", async () => {
+  process.env.RBOX_PREFLIGHT_DELTA = "1";
+  delete process.env.RBOX_PREFLIGHT_FULL;
+  const remote = new FakeRemote();
+  await write("x.txt", "payload\n");
+  const actual = (await enc("payload\n")).encSha;
+  const recovery = Array.from({ length: 50_000 }, (_, index) => index.toString(16).padStart(64, "0"))
+    .map((address, index) => address === actual ? `${(index + 50_001).toString(16).padStart(64, "0")}` : address);
+  const originalCommit = remote.commit.bind(remote);
+  let attempt = 0;
+  let callsBeforeRecovery = -1;
+  remote.commit = async (...args) => {
+    if (attempt++ === 0) {
+      remote.commitCalls++;
+      callsBeforeRecovery = remote.missingBlobCalls.length;
+      return { unsatisfiedBlobs: recovery, unsatisfiedTotal: recovery.length };
+    }
+    return originalCommit(...args);
+  };
+
+  const { sequence, committed } = await push(root, cfg, deps(remote));
+
+  expect(committed).toBe(true);
+  expect(sequence).toBe(1);
+  const retryCalls = remote.missingBlobCalls.slice(callsBeforeRecovery);
+  expect(retryCalls.map((call) => call.length)).toEqual([50_000, 1]);
+  expect(retryCalls.every((call) => call.length <= 50_000)).toBe(true);
+});
+
 test("422 decreasing missingTotal pages can progress beyond the fixed retry budget", async () => {
   const remote = new FakeRemote();
   await write("x.txt", "payload\n");

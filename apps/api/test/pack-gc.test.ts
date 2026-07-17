@@ -470,7 +470,7 @@ async function assertEntitledPackedRead(accountId: string, pack: BuiltPack): Pro
     method: "POST",
     headers: { "content-type": "application/json", "x-rbox-protocol": "upload-receipts-v1" },
     body: JSON.stringify({ shas: [sha] }),
-  }), env, /^[0-9a-f]{64}$/, accountId);
+  }), env, accountId);
   expect(check.status).toBe(200);
   expect(await check.json()).toMatchObject({ missing: [] });
   const get = await blobGet(env, sha, accountId);
@@ -938,7 +938,7 @@ describe("design 114 §7.3 fence release gates", () => {
       method: "POST",
       headers: { "content-type": "application/json", "x-rbox-protocol": "upload-receipts-v1" },
       body: JSON.stringify({ shas: [sha] }),
-    }), env, /^[0-9a-f]{64}$/, accountId);
+    }), env, accountId);
     // The receipts branch may also mint an uploadGrant (§109) — only the
     // missing set is under test here.
     expect(await check.json()).toMatchObject({ missing: [] });
@@ -1361,7 +1361,6 @@ describe("design 114 §7.3 fence release gates", () => {
           body: JSON.stringify({ shas }),
         }),
         env,
-        /^[0-9a-f]{64}$/,
         accountId,
       );
       expect(check.status).toBe(200);

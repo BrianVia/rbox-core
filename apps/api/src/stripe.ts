@@ -1,6 +1,6 @@
 import type { Env } from "./env.js";
 import type { Principal } from "./authz.js";
-import { ctEqual, json } from "./util.js";
+import { contentLengthClaim, ctEqual, json, readBytesCapped } from "./util.js";
 import { PLAN_LOOKUP_KEYS, PURCHASABLE_PLANS, planForLookupKey, type BillingCadence } from "./plans.js";
 import { GRACE_PERIOD_MS } from "./billing.js";
 import { dbFor, dirDb } from "./db.js";
@@ -128,7 +128,7 @@ function toHex(buf: ArrayBuffer): string {
 
 /** Verify a Stripe-Signature header against the raw body (HMAC-SHA256 over
  *  `${t}.${body}`), within the replay tolerance. Returns true iff a v1 sig matches. */
-export async function verifyStripeSignature(rawBody: string, sigHeader: string, secret: string, nowS: number): Promise<boolean> {
+export async function verifyStripeSignature(rawBody: string | Uint8Array, sigHeader: string, secret: string, nowS: number): Promise<boolean> {
   // Header: "t=...,v1=...,v1=...,v0=...". Preserve the RAW timestamp string (it's
   // signed verbatim) and collect ALL v1 signatures — Stripe sends one per active
   // secret during rotation, and any match is valid.
@@ -145,10 +145,23 @@ export async function verifyStripeSignature(rawBody: string, sigHeader: string, 
   if (!t || v1s.length === 0) return false;
   const tn = Number(t);
   if (!Number.isFinite(tn) || Math.abs(nowS - tn) > WEBHOOK_TOLERANCE_S) return false; // stale → reject (replay guard)
-  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-  const mac = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`${t}.${rawBody}`));
+  const encoder = new TextEncoder();
+  const bodyBytes = typeof rawBody === "string" ? encoder.encode(rawBody) : rawBody;
+  const prefix = encoder.encode(`${t}.`);
+  const signed = new Uint8Array(prefix.byteLength + bodyBytes.byteLength);
+  signed.set(prefix);
+  signed.set(bodyBytes, prefix.byteLength);
+  const key = await crypto.subtle.importKey("raw", encoder.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const mac = await crypto.subtle.sign("HMAC", key, signed);
   const expected = toHex(mac);
   return v1s.some((v) => ctEqual(expected, v)); // accept if ANY signature matches (constant-time)
+}
+
+export function stripeWebhookMaxBytes(env: Pick<Env, "RBOX_STRIPE_WEBHOOK_MAX_BYTES">): number {
+  const raw = env.RBOX_STRIPE_WEBHOOK_MAX_BYTES;
+  if (raw === undefined || !/^\d+$/.test(raw)) return 1024 * 1024;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) && value > 0 ? value : 1024 * 1024;
 }
 
 /** POST /v1/stripe/webhook — PUBLIC, signature-verified. Keeps accounts.plan
@@ -156,10 +169,21 @@ export async function verifyStripeSignature(rawBody: string, sigHeader: string, 
 export async function stripeWebhook(req: Request, env: Env, nowMs: number, ctx: Pick<ExecutionContext, "waitUntil">): Promise<Response> {
   if (!env.STRIPE_WEBHOOK_SECRET) return json({ error: "billing_not_configured" }, 501);
   const sig = req.headers.get("stripe-signature") ?? "";
-  const raw = await req.text(); // RAW body — signature is over exact bytes
-  if (!(await verifyStripeSignature(raw, sig, env.STRIPE_WEBHOOK_SECRET, Math.floor(nowMs / 1000)))) {
+  const read = await readBytesCapped(req, stripeWebhookMaxBytes(env));
+  if (read.kind === "overflow") {
+    console.warn(JSON.stringify({
+      event: "stripe_webhook_body_overflow",
+      contentLength: contentLengthClaim(req),
+      bytesCounted: read.bytesCounted,
+      signaturePresent: req.headers.has("stripe-signature"),
+    }));
+    return json({ error: "body_too_large" }, 413);
+  }
+  if (read.kind === "error") throw read.error;
+  if (!(await verifyStripeSignature(read.bytes, sig, env.STRIPE_WEBHOOK_SECRET, Math.floor(nowMs / 1000)))) {
     return json({ error: "bad_signature" }, 400);
   }
+  const raw = new TextDecoder().decode(read.bytes);
   const event = JSON.parse(raw) as { id: string; type: string; data: { object: any } };
 
   // Success-based idempotency: skip if already PROCESSED, else apply then record.

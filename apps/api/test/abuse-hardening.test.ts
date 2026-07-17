@@ -82,7 +82,7 @@ describe("design 64 §3.2 — per-account durable-device cap", () => {
 
   test("pair-redeem hits the same cap (409), keeps the token intact, and revoking frees a slot", async () => {
     const a = await bootstrap("acct-cap-pair"); // 1 durable device
-    const created = await SELF.fetch(`${BASE}/v1/auth/pair/create`, { method: "POST", headers: { authorization: `Bearer ${a.token}` } });
+    const created = await SELF.fetch(`${BASE}/v1/auth/pair/create`, { method: "POST", headers: { authorization: `Bearer ${a.token}`, "content-type": "application/json" }, body: "{}" });
     expect(created.status).toBe(200);
     const { token: pair } = (await created.json()) as { token: string };
 
@@ -124,7 +124,7 @@ describe("design 64 §3.2 — per-account durable-device cap", () => {
 
   test("pair-redeem tombstone semantics outrank the cap preflight", async () => {
     const a = await bootstrap("acct-cap-pair-tombstone");
-    const created = await SELF.fetch(`${BASE}/v1/auth/pair/create`, { method: "POST", headers: { authorization: `Bearer ${a.token}` } });
+    const created = await SELF.fetch(`${BASE}/v1/auth/pair/create`, { method: "POST", headers: { authorization: `Bearer ${a.token}`, "content-type": "application/json" }, body: "{}" });
     expect(created.status).toBe(200);
     const { token: pair } = (await created.json()) as { token: string };
     await fillDurableDevices(a.accountId, 1); // would cap at 2 if tombstone did not short-circuit it
@@ -170,7 +170,7 @@ describe("design 64 §3.1 — limiter guard (fail-open)", () => {
 
     const res = await pollDeviceAuth(pollReq("A".repeat(64)), { ...env, RL_DEVICE_POLL: failIfCalled, RL_DEVICE_POLL_IP: failIfCalled });
     expect(res.status).toBe(400);
-    expect(await res.json()).toEqual({ error: "bad_request" });
+    expect(await res.json()).toEqual({ error: "bad_request_shape" });
     expect(calls).toBe(0);
   });
 
