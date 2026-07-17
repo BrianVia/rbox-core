@@ -34,7 +34,7 @@ export function fakeDoSql(initial?: { dropped?: FakeDroppedRow[]; seqRoots?: Fak
         const floor = Number(bindings[0]);
         const limit = Number(bindings[1]);
         for (const row of [...seqRoots.values()].filter((row) => row.seq <= floor).slice(0, limit)) seqRoots.delete(row.seq);
-      } else if (sql.startsWith("select sha256 from dropped_index")) {
+      } else if (sql.startsWith("select sha256 from dropped_index") || sql.startsWith("select sha256,last_seq from dropped_index")) {
         const floor = Number(bindings[0]);
         const cursor = String(bindings[1]);
         const limit = Number(bindings[2]);
