@@ -1,13 +1,16 @@
-# 149 — Storage economics: O(change) commits and fair-use enforcement (v4)
+# 149 — Storage economics: O(change) commits and fair-use enforcement (v5)
 
-v4 after review round 3 (CHANGES-REQUIRED, 12 findings — REVIEW-149.md).
-All round-3 orchestrator rulings are binding. This revision makes incapable
-observations non-clearable for 24 hours, states the cooperative encoding trust
-boundary honestly, and makes rooting rollout and fair-use floor selection
-executable against the current routes, DO schema, and D1 schema. The next
+v5 after review round 4 (CHANGES-REQUIRED, 5 substantive findings plus three
+editorials — REVIEW-149.md). All round-4 orchestrator rulings are binding.
+This revision makes encoding overrides independent per axis, states the
+bounded concurrent-mutation overshoot as product semantics, bounds marginal
+release work through a materialized per-SHA relation, accounts for every
+commit mode for the full semaphore lifetime, and specifies the executable
+production roots-format deploy floor. The next
 free D1 migration is `apps/api/migrations/0029_storage_economics.sql` (the
 current tail is `0028_fleet_alert_state.sql`); Unit A's index and Unit C's
-tables share that one append-only migration.
+ledger/`fairuse_sha_last` tables plus `meta_deploy_floor` share that one
+append-only migration.
 
 ## Problem, with field evidence
 
@@ -243,12 +246,15 @@ canonical fields (JCS signing is at `src/engine/e2ee/commit.ts:123-145`):
 capabilityGen?: number;
 manifestEncoding?: "raw" | "snapshot" | "delta";
 refsetEncoding?: "full" | "delta";
-override?: true;
+manifestOverride?: true;
+refsetOverride?: true;
 ```
 
 New writers always send a nonnegative safe-integer `capabilityGen` plus
-`manifestEncoding` and `refsetEncoding` together; only explicit force-on
-sends `override:true`. The Worker view at
+`manifestEncoding` and `refsetEncoding` together. An explicit manifest
+force-on sends `manifestOverride:true`; an explicit refset force-on sends
+`refsetOverride:true`. Each field describes and bypasses only its own axis.
+The Worker view at
 `apps/api/src/commit-envelope.ts:53-64` gains the same fields. The fields are
 independent, so every cross-product is legal, including a force-raw manifest
 with a delta refset.
@@ -268,23 +274,24 @@ verify, and admission applies compatibility floors to that promise.
 
 Whenever either declaration is present, both MUST be present and
 `capabilityGen` MUST be a nonnegative safe integer no greater than current
-`gen`, including raw/full and override commits. The admission matrix is the
-independent union of these rows:
+`gen`, including raw/full and per-axis override commits. Admission is the
+cross-product of these independent rows:
 
-| Field | Declared value | Compatibility floors relied upon |
-|---|---|---|
-| `manifestEncoding` | `raw` | none |
-| `manifestEncoding` | `snapshot` | `mdeSnapshot` |
-| `manifestEncoding` | `delta` | `mdeSnapshot`, `mdeDelta` |
-| `refsetEncoding` | `full` | none |
-| `refsetEncoding` | `delta` | `refsetDelta` |
+| Axis | Declared value | Floors ordinarily required | Permitted override and exact effect |
+|---|---|---|---|
+| manifest | `raw` | none | none; `manifestOverride` is invalid |
+| manifest | `snapshot` | `mdeSnapshot` | `manifestOverride:true` bypasses only this row's manifest floor/lowered-generation tests |
+| manifest | `delta` | `mdeSnapshot`, `mdeDelta` | `manifestOverride:true` bypasses only this row's manifest floor/lowered-generation tests |
+| refset | `full` | none | none; `refsetOverride` is invalid |
+| refset | `delta` | `refsetDelta` | `refsetOverride:true` bypasses only this row's refset floor/lowered-generation test |
 
-For every relied-on floor, its current value must be true and
-`capabilityGen >= *_lowered_gen`. `override:true` bypasses only those
-floor/lowered-generation tests; it never bypasses the generation bound or B's
-independently verifiable refset framing, hash, entitlement, count, and
-accounting checks. Unknown enum values, only one declaration, `override:false`,
-or override without both declarations are 400. A visible refset declaration
+For every non-overridden relied-on floor, its current value must be true and
+`capabilityGen >= *_lowered_gen`. A manifest override never bypasses a refset
+test, and a refset override never bypasses a manifest test. Neither override
+bypasses the generation bound or B's independently verifiable refset framing,
+hash, entitlement, count, and accounting checks. Unknown enum values, only one
+declaration, either override encoded as `false`, an override on a raw/full row,
+or any override without both declarations are 400. A visible refset declaration
 must agree with the B descriptor (`full` for inline/legacy/RSD-full, `delta`
 for RSD-delta); that proves the refset wire form, not the encrypted manifest
 class. Manifest-chain shape is retained and validated for ordinary protocol
@@ -305,20 +312,32 @@ than guessing. This exception is required because released v1.7.1 emits no
 declarations and raw and snapshot are indistinguishable ciphertext today
 (`src/cli/e2ee-remote.ts:783-795`). v1.7.1 remains on its manual inventory
 gate until the new declaring client ships; new founder force-on clients send
-both actual declarations plus `override:true`. The gate can never brick the
-released fleet.
+both actual declarations plus only the override field(s) for the force-on
+axis or axes. The gate can never brick the released fleet.
 
 ### A3 — defaults and flag seams
 
-- With floors true, writers default to snapshot (and delta once
-  `mdeDelta` floor is true — one release after snapshot, F5's cadence).
+- With floors true, writers default to snapshot AND delta in the same
+  release (founder default-on ruling 2026-07-18: the floor mechanism IS
+  the bake gate — a floor that is satisfiable graduates immediately;
+  staging an extra release adds delay without adding safety, since both
+  encodings share the identical Phase-B reader floor).
   Env flags become tri-state overrides at BOTH seams — `mdeWriteCaps()`
   (`src/cli/e2ee-remote.ts:73-80`) and push's deltaBase selection
-  (`src/cli/sync/push.ts:629-636`): `"0"` force-raw (kill-switch), `"1"`
-  force-on (bypasses floors — operator accepts responsibility), unset →
-  floor-driven. Refset full/delta has its own independent
+  (`src/cli/sync/push.ts:629-636`): `RBOX_MDE_SNAPSHOT="0"` is the emergency
+  kill switch and wins over every other manifest flag: it forces raw and
+  disables delta even when `RBOX_MDE_DELTA="1"`. That contradictory pair is
+  accepted, logs warning `mde_delta_ignored_snapshot_kill_switch`, and sends no
+  manifest override. Otherwise `RBOX_MDE_DELTA="1"` forces delta (and therefore
+  snapshot) with `manifestOverride:true`; `RBOX_MDE_SNAPSHOT="1"` with delta
+  not force-on emits snapshot with `manifestOverride:true`; delta `"0"`
+  disables delta without disabling a snapshot; and each unset flag is
+  floor-driven unless the other manifest flag has selected a forced class.
+  This prevents a snapshot-only force-on from silently overriding a
+  floor-driven `mdeDelta` check. Refset full/delta has its own independent
   `RBOX_REFSET_DELTA` tri-state: `"0"` force-full/reanchor, `"1"` force-delta
-  when verified base evidence exists, unset → `refsetDelta` floor-driven.
+  with `refsetOverride:true` when verified base evidence exists, unset →
+  `refsetDelta` floor-driven.
   Manifest force-raw neither disables nor reanchors a valid refset delta.
 
 ### A4 — the exclusion ruling and day-31 semantics (explicit, per F3/F4)
@@ -326,20 +345,22 @@ released fleet.
 - **Product ruling (amends design 84's open compat window, requires
   founder sign-off at review exit):** a device absent for
   > `CAP_WINDOW_DAYS` days no longer holds back the workspace's floors.
-- Day-31 semantics per surface for an excluded pre-Phase-B device:
-  - **pull/sync**: decrypt succeeds, JSON.parse of the envelope fails →
-    the generic manifest-validation error, NOT a friendly message
-    (design 84 records pre-B readers have no envelope handling,
-    `84:1063-1076`). Accepted: pre-B binaries cannot be taught new error
-    text retroactively. Mitigation: the release notes and site FAQ carry
-    the "upgrade rbox" translation; Phase-B+ devices (v1.1.0+, all known
-    real devices) get the typed fail-closed error already shipped.
-  - **push**: the stale device may upload a raw-v0 manifest and win a
-    legacy-absent commit (which always admits), re-entering the recent set
-    and lowering floors via A1's recompute — the system heals toward the
-    most conservative live population automatically. A new declaring raw
-    commit still needs a valid generation but no floor. An orphaned uploaded
-    manifest blob from a lost race is reclaimed by Phase 1 as unrooted.
+
+**Day-31 semantics per surface for an excluded pre-Phase-B device:**
+
+- **pull/sync**: decrypt succeeds, JSON.parse of the envelope fails →
+  the generic manifest-validation error, NOT a friendly message
+  (design 84 records pre-B readers have no envelope handling,
+  `84:1063-1076`). Accepted: pre-B binaries cannot be taught new error
+  text retroactively. Mitigation: the release notes and site FAQ carry
+  the "upgrade rbox" translation; Phase-B+ devices (v1.1.0+, all known
+  real devices) get the typed fail-closed error already shipped.
+- **push**: the stale device may upload a raw-v0 manifest and win a
+  legacy-absent commit (which always admits), re-entering the recent set
+  and lowering floors via A1's recompute — the system heals toward the
+  most conservative live population automatically. A new declaring raw
+  commit still needs a valid generation but no floor. An orphaned uploaded
+  manifest blob from a lost race is reclaimed by Phase 1 as unrooted.
 - The v1.7.1 manual flip remains in force until A ships; A replaces it.
 
 ## Unit B — refset sidecar deltas
@@ -478,30 +499,38 @@ Peak isolate memory is a protocol budget, not an inference from the 32 MiB
 cumulative carrier limit. Replace the module-wide `isolateFoldActive` guard
 at `workspace-sync.ts:736-744` with one shared `isolateHeavyFoldActive`
 semaphore used by roots alarms, admission folds, and fair-use folds. The
-commit route acquires it before decoding every commit request,
-releases it immediately after an inline mode is decoded, and retains it
-through any sidecar fold. Thus the mode need not be known before gating and
-no roots/admission/fair-use pair can overlap. Contenders in any DO instance
-fail/requeue before body allocation; all exit paths release it. The sidecar path uses a bounded
-streaming request decoder that compacts the capped wire body/receipts into an
-at-most-8-MiB slab and releases the wire buffer. It incrementally hashes and
-parses each R2 stream in fixed chunks, merges binary `sha256[32]||size[8]`
-records, and releases each Response/chunk and the prior canonical buffer as
-soon as consumed. It never materializes a whole carrier, a 250,000-element
-string array/Set, or both old input and two outputs. SHA hex strings exist
-only for the existing bounded accounting chunk and are released per chunk.
+commit route acquires it before decoding every commit request and holds it
+until commit accounting has completed and every wire, parsed, fold, and
+accounting allocation for that request has been released. Inline mode has no
+early release. Thus the mode need not be known before gating and no two
+admission requests, nor an admission and roots/fair-use fold, can overlap in
+one isolate. Contenders in any DO instance fail/requeue before body allocation;
+every success and error path releases in one `finally` after allocation
+cleanup.
 
-With one fold in flight, the worst-case accounted live set per isolate is:
+All modes use the bounded streaming request decoder. It compacts the capped
+wire body/receipts directly into an at-most-8-MiB binary parsed slab and
+releases the wire buffer; inline mode does not retain the deployed
+`JSON.parse` object graph. The sidecar path additionally hashes and parses each
+R2 stream in fixed chunks, merges binary `sha256[32]||size[8]` records, and
+releases each Response/chunk and the prior canonical buffer as soon as
+consumed. No mode materializes a 250,000-element string array/Set. SHA hex
+strings exist only for one bounded accounting chunk and are released per
+chunk.
 
-| Live allocation | Maximum |
-|---|---:|
-| old canonical 250k set | 10,000,018 B |
-| merge output 250k set | 10,000,018 B |
-| compact normalized request/receipts | 8 MiB |
-| incremental R2/parser/hash window | 1 MiB |
-| one accounting chunk | 1 MiB |
-| binary index, allocator, and JS/runtime allowance | 18,000,000 B |
-| **total** | **48,485,796 B (<48 MiB)** |
+With aggregate gated concurrency exactly one, the worst-case accounted live
+set per isolate is:
+
+| Live allocation | Sidecar maximum | Inline maximum |
+|---|---:|---:|
+| old canonical 250k set | 10,000,018 B | 0 B |
+| merge output 250k set | 10,000,018 B | 0 B |
+| compact parsed request/receipts | 8 MiB | 8 MiB |
+| incremental decoder/parser/hash window | 1 MiB | 1 MiB |
+| one accounting chunk | 1 MiB | 1 MiB |
+| binary index, allocator, and JS/runtime allowance | 18,000,000 B | 18,000,000 B |
+| concurrent gated operations | 1 | 1 |
+| **mode total** | **48,485,796 B (<48 MiB)** | **28,485,760 B (<28 MiB)** |
 
 Allocation high-water instrumentation enforces this model; inability to stay
 within it fails 503 `sidecar_fold_budget` before head movement. Cumulative
@@ -671,10 +700,22 @@ magic fail-closed, but no capable writer exists before every Worker reads it.
 
 ### C1 — invariant (renamed per F13)
 
-Per account: `historyBytes ≤ 5 × max(activeBytes, 1 GiB)` — the
-**floor-adjusted fair-use bound**, allowance account-global. Acceptance
-uses this exact formula (a 100MiB-active account legitimately retains up
-to 5 GiB of history).
+At quiescence, per account: `historyBytes ≤ 5 × max(activeBytes, 1 GiB)` —
+the **floor-adjusted fair-use bound**, allowance account-global. Acceptance
+uses this exact formula (a 100MiB-active account legitimately retains up to
+5 GiB of history).
+
+Concurrent account mutation deliberately has bounded, honest overshoot
+semantics rather than a cross-DO serialization guarantee. A completed scan
+may become stale after its full pre-batch re-probe and before the target DO
+transaction. In that race, fair-use enforcement may prune at most one extra
+batch: no more than 500 non-head sequences from the single globally oldest
+eligible workspace, never a head and always drawn from the oldest retained
+history within the plan's retention window. The successful movement retires
+the epoch, so another batch requires a fresh scan. The re-probe keeps the stale
+interval to the seconds needed to read at most 64 DO pins and dispatch one
+target mutation; oldest-first puts any overshoot in the least-valuable retained
+history.
 
 ### C2 — durable scan ledger (per F11)
 
@@ -705,6 +746,7 @@ CREATE TABLE IF NOT EXISTS fairuse_scans (
   entitlement_cursor_sha TEXT,
   verify_cursor_id TEXT,
   verify_cursor_project TEXT,
+  release_checkpoint TEXT,
   pending_prune_request TEXT,
   active_bytes INTEGER NOT NULL DEFAULT 0 CHECK(active_bytes>=0),
   history_bytes INTEGER NOT NULL DEFAULT 0 CHECK(history_bytes>=0),
@@ -755,6 +797,21 @@ ON fairuse_root_membership(
   account_id,epoch,workspace_id,project_id,head,sequence,sha256
 );
 
+CREATE TABLE IF NOT EXISTS fairuse_sha_last (
+  account_id TEXT NOT NULL,
+  epoch INTEGER NOT NULL,
+  sha256 TEXT NOT NULL,
+  last_ws TEXT NOT NULL,
+  last_proj TEXT NOT NULL,
+  last_seq INTEGER NOT NULL CHECK(last_seq>=0),
+  in_head INTEGER NOT NULL CHECK(in_head IN (0,1)),
+  PRIMARY KEY(account_id,epoch,sha256)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_fairuse_sha_last_release
+ON fairuse_sha_last(
+  account_id,epoch,in_head,last_ws,last_proj,last_seq,sha256
+);
+
 CREATE TABLE IF NOT EXISTS fairuse_materialize_refs (
   account_id TEXT NOT NULL,
   epoch INTEGER NOT NULL,
@@ -785,12 +842,18 @@ CREATE INDEX IF NOT EXISTS idx_fairuse_queue_due
 ON fairuse_account_queue(next_run_at,account_id);
 CREATE INDEX IF NOT EXISTS idx_workspaces_account_scan
 ON workspaces(account_id,created_at,workspace_id,project_id);
+
+CREATE TABLE IF NOT EXISTS meta_deploy_floor (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 ```
 
 No foreign keys is intentional: account deletion adds explicit deletes for
 these account-owned tables, and old epoch cleanup transactionally deletes
-materialization rows, membership, workspace streams, then scan row by
-`(account_id,epoch)`.
+materialization rows, membership, `fairuse_sha_last`, workspace streams, then
+the scan row by `(account_id,epoch)`. `meta_deploy_floor` is global deployment
+metadata and is not account-owned.
 
 Global scheduling is also bounded. `fairuse_scheduler` starts at
 `(1,NULL,now)`. Each scheduled invocation keyset-reads at most one account
@@ -837,13 +900,34 @@ The checkpoint machine is exact:
    `fairuse_materialize_refs`. Each transaction commits the working-set
    inserts/deletes and the next `materialize_cursor` together. After the last
    carrier it validates count/total/resultSha by keyset-streaming the durable
-   set. The output phase handles at most 600 ordered SHAs: in one transaction
-   it inserts that membership page, deletes exactly that page with one
-   sequence/`lastSha` range statement, and checkpoints the output page token.
+   set. The output phase handles at most 200 ordered SHAs: in one transaction
+   it inserts that membership page, upserts the same SHAs into
+   `fairuse_sha_last`, deletes exactly that page with one sequence/`lastSha`
+   range statement, and checkpoints the output page token. The per-SHA row ORs
+   `in_head` across all membership and keeps the last retained non-head
+   reachability under the selector's exact
+   `(committed_at,workspace_id,project_id,sequence)` order, where
+   `committed_at` is the mirrored `commits.created_at`; a SHA with only head
+   membership stores that deterministic head location as an inert last tuple
+   and has `in_head=1`. A `timestamp_gap=1` membership sorts after every
+   timestamped membership (then by workspace/project/sequence), conservatively
+   making that SHA unreleasable in this epoch. Because the compact last row
+   does not duplicate timestamps, its upsert recovers the prior
+   `committed_at,timestamp_gap` with an exact correlated point lookup into
+   `fairuse_root_membership INDEXED BY
+   sqlite_autoindex_fairuse_root_membership_1` using the stored
+   account/epoch/SHA/last-workspace/last-project/`head=0`/last-sequence tuple,
+   then compares that evidence with the incoming membership before
+   replacement. Thus a later target occurrence, another
+   workspace occurrence, or any head prevents an earlier cut from releasing
+   the SHA. Membership, `fairuse_sha_last`, working-set deletion, and cursor
+   advance are atomic, so a crash cannot expose a last-location row ahead of
+   membership or resume without it.
    Intermediate pages neither advance `roots_cursor` nor delete un-emitted
    rows; only the final empty-page proof advances it and marks the outer page
-   done. Fold working-set mutation and membership output are separate ticks
-   and share one 600-logical-record/64-statement budget, never two allowances.
+   done. Fold working-set mutation and membership output are separate ticks:
+   fold ticks admit 600 logical records, output ticks 200, and both remain
+   within one 64-statement budget, never two allowances.
    Abort/plan-invalidation cleanup uses the same ≤600-row keyset paging. A
    crash resumes at the exact carrier/page token without duplicating/omitting
    records or refolding all parents. One 250,000-ref sequence therefore spans ticks.
@@ -867,8 +951,9 @@ The checkpoint machine is exact:
    sets `completed_at=now,status='complete'` and
    `bound_bytes=5*max(active_bytes,1073741824)` only if exact set equality is
    still true at that transition. Any mismatch deletes only
-   that epoch's partial roots/streams, sets `aborted_pins` with
-   `completed_at=NULL`, and the next tick allocates `MAX(epoch)+1`.
+   that epoch's partial membership/`fairuse_sha_last`/streams, sets
+   `aborted_pins` with `completed_at=NULL`, and the next tick allocates
+   `MAX(epoch)+1`.
    Verification slices are not a cross-DO transaction; therefore completion
    is not itself authority to mutate. The pre-batch whole-account set+pin
    re-probe in C3 is mandatory immediately before every `/prune` dispatch.
@@ -880,17 +965,21 @@ are committed together, then the account is requeued:
 | Phase | Pages/tick and page size | DO/R2 subrequests | D1 subrequests | D1 statements | synchronous CPU deadline |
 |---|---|---:|---:|---:|---:|
 | `capture_pins` | 1 page, 8 workspaces | ≤8 DO pin reads | ≤2 | ≤16 | 25 ms |
-| `materialize_roots` | 1 page, ≤600 rows and endpoint byte cap | ≤17 (1 DO + ≤16 carrier reads) | ≤2 | ≤64 | 500 ms B-fold deadline |
+| `materialize_roots` | 1 page, ≤600 fold rows or ≤200 output SHAs/600 physical row mutations, plus endpoint byte cap | ≤17 (1 DO + ≤16 carrier reads) | ≤2 | ≤64 | 500 ms B-fold deadline |
 | `classify_entitlements` | 1 page, 2,000 refs | 0 | ≤3 | ≤8 | 25 ms |
 | verify/complete | 1 slice, 8 workspaces | ≤8 DO pin reads | ≤2 | ≤16 | 25 ms |
-| pre-prune fence + enforce | exact set + all pins + one pending move | ≤65 DO (≤64 pin reads + ≤1 prune) | ≤16 (including ≤10 marginal queries) | ≤40 | 25 ms outside DO/B fold |
+| pre-prune re-probe + selector/enforce | exact set + all pins, one release page, or one pending move | ≤65 DO (≤64 pin reads + ≤1 prune) | ≤16 (at most one release-page query per tick) | ≤40 | 25 ms outside DO/B fold |
 
 This is stricter than the current Phase-1 subrequest ceiling
 (`apps/api/src/gc-phase1.ts:7-13`). A `409 prune_deferred` preserves and
 retries the same pending request; it never selects another move from that
-epoch. Root inserts use at most 11 nine-bind rows per statement (≤99 D1
-parameters), hence ≤55 insert statements for 600 rows, leaving nine of the
-64-statement budget for checkpoint/lease work; D1's 100-bind constraint is
+epoch. Membership inserts use at most 11 nine-bind rows per statement (≤99 D1
+parameters). An output tick therefore uses at most 19 membership statements
+plus 19 `fairuse_sha_last` upsert statements for 200 SHAs; with one 200-row
+working-set range delete that is at most 600 physical row mutations and leaves
+25 of the 64-statement budget for cursor, lease, queue, and other checkpoint
+work. A fold-only tick retains the existing ≤55 working-set statements for
+600 rows and nine statements of overhead. D1's 100-bind constraint is
 documented at `apps/api/src/commit-accounting.ts:26-29`. Inserts use
 `ON CONFLICT(account_id,epoch,workspace_id,project_id,sha256,head,sequence)
 DO UPDATE SET committed_at=CASE
@@ -914,7 +1003,8 @@ the latest non-null timestamp exactly as the runner does at
   likewise compare the exact old value. `plan_snapshot` is immutable canonical
   JSON of the resolved plan inputs (resolved plan, grace stamp, and relevant
   storage-plan fields) captured at epoch creation. Every scan cursor,
-  aggregate, status, pending-request, dispatch, result, and queue transition
+  aggregate, release checkpoint, status, pending-request, dispatch, result,
+  and queue transition
   is one guarded update with all three predicates: the exact unexpired lease
   value exists, `status=<expected status>`, and
   `plan_snapshot=<expected snapshot>`. Renew before five minutes and again
@@ -925,7 +1015,7 @@ the latest non-null timestamp exactly as the runner does at
   skipped entirely — the locked-account contract (all history preserved
   during grace, `apps/api/migrations/0012_billing_grace.sql`) dominates
   fair-use.
-- **Whole-account pre-batch fence:** immediately before EACH fair-use prune
+- **Whole-account pre-batch re-probe:** immediately before EACH fair-use prune
   batch, query authoritative D1 workspaces ordered by
   `(created_at,workspace_id,project_id) LIMIT 65`. More than
   `FAIRUSE_MAX_WORKSPACES=64`, or any exact tuple-set difference from both
@@ -944,6 +1034,21 @@ the latest non-null timestamp exactly as the runner does at
   is recorded and retires the epoch; a miss aborts it. Any workspace-set,
   non-target, head, or generation drift aborts without replay. This result
   reconciliation is not a new prune batch or target selection.
+  This serial set+pin re-probe is a bounded-staleness check, not account-wide
+  serialization: an already-probed non-target DO can mutate before the target
+  transaction. C1's product contract therefore permits only the one selected
+  ≤500-sequence batch to overshoot under that race. A positive target movement
+  retires the epoch, while head exclusion, the retained plan window, and the
+  target DO's local pin/CAS remain hard guards.
+
+  **Rejected alternative:** an authoritative account-wide generation or
+  global cross-DO mutation lock covering workspace set, head, floor, and index
+  changes would close this TOCTOU interval. It is rejected here because the
+  system deliberately has no cross-DO transaction/serialization primitive;
+  introducing one would put every ordinary workspace mutation on a new
+  account-global coordination path, disproportionate to the bounded
+  oldest-history overshoot. The re-probe keeps the stale window to seconds and
+  the single-batch retirement rule prevents compounding it.
 - Ordering is one account-global tuple from the D1 commits mirror:
   `(created_at,workspace_id,project_id,sequence)` ascending. A
   `(workspace_id,project_id)` whose next candidate sequence lacks a mirror
@@ -956,55 +1061,80 @@ the latest non-null timestamp exactly as the runner does at
   bounded rows, so no account-wide commit sort or new unindexed sweep exists.
 - Floor targets are derived from exact membership, never estimated from
   per-sequence bytes. For account `A`, epoch `E`, target workspace `(W,P)`,
-  saved floor `F`, and candidate `T`, `release(T)` counts an entitled SHA once
-  exactly when the cut `(W,P,F < sequence <= T)` contains it and no membership
-  survives outside that cut:
+  saved floor `F`, and candidate `T`, the materialized relation makes the
+  release predicate executable: a SHA is released exactly when `in_head=0`,
+  `last_ws=W`, `last_proj=P`, and `F < last_seq <= T`. The selector's
+  global-oldest contiguous-prefix rule is a precondition of this reduction:
+  no earlier occurrence in another workspace can be skipped. A later target
+  occurrence, another workspace's later occurrence, or any head therefore
+  contributes zero. Increasing `T` only admits additional last-location rows,
+  so `release(T)` remains nondecreasing and binary search remains valid.
+
+  `release(T)` is the sum of bounded pages from this pinned range query; the
+  Worker adds the returned `size_bytes` values using checked integers:
 
 ```sql
-WITH candidate AS (
-  SELECT DISTINCT sha256
-  FROM fairuse_root_membership
-  WHERE account_id=:A AND epoch=:E
-    AND workspace_id=:W AND project_id=:P AND head=0
-    AND sequence>:F AND sequence<=:T
-), released AS (
-  SELECT c.sha256
-  FROM candidate c
-  WHERE NOT EXISTS (
-    SELECT 1 FROM fairuse_root_membership k
-    WHERE k.account_id=:A AND k.epoch=:E AND k.sha256=c.sha256
-      AND NOT (
-        k.workspace_id=:W AND k.project_id=:P AND k.head=0
-        AND k.sequence>:F AND k.sequence<=:T
-      )
-  )
-)
-SELECT COALESCE(SUM(b.size_bytes),0) AS marginal_release
-FROM released x
-JOIN blob_refs r ON r.account_id=:A AND r.sha256=x.sha256
-JOIN blobs b ON b.sha256=x.sha256;
+SELECT s.last_seq, s.sha256,
+       (
+         SELECT b.size_bytes
+         FROM blob_refs AS r INDEXED BY sqlite_autoindex_blob_refs_1
+         JOIN blobs AS b INDEXED BY sqlite_autoindex_blobs_1
+           ON b.sha256=r.sha256
+         WHERE r.account_id=:A AND r.sha256=s.sha256
+       ) AS size_bytes
+FROM fairuse_sha_last AS s INDEXED BY idx_fairuse_sha_last_release
+WHERE s.account_id=:A AND s.epoch=:E AND s.in_head=0
+  AND s.last_ws=:W AND s.last_proj=:P
+  AND s.last_seq<=:T
+  AND (s.last_seq,s.sha256)>(:afterSeq,:afterSha)
+ORDER BY s.last_seq,s.sha256
+LIMIT :pageLimitPlusOne;
 ```
 
-  The candidate and SHA-centric indexes in C2 support the cut and anti-join.
-  A SHA shared by a later sequence, another workspace, or any head therefore
-  contributes zero; its size is summed only when its last retained account
-  reachability is removed.
+  `FAIRUSE_RELEASE_PAGE_ROWS=2000`, so `pageLimitPlusOne=2001`. The extra row
+  is lookahead and is never added to the page sum. Both named autoindexes are
+  the existing primary-key indexes from migrations 0006 and 0001; every
+  access path is therefore pinned with `INDEXED BY`, and the release index
+  supplies range order without a DISTINCT/temp B-tree. A null `size_bytes`,
+  duplicate row, order violation, or checked-sum overflow invalidates the
+  epoch fail-closed.
+
+  The initial keyset cursor is exactly `(afterSeq,afterSha)=(F,'')`; resumed
+  cursors must satisfy `F<=afterSeq<=T`. The row-value predicate is mandatory:
+  SQLite must seek the release index at that tuple rather than restart at `F`
+  and filter an OR expression across the already-aggregated prefix.
+
+  One query may report at most `FAIRUSE_RELEASE_ROWS_READ_MAX=8192` through D1
+  result metadata and one enforcement tick issues at most one such query. A
+  lookahead row, rows-read-budget hit, or CPU deadline persists canonical
+  `release_checkpoint={candidateT,afterSeq,afterSha,partialRelease,low,high}`
+  in the guarded scan row and requeues; `after*` names the last included row,
+  never the lookahead. Resume repeats the same pinned query strictly after
+  that tuple. Even when a page appears terminal, a budget hit checkpoints and
+  a later empty page proves exhaustion. Each `release(T)` evaluation can span
+  ticks; only after its empty-page proof may binary search update `low/high` or
+  persist the final prune request. Plan invalidation, pin abort, or epoch
+  cleanup clears the checkpoint.
 - The selector merge-orders each workspace's next sequence by
   `(created_at,workspace_id,project_id,sequence)`. It chooses the global oldest
   workspace, then forms only that workspace's contiguous prefix before the
   next-oldest tuple from another workspace, capped at
-  `min(pin_head-1,F+500)`. A missing timestamp stops that pair as specified
-  above. Let `excess=max(0,history_bytes-bound_bytes)`. Evaluate the exact
+  `min(pin_head-1,F+500)`. Since candidates start at the saved retained floor
+  `F`, the batch is drawn from the oldest history still inside the plan's
+  retention window; fair use may shorten that retained window but never
+  crosses the head. A missing timestamp stops that pair as specified above.
+  Let `excess=max(0,history_bytes-bound_bytes)`. Evaluate the exact
   monotone `release(T)` at the prefix end; if it reaches excess, binary-search
-  with the same query for the smallest such `T` (at most 10 exact queries for
-  a 500-sequence prefix); otherwise choose the prefix end. Persist that exact
+  with the same resumable evaluation for the smallest such `T` (at most 10
+  completed evaluations for a 500-sequence prefix); otherwise choose the
+  prefix end. Atomically clear `release_checkpoint` and persist that exact
   `{floor:T,maxDelta:T-F,...}` request before the whole-account re-probe.
   The selector cannot jump an older tuple in another workspace and cannot
   guess about shared bytes.
 - There is at most ONE successful floor movement total from a completed
   epoch (therefore at most one per workspace per epoch). After a positive DO
   result, retire the epoch and run a fresh complete scan before any further
-  movement. This also follows mechanically from the next pre-batch probe:
+  movement. This also follows mechanically from the next pre-batch re-probe:
   the moved workspace's saved `pruneFloor` no longer matches. A
   `409 prune_deferred` retries only the identical pending request and does not
   select another workspace or target.
@@ -1072,25 +1202,58 @@ Both callers check it before any floor move; fair-use also CAS-clears
 before any emergency server rollback. Once any RSD1 object exists, however,
 rollback below the B codec/rooting server is prohibited: old `/roots` cannot
 root parent carriers and old `/prune` ignores both coverage and this new env.
-The deploy job records minimum roots format 2 and refuses such a production
-rollback; recovery is a forward fix with history pruning and RSD writers
-disabled. This follows the existing explicit kill-switch convention at
-`apps/api/src/env.ts:47-55` without claiming old code can enforce a new
-switch.
+Migration 0029's `meta_deploy_floor` makes that production prohibition
+executable. Its contract is:
+
+- Key `roots_format_generation` has a canonical decimal safe-integer `value`;
+  an absent row means generation 1. Malformed or nonpositive stored values
+  fail the deployment closed.
+- The checked-out Worker source exports the version-controlled integer
+  `ROOTS_FORMAT_SUPPORTED_GENERATION`; the RSD1 codec/rooting server sets it to
+  2. The deploy helper reads this constant from the candidate artifact, never
+  from mutable workflow input or the currently deployed Worker. A candidate
+  artifact that predates or omits the constant deterministically means
+  generation 1 (or may fail closed); it can never inherit the deployed
+  generation or the stored floor.
+- After production migrations and before Worker deploy, the production job
+  reads `meta_deploy_floor`, compares the candidate generation with the stored
+  floor, and refuses the deploy when candidate `< floor`. Equality is allowed.
+- Only after the candidate Worker deploy succeeds, the same job's RSD1-era
+  path transactionally upserts the row to
+  `max(storedFloor,ROOTS_FORMAT_SUPPORTED_GENERATION)` and verifies readback.
+  A failed Worker deploy never advances the floor. The first RSD1 writer may
+  not be enabled until readback is 2; once it is 2, an old generation-1
+  candidate is rejected before deploy. A failed post-deploy floor write fails
+  the job and keeps RSD1 writing disabled until the idempotent step succeeds.
+
+Recovery is a forward fix with history pruning and RSD writers disabled. This
+follows the existing explicit kill-switch convention at
+`apps/api/src/env.ts:47-55` without claiming old code can enforce a new switch.
+
+**Design-150 seam:** design 149 owns the schema, constants, ordering, failure
+semantics, and tests above, but `.github/workflows/deploy-api.yml` is currently
+owned by design 150's GHA revamp. The workflow step lands only through a
+150-coordinated PR after a joint seam review; 149 does not independently edit
+that YAML.
 
 ### C4 — retention grace read fix (narrowed per F16)
 
 `retentionPrune` consults grace only after plan resolution and only when
 the resolved plan is `none` (`apps/api/src/retention.ts:51-59` reorder).
-NO change to `adminSetPlan`/Stripe grace-stamping semantics; C5 only makes
-their plan-write batches lease-aware. Regression pair: paid plan
-with live stale stamp IS pruned; locked account within grace is NOT.
+Regression pair: paid plan with live stale stamp IS pruned; locked account
+within grace is NOT.
 
 ### C5 — surface (F17)
 
 `GET /v1/account/usage` adds `fairUse: { activeBytes, historyBytes,
-bound, lastCompletedEpochAt, pruningActive }` read from the scan ledger;
-`rbox status` renders one line when `pruningActive`.
+bound, lastCompletedEpochAt, pruningActive, overshoot:{maxBatches:1,
+maxSequences:500} }`. The epoch-specific fields are read from the scan ledger;
+the static `overshoot` policy descriptor is appended by the API. The API
+description and `rbox status` text state that the bound is exact at quiescence; concurrent
+account mutation may remove at most one extra batch of at most 500 sequences
+from the single oldest eligible workspace, never a head and always from the
+oldest retained history within the plan window. `rbox status` renders the
+enforcement line when `pruningActive`.
 
 The displayed totals are exactly the latest stable epoch:
 
@@ -1104,7 +1267,7 @@ ORDER BY completed_at DESC,epoch DESC LIMIT 1;
 Lifecycle is durable: terminal pin verification writes `complete` and
 `completed_at`. Before dispatch, the lease holder stores the exact canonical
 body in `pending_prune_request` but leaves `pruning_active=0`. Recovery uses
-C3's full pre-batch probe: exact pins may safely replay; a target-floor-only
+C3's full pre-batch re-probe: exact pins may safely replay; a target-floor-only
 mismatch may replay solely to recover an existing fenced result and otherwise
 fails stale without mutation; every other drift aborts. Only a positive
 `pruned>0` response (original or reconciled replay) CAS-transitions
@@ -1124,7 +1287,8 @@ path uses one D1 `batch()` containing: the guarded account-plan write; an
 `INSERT ... ON CONFLICT(account_id) DO UPDATE` that rotates
 `fairuse_leases.value` to a fresh canonical, expired, immediately-takeoverable
 plan-change tombstone; invalidation of every reusable/prunable scan with
-`pending_prune_request=NULL,pruning_active=0,status='invalidated_plan'`; and
+`release_checkpoint=NULL,pending_prune_request=NULL,pruning_active=0,
+status='invalidated_plan'`; and
 the account-queue upsert. A duplicate/no-op plan event may conservatively
 rotate too. Any statement failure rolls back the plan write and rotation
 together.
@@ -1164,8 +1328,11 @@ Resumption never reuses paused/invalidated/aborted epochs.
   require the final authoritative rejection. Cover the split declaration
   matrix and every cross-product, especially manifest raw + refset delta;
   stale gen × floor-lowering/preserving change; independent tri-state flag
-  seams; generation/override validation; and the fact that opaque raw versus
-  snapshot content is not server-verifiable. Legacy omission always admits;
+  seams; per-axis override validation, including proof that each non-overridden
+  axis still fails closed; and the fact that opaque raw versus snapshot content
+  is not server-verifiable. Pin `RBOX_MDE_SNAPSHOT=0` + `RBOX_MDE_DELTA=1` to
+  raw/no-delta/no-manifest-override and exactly one
+  `mde_delta_ignored_snapshot_kill_switch` warning. Legacy omission always admits;
   a nonempty chain logs exactly `legacy_chain_commit`. Retain direct-push
   account-key pinning, exact keys/latest shapes, directory failure/overflow
   all-false, API-key population, trusted-header stripping, and a successful
@@ -1179,10 +1346,12 @@ Resumption never reuses paused/invalidated/aborted epochs.
   exact whole-union cap at `dataRefCap` and cap+1 (including duplicate
   non-data SHA, parent/manifest overlap, 15 parents, and candidate
   encode/hash-before-upload ordering), and streaming fold
-  allocation high-water ≤48 MiB for maximal full and 16-link chains. Assert
-  two admission DOs and admission-versus-roots/fair-use folds serialize on the
-  shared isolate semaphore, every success/inline/400/422/503 path releases it,
-  carrier buffers become collectible, and no 250k SHA string array/Set
+  allocation high-water ≤48 MiB for maximal full and 16-link chains and
+  inline high-water ≤28 MiB. Assert inline-inline, sidecar-sidecar, and either
+  admission mode versus roots/fair-use folds serialize on the shared isolate
+  semaphore; the gate remains held through the last accounting allocation;
+  every success/inline/400/422/503 path cleans up before release; carrier and
+  inline wire buffers become collectible; and no 250k SHA string array/Set
   exists. Test additive `chain` with unchanged `carrierSha`
   meaning against old/new collectors, old page caps before readiness, and
   fail-closed new page/byte caps after readiness. Cover platform-admin
@@ -1200,17 +1369,26 @@ Resumption never reuses paused/invalidated/aborted epochs.
   Exercise `materialize_cursor` crashes at each carrier/page boundary,
   cursor/pin tamper, exact no-gap/no-dup output, atomic working-set+cursor,
   a 250k full and 16-link chain across ticks, and charging the 16 allowed
-  parent/current GETs (17th refused before start). Prove fold/output share one
-  600-record budget, intermediate output pages retain un-emitted rows, final
-  range cleanup is bounded, and abort/plan cleanup pages. Exact workspace-set tests:
+  parent/current GETs (17th refused before start). Prove fold ticks use one
+  600-record budget, output ticks atomically maintain membership plus
+  `fairuse_sha_last` for at most 200 SHAs/600 physical row mutations within 64
+  statements, intermediate output pages retain un-emitted rows, final range
+  cleanup is bounded, and abort/plan cleanup pages. Exact workspace-set tests:
   64 succeeds, 65 fails closed, create after capture, delete+create with the
   same count (including during sliced pin verification), final-transition set
-  equality, and non-target pin drift before dispatch; each pre-batch probe
+  equality, and non-target pin drift before dispatch; each pre-batch re-probe
   must count every workspace. Marginal-query tests cover a SHA shared across
   target sequences, across workspaces, reachable from head, and uniquely
-  released; smallest exact target, 500 clamp, global-oldest boundary,
-  timestamp gap, zero-release advance, one move then mandatory fresh epoch,
-  and indexed query plan. The small synthetic 45× corpus converges across
+  released; crash before/after the atomic last-location upsert; smallest exact
+  target, 500 clamp, global-oldest boundary, timestamp gap, zero-release
+  advance, and one move then mandatory fresh epoch. Pin `EXPLAIN QUERY PLAN`
+  to `idx_fairuse_sha_last_release` and both named entitlement/blob indexes
+  with no DISTINCT/temp B-tree; force the 2001-row lookahead, rows-read and CPU
+  checkpoints, then prove exact resume without double-summing across ticks.
+  Race a non-target head/floor/set mutation immediately after its re-probe and
+  prove overshoot is at most the one selected ≤500-sequence batch from the
+  oldest workspace, never a head and always from retained history within the
+  plan window, followed by a mandatory fresh epoch. The small synthetic 45× corpus converges across
   epochs within `ceil(excess/batchRelease)`. Retain completed/status and
   grace/kill transitions, stale epoch, identical `prune_deferred` replay and
   lost-response-after-positive-move fenced-result reconciliation,
@@ -1220,8 +1398,17 @@ Resumption never reuses paused/invalidated/aborted epochs.
   account; cover deletion lookup races, plan change after completion and
   after pending-request creation, a stale holder that cannot checkpoint/
   dispatch, duplicate events, and whole-batch rollback.
-- Acceptance: design-142 runner re-run post-C: partition holds and
-  `retained-history ≤ 5 × max(active-head, 1 GiB)`.
+  Deployment-gate tests cover absent floor→1, malformed floor refusal,
+  candidate below floor refusal, omitted candidate-generation constant treated
+  as generation 1/fail-closed, equality acceptance, failed deploy without
+  advancement, successful RSD1-era deploy plus verified floor-2 write, and an
+  idempotent retry after post-deploy write failure.
+- Acceptance: in a quiescent design-142 runner re-run post-C, partition holds
+  and `retained-history ≤ 5 × max(active-head, 1 GiB)`. The adversarial
+  concurrent schedule may cause extra deletion beyond the freshly recomputed
+  target only in one oldest-workspace batch of at most 500 non-head sequences
+  within the retained plan window; it does not turn sequence count into a byte
+  allowance.
 
 ## Rollout order (per F18)
 
@@ -1230,17 +1417,22 @@ verification, green-CI checkpoint, and explicit production fast-forward as
 required by `docs/DEPLOYMENTS.md`. Production applies D1 migrations before
 the corresponding Worker. CLI readers/writers are later tagged releases.
 
-1. Apply `0029_storage_economics.sql`; ship C4 and C2 observe-only. Scans
-   complete, lifecycle is visible, `RBOX_HISTORY_PRUNE_DISABLED=1`, and no
-   retention or fair-use floor moves.
+1. Apply `0029_storage_economics.sql`, including `fairuse_sha_last` and
+   `meta_deploy_floor`; ship C4 and C2 observe-only. Scans complete, lifecycle
+   is visible, `RBOX_HISTORY_PRUNE_DISABLED=1`, and no retention or fair-use
+   floor moves.
 2. Deploy A's Worker→DO capability path, cooperative declaration admission, and
    legacy v1.7.1 exception before any declaring writer depends on it.
-3. Collector-first: deploy and verify GC plus storage-truth readers that
-   retain `carrierSha`, accept additive `chain`, and exhaust byte-bounded
-   cursors. The server still emits the old shape/caps in this stage.
+3. Collector-first: deploy and verify the GC reader; land and run/verify the
+   storage-truth reader. Both retain `carrierSha`, accept additive `chain`, and
+   exhaust byte-bounded cursors. The server still emits the old shape/caps in
+   this stage.
 4. Only after collector verification, deploy B's streaming codec/fold,
-   ≤48-MiB semaphore, non-delete normalized rooting, additive response, new
-   page caps, and platform-admin coverage driver. No RSD1 writer exists.
+   full-accounting-lifetime ≤48-MiB semaphore, non-delete normalized rooting,
+   additive response, new page caps, and platform-admin coverage driver. The
+   design-150-coordinated production gate must read/compare the candidate
+   generation before this deploy; after the successful generation-2 deploy it
+   writes and verifies `roots_format_generation=2`. No RSD1 writer exists.
    Exhaust fresh GET/POST `/v1/admin/roots-coverage` passes over the D1
    workspace enumerator; do not proceed until every authoritative workspace
    reports generation 2, ready, and head-synced.
@@ -1254,8 +1446,9 @@ the corresponding Worker. CLI readers/writers are later tagged releases.
 7. Enable C3 and resume retention by clearing the history-prune kill switch.
    Coverage generation and pin validation remain structural guards for both.
 8. In the next client release, default B writers on only where
-   `refsetDelta` is true. Snapshot defaults become floor-driven here,
-   replacing v1.7.1's manual gate; manifest delta defaults one release later.
+   `refsetDelta` is true. Snapshot AND manifest-delta defaults both
+   become floor-driven here, replacing v1.7.1's manual gate (founder
+   default-on ruling: no extra staging release beyond the floor gate).
 
 ## §8 Riders recorded, not designed
 
