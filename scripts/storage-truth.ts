@@ -13,7 +13,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 export const REPORT_VERSION = 1;
-const SPOOL_SCHEMA_VERSION = 2;
+const SPOOL_SCHEMA_VERSION = 3;
 export const GRACE_1_MS = 24 * 60 * 60 * 1000;
 export const BLOB_REF_PAGE_LIMIT = 2_000;
 export const ROOTS_PAGE_LIMIT = 20_000;
@@ -41,7 +41,7 @@ export interface RootEntry {
   head: boolean;
   sequence?: number;
   /** Epoch milliseconds for the retained version that contributed this root. */
-  committedAt: number;
+  committedAt: number | null;
 }
 export interface RootsPage {
   outcome: "ok" | "snapshot_changed" | "uninspectable";
@@ -222,6 +222,7 @@ export interface StorageTruthReport {
     arithmeticDrift: { usedBytes: number; entitlementCatalogBytes: number; signedBytes: number; unknownCatalogRows: number };
     reachableUnentitled: Measure;
     windowExpiredRetained: Measure;
+    timestampGapRoots: number;
     phase1: {
       outcome: "would-complete" | "would-fail-closed";
       uniqueRoots: CapProximity;
@@ -252,7 +253,7 @@ function initializeSpool(db: Database): void {
     CREATE TABLE IF NOT EXISTS stream_state(stream TEXT PRIMARY KEY,cursor TEXT,done INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS workspaces(workspace TEXT PRIMARY KEY,workspace_id TEXT NOT NULL,project_id TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS workspace_scans(workspace TEXT PRIMARY KEY,pin_head INTEGER,pin_floor INTEGER,pin_generation INTEGER,retries INTEGER NOT NULL DEFAULT 0,dropped_rows INTEGER NOT NULL DEFAULT 0,seq_rows INTEGER NOT NULL DEFAULT 0,done INTEGER NOT NULL DEFAULT 0,ending_head INTEGER);
-    CREATE TABLE IF NOT EXISTS roots(workspace TEXT NOT NULL,sha TEXT NOT NULL,head INTEGER NOT NULL,committed_at INTEGER NOT NULL,PRIMARY KEY(workspace,sha,head));
+    CREATE TABLE IF NOT EXISTS roots(workspace TEXT NOT NULL,sha TEXT NOT NULL,head INTEGER NOT NULL,committed_at INTEGER,timestamp_gap INTEGER NOT NULL,PRIMARY KEY(workspace,sha,head));
     CREATE INDEX IF NOT EXISTS roots_sha ON roots(sha);
     CREATE TABLE IF NOT EXISTS catalog(sha TEXT PRIMARY KEY,size INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS fleet(sha TEXT PRIMARY KEY,active INTEGER NOT NULL,retained INTEGER NOT NULL);
@@ -378,8 +379,12 @@ export async function measureStorageTruth(source: StorageTruthSource, accountId:
     });
     const workspaces = (db.query("SELECT workspace_id,project_id FROM workspaces ORDER BY workspace").all() as Array<{ workspace_id: string; project_id: string }>)
       .map((row) => ({ workspaceId: row.workspace_id, projectId: row.project_id }));
-    const insertRoot = db.prepare(`INSERT INTO roots VALUES(?,?,?,?) ON CONFLICT(workspace,sha,head)
-      DO UPDATE SET committed_at=MAX(committed_at,excluded.committed_at)`);
+    const insertRoot = db.prepare(`INSERT INTO roots VALUES(?,?,?,?,?) ON CONFLICT(workspace,sha,head)
+      DO UPDATE SET committed_at=CASE
+        WHEN roots.committed_at IS NULL THEN excluded.committed_at
+        WHEN excluded.committed_at IS NULL THEN roots.committed_at
+        ELSE MAX(roots.committed_at,excluded.committed_at)
+      END,timestamp_gap=MAX(roots.timestamp_gap,excluded.timestamp_gap)`);
 
     for (const workspace of workspaces) {
       const key = workspaceKey(workspace);
@@ -418,12 +423,14 @@ export async function measureStorageTruth(source: StorageTruthSource, accountId:
           return incompleteReport("uninspectable", accountId, startedAt, source.now(), { workspace, reason: page.reason ?? "missing snapshot identity" });
         }
         for (const entry of page.entries ?? []) {
-          if (!Number.isFinite(entry.committedAt)) return incompleteReport("uninspectable", accountId, startedAt, source.now(), { workspace, reason: `missing root timestamp for ${entry.sha}` });
+          if (entry.committedAt !== null && (!Number.isFinite(entry.committedAt) || entry.committedAt <= 0)) {
+            return incompleteReport("uninspectable", accountId, startedAt, source.now(), { workspace, reason: `invalid root timestamp for ${entry.sha}` });
+          }
         }
         if (page.nextCursor !== null && page.nextCursor !== undefined && page.nextCursor === state.cursor) throw new Error(`${rootStream}: non-advancing cursor`);
         const nextCursor = page.nextCursor ?? null;
         db.transaction(() => {
-          for (const entry of page.entries ?? []) insertRoot.run(key, entry.sha, entry.head ? 1 : 0, entry.committedAt);
+          for (const entry of page.entries ?? []) insertRoot.run(key, entry.sha, entry.head ? 1 : 0, entry.committedAt, entry.committedAt === null ? 1 : 0);
           db.prepare(`UPDATE workspace_scans SET pin_head=COALESCE(pin_head,?),pin_floor=COALESCE(pin_floor,?),pin_generation=COALESCE(pin_generation,?),
             dropped_rows=dropped_rows+?,seq_rows=seq_rows+?,done=? WHERE workspace=?`)
             .run(page.triple!.head, page.triple!.pruneFloor, page.triple!.indexGeneration, page.droppedRows ?? 0, page.seqRootRows ?? 0, nextCursor === null ? 1 : 0, key);
@@ -549,15 +556,21 @@ export async function measureStorageTruth(source: StorageTruthSource, accountId:
     const cutoff = startedAt - account.retentionDays * DAY_MS;
     const measureQuery = (where: string): Measure => {
       const row = db.query(`WITH grouped AS (
-          SELECT sha,MAX(head) has_head,MAX(CASE WHEN head=0 THEN committed_at END) latest_history
+          SELECT sha,MAX(head) has_head,
+            MAX(CASE WHEN head=0 AND committed_at IS NOT NULL THEN committed_at END) latest_history,
+            MAX(CASE WHEN head=0 THEN timestamp_gap ELSE 0 END) timestamp_gap
           FROM roots GROUP BY sha
-        ), r AS (SELECT sha,CASE WHEN has_head=0 AND latest_history<? THEN 1 ELSE 0 END expired FROM grouped)
+        ), r AS (SELECT sha,CASE WHEN has_head=0 AND timestamp_gap=0 AND latest_history IS NOT NULL AND latest_history<? THEN 1 ELSE 0 END expired FROM grouped)
         SELECT COUNT(*) count,COALESCE(SUM(COALESCE(c.size,0)),0) bytes,COALESCE(SUM(CASE WHEN c.sha IS NULL THEN 1 ELSE 0 END),0) unknown
         FROM r LEFT JOIN entitlements e ON e.sha=r.sha LEFT JOIN catalog c ON c.sha=r.sha WHERE ${where}`).get(cutoff) as Record<string, number>;
       return { count: Number(row.count), knownBytes: Number(row.bytes), unknownByteRows: Number(row.unknown) };
     };
     const reachableUnentitled = measureQuery("e.sha IS NULL");
     const windowExpiredRetained = measureQuery("r.expired=1");
+    const timestampGapRoots = Number((db.query(`SELECT COUNT(*) n FROM (
+      SELECT sha FROM roots GROUP BY sha
+      HAVING MAX(head)=0 AND MAX(CASE WHEN head=0 THEN timestamp_gap ELSE 0 END)=1
+    )`).get() as { n: number }).n);
     const uniqueRoots = Number((db.query("SELECT COUNT(DISTINCT sha) n FROM roots").get() as { n: number }).n);
     const droppedPages = Math.max(1, ...workspaceReports.map((row) => row.droppedPages));
     const seqRootPages = Math.max(1, ...workspaceReports.map((row) => row.seqRootPages));
@@ -575,7 +588,7 @@ export async function measureStorageTruth(source: StorageTruthSource, accountId:
       sectionB: {
         kind: "overlapping-diagnostics",
         arithmeticDrift: { usedBytes: account.usedBytes, entitlementCatalogBytes, signedBytes: account.usedBytes - entitlementCatalogBytes, unknownCatalogRows },
-        reachableUnentitled, windowExpiredRetained,
+        reachableUnentitled, windowExpiredRetained, timestampGapRoots,
         phase1: { outcome: proximity.uniqueRoots.wouldFail || proximity.droppedPages.wouldFail || proximity.seqRootPages.wouldFail ? "would-fail-closed" : "would-complete", ...proximity },
         workspaces: workspaceReports,
         rescanOffered: workspaceReports.some((workspace) => workspace.headAdvance > HEAD_DRIFT_THRESHOLD),
@@ -597,7 +610,7 @@ function incompleteReport(status: "stale-pin" | "uninspectable", accountId: stri
   const rec = reconcilePrefix([], [], endedAt);
   return { schemaVersion: 1, status, accountId, startedAt, endedAt, failure,
     sectionA: { kind: "entitlement-partition", buckets, anomalies: { missingCatalog: 0, inconsistent: 0, both: 0 }, totalEntitlements: 0, partitionCount: 0, partitionHolds: false },
-    sectionB: { kind: "overlapping-diagnostics", arithmeticDrift: { usedBytes: 0, entitlementCatalogBytes: 0, signedBytes: 0, unknownCatalogRows: 0 }, reachableUnentitled: emptyMeasure(), windowExpiredRetained: emptyMeasure(), phase1: { outcome: "would-fail-closed", uniqueRoots: capProximity(0, PHASE1_UNIQUE_ROOT_CAP), droppedPages: capProximity(0, PHASE1_DROPPED_PAGE_CAP), seqRootPages: capProximity(0, PHASE1_SEQ_ROOT_PAGE_CAP) }, workspaces: [], rescanOffered: true, physical: { listingStartedAt: endedAt, listingEndedAt: endedAt, catalogGrantedBytesDuringWindow: 0, inventoryChangedBytesDuringWindow: 0, skewBoundBytes: 0, canonical: rec, pack: rec } } };
+    sectionB: { kind: "overlapping-diagnostics", arithmeticDrift: { usedBytes: 0, entitlementCatalogBytes: 0, signedBytes: 0, unknownCatalogRows: 0 }, reachableUnentitled: emptyMeasure(), windowExpiredRetained: emptyMeasure(), timestampGapRoots: 0, phase1: { outcome: "would-fail-closed", uniqueRoots: capProximity(0, PHASE1_UNIQUE_ROOT_CAP), droppedPages: capProximity(0, PHASE1_DROPPED_PAGE_CAP), seqRootPages: capProximity(0, PHASE1_SEQ_ROOT_PAGE_CAP) }, workspaces: [], rescanOffered: true, physical: { listingStartedAt: endedAt, listingEndedAt: endedAt, catalogGrantedBytesDuringWindow: 0, inventoryChangedBytesDuringWindow: 0, skewBoundBytes: 0, canonical: rec, pack: rec } } };
 }
 
 const bytes = (n: number): string => `${n.toLocaleString("en-US")} B`;
@@ -612,6 +625,7 @@ export function renderHuman(report: StorageTruthReport): string {
   lines.push(`  arithmetic drift: ${b.arithmeticDrift.signedBytes >= 0 ? "+" : ""}${bytes(b.arithmeticDrift.signedBytes)}`);
   lines.push(`  R−E: ${b.reachableUnentitled.count} roots, ${bytes(b.reachableUnentitled.knownBytes)}, ${b.reachableUnentitled.unknownByteRows} unknown-byte`);
   lines.push(`  retained but window-expired: ${b.windowExpiredRetained.count} roots, ${bytes(b.windowExpiredRetained.knownBytes)}`);
+  lines.push(`  timestamp-gaps: ${b.timestampGapRoots} roots (window-expiry unknown for these)`);
   lines.push(`  Phase-1 probe: ${b.phase1.outcome}`);
   for (const [name, c] of [["roots", b.phase1.uniqueRoots], ["dropped-pages", b.phase1.droppedPages], ["seq-root-pages", b.phase1.seqRootPages]] as const) lines.push(`    ${name}: ${c.observed}/${c.cap}, delta=${c.delta}, ${c.percent.toFixed(2)}%, would-fail=${c.wouldFail}`);
   lines.push(`  head drift rescan offered: ${b.rescanOffered}`);
@@ -624,25 +638,89 @@ export function renderHuman(report: StorageTruthReport): string {
   return lines.join("\n");
 }
 
-async function main(): Promise<void> {
+export interface StorageTruthRunnerFailure {
+  schemaVersion: 1;
+  kind: "runner-failure";
+  status: "failed";
+  failure: {
+    name: string;
+    component: string;
+    environment: string;
+    requiredEnvironment: string[];
+    reason: string;
+    timeoutMs?: number;
+  };
+}
+
+export function normalizeRunnerFailure(error: unknown): StorageTruthRunnerFailure {
+  const value = error && typeof error === "object" ? error as Record<string, unknown> : {};
+  const required = Array.isArray(value.requiredEnvironment)
+    ? value.requiredEnvironment.filter((item): item is string => typeof item === "string")
+    : [];
+  return {
+    schemaVersion: 1,
+    kind: "runner-failure",
+    status: "failed",
+    failure: {
+      name: typeof value.name === "string" ? value.name : "Error",
+      component: typeof value.component === "string" ? value.component : "adapter",
+      environment: typeof value.environment === "string" ? value.environment : (process.env.RBOX_STORAGE_TRUTH_ENV ?? "production"),
+      requiredEnvironment: required,
+      reason: typeof value.reason === "string" ? value.reason
+        : error instanceof Error ? error.message : typeof error === "string" ? error : "unknown runner failure",
+      ...(typeof value.timeoutMs === "number" && Number.isFinite(value.timeoutMs) ? { timeoutMs: value.timeoutMs } : {}),
+    },
+  };
+}
+
+export function renderRunnerFailure(failure: StorageTruthRunnerFailure): string {
+  return `Storage truth runner failure\n${JSON.stringify(failure, null, 2)}`;
+}
+
+async function emitRunnerFailure(error: unknown, jsonOut: string, writeReport: boolean): Promise<void> {
+  const failure = normalizeRunnerFailure(error);
+  console.error(renderRunnerFailure(failure));
+  if (!writeReport) return;
+  try {
+    await mkdir(path.dirname(jsonOut), { recursive: true });
+    await writeFile(jsonOut, `${JSON.stringify(failure, null, 2)}\n`);
+  } catch (writeError) {
+    console.error(`runner failure report write failed: ${writeError instanceof Error ? writeError.message : String(writeError)}`);
+  }
+}
+
+export async function main(): Promise<void> {
   const args = new Map<string, string>();
   for (let i = 2; i < process.argv.length; i += 2) args.set(process.argv[i]!, process.argv[i + 1]!);
   const accountId = args.get("--account");
   const adapter = args.get("--adapter") ?? process.env.RBOX_STORAGE_TRUTH_ADAPTER;
   const spool = args.get("--spool") ?? path.resolve(".storage-truth-spool");
   const jsonOut = args.get("--json") ?? path.join(spool, "report.json");
-  if (!accountId || !adapter) throw new Error("usage: bun scripts/storage-truth.ts --account <id> --adapter <module> [--spool <dir>] [--json <file>]");
-  const loaded = await import(pathToFileURL(path.resolve(adapter)).href) as { source?: StorageTruthSource; createSource?: () => Promise<StorageTruthSource> | StorageTruthSource };
-  const source = loaded.source ?? await loaded.createSource?.();
-  if (!source) throw new Error("adapter must export source or createSource()");
+  let source: StorageTruthSource | undefined;
+  let failed = false;
   try {
+    if (!accountId || !adapter) throw new Error("usage: bun scripts/storage-truth.ts --account <id> --adapter <module> [--spool <dir>] [--json <file>]");
+    const loaded = await import(pathToFileURL(path.resolve(adapter)).href) as { source?: StorageTruthSource; createSource?: () => Promise<StorageTruthSource> | StorageTruthSource };
+    source = loaded.source ?? await loaded.createSource?.();
+    if (!source) throw new Error("adapter must export source or createSource()");
     const report = await measureStorageTruth(source, accountId, spool);
     await mkdir(path.dirname(jsonOut), { recursive: true });
     await writeFile(jsonOut, `${JSON.stringify(report, null, 2)}\n`);
     console.log(renderHuman(report));
     if (report.status !== "complete" || !report.sectionA.partitionHolds) process.exitCode = 2;
+  } catch (error) {
+    failed = true;
+    await emitRunnerFailure(error, jsonOut, true);
+    process.exitCode = 2;
   } finally {
-    await source.close?.();
+    try {
+      await source?.close?.();
+    } catch (error) {
+      const cleanup = normalizeRunnerFailure(error);
+      cleanup.failure.component = "cleanup";
+      await emitRunnerFailure(cleanup.failure, jsonOut, !failed);
+      process.exitCode = 2;
+    }
   }
 }
 

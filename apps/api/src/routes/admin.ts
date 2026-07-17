@@ -88,7 +88,12 @@ export async function adminRootsInspect(env: Env, url: URL): Promise<Response> {
       .prepare("SELECT account_id FROM workspaces WHERE workspace_id = ? AND project_id = ?")
       .bind(ws, proj)
       .first<{ account_id: string }>();
-    if (!owner?.account_id) return json({ error: "timestamp_unavailable", missingSequences: sequences }, 503);
+    if (!owner?.account_id) {
+      return json({
+        ...page,
+        createdAtBySequence: Object.fromEntries(sequences.map((sequence) => [String(sequence), null])),
+      });
+    }
 
     const times = new Map<number, number>();
     const rows = await dbFor(env, owner.account_id)
@@ -103,17 +108,16 @@ export async function adminRootsInspect(env: Env, url: URL): Promise<Response> {
       const createdAt = row.created_at == null ? Number.NaN : Number(row.created_at);
       if (Number.isInteger(sequence) && Number.isFinite(createdAt) && createdAt > 0) times.set(sequence, createdAt);
     }
-    const missing = sequences.filter((seq) => !times.has(seq));
-    if (missing.length > 0) {
-      return json({ error: "timestamp_unavailable", missingSequences: missing }, 503);
-    }
     return json({
       ...page,
-      createdAtBySequence: Object.fromEntries(sequences.map((sequence) => [String(sequence), times.get(sequence)!])),
+      createdAtBySequence: Object.fromEntries(sequences.map((sequence) => [String(sequence), times.get(sequence) ?? null])),
     });
   } catch (e) {
     logErr("roots_inspect_timestamp_failed", e);
-    return json({ error: "timestamp_unavailable", reason: "storage_unreadable" }, 503);
+    return json({
+      ...page,
+      createdAtBySequence: Object.fromEntries(sequences.map((sequence) => [String(sequence), null])),
+    });
   }
 }
 

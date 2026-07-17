@@ -1,17 +1,17 @@
 /**
  * Live, read-only adapter for the design-142 storage-truth runner.
  *
- * D1 and R2 are reached through Wrangler's remote-capable platform proxy. The one
- * binding it deliberately does not use is WORKSPACE_SYNC: authoritative roots cross
- * the deployed Worker's platform-secret gate, which is the audited read-only path.
+ * D1 and R2 are reached through Cloudflare's direct REST APIs. Authoritative roots
+ * cross the deployed Worker's platform-secret gate, which is the audited read-only
+ * path.
  */
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { getPlatformProxy, unstable_readConfig } from "wrangler";
+import { unstable_readConfig } from "wrangler";
 import { planFor } from "../apps/api/src/plans.js";
 import { parseRefset, refsetByteLength } from "../src/engine/refset.js";
 import { WorkspaceInspectionFailure } from "./storage-truth.js";
@@ -36,6 +36,8 @@ const MAX_R2_PAGE = 1_000;
 const MAX_PACK_PAGE = 50; // each immutable pack has up to 2,048 members
 const MAX_SIDECAR_REFS = 250_000;
 const FLEET_SNAPSHOT_RETRIES = 3;
+export const ESTABLISHMENT_TIMEOUT_MS = 20_000;
+const CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4";
 
 interface D1Result<T> { results?: T[] }
 interface D1Bound {
@@ -59,6 +61,219 @@ export interface ReadOnlyR2 {
     truncated: boolean;
     cursor?: string;
   }>;
+}
+
+export type StorageTruthConnectionComponent = "config" | "d1-rest" | "r2-rest" | "roots-inspect";
+
+export class StorageTruthConnectionError extends Error {
+  constructor(
+    readonly component: StorageTruthConnectionComponent,
+    readonly environment: string,
+    readonly requiredEnvironment: string[],
+    readonly reason: string,
+    readonly timeoutMs?: number,
+  ) {
+    const timeout = timeoutMs === undefined ? "" : ` within ${timeoutMs}ms`;
+    super(`${component} did not connect${timeout} for ${environment}: ${reason}; requires ${requiredEnvironment.join(", ") || "no environment variables"}`);
+    this.name = "StorageTruthConnectionError";
+  }
+}
+
+export interface StorageTruthResourceConfig {
+  environment: "dev" | "production";
+  databaseId: string;
+  bucketName: string;
+  bucketJurisdiction?: string;
+}
+
+interface CloudflareRestOptions {
+  accountId: string;
+  apiToken: string;
+  fetch?: typeof globalThis.fetch;
+  apiBase?: string;
+  jurisdiction?: string;
+}
+
+interface D1ApiMeta {
+  rows_written?: number;
+  changes?: number;
+  changed_db?: boolean;
+}
+
+interface D1ApiQueryResult<T> {
+  success?: boolean;
+  results?: T[];
+  meta?: D1ApiMeta;
+}
+
+function apiErrorReason(raw: unknown, fallback: string): string {
+  if (!raw || typeof raw !== "object") return fallback;
+  const errors = (raw as { errors?: unknown }).errors;
+  if (!Array.isArray(errors)) return fallback;
+  const messages = errors.flatMap((error) => {
+    if (typeof error === "string") return [error];
+    if (error && typeof error === "object" && typeof (error as { message?: unknown }).message === "string") {
+      return [(error as { message: string }).message];
+    }
+    return [];
+  });
+  return messages.length > 0 ? messages.join(":") : fallback;
+}
+
+async function jsonResponse(response: Response, label: string): Promise<unknown> {
+  let raw: unknown;
+  try { raw = await response.json(); } catch { raw = null; }
+  if (!response.ok) throw new Error(apiErrorReason(raw, `${label} status ${response.status}`));
+  return raw;
+}
+
+/** Reject anything except one lexical SELECT statement before it reaches D1. */
+export function assertSelectOnly(sql: string): void {
+  let visible = "";
+  let state: "normal" | "single" | "double" | "backtick" | "bracket" | "line" | "block" = "normal";
+  for (let index = 0; index < sql.length; index++) {
+    const char = sql[index]!;
+    const next = sql[index + 1];
+    if (state === "line") {
+      if (char === "\n" || char === "\r") { state = "normal"; visible += " "; }
+      continue;
+    }
+    if (state === "block") {
+      if (char === "*" && next === "/") { state = "normal"; index++; visible += " "; }
+      continue;
+    }
+    if (state !== "normal") {
+      const closing = state === "single" ? "'" : state === "double" ? "\"" : state === "backtick" ? "`" : "]";
+      if (char === closing) {
+        if (state !== "bracket" && next === closing) { index++; continue; }
+        state = "normal";
+      }
+      continue;
+    }
+    if (char === "-" && next === "-") { state = "line"; index++; visible += " "; continue; }
+    if (char === "/" && next === "*") { state = "block"; index++; visible += " "; continue; }
+    if (char === "'") { state = "single"; visible += " ? "; continue; }
+    if (char === "\"") { state = "double"; visible += " ? "; continue; }
+    if (char === "`") { state = "backtick"; visible += " ? "; continue; }
+    if (char === "[") { state = "bracket"; visible += " ? "; continue; }
+    visible += char;
+  }
+  if (state !== "normal" && state !== "line") throw new Error("D1 read query contains an unterminated quote or comment");
+  let statement = visible.trim();
+  if (statement.endsWith(";")) statement = statement.slice(0, -1).trimEnd();
+  if (statement.includes(";") || !/^SELECT\b/i.test(statement)) {
+    throw new Error("D1 REST adapter permits exactly one SELECT statement");
+  }
+}
+
+class RestD1Bound implements D1Bound {
+  constructor(private readonly client: RestD1, private readonly sql: string, private readonly values: unknown[]) {}
+  async first<T>(): Promise<T | null> { return (await this.client.query<T>(this.sql, this.values)).at(0) ?? null; }
+  async all<T>(): Promise<D1Result<T>> { return { results: await this.client.query<T>(this.sql, this.values) }; }
+}
+
+class RestD1Prepared implements D1Prepared {
+  constructor(private readonly client: RestD1, private readonly sql: string) {}
+  bind(...values: unknown[]): D1Bound { return new RestD1Bound(this.client, this.sql, values); }
+}
+
+export class RestD1 implements ReadOnlyD1 {
+  private readonly fetcher: typeof globalThis.fetch;
+  private readonly endpoint: string;
+  constructor(databaseId: string, private readonly options: CloudflareRestOptions) {
+    this.fetcher = options.fetch ?? globalThis.fetch;
+    this.endpoint = `${(options.apiBase ?? CLOUDFLARE_API_BASE).replace(/\/$/, "")}/accounts/${encodeURIComponent(options.accountId)}/d1/database/${encodeURIComponent(databaseId)}/query`;
+  }
+  prepare(sql: string): D1Prepared {
+    assertSelectOnly(sql);
+    return new RestD1Prepared(this, sql);
+  }
+  async preflight(signal: AbortSignal): Promise<void> { await this.query("SELECT 1 AS ok", [], signal); }
+  async query<T>(sql: string, params: unknown[], signal?: AbortSignal): Promise<T[]> {
+    assertSelectOnly(sql);
+    const response = await this.fetcher(this.endpoint, {
+      method: "POST",
+      headers: { authorization: `Bearer ${this.options.apiToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ sql, params }),
+      ...(signal ? { signal } : {}),
+    });
+    const raw = await jsonResponse(response, "D1 query");
+    if (!raw || typeof raw !== "object" || (raw as { success?: unknown }).success !== true
+      || !Array.isArray((raw as { result?: unknown }).result) || (raw as { result: unknown[] }).result.length !== 1) {
+      throw new Error(apiErrorReason(raw, "invalid D1 query response"));
+    }
+    const result = (raw as { result: Array<D1ApiQueryResult<T>> }).result[0]!;
+    if (result.success !== true || (result.results !== undefined && !Array.isArray(result.results))) {
+      throw new Error(apiErrorReason(raw, "D1 query failed"));
+    }
+    if (result.meta?.changed_db === true || Number(result.meta?.changes ?? 0) !== 0 || Number(result.meta?.rows_written ?? 0) !== 0) {
+      throw new Error("D1 SELECT reported a write; refusing response");
+    }
+    return result.results ?? [];
+  }
+}
+
+export class RestR2 implements ReadOnlyR2 {
+  private readonly fetcher: typeof globalThis.fetch;
+  private readonly endpoint: string;
+  constructor(bucketName: string, private readonly options: CloudflareRestOptions) {
+    this.fetcher = options.fetch ?? globalThis.fetch;
+    this.endpoint = `${(options.apiBase ?? CLOUDFLARE_API_BASE).replace(/\/$/, "")}/accounts/${encodeURIComponent(options.accountId)}/r2/buckets/${encodeURIComponent(bucketName)}/objects`;
+  }
+  async get(key: string): Promise<ReadOnlyR2Object | null> {
+    const encodedKey = key.split("/").map((segment) => {
+      // WHATWG URL parsing normalizes dot-only path segments before fetch. The
+      // official Cloudflare client rejects them for the same reason.
+      if (segment === "." || segment === "..") throw new Error("R2 object key contains an unsafe dot path segment");
+      return encodeURIComponent(segment);
+    }).join("/");
+    const response = await this.fetcher(`${this.endpoint}/${encodedKey}`, { method: "GET", headers: this.headers() });
+    if (response.status === 404) return null;
+    if (!response.ok) throw new Error(`R2 get status ${response.status}`);
+    const bytes = await response.arrayBuffer();
+    const lengthHeader = response.headers.get("content-length");
+    const lastModified = response.headers.get("last-modified");
+    const size = lengthHeader === null ? bytes.byteLength : Number(lengthHeader);
+    if (!Number.isSafeInteger(size) || size < 0 || size !== bytes.byteLength) throw new Error("invalid R2 Content-Length");
+    if (!lastModified || !Number.isFinite(Date.parse(lastModified))) throw new Error("invalid R2 Last-Modified");
+    return { key, size, uploaded: lastModified, arrayBuffer: async () => bytes.slice(0) };
+  }
+  async list(options: { prefix: string; limit: number; cursor?: string }, signal?: AbortSignal): Promise<{
+    objects: ReadOnlyR2ListObject[];
+    truncated: boolean;
+    cursor?: string;
+  }> {
+    const params = new URLSearchParams({ prefix: options.prefix, per_page: String(options.limit) });
+    if (options.cursor) params.set("cursor", options.cursor);
+    const response = await this.fetcher(`${this.endpoint}?${params}`, {
+      method: "GET", headers: this.headers(), ...(signal ? { signal } : {}),
+    });
+    const raw = await jsonResponse(response, "R2 list");
+    if (!raw || typeof raw !== "object" || (raw as { success?: unknown }).success !== true
+      || !Array.isArray((raw as { result?: unknown }).result)) throw new Error(apiErrorReason(raw, "invalid R2 list response"));
+    const info = (raw as { result_info?: unknown }).result_info;
+    if (!info || typeof info !== "object") throw new Error("invalid R2 list pagination");
+    const truncated = (info as { is_truncated?: unknown }).is_truncated === true;
+    const cursor = (info as { cursor?: unknown }).cursor;
+    if (truncated && (typeof cursor !== "string" || cursor.length === 0)) throw new Error("truncated R2 page omitted cursor");
+    const objects = (raw as { result: unknown[] }).result.map((value): ReadOnlyR2ListObject => {
+      if (!value || typeof value !== "object") throw new Error("invalid R2 list object");
+      const object = value as { key?: unknown; size?: unknown; last_modified?: unknown };
+      if (typeof object.key !== "string" || !Number.isSafeInteger(object.size) || Number(object.size) < 0
+        || typeof object.last_modified !== "string" || !Number.isFinite(Date.parse(object.last_modified))) {
+        throw new Error("invalid R2 list object");
+      }
+      return { key: object.key, size: Number(object.size), uploaded: object.last_modified };
+    });
+    return { objects, truncated, ...(truncated ? { cursor: cursor as string } : {}) };
+  }
+  async preflight(signal: AbortSignal): Promise<void> { await this.list({ prefix: "", limit: 1 }, signal); }
+  private headers(): Record<string, string> {
+    return {
+      authorization: `Bearer ${this.options.apiToken}`,
+      ...(this.options.jurisdiction ? { "cf-r2-jurisdiction": this.options.jurisdiction } : {}),
+    };
+  }
 }
 
 export interface StorageTruthLiveDependencies {
@@ -95,7 +310,7 @@ interface InspectBody {
   nextSha?: string;
   nextSeq?: number;
   nextGapSeq?: number;
-  createdAtBySequence: Record<string, number>;
+  createdAtBySequence: Record<string, number | null>;
 }
 
 type CursorKind = "workspaces" | "catalog" | "inventory" | "r2" | "fleet";
@@ -187,9 +402,10 @@ function requireString(value: unknown, label: string): string {
   return value;
 }
 
-function timestamp(body: InspectBody, sequence: number): number {
+function timestamp(body: InspectBody, sequence: number): number | null {
   const value = body.createdAtBySequence?.[String(sequence)];
-  if (!Number.isFinite(value) || value <= 0) throw new Error(`missing timestamp for sequence ${sequence}`);
+  if (value === undefined || value === null) return null;
+  if (!Number.isFinite(value) || value <= 0) throw new Error(`invalid timestamp for sequence ${sequence}`);
   return value;
 }
 
@@ -592,83 +808,128 @@ export function createStorageTruthSource(dependencies: StorageTruthLiveDependenc
   return new BindingStorageTruthSource(dependencies);
 }
 
-export async function createRemoteBindingConfig(environment: string | undefined): Promise<{ configPath: string; directory: string }> {
+export function resolveStorageTruthResources(environment: "dev" | "production"): StorageTruthResourceConfig {
   const sourceConfigPath = fileURLToPath(new URL("../apps/api/wrangler.jsonc", import.meta.url));
-  const configured = unstable_readConfig({ config: sourceConfigPath, env: environment }, { hideWarnings: true });
+  const configured = unstable_readConfig({ config: sourceConfigPath, env: environment === "dev" ? undefined : environment }, { hideWarnings: true });
   const database = configured.d1_databases.find((binding) => binding.binding === "rbox_dev_db");
   const bucket = configured.r2_buckets.find((binding) => binding.binding === "rbox_dev_blobs");
-  if (!database?.database_id || !database.database_name || !bucket?.bucket_name) {
+  if (!database?.database_id || !bucket?.bucket_name) {
     throw new Error("selected Wrangler environment is missing the storage-truth D1/R2 bindings");
   }
+  return {
+    environment,
+    databaseId: database.database_id,
+    bucketName: bucket.bucket_name,
+    ...(bucket.jurisdiction ? { bucketJurisdiction: bucket.jurisdiction } : {}),
+  };
+}
 
-  const directory = await mkdtemp(path.join(os.tmpdir(), "rbox-storage-truth-proxy-"));
-  const configPath = path.join(directory, "wrangler.json");
-  try {
-    // Keep ordinary `wrangler dev` local. This one-shot config is deliberately
-    // sourceless and exposes only the two read bindings used by this adapter.
-    await writeFile(configPath, JSON.stringify({
-      name: `${configured.name}-storage-truth-readonly`,
-      compatibility_date: configured.compatibility_date,
-      send_metrics: false,
-      d1_databases: [{
-        binding: database.binding,
-        database_name: database.database_name,
-        database_id: database.database_id,
-        remote: true,
-      }],
-      r2_buckets: [{
-        binding: bucket.binding,
-        bucket_name: bucket.bucket_name,
-        ...(bucket.jurisdiction ? { jurisdiction: bucket.jurisdiction } : {}),
-        remote: true,
-      }],
-    }));
-    return { configPath, directory };
-  } catch (error) {
-    await rm(directory, { recursive: true, force: true });
-    throw error;
-  }
+function safeReason(error: unknown, secrets: string[] = []): string {
+  const raw = error instanceof Error
+    ? error.name === "AbortError" ? "request aborted" : error.message
+    : typeof error === "string" ? error : "unknown connection failure";
+  return secrets.filter(Boolean).reduce((reason, secret) => reason.replaceAll(secret, "[redacted]"), raw);
+}
+
+function establishConnection(
+  component: "d1-rest" | "r2-rest",
+  environment: string,
+  requiredEnvironment: string[],
+  timeoutMs: number,
+  operation: (signal: AbortSignal) => Promise<void>,
+  parentSignal: AbortSignal,
+  secrets: string[],
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const controller = new AbortController();
+    let settled = false;
+    const finish = (error?: unknown): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      parentSignal.removeEventListener("abort", onParentAbort);
+      if (error === undefined) resolve();
+      else if (error instanceof StorageTruthConnectionError) reject(error);
+      else reject(new StorageTruthConnectionError(component, environment, requiredEnvironment, safeReason(error, secrets)));
+    };
+    const onParentAbort = (): void => {
+      controller.abort(parentSignal.reason);
+      finish(new StorageTruthConnectionError(component, environment, requiredEnvironment, "cancelled because another storage connection failed"));
+    };
+    const timer = setTimeout(() => {
+      controller.abort(new Error("storage connection timed out"));
+      finish(new StorageTruthConnectionError(component, environment, requiredEnvironment, "connection timed out", timeoutMs));
+    }, timeoutMs);
+    parentSignal.addEventListener("abort", onParentAbort, { once: true });
+    if (parentSignal.aborted) { onParentAbort(); return; }
+    void Promise.resolve().then(() => operation(controller.signal)).then(() => finish(), finish);
+  });
+}
+
+export interface CreateSourceOptions {
+  environment?: string;
+  accountId?: string;
+  apiToken?: string;
+  platformSecret?: string;
+  apiBase?: string;
+  fetch?: typeof globalThis.fetch;
+  cloudflareApiBase?: string;
+  establishmentTimeoutMs?: number;
 }
 
 /** Zero-argument CLI factory consumed by `scripts/storage-truth.ts --adapter ...`. */
-export async function createSource(): Promise<StorageTruthSource> {
-  const environmentName = process.env.RBOX_STORAGE_TRUTH_ENV ?? "production";
+export async function createSource(options: CreateSourceOptions = {}): Promise<StorageTruthSource> {
+  const environmentName = options.environment ?? process.env.RBOX_STORAGE_TRUTH_ENV ?? "production";
   if (environmentName !== "dev" && environmentName !== "production") {
-    throw new Error("RBOX_STORAGE_TRUTH_ENV must be dev or production");
+    throw new StorageTruthConnectionError("config", environmentName, ["RBOX_STORAGE_TRUTH_ENV"], "must be dev or production");
   }
-  // Wrangler's top-level config is the development environment; it is selected by
-  // omitting `environment`, not by asking for a nonexistent `env.dev` block.
-  const environment = environmentName === "dev" ? undefined : environmentName;
-  const remoteConfig = await createRemoteBindingConfig(environment);
-  let proxy;
+  let resources: StorageTruthResourceConfig;
   try {
-    proxy = await getPlatformProxy<{ rbox_dev_db: ReadOnlyD1; rbox_dev_blobs: ReadOnlyR2 }>({
-      configPath: remoteConfig.configPath,
-      remoteBindings: true,
-      persist: false,
-    });
+    resources = resolveStorageTruthResources(environmentName);
   } catch (error) {
-    await rm(remoteConfig.directory, { recursive: true, force: true });
+    throw new StorageTruthConnectionError("config", environmentName, ["RBOX_STORAGE_TRUTH_ENV"], safeReason(error));
+  }
+  const accountId = options.accountId ?? process.env.CLOUDFLARE_ACCOUNT_ID ?? "";
+  const apiToken = options.apiToken ?? process.env.CLOUDFLARE_API_TOKEN ?? "";
+  const cloudflareEnvironment = ["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID"];
+  if (!apiToken || !accountId) {
+    throw new StorageTruthConnectionError("d1-rest", environmentName, cloudflareEnvironment, "missing Cloudflare REST credentials");
+  }
+  const platformSecret = options.platformSecret ?? process.env.RBOX_PLATFORM_SECRET ?? "";
+  const apiBase = options.apiBase ?? process.env.RBOX_STORAGE_TRUTH_API ?? (environmentName === "production" ? "https://api.rbox.to" : "");
+  if (!platformSecret || !apiBase) {
+    throw new StorageTruthConnectionError(
+      "roots-inspect",
+      environmentName,
+      environmentName === "production" ? ["RBOX_PLATFORM_SECRET"] : ["RBOX_PLATFORM_SECRET", "RBOX_STORAGE_TRUTH_API"],
+      "missing deployed roots-inspect configuration",
+    );
+  }
+  const restOptions: CloudflareRestOptions = {
+    accountId,
+    apiToken,
+    ...(options.fetch ? { fetch: options.fetch } : {}),
+    ...(options.cloudflareApiBase ? { apiBase: options.cloudflareApiBase } : {}),
+    ...(resources.bucketJurisdiction ? { jurisdiction: resources.bucketJurisdiction } : {}),
+  };
+  const db = new RestD1(resources.databaseId, restOptions);
+  const bucket = new RestR2(resources.bucketName, restOptions);
+  const parent = new AbortController();
+  const timeoutMs = options.establishmentTimeoutMs ?? ESTABLISHMENT_TIMEOUT_MS;
+  const d1 = establishConnection("d1-rest", environmentName, cloudflareEnvironment, timeoutMs, (signal) => db.preflight(signal), parent.signal, [apiToken]);
+  const r2 = establishConnection("r2-rest", environmentName, cloudflareEnvironment, timeoutMs, (signal) => bucket.preflight(signal), parent.signal, [apiToken]);
+  try {
+    await Promise.all([d1, r2]);
+  } catch (error) {
+    parent.abort(error);
+    await Promise.allSettled([d1, r2]);
     throw error;
   }
-  const platformSecret = process.env.RBOX_PLATFORM_SECRET ?? "";
-  const apiBase = process.env.RBOX_STORAGE_TRUTH_API ?? (environmentName === "production" ? "https://api.rbox.to" : "");
-  if (!platformSecret || !apiBase) {
-    await proxy.dispose();
-    await rm(remoteConfig.directory, { recursive: true, force: true });
-    throw new Error("set RBOX_PLATFORM_SECRET and RBOX_STORAGE_TRUTH_API (API defaults to https://api.rbox.to for production)");
-  }
-  // The runner calls StorageTruthSource.close() in its outer finally, so the remote
-  // proxy and any local fleet spool have one deterministic cleanup path.
-  const source = createStorageTruthSource({
-    db: proxy.env.rbox_dev_db,
-    bucket: proxy.env.rbox_dev_blobs,
+  return createStorageTruthSource({
+    db,
+    bucket,
     apiBase,
     platformSecret,
-    close: async () => {
-      await proxy.dispose();
-      await rm(remoteConfig.directory, { recursive: true, force: true });
-    },
+    ...(options.fetch ? { fetch: options.fetch } : {}),
   });
-  return source;
 }

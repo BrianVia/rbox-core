@@ -50,6 +50,8 @@ class FixtureSource implements StorageTruthSource {
   uniqueRoots = 8;
   duplicateOldHead = false;
   mixedHistoryWindow = false;
+  gapSequences = false;
+  mixedTimestampGap: "known-first" | "null-first" | null = null;
   droppedRows = 0;
   seqRows = 0;
   readonly ent: EntitlementRow[] = [
@@ -92,7 +94,9 @@ class FixtureSource implements StorageTruthSource {
       const i = offset + j;
       const cutoff = NOW - 5 * 86_400_000;
       if (i === 0) return { sha: "a-active", head: true, committedAt: cutoff - 1 };
-      if (i === 1) return { sha: "b-history", head: false, committedAt: cutoff - 1 };
+      if (i === 1) return { sha: "b-history", head: false, committedAt: this.mixedTimestampGap === "null-first" ? null : cutoff - 1 };
+      if (i === 2 && this.gapSequences) return { sha: "root-0000002", head: false, committedAt: null };
+      if (i === 2 && this.mixedTimestampGap) return { sha: "b-history", head: false, committedAt: this.mixedTimestampGap === "known-first" ? null : cutoff - 1 };
       if (i === 2 && this.duplicateOldHead) return { sha: "a-active", head: false, committedAt: cutoff - 1 };
       if (i === 2 && this.mixedHistoryWindow) return { sha: "b-history", head: false, committedAt: NOW };
       return { sha: `root-${String(i).padStart(7, "0")}`, head: false, committedAt: i === 2 ? cutoff : NOW };
@@ -336,6 +340,39 @@ describe("disk-backed constructed cap fixture", () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  test("completes the partition and reports roots whose sequence timestamps are missing", async () => {
+    const source = new FixtureSource();
+    source.gapSequences = true;
+    const dir = await mkdtemp(path.join(os.tmpdir(), "rbox-storage-gap-sequences-"));
+    try {
+      const report = await measureStorageTruth(source, "acct", dir);
+      expect(report.status).toBe("complete");
+      expect(report.sectionA).toMatchObject({ totalEntitlements: 6, partitionCount: 6, partitionHolds: true });
+      expect(report.sectionB.windowExpiredRetained.count).toBe(1);
+      expect(report.sectionB.timestampGapRoots).toBe(1);
+      expect(renderHuman(report)).toContain("timestamp-gaps: 1 roots (window-expiry unknown for these)");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  for (const order of ["known-first", "null-first"] as const) {
+    test(`preserves a mixed known/null timestamp gap for the same SHA (${order})`, async () => {
+      const source = new FixtureSource();
+      source.mixedTimestampGap = order;
+      const dir = await mkdtemp(path.join(os.tmpdir(), `rbox-storage-mixed-timestamp-${order}-`));
+      try {
+        const report = await measureStorageTruth(source, "acct", dir);
+        expect(report.status).toBe("complete");
+        expect(report.sectionA.buckets["retained-history"].count).toBe(1);
+        expect(report.sectionB.windowExpiredRetained.count).toBe(0);
+        expect(report.sectionB.timestampGapRoots).toBe(1);
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+  }
 
   test("resumes physical inventory from the page cursor persisted before interruption", async () => {
     const source = new FixtureSource();
