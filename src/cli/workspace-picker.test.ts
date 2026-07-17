@@ -1,4 +1,9 @@
 import { test, expect } from "bun:test";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { promptMissing } from "./init-cmd.js";
+import { track } from "./track-cmd.js";
 import {
   shortWorkspaceId,
   relativeAge,
@@ -9,6 +14,7 @@ import {
   filterWorkspaceChoices,
   fetchAccountWorkspaces,
   SELECT_MAX,
+  promptWorkspacePick,
   type AccountWorkspace,
 } from "./workspace-picker.js";
 
@@ -151,4 +157,128 @@ test("fetchAccountWorkspaces is bounded by maxPages (won't spin on an endless cu
 test("fetchAccountWorkspaces throws on a non-2xx (callers degrade to manual entry)", async () => {
   const fetchFn = (async () => ({ ok: false, status: 500, json: async () => ({}), text: async () => "boom" }) as Response) as unknown as typeof fetch;
   await expect(fetchAccountWorkspaces("https://api", "tok", 10, fetchFn)).rejects.toThrow(/servers are having trouble/);
+});
+
+test("setup picker: empty account returns empty-account with message and no manual prompt", async () => {
+  const writes: string[] = [];
+  let prompts = 0;
+  const result = await promptWorkspacePick({
+    baseUrl: "https://api.test",
+    token: "tok",
+    mode: "setup",
+    deps: {
+      fetchList: async () => ({ kind: "empty" }),
+      promptInput: (async () => { prompts++; return "unexpected"; }) as never,
+      writeStderr: (text) => void writes.push(text),
+    },
+  });
+  expect(result).toEqual({ kind: "empty-account" });
+  expect(prompts).toBe(0);
+  expect(writes.join("")).toContain("no workspaces on this account yet");
+});
+
+test("setup picker: fetch failure warns, retains entered id, and blank-blank goes back", async () => {
+  const run = async (answers: string[]) => {
+    const messages: string[] = [];
+    const writes: string[] = [];
+    const result = await promptWorkspacePick({
+      baseUrl: "https://api.test",
+      token: "tok",
+      mode: "setup",
+      deps: {
+        fetchList: async () => ({ kind: "failed" }),
+        promptInput: (async (cfg: { message: string }) => { messages.push(cfg.message); return answers.shift()!; }) as never,
+        writeStderr: (text) => void writes.push(text),
+      },
+    });
+    return { result, messages, writes };
+  };
+  const entered = await run(["", "ws_manual"]);
+  expect(entered.result).toEqual({ kind: "picked", pick: { workspaceId: "ws_manual" } });
+  expect(entered.messages).toEqual([
+    "Workspace id to sync (find it with `rbox list` on an enrolled machine)",
+    "Enter a workspace id, or leave blank again to go back",
+  ]);
+  expect(entered.writes.join("")).toContain("can't list workspaces right now");
+  expect((await run(["", ""])).result).toEqual({ kind: "back" });
+});
+
+test("setup picker: listed manual escape uses the same two-blank navigation", async () => {
+  const answers = ["", "ws_after_blank"];
+  const result = await promptWorkspacePick({
+    baseUrl: "https://api.test",
+    token: "tok",
+    mode: "setup",
+    deps: {
+      fetchList: async () => ({ kind: "listed", rows: [ws({ workspaceId: "ws_listed" })] }),
+      promptSelect: (async () => "\0manual") as never,
+      promptInput: (async () => answers.shift()!) as never,
+    },
+  });
+  expect(result).toEqual({ kind: "picked", pick: { workspaceId: "ws_after_blank" } });
+});
+
+test("legacy picker bit-identity matrix drives both init and track callers", async () => {
+  const cases = [
+    { name: "no-token", token: undefined, outcome: undefined },
+    { name: "fetch-failure", token: "tok", outcome: { kind: "failed" } as const },
+    { name: "successful-empty", token: "tok", outcome: { kind: "empty" } as const },
+    { name: "nonempty-manual-escape", token: "tok", outcome: { kind: "listed", rows: [ws({ workspaceId: "ws_listed" })] } as const, manual: true },
+  ];
+
+  for (const c of cases) {
+    let initPrompts = 0;
+    const initWrites: string[] = [];
+    const initPicker = ((opts: { baseUrl: string; token?: string; mode: "legacy" }) => promptWorkspacePick({
+      ...opts,
+      deps: {
+        ...(c.outcome ? { fetchList: async () => c.outcome! } : {}),
+        ...(c.manual ? { promptSelect: (async () => "\0manual") as never } : {}),
+        promptInput: (async () => { initPrompts++; return ""; }) as never,
+        writeStderr: (text) => void initWrites.push(text),
+      },
+    })) as never;
+    const gathered = await promptMissing(
+      { project: "root", root: "/tmp/init-root", name: "-", "respect-gitignore": "true" },
+      "/tmp",
+      {
+        creds: c.token ? { token: c.token, remoteUrl: "https://api.test", deviceId: "dev", accountId: "acct" } : undefined,
+        defaultRemote: "https://api.test",
+        promptSelect: (async () => "join") as never,
+        promptWorkspacePick: initPicker,
+      }
+    );
+    expect(gathered.workspace, `init:${c.name}`).toBeUndefined();
+    expect(initPrompts, `init:${c.name}`).toBe(1);
+    expect(initWrites.join(""), `init:${c.name}`).not.toContain("can't list");
+
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-track-picker-"));
+    let trackPrompts = 0;
+    let creates = 0;
+    const trackWrites: string[] = [];
+    const trackPicker = ((opts: { baseUrl: string; token?: string; mode: "legacy" }) => promptWorkspacePick({
+      ...opts,
+      deps: {
+        ...(c.outcome ? { fetchList: async () => c.outcome! } : {}),
+        ...(c.manual ? { promptSelect: (async () => "\0manual") as never } : {}),
+        promptInput: (async () => { trackPrompts++; return ""; }) as never,
+        writeStderr: (text) => void trackWrites.push(text),
+      },
+    })) as never;
+    try {
+      const result = await track(root, {}, "https://api.test", {
+        loadCredentials: (async () => ({ token: c.token, remoteUrl: "https://api.test", deviceId: "dev", accountId: "acct" })) as never,
+        isInteractive: () => true,
+        promptSelect: (async () => "existing") as never,
+        promptWorkspacePick: trackPicker,
+        createRemoteWorkspace: async () => { creates++; return "ws_created"; },
+      });
+      expect(result.cfg.remoteWorkspaceId, `track:${c.name}`).toBe("ws_created");
+      expect(creates, `track:${c.name}`).toBe(1);
+      expect(trackPrompts, `track:${c.name}`).toBe(1);
+      expect(trackWrites.join(""), `track:${c.name}`).not.toContain("can't list");
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  }
 });

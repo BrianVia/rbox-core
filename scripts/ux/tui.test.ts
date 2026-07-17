@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { DEV_API } from "./fresh-machine.js";
 import {
-  assertDirectDevRbox, containerTmuxPlan, keyTmuxArgs, parseTuiArgs, pasteBuffer, renderCommand, shellQuote,
+  assertDirectDevRbox, containerTmuxPlan, keyTmuxArgs, parseTuiArgs, pasteBuffer, renderCommand, renderRetainedCommand, shellQuote,
   stripTrailingBlankLines, tmuxStartArgs, waitForStable,
 } from "./tui.js";
 
@@ -55,7 +58,7 @@ test("POSIX renderer preserves empty, quotes, metacharacters, dashes, and unicod
   expect(renderCommand(["rbox", "", "a b", "$()", ";", "-x", "☃"])).toBe("exec 'rbox' '' 'a b' '$()' ';' '-x' '☃'");
 });
 
-test("tmux start plan fixes geometry, cwd, DEV env, and empty scrubbed values", () => {
+test("tmux start plan fixes geometry, cwd, DEV env, and atomically retains its pane", () => {
   const args = tmuxStartArgs("walk", "/tmp/rbox-ux/r/a", 120, 40, ["rbox", "setup"]);
   expect(args.slice(0, 11)).toEqual(["new-session", "-d", "-E", "-s", "walk", "-x", "120", "-y", "40", "-c", "/tmp/rbox-ux/r/a"]);
   expect(args).toContain(`RBOX_API=${DEV_API}`);
@@ -63,7 +66,8 @@ test("tmux start plan fixes geometry, cwd, DEV env, and empty scrubbed values", 
   expect(args).toContain("RBOX_KEY=");
   expect(args).toContain("RBOX_APP=");
   expect(args.at(-2)).toBe("--");
-  expect(args.at(-1)).toBe("exec 'rbox' 'setup'");
+  expect(args.at(-1)).toBe("tmux set-option -p -t \"$TMUX_PANE\" remain-on-exit on && exec 'rbox' 'setup'");
+  expect(renderRetainedCommand(["rbox", "setup"])).not.toContain("set-option -g");
 });
 
 test("named keys and text use distinct tmux modes", () => {
@@ -108,4 +112,53 @@ test("wait-idle returns the final changing screen on timeout", async () => {
   const result = await waitForStable(1, { capture: async () => String(capture++), sleep: async (ms) => { time += ms; }, now: () => time });
   expect(result.stable).toBeFalse();
   expect(result.screen).toBe("2");
+});
+
+test("an immediately exiting child leaves a dead pane capturable by screen and wait-idle", async () => {
+  if (!Bun.which("tmux")) return;
+  const directory = await mkdtemp(path.join(os.tmpdir(), "rbox-tui-test-"));
+  const socket = path.join(directory, "tmux.sock");
+  const session = `dead-${process.pid}-${Date.now()}`;
+  const run = async (args: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> => {
+    const child = Bun.spawn(["tmux", "-S", socket, ...args], { stdout: "pipe", stderr: "pipe" });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
+    ]);
+    return { exitCode, stdout, stderr };
+  };
+
+  try {
+    const started = await run(tmuxStartArgs(session, directory, 80, 24, ["rbox", "help"]));
+    // Some managed sandboxes expose tmux but deny its Unix-socket connection.
+    if (started.exitCode !== 0 && /Operation not permitted|Permission denied/.test(started.stderr)) return;
+    expect(started.exitCode, started.stderr).toBe(0);
+
+    let dead = "";
+    for (let attempt = 0; attempt < 20 && dead !== "1"; attempt++) {
+      await Bun.sleep(25);
+      const status = await run(["display-message", "-p", "-t", session, "#{pane_dead}"]);
+      if (status.exitCode !== 0 && /Operation not permitted|Permission denied/.test(status.stderr)) return;
+      expect(status.exitCode, status.stderr).toBe(0);
+      dead = status.stdout.trim();
+    }
+    expect(dead).toBe("1");
+
+    const screen = await run(["capture-pane", "-p", "-t", session]);
+    expect(screen.exitCode, screen.stderr).toBe(0);
+    expect(screen.stdout).toContain("rbox");
+
+    const stable = await waitForStable(1, {
+      capture: async () => {
+        const capture = await run(["capture-pane", "-p", "-t", session]);
+        expect(capture.exitCode, capture.stderr).toBe(0);
+        return capture.stdout;
+      },
+      sleep: Bun.sleep,
+      now: Date.now,
+    });
+    expect(stable).toEqual({ screen: screen.stdout, stable: true });
+  } finally {
+    await run(["kill-server"]);
+    await rm(directory, { recursive: true, force: true });
+  }
 });

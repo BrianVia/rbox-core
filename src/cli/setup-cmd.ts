@@ -22,22 +22,31 @@
  * promises Steps 2–3 it can't deliver.
  */
 import os from "node:os";
-import { GITIGNORE_CHOICES, runInit } from "./init-cmd.js";
+import fs from "node:fs/promises";
+import { GITIGNORE_CHOICES, continueInitWithPrecreatedWorkspace, runInit } from "./init-cmd.js";
 import { collapseHome, interpretWorkspaceNameAnswer } from "./init-plan.js";
 import { EXISTING_ACCOUNT_ENROLLMENT_MESSAGE, login, redeemPair, runGenesisEnrollment } from "./auth-cmd.js";
-import { enrollViaRecovery } from "./e2ee-client.js";
+import { enrollViaPrevalidatedRecovery, PairingTokenShapeError, parsePairingToken } from "./e2ee-client.js";
+import { phraseToRk } from "../engine/e2ee/index.js";
 import { enableAutostart, startDaemonAndRecordDesired } from "./autostart-cmd.js";
 import { loadCredentials } from "./credentials.js";
-import { loadConfig } from "./config.js";
+import { loadConfigIfPresent } from "./config.js";
 import { hasDevice } from "./e2ee-keystore.js";
-import { RboxApi } from "./remote.js";
+import { createRemoteWorkspace, RboxApi } from "./remote.js";
 import { promptWorkspacePick } from "./workspace-picker.js";
-import { promptSelect, promptInput, promptConfirm, promptPassword } from "./prompt.js";
+import { promptSelect, promptInput, promptConfirm, promptPassword, promptPath } from "./prompt.js";
 import { stderrStyle as e } from "./style.js";
 import { checkoutUrl, type BillingCadence, type SubscribePlan } from "./subscribe-cmd.js";
 import { openAndShow } from "./browser-open.js";
 import { hasKeyInput, runKeyedSetup } from "./setup-keyed.js";
 import { getIdentity, identityText } from "./account-profile.js";
+import { WORKSPACE_MINT_RERUN_HINT } from "./remote/errors.js";
+import {
+  acquireWorkspaceSyncMutex,
+  releaseWorkspaceSyncMutex,
+  workspaceSyncMutexDegraded,
+  type WorkspaceSyncMutex,
+} from "./sync-mutex.js";
 
 /** Map a workspace decision to the exact `runInit` flags (the populate-sync runs
  *  inside runInit: push for a new workspace, pull+push for a join). */
@@ -74,6 +83,22 @@ export const START_SYNC_CHOICES = [
  *  the daemon only; "none" does neither. */
 export function startSyncActions(choice: StartSyncChoice): { startDaemon: boolean; enableAutostart: boolean } {
   return { startDaemon: choice !== "none", enableAutostart: choice === "both" };
+}
+
+/** Loop Step 2 only for explicit pre-init navigation; consume preselection once. */
+export async function runWorkspaceStepLoop(
+  opts: { cwd: string; defaultRemote: string },
+  setupOpts: { noSync?: boolean; preselectedKind?: WorkspaceKind; header: string },
+  runStep: typeof stepWorkspace = stepWorkspace
+): Promise<{ workspaceId: string; deviceId: string; root: string } | undefined> {
+  let preselectedKind = setupOpts.preselectedKind;
+  for (;;) {
+    const selectedForThisAttempt = preselectedKind;
+    preselectedKind = undefined;
+    const result = await runStep(opts, { ...setupOpts, preselectedKind: selectedForThisAttempt });
+    if (result.kind === "menu") continue;
+    return result.kind === "completed" ? result.outcome : undefined;
+  }
 }
 
 const HR = "─".repeat(72);
@@ -159,7 +184,7 @@ export async function runSetup(opts: {
 
   // Step 2 · Workspace — bind a directory + run the initial populate-sync.
   const shortFlow = accountSkipped;
-  const outcome = await stepWorkspace(opts, {
+  const outcome = await runWorkspaceStepLoop(opts, {
     noSync: syncDisabledUntilSubscribe,
     preselectedKind: opts.preselectedWorkspaceKind,
     header: shortFlow ? stepHeader(1, 2, "Workspace") : stepHeader(2, 3, "Workspace"),
@@ -229,6 +254,77 @@ interface StepAccountResult {
   created: boolean;
 }
 
+export const GENESIS_BROWSER_PROMPT = "Press Enter to sign up in your browser.";
+export const GENESIS_BOOTSTRAP_HINT = "(have a bootstrap secret? type it now — input hidden)";
+export const AUTHORIZATION_RECOVERY_FOOTER =
+  "lost access to your other machines? Sign in via browser, then choose 'Recover with my 24-word phrase'";
+
+interface WizardPairDeps {
+  promptPassword?: typeof promptPassword;
+  redeemPair?: typeof redeemPair;
+  writeStderr?: (text: string) => void;
+}
+
+/** Local-only three-attempt token gate followed by one possibly-consuming redeem. */
+export async function redeemPairInWizard(remote: string, deps: WizardPairDeps = {}): Promise<"enrolled" | "parent"> {
+  const ask = deps.promptPassword ?? promptPassword;
+  const redeem = deps.redeemPair ?? redeemPair;
+  const writeStderr = deps.writeStderr ?? ((text: string) => process.stderr.write(text));
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const token = (await ask({ message: "Paste pairing token" })).trim();
+    try {
+      parsePairingToken(token);
+    } catch (error) {
+      if (!(error instanceof PairingTokenShapeError)) throw error;
+      writeStderr(`${e.yellow(error.message)}\n`);
+      continue;
+    }
+    try {
+      await redeem(remote, token, undefined, "wizard");
+      return "enrolled";
+    } catch (error) {
+      writeStderr(`${e.yellow(error instanceof Error ? error.message : String(error))}\n`);
+      writeStderr("if this token was minted recently, it may now be used up — mint a fresh one with `rbox pair` on the other machine\n");
+      return "parent";
+    }
+  }
+  return "parent";
+}
+
+interface WizardRecoveryDeps {
+  promptPassword?: typeof promptPassword;
+  parsePhrase?: typeof phraseToRk;
+  enroll?: typeof enrollViaPrevalidatedRecovery;
+  writeStderr?: (text: string) => void;
+  now?: () => number;
+}
+
+/** Validate the phrase locally up to three times, then make one continuation attempt. */
+export async function recoverInWizard(deps: WizardRecoveryDeps = {}): Promise<"enrolled" | "parent"> {
+  const ask = deps.promptPassword ?? promptPassword;
+  const parse = deps.parsePhrase ?? phraseToRk;
+  const enroll = deps.enroll ?? enrollViaPrevalidatedRecovery;
+  const writeStderr = deps.writeStderr ?? ((text: string) => process.stderr.write(text));
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const phrase = (await ask({ message: "Enter your 24-word recovery phrase" })).trim();
+    let recoveryKey: Uint8Array;
+    try {
+      recoveryKey = await parse(phrase);
+    } catch (error) {
+      writeStderr(`${e.yellow(error instanceof Error ? error.message : String(error))}\n`);
+      continue;
+    }
+    try {
+      await enroll(recoveryKey, (deps.now ?? Date.now)());
+      return "enrolled";
+    } catch (error) {
+      writeStderr(`${e.yellow(error instanceof Error ? error.message : String(error))}\n`);
+      return "parent";
+    }
+  }
+  return "parent";
+}
+
 async function stepAccount(remote: string): Promise<StepAccountResult> {
   const choice = await promptSelect<"create" | "existing">({
     message: "Are you new here, or do you already have an rbox account?",
@@ -239,34 +335,48 @@ async function stepAccount(remote: string): Promise<StepAccountResult> {
   });
 
   if (choice === "create") {
-    const secret = await promptPassword({ message: "Press Enter to sign up in your browser (advanced: enter an account bootstrap secret)" });
+    process.stderr.write(`${e.dim(GENESIS_BOOTSTRAP_HINT)}\n`);
+    const secret = await promptPassword({ message: GENESIS_BROWSER_PROMPT });
     // A secret bootstraps the genesis device (shows the recovery phrase); blank falls
     // back to device-code, which authorizes but can't enroll → resolve inline.
-    await login(remote, secret || undefined);
+    await login(remote, secret || undefined, undefined, undefined, undefined, "wizard");
     return { ok: await resolveEnrollment(remote), created: Boolean(secret) };
   }
 
-  // Existing account.
-  const method = await promptSelect<"pair" | "browser" | "approve">({
-    message: "How do you want to authorize this machine?",
-    choices: AUTHORIZATION_CHOICES,
-  });
+  return authorizeExistingAccount(remote);
+}
 
-  if (authorizePath(method) === "pair-token") {
-    const token = await promptPassword({ message: "Paste pairing token" });
-    if (!token) {
-      process.stderr.write(e.yellow("no token entered — run `rbox pair` on a signed-in machine, then re-run `rbox setup`.\n"));
-      return { ok: false, created: false };
+interface AuthorizeExistingDeps {
+  promptSelect?: typeof promptSelect;
+  redeemPairInWizard?: typeof redeemPairInWizard;
+  login?: typeof login;
+  resolveEnrollment?: typeof resolveEnrollment;
+  writeStderr?: (text: string) => void;
+}
+
+/** Existing-account authorization menu; pairing navigation returns to this parent. */
+export async function authorizeExistingAccount(remote: string, deps: AuthorizeExistingDeps = {}): Promise<StepAccountResult> {
+  const select = deps.promptSelect ?? promptSelect;
+  const runPair = deps.redeemPairInWizard ?? redeemPairInWizard;
+  const runLogin = deps.login ?? login;
+  const resolve = deps.resolveEnrollment ?? resolveEnrollment;
+  const writeStderr = deps.writeStderr ?? ((text: string) => process.stderr.write(text));
+  for (;;) {
+    writeStderr(`${e.dim(AUTHORIZATION_RECOVERY_FOOTER)}\n`);
+    const method = await select<"pair" | "browser" | "approve">({
+      message: "How do you want to authorize this machine?",
+      choices: AUTHORIZATION_CHOICES,
+    });
+
+    if (authorizePath(method) === "pair-token") {
+      if (await runPair(remote) === "parent") continue;
+      return { ok: await resolve(remote), created: false };
     }
-    await redeemPair(remote, token); // enrolls inline → resolveEnrollment short-circuits true
-    return { ok: await resolveEnrollment(remote), created: false };
-  }
 
-  // "browser" and "approve" are the SAME device-code grant (authorize-only) — the
-  // browser option is just a friendlier front door onto login()'s own printed UX
-  // (design 47). Both authorize but do NOT enroll for encryption → resolve inline.
-  await login(remote, undefined);
-  return { ok: await resolveEnrollment(remote), created: false };
+    // "browser" and "approve" are the SAME device-code grant (authorize-only).
+    await runLogin(remote, undefined, undefined, undefined, undefined, "wizard");
+    return { ok: await resolve(remote), created: false };
+  }
 }
 
 async function startTrialAfterAccountCreation(): Promise<boolean> {
@@ -347,6 +457,11 @@ interface ResolveEnrollmentDeps {
   promptSelect?: typeof promptSelect;
   runGenesisEnrollment?: typeof runGenesisEnrollment;
   writeStderr?: (text: string) => void;
+  promptPassword?: typeof promptPassword;
+  redeemPair?: typeof redeemPair;
+  parsePhrase?: typeof phraseToRk;
+  enrollRecovery?: typeof enrollViaPrevalidatedRecovery;
+  now?: () => number;
 }
 
 export async function resolveEnrollment(remote: string, deps: ResolveEnrollmentDeps = {}): Promise<boolean> {
@@ -360,72 +475,115 @@ export async function resolveEnrollment(remote: string, deps: ResolveEnrollmentD
   const api = creds?.token ? (deps.makeApi ?? ((remoteUrl, token) => new RboxApi(remoteUrl, token, "", "")))(creds.remoteUrl ?? remote, creds.token) : undefined;
   const accountKeys = api ? await api.getAccountKeys() : null;
 
-  let method: EnrollmentMethod;
-  if (accountKeys === null) {
-    writeStderr(`\n${e.yellow("⚠")}  This machine is authorized (${e.cyan(creds?.accountId ?? "?")}) and this account has not set up encryption yet.\n`);
-    method = await select<EnrollmentMethod>({
-      message: "How do you want to enroll this machine for encryption?",
-      choices: [
-        { name: "This is my first machine — set up encryption now", value: "genesis", description: "create the recovery phrase and make this device the genesis device" },
-        ...EXISTING_ENROLLMENT_CHOICES,
-      ],
-    });
-  } else {
-    writeStderr(
-      `\n${e.yellow("⚠")}  This machine is authorized (${e.cyan(creds?.accountId ?? "?")}) but NOT yet enrolled for encryption. Enroll it now:\n`
-    );
-    method = await select<ExistingEnrollmentMethod>({
-      message: "How do you want to enroll this machine for encryption?",
-      choices: EXISTING_ENROLLMENT_CHOICES,
-    });
-  }
+  for (;;) {
+    let method: EnrollmentMethod;
+    if (accountKeys === null) {
+      writeStderr(`\n${e.yellow("⚠")}  This machine is authorized (${e.cyan(creds?.accountId ?? "?")}) and this account has not set up encryption yet.\n`);
+      method = await select<EnrollmentMethod>({
+        message: "How do you want to enroll this machine for encryption?",
+        choices: [
+          { name: "This is my first machine — set up encryption now", value: "genesis", description: "create the recovery phrase and make this device the genesis device" },
+          ...EXISTING_ENROLLMENT_CHOICES,
+        ],
+      });
+    } else {
+      writeStderr(
+        `\n${e.yellow("⚠")}  This machine is authorized (${e.cyan(creds?.accountId ?? "?")}) but NOT yet enrolled for encryption. Enroll it now:\n`
+      );
+      method = await select<ExistingEnrollmentMethod>({
+        message: "How do you want to enroll this machine for encryption?",
+        choices: EXISTING_ENROLLMENT_CHOICES,
+      });
+    }
 
-  if (method === "genesis") {
-    if (!api || !creds?.accountId || !creds.deviceId) throw new Error("missing device credentials — run `rbox login` again");
-    const result = await (deps.runGenesisEnrollment ?? runGenesisEnrollment)(api, { accountId: creds.accountId, deviceId: creds.deviceId });
-    if (result === "enrolled") return checkEnrolled();
-    writeStderr(`${e.yellow("!")}  ${EXISTING_ACCOUNT_ENROLLMENT_MESSAGE}\n`);
-    return false;
-  }
-
-  if (method === "later") {
-    writeStderr(
-      `${e.dim("run `rbox pair`/`rbox connect` on a signed-in machine, or `rbox key recover` with your phrase — then re-run `rbox setup`.")}\n`
-    );
-    return false;
-  }
-
-  if (method === "pair") {
-    const token = await promptPassword({ message: "Paste pairing token" });
-    if (!token) {
-      writeStderr(e.yellow("no token entered — run `rbox pair` on a signed-in machine, then re-run `rbox setup`.\n"));
+    if (method === "genesis") {
+      if (!api || !creds?.accountId || !creds.deviceId) throw new Error("missing device credentials — run `rbox login` again");
+      const result = await (deps.runGenesisEnrollment ?? runGenesisEnrollment)(api, { accountId: creds.accountId, deviceId: creds.deviceId });
+      if (result === "enrolled") return checkEnrolled();
+      writeStderr(`${e.yellow("!")}  ${EXISTING_ACCOUNT_ENROLLMENT_MESSAGE}\n`);
       return false;
     }
-    await redeemPair(remote, token);
-  } else {
-    // Recover — same no-echo phrase prompt as `rbox key recover` (auth-cmd.ts).
-    const phrase = (await promptPassword({ message: "Enter your 24-word recovery phrase" })).trim();
-    if (!phrase) {
-      writeStderr(e.yellow("no phrase entered — re-run `rbox setup` when you're ready.\n"));
+
+    if (method === "later") {
+      writeStderr(
+        `${e.dim("run `rbox pair`/`rbox connect` on a signed-in machine, or `rbox key recover` with your phrase — then re-run `rbox setup`.")}\n`
+      );
       return false;
     }
-    await enrollViaRecovery(phrase, Date.now());
-  }
 
-  // A bad token/phrase throws (propagates to the top-level handler); recheck the
-  // robust signal init also uses.
-  return checkEnrolled();
+    if (method === "pair") {
+      const result = await redeemPairInWizard(remote, {
+        promptPassword: deps.promptPassword,
+        redeemPair: deps.redeemPair,
+        writeStderr,
+      });
+      if (result === "parent") continue;
+      return checkEnrolled();
+    }
+
+    const result = await recoverInWizard({
+      promptPassword: deps.promptPassword,
+      parsePhrase: deps.parsePhrase,
+      enroll: deps.enrollRecovery,
+      writeStderr,
+      now: deps.now,
+    });
+    if (result === "parent") continue;
+    return checkEnrolled();
+  }
 }
 
-/** Step 2 · Workspace. Returns the init outcome, or undefined if the user backed out. */
-async function stepWorkspace(
+export type StepWorkspaceResult =
+  | { kind: "menu" }
+  | { kind: "completed"; outcome: { workspaceId: string; deviceId: string; root: string } }
+  | { kind: "terminal" };
+
+interface StepWorkspaceDeps {
+  promptSelect?: typeof promptSelect;
+  promptInput?: typeof promptInput;
+  promptConfirm?: typeof promptConfirm;
+  promptPath?: typeof promptPath;
+  promptWorkspacePick?: typeof promptWorkspacePick;
+  loadCredentials?: typeof loadCredentials;
+  loadConfigIfPresent?: typeof loadConfigIfPresent;
+  stat?: typeof fs.stat;
+  mkdir?: typeof fs.mkdir;
+  acquireMutex?: typeof acquireWorkspaceSyncMutex;
+  releaseMutex?: typeof releaseWorkspaceSyncMutex;
+  isDegraded?: typeof workspaceSyncMutexDegraded;
+  createWorkspace?: typeof createRemoteWorkspace;
+  runInit?: typeof runInit;
+  continueInit?: typeof continueInitWithPrecreatedWorkspace;
+  writeStderr?: (text: string) => void;
+}
+
+/** Step 2 · Workspace. Only explicit pre-init navigation returns `menu`. */
+export async function stepWorkspace(
   opts: { cwd: string; defaultRemote: string },
-  setupOpts: { noSync?: boolean; preselectedKind?: WorkspaceKind; header: string }
-): Promise<{ workspaceId: string; deviceId: string; root: string } | undefined> {
-  process.stderr.write(`\n── ${e.bold(setupOpts.header)} ${HR.slice(0, 44)}\n`);
+  setupOpts: { noSync?: boolean; preselectedKind?: WorkspaceKind; header: string },
+  deps: StepWorkspaceDeps = {}
+): Promise<StepWorkspaceResult> {
+  const select = deps.promptSelect ?? promptSelect;
+  const input = deps.promptInput ?? promptInput;
+  const confirm = deps.promptConfirm ?? promptConfirm;
+  const askPath = deps.promptPath ?? promptPath;
+  const pickWorkspace = deps.promptWorkspacePick ?? promptWorkspacePick;
+  const readCredentials = deps.loadCredentials ?? loadCredentials;
+  const probeConfig = deps.loadConfigIfPresent ?? loadConfigIfPresent;
+  const stat = deps.stat ?? fs.stat;
+  const mkdir = deps.mkdir ?? fs.mkdir;
+  const acquireMutex = deps.acquireMutex ?? acquireWorkspaceSyncMutex;
+  const releaseMutex = deps.releaseMutex ?? releaseWorkspaceSyncMutex;
+  const isDegraded = deps.isDegraded ?? workspaceSyncMutexDegraded;
+  const createWorkspace = deps.createWorkspace ?? createRemoteWorkspace;
+  const executeInit = deps.runInit ?? runInit;
+  const continueInit = deps.continueInit ?? continueInitWithPrecreatedWorkspace;
+  const writeStderr = deps.writeStderr ?? ((text: string) => process.stderr.write(text));
+
+  writeStderr(`\n── ${e.bold(setupOpts.header)} ${HR.slice(0, 44)}\n`);
   const choice =
     setupOpts.preselectedKind ??
-    (await promptSelect<WorkspaceKind>({
+    (await select<WorkspaceKind>({
       message: "What do you want to track here?",
       choices: [
         { name: "Create a new workspace from a directory", value: "new" },
@@ -439,67 +597,145 @@ async function stepWorkspace(
     // Pick-by-name from the account's synced workspaces (degrades to a manual id
     // prompt when offline / no creds / empty account). The picked name is cached
     // locally so `rbox status` shows it with no round-trip.
-    const creds = await loadCredentials();
-    const picked = await promptWorkspacePick({ baseUrl: creds?.remoteUrl ?? opts.defaultRemote, token: creds?.token });
-    if (!picked) {
-      process.stderr.write(e.yellow("no workspace selected — re-run `rbox setup` when you're ready.\n"));
-      return undefined;
-    }
-    workspace = picked.workspaceId;
-    name = picked.name;
-  }
-  const dir = await promptInput({ message: "Which directory should rbox sync?", default: opts.cwd });
+    const creds = await readCredentials();
+    const picked = await pickWorkspace({ baseUrl: creds?.remoteUrl ?? opts.defaultRemote, token: creds?.token, mode: "setup" });
+    if (picked.kind !== "picked") return { kind: "menu" };
+    workspace = picked.pick.workspaceId;
+    name = picked.pick.name;
 
-  // REBIND GUARD (design 44): creating a NEW workspace over a directory that already
-  // syncs to one is almost never what the user wants (the 2026-07-01 incident: a
-  // re-run of setup to name a workspace created a second, empty one). Make the
-  // consequence explicit and default to NO.
-  if (choice === "new") {
-    const bound = await loadConfig(dir).catch(() => undefined);
+    const dir = await askPath({ message: "Which directory should rbox sync?", default: opts.cwd, cwd: opts.cwd });
+    writeStderr(`${e.dim(`will sync: ${dir}`)}\n`);
+    const flags = workspaceFlags({ kind: "join", root: dir, workspace, name });
+    if (setupOpts.noSync) flags["no-sync"] = "true";
+    try {
+      const outcome = await executeInit(flags, { cwd: opts.cwd, defaultRemote: opts.defaultRemote, summary: false, guidedSetup: true });
+      return outcome ? { kind: "completed", outcome } : { kind: "terminal" };
+    } catch (error) {
+      writeStderr(`${e.yellow(error instanceof Error ? error.message : String(error))}\n`);
+      process.exitCode = 1;
+      return { kind: "terminal" };
+    }
+  }
+
+  // Create-new is a local retry loop until a usable, acknowledged, fenced root is
+  // ready. Once createWorkspace runs, every branch is single-shot.
+  for (;;) {
+    const dir = await askPath({ message: "Which directory should rbox sync?", default: opts.cwd, cwd: opts.cwd });
+    writeStderr(`${e.dim(`will sync: ${dir}`)}\n`);
+
+    try {
+      const info = await stat(dir);
+      if (!info.isDirectory()) {
+        writeStderr(`${e.yellow(`${dir} exists but is not a directory`)}\n`);
+        continue;
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        writeStderr(`${e.yellow(error instanceof Error ? error.message : String(error))}\n`);
+        continue;
+      }
+      const create = await confirm({ message: `${dir} doesn't exist — create it?`, default: false });
+      if (!create) continue;
+      try {
+        await mkdir(dir, { recursive: true });
+      } catch (mkdirError) {
+        writeStderr(`${e.yellow(mkdirError instanceof Error ? mkdirError.message : String(mkdirError))}\n`);
+        continue;
+      }
+    }
+
+    let bound: Awaited<ReturnType<typeof loadConfigIfPresent>>;
+    try {
+      bound = await probeConfig(dir);
+    } catch (error) {
+      writeStderr(`${e.yellow(error instanceof Error ? error.message : String(error))}\n`);
+      continue;
+    }
     if (bound) {
       const label = bound.name ? `${bound.name} (${bound.remoteWorkspaceId})` : bound.remoteWorkspaceId;
-      process.stderr.write(`${e.yellow("⚠")}  This directory already syncs to workspace ${e.cyan(label)}.\n`);
-      const rebind = await promptConfirm({
+      writeStderr(`${e.yellow("⚠")}  This directory already syncs to workspace ${e.cyan(label)}.\n`);
+      const rebind = await confirm({
         message: "Create a brand-new workspace for it anyway? (files on disk are untouched; sync history starts fresh)",
         default: false,
       });
       if (!rebind) {
-        process.stderr.write(
+        writeStderr(
           `${e.dim(`keeping the existing workspace. To sync it in the background run \`rbox start\`; to sync this directory to a different existing workspace, re-run setup and choose "Sync an existing workspace".`)}\n`
         );
-        return undefined;
+        return { kind: "menu" };
       }
     }
+
+    let syncMutex: WorkspaceSyncMutex;
+    try {
+      syncMutex = await acquireMutex(dir, "cli");
+    } catch (error) {
+      writeStderr(`${e.yellow(error instanceof Error ? error.message : String(error))}\n`);
+      continue;
+    }
+
+    let handedOff = false;
+    try {
+      if (isDegraded(syncMutex)) {
+        writeStderr(`${e.yellow("workspace setup requires filesystem locking, but this filesystem does not support the required lock identity — choose a directory on a supported filesystem")}\n`);
+        process.exitCode = 1;
+        return { kind: "terminal" };
+      }
+
+      // Opt-in, server-visible workspace name — offered ONLY when creating (the row
+      // is INSERTed once, first-writer-wins). Setup drives init via non-interactive
+      // flags, so it owns this prompt. "-" keeps the label private.
+      writeStderr(`${e.dim("a workspace name is OPTIONAL and shown in the web dashboard (visible to rbox, server-side — NOT end-to-end encrypted).")}\n`);
+      const ans = interpretWorkspaceNameAnswer(
+        await input({ message: `Workspace name (Enter accepts, "-" for none)`, default: collapseHome(dir, os.homedir()) })
+      );
+      if (ans) name = ans;
+
+      const respectGitignore =
+        (await select<"false" | "true">({
+          message: "How should rbox handle gitignored files?",
+          choices: SETUP_GITIGNORE_CHOICES,
+        })) === "true";
+
+      const creds = await readCredentials();
+      if (!creds) throw new Error("login did not produce a credential — aborting setup");
+      let workspaceId: string;
+      try {
+        workspaceId = await createWorkspace(creds.remoteUrl ?? opts.defaultRemote, creds.token, "root", name);
+        if (typeof workspaceId !== "string" || workspaceId.trim() === "") {
+          throw new Error(`workspace create returned no usable id — ${WORKSPACE_MINT_RERUN_HINT}`);
+        }
+      } catch (error) {
+        // NetworkError already carries the required unknown-outcome wording. Every
+        // create failure is terminal and never re-enters this loop.
+        writeStderr(`${e.yellow(error instanceof Error ? error.message : String(error))}\n`);
+        process.exitCode = 1;
+        return { kind: "terminal" };
+      }
+
+      const flags = workspaceFlags({ kind: "new", root: dir, name, respectGitignore });
+      if (setupOpts.noSync) flags["no-sync"] = "true";
+      handedOff = true;
+      try {
+        const outcome = await continueInit(
+          flags,
+          { cwd: opts.cwd, defaultRemote: opts.defaultRemote, summary: false, guidedSetup: true },
+          { workspaceId, syncMutex }
+        );
+        if (outcome) return { kind: "completed", outcome };
+        throw new Error("initial setup returned without completing");
+      } catch (error) {
+        writeStderr(
+          `${e.yellow(`workspace ${workspaceId} was created but local setup didn't finish: ${error instanceof Error ? error.message : String(error)}. ` +
+            `Re-run rbox setup and choose 'Sync an existing workspace' → ${workspaceId}.`)}\n`
+        );
+        process.exitCode = 1;
+        return { kind: "terminal" };
+      }
+    } finally {
+      if (!handedOff) await releaseMutex(syncMutex);
+    }
   }
-
-  // Opt-in, server-visible workspace name — offered ONLY when creating (the row is
-  // INSERTed once, first-writer-wins). `rbox setup` drives runInit via FLAGS, which
-  // skips runInit's own interactive name prompt, so we must prompt here (mirrors
-  // init-cmd.ts). Declining keeps it private — the label is server-side / NOT E2EE.
-  // A join reuses the picker's already-known name.
-  if (choice === "new") {
-    process.stderr.write(`${e.dim("a workspace name is OPTIONAL and shown in the web dashboard (visible to rbox, server-side — NOT end-to-end encrypted).")}\n`);
-    // Single optional input: the suggestion is the default, so a bare ENTER names the
-    // workspace by its directory (what the old confirm→input two-step did on default+
-    // ENTER); "-" is the documented skip (the old confirm's "n" path — keeps it private).
-    const ans = interpretWorkspaceNameAnswer(
-      await promptInput({ message: `Workspace name (Enter accepts, "-" for none)`, default: collapseHome(dir, os.homedir()) })
-    );
-    if (ans) name = ans;
-  }
-
-  const respectGitignore =
-    choice === "new" &&
-    (await promptSelect<"false" | "true">({
-      message: "How should rbox handle gitignored files?",
-      choices: SETUP_GITIGNORE_CHOICES,
-    })) === "true";
-
-  const flags = workspaceFlags(
-    choice === "new" ? { kind: "new", root: dir, name, respectGitignore } : { kind: "join", root: dir, workspace, name }
-  );
-  if (setupOpts.noSync) flags["no-sync"] = "true";
-  return runInit(flags, { cwd: opts.cwd, defaultRemote: opts.defaultRemote, summary: false });
 }
 
 function printSummary(workspaceId: string, deviceId: string): void {

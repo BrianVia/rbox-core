@@ -60,6 +60,15 @@ export async function scanManifestForPush(root: string, cfg: WorkspaceConfig, de
  * the filesystem (never trust the network). Returns the actions taken.
  */
 export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = {}): Promise<Action[]> {
+  return (await pullWithMetadata(root, cfg, deps)).actions;
+}
+
+/** Pull boundary metadata used by guided setup without changing pull's public API. */
+export async function pullWithMetadata(
+  root: string,
+  cfg: WorkspaceConfig,
+  deps: SyncDeps = {}
+): Promise<{ actions: Action[]; initialRemoteSequence: number }> {
   if (deps.syncMutex) assertSyncMutex(deps.syncMutex, root);
   const report = deps.report ?? PhaseReport.disabled("pull");
   deps = withReportScanStats(deps, report);
@@ -80,7 +89,10 @@ export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = 
   );
   if (latestTimings) report.recordDetails("latest", { ...latestTimings }, formatLatestTimings(latestTimings));
 
-  return applyPulledManifest(root, cfg, deps, api, { sequence, manifest: remote, manifestMeta, state });
+  return {
+    actions: await applyPulledManifest(root, cfg, deps, api, { sequence, manifest: remote, manifestMeta, state }),
+    initialRemoteSequence: sequence,
+  };
 }
 
 /** Apply an already authenticated remote manifest through the exact normal pull

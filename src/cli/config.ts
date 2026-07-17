@@ -636,18 +636,37 @@ export async function findRoot(start: string): Promise<string | undefined> {
   }
 }
 
+export class WorkspaceConfigNotFoundError extends Error {
+  readonly code = "ENOENT";
+
+  constructor(root: string) {
+    super(`No rbox workspace at ${root}. Run: rbox link ${root}`);
+    this.name = "WorkspaceConfigNotFoundError";
+  }
+}
+
 export async function loadConfig(root: string): Promise<WorkspaceConfig> {
   let raw: string;
   try {
     raw = await fs.readFile(configPath(root), "utf8");
   } catch (e) {
-    if (isENOENT(e)) throw new Error(`No rbox workspace at ${root}. Run: rbox link ${root}`);
+    if (isENOENT(e)) throw new WorkspaceConfigNotFoundError(root);
     throw e;
   }
   try {
     return JSON.parse(raw) as WorkspaceConfig;
   } catch {
     throw new Error(`Corrupt workspace config at ${configPath(root)}. Inspect or re-run \`rbox link\`.`);
+  }
+}
+
+/** Typed config probe: only a genuinely absent workspace config maps to undefined. */
+export async function loadConfigIfPresent(root: string): Promise<WorkspaceConfig | undefined> {
+  try {
+    return await loadConfig(root);
+  } catch (error) {
+    if (error instanceof WorkspaceConfigNotFoundError) return undefined;
+    throw error;
   }
 }
 

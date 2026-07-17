@@ -20,6 +20,14 @@ export interface TrackResult {
   root: string;
 }
 
+export interface TrackDeps {
+  loadCredentials?: (typeof import("./credentials.js"))["loadCredentials"];
+  isInteractive?: (typeof import("./prompt.js"))["isInteractive"];
+  promptSelect?: (typeof import("./prompt.js"))["promptSelect"];
+  promptWorkspacePick?: (typeof import("./workspace-picker.js"))["promptWorkspacePick"];
+  createRemoteWorkspace?: (typeof import("./remote.js"))["createRemoteWorkspace"];
+}
+
 /**
  * Bind `path` to a workspace and persist the per-device config. With `--workspace`
  * it adopts that id offline; without one it CREATES a workspace server-side (which
@@ -29,13 +37,14 @@ export interface TrackResult {
 export async function track(
   pathArg: string | undefined,
   flags: Record<string, string>,
-  defaultRemote: string
+  defaultRemote: string,
+  deps: TrackDeps = {}
 ): Promise<TrackResult> {
   const root = path.resolve(pathArg ?? process.cwd());
   const remoteUrl = flags.remote ?? defaultRemote;
   const projectId = flags.project ?? "root";
   const { loadCredentials } = await import("./credentials.js");
-  const creds = await loadCredentials();
+  const creds = await (deps.loadCredentials ?? loadCredentials)();
 
   // New workspace → create it server-side (ownership at creation, M7). Joining an
   // existing one (--workspace) requires the caller's account to own it; that's
@@ -47,10 +56,10 @@ export async function track(
     // `rbox track <dir>` used to silently create a brand-new workspace even when you
     // meant to attach an existing one. Now it offers create-or-pick-by-name.
     const { isInteractive } = await import("./prompt.js");
-    if (isInteractive() && flags["no-interactive"] !== "true") {
+    if ((deps.isInteractive ?? isInteractive)() && flags["no-interactive"] !== "true") {
       const { promptSelect } = await import("./prompt.js");
       const { promptWorkspacePick } = await import("./workspace-picker.js");
-      const choice = await promptSelect<"new" | "existing">({
+      const choice = await (deps.promptSelect ?? promptSelect)<"new" | "existing">({
         message: "Track a new workspace, or an existing one?",
         choices: [
           { name: "Create a new workspace", value: "new" },
@@ -60,7 +69,7 @@ export async function track(
       if (choice === "existing") {
         // Picker degrades to a manual id prompt offline / no-creds / empty account;
         // backing out (blank) falls through to the create-new path below.
-        const picked = await promptWorkspacePick({ baseUrl: creds?.remoteUrl ?? remoteUrl, token: creds?.token });
+        const picked = await (deps.promptWorkspacePick ?? promptWorkspacePick)({ baseUrl: creds?.remoteUrl ?? remoteUrl, token: creds?.token, mode: "legacy" });
         if (picked) {
           workspaceId = picked.workspaceId;
           pickedName = picked.name;
@@ -72,7 +81,7 @@ export async function track(
       // Create-new — also the non-interactive default. Needs a login.
       const { createRemoteWorkspace } = await import("./remote.js");
       if (!creds) throw new Error("run `rbox login` before creating a workspace");
-      workspaceId = await createRemoteWorkspace(remoteUrl, creds.token, projectId, flags.name);
+      workspaceId = await (deps.createRemoteWorkspace ?? createRemoteWorkspace)(remoteUrl, creds.token, projectId, flags.name);
     }
   }
 
