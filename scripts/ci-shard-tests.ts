@@ -17,28 +17,47 @@ type TestUnit = {
 
 const HEAVY_WEIGHTS: Record<string, number> = {
   // These hints keep the runtime partition balanced without hardcoding complete
-  // shard file lists. Every test is still discovered from src/**/*.test.ts.
-  "src/cli/daemon/daemon-activity.test.ts": 24,
-  "src/cli/sync/sync.test.ts": 13,
-  "src/cli/e2ee-sync.test.ts": 3,
-  "src/cli/shell-init.test.ts": 3,
-  "src/cli/daemon/daemon-binding.test.ts": 7,
-  "src/cli/daemon-spawn.test.ts": 7,
-  "src/cli/daemon/daemon-safety.test.ts": 5,
-  "src/cli/daemon-logs.test.ts": 5,
-  "src/cli/daemon/daemon-watch-degrade.test.ts": 5,
-  "src/engine/e2ee/e2ee-e2e.test.ts": 4,
-  // Compiles the pool-exit fixture into a ~100MB standalone binary and runs it.
-  "src/engine/crypto-pool-exit-compiled.test.ts": 3,
+  // shard file lists. Values are seconds from main CI run 29606708244; every
+  // test is still discovered from src/**/*.test.ts.
+  "src/cli/sync-git/follow-matrix.test.ts": 49.6,
+  "src/cli/sync-git/follow.test.ts": 47.6,
+  "src/cli/e2ee-sync.test.ts": 22.9,
+  "src/cli/git-cmd.test.ts": 18.9,
+  "src/cli/daemon/daemon-activity.test.ts": 10.3,
+  "src/engine/dircache.test.ts": 8.3,
+  "src/engine/dircache-bench.test.ts": 7.8,
+  "src/engine/e2ee/roster.test.ts": 7,
+  "src/cli/remote/blob-batch/blob-batch.test.ts": 5.8,
+  "src/cli/git-config-sync.e2e.test.ts": 5.6,
+  "src/cli/daemon/watcher.test.ts": 4.3,
+  "src/engine/manifest-delta.bench.test.ts": 4.3,
+  "src/cli/design85-layer-a.test.ts": 4.1,
+  "src/cli/remote-network-resilience.test.ts": 4.1,
+  "src/cli/daemon-logs.test.ts": 3.8,
+  "src/engine/git/apply.test.ts": 3.6,
+  "src/engine/git/p-repair-transaction.test.ts": 3.3,
+  "src/cli/versions-restore.test.ts": 3.2,
+  "src/engine/git-state.test.ts": 2.9,
+  "src/engine/e2ee/session.test.ts": 2.9,
+  "src/cli/daemon/daemon-ws-reliability.test.ts": 2.9,
+  "src/engine/e2ee/epoch.test.ts": 2.7,
+  "src/cli/publish-pipeline/pipeline.test.ts": 2.6,
+  "src/cli/sync-git/reset-journal.test.ts": 2.6,
+  "src/cli/dispatch-json.test.ts": 2.5,
+  "src/engine/git/lockfile.test.ts": 2.4,
+  "src/cli/sync-git/sync-git-config-pull.test.ts": 2,
+  "src/engine/git/base-artifacts.test.ts": 2,
+  "src/cli/sync/sync.test.ts": 1.8,
+  "src/engine/e2ee/e2ee-e2e.test.ts": 1.5,
 };
 
 const SPLIT_FILES: Record<string, { parts: number; weight: number; partWeights?: number[] }> = {
-  // Measured locally: git-sync is ~84s and git-nested is ~20s as single files,
+  // Measured on main CI: git-sync is ~36s and git-nested is ~3.7s as single files,
   // so a file-only partition cannot hit the <=30s target. Split by test names
   // discovered from the source at runtime; the guard verifies every discovered
   // test name in these files is covered exactly once.
-  "src/cli/sync-git/git-sync.test.ts": { parts: 12, weight: 73, partWeights: [8.8, 8.8, 6, 5.3, 5.4, 4.5, 4.7, 3.9, 8, 3.9, 4.3, 3.3] },
-  "src/engine/git-nested.test.ts": { parts: 4, weight: 19, partWeights: [6, 3.7, 4, 5.2] },
+  "src/cli/sync-git/git-sync.test.ts": { parts: 12, weight: 36.4, partWeights: [3.1, 4.2, 2.1, 4.1, 2.6, 4, 3.6, 1.9, 3.2, 3, 1.7, 2.9] },
+  "src/engine/git-nested.test.ts": { parts: 4, weight: 3.7, partWeights: [1, 0.7, 1.1, 0.9] },
 };
 const DEFAULT_WEIGHT = 0.5;
 
@@ -231,7 +250,7 @@ if (command === "guard") {
 if (command === "plan") {
   for (let i = 0; i < shards.length; i++) {
     const shard = shards[i]!;
-    console.log(`shard ${i}/${shardCount}: ${shard.units.length} units, weight ${shard.weight}`);
+    console.log(`shard ${i}/${shardCount}: ${shard.units.length} units, weight ${shard.weight.toFixed(1)}`);
     for (const unit of shard.units) {
       const split = unit.pattern ? ` (${unit.files[0]}, split, w=${unit.weight})` : HEAVY_WEIGHTS[unit.label] ? ` (w=${HEAVY_WEIGHTS[unit.label]})` : "";
       console.log(`  ${unit.label}${split}`);
