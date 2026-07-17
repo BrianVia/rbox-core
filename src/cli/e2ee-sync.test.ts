@@ -66,15 +66,17 @@ test("latest timing formatter appends the non-sensitive fold token", () => {
 });
 
 test("latest timing fold token distinguishes chain-free raw and snapshot heads", async () => {
-  for (const snapshot of [undefined, "1"] as const) {
+  // "0" is the force-raw kill-switch; unset means snapshot since the v1.7.1
+  // default flip. Both writer modes remain supported and distinguishable.
+  for (const snapshot of ["0", "1", undefined] as const) {
     const server = new FakeServer();
-    const secrets = await bootstrapOnto(server, ACCT, `devA-fold-token-${snapshot ?? "raw"}`, NOW);
+    const secrets = await bootstrapOnto(server, ACCT, `devA-fold-token-${snapshot ?? "default"}`, NOW);
     const writer = await remoteFor(server, secrets);
     const reader = await remoteFor(server, secrets);
     await withManifestEncodingFlags(snapshot, undefined, () => writer.commit(0, secrets.deviceId, { generatedAt: "token", files: [] }));
     let fold: string | undefined;
     await reader.latest({ onLatestTimings: (timings) => { fold = timings.fold; } });
-    expect(fold).toBe(snapshot ? "snapshot" : "raw");
+    expect(fold).toBe(snapshot === "0" ? "raw" : "snapshot");
   }
 });
 
@@ -677,7 +679,7 @@ test("C2 commit emits a chained delta and a cold peer folds it with propagated m
   });
 });
 
-test("mixed fleet reads snapshot/delta history with flags off, restores it, then writes raw-v0 without manifest meta", async () => {
+test("mixed fleet reads snapshot/delta history with the raw kill-switch, restores it, then writes raw-v0 without manifest meta", async () => {
   const server = new FakeServer();
   const secrets = await bootstrapOnto(server, ACCT, "devA-mixed-fleet", NOW);
   const writer = await remoteFor(server, secrets);
@@ -698,7 +700,9 @@ test("mixed fleet reads snapshot/delta history with flags off, restores it, then
     expect(await wireKind(server, writer, 1)).toBe("delta");
   });
 
-  await withManifestEncodingFlags(undefined, undefined, async () => {
+  // RBOX_MDE_SNAPSHOT=0 is the legacy raw-v0 writer since the v1.7.1
+  // default flip; reading snapshot/delta history is unconditional.
+  await withManifestEncodingFlags("0", undefined, async () => {
     const peer = await remoteFor(server, secrets);
     const latest = await peer.latest();
     expect(latest).toEqual({ sequence: 2, manifest: target });
@@ -1238,7 +1242,7 @@ describe("E2EE sync transport — two machines through real sync.ts", () => {
     seedManifestRefs(server, manifest);
 
     let timings: Record<string, number> | undefined;
-    await expect(remote.commit(0, secrets.deviceId, manifest, { blockedFingerprint: different, onCommitTimings: (t) => (timings = t) })).resolves.toEqual({ sequence: 1 });
+    await expect(remote.commit(0, secrets.deviceId, manifest, { blockedFingerprint: different, onCommitTimings: (t) => (timings = t) })).resolves.toMatchObject({ sequence: 1 });
     expect(server.putBlobBytesCalls).toContain(fingerprint);
     expect(server.commitSignedCalls).toBe(1);
     if (!timings) throw new Error("missing commit timings");
@@ -1409,7 +1413,7 @@ describe("E2EE sync transport — two machines through real sync.ts", () => {
     const blockerBase = seq1.files.find((f) => f.path === "a-blocker")!;
     const coherentLog = seq1.files.find((f) => f.path === "z-log")!;
     const poisonLog = { ...coherentLog, size: coherentLog.size - 1 };
-    await expect(remoteA.commit(1, secrets.deviceId, { generatedAt: "", files: [blockerBase, poisonLog] })).resolves.toEqual({ sequence: 2 });
+    await expect(remoteA.commit(1, secrets.deviceId, { generatedAt: "", files: [blockerBase, poisonLog] })).resolves.toMatchObject({ sequence: 2 });
 
     // Byte-identity reconcile accepts the existing bytes without a false conflict.
     const rootB = await tmp();
@@ -1438,7 +1442,7 @@ describe("E2EE sync transport — two machines through real sync.ts", () => {
     const encryptedWrongBytes = await makeRawEntry("a-blocker", Buffer.from("ciphertext for another image\n"));
     const badBlocker = { ...encryptedWrongBytes, sha256: shaBytes(Buffer.from("declared blocker image\n")) };
     const healedLog = await makeRawEntry("z-log", Buffer.alloc(0));
-    await expect(remoteA.commit(2, secrets.deviceId, { generatedAt: "", files: [badBlocker, healedLog] })).resolves.toEqual({ sequence: 3 });
+    await expect(remoteA.commit(2, secrets.deviceId, { generatedAt: "", files: [badBlocker, healedLog] })).resolves.toMatchObject({ sequence: 3 });
 
     const previousConcurrency = process.env.RBOX_DOWNLOAD_CONCURRENCY;
     process.env.RBOX_DOWNLOAD_CONCURRENCY = "1";

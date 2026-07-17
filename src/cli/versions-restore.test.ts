@@ -133,7 +133,16 @@ describe("E2EE version history + restore (design 12 §15)", () => {
         },
       ],
     } as const;
-    expect(await remote.commit(0, secrets.deviceId, invalidManifest)).toEqual({ sequence: 1 });
+    // Plant the invalid manifest via the raw-v0 writer: the snapshot encoder
+    // (default since v1.7.1) rejects it at encode time, but legacy raw blobs
+    // like this exist server-side and the READ boundary must still refuse them.
+    const oldSnapshot = process.env.RBOX_MDE_SNAPSHOT;
+    process.env.RBOX_MDE_SNAPSHOT = "0";
+    try {
+      expect(await remote.commit(0, secrets.deviceId, invalidManifest)).toEqual({ sequence: 1 });
+    } finally {
+      if (oldSnapshot === undefined) delete process.env.RBOX_MDE_SNAPSHOT; else process.env.RBOX_MDE_SNAPSHOT = oldSnapshot;
+    }
 
     let fileBlobReads = 0;
     const originalGet = server.store.get.bind(server.store);
