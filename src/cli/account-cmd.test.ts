@@ -106,7 +106,7 @@ describe("rbox account status / unlink", () => {
     expect(out).toMatch(/linked:\s*yes/i);
     expect(out).toMatch(/signed in as:\s*owner@example\.com \(github\+password\)/i);
     await flushAccountProfileWrites();
-    expect(await readAccountProfile("acct_xyz")).toMatchObject({ email: "owner@example.com", signInMethod: "github+password" });
+    expect(await readAccountProfile("acct_xyz")).toMatchObject({ email: "owner@example.com", signInMethod: "github+password", plan: "pro" });
   });
 
   test.each([
@@ -174,15 +174,15 @@ describe("rbox status — account section", () => {
     expect(out).toMatch(/linked:\s*yes/i);
     expect(out).toMatch(/signed in as:\s*owner@example\.com \(google\)/i);
     await flushAccountProfileWrites();
-    expect(await readAccountProfile("acct_xyz")).toMatchObject({ email: "owner@example.com", signInMethod: "google" });
+    expect(await readAccountProfile("acct_xyz")).toMatchObject({ email: "owner@example.com", signInMethod: "google", plan: "solo" });
   });
 
-  test("ok: an API without the plan field degrades to no active plan, not a failure", async () => {
+  test("ok: an API without the plan field preserves absence while legacy detail remains compatible", async () => {
     stub(() => ({ status: 200, body: { accountId: "acct_old", linked: false } }));
     const summary = await fetchAccountSummary();
-    expect(summary).toEqual({ state: "ok", status: { accountId: "acct_old", plan: "none", linked: false } });
+    expect(summary).toEqual({ state: "ok", status: { accountId: "acct_old", linked: false } });
     await flushAccountProfileWrites();
-    expect(await readAccountProfile("acct_old")).toMatchObject({ email: null, signInMethod: null });
+    expect(await readAccountProfile("acct_old")).toMatchObject({ email: null, signInMethod: null, plan: null });
     expect(plain(formatAccountSummary(summary).join("\n"))).toMatch(/plan:\s*no active plan/i);
     expect(plain(formatAccountSummary(summary).join("\n"))).toMatch(/linked:\s*no/i);
     expect(plain(formatAccountSummary(summary).join("\n"))).not.toMatch(/sign-in:/i);

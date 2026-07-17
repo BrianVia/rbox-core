@@ -34,6 +34,7 @@ test("profile write is private and keyed reads ignore another account", async ()
     accountId: "acct_one",
     email: "owner@example.com",
     signInMethod: "github",
+    plan: null,
   });
   expect(await readAccountProfile("acct_two")).toBeUndefined();
   expect((await fs.stat(accountProfilePath())).mode & 0o777).toBe(0o600);

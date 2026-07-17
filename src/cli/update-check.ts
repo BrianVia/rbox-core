@@ -73,7 +73,7 @@ function due(state: UpdateCheckState | undefined, now: Date): boolean {
   return nowMs - last >= CHECK_INTERVAL_MS;
 }
 
-function updateAvailableVersion(state: UpdateCheckState | undefined, currentVersion = RBOX_VERSION): string | undefined {
+export function updateAvailableVersion(state: UpdateCheckState | undefined, currentVersion = RBOX_VERSION): string | undefined {
   if (!state) return undefined;
   try {
     return semverGt(state.lastKnownVersion, currentVersion) ? state.lastKnownVersion : undefined;

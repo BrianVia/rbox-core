@@ -24,7 +24,7 @@ export default defineFlow({
       // status resolves the workspace from cwd, so the bound-root proof must run
       // from inside proj — the machine exec prefix pins cwd to HOME.
       on: "a",
-      guest: "cd '/tmp/rbox-ux/{{RUN_ID}}/{{MACHINE}}/proj' && rbox status",
+      guest: "cd '/tmp/rbox-ux/{{RUN_ID}}/{{MACHINE}}/proj' && rbox status --verbose",
       assertStdout: [/^workspace\s+.*@\s+\/tmp\/rbox-ux\/[^/\s]+\/a\/proj(?:\s|$)/m],
     },
   ],

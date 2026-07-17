@@ -8,7 +8,7 @@ import { loadActivity, renderShellLine, type DaemonActivity } from "../activity.
 import { loadState, syncStreamId, type SyncState, type WorkspaceConfig } from "../config.js";
 import { RboxDaemon } from "../daemon.js";
 import { daemonRuntimeDir, daemonStatusPath, readDaemonBindingRecord, readDaemonPidRecord, recordDaemonBinding } from "../daemon-control.js";
-import { pull } from "../sync.js";
+import { MassDeleteGuardError, pull } from "../sync.js";
 import { CommitRejectedError, QuotaExceededError, type CommitOptions, type CommitResult, type SyncRemote } from "../remote.js";
 import { attributeDaemonForStatus, healthLine, progressLabel } from "../status-view.js";
 import type { TransferPhase, TransferProgressBytes } from "../transfer-progress.js";
@@ -211,7 +211,7 @@ class QuotaCommitRemote extends MiniRemote {
 
 class RejectedCommitRemote extends MiniRemote {
   commitCalls = 0;
-  constructor(private readonly rejectWith: CommitRejectedError) {
+  constructor(private readonly rejectWith: Error) {
     super();
   }
   override async commit(_parentSequence: number, _device: string, _manifest: Manifest): Promise<CommitResult> {
@@ -237,7 +237,7 @@ class StillBlockedRemote extends MiniRemote {
 
 test("pump error records a halt; only a same-kind success clears it", async () => {
   const remote = new MiniRemote();
-  remote.latestError = new Error("pull would delete 8603 of 8603 tracked files — refusing (mass-delete guard).");
+  remote.latestError = new MassDeleteGuardError("pull", "pull would delete 8603 of 8603 tracked files — refusing (mass-delete guard).");
   const daemon = await makeDaemon(remote);
 
   daemon.want.pull = true;
@@ -247,6 +247,7 @@ test("pump error records a halt; only a same-kind success clears it", async () =
   expect(halted?.halt?.reason).toContain("mass-delete guard");
   expect(halted?.halt?.count).toBe(1);
   expect(halted?.halt?.op).toBe("pull");
+  expect(halted?.halt?.typedReason).toEqual({ kind: "mass-delete", op: "pull" });
 
   // Regression guard: a successful op of a DIFFERENT kind (the queued
   // no-op push, every safety scan) must NOT heal a pull halt — the guard warning
@@ -267,7 +268,7 @@ test("pump error records a halt; only a same-kind success clears it", async () =
   // Regression guard: a NEW failure with the SAME message after a heal is a new
   // episode — it must persist a fresh halt (not silently count as dedup repeat 2..9
   // and leave activity.json healed).
-  remote.latestError = new Error("pull would delete 8603 of 8603 tracked files — refusing (mass-delete guard).");
+  remote.latestError = new MassDeleteGuardError("pull", "pull would delete 8603 of 8603 tracked files — refusing (mass-delete guard).");
   daemon.want.pull = true;
   await daemon.pump();
   await daemon.activityWrite;
@@ -580,8 +581,10 @@ test("quota errors record outOfStorage, suppress watcher uploads, probe on safet
   expect(activity?.lastPush?.sequence).toBe(1);
 });
 
-test("CommitRejectedError records a terminal push halt with the sidecar fingerprint", async () => {
-  const err = new CommitRejectedError("too_many_refs", 250_001, 250_000, "sidecar-fingerprint");
+test.each([
+  [new CommitRejectedError("too_many_refs", 250_001, 250_000, "sidecar-fingerprint"), "too-many-refs"],
+  [new CommitRejectedError("body_too_large", undefined, undefined, "sidecar-fingerprint"), "body-too-large"],
+] as const)("CommitRejectedError %s records a typed terminal push halt", async (err, expectedKind) => {
   const remote = new RejectedCommitRemote(err);
   const daemon = await makeDaemon(remote);
   await fs.writeFile(path.join(root, "a.txt"), "hello");
@@ -598,9 +601,28 @@ test("CommitRejectedError records a terminal push halt with the sidecar fingerpr
     reason: err.message,
     count: 1,
     op: "push",
+    typedReason: { kind: expectedKind },
     terminal: { fingerprint: "sidecar-fingerprint" },
   });
   expect((await readShellLine()).split(" ")[2]).toBe("halt");
+});
+
+test("push mass-delete refusal persists the producer-authored push classification", async () => {
+  const err = new MassDeleteGuardError("push", "push would delete 1000 of 1000 tracked files — refusing (mass-delete guard).");
+  const remote = new RejectedCommitRemote(err);
+  const daemon = await makeDaemon(remote);
+  await fs.writeFile(path.join(root, "a.txt"), "hello");
+  daemon.manifest = await scanManifest(root);
+
+  daemon.want.push = true;
+  await daemon.pump();
+  await daemon.activityWrite;
+
+  expect((await loadActivity(root))?.halt).toMatchObject({
+    reason: err.message,
+    op: "push",
+    typedReason: { kind: "mass-delete", op: "push" },
+  });
 });
 
 test("terminal push halt passes blocked fingerprint into the push and preserves the halt when still blocked", async () => {

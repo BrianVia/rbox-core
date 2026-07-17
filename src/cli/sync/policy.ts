@@ -34,6 +34,15 @@ export function pushMassDeleteTrips(
   return deletes >= min && deletes * 100 >= pct * baseCount;
 }
 
+/** Producer-typed safety refusal. Status must never infer this class from the
+ * human message persisted beside it. */
+export class MassDeleteGuardError extends Error {
+  constructor(public readonly op: "pull" | "push", message: string) {
+    super(message);
+    this.name = "MassDeleteGuardError";
+  }
+}
+
 export function makeDeferErrnoReporter(
   sink: (line: string) => void = (l) => console.error(`rbox: ${l}`),
   onFault?: () => void,

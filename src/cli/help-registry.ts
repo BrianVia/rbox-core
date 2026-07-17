@@ -87,8 +87,12 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "status",
     group: "GETTING STARTED",
     summary: "workspace + background-sync state",
-    usage: "rbox status [path] [--json]",
-    flags: [{ flag: "--json", desc: "print JSON" }],
+    usage: "rbox status [path] [--json | --verbose | --git]",
+    flags: [
+      { flag: "--json", desc: "print JSON" },
+      { flag: "--verbose", desc: "print the complete legacy status detail" },
+      { flag: "--git", desc: "show per-repository Git deferral detail" },
+    ],
   },
   {
     name: "init",

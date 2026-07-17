@@ -74,6 +74,10 @@ function requireMatches(patterns: RegExp[] | undefined, value: string, field: st
   for (const pattern of patterns ?? []) if (!regexMatches(pattern, value)) throw new Error(`${field} did not match ${shown(pattern)}`);
 }
 
+function rejectMatches(patterns: RegExp[] | undefined, value: string, field: string): void {
+  for (const pattern of patterns ?? []) if (regexMatches(pattern, value)) throw new Error(`${field} matched forbidden fragment ${shown(pattern)}`);
+}
+
 function expand(template: string, vars: Map<string, string>, machine: string): string {
   return template.replace(/\{\{([A-Z][A-Z0-9_]*)\}\}/g, (_whole, name: string) => {
     if (name === "MACHINE") return machine;
@@ -93,6 +97,7 @@ function assertCommand(step: Extract<FlowStep, { exec: string[] } | { guest: str
   const expected = step.expectExit ?? 0;
   if (result.exitCode !== expected) throw new Error(`${stepKind(step)} exit ${result.exitCode}, expected ${expected}`);
   requireMatches(step.assertStdout, result.stdout, "stdout");
+  rejectMatches(step.assertNotStdout, result.stdout, "stdout");
   requireMatches(step.assertStderr, result.stderr, "stderr");
 }
 

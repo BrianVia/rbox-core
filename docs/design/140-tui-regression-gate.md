@@ -50,6 +50,21 @@ machine-owned step REQUIRES `on`):
 Assertions are explicit regexes on stable fragments — never full-screen
 goldens, never pids/ids/paths/durations (f14).
 
+### Design 153 Unit-D amendment
+
+Command assertions for both `exec` and `guest` also accept
+`assertNotStdout?: RegExp[]`. Like `assertStdout`, the array must be nonempty,
+is evaluated against only that command step's stdout, and is rejected on every
+non-command step kind. A matching forbidden fragment fails the step without
+dumping the command's unrelated output.
+
+The frozen status contracts are intentionally migrated with the front-door
+brief: `status-healthy` asserts positive and negative stable fragments from the
+brief (a “golden” here is never a full screen), while `tilde-expansion` retains
+its filesystem oracle and moves only the absolute-root heading assertion to
+`rbox status --verbose`. Legacy detail assertions belong to `--verbose`, and
+per-repository deferral assertions belong to `--git`.
+
 ### Server-side oracle (f5, f7 — harness riders)
 
 `fresh-machine.ts` gains two thin authenticated helpers (using the

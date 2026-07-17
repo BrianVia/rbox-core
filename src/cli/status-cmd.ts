@@ -1,8 +1,10 @@
+import path from "node:path";
 import { buildIgnoreMatcher, checkoutTransactionCapability, cryptoPoolStatus, diffManifests, HashCache, scanManifest, type CheckoutTransactionCapability, type DiscoveredGitRepo, type IgnoreMatcher } from "../engine/index.js";
 import { trashStats } from "../engine/trash.js";
 import { loadActivity, shellStateOf, type DaemonActivity } from "./activity.js";
 import { RBOX_VERSION } from "./version.js";
 import { fetchAccountSummary, formatAccountSummary } from "./account-cmd.js";
+import { readAccountProfile } from "./account-profile.js";
 import { DEFERRAL_LANES, loadConfig, loadState, repoRecordsForState, syncStreamId, type GitDeferral, type SyncState, type WorkspaceConfig } from "./config.js";
 import { loadCredentials, type Credentials } from "./credentials.js";
 import { daemonBindingStatus, readDaemonPidRecord } from "./daemon-control.js";
@@ -10,12 +12,22 @@ import { emitJson } from "./json.js";
 import { loadMetrics } from "./metrics.js";
 import {
   attributeDaemonForStatus,
+  aggregatePlanQuotaAttention,
+  briefBehindRemote,
+  briefWorkspaceLabel,
+  freshBriefActive,
   healthDetailLines,
   healthLine,
   lastSyncLines,
+  gitDeferralReasonPresentation,
   projectGitDeferralRepos,
+  renderBriefStatus,
   renderGitDeferralLine,
   trashLine,
+  type BriefHaltReason,
+  type BriefAccountSummary,
+  type BriefIdentitySource,
+  type BriefStatusSnapshot,
   type StatusRemoteHead,
 } from "./status-view.js";
 import {
@@ -26,7 +38,7 @@ import {
   type GitDivergenceStatus,
 } from "./sync-git.js";
 import { style } from "./style.js";
-import { formatUpdateAvailableLine, readUpdateCheckState } from "./update-check.js";
+import { formatUpdateAvailableLine, readUpdateCheckState, updateAvailableVersion } from "./update-check.js";
 import { shortWorkspaceId } from "./workspace-picker.js";
 import { readFreshPopulateStatus } from "./populate-status.js";
 import { readLockingHealth, type LockingHealth } from "./sync-mutex.js";
@@ -75,6 +87,7 @@ type StatusLocalCounts =
 
 export interface StatusCmdDeps {
   now: () => number;
+  loadCredentials?: typeof loadCredentials;
   loadHashCache: (root: string) => Promise<HashCache>;
   scanManifest: typeof scanManifest;
   gitDivergenceCount: typeof gitDivergenceCount;
@@ -90,6 +103,7 @@ export interface StatusCmdDeps {
   readLockingHealth?: (root: string) => Promise<LockingHealth>;
   checkoutTransactionCapability?: typeof checkoutTransactionCapability;
   readAmbientDaemonStatusRecord?: typeof readAmbientDaemonStatusRecord;
+  readBriefIdentity?: (accountId: string) => Promise<BriefIdentitySource | undefined>;
 }
 
 const defaultStatusDeps: StatusCmdDeps = {
@@ -107,6 +121,24 @@ const defaultStatusDeps: StatusCmdDeps = {
 };
 
 const LOCAL_TRUST_MS = 60_000;
+
+async function cachedAccountSummary(
+  creds: Credentials | undefined,
+  identityLookup: (accountId: string) => Promise<BriefIdentitySource | undefined>
+): Promise<BriefAccountSummary> {
+  if (!creds) return { state: "signed-out" };
+  if (!creds.accountId) return { state: "unavailable" };
+  const identity = await identityLookup(creds.accountId);
+  return {
+    state: "ok",
+    identity: identity ?? { email: null, plan: null },
+  };
+}
+
+async function readCachedBriefIdentity(accountId: string): Promise<BriefIdentitySource | undefined> {
+  const profile = await readAccountProfile(accountId);
+  return profile ? { email: profile.email, plan: profile.plan } : undefined;
+}
 
 function trustedLocalSnapshot(
   input: {
@@ -250,7 +282,20 @@ export interface StatusCmdResult {
   daemonRunning: boolean;
 }
 
-export async function statusCmd(root: string, opts: { json?: boolean; now?: Date } = {}): Promise<StatusCmdResult> {
+export interface StatusCmdOptions {
+  json?: boolean;
+  verbose?: boolean;
+  git?: boolean;
+  now?: Date;
+}
+
+function assertPresentationFlags(opts: StatusCmdOptions): void {
+  const selected = [opts.json, opts.verbose, opts.git].filter((value) => value === true).length;
+  if (selected > 1) throw new Error("choose only one status presentation flag: --json, --verbose, or --git");
+}
+
+export async function statusCmd(root: string, opts: StatusCmdOptions = {}): Promise<StatusCmdResult> {
+  assertPresentationFlags(opts);
   const deps = opts.now === undefined
     ? defaultStatusDeps
     : { ...defaultStatusDeps, now: () => opts.now!.getTime() };
@@ -259,10 +304,11 @@ export async function statusCmd(root: string, opts: { json?: boolean; now?: Date
 
 export async function statusCmdWithDeps(
   root: string,
-  opts: { json?: boolean } = {},
+  opts: Omit<StatusCmdOptions, "now"> = {},
   deps: StatusCmdDeps = defaultStatusDeps
 ): Promise<StatusCmdResult> {
-  const creds = await loadCredentials().catch(() => undefined);
+  assertPresentationFlags(opts);
+  const creds = await (deps.loadCredentials ?? loadCredentials)().catch(() => undefined);
   const rawCfg = await loadConfig(root);
   const cfg = { ...rawCfg, remoteUrl: creds?.remoteUrl ?? rawCfg.remoteUrl };
   const daemonBinding = deps.daemonBindingStatus(root, cfg.remoteWorkspaceId);
@@ -290,6 +336,17 @@ export async function statusCmdWithDeps(
       });
       return { daemonRunning: bg.running };
     }
+    if (!opts.verbose) {
+      const workspaceLabel = briefWorkspaceLabel(cfg.name, path.basename(root));
+      const rendered = renderBriefStatus({
+        kind: "reset-halt",
+        workspaceLabel,
+        daemonRunning: bg.running,
+        account: await cachedAccountSummary(creds, deps.readBriefIdentity ?? readCachedBriefIdentity),
+      });
+      for (const line of rendered.lines) console.log(line);
+      return { daemonRunning: rendered.daemonRunning };
+    }
     const wsLabel = cfg.name
       ? `${style.cyan(cfg.name)} ${style.dim("@")} ${root} ${style.dim(`(${shortWorkspaceId(cfg.remoteWorkspaceId)})`)}`
       : `${style.cyan(cfg.remoteWorkspaceId)} ${style.dim("@")} ${root}`;
@@ -301,7 +358,7 @@ export async function statusCmdWithDeps(
     return { daemonRunning: bg.running };
   }
 
-  const accountSummaryP = opts.json ? Promise.resolve(null) : fetchAccountSummary();
+  const accountSummaryP = opts.verbose ? fetchAccountSummary() : Promise.resolve(null);
   let state = await loadState(root, syncStreamId(cfg));
 
   const activityP = daemonStale ? Promise.resolve(undefined) : loadActivity(root);
@@ -543,9 +600,78 @@ export async function statusCmdWithDeps(
           },
         }
         : {}),
+      ...(activity?.halt?.reason !== undefined ? { haltReason: activity.halt.reason } : {}),
     };
     emitJson(statusJson);
     return { daemonRunning: bg.running };
+  }
+
+  if (!opts.verbose) {
+    const account = await cachedAccountSummary(
+      creds,
+      deps.readBriefIdentity ?? readCachedBriefIdentity
+    );
+    const updateState = await readUpdateCheckState();
+    const nextVersion = updateAvailableVersion(updateState);
+    const planQuota = aggregatePlanQuotaAttention(account, activity?.outOfStorage);
+    const typedHalt = activity?.halt?.typedReason;
+    const halt: BriefHaltReason | undefined = activity?.halt
+      ? typedHalt?.kind === "mass-delete"
+        ? { kind: "mass-delete", op: typedHalt.op }
+        : typedHalt?.kind === "too-many-refs"
+          ? { kind: "too-many-refs" }
+          : typedHalt?.kind === "body-too-large"
+            ? { kind: "body-too-large" }
+            : { kind: "unknown" }
+      : undefined;
+    const active = freshBriefActive(activity, bg.running, now);
+    const workspaceLabel = briefWorkspaceLabel(cfg.name, path.basename(root));
+    const brief: BriefStatusSnapshot = {
+      kind: "full",
+      workspaceLabel,
+      daemonRunning: bg.running,
+      daemonStale,
+      account,
+      pendingChanges: localChanges + counts.gitChanged,
+      ...(active ? { active } : {}),
+      ...(populate ? { populate: { filesDone: populate.operation.filesDone, filesTotal: populate.operation.filesTotal } } : {}),
+      behindRemote: briefBehindRemote(state.lastSyncedSequence, remote),
+      ...(halt ? { halt } : {}),
+      planQuota,
+      daemonVersionSkew,
+      locking,
+      ...(projectedGitRepos.length > 0
+        ? {
+          git: {
+            count: projectedGitRepos.length,
+            oldestDeferredSince: projectedGitRepos[0]!.oldestDeferredSince,
+            allLocalEditDeferrals: projectedGitRepos.every((repo) => repo.displayReason === "local-edits"),
+          },
+        }
+        : {}),
+      ...(trash && trash.files > 0 ? { trash: { files: trash.files, bytes: trash.bytes } } : {}),
+      ...(nextVersion ? { update: { current: RBOX_VERSION, next: nextVersion } } : {}),
+      now,
+    };
+    const rendered = renderBriefStatus(brief);
+    for (const line of rendered.lines) console.log(line);
+    if (opts.git) {
+      for (const deferral of projectedGitRepos) {
+        console.log(`  ${renderGitDeferralLine({
+          relPath: deferral.repo,
+          reason: deferral.displayReason,
+          deferredSince: deferral.oldestDeferredSince,
+          checkout: deferral.checkout,
+          bytesChanged: deferral.bytesChanged,
+          now,
+          capability: deferral.displayReason === "unsupported" ? gitCapability : undefined,
+        })}`);
+        const presentation = gitDeferralReasonPresentation(deferral.displayReason);
+        console.log(`    ${presentation.text}`);
+        console.log(`    ${presentation.repair}`);
+      }
+    }
+    return { daemonRunning: rendered.daemonRunning };
   }
 
   const wsLabel = cfg.name

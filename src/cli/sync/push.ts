@@ -34,7 +34,7 @@ import { beginFirstPublishTiming, finishFirstPublishStats, firstPublishMeasureme
 import { type SyncDeps, withReportScanStats, withCache, withDircache, refreshWriteContext } from "./deps.js";
 import { withPushLaneAccumulator } from "../telemetry/lane-accumulator.js";
 import { formatCommitTimings, formatScanStats, scanDetailsOf } from "./format.js";
-import { apiFor, MAX_ATTEMPTS, NO_GIT_FORCE, pushMassDeleteTrips, makeDeferErrnoReporter, defaultBackoff, filesFirstFlagEnabled, matcherForState, plaintextBytesOf, fileCountOf, scanTick } from "./policy.js";
+import { apiFor, MAX_ATTEMPTS, MassDeleteGuardError, NO_GIT_FORCE, pushMassDeleteTrips, makeDeferErrnoReporter, defaultBackoff, filesFirstFlagEnabled, matcherForState, plaintextBytesOf, fileCountOf, scanTick } from "./policy.js";
 import { pull, scanManifestForPush } from "./pull.js";
 
 export function stampManifestSchemaForCommit(manifest: Manifest): Manifest {
@@ -561,7 +561,7 @@ async function runPushAttempt(
   const pushDeletes = filesDiff.deleted.length;
   if (!deps.allowMassDeletePush && pushMassDeleteTrips(pushDeletes, appliedBase.files.length)) {
     deps.telemetry?.record({ kind: "safety_event", eventType: "mass_delete_breaker", count: 1 });
-    throw new Error(
+    throw new MassDeleteGuardError("push",
       `push would delete ${pushDeletes} of ${appliedBase.files.length} tracked files — refusing (mass-delete guard). ` +
         `If this deletion is intentional, run \`${deps.massDeleteHint ?? "rbox push --allow-mass-delete"}\` ` +
         `(or set RBOX_ALLOW_MASS_DELETE=1) to publish it once.`

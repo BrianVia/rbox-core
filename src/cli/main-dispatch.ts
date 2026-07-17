@@ -308,12 +308,22 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
     }
     case "status": {
       if (positional.length > 1) {
-        fail("usage: rbox status [path] [--json]");
+        fail("usage: rbox status [path] [--json | --verbose | --git]");
+        break;
+      }
+      const presentations = [flags.json, flags.verbose, flags.git].filter((value) => value === "true").length;
+      if (presentations > 1) {
+        fail("choose only one status presentation flag: --json, --verbose, or --git");
         break;
       }
       const root = await resolveRoot(positional[0]);
       const { statusCmd } = await import("./status-cmd.js");
-      await statusCmd(root, { json: jsonMode, now: deps.now?.() });
+      await statusCmd(root, {
+        json: jsonMode,
+        verbose: flags.verbose === "true",
+        git: flags.git === "true",
+        now: deps.now?.(),
+      });
       break;
     }
     case "doctor": {
