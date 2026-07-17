@@ -323,6 +323,9 @@ enum RboxActions {
         let env = ProcessInfo.processInfo.environment
         let candidates = [
             env["RBOX_BIN"],
+            // The canonical install.sh location — GUI launches (Raycast/Dock)
+            // don't inherit shell PATH, so this must be an explicit candidate.
+            "\(NSHomeDirectory())/.rbox/bin/rbox",
             "/opt/homebrew/bin/rbox",
             "/usr/local/bin/rbox",
             "\(NSHomeDirectory())/.bun/bin/rbox",
