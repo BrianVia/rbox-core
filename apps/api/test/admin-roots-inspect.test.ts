@@ -91,16 +91,19 @@ describe("GET /v1/admin/roots-inspect", () => {
     ]);
   });
 
-  test("fails explicitly when any required commit timestamp is absent", async () => {
+  test("returns null timestamps when the best-effort commits mirror has sequence gaps", async () => {
     const f = fakeEnv({
       droppedPage: [{ sha: "a".repeat(64), lastSeq: 2 }],
       seqRootsPage: [{ seq: 3, manifestSha: "b".repeat(64) }],
       gapPage: [],
     }, [{ sequence: 2, created_at: 2_000 }]);
     const res = await adminRoutes(ctx(`${BASE}?ws=ws&proj=root`, f.env, PLATFORM));
-    expect(res?.status).toBe(503);
+    expect(res?.status).toBe(200);
     expect(await res?.json()).toEqual({
-      error: "timestamp_unavailable", missingSequences: [3],
+      droppedPage: [{ sha: "a".repeat(64), lastSeq: 2 }],
+      seqRootsPage: [{ seq: 3, manifestSha: "b".repeat(64) }],
+      gapPage: [],
+      createdAtBySequence: { "2": 2_000, "3": null },
     });
   });
 });
