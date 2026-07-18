@@ -7,6 +7,11 @@ what happened, what it cost, fix hint if obvious.
 
 ## 2026-07-18
 
+- **`scripts/release.ts` crash leaves `src/cli/version.ts` mangled.** The
+  script rewrites version.ts during compile and restores it on success; the
+  signing-key throw (no RBOX_RELEASE_PRIVATE_KEY) exits before restoration,
+  leaving a truncated file silently dirty in the checkout. Found an hour later
+  via git status. Hint: restore in a `finally`.
 - **`scripts/release.ts` has no dev-build path.** Compiling unreleased binaries
   for fleet validation required passing the LAST released version (changelog
   gate rejects anything else) and accepting a signing-key error after compile.
