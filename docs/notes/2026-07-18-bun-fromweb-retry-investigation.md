@@ -176,6 +176,24 @@ manual pump. A `pipeTo(TransformStream)` compatibility bridge is only warranted
 if rbox must support arbitrary constructed Web streams; it should not be added
 solely to accommodate this test harness.
 
+## Filed & decision
+
+**Filed upstream: oven-sh/bun#34559** (https://github.com/oven-sh/bun/issues/34559).
+
+**Decision (2026-07-18, founder-deferred to orchestrator): HOLD the migration.**
+The bug is in `fromWeb`'s handling of ANY errored `ReadableStream`, and a
+reset native fetch body IS an errored `ReadableStream`, so the production
+interrupted-download path very plausibly hits the same hang — the controlled
+retry-harness test failed, and the downside (a blob download that silently
+hangs and never retries, on the sync path) far outweighs deleting ~15 lines.
+Keep the working `getReader()` pump. REAPPLY the
+`pipeline(Readable.fromWeb(res.body), <hashing/idle-watchdog Transform>,
+createWriteStream)` migration only after (a) Bun#34559 is fixed AND (b) a real
+local-HTTP integration test proves an actual interrupted download retries
+cleanly (partial-drop → retry → complete, hash-correct, zero leaked rejections).
+No separate branch is kept: the change is a trivial ~15-line redo guided by
+this doc and audit item 2. Watch #34559.
+
 ## Upstream filing summary
 
 Suggested title:
