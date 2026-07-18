@@ -96,6 +96,7 @@
 		label: string;
 		monthlyPrice: string;
 		annualPrice: string;
+		annualTotal: string;
 		features: string[];
 		featured?: boolean;
 	}[] = [
@@ -104,6 +105,7 @@
 			label: 'Solo',
 			monthlyPrice: '$8',
 			annualPrice: '$6.67',
+			annualTotal: '$80',
 			features: ['50 GB storage', '30-day version history', 'Unlimited workspaces']
 		},
 		{
@@ -111,6 +113,7 @@
 			label: 'Pro',
 			monthlyPrice: '$20',
 			annualPrice: '$16.67',
+			annualTotal: '$200',
 			features: ['250 GB storage', '365-day version history', 'Advanced hydration'],
 			featured: true
 		}
@@ -135,7 +138,7 @@
 	const activePrice = $derived.by(() => {
 		if (noPlan) return info.price;
 		const tier = UPGRADES.find((p) => p.id === plan);
-		if (usage?.interval === 'annual' && tier) return `${tier.annualPrice}/mo · billed annually`;
+		if (usage?.interval === 'annual' && tier) return `${tier.annualTotal}/year`;
 		return info.price;
 	});
 	const pct = $derived(
