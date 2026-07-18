@@ -20,6 +20,8 @@ rbox setup
 
 `rbox setup` is the guided wizard: it signs this machine in (or creates an account), sets up encryption on the first machine, creates or joins a workspace, and offers to start background sync. Bare `rbox` (no args) opens the same menu.
 
+A **workspace** can be a single repository or a folder of many repositories, or just a folder — it's whatever directory rbox keeps in sync across your machines.
+
 Prefer flags for CI/scripting? `rbox init` is the headless form of `setup` (see [`docs/usage.md`](docs/usage.md)).
 
 ## Add a second machine

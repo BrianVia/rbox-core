@@ -14,7 +14,6 @@ const LAUNCH_AGENT_REL = path.join("Library", "LaunchAgents", `${AUTOSTART_LABEL
 const SYSTEMD_UNIT_NAME = "rbox.service";
 const DESIRED_FILE = "desired.json";
 const RBOX_BIN_REL = `${RBOX_DIR}/bin/rbox`;
-const SYSTEMD_BINARY_PATH = `%h/${RBOX_BIN_REL}`;
 
 export type DesiredDaemonStateValue = "running" | "stopped";
 
@@ -104,7 +103,7 @@ ${bootResumeArgs(binaryPath)
 `;
 }
 
-function buildSystemdUnit(binaryPath = SYSTEMD_BINARY_PATH): string {
+function buildSystemdUnit(binaryPath: string): string {
   return `[Unit]
 Description=rbox background sync resume
 
@@ -295,10 +294,30 @@ function supportedPlatform(platform: NodeJS.Platform): "darwin" | "linux" {
 
 async function realBinaryPath(binaryPath: string): Promise<string> {
   try {
-    return await fs.realpath(binaryPath);
+    const resolved = await fs.realpath(binaryPath);
+    if (!(await fs.stat(resolved)).isFile()) throw new Error("not a file");
+    return resolved;
   } catch {
     throw new Error(`rbox binary not found at ${binaryPath}; install rbox before enabling autostart`);
   }
+}
+
+async function resolveAutostartBinary(home: string, override?: string): Promise<string> {
+  if (override !== undefined) return realBinaryPath(override);
+  // Follow the binary the user actually runs — a `~/.local/bin` (or any
+  // non-canonical) install then autostarts correctly, matching how `rbox
+  // upgrade` (upgrade-cmd.ts swaps realpath(execPath) in place) and the daemon
+  // respawn already behave. Under `bun run` (dev) execPath is the Bun runtime,
+  // not rbox (same signal runtime.ts keys on), so fall back to the canonical
+  // install path there.
+  if (path.basename(process.execPath) !== "bun") {
+    try {
+      return await realBinaryPath(process.execPath);
+    } catch {
+      // fall through to the canonical path
+    }
+  }
+  return realBinaryPath(defaultRboxBinaryPath(home));
 }
 
 async function tryExec(exec: ExecCommand, cmd: string, args: string[]): Promise<string | void> {
@@ -314,8 +333,7 @@ export async function enableAutostart(deps: AutostartDeps = {}): Promise<void> {
   const platform = supportedPlatform(deps.platform ?? process.platform);
   const home = deps.home ?? homeDir();
   const exec = deps.exec ?? execFilePromise;
-  const binaryPath = deps.binaryPath ?? defaultRboxBinaryPath(home);
-  const resolved = await realBinaryPath(binaryPath);
+  const resolved = await resolveAutostartBinary(home, deps.binaryPath);
 
   if (platform === "darwin") {
     const plist = launchAgentPath(home);
@@ -328,7 +346,7 @@ export async function enableAutostart(deps: AutostartDeps = {}): Promise<void> {
 
   const unit = systemdUnitPath(home);
   await fs.mkdir(path.dirname(unit), { recursive: true });
-  await fs.writeFile(unit, buildSystemdUnit());
+  await fs.writeFile(unit, buildSystemdUnit(resolved));
   await exec("systemctl", ["--user", "daemon-reload"]);
   await exec("systemctl", ["--user", "enable", SYSTEMD_UNIT_NAME]);
 }

@@ -64,9 +64,13 @@ function printHelp(cmd: string | undefined, positional: string[]): void {
 //   }
 // }
 
+function workspaceRequiredError(): Error {
+  return new Error("Not inside an rbox workspace. Run `rbox setup` to get started, or `rbox track <path>` to bind a directory.");
+}
+
 async function resolveRoot(arg: string | undefined): Promise<string> {
   const root = await findRoot(arg ? path.resolve(arg) : process.cwd());
-  if (!root) throw new Error("Not inside an rbox workspace. Run `rbox setup` to get started, or `rbox track <path>` to bind a directory.");
+  if (!root) throw workspaceRequiredError();
   return root;
 }
 
@@ -76,8 +80,28 @@ async function resolvePathFlagRoot(arg: string | undefined): Promise<string> {
   return root;
 }
 
+export type FrontDoorImport = () => Promise<Pick<typeof import("./front-door.js"), "resolveBareRboxTarget" | "runFrontDoor" | "runUntrackedMenu">>;
+
+async function runGuidedFrontDoor(importFrontDoor: FrontDoorImport = () => import("./front-door.js")): Promise<void> {
+  const { resolveBareRboxTarget, runFrontDoor, runUntrackedMenu } = await importFrontDoor();
+  const target = await resolveBareRboxTarget(process.cwd());
+  if (target.kind === "front-door") {
+    await runFrontDoor(target.root);
+  } else if (target.kind === "untracked-menu") {
+    const kind = await runUntrackedMenu(process.cwd(), target.accountId);
+    if (kind) {
+      const { runSetup } = await import("./setup-cmd.js");
+      await runSetup({ cwd: process.cwd(), defaultRemote: DEFAULT_REMOTE, flags: {}, preselectedWorkspaceKind: kind, viaUntrackedMenu: true });
+    }
+  } else {
+    const { runSetup } = await import("./setup-cmd.js");
+    await runSetup({ cwd: process.cwd(), defaultRemote: DEFAULT_REMOTE, flags: {} });
+  }
+}
+
 export interface MainDispatchDeps {
   now?: () => Date;
+  frontDoorImport?: FrontDoorImport;
 }
 
 export async function main(deps: MainDispatchDeps = {}): Promise<void> {
@@ -343,7 +367,18 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
       break;
     }
     case "start": {
-      await startDaemonAndRecordDesired(await resolveRoot(positional[0]), { pullOnly: flags["pull-only"] === "true" });
+      if (positional[0]) {
+        await startDaemonAndRecordDesired(await resolveRoot(positional[0]), { pullOnly: flags["pull-only"] === "true" });
+        break;
+      }
+      const root = await findRoot(process.cwd());
+      if (root) {
+        await startDaemonAndRecordDesired(root, { pullOnly: flags["pull-only"] === "true" });
+      } else if (process.stdin.isTTY) {
+        await runGuidedFrontDoor(deps.frontDoorImport);
+      } else {
+        throw workspaceRequiredError();
+      }
       break;
     }
     case "stop": {
@@ -531,20 +566,7 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
       // Non-interactive bare `rbox`, or an unknown command → the grouped help
       // screen (never hangs). An unknown command also exits non-zero.
       if (!cmd && process.stdin.isTTY) {
-        const { resolveBareRboxTarget, runFrontDoor, runUntrackedMenu } = await import("./front-door.js");
-        const target = await resolveBareRboxTarget(process.cwd());
-        if (target.kind === "front-door") {
-          await runFrontDoor(target.root);
-        } else if (target.kind === "untracked-menu") {
-          const kind = await runUntrackedMenu(process.cwd(), target.accountId);
-          if (kind) {
-            const { runSetup } = await import("./setup-cmd.js");
-            await runSetup({ cwd: process.cwd(), defaultRemote: DEFAULT_REMOTE, flags: {}, preselectedWorkspaceKind: kind, viaUntrackedMenu: true });
-          }
-        } else {
-          const { runSetup } = await import("./setup-cmd.js");
-          await runSetup({ cwd: process.cwd(), defaultRemote: DEFAULT_REMOTE, flags: {} });
-        }
+        await runGuidedFrontDoor(deps.frontDoorImport);
         break;
       }
       console.log(renderGroupedHelp());

@@ -54,6 +54,9 @@ export async function promptMissing(
   const input = ctx.promptInput ?? promptInput;
   const pickWorkspace = ctx.promptWorkspacePick ?? promptWorkspacePick;
   if (next.new !== "true" && !next.workspace) {
+    process.stderr.write(
+      `${stderrStyle.dim("a workspace can be a single repository or a folder of many repositories, or just a folder.")}\n`
+    );
     const choice = await select<"new" | "join">({
       message: "New workspace, or join an existing one?",
       choices: [
@@ -72,10 +75,6 @@ export async function promptMissing(
         if (picked.name) next.name = picked.name;
       }
     }
-  }
-  if (!next.project) {
-    const ans = (await input({ message: "Project id", default: "root" })).trim();
-    if (ans) next.project = ans;
   }
   if (!next.root) {
     next.root = await (ctx.promptPath ?? promptPath)({ message: "Sync which directory?", default: cwd, cwd });
