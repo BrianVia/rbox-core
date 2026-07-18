@@ -169,7 +169,7 @@ async function resolveDeliveries(env: Env, row: OutboxRow, now: number): Promise
 
 /** The account's owner identities (memberships role='owner' → clerk_users), deduped
  *  by the stable Clerk id. An owner with no clerk_users bridge is simply absent. */
-async function resolveOwners(env: Env, accountId: string): Promise<Array<{ userId: string; clerkUserId: string }>> {
+export async function resolveOwners(env: Env, accountId: string): Promise<Array<{ userId: string; clerkUserId: string }>> {
   // memberships + clerk_users are BOTH directory-plane, so this JOIN stays on dirDb
   // (the §6f "two-plane read" boundary is between this and the account-shard outbox).
   const rows = await dirDb(env)
@@ -244,7 +244,7 @@ async function settle(env: Env, row: OutboxRow, clerkId: string, status: "sent" 
 
 // ── recipient address resolution (cache → live Clerk, never persisted in ledger) ──
 
-type EmailLookup = { kind: "ok"; address: string } | { kind: "absent" } | { kind: "error" };
+export type EmailLookup = { kind: "ok"; address: string } | { kind: "absent" } | { kind: "error" };
 type ClerkLookup =
   | { kind: "ok"; address: string; signinMethod: string | null; clerkUpdatedAt: number }
   | { kind: "absent"; signinMethod: string | null; clerkUpdatedAt: number }
@@ -252,7 +252,7 @@ type ClerkLookup =
 
 /** Resolve the owner's primary verified email for a Clerk id: cached column first,
  *  else one live Clerk fetch (opportunistically caching the result). */
-async function ownerEmail(env: Env, clerkUserId: string, now: number): Promise<EmailLookup> {
+export async function ownerEmail(env: Env, clerkUserId: string, now: number): Promise<EmailLookup> {
   const cached = await dirDb(env).prepare("SELECT email FROM clerk_users WHERE clerk_user_id = ?").bind(clerkUserId).first<{ email: string | null }>();
   if (cached?.email) return { kind: "ok", address: cached.email };
   const fetched = await fetchClerkPrimaryEmail(env, clerkUserId);
