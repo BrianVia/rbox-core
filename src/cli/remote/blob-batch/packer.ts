@@ -35,14 +35,9 @@ async function writeAll(
   position: number,
   hash: ReturnType<typeof createHash>,
 ): Promise<number> {
-  let written = 0;
-  while (written < bytes.byteLength) {
-    const result = await file.write(bytes, written, bytes.byteLength - written, position + written);
-    if (result.bytesWritten < 1) throw new Error("blob-pack: temp file write made no progress");
-    written += result.bytesWritten;
-  }
+  await file.writeFile(bytes);
   hash.update(bytes);
-  return position + written;
+  return position + bytes.byteLength;
 }
 
 /** Build an rbox-pack-v1 body without retaining member payloads in heap. */

@@ -4,6 +4,7 @@ import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import { constants } from "node:fs";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import {
   applyWatchEvents,
   buildIgnoreMatcher,
@@ -386,8 +387,6 @@ export class RboxDaemon {
   private mutexHolderKey?: string;
   private mutexBackoffTier = 0;
   private mutexLoggedTier = -1;
-  private mutexBackoffResolve?: () => void;
-  private mutexBackoffTimer?: ReturnType<typeof setTimeout>;
   private mutexBackoffController?: AbortController;
   private lastMutexEarlyReprobeAt = Number.NEGATIVE_INFINITY;
   private readonly wsDisabled: boolean;
@@ -820,25 +819,15 @@ export class RboxDaemon {
   private pumpRun: Promise<void> = Promise.resolve();
 
   private signalMutexEarlyReprobe(): void {
-    if (!this.mutexBackoffResolve) return;
+    if (!this.mutexBackoffController) return;
     const now = this.now();
     if (now - this.lastMutexEarlyReprobeAt < MUTEX_EARLY_REPROBE_MS) return;
     this.lastMutexEarlyReprobeAt = now;
     this.mutexBackoffController?.abort();
   }
 
-  private finishMutexBackoff(): void {
-    if (this.mutexBackoffTimer) clearTimeout(this.mutexBackoffTimer);
-    this.mutexBackoffTimer = undefined;
-    this.mutexBackoffController = undefined;
-    const resolve = this.mutexBackoffResolve;
-    this.mutexBackoffResolve = undefined;
-    resolve?.();
-  }
-
   private abortMutexBackoff(): void {
     this.mutexBackoffController?.abort();
-    this.finishMutexBackoff();
   }
 
   private mutexDelay(holderKey: string): { delayMs: number; shouldLog: boolean } {
@@ -863,13 +852,15 @@ export class RboxDaemon {
 
   private async waitForMutexBackoff(delayMs: number): Promise<void> {
     if (this.stopped) return;
-    await new Promise<void>((resolve) => {
-      const controller = new AbortController();
-      this.mutexBackoffController = controller;
-      this.mutexBackoffResolve = resolve;
-      this.mutexBackoffTimer = setTimeout(() => this.finishMutexBackoff(), delayMs);
-      controller.signal.addEventListener("abort", () => this.finishMutexBackoff(), { once: true });
-    });
+    const controller = new AbortController();
+    this.mutexBackoffController = controller;
+    try {
+      await delay(delayMs, undefined, { signal: controller.signal });
+    } catch (error) {
+      if (!(error instanceof Error) || error.name !== "AbortError") throw error;
+    } finally {
+      if (this.mutexBackoffController === controller) this.mutexBackoffController = undefined;
+    }
   }
 
   private async clearLockStarvationEpisode(): Promise<void> {
