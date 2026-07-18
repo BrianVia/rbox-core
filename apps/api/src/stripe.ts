@@ -47,6 +47,17 @@ async function stripeApi(env: Env, method: "GET" | "POST" | "DELETE", path: stri
   return data;
 }
 
+/** Best-effort coupon/promo code off a Stripe subscription object — checks the
+ *  (still-populated, if deprecated) singular `discount`, then the first entry of the
+ *  newer `discounts` array. An unexpanded `discounts` entry is just an opaque id
+ *  string, not a human code, so that shape degrades to null (⇒ the ping shows "none"). */
+function extractCoupon(obj: { discount?: unknown; discounts?: unknown[] }): string | null {
+  const discount = obj.discount ?? (Array.isArray(obj.discounts) ? obj.discounts[0] : undefined);
+  if (!discount || typeof discount !== "object") return null;
+  const d = discount as { coupon?: { id?: string; name?: string }; promotion_code?: string };
+  return d.coupon?.name ?? d.coupon?.id ?? d.promotion_code ?? null;
+}
+
 /** Resolve a plan's active price id from its lookup_key (test/live agnostic). */
 async function priceIdForPlan(env: Env, plan: string, cadence: BillingCadence): Promise<string | null> {
   const lookupKey = PLAN_LOOKUP_KEYS[plan]?.[cadence];
@@ -248,7 +259,18 @@ async function applyStripeEvent(env: Env, event: { type: string; data: { object:
         // subscription, not every renewal `subscription.updated`, AND only when the
         // write actually transitioned a row. A late webhook for a reclaimed/CAS-guarded
         // shell no-ops the UPDATE (changes == 0) → no FALSE "new subscription" alert.
-        if (event.type === "customer.subscription.created" && (upd?.meta.changes ?? 0) > 0) pingNewSubscription(ctx, env, { accountId, plan });
+        if (event.type === "customer.subscription.created" && (upd?.meta.changes ?? 0) > 0) {
+          // Mirrors the onboard ping's "email over id" ask — resolve it from the same
+          // directory-plane clerk_users bridge the rest of the account-link/status
+          // reads use. A missing bridge (CLI-only account) or a failed read must never
+          // block the ping — it just degrades to "unknown" (formatNewSubscription).
+          const owner = await dirDb(env)
+            .prepare("SELECT email FROM clerk_users WHERE account_id = ? AND email IS NOT NULL LIMIT 1")
+            .bind(accountId)
+            .first<{ email: string }>()
+            .catch(() => null);
+          pingNewSubscription(ctx, env, { accountId, plan, email: owner?.email ?? null, coupon: extractCoupon(obj) });
+        }
       } else {
         // non-paying (past_due/unpaid/canceled-but-not-deleted) → locked + grace + clear extras.
         const db = dbFor(env, accountId);

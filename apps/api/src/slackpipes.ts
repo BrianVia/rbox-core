@@ -16,10 +16,11 @@ import { logErr } from "./util.js";
  * the terminal failure. A Slackpipes outage must not affect authoritative state.
  * No source configuration ⇒ no-op (self-gating).
  *
- * Keep `text` low-PII: account ids / plan names are fine (this is the founder's own
- * Slack). The one deliberate exception is the new-account ping for WEB signups, which
- * carries the signup email + sign-in method (founder request — ops needs to know who
- * actually signed up). Never tokens, paths, or blob/commit hashes.
+ * Keep `text` low-PII: plan names / coupon codes are fine (this is the founder's own
+ * Slack). The new-account and new-subscription pings deliberately carry the human's
+ * email (+ sign-in method, for signups) instead of the account id — founder request:
+ * ops needs to know WHO, not an opaque `acct_…` token. Never tokens, paths, or
+ * blob/commit hashes.
  */
 
 export type SlackChannel = "business" | "alerts";
@@ -158,12 +159,15 @@ export interface NewAccountPing {
 /**
  * PURE formatter for the new-account ping (unit-testable; the fetch/plumbing lives in
  * `pingNewAccount`). Shapes:
- *   bootstrap → `:seedling: New rbox account onboarded — \`acct_…\` (bootstrap, dev)`
+ *   bootstrap → `:seedling: New rbox account onboarded (bootstrap, dev)`
  *   web       → `… (web, prod) — jane@doe.com via github · plan none`
  * Every rich segment degrades independently — a missing field drops just that segment.
+ * `accountId` rides along on `NewAccountPing` for internal/logging use only — it never
+ * appears in the Slack string (founder ID-noise request; the email already identifies
+ * the human).
  */
 export function formatNewAccount(o: NewAccountPing): string {
-  const base = `:seedling: New rbox account onboarded — \`${o.accountId}\` (${o.origin}, ${o.env})`;
+  const base = `:seedling: New rbox account onboarded (${o.origin}, ${o.env})`;
   const bits: string[] = [];
   if (o.email && o.signInMethod) bits.push(`${o.email} via ${o.signInMethod}`);
   else if (o.email) bits.push(o.email);
@@ -186,9 +190,27 @@ export function pingNewAccount(
   schedulePing(ctx, pingSlackpipes(env, "signup", formatNewAccount({ ...o, env: envTag(env) })));
 }
 
+/** Fields for the subscription ping. `plan`/`env` always present; `email`/`coupon` are
+ *  best-effort — a missing email shows "unknown", a missing coupon shows "none" (never
+ *  a blank/dangling segment). `accountId` rides along for internal/logging use only —
+ *  it never appears in the Slack string (founder ID-noise request). */
+export interface NewSubscriptionPing {
+  accountId: string | null;
+  plan: string;
+  env: "dev" | "prod";
+  email?: string | null;
+  coupon?: string | null;
+}
+
+/** PURE formatter for the subscription ping (unit-testable; the fetch/plumbing lives
+ *  in `pingNewSubscription`). Shape: `*pro* · jane@doe.com · coupon: none (prod)`. */
+export function formatNewSubscription(o: NewSubscriptionPing): string {
+  return `:moneybag: New subscription — *${o.plan}* · ${o.email ?? "unknown"} · coupon: ${o.coupon ?? "none"} (${o.env})`;
+}
+
 /** An account started a paid subscription (Stripe `subscription.created`, paying). */
-export function pingNewSubscription(ctx: WaitUntilContext, env: Env, o: { accountId: string | null; plan: string }): void {
-  schedulePing(ctx, pingSlackpipes(env, "subscription", `:moneybag: New subscription — *${o.plan}* on account \`${o.accountId ?? "unknown"}\` (${envTag(env)})`));
+export function pingNewSubscription(ctx: WaitUntilContext, env: Env, o: { accountId: string | null; plan: string; email?: string | null; coupon?: string | null }): void {
+  schedulePing(ctx, pingSlackpipes(env, "subscription", formatNewSubscription({ ...o, env: envTag(env) })));
 }
 
 /** A subscription payment failed (Stripe `invoice.payment_failed`). */

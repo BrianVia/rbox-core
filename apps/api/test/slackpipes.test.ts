@@ -1,7 +1,7 @@
 import { env, applyD1Migrations } from "cloudflare:test";
 import { afterEach, beforeAll, describe, expect, test, vi } from "vitest";
 import { createHmac } from "node:crypto";
-import { PING_TIMEOUT_MS, pingSlackpipes, pingNewAccount, formatNewAccount } from "../src/slackpipes.js";
+import { PING_TIMEOUT_MS, pingSlackpipes, pingNewAccount, formatNewAccount, formatNewSubscription } from "../src/slackpipes.js";
 import { stripeWebhook } from "../src/stripe.js";
 import type { Env } from "../src/env.js";
 
@@ -282,34 +282,54 @@ describe("pingSlackpipes — never throws, self-gates on config", () => {
 });
 
 describe("formatNewAccount — env tag + rich web-signup line, graceful per-segment degradation", () => {
-  test("bootstrap carries only the (origin, env) tag — no rich suffix", () => {
+  test("bootstrap carries only the (origin, env) tag — no rich suffix, no account id", () => {
     expect(formatNewAccount({ accountId: "acct_abc", origin: "bootstrap", env: "dev" })).toBe(
-      ":seedling: New rbox account onboarded — `acct_abc` (bootstrap, dev)",
+      ":seedling: New rbox account onboarded (bootstrap, dev)",
     );
   });
 
-  test("web signup renders email + sign-in method + plan", () => {
+  test("web signup renders email + sign-in method + plan — no account id", () => {
     expect(
       formatNewAccount({ accountId: "acct_xyz", origin: "web", env: "prod", email: "jane@doe.com", signInMethod: "github", plan: "none" }),
-    ).toBe(":seedling: New rbox account onboarded — `acct_xyz` (web, prod) — jane@doe.com via github · plan none");
+    ).toBe(":seedling: New rbox account onboarded (web, prod) — jane@doe.com via github · plan none");
   });
 
   test("missing email drops only the email — method + plan survive", () => {
     expect(formatNewAccount({ accountId: "acct_1", origin: "web", env: "prod", signInMethod: "google", plan: "none" })).toBe(
-      ":seedling: New rbox account onboarded — `acct_1` (web, prod) — via google · plan none",
+      ":seedling: New rbox account onboarded (web, prod) — via google · plan none",
     );
   });
 
   test("missing sign-in method drops only 'via …'", () => {
     expect(formatNewAccount({ accountId: "acct_2", origin: "web", env: "dev", email: "a@b.com", plan: "solo" })).toBe(
-      ":seedling: New rbox account onboarded — `acct_2` (web, dev) — a@b.com · plan solo",
+      ":seedling: New rbox account onboarded (web, dev) — a@b.com · plan solo",
     );
   });
 
   test("all rich fields absent ⇒ bare tag line (never a dangling separator)", () => {
     expect(formatNewAccount({ accountId: "acct_3", origin: "web", env: "prod" })).toBe(
-      ":seedling: New rbox account onboarded — `acct_3` (web, prod)",
+      ":seedling: New rbox account onboarded (web, prod)",
     );
+  });
+});
+
+describe("formatNewSubscription — email + coupon over account id, graceful degradation", () => {
+  test("renders plan, email, and coupon", () => {
+    expect(
+      formatNewSubscription({ accountId: "acct_xyz", plan: "pro", env: "prod", email: "jane@doe.com", coupon: "SUMMER20" }),
+    ).toBe(":moneybag: New subscription — *pro* · jane@doe.com · coupon: SUMMER20 (prod)");
+  });
+
+  test("missing email degrades to 'unknown'; missing coupon degrades to 'none'", () => {
+    expect(formatNewSubscription({ accountId: "acct_1", plan: "solo", env: "dev" })).toBe(
+      ":moneybag: New subscription — *solo* · unknown · coupon: none (dev)",
+    );
+  });
+
+  test("never renders the raw account id", () => {
+    expect(
+      formatNewSubscription({ accountId: "acct_should_not_appear", plan: "team", env: "prod", email: "a@b.com", coupon: null }),
+    ).not.toContain("acct_should_not_appear");
   });
 });
 
@@ -327,7 +347,7 @@ describe("pingNewAccount — reads the deploy-env tag off env.RBOX_ENV", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0]!.url).toBe(BUSINESS);
     expect((calls[0]!.body as { text: string }).text).toBe(
-      ":seedling: New rbox account onboarded — `acct_prod` (web, prod) — jane@doe.com via github · plan none",
+      ":seedling: New rbox account onboarded (web, prod) — jane@doe.com via github · plan none",
     );
   });
 
@@ -367,16 +387,29 @@ describe("pingNewAccount — reads the deploy-env tag off env.RBOX_ENV", () => {
 });
 
 describe("Stripe webhook business pings — fire on the right events, never bubble a failure", () => {
-  test("subscription.created (paying) on an existing account → business channel, with the plan", async () => {
+  test("subscription.created (paying) on an existing account → business channel, with the plan/email/coupon, never the account id", async () => {
     const acct = `acct_sub_${crypto.randomUUID().replace(/-/g, "")}`;
     await env.rbox_dev_db.prepare("INSERT INTO accounts (id, name, plan, created_at) VALUES (?, 'x', 'none', ?)").bind(acct, Date.now()).run();
+    await env.rbox_dev_db
+      .prepare("INSERT INTO clerk_users (clerk_user_id, account_id, user_id, created_at, email) VALUES (?, ?, 'user_1', ?, 'jane@doe.com')")
+      .bind(`user_${crypto.randomUUID()}`, acct, Date.now())
+      .run();
     const calls: Call[] = [];
     recordFetch(calls);
     const res = await stripeWebhook(
       signedWebhook({
         id: `evt_sub_created_${crypto.randomUUID()}`,
         type: "customer.subscription.created",
-        data: { object: { id: "sub_1", customer: "cus_1", status: "active", metadata: { account_id: acct }, items: { data: [{ price: { lookup_key: "rbox_solo_monthly" } }] } } },
+        data: {
+          object: {
+            id: "sub_1",
+            customer: "cus_1",
+            status: "active",
+            metadata: { account_id: acct },
+            items: { data: [{ price: { lookup_key: "rbox_solo_monthly" } }] },
+            discount: { coupon: { id: "SUMMER20" } },
+          },
+        },
       }),
       pingEnv(),
       Date.now(),
@@ -385,7 +418,29 @@ describe("Stripe webhook business pings — fire on the right events, never bubb
     expect(res.status).toBe(200);
     const businessPings = calls.filter((c) => c.url === BUSINESS);
     expect(businessPings).toHaveLength(1);
-    expect((businessPings[0]!.body as { text: string }).text).toContain("solo");
+    const text = (businessPings[0]!.body as { text: string }).text;
+    expect(text).toBe(":moneybag: New subscription — *solo* · jane@doe.com · coupon: SUMMER20 (dev)");
+    expect(text).not.toContain(acct);
+  });
+
+  test("subscription.created with no clerk_users row or discount → email/coupon degrade gracefully", async () => {
+    const acct = `acct_sub_bare_${crypto.randomUUID().replace(/-/g, "")}`;
+    await env.rbox_dev_db.prepare("INSERT INTO accounts (id, name, plan, created_at) VALUES (?, 'x', 'none', ?)").bind(acct, Date.now()).run();
+    const calls: Call[] = [];
+    recordFetch(calls);
+    const res = await stripeWebhook(
+      signedWebhook({
+        id: `evt_sub_bare_${crypto.randomUUID()}`,
+        type: "customer.subscription.created",
+        data: { object: { id: "sub_bare", customer: "cus_bare", status: "active", metadata: { account_id: acct }, items: { data: [{ price: { lookup_key: "rbox_solo_monthly" } }] } } },
+      }),
+      pingEnv(),
+      Date.now(),
+      testCtx,
+    );
+    expect(res.status).toBe(200);
+    const text = (calls.find((c) => c.url === BUSINESS)!.body as { text: string }).text;
+    expect(text).toBe(":moneybag: New subscription — *solo* · unknown · coupon: none (dev)");
   });
 
   test("subscription.created whose UPDATE changes NO row → no business ping (no false alert)", async () => {

@@ -1123,6 +1123,8 @@ describe("worker integration (real DO + D1 + R2)", () => {
     const wt = await webToken("user_gate_allow");
     expect((await SELF.fetch(`${BASE}/v1/account/usage`, { headers: authed(wt) })).status).toBe(200);
     expect((await SELF.fetch(`${BASE}/v1/auth/devices`, { headers: authed(wt) })).status).toBe(200);
+    // A fresh account's key list is empty, not a 403 (the dashboard's first call).
+    expect((await SELF.fetch(`${BASE}/v1/keys/api`, { headers: authed(wt) })).status).toBe(200);
     // Reaches the billing handler (501 — STRIPE_SECRET absent in tests), proving it's NOT gate-blocked.
     expect((await SELF.fetch(`${BASE}/v1/billing/checkout?plan=pro`, { method: "POST", headers: authed(wt) })).status).toBe(501);
   });

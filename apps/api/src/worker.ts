@@ -412,6 +412,10 @@ function webTokenAllowed(method: string, seg: string[]): boolean {
   if (method === "GET" && eq(seg, ["v1", "auth", "devices"])) return true;
   // design 22 §2.4: the new web-facing reads — exact pairs, NOT a GET /v1/account/* wildcard.
   if (method === "GET" && (eq(seg, ["v1", "account", "devices"]) || eq(seg, ["v1", "account", "workspaces"]))) return true;
+  // The dashboard's API-key panel lists the account's OWN api-key metadata (device id,
+  // label, display prefix, timestamps, revoked) — never a token/hash — so it's the same
+  // read-only, account-scoped shape as the two lines above, not a crypto/mint surface.
+  if (method === "GET" && eq(seg, ["v1", "keys", "api"])) return true;
   if (isDeviceRevoke(method, seg)) return true;
   if (method === "POST" && eq(seg, ["v1", "account", "link", "redeem"])) return true; // self-rejects on its own kind=='device' check
   if (method === "POST" && eq(seg, ["v1", "account", "unlink"])) return true; // a web owner may unlink (§5.4)
