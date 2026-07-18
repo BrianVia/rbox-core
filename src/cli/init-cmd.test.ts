@@ -15,6 +15,7 @@ import {
 } from "./init-cmd.js";
 import { saveConfig } from "./config.js";
 import type { InitPlan } from "./init-plan.js";
+import { resolveInitPlan } from "./init-plan.js";
 import { mintSetupCreateConsent, mintSetupExistingConsent } from "./reset-consent.js";
 import { promptPath } from "./prompt.js";
 
@@ -31,6 +32,64 @@ test("interactive init gitignore prompt defaults to skipping and matches setup's
       description: "rbox can never read them; great for notes/local state (and .env via !.env), but large builds/datasets sync too",
     },
   ]);
+});
+
+test("interactive new-workspace prompts define workspace, omit Project id, and retain root project", async () => {
+  const events: string[] = [];
+  const oldWrite = process.stderr.write;
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    events.push(`stderr:${typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8")}`);
+    return true;
+  }) as typeof process.stderr.write;
+  try {
+    const gathered = await promptMissing(
+      { "respect-gitignore": "true" },
+      "/work",
+      {
+        creds: { deviceId: "dev_test", remoteUrl: "https://api.test" },
+        defaultRemote: "https://api.test",
+        promptSelect: (async (opts: { message: string }) => {
+          events.push(`select:${opts.message}`);
+          return "new";
+        }) as never,
+        promptPath: (async (opts: { message: string }) => {
+          events.push(`path:${opts.message}`);
+          return "/work";
+        }) as never,
+        promptInput: (async (opts: { message: string }) => {
+          events.push(`input:${opts.message}`);
+          return "-";
+        }) as never,
+      }
+    );
+
+    expect(events[0]).toContain("a workspace can be a single repository or a folder of many repositories, or just a folder.\n");
+    expect(events[1]).toBe("select:New workspace, or join an existing one?");
+    expect(events).not.toContain("input:Project id");
+    const plan = resolveInitPlan({ flags: gathered, cwd: "/work", creds: { deviceId: "dev_test", remoteUrl: "https://api.test" }, interactive: true, defaultRemote: "https://api.test" });
+    expect("workspace" in plan && plan.workspace.project).toBe("root");
+  } finally {
+    process.stderr.write = oldWrite;
+  }
+});
+
+test("scripted init flags bypass the workspace definition", async () => {
+  const writes: string[] = [];
+  const oldWrite = process.stderr.write;
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+    return true;
+  }) as typeof process.stderr.write;
+  try {
+    await promptMissing(
+      { new: "true", root: "/work", name: "-", "respect-gitignore": "true" },
+      "/work",
+      { creds: undefined, defaultRemote: "https://api.test" }
+    );
+    expect(writes.join("")).not.toContain("a workspace can be a single repository");
+  } finally {
+    process.stderr.write = oldWrite;
+  }
 });
 
 async function rebindFixture(): Promise<{ root: string; oldStream: string; nonce: string }> {
