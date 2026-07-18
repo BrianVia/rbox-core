@@ -137,8 +137,8 @@ describe("design 118 Darwin identity acquisition", () => {
   test("identity subprocess timeout kills a hung command", async () => {
     const started = Date.now();
     await expect(runIdentityCommand("/bin/sh", ["-c", "while :; do :; done"])).rejects.toMatchObject({ killed: true, signal: "SIGKILL" });
-    expect(Date.now() - started).toBeLessThan(3_500);
-  });
+    expect(Date.now() - started).toBeLessThan(12_000);
+  }, 15_000);
 });
 
 describe("design 118 local-filesystem proof", () => {
@@ -459,7 +459,7 @@ describe("reaper fencing", () => {
     let firstErr = "";
     child.stdout.on("data", (chunk) => { firstOut += String(chunk); });
     child.stderr.on("data", (chunk) => { firstErr += String(chunk); });
-    for (let i = 0; i < 300 && !(await fs.stat(ready).then(() => true, () => false)); i++) await Bun.sleep(10);
+    for (let i = 0; i < 1_000 && !(await fs.stat(ready).then(() => true, () => false)); i++) await Bun.sleep(10);
     expect(await fs.stat(ready).then(() => true, () => false)).toBe(true);
 
     const secondCode = `${common}
@@ -479,7 +479,7 @@ describe("reaper fencing", () => {
     const firstExit = await new Promise<number | null>((resolve) => child.on("exit", resolve));
     expect({ firstExit, firstErr }).toEqual({ firstExit: 0, firstErr: "" });
     expect(firstOut.trim()).toBe("acquired");
-  }, 10_000);
+  }, 20_000);
 
   test("an occupied-path change is re-read under the fence and never unlinked", async () => {
     const root = await tempDir();

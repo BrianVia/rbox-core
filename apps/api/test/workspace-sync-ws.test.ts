@@ -110,8 +110,6 @@ function fakeDb(
   } as unknown as D1Database;
 }
 
-const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
-
 function commitBody(seq: number, hashSeed = "b") {
   return {
     type: "rbox/commit/v1",
@@ -263,10 +261,15 @@ describe("workspace sync websocket fanout", () => {
   test("commit fanout runs before the awaited D1 mirror settles", async () => {
     const order: string[] = [];
     const mirror: { release?: () => void } = {};
+    let broadcastReached!: () => void;
+    const broadcast = new Promise<void>((resolve) => { broadcastReached = resolve; });
     const sockets = [
       {
         readyState: WebSocket.OPEN,
-        send: () => order.push("broadcast"),
+        send: () => {
+          order.push("broadcast");
+          broadcastReached();
+        },
       },
     ] as unknown as WebSocket[];
     const sync = new WorkspaceSync(fakeCtx(sockets), { rbox_dev_db: fakeDb(order, mirror, { blockMirror: true }) } as never);
@@ -281,7 +284,7 @@ describe("workspace sync websocket fanout", () => {
       })
     );
 
-    for (let i = 0; i < 10 && !order.includes("broadcast"); i++) await tick();
+    await broadcast;
     expect(order).toEqual(["broadcast"]);
 
     mirror.release?.();

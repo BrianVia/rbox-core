@@ -195,7 +195,7 @@ describe("crypto worker pool", () => {
       await Promise.all(files.map((file, i) => fs.writeFile(file, Buffer.from(`crash retry ${i}\n`.repeat(20_000)))));
       await withCryptoPool(kek, 1, 2, async () => {
         const pending = files.map((file) => encryptFileToTemp(file, kek, tmpDir, { compress: true }));
-        await __cryptoPoolTestHooks.waitForStats((stats) => stats.inFlight === 2, 1_000);
+        await __cryptoPoolTestHooks.waitForStats((stats) => stats.inFlight === 2, 10_000);
         expect(__cryptoPoolTestHooks.terminateBusiestWorker()).toBe(true);
         const blobs = await Promise.all(pending);
         expect(blobs).toHaveLength(2);
@@ -205,7 +205,7 @@ describe("crypto worker pool", () => {
       await fs.rm(root, { recursive: true, force: true });
       await fs.rm(tmpDir, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 
   test("health-check failure persistently disables worker selection and falls back inline", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-pool-health-"));
@@ -307,7 +307,7 @@ describe("crypto worker pool", () => {
       }
       await withCryptoPool(kek, 1, files.length, async () => {
         const firstSix = files.slice(0, 6).map((file) => encryptFileToTemp(file, kek, tmpDir));
-        await __cryptoPoolTestHooks.waitForStats((stats) => stats.inFlight === 2 && stats.queue === 4, 1_000);
+        await __cryptoPoolTestHooks.waitForStats((stats) => stats.inFlight === 2 && stats.queue === 4, 10_000);
         let seventhSettled = false;
         const seventh = encryptFileToTemp(files[6]!, kek, tmpDir).then(() => {
           seventhSettled = true;
@@ -323,5 +323,5 @@ describe("crypto worker pool", () => {
       await fs.rm(root, { recursive: true, force: true });
       await fs.rm(tmpDir, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 });

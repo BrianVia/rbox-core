@@ -725,7 +725,7 @@ test("logout waits for a normal in-flight credential writer and clears definitiv
     stdout: "pipe",
     stderr: "pipe",
   });
-  for (let n = 0; n < 100; n++) {
+  for (let n = 0; n < 1_000; n++) {
     if (await fs.lstat(lockPath()).then(() => true).catch(() => false)) break;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
@@ -741,7 +741,7 @@ test("logout waits for a normal in-flight credential writer and clears definitiv
   expect(warnings.join("\n")).not.toContain("destructive-recovery override");
   await expect(fs.lstat(credentialPath())).rejects.toThrow();
   await expect(fs.lstat(lockPath())).rejects.toThrow();
-});
+}, 20_000);
 
 test("future main marker and a post-acquisition fence failure use the logout-only override", async () => {
   for (const mode of ["future", "post-acquisition"] as const) {

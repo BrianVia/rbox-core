@@ -15,6 +15,7 @@ import { accountProfilePath, flushAccountProfileWrites, readAccountProfile } fro
 const plain = (s: string) => s.replace(/\[[0-9;]*m/g, "");
 
 const origFetch = globalThis.fetch;
+const origAbortSignalTimeout = AbortSignal.timeout;
 const origLog = console.log;
 const origStdout = process.stdout.write.bind(process.stdout);
 let calls: { url: string; init?: RequestInit }[] = [];
@@ -61,6 +62,7 @@ beforeEach(async () => {
 afterEach(async () => {
   await flushAccountProfileWrites();
   globalThis.fetch = origFetch;
+  (AbortSignal as unknown as { timeout: typeof AbortSignal.timeout }).timeout = origAbortSignalTimeout;
   console.log = origLog;
   process.stdout.write = origStdout;
   delete process.env.RBOX_TOKEN;
@@ -224,10 +226,16 @@ describe("rbox status — account section", () => {
       new Promise((_resolve, reject) => {
         init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
       })) as unknown as typeof fetch;
-    const started = Date.now();
+    let timeoutBudget: number | undefined;
+    (AbortSignal as unknown as { timeout: typeof AbortSignal.timeout }).timeout = ((ms: number) => {
+      timeoutBudget = ms;
+      const controller = new AbortController();
+      queueMicrotask(() => controller.abort());
+      return controller.signal;
+    }) as typeof AbortSignal.timeout;
     const summary = await fetchAccountSummary(20);
     expect(summary).toEqual({ state: "unavailable" });
-    expect(Date.now() - started).toBeLessThan(1000);
+    expect(timeoutBudget).toBe(20);
   });
 
   test("signed-out renders a `not signed in` hint (no account id / plan lines)", () => {

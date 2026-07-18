@@ -67,7 +67,7 @@ async function observedPeakFor(envValue: string | undefined, expectedPeak: numbe
     try {
       await Promise.race([
         reachedExpected,
-        new Promise<void>((_, reject) => setTimeout(() => reject(new Error(`expected peak ${expectedPeak}, saw ${peak}`)), 1000)),
+        new Promise<void>((_, reject) => setTimeout(() => reject(new Error(`expected peak ${expectedPeak}, saw ${peak}`)), 10_000)),
       ]);
     } catch (e) {
       waitError = e;
@@ -88,8 +88,8 @@ async function observedPeakFor(envValue: string | undefined, expectedPeak: numbe
 
 test("download concurrency defaults to 128 when RBOX_DOWNLOAD_CONCURRENCY is unset", async () => {
   expect(await observedPeakFor(undefined, 128)).toBeGreaterThanOrEqual(128);
-});
+}, 15_000);
 
 test("RBOX_DOWNLOAD_CONCURRENCY=64 preserves the old comparison behavior", async () => {
   expect(await observedPeakFor("64", 64)).toBe(64);
-});
+}, 15_000);

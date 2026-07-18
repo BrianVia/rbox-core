@@ -261,12 +261,15 @@ describe("POST /v1/blob-batch/get", () => {
     const shas = [sha("p1"), sha("p2"), sha("p3")];
     const waits = new Map(shas.map((s) => [s, deferred<R2ObjectBody | null>()]));
     const started: string[] = [];
+    let allStarted!: () => void;
+    const startedAll = new Promise<void>((resolve) => { allStarted = resolve; });
     const fakeEnv = {
       rbox_dev_db: emptyPlacementDb(),
       rbox_dev_blobs: {
         get: (key: string) => {
           const s = key.slice(-64);
           started.push(s);
+          if (started.length === shas.length) allStarted();
           return waits.get(s)!.promise;
         },
       },
@@ -276,22 +279,27 @@ describe("POST /v1/blob-batch/get", () => {
       fakeEnv,
       "acct_parallel",
     );
-    const body = decodeFrames(res);
-    // Yield between resolutions: once several results are settled at race time
-    // the drain legitimately proceeds in array order, so completion order is
-    // only observable when completions are actually spaced out.
-    const settle = () => new Promise((r) => setTimeout(r, 0));
-    // A macrotask (not one microtask): the §114 placement lookup awaits D1
-    // before the fan-out starts; all R2 gets must still begin before ANY body
-    // resolves — the parallelism property under test is unchanged.
-    await settle();
+    const reader = res.body!.getReader();
+    const readFrame = async (): Promise<DecodedFrame> => {
+      const header = (await reader.read()).value!;
+      expect(header.byteLength).toBe(BATCH_FRAME_HEADER_BYTES);
+      const payload = (await reader.read()).value!;
+      const s = [...header.subarray(0, 32)].map((b) => b.toString(16).padStart(2, "0")).join("");
+      const word = new DataView(header.buffer, header.byteOffset + 32, 4).getUint32(0, false);
+      expect(payload.byteLength).toBe(word & 0x7fffffff);
+      return { sha: s, status: (word & BATCH_STATUS_BIT) !== 0, payload };
+    };
+    // The get callbacks explicitly signal that the placement lookup has
+    // completed and every R2 read is in flight before any body resolves.
+    await startedAll;
     expect(started).toEqual(shas);
     waits.get(shas[1]!)!.resolve(r2Object(new TextEncoder().encode("two")));
-    await settle();
+    const second = await readFrame();
     waits.get(shas[2]!)!.resolve(null);
-    await settle();
+    const third = await readFrame();
     waits.get(shas[0]!)!.resolve(r2Object(new TextEncoder().encode("one")));
-    const frames = await body;
+    const first = await readFrame();
+    const frames = [second, third, first];
     expect(frames.map((f) => f.sha)).toEqual([shas[1], shas[2], shas[0]]);
     expect(statusText(frames[1]!)).toBe('{"status":"missing"}');
   });
