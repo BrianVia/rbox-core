@@ -1,4 +1,5 @@
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import { buildIgnoreMatcher, checkoutTransactionCapability, cryptoPoolStatus, diffManifests, HashCache, scanManifest, type CheckoutTransactionCapability, type DiscoveredGitRepo, type IgnoreMatcher } from "../engine/index.js";
 import { trashStats } from "../engine/trash.js";
 import { loadActivity, shellStateOf, type DaemonActivity } from "./activity.js";
@@ -186,19 +187,13 @@ async function fetchRemoteSequence(
     const token = creds?.token || cfg.token;
     if (!token) return undefined;
     const base = creds?.remoteUrl ?? cfg.remoteUrl;
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-    try {
-      const res = await fetch(`${base}/v1/ws/${cfg.remoteWorkspaceId}/proj/${cfg.projectId}/latest`, {
-        headers: { authorization: `Bearer ${token}` },
-        signal: ctrl.signal,
-      });
-      if (!res.ok) return undefined;
-      const seq = ((await res.json()) as { sequence?: number }).sequence;
-      return typeof seq === "number" ? seq : undefined;
-    } finally {
-      clearTimeout(timer);
-    }
+    const res = await fetch(`${base}/v1/ws/${cfg.remoteWorkspaceId}/proj/${cfg.projectId}/latest`, {
+      headers: { authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) return undefined;
+    const seq = ((await res.json()) as { sequence?: number }).sequence;
+    return typeof seq === "number" ? seq : undefined;
   } catch {
     return undefined;
   }
@@ -208,12 +203,10 @@ async function fetchStatusAccountJson(loaded: CredentialLoadResult, timeoutMs = 
   const unavailable = { plan: null, usedBytes: null, capBytes: null };
   if (loaded.state !== "valid") return unavailable;
   const creds = loaded.credentials;
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const res = await fetch(`${creds.remoteUrl}/v1/account/usage`, {
       headers: { authorization: `Bearer ${creds.token}` },
-      signal: ctrl.signal,
+      signal: AbortSignal.timeout(timeoutMs),
     });
     if (!res.ok) return unavailable;
     const body = (await res.json()) as { plan?: unknown; usedBytes?: unknown; storageCap?: unknown };
@@ -222,8 +215,6 @@ async function fetchStatusAccountJson(loaded: CredentialLoadResult, timeoutMs = 
     return { plan: body.plan, usedBytes: body.usedBytes, capBytes };
   } catch {
     return unavailable;
-  } finally {
-    clearTimeout(timer);
   }
 }
 
@@ -259,34 +250,20 @@ function createGitRepoFeed(): {
   close: () => void;
   iterable: AsyncIterable<DiscoveredGitRepo>;
 } {
-  const queue: DiscoveredGitRepo[] = [];
-  const waiters: Array<(result: IteratorResult<DiscoveredGitRepo>) => void> = [];
+  const feed = new PassThrough({ objectMode: true });
   let closed = false;
 
   return {
     push(repo) {
       if (closed) return;
-      const waiter = waiters.shift();
-      if (waiter) waiter({ value: repo, done: false });
-      else queue.push(repo);
+      feed.write(repo);
     },
     close() {
       if (closed) return;
       closed = true;
-      for (const waiter of waiters.splice(0)) waiter({ value: undefined, done: true });
+      feed.end();
     },
-    iterable: {
-      [Symbol.asyncIterator]() {
-        return {
-          next(): Promise<IteratorResult<DiscoveredGitRepo>> {
-            const repo = queue.shift();
-            if (repo) return Promise.resolve({ value: repo, done: false });
-            if (closed) return Promise.resolve({ value: undefined, done: true });
-            return new Promise((resolve) => waiters.push(resolve));
-          },
-        };
-      },
-    },
+    iterable: feed.iterator({ destroyOnReturn: false }) as AsyncIterable<DiscoveredGitRepo>,
   };
 }
 

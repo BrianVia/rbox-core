@@ -72,12 +72,10 @@ export async function fetchAccountSummary(timeoutMs = 3500, loaded?: CredentialL
   if (result.state === "absent") return { state: "signed-out" };
   if (result.state !== "valid") return { state: "credential-degraded", credential: result };
   const c = result.credentials;
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const res = await fetch(`${c.remoteUrl}/v1/account/status`, {
       headers: { authorization: `Bearer ${c.token}` },
-      signal: ctrl.signal,
+      signal: AbortSignal.timeout(timeoutMs),
     });
     if (!res.ok) return { state: "unavailable" };
     const status = accountStatusFromResponse(await res.json());
@@ -92,8 +90,6 @@ export async function fetchAccountSummary(timeoutMs = 3500, loaded?: CredentialL
     // Offline, DNS failure, timeout/abort, malformed body — all degrade to the same
     // "we couldn't reach the account plane" outcome. Local status still renders.
     return { state: "unavailable" };
-  } finally {
-    clearTimeout(timer);
   }
 }
 

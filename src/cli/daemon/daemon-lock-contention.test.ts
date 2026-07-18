@@ -148,3 +148,19 @@ test("capped wait is abortable and queued wakeups are rate limited", async () =>
   d.abortMutexBackoff();
   await shutdown;
 });
+
+test("an older waiter cannot clear a newer backoff controller", async () => {
+  const d = daemon();
+  const older = d.waitForMutexBackoff(30_000);
+  const olderController = d.mutexBackoffController as AbortController;
+  const newer = d.waitForMutexBackoff(30_000);
+  const newerController = d.mutexBackoffController as AbortController;
+
+  olderController.abort();
+  await older;
+  expect(d.mutexBackoffController).toBe(newerController);
+
+  d.abortMutexBackoff();
+  await newer;
+  expect(d.mutexBackoffController).toBeUndefined();
+});

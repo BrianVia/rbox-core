@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { buildIgnoreMatcher, checkoutTransactionCapability, cryptoPoolStatus, ManifestChainError, MAX_MANIFEST_DELTA_CHAIN, type IgnoreMatcher } from "../engine/index.js";
 import { loadActivity, type DaemonActivity } from "./activity.js";
-import { loadConfig, loadState, syncStreamId, type WorkspaceConfig } from "./config.js";
+import { loadConfig, loadRawState, loadState, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { credentialFailureMessage, loadCredentials, type CredentialLoadResult, type Credentials } from "./credentials.js";
 import { currentWorkspaceId, daemonBindingStatus, readDaemonBindingRecord, readMergedDaemonLogTail } from "./daemon-control.js";
 import { enrolledDeviceId, loadDevice } from "./e2ee-keystore.js";
@@ -17,6 +17,7 @@ import { friendlyHttpError } from "./http-error.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
 import type { E2eeRemote } from "./e2ee-remote.js";
 import { readLockingHealth } from "./sync-mutex.js";
+import { ResetCorruptionError } from "./reset-io.js";
 
 const REPORT_CAP_BYTES = 512 * 1024;
 const DAEMON_LOG_TAIL_BYTES = 64 * 1024;
@@ -214,15 +215,9 @@ export function redactGitLogLines(tail: string): string {
 }
 
 async function fetchWithTimeout(url: string, init: RequestInit = {}, timeoutMs = FETCH_TIMEOUT_MS): Promise<{ res: Response; latencyMs: number }> {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   const t0 = performance.now();
-  try {
-    const res = await fetch(url, { ...init, signal: ctrl.signal });
-    return { res, latencyMs: Math.round(performance.now() - t0) };
-  } finally {
-    clearTimeout(timer);
-  }
+  const res = await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+  return { res, latencyMs: Math.round(performance.now() - t0) };
 }
 
 async function checkCredentials(creds: Credentials | undefined): Promise<DoctorCheck> {
@@ -317,20 +312,20 @@ async function checkVersion(creds: Credentials | undefined, cfg: WorkspaceConfig
 async function checkState(root: string, cfg: WorkspaceConfig): Promise<DoctorCheck> {
   const file = path.join(root, ".rbox", "state.json");
   try {
-    const raw = await fsp.readFile(file, "utf8");
-    let parsed: { stream?: unknown };
-    try {
-      parsed = JSON.parse(raw) as { stream?: unknown };
-    } catch {
-      return { ok: false, label: "state", message: ".rbox/state.json is not valid JSON", hint: "inspect the file or delete it to intentionally re-baseline" };
-    }
+    const parsed = await loadRawState(root);
+    if (!parsed) return { ok: true, label: "state", message: "no sync state yet" };
     const expected = syncStreamId(cfg);
     if (parsed.stream !== undefined && parsed.stream !== expected) {
       return { ok: false, label: "state", message: ".rbox/state.json belongs to a different stream", hint: "run `rbox status` for the local re-baseline warning" };
     }
     return { ok: true, label: "state", message: "state file parses and matches this stream" };
   } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === "ENOENT") return { ok: true, label: "state", message: "no sync state yet" };
+    const message = e instanceof Error ? e.message : "";
+    if (e instanceof ResetCorruptionError
+      && message.includes(file)
+      && (message.includes("malformed JSON") || message.includes("JSON nesting exceeded"))) {
+      return { ok: false, label: "state", message: ".rbox/state.json is not valid JSON", hint: "inspect the file or delete it to intentionally re-baseline" };
+    }
     return { ok: false, label: "state", message: "could not read .rbox/state.json" };
   }
 }
