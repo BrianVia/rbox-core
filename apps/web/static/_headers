@@ -8,7 +8,7 @@
   X-Content-Type-Options: nosniff
   X-Frame-Options: DENY
   Referrer-Policy: strict-origin-when-cross-origin
-  Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://clerk.rbox.to https://*.clerk.accounts.dev https://js.stripe.com https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline'; connect-src 'self' https://api.rbox.to https://rbox-dev-api.brian-via.workers.dev https://clerk.rbox.to https://*.clerk.accounts.dev; frame-src https://challenges.cloudflare.com https://js.stripe.com https://checkout.stripe.com https://clerk.rbox.to https://*.clerk.accounts.dev; img-src 'self' data: https://img.clerk.com https://*.clerk.accounts.dev; worker-src 'self' blob:; base-uri 'self'; form-action 'self' https://checkout.stripe.com
+  Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://clerk.rbox.to https://*.clerk.accounts.dev https://js.stripe.com https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline'; connect-src 'self' https://api.rbox.to https://rbox-dev-api.brian-via.workers.dev https://clerk.rbox.to https://*.clerk.accounts.dev; frame-src https://challenges.cloudflare.com https://js.stripe.com https://checkout.stripe.com https://clerk.rbox.to https://*.clerk.accounts.dev; img-src 'self' data: https://img.clerk.com https://*.clerk.accounts.dev; font-src 'self' data:; worker-src 'self' blob:; base-uri 'self'; form-action 'self' https://checkout.stripe.com
 
 /_app/immutable/*
   Cache-Control: public, max-age=31536000, immutable
