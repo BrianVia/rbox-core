@@ -21,6 +21,11 @@ const credential = { token: "tok_secret", deviceId: "dev_1", remoteUrl: "https:/
 const credentialPath = () => path.join(home, ".rbox", "credentials.json");
 const lockPath = () => path.join(home, ".rbox", "credentials.lock");
 
+async function writeCorruptCredential(raw = "{lock-mutation-evidence"): Promise<void> {
+  await fs.mkdir(path.dirname(credentialPath()), { recursive: true, mode: 0o700 });
+  await fs.writeFile(credentialPath(), raw, { mode: 0o600 });
+}
+
 beforeEach(async () => {
   priorEnv = { ...process.env };
   home = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-credentials-"));
@@ -86,6 +91,55 @@ test("strict policy distinguishes first-run absence from every degraded typed st
   ]) expect(() => credentialsForStrictFlow(degraded)).toThrow(degraded.state);
 });
 
+test("an absent read does not materialize ~/.rbox and absent/valid reads never acquire the lock", async () => {
+  let lockAttempted = false;
+  restoreHook = installCredentialTestHook((seam) => {
+    if (seam === "lock-before-acquire") lockAttempted = true;
+  });
+
+  expect(await loadCredentials()).toEqual({ state: "absent", path: credentialPath() });
+  expect(lockAttempted).toBe(false);
+  await expect(fs.lstat(path.join(home, ".rbox"))).rejects.toThrow();
+
+  await fs.mkdir(path.dirname(credentialPath()), { mode: 0o700 });
+  await fs.writeFile(credentialPath(), JSON.stringify({ v: 1, ...credential }), { mode: 0o600 });
+  const valid = await loadCredentials();
+  expect(valid.state).toBe("valid");
+  expect(lockAttempted).toBe(false);
+  await expect(fs.lstat(lockPath())).rejects.toThrow();
+  await expect(fs.lstat(`${lockPath()}.fence`)).rejects.toThrow();
+});
+
+test("an unreadable disk classification returns without acquiring the lock", async () => {
+  await fs.mkdir(path.dirname(credentialPath()), { mode: 0o700 });
+  await fs.mkdir(credentialPath());
+  let lockAttempted = false;
+  restoreHook = installCredentialTestHook((seam) => {
+    if (seam === "lock-before-acquire") lockAttempted = true;
+  });
+
+  expect((await loadCredentials()).state).toBe("unreadable");
+  expect(lockAttempted).toBe(false);
+  await expect(fs.lstat(lockPath())).rejects.toThrow();
+});
+
+test("an optimistic valid read retries an atomic save that lands between lstat and open", async () => {
+  await fs.mkdir(path.dirname(credentialPath()), { mode: 0o700 });
+  await fs.writeFile(credentialPath(), JSON.stringify({ v: 1, ...credential, token: "old" }), { mode: 0o600 });
+  let saveLanded = false;
+  restoreHook = installCredentialTestHook(async (seam) => {
+    if (seam !== "source-after-lstat" || saveLanded) return;
+    saveLanded = true;
+    await saveCredentials({ ...credential, token: "new" });
+  });
+
+  const loaded = await loadCredentials();
+  expect(saveLanded).toBe(true);
+  expect(loaded.state).toBe("valid");
+  if (loaded.state === "valid") expect(loaded.credentials.token).toBe("new");
+  expect((await fs.readdir(path.dirname(credentialPath()))).some((name) => name.includes(".corrupt-"))).toBe(false);
+});
+
 test("absent, v1 save, exact mode, whitelist, and typed strict adapter", async () => {
   expect(await loadCredentials()).toEqual({ state: "absent", path: credentialPath() });
   await saveCredentials({ ...credential, v: 1, ignored: "drop" } as never);
@@ -121,6 +175,12 @@ test("load quarantine preserves exact corrupt bytes at 0600 and uses collision c
   const base = `${credentialPath()}.corrupt-2026-07-17T12-34-56-789Z`;
   await fs.writeFile(base, "existing", { mode: 0o600 });
   await fs.writeFile(`${base}-1`, "existing-1", { mode: 0o600 });
+  let sourceReads = 0;
+  let lockAttempted = false;
+  restoreHook = installCredentialTestHook((seam) => {
+    if (seam === "source-after-read") sourceReads++;
+    if (seam === "lock-before-acquire") lockAttempted = true;
+  });
   const loaded = await loadCredentials();
   expect(loaded.state).toBe("corrupt");
   if (loaded.state === "corrupt") expect(loaded.quarantinedTo).toBe(`${base}-2`);
@@ -128,7 +188,29 @@ test("load quarantine preserves exact corrupt bytes at 0600 and uses collision c
   expect((await fs.stat(`${base}-2`)).mode & 0o777).toBe(0o600);
   expect(await fs.readFile(base, "utf8")).toBe("existing");
   expect(await fs.readFile(`${base}-1`, "utf8")).toBe("existing-1");
+  expect(sourceReads).toBe(2);
+  expect(lockAttempted).toBe(true);
   await expect(fs.lstat(credentialPath())).rejects.toThrow();
+});
+
+test("load rechecks under the mutation lock and preserves a concurrent valid save", async () => {
+  const raw = Buffer.from("{corrupt-before-concurrent-save");
+  await writeCorruptCredential(raw.toString("utf8"));
+  let saveLanded = false;
+  restoreHook = installCredentialTestHook(async (seam) => {
+    if (seam !== "load-before-mutation-lock" || saveLanded) return;
+    saveLanded = true;
+    await saveCredentials({ ...credential, token: "concurrent-valid" });
+  });
+
+  const loaded = await loadCredentials();
+  expect(saveLanded).toBe(true);
+  expect(loaded.state).toBe("valid");
+  if (loaded.state === "valid") expect(loaded.credentials.token).toBe("concurrent-valid");
+  expect(JSON.parse(await fs.readFile(credentialPath(), "utf8")).token).toBe("concurrent-valid");
+  const quarantines = (await fs.readdir(path.dirname(credentialPath()))).filter((name) => name.includes(".corrupt-"));
+  expect(quarantines).toHaveLength(1);
+  expect(await fs.readFile(path.join(path.dirname(credentialPath()), quarantines[0]!))).toEqual(raw);
 });
 
 test("future version is typed and quarantined; save preflight preserves malformed evidence", async () => {
@@ -162,6 +244,10 @@ test("valid env override and every invalid auxiliary env value leave corrupt dis
   await fs.mkdir(path.dirname(credentialPath()), { mode: 0o700 });
   const raw = Buffer.from("{broken-disk");
   await fs.writeFile(credentialPath(), raw, { mode: 0o600 });
+  let lockAttempted = false;
+  restoreHook = installCredentialTestHook((seam) => {
+    if (seam === "lock-before-acquire") lockAttempted = true;
+  });
   process.env.RBOX_TOKEN = "env-token";
   process.env.RBOX_DEVICE_ID = "env-device";
   process.env.RBOX_API = "https://env.test";
@@ -182,6 +268,7 @@ test("valid env override and every invalid auxiliary env value leave corrupt dis
     expect(await fs.readFile(credentialPath())).toEqual(raw);
   }
   expect((await fs.readdir(path.dirname(credentialPath()))).filter((name) => name.includes(".corrupt-")).length).toBe(0);
+  expect(lockAttempted).toBe(false);
 });
 
 test("symlink and non-regular credential destinations are unreadable and save refuses", async () => {
@@ -238,6 +325,7 @@ test.skipIf(typeof process.geteuid !== "function" || process.geteuid() === 0)("c
 
 test("oversized, malformed, and future lock markers fail closed without being reaped", async () => {
   await fs.mkdir(path.dirname(lockPath()), { mode: 0o700 });
+  await writeCorruptCredential();
   for (const raw of [
     "x".repeat(2048),
     JSON.stringify({ v: 1, pid: process.pid, processStart: "garbage", acquiredAt: fixedNow.toISOString(), nonce: "a".repeat(32) }),
@@ -253,11 +341,13 @@ test("oversized, malformed, and future lock markers fail closed without being re
 test("abandoned fence is recovered only when its exact process incarnation is dead", async () => {
   const fence = `${lockPath()}.fence`;
   await fs.mkdir(path.dirname(fence), { mode: 0o700 });
+  await writeCorruptCredential();
   await fs.writeFile(fence, JSON.stringify({ v: 1, pid: 999_999, processStart: "1", acquiredAt: fixedNow.toISOString(), nonce: "c".repeat(32) }), { mode: 0o600 });
   await fs.utimes(fence, fixedNow, fixedNow);
-  expect((await loadCredentials()).state).toBe("absent");
+  expect((await loadCredentials()).state).toBe("corrupt");
   await expect(fs.lstat(fence)).rejects.toThrow();
 
+  await writeCorruptCredential();
   const future = JSON.stringify({ v: 1, pid: 999_999, processStart: "1", acquiredAt: new Date(fixedNow.getTime() + 60_000).toISOString(), nonce: "d".repeat(32) });
   await fs.writeFile(fence, future, { mode: 0o600 });
   await fs.utimes(fence, fixedNow, fixedNow);
@@ -327,6 +417,7 @@ test("fresh main contention and a live exact-incarnation fence fail closed witho
   for (const target of [lockPath(), `${lockPath()}.fence`]) {
     await fs.rm(path.join(home, ".rbox"), { recursive: true, force: true });
     await fs.mkdir(path.dirname(target), { mode: 0o700 });
+    await writeCorruptCredential();
     const raw = JSON.stringify({ v: 1, pid: process.pid, processStart: identity.startTime, acquiredAt: new Date().toISOString(), nonce: "9".repeat(32) });
     await fs.writeFile(target, raw, { mode: 0o600 });
     expect((await loadCredentials()).state).toBe("unreadable");
@@ -415,8 +506,9 @@ test("source identity swaps at every open/read boundary preserve the replacement
     await fs.writeFile(credentialPath(), "{original-corrupt", { mode: 0o600 });
     const displaced = `${credentialPath()}.displaced`;
     let swapped = false;
+    let observations = 0;
     restoreHook = installCredentialTestHook(async (observed) => {
-      if (observed !== seam || swapped) return;
+      if (observed !== seam || swapped || ++observations !== 2) return;
       swapped = true;
       await fs.rename(credentialPath(), displaced);
       await fs.writeFile(credentialPath(), "replacement-must-survive", { mode: 0o600 });
@@ -492,6 +584,7 @@ test("fence and main-lock publication faults expose no partial final marker", as
   for (const faultedPath of [`${lockPath()}.fence`, lockPath()]) {
     for (const seam of seams) {
       await fs.rm(path.join(home, ".rbox"), { recursive: true, force: true });
+      await writeCorruptCredential();
       restoreHook = installCredentialTestHook((observed, context) => {
         if (observed === seam && context.markerPath === faultedPath) throw new Error(`injected ${seam}`);
       });
@@ -514,6 +607,7 @@ test("fence and main-lock publication faults expose no partial final marker", as
 });
 
 test("a successor swapped into the main marker path is never removed", async () => {
+  await writeCorruptCredential();
   let successor = "";
   restoreHook = installCredentialTestHook(async (seam, context) => {
     if (seam !== "marker-after-link" || context.markerPath !== lockPath() || successor) return;
@@ -529,6 +623,7 @@ test("a successor swapped into the main marker path is never removed", async () 
 test("marker hardlink EEXIST is handled for both fence and main publication", async () => {
   for (const collidedPath of [`${lockPath()}.fence`, lockPath()]) {
     await fs.rm(path.join(home, ".rbox"), { recursive: true, force: true });
+    await writeCorruptCredential();
     let collided = false;
     restoreHook = installCredentialTestHook(async (seam, context) => {
       if (seam !== "marker-before-link" || context.markerPath !== collidedPath || collided) return;
@@ -546,6 +641,7 @@ test("marker hardlink EEXIST is handled for both fence and main publication", as
 });
 
 test("unsupported marker hardlinks fail closed with no partial final marker", async () => {
+  await writeCorruptCredential();
   const originalLink = fs.link;
   (fs as unknown as { link: typeof fs.link }).link = async () => {
     const error = new Error("hardlinks unsupported") as NodeJS.ErrnoException;
@@ -563,6 +659,7 @@ test("unsupported marker hardlinks fail closed with no partial final marker", as
 
 test("faulted stale-takeover installation never restores or partially publishes the main marker", async () => {
   await fs.mkdir(path.dirname(lockPath()), { mode: 0o700 });
+  await writeCorruptCredential();
   const stale = { v: 1, pid: process.pid, processStart: "1", acquiredAt: fixedNow.toISOString(), nonce: "7".repeat(32) };
   await fs.writeFile(lockPath(), JSON.stringify(stale), { mode: 0o600 });
   const old = new Date(fixedNow.getTime() - 5 * 60_000);

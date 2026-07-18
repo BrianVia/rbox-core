@@ -68,6 +68,7 @@ const LOCK_STALE_MS = 5 * 60_000;
 const LOCK_RETRY_MS = 25;
 const LOCK_RETRIES = 80;
 const HEARTBEAT_MS = 25_000;
+const OPTIMISTIC_READ_RETRIES = 3;
 let heartbeatIntervalMs = HEARTBEAT_MS;
 const MARKER_MAX_BYTES = 1024;
 const NONCE_RE = /^[0-9a-f]{32}$/;
@@ -75,6 +76,7 @@ const PROCESS_START_RE = /^\d+(?:\.\d+)?$/;
 const NOFOLLOW = constants.O_NOFOLLOW ?? 0;
 
 type CredentialTestSeam =
+  | "lock-before-acquire" | "load-before-mutation-lock"
   | "marker-temp-opened" | "marker-temp-written" | "marker-temp-synced" | "marker-temp-closed"
   | "marker-before-link" | "marker-after-link" | "marker-before-temp-cleanup" | "marker-after-temp-cleanup"
   | "source-after-lstat" | "source-after-open" | "source-after-fstat" | "source-after-read"
@@ -521,6 +523,7 @@ async function openOwnedLock(markerPath: string, expected: MarkerV1, raw: string
 }
 
 async function acquireCredentialLock(): Promise<OwnedCredentialLock> {
+  await testSeam("lock-before-acquire", { lockPath: lockFile() });
   await secureCredentialDirectory(true);
   const markerPath = lockFile();
   for (let attempt = 0; attempt < LOCK_RETRIES; attempt++) {
@@ -562,6 +565,8 @@ async function acquireCredentialLock(): Promise<OwnedCredentialLock> {
   throw new Error(`credential lock contention did not clear: ${markerPath}`);
 }
 
+class CredentialSourceReplacedError extends Error {}
+
 async function openCredentialSource(sourcePath: string): Promise<{ handle: fs.FileHandle; identity: PathObservation; bytes: Buffer }> {
   const before = observation(await fs.lstat(sourcePath, { bigint: true }));
   await testSeam("source-after-lstat", { sourcePath });
@@ -571,7 +576,8 @@ async function openCredentialSource(sourcePath: string): Promise<{ handle: fs.Fi
     await testSeam("source-after-open", { sourcePath });
     const opened = observation(await handle.stat({ bigint: true }));
     await testSeam("source-after-fstat", { sourcePath });
-    if (!sameIdentity(before, opened)) throw new Error(`credential path changed between lstat and open: ${sourcePath}`);
+    if (!sameIdentity(before, opened, false)) throw new CredentialSourceReplacedError(`credential path changed between lstat and open: ${sourcePath}`);
+    if (before.size !== opened.size) throw new Error(`credential file changed between lstat and open: ${sourcePath}`);
     const bytes = await handle.readFile();
     await testSeam("source-after-read", { sourcePath });
     const after = observation(await handle.stat({ bigint: true }));
@@ -583,13 +589,17 @@ async function openCredentialSource(sourcePath: string): Promise<{ handle: fs.Fi
   }
 }
 
-async function classifyDisk(): Promise<{ parsed: ParsedCredential; source: Awaited<ReturnType<typeof openCredentialSource>> } | { absent: true }> {
-  try {
-    const source = await openCredentialSource(file());
-    return { parsed: parseCredentialDocument(source.bytes), source };
-  } catch (error) {
-    if (errno(error) === "ENOENT") return { absent: true };
-    throw error;
+async function classifyDisk(optimistic = false): Promise<{ parsed: ParsedCredential; source: Awaited<ReturnType<typeof openCredentialSource>> } | { absent: true }> {
+  for (let attempt = 0;; attempt++) {
+    try {
+      if (!(await secureCredentialDirectory(false))) return { absent: true };
+      const source = await openCredentialSource(file());
+      return { parsed: parseCredentialDocument(source.bytes), source };
+    } catch (error) {
+      if (errno(error) === "ENOENT") return { absent: true };
+      if (optimistic && error instanceof CredentialSourceReplacedError && attempt + 1 < OPTIMISTIC_READ_RETRIES) continue;
+      throw error;
+    }
   }
 }
 
@@ -671,15 +681,35 @@ export function credentialsForStrictFlow(result: CredentialLoadResult): Credenti
 export async function loadCredentials(): Promise<CredentialLoadResult> {
   const env = envResult();
   if (env) return env;
+
+  // Reads are optimistic and side-effect free. Only a classification that
+  // intends to quarantine crosses into the fenced mutation path below.
+  let initial: Awaited<ReturnType<typeof classifyDisk>>;
+  try {
+    initial = await classifyDisk(true);
+    if ("absent" in initial) return { state: "absent", path: file() };
+    if (initial.parsed.state === "valid") {
+      const result: CredentialLoadResult = { ...initial.parsed, source: "disk" };
+      await initial.source.handle.close();
+      return result;
+    }
+    await initial.source.handle.close();
+    await testSeam("load-before-mutation-lock", { state: initial.parsed.state });
+  } catch (error) {
+    return unreadable(error);
+  }
+
   let lock: OwnedCredentialLock | undefined;
   let result: CredentialLoadResult | undefined;
   try {
     lock = await acquireCredentialLock();
-    const classified = await classifyDisk();
-    if ("absent" in classified) {
+    // Discard the optimistic handle and classify again while serialized. A
+    // concurrent save may have replaced corrupt evidence with a valid file.
+    const rechecked = await classifyDisk();
+    if ("absent" in rechecked) {
       result = { state: "absent", path: file() };
     } else {
-      const { parsed, source } = classified;
+      const { parsed, source } = rechecked;
       try {
         if (parsed.state === "valid") {
           result = { ...parsed, source: "disk" };
