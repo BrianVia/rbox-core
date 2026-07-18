@@ -107,7 +107,10 @@ test("fuse arithmetic handles M, M-1, and the rolling-window boundary", async ()
     expect(h.daemon.trustState).toBe("fused");
   } finally { await h.close(); }
 
-  for (const offset of [-1, 0, 1]) {
+  // ±5s (not ±1ms): the daemon reads its own Date.now() inside error(), so a
+  // 1ms-inside-the-window entry ages out whenever the two clock reads straddle a
+  // millisecond — the offset must exceed scheduling jitter to be deterministic.
+  for (const offset of [-5_000, 0, 5_000]) {
     const b = daemonHarness();
     try {
       await b.daemon.startLiveWatch();
