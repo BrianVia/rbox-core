@@ -64,6 +64,38 @@ async function addRef(acct: string, sha: string, size: number, grantedAt = NOW) 
 const mark = (acct: string, sha: string, at = NOW) =>
   db().prepare("INSERT OR IGNORE INTO blob_ref_candidates(account_id, sha256, marked_at) VALUES (?, ?, ?)").bind(acct, sha, at).run();
 
+const SEED_INSERT_CHUNK = 33; // 3 params/row stays within D1's 100-param statement limit.
+async function seedRefs(
+  acct: string,
+  refs: Array<{ sha: string; size: number; grantedAt: number }>,
+  markedAt?: number,
+) {
+  const chunks = Array.from({ length: Math.ceil(refs.length / SEED_INSERT_CHUNK) }, (_, i) =>
+    refs.slice(i * SEED_INSERT_CHUNK, (i + 1) * SEED_INSERT_CHUNK),
+  );
+  await db().batch(chunks.map((chunk) =>
+    db()
+      .prepare(`INSERT OR IGNORE INTO blobs(sha256, size_bytes, present) VALUES ${chunk.map(() => "(?, ?, 1)").join(", ")}`)
+      .bind(...chunk.flatMap(({ sha, size }) => [sha, size])),
+  ));
+  await db().batch(chunks.map((chunk) =>
+    db()
+      .prepare(`INSERT INTO blob_refs(account_id, sha256, granted_at) VALUES ${chunk.map(() => "(?, ?, ?)").join(", ")}`)
+      .bind(...chunk.flatMap(({ sha, grantedAt }) => [acct, sha, grantedAt])),
+  ));
+  if (markedAt !== undefined) {
+    await db().batch(chunks.map((chunk) =>
+      db()
+        .prepare(`INSERT OR IGNORE INTO blob_ref_candidates(account_id, sha256, marked_at) VALUES ${chunk.map(() => "(?, ?, ?)").join(", ")}`)
+        .bind(...chunk.flatMap(({ sha }) => [acct, sha, markedAt])),
+    ));
+  }
+  await db()
+    .prepare("UPDATE accounts SET used_bytes = used_bytes + ? WHERE id = ?")
+    .bind(refs.reduce((sum, { size }) => sum + size, 0), acct)
+    .run();
+}
+
 const used = async (id: string) => Number((await db().prepare("SELECT used_bytes FROM accounts WHERE id=?").bind(id).first())!.used_bytes);
 const refExists = async (acct: string, sha: string) => !!(await db().prepare("SELECT 1 FROM blob_refs WHERE account_id=? AND sha256=?").bind(acct, sha).first());
 const candExists = async (acct: string, sha: string) => !!(await db().prepare("SELECT 1 FROM blob_ref_candidates WHERE account_id=? AND sha256=?").bind(acct, sha).first());
@@ -146,21 +178,22 @@ describe("§33 mark → grace → purge (the leak fix)", () => {
 
   it("bounds and advances phase-1 mark cursor across pages", async () => {
     await mkAccount("a");
-    for (let i = 0; i < PHASE1_MAX_ROWS + 1; i += 100) {
-      const values = Array.from({ length: Math.min(100, PHASE1_MAX_ROWS + 1 - i) }, (_, j) => `m${String(i + j).padStart(4, "0")}`);
-      for (const sha of values) await addRef("a", sha, 1, NOW - 2 * HOUR);
-    }
+    await seedRefs("a", Array.from({ length: PHASE1_MAX_ROWS + 1 }, (_, i) => ({
+      sha: `m${String(i).padStart(4, "0")}`,
+      size: 1,
+      grantedAt: NOW - 2 * HOUR,
+    })));
     expect((await phase1Mark(db(), "a", EMPTY, HOUR, NOW)).marked).toBe(PHASE1_MAX_ROWS);
     expect((await phase1Mark(db(), "a", EMPTY, HOUR, NOW)).marked).toBe(1);
   });
 
   it("bounds and drains phase-1 purge cursor across pages", async () => {
     await mkAccount("a");
-    for (let i = 0; i < PHASE1_MAX_ROWS + 1; i++) {
-      const sha = `p${String(i).padStart(4, "0")}`;
-      await addRef("a", sha, 1, NOW - 4 * HOUR);
-      await mark("a", sha, NOW - 2 * HOUR);
-    }
+    await seedRefs("a", Array.from({ length: PHASE1_MAX_ROWS + 1 }, (_, i) => ({
+      sha: `p${String(i).padStart(4, "0")}`,
+      size: 1,
+      grantedAt: NOW - 4 * HOUR,
+    })), NOW - 2 * HOUR);
     const first = await phase1Purge(db(), "a", EMPTY, HOUR, NOW);
     expect(first.purged).toBe(PHASE1_MAX_ROWS);
     const second = await phase1Purge(db(), "a", EMPTY, HOUR, NOW);
@@ -171,11 +204,11 @@ describe("§33 mark → grace → purge (the leak fix)", () => {
   it("isolates phase-1 purge cursors per account", async () => {
     await mkAccount("small");
     await mkAccount("large");
-    for (let i = 0; i < PHASE1_MAX_ROWS + 1; i++) {
-      const sha = `large-${String(i).padStart(4, "0")}`;
-      await addRef("large", sha, 1, NOW - 4 * HOUR);
-      await mark("large", sha, NOW - 2 * HOUR);
-    }
+    await seedRefs("large", Array.from({ length: PHASE1_MAX_ROWS + 1 }, (_, i) => ({
+      sha: `large-${String(i).padStart(4, "0")}`,
+      size: 1,
+      grantedAt: NOW - 4 * HOUR,
+    })), NOW - 2 * HOUR);
     for (let i = 0; i < 3; i++) {
       const sha = `small-${i}`;
       await addRef("small", sha, 1, NOW - 4 * HOUR);
