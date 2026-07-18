@@ -175,10 +175,12 @@ wtest("directory delete removes the whole subtree via `unlinkDir`", async () => 
 // same code path both backends feed — so this is real coverage, just backend-independent.
 test("batcher last-kind-wins: create-then-delete in one window coalesces to a single delete", async () => {
   const batches: WatchEvent[][] = [];
-  const b = createBatcher((evs) => batches.push(evs), 20, 3000);
+  let settled!: () => void;
+  const didSettle = new Promise<void>((resolve) => { settled = resolve; });
+  const b = createBatcher((evs) => { batches.push(evs); settled(); }, 20, 3000);
   b.push("ephemeral.txt", "add");
   b.push("ephemeral.txt", "unlinkDir"); // same path, same window → overwrites the add
-  await new Promise((r) => setTimeout(r, 80)); // > debounce → one flush
+  await didSettle;
   b.dispose();
   expect(batches).toHaveLength(1);
   expect(batches[0]).toEqual([{ relPath: "ephemeral.txt", kind: "unlinkDir" }]);
@@ -186,11 +188,13 @@ test("batcher last-kind-wins: create-then-delete in one window coalesces to a si
 
 test("batcher coalesces a burst of many events across paths into one settled batch", async () => {
   const batches: WatchEvent[][] = [];
-  const b = createBatcher((evs) => batches.push(evs), 20, 3000);
+  let settled!: () => void;
+  const didSettle = new Promise<void>((resolve) => { settled = resolve; });
+  const b = createBatcher((evs) => { batches.push(evs); settled(); }, 20, 3000);
   b.push("a.ts", "add");
   b.push("b.ts", "add");
   b.push("a.ts", "change"); // last-kind-wins for a.ts
-  await new Promise((r) => setTimeout(r, 80));
+  await didSettle;
   b.dispose();
   expect(batches).toHaveLength(1);
   expect(new Map(batches[0]!.map((e) => [e.relPath, e.kind]))).toEqual(new Map([["a.ts", "change"], ["b.ts", "add"]]));
@@ -198,14 +202,21 @@ test("batcher coalesces a burst of many events across paths into one settled bat
 
 test("batcher maxWait cap flushes a sustained burst even without a quiet gap", async () => {
   const batches: WatchEvent[][] = [];
+  const realNow = Date.now;
+  let now = 1_000;
+  Date.now = () => now;
   const b = createBatcher((evs) => batches.push(evs), 1000, 60); // debounce >> maxWait
-  b.push("x.ts", "add");
-  await new Promise((r) => setTimeout(r, 20));
-  b.push("y.ts", "add"); // still within maxWait; no flush yet
-  await new Promise((r) => setTimeout(r, 90)); // now past maxWait (60ms) → forced flush on next push
-  b.push("z.ts", "add");
-  await new Promise((r) => setTimeout(r, 10));
-  b.dispose();
+  try {
+    b.push("x.ts", "add");
+    now += 20;
+    b.push("y.ts", "add"); // still within maxWait; no flush yet
+    expect(batches).toHaveLength(0);
+    now += 90;
+    b.push("z.ts", "add"); // now past maxWait (60ms) → forced flush
+  } finally {
+    b.dispose();
+    Date.now = realNow;
+  }
   // The cap forced a flush that included the earlier events (not stuck behind the long debounce).
   expect(batches.length).toBeGreaterThanOrEqual(1);
   expect(batches.flat().some((e) => e.relPath === "x.ts")).toBe(true);

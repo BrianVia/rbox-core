@@ -204,7 +204,7 @@ describe("fused crypto", () => {
         stream.cancel();
         resumeStat();
         await __cryptoPoolTestHooks.waitForStats((stats) => stats.inFlight === 0 && stats.queue === 0);
-        await new Promise((resolve) => setTimeout(resolve, 25));
+        while (pool!.fusedStatsForTest().used !== 0) await new Promise((resolve) => setTimeout(resolve, 10));
         expect(await fs.readFile(dispatchesPath, "utf8")).toBe("x");
         expect(pool!.fusedStatsForTest().used).toBe(0);
       });

@@ -210,14 +210,17 @@ test("follow initial-tail handoff emits an append exactly once without a gap", a
 });
 
 test("follow with no source waits and promotes crash-only to dated", async () => {
-  const follow = logsDaemon(root, { follow: true, lines: 10 });
-  await Bun.sleep(100);
+  const polls = controlledPolls();
+  const follow = logsDaemon(root, { follow: true, lines: 10 }, { waitForPoll: polls.waitForPoll });
+  await polls.waitUntilPoll();
   await fs.mkdir(daemonRuntimeDir(root), { recursive: true });
   await fs.writeFile(daemonCrashLogPath(root), "crash-only\n");
-  await Bun.sleep(300);
+  polls.release();
+  await polls.waitUntilPoll();
   await fs.writeFile(daemonDatedLogPath(root, new Date()), `${new Date().toISOString()} promoted-dated\n`);
-  await Bun.sleep(650);
+  for (let i = 0; i < 4; i++) { polls.release(); await polls.waitUntilPoll(); }
   process.emit("SIGTERM");
+  polls.release();
   await follow;
   expect(out.join("")).toContain("crash-only");
   expect(out.join("")).toContain("promoted-dated");
@@ -235,8 +238,9 @@ test("follow exits on untrack, workspace rebinding, and an unrelated boot genera
   for (const change of ["untrack", "binding", "boot"] as const) {
     out.length = 0;
     await writeLifecycle("ws-one", "boot-one");
-    const follow = logsDaemon(root, { follow: true, lines: 1 });
-    await Bun.sleep(100);
+    const polls = controlledPolls();
+    const follow = logsDaemon(root, { follow: true, lines: 1 }, { waitForPoll: polls.waitForPoll });
+    await polls.waitUntilPoll();
     if (change === "untrack") {
       await fs.rm(path.join(daemonRuntimeDir(root), "daemon.pid"));
       await fs.rm(path.join(daemonRuntimeDir(root), "workspace.bound"));
@@ -246,7 +250,8 @@ test("follow exits on untrack, workspace rebinding, and an unrelated boot genera
       await fs.writeFile(path.join(daemonRuntimeDir(root), "daemon.pid"), "v2 4243 boot-two\n");
       await fs.writeFile(path.join(daemonRuntimeDir(root), "workspace.bound"), "v2 ws-one boot-two\n");
     }
-    await Promise.race([follow, Bun.sleep(1_000).then(() => { throw new Error(`follow did not exit on ${change}`); })]);
+    polls.release();
+    await follow;
     await fs.rm(daemonRuntimeDir(root), { recursive: true, force: true });
     await fs.rm(path.join(root, ".rbox", "workspace.json"), { force: true });
   }
@@ -293,15 +298,18 @@ test("follow keeps legacy growth visible after dated promotion and exits for a l
   await fs.mkdir(daemonRuntimeDir(root), { recursive: true });
   await fs.writeFile(path.join(daemonRuntimeDir(root), "daemon.pid"), "4242\n");
   await fs.writeFile(path.join(daemonRuntimeDir(root), "workspace.bound"), "ws-legacy\n");
-  const follow = logsDaemon(root, { follow: true, lines: 10 });
-  await Bun.sleep(100);
+  const polls = controlledPolls();
+  const follow = logsDaemon(root, { follow: true, lines: 10 }, { waitForPoll: polls.waitForPoll });
+  await polls.waitUntilPoll();
   await fs.writeFile(daemonDatedLogPath(root, new Date()), `${new Date().toISOString()} dated-promoted\n`);
-  await Bun.sleep(650);
+  for (let i = 0; i < 4; i++) { polls.release(); await polls.waitUntilPoll(); }
   await fs.appendFile(path.join(root, ".rbox", "daemon.log"), "legacy-late-growth\n");
-  await Bun.sleep(350);
+  polls.release();
+  await polls.waitUntilPoll();
   await fs.rm(path.join(daemonRuntimeDir(root), "daemon.pid"));
   await fs.rm(path.join(daemonRuntimeDir(root), "workspace.bound"));
-  await Promise.race([follow, Bun.sleep(1_000).then(() => { throw new Error("legacy follow did not exit on untrack"); })]);
+  polls.release();
+  await follow;
   expect(out.join("")).toContain("dated-promoted");
   expect(out.join("")).toContain("legacy-late-growth");
 });
@@ -310,12 +318,15 @@ test("follow treats same-path recreation as a new generation from offset zero", 
   const crash = daemonCrashLogPath(root);
   await fs.mkdir(daemonRuntimeDir(root), { recursive: true });
   await fs.writeFile(crash, "old-crash\n");
-  const follow = logsDaemon(root, { follow: true, lines: 10 });
-  await Bun.sleep(100);
+  const polls = controlledPolls();
+  const follow = logsDaemon(root, { follow: true, lines: 10 }, { waitForPoll: polls.waitForPoll });
+  await polls.waitUntilPoll();
   await fs.rm(crash);
   await fs.writeFile(crash, "recreated-from-zero\n");
-  await Bun.sleep(350);
+  polls.release();
+  await polls.waitUntilPoll();
   process.emit("SIGINT");
+  polls.release();
   await follow;
   expect(out.join("")).toContain("recreated-from-zero");
 });
