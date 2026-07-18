@@ -499,6 +499,67 @@ describe("worker integration (real DO + D1 + R2)", () => {
     expect(((await usage.json()) as { plan: string }).plan).toBe("pro");
   });
 
+  test("webhook stores the annual interval on an annual subscription (validation note #21)", async () => {
+    const a = await bootstrap("acct-sub-annual");
+    const t = Math.floor(Date.now() / 1000);
+    const body = JSON.stringify({
+      id: "evt_sub_annual",
+      type: "customer.subscription.created",
+      data: {
+        object: {
+          id: "sub_annual",
+          status: "active",
+          customer: "cus_sub_annual",
+          metadata: { account_id: a.accountId },
+          items: { data: [{ price: { lookup_key: "rbox_pro_annual", recurring: { interval: "year" } } }] },
+        },
+      },
+    });
+    const res = await webhook(body, await stripeSig(body, "whsec_test_secret", t));
+    expect(res.status).toBe(200);
+    const row = await env.rbox_dev_db.prepare("SELECT billing_interval FROM accounts WHERE id = ?").bind(a.accountId).first<{ billing_interval: string | null }>();
+    expect(row?.billing_interval).toBe("annual");
+    const usage = await SELF.fetch(`${BASE}/v1/account/usage`, { headers: authed(a.token) });
+    expect(((await usage.json()) as { plan: string; interval: string | null })).toMatchObject({ plan: "pro", interval: "annual" });
+  });
+
+  test("webhook stores the monthly interval and clears it on downgrade to none", async () => {
+    const a = await bootstrap("acct-sub-monthly-interval");
+    const t = Math.floor(Date.now() / 1000);
+    const up = JSON.stringify({
+      id: "evt_sub_monthly_interval",
+      type: "customer.subscription.updated",
+      data: {
+        object: {
+          id: "sub_monthly_iv",
+          status: "active",
+          customer: "cus_sub_monthly_iv",
+          metadata: { account_id: a.accountId },
+          items: { data: [{ price: { lookup_key: "rbox_pro_monthly", recurring: { interval: "month" } } }] },
+        },
+      },
+    });
+    await webhook(up, await stripeSig(up, "whsec_test_secret", t));
+    const usage1 = await SELF.fetch(`${BASE}/v1/account/usage`, { headers: authed(a.token) });
+    expect(((await usage1.json()) as { interval: string | null }).interval).toBe("monthly");
+    const down = JSON.stringify({
+      id: "evt_sub_monthly_iv_down",
+      type: "customer.subscription.updated",
+      data: {
+        object: {
+          id: "sub_monthly_iv",
+          status: "past_due",
+          customer: "cus_sub_monthly_iv",
+          metadata: { account_id: a.accountId },
+          items: { data: [{ price: { lookup_key: "rbox_pro_monthly", recurring: { interval: "month" } } }] },
+        },
+      },
+    });
+    await webhook(down, await stripeSig(down, "whsec_test_secret", t));
+    const usage2 = await SELF.fetch(`${BASE}/v1/account/usage`, { headers: authed(a.token) });
+    expect(((await usage2.json()) as { plan: string; interval: string | null })).toMatchObject({ plan: "none", interval: null });
+  });
+
   test("webhook is idempotent (same event id re-delivered → duplicate, applied once)", async () => {
     const a = await bootstrap("acct-idem");
     const t = Math.floor(Date.now() / 1000);

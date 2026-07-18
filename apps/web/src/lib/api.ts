@@ -6,6 +6,9 @@ import { sessionId } from './clerk';
 
 export interface Usage {
 	plan: string;
+	// Billing cadence of the active subscription; null = unknown/no plan (pre-migration
+	// rows, non-Stripe admin-set plans) — treat as monthly for display.
+	interval?: 'monthly' | 'annual' | null;
 	usedBytes: number;
 	storageCap: number | null; // null = unlimited
 	workspaces: number;

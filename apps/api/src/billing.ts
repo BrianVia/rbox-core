@@ -10,9 +10,9 @@ import { fairUseQueueStatement } from "./fairuse.js";
  *  for this long before locked-state retention resumes. */
 export const GRACE_PERIOD_MS = 30 * 24 * 60 * 60 * 1000;
 
-async function account(env: Env, accountId: string): Promise<{ plan: string; extra: number; used: number; graceUntil: number | null }> {
-  const r = await dbFor(env, accountId).prepare("SELECT plan, extra_storage_bytes, used_bytes, grace_until FROM accounts WHERE id = ?").bind(accountId).first<{ plan: string; extra_storage_bytes: number; used_bytes: number; grace_until: number | null }>();
-  return { plan: r?.plan ?? "none", extra: Number(r?.extra_storage_bytes ?? 0), used: Number(r?.used_bytes ?? 0), graceUntil: r?.grace_until ?? null };
+async function account(env: Env, accountId: string): Promise<{ plan: string; extra: number; used: number; graceUntil: number | null; billingInterval: string | null }> {
+  const r = await dbFor(env, accountId).prepare("SELECT plan, extra_storage_bytes, used_bytes, grace_until, billing_interval FROM accounts WHERE id = ?").bind(accountId).first<{ plan: string; extra_storage_bytes: number; used_bytes: number; grace_until: number | null; billing_interval: string | null }>();
+  return { plan: r?.plan ?? "none", extra: Number(r?.extra_storage_bytes ?? 0), used: Number(r?.used_bytes ?? 0), graceUntil: r?.grace_until ?? null, billingInterval: r?.billing_interval ?? null };
 }
 
 /** Fast-fail over-cap check BEFORE writing bytes to R2 (design 13 G4): true when
@@ -144,6 +144,10 @@ export async function usage(env: Env, p: Principal): Promise<Response> {
   ]);
   return json({
     plan: a.plan,
+    // Billing cadence (validation note #21): 'monthly' | 'annual' | null (unknown/no
+    // plan — pre-migration rows and non-Stripe admin-set plans). The dashboard
+    // defaults to the monthly price display when null.
+    interval: a.billingInterval,
     usedBytes: a.used,
     storageCap: cap === Infinity ? null : cap,
     workspaces,
