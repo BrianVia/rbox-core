@@ -3,7 +3,7 @@ import { progressLabel } from "./status-view.js";
 import { findRoot } from "./config.js";
 import { pull, push } from "./sync.js";
 import { attachGitSyncProgress, postSyncNudge, runSyncCommand, summarize } from "./sync-cmd.js";
-import { beginReport } from "./metrics.js";
+import { beginReport, logDebugSummary } from "./metrics.js";
 import { DEFAULT_LOG_LINES, logsDaemon } from "./daemon-control.js";
 import { autostartCmd, bootResume, BOOT_RESUME_MARKER, startDaemonAndRecordDesired, stopDaemonAndRecordDesired } from "./autostart-cmd.js";
 import { addIgnorePattern, listIgnoreRules, purgeIgnored, setRespectGitignore } from "./ignore-cmd.js";
@@ -284,7 +284,7 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
               ? `pushed ${style.dim(root)} ${style.sym.arrow} sequence ${style.cyan(String(seq))}`
               : `already in sync — nothing to upload ${style.dim(`(sequence ${seq})`)}`
           );
-          report?.logSummaryTo((l) => console.log(style.dim(l)));
+          logDebugSummary(report, (l) => console.log(style.dim(l)));
         });
       } catch (e) {
         sp.fail("push failed");
@@ -307,7 +307,7 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
           const actions = await pull(root, cfg, deps);
           sp.stop();
           summarize("pulled", actions, root);
-          report?.logSummaryTo((l) => console.log(style.dim(l)));
+          logDebugSummary(report, (l) => console.log(style.dim(l)));
           await postSyncNudge(root, actions, cfg);
         });
       } catch (e) {

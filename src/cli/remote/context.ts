@@ -8,6 +8,7 @@
 import { translateRemoteError } from "./errors.js";
 import { fetchResilient, type ResilientOpts } from "./resilient.js";
 import { RBOX_VERSION } from "../version.js";
+import { debugEnabled } from "../debug.js";
 
 const authGrantEnabled = (): boolean => process.env.RBOX_AUTH_GRANT !== "0";
 export const UPLOAD_GRANT_ATTACH_WINDOW_MS = 270_000;
@@ -21,6 +22,9 @@ export class RemoteContext {
     readonly workspaceId: string,
     readonly projectId: string,
     readonly warningSink: (line: string) => void = (line) => process.stderr.write(`${line}\n`),
+    readonly instrumentationSink: (line: string) => void = (line) => {
+      if (debugEnabled()) warningSink(line);
+    },
   ) {}
 
   // §23 upload-receipts: single-PUT/check/commit speak the receipts protocol. PUT

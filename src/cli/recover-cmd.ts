@@ -3,7 +3,7 @@ import { findRoot, loadConfig } from "./config.js";
 import { credentialsForStrictFlow, loadCredentials } from "./credentials.js";
 import { keystorePinStore } from "./e2ee-keystore.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
-import { beginReport } from "./metrics.js";
+import { beginReport, logDebugSummary } from "./metrics.js";
 import { promptConfirm } from "./prompt.js";
 import { NeedsRebaselineError } from "./remote.js";
 import { pull, push } from "./sync.js";
@@ -121,7 +121,7 @@ export async function recoverWorkspaceCmd(pathArg: string | undefined, opts: Rec
         ? `${style.bold("pushed")} ${style.sym.arrow} sequence ${style.cyan(String(pushed.sequence))}`
         : `${style.bold("push")}: already in sync ${style.dim(`(sequence ${pushed.sequence})`)}`
     );
-    report?.logSummaryTo((l) => (deps.log ?? console.log)(style.dim(l)));
+    logDebugSummary(report, (l) => (deps.log ?? console.log)(style.dim(l)));
     (deps.log ?? console.log)(
       `${style.bold("recover")}: head re-verified, ${count(pulled, "write")} pulled, ${count(pulled, "delete")} trashed/deleted, ${count(pulled, "conflict")} keep-both conflict(s)`
     );

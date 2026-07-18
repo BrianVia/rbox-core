@@ -1,6 +1,6 @@
 import { type Action } from "../engine/index.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
-import { beginReport } from "./metrics.js";
+import { beginReport, logDebugSummary } from "./metrics.js";
 import { spinner, type Spinner } from "./spinner.js";
 import { progressLabel } from "./status-view.js";
 import { pull, sync, type SyncDeps } from "./sync.js";
@@ -69,7 +69,7 @@ export async function runSyncCommand(root: string, opts: { allowMassDelete?: boo
         const pulled = await pull(root, cfg, deps);
         sp.stop();
         summarize("pulled", pulled, root);
-        report?.logSummaryTo((l) => console.log(style.dim(l)));
+        logDebugSummary(report, (l) => console.log(style.dim(l)));
         await postSyncNudge(root, pulled, cfg);
         return;
       }
@@ -81,7 +81,7 @@ export async function runSyncCommand(root: string, opts: { allowMassDelete?: boo
           ? `${style.bold("pushed")} ${style.sym.arrow} sequence ${style.cyan(String(pushedSequence))}`
           : `${style.bold("push")}: already in sync ${style.dim(`(sequence ${pushedSequence})`)}`
       );
-      report?.logSummaryTo((l) => console.log(style.dim(l)));
+      logDebugSummary(report, (l) => console.log(style.dim(l)));
       await postSyncNudge(root, pulled, cfg);
     });
   } catch (e) {
