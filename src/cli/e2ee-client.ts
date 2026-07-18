@@ -23,7 +23,7 @@ import type { AccountKeysDTO } from "./e2ee-remote.js";
 import { E2eeRemote } from "./e2ee-remote.js";
 import { hasDevice, keystorePinStore, loadDevice, saveDevice, saveMasterKey, saveRecoveryKey } from "./e2ee-keystore.js";
 import { loadConfig, type WorkspaceConfig } from "./config.js";
-import { loadCredentials, saveCredentials } from "./credentials.js";
+import { credentialsForStrictFlow, loadCredentials, saveCredentials, type CredentialLoadResult } from "./credentials.js";
 import type { SyncDeps } from "./sync.js";
 
 const ACCOUNT_ID_RE = /^acct_[a-z0-9]+$/i; // grammar gate before trusting the value (D7)
@@ -194,13 +194,13 @@ export async function enrollViaPairing(remoteUrl: string, fullToken: string, now
 
 /** Recover this machine from the phrase (D10): needs an existing device credential
  *  (the caller logged in first); RK unlocks MK + RSK to self-admit. */
-export async function enrollViaRecovery(phrase: string, now: number): Promise<{ accountId: string; deviceId: string }> {
-  return enrollViaPrevalidatedRecovery(await phraseToRk(phrase), now);
+export async function enrollViaRecovery(phrase: string, now: number, loaded?: CredentialLoadResult): Promise<{ accountId: string; deviceId: string }> {
+  return enrollViaPrevalidatedRecovery(await phraseToRk(phrase), now, loaded);
 }
 
 /** Recovery continuation for callers that already passed the local BIP39 gate. */
-export async function enrollViaPrevalidatedRecovery(rk: Uint8Array, now: number): Promise<{ accountId: string; deviceId: string }> {
-  const creds = await loadCredentials();
+export async function enrollViaPrevalidatedRecovery(rk: Uint8Array, now: number, loaded?: CredentialLoadResult): Promise<{ accountId: string; deviceId: string }> {
+  const creds = credentialsForStrictFlow(loaded ?? await loadCredentials());
   if (!creds?.accountId) throw new Error("`rbox key recover` needs an account login first — run `rbox login` (web/device-code), then recover.");
   const api = new RboxApi(creds.remoteUrl, creds.token, "", "");
   const dto = await api.getAccountKeys();
@@ -300,12 +300,12 @@ async function ensureSecrets(api: RboxApi, accountId: string): Promise<DeviceSec
  * marker / no enrollment → throw before any sync. Returns the cfg (with the
  * blob-encryption KEK set from the frozen write context) and the E2eeRemote.
  */
-export async function buildAuthedRemote(root: string, now: () => number = Date.now, warningSink?: (line: string) => void): Promise<{ cfg: WorkspaceConfig; deps: SyncDeps; remote: E2eeRemote }> {
+export async function buildAuthedRemote(root: string, now: () => number = Date.now, warningSink?: (line: string) => void, loaded?: CredentialLoadResult): Promise<{ cfg: WorkspaceConfig; deps: SyncDeps; remote: E2eeRemote }> {
   const cfg = await loadConfig(root);
   if ((cfg as { schema?: string }).schema !== "e2ee/v1") {
     throw new Error("this workspace predates full E2EE — re-run `rbox init` to re-enroll (greenfield; dev data is wiped).");
   }
-  const creds = await loadCredentials();
+  const creds = credentialsForStrictFlow(loaded ?? await loadCredentials());
   if (!creds) throw new Error("not logged in — run `rbox login`");
   if (!creds.accountId) throw new Error("credential has no account — re-run `rbox login`");
 

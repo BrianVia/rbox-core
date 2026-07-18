@@ -8,7 +8,7 @@
  */
 import os from "node:os";
 import path from "node:path";
-import { loadCredentials, type Credentials } from "./credentials.js";
+import { credentialsForStrictFlow, loadCredentials, type CredentialLoadResult, type Credentials } from "./credentials.js";
 import { createRemoteWorkspace } from "./remote.js";
 import { loadConfig, loadConfigIfPresent, loadRawState, resetSyncState, saveConfig, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
@@ -144,9 +144,17 @@ export function writeGuidedGenesisPullNotice(
 
 export async function runInit(
   flags: Record<string, string>,
-  opts: { cwd: string; defaultRemote: string; summary?: boolean; guidedSetup?: boolean; resetConsent?: ResetConsentWitness }
+  opts: {
+    cwd: string;
+    defaultRemote: string;
+    summary?: boolean;
+    guidedSetup?: boolean;
+    resetConsent?: ResetConsentWitness;
+    credentialResult?: CredentialLoadResult;
+  }
 ): Promise<InitOutcome | undefined> {
-  const creds = await loadCredentials();
+  const credentialResult = opts.credentialResult ?? await loadCredentials();
+  const creds = credentialsForStrictFlow(credentialResult);
   const interactive = process.stdin.isTTY === true && flags["no-interactive"] !== "true";
 
   let gathered = flags;
@@ -166,6 +174,7 @@ export async function runInit(
     newDevice: gathered["new-device"] === "true",
     guidedSetup: opts.guidedSetup === true,
     resetConsent: opts.resetConsent,
+    credentialResult,
   });
 }
 
@@ -252,7 +261,8 @@ export async function continueInitWithPrecreatedWorkspace(
   deps: PrecreatedContinuationDeps = {}
 ): Promise<InitOutcome | undefined> {
   try {
-    const creds = await (deps.loadCredentials ?? loadCredentials)();
+    const credentialResult = await (deps.loadCredentials ?? loadCredentials)();
+    const creds = credentialsForStrictFlow(credentialResult);
     const plan = resolveInitPlan({ flags, cwd: opts.cwd, creds, interactive: false, defaultRemote: opts.defaultRemote });
     if (isInitError(plan)) {
       fail(plan.message);
@@ -272,6 +282,7 @@ export async function continueInitWithPrecreatedWorkspace(
         newDevice: flags["new-device"] === "true",
         guidedSetup: opts.guidedSetup === true,
         resetConsent: continuation.resetConsent,
+        credentialResult,
       },
       continuation
     );
@@ -283,7 +294,14 @@ export async function continueInitWithPrecreatedWorkspace(
 async function executeInitPlan(
   plan: InitPlan,
   bootstrapSecret: string | undefined,
-  opts: { summary: boolean; recoveryKit: RecoveryKitOptions; newDevice: boolean; guidedSetup: boolean; resetConsent?: ResetConsentWitness },
+  opts: {
+    summary: boolean;
+    recoveryKit: RecoveryKitOptions;
+    newDevice: boolean;
+    guidedSetup: boolean;
+    resetConsent?: ResetConsentWitness;
+    credentialResult?: CredentialLoadResult;
+  },
   continuation?: PrecreatedWorkspaceContinuation
 ): Promise<InitOutcome | undefined> {
   // 1. Auth: bootstrap-login works headlessly (one-shot secret); device-code is
@@ -293,7 +311,12 @@ async function executeInitPlan(
   } else if (plan.auth === "need-interactive-login") {
     await login(plan.remoteUrl, undefined);
   }
-  const creds = await loadCredentials();
+  // "have" was authorized by the caller's typed observation. Login is the one
+  // transition that intentionally replaces it by saving new credentials.
+  const loadedCredentials = plan.auth === "have" && opts.credentialResult
+    ? opts.credentialResult
+    : await loadCredentials();
+  const creds = credentialsForStrictFlow(loadedCredentials);
   if (!creds) {
     fail("login did not produce a credential — aborting init.");
     return undefined;
@@ -387,7 +410,7 @@ async function executeInitPlan(
       process.exitCode = 1;
       return undefined;
     }
-    const { cfg: authed, deps } = await buildAuthedRemote(plan.root);
+    const { cfg: authed, deps } = await buildAuthedRemote(plan.root, Date.now, undefined, loadedCredentials);
     deps.syncMutex = syncMutex;
     if (plan.firstSync === "push") {
       const sp = spinner("publishing initial snapshot — scanning files");

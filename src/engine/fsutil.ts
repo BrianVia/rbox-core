@@ -20,6 +20,10 @@ export async function writeFileAtomic(
     beforeRename?: () => boolean | Promise<boolean>;
     mode?: number;
     flag?: string;
+    /** Opt-in exact mode enforcement for secret material; ordinary callers keep umask semantics. */
+    exactMode?: boolean;
+    /** Internal fault-observation hook used by persistence tests. */
+    onStep?: (step: "temp-opened" | "temp-written" | "temp-synced" | "temp-closed" | "before-rename" | "after-rename") => void | Promise<void>;
   } = {}
 ): Promise<void> {
   const dir = path.dirname(absPath);
@@ -28,10 +32,15 @@ export async function writeFileAtomic(
   try {
     try {
       fh = await fs.open(tmp, opts.flag ?? "w", opts.mode);
+      await opts.onStep?.("temp-opened");
       await fh.writeFile(data);
+      await opts.onStep?.("temp-written");
+      if (opts.exactMode && opts.mode !== undefined) await fh.chmod(opts.mode);
       await fh.sync(); // durability: bytes hit disk before the rename publishes them
+      await opts.onStep?.("temp-synced");
     } finally {
       await fh?.close();
+      await opts.onStep?.("temp-closed");
     }
   } catch (error) {
     await fs.rm(tmp, { force: true }).catch(() => {});
@@ -49,7 +58,9 @@ export async function writeFileAtomic(
     return;
   }
   try {
+    await opts.onStep?.("before-rename");
     await fs.rename(tmp, absPath);
+    await opts.onStep?.("after-rename");
   } catch (error) {
     await fs.rm(tmp, { force: true }).catch(() => {});
     throw error;

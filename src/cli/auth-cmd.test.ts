@@ -418,6 +418,11 @@ test("bootstrap login success prints the shared workspace step", async () => {
     throw new Error(`unexpected fetch: ${url}`);
   }) as typeof fetch;
 
+  const credentialFile = path.join(home, ".rbox", "credentials.json");
+  await fs.mkdir(path.dirname(credentialFile), { mode: 0o700 });
+  const corruptEvidence = Buffer.from("{direct-login-corrupt");
+  await fs.writeFile(credentialFile, corruptEvidence, { mode: 0o600 });
+
   try {
     await login("https://api.test", "bootstrap-secret");
   } finally {
@@ -426,6 +431,10 @@ test("bootstrap login success prints the shared workspace step", async () => {
 
   expect(output.filter((line) => line === WORKSPACE_SYNC_NEXT_STEP)).toHaveLength(1);
   expect(errors).toContain("account already set up — enroll this machine with `rbox pair` from an enrolled machine, or run `rbox key recover`.");
+  expect(JSON.parse(await fs.readFile(credentialFile, "utf8"))).toMatchObject({ v: 1, token: "tok", deviceId: "dev_bootstrap" });
+  const quarantine = (await fs.readdir(path.dirname(credentialFile))).find((name) => name.startsWith("credentials.json.corrupt-"));
+  expect(quarantine).toBeDefined();
+  expect(await fs.readFile(path.join(path.dirname(credentialFile), quarantine!))).toEqual(corruptEvidence);
 });
 
 describe("device-code post-approval encryption handling", () => {

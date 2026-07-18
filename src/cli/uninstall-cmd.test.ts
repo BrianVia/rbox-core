@@ -140,3 +140,18 @@ test("not-at-risk uninstall prints no keystore warning", async () => {
   expect(lines.join("\n")).not.toContain("WARNING:");
   expect(lines.join("\n")).not.toContain("rbox key backup");
 });
+
+test("unknown credential risk warns explicitly and uninstall continues", async () => {
+  let removed = false;
+  await uninstallCmd({ yes: "true" }, {
+    home,
+    rboxHome,
+    log: (line) => lines.push(line),
+    keystoreBackupAtRisk: async () => "unknown",
+    readDesiredDaemonRows: async () => [],
+    disableAutostart: async () => {},
+    rm: async () => { removed = true; },
+  });
+  expect(lines.join("\n")).toContain("credential degraded; backup risk unknown");
+  expect(removed).toBe(true);
+});

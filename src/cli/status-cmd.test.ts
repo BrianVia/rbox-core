@@ -246,6 +246,19 @@ test("status text and JSON expose only closed locking health", async () => {
   });
 });
 
+test("status loads credentials once and continues locally with credential-degraded", async () => {
+  let loads = 0;
+  const d = cleanScanDeps();
+  d.loadCredentials = async () => {
+    loads++;
+    return { state: "invalid-environment", variable: "RBOX_API", detail: "RBOX_API must be absolute" };
+  };
+  const text = await captureStatusWithDeps({}, d);
+  expect(loads).toBe(1);
+  expect(text).toContain("Credential degraded");
+  expect(text).toContain("invalid-environment");
+});
+
 test("status exposes a durable starvation warning without holder details", async () => {
   await fs.mkdir(path.join(root, ".rbox", "state"), { recursive: true });
   await fs.writeFile(path.join(root, ".rbox", "state", "lock-starvation.json"), JSON.stringify({

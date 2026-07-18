@@ -19,6 +19,7 @@ import { fail, setJsonErrorMode } from "./style.js";
 const origFetch = globalThis.fetch;
 const origStdout = process.stdout.write.bind(process.stdout);
 const origStderr = process.stderr.write.bind(process.stderr);
+const origHome = process.env.HOME;
 
 let tmp: string;
 const STATUS_NOW = Date.parse("2026-07-04T12:00:00Z");
@@ -113,6 +114,8 @@ function trustedActivity(ageMs: number, localOverrides: Partial<NonNullable<Daem
 beforeEach(async () => {
   tmp = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-json-output-"));
   process.env.RBOX_HOME = path.join(tmp, "home");
+  process.env.HOME = path.join(tmp, "home");
+  await fs.mkdir(process.env.HOME, { recursive: true, mode: 0o700 });
   // The crypto DTO asserts jobsRun/workerExecutions, which are process-global —
   // crypto-pool tests running earlier in the same process leave them non-zero.
   const { __cryptoPoolTestHooks } = await import("../engine/crypto-pool.js");
@@ -131,6 +134,8 @@ afterEach(async () => {
   delete process.env.RBOX_DEVICE_ID;
   delete process.env.RBOX_ACCOUNT_ID;
   delete process.env.RBOX_HOME;
+  if (origHome === undefined) delete process.env.HOME;
+  else process.env.HOME = origHome;
   await fs.rm(tmp, { recursive: true, force: true });
 });
 
@@ -161,6 +166,7 @@ test("status --json emits JSON and uses shellStateOf health values", async () =>
     remote: null,
     trash: null,
     account: { plan: null, usedBytes: null, capBytes: null },
+    credential: { state: "absent" },
     crypto: { state: "idle", workers: 0, jobsRun: 0, workerExecutions: 0 },
     git: { deferrals: [], deferredRepos: [] },
   });

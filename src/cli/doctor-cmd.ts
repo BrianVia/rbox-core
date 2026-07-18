@@ -4,7 +4,7 @@ import path from "node:path";
 import { buildIgnoreMatcher, checkoutTransactionCapability, cryptoPoolStatus, ManifestChainError, MAX_MANIFEST_DELTA_CHAIN, type IgnoreMatcher } from "../engine/index.js";
 import { loadActivity, type DaemonActivity } from "./activity.js";
 import { loadConfig, loadState, syncStreamId, type WorkspaceConfig } from "./config.js";
-import { loadCredentials, type Credentials } from "./credentials.js";
+import { credentialFailureMessage, loadCredentials, type CredentialLoadResult, type Credentials } from "./credentials.js";
 import { currentWorkspaceId, daemonBindingStatus, readDaemonBindingRecord, readMergedDaemonLogTail } from "./daemon-control.js";
 import { enrolledDeviceId, loadDevice } from "./e2ee-keystore.js";
 import { loadMetrics, type SyncMetrics } from "./metrics.js";
@@ -73,6 +73,7 @@ export interface DoctorContext {
   root: string;
   cfg: WorkspaceConfig;
   creds?: Credentials;
+  credentialResult?: CredentialLoadResult;
   checks: DoctorChecks;
   workspaceShape: WorkspaceShape;
   daemonStale: boolean;
@@ -451,11 +452,14 @@ async function checkLocking(root: string): Promise<DoctorCheck> {
 
 export async function collectDoctorContext(root: string): Promise<DoctorContext> {
   const rawCfg = await loadConfig(root);
-  const creds = await loadCredentials();
+  const loaded = await loadCredentials();
+  const creds = loaded.state === "valid" ? loaded.credentials : undefined;
   const cfg = { ...rawCfg, remoteUrl: creds?.remoteUrl ?? rawCfg.remoteUrl };
   const daemon = checkDaemon(root, cfg);
   const [credentials, enrollment, device, remote, version, state, locking, git, shape, chain] = await Promise.all([
-    checkCredentials(creds),
+    loaded.state !== "valid" && loaded.state !== "absent"
+      ? Promise.resolve({ ok: false, label: "credentials", message: `credential-degraded: ${credentialFailureMessage(loaded)}`, hint: "repair the credential source, then retry" })
+      : checkCredentials(creds),
     checkEnrollment(creds),
     checkDeviceIdentity(creds, cfg),
     checkRemote(creds, cfg),
@@ -464,7 +468,7 @@ export async function collectDoctorContext(root: string): Promise<DoctorContext>
     checkLocking(root),
     checkGitCapability(root),
     workspaceShape(root, cfg),
-    buildAuthedRemote(root).then((built) => checkManifestChain(built.remote)).catch((error: unknown) => ({
+    buildAuthedRemote(root, Date.now, undefined, loaded).then((built) => checkManifestChain(built.remote)).catch((error: unknown) => ({
       ok: false, label: "manifest chain", message: error instanceof Error ? error.message : String(error),
     })),
   ]);
@@ -472,6 +476,7 @@ export async function collectDoctorContext(root: string): Promise<DoctorContext>
     root,
     cfg,
     creds,
+    credentialResult: loaded,
     daemonStale: daemon.stale,
     workspaceShape: shape,
     checks: { credentials, enrollment, device, daemon: daemon.check, remote, version, state, crypto: checkCryptoWorkers(), locking, git, chain },
@@ -617,8 +622,12 @@ function printDiagnosticsPreview(bundle: DiagnosticsBundle): void {
   console.log("--- end diagnostics preview ---");
 }
 
-async function uploadDiagnostics(creds: Credentials | undefined, bundle: DiagnosticsBundle): Promise<void> {
-  if (!creds?.token) throw new Error("not logged in — run `rbox login` before uploading diagnostics");
+async function uploadDiagnostics(loaded: CredentialLoadResult, bundle: DiagnosticsBundle): Promise<void> {
+  if (loaded.state !== "valid") {
+    if (loaded.state === "absent") throw new Error("not logged in — run `rbox login` before uploading diagnostics");
+    throw new Error(credentialFailureMessage(loaded));
+  }
+  const creds = loaded.credentials;
   const body = JSON.stringify(bundle, null, 2);
   const res = await fetch(`${creds.remoteUrl}/v1/diagnostics`, {
     method: "POST",
@@ -639,7 +648,12 @@ export async function doctorCmd(root: string, opts: DoctorCmdOptions): Promise<v
   if (opts.report) {
     const bundle = await buildDiagnosticsBundle(ctx);
     if (diagnosticsUploadEnabled(opts)) {
-      if (await presentDiagnosticsPreview(bundle, { yes: opts.yes })) await uploadDiagnostics(ctx.creds, bundle);
+      if (await presentDiagnosticsPreview(bundle, { yes: opts.yes })) {
+        const loaded = ctx.credentialResult ?? (ctx.creds
+          ? { state: "valid" as const, source: "disk" as const, credentials: { v: 1, ...ctx.creds }, legacy: false, extensions: {} }
+          : { state: "absent" as const, path: "credentials.json" });
+        await uploadDiagnostics(loaded, bundle);
+      }
       else console.log("diagnostics report not uploaded");
     } else {
       printDiagnosticsPreview(bundle);

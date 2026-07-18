@@ -6,7 +6,7 @@ import { RBOX_VERSION } from "./version.js";
 import { fetchAccountSummary, formatAccountSummary } from "./account-cmd.js";
 import { readAccountProfile } from "./account-profile.js";
 import { DEFERRAL_LANES, loadConfig, loadState, repoRecordsForState, syncStreamId, type GitDeferral, type SyncState, type WorkspaceConfig } from "./config.js";
-import { loadCredentials, type Credentials } from "./credentials.js";
+import { loadCredentials, type CredentialLoadResult, type Credentials } from "./credentials.js";
 import { daemonBindingStatus, readDaemonPidRecord } from "./daemon-control.js";
 import { emitJson } from "./json.js";
 import { loadMetrics } from "./metrics.js";
@@ -123,10 +123,15 @@ const defaultStatusDeps: StatusCmdDeps = {
 const LOCAL_TRUST_MS = 60_000;
 
 async function cachedAccountSummary(
-  creds: Credentials | undefined,
+  loaded: CredentialLoadResult,
   identityLookup: (accountId: string) => Promise<BriefIdentitySource | undefined>
 ): Promise<BriefAccountSummary> {
-  if (!creds) return { state: "signed-out" };
+  if (loaded.state === "absent") return { state: "signed-out" };
+  if (loaded.state !== "valid") {
+    const where = loaded.state === "invalid-environment" ? loaded.variable : loaded.path;
+    return { state: "credential-degraded", reason: `${loaded.state}: ${where}` };
+  }
+  const creds = loaded.credentials;
   if (!creds.accountId) return { state: "unavailable" };
   const identity = await identityLookup(creds.accountId);
   return {
@@ -199,9 +204,10 @@ async function fetchRemoteSequence(
   }
 }
 
-async function fetchStatusAccountJson(creds: Credentials | undefined, timeoutMs = 3500): Promise<StatusAccountJson> {
+async function fetchStatusAccountJson(loaded: CredentialLoadResult, timeoutMs = 3500): Promise<StatusAccountJson> {
   const unavailable = { plan: null, usedBytes: null, capBytes: null };
-  if (!creds) return unavailable;
+  if (loaded.state !== "valid") return unavailable;
+  const creds = loaded.credentials;
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
@@ -219,6 +225,12 @@ async function fetchStatusAccountJson(creds: Credentials | undefined, timeoutMs 
   } finally {
     clearTimeout(timer);
   }
+}
+
+function credentialStatusJson(loaded: CredentialLoadResult): Record<string, unknown> {
+  if (loaded.state === "valid" || loaded.state === "absent") return { state: loaded.state };
+  if (loaded.state === "invalid-environment") return { state: "credential-degraded", reason: loaded.state, variable: loaded.variable };
+  return { state: "credential-degraded", reason: loaded.state, path: loaded.path };
 }
 
 function statusHealthJson(input: {
@@ -308,7 +320,8 @@ export async function statusCmdWithDeps(
   deps: StatusCmdDeps = defaultStatusDeps
 ): Promise<StatusCmdResult> {
   assertPresentationFlags(opts);
-  const creds = await (deps.loadCredentials ?? loadCredentials)().catch(() => undefined);
+  const loadedCredentials = await (deps.loadCredentials ?? loadCredentials)();
+  const creds = loadedCredentials.state === "valid" ? loadedCredentials.credentials : undefined;
   const rawCfg = await loadConfig(root);
   const cfg = { ...rawCfg, remoteUrl: creds?.remoteUrl ?? rawCfg.remoteUrl };
   const daemonBinding = deps.daemonBindingStatus(root, cfg.remoteWorkspaceId);
@@ -333,6 +346,7 @@ export async function statusCmdWithDeps(
         halted: true,
         reason,
         daemon: { running: bg.running, pid: bg.pid ?? null },
+        credential: credentialStatusJson(loadedCredentials),
       });
       return { daemonRunning: bg.running };
     }
@@ -342,7 +356,7 @@ export async function statusCmdWithDeps(
         kind: "reset-halt",
         workspaceLabel,
         daemonRunning: bg.running,
-        account: await cachedAccountSummary(creds, deps.readBriefIdentity ?? readCachedBriefIdentity),
+        account: await cachedAccountSummary(loadedCredentials, deps.readBriefIdentity ?? readCachedBriefIdentity),
       });
       for (const line of rendered.lines) console.log(line);
       return { daemonRunning: rendered.daemonRunning };
@@ -351,6 +365,10 @@ export async function statusCmdWithDeps(
       ? `${style.cyan(cfg.name)} ${style.dim("@")} ${root} ${style.dim(`(${shortWorkspaceId(cfg.remoteWorkspaceId)})`)}`
       : `${style.cyan(cfg.remoteWorkspaceId)} ${style.dim("@")} ${root}`;
     console.log(`${style.bold("workspace")} ${wsLabel} ${style.dim(`· rbox ${RBOX_VERSION}`)}`);
+    if (loadedCredentials.state !== "valid" && loadedCredentials.state !== "absent") {
+      const diagnostic = credentialStatusJson(loadedCredentials);
+      console.log(`  ${style.yellow(`credential-degraded: ${String(diagnostic.reason)} (${String(diagnostic.variable ?? diagnostic.path)})`)}`);
+    }
     console.log(`  ${style.yellow(`sync halted: a state-recovery record can't be processed (${reason}). Files on disk are untouched; run \`rbox doctor reset-journal\`.`)}`);
     console.log(`  ${style.dim("background sync:")} ${daemonStale
       ? style.yellow(`running but bound to a previous workspace (pid ${alive.pid})`)
@@ -358,13 +376,13 @@ export async function statusCmdWithDeps(
     return { daemonRunning: bg.running };
   }
 
-  const accountSummaryP = opts.verbose ? fetchAccountSummary() : Promise.resolve(null);
+  const accountSummaryP = opts.verbose ? fetchAccountSummary(3500, loadedCredentials) : Promise.resolve(null);
   let state = await loadState(root, syncStreamId(cfg));
 
   const activityP = daemonStale ? Promise.resolve(undefined) : loadActivity(root);
   const trashP = trashStats(root).catch(() => undefined);
   const lockingP = (deps.readLockingHealth ?? readLockingHealth)(root);
-  const accountJsonP = opts.json ? fetchStatusAccountJson(creds) : Promise.resolve(null);
+  const accountJsonP = opts.json ? fetchStatusAccountJson(loadedCredentials) : Promise.resolve(null);
   const rawActivity = await activityP;
   const attributionNow = deps.now();
   const attributeActivity = (base: SyncState) =>
@@ -572,6 +590,7 @@ export async function statusCmdWithDeps(
         : {}),
       trash: trash && trash.files > 0 ? { bytes: trash.bytes, count: trash.files } : null,
       account: accountJson,
+      credential: credentialStatusJson(loadedCredentials),
       crypto,
       git: {
         ...(gitCapability ? { capability: gitCapability } : {}),
@@ -608,7 +627,7 @@ export async function statusCmdWithDeps(
 
   if (!opts.verbose) {
     const account = await cachedAccountSummary(
-      creds,
+      loadedCredentials,
       deps.readBriefIdentity ?? readCachedBriefIdentity
     );
     const updateState = await readUpdateCheckState();

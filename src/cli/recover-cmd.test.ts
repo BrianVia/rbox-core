@@ -16,6 +16,14 @@ const cfg: WorkspaceConfig = {
   encrypted: true,
 };
 
+const validCredentials = async () => ({
+  state: "valid" as const,
+  source: "disk" as const,
+  credentials: { v: 1 as const, token: "tok", deviceId: "dev_1", remoteUrl: "https://api.test", accountId: "acct_1" },
+  legacy: false,
+  extensions: {},
+});
+
 const pin = (seq: number, hash = `${seq}`.padStart(64, "0")): HeadPin => ({
   commitSeq: seq,
   commitHash: hash,
@@ -26,6 +34,17 @@ const pin = (seq: number, hash = `${seq}`.padStart(64, "0")): HeadPin => ({
 });
 
 describe("recover workspace command", () => {
+  test("credential degradation fails closed before remote construction or mutation", async () => {
+    let built = 0;
+    await expect(recoverWorkspaceCmd("/tmp/ws", { yes: true }, {
+      findRoot: async () => "/tmp/ws",
+      loadConfig: async () => cfg,
+      loadCredentials: async () => ({ state: "unsupported-version", path: "/test/credentials.json", version: 2 }),
+      buildAuthedRemote: async () => { built++; throw new Error("must not build"); },
+    })).rejects.toThrow(/unsupported-version/);
+    expect(built).toBe(0);
+  });
+
   test("chain failure retains the newly verified head and requires suffix consent", async () => {
     let currentPin: HeadPin | undefined = pin(4);
     let confirmations = 0;
@@ -34,7 +53,7 @@ describe("recover workspace command", () => {
     await recoverWorkspaceCmd("/tmp/ws", { yes: true }, {
       findRoot: async () => "/tmp/ws",
       loadConfig: async () => cfg,
-      loadCredentials: async () => ({ token: "tok", deviceId: "dev_1", remoteUrl: "https://api.test", accountId: "acct_1" }),
+      loadCredentials: validCredentials,
       pinStore: () => ({
         load: async () => currentPin,
         save: async (next) => { currentPin = next; },
@@ -62,7 +81,7 @@ describe("recover workspace command", () => {
     await recoverWorkspaceCmd("/tmp/ws", { repairChain: true }, {
       findRoot: async () => "/tmp/ws",
       loadConfig: async () => cfg,
-      loadCredentials: async () => ({ token: "tok", deviceId: "dev_1", remoteUrl: "https://api.test", accountId: "acct_1" }),
+      loadCredentials: validCredentials,
       pinStore: () => ({ load: async () => currentPin, save: async (next) => { currentPin = next; }, clear: async () => { currentPin = undefined; } }),
       buildAuthedRemote: async () => ({ cfg, deps: {}, remote: {} as never }),
       beginReport: () => ({ logSummaryTo: () => {} } as never),
@@ -85,7 +104,7 @@ describe("recover workspace command", () => {
     await recoverWorkspaceCmd("/tmp/ws", { yes: true }, {
       findRoot: async () => "/tmp/ws",
       loadConfig: async () => cfg,
-      loadCredentials: async () => ({ token: "tok", deviceId: "dev_1", remoteUrl: "https://api.test", accountId: "acct_1" }),
+      loadCredentials: validCredentials,
       pinStore: (accountId, workspaceId) => ({
         load: async () => undefined,
         save: async () => {},
@@ -119,7 +138,7 @@ describe("recover workspace command", () => {
     await recoverWorkspaceCmd("/tmp/ws", { yes: true }, {
       findRoot: async () => "/tmp/ws",
       loadConfig: async () => cfg,
-      loadCredentials: async () => ({ token: "tok", deviceId: "dev_1", remoteUrl: "https://api.test", accountId: "acct_1" }),
+      loadCredentials: validCredentials,
       pinStore: () => ({
         load: async () => currentPin,
         save: async (next) => {
@@ -169,7 +188,7 @@ describe("recover workspace command", () => {
     await expect(recoverWorkspaceCmd("/tmp/ws", { yes: true }, {
       findRoot: async () => "/tmp/ws",
       loadConfig: async () => cfg,
-      loadCredentials: async () => ({ token: "tok", deviceId: "dev_1", remoteUrl: "https://api.test", accountId: "acct_1" }),
+      loadCredentials: validCredentials,
       pinStore: () => ({
         load: async () => currentPin,
         save: async (next) => { currentPin = next; },
@@ -199,7 +218,7 @@ describe("recover workspace command", () => {
     await expect(recoverWorkspaceCmd("/tmp/ws", { yes: true }, {
       findRoot: async () => "/tmp/ws",
       loadConfig: async () => cfg,
-      loadCredentials: async () => ({ token: "tok", deviceId: "dev_1", remoteUrl: "https://api.test", accountId: "acct_1" }),
+      loadCredentials: validCredentials,
       pinStore: () => ({
         load: async () => localPin,
         save: async () => {},
@@ -229,7 +248,7 @@ describe("recover workspace command", () => {
     await recoverWorkspaceCmd("/tmp/ws", { yes: true }, {
       findRoot: async () => "/tmp/ws",
       loadConfig: async () => cfg,
-      loadCredentials: async () => ({ token: "tok", deviceId: "dev_1", remoteUrl: "https://api.test", accountId: "acct_1" }),
+      loadCredentials: validCredentials,
       pinStore: () => ({ load: async () => undefined, save: async () => {}, clear: async () => {} }),
       buildAuthedRemote: async () => ({ cfg, deps: {}, remote: {} as never }),
       beginReport: () => ({ logSummaryTo: () => {} } as never),

@@ -267,7 +267,13 @@ test("legacy picker bit-identity matrix drives both init and track callers", asy
     })) as never;
     try {
       const result = await track(root, {}, "https://api.test", {
-        loadCredentials: (async () => ({ token: c.token, remoteUrl: "https://api.test", deviceId: "dev", accountId: "acct" })) as never,
+        loadCredentials: (async () => ({
+          state: "valid" as const,
+          source: "disk" as const,
+          credentials: { v: 1 as const, token: c.token, remoteUrl: "https://api.test", deviceId: "dev", accountId: "acct" },
+          legacy: false,
+          extensions: {},
+        })) as never,
         isInteractive: () => true,
         promptSelect: (async () => "existing") as never,
         promptWorkspacePick: trackPicker,

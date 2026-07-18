@@ -29,7 +29,7 @@ import { EXISTING_ACCOUNT_ENROLLMENT_MESSAGE, login, redeemPair, runGenesisEnrol
 import { enrollViaPrevalidatedRecovery, PairingTokenShapeError, parsePairingToken } from "./e2ee-client.js";
 import { phraseToRk } from "../engine/e2ee/index.js";
 import { enableAutostart, startDaemonAndRecordDesired } from "./autostart-cmd.js";
-import { loadCredentials } from "./credentials.js";
+import { credentialsForStrictFlow, loadCredentials, type CredentialLoadResult } from "./credentials.js";
 import { loadConfigIfPresent, loadRawState, syncStreamId } from "./config.js";
 import { hasDevice } from "./e2ee-keystore.js";
 import { createRemoteWorkspace, RboxApi } from "./remote.js";
@@ -94,7 +94,7 @@ export function startSyncActions(choice: StartSyncChoice): { startDaemon: boolea
 /** Loop Step 2 only for explicit pre-init navigation; consume preselection once. */
 export async function runWorkspaceStepLoop(
   opts: { cwd: string; defaultRemote: string },
-  setupOpts: { noSync?: boolean; preselectedKind?: WorkspaceKind; header: string },
+  setupOpts: { noSync?: boolean; preselectedKind?: WorkspaceKind; header: string; credentialResult?: CredentialLoadResult },
   runStep: typeof stepWorkspace = stepWorkspace
 ): Promise<{ workspaceId: string; deviceId: string; root: string } | undefined> {
   let preselectedKind = setupOpts.preselectedKind;
@@ -169,7 +169,10 @@ export async function runSetup(opts: {
   // new/existing picker as if the user had never signed in.
   let syncDisabledUntilSubscribe = false;
   const viaUntrackedMenu = opts.viaUntrackedMenu === true;
-  const accountId = viaUntrackedMenu ? undefined : await enrolledAccountId();
+  const initialCredentials = viaUntrackedMenu ? undefined : await loadCredentials();
+  const initialCreds = initialCredentials ? credentialsForStrictFlow(initialCredentials) : undefined;
+  let workspaceCredentialResult = initialCredentials;
+  const accountId = viaUntrackedMenu ? undefined : await enrolledAccountId(initialCredentials);
   const accountSkipped = viaUntrackedMenu || accountId !== undefined;
   // Via the untracked menu, enrollment was verified by resolveBareRboxTarget and
   // the menu printed its own banner — skip both.
@@ -179,13 +182,32 @@ export async function runSetup(opts: {
       await writeEnrolledSkipNotice(accountId);
     } else {
       process.stderr.write(`\n── ${e.bold(stepHeader(1, 3, "Account"))} ${HR.slice(0, 46)}\n`);
-      const hasCreds = Boolean((await loadCredentials())?.accountId);
-      const result = hasCreds ? { ok: await resolveEnrollment(opts.defaultRemote), created: false } : await stepAccount(opts.defaultRemote);
+      const hasCreds = Boolean(initialCreds?.accountId);
+      const result = hasCreds
+        ? {
+            ok: await resolveEnrollment(opts.defaultRemote, { loadCredentials: async () => initialCredentials! }),
+            created: false,
+          }
+        : await stepAccount(opts.defaultRemote);
       if (!result.ok) return;
       if (result.created) {
-        syncDisabledUntilSubscribe = !(await startTrialAfterAccountCreation());
+        const enrolledCredentials = await loadCredentials();
+        credentialsForStrictFlow(enrolledCredentials);
+        workspaceCredentialResult = enrolledCredentials;
+        syncDisabledUntilSubscribe = !(await startTrialAfterAccountCreation(enrolledCredentials));
+      } else {
+        // Account authorization/enrollment may have completed a login or pairing
+        // save. Observe that transition once, then carry the result through every
+        // following workspace mutation.
+        workspaceCredentialResult = await loadCredentials();
+        credentialsForStrictFlow(workspaceCredentialResult);
       }
     }
+  }
+
+  if (!workspaceCredentialResult) {
+    workspaceCredentialResult = await loadCredentials();
+    credentialsForStrictFlow(workspaceCredentialResult);
   }
 
   // Step 2 · Workspace — bind a directory + run the initial populate-sync.
@@ -194,6 +216,7 @@ export async function runSetup(opts: {
     noSync: syncDisabledUntilSubscribe,
     preselectedKind: opts.preselectedWorkspaceKind,
     header: shortFlow ? stepHeader(1, 2, "Workspace") : stepHeader(2, 3, "Workspace"),
+    credentialResult: workspaceCredentialResult,
   });
   if (!outcome) return;
 
@@ -243,8 +266,8 @@ export async function runSetup(opts: {
 }
 
 /** The enrolled account id, or undefined when signed out / not enrolled. */
-export async function enrolledAccountId(): Promise<string | undefined> {
-  const creds = await loadCredentials();
+export async function enrolledAccountId(loaded?: CredentialLoadResult): Promise<string | undefined> {
+  const creds = credentialsForStrictFlow(loaded ?? await loadCredentials());
   return creds?.accountId && (await hasDevice(creds.accountId)) ? creds.accountId : undefined;
 }
 
@@ -303,6 +326,7 @@ interface WizardRecoveryDeps {
   enroll?: typeof enrollViaPrevalidatedRecovery;
   writeStderr?: (text: string) => void;
   now?: () => number;
+  loadedCredentials?: CredentialLoadResult;
 }
 
 /** Validate the phrase locally up to three times, then make one continuation attempt. */
@@ -321,7 +345,7 @@ export async function recoverInWizard(deps: WizardRecoveryDeps = {}): Promise<"e
       continue;
     }
     try {
-      await enroll(recoveryKey, (deps.now ?? Date.now)());
+      await enroll(recoveryKey, (deps.now ?? Date.now)(), deps.loadedCredentials);
       return "enrolled";
     } catch (error) {
       writeStderr(`${e.yellow(error instanceof Error ? error.message : String(error))}\n`);
@@ -385,7 +409,7 @@ export async function authorizeExistingAccount(remote: string, deps: AuthorizeEx
   }
 }
 
-async function startTrialAfterAccountCreation(): Promise<boolean> {
+async function startTrialAfterAccountCreation(credentialResult: CredentialLoadResult): Promise<boolean> {
   process.stderr.write(`\n── ${e.bold("Start your 14-day free trial")} ${HR.slice(0, 36)}\n`);
   const choice = await promptSelect<`${SubscribePlan}:${BillingCadence}`>({
     message: "Choose a plan for this new account:",
@@ -398,15 +422,15 @@ async function startTrialAfterAccountCreation(): Promise<boolean> {
   });
   const [plan, cadence] = choice.split(":") as [SubscribePlan, BillingCadence];
   process.stderr.write(`${e.dim("Card required; cancel anytime before the trial ends.")}\n`);
-  const url = await checkoutUrl(plan, cadence);
+  const url = await checkoutUrl(plan, cadence, credentialResult);
   if (url === "already_subscribed") return true;
   openAndShow(url, "Opening your browser to complete checkout...", "Open this URL in your browser to complete checkout:");
   process.stderr.write(`${e.dim("Waiting for checkout to complete...")}\n`);
-  return pollUntilPlanActive();
+  return pollUntilPlanActive(credentialResult);
 }
 
-async function pollUntilPlanActive(): Promise<boolean> {
-  const creds = await loadCredentials();
+async function pollUntilPlanActive(credentialResult: CredentialLoadResult): Promise<boolean> {
+  const creds = credentialsForStrictFlow(credentialResult);
   if (!creds?.token || !creds.remoteUrl) return false;
   const deadline = Date.now() + 5 * 60 * 1000;
   while (Date.now() < deadline) {
@@ -471,11 +495,13 @@ interface ResolveEnrollmentDeps {
 }
 
 export async function resolveEnrollment(remote: string, deps: ResolveEnrollmentDeps = {}): Promise<boolean> {
-  const checkEnrolled = deps.alreadyEnrolled ?? alreadyEnrolled;
-  if (await checkEnrolled()) return true;
+  if (deps.alreadyEnrolled && await deps.alreadyEnrolled()) return true;
 
   // There must be credentials here — this is only reached once we know we're authorized.
-  const creds = await (deps.loadCredentials ?? loadCredentials)();
+  const loadedCredentials = await (deps.loadCredentials ?? loadCredentials)();
+  const creds = credentialsForStrictFlow(loadedCredentials);
+  const checkEnrolled = deps.alreadyEnrolled ?? (async () => Boolean(creds?.accountId && await hasDevice(creds.accountId)));
+  if (!deps.alreadyEnrolled && await checkEnrolled()) return true;
   const writeStderr = deps.writeStderr ?? ((text: string) => process.stderr.write(text));
   const select = deps.promptSelect ?? promptSelect;
   const api = creds?.token ? (deps.makeApi ?? ((remoteUrl, token) => new RboxApi(remoteUrl, token, "", "")))(creds.remoteUrl ?? remote, creds.token) : undefined;
@@ -533,6 +559,7 @@ export async function resolveEnrollment(remote: string, deps: ResolveEnrollmentD
       enroll: deps.enrollRecovery,
       writeStderr,
       now: deps.now,
+      loadedCredentials,
     });
     if (result === "parent") continue;
     return checkEnrolled();
@@ -567,7 +594,7 @@ interface StepWorkspaceDeps {
 /** Step 2 · Workspace. Only explicit pre-init navigation returns `menu`. */
 export async function stepWorkspace(
   opts: { cwd: string; defaultRemote: string },
-  setupOpts: { noSync?: boolean; preselectedKind?: WorkspaceKind; header: string },
+  setupOpts: { noSync?: boolean; preselectedKind?: WorkspaceKind; header: string; credentialResult?: CredentialLoadResult },
   deps: StepWorkspaceDeps = {}
 ): Promise<StepWorkspaceResult> {
   const select = deps.promptSelect ?? promptSelect;
@@ -588,6 +615,11 @@ export async function stepWorkspace(
   const continueInit = deps.continueInit ?? continueInitWithPrecreatedWorkspace;
   const writeStderr = deps.writeStderr ?? ((text: string) => process.stderr.write(text));
 
+  // One typed observation governs this workspace step; degradation must stop
+  // before directory creation, mutex publication, or a remote mutation.
+  const loadedCredentials = setupOpts.credentialResult ?? await readCredentials();
+  const creds = credentialsForStrictFlow(loadedCredentials);
+
   writeStderr(`\n── ${e.bold(setupOpts.header)} ${HR.slice(0, 44)}\n`);
   const choice =
     setupOpts.preselectedKind ??
@@ -605,7 +637,6 @@ export async function stepWorkspace(
     // Pick-by-name from the account's synced workspaces (degrades to a manual id
     // prompt when offline / no creds / empty account). The picked name is cached
     // locally so `rbox status` shows it with no round-trip.
-    const creds = await readCredentials();
     const picked = await pickWorkspace({ baseUrl: creds?.remoteUrl ?? opts.defaultRemote, token: creds?.token, mode: "setup" });
     if (picked.kind !== "picked") return { kind: "menu" };
     workspace = picked.pick.workspaceId;
@@ -651,6 +682,7 @@ export async function stepWorkspace(
         summary: false,
         guidedSetup: true,
         resetConsent,
+        credentialResult: loadedCredentials,
       });
       return outcome ? { kind: "completed", outcome } : { kind: "terminal" };
     } catch (error) {
@@ -703,7 +735,7 @@ export async function stepWorkspace(
         ? (bound.name ? `${bound.name} (${bound.remoteWorkspaceId})` : bound.remoteWorkspaceId)
         : oldStream;
       writeStderr(`${e.yellow("⚠")}  This directory already syncs to workspace ${e.cyan(label)}.\n`);
-      const remoteUrl = (await readCredentials())?.remoteUrl ?? opts.defaultRemote;
+      const remoteUrl = creds?.remoteUrl ?? opts.defaultRemote;
       const rebind = await confirm({
         message: "Create a brand-new workspace for it anyway? (files on disk are untouched; sync history starts fresh)",
         default: false,
@@ -755,7 +787,6 @@ export async function stepWorkspace(
           choices: SETUP_GITIGNORE_CHOICES,
         })) === "true";
 
-      const creds = await readCredentials();
       if (!creds) throw new Error("login did not produce a credential — aborting setup");
       let workspaceId: string;
       try {
@@ -797,7 +828,8 @@ export async function stepWorkspace(
         const outcome = await continueInit(
           flags,
           { cwd: opts.cwd, defaultRemote: opts.defaultRemote, summary: false, guidedSetup: true },
-          { workspaceId, syncMutex, resetConsent }
+          { workspaceId, syncMutex, resetConsent },
+          { loadCredentials: async () => loadedCredentials },
         );
         if (outcome) return { kind: "completed", outcome };
         throw new Error("initial setup returned without completing");

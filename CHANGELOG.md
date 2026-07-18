@@ -5,6 +5,15 @@ All notable changes to rbox are recorded here. The format follows
 `v*` git tags that trigger the CLI release build.
 
 ## [Unreleased]
+
+### Changed
+- **Credential corruption is now preserved and reported instead of looking like
+  a logout.** Credentials use a versioned, atomically written format; malformed
+  or future files are quarantined without overwriting prior evidence. rbox also
+  refuses symlinked, non-regular, or unsafe credential paths and gives recovery
+  guidance, while status and doctor remain available in a credential-degraded
+  state.
+
 ## [1.7.2] — 2026-07-17 — faster releases, same gates
 
 ### Internal

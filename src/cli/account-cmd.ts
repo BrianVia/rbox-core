@@ -1,4 +1,4 @@
-import { loadCredentials, requireCredentials } from "./credentials.js";
+import { loadCredentials, requireCredentials, type CredentialLoadResult } from "./credentials.js";
 import { emitJson } from "./json.js";
 import { style } from "./style.js";
 import { friendlyHttpError } from "./http-error.js";
@@ -64,11 +64,14 @@ function accountStatusFromResponse(body: unknown): AccountStatus {
 export type AccountSummary =
   | { state: "ok"; status: AccountStatus }
   | { state: "signed-out" }
+  | { state: "credential-degraded"; credential: Exclude<CredentialLoadResult, { state: "valid" | "absent" }> }
   | { state: "unavailable" };
 
-export async function fetchAccountSummary(timeoutMs = 3500): Promise<AccountSummary> {
-  const c = await loadCredentials();
-  if (!c) return { state: "signed-out" };
+export async function fetchAccountSummary(timeoutMs = 3500, loaded?: CredentialLoadResult): Promise<AccountSummary> {
+  const result = loaded ?? await loadCredentials();
+  if (result.state === "absent") return { state: "signed-out" };
+  if (result.state !== "valid") return { state: "credential-degraded", credential: result };
+  const c = result.credentials;
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
@@ -103,6 +106,10 @@ export function formatAccountSummary(s: AccountSummary): string[] {
   }
   if (s.state === "unavailable") {
     return [`${style.bold("account")} ${style.yellow("(unavailable — offline?)")}`];
+  }
+  if (s.state === "credential-degraded") {
+    const where = s.credential.state === "invalid-environment" ? s.credential.variable : s.credential.path;
+    return [`${style.bold("account")} ${style.yellow(`credential-degraded (${s.credential.state}: ${where})`)}`];
   }
   const { accountId, plan, linked, email, signInMethod } = s.status;
   const identity = identityText(email, signInMethod);

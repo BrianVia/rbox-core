@@ -1,6 +1,6 @@
 import { createPatToken, patDisplayPrefix, PAT_MAX_TTL_MS } from "../engine/pat-token.js";
 import { sha256Hex, toB64url, utf8 } from "../engine/e2ee/index.js";
-import { loadCredentials } from "./credentials.js";
+import { credentialsForStrictFlow, loadCredentials } from "./credentials.js";
 import { admitAgentDevice, newAgentId } from "./e2ee-client.js";
 import { loadDevice } from "./e2ee-keystore.js";
 import { RboxApi } from "./remote.js";
@@ -51,7 +51,7 @@ async function confirmRootKey(accepted: boolean): Promise<void> {
 export async function createCiKey(flags: Record<string, string>): Promise<void> {
   await confirmRootKey(flags["accept-root-key"] === "true");
   const expiresAt = Date.now() + parseDuration(flags.expires);
-  const creds = await loadCredentials();
+  const creds = credentialsForStrictFlow(await loadCredentials());
   if (!creds?.accountId) throw new Error("not logged in or missing account id — run `rbox login` first");
   const loaded = await loadDevice(creds.accountId);
   if (!loaded || !("secrets" in loaded)) throw new Error("this device is not enrolled for encryption — run `rbox pair`/`rbox key recover` first");
@@ -102,7 +102,7 @@ export async function createCiKey(flags: Record<string, string>): Promise<void> 
 }
 
 export async function listKeys(opts: { json?: boolean } = {}): Promise<void> {
-  const creds = await loadCredentials();
+  const creds = credentialsForStrictFlow(await loadCredentials());
   if (!creds) throw new Error("not logged in — run `rbox login`");
   const keys = await new RboxApi(creds.remoteUrl, creds.token, "", "").listApiKeys();
   if (opts.json) {
@@ -117,7 +117,7 @@ export async function listKeys(opts: { json?: boolean } = {}): Promise<void> {
 
 export async function revokeKey(deviceId: string): Promise<void> {
   if (!deviceId) throw new Error("usage: rbox key revoke <id>");
-  const creds = await loadCredentials();
+  const creds = credentialsForStrictFlow(await loadCredentials());
   if (!creds) throw new Error("not logged in — run `rbox login`");
   await new RboxApi(creds.remoteUrl, creds.token, "", "").revokeApiKey(deviceId);
   console.log(`revoked ${deviceId}`);

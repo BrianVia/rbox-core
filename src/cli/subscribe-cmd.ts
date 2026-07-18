@@ -1,4 +1,4 @@
-import { requireCredentials } from "./credentials.js";
+import { credentialsForStrictFlow, requireCredentials, type CredentialLoadResult } from "./credentials.js";
 import { openAndShow } from "./browser-open.js";
 import { friendlyHttpError } from "./http-error.js";
 
@@ -23,8 +23,13 @@ function normalizePlan(plan: string | undefined): SubscribePlan {
   return plan as SubscribePlan;
 }
 
-export async function checkoutUrl(plan: SubscribePlan, cadence: BillingCadence = "monthly"): Promise<string | "already_subscribed"> {
-  const c = await requireCredentials();
+export async function checkoutUrl(
+  plan: SubscribePlan,
+  cadence: BillingCadence = "monthly",
+  credentialResult?: CredentialLoadResult,
+): Promise<string | "already_subscribed"> {
+  const c = credentialResult ? credentialsForStrictFlow(credentialResult) : await requireCredentials();
+  if (!c) throw new Error("not logged in — run `rbox login`");
   const q = new URLSearchParams({ plan, cadence });
   const res = await fetch(`${c.remoteUrl}/v1/billing/checkout?${q}`, {
     method: "POST",

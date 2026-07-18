@@ -16,11 +16,13 @@ let home: string;
 let roots: string[];
 
 const creds = (accountId: string) => async () => ({
-  token: "tok",
-  deviceId: "dev_test",
-  remoteUrl: "https://api.test",
-  accountId,
+  state: "valid" as const,
+  source: "disk" as const,
+  credentials: { v: 1 as const, token: "tok", deviceId: "dev_test", remoteUrl: "https://api.test", accountId },
+  legacy: false,
+  extensions: {},
 });
+const absent = async () => ({ state: "absent" as const, path: "/test/credentials.json" });
 
 async function writeWorkspaceBinding(root: string, workspaceId: string): Promise<void> {
   await fs.mkdir(path.join(root, ".rbox"), { recursive: true });
@@ -122,7 +124,7 @@ for (const [lingerOutput, showsNote] of [["Linger=no\n", true], ["Linger=yes\n",
     const oldLog = console.log;
     console.log = (line?: unknown) => void lines.push(String(line ?? ""));
     try {
-      await autostartCmd("status", { platform: "linux", home, loadCredentials: async () => undefined, exec: async () => lingerOutput });
+      await autostartCmd("status", { platform: "linux", home, loadCredentials: absent, exec: async () => lingerOutput });
     } finally {
       console.log = oldLog;
     }
@@ -138,7 +140,7 @@ test("autostart status hides the linger note when loginctl fails", async () => {
     await autostartCmd("status", {
       platform: "linux",
       home,
-      loadCredentials: async () => undefined,
+      loadCredentials: absent,
       exec: async () => { throw new Error("loginctl unavailable"); },
     });
   } finally {
@@ -290,7 +292,7 @@ test("__boot-resume without credentials logs once and starts nothing", async () 
   const started: string[] = [];
   const logs: string[] = [];
   await bootResume({
-    loadCredentials: async () => undefined,
+    loadCredentials: absent,
     startDaemon: async (root) => {
       started.push(root);
       return "started";
@@ -300,4 +302,28 @@ test("__boot-resume without credentials logs once and starts nothing", async () 
 
   expect(started).toEqual([]);
   expect(logs).toEqual(["autostart: not logged in"]);
+});
+
+test("credential degradation is actionable in status and starts zero boot-resume daemons", async () => {
+  const degraded = async () => ({ state: "corrupt" as const, path: "/test/credentials.json", detail: "bad schema" });
+  const started: string[] = [];
+  const logs: string[] = [];
+  await bootResume({
+    loadCredentials: degraded,
+    startDaemon: async (root) => { started.push(root); return "started"; },
+    log: (line) => logs.push(line),
+  });
+  expect(started).toEqual([]);
+  expect(logs.join("\n")).toContain("credential-degraded");
+  expect(logs.join("\n")).toContain("corrupt");
+
+  const lines: string[] = [];
+  const oldLog = console.log;
+  console.log = (line?: unknown) => void lines.push(String(line ?? ""));
+  try {
+    await autostartCmd("status", { platform: "linux", home, loadCredentials: degraded, exec: async () => "Linger=yes\n" });
+  } finally {
+    console.log = oldLog;
+  }
+  expect(lines.join("\n")).toContain("credential-degraded");
 });

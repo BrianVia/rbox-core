@@ -37,6 +37,14 @@ import { createHash } from "node:crypto";
 
 const ACCOUNT_KEYS: AccountKeysDTO = { recoveryWrap: null, recoveryWrapId: null, rosters: [], keyStates: [], devices: [] };
 
+const validSetupCredentials = async () => ({
+  state: "valid" as const,
+  source: "disk" as const,
+  credentials: { v: 1 as const, token: "tok", deviceId: "dev_setup", remoteUrl: "https://api.test", accountId: "acct_setup" },
+  legacy: false,
+  extensions: {},
+});
+
 test("setup step header numbers fresh and enrolled flows", () => {
   expect([stepHeader(1, 3, "Account"), stepHeader(2, 3, "Workspace"), stepHeader(3, 3, "Start syncing")]).toEqual([
     "Step 1 of 3 · Account",
@@ -177,7 +185,7 @@ test("resolveEnrollment: keyless account renders the first-machine choice and ru
       enrolledChecks++;
       return enrolledChecks > 1;
     },
-    loadCredentials: async () => ({ token: "tok", deviceId: "dev_setup", remoteUrl: "https://api.test", accountId: "acct_setup" }),
+    loadCredentials: validSetupCredentials,
     makeApi: () => ({
       getAccountKeys: async () => null,
       bootstrapKeys: async () => {},
@@ -205,7 +213,7 @@ test("resolveEnrollment: existing key world keeps the current three choices and 
 
   const ok = await resolveEnrollment("https://api.test", {
     alreadyEnrolled: async () => false,
-    loadCredentials: async () => ({ token: "tok", deviceId: "dev_setup", remoteUrl: "https://api.test", accountId: "acct_setup" }),
+    loadCredentials: validSetupCredentials,
     makeApi: () => ({
       getAccountKeys: async () => ACCOUNT_KEYS,
       bootstrapKeys: async () => {},
@@ -234,7 +242,7 @@ test("resolveEnrollment pairing and recovery exhaust their own local budget back
     let remoteAttempts = 0;
     const ok = await resolveEnrollment("https://api.test", {
       alreadyEnrolled: async () => false,
-      loadCredentials: async () => ({ token: "tok", deviceId: "dev_setup", remoteUrl: "https://api.test", accountId: "acct_setup" }),
+      loadCredentials: validSetupCredentials,
       makeApi: () => ({ getAccountKeys: async () => ACCOUNT_KEYS, bootstrapKeys: async () => {} }),
       promptSelect: (async () => { menuPrompts++; return selections.shift()!; }) as never,
       promptPassword: (async () => { inputPrompts++; return method === "pair" ? "bad-token" : "bad phrase"; }) as never,
@@ -256,7 +264,7 @@ test("resolveEnrollment post-validation recovery failure is one-shot back to enr
   const key = new Uint8Array([7]);
   const ok = await resolveEnrollment("https://api.test", {
     alreadyEnrolled: async () => false,
-    loadCredentials: async () => ({ token: "tok", deviceId: "dev_setup", remoteUrl: "https://api.test", accountId: "acct_setup" }),
+    loadCredentials: validSetupCredentials,
     makeApi: () => ({ getAccountKeys: async () => ACCOUNT_KEYS, bootstrapKeys: async () => {} }),
     promptSelect: (async () => selections.shift()!) as never,
     promptPassword: (async () => "checksum-valid phrase") as never,
@@ -277,7 +285,7 @@ test("resolveEnrollment post-send pairing failures return to parent without enro
     let menus = 0;
     const ok = await resolveEnrollment("https://api.test", {
       alreadyEnrolled: async () => { enrolledChecks++; return false; },
-      loadCredentials: async () => ({ token: "tok", deviceId: "dev_setup", remoteUrl: "https://api.test", accountId: "acct_setup" }),
+      loadCredentials: validSetupCredentials,
       makeApi: () => ({ getAccountKeys: async () => ACCOUNT_KEYS, bootstrapKeys: async () => {} }),
       promptSelect: (async () => { menus++; return selections.shift()!; }) as never,
       promptPassword: (async () => valid) as never,
@@ -330,6 +338,7 @@ test("keyed setup persists credentials with private file mode", async () => {
     );
     const file = path.join(home, ".rbox", "credentials.json");
     expect(JSON.parse(await fs.readFile(file, "utf8"))).toEqual({
+      v: 1,
       token: "rbox_pat_keyed",
       deviceId: "agent_dev",
       remoteUrl: "https://api.test",
@@ -362,7 +371,7 @@ function baseCreateDeps(root: string, overrides: Record<string, unknown> = {}) {
     acquireMutex: async () => fakeMutex(root),
     releaseMutex: async () => undefined,
     isDegraded: () => false,
-    loadCredentials: async () => ({ token: "tok", deviceId: "dev", accountId: "acct", remoteUrl: "https://api.test" }),
+    loadCredentials: validSetupCredentials,
     createWorkspace: async () => "ws_created",
     continueInit: async () => ({ workspaceId: "ws_created", deviceId: "dev", root }),
     writeStderr: () => undefined,
@@ -516,7 +525,7 @@ test("existing-workspace rebind confirmation supplies a narrowed witness to runI
       { cwd: root, defaultRemote: "https://api.test" },
       { preselectedKind: "existing", header: "Workspace" },
       {
-        loadCredentials: async () => ({ token: "tok", remoteUrl: "https://api.test" }),
+        loadCredentials: validSetupCredentials,
         promptWorkspacePick: (async () => ({ kind: "picked", pick: { workspaceId: "ws_new" } })) as never,
         promptPath: async () => root,
         loadConfigIfPresent: async () => ({ remoteUrl: "https://api.test", remoteWorkspaceId: "ws_old", projectId: "root" }),
@@ -565,7 +574,7 @@ test("v2 transaction quarantine composes end to end with the next setup rebind",
       { cwd: root, defaultRemote: "https://api.test" },
       { preselectedKind: "existing", header: "Workspace" },
       {
-        loadCredentials: async () => ({ token: "tok", remoteUrl: "https://api.test" }),
+        loadCredentials: validSetupCredentials,
         promptWorkspacePick: async () => ({ kind: "picked", pick: { workspaceId: "ws_new" } }),
         promptPath: async () => root,
         loadConfigIfPresent: async () => ({ remoteUrl: "https://api.test", remoteWorkspaceId: "ws_old", projectId: "root" }),
@@ -591,7 +600,7 @@ test("declined existing-workspace rebind returns to the Step-2 menu without call
     { cwd: "/join", defaultRemote: "https://api.test" },
     { preselectedKind: "existing", header: "Workspace" },
     {
-      loadCredentials: async () => ({ token: "tok", remoteUrl: "https://api.test" }),
+      loadCredentials: validSetupCredentials,
       promptWorkspacePick: (async () => ({ kind: "picked", pick: { workspaceId: "ws_new" } })) as never,
       promptPath: async () => "/join",
       loadConfigIfPresent: async () => ({ remoteUrl: "https://api.test", remoteWorkspaceId: "ws_old", projectId: "root" }),
@@ -613,7 +622,7 @@ test("post-runInit StreamMismatchError is rendered and remains terminal", async 
       { cwd: "/join", defaultRemote: "https://api.test" },
       { preselectedKind: "existing", header: "Workspace" },
       {
-        loadCredentials: async () => ({ token: "tok", remoteUrl: "https://api.test" }),
+        loadCredentials: validSetupCredentials,
         promptWorkspacePick: (async () => ({ kind: "picked", pick: { workspaceId: "ws_new" } })) as never,
         promptPath: async () => "/join",
         loadConfigIfPresent: async () => undefined,
@@ -923,7 +932,7 @@ test("setup picker back/empty navigation returns menu before any path or create 
       { cwd: "/cwd", defaultRemote: "https://api.test" },
       { preselectedKind: "existing", header: "Workspace" },
       {
-        loadCredentials: async () => ({ token: "tok", remoteUrl: "https://api.test" }),
+        loadCredentials: validSetupCredentials,
         promptWorkspacePick: (async () => pickerResult) as never,
         promptPath: async () => { paths++; return "/never"; },
         createWorkspace: async () => { creates++; return "ws_never"; },
@@ -945,7 +954,7 @@ test("manual-id runInit terminal-undefined after mutation is terminal with no re
       { cwd: "/cwd", defaultRemote: "https://api.test" },
       { preselectedKind: "existing", header: "Workspace" },
       {
-        loadCredentials: async () => ({ token: "tok", remoteUrl: "https://api.test" }),
+        loadCredentials: validSetupCredentials,
         promptWorkspacePick: (async () => ({ kind: "picked", pick: { workspaceId: "ws_bad" } })) as never,
         promptPath: async () => { pathPrompts++; return "/join"; },
         runInit: async () => { initCalls++; return undefined; },
