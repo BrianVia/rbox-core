@@ -179,6 +179,17 @@ describe("agent/API sync keys", () => {
     expect((await SELF.fetch(`${BASE}/v1/account/usage`, { headers: authed(k2.token) })).status).toBe(200);
   });
 
+  test("a brand-new account's dashboard session lists its (empty) API keys — 200, not 403", async () => {
+    // Regression: the design-21 §1.1 web-token allowlist didn't include GET
+    // /v1/keys/api, so the FIRST thing a fresh web login does (list keys, which
+    // is empty for a brand-new account) 403'd before the user ever saw a key.
+    const a = await bootstrap("apikey-web-list-fresh");
+    const web = await createWebSession(env as Env, a.accountId, a.userId);
+    const res = await SELF.fetch(`${BASE}/v1/keys/api`, { headers: authed(web.token) });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ keys: [] });
+  });
+
   test("agent.sh route serves the passthrough setup wrapper with install.sh cache headers", async () => {
     const req = new Request(`${BASE}/agent.sh`);
     let forwarded = false;

@@ -160,39 +160,115 @@
 				</div>
 			</div>
 
-			<Separator class="my-5" />
+			<!-- Usage metrics only make sense once there's a plan; a brand-new account has
+			     nothing but zeroes to show, so we hide the whole block until noPlan clears. -->
+			{#if !noPlan}
+				<Separator class="my-5" />
 
-			<div>
-				<div class="flex items-baseline justify-between text-sm">
-					<span class="text-muted-foreground">Storage</span>
-					<span>
-						<span class="font-medium tabular">{formatBytes(usage.usedBytes)}</span>
-						<span class="text-muted-foreground">
-							of {usage.storageCap === null ? '∞' : formatBytes(usage.storageCap)}
+				<div>
+					<div class="flex items-baseline justify-between text-sm">
+						<span class="text-muted-foreground">Storage</span>
+						<span>
+							<span class="font-medium tabular">{formatBytes(usage.usedBytes)}</span>
+							<span class="text-muted-foreground">
+								of {usage.storageCap === null ? '∞' : formatBytes(usage.storageCap)}
+							</span>
 						</span>
-					</span>
-				</div>
-				{#if usage.storageCap !== null}
-					<Progress value={pct} class="mt-2.5 h-2" />
-				{/if}
-			</div>
-
-			<Separator class="my-5" />
-
-			<div class="grid grid-cols-2 gap-4">
-				<div>
-					<div class="text-xl font-semibold tabular">
-						{usage.workspaces}{usage.workspaceCap === null ? '' : `/${usage.workspaceCap}`}
 					</div>
-					<div class="mt-0.5 text-xs text-muted-foreground">Workspaces</div>
+					{#if usage.storageCap !== null}
+						<Progress value={pct} class="mt-2.5 h-2" />
+					{/if}
 				</div>
-				<div>
-					<div class="text-xl font-semibold tabular">{usage.retentionDays}d</div>
-					<div class="mt-0.5 text-xs text-muted-foreground">Version history</div>
+
+				<Separator class="my-5" />
+
+				<div class="grid grid-cols-2 gap-4">
+					<div>
+						<div class="text-xl font-semibold tabular">
+							{usage.workspaces}{usage.workspaceCap === null ? '' : `/${usage.workspaceCap}`}
+						</div>
+						<div class="mt-0.5 text-xs text-muted-foreground">Workspaces</div>
+					</div>
+					<div>
+						<div class="text-xl font-semibold tabular">{usage.retentionDays}d</div>
+						<div class="mt-0.5 text-xs text-muted-foreground">Version history</div>
+					</div>
 				</div>
-			</div>
+			{/if}
 		</CardContent>
 	</Card>
+
+	{#if noPlan}
+		<!-- Locked → trial. This is the primary next step for a brand-new account, so it
+		     sits immediately below the plan line. Cards make the choice + value obvious.
+		     Paid users change plans via the portal (in the summary above), never a second
+		     checkout — this block only renders while there's no active plan. -->
+		<div class="mt-6 mb-4 flex flex-wrap items-center justify-between gap-3">
+			<h2 class="text-lg font-semibold tracking-tight">Start your 14-day free trial</h2>
+			<div class="inline-flex rounded-lg border border-border bg-muted/50 p-1">
+				<button
+					type="button"
+					class="rounded-md px-3 py-1.5 text-sm transition-colors {cadence === 'annual'
+						? 'bg-background text-foreground shadow-sm'
+						: 'text-muted-foreground hover:text-foreground'}"
+					onclick={() => (cadence = 'annual')}
+					aria-pressed={cadence === 'annual'}
+				>
+					Annual
+				</button>
+				<button
+					type="button"
+					class="rounded-md px-3 py-1.5 text-sm transition-colors {cadence === 'monthly'
+						? 'bg-background text-foreground shadow-sm'
+						: 'text-muted-foreground hover:text-foreground'}"
+					onclick={() => (cadence = 'monthly')}
+					aria-pressed={cadence === 'monthly'}
+				>
+					Monthly
+				</button>
+			</div>
+		</div>
+		<div class="grid gap-4 sm:grid-cols-2">
+			{#each UPGRADES as p (p.id)}
+				<div
+					class="relative flex flex-col rounded-xl border bg-card p-5 {p.featured
+						? 'border-primary/50 ring-1 ring-primary/20'
+						: 'border-border'}"
+				>
+					{#if p.featured}
+						<span class="absolute -top-2.5 left-5 rounded-full bg-primary px-2 py-0.5 text-[10px] font-semibold tracking-wide text-primary-foreground uppercase">
+							Most popular
+						</span>
+					{/if}
+					<div class="text-sm font-medium text-muted-foreground">{p.label}</div>
+					<div class="mt-1 mb-4 flex items-baseline gap-1">
+						<span class="text-3xl font-semibold tracking-tight tabular">{cadence === 'annual' ? p.annualPrice : p.monthlyPrice}</span>
+						<span class="text-sm text-muted-foreground">
+							{cadence === 'annual' ? '/mo · billed annually' : '/mo'}
+						</span>
+					</div>
+					<ul class="mb-5 flex flex-1 flex-col gap-2.5">
+						{#each p.features as f (f)}
+							<li class="flex items-start gap-2 text-sm text-muted-foreground">
+								<CheckIcon class="mt-0.5 size-4 shrink-0 text-success" />
+								{f}
+							</li>
+						{/each}
+					</ul>
+					<Button
+						variant={p.featured ? 'default' : 'outline'}
+						disabled={busy}
+						onclick={() => checkout(p.id)}
+					>
+						Start {p.label} trial
+					</Button>
+				</div>
+			{/each}
+		</div>
+		<p class="mt-4 text-center text-xs text-muted-foreground">
+			Need a team? <strong class="font-medium text-foreground">Team plans</strong> with roles &amp; per-seat billing are coming soon.
+		</p>
+	{/if}
 
 	<!-- Discovery nudge (design 21 §6 / 17 §4.1): route CLI-first users to the
 	     possession-proof link flow. Shown ONLY to logins that aren't linked yet. -->
@@ -261,76 +337,8 @@
 		</div>
 	</details>
 
-	<ApiKeysSection class="mt-8" />
-
-	{#if noPlan}
-		<!-- Locked → trial. Cards make the choice + value obvious. Paid users change
-		     plans via the portal (in the summary above), never a second checkout. -->
-		<div class="mt-9 mb-4 flex flex-wrap items-center justify-between gap-3">
-			<h2 class="text-lg font-semibold tracking-tight">Start your 14-day free trial</h2>
-			<div class="inline-flex rounded-lg border border-border bg-muted/50 p-1">
-				<button
-					type="button"
-					class="rounded-md px-3 py-1.5 text-sm transition-colors {cadence === 'annual'
-						? 'bg-background text-foreground shadow-sm'
-						: 'text-muted-foreground hover:text-foreground'}"
-					onclick={() => (cadence = 'annual')}
-					aria-pressed={cadence === 'annual'}
-				>
-					Annual
-				</button>
-				<button
-					type="button"
-					class="rounded-md px-3 py-1.5 text-sm transition-colors {cadence === 'monthly'
-						? 'bg-background text-foreground shadow-sm'
-						: 'text-muted-foreground hover:text-foreground'}"
-					onclick={() => (cadence = 'monthly')}
-					aria-pressed={cadence === 'monthly'}
-				>
-					Monthly
-				</button>
-			</div>
-		</div>
-		<div class="grid gap-4 sm:grid-cols-2">
-			{#each UPGRADES as p (p.id)}
-				<div
-					class="relative flex flex-col rounded-xl border bg-card p-5 {p.featured
-						? 'border-primary/50 ring-1 ring-primary/20'
-						: 'border-border'}"
-				>
-					{#if p.featured}
-						<span class="absolute -top-2.5 left-5 rounded-full bg-primary px-2 py-0.5 text-[10px] font-semibold tracking-wide text-primary-foreground uppercase">
-							Most popular
-						</span>
-					{/if}
-					<div class="text-sm font-medium text-muted-foreground">{p.label}</div>
-					<div class="mt-1 mb-4 flex items-baseline gap-1">
-						<span class="text-3xl font-semibold tracking-tight tabular">{cadence === 'annual' ? p.annualPrice : p.monthlyPrice}</span>
-						<span class="text-sm text-muted-foreground">
-							{cadence === 'annual' ? '/mo · billed annually' : '/mo'}
-						</span>
-					</div>
-					<ul class="mb-5 flex flex-1 flex-col gap-2.5">
-						{#each p.features as f (f)}
-							<li class="flex items-start gap-2 text-sm text-muted-foreground">
-								<CheckIcon class="mt-0.5 size-4 shrink-0 text-success" />
-								{f}
-							</li>
-						{/each}
-					</ul>
-					<Button
-						variant={p.featured ? 'default' : 'outline'}
-						disabled={busy}
-						onclick={() => checkout(p.id)}
-					>
-						Start {p.label} trial
-					</Button>
-				</div>
-			{/each}
-		</div>
-		<p class="mt-4 text-center text-xs text-muted-foreground">
-			Need a team? <strong class="font-medium text-foreground">Team plans</strong> with roles &amp; per-seat billing are coming soon.
-		</p>
+	{#if linked === true}
+		<ApiKeysSection class="mt-8" />
 	{/if}
 {:else if !error}
 	<Loading label="Loading account…" />
