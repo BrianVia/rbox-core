@@ -99,11 +99,11 @@ export async function scanManifest(
   root: string,
   matcher: IgnoreMatcher = buildIgnoreMatcher(root),
   cache?: HashCache,
-  /** Optional discovery progress: called with the running discovered-entry count
-   *  every {@link SCAN_PROGRESS_STRIDE} entries (and never with a total — a live walk
-   *  has no known total). Display-only; the CLI renders it as the indeterminate
-   *  `scanning… N files` phase. */
-  onProgress?: (discovered: number) => void,
+  /** Optional discovery progress: called with the running discovered-entry count and
+   *  payload bytes every {@link SCAN_PROGRESS_STRIDE} entries, plus a final partial
+   *  stride (and never with a total — a live walk has no known total). Display-only;
+   *  the CLI renders it as the indeterminate `scanning… N files · N GB` phase. */
+  onProgress?: (discovered: number, bytesDiscovered: number) => void,
   /** Optional git repo discovery hook. Fires for `.git` directories and gitfile
    *  pointers before the hard `.git` ignore prune, so callers can avoid a second
    *  full workspace walk. */
@@ -223,7 +223,7 @@ interface WalkCtxOptions {
   scanStats?: ScanStats;
   deferred?: Set<string>;
   dirProbe?: DirProbeSink;
-  onProgress?: (discovered: number) => void;
+  onProgress?: (discovered: number, bytesDiscovered: number) => void;
   onGitRepo?: (repo: DiscoveredGitRepo) => void;
   onDeferErrno?: (code: string) => void;
   warningSink?: (line: string) => void;
@@ -232,16 +232,24 @@ interface WalkCtxOptions {
 
 function makeWalkCtx(o: WalkCtxOptions): WalkCtx {
   let discovered = 0;
+  let bytesDiscovered = 0;
   const onProgress = o.onProgress;
+  let lastEmitted = 0;
   const onDiscover = onProgress
-    ? () => {
-        if (++discovered % SCAN_PROGRESS_STRIDE === 0) onProgress(discovered);
+    ? (bytes: number) => {
+        bytesDiscovered += bytes;
+        if (++discovered % SCAN_PROGRESS_STRIDE === 0) {
+          lastEmitted = discovered;
+          onProgress(discovered, bytesDiscovered);
+        }
       }
     : undefined;
   return {
     root: o.root, matcher: o.matcher, cache: o.cache, dircache: o.dircache, mode: o.mode,
     scanStartMs: o.scanStartMs, scanStats: o.scanStats, deferred: o.deferred, dirProbe: o.dirProbe,
-    onDiscover, onGitRepo: o.onGitRepo, onDeferErrno: o.onDeferErrno, warningSink: o.warningSink, priorRuleFiles: o.priorRuleFiles ?? new Set(), observedRuleFiles: new Set(),
+    onDiscover,
+    flushProgress: onProgress ? () => { if (discovered > lastEmitted) onProgress(discovered, bytesDiscovered); } : undefined,
+    onGitRepo: o.onGitRepo, onDeferErrno: o.onDeferErrno, warningSink: o.warningSink, priorRuleFiles: o.priorRuleFiles ?? new Set(), observedRuleFiles: new Set(),
   };
 }
 
@@ -450,7 +458,8 @@ interface WalkCtx {
   scanStats?: ScanStats;
   deferred?: Set<string>;
   dirProbe?: DirProbeSink;
-  onDiscover?: () => void;
+  onDiscover?: (bytes: number) => void;
+  flushProgress?: () => void;
   onGitRepo?: (repo: DiscoveredGitRepo) => void;
   onDeferErrno?: (code: string) => void;
   warningSink?: (line: string) => void;
@@ -576,13 +585,13 @@ async function walk(
       }
     } else if (child.type === "symlink") {
       if (ctx.scanStats ? timedMatcher(ctx.scanStats, () => ctx.matcher.ignores(childRel)) : ctx.matcher.ignores(childRel)) continue;
-      ctx.onDiscover?.();
       let target: string;
       try { target = await fs.readlink(abs); }
       catch (error) {
         if (deferWalkFault(ctx, childRel, error)) continue;
         throw error;
       }
+      ctx.onDiscover?.(Buffer.byteLength(target));
       out.push({
         path: childRel,
         type: "symlink",
@@ -594,7 +603,6 @@ async function walk(
       });
     } else if (child.type === "file") {
       if (ctx.scanStats ? timedMatcher(ctx.scanStats, () => ctx.matcher.ignores(childRel)) : ctx.matcher.ignores(childRel)) continue;
-      ctx.onDiscover?.();
       let st: FileStatLike | undefined = bulkStats?.get(child.name);
       if (!st && ctx.scanStats) {
         const t0 = Date.now();
@@ -613,6 +621,7 @@ async function walk(
           throw error;
         }
       }
+      ctx.onDiscover?.(st.size);
       if (ctx.scanStats) ctx.scanStats.filesStatted += 1;
       const cached = ctx.cache?.lookup(childRel, st.mtimeMs, st.size, st.ctimeMs);
       if (cached) {
@@ -647,6 +656,7 @@ async function runWalk(ctx: WalkCtx, rel: string, out: FileEntry[]): Promise<voi
   const toHash: PendingHash[] = [];
   await walk(ctx, rel, out, toHash, false);
   await finishHashes(ctx, toHash, out);
+  ctx.flushProgress?.();
 }
 
 function timedMatcher(scanStats: ScanStats, fn: () => boolean): boolean {

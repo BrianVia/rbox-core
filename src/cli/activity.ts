@@ -65,6 +65,8 @@ export interface DaemonActivity {
     detail?: string;
     bytesDone?: number;
     bytesTotal?: number;
+    bytesPerSecond?: number;
+    etaSeconds?: number;
   };
   /** Standing warning set by the pump's error path, cleared ONLY by a later success
    *  of the SAME op kind (`op`) — a mass-delete-guard halt from a pull must survive
@@ -174,6 +176,10 @@ export async function loadActivity(root: string): Promise<DaemonActivity | undef
         a.active.bytesDone = act.bytesDone;
         if (act.bytesTotal !== undefined) a.active.bytesTotal = act.bytesTotal;
       }
+      if (typeof act.bytesPerSecond === "number" && Number.isFinite(act.bytesPerSecond) && act.bytesPerSecond > 0) {
+        a.active.bytesPerSecond = act.bytesPerSecond;
+      }
+      if (uint(act.etaSeconds)) a.active.etaSeconds = act.etaSeconds;
     }
     const halt = raw.halt;
     if (halt && typeof halt.at === "string" && typeof halt.reason === "string" && num(halt.count) && (halt.op === "pull" || halt.op === "push" || halt.op === "fullScan" || halt.op === "deepScan")) {
@@ -286,7 +292,7 @@ export function renderShellLine(
   if (a.active?.bytesTotal !== undefined && a.active.bytesTotal > 0) {
     const { bytesDone, bytesTotal } = a.active;
     pct = Math.min(100, Math.max(0, Math.floor(((bytesDone ?? 0) / bytesTotal) * 100)));
-  } else if (a.active && a.active.total > 0) {
+  } else if (a.active?.phase === "gitcap" && a.active.total > 0) {
     const { done, total } = a.active;
     pct = Math.min(100, Math.max(0, Math.floor((done / total) * 100)));
   }

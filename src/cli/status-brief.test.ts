@@ -45,7 +45,7 @@ test("healthy, upload-evidence, paused, and initial-populate headline goldens", 
   expect(lines(full({ pendingChanges: 2, active: { phase: "upload", done: 1, total: 2 } }))[0])
     .toBe("Development · syncing normally — 2 changes uploading now");
   expect(lines(full({ pendingChanges: 2, active: { phase: "encrypt", done: 1, total: 2 } }))[0])
-    .toBe("Development · syncing now — encrypting 50% (1/2)");
+    .toBe("Development · syncing now — encrypting 1/2");
   expect(lines(full({ populate: { filesDone: 12, filesTotal: 20 } }))[0])
     .toBe("Development · initial sync in progress — 12/20 files");
   expect(lines(full({ populate: { filesDone: 0, filesTotal: 0 } }))[0])

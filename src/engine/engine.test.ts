@@ -80,6 +80,22 @@ test("round-trip: a fresh tree materializes byte-identically on the other side",
   expect(await read(B, "src/index.ts")).toBe("export const x = 1;\n");
 });
 
+test("apply progress reports byte-based download completion", async () => {
+  await write(A, "small.txt", "one");
+  await write(A, "large.txt", "1234567890");
+  const remote = await push(A);
+  const actions = reconcile(EMPTY, EMPTY, remote, "B", new Date().toISOString());
+  const progress: Array<{ bytesDone: number; bytesTotal: number }> = [];
+  await applyActions(B, actions, store, {
+    concurrency: 1,
+    onProgress: (_done, _total, bytesDone, bytesTotal) => progress.push({ bytesDone, bytesTotal }),
+  });
+  expect(progress).toEqual([
+    { bytesDone: 10, bytesTotal: 13 },
+    { bytesDone: 13, bytesTotal: 13 },
+  ]);
+});
+
 test("ignore rules: node_modules / .env are never synced, .env.example is", async () => {
   await write(A, "src/app.ts", "ok\n");
   await write(A, "node_modules/lib/index.js", "vendor\n");
@@ -168,11 +184,12 @@ test("scanManifest reports discovery progress every 500 entries across the recur
   await Promise.all(
     Array.from({ length: TOTAL }, (_, i) => write(A, `d${i % 7}/sub${i % 3}/f${i}.txt`, `x${i}`))
   );
-  const ticks: number[] = [];
-  const m = await scanManifest(A, undefined, undefined, (n) => ticks.push(n));
+  const ticks: Array<{ files: number; bytes: number }> = [];
+  const m = await scanManifest(A, undefined, undefined, (files, bytes) => ticks.push({ files, bytes }));
   expect(m.files.length).toBe(TOTAL);
-  // 1050 entries → callbacks at 500 and 1000 (stride 500), and only those.
-  expect(ticks).toEqual([500, 1000]);
+  expect(ticks.map(({ files }) => files)).toEqual([500, 1000, 1050]);
+  expect(ticks[0]!.bytes).toBeLessThan(ticks[1]!.bytes);
+  expect(ticks.at(-1)!.bytes).toBe(m.files.reduce((sum, file) => sum + file.size, 0));
 });
 
 test("scanManifest omits progress entirely when no callback is given (no-op fast path)", async () => {
