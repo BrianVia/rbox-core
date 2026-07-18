@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { RBOX_DIR } from "./config.js";
 import { currentWorkspaceId, daemonRuntimeDir, startDaemon, stopDaemon } from "./daemon-control.js";
-import { loadCredentials, type Credentials } from "./credentials.js";
+import { credentialFailureMessage, credentialsForStrictFlow, loadCredentials } from "./credentials.js";
 import { homeDir } from "./rbox-paths.js";
 import { fail, style } from "./style.js";
 
@@ -158,7 +158,7 @@ function parseDesired(raw: string): DesiredDaemonState | undefined {
 
 async function desiredContext(root: string, state: DesiredDaemonStateValue, deps: DesiredDeps = {}): Promise<DesiredDaemonState> {
   const abs = path.resolve(root);
-  const creds = await (deps.loadCredentials ?? loadCredentials)();
+  const creds = credentialsForStrictFlow(await (deps.loadCredentials ?? loadCredentials)());
   const accountId = creds?.accountId;
   const workspaceId = currentWorkspaceId(abs);
   if (!accountId) throw new Error("not logged in — run `rbox login` before changing background sync state");
@@ -267,10 +267,19 @@ export async function autostartWorkspaceStatuses(currentAccountId?: string): Pro
 }
 
 export async function bootResume(deps: BootResumeDeps = {}): Promise<void> {
-  const creds = await (deps.loadCredentials ?? loadCredentials)();
+  const loaded = await (deps.loadCredentials ?? loadCredentials)();
   const log = deps.log ?? ((line: string) => console.log(line));
-  if (!creds?.accountId) {
+  if (loaded.state === "absent") {
     log("autostart: not logged in");
+    return;
+  }
+  if (loaded.state !== "valid") {
+    log(`autostart: credential-degraded: ${credentialFailureMessage(loaded)}`);
+    return;
+  }
+  const creds = loaded.credentials;
+  if (!creds.accountId) {
+    log("autostart: credential has no account id");
     return;
   }
   const starter = deps.startDaemon ?? startDaemon;
@@ -353,7 +362,11 @@ async function printAutostartStatus(deps: AutostartDeps = {}): Promise<void> {
   const enabled = await isAutostartEnabled(deps);
   console.log(`autostart: ${enabled ? style.green("enabled") : style.yellow("disabled")}`);
 
-  const creds = await (deps.loadCredentials ?? loadCredentials)().catch((): Credentials | undefined => undefined);
+  const loaded = await (deps.loadCredentials ?? loadCredentials)();
+  const creds = loaded.state === "valid" ? loaded.credentials : undefined;
+  if (loaded.state !== "valid" && loaded.state !== "absent") {
+    console.log(style.yellow(`credential-degraded: ${credentialFailureMessage(loaded)}`));
+  }
   const rows = await autostartWorkspaceStatuses(creds?.accountId);
   if (!rows.length) {
     console.log("workspaces: none");

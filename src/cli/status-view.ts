@@ -68,6 +68,7 @@ export interface BriefIdentitySource {
 export type BriefAccountSummary =
   | { state: "ok"; identity: BriefIdentitySource }
   | { state: "signed-out" }
+  | { state: "credential-degraded"; reason: string }
   | { state: "unavailable" };
 
 /** The only daemon halt reasons the brief is allowed to interpret. */
@@ -549,6 +550,7 @@ function briefPlan(plan: string | null | undefined): string {
 
 export function briefIdentityLine(account: BriefAccountSummary): string {
   if (account.state === "signed-out") return "Signed out · rbox login";
+  if (account.state === "credential-degraded") return `Credential degraded · ${account.reason}`;
   if (account.state === "unavailable") return "Signed in · account details unavailable";
   const plan = briefPlan(account.identity.plan);
   const email = sanitizeTerminalText(account.identity.email?.trim() ?? "");

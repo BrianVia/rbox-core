@@ -18,18 +18,24 @@ interface UninstallDeps {
   rm?: typeof fs.rm;
   log?: (line: string) => void;
   readDesiredDaemonRows?: typeof readDesiredDaemonRows;
-  keystoreBackupAtRisk?: () => Promise<boolean>;
+  keystoreBackupAtRisk?: () => Promise<boolean | "unknown">;
 }
 
-async function keystoreBackupAtRisk(): Promise<boolean> {
-  const creds = await loadCredentials();
-  if (!creds?.accountId) return false;
+async function keystoreBackupAtRisk(): Promise<boolean | "unknown"> {
+  const loaded = await loadCredentials();
+  if (loaded.state !== "valid") return loaded.state === "absent" ? false : "unknown";
+  const creds = loaded.credentials;
+  if (!creds.accountId) return false;
   const [device, kit] = await Promise.all([loadDevice(creds.accountId), readRecoveryKitRecord(creds.accountId)]);
   return device !== undefined && kit === undefined;
 }
 
 async function warnIfKeystoreAtRisk(log: (line: string) => void, deps: UninstallDeps): Promise<void> {
-  const atRisk = await (deps.keystoreBackupAtRisk ?? keystoreBackupAtRisk)().catch(() => false);
+  const atRisk = await (deps.keystoreBackupAtRisk ?? keystoreBackupAtRisk)().catch(() => "unknown" as const);
+  if (atRisk === "unknown") {
+    log(style.yellow("WARNING: credential degraded; backup risk unknown. Continuing uninstall."));
+    return;
+  }
   if (!atRisk) return;
   log(style.red("WARNING: this machine holds your encryption keys and no recovery kit has been saved."));
   log("Removing ~/.rbox without a recovery phrase backup makes your encrypted data UNRECOVERABLE.");

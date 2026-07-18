@@ -6,6 +6,7 @@ import { daemonRuntimeDir } from "./daemon-control.js";
 import {
   buildDiagnosticsBundle,
   checkDeviceIdentity,
+  collectDoctorContext,
   doctorCmd,
   presentDiagnosticsPreview,
   redactGitLogLines,
@@ -22,6 +23,7 @@ const origLog = console.log;
 const origFetch = globalThis.fetch;
 const stdinTty = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
 const bunVersion = () => (process.versions as NodeJS.ProcessVersions & { bun?: string }).bun ?? "unknown";
+const originalHome = process.env.HOME;
 
 const checks: DoctorChecks = {
   credentials: { ok: true, label: "credentials", message: "authenticated" },
@@ -39,6 +41,7 @@ const checks: DoctorChecks = {
 beforeEach(async () => {
   home = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-doctor-home-"));
   process.env.RBOX_HOME = home;
+  process.env.HOME = home;
   process.exitCode = 0;
   logs = [];
   console.log = (...m: unknown[]) => void logs.push(m.map(String).join(" "));
@@ -50,6 +53,8 @@ afterEach(async () => {
   if (stdinTty) Object.defineProperty(process.stdin, "isTTY", stdinTty);
   else delete (process.stdin as { isTTY?: boolean }).isTTY;
   delete process.env.RBOX_HOME;
+  if (originalHome === undefined) delete process.env.HOME;
+  else process.env.HOME = originalHome;
   delete process.env.RBOX_DIAGNOSTICS;
   delete process.env.RBOX_TOKEN;
   delete process.env.RBOX_DEVICE_ID;
@@ -120,6 +125,24 @@ test("device identity check reports match, mismatch, and no enrollment", async (
   expect(mismatch.ok).toBe(false);
   expect(mismatch.message).toContain("dev_dangling");
   expect((await checkDeviceIdentity(undefined, cfg)).ok).toBe(true);
+});
+
+test("doctor reports credential degradation and continues the remaining safe checks", async () => {
+  const root = await makeWorkspace();
+  await fs.mkdir(path.join(home, ".rbox"), { recursive: true, mode: 0o700 });
+  await fs.writeFile(path.join(home, ".rbox", "credentials.json"), "{malformed", { mode: 0o600 });
+  const calls = recordFetches();
+  try {
+    const context = await collectDoctorContext(root);
+    expect(context.credentialResult?.state).toBe("corrupt");
+    expect(context.checks.credentials.message).toContain("credential-degraded");
+    expect(context.checks.state).toBeDefined();
+    expect(context.checks.locking).toBeDefined();
+    expect(context.checks.git).toBeDefined();
+    expect(calls.length).toBeGreaterThan(0);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });
 
 async function expectReportReachesConsent(opts: { diagnostics?: boolean; env?: boolean }): Promise<void> {

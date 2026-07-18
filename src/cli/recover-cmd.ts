@@ -1,6 +1,6 @@
 import { ManifestChainError, type Action } from "../engine/index.js";
 import { findRoot, loadConfig } from "./config.js";
-import { loadCredentials } from "./credentials.js";
+import { credentialsForStrictFlow, loadCredentials } from "./credentials.js";
 import { keystorePinStore } from "./e2ee-keystore.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
 import { beginReport } from "./metrics.js";
@@ -52,12 +52,16 @@ export async function recoverWorkspaceCmd(pathArg: string | undefined, opts: Rec
     }
   }
 
+  // Strict credential policy precedes sync-mutex acquisition (a local mutation).
+  const loaded = await (deps.loadCredentials ?? loadCredentials)();
+  const creds = credentialsForStrictFlow(loaded);
+  if (!creds?.accountId) throw new Error("not logged in — run `rbox login`");
+  const accountId = creds.accountId;
+
   await withWorkspaceSyncMutex(root, async (syncMutex) => {
     const cfg0 = await (deps.loadConfig ?? loadConfig)(root);
-    const creds = await (deps.loadCredentials ?? loadCredentials)();
-    if (!creds?.accountId) throw new Error("not logged in — run `rbox login`");
-    const pins = (deps.pinStore ?? keystorePinStore)(creds.accountId, cfg0.remoteWorkspaceId);
-    const built = await (deps.buildAuthedRemote ?? buildAuthedRemote)(root);
+    const pins = (deps.pinStore ?? keystorePinStore)(accountId, cfg0.remoteWorkspaceId);
+    const built = await (deps.buildAuthedRemote ?? buildAuthedRemote)(root, Date.now, undefined, loaded);
     built.deps.syncMutex = syncMutex;
     built.deps.allowMassDelete = opts.allowMassDelete === true;
     // recover both pulls AND repair-publishes; one explicit flag covers both directions

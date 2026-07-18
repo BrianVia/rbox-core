@@ -160,10 +160,11 @@ const continuationFlags = (root: string) => ({
   "no-interactive": "true",
 });
 const continuationCreds = async () => ({
-  token: "tok",
-  deviceId: "dev",
-  accountId: "acct",
-  remoteUrl: "https://api.test",
+  state: "valid" as const,
+  source: "disk" as const,
+  credentials: { v: 1 as const, token: "tok", deviceId: "dev", accountId: "acct", remoteUrl: "https://api.test" },
+  legacy: false,
+  extensions: {},
 });
 
 test("precreated continuation preserves new kind/id/held root and releases exactly once on success", async () => {

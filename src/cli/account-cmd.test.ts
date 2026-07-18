@@ -97,6 +97,12 @@ describe("rbox account link", () => {
 });
 
 describe("rbox account status / unlink", () => {
+  test("degraded account summary is explicit and remains renderable", () => {
+    const rendered = formatAccountSummary({ state: "credential-degraded", credential: { state: "corrupt", path: "/test/credentials.json", detail: "bad schema" } });
+    expect(plain(rendered.join("\n"))).toContain("credential-degraded");
+    expect(plain(rendered.join("\n"))).toContain("corrupt");
+  });
+
   test("status prints the account id, plan and linked state", async () => {
     stub(() => ({ status: 200, body: { accountId: "acct_xyz", linked: true, plan: "pro", email: "owner@example.com", signInMethod: "github+password" } }));
     await accountStatus();

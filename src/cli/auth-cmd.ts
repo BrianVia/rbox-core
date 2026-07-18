@@ -1,5 +1,5 @@
 import os from "node:os";
-import { clearCredentials, loadCredentials, PROD_WEB, saveCredentials } from "./credentials.js";
+import { clearCredentials, credentialsForStrictFlow, loadCredentials, PROD_WEB, saveCredentials } from "./credentials.js";
 import { clearAccountProfile } from "./account-profile.js";
 import { cancelableSelect, isInteractive, promptConfirm, promptPassword } from "./prompt.js";
 import { copyToClipboard, openInBrowser, waitForKeypress } from "./browser-open.js";
@@ -349,7 +349,7 @@ export async function logout(): Promise<void> {
 }
 
 async function requireCreds() {
-  const creds = await loadCredentials();
+  const creds = credentialsForStrictFlow(await loadCredentials());
   if (!creds) throw new Error("not logged in — run `rbox login` (or `rbox login --bootstrap <secret>`)");
   return creds;
 }
@@ -458,7 +458,8 @@ export async function readPairingTokenInteractive(deps: PairingTokenInputDeps = 
 /** `rbox key recover` — re-enroll this machine from the recovery phrase (needs an
  *  account login first; the phrase unlocks MK, not server auth — §14.7/D10). */
 export async function recoverCmd(kitOpts: RecoveryKitOptions = NO_KIT): Promise<void> {
-  const creds = await loadCredentials();
+  const loaded = await loadCredentials();
+  const creds = credentialsForStrictFlow(loaded);
   if (!creds?.accountId) throw new Error("`rbox key recover` needs an account login first — run `rbox login` (web/device-code), then recover.");
   let phrase: string;
   if (isInteractive()) {
@@ -470,14 +471,14 @@ export async function recoverCmd(kitOpts: RecoveryKitOptions = NO_KIT): Promise<
     phrase = await readStdinTrimmed();
   }
   if (!phrase) throw new Error("no phrase entered");
-  const { accountId, deviceId } = await enrollViaRecovery(phrase, Date.now());
+  const { accountId, deviceId } = await enrollViaRecovery(phrase, Date.now(), loaded);
   console.log(`recovered + enrolled this device: ${deviceId}`);
   await offerRecoveryKitAfterRecover(phrase, { accountId, deviceId }, kitOpts);
 }
 
 /** `rbox key status` — local E2EE enrollment state for the current account. */
 export async function keyStatus(opts: { json?: boolean } = {}): Promise<void> {
-  const creds = await loadCredentials();
+  const creds = credentialsForStrictFlow(await loadCredentials());
   if (!creds) throw new Error("not logged in — run `rbox login`");
   const loaded = creds.accountId ? await loadDevice(creds.accountId) : undefined;
   const enrolled = Boolean(loaded && "secrets" in loaded);
@@ -501,7 +502,7 @@ export async function keyStatus(opts: { json?: boolean } = {}): Promise<void> {
 /** `rbox key genesis --yes` — explicit non-interactive first-machine genesis. */
 export async function keyGenesis(yes: boolean, kitOpts: RecoveryKitOptions = NO_KIT): Promise<void> {
   if (!yes) throw new Error(`usage: ${GENESIS_COMMAND}`);
-  const creds = await loadCredentials();
+  const creds = credentialsForStrictFlow(await loadCredentials());
   if (!creds?.accountId) throw new Error("not logged in — run `rbox login` first");
   const result = await runGenesisEnrollment(new RboxApi(creds.remoteUrl, creds.token, "", ""), { accountId: creds.accountId, deviceId: creds.deviceId }, kitOpts);
   if (result === "enrolled") {
@@ -513,7 +514,7 @@ export async function keyGenesis(yes: boolean, kitOpts: RecoveryKitOptions = NO_
 
 /** `rbox key backup` — re-show the recovery phrase IF it was cached at setup (C9). */
 export async function keyBackup(kitOpts: RecoveryKitOptions = NO_KIT): Promise<void> {
-  const creds = await loadCredentials();
+  const creds = credentialsForStrictFlow(await loadCredentials());
   if (!creds?.accountId) throw new Error("not logged in — run `rbox login`");
   const rk = await loadRecoveryKey(creds.accountId);
   if (!rk) {

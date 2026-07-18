@@ -44,8 +44,8 @@ export async function track(
   const root = path.resolve(pathArg ?? process.cwd());
   const remoteUrl = flags.remote ?? defaultRemote;
   const projectId = flags.project ?? "root";
-  const { loadCredentials } = await import("./credentials.js");
-  const creds = await (deps.loadCredentials ?? loadCredentials)();
+  const { credentialsForStrictFlow, loadCredentials } = await import("./credentials.js");
+  const creds = credentialsForStrictFlow(await (deps.loadCredentials ?? loadCredentials)());
   const initialPrev = await loadConfig(root).catch(() => undefined);
   const initialState = await loadRawState(root);
   const initialStream = initialState?.stream ?? (initialPrev ? syncStreamId(initialPrev) : undefined);
