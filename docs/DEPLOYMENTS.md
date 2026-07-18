@@ -56,11 +56,26 @@ Workers Builds runs no tests. PR CI remains the pre-merge gate, and the
 production workflow repeats typecheck plus the API Worker suite before any
 production mutation.
 
-## Web dashboard (`apps/web`) — GitHub Actions
+## Web dashboard (`apps/web`) — Cloudflare Pages Builds (git integration)
 
-`.github/workflows/deploy-web.yml`: on `production` pushes touching
-`apps/web/**` → build + `wrangler pages deploy` → **`rbox-app` /
-`app.rbox.to`**, gated on `check` + `test`.
+The dashboard deploys via the **Cloudflare Pages git integration** (founder-
+managed in the Cloudflare dashboard), NOT a GitHub Action — the former
+`deploy-web.yml` used `wrangler pages deploy`, whose content-hash upload cache
+intermittently dropped changed assets (a CSS/JS file would 404 as the SPA
+fallback). Cloudflare builds the project itself and publishes the whole output,
+avoiding that cache. Founder-managed config:
+
+| Setting | Value |
+|---|---|
+| Production branch | `production` |
+| Root directory | `apps/web` |
+| Build command | `npm run build` (Cloudflare runs `npm ci` first) |
+| Build output | `build` (SvelteKit `adapter-static`; NOT `.svelte-kit/cloudflare`) |
+| Watch paths | include `apps/web`, exclude `package.json` |
+
+`apps/web`'s `package-lock.json` must stay in sync for the Cloudflare build's
+`npm ci` (Cloudflare uses npm 10.9.2 — regenerate the lock with that npm if it
+drifts).
 
 ## CLI binaries — GitHub Actions on `v*` tags
 
@@ -124,7 +139,7 @@ deployed.
 ## Secrets (GitHub repo)
 
 - `CLOUDFLARE_DEPLOY_TOKEN` — Workers Scripts:Edit + D1:Edit + Cloudflare
-  Pages:Edit (+ Account:Read); used by `deploy-api.yml` and `deploy-web.yml`.
+  Pages:Edit (+ Account:Read); used by `deploy-api.yml` (web now deploys via the Cloudflare Pages git integration).
 - `CLOUDFLARE_API_TOKEN` — R2-only; used by `release.yml`.
 - `RBOX_HOME_DEPLOY_HOOK` — secret Cloudflare Pages deploy-hook URL for the
   `rbox-home` `main` branch; used by `release.yml` after changelog publication.

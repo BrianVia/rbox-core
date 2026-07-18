@@ -163,4 +163,4 @@
 }
 
 /* build nonce — forces a fresh asset hash so Pages re-uploads styles */
-:root { --rbox-build-nonce: 1; }
+:root { --rbox-build-nonce: 2; }
