@@ -6,7 +6,20 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.7.3] — 2026-07-18 — a friendlier first run
+
+### Added
+- Setup now explains what a workspace is right where you create or join one:
+  a single repository, a folder of many repositories, or just a folder.
+
 ### Changed
+- `rbox start` outside a workspace opens the guided setup on a terminal so you
+  can create or join one on the spot, instead of erroring out. Scripts and
+  service managers still get the explicit "not inside a workspace" error.
+- Setup no longer asks for a "Project id" — one fewer confusing prompt when
+  creating a workspace.
+- Enabling autostart follows the rbox binary you actually run, so an install
+  outside `~/.rbox/bin` (for example `~/.local/bin`) starts on login correctly.
 - **Credential corruption is now preserved and reported instead of looking like
   a logout.** Credentials use a versioned, atomically written format; malformed
   or future files are quarantined without overwriting prior evidence. rbox also
