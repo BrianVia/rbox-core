@@ -23,6 +23,10 @@ export interface TransferProgressBytes {
   bytesDone: number;
   /** Present only when the byte denominator is determinate. */
   bytesTotal?: number;
+  /** Sliding-window upload rate. Additive/optional for daemon wire compatibility. */
+  bytesPerSecond?: number;
+  /** Stable-rate estimate of whole seconds remaining. */
+  etaSeconds?: number;
 }
 
 /** Progress for the long phases of sync. The CLI renders it on the spinner and

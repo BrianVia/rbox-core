@@ -19,6 +19,7 @@ import { BlobRetryLaterError, BlobShaMismatchError, type SyncRemote } from "./re
 import type { WorkspaceConfig } from "./config.js";
 import type { TransferProgress } from "./transfer-progress.js";
 import { UploadByteTracker } from "./upload-byte-tracker.js";
+import { TransferRateSampler } from "./transfer-rate.js";
 import { beginFirstPublishTiming, firstPublishMeasurementLive, firstPublishMeasurementToken, firstPublishReady, firstPublishTiming, firstPublishUploadEnd, firstPublishUploadStart, LANE_TIMING, uploadLaneTiming, uploadLaneTimingSummary } from "./upload-lane-timing.js";
 import { metricsEnabled } from "./metrics.js";
 import { runPublishPipeline } from "./publish-pipeline/pipeline.js";
@@ -211,6 +212,13 @@ export async function encryptAndUpload(
       const fuse = pool !== undefined && fuseEnabled() && options.encryptFileToTemp === undefined;
       // Encrypt changed files concurrently (was sequential — slow on a big first push).
       let enc = 0;
+      let encBytesDone = 0;
+      const encBytesTotal = toEncrypt.reduce((sum, file) => sum + file.size, 0);
+      const emitEncrypt = (file: FileEntry): void => {
+        enc++;
+        encBytesDone += file.size;
+        onProgress?.(enc, toEncrypt.length, "encrypt", file.path, { bytesDone: encBytesDone, bytesTotal: encBytesTotal });
+      };
       let encCtBytes = 0; // ciphertext this run had to (re)encrypt = §35 "changed bytes"
       let cacheHits = 0;
       let cacheMisses = 0;
@@ -227,7 +235,7 @@ export async function encryptAndUpload(
           const status = await classifyCacheHit(root, f);
           if (status === "defer") {
             deferred.add(f.path);
-            onProgress?.(++enc, toEncrypt.length, "encrypt", f.path);
+            emitEncrypt(f);
             return;
           }
           if (status === "accept") {
@@ -237,7 +245,7 @@ export async function encryptAndUpload(
             encryptCache.record(f.sha256, { ...cached, path: f.path });
             cacheWriter.schedule();
             if (LANE_TIMING) uploadLaneTiming.encryptMs += performance.now() - t0;
-            onProgress?.(++enc, toEncrypt.length, "encrypt", f.path);
+            emitEncrypt(f);
             return;
           }
         }
@@ -256,7 +264,7 @@ export async function encryptAndUpload(
           // never-synced one) and the next scan sees the deletion for real.
           if (isDeferrableChurn(err, f.path, options.warningSink)) {
             deferred.add(f.path);
-            onProgress?.(++enc, toEncrypt.length, "encrypt", f.path);
+            emitEncrypt(f);
             return;
           }
           throw err;
@@ -269,7 +277,7 @@ export async function encryptAndUpload(
         cacheWriter.schedule();
         encCtBytes += e.cipherSize;
         if (LANE_TIMING) uploadLaneTiming.encryptMs += performance.now() - t0;
-        onProgress?.(++enc, toEncrypt.length, "encrypt", f.path);
+        emitEncrypt(f);
         });
         if (firstPublishTiming.enabled) {
           const wall = performance.now() - wallT0;
@@ -350,7 +358,8 @@ export async function encryptAndUpload(
     const uploaded = new Set<string>(); // addresses already landed this run (convergent dedup)
     let up = 0;
     const byteTracker = UploadByteTracker.fromFiles(toUpload, missing, ctSizeByEnc);
-    const emitUploadProgress = (currentPath?: string) => onProgress?.(up, toUpload.length, "upload", currentPath, byteTracker.progress());
+    const rateSampler = new TransferRateSampler();
+    const emitUploadProgress = (currentPath?: string) => onProgress?.(up, toUpload.length, "upload", currentPath, rateSampler.sample(byteTracker.progress()));
 
     /**
      * Upload ONE file's blob with bounded per-file retry. Each retry re-encrypts a fresh

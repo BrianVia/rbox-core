@@ -162,22 +162,22 @@ test("remediation classification covers every lane and the apply capability gate
 
 // ── progressLabel ─────────────────────────────────────────────────────────────
 
-test("progressLabel renders percent + counts per phase", () => {
-  expect(progressLabel("upload", 3612, 8603)).toBe("uploading 41% (3,612/8,603)");
-  expect(progressLabel("encrypt", 1, 4)).toBe("encrypting 25% (1/4)");
-  expect(progressLabel("download", 4, 4)).toBe("downloading 100% (4/4)");
-  expect(progressLabel("upload", 0, 0)).toBe("uploading 100% (0/0)"); // degenerate: no work = done
-  expect(progressLabel("upload", 3, 2)).toBe("uploading 100% (3/2)"); // clamped, never 150%
-  expect(progressLabel("upload", -1, 2)).toBe("uploading 0% (-1/2)"); // clamped, never negative
+test("progressLabel never derives transfer percent from file counts", () => {
+  expect(progressLabel("upload", 3612, 8603)).toBe("uploading 3,612/8,603");
+  expect(progressLabel("encrypt", 1, 4)).toBe("encrypting 1/4");
+  expect(progressLabel("download", 4, 4)).toBe("downloading 4/4");
+  expect(progressLabel("upload", 0, 0)).toBe("uploading 0/0");
 });
 
-test("progressLabel renders byte channel as a second fraction without a unified percent", () => {
-  const GiB = 1024 ** 3;
-  expect(progressLabel("upload", 126352, 126369, undefined, { bytesDone: Math.round(4.1 * GiB), bytesTotal: Math.round(6.3 * GiB) })).toBe(
-    "uploading 126,352/126,369 · 4.1/6.3 GiB"
+test("progressLabel derives bars and percent from bytes and renders decimal transfer metrics", () => {
+  expect(progressLabel("upload", 126352, 126369, undefined, { bytesDone: 1_100_000_000, bytesTotal: 2_700_000_000, bytesPerSecond: 38_000_000, etaSeconds: 40 })).toBe(
+    "uploading ▓▓░░░ 40% · 1.1 GB / 2.7 GB · 38 MB/s · ~40s left"
   );
-  expect(progressLabel("gitcap", 2, 140, undefined, { bytesDone: Math.round(4.1 * GiB) })).toBe(
-    "capturing git state 2/140 · 4.1 GiB sent"
+  expect(progressLabel("encrypt", 99, 100, undefined, { bytesDone: 1_200_000_000, bytesTotal: 2_700_000_000 })).toBe(
+    "encrypting ▓▓░░░ 44% · 1.2 GB / 2.7 GB"
+  );
+  expect(progressLabel("upload", 1, 9, undefined, { bytesDone: 10_000_000, bytesTotal: 100_000_000, bytesPerSecond: 9_540_000, etaSeconds: 181 })).toBe(
+    "uploading ░░░░░ 10% · 10.0 MB / 100.0 MB · 9.5 MB/s · ~3m left"
   );
   expect(progressLabel("gitcap", 2, 140, "repo", { bytesDone: 512 })).toBe("capturing git state 2/140 · 512 B sent — repo");
 });
@@ -185,6 +185,7 @@ test("progressLabel renders byte channel as a second fraction without a unified 
 test("progressLabel scan is indeterminate — formatted count, no percent", () => {
   expect(progressLabel("scan", 12304, 0)).toBe("scanning… 12,304 files");
   expect(progressLabel("scan", 500, 0)).toBe("scanning… 500 files");
+  expect(progressLabel("scan", 112304, 0, undefined, { bytesDone: 1_800_000_000 })).toBe("scanning… 112,304 files · 1.8 GB");
 });
 
 test("progressLabel gitcap renders N/total with the repo name", () => {
@@ -222,7 +223,7 @@ test("progressLabel gitcap detail strips ANSI escapes and control chars", () => 
 test("progressLabel unknown phase falls back to a sane verb, not garbage", () => {
   // Simulates an older/other writer landing a phase this build's union doesn't name:
   // it must not masquerade as "downloading".
-  expect(progressLabel("bogus" as unknown as Parameters<typeof progressLabel>[0], 1, 4)).toBe("syncing 25% (1/4)");
+  expect(progressLabel("bogus" as unknown as Parameters<typeof progressLabel>[0], 1, 4)).toBe("syncing 1/4");
 });
 
 // ── healthLine priority order ────────────────────────────────────────────────
@@ -241,7 +242,7 @@ test("fresh active progress outranks a standing halt and renders the halt as ret
   };
   const snapshot = base({ activity, added: 5, remote: { sequence: 99, source: "probe" } });
   const line = healthLine(snapshot);
-  expect(line).toBe("↻ syncing — encrypting 86% (105,551/121,885)");
+  expect(line).toBe("↻ syncing — encrypting 105,551/121,885");
   expect(healthDetailLines(snapshot)).toEqual([
     "⚠ last attempt failed (2m ago) ENOENT: no such file or directory — will be retried",
   ]);
@@ -334,13 +335,13 @@ test("fresh live progress renders the syncing line", () => {
   const activity: DaemonActivity = { at: iso(1), active: { at: iso(2), phase: "upload", done: 3612, total: 8603 } };
   const line = healthLine(base({ activity }));
   expect(line).toContain("syncing");
-  expect(line).toContain("uploading 41% (3,612/8,603)");
+  expect(line).toContain("uploading 3,612/8,603");
 });
 
 test("fresh live progress renders byte suffix from activity", () => {
   const activity: DaemonActivity = { at: iso(1), active: { at: iso(2), phase: "upload", done: 12, total: 100, bytesDone: 512, bytesTotal: 1024 } };
   const line = healthLine(base({ activity }));
-  expect(line).toBe("↻ syncing — uploading 12/100 · 0.5/1.0 KiB");
+  expect(line).toBe("↻ syncing — uploading ▓▓░░░ 50% · 0.5 KB / 1.0 KB");
 });
 
 test("stale live progress is ignored (a crashed daemon must not show syncing forever)", () => {

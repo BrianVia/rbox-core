@@ -1280,14 +1280,14 @@ test("transfer-progress throttle: byte-only ticks use the existing write cadence
 
   // Retraction-corrected tracker values also pass through raw and stay valid at
   // the activity boundary and renderer boundary.
-  daemon.onTransferProgress(1, 2, "upload", { bytesDone: 10, bytesTotal: 40 });
-  expect(daemon.activity.active).toMatchObject({ phase: "upload", done: 1, total: 2, bytesDone: 10, bytesTotal: 40 });
+  daemon.onTransferProgress(1, 2, "upload", { bytesDone: 10, bytesTotal: 40, bytesPerSecond: 5_000_000, etaSeconds: 6 });
+  expect(daemon.activity.active).toMatchObject({ phase: "upload", done: 1, total: 2, bytesDone: 10, bytesTotal: 40, bytesPerSecond: 5_000_000, etaSeconds: 6 });
   expect(daemon.activity.active!.bytesDone!).toBeLessThanOrEqual(daemon.activity.active!.bytesTotal!);
-  expect(progressLabel("upload", 1, 2, undefined, { bytesDone: 10, bytesTotal: 40 })).toBe("uploading 1/2 · 10/40 B");
+  expect(progressLabel("upload", 1, 2, undefined, { bytesDone: 10, bytesTotal: 40 })).toBe("uploading ▓░░░░ 25% · 10 B / 40 B");
 
   await daemon.activityWrite;
   const persisted = (await loadActivity(root))?.active;
-  expect(persisted).toMatchObject({ phase: "upload", done: 1, total: 2, bytesDone: 10, bytesTotal: 40 });
+  expect(persisted).toMatchObject({ phase: "upload", done: 1, total: 2, bytesDone: 10, bytesTotal: 40, bytesPerSecond: 5_000_000, etaSeconds: 6 });
   expect(persisted!.bytesDone!).toBeLessThanOrEqual(persisted!.bytesTotal!);
   expect(renderShellLine({ at: "", active: persisted }, { settled: false, name: "ws", now: Date.now() }).split(" ")[3]).toBe("25");
 });

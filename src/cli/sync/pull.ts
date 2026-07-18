@@ -190,7 +190,8 @@ export async function applyPulledManifest(
     trash: batch,
     onTypeFlip: deps.onTypeFlip,
     warningSink: deps.warningSink,
-    onProgress: deps.onProgress ? (done: number, total: number) => deps.onProgress!(done, total, "download") : undefined,
+    onProgress: deps.onProgress ? (done: number, total: number, bytesDone: number, bytesTotal: number) =>
+      deps.onProgress!(done, total, "download", undefined, { bytesDone, bytesTotal }) : undefined,
   };
   let actions: Action[] = [];
   let finalMatcher = matcher; // the post-pull rules — also gates git materialization below

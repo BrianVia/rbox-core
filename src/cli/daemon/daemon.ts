@@ -1832,6 +1832,8 @@ export class RboxDaemon {
       total,
       ...(detail !== undefined ? { detail } : {}),
       ...(bytes ? { bytesDone: bytes.bytesDone, ...(bytes.bytesTotal !== undefined ? { bytesTotal: bytes.bytesTotal } : {}) } : {}),
+      ...(bytes?.bytesPerSecond !== undefined ? { bytesPerSecond: bytes.bytesPerSecond } : {}),
+      ...(bytes?.etaSeconds !== undefined ? { etaSeconds: bytes.etaSeconds } : {}),
     };
     this.writeActivity();
   }

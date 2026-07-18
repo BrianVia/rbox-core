@@ -27,6 +27,7 @@ import type {
 import { BlobRetryLaterError, BlobShaMismatchError, type SyncRemote } from "../remote.js";
 import type { TransferProgress } from "../transfer-progress.js";
 import { UploadByteTracker } from "../upload-byte-tracker.js";
+import { TransferRateSampler } from "../transfer-rate.js";
 import { firstPublishMeasurementLive, firstPublishMeasurementToken, firstPublishReady, firstPublishTiming, firstPublishUploadEnd, firstPublishUploadStart, LANE_TIMING, uploadLaneTiming } from "../upload-lane-timing.js";
 import { ResourceBudget } from "./budget.js";
 import { EOF, ReadyQueue, type ReadyBlob } from "./ready-queue.js";
@@ -235,6 +236,13 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
   };
 
   let encDone = 0;
+  let encBytesDone = 0;
+  const encBytesTotal = args.toEncrypt.reduce((sum, file) => sum + file.size, 0);
+  const emitEncrypt = (file: FileEntry): void => {
+    encDone++;
+    encBytesDone += file.size;
+    args.onProgress?.(encDone, args.toEncrypt.length, "encrypt", file.path, { bytesDone: encBytesDone, bytesTotal: encBytesTotal });
+  };
   let encCtBytes = 0;
   let cacheHits = 0;
   let cacheMisses = 0;
@@ -251,7 +259,7 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
     if (cached) {
       if ((await classifyCacheHit(args.root, file)) === "defer") {
         args.deferred.add(file.path);
-        args.onProgress?.(++encDone, args.toEncrypt.length, "encrypt", file.path);
+        emitEncrypt(file);
         return;
       }
       cacheHits++;
@@ -259,7 +267,7 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
       args.encryptCache.record(file.sha256, { ...cached, path: file.path });
       args.cacheWriter.schedule();
       if (LANE_TIMING) uploadLaneTiming.encryptMs += performance.now() - t0;
-      args.onProgress?.(++encDone, args.toEncrypt.length, "encrypt", file.path);
+      emitEncrypt(file);
       submitAddressCheck(file);
       return;
     }
@@ -281,7 +289,7 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
       disk.release(reservation);
       if (isDeferrableChurn(error, file.path, args.warningSink)) {
         args.deferred.add(file.path);
-        args.onProgress?.(++encDone, args.toEncrypt.length, "encrypt", file.path);
+        emitEncrypt(file);
         return;
       }
       throw error;
@@ -292,7 +300,7 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
     recordEncrypted(file, encrypted);
     encCtBytes += encrypted.cipherSize;
     if (LANE_TIMING) uploadLaneTiming.encryptMs += performance.now() - t0;
-    args.onProgress?.(++encDone, args.toEncrypt.length, "encrypt", file.path);
+    emitEncrypt(file);
     const ready = makeReady(file, encrypted);
     submitCheck(file, ready);
     try {
@@ -321,10 +329,11 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
 
   const uploaded = new Set<string>();
   const byteTracker = new UploadByteTracker();
+  const rateSampler = new TransferRateSampler();
   let up = 0;
   let upTotal = 0;
   let upWireBytes = 0;
-  const emitUpload = (file?: FileEntry) => args.onProgress?.(up, upTotal, "upload", file?.path, byteTracker.progress());
+  const emitUpload = (file?: FileEntry) => args.onProgress?.(up, upTotal, "upload", file?.path, rateSampler.sample(byteTracker.progress()));
   const uploadReady = async (initial: ReadyBlob): Promise<number | null> => {
     let current = initial;
     for (let attempt = 0; attempt < PER_FILE_UPLOAD_ATTEMPTS; attempt++) {

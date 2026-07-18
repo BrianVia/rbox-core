@@ -240,13 +240,13 @@ test("renderShellLine state precedence: fresh active can show a retry over halt,
   expect(renderShellLine({ at: "" }, { ...base, settled: false }).split(" ")[2]).toBe("pending");
 });
 
-test("renderShellLine pct: floors, clamps 0–100, indeterminate (total<=0) → `-`; `-` when not active", () => {
+test("renderShellLine never derives transfer pct from entry counts", () => {
   const render = (done: number, total: number) =>
     renderShellLine({ at: "", active: { at: at(1799999990), phase: "upload", done, total } }, { settled: false, name: "ws", now: NOW }).split(" ")[3];
-  expect(render(1, 3)).toBe("33"); // 33.3 → floored
-  expect(render(4, 4)).toBe("100");
-  expect(render(9, 4)).toBe("100"); // over-100 clamped
-  expect(render(-1, 4)).toBe("0"); // under-0 clamped
+  expect(render(1, 3)).toBe("-");
+  expect(render(4, 4)).toBe("-");
+  expect(render(9, 4)).toBe("-");
+  expect(render(-1, 4)).toBe("-");
   // Indeterminate active (total<=0, e.g. a live scan): `-`, never a fake 100 — the
   // shell glyph would show `↻ 100%` for the whole walk. `-` is regex-legal in every
   // installed snippet (`([0-9]{1,3}|-)`), whose glyph renders `↻` alone for it.
@@ -254,7 +254,7 @@ test("renderShellLine pct: floors, clamps 0–100, indeterminate (total<=0) → 
   expect(renderShellLine({ at: "" }, { settled: true, name: "ws", now: NOW }).split(" ")[3]).toBe("-");
 });
 
-test("renderShellLine pct prefers determinate bytes, otherwise falls back to count or `-`", () => {
+test("renderShellLine pct prefers determinate bytes and keeps count fallback only for git capture", () => {
   const activeAt = at(1799999990);
   const pct = (active: DaemonActivity["active"]) =>
     renderShellLine({ at: "", active }, { settled: false, name: "ws", now: NOW }).split(" ")[3];

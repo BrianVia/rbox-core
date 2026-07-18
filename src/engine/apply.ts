@@ -48,8 +48,9 @@ export interface ApplyOptions {
   /** Max concurrent writes (each fetches+decrypts a blob). Defaults to 16 — the
    *  dominant cost of a pull is per-blob download latency, so this is the lever. */
   concurrency?: number;
-  /** Progress over the write phase (download+decrypt). `done`/`total` are entries. */
-  onProgress?: (done: number, total: number) => void;
+  /** Progress over the write phase (download+decrypt). Counts are preserved for
+   * compatibility; byte counters are the transfer-percent authority. */
+  onProgress?: (done: number, total: number, bytesDone: number, bytesTotal: number) => void;
   /** Local trash tier (design 50). When set, propagated clean deletes and type-flip
    *  directory evictions RENAME here instead of `fs.rm` — bytes stay recoverable. */
   trash?: TrashBatch;
@@ -112,6 +113,8 @@ export async function applyActions(
   // them through a bounded pool — a pull was a sequential per-blob download, which
   // is latency-bound and slow on a real clone. Deletes (local, cheap) stay last.
   let done = 0;
+  let bytesDone = 0;
+  const bytesTotal = rest.reduce((sum, action) => sum + transferBytesForEntry(action.entry, opts.kek), 0);
   const envDl = Number(process.env.RBOX_DOWNLOAD_CONCURRENCY);
   // The recorded savvy-core sweep kept improving from 64 to 128 without a D1
   // plateau, so foreground pulls default to 128. Constrained clients can pin
@@ -189,7 +192,8 @@ export async function applyActions(
               kek: opts.kek, trash: opts.trash, onTypeFlip: opts.onTypeFlip, keepLocalAs: a.keepLocalAs, preparedTmp: prepared.get(a),
             });
           }
-          opts.onProgress?.(++done, rest.length);
+          bytesDone += transferBytesForEntry(a.entry, opts.kek);
+          opts.onProgress?.(++done, rest.length, bytesDone, bytesTotal);
         });
       } finally {
         if (measured) addWritePoolMs(performance.now() - poolT0);
@@ -205,6 +209,12 @@ export async function applyActions(
   for (const a of deletes) {
     await deleteEntry(destRoot, a.path, a.expectedLocal, device, now, opts.trash);
   }
+}
+
+function transferBytesForEntry(entry: FileEntry, kek?: Buffer): number {
+  if (entry.type !== "file") return 0;
+  if (!entry.encSha || !kek) return entry.size;
+  return entry.comp ? (entry.cipherSize ?? entry.size + BLOB_CIPHERTEXT_TAG_BYTES) : entry.size + BLOB_CIPHERTEXT_TAG_BYTES;
 }
 
 /** Stage the remote entry to a temp, re-check the target, preserve any surprise

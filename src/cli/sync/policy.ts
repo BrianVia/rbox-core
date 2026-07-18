@@ -78,8 +78,8 @@ export const defaultBackoff = (attempt: number) => sleep(Math.min(2000, 100 * 2 
 
 /** Adapt `deps.onProgress` into the engine scan's discovery callback: the walk reports a
  *  running count with no known total, which surfaces as the indeterminate `scan` phase. */
-export const scanTick = (deps: SyncDeps): ((discovered: number) => void) | undefined =>
-  deps.onProgress ? (discovered) => deps.onProgress!(discovered, 0, "scan") : undefined;
+export const scanTick = (deps: SyncDeps): ((discovered: number, bytesDiscovered: number) => void) | undefined =>
+  deps.onProgress ? (discovered, bytesDiscovered) => deps.onProgress!(discovered, 0, "scan", undefined, { bytesDone: bytesDiscovered }) : undefined;
 
 /** Plaintext byte total / file-entry count of a manifest (the §35 "plaintext bytes" basis
  *  + file count). Computed only on the metrics-enabled path (each is an O(files) pass). */

@@ -404,16 +404,17 @@ test("encrypt cache hit skips encrypt when the cached blob already exists", asyn
   });
 
   const counter = countingEncrypt();
-  const progress: Array<{ phase: string; bytesTotal?: number }> = [];
+  const progress: Array<{ phase: string; bytesDone?: number; bytesTotal?: number }> = [];
   const res = await push(root, cfg, {
     ...deps(remote),
     encryptFileToTemp: counter.fn,
-    onProgress: (_done, _total, phase, _label, bytes) => progress.push({ phase, bytesTotal: bytes?.bytesTotal }),
+    onProgress: (_done, _total, phase, _label, bytes) => progress.push({ phase, bytesDone: bytes?.bytesDone, bytesTotal: bytes?.bytesTotal }),
   });
 
   expect(res.sequence).toBe(1);
   expect(counter.calls()).toBe(0);
   expect((await remote.latest()).manifest.files[0]!.encSha).toBe(cached.encSha);
+  expect(progress.filter((p) => p.phase === "encrypt")).toEqual([{ phase: "encrypt", bytesDone: Buffer.byteLength(content), bytesTotal: Buffer.byteLength(content) }]);
   expect(progress.filter((p) => p.phase === "upload" && (p.bytesTotal ?? 0) > 0)).toEqual([]);
 });
 
