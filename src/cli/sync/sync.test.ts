@@ -290,7 +290,17 @@ test("no-op: pull-then-push with no local changes makes ZERO commits, sequence s
   expect(remote.headSeq()).toBe(1);
 });
 
-test("same-SHA size mismatch commits a metadata heal without re-encrypting or conflicting", async () => {
+// QUARANTINED locally (design 155): red on clean main on dev machines while CI has
+// never seen it fail — the design-123 registry's one tolerated flake. A known-red
+// test means a red `bun test src/cli` needs hand-triage every run, so local runs
+// skip it; CI still runs it, and RBOX_RUN_QUARANTINED=1 opts back in. Root cause
+// is NOT established: it passes isolated AND full-suite on Linux under bun 1.3.11
+// and 1.3.14 (15+ attempts, 2026-07-18); all known failures are on macOS dev
+// machines. The combined assertion below makes the next opted-in failure
+// self-attributing (scan/churn defer vs re-encrypt vs conflict) — capture that
+// output, root-cause, then delete the skip.
+const quarantinedLocally = !process.env.CI && process.env.RBOX_RUN_QUARANTINED !== "1";
+test.skipIf(quarantinedLocally)("same-SHA size mismatch commits a metadata heal without re-encrypting or conflicting", async () => {
   const remote = new FakeRemote();
   const content = "coherent bytes\n";
   await write("heal.txt", content);
@@ -303,8 +313,13 @@ test("same-SHA size mismatch commits a metadata heal without re-encrypting or co
 
   const counter = countingEncrypt();
   const res = await push(root, cfg, { ...deps(remote), encryptFileToTemp: counter.fn });
-  expect(res.committed).toBe(true);
-  expect(counter.calls()).toBe(0);
+  // One combined assertion so a failure names its channel: a scan/churn defer
+  // surfaces as deferred:["heal.txt"], a needless re-encrypt as encryptCalls:1.
+  expect({ committed: res.committed, deferred: res.deferred ?? [], encryptCalls: counter.calls() }).toEqual({
+    committed: true,
+    deferred: [],
+    encryptCalls: 0,
+  });
   const healed = (await remote.latest()).manifest.files.find((f) => f.path === "heal.txt")!;
   expect(healed.size).toBe(Buffer.byteLength(content));
   expect(healed.sha256).toBe(coherent.sha256);
