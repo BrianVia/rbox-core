@@ -10,10 +10,13 @@ import { putBlobMultipart } from "./multipart.js";
 
 const METRIC_SHAPE = /^rbox multipart parts=\d+ bytes=\d+ partWall p50=\d+ p95=\d+ max=\d+ sum=\d+ms gap p50=\d+ p95=\d+ max=\d+ sum=\d+ms complete=\d+ms retries=\d+ reinit=\d+(?: srv total=\d+ assemble=\d+ reread=\d+ acct=\d+)?$/;
 const previousMetricsEnv = process.env.RBOX_METRICS;
+const previousDebugEnv = process.env.RBOX_DEBUG;
 
 afterEach(() => {
   if (previousMetricsEnv === undefined) delete process.env.RBOX_METRICS;
   else process.env.RBOX_METRICS = previousMetricsEnv;
+  if (previousDebugEnv === undefined) delete process.env.RBOX_DEBUG;
+  else process.env.RBOX_DEBUG = previousDebugEnv;
 });
 
 async function makeBlob(size: number): Promise<{ dir: string; file: string; sha: string }> {
@@ -29,6 +32,7 @@ async function makeBlob(size: number): Promise<{ dir: string; file: string; sha:
 describe("multipart client instrumentation", () => {
   test("a real three-part upload emits exactly one numbers-only line with server timings", async () => {
     process.env.RBOX_METRICS = "1";
+    process.env.RBOX_DEBUG = "1";
     const blob = await makeBlob(24 * 1024 * 1024);
     const server = await startFakeMultipartServer({ partSize: 8 * 1024 * 1024, partLatencyMs: 1 });
     const lines: string[] = [];
@@ -61,6 +65,7 @@ describe("multipart client instrumentation", () => {
 
   test("an old server omitting serverTimings still emits without the srv suffix", async () => {
     process.env.RBOX_METRICS = "1";
+    process.env.RBOX_DEBUG = "1";
     const blob = await makeBlob(32);
     const server = await startFakeMultipartServer({ partSize: 16, includeServerTimings: false });
     const lines: string[] = [];
@@ -78,6 +83,23 @@ describe("multipart client instrumentation", () => {
 
   test("RBOX_METRICS=0 emits nothing and the upload still succeeds (pre-101 behavior)", async () => {
     process.env.RBOX_METRICS = "0";
+    process.env.RBOX_DEBUG = "1";
+    const blob = await makeBlob(32);
+    const server = await startFakeMultipartServer({ partSize: 16 });
+    const lines: string[] = [];
+    try {
+      await putBlobMultipart(new RemoteContext(server.baseUrl, "token", "workspace", "project", (line) => lines.push(line)), blob.sha, blob.file, 32);
+      expect(lines).toEqual([]);
+      expect(server.stats.completedParts).toBe(2);
+    } finally {
+      await server.close();
+      await fs.rm(blob.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("multipart instrumentation is hidden by default while the upload still succeeds", async () => {
+    process.env.RBOX_METRICS = "1";
+    delete process.env.RBOX_DEBUG;
     const blob = await makeBlob(32);
     const server = await startFakeMultipartServer({ partSize: 16 });
     const lines: string[] = [];
@@ -93,6 +115,7 @@ describe("multipart client instrumentation", () => {
 
   test("one transient part failure is counted and the upload succeeds", async () => {
     process.env.RBOX_METRICS = "1";
+    process.env.RBOX_DEBUG = "1";
     const blob = await makeBlob(32);
     const server = await startFakeMultipartServer({ partSize: 16, failPartOnce: 1 });
     const lines: string[] = [];

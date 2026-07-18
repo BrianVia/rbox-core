@@ -59,7 +59,7 @@ export class RboxApi implements SyncRemote {
 
   constructor(baseUrl: string, token: string, workspaceId: string, projectId: string, warningSink?: (line: string) => void) {
     this.ctx = warningSink
-      ? new RemoteContext(baseUrl, token, workspaceId, projectId, warningSink)
+      ? new RemoteContext(baseUrl, token, workspaceId, projectId, warningSink, warningSink)
       : new RemoteContext(baseUrl, token, workspaceId, projectId);
     this.batchDownloader = new BlobBatchDownloader(this.ctx);
     this.batchUploader = new BlobBatchUploader(this.ctx);

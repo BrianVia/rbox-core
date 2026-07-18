@@ -26,7 +26,7 @@ export async function putBlobMultipart(
   uploadsDir?: string,
   onBytes?: ByteProgressCallback
 ): Promise<void> {
-  const metrics = new MultipartMetrics(multipartMetricsEnabled(), ctx.warningSink);
+  const metrics = new MultipartMetrics(multipartMetricsEnabled(), ctx.instrumentationSink);
   try {
     await multipartAttempt(ctx, sha256, absPath, size, uploadsDir, true, onBytes, metrics);
   } catch (e) {

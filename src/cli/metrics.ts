@@ -13,6 +13,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { PhaseReport, writeFileAtomic } from "../engine/index.js";
 import { RBOX_DIR } from "./config.js";
+import { debugEnabled } from "./debug.js";
 
 /** Per-run phase metrics (design §35/85) are on by default. Measured scan overhead is
  *  <=3% in the worst cache-hit profile; set `RBOX_METRICS=0` (or `false`) to opt out. */
@@ -24,6 +25,12 @@ export const metricsEnabled = (): boolean => process.env.RBOX_METRICS !== "0" &&
 export function beginReport(op: "push" | "pull" | "sync"): PhaseReport | undefined {
   if (!metricsEnabled()) return undefined;
   return op === "push" ? PhaseReport.push() : op === "pull" ? PhaseReport.pull() : PhaseReport.sync();
+}
+
+/** Print a collected report to an interactive terminal only when debug output is on.
+ * Daemon and machine consumers continue to call PhaseReport.logSummaryTo directly. */
+export function logDebugSummary(report: PhaseReport | undefined, sink: (line: string) => void): void {
+  if (debugEnabled()) report?.logSummaryTo(sink);
 }
 
 export interface SyncMetrics {

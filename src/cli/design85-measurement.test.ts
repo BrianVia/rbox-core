@@ -2,9 +2,9 @@ import { afterEach, describe, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { createScanStats, HashCache, scanManifest, type FileEntry, type Manifest, type WatchEvent } from "../engine/index.js";
+import { createScanStats, HashCache, PhaseReport, scanManifest, type FileEntry, type Manifest, type WatchEvent } from "../engine/index.js";
 import { RboxDaemon, scanStatsLine } from "./daemon.js";
-import { metricsEnabled } from "./metrics.js";
+import { logDebugSummary, metricsEnabled } from "./metrics.js";
 import { createScanProbe, probeEligible, RACY_MARGIN_MS, type ScanProbeState } from "./scan-probe.js";
 import {
   candidateStillMismatch,
@@ -22,13 +22,33 @@ import {
 } from "./daemon/drift-audit.js";
 
 const oldMetrics = process.env.RBOX_METRICS;
-afterEach(() => { if (oldMetrics === undefined) delete process.env.RBOX_METRICS; else process.env.RBOX_METRICS = oldMetrics; });
+const oldDebug = process.env.RBOX_DEBUG;
+afterEach(() => {
+  if (oldMetrics === undefined) delete process.env.RBOX_METRICS; else process.env.RBOX_METRICS = oldMetrics;
+  if (oldDebug === undefined) delete process.env.RBOX_DEBUG; else process.env.RBOX_DEBUG = oldDebug;
+});
 
 test("metrics default on with explicit opt-out", () => {
   delete process.env.RBOX_METRICS; expect(metricsEnabled()).toBe(true);
   process.env.RBOX_METRICS = "0"; expect(metricsEnabled()).toBe(false);
   process.env.RBOX_METRICS = "false"; expect(metricsEnabled()).toBe(false);
   process.env.RBOX_METRICS = "1"; expect(metricsEnabled()).toBe(true);
+});
+
+test("interactive phase summary is hidden by default and shown under RBOX_DEBUG", () => {
+  const report = PhaseReport.push();
+  report.record("scan", { count: 1 });
+  const lines: string[] = [];
+
+  delete process.env.RBOX_DEBUG;
+  logDebugSummary(report, (line) => lines.push(line));
+  expect(lines).toEqual([]);
+  expect(report.toJSON().phases.scan?.count).toBe(1);
+
+  process.env.RBOX_DEBUG = "1";
+  logDebugSummary(report, (line) => lines.push(line));
+  expect(lines).toHaveLength(1);
+  expect(lines[0]).toContain("rbox push files=");
 });
 
 test("daemon deep audit records, confirms, and races without sleeping", async () => {

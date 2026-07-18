@@ -15,7 +15,7 @@ import { buildAuthedRemote } from "./e2ee-client.js";
 import { enrolledDeviceId, hasDevice } from "./e2ee-keystore.js";
 import { login } from "./auth-cmd.js";
 import { filesFirstFlagEnabled, pull, push, sync } from "./sync.js";
-import { beginReport } from "./metrics.js";
+import { beginReport, logDebugSummary } from "./metrics.js";
 import { resolveInitPlan, resolveWorkspaceDeviceId, isInitError, collapseHome, interpretWorkspaceNameAnswer, type InitPlan } from "./init-plan.js";
 import { style, stderrStyle, fail } from "./style.js";
 import { spinner } from "./spinner.js";
@@ -451,7 +451,7 @@ async function executeInitPlan(
             ? `published ${style.sym.arrow} sequence ${style.cyan(String(r1.sequence))}`
             : `already in sync — nothing to upload ${style.dim(`(sequence ${r1.sequence})`)}`
         );
-        report1?.logSummaryTo((l) => console.log(style.dim(l)));
+        logDebugSummary(report1, (l) => console.log(style.dim(l)));
 
         // Commit 2 — attach git history (design 108 §3.1). CONDITIONAL: only when commit 1
         // was a files-only, sequence-advancing genesis commit with git still owed. A bypass
@@ -470,7 +470,7 @@ async function executeInitPlan(
                 ? `git history attached ${style.sym.arrow} sequence ${style.cyan(String(r2.sequence))}`
                 : `git history up to date ${style.dim(`(sequence ${r2.sequence})`)}`
             );
-            report2?.logSummaryTo((l) => console.log(style.dim(l)));
+            logDebugSummary(report2, (l) => console.log(style.dim(l)));
           } catch {
             // Commit 1's files are durable; git resumes via the daemon or the next push.
             sp2.stop();
