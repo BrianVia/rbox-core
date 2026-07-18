@@ -242,6 +242,11 @@ async function applyStripeEvent(env: Env, event: { type: string; data: { object:
       if (!accountId || !obj.customer) break;
       const item = obj.items?.data?.[0];
       const lookupKey = item?.price?.lookup_key as string | undefined;
+      // 'year'→'annual', 'month'→'monthly' (validation note #21). Anything else
+      // (missing/unrecognized recurring.interval) leaves it NULL rather than guess —
+      // the dashboard degrades to its default monthly display for NULL.
+      const rawInterval = item?.price?.recurring?.interval as string | undefined;
+      const interval: BillingCadence | null = rawInterval === "year" ? "annual" : rawInterval === "month" ? "monthly" : null;
       const paying = obj.status === "active" || obj.status === "trialing";
       // Ownership guard unchanged: only the account this customer is bound to (or an
       // as-yet UNBOUND account named by trusted-at-checkout metadata) can change.
@@ -251,8 +256,8 @@ async function applyStripeEvent(env: Env, event: { type: string; data: { object:
         const plan = planForLookupKey(lookupKey) ?? "none";
         const db = dbFor(env, accountId);
         const [upd] = await db.batch([
-          db.prepare("UPDATE accounts SET plan = ?, stripe_customer_id = ?, stripe_subscription_id = ? WHERE id = ? AND reclaimed_at IS NULL AND (stripe_customer_id IS NULL OR stripe_customer_id = ?)")
-            .bind(plan, obj.customer, obj.id, accountId, obj.customer),
+          db.prepare("UPDATE accounts SET plan = ?, billing_interval = ?, stripe_customer_id = ?, stripe_subscription_id = ? WHERE id = ? AND reclaimed_at IS NULL AND (stripe_customer_id IS NULL OR stripe_customer_id = ?)")
+            .bind(plan, interval, obj.customer, obj.id, accountId, obj.customer),
           fairUseQueueStatement(db, accountId, nowMs, "plan_changed"),
         ]);
         // §32 Tier 1 business ping (best-effort, never throws) — only on the INITIAL
@@ -275,7 +280,7 @@ async function applyStripeEvent(env: Env, event: { type: string; data: { object:
         // non-paying (past_due/unpaid/canceled-but-not-deleted) → locked + grace + clear extras.
         const db = dbFor(env, accountId);
         await db.batch([
-          db.prepare(`UPDATE accounts SET plan = 'none', extra_storage_bytes = 0, stripe_customer_id = ?, stripe_subscription_id = ?, grace_until = ${graceCase()} WHERE id = ? AND reclaimed_at IS NULL AND (stripe_customer_id IS NULL OR stripe_customer_id = ?)`)
+          db.prepare(`UPDATE accounts SET plan = 'none', billing_interval = NULL, extra_storage_bytes = 0, stripe_customer_id = ?, stripe_subscription_id = ?, grace_until = ${graceCase()} WHERE id = ? AND reclaimed_at IS NULL AND (stripe_customer_id IS NULL OR stripe_customer_id = ?)`)
             .bind(obj.customer, obj.id, nowMs, nowMs + GRACE_PERIOD_MS, accountId, obj.customer),
           fairUseQueueStatement(db, accountId, nowMs, "plan_changed"),
         ]);
@@ -289,7 +294,7 @@ async function applyStripeEvent(env: Env, event: { type: string; data: { object:
         // placement-constraint model) with NO account id in scope. Account-less at N=1 (one
         // shard); a sharded world needs a (stripe_customer_id → shard) directory index.
         const del = await dbFor(env, "")
-          .prepare(`UPDATE accounts SET plan = 'none', extra_storage_bytes = 0, stripe_subscription_id = NULL, grace_until = ${graceCase()} WHERE stripe_customer_id = ? AND stripe_subscription_id = ?`)
+          .prepare(`UPDATE accounts SET plan = 'none', billing_interval = NULL, extra_storage_bytes = 0, stripe_subscription_id = NULL, grace_until = ${graceCase()} WHERE stripe_customer_id = ? AND stripe_subscription_id = ?`)
           .bind(nowMs, nowMs + GRACE_PERIOD_MS, obj.customer, obj.id)
           .run();
         if ((del.meta.changes ?? 0) > 0 && obj.metadata?.account_id) {

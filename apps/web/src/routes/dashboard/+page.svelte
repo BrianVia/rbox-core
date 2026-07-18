@@ -126,6 +126,18 @@
 	const plan = $derived((usage?.plan as Tier) ?? 'none');
 	const noPlan = $derived(plan === 'none');
 	const info = $derived(PLAN[plan] ?? PLAN.none);
+	// The active-subscription summary must show the price the account is actually
+	// paying, not always the monthly one (validation note #21). usage.interval is
+	// only meaningful once a plan is active; 'monthly' and null (unknown — e.g.
+	// pre-migration rows) both fall back to the existing monthly label. Reuses the
+	// same per-plan annual price metadata as the checkout cards below — no new
+	// hardcoded numbers.
+	const activePrice = $derived.by(() => {
+		if (noPlan) return info.price;
+		const tier = UPGRADES.find((p) => p.id === plan);
+		if (usage?.interval === 'annual' && tier) return `${tier.annualPrice}/mo · billed annually`;
+		return info.price;
+	});
 	const pct = $derived(
 		usage && usage.storageCap ? Math.min(100, (usage.usedBytes / usage.storageCap) * 100) : 0
 	);
@@ -151,7 +163,7 @@
 					</span>
 				</div>
 				<div class="flex items-center gap-4">
-					<span class="text-lg font-semibold tabular">{info.price}</span>
+					<span class="text-lg font-semibold tabular">{activePrice}</span>
 					{#if !noPlan}
 						<Button variant="outline" size="sm" disabled={busy} onclick={portal}>
 							Manage billing
