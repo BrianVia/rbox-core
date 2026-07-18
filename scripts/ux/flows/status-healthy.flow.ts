@@ -19,6 +19,9 @@ export default defineFlow({
     { on: "a", keys: ["Enter"] },
     { on: "a", waitFor: /Keep this workspace syncing in the background\?/, timeout: 120 },
     { on: "a", keys: ["Down", "Enter"] },
+    { on: "a", waitFor: /Set up another machine now/, timeout: 120 },
+    { on: "a", keys: ["Down", "Enter"] },
+    { on: "a", waitFor: /To pair more devices later, run `rbox pair` on an already-paired machine\./ },
     { on: "a", pollUntil: { exec: ["status"], pattern: /^a · syncing normally$/m, timeout: 120 } },
     {
       on: "a",

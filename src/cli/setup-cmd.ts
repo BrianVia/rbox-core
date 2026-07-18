@@ -26,7 +26,7 @@ import path from "node:path";
 import fs from "node:fs/promises";
 import { GITIGNORE_CHOICES, WORKSPACE_DEFINITION, continueInitWithPrecreatedWorkspace, preflightInitRebind, runInit } from "./init-cmd.js";
 import { collapseHome, interpretWorkspaceNameAnswer } from "./init-plan.js";
-import { EXISTING_ACCOUNT_ENROLLMENT_MESSAGE, login, redeemPair, runGenesisEnrollment } from "./auth-cmd.js";
+import { EXISTING_ACCOUNT_ENROLLMENT_MESSAGE, login, pairCreate, redeemPair, runGenesisEnrollment } from "./auth-cmd.js";
 import { enrollViaPrevalidatedRecovery, PairingTokenShapeError, parsePairingToken } from "./e2ee-client.js";
 import { phraseToRk } from "../engine/e2ee/index.js";
 import { enableAutostart, startDaemonAndRecordDesired } from "./autostart-cmd.js";
@@ -35,7 +35,7 @@ import { loadConfigIfPresent, loadRawState, syncStreamId } from "./config.js";
 import { hasDevice } from "./e2ee-keystore.js";
 import { createRemoteWorkspace, RboxApi } from "./remote.js";
 import { promptWorkspacePick } from "./workspace-picker.js";
-import { promptSelect, promptInput, promptConfirm, promptPassword, promptPath } from "./prompt.js";
+import { isInteractive, promptSelect, promptInput, promptConfirm, promptPassword, promptPath } from "./prompt.js";
 import { stderrStyle as e } from "./style.js";
 import { checkoutUrl, type BillingCadence, type SubscribePlan } from "./subscribe-cmd.js";
 import { openAndShow } from "./browser-open.js";
@@ -90,6 +90,18 @@ export const START_SYNC_CHOICES = [
  *  the daemon only; "none" does neither. */
 export function startSyncActions(choice: StartSyncChoice): { startDaemon: boolean; enableAutostart: boolean } {
   return { startDaemon: choice !== "none", enableAutostart: choice === "both" };
+}
+
+export type SetupCompletionChoice = "pair" | "exit";
+
+/** Keep the live labels and their effects coupled through a unit-tested mapper. */
+export const SETUP_COMPLETION_CHOICES = [
+  { name: "Set up another machine now", value: "pair" },
+  { name: "Exit", value: "exit" },
+] as const satisfies ReadonlyArray<{ name: string; value: SetupCompletionChoice }>;
+
+export function setupCompletionActions(choice: SetupCompletionChoice): { createPairingToken: boolean } {
+  return { createPairingToken: choice === "pair" };
 }
 
 /** Loop Step 2 only for explicit pre-init navigation; consume preselection once. */
@@ -223,7 +235,7 @@ export async function runSetup(opts: {
 
   if (syncDisabledUntilSubscribe) {
     process.stderr.write(`${e.yellow("!")}  Sync is disabled until you run \`rbox subscribe\` and choose a plan.\n`);
-    printSummary(outcome.workspaceName || path.basename(outcome.root));
+    await finishSetup(outcome.workspaceName || path.basename(outcome.root));
     return;
   }
 
@@ -263,7 +275,7 @@ export async function runSetup(opts: {
   //   }
   // }
 
-  printSummary(outcome.workspaceName || path.basename(outcome.root));
+  await finishSetup(outcome.workspaceName || path.basename(outcome.root));
 }
 
 /** The enrolled account id, or undefined when signed out / not enrolled. */
@@ -847,15 +859,44 @@ export async function stepWorkspace(
   }
 }
 
-function printSummary(workspaceName: string): void {
-  process.stderr.write(`\n${HR}\n`);
-  process.stderr.write(`${e.green("✓")}  ${e.bold("rbox is set up.")}\n`);
-  process.stderr.write(`     workspace: ${e.cyan(workspaceName)}     device: ${os.hostname()}\n`);
-  process.stderr.write(`     ${e.dim("This workspace is end-to-end encrypted — the server never sees your files.")}\n`);
-  process.stderr.write(`     ${e.dim("Tune what syncs with `rbox ignore` or .rboxignore.")}\n`);
-  process.stderr.write(`\n   ${e.bold("Bring another machine online:")}\n`);
-  process.stderr.write(`     rbox pair      ${e.dim("(here — prints a token)")}\n`);
-  process.stderr.write(`     rbox setup     ${e.dim('(there — choose "Log into an existing account" → paste the token)')}\n`);
+interface FinishSetupDeps {
+  interactive?: () => boolean;
+  select?: typeof promptSelect;
+  createPairingToken?: typeof pairCreate;
+  writeStderr?: (text: string) => void;
+}
+
+const PAIR_LATER_NOTE = "To pair more devices later, run `rbox pair` on an already-paired machine.";
+
+/** Print the successful summary and offer exactly one post-setup action. */
+export async function finishSetup(workspaceName: string, deps: FinishSetupDeps = {}): Promise<void> {
+  const interactive = (deps.interactive ?? isInteractive)();
+  const writeStderr = deps.writeStderr ?? ((text: string) => process.stderr.write(text));
+  writeStderr(`\n${HR}\n`);
+  writeStderr(`${e.green("✓")}  ${e.bold("rbox is set up.")}\n`);
+  writeStderr(`     workspace: ${e.cyan(workspaceName)}     device: ${os.hostname()}\n`);
+  writeStderr(`     ${e.dim("This workspace is end-to-end encrypted — the server never sees your files.")}\n`);
+  writeStderr(`     ${e.dim("Tune what syncs with `rbox ignore` or .rboxignore.")}\n`);
+
+  if (!interactive) {
+    writeStderr(`\n   ${e.bold("Bring another machine online:")}\n`);
+    writeStderr(`     rbox pair      ${e.dim("(here — prints a token)")}\n`);
+    writeStderr(`     rbox setup     ${e.dim('(there — choose "Log into an existing account" → paste the token)')}\n`);
+    return;
+  }
+
+  const choice = await (deps.select ?? promptSelect)<SetupCompletionChoice>({
+    message: "What would you like to do next?",
+    choices: SETUP_COMPLETION_CHOICES,
+  });
+  if (setupCompletionActions(choice).createPairingToken) {
+    try {
+      await (deps.createPairingToken ?? pairCreate)();
+    } catch (error) {
+      writeStderr(`${e.yellow(error instanceof Error ? error.message : String(error))}\n`);
+    }
+  }
+  writeStderr(`${e.dim(PAIR_LATER_NOTE)}\n`);
 }
 
 export const SETUP_GITIGNORE_CHOICES = GITIGNORE_CHOICES;
