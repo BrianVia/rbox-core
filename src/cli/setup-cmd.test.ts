@@ -9,6 +9,9 @@ import {
   resolveEnrollment,
   startSyncActions,
   START_SYNC_CHOICES,
+  setupCompletionActions,
+  SETUP_COMPLETION_CHOICES,
+  finishSetup,
   SETUP_GITIGNORE_CHOICES,
   PAIRING_TOKEN_SOURCE_DESCRIPTION,
   AUTHORIZATION_CHOICES,
@@ -135,6 +138,46 @@ test("Step 3 select wiring: ordered choices → side effects (both first, then d
     { name: "Start background sync now only", value: "start", startDaemon: true, enableAutostart: false },
     { name: "Not now", value: "none", startDaemon: false, enableAutostart: false },
   ]);
+});
+
+test("post-setup select wiring: ordered choices map to pair once or exit", () => {
+  expect(SETUP_COMPLETION_CHOICES.map((choice) => ({ ...choice, ...setupCompletionActions(choice.value) }))).toEqual([
+    { name: "Set up another machine now", value: "pair", createPairingToken: true },
+    { name: "Exit", value: "exit", createPairingToken: false },
+  ]);
+});
+
+test("non-interactive setup completion keeps the existing static handoff and does not prompt", async () => {
+  const writes: string[] = [];
+  let prompts = 0;
+  let pairs = 0;
+  await finishSetup("workspace-a", {
+    interactive: () => false,
+    select: (async () => { prompts++; return "pair"; }) as never,
+    createPairingToken: async () => { pairs++; },
+    writeStderr: (text) => void writes.push(text),
+  });
+  const output = writes.join("");
+  expect(output).toContain("✓  rbox is set up.");
+  expect(output).toContain("Bring another machine online:");
+  expect(output).toContain("rbox pair      (here — prints a token)");
+  expect(output).toContain('rbox setup     (there — choose "Log into an existing account" → paste the token)');
+  expect(output).not.toContain("To pair more devices later");
+  expect({ prompts, pairs }).toEqual({ prompts: 0, pairs: 0 });
+});
+
+test("interactive setup completion catches pair failures and always prints the fallback note", async () => {
+  const writes: string[] = [];
+  let pairs = 0;
+  await finishSetup("workspace-a", {
+    interactive: () => true,
+    select: (async () => "pair") as never,
+    createPairingToken: async () => { pairs++; throw new Error("too many active pairing tokens"); },
+    writeStderr: (text) => void writes.push(text),
+  });
+  expect(pairs).toBe(1);
+  expect(writes.join("")).toContain("too many active pairing tokens");
+  expect(writes.at(-1)).toBe("To pair more devices later, run `rbox pair` on an already-paired machine.\n");
 });
 
 // Browser sign-in uses the device-code grant; only a pairing token enrolls inline.
