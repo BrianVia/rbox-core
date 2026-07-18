@@ -32,6 +32,9 @@ import {
   type ResetConsentWitness,
 } from "./reset-consent.js";
 
+export const WORKSPACE_DEFINITION =
+  "a workspace can be a single repository or a folder of many repositories, or just a folder.";
+
 /**
  * Gather the missing init inputs interactively (all widgets render on stderr, so
  * `rbox init > out.txt` never pollutes stdout). Callers gate this on a TTY —
@@ -55,7 +58,7 @@ export async function promptMissing(
   const pickWorkspace = ctx.promptWorkspacePick ?? promptWorkspacePick;
   if (next.new !== "true" && !next.workspace) {
     process.stderr.write(
-      `${stderrStyle.dim("a workspace can be a single repository or a folder of many repositories, or just a folder.")}\n`
+      `${stderrStyle.dim(WORKSPACE_DEFINITION)}\n`
     );
     const choice = await select<"new" | "join">({
       message: "New workspace, or join an existing one?",
@@ -122,6 +125,7 @@ export const GITIGNORE_CHOICES = [
  *  unified summary (with `summary: false`) instead of init's own trailing block. */
 export interface InitOutcome {
   workspaceId: string;
+  workspaceName?: string;
   deviceId: string;
   root: string;
 }
@@ -414,7 +418,18 @@ async function executeInitPlan(
     if (plan.firstSync === "push") {
       const sp = spinner("publishing initial snapshot — scanning files");
       try {
-        deps.onProgress = (done, total, phase, detail, bytes) => sp.update(progressLabel(phase, done, total, detail, bytes));
+        let slowNotePhase: "encrypt" | "upload" | undefined;
+        deps.onProgress = (done, total, phase, detail, bytes) => {
+          sp.update(progressLabel(phase, done, total, detail, bytes));
+          if (phase !== slowNotePhase && (phase === "encrypt" || phase === "upload")) {
+            slowNotePhase = phase;
+            sp.slowNote(
+              phase === "encrypt"
+                ? "initial encryption of many small files can take time"
+                : "uploading many small files can take a while — this is normal"
+            );
+          }
+        };
         // (design 108): the milestone + report wiring is FLAG-GATED — a flag-off init
         // must emit exactly the pre-108 output (no summary
         // line, no report-enabled commit path). Under the flag: the command-level
@@ -458,8 +473,8 @@ async function executeInitPlan(
             report2?.logSummaryTo((l) => console.log(style.dim(l)));
           } catch {
             // Commit 1's files are durable; git resumes via the daemon or the next push.
-            sp2.fail("git history still uploading — will resume");
-            process.stderr.write(`${stderrStyle.yellow("!")} git history did not finish attaching — the daemon (or \`rbox push\`) will resume it.\n`);
+            sp2.stop();
+            process.stderr.write(`${stderrStyle.dim("Git history will continue uploading in the background.")}\n`);
           }
         }
       } catch (e) {
@@ -518,10 +533,10 @@ async function executeInitPlan(
   // 6. Done — show how to bring another machine online (unless the caller, e.g.
   //    `setup`, prints its own unified summary instead).
   if (opts.summary) {
+    const workspaceName = plan.workspace.name || path.basename(plan.root);
     console.log(`\n${style.sym.ok} ${style.bold("rbox is set up.")}`);
-    console.log(`  ${style.dim("workspace:")} ${style.cyan(workspaceId)}`);
-    console.log(`  ${style.dim("device:")}    ${deviceId}`);
+    console.log(`  ${style.dim("workspace:")} ${style.cyan(workspaceName)}     ${style.dim("device:")} ${os.hostname()}`);
     console.log(`\n${style.dim("Link another machine:")}\n  rbox login   ${style.dim("# on the other machine, then:")}\n  rbox init --workspace ${workspaceId} --root <path>`);
   }
-  return { workspaceId, deviceId, root: plan.root };
+  return { workspaceId, workspaceName: plan.workspace.name || path.basename(plan.root), deviceId, root: plan.root };
 }

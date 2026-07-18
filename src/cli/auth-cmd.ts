@@ -1,7 +1,7 @@
 import os from "node:os";
 import { clearCredentials, credentialsForStrictFlow, loadCredentials, PROD_WEB, saveCredentials } from "./credentials.js";
 import { clearAccountProfile } from "./account-profile.js";
-import { cancelableSelect, isInteractive, promptConfirm, promptPassword } from "./prompt.js";
+import { isInteractive, promptConfirm, promptPassword } from "./prompt.js";
 import { copyToClipboard, openInBrowser, waitForKeypress } from "./browser-open.js";
 import { AccountAlreadyBootstrappedError, RboxApi } from "./remote.js";
 import { emitJson } from "./json.js";
@@ -253,10 +253,10 @@ export async function login(
   console.log(`    (or run \`rbox device approve ${start.userCode}\` on an already-signed-in machine)`);
   console.log(`\nWaiting for approval (expires in ${start.expiresIn}s)...`);
 
-  // The open/copy prompt runs CONCURRENTLY with polling — it never gates a single
-  // tick. We keep the cancelable prompt so we can close it the instant approval
+  // The copy-key listener runs CONCURRENTLY with polling — it never gates a single
+  // tick. We keep a cancel handle so we can close it the instant approval
   // lands (or on timeout), so it never blocks or outlives the flow.
-  const prompt = offerApprovalOpen(approveUrl);
+  const copyKey = offerApprovalCopy(approveUrl);
   try {
     const deadline = Date.now() + start.expiresIn * 1000;
     const basePollWaitMs = pollIntervalMs(start.interval);
@@ -305,39 +305,25 @@ export async function login(
     throw new Error("authorization timed out");
   } finally {
     try {
-      prompt?.cancel();
+      copyKey?.cancel();
     } catch {
       // already resolved / non-interactive → nothing to close
     }
   }
 }
 
-/** Best-effort, non-blocking "open the approval page" helper for the browser-login
- *  flow. Auto-opens the URL opportunistically (a headless spawn just no-ops — there's
- *  no reliable headed/headless signal, so we don't gate on one), then, on a TTY,
- *  shows an [open]/[copy]/[wait] choice WITHOUT the caller awaiting it, so polling
- *  proceeds regardless of whether the user ever answers. Returns the cancelable
- *  prompt (or undefined off-TTY) so the caller can close it once approval lands. */
-function offerApprovalOpen(url: string): { cancel: () => void } | undefined {
+/** Opportunistically open the approval page and listen for a single copy key
+ *  concurrently with polling. The cancel handle restores stdin as soon as the
+ *  grant completes, so the key listener never outlives the login flow. */
+function offerApprovalCopy(url: string): { cancel: () => void } | undefined {
   openInBrowser(url); // opportunistic; silently no-ops on a headless box
   if (!isInteractive()) return undefined;
-  return cancelableSelect<"open" | "copy" | "wait">(
-    {
-      message: "Open the approval page?",
-      choices: [
-        { name: "Open in browser", value: "open", description: "launch the URL above in your default browser" },
-        { name: "Copy URL to clipboard", value: "copy", description: "paste into a browser on another device (e.g. over SSH)" },
-        { name: "I'll approve it another way", value: "wait", description: "keep waiting — approve from any browser or another terminal" },
-      ],
-    },
-    (choice) => {
-      if (choice === "open") {
-        if (!openInBrowser(url)) console.log(`Open this URL to approve:\n    ${url}`);
-      } else if (choice === "copy") {
-        console.log(copyToClipboard(url) ? "URL copied to clipboard." : `Copy this URL to approve:\n    ${url}`);
-      }
-    }
-  );
+  console.log("    press [c] to copy the URL");
+  const controller = new AbortController();
+  void waitForKeypress(controller.signal).then((key) => {
+    if (key === "c") console.log(copyToClipboard(url) ? "Copied to clipboard." : "Couldn't reach the clipboard — copy the URL above manually.");
+  });
+  return { cancel: () => controller.abort() };
 }
 
 export async function logout(): Promise<void> {
