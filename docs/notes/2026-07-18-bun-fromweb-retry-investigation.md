@@ -178,7 +178,20 @@ solely to accommodate this test harness.
 
 ## Filed & decision
 
-**Filed upstream: oven-sh/bun#34559** (https://github.com/oven-sh/bun/issues/34559).
+**Filed upstream: oven-sh/bun#34559**
+
+### UPSTREAM RESOLUTION (2026-07-18, same day)
+Bun triage (robobun) confirmed the bug and reported it is **already fixed on
+Bun `main`** by PR #32863 (+ follow-ups #33300, #34025) — landed AFTER 1.3.14,
+not yet in canary/release. robobun reproduced our repro verbatim on
+`1.4.0-canary.1` (exit 1) and confirmed the fix on a debug build of main
+(matches the Node 24 control: pipeline rejects, zero escaped rejections).
+
+**Graduation trigger (concrete):** when we bump Bun to a released version that
+includes #32863, REAPPLY the pipeline(Readable.fromWeb(...)) migration (audit
+item 2), gated on the real-HTTP interrupted-download integration test. Until
+that Bun bump, the getReader() pump stays. No open-ended watch needed — it's a
+version bump away. (https://github.com/oven-sh/bun/issues/34559).
 
 **Decision (2026-07-18, founder-deferred to orchestrator): HOLD the migration.**
 The bug is in `fromWeb`'s handling of ANY errored `ReadableStream`, and a
