@@ -20,6 +20,7 @@ export default defineFlow({
       assertScreen: [
         /To authorize this device,[\s\S]*visit:/,
         /cli-login\?code=[A-Z0-9-]+/,
+        /press \[c\] to copy the URL/,
         /expires in\s+\d+s/,
       ],
     },

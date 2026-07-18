@@ -18,7 +18,7 @@ export default defineFlow({
     { on: "b", waitFor: /Are you new here,[\s\S]*or do you already have an rbox account\?/ },
     { on: "b", keys: ["Down", "Enter"] },
     { on: "b", waitFor: /How do you want to authorize this machine\?/ },
-    { on: "b", keys: ["Enter"] },
+    { on: "b", keys: ["Down", "Enter"] },
     { on: "b", waitFor: /Paste pairing token/ },
     { on: "b", typeVar: "TOKEN" },
     { on: "b", keys: ["Enter"] },

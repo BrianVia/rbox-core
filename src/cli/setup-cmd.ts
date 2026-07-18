@@ -22,8 +22,9 @@
  * promises Steps 2–3 it can't deliver.
  */
 import os from "node:os";
+import path from "node:path";
 import fs from "node:fs/promises";
-import { GITIGNORE_CHOICES, continueInitWithPrecreatedWorkspace, preflightInitRebind, runInit } from "./init-cmd.js";
+import { GITIGNORE_CHOICES, WORKSPACE_DEFINITION, continueInitWithPrecreatedWorkspace, preflightInitRebind, runInit } from "./init-cmd.js";
 import { collapseHome, interpretWorkspaceNameAnswer } from "./init-plan.js";
 import { EXISTING_ACCOUNT_ENROLLMENT_MESSAGE, login, redeemPair, runGenesisEnrollment } from "./auth-cmd.js";
 import { enrollViaPrevalidatedRecovery, PairingTokenShapeError, parsePairingToken } from "./e2ee-client.js";
@@ -78,8 +79,8 @@ export type StartSyncChoice = "both" | "start" | "none";
  *  `startSyncActions` — a re-shuffle or value swap in the live select can't silently
  *  invert which option starts the daemon / enables autostart. */
 export const START_SYNC_CHOICES = [
-  { name: "Start now and resume after reboot (recommended)", value: "both" },
-  { name: "Start now only", value: "start" },
+  { name: "Start background sync now and on machine boot (recommended)", value: "both" },
+  { name: "Start background sync now only", value: "start" },
   { name: "Not now", value: "none" },
 ] as const satisfies ReadonlyArray<{ name: string; value: StartSyncChoice }>;
 
@@ -96,7 +97,7 @@ export async function runWorkspaceStepLoop(
   opts: { cwd: string; defaultRemote: string },
   setupOpts: { noSync?: boolean; preselectedKind?: WorkspaceKind; header: string; credentialResult?: CredentialLoadResult },
   runStep: typeof stepWorkspace = stepWorkspace
-): Promise<{ workspaceId: string; deviceId: string; root: string } | undefined> {
+): Promise<{ workspaceId: string; workspaceName?: string; deviceId: string; root: string } | undefined> {
   let preselectedKind = setupOpts.preselectedKind;
   for (;;) {
     const selectedForThisAttempt = preselectedKind;
@@ -222,7 +223,7 @@ export async function runSetup(opts: {
 
   if (syncDisabledUntilSubscribe) {
     process.stderr.write(`${e.yellow("!")}  Sync is disabled until you run \`rbox subscribe\` and choose a plan.\n`);
-    printSummary(outcome.workspaceId, outcome.deviceId);
+    printSummary(outcome.workspaceName || path.basename(outcome.root));
     return;
   }
 
@@ -240,7 +241,7 @@ export async function runSetup(opts: {
       await enableAutostart();
       process.stderr.write(`${e.green("✓")} autostart enabled\n`);
     } else {
-      process.stderr.write(`${e.dim("Enable resume-after-reboot later with `rbox autostart enable`.")}\n`);
+      process.stderr.write(`${e.dim("Enable start-on-boot later with `rbox autostart enable`.")}\n`);
     }
   } else {
     process.stderr.write(`${e.dim("Run `rbox start` whenever you're ready.")}\n`);
@@ -262,7 +263,7 @@ export async function runSetup(opts: {
   //   }
   // }
 
-  printSummary(outcome.workspaceId, outcome.deviceId);
+  printSummary(outcome.workspaceName || path.basename(outcome.root));
 }
 
 /** The enrolled account id, or undefined when signed out / not enrolled. */
@@ -393,7 +394,7 @@ export async function authorizeExistingAccount(remote: string, deps: AuthorizeEx
   const writeStderr = deps.writeStderr ?? ((text: string) => process.stderr.write(text));
   for (;;) {
     writeStderr(`${e.dim(AUTHORIZATION_RECOVERY_FOOTER)}\n`);
-    const method = await select<"pair" | "browser" | "approve">({
+    const method = await select<"pair" | "browser">({
       message: "How do you want to authorize this machine?",
       choices: AUTHORIZATION_CHOICES,
     });
@@ -403,7 +404,7 @@ export async function authorizeExistingAccount(remote: string, deps: AuthorizeEx
       return { ok: await resolve(remote), created: false };
     }
 
-    // "browser" and "approve" are the SAME device-code grant (authorize-only).
+    // Browser sign-in uses the device-code grant (authorize-only).
     await runLogin(remote, undefined, undefined, undefined, undefined, "wizard");
     return { ok: await resolve(remote), created: false };
   }
@@ -449,22 +450,20 @@ async function pollUntilPlanActive(credentialResult: CredentialLoadResult): Prom
 }
 
 /** Which authorize path an existing-account method takes. "pair" redeems a pairing
- *  token (enrolls encryption inline); "browser" and "approve" are both the
- *  device-code grant (authorize-only) — same `login(remote, undefined)` call, just a
- *  different front door. Pure so the three-way routing is pinned by a unit test
+ *  token (enrolls encryption inline); "browser" uses the device-code grant.
+ *  Pure so the two-way routing is pinned by a unit test
  *  without driving the inquirer widget (mirrors `workspaceFlags`). */
-export function authorizePath(method: "pair" | "browser" | "approve"): "pair-token" | "device-code" {
+export function authorizePath(method: "pair" | "browser"): "pair-token" | "device-code" {
   return method === "pair" ? "pair-token" : "device-code";
 }
 
 export const PAIRING_TOKEN_SOURCE_DESCRIPTION =
   "run `rbox pair` in a terminal on an already-set-up machine — never shown in the dashboard because it carries your encryption key";
-export const APPROVE_CODE_DESCRIPTION =
-  "this machine shows a confirmation code you approve elsewhere — different from a pairing token: it authorizes but does not carry encryption";
+// "Browser" and the removed "Approve a code" option invoked the same device-code
+// grant; keeping both entry points confused users without adding capability.
 export const AUTHORIZATION_CHOICES = [
-  { name: "Paste a pairing token", value: "pair", description: PAIRING_TOKEN_SOURCE_DESCRIPTION },
   { name: "Sign in via browser", value: "browser", description: "opens app.rbox.to to approve — no second terminal needed" },
-  { name: "Approve a code", value: "approve", description: APPROVE_CODE_DESCRIPTION },
+  { name: "Paste a pairing token", value: "pair", description: PAIRING_TOKEN_SOURCE_DESCRIPTION },
 ] as const;
 
 /** Resolve enrollment for an authorized-but-unenrolled machine (device-code login
@@ -568,7 +567,7 @@ export async function resolveEnrollment(remote: string, deps: ResolveEnrollmentD
 
 export type StepWorkspaceResult =
   | { kind: "menu" }
-  | { kind: "completed"; outcome: { workspaceId: string; deviceId: string; root: string } }
+  | { kind: "completed"; outcome: { workspaceId: string; workspaceName?: string; deviceId: string; root: string } }
   | { kind: "terminal" };
 
 interface StepWorkspaceDeps {
@@ -621,6 +620,7 @@ export async function stepWorkspace(
   const creds = credentialsForStrictFlow(loadedCredentials);
 
   writeStderr(`\n── ${e.bold(setupOpts.header)} ${HR.slice(0, 44)}\n`);
+  writeStderr(`${e.dim(WORKSPACE_DEFINITION)}\n`);
   const choice =
     setupOpts.preselectedKind ??
     (await select<WorkspaceKind>({
@@ -847,10 +847,10 @@ export async function stepWorkspace(
   }
 }
 
-function printSummary(workspaceId: string, deviceId: string): void {
+function printSummary(workspaceName: string): void {
   process.stderr.write(`\n${HR}\n`);
   process.stderr.write(`${e.green("✓")}  ${e.bold("rbox is set up.")}\n`);
-  process.stderr.write(`     workspace: ${e.cyan(workspaceId)}     device: ${deviceId}\n`);
+  process.stderr.write(`     workspace: ${e.cyan(workspaceName)}     device: ${os.hostname()}\n`);
   process.stderr.write(`     ${e.dim("This workspace is end-to-end encrypted — the server never sees your files.")}\n`);
   process.stderr.write(`     ${e.dim("Tune what syncs with `rbox ignore` or .rboxignore.")}\n`);
   process.stderr.write(`\n   ${e.bold("Bring another machine online:")}\n`);

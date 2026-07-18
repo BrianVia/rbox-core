@@ -11,7 +11,6 @@ import {
   START_SYNC_CHOICES,
   SETUP_GITIGNORE_CHOICES,
   PAIRING_TOKEN_SOURCE_DESCRIPTION,
-  APPROVE_CODE_DESCRIPTION,
   AUTHORIZATION_CHOICES,
   EXISTING_ENROLLMENT_CHOICES,
   runSetup,
@@ -132,33 +131,25 @@ test("Step 2 gitignore prompt defaults to skipping, with both escape hatches and
 // must stay FIRST so a bare ENTER reproduces the old default:true+ENTER outcome.
 test("Step 3 select wiring: ordered choices → side effects (both first, then daemon-only, then neither)", () => {
   expect(START_SYNC_CHOICES.map((c) => ({ ...c, ...startSyncActions(c.value) }))).toEqual([
-    { name: "Start now and resume after reboot (recommended)", value: "both", startDaemon: true, enableAutostart: true },
-    { name: "Start now only", value: "start", startDaemon: true, enableAutostart: false },
+    { name: "Start background sync now and on machine boot (recommended)", value: "both", startDaemon: true, enableAutostart: true },
+    { name: "Start background sync now only", value: "start", startDaemon: true, enableAutostart: false },
     { name: "Not now", value: "none", startDaemon: false, enableAutostart: false },
   ]);
 });
 
-// The new "Sign in via browser" method (design 47) must land on the SAME device-code
-// grant as "Approve a code" — a friendlier front door, not a new backend. Only a
-// pairing token takes the enroll-inline path. Pinning this stops a future edit from
-// silently wiring "browser" to pairing (which would demand a token it doesn't have).
-test("authorize routing: browser and approve are both the device-code grant; only pair redeems a token", () => {
+// Browser sign-in uses the device-code grant; only a pairing token enrolls inline.
+test("authorize routing: browser uses device-code; pair redeems a token", () => {
   expect(authorizePath("pair")).toBe("pair-token");
-  expect(authorizePath("approve")).toBe("device-code");
   expect(authorizePath("browser")).toBe("device-code");
 });
 
-test("authorization choices distinguish pairing tokens from confirmation codes", () => {
+test("authorization choices put browser first and omit the duplicate approve entry", () => {
   expect(PAIRING_TOKEN_SOURCE_DESCRIPTION).toBe(
     "run `rbox pair` in a terminal on an already-set-up machine — never shown in the dashboard because it carries your encryption key"
   );
-  expect(APPROVE_CODE_DESCRIPTION).toBe(
-    "this machine shows a confirmation code you approve elsewhere — different from a pairing token: it authorizes but does not carry encryption"
-  );
   expect(AUTHORIZATION_CHOICES).toEqual([
-    { name: "Paste a pairing token", value: "pair", description: PAIRING_TOKEN_SOURCE_DESCRIPTION },
     { name: "Sign in via browser", value: "browser", description: "opens app.rbox.to to approve — no second terminal needed" },
-    { name: "Approve a code", value: "approve", description: APPROVE_CODE_DESCRIPTION },
+    { name: "Paste a pairing token", value: "pair", description: PAIRING_TOKEN_SOURCE_DESCRIPTION },
   ]);
   expect(EXISTING_ENROLLMENT_CHOICES[0]).toEqual({
     name: "Paste a pairing token",
