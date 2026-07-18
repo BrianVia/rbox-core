@@ -1,6 +1,6 @@
 # 151 — Phase 0 containment: fail-closed CLI, bounded parsing, atomic credentials, GC observability
 
-Status: **ALIGNED v7** — six review rounds (17→14→7→16-rescope→8→5; final
+Status: **ALIGNED v8** — six review rounds to v7 + the founder lock-on-mutation refinement (2026-07-18): the credential lock guards mutation, not reads (optimistic-read + recheck-under-lock). Units 1, 2, 4 implement on this design alone; Unit 3 impl is additionally gated on design 155 ALIGNED (founder do-it-right ruling).
 round MEDIUM-or-below, residuals ruled, applied, and self-certified per the
 convergence rule; all rulings in `REVIEW-151.md` binding, the round-4 re-scope
 superseding Unit 3's round-3 identity/lifecycle machinery). Units 1, 2, and 4
@@ -928,10 +928,26 @@ unlink the temp in `finally`. `EEXIST` means contention; unsupported hardlinks
 or any other publication failure fail closed. This is the repository pattern at
 `src/engine/git/lockfile.ts:709-733`, not a direct write to the final marker.
 The holder keeps the identity-verified lock handle and refreshes its mtime at
-least every 30 seconds and after each awaited filesystem step. Acquisition
-precedes disk classification. Load-side
-quarantine holds ownership through
-classify→preserve→source removal; every save holds it through
+least every 30 seconds and after each awaited filesystem step.
+
+**The lock guards MUTATION, not reading (v7 refinement — founder call
+2026-07-18: lock-on-every-read is disproportionate).** A load performs its
+initial classification with NO lock and NO directory creation: a `valid` or
+`absent` result returns immediately, so the overwhelmingly common path — every
+read-only command, including a signed-out `rbox status` — pays no lock, no
+directory fsync, and never materializes `~/.rbox`. The lock is acquired ONLY on
+a path that will mutate the filesystem: (a) a load that classified
+`corrupt`/`unsupported-version` and therefore intends to quarantine, and
+(b) every save. On the quarantine path the lock acquisition is followed by a
+RE-READ and RE-CLASSIFY of the source under the lock; quarantine proceeds only
+if it is STILL `corrupt`/`unsupported-version` — a fresh valid login that
+landed in the classify→lock gap is observed and left untouched, returning
+`valid`. This optimistic-read + recheck-under-lock is strictly safer than
+lock-on-read (the recheck is what actually closes the classify/quarantine race)
+while making the read path free. Atomic-rename save guarantees a reader always
+observes a complete file, so the lock-free classification is never torn.
+Load-side quarantine then holds ownership through
+recheck→classify→preserve→source removal; every save holds it through
 classify→quarantine-if-needed→temp write→rename.
 
 A lock younger than five minutes, measured from its `lstat` modification time,
