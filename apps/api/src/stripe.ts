@@ -6,6 +6,7 @@ import { GRACE_PERIOD_MS } from "./billing.js";
 import { dbFor, dirDb } from "./db.js";
 import { pingChurn, pingNewSubscription, pingPaymentFailed } from "./slackpipes.js";
 import { fairUseQueueStatement } from "./fairuse.js";
+import { ownerEmail, resolveOwners } from "./notify.js";
 
 /**
  * Stripe billing (M10) — Checkout + Customer Portal + signature-verified webhook,
@@ -66,6 +67,19 @@ async function priceIdForPlan(env: Env, plan: string, cadence: BillingCadence): 
   return list.data?.[0]?.id ?? null;
 }
 
+/** Best-effort checkout prefill. Billing must remain available when the owner
+ *  bridge, email cache, Clerk, or a lookup query is unavailable. */
+async function checkoutOwnerEmail(env: Env, accountId: string): Promise<string | undefined> {
+  try {
+    const owner = (await resolveOwners(env, accountId))[0];
+    if (!owner) return undefined;
+    const email = await ownerEmail(env, owner.clerkUserId, Date.now());
+    return email.kind === "ok" ? email.address : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 // ---- routes (all gated on STRIPE_SECRET) ----
 
 /** POST /v1/billing/checkout?plan=solo&cadence=monthly|annual — authed. Returns a Stripe Checkout URL. */
@@ -101,6 +115,7 @@ export async function billingCheckout(req: Request, env: Env, p: Principal): Pro
   if (!priceId) return json({ error: "price_unavailable", message: `no active ${cadence} price for ${plan}` }, 500);
 
   const appUrl = env.RBOX_APP_URL ?? "https://rbox.to";
+  const customerEmail = acct?.stripe_customer_id ? undefined : await checkoutOwnerEmail(env, p.accountId);
   const session = await stripeApi(env, "POST", "/checkout/sessions", {
     mode: "subscription",
     "line_items[0][price]": priceId,
@@ -115,7 +130,7 @@ export async function billingCheckout(req: Request, env: Env, p: Principal): Pro
     ...(acct?.stripe_customer_id ? {} : { "subscription_data[trial_period_days]": 14 }),
     // Reuse the account's customer if it has one; in subscription mode Stripe
     // auto-creates a customer otherwise (customer_creation is payment-mode only).
-    ...(acct?.stripe_customer_id ? { customer: acct.stripe_customer_id } : {}),
+    ...(acct?.stripe_customer_id ? { customer: acct.stripe_customer_id } : customerEmail ? { customer_email: customerEmail } : {}),
   });
   return json({ url: session.url });
 }

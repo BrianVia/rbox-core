@@ -1541,6 +1541,17 @@ describe("worker integration (real DO + D1 + R2)", () => {
     }
   }
   const durablePrincipal = (a: { accountId: string; deviceId: string }, userId = "user_x"): Principal => ({ deviceId: a.deviceId, accountId: a.accountId, userId, role: "owner", kind: "device" });
+  const linkCheckoutOwner = async (accountId: string, clerkUserId: string, email: string | null) => {
+    const owner = await env.rbox_dev_db
+      .prepare("SELECT user_id FROM memberships WHERE account_id = ? AND role = 'owner'")
+      .bind(accountId)
+      .first<{ user_id: string }>();
+    expect(owner).toBeTruthy();
+    await env.rbox_dev_db
+      .prepare("INSERT INTO clerk_users (clerk_user_id, account_id, user_id, created_at, email) VALUES (?, ?, ?, ?, ?)")
+      .bind(clerkUserId, accountId, owner!.user_id, Date.now(), email)
+      .run();
+  };
   const setBilling = (id: string, cust: string, sub: string, plan = "pro") =>
     env.rbox_dev_db.prepare("UPDATE accounts SET stripe_customer_id = ?, stripe_subscription_id = ?, plan = ? WHERE id = ?").bind(cust, sub, plan, id).run();
   const billingOf = (id: string) =>
@@ -1580,6 +1591,59 @@ describe("worker integration (real DO + D1 + R2)", () => {
       expect(priceCalls).toHaveLength(1);
       expect(priceCalls[0]!.path).toContain("rbox_solo_annual");
     });
+  });
+
+  test("subscribe: new-customer checkout includes the cached owner sign-in email", async () => {
+    const a = await bootstrap("acct-sub-owner-email");
+    const clerkUserId = "user_checkout_cached";
+    await linkCheckoutOwner(a.accountId, clerkUserId, "secondary+checkout@example.com");
+    const fetchesBefore = clerkFetches.get(clerkUserId) ?? 0;
+
+    await withStripe(async () => {
+      const res = await billingCheckout(new Request(`${BASE}/v1/billing/checkout?plan=pro`, { method: "POST" }), env, durablePrincipal(a));
+      expect(res.status).toBe(200);
+      const checkout = stripeCalls.find((c) => c.path.startsWith("/v1/checkout/sessions"))!;
+      const params = new URLSearchParams(checkout.body);
+      expect(params.get("customer_email")).toBe("secondary+checkout@example.com");
+      expect(params.has("customer")).toBe(false);
+    });
+    expect(clerkFetches.get(clerkUserId) ?? 0).toBe(fetchesBefore);
+  });
+
+  test("subscribe: owner-email lookup failure soft-fails and still creates a new-customer session", async () => {
+    const a = await bootstrap("acct-sub-owner-email-failure");
+    const clerkUserId = "user_checkout_failure";
+    await linkCheckoutOwner(a.accountId, clerkUserId, null);
+    clerkStates.set(clerkUserId, { updatedAt: 100, responseStatus: 503 });
+
+    await withStripe(async () => {
+      const res = await billingCheckout(new Request(`${BASE}/v1/billing/checkout?plan=pro`, { method: "POST" }), env, durablePrincipal(a));
+      expect(res.status).toBe(200);
+      const checkout = stripeCalls.find((c) => c.path.startsWith("/v1/checkout/sessions"))!;
+      const params = new URLSearchParams(checkout.body);
+      expect(params.has("customer_email")).toBe(false);
+      expect(params.has("customer")).toBe(false);
+    });
+    expect(clerkFetches.get(clerkUserId)).toBe(1);
+  });
+
+  test("subscribe: existing-customer checkout passes customer and never looks up customer_email", async () => {
+    const a = await bootstrap("acct-sub-existing-customer-email");
+    const clerkUserId = "user_checkout_existing";
+    await linkCheckoutOwner(a.accountId, clerkUserId, null);
+    clerkStates.set(clerkUserId, { updatedAt: 100, responseStatus: 503 });
+    await env.rbox_dev_db.prepare("UPDATE accounts SET stripe_customer_id = ? WHERE id = ?").bind("cus_checkout_existing", a.accountId).run();
+    const fetchesBefore = clerkFetches.get(clerkUserId) ?? 0;
+
+    await withStripe(async () => {
+      const res = await billingCheckout(new Request(`${BASE}/v1/billing/checkout?plan=pro`, { method: "POST" }), env, durablePrincipal(a));
+      expect(res.status).toBe(200);
+      const checkout = stripeCalls.find((c) => c.path.startsWith("/v1/checkout/sessions"))!;
+      const params = new URLSearchParams(checkout.body);
+      expect(params.get("customer")).toBe("cus_checkout_existing");
+      expect(params.has("customer_email")).toBe(false);
+    });
+    expect(clerkFetches.get(clerkUserId) ?? 0).toBe(fetchesBefore);
   });
 
   test("subscribe: junk cadence → 400 before any Stripe call", async () => {
