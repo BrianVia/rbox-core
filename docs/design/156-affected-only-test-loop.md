@@ -1,4 +1,4 @@
-# 155 — Affected-only test loop (`test:affected`)
+# 156 — Affected-only test loop (`test:affected`)
 
 Founder ask: the nightly verify loop is `bun run test:api` (~60s) + `bun test
 src/cli` (~190s), run many times per night, almost always to check a change

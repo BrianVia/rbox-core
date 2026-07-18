@@ -290,7 +290,7 @@ test("no-op: pull-then-push with no local changes makes ZERO commits, sequence s
   expect(remote.headSeq()).toBe(1);
 });
 
-// QUARANTINED locally (design 155): red on clean main on dev machines while CI has
+// QUARANTINED locally (design 156): red on clean main on dev machines while CI has
 // never seen it fail — the design-123 registry's one tolerated flake. A known-red
 // test means a red `bun test src/cli` needs hand-triage every run, so local runs
 // skip it; CI still runs it, and RBOX_RUN_QUARANTINED=1 opts back in. Root cause
