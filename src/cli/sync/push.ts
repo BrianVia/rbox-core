@@ -415,11 +415,6 @@ async function runPushAttempt(
       return [relPath, carryRepoBaseProof(lineageHash)];
     }));
   };
-  const currentRepoAbsent: Record<string, true> = Object.fromEntries(
-    Object.entries(repoRecords)
-      .filter(([, record]) => record.repoAbsent === true)
-      .map(([relPath]) => [relPath, true as const]),
-  );
   const now = new Date().toISOString();
   for (const rel of gitPlan.captureObserved) {
     const current = repoRecords[rel]?.deferrals;
@@ -518,14 +513,7 @@ async function runPushAttempt(
     // removal changes no synced files), yet §9 requires its removal memory to be
     // pruned then, or the stale memory suppresses a later legitimate re-add at that
     // path. Persist the bookkeeping commit-free.
-    const same = (a: unknown, b: unknown) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
-    if (
-      cfg.syncGit &&
-      (!same(gitPlan.repoAbsent, currentRepoAbsent) ||
-        !same(gitPlan.gitReposRemoved, state.gitReposRemoved) ||
-        !same(gitPlan.gitNeedsResolution, state.gitNeedsResolution) ||
-        !same(gitPlan.gitPendingRemote, state.gitPendingRemote))
-    ) {
+    if (cfg.syncGit) {
       const values = {
         bases: appliedBase.gitRepos,
         repoAbsent: gitPlan.repoAbsent ?? {},
@@ -533,16 +521,19 @@ async function runPushAttempt(
         removed: gitPlan.gitReposRemoved,
         resolutions: gitPlan.gitNeedsResolution,
       };
-      await report.phase("state-save", () => saveStateSource(root, state, {
-        expectedStream: syncStreamId(cfg),
-        sourceGlobalSeq: appliedSequence,
-        observedRepos: changedSidecarRepoKeys(state, values),
-        values,
-        repoProofs: carryProofsFor(state, changedSidecarRepoKeys(state, values)),
-      }, {
-        allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),
-        forceLegacy: workspaceSyncMutexDegraded(deps.syncMutex),
-      }));
+      const changedRepos = changedSidecarRepoKeys(state, values);
+      if (changedRepos.length > 0) {
+        await report.phase("state-save", () => saveStateSource(root, state, {
+          expectedStream: syncStreamId(cfg),
+          sourceGlobalSeq: appliedSequence,
+          observedRepos: changedRepos,
+          values,
+          repoProofs: carryProofsFor(state, changedRepos),
+        }, {
+          allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),
+          forceLegacy: workspaceSyncMutexDegraded(deps.syncMutex),
+        }));
+      }
     }
     if (cfg.encrypted) await pruneEncryptAddressCache(root, cfg, scannedFilePaths);
     return { done: true, result: { sequence: appliedSequence, manifest: local, committed: false } };

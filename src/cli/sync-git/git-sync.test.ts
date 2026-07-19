@@ -8,6 +8,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { pull, push, pushManifest, sync, type SyncDeps } from "../sync.js";
 import { loadState, repoRecordsForState, saveStateUnsafeLegacyOrTest, type SyncState, type WorkspaceConfig } from "../config.js";
+import { changedSidecarRepoKeys, orderedDeferralUpdates, type GitDeferralUpdates, type OrderedGitDeferralUpdates } from "../sync-state.js";
 import { BlobShaMismatchError, type CommitResult, type SyncRemote } from "../remote.js";
 import { buildIgnoreMatcher, captureGitState, gitIdentity, gitIdentityKey, gitPreflight, gitSectionBlobRefs, gitSectionNewestLink, MAX_PACK_CHAIN, scanManifest, setGitSpawnObserver, type BlobStore, type FileEntry, type GitSection, type Manifest } from "../../engine/index.js";
 import {
@@ -2240,6 +2241,76 @@ test("gitDivergenceCount heals corrupt divergence cache after correct slow path"
 }, 30_000);
 
 // ── design 83: push-side git-plan fingerprint cache ─────────────────────────────
+
+test("steady-state all-hit git plan has no sidecar changes", async () => {
+  for (const rel of ["steady-a", "steady-b"]) {
+    const repo = path.join(rootA, rel);
+    await initRepo(repo);
+    await commitFile(repo, "f.txt", rel, "c1");
+  }
+  await push(rootA, cfgA, depsA);
+  for (const rel of ["steady-a", "steady-b"]) {
+    await commitFile(path.join(rootA, rel), "f.txt", `${rel}-next`, "c2");
+  }
+  await push(rootA, cfgA, depsA);
+
+  const state = await st(rootA);
+  const matcher = buildIgnoreMatcher(rootA);
+  await planGitSections(rootA, cfgA, state, remote, new Set(), matcher);
+  await markDivergenceCacheTrusted(rootA);
+  const plan = await planGitSections(rootA, cfgA, state, remote, new Set(), matcher);
+  expect(plan.gitPlanStats?.fpHits).toBe(2);
+  expect(plan.gitPlanStats?.fpMisses).toBe(0);
+  expect(plan.captured).toEqual([]);
+  expect(plan.deferred).toEqual([]);
+
+  const records = repoRecordsForState(state);
+  const deferralUpdates: Record<string, OrderedGitDeferralUpdates> = {};
+  const now = "2026-07-19T12:00:00.000Z";
+  for (const rel of plan.captureObserved) {
+    const current = records[rel]?.deferrals;
+    const lanes: GitDeferralUpdates = {};
+    const captureReason = plan.captureDeferrals[rel];
+    if (captureReason) lanes.capture = nextDeferral("capture", current?.capture, captureReason, now);
+    else if (current?.capture) lanes.capture = null;
+    if (plan.configObserved.includes(rel)) {
+      const configReason = plan.configDeferrals[rel];
+      if (configReason) lanes.config = nextDeferral("config", current?.config, configReason, now);
+      else if (current?.config) lanes.config = null;
+    }
+    const ordered = orderedDeferralUpdates(current, lanes);
+    if (ordered !== undefined) deferralUpdates[rel] = ordered;
+  }
+  const deferralChurningRepoKeys = changedSidecarRepoKeys(state, {
+    bases: state.lastSyncedManifest.gitRepos,
+    pending: state.gitPendingRemote,
+    removed: state.gitReposRemoved,
+    resolutions: state.gitNeedsResolution,
+    deferrals: deferralUpdates,
+  });
+  const churningRepoKeys = changedSidecarRepoKeys(state, {
+    bases: state.lastSyncedManifest.gitRepos,
+    repoAbsent: plan.repoAbsent ?? {},
+    pending: plan.gitPendingRemote,
+    removed: plan.gitReposRemoved,
+    resolutions: plan.gitNeedsResolution,
+  });
+  const steadyPush = await push(rootA, cfgA, depsA);
+  const after = await st(rootA);
+  expect({
+    committed: steadyPush.committed,
+    deferralChurningRepoKeys,
+    churningRepoKeys,
+    stateRevisionBefore: state.stateRevision,
+    stateRevisionAfter: after.stateRevision,
+  }, `churningRepoKeys=${JSON.stringify({ deferralChurningRepoKeys, churningRepoKeys })}`).toEqual({
+    committed: false,
+    deferralChurningRepoKeys: [],
+    churningRepoKeys: [],
+    stateRevisionBefore: state.stateRevision,
+    stateRevisionAfter: state.stateRevision,
+  });
+}, 30_000);
 
 test("design 83/93: plan cache treats v2 as cold, writes the current version, then serves trusted warm carries with zero git spawns", async () => {
   const repo = path.join(rootA, "d83-v2");
