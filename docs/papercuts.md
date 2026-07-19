@@ -7,6 +7,13 @@ what happened, what it cost, fix hint if obvious.
 
 ## 2026-07-19 (overnight)
 
+- **CI guard scripts have no local runner.** The "only prompt.ts imports
+  @inquirer" guard (ci.yml checks job) caught PR #336 — correctly — but only
+  AFTER push: the guards are inline workflow shell, so neither codex's
+  conformance reviews nor local gates can run them. Cost: one red CI round.
+  Hint: extract guards to `scripts/guards.ts` invoked by both CI and a local
+  `bun run guards` (and mention it in AGENTS.md gates).
+
 - **Silent no-op `str.replace` design-doc edits cost two review rounds.**
   Folding review findings via python `str.replace` with a slightly-off
   target string no-ops silently; the stale text then contradicts the new
@@ -65,7 +72,7 @@ what happened, what it cost, fix hint if obvious.
   dispatched for a bounded test sweep, it started writing
   `docs/design/158-…` + review rounds instead of fixing tests. Hint: small-fix
   dispatch prompts need an explicit "no design docs; implement from SPEC.md".
-- **No branch protection ⇒ no GitHub auto-merge.** Every merge-on-green needs
+- **RESOLVED 2026-07-19 (founder added the ruleset): No branch protection ⇒ no GitHub auto-merge.** Every merge-on-green needs
   a hand-rolled watcher loop. Hint: a minimal required-check ruleset on main
   would unlock native auto-merge.
 - **`pgrep -f "codex exec"` matches the watcher's own command line** when the

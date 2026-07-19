@@ -174,3 +174,15 @@ _Themes: (a) hide internal IDs / dev telemetry from real users, show human names
 notes 5, 19; (c) copy that doesn't imply scary actions (reboot) — note 17.
 Pending founder actions to fold in post-validation: this whole set + CLI pairing
 flow (#5) + macOS keychain (#6) from onboarding-ux-backlog._
+
+## 2026-07-19 follow-ups (v1.7.4 founder validation)
+
+### 25. Plan unavailable from cache-only brief — IMPLEMENTED-IN-THIS-PR
+Fresh signed-in devices had no `account-profile.json`, so bare `rbox` rendered
+`plan unavailable`. The interactive bound-workspace front door now makes one
+bounded best-effort account fetch on a cold profile and otherwise degrades unchanged.
+
+### 26. Founder front-door menu order — IMPLEMENTED-IN-THIS-PR
+The bound-workspace menu now follows the founder order, with complementary
+`Sync now` / `Pause syncing` gating, existing setup/pair/usage/log flows, and
+`Exit` last. The untracked-directory menu remains unchanged.

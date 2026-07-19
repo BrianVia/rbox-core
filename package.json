@@ -1,6 +1,6 @@
 {
   "name": "@rbox/core",
-  "version": "1.7.3",
+  "version": "1.7.4",
   "private": true,
   "type": "module",
   "engines": {
@@ -15,6 +15,7 @@
     "test:storage-truth": "bun test ./scripts/storage-truth.test.ts ./scripts/storage-truth-live-unit.test.ts ./scripts/storage-truth-live.test.ts",
     "test:all": "bun test ./src/ ./scripts/gc-drain.test.ts && bun run test:storage-truth && cd apps/api && vitest run",
     "typecheck": "mkdir -p .cache/tsbuildinfo && tsc --noEmit --incremental --tsBuildInfoFile .cache/tsbuildinfo/root.tsbuildinfo && tsc -p apps/api --noEmit --incremental --tsBuildInfoFile .cache/tsbuildinfo/apps-api.tsbuildinfo",
+    "guards": "bun scripts/guards.ts",
     "typecheck:rig": "tsc -p scripts/rig/tsconfig.json",
     "gate:dl-integrity": "bun scripts/dl-integrity-gate.ts",
     "rig": "bun scripts/rig/rig.ts",
