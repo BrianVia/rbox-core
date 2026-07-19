@@ -6,6 +6,25 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.7.7] — 2026-07-19 — branch switches follow both ways
+
+### Fixed
+- Switching a repo back to a branch whose tip is an ancestor of your current
+  branch (for example `git switch main` after working on a feature branch) now
+  follows on every paired machine within one sync cycle. Previously the
+  follower machine could be permanently stranded on the old branch with a
+  perpetually dirty `git status` and a stuck "receiver-only commits" deferral,
+  even though every commit was fully synced. Machines with genuinely local
+  commits still defer safely to `rbox git resolve`; `RBOX_GIT_FOLLOW=0`
+  remains the containment switch and now has pinned semantics (it bypasses
+  the follow pipeline entirely via the legacy apply path).
+
+### Added
+- A two-machine `git-ff` test-rig scenario now gates every release on the
+  everyday git flows: commit fast-forward, branch creation with passive
+  checkout-follow on the paired machine (in both author directions), and
+  switch-back — 46 assertions of end-state including sync-record promotion.
+
 ## [1.7.6] — 2026-07-19 — faster scans, quieter cycles
 
 ### Changed
