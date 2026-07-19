@@ -13,6 +13,7 @@ export default defineFlow({
     { on: "a", waitFor: /What do you want to track here\?/ },
     { on: "a", keys: ["Enter"] },
     { on: "a", waitFor: /Which directory should rbox sync\?/ },
+    { on: "a", assertScreen: [/Enter = this directory · type to filter · Tab completes/, /use this directory/] },
     { on: "a", keys: ["Enter"] },
     { on: "a", waitFor: /Workspace name \(Enter accepts,[\s\S]*for none\)/ },
     { on: "a", keys: ["Enter"] },
