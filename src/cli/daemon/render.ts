@@ -3,7 +3,7 @@ import type { Action } from "../../engine/reconcile.js";
 
 export function scanStatsLine(kind: "safety scan" | "deep scan", stats: ScanStats, wallMs: number, deferred: number): string {
   const accounted = stats.readdirMs + stats.statMs + stats.matcherMs + stats.hashMs + stats.sortMs;
-  return `${kind}: files=${stats.filesStatted} dirs=${stats.dirsWalked} wall=${wallMs}ms readdir=${stats.readdirMs} stat=${stats.statMs} matcher=${stats.matcherMs} hash=${stats.hashMs} sort=${stats.sortMs} residual=${wallMs - accounted} cacheHits=${stats.filesSkippedCacheHit} hashed=${stats.filesHashed} deferred=${deferred} reuse=${stats.dirsReusedFromCache} dc=${stats.dircacheOutcome}`;
+  return `${kind}: files=${stats.filesStatted} dirs=${stats.dirsWalked} wall=${wallMs}ms readdir=${stats.readdirMs} stat=${stats.statMs} matcher=${stats.matcherMs} hash=${stats.hashMs} sort=${stats.sortMs} residual=${wallMs - accounted} cacheHits=${stats.filesSkippedCacheHit} hashed=${stats.filesHashed} deferred=${deferred} dc:${stats.dircacheOutcome} hits=${stats.dirsReusedFromCache} walked=${stats.dirsWalked}`;
 }
 
 /** How many changed paths a pull/push log line spells out before eliding. High on

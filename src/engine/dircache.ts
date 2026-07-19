@@ -73,7 +73,7 @@ function sameChildren(a: DirCacheChild[], b: DirCacheChild[]): boolean {
 }
 
 export function scanPruneEnabled(): boolean {
-  return process.env.RBOX_SCAN_PRUNE === "1";
+  return process.env.RBOX_SCAN_PRUNE !== "0";
 }
 
 export function coverageOf(outcome: DircacheOutcome): "full-tree" | "pruned" {

@@ -1,18 +1,63 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, setSystemTime, test } from "bun:test";
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { bulkWalkDir, bulkWalkSupported } from "./darwin-bulk-walk.js";
-import { scanManifest, statsStableAcrossHash } from "./manifest.js";
+import { bulkWalkDir, bulkWalkSupported, setBulkWalkOverrideForTests, type BulkChild } from "./darwin-bulk-walk.js";
+import { DirCache, RACY_MARGIN_MS } from "./dircache.js";
+import { createScanStats, scanManifest, statsStableAcrossHash } from "./manifest.js";
 
 const roots: string[] = [];
-afterEach(async () => { await Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true }))); });
+afterEach(async () => {
+  setBulkWalkOverrideForTests(undefined);
+  setSystemTime();
+  await Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })));
+});
 
 test("bulk walk is safely unavailable off Darwin", () => {
   if (process.platform === "darwin") return;
   expect(bulkWalkSupported()).toBe(false);
   expect(() => bulkWalkDir(".")).not.toThrow();
   expect(bulkWalkDir(".")).toBeNull();
+});
+
+test("successful bulk listings seed dircache and the warm scan reuses every directory", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-bulk-dircache-"));
+  roots.push(root);
+  await fs.mkdir(path.join(root, "nested"));
+  await fs.writeFile(path.join(root, "top.txt"), "top");
+  await fs.writeFile(path.join(root, "nested/child.txt"), "child");
+
+  const priorFlag = process.env.RBOX_SCAN_BULK;
+  process.env.RBOX_SCAN_BULK = "1";
+  setSystemTime(Date.now() + RACY_MARGIN_MS + 1_000);
+  let bulkCalls = 0;
+  setBulkWalkOverrideForTests((absDir): BulkChild[] => {
+    bulkCalls++;
+    return fsSync.readdirSync(absDir, { withFileTypes: true }).map((entry) => {
+      if (entry.isDirectory()) return { name: entry.name, type: "dir" };
+      if (entry.isSymbolicLink()) return { name: entry.name, type: "symlink" };
+      if (entry.isFile()) return { name: entry.name, type: "file", stat: fsSync.lstatSync(path.join(absDir, entry.name)) };
+      return { name: entry.name, type: "other" };
+    });
+  });
+
+  try {
+    const dircache = new DirCache();
+    const seeded = await scanManifest(root, undefined, undefined, undefined, undefined, undefined, undefined, undefined, dircache, "unpruned");
+    expect(bulkCalls).toBe(2);
+
+    setBulkWalkOverrideForTests(() => { throw new Error("warm scan enumerated instead of reusing bulk-seeded listings"); });
+    const stats = createScanStats();
+    const warm = await scanManifest(root, undefined, undefined, undefined, undefined, stats, undefined, undefined, dircache, "pruned");
+    expect(warm.files).toEqual(seeded.files);
+    expect(stats.dircacheOutcome).toBe("hit");
+    expect(stats.dirsReusedFromCache).toBe(2);
+    expect(stats.dirsWalked).toBe(0);
+  } finally {
+    if (priorFlag === undefined) delete process.env.RBOX_SCAN_BULK;
+    else process.env.RBOX_SCAN_BULK = priorFlag;
+  }
 });
 
 const darwinTest = process.platform === "darwin" ? test : test.skip;

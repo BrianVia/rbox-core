@@ -35,6 +35,8 @@ interface Binding {
   error: ErrorFn;
 }
 
+type BulkWalkOverride = (absDir: string, warningSink: (line: string) => void) => BulkChild[] | null;
+
 export interface BulkStat {
   ino: number;
   dev: number;
@@ -58,6 +60,11 @@ export interface BulkChild {
 let support: Binding | null | undefined;
 let libraryHandle: ReturnType<typeof dlopen> | undefined;
 const loggedErrnos = new Set<number>();
+let bulkWalkOverride: BulkWalkOverride | undefined;
+
+export function setBulkWalkOverrideForTests(override: BulkWalkOverride | undefined): void {
+  bulkWalkOverride = override;
+}
 
 function binding(): Binding | null {
   if (support !== undefined) return support;
@@ -78,7 +85,7 @@ function binding(): Binding | null {
 }
 
 export function bulkWalkSupported(): boolean {
-  return binding() !== null;
+  return bulkWalkOverride !== undefined || binding() !== null;
 }
 
 function logErrno(errno: number, warningSink: (line: string) => void): void {
@@ -173,6 +180,7 @@ function parseRecord(view: DataView, start: number, length: number, absDir: stri
 }
 
 export function bulkWalkDir(absDir: string, warningSink: (line: string) => void = console.warn): BulkChild[] | null {
+  if (bulkWalkOverride) return bulkWalkOverride(absDir, warningSink);
   const native = binding();
   if (!native) return null;
   let fd: number;

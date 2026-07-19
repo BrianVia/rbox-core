@@ -211,12 +211,15 @@ let root: string;
 let cfg: WorkspaceConfig;
 let savedPreflightDelta: string | undefined;
 let savedPreflightFull: string | undefined;
+let savedScanPrune: string | undefined;
 const noBackoff = async () => {};
 const deps = (remote: SyncRemote): SyncDeps => ({ remote, backoff: noBackoff });
 
 beforeEach(async () => {
   savedPreflightDelta = process.env.RBOX_PREFLIGHT_DELTA;
   savedPreflightFull = process.env.RBOX_PREFLIGHT_FULL;
+  savedScanPrune = process.env.RBOX_SCAN_PRUNE;
+  delete process.env.RBOX_SCAN_PRUNE;
   root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-sync-test-"));
   await fs.mkdir(path.join(root, ".rbox", "state"), { recursive: true });
   // E2EE is the only mode (D6): a workspace always has an encryption key.
@@ -239,6 +242,8 @@ afterEach(async () => {
   else process.env.RBOX_PREFLIGHT_DELTA = savedPreflightDelta;
   if (savedPreflightFull === undefined) delete process.env.RBOX_PREFLIGHT_FULL;
   else process.env.RBOX_PREFLIGHT_FULL = savedPreflightFull;
+  if (savedScanPrune === undefined) delete process.env.RBOX_SCAN_PRUNE;
+  else process.env.RBOX_SCAN_PRUNE = savedScanPrune;
   await fs.rm(root, { recursive: true, force: true });
 });
 
@@ -1312,7 +1317,7 @@ test("§35: an enabled report times push phases and attributes the byte bases", 
   expect(lines.length).toBe(1);
   expect(lines[0]).not.toContain("x.txt");
   expect(lines[0]).toContain("scan");
-  expect(lines[0]).toContain("reuse0 dc:off");
+  expect(lines[0]).toContain("reuse0 dc:deadline");
   expect(lines[0]).toContain("commit");
   expect(lines[0]).toContain("r0.0 sc0.0 e0.0 c0.0 u0.0 p0.0 7B");
 });
@@ -1349,7 +1354,7 @@ test("§35: an enabled report times pull phases (scan + apply) with plaintext by
   const lines: string[] = [];
   report.logSummaryTo((l) => lines.push(l));
   expect(lines[0]).toContain("latest");
-  expect(lines[0]).toContain("reuse0 dc:off");
+  expect(lines[0]).toContain("reuse0 dc:deadline");
   expect(lines[0]).toContain("d0.0 x0.0 p0.0 4B");
 });
 

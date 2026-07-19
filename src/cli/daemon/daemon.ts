@@ -467,7 +467,7 @@ export class RboxDaemon {
           const initialState = this.syncBase ?? await this.loadSyncBase(startupMutex.handle);
           if (boundaryBootstrapped || await this.bootstrapAgreement(initialState)) {
             if (!boundaryBootstrapped) this.seedFromState(initialState);
-            await this.replaceManifestFromScan(this.cache, initialState.lastSyncedManifest, undefined, undefined, "pruned");
+            await this.replaceManifestFromScan(this.cache, initialState.lastSyncedManifest, undefined, undefined, this.watcherScanMode());
             this.pruneCache();
             await this.cache.save(this.root);
             this.want.pull = true;
@@ -1251,7 +1251,7 @@ export class RboxDaemon {
       if (events.some((e) => isIgnoreRuleFile(e.relPath))) {
         this.rebuildMatcher(await this.loadSyncBase());
         this.rulesChangedSinceDeepScan = true;
-        const { deferred } = await this.replaceManifestFromScan(this.cache, this.manifest, undefined, undefined, "pruned");
+        const { deferred } = await this.replaceManifestFromScan(this.cache, this.manifest, undefined, undefined, this.watcherScanMode());
         await this.resolveDriftFromAppliedEvents(events, deferred);
       } else {
         const deferred = new Set<string>();
@@ -1396,7 +1396,7 @@ export class RboxDaemon {
     // Deferred paths carry the POST-pull base entry, never the pre-pull manifest —
     // carrying pre-pull truth would let the follow-up push publish a stale entry
     // over the version this pull just applied.
-    await this.replaceManifestFromScan(this.cache, base.lastSyncedManifest, undefined, undefined, "pruned");
+    await this.replaceManifestFromScan(this.cache, base.lastSyncedManifest, undefined, undefined, this.watcherScanMode());
   }
 
   private bumpConflict(_kind: "commit"): void {
@@ -1843,11 +1843,18 @@ export class RboxDaemon {
     const errorGenAtStart = this.watcherErrorGeneration;
     const stats = createScanStats();
     const started = Date.now();
-    const { deferred, coverage } = await this.replaceManifestFromScan(this.cache, this.manifest, stats, "safety scan", "pruned");
+    const { deferred, coverage } = await this.replaceManifestFromScan(this.cache, this.manifest, stats, "safety scan", this.watcherScanMode());
     if (metricsEnabled()) this.log(scanStatsLine("safety scan", stats, Date.now() - started, deferred.size));
     this.lastSafetyCompletedMs = Date.now();
     this.pruneCache();
     return { coverage, errorGenAtStart };
+  }
+
+  /** Layer A may prune only while a live watcher is trusted. `watcherHealthy`
+   *  starts true before watcher initialization, so the object-presence half is
+   *  load-bearing for startup failure and periodic-scan-only mode. */
+  private watcherScanMode(): "pruned" | "unpruned" {
+    return this.watcher !== undefined && this.watcherHealthy ? "pruned" : "unpruned";
   }
 
   /** Cache-bypassing re-hash — the ultimate authority against mtime+size-stable drift. */

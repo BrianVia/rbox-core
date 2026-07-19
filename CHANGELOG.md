@@ -6,6 +6,17 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- Layer A's directory-listing cache is now enabled by default for foreground
+  and daemon scans; `RBOX_SCAN_PRUNE=0` is the single kill switch (`=1` remains
+  accepted). It elides reusable directory enumeration while per-file stat and
+  matcher work remain. Daemon safety scans prune only with a live, trusted
+  watcher; untrusted or absent watchers retain full-tree coverage for recovery.
+
+### Fixed
+- Successful macOS bulk directory listings now refresh Layer A cache entries,
+  so bulk scanning and directory-listing reuse compose on subsequent scans.
+
 ## [1.7.5] — 2026-07-19 — a front door that knows you
 
 ### Fixed
