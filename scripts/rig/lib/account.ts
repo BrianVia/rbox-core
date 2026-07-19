@@ -58,6 +58,19 @@ export interface SecretDeps {
   readFile: (p: string) => string | undefined;
 }
 
+/** Resolve one named key from the repo-local dev secret file. Worktrees fall back
+ *  to the primary checkout, exactly like the rig's bootstrap-secret lookup. */
+export function resolveSecretFileKey(repoRoot: string, key: string, deps: Pick<SecretDeps, "readFile"> = defaultSecretDeps()): string {
+  for (const root of candidateRoots(repoRoot)) {
+    const content = deps.readFile(path.join(root, SECRET_FILE));
+    if (content) {
+      const value = parseSecretFile(content, key);
+      if (value) return value;
+    }
+  }
+  throw new Error(`no ${key} in ${SECRET_FILE} at the repo root`);
+}
+
 /**
  * Resolve the dev bootstrap secret: env `RBOX_DEV_BOOTSTRAP` wins, else the
  * `RBOX_DEV_BOOTSTRAP_SECRET=` line in `dev-keys.local.secret` (worktree → primary
@@ -66,17 +79,14 @@ export interface SecretDeps {
 export function resolveBootstrapSecret(repoRoot: string, deps: SecretDeps = defaultSecretDeps()): string {
   const fromEnv = deps.env[BOOTSTRAP_ENV_KEY]?.trim();
   if (fromEnv) return fromEnv;
-  for (const root of candidateRoots(repoRoot)) {
-    const content = deps.readFile(path.join(root, SECRET_FILE));
-    if (content) {
-      const v = parseSecretFile(content, BOOTSTRAP_SECRET_KEY);
-      if (v) return v;
-    }
+  try {
+    return resolveSecretFileKey(repoRoot, BOOTSTRAP_SECRET_KEY, deps);
+  } catch {
+    throw new Error(
+      `rig: no dev bootstrap secret. Set ${BOOTSTRAP_ENV_KEY}=<secret>, or add a line ` +
+        `${BOOTSTRAP_SECRET_KEY}=<secret> to ${SECRET_FILE} at the repo root.`
+    );
   }
-  throw new Error(
-    `rig: no dev bootstrap secret. Set ${BOOTSTRAP_ENV_KEY}=<secret>, or add a line ` +
-      `${BOOTSTRAP_SECRET_KEY}=<secret> to ${SECRET_FILE} at the repo root.`
-  );
 }
 
 /**
@@ -86,17 +96,14 @@ export function resolveBootstrapSecret(repoRoot: string, deps: SecretDeps = defa
 export function resolvePlatformSecret(repoRoot: string, deps: SecretDeps = defaultSecretDeps()): string {
   const fromEnv = deps.env[PLATFORM_SECRET_KEY]?.trim();
   if (fromEnv) return fromEnv;
-  for (const root of candidateRoots(repoRoot)) {
-    const content = deps.readFile(path.join(root, SECRET_FILE));
-    if (content) {
-      const v = parseSecretFile(content, PLATFORM_SECRET_KEY);
-      if (v) return v;
-    }
+  try {
+    return resolveSecretFileKey(repoRoot, PLATFORM_SECRET_KEY, deps);
+  } catch {
+    throw new Error(
+      `rig: no dev platform secret. Set ${PLATFORM_SECRET_KEY}=<secret>, or add a line ` +
+        `${PLATFORM_SECRET_KEY}=<secret> to ${SECRET_FILE} at the repo root.`
+    );
   }
-  throw new Error(
-    `rig: no dev platform secret. Set ${PLATFORM_SECRET_KEY}=<secret>, or add a line ` +
-      `${PLATFORM_SECRET_KEY}=<secret> to ${SECRET_FILE} at the repo root.`
-  );
 }
 
 function defaultSecretDeps(): SecretDeps {
