@@ -21,7 +21,7 @@ import { deleteAccount, readCredentials, resolveBootstrapSecret, resolvePlatform
 import { RunCapture } from "./lib/capture.js";
 import { assignMainExit, reportExit } from "./lib/exit-code.js";
 import { renderReportMd } from "./lib/report.js";
-import { deleteImageHashRecord, readImageHashRecord, writeImageHashRecord } from "./lib/image-hash-records.js";
+import { deleteImageHashRecord, imageHashRecordPath, readImageHashRecord, writeImageHashRecord } from "./lib/image-hash-records.js";
 import { formatBytes, trimRunDirectories, trimWorkloadCache } from "./lib/gc.js";
 import { assessDiskHeadroom, assessDockerInfo, assessRootlessPolicy, mayRunDockerDoctorProbes } from "./lib/doctor.js";
 import { waitForConvergence, waitForPath } from "./lib/waiters.js";
@@ -32,7 +32,7 @@ import { finalizeReport, renderReportTable, skipReport, type RigCtx, type Scenar
 const REPO_ROOT = path.resolve(fileURLToPath(import.meta.url), "../../.."); // scripts/rig/rig.ts → repo root
 const RIG_DIR = path.join(REPO_ROOT, "scripts", "rig");
 const RUNS_DIR = path.join(RIG_DIR, "runs");
-const HASH_FILE = path.join(RUNS_DIR, ".image-hash");
+const HASH_FILE = imageHashRecordPath();
 const DEV_CPUS = 2;
 const DEV_MEMORY = "2G"; // container CLI documents uppercase K/M/G/T/P suffixes
 

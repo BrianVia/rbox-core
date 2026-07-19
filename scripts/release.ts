@@ -9,6 +9,7 @@
  *      install.sh, manifest, signature, and changelog to the rbox-releases bucket
  *
  * Usage: bun scripts/release.ts <version> [--targets=linux-x64,darwin-arm64] [--no-upload]
+ *        bun scripts/release.ts --dev [--targets=linux-x64,darwin-arm64]
  * Env:   RBOX_RELEASE_PRIVATE_KEY (Ed25519 pkcs8 b64url), RBOX_RELEASE_KEY_ID
  */
 import { createHash, createPrivateKey, createPublicKey, sign as edSign } from "node:crypto";
@@ -38,30 +39,61 @@ export const PARCEL_PKG: Record<ReleaseTarget, string> = {
 export const externalFlagsFor = (t: ReleaseTarget): string[] =>
   ALL.filter((o) => o !== t).flatMap((o) => ["--external", PARCEL_PKG[o]]);
 
+export function checkedInRboxVersion(source: string): string {
+  const version = source.match(/const CHECKED_IN_RBOX_VERSION = "([^"]+)";/)?.[1];
+  if (!version) throw new Error("src/cli/version.ts has no CHECKED_IN_RBOX_VERSION literal");
+  return version;
+}
+
+export function deriveDevVersion(checkedInVersion: string, shortSha: string): string {
+  if (!/^[0-9a-f]{7,64}$/i.test(shortSha)) throw new Error(`invalid short git sha ${JSON.stringify(shortSha)}`);
+  return `${checkedInVersion}-dev+${shortSha}`;
+}
+
+/** Rewrite version.ts only for the duration of a build, restoring its exact bytes on every throw/return. */
+export async function withTemporaryVersionFile<T>(file: string, version: string, work: () => Promise<T>): Promise<T> {
+  const original = fs.readFileSync(file);
+  try {
+    fs.writeFileSync(file, `export const RBOX_VERSION = ${JSON.stringify(version)};\n`);
+    return await work();
+  } finally {
+    fs.writeFileSync(file, original);
+  }
+}
+
 function arg(name: string): string | undefined {
   const a = process.argv.find((x) => x.startsWith(`--${name}=`));
   return a ? a.slice(name.length + 3) : undefined;
 }
 
 async function main(): Promise<void> {
-const version = process.argv[2];
-if (!version || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) {
-  console.error("usage: bun scripts/release.ts <version> [--targets=...] [--no-upload | --upload-only]");
+const argv = process.argv.slice(2);
+const dev = argv.includes("--dev");
+const positional = argv.filter((value) => !value.startsWith("--"));
+const uploadOnly = argv.includes("--upload-only");
+if ((dev && (positional.length !== 0 || uploadOnly)) || (!dev && (positional.length !== 1 || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(positional[0]!)))) {
+  console.error("usage: bun scripts/release.ts <version> [--targets=...] [--no-upload | --upload-only]\n       bun scripts/release.ts --dev [--targets=...]");
   process.exit(2);
 }
+const versionFile = path.join(ROOT, "src/cli/version.ts");
+const checkedInSource = fs.readFileSync(versionFile, "utf8");
+const gitSha = dev ? Bun.spawnSync(["git", "rev-parse", "--short=7", "HEAD"], { cwd: ROOT, stdout: "pipe", stderr: "pipe" }) : undefined;
+if (gitSha && gitSha.exitCode !== 0) throw new Error(`git rev-parse failed: ${gitSha.stderr.toString().trim()}`);
+const version = dev ? deriveDevVersion(checkedInRboxVersion(checkedInSource), gitSha!.stdout.toString().trim()) : positional[0]!;
 const targets = (arg("targets")?.split(",") ?? [...ALL]).filter((t): t is ReleaseTarget => (ALL as readonly string[]).includes(t));
 const noUpload = process.argv.includes("--no-upload");
 // `--upload-only`: publish a dist/ that an EARLIER job already built + signed + smoke-tested,
 // without rebuilding — so the published bytes are exactly the smoked bytes (design §41 §6).
-const uploadOnly = process.argv.includes("--upload-only");
 const keyId = process.env.RBOX_RELEASE_KEY_ID ?? RELEASE_KEYS[0]!.keyId;
 const tag = `v${version}`;
 const dist = path.join(ROOT, "dist");
 
-const changelog = fs.readFileSync(path.join(ROOT, "CHANGELOG.md"), "utf8");
-const firstReleased = changelog.match(/^## \[(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\]/m)?.[1];
-if (firstReleased !== version) {
-  throw new Error(`CHANGELOG.md newest release is ${firstReleased ?? "missing"}, expected ${version}`);
+if (!dev) {
+  const changelog = fs.readFileSync(path.join(ROOT, "CHANGELOG.md"), "utf8");
+  const firstReleased = changelog.match(/^## \[(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\]/m)?.[1];
+  if (firstReleased !== version) {
+    throw new Error(`CHANGELOG.md newest release is ${firstReleased ?? "missing"}, expected ${version}`);
+  }
 }
 
 function sh(cmd: string[]): void {
@@ -106,11 +138,11 @@ async function uploadRelease(): Promise<void> {
 // upload those exact bytes. uploadRelease() re-verifies the signature before anything ships.
 if (uploadOnly) {
   await uploadRelease();
-  process.exit(0);
+  return;
 }
 
-// 1. embed the version
-fs.writeFileSync(path.join(ROOT, "src/cli/version.ts"), `export const RBOX_VERSION = ${JSON.stringify(version)};\n`);
+await withTemporaryVersionFile(versionFile, version, async () => {
+// 1. embed the version for compile; withTemporaryVersionFile restores the checkout in finally.
 console.log(`[release] version.ts → ${version}`);
 
 // 2. compile each target.
@@ -154,6 +186,11 @@ const manifest = { version, keyId, artifacts, releasedAt: new Date(Number(proces
 const manifestBytes = new TextEncoder().encode(JSON.stringify(manifest));
 fs.writeFileSync(path.join(dist, "version.json"), manifestBytes);
 
+if (dev) {
+  console.log(`[release] --dev: built unsigned artifacts in ${dist}`);
+  return;
+}
+
 // 4. sign version.json over the domain-tagged exact bytes
 const privB64 = process.env.RBOX_RELEASE_PRIVATE_KEY;
 if (!privB64) throw new Error("RBOX_RELEASE_PRIVATE_KEY not set");
@@ -174,12 +211,13 @@ console.log(`[release] signed manifest (keyId ${keyId})`);
 // `--no-upload`: stop after build+sign so a separate (smoke-gated) job can publish dist/.
 if (noUpload) {
   console.log(`[release] --no-upload: built + signed artifacts in ${dist}`);
-  process.exit(0);
+  return;
 }
 
 // 5. upload to rbox-releases (default single-shot local path). uploadRelease() re-reads and
 //    re-verifies the just-signed version.json before uploading — same gate as --upload-only.
 await uploadRelease();
+});
 }
 
 if (import.meta.main) await main();
