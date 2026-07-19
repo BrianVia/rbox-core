@@ -1,6 +1,6 @@
 # 159 — Typeahead directory picker for "Which directory should rbox sync?"
 
-Status: DRAFT v6 (folded review rounds 1–5 — rulings in Decisions; reviews at
+Status: DRAFT v7 (folded review rounds 1–6 — rulings in Decisions; reviews at
 `.claude/review-159-r1.md`, `-r2.md`, `-r3.md`). Origin: validation item #8,
 founder-greenlit design pass 2026-07-18.
 
@@ -22,57 +22,57 @@ built from) — no new dependency. `promptPath` keeps its exported signature
 and becomes this picker on a real TTY; `opts.input` (the test/embedding seam)
 forces the legacy plain-input path (r1 f10).
 
-### Canonical state model (r1 f7 accepted — no mutable anchor)
+### Canonical state model (r1 f7; staged projection per r4 f1 / r5 f1 / r6 f1)
 
-- State: the **visible input string** plus a **highlight index** that resets
-  to row 1 on every edit (r2 f2). **Normalized projection (r4 f1):** ALL
-  derivation — resolution, row labels, error classification, listing and
-  filter — runs on ONE normalized projection of the visible string: trim →
-  `expandUserPath` → resolve semantics, identical to submission. The raw
-  visible spelling is retained ONLY for Tab's basename-preserving rewrite.
-  So `" foo "` labels row 1 `use "<cwd>/foo"` and filters on `foo`, and
-  `" ~user"` classifies as the no-answer UnsupportedPathError state exactly
-  as its trimmed submission would — the highlighted row and the submitted
-  answer can never differ. Whitespace-edged transitions (including
-  whitespace before `~user`) are pinned by tests. The resolution base is always the immutable
-  `opts.cwd` (r2 f5 — `opts.default` keeps today's meaning: the bare-Enter
-  answer, resolved against cwd exactly as now; it is NOT a resolution base).
-  `~` and absolute forms via `expandUserPath`.
-- Derived, never stored: `resolved = resolve(cwd, input)`;
-  **boundary = `input === "" || input.endsWith("/")`** (r2 f1 — empty input
-  is a boundary, so the initial listing shows `resolve(cwd, default ?? ".")`,
-  not its parent); `listDir = boundary ? (input === "" ?
-  resolve(cwd, default ?? ".") : resolved) : dirname(resolved)`;
-  `filterTerm = boundary ? "" : basename(input)`. Initial-state test must pin
-  BOTH the displayed directory and the bare-Enter answer = default.
-  **Normalization (r3 f3):** submissions AND the default run today's exact
-  pipeline — trim → `expandUserPath` → `resolve(cwd, ·)` (prompt.ts:94-101).
-  The initial `listDir` applies that pipeline to `default ?? ""` (the EMPTY
-  raw answer, not cwd, in the no-default case). A `~` default therefore lists
-  the home directory, whitespace defaults are trimmed, and an unsupported
-  `~user` default triggers the same retry as today. All three pinned.
-- **Key split (r2 f2, the round-2 BLOCKER):** Enter acts on the HIGHLIGHTED
-  row — which resets to the pinned use-input row after every edit, so
-  type-literal-then-Enter always answers the literal (typo-no-phantom
-  contract). Arrow keys move the highlight for Enter selection. **Tab ignores
-  the highlight** and completes the visible input to the BEST-RANKED CHILD's
-  path + `/` (no-op when no child matches). So `pro` + Tab → `project/`,
-  while `pro` + Enter → `use "<cwd>/pro"`. Both contracts hold by
-  construction; the type-Tab-Enter flow proves the Tab side.
-  **Rewrite construction (r3 f2 + r5 f1):** branch on SEMANTIC emptiness
-  (`lexical === ""`), never raw spelling. Non-empty: Tab replaces only the
-  final lexical segment (after the last `/` of `lexical`) with the completed
-  child's name + `/`, preserving the lexical prefix (`~/`, `../`, absolute,
-  repeated slashes) verbatim — so the rewritten string always re-derives the
-  completed child under the staged projection. Bare `~` normalizes to `~/`
-  first, then appends. Empty (includes whitespace-only): the child is
+- State: the **visible input string** (raw) plus a **highlight index** that
+  resets to row 1 on every edit (r2 f2). The resolution base is always the
+  immutable `opts.cwd` (r2 f5 — `opts.default` keeps today's meaning: the
+  bare-Enter answer; it is NOT a resolution base).
+- **Staged projection** — every derivation names its owning stage; there is
+  no undifferentiated `input` anywhere in this model:
+  1. `lexical = trim(raw)`. Owns: **semantic emptiness** (`lexical === ""`),
+     **boundary** (`lexical === "" || lexical === "~" ||
+     lexical.endsWith("/")` — computed BEFORE expansion, which erases
+     trailing slashes; bare `~` is a boundary so it LISTS the home
+     directory), **filterTerm** (`boundary ? "" : lastSegment(lexical)`),
+     and the empty-vs-non-empty **Tab branch**.
+  2. `expanded = expandUserPath(lexical)` — a throw here (`~user`) IS the
+     no-answer UnsupportedPathError state (so `" ~user"` classifies exactly
+     as its submission would).
+  3. `resolved = resolve(cwd, expanded)`. Owns: the row-1 label and answer,
+     and `listDir = boundary ? resolved : dirname(resolved)` — except
+     semantic-empty input, where `listDir` = today's submission pipeline
+     applied to `default ?? ""` (so a `~` default lists home; the EMPTY raw
+     answer, not cwd, in the no-default case; an unsupported `~user` default
+     retries as today — all pinned).
+- **Raw participates in exactly two rules** (retracting v5's "display-only"
+  absolutism): it is the editor display, and the **default fast path keys on
+  RAW emptiness** — only a truly untouched prompt answers `default`, exactly
+  like today's input widget. Whitespace-only input is therefore
+  semantically empty for listing/Tab (lists the default's directory,
+  absolute-form completion) but its ENTER submission runs the normal
+  pipeline: trim → "" → `resolve(cwd, "")` = cwd — byte-identical to today
+  even when `default !== cwd`. Pinned by a whitespace-only-Enter test with
+  `default !== cwd`.
+- **Key split (r2 f2):** Enter acts on the HIGHLIGHTED row — which resets to
+  the pinned use-input row after every edit, so type-literal-then-Enter
+  always answers the literal (typo-no-phantom contract). Arrow keys move the
+  highlight. **Tab ignores the highlight** and completes to the BEST-RANKED
+  CHILD (no-op when no child matches). `pro` + Tab → `project/`; `pro` +
+  Enter → `use "<cwd>/pro"`.
+- **Tab rewrite construction (r3 f2 + r5/r6):** branch on semantic
+  emptiness. Non-empty: replace only the final lexical segment (after the
+  last `/` of `lexical`) with the completed child's name + `/`, preserving
+  the lexical prefix (`~/`, `../`, absolute, repeated slashes) verbatim;
+  edge whitespace is dropped by a rewrite (pinned). Bare `~` (a boundary):
+  Tab rewrites to `~/` + best child of HOME + `/` — e.g. `~` + Tab →
+  `~/Documents/`. Semantic-empty (includes whitespace-only): the child is
   written relative when `listDir` is cwd, ABSOLUTE otherwise (a default
   outside cwd must not silently re-derive under cwd). Every named transition
   test states its expected visible string.
-  Backspace is just string editing — deleting past a `/` naturally re-lists
-  the parent because `listDir` is derived. Trailing/repeated slashes, `..`,
-  absolute, and `~/` all fall out of resolve(); state-transition tests
-  required for each.
+- Backspace is just string editing — deleting past a `/` naturally re-lists
+  the parent because `listDir` is derived. Initial-state test pins BOTH the
+  displayed directory and the bare-Enter answer = default.
 
 ### Candidate rows (r1 f1+f3 accepted — free-form input is always accepted)
 
@@ -217,3 +217,10 @@ R5, 1 accepted: f1 staged projection (lexical/expanded/resolved) with
 per-stage ownership; boundary computed pre-expansion; Tab branches on
 semantic emptiness; bare-`~`, `~/`, and whitespace-only Tab transitions
 pinned with exact visible strings.
+R6, 1 accepted: f1 the staged model is now the NORMATIVE state model (the
+old one-projection formulas were removed wholesale — a silent no-op edit in
+the v6 fold had left both in place); bare `~` is a boundary listing home
+with Tab → `~/<child>/`; raw emptiness gates ONLY the default fast path
+(matching today's widget), so whitespace-only Enter still submits cwd
+byte-identically even with `default !== cwd` — v5's raw-is-display-only
+claim retracted.
