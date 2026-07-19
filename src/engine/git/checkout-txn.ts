@@ -49,8 +49,9 @@ export interface CheckoutPlan {
   /** Narrow raw-forensics arm: refs/* still validates via show-ref, while fsck
    * skips pseudo-ref parsing so malformed preserved ORIG_HEAD alone can heal. */
   malformedOrigHeadPreserved?: true;
-  /** Refs read by HEAD but not mutated in this transaction. Their ordinary
-   * ref lock is held across the boundary proof and commit. */
+  /** Refs used as durability witnesses or read by HEAD but not mutated in
+   * this transaction. Their ordinary ref lock is held across the boundary
+   * proof and commit. */
   refReservations?: Array<{ ref: string; expectedOid: string | null }>;
 }
 

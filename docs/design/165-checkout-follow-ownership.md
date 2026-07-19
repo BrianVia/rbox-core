@@ -167,8 +167,13 @@ Rig (`git-ff` scenario, upgraded):
 2. After follow: persisted record's BASE HEAD/refs equal the incoming
    section; `pending` absent; apply deferral absent; `partial` null/absent;
    then ONE idle cycle proves no re-park (R1B-4).
-3. `RBOX_GIT_FOLLOW=0` blocks the newly authorized HEAD-only follow while
-   ref-plane behavior is preserved (R1A-5).
+3. `RBOX_GIT_FOLLOW=0` containment semantics, pinned by rig run (2026-07-19,
+   corrects R1A-5's model): the flag routes STEADY receivers around the
+   design-116 follow pipeline — and therefore around the self-root witness
+   logic entirely — into the legacy direct-apply path, which also converges
+   (B still lands on the incoming HEAD with a clean tree; safe refs publish;
+   record settles). The kill switch's value is removing 165's new code from
+   the decision path, not freezing the receiver's checkout.
 
 Unit/behavior (extract a pure checkout-root/eligibility constructor, or
 test through `followDivergedRepo` — `checkoutRoots` is currently local and
@@ -216,12 +221,14 @@ Suites: `bun test src/cli/sync-git src/engine/git` + CI shards green.
 
 ## Rollout
 
-Ships default-on in the next 1.7.x release (founder priority: at least even
-with the recovery-binary fix). Containment: the EXISTING kill switch
-`RBOX_GIT_FOLLOW=0` already gates this entire path
-(`src/cli/sync-git/shared.ts:49-52`, threaded via `apply.ts:1135-1148`,
-early-return before root construction at `follow.ts:964-973`) — v1's
-"no kill switch exists" claim was wrong (R1A-5). It is a per-process env
-switch: founder daemons receive it via the daemon environment (`rbox stop`,
-export, `rbox start`), not remotely. Test 3 pins that `=0` suppresses the
-new follow. No new flag.
+Ships default-on in the next 1.7.x release (founder priority: 165 releases
+FIRST, ahead of the recovery-binary fix). Containment: the EXISTING kill
+switch `RBOX_GIT_FOLLOW=0` (`src/cli/sync-git/shared.ts:52`, consulted at
+`apply.ts:739/:896/:1147`) routes steady receivers through the legacy
+direct-apply path, bypassing the follow pipeline and with it every line 165
+adds — verified by rig: the legacy path also converges the switch-back, so
+the flag is pure containment, not a behavior freeze (corrects R1A-5's
+suppression model; v1's "no kill switch exists" claim was also wrong). It is
+a per-process env switch: founder daemons receive it via the daemon
+environment (`rbox stop`, export, `rbox start`), not remotely. Test 3 pins
+these exact semantics. No new flag.
