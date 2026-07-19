@@ -17,10 +17,21 @@ function simulatedExitPromptError(): Error {
   return err;
 }
 
-test("inside workspace renders status before picker and default nothing runs no action", async () => {
+const noIdentityFetch = { loadCredentials: async () => ({ state: "absent" as const, path: "/missing/credentials.json" }) };
+
+const validCredentials = {
+  state: "valid" as const,
+  source: "disk" as const,
+  credentials: { v: 1 as const, accountId: "acct_one", deviceId: "dev_one", token: "token", remoteUrl: "https://api.test" },
+  legacy: false,
+  extensions: {},
+};
+
+test("inside workspace renders status before picker and Exit runs no action", async () => {
   const calls: string[] = [];
   let statusDone = false;
   await runFrontDoor("/work/root", {
+    ...noIdentityFetch,
     statusCmd: async (root) => {
       calls.push(`status:${root}`);
       await Promise.resolve();
@@ -32,7 +43,7 @@ test("inside workspace renders status before picker and default nothing runs no 
       expect(statusDone).toBe(true);
       expect(cfg.message).toBe("What would you like to do?");
       expect(cfg.choices).toEqual(frontDoorChoices(false));
-      return "nothing";
+      return "exit";
     },
   });
   expect(calls).toEqual(["status:/work/root", "prompt"]);
@@ -42,15 +53,22 @@ for (const [action, expected] of [
   ["sync", "sync:/work/root"],
   ["logs", "logs:/work/root"],
   ["stop", "stop:/work/root"],
+  ["setup", "setup:/work/root"],
+  ["pair", "pair"],
+  ["usage", "usage"],
 ] as const satisfies ReadonlyArray<readonly [FrontDoorAction, string]>) {
   test(`front-door action ${action} dispatches to the injected handler`, async () => {
     const calls: string[] = [];
     await runFrontDoor("/work/root", {
+      ...noIdentityFetch,
       statusCmd: async () => ({ daemonRunning: action === "stop" }),
       promptSelect: async () => action,
       syncNow: async (root) => void calls.push(`sync:${root}`),
       viewLogs: async (root) => void calls.push(`logs:${root}`),
       pauseSyncing: async (root) => void calls.push(`stop:${root}`),
+      setUpWorkspace: async (root) => void calls.push(`setup:${root}`),
+      pairAnotherDevice: async () => void calls.push("pair"),
+      viewUsage: async () => void calls.push("usage"),
     });
     expect(calls).toEqual([expected]);
   });
@@ -83,6 +101,7 @@ test("bare rbox target resolves unenrolled untracked directories to setup", asyn
 test("prompt abort returns cleanly without running an action", async () => {
   const calls: string[] = [];
   await runFrontDoor("/work/root", {
+    ...noIdentityFetch,
     statusCmd: async () => {
       calls.push("status");
       return { daemonRunning: false };
@@ -91,7 +110,7 @@ test("prompt abort returns cleanly without running an action", async () => {
       calls.push("prompt");
       throw simulatedExitPromptError();
     },
-    startSyncing: async () => void calls.push("start"),
+    syncNow: async () => void calls.push("sync"),
   });
   expect(calls).toEqual(["status", "prompt"]);
 });
@@ -99,20 +118,100 @@ test("prompt abort returns cleanly without running an action", async () => {
 test("front-door sync-control choice and action flip with daemon state", async () => {
   for (const [running, expectedChoice, selected, expectedCall] of [
     [true, { name: "Pause syncing", value: "stop", description: "rbox stop" }, "stop", "stop:/work/root"],
-    [false, { name: "Start syncing", value: "start", description: "rbox start" }, "start", "start:/work/root"],
+    [false, { name: "Sync now", value: "sync", description: "rbox sync" }, "sync", "sync:/work/root"],
   ] as const) {
     const calls: string[] = [];
     await runFrontDoor("/work/root", {
+      ...noIdentityFetch,
       statusCmd: async () => ({ daemonRunning: running }),
       promptSelect: async (cfg) => {
-        expect(cfg.choices.at(-1)).toEqual(expectedChoice);
+        expect(cfg.choices[0]).toEqual(expectedChoice);
+        expect(cfg.choices.at(-1)).toEqual({ name: "Exit", value: "exit" });
         return selected;
       },
-      startSyncing: async (root) => void calls.push(`start:${root}`),
+      syncNow: async (root) => void calls.push(`sync:${root}`),
       pauseSyncing: async (root) => void calls.push(`stop:${root}`),
     });
     expect(calls).toEqual([expectedCall]);
   }
+});
+
+test("front-door choices pin the founder order and complementary sync gate", () => {
+  expect(frontDoorChoices(false)).toEqual([
+    { name: "Sync now", value: "sync", description: "rbox sync" },
+    { name: "Start background syncing", value: "start", description: "rbox start" },
+    { name: "Set up a new workspace", value: "setup", description: "rbox setup" },
+    { name: "Pair another device", value: "pair", description: "rbox pair" },
+    { name: "View usage", value: "usage", description: "rbox usage" },
+    { name: "View logs", value: "logs", description: "rbox logs" },
+    { name: "Exit", value: "exit" },
+  ]);
+  expect(frontDoorChoices(true)).toEqual([
+    { name: "Pause syncing", value: "stop", description: "rbox stop" },
+    ...frontDoorChoices(false).slice(2),
+  ]);
+});
+
+test("cold front-door identity fetches exactly once and renders the fresh response", async () => {
+  const loaded = validCredentials;
+  let fetches = 0;
+  let renderedIdentity: { email: string | null; plan: string | null } | undefined;
+  await runFrontDoor("/work/root", {
+    loadCredentials: async () => loaded,
+    readAccountProfile: async (accountId) => {
+      expect(accountId).toBe("acct_one");
+      return undefined;
+    },
+    fetchAccountSummary: async (timeoutMs, credentials) => {
+      fetches++;
+      expect(timeoutMs).toBe(2_000);
+      expect(credentials).toBe(loaded);
+      return { state: "ok", status: { accountId: "acct_one", linked: true, email: "founder@example.com", plan: "pro" } };
+    },
+    statusCmd: async (_root, identity) => {
+      renderedIdentity = identity;
+      return { daemonRunning: false };
+    },
+    promptSelect: async () => "exit",
+  });
+  expect(fetches).toBe(1);
+  expect(renderedIdentity).toEqual({ email: "founder@example.com", plan: "pro" });
+});
+
+test("warm front-door identity cache skips the network fetch", async () => {
+  let fetches = 0;
+  await runFrontDoor("/work/root", {
+    loadCredentials: async () => validCredentials,
+    readAccountProfile: async () => ({ accountId: "acct_one", email: null, signInMethod: null, plan: "pro" }),
+    fetchAccountSummary: async () => {
+      fetches++;
+      return { state: "unavailable" };
+    },
+    statusCmd: async (_root, identity) => {
+      expect(identity).toBeUndefined();
+      return { daemonRunning: false };
+    },
+    promptSelect: async () => "exit",
+  });
+  expect(fetches).toBe(0);
+});
+
+test("front-door identity fetch soft-fails to the existing cache-only status render", async () => {
+  let fetches = 0;
+  await runFrontDoor("/work/root", {
+    loadCredentials: async () => validCredentials,
+    readAccountProfile: async () => ({ accountId: "acct_one", email: "founder@example.com", signInMethod: "github", plan: null }),
+    fetchAccountSummary: async () => {
+      fetches++;
+      return { state: "unavailable" };
+    },
+    statusCmd: async (_root, identity) => {
+      expect(identity).toBeUndefined();
+      return { daemonRunning: false };
+    },
+    promptSelect: async () => "exit",
+  });
+  expect(fetches).toBe(1);
 });
 
 for (const action of ["new", "existing", "nothing"] as const satisfies ReadonlyArray<UntrackedMenuAction>) {

@@ -291,6 +291,15 @@ export async function statusCmd(root: string, opts: StatusCmdOptions = {}): Prom
   return statusCmdWithDeps(root, opts, deps);
 }
 
+/** Interactive front-door seam: render the brief from a just-fetched identity
+ * while the fetch's existing asynchronous profile-cache write settles. */
+export async function statusCmdWithBriefIdentity(root: string, identity: BriefIdentitySource): Promise<StatusCmdResult> {
+  return statusCmdWithDeps(root, {}, {
+    ...defaultStatusDeps,
+    readBriefIdentity: async () => identity,
+  });
+}
+
 export async function statusCmdWithDeps(
   root: string,
   opts: Omit<StatusCmdOptions, "now"> = {},
