@@ -5,6 +5,30 @@ sessions. Founder-requested (2026-07-18): proactively appended by agents as
 they work; signal for what to fix. Newest first. Keep entries to 2–4 lines:
 what happened, what it cost, fix hint if obvious.
 
+## 2026-07-19 (day/evening batch)
+
+- **Mid-run review artifacts caused a false ALIGNED merge.** A long codex
+  review wrote its verdict file mid-run (draft said ALIGNED), the completion
+  sentinel fired on file-existence, and the design merged mislabeled — the
+  process's FINAL output was CHANGES-REQUIRED. Cost: a correction PR + a
+  wrong report to the founder. Rules now: sentinels require process-exit AND
+  artifact; review prompts say "write the file ONCE, at the end"; verify the
+  log tail against the artifact before acting on any long run.
+- **Deleting a merged stacked-PR base branch CLOSES the child PR** instead
+  of retargeting (GitHub). Cost: PR #355 recreated as #356. Merge or
+  retarget children first.
+- **Rebuilding a branch by file-copy dragged a stale package.json version**
+  over main's, tripping the release-consistency test (caught by CI). File
+  lists lie about content vintage; re-take contested files from main.
+- **When the same flake survives two structural CI fixes, stop tuning CI
+  and hunt a deadlock** — the two-day "runner starvation" was a real FIFO
+  deadlock (keep-pins, fixed #357) whose zombie handles starved subsequent
+  tests because Bun never cancels timed-out async tests.
+- **bun test with a nonexistent path filter exits 0 silently** (zero files
+  matched) — combined with sandbox cwd resets, this manufactured a phantom
+  hang investigation. Print pwd or use absolute paths in automated test
+  invocations.
+
 ## 2026-07-19 (overnight)
 
 - **RESOLVED same night (#pending): `scripts/ux/tui.test.ts` required an
