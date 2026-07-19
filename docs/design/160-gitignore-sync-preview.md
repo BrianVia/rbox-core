@@ -1,83 +1,136 @@
 # 160 — Gitignore sync preview: show what will and won't sync before first sync
 
-Status: DRAFT — review loop pending. Origin: validation item #9
-(`docs/validation-2026-07-18-new-user-flow.md`), founder: "table this for now
-but worth exploring" → design pass greenlit 2026-07-18 (design only; ship
-decision separate).
+Status: DRAFT v2 (folded review round 1 — all 9 findings ruled accepted, see
+Decisions). Origin: validation item #9, founder greenlit design pass
+2026-07-18 (design only; ship decision separate).
 
 ## Problem (field evidence)
 
 The gitignore step (`GITIGNORE_CHOICES`, `src/cli/init-cmd.ts:111`) asks
 "How should rbox handle gitignored files?" as a blind policy choice. The
-founder's validation dir had NO root `.gitignore`, making option 1 ("skip
-gitignored") feel unverifiable — the user can't see what the choice means for
-THEIR tree before committing to a first sync of potentially 100k+ files.
-Original idea: a third option that previews what will/won't sync; founder
-amendment: when there's no root .gitignore, recursively find ignore patterns
-and surface a truncated summary of what was found.
+founder's validation dir had no root `.gitignore`, making the choice feel
+unverifiable — the user can't see what it means for THEIR tree before a first
+sync of 100k+ files.
 
-## Mechanism — preview as an ACTION, not a third policy
+## ⚠ FOUNDER DECISION REQUIRED (surfaced by review r1, exists TODAY)
 
-Keep exactly two policy choices (founder decision d-2026-07-18 pinned:
-default stays "Skip gitignored (recommended)"). Add a non-answering action
-row to the same select:
+The engine respects the workspace-root `.gitignore` in BOTH modes
+(`buildIgnoreMatcher` adds it to the legacy layer unconditionally,
+`src/engine/ignore.ts:281-288`; design 72 §preserved-legacy). Builtin rules
+(`.env`, `node_modules/`, …) and `.rboxignore` also apply in both modes. The
+`respect-gitignore` flag ONLY toggles nested-`.gitignore` honoring. So the
+shipped option-2 label "Sync gitignored files too" overpromises **today**:
+root-ignored files are never synced under it. Options: (a) relabel option 2
+honestly ("Also sync files ignored by nested .gitignores…"), or (b) change
+engine semantics so option 2 ignores the root `.gitignore` layer too. This
+design assumes **(a) relabel** (semantics changes are a non-goal here) but the
+call is the founder's; the preview below tells the truth either way.
+
+## Mechanism — preview as an ACTION row in the existing select
+
+Two policy choices stay exactly as-is (default unchanged). A third,
+non-policy row is appended to the PROMPT LIST (not to `GITIGNORE_CHOICES`,
+which stays two-valued):
 
     › Skip gitignored untracked files (recommended)
-      Sync gitignored files too (end-to-end encrypted)
+      Sync gitignored files too (end-to-end encrypted)      ← label per founder call above
       Preview what each choice syncs…
 
-Choosing "Preview…" runs the preview then RE-RENDERS the same select (loop
-until a policy row is picked) — the pattern the wizard already uses for
-info-then-reprompt navigation. It never becomes the answer, so the choice
-mapper's two-value contract (and every pinned test/flow) stays two-valued.
+**Widget contract (r1 f6 accepted):** `@inquirer/select` rows always complete
+the widget — there is no non-answering row at the widget layer. The preview
+row completes the select with a sentinel value and `short: "Previewing…"`
+(truthful transcript), the preview prints, and the select re-renders. Loop
+until a policy row answers. Tested at the wrapper level (transcript-visible
+behavior), not just a mocked sentinel.
 
-### The preview computation
-- Reuse the engine's existing ignore machinery — the scanner already resolves
-  gitignore + .rboxignore decisions (design 133 lineage; `respect-gitignore`
-  flip). The preview MUST call the same resolver the real scan uses (single
-  source of truth; a parallel reimplementation WILL drift). If the current
-  resolver is not cleanly callable pre-workspace, extracting that seam is
-  part of this design's implementation.
-- Bounded walk: breadth-first from the chosen root, hard caps (e.g. 20k
-  entries or 2s wall clock, whichever first) — this is a PREVIEW, not an
-  audit; on cap, say so: `previewed the first 20,000 entries`.
-- Output (dim, ~15 lines max):
-  - `found N .gitignore files (root: yes/no)` — the founder's no-root case
-    reads `found 14 .gitignore files across subfolders (none at the root)`.
-  - Top ignored-by-size/count summary: `would skip: node_modules/ (~9,400
-    files), dist/ (~1,100), .env, …` truncated with `+N more patterns`.
-  - One line for the flip side: `sync-everything would additionally upload
-    ~X files / ~Y size` (from the same walk's tally).
-- No network, no writes, no state; pure read + print.
+**Shared step (r1 f7 accepted):** new `src/cli/gitignore-step.ts` exporting
+`runGitignoreStep(root, deps): Promise<"true" | "false">` — deps inject
+select, preview runner, stderr writer, clock/budget. BOTH call sites
+(`init-cmd.ts:102-107`, `setup-cmd.ts:796-800`) switch to it; the sentinel
+can never escape as a policy value (return type forbids it). Existing pinned
+tests keep pinning `GITIGNORE_CHOICES`; new tests pin the step's mapping at
+both live call sites.
 
-### Copy contract
-The preview must name CONSEQUENCES, not mechanisms: "would skip" / "would
-also upload", never "pattern matched". Secrets framing stays honest: the
-existing option-2 description already covers E2EE; the preview adds
-`.env would be skipped` visibility precisely where Max-class users worry.
+## The preview computation
 
-## Contracts
-- `GITIGNORE_CHOICES` stays exported with two policy values; the preview row
-  is additive with a distinct non-policy value consumed by the wizard loop.
-- Non-interactive paths never preview.
-- Works in both `rbox init` and `rbox setup` (shared step module).
+**Three-set model (r1 f1 accepted — the policy delta is nested-only):**
+- **A. Skipped under BOTH choices:** builtin rules, `.rboxignore`, root
+  `.gitignore` (legacy layer).
+- **B. Skipped only under "respect nested gitignores"** — the ACTUAL
+  difference between the two rows.
+- **C. Synced under both.**
+The rendered comparison is honest: "either way rbox skips: …(A)…; choosing
+'skip gitignored' additionally skips: …(B)…".
+
+**Decision source (r1 f2, f4, f5 accepted):**
+- Decisions come from the production resolver — never a reimplementation.
+  New construction option `buildIgnoreMatcher(root, { …, readOnly: true })`:
+  identical decisions, but tracked-set cache misses compute in memory WITHOUT
+  `writeTrackedCache` — no `.rbox/` creation or mutation pre-workspace.
+  Contract test: before/after filesystem snapshot on a real git repo with an
+  index and no `.rbox`.
+- **Attribution:** the resolver exposes inclusion booleans, not winning
+  patterns (`IgnoreMatcher`, ignore.ts:191-205). The summary key is therefore
+  **skipped groups/paths**, not patterns: top-level skipped directories with
+  estimated descendant counts from the preview's own descent, plus named
+  top-level skipped files. Copy says "groups", never "+N more patterns".
+- **Walker:** a dedicated bounded inventory walker (streaming `fs.opendir`)
+  that — unlike the scanner — DESCENDS into skipped directories to estimate
+  their size. Explicitly not walker-parity with `scanManifest`; only the
+  per-path DECISION comes from the shared resolver. Symlinks: classified as
+  single entries, never followed. Unreadable dirs: counted once + noted.
+  Paths vanishing mid-walk: skipped silently.
+
+**Budget (r1 f3 accepted):** ONE shared budget spans the whole preview —
+git-repo discovery, trackedness resolution, and traversal. An "entry" = one
+dirent processed OR one git repo probed. Caps: 20k entries AND a ~2s
+**cooperative deadline** (checked between filesystem/subprocess operations;
+a single blocked syscall or `spawnSync` can overshoot — stated limitation,
+no abortable-subprocess architecture for a preview). On cap:
+`previewed the first 20,000 entries — larger trees are sampled`.
+
+**Capped-copy honesty (r1 f8 accepted):** "found" counts only *encountered,
+effective* `.gitignore` files (files under pruned/excluded parents are not
+consulted by the resolver and are not counted). No-root case renders:
+`among the entries previewed, found 14 effective .gitignore files in
+subfolders (none at the root)`. Under cap, never print exact remainder
+claims; use `additional rules may exist beyond the preview limit`.
+
+## Output sketch (dim, ≤15 lines)
+
+    found 14 effective .gitignore files in subfolders (none at the root)
+    either way rbox skips: node_modules/ (~9,400 files) · .env · dist/ (~1,100) · +3 groups
+    "skip gitignored" additionally skips: coverage/ (~800 files) · *.log files in 6 folders
+    everything else syncs under both choices (~101,000 files, ~1.8 GB)
+    previewed the first 20,000 entries — larger trees are sampled
 
 ## Tests the implementation MUST write
-- Preview-then-choose loop: preview never answers; each policy row still maps
-  identically (pinned like `startSyncActions`).
-- Resolver parity: a fixture tree where preview's skip-set EQUALS the real
-  scanner's skip-set (the anti-drift test — this is the load-bearing one).
-- Cap behavior: truncation line renders at the cap; no unbounded walk.
-- No-root-gitignore fixture renders the "across subfolders" line.
+- **Parity oracle (r1 f9 accepted, the load-bearing one):** on an UNCAPPED
+  fixture, for every syncable file/symlink, preview classification under each
+  policy equals `scanManifest` inclusion with the corresponding production
+  matcher options. Fixture must include: root + nested rules, a
+  tracked-but-ignored file, an untracked ignored file, builtin `.env`,
+  `.rboxignore` negation under an ignored parent, a symlink, a pruned
+  directory, and a `.gitignore` beneath an excluded parent. Cap mechanics and
+  sampled-copy honesty are tested separately — never mixed into the oracle.
+- Read-only mode: identical decisions to default mode + zero fs mutations
+  (snapshot assert) + zero network.
+- Step loop: preview never answers; both call sites map policy rows
+  identically; sentinel unrepresentable in the return type.
+- Budget: entry accounting covers discovery + git probes + walk; large-dir
+  fixture confirms streaming (no full-listing allocation blowup).
 
 ## Non-goals
-- No interactive per-pattern toggling (that's `rbox ignore --review`,
-  separate backlog idea).
-- No third POLICY. Two choices, one preview action.
-- No change to .rboxignore semantics or defaults.
+- No engine semantics changes (the option-2 label question is the founder's
+  separate call; if (b) is chosen this design gets a v3 with set A redefined).
+- No per-pattern toggling (`rbox ignore --review` is separate backlog).
+- No third POLICY; two choices, one preview action.
 
-## Open decision for review
-Whether the preview walk can reuse the scanner's walker directly (with an
-early-stop visitor) vs. a dedicated bounded walker sharing only the ignore
-resolver — pick whichever keeps ONE ignore-decision code path; the walker may
-differ, the RESOLVER may not.
+## Decisions (r1 rulings)
+All 9 findings accepted: f1 three-set model (+ founder flag above); f2
+readOnly resolver mode with snapshot test; f3 single cooperative budget with
+overshoot semantics + streaming opendir; f4 groups-not-patterns summary; f5
+dedicated descending walker, resolver-only sharing; f6 sentinel-completes-
+widget transcript contract accepted + wrapper-level test; f7 named shared
+step `runGitignoreStep` with typed return; f8 effective/encountered counting
++ honest cap copy; f9 parity oracle as specified.
