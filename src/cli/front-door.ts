@@ -1,33 +1,42 @@
 import os from "node:os";
 import { startDaemonAndRecordDesired, stopDaemonAndRecordDesired } from "./autostart-cmd.js";
+import { fetchAccountSummary } from "./account-cmd.js";
+import { getIdentity, identityText, readAccountProfile } from "./account-profile.js";
+import { DEFAULT_REMOTE } from "./api-base.js";
 import { findRoot } from "./config.js";
+import { loadCredentials } from "./credentials.js";
 import { DEFAULT_LOG_LINES, logsDaemon } from "./daemon-control.js";
 import { collapseHome } from "./init-plan.js";
 import { promptSelect } from "./prompt.js";
 import type { WorkspaceKind } from "./setup-cmd.js";
 import { runSyncCommand } from "./sync-cmd.js";
-import { statusCmd } from "./status-cmd.js";
+import { statusCmd, statusCmdWithBriefIdentity } from "./status-cmd.js";
+import type { BriefIdentitySource } from "./status-view.js";
 import { stderrStyle as e } from "./style.js";
-import { getIdentity, identityText } from "./account-profile.js";
 
-export type FrontDoorAction = "nothing" | "sync" | "logs" | "start" | "stop";
+export type FrontDoorAction = "sync" | "start" | "stop" | "setup" | "pair" | "usage" | "logs" | "exit";
 export type UntrackedMenuAction = WorkspaceKind | "nothing";
 
 type FrontDoorChoice<V> = { name: string; value: V; description?: string };
 type SelectPrompt = <V>(cfg: { message: string; choices: ReadonlyArray<FrontDoorChoice<V>> }) => Promise<V>;
 
-const FRONT_DOOR_BASE_CHOICES = [
-  { name: "Nothing, I'm good", value: "nothing" },
-  { name: "Sync now", value: "sync", description: "rbox sync" },
+const FRONT_DOOR_TRAILING_CHOICES = [
+  { name: "Set up a new workspace", value: "setup", description: "rbox setup" },
+  { name: "Pair another device", value: "pair", description: "rbox pair" },
+  { name: "View usage", value: "usage", description: "rbox usage" },
   { name: "View logs", value: "logs", description: "rbox logs" },
+  { name: "Exit", value: "exit" },
 ] as const;
 
 export function frontDoorChoices(daemonRunning: boolean): ReadonlyArray<FrontDoorChoice<FrontDoorAction>> {
   return [
-    ...FRONT_DOOR_BASE_CHOICES,
-    daemonRunning
-      ? { name: "Pause syncing", value: "stop", description: "rbox stop" }
-      : { name: "Start syncing", value: "start", description: "rbox start" },
+    ...(daemonRunning
+      ? [{ name: "Pause syncing", value: "stop" as const, description: "rbox stop" }]
+      : [
+          { name: "Sync now", value: "sync" as const, description: "rbox sync" },
+          { name: "Start background syncing", value: "start" as const, description: "rbox start" },
+        ]),
+    ...FRONT_DOOR_TRAILING_CHOICES,
   ];
 }
 
@@ -47,12 +56,35 @@ export async function resolveBareRboxTarget(cwd: string, deps: BareRboxTargetDep
 }
 
 interface FrontDoorDeps {
-  statusCmd?: (root: string) => Promise<{ daemonRunning: boolean }>;
+  loadCredentials?: typeof loadCredentials;
+  readAccountProfile?: typeof readAccountProfile;
+  fetchAccountSummary?: typeof fetchAccountSummary;
+  statusCmd?: (root: string, identity?: BriefIdentitySource) => Promise<{ daemonRunning: boolean }>;
   promptSelect?: SelectPrompt;
   syncNow?: (root: string) => Promise<void>;
   viewLogs?: (root: string) => Promise<void>;
-  startSyncing?: (root: string) => Promise<void>;
   pauseSyncing?: (root: string) => Promise<void>;
+  setUpWorkspace?: (root: string) => Promise<void>;
+  startSyncing?: (root: string) => Promise<void>;
+  pairAnotherDevice?: () => Promise<void>;
+  viewUsage?: () => Promise<void>;
+}
+
+const FRONT_DOOR_IDENTITY_TIMEOUT_MS = 2_000;
+
+async function fetchColdFrontDoorIdentity(deps: FrontDoorDeps): Promise<BriefIdentitySource | undefined> {
+  try {
+    const loaded = await (deps.loadCredentials ?? loadCredentials)();
+    if (loaded.state !== "valid" || !loaded.credentials.accountId) return undefined;
+    const profile = await (deps.readAccountProfile ?? readAccountProfile)(loaded.credentials.accountId);
+    if (profile && profile.plan !== null) return undefined;
+    const summary = await (deps.fetchAccountSummary ?? fetchAccountSummary)(FRONT_DOOR_IDENTITY_TIMEOUT_MS, loaded);
+    return summary.state === "ok"
+      ? { email: summary.status.email ?? null, plan: summary.status.plan ?? null }
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function isExitPromptError(err: unknown): boolean {
@@ -69,18 +101,33 @@ async function promptCancelable<V>(select: SelectPrompt, cfg: { message: string;
 }
 
 export async function runFrontDoor(root: string, deps: FrontDoorDeps = {}): Promise<void> {
-  const { daemonRunning } = await (deps.statusCmd ?? statusCmd)(root);
+  const freshIdentity = await fetchColdFrontDoorIdentity(deps);
+  const renderStatus = deps.statusCmd ?? ((r: string, identity?: BriefIdentitySource) =>
+    identity ? statusCmdWithBriefIdentity(r, identity) : statusCmd(r));
+  const { daemonRunning } = await renderStatus(root, freshIdentity);
   console.log();
   const action = await promptCancelable<FrontDoorAction>(deps.promptSelect ?? promptSelect, {
     message: "What would you like to do?",
     choices: frontDoorChoices(daemonRunning),
   });
 
-  if (action === undefined || action === "nothing") return;
+  if (action === undefined || action === "exit") return;
   if (action === "sync") return (deps.syncNow ?? runSyncCommand)(root);
   if (action === "logs") return (deps.viewLogs ?? ((r) => logsDaemon(r, { follow: false, lines: DEFAULT_LOG_LINES })))(root);
+  if (action === "stop") return (deps.pauseSyncing ?? stopDaemonAndRecordDesired)(root);
   if (action === "start") return (deps.startSyncing ?? startDaemonAndRecordDesired)(root);
-  return (deps.pauseSyncing ?? stopDaemonAndRecordDesired)(root);
+  if (action === "setup") return (deps.setUpWorkspace ?? (async (cwd) => {
+    const { runSetup } = await import("./setup-cmd.js");
+    await runSetup({ cwd, defaultRemote: DEFAULT_REMOTE, flags: {}, preselectedWorkspaceKind: "new" });
+  }))(root);
+  if (action === "pair") return (deps.pairAnotherDevice ?? (async () => {
+    const { pairCreate } = await import("./auth-cmd.js");
+    await pairCreate();
+  }))();
+  return (deps.viewUsage ?? (async () => {
+    const { usageCmd } = await import("./usage-cmd.js");
+    await usageCmd();
+  }))();
 }
 
 export const UNTRACKED_MENU_CHOICES = (cwd: string) =>

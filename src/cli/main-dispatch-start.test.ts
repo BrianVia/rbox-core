@@ -45,6 +45,13 @@ test("start outside a workspace stays a clear error for non-TTY stdin", async ()
   expect(frontDoorCalls).toBe(0);
 });
 
+test("non-interactive bare rbox never runs the interactive front door", async () => {
+  Object.defineProperty(process.stdin, "isTTY", { value: false, configurable: true });
+  process.argv = [process.execPath, "rbox"];
+  await main({ frontDoorImport });
+  expect(frontDoorCalls).toBe(0);
+});
+
 test("start outside a workspace invokes the guided front door for TTY stdin", async () => {
   Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
   await main({ frontDoorImport });
