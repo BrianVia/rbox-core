@@ -532,6 +532,39 @@ function effectiveRefs(ctx: RepoCtx, incoming: GitSection): { refs: Record<strin
   return { refs, deleteAbsent: false };
 }
 
+export interface CheckoutSelfRootWitness {
+  ref: string;
+  oid: string;
+}
+
+/** Selects the exact branch ref that makes the live tip a durable self-root.
+ * The caller supplies ref-plane exclusions because the current ref is skipped
+ * by publication and therefore is not necessarily represented in heldRefs. */
+export function selectCheckoutSelfRootWitness(args: {
+  currentTip?: string;
+  effectiveIncomingRefs: Readonly<Record<string, string>>;
+  receiverRefs: Readonly<Record<string, string>>;
+  heldRefs?: ReadonlySet<string>;
+  forcedRefs?: ReadonlySet<string>;
+  ambiguousRefs?: ReadonlySet<string>;
+  /** Boundary proofs must revalidate the same initially selected ref. */
+  requiredRef?: string;
+}): CheckoutSelfRootWitness | undefined {
+  if (!args.currentTip) return undefined;
+  const refs = args.requiredRef ? [args.requiredRef] : Object.keys(args.effectiveIncomingRefs).sort();
+  for (const ref of refs) {
+    if (!ref.startsWith("refs/heads/")
+      || args.heldRefs?.has(ref)
+      || args.forcedRefs?.has(ref)
+      || args.ambiguousRefs?.has(ref)) continue;
+    const incomingOid = args.effectiveIncomingRefs[ref];
+    if (incomingOid === args.currentTip && args.receiverRefs[ref] === incomingOid) {
+      return { ref, oid: incomingOid };
+    }
+  }
+  return undefined;
+}
+
 function appliedTerminalOid(value: GitPartialApply["appliedRefs"][string]): string | null | undefined {
   if (value.kind === "direct" || value.kind === "present") return value.oid;
   if (value.kind === "absent") return null;
@@ -546,6 +579,11 @@ async function publishRefPlane(
 ): Promise<FollowProgress & {
   checkoutRefReason?: GitDeferralReason;
   checkoutRefDetail?: string;
+  checkoutWitnessDisposition: {
+    heldRefs: ReadonlySet<string>;
+    forcedRefs: ReadonlySet<string>;
+    ambiguousRefs: ReadonlySet<string>;
+  };
   authoredRefChanges: Array<{ ref: string; before?: string; after?: string }>;
 }> {
   const effective = effectiveRefs(opts.ctx, opts.incoming);
@@ -871,6 +909,11 @@ async function publishRefPlane(
   }
 
   const configApplied = await opts.runConfig?.().catch(() => false) ?? true;
+  const checkoutWitnessDisposition = {
+    heldRefs: new Set(Object.keys(heldRefs)),
+    forcedRefs,
+    ambiguousRefs,
+  };
   return {
     appliedRefs,
     heldRefs,
@@ -882,6 +925,7 @@ async function publishRefPlane(
     configApplied,
     checkoutRefReason,
     checkoutRefDetail,
+    checkoutWitnessDisposition,
     authoredRefChanges,
   };
 }
@@ -982,6 +1026,13 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
     if (incomingHeadRef && effective.refs[incomingHeadRef]) {
       durableIncomingRefs[incomingHeadRef] = effective.refs[incomingHeadRef]!;
     }
+    const selfRootWitness = selectCheckoutSelfRootWitness({
+      currentTip: liveBefore.currentTip,
+      effectiveIncomingRefs: effective.refs,
+      receiverRefs: liveBefore.refs,
+      ...refProgress.checkoutWitnessDisposition,
+    });
+    if (selfRootWitness) durableIncomingRefs[selfRootWitness.ref] = selfRootWitness.oid;
     const checkoutRoots = incomingOwnershipRoots(
       { ...opts.incoming, refs: durableIncomingRefs },
       { prefix: staged.incomingNs, opState: staged.opBytes },
@@ -1023,6 +1074,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
       if (existing && existing.expectedOid !== expectedOid) throw new Error(`contradictory ref reservation for ${ref}`);
       if (!existing) refReservations.push({ ref, expectedOid });
     };
+    if (selfRootWitness) reserveRef(selfRootWitness.ref, selfRootWitness.oid);
     const extraTransactionLines: string[] = [];
     const expectedRefs: Record<string, string> = {};
     let checkoutBranchPlan: PlannedBranchTransition | undefined;
@@ -1243,6 +1295,29 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
         if (!sameIncarnation) { noteBoundaryFailure("unreadable", "repository incarnation changed at checkout boundary"); return false; }
         if (!live) { noteBoundaryFailure("unreadable", "git metadata became unreadable"); return false; }
         const boundaryOwned = await branchesCheckedOutElsewhere(opts.ctx);
+        if (selfRootWitness) {
+          const boundaryAmbiguousRefs = new Set([
+            ...refProgress.checkoutWitnessDisposition.ambiguousRefs,
+            ...receiverEquivalentCollisionNames([
+              ...Object.keys(effective.refs),
+              ...Object.keys(live.refs),
+              ...boundaryOwned.keys(),
+            ]),
+          ]);
+          const boundaryWitness = selectCheckoutSelfRootWitness({
+            currentTip: live.currentTip,
+            effectiveIncomingRefs: effective.refs,
+            receiverRefs: live.refs,
+            heldRefs: refProgress.checkoutWitnessDisposition.heldRefs,
+            forcedRefs: refProgress.checkoutWitnessDisposition.forcedRefs,
+            ambiguousRefs: boundaryAmbiguousRefs,
+            requiredRef: selfRootWitness.ref,
+          });
+          if (!boundaryWitness || boundaryWitness.oid !== selfRootWitness.oid) {
+            noteBoundaryFailure("local-commits", `checkout self-root witness changed at ${selfRootWitness.ref}`);
+            return false;
+          }
+        }
         for (const [ref, expected] of Object.entries(progress.appliedRefs)) {
           const terminal = appliedTerminalOid(expected);
           if (boundaryOwned.has(ref) && (liveBefore.refs[ref] ?? null) !== (terminal ?? null)) {

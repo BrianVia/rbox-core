@@ -28,7 +28,7 @@ import { loadState, repoRecordsForState, saveStateUnsafeLegacyOrTest, type SyncS
 import type { SyncRemote } from "../remote.js";
 import { orderedRepoDeferralUpdates, saveStateSource } from "../sync-state.js";
 import { applyGitSections, settleCommittedBranchArtifacts, withRevalidatedGitPartialApplies } from "./apply.js";
-import { checkoutJournalBinding, FollowCrashInjectedError, followDivergedRepo, recoverFollowJournal, type FollowCrashPoint } from "./follow.js";
+import { checkoutJournalBinding, FollowCrashInjectedError, followDivergedRepo, recoverFollowJournal, selectCheckoutSelfRootWitness, type FollowCrashPoint } from "./follow.js";
 import { boundedOrigHeadPreservationError, origHeadPreservationFailureLine, origHeadWorktreeDiscriminator } from "./orig-head.js";
 import { planGitSections } from "./plan.js";
 import { gitFingerprint, gitFingerprintRun } from "./fingerprint.js";
@@ -169,6 +169,29 @@ async function baseAndIncoming(mode: "same" | "switch" | "detached" = "same"): P
   const incoming = await capture();
   await fs.writeFile(path.join(receiver, "tracked.txt"), "three\n");
   return { c1, base, incoming, state: stateWith(base) };
+}
+
+const SWITCH_BACK_REF = "refs/heads/feature/prop-test";
+
+async function switchBackFixture(): Promise<{
+  base: GitSection;
+  incoming: GitSection;
+  state: SyncState;
+  mainTip: string;
+  featureTip: string;
+}> {
+  await commit("one\n", "switch-back-c1");
+  const mainTip = await commit("two\n", "switch-back-c2");
+  await git(sender, "checkout", "-qb", SWITCH_BACK_REF.replace(/^refs\/heads\//, ""));
+  const featureTip = await commit("feature\n", "switch-back-feature");
+  const base = await capture();
+  await materialize(base);
+  await git(sender, "switch", "-q", "main");
+  const incoming = await capture();
+  // The file plane has already applied the incoming main snapshot when Git
+  // follow runs in production.
+  await fs.writeFile(path.join(receiver, "tracked.txt"), "two\n");
+  return { base, incoming, state: stateWith(base), mainTip, featureTip };
 }
 
 async function breadcrumbBaseAndIncoming(opts: { markerRel?: string; incomingAbsent?: boolean } = {}): Promise<{
@@ -756,6 +779,254 @@ for (const incomingAbsent of [false, true]) {
     expect((await fingerprintHitProbe(gitFingerprintRun("per-decision"), workspace, "repo", cache, "dir", false)).status).toBe("miss");
   });
 }
+
+test("design 165 exact unchanged current tip follows through a locked branch witness", async () => {
+  const { state, incoming, mainTip, featureTip } = await switchBackFixture();
+  const ctx = await repoCtx(receiver);
+  if (!ctx) throw new Error("receiver context missing");
+  let witnessLockedAfterRefCommit = false;
+
+  const { outcome, logs } = await applyIncoming(state, incoming, matchingOracle, {
+    crashAt: (point) => {
+      if (point === "after-ref-commit") {
+        witnessLockedAfterRefCommit = fsSync.existsSync(path.join(ctx.commonDir, `${SWITCH_BACK_REF}.lock`));
+      }
+    },
+  });
+
+  expect(logs).toContain("git-sync followed repo");
+  expect(witnessLockedAfterRefCommit).toBe(true);
+  expect(await git(receiver, "symbolic-ref", "HEAD")).toBe("refs/heads/main");
+  expect(await git(receiver, "rev-parse", "HEAD")).toBe(mainTip);
+  expect(await git(receiver, "rev-parse", SWITCH_BACK_REF)).toBe(featureTip);
+  expect(outcome.gitRepos?.repo).toEqual(incoming);
+  expect(outcome.gitPendingRemote?.repo).toBeUndefined();
+  expect(outcome.partial?.repo).toBeNull();
+  expect(outcome.deferrals?.repo?.apply).toBeUndefined();
+});
+
+test("design 165 self-root eligibility is exact, branch-only, effective, and disposition-aware", () => {
+  const tip = "1".repeat(40);
+  const other = "2".repeat(40);
+  const branch = "refs/heads/current";
+  const exact = {
+    currentTip: tip,
+    effectiveIncomingRefs: { [branch]: tip },
+    receiverRefs: { [branch]: tip },
+  };
+
+  expect(selectCheckoutSelfRootWitness(exact)).toEqual({ ref: branch, oid: tip });
+  expect(selectCheckoutSelfRootWitness({ ...exact, effectiveIncomingRefs: { [branch]: other } })).toBeUndefined();
+  expect(selectCheckoutSelfRootWitness({ ...exact, receiverRefs: { [branch]: other } })).toBeUndefined();
+
+  expect(selectCheckoutSelfRootWitness({ ...exact, heldRefs: new Set([branch]) }), "held").toBeUndefined();
+  expect(selectCheckoutSelfRootWitness({ ...exact, forcedRefs: new Set([branch]) }), "forced").toBeUndefined();
+  expect(selectCheckoutSelfRootWitness({ ...exact, ambiguousRefs: new Set([branch]) }), "ambiguous").toBeUndefined();
+  expect(selectCheckoutSelfRootWitness({ ...exact, ambiguousRefs: new Set([branch]) }), "receiver-equivalent").toBeUndefined();
+  // A pointer receiver's filtered tag/stash values are absent from effective
+  // refs, so raw incoming values cannot become witnesses.
+  expect(selectCheckoutSelfRootWitness({
+    currentTip: tip,
+    effectiveIncomingRefs: {},
+    receiverRefs: { "refs/tags/scoped-out": tip, "refs/stash": tip },
+  })).toBeUndefined();
+
+  for (const ref of [
+    "refs/tags/lightweight-commit",
+    "refs/tags/annotated-commit",
+    "refs/tags/non-commit",
+    "refs/stash",
+  ]) {
+    expect(selectCheckoutSelfRootWitness({
+      currentTip: tip,
+      effectiveIncomingRefs: { [ref]: tip },
+      receiverRefs: { [ref]: tip },
+    }), ref).toBeUndefined();
+  }
+
+  // Equal sibling-owned refs are not blanket-excluded: only an actual ref-plane
+  // hold enters heldRefs, preserving their existing ordinary-root role.
+  const sibling = "refs/heads/equal-sibling";
+  expect(selectCheckoutSelfRootWitness({
+    currentTip: tip,
+    effectiveIncomingRefs: { [sibling]: tip },
+    receiverRefs: { [sibling]: tip },
+  })).toEqual({ ref: sibling, oid: tip });
+  expect(selectCheckoutSelfRootWitness({ ...exact, requiredRef: "refs/heads/missing" })).toBeUndefined();
+});
+
+test("design 165 local-ahead tip unreachable from every admissible root still defers", async () => {
+  const { state, incoming } = await switchBackFixture();
+  await git(receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "receiver ahead");
+  const localTip = await git(receiver, "rev-parse", "HEAD");
+
+  const { outcome } = await applyIncoming(state, incoming);
+
+  expect(outcome.deferrals?.repo?.apply?.reason).toBe("local-commits");
+  expect(outcome.gitPendingRemote?.repo).toEqual(incoming);
+  expect(await git(receiver, "symbolic-ref", "HEAD")).toBe(SWITCH_BACK_REF);
+  expect(await git(receiver, "rev-parse", "HEAD")).toBe(localTip);
+});
+
+test("design 165 local-ahead tip remains owned through another durable descendant root", async () => {
+  const mainTip = await commit("main\n", "ahead-main");
+  await git(sender, "checkout", "-qb", "ahead");
+  const ownIncoming = await commit("ahead-own\n", "ahead-own");
+  const liveTip = await commit("ahead-live\n", "ahead-live");
+  const base = await capture();
+  await materialize(base);
+  const otherRoot = await commit("ahead-other\n", "ahead-other");
+  await git(sender, "branch", "other-root", otherRoot);
+  await git(sender, "switch", "-q", "main");
+  await git(sender, "branch", "-f", "ahead", ownIncoming);
+  const incoming = await capture();
+  await fs.writeFile(path.join(receiver, "tracked.txt"), "main\n");
+
+  expect(selectCheckoutSelfRootWitness({
+    currentTip: liveTip,
+    effectiveIncomingRefs: incoming.refs,
+    receiverRefs: { ...base.refs, "refs/heads/other-root": otherRoot },
+  })).toBeUndefined();
+  const { outcome, logs } = await applyIncoming(stateWith(base), incoming);
+
+  expect(logs).toContain("git-sync followed repo");
+  expect(await git(receiver, "symbolic-ref", "HEAD")).toBe("refs/heads/main");
+  expect(await git(receiver, "rev-parse", "HEAD")).toBe(mainTip);
+  expect(await git(receiver, "rev-parse", "refs/heads/ahead")).toBe(ownIncoming);
+  expect(await git(receiver, "merge-base", "--is-ancestor", liveTip, otherRoot).then(() => "owned")).toBe("owned");
+  expect(outcome.deferrals?.repo?.apply).toBeUndefined();
+});
+
+for (const mutation of ["move", "delete"] as const) {
+  test(`design 165 ${mutation} of the selected witness before reservation aborts checkout`, async () => {
+    const { state, incoming, featureTip } = await switchBackFixture();
+    const ctx = await repoCtx(receiver);
+    if (!ctx) throw new Error("receiver context missing");
+    const tree = await git(receiver, "rev-parse", `${featureTip}^{tree}`);
+    const movedTip = mutation === "move"
+      ? await gitExec(["-C", receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit-tree", tree, "-p", featureTip, "-m", "boundary witness move"])
+          .then(({ stdout }) => stdout.toString().trim())
+      : undefined;
+    let mutated = false;
+
+    const { outcome } = await applyIncoming(state, incoming, matchingOracle, {
+      crashAt: (point) => {
+        if (point !== "after-journal-write" || mutated) return;
+        mutated = true;
+        if (mutation === "move") {
+          execFileSync("git", ["-C", receiver, "update-ref", SWITCH_BACK_REF, movedTip!, featureTip], { env: TEST_GIT_ENV });
+        } else {
+          execFileSync("git", ["-C", receiver, "update-ref", "refs/heads/witness-race-backup", featureTip], { env: TEST_GIT_ENV });
+          execFileSync("git", ["-C", receiver, "update-ref", "-d", SWITCH_BACK_REF, featureTip], { env: TEST_GIT_ENV });
+        }
+      },
+    });
+
+    expect(mutated).toBe(true);
+    expect(outcome.gitPendingRemote?.repo).toEqual(incoming);
+    expect(outcome.deferrals?.repo?.apply).toBeDefined();
+    expect(await git(receiver, "symbolic-ref", "HEAD")).toBe(SWITCH_BACK_REF);
+    const durableRef = mutation === "move" ? SWITCH_BACK_REF : "refs/heads/witness-race-backup";
+    const durableTip = await git(receiver, "rev-parse", durableRef);
+    await expect(git(receiver, "merge-base", "--is-ancestor", featureTip, durableTip)).resolves.toBe("");
+    await expect(git(receiver, "cat-file", "-e", `${featureTip}^{commit}`)).resolves.toBe("");
+    await expect(fs.access(path.join(ctx.commonDir, `${SWITCH_BACK_REF}.lock`))).rejects.toThrow();
+  });
+}
+
+test("design 165 scoped incoming refs remain non-deleting and cannot supply an absent witness", async () => {
+  const { state, incoming, featureTip } = await switchBackFixture();
+  const scoped: GitSection = {
+    ...incoming,
+    refScope: "scoped",
+    refs: { "refs/heads/main": incoming.refs["refs/heads/main"]! },
+  };
+
+  const { outcome } = await applyIncoming(state, scoped);
+
+  expect(outcome.deferrals?.repo?.apply?.reason).toBe("local-commits");
+  expect(outcome.gitPendingRemote?.repo).toEqual(scoped);
+  expect(await git(receiver, "rev-parse", SWITCH_BACK_REF)).toBe(featureTip);
+  expect(await git(receiver, "symbolic-ref", "HEAD")).toBe(SWITCH_BACK_REF);
+});
+
+test("design 165 detached receiver follows only with an exact reserved branch witness", async () => {
+  const { state, incoming, mainTip, featureTip } = await switchBackFixture();
+  await git(receiver, "checkout", "-q", "--detach", featureTip);
+  const ctx = await repoCtx(receiver);
+  if (!ctx) throw new Error("receiver context missing");
+  let witnessLocked = false;
+
+  const { outcome } = await applyIncoming(state, incoming, matchingOracle, {
+    crashAt: (point) => {
+      if (point === "after-ref-commit") witnessLocked = fsSync.existsSync(path.join(ctx.commonDir, `${SWITCH_BACK_REF}.lock`));
+    },
+  });
+
+  expect(witnessLocked).toBe(true);
+  expect(outcome.deferrals?.repo?.apply).toBeUndefined();
+  expect(await git(receiver, "symbolic-ref", "HEAD")).toBe("refs/heads/main");
+  expect(await git(receiver, "rev-parse", "HEAD")).toBe(mainTip);
+  expect(selectCheckoutSelfRootWitness({
+    currentTip: "3".repeat(40),
+    effectiveIncomingRefs: incoming.refs,
+    receiverRefs: incoming.refs,
+  })).toBeUndefined();
+});
+
+for (const withContainingRoot of [false, true]) {
+  test(`design 165 all-scope checked-out branch deletion ${withContainingRoot ? "uses another durable root" : "defers without a containing root"}`, async () => {
+    const mainTip = await commit("delete-main\n", "delete-main");
+    await git(sender, "checkout", "-qb", "delete-me");
+    const deletedTip = await commit("delete-feature\n", "delete-feature");
+    const base = await capture();
+    await materialize(base);
+    let containingRoot: string | undefined;
+    if (withContainingRoot) {
+      containingRoot = await commit("delete-descendant\n", "delete-descendant");
+      await git(sender, "branch", "delete-container", containingRoot);
+    }
+    await git(sender, "switch", "-q", "main");
+    await git(sender, "branch", "-D", "delete-me");
+    const incoming = await capture();
+    await fs.writeFile(path.join(receiver, "tracked.txt"), "delete-main\n");
+
+    const { outcome, logs } = await applyIncoming(stateWith(base), incoming);
+    if (!withContainingRoot) {
+      expect(outcome.deferrals?.repo?.apply?.reason).toBe("local-commits");
+      expect(outcome.gitPendingRemote?.repo).toEqual(incoming);
+      expect(await git(receiver, "rev-parse", "refs/heads/delete-me")).toBe(deletedTip);
+      expect(await git(receiver, "symbolic-ref", "HEAD")).toBe("refs/heads/delete-me");
+    } else {
+      expect(logs).toContain("git-sync followed repo");
+      expect(outcome.deferrals?.repo?.apply).toBeUndefined();
+      await expect(git(receiver, "rev-parse", "--verify", "refs/heads/delete-me")).rejects.toThrow();
+      expect(await git(receiver, "rev-parse", "refs/heads/delete-container")).toBe(containingRoot!);
+      await expect(git(receiver, "merge-base", "--is-ancestor", deletedTip, containingRoot!)).resolves.toBe("");
+      expect(await git(receiver, "symbolic-ref", "HEAD")).toBe("refs/heads/main");
+      expect(await git(receiver, "rev-parse", "HEAD")).toBe(mainTip);
+    }
+  });
+}
+
+test("design 165 applies a closed snapshot before converging to a newer publish", async () => {
+  const { state, incoming: closed, mainTip, featureTip } = await switchBackFixture();
+  await git(sender, "switch", "-q", SWITCH_BACK_REF.replace(/^refs\/heads\//, ""));
+  const newer = await capture();
+
+  const first = await applyIncoming(state, closed);
+  expect(first.outcome.deferrals?.repo?.apply).toBeUndefined();
+  expect(await git(receiver, "symbolic-ref", "HEAD")).toBe("refs/heads/main");
+  expect(await git(receiver, "rev-parse", "HEAD")).toBe(mainTip);
+  const advanced = await landOutcome(state, first.outcome, 2);
+
+  await fs.writeFile(path.join(receiver, "tracked.txt"), "feature\n");
+  const second = await applyIncoming(advanced, newer, matchingOracle, { sourceGlobalSeq: 3 });
+  expect(second.outcome.deferrals?.repo?.apply).toBeUndefined();
+  expect(await git(receiver, "symbolic-ref", "HEAD")).toBe(SWITCH_BACK_REF);
+  expect(await git(receiver, "rev-parse", "HEAD")).toBe(featureTip);
+  expect(second.outcome.gitRepos?.repo).toEqual(newer);
+});
 
 test("field incident follows an incoming branch switch", async () => {
   const { c1, state, incoming } = await baseAndIncoming("switch");
