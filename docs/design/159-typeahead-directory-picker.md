@@ -1,6 +1,7 @@
 # 159 — Typeahead directory picker for "Which directory should rbox sync?"
 
-Status: DRAFT v8 (folded review rounds 1–7 — rulings in Decisions; reviews at
+Status: **ALIGNED** (v8; 8 review rounds, r8 verdict ALIGNED with zero
+findings — rulings in Decisions; reviews at
 `.claude/review-159-r1.md`, `-r2.md`, `-r3.md`). Origin: validation item #8,
 founder-greenlit design pass 2026-07-18.
 

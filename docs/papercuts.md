@@ -5,6 +5,20 @@ sessions. Founder-requested (2026-07-18): proactively appended by agents as
 they work; signal for what to fix. Newest first. Keep entries to 2–4 lines:
 what happened, what it cost, fix hint if obvious.
 
+## 2026-07-19 (overnight)
+
+- **Silent no-op `str.replace` design-doc edits cost two review rounds.**
+  Folding review findings via python `str.replace` with a slightly-off
+  target string no-ops silently; the stale text then contradicts the new
+  text and the next adversarial round attacks the ghost (design 159 r6+r7
+  were both this). Fix pattern: whole-section replacement by heading
+  boundaries + grep-verify the old phrasing is GONE before committing.
+- **`gh pr merge` from inside a worktree can commit to the wrong context.**
+  Committed a main-checkout design doc while cwd was still a worktree —
+  the add/commit silently targeted the worktree branch ("nothing to
+  commit"). Always `cd` to the primary checkout (or pass `git -C`) for
+  main-branch doc commits.
+
 ## 2026-07-18
 
 - **`scripts/release.ts` crash leaves `src/cli/version.ts` mangled.** The
