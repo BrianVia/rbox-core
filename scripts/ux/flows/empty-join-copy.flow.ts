@@ -11,6 +11,7 @@ export default defineFlow({
       assertStdout: [/^workspaceId=ws_[A-Za-z0-9_-]+$/m],
     },
     { on: "a", captureVar: { name: "WORKSPACE", pattern: /^workspaceId=(ws_[A-Za-z0-9_-]+)$/m } },
+    { on: "a", guest: "mkdir -p node_modules" },
     { on: "a", tui: "setup" },
     { on: "a", waitFor: /What do you want to track here\?/ },
     { on: "a", keys: ["Down", "Enter"] },
@@ -18,6 +19,9 @@ export default defineFlow({
     { on: "a", assertScreen: [/empty-join/, /never synced/] },
     { on: "a", keys: ["Enter"] },
     { on: "a", waitFor: /Which directory should rbox sync\?/ },
+    { on: "a", assertScreen: [/Enter = this directory · type to filter · Tab completes/] },
+    { on: "a", keys: ["node_modules"] },
+    { on: "a", waitFor: /use "[^"]*\/node_modules"/ },
     { on: "a", keys: ["Enter"] },
     {
       on: "a",
