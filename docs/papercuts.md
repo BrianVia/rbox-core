@@ -72,7 +72,7 @@ what happened, what it cost, fix hint if obvious.
   dispatched for a bounded test sweep, it started writing
   `docs/design/158-…` + review rounds instead of fixing tests. Hint: small-fix
   dispatch prompts need an explicit "no design docs; implement from SPEC.md".
-- **No branch protection ⇒ no GitHub auto-merge.** Every merge-on-green needs
+- **RESOLVED 2026-07-19 (founder added the ruleset): No branch protection ⇒ no GitHub auto-merge.** Every merge-on-green needs
   a hand-rolled watcher loop. Hint: a minimal required-check ruleset on main
   would unlock native auto-merge.
 - **`pgrep -f "codex exec"` matches the watcher's own command line** when the
