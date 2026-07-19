@@ -1,6 +1,12 @@
 # 163 — The state plane moves to SQLite
 
-Status: DRAFT — adversarial loop pending. Origin: founder step-back question
+Status: DRAFT v2-IN-PROGRESS — r1 verdict CHANGES-REQUIRED (13 findings,
+5 CRITICAL; review at .claude/review-163-r1.md on the designs-163 branch
+history). v2 must deliver r1's five-point revision list; sections land
+incrementally on this branch. Field-claim corrections from r1's audit table
+are folded below; the steady-state write churn was root-caused and FIXED
+separately (#349 — undefined-vs-{} guard bug; git-plan bookkeeping was
+never the dirtier, the guard was). Origin: founder step-back question
 2026-07-19 ("is that not a lot of memory to need? what's the step-back?")
 after the third guard-layer around monolithic state reads.
 
@@ -128,3 +134,19 @@ migration path from real pre-163 states.
 - Query-set completeness: any engine path that secretly wants the whole
   manifest in memory (apply? scan diffing?) — those keep an iterator/cursor
   contract, not a full materialization.
+
+## Growth model & maintenance (added v2 — founder question 2026-07-19)
+
+State is a keyed SNAPSHOT, not a log: one row per file updated in place, so
+row count tracks workspace size, never change volume. Append-shaped data
+(tombstone chains, deferrals) ports design 130's existing hard caps (8/ref,
+expiry, per-repo caps) as row-count bounds. Churn fragments pages onto
+SQLite's freelist, which is REUSED — the file plateaus at its high-water
+mark rather than growing; a workspace that shrinks massively is compacted
+by explicit `incremental_vacuum`/`VACUUM` from doctor or idle time (the
+JSON blob "vacuums" on every save today — that continuous implicit rewrite
+is precisely the removed cost; we trade it for a rare explicit one). WAL
+growth is bounded by pinned checkpoint policy (r1 f8): auto-checkpoint
+pinned explicitly + truncate-on-clean-shutdown; `-wal`/`-shm` lifecycle
+defined alongside. Precedent: browser history/iMessage/Photos run
+years-long constant-churn single-file SQLite at this exact shape.
