@@ -6,6 +6,11 @@ import {
   ResetCorruptionError,
   ResetMemoryAdmissionError,
   assertResetParseAdmission,
+  defaultResetParseBudgetBytes,
+  linuxCgroupMemoryLimitBytes,
+  RESET_PARSE_BUDGET_CEILING_BYTES,
+  RESET_PARSE_BUDGET_FLOOR_BYTES,
+  RESET_PARSE_EXPANSION_MULTIPLIER,
   boundedCopy,
   boundedEqualsBytes,
   boundedFilesEqual,
@@ -87,6 +92,98 @@ describe("design 138 bounded reset I/O", () => {
       currentRssBytes: 500,
       expansionMultiplier: 6,
     })).not.toThrow();
+  });
+
+  test("default parse budget scales with machine memory: 4 GiB floor, totalmem/4, 32 GiB cap", () => {
+    const GiB = 1024 ** 3;
+    expect(defaultResetParseBudgetBytes(8 * GiB)).toBe(RESET_PARSE_BUDGET_FLOOR_BYTES);
+    expect(defaultResetParseBudgetBytes(16 * GiB)).toBe(RESET_PARSE_BUDGET_FLOOR_BYTES);
+    expect(defaultResetParseBudgetBytes(32 * GiB)).toBe(8 * GiB);
+    expect(defaultResetParseBudgetBytes(96 * GiB)).toBe(24 * GiB);
+    expect(defaultResetParseBudgetBytes(1024 * GiB)).toBe(RESET_PARSE_BUDGET_CEILING_BYTES);
+  });
+
+  test("cgroup hard limits cap the budget; unknown limits fall back to host scaling", () => {
+    const GiB = 1024 ** 3;
+    expect(defaultResetParseBudgetBytes(96 * GiB, 4 * GiB)).toBe(4 * GiB);
+    expect(defaultResetParseBudgetBytes(96 * GiB, 2 * GiB)).toBe(2 * GiB);
+    expect(defaultResetParseBudgetBytes(96 * GiB, 64 * GiB)).toBe(16 * GiB);
+    expect(defaultResetParseBudgetBytes(96 * GiB, undefined)).toBe(24 * GiB);
+    expect(linuxCgroupMemoryLimitBytes(() => undefined)).toBeUndefined();
+    expect(linuxCgroupMemoryLimitBytes((f) => (f.endsWith("memory.max") ? "max\n" : undefined))).toBeUndefined();
+    expect(linuxCgroupMemoryLimitBytes((f) => (f.endsWith("memory.max") ? `${4 * GiB}\n` : undefined))).toBe(4 * GiB);
+    expect(linuxCgroupMemoryLimitBytes((f) => (f.endsWith("limit_in_bytes") ? "9223372036854771712" : undefined))).toBeUndefined();
+    expect(linuxCgroupMemoryLimitBytes((f) => (f.endsWith("limit_in_bytes") ? `${2 * GiB}` : undefined))).toBe(2 * GiB);
+    expect(linuxCgroupMemoryLimitBytes(() => "garbage")).toBeUndefined();
+  });
+
+  test("admission boundary is exact around the field threshold RSS", () => {
+    const fileSize = 59_220_693;
+    const budget = 4 * 1024 ** 3;
+    const thresholdRss = budget - fileSize * RESET_PARSE_EXPANSION_MULTIPLIER; // 1,215,491,260
+    expect(() => assertResetParseAdmission(fileSize, {
+      processBudgetBytes: budget, currentRssBytes: thresholdRss, expansionMultiplier: RESET_PARSE_EXPANSION_MULTIPLIER,
+    })).not.toThrow();
+    expect(() => assertResetParseAdmission(fileSize, {
+      processBudgetBytes: budget, currentRssBytes: thresholdRss + 1, expansionMultiplier: RESET_PARSE_EXPANSION_MULTIPLIER,
+    })).toThrow(ResetMemoryAdmissionError);
+  });
+
+  test("env override: absolute when valid (unclamped both directions), machine-scaled fallback when absent/invalid", () => {
+    const GiB = 1024 ** 3;
+    const MiB = 1024 ** 2;
+    const prior = process.env.RBOX_RESET_PARSE_BUDGET_BYTES;
+    const admits = (fileSize: number) => {
+      try {
+        assertResetParseAdmission(fileSize, { currentRssBytes: 0 });
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    try {
+      // 50 MiB file: required ~2.55 GiB.
+      // Below-default override (2 GiB) must be used VERBATIM → refuses what the 4 GiB floor would admit.
+      process.env.RBOX_RESET_PARSE_BUDGET_BYTES = String(2 * GiB);
+      expect(admits(50 * MiB)).toBe(false);
+      // 500 MiB file: required ~25.4 GiB. Above-ceiling override (64 GiB) is not clamped → admits.
+      process.env.RBOX_RESET_PARSE_BUDGET_BYTES = String(64 * GiB);
+      expect(admits(500 * MiB)).toBe(true);
+      // Absent and invalid values fall back to the machine-scaled default (≥ 4 GiB floor): 50 MiB admits.
+      for (const raw of [undefined, "0", "-5", "abc", "1.5", "9007199254740992"]) {
+        if (raw === undefined) delete process.env.RBOX_RESET_PARSE_BUDGET_BYTES;
+        else process.env.RBOX_RESET_PARSE_BUDGET_BYTES = raw;
+        expect(admits(50 * MiB)).toBe(true);
+      }
+    } finally {
+      if (prior === undefined) delete process.env.RBOX_RESET_PARSE_BUDGET_BYTES;
+      else process.env.RBOX_RESET_PARSE_BUDGET_BYTES = prior;
+    }
+  });
+
+  test("2026-07-19 field regression: 59 MB state admits on a 96 GB machine, still fails closed on an 8 GB one", () => {
+    const GiB = 1024 ** 3;
+    const fileSize = 59_220_693;
+    const rss = 1_300_000_000; // field: available was 2.99e9 = 4GiB − ~1.3GB
+    expect(() => assertResetParseAdmission(fileSize, {
+      processBudgetBytes: defaultResetParseBudgetBytes(96 * GiB),
+      currentRssBytes: rss,
+      expansionMultiplier: RESET_PARSE_EXPANSION_MULTIPLIER,
+    })).not.toThrow();
+    expect(() => assertResetParseAdmission(fileSize, {
+      processBudgetBytes: defaultResetParseBudgetBytes(8 * GiB),
+      currentRssBytes: rss,
+      expansionMultiplier: RESET_PARSE_EXPANSION_MULTIPLIER,
+    })).toThrow(ResetMemoryAdmissionError);
+    try {
+      assertResetParseAdmission(fileSize, {
+        processBudgetBytes: defaultResetParseBudgetBytes(8 * GiB),
+        currentRssBytes: rss,
+        expansionMultiplier: RESET_PARSE_EXPANSION_MULTIPLIER,
+      });
+    } catch (error) {
+      expect((error as Error).message).toContain("RBOX_RESET_PARSE_BUDGET_BYTES");
+    }
   });
 
   test("materialized and streaming ceilings are enforced at their exact boundaries", async () => {
