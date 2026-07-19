@@ -404,9 +404,15 @@ export function resolveRunnerName(flag: string | undefined, env: NodeJS.ProcessE
 let configuredFlag: string | undefined;
 let selected: RunnerBackend | undefined;
 export function configureRunner(flag?: string): RunnerName {
-  if (selected) throw new Error("rig: runner already resolved");
+  const requested = resolveRunnerName(flag, process.env, process.platform);
+  // A matching re-configure is benign (harness layers may both pin the same
+  // runner; import order can lazily resolve first). Switching mid-flight stays fatal.
+  if (selected) {
+    if (selected.name !== requested) throw new Error("rig: runner already resolved");
+    return requested;
+  }
   configuredFlag = flag;
-  return resolveRunnerName(flag, process.env, process.platform);
+  return requested;
 }
 function backend(): RunnerBackend {
   if (!selected) selected = resolveRunnerName(configuredFlag, process.env, process.platform) === "docker" ? dockerBackend : appleBackend;
