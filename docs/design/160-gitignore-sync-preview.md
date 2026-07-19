@@ -1,7 +1,7 @@
 # 160 — Gitignore sync preview: show what will and won't sync before first sync
 
-Status: DRAFT v4 (folded review rounds 1–3 — all findings accepted, see
-Decisions). Origin: validation item #9, founder greenlit design pass
+Status: **ALIGNED** (v5; 4 review rounds — r4 verdict ALIGNED with 3
+editorial LOWs, fixed here and self-certified per the convergence rule). Origin: validation item #9, founder greenlit design pass
 2026-07-18 (design only; ship decision separate).
 
 ## Problem (field evidence)
@@ -32,7 +32,9 @@ call is the founder's; the preview below tells the truth either way.
 
 ## Mechanism — preview as an ACTION row in the existing select
 
-Two policy choices stay exactly as-is (default unchanged). A third,
+The two policy VALUES and the default stay unchanged (option 2's label text
+is pending the founder call above; the old label is shown for placement
+only). A third,
 non-policy row is appended to the PROMPT LIST (not to `GITIGNORE_CHOICES`,
 which stays two-valued):
 
@@ -142,14 +144,16 @@ decisions; and mid-walk), asserting both counters and the rendered copy.
 effective* `.gitignore` files (files under pruned/excluded parents are not
 consulted by the resolver and are not counted). No-root case renders:
 `among the entries previewed, found 14 effective .gitignore files in
-subfolders (none at the root)`. Under cap, never print exact remainder
+subfolders (none at the root)` — "effective" is defined as files consulted
+by the `respectGitignore: true` policy (the false policy consults none; one
+owner prevents conforming implementations from rendering different counts). Under cap, never print exact remainder
 claims; use `additional rules may exist beyond the preview limit`.
 
 ## Output sketch (dim, ≤15 lines)
 
     found 14 effective .gitignore files in subfolders (none at the root)
     either way rbox skips: node_modules/ (~9,400 files) · .env · dist/ (~1,100) · +3 groups
-    "skip gitignored" additionally skips: coverage/ (~800 files) · *.log files in 6 folders
+    "skip gitignored" additionally skips: coverage/ (~800 files) · build/ (~350) · +2 groups
     everything else syncs under both choices (~101,000 files, ~1.8 GB)
     previewed the first 20,000 entries — larger trees are sampled
 
@@ -171,7 +175,7 @@ claims; use `additional rules may exist beyond the preview limit`.
 
 ## Non-goals
 - No engine semantics changes (the option-2 label question is the founder's
-  separate call; if (b) is chosen this design gets a v3 with set A redefined).
+  separate call; if (b) is chosen a subsequent revision redefines the sets).
 - No per-pattern toggling (`rbox ignore --review` is separate backlog).
 - No third POLICY; two choices, one preview action.
 
