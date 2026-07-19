@@ -1,7 +1,8 @@
 # 160 — Gitignore sync preview: show what will and won't sync before first sync
 
-Status: **ALIGNED** (v5; 4 review rounds — r4 verdict ALIGNED with 3
-editorial LOWs, fixed here and self-certified per the convergence rule). Origin: validation item #9, founder greenlit design pass
+Status: **ALIGNED + PARKED** (founder call 2026-07-19: preview feature
+parked; the honest-copy relabel shipped separately as a copy-only PR. v5;
+4 review rounds — r4 ALIGNED with 3 editorial LOWs, fixed + self-certified). Origin: validation item #9, founder greenlit design pass
 2026-07-18 (design only; ship decision separate).
 
 ## Problem (field evidence)
@@ -203,3 +204,15 @@ tracked/possibly-tracked non-directories incl. symlinks, founder-warning
 both policy matchers share one budget, neither exposed unless both complete;
 f4 three cap boundaries incl. between tracked-set loads; policy prose fixed
 (flag toggles nested honoring AND tracked protection).
+
+## Future evolution (founder idea, 2026-07-19 — separate design when picked up)
+
+When setup finds `.gitignore` files (the scanner already discovers them
+recursively), offer a SUGGESTED `.rboxignore`: scan for secret-shaped file
+NAMES only — `.env`, `.env.*`, `.dev.vars`, and similar patterns — by
+EXISTENCE, never reading contents, and propose the inverse (`!.env`,
+`!.dev.vars`) so a solo dev's secrets sync E2EE between machines without
+being committed. The pitch: gitignored build/test outputs stay unsynced,
+but the files you gitignore *because they're secrets* are exactly the files
+an E2EE sync should carry. Opt-in suggestion, never automatic; composes
+with this design's preview (the suggestion could render inside it).
