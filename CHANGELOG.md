@@ -6,6 +6,24 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.7.5] — 2026-07-19 — a front door that knows you
+
+### Added
+- The "which directory should rbox sync?" prompt is now a real picker: type
+  to fuzzy-filter the current directory's folders, press Tab to complete
+  into a subdirectory like shell completion, and plain Enter still takes the
+  current directory instantly. Typing any path by hand (including one that
+  doesn't exist yet) works exactly as before.
+- Running bare `rbox` in a workspace now offers everything you'd reach for:
+  Sync now / Start background syncing (or Pause syncing while it's running),
+  Set up a new workspace, Pair another device, View usage, View logs, Exit.
+
+### Fixed
+- The bare-`rbox` overview no longer shows "plan unavailable" on a freshly
+  set-up machine — it now fetches your email and plan once (quickly, and
+  only when interactive) instead of waiting for a cache another command
+  would have filled.
+
 ## [1.7.4] — 2026-07-19 — a first sync you can watch
 
 ### Added
