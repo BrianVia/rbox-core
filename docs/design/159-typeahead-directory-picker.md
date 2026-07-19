@@ -1,6 +1,6 @@
 # 159 — Typeahead directory picker for "Which directory should rbox sync?"
 
-Status: DRAFT v7 (folded review rounds 1–6 — rulings in Decisions; reviews at
+Status: DRAFT v8 (folded review rounds 1–7 — rulings in Decisions; reviews at
 `.claude/review-159-r1.md`, `-r2.md`, `-r3.md`). Origin: validation item #8,
 founder-greenlit design pass 2026-07-18.
 
@@ -45,14 +45,14 @@ forces the legacy plain-input path (r1 f10).
      applied to `default ?? ""` (so a `~` default lists home; the EMPTY raw
      answer, not cwd, in the no-default case; an unsupported `~user` default
      retries as today — all pinned).
-- **Raw participates in exactly two rules** (retracting v5's "display-only"
-  absolutism): it is the editor display, and the **default fast path keys on
-  RAW emptiness** — only a truly untouched prompt answers `default`, exactly
-  like today's input widget. Whitespace-only input is therefore
+- **Raw participates in exactly three rules** (retracting v5's
+  "display-only" absolutism): editor display; the **default fast path**,
+  which keys on RAW emptiness AND the highlight resting on the initial row
+  (r7 f2); and use-input row presence (r7 f1). Whitespace-only input is therefore
   semantically empty for listing/Tab (lists the default's directory,
-  absolute-form completion) but its ENTER submission runs the normal
-  pipeline: trim → "" → `resolve(cwd, "")` = cwd — byte-identical to today
-  even when `default !== cwd`. Pinned by a whitespace-only-Enter test with
+  absolute-form completion) but its ENTER answers the highlighted use-input
+  row = cwd — byte-identical to today's trim→resolve submission even when
+  `default !== cwd`. Pinned by a whitespace-only-Enter test with
   `default !== cwd`.
 - **Key split (r2 f2):** Enter acts on the HIGHLIGHTED row — which resets to
   the pinned use-input row after every edit, so type-literal-then-Enter
@@ -74,17 +74,22 @@ forces the legacy plain-input path (r1 f10).
   the parent because `listDir` is derived. Initial-state test pins BOTH the
   displayed directory and the bare-Enter answer = default.
 
-### Candidate rows (r1 f1+f3 accepted — free-form input is always accepted)
+### Candidate rows + Enter (r1 f1+f3; r7 f1/f2/f3 — derived from named fields only)
 
-1. **`use "<resolved>"`** — synthetic row pinned first whenever input is
-   non-empty; answers with the raw resolved input, existing or not. This
-   preserves the current contract where setup accepts a nonexistent path and
-   offers to create it (`setup-cmd.ts:707-731`, pinned by `typo-no-phantom`)
-   — the picker changes how paths are found, never what answers are legal.
-   Caller-side validation (create-confirm, ENOENT handling) is untouched;
-   the v1 claim that `promptPath` validates existence is RETRACTED (it never
-   did).
-2. **`use this directory (<listDir>)`** — when filterTerm is empty.
+1. **`use "<resolved>"`** — synthetic row, pinned first, present exactly when
+   **`raw !== ""`**; its label AND answer are `resolved` (r7 f1). Raw
+   therefore participates in exactly THREE rules: editor display, the default
+   fast path below, and this row's presence — the v7 "exactly two" claim is
+   corrected. Whitespace-only input (`raw = "   "`, `lexical = ""`) thus has
+   row 1 = `use "<cwd>"` highlighted after any edit, so Enter answers cwd —
+   the pinned whitespace-Enter transition falls out of the row rules with no
+   special case. This row preserves the contract where setup accepts a
+   nonexistent path and offers to create it (`setup-cmd.ts:707-731`, pinned
+   by `typo-no-phantom`) — the picker changes how paths are found, never what
+   answers are legal. Caller-side validation (create-confirm, ENOENT
+   handling) untouched; the v1 claim that `promptPath` validates existence is
+   RETRACTED (it never did).
+2. **`use this directory (<listDir>)`** — present when `filterTerm` is empty.
 3. Child directories of `listDir`, filtered + ranked (below). `.git`,
    `node_modules`, `.rbox` are hidden from suggestions but reachable via
    row 1 by typing them. **Symlink policy (r2 f4):** a dirent that is a
@@ -93,15 +98,21 @@ forces the legacy plain-input path (r1 f10).
    setup-cmd.ts:713-718); descent through one simply resolves through it.
    Broken symlinks are omitted from suggestions (row 1 still reaches them).
    The symlink test pins this policy.
-- Bare Enter with empty input answers `opts.default ?? cwd` resolved against
-  cwd — today's fast path exactly.
-- Enter otherwise answers the highlighted row. **Listing policy (r2 f3):**
-  cache miss uses BLOCKING `readdirSync` — there is no asynchronous source
-  anywhere in the prompt, so no loading window, no generation/abort state,
-  and the rig's literal-then-Enter keystroke pattern cannot race. Tradeoff
-  accepted and stated: first descent into a very large directory briefly
-  blocks the render (same order of cost the eventual scan pays anyway);
-  subsequent keystrokes filter the cached listing synchronously.
+
+**Enter precedence (r7 f2):** the default fast path applies ONLY when
+`raw === ""` AND the highlight still sits on the initial row; it answers via
+the canonical default pipeline (the staged model's semantic-empty exception —
+trim → expand → resolve applied to `default ?? ""`; `~`/`~user`/no-default
+behavior as defined there, r7 f3 — the old `opts.default ?? cwd resolved
+against cwd` formula is DELETED). In every other state Enter answers the
+highlighted row. Pinned by an initial ArrowDown → Enter child-selection
+transition test (arrowing at raw-empty selects the child, never the
+default). **Listing policy (r2 f3):** cache miss uses BLOCKING `readdirSync`
+— no asynchronous source anywhere in the prompt, so no loading window, no
+generation/abort state, and the rig's literal-then-Enter keystroke pattern
+cannot race. Tradeoff accepted and stated: first descent into a very large
+directory briefly blocks the render (same order of cost the eventual scan
+pays anyway); subsequent keystrokes filter the cached listing synchronously.
 
 ### Listing + performance (r1 f6 accepted)
 
@@ -217,6 +228,11 @@ R5, 1 accepted: f1 staged projection (lexical/expanded/resolved) with
 per-stage ownership; boundary computed pre-expansion; Tab branches on
 semantic emptiness; bare-`~`, `~/`, and whitespace-only Tab transitions
 pinned with exact visible strings.
+R7, 3 accepted: f1 use-input row keyed on raw non-emptiness with
+resolved-owned label/answer (raw's rule count corrected to three);
+f2 default fast path additionally requires the highlight on the initial row,
+ArrowDown→Enter child selection pinned; f3 the stale bare-Enter formula
+deleted in favor of the canonical default pipeline.
 R6, 1 accepted: f1 the staged model is now the NORMATIVE state model (the
 old one-projection formulas were removed wholesale — a silent no-op edit in
 the v6 fold had left both in place); bare `~` is a boundary listing home
