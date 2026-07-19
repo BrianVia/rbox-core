@@ -1,6 +1,6 @@
 # 159 — Typeahead directory picker for "Which directory should rbox sync?"
 
-Status: DRAFT v5 (folded review rounds 1–4 — rulings in Decisions; reviews at
+Status: DRAFT v6 (folded review rounds 1–5 — rulings in Decisions; reviews at
 `.claude/review-159-r1.md`, `-r2.md`, `-r3.md`). Origin: validation item #8,
 founder-greenlit design pass 2026-07-18.
 
@@ -59,14 +59,16 @@ forces the legacy plain-input path (r1 f10).
   path + `/` (no-op when no child matches). So `pro` + Tab → `project/`,
   while `pro` + Enter → `use "<cwd>/pro"`. Both contracts hold by
   construction; the type-Tab-Enter flow proves the Tab side.
-  **Rewrite construction (r3 f2):** for non-empty input, Tab replaces ONLY
-  the textual basename — the user's spelling prefix (`~/`, `../`, absolute,
-  repeated slashes) is preserved verbatim, so the rewritten string always
-  re-derives the completed child under resolve(cwd, ·). For empty-input
-  completion, the child is written relative when the listed directory is
-  cwd, ABSOLUTE otherwise (default outside cwd must not silently re-derive
-  under cwd). Every named transition test states its expected visible
-  string.
+  **Rewrite construction (r3 f2 + r5 f1):** branch on SEMANTIC emptiness
+  (`lexical === ""`), never raw spelling. Non-empty: Tab replaces only the
+  final lexical segment (after the last `/` of `lexical`) with the completed
+  child's name + `/`, preserving the lexical prefix (`~/`, `../`, absolute,
+  repeated slashes) verbatim — so the rewritten string always re-derives the
+  completed child under the staged projection. Bare `~` normalizes to `~/`
+  first, then appends. Empty (includes whitespace-only): the child is
+  written relative when `listDir` is cwd, ABSOLUTE otherwise (a default
+  outside cwd must not silently re-derive under cwd). Every named transition
+  test states its expected visible string.
   Backspace is just string editing — deleting past a `/` naturally re-lists
   the parent because `listDir` is derived. Trailing/repeated slashes, `..`,
   absolute, and `~/` all fall out of resolve(); state-transition tests
@@ -210,6 +212,8 @@ outside cwd, transition tests state visible strings; f3 canonical
 trim→tilde→resolve pipeline for submissions and defaults, empty raw answer
 in the no-default case; f4 lifetime memoization chosen — A→B→A reuses the
 cache, mid-prompt fs changes invisible.
-R4, 1 accepted: f1 single normalized projection (trim→tilde→resolve) drives
-ALL derivation; raw spelling only for Tab rewrites; whitespace transitions
-pinned.
+R4, 1 accepted: f1 normalized derivation (revised by r5 — see below).
+R5, 1 accepted: f1 staged projection (lexical/expanded/resolved) with
+per-stage ownership; boundary computed pre-expansion; Tab branches on
+semantic emptiness; bare-`~`, `~/`, and whitespace-only Tab transitions
+pinned with exact visible strings.
