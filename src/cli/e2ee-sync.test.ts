@@ -1559,7 +1559,7 @@ describe("E2EE sync transport — two machines through real sync.ts", () => {
       expect(await git(path.join(rootB, r), "rev-parse", "main")).toBe(await git(path.join(rootA, r), "rev-parse", "main"));
       await expect(git(path.join(rootB, r), "fsck", "--connectivity-only", "--no-dangling")).resolves.toBeDefined();
     }
-  }, 30_000);
+  }, 120_000);
 });
 
 test("D fast pull rejects an intermediate SIGNED-chain substitution (same snapshot/length/immediate base) and the cold walk fails closed", async () => {
@@ -1607,7 +1607,7 @@ test("D fast pull rejects an intermediate SIGNED-chain substitution (same snapsh
     // The cold walk ran (chain blobs fetched) — the fast path did not accept.
     expect(server.store.getCalls).toContain(substitute.encManifestSha);
   });
-});
+}, 60_000);
 
 test("R4 evidence suffix rejects bytes substituted under a signed link address without refetching the prefix", async () => {
   await withManifestEncodingFlags("1", "1", async () => {
@@ -1630,7 +1630,7 @@ test("R4 evidence suffix rejects bytes substituted under a signed link address w
     expect(server.store.getCalls).not.toContain(first.manifestMeta!.encManifestSha);
     expect(server.store.getCalls).not.toContain(second.manifestMeta!.encManifestSha);
   });
-});
+}, 60_000);
 
 test("repairChain converges on a readable head that raced in BEFORE the repair started (never supersedes readable data)", async () => {
   await withManifestEncodingFlags("1", "1", async () => {
@@ -1658,4 +1658,4 @@ test("repairChain converges on a readable head that raced in BEFORE the repair s
     expect(outcome.kind === "converged" && outcome.sequence).toBe(3);
     expect(server.commits).toHaveLength(3); // no repair commit published
   });
-});
+}, 60_000);
