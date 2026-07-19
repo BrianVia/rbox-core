@@ -60,6 +60,12 @@ const DEDICATED_TESTS: Record<string, DedicatedTest[]> = {
     { name: "clean materialization with a ref-wiping hook defers before stranding a sibling worktree branch", weight: 0.6, antiAffinityGroup: "git-sync-process" },
   ],
 };
+
+const WHOLE_FILE_ANTI_AFFINITY: Record<string, string> = {
+  // This file's transport family is subprocess/crypto heavy as a whole. Keep
+  // it unsplit so nested describe names retain Bun's normal matching semantics.
+  "src/cli/e2ee-sync.test.ts": "git-sync-process",
+};
 const DEFAULT_WEIGHT = 0.5;
 
 function usage(): never {
@@ -137,7 +143,12 @@ async function buildUnits(files: string[]): Promise<TestUnit[]> {
   for (const file of files) {
     const split = SPLIT_FILES[file];
     if (!split) {
-      units.push({ label: file, files: [file], weight: weightOf(file) });
+      units.push({
+        label: file,
+        files: [file],
+        weight: weightOf(file),
+        antiAffinityGroup: WHOLE_FILE_ANTI_AFFINITY[file],
+      });
       continue;
     }
 
@@ -255,6 +266,12 @@ async function verify(files: string[], shards: Shard[]): Promise<void> {
       if (emitted.length !== 1 || emitted[0]?.antiAffinityGroup !== entry.antiAffinityGroup) {
         dedicatedErrors.push(`${file}: ${entry.name}: emitted ${emitted.length} times with expected anti-affinity`);
       }
+    }
+  }
+  for (const [file, antiAffinityGroup] of Object.entries(WHOLE_FILE_ANTI_AFFINITY)) {
+    const emitted = shards.flatMap((shard) => shard.units).filter((unit) => unit.label === file && unit.files.length === 1 && unit.files[0] === file);
+    if (emitted.length !== 1 || emitted[0]?.antiAffinityGroup !== antiAffinityGroup) {
+      dedicatedErrors.push(`${file}: emitted ${emitted.length} times with expected anti-affinity`);
     }
   }
   const affinityErrors: string[] = [];

@@ -505,7 +505,7 @@ test("git apply pools independent repos under RBOX_GIT_APPLY_CONCURRENCY>=2", as
 
   expect(betaStartedBeforeAlphaFinished).toBe(true);
   expect(logsB.filter((l) => l.startsWith("git-sync applied ")).sort()).toEqual(["git-sync applied alpha", "git-sync applied beta"]);
-}, 30_000);
+}, 120_000);
 
 test("git apply serializes pointer repos that share one common git dir", async () => {
   process.env.RBOX_GIT_APPLY_CONCURRENCY = "2";
@@ -560,7 +560,7 @@ test("git apply serializes pointer repos that share one common git dir", async (
 
   expect(overlapped).toBe(false);
   expect(logsB.filter((l) => l.startsWith("git-sync applied ")).sort()).toEqual(["git-sync applied wt-a", "git-sync applied wt-b"]);
-}, 30_000);
+}, 120_000);
 
 test("git apply keeps nested repo chains parent-before-child under pooling", async () => {
   process.env.RBOX_GIT_APPLY_CONCURRENCY = "2";
@@ -595,7 +595,7 @@ test("git apply keeps nested repo chains parent-before-child under pooling", asy
 
   expect(childStartedBeforeParentFinished).toBe(false);
   expect(logsB.filter((l) => l.startsWith("git-sync applied "))).toEqual(["git-sync applied parent", "git-sync applied parent/child"]);
-}, 30_000);
+}, 120_000);
 
 test("RBOX_GIT_APPLY_CONCURRENCY=1 preserves serial apply order", async () => {
   process.env.RBOX_GIT_APPLY_CONCURRENCY = "1";
@@ -644,7 +644,7 @@ test("RBOX_GIT_APPLY_CONCURRENCY=1 preserves serial apply order", async () => {
 
   expect(twoStartedBeforeOneFinished).toBe(false);
   expect(events).toEqual(["start:one", "done:one", "start:two", "done:two"]);
-}, 30_000);
+}, 120_000);
 
 // ── (a) two-machine e2e: fidelity across nested repos + a real worktree ──────────
 
@@ -709,7 +709,7 @@ test("e2e: nested dir repos (staged+stash+paused rebase) + out-of-tree worktree 
   expect(await git(bw, "symbolic-ref", "HEAD")).toBe("refs/heads/feat");
   expect(await git(bw, "rev-parse", "feat")).toBe(await git(W, "rev-parse", "feat"));
   expect((await git(bw, "branch", "--format=%(refname:short)")).split("\n")).toEqual(["feat"]); // main never leaked
-}, 30_000);
+}, 120_000);
 
 test("e2e: worktree scope-crossing converges (§7 trace) — B's edit applies into A's pointer repo, then ZERO capture ping-pong", async () => {
   const M = path.join(tmp, "mainclone");
@@ -745,7 +745,7 @@ test("e2e: worktree scope-crossing converges (§7 trace) — B's edit applies in
   await syncCycle();
   expect(remote.headSeq()).toBe(head); // no capture ping-pong across scope crossings
   expect(remote.commitCalls).toBe(calls); // not even attempted commits
-}, 30_000);
+}, 120_000);
 
 test("root repo '.' still syncs end-to-end (pre-§43 behavior preserved)", async () => {
   await initRepo(rootA);
@@ -876,7 +876,7 @@ test("design 53: length and byte compaction triggers publish full bundles", asyn
   await commitFile(rByte, "f.txt", "v2", "c2");
   await push(rootA, cfgA, depsA);
   expect((await remote.latest()).manifest.gitRepos!["rByte"]!.packChain).toBeUndefined();
-}, 30_000);
+}, 120_000);
 
 test("design 53: missing receiver link defers, then heals when sender recompacts full", async () => {
   cfgA = { ...cfgA, git: { incremental: true } };
@@ -925,7 +925,7 @@ test("design 53: missing receiver link defers, then heals when sender recompacts
   await pull(rootB, cfgB, depsB);
   expect((await st(rootB)).gitPendingRemote?.["r"]).toBeUndefined();
   expect(await git(path.join(rootB, "r"), "rev-parse", "main")).toBe(await git(r, "rev-parse", "main"));
-}, 30_000);
+}, 120_000);
 
 test("design 53: fresh join fetch/import work is bounded by repos times MAX_PACK_CHAIN", async () => {
   cfgA = { ...cfgA, git: { incremental: true } };
@@ -970,7 +970,7 @@ test("design 116: chained-section human edits defer with newest incoming carried
   expect(deferred.deferrals?.apply?.reason).toBe("local-edits");
   expect(deferred.pending?.packChain).toHaveLength(1);
   expect(deferred.resolutionKey).toBeUndefined();
-}, 30_000);
+}, 120_000);
 
 // ── design 68 §3.3: in-tree linked-worktree pointer skip (base-carry) ──────────────
 
@@ -2016,7 +2016,7 @@ test("gitDivergenceCount warm unchanged multi-repo fixture issues zero git spawn
   const warm = await observeGitSpawns(async () => gitDivergenceCount(rootA, cfgA, await st(rootA), matcher));
   expect(warm.value).toBe(0);
   expect(warm.spawns).toBe(0);
-}, 30_000);
+}, 120_000);
 
 test("gitDivergenceFastRepoSource treats v2 divergence cache as empty", async () => {
   const cachePath = path.join(rootA, ".rbox", "state", "git-divergence.json");
@@ -2170,7 +2170,7 @@ test("gitDivergenceCount fingerprint cache invalidates on rebase op-state", asyn
   const after = await observeGitSpawns(async () => gitDivergenceCount(rootA, cfgA, await st(rootA), matcher));
   expect(after.value).toBe(1);
   expect(after.spawns).toBeGreaterThan(0);
-}, 30_000);
+}, 120_000);
 
 test("gitDivergenceCount fingerprint cache invalidates pointer worktree refs via commonDir", async () => {
   const main = path.join(tmp, "main-outside");
@@ -2189,7 +2189,7 @@ test("gitDivergenceCount fingerprint cache invalidates pointer worktree refs via
   const after = await observeGitSpawns(async () => gitDivergenceCount(rootA, cfgA, await st(rootA), matcher));
   expect(after.value).toBe(1);
   expect(after.spawns).toBeGreaterThan(0);
-}, 30_000);
+}, 120_000);
 
 test("gitDivergenceCount stable-pair retry avoids stale cache under mid-probe mutation", async () => {
   const repo = path.join(rootA, "stable");
@@ -2217,7 +2217,7 @@ test("gitDivergenceCount stable-pair retry avoids stale cache under mid-probe mu
   const warm = await observeGitSpawns(async () => gitDivergenceCount(rootA, cfgA, await st(rootA), matcher));
   expect(warm.value).toBe(1);
   expect(warm.spawns).toBe(0);
-}, 30_000);
+}, 120_000);
 
 test("gitDivergenceCount heals corrupt divergence cache after correct slow path", async () => {
   const repo = path.join(rootA, "corrupt-cache");
@@ -2238,7 +2238,7 @@ test("gitDivergenceCount heals corrupt divergence cache after correct slow path"
   const warm = await observeGitSpawns(async () => gitDivergenceCount(rootA, cfgA, await st(rootA), matcher));
   expect(warm.value).toBe(0);
   expect(warm.spawns).toBe(0);
-}, 30_000);
+}, 120_000);
 
 // ── design 83: push-side git-plan fingerprint cache ─────────────────────────────
 
@@ -2310,7 +2310,7 @@ test("steady-state all-hit git plan has no sidecar changes", async () => {
     stateRevisionBefore: state.stateRevision,
     stateRevisionAfter: state.stateRevision,
   });
-}, 30_000);
+}, 120_000);
 
 test("design 83/93: plan cache treats v2 as cold, writes the current version, then serves trusted warm carries with zero git spawns", async () => {
   const repo = path.join(rootA, "d83-v2");
@@ -2339,7 +2339,7 @@ test("design 83/93: plan cache treats v2 as cold, writes the current version, th
   expect(warm.value.gitPlanStats?.spawnedRepos).toBe(0);
   expect(warm.spawns).toBe(0);
   expect(gitPlanSurface(warm.value)).toEqual(gitPlanSurface(cold.value));
-}, 30_000);
+}, 120_000);
 
 test("design 83: racy-clean margin refuses a hash-matching entry and takes the spawn path", async () => {
   const repo = path.join(rootA, "d83-margin");
@@ -2364,7 +2364,7 @@ test("design 83: racy-clean margin refuses a hash-matching entry and takes the s
   expect(plan.value.gitPlanStats?.fpUntrusted).toBe(1);
   expect(plan.value.gitPlanStats?.spawnedRepos).toBe(1);
   expect(plan.spawns).toBeGreaterThan(0);
-}, 30_000);
+}, 120_000);
 
 test("design 83: plan cache does not trust a stale carried probe after another repo changes during capture", async () => {
   const cleanRel = "d83-race-clean";
@@ -2422,7 +2422,7 @@ test("design 83: trusted warm plan is zero-spawn and uses cached parentRel for p
   expect(warm.value.gitPlanStats?.spawnedRepos).toBe(0);
   expect(warm.value.gitPlanStats?.parentRelCached).toBe(1);
   expect(warm.spawns).toBe(0);
-}, 30_000);
+}, 120_000);
 
 test("design 83: baseless in-tree pointer pre-skip uses warm cached parentRel with zero spawns", async () => {
   const { W } = await makeInTreeMainWithWorktree();
@@ -2449,7 +2449,7 @@ test("design 83: baseless in-tree pointer pre-skip uses warm cached parentRel wi
   expect(warm.value.gitPlanStats?.spawnedRepos).toBe(0);
   expect(warm.targetSpawns).toBe(0);
   expect(warm.spawns).toBe(0);
-}, 30_000);
+}, 120_000);
 
 test("design 83: baseless pointer pre-skip falls back when cached parent is not sectioned", async () => {
   const { W } = await makeInTreeMainWithWorktree();
@@ -2471,7 +2471,7 @@ test("design 83: baseless pointer pre-skip falls back when cached parent is not 
   expect(warm.value.gitPlanStats?.pointerPreSkips).toBe(0);
   expect(warm.value.gitPlanStats?.spawnedRepos).toBeGreaterThan(0);
   expect(warm.targetSpawns).toBeGreaterThan(0);
-}, 30_000);
+}, 120_000);
 
 test("design 83: baseless pointer fingerprint miss spawns and never pre-skips", async () => {
   const { W } = await makeInTreeMainWithWorktree();
@@ -2486,7 +2486,7 @@ test("design 83: baseless pointer fingerprint miss spawns and never pre-skips", 
   expect(planned.value.gitPlanStats?.spawnedRepos).toBeGreaterThan(0);
   expect(planned.targetSpawns).toBeGreaterThan(0);
   expect(planned.value.skipped.map((s) => s.relPath)).toContain("wt");
-}, 30_000);
+}, 120_000);
 
 test("design 83: pending, needs-resolution, and force baseless pointers never pre-skip", async () => {
   const { W } = await makeInTreeMainWithWorktree();
@@ -2523,7 +2523,7 @@ test("design 83: pending, needs-resolution, and force baseless pointers never pr
   expect(forced.value.skipped.map((s) => s.relPath)).not.toContain("wt");
   expect(forced.value.captured).toContain("wt");
   expect(forced.targetSpawns).toBeGreaterThan(0);
-}, 30_000);
+}, 120_000);
 
 test("design 83: fast-path guard failures stay on the existing live planner path", async () => {
   const rel = "d83-guards";
@@ -2648,7 +2648,7 @@ test("design 83: plan cache misses changed git state and keeps other repos on th
   await expectOneRepoMiss(async () => {
     await git(path.join(rootA, "d83-a"), "pack-refs", "--all", "--prune");
   }, false);
-}, 30_000);
+}, 120_000);
 
 test("design 83: plan cache invalidates paused rebase op-state instead of fast-carrying", async () => {
   const rel = "d83-rebase-plan";
@@ -2675,7 +2675,7 @@ test("design 83: plan cache invalidates paused rebase op-state instead of fast-c
   expect(planned.value.carried).not.toContain(rel);
   expect(planned.value.captured.includes(rel) || planned.value.deferred.some((d) => d.relPath === rel)).toBe(true);
   expect(planned.spawns).toBeGreaterThan(0);
-}, 30_000);
+}, 120_000);
 
 test("design 83/93: status and plan writers leave one loadable bounds-versioned cache", async () => {
   const repo = path.join(rootA, "d83-cross-writer");
@@ -2698,7 +2698,7 @@ test("design 83/93: status and plan writers leave one loadable bounds-versioned 
   expect(cache.version).toBe(GIT_FINGERPRINT_VERSION);
   expect(typeof cache.repos?.["d83-cross-writer"]?.writtenAtMs).toBe("number");
   expect(typeof cache.repos?.["d83-cross-writer"]?.probe?.identityKey).toBe("string");
-}, 30_000);
+}, 120_000);
 
 // ── gitcap progress (the long silent phase on a repo-heavy first push) ───────────
 

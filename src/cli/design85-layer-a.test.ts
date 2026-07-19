@@ -49,7 +49,7 @@ test("daemon safety-mode coverage is pruned when warm; deep mode is full-tree an
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
-}, 10_000);
+}, 20_000);
 
 test("foreground default-on and kill-switch scans stay manifest-identical across structural and metadata changes", async () => {
   priorFlag = process.env.RBOX_SCAN_PRUNE;

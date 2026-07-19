@@ -29,6 +29,7 @@ async function makeFixture(options: { duplicateSplitName?: boolean; missingDedic
   const configured = options.missingDedicatedName ? dedicatedGitSyncTests.slice(1) : dedicatedGitSyncTests;
   const ordinary = options.duplicateSplitName ? ["duplicate", "duplicate"] : ["sync one", "sync two"];
   await put(root, "src/cli/sync-git/git-sync.test.ts", [...configured, ...ordinary].map((name) => `test(${JSON.stringify(name)}, () => {});`).join("\n"));
+  await put(root, "src/cli/e2ee-sync.test.ts", 'test("e2ee transport", () => {});\n');
   await put(root, "src/engine/git-nested.test.ts", 'test("nested one", () => {});\n');
   await put(root, "src/cli/prompt.ts", 'import { select } from "@inquirer/prompts";\nvoid select;\n');
   if (options.strayImport) {
@@ -100,7 +101,7 @@ describe("repository guards", () => {
     expect(result.stderr).toContain("missing 0, duplicate 1");
   });
 
-  test("spreads configured git-sync process-heavy tests deterministically", async () => {
+  test("spreads configured process-heavy families deterministically", async () => {
     const root = await makeFixture();
     const first = await runSharderFixture(root, "plan", 6);
     const second = await runSharderFixture(root, "plan", 6);
@@ -114,9 +115,10 @@ describe("repository guards", () => {
       for (const name of dedicatedGitSyncTests) {
         if (line.includes(`#dedicated:${name}`)) shardByName.set(name, shard);
       }
+      if (line.trimStart().startsWith("src/cli/e2ee-sync.test.ts ")) shardByName.set("e2ee-sync", shard);
     }
-    expect(shardByName.size).toBe(dedicatedGitSyncTests.length);
-    expect(new Set(shardByName.values()).size).toBe(dedicatedGitSyncTests.length);
+    expect(shardByName.size).toBe(dedicatedGitSyncTests.length + 1);
+    expect(new Set(shardByName.values()).size).toBe(dedicatedGitSyncTests.length + 1);
   });
 
   test("rejects a stale configured dedicated test name", async () => {
