@@ -7,7 +7,15 @@ what happened, what it cost, fix hint if obvious.
 
 ## 2026-07-19 (overnight)
 
-- **CI guard scripts have no local runner.** The "only prompt.ts imports
+- **RESOLVED same night (#pending): `scripts/ux/tui.test.ts` required an
+  installed `rbox`** — its dead-pane test spawned the real binary, failing
+  with status 127 on any host without one (bit codex's sandbox AND the
+  fleet-wiped desktop in one evening). The child's identity was irrelevant;
+  it now spawns a PATH-independent shell child printing the same output.
+- **`scripts/guards.ts` hardcodes shard-count 6** while ci.yml's test matrix
+  defines it — if the shard count ever changes, the local guard drifts from
+  CI. Hint: single source (read the matrix value or a shared constant).
+- **RESOLVED (#339): CI guard scripts have no local runner.** The "only prompt.ts imports
   @inquirer" guard (ci.yml checks job) caught PR #336 — correctly — but only
   AFTER push: the guards are inline workflow shell, so neither codex's
   conformance reviews nor local gates can run them. Cost: one red CI round.
@@ -28,18 +36,18 @@ what happened, what it cost, fix hint if obvious.
 
 ## 2026-07-18
 
-- **`scripts/release.ts` crash leaves `src/cli/version.ts` mangled.** The
+- **RESOLVED (#334): `scripts/release.ts` crash leaves `src/cli/version.ts` mangled.** The
   script rewrites version.ts during compile and restores it on success; the
   signing-key throw (no RBOX_RELEASE_PRIVATE_KEY) exits before restoration,
   leaving a truncated file silently dirty in the checkout. Found an hour later
   via git status. Hint: restore in a `finally`.
-- **`scripts/release.ts` has no dev-build path.** Compiling unreleased binaries
+- **RESOLVED (#334): `scripts/release.ts` has no dev-build path.** Compiling unreleased binaries
   for fleet validation required passing the LAST released version (changelog
   gate rejects anything else) and accepting a signing-key error after compile.
   Cost: two failed invocations + binaries whose `--version` lies (say 1.7.3,
   are main-tip). Hint: a `--dev` flag that skips the changelog gate + signing
   and stamps `<ver>+<sha>`.
-- **apps/api tests fail confusingly under plain `bun test`.** They need the
+- **RESOLVED (#334): apps/api tests fail confusingly under plain `bun test`.** They need the
   vitest/miniflare harness (`bun run test:api`); under bun they part-run and
   produce real-looking assertion failures (serverTimings mismatch) plus
   `Cannot find package 'cloudflare:test'`. Cost: one false "3 fail" scare.
@@ -57,7 +65,7 @@ what happened, what it cost, fix hint if obvious.
 - **`gh run rerun --failed` refuses after a cancel/finish race** ("cannot be
   retried") when the run concluded success right as the cancel landed.
   Harmless but confusing; verify run conclusion before rerunning.
-- **regress.ts mutates `scripts/rig/runs/.image-hash` in the checkout it runs
+- **RESOLVED (#334): regress.ts mutates `scripts/rig/runs/.image-hash` in the checkout it runs
   from.** A later `git pull --ff-only` in the primary checkout failed on the
   dirty file. Hint: write it under scratch/gitignore it.
 - **Session background tasks get externally killed mid-run** (four times today:
@@ -72,7 +80,7 @@ what happened, what it cost, fix hint if obvious.
   dispatched for a bounded test sweep, it started writing
   `docs/design/158-…` + review rounds instead of fixing tests. Hint: small-fix
   dispatch prompts need an explicit "no design docs; implement from SPEC.md".
-- **RESOLVED 2026-07-19 (founder added the ruleset): No branch protection ⇒ no GitHub auto-merge.** Every merge-on-green needs
+- **RESOLVED 2026-07-19 (founder ruleset): No branch protection ⇒ no GitHub auto-merge.** Every merge-on-green needs
   a hand-rolled watcher loop. Hint: a minimal required-check ruleset on main
   would unlock native auto-merge.
 - **`pgrep -f "codex exec"` matches the watcher's own command line** when the
