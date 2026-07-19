@@ -86,7 +86,12 @@ export async function verifyClerkJWT(env: Env, token: string, nowS: number): Pro
   if (typeof payload.exp !== "number" || nowS > payload.exp + LEEWAY_S) return null;
   if (payload.nbf !== undefined && (typeof payload.nbf !== "number" || nowS < payload.nbf - LEEWAY_S)) return null;
   const allowed = (env.CLERK_ALLOWED_ORIGINS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
-  if (typeof payload.azp !== "string" || !allowed.includes(payload.azp)) return null; // absent/unlisted azp → reject
+  // Backend-minted Clerk session tokens carry no azp. The DEV worker's CSV may
+  // opt into accepting them with the `__absent-azp__` sentinel (e2e account
+  // minting, design 158); prod's allowlist never contains the sentinel, so the
+  // browser-origin requirement is unchanged there.
+  const azpOk = typeof payload.azp === "string" ? allowed.includes(payload.azp) : allowed.includes("__absent-azp__");
+  if (!azpOk) return null; // absent/unlisted azp → reject
 
   // Signature: match kid exactly (refetch once on miss), verify over raw segments.
   let key = (await getJwks(env)).find((k) => (k as { kid?: string }).kid === header.kid);

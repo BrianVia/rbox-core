@@ -873,6 +873,18 @@ describe("worker integration (real DO + D1 + R2)", () => {
     expect((await webExchange(await signJwt(c))).status).toBe(401);
   });
 
+  test("absent azp accepted ONLY with the dev __absent-azp__ sentinel in the allowlist; still never for a wrong azp", async () => {
+    const prior = env.CLERK_ALLOWED_ORIGINS;
+    env.CLERK_ALLOWED_ORIGINS = `${prior},__absent-azp__`;
+    try {
+      const c = claims({ sub: "u_backend_minted" }); delete (c as Record<string, unknown>).azp;
+      expect((await webExchange(await signJwt(c))).status).toBe(200);
+      expect((await webExchange(await signJwt(claims({ sub: "u_azp2", azp: "https://evil.test" })))).status).toBe(401);
+    } finally {
+      env.CLERK_ALLOWED_ORIGINS = prior;
+    }
+  });
+
   test("unknown kid → 401", async () => {
     expect((await webExchange(await signJwt(claims({ sub: "u_kid" }), { kid: "nope" }))).status).toBe(401);
   });
