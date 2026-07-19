@@ -252,4 +252,11 @@ jobs:
 
       - name: Regress flows (report only)
         if: steps.regress-changes.outputs.changed == 'true'
-        run: bun scripts/ux/regress.ts
+        env:
+          RBOX_DEV_BOOTSTRAP: ${{ secrets.RBOX_DEV_BOOTSTRAP }}
+        run: |
+          if [ -z "$RBOX_DEV_BOOTSTRAP" ]; then
+            echo "::notice::RBOX_DEV_BOOTSTRAP repo secret not configured — regress flows skipped (add the dev bootstrap secret to enable this job)"
+            exit 0
+          fi
+          bun scripts/ux/regress.ts
