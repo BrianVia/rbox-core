@@ -13,6 +13,13 @@ type TestUnit = {
   names?: string[];
   pattern?: string;
   weight: number;
+  antiAffinityGroup?: string;
+};
+
+type DedicatedTest = {
+  name: string;
+  weight: number;
+  antiAffinityGroup: string;
 };
 
 const HEAVY_WEIGHTS: Record<string, number> = {
@@ -39,6 +46,19 @@ const SPLIT_FILES: Record<string, { parts: number; weight: number; partWeights?:
   // test name in these files is covered exactly once.
   "src/cli/sync-git/git-sync.test.ts": { parts: 12, weight: 73, partWeights: [8.8, 8.8, 6, 5.3, 5.4, 4.5, 4.7, 3.9, 8, 3.9, 4.3, 3.3] },
   "src/engine/git-nested.test.ts": { parts: 4, weight: 19, partWeights: [6, 3.7, 4, 5.2] },
+};
+
+const DEDICATED_TESTS: Record<string, DedicatedTest[]> = {
+  // These subprocess-heavy end-to-end workflows have repeatedly exhausted
+  // their caps together on contended runners. Standalone units let the
+  // partitioner spread them without depending on source-order bucket positions.
+  "src/cli/sync-git/git-sync.test.ts": [
+    { name: "design 53: fresh join fetch/import work is bounded by repos times MAX_PACK_CHAIN", weight: 0.9, antiAffinityGroup: "git-sync-process" },
+    { name: "git artifact sha_mismatch re-encrypts and retries with resumable uploadsDir", weight: 0.3, antiAffinityGroup: "git-sync-process" },
+    { name: "D2 apply deferral keeps chronic age across newer truth and resets reason age", weight: 0.7, antiAffinityGroup: "git-sync-process" },
+    { name: "pending + 422: M5 non-looping drop — section dropped from THIS commit, pending kept for the next pull [v6]", weight: 0.6, antiAffinityGroup: "git-sync-process" },
+    { name: "clean materialization with a ref-wiping hook defers before stranding a sibling worktree branch", weight: 0.6, antiAffinityGroup: "git-sync-process" },
+  ],
 };
 const DEFAULT_WEIGHT = 0.5;
 
@@ -122,8 +142,22 @@ async function buildUnits(files: string[]): Promise<TestUnit[]> {
     }
 
     const names = await testNames(file);
+    const dedicated = DEDICATED_TESTS[file] ?? [];
+    const dedicatedByName = new Map(dedicated.map((entry) => [entry.name, entry]));
+    for (const entry of dedicated) {
+      const count = names.filter((name) => name === entry.name).length;
+      if (count !== 1) {
+        console.error(`dedicated test must be discovered exactly once: ${file}: ${entry.name} (found ${count})`);
+        process.exit(1);
+      }
+    }
     const buckets = Array.from({ length: split.parts }, () => [] as string[]);
-    for (let i = 0; i < names.length; i++) buckets[i % split.parts]!.push(names[i]!);
+    // Preserve each residual test's original source-ordinal bucket. Filtering
+    // before assigning would reshuffle every name after a dedicated test.
+    for (let i = 0; i < names.length; i++) {
+      const name = names[i]!;
+      if (!dedicatedByName.has(name)) buckets[i % split.parts]!.push(name);
+    }
     for (let i = 0; i < buckets.length; i++) {
       const bucket = buckets[i]!;
       units.push({
@@ -132,6 +166,16 @@ async function buildUnits(files: string[]): Promise<TestUnit[]> {
         names: bucket,
         pattern: patternFor(bucket),
         weight: split.partWeights?.[i] ?? split.weight / split.parts,
+      });
+    }
+    for (const entry of dedicated) {
+      units.push({
+        label: `${file}#dedicated:${entry.name}`,
+        files: [file],
+        names: [entry.name],
+        pattern: patternFor([entry.name]),
+        weight: entry.weight,
+        antiAffinityGroup: entry.antiAffinityGroup,
       });
     }
   }
@@ -146,13 +190,17 @@ function partition(units: TestUnit[], shardCount: number): Shard[] {
     .sort((a, b) => b.unit.weight - a.unit.weight || a.hash - b.hash || a.unit.label.localeCompare(b.unit.label));
 
   for (const entry of ordered) {
-    let target = 0;
-    for (let i = 1; i < shards.length; i++) {
+    let target = -1;
+    for (let i = 0; i < shards.length; i++) {
       const shard = shards[i]!;
-      const best = shards[target]!;
-      if (shard.weight < best.weight || (shard.weight === best.weight && i < target)) {
+      if (entry.unit.antiAffinityGroup && shard.units.some((unit) => unit.antiAffinityGroup === entry.unit.antiAffinityGroup)) continue;
+      const best = target >= 0 ? shards[target]! : undefined;
+      if (!best || shard.weight < best.weight || (shard.weight === best.weight && i < target)) {
         target = i;
       }
+    }
+    if (target < 0) {
+      throw new Error(`cannot place ${entry.unit.label}: anti-affinity group ${entry.unit.antiAffinityGroup} exceeds ${shardCount} shards`);
     }
     shards[target]!.units.push(entry.unit);
     shards[target]!.weight += entry.unit.weight;
@@ -200,12 +248,34 @@ async function verify(files: string[], shards: Shard[]): Promise<void> {
     }
   }
 
-  if (missing.length || duplicates.length || extra.length || empty.length || splitErrors.length) {
+  const dedicatedErrors: string[] = [];
+  for (const [file, configured] of Object.entries(DEDICATED_TESTS)) {
+    for (const entry of configured) {
+      const emitted = shards.flatMap((shard) => shard.units).filter((unit) => unit.files[0] === file && unit.names?.includes(entry.name));
+      if (emitted.length !== 1 || emitted[0]?.antiAffinityGroup !== entry.antiAffinityGroup) {
+        dedicatedErrors.push(`${file}: ${entry.name}: emitted ${emitted.length} times with expected anti-affinity`);
+      }
+    }
+  }
+  const affinityErrors: string[] = [];
+  for (let i = 0; i < shards.length; i++) {
+    const groups = new Map<string, number>();
+    for (const unit of shards[i]!.units) {
+      if (unit.antiAffinityGroup) groups.set(unit.antiAffinityGroup, (groups.get(unit.antiAffinityGroup) ?? 0) + 1);
+    }
+    for (const [group, count] of groups) {
+      if (count > 1) affinityErrors.push(`shard ${i}: anti-affinity group ${group} appears ${count} times`);
+    }
+  }
+
+  if (missing.length || duplicates.length || extra.length || empty.length || splitErrors.length || dedicatedErrors.length || affinityErrors.length) {
     if (missing.length) console.error(`missing files:\n${missing.join("\n")}`);
     if (duplicates.length) console.error(`duplicate files:\n${duplicates.join("\n")}`);
     if (extra.length) console.error(`extra files:\n${extra.join("\n")}`);
     if (empty.length) console.error(`empty shards: ${empty.join(", ")}`);
     if (splitErrors.length) console.error(`split coverage errors:\n${splitErrors.join("\n")}`);
+    if (dedicatedErrors.length) console.error(`dedicated test errors:\n${dedicatedErrors.join("\n")}`);
+    if (affinityErrors.length) console.error(`anti-affinity errors:\n${affinityErrors.join("\n")}`);
     process.exit(1);
   }
 }
