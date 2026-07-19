@@ -119,8 +119,8 @@ export async function withCache(
   return { cache, save: () => cache.save(root) };
 }
 
-/** Either use the caller's dircache, load+save one when Layer A is enabled, or
- * stay entirely inert on the default-off path. */
+/** Either use the caller's dircache, load+save the default-on Layer A cache, or
+ * stay entirely inert when the RBOX_SCAN_PRUNE=0 kill switch is set. */
 export async function withDircache(
   root: string,
   provided: DirCache | undefined

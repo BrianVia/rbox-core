@@ -2,13 +2,30 @@ import { afterEach, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { coverageOf, createScanStats, DirCache, HashCache, RACY_MARGIN_MS, scanManifest, UNPRUNED_DEADLINE_MS } from "./index.js";
+import { coverageOf, createScanStats, DirCache, HashCache, RACY_MARGIN_MS, scanManifest, scanPruneEnabled, UNPRUNED_DEADLINE_MS } from "./index.js";
 
 const roots: string[] = [];
 async function tmp(): Promise<string> { const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-dircache-")); roots.push(root); return root; }
 afterEach(async () => { await Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true }))); });
 const settle = () => Bun.sleep(RACY_MARGIN_MS + 40);
 const filesOf = (manifest: Awaited<ReturnType<typeof scanManifest>>) => manifest.files;
+
+test("RBOX_SCAN_PRUNE has one exact kill switch and otherwise defaults on", () => {
+  const prior = process.env.RBOX_SCAN_PRUNE;
+  try {
+    delete process.env.RBOX_SCAN_PRUNE;
+    expect(scanPruneEnabled()).toBe(true);
+    process.env.RBOX_SCAN_PRUNE = "1";
+    expect(scanPruneEnabled()).toBe(true);
+    process.env.RBOX_SCAN_PRUNE = "affirm";
+    expect(scanPruneEnabled()).toBe(true);
+    process.env.RBOX_SCAN_PRUNE = "0";
+    expect(scanPruneEnabled()).toBe(false);
+  } finally {
+    if (prior === undefined) delete process.env.RBOX_SCAN_PRUNE;
+    else process.env.RBOX_SCAN_PRUNE = prior;
+  }
+});
 
 test("DirCache round-trips and safely discards missing, corrupt, old, or malformed files", async () => {
   const root = await tmp();

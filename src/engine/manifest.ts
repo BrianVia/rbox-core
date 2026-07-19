@@ -536,9 +536,9 @@ async function walk(
         : entry.isSymbolicLink() ? { name: entry.name, type: "symlink" }
         : entry.isFile() ? { name: entry.name, type: "file" }
         : { name: entry.name, type: "other" });
-      if (ctx.dircache && dirStat) ctx.dircache.record(rel, { mtimeMs: dirStat.mtimeMs, ctimeMs: dirStat.ctimeMs, children });
       if (ctx.dirProbe) probeProjectedBytes = Buffer.byteLength(JSON.stringify(entries.map((entry) => ({ name: entry.name, type: entry.isDirectory() ? "dir" : entry.isSymbolicLink() ? "symlink" : "file" }))));
     }
+    if (ctx.dircache && dirStat) ctx.dircache.record(rel, { mtimeMs: dirStat.mtimeMs, ctimeMs: dirStat.ctimeMs, children });
   }
   if (ctx.dirProbe && !reused) {
     const readdirMs = Date.now() - readdirStart;

@@ -268,8 +268,12 @@ test("corrupt drift sidecars are safely discarded", async () => {
 });
 
 test("scan stats line is fixed-shape and path-free", () => {
-  const line = scanStatsLine("safety scan", createScanStats(), 12, 0);
-  expect(line).toBe("safety scan: files=0 dirs=0 wall=12ms readdir=0 stat=0 matcher=0 hash=0 sort=0 residual=12 cacheHits=0 hashed=0 deferred=0 reuse=0 dc=off");
+  const stats = createScanStats();
+  stats.dirsWalked = 2;
+  stats.dirsReusedFromCache = 7;
+  stats.dircacheOutcome = "hit";
+  const line = scanStatsLine("safety scan", stats, 12, 0);
+  expect(line).toBe("safety scan: files=0 dirs=2 wall=12ms readdir=0 stat=0 matcher=0 hash=0 sort=0 residual=12 cacheHits=0 hashed=0 deferred=0 dc:hit hits=7 walked=2");
   expect(line).not.toContain("DISTINCTIVE_PRIVATE_NAME");
 });
 
