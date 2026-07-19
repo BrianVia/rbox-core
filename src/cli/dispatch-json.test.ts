@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { renderEssentialHelp, renderGroupedHelp } from "./help-registry.js";
 
 const cliEntry = path.join(path.dirname(fileURLToPath(import.meta.url)), "index.ts");
 
@@ -60,6 +61,24 @@ test("unknown flags fail before command dispatch", () => {
   expect(res.stdout).toBe("");
   expect(res.stderr).toContain("unknown flag --pullonly");
   expect(res.stderr).toContain("rbox start --help");
+});
+
+test("top-level help is pared while help --all retains the full reference", () => {
+  for (const args of [["--help"], ["help"]]) {
+    const res = run(args);
+    expect(res.status).toBe(0);
+    expect(res.stdout).toBe(`${renderEssentialHelp()}\n`);
+  }
+
+  const full = run(["help", "--all"]);
+  expect(full.status).toBe(0);
+  expect(full.stdout).toBe(`${renderGroupedHelp()}\n`);
+});
+
+test("unknown commands use the pared help screen and fail", () => {
+  const res = run(["definitely-not-a-command"]);
+  expect(res.status).toBe(1);
+  expect(res.stdout).toBe(`${renderEssentialHelp()}\n`);
 });
 
 test("RBOX_API override warning leaves JSON command stdout valid", async () => {

@@ -4,7 +4,8 @@
  * from a single source of truth:
  *
  *   - `rbox <cmd> --help` / `rbox help <cmd>` → that command's block, and
- *   - bare `rbox help` (or an unknown command) → the grouped screen.
+ *   - bare `rbox help` (or an unknown command) → the essential-flows screen, and
+ *   - `rbox help --all` → the grouped full-reference screen.
  *
  * It can still drift from the real `switch` (separate code), so a parity test
  * (help-registry.test.ts) asserts the public registry matches the command catalog.
@@ -612,7 +613,64 @@ export function renderCommand(c: CommandHelp): string {
   return lines.join("\n");
 }
 
-/** Render the grouped help screen (every non-hidden entry, in group order). */
+/** Render the founder-approved top-level help screen with only essential flows. */
+export function renderEssentialHelp(): string {
+  const lines: string[] = [];
+  lines.push(`${style.bold("rbox")} — end-to-end encrypted sync for your dev folders`);
+
+  const groups: { heading: string; entries: [string, string][] }[] = [
+    {
+      heading: "START",
+      entries: [
+        ["setup", "guided onboarding: account → workspace → syncing"],
+        ["status", "what's synced, what's running"],
+      ],
+    },
+    {
+      heading: "SYNC",
+      entries: [
+        ["start", "begin background sync for this workspace"],
+        ["stop", "stop background sync"],
+        ["sync", "sync once, right now"],
+        ["logs", "follow the background-sync log"],
+      ],
+    },
+    {
+      heading: "ADD A MACHINE",
+      entries: [
+        ["pair", "create a token on a signed-in machine"],
+        ["connect", "join this machine from a pasted token"],
+      ],
+    },
+    {
+      heading: "IF SOMETHING'S WRONG",
+      entries: [
+        ["doctor", "check workspace health"],
+        ["trash", "list/restore files rbox moved aside"],
+        ["key", "encryption: status, backup, recover"],
+      ],
+    },
+    {
+      heading: "MORE",
+      entries: [
+        ["rbox help --all", "the full command reference"],
+        ["rbox <command> --help", "flags and details for one command"],
+      ],
+    },
+  ];
+
+  for (const { heading, entries } of groups) {
+    lines.push("");
+    lines.push(style.dim(heading));
+    const w = Math.max(...entries.map(([command]) => command.length));
+    for (const [command, summary] of entries) lines.push(`  ${command.padEnd(w)}  ${style.dim(summary)}`);
+  }
+  lines.push("");
+  lines.push(style.dim("Exit codes: 0 ok, 1 error, 130 user cancel (Ctrl-C)."));
+  return lines.join("\n");
+}
+
+/** Render the full reference screen (every non-hidden entry, in group order). */
 export function renderGroupedHelp(): string {
   const lines: string[] = [];
   lines.push(`${style.bold("rbox")} — dev-aware sync ${style.dim("(end-to-end encrypted)")}`);
