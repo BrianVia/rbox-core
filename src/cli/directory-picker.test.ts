@@ -7,7 +7,6 @@ import {
   compareDirectoryRows,
   DIRECTORY_PICKER_PAGE_SIZE,
   DirectoryListingCache,
-  directoryPickerPrompt,
   highlightedAnswer,
   projectDirectoryPicker,
   rankDirectoryChildren,
@@ -17,6 +16,7 @@ import {
   type DirectoryPickerRow,
   type DirectoryReader,
 } from "./directory-picker.js";
+import { directoryPickerPrompt } from "./prompt.js";
 
 type EntryKind = "directory" | "file" | "symlink";
 

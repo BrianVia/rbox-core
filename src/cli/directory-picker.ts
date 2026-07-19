@@ -1,14 +1,3 @@
-import {
-  createPrompt,
-  isDownKey,
-  isEnterKey,
-  isTabKey,
-  isUpKey,
-  makeTheme,
-  useKeypress,
-  usePrefix,
-  useState,
-} from "@inquirer/core";
 import fs, { type Dirent, type Stats } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -319,59 +308,3 @@ export function highlightedAnswer(
   if (projection.raw === "" && highlight === 0) return projection.defaultAnswer;
   return projection.rows.slice(0, DIRECTORY_PICKER_PAGE_SIZE)[highlight]?.answer;
 }
-
-const pickerTheme = makeTheme();
-
-/** Real synchronous typeahead prompt. Tests may invoke it with in-memory streams. */
-export const directoryPickerPrompt = createPrompt<string, DirectoryPickerOptions>((config, done) => {
-  const [status, setStatus] = useState<"idle" | "done">("idle");
-  const [raw, setRaw] = useState("");
-  const [highlight, setHighlight] = useState(0);
-  const [answer, setAnswer] = useState("");
-  const [cache] = useState(() => config.cache ?? new DirectoryListingCache());
-  const prefix = usePrefix({ status, theme: pickerTheme });
-  const projection = projectDirectoryPicker(raw, config, cache);
-  const visibleRows = projection.rows.slice(0, DIRECTORY_PICKER_PAGE_SIZE);
-
-  useKeypress((key, rl) => {
-    if (isEnterKey(key)) {
-      const selected = highlightedAnswer(projection, highlight);
-      if (selected === undefined) return;
-      setAnswer(selected);
-      setStatus("done");
-      done(selected);
-      return;
-    }
-    if (isTabKey(key)) {
-      const rewritten = tabRewrite(projection, config.cwd);
-      if (rewritten === undefined) return;
-      rl.clearLine(0);
-      rl.write(rewritten);
-      setRaw(rewritten);
-      setHighlight(0);
-      return;
-    }
-    if (isUpKey(key) || isDownKey(key)) {
-      if (visibleRows.length === 0) return;
-      const offset = isUpKey(key) ? -1 : 1;
-      setHighlight((highlight + offset + visibleRows.length) % visibleRows.length);
-      return;
-    }
-    setRaw(rl.line);
-    setHighlight(0);
-  });
-
-  const message = pickerTheme.style.message(config.message, status);
-  if (status === "done") return [prefix, message, pickerTheme.style.answer(answer)].filter(Boolean).join(" ");
-
-  const rowLines = visibleRows.map((row, index) => {
-    const line = `${index === highlight ? "❯" : " "} ${row.label}`;
-    return index === highlight ? pickerTheme.style.highlight(line) : line;
-  });
-  if (projection.notice) rowLines.push(pickerTheme.style.help(projection.notice));
-  const hidden = projection.rows.length - visibleRows.length;
-  if (hidden > 0) rowLines.push(pickerTheme.style.help(`+${hidden} more`));
-  const hint = pickerTheme.style.help("Enter = this directory · type to filter · Tab completes");
-  const body = [hint, ...rowLines].join("\n");
-  return [[prefix, message, raw].filter((part) => part !== "").join(" "), body];
-});
