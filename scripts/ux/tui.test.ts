@@ -128,7 +128,9 @@ test("an immediately exiting child leaves a dead pane capturable by screen and w
   };
 
   try {
-    const started = await run(tmuxStartArgs(session, directory, 80, 24, ["rbox", "help"]));
+    const started = await run(tmuxStartArgs(session, directory, 80, 24, [
+      "/bin/sh", "-c", "i=0; while [ \"$i\" -lt 24 ]; do echo rbox; i=$((i + 1)); done",
+    ]));
     // Some managed sandboxes expose tmux but deny its Unix-socket connection.
     if (started.exitCode !== 0 && /Operation not permitted|Permission denied/.test(started.stderr)) return;
     expect(started.exitCode, started.stderr).toBe(0);
