@@ -6,6 +6,7 @@ import {
   redactSecret,
   resolveBootstrapSecret,
   resolvePlatformSecret,
+  resolveSecretFileKey,
   readCredentials,
 } from "./account.js";
 
@@ -36,6 +37,13 @@ test("resolveBootstrapSecret precedence: env wins, then file (worktree → prima
   expect(resolveBootstrapSecret(worktree, { env: {}, readFile })).toBe("from-file");
   // no env, no file → hard error naming both options
   expect(() => resolveBootstrapSecret("/nowhere", { env: {}, readFile: () => undefined })).toThrow(/RBOX_DEV_BOOTSTRAP/);
+});
+
+test("resolveSecretFileKey reuses the worktree-to-primary dev key lookup", () => {
+  const worktree = "/repo/.claude/worktrees/feature";
+  const files: Record<string, string> = { "/repo/dev-keys.local.secret": "CLERK_DEV_SECRET_KEY=sk_test_dev" };
+  expect(resolveSecretFileKey(worktree, "CLERK_DEV_SECRET_KEY", { readFile: (p) => files[p] })).toBe("sk_test_dev");
+  expect(() => resolveSecretFileKey(worktree, "MISSING", { readFile: (p) => files[p] })).toThrow(/MISSING/);
 });
 
 test("resolvePlatformSecret uses RBOX_DEV_PLATFORM_SECRET from env, then the repo secret file", () => {
