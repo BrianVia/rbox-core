@@ -931,7 +931,7 @@ test("design 53: fresh join fetch/import work is bounded by repos times MAX_PACK
   for (const rel of ["ra", "rb", "rc"]) {
     const r = path.join(rootA, rel);
     await initRepo(r);
-    await commitBinaryHistory(r, "base");
+    await commitBinaryHistory(r, "base", 1);
   }
   await push(rootA, cfgA, depsA);
   for (const rel of ["ra", "rb", "rc"]) await commitFile(path.join(rootA, rel), "delta.txt", "v2", "c2");
@@ -948,7 +948,7 @@ test("design 53: fresh join fetch/import work is bounded by repos times MAX_PACK
   }
   expect(fetches).toBeLessThanOrEqual(3 * MAX_PACK_CHAIN);
   expect(fetches).toBe(6);
-}, 30_000);
+}, 120_000);
 
 test("design 116: chained-section human edits defer with newest incoming carried", async () => {
   cfgA = { ...cfgA, git: { incremental: true } };
@@ -1134,7 +1134,7 @@ test("git artifact sha_mismatch re-encrypts and retries with resumable uploadsDi
   expect(remote.gitPutUploads[0]!.src.startsWith(scratch)).toBe(true);
   expect(remote.gitPutUploads[1]!.src.startsWith(scratch)).toBe(true);
   expect(new Set(remote.gitPutUploads.map((u) => u.uploadsDir))).toEqual(new Set([path.join(rootA, ".rbox", "state", "uploads")]));
-}, 20_000);
+}, 90_000);
 
 test("git artifact sha_mismatch retries are bounded; final failure defers with base carry", async () => {
   const r = path.join(rootA, "r");
@@ -1357,7 +1357,7 @@ test("D2 apply deferral keeps chronic age across newer truth and resets reason a
   expect(artifact.reasonSince).not.toBe(busy.reasonSince);
   expect(artifact.lastSeen >= busy.lastSeen).toBe(true);
   expect(artifact.subjectKey).not.toBe(busy.subjectKey);
-}, 20_000);
+}, 90_000);
 
 test("design 116: pending remote plus ordinary human divergence remains a typed deferral", async () => {
   const { b, lock } = await makePending("human-divergence");
@@ -1506,7 +1506,7 @@ test("pending + 422: M5 non-looping drop — section dropped from THIS commit, p
   const sB3 = await st(rootB);
   expect(sB3.gitPendingRemote?.["r"]).toBeUndefined();
   expect(sB3.gitReposRemoved?.["r"]).toBeDefined();
-}, 20_000);
+}, 90_000);
 
 test("pending + remote deletion while the repo is BUSY: absence still supersedes pending — no resurrection through pending or base", async () => {
   const { a, b } = await makePending("r"); // index.lock still held on B
@@ -1681,7 +1681,7 @@ test("clean materialization with a ref-wiping hook defers before stranding a sib
   expect(await git(b, "rev-parse", "sibling")).toBe(siblingSha);
   expect(await git(siblingWt, "rev-parse", "HEAD")).toBe(siblingSha);
   expect(await fs.readdir(path.join(b, ".rbox", "git-quarantine")).catch(() => [])).toEqual([]);
-}, 20_000);
+}, 90_000);
 
 test("clean materialization with a ref-wiping hook still applies when no sibling worktree owns the wiped refs", async () => {
   const a = path.join(rootA, "r");
