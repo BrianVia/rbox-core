@@ -1,8 +1,8 @@
 # 159 — Typeahead directory picker for "Which directory should rbox sync?"
 
-Status: DRAFT v2 (folded review round 1 — rulings in Decisions; r1 at
-`.claude/review-159-r1.md`). Origin: validation item #8, founder-greenlit
-design pass 2026-07-18.
+Status: DRAFT v3 (folded review rounds 1–2 — rulings in Decisions; reviews at
+`.claude/review-159-r1.md`, `-r2.md`). Origin: validation item #8,
+founder-greenlit design pass 2026-07-18.
 
 ## Problem (field evidence)
 
@@ -24,16 +24,29 @@ forces the legacy plain-input path (r1 f10).
 
 ### Canonical state model (r1 f7 accepted — no mutable anchor)
 
-- ONE piece of state: the **visible input string**. It is always resolved
-  against an immutable base = `opts.default ?? cwd` (r1 f10), with `~` and
-  absolute forms via `expandUserPath`.
-- Derived, never stored: `resolved = resolve(base, input)`;
-  `listDir = input ends with "/" ? resolved : dirname(resolved)`;
-  `filterTerm = input ends with "/" ? "" : basename(input)`.
-- Tab = rewrite the visible input to the highlighted child's path + `/`.
+- State: the **visible input string** plus a **highlight index** that resets
+  to row 1 on every edit (r2 f2). The resolution base is always the immutable
+  `opts.cwd` (r2 f5 — `opts.default` keeps today's meaning: the bare-Enter
+  answer, resolved against cwd exactly as now; it is NOT a resolution base).
+  `~` and absolute forms via `expandUserPath`.
+- Derived, never stored: `resolved = resolve(cwd, input)`;
+  **boundary = `input === "" || input.endsWith("/")`** (r2 f1 — empty input
+  is a boundary, so the initial listing shows `resolve(cwd, default ?? ".")`,
+  not its parent); `listDir = boundary ? (input === "" ?
+  resolve(cwd, default ?? ".") : resolved) : dirname(resolved)`;
+  `filterTerm = boundary ? "" : basename(input)`. Initial-state test must pin
+  BOTH the displayed directory and the bare-Enter answer = default.
+- **Key split (r2 f2, the round-2 BLOCKER):** Enter acts on the HIGHLIGHTED
+  row — which resets to the pinned use-input row after every edit, so
+  type-literal-then-Enter always answers the literal (typo-no-phantom
+  contract). Arrow keys move the highlight for Enter selection. **Tab ignores
+  the highlight** and completes the visible input to the BEST-RANKED CHILD's
+  path + `/` (no-op when no child matches). So `pro` + Tab → `project/`,
+  while `pro` + Enter → `use "<cwd>/pro"`. Both contracts hold by
+  construction; the type-Tab-Enter flow proves the Tab side.
   Backspace is just string editing — deleting past a `/` naturally re-lists
-  the parent because `listDir` is derived. Trailing/repeated slashes,
-  `..`, absolute, and `~/` all fall out of resolve(); state-transition tests
+  the parent because `listDir` is derived. Trailing/repeated slashes, `..`,
+  absolute, and `~/` all fall out of resolve(); state-transition tests
   required for each.
 
 ### Candidate rows (r1 f1+f3 accepted — free-form input is always accepted)
@@ -49,20 +62,29 @@ forces the legacy plain-input path (r1 f10).
 2. **`use this directory (<listDir>)`** — when filterTerm is empty.
 3. Child directories of `listDir`, filtered + ranked (below). `.git`,
    `node_modules`, `.rbox` are hidden from suggestions but reachable via
-   row 1 by typing them. Symlinks-to-directories are listed (lstat dirent +
-   the same acceptance rule as today's downstream behavior; never followed
-   for listing).
-- Bare Enter with empty input answers `base` — today's fast path exactly.
-- Enter otherwise answers the highlighted row. Because filtering is
-  synchronous over a cached listing (below), there is no loading window for
-  Enter to race (r1 f4).
+   row 1 by typing them. **Symlink policy (r2 f4):** a dirent that is a
+   symlink gets ONE follow-`stat` to classify; symlinks-to-directories are
+   listed as children (matching the downstream `stat`-based acceptance in
+   setup-cmd.ts:713-718); descent through one simply resolves through it.
+   Broken symlinks are omitted from suggestions (row 1 still reaches them).
+   The symlink test pins this policy.
+- Bare Enter with empty input answers `opts.default ?? cwd` resolved against
+  cwd — today's fast path exactly.
+- Enter otherwise answers the highlighted row. **Listing policy (r2 f3):**
+  cache miss uses BLOCKING `readdirSync` — there is no asynchronous source
+  anywhere in the prompt, so no loading window, no generation/abort state,
+  and the rig's literal-then-Enter keystroke pattern cannot race. Tradeoff
+  accepted and stated: first descent into a very large directory briefly
+  blocks the render (same order of cost the eventual scan pays anyway);
+  subsequent keystrokes filter the cached listing synchronously.
 
 ### Listing + performance (r1 f6 accepted)
 
-- ONE `readdir(listDir, { withFileTypes: true })` per distinct `listDir`,
-  cached for the prompt's lifetime; keystrokes filter the cache
-  synchronously. Cache invalidates only when `listDir` changes (documented
-  tradeoff: directories created mid-prompt appear only after re-anchor).
+- ONE blocking `readdirSync(listDir, { withFileTypes: true })` per distinct
+  `listDir` (+ one follow-`stat` per symlink dirent), cached for the prompt's
+  lifetime; keystrokes filter the cache synchronously. Cache invalidates only
+  when `listDir` changes (documented tradeoff: directories created mid-prompt
+  appear only after re-anchor).
 - Perf test fixture: many files + few directories (the 112k-entry home-dir
   shape) with rapid typing and repeated descent; interaction latency after
   the initial listing must be allocation-light and synchronous.
@@ -134,16 +156,22 @@ create-confirm, and a filtered-name literal (`node_modules`).
 - No file selection; no MRU/persistence.
 - No change to caller-side create/validation semantics.
 
-## Decisions (r1 rulings)
+## Decisions (r1 + r2 rulings)
 
-f1 ACCEPT — free-form answers preserved via pinned `use "<input>"` row;
-existence claim retracted. f2 ACCEPT — custom @inquirer/core prompt; state
-machine specified. f3 ACCEPT — folded into row-1 rule (+symlink listing).
-f4 ACCEPT — collapsed by synchronous cached filtering. f5 ACCEPT — rig
-drives the real picker; no global escape; flow audit enumerated. f6 ACCEPT —
-one readdir per listDir + sync filter + perf fixture. f7 ACCEPT — single
-visible-input state, derived listDir, immutable base. f8 ACCEPT —
-recoverable error rows. f9 ACCEPT — total comparator with span score.
-f10 ACCEPT — base = default ?? cwd; opts.input forces plain; byte-identical
-scoped. f11 ACCEPT — caller copy authoritative; hint separate. f12 ACCEPT —
-flow citations corrected.
+R1: f1 free-form answers via pinned `use "<input>"` row, existence claim
+retracted; f2 custom @inquirer/core prompt (r2 verified: @inquirer/core
+11.2.1 in-tree, exports createPrompt/useKeypress/isTabKey); f3 folded into
+row-1 rule; f4 collapsed (now fully, via readdirSync); f5 rig drives the real
+picker, flow audit enumerated; f6 one listing per listDir + sync filter +
+perf fixture; f7 single input state + derived listDir; f8 recoverable error
+rows; f9 total comparator with span score; f10 revised by r2 f5; f11 caller
+copy authoritative; f12 flow citations corrected.
+R2, all 5 accepted: f1 empty input is a boundary (initial listing = the
+default's directory, pinned by an initial-state test); f2 (BLOCKER)
+Enter/Tab split — highlight resets to row 1 on edit, Enter takes highlight,
+Tab always completes the best-ranked CHILD; f3 blocking readdirSync on cache
+miss — zero async, zero loading window, brief-block tradeoff stated; f4
+symlinks classified via one follow-stat, listed when target is a directory,
+broken ones suggestion-omitted; f5 resolution base is ALWAYS opts.cwd and
+opts.default stays the bare-Enter answer (today's exported contract
+unchanged).
