@@ -2,7 +2,7 @@
 
 Research-only source audit. This report records the current JSON-state reset protocol so design 138's crash-window table can be re-derived for design 163's SQLite state plane. It proposes no replacement design.
 
-Source snapshot: branch `163-v2`, commit `614060d`. Current line references below are deliberately separate from design 138's historical line references embedded in its normative text.
+Source snapshot: branch `163-v2`, current `HEAD` `9ad516b` (the reset implementation is unchanged from parent `614060d`). Current line references below are deliberately separate from design 138's historical line references embedded in its normative text.
 
 ## 1. Design 138 normative corpus — verbatim
 
@@ -230,6 +230,8 @@ retirement/cleanup; anything else → halt.
 | Active retirement order `D1..Dm` | `src/cli/reset-journal.ts:401-407` | Distinct `commonDirReal` lexical order; refs inside a group sorted by `activeRef` |
 | Fresh journal handoff | `src/cli/config.ts:1240-1246`, then `:1252-1255` | Preparation calls `beginResetJournal` while the complete fence/state lock is held; after that scope releases, the standing journal is detected and `recoverResetJournal` reacquires the recovery fence/state lock at `src/cli/reset-journal.ts:514-529` |
 
+The relevant directory identities are distinct: active destination parent is `<root>/.rbox` (`src/cli/reset-journal.ts:134,466`); candidate source parent is `<root>/.rbox/state/reset-candidates` (`:131,467`); journal and marker parent is `<root>/.rbox/state` (`:130,133`); and archive parent is `<root>/.rbox/state/lineages/<old-nonce>` (`:132`). Thus the active-parent fsync at `:469` and candidate-parent fsync at `:472` close different directory entries.
+
 ### 2.2 Durability primitives actually used
 
 | Primitive | Current implementation | File-byte discipline | Directory discipline |
@@ -260,7 +262,7 @@ Notation in the signature column is the executable classifier's notation from `s
 | 8 | Force-remove candidate at `src/cli/reset-journal.ts:471`; this runs for R0, R1, and R2. | Candidate directory entry. | Unlink only; not durably closed until step 9. | Live R1; before source-parent fsync, a crash may still recover as R2. |
 | 9 | Fsync candidate/source parent at `src/cli/reset-journal.ts:472-474`. The R2 path therefore fsyncs destination, unlinks the redundant candidate, then fsyncs source, without renaming over active. | Candidate-parent directory metadata. | Source-directory fsync paired with step 7's destination-directory fsync. | **R1 only** = `ready,N,absent,O,Mpre,Rn,A0`. This is the closed active-install boundary. |
 | 10 | Reinspect and require R1 at `src/cli/reset-journal.ts:475-478`; publish journal phase `installed` at `:479`; reinspection at `:480-481`. | Journal phase. | Durable journal overwrite. | **I0/I1 observational alias** = `installed,N,absent,O,Mpre,Rn,A0`. Current code has no distinct durable state-check write between these IDs; the classifier returns both at `src/cli/reset-journal-classifier.ts:62-64`. |
-| 11 | If marker is not already `next`, publish next incarnation tuple at `src/cli/reset-journal.ts:484-488` (write at `:486`). | Incarnation marker `MN`. | `durableWrite`: staged marker fsync, rename, marker-parent fsync, created-ancestor publication. | **I2** = `installed,N,absent,O,MN,Rn,A0`. |
+| 11 | If marker is not already `next`, publish next incarnation tuple at `src/cli/reset-journal.ts:484-488` (write at `:486`). | Incarnation marker `MN`. | `durableWrite`: staged marker fsync, rename, marker-parent fsync, created-ancestor publication. | Clean I0/I1 → marker-write path produces **I2** = `installed,N,absent,O,MN,Rn,A0`. On resume, an already-next marker can mean I2 or I3.g (`src/cli/reset-journal-classifier.ts:64-66`); then this write is skipped and the existing signature/group count is preserved before retirement resumes at `reset-journal.ts:489-491`. |
 | 12 | Reinspect, then retire active Z-ref groups `D1..Dm` at `src/cli/reset-journal.ts:489-497`, using group loop/transaction at `:401-420`. Every group's refs are validated as uniformly present/absent; a present group is deleted in one transaction. | All active settled-absence refs in one common-directory group. | One Git `update-ref --stdin` transaction per group; no explicit reset-code fsync. | After `Dg`: **I3.g** = `installed,N,absent,O,MN,Rn,Ag`, for `1 ≤ g ≤ m`. For `m=0`, the physical row remains I2. |
 | 13 | Reinspect and require all groups retired at `src/cli/reset-journal.ts:492-497`; publish phase `z-retired` at `:498`. | Journal phase. | Durable journal overwrite. | **Z0** = `z-retired,N,absent,O,MN,Rn,Am`. |
 | 14 | Reinspect and require Z0 at `src/cli/reset-journal.ts:501-503`; unlink journal at `:504`; fsync journal parent at `:505`. | Live-journal directory entry. | Unlink followed by parent-directory fsync. | After the parent fsync there is **no standing-journal classification**; `inspectResetJournal` returns `none`. |
@@ -277,20 +279,20 @@ Notation in the signature column is the executable classifier's notation from `s
 
 ## 3. State reads and reset classification
 
-### 3.1 Every physical coordinate read by the correlated classifier
+### 3.1 Every authorization gate, observation prerequisite, and physical row coordinate read by the correlated classifier
 
-`observePhysical` is the single composition point at `src/cli/reset-journal.ts:324-340`. `inspectResetJournal` supplies the journal/config gate and calls the executable row table at `:353-374`.
+`observePhysical` is the single composition point for `ResetPhysicalObservation` at `src/cli/reset-journal.ts:324-340`. `inspectResetJournal` supplies the journal/stream authorization gates and calls the executable row table at `:353-374`. Journal schema/authorization and caller stream are gates, not row axes; repository incarnation is an observation prerequisite that can halt before a row is produced.
 
 | Observed coordinate | Exact current read site | Classification/result |
 |---|---|---|
 | Standing journal bytes | `src/cli/reset-journal.ts:353-360`; unreadable fallback identity hash at `:356-358` | Missing → `none`; unreadable → halt; otherwise bytes are hashed and parsed. |
 | Journal schema/version/durable authorization | Parse at `src/cli/reset-journal.ts:363-365`; v2 validation at `:194-204` | Malformed → halt; v1 → halt; v2 requires embedded `authorizedNextStream === next.stream`. |
-| Caller/durable-config stream | Gate at `src/cli/reset-journal.ts:366-368` | Must equal journal old or next stream; otherwise halt before physical observation. |
+| Caller-supplied runtime stream (authorization gate, not a physical row axis) | Argument at `src/cli/reset-journal.ts:353`; gate at `:366-368` | Must equal journal old or next stream; otherwise halt before physical observation. `inspectResetJournal` does not establish that the argument came byte-for-byte from durable config. |
 | Active state | Path at `src/cli/reset-journal.ts:324-329`; streaming hash at `:330-332`; mapping at `:298-303` | `absent`, `old`, `next`, or `other`. |
 | Candidate | Streaming hash at `src/cli/reset-journal.ts:330-332`; mapping at `:304-306` | `absent`, `next`, or `other`. |
 | Old-lineage archive | Streaming hash at `src/cli/reset-journal.ts:330-332`; mapping at `:307-309` | `absent`, `old`, or `other`, correlated with authenticated `archiveBaseline`. |
 | Incarnation marker | `markerDisposition` bounded read/parse at `src/cli/reset-journal.ts:311-321`, invoked at `:330-332` | Exact semantic old tuple, exact semantic next tuple, absent, or other. |
-| Repository incarnation for every Z entry | `verifyIdentity` at `src/cli/reset-journal.ts:252-255`, invoked from `observeRefs` at `:265-267` | Current identity hash must equal the journal-recorded identity; failure halts inspection. |
+| Repository incarnation for every Z entry (observation prerequisite, not a physical row axis) | `verifyIdentity` at `src/cli/reset-journal.ts:252-255`, invoked from `observeRefs` at `:265-267` | Current identity hash must equal the journal-recorded identity; failure is caught as a physical-inspection halt at `:369-371`. |
 | Recovery ref for every ordered Z entry | `readRef` at `src/cli/reset-journal.ts:243-250`; loop at `:263-270`; prefix reducer at `:257-261` | Exact-target presence vector becomes a global prefix count or `other`. |
 | Active refs by sorted common-directory group | Group construction/read/reduction at `src/cli/reset-journal.ts:271-284` | Each group must be uniform; retired-group vector becomes a prefix count or `other`. |
 | Correlated row | `src/cli/reset-journal.ts:372-374` calls `src/cli/reset-journal-classifier.ts:43-72` | No complete row → halt; exact row → recoverable. |
@@ -301,8 +303,11 @@ The bounded file readers backing these observations are identity-stable, no-foll
 
 | Use | Exact read sites | Purpose |
 |---|---|---|
-| P0/P0A initiation preflight | Parallel active/candidate/archive/marker/ref reads at `src/cli/reset-journal.ts:561-564`; invariant at `:565-570`; ref rescan after normalization at `:581-584` | Establish a normalized initiation state before the journal exists. |
-| Quarantine restore precondition | Bundled journal bytes at `src/cli/reset-quarantine.ts:332-334`; parser/observation adapter at `src/cli/reset-journal.ts:344-350`; marker/ref comparison at `src/cli/reset-quarantine.ts:335-338` | Re-observe the physical marker/ref plane before republishing a quarantined journal. |
+| P0/P0A initiation preflight | Parallel active/candidate/archive/marker/`observeRefs` reads at `src/cli/reset-journal.ts:561-564`, plus the distinct exact-recovery-ref scan implemented at `:287-295` and invoked in that same `Promise.all`; invariant at `:565-570`; ref rescan after normalization at `:581-584` | Establish a normalized initiation state before the journal exists. `exactRecoveryRefs` separately records which exact refs must be CAS-deleted. |
+| Reset-initiation marker normalization | Call at `src/cli/config.ts:1182`; bounded marker read and exact schema/old-lineage tuple comparison at `:858-868` | Refuse a stale/foreign marker before journal publication; exact-old or absence can proceed to P0/P0A initiation. |
+| Quarantine restore active-state disposition | `src/cli/reset-quarantine.ts:316-328` | Classifies active hash as original precondition, already recovered target, or advanced/refusal before any restore publication. |
+| Quarantine restore marker/ref precondition | Bundled journal bytes at `src/cli/reset-quarantine.ts:332-334`; parser/observation adapter at `src/cli/reset-journal.ts:344-350`; marker/ref comparison at `src/cli/reset-quarantine.ts:335-338` | Re-observes the physical marker/ref plane before republishing a quarantined journal. |
+| Quarantine restore standing-journal disposition | `src/cli/reset-quarantine.ts:340-348` | Classifies journal destination as exact already-restored, absent/eligible, or different/refusal. |
 
 ### 3.3 Production entry points that classify a standing journal
 
@@ -324,7 +329,7 @@ The bounded file readers backing these observations are identity-stable, no-foll
 
 `readResetJournal` at `src/cli/reset-journal.ts:221-224` reads and parses only; it does not correlate physical axes. Reset health reads (`src/cli/status-cmd.ts:324`, `src/cli/daemon/daemon.ts:776`) are lifecycle/advisory reads, not classifier authority.
 
-`inspectResetJournal` does not load workspace config itself: the stream axis is its `callerStream` argument at `src/cli/reset-journal.ts:353,366-374`. Each production surface is responsible for deriving that value from its durable/boot config before calling the adapter or recovery path.
+`inspectResetJournal` does not load workspace config itself: the stream gate is its `callerStream` argument at `src/cli/reset-journal.ts:353,366-374`. Each production surface derives that runtime value. For example, status merges credential remote URL into raw config before calling at `src/cli/status-cmd.ts:309-312,323`; the daemon passes its boot config at `src/cli/daemon/daemon.ts:775,792`, whose authenticated remote construction can override `remoteUrl` at `src/cli/e2ee-client.ts:303-304,317,325-335`. This is narrower than independently proving that the argument is the byte-for-byte durable config stream.
 
 ### 3.4 Complete production `loadState` call inventory
 
@@ -361,6 +366,21 @@ Every call below can enter journal recovery through `src/cli/config.ts:731-745`.
 
 Reset-specific raw reads inside `resetSyncState` are therefore: initial unfenced state at `src/cli/config.ts:1099`; post-standing-recovery state for repository inventory at `:1133`; complete-fence state at `:1158`; and barrier state immediately before mutation/journal preparation at `:1173`. The final byte-exact state reads are at `src/cli/config.ts:1064-1071` and `:1241-1244`.
 
+### 3.6 Ordered state/config/journal read gates inside `resetSyncState`
+
+| Order | Exact current read site | Classification/gate supplied |
+|---:|---|---|
+| 1 | Initial raw state and config at `src/cli/config.ts:1099-1101` | Derives the unfenced old stream/nonce/revision for side-effect-free witness validation. |
+| 2 | Initial pure witness inspection/comparison at `src/cli/config.ts:1102-1113` | Requires the witness's old tuple and next stream to match the initial state/config view. |
+| 3 | Standing-journal probe at `src/cli/config.ts:1125-1131`, especially `readResetJournal` at `:1128` | If present, routes through independent journal authorization/classification/recovery before fresh preparation. |
+| 4 | Post-recovery raw state at `src/cli/config.ts:1133-1139` | Supplies repository descriptors used to choose the complete repository fence. |
+| 5 | Under-fence raw state and fresh config at `src/cli/config.ts:1158-1169` | Re-derives old stream and requires exact equality with the confirmed old lineage. |
+| 6 | Barrier raw state and config at `src/cli/config.ts:1172-1180` | Rechecks stream/nonce/revision after the injected barrier and immediately before consent consumption/preparation. |
+| 7 | Marker normalization read at `src/cli/config.ts:1182`, implemented at `:858-868` | Requires marker absence or exact semantic agreement with the fenced old state. |
+| 8 | Final active-state byte read/parse after protocol-artifact preparation at `src/cli/config.ts:1061-1071` | Requires active state still present with the same stream/nonce; supplies exact bytes and Z inventory to the finish callback. |
+| 9 | Byte-exact active-state revalidation immediately before `beginResetJournal` at `src/cli/config.ts:1240-1245` | Requires bytes unchanged and state-lock ownership still held before prepared publication. |
+| 10 | Post-publication journal probe at `src/cli/config.ts:1252-1255` | Detects the new standing journal and enters classifier-gated recovery. |
+
 ## 4. Consent witness threading: design 137/138 seam
 
 ### 4.1 End-to-end threading table
@@ -371,12 +391,14 @@ Reset-specific raw reads inside `resetSyncState` are therefore: initial unfenced
 | Existing-workspace prior-lineage observation | `src/cli/setup-cmd.ts:663-668` | Reads config/raw state and derives old stream, nonce, revision, plus fully known destination coordinates. |
 | Existing-workspace consequence confirmation and mint | Prompt at `src/cli/setup-cmd.ts:672-680`; mint/pass coordinates at `:681-689`; implementation at `src/cli/reset-consent.ts:118-140` | Binds root, old stream/nonce/revision, remote URL, workspace id, project id, and therefore the complete next stream. |
 | Existing-workspace handoff to init | `src/cli/setup-cmd.ts:691-698` | Passes witness as `resetConsent` into init. |
+| Standard existing-workspace `runInit` bridge | Witness preflight at `src/cli/init-cmd.ts:173`; forwarding into `executeInitPlan` at `:174-180` | Preserves `resetConsent` from setup's ordinary existing-workspace path into the common init executor. |
 | Create-new prior-lineage observation | `src/cli/setup-cmd.ts:734-745` | Reads config/raw state before remote creation. |
 | Create-new consequence confirmation and Stage-A mint | Prompt at `src/cli/setup-cmd.ts:749-760`; mint at `:761-768`; implementation at `src/cli/reset-consent.ts:143-159` | Binds root, old stream/nonce/revision and remote/project intent; workspace id/next stream do not yet exist. |
-| Refusal-before-POST seam | `src/cli/setup-cmd.ts:802-809` calls `preflightInitRebind`; pure preflight is `src/cli/init-cmd.ts:189-220`, witness inspection at `:203`, full tuple/intent comparison at `:206-219` | Direct/scripted or substituted rebind is refused before remote create, mutex acquisition, or local reset writes. |
+| Refusal-before-POST seam | `src/cli/setup-cmd.ts:802-809` calls `preflightInitRebind`; pure preflight is `src/cli/init-cmd.ts:189-220`, witness inspection call at `:203`, inspection implementation at `src/cli/reset-consent.ts:196-205`, and full tuple/intent comparison at `src/cli/init-cmd.ts:206-219` | Direct/scripted or substituted rebind is refused before remote create or local reset writes. In setup create-new, the workspace mutex was already acquired at `src/cli/setup-cmd.ts:771-773`. |
 | Create-new Stage-B narrowing | Setup call at `src/cli/setup-cmd.ts:817-824`; helper at `src/cli/reset-consent.ts:167-193` | Helper checks remote/project before POST callback at `:172-184`; the id returned by that callback stamps the same witness at `:190-193`; double narrowing is refused at `:178-181`. |
 | Design-137 structured continuation handoff | Setup passes `{workspaceId, syncMutex, resetConsent}` at `src/cli/setup-cmd.ts:836-844`; continuation type at `src/cli/init-cmd.ts:233-237` | Created workspace id and held workspace mutex cross the existing 137 continuation seam together with the narrowed 138 witness. |
 | Continuation adoption/recheck/forwarding | `src/cli/init-cmd.ts:260-294`; plan/root/mutex checks and witness preflight at `:269-278`; forwarding at `:279-290`; release at `:292-294` | Preserves all three values through init and transfers mutex ownership exactly once. |
+| Actual precreated resource extraction | `adoptPrecreatedWorkspaceResources` at `src/cli/init-cmd.ts:245-253`; called from `executeInitPlan` at `:333-335` | Extracts the precreated `workspaceId` and already-held `syncMutex` from the same continuation that carries `resetConsent`; marks mutex ownership as transferred rather than reacquired. |
 | Generic non-continuation create path | `src/cli/init-cmd.ts:335-342` | Also narrows through `createWorkspaceWithConsent` and retains the same witness. |
 | Reset decision and primitive call | `src/cli/init-cmd.ts:368-380` | Passes `opts.resetConsent` to `resetSyncState(root,nextStream,syncMutex,...)`. |
 | Initial side-effect-free witness inspection | `src/cli/config.ts:1097-1113`, especially `:1105-1110`; implementation `src/cli/reset-consent.ts:208-221` | Checks root, observed old stream/nonce/revision, narrowed next stream, validity/expiry/non-consumption before locking/preparation. |
