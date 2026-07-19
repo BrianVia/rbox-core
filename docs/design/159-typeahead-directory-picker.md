@@ -1,7 +1,7 @@
 # 159 — Typeahead directory picker for "Which directory should rbox sync?"
 
-Status: DRAFT v3 (folded review rounds 1–2 — rulings in Decisions; reviews at
-`.claude/review-159-r1.md`, `-r2.md`). Origin: validation item #8,
+Status: DRAFT v4 (folded review rounds 1–3 — rulings in Decisions; reviews at
+`.claude/review-159-r1.md`, `-r2.md`, `-r3.md`). Origin: validation item #8,
 founder-greenlit design pass 2026-07-18.
 
 ## Problem (field evidence)
@@ -36,6 +36,12 @@ forces the legacy plain-input path (r1 f10).
   resolve(cwd, default ?? ".") : resolved) : dirname(resolved)`;
   `filterTerm = boundary ? "" : basename(input)`. Initial-state test must pin
   BOTH the displayed directory and the bare-Enter answer = default.
+  **Normalization (r3 f3):** submissions AND the default run today's exact
+  pipeline — trim → `expandUserPath` → `resolve(cwd, ·)` (prompt.ts:94-101).
+  The initial `listDir` applies that pipeline to `default ?? ""` (the EMPTY
+  raw answer, not cwd, in the no-default case). A `~` default therefore lists
+  the home directory, whitespace defaults are trimmed, and an unsupported
+  `~user` default triggers the same retry as today. All three pinned.
 - **Key split (r2 f2, the round-2 BLOCKER):** Enter acts on the HIGHLIGHTED
   row — which resets to the pinned use-input row after every edit, so
   type-literal-then-Enter always answers the literal (typo-no-phantom
@@ -44,6 +50,14 @@ forces the legacy plain-input path (r1 f10).
   path + `/` (no-op when no child matches). So `pro` + Tab → `project/`,
   while `pro` + Enter → `use "<cwd>/pro"`. Both contracts hold by
   construction; the type-Tab-Enter flow proves the Tab side.
+  **Rewrite construction (r3 f2):** for non-empty input, Tab replaces ONLY
+  the textual basename — the user's spelling prefix (`~/`, `../`, absolute,
+  repeated slashes) is preserved verbatim, so the rewritten string always
+  re-derives the completed child under resolve(cwd, ·). For empty-input
+  completion, the child is written relative when the listed directory is
+  cwd, ABSOLUTE otherwise (default outside cwd must not silently re-derive
+  under cwd). Every named transition test states its expected visible
+  string.
   Backspace is just string editing — deleting past a `/` naturally re-lists
   the parent because `listDir` is derived. Trailing/repeated slashes, `..`,
   absolute, and `~/` all fall out of resolve(); state-transition tests
@@ -82,9 +96,10 @@ forces the legacy plain-input path (r1 f10).
 
 - ONE blocking `readdirSync(listDir, { withFileTypes: true })` per distinct
   `listDir` (+ one follow-`stat` per symlink dirent), cached for the prompt's
-  lifetime; keystrokes filter the cache synchronously. Cache invalidates only
-  when `listDir` changes (documented tradeoff: directories created mid-prompt
-  appear only after re-anchor).
+  lifetime; keystrokes filter the cache synchronously. **Lifetime
+  memoization (r3 f4):** an A → B → A revisit reuses A's cached listing —
+  filesystem changes made mid-prompt never appear until the prompt restarts
+  (documented tradeoff, prose and the A→B→A one-read test agree).
 - Perf test fixture: many files + few directories (the 112k-entry home-dir
   shape) with rapid typing and repeated descent; interaction latency after
   the initial listing must be allocation-light and synchronous.
@@ -94,7 +109,11 @@ forces the legacy plain-input path (r1 f10).
 The lister classifies `EACCES`/`ENOENT`/`ENOTDIR` into a recoverable state:
 a dim non-selectable notice row (`can't read <dir>: permission denied`) with
 row 1 still selectable and editing still live — never a stuck loading state.
-`~user` (UnsupportedPathError) renders the same way. The final answer is
+**Invalid expansion is a SEPARATE transition (r3 f1):** `~user`
+(UnsupportedPathError) has no resolved value, so there is NO use-input row —
+the notice row explains the unsupported form, Enter stays in the editor (no
+answer possible), and editing remains live; pinned by a real-picker test
+(matches today's catch-and-reprompt, prompt.ts:94-101). The final answer is
 revalidated at submit time only by the CALLER, as today.
 
 ### Ranking — total comparator (r1 f9 accepted)
@@ -175,3 +194,10 @@ symlinks classified via one follow-stat, listed when target is a directory,
 broken ones suggestion-omitted; f5 resolution base is ALWAYS opts.cwd and
 opts.default stays the bare-Enter answer (today's exported contract
 unchanged).
+R3, all 4 accepted: f1 `~user` is a distinct no-answer editor state (no
+use-input row, Enter inert); f2 Tab rewrite = basename-only replacement
+preserving the spelling prefix, absolute form for empty-input completion
+outside cwd, transition tests state visible strings; f3 canonical
+trim→tilde→resolve pipeline for submissions and defaults, empty raw answer
+in the no-default case; f4 lifetime memoization chosen — A→B→A reuses the
+cache, mid-prompt fs changes invisible.
