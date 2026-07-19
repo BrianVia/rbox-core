@@ -1,6 +1,6 @@
 # 159 — Typeahead directory picker for "Which directory should rbox sync?"
 
-Status: DRAFT v4 (folded review rounds 1–3 — rulings in Decisions; reviews at
+Status: DRAFT v5 (folded review rounds 1–4 — rulings in Decisions; reviews at
 `.claude/review-159-r1.md`, `-r2.md`, `-r3.md`). Origin: validation item #8,
 founder-greenlit design pass 2026-07-18.
 
@@ -25,7 +25,16 @@ forces the legacy plain-input path (r1 f10).
 ### Canonical state model (r1 f7 accepted — no mutable anchor)
 
 - State: the **visible input string** plus a **highlight index** that resets
-  to row 1 on every edit (r2 f2). The resolution base is always the immutable
+  to row 1 on every edit (r2 f2). **Normalized projection (r4 f1):** ALL
+  derivation — resolution, row labels, error classification, listing and
+  filter — runs on ONE normalized projection of the visible string: trim →
+  `expandUserPath` → resolve semantics, identical to submission. The raw
+  visible spelling is retained ONLY for Tab's basename-preserving rewrite.
+  So `" foo "` labels row 1 `use "<cwd>/foo"` and filters on `foo`, and
+  `" ~user"` classifies as the no-answer UnsupportedPathError state exactly
+  as its trimmed submission would — the highlighted row and the submitted
+  answer can never differ. Whitespace-edged transitions (including
+  whitespace before `~user`) are pinned by tests. The resolution base is always the immutable
   `opts.cwd` (r2 f5 — `opts.default` keeps today's meaning: the bare-Enter
   answer, resolved against cwd exactly as now; it is NOT a resolution base).
   `~` and absolute forms via `expandUserPath`.
@@ -201,3 +210,6 @@ outside cwd, transition tests state visible strings; f3 canonical
 trim→tilde→resolve pipeline for submissions and defaults, empty raw answer
 in the no-default case; f4 lifetime memoization chosen — A→B→A reuses the
 cache, mid-prompt fs changes invisible.
+R4, 1 accepted: f1 single normalized projection (trim→tilde→resolve) drives
+ALL derivation; raw spelling only for Tab rewrites; whitespace transitions
+pinned.
