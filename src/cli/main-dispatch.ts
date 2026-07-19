@@ -14,21 +14,21 @@ import { fail, setJsonErrorMode, style } from "./style.js";
 import { spinner } from "./spinner.js";
 import { resolveAlias } from "./deprecations.js";
 import { isKnownTopLevel } from "./command-catalog.js";
-import { commandSupportsFlag, helpFor, helpKeyFor, renderCommand, renderGroupedHelp } from "./help-registry.js";
+import { commandSupportsFlag, helpFor, helpKeyFor, renderCommand, renderEssentialHelp, renderGroupedHelp } from "./help-registry.js";
 import { recoveryKitOptionsFromFlags } from "./recovery-kit.js";
 import { maybeNudgeForUpdate } from "./update-check.js";
 import { parseFlags, unknownFlagError } from "./flags.js";
 import { withWorkspaceSyncMutex } from "./sync-mutex.js";
 import { refreshSystemLockIdentityLedger } from "../engine/git/lockfile.js";
 
-/** Print per-command help (or the grouped screen) and nothing else. Stdout, exit 0. */
-function printHelp(cmd: string | undefined, positional: string[]): void {
+/** Print per-command, essential, or full-reference help and nothing else. Stdout, exit 0. */
+function printHelp(cmd: string | undefined, positional: string[], fullReference = false): void {
   if (!cmd) {
-    console.log(renderGroupedHelp());
+    console.log(fullReference ? renderGroupedHelp() : renderEssentialHelp());
     return;
   }
   const entries = helpFor(helpKeyFor(cmd, positional));
-  console.log(entries ? entries.map(renderCommand).join("\n\n") : renderGroupedHelp());
+  console.log(entries ? entries.map(renderCommand).join("\n\n") : renderEssentialHelp());
 }
 
 // `rbox deps <sub>` group dispatch — commented out (design 51): the whole `deps`
@@ -127,7 +127,8 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
   // alias's `--help` shows its own "deprecated → …" block):
   //   `rbox help [<cmd>]`, `rbox --help`/`-h`, and `rbox <cmd> --help`/`-h`.
   if (cmd === "help" || cmd === "--help" || cmd === "-h") {
-    printHelp(positional[0], positional.slice(1));
+    const fullReference = cmd === "help" && positional.length === 0 && flags.all === "true";
+    printHelp(positional[0], positional.slice(1), fullReference);
     return;
   }
   if (cmd && (rest.includes("--help") || rest.includes("-h"))) {
@@ -563,13 +564,13 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
     default:
       // Bare `rbox` in a terminal → status/actions when already inside a workspace,
       // otherwise the guided `setup` front door (design 29).
-      // Non-interactive bare `rbox`, or an unknown command → the grouped help
+      // Non-interactive bare `rbox`, or an unknown command → the essential help
       // screen (never hangs). An unknown command also exits non-zero.
       if (!cmd && process.stdin.isTTY) {
         await runGuidedFrontDoor(deps.frontDoorImport);
         break;
       }
-      console.log(renderGroupedHelp());
+      console.log(renderEssentialHelp());
       if (cmd && !isKnownTopLevel(cmd)) process.exitCode = 1;
   }
 }

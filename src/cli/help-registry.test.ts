@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { COMMAND_HELP, helpFor, helpKeyFor, renderCommand, renderGroupedHelp } from "./help-registry.js";
+import { COMMAND_HELP, helpFor, helpKeyFor, renderCommand, renderEssentialHelp, renderGroupedHelp } from "./help-registry.js";
 import { ALIAS_COMMANDS, KNOWN_TOP_LEVEL, PUBLIC_COMMANDS } from "./command-catalog.js";
 import { resolveAlias } from "./deprecations.js";
 
@@ -95,7 +95,36 @@ test("the registry's alias targets agree with the deprecations resolver (no drif
   }
 });
 
-test("grouped screen renders every public group and omits hidden commands", () => {
+test("essential screen matches the founder-approved top-level help", () => {
+  expect(renderEssentialHelp()).toBe(`rbox — end-to-end encrypted sync for your dev folders
+
+START
+  setup   guided onboarding: account → workspace → syncing
+  status  what's synced, what's running
+
+SYNC
+  start  begin background sync for this workspace
+  stop   stop background sync
+  sync   sync once, right now
+  logs   follow the background-sync log
+
+ADD A MACHINE
+  pair     create a token on a signed-in machine
+  connect  join this machine from a pasted token
+
+IF SOMETHING'S WRONG
+  doctor  check workspace health
+  trash   list/restore files rbox moved aside
+  key     encryption: status, backup, recover
+
+MORE
+  rbox help --all        the full command reference
+  rbox <command> --help  flags and details for one command
+
+Exit codes: 0 ok, 1 error, 130 user cancel (Ctrl-C).`);
+});
+
+test("full-reference screen renders every public group and omits hidden commands", () => {
   const screen = renderGroupedHelp();
   // DEPENDENCIES omitted: the whole `deps` group is commented out (design 51),
   // so that group has zero entries and renderGroupedHelp skips its header.
