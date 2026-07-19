@@ -150,3 +150,41 @@ growth is bounded by pinned checkpoint policy (r1 f8): auto-checkpoint
 pinned explicitly + truncate-on-clean-shutdown; `-wal`/`-shm` lifecycle
 defined alongside. Precedent: browser history/iMessage/Photos run
 years-long constant-churn single-file SQLite at this exact shape.
+
+## v2 keystone: file-swap at reset boundaries, transactions in between (r1 f1+f2)
+
+RULING (2026-07-19, from the RESEARCH-138-BOUNDARIES extraction): design 163
+does NOT replace 138's file-swap mechanics. It keeps them, byte-for-byte in
+protocol terms, and changes only the payload format:
+
+- **Steady state** (normal daemon operation, between 138 commit points):
+  `state.db` is written via WAL transactions — the incremental, row-local
+  writes that remove the per-cycle full serialize. `journal_mode=WAL`,
+  `synchronous=FULL`, pinned and verified at open (r1 f8).
+- **Every 138-relevant boundary** (reset, recovery, adoption, quarantine)
+  uses the existing choreography unchanged: build a CANDIDATE database at a
+  sibling path; close it; checkpoint(TRUNCATE) so no `-wal`/`-shm` remains;
+  fsync file + parent; verify; atomically rename into place under the same
+  journal phases, marker writes, and ref-group retirement order the current
+  implementation performs. The candidate artifact is a .db instead of a
+  .json — the P*/R*/I*/Z0 rows carry over with artifact substitution, plus
+  new rows for the WAL sidecar states (below).
+- **The byte-hash-exact witness SURVIVES**: an at-rest, closed,
+  checkpoint-truncated SQLite file has stable bytes, so 138's exact-old /
+  exact-new classification hashes the file exactly as it hashes JSON today.
+  No logical digest is required on the reset path (r1 f2 resolved by
+  construction; the digest idea is withdrawn).
+- **Reset entry quiesces the WAL first**: close writer, checkpoint(TRUNCATE),
+  verify sidecar absence. A `state.db` accompanied by `-wal`/`-shm` at
+  classification time is NOT at rest: it is a crash-window signature of its
+  own. Two new normative rows (working names W1: wal-present + journal
+  absent → normal daemon takeover, replay by SQLite on open; W2: wal-present
+  + journal present → halt, zero writes, the journal governs) — exact
+  wording lands with the full re-derived table.
+- Quarantine/backup snapshots use `VACUUM INTO` (available, bounded, no
+  O(size) buffer — replaces the withdrawn Database.serialize idea, r1 f2).
+
+NEXT (in order): the full row-by-row re-derived table from
+RESEARCH-138-BOUNDARIES.md; the engine ordered-merge/cursor architecture
+(r1 f3); the migration authority state machine (r1 f4/f5/f6); the
+field-complete schema mapping (r1 f7).
