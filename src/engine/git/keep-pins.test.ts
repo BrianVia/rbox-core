@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -40,6 +40,9 @@ const TEST_GIT_ENV = {
 };
 const runGit = (dir: string, ...args: string[]) => exec("git", ["-C", dir, ...args], { env: TEST_GIT_ENV }).then(({ stdout }) => stdout.toString().trim());
 const KEK = Buffer.alloc(32, 116);
+
+const preparedFifos = async (gitDir: string): Promise<string[]> =>
+  (await fs.readdir(gitDir)).filter((name) => name.startsWith(".rbox-prepared-txn-"));
 
 let tmp: string;
 let repo: string;
@@ -261,7 +264,91 @@ test("§130 prepared transaction fingerprints the reflog under Git's ref lock", 
     },
   )).rejects.toThrow(/fingerprint changed/);
   expect(await runGit(repo, "rev-parse", "refs/heads/main")).toBe(newOid);
+  expect(await preparedFifos(path.join(repo, ".git"))).toEqual([]);
 });
+
+test("prepared transactions cannot deadlock Bun's filesystem workers under parallel repo apply", async () => {
+  if (process.platform === "win32") return;
+  const fixtureRoot = path.join(tmp, "parallel-prepared-transactions");
+  await fs.mkdir(fixtureRoot);
+  const repos = Array.from({ length: 16 }, (_, index) => path.join(fixtureRoot, `repo-${index}`));
+  const expected: string[] = [];
+  for (let index = 0; index < repos.length; index++) {
+    const fixtureRepo = repos[index]!;
+    await fs.mkdir(fixtureRepo);
+    await runGit(fixtureRepo, "init", "-qb", "main");
+    await runGit(fixtureRepo, "commit", "--allow-empty", "-qm", `base-${index}`);
+    expected.push(await runGit(fixtureRepo, "rev-parse", "HEAD"));
+  }
+  const keepPinsUrl = new URL("./keep-pins.ts", import.meta.url).href;
+  const fixture = `
+    import { execFile } from "node:child_process";
+    import fs from "node:fs/promises";
+    import path from "node:path";
+    import { promisify } from "node:util";
+    import { runPreparedUpdateRefTransaction } from ${JSON.stringify(keepPinsUrl)};
+
+    const exec = promisify(execFile);
+    const fixtureJson = process.env.RBOX_PREPARED_TXN_FIXTURE;
+    if (!fixtureJson) throw new Error("missing fixture description");
+    const { repos, expected } = JSON.parse(fixtureJson);
+    const gitEnv = {
+      ...process.env,
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_AUTHOR_NAME: "rbox test",
+      GIT_AUTHOR_EMAIL: "rbox-test@local",
+      GIT_COMMITTER_NAME: "rbox test",
+      GIT_COMMITTER_EMAIL: "rbox-test@local",
+    };
+    const git = (repo, ...args) => exec("git", ["-C", repo, ...args], { env: gitEnv }).then(({ stdout }) => stdout.toString().trim());
+    let callbacks = 0;
+    await Promise.all(repos.map((repo, index) => runPreparedUpdateRefTransaction(
+      repo,
+      ["create refs/heads/incoming " + expected[index]],
+      async () => { callbacks++; },
+    )));
+    const refs = await Promise.all(repos.map((repo) => git(repo, "rev-parse", "refs/heads/incoming")));
+    const leftovers = (await Promise.all(repos.map(async (repo) =>
+      (await fs.readdir(path.join(repo, ".git"))).filter((name) => name.startsWith(".rbox-prepared-txn-"))
+    ))).flat();
+    process.stdout.write(JSON.stringify({ callbacks, exact: refs.every((ref, index) => ref === expected[index]), leftovers }) + "\\n");
+  `;
+  const child = spawn(process.execPath, ["--eval", fixture], {
+    detached: true,
+    env: { ...process.env, RBOX_PREPARED_TXN_FIXTURE: JSON.stringify({ repos, expected }) },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+  child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+  const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (code, signal) => resolve({ code, signal }));
+  });
+  let deadline: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<"timeout">((resolve) => {
+    deadline = setTimeout(() => resolve("timeout"), 10_000);
+  });
+  let outcome: Awaited<typeof exited>;
+  try {
+    const settled = await Promise.race([exited, timedOut]);
+    if (settled === "timeout") {
+      if (child.pid) {
+        try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); }
+      }
+      await exited;
+      throw new Error(`parallel prepared transactions timed out: ${stderr.trim()}`);
+    }
+    outcome = settled;
+  } finally {
+    if (deadline) clearTimeout(deadline);
+  }
+  expect(outcome, stderr).toEqual({ code: 0, signal: null });
+  const result = JSON.parse(stdout.trim().split("\n").at(-1)!) as { callbacks: number; exact: boolean; leftovers: string[] };
+  expect(result).toEqual({ callbacks: 16, exact: true, leftovers: [] });
+}, 30_000);
 
 test("§130 tombstone callback holds operation→reflog→origin→Git and aborts on fingerprint drift", async () => {
   const oldOid = await commit("tombstone-lock.txt", "old\n");

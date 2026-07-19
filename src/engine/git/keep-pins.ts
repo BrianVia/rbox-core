@@ -17,6 +17,7 @@ import {
 const execFileAsync = promisify(execFile);
 const sweptPreparedTxnDirs = new Set<string>();
 const PREPARED_TXN_SWEEP_LIMIT = 256;
+const PREPARED_TXN_PROTOCOL_TIMEOUT_MS = 10_000;
 
 /** Best-effort boot/use-time cleanup for FIFOs left by hard-killed prepared
  * transactions. Exact names, dead PIDs, FIFO type, and a directory bound keep
@@ -196,54 +197,84 @@ async function runPreparedUpdateRefTransactionUnlocked(
   options: { reflogMessage?: string } = {},
 ): Promise<void> {
   if (lines.length === 0) return;
+  if (options.reflogMessage?.includes("\0") || options.reflogMessage?.includes("\n")) throw new Error("invalid ref transaction reflog message");
   const ctx = await repoCtx(repoDir);
   if (!ctx) throw new Error("repository unavailable while preparing ref transaction");
   await sweepStalePreparedTransactionFifos(ctx.commonDir);
   const fifoPath = path.join(ctx.commonDir, `.rbox-prepared-txn-${process.pid}-${crypto.randomBytes(6).toString("hex")}`);
   await execFileAsync("mkfifo", [fifoPath]);
-  // Bun does not incrementally deliver a child-process stdin pipe to
-  // update-ref. Pairing a read-only FIFO descriptor with a distinct writer
-  // supplies the streaming protocol and still lets commit observe EOF.
-  const readerPromise = fs.open(fifoPath, constants.O_RDONLY);
-  const fifo = await fs.open(fifoPath, constants.O_WRONLY);
-  const reader = await readerPromise;
-  if (options.reflogMessage?.includes("\0") || options.reflogMessage?.includes("\n")) throw new Error("invalid ref transaction reflog message");
-  const child = spawn("git", ["-C", repoDir, "update-ref", ...(options.reflogMessage ? ["-m", options.reflogMessage] : []), "--stdin"], {
-    env: cleanGitEnv(), stdio: [reader.fd, "pipe", "pipe"],
-  });
-  await reader.close();
-  child.stdout!.setEncoding("utf8");
-  child.stderr!.setEncoding("utf8");
+  let bootstrapReader: fs.FileHandle | undefined;
+  let fifo: fs.FileHandle | undefined;
+  let reader: fs.FileHandle | undefined;
+  let child: ReturnType<typeof spawn> | undefined;
   let stdout = "";
   let stderr = "";
   let closed: { code: number | null } | undefined;
   let closeError: Error | undefined;
   const waiters = new Set<() => void>();
   const notify = () => { for (const waiter of [...waiters]) waiter(); };
-  child.stdout!.on("data", (chunk: string) => { stdout += chunk; notify(); });
-  child.stderr!.on("data", (chunk: string) => { stderr += chunk; notify(); });
-  child.once("error", (error) => { closeError = error; notify(); });
-  child.once("close", (code) => { closed = { code }; notify(); });
+  const waitForNotification = async (timeoutMs: number): Promise<boolean> => {
+    let notified = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await new Promise<void>((resolve) => {
+      const finish = (didNotify: boolean) => {
+        notified = didNotify;
+        waiters.delete(waiter);
+        if (timer) clearTimeout(timer);
+        resolve();
+      };
+      const waiter = () => finish(true);
+      waiters.add(waiter);
+      timer = setTimeout(() => finish(false), timeoutMs);
+    });
+    return notified;
+  };
+  const waitForSettlement = async (timeoutMs: number): Promise<boolean> => {
+    if (closed) return true;
+    await waitForNotification(timeoutMs);
+    return closed !== undefined;
+  };
   const waitFor = async (marker: string): Promise<void> => {
     for (;;) {
       if (stdout.includes(marker)) return;
       if (closeError) throw closeError;
       if (closed) throw new Error(`git update-ref closed before ${marker.trim()} (${closed.code}): ${stderr.trim()}`);
-      await new Promise<void>((resolve) => {
-        const waiter = () => { waiters.delete(waiter); resolve(); };
-        waiters.add(waiter);
-      });
+      if (!await waitForNotification(PREPARED_TXN_PROTOCOL_TIMEOUT_MS)) {
+        throw new Error(`git update-ref timed out waiting for ${marker.trim()}`);
+      }
     }
   };
   const waitClose = async (): Promise<number | null> => {
-    while (!closed && !closeError) await new Promise<void>((resolve) => {
-      const waiter = () => { waiters.delete(waiter); resolve(); };
-      waiters.add(waiter);
-    });
+    while (!closed && !closeError) {
+      if (!await waitForNotification(PREPARED_TXN_PROTOCOL_TIMEOUT_MS)) {
+        throw new Error("git update-ref timed out waiting for close");
+      }
+    }
     if (closeError) throw closeError;
     return closed!.code;
   };
   try {
+    // Bun services blocking FIFO opens on a bounded filesystem worker pool. If
+    // concurrent transactions queue every reader before its writer, the readers
+    // occupy the pool and the matching writers can never run. A temporary
+    // nonblocking reader supplies a peer for the real writer; that writer then
+    // supplies a peer for Git's blocking reader. No open can wait behind itself.
+    bootstrapReader = await fs.open(fifoPath, constants.O_RDONLY | constants.O_NONBLOCK);
+    fifo = await fs.open(fifoPath, constants.O_WRONLY);
+    reader = await fs.open(fifoPath, constants.O_RDONLY);
+    await bootstrapReader.close();
+    bootstrapReader = undefined;
+    child = spawn("git", ["-C", repoDir, "update-ref", ...(options.reflogMessage ? ["-m", options.reflogMessage] : []), "--stdin"], {
+      env: cleanGitEnv(), stdio: [reader.fd, "pipe", "pipe"],
+    });
+    child.stdout!.setEncoding("utf8");
+    child.stderr!.setEncoding("utf8");
+    child.stdout!.on("data", (chunk: string) => { stdout += chunk; notify(); });
+    child.stderr!.on("data", (chunk: string) => { stderr += chunk; notify(); });
+    child.once("error", (error) => { closeError = error; notify(); });
+    child.once("close", (code) => { closed = { code }; notify(); });
+    await reader.close();
+    reader = undefined;
     await fifo.write(["start", "option no-deref", ...lines, "prepare", ""].join("\n"));
     try {
       await waitFor("prepare: ok");
@@ -255,18 +286,29 @@ async function runPreparedUpdateRefTransactionUnlocked(
     } catch (error) {
       await fifo.write("abort\n");
       await fifo.close();
+      fifo = undefined;
       await waitClose().catch(() => {});
       throw error;
     }
     await fifo.write("commit\n");
     await fifo.close();
+    fifo = undefined;
     const code = await waitClose();
     if (code !== 0 || !stdout.includes("commit: ok") || /\bfatal:/i.test(stderr)) {
       throw new Error(`git update-ref failed (${code}): ${stderr.trim()}`);
     }
   } finally {
-    await fifo.close().catch(() => {});
+    let cleanupError: Error | undefined;
+    await bootstrapReader?.close().catch(() => {});
+    await reader?.close().catch(() => {});
+    await fifo?.close().catch(() => {});
+    fifo = undefined;
+    if (child && !closed && !await waitForSettlement(250)) {
+      child.kill("SIGKILL");
+      if (!await waitForSettlement(1_000)) cleanupError = new Error("git update-ref did not exit after SIGKILL");
+    }
     await fs.rm(fifoPath, { force: true }).catch(() => {});
+    if (cleanupError) throw cleanupError;
   }
 }
 
