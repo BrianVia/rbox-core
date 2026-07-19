@@ -1,6 +1,6 @@
 # 160 — Gitignore sync preview: show what will and won't sync before first sync
 
-Status: DRAFT v2 (folded review round 1 — all 9 findings ruled accepted, see
+Status: DRAFT v3 (folded review rounds 1–2 — all findings accepted, see
 Decisions). Origin: validation item #9, founder greenlit design pass
 2026-07-18 (design only; ship decision separate).
 
@@ -43,24 +43,40 @@ row completes the select with a sentinel value and `short: "Previewing…"`
 until a policy row answers. Tested at the wrapper level (transcript-visible
 behavior), not just a mocked sentinel.
 
-**Shared step (r1 f7 accepted):** new `src/cli/gitignore-step.ts` exporting
-`runGitignoreStep(root, deps): Promise<"true" | "false">` — deps inject
-select, preview runner, stderr writer, clock/budget. BOTH call sites
-(`init-cmd.ts:102-107`, `setup-cmd.ts:796-800`) switch to it; the sentinel
-can never escape as a policy value (return type forbids it). Existing pinned
-tests keep pinning `GITIGNORE_CHOICES`; new tests pin the step's mapping at
-both live call sites.
+**Shared step (r1 f7 + r2 f4 accepted):** new `src/cli/gitignore-step.ts`
+exporting `runGitignoreStep(root, deps): Promise<"true" | "false">` — deps
+inject select, preview runner, stderr writer, clock/budget. `root` MUST be
+absolute and planner-resolved: direct init passes
+`path.resolve(cwd, next.root ?? cwd)` (exactly the `resolveInitPlan` rule,
+init-plan.ts:168-170) so a relative `--root` can never preview a different
+tree than first sync targets; setup passes its already-resolved `dir`
+unchanged. Live-call-site test: relative `--root` + injected `cwd` ≠
+`process.cwd()`. BOTH call sites switch to the helper; the sentinel can never
+escape as a policy value (return type forbids it). Existing pinned tests keep
+pinning `GITIGNORE_CHOICES`; new tests pin the step's mapping at both call
+sites (init stores the string; setup converts `=== "true"` — r2-verified
+sound).
 
 ## The preview computation
 
-**Three-set model (r1 f1 accepted — the policy delta is nested-only):**
-- **A. Skipped under BOTH choices:** builtin rules, `.rboxignore`, root
-  `.gitignore` (legacy layer).
-- **B. Skipped only under "respect nested gitignores"** — the ACTUAL
-  difference between the two rows.
+**Four-set model (r1 f1 + r2 f1 accepted):** the two policies partition paths
+into FOUR outcomes, not three — tracked files matched by the ROOT
+`.gitignore` are re-included under `respectGitignore: true` (tracked
+protection, ignore.ts:426-436) but skipped under `false` (legacy exclusion,
+no tracked evaluation) — an INVERSE delta:
+- **A. Skipped under both:** builtin rules, `.rboxignore`, root `.gitignore`
+  on untracked files.
+- **B. Skipped only under "skip gitignored":** nested-`.gitignore` matches
+  (untracked).
+- **B′. Skipped only under "sync everything":** TRACKED files matched by the
+  root `.gitignore`.
 - **C. Synced under both.**
-The rendered comparison is honest: "either way rbox skips: …(A)…; choosing
-'skip gitignored' additionally skips: …(B)…".
+Rendering: when B′ is empty, delta framing ("either way rbox skips: …(A)…;
+'skip gitignored' additionally skips: …(B)…"). When B′ is nonempty, switch to
+per-choice framing (one "would skip" summary per row) — delta copy cannot
+state an inverse set without misleading. The parity fixture MUST include a
+tracked file matched by the ROOT `.gitignore` (nested-only fixtures miss this
+edge).
 
 **Decision source (r1 f2, f4, f5 accepted):**
 - Decisions come from the production resolver — never a reimplementation.
@@ -81,13 +97,22 @@ The rendered comparison is honest: "either way rbox skips: …(A)…; choosing
   single entries, never followed. Unreadable dirs: counted once + noted.
   Paths vanishing mid-walk: skipped silently.
 
-**Budget (r1 f3 accepted):** ONE shared budget spans the whole preview —
-git-repo discovery, trackedness resolution, and traversal. An "entry" = one
-dirent processed OR one git repo probed. Caps: 20k entries AND a ~2s
-**cooperative deadline** (checked between filesystem/subprocess operations;
-a single blocked syscall or `spawnSync` can overshoot — stated limitation,
-no abortable-subprocess architecture for a preview). On cap:
-`previewed the first 20,000 entries — larger trees are sampled`.
+**Budget (r1 f3 + r2 f2/f3 accepted):** ONE shared internal **work-unit**
+budget spans matcher PREPARATION (repo discovery — made streaming too — and
+per-repo trackedness loads) and traversal, threaded as
+`buildIgnoreMatcher(root, { readOnly: true, budget })`; ~2s cooperative
+deadline checked between fs/subprocess operations (single blocked syscall or
+`spawnSync` can overshoot — stated limitation). **Cap during PREPARATION
+fails closed:** the build returns an explicit incomplete result and the
+preview ABORTS with honest copy (`this tree is too large to preview quickly —
+the choice still applies as described`) — a partially prepared matcher must
+never present decisions (undiscovered repos would misclassify tracked files
+as untracked). Cap during the inventory walk truncates normally. Work units
+(dirents + repo probes, possibly double-charged across phases) are INTERNAL;
+the rendered count uses a separate distinct-inventory-entries counter:
+`previewed the first N entries — larger trees are sampled`. Cap tests at both
+boundaries (mid-discovery and mid-walk), asserting both counters and the
+rendered copy.
 
 **Capped-copy honesty (r1 f8 accepted):** "found" counts only *encountered,
 effective* `.gitignore` files (files under pruned/excluded parents are not
@@ -126,11 +151,19 @@ claims; use `additional rules may exist beyond the preview limit`.
 - No per-pattern toggling (`rbox ignore --review` is separate backlog).
 - No third POLICY; two choices, one preview action.
 
-## Decisions (r1 rulings)
-All 9 findings accepted: f1 three-set model (+ founder flag above); f2
-readOnly resolver mode with snapshot test; f3 single cooperative budget with
-overshoot semantics + streaming opendir; f4 groups-not-patterns summary; f5
-dedicated descending walker, resolver-only sharing; f6 sentinel-completes-
-widget transcript contract accepted + wrapper-level test; f7 named shared
-step `runGitignoreStep` with typed return; f8 effective/encountered counting
-+ honest cap copy; f9 parity oracle as specified.
+## Decisions (r1 + r2 rulings)
+R1, all 9 accepted: f1 set model (+ founder flag above); f2 readOnly resolver
+mode with snapshot test; f3 single cooperative budget with overshoot
+semantics + streaming opendir; f4 groups-not-patterns summary; f5 dedicated
+descending walker, resolver-only sharing; f6 sentinel-completes-widget
+transcript contract + wrapper-level test; f7 named shared step with typed
+return; f8 effective/encountered counting + honest cap copy; f9 parity
+oracle as specified.
+R2, all 4 accepted: f1 FOUR-set model (inverse B′ = tracked root-ignored;
+per-choice copy when B′ nonempty; root-tracked parity fixture); f2 budget
+threaded into matcher preparation, streaming discovery, fail-closed
+incomplete result — never partial decisions; f3 internal work units separated
+from rendered inventory count; f4 seam requires absolute planner-resolved
+root (init resolves via the planner rule; live-call-site test with injected
+cwd). R2 also confirmed readOnly feasibility (suppress only the
+writeTrackedCache call at ignore.ts:608; all cache branches preserved).
