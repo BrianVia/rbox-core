@@ -19,7 +19,8 @@
     "typecheck:rig": "tsc -p scripts/rig/tsconfig.json",
     "gate:dl-integrity": "bun scripts/dl-integrity-gate.ts",
     "rig": "bun scripts/rig/rig.ts",
-    "test:rig": "bun test ./scripts/rig/"
+    "test:rig": "bun test ./scripts/rig/",
+    "e2e:dev": "bun scripts/e2e/dev-backed-scenario.ts"
   },
   "dependencies": {
     "@inquirer/prompts": "^8.5",
