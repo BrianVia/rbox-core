@@ -6,6 +6,40 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.7.4] — 2026-07-19 — a first sync you can watch
+
+### Added
+- Byte-based progress across the first sync: scanning shows the payload size
+  as it grows, encrypting shows bytes done vs total, and uploading shows a
+  live MB/s rate with an ETA once the rate settles. Progress percentages now
+  track bytes, not file counts — 100k tiny files no longer skew the bar.
+- After setup completes, rbox offers to set up another machine right away
+  (generates a pairing token on the spot). Pair more devices any time with
+  `rbox pair` on an already-paired machine.
+- Long steps reassure you after ~10 seconds ("initial encryption of many
+  small files can take time") instead of looking hung.
+
+### Changed
+- The "authorize this machine" menu leads with "Sign in via browser", and the
+  duplicate "Approve a code" entry is gone (it was the same browser grant
+  under a second name).
+- Press `c` on the browser sign-in screen to copy the URL to your clipboard.
+- The setup workspace step shows the same "what is a workspace" definition as
+  `rbox init`.
+- Git history still uploading after setup is announced calmly ("Git history
+  will continue uploading in the background.") — it's expected, not an error.
+- Start-sync choices now read "Start background sync now and on machine
+  boot" — nothing implies you need to reboot.
+- The final setup screen shows your workspace name and this machine's
+  hostname instead of internal ids.
+- The gitignore choice now tells the truth about what each option does and
+  teaches the `!.env` trick: sync a secrets file between your machines,
+  end-to-end encrypted, without ever committing it.
+
+### Fixed
+- Debug telemetry (multipart instrumentation and the push summary line) no
+  longer prints mid-setup for release users; set `RBOX_DEBUG=1` to see it.
+
 ## [1.7.3] — 2026-07-18 — a friendlier first run
 
 ### Added
