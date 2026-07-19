@@ -8,6 +8,13 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [1.7.5] — 2026-07-19 — a front door that knows you
 
+### Fixed
+- Crash recovery no longer refuses to read a normal-sized state file on
+  machines with plenty of memory: the safety budget now scales with your
+  machine's RAM (quarter of physical memory, between 4 and 32 GiB) and
+  respects container memory limits. The refusal message now also explains
+  the `RBOX_RESET_PARSE_BUDGET_BYTES` override.
+
 ### Added
 - The "which directory should rbox sync?" prompt is now a real picker: type
   to fuzzy-filter the current directory's folders, press Tab to complete

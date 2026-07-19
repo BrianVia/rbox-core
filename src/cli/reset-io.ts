@@ -1,11 +1,64 @@
 import crypto from "node:crypto";
+import { readFileSync } from "node:fs";
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory, RBOX_TMP_PREFIX } from "../engine/fsutil.js";
 
 export const RESET_STREAM_BYTE_LIMIT = 2 * 1024 * 1024 * 1024;
 export const RESET_MATERIALIZED_BYTE_LIMIT = 512 * 1024 * 1024;
-export const DEFAULT_RESET_PARSE_BUDGET_BYTES = 4 * 1024 * 1024 * 1024;
+export const RESET_PARSE_BUDGET_FLOOR_BYTES = 4 * 1024 * 1024 * 1024;
+export const RESET_PARSE_BUDGET_CEILING_BYTES = 32 * 1024 * 1024 * 1024;
+
+/** Default parse budget scales with the machine: a quarter of physical memory,
+ * floored at 4 GiB (small machines keep the original fail-closed behavior) and
+ * capped at 32 GiB. A fixed 4 GiB starved legitimate ~59 MB states on a 96 GB
+ * host (2026-07-19 field incident): required = size×multiplier outgrew
+ * budget−RSS whenever the daemon carried a warm multi-GB heap. */
+export function defaultResetParseBudgetBytes(
+  totalMemoryBytes = os.totalmem(),
+  cgroupLimitBytes: number | undefined = linuxCgroupMemoryLimitBytes(),
+): number {
+  const effectiveTotal = cgroupLimitBytes !== undefined ? Math.min(totalMemoryBytes, cgroupLimitBytes) : totalMemoryBytes;
+  const scaled = Math.floor(effectiveTotal / 4);
+  const budget = Math.max(RESET_PARSE_BUDGET_FLOOR_BYTES, Math.min(scaled, RESET_PARSE_BUDGET_CEILING_BYTES));
+  // A known hard limit BELOW the floor must win — refusing cleanly beats the
+  // kernel OOM-killing a parse the floor would have admitted.
+  return cgroupLimitBytes !== undefined ? Math.min(budget, cgroupLimitBytes) : budget;
+}
+
+/** Linux-only: the cgroup (v2 then v1) memory hard limit, if one applies.
+ * `os.totalmem()` reports HOST physical memory inside containers; budgeting
+ * against it would let admission approve parses the kernel will kill. This is
+ * a policy budget, not an allocatability proof — concurrent host pressure can
+ * still fail an admitted parse; the guard only promises we never PLAN past a
+ * known hard bound. Any read/parse failure falls back to host-total scaling
+ * (pre-fix behavior). */
+export function linuxCgroupMemoryLimitBytes(
+  read: (file: string) => string | undefined = (file) => {
+    if (process.platform !== "linux") return undefined;
+    try {
+      return readFileSync(file, "utf8");
+    } catch {
+      return undefined;
+    }
+  },
+): number | undefined {
+  const v2 = read("/sys/fs/cgroup/memory.max");
+  if (v2 !== undefined) {
+    const text = v2.trim();
+    if (text === "max") return undefined;
+    const value = Number(text);
+    return Number.isSafeInteger(value) && value > 0 ? value : undefined;
+  }
+  const v1 = read("/sys/fs/cgroup/memory/memory.limit_in_bytes");
+  if (v1 !== undefined) {
+    const value = Number(v1.trim());
+    // cgroup v1 reports "unlimited" as a page-rounded 2^63-ish sentinel.
+    return Number.isSafeInteger(value) && value > 0 && value < 2 ** 62 ? value : undefined;
+  }
+  return undefined;
+}
 
 /** Pinned by reset-memory-benchmark.test.ts's JSON-grammar flood-family sweep.
  * CI reruns the same arrays/objects/strings/mixed corpus and fails if Bun's
@@ -36,7 +89,10 @@ export class ResetCorruptionError extends Error {
 export class ResetMemoryAdmissionError extends RangeError {
   readonly code = "RESET_MEMORY_ADMISSION";
   constructor(readonly fileSize: number, readonly requiredBytes: number, readonly availableBytes: number) {
-    super(`reset state needs ${requiredBytes} bytes of parse headroom, but only ${availableBytes} bytes are available`);
+    super(
+      `reset state needs ${requiredBytes} bytes of parse headroom, but only ${availableBytes} bytes are available — ` +
+        `set RBOX_RESET_PARSE_BUDGET_BYTES to raise the budget if this machine has memory to spare`
+    );
     this.name = "ResetMemoryAdmissionError";
   }
 }
@@ -217,9 +273,9 @@ export interface ResetParseAdmissionOptions {
 
 function envBudget(): number {
   const raw = process.env.RBOX_RESET_PARSE_BUDGET_BYTES;
-  if (raw === undefined) return DEFAULT_RESET_PARSE_BUDGET_BYTES;
+  if (raw === undefined) return defaultResetParseBudgetBytes();
   const value = Number(raw);
-  return Number.isSafeInteger(value) && value > 0 ? value : DEFAULT_RESET_PARSE_BUDGET_BYTES;
+  return Number.isSafeInteger(value) && value > 0 ? value : defaultResetParseBudgetBytes();
 }
 
 export function assertResetParseAdmission(fileSize: number, options: ResetParseAdmissionOptions = {}): void {
