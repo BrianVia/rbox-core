@@ -3,7 +3,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import * as C from "../rig/lib/container.js";
 import { GUEST, imageHash, NAMES } from "../rig/lib/config.js";
-import { readImageHashRecord, writeImageHashRecord } from "../rig/lib/image-hash-records.js";
+import { imageHashRecordPath, readImageHashRecord, writeImageHashRecord } from "../rig/lib/image-hash-records.js";
 import { DEV_API, safeId, SCRUBBED_ENV, shellQuote, UX_ROOT } from "./lib.js";
 
 export const UX_IMAGE = NAMES.image;
@@ -13,7 +13,7 @@ export const UX_MEMORY = "2G";
 export const REPO_ROOT = path.resolve(import.meta.dir, "../..");
 const RIG_DIR = path.join(REPO_ROOT, "scripts", "rig");
 const RIG_DOCKERFILE = path.join(RIG_DIR, "Dockerfile");
-const RIG_HASH_FILE = path.join(RIG_DIR, "runs", ".image-hash");
+const RIG_HASH_FILE = imageHashRecordPath();
 
 export interface UxContainerPlan {
   runId: string;

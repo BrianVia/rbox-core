@@ -1,6 +1,16 @@
 // Test preload (bunfig.toml). Design 108's files-first defaults ON in production;
 // the broad suite predates that and pins the legacy path — which stays supported
 // as the RBOX_FILES_FIRST=0 kill switch. files-first.test.ts sets the flag itself.
+export const API_HARNESS_ERROR = "apps/api tests need the Workers harness — run: bun run test:api";
+
+export function targetsApiTests(argv: string[]): boolean {
+  return argv.some((value) => /(^|[\\/])apps[\\/]api[\\/]test(?:[\\/]|$)/.test(value));
+}
+
+// Bun cannot provide cloudflare:test or the Miniflare bindings. Stop before it
+// partially executes a Workers suite and prints misleading application failures.
+if (targetsApiTests(process.argv)) throw new Error(API_HARNESS_ERROR);
+
 process.env.RBOX_FILES_FIRST = "0";
 // Designs 109/111/112 also default ON in production (founder call, single-user fleet);
 // the broad suite predates the flips and pins the legacy paths — kill-switch

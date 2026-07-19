@@ -1,8 +1,14 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import type { RunnerName } from "./container.js";
 
 export type ImageHashRecords = Partial<Record<RunnerName, string>>;
+
+/** Shared rig/regress cache state lives outside the source checkout. */
+export function imageHashRecordPath(tempRoot = os.tmpdir()): string {
+  return path.join(tempRoot, "rbox-rig", "image-hashes.json");
+}
 
 export function parseImageHashRecords(text: string): ImageHashRecords {
   const parsed: unknown = JSON.parse(text);
