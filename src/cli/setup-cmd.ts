@@ -789,9 +789,14 @@ export async function stepWorkspace(
     let handedOff = false;
     try {
       if (isDegraded(syncMutex)) {
-        writeStderr(`${e.yellow("workspace setup requires filesystem locking, but this filesystem does not support the required lock identity — choose a directory on a supported filesystem")}\n`);
-        process.exitCode = 1;
-        return { kind: "terminal" };
+        // Locking couldn't be established (identity resolution, ledger I/O, or a
+        // filesystem without the link primitive). Rather than refuse setup, warn
+        // and continue in the same legacy-unlocked mode every other flow uses —
+        // the only thing lost is coordination against *concurrent* rbox processes
+        // on this workspace, which is negligible for a single user. Surface the
+        // real reason so a genuine filesystem problem is still diagnosable.
+        const detail = syncMutex.degraded?.detail;
+        writeStderr(`${e.yellow(`⚠  workspace locking is unavailable on this machine${detail ? ` (${detail})` : ""} — continuing without it. Concurrent rbox processes on this workspace won't be coordinated, and git config sync is disabled.`)}\n`);
       }
 
       // Opt-in, server-visible workspace name — offered ONLY when creating (the row

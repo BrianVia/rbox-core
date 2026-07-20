@@ -11,8 +11,10 @@ export interface WorkspaceSyncMutex {
   readonly root: string;
   readonly lock?: OwnedLock;
   /** No safe identity/link primitive exists. Callers continue through the legacy
-   * unlocked state path with the workspace config lane disabled. */
-  readonly degraded?: { reason: string };
+   * unlocked state path with the workspace config lane disabled. `detail` carries
+   * the real underlying error (identity resolution, ledger I/O, or link failure)
+   * so surfaces can show WHY instead of a generic filesystem message. */
+  readonly degraded?: { reason: string; detail?: string };
   /** Exact on-disk lock marker used to bind adoption continuation/recovery. */
   readonly incarnation: string;
   /** Set before release is attempted so a stale handle can never be replayed. */
@@ -123,10 +125,10 @@ function daemonContention(result: Extract<Awaited<ReturnType<typeof acquireLock>
   };
 }
 
-async function degradedHandle(root: string, onDegraded?: (message: string) => void): Promise<WorkspaceSyncMutex> {
+async function degradedHandle(root: string, onDegraded?: (message: string) => void, detail?: string): Promise<WorkspaceSyncMutex> {
   const previous = await readLockingHealth(root);
   await writeFileAtomic(lockingHealthPath(root), JSON.stringify({ status: "degraded-unlocked", reason: "identity-unavailable" }));
-  const message = "workspace locking unavailable; git config sync disabled, continuing with legacy state saves";
+  const message = `workspace locking unavailable${detail ? ` (${detail})` : ""}; git config sync disabled, continuing with legacy state saves`;
   if (previous.status === "ok") {
     try {
       (onDegraded ?? ((line) => process.stderr.write(`warning: ${line}\n`)))(message);
@@ -134,7 +136,7 @@ async function degradedHandle(root: string, onDegraded?: (message: string) => vo
       // Surfacing is advisory; the entire point of this bucket is never-fatal sync.
     }
   }
-  return { root, degraded: { reason: "identity-unavailable" }, incarnation: "degraded", released: false };
+  return { root, degraded: { reason: "identity-unavailable", ...(detail ? { detail } : {}) }, incarnation: "degraded", released: false };
 }
 
 export const workspaceSyncMutexDegraded = (handle: WorkspaceSyncMutex | undefined): boolean => handle?.degraded !== undefined;
@@ -205,7 +207,7 @@ async function acquireWorkspaceSyncMutexInternal(
       return mode === "daemon" ? { status: "acquired", handle } : handle;
     }
     if (result.status === "unsupported") {
-      const handle = await degradedHandle(root, options.onDegraded);
+      const handle = await degradedHandle(root, options.onDegraded, result.error instanceof Error ? result.error.message : result.error ? String(result.error) : undefined);
       const fence = await inspectAdoptFence(root);
       if (adoptAuthority || fence.status === "active" || fence.status === "corrupt") {
         if (mode === "daemon") {

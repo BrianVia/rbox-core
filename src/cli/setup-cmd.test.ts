@@ -797,13 +797,13 @@ test("typed rebind probe EACCES/ENOTDIR surfaces and re-prompts before mint", as
   }
 });
 
-test("ordinary mutex failure re-prompts before mint; degraded handle fails closed", async () => {
+test("ordinary mutex failure re-prompts before mint; degraded handle warns but proceeds", async () => {
   const paths = ["/busy", "/degraded"];
   let acquires = 0;
   let creates = 0;
-  let releases = 0;
   const writes: string[] = [];
   const previousExit = process.exitCode;
+  process.exitCode = undefined; // isolate from any leaked failure state
   try {
     const result = await stepWorkspace(
       { cwd: "/cwd", defaultRemote: "https://api.test" },
@@ -813,19 +813,21 @@ test("ordinary mutex failure re-prompts before mint; degraded handle fails close
         acquireMutex: async (root: string) => {
           acquires++;
           if (acquires === 1) throw new Error("busy");
-          return { root, degraded: { reason: "identity-unavailable" } };
+          return { root, degraded: { reason: "identity-unavailable", detail: "compatible lock identity unavailable" } };
         },
         isDegraded: (handle: { degraded?: unknown }) => Boolean(handle.degraded),
-        releaseMutex: async () => { releases++; },
-        createWorkspace: async () => { creates++; return "ws_never"; },
+        createWorkspace: async () => { creates++; return "ws_created"; },
         writeStderr: (text: string) => void writes.push(text),
       })
     );
-    expect(result).toEqual({ kind: "terminal" });
-    expect(creates).toBe(0);
-    expect(releases).toBe(1);
-    expect(process.exitCode).toBe(1);
-    expect(writes.join("")).toContain("filesystem does not support the required lock identity");
+    // Degraded locking no longer aborts setup: it warns (with the real reason)
+    // and continues in legacy-unlocked mode, so the workspace still gets created.
+    // Proceeded (completed + workspace created) rather than fail-closing.
+    expect(result).toEqual({ kind: "completed", outcome: { workspaceId: "ws_created", deviceId: "dev", root: "/degraded" } });
+    expect(creates).toBe(1);
+    const out = writes.join("");
+    expect(out).toContain("workspace locking is unavailable");
+    expect(out).toContain("compatible lock identity unavailable");
   } finally {
     process.exitCode = previousExit;
   }
