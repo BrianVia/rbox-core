@@ -38,7 +38,7 @@ export const SCENARIOS: Record<string, Scenario> = {
  * split also omits it). Its wall time is additionally network-variable (resume push + B
  * pull), so it's a poor fit for a tight PR loop regardless.
  */
-export const FAST_SUITE = ["onboard-smoke", "two-device-live", "mass-delete-guard", "type-flip", "daemon-idle-cpu", "git-entanglement"] as const;
+export const FAST_SUITE = ["onboard-smoke", "two-device-live", "mass-delete-guard", "type-flip", "daemon-idle-cpu", "git-entanglement", "git-join-ahead"] as const;
 
 export function getScenario(name: string): Scenario | undefined {
   return SCENARIOS[name];

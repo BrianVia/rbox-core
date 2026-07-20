@@ -135,6 +135,7 @@ describe("design 93 §6 complete caller disposition drift gate", () => {
       ) importers.push(name);
     }
     expect(importers.sort()).toEqual([
+      "adopt-cmd.ts",
       "chain-repair.ts",
       "daemon/daemon.ts",
       "export-cmd.ts",

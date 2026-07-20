@@ -99,11 +99,12 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "init",
     group: "GETTING STARTED",
     summary: "headless/CI onboarding (the scripting form of setup)",
-    usage: "rbox init [--new | --workspace <id>] [--root <path>] [--respect-gitignore] [--new-device] [--bootstrap <secret>] [--kit] [--kit-path <path>] [--no-interactive]",
+    usage: "rbox init [--new | --workspace <id>] [--root <path>] [--adopt] [--respect-gitignore] [--new-device] [--bootstrap <secret>] [--kit] [--kit-path <path>] [--no-interactive]",
     flags: [
       { flag: "--new", desc: "create a new workspace" },
       { flag: "--workspace <id>", desc: "join an existing workspace (alias: -w)" },
       { flag: "--root <path>", desc: "directory to track (default: cwd)" },
+      { flag: "--adopt", desc: "on a non-empty join, retain local content and adopt it over the remote baseline" },
       { flag: "--bootstrap <secret>", desc: "create a brand-new account from a bootstrap secret before initializing" },
       { flag: "--respect-gitignore", desc: "skip gitignored untracked files in this workspace" },
       { flag: "--new-device", desc: "mint a new device identity instead of reusing this machine's enrolled device (advanced)" },
@@ -112,6 +113,16 @@ export const COMMAND_HELP: CommandHelp[] = [
       { flag: "--no-interactive", desc: "never prompt (CI); fail fast if inputs are missing" },
       { flag: "--remote <url>", desc: "rbox API server (default: production; the RBOX_API env var also overrides)" },
       { flag: "--git <true|false>", desc: "sync git repo state, encrypted (default true; pass false to opt out)" },
+    ],
+  },
+  {
+    name: "adopt",
+    group: "GETTING STARTED",
+    summary: "inspect or recover a retained non-empty join",
+    usage: "rbox adopt <status|resume|abort|clean> [path] [--json] [--yes]",
+    flags: [
+      { flag: "--json", desc: "print status as JSON" },
+      { flag: "--yes", desc: "confirm permanent removal for adopt clean" },
     ],
   },
 

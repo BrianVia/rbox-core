@@ -7,6 +7,7 @@
  * All decision logic lives in init-plan.ts; this file is presentation + I/O.
  */
 import os from "node:os";
+import fs from "node:fs/promises";
 import path from "node:path";
 import { credentialsForStrictFlow, loadCredentials, type CredentialLoadResult, type Credentials } from "./credentials.js";
 import { createRemoteWorkspace } from "./remote.js";
@@ -21,6 +22,7 @@ import { style, stderrStyle, fail } from "./style.js";
 import { spinner } from "./spinner.js";
 import { progressLabel } from "./status-view.js";
 import { promptSelect, promptInput, promptPath } from "./prompt.js";
+import { promptConfirm } from "./prompt.js";
 import { promptWorkspacePick } from "./workspace-picker.js";
 import { recoveryKitOptionsFromFlags, type RecoveryKitOptions } from "./recovery-kit.js";
 import { createPopulateStatusWriter } from "./populate-status.js";
@@ -32,6 +34,12 @@ import {
   inspectResetConsentIntent,
   type ResetConsentWitness,
 } from "./reset-consent.js";
+import { consumeAdoptConsent, mintHeadlessAdoptConsent, mintInteractiveAdoptConsent, type AdoptConsentWitness } from "./adopt-consent.js";
+import { inventoryAdoptionSource, rootHasAdoptableContent } from "./adopt-inventory.js";
+import { continueAdoption, startAdoption } from "./adopt-lifecycle.js";
+import { acknowledgeCacheGeneration } from "./adopt-cache.js";
+import { DirCache, HashCache } from "../engine/index.js";
+import type { AdoptJournal } from "./adopt-journal.js";
 
 export const WORKSPACE_DEFINITION =
   "a workspace can be a single repository or a folder of many repositories, or just a folder.";
@@ -187,6 +195,7 @@ export async function runInit(
     guidedSetup?: boolean;
     resetConsent?: ResetConsentWitness;
     credentialResult?: CredentialLoadResult;
+    adoptConsent?: AdoptConsentWitness;
   }
 ): Promise<InitOutcome | undefined> {
   const credentialResult = opts.credentialResult ?? await loadCredentials();
@@ -204,6 +213,22 @@ export async function runInit(
     return undefined;
   }
   await preflightInitRebind(plan, opts.resetConsent);
+  let adoptConsent = opts.adoptConsent;
+  const adoptRequested = gathered.adopt === "true" || adoptConsent !== undefined;
+  const nonEmptyJoin = plan.workspace.kind === "join" && await rootHasAdoptableContent(plan.root);
+  if (adoptRequested && (plan.workspace.kind !== "join" || plan.firstSync !== "sync")) {
+    throw new Error("adoption requires `init --workspace` with the default first sync; --pull-only and --no-sync are unsupported");
+  }
+  if (plan.workspace.kind === "join" && nonEmptyJoin && process.env.RBOX_ADOPT_OVERLAY !== "0") {
+    const stream = syncStreamId({ remoteUrl: plan.remoteUrl, remoteWorkspaceId: plan.workspace.id, projectId: plan.workspace.project });
+    if (!adoptConsent && gathered.adopt === "true") {
+      adoptConsent = mintHeadlessAdoptConsent({ root: plan.root, stream, workspaceId: plan.workspace.id });
+    } else if (!adoptConsent && interactive) {
+      process.stderr.write(`${stderrStyle.dim("rbox can establish the remote baseline first, fetch-union eligible Git branches, then overlay this directory while retaining collisions under .rbox/adopt.")}\n`);
+      const accepted = await promptConfirm({ message: "Adopt this directory into the existing workspace?", default: true });
+      if (accepted) adoptConsent = mintInteractiveAdoptConsent({ root: plan.root, stream, workspaceId: plan.workspace.id });
+    }
+  }
   return executeInitPlan(plan, gathered.bootstrap, {
     summary: opts.summary !== false,
     recoveryKit: recoveryKitOptionsFromFlags(gathered),
@@ -211,6 +236,7 @@ export async function runInit(
     guidedSetup: opts.guidedSetup === true,
     resetConsent: opts.resetConsent,
     credentialResult,
+    ...(adoptConsent ? { adoption: { consent: adoptConsent } } : {}),
   });
 }
 
@@ -230,7 +256,7 @@ export async function preflightInitRebind(
   const nextKnown = plan.workspace.kind === "join"
     ? syncStreamId({ remoteUrl: plan.remoteUrl, remoteWorkspaceId: plan.workspace.id, projectId: plan.workspace.project })
     : undefined;
-  if (nextKnown === oldStream) return;
+  if (nextKnown === oldStream) throw new Error("this directory is already bound to that workspace; use `rbox sync` instead of re-running init");
   if (!consent) throw new RebindConsentRequiredError(plan.root);
 
   const inspected = inspectResetConsentIntent(consent);
@@ -337,6 +363,7 @@ async function executeInitPlan(
     guidedSetup: boolean;
     resetConsent?: ResetConsentWitness;
     credentialResult?: CredentialLoadResult;
+    adoption?: { consent: AdoptConsentWitness };
   },
   continuation?: PrecreatedWorkspaceContinuation
 ): Promise<InitOutcome | undefined> {
@@ -388,6 +415,7 @@ async function executeInitPlan(
   // decision, mutation, and state-save interval. Nested pull/push calls inherit it.
   if (!continuation) syncMutex = await acquireWorkspaceSyncMutex(plan.root, "cli");
   let deviceId!: string;
+  let adoptionJournal: AdoptJournal | undefined;
   try {
     // 3. Write the per-device binding (token injected at runtime, never persisted).
     //    REBIND (design 44): if this root was already bound to a DIFFERENT workspace,
@@ -432,6 +460,27 @@ async function executeInitPlan(
       // Present on CREATE (the name just typed) and on TRACK-EXISTING (the picked name).
       ...(plan.workspace.name ? { name: plan.workspace.name } : {}),
     };
+    if (opts.adoption) {
+      if (plan.workspace.kind !== "join" || plan.firstSync !== "sync") throw new Error("invalid adoption execution route");
+      consumeAdoptConsent(opts.adoption.consent, { root: plan.root, stream: nextStream, workspaceId });
+      // Inventory is part of phase 0 and therefore runs only while the exact
+      // healthy workspace mutex is held. It remains before journal publication
+      // and before the first source namespace mutation.
+      const inventory = await inventoryAdoptionSource(plan.root);
+      adoptionJournal = await startAdoption({
+        root: plan.root,
+        rootReal: await fs.realpath(plan.root),
+        stream: nextStream,
+        workspaceId,
+        projectId: plan.workspace.project,
+        remoteUrl: plan.remoteUrl,
+        deviceId,
+        syncGit: plan.syncGit,
+        respectGitignore: plan.respectGitignore,
+        ...(plan.workspace.name ? { name: plan.workspace.name } : {}),
+      }, inventory, syncMutex);
+      if (adoptionJournal.phase === "paused") throw new Error("adoption paused while retaining source; run `rbox adopt status|resume|abort`");
+    }
     await saveConfig(plan.root, cfg);
 
     // 4. This workspace is end-to-end encrypted: the server stores only ciphertext.
@@ -548,16 +597,46 @@ async function executeInitPlan(
           sp.update(progressLabel(phase, done, total, detail, bytes));
           populate.update(done, total, phase, bytes);
         };
-        const { pulled, pushedSequence, initialRemoteSequence } = await sync(plan.root, authed, deps);
-        sp.stop();
-        const conflicts = pulled.filter((a) => a.kind === "conflict");
-        const writes = pulled.filter((a) => a.kind === "write").length;
-        console.log(
-          `${style.bold("synced")}: ${style.green(`${writes} pulled`)}, ${conflicts.length ? style.red(`${conflicts.length} conflict(s)`) : style.dim("0 conflict(s)")} ${style.sym.arrow} sequence ${style.cyan(String(pushedSequence))}`
-        );
-        flushGitSummaries();
-        for (const c of conflicts) console.log(`  ${style.sym.warn} ${style.yellow(c.path ?? "?")} ${style.dim(`(local kept as ${c.keepLocalAs})`)}`);
-        writeGuidedGenesisPullNotice(opts.guidedSetup, initialRemoteSequence);
+        let result: Pick<Awaited<ReturnType<typeof sync>>, "pulled" | "pushedSequence" | "initialRemoteSequence"> | undefined;
+        if (adoptionJournal) {
+          const completed = await continueAdoption(adoptionJournal, syncMutex, {
+            establishBaseline: async () => { await sync(plan.root, authed, deps); },
+            finishSync: async (journal) => {
+              deps.cache = new HashCache();
+              deps.dircache = new DirCache();
+              deps.forceFullScan = true;
+              result = await sync(plan.root, authed, deps);
+              if (journal.cache.generationAfter !== undefined) {
+                await acknowledgeCacheGeneration(plan.root, journal.cache.generationAfter, `foreground-${journal.journalId}`);
+              }
+            },
+          });
+          if (completed.phase === "paused") throw new Error("adoption paused; run `rbox adopt status|resume|abort`");
+          if (completed.finishSync.error) {
+            process.stderr.write(`${stderrStyle.yellow("adoption is locally complete, but its ordinary finish sync needs retry: ")}${completed.finishSync.error}\n`);
+          }
+        } else {
+          const { pulled, pushedSequence, initialRemoteSequence } = await sync(plan.root, authed, deps);
+          result = { pulled, pushedSequence, initialRemoteSequence };
+        }
+        if (!result) {
+          if (!adoptionJournal || adoptionJournal.phase !== "complete" || !adoptionJournal.finishSync.error) {
+            throw new Error("ordinary finish sync did not complete; local adoption remains retained");
+          }
+          sp.stop();
+          console.log(`${style.bold("adopted locally")}: retained recovery data is intact; run ${style.cyan("rbox sync")} to retry ordinary publication`);
+        } else {
+          const { pulled, pushedSequence, initialRemoteSequence } = result;
+          sp.stop();
+          const conflicts = pulled.filter((a) => a.kind === "conflict");
+          const writes = pulled.filter((a) => a.kind === "write").length;
+          console.log(
+            `${style.bold("synced")}: ${style.green(`${writes} pulled`)}, ${conflicts.length ? style.red(`${conflicts.length} conflict(s)`) : style.dim("0 conflict(s)")} ${style.sym.arrow} sequence ${style.cyan(String(pushedSequence))}`
+          );
+          flushGitSummaries();
+          for (const c of conflicts) console.log(`  ${style.sym.warn} ${style.yellow(c.path ?? "?")} ${style.dim(`(local kept as ${c.keepLocalAs})`)}`);
+          writeGuidedGenesisPullNotice(opts.guidedSetup, initialRemoteSequence);
+        }
       } catch (e) {
         sp.fail("initial sync failed");
         throw e;

@@ -67,7 +67,7 @@ export async function push(
   const scanFault = () => deps.telemetry?.record({ kind: "safety_event", eventType: "scan_fault", count: 1 });
   const deferErrnos = deps.warningSink ? makeDeferErrnoReporter(deps.warningSink, scanFault) : makeDeferErrnoReporter(undefined, scanFault);
   const scanT0 = Date.now();
-  let local = await report.phase("scan", () => scanManifest(root, matcher, cache, scanTick(deps), undefined, scanStats, scanDeferred, undefined, dircache, "pruned", deferErrnos.onErrno, deps.warningSink));
+  let local = await report.phase("scan", () => scanManifest(root, matcher, cache, scanTick(deps), undefined, scanStats, scanDeferred, undefined, dircache, deps.forceFullScan ? "unpruned" : "pruned", deferErrnos.onErrno, deps.warningSink));
   deferErrnos.flush();
   const scanWallMs = Date.now() - scanT0;
   if (scanDeferred.size > 0) local = deferManifest(local, state.lastSyncedManifest, scanDeferred);

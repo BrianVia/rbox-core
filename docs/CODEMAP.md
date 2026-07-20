@@ -51,10 +51,10 @@ requires an explicit ownership/layering decision.
 ```
 src/cli/sync.ts               — barrel: pre-113-split public surface of sync/.
 src/cli/sync/sync.ts          — sync(): one full cycle, pull then push, under the sync mutex. Never: per-phase logic.
-src/cli/sync/pull.ts          — pull driver: scanManifestForPush, pull, applyPulledManifest (reconcile, two-phase ignore, mass-delete/trash safety, git apply, atomic state advance). Never: push/commit logic, rendering.
-src/cli/sync/push.ts          — push retry orchestration (pushManifest) + single-attempt transaction (runPushAttempt) + recovery-page accumulation + stampManifestSchemaForCommit. Never: rendering, remote construction, pull-side reconcile.
+src/cli/sync/pull.ts          — pull driver: scanManifestForPush, pull, applyPulledManifest (reconcile, two-phase ignore, mass-delete/trash safety, git apply, atomic state advance), including caller-required uncached/unpruned scan mode. Never: push/commit logic, rendering, or adoption orchestration.
+src/cli/sync/push.ts          — push retry orchestration (pushManifest) + single-attempt transaction (runPushAttempt) + recovery-page accumulation + stampManifestSchemaForCommit, including caller-required uncached/unpruned scan mode. Never: rendering, remote construction, pull-side reconcile, or adoption orchestration.
 src/cli/sync/policy.ts        — sync policy & flags: filesFirstFlagEnabled, mass-delete trip predicates/constants, deferred-errno reporting, retry backoff, apiFor, scan/matcher adapters. Never: I/O drivers, rendering.
-src/cli/sync/deps.ts          — SyncDeps injectable contract + cache/scan-stats/write-context wiring (withCache, withDircache, withReportScanStats, refreshWriteContext, CurrentWriteContext). Never: sync decisions.
+src/cli/sync/deps.ts          — SyncDeps injectable contract + cache/scan-stats/write-context wiring (withCache, withDircache, withReportScanStats, refreshWriteContext, CurrentWriteContext) + explicit full-scan request. Never: sync or adoption decisions.
 src/cli/sync/format.ts        — compact stat/timing token rendering (formatCommitTimings, formatLatestTimings, formatApplyStats, formatScanStats). Format strings are load-bearing (privacy tests grep them). Never: state, I/O, policy.
 ```
 
@@ -85,7 +85,7 @@ src/cli/sync-git/status.ts           — read-only divergence status: gitDiverge
 
 ```
 src/cli/daemon.ts            — barrel: pre-113-split public surface of daemon/ (main-dispatch's dynamic import("./daemon.js") lands here).
-src/cli/daemon/daemon.ts     — RboxDaemon (§2.7 — one state machine: pump single-flight, reset-journal halt/recover/bootstrap, watcher trust/retrust, safety/deep scan cadence, push/pull drivers, retry fences, drift audits, activity/ambient-status persistence, WS channel, ownership wind-down) + runDaemon + class-coupled types. Never: reusable policy or rendering (those live in siblings).
+src/cli/daemon/daemon.ts     — RboxDaemon (§2.7 — one state machine: pump single-flight, reset-journal halt/recover/bootstrap, watcher trust/retrust, safety/deep scan cadence, adopt cache-generation observation/full-scan acknowledgement, push/pull drivers, retry fences, drift audits, activity/ambient-status persistence, WS channel, ownership wind-down) + runDaemon + class-coupled types. Never: reusable policy, adoption lifecycle mutation, or rendering (those live in siblings).
 src/cli/daemon/policy.ts     — daemon policy, pure: DaemonChainRepairPolicy, classifyWatcherError, TrustState/worseTrust, daemonConsumesWakeup, Wants, cadence/retrust/WS constants, reconnectDelayMs/nextSafetyDelay/jitter. Never: class state, I/O.
 src/cli/daemon/reset-halt-policy.ts — pure bounded per-message LRU log gate and hourly reset-recovery retry constant. Never: daemon lifecycle state, journal inspection, or I/O.
 src/cli/daemon/render.ts     — daemon log-line rendering: scanStatsLine, summarizeActions, path cleaning. Format strings are load-bearing. Never: state, decisions, sink ownership.
@@ -109,7 +109,15 @@ src/cli/telemetry/lane-accumulator.ts — AsyncLocalStorage-scoped per-push uplo
 ## `src/cli/` — sync-adjacent singles
 
 ```
-src/cli/sync-mutex.ts         — the one workspace-wide sync mutex (acquire/release/withWorkspaceSyncMutex) + degraded lock-unsupported fallback, CLI vs daemon acquisition policy. Never: the lockfile primitive itself (engine/git/lockfile.ts).
+src/cli/sync-mutex.ts         — the one workspace-wide sync mutex (acquire/release/withWorkspaceSyncMutex), global adopt-journal fence/recovery authority, invocation-local baseline continuation capability, degraded lock-unsupported fallback, and CLI vs daemon acquisition policy. Never: the lockfile primitive itself (engine/git/lockfile.ts) or adoption content/Git mutation.
+src/cli/adopt-consent.ts      — opaque single-use adoption-consent witnesses bound to root/stream/workspace and their three affirmative routes. Never: prompting, inventory, or mutation.
+src/cli/adopt-journal.ts      — versioned adoption protocol types, strict direct-path load/save/fence inspection, full no-follow identities, and retention path definitions. Never: lifecycle policy or namespace mutation.
+src/cli/adopt-inventory.ts    — phase-0 no-follow source inventory, headroom inputs, mount/readability checks, and ordinary-vs-linked Git source admission. Never: journal publication or source movement.
+src/cli/adopt-fs.ts           — dirfd-held no-follow traversal plus native no-replace rename and scaffold-directory primitives. Never: overlay disposition or lifecycle policy.
+src/cli/adopt-git.ts          — retained-source exact-OID fetch-union, target scope/ownership/index gates, journaled branch CAS/index recovery, containment/incarnation checks, and Git abort inverses. Never: sync-engine classification, capture, reconcile, or BASE authority.
+src/cli/adopt-overlay.ts      — ignore-independent B-driven per-leaf overlay, collision displacement/unplaced policy, closed move classification, and file abort inverses. Never: ordinary matcher/reconcile policy or Git administrative mutation.
+src/cli/adopt-cache.ts        — adoption cache-class invalidation, durable workspace cache generation, and per-owner acknowledgement. Never: scanning, matcher construction, or daemon scheduling.
+src/cli/adopt-lifecycle.ts    — phases 0–4 orchestration over journal/retain/baseline/Git/overlay/cache/finish hooks plus resume nonce refresh and abort sequencing. Never: sync-engine classification, reconcile, capture, or BASE authority.
 src/cli/sync-recovery.ts      — within-attempt churn recovery for file blobs: encryptAndUpload (bounded per-file retry, address-cache reuse, defer-on-churn, design-98 pipeline routing, flag-gated serialized receipt-drainer wiring) + deferManifest/reportDeferred. Never: whole-attempt retry (sync/push.ts), encrypt/upload mechanics (engine + remote).
 src/cli/sync-state.ts         — sync state-transition composition + CAS save (composeStateSavePacket, saveStateSource, episode-aware published-checkout recovery, config-lane state, daemonBindingMatches). Never: state-file persistence format (config.ts owns saveState/applyStateSavePacket).
 src/cli/reset-consent.ts      — design-138 opaque two-stage setup consent capabilities: stream-selecting tuple binding, create-result narrowing, fenced inspection, and single-use consumption. Never: prompting, remote creation, reset mutation, or durable authorization storage.

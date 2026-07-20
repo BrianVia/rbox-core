@@ -38,6 +38,9 @@ export interface SyncDeps {
   /** Optional caller-owned directory cache. Foreground scans load their own only
    * when Layer A is explicitly enabled. */
   dircache?: DirCache;
+  /** Adoption completion/abort requires one uncached, unpruned scan before a
+   * publisher/applier may trust any warm listing or hash identity. */
+  forceFullScan?: boolean;
   remote?: SyncRemote;
   backoff?: (attempt: number) => Promise<void>;
   /** Called once per commit-level 409 (parent-sequence conflict). Lets the daemon
