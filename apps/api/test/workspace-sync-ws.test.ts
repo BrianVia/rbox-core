@@ -203,6 +203,44 @@ function expectServerTimings(body: Record<string, unknown>) {
 }
 
 describe("workspace sync websocket fanout", () => {
+  test("hibernation cursor handler returns the KV head and ignores every other frame", () => {
+    const sent: string[] = [];
+    const socket = { send: (message: string) => sent.push(message) } as unknown as WebSocket;
+    const sync = new WorkspaceSync(fakeCtx([], new Map([["head", { sequence: 7, commitHash: sha("a") }]])), metricsEnv() as never);
+
+    sync.webSocketMessage(socket, "ping");
+    sync.webSocketMessage(socket, "unknown");
+    sync.webSocketMessage(socket, new TextEncoder().encode("cursor").buffer);
+    sync.webSocketMessage(socket, "cursor");
+
+    expect(sent).toEqual([JSON.stringify({ head: 7 })]);
+    const deadSocket = { send: () => { throw new Error("dead"); } } as unknown as WebSocket;
+    expect(() => sync.webSocketMessage(deadSocket, "cursor")).not.toThrow();
+  });
+
+  test("a receiver whose committed fanout is dropped can still query the DO cursor handler", () => {
+    const receivedA: string[] = [];
+    const receivedB: string[] = [];
+    const socketA = {
+      readyState: WebSocket.OPEN,
+      deserializeAttachment: () => ({ deviceId: "dev-a" }),
+      send: (message: string) => receivedA.push(message),
+    } as unknown as WebSocket;
+    const socketB = {
+      readyState: WebSocket.OPEN,
+      deserializeAttachment: () => ({ deviceId: "dev-b" }),
+      send: (message: string) => { if (message !== "committed") receivedB.push(message); },
+    } as unknown as WebSocket;
+    const ctx = fakeCtx([socketA, socketB], new Map([["head", { sequence: 9, commitHash: sha("a") }]]));
+    const sync = new WorkspaceSync(ctx, metricsEnv() as never);
+
+    broadcast(ctx, "committed");
+    sync.webSocketMessage(socketB, "cursor");
+
+    expect(receivedA).toEqual(["committed"]);
+    expect(receivedB).toEqual([JSON.stringify({ head: 9 })]);
+  });
+
   test("full admission rejects a lost carried ref even when another ref is introduced", async () => {
     const introduced = sha("c");
     const carriedNowAbsent = sha("d");

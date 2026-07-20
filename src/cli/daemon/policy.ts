@@ -23,6 +23,7 @@ const RECONNECT_SPREAD_MS = 3_000;
 export const WS_PING_MS = 25_000;
 export const WS_KEEPALIVE_PERSIST_MS = 20_000;
 export const WS_PONG_DEADLINE_DEFAULT_MS = 60_000; // 2 ping intervals (50s) + 10s grace
+export const WS_CURSOR_CHECK_MS = 45_000;
 export const POLL_BACKSTOP_DEFAULT_MS = 300_000; // 5 min = safety-scan idle cap
 export const ACTIVITY_HEARTBEAT_MS = 30_000;
 export const UPDATE_CHECK_TICK_MS = 60 * 60_000;

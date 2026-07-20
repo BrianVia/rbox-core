@@ -2,15 +2,19 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { HashCache, scanManifest, type BlobStore, type Manifest } from "../../engine/index.js";
+import { HashCache, scanManifest, type BlobStore, type FileEntry, type Manifest } from "../../engine/index.js";
+import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
 import type { SyncState, WorkspaceConfig } from "../config.js";
 import { reconnectDelayMs, RboxDaemon } from "../daemon.js";
 import type { CommitResult, SyncRemote } from "../remote.js";
+import type { TelemetryRecorder } from "../telemetry/queue.js";
+import type { WsHealthSample } from "../telemetry/contract.js";
 
 const ENV_KEYS = [
   "RBOX_DAEMON_WS_DISABLED",
   "RBOX_DAEMON_WS_RELIABILITY_DISABLED",
   "RBOX_DAEMON_WS_PONG_DEADLINE_MS",
+  "RBOX_DAEMON_WS_CURSOR_CHECK_MS",
   "RBOX_DAEMON_POLL_BACKSTOP_MS",
 ] as const;
 
@@ -18,26 +22,45 @@ interface DaemonInternals {
   ws?: WebSocket;
   pongDeadlineMs: number;
   backstopMs: number;
+  cursorCheckMs: number;
   wsReliabilityDisabled: boolean;
   wsDisabled: boolean;
+  wsReconnects: number;
   wsHalfOpenDetected: number;
   wsBackstopPulls: number;
+  backstopAppliedPulls: number;
+  cursorAppliedPulls: number;
+  notifyAppliedPulls: number;
+  notifyLatencyCount: number;
+  queuedCarrier: "none" | "backstop" | "cursor" | "notify";
+  queuedBackstopPending: boolean;
+  pumping: boolean;
   reconnectAttempt: number;
   notifyPullPendingAt?: number;
   pendingCatchUpGeneration?: number;
   wsPongDeadlineTimer?: ReturnType<typeof setTimeout>;
   backstopTimer?: ReturnType<typeof setTimeout>;
+  cursorTimer?: ReturnType<typeof setTimeout>;
+  cursorEpoch: number;
+  cursorAbortController?: AbortController;
+  wsGeneration: number;
+  resetLifecycle: "ready" | "halted" | "recovering" | "bootstrapping";
   want: { pull: boolean; push: boolean; fullScan: boolean; deepScan: boolean };
   pumpRun: Promise<void>;
   cache: HashCache;
   manifest: Manifest;
   activity: { ws?: { connected: boolean; caughtUp: boolean } };
+  telemetry: TelemetryRecorder & { flush(signal?: AbortSignal): Promise<void> };
   armPongDeadline(ws: WebSocket): void;
   clearPongDeadline(): void;
   onPongDeadline(ws: WebSocket): void;
   startBackstop(): void;
+  onBackstopTick(): void;
   scheduleNextBackstop(): void;
   clearBackstop(): void;
+  resetCursorSchedule(ws: WebSocket): void;
+  invalidateCursorSchedule(): void;
+  runCursorCheck(ws: WebSocket, generation: number, epoch: number): Promise<void>;
   markWsOpen(ws: WebSocket): number;
   markWsDisconnected(ws: WebSocket, reason: "close" | "error" | "timeout"): boolean;
   handleWsMessageData(data: string, from?: WebSocket): void;
@@ -45,26 +68,55 @@ interface DaemonInternals {
   maybeConnect(): void;
   scheduleReconnect(): void;
   pump(): Promise<void>;
+  sampleWsHealth(): void;
+  raiseQueuedCarrier(carrier: "none" | "backstop" | "cursor" | "notify"): void;
+  discardQueuedWsCarrier(): void;
   loadSyncBase(): Promise<SyncState>;
   stop(): Promise<void>;
 }
 
+const KEK = Buffer.alloc(32, 7);
 class MiniRemote implements SyncRemote {
   latestCalls = 0;
   throwNextLatest = false;
+  head = 0;
+  private readonly manifests = new Map<number, Manifest>();
+  private readonly blobs = new Map<string, Buffer>();
+  async seedEntry(rel: string, content: string): Promise<FileEntry> {
+    const p = await encryptFileNameProbe(new Uint8Array(KEK), new Uint8Array(Buffer.from(content)));
+    this.blobs.set(p.encSha, Buffer.from(p.ciphertext));
+    return { path: rel, type: "file", sha256: p.plaintextSha, encSha: p.encSha, size: content.length, mode: 0o644, mtimeMs: 1 };
+  }
+  injectCommit(files: FileEntry[]): void {
+    this.head++;
+    this.manifests.set(this.head, { generatedAt: "", files });
+  }
   async latest(): Promise<{ sequence: number; manifest: Manifest }> {
     this.latestCalls++;
     if (this.throwNextLatest) {
       this.throwNextLatest = false;
       throw new Error("latest failed");
     }
-    return { sequence: 0, manifest: { generatedAt: "", files: [] } };
+    return { sequence: this.head, manifest: this.manifests.get(this.head) ?? { generatedAt: "", files: [] } };
   }
-  async missingBlobs(): Promise<string[]> { return []; }
-  async putBlobFile(): Promise<void> {}
-  async commit(): Promise<CommitResult> { return { sequence: 1 }; }
+  async missingBlobs(shas: string[]): Promise<string[]> { return shas.filter((sha) => !this.blobs.has(sha)); }
+  async putBlobFile(sha: string, absPath: string): Promise<void> { this.blobs.set(sha, await fs.readFile(absPath)); }
+  async commit(parentSequence: number, _device: string, manifest: Manifest): Promise<CommitResult> {
+    if (parentSequence !== this.head) return { conflict: true, head: this.head };
+    this.head++;
+    this.manifests.set(this.head, manifest);
+    return { sequence: this.head };
+  }
   blobStore(): BlobStore {
-    return { has: async () => false, put: async () => {}, get: async () => { throw new Error("missing"); } };
+    return {
+      has: async (sha) => this.blobs.has(sha),
+      put: async (sha, bytes) => void this.blobs.set(sha, Buffer.from(bytes)),
+      get: async (sha) => {
+        const bytes = this.blobs.get(sha);
+        if (!bytes) throw new Error(`missing: ${sha}`);
+        return bytes;
+      },
+    };
   }
 }
 
@@ -92,14 +144,19 @@ afterEach(async () => {
   await fs.rm(root, { recursive: true, force: true });
 });
 
-async function makeDaemon(remote: MiniRemote = new MiniRemote()): Promise<DaemonInternals> {
+async function makeDaemon(remote: MiniRemote = new MiniRemote(), opts: {
+  now?: () => number;
+  monotonicNow?: () => number;
+  log?: (line: string) => void;
+} = {}): Promise<DaemonInternals> {
   const cfg: WorkspaceConfig = {
     schema: "e2ee/v1", remoteWorkspaceId: "ws_test", projectId: "root", deviceId: "dev_test",
-    rootPath: root, remoteUrl: "mem://", token: "", encrypted: true, kek: Buffer.alloc(32, 7),
+    rootPath: root, remoteUrl: "mem://", token: "", encrypted: true, kek: KEK,
     accountId: "acct_test", accountEpoch: 0, keyEpoch: 0,
   };
   const daemon = new RboxDaemon(root, cfg, { remote, backoff: async () => {} }, {
     bootId: "boot-test",
+    ...opts,
   }) as unknown as DaemonInternals;
   daemon.cache = await HashCache.load(root);
   daemon.manifest = await scanManifest(root);
@@ -108,8 +165,8 @@ async function makeDaemon(remote: MiniRemote = new MiniRemote()): Promise<Daemon
   return daemon;
 }
 
-function fakeWs(close = () => {}): WebSocket {
-  return { readyState: WebSocket.OPEN, send: () => {}, close } as unknown as WebSocket;
+function fakeWs(close = () => {}, send = (_message: string) => {}): WebSocket {
+  return { readyState: WebSocket.OPEN, send, close } as unknown as WebSocket;
 }
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -186,6 +243,7 @@ test("backstop pulls and reschedules itself", async () => {
   daemon.startBackstop();
   await sleep(90);
   expect(daemon.wsBackstopPulls).toBeGreaterThanOrEqual(1);
+  expect(daemon.backstopAppliedPulls).toBe(0); // every tick was a no-op pull
   expect(daemon.backstopTimer).toBeDefined();
 });
 
@@ -228,6 +286,8 @@ test("failed notified pull logs latency at dequeue without restoring the timesta
   }
   expect(lines.some((line) => line.includes("notify_latency_ms="))).toBe(true);
   expect(daemon.notifyPullPendingAt).toBeUndefined();
+  expect(daemon.notifyLatencyCount).toBe(1);
+  expect(daemon.notifyAppliedPulls).toBe(0);
 });
 
 test("failed catch-up pull restores its generation until a healing pull", async () => {
@@ -270,9 +330,146 @@ test("reliability master switch disables deadline, backstop, and notify token", 
   expect(daemon.wsReliabilityDisabled).toBe(true);
   expect(daemon.pongDeadlineMs).toBe(0);
   expect(daemon.backstopMs).toBe(0);
+  expect(daemon.cursorCheckMs).toBe(0);
   expect(daemon.wsPongDeadlineTimer).toBeUndefined();
   expect(daemon.backstopTimer).toBeUndefined();
   expect(daemon.notifyPullPendingAt).toBeUndefined();
+});
+
+test("a missed committed frame is recovered by cursor before the backstop and credited once", async () => {
+  process.env.RBOX_DAEMON_WS_CURSOR_CHECK_MS = "30";
+  process.env.RBOX_DAEMON_POLL_BACKSTOP_MS = "1000";
+  process.env.RBOX_DAEMON_WS_PONG_DEADLINE_MS = "0";
+  const remote = new MiniRemote();
+  remote.injectCommit([await remote.seedEntry("cursor.txt", "recovered")]);
+  const daemon = await makeDaemon(remote);
+  const sent: string[] = [];
+  const startedAt = Date.now();
+  let firstCursorAt: number | undefined;
+  let ws!: WebSocket;
+  ws = fakeWs(() => {}, (message) => {
+    sent.push(message);
+    if (message === "cursor") {
+      firstCursorAt ??= Date.now();
+      queueMicrotask(() => daemon.handleWsMessageData(JSON.stringify({ head: remote.head }), ws));
+    }
+  });
+  daemon.ws = ws;
+  daemon.markWsOpen(ws);
+  daemon.scheduleNextBackstop();
+
+  await sleep(100);
+  await daemon.pumpRun;
+
+  expect(sent).toContain("cursor");
+  expect(firstCursorAt! - startedAt).toBeLessThan(60);
+  expect(await fs.readFile(path.join(root, "cursor.txt"), "utf8")).toBe("recovered");
+  expect(daemon.cursorAppliedPulls).toBe(1);
+  expect(daemon.notifyAppliedPulls).toBe(0);
+  expect(daemon.backstopAppliedPulls).toBe(0);
+  expect(daemon.wsBackstopPulls).toBe(0);
+});
+
+test("live committed frames reset the cursor cadence before it can wake the DO", async () => {
+  process.env.RBOX_DAEMON_WS_CURSOR_CHECK_MS = "200";
+  process.env.RBOX_DAEMON_WS_PONG_DEADLINE_MS = "0";
+  const daemon = await makeDaemon();
+  const sent: string[] = [];
+  const ws = fakeWs(() => {}, (message) => sent.push(message));
+  daemon.ws = ws;
+  daemon.markWsOpen(ws);
+  await sleep(140); // before the old timer's 150ms jittered minimum
+  daemon.handleWsMessageData(JSON.stringify({ type: "committed", sequence: 0 }), ws);
+  await daemon.pumpRun;
+  await sleep(140); // past the old timer's 250ms maximum, before the reset timer's minimum
+
+  expect(sent.filter((message) => message === "cursor")).toHaveLength(0);
+});
+
+test("a blackholed cursor is bounded, single-flight, does not cycle the socket, and preserves backstop", async () => {
+  process.env.RBOX_DAEMON_WS_CURSOR_CHECK_MS = "30";
+  process.env.RBOX_DAEMON_POLL_BACKSTOP_MS = "40";
+  process.env.RBOX_DAEMON_WS_PONG_DEADLINE_MS = "0";
+  const daemon = await makeDaemon();
+  const sendTimes: number[] = [];
+  let closes = 0;
+  const ws = fakeWs(() => closes++, (message) => { if (message === "cursor") sendTimes.push(Date.now()); });
+  daemon.ws = ws;
+  daemon.markWsOpen(ws);
+  daemon.scheduleNextBackstop();
+
+  await sleep(140);
+
+  expect(sendTimes.length).toBeGreaterThanOrEqual(2);
+  expect(sendTimes.length).toBeLessThanOrEqual(3);
+  expect(sendTimes.slice(1).every((at, index) => at - sendTimes[index]! >= 45)).toBe(true);
+  expect(closes).toBe(0);
+  expect(daemon.ws).toBe(ws);
+  expect(daemon.wsBackstopPulls).toBeGreaterThanOrEqual(1);
+  expect(daemon.cursorAppliedPulls).toBe(0);
+});
+
+test("cursor epoch fences committed, reconnect, and stop overlaps", async () => {
+  process.env.RBOX_DAEMON_WS_CURSOR_CHECK_MS = "100";
+  process.env.RBOX_DAEMON_WS_PONG_DEADLINE_MS = "0";
+  const remote = new MiniRemote();
+  remote.injectCommit([await remote.seedEntry("overlap.txt", "once")]);
+  const daemon = await makeDaemon(remote);
+  let sendsA = 0;
+  let wsA!: WebSocket;
+  wsA = fakeWs(() => {}, (message) => {
+    if (message !== "cursor") return;
+    sendsA++;
+    if (sendsA > 1) queueMicrotask(() => daemon.handleWsMessageData(JSON.stringify({ head: remote.head }), wsA));
+  });
+  daemon.ws = wsA;
+  daemon.markWsOpen(wsA);
+  daemon.invalidateCursorSchedule();
+  const committedEpoch = daemon.cursorEpoch;
+  const committedRun = daemon.runCursorCheck(wsA, daemon.wsGeneration, committedEpoch);
+  expect(sendsA).toBe(1);
+  daemon.handleWsMessageData(JSON.stringify({ type: "committed", sequence: 0 }), wsA);
+  await committedRun;
+  await daemon.pumpRun;
+  await sleep(140);
+  expect(sendsA).toBe(2);
+  expect(await fs.readFile(path.join(root, "overlap.txt"), "utf8")).toBe("once");
+  expect(daemon.notifyAppliedPulls).toBe(1);
+  expect(daemon.cursorAppliedPulls).toBe(0);
+
+  daemon.invalidateCursorSchedule();
+  const reconnectEpoch = daemon.cursorEpoch;
+  const reconnectRun = daemon.runCursorCheck(wsA, daemon.wsGeneration, reconnectEpoch);
+  expect(sendsA).toBe(3);
+  daemon.markWsDisconnected(wsA, "close");
+  let sendsB = 0;
+  const wsB = fakeWs(() => {}, (message) => { if (message === "cursor") sendsB++; });
+  daemon.ws = wsB;
+  daemon.markWsOpen(wsB);
+  await reconnectRun;
+  await sleep(140);
+  expect(sendsB).toBe(1);
+  expect(sendsA).toBe(3);
+  expect(daemon.cursorAppliedPulls).toBe(0);
+
+  await daemon.stop();
+  await sleep(140);
+  expect(sendsB).toBe(1);
+  expect(daemon.cursorTimer).toBeUndefined();
+});
+
+test("cursor scheduling stays off while reset-halted and resumes once ready", async () => {
+  process.env.RBOX_DAEMON_WS_CURSOR_CHECK_MS = "30";
+  process.env.RBOX_DAEMON_WS_PONG_DEADLINE_MS = "0";
+  const daemon = await makeDaemon();
+  const ws = fakeWs();
+  daemon.ws = ws;
+  daemon.resetLifecycle = "halted";
+  daemon.markWsOpen(ws);
+  expect(daemon.cursorTimer).toBeUndefined();
+  daemon.resetLifecycle = "ready";
+  daemon.resetCursorSchedule(ws);
+  expect(daemon.cursorTimer).toBeDefined();
 });
 
 test("WS-disabled plus zero backstop is the pure-polling falsification config", async () => {
@@ -296,4 +493,163 @@ test("WS-disabled plus zero backstop is the pure-polling falsification config", 
   enabled.connect = () => { connectCalls++; };
   enabled.maybeConnect();
   expect(connectCalls).toBe(1);
+});
+
+test("an applying backstop pull increments attempts and backstop attribution", async () => {
+  const remote = new MiniRemote();
+  remote.injectCommit([await remote.seedEntry("backstop.txt", "arrived")]);
+  const daemon = await makeDaemon(remote);
+  daemon.onBackstopTick();
+  await daemon.pumpRun;
+  expect(await fs.readFile(path.join(root, "backstop.txt"), "utf8")).toBe("arrived");
+  expect(daemon.wsBackstopPulls).toBe(1);
+  expect(daemon.backstopAppliedPulls).toBe(1);
+  expect(daemon.notifyAppliedPulls).toBe(0);
+});
+
+test("a failed notify is discarded and a fresh applying backstop gets the credit", async () => {
+  const remote = new MiniRemote();
+  remote.injectCommit([await remote.seedEntry("healed.txt", "backstop")]);
+  remote.throwNextLatest = true;
+  const daemon = await makeDaemon(remote);
+  daemon.handleWsMessageData(JSON.stringify({ type: "committed", sequence: 1 }));
+  await daemon.pumpRun;
+  expect(daemon.notifyAppliedPulls).toBe(0);
+  expect(daemon.backstopAppliedPulls).toBe(0);
+
+  daemon.onBackstopTick();
+  await daemon.pumpRun;
+  expect(await fs.readFile(path.join(root, "healed.txt"), "utf8")).toBe("backstop");
+  expect(daemon.notifyAppliedPulls).toBe(0);
+  expect(daemon.backstopAppliedPulls).toBe(1);
+});
+
+test("notify wins over cursor, coalesced backstop, and a carrier-less catch-up", async () => {
+  const remote = new MiniRemote();
+  remote.injectCommit([await remote.seedEntry("coalesced.txt", "notify")]);
+  const daemon = await makeDaemon(remote);
+  daemon.pumping = true; // hold the pending pull until every trigger has coalesced
+  daemon.want.pull = true; // reconnect/startup-style none carrier
+  daemon.onBackstopTick();
+  daemon.raiseQueuedCarrier("cursor");
+  daemon.handleWsMessageData(JSON.stringify({ type: "committed", sequence: 1 }));
+  expect(daemon.queuedCarrier).toBe("notify");
+  daemon.pumping = false;
+  await daemon.pump();
+  expect(daemon.notifyAppliedPulls).toBe(1);
+  expect(daemon.backstopAppliedPulls).toBe(0);
+});
+
+test("a WS generation change discards notify but preserves a masked backstop", async () => {
+  const daemon = await makeDaemon();
+  daemon.pumping = true;
+  daemon.onBackstopTick();
+  daemon.handleWsMessageData(JSON.stringify({ type: "committed", sequence: 1 }));
+  expect(daemon.queuedCarrier).toBe("notify");
+  expect(daemon.queuedBackstopPending).toBe(true);
+  const ws = fakeWs();
+  daemon.ws = ws;
+  daemon.markWsOpen(ws); // the real generation transition discards only WS provenance
+  expect(daemon.queuedCarrier).toBe("backstop");
+  expect(daemon.notifyPullPendingAt).toBeUndefined();
+  daemon.pumping = false;
+});
+
+test("a WS generation change discards cursor but preserves a masked backstop", async () => {
+  const daemon = await makeDaemon();
+  daemon.pumping = true;
+  daemon.onBackstopTick();
+  daemon.raiseQueuedCarrier("cursor");
+  expect(daemon.queuedCarrier).toBe("cursor");
+  const ws = fakeWs();
+  daemon.ws = ws;
+  daemon.markWsOpen(ws);
+  expect(daemon.queuedCarrier).toBe("backstop");
+  daemon.pumping = false;
+});
+
+test("startup and reconnect catch-up applying pulls are attributed to neither carrier", async () => {
+  const remote = new MiniRemote();
+  const first = await remote.seedEntry("startup.txt", "startup");
+  remote.injectCommit([first]);
+  const daemon = await makeDaemon(remote);
+  daemon.want.pull = true;
+  await daemon.pump();
+  expect(daemon.notifyAppliedPulls).toBe(0);
+  expect(daemon.backstopAppliedPulls).toBe(0);
+
+  const second = await remote.seedEntry("reconnect.txt", "reconnect");
+  remote.injectCommit([first, second]);
+  const ws = fakeWs();
+  daemon.ws = ws;
+  daemon.pendingCatchUpGeneration = daemon.markWsOpen(ws);
+  daemon.want.pull = true;
+  await daemon.pump();
+  expect(await fs.readFile(path.join(root, "reconnect.txt"), "utf8")).toBe("reconnect");
+  expect(daemon.notifyAppliedPulls).toBe(0);
+  expect(daemon.backstopAppliedPulls).toBe(0);
+});
+
+test("a push-internal recovery pull is attributed to neither carrier", async () => {
+  const remote = new MiniRemote();
+  remote.injectCommit([await remote.seedEntry("remote.txt", "remote")]);
+  const daemon = await makeDaemon(remote);
+  await fs.writeFile(path.join(root, "local.txt"), "local");
+  daemon.manifest = await scanManifest(root, undefined, daemon.cache);
+  daemon.want.push = true;
+  await daemon.pump();
+  expect(await fs.readFile(path.join(root, "remote.txt"), "utf8")).toBe("remote");
+  expect(daemon.notifyAppliedPulls).toBe(0);
+  expect(daemon.backstopAppliedPulls).toBe(0);
+});
+
+test("sampling exports absolute counter deltas and leaves cumulative log counters intact", async () => {
+  let monotonic = 0;
+  const logs: string[] = [];
+  const daemon = await makeDaemon(new MiniRemote(), { monotonicNow: () => monotonic, log: (line) => logs.push(line) });
+  const samples: WsHealthSample[] = [];
+  daemon.telemetry = { record: (sample) => { if (sample.kind === "ws_health") samples.push(sample); }, flush: async () => {} };
+  daemon.wsBackstopPulls = 5;
+  daemon.wsReconnects = 5;
+  daemon.wsHalfOpenDetected = 5;
+  monotonic = 120_000;
+  daemon.sampleWsHealth();
+  daemon.wsBackstopPulls = 8;
+  monotonic = 240_000;
+  daemon.sampleWsHealth();
+  expect(samples.map((sample) => sample.backstopAttempts)).toEqual([5, 3]);
+  expect(samples[0]).toMatchObject({ notifyLatencyCount: 0, notifyLatencyMaxMs: 0, cursorAppliedPulls: 0 });
+  expect(daemon.wsBackstopPulls).toBe(8);
+  daemon.onBackstopTick();
+  expect(logs).toContain("ws backstop pull (ws_backstop_pull=9)");
+  daemon.scheduleReconnect = () => {};
+  const ws = fakeWs();
+  daemon.ws = ws;
+  daemon.onPongDeadline(ws);
+  expect(logs.some((line) => line.includes("ws_half_open_detected=6"))).toBe(true);
+  expect(logs).toContain("ws_reconnect reason=timeout count=6");
+});
+
+test("monotonic WS exposure never exceeds its window and never goes negative", async () => {
+  let monotonic = 0;
+  const daemon = await makeDaemon(new MiniRemote(), { monotonicNow: () => monotonic });
+  const samples: WsHealthSample[] = [];
+  daemon.telemetry = { record: (sample) => { if (sample.kind === "ws_health") samples.push(sample); }, flush: async () => {} };
+  const ws = fakeWs();
+  daemon.ws = ws;
+  daemon.markWsOpen(ws);
+  monotonic = 100;
+  daemon.sampleWsHealth();
+  monotonic = 175;
+  daemon.markWsDisconnected(ws, "close");
+  monotonic = 200;
+  daemon.sampleWsHealth();
+  monotonic = 150; // regressed source is clamped by the daemon's monotonic high-water
+  daemon.sampleWsHealth();
+  expect(samples.map(({ windowMs, wsConnectedMs }) => ({ windowMs, wsConnectedMs }))).toEqual([
+    { windowMs: 100, wsConnectedMs: 100 },
+    { windowMs: 100, wsConnectedMs: 75 },
+    { windowMs: 0, wsConnectedMs: 0 },
+  ]);
+  expect(samples.every((sample) => sample.windowMs >= 0 && sample.wsConnectedMs >= 0 && sample.wsConnectedMs <= sample.windowMs)).toBe(true);
 });

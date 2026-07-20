@@ -1313,10 +1313,18 @@ export class WorkspaceSync {
 
   // ---- WebSocket hibernation handlers (see ws-fanout.ts for connect/broadcast) ----
 
-  // Hibernation handlers. Clients never drive state over WS, so messages are ignored
-  // (protocol pings are auto-answered via setWebSocketAutoResponse). The runtime calls
-  // these by name on the instance, so they MUST live on the class.
-  webSocketMessage(_ws: WebSocket, _message: string | ArrayBuffer): void {}
+  // Hibernation handlers. Protocol pings are auto-answered via
+  // setWebSocketAutoResponse; the cursor control frame is a KV-only wake hint.
+  // The runtime calls these by name on the instance, so they MUST live on the class.
+  webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): void {
+    if (message !== "cursor") return;
+    const head = readHead(this.ctx.storage.kv.get("head")).sequence;
+    try {
+      ws.send(JSON.stringify({ head }));
+    } catch {
+      /* a dead hibernated socket must not escape the handler */
+    }
+  }
   webSocketClose(ws: WebSocket, code: number): void {
     try {
       ws.close(code);
