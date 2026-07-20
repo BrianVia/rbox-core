@@ -19,6 +19,12 @@ function simulatedExitPromptError(): Error {
 
 const noIdentityFetch = { loadCredentials: async () => ({ state: "absent" as const, path: "/missing/credentials.json" }) };
 
+// Signed in, but skip the network identity fetch (cached plan short-circuits it).
+const signedInNoFetch = {
+  loadCredentials: async () => validCredentials,
+  readAccountProfile: (async () => ({ email: "owner@example.com", plan: "pro", signInMethod: "github" })) as never,
+};
+
 const validCredentials = {
   state: "valid" as const,
   source: "disk" as const,
@@ -31,7 +37,7 @@ test("inside workspace renders status before picker and Exit runs no action", as
   const calls: string[] = [];
   let statusDone = false;
   await runFrontDoor("/work/root", {
-    ...noIdentityFetch,
+    ...signedInNoFetch,
     statusCmd: async (root) => {
       calls.push(`status:${root}`);
       await Promise.resolve();
@@ -122,7 +128,7 @@ test("front-door sync-control choice and action flip with daemon state", async (
   ] as const) {
     const calls: string[] = [];
     await runFrontDoor("/work/root", {
-      ...noIdentityFetch,
+      ...signedInNoFetch,
       statusCmd: async () => ({ daemonRunning: running }),
       promptSelect: async (cfg) => {
         expect(cfg.choices[0]).toEqual(expectedChoice);
@@ -134,6 +140,24 @@ test("front-door sync-control choice and action flip with daemon state", async (
     });
     expect(calls).toEqual([expectedCall]);
   }
+});
+
+test("signed out: Log in leads the menu and routes to the login flow", async () => {
+  // Signed-out shows Log in first; signed-in never shows it.
+  expect(frontDoorChoices(false, false)[0]).toEqual({ name: "Log in", value: "login", description: "rbox login" });
+  expect(frontDoorChoices(false, true).some((c) => c.value === "login")).toBe(false);
+
+  let loggedIn = false;
+  await runFrontDoor("/work/root", {
+    ...noIdentityFetch, // absent credentials → signed out
+    statusCmd: async () => ({ daemonRunning: false }),
+    promptSelect: async (cfg) => {
+      expect(cfg.choices[0]).toEqual({ name: "Log in", value: "login", description: "rbox login" });
+      return "login";
+    },
+    logIn: async () => void (loggedIn = true),
+  });
+  expect(loggedIn).toBe(true);
 });
 
 test("front-door choices pin the founder order and complementary sync gate", () => {

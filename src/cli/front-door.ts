@@ -14,7 +14,7 @@ import { statusCmd, statusCmdWithBriefIdentity } from "./status-cmd.js";
 import type { BriefIdentitySource } from "./status-view.js";
 import { stderrStyle as e } from "./style.js";
 
-export type FrontDoorAction = "sync" | "start" | "stop" | "setup" | "pair" | "usage" | "logs" | "exit";
+export type FrontDoorAction = "login" | "sync" | "start" | "stop" | "setup" | "pair" | "usage" | "logs" | "exit";
 export type UntrackedMenuAction = WorkspaceKind | "nothing";
 
 type FrontDoorChoice<V> = { name: string; value: V; description?: string };
@@ -28,8 +28,10 @@ const FRONT_DOOR_TRAILING_CHOICES = [
   { name: "Exit", value: "exit" },
 ] as const;
 
-export function frontDoorChoices(daemonRunning: boolean): ReadonlyArray<FrontDoorChoice<FrontDoorAction>> {
+export function frontDoorChoices(daemonRunning: boolean, signedIn = true): ReadonlyArray<FrontDoorChoice<FrontDoorAction>> {
   return [
+    // Signed out, nothing else in the menu works — lead with the fix.
+    ...(signedIn ? [] : [{ name: "Log in", value: "login" as const, description: "rbox login" }]),
     ...(daemonRunning
       ? [{ name: "Pause syncing", value: "stop" as const, description: "rbox stop" }]
       : [
@@ -68,6 +70,7 @@ interface FrontDoorDeps {
   startSyncing?: (root: string) => Promise<void>;
   pairAnotherDevice?: () => Promise<void>;
   viewUsage?: () => Promise<void>;
+  logIn?: () => Promise<void>;
 }
 
 const FRONT_DOOR_IDENTITY_TIMEOUT_MS = 2_000;
@@ -101,6 +104,8 @@ async function promptCancelable<V>(select: SelectPrompt, cfg: { message: string;
 }
 
 export async function runFrontDoor(root: string, deps: FrontDoorDeps = {}): Promise<void> {
+  const loaded = await (deps.loadCredentials ?? loadCredentials)();
+  const signedIn = loaded.state === "valid" && Boolean(loaded.credentials.accountId);
   const freshIdentity = await fetchColdFrontDoorIdentity(deps);
   const renderStatus = deps.statusCmd ?? ((r: string, identity?: BriefIdentitySource) =>
     identity ? statusCmdWithBriefIdentity(r, identity) : statusCmd(r));
@@ -108,10 +113,14 @@ export async function runFrontDoor(root: string, deps: FrontDoorDeps = {}): Prom
   console.log();
   const action = await promptCancelable<FrontDoorAction>(deps.promptSelect ?? promptSelect, {
     message: "What would you like to do?",
-    choices: frontDoorChoices(daemonRunning),
+    choices: frontDoorChoices(daemonRunning, signedIn),
   });
 
   if (action === undefined || action === "exit") return;
+  if (action === "login") return (deps.logIn ?? (async () => {
+    const { login } = await import("./auth-cmd.js");
+    await login(DEFAULT_REMOTE);
+  }))();
   if (action === "sync") return (deps.syncNow ?? runSyncCommand)(root);
   if (action === "logs") return (deps.viewLogs ?? ((r) => logsDaemon(r, { follow: false, lines: DEFAULT_LOG_LINES })))(root);
   if (action === "stop") return (deps.pauseSyncing ?? stopDaemonAndRecordDesired)(root);
