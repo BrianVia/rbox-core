@@ -10,9 +10,10 @@
  * BIP39 gives a checksum (catches typos) and a familiar word format. We implement
  * just entropy↔mnemonic; we never use the BIP39 seed function.
  */
+import { createHash } from "node:crypto";
 import { signKeyPairFromSeed, type SignKeyPair } from "./asym.js";
 import { BIP39_WORDS } from "./bip39-wordlist.js";
-import { hkdf, randomBytes, sha256, utf8 } from "./primitives.js";
+import { hkdf, randomBytes, utf8 } from "./primitives.js";
 
 const ENTROPY_BYTES = 32; // 256-bit → 24 words
 const RECOVERY_SALT = utf8("rbox/recovery/v1");
@@ -25,7 +26,7 @@ export function generateRecoveryKey(): Uint8Array {
 /** Encode 32 bytes of entropy as a 24-word BIP39 mnemonic (with checksum). */
 export async function rkToPhrase(rk: Uint8Array): Promise<string> {
   if (rk.length !== ENTROPY_BYTES) throw new Error("recovery key must be 32 bytes");
-  const checksum = (await sha256(rk))[0]!; // first 8 bits (CS = ENT/32 = 8)
+  const checksum = createHash("sha256").update(rk).digest()[0]!; // first 8 bits (CS = ENT/32 = 8)
   const bits: number[] = [];
   for (const b of rk) for (let i = 7; i >= 0; i--) bits.push((b >> i) & 1);
   for (let i = 7; i >= 0; i--) bits.push((checksum >> i) & 1); // append 8 checksum bits → 264 = 24×11
@@ -57,7 +58,7 @@ export async function phraseToRk(phrase: string): Promise<Uint8Array> {
   }
   let cs = 0;
   for (let j = 0; j < 8; j++) cs = (cs << 1) | bits[ENTROPY_BYTES * 8 + j]!;
-  if (cs !== (await sha256(rk))[0]!) throw new Error("recovery phrase checksum failed — check for a typo");
+  if (cs !== createHash("sha256").update(rk).digest()[0]!) throw new Error("recovery phrase checksum failed — check for a typo");
   return rk;
 }
 
