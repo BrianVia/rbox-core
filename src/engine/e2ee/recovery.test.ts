@@ -11,6 +11,21 @@ describe("bip39 recovery phrase", () => {
     expect(toHex(await phraseToRk(phrase))).toBe(toHex(rk));
   });
 
+  test("round-trips several recovery keys and still rejects a corrupted word", async () => {
+    const keys = [
+      fromHex("00".repeat(32)),
+      fromHex("ff".repeat(32)),
+      Uint8Array.from({ length: 32 }, (_, index) => index),
+    ];
+    for (const rk of keys) {
+      expect(toHex(await phraseToRk(await rkToPhrase(rk)))).toBe(toHex(rk));
+    }
+
+    const words = (await rkToPhrase(fromHex("7f".repeat(32)))).split(" ");
+    words[0] = "zoo";
+    await expect(phraseToRk(words.join(" "))).rejects.toThrow(/checksum/);
+  });
+
   test("matches the canonical BIP39 all-zeros test vector", async () => {
     // entropy of 32 zero bytes → the well-known "abandon ... art" mnemonic
     const rk = fromHex("00".repeat(32));
