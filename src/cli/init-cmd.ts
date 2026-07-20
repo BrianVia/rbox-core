@@ -24,6 +24,7 @@ import { promptSelect, promptInput, promptPath } from "./prompt.js";
 import { promptWorkspacePick } from "./workspace-picker.js";
 import { recoveryKitOptionsFromFlags, type RecoveryKitOptions } from "./recovery-kit.js";
 import { createPopulateStatusWriter } from "./populate-status.js";
+import type { GitPushPlan } from "./sync-git.js";
 import { acquireWorkspaceSyncMutex, assertSyncMutex, releaseWorkspaceSyncMutex, type WorkspaceSyncMutex } from "./sync-mutex.js";
 import {
   RebindConsentRequiredError,
@@ -34,6 +35,38 @@ import {
 
 export const WORKSPACE_DEFINITION =
   "a workspace can be a single repository or a folder of many repositories, or just a folder.";
+
+const INTERACTIVE_GIT_LIST_LIMIT = 5;
+
+/** Init-only presentation of the structured git plan. The forensic formatter remains
+ * a full, single log line for daemon and other grep-oriented sinks. */
+export function formatInteractiveGitPushSummary(plan: GitPushPlan): string {
+  const oneLine = (value: string) => value
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ");
+  const bullets = (items: readonly string[]) => {
+    const shown = items.slice(0, INTERACTIVE_GIT_LIST_LIMIT).map((item) => `    • ${oneLine(item)}`);
+    if (items.length > INTERACTIVE_GIT_LIST_LIMIT) shown.push(`    …and ${items.length - INTERACTIVE_GIT_LIST_LIMIT} more`);
+    return shown;
+  };
+  const lines = [
+    `git-sync: captured ${plan.captured.length} · carried ${plan.carried.length} · skipped ${plan.skipped.length} · deferred ${plan.deferred.length} · removed ${plan.removed.length}`,
+  ];
+  if (plan.captured.length) lines.push("  captured:", ...bullets(plan.captured));
+  if (plan.skipped.length) {
+    lines.push(
+      "  skipped:",
+      ...bullets(plan.skipped.map(({ relPath, reason }) => `${relPath} — ${reason}`)),
+    );
+  }
+  return lines.join("\n");
+}
+
+/** Founder-specified init label; progressLabel supplies terminal-safe repo detail. */
+export function attachingGitHistoryLabel(done: number, total: number, detail?: string): string {
+  const generic = progressLabel("gitcap", done, total, detail);
+  return `attaching git history (${generic.slice("capturing git state ".length)})`;
+}
 
 /**
  * Gather the missing init inputs interactively (all widgets render on stderr, so
@@ -415,6 +448,16 @@ async function executeInitPlan(
     }
     const { cfg: authed, deps } = await buildAuthedRemote(plan.root, Date.now, undefined, loadedCredentials);
     deps.syncMutex = syncMutex;
+    let pendingGitSummary: GitPushPlan | undefined;
+    deps.onGitLog = (line, pushPlan) => {
+      if (pushPlan) pendingGitSummary = pushPlan;
+      else console.error(line);
+    };
+    const flushGitSummaries = () => {
+      if (!pendingGitSummary) return;
+      process.stderr.write(`${stderrStyle.green(formatInteractiveGitPushSummary(pendingGitSummary))}\n`);
+      pendingGitSummary = undefined;
+    };
     if (plan.firstSync === "push") {
       const sp = spinner("publishing initial snapshot — scanning files");
       try {
@@ -451,6 +494,7 @@ async function executeInitPlan(
             ? `published ${style.sym.arrow} sequence ${style.cyan(String(r1.sequence))}`
             : `already in sync — nothing to upload ${style.dim(`(sequence ${r1.sequence})`)}`
         );
+        flushGitSummaries();
         logDebugSummary(report1, (l) => console.log(style.dim(l)));
 
         // Commit 2 — attach git history (design 108 §3.1). CONDITIONAL: only when commit 1
@@ -463,6 +507,19 @@ async function executeInitPlan(
           deps.filesFirstStartedAt = undefined; // commit 2 is not the files-synced milestone
           const report2 = beginReport("push");
           deps.report = report2;
+          let attachedRepos = 0;
+          deps.onProgress = (done, total, phase, detail, bytes) => {
+            if (phase === "gitcap") {
+              // Byte ticks use the completed count and can precede the first settle;
+              // update only as repositories finish so the index stays truthful.
+              if (done > attachedRepos) {
+                attachedRepos = done;
+                sp2.update(attachingGitHistoryLabel(done, total, detail));
+              }
+              return;
+            }
+            sp2.update(progressLabel(phase, done, total, detail, bytes));
+          };
           try {
             const r2 = await push(plan.root, authed, deps);
             sp2.succeed(
@@ -470,6 +527,7 @@ async function executeInitPlan(
                 ? `git history attached ${style.sym.arrow} sequence ${style.cyan(String(r2.sequence))}`
                 : `git history up to date ${style.dim(`(sequence ${r2.sequence})`)}`
             );
+            flushGitSummaries();
             logDebugSummary(report2, (l) => console.log(style.dim(l)));
           } catch {
             // Commit 1's files are durable; git resumes via the daemon or the next push.
@@ -497,6 +555,7 @@ async function executeInitPlan(
         console.log(
           `${style.bold("synced")}: ${style.green(`${writes} pulled`)}, ${conflicts.length ? style.red(`${conflicts.length} conflict(s)`) : style.dim("0 conflict(s)")} ${style.sym.arrow} sequence ${style.cyan(String(pushedSequence))}`
         );
+        flushGitSummaries();
         for (const c of conflicts) console.log(`  ${style.sym.warn} ${style.yellow(c.path ?? "?")} ${style.dim(`(local kept as ${c.keepLocalAs})`)}`);
         writeGuidedGenesisPullNotice(opts.guidedSetup, initialRemoteSequence);
       } catch (e) {

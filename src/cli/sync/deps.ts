@@ -13,6 +13,7 @@ import type { EncryptAndUploadOptions } from "../sync-recovery.js";
 import type { WorkspaceSyncMutex } from "../sync-mutex.js";
 import type { TransferProgress } from "../transfer-progress.js";
 import type { TelemetryRecorder } from "../telemetry/queue.js";
+import type { GitPushPlan } from "../sync-git/plan.js";
 
 type CurrentWriteContext = {
   kek: Uint8Array;
@@ -59,9 +60,10 @@ export interface SyncDeps {
   /** Test seam for debounce timing; production leaves the design-75 ~10s default. */
   encryptCacheFlushMs?: number;
   /** Forensic git-sync log sink (design 43 §10): capture/carry/defer/remove summaries on
-   *  push, per-repo apply/conflict lines on pull. Default: console.error. The daemon
-   *  injects its timestamped logger so the lines land in the daemon log. */
-  onGitLog?: (line: string) => void;
+   *  push, per-repo apply/conflict lines on pull. Push summaries include their structured
+   *  plan as optional presentation context; grep-oriented sinks can ignore it and retain
+   *  the exact full line. Default: console.error. The daemon injects its dated logger. */
+  onGitLog?: (line: string, pushPlan?: GitPushPlan) => void;
   /** Operational warning/metrics sink. Daemons inject their instance-local dated
    * logger; foreground commands retain their existing stderr defaults. */
   warningSink?: (line: string) => void;

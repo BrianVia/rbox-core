@@ -25,6 +25,7 @@ import {
   gitDivergenceFastRepoSource,
   gitFingerprintVersionForBounds,
   gitIncomingKey,
+  formatGitPushLine,
   nextDeferral,
   planGitSections,
   withRevalidatedGitPartialApplies,
@@ -2711,12 +2712,20 @@ test("push emits gitcap progress per CAPTURED repo — monotonic settle count, r
   await commitFile(beta, "b.txt", "b", "c1");
 
   type Ev = { done: number; total: number; detail?: string; bytesDone?: number; bytesTotal?: number };
-  const cap = (): { events: Ev[]; deps: SyncDeps } => {
+  const cap = (): { events: Ev[]; logs: string[]; summaries: GitPushPlan[]; deps: SyncDeps } => {
     const events: Ev[] = [];
+    const logs: string[] = [];
+    const summaries: GitPushPlan[] = [];
     return {
       events,
+      logs,
+      summaries,
       deps: {
         ...depsA,
+        onGitLog: (line, pushPlan) => {
+          logs.push(line);
+          if (pushPlan) summaries.push(pushPlan);
+        },
         onProgress: (done, total, phase, detail, bytes) =>
           phase === "gitcap" && events.push({ done, total, detail, bytesDone: bytes?.bytesDone, bytesTotal: bytes?.bytesTotal }),
       },
@@ -2732,8 +2741,11 @@ test("push emits gitcap progress per CAPTURED repo — monotonic settle count, r
   // can arrive before the repo count advances.
   expect(Math.max(...first.events.map((e) => e.done))).toBe(2);
   expect(first.events.some((e) => e.bytesDone !== undefined && e.bytesDone > 0 && e.bytesTotal === undefined)).toBe(true);
-  // Detail is the repo basename (a nested repo shows its own name, not the path).
-  expect(new Set(first.events.map((e) => e.detail))).toEqual(new Set(["alpha", "beta"]));
+  // Detail is the workspace-relative repo path, so nested repositories stay unique.
+  expect(new Set(first.events.map((e) => e.detail))).toEqual(new Set(["alpha", "sub/beta"]));
+  // Interactive sinks receive structure without changing the forensic log payload.
+  expect(first.summaries).toHaveLength(1);
+  expect(first.logs).toEqual([formatGitPushLine(first.summaries[0]!)]);
 
   // A second push with nothing changed CARRIES both repos (no capture) → zero gitcap
   // events. Proves the denominator is capture-scoped, not repo-count-scoped.

@@ -788,7 +788,7 @@ export async function planGitSections(
     }
     gitBytesDone += abs - prev;
     repoByteAbs.set(rel, abs);
-    onProgress?.(captureDone, repoCount, "gitcap", rel === "." ? path.basename(root) : path.basename(rel), { bytesDone: gitBytesDone });
+    onProgress?.(captureDone, repoCount, "gitcap", rel === "." ? path.basename(root) : rel, { bytesDone: gitBytesDone });
   };
   const uploadsDir = path.join(root, ".rbox", "state", "uploads");
   await poolMap(toCapture, GIT_CAPTURE_CONCURRENCY, async (rel) => {
@@ -812,7 +812,7 @@ export async function planGitSections(
         ++captureDone,
         repoCount,
         "gitcap",
-        rel === "." ? path.basename(root) : path.basename(rel),
+        rel === "." ? path.basename(root) : rel,
         gitBytesDone > 0 ? { bytesDone: gitBytesDone } : undefined
       );
     }
