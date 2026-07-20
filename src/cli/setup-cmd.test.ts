@@ -580,6 +580,38 @@ test("existing-workspace rebind confirmation supplies a narrowed witness to runI
   }
 });
 
+test("non-empty existing-workspace wizard accept/decline passes typed adoption consent only on acceptance", async () => {
+  for (const accepted of [true, false]) {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), `rbox-setup-adopt-${accepted}-`));
+    await fs.writeFile(path.join(root, "preexisting.txt"), "local\n");
+    let confirms = 0;
+    try {
+      const result = await stepWorkspace(
+        { cwd: root, defaultRemote: "https://api.test" },
+        { preselectedKind: "existing", header: "Workspace" },
+        {
+          loadCredentials: validSetupCredentials,
+          promptWorkspacePick: (async () => ({ kind: "picked", pick: { workspaceId: "ws_adopt" } })) as never,
+          promptPath: async () => root,
+          loadConfigIfPresent: async () => undefined,
+          loadRawState: async () => undefined,
+          promptConfirm: async () => { confirms++; return accepted; },
+          runInit: async (flags, initOpts) => {
+            expect(flags["no-interactive"]).toBe("true");
+            expect(initOpts.adoptConsent !== undefined).toBe(accepted);
+            return { workspaceId: "ws_adopt", deviceId: "dev", root };
+          },
+          writeStderr: () => undefined,
+        } as never
+      );
+      expect(result.kind).toBe("completed");
+      expect(confirms).toBe(1);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  }
+});
+
 test("v2 transaction quarantine composes end to end with the next setup rebind", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-setup-quarantine-rebind-"));
   const oldStream = "https://api.test::ws_old::root";

@@ -109,6 +109,7 @@ import { SyncStateReporter } from "../telemetry/sync-state.js";
 import { inspectResetJournalSafety } from "../reset-halt-inspection.js";
 import { clearResetHaltHealth, readResetHaltHealth, writeResetHaltHealth } from "../reset-health.js";
 import { RESET_RECOVERY_RETRY_MS, ResetHaltLogGate } from "./reset-halt-policy.js";
+import { acknowledgeCacheGeneration, readCacheGeneration } from "../adopt-cache.js";
 
 type RboxBarAmbientStatus = AmbientDaemonStatusV1 & {
   fileCount: number;
@@ -364,6 +365,7 @@ export class RboxDaemon {
    *  a process-global module mock (which leaks across test files). */
   private startWatcherFn: typeof startWatcher = startWatcher;
   private workspaceConfigStat?: { mtimeMs: number; size: number };
+  private observedAdoptCacheGeneration = 0;
 
   private readonly want: Wants = { pull: false, push: false, fullScan: false, deepScan: false };
   private pumping = false;
@@ -467,6 +469,7 @@ export class RboxDaemon {
           const initialState = this.syncBase ?? await this.loadSyncBase(startupMutex.handle);
           if (boundaryBootstrapped || await this.bootstrapAgreement(initialState)) {
             if (!boundaryBootstrapped) this.seedFromState(initialState);
+            await this.adoptionCacheGenerationBoundary();
             await this.replaceManifestFromScan(this.cache, initialState.lastSyncedManifest, undefined, undefined, this.watcherScanMode());
             this.pruneCache();
             await this.cache.save(this.root);
@@ -934,6 +937,7 @@ export class RboxDaemon {
         const syncMutex = acquired.handle;
         try {
           if (!await this.resetOperationBoundary(syncMutex)) break;
+          await this.adoptionCacheGenerationBoundary();
           const binding = this.syncBase ?? await this.loadSyncBase();
           const bindingMatches = await daemonBindingMatches(this.root, syncStreamId(this.cfg), expectedStateNonce(binding));
           if (!bindingMatches) {
@@ -2078,6 +2082,25 @@ export class RboxDaemon {
       respectGitignore: this.cfg.respectGitignore === true,
       knownGitRepos: Object.keys(state?.lastSyncedManifest.gitRepos ?? {}),
     });
+  }
+
+  /** Adoption invalidation is a durable cross-process generation, not merely a
+   * disk-cache deletion. Observe it only under the workspace mutex, drop every
+   * resident scan hint, and acknowledge only after an uncached unpruned scan. */
+  private async adoptionCacheGenerationBoundary(): Promise<void> {
+    const record = await readCacheGeneration(this.root);
+    if (!record || record.generation <= this.observedAdoptCacheGeneration) return;
+    const fresh = new HashCache();
+    this.rebuildMatcher(this.syncBase);
+    const prior = this.manifest;
+    const scanned = await this.replaceManifestFromScan(fresh, prior, undefined, "deep scan", "unpruned");
+    if (scanned.deferred.size > 0) throw new Error("adoption cache generation full scan deferred; publication remains blocked");
+    this.cache = fresh;
+    this.pruneCache();
+    await this.cache.save(this.root);
+    await acknowledgeCacheGeneration(this.root, record.generation, `daemon-${this.bootId}`);
+    this.observedAdoptCacheGeneration = record.generation;
+    this.log(`adoption cache generation ${record.generation} acknowledged after full scan`);
   }
 
   private async reloadWorkspaceConfigIfChanged(): Promise<void> {

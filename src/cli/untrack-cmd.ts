@@ -23,6 +23,7 @@ import path from "node:path";
 import { RBOX_DIR } from "./config.js";
 import { forceKill, isDaemonRunning, removeDaemonRuntime, stopDaemon, waitForExit } from "./daemon-control.js";
 import { style } from "./style.js";
+import { loadAdoptJournal } from "./adopt-journal.js";
 
 const STOP_TIMEOUT_MS = 5000;
 const KILL_TIMEOUT_MS = 2000;
@@ -36,6 +37,22 @@ export interface UntrackOptions {
 
 export async function untrack(opts: UntrackOptions): Promise<void> {
   const { root, force } = opts;
+
+  // Preserve untrack's established, specific refusal for a swapped workspace
+  // binding before the adoption-journal reader performs its broader control-path
+  // validation.  This is only an early refusal; removeRboxDir repeats the check
+  // at the destructive boundary.
+  const earlyRboxPath = path.join(root, RBOX_DIR);
+  const earlyRboxStat = await fsp.lstat(earlyRboxPath).catch((error: NodeJS.ErrnoException) =>
+    error.code === "ENOENT" ? undefined : Promise.reject(error),
+  );
+  if (earlyRboxStat?.isSymbolicLink()) {
+    throw new Error(`${earlyRboxPath} is a symlink — refusing to remove it (resolve it manually)`);
+  }
+
+  if (await loadAdoptJournal(root)) {
+    throw new Error("retained adoption data can be removed only with `rbox adopt clean`; untrack refused");
+  }
 
   if (!force && opts.confirm) {
     const ok = await opts.confirm();

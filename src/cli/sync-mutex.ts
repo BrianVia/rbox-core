@@ -3,6 +3,7 @@ import path from "node:path";
 import { acquireLock, type AcquireLockOptions, type OwnedLock } from "../engine/git/lockfile.js";
 import { writeFileAtomic } from "../engine/fsutil.js";
 import { resolveDaemonLogSources } from "./daemon-control.js";
+import { inspectAdoptFence } from "./adopt-journal.js";
 
 export type SyncMutexMode = "cli" | "daemon";
 
@@ -12,7 +13,27 @@ export interface WorkspaceSyncMutex {
   /** No safe identity/link primitive exists. Callers continue through the legacy
    * unlocked state path with the workspace config lane disabled. */
   readonly degraded?: { reason: string };
+  /** Exact on-disk lock marker used to bind adoption continuation/recovery. */
+  readonly incarnation: string;
+  /** Set before release is attempted so a stale handle can never be replayed. */
+  released?: boolean;
+  readonly adoptAuthority?: { kind: "resume" | "abort" | "clean"; journalId: string };
 }
+
+interface BaselineContinuationCapability {
+  journalId: string;
+  root: string;
+  stream: string;
+  nonce: string;
+  mutexIncarnation: string;
+  active: boolean;
+  consumed: boolean;
+}
+
+// Invocation-local and unforgeable by structural WorkspaceSyncMutex values.
+// Only adopt-lifecycle receives the functions which manipulate this WeakMap;
+// nested sync/pull/push merely borrow the already-held handle.
+const baselineCapabilities = new WeakMap<WorkspaceSyncMutex, BaselineContinuationCapability>();
 
 export type MutexBlockerKind = "live" | "foreign" | "stale-owned" | "fence";
 export type LockStarvationReason = "foreign" | "identity-drift" | "stale-owned" | "fence";
@@ -113,7 +134,7 @@ async function degradedHandle(root: string, onDegraded?: (message: string) => vo
       // Surfacing is advisory; the entire point of this bucket is never-fatal sync.
     }
   }
-  return { root, degraded: { reason: "identity-unavailable" } };
+  return { root, degraded: { reason: "identity-unavailable" }, incarnation: "degraded", released: false };
 }
 
 export const workspaceSyncMutexDegraded = (handle: WorkspaceSyncMutex | undefined): boolean => handle?.degraded !== undefined;
@@ -137,6 +158,15 @@ export async function acquireWorkspaceSyncMutex(
   mode: SyncMutexMode,
   options: SyncMutexOptions = {},
 ): Promise<WorkspaceSyncMutex | DaemonMutexResult> {
+  return acquireWorkspaceSyncMutexInternal(root, mode, options);
+}
+
+async function acquireWorkspaceSyncMutexInternal(
+  root: string,
+  mode: SyncMutexMode,
+  options: SyncMutexOptions,
+  adoptAuthority?: { kind: "resume" | "abort" | "clean"; journalId: string },
+): Promise<WorkspaceSyncMutex | DaemonMutexResult> {
   const lockPath = syncMutexPath(root);
   await fs.mkdir(path.dirname(lockPath), { recursive: true });
   const attempts = mode === "cli" ? (options.attempts ?? 16) : 1;
@@ -146,11 +176,45 @@ export async function acquireWorkspaceSyncMutex(
     const result = await acquireLock(lockPath, options.lock);
     if (result.status === "acquired") {
       await fs.rm(lockingHealthPath(root), { force: true });
-      const handle = { root, lock: result.lock };
+      const handle: WorkspaceSyncMutex = {
+        root,
+        lock: result.lock,
+        incarnation: result.lock.raw,
+        released: false,
+        ...(adoptAuthority ? { adoptAuthority } : {}),
+      };
+      const fence = await inspectAdoptFence(root);
+      const authorized = adoptAuthority !== undefined
+        && fence.status !== "none" && fence.status !== "corrupt"
+        && fence.journalId === adoptAuthority.journalId
+        && (adoptAuthority.kind === "clean" ? fence.status === "terminal" : fence.status === "active");
+      if ((fence.status === "active" || fence.status === "corrupt") && !authorized
+        || adoptAuthority !== undefined && !authorized) {
+        await releaseWorkspaceSyncMutex(handle).catch(() => {});
+        if (mode === "daemon") {
+          return {
+            status: "contended",
+            holderKey: fence.status === "active" ? `adopt-${fence.journalId}` : "adopt-corrupt",
+            blockerKind: "fence",
+            warningReason: "fence",
+          };
+        }
+        const detail = fence.status === "corrupt" ? ` (${fence.reason})` : "";
+        throw new Error(`workspace has an incomplete adoption${detail}; run \`rbox adopt status|resume|abort\``);
+      }
       return mode === "daemon" ? { status: "acquired", handle } : handle;
     }
     if (result.status === "unsupported") {
       const handle = await degradedHandle(root, options.onDegraded);
+      const fence = await inspectAdoptFence(root);
+      if (adoptAuthority || fence.status === "active" || fence.status === "corrupt") {
+        if (mode === "daemon") {
+          return { status: "contended", holderKey: fence.status === "active" ? `adopt-${fence.journalId}` : "adopt-fence", blockerKind: "fence", warningReason: "fence" };
+        }
+        throw new Error(adoptAuthority
+          ? `adopt ${adoptAuthority.kind} requires a non-degraded workspace mutex`
+          : "workspace has an incomplete adoption; run `rbox adopt status|resume|abort`");
+      }
       return mode === "daemon" ? { status: "acquired", handle } : handle;
     }
     if (result.status === "error") throw new Error(`workspace sync mutex failed: ${String(result.error)}`);
@@ -160,11 +224,85 @@ export async function acquireWorkspaceSyncMutex(
   throw new WorkspaceSyncBusyError();
 }
 
+/** Recovery-only entry. No public command can mint an authority: the expected
+ * journal id comes from the validated direct-path recovery reader. */
+export async function acquireWorkspaceSyncMutexForAdopt(
+  root: string,
+  kind: "resume" | "abort" | "clean",
+  journalId: string,
+  options: SyncMutexOptions = {},
+): Promise<WorkspaceSyncMutex> {
+  const handle = await acquireWorkspaceSyncMutexInternal(root, "cli", options, { kind, journalId });
+  if ("status" in handle) throw new Error("unexpected daemon mutex result");
+  if (workspaceSyncMutexDegraded(handle)) {
+    await releaseWorkspaceSyncMutex(handle).catch(() => {});
+    throw new Error(`adopt ${kind} requires a non-degraded workspace mutex`);
+  }
+  return handle;
+}
+
 export function assertSyncMutex(handle: WorkspaceSyncMutex, root: string): void {
   if (handle.root !== root) throw new Error("workspace sync mutex belongs to a different root");
+  if (handle.released) throw new Error("workspace sync mutex has already been released");
+  const continuation = baselineCapabilities.get(handle);
+  if (continuation && !continuation.active) throw new Error("workspace adoption fence requires its active baseline continuation");
+}
+
+function assertMutexBase(handle: WorkspaceSyncMutex, root: string): void {
+  if (handle.root !== root) throw new Error("workspace sync mutex belongs to a different root");
+  if (handle.released) throw new Error("workspace sync mutex has already been released");
+}
+
+/** Internal adoption seam: bind a newly-persisted or refreshed nonce to the
+ * exact handle before any baseline sync can borrow it. */
+export function bindAdoptBaselineContinuation(handle: WorkspaceSyncMutex, input: Omit<BaselineContinuationCapability, "active" | "consumed">): void {
+  assertMutexBase(handle, input.root);
+  if (handle.incarnation !== input.mutexIncarnation || handle.degraded || !handle.lock) {
+    throw new Error("adoption continuation mutex incarnation mismatch");
+  }
+  const prior = baselineCapabilities.get(handle);
+  if (prior?.active) throw new Error("adoption continuation is already active");
+  baselineCapabilities.set(handle, { ...input, active: false, consumed: false });
+}
+
+/** Internal adoption seam: activate one journaled top-level baseline call. */
+export function beginAdoptBaselineContinuation(handle: WorkspaceSyncMutex, input: Omit<BaselineContinuationCapability, "active" | "consumed">): void {
+  assertMutexBase(handle, input.root);
+  const prior = baselineCapabilities.get(handle);
+  if (!prior || prior.journalId !== input.journalId || prior.root !== input.root || prior.stream !== input.stream
+    || prior.nonce !== input.nonce || prior.mutexIncarnation !== input.mutexIncarnation) {
+    throw new Error("adoption continuation binding mismatch");
+  }
+  if (prior.active || prior.consumed) throw new Error("adoption continuation replay rejected");
+  prior.active = true;
+  prior.consumed = true;
+}
+
+/** Internal adoption seam: end borrowing after nested pull/push return. */
+export function endAdoptBaselineContinuation(handle: WorkspaceSyncMutex, nonce: string): void {
+  const active = baselineCapabilities.get(handle);
+  if (!active || !active.active || active.nonce !== nonce) throw new Error("adoption continuation capability mismatch");
+  active.active = false;
+}
+
+/** Lift only the invocation-local exception after phase-2 baseline completion. */
+export function retireAdoptBaselineContinuation(handle: WorkspaceSyncMutex, nonce: string): void {
+  const continuation = baselineCapabilities.get(handle);
+  if (!continuation || continuation.active || !continuation.consumed || continuation.nonce !== nonce) {
+    throw new Error("adoption continuation retirement mismatch");
+  }
+  baselineCapabilities.delete(handle);
+}
+
+export async function assertHealthyOwnedSyncMutex(handle: WorkspaceSyncMutex, root: string): Promise<void> {
+  assertMutexBase(handle, root);
+  if (workspaceSyncMutexDegraded(handle) || !handle.lock) throw new Error("operation requires a non-degraded workspace mutex");
+  if (!await handle.lock.isOwner()) throw new Error("workspace sync mutex ownership was lost");
 }
 
 export async function releaseWorkspaceSyncMutex(handle: WorkspaceSyncMutex): Promise<void> {
+  if (handle.released) throw new Error("workspace sync mutex already released");
+  handle.released = true;
   if (!handle.lock) return;
   const released = await handle.lock.release();
   if (!released.released) throw new Error("workspace sync mutex ownership was lost before release");

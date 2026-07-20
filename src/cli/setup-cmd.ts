@@ -25,6 +25,8 @@ import os from "node:os";
 import path from "node:path";
 import fs from "node:fs/promises";
 import { GITIGNORE_CHOICES, WORKSPACE_DEFINITION, continueInitWithPrecreatedWorkspace, preflightInitRebind, runInit } from "./init-cmd.js";
+import { mintWizardAdoptConsent, type AdoptConsentWitness } from "./adopt-consent.js";
+import { rootHasAdoptableContent } from "./adopt-inventory.js";
 import { collapseHome, interpretWorkspaceNameAnswer } from "./init-plan.js";
 import { EXISTING_ACCOUNT_ENROLLMENT_MESSAGE, login, pairCreate, redeemPair, runGenesisEnrollment } from "./auth-cmd.js";
 import { enrollViaPrevalidatedRecovery, PairingTokenShapeError, parsePairingToken } from "./e2ee-client.js";
@@ -657,6 +659,7 @@ export async function stepWorkspace(
     const dir = await askPath({ message: "Which directory should rbox sync?", default: opts.cwd, cwd: opts.cwd });
     writeStderr(`${e.dim(`will sync: ${dir}`)}\n`);
     let resetConsent: ResetConsentWitness | undefined;
+    let adoptConsent: AdoptConsentWitness | undefined;
     const flags = workspaceFlags({ kind: "join", root: dir, workspace, name });
     if (setupOpts.noSync) flags["no-sync"] = "true";
     try {
@@ -688,6 +691,11 @@ export async function stepWorkspace(
           projectId: "root",
         });
       }
+      if (!setupOpts.noSync && !oldStream && await rootHasAdoptableContent(dir) && process.env.RBOX_ADOPT_OVERLAY !== "0") {
+        writeStderr(`${e.dim("rbox will establish the remote baseline first, fetch-union eligible Git branches, overlay local files, and retain every collision under .rbox/adopt.")}\n`);
+        const adopt = await confirm({ message: "Adopt the existing contents of this directory?", default: true });
+        if (adopt) adoptConsent = mintWizardAdoptConsent({ root: dir, stream: nextStream, workspaceId: workspace });
+      }
       const outcome = await executeInit(flags, {
         cwd: opts.cwd,
         defaultRemote: opts.defaultRemote,
@@ -695,6 +703,7 @@ export async function stepWorkspace(
         guidedSetup: true,
         resetConsent,
         credentialResult: loadedCredentials,
+        adoptConsent,
       });
       return outcome ? { kind: "completed", outcome } : { kind: "terminal" };
     } catch (error) {
