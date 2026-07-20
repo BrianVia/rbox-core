@@ -452,6 +452,25 @@ export async function refreshHostIdentityLedger(
   filePath = hostIdentityLedgerPath(),
   seenAt = bootSeenAt,
 ): Promise<ResolvedLockIdentity> {
+  // The ledger is a boot-history CACHE that only sharpens stale-lock cleanup
+  // across reboots. If ANY step fails to acquire its lock, read, or write it —
+  // a transient stat race, a security agent monitoring ~/.rbox, an ACL/permission
+  // quirk — workspace locking must still work: the live host/boot/platform
+  // identity (already resolved by the caller) fully distinguishes machines and
+  // boots. So a broken cache degrades to "no persisted history", never to a
+  // failed identity that makes every lock acquisition "unsupported".
+  try {
+    return await refreshHostIdentityLedgerStrict(current, filePath, seenAt);
+  } catch {
+    return current;
+  }
+}
+
+async function refreshHostIdentityLedgerStrict(
+  current: ResolvedLockIdentity,
+  filePath: string,
+  seenAt: number,
+): Promise<ResolvedLockIdentity> {
   await fs.mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
   const ledgerIdentity: LockIdentitySource = { current: async () => current, probe: systemLockIdentity.probe };
   const deadline = Date.now() + 2_000;
@@ -466,12 +485,22 @@ export async function refreshHostIdentityLedger(
   try {
     let boots: HostIdentityBoot[];
     let read: HostIdentityBoot[] | undefined;
-    try {
-      read = await readHostIdentityLedger(filePath);
-    } catch {
-      // An unclassified read error must not overwrite existing history.
-      throw new Error("host identity ledger unreadable");
+    let lastReadError: unknown;
+    // A stat-race read failure (something touching ~/.rbox mid-read) is commonly
+    // transient — retry a few times before giving up rather than quarantining a
+    // file we simply couldn't read this instant. A persistent failure throws and
+    // the non-fatal wrapper above degrades to no history.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        read = await readHostIdentityLedger(filePath);
+        lastReadError = undefined;
+        break;
+      } catch (error) {
+        lastReadError = error;
+        if (attempt < 2) await sleep(15);
+      }
     }
+    if (lastReadError) throw new Error("host identity ledger unreadable");
     if (read === undefined) {
       const corrupt = `${filePath}.corrupt`;
       await fs.rm(corrupt, { force: true }).catch(() => {});

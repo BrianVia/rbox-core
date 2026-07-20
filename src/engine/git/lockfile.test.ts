@@ -263,6 +263,22 @@ describe("design 118 host identity ledger", () => {
     expect(await readHostIdentityLedger(filePath)).toEqual(refreshed.knownBoots);
   });
 
+  test("an unreadable ledger degrades to the live identity instead of disabling locking", async () => {
+    if (process.getuid?.() === 0) return; // root bypasses the mode-bit denial this relies on
+    const root = await tempDir();
+    const filePath = path.join(root, "host-identity.json");
+    await fs.writeFile(filePath, JSON.stringify({ version: 1, boots: [] }));
+    await fs.chmod(filePath, 0o000); // open() now fails EACCES → an unclassified read error
+    const resolved: ResolvedLockIdentity = { ...current, platformUuid: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" };
+    // Must NOT throw: the live identity is valid, so locking proceeds; the broken
+    // ledger cache degrades to "no persisted boot history".
+    const refreshed = await refreshHostIdentityLedger(resolved, filePath, 123);
+    expect(refreshed.hostId).toBe(current.hostId);
+    expect(refreshed.bootId).toBe(current.bootId);
+    expect(refreshed.platformUuid).toBe("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+    await fs.chmod(filePath, 0o600).catch(() => {}); // let tempDir cleanup remove it
+  });
+
   test("no-follow read rejects symlinks without reading their target", async () => {
     const root = await tempDir();
     const target = path.join(root, "secret");
