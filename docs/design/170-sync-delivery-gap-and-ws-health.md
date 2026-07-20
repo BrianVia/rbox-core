@@ -1,244 +1,310 @@
-# 170 — Sync delivery-gap recovery + WebSocket-health telemetry
+# 170 — Sync delivery-gap: WebSocket-health telemetry (Phase 1) + gap recovery (Phase 2)
 
-Status: **v1 — pending review**
+Status: **v2 — pending review**
 Owner: Claude (founder-directed, 2026-07-20)
 Origin: field report — a paying-adjacent user (Max) observed a small commit
-taking ~4 minutes to propagate between two of his machines. Root-caused here to
-a structural gap in the live-notification path, not a regression.
+taking ~4 minutes to propagate between two of his machines.
+
+**Reframe from v1 (r1 finding 17):** this is a *hypothesis consistent with the
+timing*, not a confirmed root cause. The keepalive mechanism below is proven in
+code; the field attribution is not, and Max's two-machine logs are still
+pending. The design is therefore split so the part that does not depend on the
+root cause ships first and *is what confirms the hypothesis fleet-wide*:
+
+- **Phase 1 (ship now): honest fleet WS-health telemetry.** Does not assume the
+  cause. Turns the one-off "ask the user to paste logs" into a standing fleet
+  signal. This is the deliverable that tells us whether — and how often — the
+  delivery gap actually happens.
+- **Phase 2 (gated on field confirmation): delivery-gap recovery.** Only built
+  if Phase 1 (or Max's logs) confirms alive-socket-but-behind is a real,
+  recurring mode. Mechanism reworked to be DO-wake-only (r1 finding 4).
 
 ## Problem (field evidence)
 
 A single small commit took ~4 minutes to appear on a second machine. The
-healthy path is sub-second: a push settles in 0.4–3 s (watcher debounce,
-`src/cli/daemon/watcher.ts:210-211`), the server broadcasts a `committed`
-frame **synchronously** on commit (`apps/api/src/workspace-sync.ts:715`), and
-the receiver pulls immediately on that frame (`src/cli/daemon/daemon.ts:2194`).
+healthy path is sub-second: a push settles in 0.4–3 s (`src/cli/daemon/watcher.ts:210-211`),
+the server broadcasts a `committed` frame **synchronously** on commit
+(`apps/api/src/workspace-sync.ts:689-718`), and the receiver pulls immediately
+on that frame — the `committed` type branch is `daemon.ts:2194`, the
+`request("pull")` at `daemon.ts:2197`.
 
-~4 minutes is one **backstop-poll** cycle: `POLL_BACKSTOP_DEFAULT_MS = 300_000`
-±25 % = 3.75–6.25 min (`src/cli/daemon/policy.ts:26`, `daemon.ts:2280-2286`).
-The receiver only fell to the backstop because the WebSocket `committed`
-notification never arrived — yet the socket was *not* detected as dead.
+~4 minutes is one **backstop-poll** cycle: `POLL_BACKSTOP_DEFAULT_MS = 300_000`,
+subsequent ticks ±25 % = 3.75–6.25 min (`src/cli/daemon/policy.ts:26`,
+`daemon.ts:2280-2286`; first tick is uniform `[0, interval)`).
 
-### Why the socket looks healthy while dropping messages
+### The proven mechanism: liveness is decoupled from delivery
 
-The server registers a Cloudflare **edge auto-response** for keepalives:
+The server registers a Cloudflare **edge auto-response** for keepalives
+(`apps/api/src/workspace-sync.ts:124-127`):
 
 ```
 this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
 ```
-(`apps/api/src/workspace-sync.ts:126`)
 
-The client pings every `WS_PING_MS = 25_000` (`daemon.ts:2221-2231`). The edge
-answers `pong` **without waking the Durable Object**, and every inbound frame —
-including that auto-pong — re-arms the client's half-open deadline
-(`armPongDeadline`, `daemon.ts:2187`; default `WS_PONG_DEADLINE_DEFAULT_MS =
-60_000`, `policy.ts:25`). So:
+The client pings every `WS_PING_MS = 25_000` (`daemon.ts:2221-2230`). The edge
+answers `pong` **without waking the Durable Object**, and Bun delivers that
+text `pong` through the client `message` listener (`daemon.ts:2324-2326`), which
+re-arms the half-open deadline *before* recognizing it as a pong
+(`daemon.ts:2184-2190`); the protocol `pong` event re-arms too
+(`daemon.ts:2327-2330`). Default deadline `WS_PONG_DEADLINE_DEFAULT_MS = 60_000`
+(`policy.ts:25`). Therefore:
 
-- **Liveness (pong) is decoupled from delivery (`committed` frames).** A socket
-  can be perfectly "alive" per keepalive yet miss a broadcast. The client has
-  no signal that it is behind.
-- **Half-open detection cannot fire for this case** — the auto-pong keeps the
-  deadline alive. `onPongDeadline` (`daemon.ts:2252`) only triggers when *no*
-  frame (not even a pong) arrives for 60 s, i.e. only for a fully-dead pipe,
-  not a lossy one.
-- **The only recovery for a missed `committed` frame is the 5-min backstop.**
+- **Liveness (pong) is decoupled from delivery (`committed` frames).** An
+  application auto-pong keeps the no-frame deadline from ever firing.
+- **Half-open detection (`onPongDeadline`, `daemon.ts:2252`) cannot fire while
+  auto-pongs arrive** — it only triggers when *no* frame at all arrives for
+  60 s (a fully-dead pipe), not a pipe that drops one `committed` frame.
+- **For a genuinely missed `committed` frame on an otherwise-open socket, the
+  only recovery is the 5-min backstop.** (Precisely: "only recovery" holds for
+  an idle daemon whose socket stays open and which gets no other pull trigger —
+  a later local change, reconnect, or safety scan would also recover it.)
 
-The broadcast itself is correct — it enumerates `ctx.getWebSockets()`
-(`apps/api/src/ws-fanout.ts:27`), which survives hibernation, and swallows a
-per-socket `send` failure so one dead socket can't abort the fanout
-(`ws-fanout.ts:39-41`). That swallow is the point: **a dropped or failed
-delivery to one receiver is silent and unrecoverable until the backstop.**
-Candidate triggers for a single missed frame (exact mix to be confirmed from
-field logs, see Non-goals / Open decision): a reconnect race (old socket
-`CLOSING`, new socket not yet accepted at broadcast time — skipped at
-`ws-fanout.ts:28`), a transient `ws.send` throw (`ws-fanout.ts:39`), or a
-hibernation edge. The fix below is deliberately **independent of which
-trigger** — it does not rely on delivery being reliable.
+The broadcast itself is correct — `ctx.getWebSockets()` survives hibernation
+(`ws-fanout.ts:27`), non-OPEN/over-age sockets are skipped, and a per-socket
+`send` throw is swallowed so one dead socket can't abort the fanout
+(`ws-fanout.ts:37-41`). That swallow (`ws-fanout.ts:39`) is the one *unhandled*
+way a single frame is silently lost to an otherwise-healthy connection. Other
+candidate triggers are already self-healing and are **not** evidence of a
+persistent gap (r1 finding 17): a reconnect race is followed by an unconditional
+catch-up pull on new open (`daemon.ts:2315-2322`), and hibernation is supported
+by accepted hibernatable sockets + `getWebSockets`. **Whether Max hit a real
+alive-socket delivery gap is unconfirmed until logs; Phase 1 is how we find
+out.**
 
 ### Second problem: the failure mode is invisible fleet-wide
 
-The design-120 telemetry pipeline (`POST /v1/telemetry` → Analytics Engine,
-`apps/api/src/telemetry-ingest.ts`) records five client kinds — `propagation`,
-`first_publish`, `upload_lane`, `capability`, `safety_event`
-(`src/cli/telemetry/contract.ts:26-64`). The cockpit renders a "Client apply
-delay" panel from `client.propagation`. But:
+The design-120 pipeline (`POST /v1/telemetry` → Analytics Engine,
+`apps/api/src/telemetry-ingest.ts`) records five client kinds
+(`src/cli/telemetry/contract.ts:27-66`). But:
 
-- `propagation` is recorded **only when `notifyPendingAt` is set**
-  (`daemon.ts:1371-1372`), and `notifyPendingAt` is set in exactly one place —
-  receipt of a `committed` WS frame (`daemon.ts:2196`). A **backstop-carried
-  pull emits no `propagation` sample at all.** The apply-delay metric is
-  survivorship-biased to the fast path; the slow syncs we care about are
-  literally absent from it.
-- The WS-health counters that *would* reveal the gap — `wsReconnects`,
-  `wsBackstopPulls`, `wsHalfOpenDetected` (`daemon.ts:295-297`), and the raw
-  `notify_latency_ms` value — are written **only to the local daemon log**
-  (`daemon.ts:965-969, 2255, 2283`). No telemetry path exists. That is why
-  diagnosing Max required asking him to paste logs by hand.
+- The `propagation` apply-delay metric is recorded **only when a `committed`
+  frame set `notifyPendingAt`** (`daemon.ts:1371-1373`, stamp at
+  `daemon.ts:2194-2197`). A backstop-carried pull emits **no** `propagation`
+  sample. The panel is survivorship-biased to the fast path.
+- The WS-health counters that would reveal the gap — `wsReconnects`,
+  `wsBackstopPulls`, `wsHalfOpenDetected` (`daemon.ts:295-297`) and raw
+  `notify_latency_ms` (`daemon.ts:965-969`) — are **log-only** (reconnect log
+  `daemon.ts:2144-2145`, half-open `daemon.ts:2255`, backstop `daemon.ts:2283`).
+  No telemetry path. That is why diagnosing Max needs hand-pasted logs.
 
 ## Goals
 
-1. **Bound worst-case propagation to ~one cursor interval (target ≤ 60 s)**
-   even when a `committed` frame is missed, without relying on delivery
-   reliability and without shortening the 5-min backstop fleet-wide.
-2. **Make the failure mode observable fleet-wide** — upload WS-health and count
-   backstop-carried syncs — so we can watch the fix land and catch regressions
-   without a human in the loop. (Value scales with the user base.)
-3. **Self-heal on upgrade.** The WS layer holds no persisted state; every
-   daemon restart re-establishes the socket fresh. The fix must ship as an
-   ordinary binary that resolves on `rbox upgrade` / stop-start, with nothing
-   to migrate or reset.
+1. **Make the failure mode observable fleet-wide** (Phase 1): upload honest
+   WS-health signal so a delivery gap shows up as a fleet trend, not a support
+   anecdote. Value scales with the user base, and it is the data source for a
+   future alerting cron (see Future work).
+2. **Bound worst-case propagation** when a `committed` frame is missed (Phase 2,
+   gated), without shortening the 5-min backstop fleet-wide and without polling
+   every idle daemon over the authenticated HTTP path.
+3. **Self-heal on upgrade.** The WS layer holds no persisted state; every daemon
+   restart re-establishes the socket fresh. Both phases ship as ordinary
+   binaries that resolve on `rbox upgrade` / stop-start, nothing to migrate.
 
-## Mechanism
+## Phase 1 — honest fleet WS-health telemetry
 
-### Part A — delivery-gap recovery: an idle sequence cursor check
+### New `ws_health` telemetry kind (additive; existing families untouched)
 
-Add a client-driven **cursor check** that learns the server's head sequence and
-pulls if the local applied sequence is behind — independent of whether any
-`committed` frame was delivered.
+Adding a *new* kind does not shift any existing family's positional doubles
+(r1 verified non-finding). It is emitted on the existing 120 s flush timer
+(`daemon.ts:124,1477-1481`), gated by `RBOX_TELEMETRY` opt-out
+(`contract.ts:19-21`).
 
-- **Wire shape.** A lightweight request to the workspace DO that wakes it and
-  returns the current head: `{ head: <sequence> }` (the DO already holds
-  `head.sequence` in KV, `workspace-sync.ts:111,262`). Reuse the existing
-  authenticated sync channel; this is a read of already-authorized state, no
-  new privilege. Prefer a tiny HTTP `GET …/head` on the existing RboxApi over a
-  new WS message type, so it is trivially testable and stateless. (Decision
-  pinned: HTTP over a new WS frame — the WS frame would need its own
-  request/response correlation; the head read is cheap and cacheless.)
-- **Cadence — `WS_CURSOR_CHECK_MS`, target 45 s**, sitting between the 25 s
-  keepalive and the 300 s backstop. Adaptive to avoid defeating hibernation
-  fleet-wide:
-  - Only armed while the WS is believed connected (when disconnected, reconnect
-    already does a catch-up pull, `daemon.ts:2321`; the backstop covers the
-    rest).
-  - **Reset on every `committed` frame** (`daemon.ts:2194` path): a workspace
-    receiving live notifications never pays for cursor checks. The check only
-    fires during a notification *gap* — exactly the missed-frame case.
-  - On a check that finds the client behind, emit a `propagation`-equivalent
-    sample tagged as cursor-carried (see Part B) and `request("pull")`.
-- **Cost.** Each fired check wakes the DO once. Because it fires only after
-  `WS_CURSOR_CHECK_MS` of notification silence, an actively-syncing pair pays
-  nothing; a fully-idle connected daemon wakes its DO ~1×/45 s (far cheaper
-  than the alternative of removing the auto-response and waking on every 25 s
-  ping). With the backstop retained as the ultimate safety net, this is purely
-  additive latency reduction.
+Fields (declaration order is load-bearing = AE `doubles` order,
+`telemetry-ingest.ts:24-27`). **All fields must be valid at zero observations**
+(the validator requires every declared number, `telemetry-ingest.ts:133-138`),
+and daemon-side percentiles are *not* sent — a percentile-of-percentiles is not
+composable into a fleet percentile (r1 finding 12). Instead we send count + sum
++ max so the cockpit can compute fleet mean/max and a real distribution later:
 
-This is robust to **both** candidate failure modes: a missed fan-out (socket
-alive, frame lost) is caught within `WS_CURSOR_CHECK_MS`; a truly dead socket
-is still caught by the existing half-open path, and the cursor request failing
-gives a second, faster signal to cycle.
+```
+ws_health:
+  numbers (interval deltas since last successful flush, all ≥ 0, valid at 0):
+    windowMs                 // wall time this sample covers (for rate denominators)
+    wsReconnects
+    wsHalfOpenDetected
+    backstopAttempts         // every scheduled backstop tick (was wsBackstopPulls)
+    backstopAppliedPulls     // backstop ticks whose pull APPLIED a change
+    cursorAppliedPulls       // Phase 2; always 0 until Phase 2 ships
+    notifyAppliedPulls       // committed-carried pulls that applied a change
+    notifyLatencyCount       // # of notify_latency_ms observations this window
+    notifyLatencySumMs       // Σ notify_latency_ms (fleet mean = Σsum/Σcount)
+    notifyLatencyMaxMs       // max (0 when count==0)
+  enums: []
+```
 
-Reliability, not correctness: like all notification-path logic, the cursor
-check is an optimization over the backstop. If it fails, behavior degrades to
-today's 5-min backstop — never worse.
+Rationale for the count fields (r1 finding 13): the old `wsBackstopPulls`
+increments on *every* tick before `request("pull")` (`daemon.ts:2280-2285`), so
+every healthy idle account has a steady backstop-attempt rate. "A sync had to be
+carried by the backstop" is `backstopAppliedPulls`, not attempts. The alert
+signature (a workspace repeatedly getting changes via backstop instead of
+notify) is `backstopAppliedPulls / (backstopAppliedPulls + notifyAppliedPulls)`
+— a real ratio with a real denominator, not attempt volume.
 
-### Part B — WebSocket-health + backstop-carried telemetry
+### Counter bookkeeping (r1 findings 10, 11)
 
-Two additive changes to the design-120 pipeline (append-only; never reorder
-existing fields — the declaration order is the positional AE `doubles` order,
-`telemetry-ingest.ts:24-27`):
+- The existing counters stay **absolute/cumulative** so the log lines remain
+  truthful running counts (`daemon.ts:2144,2255,2283` unchanged). Interval
+  deltas are derived against a `lastFlushedBaseline` snapshot taken **only after
+  a flush is acknowledged 2xx** — never on enqueue.
+- The queue entry is an **additive accumulator**, not "coalesced like
+  capability" (which overwrites, `queue.ts:40-50`). On a failed/deferred flush
+  (network throw / 429 / 5xx, `queue.ts:61-85`, `retries:0`) the pending sample
+  is *retained and the next interval's deltas are added into it*, so the outage
+  the metric is meant to diagnose does not erase itself. Baseline advances only
+  on ack.
+- Restart/overflow: on daemon boot counters start at 0 and baseline at 0 (a
+  restart just emits one short window; acceptable). Counters are monotonic
+  within a boot.
 
-1. **New `ws_health` telemetry kind**, flushed on the existing 120 s timer
-   (`TELEMETRY_FLUSH_MS`, `daemon.ts:124`), carrying the counters that are
-   currently log-only:
-   - numbers: `notifyLatencyP50Ms`, `notifyLatencyP95Ms` (from observed
-     `notify_latency_ms` values since last flush), `wsReconnects`,
-     `wsBackstopPulls`, `wsHalfOpenDetected`, `cursorBehindPulls` (Part A).
-     These are deltas since last flush (counters snapshot-and-reset), so AE
-     aggregation is additive.
-   - Append the schema to **both** `TELEMETRY_SAMPLE_SCHEMAS`
-     (`src/cli/telemetry/contract.ts`) and `SERVER_TELEMETRY_SAMPLE_SCHEMAS`
-     (`apps/api/src/telemetry-ingest.ts`); the drift test that imports both
-     copies keeps them in lockstep.
-   - Add a queue ring in `src/cli/telemetry/queue.ts` (coalesced, like
-     `capability`), gated by the existing `RBOX_TELEMETRY` opt-out
-     (`contract.ts:19-21`).
-   - AE index/blob1 `client.ws_health`; emit via the existing
-     `emitClientMetric` path (`telemetry-ingest.ts:106`).
+### Wire + drift safety (r1 findings 2, 15)
 
-2. **Emit `propagation` on non-notification pulls.** Today `propagation` is
-   skipped when `notifyPendingAt` is undefined (`daemon.ts:1371`). Extend it so
-   a backstop- or cursor-carried pull that applies changes also records a
-   `propagation` sample, with a new enum field `carriedBy`
-   (`notify | cursor | backstop`). This makes slow syncs visible in the exact
-   panel that currently hides them, and lets the cockpit split apply-delay by
-   carrier. (Append `carriedBy` as a new trailing enum — existing
-   `deliveryToApplyMs` number stays first.)
+- No change to the `propagation` sample. We do **not** append `carriedBy` to it
+  (r1 finding 2: the server allow-lists exact keys and requires every enum, so
+  appending a required field breaks mixed-version rollout in both directions;
+  r1 finding 3: a carried pull has no honest `deliveryToApplyMs` anyway). The
+  carried-vs-notify story lives entirely in the `ws_health` counts above.
+- Mirror the schema in **both** `TELEMETRY_SAMPLE_SCHEMAS`
+  (`src/cli/telemetry/contract.ts`) and `SERVER_TELEMETRY_SAMPLE_SCHEMAS`
+  (`apps/api/src/telemetry-ingest.ts`).
+- Extend the hard-coded AE-layout test (`apps/api/test/telemetry-ingest.test.ts:76-95`)
+  to assert the exact `ws_health` doubles positions, and add an **ordered**
+  field-name comparison for every family (the current drift test compares
+  objects, which ignores order — `test:61-67`).
+- Add a queue ring for `ws_health` in `queue.ts` and AE index/blob1
+  `client.ws_health` via the existing `emitClientMetric` (`telemetry-ingest.ts:101`).
 
-### Part C — cockpit panel (rbox-admin)
+### Cockpit (Phase 1) — fleet-only (r1 finding 1)
 
-Add a "Sync delivery health" fetcher + panel:
+Design 120 forbids account/device/workspace identifiers in AE
+(`docs/design/120-telemetry-ingest.md:79-97`), so **there is no per-account
+grouping** and no per-account red tile. Part C is fleet-only:
 - `fetchWsHealth` in `rbox-admin/src/lib/server/client-telemetry.ts` reading
-  `index1='client.ws_health'` — fleet + per-account reconnect rate, backstop
-  rate, half-open rate, cursor-behind rate, notify-latency p50/p95.
-- Split the existing propagation panel by `carriedBy` so
-  backstop/cursor-carried apply-delay is visible next to notify-carried.
-- Panel in `rbox-admin/src/lib/components/ClientTelemetryPanels.svelte` under
-  "Sync experience". A red tile when an account's backstop rate is high relative
-  to its `committed`-notify rate — that is the signature of Max's situation and
-  should surface without anyone pasting logs.
+  `index1='client.ws_health'`: fleet backstop-carried ratio, reconnect rate,
+  half-open rate, notify-latency mean/max — all over the `windowMs`
+  denominator, 7-day trend.
+- A "Sync delivery health" panel in `ClientTelemetryPanels.svelte` under "Sync
+  experience", trending the backstop-carried ratio. A rising fleet ratio is the
+  signal that the delivery gap is real and worsening.
+- Per-account attribution, if later required, needs a separate
+  privacy-reviewed path (D1, not AE) — explicit **non-goal** here.
+
+## Phase 2 — delivery-gap recovery (GATED on field confirmation)
+
+Built only if Phase 1 or Max's logs confirm a recurring alive-socket-but-behind
+mode. Mechanism reworked from v1's HTTP `/head` (r1 findings 4, 9) to a
+**WebSocket control frame**, which the socket already authenticated at connect —
+no per-check directory/account/workspace D1 auth work, no new HTTP route:
+
+- **Cursor frame.** Client sends a non-`ping` text frame (e.g. `cursor`) which
+  is *not* the auto-response key, so it falls through to `webSocketMessage`,
+  wakes the DO, which replies `{ head: <sequence> }` from KV
+  (`workspace-sync.ts` head write `689-693`, authoritative read `1187-1192`).
+  Add a `cursor` action to the DO message dispatch (`workspace-sync.ts:160-184`)
+  + a test; no Worker HTTP route changes.
+- **Cursor correctness.** Client pulls iff `head > localAppliedSequence`, where
+  the compared value is the current stream's `syncBase.lastSyncedSequence`
+  (`src/cli/config.ts:129-142`; lower-sequence writes rejected `config.ts:545-579`;
+  E2EE verifies the unsigned server head against the signed chain
+  `src/cli/e2ee-remote.ts:449-480`). The head is only an untrusted wake hint;
+  the normal pull retains all correctness checks.
+- **Cadence — `WS_CURSOR_CHECK_MS`, target 45 s, with jitter** (r1 finding 5).
+  Env override `RBOX_DAEMON_WS_CURSOR_CHECK_MS`; `0` disables; off entirely
+  under `RBOX_DAEMON_WS_RELIABILITY_DISABLED=1` (parity, `daemon.ts:426-430`).
+  Armed only while connected; reset (with fresh jitter) on every `committed`
+  frame so a live pair pays nothing *during* live notifications. Honest residual
+  cost: one DO-waking frame per notification gap ≥ cadence, plus one every
+  cadence while idle-connected. This is DO-wake-only — no HTTP auth/D1 — which
+  is the entire point of the mechanism change.
+- **One in flight, bounded, generation-fenced** (r1 findings 6, 8). At most one
+  cursor frame outstanding; a cursor-specific timeout well below cadence;
+  self-schedule only after completion. Capture `(socket, wsGeneration)` before
+  awaiting (`daemon.ts:2119-2137,2150-2153,2184-2187`); on reply, discard if the
+  generation advanced; abort/clear on `committed`, disconnect, reset-halt, and
+  `stop()` (`daemon.ts:649-684`) via a single `AbortController`; re-arm in
+  `finally`. A stale completion must re-read the local sequence and skip if a
+  newer pull already advanced it.
+- **Failure = degrade-not-worse, no socket cycling** (r1 finding 7). A failed
+  cursor frame is caught, logged, and the timer re-armed. It does **not** cycle
+  the socket — cycling is left to the existing half-open/close/error paths, so
+  an API/DO incident cannot trigger a fleet reconnect herd. Worst case falls
+  back to today's exact 5-min backstop.
+- **Attribution** (r1 finding 14). The daemon coalesces all pull reasons into one
+  `want.pull` (`daemon.ts:703-713`) and clears the notify stamp at dequeue
+  (`daemon.ts:963-979`). Define a queued **carrier token** with precedence
+  `notify > cursor > backstop`, generation-tagged, carried through a failed pull
+  until an *applying* success (then increment the matching `*AppliedPulls`
+  counter) or explicitly discarded on a newer higher-precedence trigger. A no-op
+  pull increments nothing. This makes the counts in Phase 1 unambiguous.
 
 ## Contracts
 
-- `WS_CURSOR_CHECK_MS` (default 45_000) and env override
-  `RBOX_DAEMON_WS_CURSOR_CHECK_MS`; `0` disables (parity with the existing
-  `wsReliabilityDisabled` switch, `daemon.ts:426-430`). Under
-  `RBOX_DAEMON_WS_RELIABILITY_DISABLED=1` the cursor check is off, matching the
-  existing disabled semantics.
-- `GET …/head` returns `{ head: number }`; the client pulls iff
-  `head > localAppliedSequence`. No body, cacheless, authenticated as the
-  existing device principal.
-- `ws_health` sample fields and order fixed as above; `carriedBy` appended to
-  `propagation`. Both mirrored in the server schema and covered by the
-  contract-drift test.
-- Counters (`wsReconnects`, `wsBackstopPulls`, `wsHalfOpenDetected`,
-  `cursorBehindPulls`) become snapshot-and-reset deltas per flush; the local
-  log lines are unchanged (still absolute running counts).
+- `ws_health` fields + order fixed as above; valid at zero observations;
+  interval deltas via ack-advanced baseline; additive accumulation on failed
+  flush.
+- Phase 2: `cursor` DO message → `{ head:number }`; client pulls iff
+  `head > syncBase.lastSyncedSequence`; `WS_CURSOR_CHECK_MS` default 45_000 +
+  jitter, env-overridable, disabled under the existing reliability switch; one
+  in flight; generation-fenced; failure re-arms without cycling.
 
 ## Tests the implementation MUST write
 
-1. **Cursor closes a missed-frame gap.** Simulate a `committed` frame that is
-   dropped (server broadcasts to a socket whose `send` is stubbed to no-op);
-   assert the receiver pulls within `WS_CURSOR_CHECK_MS`, not at the backstop.
-2. **Cursor is suppressed under live notifications.** With `committed` frames
-   arriving, assert zero cursor checks fire (no DO wake) — proves the adaptive
-   reset.
-3. **Backstop-carried pull emits `propagation carriedBy=backstop`.** The exact
-   regression for the invisibility bug: a pull with `notifyPendingAt` undefined
-   still records a sample.
-4. **`ws_health` round-trips the schema** through both contract copies
-   (extend the existing drift test) and is rejected/counted correctly by
-   `telemetry-ingest.ts` (bad field → `client.telemetry.drops`).
-5. **Opt-out honored.** `RBOX_TELEMETRY=0` emits no `ws_health`;
-   `RBOX_DAEMON_WS_CURSOR_CHECK_MS=0` fires no cursor checks; behavior falls
-   back to today's backstop exactly.
-6. **Degrade-not-worse.** With the cursor endpoint returning 5xx/timeouts, the
-   daemon still backstops on schedule and never wedges.
+**Phase 1**
+1. `ws_health` round-trips through both contract copies; a bad field →
+   `client.telemetry.drops`; the AE-layout test asserts exact doubles positions
+   and ordered field names per family.
+2. Additive accumulation across a **failed** flush: network-throw, 5xx, and 429
+   across multiple 120 s intervals do **not** lose deltas; baseline advances only
+   on 2xx.
+3. Counters valid at zero: a reconnect/backstop-only window emits
+   `notifyLatencyCount=0`, `notifyLatencyMaxMs=0`, no rejection.
+4. Log lines stay absolute after a flush reset (cumulative counters unchanged).
+5. `RBOX_TELEMETRY=0` emits no `ws_health`.
+6. `backstopAppliedPulls` increments only when a backstop-carried pull applied a
+   change; a no-op backstop tick increments only `backstopAttempts`.
+
+**Phase 2 (when built)**
+7. A dropped `committed` frame (fanout `send` stubbed no-op) → receiver pulls
+   within `WS_CURSOR_CHECK_MS`, not at the backstop; `cursorAppliedPulls`
+   increments once.
+8. Live `committed` frames suppress cursor frames (no DO wake).
+9. Blackholed cursor frame (no reply, not just 5xx) → bounded by the cursor
+   timeout, one in flight, socket **not** cycled, backstop still fires on time.
+10. Races: in-flight cursor vs `committed`, vs reconnect (generation bump), vs
+    `stop()` — no double-apply, no false `cursorAppliedPulls`, no close of the
+    replacement socket.
 
 ## Non-goals
 
-- **Not** removing the edge auto-response (it is the correct cheap-liveness /
-  hibernation optimization; the fix adds a delivery-gap signal alongside it,
-  not instead of it).
-- **Not** shortening `POLL_BACKSTOP_DEFAULT_MS` as the primary fix (crude, adds
-  fleet-wide poll load, and still can't tell "alive but behind").
-- **Not** touching the commit sequencer, fanout enumeration, or E2EE. This is
-  notification-path reliability + observability only.
-- **Not** server-side root-causing the specific single-frame-drop trigger in
-  this doc. The fix is trigger-independent by design; if field telemetry later
-  shows one dominant trigger (e.g. a reconnect race), that becomes a separate,
-  smaller follow-up. This is the deliberate altitude choice: recover from a
-  missed frame generically rather than chase every way one can be missed.
+- **Not** removing the edge auto-response (correct cheap-liveness / hibernation
+  optimization; Phase 2 adds a delivery signal alongside it).
+- **Not** shortening `POLL_BACKSTOP_DEFAULT_MS` as the fix (crude; adds
+  fleet-wide poll load; still can't tell "alive but behind").
+- **Not** per-account WS-health in AE (design-120 privacy contract). A future
+  account-scoped path is a separate design.
+- **Not** touching the commit sequencer, fanout enumeration, or E2EE.
+- **Not** server-side root-causing the specific single-frame-drop trigger;
+  Phase 2 recovers generically from a missed frame rather than chasing every way
+  one can be missed. If Phase 1 telemetry later isolates one dominant trigger,
+  that becomes a separate follow-up.
+
+## Future work (adjacent, not in scope)
+
+Phase 1's `ws_health` family is shaped to be **alert-friendly** (rates over an
+explicit `windowMs` denominator). A follow-on design (171) can add a Cloudflare
+**scheduled worker** that runs the same AE SQL the cockpit uses and posts to a
+**Slack incoming webhook** when a fleet threshold trips (e.g. backstop-carried
+ratio, 5xx, ingest drops), with simple per-alert state to avoid re-paging. The
+cron + AE-query pieces already exist (diagnostics sweep uses a scheduled
+handler; the cockpit already queries AE); the only new dependency is the Slack
+webhook secret. Gated behind this PR landing so the alert queries target real
+`ws_health` data.
 
 ## Open decision (pending field logs)
 
-Max's two-machine logs (grep of `notify_latency_ms | ws backstop pull |
-ws half-open | ws_reconnect | ws connected | pull applied | push: published`)
-will confirm the failure-mode mix: predominantly `ws backstop pull` with **no**
-`ws half-open`/`ws_reconnect` churn ⇒ missed-fanout (this doc's primary target,
-cursor check is the fix); heavy half-open/reconnect churn ⇒ a dead-socket
-component too, which would additionally motivate revisiting keepalive/pong
-tuning. The **telemetry half (Parts B/C) ships regardless** — it is what turns
-that one-off log grep into a standing fleet signal. The cursor cadence
-(`WS_CURSOR_CHECK_MS`) is the one tunable to revisit once the field data
-quantifies the gap.
-```
+Max's two-machine log grep (`notify_latency_ms | ws backstop pull | ws half-open
+| ws_reconnect | ws connected | pull applied | push: published`) confirms the
+failure-mode mix: predominantly `ws backstop pull` with **no** half-open/reconnect
+churn ⇒ alive-socket delivery gap (Phase 2's target). Heavy half-open/reconnect
+churn ⇒ a dead-socket component, which would instead motivate keepalive/pong
+tuning. **Phase 1 ships regardless** and quantifies this fleet-wide; the Phase 2
+`WS_CURSOR_CHECK_MS` cadence is the one knob to set once field data exists.
