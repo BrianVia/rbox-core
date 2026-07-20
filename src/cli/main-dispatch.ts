@@ -177,6 +177,12 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
       await runSetup({ cwd: process.cwd(), defaultRemote: DEFAULT_REMOTE, flags });
       break;
     }
+    case "adopt": {
+      if (positional.length > 2) throw new Error("usage: rbox adopt <status|resume|abort|clean> [path] [--json] [--yes]");
+      const { adoptCmd } = await import("./adopt-cmd.js");
+      await adoptCmd(positional[0], positional[1] ?? process.cwd(), { json: jsonMode, yes: flags.yes === "true" });
+      break;
+    }
     case "track": {
       const { track, printTrackResult } = await import("./track-cmd.js");
       printTrackResult(await track(positional[0], flags, DEFAULT_REMOTE));
@@ -327,7 +333,17 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
     }
     case "export": {
       const { runExport } = await import("./export-cmd.js");
-      await runExport(flags);
+      const localRoot = await findRoot(process.cwd());
+      if (localRoot) await withWorkspaceSyncMutex(localRoot, async () => runExport(flags));
+      else {
+        const { findAdoptRoot, inspectAdoptFence } = await import("./adopt-journal.js");
+        const adoptRoot = await findAdoptRoot(process.cwd());
+        if (adoptRoot) {
+          const fence = await inspectAdoptFence(adoptRoot);
+          if (fence.status === "active" || fence.status === "corrupt") throw new Error("workspace has an incomplete adoption; run `rbox adopt status|resume|abort`");
+        }
+        await runExport(flags);
+      }
       break;
     }
     case "status": {
@@ -459,7 +475,7 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
       const spec = positional[0];
       if (!spec) throw new Error("usage: rbox restore <path>@<seq>  (e.g. rbox restore src/app.ts@3)");
       const root = await resolveRoot(undefined);
-      await restoreCmd(root, spec);
+      await withWorkspaceSyncMutex(root, async () => restoreCmd(root, spec));
       break;
     }
     case "key": {

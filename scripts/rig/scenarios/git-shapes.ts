@@ -627,7 +627,7 @@ async function runPartialOnline(ctx: RigCtx, rec: Recorder): Promise<void> {
   const bRecord = settledB.repoRecords?.["s4-partial-online"];
   const recordSettled = (record: RepoRecordView | undefined) => record?.sourceSeq === 2 && record.base !== undefined && record.pending === undefined && record.partial === undefined && record.resolutionKey === undefined && record.deferrals === undefined;
   rec.assert("[s4-partial-online] post-settlement A repo record exact shape", recordSettled(aRecord) && aRecord?.advertised !== undefined && Object.values(aRecord.branchBaseOrigins ?? {}).some((origin) => origin.kind === "publisher-ack"), JSON.stringify(aRecord));
-  rec.assert("[s4-partial-online] post-settlement B repo record exact shape", recordSettled(bRecord) && bRecord?.advertised === undefined && Object.values(bRecord.branchBaseOrigins ?? {}).some((origin) => origin.kind === "pull-p"), JSON.stringify(bRecord));
+  rec.assert("[s4-partial-online] post-settlement B repo record exact shape", recordSettled(bRecord) && bRecord?.advertised === undefined && Object.values(bRecord?.branchBaseOrigins ?? {}).some((origin) => origin.kind === "pull-p"), JSON.stringify(bRecord));
 }
 
 async function runPartialOffline(ctx: RigCtx, rec: Recorder): Promise<void> {

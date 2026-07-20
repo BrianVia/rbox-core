@@ -34,6 +34,9 @@ export interface ProvisionOpts {
   /** Extra flags appended to BOTH `init --new` (A) and `init --workspace` (B) — e.g.
    *  `["--git", "false"]` to disable git-sync for a pure plain-file workload. */
   initFlags?: string[];
+  /** Flags appended only to B's existing-workspace join. Adoption scenarios use
+   * this for explicit headless consent without changing A's create path. */
+  joinInitFlags?: string[];
   /** Seed B AFTER pairing but BEFORE `init --workspace` — the non-empty-join
    *  case (a directory with pre-existing content adopting an existing
    *  workspace). The closure captures ctx for cross-device copies. */
@@ -75,6 +78,15 @@ async function initWithTransientRetry(device: Device, log: (line: string) => voi
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (!PROVISION_TRANSIENT.test(message)) throw error;
+    const hasAdoption = (await device.exec(["test", "-f", `${GUEST.workDir}/.rbox/adopt/journal.json`], { allowFail: true })).exitCode === 0;
+    if (hasAdoption) {
+      log(`  transient provisioning failure — resuming retained adoption once`);
+      const status = await device.rbox(["adopt", "status", GUEST.workDir, "--json"], { cwd: GUEST.workDir });
+      const phase = (JSON.parse(status.stdout) as { phase?: string }).phase;
+      return phase === "complete"
+        ? device.rbox(["sync"], { cwd: GUEST.workDir })
+        : device.rbox(["adopt", "resume", GUEST.workDir], { cwd: GUEST.workDir });
+    }
     log(`  transient provisioning failure — retrying once after unbind`);
     await device.exec(["rm", "-rf", `${GUEST.workDir}/.rbox`], { allowFail: true });
     return await run();
@@ -159,7 +171,7 @@ export async function provisionPair(ctx: RigCtx, rec: Recorder, opts: ProvisionO
   }
   const initB = await rec.step(doPull ? "[B] init --workspace + pull" : "[B] init --workspace", async () => {
     await ctx.b.mkdirp(GUEST.workDir);
-    const result = await initWithTransientRetry(ctx.b, ctx.log, ["init", "--workspace", workspaceId, "--no-interactive", "--remote", ctx.apiUrl, ...(opts.initFlags ?? [])]);
+    const result = await initWithTransientRetry(ctx.b, ctx.log, ["init", "--workspace", workspaceId, "--no-interactive", "--remote", ctx.apiUrl, ...(opts.initFlags ?? []), ...(opts.joinInitFlags ?? [])]);
     if (doPull) await ctx.b.rbox(["pull"], { cwd: GUEST.workDir, env: { RBOX_DOWNLOAD_CONCURRENCY: CONCURRENCY } });
     return result;
   });
