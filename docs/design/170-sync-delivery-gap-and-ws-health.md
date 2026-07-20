@@ -40,10 +40,12 @@ mode):
 
 - **Phase 1 (ship now): honest fleet WS-health telemetry** + the notify/backstop
   carrier-attribution needed to count applied pulls correctly.
-- **Phase 2 (gated on field confirmation): delivery-gap recovery** via a WS
-  cursor frame. Only built once Max's logs (or a future event-scoped while-open
-  counter) confirm alive-socket-but-behind is real and recurring — Phase 1's
-  broad proxy motivates that confirmation but does not itself perform it.
+- **Phase 2 (the delivery-gap fix — shipping now on smell-test confidence):**
+  a WS cursor frame. Founder call (2026-07-20): this is the core-product
+  improvement (painless sync) and ships alongside Phase 1 without waiting on
+  logs. It is a general "am I behind?" check, robust to the exact trigger, and a
+  strict improvement over the 5-min backstop; Phase 1's telemetry then *confirms*
+  the mode fleet-wide and *tunes* the cadence after it is live.
 
 ## Problem (field evidence)
 
@@ -288,11 +290,13 @@ grouping** and no per-account tile. Fleet-only:
 - Per-account attribution, if later needed, is a separate privacy-reviewed D1
   path — explicit **non-goal** here.
 
-## Phase 2 — delivery-gap recovery (GATED on field confirmation)
+## Phase 2 — delivery-gap recovery (the fix — shipping now)
 
-Built only once Max's logs (or a future event-scoped while-open counter) confirm
-a recurring alive-socket-but-behind mode — Phase 1's broad proxy points here but
-does not itself confirm it. Mechanism is a **WebSocket control frame** (socket
+Ships alongside Phase 1 on smell-test confidence (founder call 2026-07-20): a
+general "am I behind?" check that bounds worst-case propagation to ~one cadence
+regardless of the exact missed-notification trigger, and never worse than
+today's backstop. Phase 1's telemetry confirms the mode and tunes the cadence
+once live. Mechanism is a **WebSocket control frame** (socket
 already authenticated at connect — no per-check auth/D1, no new HTTP route):
 
 - **Server contract — pinned to `webSocketMessage` (r2 finding 19).** A non-`ping`
