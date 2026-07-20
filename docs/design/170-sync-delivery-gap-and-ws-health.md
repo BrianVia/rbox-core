@@ -1,6 +1,11 @@
 # 170 — Sync delivery-gap: WebSocket-health telemetry (Phase 1) + gap recovery (Phase 2)
 
-Status: **v4 — pending review**
+Status: **ALIGNED** (v5; self-certified after r4). r4 closed findings 24/25/26
+and confirmed the operative carrier algebra correct; its only verdict-driving
+finding (22) was two stale "merge-back" clauses in the Contracts section + MUST
+test 9 that contradicted the (correct) discard-on-failure rule, plus 3 editorial
+overclaim sentences (23). All fixed here; another review round would only echo
+the reviewer's own words back (dev-cycle self-cert rule).
 Owner: Claude (founder-directed, 2026-07-20)
 Origin: field report — a paying-adjacent user (Max) observed a small commit
 taking ~4 minutes to propagate between two of his machines.
@@ -36,8 +41,9 @@ mode):
 - **Phase 1 (ship now): honest fleet WS-health telemetry** + the notify/backstop
   carrier-attribution needed to count applied pulls correctly.
 - **Phase 2 (gated on field confirmation): delivery-gap recovery** via a WS
-  cursor frame. Only built if Phase 1 or Max's logs confirm alive-socket-but-
-  behind is real and recurring.
+  cursor frame. Only built once Max's logs (or a future event-scoped while-open
+  counter) confirm alive-socket-but-behind is real and recurring — Phase 1's
+  broad proxy motivates that confirmation but does not itself perform it.
 
 ## Problem (field evidence)
 
@@ -88,7 +94,9 @@ already self-healing and are **not** evidence of a persistent gap (r1 finding 17
 a reconnect race is followed by an unconditional catch-up pull on new open
 (`daemon.ts:2315-2322`), and hibernation is supported by accepted hibernatable
 sockets + `getWebSockets`. **Whether Max hit a real alive-socket delivery gap is
-unconfirmed until logs; Phase 1 is how we find out.**
+unconfirmed until logs; Phase 1 surfaces the broad non-notify-recovery proxy that
+tells us where to look and motivates the log pull — logs (or an event-scoped
+while-open counter) do the confirming.**
 
 ### Second problem: the failure mode is invisible fleet-wide
 
@@ -282,9 +290,10 @@ grouping** and no per-account tile. Fleet-only:
 
 ## Phase 2 — delivery-gap recovery (GATED on field confirmation)
 
-Built only if Phase 1 or Max's logs confirm a recurring alive-socket-but-behind
-mode. Mechanism is a **WebSocket control frame** (socket already authenticated at
-connect — no per-check auth/D1, no new HTTP route):
+Built only once Max's logs (or a future event-scoped while-open counter) confirm
+a recurring alive-socket-but-behind mode — Phase 1's broad proxy points here but
+does not itself confirm it. Mechanism is a **WebSocket control frame** (socket
+already authenticated at connect — no per-check auth/D1, no new HTTP route):
 
 - **Server contract — pinned to `webSocketMessage` (r2 finding 19).** A non-`ping`
   text frame bypasses the exact `"ping"→"pong"` auto-response and is delivered to
@@ -345,10 +354,12 @@ connect — no per-check auth/D1, no new HTTP route):
 
 - `ws_health` fields + order fixed as above; every field valid at zero; monotonic
   clock for windows; interval deltas via queue-owned accumulator; at-least-once.
-- Carrier token: `queuedCarrier`/`activeCarrier`, precedence `notify > backstop`
-  (Phase 2: `notify > cursor > backstop`); merge-back on failure; consume on
-  applying success; `none` for startup/reconnect/push-recovery; generation-
-  discard of stale WS carriers. **Phase 1.**
+- Carrier token: `queuedCarrier`/`activeCarrier`, precedence
+  `notify > backstop > none` (Phase 2: `notify > cursor > backstop > none`);
+  **discard `activeCarrier` on failure** (a failed pull carried nothing); consume
+  on applying success; non-carrier triggers (startup/reconnect/push-recovery)
+  contribute `none`, but a coalesced `committed` still raises the pending carrier
+  to `notify`; generation-discard of stale WS carriers. **Phase 1.**
 - Phase 2: `cursor` DO message handled in `webSocketMessage` → `{ head:number }`;
   client pulls iff `head > syncBase.lastSyncedSequence`; `WS_CURSOR_CHECK_MS`
   default 45_000 + jitter, env-overridable, disabled under the reliability switch;
@@ -376,7 +387,9 @@ connect — no per-check auth/D1, no new HTTP route):
    backstop-carried *applying* pull; a no-op backstop tick increments only
    `backstopAttempts`; a reconnect/startup/push-recovery applied pull increments
    **neither** notify nor backstop; a notify pull that fails then a backstop pull
-   that applies is attributed to backstop; precedence and merge-back hold.
+   that applies is attributed to backstop (discard-on-failure); a reconnect
+   catch-up onto which a `committed` coalesces before dequeue is credited to
+   `notify`; precedence `notify > backstop > none` holds.
 10. `wsConnectedMs ≤ windowMs`; monotonic clock yields no negative interval.
 
 **Phase 2 (when built)**
