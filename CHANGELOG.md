@@ -6,6 +6,24 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.7.10] — 2026-07-20 — setup works when locking is degraded, plus onboarding polish
+
+### Fixed
+- `rbox setup` no longer refuses when workspace locking can't be established
+  (e.g. a hardened macOS where the identity probe can't run). It now warns and
+  continues in the same legacy-unlocked mode every other command already uses,
+  and the warning shows the *real* underlying error instead of a misleading
+  "this filesystem does not support locking." The only thing given up is
+  coordination against concurrent rbox processes on the same workspace.
+
+### Changed
+- The recovery-phrase prompt (`rbox key recover` and setup recovery) is now a
+  visible input — a 24-word phrase is long and paste-error-prone, and hiding it
+  made a bad paste impossible to spot. Pairing tokens and genesis secrets stay
+  masked.
+- Running bare `rbox` inside a workspace while signed out now leads the menu
+  with "Log in", which routes into the normal `rbox login` flow.
+
 ## [1.7.9] — 2026-07-20 — recovery phrase & first-run encryption no longer crash
 
 ### Fixed
