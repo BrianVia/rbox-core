@@ -6,6 +6,17 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.7.9] — 2026-07-20 — recovery phrase & first-run encryption no longer crash
+
+### Fixed
+- Entering your recovery phrase (`rbox key recover` or the setup wizard) and
+  first-run encryption setup ("set up encryption on this machine") no longer
+  cause rbox to silently exit with no message. The BIP39 checksum used an
+  asynchronous WebCrypto call that, run as the final step of a one-shot
+  command, could let the process end before it completed; it now uses a
+  synchronous hash. If you upgraded and hit this on 1.7.8, `rbox key recover`
+  with your phrase now works.
+
 ## [1.7.8] — 2026-07-20 — join a folder that's already ahead
 
 ### Added
