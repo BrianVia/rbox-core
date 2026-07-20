@@ -311,12 +311,11 @@ export class RboxDaemon {
   private backstopAppliedPulls = 0;
   private cursorAppliedPulls = 0;
   private notifyAppliedPulls = 0;
+  // Only the three cumulative-and-logged counters need a last-sampled baseline;
+  // the *AppliedPulls counters are telemetry-only and reset to 0 each sample.
   private lastSampledWsReconnects = 0;
   private lastSampledWsBackstopPulls = 0;
   private lastSampledWsHalfOpenDetected = 0;
-  private lastSampledBackstopAppliedPulls = 0;
-  private lastSampledCursorAppliedPulls = 0;
-  private lastSampledNotifyAppliedPulls = 0;
   private notifyLatencyCount = 0;
   private notifyLatencySumMs = 0;
   private notifyLatencyMaxMs = 0;
@@ -1905,21 +1904,22 @@ export class RboxDaemon {
     this.accrueWsConnectedUntil(now);
     const durationMax = TELEMETRY_SAMPLE_SCHEMAS.ws_health.numbers.windowMs.max;
     const windowMs = Math.min(durationMax, Math.max(0, Math.floor(now - this.wsHealthWindowStartedMs)));
-    const wsConnectedMs = Math.min(windowMs, durationMax, Math.max(0, Math.floor(this.wsConnectedAccumulatedMs)));
+    const wsConnectedMs = Math.min(windowMs, Math.max(0, Math.floor(this.wsConnectedAccumulatedMs)));
     const counterDelta = (absolute: number, sampled: number): number => Math.max(0, absolute - sampled);
     const wsReconnects = counterDelta(this.wsReconnects, this.lastSampledWsReconnects);
     const wsHalfOpenDetected = counterDelta(this.wsHalfOpenDetected, this.lastSampledWsHalfOpenDetected);
     const backstopAttempts = counterDelta(this.wsBackstopPulls, this.lastSampledWsBackstopPulls);
-    const backstopAppliedPulls = counterDelta(this.backstopAppliedPulls, this.lastSampledBackstopAppliedPulls);
-    const cursorAppliedPulls = counterDelta(this.cursorAppliedPulls, this.lastSampledCursorAppliedPulls);
-    const notifyAppliedPulls = counterDelta(this.notifyAppliedPulls, this.lastSampledNotifyAppliedPulls);
+    // Telemetry-only counters: the sample IS the running total, then zero it.
+    const backstopAppliedPulls = this.backstopAppliedPulls;
+    const cursorAppliedPulls = this.cursorAppliedPulls;
+    const notifyAppliedPulls = this.notifyAppliedPulls;
 
     this.lastSampledWsReconnects = this.wsReconnects;
     this.lastSampledWsHalfOpenDetected = this.wsHalfOpenDetected;
     this.lastSampledWsBackstopPulls = this.wsBackstopPulls;
-    this.lastSampledBackstopAppliedPulls = this.backstopAppliedPulls;
-    this.lastSampledCursorAppliedPulls = this.cursorAppliedPulls;
-    this.lastSampledNotifyAppliedPulls = this.notifyAppliedPulls;
+    this.backstopAppliedPulls = 0;
+    this.cursorAppliedPulls = 0;
+    this.notifyAppliedPulls = 0;
     this.wsHealthWindowStartedMs = now;
     this.wsConnectedAccumulatedMs = 0;
 
@@ -2461,8 +2461,16 @@ export class RboxDaemon {
     this.cursorTimer.unref?.();
   }
 
+  /** A cursor check captured at (ws, generation, epoch) is stale — no longer the
+   *  live socket/schedule — if the daemon stopped, the socket was swapped/closed,
+   *  or a newer WS generation or cursor epoch superseded it. */
+  private cursorStale(ws: WebSocket, generation: number, epoch: number): boolean {
+    return this.stopped || this.ws !== ws || ws.readyState !== WebSocket.OPEN
+      || generation !== this.wsGeneration || epoch !== this.cursorEpoch;
+  }
+
   private async runCursorCheck(ws: WebSocket, generation: number, epoch: number): Promise<void> {
-    if (this.stopped || this.ws !== ws || ws.readyState !== WebSocket.OPEN || generation !== this.wsGeneration || epoch !== this.cursorEpoch) return;
+    if (this.cursorStale(ws, generation, epoch)) return;
     const controller = new AbortController();
     this.cursorAbortController = controller;
     const timeoutMs = Math.min(10_000, Math.max(1, this.cursorCheckMs - 1));
@@ -2476,7 +2484,7 @@ export class RboxDaemon {
     try {
       ws.send("cursor");
       const head = await reply;
-      if (this.stopped || this.ws !== ws || ws.readyState !== WebSocket.OPEN || generation !== this.wsGeneration || epoch !== this.cursorEpoch) return;
+      if (this.cursorStale(ws, generation, epoch)) return;
       const localAppliedSequence = this.syncBase?.lastSyncedSequence ?? 0;
       if (head <= localAppliedSequence) return;
       this.raiseQueuedCarrier("cursor");
@@ -2491,10 +2499,7 @@ export class RboxDaemon {
         this.cursorAbortController = undefined;
         this.cursorReplyResolve = undefined;
       }
-      if (
-        epoch === this.cursorEpoch && this.cursorTimer === undefined && !this.stopped
-        && this.ws === ws && ws.readyState === WebSocket.OPEN && generation === this.wsGeneration
-      ) {
+      if (!this.cursorStale(ws, generation, epoch) && this.cursorTimer === undefined) {
         this.armCursorCheck(ws, generation, epoch);
       }
     }
