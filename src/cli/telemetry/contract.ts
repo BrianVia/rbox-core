@@ -8,6 +8,8 @@ export interface NumericDomain {
 
 const MS_DOMAIN = { min: 0, max: 604_800_000, integer: true } as const;
 const COUNT_DOMAIN = { min: 0, max: 10_000_000, integer: true } as const;
+const WS_HEALTH_COUNT_DOMAIN = { min: 0, max: 1_000_000_000, integer: true } as const;
+const WS_HEALTH_SUM_MS_DOMAIN = { min: 0, max: 1_000_000_000_000, integer: true } as const;
 export const TRANSPORTS = ["batch", "pack", "single"] as const;
 export type LaneTransport = (typeof TRANSPORTS)[number];
 export const FILL_VERSIONS = ["v1", "v2"] as const;
@@ -57,6 +59,22 @@ export const TELEMETRY_SAMPLE_SCHEMAS = {
     numbers: { count: COUNT_DOMAIN },
     enums: { eventType: SAFETY_EVENT_TYPES },
   },
+  ws_health: {
+    numbers: {
+      windowMs: MS_DOMAIN,
+      wsConnectedMs: MS_DOMAIN,
+      wsReconnects: WS_HEALTH_COUNT_DOMAIN,
+      wsHalfOpenDetected: WS_HEALTH_COUNT_DOMAIN,
+      backstopAttempts: WS_HEALTH_COUNT_DOMAIN,
+      backstopAppliedPulls: WS_HEALTH_COUNT_DOMAIN,
+      cursorAppliedPulls: WS_HEALTH_COUNT_DOMAIN,
+      notifyAppliedPulls: WS_HEALTH_COUNT_DOMAIN,
+      notifyLatencyCount: WS_HEALTH_COUNT_DOMAIN,
+      notifyLatencySumMs: WS_HEALTH_SUM_MS_DOMAIN,
+      notifyLatencyMaxMs: MS_DOMAIN,
+    },
+    enums: {},
+  },
 } as const satisfies Record<string, {
   readonly numbers: Readonly<Record<string, NumericDomain>>;
   readonly enums: Readonly<Record<string, readonly string[]>>;
@@ -96,7 +114,21 @@ export interface FirstPublishSample { kind: "first_publish"; timeToFilesSyncedMs
 export interface UploadLaneSample { kind: "upload_lane"; transport: LaneTransport; bytes: number; uploadMs: number; opCount: number; fillVersion: FillVersion }
 export interface CapabilitySample { kind: "capability"; workerExecutions: number }
 export interface SafetyEventSample { kind: "safety_event"; eventType: SafetyEventType; count: number }
-export type TelemetrySample = PropagationSample | FirstPublishSample | UploadLaneSample | CapabilitySample | SafetyEventSample;
+export interface WsHealthSample {
+  kind: "ws_health";
+  windowMs: number;
+  wsConnectedMs: number;
+  wsReconnects: number;
+  wsHalfOpenDetected: number;
+  backstopAttempts: number;
+  backstopAppliedPulls: number;
+  cursorAppliedPulls: number;
+  notifyAppliedPulls: number;
+  notifyLatencyCount: number;
+  notifyLatencySumMs: number;
+  notifyLatencyMaxMs: number;
+}
+export type TelemetrySample = PropagationSample | FirstPublishSample | UploadLaneSample | CapabilitySample | SafetyEventSample | WsHealthSample;
 export interface TelemetryEnvelope { v: 1; samples: TelemetrySample[] }
 
 export interface SyncState {

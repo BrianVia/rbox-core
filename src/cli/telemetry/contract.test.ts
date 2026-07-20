@@ -13,7 +13,7 @@ import {
 
 describe("telemetry wire contract", () => {
   test("pins sample kinds, enum axes, and corpus thresholds", () => {
-    expect(TELEMETRY_KINDS).toEqual(["propagation", "first_publish", "upload_lane", "capability", "safety_event"]);
+    expect(TELEMETRY_KINDS).toEqual(["propagation", "first_publish", "upload_lane", "capability", "safety_event", "ws_health"]);
     expect(TRANSPORTS).toEqual(["batch", "pack", "single"]);
     expect(FILL_VERSIONS).toEqual(["v1", "v2"]);
     expect(SAFETY_EVENT_TYPES).toEqual(["mass_delete_breaker", "scan_fault"]);
@@ -29,6 +29,18 @@ describe("telemetry wire contract", () => {
   test("pins numeric domains and all fifteen deferral reasons", () => {
     expect(TELEMETRY_SAMPLE_SCHEMAS.upload_lane.numbers.bytes.max).toBe(10_000_000_000_000);
     expect(TELEMETRY_SAMPLE_SCHEMAS.propagation.numbers.deliveryToApplyMs).toEqual({ min: 0, max: 604_800_000, integer: true });
+    expect(Object.keys(TELEMETRY_SAMPLE_SCHEMAS.ws_health.numbers)).toEqual([
+      "windowMs", "wsConnectedMs", "wsReconnects", "wsHalfOpenDetected", "backstopAttempts",
+      "backstopAppliedPulls", "cursorAppliedPulls", "notifyAppliedPulls", "notifyLatencyCount",
+      "notifyLatencySumMs", "notifyLatencyMaxMs",
+    ]);
+    expect(TELEMETRY_SAMPLE_SCHEMAS.ws_health.numbers.windowMs.max).toBe(604_800_000);
+    expect(TELEMETRY_SAMPLE_SCHEMAS.ws_health.numbers.wsReconnects.max).toBe(1_000_000_000);
+    for (const field of ["wsReconnects", "wsHalfOpenDetected", "backstopAttempts", "backstopAppliedPulls", "cursorAppliedPulls", "notifyAppliedPulls", "notifyLatencyCount"] as const) {
+      expect(TELEMETRY_SAMPLE_SCHEMAS.ws_health.numbers[field]).toEqual({ min: 0, max: 1_000_000_000, integer: true });
+    }
+    expect(TELEMETRY_SAMPLE_SCHEMAS.ws_health.numbers.notifyLatencySumMs.max).toBe(1_000_000_000_000);
+    expect(TELEMETRY_SAMPLE_SCHEMAS.ws_health.numbers.notifyLatencyMaxMs.max).toBe(604_800_000);
     expect(SYNC_STATE_NUMERIC_DOMAINS.fileSeq.max).toBe(2 ** 48);
     expect(GIT_DEFERRAL_REASONS).toHaveLength(15);
     expect(BINDING_ID_RE.test("0123456789abcdef")).toBe(true);

@@ -21,6 +21,7 @@ interface SampleSchema { readonly numbers: readonly NumberField[]; readonly enum
 
 const MS = { min: 0, max: 604_800_000, integer: true } as const;
 const COUNT = { min: 0, max: 10_000_000, integer: true } as const;
+const WS_HEALTH_COUNT = { min: 0, max: 1_000_000_000, integer: true } as const;
 
 /** Runtime duplicate of the client contract. A test imports both copies and prevents drift.
  * Field declaration order IS the positional AE doubles order and feeds normalizeSample
@@ -58,6 +59,22 @@ export const SERVER_TELEMETRY_SAMPLE_SCHEMAS = {
   safety_event: {
     numbers: [{ field: "count", ...COUNT }],
     enums: [{ field: "eventType", values: ["mass_delete_breaker", "scan_fault"] }],
+  },
+  ws_health: {
+    numbers: [
+      { field: "windowMs", ...MS },
+      { field: "wsConnectedMs", ...MS },
+      { field: "wsReconnects", ...WS_HEALTH_COUNT },
+      { field: "wsHalfOpenDetected", ...WS_HEALTH_COUNT },
+      { field: "backstopAttempts", ...WS_HEALTH_COUNT },
+      { field: "backstopAppliedPulls", ...WS_HEALTH_COUNT },
+      { field: "cursorAppliedPulls", ...WS_HEALTH_COUNT },
+      { field: "notifyAppliedPulls", ...WS_HEALTH_COUNT },
+      { field: "notifyLatencyCount", ...WS_HEALTH_COUNT },
+      { field: "notifyLatencySumMs", min: 0, max: 1_000_000_000_000, integer: true },
+      { field: "notifyLatencyMaxMs", ...MS },
+    ],
+    enums: [],
   },
 } as const satisfies Record<string, SampleSchema>;
 
@@ -153,6 +170,9 @@ function normalizeSample(value: unknown): { ok: true; metric: NormalizedClientMe
     const mbps = uploadMs === 0 ? 0 : 8 * bytes / (uploadMs / 1000) / 1_000_000;
     if (!Number.isFinite(mbps) || mbps > 100_000) return { ok: false, reason: "bad_number" };
     return { ok: true, metric: { index: "client.upload_lane", blobs: canonicalEnums, doubles: [mbps, bytes, uploadMs, opCount] } };
+  }
+  if (kind === "ws_health" && wireNumbers[1]! > wireNumbers[0]!) {
+    return { ok: false, reason: "bad_number" };
   }
   return { ok: true, metric: { index: `client.${kind}`, blobs: canonicalEnums, doubles: wireNumbers } };
 }

@@ -65,6 +65,12 @@ describe("telemetry contract drift guard", () => {
       enums: Object.fromEntries(schema.enums.map(({ field, values }) => [field, values])),
     }]));
     expect(serverShape).toEqual(TELEMETRY_SAMPLE_SCHEMAS);
+    expect(Object.keys(SERVER_TELEMETRY_SAMPLE_SCHEMAS)).toEqual(Object.keys(TELEMETRY_SAMPLE_SCHEMAS));
+    for (const [kind, serverSchema] of Object.entries(SERVER_TELEMETRY_SAMPLE_SCHEMAS)) {
+      const clientSchema = TELEMETRY_SAMPLE_SCHEMAS[kind as keyof typeof TELEMETRY_SAMPLE_SCHEMAS];
+      expect(serverSchema.numbers.map(({ field }) => field), `${kind} number field order`).toEqual(Object.keys(clientSchema.numbers));
+      expect(serverSchema.enums.map(({ field }) => field), `${kind} enum field order`).toEqual(Object.keys(clientSchema.enums));
+    }
     expect(SERVER_CORPUS_BUCKETS).toEqual(CORPUS_BUCKETS);
     expect(SERVER_GIT_DEFERRAL_REASONS).toEqual(GIT_DEFERRAL_REASONS);
     expect(SERVER_SYNC_STATE_NUMERIC_DOMAINS).toEqual(SYNC_STATE_NUMERIC_DOMAINS);
@@ -83,16 +89,33 @@ describe("POST /v1/telemetry", () => {
       { kind: "upload_lane", transport: "pack", bytes: 1_000_000, uploadMs: 1_000, opCount: 2, fillVersion: "v2" },
       { kind: "capability", workerExecutions: 4 },
       { kind: "safety_event", eventType: "scan_fault", count: 3 },
+      { kind: "ws_health", windowMs: 120_000, wsConnectedMs: 110_000, wsReconnects: 1, wsHalfOpenDetected: 2, backstopAttempts: 3, backstopAppliedPulls: 4, cursorAppliedPulls: 0, notifyAppliedPulls: 5, notifyLatencyCount: 6, notifyLatencySumMs: 7_000, notifyLatencyMaxMs: 2_000 },
     ] }), testEnv(points), devicePrincipal(a));
     expect(res.status).toBe(202);
-    expect(await res.json()).toEqual({ accepted: 5, dropped: 0 });
+    expect(await res.json()).toEqual({ accepted: 6, dropped: 0 });
     expect(points).toEqual([
       { indexes: ["client.propagation"], blobs: ["client.propagation"], doubles: [7] },
       { indexes: ["client.first_publish"], blobs: ["client.first_publish", "s"], doubles: [11, 12, 101, 9] },
       { indexes: ["client.upload_lane"], blobs: ["client.upload_lane", "pack", "v2"], doubles: [8, 1_000_000, 1_000, 2] },
       { indexes: ["client.capability"], blobs: ["client.capability"], doubles: [4] },
       { indexes: ["client.safety_event"], blobs: ["client.safety_event", "scan_fault"], doubles: [3] },
+      { indexes: ["client.ws_health"], blobs: ["client.ws_health"], doubles: [120_000, 110_000, 1, 2, 3, 4, 0, 5, 6, 7_000, 2_000] },
     ]);
+  });
+
+  test("accepts zero-valued ws health windows and drops a bad ws health field without affecting valid samples", async () => {
+    const a = await bootstrap("telemetry-ws-health");
+    const points: AnalyticsEngineDataPoint[] = [];
+    const zero = { kind: "ws_health", windowMs: 0, wsConnectedMs: 0, wsReconnects: 0, wsHalfOpenDetected: 0, backstopAttempts: 0, backstopAppliedPulls: 0, cursorAppliedPulls: 0, notifyAppliedPulls: 0, notifyLatencyCount: 0, notifyLatencySumMs: 0, notifyLatencyMaxMs: 0 };
+    const reconnectOnly = { ...zero, windowMs: 120_000, wsReconnects: 1, backstopAttempts: 1 };
+    const bad = { ...zero, deviceId: "must-not-pass" };
+    const impossibleExposure = { ...zero, windowMs: 1, wsConnectedMs: 2 };
+    const res = await ingestTelemetry(post({ v: 1, samples: [zero, reconnectOnly, bad, impossibleExposure] }), testEnv(points), devicePrincipal(a));
+    expect(await res.json()).toEqual({ accepted: 2, dropped: 2 });
+    expect(points.filter((point) => point.indexes?.[0] === "client.ws_health")).toHaveLength(2);
+    expect(points).toContainEqual({ indexes: ["client.ws_health"], blobs: ["client.ws_health"], doubles: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] });
+    expect(points).toContainEqual({ indexes: ["client.telemetry.drops"], blobs: ["client.telemetry.drops", "unknown_field"], doubles: [1] });
+    expect(points).toContainEqual({ indexes: ["client.telemetry.drops"], blobs: ["client.telemetry.drops", "bad_number"], doubles: [1] });
   });
 
   test("derives corpus buckets at every locked boundary", async () => {

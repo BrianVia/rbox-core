@@ -1,8 +1,27 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { TelemetryQueue } from "./queue.js";
-import type { TelemetryEnvelope } from "./contract.js";
+import type { TelemetryEnvelope, WsHealthSample } from "./contract.js";
 
 afterEach(() => { delete process.env.RBOX_TELEMETRY; });
+
+const wsHealth = (overrides: Partial<WsHealthSample> = {}): WsHealthSample => ({
+  kind: "ws_health",
+  windowMs: 120_000,
+  wsConnectedMs: 100_000,
+  wsReconnects: 0,
+  wsHalfOpenDetected: 0,
+  backstopAttempts: 0,
+  backstopAppliedPulls: 0,
+  cursorAppliedPulls: 0,
+  notifyAppliedPulls: 0,
+  notifyLatencyCount: 0,
+  notifyLatencySumMs: 0,
+  notifyLatencyMaxMs: 0,
+  ...overrides,
+});
+
+const wsSample = (body: TelemetryEnvelope): WsHealthSample =>
+  body.samples.find((sample): sample is WsHealthSample => sample.kind === "ws_health")!;
 
 describe("TelemetryQueue", () => {
   test("retains per family, drains in priority order, and removes only on 202", async () => {
@@ -71,5 +90,157 @@ describe("TelemetryQueue", () => {
     await queue.flush();
 
     expect(queue.empty).toBe(false);
+  });
+
+  test("adds deltas without double-counting across throw, 5xx, and 429 failures", async () => {
+    let now = 0;
+    let call = 0;
+    const bodies: TelemetryEnvelope[] = [];
+    const queue = new TelemetryQueue({ postJson: async (_path, body) => {
+      bodies.push(body as TelemetryEnvelope);
+      call++;
+      if (call === 1) throw new Error("offline");
+      if (call === 2) return new Response("{}", { status: 500 });
+      if (call === 3) return new Response("{}", { status: 429 });
+      return new Response("{}", { status: 202 });
+    } }, () => {}, () => now);
+    queue.record(wsHealth({ windowMs: 1, wsConnectedMs: 0, backstopAttempts: 5 }));
+    await queue.flush();
+    queue.record(wsHealth({ windowMs: 1, wsConnectedMs: 0, backstopAttempts: 3 }));
+    await queue.flush();
+    await queue.flush();
+    now = 240_000;
+    await queue.flush();
+    expect(bodies.map((body) => wsSample(body).backstopAttempts)).toEqual([5, 8, 8, 8]);
+    expect(queue.empty).toBe(true);
+  });
+
+  test("retains count, sum, and live max recorded while a 202 flush is in flight", async () => {
+    let release!: (response: Response) => void;
+    const firstResponse = new Promise<Response>((resolve) => { release = resolve; });
+    const bodies: TelemetryEnvelope[] = [];
+    let calls = 0;
+    const queue = new TelemetryQueue({ postJson: async (_path, body) => {
+      bodies.push(body as TelemetryEnvelope);
+      calls++;
+      return calls === 1 ? firstResponse : new Response("{}", { status: 202 });
+    } });
+    queue.record(wsHealth({ notifyLatencyCount: 1, notifyLatencySumMs: 100, notifyLatencyMaxMs: 100 }));
+    const flushing = queue.flush();
+    await Promise.resolve();
+    queue.record(wsHealth({ notifyLatencyCount: 1, notifyLatencySumMs: 50, notifyLatencyMaxMs: 50 }));
+    release(new Response("{}", { status: 202 }));
+    await flushing;
+    await queue.flush();
+    expect(wsSample(bodies[0]!)).toMatchObject({ notifyLatencyCount: 1, notifyLatencySumMs: 100, notifyLatencyMaxMs: 100 });
+    expect(wsSample(bodies[1]!)).toMatchObject({ notifyLatencyCount: 1, notifyLatencySumMs: 50, notifyLatencyMaxMs: 50 });
+  });
+
+  test("merges a frozen max back after failure without adding maxima", async () => {
+    let release!: (response: Response) => void;
+    const firstResponse = new Promise<Response>((resolve) => { release = resolve; });
+    const bodies: TelemetryEnvelope[] = [];
+    let calls = 0;
+    const queue = new TelemetryQueue({ postJson: async (_path, body) => {
+      bodies.push(body as TelemetryEnvelope);
+      calls++;
+      return calls === 1 ? firstResponse : new Response("{}", { status: 202 });
+    } });
+    queue.record(wsHealth({ notifyLatencyCount: 1, notifyLatencySumMs: 100, notifyLatencyMaxMs: 100 }));
+    const flushing = queue.flush();
+    await Promise.resolve();
+    queue.record(wsHealth({ notifyLatencyCount: 1, notifyLatencySumMs: 50, notifyLatencyMaxMs: 50 }));
+    release(new Response("{}", { status: 500 }));
+    await flushing;
+    await queue.flush();
+    expect(wsSample(bodies[1]!)).toMatchObject({ notifyLatencyCount: 2, notifyLatencySumMs: 150, notifyLatencyMaxMs: 100 });
+  });
+
+  test("documents accepted-response-lost delivery as over-counting, never under-counting", async () => {
+    const accepted: WsHealthSample[] = [];
+    let calls = 0;
+    const queue = new TelemetryQueue({ postJson: async (_path, body) => {
+      const sample = wsSample(body as TelemetryEnvelope);
+      accepted.push(sample);
+      calls++;
+      if (calls === 1) throw new Error("response lost after acceptance");
+      return new Response("{}", { status: 202 });
+    } });
+    queue.record(wsHealth({ windowMs: 1, wsConnectedMs: 0, backstopAttempts: 5 }));
+    await queue.flush();
+    queue.record(wsHealth({ windowMs: 1, wsConnectedMs: 0, backstopAttempts: 3 }));
+    await queue.flush();
+    expect(accepted.map((sample) => sample.backstopAttempts)).toEqual([5, 8]);
+    expect(accepted.reduce((sum, sample) => sum + sample.backstopAttempts, 0)).toBe(13);
+  });
+
+  test("pins ws health above the 64-sample batch cap", async () => {
+    let body!: TelemetryEnvelope;
+    const queue = new TelemetryQueue({ postJson: async (_path, value) => {
+      body = value as TelemetryEnvelope;
+      return new Response("{}", { status: 202 });
+    } });
+    queue.record({ kind: "safety_event", eventType: "scan_fault", count: 1 });
+    queue.record({ kind: "capability", workerExecutions: 1 });
+    queue.record({ kind: "first_publish", timeToFilesSyncedMs: 1, pushWallMs: 1, fileCount: 1, uniqueBlobs: 1 });
+    queue.record({ kind: "upload_lane", transport: "single", bytes: 1, uploadMs: 1, opCount: 1, fillVersion: "v1" });
+    for (let i = 0; i < 64; i++) queue.record({ kind: "propagation", deliveryToApplyMs: i });
+    queue.record(wsHealth());
+    await queue.flush();
+    expect(body.samples).toHaveLength(64);
+    expect(body.samples[0]?.kind).toBe("ws_health");
+    expect(body.samples.filter((sample) => sample.kind === "ws_health")).toHaveLength(1);
+  });
+
+  test("drains additive overflow across capped wire snapshots", async () => {
+    const bodies: TelemetryEnvelope[] = [];
+    const queue = new TelemetryQueue({ postJson: async (_path, body) => {
+      bodies.push(body as TelemetryEnvelope);
+      return new Response("{}", { status: 202 });
+    } });
+    queue.record(wsHealth({ windowMs: 1, wsConnectedMs: 0, backstopAttempts: 600_000_000 }));
+    queue.record(wsHealth({ windowMs: 1, wsConnectedMs: 0, backstopAttempts: 600_000_000 }));
+    await queue.flush();
+    expect(queue.empty).toBe(false);
+    await queue.flush();
+    expect(bodies.map((body) => wsSample(body).backstopAttempts)).toEqual([1_000_000_000, 200_000_000]);
+    expect(queue.empty).toBe(true);
+  });
+
+  test("retains an all-zero record added while an earlier zero snapshot is in flight", async () => {
+    let release!: (response: Response) => void;
+    const firstResponse = new Promise<Response>((resolve) => { release = resolve; });
+    const bodies: TelemetryEnvelope[] = [];
+    let calls = 0;
+    const queue = new TelemetryQueue({ postJson: async (_path, body) => {
+      bodies.push(body as TelemetryEnvelope);
+      calls++;
+      return calls === 1 ? firstResponse : new Response("{}", { status: 202 });
+    } });
+    queue.record(wsHealth({ windowMs: 0, wsConnectedMs: 0 }));
+    const flushing = queue.flush();
+    await Promise.resolve();
+    queue.record(wsHealth({ windowMs: 0, wsConnectedMs: 0 }));
+    release(new Response("{}", { status: 202 }));
+    await flushing;
+    expect(queue.empty).toBe(false);
+    await queue.flush();
+    expect(bodies).toHaveLength(2);
+    expect(wsSample(bodies[1]!)).toEqual(wsHealth({ windowMs: 0, wsConnectedMs: 0 }));
+  });
+
+  test("flushes an all-zero ws health window and honors the telemetry opt-out", async () => {
+    const bodies: TelemetryEnvelope[] = [];
+    const queue = new TelemetryQueue({ postJson: async (_path, body) => {
+      bodies.push(body as TelemetryEnvelope);
+      return new Response("{}", { status: 202 });
+    } });
+    queue.record(wsHealth({ windowMs: 0, wsConnectedMs: 0 }));
+    await queue.flush();
+    expect(wsSample(bodies[0]!)).toEqual(wsHealth({ windowMs: 0, wsConnectedMs: 0 }));
+    process.env.RBOX_TELEMETRY = "0";
+    queue.record(wsHealth({ backstopAttempts: 1 }));
+    await queue.flush();
+    expect(bodies).toHaveLength(1);
   });
 });

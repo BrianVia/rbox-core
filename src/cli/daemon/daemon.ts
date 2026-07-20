@@ -99,12 +99,14 @@ import {
   type Wants,
   worseTrust,
   WS_KEEPALIVE_PERSIST_MS,
+  WS_CURSOR_CHECK_MS,
   WS_PING_MS,
   WS_PONG_DEADLINE_DEFAULT_MS,
 } from "./policy.js";
 import { cleanPath, LOG_PATHS_MAX, scanStatsLine, summarizeActions } from "./render.js";
 import { RotatingDaemonLogger, type DaemonLogSink } from "./logger.js";
 import { TelemetryQueue } from "../telemetry/queue.js";
+import { TELEMETRY_SAMPLE_SCHEMAS } from "../telemetry/contract.js";
 import { SyncStateReporter } from "../telemetry/sync-state.js";
 import { inspectResetJournalSafety } from "../reset-halt-inspection.js";
 import { clearResetHaltHealth, readResetHaltHealth, writeResetHaltHealth } from "../reset-health.js";
@@ -179,6 +181,8 @@ export function lockStarvationAgeBucket(ageMs: number): "15m" | "1h" | "1d" {
 }
 
 interface ScanCoverage { coverage: "full-tree" | "pruned"; errorGenAtStart: number }
+type Carrier = "none" | "backstop" | "cursor" | "notify";
+const CARRIER_PRECEDENCE: Readonly<Record<Carrier, number>> = { none: 0, backstop: 1, cursor: 2, notify: 3 };
 
 export interface GitDeferralLogSeen { reason: string; boundary: string }
 
@@ -291,11 +295,35 @@ export class RboxDaemon {
   private ws?: WebSocket;
   private wsKeepaliveTimer?: ReturnType<typeof setInterval>;
   private wsPongDeadlineTimer?: ReturnType<typeof setTimeout>;
+  private cursorTimer?: ReturnType<typeof setTimeout>;
+  private cursorEpoch = 0;
+  private cursorAbortController?: AbortController;
+  private cursorReplyResolve?: (head: number) => void;
   private backstopTimer?: ReturnType<typeof setTimeout>;
   private notifyPullPendingAt?: number;
+  private queuedCarrier: Carrier = "none";
+  /** Retains a coalesced backstop beneath a higher-priority notify so a WS
+   * generation change can discard only the stale WS provenance. */
+  private queuedBackstopPending = false;
   private wsReconnects = 0;
   private wsBackstopPulls = 0;
   private wsHalfOpenDetected = 0;
+  private backstopAppliedPulls = 0;
+  private cursorAppliedPulls = 0;
+  private notifyAppliedPulls = 0;
+  // Only the three cumulative-and-logged counters need a last-sampled baseline;
+  // the *AppliedPulls counters are telemetry-only and reset to 0 each sample.
+  private lastSampledWsReconnects = 0;
+  private lastSampledWsBackstopPulls = 0;
+  private lastSampledWsHalfOpenDetected = 0;
+  private notifyLatencyCount = 0;
+  private notifyLatencySumMs = 0;
+  private notifyLatencyMaxMs = 0;
+  private readonly monotonicNow: () => number;
+  private monotonicLastMs: number;
+  private wsHealthWindowStartedMs: number;
+  private wsConnectedSinceMs?: number;
+  private wsConnectedAccumulatedMs = 0;
   private activityHeartbeatTimer?: ReturnType<typeof setInterval>;
   private ambientStatusHeartbeatTimer?: ReturnType<typeof setInterval>;
   private wsGeneration = 0;
@@ -394,6 +422,7 @@ export class RboxDaemon {
   private readonly wsDisabled: boolean;
   private readonly wsReliabilityDisabled: boolean;
   private readonly pongDeadlineMs: number;
+  private readonly cursorCheckMs: number;
   private readonly backstopMs: number;
   private readonly log: DaemonLogSink;
   private readonly onStopped?: () => void;
@@ -409,6 +438,7 @@ export class RboxDaemon {
       pullOnly?: boolean;
       acquireSyncMutex?: (root: string) => Promise<DaemonMutexResult>;
       now?: () => number;
+      monotonicNow?: () => number;
       log?: DaemonLogSink;
       onStopped?: () => void;
     } = {},
@@ -424,11 +454,18 @@ export class RboxDaemon {
     this.chainRepairPolicy = new DaemonChainRepairPolicy(cfg.deviceId);
     this.acquireSyncMutexFn = opts.acquireSyncMutex ?? ((workspaceRoot) => acquireWorkspaceSyncMutex(workspaceRoot, "daemon"));
     this.now = opts.now ?? Date.now;
+    this.monotonicNow = opts.monotonicNow ?? (() => performance.now());
+    const monotonicStart = this.monotonicNow();
+    this.monotonicLastMs = Number.isFinite(monotonicStart) ? Math.max(0, monotonicStart) : 0;
+    this.wsHealthWindowStartedMs = this.monotonicLastMs;
     this.wsDisabled = process.env.RBOX_DAEMON_WS_DISABLED === "1";
     this.wsReliabilityDisabled = process.env.RBOX_DAEMON_WS_RELIABILITY_DISABLED === "1";
     this.pongDeadlineMs = this.wsReliabilityDisabled
       ? 0
       : envInt("RBOX_DAEMON_WS_PONG_DEADLINE_MS", WS_PONG_DEADLINE_DEFAULT_MS, 0, Number.MAX_SAFE_INTEGER);
+    this.cursorCheckMs = this.wsReliabilityDisabled
+      ? 0
+      : envInt("RBOX_DAEMON_WS_CURSOR_CHECK_MS", WS_CURSOR_CHECK_MS, 0, Number.MAX_SAFE_INTEGER);
     this.backstopMs = this.wsReliabilityDisabled
       ? 0
       : envInt("RBOX_DAEMON_POLL_BACKSTOP_MS", POLL_BACKSTOP_DEFAULT_MS, 0, Number.MAX_SAFE_INTEGER);
@@ -652,6 +689,7 @@ export class RboxDaemon {
   async stop(): Promise<void> {
     const firstStop = !this.stopped;
     this.stopped = true;
+    this.invalidateCursorSchedule();
     this.abortMutexBackoff();
     if (firstStop) await this.writePausedAmbientStatusImmediate().catch(() => {});
     if (this.safetyTimer) clearTimeout(this.safetyTimer);
@@ -745,6 +783,7 @@ export class RboxDaemon {
     const identity = journalIdentity ?? this.resetHaltIdentity ?? "0".repeat(64);
     const changed = this.resetLifecycle !== "halted" || this.resetHaltIdentity !== identity || this.resetHaltReason !== reason;
     this.resetLifecycle = "halted";
+    this.invalidateCursorSchedule();
     this.resetHaltIdentity = identity;
     this.resetHaltReason = reason;
     this.nextResetRetryAt = this.now() + RESET_RECOVERY_RETRY_MS;
@@ -802,6 +841,7 @@ export class RboxDaemon {
       this.resetLifecycle = "bootstrapping";
       this.seedFromState(state);
       this.resetLifecycle = "ready";
+      if (this.ws?.readyState === WebSocket.OPEN) this.resetCursorSchedule(this.ws);
       this.resetHaltIdentity = undefined;
       this.resetHaltReason = undefined;
       this.nextResetRetryAt = Number.NEGATIVE_INFINITY;
@@ -951,6 +991,7 @@ export class RboxDaemon {
             let pushedToRemote = false;
             this.pushTerminalBlocked = false;
             this.want[op] = false;
+            const activeCarrier = op === "pull" ? this.takeQueuedCarrier() : "none";
             this.activePumpOp = op;
             this.writeAmbientStatus();
             this.appliedPendingEventsInOp = false;
@@ -966,15 +1007,20 @@ export class RboxDaemon {
                 this.requestPush();
               } else if (op === "pull") {
                 const notifyPendingAt = this.notifyPullPendingAt;
-                const notifyLatencyMs = notifyPendingAt !== undefined ? Date.now() - notifyPendingAt : undefined;
+                const notifyLatencyMs = notifyPendingAt !== undefined
+                  ? Math.min(TELEMETRY_SAMPLE_SCHEMAS.ws_health.numbers.notifyLatencyMaxMs.max, Math.max(0, Math.floor(this.now() - notifyPendingAt)))
+                  : undefined;
                 this.notifyPullPendingAt = undefined;
                 // §6: the standalone metric event fires at dequeue — measured latency is recorded
                 // even if the pull below fails (the pull-line token then simply never prints).
-                if (notifyLatencyMs !== undefined) this.log(`notify_latency_ms=${notifyLatencyMs}`);
+                if (notifyLatencyMs !== undefined) {
+                  this.observeNotifyLatency(notifyLatencyMs);
+                  this.log(`notify_latency_ms=${notifyLatencyMs}`);
+                }
                 const catchUpGeneration = this.pendingCatchUpGeneration;
                 this.pendingCatchUpGeneration = undefined;
                 try {
-                  await this.doPull(syncMutex, notifyLatencyMs, notifyPendingAt);
+                  await this.doPull(syncMutex, notifyLatencyMs, notifyPendingAt, activeCarrier);
                 } catch (e) {
                   // A failed catch-up pull must not orphan its generation: restore it so the eventual
                   // healing pull (backstop / next frame) can still mark the socket caught up.
@@ -1327,7 +1373,7 @@ export class RboxDaemon {
     this.writeFinishRetryTimers.add(timer);
   }
 
-  private async doPull(syncMutex: WorkspaceSyncMutex, notifyLatencyMs?: number, notifyPendingAt?: number): Promise<void> {
+  private async doPull(syncMutex: WorkspaceSyncMutex, notifyLatencyMs?: number, notifyPendingAt?: number, carrier: Carrier = "none"): Promise<void> {
     if (this.e2ee.remote instanceof E2eeRemote) {
       const pin = await this.e2ee.remote.loadVerifiedPin();
       this.chainRepairPolicy.assertHeadAllowed(pin);
@@ -1338,6 +1384,7 @@ export class RboxDaemon {
     // onPullApplied carries BOTH the forensic log line and the status trail — wired
     // here and in doPush's deps so the pull inside push's 409 recovery is recorded
     // identically; its actions are discarded by the retry loop.
+    let activeCarrier = carrier;
     const pullDeps: SyncDeps = {
       ...this.e2ee,
       cache: this.cache,
@@ -1346,7 +1393,11 @@ export class RboxDaemon {
       onGitLog: this.log,
       onGitDeferralsSaved: (state) => this.observeDurableGitState(state),
       onProgress: (done, total, phase, detail, bytes) => this.onTransferProgress(done, total, phase, detail, bytes), // design 45 + 88
-      onPullApplied: (a) => this.recordPullApplied(a),
+      onPullApplied: (a) => {
+        this.creditAppliedCarrier(activeCarrier);
+        activeCarrier = "none";
+        this.recordPullApplied(a);
+      },
       onTypeFlip: (rel) => this.noteTypeFlip(rel), // design 50 §3: forensic line + conflict count
       telemetry: this.telemetry,
     };
@@ -1373,7 +1424,7 @@ export class RboxDaemon {
     }
     this.chainRepairPolicy.clear();
     if (notifyPendingAt !== undefined) {
-      this.telemetry.record({ kind: "propagation", deliveryToApplyMs: Math.max(0, Date.now() - notifyPendingAt) });
+      this.telemetry.record({ kind: "propagation", deliveryToApplyMs: Math.max(0, this.now() - notifyPendingAt) });
     }
     report?.logSummaryTo((line) =>
       this.log(notifyLatencyMs !== undefined ? `${line} notify_latency_ms=${notifyLatencyMs}` : line),
@@ -1480,6 +1531,7 @@ export class RboxDaemon {
 
   private startTelemetryTimers(): void {
     this.telemetryFlushTimer = setInterval(() => {
+      if (!this.stopped) this.sampleWsHealth();
       if (!this.stopped && !this.telemetry.empty) void this.telemetry.flush(AbortSignal.timeout(1500)).catch(() => {});
     }, TELEMETRY_FLUSH_MS);
     this.telemetryFlushTimer.unref?.();
@@ -1800,6 +1852,94 @@ export class RboxDaemon {
     this.activity.lastPull = { at: new Date().toISOString(), writes, deletes, conflicts: conflicts + this.typeFlipsSincePull };
     this.typeFlipsSincePull = 0;
     this.activityDirty = true;
+  }
+
+  private raiseQueuedCarrier(carrier: Carrier): void {
+    if (carrier === "backstop") this.queuedBackstopPending = true;
+    if (CARRIER_PRECEDENCE[carrier] > CARRIER_PRECEDENCE[this.queuedCarrier]) this.queuedCarrier = carrier;
+  }
+
+  private takeQueuedCarrier(): Carrier {
+    const carrier = this.queuedCarrier;
+    this.queuedCarrier = "none";
+    this.queuedBackstopPending = false;
+    return carrier;
+  }
+
+  private discardQueuedWsCarrier(): void {
+    if (this.queuedCarrier !== "notify" && this.queuedCarrier !== "cursor") return;
+    this.queuedCarrier = this.queuedBackstopPending ? "backstop" : "none";
+    this.notifyPullPendingAt = undefined;
+  }
+
+  private creditAppliedCarrier(carrier: Carrier): void {
+    if (carrier === "notify") this.notifyAppliedPulls++;
+    else if (carrier === "cursor") this.cursorAppliedPulls++;
+    else if (carrier === "backstop") this.backstopAppliedPulls++;
+  }
+
+  private observeNotifyLatency(latencyMs: number): void {
+    this.notifyLatencyCount = Math.min(Number.MAX_SAFE_INTEGER, this.notifyLatencyCount + 1);
+    this.notifyLatencySumMs = Math.min(Number.MAX_SAFE_INTEGER, this.notifyLatencySumMs + latencyMs);
+    this.notifyLatencyMaxMs = Math.max(this.notifyLatencyMaxMs, latencyMs);
+  }
+
+  private readMonotonicMs(): number {
+    const raw = this.monotonicNow();
+    if (Number.isFinite(raw)) this.monotonicLastMs = Math.max(this.monotonicLastMs, raw);
+    return this.monotonicLastMs;
+  }
+
+  private accrueWsConnectedUntil(now: number): void {
+    if (this.wsConnectedSinceMs === undefined) return;
+    this.wsConnectedAccumulatedMs = Math.min(
+      Number.MAX_SAFE_INTEGER,
+      this.wsConnectedAccumulatedMs + Math.max(0, now - this.wsConnectedSinceMs),
+    );
+    this.wsConnectedSinceMs = now;
+  }
+
+  private sampleWsHealth(): void {
+    const now = this.readMonotonicMs();
+    this.accrueWsConnectedUntil(now);
+    const durationMax = TELEMETRY_SAMPLE_SCHEMAS.ws_health.numbers.windowMs.max;
+    const windowMs = Math.min(durationMax, Math.max(0, Math.floor(now - this.wsHealthWindowStartedMs)));
+    const wsConnectedMs = Math.min(windowMs, Math.max(0, Math.floor(this.wsConnectedAccumulatedMs)));
+    const counterDelta = (absolute: number, sampled: number): number => Math.max(0, absolute - sampled);
+    const wsReconnects = counterDelta(this.wsReconnects, this.lastSampledWsReconnects);
+    const wsHalfOpenDetected = counterDelta(this.wsHalfOpenDetected, this.lastSampledWsHalfOpenDetected);
+    const backstopAttempts = counterDelta(this.wsBackstopPulls, this.lastSampledWsBackstopPulls);
+    // Telemetry-only counters: the sample IS the running total, then zero it.
+    const backstopAppliedPulls = this.backstopAppliedPulls;
+    const cursorAppliedPulls = this.cursorAppliedPulls;
+    const notifyAppliedPulls = this.notifyAppliedPulls;
+
+    this.lastSampledWsReconnects = this.wsReconnects;
+    this.lastSampledWsHalfOpenDetected = this.wsHalfOpenDetected;
+    this.lastSampledWsBackstopPulls = this.wsBackstopPulls;
+    this.backstopAppliedPulls = 0;
+    this.cursorAppliedPulls = 0;
+    this.notifyAppliedPulls = 0;
+    this.wsHealthWindowStartedMs = now;
+    this.wsConnectedAccumulatedMs = 0;
+
+    this.telemetry.record({
+      kind: "ws_health",
+      windowMs,
+      wsConnectedMs,
+      wsReconnects,
+      wsHalfOpenDetected,
+      backstopAttempts,
+      backstopAppliedPulls,
+      cursorAppliedPulls,
+      notifyAppliedPulls,
+      notifyLatencyCount: this.notifyLatencyCount,
+      notifyLatencySumMs: this.notifyLatencySumMs,
+      notifyLatencyMaxMs: Math.min(durationMax, this.notifyLatencyMaxMs),
+    });
+    this.notifyLatencyCount = 0;
+    this.notifyLatencySumMs = 0;
+    this.notifyLatencyMaxMs = 0;
   }
 
   /** Live transfer progress → activity sidecar, throttled to ~2 writes/s so a big
@@ -2147,7 +2287,11 @@ export class RboxDaemon {
   }
 
   private markWsOpen(ws: WebSocket): number {
+    this.discardQueuedWsCarrier();
     const generation = ++this.wsGeneration;
+    const now = this.readMonotonicMs();
+    this.accrueWsConnectedUntil(now);
+    this.wsConnectedSinceMs = now;
     this.activity.ws = {
       ...this.wsBase(),
       connected: true,
@@ -2155,14 +2299,19 @@ export class RboxDaemon {
     this.writeWsActivity();
     this.startWsKeepalive(ws);
     this.armPongDeadline(ws);
+    this.resetCursorSchedule(ws);
     return generation;
   }
 
   private markWsDisconnected(ws: WebSocket, reason: "close" | "error" | "timeout"): boolean {
     if (this.ws !== ws) return false;
+    this.invalidateCursorSchedule();
+    this.accrueWsConnectedUntil(this.readMonotonicMs());
+    this.wsConnectedSinceMs = undefined;
     this.ws = undefined;
     this.stopWsKeepalive();
     this.wsGeneration++;
+    this.discardQueuedWsCarrier();
     this.pendingCatchUpGeneration = undefined;
     this.activity.ws = {
       ...this.wsBase(),
@@ -2222,10 +2371,16 @@ export class RboxDaemon {
     try {
       const m = JSON.parse(data) as { type?: string; sequence?: unknown };
       if (m.type === "committed") {
+        if (this.ws) this.resetCursorSchedule(this.ws);
         this.recordCommittedFrame(typeof m.sequence === "number" ? m.sequence : -1);
-        if (!this.wsReliabilityDisabled) this.notifyPullPendingAt ??= Date.now();
+        if (!this.wsReliabilityDisabled) this.notifyPullPendingAt ??= this.now();
+        this.raiseQueuedCarrier("notify");
         this.request("pull");
         this.scheduleNextBackstop();
+      } else if (Number.isInteger((m as { head?: unknown }).head) && (m as { head: number }).head >= 0 && this.cursorReplyResolve) {
+        const resolve = this.cursorReplyResolve;
+        this.cursorReplyResolve = undefined;
+        resolve((m as { head: number }).head);
       } else {
         this.refreshWsAtThrottled();
       }
@@ -2279,6 +2434,77 @@ export class RboxDaemon {
     this.wsPongDeadlineTimer = undefined;
   }
 
+  private invalidateCursorSchedule(): void {
+    this.cursorEpoch++;
+    if (this.cursorTimer) clearTimeout(this.cursorTimer);
+    this.cursorTimer = undefined;
+    const controller = this.cursorAbortController;
+    this.cursorAbortController = undefined;
+    this.cursorReplyResolve = undefined;
+    controller?.abort(new Error("cursor check invalidated"));
+  }
+
+  private resetCursorSchedule(ws: WebSocket): void {
+    this.invalidateCursorSchedule();
+    if (
+      this.cursorCheckMs <= 0 || this.stopped || this.resetLifecycle !== "ready"
+      || this.ws !== ws || ws.readyState !== WebSocket.OPEN
+    ) return;
+    this.armCursorCheck(ws, this.wsGeneration, this.cursorEpoch);
+  }
+
+  private armCursorCheck(ws: WebSocket, generation: number, epoch: number): void {
+    this.cursorTimer = setTimeout(() => {
+      this.cursorTimer = undefined;
+      void this.runCursorCheck(ws, generation, epoch);
+    }, jitter(this.cursorCheckMs));
+    this.cursorTimer.unref?.();
+  }
+
+  /** A cursor check captured at (ws, generation, epoch) is stale — no longer the
+   *  live socket/schedule — if the daemon stopped, the socket was swapped/closed,
+   *  or a newer WS generation or cursor epoch superseded it. */
+  private cursorStale(ws: WebSocket, generation: number, epoch: number): boolean {
+    return this.stopped || this.ws !== ws || ws.readyState !== WebSocket.OPEN
+      || generation !== this.wsGeneration || epoch !== this.cursorEpoch;
+  }
+
+  private async runCursorCheck(ws: WebSocket, generation: number, epoch: number): Promise<void> {
+    if (this.cursorStale(ws, generation, epoch)) return;
+    const controller = new AbortController();
+    this.cursorAbortController = controller;
+    const timeoutMs = Math.min(10_000, Math.max(1, this.cursorCheckMs - 1));
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const reply = new Promise<number>((resolve, reject) => {
+      this.cursorReplyResolve = resolve;
+      controller.signal.addEventListener("abort", () => reject(controller.signal.reason), { once: true });
+      timeout = setTimeout(() => controller.abort(new Error(`cursor reply timed out after ${timeoutMs}ms`)), timeoutMs);
+      timeout.unref?.();
+    });
+    try {
+      ws.send("cursor");
+      const head = await reply;
+      if (this.cursorStale(ws, generation, epoch)) return;
+      const localAppliedSequence = this.syncBase?.lastSyncedSequence ?? 0;
+      if (head <= localAppliedSequence) return;
+      this.raiseQueuedCarrier("cursor");
+      this.request("pull");
+    } catch (error) {
+      if (epoch === this.cursorEpoch && !this.stopped) {
+        this.log(`ws cursor check failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      if (this.cursorAbortController === controller) {
+        this.cursorAbortController = undefined;
+        this.cursorReplyResolve = undefined;
+      }
+      if (!this.cursorStale(ws, generation, epoch) && this.cursorTimer === undefined) {
+        this.armCursorCheck(ws, generation, epoch);
+      }
+    }
+  }
+
   private onPongDeadline(ws: WebSocket): void {
     if (this.stopped || this.ws !== ws) return;
     this.wsHalfOpenDetected++;
@@ -2311,6 +2537,7 @@ export class RboxDaemon {
     if (this.stopped || this.backstopMs <= 0) return;
     this.wsBackstopPulls++;
     this.log(`ws backstop pull (ws_backstop_pull=${this.wsBackstopPulls})`);
+    this.raiseQueuedCarrier("backstop");
     this.request("pull");
     this.scheduleNextBackstop();
   }

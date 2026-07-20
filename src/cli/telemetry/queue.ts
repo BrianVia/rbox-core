@@ -4,6 +4,7 @@ import {
   telemetryEnabled,
   type TelemetryEnvelope,
   type TelemetrySample,
+  type WsHealthSample,
 } from "./contract.js";
 
 export interface TelemetryTransport {
@@ -15,6 +16,25 @@ export interface TelemetryRecorder {
 }
 
 type Family = TelemetrySample["kind"];
+type WsHealthAdditive = Omit<WsHealthSample, "kind" | "notifyLatencyMaxMs">;
+interface WsHealthSnapshot {
+  readonly sample: WsHealthSample;
+  readonly records: number;
+  readonly frozenMax: number;
+}
+
+const emptyWsHealthAdditive = (): WsHealthAdditive => ({
+  windowMs: 0,
+  wsConnectedMs: 0,
+  wsReconnects: 0,
+  wsHalfOpenDetected: 0,
+  backstopAttempts: 0,
+  backstopAppliedPulls: 0,
+  cursorAppliedPulls: 0,
+  notifyAppliedPulls: 0,
+  notifyLatencyCount: 0,
+  notifyLatencySumMs: 0,
+});
 
 export class TelemetryQueue implements TelemetryRecorder {
   private readonly safety = new Map<Extract<TelemetrySample, { kind: "safety_event" }>["eventType"], number>();
@@ -22,6 +42,9 @@ export class TelemetryQueue implements TelemetryRecorder {
   private readonly firstPublish: Extract<TelemetrySample, { kind: "first_publish" }>[] = [];
   private readonly uploadLane: Extract<TelemetrySample, { kind: "upload_lane" }>[] = [];
   private readonly propagation: Extract<TelemetrySample, { kind: "propagation" }>[] = [];
+  private readonly wsHealth = emptyWsHealthAdditive();
+  private wsHealthLiveMax = 0;
+  private wsHealthPendingRecords = 0;
   private blockedUntil = 0;
   private flushing?: Promise<void>;
   private readonly dropCounts = new Map<Family, number>();
@@ -34,7 +57,8 @@ export class TelemetryQueue implements TelemetryRecorder {
 
   get empty(): boolean {
     return this.safety.size === 0 && !this.capability && this.firstPublish.length === 0
-      && this.uploadLane.length === 0 && this.propagation.length === 0;
+      && this.uploadLane.length === 0 && this.propagation.length === 0
+      && this.wsHealthPendingRecords === 0;
   }
 
   record(sample: TelemetrySample): void {
@@ -48,6 +72,9 @@ export class TelemetryQueue implements TelemetryRecorder {
         case "first_publish": this.pushRing(this.firstPublish, sample, 16, sample.kind); break;
         case "upload_lane": this.pushRing(this.uploadLane, sample, 64, sample.kind); break;
         case "propagation": this.pushRing(this.propagation, sample, 64, sample.kind); break;
+        case "ws_health":
+          this.addWsHealth(sample);
+          break;
       }
     } catch { /* telemetry never escapes into sync */ }
   }
@@ -62,6 +89,8 @@ export class TelemetryQueue implements TelemetryRecorder {
     if (!telemetryEnabled() || this.empty) return;
     if (this.now() < this.blockedUntil) return;
     const samples: TelemetrySample[] = [];
+    const wsHealthSnapshot = this.wsHealthPendingRecords > 0 ? this.snapshotWsHealth() : undefined;
+    if (wsHealthSnapshot) samples.push(wsHealthSnapshot.sample); // highest priority: never truncated by the batch cap
     for (const [eventType, count] of this.safety) samples.push({
       kind: "safety_event",
       eventType,
@@ -74,22 +103,32 @@ export class TelemetryQueue implements TelemetryRecorder {
     let response: Response;
     try {
       response = await this.transport.postJson("/v1/telemetry", envelope, { retries: 0, ...(signal ? { signal } : {}) });
-    } catch { return; }
-    if (response.status === 429) { this.blockedUntil = this.now() + 240_000; return; }
+    } catch {
+      this.restoreWsHealthMax(wsHealthSnapshot);
+      return;
+    }
+    if (response.status === 429) {
+      this.restoreWsHealthMax(wsHealthSnapshot);
+      this.blockedUntil = this.now() + 240_000;
+      return;
+    }
     if (response.status >= 400 && response.status <= 499) {
-      this.removeAccepted(samples);
+      this.removeAccepted(samples, wsHealthSnapshot);
       try { this.log(`telemetry discarded ${samples.length} sample(s) rejected with HTTP ${response.status}`); } catch {}
       return;
     }
-    if (response.status !== 202) return;
-    this.removeAccepted(samples);
+    if (response.status !== 202) {
+      this.restoreWsHealthMax(wsHealthSnapshot);
+      return;
+    }
+    this.removeAccepted(samples, wsHealthSnapshot);
     try {
       const body = await response.json() as { dropped?: unknown };
       if (typeof body.dropped === "number" && body.dropped > 0) this.log(`telemetry server dropped ${body.dropped} sample(s)`);
     } catch { /* response diagnostics are optional */ }
   }
 
-  private removeAccepted(samples: TelemetrySample[]): void {
+  private removeAccepted(samples: TelemetrySample[], wsHealthSnapshot?: WsHealthSnapshot): void {
     for (const sample of samples) {
       switch (sample.kind) {
         case "safety_event": {
@@ -102,8 +141,59 @@ export class TelemetryQueue implements TelemetryRecorder {
         case "first_publish": this.removeIdentity(this.firstPublish, sample); break;
         case "upload_lane": this.removeIdentity(this.uploadLane, sample); break;
         case "propagation": this.removeIdentity(this.propagation, sample); break;
+        case "ws_health":
+          if (wsHealthSnapshot) this.removeWsHealthSnapshot(wsHealthSnapshot);
+          break;
       }
     }
+  }
+
+  private addWsHealth(sample: WsHealthSample): void {
+    for (const field of Object.keys(this.wsHealth) as (keyof WsHealthAdditive)[]) {
+      this.wsHealth[field] = Math.min(Number.MAX_SAFE_INTEGER, this.wsHealth[field] + sample[field]);
+    }
+    this.wsHealthLiveMax = Math.max(this.wsHealthLiveMax, sample.notifyLatencyMaxMs);
+    this.wsHealthPendingRecords = Math.min(Number.MAX_SAFE_INTEGER, this.wsHealthPendingRecords + 1);
+  }
+
+  private snapshotWsHealth(): WsHealthSnapshot {
+    const numbers = TELEMETRY_SAMPLE_SCHEMAS.ws_health.numbers;
+    const frozenMax = Math.min(numbers.notifyLatencyMaxMs.max, this.wsHealthLiveMax);
+    this.wsHealthLiveMax = 0;
+    return {
+      sample: {
+        kind: "ws_health",
+        windowMs: Math.min(numbers.windowMs.max, this.wsHealth.windowMs),
+        wsConnectedMs: Math.min(numbers.wsConnectedMs.max, this.wsHealth.wsConnectedMs),
+        wsReconnects: Math.min(numbers.wsReconnects.max, this.wsHealth.wsReconnects),
+        wsHalfOpenDetected: Math.min(numbers.wsHalfOpenDetected.max, this.wsHealth.wsHalfOpenDetected),
+        backstopAttempts: Math.min(numbers.backstopAttempts.max, this.wsHealth.backstopAttempts),
+        backstopAppliedPulls: Math.min(numbers.backstopAppliedPulls.max, this.wsHealth.backstopAppliedPulls),
+        cursorAppliedPulls: Math.min(numbers.cursorAppliedPulls.max, this.wsHealth.cursorAppliedPulls),
+        notifyAppliedPulls: Math.min(numbers.notifyAppliedPulls.max, this.wsHealth.notifyAppliedPulls),
+        notifyLatencyCount: Math.min(numbers.notifyLatencyCount.max, this.wsHealth.notifyLatencyCount),
+        notifyLatencySumMs: Math.min(numbers.notifyLatencySumMs.max, this.wsHealth.notifyLatencySumMs),
+        notifyLatencyMaxMs: frozenMax,
+      },
+      records: this.wsHealthPendingRecords,
+      frozenMax,
+    };
+  }
+
+  private restoreWsHealthMax(snapshot?: WsHealthSnapshot): void {
+    if (snapshot) this.wsHealthLiveMax = Math.max(this.wsHealthLiveMax, snapshot.frozenMax);
+  }
+
+  private removeWsHealthSnapshot(snapshot: WsHealthSnapshot): void {
+    const { sample } = snapshot;
+    for (const field of Object.keys(this.wsHealth) as (keyof WsHealthAdditive)[]) {
+      this.wsHealth[field] = Math.max(0, this.wsHealth[field] - sample[field]);
+    }
+    this.wsHealthPendingRecords = Math.max(0, this.wsHealthPendingRecords - snapshot.records);
+    // A long outage can accumulate more than one wire-domain maximum. Keep a
+    // presence token until the capped residual drains over later batches.
+    if (this.wsHealthPendingRecords === 0
+      && Object.values(this.wsHealth).some((value) => value > 0)) this.wsHealthPendingRecords = 1;
   }
 
   private removeIdentity<T>(ring: T[], item: T): void {
