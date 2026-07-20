@@ -34,6 +34,10 @@ export interface ProvisionOpts {
   /** Extra flags appended to BOTH `init --new` (A) and `init --workspace` (B) — e.g.
    *  `["--git", "false"]` to disable git-sync for a pure plain-file workload. */
   initFlags?: string[];
+  /** Seed B AFTER pairing but BEFORE `init --workspace` — the non-empty-join
+   *  case (a directory with pre-existing content adopting an existing
+   *  workspace). The closure captures ctx for cross-device copies. */
+  beforeJoinB?: () => Promise<void>;
 }
 
 export interface ProvisionResult {
@@ -150,6 +154,9 @@ export async function provisionPair(ctx: RigCtx, rec: Recorder, opts: ProvisionO
   });
 
   // 7. B: join the workspace + pull (throttled).
+  if (opts.beforeJoinB) {
+    await rec.step("[B] pre-join seed (non-empty adopt)", async () => opts.beforeJoinB!());
+  }
   const initB = await rec.step(doPull ? "[B] init --workspace + pull" : "[B] init --workspace", async () => {
     await ctx.b.mkdirp(GUEST.workDir);
     const result = await initWithTransientRetry(ctx.b, ctx.log, ["init", "--workspace", workspaceId, "--no-interactive", "--remote", ctx.apiUrl, ...(opts.initFlags ?? [])]);

@@ -11,6 +11,7 @@ import { gitEntanglement } from "./git-entanglement.js";
 import { gitConfigSync } from "./git-config-sync.js";
 import { gitShapes } from "./git-shapes.js";
 import { gitFf } from "./git-ff.js";
+import { gitJoinAhead } from "./git-join-ahead.js";
 
 export const SCENARIOS: Record<string, Scenario> = {
   "onboard-smoke": onboardSmoke,
@@ -22,6 +23,7 @@ export const SCENARIOS: Record<string, Scenario> = {
   "git-config-sync": gitConfigSync,
   "git-shapes": gitShapes,
   "git-ff": gitFf,
+  "git-join-ahead": gitJoinAhead,
   "conductor-initial-sync": conductorInitialSync,
   "chaos-restart": chaosRestart,
 };
