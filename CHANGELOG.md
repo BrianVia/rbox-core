@@ -6,6 +6,19 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.7.12] — 2026-07-20 — faster sync recovery
+
+### Fixed
+- When a live change notification is missed, sync now catches up within seconds
+  instead of waiting up to ~5 minutes for the periodic safety poll. During quiet
+  periods rbox briefly asks the server whether it's behind and pulls immediately
+  if so — so a small commit lands on your other machines promptly even if the
+  real-time nudge didn't arrive.
+
+### Added
+- Fleet sync-health telemetry so we can spot propagation slowdowns across the
+  fleet without asking for logs. Opt out with `RBOX_TELEMETRY=0`.
+
 ## [1.7.11] — 2026-07-20 — locking survives a broken host-identity cache
 
 ### Fixed
