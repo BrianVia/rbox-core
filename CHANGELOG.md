@@ -6,6 +6,20 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.7.11] — 2026-07-20 — locking survives a broken host-identity cache
+
+### Fixed
+- Workspace locking no longer breaks when the on-disk host-identity ledger
+  (`~/.rbox/host-identity.json`) can't be read or written. That file is only a
+  boot-history cache used to sharpen stale-lock cleanup across reboots; a read
+  failure (e.g. a filesystem that reports slightly different timestamps for the
+  same file depending on how it's queried) used to make every lock-dependent
+  operation report "unsupported" — which on some macOS setups aborted `rbox
+  setup`'s initial push with "capable state-lineage initialization failed
+  (unsupported)". rbox now retries a transient read and, if the cache remains
+  unreadable, proceeds using the machine's live identity with locking fully
+  intact — only the cross-reboot stale-lock optimization is skipped.
+
 ## [1.7.10] — 2026-07-20 — setup works when locking is degraded, plus onboarding polish
 
 ### Fixed
