@@ -540,7 +540,7 @@ async function runPushAttempt(
   }
   // §10 forensic line — only when git-sync did something beyond a steady carry.
   if (cfg.syncGit && (gitPlan.captured.length || gitPlan.deferred.length || gitPlan.removed.length)) {
-    (deps.onGitLog ?? ((l: string) => console.error(l)))(formatGitPushLine(gitPlan));
+    (deps.onGitLog ?? ((l: string) => console.error(l)))(formatGitPushLine(gitPlan), gitPlan);
   }
 
   // Push-side mass-delete breaker (design 108): compute the intended deletions on the

@@ -10,6 +10,8 @@ import {
   initRebindNeedsReset,
   promptMissing,
   adoptPrecreatedWorkspaceResources,
+  attachingGitHistoryLabel,
+  formatInteractiveGitPushSummary,
   preflightInitRebind,
   writeGuidedGenesisPullNotice,
 } from "./init-cmd.js";
@@ -18,6 +20,62 @@ import type { InitPlan } from "./init-plan.js";
 import { resolveInitPlan } from "./init-plan.js";
 import { mintSetupCreateConsent, mintSetupExistingConsent } from "./reset-consent.js";
 import { promptPath } from "./prompt.js";
+import { formatGitPushLine, type GitPushPlan } from "./sync-git.js";
+
+function gitPushPlan(overrides: Partial<GitPushPlan> = {}): GitPushPlan {
+  return {
+    changed: true,
+    authoredCfgHashByRepo: {},
+    captured: [],
+    carried: [],
+    deferred: [],
+    captureDeferrals: {},
+    configDeferrals: {},
+    captureObserved: [],
+    configObserved: [],
+    skipped: [],
+    removed: [],
+    ...overrides,
+  };
+}
+
+test("git-history attachment progress uses the founder-specified per-repo label", () => {
+  expect(attachingGitHistoryLabel(2, 101, "Dfinitiv/savvy-core"))
+    .toBe("attaching git history (2/101 — Dfinitiv/savvy-core)");
+});
+
+test("interactive git capture summary is compact, bulleted, and truncates captured and skipped repos", () => {
+  const captured = Array.from({ length: 101 }, (_, i) => `org/repo-${i + 1}`);
+  const skipped = Array.from({ length: 12 }, (_, i) => ({ relPath: `org/worktree-${i + 1}`, reason: `owned by repo-${i + 1}` }));
+  const output = formatInteractiveGitPushSummary(gitPushPlan({
+    captured,
+    carried: [],
+    skipped,
+    deferred: [],
+    removed: [],
+  }));
+
+  expect(output.split("\n")[0]).toBe("git-sync: captured 101 · carried 0 · skipped 12 · deferred 0 · removed 0");
+  expect(output).toContain("    • org/repo-5\n    …and 96 more");
+  expect(output).not.toContain("org/repo-6\n");
+  expect(output).toContain("    • org/worktree-5 — owned by repo-5\n    …and 7 more");
+  expect(output).not.toContain("org/worktree-6 —");
+
+  const forensic = formatGitPushLine(gitPushPlan({ captured, skipped }));
+  expect(forensic).toContain("org/repo-101");
+  expect(forensic).toContain("org/worktree-12: owned by repo-12");
+  expect(forensic).not.toContain("\n");
+});
+
+test("interactive git summary keeps names and skip reasons to safe physical lines", () => {
+  const output = formatInteractiveGitPushSummary(gitPushPlan({
+    captured: ["safe\u001b[31m\nrepo"],
+    skipped: [{ relPath: "worktree\rname", reason: "first\nsecond" }],
+  }));
+  expect(output).toContain("    • safe repo");
+  expect(output).toContain("    • worktree name — first second");
+  expect(output).not.toContain("\u001b");
+});
 
 test("interactive init gitignore prompt defaults to skipping and matches setup's honest choices", () => {
   expect(GITIGNORE_CHOICES).toEqual([
