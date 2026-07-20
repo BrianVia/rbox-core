@@ -1,7 +1,7 @@
 import os from "node:os";
 import { clearCredentials, credentialsForStrictFlow, loadCredentials, PROD_WEB, saveCredentials } from "./credentials.js";
 import { clearAccountProfile } from "./account-profile.js";
-import { isInteractive, promptConfirm, promptPassword } from "./prompt.js";
+import { isInteractive, promptConfirm, promptInput, promptPassword } from "./prompt.js";
 import { copyToClipboard, openInBrowser, waitForKeypress } from "./browser-open.js";
 import { AccountAlreadyBootstrappedError, RboxApi } from "./remote.js";
 import { emitJson } from "./json.js";
@@ -449,8 +449,10 @@ export async function recoverCmd(kitOpts: RecoveryKitOptions = NO_KIT): Promise<
   if (!creds?.accountId) throw new Error("`rbox key recover` needs an account login first — run `rbox login` (web/device-code), then recover.");
   let phrase: string;
   if (isInteractive()) {
-    // No-echo — the phrase is key material (mask:false = matches the old no-echo).
-    phrase = (await promptPassword({ message: "Enter your 24-word recovery phrase" })).trim();
+    // Visible input: a 24-word phrase is long and paste-error-prone, and it's
+    // entered once on the owner's own machine — showing it lets the user catch
+    // a bad paste (the phrase is displayed at genesis anyway).
+    phrase = (await promptInput({ message: "Enter your 24-word recovery phrase" })).trim();
   } else {
     // Piped (`echo "<phrase>" | rbox key recover`) — drain stdin like `connect` does so
     // recovery still works in CI / non-TTY, where inquirer can't run.

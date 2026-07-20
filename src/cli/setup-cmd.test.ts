@@ -279,7 +279,8 @@ test("resolveEnrollment pairing and recovery exhaust their own local budget back
       loadCredentials: validSetupCredentials,
       makeApi: () => ({ getAccountKeys: async () => ACCOUNT_KEYS, bootstrapKeys: async () => {} }),
       promptSelect: (async () => { menuPrompts++; return selections.shift()!; }) as never,
-      promptPassword: (async () => { inputPrompts++; return method === "pair" ? "bad-token" : "bad phrase"; }) as never,
+      promptPassword: (async () => { inputPrompts++; return "bad-token"; }) as never,
+      promptInput: (async () => { inputPrompts++; return "bad phrase"; }) as never,
       redeemPair: async () => { remoteAttempts++; },
       parsePhrase: async () => { throw new Error("checksum"); },
       enrollRecovery: async () => { remoteAttempts++; return { accountId: "acct", deviceId: "dev" }; },
@@ -301,7 +302,7 @@ test("resolveEnrollment post-validation recovery failure is one-shot back to enr
     loadCredentials: validSetupCredentials,
     makeApi: () => ({ getAccountKeys: async () => ACCOUNT_KEYS, bootstrapKeys: async () => {} }),
     promptSelect: (async () => selections.shift()!) as never,
-    promptPassword: (async () => "checksum-valid phrase") as never,
+    promptInput: (async () => "checksum-valid phrase") as never,
     parsePhrase: async () => key,
     enrollRecovery: async (received) => { enrolls++; expect(received).toBe(key); throw new Error("remote failed"); },
     writeStderr: () => undefined,
@@ -1093,7 +1094,7 @@ test("wizard recovery retries local phrase failures, passes parsed key once, and
   let enrolls = 0;
   const key = new Uint8Array([1, 2, 3]);
   const result = await recoverInWizard({
-    promptPassword: (async () => "phrase") as never,
+    promptInput: (async () => "phrase") as never,
     parsePhrase: async () => { parses++; if (parses < 3) throw new Error("checksum"); return key; },
     enroll: async (received) => { enrolls++; expect(received).toBe(key); throw new Error("remote rejection"); },
     writeStderr: () => undefined,
@@ -1105,7 +1106,7 @@ test("wizard recovery retries local phrase failures, passes parsed key once, and
   parses = 0;
   enrolls = 0;
   expect(await recoverInWizard({
-    promptPassword: (async () => "bad") as never,
+    promptInput: (async () => "bad") as never,
     parsePhrase: async () => { parses++; throw new Error("word list"); },
     enroll: async () => { enrolls++; return { accountId: "acct", deviceId: "dev" }; },
     writeStderr: () => undefined,
@@ -1120,7 +1121,7 @@ test("checksum-valid but wrong recovery phrase reaches exactly one prevalidated 
   let prompts = 0;
   let enrolls = 0;
   const result = await recoverInWizard({
-    promptPassword: (async () => { prompts++; return validWrongPhrase; }) as never,
+    promptInput: (async () => { prompts++; return validWrongPhrase; }) as never,
     enroll: async (rk) => { enrolls++; expect(rk).toHaveLength(32); throw new Error("wrong key"); },
     writeStderr: () => undefined,
   });

@@ -336,7 +336,7 @@ export async function redeemPairInWizard(remote: string, deps: WizardPairDeps = 
 }
 
 interface WizardRecoveryDeps {
-  promptPassword?: typeof promptPassword;
+  promptInput?: typeof promptInput;
   parsePhrase?: typeof phraseToRk;
   enroll?: typeof enrollViaPrevalidatedRecovery;
   writeStderr?: (text: string) => void;
@@ -346,7 +346,7 @@ interface WizardRecoveryDeps {
 
 /** Validate the phrase locally up to three times, then make one continuation attempt. */
 export async function recoverInWizard(deps: WizardRecoveryDeps = {}): Promise<"enrolled" | "parent"> {
-  const ask = deps.promptPassword ?? promptPassword;
+  const ask = deps.promptInput ?? promptInput;
   const parse = deps.parsePhrase ?? phraseToRk;
   const enroll = deps.enroll ?? enrollViaPrevalidatedRecovery;
   const writeStderr = deps.writeStderr ?? ((text: string) => process.stderr.write(text));
@@ -501,6 +501,7 @@ interface ResolveEnrollmentDeps {
   runGenesisEnrollment?: typeof runGenesisEnrollment;
   writeStderr?: (text: string) => void;
   promptPassword?: typeof promptPassword;
+  promptInput?: typeof promptInput;
   redeemPair?: typeof redeemPair;
   parsePhrase?: typeof phraseToRk;
   enrollRecovery?: typeof enrollViaPrevalidatedRecovery;
@@ -567,7 +568,7 @@ export async function resolveEnrollment(remote: string, deps: ResolveEnrollmentD
     }
 
     const result = await recoverInWizard({
-      promptPassword: deps.promptPassword,
+      promptInput: deps.promptInput,
       parsePhrase: deps.parsePhrase,
       enroll: deps.enrollRecovery,
       writeStderr,
