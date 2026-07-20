@@ -6,6 +6,25 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.7.8] — 2026-07-20 — join a folder that's already ahead
+
+### Added
+- Joining a workspace with a folder that already has content — repos that
+  are ahead of the fleet, extra files — now converges forward instead of
+  getting stuck. rbox retains your pre-join content, pulls the workspace
+  baseline, then overlays your files and commits back on top: ahead repos
+  fast-forward the whole fleet to your state, files you already had are
+  preserved, and anything genuinely diverged is kept safely aside and
+  reported (`rbox adopt status`) rather than published. Your pre-join copies
+  are retained until you clear them, so the whole join is reversible.
+- `rbox adopt status|resume|abort|clean` — inspect, resume, roll back, or
+  clear an in-progress or completed adoption.
+
+### Fixed
+- A folder whose repos were ahead of the fleet previously parked on join
+  with no automatic path forward (its newer commits never published and the
+  working tree could show older content). It now converges forward.
+
 ## [1.7.7] — 2026-07-19 — branch switches follow both ways
 
 ### Fixed
