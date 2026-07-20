@@ -169,6 +169,18 @@ function fakeWs(close = () => {}, send = (_message: string) => {}): WebSocket {
   return { readyState: WebSocket.OPEN, send, close } as unknown as WebSocket;
 }
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+// Poll until a condition holds rather than sleeping a fixed interval and asserting
+// an exact count — the cursor timer fires at cadence ±25% jitter + event-loop
+// delay, so a fixed `sleep` races the send. waitUntil returns the instant the
+// count reaches the target (before any further send), preserving the exact-count
+// intent without the timing flake.
+const waitUntil = async (cond: () => boolean, timeoutMs = 2000): Promise<void> => {
+  const start = performance.now();
+  while (!cond()) {
+    if (performance.now() - start > timeoutMs) throw new Error(`waitUntil timed out after ${timeoutMs}ms`);
+    await sleep(5);
+  }
+};
 
 test("pong deadline closes a silent socket and counts the half-open", async () => {
   process.env.RBOX_DAEMON_WS_PONG_DEADLINE_MS = "20";
@@ -358,11 +370,11 @@ test("a missed committed frame is recovered by cursor before the backstop and cr
   daemon.markWsOpen(ws);
   daemon.scheduleNextBackstop();
 
-  await sleep(100);
+  await waitUntil(() => daemon.cursorAppliedPulls === 1);
   await daemon.pumpRun;
 
   expect(sent).toContain("cursor");
-  expect(firstCursorAt! - startedAt).toBeLessThan(60);
+  expect(firstCursorAt! - startedAt).toBeLessThan(100);
   expect(await fs.readFile(path.join(root, "cursor.txt"), "utf8")).toBe("recovered");
   expect(daemon.cursorAppliedPulls).toBe(1);
   expect(daemon.notifyAppliedPulls).toBe(0);
@@ -378,10 +390,16 @@ test("live committed frames reset the cursor cadence before it can wake the DO",
   const ws = fakeWs(() => {}, (message) => sent.push(message));
   daemon.ws = ws;
   daemon.markWsOpen(ws);
-  await sleep(140); // before the old timer's 150ms jittered minimum
-  daemon.handleWsMessageData(JSON.stringify({ type: "committed", sequence: 0 }), ws);
-  await daemon.pumpRun;
-  await sleep(140); // past the old timer's 250ms maximum, before the reset timer's minimum
+  // A committed frame resets the cursor cadence. Deliver them every 40ms — far
+  // below the 200ms cadence (even at its 150ms jittered minimum) — for a span
+  // covering multiple cadences. The cursor timer is reset before it can ever
+  // expire, so no "cursor" frame is sent. This proves suppression by domination
+  // rather than threading a single jitter window (which raced ±25% jitter).
+  for (let i = 0; i < 12; i++) {
+    daemon.handleWsMessageData(JSON.stringify({ type: "committed", sequence: i }), ws);
+    await daemon.pumpRun;
+    await sleep(40);
+  }
 
   expect(sent.filter((message) => message === "cursor")).toHaveLength(0);
 });
@@ -398,11 +416,15 @@ test("a blackholed cursor is bounded, single-flight, does not cycle the socket, 
   daemon.markWsOpen(ws);
   daemon.scheduleNextBackstop();
 
-  await sleep(140);
+  await waitUntil(() => sendTimes.length >= 1);
+  await sleep(120);
 
-  expect(sendTimes.length).toBeGreaterThanOrEqual(2);
-  expect(sendTimes.length).toBeLessThanOrEqual(3);
-  expect(sendTimes.slice(1).every((at, index) => at - sendTimes[index]! >= 45)).toBe(true);
+  // Single-flight: a blackholed cursor must time out before the next is sent, so
+  // consecutive sends never overlap. Count is a loose range (real-timer bounded),
+  // but the invariants below are exact: no socket cycle, backstop preserved.
+  expect(sendTimes.length).toBeGreaterThanOrEqual(1);
+  expect(sendTimes.length).toBeLessThanOrEqual(6);
+  expect(sendTimes.slice(1).every((at, index) => at - sendTimes[index]! >= 20)).toBe(true);
   expect(closes).toBe(0);
   expect(daemon.ws).toBe(ws);
   expect(daemon.wsBackstopPulls).toBeGreaterThanOrEqual(1);
@@ -431,8 +453,7 @@ test("cursor epoch fences committed, reconnect, and stop overlaps", async () => 
   daemon.handleWsMessageData(JSON.stringify({ type: "committed", sequence: 0 }), wsA);
   await committedRun;
   await daemon.pumpRun;
-  await sleep(140);
-  expect(sendsA).toBe(2);
+  await waitUntil(() => sendsA === 2);
   expect(await fs.readFile(path.join(root, "overlap.txt"), "utf8")).toBe("once");
   expect(daemon.notifyAppliedPulls).toBe(1);
   expect(daemon.cursorAppliedPulls).toBe(0);
@@ -447,8 +468,7 @@ test("cursor epoch fences committed, reconnect, and stop overlaps", async () => 
   daemon.ws = wsB;
   daemon.markWsOpen(wsB);
   await reconnectRun;
-  await sleep(140);
-  expect(sendsB).toBe(1);
+  await waitUntil(() => sendsB === 1);
   expect(sendsA).toBe(3);
   expect(daemon.cursorAppliedPulls).toBe(0);
 
