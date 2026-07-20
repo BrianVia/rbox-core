@@ -1,9 +1,18 @@
 # 170 — Sync delivery-gap: WebSocket-health telemetry (Phase 1) + gap recovery (Phase 2)
 
-Status: **v3 — pending review**
+Status: **v4 — pending review**
 Owner: Claude (founder-directed, 2026-07-20)
 Origin: field report — a paying-adjacent user (Max) observed a small commit
 taking ~4 minutes to propagate between two of his machines.
+
+**v4 fold (closes REVIEW-170-R3 findings 22–26):** carrier attribution — discard
+(not merge-back) the carrier on a failed pull, and `none` joins the precedence
+chain (`notify > backstop > none`) so a coalesced notification is still credited
+and a carrier-less catch-up is never invented; `notifyLatencyMaxMs` uses a
+freeze/merge cell (max is not additive); Phase-2 `cursorEpoch` is advanced by
+every lifecycle invalidation incl. `stop()` with a `stopped`/OPEN/socket/gen
+re-arm guard; exact numeric field maxima pinned; over-claiming intro/open-decision
+lines softened to "broad proxy motivates logs."
 
 **v3 fold (closes REVIEW-170-R2 findings 19–24):** cursor server contract pinned
 to `webSocketMessage` (not the HTTP dispatch); counter bookkeeping reworked to a
@@ -17,8 +26,12 @@ denominator and alert threshold; `windowMs`/latency-sum domains + monotonic cloc
 **Reframe (r1 finding 17):** this is a *hypothesis consistent with the timing*,
 not a confirmed root cause. The keepalive mechanism below is proven in code; the
 field attribution is not, and Max's two-machine logs are pending. The design is
-split so the part that does not depend on the root cause ships first and *is
-what confirms the hypothesis fleet-wide*:
+split so the part that does not depend on the root cause ships first and
+*surfaces the broad non-notify-recovery proxy fleet-wide and motivates a log
+pull* (r3 finding 23: aggregate connected exposure cannot, on its own, prove a
+particular applied backstop happened on a continuously-open, caught-up socket —
+field logs or a future event-scoped while-open counter confirm that narrow
+mode):
 
 - **Phase 1 (ship now): honest fleet WS-health telemetry** + the notify/backstop
   carrier-attribution needed to count applied pulls correctly.
@@ -115,23 +128,36 @@ pull (`daemon.ts:947-973`). To count *which mechanism carried an applied change*
 Phase 1 adds a carrier token with **separate queued and active state**:
 
 - `queuedCarrier` on the pending pull, and a dequeue-local `activeCarrier`.
-- A trigger merges into `queuedCarrier` by **precedence** `notify > backstop`
-  (Phase 2 inserts `cursor` between them). At dequeue, `activeCarrier =
-  queuedCarrier`; `queuedCarrier` resets to `none`.
-- On pull **failure**, merge `activeCarrier` back into `queuedCarrier` by
-  precedence (attribution is not lost to a transient failure).
+  **Precedence is `notify > backstop > none`.**
+- A trigger raises `queuedCarrier` to `max(queuedCarrier, itsCarrier)`: the
+  `committed` path contributes `notify`, the backstop tick `backstop`, and the
+  non-carrier triggers below contribute `none` (which never lowers an already
+  queued real carrier). Phase 2 inserts `cursor` between `notify` and `backstop`.
+  At dequeue, `activeCarrier = queuedCarrier`; `queuedCarrier` resets to `none`.
+- On pull **failure**, **discard `activeCarrier`** (set it to `none`): a pull that
+  applied nothing carried nothing. The pump does not restore `want.pull` on an
+  ordinary failure (`daemon.ts:974-979`), so the pending change waits for a fresh
+  trigger, and the *next applying* pull is attributed to whatever triggered it.
+  (This is why a failed `notify` followed by an applying `backstop` counts as
+  `backstop`, not `notify` — the applied change was backstop-carried.)
 - On an **applying** success only — `pull()` calls `onPullApplied` iff its
   reconciled `actions` array is non-empty (`src/cli/sync/pull.ts:196-209,311-319`;
   hook at `daemon.ts:1337-1348,1781-1799`) — increment the matching
-  `*AppliedPulls` for `activeCarrier`, then consume it. A **no-op** pull
-  increments nothing. "Applied" means a local file-tree action, never merely
-  advancing `lastSyncedSequence`.
-- A WS **generation change** (`daemon.ts:2119-2137`) discards any stale queued
-  WS-origin carrier.
-- **Non-carrier pulls use `none` and neither inherit nor consume a token:**
-  startup pull (`daemon.ts:473-484`), reconnect catch-up (`daemon.ts:2315-2322`),
-  and push-internal conflict recovery (`daemon.ts:1117-1140`). This prevents a
-  reconnect-applied change from being falsely counted as backstop-applied.
+  `*AppliedPulls` for `activeCarrier`, then clear it. `activeCarrier === none`
+  increments nothing. A **no-op** pull increments nothing. "Applied" means a local
+  file-tree action, never merely advancing `lastSyncedSequence`.
+- A WS **generation change** (`daemon.ts:2119-2137`) discards a stale queued
+  WS-origin carrier (`notify`; Phase 2 `cursor`) — backstop is not WS-origin and
+  is unaffected.
+- **Non-carrier triggers contribute `none`:** startup pull (`daemon.ts:473-484`),
+  reconnect catch-up (`daemon.ts:2315-2322`), and push-internal conflict recovery
+  (`daemon.ts:1117-1140`). Because `none` is the lowest precedence, a
+  reconnect/startup/recovery pull that runs alone is attributed to `none` (counted
+  as neither notify nor backstop). But if a real `committed` notification
+  coalesces onto the same pending pull before dequeue, `queuedCarrier` is already
+  `notify`, and the applied change is honestly credited to `notify` — a
+  notification did arrive and its change applied. Coalescing therefore never
+  *hides* a real carrier, and a carrier-less catch-up is never *invented* as one.
 
 Phase 2 adds only the `cursor` carrier and its precedence slot.
 
@@ -165,12 +191,19 @@ ws_health:
   enums: []
 ```
 
-Field domains (r2 finding 24): `windowMs`/`wsConnectedMs` use a **monotonic
-elapsed clock** (not the injectable `Date.now`, which can jump — `daemon.ts:401-425`),
-so no negative intervals; a window exceeding the 7-day `MS` domain
-(`contract.ts:9-10`) saturates at that max (a >7-day flush is degenerate). Count
-fields cap at a per-window sane bound. `notifyLatencySumMs` gets its own sum
-domain (multiple observations), distinct from the single-observation `MS` max.
+Field domains — pinned exactly (r2 finding 24; r3 finding 24), since the mirrored
+client/server validators require identical concrete maxima (`contract.ts:3-10`,
+`telemetry-ingest.ts:17-23,117-138`):
+- `windowMs`, `wsConnectedMs`: monotonic **elapsed** clock (not the injectable
+  `Date.now`, which can jump — `daemon.ts:401-425`), so no negative intervals;
+  max `604_800_000` (7 days), saturating (a >7-day flush is degenerate);
+  `wsConnectedMs ≤ windowMs`.
+- All count fields (`wsReconnects`, `wsHalfOpenDetected`, `backstopAttempts`,
+  `*AppliedPulls`, `notifyLatencyCount`): max `1_000_000_000` per window.
+- `notifyLatencySumMs`: its own **sum** domain, max `1_000_000_000_000` (well
+  above `count × single-obs MS`), distinct from the single-observation `MS` max.
+- `notifyLatencyMaxMs`: single-observation `MS` max (same as the existing MS
+  domain), `0` when count is `0`.
 
 ### Counter bookkeeping — no double-count, at-least-once (r2 finding 20)
 
@@ -184,11 +217,21 @@ separate and does **not** wait on ack:
   advances every tick, so a delta is never re-derived from a stale baseline (this
   was the v2 double-count bug: a failed flush left the baseline at 0 and the next
   tick re-derived the full absolute).
-- On flush, snapshot the accumulator and send that snapshot. On **202**, subtract
-  the exact snapshot from the accumulator; deltas added *during* the in-flight
-  request stay pending. On **failure** (throw/429/5xx, retained per
-  `queue.ts:61-85`, `retries:0`) the accumulator keeps snapshot + new deltas and
-  resends next interval — the diagnostic outage does not erase its own evidence.
+- **Additive fields** (durations, counts, `notifyLatencyCount`,
+  `notifyLatencySumMs`): on flush, snapshot and send; on **202**, subtract the
+  exact snapshot from the accumulator (deltas added *during* the in-flight request
+  stay pending); on **failure** (throw/429/5xx, retained per `queue.ts:61-85`,
+  `retries:0`) keep snapshot + new deltas and resend next interval.
+- **`notifyLatencyMaxMs` is a max, NOT additive (r3 finding 25)** — subtracting a
+  sent snapshot from a max is wrong. It uses a **freeze/merge** cell alongside the
+  additive accumulator: on flush, freeze the current live max into the snapshot and
+  reset the live max to 0; new observations update the live max; on **202** discard
+  the frozen max; on **failure** merge it back (`live = max(live, frozen)`). So an
+  observation of 50 arriving while a frozen max of 100 is in flight updates only
+  the live cell (→ 50 pending), and a lost/failed flush merges 100 back
+  (→ max(50,100)=100) — no inflation, no loss. The in-flight test MUST cover
+  count, sum, **and** max.
+- The diagnostic outage does not erase its own evidence.
 - Pin `ws_health` **above** the 64-sample batch cap priority so it is never the
   family silently dropped (`queue.ts:64-73`).
 - **Transport is at-least-once.** The envelope has no sample-id/idempotency key
@@ -264,11 +307,18 @@ connect — no per-check auth/D1, no new HTTP route):
   only while connected; reset (fresh jitter) on every `committed` frame. Honest
   residual: one DO-waking frame per notification gap ≥ cadence, plus one every
   cadence while idle-connected. DO-wake-only — no HTTP auth/D1.
-- **Single timer owner + scheduling epoch (r2 finding 21).** One timer owns the
-  cursor schedule. Every reset (committed frame) increments a `cursorEpoch` and
-  installs the sole timer, replacing any prior. A completion/`finally` may re-arm
-  **only if** its captured epoch is still current and no newer handler armed a
-  timer. Prevents the two-owner duplicate-wake race.
+- **Single timer owner + scheduling epoch (r2 finding 21; r3 finding 26).** One
+  timer owns the cursor schedule. **Every** reset AND every lifecycle invalidation
+  — committed frame, disconnect, reset-halt, and `stop()` — increments a
+  `cursorEpoch` and (for a live reset) installs the sole timer, replacing any
+  prior. A completion/`finally` may re-arm **only if** its captured epoch is still
+  current, no newer handler armed a timer, AND the daemon is not `stopped`, the
+  captured socket is still `this.ws`, OPEN, and its generation is current. This
+  matters because `stop()` sets `stopped`/clears timers/closes the socket but does
+  **not** synchronously clear `this.ws` or bump `wsGeneration` (`daemon.ts:649-676`;
+  generation advances later via `markWsDisconnected`, `daemon.ts:2131-2143`), so
+  epoch advance on `stop()` plus the `stopped` guard is what prevents a
+  post-shutdown re-arm.
 - **One in flight, bounded, generation-fenced (r2 findings 6, 8).** At most one
   cursor frame outstanding; a cursor-specific timeout below cadence; self-schedule
   after completion. Capture `(socket, wsGeneration, cursorEpoch)` before awaiting;
@@ -276,7 +326,7 @@ connect — no per-check auth/D1, no new HTTP route):
   disconnect, reset-halt, `stop()` (`daemon.ts:649-684`) via one `AbortController`
   (which cancels the local waiter, not an in-flight frame — hence the epoch fence).
   A stale completion re-reads the local sequence and skips if a newer pull already
-  advanced it.
+  advanced it. Test: stop mid-flight → **zero** later timer/frame.
 - **Failure = degrade-not-worse, no socket cycling (r1 finding 7).** A failed
   cursor frame is caught, logged, timer re-armed. It does **not** cycle the socket
   — cycling stays with the existing half-open/close/error paths, so an API/DO
@@ -368,5 +418,7 @@ ws_reconnect | ws connected | pull applied | push: published`) confirms the
 failure-mode mix: predominantly `ws backstop pull` with **no** half-open/reconnect
 churn ⇒ alive-socket delivery gap (Phase 2's target). Heavy half-open/reconnect
 churn ⇒ a dead-socket component (keepalive/pong tuning instead). **Phase 1 ships
-regardless** and quantifies this fleet-wide; the Phase 2 `WS_CURSOR_CHECK_MS`
+regardless** and surfaces the broad non-notify-recovery proxy fleet-wide (which
+*motivates* the log pull); the logs — or a future event-scoped while-open counter
+— confirm the narrow alive-socket-gap hypothesis. The Phase 2 `WS_CURSOR_CHECK_MS`
 cadence is the one knob to set once field data exists.
