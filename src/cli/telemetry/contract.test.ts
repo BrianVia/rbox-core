@@ -5,6 +5,7 @@ import {
   FILL_VERSIONS,
   GIT_DEFERRAL_REASONS,
   SAFETY_EVENT_TYPES,
+  SYNC_PHASE_NAMES,
   SYNC_STATE_NUMERIC_DOMAINS,
   TELEMETRY_KINDS,
   TELEMETRY_SAMPLE_SCHEMAS,
@@ -13,10 +14,11 @@ import {
 
 describe("telemetry wire contract", () => {
   test("pins sample kinds, enum axes, and corpus thresholds", () => {
-    expect(TELEMETRY_KINDS).toEqual(["propagation", "first_publish", "upload_lane", "capability", "safety_event", "git_capture", "ws_health"]);
+    expect(TELEMETRY_KINDS).toEqual(["propagation", "first_publish", "upload_lane", "capability", "safety_event", "git_capture", "ws_health", "sync_phase"]);
     expect(TRANSPORTS).toEqual(["batch", "pack", "single"]);
     expect(FILL_VERSIONS).toEqual(["v1", "v2"]);
     expect(SAFETY_EVENT_TYPES).toEqual(["mass_delete_breaker", "scan_fault"]);
+    expect(SYNC_PHASE_NAMES).toHaveLength(15);
     expect(CORPUS_BUCKETS).toEqual([
       { bucket: "xs", maxFileCount: 100 },
       { bucket: "s", maxFileCount: 1_000 },

@@ -342,7 +342,7 @@ test("status renders the design-93 indeterminate config lane and never reports z
   cfg.syncGit = true;
   await saveConfig(root, cfg);
   const d = scanDeps();
-  d.gitDivergenceStatus = async () => ({ count: 1, deferrals: [], configChecking: ["repo"], configDisabled: [] });
+  d.gitDivergenceStatus = async () => ({ count: 1, deferrals: [], configChecking: ["repo"], configDisabled: [], conflictSnapshots: { total: 0, prunable: 0 } });
 
   const lines: string[] = [];
   const oldLog = console.log;
@@ -496,6 +496,7 @@ test("typed divergence seam deferrals gate health even when local detail records
     }],
     configChecking: [],
     configDisabled: [],
+    conflictSnapshots: { total: 3, prunable: 2 },
   });
   const lines: string[] = [];
   const oldLog = console.log;
@@ -508,6 +509,7 @@ test("typed divergence seam deferrals gate health even when local detail records
   const out = lines.join("\n");
   expect(out).toContain("1 git repo deferred");
   expect(out).toContain("git-sync: 0 repos synced · 1 deferred");
+  expect(out).toContain("conflict snapshots: 3 (2 prunable)");
   expect(out).not.toContain("✓ in sync");
   expect(out.split("\n").filter((line) => line.includes("git deferred "))).toHaveLength(0);
 });

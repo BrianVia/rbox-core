@@ -13,6 +13,7 @@ import { gitShapes } from "./git-shapes.js";
 import { gitFf } from "./git-ff.js";
 import { gitJoinAhead } from "./git-join-ahead.js";
 import { gitCommitPropagation } from "./git-commit-propagation.js";
+import { gitHeldLivelock } from "./git-held-livelock.js";
 
 export const SCENARIOS: Record<string, Scenario> = {
   "onboard-smoke": onboardSmoke,
@@ -26,6 +27,7 @@ export const SCENARIOS: Record<string, Scenario> = {
   "git-ff": gitFf,
   "git-join-ahead": gitJoinAhead,
   "git-commit-propagation": gitCommitPropagation,
+  "git-held-livelock": gitHeldLivelock,
   "conductor-initial-sync": conductorInitialSync,
   "chaos-restart": chaosRestart,
 };
@@ -42,7 +44,9 @@ export const SCENARIOS: Record<string, Scenario> = {
  * EXCLUDED too (explicit/nightly): it runs a change-shape matrix (commits, file-plane
  * edits, and a ~200MB repo moved through the dev API) and, until design 172 lands, its
  * empty-commit rounds wait out the 60s safety scan — too slow and red-by-design for the
- * every-PR gate. Run it explicitly to guard design 172.
+ * every-PR gate. Run it explicitly to guard design 172. git-held-livelock is likewise
+ * EXCLUDED (explicit/pre-merge): it stops/starts a live daemon mid-scenario and runs
+ * several propagation rounds — the design-174 guard, run explicitly like its sibling.
  */
 export const FAST_SUITE = ["onboard-smoke", "two-device-live", "mass-delete-guard", "type-flip", "daemon-idle-cpu", "git-entanglement", "git-join-ahead"] as const;
 

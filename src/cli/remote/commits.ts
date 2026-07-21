@@ -4,6 +4,7 @@ import type { CommitChainResult } from "../e2ee-remote.js";
 import type { GlobalManifestMeta } from "../config.js";
 import type { RemoteContext } from "./context.js";
 import { firstPublishMeasurementLive, firstPublishMeasurementToken, firstPublishTiming, uploadActiveOverlapMs } from "../upload-lane-timing.js";
+import { timePushTailRequest } from "../push-tail-timing.js";
 import { NeedsRebaselineError, readQuotaExceeded, translateRemoteError } from "./errors.js";
 import { readNumericFields } from "./timings.js";
 
@@ -150,15 +151,16 @@ export async function commit(ctx: RemoteContext, parentSequence: number, deviceI
   // Response, so it returns below as `{ conflict }` and the push loop absorbs it (pull → reconcile
   // → no-op). Accounting is idempotent too (charges 0 for already-entitled refs; INSERT OR IGNORE
   // on the D1 mirror). A blind retry is therefore benign, not a double-submit.
-  const res = await ctx.fetch(
+  const requestBody = JSON.stringify({ parentSequence, deviceId, manifest });
+  const res = await timePushTailRequest("commit", Buffer.byteLength(requestBody), () => ctx.fetch(
     `${ctx.baseUrl}/v1/ws/${ctx.workspaceId}/proj/${ctx.projectId}/manifests`,
     {
       method: "POST",
       headers: { ...ctx.auth, "content-type": "application/json" },
-      body: JSON.stringify({ parentSequence, deviceId, manifest }),
+      body: requestBody,
     },
     { op: "publishing your changes" }
-  );
+  ));
   if (res.status === 409) {
     const body = (await res.json()) as { head: number };
     return { conflict: true, head: body.head };
@@ -190,7 +192,7 @@ export async function commitsSince(ctx: RemoteContext, since: number): Promise<A
   return ((await r.json()) as { commits: Array<SignedCommit> }).commits;
 }
 
-export async function redeemReceipts(ctx: RemoteContext): Promise<ReceiptRedeemResult[]> {
+export async function redeemReceipts(ctx: RemoteContext, recordCommitTail = false): Promise<ReceiptRedeemResult[]> {
   ctx.receiptSendCap ??= initialReceiptSendCap();
   const timingToken = firstPublishMeasurementToken();
   const timingT0 = timingToken ? performance.now() : 0;
@@ -215,11 +217,14 @@ export async function redeemReceipts(ctx: RemoteContext): Promise<ReceiptRedeemR
         Buffer.byteLength(requestBody),
       );
     }
-    const r = await ctx.fetch(`${ctx.baseUrl}/v1/ws/${ctx.workspaceId}/proj/${ctx.projectId}/receipts/redeem`, {
+    const send = () => ctx.fetch(`${ctx.baseUrl}/v1/ws/${ctx.workspaceId}/proj/${ctx.projectId}/receipts/redeem`, {
       method: "POST",
       headers: { ...ctx.protoAuth, "content-type": "application/json" },
       body: requestBody,
     }, { op: "redeeming upload receipts" });
+    const r = recordCommitTail
+      ? await timePushTailRequest("commit", Buffer.byteLength(requestBody), send)
+      : await send();
     if (r.status === 400) {
       const text = await r.text();
       let body: { error?: unknown; max?: unknown } = {};
@@ -300,7 +305,7 @@ export async function commitSigned(ctx: RemoteContext, parentSeq: number, commit
   const drainT0 = drainToken ? performance.now() : 0;
   let redeemed: ReceiptRedeemResult[];
   try {
-    redeemed = await redeemReceipts(ctx);
+    redeemed = await redeemReceipts(ctx, true);
   } finally {
     if (firstPublishMeasurementLive(drainToken)) firstPublishTiming.stats.finalDrainMs += Math.max(0, Math.round(performance.now() - drainT0));
   }
@@ -308,11 +313,12 @@ export async function commitSigned(ctx: RemoteContext, parentSeq: number, commit
   if (redeemNeedsUpload.length > 0) {
     return { unsatisfiedBlobs: redeemNeedsUpload, unsatisfiedTotal: redeemNeedsUpload.length };
   }
-  const r = await ctx.fetch(`${ctx.baseUrl}/v1/ws/${ctx.workspaceId}/proj/${ctx.projectId}/manifests`, {
+  const requestBody = JSON.stringify({ parentSequence: parentSeq, commit, receipts: {} });
+  const r = await timePushTailRequest("commit", Buffer.byteLength(requestBody), () => ctx.fetch(`${ctx.baseUrl}/v1/ws/${ctx.workspaceId}/proj/${ctx.projectId}/manifests`, {
     method: "POST",
     headers: { ...ctx.protoAuth, "content-type": "application/json" },
-    body: JSON.stringify({ parentSequence: parentSeq, commit, receipts: {} }),
-  }, { op: "publishing your changes" });
+    body: requestBody,
+  }, { op: "publishing your changes" }));
   if (r.status === 409) {
     const b = (await r.json()) as { error?: string; head?: number; currentEpoch?: number; serverTimings?: unknown };
     const serverTimings = readServerTimings(b.serverTimings);

@@ -12,6 +12,7 @@ import { loadGitDivergenceCache, saveGitDivergenceCache, fingerprintHitProbe, bu
 import { checkoutJournalBinding, quarantineUnboundFollowJournal, recoverAndLandFollowJournal } from "./follow.js";
 import { normalizeOutgoingGitSections, tombstoneFindingLine } from "./publisher-tombstones.js";
 import { gitPendingSupersedeEnabled, journalAllowsPendingSupersession, pendingSupersessionPreProbe, provePendingSupersession } from "./pending-supersession.js";
+import { CONFLICT_REF_PRUNE_LIMIT, pruneConflictRefs } from "./conflict-retention.js";
 /** The outcome of push-side git orchestration: the outbound `gitRepos` map, whether it
  *  differs from what the last commit carried, the local-only state after this cycle
  *  (persisted only on a successful commit — recomputed idempotently otherwise), and
@@ -161,6 +162,7 @@ export async function planGitSections(
   };
   const pendingSupersessionCandidates = new Set<string>();
   const supersededPending = new Set<string>();
+  const stableCarryHygiene = new Set<string>();
   const cache = await loadGitDivergenceCache(root);
   const fingerprintRun = gitFingerprintRun("per-decision");
   const fastPathParentRel = new Map<string, string | undefined>();
@@ -621,7 +623,7 @@ export async function planGitSections(
       recomputeCacheProbe,
       () => noteCredentialSkip(rel),
       options.disableConfigLane
-    ).catch((): DivergenceCacheWriteResult => ({ kind: liveKind }));
+    ).catch((): DivergenceCacheWriteResult => ({ kind: liveKind, stable: false }));
     if (idKey === "none") {
       // empty repo (no commits yet): nothing to capture; keep any synced base.
       const carry = pending[rel] ?? baseSec;
@@ -647,6 +649,7 @@ export async function planGitSections(
       const carry = carryMatrixMatches(baseSec, liveKind, idKey);
       if (carry) {
         await carryOwnedWithConfig(rel, baseSec, cacheWrite.localCfg, builtProbe.diskCtx);
+        if (cacheWrite.stable) stableCarryHygiene.add(rel);
         return;
       }
     }
@@ -763,6 +766,7 @@ export async function planGitSections(
             if (!options.disableConfigLane) configObserved.add(rel);
             fastPathParentRel.set(rel, probe.parentRel);
             stats.fpHits++;
+            stableCarryHygiene.add(rel);
             continue;
           }
         }
@@ -909,6 +913,33 @@ export async function planGitSections(
       continue;
     }
     if (p) revertCapture(rel, p, "final candidate did not supersede pending section — carrying pending verbatim");
+  }
+
+  // Design 174 D: independently bounded scratch-ref hygiene. Only an exact
+  // stable carry or a successful final capture qualifies; an unconditional P,
+  // needs-resolution, policy, or failure carry never spends this authority.
+  let conflictDeleteBudget = CONFLICT_REF_PRUNE_LIMIT;
+  const cleanedCommonDirs = new Set<string>();
+  for (const rel of [...new Set([...stableCarryHygiene, ...captured])].sort()) {
+    if (conflictDeleteBudget === 0) break;
+    const ctx = await repoCtxFromDisk(repoDirOf(root, rel)).catch(() => undefined);
+    if (!ctx) continue;
+    const commonDir = path.resolve(ctx.commonDir);
+    if (cleanedCommonDirs.has(commonDir)) continue;
+    cleanedCommonDirs.add(commonDir);
+    const result = await pruneConflictRefs(repoDirOf(root, rel), {
+      limit: conflictDeleteBudget,
+      ctx,
+      onBatch: async () => {
+        for (const cachedRel of [...cache.repos.keys()]) {
+          const cachedCtx = await repoCtxFromDisk(repoDirOf(root, cachedRel)).catch(() => undefined);
+          if (cachedCtx && path.resolve(cachedCtx.commonDir) === commonDir) cache.repos.delete(cachedRel);
+        }
+        cache.dirty = true;
+        fingerprintRun.commonDirFingerprints.delete(commonDir);
+      },
+    }).catch(() => undefined);
+    conflictDeleteBudget -= result?.deleted ?? 0;
   }
 
   const liveKeys = new Set(keys);

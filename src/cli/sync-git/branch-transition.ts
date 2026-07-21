@@ -13,7 +13,7 @@ import {
 import type { GitPartialApply } from "../config.js";
 import { branchesCheckedOutElsewhere } from "../../engine/git/apply.js";
 import { readAllRefs } from "../../engine/git/refs.js";
-import { readHead, repoCtx } from "../../engine/git/shared.js";
+import { addTimedMs, readHead, repoCtx, type GitChainTimings } from "../../engine/git/shared.js";
 import type { BranchTransitionWitness, LockedBranchProof } from "./base-composer.js";
 
 const HEX40 = /^[0-9a-f]{40}$/;
@@ -294,31 +294,35 @@ export async function planManualBranchTransition(input: PlanManualBranchTransiti
 export async function commitPlannedBranchTransition(
   plan: PlannedBranchTransition,
   lockedSecondProof: () => Promise<void> = async () => {},
+  chainTimings?: GitChainTimings,
 ): Promise<CommittedBranchTransition> {
   if (!plan.headReservation) throw new Error("standalone branch transition lacks a reserved HEAD observation");
   let lockedObservation: Omit<LockedBranchProof, "liveOid" | "witness" | "reflogEpisode" | "artifactsClear" | "reflogStable"> | undefined;
   await runPreparedUpdateRefTransaction(plan.repoDir, plan.lines, async () => {
     if (plan.expectedReflogFingerprint) {
-      const locked = await readRefReflogFingerprint(plan.repoDir, plan.ref);
+      const locked = await addTimedMs(chainTimings, "reflogMs", () => readRefReflogFingerprint(plan.repoDir, plan.ref));
       if (locked.sha256 !== plan.expectedReflogFingerprint) throw new Error("branch reflog changed at prepared transaction boundary");
     }
-    const ctx = await repoCtx(plan.repoDir);
+    const ctx = await addTimedMs(chainTimings, "ownershipMs", () => repoCtx(plan.repoDir));
     if (!ctx) throw new Error("repository disappeared at prepared transaction boundary");
-    const [refs, owned, head] = await Promise.all([
+    const [refs, owned, head] = await addTimedMs(chainTimings, "ownershipMs", () => Promise.all([
       readAllRefs(plan.repoDir),
       branchesCheckedOutElsewhere(ctx),
       readHead(ctx),
-    ]);
+    ]));
     if ((refs[plan.ref] ?? null) !== plan.beforeOid) throw new Error("branch changed at prepared transaction boundary");
     if (head !== plan.headReservation!.content) throw new Error("HEAD changed at prepared transaction boundary");
     if (owned.has(plan.ref)) throw new Error("branch became sibling-owned at prepared transaction boundary");
-    await lockedSecondProof();
+    await addTimedMs(chainTimings, "ownershipMs", lockedSecondProof);
     lockedObservation = {
       ownershipStable: true,
       currentRef: plan.headReservation!.currentRef,
       siblingOwned: false,
     };
-  }, plan.reflogMessage ? { reflogMessage: plan.reflogMessage } : {});
+  }, {
+    ...(plan.reflogMessage ? { reflogMessage: plan.reflogMessage } : {}),
+    ...(chainTimings ? { onExclusiveMs: (ms: number) => { chainTimings.refTxnExclusiveMs += ms; } } : {}),
+  });
   if (!lockedObservation) throw new Error("branch transaction committed without locked observations");
   return {
     witness: plan.witness,

@@ -22,6 +22,7 @@ import {
   GIT_FINGERPRINT_VERSION,
   GIT_FINGERPRINT_RACY_CLEAN_MARGIN_MS,
   gitDivergenceCount,
+  gitDivergenceStatus,
   gitDivergenceFastRepoSource,
   gitFingerprintVersionForBounds,
   gitIncomingKey,
@@ -31,6 +32,7 @@ import {
   withRevalidatedGitPartialApplies,
   type GitPushPlan,
 } from "../sync-git.js";
+import { loadGitDivergenceCache } from "./divergence-cache.js";
 import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
 
 const exec = promisify(execFile);

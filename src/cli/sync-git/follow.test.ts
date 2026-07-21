@@ -1983,3 +1983,25 @@ test("R2-11: refname alias group is held while an unrelated checkout follows", a
   expect(outcome.partial?.repo?.heldRefs["refs/heads/foo"]).toBe("ownership");
   expect(logs.some((line) => line.includes("receiver-equivalent Git refnames held"))).toBe(true);
 });
+
+test("design 174 C: many-ref follow has exclusive leaf coverage and an explicit residual", async () => {
+  const c1 = await commit("base\n", "many-ref base");
+  for (let i = 0; i < 40; i++) await git(sender, "branch", `many-${i}`, c1);
+  const base = await capture();
+  await materialize(base);
+  const c2 = await commit("incoming\n", "many-ref incoming");
+  for (let i = 0; i < 40; i++) await git(sender, "branch", "-f", `many-${i}`, c2);
+  const incoming = await capture();
+  await fs.writeFile(path.join(receiver, "tracked.txt"), "incoming\n");
+
+  const { outcome } = await applyIncoming(stateWith(base), incoming, matchingOracle, { collectMetrics: true });
+  const timing = outcome.gitApplyMetrics?.repoTimings[0];
+  const chain = timing?.chain;
+  if (!timing || !chain) throw new Error("missing instrumented repo timing");
+  const leafSum = chain.fetchDecryptMs + chain.bundleVerifyMs + chain.gitImportMs
+    + chain.refTxnExclusiveMs + chain.ownershipMs + chain.reflogMs
+    + chain.connectivityProofMs + chain.indexOpStateMs;
+  expect(chain.classifyMs).toBeGreaterThan(0);
+  expect(chain.residualMs).toBeCloseTo(Math.max(0, timing.wallMs - leafSum), 5);
+  expect(chain.residualMs).toBeLessThanOrEqual(timing.wallMs * 0.10);
+}, 30_000);

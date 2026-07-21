@@ -194,7 +194,7 @@ async function runPreparedUpdateRefTransactionUnlocked(
   repoDir: string,
   lines: readonly string[],
   afterPrepare: () => Promise<void>,
-  options: { reflogMessage?: string } = {},
+  options: { reflogMessage?: string; onExclusiveMs?: (ms: number) => void } = {},
 ): Promise<void> {
   if (lines.length === 0) return;
   if (options.reflogMessage?.includes("\0") || options.reflogMessage?.includes("\n")) throw new Error("invalid ref transaction reflog message");
@@ -211,6 +211,19 @@ async function runPreparedUpdateRefTransactionUnlocked(
   let stderr = "";
   let closed: { code: number | null } | undefined;
   let closeError: Error | undefined;
+  let exclusiveStartedAt = performance.now();
+  let exclusiveMs = 0;
+  let exclusiveRunning = true;
+  const pauseExclusive = () => {
+    if (!exclusiveRunning) return;
+    exclusiveMs += performance.now() - exclusiveStartedAt;
+    exclusiveRunning = false;
+  };
+  const resumeExclusive = () => {
+    if (exclusiveRunning) return;
+    exclusiveStartedAt = performance.now();
+    exclusiveRunning = true;
+  };
   const waiters = new Set<() => void>();
   const notify = () => { for (const waiter of [...waiters]) waiter(); };
   const waitForNotification = async (timeoutMs: number): Promise<boolean> => {
@@ -282,7 +295,8 @@ async function runPreparedUpdateRefTransactionUnlocked(
       throw new PreparedRefTransactionPrepareError(String((error as Error)?.message ?? error));
     }
     try {
-      await afterPrepare();
+      pauseExclusive();
+      try { await afterPrepare(); } finally { resumeExclusive(); }
     } catch (error) {
       await fifo.write("abort\n");
       await fifo.close();
@@ -308,6 +322,8 @@ async function runPreparedUpdateRefTransactionUnlocked(
       if (!await waitForSettlement(1_000)) cleanupError = new Error("git update-ref did not exit after SIGKILL");
     }
     await fs.rm(fifoPath, { force: true }).catch(() => {});
+    pauseExclusive();
+    options.onExclusiveMs?.(exclusiveMs);
     if (cleanupError) throw cleanupError;
   }
 }
@@ -322,15 +338,25 @@ export class PreparedRefTransactionPrepareError extends Error {
   }
 }
 
-export function runPreparedUpdateRefTransaction(
+export async function runPreparedUpdateRefTransaction(
   repoDir: string,
   lines: readonly string[],
   afterPrepare: () => Promise<void>,
-  options: { reflogMessage?: string } = {},
+  options: { reflogMessage?: string; onExclusiveMs?: (ms: number) => void } = {},
 ): Promise<void> {
-  if (lines.length === 0) return Promise.resolve();
-  return withRepoOperationLock(repoDir, () => withProtocolLockClass("git", `${repoDir}:${lines.join(",")}`, () =>
-    runPreparedUpdateRefTransactionUnlocked(repoDir, lines, afterPrepare, options)));
+  if (lines.length === 0) return;
+  const startedAt = performance.now();
+  let proofMs = 0;
+  const { onExclusiveMs, ...innerOptions } = options;
+  try {
+    await withRepoOperationLock(repoDir, () => withProtocolLockClass("git", `${repoDir}:${lines.join(",")}`, () =>
+      runPreparedUpdateRefTransactionUnlocked(repoDir, lines, async () => {
+        const proofStartedAt = performance.now();
+        try { await afterPrepare(); } finally { proofMs += performance.now() - proofStartedAt; }
+      }, innerOptions)));
+  } finally {
+    onExclusiveMs?.(Math.max(0, performance.now() - startedAt - proofMs));
+  }
 }
 
 function mergeOrigin(existing: KeepPinOrigin[], incoming: KeepPinOrigin): KeepPinOrigin[] {

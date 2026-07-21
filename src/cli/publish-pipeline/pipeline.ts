@@ -29,6 +29,7 @@ import type { TransferProgress } from "../transfer-progress.js";
 import { UploadByteTracker } from "../upload-byte-tracker.js";
 import { TransferRateSampler } from "../transfer-rate.js";
 import { firstPublishMeasurementLive, firstPublishMeasurementToken, firstPublishReady, firstPublishTiming, firstPublishUploadEnd, firstPublishUploadStart, LANE_TIMING, uploadLaneTiming } from "../upload-lane-timing.js";
+import { timeMissingBlobs } from "../push-tail-timing.js";
 import { ResourceBudget } from "./budget.js";
 import { EOF, ReadyQueue, type ReadyBlob } from "./ready-queue.js";
 import { DEFAULT_REDEEM_THRESHOLD, ReceiptDrainer } from "./receipt-drainer.js";
@@ -204,7 +205,7 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
       const addresses = [...new Set(batch.map((item) => item.address))];
       const t0 = LANE_TIMING ? performance.now() : 0;
       const statsT0 = firstPublishTiming.enabled ? performance.now() : 0;
-      const missing = new Set(await args.api.missingBlobs(addresses));
+      const missing = new Set(await timeMissingBlobs(args.api, addresses));
       if (firstPublishTiming.enabled) {
         firstPublishTiming.stats.missingCheckWallMs += Math.max(0, Math.round(performance.now() - statsT0));
         for (const address of addresses) {
@@ -408,7 +409,7 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
         current = makeReady(file, encrypted);
         byteTracker.migrate(file.path, current.encSha, current.cipherSize);
         if (scope.signal.aborted) { current.release("abandoned"); throw abortCause; }
-        const missing = await args.api.missingBlobs([current.encSha]);
+        const missing = await timeMissingBlobs(args.api, [current.encSha]);
         if (missing.length === 0) { current.release("satisfied-skip"); return 0; }
       }
     }

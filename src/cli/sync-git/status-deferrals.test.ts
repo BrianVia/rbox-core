@@ -38,6 +38,7 @@ test("gitDivergenceStatus projects durable lanes read-only even when git sync is
     count: 0,
     configChecking: [],
     configDisabled: [],
+    conflictSnapshots: { total: 0, prunable: 0 },
     deferrals: [
       { relPath: "repo", lane: "apply", reason: "local-edits", deferredSince: since, bytesChanged: true },
       { relPath: "repo", lane: "config", reason: "config", deferredSince: since },

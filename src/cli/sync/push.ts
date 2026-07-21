@@ -33,6 +33,7 @@ import { changedSidecarRepoKeys, observedRepoKeys, orderedDeferralUpdates, saveS
 import { beginFirstPublishTiming, finishFirstPublishStats, firstPublishMeasurementLive, firstPublishMeasurementToken, firstPublishTiming, formatFirstPublishStats } from "../upload-lane-timing.js";
 import { type SyncDeps, withReportScanStats, withCache, withDircache, refreshWriteContext } from "./deps.js";
 import { withPushLaneAccumulator } from "../telemetry/lane-accumulator.js";
+import { withPushTailTiming } from "../push-tail-timing.js";
 import { formatCommitTimings, formatScanStats, scanDetailsOf } from "./format.js";
 import { apiFor, MAX_ATTEMPTS, MassDeleteGuardError, NO_GIT_FORCE, pushMassDeleteTrips, makeDeferErrnoReporter, defaultBackoff, filesFirstFlagEnabled, matcherForState, plaintextBytesOf, fileCountOf, scanTick } from "./policy.js";
 import { pull, scanManifestForPush } from "./pull.js";
@@ -199,10 +200,11 @@ export async function pushManifest(
   deps: SyncDeps = {},
   options: PushManifestOptions = {}
 ): Promise<PushResult> {
-  return withPushLaneAccumulator(
-    () => pushManifestInner(root, cfg, local, deps, options),
-    (samples) => { for (const sample of samples) deps.telemetry?.record(sample); },
-  );
+  const report = deps.report ?? PhaseReport.disabled("push");
+  return withPushTailTiming(report, () => withPushLaneAccumulator(
+      () => pushManifestInner(root, cfg, local, deps, options),
+      (samples) => { for (const sample of samples) deps.telemetry?.record(sample); },
+    ));
 }
 
 async function pushManifestInner(
@@ -684,6 +686,13 @@ async function runPushAttempt(
     // remote's own unapplied truth — the saved git BASE keeps the OLD entry (or none) so the
     // next pull still sees remote != base and retries the apply (see gitBaseAfterCommit).
     const supersededPending = new Set(gitPlan.supersededPending);
+    // Design 174 §4.2: the one bounded supersession line — emitted ONLY here, after
+    // the accepted commit, so it never claims a supersession a pre-ACK failure undid.
+    for (const relPath of [...supersededPending].sort()) {
+      (deps.onGitLog ?? ((l: string) => console.error(l)))(
+        `git-sync superseded pending ${relPath}: local history subsumes the unapplied remote section`,
+      );
+    }
     const pendingAfterAck = { ...(gitPlan.gitPendingRemote ?? {}) };
     for (const relPath of supersededPending) delete pendingAfterAck[relPath];
     const stateGit = gitBaseAfterCommit(committed.gitRepos, pendingAfterAck, appliedBase.gitRepos);

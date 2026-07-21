@@ -63,10 +63,10 @@ src/cli/sync/format.ts        — compact stat/timing token rendering (formatCom
 ```
 src/cli/sync-git.ts                  — barrel: pre-113-split public surface of sync-git/.
 src/cli/sync-git/shared.ts           — cross-lane orchestration policy (capture/apply concurrency, repo cap/path helpers, scope projection/carry matrix, log-once sets) + capture/locking primitives (chainLock, gitApplyMutationKey, nestedRepoChains, capturePlannedGitSection). SINGLE owner of the module-level state shared by plan AND apply. Never: plan or apply decisions themselves.
-src/cli/sync-git/plan.ts             — push planner: planGitSections (§2.7 — one closure unit, helper order is semantic), pending-supersession candidate admission/final-proof flow, plan contracts, push formatters, gitBaseAfterCommit, gitForceForMissingBlobs. Never: apply-side mutation, status rendering.
+src/cli/sync-git/plan.ts             — push planner: planGitSections (§2.7 — one closure unit, helper order is semantic), pending-supersession candidate admission/final-proof flow, post-proof conflict-ref hygiene dispatch, plan contracts, push formatters, gitBaseAfterCommit, gitForceForMissingBlobs. Never: apply-side mutation, status rendering.
 src/cli/sync-git/pending-supersession.ts — design-174 pending admission gate plus final normalized candidate-vs-pending semantic proof. Never: clear pending/sidecars, publish a candidate, mutate refs, or grant BASE authority.
-src/cli/sync-git/apply.ts            — pull-side git materialization: applyGitSections, held-skip orchestration, post-settlement attempt-rebind dispatch, receiver-equivalent repo-key admission, apply metrics, config-lane transactions, conflict preservation, quarantine ordering. Never: planning policy.
-src/cli/sync-git/follow.ts           — design-116/126 checkout orchestration: artifact/index-equivalence staging guards, all-guard and breadcrumb-waiver classification, independent safe-ref publication, journaled checkout commit/recovery adapters. Never: ORIG_HEAD preservation mechanics, D4a journal/reachability/index/pin mechanics, or state-file persistence.
+src/cli/sync-git/apply.ts            — pull-side git materialization: applyGitSections, held-skip orchestration, post-settlement attempt-rebind dispatch, receiver-equivalent repo-key admission, exclusive-leaf apply metrics, config-lane transactions, conflict preservation, quarantine ordering. Never: planning policy.
+src/cli/sync-git/follow.ts           — design-116/126 checkout orchestration: artifact/index-equivalence staging guards, all-guard and breadcrumb-waiver classification, independent safe-ref publication, journaled checkout commit/recovery adapters, and follow leaf-timer plumbing. Never: ORIG_HEAD preservation mechanics, D4a journal/reachability/index/pin mechanics, or state-file persistence.
 src/cli/sync-git/held-skip.ts        — design-174 stable held-attempt input observation, exact consulted-reflog binding, eligibility, safety-floor/kill-switch helpers, and batched generation-CAS attempt rebind after P/K settlement. Never: follow/ref mutation, BASE composition, or unrelated state persistence.
 src/cli/sync-git/breadcrumb-veto.ts  — closed design-126/130 BreadcrumbVetoGate universe, exact total order, deferral mapping, and boot-bounded logVetoOnce. Never: gathering Git proof facts or deciding ref mutations.
 src/cli/sync-git/tombstone-attestation.ts — strict wire-to-immutable §130 tombstone attestation conversion and mutation-boundary binding checks. Never: parsing Git artifacts from disk or performing ref mutations.
@@ -80,7 +80,8 @@ src/cli/sync-git/p-settlement.ts     — exact-P preflight settlement: prepared 
 src/cli/sync-git/config-lane.ts      — config-lane capture model + receiver: CachedLocalCfg, gitConfigHash, shouldPublishGitConfig, readLocalGitConfig, configReceiver, sameConfigShape. Never: fingerprinting, apply transactions.
 src/cli/sync-git/fingerprint.ts      — divergence fingerprint construction: stat/tree/index tokenization, racy-clean trust, GIT_FINGERPRINT_VERSION derivation (version MUST stay adjacent to the token code it versions — design 113 §8). Never: cache persistence, probing.
 src/cli/sync-git/divergence-cache.ts — divergence cache schema/persistence + probe build/classify/write/refresh. Never: fingerprint token construction.
-src/cli/sync-git/status.ts           — read-only divergence status: gitDivergenceStatus, gitDivergenceCount (mirrors planner suppressions). Never: mutation of repos, cache, or state.
+src/cli/sync-git/conflict-retention.ts — bounded refs/rbox-conflict reachability/age inspection and old-OID transactional pruning. Never: granting push carry/capture authority, deleting other namespaces, or state persistence.
+src/cli/sync-git/status.ts           — read-only divergence and conflict-snapshot status: gitDivergenceStatus, gitDivergenceCount (mirrors planner suppressions). Never: mutation of repos, cache, or state.
 ```
 
 ## `src/cli/daemon/` — background daemon
@@ -103,10 +104,11 @@ src/cli/daemon/drift-audit.ts — watcher-drift measurement contracts, persisten
 ## `src/cli/telemetry/` — opt-out operational telemetry
 
 ```
-src/cli/telemetry/contract.ts — client/server telemetry wire schemas, numeric/enum domains, corpus buckets, fleet sync-state contract, and RBOX_TELEMETRY enablement. Never: queueing, transport, or measurement.
-src/cli/telemetry/queue.ts — best-effort bounded in-memory sample coalescing/rings, single-flight flush, backoff, rejection/drop handling, and TelemetryRecorder/Transport contracts. Never: producing measurements or sync-state summaries.
+src/cli/telemetry/contract.ts — client/server telemetry wire schemas (including fixed sync-phase axes), numeric/enum domains, corpus buckets, fleet sync-state contract, and RBOX_TELEMETRY enablement. Never: queueing, transport, or measurement.
+src/cli/telemetry/queue.ts — best-effort bounded in-memory sample coalescing/rings (including sync-phase), single-flight flush, backoff, rejection/drop handling, and TelemetryRecorder/Transport contracts. Never: producing measurements or sync-state summaries.
 src/cli/telemetry/sync-state.ts — privacy-bounded fleet sync-state projection plus daemon change/heartbeat reporting with stable binding identity and serialized best-effort sends. Never: alert evaluation or sync-state mutation.
 src/cli/telemetry/lane-accumulator.ts — AsyncLocalStorage-scoped per-push upload-lane byte/time/op accumulation and completion samples. Never: upload scheduling, transport selection, or network I/O.
+src/cli/telemetry/sync-phase.ts — per-daemon independent pull/push cadence and tail sampling plus privacy-bounded PhaseReport projection. Never: sync execution, queue transport, or repo identifiers.
 ```
 
 ## `src/cli/` — sync-adjacent singles
@@ -134,6 +136,7 @@ src/cli/reset-quarantine.ts   — design-138 fenced crash-resumable reset quaran
 src/cli/reset-journal-doctor.ts — doctor reset-journal pre-state dispatch, complete-fence reinspection, quarantine eligibility, and restore orchestration. Never: daemon lifecycle, ordinary doctor collection, or unfenced reset mutation.
 src/cli/daemon-control.ts     — daemon process lifecycle + on-disk records: binding/pid files, start/stop/liveness/PID-ownership, rbox logs tailing. Never: the daemon's sync loop (daemon/).
 src/cli/upload-lane-timing.ts — push-side timing instrumentation: the process-global firstPublishTiming singleton (SINGLE definition site), uploadLaneTiming + batch-dispatch/pack-lane telemetry accumulators, overlap math, summary formatters. Never: network or file I/O.
+src/cli/push-tail-timing.ts — AsyncLocalStorage-scoped missing/commit chunk timing and exact request-payload byte accumulation for one complete push retry loop. Never: retry, request, or upload policy.
 src/cli/e2ee-remote.ts        — E2eeRemote (§2.7 — ordering-sensitive anti-rollback): verified head + pins, manifest fetch/decrypt/fold, history/restore/suffix/rebaseline, commit orchestration, blob delegation, KEK cache + its implementation policy (sidecar threshold, write-caps, manifest blob traversal). Never: raw HTTP (remote/), crypto primitives (engine/e2ee), pure contracts (e2ee-remote-types.ts).
 src/cli/e2ee-remote-types.ts  — pure shared contracts: E2eeApi, AccountKeysDTO, WsKeyDTO, CommitChainResult, VersionInfo, VerifiedSuffixEntry, HeadPin, PinStore, E2eeContext, CurrentWriteKek. Never: behavior, policy constants.
 src/cli/e2ee-client.ts        — E2EE account/device bootstrap + pairing client flows (bootstrap, redemption, admission, verifyAccount glue). Never: transport (RboxApi/E2eeRemote), key storage (e2ee-keystore.ts).
@@ -146,7 +149,7 @@ src/cli/remote.ts                — barrel: stable import surface for the remot
 src/cli/remote/api.ts            — RboxApi facade (implements SyncRemote) + the SyncRemote interface: wires RemoteContext + blobs/commits/keys/batch modules into the surface sync depends on. Never: HTTP/crypto details (sibling domain modules).
 src/cli/remote/context.ts        — shared transport core: RemoteContext (base URL, auth token, ws/project ids, auth headers, upload-receipts accumulator, download/upload-grant caches (§27/§109), fetch/postJson/missingBlobs primitives). Never: domain-specific endpoints.
 src/cli/remote/blobs.ts          — single-blob PUT/GET transport (putBlob, getBlob, getBlobToFile), single-vs-multipart threshold, download integrity re-fetch. Never: multipart mechanics (multipart.ts), batch scheduling (blob-batch/).
-src/cli/remote/commits.ts        — manifest/commit transport: commit/commitSigned/commitsSince/latest/commitTimes/redeemReceipts + CommitRejectedError/CommitOptions/CommitTimings. Never: blob transfer, key/roster crypto.
+src/cli/remote/commits.ts        — manifest/commit transport: commit/commitSigned/commitsSince/latest/commitTimes/redeemReceipts + CommitRejectedError/CommitOptions/CommitTimings, with push-tail request timing hooks. Never: blob transfer, key/roster crypto.
 src/cli/remote/keys.ts           — E2EE key/pairing/device-admission transport (bootstrapKeys, account/device/workspace key endpoints, roster append, API-key CRUD). Never: verifying or interpreting the crypto material (engine/e2ee + e2ee-client.ts).
 src/cli/remote/multipart.ts      — resumable multipart blob upload: init/part/complete attempt loop, resume-token files, mismatch/retry-later/quota recovery. Never: streaming primitives (stream.ts), metrics (multipart-metrics.ts).
 src/cli/remote/multipart-metrics.ts — multipart upload metrics (MultipartMetrics distributions + summary formatting). Never: performing uploads.

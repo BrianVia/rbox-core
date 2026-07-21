@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { applyGitState, assertGitTargetWithinRoot, gitIdentity, gitIdentityKey, gitPreflight, indexIdentityV2, inspectLockedPRepairReceipt, isGitBusy, persistPRepairTerminal, preserveGitConflict, receiverEquivalentCollisionNames, repoCtxFromDisk, poolMap, readBaseAbsentArtifact, readBasePresentArtifact, runLockedPRepairAttempt, resumeLockedAcceptedPRepair, refreshLockedAcceptedPRepair, settleBaseAbsentArtifact, type AppliedManifestOracle, type ApplyBranchTransitionAdapter, type ApplyBranchTransitionInput, type CheckoutCapabilityProbe, type GitIdentity, type GitChainTimings, type GitSection, type IgnoreMatcher, type Manifest, type BlobStore, zeroGitChainTimings } from "../../engine/index.js";
+import { applyGitState, assertGitTargetWithinRoot, finalizeGitChainTimings, gitIdentity, gitIdentityKey, gitPreflight, indexIdentityV2, inspectLockedPRepairReceipt, isGitBusy, persistPRepairTerminal, preserveGitConflict, receiverEquivalentCollisionNames, repoCtxFromDisk, poolMap, readBaseAbsentArtifact, readBasePresentArtifact, runLockedPRepairAttempt, resumeLockedAcceptedPRepair, refreshLockedAcceptedPRepair, settleBaseAbsentArtifact, type AppliedManifestOracle, type ApplyBranchTransitionAdapter, type ApplyBranchTransitionInput, type CheckoutCapabilityProbe, type GitIdentity, type GitChainTimings, type GitSection, type IgnoreMatcher, type Manifest, type BlobStore, zeroGitChainTimings } from "../../engine/index.js";
 import { canonicalizeGitConfig, validateCanonicalGitConfig, type GitConfig } from "../../engine/git/config-sync.js";
 import { applyConfigTransaction, materializeFreshGitConfig, readConfigSnapshot, readParsedConfigSnapshot, sameConfigStatToken, type ConfigStatToken, type ConfigTransactionResult } from "../../engine/git/config-txn.js";
 import { readAllRefs } from "../../engine/git/refs.js";
@@ -219,8 +219,8 @@ export function formatGitApplyMetrics(metrics: GitApplyMetrics): string {
   const repoBits = gitApplyRepoExemplars(metrics.repoTimings)
     .map((t) => {
       const group = t.commonDirGroup === undefined ? "" : `g${t.commonDirGroup}`;
-      const chain = t.chain && t.chain.chainLength > 0
-        ? ` L${t.chain.chainLength}fd${Math.round(t.chain.fetchDecryptMs)}bv${Math.round(t.chain.bundleVerifyMs)}gi${Math.round(t.chain.gitImportMs)}io${Math.round(t.chain.indexOpStateMs)}`
+      const chain = t.chain && hasGitChainTiming(t.chain)
+        ? ` L${t.chain.chainLength}fd${Math.round(chainMetric(t.chain.fetchDecryptMs))}bv${Math.round(chainMetric(t.chain.bundleVerifyMs))}gi${Math.round(chainMetric(t.chain.gitImportMs))}io${Math.round(chainMetric(t.chain.indexOpStateMs))}rt${Math.round(chainMetric(t.chain.refTxnExclusiveMs))}ow${Math.round(chainMetric(t.chain.ownershipMs))}rl${Math.round(chainMetric(t.chain.reflogMs))}cp${Math.round(chainMetric(t.chain.connectivityProofMs))}cl${Math.round(chainMetric(t.chain.classifyMs))}rs${Math.round(chainMetric(t.chain.residualMs))}`
         : "";
       return `i${t.index}q${t.queueMs}w${t.wallMs}${GIT_APPLY_RESULT_ABBR[t.result]}${group}${chain}`;
     })
@@ -231,16 +231,33 @@ export function formatGitApplyMetrics(metrics: GitApplyMetrics): string {
   ];
   const chainTimings = metrics.repoTimings
     .map((timing) => timing.chain)
-    .filter((chain): chain is GitChainTimings => chain !== undefined && chain.chainLength > 0);
+    .filter((chain): chain is GitChainTimings => chain !== undefined && hasGitChainTiming(chain));
   if (chainTimings.length > 0) {
     distributions.push(
       formatGitApplyDistribution("fetchDecryptMs", chainTimings.map((chain) => chain.fetchDecryptMs)),
       formatGitApplyDistribution("bundleVerifyMs", chainTimings.map((chain) => chain.bundleVerifyMs)),
       formatGitApplyDistribution("gitImportMs", chainTimings.map((chain) => chain.gitImportMs)),
       formatGitApplyDistribution("indexOpStateMs", chainTimings.map((chain) => chain.indexOpStateMs)),
+      formatGitApplyDistribution("refTxnExclusiveMs", chainTimings.map((chain) => chainMetric(chain.refTxnExclusiveMs))),
+      formatGitApplyDistribution("ownershipMs", chainTimings.map((chain) => chainMetric(chain.ownershipMs))),
+      formatGitApplyDistribution("reflogMs", chainTimings.map((chain) => chainMetric(chain.reflogMs))),
+      formatGitApplyDistribution("connectivityProofMs", chainTimings.map((chain) => chainMetric(chain.connectivityProofMs))),
+      formatGitApplyDistribution("classifyMs", chainTimings.map((chain) => chainMetric(chain.classifyMs))),
+      formatGitApplyDistribution("residualMs", chainTimings.map((chain) => chainMetric(chain.residualMs))),
     );
   }
   return `mode=${metrics.runKind} repos=${metrics.repos} commonDirs=${metrics.commonDirGroups} skippedHeld=${metrics.results.skipped} results=${resultBits || "none"} ${distributions.join(" ")} repoMs=${repoBits || "none"}`;
+}
+
+function hasGitChainTiming(chain: GitChainTimings): boolean {
+  return chain.chainLength > 0 || chain.fetchDecryptMs > 0 || chain.bundleVerifyMs > 0
+    || chain.gitImportMs > 0 || chain.refTxnExclusiveMs > 0 || chain.ownershipMs > 0
+    || chain.reflogMs > 0 || chain.connectivityProofMs > 0 || chain.indexOpStateMs > 0
+    || chain.classifyMs > 0;
+}
+
+function chainMetric(value: number | undefined): number {
+  return Number.isFinite(value) ? value! : 0;
 }
 
 /**
@@ -1580,11 +1597,13 @@ opts: {
       result = "deferred";
     } finally {
       if (metrics) {
+        const wallMs = Date.now() - startedAt;
+        if (chainTimings) finalizeGitChainTimings(chainTimings, wallMs);
         metrics.results[result] += 1;
         metrics.repoTimings.push({
           index: i,
           queueMs: startedAt - queuedAt,
-          wallMs: Date.now() - startedAt,
+          wallMs,
           result,
           commonDirGroup,
           chain: chainTimings,

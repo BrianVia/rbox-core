@@ -98,3 +98,25 @@ Acceptance:
 - Independent adversarial re-audit — all IDs applied; binding skips and inviolables intact; no remaining correctness issue found.
 
 QUALITY-COMPLETE
+
+## U3-U5 (periphery; codex cut at founder's 15-min box after substance complete, residue closed by orchestrator)
+
+- U3: GitChainTimings exclusive leaves (refTxnExclusiveMs, ownershipMs, reflogMs,
+  connectivityProofMs) + residual; classifyMs reported as nested parent, excluded
+  from the leaf sum. C2 `sync_phase` telemetry: client emitter
+  (src/cli/telemetry/sync-phase.ts, N=8 + outlier always-emit pull>20s/push>15s),
+  contract kind (contract.ts), server ingest (apps/api telemetry-ingest.ts,
+  additive). No repo paths in samples.
+- U4: conflict-retention (src/cli/sync-git/conflict-retention.ts): namespace-
+  confined inventory (structural throw on escape), prune = owned-by-branch OR
+  >90d namespace timestamp, indeterminate → prune nothing, cap 64/push,
+  old-OID-checked single transaction, divergence-cache refresh via onBatch.
+  `rbox status` surfaces `conflict snapshots: N (M prunable)`.
+- U5: push-tail sub-timing (src/cli/push-tail-timing.ts) — missing/commit chunk
+  counts, per-chunk p95, payload bytes in the push summary.
+- Orchestrator additions in the same window: the design-§4.2 mandated
+  `git-sync superseded pending <rel>` line at the accepted-ACK clear (was
+  missing); rig scenario scripts/rig/scenarios/git-held-livelock.ts (registered,
+  explicit-only).
+- Gates (native): typecheck 0; cli+engine 2636/0 across 217 files; API green.
+IMPL2-COMPLETE
