@@ -56,7 +56,7 @@ const DEDICATED_TESTS: Record<string, DedicatedTest[]> = {
     { name: "design 53: fresh join fetch/import work is bounded by repos times MAX_PACK_CHAIN", weight: 0.9, antiAffinityGroup: "git-sync-process" },
     { name: "git artifact sha_mismatch re-encrypts and retries with resumable uploadsDir", weight: 0.3, antiAffinityGroup: "git-sync-process" },
     { name: "D2 apply deferral keeps chronic age across newer truth and resets reason age", weight: 0.7, antiAffinityGroup: "git-sync-process" },
-    { name: "pending + 422: M5 non-looping drop — section dropped from THIS commit, pending kept for the next pull [v6]", weight: 0.6, antiAffinityGroup: "git-sync-process" },
+    { name: "pending + 422: failed retries preserve P and all sidecars byte-for-byte", weight: 0.6, antiAffinityGroup: "git-sync-process" },
     { name: "clean materialization with a ref-wiping hook defers before stranding a sibling worktree branch", weight: 0.6, antiAffinityGroup: "git-sync-process" },
   ],
 };
