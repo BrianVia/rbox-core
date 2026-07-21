@@ -1,6 +1,6 @@
 # 175 — Linux git-ref side-channel (a.k.a. 172B): event-driven refs for repos that appear after daemon start
 
-Status: DRAFT v3 (2026-07-21) — r1 parallel wave folded in v2 (codex 4B+10M +
+Status: ALIGNED v4 (2026-07-21) — r1 parallel wave folded in v2 (codex 4B+10M +
 opus 4M); r2 serial review folded here (codex xhigh: 2B+5M+1m+ed,
 REVIEW-175-R2-CODEX.md — both blockers were v2-fold artifacts, now closed:
 reftable detection moved from filesystem layout to `extensions.refStorage`
@@ -25,7 +25,7 @@ silently swallowed (`:178-183`); `IN_Q_OVERFLOW` silently discarded
 (`:96-123`). Parcel 2.6.0 unchanged. macOS unaffected (single FSEvents
 full-path stream; field-verified 2026-07-21).
 
-## Fix shape: bounded Bun `fs.watch` ref side-channel (Linux + Parcel only)
+## Fix shape: admission-budgeted Bun `fs.watch` ref side-channel (Linux + Parcel only)
 
 A registry of per-repo ref watches on Bun's `node:fs.watch`, fed by the
 engine's git discovery, signaling into 172's `SignalDebouncer` →
@@ -176,8 +176,9 @@ erased).
 
 **Bounds (C-11, honest form per R2-3):** repo count capped at the existing
 `gitRepoCap()` ceiling with deterministic selection: ALL admitted repos (dir
-AND pointer) in stable path order; over-cap repos are floor-eligible, logged
-once per composition. JS handles: ≤4/repo for `gitDir === commonDir`, 5 for
+AND pointer) in stable path order; over-cap repos are floor-eligible (for
+dir-backed ownership — only dir-backed ownership pins), logged once per
+composition. JS handles: ≤4/repo for `gitDir === commonDir`, 5 for
 a pointer whose `gitDir !== commonDir`. Descriptor exposure: the strict
 "bounded" claim is WITHDRAWN — Bun performs its own recursive walk after any
 pre-check (`path_watcher.zig:469-477`) and a post-arm populated move-in
@@ -187,7 +188,7 @@ lifetime descriptors. What ships instead:
   `opendir` streaming, no symlink following, combined heads+tags accounting,
   visited-entry ceiling (dirs default 512, entries default 8192), stop
   immediately at budget+1, any read fault ⇒ no-recursive-roots for that repo
-  + pending/floor;
+  + pending/floor (dir-backed ownership only, per the floor formula);
 - a DOCUMENTED exception: growth between count and attach, or a post-arm
   populated move-in, can exceed the heuristic — the exposure is inotify wd
   exhaustion, whose failure surfaces on the NEXT attach attempt (visible,
