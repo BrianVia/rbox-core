@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { captureGitState, gitIdentityKey, gitSectionNewestLink, gitSectionTips, hashBytes, projectIdentity, repoCtxFromDisk, MAX_PACK_CHAIN, MAX_GIT_REPOS, type GitIdentity, type GitPackLink, type GitRepoKind, type GitRefScope, type GitSection } from "../../engine/index.js";
+import type { GitCaptureOptions } from "../../engine/git/capture.js";
 import { headBranchOf } from "../../engine/git/shared.js";
 import { type GitDeferral, type GitDeferralReason, type WorkspaceConfig } from "../config.js";
 import type { SyncRemote } from "../remote.js";
@@ -21,6 +22,7 @@ const GIT_APPLY_CONCURRENCY_DEFAULT = 6;
  * loud once per workspace/repo without repeating forever on every pull. */
 export const configOwnershipSkipLogged = new Set<string>();
 export const pendingCarryLogged = new Set<string>();
+export type ResolutionCaptureTestHooks = NonNullable<GitCaptureOptions["testHooks"]>;
 /** Invalid incoming config is an additive-field compatibility event. Keep it
  * loud once per workspace/repo while the independent Git lane continues. */
 export const configInvalidSkipLogged = new Set<string>();
@@ -208,7 +210,9 @@ export async function capturePlannedGitSection(
   uploadsDir: string,
   forced: boolean,
   backoff?: (attempt: number) => Promise<void>,
-  onBytes?: (absoluteBytes: number) => void
+  onBytes?: (absoluteBytes: number) => void,
+  resolution = false,
+  testHooks?: ResolutionCaptureTestHooks,
 ): Promise<{ section?: GitSection; reason?: string }> {
   const repoDir = repoDirOf(root, rel);
   const capture = (opts: { basis?: { tips: string[] }; onBasisFallback?: (reason: string) => void } = {}) =>
@@ -218,6 +222,8 @@ export async function capturePlannedGitSection(
       uploadAttempts: PER_FILE_UPLOAD_ATTEMPTS,
       backoff,
       onBytes,
+      resolution,
+      testHooks,
       ...opts,
     });
 

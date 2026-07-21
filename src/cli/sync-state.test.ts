@@ -107,6 +107,32 @@ describe("design 93 §6 sync-point truth table", () => {
 });
 
 describe("design 93 §6 transactional unit", () => {
+  test("design 177 strips a <=1.7.18 intent and an unrelated repository save drops it from disk", async () => {
+    const raw = baseState({
+      old: {
+        repoGen: 1,
+        sourceSeq: 0,
+        pending: section("pending"),
+        resolutionIntent: { v: 1, verb: "keep-mine", snapshot: "obsolete" },
+      } as unknown as RepoRecord,
+      other: { repoGen: 0, sourceSeq: 0 },
+    });
+    await fs.mkdir(path.join(root, ".rbox"), { recursive: true });
+    await fs.writeFile(path.join(root, ".rbox", "state.json"), JSON.stringify(raw));
+
+    const loaded = await loadState(root, stream);
+    expect((loaded.repoRecords?.old as RepoRecord & { resolutionIntent?: unknown }).resolutionIntent).toBeUndefined();
+    await saveStateSource(root, loaded, {
+      expectedStream: stream,
+      sourceGlobalSeq: 0,
+      observedRepos: ["other"],
+      values: { partial: { other: null } },
+    });
+    const persisted = await fs.readFile(path.join(root, ".rbox", "state.json"), "utf8");
+    expect(persisted).not.toContain("resolutionIntent");
+    expect(repoRecordsForState(await loadState(root, stream)).old?.pending).toEqual(section("pending"));
+  });
+
   test("published checkout recovery merges fresh lanes and is idempotent", async () => {
     const oldApply = {
       lane: "apply" as const,

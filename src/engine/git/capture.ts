@@ -4,9 +4,10 @@ import type { BlobStore, ByteProgressCallback } from "../blobstore.js";
 import { validateGitSection } from "../manifest-validate.js";
 import type { GitArtifactRef, GitSection } from "../types.js";
 import { clearIndexResolveUndo, exists, git, gitOk, headBranchOf, listWorktrees, putGitArtifact, readHead, type RepoCtx, repoCtx } from "./shared.js";
-import { readAllRefs, readOpState, readScopedRefs } from "./refs.js";
+import { hasInProgressOpState, readAllRefs, readOpStateSnapshot, readScopedRefs } from "./refs.js";
 import { type ScratchPins, WIP_NS, collectPinShas, createScratchPins, deleteScratchPins, pruneStaleScratchRefs } from "./pins.js";
-import { indexTreeOf } from "./identity.js";
+import { indexTreeOfPath } from "./identity.js";
+import { hashFile } from "../hash.js";
 
 /**
  * Git-native repo-state sync (M2 v3, generalized per design 43 §§4-5). History rides
@@ -75,6 +76,32 @@ export interface GitCaptureOptions {
   /** Cumulative ciphertext bytes uploaded during this capture. Engine-local:
    *  callers decide how to surface it. */
   onBytes?: ByteProgressCallback;
+  /** Synchronous keep-mine hardening: pin the recorded snapshot and prove the
+   * live repository still equals it before returning a publish candidate. */
+  resolution?: boolean;
+  /** Deterministic capture-race seams. Production never supplies these. */
+  testHooks?: {
+    afterStagedArtifacts?: () => void | Promise<void>;
+    afterRefsRecorded?: () => void | Promise<void>;
+    afterStashCreated?: () => void | Promise<void>;
+    afterScratchPins?: (snapshot: { tmpDir: string; bundlePath: string; refs: readonly string[] }) => void | Promise<void>;
+    beforeStabilityCheck?: () => void | Promise<void>;
+  };
+}
+
+/** Complete object roots for a raw/unmerged staged index. Paths are NUL framed;
+ * filenames containing newlines must never corrupt object enumeration. */
+export async function stagedIndexObjectOids(repoDir: string, stagedIndex: string): Promise<string[]> {
+  const stagedEntries = await git(repoDir, ["ls-files", "-z", "--stage", "--sparse"], { env: { GIT_INDEX_FILE: stagedIndex } });
+  const oids = new Set<string>();
+  for (const entry of stagedEntries.split("\0")) {
+    if (!entry) continue;
+    const match = /^\d+\s+([0-9a-f]{40})\s+\d+\t/.exec(entry);
+    if (!match || /^0{40}$/.test(match[1]!)) continue;
+    await git(repoDir, ["cat-file", "-e", `${match[1]}^{object}`]);
+    oids.add(match[1]!);
+  }
+  return [...oids].sort();
 }
 
 export function gitCaptureScratchRoot(workspaceRoot: string): string {
@@ -213,34 +240,50 @@ export async function captureGitState(repoDir: string, store: BlobStore, kek: Bu
       await clearIndexResolveUndo(repoDir, stagedIndex);
     }
     const stagedOp: Array<{ rel: string; staged: string }> = [];
-    const liveOp = await readOpState(ctx.gitDir, async () => ""); // just enumerate present op-state
-    for (const rel of Object.keys(liveOp)) {
+    const sampledOp = await readOpStateSnapshot(ctx.gitDir, hashFile);
+    for (const rel of Object.keys(sampledOp.files)) {
       const staged = path.join(tmpDir, "op", rel);
       await fs.mkdir(path.dirname(staged), { recursive: true });
       await fs.copyFile(path.join(ctx.gitDir, rel), staged);
       stagedOp.push({ rel, staged });
     }
+    const stagedOpFiles = Object.fromEntries(await Promise.all(stagedOp.map(async ({ rel, staged }) => [rel, await hashFile(staged)])));
+    const stagedOpSnapshot = { files: stagedOpFiles, rootsPresent: sampledOp.rootsPresent };
+    if (opts.resolution && hasInProgressOpState(stagedOpSnapshot)) {
+      throw new GitCaptureDeferredError("a Git operation is in progress; finish or abort it, then run keep-mine again");
+    }
+    await opts.testHooks?.afterStagedArtifacts?.();
 
     // 2. refs + HEAD (scope-aware) — read via git / atomic file from the resolved gitdir.
     let head = await readHead(ctx);
     const refs = ctx.kind === "dir" ? await readAllRefs(repoDir) : await readScopedRefs(repoDir, head);
     head = normalizeSymbolicHeadCasing(head, refs);
+    await opts.testHooks?.afterRefsRecorded?.();
 
     // 3. Make dirty+staged state + pseudo-ref commits reachable, then bundle.
     //    `git stash create` works from a worktree context unchanged.
     const wip = (await git(repoDir, ["stash", "create"]).catch(() => "")).trim();
-    const pinShas = new Set(await collectPinShas(ctx, head));
+    await opts.testHooks?.afterStashCreated?.();
+    const pinShas = new Set(await collectPinShas(ctx, head, path.join(tmpDir, "op")));
     if (wip) pinShas.add(wip);
+    const indexTree = stagedIndex ? await indexTreeOfPath(ctx, stagedIndex) : undefined;
+    if (opts.resolution && indexTree && /^[0-9a-f]{40}$/.test(indexTree)) pinShas.add(indexTree);
+    if (opts.resolution && stagedIndex && indexTree?.startsWith("raw:")) {
+      for (const oid of await stagedIndexObjectOids(repoDir, stagedIndex)) pinShas.add(oid);
+    }
+    if (opts.resolution) for (const oid of Object.values(refs)) pinShas.add(oid);
     pins = await createScratchPins(repoDir, [...pinShas]);
     const bundlePath = path.join(tmpDir, "repo.bundle");
+    await opts.testHooks?.afterScratchPins?.({ tmpDir, bundlePath, refs: pins.refs });
     let dirAllArgs: string[] | undefined;
-    if (ctx.kind === "dir") {
+    if (ctx.kind === "dir" && !opts.resolution) {
       const decision = decideDirBundleAllArgs(await gitSupportsSingleWorktree(repoDir), await hasLiveLinkedWorktrees(ctx));
       if (!decision.ok) throw new GitCaptureDeferredError(decision.reason);
       dirAllArgs = decision.args;
     }
-    const bundleArgs =
-      ctx.kind === "dir"
+    const bundleArgs = opts.resolution
+      ? pins.refs
+      : ctx.kind === "dir"
         ? [...dirAllArgs!, ...(refs["refs/stash"] ? ["refs/stash"] : []), ...pins.refs]
         : [...Object.keys(refs), ...pins.refs]; // current branch (if any) + pins; detached HEAD rides its pin
     const basisTips = [...new Set(opts.basis?.tips ?? [])].filter((tip) => /^[0-9a-f]{40}$/.test(tip)).sort();
@@ -275,7 +318,6 @@ export async function captureGitState(repoDir: string, store: BlobStore, kek: Bu
 
     let index: GitArtifactRef | undefined;
     if (stagedIndex) index = await putGitArtifact(store, kek, stagedIndex, tmpDir, uploadOpts());
-    const indexTree = await indexTreeOf(ctx);
     const opState: Record<string, GitArtifactRef> = {};
     for (const { rel, staged } of stagedOp) {
       opState[rel] = await putGitArtifact(store, kek, staged, tmpDir, uploadOpts());
@@ -301,6 +343,34 @@ export async function captureGitState(repoDir: string, store: BlobStore, kek: Bu
     // with the validator reason rather than commit a section every receiver will reject.
     const validation = validateGitSection(section);
     if (!validation.ok) throw new GitCaptureDeferredError(`capture failed self-validation: ${validation.reason ?? "invalid git section"}`);
+    if (opts.resolution) {
+      await opts.testHooks?.beforeStabilityCheck?.();
+      try {
+        let liveHead = await readHead(ctx);
+        const liveRefs = ctx.kind === "dir" ? await readAllRefs(repoDir) : await readScopedRefs(repoDir, liveHead);
+        liveHead = normalizeSymbolicHeadCasing(liveHead, liveRefs);
+        const liveIndexPath = path.join(ctx.gitDir, "index");
+        const liveIndex = await exists(liveIndexPath);
+        let liveIndexTree: string | undefined;
+        if (liveIndex) {
+          const normalizedLiveIndex = path.join(tmpDir, "live-index");
+          await fs.copyFile(liveIndexPath, normalizedLiveIndex);
+          await clearIndexResolveUndo(repoDir, normalizedLiveIndex);
+          liveIndexTree = await indexTreeOfPath(ctx, normalizedLiveIndex);
+        }
+        const liveOpSnapshot = await readOpStateSnapshot(ctx.gitDir, hashFile);
+        const canonical = (value: Record<string, string>) => JSON.stringify(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)));
+        const stable = liveHead === head
+          && canonical(liveRefs) === canonical(refs)
+          && liveIndex === (stagedIndex !== undefined)
+          && liveIndexTree === indexTree
+          && canonical(liveOpSnapshot.files) === canonical(stagedOpSnapshot.files)
+          && JSON.stringify([...liveOpSnapshot.rootsPresent].sort()) === JSON.stringify([...stagedOpSnapshot.rootsPresent].sort());
+        if (!stable) throw new Error("snapshot mismatch");
+      } catch {
+        throw new GitCaptureDeferredError("your repository changed while publishing — run the command again");
+      }
+    }
     return section;
   } finally {
     if (pins) await deleteScratchPins(repoDir, pins);

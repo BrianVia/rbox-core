@@ -6,6 +6,12 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- Confirmed `keep-mine` now waits for the current sync cycle and publishes in
+  the foreground under the same workspace lock. Local intents written by
+  rbox <=1.7.18 are ignored and dropped on the next state save; restart any
+  still-running older daemon before confirming with the new CLI.
+
 ## [1.7.19] — 2026-07-21 — "status tells you what's actually wrong"
 
 ### Added

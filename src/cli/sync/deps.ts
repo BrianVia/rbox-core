@@ -15,6 +15,7 @@ import type { WorkspaceSyncMutex } from "../sync-mutex.js";
 import type { TransferProgress } from "../transfer-progress.js";
 import type { TelemetryRecorder } from "../telemetry/queue.js";
 import type { GitPushPlan } from "../sync-git/plan.js";
+import type { ResolutionCaptureTestHooks } from "../sync-git/shared.js";
 
 type CurrentWriteContext = {
   kek: Uint8Array;
@@ -63,6 +64,8 @@ export interface SyncDeps {
   encryptFileToTemp?: EncryptAndUploadOptions["encryptFileToTemp"];
   /** Test seam for debounce timing; production leaves the design-75 ~10s default. */
   encryptCacheFlushMs?: number;
+  /** Test-only race seam for synchronous keep-mine's actual publication capture. */
+  resolutionCaptureTestHooks?: ResolutionCaptureTestHooks;
   /** Forensic git-sync log sink (design 43 §10): capture/carry/defer/remove summaries on
    *  push, per-repo apply/conflict lines on pull. Push summaries include their structured
    *  plan as optional presentation context; grep-oriented sinks can ignore it and retain

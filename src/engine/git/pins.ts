@@ -83,12 +83,12 @@ export async function pruneStaleScratchRefs(repoDir: string, ns: string): Promis
  *  DIR captures too (the pseudo-ref hole is latent in design 02: `--all` usually reaches
  *  those commits via a branch, but nothing guarantees it). Only shas whose objects verify
  *  are pinned — a stale pseudo-ref must not fail the whole bundle. */
-export async function collectPinShas(ctx: RepoCtx, head: string): Promise<string[]> {
+export async function collectPinShas(ctx: RepoCtx, head: string, opStateRoot = ctx.gitDir): Promise<string[]> {
   const shas = new Set<string>();
   const h = head.trim();
   if (HEX40.test(h)) shas.add(h); // detached HEAD
   for (const rel of PSEUDO_REF_SHA_FILES) {
-    const txt = await fs.readFile(path.join(ctx.gitDir, rel), "utf8").catch(() => "");
+    const txt = await fs.readFile(path.join(opStateRoot, rel), "utf8").catch(() => "");
     for (const line of txt.split("\n")) {
       const s = line.trim();
       if (HEX40.test(s)) shas.add(s); // MERGE_HEAD may list several (octopus)
@@ -98,7 +98,7 @@ export async function collectPinShas(ctx: RepoCtx, head: string): Promise<string
   for (const s of shas) {
     if (await gitOk(ctx.repoDir, ["rev-parse", "--verify", "--quiet", `${s}^{commit}`])) out.push(s);
   }
-  const autoMerge = (await fs.readFile(path.join(ctx.gitDir, "AUTO_MERGE"), "utf8").catch(() => "")).trim();
+  const autoMerge = (await fs.readFile(path.join(opStateRoot, "AUTO_MERGE"), "utf8").catch(() => "")).trim();
   if (HEX40.test(autoMerge) && !out.includes(autoMerge) && (await gitOk(ctx.repoDir, ["rev-parse", "--verify", "--quiet", `${autoMerge}^{tree}`]))) {
     out.push(autoMerge);
   }

@@ -7,7 +7,7 @@ import { type GitConfigRunner } from "../../engine/git/config-txn.js";
 import { expectedStateNonce, repoRecordsForState, type GitDeferralReason, type SyncState, type WorkspaceConfig } from "../config.js";
 import type { SyncRemote } from "../remote.js";
 import type { TransferProgress } from "../transfer-progress.js";
-import { GIT_CAPTURE_CONCURRENCY, configCredentialSkipLogged, configOwnershipSkipLogged, pendingCarryLogged, gitRepoCap, repoDirOf, carryMatrixMatches, emptyToUndef, errMsg, gitIncomingKey, capturePlannedGitSection } from "./shared.js";
+import { GIT_CAPTURE_CONCURRENCY, configCredentialSkipLogged, configOwnershipSkipLogged, pendingCarryLogged, gitRepoCap, repoDirOf, carryMatrixMatches, emptyToUndef, errMsg, gitIncomingKey, capturePlannedGitSection, type ResolutionCaptureTestHooks } from "./shared.js";
 import { configReceiver, gitConfigHash, readLocalGitConfig, shouldPublishGitConfig, type LocalCfgRead } from "./config-lane.js";
 import { gitFingerprint, gitFingerprintRun } from "./fingerprint.js";
 import { loadGitDivergenceCache, saveGitDivergenceCache, fingerprintHitProbe, buildPlanProbe, writeDivergenceCacheEntry, isGitRepoKind, type FingerprintHitProbeResult, type DivergenceCacheProbeSnapshot, type DivergenceCacheWriteResult } from "./divergence-cache.js";
@@ -15,7 +15,7 @@ import { checkoutJournalBinding, quarantineUnboundFollowJournal, recoverAndLandF
 import { normalizeOutgoingGitSections, tombstoneFindingLine } from "./publisher-tombstones.js";
 import { gitPendingSupersedeEnabled, journalAllowsPendingSupersession, pendingSupersessionPreProbe, provePendingSupersession } from "./pending-supersession.js";
 import { CONFLICT_REF_PRUNE_LIMIT, pruneConflictRefs } from "./conflict-retention.js";
-import { discardedIncomingOids, finalResolutionReport, reportAuthorized, resolutionBindingIdentity } from "./resolution-intent.js";
+import { discardedIncomingOids, finalResolutionReport, reportAuthorized, resolutionReportHash, type GitResolutionRider } from "./resolution-intent.js";
 /** The outcome of push-side git orchestration: the outbound `gitRepos` map, whether it
  *  differs from what the last commit carried, the local-only state after this cycle
  *  (persisted only on a successful commit — recomputed idempotently otherwise), and
@@ -48,8 +48,10 @@ export interface GitPushPlan {
   carried: string[];
   /** Candidate-bound receipts consumed only by the accepted publisher ACK. */
   supersededPending: string[];
-  /** Design-176 intents whose exact final candidate passed its directional report. */
+  /** Synchronous keep-mine candidate whose final directional report was authorized. */
   resolvedPending?: string[];
+  /** Explicit disposition for the foreground resolver. Never infer this from changed. */
+  resolution?: { outcome: "published" | "refused"; reason?: string; confirmedReportHash?: string };
   /** Repos whose entire P-bound record is immutable before accepted ACK. */
   protectedPending: string[];
   deferred: Array<{ relPath: string; reason: string }>;
@@ -99,6 +101,10 @@ export interface GitPlanOptions {
   onGitReposDiscovered?: (repos: readonly DiscoveredGitRepo[]) => Promise<void>;
   /** Deterministic test seam for a ref race after B's provisional pre-probe. */
   afterPendingPreProbe?: (relPath: string) => void | Promise<void>;
+  /** Ephemeral foreground confirmation authority, retained by the push loop. */
+  resolution?: GitResolutionRider;
+  /** Publication-capture race seam. Tests only; ordinary/preliminary capture never receives it. */
+  resolutionCaptureTestHooks?: ResolutionCaptureTestHooks;
 }
 
 /**
@@ -167,8 +173,9 @@ export async function planGitSections(
   };
   const pendingSupersessionCandidates = new Set<string>();
   const supersededPending = new Set<string>();
-  const resolutionIntentCandidates = new Set<string>();
+  const resolutionCandidates = new Set<string>();
   const resolvedPending = new Set<string>();
+  let resolutionDisposition: GitPushPlan["resolution"];
   const stableCarryHygiene = new Set<string>();
   const cache = await loadGitDivergenceCache(root);
   const fingerprintRun = gitFingerprintRun("per-decision");
@@ -251,6 +258,7 @@ export async function planGitSections(
       carried,
       supersededPending: [...supersededPending].sort(),
       resolvedPending: [...resolvedPending].sort(),
+      ...(resolutionDisposition ? { resolution: resolutionDisposition } : {}),
       protectedPending: Object.keys(pending).sort(),
       deferred,
       captureDeferrals,
@@ -279,24 +287,14 @@ export async function planGitSections(
     // propagates), and the local-only bookkeeping is abandoned with it — a surviving
     // pending entry would otherwise re-trigger the per-repo base restore every push
     // (changed forever → echo-commit loop).
-    const intentProtected = new Set(Object.entries(repoRecordsForState(state))
-      .filter(([, record]) => record.resolutionIntent !== undefined && record.pending !== undefined)
-      .map(([relPath]) => relPath));
     for (const k of new Set([...Object.keys(state.repoRecords ?? {}), ...Object.keys(base), ...Object.keys(pending)])) {
       captureObserved.add(k);
       configObserved.add(k);
-      if (intentProtected.has(k)) {
-        if (pending[k]) {
-          out[k] = pending[k]!;
-          carried.push(k);
-        }
-        continue;
-      }
       repoAbsent[k] = true;
     }
-    for (const k of Object.keys(pending)) if (!intentProtected.has(k)) delete pending[k];
-    for (const k of Object.keys(needsRes)) if (!intentProtected.has(k)) delete needsRes[k];
-    for (const k of Object.keys(removedMem)) if (!intentProtected.has(k)) delete removedMem[k];
+    for (const k of Object.keys(pending)) delete pending[k];
+    for (const k of Object.keys(needsRes)) delete needsRes[k];
+    for (const k of Object.keys(removedMem)) delete removedMem[k];
     return plan();
   }
   if (!cfg.kek) throw new Error("git-sync requires an encryption key (E2EE)"); // §28: artifacts are encrypted
@@ -321,8 +319,7 @@ export async function planGitSections(
   for (const rel of keys) {
     const repoDir = repoDirOf(root, rel);
     const ctx = await repoCtxFromDisk(repoDir).catch(() => undefined);
-    const recordBeforeRecovery = repoRecordsForState(state)[rel];
-    if (recordBeforeRecovery?.resolutionIntent && recordBeforeRecovery.pending) {
+    if (options.resolution?.repo === rel && pending[rel]) {
       const journalPresent = await fs.lstat(checkoutJournalDir(root, rel)).then(
         () => true,
         (error: NodeJS.ErrnoException) => {
@@ -525,7 +522,7 @@ export async function planGitSections(
     kind: GitRepoKind | undefined,
     baseSec: GitSection | undefined,
     fastLookup?: FingerprintHitProbeResult,
-    opts: { admissionAlreadyCounted?: boolean; forceCapture?: boolean; resolutionIntent?: boolean } = {}
+    opts: { admissionAlreadyCounted?: boolean; forceCapture?: boolean; resolution?: boolean } = {}
   ): Promise<void> => {
     stats.spawnedRepos++;
     const probeBeforeFingerprint = fastLookup?.fingerprint ?? (await gitFingerprint(fingerprintRun, root, rel));
@@ -568,7 +565,7 @@ export async function planGitSections(
     // user worked there → re-adding is intentional; clear the memory and fall through.
     // An UNREADABLE leftover (dangling pointer, transient) keeps its guard and is
     // skipped — clearing on a transient would re-add unchanged git once it heals.
-    if (!baseSec && removedMem[rel] !== undefined && !opts.resolutionIntent) {
+    if (!baseSec && removedMem[rel] !== undefined && !opts.resolution) {
       const id = await gitIdentity(repoDirOf(root, rel));
       if (!id || gitIdentityKey(id) === removedMem[rel]) return;
       delete removedMem[rel];
@@ -576,7 +573,7 @@ export async function planGitSections(
 
     // needsResolution [v2, M2]: carry the checkpointed base until the local identity
     // CHANGES from the recorded conflict-time value (republish must be intentional).
-    if (needsRes[rel] !== undefined && !opts.resolutionIntent) {
+    if (needsRes[rel] !== undefined && !opts.resolution) {
       const id = await gitIdentity(repoDirOf(root, rel));
       if (gitIdentityKey(id) === needsRes[rel]) {
         const carry = pending[rel] ?? baseSec;
@@ -707,11 +704,14 @@ export async function planGitSections(
     const recoveryReason = recoveryBlocked.get(rel);
     if (recoveryReason) {
       if (pend) {
+        const rider = options.resolution?.repo === rel ? options.resolution : undefined;
         deferred.push({ relPath: rel, reason: recoveryReason });
-        if (!force.has(rel)) {
-          out[rel] = pend;
-          carried.push(rel);
-        }
+        // P remains authoritative until an accepted ACK, including a forced 422
+        // recapture. Recovery refusal is a typed keep-mine disposition and must
+        // never make the protected section disappear from the retry manifest.
+        out[rel] = pend;
+        carried.push(rel);
+        if (rider) resolutionDisposition = { outcome: "refused", reason: recoveryReason };
         continue;
       }
       deferOne(rel, recoveryReason);
@@ -722,54 +722,21 @@ export async function planGitSections(
     // only admits a provisional candidate; final normalized-candidate proof below
     // decides whether publication is permitted.
     if (pend) {
-      const record = repoRecordsForState(state)[rel];
-      const intent = record?.resolutionIntent;
-      if (intent) {
+      const rider = options.resolution?.repo === rel ? options.resolution : undefined;
+      if (rider) {
         if (options.degradedMutex) {
           out[rel] = pend;
           carried.push(rel);
-          deferred.push({ relPath: rel, reason: "workspace locking is degraded; keep-mine publication requires safe serialization" });
+          const reason = "workspace locking is degraded; keep-mine publication requires safe serialization";
+          deferred.push({ relPath: rel, reason });
+          resolutionDisposition = { outcome: "refused", reason };
           continue;
         }
-        let bindingMatches = false;
-        try {
-          if (intent.v === 1 && intent.verb === "keep-mine"
-            && record.repoGen === intent.binding.repoGen + 1
-            && intent.binding.stream === state.stream
-            && intent.binding.stateNonce === expectedStateNonce(state)
-            && intent.binding.incomingKey === gitIncomingKey(pend)) {
-            const oracle = oracleFromState({ base: state.lastSyncedManifest, matcher, root });
-            const current = await resolutionBindingIdentity({
-              root,
-              rel,
-              ctx: await repoCtxFromDisk(repoDirOf(root, rel)).then((value) => {
-                if (!value) throw new Error("repository context unavailable");
-                return value;
-              }),
-              state,
-              // The install transition itself is not a bound-input race.
-              record: { ...record, repoGen: intent.binding.repoGen },
-              incoming: pend,
-              oracle,
-              cfg,
-              boundary: true,
-            });
-            bindingMatches = JSON.stringify(current) === JSON.stringify(intent.binding);
-          }
-        } catch {
-          bindingMatches = false;
-        }
-        if (!bindingMatches) {
-          out[rel] = pend;
-          carried.push(rel);
-          deferred.push({ relPath: rel, reason: "keep-mine snapshot changed; review the current repository and confirm again" });
-          continue;
-        }
-        resolutionIntentCandidates.add(rel);
+        resolutionCandidates.add(rel);
         await processRepoSlowPath(rel, kind, baseSec, undefined, {
           forceCapture: true,
           admissionAlreadyCounted: true,
-          resolutionIntent: true,
+          resolution: true,
         });
         continue;
       }
@@ -965,7 +932,8 @@ export async function planGitSections(
     try {
       const { section: sec, reason } = await capturePlannedGitSection(
         root, rel, cfg, base[rel], api, kek, uploadsDir, force.has(rel), backoff,
-        (abs) => noteRepoBytes(rel, abs)
+        (abs) => noteRepoBytes(rel, abs), resolutionCandidates.has(rel),
+        resolutionCandidates.has(rel) ? options.resolutionCaptureTestHooks : undefined,
       );
       if (sec) {
         commitCapture(rel, await captureWithConfig(rel, sec));
@@ -989,57 +957,25 @@ export async function planGitSections(
   const normalized = normalizeCurrentOutgoing();
   for (const { relPath, finding } of normalized.findings) glog(tombstoneFindingLine(relPath, finding));
   finalizedOutgoing = normalized.sections;
-  for (const rel of [...resolutionIntentCandidates].sort()) {
-    const record = repoRecordsForState(state)[rel];
-    const intent = record?.resolutionIntent;
+  for (const rel of [...resolutionCandidates].sort()) {
+    const rider = options.resolution?.repo === rel ? options.resolution : undefined;
     const p = pending[rel];
     const candidate = finalizedOutgoing[rel];
     const ctx = await repoCtxFromDisk(repoDirOf(root, rel)).catch(() => undefined);
-    if (!intent || !p || !candidate || !ctx || !captured.includes(rel)) {
-      if (p) revertCapture(rel, p, "keep-mine capture did not produce a final candidate — intent and incoming state remain unchanged");
-      continue;
-    }
-    let postCaptureBindingMatches = false;
-    try {
-      const oracle = oracleFromState({ base: state.lastSyncedManifest, matcher, root });
-      const postCaptureBinding = await resolutionBindingIdentity({
-        root,
-        rel,
-        ctx,
-        state,
-        record: { ...record, repoGen: intent.binding.repoGen },
-        incoming: p,
-        oracle,
-        cfg,
-        boundary: true,
-      });
-      postCaptureBindingMatches = JSON.stringify(postCaptureBinding) === JSON.stringify(intent.binding);
-    } catch {
-      postCaptureBindingMatches = false;
-    }
-    if (!postCaptureBindingMatches) {
-      revertCapture(rel, p, "keep-mine snapshot changed during capture — intent and incoming state remain unchanged");
+    if (!rider || !p || !candidate || !ctx || !captured.includes(rel)) {
+      const reason = deferred.find((item) => item.relPath === rel)?.reason
+        ?? "keep-mine capture did not produce a final candidate";
+      if (p && candidate !== p) revertCapture(rel, p, reason);
+      resolutionDisposition = { outcome: "refused", reason };
       continue;
     }
     const report = await finalResolutionReport({ ctx, pending: p, candidate, store: api.blobStore(), kek });
-    if (!reportAuthorized(intent, report)) {
-      revertCapture(rel, p, report.lanes.some((lane) => lane.disposition === "indeterminate")
-        ? "keep-mine final discard report was indeterminate — intent and incoming state remain unchanged"
-        : "keep-mine final candidate would discard a lane that was not confirmed — review and confirm again");
-      continue;
-    }
-    let prePinBindingMatches = false;
-    try {
-      const oracle = oracleFromState({ base: state.lastSyncedManifest, matcher, root });
-      const prePinBinding = await resolutionBindingIdentity({
-        root, rel, ctx, state, record: { ...record, repoGen: intent.binding.repoGen }, incoming: p, oracle, cfg, boundary: true,
-      });
-      prePinBindingMatches = JSON.stringify(prePinBinding) === JSON.stringify(intent.binding);
-    } catch {
-      prePinBindingMatches = false;
-    }
-    if (!prePinBindingMatches) {
-      revertCapture(rel, p, "keep-mine snapshot changed during final reporting — intent and incoming state remain unchanged");
+    if (!reportAuthorized(rider.authorizedLanes, report)) {
+      const reason = report.lanes.some((lane) => lane.disposition === "indeterminate")
+        ? "keep-mine final discard report was indeterminate"
+        : "keep-mine final candidate would discard a lane that was not confirmed — review and confirm again";
+      revertCapture(rel, p, reason);
+      resolutionDisposition = { outcome: "refused", reason };
       continue;
     }
     const reachable: string[] = [];
@@ -1049,12 +985,16 @@ export async function planGitSections(
     if (reachable.length > 0) {
       await pinDisplaced(ctx.repoDir, reachable, {
         ref: `keep-mine:${rel}`,
-        episode: intent.snapshot,
+        episode: resolutionReportHash(rider.confirmedReport),
         time: (options.now?.() ?? new Date()).toISOString(),
         class: "human",
       });
     }
     resolvedPending.add(rel);
+    resolutionDisposition = {
+      outcome: "published",
+      confirmedReportHash: resolutionReportHash(rider.confirmedReport),
+    };
   }
   for (const rel of [...pendingSupersessionCandidates].sort()) {
     const p = pending[rel];
@@ -1075,7 +1015,7 @@ export async function planGitSections(
   let conflictDeleteBudget = CONFLICT_REF_PRUNE_LIMIT;
   const cleanedCommonDirs = new Set<string>();
   for (const rel of [...new Set([...stableCarryHygiene, ...captured])]
-    .filter((candidate) => !resolutionIntentCandidates.has(candidate))
+    .filter((candidate) => !resolutionCandidates.has(candidate))
     .sort()) {
     if (conflictDeleteBudget === 0) break;
     const ctx = await repoCtxFromDisk(repoDirOf(root, rel)).catch(() => undefined);

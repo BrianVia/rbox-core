@@ -43,7 +43,7 @@ export interface E2eeApi {
   // signed commit chain
   latestCommit(): Promise<{ sequence: number; commit: SignedCommit | null }>;
   commitsSince(seq: number): Promise<SignedCommit[]>;
-  commitSigned(parentSeq: number, commit: SignedCommit): Promise<CommitChainResult>;
+  commitSigned(parentSeq: number, commit: SignedCommit, beforeManifestPost?: () => Promise<void>): Promise<CommitChainResult>;
   /** Advisory server-reported commit timestamps (seq → epoch-ms) for display only —
    *  the best-effort D1 mirror, NOT authenticated. Used by `rbox versions` to show a
    *  time column; the in-memory test fake returns an empty map. */

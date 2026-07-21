@@ -807,10 +807,10 @@ export class E2eeRemote implements SyncRemote {
     try {
       if (onCommitTimings) {
         const t0 = Date.now();
-        res = await this.api.commitSigned(parentSequence, built.commit);
+        res = await this.api.commitSigned(parentSequence, built.commit, options?.beforeCommitSend);
         postMs = Date.now() - t0;
       } else {
-        res = await this.api.commitSigned(parentSequence, built.commit);
+        res = await this.api.commitSigned(parentSequence, built.commit, options?.beforeCommitSend);
       }
     } catch (e) {
       if (e instanceof CommitRejectedError && blobRefset) e.fingerprint = blobRefset.sidecarSha;

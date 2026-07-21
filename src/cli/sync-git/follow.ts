@@ -39,7 +39,7 @@ import {
 } from "../../engine/git/keep-pins.js";
 import { hashFile } from "../../engine/hash.js";
 import { pruneStaleScratchRefs } from "../../engine/git/pins.js";
-import { listRefs, readAllRefs, readOpState } from "../../engine/git/refs.js";
+import { listRefs, readAllRefs, readOpState, readOpStateSnapshot } from "../../engine/git/refs.js";
 import { OP_STATE_CLASSIFICATION, OP_STATE_DIRS, OP_STATE_FILES, type OpStateRoot } from "../../engine/manifest-validate.js";
 import {
   clearIndexResolveUndo,
@@ -432,14 +432,9 @@ async function readLive(ctx: RepoCtx, chainTimings?: GitChainTimings): Promise<L
         throw error;
       });
       const indexProjection = indexPresent ? await indexIdentityV2(ctx.repoDir, indexPath) : undefined;
-      const opStateRoots = [...OP_STATE_FILES, ...OP_STATE_DIRS] as const;
-      const [opState, opStateRootsPresent] = await Promise.all([
-        readOpState(ctx.gitDir, hashFile),
-        Promise.all(opStateRoots.map(async (rel) => fs.lstat(path.join(ctx.gitDir, rel)).then(
-          () => rel,
-          (error: NodeJS.ErrnoException) => error.code === "ENOENT" ? undefined : Promise.reject(error),
-        ))).then((entries) => entries.filter((rel): rel is OpStateRoot => rel !== undefined)),
-      ]);
+      const snapshot = await readOpStateSnapshot(ctx.gitDir, hashFile);
+      const opState = snapshot.files;
+      const opStateRootsPresent = snapshot.rootsPresent;
       return { indexPresent, indexProjection, opState, opStateRootsPresent };
     });
     return { headContent, currentRef, currentTip, refs, indexPresent, indexProjection, opState, opStateRootsPresent };

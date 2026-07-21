@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { OP_STATE_DIRS, OP_STATE_FILES, isSyncableRef } from "../manifest-validate.js";
+import { OP_STATE_CLASSIFICATION, OP_STATE_DIRS, OP_STATE_FILES, isSyncableRef, type OpStateRoot } from "../manifest-validate.js";
 import { HEX40, exists, git, headBranchOf, moveFileAtomic, walkFiles } from "./shared.js";
 
 export async function readAllRefs(repoDir: string): Promise<Record<string, string>> {
@@ -43,6 +43,33 @@ export async function readOpState(gitDir: string, hash: (absPath: string) => Pro
     }
   }
   return out;
+}
+
+/** Presence is separate from file enumeration: an empty rebase/sequencer root is
+ * still operationally active even though readOpState returns no entries for it. */
+export async function readOpStateRootsPresent(gitDir: string): Promise<OpStateRoot[]> {
+  const roots = [...OP_STATE_FILES, ...OP_STATE_DIRS] as const;
+  const present = await Promise.all(roots.map(async (rel) => fs.lstat(path.join(gitDir, rel)).then(
+    () => rel,
+    (error: NodeJS.ErrnoException) => error.code === "ENOENT" ? undefined : Promise.reject(error),
+  )));
+  return present.filter((rel): rel is OpStateRoot => rel !== undefined);
+}
+
+export async function readOpStateSnapshot(
+  gitDir: string,
+  hash: (absPath: string) => Promise<string>,
+): Promise<{ files: Record<string, string>; rootsPresent: OpStateRoot[] }> {
+  const [files, rootsPresent] = await Promise.all([
+    readOpState(gitDir, hash),
+    readOpStateRootsPresent(gitDir),
+  ]);
+  return { files, rootsPresent };
+}
+
+export function hasInProgressOpState(snapshot: { files: Record<string, unknown>; rootsPresent: readonly OpStateRoot[] }): boolean {
+  return Object.keys(snapshot.files).some((rel) => OP_STATE_CLASSIFICATION[rel.split("/")[0] as OpStateRoot] === "in-progress")
+    || snapshot.rootsPresent.some((root) => OP_STATE_CLASSIFICATION[root] === "in-progress");
 }
 
 export async function restoreOpState(gitDir: string, opTmp: Array<{ rel: string; tmp: string }>): Promise<void> {

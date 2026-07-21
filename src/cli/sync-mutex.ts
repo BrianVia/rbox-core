@@ -47,6 +47,13 @@ export class WorkspaceSyncBusyError extends Error {
   }
 }
 
+export class WorkspaceSyncTimeoutError extends Error {
+  constructor() {
+    super("timed out waiting for the current sync cycle to finish");
+    this.name = "WorkspaceSyncTimeoutError";
+  }
+}
+
 export type DaemonMutexResult =
   | { status: "acquired"; handle: WorkspaceSyncMutex }
   | {
@@ -65,6 +72,11 @@ export interface SyncMutexOptions {
   sleep?: (ms: number) => Promise<void>;
   /** Test/embedding seam for the once-per-workspace degradation surface. */
   onDegraded?: (message: string) => void;
+  /** Acquisition-only wall-clock bound. Once acquired, no timer affects work. */
+  acquisitionDeadlineMs?: number;
+  /** Called once after the first observed contention. */
+  onWait?: () => void;
+  nowMs?: () => number;
 }
 
 const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -174,7 +186,10 @@ async function acquireWorkspaceSyncMutexInternal(
   const attempts = mode === "cli" ? (options.attempts ?? 16) : 1;
   const retryDelayMs = options.retryDelayMs ?? 50;
   const sleep = options.sleep ?? defaultSleep;
-  for (let attempt = 0; attempt < attempts; attempt++) {
+  const nowMs = options.nowMs ?? Date.now;
+  const deadline = options.acquisitionDeadlineMs === undefined ? undefined : nowMs() + options.acquisitionDeadlineMs;
+  let waitSurfaced = false;
+  for (let attempt = 0; deadline !== undefined || attempt < attempts; attempt++) {
     const result = await acquireLock(lockPath, options.lock);
     if (result.status === "acquired") {
       await fs.rm(lockingHealthPath(root), { force: true });
@@ -221,7 +236,18 @@ async function acquireWorkspaceSyncMutexInternal(
     }
     if (result.status === "error") throw new Error(`workspace sync mutex failed: ${String(result.error)}`);
     if (mode === "daemon") return daemonContention(result);
-    if (attempt + 1 < attempts) await sleep(retryDelayMs);
+    if (!waitSurfaced) {
+      waitSurfaced = true;
+      options.onWait?.();
+    }
+    if (deadline !== undefined) {
+      const remaining = deadline - nowMs();
+      if (remaining <= 0) throw new WorkspaceSyncTimeoutError();
+      await sleep(Math.min(retryDelayMs, remaining));
+      if (nowMs() >= deadline) throw new WorkspaceSyncTimeoutError();
+    } else if (attempt + 1 < attempts) {
+      await sleep(retryDelayMs);
+    }
   }
   throw new WorkspaceSyncBusyError();
 }

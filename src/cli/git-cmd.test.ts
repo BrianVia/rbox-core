@@ -7,7 +7,7 @@ import { promisify } from "node:util";
 import { LocalBlobStore, buildIgnoreMatcher, captureGitState, setGitSpawnObserver, type GitSection, type Manifest } from "../engine/index.js";
 import { checkoutJournalDir } from "../engine/git/journal.js";
 import { repoCtx } from "../engine/git/shared.js";
-import { loadState, repoRecordsForState, saveStateUnsafeLegacyOrTest, syncStreamId, type SyncState, type WorkspaceConfig } from "./config.js";
+import { loadState, repoRecordsForState, saveStateUnsafeLegacyOrTest, syncStreamId, type RepoRecord, type SyncState, type WorkspaceConfig } from "./config.js";
 import { gitDeferralsCmd, gitResolveCmd, safeResolveText, type GitResolveShow } from "./git-cmd.js";
 import { applyGitSections, settleCommittedBranchArtifacts } from "./sync-git/apply.js";
 import { commitPlannedBranchTransition, planBranchTransition } from "./sync-git/branch-transition.js";
@@ -163,6 +163,15 @@ function deps(lines: string[], extra: Parameters<typeof gitResolveCmd>[4] = {}) 
     stdout: (line: string) => lines.push(line),
     stderr: (line: string) => lines.push(line),
     now: () => new Date("2026-07-13T01:00:00.000Z"),
+    confirmedPush: async () => {
+      const state = await loadState(root, syncStreamId(cfg));
+      return {
+        sequence: state.lastSyncedSequence + 1,
+        manifest: state.lastSyncedManifest,
+        committed: true,
+        resolution: { outcome: "published" as const, sequence: state.lastSyncedSequence + 1 },
+      };
+    },
     ...extra,
   };
 }
@@ -170,6 +179,15 @@ function deps(lines: string[], extra: Parameters<typeof gitResolveCmd>[4] = {}) 
 async function show(lines: string[]): Promise<GitResolveShow> {
   expect(await gitResolveCmd(root, receiver, "show-me", { json: true }, deps(lines))).toBe(0);
   return JSON.parse(lines.at(-1)!) as GitResolveShow;
+}
+
+async function makeKeepMinePreviewable(): Promise<void> {
+  const record = repoRecordsForState(await loadState(root, syncStreamId(cfg))).repo!;
+  const incomingTip = record.pending!.refs["refs/heads/main"]!;
+  await git(receiver, "fetch", "-q", sender, incomingTip);
+  await git(receiver, "reset", "--hard", incomingTip);
+  await fs.rm(path.join(receiver, ".git", "ORIG_HEAD"), { force: true });
+  await git(receiver, "-c", "user.email=resolve@example.invalid", "-c", "user.name=resolve", "commit", "--allow-empty", "-qm", "keep local ahead");
 }
 
 test("show-me snapshot is stable and JSON exposes no commit OIDs", async () => {
@@ -563,6 +581,21 @@ test("take-theirs quarantines, pins, follows, and clears pending resolution stat
   expect((await fs.readdir(path.join(quarantineRoot, (await fs.readdir(quarantineRoot))[0]!))).some((name) => name.endsWith(".bundle"))).toBe(true);
 });
 
+test("design 177 take-theirs is unchanged and never copies a leftover keep-mine intent", async () => {
+  await fixture();
+  const seeded = await loadState(root, syncStreamId(cfg));
+  (seeded.repoRecords!.repo as RepoRecord & { resolutionIntent?: unknown }).resolutionIntent = {
+    v: 1, verb: "keep-mine", snapshot: "old-client",
+  };
+  await saveStateUnsafeLegacyOrTest(root, seeded);
+  const current = await show([]);
+  expect(await gitResolveCmd(root, receiver, "take-theirs", { json: true, confirm: current.snapshot }, deps([]))).toBe(0);
+  const saved = repoRecordsForState(await loadState(root, syncStreamId(cfg))).repo!;
+  expect(saved.pending).toBeUndefined();
+  expect((saved as RepoRecord & { resolutionIntent?: unknown }).resolutionIntent).toBeUndefined();
+  expect(await fs.readFile(path.join(root, ".rbox", "state.json"), "utf8")).not.toContain("resolutionIntent");
+});
+
 test("take-theirs composes a stable side branch with no P into a manual origin", async () => {
   const { base, incoming } = await fixture();
   const baseOid = base.refs["refs/heads/main"]!;
@@ -700,7 +733,7 @@ test("take-theirs names a sibling worktree collision", async () => {
   expect(result.message).not.toContain("sibling-next");
 });
 
-test("keep-mine confirmation writes only a lineage/token-bound intent sidecar", async () => {
+test("keep-mine confirmation executes synchronously from the confirmed preview", async () => {
   const { incoming } = await fixture();
   const incomingTip = incoming.refs["refs/heads/main"]!;
   await git(receiver, "fetch", "-q", sender, incomingTip);
@@ -721,41 +754,26 @@ test("keep-mine confirmation writes only a lineage/token-bound intent sidecar", 
   expect(humanPreview.findIndex((line) => line.startsWith("Preliminary incoming-discard report")))
     .toBeLessThan(humanPreview.findIndex((line) => line.startsWith("Confirm exactly this preview with:")));
   const before = repoRecordsForState(await loadState(root, syncStreamId(cfg))).repo!;
-  const { repoGen: beforeGen, resolutionIntent: _beforeIntent, ...beforeOther } = before;
   const refsBefore = await git(receiver, "for-each-ref", "--format=%(refname) %(objectname)");
   const indexBefore = await fs.readFile(path.join(receiver, ".git", "index"));
 
   const confirmed: string[] = [];
   // Force is exact, not a generic acknowledgement: an unnecessary force flag
-  // re-renders the preview and cannot install an intent.
+  // re-renders the preview and cannot publish.
   expect(await gitResolveCmd(root, receiver, "keep-mine", {
     json: true,
     confirm: preview.current.snapshot,
     forceDiscardIncoming: true,
   }, deps(confirmed))).toBe(1);
   expect(JSON.parse(confirmed.at(-1)!)).toMatchObject({ status: "preview", confirm: { forceDiscardIncoming: false } });
-  expect(repoRecordsForState(await loadState(root, syncStreamId(cfg))).repo?.resolutionIntent).toBeUndefined();
   confirmed.length = 0;
   const confirmCode = await gitResolveCmd(root, receiver, "keep-mine", {
     confirm: preview.current.snapshot,
   }, deps(confirmed));
   expect(confirmCode).toBe(0);
-  expect(confirmed.findIndex((line) => line.startsWith("Preliminary incoming-discard report")))
-    .toBeLessThan(confirmed.findIndex((line) => line.includes("keep-mine intent recorded")));
+  expect(confirmed.join("\n")).toContain("published; your repo is the synced truth now");
   const after = repoRecordsForState(await loadState(root, syncStreamId(cfg))).repo!;
-  const { repoGen: afterGen, resolutionIntent, ...afterOther } = after;
-  expect(afterGen).toBe(beforeGen + 1);
-  expect(afterOther).toEqual(beforeOther);
-  expect(resolutionIntent).toMatchObject({
-    v: 1,
-    verb: "keep-mine",
-    snapshot: preview.current.snapshot,
-    binding: {
-      stream: syncStreamId(cfg), stateNonce: "a".repeat(32), repoGen: beforeGen,
-      incomingKey: expect.any(String), repoKind: "dir", repositoryIdentity: expect.stringMatching(/^[0-9a-f]{64}$/),
-      capturePolicy: { syncGit: true, respectGitignore: false, incremental: true },
-    },
-  });
+  expect(after).toEqual(before);
   expect(await git(receiver, "for-each-ref", "--format=%(refname) %(objectname)")).toBe(refsBefore);
   expect(await fs.readFile(path.join(receiver, ".git", "index"))).toEqual(indexBefore);
 });
@@ -793,13 +811,12 @@ test("keep-mine requires force exactly when the preview has a non-subsumed lane"
     json: true, confirm: preview.current.snapshot,
   }, deps(missingForce))).toBe(1);
   expect(JSON.parse(missingForce.at(-1)!)).toMatchObject({ status: "preview", confirm: { forceDiscardIncoming: true } });
-  expect(repoRecordsForState(await loadState(root, syncStreamId(cfg))).repo?.resolutionIntent).toBeUndefined();
 
   const confirmed: string[] = [];
   expect(await gitResolveCmd(root, receiver, "keep-mine", {
     json: true, confirm: preview.current.snapshot, forceDiscardIncoming: true,
   }, deps(confirmed))).toBe(0);
-  expect(JSON.parse(confirmed.at(-1)!)).toMatchObject({ status: "intent-recorded", forceDiscardIncoming: true });
+  expect(JSON.parse(confirmed.at(-1)!)).toMatchObject({ status: "published", sequence: expect.any(Number) });
 });
 
 test("keep-mine refuses a checkout journal without recovering or changing sidecars", async () => {
@@ -875,6 +892,117 @@ test("keep-mine previews despite breadcrumb op-state (ORIG_HEAD) but refuses in-
   expect(JSON.parse(refusedLines.at(-1)!)).toMatchObject({ status: "refused", code: "local-operation" });
 });
 
+test("design 177 treats a bare rebase root as in-progress at both preview and confirm doors", async () => {
+  await fixture();
+  await makeKeepMinePreviewable();
+  const bare = path.join(receiver, ".git", "rebase-merge");
+  await fs.mkdir(bare);
+  const previewRefusal: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "keep-mine", { json: true }, deps(previewRefusal))).toBe(1);
+  expect(JSON.parse(previewRefusal.at(-1)!)).toMatchObject({ status: "refused", code: "local-operation" });
+
+  await fs.rm(bare, { recursive: true });
+  const previewLines: string[] = [];
+  await gitResolveCmd(root, receiver, "keep-mine", { json: true }, deps(previewLines));
+  const preview = JSON.parse(previewLines.at(-1)!);
+  const confirmRefusal: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "keep-mine", {
+    json: true,
+    confirm: preview.current.snapshot,
+    forceDiscardIncoming: preview.confirm.forceDiscardIncoming,
+  }, deps(confirmRefusal, {
+    beforeConfirmRecheck: async () => { await fs.mkdir(bare); },
+  }))).toBe(1);
+  expect(JSON.parse(confirmRefusal.at(-1)!)).toMatchObject({ status: "refused", code: "local-operation" });
+});
+
+test("design 177 preview drift returns a fresh token and the old token stays dead", async () => {
+  await fixture();
+  await makeKeepMinePreviewable();
+  const state = await loadState(root, syncStreamId(cfg));
+  const incomingTip = state.repoRecords!.repo!.pending!.refs["refs/heads/main"]!;
+  await git(receiver, "tag", "preview-drift", incomingTip);
+  state.repoRecords!.repo!.pending = {
+    ...state.repoRecords!.repo!.pending!,
+    refs: { ...state.repoRecords!.repo!.pending!.refs, "refs/tags/preview-drift": incomingTip },
+  };
+  await saveStateUnsafeLegacyOrTest(root, state);
+  const previewLines: string[] = [];
+  await gitResolveCmd(root, receiver, "keep-mine", { json: true }, deps(previewLines));
+  const preview = JSON.parse(previewLines.at(-1)!);
+  expect(preview.discardReport).toMatchObject({ forceRequired: false });
+  expect(preview.discardReport.lanes).toContainEqual(expect.objectContaining({
+    lane: "tag:refs/tags/preview-drift", disposition: "subsumed",
+  }));
+  const driftedLines: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "keep-mine", {
+    json: true,
+    confirm: preview.current.snapshot,
+    forceDiscardIncoming: preview.confirm.forceDiscardIncoming,
+  }, deps(driftedLines, {
+    beforeConfirmRecheck: async () => {
+      await git(receiver, "tag", "-d", "preview-drift");
+    },
+  }))).toBe(1);
+  const fresh = JSON.parse(driftedLines.at(-1)!);
+  expect(fresh).toMatchObject({ status: "snapshot-mismatch", current: { snapshot: expect.any(String) } });
+  expect(fresh.current.snapshot).not.toBe(preview.current.snapshot);
+  expect(fresh.discardReport).toMatchObject({ forceRequired: true });
+  expect(fresh.discardReport.lanes).toContainEqual(expect.objectContaining({
+    lane: "tag:refs/tags/preview-drift", disposition: "not-subsumed",
+  }));
+  expect(fresh.discardReport.lanes).not.toEqual(preview.discardReport.lanes);
+
+  const replay: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "keep-mine", {
+    json: true,
+    confirm: preview.current.snapshot,
+    forceDiscardIncoming: preview.confirm.forceDiscardIncoming,
+  }, deps(replay))).toBe(1);
+  expect(JSON.parse(replay.at(-1)!)).toMatchObject({
+    status: "snapshot-mismatch",
+    current: { snapshot: fresh.current.snapshot },
+  });
+});
+
+test("design 177 confirmed keep-mine surfaces lock waiting and a plain timeout", async () => {
+  await fixture();
+  await makeKeepMinePreviewable();
+  const previewLines: string[] = [];
+  await gitResolveCmd(root, receiver, "keep-mine", { json: true }, deps(previewLines));
+  const preview = JSON.parse(previewLines.at(-1)!);
+
+  const owner = await acquireWorkspaceSyncMutex(root, "cli", { attempts: 1 });
+  const waited: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "keep-mine", {
+    json: true, confirm: preview.current.snapshot, forceDiscardIncoming: preview.confirm.forceDiscardIncoming,
+  }, deps(waited, {
+    mutexOptions: {
+      acquisitionDeadlineMs: 1_000,
+      retryDelayMs: 1,
+      sleep: async () => { await releaseWorkspaceSyncMutex(owner); },
+    },
+  }))).toBe(0);
+  expect(waited).toContain("waiting for the current sync cycle to finish…");
+
+  const blocking = await acquireWorkspaceSyncMutex(root, "cli", { attempts: 1 });
+  let now = 0;
+  const timedOut: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "keep-mine", {
+    json: true, confirm: preview.current.snapshot, forceDiscardIncoming: preview.confirm.forceDiscardIncoming,
+  }, deps(timedOut, {
+    mutexOptions: {
+      acquisitionDeadlineMs: 100,
+      retryDelayMs: 50,
+      nowMs: () => now,
+      sleep: async (ms) => { now += ms; },
+    },
+  }))).toBe(1);
+  expect(JSON.parse(timedOut.at(-1)!)).toMatchObject({ status: "refused", code: "sync-busy" });
+  expect(JSON.parse(timedOut.at(-1)!).message).toContain("timed out waiting");
+  await releaseWorkspaceSyncMutex(blocking);
+});
+
 test("keep-mine refuses reserved current-branch divergence without clearing anything", async () => {
   await fixture();
   const before = JSON.stringify(await loadState(root, syncStreamId(cfg)));
@@ -913,7 +1041,6 @@ test("keep-mine voids a config-only race and requires a real pending section", a
     json: true, confirm: preview.current.snapshot,
   }, deps(raced))).toBe(1);
   expect(JSON.parse(raced.at(-1)!)).toMatchObject({ status: "snapshot-mismatch", verb: "keep-mine" });
-  expect(repoRecordsForState(await loadState(root, syncStreamId(cfg))).repo?.resolutionIntent).toBeUndefined();
 
   const state = await loadState(root, syncStreamId(cfg));
   delete state.repoRecords!.repo!.pending;
@@ -942,7 +1069,6 @@ test("keep-mine binds the exact incremental capture-policy setting", async () =>
     json: true, confirm: preview.current.snapshot,
   }, deps(raced))).toBe(1);
   expect(JSON.parse(raced.at(-1)!)).toMatchObject({ status: "snapshot-mismatch", verb: "keep-mine" });
-  expect(repoRecordsForState(await loadState(root, syncStreamId(cfg))).repo?.resolutionIntent).toBeUndefined();
 });
 
 test("keep-mine voids pending-key and effective-scope races at the immediate pre-write reload", async () => {
@@ -966,7 +1092,7 @@ test("keep-mine voids pending-key and effective-scope races at the immediate pre
     json: true,
     confirm: pendingPreview.snapshot,
   }, deps(pendingRace, {
-    beforeIntentRecheck: async () => {
+    beforeConfirmRecheck: async () => {
       const raced = await loadState(root, syncStreamId(cfg));
       const pending = raced.repoRecords!.repo!.pending!;
       raced.repoRecords!.repo!.pending = {
@@ -980,7 +1106,6 @@ test("keep-mine voids pending-key and effective-scope races at the immediate pre
     },
   }))).toBe(1);
   expect(JSON.parse(pendingRace.at(-1)!)).toMatchObject({ status: "snapshot-mismatch", verb: "keep-mine" });
-  expect(repoRecordsForState(await loadState(root, syncStreamId(cfg))).repo?.resolutionIntent).toBeUndefined();
 
   // Rebuild a fresh fixture, then change only the on-disk repository
   // representation from a directory to a gitfile pointing at the same bytes.
@@ -993,7 +1118,7 @@ test("keep-mine voids pending-key and effective-scope races at the immediate pre
     json: true,
     confirm: scopePreview.snapshot,
   }, deps(scopeRace, {
-    beforeIntentRecheck: async () => {
+    beforeConfirmRecheck: async () => {
       const gitDir = path.join(receiver, ".git");
       const pointed = path.join(receiver, ".git-pointed");
       await fs.rename(gitDir, pointed);
@@ -1001,7 +1126,6 @@ test("keep-mine voids pending-key and effective-scope races at the immediate pre
     },
   }))).toBe(1);
   expect(JSON.parse(scopeRace.at(-1)!)).toMatchObject({ status: "snapshot-mismatch", verb: "keep-mine" });
-  expect(repoRecordsForState(await loadState(root, syncStreamId(cfg))).repo?.resolutionIntent).toBeUndefined();
 });
 
 test("resolve maps workspace contention to the closed sync-busy refusal", async () => {
@@ -1071,11 +1195,29 @@ test("resolve maps indeterminate proof, journal recovery, and degraded mutex to 
   expect(journal.at(-1)).not.toContain(journalDir);
   await fs.rm(journalDir, { recursive: true, force: true });
 
-  const current = await show([]);
+  await makeKeepMinePreviewable();
+  const previewLines: string[] = [];
+  await gitResolveCmd(root, receiver, "keep-mine", { json: true }, deps(previewLines));
+  const preview = JSON.parse(previewLines.at(-1)!);
+  const pendingBefore = repoRecordsForState(await loadState(root, syncStreamId(cfg))).repo?.pending;
+  let confirmedPushCalls = 0;
   const degraded: string[] = [];
-  expect(await gitResolveCmd(root, receiver, "take-theirs", { json: true, confirm: current.snapshot }, deps(degraded, {
+  expect(await gitResolveCmd(root, receiver, "keep-mine", {
+    json: true,
+    confirm: preview.current.snapshot,
+    forceDiscardIncoming: preview.confirm.forceDiscardIncoming,
+  }, deps(degraded, {
     mutexOptions: { lock: { identity: { current: async () => { throw new Error("private identity failure"); }, probe: async () => ({ status: "unknown" }) } } },
+    confirmedPush: async () => {
+      confirmedPushCalls++;
+      throw new Error("degraded keep-mine must not publish");
+    },
   }))).toBe(1);
-  expect(JSON.parse(degraded.at(-1)!)).toMatchObject({ code: "mutex-degraded", message: "locking unavailable; resolution refused" });
+  expect(JSON.parse(degraded.at(-1)!)).toMatchObject({
+    code: "mutex-degraded",
+    message: "locking unavailable; keep-mine will not publish until safe serialization is restored",
+  });
   expect(degraded.at(-1)).not.toContain("private identity failure");
+  expect(confirmedPushCalls).toBe(0);
+  expect(repoRecordsForState(await loadState(root, syncStreamId(cfg))).repo?.pending).toEqual(pendingBefore);
 });
