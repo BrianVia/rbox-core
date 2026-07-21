@@ -1,11 +1,13 @@
 import fs from "node:fs/promises";
-import { discoverGitRepos, type GitRepoKind, type GitSection, type IgnoreMatcher } from "../../engine/index.js";
+import path from "node:path";
+import { discoverGitRepos, poolMap, repoCtxFromDisk, type GitRepoKind, type GitSection, type IgnoreMatcher } from "../../engine/index.js";
 import { type GitConfigRunner } from "../../engine/git/config-txn.js";
 import { DEFERRAL_LANES, repoRecordsForState, type GitDeferral, type SyncState, type WorkspaceConfig } from "../config.js";
 import { repoDirOf, carryMatrixMatches } from "./shared.js";
 import { readLocalGitConfig, shouldPublishGitConfig } from "./config-lane.js";
 import { gitFingerprintRun } from "./fingerprint.js";
 import { GIT_DIVERGENCE_CONCURRENCY, loadGitDivergenceCache, saveGitDivergenceCache, cachedDivergenceProbe, type CachedDivergenceProbe, type GitDivergenceRepoHint, type GitDivergenceRepoSource } from "./divergence-cache.js";
+import { inspectConflictRefs } from "./conflict-retention.js";
 /**
  * READ-ONLY advisory count of repos whose LOCAL git state a push would publish —
  * the `rbox status` verdict's git dimension (design 45). Mirrors
@@ -34,11 +36,28 @@ export interface GitDivergenceStatus {
   configChecking: string[];
   /** Permanently disabled or over-wire-bounds config lanes, surfaced loudly. */
   configDisabled: Array<{ relPath: string; reason: string }>;
+  conflictSnapshots: { total: number; prunable: number };
 }
 
 export interface GitDivergenceStatusOptions {
   /** Deterministic §11 seam for forcing a config snapshot to remain unstable. */
   gitConfigRunner?: GitConfigRunner;
+}
+
+export async function conflictSnapshotStatus(root: string, relPaths: readonly string[]): Promise<{ total: number; prunable: number }> {
+  const result = { total: 0, prunable: 0 };
+  const repos = new Map<string, { rel: string; ctx: NonNullable<Awaited<ReturnType<typeof repoCtxFromDisk>>> }>();
+  for (const rel of [...new Set(relPaths)].sort()) {
+    const ctx = await repoCtxFromDisk(repoDirOf(root, rel)).catch(() => undefined);
+    if (ctx) repos.set(path.resolve(ctx.commonDir), { rel, ctx });
+  }
+  await poolMap([...repos.values()], GIT_DIVERGENCE_CONCURRENCY, async ({ rel, ctx }) => {
+    const inspected = await inspectConflictRefs(repoDirOf(root, rel), Date.now(), ctx).catch(() => undefined);
+    if (!inspected) return;
+    result.total += inspected.total;
+    result.prunable += inspected.prunable.length;
+  });
+  return result;
 }
 
 export async function gitDivergenceStatus(
@@ -65,9 +84,14 @@ export async function gitDivergenceStatus(
     }
   }
   deferrals.sort((a, b) => (a.relPath < b.relPath ? -1 : a.relPath > b.relPath ? 1 : 0) || (a.lane < b.lane ? -1 : a.lane > b.lane ? 1 : 0));
-  if (!cfg.syncGit) return { count: 0, deferrals, configChecking: [], configDisabled: [] };
   const base = state.lastSyncedManifest.gitRepos ?? {};
   const pending = state.gitPendingRemote ?? {};
+  if (!cfg.syncGit) {
+    const known = new Set([...Object.keys(base), ...Object.keys(pending), ...Object.keys(repoRecordsForState(state))]);
+    if (discoveredRepos) for await (const repo of discoveredRepos) known.add(repo.relPath);
+    else if (matcher) for (const repo of await discoverGitRepos(root, matcher)) known.add(repo.relPath);
+    return { count: 0, deferrals, configChecking: [], configDisabled: [], conflictSnapshots: await conflictSnapshotStatus(root, [...known]) };
+  }
   const needsRes = state.gitNeedsResolution ?? {};
   const removedMem = state.gitReposRemoved ?? {};
   const cache = await loadGitDivergenceCache(root);
@@ -103,7 +127,8 @@ export async function gitDivergenceStatus(
   for await (const repo of repoSource) await scheduleProbe(repo);
   await Promise.all(inFlight);
 
-  const keys = [...new Set([...kindByPath.keys(), ...sourcePaths, ...(includeBaseRepos ? Object.keys(base) : [])])].sort();
+  const keys = [...new Set([...kindByPath.keys(), ...sourcePaths, ...Object.keys(pending), ...(includeBaseRepos ? Object.keys(base) : [])])].sort();
+  const conflictSnapshots = await conflictSnapshotStatus(root, keys);
   const liveKeys = new Set(keys);
   for (const rel of [...cache.repos.keys()]) {
     if (!liveKeys.has(rel)) {
@@ -200,7 +225,7 @@ export async function gitDivergenceStatus(
     if (!carry) n++;
     else await countConfigDisposition(rel, baseSec);
   }
-  return { count: n, deferrals, configChecking, configDisabled };
+  return { count: n, deferrals, configChecking, configDisabled, conflictSnapshots };
 }
 
 export async function gitDivergenceCount(

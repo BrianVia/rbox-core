@@ -80,6 +80,14 @@ export async function gitPreflight(repoDir: string, knownCtx?: RepoCtx | null): 
   if ((await git(repoDir, ["rev-parse", "--is-shallow-repository"]).catch(() => "")) === "true") {
     return { ok: false, reason: "shallow clone — unsupported (git fetch --unshallow to sync history)", kind, structural: true };
   }
+  // Legacy grafts rewrite ancestry without appearing in refs or objects. They
+  // cannot participate in ownership/supersession proofs because the rewrite is
+  // device-local and would make an unrelated tip look ancestral.
+  for (const bad of ["info/grafts", "shallow.lock"]) {
+    if (await exists(path.join(ctx.commonDir, bad))) {
+      return { ok: false, reason: `${bad} present — local graph rewriting is unsupported`, kind, structural: true };
+    }
+  }
   const top = await git(repoDir, ["rev-parse", "--show-toplevel"]).catch(() => "");
   // git returns a realpath; the repo dir may contain symlinks (e.g. macOS
   // /var/folders -> /private/var/folders), so compare realpaths, not lexical paths.

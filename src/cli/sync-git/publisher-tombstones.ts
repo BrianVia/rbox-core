@@ -10,7 +10,7 @@ import { gitIncomingKey } from "./shared.js";
 export const REF_TOMBSTONE_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
 
 export type TombstoneNormalizationFinding =
-  | { kind: "invalid-carried-fields"; source: "advertised" | "candidate" }
+  | { kind: "invalid-carried-fields"; source: "advertised" | "pending" | "candidate" }
   | { kind: "generation-collision"; count: number }
   | { kind: "generation-overflow"; count: number }
   | { kind: "expired"; count: number }
@@ -55,6 +55,7 @@ export function normalizePublishedGitSection(
   advertised: GitSection | undefined,
   candidate: GitSection,
   now: string,
+  pendingRetention?: GitSection,
 ): TombstoneNormalizationResult {
   const nowMs = Date.parse(now);
   if (!Number.isFinite(nowMs) || new Date(nowMs).toISOString() !== now) {
@@ -63,10 +64,12 @@ export function normalizePublishedGitSection(
 
   const findings: TombstoneNormalizationFinding[] = [];
   const advertisedFields = acceptedFields(advertised);
+  const pendingFields = pendingRetention === undefined ? undefined : acceptedFields(pendingRetention);
   const candidateFields = acceptedFields(candidate);
   if (!advertisedFields) findings.push({ kind: "invalid-carried-fields", source: "advertised" });
+  if (pendingRetention !== undefined && !pendingFields) findings.push({ kind: "invalid-carried-fields", source: "pending" });
   if (!candidateFields) findings.push({ kind: "invalid-carried-fields", source: "candidate" });
-  const sources = [advertisedFields, candidateFields].filter((value): value is AcceptedFields => value !== undefined);
+  const sources = [advertisedFields, pendingFields, candidateFields].filter((value): value is AcceptedFields => value !== undefined);
   let generation = sources.reduce((maximum, source) => Math.max(maximum, source.generation), 0);
 
   // Merge by (ref,oid), preferring the newest generation. A same-ref generation
@@ -182,7 +185,7 @@ export function normalizeOutgoingGitSections(
       sections[relPath] = pendingSection;
       continue;
     }
-    const normalized = normalizePublishedGitSection(advertised[relPath], section, now);
+    const normalized = normalizePublishedGitSection(advertised[relPath], section, now, pendingSection);
     sections[relPath] = normalized.section;
     findings.push(...normalized.findings.map((finding) => ({ relPath, finding })));
   }

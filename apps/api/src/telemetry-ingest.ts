@@ -17,11 +17,21 @@ type JsonRecord = Record<string, unknown>;
 interface NumericDomain { readonly min: number; readonly max: number; readonly integer: boolean }
 interface NumberField extends NumericDomain { readonly field: string }
 interface EnumField { readonly field: string; readonly values: readonly string[] }
-interface SampleSchema { readonly numbers: readonly NumberField[]; readonly enums: readonly EnumField[] }
+interface NumericRecordField { readonly field: string; readonly keys: readonly string[]; readonly domain: NumericDomain }
+interface SampleSchema {
+  readonly numbers: readonly NumberField[];
+  readonly enums: readonly EnumField[];
+  readonly optionalNumbers?: readonly NumberField[];
+  readonly numericRecords?: readonly NumericRecordField[];
+}
 
 const MS = { min: 0, max: 604_800_000, integer: true } as const;
 const COUNT = { min: 0, max: 10_000_000, integer: true } as const;
 const WS_HEALTH_COUNT = { min: 0, max: 1_000_000_000, integer: true } as const;
+export const SERVER_SYNC_PHASE_NAMES = [
+  "latest", "state-load", "scan", "git-plan", "address", "encrypt", "missing", "upload",
+  "commit", "download", "decrypt", "apply", "git-apply", "cache-save", "state-save",
+] as const;
 
 /** Runtime duplicate of the client contract. A test imports both copies and prevents drift.
  * Field declaration order IS the positional AE doubles order and feeds normalizeSample
@@ -84,6 +94,15 @@ export const SERVER_TELEMETRY_SAMPLE_SCHEMAS = {
     ],
     enums: [],
   },
+  sync_phase: {
+    numbers: [{ field: "wallMs", ...MS }],
+    optionalNumbers: [
+      { field: "gitApplyMaxRepoMs", ...MS },
+      { field: "gitApplySkippedHeld", ...COUNT },
+    ],
+    enums: [{ field: "op", values: ["pull", "push"] }],
+    numericRecords: [{ field: "phases", keys: SERVER_SYNC_PHASE_NAMES, domain: MS }],
+  },
 } as const satisfies Record<string, SampleSchema>;
 
 export type ClientTelemetryKind = keyof typeof SERVER_TELEMETRY_SAMPLE_SCHEMAS;
@@ -112,7 +131,13 @@ export const SERVER_SYNC_STATE_NUMERIC_DOMAINS = {
 const ALLOWED_SAMPLE_KEYS = new Map<ClientTelemetryKind, ReadonlySet<string>>(
   (Object.entries(SERVER_TELEMETRY_SAMPLE_SCHEMAS) as [ClientTelemetryKind, SampleSchema][]).map(([kind, schema]) => [
     kind,
-    new Set(["kind", ...schema.numbers.map((field) => field.field), ...schema.enums.map((field) => field.field)]),
+    new Set([
+      "kind",
+      ...schema.numbers.map((field) => field.field),
+      ...schema.enums.map((field) => field.field),
+      ...(schema.optionalNumbers ?? []).map((field) => field.field),
+      ...(schema.numericRecords ?? []).map((field) => field.field),
+    ]),
   ]),
 );
 
@@ -168,6 +193,26 @@ function normalizeSample(value: unknown): { ok: true; metric: NormalizedClientMe
     if (canonical === undefined) return { ok: false, reason: "bad_enum" };
     canonicalEnums.push(canonical);
   }
+  const recordNumbers: number[] = [];
+  for (const field of schema.numericRecords ?? []) {
+    const raw = value[field.field];
+    if (!isRecord(raw)) return { ok: false, reason: "bad_number" };
+    const allowed = new Set(field.keys);
+    if (!hasOnlyKeys(raw, allowed)) return { ok: false, reason: "unknown_field" };
+    for (const key of field.keys) {
+      const item = raw[key];
+      if (item === undefined) recordNumbers.push(0);
+      else if (!validNumber(item, field.domain)) return { ok: false, reason: "bad_number" };
+      else recordNumbers.push(item);
+    }
+  }
+  const optionalNumbers: number[] = [];
+  for (const field of schema.optionalNumbers ?? []) {
+    const raw = value[field.field];
+    if (raw === undefined) optionalNumbers.push(0);
+    else if (!validNumber(raw, field)) return { ok: false, reason: "bad_number" };
+    else optionalNumbers.push(raw);
+  }
 
   if (kind === "first_publish") {
     return { ok: true, metric: { index: "client.first_publish", blobs: [corpusBucket(wireNumbers[2]!)], doubles: wireNumbers } };
@@ -181,6 +226,13 @@ function normalizeSample(value: unknown): { ok: true; metric: NormalizedClientMe
   }
   if (kind === "ws_health" && wireNumbers[1]! > wireNumbers[0]!) {
     return { ok: false, reason: "bad_number" };
+  }
+  if (kind === "sync_phase") {
+    return { ok: true, metric: {
+      index: "client.sync_phase",
+      blobs: canonicalEnums,
+      doubles: [...wireNumbers, ...recordNumbers, ...optionalNumbers],
+    } };
   }
   return { ok: true, metric: { index: `client.${kind}`, blobs: canonicalEnums, doubles: wireNumbers } };
 }

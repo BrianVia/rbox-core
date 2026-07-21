@@ -9,7 +9,7 @@ const dedicatedGitSyncTests = [
   "design 53: fresh join fetch/import work is bounded by repos times MAX_PACK_CHAIN",
   "git artifact sha_mismatch re-encrypts and retries with resumable uploadsDir",
   "D2 apply deferral keeps chronic age across newer truth and resets reason age",
-  "pending + 422: M5 non-looping drop — section dropped from THIS commit, pending kept for the next pull [v6]",
+  "pending + 422: failed retries preserve P and all sidecars byte-for-byte",
   "clean materialization with a ref-wiping hook defers before stranding a sibling worktree branch",
 ];
 

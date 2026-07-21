@@ -24,6 +24,7 @@ import {
   type WatchEvent,
   type DiscoveredGitRepo,
   ManifestChainError,
+  PhaseReport,
   cryptoPoolStatus,
   writeFileAtomic,
 } from "../../engine/index.js";
@@ -110,7 +111,8 @@ import {
 import { cleanPath, LOG_PATHS_MAX, scanStatsLine, summarizeActions } from "./render.js";
 import { RotatingDaemonLogger, type DaemonLogSink } from "./logger.js";
 import { TelemetryQueue } from "../telemetry/queue.js";
-import { TELEMETRY_SAMPLE_SCHEMAS, type GitCaptureSample } from "../telemetry/contract.js";
+import { TELEMETRY_SAMPLE_SCHEMAS, telemetryEnabled, type GitCaptureSample } from "../telemetry/contract.js";
+import { SyncPhaseSampler } from "../telemetry/sync-phase.js";
 import { SyncStateReporter } from "../telemetry/sync-state.js";
 import { inspectResetJournalSafety } from "../reset-halt-inspection.js";
 import { clearResetHaltHealth, readResetHaltHealth, writeResetHaltHealth } from "../reset-health.js";
@@ -296,6 +298,7 @@ interface OpenDriftAudit {
 export class RboxDaemon {
   private readonly api: RboxApi;
   private readonly telemetry: TelemetryQueue;
+  private readonly syncPhaseSampler = new SyncPhaseSampler();
   private readonly syncStateReporter: SyncStateReporter;
   private matcher: IgnoreMatcher; // rebuilt when .gitignore/.rboxignore changes
   private cache!: HashCache;
@@ -1334,7 +1337,8 @@ export class RboxDaemon {
     this.typeFlipsSincePull = 0; // per-op tally — a failed prior op's flips must not inflate this one's count
     await this.applyPendingWatchEvents();
     const blockedFingerprint = this.terminalPushBlock();
-    const report = beginReport("push");
+    const metricsReport = beginReport("push");
+    const report = metricsReport ?? (telemetryEnabled() ? PhaseReport.push() : undefined);
     let res: Awaited<ReturnType<typeof pushManifest>>;
     try {
       const pushManifestInput = this.gcFenceRetryPaths.size > 0 && this.syncBase
@@ -1406,7 +1410,8 @@ export class RboxDaemon {
     this.emitDurableGitDeferrals(durableState);
     this.metrics.syncs += 1;
     await saveMetrics(this.root, this.metrics);
-    report?.logSummaryTo(this.log); // Explicit metrics opt-out is silent. By default even a
+    if (report) this.syncPhaseSampler.recordCompleted(report, "push", this.telemetry);
+    metricsReport?.logSummaryTo(this.log); // Explicit metrics opt-out is silent. By default even a
     // no-op tick logs its state-load/git-plan cost — intentional since design 82 §4 (the
     // invisible steady-state cost is exactly what that design instruments).
   }
@@ -1548,7 +1553,8 @@ export class RboxDaemon {
       this.chainRepairPolicy.assertHeadAllowed(pin);
     }
     this.typeFlipsSincePull = 0; // per-op tally — a failed prior op's flips must not inflate this one's count
-    const report = beginReport("pull");
+    const metricsReport = beginReport("pull");
+    const report = metricsReport ?? (telemetryEnabled() ? PhaseReport.pull() : undefined);
     // onGitLog: per-repo apply/conflict/defer forensics (design 43 §10) land in the daemon log.
     // onPullApplied carries BOTH the forensic log line and the status trail — wired
     // here and in doPush's deps so the pull inside push's 409 recovery is recorded
@@ -1595,7 +1601,8 @@ export class RboxDaemon {
     if (notifyPendingAt !== undefined) {
       this.telemetry.record({ kind: "propagation", deliveryToApplyMs: Math.max(0, this.now() - notifyPendingAt) });
     }
-    report?.logSummaryTo((line) =>
+    if (report) this.syncPhaseSampler.recordCompleted(report, "pull", this.telemetry);
+    metricsReport?.logSummaryTo((line) =>
       this.log(notifyLatencyMs !== undefined ? `${line} notify_latency_ms=${notifyLatencyMs}` : line),
     );
     const fileConflicts = actions.filter((a) => a.kind === "conflict").length;

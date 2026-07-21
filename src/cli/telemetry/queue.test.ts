@@ -35,6 +35,19 @@ const gitCaptureSample = (body: TelemetryEnvelope): GitCaptureSample =>
   body.samples.find((sample): sample is GitCaptureSample => sample.kind === "git_capture")!;
 
 describe("TelemetryQueue", () => {
+  test("retains and flushes sync_phase samples through the existing envelope", async () => {
+    const bodies: TelemetryEnvelope[] = [];
+    const queue = new TelemetryQueue({ postJson: async (_path, body) => {
+      bodies.push(body as TelemetryEnvelope);
+      return new Response("{}", { status: 202 });
+    } });
+    queue.record({ kind: "sync_phase", op: "pull", wallMs: 23, phases: { latest: 2 } });
+    expect(queue.empty).toBe(false);
+    await queue.flush();
+    expect(bodies[0]?.samples).toEqual([{ kind: "sync_phase", op: "pull", wallMs: 23, phases: { latest: 2 } }]);
+    expect(queue.empty).toBe(true);
+  });
+
   test("retains per family, drains in priority order, and removes only on 202", async () => {
     const bodies: TelemetryEnvelope[] = [];
     let status = 500;

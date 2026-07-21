@@ -54,6 +54,7 @@ export class TelemetryQueue implements TelemetryRecorder {
   private readonly firstPublish: Extract<TelemetrySample, { kind: "first_publish" }>[] = [];
   private readonly uploadLane: Extract<TelemetrySample, { kind: "upload_lane" }>[] = [];
   private readonly propagation: Extract<TelemetrySample, { kind: "propagation" }>[] = [];
+  private readonly syncPhase: Extract<TelemetrySample, { kind: "sync_phase" }>[] = [];
   private readonly gitCapture = emptyGitCaptureAdditive();
   private gitCapturePendingRecords = 0;
   private readonly wsHealth = emptyWsHealthAdditive();
@@ -73,7 +74,8 @@ export class TelemetryQueue implements TelemetryRecorder {
     return this.safety.size === 0 && !this.capability && this.firstPublish.length === 0
       && this.uploadLane.length === 0 && this.propagation.length === 0
       && this.gitCapturePendingRecords === 0
-      && this.wsHealthPendingRecords === 0;
+      && this.wsHealthPendingRecords === 0
+      && this.syncPhase.length === 0;
   }
 
   record(sample: TelemetrySample): void {
@@ -87,6 +89,7 @@ export class TelemetryQueue implements TelemetryRecorder {
         case "first_publish": this.pushRing(this.firstPublish, sample, 16, sample.kind); break;
         case "upload_lane": this.pushRing(this.uploadLane, sample, 64, sample.kind); break;
         case "propagation": this.pushRing(this.propagation, sample, 64, sample.kind); break;
+        case "sync_phase": this.pushRing(this.syncPhase, sample, 64, sample.kind); break;
         case "git_capture":
           this.addGitCapture(sample);
           break;
@@ -117,7 +120,7 @@ export class TelemetryQueue implements TelemetryRecorder {
       count: Math.min(TELEMETRY_SAMPLE_SCHEMAS.safety_event.numbers.count.max, count),
     });
     if (this.capability) samples.push(this.capability);
-    samples.push(...this.firstPublish, ...this.uploadLane, ...this.propagation);
+    samples.push(...this.syncPhase, ...this.firstPublish, ...this.uploadLane, ...this.propagation);
     samples.length = Math.min(samples.length, TELEMETRY_BATCH_CAP);
     const envelope: TelemetryEnvelope = { v: 1, samples };
     let response: Response;
@@ -165,6 +168,7 @@ export class TelemetryQueue implements TelemetryRecorder {
         case "first_publish": this.removeIdentity(this.firstPublish, sample); break;
         case "upload_lane": this.removeIdentity(this.uploadLane, sample); break;
         case "propagation": this.removeIdentity(this.propagation, sample); break;
+        case "sync_phase": this.removeIdentity(this.syncPhase, sample); break;
         case "git_capture":
           if (gitCaptureSnapshot) this.removeGitCaptureSnapshot(gitCaptureSnapshot);
           break;

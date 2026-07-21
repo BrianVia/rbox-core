@@ -27,6 +27,7 @@ export {
   repoCtxFromDisk,
   setGitSpawnObserver,
   zeroGitChainTimings,
+  finalizeGitChainTimings,
   BASE_ABSENT_PREFIX,
   BASE_PRESENT_PREFIX,
   BASE_PRESENT_KEEP_PREFIX,

@@ -29,4 +29,13 @@ export {
   type GitApplyRepoTiming,
   type GitApplyMetrics,
 } from "./sync-git/apply.js";
-export { gitDivergenceStatus, gitDivergenceCount, type GitDivergenceStatus, type GitDivergenceStatusOptions } from "./sync-git/status.js";
+export { conflictSnapshotStatus, gitDivergenceStatus, gitDivergenceCount, type GitDivergenceStatus, type GitDivergenceStatusOptions } from "./sync-git/status.js";
+export {
+  CONFLICT_REF_PREFIX,
+  CONFLICT_REF_PRUNE_LIMIT,
+  CONFLICT_REF_RETENTION_MS,
+  conflictRefNamespacePresent,
+  inspectConflictRefs,
+  pruneConflictRefs,
+  type ConflictRefInspection,
+} from "./sync-git/conflict-retention.js";

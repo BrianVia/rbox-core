@@ -33,6 +33,7 @@ import { changedSidecarRepoKeys, observedRepoKeys, orderedDeferralUpdates, saveS
 import { beginFirstPublishTiming, finishFirstPublishStats, firstPublishMeasurementLive, firstPublishMeasurementToken, firstPublishTiming, formatFirstPublishStats } from "../upload-lane-timing.js";
 import { type SyncDeps, withReportScanStats, withCache, withDircache, refreshWriteContext } from "./deps.js";
 import { withPushLaneAccumulator } from "../telemetry/lane-accumulator.js";
+import { withPushTailTiming } from "../push-tail-timing.js";
 import { formatCommitTimings, formatScanStats, scanDetailsOf } from "./format.js";
 import { apiFor, MAX_ATTEMPTS, MassDeleteGuardError, NO_GIT_FORCE, pushMassDeleteTrips, makeDeferErrnoReporter, defaultBackoff, filesFirstFlagEnabled, matcherForState, plaintextBytesOf, fileCountOf, scanTick } from "./policy.js";
 import { pull, scanManifestForPush } from "./pull.js";
@@ -199,10 +200,11 @@ export async function pushManifest(
   deps: SyncDeps = {},
   options: PushManifestOptions = {}
 ): Promise<PushResult> {
-  return withPushLaneAccumulator(
-    () => pushManifestInner(root, cfg, local, deps, options),
-    (samples) => { for (const sample of samples) deps.telemetry?.record(sample); },
-  );
+  const report = deps.report ?? PhaseReport.disabled("push");
+  return withPushTailTiming(report, () => withPushLaneAccumulator(
+      () => pushManifestInner(root, cfg, local, deps, options),
+      (samples) => { for (const sample of samples) deps.telemetry?.record(sample); },
+    ));
 }
 
 async function pushManifestInner(
@@ -412,6 +414,7 @@ async function runPushAttempt(
   // the accepted sequence and therefore cannot claim a candidate commit that later fails.
   const deferralUpdates: Record<string, OrderedGitDeferralUpdates> = {};
   const repoRecords = repoRecordsForState(state);
+  const protectedPending = new Set(gitPlan.protectedPending);
   const carryProofsFor = (snapshot: typeof state, relPaths: readonly string[]): Record<string, RepoBaseProof> => {
     const records = repoRecordsForState(snapshot);
     return Object.fromEntries(relPaths.map((relPath) => {
@@ -423,6 +426,7 @@ async function runPushAttempt(
   };
   const now = new Date().toISOString();
   for (const rel of gitPlan.captureObserved) {
+    if (protectedPending.has(rel)) continue;
     const current = repoRecords[rel]?.deferrals;
     const lanes: GitDeferralUpdates = {};
     const captureReason = gitPlan.captureDeferrals[rel];
@@ -444,7 +448,8 @@ async function runPushAttempt(
   // apply episode itself clears. This is sender-local state only; it never enters
   // the manifest or changes the apply lane's retry timestamp.
   const writeBytesChanged = (): void => {
-    const candidates = Object.entries(repoRecords).filter(([, record]) => {
+    const candidates = Object.entries(repoRecords).filter(([relPath, record]) => {
+      if (protectedPending.has(relPath)) return false;
       const apply = record.deferrals?.apply;
       return apply !== undefined && apply.bytesChanged !== true;
     });
@@ -680,10 +685,27 @@ async function runPushAttempt(
     // Per-repo base advance (design 43 §7 [v5]): a PENDING repo's committed section is the
     // remote's own unapplied truth — the saved git BASE keeps the OLD entry (or none) so the
     // next pull still sees remote != base and retries the apply (see gitBaseAfterCommit).
-    const stateGit = gitBaseAfterCommit(committed.gitRepos, gitPlan.gitPendingRemote, appliedBase.gitRepos);
+    const supersededPending = new Set(gitPlan.supersededPending);
+    // Design 174 §4.2: the one bounded supersession line — emitted ONLY here, after
+    // the accepted commit, so it never claims a supersession a pre-ACK failure undid.
+    for (const relPath of [...supersededPending].sort()) {
+      (deps.onGitLog ?? ((l: string) => console.error(l)))(
+        `git-sync superseded pending ${relPath}: local history subsumes the unapplied remote section`,
+      );
+    }
+    const pendingAfterAck = { ...(gitPlan.gitPendingRemote ?? {}) };
+    for (const relPath of supersededPending) delete pendingAfterAck[relPath];
+    const stateGit = gitBaseAfterCommit(committed.gitRepos, pendingAfterAck, appliedBase.gitRepos);
     const advertised: Record<string, GitSection | null> = {};
     const repoProofs: Record<string, RepoBaseProof> = {};
     const ackRecords = repoRecordsForState(state);
+    const ackPartial = Object.fromEntries([...supersededPending].map((relPath) => [relPath, null]));
+    const ackAttempt = Object.fromEntries([...supersededPending].map((relPath) => [relPath, null]));
+    const ackDeferrals: Record<string, OrderedGitDeferralUpdates> = {};
+    for (const relPath of supersededPending) {
+      const ordered = orderedDeferralUpdates(ackRecords[relPath]?.deferrals, { apply: null });
+      if (ordered) ackDeferrals[relPath] = ordered;
+    }
     for (const relPath of new Set([
       ...Object.keys(ackRecords),
       ...Object.keys(committed.gitRepos ?? {}),
@@ -719,9 +741,12 @@ async function runPushAttempt(
       bases: stateGit,
       advertised,
       repoAbsent: gitPlan.repoAbsent ?? {},
-      pending: gitPlan.gitPendingRemote,
+      pending: pendingAfterAck,
       removed: gitPlan.gitReposRemoved,
       resolutions: gitPlan.gitNeedsResolution,
+      partial: ackPartial,
+      attempt: ackAttempt,
+      deferrals: ackDeferrals,
     };
     await report.phase("state-save", () => saveStateSource(root, state, {
       expectedStream: syncStreamId(cfg),

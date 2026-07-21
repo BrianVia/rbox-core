@@ -9,7 +9,7 @@
 export { isSyncableRef, validateGitSection, validateRefTombstones } from "./manifest-validate.js";
 
 export type { GitChainTimings, GitRepoKind, RepoCtx } from "./git/shared.js";
-export { gitSectionBlobRefs, gitSectionNewestLink, gitSectionPackLinks, gitSectionTips, inTreeWorktreeParentRel, inTreeWorktreeParentRelFromCtx, repoCtxFromDisk, setGitSpawnObserver, zeroGitChainTimings } from "./git/shared.js";
+export { finalizeGitChainTimings, gitSectionBlobRefs, gitSectionNewestLink, gitSectionPackLinks, gitSectionTips, inTreeWorktreeParentRel, inTreeWorktreeParentRelFromCtx, repoCtxFromDisk, setGitSpawnObserver, zeroGitChainTimings } from "./git/shared.js";
 export { gitPreflight, gitRefStorage, isGitBusy, type GitPreflightResult } from "./git/preflight.js";
 export { gitIdentity, gitIdentityKey, projectIdentity, type GitIdentity } from "./git/identity.js";
 export {

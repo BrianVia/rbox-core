@@ -32,6 +32,7 @@ import {
   type StatusRemoteHead,
 } from "./status-view.js";
 import {
+  conflictSnapshotStatus,
   gitDivergenceCount,
   gitDivergenceFastRepoSource,
   gitDivergenceStatus,
@@ -63,6 +64,7 @@ interface StatusLocalCountsBase {
   gitDeferrals: GitDivergenceStatus["deferrals"];
   gitConfigChecking?: string[];
   gitConfigDisabled?: GitDivergenceStatus["configDisabled"];
+  conflictSnapshots: { total: number; prunable: number };
 }
 
 interface LocalGitDeferral extends GitDeferral {
@@ -411,7 +413,7 @@ export async function statusCmdWithDeps(
     source?: readonly GitDivergenceRepoHint[] | AsyncIterable<GitDivergenceRepoHint>,
     includeBaseRepos = true
   ): Promise<GitDivergenceStatus> => {
-    if (!cfg.syncGit) return { count: 0, deferrals: localGitDeferrals(state).map(({ repo, ...d }) => ({ relPath: repo, ...d })), configChecking: [], configDisabled: [] };
+    if (!cfg.syncGit) return { count: 0, deferrals: localGitDeferrals(state).map(({ repo, ...d }) => ({ relPath: repo, ...d })), configChecking: [], configDisabled: [], conflictSnapshots: { total: 0, prunable: 0 } };
     try {
       if (deps.gitDivergenceStatus) {
         return await deps.gitDivergenceStatus(root, cfg, state, matcher, source, includeBaseRepos);
@@ -421,11 +423,12 @@ export async function statusCmdWithDeps(
         deferrals: localGitDeferrals(state).map(({ repo, ...d }) => ({ relPath: repo, ...d })),
         configChecking: [],
         configDisabled: [],
+        conflictSnapshots: { total: 0, prunable: 0 },
       };
     } catch {
       // Design 93 §6: an indeterminate config lane is conservatively divergent;
       // status must never collapse an evaluation failure to zero.
-      return { count: 1, deferrals: localGitDeferrals(state).map(({ repo, ...d }) => ({ relPath: repo, ...d })), configChecking: ["*"], configDisabled: [] };
+      return { count: 1, deferrals: localGitDeferrals(state).map(({ repo, ...d }) => ({ relPath: repo, ...d })), configChecking: ["*"], configDisabled: [], conflictSnapshots: { total: 0, prunable: 0 } };
     }
   };
 
@@ -446,10 +449,16 @@ export async function statusCmdWithDeps(
       gitDeferrals: gitStatus.deferrals,
       gitConfigChecking: gitStatus.configChecking,
       gitConfigDisabled: gitStatus.configDisabled,
+      conflictSnapshots: gitStatus.conflictSnapshots,
       source: "daemon",
       ageMs: trusted.ageMs,
     };
   } else if (populate) {
+    const conflictSnapshots = await conflictSnapshotStatus(root, [
+      ...Object.keys(state.lastSyncedManifest.gitRepos ?? {}),
+      ...Object.keys(state.gitPendingRemote ?? {}),
+      ...Object.keys(repoRecordsForState(state)),
+    ]);
     counts = {
       added: 0,
       changed: 0,
@@ -463,6 +472,7 @@ export async function statusCmdWithDeps(
         deferredSince: d.deferredSince,
         ...(d.bytesChanged === undefined ? {} : { bytesChanged: d.bytesChanged }),
       })),
+      conflictSnapshots,
       source: "computed",
     };
   } else {
@@ -495,6 +505,7 @@ export async function statusCmdWithDeps(
       gitDeferrals: gitStatus.deferrals,
       gitConfigChecking: gitStatus.configChecking,
       gitConfigDisabled: gitStatus.configDisabled,
+      conflictSnapshots: gitStatus.conflictSnapshots,
       source: "computed",
     };
   }
@@ -595,6 +606,7 @@ export async function statusCmdWithDeps(
               ? { checkout: { kind: "detached" as const } }
               : {}),
         })),
+        conflictSnapshots: counts.conflictSnapshots,
       },
       ...(counts.gitConfigChecking?.length || counts.gitConfigDisabled?.length
         ? {
@@ -660,6 +672,9 @@ export async function statusCmdWithDeps(
     };
     const rendered = renderBriefStatus(brief);
     for (const line of rendered.lines) console.log(line);
+    if (counts.conflictSnapshots.total > 0) {
+      console.log(`  conflict snapshots: ${counts.conflictSnapshots.total} (${counts.conflictSnapshots.prunable} prunable)`);
+    }
     if (opts.git) {
       for (const deferral of projectedGitRepos) {
         console.log(`  ${renderGitDeferralLine({
@@ -763,6 +778,9 @@ export async function statusCmdWithDeps(
       parts.push(style.yellow(`config: disabled (${counts.gitConfigDisabled.map((issue) => `${issue.relPath}: ${issue.reason}`).join("; ")})`));
     }
     console.log(`  ${style.dim("git-sync:")} ${parts.join(" · ")}`);
+    if (counts.conflictSnapshots.total > 0) {
+      console.log(`  conflict snapshots: ${counts.conflictSnapshots.total} (${counts.conflictSnapshots.prunable} prunable)`);
+    }
     for (const deferral of localGitRepoProjections) {
       console.log(`    ${renderGitDeferralLine({
         relPath: deferral.repo,

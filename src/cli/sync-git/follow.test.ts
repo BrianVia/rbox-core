@@ -251,6 +251,7 @@ async function landOutcome(state: SyncState, outcome: Awaited<ReturnType<typeof 
       resolutions: outcome.gitNeedsResolution,
       deferrals: orderedRepoDeferralUpdates(repoRecordsForState(state), outcome.deferrals),
       partial: outcome.partial,
+      attempt: outcome.attempt,
       idxProj: outcome.idxProj,
     },
   }));
@@ -1239,6 +1240,118 @@ test("disposition: receiver-only non-current branch is held while checkout follo
   expect(await git(receiver, "rev-parse", "refs/heads/local-side")).toBe(local);
 });
 
+test("design 174 A: unchanged allowlisted hold skips only after the mandatory prepass; a ref move resumes follow", async () => {
+  const { state, incoming } = await baseAndIncoming();
+  const tree = await git(receiver, "write-tree");
+  const local = await gitExec(["-C", receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit-tree", tree, "-p", await git(receiver, "rev-parse", "HEAD"), "-m", "held side"])
+    .then(({ stdout }) => stdout.toString().trim());
+  await git(receiver, "update-ref", "refs/heads/local-side", local);
+
+  const first = await applyIncoming(state, incoming, matchingOracle, { collectMetrics: true });
+  expect(first.outcome.attempt?.repo?.blockers).toContainEqual({
+    provenance: "ref-plane", reason: "local-commits", ref: "refs/heads/local-side",
+  });
+  const saved = await landOutcome(state, first.outcome, 2);
+  await Bun.sleep(2_100);
+
+  let capabilityCalls = 0;
+  let pinCalls = 0;
+  const ordering: string[] = [];
+  const skipped = await applyIncoming(saved, incoming, matchingOracle, {
+    collectMetrics: true,
+    afterHeldSkipPrepass: () => { ordering.push("prepass"); },
+    capabilityProbe: async () => { capabilityCalls++; ordering.push("follow"); return true; },
+    afterBranchPinsPrepared: () => { pinCalls++; },
+  });
+  expect(skipped.outcome.gitApplyMetrics?.results.skipped).toBe(1);
+  expect(capabilityCalls).toBe(0);
+  expect(pinCalls).toBe(0);
+  expect(ordering).toEqual(["prepass"]);
+  expect(skipped.outcome.gitRepos?.repo).toEqual(saved.lastSyncedManifest.gitRepos?.repo);
+  expect(skipped.outcome.attempt?.repo).toBeUndefined();
+
+  await git(receiver, "update-ref", "refs/heads/local-side", await git(receiver, "rev-parse", "refs/heads/main"), local);
+  capabilityCalls = 0;
+  const resumed = await applyIncoming(saved, incoming, matchingOracle, {
+    collectMetrics: true,
+    capabilityProbe: async () => { capabilityCalls++; return true; },
+  });
+  expect(resumed.outcome.gitApplyMetrics?.results.skipped).toBe(0);
+  expect(capabilityCalls).toBeGreaterThan(0);
+});
+
+for (const [label, expectedReason, prepare] of [
+  ["local-edits", "local-edits", async () => ({
+    proveRepo: async () => ({ kind: "mismatch" as const, sample: ["repo/tracked.txt"] }),
+    reproveRepo: async () => ({ kind: "mismatch" as const, sample: ["repo/tracked.txt"] }),
+    receiptHash: () => undefined,
+  })],
+  ["local-index", "local-index", async () => {
+    await fs.writeFile(path.join(receiver, "held-index.txt"), "held\n");
+    await git(receiver, "add", "held-index.txt");
+    return matchingOracle;
+  }],
+  ["local-operation", "local-operation", async (c1: string) => {
+    await fs.writeFile(path.join(receiver, ".git", "MERGE_HEAD"), `${c1}\n`);
+    return matchingOracle;
+  }],
+] as const) {
+  test(`design 174 A: ${label} blockers never take held-skip`, async () => {
+    const { c1, state, incoming } = await baseAndIncoming();
+    const oracle = await prepare(c1);
+    const first = await applyIncoming(state, incoming, oracle, { collectMetrics: true });
+    expect(first.outcome.deferrals?.repo?.apply?.reason).toBe(expectedReason);
+    expect(first.outcome.attempt?.repo).toBeDefined();
+    const saved = await landOutcome(state, first.outcome, 2);
+    await Bun.sleep(2_100);
+    let capabilityCalls = 0;
+    const retried = await applyIncoming(saved, incoming, oracle, {
+      collectMetrics: true,
+      capabilityProbe: async () => { capabilityCalls++; return true; },
+    });
+    expect(retried.outcome.gitApplyMetrics?.results.skipped).toBe(0);
+    expect(capabilityCalls).toBeGreaterThan(0);
+  });
+}
+
+test("design 174 A: elapsed floor re-follows and refreshes the same held outcome", async () => {
+  const { state, incoming } = await baseAndIncoming();
+  const tree = await git(receiver, "write-tree");
+  const local = await gitExec(["-C", receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit-tree", tree, "-p", await git(receiver, "rev-parse", "HEAD"), "-m", "held floor side"])
+    .then(({ stdout }) => stdout.toString().trim());
+  await git(receiver, "update-ref", "refs/heads/local-side", local);
+  const first = await applyIncoming(state, incoming);
+  const saved = await landOutcome(state, first.outcome, 2);
+  await Bun.sleep(2_100);
+  const expiredAt = new Date(Date.now() - 3_700_000).toISOString();
+  saved.repoRecords!.repo!.attempt!.at = expiredAt;
+
+  const same = await applyIncoming(saved, incoming, matchingOracle, { collectMetrics: true });
+  expect(same.outcome.gitApplyMetrics?.results.skipped).toBe(0);
+  expect(Date.parse(same.outcome.attempt!.repo!.at)).toBeGreaterThan(Date.parse(expiredAt));
+  expect(same.logs.some((line) => line.includes("held-skip fingerprint miss"))).toBe(false);
+});
+
+test("design 174 A: elapsed floor warns when unchanged bound inputs yield a different blocker set", async () => {
+  const { state, incoming } = await baseAndIncoming();
+  const tree = await git(receiver, "write-tree");
+  const local = await gitExec(["-C", receiver, "-c", "user.email=t@t.t", "-c", "user.name=t", "commit-tree", tree, "-p", await git(receiver, "rev-parse", "HEAD"), "-m", "held warning side"])
+    .then(({ stdout }) => stdout.toString().trim());
+  await git(receiver, "update-ref", "refs/heads/local-side", local);
+  const first = await applyIncoming(state, incoming);
+  const saved = await landOutcome(state, first.outcome, 2);
+  await Bun.sleep(2_100);
+  saved.repoRecords!.repo!.attempt!.at = new Date(Date.now() - 3_700_000).toISOString();
+  const unreadable: AppliedManifestOracle = {
+    proveRepo: async () => ({ kind: "indeterminate", why: "floor adversary" }),
+    reproveRepo: async () => ({ kind: "indeterminate", why: "floor adversary" }),
+    receiptHash: () => undefined,
+  };
+  const changed = await applyIncoming(saved, incoming, unreadable, { collectMetrics: true });
+  expect(changed.outcome.gitApplyMetrics?.results.skipped).toBe(0);
+  expect(changed.logs.some((line) => line.includes("held-skip fingerprint miss"))).toBe(true);
+});
+
 test("design safety: receiver-only tag is held and reachable while the safe checkout follows", async () => {
   const { c1, state, incoming } = await baseAndIncoming();
   const tree = await git(receiver, "write-tree");
@@ -1870,3 +1983,25 @@ test("R2-11: refname alias group is held while an unrelated checkout follows", a
   expect(outcome.partial?.repo?.heldRefs["refs/heads/foo"]).toBe("ownership");
   expect(logs.some((line) => line.includes("receiver-equivalent Git refnames held"))).toBe(true);
 });
+
+test("design 174 C: many-ref follow has exclusive leaf coverage and an explicit residual", async () => {
+  const c1 = await commit("base\n", "many-ref base");
+  for (let i = 0; i < 40; i++) await git(sender, "branch", `many-${i}`, c1);
+  const base = await capture();
+  await materialize(base);
+  const c2 = await commit("incoming\n", "many-ref incoming");
+  for (let i = 0; i < 40; i++) await git(sender, "branch", "-f", `many-${i}`, c2);
+  const incoming = await capture();
+  await fs.writeFile(path.join(receiver, "tracked.txt"), "incoming\n");
+
+  const { outcome } = await applyIncoming(stateWith(base), incoming, matchingOracle, { collectMetrics: true });
+  const timing = outcome.gitApplyMetrics?.repoTimings[0];
+  const chain = timing?.chain;
+  if (!timing || !chain) throw new Error("missing instrumented repo timing");
+  const leafSum = chain.fetchDecryptMs + chain.bundleVerifyMs + chain.gitImportMs
+    + chain.refTxnExclusiveMs + chain.ownershipMs + chain.reflogMs
+    + chain.connectivityProofMs + chain.indexOpStateMs;
+  expect(chain.classifyMs).toBeGreaterThan(0);
+  expect(chain.residualMs).toBeCloseTo(Math.max(0, timing.wallMs - leafSum), 5);
+  expect(chain.residualMs).toBeLessThanOrEqual(timing.wallMs * 0.10);
+}, 30_000);

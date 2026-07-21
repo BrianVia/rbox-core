@@ -43,7 +43,7 @@ export type PhaseName =
   | "state-save";
 
 /** Stable display order for the summary line (and any tabular diff). */
-const PHASE_ORDER: readonly PhaseName[] = [
+export const PHASE_ORDER: readonly PhaseName[] = [
   "latest",
   "state-load",
   "scan",
@@ -169,6 +169,17 @@ export class PhaseReport {
     const t = this.ensure(name);
     t.details = { ...(t.details ?? {}), ...details };
     if (summary) this.phaseSummaries.set(name, summary);
+  }
+
+  /** Merge detail and append a summary fragment without replacing existing phase text. */
+  appendDetails(name: PhaseName, details: Record<string, unknown>, summary?: string): void {
+    if (!this.enabled) return;
+    const t = this.ensure(name);
+    t.details = { ...(t.details ?? {}), ...details };
+    if (summary) {
+      const existing = this.phaseSummaries.get(name);
+      this.phaseSummaries.set(name, existing ? `${existing} ${summary}` : summary);
+    }
   }
 
   private bump(name: PhaseName, ms: number, bytes?: PhaseBytes): void {

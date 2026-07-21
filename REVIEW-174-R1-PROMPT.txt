@@ -1,0 +1,21 @@
+Adversarial design review, round 1, of docs/design/174-apply-side-perf-and-held-repo-livelock.md.
+
+You have full read access to this repository checkout. Verify EVERY claim in the doc against the actual code before accepting it — the doc cites file:line anchors; check them. Key surfaces:
+- src/cli/sync-git/apply.ts (follow orchestration, pending/partial/deferral bookkeeping, ~1180-1235)
+- src/cli/sync-git/follow.ts (classifyCheckout 393-508, classifiedHolds 632-682, safe-ref loop 605-675)
+- src/cli/sync-git/plan.ts (pending-carry 605-633, capture pool, post-commit fold)
+- src/cli/sync-git/fingerprint.ts + divergence-cache.ts (the fingerprint primitive §4.1 reuses)
+- src/engine/git/reachability.ts (tipOwnedByIncoming), src/engine/git/apply.ts, checkout-txn.ts
+- docs/design/130-follower-branch-hygiene.md (the ownership/BASE-composer model 174 must not violate)
+
+Attack list (minimum):
+1. §4.1 held-skip: is the {local-commits, local-stash} reason allowlist REALLY fully covered by gitFingerprint's inputs? Enumerate every input to classifyCheckout that can flip those two reasons and check each is fingerprint-visible. Hunt a state change that unblocks the hold but leaves the fingerprint unchanged.
+2. §4.2 supersession: hunt information loss — a pending section lane (refs, tags, stash, opState, head, index, config, packChain/bundle family, refTombstones!) whose content could be lost or whose semantics change when pending is cleared and fresh capture publishes. Pay special attention to refTombstones (130 §wire): the pending section may carry tombstone chains the local advertised-state does not; does clearing pending + fresh capture regress a follower somewhere else in the fleet?
+3. §4.2 multi-writer: the 409/parent-sequence argument — is it actually airtight given plan/commit ordering? Find an interleaving where superseded-clear publishes over a newer remote section without losing.
+4. §4.2 journal hygiene: exactly what does "quarantine-then-clear any standing follow journal" need to do; does the existing absence-supersession path really provide a reusable primitive (cite it), or is the doc hand-waving?
+5. §4.5 scan-skip: verify the claimed watcher authority actually exists post-172/175 with the stated properties, and that reconcile() consuming a REUSED manifest cannot mask real local changes (deletion-detection, mass-delete guard interplay, pull.ts:165-178).
+6. Deferral-episode + status-banner semantics under A-skips: ageBucket display, busy-retry episodes, anything assuming "a pull attempt happened".
+7. The livelock causal chain in §1.2-1.3 — verify against the code that the seeding path is reachable exactly as described (schema-bump republish → next pull holds). If you find the TRUE seeding differs, say so with evidence.
+8. Anything in 130's composer/A-P-K/tombstone contracts that any of A/B/D/E silently violates.
+
+Output format: write your COMPLETE review to REVIEW-174-R1-CODEX.md in the repo root (create/overwrite). Numbered findings, each with severity (BLOCKER / MAJOR / MINOR / EDITORIAL), exact evidence (file:line), and a concrete fix direction. End with "Verdict: ALIGNED" or "Verdict: CHANGES-REQUIRED". The LAST line of the file must be exactly: REVIEW-COMPLETE

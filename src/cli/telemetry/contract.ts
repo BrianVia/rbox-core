@@ -10,6 +10,12 @@ const MS_DOMAIN = { min: 0, max: 604_800_000, integer: true } as const;
 const COUNT_DOMAIN = { min: 0, max: 10_000_000, integer: true } as const;
 const WS_HEALTH_COUNT_DOMAIN = { min: 0, max: 1_000_000_000, integer: true } as const;
 const WS_HEALTH_SUM_MS_DOMAIN = { min: 0, max: 1_000_000_000_000, integer: true } as const;
+export const SYNC_PHASE_NAMES = [
+  "latest", "state-load", "scan", "git-plan", "address", "encrypt", "missing", "upload",
+  "commit", "download", "decrypt", "apply", "git-apply", "cache-save", "state-save",
+] as const;
+export type SyncPhaseName = (typeof SYNC_PHASE_NAMES)[number];
+export const SYNC_PHASE_OPS = ["pull", "push"] as const;
 export const TRANSPORTS = ["batch", "pack", "single"] as const;
 export type LaneTransport = (typeof TRANSPORTS)[number];
 export const FILL_VERSIONS = ["v1", "v2"] as const;
@@ -83,9 +89,20 @@ export const TELEMETRY_SAMPLE_SCHEMAS = {
     },
     enums: {},
   },
+  sync_phase: {
+    numbers: { wallMs: MS_DOMAIN },
+    optionalNumbers: {
+      gitApplyMaxRepoMs: MS_DOMAIN,
+      gitApplySkippedHeld: COUNT_DOMAIN,
+    },
+    enums: { op: SYNC_PHASE_OPS },
+    numericRecords: { phases: { keys: SYNC_PHASE_NAMES, domain: MS_DOMAIN } },
+  },
 } as const satisfies Record<string, {
   readonly numbers: Readonly<Record<string, NumericDomain>>;
   readonly enums: Readonly<Record<string, readonly string[]>>;
+  readonly optionalNumbers?: Readonly<Record<string, NumericDomain>>;
+  readonly numericRecords?: Readonly<Record<string, { readonly keys: readonly string[]; readonly domain: NumericDomain }>>;
 }>;
 
 export type TelemetryKind = keyof typeof TELEMETRY_SAMPLE_SCHEMAS;
@@ -137,7 +154,15 @@ export interface WsHealthSample {
   notifyLatencySumMs: number;
   notifyLatencyMaxMs: number;
 }
-export type TelemetrySample = PropagationSample | FirstPublishSample | UploadLaneSample | CapabilitySample | SafetyEventSample | GitCaptureSample | WsHealthSample;
+export interface SyncPhaseSample {
+  kind: "sync_phase";
+  op: "pull" | "push";
+  wallMs: number;
+  phases: Record<string, number>;
+  gitApplyMaxRepoMs?: number;
+  gitApplySkippedHeld?: number;
+}
+export type TelemetrySample = PropagationSample | FirstPublishSample | UploadLaneSample | CapabilitySample | SafetyEventSample | GitCaptureSample | WsHealthSample | SyncPhaseSample;
 export interface TelemetryEnvelope { v: 1; samples: TelemetrySample[] }
 
 export interface SyncState {

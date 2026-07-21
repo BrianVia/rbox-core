@@ -384,7 +384,10 @@ test("a chain link encrypted under another epoch fails closed with its sha named
 });
 
 test("R6 writer carrying a pending repo preserves evidence and emits consecutive deltas", async () => {
-  await withManifestEncodingFlags(undefined, "1", async () => {
+  const priorSupersession = process.env.RBOX_GIT_PENDING_SUPERSEDE;
+  process.env.RBOX_GIT_PENDING_SUPERSEDE = "0";
+  try {
+    await withManifestEncodingFlags(undefined, "1", async () => {
     const server = new FakeServer();
     const secrets = await bootstrapOnto(server, ACCT, "devA-pending-snapshot", NOW);
     const root = await tmp();
@@ -421,7 +424,11 @@ test("R6 writer carrying a pending repo preserves evidence and emits consecutive
     expect(await wireKind(server, remote)).toBe("delta");
     expect(parseSignedCommit(server.commits.at(-1)!).manifestChain.length).toBeGreaterThan(0);
     expect((await peer.latest()).manifest.gitRepos).toEqual({ repo: section });
-  });
+    });
+  } finally {
+    if (priorSupersession === undefined) delete process.env.RBOX_GIT_PENDING_SUPERSEDE;
+    else process.env.RBOX_GIT_PENDING_SUPERSEDE = priorSupersession;
+  }
 });
 
 test("context-invalid reconstructed writer evidence fails to a snapshot without throwing", async () => {

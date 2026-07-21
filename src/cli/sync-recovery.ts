@@ -22,6 +22,7 @@ import { UploadByteTracker } from "./upload-byte-tracker.js";
 import { TransferRateSampler } from "./transfer-rate.js";
 import { beginFirstPublishTiming, firstPublishMeasurementLive, firstPublishMeasurementToken, firstPublishReady, firstPublishTiming, firstPublishUploadEnd, firstPublishUploadStart, LANE_TIMING, uploadLaneTiming, uploadLaneTimingSummary } from "./upload-lane-timing.js";
 import { metricsEnabled } from "./metrics.js";
+import { timeMissingBlobs } from "./push-tail-timing.js";
 import { runPublishPipeline } from "./publish-pipeline/pipeline.js";
 import { DEFAULT_REDEEM_THRESHOLD, ReceiptDrainer } from "./publish-pipeline/receipt-drainer.js";
 import { createRunTempDir } from "./publish-pipeline/stale-temp.js";
@@ -95,7 +96,7 @@ const isRuntimeEpoch = (v: unknown): v is number => typeof v === "number" && Num
 export async function missingBlobsChunked(api: SyncRemote, shas: string[]): Promise<string[]> {
   const missing = new Set<string>();
   for (let i = 0; i < shas.length; i += MAX_SHAS_PER_CHECK) {
-    for (const sha of await api.missingBlobs(shas.slice(i, i + MAX_SHAS_PER_CHECK))) missing.add(sha);
+    for (const sha of await timeMissingBlobs(api, shas.slice(i, i + MAX_SHAS_PER_CHECK))) missing.add(sha);
   }
   return [...missing];
 }
@@ -409,7 +410,7 @@ export async function encryptAndUpload(
           }
           if (!missing.has(freshEncSha)) {
             const checkT0 = LANE_TIMING ? performance.now() : 0;
-            const present = (await api.missingBlobs([freshEncSha])).length === 0;
+            const present = (await timeMissingBlobs(api, [freshEncSha])).length === 0;
             if (LANE_TIMING) uploadLaneTiming.uploadMs += performance.now() - checkT0;
             if (present) {
               uploaded.add(freshEncSha);

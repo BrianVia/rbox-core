@@ -273,7 +273,7 @@ export async function fingerprintHitProbe(
   return { status: "hit", fingerprint: fresh, probe: cached.probe, cachedLocalCfg: cached.cachedLocalCfg, kind };
 }
 
-export type DivergenceCacheWriteResult = { kind?: GitRepoKind; localCfg?: LocalCfgRead };
+export type DivergenceCacheWriteResult = { kind?: GitRepoKind; localCfg?: LocalCfgRead; stable: boolean };
 
 export async function writeDivergenceCacheEntry(
   run: GitFingerprintRun,
@@ -307,15 +307,18 @@ export async function writeDivergenceCacheEntry(
         ...(localCfg?.status === "ok" ? { cachedLocalCfg: localCfg.cached } : {}),
       });
       cache.dirty = true;
-      return { kind: afterKind, localCfg };
+      // Hygiene authority is bound to the original decision input. A stable
+      // recomputed retry may populate the cache, but it cannot retroactively
+      // authorize the carry chosen from the first probe.
+      return { kind: afterKind, localCfg, stable: attempt === 0 };
     }
-    if (!recompute || attempt === 1) return { kind: afterKind };
+    if (!recompute || attempt === 1) return { kind: afterKind, stable: false };
     const next = await recompute();
     before = next.beforeFingerprint;
     currentProbe = next.probe;
     currentKind = next.kind;
   }
-  return { kind: currentKind };
+  return { kind: currentKind, stable: false };
 }
 
 async function probeAndCacheDivergenceRepo(

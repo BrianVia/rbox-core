@@ -273,6 +273,26 @@ export interface GitPartialApply {
   configBase?: Record<string, string[]>;
 }
 
+export type TypedBlocker =
+  | { provenance: "ref-plane"; reason: "local-commits" | "local-stash" | "worktree-ownership"; ref: string }
+  | { provenance: "checkout" | "boundary"; reason: GitDeferralReason; detail?: string }
+  | { provenance: "indeterminate"; reason: "unreadable" | "unsupported"; detail: string }
+  | { provenance: "protocol" | "composer"; reason: "artifact"; detail: string };
+
+/** Local-only held-follow observation. This is never projected onto a manifest. */
+export interface GitHeldAttempt {
+  incomingKey: string;
+  localFingerprint: string;
+  fingerprintVersion: string;
+  reflogs: Array<{ path: string; digest: string }>;
+  blockers: TypedBlocker[];
+  repoIdentity: string;
+  stateNonce: string;
+  baseOriginsHash: string;
+  partialDisposition: string;
+  at: string;
+}
+
 export interface RepoRecord {
   repoGen: number;
   sourceSeq: number;
@@ -295,6 +315,8 @@ export interface RepoRecord {
   cfgShape?: ConfigShapeIdentity;
   deferrals?: GitDeferrals;
   partial?: GitPartialApply;
+  /** Local-only design-174 held-follow observation; never wire-visible. */
+  attempt?: GitHeldAttempt;
   /** D4's projected-index cache; stored here so RepoRecord's shape lands once. */
   idxProj?: string;
 }

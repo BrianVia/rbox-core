@@ -21,6 +21,7 @@ import {
   type GitDeferral,
   type GitDeferrals,
   type GitPartialApply,
+  type GitHeldAttempt,
   type RepoRecord,
   type RepoRecordInput,
   type StateSavePacket,
@@ -68,6 +69,8 @@ export interface RepoStateValues {
    * resurrect a newer episode. */
   deferrals?: Record<string, OrderedGitDeferralUpdates>;
   partial?: Record<string, GitPartialApply | null>;
+  /** Explicit local-only held-attempt transitions; omission preserves, null clears. */
+  attempt?: Record<string, GitHeldAttempt | null>;
   /** Semantic projection of the last applied index; null clears a stale cache. */
   idxProj?: Record<string, string | null>;
 }
@@ -226,6 +229,9 @@ function sourceRecord(source: StateSource, relPath: string, current: RepoRecord)
     ...(source.values.partial?.[relPath] === undefined
       ? (current.partial === undefined ? {} : { partial: current.partial })
       : source.values.partial[relPath] === null ? {} : { partial: source.values.partial[relPath] }),
+    ...(source.values.attempt?.[relPath] === undefined
+      ? (current.attempt === undefined ? {} : { attempt: current.attempt })
+      : source.values.attempt[relPath] === null ? {} : { attempt: source.values.attempt[relPath] }),
     ...(source.values.idxProj?.[relPath] === undefined
       ? (current.idxProj === undefined ? {} : { idxProj: current.idxProj })
       : source.values.idxProj[relPath] === null ? {} : { idxProj: source.values.idxProj[relPath] }),
@@ -344,6 +350,7 @@ export function observedRepoKeys(state: SyncState, manifestGit?: Record<string, 
     ...Object.keys(values.configLane ?? {}),
     ...Object.keys(values.deferrals ?? {}),
     ...Object.keys(values.partial ?? {}),
+    ...Object.keys(values.attempt ?? {}),
     ...Object.keys(values.idxProj ?? {}),
   ])].sort();
 }

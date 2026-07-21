@@ -19,14 +19,35 @@ export interface GitChainTimings {
   fetchDecryptMs: number;
   bundleVerifyMs: number;
   gitImportMs: number;
+  refTxnExclusiveMs: number;
+  ownershipMs: number;
+  reflogMs: number;
+  connectivityProofMs: number;
   indexOpStateMs: number;
+  /** Nested parent: reported separately and never added to exclusive leaves. */
+  classifyMs: number;
+  residualMs: number;
 }
 
 export function zeroGitChainTimings(): GitChainTimings {
-  return { chainLength: 0, fetchDecryptMs: 0, bundleVerifyMs: 0, gitImportMs: 0, indexOpStateMs: 0 };
+  return {
+    chainLength: 0,
+    fetchDecryptMs: 0,
+    bundleVerifyMs: 0,
+    gitImportMs: 0,
+    refTxnExclusiveMs: 0,
+    ownershipMs: 0,
+    reflogMs: 0,
+    connectivityProofMs: 0,
+    indexOpStateMs: 0,
+    classifyMs: 0,
+    residualMs: 0,
+  };
 }
 
-export async function addTimedMs<T>(timings: GitChainTimings | undefined, field: keyof GitChainTimings, fn: () => Promise<T>): Promise<T> {
+type GitTimedField = Exclude<keyof GitChainTimings, "chainLength" | "residualMs">;
+
+export async function addTimedMs<T>(timings: GitChainTimings | undefined, field: GitTimedField, fn: () => T | Promise<T>): Promise<T> {
   if (!timings) return fn();
   const t0 = performance.now();
   try {
@@ -34,6 +55,14 @@ export async function addTimedMs<T>(timings: GitChainTimings | undefined, field:
   } finally {
     timings[field] += performance.now() - t0;
   }
+}
+
+/** Close the explicit residual against the exact per-repo wall interval. */
+export function finalizeGitChainTimings(timings: GitChainTimings, repoWallMs: number): void {
+  const attributed = timings.fetchDecryptMs + timings.bundleVerifyMs + timings.gitImportMs
+    + timings.refTxnExclusiveMs + timings.ownershipMs + timings.reflogMs
+    + timings.connectivityProofMs + timings.indexOpStateMs;
+  timings.residualMs = Math.max(0, repoWallMs - attributed);
 }
 
 const exec = promisify(execFile);

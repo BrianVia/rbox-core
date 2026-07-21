@@ -20,6 +20,7 @@ const GIT_APPLY_CONCURRENCY_DEFAULT = 6;
 /** Cross-shape config skips are policy, not a per-tick error. Keep daemon logs
  * loud once per workspace/repo without repeating forever on every pull. */
 export const configOwnershipSkipLogged = new Set<string>();
+export const pendingCarryLogged = new Set<string>();
 /** Invalid incoming config is an additive-field compatibility event. Keep it
  * loud once per workspace/repo while the independent Git lane continues. */
 export const configInvalidSkipLogged = new Set<string>();

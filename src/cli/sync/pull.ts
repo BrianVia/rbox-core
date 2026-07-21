@@ -284,6 +284,7 @@ export async function applyPulledManifest(
       configLane: gitOutcome.configLane,
       deferrals: deferralUpdates,
       partial: gitOutcome.partial,
+      attempt: gitOutcome.attempt,
       idxProj: gitOutcome.idxProj,
     }),
     values: {
@@ -295,6 +296,7 @@ export async function applyPulledManifest(
       configLane: gitOutcome.configLane,
       deferrals: deferralUpdates,
       partial: gitOutcome.partial,
+      attempt: gitOutcome.attempt,
       idxProj: gitOutcome.idxProj,
     },
     repoProofs: gitOutcome.repoProofs,

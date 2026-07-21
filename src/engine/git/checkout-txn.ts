@@ -7,7 +7,7 @@ import crypto from "node:crypto";
 import { promisify } from "node:util";
 import { hashBytes } from "../hash.js";
 import { fsyncDirectory } from "../fsutil.js";
-import { cleanGitEnv, clearIndexResolveUndo, git, moveFileAtomic, readRegularFileNoFollow, walkFiles, ZERO_OID, type RepoCtx } from "./shared.js";
+import { addTimedMs, cleanGitEnv, clearIndexResolveUndo, git, moveFileAtomic, readRegularFileNoFollow, walkFiles, ZERO_OID, type GitChainTimings, type RepoCtx } from "./shared.js";
 import { readOpState, pruneEmptyOpStateDirs } from "./refs.js";
 import { updateCheckoutJournal, type CheckoutJournal } from "./journal.js";
 
@@ -67,6 +67,7 @@ export interface SecondProofContext {
 }
 
 export interface CommitCheckoutOptions<TIntended = unknown> {
+  chainTimings?: GitChainTimings;
   connectivityProof?: (repoDir: string, roots: readonly string[]) => Promise<boolean>;
   secondProof: (context: SecondProofContext) => Promise<boolean>;
   /** Branch-switch compatibility phase: proof run after the post-HEAD ref
@@ -517,6 +518,10 @@ async function restoreOpStateWithCrash(ctx: RepoCtx, desired: Array<{ rel: strin
 
 /** The pinned 10-step checkout commit from design 116 (r1 F3/r2 F4/r3 F6). */
 export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPlan, opts: CommitCheckoutOptions<T>): Promise<CommitCheckoutResult> {
+  const persistJournal = (): Promise<void> => opts.journal
+    ? addTimedMs(opts.chainTimings, "indexOpStateMs", () =>
+        updateCheckoutJournal(opts.journal!.workspaceRoot, opts.journal!.relPath, opts.journal!.value))
+    : Promise.resolve();
   if (!(opts.capabilitySupported ?? await checkoutTransactionSupported(ctx.repoDir, opts.capabilityProbe))) return { status: "unsupported", reason: "git lacks prepared transactional symref-update" };
 
   if ((plan.candidateIndexPath === undefined) === (plan.removeIndex !== true)) {
@@ -549,20 +554,20 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
   try {
     let candidate: Buffer | undefined;
     let indexHash: string | undefined;
-    if (plan.candidateIndexPath) {
-      await fs.copyFile(plan.candidateIndexPath, staged);
+    if (plan.candidateIndexPath) await addTimedMs(opts.chainTimings, "indexOpStateMs", async () => {
+      await fs.copyFile(plan.candidateIndexPath!, staged);
       await clearIndexResolveUndo(ctx.repoDir, staged); // private GIT_INDEX_FILE, never live index.
       candidate = await fs.readFile(staged);
       indexHash = hashBytes(candidate);
-    }
+    });
     if (opts.journal) {
       opts.journal.value.expectedNew.indexHash = indexHash;
-      await updateCheckoutJournal(opts.journal.workspaceRoot, opts.journal.relPath, opts.journal.value);
+      await persistJournal();
     }
 
-    const connected = opts.connectivityProof
-      ? await opts.connectivityProof(ctx.repoDir, plan.plannedGraphRoots)
-      : await defaultConnectivityProof(ctx.repoDir, plan.plannedGraphRoots, plan.malformedOrigHeadPreserved === true);
+    const connected = await addTimedMs(opts.chainTimings, "connectivityProofMs", () => opts.connectivityProof
+      ? opts.connectivityProof(ctx.repoDir, plan.plannedGraphRoots)
+      : defaultConnectivityProof(ctx.repoDir, plan.plannedGraphRoots, plan.malformedOrigHeadPreserved === true));
     if (!connected) return { status: "defer", reason: "planned graph connectivity proof failed" };
     try { opts.crashAt?.("after-connectivity-proof"); } catch (error) { throw new InjectedCheckoutCrash(error); }
 
@@ -574,23 +579,26 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
 
     const primaryLines = transactionLines(plan);
     tx = new RefTransaction(ctx.repoDir, plan.reflogMessage);
-    await tx.start();
-    await tx.write("option no-deref");
-    for (const line of primaryLines) await tx.write(line);
-    const primaryIntent = await preparedTransactionIntent(ctx, "primary", await tx.processId(), primaryLines, plan.head.kind === "symbolic");
+    let primaryIntent!: JournalPreparedTransaction;
+    await addTimedMs(opts.chainTimings, "refTxnExclusiveMs", async () => {
+      await tx!.start();
+      await tx!.write("option no-deref");
+      for (const line of primaryLines) await tx!.write(line);
+      primaryIntent = await preparedTransactionIntent(ctx, "primary", await tx!.processId(), primaryLines, plan.head.kind === "symbolic");
+    });
     if (opts.journal) {
       opts.journal.value.expectedNew.preparedTransactions = [
         ...(opts.journal.value.expectedNew.preparedTransactions ?? []).filter((entry) => entry.id !== "primary"),
         primaryIntent,
       ];
-      await updateCheckoutJournal(opts.journal.workspaceRoot, opts.journal.relPath, opts.journal.value);
+      await persistJournal();
     }
-    await tx.prepare();
+    await addTimedMs(opts.chainTimings, "refTxnExclusiveMs", () => tx!.prepare());
     const postHeadLines = refUpdateLines(plan.postHeadRefUpdates ?? [], plan.postHeadExtraTransactionLines);
     await opts.afterPrepareChild?.(await tx.processId(), "primary");
     await observePreparedLockTokens(primaryIntent);
     if (opts.journal) {
-      await updateCheckoutJournal(opts.journal.workspaceRoot, opts.journal.relPath, opts.journal.value);
+      await persistJournal();
     }
     try { opts.crashAt?.("after-prepare"); } catch (error) { throw new InjectedCheckoutCrash(error); }
 
@@ -610,7 +618,7 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
         dev: reservationTokens[i]!.dev,
         ino: reservationTokens[i]!.ino,
       }]));
-      await updateCheckoutJournal(opts.journal.workspaceRoot, opts.journal.relPath, opts.journal.value);
+      await persistJournal();
     }
 
     if (plan.origHeadLock) {
@@ -633,7 +641,7 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
     if (!indexToken) throw new Error("could not identify owned index.lock");
     if (opts.journal) {
       opts.journal.value.expectedNew.indexLock = { dev: indexToken.dev, ino: indexToken.ino };
-      await updateCheckoutJournal(opts.journal.workspaceRoot, opts.journal.relPath, opts.journal.value);
+      await persistJournal();
     }
     try { opts.crashAt?.("after-index-lock"); } catch (error) { throw new InjectedCheckoutCrash(error); }
 
@@ -654,7 +662,7 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
     const breadcrumbChanged = plan.origHeadLock ? !(await origHeadEquals(ctx, plan.origHeadLock.expectedOldBytes)) : false;
     const secondProofPassed = !becameBusy && !breadcrumbChanged && await opts.secondProof(proofContext);
     if (becameBusy || breadcrumbChanged || !secondProofPassed) {
-      await tx.abort();
+      await addTimedMs(opts.chainTimings, "refTxnExclusiveMs", () => tx!.abort());
       tx = undefined;
       await postHeadTx?.abort();
       postHeadTx = undefined;
@@ -680,9 +688,9 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
         acquireStarted: true,
         expectedBytes: [Buffer.alloc(0).toString("base64")],
       };
-      await updateCheckoutJournal(opts.journal.workspaceRoot, opts.journal.relPath, opts.journal.value);
+      await persistJournal();
     }
-    await tx.commit();
+    await addTimedMs(opts.chainTimings, "refTxnExclusiveMs", () => tx!.commit());
     tx = undefined;
     refsCommitted = true;
     try { opts.crashAt?.("after-head-commit"); } catch (error) { throw new InjectedCheckoutCrash(error); }
@@ -695,66 +703,70 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
         opts.journal.value.expectedNew.headLock.token = { dev: headToken.dev, ino: headToken.ino };
         const primary = opts.journal.value.expectedNew.preparedTransactions?.find((entry) => entry.id === "primary");
         if (primary) primary.completed = true;
-        await updateCheckoutJournal(opts.journal.workspaceRoot, opts.journal.relPath, opts.journal.value);
+        await persistJournal();
       }
       const head = await fs.readFile(path.join(ctx.gitDir, "HEAD"), "utf8");
       if (head !== `ref: ${branchSwitchTarget}\n`) throw new JournalArbitrationDefer("symbolic HEAD changed after branch-switch commit");
     } else if (opts.journal) {
       const primary = opts.journal.value.expectedNew.preparedTransactions?.find((entry) => entry.id === "primary");
       if (primary) primary.completed = true;
-      await updateCheckoutJournal(opts.journal.workspaceRoot, opts.journal.relPath, opts.journal.value);
+      await persistJournal();
     }
     if (postHeadLines.length) {
       // Git cannot prepare an update of HEAD's old referent while HEAD.lock is
       // held by the symref transaction. Keep this second expected-old commit
       // inside checkout-txn and under the same intent journal/index reservation.
       postHeadTx = new RefTransaction(ctx.repoDir, plan.postHeadReflogMessage);
-      await postHeadTx.start();
-      await postHeadTx.write("option no-deref");
-      for (const line of postHeadLines) await postHeadTx.write(line);
+      await addTimedMs(opts.chainTimings, "refTxnExclusiveMs", async () => {
+        await postHeadTx!.start();
+        await postHeadTx!.write("option no-deref");
+        for (const line of postHeadLines) await postHeadTx!.write(line);
+      });
       if (opts.journal) {
         const intent = await preparedTransactionIntent(ctx, "post-head", await postHeadTx.processId(), postHeadLines, false);
         opts.journal.value.expectedNew.preparedTransactions = [
           ...(opts.journal.value.expectedNew.preparedTransactions ?? []).filter((entry) => entry.id !== "post-head"),
           intent,
         ];
-        await updateCheckoutJournal(opts.journal.workspaceRoot, opts.journal.relPath, opts.journal.value);
+        await persistJournal();
       }
-      await postHeadTx.prepare();
+      await addTimedMs(opts.chainTimings, "refTxnExclusiveMs", () => postHeadTx!.prepare());
       await opts.afterPrepareChild?.(await postHeadTx.processId(), "post-head");
       if (opts.journal) {
         const intent = opts.journal.value.expectedNew.preparedTransactions?.find((entry) => entry.id === "post-head");
         if (intent) await observePreparedLockTokens(intent);
-        await updateCheckoutJournal(opts.journal.workspaceRoot, opts.journal.relPath, opts.journal.value);
+        await persistJournal();
       }
       if (opts.postHeadSecondProof && !(await opts.postHeadSecondProof())) {
-        await postHeadTx.abort();
+        await addTimedMs(opts.chainTimings, "refTxnExclusiveMs", () => postHeadTx!.abort());
         postHeadTx = undefined;
         throw new JournalArbitrationDefer("post-HEAD branch proof changed");
       }
-      await postHeadTx.commit();
+      await addTimedMs(opts.chainTimings, "refTxnExclusiveMs", () => postHeadTx!.commit());
       postHeadTx = undefined;
       if (opts.journal) {
         const intent = opts.journal.value.expectedNew.preparedTransactions?.find((entry) => entry.id === "post-head");
         if (intent) intent.completed = true;
-        await updateCheckoutJournal(opts.journal.workspaceRoot, opts.journal.relPath, opts.journal.value);
+        await persistJournal();
       }
     }
     try { opts.crashAt?.("after-ref-commit"); } catch (error) { throw new InjectedCheckoutCrash(error); }
     try { opts.crashAt?.("before-index-publish"); } catch (error) { throw new InjectedCheckoutCrash(error); }
-    if (candidate) {
-      await indexHandle.writeFile(candidate);
-      await indexHandle.sync();
-    }
-    await indexHandle.close();
-    indexHandle = undefined;
-    if (candidate) await fs.rename(indexLock, path.join(ctx.gitDir, "index"));
-    else {
-      await fs.rm(path.join(ctx.gitDir, "index"), { force: true });
-      await fs.rm(indexLock, { force: true });
-    }
+    await addTimedMs(opts.chainTimings, "indexOpStateMs", async () => {
+      if (candidate) {
+        await indexHandle!.writeFile(candidate);
+        await indexHandle!.sync();
+      }
+      await indexHandle!.close();
+      indexHandle = undefined;
+      if (candidate) await fs.rename(indexLock, path.join(ctx.gitDir, "index"));
+      else {
+        await fs.rm(path.join(ctx.gitDir, "index"), { force: true });
+        await fs.rm(indexLock, { force: true });
+      }
+    });
     try { opts.crashAt?.("after-index-publish"); } catch (error) { throw new InjectedCheckoutCrash(error); }
-    await restoreOpStateWithCrash(ctx, plan.opState, opts.crashAt);
+    await addTimedMs(opts.chainTimings, "indexOpStateMs", () => restoreOpStateWithCrash(ctx, plan.opState, opts.crashAt));
     await releasePlannedOrigHeadLock();
     await headHandle?.close();
     headHandle = undefined;

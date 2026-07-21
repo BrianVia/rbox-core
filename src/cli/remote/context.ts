@@ -6,6 +6,7 @@
  * commits, keys) reads and mutates ONE instance held by `RboxApi`.
  */
 import { translateRemoteError } from "./errors.js";
+import { timePushTailRequest } from "../push-tail-timing.js";
 import { fetchResilient, type ResilientOpts } from "./resilient.js";
 import { RBOX_VERSION } from "../version.js";
 import { debugEnabled } from "../debug.js";
@@ -136,11 +137,12 @@ export class RemoteContext {
 
   async missingBlobs(shas: string[]): Promise<string[]> {
     if (shas.length === 0) return [];
-    const res = await this.fetch(`${this.baseUrl}/v1/blobs/check`, {
+    const requestBody = JSON.stringify({ shas });
+    const res = await timePushTailRequest("missing", Buffer.byteLength(requestBody), () => this.fetch(`${this.baseUrl}/v1/blobs/check`, {
       method: "POST",
       headers: { ...this.protoAuth, "content-type": "application/json" },
-      body: JSON.stringify({ shas }),
-    }, { op: "checking which blobs to upload" });
+      body: requestBody,
+    }, { op: "checking which blobs to upload" }));
     if (!res.ok) throw new Error(translateRemoteError(res.status, "blobs/check failed", await res.text(), "workspace not found — check you're in the right directory"));
     const body = (await res.json()) as { missing: string[]; uploadGrant?: unknown };
     this.captureUploadGrant(body);
