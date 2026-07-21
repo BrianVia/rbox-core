@@ -1,10 +1,14 @@
 # 175 — Linux git-ref side-channel (a.k.a. 172B): event-driven refs for repos that appear after daemon start
 
-Status: DRAFT v2 (2026-07-21) — round-1 parallel reviews folded (codex xhigh:
-4 BLOCKER + 10 MAJOR, REVIEW-175-R1-CODEX.md; opus: 4 MAJOR, synthesized in
-FOLD-PLAN-175-R1.md). Every finding ruled; rulings cited inline as (C-n)/(O-n).
-Investigation record: `RECOMMENDATION-172B.md` + `PROBE-RESULTS.md`.
-Prereq: design 172 (shipped, v1.7.13).
+Status: DRAFT v3 (2026-07-21) — r1 parallel wave folded in v2 (codex 4B+10M +
+opus 4M); r2 serial review folded here (codex xhigh: 2B+5M+1m+ed,
+REVIEW-175-R2-CODEX.md — both blockers were v2-fold artifacts, now closed:
+reftable detection moved from filesystem layout to `extensions.refStorage`
+config authority; floor formula re-based on dir-backed ownership with pointer
+shapes carved out honestly). Rulings cited inline as (C-n)/(O-n)/(R2-n).
+Investigation record: `RECOMMENDATION-172B.md` + `PROBE-RESULTS.md` (v2
+strengthened probe: PASS 3/3 incl. populated move-in + compiled run + real
+Parcel pressure ≥100 delivered events). Prereq: design 172 (shipped, v1.7.13).
 
 ## Problem (field- and rig-proven; unchanged from v1)
 
@@ -74,8 +78,18 @@ ANY event kind — create, update, AND delete (C-8) — on an exact path-segment
 `git-discover.ts:39` — never `startsWith`, O-5) is a signal-only lifecycle
 input: create/update request discovery; update/delete DIRTY the owning
 registry generation (pointer retarget via in-place rewrite is an `update`;
-delete invalidates ownership even if a recreate coalesces). Candidates ride
-the SAME SignalDebouncer; discovery-negative candidates are cheap no-ops.
+delete invalidates ownership even if a recreate coalesces).
+
+**The debouncer carries payload (R2-7):** the shared seam becomes
+`SignalDebouncer.push(reason, candidate?)` — reason bits OR-accumulate, and
+a BOUNDED per-owner `{dirty, discover}` map records candidate paths;
+update/delete dirtiness is monotonic across a coalesced recreate. Flush
+atomically snapshots and clears both, hands candidate work to targeted
+registry discovery, and only THEN merges the reasons into the queued push
+provenance (raising provenance at raw-event time is wrong: an already-queued
+unrelated file push could dequeue first and be falsely attributed).
+Candidate-map overflow requests ordinary full-plan discovery and remains
+signal-only. Discovery-negative candidates are cheap no-ops.
 
 **Backend policy (normative):** all backends keep today's `isGitRefSignal`
 main-path behavior UNCHANGED (locks stay rejected there — macOS and the
@@ -96,12 +110,22 @@ planning while the lock is still held, the planner defers on `isGitBusy`
 on file deferrals. Without more, a max-wait flush can consume the only usable
 pre-signal and strand the capture until the safety scan.
 
-**Normative:** the push path reports git-busy deferrals to the daemon
-(seam: the same SyncDeps observer below, or a `gitDeferred` field —
-implementation picks, but the DAEMON must see it), and the daemon schedules a
-bounded post-busy recheck: one retry at +2s, one at +8s, then surrender to
-the floor. Test: transaction held past debounce AND max-wait with the final
-target callback suppressed — the pre-signal + busy-retry alone must capture.
+**Normative (R2-4, decision-complete):** `packed-refs.lock` participates in
+BOTH `gitBusy` (`git/shared.ts:562-572` currently omits it) and fingerprint
+invalidation (`fingerprint.ts:204-224` currently omits it) — otherwise a
+trusted fast-path probe carries old packed refs without ever reaching
+`isGitBusy`, reports no deferral, and schedules no retry.
+`SyncDeps.onGitBusyDeferred` is the SOLE reporting seam; it is invoked
+non-throwingly immediately after each completed `planGitSections` result and
+before later state-save/upload/commit work (a terminal-result field would be
+lost to later failures — rejected for the same reason as terminal discovery
+threading). The first report opens ONE workspace episode with absolute +2s
+and +8s retries; reports from those retries do not reset or extend the
+episode; close cancels it; the episode resets after the second retry
+(surrender to the floor). Test: transaction held past debounce AND max-wait
+with the final target callback suppressed — specifically for
+`packed-refs.lock` as well as a branch-ref lock — the pre-signal +
+busy-retry alone must capture.
 
 ## Registry: generations, roles, and the ownership graph (C-2, C-5, C-12, O-2)
 
@@ -137,15 +161,38 @@ handle created after closure is closed before publication; late discovery
 results arriving after close are no-ops (tested explicitly — `stop()` drains
 an in-flight pump AFTER `watcher.close()`, so late results WILL happen).
 
-**Bounds (C-11):** repo count capped at the existing `gitRepoCap()` ceiling
-with deterministic selection (in-tree dir repos in stable path order;
-over-cap repos are floor-eligible, logged once per composition). Descriptor
-budget: JS handles are bounded (≤4/repo) but recursive namespace roots cost
-one inotify wd per DIRECTORY, unbounded per repo. Pre-arm, the registry
-counts namespace dirs itself (cheap bounded walk of `refs/{heads,tags}`); a
-repo over the namespace budget (default 512 dirs) gets NO recursive roots —
-shallow roots still arm, the repo is floor-eligible, one log line. This makes
-"bounded" true rather than claimed.
+**Input serialization and snapshot horizon (R2-6):** all registry inputs
+enter ONE serialized reconcile pump with a monotonic input epoch; only the
+latest generation may publish, and a superseded run closes any handles it
+created. The safety-scan snapshot — the sole SHRINKING input — carries its
+start epoch and a COMPLETENESS bit: it may remove only owners not touched by
+post-start inputs, and any discovery I/O failure (note: `discoverGitRepos`
+converts `readdir` failures into empty listings, `git-discover.ts:35-52` —
+"completed" is not "complete") or relevant epoch advance makes the snapshot
+non-shrinking and preserves the floor until a later complete snapshot.
+Tests: stale attach completing after a newer generation published;
+candidate-armed-repo racing an older in-flight safety snapshot (must NOT be
+erased).
+
+**Bounds (C-11, honest form per R2-3):** repo count capped at the existing
+`gitRepoCap()` ceiling with deterministic selection: ALL admitted repos (dir
+AND pointer) in stable path order; over-cap repos are floor-eligible, logged
+once per composition. JS handles: ≤4/repo for `gitDir === commonDir`, 5 for
+a pointer whose `gitDir !== commonDir`. Descriptor exposure: the strict
+"bounded" claim is WITHDRAWN — Bun performs its own recursive walk after any
+pre-check (`path_watcher.zig:469-477`) and a post-arm populated move-in
+installs wds before JS sees anything (`:659-675`), so no pre-count bounds
+lifetime descriptors. What ships instead:
+- an ADMISSION heuristic: pre-arm streaming walk of `refs/{heads,tags}` —
+  `opendir` streaming, no symlink following, combined heads+tags accounting,
+  visited-entry ceiling (dirs default 512, entries default 8192), stop
+  immediately at budget+1, any read fault ⇒ no-recursive-roots for that repo
+  + pending/floor;
+- a DOCUMENTED exception: growth between count and attach, or a post-arm
+  populated move-in, can exceed the heuristic — the exposure is inotify wd
+  exhaustion, whose failure surfaces on the NEXT attach attempt (visible,
+  retried, floor-pinned) while existing watches keep working. Test both
+  count-to-attach growth and post-arm move-in above budget.
 
 **Retry/backoff (C-11), executable semantics:** per-target exponential —
 base 1s, ×2, cap 60s, ±20% jitter, reset on successful attach; ONE timer
@@ -168,14 +215,19 @@ only after capture/upload/commit success, and races `stop()`.
 
 1. **Initial:** the watcher-start `discoverGitRepos` walk (already exists,
    `watcher.ts:270`) feeds the first reconcile.
-2. **Every plan:** a `SyncDeps` observer (`onGitReposDiscovered`), invoked
-   INSIDE `planGitSections` immediately after discovery — including the
-   genesis branch — carrying `{repoPath, kind}[]`. The REGISTRY resolves
-   contexts itself via `repoCtxFromDisk` (engine-exported, callable from the
-   daemon layer; per-repo resolution failure → pending + floor, not a thrown
-   plan). This fires before any later plan/upload failure can eat it, uses
-   the plan's own walk as the single authority, and adds no `GitPushPlan`
-   field. `SyncDeps` already carries daemon-owned observers (`deps.ts:31-75`).
+2. **Every plan (R2-5, settlement normative):**
+   `SyncDeps.onGitReposDiscovered?: (repos: readonly DiscoveredGitRepo[]) =>
+   Promise<void>` — the exact source contract type (`git-discover.ts:5-12`,
+   `{relPath, kind}`) — is AWAITED immediately after BOTH discovery calls in
+   `planGitSections` (the ordinary path AND the genesis branch, before its
+   early return). It never rejects into planning; it resolves only after
+   each input repo is either published as armed or recorded pending/floor
+   and any arm-handshake push is queued; a closed registry resolves as a
+   no-op. Initial/plan/candidate inputs are ADDITIVE UPSERTS — they never
+   shrink ownership. The REGISTRY resolves contexts itself via
+   `repoCtxFromDisk` (per-repo resolution failure → pending + floor, not a
+   thrown plan). No `GitPushPlan` field is added; `SyncDeps` already carries
+   daemon-owned observers (`deps.ts:31-75`).
 3. **Candidates:** debounced targeted discovery of the candidate subtree
    only.
 4. **Safety-scan completion:** full re-discovery — the ONLY input that may
@@ -191,14 +243,25 @@ no gap.
 ## The floor: imperative, backend-independent, snapshot-cleared (C-6, O-3)
 
 Two separate states:
-- `gitSafetyFloorRequired` (backend-independent): true iff the latest
+- `gitSafetyFloorRequired` (backend-independent, R2-2): true iff the latest
   authoritative snapshot contains ANY in-tree repo of kind `dir`, OR any
-  registry root is armed/attaching/failed, OR reader-death latched. Pointer-
-  only and out-of-root repos do NOT pin — exactly 172's shipped semantics
-  (O-3; preserving, not changing, the current pin behavior). Maintained from
-  plan/scan snapshots, so Linux+Chokidar (which returns no
-  `gitRefWatchActive` and prunes `.git`) now gets the floor it was promised.
+  **dir-owned** registry root is armed/attaching/failed, OR reader-death
+  latched. ONLY dir-backed ownership pins. Pointer-only and out-of-root
+  pointer workspaces do NOT pin — exactly 172's shipped semantics (O-3) —
+  and are therefore EXPLICITLY CARVED OUT of invariant 4 and the
+  event-driven guarantee (a linked worktree whose main clone is in-root is
+  covered via that clone's dir ownership; the pointer-only carve is the rare
+  main-clone-outside-root case, which is scan-carried today and stays so).
+  In-root pointer repos still get best-effort side-channel arming; their
+  root states never feed the floor formula. Maintained from plan/scan
+  snapshots, so Linux+Chokidar (no `gitRefWatchActive`, prunes `.git`) now
+  gets the floor it was promised.
 - `gitSidechannelActive/Pending`: handle states, for logs/telemetry only.
+
+**Containment (R2-2):** every candidate watch root is realpath-canonicalized
+and containment-checked against the sync root before attach —
+`repoCtxFromDisk` is lexical-only (`git/shared.ts:299-328`) and does not
+enforce invariant 5 by itself.
 
 **Imperative pin (C-6):** the tick-time `pinToFloor` read is not enough — a
 quiet tick may have armed a 120–300s timer already. Every false→true
@@ -215,11 +278,25 @@ Invariant-4-as-v1 was FALSE for reftable: the common-dir fingerprint reads
 `packed-refs` + loose `refs` only (`fingerprint.ts:204-224,266-295`) — a
 reftable repo's safety scan can carry a stale trusted fingerprint FOREVER.
 That is silent unboundedness shipping TODAY (pre-dates 175; 172 §"reftable"
-recorded the exception). Resolution: `gitPreflight` gains a STRUCTURAL
-refusal for reftable repos (`refs/heads` absent + `reftable/` present ⇒
-defer with the teachable message pattern used for shallow clones — design 43
-precedent), until a reftable-aware fingerprint exists (explicit non-goal
-here). Invariant 4 then holds honestly for every ADMITTED shape.
+recorded the exception).
+
+**Detection authority is the repository CONFIG, not filesystem layout
+(R2-1):** real reftable (`git init --ref-format=reftable`, reproduced on git
+2.54) creates `.git/reftable/` AND `.git/refs/heads` as a regular sentinel
+FILE — a layout predicate ("refs/heads absent") admits the exact shape it
+must refuse. Normative: a single helper, used by BOTH `gitPreflight` and the
+registry before attach, reads `extensions.refStorage` through the repository
+and structurally refuses the exact value `reftable` for dir and pointer
+repos; filesystem layout is never the authority. Because the trusted carry
+path accepts a cached `preflightOk` without re-running live preflight
+(`plan.ts:671-688`, `divergence-cache.ts:254-273`) and the cache file version
+is the fingerprint version, this change INCREMENTS
+`GIT_FINGERPRINT_SCHEMA_VERSION`, invalidating the divergence cache before
+the refusal ships. Regression test: seed an old-version trusted `preflightOk`
+entry for a reftable repo and prove refusal. The refusal uses the teachable
+defer-message pattern (design 43 shallow precedent); reftable-aware
+fingerprinting stays a non-goal. Invariant 4 then holds honestly for every
+ADMITTED shape.
 
 ## Telemetry rider `git_capture` — cross-surface or not at all (C-4, C-13, O-2)
 
@@ -228,15 +305,22 @@ unknown kinds to `unknown_kind`, DROPS them, and still returns 202
 (`telemetry-ingest.ts:142-148,216-236`), upon which the client deletes the
 samples (`queue.ts:115-128`). Normative scope:
 
-- **Provenance:** a pending-reason bitset {signal, candidate, scan, other}
-  raised at `request("push")` time, SNAPSHOT + cleared when a push dequeues,
-  retained across that push's internal retries (409/epoch recovery), reasons
-  arriving during an active push stay pending for the next one. Attribution
-  is mutually exclusive by precedence signal > candidate > scan > other; the
-  unit is TERMINAL SUCCESSFUL PUSHES (not per-repo captures, not attempts);
-  counted exactly once at terminal success. (C-13's ancestry ambiguity: a
-  push with both signal and scan ancestry counts as `signal` — precedence,
-  deterministic, tested.)
+- **Provenance (boundaries per R2-8):** a pending-reason bitset {signal,
+  candidate, scan, other}. EVERY enqueue flows through `requestPush(reason)`
+  — the direct `want.push`/`requestPush()` sites (scan completion, pull
+  completion, startup, `daemon.ts:515-516,1009-1017,1038-1042`) are
+  converted: debounced ref/lock = signal, debounced `.git` lifecycle =
+  candidate, completed full/deep scan = scan, startup/file/pull/retry/
+  handshake = other. SNAPSHOT + cleared where `want.push` is consumed
+  (`daemon.ts:998-1005`), retained across that push's internal retries
+  (409/epoch recovery); reasons arriving during an active push stay pending
+  for the next one. Attribution mutually exclusive by precedence
+  signal > candidate > scan > other. "Successful" = every normal
+  `pushManifest` return INCLUDING `committed:false`; thrown and
+  terminal-blocked operations do not increment and discard only their active
+  snapshot. `other` emits no `git_capture` counter. Recording happens
+  immediately after the normal `pushManifest` return, before later daemon
+  bookkeeping. Unit = terminal pushes, counted exactly once.
 - **Client:** `git_capture { signalPushes, candidatePushes, scanPushes }`
   additive accumulator in contract.ts + queue (snapshot/removal like
   ws_health) + queue tests.
@@ -282,10 +366,13 @@ Sizing includes `apps/api/**`; deployment rides the normal dev-first flow.
    channel) both derive from it; equivalence on the non-lock subset is
    test-pinned. File-plane exclusion is owned by the hard-exclude
    independently of both.
-4. Every failure mode of an ADMITTED repo shape degrades toward the 60s
-   floor, never silence: visible failures via retry+floor, silent inotify
-   modes via floor retention, reader death via latched floor. Reftable is
-   refused at preflight (not admitted), so no admitted shape is unbounded.
+4. Every failure mode of an ADMITTED, DIR-BACKED repo shape degrades toward
+   the 60s floor, never silence: visible failures via retry+floor, silent
+   inotify modes via floor retention, reader death via latched floor.
+   Reftable is refused (config-authority, not admitted). Pointer-only and
+   out-of-root pointer workspaces are EXPLICITLY outside this guarantee
+   (R2-2 carve): they keep today's scan-carried behavior, best-effort
+   side-channel arming, and no floor pin — 172 parity.
 5. No watch authority outside the sync root.
 6. macOS: implementation MUST keep the `process.platform === "linux"` gate
    on registry construction AND floor eligibility; zero side-channel handles
@@ -314,14 +401,21 @@ Sizing includes `apps/api/**`; deployment rides the normal dev-first flow.
 8. Floor: imperative pin on each transition site; scan-snapshot clear;
    zero-repo release; pointer-only does NOT pin (172 parity); chokidar
    backend gets the floor.
-9. Reftable: preflight refusal with teachable message; admitted-shape
-   invariant holds.
+9. Reftable: config-authority refusal (`extensions.refStorage`) in preflight
+   AND registry pre-attach; the seeded old-version trusted `preflightOk`
+   cache entry is refused post-schema-bump (R2-1); teachable message.
 10. Telemetry: provenance precedence + snapshot/retention across retries +
     exactly-once terminal counting; client accumulator; server drift +
     ingest tests.
 11. Strengthened probe: source-run in CI job; compiled run in release legs;
     macOS zero-handle assertion.
 12. Rig (manual gate): both empty-commit rounds event-driven <30s.
+13. Product-level integration flood test (F8 ruling, restored per R2-9):
+    registry + debouncer + daemon seam under real Parcel churn — the
+    standalone probe has no product imports and is not a substitute for
+    wiring/floor-retention proof.
+14. Provenance enqueue conversion: every former direct `want.push` site
+    flows through `requestPush(reason)` (site-enumerated test).
 
 ## Non-goals
 
@@ -334,5 +428,8 @@ to capture/bundle/encrypt/upload/apply/purge/identity; 173/174 untouched.
 ~450–650 production lines: `src/cli/daemon/git-ref-watch.ts` (~250–320,
 registry+classifier+backoff), watcher.ts (~60–100), SyncDeps observer +
 plan hook (~30–50), daemon wiring + provenance (~60–90), preflight reftable
-(~15–25), telemetry client (~40–60), `apps/api` telemetry (~40–60), CI/
-release workflow edits, Dockerfile pin. Tests ~400–600 lines + probe v2.
+config-authority + fingerprint schema bump (~20–35), telemetry client
+(~40–60), `apps/api` telemetry (~40–60), CI/release workflow edits,
+Dockerfile pin, and the REQUIRED same-PR `docs/CODEMAP.md` entry for the new
+module (ownership + never-own boundary, R2-9). Tests ~400–600 lines +
+probe v2 (already landed).
