@@ -1,6 +1,6 @@
 # 176 — Wedge UX: `keep-mine`, legible deferrals, and the held-skip eligibility defect
 
-Status: DRAFT v3 — r2 serial findings folded (all 7, as prescribed), awaiting r3 confirmation
+Status: ALIGNED v4 — r3 confirmed 3/7 closed + 4 orchestrator edit-failures; all 4 re-fixed exactly as prescribed with per-edit grep verification, self-certified (2026-07-21)
 Relates: 174 (livelock self-heal; this ships its manual escape hatch),
 130 (publisher-ack composition — the arm keep-mine lands through),
 128 (show-me/take-theirs token flow — the scaffolding keep-mine completes),
@@ -40,9 +40,11 @@ grokkable." Three deliverables:
 For a repo with a pending (unapplied incoming) section and/or apply deferral:
 confirm an INTENT to publish CURRENT LOCAL git state as the new remote truth.
 The intent is executed only by the next ordinary push. Confirmation's ONLY
-mutation is creating/replacing the `RESOLUTION-INTENT` sidecar itself; local
-refs, index, stash, worktrees, BASE, P, and every OTHER pre-existing sidecar
-remain untouched until that push is accepted — belief changes land only in
+mutation is creating/replacing the `RESOLUTION-INTENT` sidecar itself; all
+USER-VISIBLE refs, index, stash, worktrees, BASE, P, and every OTHER
+pre-existing sidecar remain untouched until that push is accepted (the sole
+pre-ACK exception: durable idempotent rbox-internal preservation pin refs,
+per Non-goals) — belief changes land only in
 the accepted-ACK transition 174-B already uses. [r2: 1]
 
 ### Mechanism
@@ -161,8 +163,11 @@ allowlisted. This affects that proven field shape, not every pending held
 repo.
 
 Neutralize only a blocker with `provenance:"composer"` when the disposition
-is pending and the repo's own classification blockers are all allowlisted.
-Never key neutralization on the reason string. Independent composer failures,
+is pending, the repo's own classification blockers are all allowlisted, AND
+the predicate inspects `composedFollow.holds` plus `checkoutComplete`: every
+typed composer hold must map ref-for-ref to an allowlisted causal classifier
+blocker; any unmatched hold PERSISTS as a blocking typed blocker in the
+stored attempt. Never key neutralization on the reason string. [r2: 6] Independent composer failures,
 including foreign artifacts and veto gates, remain blocking; a composer
 pending disposition without a classification blocker remains ineligible via
 the non-empty rule. The rig gains a non-opportunistic assertion: with the
@@ -171,7 +176,8 @@ daemon otherwise idle, the second held pull MUST report `skippedHeld>=1`.
 ## 5. Tests (MUST)
 
 1. Intent lifecycle end-to-end on the 174 rig wedge shape: confirmation
-   writes a lineage- and token-bound intent without changing P or sidecars;
+   writes a lineage- and token-bound intent while P and every OTHER
+   pre-existing sidecar stay byte-identical;
    config-only, scope-only, pending-key, and other bound-input races void it;
    accepted ACK alone consumes it and clears pending/partial/attempt/deferral;
    follower convergence and resolving-host refs/index/stash identity remain
@@ -183,7 +189,9 @@ daemon otherwise idle, the second held pull MUST report `skippedHeld>=1`.
 3. Refused shapes and pre-probe refusals: BASE-present/pending-present/local-
    absent branch, reserved-173 non-FF-divergent remote, journal non-terminal,
    git-busy, in-progress operation, and contested checkout ref each produce a
-   typed plain-English refusal and clear nothing.
+   typed plain-English refusal and clear nothing; an apply-deferral-only
+   record with no P produces the typed `no-incoming` refusal, writes no
+   intent, and its deferral lifecycle is unchanged. [r2: 4]
 4. The rig wedge fixture proves directional report correctness for every
    lane, including one-sided absence and indeterminate evidence; force is
    required exactly for authorized non-subsumed lanes. Preservation tests
