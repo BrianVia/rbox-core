@@ -39,9 +39,10 @@ export const SCENARIOS: Record<string, Scenario> = {
  * in the every-PR gate; run it explicitly + nightly instead (design 56 §11's fast/nightly
  * split also omits it). Its wall time is additionally network-variable (resume push + B
  * pull), so it's a poor fit for a tight PR loop regardless. git-commit-propagation is
- * EXCLUDED too (explicit/nightly): it runs two live propagation rounds and, until design
- * 172 lands, its empty-commit round waits out the 60s safety scan — too slow and
- * red-by-design for the every-PR gate. Run it explicitly to guard design 172.
+ * EXCLUDED too (explicit/nightly): it runs a change-shape matrix (commits, file-plane
+ * edits, and a ~200MB repo moved through the dev API) and, until design 172 lands, its
+ * empty-commit rounds wait out the 60s safety scan — too slow and red-by-design for the
+ * every-PR gate. Run it explicitly to guard design 172.
  */
 export const FAST_SUITE = ["onboard-smoke", "two-device-live", "mass-delete-guard", "type-flip", "daemon-idle-cpu", "git-entanglement", "git-join-ahead"] as const;
 
