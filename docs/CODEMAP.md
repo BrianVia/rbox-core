@@ -92,7 +92,7 @@ src/cli/daemon/render.ts     — daemon log-line rendering: scanStatsLine, summa
 src/cli/daemon/logger.ts     — per-daemon synchronous dated-log ownership: append/rollover, crash-channel pointers/fallback, unlink recovery, and filename-date retention. Never: daemon sync state or reader/follow policy.
 src/cli/daemon/ambient-status.ts — ambient daemon/prompt status contracts, validation, projection, and rendering over persisted runtime records. Never: writing daemon status or driving daemon state.
 src/cli/daemon/ambient-status-writer.ts — best-effort atomic persistence/removal of ambient daemon status records. Never: status projection, rendering, or daemon decisions.
-src/cli/daemon/watcher.ts    — native/chokidar watcher adapter, ignore filtering, and settled-event batching. Never: daemon trust/retry policy or sync decisions.
+src/cli/daemon/watcher.ts    — native/chokidar watcher adapter, ignore filtering, settled-file batching, and isolated Git-ref signal debouncing. Never: daemon trust/retry policy or sync decisions.
 src/cli/daemon/watcher-selftest.ts — compiled-release watcher and I/O-priority smoke probe with machine-readable exit codes. Never: production daemon orchestration.
 src/cli/daemon/drift-audit.ts — watcher-drift measurement contracts, persistence, candidate diff/coverage/continuity classification, and bounded pending resolution. Never: scan scheduling, watcher trust policy, or telemetry emission.
 ```
@@ -199,7 +199,7 @@ src/engine/sha256-stream.ts         — pure-JS streaming SHA-256 for the worker
 src/engine/hashcache.ts             — persistent (mtime,size,ctime)→sha256 cache (.rbox/state/hashcache.json). Safe to discard. Never: authoritative identity.
 src/engine/dircache.ts              — persistent per-directory-listing cache driving scan pruning/racy-clean reuse. Owns its cache-correctness invariants. Never: the scan walk itself (manifest.ts).
 src/engine/encrypt-address-cache.ts — persistent plaintext→ciphertext-address cache scoped per account/workspace/epoch. Never: encryption itself.
-src/engine/ignore.ts                — ignore-rule engine: BUILTIN_IGNORE/HARD_PRUNE_DIRS, .rboxignore support, buildIgnoreMatcher. Owns what never syncs. Never: the walk.
+src/engine/ignore.ts                — ignore-rule engine: BUILTIN_IGNORE/HARD_PRUNE_DIRS, .rboxignore support, buildIgnoreMatcher, and the pure watcher-only Git-ref signal predicate. Owns what never syncs. Never: the walk.
 src/engine/crypto.ts                — convergent per-blob AES-256-GCM encrypt/decrypt (design 12), KEK generation/phrase encode, zstd, inline + temp-file encrypt/decrypt paths. Never: pool orchestration (crypto-pool/), key wrapping (e2ee/keys.ts).
 src/engine/fsutil.ts                — filesystem safety primitives: writeFileAtomic, fsyncDirectory, safe plain-directory-chain creation/ancestor publication, assertWithinRoot, RBOX_TMP_PREFIX. Never: domain logic.
 src/engine/pool.ts                  — generic bounded-concurrency poolMap (fail-fast). Never: crypto-pool specifics.
