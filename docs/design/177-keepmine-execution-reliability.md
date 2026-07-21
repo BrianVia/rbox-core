@@ -23,7 +23,8 @@ root presence VETOES publication independently of endpoint equality (r6-1),
 and the staged index tree's object closure is pinned into the bundle — stash
 WIP derives from the live index and cannot be the only carrier of staged-index
 objects (r6-2); receipt removal made atomic-with-or-after the accepted clears
-(r6 §1e note). Round 7 pending.
+(r6 §1e note). r7 verdict ALIGNED (both foldings certified faithful, no new
+substantive hole).
 
 ## Problem (field evidence, 2026-07-21, founder's Mac)
 
