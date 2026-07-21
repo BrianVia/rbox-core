@@ -6,6 +6,23 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.7.14] — 2026-07-21 — new repos sync fast too
+
+### Fixed
+- Repositories created, cloned, or moved into the workspace *while rbox is
+  running* now get the same seconds-fast commit sync as everything else
+  (previously their commit-only changes waited for the periodic safety scan,
+  up to a minute). rbox watches each repository's branch/tag surface directly
+  on Linux; macOS already behaved this way.
+- Repositories using git's experimental `reftable` format are now refused for
+  git history sync with a clear message (previously their commits could
+  silently stop syncing while files continued). Standard-format repositories
+  are unaffected.
+
+### Added
+- Sync-trigger telemetry so the fleet dashboard can chart how commits get
+  detected (instant signal vs periodic scan). Opt out with `RBOX_TELEMETRY=0`.
+
 ## [1.7.13] — 2026-07-21 — commits sync in seconds
 
 ### Changed
