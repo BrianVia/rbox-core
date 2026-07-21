@@ -174,14 +174,19 @@ export const gitHeldLivelock: Scenario = {
           const push = await ctx.a.rboxShell(`cd '${GUEST.workDir}' && RBOX_GIT_PENDING_SUPERSEDE=0 bun ${GUEST.cliEntry} push`, { allowFail: true });
           const pull = await ctx.a.rbox(["pull", "--verbose"], { cwd: GUEST.workDir, allowFail: true });
           const text = pull.stdout + pull.stderr;
-          return !/working tree differs|index differs/.test(text);
+          // Settled = the full follow's deferral names ONLY git-plane blockers,
+          // OR the pull already skips silently (v6 allowlist: a skipping pull
+          // prints no deferral line at all — that IS the hold working cheaply).
+          return (heldRe.test(text) && !/working tree differs/.test(text)) || skippedHeldRe.test(text);
         }, done: (v) => v === true, timeoutMs: PROPAGATE_TIMEOUT_MS, intervalMs: HEAD_POLL_MS });
         if (!out.ok) throw new Error("A's file plane never settled — oracle blockers persist");
       });
       await rec.step("[A] explicit pull while daemon idle — HOLDS (pending ⊑ local)", async () => {
         const pull = await ctx.a.rbox(["pull", "--verbose"], { cwd: GUEST.workDir });
         const firstHeldPull = pull.stdout + pull.stderr;
-        if (!heldRe.test(firstHeldPull)) throw new Error(`A never held ${REPO} on the first idle pull — seed did not take`);
+        if (!heldRe.test(firstHeldPull) && !skippedHeldRe.test(firstHeldPull)) {
+          throw new Error(`A never held ${REPO} on the first idle pull — seed did not take`);
+        }
       });
       rec.assert("seed: A holds with local main untouched", (await gitHead(ctx.a, repoDir)) === headY,
         `A HEAD must remain Y (${headY.slice(0, 8)}) while the incoming section is held`);
