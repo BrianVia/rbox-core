@@ -17,6 +17,16 @@ export interface GitPreflightResult {
   structural?: boolean;
 }
 
+/** Repository config is the sole authority for the ref-storage format. */
+export async function gitRefStorage(repoDir: string): Promise<string | undefined> {
+  try {
+    const value = await git(repoDir, ["config", "--local", "--get", "extensions.refStorage"]);
+    return value || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 // ---- preflight (design 43 §4) ------------------------------------------------
 
 /** Preflight: ordinary non-bare repos whose toplevel IS `repoDir` — as a real `.git`
@@ -37,6 +47,14 @@ export async function gitPreflight(repoDir: string, knownCtx?: RepoCtx | null): 
   const ctx = knownCtx === null ? undefined : knownCtx ?? (await repoCtx(repoDir));
   if (!ctx) {
     return { ok: false, reason: kind === "pointer" ? "dangling .git pointer (main clone missing?)" : "unreadable .git — unsupported", kind };
+  }
+  if (await gitRefStorage(repoDir) === "reftable") {
+    return {
+      ok: false,
+      reason: "reftable ref storage is unsupported — convert this repository to files refs before syncing Git history",
+      kind,
+      structural: true,
+    };
   }
   if (!(await gitOk(repoDir, ["rev-parse", "--is-inside-work-tree"]))) return { ok: false, reason: "not a work tree", kind, structural: true };
   if ((await git(repoDir, ["rev-parse", "--is-bare-repository"]).catch(() => "")) !== "false") return { ok: false, reason: "bare repo — unsupported", kind, structural: true };

@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { cleanGitEnv, gitBusy, gitRaw, readLocalGitConfigEntries, setGitSpawnObserver, type RepoCtx } from "./shared.js";
+import { gitPreflight, gitRefStorage } from "./preflight.js";
 
 const exec = promisify(execFile);
 const TEST_GIT_ENV = {
@@ -118,4 +119,28 @@ describe("gitBusy common-config lock", () => {
     const ctx: RepoCtx = { repoDir: root, kind: "pointer", gitDir, commonDir };
     expect(await gitBusy(ctx)).toBe(false);
   });
+
+  test("packed-refs.lock in the common dir marks every worktree busy", async () => {
+    const root = await tempDir();
+    const gitDir = path.join(root, "worktree-gitdir");
+    const commonDir = path.join(root, "common.git");
+    await fs.mkdir(path.join(commonDir, "refs"), { recursive: true });
+    await fs.mkdir(gitDir, { recursive: true });
+    const ctx: RepoCtx = { repoDir: root, kind: "pointer", gitDir, commonDir };
+    await fs.writeFile(path.join(commonDir, "packed-refs.lock"), "held");
+    expect(await gitBusy(ctx)).toBe(true);
+  });
+});
+
+test("reftable refusal uses extensions.refStorage config authority and a teachable structural result", async () => {
+  const root = await tempDir();
+  await exec("git", ["-C", root, "init", "--ref-format=reftable", "-q"], { env: TEST_GIT_ENV });
+  expect(await gitRefStorage(root)).toBe("reftable");
+  expect((await fs.lstat(path.join(root, ".git", "refs", "heads"))).isFile()).toBe(true); // layout is not authority
+  expect(await gitPreflight(root)).toEqual(expect.objectContaining({
+    ok: false,
+    kind: "dir",
+    structural: true,
+    reason: expect.stringMatching(/reftable.*unsupported.*convert/i),
+  }));
 });

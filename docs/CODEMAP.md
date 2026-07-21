@@ -93,6 +93,7 @@ src/cli/daemon/logger.ts     — per-daemon synchronous dated-log ownership: app
 src/cli/daemon/ambient-status.ts — ambient daemon/prompt status contracts, validation, projection, and rendering over persisted runtime records. Never: writing daemon status or driving daemon state.
 src/cli/daemon/ambient-status-writer.ts — best-effort atomic persistence/removal of ambient daemon status records. Never: status projection, rendering, or daemon decisions.
 src/cli/daemon/watcher.ts    — native/chokidar watcher adapter, ignore filtering, settled-file batching, and isolated Git-ref signal debouncing. Never: daemon trust/retry policy or sync decisions.
+src/cli/daemon/git-ref-watch.ts — Linux bounded Git-ref side-channel classification + GitRefWatchRegistry (§2.7 — one ownership/reconcile/backoff/close-fence state machine). Never: manifest/file-plane events, sync planning, safety cadence, or telemetry attribution.
 src/cli/daemon/watcher-selftest.ts — compiled-release watcher and I/O-priority smoke probe with machine-readable exit codes. Never: production daemon orchestration.
 src/cli/daemon/drift-audit.ts — watcher-drift measurement contracts, persistence, candidate diff/coverage/continuity classification, and bounded pending resolution. Never: scan scheduling, watcher trust policy, or telemetry emission.
 ```

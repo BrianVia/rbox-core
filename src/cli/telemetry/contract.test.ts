@@ -13,7 +13,7 @@ import {
 
 describe("telemetry wire contract", () => {
   test("pins sample kinds, enum axes, and corpus thresholds", () => {
-    expect(TELEMETRY_KINDS).toEqual(["propagation", "first_publish", "upload_lane", "capability", "safety_event", "ws_health"]);
+    expect(TELEMETRY_KINDS).toEqual(["propagation", "first_publish", "upload_lane", "capability", "safety_event", "git_capture", "ws_health"]);
     expect(TRANSPORTS).toEqual(["batch", "pack", "single"]);
     expect(FILL_VERSIONS).toEqual(["v1", "v2"]);
     expect(SAFETY_EVENT_TYPES).toEqual(["mass_delete_breaker", "scan_fault"]);
@@ -28,6 +28,7 @@ describe("telemetry wire contract", () => {
 
   test("pins numeric domains and all fifteen deferral reasons", () => {
     expect(TELEMETRY_SAMPLE_SCHEMAS.upload_lane.numbers.bytes.max).toBe(10_000_000_000_000);
+    expect(Object.keys(TELEMETRY_SAMPLE_SCHEMAS.git_capture.numbers)).toEqual(["signalPushes", "candidatePushes", "scanPushes"]);
     expect(TELEMETRY_SAMPLE_SCHEMAS.propagation.numbers.deliveryToApplyMs).toEqual({ min: 0, max: 604_800_000, integer: true });
     expect(Object.keys(TELEMETRY_SAMPLE_SCHEMAS.ws_health.numbers)).toEqual([
       "windowMs", "wsConnectedMs", "wsReconnects", "wsHalfOpenDetected", "backstopAttempts",

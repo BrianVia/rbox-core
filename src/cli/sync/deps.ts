@@ -5,6 +5,7 @@ import {
   createScanStats,
   scanPruneEnabled,
   type Action,
+  type DiscoveredGitRepo,
   type ScanStats,
 } from "../../engine/index.js";
 import type { SyncState, WorkspaceConfig } from "../config.js";
@@ -73,6 +74,11 @@ export interface SyncDeps {
   /** Called immediately after a state save that may set/clear durable Git
    * deferrals. Observability-only: callers must not throw or mutate the state. */
   onGitDeferralsSaved?: (state: SyncState) => void;
+  /** Daemon-owned additive Git discovery observer. It settles only after every
+   * input is armed or recorded pending; planning never inherits observer errors. */
+  onGitReposDiscovered?: (repos: readonly DiscoveredGitRepo[]) => Promise<void>;
+  /** Sole prompt-retry report for a completed plan that deferred on Git locks. */
+  onGitBusyDeferred?: (repos: readonly string[]) => void;
   /** Per-repo progress during the pull-side git-apply loop (`done` advances once per
    *  repo examined, including no-op "unchanged" ones) — lets a CLI collapse the N
    *  per-repo `onGitLog` lines into a single updating "N/total" counter instead. */

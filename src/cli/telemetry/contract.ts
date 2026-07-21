@@ -59,6 +59,14 @@ export const TELEMETRY_SAMPLE_SCHEMAS = {
     numbers: { count: COUNT_DOMAIN },
     enums: { eventType: SAFETY_EVENT_TYPES },
   },
+  git_capture: {
+    numbers: {
+      signalPushes: WS_HEALTH_COUNT_DOMAIN,
+      candidatePushes: WS_HEALTH_COUNT_DOMAIN,
+      scanPushes: WS_HEALTH_COUNT_DOMAIN,
+    },
+    enums: {},
+  },
   ws_health: {
     numbers: {
       windowMs: MS_DOMAIN,
@@ -114,6 +122,7 @@ export interface FirstPublishSample { kind: "first_publish"; timeToFilesSyncedMs
 export interface UploadLaneSample { kind: "upload_lane"; transport: LaneTransport; bytes: number; uploadMs: number; opCount: number; fillVersion: FillVersion }
 export interface CapabilitySample { kind: "capability"; workerExecutions: number }
 export interface SafetyEventSample { kind: "safety_event"; eventType: SafetyEventType; count: number }
+export interface GitCaptureSample { kind: "git_capture"; signalPushes: number; candidatePushes: number; scanPushes: number }
 export interface WsHealthSample {
   kind: "ws_health";
   windowMs: number;
@@ -128,7 +137,7 @@ export interface WsHealthSample {
   notifyLatencySumMs: number;
   notifyLatencyMaxMs: number;
 }
-export type TelemetrySample = PropagationSample | FirstPublishSample | UploadLaneSample | CapabilitySample | SafetyEventSample | WsHealthSample;
+export type TelemetrySample = PropagationSample | FirstPublishSample | UploadLaneSample | CapabilitySample | SafetyEventSample | GitCaptureSample | WsHealthSample;
 export interface TelemetryEnvelope { v: 1; samples: TelemetrySample[] }
 
 export interface SyncState {

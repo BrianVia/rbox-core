@@ -143,18 +143,23 @@ test("files-first defaults ON with the env unset; =0 disables", () => {
 // ── 1. flag OFF: git captured inline (byte-identical legacy path) ───────────
 test("flag OFF: genesis captures git INLINE at commit 1 (no files-first)", async () => {
   await repoWithFile();
+  const observed: string[][] = [];
+  deps.onGitReposDiscovered = async (repos) => { await Promise.resolve(); observed.push(repos.map((repo) => repo.relPath)); };
   const r = await push(root, cfg, deps);
   expect(r.committed).toBe(true);
   expect(r.gitDeferred).toBeFalsy();
   expect(r.sequence).toBe(1);
   expect(gitKeys(remote.manifestAt(1))).toEqual(["repo"]); // git in commit 1
   expect(remote.gitPutCalls).toBeGreaterThan(0);
+  expect(observed).toEqual([["repo"]]);
 });
 
 // ── 2. genesis files-first fires: commit 1 files-only, commit 2 attaches git ─
 test("flag ON genesis: commit 1 files-only, gitDeferred, commit 2 attaches git", async () => {
   process.env.RBOX_FILES_FIRST = "1";
   await repoWithFile();
+  const observed: string[][] = [];
+  deps.onGitReposDiscovered = async (repos) => { await Promise.resolve(); observed.push(repos.map((repo) => repo.relPath)); };
 
   const r1 = await push(root, cfg, deps);
   expect(r1.committed).toBe(true);
@@ -164,6 +169,7 @@ test("flag ON genesis: commit 1 files-only, gitDeferred, commit 2 attaches git",
   expect(gitKeys(m1)).toEqual([]); // NO git in commit 1
   expect(m1.files.some((f) => f.path === "repo/a.txt")).toBe(true); // files present
   expect(remote.gitPutCalls).toBe(0); // no git blob uploaded during commit 1
+  expect(observed).toEqual([["repo"]]); // genesis early-return site is observed and awaited
 
   const r2 = await push(root, cfg, deps);
   expect(r2.committed).toBe(true);
@@ -171,6 +177,7 @@ test("flag ON genesis: commit 1 files-only, gitDeferred, commit 2 attaches git",
   expect(r2.sequence).toBe(2);
   expect(gitKeys(remote.manifestAt(2))).toEqual(["repo"]); // git attached in commit 2
   expect(remote.gitPutCalls).toBeGreaterThan(0);
+  expect(observed).toEqual([["repo"], ["repo"]]);
 });
 
 // ── 2b. syncGit workspace with NO repos: files-first does not signal a wasted commit 2 ─

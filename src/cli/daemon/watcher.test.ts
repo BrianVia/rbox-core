@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { buildIgnoreMatcher, captureGitState, type BlobStore, type WatchEvent } from "../../engine/index.js";
-import { createBatcher, startWatcher, type Watcher } from "./watcher.js";
+import { createBatcher, startWatcher, type GitSignalBatch, type Watcher } from "./watcher.js";
 
 // These exercise the DEFAULT (@parcel/watcher) backend end-to-end on a real temp
 // tree: the design-§41 swap that took the founder's workspace from ~11 GB / 330 s
@@ -217,6 +217,26 @@ test("batcher coalesces a burst of many events across paths into one settled bat
   b.dispose();
   expect(batches).toHaveLength(1);
   expect(new Map(batches[0]!.map((e) => [e.relPath, e.kind]))).toEqual(new Map([["a.ts", "change"], ["b.ts", "add"]]));
+});
+
+test("chokidar keeps exact .git lifecycle events signal-only", async () => {
+  const root = tmpRoot();
+  const repo = path.join(root, "repo");
+  fs.mkdirSync(repo);
+  const settled: WatchEvent[] = [];
+  const raw: WatchEvent[] = [];
+  const signals: GitSignalBatch[] = [];
+  active = await startWatcher(root, buildIgnoreMatcher(root), (events) => settled.push(...events), {
+    backend: "chokidar",
+    debounceMs: 30,
+    onRawEvent: (event) => raw.push(event),
+    onGitSignal: (batch) => signals.push(batch),
+  });
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  await git(repo, "init", "--initial-branch=main", "--quiet");
+  expect(await waitFor(() => signals.some((batch) => batch.reasons.candidate))).toBe(true);
+  expect(settled.some((event) => event.relPath.split("/").includes(".git"))).toBe(false);
+  expect(raw.some((event) => event.relPath.split("/").includes(".git"))).toBe(false);
 });
 
 test("batcher maxWait cap flushes a sustained burst even without a quiet gap", async () => {

@@ -89,16 +89,18 @@ describe("POST /v1/telemetry", () => {
       { kind: "upload_lane", transport: "pack", bytes: 1_000_000, uploadMs: 1_000, opCount: 2, fillVersion: "v2" },
       { kind: "capability", workerExecutions: 4 },
       { kind: "safety_event", eventType: "scan_fault", count: 3 },
+      { kind: "git_capture", signalPushes: 5, candidatePushes: 6, scanPushes: 7 },
       { kind: "ws_health", windowMs: 120_000, wsConnectedMs: 110_000, wsReconnects: 1, wsHalfOpenDetected: 2, backstopAttempts: 3, backstopAppliedPulls: 4, cursorAppliedPulls: 0, notifyAppliedPulls: 5, notifyLatencyCount: 6, notifyLatencySumMs: 7_000, notifyLatencyMaxMs: 2_000 },
     ] }), testEnv(points), devicePrincipal(a));
     expect(res.status).toBe(202);
-    expect(await res.json()).toEqual({ accepted: 6, dropped: 0 });
+    expect(await res.json()).toEqual({ accepted: 7, dropped: 0 });
     expect(points).toEqual([
       { indexes: ["client.propagation"], blobs: ["client.propagation"], doubles: [7] },
       { indexes: ["client.first_publish"], blobs: ["client.first_publish", "s"], doubles: [11, 12, 101, 9] },
       { indexes: ["client.upload_lane"], blobs: ["client.upload_lane", "pack", "v2"], doubles: [8, 1_000_000, 1_000, 2] },
       { indexes: ["client.capability"], blobs: ["client.capability"], doubles: [4] },
       { indexes: ["client.safety_event"], blobs: ["client.safety_event", "scan_fault"], doubles: [3] },
+      { indexes: ["client.git_capture"], blobs: ["client.git_capture"], doubles: [5, 6, 7] },
       { indexes: ["client.ws_health"], blobs: ["client.ws_health"], doubles: [120_000, 110_000, 1, 2, 3, 4, 0, 5, 6, 7_000, 2_000] },
     ]);
   });

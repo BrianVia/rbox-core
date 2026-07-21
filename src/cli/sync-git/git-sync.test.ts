@@ -1172,12 +1172,16 @@ test("push: a locked (busy) repo defers with base carry — no raw-identity capt
   await commitFile(r, "f.txt", "v2", "c2");
   await fs.writeFile(path.join(r, ".git", "index.lock"), ""); // repo is mid-operation
   await fs.writeFile(path.join(rootA, "x.txt"), "x");
-  await push(rootA, cfgA, depsA);
+  const reports: string[][] = [];
+  await push(rootA, cfgA, { ...depsA, onGitBusyDeferred: (repos) => reports.push([...repos]) });
   expect((await remote.latest()).manifest.gitRepos!["r"]!.bundleEncSha).toBe(base.bundleEncSha); // base carried
   expect(logsA.some((l) => l.includes("r: git busy"))).toBe(true);
+  expect(reports).toEqual([["r"]]);
 
   await fs.rm(path.join(r, ".git", "index.lock"));
-  await push(rootA, cfgA, depsA); // quiesced → captures v2
+  const quietReports: string[][] = [];
+  await push(rootA, cfgA, { ...depsA, onGitBusyDeferred: (repos) => quietReports.push([...repos]) }); // quiesced → captures v2
+  expect(quietReports).toEqual([[]]);
   expect((await remote.latest()).manifest.gitRepos!["r"]!.bundleEncSha).not.toBe(base.bundleEncSha);
 }, 20_000);
 

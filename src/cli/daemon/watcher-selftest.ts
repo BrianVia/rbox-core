@@ -4,6 +4,7 @@ import path from "node:path";
 import { buildIgnoreMatcher } from "../../engine/index.js";
 import { lowerIoPriority, verifyIoPriority } from "../io-priority.js";
 import { startWatcher, type Watcher } from "./watcher.js";
+import { GitRefWatchRegistry, gitRefSideChannelEligible } from "./git-ref-watch.js";
 
 /**
  * Hidden release self-check (design §41 §6). Run from the COMPILED release binary on the
@@ -70,6 +71,19 @@ export async function watcherSelfTest(dirArg?: string, opts: { timeoutMs?: numbe
     await watcher?.close().catch(() => {});
     if (createdTemp) fs.rmSync(base, { recursive: true, force: true });
   }
+}
+
+/** Native release assertion for the deliberately unsupported Darwin side-channel. */
+export async function gitRefWatchPlatformSelfTest(): Promise<number> {
+  const createdTemp = fs.mkdtempSync(path.join(os.tmpdir(), "rbox-refwatch-platform-"));
+  const eligible = gitRefSideChannelEligible();
+  const registry = eligible ? new GitRefWatchRegistry({ root: fs.realpathSync(createdTemp) }) : undefined;
+  const handles = registry?.state.activeHandles ?? 0;
+  await registry?.close();
+  fs.rmSync(createdTemp, { recursive: true, force: true });
+  const ok = process.platform !== "darwin" || (!eligible && handles === 0);
+  console.log(`GIT_REFWATCH_SELFTEST ${ok ? "ok" : "fail"} eligible=${eligible} handles=${handles} platform=${process.platform}-${process.arch}`);
+  return ok ? 0 : 1;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));

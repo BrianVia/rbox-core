@@ -8,11 +8,14 @@ import { createWrapper } from "@parcel/watcher/wrapper";
 import {
   discoverGitRepos,
   isGitRefSignal,
+  MAX_GIT_REPOS,
   nativePruneGlobs,
   type IgnoreMatcher,
+  type DiscoveredGitRepo,
   type WatchEvent,
   type WatchEventKind,
 } from "../../engine/index.js";
+import { classifyRepoCandidate, type RepoCandidateWork } from "./git-ref-watch.js";
 
 export interface Watcher {
   /** True only when Parcel found an in-tree directory-backed repo whose refs are
@@ -38,8 +41,12 @@ export interface WatchOptions {
   onError?: (err: Error) => void;
   /** Fires after matcher filtering and before debounce coalescing. */
   onRawEvent?: (event: WatchEvent) => void;
-  /** Ref-surface activity is a push signal only; it never enters the file batch. */
-  onGitSignal?: () => void;
+  /** Ref/candidate activity is signal-only; it never enters the file batch. */
+  onGitSignal?: (batch: GitSignalBatch) => void | Promise<void>;
+  /** Daemon-owned shared debouncer, also used by registry arm handshakes. */
+  signalDebouncer?: SignalDebouncer;
+  /** Initial watcher-start discovery, awaited before readiness. */
+  onInitialGitRepos?: (repos: readonly DiscoveredGitRepo[]) => Promise<void>;
 }
 
 const EVENT_KIND: Record<string, WatchEventKind | undefined> = {
@@ -96,8 +103,17 @@ export interface Batcher {
 }
 
 export interface SignalDebouncer {
-  push(): void;
+  push(reason: GitSignalReason, candidate?: RepoCandidateWork): void;
   dispose(): void;
+}
+
+export type GitSignalReason = "signal" | "candidate" | "other";
+
+export interface GitSignalBatch {
+  readonly reasons: Readonly<{ signal: boolean; candidate: boolean; other: boolean }>;
+  readonly candidates: readonly RepoCandidateWork[];
+  /** Candidate-map overflow degrades to ordinary full-plan discovery. */
+  readonly discoverAll: boolean;
 }
 
 /**
@@ -138,19 +154,58 @@ export function createBatcher(onSettle: (events: WatchEvent[]) => void, debounce
 }
 
 /** Independent debounce for watch-only signals that must never enter file batches. */
-export function createSignalDebouncer(onSignal: (() => void) | undefined, debounceMs: number, maxWaitMs: number): SignalDebouncer {
+export function createSignalDebouncer(
+  onSignal: ((batch: GitSignalBatch) => void | Promise<void>) | undefined,
+  debounceMs: number,
+  maxWaitMs: number,
+  candidateCap = MAX_GIT_REPOS
+): SignalDebouncer {
+  if (!Number.isInteger(candidateCap) || candidateCap < 1) throw new Error("candidateCap must be a positive integer");
   let timer: ReturnType<typeof setTimeout> | undefined;
   let firstSignalAt = 0;
+  let signal = false;
+  let candidateReason = false;
+  let other = false;
+  let discoverAll = false;
+  let candidates = new Map<string, RepoCandidateWork>();
 
   const flush = () => {
     if (timer) clearTimeout(timer);
     timer = undefined;
     firstSignalAt = 0;
-    onSignal?.();
+    if (!signal && !candidateReason && !other) return;
+    // Snapshot and clear atomically before handing work to async consumers. A
+    // callback-triggered push therefore belongs to the next debounce window.
+    const batch: GitSignalBatch = {
+      reasons: { signal, candidate: candidateReason, other },
+      candidates: [...candidates.values()],
+      discoverAll,
+    };
+    signal = false;
+    candidateReason = false;
+    other = false;
+    discoverAll = false;
+    candidates = new Map();
+    void onSignal?.(batch);
   };
 
   return {
-    push() {
+    push(reason, candidate) {
+      if (reason === "signal") signal = true;
+      else if (reason === "candidate") candidateReason = true;
+      else other = true;
+      if (candidate && !discoverAll) {
+        const prior = candidates.get(candidate.owner);
+        if (prior) {
+          prior.dirty ||= candidate.dirty;
+          prior.discover ||= candidate.discover;
+        } else if (candidates.size < candidateCap) {
+          candidates.set(candidate.owner, { ...candidate });
+        } else {
+          candidates.clear();
+          discoverAll = true;
+        }
+      }
       const now = Date.now();
       if (firstSignalAt === 0) firstSignalAt = now;
       if (timer) clearTimeout(timer);
@@ -161,6 +216,11 @@ export function createSignalDebouncer(onSignal: (() => void) | undefined, deboun
       if (timer) clearTimeout(timer);
       timer = undefined;
       firstSignalAt = 0;
+      signal = false;
+      candidateReason = false;
+      other = false;
+      discoverAll = false;
+      candidates.clear();
     },
   };
 }
@@ -256,7 +316,7 @@ async function startParcel(
   const maxWaitMs = opts.maxWaitMs ?? 3000;
   const wrapper = loadParcelWrapper();
   const batcher = createBatcher(onSettle, debounceMs, maxWaitMs);
-  const signalDebouncer = createSignalDebouncer(opts.onGitSignal, debounceMs, maxWaitMs);
+  const signalDebouncer = opts.signalDebouncer ?? createSignalDebouncer(opts.onGitSignal, debounceMs, maxWaitMs);
   // @parcel/watcher reports event paths as REAL paths (symlinks resolved). If the
   // watched root has a symlinked component (e.g. macOS `/tmp` → `/private/tmp`),
   // relativizing against the un-resolved root yields `../…` and silently drops
@@ -265,11 +325,12 @@ async function startParcel(
   const realRoot = safeRealpath(root);
   const toRel = toRelFor(realRoot);
   // Kicked off before subscribe and awaited after: the ignore-pruned repo walk
-  // only feeds `gitRefWatchActive` (the Linux floor pin), so it must not delay
-  // watch readiness on large workspaces.
-  const gitRefWatchActivePromise = discoverGitRepos(realRoot, matcher).then((repos) =>
-    repos.some((repo) => repo.kind === "dir")
-  );
+  // feeds initial registry ownership (and the legacy activity bit) without
+  // delaying native subscription startup on large workspaces.
+  const gitRefWatchActivePromise = discoverGitRepos(realRoot, matcher).then(async (repos) => {
+    await opts.onInitialGitRepos?.(repos);
+    return repos.some((repo) => repo.kind === "dir");
+  });
 
   const sub = await wrapper.subscribe(
     realRoot,
@@ -286,11 +347,17 @@ async function startParcel(
         const rel = toRel(ev.path);
         if (rel === "" || escapesRoot(rel)) continue;
 
+        const candidate = classifyRepoCandidate(rel, ev.type);
+        if (candidate) {
+          signalDebouncer.push("candidate", candidate);
+          continue;
+        }
+
         // This classification is deliberately before BOTH Parcel's delete fork
         // and the authoritative sync matcher. A ref signal is routed through its
         // own seam and can therefore never become a file WatchEvent.
         if (isGitRefSignal(rel)) {
-          signalDebouncer.push();
+          signalDebouncer.push("signal");
           continue;
         }
 
@@ -355,6 +422,7 @@ function startChokidar(
   const debounceMs = opts.debounceMs ?? 400;
   const maxWaitMs = opts.maxWaitMs ?? 3000;
   const batcher = createBatcher(onSettle, debounceMs, maxWaitMs);
+  const signalDebouncer = opts.signalDebouncer ?? createSignalDebouncer(opts.onGitSignal, debounceMs, maxWaitMs);
   const toRel = toRelFor(root);
 
   const watcher = chokidar.watch(root, {
@@ -364,6 +432,7 @@ function startChokidar(
     ignored: (p: string, stats?: { isDirectory(): boolean }) => {
       const rel = toRel(p);
       if (rel === "" || escapesRoot(rel)) return false; // the root itself
+      if (classifyRepoCandidate(rel, "create")) return false; // admit only the lifecycle entry; descendants remain pruned
       // The classifier stays ahead of the shared matcher, but `.git/` itself is
       // still pruned below, so Chokidar remains intentionally scan-bound for Git.
       if (isGitRefSignal(rel)) return true;
@@ -377,12 +446,21 @@ function startChokidar(
     if (!kind) return;
     const rel = toRel(abs);
     if (rel === "" || escapesRoot(rel)) return; // parity with the parcel path
+    const candidateKind = kind === "add" || kind === "addDir" ? "create"
+      : kind === "change" ? "update"
+      : "delete";
+    const candidate = classifyRepoCandidate(rel, candidateKind);
+    if (candidate) {
+      signalDebouncer.push("candidate", candidate);
+      return;
+    }
     pushWatchEvent(batcher, opts, rel, kind);
   });
 
   return {
     async close() {
       batcher.dispose();
+      signalDebouncer.dispose();
       await watcher.close();
     },
   };

@@ -75,6 +75,11 @@ jobs:
           RBOX_RELEASE_KEY_ID: ${{ secrets.RBOX_RELEASE_KEY_ID }}
         run: bun scripts/release.ts "${GITHUB_REF_NAME#v}" --no-upload
 
+      - name: Compile Linux Bun ref-watch contract probes
+        run: |
+          bun build --compile --target=bun-linux-x64 scripts/probe/bun-refwatch-contract.ts --outfile dist/bun-refwatch-contract-linux-x64
+          bun build --compile --target=bun-linux-arm64 scripts/probe/bun-refwatch-contract.ts --outfile dist/bun-refwatch-contract-linux-arm64
+
       - name: Upload built + signed dist as an artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -112,6 +117,15 @@ jobs:
           bin="dist/rbox-${{ matrix.target }}"
           chmod +x "$bin"
           "$bin" __watcher-selftest
+      - name: Run compiled Linux Bun ref-watch contract (${{ matrix.target }})
+        if: startsWith(matrix.target, 'linux-')
+        run: |
+          probe="dist/bun-refwatch-contract-${{ matrix.target }}"
+          chmod +x "$probe"
+          RBOX_REFWATCH_PROBE_COMPILED_CHILD=1 "$probe"
+      - name: Assert zero Darwin side-channel handles
+        if: startsWith(matrix.target, 'darwin-')
+        run: dist/rbox-${{ matrix.target }} __git-refwatch-platform-selftest
 
   # 3) PUBLISH — gated on ALL smoke legs. Upload the EXACT built+signed+smoked bytes to R2
   #    (release.ts --upload-only re-verifies each binary's sha against the signed manifest).

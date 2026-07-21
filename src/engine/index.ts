@@ -1,6 +1,7 @@
 export type { FileEntry, FileType, Manifest, GitSection, GitRefScope, GitRefTombstone, GitArtifactRef, GitPackLink } from "./types.js";
 export {
   gitPreflight,
+  gitRefStorage,
   gitIdentity,
   captureGitState,
   normalizeSymbolicHeadCasing,
@@ -109,7 +110,7 @@ export {
   type ProtocolLockTraceEvent,
   type RepositoryProtocolFenceRequest,
 } from "./git-state.js";
-export { discoverGitRepos, type DiscoveredGitRepo } from "./git-discover.js";
+export { discoverGitRepos, discoverGitReposUnder, type DiscoveredGitRepo } from "./git-discover.js";
 export {
   generateKek,
   kekToPhrase,
@@ -147,8 +148,10 @@ export { cryptoPoolStatus, shutdownCryptoPool, withCryptoPool, type CryptoPoolSt
 export { hashFile, hashBytes } from "./hash.js";
 export {
   BUILTIN_IGNORE,
+  GIT_REF_SIGNAL_TAIL_TABLE,
   HARD_PRUNE_DIRS,
   isGitRefSignal,
+  isGitRefSignalTail,
   nativePruneGlobs,
   buildIgnoreMatcher,
   effectiveIgnoreRules,

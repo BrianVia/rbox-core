@@ -400,8 +400,14 @@ async function runPushAttempt(
       disableConfigLane: workspaceSyncMutexDegraded(deps.syncMutex),
       degradedMutex: workspaceSyncMutexDegraded(deps.syncMutex),
       filesFirstDefer,
+      onGitReposDiscovered: deps.onGitReposDiscovered,
     })
   );
+  const busyRepos = Object.entries(gitPlan.captureDeferrals)
+    .filter(([, reason]) => reason === "git-busy")
+    .map(([relPath]) => relPath)
+    .sort();
+  try { deps.onGitBusyDeferred?.(busyRepos); } catch { /* daemon observer is non-throwing */ }
   // Visibility is durable as soon as planning settles. This sidecar-only packet carries
   // the accepted sequence and therefore cannot claim a candidate commit that later fails.
   const deferralUpdates: Record<string, OrderedGitDeferralUpdates> = {};

@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { GitCaptureDeferredError, artifactBinding, discoverGitRepos, gitIdentity, gitIdentityKey, gitPreflight, inTreeWorktreeParentRel, isGitBusy, isPresentButUnreadableError, gitSectionBlobRefs, readRepoIdentityV1, readStateLineageV1, repoCtxFromDisk, poolMap, type GitRepoKind, type GitSection, type IgnoreMatcher, type RepoCtx } from "../../engine/index.js";
+import { GitCaptureDeferredError, artifactBinding, discoverGitRepos, gitIdentity, gitIdentityKey, gitPreflight, inTreeWorktreeParentRel, isGitBusy, isPresentButUnreadableError, gitSectionBlobRefs, readRepoIdentityV1, readStateLineageV1, repoCtxFromDisk, poolMap, type DiscoveredGitRepo, type GitRepoKind, type GitSection, type IgnoreMatcher, type RepoCtx } from "../../engine/index.js";
 import { type GitConfigRunner } from "../../engine/git/config-txn.js";
 import { expectedStateNonce, repoRecordsForState, type GitDeferralReason, type SyncState, type WorkspaceConfig } from "../config.js";
 import type { SyncRemote } from "../remote.js";
@@ -84,6 +84,8 @@ export interface GitPlanOptions {
   filesFirstDefer?: boolean;
   /** Deterministic design-130 tombstone timestamp seam. */
   now?: () => Date;
+  /** Awaited daemon registry observer; errors are observability-only. */
+  onGitReposDiscovered?: (repos: readonly DiscoveredGitRepo[]) => Promise<void>;
 }
 
 /**
@@ -223,6 +225,7 @@ export async function planGitSections(
   // second push, no "history attached" lie).
   if (options.filesFirstDefer && cfg.syncGit) {
     const discovered = await discoverGitRepos(root, matcher);
+    try { await options.onGitReposDiscovered?.(discovered); } catch { /* daemon observer never changes planning */ }
     return { ...plan(), ...(discovered.length > 0 ? { filesFirstDeferred: true } : {}) };
   }
   if (!cfg.syncGit) {
@@ -244,6 +247,7 @@ export async function planGitSections(
   const kek = cfg.kek;
 
   const discovered = await discoverGitRepos(root, matcher);
+  try { await options.onGitReposDiscovered?.(discovered); } catch { /* daemon observer never changes planning */ }
   const kindByPath = new Map(discovered.map((d) => [d.relPath, d.kind]));
 
   // §9: removal memories are pruned ONLY when the local `.git` genuinely disappears —

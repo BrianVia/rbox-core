@@ -41,7 +41,11 @@ interface SafetyInternals {
     root: string,
     matcher: unknown,
     cb: (events: unknown[]) => void,
-    opts?: { onError?: (err: Error) => void; onGitSignal?: () => void }
+    opts?: {
+      onError?: (err: Error) => void;
+      signalDebouncer?: { push(reason: "signal" | "candidate" | "other"): void };
+      onInitialGitRepos?: (repos: readonly { relPath: string; kind: "dir" | "pointer" }[]) => Promise<void>;
+    }
   ) => Promise<{ gitRefWatchActive?: boolean; close(): Promise<void> }>;
   startLiveWatch(): Promise<void>;
   advanceSafetyCadenceForTick(): void;
@@ -63,14 +67,18 @@ interface SafetyInternals {
   matcher: { ignores(path: string): boolean };
   cfg: { respectGitignore?: boolean };
   reloadWorkspaceConfigIfChanged(): Promise<void>;
+  gitSafetyFloorRequired: boolean;
+  gitBackendFallbackPending: boolean;
+  authoritativeGitRepos: readonly { relPath: string; kind: "dir" | "pointer" }[];
+  refreshGitSafetyFloor(reason: string): void;
 }
 
-test("design 172: onGitSignal requests push without pending/file-settle state", async () => {
+test("design 175: ref signal requests push without pending/file-settle state", async () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-git-signal-")));
   const daemon = makeDaemon(root);
   let signal: (() => void) | undefined;
   daemon.startWatcherFn = (_root, _matcher, _cb, opts) => {
-    signal = opts?.onGitSignal;
+    signal = () => opts?.signalDebouncer?.push("signal");
     return Promise.resolve({ gitRefWatchActive: true, close: async () => {} });
   };
   daemon.pumping = true;
@@ -78,6 +86,7 @@ test("design 172: onGitSignal requests push without pending/file-settle state", 
   try {
     await daemon.startLiveWatch();
     signal!();
+    await new Promise((resolve) => setTimeout(resolve, 450));
     expect(daemon.want.push).toBe(true);
     expect(daemon.churnSinceSafety).toBe(true);
     expect(daemon.pendingEvents).toEqual([]);
@@ -90,21 +99,53 @@ test("design 172: onGitSignal requests push without pending/file-settle state", 
   }
 });
 
-test("design 172: daemon holds the git safety floor only on Linux", async () => {
+test("design 175: a directory-backed repo holds the git safety floor only on Linux", async () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-git-floor-")));
   const daemon = makeDaemon(root);
-  daemon.startWatcherFn = () => Promise.resolve({ gitRefWatchActive: true, close: async () => {} });
+  daemon.startWatcherFn = async (_root, _matcher, _cb, opts) => {
+    await opts?.onInitialGitRepos?.([{ relPath: ".", kind: "dir" }]);
+    return { gitRefWatchActive: true, close: async () => {} };
+  };
   daemon.pumping = true;
 
   try {
     await daemon.startLiveWatch();
     daemon.safetyDelay = FLOOR;
+    await new Promise((resolve) => setTimeout(resolve, 0));
     daemon.advanceSafetyCadenceForTick();
     expect(daemon.safetyDelay).toBe(process.platform === "linux" ? FLOOR : 120_000);
   } finally {
     if (daemon.safetyTimer) clearTimeout(daemon.safetyTimer);
     if (daemon.deepTimer) clearInterval(daemon.deepTimer);
     await daemon.watcher?.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test.skipIf(process.platform !== "linux")("design 175: fallback and dir snapshots pin; pointer-only and zero-repo snapshots release", () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-git-floor-state-")));
+  const daemon = makeDaemon(root);
+  try {
+    daemon.safetyDelay = CAP;
+    daemon.gitBackendFallbackPending = true;
+    daemon.refreshGitSafetyFloor("chokidar-pending");
+    expect(daemon.gitSafetyFloorRequired).toBe(true);
+    expect(daemon.safetyDelay).toBe(FLOOR);
+
+    daemon.gitBackendFallbackPending = false;
+    daemon.authoritativeGitRepos = [{ relPath: "linked", kind: "pointer" }];
+    daemon.refreshGitSafetyFloor("pointer-only-snapshot");
+    expect(daemon.gitSafetyFloorRequired).toBe(false);
+
+    daemon.authoritativeGitRepos = [{ relPath: "repo", kind: "dir" }];
+    daemon.refreshGitSafetyFloor("dir-snapshot");
+    expect(daemon.gitSafetyFloorRequired).toBe(true);
+
+    daemon.authoritativeGitRepos = [];
+    daemon.refreshGitSafetyFloor("zero-repo-snapshot");
+    expect(daemon.gitSafetyFloorRequired).toBe(false);
+  } finally {
+    if (daemon.safetyTimer) clearTimeout(daemon.safetyTimer);
     fs.rmSync(root, { recursive: true, force: true });
   }
 });

@@ -60,6 +60,14 @@ export const SERVER_TELEMETRY_SAMPLE_SCHEMAS = {
     numbers: [{ field: "count", ...COUNT }],
     enums: [{ field: "eventType", values: ["mass_delete_breaker", "scan_fault"] }],
   },
+  git_capture: {
+    numbers: [
+      { field: "signalPushes", ...WS_HEALTH_COUNT },
+      { field: "candidatePushes", ...WS_HEALTH_COUNT },
+      { field: "scanPushes", ...WS_HEALTH_COUNT },
+    ],
+    enums: [],
+  },
   ws_health: {
     numbers: [
       { field: "windowMs", ...MS },
