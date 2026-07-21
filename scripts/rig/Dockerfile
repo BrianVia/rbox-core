@@ -5,9 +5,9 @@
 # node_modules (native @parcel/watcher), never the host's macOS ones.
 FROM docker.io/library/ubuntu:24.04
 
-# Pin bun so the image is reproducible + staleness-hashable. `.bun-version` is empty
-# and package.json declares no engines.bun, so this pins to the version in use.
-ARG BUN_VERSION=1.3.5
+# Pin Bun so the image is reproducible + staleness-hashable. package.json declares
+# engines.bun ^1.3.14; this exact pin is also gated by bun-refwatch-contract.
+ARG BUN_VERSION=1.3.14
 
 # git >= 2.46 (transactional symref-update) is a product floor since design 118;
 # ubuntu 24.04 ships 2.43, so pull git from the git-core PPA like the fleet does.

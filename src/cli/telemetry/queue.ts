@@ -2,6 +2,7 @@ import {
   TELEMETRY_BATCH_CAP,
   TELEMETRY_SAMPLE_SCHEMAS,
   telemetryEnabled,
+  type GitCaptureSample,
   type TelemetryEnvelope,
   type TelemetrySample,
   type WsHealthSample,
@@ -16,6 +17,11 @@ export interface TelemetryRecorder {
 }
 
 type Family = TelemetrySample["kind"];
+type GitCaptureAdditive = Omit<GitCaptureSample, "kind">;
+interface GitCaptureSnapshot {
+  readonly sample: GitCaptureSample;
+  readonly records: number;
+}
 type WsHealthAdditive = Omit<WsHealthSample, "kind" | "notifyLatencyMaxMs">;
 interface WsHealthSnapshot {
   readonly sample: WsHealthSample;
@@ -36,12 +42,20 @@ const emptyWsHealthAdditive = (): WsHealthAdditive => ({
   notifyLatencySumMs: 0,
 });
 
+const emptyGitCaptureAdditive = (): GitCaptureAdditive => ({
+  signalPushes: 0,
+  candidatePushes: 0,
+  scanPushes: 0,
+});
+
 export class TelemetryQueue implements TelemetryRecorder {
   private readonly safety = new Map<Extract<TelemetrySample, { kind: "safety_event" }>["eventType"], number>();
   private capability?: Extract<TelemetrySample, { kind: "capability" }>;
   private readonly firstPublish: Extract<TelemetrySample, { kind: "first_publish" }>[] = [];
   private readonly uploadLane: Extract<TelemetrySample, { kind: "upload_lane" }>[] = [];
   private readonly propagation: Extract<TelemetrySample, { kind: "propagation" }>[] = [];
+  private readonly gitCapture = emptyGitCaptureAdditive();
+  private gitCapturePendingRecords = 0;
   private readonly wsHealth = emptyWsHealthAdditive();
   private wsHealthLiveMax = 0;
   private wsHealthPendingRecords = 0;
@@ -58,6 +72,7 @@ export class TelemetryQueue implements TelemetryRecorder {
   get empty(): boolean {
     return this.safety.size === 0 && !this.capability && this.firstPublish.length === 0
       && this.uploadLane.length === 0 && this.propagation.length === 0
+      && this.gitCapturePendingRecords === 0
       && this.wsHealthPendingRecords === 0;
   }
 
@@ -72,6 +87,9 @@ export class TelemetryQueue implements TelemetryRecorder {
         case "first_publish": this.pushRing(this.firstPublish, sample, 16, sample.kind); break;
         case "upload_lane": this.pushRing(this.uploadLane, sample, 64, sample.kind); break;
         case "propagation": this.pushRing(this.propagation, sample, 64, sample.kind); break;
+        case "git_capture":
+          this.addGitCapture(sample);
+          break;
         case "ws_health":
           this.addWsHealth(sample);
           break;
@@ -91,6 +109,8 @@ export class TelemetryQueue implements TelemetryRecorder {
     const samples: TelemetrySample[] = [];
     const wsHealthSnapshot = this.wsHealthPendingRecords > 0 ? this.snapshotWsHealth() : undefined;
     if (wsHealthSnapshot) samples.push(wsHealthSnapshot.sample); // highest priority: never truncated by the batch cap
+    const gitCaptureSnapshot = this.gitCapturePendingRecords > 0 ? this.snapshotGitCapture() : undefined;
+    if (gitCaptureSnapshot) samples.push(gitCaptureSnapshot.sample); // additive control-plane counters are also cap-proof
     for (const [eventType, count] of this.safety) samples.push({
       kind: "safety_event",
       eventType,
@@ -113,7 +133,7 @@ export class TelemetryQueue implements TelemetryRecorder {
       return;
     }
     if (response.status >= 400 && response.status <= 499) {
-      this.removeAccepted(samples, wsHealthSnapshot);
+      this.removeAccepted(samples, wsHealthSnapshot, gitCaptureSnapshot);
       try { this.log(`telemetry discarded ${samples.length} sample(s) rejected with HTTP ${response.status}`); } catch {}
       return;
     }
@@ -121,14 +141,18 @@ export class TelemetryQueue implements TelemetryRecorder {
       this.restoreWsHealthMax(wsHealthSnapshot);
       return;
     }
-    this.removeAccepted(samples, wsHealthSnapshot);
+    this.removeAccepted(samples, wsHealthSnapshot, gitCaptureSnapshot);
     try {
       const body = await response.json() as { dropped?: unknown };
       if (typeof body.dropped === "number" && body.dropped > 0) this.log(`telemetry server dropped ${body.dropped} sample(s)`);
     } catch { /* response diagnostics are optional */ }
   }
 
-  private removeAccepted(samples: TelemetrySample[], wsHealthSnapshot?: WsHealthSnapshot): void {
+  private removeAccepted(
+    samples: TelemetrySample[],
+    wsHealthSnapshot?: WsHealthSnapshot,
+    gitCaptureSnapshot?: GitCaptureSnapshot,
+  ): void {
     for (const sample of samples) {
       switch (sample.kind) {
         case "safety_event": {
@@ -141,11 +165,44 @@ export class TelemetryQueue implements TelemetryRecorder {
         case "first_publish": this.removeIdentity(this.firstPublish, sample); break;
         case "upload_lane": this.removeIdentity(this.uploadLane, sample); break;
         case "propagation": this.removeIdentity(this.propagation, sample); break;
+        case "git_capture":
+          if (gitCaptureSnapshot) this.removeGitCaptureSnapshot(gitCaptureSnapshot);
+          break;
         case "ws_health":
           if (wsHealthSnapshot) this.removeWsHealthSnapshot(wsHealthSnapshot);
           break;
       }
     }
+  }
+
+  private addGitCapture(sample: GitCaptureSample): void {
+    for (const field of Object.keys(this.gitCapture) as (keyof GitCaptureAdditive)[]) {
+      this.gitCapture[field] = Math.min(Number.MAX_SAFE_INTEGER, this.gitCapture[field] + sample[field]);
+    }
+    this.gitCapturePendingRecords = Math.min(Number.MAX_SAFE_INTEGER, this.gitCapturePendingRecords + 1);
+  }
+
+  private snapshotGitCapture(): GitCaptureSnapshot {
+    const numbers = TELEMETRY_SAMPLE_SCHEMAS.git_capture.numbers;
+    return {
+      sample: {
+        kind: "git_capture",
+        signalPushes: Math.min(numbers.signalPushes.max, this.gitCapture.signalPushes),
+        candidatePushes: Math.min(numbers.candidatePushes.max, this.gitCapture.candidatePushes),
+        scanPushes: Math.min(numbers.scanPushes.max, this.gitCapture.scanPushes),
+      },
+      records: this.gitCapturePendingRecords,
+    };
+  }
+
+  private removeGitCaptureSnapshot(snapshot: GitCaptureSnapshot): void {
+    const { sample } = snapshot;
+    this.gitCapture.signalPushes = Math.max(0, this.gitCapture.signalPushes - sample.signalPushes);
+    this.gitCapture.candidatePushes = Math.max(0, this.gitCapture.candidatePushes - sample.candidatePushes);
+    this.gitCapture.scanPushes = Math.max(0, this.gitCapture.scanPushes - sample.scanPushes);
+    this.gitCapturePendingRecords = Math.max(0, this.gitCapturePendingRecords - snapshot.records);
+    if (this.gitCapturePendingRecords === 0
+      && Object.values(this.gitCapture).some((value) => value > 0)) this.gitCapturePendingRecords = 1;
   }
 
   private addWsHealth(sample: WsHealthSample): void {

@@ -187,6 +187,21 @@ FROM rbox_prod_metrics
 WHERE blob1 = 'commit';
 ```
 
+**Git capture trigger mix, hourly** (`client.git_capture`: `double1` = ref/lock
+signal pushes, `double2` = `.git` lifecycle candidate pushes, `double3` =
+safety/deep-scan pushes). These are additive, at-least-once fleet counters:
+
+```sql
+SELECT
+  intDiv(toUInt32(timestamp), 3600) * 3600 AS hour,
+  sum(double1 * _sample_interval) AS signal_pushes,
+  sum(double2 * _sample_interval) AS candidate_pushes,
+  sum(double3 * _sample_interval) AS scan_pushes
+FROM rbox_prod_metrics
+WHERE index1 = 'client.git_capture'
+GROUP BY hour ORDER BY hour;
+```
+
 **Future §23/§24 validation panels** (add when the emitters land)
 - Stale receipt rejects: count `blob1 = 'commit' AND blob3 = 'receipt_stale'`.
 - Orphan reclaim: count/sum `blob1 = 'gc.orphan'` split by `blob3 = 'candidate'|'deleted'`.

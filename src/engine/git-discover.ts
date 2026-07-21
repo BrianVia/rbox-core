@@ -32,6 +32,17 @@ export async function discoverGitRepos(root: string, matcher: IgnoreMatcher): Pr
   return out;
 }
 
+/** Targeted additive discovery rooted at one candidate owner subtree. */
+export async function discoverGitReposUnder(root: string, ownerRelPath: string, matcher: IgnoreMatcher): Promise<DiscoveredGitRepo[]> {
+  const rel = ownerRelPath === "." ? "" : ownerRelPath;
+  if (rel && (rel.startsWith("/") || rel.split("/").some((part) => !part || part === "." || part === ".."))) return [];
+  if (rel && (matcher.prunesForGitDiscovery?.(`${rel}/`) ?? matcher.ignores(`${rel}/`))) return [];
+  const out: DiscoveredGitRepo[] = [];
+  await walkDir(root, rel, matcher, out);
+  out.sort((a, b) => (a.relPath < b.relPath ? -1 : a.relPath > b.relPath ? 1 : 0));
+  return out;
+}
+
 async function walkDir(root: string, rel: string, matcher: IgnoreMatcher, out: DiscoveredGitRepo[]): Promise<void> {
   // A dir vanishing mid-walk (Conductor archiving a worktree) is a defer, not an abort.
   const entries = await fs.readdir(path.join(root, rel), { withFileTypes: true }).catch(() => []);

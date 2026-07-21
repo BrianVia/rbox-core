@@ -17,6 +17,20 @@ export interface GitPreflightResult {
   structural?: boolean;
 }
 
+/** Repository config is the sole authority for the ref-storage format. */
+export async function gitRefStorage(repoDir: string): Promise<string | undefined> {
+  try {
+    const value = await git(repoDir, ["config", "--local", "--get", "extensions.refStorage"]);
+    return value || undefined;
+  } catch (error) {
+    // `git config --get` uses status 1 for an authoritatively absent key. Every
+    // other failure means authority could not be established and must remain
+    // distinguishable from absence so callers fail closed.
+    if ((error as { code?: unknown }).code === 1) return undefined;
+    throw error;
+  }
+}
+
 // ---- preflight (design 43 §4) ------------------------------------------------
 
 /** Preflight: ordinary non-bare repos whose toplevel IS `repoDir` — as a real `.git`
@@ -37,6 +51,24 @@ export async function gitPreflight(repoDir: string, knownCtx?: RepoCtx | null): 
   const ctx = knownCtx === null ? undefined : knownCtx ?? (await repoCtx(repoDir));
   if (!ctx) {
     return { ok: false, reason: kind === "pointer" ? "dangling .git pointer (main clone missing?)" : "unreadable .git — unsupported", kind };
+  }
+  let refStorage: string | undefined;
+  try {
+    refStorage = await gitRefStorage(repoDir);
+  } catch {
+    return {
+      ok: false,
+      reason: "repository ref-storage config could not be read — retry after Git configuration is readable",
+      kind,
+    };
+  }
+  if (refStorage === "reftable") {
+    return {
+      ok: false,
+      reason: "reftable ref storage is unsupported — convert this repository to files refs before syncing Git history",
+      kind,
+      structural: true,
+    };
   }
   if (!(await gitOk(repoDir, ["rev-parse", "--is-inside-work-tree"]))) return { ok: false, reason: "not a work tree", kind, structural: true };
   if ((await git(repoDir, ["rev-parse", "--is-bare-repository"]).catch(() => "")) !== "false") return { ok: false, reason: "bare repo — unsupported", kind, structural: true };

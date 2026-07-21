@@ -569,6 +569,12 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
       process.exit(await watcherSelfTest(positional[0]));
       break;
     }
+    case "__git-refwatch-platform-selftest": {
+      // Hidden release gate: Darwin must construct zero Linux ref side-channel handles.
+      const { gitRefWatchPlatformSelfTest } = await import("./daemon/watcher-selftest.js");
+      process.exit(await gitRefWatchPlatformSelfTest());
+      break;
+    }
     case "__crypto-smoke": {
       // Hidden: compiled-binary smoke for design 81. Proves worker-pool crypto actually
       // executes in this binary; inline fallback alone exits non-zero.

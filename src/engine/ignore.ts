@@ -157,17 +157,33 @@ const ALWAYS_NATIVE_PRUNE = new Set(["node_modules", ".git", ".rbox"]);
  */
 const RBOX_SCRATCH_REF_RE = /^refs\/rbox-[^/]*(?:\/|$)/;
 
-function isSignalTail(parts: string[], start: number): boolean {
-  const tail = parts.slice(start).join("/");
+/**
+ * The committed Git ref surface observed by both the workspace watcher and the
+ * Linux ref side-channel. Keep this data-only table as the single source of
+ * truth: the two classifiers deliberately have different path inputs, but must
+ * never drift on which committed names are signals.
+ */
+export const GIT_REF_SIGNAL_TAIL_TABLE = {
+  gitDir: { targets: ["HEAD"], structures: [] },
+  commonDir: { targets: ["packed-refs"], structures: ["refs"] },
+  refsRoot: { targets: ["stash"], structures: ["heads", "tags"] },
+  refsNamespace: { parents: ["refs/heads", "refs/tags"] },
+} as const;
+
+/** True for a committed-state target relative to a Git control directory. */
+export function isGitRefSignalTail(tail: string): boolean {
   if (tail.length === 0 || tail.endsWith(".lock")) return false;
   if (tail === "reftable" || tail.startsWith("reftable/")) return false;
   if (tail === "refs/remotes" || tail.startsWith("refs/remotes/")) return false;
   if (RBOX_SCRATCH_REF_RE.test(tail)) return false;
-  return tail === "HEAD"
-    || tail === "packed-refs"
-    || tail === "refs/stash"
-    || tail.startsWith("refs/heads/") && tail.length > "refs/heads/".length
-    || tail.startsWith("refs/tags/") && tail.length > "refs/tags/".length;
+  return (GIT_REF_SIGNAL_TAIL_TABLE.gitDir.targets as readonly string[]).includes(tail)
+    || (GIT_REF_SIGNAL_TAIL_TABLE.commonDir.targets as readonly string[]).includes(tail)
+    || tail.startsWith("refs/") && (GIT_REF_SIGNAL_TAIL_TABLE.refsRoot.targets as readonly string[]).includes(tail.slice("refs/".length))
+    || GIT_REF_SIGNAL_TAIL_TABLE.refsNamespace.parents.some((root) => tail.startsWith(`${root}/`) && tail.length > root.length + 1);
+}
+
+function isSignalTail(parts: string[], start: number): boolean {
+  return isGitRefSignalTail(parts.slice(start).join("/"));
 }
 
 export function isGitRefSignal(relPath: string): boolean {

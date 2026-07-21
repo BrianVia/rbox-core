@@ -4,7 +4,7 @@ import { hashBytes, repoCtxFromDisk, type RepoCtx } from "../../engine/index.js"
 import { OP_STATE_DIRS, OP_STATE_FILES } from "../../engine/manifest-validate.js";
 import { MAX_GIT_CONFIG_KEYS, MAX_GIT_CONFIG_KEY_BYTES, MAX_GIT_CONFIG_SERIALIZED_BYTES, MAX_GIT_CONFIG_VALUE_BYTES } from "../../engine/git/config-sync.js";
 import { repoDirOf } from "./shared.js";
-const GIT_FINGERPRINT_SCHEMA_VERSION = 4;
+export const GIT_FINGERPRINT_SCHEMA_VERSION = 5;
 export interface GitConfigWireBounds {
   maxKeys: number;
   maxSerializedBytes: number;
@@ -202,7 +202,7 @@ async function opStateFingerprint(gitDir: string): Promise<unknown> {
 }
 
 async function commonDirFingerprint(ctx: RepoCtx): Promise<unknown> {
-  const [shallow, alternates, config, modules, worktrees, gcPid, packedRefs, refs] = await Promise.all([
+  const [shallow, alternates, config, modules, worktrees, gcPid, packedRefs, packedRefsLock, refs] = await Promise.all([
     statToken(path.join(ctx.commonDir, "shallow")),
     statToken(path.join(ctx.commonDir, "objects", "info", "alternates")),
     statToken(path.join(ctx.commonDir, "config")),
@@ -210,6 +210,7 @@ async function commonDirFingerprint(ctx: RepoCtx): Promise<unknown> {
     worktreesToken(path.join(ctx.commonDir, "worktrees")),
     statToken(path.join(ctx.commonDir, "gc.pid")),
     statToken(path.join(ctx.commonDir, "packed-refs"), { hashFileMaxBytes: PACKED_REFS_HASH_MAX_BYTES }),
+    statToken(path.join(ctx.commonDir, "packed-refs.lock")),
     statTree(path.join(ctx.commonDir, "refs"), "", { hashFileMaxBytes: LOOSE_REF_HASH_MAX_BYTES }),
   ]);
   return {
@@ -220,6 +221,7 @@ async function commonDirFingerprint(ctx: RepoCtx): Promise<unknown> {
     worktrees,
     gcPid,
     packedRefs,
+    packedRefsLock,
     refs,
   };
 }

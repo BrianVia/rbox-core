@@ -561,7 +561,7 @@ export async function moveFileAtomic(src: string, dest: string): Promise<void> {
 
 export async function gitBusy(ctx: RepoCtx): Promise<boolean> {
   // per-worktree locks live in the resolved gitdir; store-wide locks in the common dir
-  for (const lock of [path.join(ctx.gitDir, "index.lock"), path.join(ctx.gitDir, "HEAD.lock"), path.join(ctx.commonDir, "config.lock"), path.join(ctx.commonDir, "gc.pid")]) {
+  for (const lock of [path.join(ctx.gitDir, "index.lock"), path.join(ctx.gitDir, "HEAD.lock"), path.join(ctx.commonDir, "config.lock"), path.join(ctx.commonDir, "packed-refs.lock"), path.join(ctx.commonDir, "gc.pid")]) {
     if (await existsNoFollow(lock)) return true;
   }
   // any *.lock under the SHARED refs/

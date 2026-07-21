@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { TelemetryQueue } from "./queue.js";
-import type { TelemetryEnvelope, WsHealthSample } from "./contract.js";
+import type { GitCaptureSample, TelemetryEnvelope, WsHealthSample } from "./contract.js";
 
 afterEach(() => { delete process.env.RBOX_TELEMETRY; });
 
@@ -22,6 +22,17 @@ const wsHealth = (overrides: Partial<WsHealthSample> = {}): WsHealthSample => ({
 
 const wsSample = (body: TelemetryEnvelope): WsHealthSample =>
   body.samples.find((sample): sample is WsHealthSample => sample.kind === "ws_health")!;
+
+const gitCapture = (overrides: Partial<GitCaptureSample> = {}): GitCaptureSample => ({
+  kind: "git_capture",
+  signalPushes: 0,
+  candidatePushes: 0,
+  scanPushes: 0,
+  ...overrides,
+});
+
+const gitCaptureSample = (body: TelemetryEnvelope): GitCaptureSample =>
+  body.samples.find((sample): sample is GitCaptureSample => sample.kind === "git_capture")!;
 
 describe("TelemetryQueue", () => {
   test("retains per family, drains in priority order, and removes only on 202", async () => {
@@ -90,6 +101,51 @@ describe("TelemetryQueue", () => {
     await queue.flush();
 
     expect(queue.empty).toBe(false);
+  });
+
+  test("snapshots git capture additively and retains concurrent records across failures", async () => {
+    let release!: (response: Response) => void;
+    const firstResponse = new Promise<Response>((resolve) => { release = resolve; });
+    const bodies: TelemetryEnvelope[] = [];
+    let calls = 0;
+    const queue = new TelemetryQueue({ postJson: async (_path, body) => {
+      bodies.push(body as TelemetryEnvelope);
+      calls++;
+      if (calls === 1) return firstResponse;
+      return new Response("{}", { status: 202 });
+    } });
+    queue.record(gitCapture({ signalPushes: 1 }));
+    const flushing = queue.flush();
+    await Promise.resolve();
+    queue.record(gitCapture({ candidatePushes: 1 }));
+    release(new Response("{}", { status: 500 }));
+    await flushing;
+    await queue.flush();
+    expect(gitCaptureSample(bodies[0]!)).toEqual(gitCapture({ signalPushes: 1 }));
+    expect(gitCaptureSample(bodies[1]!)).toEqual(gitCapture({ signalPushes: 1, candidatePushes: 1 }));
+    expect(queue.empty).toBe(true);
+  });
+
+  test("removes only a git capture snapshot accepted while another record arrives", async () => {
+    let release!: (response: Response) => void;
+    const firstResponse = new Promise<Response>((resolve) => { release = resolve; });
+    const bodies: TelemetryEnvelope[] = [];
+    let calls = 0;
+    const queue = new TelemetryQueue({ postJson: async (_path, body) => {
+      bodies.push(body as TelemetryEnvelope);
+      calls++;
+      return calls === 1 ? firstResponse : new Response("{}", { status: 202 });
+    } });
+    queue.record(gitCapture({ scanPushes: 1 }));
+    const flushing = queue.flush();
+    await Promise.resolve();
+    queue.record(gitCapture({ candidatePushes: 1 }));
+    release(new Response("{}", { status: 202 }));
+    await flushing;
+    expect(queue.empty).toBe(false);
+    await queue.flush();
+    expect(gitCaptureSample(bodies[1]!)).toEqual(gitCapture({ candidatePushes: 1 }));
+    expect(queue.empty).toBe(true);
   });
 
   test("adds deltas without double-counting across throw, 5xx, and 429 failures", async () => {
