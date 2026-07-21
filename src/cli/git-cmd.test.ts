@@ -861,7 +861,7 @@ test("keep-mine refuses reserved current-branch divergence without clearing anyt
   const lines: string[] = [];
   expect(await gitResolveCmd(root, receiver, "keep-mine", { json: true, forceDiscardIncoming: true }, deps(lines))).toBe(1);
   expect(JSON.parse(lines.at(-1)!)).toMatchObject({ status: "refused", code: "conflict" });
-  expect(JSON.parse(lines.at(-1)!).message).toContain("two-writer");
+  expect(JSON.parse(lines.at(-1)!).message).toContain("rbox won't pick a side");
   expect(JSON.stringify(await loadState(root, syncStreamId(cfg)))).toBe(before);
 });
 
@@ -873,7 +873,7 @@ test("keep-mine refuses BASE-present pending-present local-absent branch shape",
   const lines: string[] = [];
   expect(await gitResolveCmd(root, receiver, "keep-mine", { json: true, forceDiscardIncoming: true }, deps(lines))).toBe(1);
   expect(JSON.parse(lines.at(-1)!)).toMatchObject({ status: "refused", code: "conflict" });
-  expect(JSON.parse(lines.at(-1)!).message).toContain("BASE still holds it");
+  expect(JSON.parse(lines.at(-1)!).message).toContain("rbox still tracks it as synced");
   expect(JSON.stringify(await loadState(root, syncStreamId(cfg)))).toBe(before);
 });
 
