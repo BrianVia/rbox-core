@@ -150,16 +150,18 @@ test("incarnation-only stream mismatch is typed and never freshened", async () =
 
 test("the full design-138 loadState caller inventory remains on the hard-refusal API", async () => {
   const inventory: Record<string, number> = {
-    "sync/pull.ts": 3,
-    "sync/push.ts": 2,
+    "sync/pull.ts": 5,
+    // Receipt arming consumes applyStateSavePacket's installed state directly;
+    // a reload after the durable arm would reopen a pre-POST failure window.
+    "sync/push.ts": 6,
     "status-cmd.ts": 2,
     "doctor-cmd.ts": 1,
     "ignore-cmd.ts": 1,
     "chain-repair.ts": 2,
     "daemon/daemon.ts": 1,
-    // Seven direct reloads (including keep-mine's immediate pre-write reload)
+    // Eight direct reloads (including keep-mine's synchronous confirm reload)
     // plus gitDeferralsCmd's dependency-injectable call.
-    "git-cmd.ts": 8,
+    "git-cmd.ts": 9,
   };
   const cli = path.dirname(new URL(import.meta.url).pathname);
   let total = 0;
@@ -170,7 +172,7 @@ test("the full design-138 loadState caller inventory remains on the hard-refusal
     expect(direct + injected, relative).toBe(expected);
     total += direct + injected;
   }
-  expect(total).toBe(20);
+  expect(total).toBe(27);
 });
 
 test("nonce advance after witness validation is a zero-reset-write barrier including Git refs", async () => {

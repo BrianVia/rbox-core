@@ -22,7 +22,7 @@ import {
   type GitDeferrals,
   type GitPartialApply,
   type GitHeldAttempt,
-  type GitResolutionIntent,
+  type GitResolutionPublicationReceipt,
   type RepoRecord,
   type RepoRecordInput,
   type StateSavePacket,
@@ -72,9 +72,9 @@ export interface RepoStateValues {
   partial?: Record<string, GitPartialApply | null>;
   /** Explicit local-only held-attempt transitions; omission preserves, null clears. */
   attempt?: Record<string, GitHeldAttempt | null>;
-  /** Design-176 intent transition. ACK clear is predecessor-bound so a CAS
-   * recompute can never consume a newer confirmation. */
-  resolutionIntent?: Record<string, GitResolutionIntent | { clearIfSnapshot: string }>;
+  /** Synchronous keep-mine publication receipt transition. Missing preserves;
+   * null clears only in the same or a later transition than accepted clears. */
+  resolutionReceipt?: Record<string, GitResolutionPublicationReceipt | null>;
   /** Semantic projection of the last applied index; null clears a stale cache. */
   idxProj?: Record<string, string | null>;
 }
@@ -236,16 +236,9 @@ function sourceRecord(source: StateSource, relPath: string, current: RepoRecord)
     ...(source.values.attempt?.[relPath] === undefined
       ? (current.attempt === undefined ? {} : { attempt: current.attempt })
       : source.values.attempt[relPath] === null ? {} : { attempt: source.values.attempt[relPath] }),
-    ...(() => {
-      const transition = source.values.resolutionIntent?.[relPath];
-      if (transition === undefined) return current.resolutionIntent === undefined ? {} : { resolutionIntent: current.resolutionIntent };
-      if ("clearIfSnapshot" in transition) {
-        return current.resolutionIntent?.snapshot === transition.clearIfSnapshot
-          ? {}
-          : current.resolutionIntent === undefined ? {} : { resolutionIntent: current.resolutionIntent };
-      }
-      return { resolutionIntent: transition };
-    })(),
+    ...(source.values.resolutionReceipt?.[relPath] === undefined
+      ? (current.resolutionReceipt === undefined ? {} : { resolutionReceipt: current.resolutionReceipt })
+      : source.values.resolutionReceipt[relPath] === null ? {} : { resolutionReceipt: source.values.resolutionReceipt[relPath] }),
     ...(source.values.idxProj?.[relPath] === undefined
       ? (current.idxProj === undefined ? {} : { idxProj: current.idxProj })
       : source.values.idxProj[relPath] === null ? {} : { idxProj: source.values.idxProj[relPath] }),
@@ -365,7 +358,7 @@ export function observedRepoKeys(state: SyncState, manifestGit?: Record<string, 
     ...Object.keys(values.deferrals ?? {}),
     ...Object.keys(values.partial ?? {}),
     ...Object.keys(values.attempt ?? {}),
-    ...Object.keys(values.resolutionIntent ?? {}),
+    ...Object.keys(values.resolutionReceipt ?? {}),
     ...Object.keys(values.idxProj ?? {}),
   ])].sort();
 }
@@ -544,24 +537,19 @@ export function changedSidecarRepoKeys(state: SyncState, values: RepoStateValues
     ...Object.keys(values.resolutions ?? {}),
     ...Object.keys(values.deferrals ?? {}),
     ...Object.keys(values.partial ?? {}),
-    ...Object.keys(values.resolutionIntent ?? {}),
+    ...Object.keys(values.resolutionReceipt ?? {}),
   ]);
   const same = (a: unknown, b: unknown) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
   return [...keys].filter((relPath) => {
     const record = records[relPath];
-    const intentTransition = values.resolutionIntent?.[relPath];
-    const intendedIntent = intentTransition === undefined
-      ? record?.resolutionIntent
-      : "clearIfSnapshot" in intentTransition
-        ? (record?.resolutionIntent?.snapshot === intentTransition.clearIfSnapshot ? undefined : record?.resolutionIntent)
-        : intentTransition;
+    const receiptTransition = values.resolutionReceipt?.[relPath];
     return !same(record?.pending, values.pending?.[relPath])
       || (values.repoAbsent !== undefined && record?.repoAbsent !== values.repoAbsent[relPath])
       || record?.removedKey !== values.removed?.[relPath]
       || record?.resolutionKey !== values.resolutions?.[relPath]
       || (values.deferrals?.[relPath] !== undefined && !same(mergeDeferrals(record?.deferrals, values.deferrals[relPath]), record?.deferrals))
       || (values.partial?.[relPath] !== undefined && !same(values.partial[relPath], record?.partial))
-      || (intentTransition !== undefined && !same(intendedIntent, record?.resolutionIntent));
+      || (receiptTransition !== undefined && !same(receiptTransition, record?.resolutionReceipt));
   }).sort();
 }
 

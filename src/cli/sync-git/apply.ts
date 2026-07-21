@@ -598,13 +598,6 @@ opts: {
       }
     }
 
-    // A confirmed keep-mine intent reserves this exact P-bound record for the
-    // ordinary push. Pull may advance global truth, which will invalidate the
-    // binding, but it must not apply/replace/clear P or any companion sidecar.
-    if (records[rel]?.resolutionIntent && pend) {
-      return { result: "unchanged", commonDirGroup };
-    }
-
     // Receiver quiescence (design 43 §7): a busy repo defers only itself, and the busy
     // check must run BEFORE any identity comparison — a lock makes write-tree fail,
     // flipping gitIdentity onto the raw-index fallback, which would read as FALSE

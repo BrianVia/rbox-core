@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import {
   gitIdentity,
+  hashBytes,
   indexIdentityV2,
   readRepoIdentityV1,
   repositoryIdentityHash,
@@ -19,7 +20,6 @@ import { hashFile } from "../../engine/hash.js";
 import {
   expectedStateNonce,
   type GitResolutionBinding,
-  type GitResolutionIntent,
   type GitResolutionLaneDisposition,
   type RepoRecord,
   type SyncState,
@@ -39,6 +39,19 @@ export interface ResolutionLaneReport {
 export interface ResolutionDiscardReport {
   lanes: ResolutionLaneReport[];
   forceRequired: boolean;
+}
+
+/** Ephemeral authority carried only by the foreground confirmed push. */
+export interface GitResolutionRider {
+  repo: string;
+  verb: "keep-mine";
+  confirmedReport: ResolutionDiscardReport;
+  authorizedLanes: string[];
+  forceDiscardIncoming: boolean;
+}
+
+export function resolutionReportHash(report: ResolutionDiscardReport): string {
+  return hashBytes(Buffer.from(canonicalString(report)));
 }
 
 const sortedEntries = (value: Record<string, string>): Array<[string, string]> =>
@@ -328,8 +341,8 @@ export async function finalResolutionReport(args: {
   return report;
 }
 
-export function reportAuthorized(intent: GitResolutionIntent, report: ResolutionDiscardReport): boolean {
-  const authorized = new Set(intent.authorizedLanes);
+export function reportAuthorized(authorizedLanes: readonly string[], report: ResolutionDiscardReport): boolean {
+  const authorized = new Set(authorizedLanes);
   // An indeterminate branch lane (ancestry unprovable because the incoming oid
   // no longer resolves anywhere) is acceptable only when the user already
   // confirmed discarding that exact lane in the preview; branch lanes always

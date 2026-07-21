@@ -62,6 +62,9 @@ export interface CommitOptions {
   deltaBase?: { manifest: Manifest; meta: GlobalManifestMeta };
   /** Design 84 repair: encode a chain-free snapshot regardless of rollout flags. */
   forceSnapshot?: boolean;
+  /** Awaited at the last client-side boundary before the manifest POST. A
+   * synchronous keep-mine uses this to durably arm uncertain-ACK recovery. */
+  beforeCommitSend?: () => Promise<void>;
 }
 
 export interface CommitTimings {
@@ -293,7 +296,12 @@ export async function redeemReceipts(ctx: RemoteContext, recordCommitTail = fals
 
 /** Post a signed commit envelope. Maps the server's 409 variants: a parent
  *  conflict (pull+retry) vs `epoch_stale` (a rotation landed under us). */
-export async function commitSigned(ctx: RemoteContext, parentSeq: number, commit: SignedCommit): Promise<CommitChainResult> {
+export async function commitSigned(
+  ctx: RemoteContext,
+  parentSeq: number,
+  commit: SignedCommit,
+  beforeManifestPost?: () => Promise<void>,
+): Promise<CommitChainResult> {
   // §23.4: hand the accumulated upload receipts to commit (it does the batched
   // catalog+charge+grant+promote). Sending all still-valid receipts each attempt is
   // safe — the server charges 0 for already-entitled refs.
@@ -314,6 +322,11 @@ export async function commitSigned(ctx: RemoteContext, parentSeq: number, commit
     return { unsatisfiedBlobs: redeemNeedsUpload, unsatisfiedTotal: redeemNeedsUpload.length };
   }
   const requestBody = JSON.stringify({ parentSequence: parentSeq, commit, receipts: {} });
+  // This is the actual last client-side failure boundary. In particular, upload
+  // receipt redemption above may still fail or request another upload; neither
+  // outcome may arm keep-mine's uncertain-ACK receipt because no manifest POST
+  // has been attempted yet.
+  await beforeManifestPost?.();
   const r = await timePushTailRequest("commit", Buffer.byteLength(requestBody), () => ctx.fetch(`${ctx.baseUrl}/v1/ws/${ctx.workspaceId}/proj/${ctx.projectId}/manifests`, {
     method: "POST",
     headers: { ...ctx.protoAuth, "content-type": "application/json" },

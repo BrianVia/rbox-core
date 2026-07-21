@@ -44,8 +44,7 @@ export async function gitIdentity(repoDir: string, knownCtx?: RepoCtx): Promise<
  *  conflict-resolution progress — so identity falls back to `raw:<sha256 of the
  *  resolved-gitdir index bytes>`. Volatile (stat refreshes can over-capture) but
  *  conservative: in the transient unmerged window, re-capturing beats carrying stale state. */
-export async function indexTreeOf(ctx: RepoCtx): Promise<string | undefined> {
-  const idx = path.join(ctx.gitDir, "index");
+export async function indexTreeOfPath(ctx: RepoCtx, idx: string): Promise<string | undefined> {
   if (await exists(idx)) {
     let tmpDir: string | undefined;
     let wt: string | undefined;
@@ -66,6 +65,10 @@ export async function indexTreeOf(ctx: RepoCtx): Promise<string | undefined> {
   }
   if (!(await exists(idx))) return undefined;
   return `raw:${await hashFile(idx)}`;
+}
+
+export async function indexTreeOf(ctx: RepoCtx): Promise<string | undefined> {
+  return indexTreeOfPath(ctx, path.join(ctx.gitDir, "index"));
 }
 
 /**

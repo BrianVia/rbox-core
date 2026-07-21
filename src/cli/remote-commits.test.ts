@@ -36,21 +36,24 @@ test("commitSigned redeems first and posts an empty receipts map", async () => {
   const ctx = new RemoteContext("https://rbox.test", "tok", "ws", "root");
   ctx.receipts.set(sha("one"), "receipt-one");
   const paths: string[] = [];
+  const ordering: string[] = [];
   const commitBodies: unknown[] = [];
   (ctx as unknown as { fetch: RemoteContext["fetch"] }).fetch = async (url, init) => {
     paths.push(url);
+    ordering.push(url.endsWith("/receipts/redeem") ? "redeem" : "post");
     const body = JSON.parse(String(init.body)) as Record<string, unknown>;
     if (url.endsWith("/receipts/redeem")) return json(200, { granted: 1, alreadyEntitled: 0, rejected: 0 });
     commitBodies.push(body);
     return json(200, { sequence: 1, serverTimings });
   };
 
-  await expect(commitSigned(ctx, 0, commit)).resolves.toEqual({ sequence: 1, serverTimings });
+  await expect(commitSigned(ctx, 0, commit, async () => { ordering.push("arm"); })).resolves.toEqual({ sequence: 1, serverTimings });
   expect(paths.map((p) => new URL(p).pathname)).toEqual([
     "/v1/ws/ws/proj/root/receipts/redeem",
     "/v1/ws/ws/proj/root/manifests",
   ]);
   expect(commitBodies).toEqual([{ parentSequence: 0, commit, receipts: {} }]);
+  expect(ordering).toEqual(["redeem", "arm", "post"]);
   expect(ctx.receipts.size).toBe(0);
 });
 
@@ -80,12 +83,27 @@ test("commitSigned maps a redeem fence abort to per-blob staging without posting
     return json(422, { error: "unsatisfied_blobs", missing: [fenced], missingTotal: 1 });
   };
 
-  await expect(commitSigned(ctx, 0, commit)).resolves.toEqual({
+  let armed = false;
+  await expect(commitSigned(ctx, 0, commit, async () => { armed = true; })).resolves.toEqual({
     unsatisfiedBlobs: [fenced],
     unsatisfiedTotal: 1,
   });
   expect(paths).toEqual(["/v1/ws/ws/proj/root/receipts/redeem"]);
+  expect(armed).toBe(false);
   expect(ctx.receipts.has(fenced)).toBe(false);
+});
+
+test("commitSigned leaves the publication receipt unarmed when redemption fails before POST", async () => {
+  const ctx = new RemoteContext("https://rbox.test", "tok", "ws", "root");
+  ctx.receipts.set(sha("redeem-failure"), "receipt");
+  let armed = false;
+  (ctx as unknown as { fetch: RemoteContext["fetch"] }).fetch = async (url) => {
+    if (url.endsWith("/receipts/redeem")) throw new Error("redeem unavailable");
+    throw new Error("manifest POST must not run");
+  };
+
+  await expect(commitSigned(ctx, 0, commit, async () => { armed = true; })).rejects.toThrow("redeem unavailable");
+  expect(armed).toBe(false);
 });
 
 test("redeemReceipts clears the whole caught batch when a 422 omits missing detail", async () => {

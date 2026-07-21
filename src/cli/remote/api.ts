@@ -106,7 +106,8 @@ export class RboxApi implements SyncRemote {
     return this.batchDownloader.getToFile(sha256, expectedSize, destPath);
   }
 
-  commit(parentSequence: number, deviceId: string, manifest: Manifest, _options?: CommitOptions): Promise<CommitResult> {
+  async commit(parentSequence: number, deviceId: string, manifest: Manifest, options?: CommitOptions): Promise<CommitResult> {
+    await options?.beforeCommitSend?.();
     return commit(this.ctx, parentSequence, deviceId, manifest);
   }
 
@@ -152,8 +153,8 @@ export class RboxApi implements SyncRemote {
     return commitsSince(this.ctx, since);
   }
 
-  commitSigned(parentSeq: number, commit: SignedCommit): Promise<CommitChainResult> {
-    return commitSigned(this.ctx, parentSeq, commit);
+  commitSigned(parentSeq: number, commit: SignedCommit, beforeManifestPost?: () => Promise<void>): Promise<CommitChainResult> {
+    return commitSigned(this.ctx, parentSeq, commit, beforeManifestPost);
   }
 
   pairCreate(body: { tokenId: string; mkWrap: string; admissionGrant: string }): Promise<{ token: string }> {

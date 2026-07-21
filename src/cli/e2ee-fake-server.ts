@@ -112,8 +112,9 @@ export class FakeServer implements E2eeApi {
     if (since < this.pruneFloor) throw new NeedsRebaselineError(this.commits.length); // pruned past retention
     return this.commits.slice(since);
   };
-  commitSigned = async (parentSeq: number, commit: SignedCommit) => {
+  commitSigned = async (parentSeq: number, commit: SignedCommit, beforeManifestPost?: () => Promise<void>) => {
     const body = parseCommit(commit);
+    await beforeManifestPost?.();
     await this.beforeCommitSigned?.();
     const currentEpoch = this.account.keyStates.length - 1;
     if (body.accountEpoch !== currentEpoch) return { epochStale: currentEpoch };

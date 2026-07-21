@@ -21,12 +21,10 @@ import {
   resumeLockedAcceptedPRepair,
   runLockedPRepairAttempt,
 } from "../engine/index.js";
-import { OP_STATE_CLASSIFICATION } from "../engine/manifest-validate.js";
-import { opStateRootOf } from "./sync-git/follow.js";
 import { pinDisplaced } from "../engine/git/keep-pins.js";
 import { branchesCheckedOutElsewhere } from "../engine/git/apply.js";
 import { quarantineLocal } from "../engine/git/quarantine.js";
-import { readAllRefs, readOpState } from "../engine/git/refs.js";
+import { hasInProgressOpState, readAllRefs, readOpStateSnapshot } from "../engine/git/refs.js";
 import { git, headBranchOf, repoCtx, type RepoCtx } from "../engine/git/shared.js";
 import { hashBytes, hashFile } from "../engine/hash.js";
 import {
@@ -39,15 +37,18 @@ import {
   syncStreamId,
   type GitDeferralReason,
   type GitResolutionBinding,
-  type GitResolutionIntent,
   type RepoRecord,
   type RepoRecordInput,
   type SyncState,
   type WorkspaceConfig,
 } from "./config.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
+import type { SyncRemote } from "./remote.js";
+import { reconcileResolutionReceipt, scanManifestForPush } from "./sync/pull.js";
+import { pushManifest, type PushResult } from "./sync/push.js";
+import type { SyncDeps } from "./sync/deps.js";
 import { inputRecord } from "./sync-state.js";
-import { withWorkspaceSyncMutex, WorkspaceSyncBusyError, workspaceSyncMutexDegraded, type SyncMutexOptions } from "./sync-mutex.js";
+import { withWorkspaceSyncMutex, WorkspaceSyncBusyError, WorkspaceSyncTimeoutError, workspaceSyncMutexDegraded, type SyncMutexOptions } from "./sync-mutex.js";
 import {
   checkoutJournalBinding,
   followDivergedRepo,
@@ -73,6 +74,7 @@ type GitResolveVerb = "show-me" | "take-theirs" | "keep-mine";
 interface ResolveEnvironment {
   cfg: WorkspaceConfig;
   store: BlobStore;
+  remote?: SyncRemote;
 }
 
 interface GitResolveDeps {
@@ -83,8 +85,10 @@ interface GitResolveDeps {
   forceProofIndeterminate?: boolean;
   /** Test seam: runs inside checkout-txn's lock-bound second-proof callback. */
   beforeSecondProof?: () => Promise<void>;
-  /** Test seam: runs immediately before keep-mine reloads every bound input. */
-  beforeIntentRecheck?: () => Promise<void>;
+  /** Test seam: runs immediately before keep-mine reloads every confirmed input. */
+  beforeConfirmRecheck?: () => Promise<void>;
+  /** Test seam around the ordinary in-process push pipeline. */
+  confirmedPush?: (args: { cfg: WorkspaceConfig; deps: SyncDeps; resolution: import("./sync-git/resolution-intent.js").GitResolutionRider }) => Promise<PushResult>;
   now?: () => Date;
   stdout?: (line: string) => void;
   stderr?: (line: string) => void;
@@ -153,7 +157,8 @@ type ResolveOutput =
     }
   | { status: "snapshot-mismatch"; verb: "take-theirs" | "keep-mine"; repo: string; message: string; current: GitResolveShow; discardReport?: ResolutionDiscardReport }
   | { status: "refused"; verb: GitResolveVerb; repo: string; code: ResolveRefusalCode; message: string; current?: GitResolveShow }
-  | { status: "intent-recorded"; verb: "keep-mine"; repo: string; snapshot: string; forceDiscardIncoming: boolean; discardReport: ResolutionDiscardReport };
+  | { status: "published"; verb: "keep-mine"; repo: string; sequence: number }
+  | { status: "ack-uncertain"; verb: "keep-mine"; repo: string; message: string };
 
 function sortedEntries(value: Record<string, string>): Array<[string, string]> {
   return Object.entries(value).sort(([a], [b]) => a.localeCompare(b));
@@ -563,10 +568,12 @@ function emit(output: ResolveOutput, json: boolean, deps: GitResolveDeps, root: 
     safeOut(`${safe.repo}: followed incoming checkout; local Git state quarantined at ${safe.quarantine}`);
     return;
   }
-  if (safe.status === "intent-recorded") {
-    printDiscardReport(safe.discardReport, safeOut);
-    safeOut(`${safe.repo}: keep-mine intent recorded for snapshot ${safe.snapshot}.`);
-    safeOut("The next ordinary push will re-check the final candidate, preserve discarded incoming objects, and publish local Git state.");
+  if (safe.status === "published") {
+    safeOut(`${safe.repo}: published; your repo is the synced truth now (sequence ${safe.sequence}).`);
+    return;
+  }
+  if (safe.status === "ack-uncertain") {
+    safeErr(`${safe.repo}: ${safe.message}`);
     return;
   }
   if (safe.status === "preview") {
@@ -604,7 +611,7 @@ function refusalMessage(reason: GitDeferralReason): string {
 
 async function defaultBuild(root: string): Promise<ResolveEnvironment> {
   const built = await buildAuthedRemote(root);
-  return { cfg: built.cfg, store: built.remote.blobStore() };
+  return { cfg: built.cfg, store: built.remote.blobStore(), remote: built.remote };
 }
 
 async function recoverFirst(root: string, rel: string, ctx: RepoCtx | undefined, state: SyncState): Promise<{ state: SyncState; error?: string }> {
@@ -776,8 +783,26 @@ export async function gitResolveCmd(
     return 1;
   }
   const now = deps.now ?? (() => new Date());
+  const confirmedKeepMine = verb === "keep-mine" && options.confirm !== undefined;
+  const mutexOptions: SyncMutexOptions | undefined = confirmedKeepMine
+    ? {
+        ...deps.mutexOptions,
+        acquisitionDeadlineMs: deps.mutexOptions?.acquisitionDeadlineMs ?? 60_000,
+        onWait: () => {
+          (deps.stderr ?? console.error)("waiting for the current sync cycle to finish…");
+          deps.mutexOptions?.onWait?.();
+        },
+      }
+    : deps.mutexOptions;
   const run = withWorkspaceSyncMutex(root, async (mutex) => {
     const env = await (deps.build ?? defaultBuild)(root);
+    if (confirmedKeepMine) {
+      await reconcileResolutionReceipt(root, env.cfg, {
+        ...(env.remote ? { remote: env.remote } : {}),
+        syncMutex: mutex,
+        warningSink: deps.stderr,
+      });
+    }
     let state = await loadState(root, syncStreamId(env.cfg));
     const repoDir = repoDirOf(root, rel);
     let ctx = await repoCtx(repoDir).catch(() => undefined);
@@ -816,9 +841,8 @@ export async function gitResolveCmd(
     // Breadcrumbs (ORIG_HEAD-class, design 126) are inert leftovers, not
     // operations — refusing on them blocked the founder's live unwedge on a
     // stale ORIG_HEAD. Only genuinely in-progress op-state refuses.
-    const inProgressOps = Object.keys(await readOpState(ctx.gitDir, hashFile))
-      .filter((rel) => OP_STATE_CLASSIFICATION[opStateRootOf(rel)] === "in-progress");
-    if (verb === "keep-mine" && inProgressOps.length > 0) {
+    const opStateSnapshot = await readOpStateSnapshot(ctx.gitDir, hashFile);
+    if (verb === "keep-mine" && hasInProgressOpState(opStateSnapshot)) {
       emit({ status: "refused", verb, repo: rel, code: "local-operation", message: "a Git operation is in progress; finish or abort it, then run keep-mine again" }, json, deps, root);
       return 1;
     }
@@ -908,7 +932,7 @@ export async function gitResolveCmd(
       if (!options.confirm) {
         emit({
           status: "preview", verb, repo: rel,
-          message: "Review the preliminary report before recording a publish-my-work intent; the final report is confirmed at publish time.",
+          message: "Review the preliminary report before publishing; confirmation re-checks the final candidate immediately.",
           current: snapshot.public,
           discardReport,
           confirm: { snapshot: snapshot.public.snapshot, forceDiscardIncoming: discardReport.forceRequired },
@@ -932,18 +956,18 @@ export async function gitResolveCmd(
         return 1;
       }
       if (workspaceSyncMutexDegraded(mutex)) {
-        emit({ status: "refused", verb, repo: rel, code: "mutex-degraded", message: "locking unavailable; keep-mine will not record an intent until safe serialization is restored" }, json, deps, root);
+        emit({ status: "refused", verb, repo: rel, code: "mutex-degraded", message: "locking unavailable; keep-mine will not publish until safe serialization is restored" }, json, deps, root);
         return 1;
       }
 
-      // Recompute every bound input immediately before the intent-only state write.
-      await deps.beforeIntentRecheck?.();
+      // Recompute the live preview at the execution boundary under the same lock.
+      await deps.beforeConfirmRecheck?.();
       const boundaryState = await loadState(root, syncStreamId(env.cfg));
       const boundaryRecord = repoRecordsForState(boundaryState)[rel];
       const boundaryIncoming = boundaryRecord?.pending;
       const boundaryCtx = await repoCtx(repoDir).catch(() => undefined);
       if (!boundaryRecord || !boundaryIncoming || !boundaryCtx) {
-        emit({ status: "snapshot-mismatch", verb, repo: rel, message: "the pending repository binding changed before the intent was recorded; inspect and confirm again", current: snapshot.public, discardReport }, json, deps, root);
+        emit({ status: "snapshot-mismatch", verb, repo: rel, message: "the pending repository binding changed before publication; inspect and confirm again", current: snapshot.public, discardReport }, json, deps, root);
         return 1;
       }
       state = boundaryState;
@@ -953,16 +977,15 @@ export async function gitResolveCmd(
       snapshot = await takeSnapshot();
       if (options.confirm !== snapshot.public.snapshot) {
         discardReport = await preliminaryResolutionReport({ ctx, pending: incoming, binding: snapshot.identity, store: env.store, kek: env.cfg.kek });
-        emit({ status: "snapshot-mismatch", verb, repo: rel, message: "snapshot changed before the intent was recorded; confirm the fresh preliminary report", current: snapshot.public, discardReport }, json, deps, root);
+        emit({ status: "snapshot-mismatch", verb, repo: rel, message: "snapshot changed before publication; confirm the fresh preliminary report", current: snapshot.public, discardReport }, json, deps, root);
         return 1;
       }
       if (await isGitBusy(ctx.repoDir, ctx)) {
         emit({ status: "refused", verb, repo: rel, code: "git-busy", message: "Git became busy; retry keep-mine after the other Git operation finishes" }, json, deps, root);
         return 1;
       }
-      const confirmInProgress = Object.keys(await readOpState(ctx.gitDir, hashFile))
-        .filter((rel2) => OP_STATE_CLASSIFICATION[opStateRootOf(rel2)] === "in-progress");
-      if (confirmInProgress.length > 0) {
+      const confirmOpState = await readOpStateSnapshot(ctx.gitDir, hashFile);
+      if (hasInProgressOpState(confirmOpState)) {
         emit({ status: "refused", verb, repo: rel, code: "local-operation", message: "a Git operation began before confirmation; finish or abort it, then run keep-mine again" }, json, deps, root);
         return 1;
       }
@@ -974,7 +997,7 @@ export async function gitResolveCmd(
       discardReport = await preliminaryResolutionReport({ ctx, pending: incoming, binding: snapshot.identity, store: env.store, kek: env.cfg.kek });
       if (discardReport.lanes.some((lane) => lane.disposition === "indeterminate")
         || forceDiscardIncoming !== discardReport.forceRequired) {
-        emit({ status: "snapshot-mismatch", verb, repo: rel, message: "the preliminary discard decision changed before the intent was recorded; review and confirm again", current: snapshot.public, discardReport }, json, deps, root);
+        emit({ status: "snapshot-mismatch", verb, repo: rel, message: "the preliminary discard decision changed before publication; review and confirm again", current: snapshot.public, discardReport }, json, deps, root);
         return 1;
       }
       const finalCheckoutRef = headBranchOf(incoming.head);
@@ -982,46 +1005,70 @@ export async function gitResolveCmd(
         emit({ status: "refused", verb, repo: rel, code: "worktree-ownership", message: "the incoming checkout branch became active in another linked worktree; switch or detach that worktree, then retry keep-mine" }, json, deps, root);
         return 1;
       }
-      const finalOracle = oracleFromState({
-        base: state.lastSyncedManifest,
-        matcher: buildIgnoreMatcher(root, {
-          respectGitignore: env.cfg.respectGitignore === true,
-          knownGitRepos: Object.keys(state.lastSyncedManifest.gitRepos ?? {}),
-        }),
-        root,
-      });
-      const finalBinding = await resolutionBindingIdentity({
-        root, rel, ctx, state, record, incoming, oracle: finalOracle, cfg: env.cfg, boundary: true,
-      });
-      if (JSON.stringify(finalBinding) !== JSON.stringify(snapshot.identity)) {
-        emit({ status: "snapshot-mismatch", verb, repo: rel, message: "the repository changed at the intent-write boundary; inspect and confirm again", current: snapshot.public, discardReport }, json, deps, root);
-        return 1;
-      }
-      const intent: GitResolutionIntent = {
-        v: 1,
-        verb: "keep-mine",
-        snapshot: snapshot.public.snapshot,
-        binding: finalBinding,
+      const resolution = {
+        repo: rel,
+        verb: "keep-mine" as const,
+        confirmedReport: discardReport,
         authorizedLanes: discardReport.lanes.filter((lane) => lane.disposition === "not-subsumed").map((lane) => lane.lane).sort(),
-        createdAt: now().toISOString(),
+        forceDiscardIncoming,
       };
-      const installed = await applyStateSavePacket(root, {
-        expectedStream: state.stream,
-        expectedNonce: expectedStateNonce(state),
-        sourceGlobalSeq: state.lastSyncedSequence,
-        repos: [{
-          relPath: rel,
-          expectedRepoGen: record.repoGen,
-          newRecord: { ...inputRecord(record), resolutionIntent: intent },
-          baseProof: carryRepoBaseProof(recordOriginLineage(record.branchBaseOrigins) ?? "legacy-untrusted"),
-        }],
-      });
-      if (installed.status !== "accepted") {
-        emit({ status: "snapshot-mismatch", verb, repo: rel, message: "sync state changed before the intent was recorded; inspect and confirm again", current: snapshot.public, discardReport }, json, deps, root);
+      const syncDeps: SyncDeps = {
+        ...(env.remote ? { remote: env.remote } : {}),
+        syncMutex: mutex,
+        warningSink: deps.stderr,
+      };
+      const result = deps.confirmedPush
+        ? await deps.confirmedPush({ cfg: env.cfg, deps: syncDeps, resolution })
+        : await scanManifestForPush(root, env.cfg, syncDeps).then((local) =>
+            pushManifest(root, env.cfg, local, syncDeps, { resolution }));
+      const disposition = result.resolution;
+      if (disposition?.outcome === "published") {
+        emit({ status: "published", verb, repo: rel, sequence: disposition.sequence ?? result.sequence }, json, deps, root);
+        return 0;
+      }
+      if (disposition?.outcome === "ack-uncertain") {
+        emit({
+          status: "ack-uncertain",
+          verb,
+          repo: rel,
+          message: disposition.reason ?? "the publish acknowledgement is uncertain; run rbox push or rbox pull to reconcile",
+        }, json, deps, root);
         return 1;
       }
-      emit({ status: "intent-recorded", verb, repo: rel, snapshot: intent.snapshot, forceDiscardIncoming: discardReport.forceRequired, discardReport }, json, deps, root);
-      return 0;
+      const freshState = await loadState(root, syncStreamId(env.cfg));
+      const freshRecord = repoRecordsForState(freshState)[rel];
+      const freshIncoming = freshRecord?.pending;
+      if (freshRecord && freshIncoming) {
+        const freshCtx = await repoCtx(repoDir).catch(() => undefined);
+        if (freshCtx) {
+          const fresh = await buildSnapshot({
+            root, rel, ctx: freshCtx, state: freshState, record: freshRecord, incoming: freshIncoming,
+            store: env.store, kek: env.cfg.kek, cfg: env.cfg, now: now(),
+          });
+          const freshReport = await preliminaryResolutionReport({ ctx: freshCtx, pending: freshIncoming, binding: fresh.identity, store: env.store, kek: env.cfg.kek });
+          emit({
+            status: "snapshot-mismatch",
+            verb,
+            repo: rel,
+            message: disposition?.outcome === "aborted-remote-moved"
+              ? "another machine published while confirming — review the new state and confirm again"
+              : disposition?.reason ?? "publication was refused; review the fresh preliminary report and confirm again",
+            current: fresh.public,
+            discardReport: freshReport,
+          }, json, deps, root);
+          return 1;
+        }
+      }
+      emit({
+        status: "refused",
+        verb,
+        repo: rel,
+        code: "no-incoming",
+        message: disposition?.outcome === "aborted-remote-moved"
+          ? "another machine published while confirming; the post-pull state has no incoming hold"
+          : disposition?.reason ?? "keep-mine did not publish because no incoming hold remains",
+      }, json, deps, root);
+      return 1;
     }
     if (snapshot.proofIndeterminate || deps.forceProofIndeterminate === true) {
       emit({ status: "refused", verb, repo: rel, code: "proof-indeterminate", message: "proof could not complete; retry after Git state settles", current: snapshot.public }, json, deps, root);
@@ -1206,15 +1253,18 @@ export async function gitResolveCmd(
     if (pSettled.error) throw new Error(pSettled.error);
     emit({ status: "resolved", verb, repo: rel, snapshot: snapshot.public.snapshot, quarantine }, json, deps, root);
     return 0;
-  }, deps.mutexOptions);
+  }, mutexOptions);
   return run.catch((error) => {
     const busy = error instanceof WorkspaceSyncBusyError;
+    const timedOut = error instanceof WorkspaceSyncTimeoutError;
     emit({
       status: "refused",
       verb,
       repo: rel,
-      code: busy ? "sync-busy" : "operation-failed",
-      message: busy ? "daemon/CLI is syncing; retry, or run `rbox stop` first" : "the Git resolution could not complete safely; no confirmation can be reused",
+      code: busy || timedOut ? "sync-busy" : "operation-failed",
+      message: timedOut ? "timed out waiting for the current sync cycle to finish; try again"
+        : busy ? "daemon/CLI is syncing; retry, or run `rbox stop` first"
+        : "the Git resolution could not complete safely; no confirmation can be reused",
     }, json, deps, root);
     return 1;
   });

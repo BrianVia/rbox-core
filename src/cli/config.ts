@@ -346,15 +346,13 @@ export interface GitResolutionBinding {
   repositoryIdentity: string;
 }
 
-/** Single-use confirmation intent. The record generation is the predecessor
- * generation: installing this sidecar is the sole transition to repoGen + 1. */
-export interface GitResolutionIntent {
-  v: 1;
-  verb: "keep-mine";
-  snapshot: string;
-  binding: GitResolutionBinding;
-  authorizedLanes: string[];
-  createdAt: string;
+/** Durable proof that a synchronous keep-mine publication may have reached the
+ * server. Local-only; push/pull reconcile it against authenticated remote truth. */
+export interface GitResolutionPublicationReceipt {
+  repo: string;
+  attemptedGitIncomingKey: string;
+  attemptedSequence: number;
+  confirmedReportHash: string;
 }
 
 export interface RepoRecord {
@@ -381,9 +379,8 @@ export interface RepoRecord {
   partial?: GitPartialApply;
   /** Local-only design-174 held-follow observation; never wire-visible. */
   attempt?: GitHeldAttempt;
-  /** Local-only design-176 publish-my-work confirmation; consumed only by an
-   * accepted publisher ACK. */
-  resolutionIntent?: GitResolutionIntent;
+  /** Local-only synchronous keep-mine uncertain-ACK proof. */
+  resolutionReceipt?: GitResolutionPublicationReceipt;
   /** D4's projected-index cache; stored here so RepoRecord's shape lands once. */
   idxProj?: string;
 }
@@ -474,7 +471,7 @@ async function hasResetLineageArchive(root: string): Promise<boolean> {
  * hides a stream mismatch by manufacturing a fresh baseline. */
 export async function loadRawState(root: string): Promise<SyncState | undefined> {
   const state = await boundedJsonRead<SyncState>(statePath(root));
-  if (state) return state;
+  if (state) return stripObsoleteResolutionIntents(state);
   const marker = await boundedJsonRead<{
     stream?: unknown; stateNonce?: unknown; stateRevision?: unknown;
   }>(stateIncarnationPath(root), 512 * 1024);
@@ -488,6 +485,25 @@ export async function loadRawState(root: string): Promise<SyncState | undefined>
     };
   }
   throw new Error(`Corrupt sync state incarnation at ${stateIncarnationPath(root)}`);
+}
+
+/** <=1.7.18 persisted deferred keep-mine intents. They have no meaning under
+ * synchronous confirmation, so every state reader sees them stripped — not
+ * merely callers that later project records through repoRecordsForState(). */
+function stripObsoleteResolutionIntents(state: SyncState): SyncState {
+  if (!state.repoRecords) return state;
+  let changed = false;
+  const repoRecords: Record<string, RepoRecord> = {};
+  for (const [relPath, record] of Object.entries(state.repoRecords)) {
+    if (Object.prototype.hasOwnProperty.call(record, "resolutionIntent")) {
+      const { resolutionIntent: _obsoleteResolutionIntent, ...normalized } = record as RepoRecord & { resolutionIntent?: unknown };
+      repoRecords[relPath] = normalized;
+      changed = true;
+    } else {
+      repoRecords[relPath] = record;
+    }
+  }
+  return changed ? { ...state, repoRecords } : state;
 }
 
 function validCounter(value: unknown): number {
@@ -518,7 +534,10 @@ export function repoRecordsForState(state: SyncState): Record<string, RepoRecord
     if (saved) {
       // Once a record exists it is authoritative, including property absence.
       // Falling back to a legacy map here would resurrect an observed deletion.
-      records[relPath] = { ...saved, repoGen: validCounter(saved.repoGen), sourceSeq: validCounter(saved.sourceSeq) };
+      // loadRawState strips <=1.7.18 resolutionIntent fields. Keep this projection
+      // defensive for callers that construct a SyncState directly in memory.
+      const { resolutionIntent: _obsoleteResolutionIntent, ...normalizedSaved } = saved as RepoRecord & { resolutionIntent?: unknown };
+      records[relPath] = { ...normalizedSaved, repoGen: validCounter(saved.repoGen), sourceSeq: validCounter(saved.sourceSeq) };
       continue;
     }
     records[relPath] = {

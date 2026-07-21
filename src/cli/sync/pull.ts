@@ -14,7 +14,7 @@ import {
   snapshotApplyStats,
 } from "../../engine/index.js";
 import { openTrashBatch } from "../../engine/trash.js";
-import { ensureCapableStateLineage, loadState, manifestFromMeta, repoRecordsForState, stateWasStreamMismatch, syncStreamId, trashConfig, validManifestMeta, type GlobalManifestMeta, type SyncState, type WorkspaceConfig } from "../config.js";
+import { applyStateSavePacket, ensureCapableStateLineage, expectedStateNonce, loadState, manifestFromMeta, repoRecordsForState, stateWasStreamMismatch, syncStreamId, trashConfig, validManifestMeta, type GitResolutionPublicationReceipt, type GlobalManifestMeta, type SyncState, type WorkspaceConfig } from "../config.js";
 import { type LatestTimings, type SyncRemote } from "../remote.js";
 import {
   deferManifest,
@@ -25,8 +25,10 @@ import {
   settleCommittedBranchArtifacts,
   withRevalidatedGitPartialApplies,
 } from "../sync-git.js";
+import { carryRepoBaseProof, recordOriginLineage } from "../sync-git/base-composer.js";
+import { gitIncomingKey } from "../sync-git/shared.js";
 import { assertSyncMutex, workspaceSyncMutexDegraded } from "../sync-mutex.js";
-import { observedRepoKeys, orderedRepoDeferralUpdates, saveStateSource } from "../sync-state.js";
+import { inputRecord, observedRepoKeys, orderedRepoDeferralUpdates, saveStateSource } from "../sync-state.js";
 import { type SyncDeps, withReportScanStats, withCache, withDircache } from "./deps.js";
 import { formatLatestTimings, formatScanStats, scanDetailsOf, formatApplyStats } from "./format.js";
 import { apiFor, makeDeferErrnoReporter, MASS_DELETE_MIN_FILES, MassDeleteGuardError, matcherForState, plaintextBytesOf, fileCountOf, scanTick } from "./policy.js";
@@ -89,10 +91,108 @@ export async function pullWithMetadata(
   );
   if (latestTimings) report.recordDetails("latest", { ...latestTimings }, formatLatestTimings(latestTimings));
 
+  const reconciled = await reconcileResolutionReceipt(root, cfg, deps, api, {
+    state,
+    head: { sequence, manifest: remote, manifestMeta },
+  });
+  surfaceResolutionReceiptReconciliation(reconciled, deps);
   return {
-    actions: await applyPulledManifest(root, cfg, deps, api, { sequence, manifest: remote, manifestMeta, state }),
+    actions: reconciled.status === "none"
+      ? await applyPulledManifest(root, cfg, deps, api, { sequence, manifest: remote, manifestMeta, state })
+      : reconciled.actions,
     initialRemoteSequence: sequence,
   };
+}
+
+export type ResolutionReceiptReconciliation =
+  | { status: "none"; actions: Action[] }
+  | { status: "exact" | "mismatch"; actions: Action[]; sequence: number; repo: string; manifest: Manifest; pendingRetained: boolean };
+
+/** Ordinary push/pull must make a different-writer reconciliation visible when
+ * the incoming hold survived. With no pending there is nothing left to preview. */
+export function surfaceResolutionReceiptReconciliation(
+  result: ResolutionReceiptReconciliation,
+  deps: SyncDeps,
+): void {
+  if (result.status !== "mismatch") return;
+  const write = deps.warningSink ?? ((line: string) => process.stderr.write(`${line}\n`));
+  write(result.pendingRetained
+    ? "another machine published while confirming — review the new state and confirm again"
+    : "another machine published while confirming; the post-pull state has no incoming hold");
+}
+
+function resolutionReceiptIn(state: SyncState): { rel: string; receipt: GitResolutionPublicationReceipt } | undefined {
+  return Object.entries(repoRecordsForState(state))
+    .sort(([a], [b]) => a.localeCompare(b))
+    .flatMap(([rel, record]) => record.resolutionReceipt ? [{ rel, receipt: record.resolutionReceipt }] : [])[0];
+}
+
+export async function finishResolutionReceipt(
+  root: string,
+  state: SyncState,
+  rel: string,
+  receipt: GitResolutionPublicationReceipt,
+  exact: boolean,
+  savePacket: typeof applyStateSavePacket = applyStateSavePacket,
+): Promise<void> {
+  const record = repoRecordsForState(state)[rel];
+  if (!record || JSON.stringify(record.resolutionReceipt) !== JSON.stringify(receipt)) {
+    throw new Error("resolution publication receipt changed during reconciliation");
+  }
+  const next = inputRecord(record);
+  delete next.resolutionReceipt;
+  if (exact) {
+    delete next.pending;
+    delete next.resolutionKey;
+    delete next.partial;
+    delete next.attempt;
+    const deferrals = { ...(next.deferrals ?? {}) };
+    delete deferrals.apply;
+    if (Object.keys(deferrals).length > 0) next.deferrals = deferrals; else delete next.deferrals;
+  }
+  const installed = await savePacket(root, {
+    expectedStream: state.stream,
+    expectedNonce: expectedStateNonce(state),
+    sourceGlobalSeq: state.lastSyncedSequence,
+    repos: [{
+      relPath: rel,
+      expectedRepoGen: record.repoGen,
+      newRecord: next,
+      baseProof: carryRepoBaseProof(recordOriginLineage(record.branchBaseOrigins) ?? "legacy-untrusted"),
+    }],
+  });
+  if (installed.status !== "accepted") throw new Error("resolution publication receipt could not be cleared safely");
+}
+
+/** Reconcile one durable keep-mine publication receipt through authenticated
+ * full-head pull ordering. Any fetch/apply/clear failure leaves the receipt for
+ * the next push or pull. */
+export async function reconcileResolutionReceipt(
+  root: string,
+  cfg: WorkspaceConfig,
+  deps: SyncDeps,
+  api: SyncRemote = deps.remote ?? apiFor(cfg),
+  input?: {
+    state?: SyncState;
+    head?: { sequence: number; manifest: Manifest; manifestMeta?: GlobalManifestMeta };
+  },
+): Promise<ResolutionReceiptReconciliation> {
+  const state = input?.state ?? await loadState(root, syncStreamId(cfg), deps.warningSink, deps.syncMutex);
+  const found = resolutionReceiptIn(state);
+  if (!found) return { status: "none", actions: [] };
+  const head = input?.head ?? await api.latest();
+  const section = head.manifest.gitRepos?.[found.receipt.repo];
+  const exact = section !== undefined && gitIncomingKey(section) === found.receipt.attemptedGitIncomingKey;
+  const actions = await applyPulledManifest(root, cfg, deps, api, {
+    sequence: head.sequence,
+    manifest: head.manifest,
+    ...(head.manifestMeta ? { manifestMeta: head.manifestMeta } : {}),
+    state,
+  });
+  const afterApply = await loadState(root, syncStreamId(cfg), deps.warningSink, deps.syncMutex);
+  const pendingRetained = repoRecordsForState(afterApply)[found.rel]?.pending !== undefined;
+  await finishResolutionReceipt(root, afterApply, found.rel, found.receipt, exact);
+  return { status: exact ? "exact" : "mismatch", actions, sequence: head.sequence, repo: found.rel, manifest: head.manifest, pendingRetained: !exact && pendingRetained };
 }
 
 /** Apply an already authenticated remote manifest through the exact normal pull

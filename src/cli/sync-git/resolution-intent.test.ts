@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { captureGitState, LocalBlobStore, type BlobStore, type GitSection } from "../../engine/index.js";
 import { git, repoCtx } from "../../engine/git/shared.js";
-import type { GitResolutionBinding, GitResolutionIntent } from "../config.js";
+import type { GitResolutionBinding } from "../config.js";
 import { discardedIncomingOids, finalResolutionReport, preliminaryResolutionReport, reportAuthorized, type ResolutionDiscardReport } from "./resolution-intent.js";
 
 const roots: string[] = [];
@@ -113,10 +113,8 @@ test("design 176 final report permits only lanes recorded by the confirmed inten
     store,
     kek,
   });
-  const intent = { authorizedLanes: [] } as unknown as GitResolutionIntent;
-  expect(reportAuthorized(intent, report)).toBe(false);
-  intent.authorizedLanes = ["tag:refs/tags/release"];
-  expect(reportAuthorized(intent, report)).toBe(true);
+  expect(reportAuthorized([], report)).toBe(false);
+  expect(reportAuthorized(["tag:refs/tags/release"], report)).toBe(true);
 });
 
 test("an indeterminate lane passes only when the confirmed intent covers that exact lane, and its oids stay preserved", async () => {
@@ -133,12 +131,9 @@ test("an indeterminate lane passes only when the confirmed intent covers that ex
     kek,
   });
   expect(report.lanes.find((lane) => lane.lane === "branch:refs/heads/gone")?.disposition).toBe("indeterminate");
-  const intent = { authorizedLanes: [] } as unknown as GitResolutionIntent;
-  expect(reportAuthorized(intent, report)).toBe(false);
-  intent.authorizedLanes = ["branch:refs/heads/main"];
-  expect(reportAuthorized(intent, report)).toBe(false);
-  intent.authorizedLanes = ["branch:refs/heads/gone"];
-  expect(reportAuthorized(intent, report)).toBe(true);
+  expect(reportAuthorized([], report)).toBe(false);
+  expect(reportAuthorized(["branch:refs/heads/main"], report)).toBe(false);
+  expect(reportAuthorized(["branch:refs/heads/gone"], report)).toBe(true);
   expect(discardedIncomingOids(report)).toContain(missingOid);
 });
 
@@ -146,8 +141,7 @@ test("indeterminate index and op-state lanes refuse even when authorized — the
   const base = { detail: "could not be proven" };
   for (const lane of ["index", "op-state"]) {
     const report = { forceRequired: true, lanes: [{ lane, disposition: "indeterminate", ...base }] } as unknown as ResolutionDiscardReport;
-    const intent = { authorizedLanes: [lane] } as unknown as GitResolutionIntent;
-    expect(reportAuthorized(intent, report)).toBe(false);
+    expect(reportAuthorized([lane], report)).toBe(false);
   }
 });
 

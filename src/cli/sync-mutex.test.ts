@@ -72,6 +72,37 @@ describe("design 93 §6 workspace sync mutex", () => {
     await releaseWorkspaceSyncMutex(owner);
   });
 
+  test("design 177 confirmed acquisition waits through contention and bounds only acquisition", async () => {
+    const owner = await acquireWorkspaceSyncMutex(root, "cli", options(identity()));
+    const waits: string[] = [];
+    let now = 0;
+    const acquired = await acquireWorkspaceSyncMutex(root, "cli", {
+      ...options(identity()),
+      acquisitionDeadlineMs: 60_000,
+      nowMs: () => now,
+      onWait: () => waits.push("waiting"),
+      sleep: async (ms) => {
+        now += ms;
+        await releaseWorkspaceSyncMutex(owner);
+      },
+    });
+    expect(waits).toEqual(["waiting"]);
+    expect(await acquired.lock.isOwner()).toBe(true);
+    await releaseWorkspaceSyncMutex(acquired);
+
+    const blocking = await acquireWorkspaceSyncMutex(root, "cli", options(identity()));
+    now = 0;
+    await expect(acquireWorkspaceSyncMutex(root, "cli", {
+      ...options(identity()),
+      acquisitionDeadlineMs: 100,
+      retryDelayMs: 50,
+      nowMs: () => now,
+      sleep: async (ms) => { now += ms; },
+    })).rejects.toThrow("timed out waiting for the current sync cycle to finish");
+    expect(await blocking.lock.isOwner()).toBe(true);
+    await releaseWorkspaceSyncMutex(blocking);
+  });
+
   test("daemon contention requeues: the wakeup is never consumed", async () => {
     const owner = await acquireWorkspaceSyncMutex(root, "cli", options(identity()));
     const contender = await acquireWorkspaceSyncMutex(root, "daemon", options(identity()));
