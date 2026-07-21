@@ -155,39 +155,45 @@ const ALWAYS_NATIVE_PRUNE = new Set(["node_modules", ".git", ".rbox"]);
  * ignore matcher: `.git` remains hard-excluded from manifests while the native
  * watcher may use these paths only to request a git-aware push.
  */
-export function isGitRefSignal(relPath: string): boolean {
-  const parts = relPath.split("/");
+const RBOX_SCRATCH_REF_RE = /^refs\/rbox-[^/]*(?:\/|$)/;
 
-  const isSignalTail = (start: number): boolean => {
-    const tail = parts.slice(start).join("/");
-    if (tail.length === 0 || tail.endsWith(".lock")) return false;
-    if (tail === "reftable" || tail.startsWith("reftable/")) return false;
-    if (tail === "refs/remotes" || tail.startsWith("refs/remotes/")) return false;
-    if (/^refs\/rbox-[^/]*(?:\/|$)/.test(tail)) return false;
-    return tail === "HEAD"
-      || tail === "packed-refs"
-      || tail === "refs/stash"
-      || tail.startsWith("refs/heads/") && tail.length > "refs/heads/".length
-      || tail.startsWith("refs/tags/") && tail.length > "refs/tags/".length;
-  };
+function isSignalTail(parts: string[], start: number): boolean {
+  const tail = parts.slice(start).join("/");
+  if (tail.length === 0 || tail.endsWith(".lock")) return false;
+  if (tail === "reftable" || tail.startsWith("reftable/")) return false;
+  if (tail === "refs/remotes" || tail.startsWith("refs/remotes/")) return false;
+  if (RBOX_SCRATCH_REF_RE.test(tail)) return false;
+  return tail === "HEAD"
+    || tail === "packed-refs"
+    || tail === "refs/stash"
+    || tail.startsWith("refs/heads/") && tail.length > "refs/heads/".length
+    || tail.startsWith("refs/tags/") && tail.length > "refs/tags/".length;
+}
+
+export function isGitRefSignal(relPath: string): boolean {
+  // Fast bail for the hot path: this runs on EVERY watcher event, and almost
+  // all paths contain no ".git" segment at all — skip the split/scan for them.
+  if (!relPath.includes(".git")) return false;
+
+  const parts = relPath.split("/");
 
   for (let dotGit = 0; dotGit < parts.length; dotGit++) {
     if (parts[dotGit] !== ".git") continue;
 
     // Ordinary repository control directory: <repo>/.git/<tail>.
-    if (isSignalTail(dotGit + 1)) return true;
+    if (isSignalTail(parts, dotGit + 1)) return true;
 
     // Linked-worktree control directory: <repo>/.git/worktrees/<name>/<tail>.
-    if (parts[dotGit + 1] === "worktrees" && parts[dotGit + 2] && isSignalTail(dotGit + 3)) return true;
+    if (parts[dotGit + 1] === "worktrees" && parts[dotGit + 2] && isSignalTail(parts, dotGit + 3)) return true;
 
     // Submodule control directories, including nested module chains:
     // <base>/.git/modules/<name>[/modules/<nested>].../<tail>.
     if (parts[dotGit + 1] !== "modules" || !parts[dotGit + 2]) continue;
     let tailStart = dotGit + 3;
-    if (isSignalTail(tailStart)) return true;
+    if (isSignalTail(parts, tailStart)) return true;
     while (parts[tailStart] === "modules" && parts[tailStart + 1]) {
       tailStart += 2;
-      if (isSignalTail(tailStart)) return true;
+      if (isSignalTail(parts, tailStart)) return true;
     }
   }
   return false;

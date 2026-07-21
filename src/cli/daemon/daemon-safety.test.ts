@@ -46,7 +46,6 @@ interface SafetyInternals {
   startLiveWatch(): Promise<void>;
   advanceSafetyCadenceForTick(): void;
   churnSinceSafety: boolean;
-  gitSafetyFloorPinned: boolean;
   watcherHealthy: boolean;
   trustState: "trusted" | "suspect" | "fused";
   watcherErrorGeneration: number;
@@ -99,7 +98,6 @@ test("design 172: daemon holds the git safety floor only on Linux", async () => 
 
   try {
     await daemon.startLiveWatch();
-    expect(daemon.gitSafetyFloorPinned).toBe(process.platform === "linux");
     daemon.safetyDelay = FLOOR;
     daemon.advanceSafetyCadenceForTick();
     expect(daemon.safetyDelay).toBe(process.platform === "linux" ? FLOOR : 120_000);

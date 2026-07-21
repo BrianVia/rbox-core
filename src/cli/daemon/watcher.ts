@@ -264,7 +264,12 @@ async function startParcel(
   // thus the daemon's manifest keys — is unchanged by realpath.
   const realRoot = safeRealpath(root);
   const toRel = toRelFor(realRoot);
-  const gitRefWatchActive = (await discoverGitRepos(realRoot, matcher)).some((repo) => repo.kind === "dir");
+  // Kicked off before subscribe and awaited after: the ignore-pruned repo walk
+  // only feeds `gitRefWatchActive` (the Linux floor pin), so it must not delay
+  // watch readiness on large workspaces.
+  const gitRefWatchActivePromise = discoverGitRepos(realRoot, matcher).then((repos) =>
+    repos.some((repo) => repo.kind === "dir")
+  );
 
   const sub = await wrapper.subscribe(
     realRoot,
@@ -316,6 +321,19 @@ async function startParcel(
     { ignore: nativePruneGlobs(root) }
   );
 
+  let gitRefWatchActive: boolean;
+  try {
+    gitRefWatchActive = await gitRefWatchActivePromise;
+  } catch (e) {
+    // Preserve the sequential-walk failure semantics: a discovery failure fails
+    // startParcel (daemon degrades to periodic scan) without leaking the live
+    // subscription that now starts before the walk finishes.
+    batcher.dispose();
+    signalDebouncer.dispose();
+    await sub.unsubscribe().catch(() => {});
+    throw e;
+  }
+
   return {
     gitRefWatchActive,
     async close() {
@@ -337,7 +355,6 @@ function startChokidar(
   const debounceMs = opts.debounceMs ?? 400;
   const maxWaitMs = opts.maxWaitMs ?? 3000;
   const batcher = createBatcher(onSettle, debounceMs, maxWaitMs);
-  const signalDebouncer = createSignalDebouncer(opts.onGitSignal, debounceMs, maxWaitMs);
   const toRel = toRelFor(root);
 
   const watcher = chokidar.watch(root, {
@@ -366,7 +383,6 @@ function startChokidar(
   return {
     async close() {
       batcher.dispose();
-      signalDebouncer.dispose();
       await watcher.close();
     },
   };
