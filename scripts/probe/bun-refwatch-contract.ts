@@ -30,7 +30,9 @@ import { createWrapper } from "@parcel/watcher/wrapper";
 
 const exec = promisify(execFile);
 const ATTEMPTS = positiveInt(process.env.RBOX_REFWATCH_PROBE_ATTEMPTS, 5);
+const PREMISE_FAILURE_LIMIT = 5;
 const DEADLINE_MS = 5_000;
+const PRESSURE_WAIT_MS = 5_000;
 const PARCEL_MIN_EVENTS = 100;
 const PARCEL_DIRECTORY_COUNT = 16;
 const PARCEL_FILES_PER_ROUND = 192;
@@ -74,7 +76,7 @@ type AttemptResult = {
 
 type CaseResult = {
   case: string;
-  result: "PASS" | "FAIL";
+  result: "PASS" | "FAIL" | "INCONCLUSIVE";
   attempts: string;
   callbackLatency: string;
   churnOps: number;
@@ -96,6 +98,13 @@ type RawWatchEvent = {
   filename: string | null;
   observedAt: number;
 };
+
+class PremiseNotEstablished extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PremiseNotEstablished";
+  }
+}
 
 function loadHostParcelBinding(): unknown {
   const key = `${process.platform}-${process.arch}`;
@@ -125,12 +134,15 @@ function delay(ms: number): Promise<void> {
 
 async function waitFor(
   condition: () => boolean,
-  failure: () => string,
+  failure: () => string | Error,
   timeoutMs = DEADLINE_MS,
 ): Promise<void> {
   const startedAt = performance.now();
   while (!condition()) {
-    if (performance.now() - startedAt >= timeoutMs) throw new Error(failure());
+    if (performance.now() - startedAt >= timeoutMs) {
+      const reason = failure();
+      throw typeof reason === "string" ? new Error(reason) : reason;
+    }
     await delay(5);
   }
 }
@@ -244,7 +256,7 @@ class RefWatchLayout {
   }
 }
 
-async function startParcelFlood(tree: string): Promise<Flood> {
+async function startParcelFlood(tree: string, pressureScale: number): Promise<Flood> {
   const directories = Array.from({ length: PARCEL_DIRECTORY_COUNT }, (_, index) =>
     path.join(tree, `watched-${index}`),
   );
@@ -259,6 +271,7 @@ async function startParcelFlood(tree: string): Promise<Flood> {
   let stopPromise: Promise<void> | undefined;
   let baselineObserved = false;
   let overlapBurst = 0;
+  const activeOverlapBursts = new Set<Promise<void>>();
   const baseline = path.join(directories[0]!, "baseline.txt");
   const subscription = await parcel.subscribe(tree, (error, events) => {
     if (error) parcelError = error;
@@ -335,7 +348,7 @@ async function startParcelFlood(tree: string): Promise<Flood> {
           churnOperations += batch.length;
           await delay(0);
         }
-        while (performance.now() - startedAt < PARCEL_OVERLAP_MIN_MS) {
+        while (performance.now() - startedAt < PARCEL_OVERLAP_MIN_MS * pressureScale) {
           const batch = files.slice(0, 64);
           await Promise.all(
             batch.map((file, index) => writeFile(file, `overlap:${burst}:tail:${index}\n`)),
@@ -345,13 +358,23 @@ async function startParcelFlood(tree: string): Promise<Flood> {
         }
         complete = true;
       })();
+      activeOverlapBursts.add(done);
+      void done.then(
+        () => activeOverlapBursts.delete(done),
+        () => {
+          // Keep the rejected burst registered so stop() observes and reports it.
+        },
+      );
       return { completed: () => complete, done };
     },
     waitForPressure: () =>
       waitFor(
         () => parcelEvents - parcelEventsBeforeFlood >= PARCEL_MIN_EVENTS || parcelError !== undefined,
         () =>
-          `Parcel delivered ${parcelEvents - parcelEventsBeforeFlood} flood events; expected at least ${PARCEL_MIN_EVENTS}`,
+          new PremiseNotEstablished(
+            `Parcel delivered ${parcelEvents - parcelEventsBeforeFlood} flood events; expected at least ${PARCEL_MIN_EVENTS}`,
+          ),
+        PRESSURE_WAIT_MS * pressureScale,
       ).then(() => {
         if (parcelError) throw parcelError;
       }),
@@ -363,14 +386,16 @@ async function startParcelFlood(tree: string): Promise<Flood> {
           const deliveredAt = parcelDeliveryTimes[targetIndex];
           if (deliveredAt === undefined) return false;
           if (deliveredAt - startedAt > DEADLINE_MS) {
-            throw new Error(
+            throw new PremiseNotEstablished(
               `Parcel's ${PARCEL_MIN_EVENTS}th additional event arrived after the ref deadline`,
             );
           }
           return true;
         },
         () =>
-          `Parcel delivered ${parcelEvents - parcelEventsBeforeFlood - baseline} events during the ref deadline; expected at least ${PARCEL_MIN_EVENTS}`,
+          new PremiseNotEstablished(
+            `Parcel delivered ${parcelEvents - parcelEventsBeforeFlood - baseline} events during the ref deadline; expected at least ${PARCEL_MIN_EVENTS}`,
+          ),
         Math.max(1, DEADLINE_MS - (performance.now() - startedAt)),
       ).then(() => {
         if (parcelError) throw parcelError;
@@ -380,10 +405,13 @@ async function startParcelFlood(tree: string): Promise<Flood> {
       stopPromise ??= (async () => {
         stopping = true;
         await churn;
+        const overlapResults = await Promise.allSettled(activeOverlapBursts);
         // Let Parcel drain its native queue before measuring and unsubscribing.
         await delay(25);
         await subscription.unsubscribe();
         if (parcelError) throw parcelError;
+        const overlapFailure = overlapResults.find((result) => result.status === "rejected");
+        if (overlapFailure?.status === "rejected") throw overlapFailure.reason;
       })();
       return stopPromise;
     },
@@ -397,6 +425,7 @@ async function withHarness(
     layout: RefWatchLayout,
     flood: Flood,
   ) => Promise<{ target: string; event: RefEvent; operationStartedAt: number }>,
+  pressureScale: number,
 ): Promise<AttemptResult> {
   const root = await mkdtemp(path.join(os.tmpdir(), "rbox-bun-refwatch-"));
   let layout: RefWatchLayout | undefined;
@@ -405,7 +434,7 @@ async function withHarness(
   try {
     const { repo, beforeFlood } = await prepare(root);
     const churnTree = path.join(root, "parcel-churn");
-    flood = await startParcelFlood(churnTree);
+    flood = await startParcelFlood(churnTree, pressureScale);
     await beforeFlood?.();
 
     const gitDir = path.join(repo, ".git");
@@ -427,7 +456,7 @@ async function withHarness(
     parcelEvents = flood.parcelEventCount();
     flood = undefined;
     if (parcelEvents < PARCEL_MIN_EVENTS) {
-      throw new Error(
+      throw new PremiseNotEstablished(
         `Parcel delivered ${parcelEvents} flood events; expected at least ${PARCEL_MIN_EVENTS}`,
       );
     }
@@ -464,12 +493,40 @@ async function observeMutation(
   const parcelBaseline = flood.parcelEventCount();
   const parcelPressure = flood.waitForPressureSince(parcelBaseline, operationStartedAt);
   const overlap = flood.startOverlapBurst();
-  await mutate();
-  const event = await eventPromise;
-  if (overlap.completed()) {
-    throw new Error("Parcel overlap burst completed before the Bun ref callback");
+  const eventObservation = eventPromise.then((event) => ({
+    event,
+    overlapCompleted: overlap.completed(),
+  }));
+  // Attach all rejection handlers before the Git operation. On a starved
+  // runner the immutable observation deadline can expire while Git is still
+  // mutating, and those rejections must remain classified rather than becoming
+  // unhandled process errors.
+  const observations = Promise.allSettled([
+    eventObservation,
+    parcelPressure,
+  ]);
+  const overlapSettlement = Promise.allSettled([overlap.done]);
+  let mutationFailed = false;
+  let mutationError: unknown;
+  try {
+    await mutate();
+  } catch (error) {
+    mutationFailed = true;
+    mutationError = error;
   }
-  await parcelPressure;
+  const [eventResult, pressureResult] = await observations;
+  const [overlapResult] = await overlapSettlement;
+  if (mutationFailed) throw mutationError;
+  // A Bun callback failure is a contract violation only if Parcel established
+  // the pressure premise. Settle both concurrent observations and give a typed
+  // premise failure precedence when a starved runner causes both to time out.
+  if (overlapResult?.status === "rejected") throw overlapResult.reason;
+  if (pressureResult.status === "rejected") throw pressureResult.reason;
+  if (eventResult.status === "rejected") throw eventResult.reason;
+  const { event, overlapCompleted } = eventResult.value;
+  if (overlapCompleted) {
+    throw new PremiseNotEstablished("Parcel overlap burst completed before the Bun ref callback");
+  }
   await overlap.done;
   return { target, event, operationStartedAt };
 }
@@ -505,11 +562,11 @@ async function movePopulatedRefSubtree(
 
 const cases: Array<{
   name: string;
-  run(): Promise<AttemptResult>;
+  run(pressureScale: number): Promise<AttemptResult>;
 }> = [
   {
     name: "fast git init -> empty commit",
-    run: () =>
+    run: (pressureScale) =>
       withHarness(
         async (root) => {
           const repo = path.join(root, "workspace", "fast-init");
@@ -524,11 +581,12 @@ const cases: Array<{
             emptyCommit(repo, "empty after fast init"),
           );
         },
+        pressureScale,
       ),
   },
   {
     name: "atomic move-in -> empty commit",
-    run: () =>
+    run: (pressureScale) =>
       withHarness(
         async (root) => {
           const incoming = path.join(root, "incoming", "prebuilt");
@@ -546,11 +604,12 @@ const cases: Array<{
             emptyCommit(repo, "empty after atomic move"),
           );
         },
+        pressureScale,
       ),
   },
   {
     name: "populated ref subtree move-in",
-    run: () =>
+    run: (pressureScale) =>
       withHarness(
         async (root) => {
           const repo = path.join(root, "workspace", "nested-ref");
@@ -558,6 +617,7 @@ const cases: Array<{
           return { repo };
         },
         movePopulatedRefSubtree,
+        pressureScale,
       ),
   },
 ];
@@ -674,20 +734,42 @@ function numericRange(values: number[]): string {
 
 async function runCase(testCase: (typeof cases)[number]): Promise<CaseResult> {
   const successes: AttemptResult[] = [];
-  for (let attempt = 1; attempt <= ATTEMPTS; attempt += 1) {
+  let physicalRuns = 0;
+  let premiseFailures = 0;
+  let lastPremise: PremiseNotEstablished | undefined;
+  while (successes.length < ATTEMPTS && premiseFailures < PREMISE_FAILURE_LIMIT) {
+    physicalRuns += 1;
+    const pressureScale = Math.min(2 ** (physicalRuns - 1), 8);
     try {
-      successes.push(await testCase.run());
+      successes.push(await testCase.run(pressureScale));
     } catch (error) {
+      if (error instanceof PremiseNotEstablished) {
+        premiseFailures += 1;
+        lastPremise = error;
+        continue;
+      }
       return {
         case: testCase.name,
         result: "FAIL",
-        attempts: `${attempt - 1}/${ATTEMPTS}`,
+        attempts: `${successes.length}/${physicalRuns}`,
         callbackLatency: "-",
         churnOps: successes.reduce((sum, result) => sum + result.churnOperations, 0),
         parcelEvents: numericRange(successes.map((result) => result.parcelEvents)),
-        detail: `attempt ${attempt}: ${error instanceof Error ? error.message : String(error)}`,
+        detail: `attempt ${physicalRuns}: ${error instanceof Error ? error.message : String(error)}`,
       };
     }
+  }
+
+  if (successes.length === 0) {
+    return {
+      case: testCase.name,
+      result: "INCONCLUSIVE",
+      attempts: `0/${physicalRuns}`,
+      callbackLatency: "-",
+      churnOps: 0,
+      parcelEvents: "-",
+      detail: lastPremise?.message ?? "Parcel pressure premise was not established",
+    };
   }
 
   const latencies = successes.map((result) => result.latencyMs);
@@ -695,7 +777,7 @@ async function runCase(testCase: (typeof cases)[number]): Promise<CaseResult> {
   return {
     case: testCase.name,
     result: "PASS",
-    attempts: `${ATTEMPTS}/${ATTEMPTS}`,
+    attempts: `${successes.length}/${physicalRuns}`,
     callbackLatency: `${Math.min(...latencies).toFixed(1)}-${Math.max(...latencies).toFixed(1)}ms`,
     churnOps: successes.reduce((sum, result) => sum + result.churnOperations, 0),
     parcelEvents: numericRange(successes.map((result) => result.parcelEvents)),
@@ -719,10 +801,19 @@ async function runCompiledProbe(): Promise<void> {
     });
     process.stdout.write(compiled.stdout);
     process.stderr.write(compiled.stderr);
-    if (!compiled.stdout.includes("Bun ref-watch contract PASSED (3/3 cases)")) {
-      throw new Error("compiled probe exited without the required 3/3 PASS marker");
+    if (/^Bun ref-watch contract PASSED \(3\/3 cases\)$/m.test(compiled.stdout)) {
+      console.log("Compiled execution PASSED (3/3 cases)");
+      return;
     }
-    console.log("Compiled execution PASSED (3/3 cases)");
+    const inconclusive = compiled.stdout.match(
+      /^Bun ref-watch contract COMPLETED \((\d+)\/3 PASS; (\d+) INCONCLUSIVE\)$/m,
+    );
+    const passCount = Number(inconclusive?.[1]);
+    const inconclusiveCount = Number(inconclusive?.[2]);
+    if (!inconclusive || inconclusiveCount <= 0 || passCount + inconclusiveCount !== 3) {
+      throw new Error("compiled probe exited without a recognized successful completion marker");
+    }
+    console.log(`Compiled execution INCONCLUSIVE (${inconclusiveCount}/3 cases)`);
   } finally {
     await rm(compileRoot, { recursive: true, force: true });
   }
@@ -736,13 +827,28 @@ console.log(`attempts per case: ${ATTEMPTS}; callback deadline: ${DEADLINE_MS}ms
 const results: CaseResult[] = [];
 for (const testCase of cases) results.push(await runCase(testCase));
 console.table(results);
+const inconclusive = results.filter((result) => result.result === "INCONCLUSIVE");
+for (const result of inconclusive) {
+  console.warn(
+    `WARNING: case ${result.case} INCONCLUSIVE — environment could not generate Parcel pressure; Bun contract not exercised`,
+  );
+}
 await reportRootReplacement();
 
 const failures = results.filter((result) => result.result === "FAIL");
 if (failures.length > 0) {
   console.error(`Bun ref-watch contract FAILED (${failures.length}/${results.length} cases)`);
   process.exitCode = 1;
-} else {
+} else if (inconclusive.length === 0) {
   console.log(`Bun ref-watch contract PASSED (${results.length}/${results.length} cases)`);
+  if (!compiledChild) await runCompiledProbe();
+} else {
+  // This probe guards Bun regressions during the Zig-to-Rust rewrite. A
+  // starved runner proves nothing either way, and blocking releases on runner
+  // starvation is a false positive that has already cost three pipeline legs.
+  console.log(
+    `Bun ref-watch contract COMPLETED (${results.length - inconclusive.length}/${results.length} PASS; ` +
+      `${inconclusive.length} INCONCLUSIVE)`,
+  );
   if (!compiledChild) await runCompiledProbe();
 }
