@@ -1,6 +1,15 @@
 # 172 — Event-driven git-commit detection
 
-Status: **v4 — pending review**
+Status: **ALIGNED** (v5; self-certified after final3)
+Review trail: r1 = 3 parallel reviewers (codex+opus+fable) → v2; serial finals
+r2/r3/r4 (codex, high) → v3/v4/v5. BLOCKER (shared-matcher seam) closed at v2;
+converged structural → contract → impl-completeness → glob-precision. final3
+residuals were 1 real glob-collision bug (branch named `logs` pruned) + 2
+wording-precision items, all folded in v5 (native prune reframed as conservative
+volume-only, classifier is the signal authority; honest ~60s+tail bound; fetch
+carry-only-push wording). Self-cert per dev-cycle convergence: another round would
+echo. Parcel behavior source-verified (fts.cc FTS_SKIP, InotifyBackend silent
+overflow, wrapper.js no-negation).
 Owner: Claude (founder-directed, 2026-07-21)
 Origin: two-machine propagation measurement (design-170 follow-up). A commit on
 host A took ~52 s to reach host B; **~31 s of that was host A's daemon simply not
@@ -93,20 +102,27 @@ watcher differs from the scanner:
    `@parcel/watcher/wrapper.js` — each entry is an independent `picomatch` OR-term),
    so we cannot say "prune `.git/**` except refs". Instead prune the *specific
    noisy subtrees* (both the dir and its contents, so `FTS_SKIP` fires — see
-   Watcher-health) and admit the ref surface. The prune set must be **complete for
-   nested control stores** (final2 finding 5) — `.git/modules/<m>/`,
-   recursively-nested `.git/modules/…/modules/<n>/`, and `.git/worktrees/<w>/` each
-   have their OWN `objects/` and `logs/`:
-   - Prune: `**/.git/objects` + `**/.git/objects/**`, `**/.git/logs` +
-     `**/.git/logs/**`, `**/.git/modules/**/objects` + `…/objects/**`,
-     `**/.git/modules/**/logs` + `…/logs/**`, `**/.git/worktrees/*/logs` +
-     `…/logs/**`. (A missed nested `objects` re-admits a high-volume store — the
-     exact prior MAJOR.)
-   - Admit (residual): `**/.git/HEAD`, `**/.git/packed-refs`, `**/.git/refs/**`,
-     `**/.git/worktrees/*/{HEAD,refs/**}`, `**/.git/modules/**/{HEAD,packed-refs,refs/**}`.
-   Consequence (stated honestly): the *other* non-ref `.git` files (`index`,
-   `FETCH_HEAD`, `COMMIT_EDITMSG`, `ORIG_HEAD`, top-level `*.lock`) reach the JS
-   layer on commit/fetch and are dropped there (step 2).
+   Watcher-health). **The native prune is a *conservative volume* optimization; the
+   classifier (step 2) is the *authority* on what is a signal.** So the globs must
+   never span into `refs/` — a greedy `**/.git/modules/**/logs` would also prune a
+   branch literally named `logs` (`.git/modules/<m>/refs/heads/logs`), dropping a
+   real ref event (final3 finding 5a). **Prune ONLY the unambiguous top-level
+   stores:** `**/.git/objects` + `**/.git/objects/**`, `**/.git/logs` +
+   `**/.git/logs/**`. Do NOT attempt greedy `**/.git/modules/**/{objects,logs}`
+   globs (ref-collision). Consequence: submodule/nested-worktree object+log churn
+   (`.git/modules/<m>/objects/…`) reaches the JS layer and is **dropped by the
+   classifier** — a bounded *volume* residual (submodules are far less common than
+   the top-level object churn we do prune), NOT a correctness issue, since the
+   classifier authoritatively rejects non-ref paths. If that volume ever bites, the
+   precise fix is a control-dir-anchored predicate in the classifier (prune
+   `objects`/`logs` only as a *direct child of a resolved git control dir*), not a
+   greedy glob. The other non-ref `.git` files (`index`, `FETCH_HEAD`,
+   `COMMIT_EDITMSG`, top-level `*.lock`) likewise reach JS and are dropped there.
+
+   The *signal* surface (what the classifier ADMITS) is the full ref set incl.
+   nested: `.git/HEAD`, `.git/packed-refs`, `.git/refs/**`,
+   `.git/worktrees/*/{HEAD,refs/**}`, `.git/modules/**/{HEAD,packed-refs,refs/**}`
+   — correctness lives here, in the predicate, not the prune globs.
 
    **Backend scope (final2 finding 5b):** this is a **Parcel-backend feature.** The
    Chokidar fallback prunes `.git/` via `matcher.prunes` *before* traversal
@@ -226,13 +242,16 @@ would let the safety scan back off toward 5 min. So the concrete mitigation is:
 > (5 min).** (Wire alongside the existing floor-pin, `daemon.ts:592-610`,
 > `nextSafetyDelay` `policy.ts:107-111`.)
 
-This bounds the worst case to **60 s even if the fast path silently dies** —
-identical to today's non-git floor, never worse — without needing to detect the
-undetectable. macOS/FSEvents keeps its normal back-off (single stream, no inotify
-queue). Descriptor-bounding still applies as defence-in-depth: express it as
-*exclusion* (Parcel `ignore` is exclusion-only — prune every noisy `.git` subtree;
-the residual `.git/` dir + `refs/heads` [+tags/stash] IS the watch set, ≈2-3
-descriptors/repo), NOT a positive admit-list.
+This bounds the worst case to **the 60 s scan interval plus one scan→push→capture
+cycle** even if the fast path silently dies (final3 finding 4: the floor caps when
+the scan *fires*, not when the capture lands, so it is ~60 s + the scan/push tail,
+not a flat 60 s) — the point is it is **identical to today's non-git behavior,
+never worse**, without needing to detect the undetectable. macOS/FSEvents keeps its
+normal back-off (single stream, no inotify queue). Descriptor-bounding is
+defence-in-depth, and — because Parcel `ignore` is **exclusion-only** — it is
+achieved purely by pruning noisy subtrees; there is no positive admit-list. The
+watch set is whatever the prunes leave (the `.git/` dir + the ref subdirs), and the
+*classifier* decides which of those events are signals.
 macOS/FSEvents is unaffected (single stream, no per-dir descriptors). The `onError`
 routing for the errors Parcel *does* surface (init failure, backend death) stays
 wired as today; we simply don't claim to catch the ones it swallows.
@@ -352,7 +371,9 @@ Founder-directed rig (stood up): a **dev build to the Mac (APFS) + flat-meadow
 (`scratchpad/ab-clean.sh`): expect the send-side capture phase ~31 s → sub-second,
 A→B ~52 s → git-apply-bound (~10 s; the APFS/EXT4 git-apply gap is a separate line).
 Verify on BOTH OSes that ref events flow, objects churn does not reach the daemon,
-a `git fetch` (writes `refs/remotes` + `FETCH_HEAD`) does NOT spuriously push, and
+a `git fetch` (writes `refs/remotes` + `FETCH_HEAD`) does not spuriously
+**capture/upload** (a `packed-refs` repack during fetch may fire one carry-only
+push — slow probe, zero capture, per §Contracts — which is acceptable), and
 the Linux host shows no inotify-overflow regression under a fetch-heavy repo.
 
 ## Open decisions (for the final review)
