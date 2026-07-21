@@ -1,6 +1,6 @@
 # 174 — Apply-side performance: held-repo livelock, git-apply dark time, and pull/push tails
 
-Status: ALIGNED v4 — r3 confirmed 6/7 closed; sole residual (one missing test-10 adversary) fixed exactly as prescribed and self-certified (2026-07-21)
+Status: v5 — index-lane amendment (rig-found vacuity) UNDER FOCUSED REVIEW; v4 was ALIGNED 2026-07-21
 Author: Claude (session 2026-07-21), field evidence from the live fleet
 Relates: 172 (event-driven capture), 175 (ref side-channel), 130 (follow/ownership model),
 173 (reserved: two-writer spurious divergence — this doc's item B is the ONE-writer sibling)
@@ -329,7 +329,19 @@ iff every lane passes: [r1: C6,C7,O7,B4b]
 - `refs/stash` is exactly equal in `P` and `C`;
 - HEAD is exactly equal, both for symbolic and detached forms;
 - `refScope` is exactly equal;
-- the semantic index projection is exactly equal under `indexIdentityV2`;
+- the index lane is subsumed. AMENDED v5 (maiden rig run, 2026-07-21): exact
+  `indexIdentityV2` equality between `P` and `C` — the r1 rule — is VACUOUS for
+  the healing case: a writer that is ahead holds a clean index at its newer
+  tree, so equality can never hold and B never fires (rig-proven:
+  "final candidate did not supersede pending section" on the seeded wedge).
+  The sound rule: `P`'s index is subsumed iff it is CLEAN AGAINST ITS OWN
+  HEAD — `git diff-index --cached --quiet <P.mainOid>` with `GIT_INDEX_FILE`
+  pointing at `P`'s fetched index artifact (graphEnv; exit 0 = clean). A clean
+  pending index carries no information beyond `P`'s committed history, which
+  the branch lane has already proven subsumed. A DIRTY pending index (staged
+  uncommitted work unique to `P`) still blocks supersession; any error blocks.
+  `C`'s own index needs no comparison — it is this writer's current truth,
+  published as-is;
 - the complete op-state path→artifact map is exactly equal;
 - canonical config is exactly equal.
 
