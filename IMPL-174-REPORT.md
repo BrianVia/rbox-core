@@ -56,3 +56,45 @@ None. The API command-line workaround changes only Vitest config loading to avoi
 - Tests: `src/cli/apply-stats-format.test.ts`, `src/cli/e2ee-sync.test.ts`, `src/cli/sync-git/follow.test.ts`, `src/cli/sync-git/git-sync.test.ts`, `src/cli/sync-git/held-attempt-state.test.ts`, `src/cli/sync-git/held-skip.test.ts`, `src/cli/sync-git/pending-supersession.test.ts`, `src/cli/sync-git/publisher-tombstones.test.ts`.
 
 IMPL-COMPLETE
+
+## Quality pass
+
+Completed `FIX-PLAN-174-QUALITY.md` against the committed partial pass. Each ID was first audited in the current tree; none was fully already-applied, and the partially placed A3 invariant was completed at its required declaration. The design contracts and all five `SPEC-174-IMPL.md` inviolables remain unchanged.
+
+- S1 — applied: both ownership-indeterminate paths now retain physical held-ref state while emitting only the `indeterminate` typed blocker; later ref-plane and checkout projections cannot re-add `local-commits`/`local-stash` blockers.
+- R1 — applied: both local canonicalizers were removed in favor of `canonicalString`; audited inputs contain only supported JSON values and non-negative integer sizes/generations.
+- R2 — applied: `graphEnv` is exported from reachability and is the sole pending-proof graph environment.
+- R3 — applied: `indexArtifact` is exported with strict/throwing mode and the pending-proof copy was removed.
+- D1 — applied: removed duplicated `metrics.skippedHeld` state; the `skippedHeld=` summary token now reads `results.skipped` directly.
+- D2 — applied: all 14 attempt clears use the separate `clearAttempt` helper.
+- D3 — applied: both partial-state lookups use `currentPartial`.
+- D4 — applied: attempt omission uses destructuring rather than an IIFE/delete copy.
+- D5 — applied: the two hand-built blocker returns use the shared progress/defer path.
+- D6 — applied: `deferResult` removes repeated reason/detail/blocker construction from defer returns.
+- D7 — applied: repeated four-field sidecar serialization uses `sidecarSnapshot`.
+- D8 — applied: `HELD_SKIP_SAFETY_FLOOR_MS` is module-private.
+- E1 — applied: removed the discarded `readAllRefs` call from held observation.
+- E2 — applied: missing pending state short-circuits before `observeHeldInputs`.
+- E3 — applied: the stable pending pre-probe fingerprint/preflight/identity snapshot is threaded into and reused by the slow path.
+- E4 — applied: post-settlement attempt rebinds use one multi-repo state packet and one reload while retaining each repo's exact generation CAS.
+- E5 — applied: independent per-ref supersession proofs run through `Promise.all`.
+- A1 — applied: post-settlement attempt CAS rebind is the exported `rebindHeldAttemptsAfterSettlement` collaborator in `held-skip.ts`.
+- A2 — applied: capture commit/revert bookkeeping is paired through named helpers next to the state it updates.
+- A3 — applied: the two-line normalize-once/prove-exact-object invariant is at the `finalizedOutgoing` declaration.
+- C1 — applied: CODEMAP now names pending-candidate flow, held-skip orchestration, and batched attempt rebind ownership.
+
+Binding skipped items:
+
+- skipped: no shared fetch-and-project-index helper was introduced.
+- skipped: `IMPL-174-REPORT.md` was retained and extended.
+- skipped: attempt clearing remains separate from deferral helpers.
+
+Acceptance:
+
+- `bun run typecheck` — passed.
+- `bun test src/cli src/engine` — passed: 2,610 passed, 16 skipped, 0 failed across 214 files.
+- `bunx vitest run --configLoader runner` from `apps/api` — passed: 781 passed, 4 skipped, 0 failed across 46 files; the existing non-fatal Wrangler read-only log warning was emitted.
+- Focused quality/design-174 suites and `git diff --check` — passed.
+- Independent adversarial re-audit — all IDs applied; binding skips and inviolables intact; no remaining correctness issue found.
+
+QUALITY-COMPLETE

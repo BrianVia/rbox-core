@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { pull, push, pushManifest, sync, type SyncDeps } from "../sync.js";
-import { loadState, repoRecordsForState, saveStateUnsafeLegacyOrTest, type SyncState, type WorkspaceConfig } from "../config.js";
+import { loadState, repoRecordsForState, saveStateUnsafeLegacyOrTest, type RepoRecord, type SyncState, type WorkspaceConfig } from "../config.js";
 import { changedSidecarRepoKeys, orderedDeferralUpdates, type GitDeferralUpdates, type OrderedGitDeferralUpdates } from "../sync-state.js";
 import { BlobShaMismatchError, type CommitResult, type SyncRemote } from "../remote.js";
 import { buildIgnoreMatcher, captureGitState, gitIdentity, gitIdentityKey, gitPreflight, gitSectionBlobRefs, gitSectionNewestLink, MAX_PACK_CHAIN, scanManifest, setGitSpawnObserver, type BlobStore, type FileEntry, type GitSection, type Manifest } from "../../engine/index.js";
@@ -46,6 +46,13 @@ const gitAt = (dir: string, date: string, ...args: string[]) =>
 const test = (name: string, fn: () => unknown | Promise<unknown>, timeout = 20_000) => bunTest(name, fn, timeout);
 test.if = (cond: boolean) => (name: string, fn: () => unknown | Promise<unknown>, timeout = 20_000) =>
   cond ? bunTest(name, fn, timeout) : bunTest.skip(name, fn);
+
+const sidecarSnapshot = (record: RepoRecord): string => JSON.stringify({
+  pending: record.pending,
+  partial: record.partial,
+  attempt: record.attempt,
+  deferrals: record.deferrals,
+});
 
 test("D2 deferral writer preserves chronic age across newer incoming keys and resets reason age", () => {
   const first = nextDeferral("apply", undefined, "git-busy", "2026-01-01T00:00:00.000Z", "incoming-v1");
@@ -456,22 +463,12 @@ test("D2 capture deferral survives failures and remains exact while pending is o
   record = repoRecordsForState(await st(rootA))["capture-restart"]!;
   expect(record.deferrals?.capture?.deferredSince).toBe(since);
   expect(record.deferrals?.apply?.reason).toBe("git-busy");
-  const heldSidecars = JSON.stringify({
-    pending: record.pending,
-    partial: record.partial,
-    attempt: record.attempt,
-    deferrals: record.deferrals,
-  });
+  const heldSidecars = sidecarSnapshot(record);
 
   await fs.rm(busyLock);
   await push(rootA, cfgA, depsA);
   record = repoRecordsForState(await st(rootA))["capture-restart"]!;
-  expect(JSON.stringify({
-    pending: record.pending,
-    partial: record.partial,
-    attempt: record.attempt,
-    deferrals: record.deferrals,
-  })).toBe(heldSidecars);
+  expect(sidecarSnapshot(record)).toBe(heldSidecars);
   expect(since).toBeDefined();
 });
 
@@ -1397,12 +1394,7 @@ async function prepareSupersedingPending(rel: string): Promise<{
   return {
     a,
     b,
-    sidecars: JSON.stringify({
-      pending: exact.pending,
-      partial: exact.partial,
-      attempt: exact.attempt,
-      deferrals: exact.deferrals,
-    }),
+    sidecars: sidecarSnapshot(exact),
   };
 }
 
@@ -1411,12 +1403,7 @@ test("design 174 B: upload, commit-error, and multi-writer 409 preserve every P-
   const { sidecars } = await prepareSupersedingPending(rel);
   const assertExact = async () => {
     const record = repoRecordsForState(await st(rootB))[rel]!;
-    expect(JSON.stringify({
-      pending: record.pending,
-      partial: record.partial,
-      attempt: record.attempt,
-      deferrals: record.deferrals,
-    })).toBe(sidecars);
+    expect(sidecarSnapshot(record)).toBe(sidecars);
   };
 
   // Candidate capture's artifact upload fails. An unrelated file may still ACK,
@@ -1437,12 +1424,7 @@ test("design 174 B: upload, commit-error, and multi-writer 409 preserve every P-
   remote.conflictNext = true;
   remote.beforeForcedConflict = async () => {
     const record = repoRecordsForState(await st(rootB))[rel]!;
-    atConflict = JSON.stringify({
-      pending: record.pending,
-      partial: record.partial,
-      attempt: record.attempt,
-      deferrals: record.deferrals,
-    });
+    atConflict = sidecarSnapshot(record);
   };
   await push(rootB, cfgB, depsB);
   expect(atConflict).toBe(sidecars);
@@ -1603,12 +1585,7 @@ test("standing apply deferral remains byte-exact across a pre-ACK push while pen
   const before = repoRecordsForState(await st(rootB))["bytes-marker"]!.deferrals!.apply!;
   expect(before.bytesChanged).toBeUndefined();
   const beforeRecord = repoRecordsForState(await st(rootB))["bytes-marker"]!;
-  const beforeBytes = JSON.stringify({
-    pending: beforeRecord.pending,
-    partial: beforeRecord.partial,
-    attempt: beforeRecord.attempt,
-    deferrals: beforeRecord.deferrals,
-  });
+  const beforeBytes = sidecarSnapshot(beforeRecord);
 
   await fs.writeFile(path.join(b, "f.txt"), "human bytes during deferral");
   await push(rootB, cfgB, depsB);
@@ -1619,12 +1596,7 @@ test("standing apply deferral remains byte-exact across a pre-ACK push while pen
   expect(marked.deferredSince).toBe(before.deferredSince);
   expect(marked.lastSeen).toBe(before.lastSeen);
   const restartedRecord = repoRecordsForState(restarted)["bytes-marker"]!;
-  expect(JSON.stringify({
-    pending: restartedRecord.pending,
-    partial: restartedRecord.partial,
-    attempt: restartedRecord.attempt,
-    deferrals: restartedRecord.deferrals,
-  })).toBe(beforeBytes);
+  expect(sidecarSnapshot(restartedRecord)).toBe(beforeBytes);
 
   await fs.rm(lock);
   await pull(rootB, cfgB, depsB);

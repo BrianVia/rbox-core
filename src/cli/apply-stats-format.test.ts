@@ -26,7 +26,6 @@ const metricsWith = (repoTimings: GitApplyRepoTiming[], resultCounts: Partial<Re
   commonDirGroups: 0,
   results: results(resultCounts),
   repoTimings,
-  skippedHeld: resultCounts.skipped ?? 0,
 });
 
 function exemplarIndexes(detail: string): number[] {
@@ -50,7 +49,6 @@ test("apply and git metric formats are numeric and path-free", () => {
   const metrics: GitApplyMetrics = {
     runKind: "fresh", repos: 1, commonDirGroups: 0,
     results: { unchanged: 0, applied: 1, deferred: 0, conflict: 0, removed: 0, skipped: 0 },
-    skippedHeld: 0,
     repoTimings: [{ index: 0, queueMs: 5, wallMs: 1234, result: "applied", chain: {
       chainLength: 3, fetchDecryptMs: 820.2, bundleVerifyMs: 40.4, gitImportMs: 3200.1, indexOpStateMs: 30.2,
     } }],

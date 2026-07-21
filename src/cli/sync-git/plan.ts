@@ -141,7 +141,24 @@ export async function planGitSections(
   const configObserved = new Set<string>();
   const skipped: Array<{ relPath: string; reason: string }> = [];
   const out: Record<string, GitSection> = {};
+  // Normalize exactly once, then prove-and-publish that exact object.
+  // A failed proof restores the original P object by identity.
   let finalizedOutgoing: Record<string, GitSection> | undefined;
+  const commitCapture = (rel: string, section: GitSection): void => {
+    out[rel] = section;
+    delete repoAbsent[rel];
+    captured.push(rel);
+  };
+  const revertCapture = (rel: string, fallback: GitSection, reason: string): void => {
+    out[rel] = fallback;
+    if (finalizedOutgoing) finalizedOutgoing[rel] = fallback;
+    delete authoredCfgHashByRepo[rel];
+    delete repoAbsent[rel];
+    const capturedIndex = captured.indexOf(rel);
+    if (capturedIndex >= 0) captured.splice(capturedIndex, 1);
+    if (!carried.includes(rel)) carried.push(rel);
+    deferred.push({ relPath: rel, reason });
+  };
   const pendingSupersessionCandidates = new Set<string>();
   const supersededPending = new Set<string>();
   const cache = await loadGitDivergenceCache(root);
@@ -537,7 +554,13 @@ export async function planGitSections(
       delete needsRes[rel];
     }
 
-    const pf = await gitPreflight(repoDirOf(root, rel));
+    const precomputedPendingProbe = opts.forceCapture && fastLookup?.status === "hit"
+      && fastLookup.probe.preflightOk && !fastLookup.probe.preflightStructural
+      ? fastLookup.probe
+      : undefined;
+    const pf = precomputedPendingProbe
+      ? { ok: true as const, kind: precomputedPendingProbe.preflightKind }
+      : await gitPreflight(repoDirOf(root, rel));
     if (!pf.ok) {
       const builtProbe = await buildPlanProbe(root, rel, fastLookup?.fingerprint.diskCtx, pf);
       if (builtProbe.diskCtx?.kind === "pointer") fastPathParentRel.set(rel, builtProbe.parentRel);
@@ -576,9 +599,14 @@ export async function planGitSections(
       deferOne(rel, pf.reason ?? "preflight failed");
       return;
     }
-    const builtProbe = await buildPlanProbe(root, rel, fastLookup?.fingerprint.diskCtx, pf);
+    const builtProbe = precomputedPendingProbe && fastLookup
+      ? {
+          probe: precomputedPendingProbe,
+          diskCtx: fastLookup.fingerprint.diskCtx,
+          parentRel: precomputedPendingProbe.parentRel,
+        }
+      : await buildPlanProbe(root, rel, fastLookup?.fingerprint.diskCtx, pf);
     if (builtProbe.diskCtx?.kind === "pointer") fastPathParentRel.set(rel, builtProbe.parentRel);
-    const id = builtProbe.identity;
     const idKey = builtProbe.probe.identityKey;
     const liveKind = pf.kind ?? kind;
     const probe = builtProbe.probe;
@@ -594,7 +622,7 @@ export async function planGitSections(
       () => noteCredentialSkip(rel),
       options.disableConfigLane
     ).catch((): DivergenceCacheWriteResult => ({ kind: liveKind }));
-    if (!id) {
+    if (idKey === "none") {
       // empty repo (no commits yet): nothing to capture; keep any synced base.
       const carry = pending[rel] ?? baseSec;
       if (carry) {
@@ -675,7 +703,7 @@ export async function planGitSections(
       }
       pendingSupersessionCandidates.add(rel);
       await options.afterPendingPreProbe?.(rel);
-      await processRepoSlowPath(rel, kind, baseSec, undefined, { forceCapture: true });
+      await processRepoSlowPath(rel, kind, baseSec, probe.fastLookup, { forceCapture: true });
       continue;
     }
 
@@ -849,9 +877,7 @@ export async function planGitSections(
         (abs) => noteRepoBytes(rel, abs)
       );
       if (sec) {
-        out[rel] = await captureWithConfig(rel, sec);
-        delete repoAbsent[rel];
-        captured.push(rel);
+        commitCapture(rel, await captureWithConfig(rel, sec));
       } else {
         deferOne(rel, reason ?? "capture returned nothing (repo vanished mid-capture or failed self-validation)");
       }
@@ -869,8 +895,6 @@ export async function planGitSections(
     }
   });
 
-  // Normalize exactly once, then prove and publish that exact object. A failed
-  // proof swaps the row back to the original P object by identity.
   const normalized = normalizeCurrentOutgoing();
   for (const { relPath, finding } of normalized.findings) glog(tombstoneFindingLine(relPath, finding));
   finalizedOutgoing = normalized.sections;
@@ -884,13 +908,7 @@ export async function planGitSections(
       supersededPending.add(rel);
       continue;
     }
-    if (p) finalizedOutgoing[rel] = p;
-    delete authoredCfgHashByRepo[rel];
-    delete repoAbsent[rel];
-    const capturedIndex = captured.indexOf(rel);
-    if (capturedIndex >= 0) captured.splice(capturedIndex, 1);
-    if (!carried.includes(rel)) carried.push(rel);
-    deferred.push({ relPath: rel, reason: "final candidate did not supersede pending section — carrying pending verbatim" });
+    if (p) revertCapture(rel, p, "final candidate did not supersede pending section — carrying pending verbatim");
   }
 
   const liveKeys = new Set(keys);

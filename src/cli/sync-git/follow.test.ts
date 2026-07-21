@@ -1264,7 +1264,6 @@ test("design 174 A: unchanged allowlisted hold skips only after the mandatory pr
     afterBranchPinsPrepared: () => { pinCalls++; },
   });
   expect(skipped.outcome.gitApplyMetrics?.results.skipped).toBe(1);
-  expect(skipped.outcome.gitApplyMetrics?.skippedHeld).toBe(1);
   expect(capabilityCalls).toBe(0);
   expect(pinCalls).toBe(0);
   expect(ordering).toEqual(["prepass"]);

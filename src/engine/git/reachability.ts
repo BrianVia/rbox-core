@@ -29,7 +29,7 @@ export type NoDropProof =
 
 // r1 F5: graph classification must never turn a promisor fetch into an
 // apparently complete local proof.
-const graphEnv: NodeJS.ProcessEnv = { GIT_NO_LAZY_FETCH: "1", GIT_NO_REPLACE_OBJECTS: "1" };
+export const graphEnv: NodeJS.ProcessEnv = { GIT_NO_LAZY_FETCH: "1", GIT_NO_REPLACE_OBJECTS: "1" };
 
 function errorCode(error: unknown): number | undefined {
   const code = (error as { code?: unknown }).code;

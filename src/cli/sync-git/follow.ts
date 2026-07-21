@@ -263,6 +263,15 @@ function progressWithBlocker(
   return { ...progress, blockers: [...progress.blockers, blockerForReason(reason, provenance, detail)] };
 }
 
+function deferResult(
+  progress: FollowProgress,
+  reason: GitDeferralReason,
+  detail: string,
+  provenance: "checkout" | "boundary" = "checkout",
+): FollowResult {
+  return { status: "defer", reason, detail, ...progressWithBlocker(progress, reason, detail, provenance) };
+}
+
 export async function checkoutJournalBinding(stream: string, stateNonce: string, ctx: RepoCtx): Promise<CheckoutJournalBinding> {
   return {
     stream,
@@ -320,13 +329,20 @@ export async function clearFollowJournal(workspaceRoot: string, relPath: string,
   await clearCheckoutJournal(workspaceRoot, relPath);
 }
 
-function indexArtifact(section: GitSection | undefined) {
-  if (!section || !section.indexSha || !section.indexEncSha || section.indexCipherSize === undefined) return undefined;
+export function indexArtifact(section: GitSection | undefined, options: { strict?: boolean } = {}) {
+  if (!section) return undefined;
+  const fields = [section.indexSha, section.indexEncSha, section.indexCipherSize] as const;
+  if (fields.every((field) => field === undefined)) return undefined;
+  if (!section.indexSha || !section.indexEncSha || section.indexCipherSize === undefined) {
+    if (options.strict) throw new Error("incomplete index lane");
+    return undefined;
+  }
   return {
     sha: section.indexSha,
     encSha: section.indexEncSha,
     cipherSize: section.indexCipherSize,
-    ...(section.indexComp ? { comp: section.indexComp, payloadSha: section.indexPayloadSha } : {}),
+    ...(section.indexComp ? { comp: section.indexComp } : {}),
+    ...(section.indexPayloadSha ? { payloadSha: section.indexPayloadSha } : {}),
   };
 }
 
@@ -628,6 +644,7 @@ async function publishRefPlane(
   const plannedRoots = [...new Set(Object.values(effective.refs))];
   let checkoutRefReason: GitDeferralReason | undefined;
   let checkoutRefDetail: string | undefined;
+  let checkoutRefReasonFromIndeterminate = false;
   const authoredRefChanges: Array<{ ref: string; before?: string; after?: string }> = [];
   const manualProtected = new Set(opts.manualResolution?.protectedOids ?? []);
   const incomingHeadRef = headBranchOf(opts.incoming.head);
@@ -697,7 +714,10 @@ async function publishRefPlane(
             detail: `${ref} preservation proof ${proof.marker}`,
           });
           hold = ref === "refs/stash" ? "local-stash" : "local-commits";
-          checkoutRefReason ??= proof.marker === "shallow-store" ? "unsupported" : "unreadable";
+          if (!checkoutRefReason) {
+            checkoutRefReason = proof.marker === "shallow-store" ? "unsupported" : "unreadable";
+            checkoutRefReasonFromIndeterminate = true;
+          }
           break;
         }
       }
@@ -752,7 +772,11 @@ async function publishRefPlane(
       if (proof.status === "proven") continue;
       classifiedHolds.set(ref, ref === "refs/stash" ? "local-stash" : "local-commits");
       if (proof.status === "indeterminate") {
-        checkoutRefReason ??= proof.marker === "shallow-store" ? "unsupported" : "unreadable";
+        indeterminateRefs.add(ref);
+        if (!checkoutRefReason) {
+          checkoutRefReason = proof.marker === "shallow-store" ? "unsupported" : "unreadable";
+          checkoutRefReasonFromIndeterminate = true;
+        }
         blockers.push({
           provenance: "indeterminate",
           reason: proof.marker === "shallow-store" ? "unsupported" : "unreadable",
@@ -773,7 +797,7 @@ async function publishRefPlane(
     if (hold) {
       heldRefs[ref] = hold === "worktree-ownership" ? "ownership" : hold;
       if (opts.manualResolution) checkoutRefReason ??= hold;
-      if (ref === incomingHeadRef) checkoutRefReason = ambiguousRefs.has(ref)
+      if (ref === incomingHeadRef && !indeterminateRefs.has(ref)) checkoutRefReason = ambiguousRefs.has(ref)
         ? "unreadable"
         : hold;
       continue;
@@ -949,12 +973,15 @@ async function publishRefPlane(
   }
 
   const configApplied = await opts.runConfig?.().catch(() => false) ?? true;
-  for (const [ref, held] of Object.entries(heldRefs)) blockers.push({
-    provenance: "ref-plane",
-    reason: held === "ownership" ? "worktree-ownership" : held,
-    ref,
-  });
-  if (checkoutRefReason) blockers.push(blockerForReason(checkoutRefReason, "checkout", checkoutRefDetail));
+  for (const [ref, held] of Object.entries(heldRefs)) {
+    if (indeterminateRefs.has(ref)) continue;
+    blockers.push({
+      provenance: "ref-plane",
+      reason: held === "ownership" ? "worktree-ownership" : held,
+      ref,
+    });
+  }
+  if (checkoutRefReason && !checkoutRefReasonFromIndeterminate) blockers.push(blockerForReason(checkoutRefReason, "checkout", checkoutRefDetail));
   const checkoutWitnessDisposition = {
     heldRefs: new Set(Object.keys(heldRefs)),
     forcedRefs,
@@ -1006,14 +1033,14 @@ function expectedHead(section: GitSection): string {
 export async function followDivergedRepo(opts: FollowOptions): Promise<FollowResult> {
   const valid = validateGitSection(opts.incoming);
   const emptyProgress: FollowProgress = { appliedRefs: {}, heldRefs: {}, blockers: [], configApplied: true };
-  if (!valid.ok) return { status: "defer", reason: "unsupported", detail: `invalid git section: ${valid.reason}`, ...emptyProgress, blockers: [blockerForReason("unsupported", "checkout", valid.reason)] };
+  if (!valid.ok) return deferResult(emptyProgress, "unsupported", `invalid git section: ${valid.reason}`);
 
   let staged: StagedIncoming;
   try {
     staged = await stageIncoming(opts);
   } catch (error) {
     const detail = `git artifact fetch/decrypt/import failed: ${String((error as Error)?.message ?? error)}`;
-    return { status: "defer", reason: "artifact", detail, ...emptyProgress, blockers: [blockerForReason("artifact", "checkout", detail)] };
+    return deferResult(emptyProgress, "artifact", detail);
   }
 
   try {
@@ -1022,14 +1049,14 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
         const collision = await candidateIndexCollision(opts.workspaceRoot, opts.ctx.repoDir, staged.candidateIndex);
         if (collision) {
           opts.log?.(`git-sync WARNING ${opts.relPath}: incoming index has receiver-equivalent paths (${collision})`);
-          return { status: "defer", reason: "unreadable", detail: "incoming index has receiver path-equivalence collision", ...progressWithBlocker(emptyProgress, "unreadable", "incoming index has receiver path-equivalence collision") };
+          return deferResult(emptyProgress, "unreadable", "incoming index has receiver path-equivalence collision");
         }
       } catch {
-        return { status: "defer", reason: "unreadable", detail: "incoming index receiver-equivalence check failed", ...progressWithBlocker(emptyProgress, "unreadable", "incoming index receiver-equivalence check failed") };
+        return deferResult(emptyProgress, "unreadable", "incoming index receiver-equivalence check failed");
       }
     }
     const liveBefore = await readLive(opts.ctx);
-    if (!liveBefore) return { status: "defer", reason: "unreadable", detail: "git metadata could not be read", ...progressWithBlocker(emptyProgress, "unreadable", "git metadata could not be read") };
+    if (!liveBefore) return deferResult(emptyProgress, "unreadable", "git metadata could not be read");
     const baseProjection = opts.record?.idxProj ?? await deriveBaseIndexProjection(opts, staged.tmpDir).catch(() => undefined);
     const effective = effectiveRefs(opts.ctx, opts.incoming);
     const ownershipSection = { ...opts.incoming, refs: effective.refs };
@@ -1068,7 +1095,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
     const capabilitySupported = opts.capabilityProbe
       ? await opts.capabilityProbe(await git(opts.ctx.repoDir, ["--version"]))
       : await checkoutTransactionSupported(opts.ctx.repoDir);
-    if (!capabilitySupported) return { status: "defer", reason: "unsupported", detail: "git lacks prepared transactional symref-update", ...progressWithBlocker(progress, "unsupported", "git lacks prepared transactional symref-update") };
+    if (!capabilitySupported) return deferResult(progress, "unsupported", "git lacks prepared transactional symref-update");
 
     // Scratch refs and held incoming values are not durable roots. Authorize
     // checkout only from incoming refs that are already published (plus the
@@ -1115,7 +1142,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
         origHeadPreservation = await preserveOrigHead(opts, origHeadMismatch);
       } catch (error) {
         opts.log?.(origHeadPreservationFailureLine(opts.relPath, error));
-        return { status: "defer", reason: "local-operation", detail: "operation state differs at ORIG_HEAD", ...progressWithBlocker(progress, "local-operation", "operation state differs at ORIG_HEAD") };
+        return deferResult(progress, "local-operation", "operation state differs at ORIG_HEAD");
       }
     }
 
@@ -1155,13 +1182,13 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
           humanDisplacementOrigin(liveBefore.currentRef, opts.incoming),
         );
         if (pins.status === "indeterminate") {
-          return { status: "defer", reason: "unreadable", detail: `current-ref reflog reachability ${pins.marker}`, ...progressWithBlocker(progress, "unreadable", `current-ref reflog reachability ${pins.marker}`) };
+          return deferResult(progress, "unreadable", `current-ref reflog reachability ${pins.marker}`);
         }
         pinLines = pins.transactionLines;
         checkoutBranchReflogFingerprint = pins.reflogFingerprint;
       }
       if (oldOid && ((newOid && oldOid !== newOid) || (!newOid && effective.deleteAbsent))) {
-        if (!opts.branchProtocol) return { status: "defer", reason: "artifact", detail: "checked-out branch transition lacks lineage authority", ...progressWithBlocker(progress, "artifact", "checked-out branch transition lacks lineage authority") };
+        if (!opts.branchProtocol) return deferResult(progress, "artifact", "checked-out branch transition lacks lineage authority");
         checkoutBranchPlan = opts.manualResolution
           ? await planManualBranchTransition({
               repoDir: opts.ctx.repoDir, binding: opts.branchProtocol.binding, ref: liveBefore.currentRef,
@@ -1193,7 +1220,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
       : { kind: "detached" as const, newOid: opts.incoming.head.trim(), oldOid: liveBefore.currentTip! };
     if (incomingHeadRef && incomingHeadRef !== liveBefore.currentRef) {
       const targetOid = effective.refs[incomingHeadRef];
-      if (!targetOid) return { status: "defer", reason: "unsupported", detail: "incoming HEAD branch is filtered or absent", ...progressWithBlocker(progress, "unsupported", "incoming HEAD branch is filtered or absent") };
+      if (!targetOid) return deferResult(progress, "unsupported", "incoming HEAD branch is filtered or absent");
       reserveRef(incomingHeadRef, targetOid);
     }
 
