@@ -6,6 +6,14 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.7.17] — 2026-07-21 — "leftovers don't block you"
+
+### Fixed
+- `keep-mine` no longer refuses because of harmless leftover files from
+  finished git operations (a stale `ORIG_HEAD` or `REBASE_HEAD`). Only a
+  genuinely in-progress merge/rebase/cherry-pick blocks it — found live
+  during the first real-world unwedge, which succeeded.
+
 ## [1.7.16] — 2026-07-21 — "your repo explains itself"
 
 ### Added
