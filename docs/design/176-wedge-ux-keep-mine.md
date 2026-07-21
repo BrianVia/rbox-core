@@ -1,6 +1,6 @@
 # 176 — Wedge UX: `keep-mine`, legible deferrals, and the held-skip eligibility defect
 
-Status: v5 — §4 allowlist amendment (rig-forced: local-index is structural to the wedge) UNDER FOCUSED REVIEW; v4 was ALIGNED 2026-07-21
+Status: v6 — r5 folded
 Relates: 174 (livelock self-heal; this ships its manual escape hatch),
 130 (publisher-ack composition — the arm keep-mine lands through),
 128 (show-me/take-theirs token flow — the scaffolding keep-mine completes),
@@ -187,6 +187,43 @@ The allowlist becomes `{local-commits, local-stash, local-index}`; every
 other rule (merged non-empty set, composer hold mapping, floor, canary)
 unchanged. The rig's non-opportunistic assertion now exercises exactly this
 triple. 174 §4.1's allowlist is superseded by this amendment.
+
+### §4 AMENDMENT v6 (r5 folded, 2026-07-21): stable classification identity
+
+The allowlist is `{local-commits, local-stash, local-index}`. The exact
+blocker-producing classification whose blocker set is persisted MUST be
+bracketed: take a trusted fingerprint before that classification and the
+matching fingerprint only after every classification/composer input has been
+read, recording no attempt if they differ. If rbox-authored mutations make
+that impractical, rerun the complete classification inside a final stable
+bracket. A change from a divergent index to BASE/incoming after classification
+therefore cannot pair a stale `local-index` blocker with a repaired index
+fingerprint.
+
+The stable bracket also computes and binds the effective BASE index projection
+(including absent) and the effective incoming index projection in
+`HeldInputObservation`/`GitHeldAttempt`. BASE's effective projection is the
+`RepoRecord.idxProj` value when present, otherwise the decrypt-verified BASE
+artifact projection. The attempt additionally binds the exact canonical
+incoming index artifact descriptor, including `indexSha`, `indexEncSha`,
+`indexCipherSize`, `indexComp`, and `indexPayloadSha`, so same-plaintext
+locator/encoding changes invalidate it.
+
+The live semantic projection's split-index dependency is part of the same
+fingerprint bracket. The exact referenced `sharedindex.*` file uses the same
+content-hash or stat plus racy-clean discipline as `.git/index`; inability to
+enumerate that dependency fails open to a full follow. Mutating or removing
+only the referenced shared index invalidates an attempt.
+
+Composer authority is unchanged. `local-index` has checkout provenance and no
+ref, so it cannot satisfy causal ref mapping. Mapping remains limited to
+`local-commits`/`missing-branch-proof` and
+`local-stash`/`missing-safe-ref-proof`; unmatched composer holds and
+`checkoutComplete:false` remain blocking, and the merged blocker set remains
+non-empty. Tests pin the exact mixed classifier triple, unmatched same-ref
+composer code, checkout-incomplete control, the classification/recording race,
+idxProj-only invalidation, same-`indexSha`/changed-locator invalidation, and a
+split-index shared-dependency mutation.
 
 ## 5. Tests (MUST)
 

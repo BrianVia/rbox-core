@@ -10,6 +10,7 @@ import {
   gitDeferralReasonPresentation,
   progressLabel,
   relTime,
+  renderGitDeferralCompanion,
   renderGitDeferralLine,
   type StatusSnapshot,
 } from "./status-view.js";
@@ -75,6 +76,22 @@ test("renderGitDeferralLine sanitizes branches, hides detached OIDs, and marks c
   })).toBe("git deferred 1h: local commits on detached checkout (repo)");
 });
 
+test("status companion explains the hold without changing the shared deferred grammar", () => {
+  const frozen = renderGitDeferralLine({
+    relPath: "repo",
+    reason: "local-commits",
+    deferredSince: iso(3600),
+    checkout: { kind: "detached" },
+    now: NOW,
+  });
+  expect(frozen).toBe("git deferred 1h: local commits on detached checkout (repo)");
+  const actionable = renderGitDeferralCompanion({ reason: "local-commits", canResolve: true, canKeepMine: true });
+  expect(actionable).toBe("Your repository is healthy; only rbox's bookkeeping is paused (local commits). To publish my work, run `rbox git resolve <repo> keep-mine`; `take-theirs` discards my local changes and follows incoming.");
+  expect(actionable).not.toMatch(/^git(?:-sync)? deferred/);
+  expect(renderGitDeferralCompanion({ reason: "git-busy", canResolve: false, canKeepMine: false }))
+    .toBe("Your repository is healthy; only rbox's bookkeeping is paused (git busy). Let the other Git process finish, then let sync retry.");
+});
+
 test("projectGitDeferralRepos collapses lanes by oldest age, reason precedence, and bytes OR", () => {
   const projected = projectGitDeferralRepos([
     { repo: "repo", deferral: { lane: "capture", reason: "local-commits", deferredSince: iso(3600), reasonSince: iso(120), bytesChanged: true } },
@@ -88,6 +105,7 @@ test("projectGitDeferralRepos collapses lanes by oldest age, reason precedence, 
     reasonSince: iso(30),
     remediationClass: "transient",
     canResolve: false,
+    canKeepMine: false,
     alsoDeferred: "Also deferred: capture — local commits.",
     bytesChanged: true,
     checkout: { kind: "branch", label: "main" },
@@ -109,7 +127,7 @@ test("projection derives resolver capability from the complete record and sorts 
     { repo: "actionable", deferral: valid, record },
   ], NOW);
   expect(projected.map((entry) => entry.repo)).toEqual(["actionable", "bad", "future"]);
-  expect(projected[0]).toMatchObject({ canResolve: true, remediationClass: "apply-resolvable" });
+  expect(projected[0]).toMatchObject({ canResolve: true, canKeepMine: false, remediationClass: "apply-resolvable" });
 });
 
 test("the reason vocabulary is exhaustive and unknown reasons stay opaque and non-actionable", () => {
@@ -136,6 +154,7 @@ test("the reason vocabulary is exhaustive and unknown reasons stay opaque and no
     reasonText: "Git sync is deferred for an unrecognized reason.",
     remediationClass: "apply-unavailable",
     canResolve: false,
+    canKeepMine: false,
   });
 });
 

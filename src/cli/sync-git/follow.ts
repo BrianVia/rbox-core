@@ -80,6 +80,7 @@ import {
   logVetoOnce,
   type BreadcrumbVetoGate,
 } from "./breadcrumb-veto.js";
+import { gitFingerprint, gitFingerprintRun, type GitFingerprint } from "./fingerprint.js";
 
 const refEquivalenceWarnings = new Set<string>();
 const receiverEquivalenceByWorkspace = new Map<string, ReturnType<typeof probeReceiverEquivalence>>();
@@ -168,6 +169,18 @@ interface FollowOptions {
   forcedHeldRefs?: GitPartialApply["heldRefs"];
   /** Deterministic preservation-boundary race injection for §130 tests. */
   afterBranchPinsPrepared?: (ref: string) => void | Promise<void>;
+  /** Runs after the exact initial classifier and before staged scratch refs are
+   * cleaned. The callback may persist an attempt only if its trusted edge still
+   * matches after all orchestration/composer inputs have been consumed. */
+  afterHeldClassification?: (input: {
+    phase: "defer" | "followed";
+    trustedFingerprint: GitFingerprint | undefined;
+    effectiveBaseIndexProjection: string | null | undefined;
+    effectiveIncomingIndexProjection: string | null | undefined;
+    blockers: readonly TypedBlocker[];
+    reflogPaths: readonly string[];
+    progress: FollowProgress;
+  }) => void | Promise<void>;
   /** Prevalidated, incoming-key-bound §130 lineage/artifact authority. Without
    * it branch mutation is forbidden; tags/stash retain their distinct lane. */
   branchProtocol?: FollowerBranchProtocol;
@@ -210,6 +223,7 @@ interface StagedIncoming {
   incomingIndexProjection?: string;
   opState: Array<{ rel: string; tmp: string }>;
   opBytes: Record<string, Uint8Array>;
+  cleanupRefs(): Promise<void>;
   cleanup(): Promise<void>;
 }
 
@@ -362,8 +376,11 @@ export async function stageIncoming(opts: StageIncomingOptions): Promise<StagedI
   await fs.mkdir(path.join(ctx.repoDir, ".rbox"), { recursive: true });
   const tmpDir = await fs.mkdtemp(path.join(ctx.repoDir, ".rbox", "git-follow-"));
   const incomingNs = `refs/rbox-incoming/${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
-  const cleanup = async () => {
+  const cleanupRefs = async () => {
     for (const ref of await listRefs(ctx.repoDir, incomingNs).catch(() => [])) await git(ctx.repoDir, ["update-ref", "-d", ref]).catch(() => {});
+  };
+  const cleanup = async () => {
+    await cleanupRefs();
     await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   };
   try {
@@ -390,7 +407,7 @@ export async function stageIncoming(opts: StageIncomingOptions): Promise<StagedI
     }
     await pruneStaleScratchRefs(ctx.repoDir, "refs/rbox-incoming");
     await importGitPackChain(ctx.repoDir, incoming, store, kek, tmpDir, incomingNs, opts.chainTimings);
-    return { tmpDir, incomingNs, candidateIndex, incomingIndexProjection, opState, opBytes, cleanup };
+    return { tmpDir, incomingNs, candidateIndex, incomingIndexProjection, opState, opBytes, cleanupRefs, cleanup };
   } catch (error) {
     await cleanup();
     throw error;
@@ -632,6 +649,7 @@ async function publishRefPlane(
   opts: FollowOptions,
   live: LiveMetadata,
   roots: readonly string[],
+  classifyOnly = false,
 ): Promise<FollowProgress & {
   checkoutRefReason?: GitDeferralReason;
   checkoutRefDetail?: string;
@@ -880,10 +898,11 @@ async function publishRefPlane(
         appliedRefs[ref] = { kind: "direct", oid: newOid };
       }
       if (!opts.manualResolution && ref === "refs/stash" && newOid) {
-        await addTimedMs(opts.chainTimings, "reflogMs", () => ensureStashReflog(opts.ctx.repoDir, newOid));
+        if (!classifyOnly) await addTimedMs(opts.chainTimings, "reflogMs", () => ensureStashReflog(opts.ctx.repoDir, newOid));
       }
       continue;
     }
+    if (classifyOnly) continue;
     try {
       const ownedNow = await addTimedMs(opts.chainTimings, "ownershipMs", () => branchesCheckedOutElsewhere(opts.ctx));
       const liveNow = await addTimedMs(opts.chainTimings, "ownershipMs", () => readAllRefs(opts.ctx.repoDir));
@@ -996,7 +1015,7 @@ async function publishRefPlane(
     }
   }
 
-  const configApplied = await opts.runConfig?.().catch(() => false) ?? true;
+  const configApplied = classifyOnly ? true : await opts.runConfig?.().catch(() => false) ?? true;
   for (const [ref, held] of Object.entries(heldRefs)) {
     if (indeterminateRefs.has(ref)) continue;
     blockers.push({
@@ -1068,6 +1087,10 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
   }
 
   try {
+    // Imported scratch refs are transport scaffolding, never ownership roots.
+    // Remove them before the trusted held-classification edge so cleanup cannot
+    // make an otherwise stable attempt fingerprint self-invalidate.
+    await staged.cleanupRefs();
     if (staged.candidateIndex) {
       try {
         const collision = await candidateIndexCollision(opts.workspaceRoot, opts.ctx.repoDir, staged.candidateIndex);
@@ -1079,10 +1102,19 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
         return deferResult(emptyProgress, "unreadable", "incoming index receiver-equivalence check failed");
       }
     }
+    const trustedFingerprint = await gitFingerprint(
+      gitFingerprintRun("per-decision"), opts.workspaceRoot, opts.relPath, { includeIndexDependencies: true },
+    ).catch(() => undefined);
+    const effectiveIncomingIndexProjection = indexArtifact(opts.incoming)
+      ? staged.candidateIndex
+        ? await indexIdentityV2(opts.ctx.repoDir, staged.candidateIndex)
+        : undefined
+      : null;
     const liveBefore = await readLive(opts.ctx, opts.chainTimings);
     if (!liveBefore) return deferResult(emptyProgress, "unreadable", "git metadata could not be read");
     const baseProjection = opts.record?.idxProj ?? await addTimedMs(opts.chainTimings, "indexOpStateMs", () =>
       deriveBaseIndexProjection(opts, staged.tmpDir).catch(() => undefined));
+    const effectiveBaseIndexProjection = indexArtifact(opts.base) ? baseProjection : null;
     const effective = effectiveRefs(opts.ctx, opts.incoming);
     const ownershipSection = { ...opts.incoming, refs: effective.refs };
     const roots = incomingOwnershipRoots(ownershipSection, { prefix: staged.incomingNs, opState: staged.opBytes });
@@ -1147,7 +1179,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
     const first = await addTimedMs(opts.chainTimings, "classifyMs", () => classifyCheckout({
       opts,
       live: liveBefore,
-      incomingProjection: staged.incomingIndexProjection,
+      incomingProjection: effectiveIncomingIndexProjection ?? undefined,
       baseProjection,
       roots: checkoutRoots,
       boundary: false,
@@ -1156,7 +1188,19 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
       checkoutRefDetail: refProgress.checkoutRefDetail,
       heldRefs: progress.heldRefs,
     }));
-    if (!first.safe) return { status: "defer", reason: first.reason!, detail: first.detail ?? "checkout follow proof failed", ...progress, blockers: [...progress.blockers, ...first.blockers] };
+    if (!first.safe) {
+      const blockers = [...progress.blockers, ...first.blockers];
+      await opts.afterHeldClassification?.({
+        phase: "defer",
+        trustedFingerprint,
+        effectiveBaseIndexProjection,
+        effectiveIncomingIndexProjection,
+        blockers,
+        reflogPaths: progress.consultedReflogPaths ?? [],
+        progress: { ...progress, blockers },
+      });
+      return { status: "defer", reason: first.reason!, detail: first.detail ?? "checkout follow proof failed", ...progress, blockers };
+    }
 
     let origHeadPreservation: OrigHeadPreservation | undefined;
     if (first.breadcrumbWaived) {
@@ -1549,6 +1593,56 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
         await pruneOrigHeadRecoveryRefs(opts.ctx.repoDir, origHeadPreservation.discriminator, origHeadPreservation.recoveryRef).catch(() => {});
       }
       opts.log?.(`git-sync: adopted stale ORIG_HEAD breadcrumb for ${opts.relPath} (old value preserved at ${origHeadPreservation.recoveryLocation})`);
+    }
+    if (opts.afterHeldClassification && !opts.manualResolution) {
+      const finalTrusted = await gitFingerprint(
+        gitFingerprintRun("per-decision"), opts.workspaceRoot, opts.relPath, { includeIndexDependencies: true },
+      ).catch(() => undefined);
+      const finalIncomingProjection = indexArtifact(opts.incoming)
+        ? staged.candidateIndex
+          ? await indexIdentityV2(opts.ctx.repoDir, staged.candidateIndex)
+          : undefined
+        : null;
+      const finalBaseProjection = indexArtifact(opts.base)
+        ? opts.record?.idxProj ?? await addTimedMs(opts.chainTimings, "indexOpStateMs", () =>
+          deriveBaseIndexProjection(opts, staged.tmpDir).catch(() => undefined))
+        : null;
+      const finalLive = await readLive(opts.ctx, opts.chainTimings);
+      if (finalLive) {
+        const finalRef = await publishRefPlane(opts, finalLive, roots, true);
+        const finalCheckout = await addTimedMs(opts.chainTimings, "classifyMs", () => classifyCheckout({
+          opts,
+          live: finalLive,
+          incomingProjection: finalIncomingProjection ?? undefined,
+          baseProjection: finalBaseProjection ?? undefined,
+          roots: checkoutRoots,
+          boundary: false,
+          tombstonePrunedThisCycle: postProgress.tombstonePrunedThisCycle === true,
+          checkoutRefReason: finalRef.checkoutRefReason,
+          checkoutRefDetail: finalRef.checkoutRefDetail,
+          heldRefs: finalRef.heldRefs,
+        }));
+        const blockers = [...finalRef.blockers, ...finalCheckout.blockers];
+        const finalReflogPaths = [...new Set([
+          ...(opts.ctx.kind === "dir" ? ["logs/refs/stash"] : []),
+          ...(finalRef.consultedReflogPaths ?? []),
+        ])].sort();
+        const finalProgress: FollowProgress = {
+          ...postProgress,
+          heldRefs: finalRef.heldRefs,
+          blockers,
+          consultedReflogPaths: finalReflogPaths,
+        };
+        await opts.afterHeldClassification({
+          phase: "followed",
+          trustedFingerprint: finalTrusted,
+          effectiveBaseIndexProjection: finalBaseProjection,
+          effectiveIncomingIndexProjection: finalIncomingProjection,
+          blockers,
+          reflogPaths: finalReflogPaths,
+          progress: finalProgress,
+        });
+      }
     }
     return { status: "followed", ...postProgress };
   } finally {

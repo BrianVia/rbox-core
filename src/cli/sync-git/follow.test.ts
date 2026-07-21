@@ -1280,17 +1280,55 @@ test("design 174 A: unchanged allowlisted hold skips only after the mandatory pr
   expect(capabilityCalls).toBeGreaterThan(0);
 });
 
+test("design 176: own composer-pending hold maps to its causal ref blocker and becomes skippable", async () => {
+  await commit("main base\n", "main base");
+  await git(sender, "branch", "topic");
+  const base = await capture();
+  await materialize(base);
+  await git(sender, "switch", "-q", "topic");
+  await commit("incoming topic\n", "incoming topic");
+  await git(sender, "switch", "-q", "main");
+  const incoming = await capture();
+
+  const topic = "refs/heads/topic";
+  const oldTopic = await git(receiver, "rev-parse", topic);
+  const tree = await git(receiver, "rev-parse", `${oldTopic}^{tree}`);
+  const localTopic = await gitExec([
+    "-C", receiver,
+    "-c", "user.email=t@t.t",
+    "-c", "user.name=t",
+    "commit-tree", tree,
+    "-p", oldTopic,
+    "-m", "local topic",
+  ]).then(({ stdout }) => stdout.toString().trim());
+  await git(receiver, "update-ref", topic, localTopic, oldTopic);
+
+  const state = stateWith(base);
+  const first = await applyIncoming(state, incoming, matchingOracle, { collectMetrics: true });
+  expect(first.outcome.gitPendingRemote?.repo).toEqual(incoming);
+  expect(first.outcome.partial?.repo?.heldRefs[topic]).toBe("local-commits");
+  expect(first.outcome.attempt?.repo?.blockers).toContainEqual({
+    provenance: "ref-plane", reason: "local-commits", ref: topic,
+  });
+  expect(first.outcome.attempt?.repo?.blockers.some((blocker) => blocker.provenance === "composer")).toBe(false);
+
+  const saved = await landOutcome(state, first.outcome, 2);
+  await Bun.sleep(2_100);
+  let followCalls = 0;
+  const second = await applyIncoming(saved, incoming, matchingOracle, {
+    collectMetrics: true,
+    capabilityProbe: async () => { followCalls++; return true; },
+  });
+  expect(second.outcome.gitApplyMetrics?.results.skipped).toBe(1);
+  expect(followCalls).toBe(0);
+});
+
 for (const [label, expectedReason, prepare] of [
   ["local-edits", "local-edits", async () => ({
     proveRepo: async () => ({ kind: "mismatch" as const, sample: ["repo/tracked.txt"] }),
     reproveRepo: async () => ({ kind: "mismatch" as const, sample: ["repo/tracked.txt"] }),
     receiptHash: () => undefined,
   })],
-  ["local-index", "local-index", async () => {
-    await fs.writeFile(path.join(receiver, "held-index.txt"), "held\n");
-    await git(receiver, "add", "held-index.txt");
-    return matchingOracle;
-  }],
   ["local-operation", "local-operation", async (c1: string) => {
     await fs.writeFile(path.join(receiver, ".git", "MERGE_HEAD"), `${c1}\n`);
     return matchingOracle;
@@ -1313,6 +1351,67 @@ for (const [label, expectedReason, prepare] of [
     expect(capabilityCalls).toBeGreaterThan(0);
   });
 }
+
+test("design 176 v6: unchanged local-index hold is eligible for held-skip", async () => {
+  const { state, incoming } = await baseAndIncoming();
+  await fs.writeFile(path.join(receiver, "held-index.txt"), "held\n");
+  await git(receiver, "add", "held-index.txt");
+  const first = await applyIncoming(state, incoming, matchingOracle, { collectMetrics: true });
+  expect(first.outcome.attempt?.repo?.blockers).toContainEqual(expect.objectContaining({
+    provenance: "checkout", reason: "local-index",
+  }));
+  const saved = await landOutcome(state, first.outcome, 2);
+  await Bun.sleep(2_100);
+  let capabilityCalls = 0;
+  const retried = await applyIncoming(saved, incoming, matchingOracle, {
+    collectMetrics: true,
+    capabilityProbe: async () => { capabilityCalls++; return true; },
+  });
+  expect(retried.outcome.gitApplyMetrics?.results.skipped).toBe(1);
+  expect(capabilityCalls).toBe(0);
+});
+
+test("design 176 v6: index repair after classification records no stale attempt", async () => {
+  const { state, incoming } = await baseAndIncoming();
+  await fs.writeFile(path.join(receiver, "held-index.txt"), "held\n");
+  await git(receiver, "add", "held-index.txt");
+  let seamCalls = 0;
+  const first = await applyIncoming(state, incoming, matchingOracle, {
+    collectMetrics: true,
+    afterHeldClassification: async () => {
+      seamCalls++;
+      await git(receiver, "reset", "--mixed", "HEAD");
+    },
+  });
+  expect(seamCalls).toBe(1);
+  expect(first.outcome.attempt?.repo).toBeNull();
+  const saved = await landOutcome(state, first.outcome, 2);
+  await Bun.sleep(2_100);
+  let capabilityCalls = 0;
+  const retried = await applyIncoming(saved, incoming, matchingOracle, {
+    collectMetrics: true,
+    capabilityProbe: async () => { capabilityCalls++; return true; },
+  });
+  expect(retried.outcome.gitApplyMetrics?.results.skipped).toBe(0);
+  expect(capabilityCalls).toBeGreaterThan(0);
+});
+
+test("design 176 v6: rejected attempt is cleared when full follow defers before classification", async () => {
+  const { state, incoming } = await baseAndIncoming();
+  await fs.writeFile(path.join(receiver, "held-index.txt"), "held\n");
+  await git(receiver, "add", "held-index.txt");
+  const first = await applyIncoming(state, incoming, matchingOracle, { collectMetrics: true });
+  const saved = await landOutcome(state, first.outcome, 2);
+  await Bun.sleep(2_100);
+  saved.repoRecords!.repo!.attempt!.at = new Date(Date.now() - 3_700_000).toISOString();
+
+  const deferred = await applyIncoming(saved, incoming, matchingOracle, {
+    collectMetrics: true,
+    capabilityProbe: async () => false,
+  });
+  expect(deferred.outcome.gitApplyMetrics?.results.skipped).toBe(0);
+  expect(deferred.outcome.attempt?.repo == null).toBe(true);
+});
 
 test("design 174 A: elapsed floor re-follows and refreshes the same held outcome", async () => {
   const { state, incoming } = await baseAndIncoming();

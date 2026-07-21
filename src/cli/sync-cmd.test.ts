@@ -35,7 +35,7 @@ describe("attachGitSyncProgress", () => {
     const deps = {} as SyncDeps;
     attachGitSyncProgress(deps, fakeSpinner());
     deps.onGitLog!("git-sync applied foo/repo");
-    deps.onGitLog!("git-sync removed bar/repo (remote deleted; local .git untouched)");
+    deps.onGitLog!("git-sync removed bar/repo (remote deleted; local .git untouched). Your local Git repository is safe.");
     deps.onGitLog!("git-sync deferred baz/repo: receiver git busy");
     expect(errors).toEqual([]);
   });
@@ -43,7 +43,7 @@ describe("attachGitSyncProgress", () => {
   test("default (non-verbose): CONFLICT and WARNING lines still print", () => {
     const deps = {} as SyncDeps;
     attachGitSyncProgress(deps, fakeSpinner());
-    deps.onGitLog!("git-sync CONFLICT foo/repo — local kept; remote preserved. Resolve manually.");
+    deps.onGitLog!("git-sync CONFLICT foo/repo — local kept; remote preserved. Resolve manually. Your local Git work is safe; inspect the preserved incoming state before resolving.");
     deps.onGitLog!("git-sync WARNING bar/repo: post-apply containment check failed: boom");
     expect(errors.length).toBe(2);
     expect(errors[0]).toContain("git-sync CONFLICT foo/repo");
@@ -62,8 +62,8 @@ describe("attachGitSyncProgress", () => {
     const deps = {} as SyncDeps;
     attachGitSyncProgress(deps, fakeSpinner(), { verbose: true });
     deps.onGitLog!("git-sync applied foo/repo");
-    deps.onGitLog!("git-sync CONFLICT bar/repo — local kept; remote preserved.");
-    expect(errors).toEqual(["git-sync applied foo/repo", "git-sync CONFLICT bar/repo — local kept; remote preserved."]);
+    deps.onGitLog!("git-sync CONFLICT bar/repo — local kept; remote preserved. Your local Git work is safe; inspect the preserved incoming state before resolving.");
+    expect(errors).toEqual(["git-sync applied foo/repo", "git-sync CONFLICT bar/repo — local kept; remote preserved. Your local Git work is safe; inspect the preserved incoming state before resolving."]);
     expect(deps.onGitProgress).toBeUndefined();
   });
 });

@@ -4,9 +4,9 @@ import path from "node:path";
 import {
   assertGitTargetWithinRoot,
   buildIgnoreMatcher,
-  enumerateStashReflogOids,
+  checkoutJournalDir,
   incomingOwnershipRoots,
-  indexIdentityV2,
+  isGitBusy,
   oracleFromState,
   partitionOwnedByIncoming,
   type AppliedManifestOracle,
@@ -21,12 +21,14 @@ import {
   resumeLockedAcceptedPRepair,
   runLockedPRepairAttempt,
 } from "../engine/index.js";
-import { enumerateRefReflogOids, pinDisplaced } from "../engine/git/keep-pins.js";
+import { pinDisplaced } from "../engine/git/keep-pins.js";
+import { branchesCheckedOutElsewhere } from "../engine/git/apply.js";
 import { quarantineLocal } from "../engine/git/quarantine.js";
 import { readAllRefs, readOpState } from "../engine/git/refs.js";
-import { exists, git, repoCtx, type RepoCtx } from "../engine/git/shared.js";
+import { git, headBranchOf, repoCtx, type RepoCtx } from "../engine/git/shared.js";
 import { hashBytes, hashFile } from "../engine/hash.js";
 import {
+  applyStateSavePacket,
   expectedStateNonce,
   DEFERRAL_LANES,
   loadConfig,
@@ -34,6 +36,8 @@ import {
   repoRecordsForState,
   syncStreamId,
   type GitDeferralReason,
+  type GitResolutionBinding,
+  type GitResolutionIntent,
   type RepoRecord,
   type RepoRecordInput,
   type SyncState,
@@ -52,12 +56,13 @@ import {
   type FollowProgress,
 } from "./sync-git/follow.js";
 import { checkoutLabel, gitIncomingKey, repoDirOf, sectionOpState } from "./sync-git/shared.js";
-import { composeRepoBase, type ManualBranchDecision, type RepoBaseLockedProof, type RepoBaseProof } from "./sync-git/base-composer.js";
+import { carryRepoBaseProof, composeRepoBase, recordOriginLineage, type ManualBranchDecision, type RepoBaseLockedProof, type RepoBaseProof } from "./sync-git/base-composer.js";
 import { prepareFollowerBranchProtocol, type FollowerBranchProtocol } from "./sync-git/follower-protocol.js";
 import { settleExactPresentArtifact } from "./sync-git/p-settlement.js";
 import { createPRepairStatePort, createPRepairStatePortFromReceipt } from "./sync-git/p-repair-state.js";
-import { ageBucket, hasGitResolutionIncoming, projectGitDeferralRepos, sanitizeTerminalText, type GitDeferralRepoProjection } from "./status-view.js";
+import { ageBucket, gitDeferralReasonPresentation, hasGitResolutionIncoming, projectGitDeferralRepos, sanitizeTerminalText, type GitDeferralRepoProjection } from "./status-view.js";
 import { serializeGitDeferralLanes } from "./sync-git/git-deferral-json.js";
+import { preliminaryResolutionReport, resolutionBindingIdentity, type ResolutionDiscardReport } from "./sync-git/resolution-intent.js";
 import { shQuote } from "./shell-quote.js";
 import { RBOX_VERSION } from "./version.js";
 
@@ -76,6 +81,8 @@ interface GitResolveDeps {
   forceProofIndeterminate?: boolean;
   /** Test seam: runs inside checkout-txn's lock-bound second-proof callback. */
   beforeSecondProof?: () => Promise<void>;
+  /** Test seam: runs immediately before keep-mine reloads every bound input. */
+  beforeIntentRecheck?: () => Promise<void>;
   now?: () => Date;
   stdout?: (line: string) => void;
   stderr?: (line: string) => void;
@@ -102,19 +109,7 @@ export interface GitDeferralsCmdOptions {
 type HumanReason = Extract<GitDeferralReason,
   "local-edits" | "local-index" | "local-operation" | "local-commits" | "local-stash">;
 
-interface SnapshotIdentity {
-  stream: string;
-  stateNonce: string;
-  incomingKey: string;
-  repoGen: number;
-  refs: Array<[string, string]>;
-  reflogs: Array<[string, string[]]>;
-  head: string;
-  index: { kind: "absent" | "indeterminate" | "projected"; value?: string };
-  opState: Array<[string, string]>;
-  stash: string[];
-  oracleReceipt: string | null;
-}
+type SnapshotIdentity = GitResolutionBinding;
 
 export interface GitResolveShow {
   status: "show-me";
@@ -145,9 +140,18 @@ export type ResolveRefusalCode =
 type ResolveOutput =
   | GitResolveShow
   | { status: "resolved"; verb: "take-theirs"; repo: string; snapshot: string; quarantine: string }
-  | { status: "snapshot-mismatch"; verb: "take-theirs"; repo: string; message: string; current: GitResolveShow }
+  | {
+      status: "preview";
+      verb: "keep-mine";
+      repo: string;
+      message: string;
+      current: GitResolveShow;
+      discardReport: ResolutionDiscardReport;
+      confirm: { snapshot: string; forceDiscardIncoming: boolean };
+    }
+  | { status: "snapshot-mismatch"; verb: "take-theirs" | "keep-mine"; repo: string; message: string; current: GitResolveShow; discardReport?: ResolutionDiscardReport }
   | { status: "refused"; verb: GitResolveVerb; repo: string; code: ResolveRefusalCode; message: string; current?: GitResolveShow }
-  | { status: "unsupported"; verb: "keep-mine"; repo: string; code: "not-yet-supported"; message: string; recovery: string[] };
+  | { status: "intent-recorded"; verb: "keep-mine"; repo: string; snapshot: string; forceDiscardIncoming: boolean; discardReport: ResolutionDiscardReport };
 
 function sortedEntries(value: Record<string, string>): Array<[string, string]> {
   return Object.entries(value).sort(([a], [b]) => a.localeCompare(b));
@@ -241,8 +245,11 @@ function remediationLines(repo: GitDeferralRepoProjection): string[] {
     lines.push("The resolver has no deferred incoming state. Let sync fetch or rebuild it; inspect `rbox status` and daemon logs if this persists.");
   }
   if (shouldOfferResolve(repo)) {
-    lines.push("An incoming apply state is available. `keep-mine` is unavailable.");
-    lines.push("`take-theirs` quarantines and reflog-pins local Git state and does not rewrite working files. First inspect the fresh snapshot, then substitute its token in the confirmation command:");
+    lines.push("Your repository is healthy; only rbox's bookkeeping is paused while incoming Git state waits.");
+    lines.push(repo.canKeepMine
+      ? "Choose `keep-mine` to publish my local work as truth, or `take-theirs` to discard my local changes and follow incoming."
+      : "Nothing is waiting to publish with `keep-mine`; `take-theirs` discards my local changes and follows the available incoming snapshot.");
+    lines.push("First inspect the fresh snapshot, then substitute its token in the command that matches your choice:");
   }
   return lines;
 }
@@ -251,11 +258,13 @@ function shouldOfferResolve(repo: GitDeferralRepoProjection): boolean {
   return repo.canResolve && (repo.displayLane === "apply" || repo.remediationClass === "transient");
 }
 
-function resolveCommand(root: string, repo: string, token?: string): string {
+function resolveCommand(root: string, repo: string, token?: string, verb?: "take-theirs" | "keep-mine"): string {
   const repoArg = repo.startsWith("-") ? `./${repo}` : repo;
-  const argv = token === undefined
-    ? ["rbox", "git", "resolve", repoArg]
-    : ["rbox", "git", "resolve", repoArg, "take-theirs", "--confirm", token];
+  const argv = verb === "keep-mine" && token === undefined
+    ? ["rbox", "git", "resolve", repoArg, "keep-mine"]
+    : token === undefined
+      ? ["rbox", "git", "resolve", repoArg]
+      : ["rbox", "git", "resolve", repoArg, verb ?? "take-theirs", "--confirm", token];
   return `cd ${shQuote(root)} && ${argv.map(shQuote).join(" ")}`;
 }
 
@@ -309,6 +318,7 @@ export async function gitDeferralsCmd(
       for (const line of remediationLines(repo)) write(line);
       if (shouldOfferResolve(repo)) {
         write(resolveCommand(path.resolve(root), repo.repo));
+        if (repo.canKeepMine) write(resolveCommand(path.resolve(root), repo.repo, undefined, "keep-mine"));
         write(resolveCommand(path.resolve(root), repo.repo, "<token-printed-by-show-me>"));
       }
     }
@@ -323,47 +333,6 @@ export async function gitDeferralsCmd(
 
 function sameMap(a: Record<string, string>, b: Record<string, string>): boolean {
   return JSON.stringify(sortedEntries(a)) === JSON.stringify(sortedEntries(b));
-}
-
-async function snapshotIdentityOnly(args: {
-  root: string;
-  rel: string;
-  ctx: RepoCtx;
-  state: SyncState;
-  record: RepoRecord;
-  incoming: GitSection;
-  oracle: AppliedManifestOracle;
-  boundary: boolean;
-}): Promise<SnapshotIdentity> {
-  const { rel, ctx, state, record, incoming, oracle } = args;
-  const refs = await readAllRefs(ctx.repoDir);
-  const reflogs: Array<[string, string[]]> = [];
-  for (const ref of Object.keys(refs).filter((ref) => ref !== "refs/stash").sort()) {
-    reflogs.push([ref, (await enumerateRefReflogOids(ctx.repoDir, ref)).sort()]);
-  }
-  const head = await fs.readFile(path.join(ctx.gitDir, "HEAD"), "utf8");
-  const indexPath = path.join(ctx.gitDir, "index");
-  const indexPresent = await exists(indexPath);
-  const indexProjection = indexPresent ? await indexIdentityV2(ctx.repoDir, indexPath) : undefined;
-  const index: SnapshotIdentity["index"] = !indexPresent
-    ? { kind: "absent" }
-    : indexProjection === undefined ? { kind: "indeterminate" } : { kind: "projected", value: indexProjection };
-  const opState = await readOpState(ctx.gitDir, hashFile);
-  const stash = ctx.kind === "dir" ? (await enumerateStashReflogOids(ctx.repoDir)).sort() : [];
-  if (args.boundary) await oracle.reproveRepo(rel); else await oracle.proveRepo(rel);
-  return {
-    stream: state.stream,
-    stateNonce: expectedStateNonce(state),
-    incomingKey: gitIncomingKey(incoming),
-    repoGen: record.repoGen,
-    refs: sortedEntries(refs),
-    reflogs,
-    head,
-    index,
-    opState: sortedEntries(opState),
-    stash,
-    oracleReceipt: oracle.receiptHash(rel) ?? null,
-  };
 }
 
 async function buildSnapshot(args: {
@@ -386,7 +355,7 @@ async function buildSnapshot(args: {
   const oracle = oracleFromState({ base: args.state.lastSyncedManifest, matcher, root: args.root });
   const staged = await stageIncoming({ ctx: args.ctx, incoming: args.incoming, store: args.store, kek: args.kek });
   try {
-    const identity = await snapshotIdentityOnly({ ...args, oracle, boundary: false });
+    const identity = await resolutionBindingIdentity({ ...args, oracle, boundary: false });
     const roots = incomingOwnershipRoots(args.incoming, { prefix: staged.incomingNs, opState: staged.opBytes });
     const candidates = new Map<string, Set<string>>();
     const addCandidate = (oid: string | undefined, label: string) => {
@@ -481,17 +450,70 @@ async function buildSnapshot(args: {
 
 const HUMAN_LOCAL_ONLY_CAP = 50;
 
+function humanRefLabel(label: string): string {
+  if (label === "stash reflog") return "the stash reflog";
+  if (label === "detached HEAD") return "detached HEAD";
+  const reflog = label.endsWith(" reflog");
+  const ref = reflog ? label.slice(0, -(" reflog".length)) : label;
+  const kind = ref.startsWith("heads/") ? `branch ${ref.slice("heads/".length)}`
+    : ref.startsWith("tags/") ? `tag ${ref.slice("tags/".length)}`
+    : ref;
+  return reflog ? `${kind}'s reflog` : kind;
+}
+
+function humanResolveCommand(show: GitResolveShow, verb: "keep-mine" | "take-theirs"): string {
+  const repoArg = show.repo.startsWith("-") ? `./${show.repo}` : show.repo;
+  const argv = verb === "keep-mine"
+    ? ["rbox", "git", "resolve", repoArg, verb]
+    : ["rbox", "git", "resolve", repoArg, verb, "--confirm", show.snapshot];
+  return argv.map(shQuote).join(" ");
+}
+
 function printShow(show: GitResolveShow, write: (line: string) => void): void {
   const checkout = show.incomingCheckout.kind === "branch" ? `branch ${show.incomingCheckout.label}` : "detached checkout";
-  write(`${show.repo}: incoming ${checkout}`);
-  write(`  oracle: ${show.oracle}; index: ${show.index}; operation state: ${show.operationState}; stash: ${show.stash}`);
-  if (show.localOnlyCommits.length === 0) write("  local-only commits: none");
+  write(`What happened: rbox paused Git sync for ${show.repo} because local work and the incoming ${checkout} need a choice.`);
+  write("What is safe: Your repository is healthy; rbox has not changed your local Git state.");
+  write(`What to do: preview publishing my work with ${humanResolveCommand(show, "keep-mine")}; or use ${humanResolveCommand(show, "take-theirs")} to discard my local changes and follow incoming.`);
+  write(`  Incoming checkout: ${checkout}`);
+  const workingFiles = show.oracle === "clean" ? "match the last applied snapshot"
+    : show.oracle === "dirty" ? "changed locally after the last applied snapshot"
+    : "could not be compared safely";
+  const index = show.index === "matches-incoming" ? "matches incoming"
+    : show.index === "diverged" ? "differs from incoming"
+    : show.index === "absent" ? "is absent on both sides"
+    : "could not be compared safely";
+  const operation = show.operationState === "matches-incoming" ? "matches incoming" : "differs from incoming";
+  const stash = show.stash === "clean" ? "matches incoming"
+    : show.stash === "diverged" ? "contains local-only history"
+    : "is not owned by this checkout";
+  write(`  Working files ${workingFiles}; the index ${index}; Git operation state ${operation}; the stash ${stash}.`);
+  if (show.localOnlyCommits.length === 0) write("  Local-only history: none.");
   else {
-    for (const commit of show.localOnlyCommits.slice(0, HUMAN_LOCAL_ONLY_CAP)) write(`  local-only ${commit.labels.join(", ")}: ${commit.subject}`);
-    if (show.localOnlyCommits.length > HUMAN_LOCAL_ONLY_CAP) write(`  …and ${show.localOnlyCommits.length - HUMAN_LOCAL_ONLY_CAP} more local-only commits`);
+    for (const commit of show.localOnlyCommits.slice(0, HUMAN_LOCAL_ONLY_CAP)) {
+      const refs = commit.labels.map(humanRefLabel);
+      write(`  ${refs.join(", ")} ${refs.length === 1 ? "contains" : "contain"} local-only history after the incoming snapshot: ${commit.subject}`);
+    }
+    if (show.localOnlyCommits.length > HUMAN_LOCAL_ONLY_CAP) write(`  …and ${show.localOnlyCommits.length - HUMAN_LOCAL_ONLY_CAP} more local-only commits.`);
   }
-  for (const d of show.deferrals) write(`  ${d.lane} deferred (${d.reason}) since ${d.deferredSince}${d.bytesChanged ? "; working bytes changed" : ""}`);
-  write(`  snapshot: ${show.snapshot}`);
+  for (const d of show.deferrals) {
+    const reason = gitDeferralReasonPresentation(d.reason).label;
+    write(`  rbox paused the ${d.lane} step because of ${reason} since ${d.deferredSince}${d.bytesChanged ? "; working files changed again since then" : ""}.`);
+  }
+  write(`  Confirmation token: ${show.snapshot}`);
+}
+
+function printDiscardReport(report: ResolutionDiscardReport, write: (line: string) => void): void {
+  write("Preliminary incoming-discard report (the final report is confirmed at publish time):");
+  for (const lane of report.lanes) write(`  ${lane.lane}: ${lane.disposition} — ${lane.detail}`);
+  if (report.forceRequired) write("  At least one incoming lane is not retained; confirmation requires --force-discard-incoming.");
+}
+
+function keepMineConfirmCommand(repo: string, snapshot: string, force: boolean): string {
+  const repoArg = repo.startsWith("-") ? `./${repo}` : repo;
+  return [
+    "rbox", "git", "resolve", repoArg, "keep-mine", "--confirm", snapshot,
+    ...(force ? ["--force-discard-incoming"] : []),
+  ].map(shQuote).join(" ");
 }
 
 export function safeResolveText(value: string, root: string): string {
@@ -532,12 +554,21 @@ function emit(output: ResolveOutput, json: boolean, deps: GitResolveDeps, root: 
     safeOut(`${safe.repo}: followed incoming checkout; local Git state quarantined at ${safe.quarantine}`);
     return;
   }
-  if (safe.status === "unsupported") {
-    safeErr(`${safe.repo}: keep-mine is not yet supported in this build.`);
-    for (const line of safe.recovery) safeErr(`  ${line}`);
+  if (safe.status === "intent-recorded") {
+    printDiscardReport(safe.discardReport, safeOut);
+    safeOut(`${safe.repo}: keep-mine intent recorded for snapshot ${safe.snapshot}.`);
+    safeOut("The next ordinary push will re-check the final candidate, preserve discarded incoming objects, and publish local Git state.");
+    return;
+  }
+  if (safe.status === "preview") {
+    printShow(safe.current, safeOut);
+    printDiscardReport(safe.discardReport, safeOut);
+    safeOut(safe.message);
+    safeOut(`Confirm exactly this preview with: ${keepMineConfirmCommand(safe.repo, safe.confirm.snapshot, safe.confirm.forceDiscardIncoming)}`);
     return;
   }
   safeErr(`${safe.repo}: ${safe.message}`);
+  if (safe.status === "snapshot-mismatch" && safe.discardReport) printDiscardReport(safe.discardReport, safeErr);
   if (safe.current) printShow(safe.current, safeErr);
 }
 
@@ -587,6 +618,16 @@ async function recoverFirst(root: string, rel: string, ctx: RepoCtx | undefined,
   if (recovery.status === "human-intervened") return { state, error: `crash-window changes were preserved in ${recovery.quarantinePath}` };
   if (recovery.status === "fresh-quarantined") return { state, error: `partial repository was quarantined at ${recovery.quarantinePath}` };
   return { state };
+}
+
+async function checkoutJournalPresent(root: string, rel: string): Promise<boolean> {
+  return fs.lstat(checkoutJournalDir(root, rel)).then(
+    () => true,
+    (error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return false;
+      throw error;
+    },
+  );
 }
 
 type ManualProtocolPreflight =
@@ -717,6 +758,7 @@ export async function gitResolveCmd(
   deps: GitResolveDeps = {},
 ): Promise<number> {
   const json = options.json === true;
+  const forceDiscardIncoming = options.forceDiscardIncoming === true;
   let rel = ".";
   try {
     rel = normalizedRepo(root, repoArg);
@@ -729,39 +771,53 @@ export async function gitResolveCmd(
     const env = await (deps.build ?? defaultBuild)(root);
     let state = await loadState(root, syncStreamId(env.cfg));
     const repoDir = repoDirOf(root, rel);
-    const ctx = await repoCtx(repoDir).catch(() => undefined);
-    const recovered = await recoverFirst(root, rel, ctx, state);
+    let ctx = await repoCtx(repoDir).catch(() => undefined);
+    // keep-mine confirmation is a sidecar-only transition. A journal must be
+    // handled by an ordinary sync first; resolving or quarantining it here would
+    // mutate checkout state before the publisher ACK.
+    const recovered = verb === "keep-mine"
+      ? { state, ...(await checkoutJournalPresent(root, rel) ? { error: "checkout journal is present" } : {}) }
+      : await recoverFirst(root, rel, ctx, state);
     state = recovered.state;
     if (recovered.error || !ctx) {
       emit({ status: "refused", verb, repo: rel, code: "journal-recovery", message: "journal recovery could not complete; retry after Git state settles, or inspect the local recovery copy" }, json, deps, root);
       return 1;
     }
 
-    if (verb === "keep-mine") {
-      const recovery = [
-        "Run `rbox git resolve <repo> show-me` to inspect the incoming and local work.",
-        "Use `take-theirs --confirm <snapshot>` to preserve local Git state and follow incoming.",
-        "Otherwise merge/publish the local work manually, then let normal sync clear the deferral.",
-      ];
+    await assertGitTargetWithinRoot(root, rel);
+    let record = repoRecordsForState(state)[rel];
+    let incoming = verb === "keep-mine" ? record?.pending : incomingFor(record);
+    if (!record || !incoming || !env.cfg.kek) {
       emit({
-        status: "unsupported",
-        verb,
-        repo: rel,
-        code: "not-yet-supported",
-        message: "keep-mine is not yet supported in this build",
-        recovery: options.forceDiscardIncoming
-          ? [...recovery, "`--force-discard-incoming` cannot bypass this build-time safety boundary."]
-          : recovery,
+        status: "refused", verb, repo: rel, code: "no-incoming",
+        message: verb === "keep-mine"
+          ? "nothing is waiting to apply here — this hold clears on its own or names a different fix"
+          : "no deferred incoming Git state is available for this repository",
       }, json, deps, root);
       return 1;
     }
-
-    await assertGitTargetWithinRoot(root, rel);
-    let record = repoRecordsForState(state)[rel];
-    let incoming = incomingFor(record);
-    if (!record || !incoming || !env.cfg.kek) {
-      emit({ status: "refused", verb, repo: rel, code: "no-incoming", message: "no deferred incoming Git state is available for this repository" }, json, deps, root);
+    if (verb === "keep-mine" && env.cfg.syncGit !== true) {
+      emit({ status: "refused", verb, repo: rel, code: "unsupported", message: "Git sync is disabled; enable it before confirming keep-mine" }, json, deps, root);
       return 1;
+    }
+    if (verb === "keep-mine" && await isGitBusy(ctx.repoDir, ctx)) {
+      emit({ status: "refused", verb, repo: rel, code: "git-busy", message: "Git is busy; retry keep-mine after the other Git operation finishes" }, json, deps, root);
+      return 1;
+    }
+    if (verb === "keep-mine" && Object.keys(await readOpState(ctx.gitDir, hashFile)).length > 0) {
+      emit({ status: "refused", verb, repo: rel, code: "local-operation", message: "a Git operation is in progress; finish or abort it, then run keep-mine again" }, json, deps, root);
+      return 1;
+    }
+    if (verb === "keep-mine") {
+      const incomingCheckoutRef = headBranchOf(incoming.head);
+      const ownedElsewhere = await branchesCheckedOutElsewhere(ctx);
+      if (incomingCheckoutRef && ownedElsewhere.has(incomingCheckoutRef)) {
+        emit({
+          status: "refused", verb, repo: rel, code: "worktree-ownership",
+          message: "the incoming checkout branch is active in another linked worktree; switch or detach that worktree, then retry keep-mine",
+        }, json, deps, root);
+        return 1;
+      }
     }
     let branchProtocol: FollowerBranchProtocol | undefined;
     if (verb === "take-theirs") {
@@ -791,7 +847,7 @@ export async function gitResolveCmd(
       }
     } : undefined;
     const takeSnapshot = () => buildSnapshot({
-      root, rel, ctx, state, record, incoming, store: env.store, kek: env.cfg.kek!, cfg: env.cfg, now: now(),
+      root, rel, ctx: ctx!, state, record: record!, incoming: incoming!, store: env.store, kek: env.cfg.kek!, cfg: env.cfg, now: now(),
       ...(setProgressPhase ? { progress: (phase: "proving" | "found", count: number) => setProgressPhase(phase, count) } : {}),
     });
     if (setProgressPhase) {
@@ -805,6 +861,150 @@ export async function gitResolveCmd(
     }
     if (verb === "show-me") {
       emit(snapshot.public, json, deps, root);
+      return 0;
+    }
+    if (verb === "keep-mine") {
+      let discardReport = await preliminaryResolutionReport({ ctx, pending: incoming, binding: snapshot.identity, store: env.store, kek: env.cfg.kek });
+      if (snapshot.proofIndeterminate || deps.forceProofIndeterminate === true || discardReport.lanes.some((lane) => lane.disposition === "indeterminate")) {
+        emit({ status: "refused", verb, repo: rel, code: "proof-indeterminate", message: "the incoming-versus-local comparison could not complete; retry after Git state settles", current: snapshot.public }, json, deps, root);
+        return 1;
+      }
+      const localRefs = new Map(snapshot.identity.refs);
+      const absentPublisherBranch = Object.entries(incoming.refs).find(([ref]) =>
+        ref.startsWith("refs/heads/") && record!.base?.refs[ref] !== undefined && localRefs.get(ref) === undefined);
+      if (absentPublisherBranch) {
+        emit({
+          status: "refused", verb, repo: rel, code: "conflict",
+          message: `keep-mine cannot publish branch absence for ${absentPublisherBranch[0]} while BASE still holds it; restore or resolve that branch first`,
+        }, json, deps, root);
+        return 1;
+      }
+      const currentCheckoutRef = /^ref:\s*(refs\/\S+)\s*$/.exec(snapshot.identity.head)?.[1];
+      const divergentBranch = discardReport.lanes.find((lane) =>
+        lane.lane === `branch:${currentCheckoutRef}`
+        && lane.disposition === "not-subsumed"
+        && localRefs.has(lane.lane.slice("branch:".length)));
+      if (divergentBranch) {
+        emit({
+          status: "refused", verb, repo: rel, code: "conflict",
+          message: `incoming and local history diverge for ${divergentBranch.lane.slice("branch:".length)}; resolve this reserved two-writer case with Git before retrying`,
+        }, json, deps, root);
+        return 1;
+      }
+      if (!options.confirm) {
+        emit({
+          status: "preview", verb, repo: rel,
+          message: "Review the preliminary report before recording a publish-my-work intent; the final report is confirmed at publish time.",
+          current: snapshot.public,
+          discardReport,
+          confirm: { snapshot: snapshot.public.snapshot, forceDiscardIncoming: discardReport.forceRequired },
+        }, json, deps, root);
+        return 1;
+      }
+      if (options.confirm !== snapshot.public.snapshot) {
+        emit({ status: "snapshot-mismatch", verb, repo: rel, message: "snapshot changed; review the fresh preliminary report and confirm again", current: snapshot.public, discardReport }, json, deps, root);
+        return 1;
+      }
+      if (forceDiscardIncoming !== discardReport.forceRequired) {
+        emit({
+          status: "preview", verb, repo: rel,
+          message: discardReport.forceRequired
+            ? "This preview discards at least one incoming lane, so confirmation requires --force-discard-incoming."
+            : "This preview retains every incoming lane, so confirmation must omit --force-discard-incoming.",
+          current: snapshot.public,
+          discardReport,
+          confirm: { snapshot: snapshot.public.snapshot, forceDiscardIncoming: discardReport.forceRequired },
+        }, json, deps, root);
+        return 1;
+      }
+      if (workspaceSyncMutexDegraded(mutex)) {
+        emit({ status: "refused", verb, repo: rel, code: "mutex-degraded", message: "locking unavailable; keep-mine will not record an intent until safe serialization is restored" }, json, deps, root);
+        return 1;
+      }
+
+      // Recompute every bound input immediately before the intent-only state write.
+      await deps.beforeIntentRecheck?.();
+      const boundaryState = await loadState(root, syncStreamId(env.cfg));
+      const boundaryRecord = repoRecordsForState(boundaryState)[rel];
+      const boundaryIncoming = boundaryRecord?.pending;
+      const boundaryCtx = await repoCtx(repoDir).catch(() => undefined);
+      if (!boundaryRecord || !boundaryIncoming || !boundaryCtx) {
+        emit({ status: "snapshot-mismatch", verb, repo: rel, message: "the pending repository binding changed before the intent was recorded; inspect and confirm again", current: snapshot.public, discardReport }, json, deps, root);
+        return 1;
+      }
+      state = boundaryState;
+      record = boundaryRecord;
+      incoming = boundaryIncoming;
+      ctx = boundaryCtx;
+      snapshot = await takeSnapshot();
+      if (options.confirm !== snapshot.public.snapshot) {
+        discardReport = await preliminaryResolutionReport({ ctx, pending: incoming, binding: snapshot.identity, store: env.store, kek: env.cfg.kek });
+        emit({ status: "snapshot-mismatch", verb, repo: rel, message: "snapshot changed before the intent was recorded; confirm the fresh preliminary report", current: snapshot.public, discardReport }, json, deps, root);
+        return 1;
+      }
+      if (await isGitBusy(ctx.repoDir, ctx)) {
+        emit({ status: "refused", verb, repo: rel, code: "git-busy", message: "Git became busy; retry keep-mine after the other Git operation finishes" }, json, deps, root);
+        return 1;
+      }
+      if (Object.keys(await readOpState(ctx.gitDir, hashFile)).length > 0) {
+        emit({ status: "refused", verb, repo: rel, code: "local-operation", message: "a Git operation began before confirmation; finish or abort it, then run keep-mine again" }, json, deps, root);
+        return 1;
+      }
+      const boundaryCheckoutRef = headBranchOf(incoming.head);
+      if (boundaryCheckoutRef && (await branchesCheckedOutElsewhere(ctx)).has(boundaryCheckoutRef)) {
+        emit({ status: "refused", verb, repo: rel, code: "worktree-ownership", message: "the incoming checkout branch became active in another linked worktree; switch or detach that worktree, then retry keep-mine" }, json, deps, root);
+        return 1;
+      }
+      discardReport = await preliminaryResolutionReport({ ctx, pending: incoming, binding: snapshot.identity, store: env.store, kek: env.cfg.kek });
+      if (discardReport.lanes.some((lane) => lane.disposition === "indeterminate")
+        || forceDiscardIncoming !== discardReport.forceRequired) {
+        emit({ status: "snapshot-mismatch", verb, repo: rel, message: "the preliminary discard decision changed before the intent was recorded; review and confirm again", current: snapshot.public, discardReport }, json, deps, root);
+        return 1;
+      }
+      const finalCheckoutRef = headBranchOf(incoming.head);
+      if (finalCheckoutRef && (await branchesCheckedOutElsewhere(ctx)).has(finalCheckoutRef)) {
+        emit({ status: "refused", verb, repo: rel, code: "worktree-ownership", message: "the incoming checkout branch became active in another linked worktree; switch or detach that worktree, then retry keep-mine" }, json, deps, root);
+        return 1;
+      }
+      const finalOracle = oracleFromState({
+        base: state.lastSyncedManifest,
+        matcher: buildIgnoreMatcher(root, {
+          respectGitignore: env.cfg.respectGitignore === true,
+          knownGitRepos: Object.keys(state.lastSyncedManifest.gitRepos ?? {}),
+        }),
+        root,
+      });
+      const finalBinding = await resolutionBindingIdentity({
+        root, rel, ctx, state, record, incoming, oracle: finalOracle, cfg: env.cfg, boundary: true,
+      });
+      if (JSON.stringify(finalBinding) !== JSON.stringify(snapshot.identity)) {
+        emit({ status: "snapshot-mismatch", verb, repo: rel, message: "the repository changed at the intent-write boundary; inspect and confirm again", current: snapshot.public, discardReport }, json, deps, root);
+        return 1;
+      }
+      const intent: GitResolutionIntent = {
+        v: 1,
+        verb: "keep-mine",
+        snapshot: snapshot.public.snapshot,
+        binding: finalBinding,
+        authorizedLanes: discardReport.lanes.filter((lane) => lane.disposition === "not-subsumed").map((lane) => lane.lane).sort(),
+        createdAt: now().toISOString(),
+      };
+      const installed = await applyStateSavePacket(root, {
+        expectedStream: state.stream,
+        expectedNonce: expectedStateNonce(state),
+        sourceGlobalSeq: state.lastSyncedSequence,
+        repos: [{
+          relPath: rel,
+          expectedRepoGen: record.repoGen,
+          newRecord: { ...inputRecord(record), resolutionIntent: intent },
+          baseProof: carryRepoBaseProof(recordOriginLineage(record.branchBaseOrigins) ?? "legacy-untrusted"),
+        }],
+      });
+      if (installed.status !== "accepted") {
+        emit({ status: "snapshot-mismatch", verb, repo: rel, message: "sync state changed before the intent was recorded; inspect and confirm again", current: snapshot.public, discardReport }, json, deps, root);
+        return 1;
+      }
+      emit({ status: "intent-recorded", verb, repo: rel, snapshot: intent.snapshot, forceDiscardIncoming: discardReport.forceRequired, discardReport }, json, deps, root);
       return 0;
     }
     if (snapshot.proofIndeterminate || deps.forceProofIndeterminate === true) {
@@ -961,8 +1161,8 @@ export async function gitResolveCmd(
           const currentRecord = repoRecordsForState(currentState)[rel];
           const currentIncoming = incomingFor(currentRecord);
           if (!currentRecord || !currentIncoming) { boundaryMismatch = true; return false; }
-          const currentIdentity = await snapshotIdentityOnly({
-            root, rel, ctx, state: currentState, record: currentRecord, incoming: currentIncoming, oracle: snapshot.oracle, boundary: true,
+          const currentIdentity = await resolutionBindingIdentity({
+            root, rel, ctx, state: currentState, record: currentRecord, incoming: currentIncoming, oracle: snapshot.oracle, cfg: env.cfg, boundary: true,
           });
           const normalized = normalizedAfterAuthoredRefs(currentIdentity, snapshot.identity, authoredRefChanges);
           const same = normalized !== undefined && JSON.stringify(normalized) === confirmedIdentity;

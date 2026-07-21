@@ -686,26 +686,39 @@ async function runPushAttempt(
     // remote's own unapplied truth — the saved git BASE keeps the OLD entry (or none) so the
     // next pull still sees remote != base and retries the apply (see gitBaseAfterCommit).
     const supersededPending = new Set(gitPlan.supersededPending);
+    const resolvedPending = new Set(gitPlan.resolvedPending ?? []);
+    const settledPending = new Set([...supersededPending, ...resolvedPending]);
     // Design 174 §4.2: the one bounded supersession line — emitted ONLY here, after
     // the accepted commit, so it never claims a supersession a pre-ACK failure undid.
     for (const relPath of [...supersededPending].sort()) {
       (deps.onGitLog ?? ((l: string) => console.error(l)))(
-        `git-sync superseded pending ${relPath}: local history subsumes the unapplied remote section`,
+        `git-sync superseded pending ${relPath}: local history subsumes the unapplied remote section. rbox will publish the local history instead.`,
+      );
+    }
+    for (const relPath of [...resolvedPending].sort()) {
+      (deps.onGitLog ?? ((l: string) => console.error(l)))(
+        `git-sync published keep-mine ${relPath}: local Git state is now the acknowledged remote truth`,
       );
     }
     const pendingAfterAck = { ...(gitPlan.gitPendingRemote ?? {}) };
-    for (const relPath of supersededPending) delete pendingAfterAck[relPath];
+    for (const relPath of settledPending) delete pendingAfterAck[relPath];
     const stateGit = gitBaseAfterCommit(committed.gitRepos, pendingAfterAck, appliedBase.gitRepos);
     const advertised: Record<string, GitSection | null> = {};
     const repoProofs: Record<string, RepoBaseProof> = {};
     const ackRecords = repoRecordsForState(state);
-    const ackPartial = Object.fromEntries([...supersededPending].map((relPath) => [relPath, null]));
-    const ackAttempt = Object.fromEntries([...supersededPending].map((relPath) => [relPath, null]));
+    const ackPartial = Object.fromEntries([...settledPending].map((relPath) => [relPath, null]));
+    const ackAttempt = Object.fromEntries([...settledPending].map((relPath) => [relPath, null]));
+    const ackResolutionIntent = Object.fromEntries([...resolvedPending].flatMap((relPath) => {
+      const snapshot = ackRecords[relPath]?.resolutionIntent?.snapshot;
+      return snapshot === undefined ? [] : [[relPath, { clearIfSnapshot: snapshot }]];
+    }));
     const ackDeferrals: Record<string, OrderedGitDeferralUpdates> = {};
-    for (const relPath of supersededPending) {
+    for (const relPath of settledPending) {
       const ordered = orderedDeferralUpdates(ackRecords[relPath]?.deferrals, { apply: null });
       if (ordered) ackDeferrals[relPath] = ordered;
     }
+    const resolutionsAfterAck = { ...(gitPlan.gitNeedsResolution ?? {}) };
+    for (const relPath of resolvedPending) delete resolutionsAfterAck[relPath];
     for (const relPath of new Set([
       ...Object.keys(ackRecords),
       ...Object.keys(committed.gitRepos ?? {}),
@@ -743,9 +756,10 @@ async function runPushAttempt(
       repoAbsent: gitPlan.repoAbsent ?? {},
       pending: pendingAfterAck,
       removed: gitPlan.gitReposRemoved,
-      resolutions: gitPlan.gitNeedsResolution,
+      resolutions: resolutionsAfterAck,
       partial: ackPartial,
       attempt: ackAttempt,
+      resolutionIntent: ackResolutionIntent,
       deferrals: ackDeferrals,
     };
     await report.phase("state-save", () => saveStateSource(root, state, {

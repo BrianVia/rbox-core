@@ -385,6 +385,63 @@ test("status --git aggregate and detail use one consistent repo projection", asy
   expect(out).not.toContain("0123456789abcdef");
 });
 
+test("full and --git status add one actionable companion while JSON and the shared line stay frozen", async () => {
+  const at = new Date(NOW - 3_600_000).toISOString();
+  const pending = {
+    bundleSha: "1".repeat(64),
+    bundleEncSha: "2".repeat(64),
+    bundleCipherSize: 1,
+    head: "ref: refs/heads/main\n",
+    refs: { "refs/heads/main": "3".repeat(40) },
+    refScope: "all" as const,
+  };
+  await saveStateUnsafeLegacyOrTest(root, {
+    stream: syncStreamId(cfg),
+    lastSyncedSequence: 7,
+    lastSyncedManifest: { generatedAt: at, files: [] },
+    repoRecords: {
+      repo: {
+        repoGen: 1,
+        sourceSeq: 7,
+        pending,
+        deferrals: {
+          apply: {
+            lane: "apply",
+            reason: "local-commits",
+            deferredSince: at,
+            reasonSince: at,
+            lastSeen: at,
+            checkout: { kind: "branch", label: "main" },
+          },
+        },
+      },
+    },
+  });
+
+  const frozen = "git deferred 1h: local commits on branch main (repo)";
+  const guidance = "To publish my work, run `rbox git resolve <repo> keep-mine`; `take-theirs` discards my local changes and follows incoming.";
+  for (const options of [{ verbose: true }, { git: true }]) {
+    const human = await captureStatus(options);
+    expect(human.split("\n").filter((line) => line.trim() === frozen)).toHaveLength(1);
+    expect(human.split(guidance)).toHaveLength(2);
+    expect(human.match(/Your repository is healthy; only rbox's bookkeeping is paused/g)).toHaveLength(1);
+  }
+
+  const jsonText = await captureStatus({ json: true });
+  expect(jsonText).not.toContain("bookkeeping");
+  expect(jsonText).not.toContain("keep-mine");
+  expect(JSON.parse(jsonText).git.deferrals).toEqual([{
+    repo: "repo",
+    lane: "apply",
+    reason: "local-commits",
+    deferredSince: at,
+    reasonSince: at,
+    ageSeconds: 3600,
+    bytesChanged: false,
+    checkout: { kind: "branch", label: "main" },
+  }]);
+});
+
 test("degraded legacy deferral reload retains status reason and age", async () => {
   const deferredSince = new Date(NOW - 15 * 86400_000).toISOString();
   await saveStateUnsafeLegacyOrTest(root, {

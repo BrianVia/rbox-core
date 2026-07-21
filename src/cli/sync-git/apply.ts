@@ -15,7 +15,7 @@ import { createPRepairStatePort } from "./p-repair-state.js";
 import { settleExactPresentArtifact } from "./p-settlement.js";
 import { commitPlannedBranchTransition, planBranchTransition } from "./branch-transition.js";
 import { runUpdateRefTransaction } from "../../engine/git/keep-pins.js";
-import { createHeldAttempt, gitHeldSkipEnabled, heldAttemptFloorElapsed, heldAttemptMatches, heldBlockersAllowSkip, observeHeldInputs, rebindHeldAttemptsAfterSettlement, sameHeldOutcome, sortedTypedBlockers } from "./held-skip.js";
+import { blockersAfterComposer, createHeldAttempt, gitHeldSkipEnabled, heldAttemptFloorElapsed, heldAttemptMatches, heldBlockersAllowSkip, incomingIndexArtifactDescriptor, observeHeldInputs, rebindHeldAttemptsAfterSettlement, sameHeldOutcome, sortedTypedBlockers } from "./held-skip.js";
 import {
   carryRepoBaseProof,
   composeRepoBase,
@@ -304,6 +304,8 @@ opts: {
     afterBranchPinsPrepared?: (ref: string) => void | Promise<void>;
     /** Test observation point after recovery/protocol/P/partial prepasses, before A. */
     afterHeldSkipPrepass?: (relPath: string) => void | Promise<void>;
+    /** Test seam after the persisted classifier but before attempt completion. */
+    afterHeldClassification?: (relPath: string) => void | Promise<void>;
     warningSink?: (message: string) => void;
   } = {}
 ): Promise<GitPullOutcome> {
@@ -596,6 +598,13 @@ opts: {
       }
     }
 
+    // A confirmed keep-mine intent reserves this exact P-bound record for the
+    // ordinary push. Pull may advance global truth, which will invalidate the
+    // binding, but it must not apply/replace/clear P or any companion sidecar.
+    if (records[rel]?.resolutionIntent && pend) {
+      return { result: "unchanged", commonDirGroup };
+    }
+
     // Receiver quiescence (design 43 §7): a busy repo defers only itself, and the busy
     // check must run BEFORE any identity comparison — a lock makes write-tree fail,
     // flipping gitIdentity onto the raw-index fallback, which would read as FALSE
@@ -629,7 +638,7 @@ opts: {
       idxProj[rel] = null;
       if (rel in applied) {
         delete applied[rel];
-        glog(`git-sync removed ${rel} (remote deleted; local .git untouched)`);
+        glog(`git-sync removed ${rel} (remote deleted; local .git untouched). Your local Git repository is safe.`);
       }
       const retainedLineage = recordOriginLineage(records[rel]?.branchBaseOrigins) ?? "legacy-untrusted";
       repoProofs[rel] = carryRepoBaseProof(retainedLineage);
@@ -650,7 +659,7 @@ opts: {
         try {
           const { recoveryBundle } = await preserveGitConflict(repoDir, pend, store, cfg.kek!);
           glog(
-            `git-sync CONFLICT ${rel} — remote deleted the repo while an apply was pending and local diverged; local kept, pending remote preserved at ${recoveryBundle ?? "refs/rbox-conflict/*"}`
+            `git-sync CONFLICT ${rel} — remote deleted the repo while an apply was pending and local diverged; local kept, pending remote preserved at ${recoveryBundle ?? "refs/rbox-conflict/*"}. Your local Git work is safe; inspect the preserved incoming state before resolving.`
           );
         } catch (e) {
           glog(`git-sync WARNING ${rel}: could not preserve the pending remote section after the remote deletion (local work untouched): ${errMsg(e)}`);
@@ -724,7 +733,7 @@ opts: {
           const logKey = `${root}\0${rel}`;
           if (!configOwnershipSkipLogged.has(logKey)) {
             configOwnershipSkipLogged.add(logKey);
-            glog(`git-sync config skipped ${rel}: receiver repository shape is unreadable/non-owned`);
+            glog(`git-sync config skipped ${rel}: receiver repository shape is unreadable/non-owned. rbox left shared Git settings alone; Git history can still sync.`);
           }
         } else {
           const receiver = await configReceiver(root, diskCtx);
@@ -733,7 +742,7 @@ opts: {
             const logKey = `${root}\0${rel}`;
             if (!configOwnershipSkipLogged.has(logKey)) {
               configOwnershipSkipLogged.add(logKey);
-              glog(`git-sync config skipped ${rel}: receiver ${diskCtx.kind} shape does not own the common config`);
+              glog(`git-sync config skipped ${rel}: receiver ${diskCtx.kind} shape does not own the common config. rbox left shared Git settings alone; Git history can still sync.`);
             }
           } else {
             configTarget = { fresh: false, shape: receiver.shape, configPath: receiver.configPath };
@@ -949,7 +958,7 @@ opts: {
       needsRes[rel] = gitIdentityKey(progress ? await gitIdentity(repoDir) : localId);
       clearAttempt(rel);
       setDeferral(rel, "apply", reason, incomingKey, await checkoutOf(repoDir));
-      glog(`git-sync CONFLICT ${rel} — local kept; remote preserved at ${recoveryBundle ?? "refs/rbox-conflict/*"}. Resolve manually.`);
+      glog(`git-sync CONFLICT ${rel} — local kept; remote preserved at ${recoveryBundle ?? "refs/rbox-conflict/*"}. Resolve manually. Your local Git work is safe; inspect the preserved incoming state before resolving.`);
       return { result: "conflict", commonDirGroup };
     };
     if (routeThroughFollow) {
@@ -987,16 +996,12 @@ opts: {
       });
       if (protocolResult.status === "hold") {
         await defer(protocolResult.reason, "artifact");
-        const observed = await observeHeldInputs({
-          root, relPath: rel, incomingKey: incomingKey!, incoming: remoteSec,
-          record: records[rel], partial: records[rel]?.partial,
-          stateNonce: expectedStateNonce(state), reflogPaths: [],
-        });
-        if (observed) attempt[rel] = createHeldAttempt(observed, [{
-          provenance: "protocol", reason: "artifact", detail: protocolResult.reason,
-        }]);
+        clearAttempt(rel);
         return { result: "deferred", commonDirGroup };
       }
+      const standingPInvalidatedAttempt = Object.keys(records[rel]?.partial?.pRepaired ?? {}).length > 0
+        || protocolResult.protocol.presentArtifacts.length > 0;
+      if (standingPInvalidatedAttempt) clearAttempt(rel);
       for (const [ref, receipt] of Object.entries(records[rel]?.partial?.pRepaired ?? {})) {
         const inspected = await inspectLockedPRepairReceipt(repoDir, receipt);
         if (inspected.action === "compact-and-restart") {
@@ -1107,12 +1112,18 @@ opts: {
       }
       await opts.afterHeldSkipPrepass?.(rel);
       const effectivePartial = currentPartial(rel);
-      const priorAttempt = pend ? records[rel]?.attempt : undefined;
+      const priorAttempt = pend && !standingPInvalidatedAttempt ? records[rel]?.attempt : undefined;
       const priorObservation = priorAttempt
         ? await observeHeldInputs({
             root, relPath: rel, incomingKey: incomingKey!, incoming: remoteSec,
             record: records[rel], partial: effectivePartial,
             stateNonce: expectedStateNonce(state),
+            effectiveBaseIndexProjection: records[rel]?.idxProj
+              ?? (baseSec?.indexSha === undefined ? null : undefined),
+            effectiveIncomingIndexProjection:
+              incomingIndexArtifactDescriptor(remoteSec) === priorAttempt.incomingIndexArtifactDescriptor
+                ? priorAttempt.effectiveIncomingIndexProjection
+                : undefined,
             reflogPaths: priorAttempt.reflogs.map((entry) => entry.path),
           })
         : undefined;
@@ -1126,22 +1137,42 @@ opts: {
         setDeferral(rel, "apply", standingApply.reason, standingApply.subjectKey, standingApply.checkout);
         return { result: "skipped", commonDirGroup };
       }
-      const recordAttempt = async (blockers: readonly TypedBlocker[], reflogPaths: readonly string[]): Promise<void> => {
+      // Once a full follow is required, omission must not preserve the rejected
+      // attempt across an early artifact/capability/boundary exit. Only a
+      // completed stable classification callback may install its replacement.
+      clearAttempt(rel);
+      const recordAttempt = async (input: {
+        blockers: readonly TypedBlocker[];
+        reflogPaths: readonly string[];
+        trustedFingerprint: import("./fingerprint.js").GitFingerprint | undefined;
+        effectiveBaseIndexProjection: string | null | undefined;
+        effectiveIncomingIndexProjection: string | null | undefined;
+        boundBase?: GitSection;
+        boundOrigins?: RepoRecord["branchBaseOrigins"];
+        observationPartial?: GitPartialApply;
+      }): Promise<void> => {
         const priorRecord = records[rel];
-        const observationPartial = currentPartial(rel);
+        const observationPartial = input.observationPartial ?? currentPartial(rel);
+        if (!input.trustedFingerprint) {
+          clearAttempt(rel);
+          return;
+        }
         const observed = await observeHeldInputs({
           root, relPath: rel, incomingKey: incomingKey!, incoming: remoteSec,
           record: priorRecord,
-          ...(applied[rel] === undefined ? {} : { boundBase: applied[rel] }),
-          ...(branchBaseOrigins[rel] === undefined ? {} : { boundOrigins: branchBaseOrigins[rel] }),
+          ...((input.boundBase ?? applied[rel]) === undefined ? {} : { boundBase: input.boundBase ?? applied[rel] }),
+          ...((input.boundOrigins ?? branchBaseOrigins[rel]) === undefined ? {} : { boundOrigins: input.boundOrigins ?? branchBaseOrigins[rel] }),
           partial: observationPartial,
-          stateNonce: expectedStateNonce(state), reflogPaths,
+          stateNonce: expectedStateNonce(state), reflogPaths: input.reflogPaths,
+          trustedFingerprint: input.trustedFingerprint,
+          effectiveBaseIndexProjection: input.effectiveBaseIndexProjection,
+          effectiveIncomingIndexProjection: input.effectiveIncomingIndexProjection,
         });
         if (!observed) {
           clearAttempt(rel);
           return;
         }
-        const merged = sortedTypedBlockers(blockers);
+        const merged = sortedTypedBlockers(input.blockers);
         if (priorFloorElapsed && priorInputsMatch && priorAttempt && !sameHeldOutcome(priorAttempt.blockers, merged)) {
           glog(`git-sync WARNING ${rel}: held-skip fingerprint miss`);
         }
@@ -1237,6 +1268,35 @@ opts: {
         log: glog,
         forcedHeldRefs,
         afterBranchPinsPrepared: opts.afterBranchPinsPrepared,
+        afterHeldClassification: async (classification) => {
+          await opts.afterHeldClassification?.(rel);
+          if (classification.phase === "followed") {
+            const finalProof = proofFor(classification.progress, true);
+            const finalComposed = composeRepoBase(
+              { base: baseSec, branchBaseOrigins: records[rel]?.branchBaseOrigins },
+              { base: remoteSec },
+              finalProof.authority,
+              finalProof.lockedProof,
+            );
+            await recordAttempt({
+              ...classification,
+              ...(finalComposed.base ? { boundBase: finalComposed.base } : {}),
+              ...(finalComposed.branchBaseOrigins ? { boundOrigins: finalComposed.branchBaseOrigins } : {}),
+              observationPartial: partialFrom(classification.progress, false),
+              blockers: blockersAfterComposer({
+                classification: classification.blockers,
+                disposition: finalComposed.disposition,
+                holds: finalComposed.holds,
+                checkoutComplete: finalProof.lockedProof.checkoutComplete,
+              }),
+            });
+          } else {
+            await recordAttempt({
+              ...classification,
+              observationPartial: partialFrom(classification.progress, true),
+            });
+          }
+        },
       });
       if (follow.derivedBaseIndexProjection) idxProj[rel] = follow.derivedBaseIndexProjection;
       if (follow.status === "legacy") {
@@ -1287,10 +1347,6 @@ opts: {
         pending[rel] = remoteSec;
         partial[rel] = partialFrom(follow, true);
         setDeferral(rel, "apply", follow.reason, incomingKey, await checkoutOf(repoDir));
-        await recordAttempt(
-          [...follow.blockers, { provenance: "checkout", reason: follow.reason, detail: follow.detail }],
-          follow.consultedReflogPaths ?? [],
-        );
         glog(`git-sync deferred ${rel}: ${follow.detail}`);
         return { result: "deferred", commonDirGroup };
       }
@@ -1313,12 +1369,6 @@ opts: {
         pending[rel] = remoteSec;
         partial[rel] = partialFrom(follow, false);
         setDeferral(rel, "apply", held.length ? heldReasonOf(follow.heldRefs) : "artifact", incomingKey, await checkoutOf(repoDir));
-        await recordAttempt([
-          ...follow.blockers,
-          ...(composedFollow.disposition === "pending" ? [{
-            provenance: "composer", reason: "artifact", detail: "BASE composer retained pending disposition",
-          } satisfies TypedBlocker] : []),
-        ], follow.consultedReflogPaths ?? []);
       } else {
         delete pending[rel];
         clearAttempt(rel);

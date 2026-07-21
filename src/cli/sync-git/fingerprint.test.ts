@@ -63,3 +63,28 @@ test("schema-4 trusted preflight cache is invalidated before config-authoritativ
   expect(await gitDivergenceFastRepoSource(root, undefined, buildIgnoreMatcher(root))).toEqual([]);
   expect(await gitPreflight(repo)).toEqual(expect.objectContaining({ ok: false, structural: true, reason: expect.stringMatching(/reftable/i) }));
 });
+
+test("split-index shared dependency invalidates while the link index stays byte-identical", async () => {
+  const root = await tempRoot();
+  await exec("git", ["-C", root, "init", "-q"]);
+  await exec("git", ["-C", root, "config", "user.email", "test@example.com"]);
+  await exec("git", ["-C", root, "config", "user.name", "Test"]);
+  await fs.writeFile(path.join(root, "tracked"), "one\n");
+  await exec("git", ["-C", root, "add", "tracked"]);
+  await exec("git", ["-C", root, "commit", "-qm", "one"]);
+  await exec("git", ["-C", root, "update-index", "--split-index"]);
+
+  const sharedRel = (await exec("git", ["-C", root, "rev-parse", "--shared-index-path"])).stdout.trim();
+  const shared = path.resolve(root, sharedRel);
+  const linkBefore = await fs.readFile(path.join(root, ".git", "index"));
+  const before = await gitFingerprint(gitFingerprintRun("per-decision"), root, ".", { includeIndexDependencies: true });
+  expect(before.dependenciesComplete).toBe(true);
+
+  const bytes = await fs.readFile(shared);
+  bytes[Math.max(0, bytes.length - 1)] ^= 1;
+  await fs.writeFile(shared, bytes);
+
+  const after = await gitFingerprint(gitFingerprintRun("per-decision"), root, ".", { includeIndexDependencies: true });
+  expect(await fs.readFile(path.join(root, ".git", "index"))).toEqual(linkBefore);
+  expect(after.hash).not.toBe(before.hash);
+});

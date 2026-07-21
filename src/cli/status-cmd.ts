@@ -20,9 +20,9 @@ import {
   healthDetailLines,
   healthLine,
   lastSyncLines,
-  gitDeferralReasonPresentation,
   projectGitDeferralRepos,
   renderBriefStatus,
+  renderGitDeferralCompanion,
   renderGitDeferralLine,
   trashLine,
   type BriefHaltReason,
@@ -516,13 +516,16 @@ export async function statusCmdWithDeps(
   const crypto = cryptoPoolStatus();
   const gitDeferrals = localGitDeferrals(state);
   const projectedGitDeferrals = counts.gitDeferrals;
+  const statusRecords = repoRecordsForState(state);
   const projectedGitRepos = projectGitDeferralRepos(projectedGitDeferrals.map((deferral) => ({
     repo: deferral.relPath,
     deferral,
+    record: statusRecords[deferral.relPath],
   })), now);
   const localGitRepoProjections = projectGitDeferralRepos(gitDeferrals.map((deferral) => ({
     repo: deferral.repo,
     deferral,
+    record: statusRecords[deferral.repo],
   })), now);
   const gitDeferredRepos = projectedGitRepos.length;
   const gitBytesChangedDeferrals = projectedGitRepos.filter((repo) => repo.bytesChanged).length;
@@ -686,9 +689,11 @@ export async function statusCmdWithDeps(
           now,
           capability: deferral.displayReason === "unsupported" ? gitCapability : undefined,
         })}`);
-        const presentation = gitDeferralReasonPresentation(deferral.displayReason);
-        console.log(`    ${presentation.text}`);
-        console.log(`    ${presentation.repair}`);
+        console.log(`    ${renderGitDeferralCompanion({
+          reason: deferral.displayReason,
+          canResolve: deferral.canResolve,
+          canKeepMine: deferral.canKeepMine,
+        })}`);
       }
     }
     return { daemonRunning: rendered.daemonRunning };
@@ -790,6 +795,11 @@ export async function statusCmdWithDeps(
         bytesChanged: deferral.bytesChanged,
         now,
         capability: deferral.displayReason === "unsupported" ? gitCapability : undefined,
+      })}`);
+      console.log(`      ${renderGitDeferralCompanion({
+        reason: deferral.displayReason,
+        canResolve: deferral.canResolve,
+        canKeepMine: deferral.canKeepMine,
       })}`);
     }
   }
