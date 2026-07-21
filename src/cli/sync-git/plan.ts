@@ -5,7 +5,7 @@ import { type GitConfigRunner } from "../../engine/git/config-txn.js";
 import { expectedStateNonce, repoRecordsForState, type GitDeferralReason, type SyncState, type WorkspaceConfig } from "../config.js";
 import type { SyncRemote } from "../remote.js";
 import type { TransferProgress } from "../transfer-progress.js";
-import { GIT_CAPTURE_CONCURRENCY, configCredentialSkipLogged, configOwnershipSkipLogged, gitRepoCap, repoDirOf, carryMatrixMatches, emptyToUndef, errMsg, capturePlannedGitSection } from "./shared.js";
+import { GIT_CAPTURE_CONCURRENCY, configCredentialSkipLogged, configOwnershipSkipLogged, pendingCarryLogged, gitRepoCap, repoDirOf, carryMatrixMatches, emptyToUndef, errMsg, capturePlannedGitSection } from "./shared.js";
 import { configReceiver, gitConfigHash, readLocalGitConfig, shouldPublishGitConfig, type LocalCfgRead } from "./config-lane.js";
 import { gitFingerprint, gitFingerprintRun } from "./fingerprint.js";
 import { loadGitDivergenceCache, saveGitDivergenceCache, fingerprintHitProbe, buildPlanProbe, writeDivergenceCacheEntry, isGitRepoKind, type FingerprintHitProbeResult, type DivergenceCacheProbeSnapshot, type DivergenceCacheWriteResult } from "./divergence-cache.js";
@@ -702,6 +702,9 @@ export async function planGitSections(
         out[rel] = pend;
         carried.push(rel);
         if (probe.busy) deferred.push({ relPath: rel, reason: probe.reason });
+        // Field-forensics lesson (Mac wedge, 2026-07-21): a silent carry made the
+        // no-heal diagnosis require SSH log archaeology. One bounded line per push.
+        else logOnce(pendingCarryLogged, rel, `git-sync pending carry ${rel}: ${probe.reason}`);
         continue;
       }
       pendingSupersessionCandidates.add(rel);
