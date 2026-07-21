@@ -855,6 +855,25 @@ test("keep-mine refuses busy and in-progress Git state without clearing anything
   expect(JSON.stringify(await loadState(root, syncStreamId(cfg)))).toBe(before);
 });
 
+test("keep-mine previews despite breadcrumb op-state (ORIG_HEAD) but refuses in-progress (MERGE_HEAD)", async () => {
+  const { incoming } = await fixture();
+  const incomingTip = incoming.refs["refs/heads/main"]!;
+  await git(receiver, "fetch", "-q", sender, incomingTip);
+  await git(receiver, "reset", "--hard", incomingTip);
+  await git(receiver, "-c", "user.email=resolve@example.invalid", "-c", "user.name=resolve", "commit", "--allow-empty", "-qm", "keep local ahead");
+  // ORIG_HEAD (breadcrumb, design 126) exists from the reset — the preview must NOT refuse on it.
+  await expect(fs.access(path.join(receiver, ".git", "ORIG_HEAD"))).resolves.toBeUndefined();
+  cfg.git = { incremental: true };
+  const previewLines: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "keep-mine", { json: true }, deps(previewLines))).toBe(1);
+  expect(JSON.parse(previewLines.at(-1)!)).toMatchObject({ status: "preview", verb: "keep-mine" });
+  // A genuinely in-progress operation still refuses.
+  await fs.writeFile(path.join(receiver, ".git", "MERGE_HEAD"), `${incomingTip}\n`);
+  const refusedLines: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "keep-mine", { json: true }, deps(refusedLines))).toBe(1);
+  expect(JSON.parse(refusedLines.at(-1)!)).toMatchObject({ status: "refused", code: "local-operation" });
+});
+
 test("keep-mine refuses reserved current-branch divergence without clearing anything", async () => {
   await fixture();
   const before = JSON.stringify(await loadState(root, syncStreamId(cfg)));
