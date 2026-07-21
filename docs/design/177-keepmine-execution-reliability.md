@@ -1,6 +1,6 @@
 # 177 — keep-mine executes at confirm time (kill the intent gap)
 
-Status: DRAFT v5 — architectural pivot holding. History: r1/r2 hardened the
+Status: DRAFT v7 — architectural pivot holding. History: r1/r2 hardened the
 deferred-intent model; r3's nine deepening findings triggered the founder
 "growing complexity = wrong layer" rule; v4 deleted the intent gap
 (synchronous confirm). r4 (gpt-5.6-sol, high) verdict CHANGES-REQUIRED but
@@ -17,7 +17,13 @@ gitIncomingKey and reconciles BEFORE any 409 classification with the
 exact-key/mismatch policy (r5-1/2/3, receipt scope narrowed to push/pull);
 stability identities carry presence bits for every op-state root (r5-4);
 pseudo-ref/AUTO_MERGE pin roots derive from the staged copies, never live
-rereads (r5-5); test list extended per r5-9. Round 6 pending.
+rereads (r5-5); test list extended per r5-9. r6 certified §1a/§1b/§1e and the
+r5-5 folding; its two remaining capture holes folded in v7: staged in-progress
+root presence VETOES publication independently of endpoint equality (r6-1),
+and the staged index tree's object closure is pinned into the bundle — stash
+WIP derives from the live index and cannot be the only carrier of staged-index
+objects (r6-2); receipt removal made atomic-with-or-after the accepted clears
+(r6 §1e note). Round 7 pending.
 
 ## Problem (field evidence, 2026-07-21, founder's Mac)
 
@@ -148,8 +154,11 @@ machine (r5-2). Policy (r5-3):
   head through normal pull, drop the receipt, and surface the fresh-preview
   message only if pending remains after the pull.
 
-The user-facing contract for a crashed confirm is "run rbox push or rbox
-pull; it reconciles" — never a silent half-state.
+Receipt removal is atomic with — or strictly after — the accepted clears
+(never before), and an unreadable/unauthenticated head RETAINS the receipt
+for the next attempt (r6 note). The user-facing contract for a crashed
+confirm is "run rbox push or rbox pull; it reconciles" — never a silent
+half-state.
 
 ### 2. What gets deleted
 
@@ -211,6 +220,18 @@ first as a separate follow-up since it is a latent general defect):
   while the uploaded staged artifact references A and the endpoint still
   passes. Pseudo-ref and AUTO_MERGE roots are extracted from the STAGED
   op-state copies, and those oids join the scratch-ref bundle roots.
+- **Staged in-progress presence VETOES, independent of equality** (r6-1): an
+  in-progress root (even a bare directory) present in the STAGED snapshot
+  refuses publication outright — equality with a live snapshot that has the
+  same root present proves stability, not safety. This mirrors follow's
+  root-presence veto (follow.ts:550) on the publish side.
+- **Staged index closure is pinned** (r6-2): the stash WIP commit derives
+  from the LIVE index (capture.ts:229), so it cannot be the carrier of
+  staged-index objects — an index A→B→A around stash creation yields WIP(B)
+  while the uploaded artifact and `indexTree` describe A, leaving A-only
+  blobs out of the bundle. The staged index tree (and, for the raw/unmerged
+  fallback of identity.ts:38, every object the staged index references) is
+  pinned as a bundle root alongside the scratch refs.
 
 ## Acknowledged UX regression (r4-7)
 
@@ -265,9 +286,15 @@ authenticated remote, git-cmd.ts:605).
    ordering applies them before clears; exact-key match from an independent
    identical writer → accepted-equivalent; mismatching writer → pending
    retained, fresh preview only if pending remains.
-10. Capture coherence (r5-9): deterministic index replacement mid-capture →
-    endpoint refuses; op-state add/change/delete and BARE-DIRECTORY creation
-    mid-capture → endpoint refuses (presence bits); staged pseudo-ref ABA
-    (MERGE_HEAD A→B→A during pin collection) → pins derive from staged A,
-    bundle coherent, publish proceeds; HEAD drift → refuses; scratch refs
-    cleaned up on every path.
+10. Capture coherence (r5-9, extended r6): deterministic index replacement
+    mid-capture → endpoint refuses; op-state add/change/delete and
+    BARE-DIRECTORY creation mid-capture → endpoint refuses (presence bits);
+    bare root created BEFORE staged sampling and stable through the endpoint
+    → staged-presence veto refuses (r6-1); staged pseudo-ref ABA (MERGE_HEAD
+    A→B→A during pin collection) → pins derive from staged A, bundle
+    coherent, publish proceeds; index A→B→A around stash creation → staged
+    index closure pinned, bundle contains every staged-index object (r6-2);
+    HEAD drift → refuses; scratch refs cleaned up on every path.
+11. Receipt retention: an unreadable or unauthenticated head during
+    reconciliation retains the receipt; receipt removal happens atomically
+    with or strictly after the accepted clears.
