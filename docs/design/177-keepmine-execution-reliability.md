@@ -1,192 +1,273 @@
-# 177 — keep-mine execution reliability (survive ambient churn)
+# 177 — keep-mine executes at confirm time (kill the intent gap)
 
-Status: DRAFT v3 — r1 findings all folded (1 accepted-modified, 2 accepted/
-dropped-mechanism-A, 3-5 accepted). r2 (gpt-5.6-sol, high) verdict
-CHANGES-REQUIRED, all five findings accepted and folded in v3: absence voids
-(r2-1), lineage transition centralized in state composition + take-theirs
-clears stale intents (r2-2), repositoryIdentity/repoKind stay hard (r2-3),
-record-time branch predicates re-run at execution (r2-4), pin-time stability
-endpoint replaces full-equality with refuse-not-void semantics (r2-5).
-Round 3 pending.
+Status: DRAFT v5 — architectural pivot holding. History: r1/r2 hardened the
+deferred-intent model; r3's nine deepening findings triggered the founder
+"growing complexity = wrong layer" rule; v4 deleted the intent gap
+(synchronous confirm). r4 (gpt-5.6-sol, high) verdict CHANGES-REQUIRED but
+affirmed "the synchronous pivot is viable" — all eight findings are missing
+CONTRACTS, not architecture, and all are accepted and folded in v5:
+409-aborts-with-fresh-preview (r4-1), explicit rider/result contract (r4-2),
+durable publication receipt for uncertain ACK (r4-3), lock gate + acquisition
+deadline (r4-4), explicit intent-stripping normalizer (r4-5), scratch-ref
+bundle pinning + staged-snapshot endpoint (r4-6), honest UX-regression notes
+(r4-7), CODEMAP ownership updates in the same PR (r4-8). r5 verdict CHANGES-REQUIRED but "the synchronous architecture remains
+viable"; 1c/1d certified faithful (r5-8), 1a/1b tightened per r5-6/7, and the
+three substantive holes folded in v6: receipt persists the attempted
+gitIncomingKey and reconciles BEFORE any 409 classification with the
+exact-key/mismatch policy (r5-1/2/3, receipt scope narrowed to push/pull);
+stability identities carry presence bits for every op-state root (r5-4);
+pseudo-ref/AUTO_MERGE pin roots derive from the staged copies, never live
+rereads (r5-5); test list extended per r5-9. Round 6 pending.
 
 ## Problem (field evidence, 2026-07-21, founder's Mac)
 
-Healing savvy-core took five keep-mine attempts. The dominant failure:
-"keep-mine snapshot changed; review the current repository and confirm again",
-three consecutive times across ~2h on an actively-used repo. The intent binds
-the full snapshot (`resolutionBindingIdentity`: refs, reflogs, head, index,
-op-state, stash, config, repoGen, incomingKey…), and ANY drift between record
-and the executing push voids it. On a live work repo — IDE background fetches,
-linked-worktree agent activity, routine commits, and the daemon's own pull
-cadence — the record→push window virtually never closes. Success required
-stopping the daemon and scripting record+push into one ~10s window. Users
-cannot be expected to discover that.
+176's keep-mine records a resolution intent at confirm time and executes it
+on "the next ordinary push". Everything that went wrong in the field lives in
+that gap:
 
-**Non-problem (r1 finding 2):** there is no quiescent early-exit catch-22.
-An executed intent produces `resolvedPending` (plan.ts:992), which alone makes
-`gitPlan.changed` true (plan.ts:227) and bypasses the no-op exit
-(push.ts:511); the file-plane-quiescent E2E (git-sync.test.ts:1526) passes.
-The field "already in sync" pushes were the intent voiding at the equality
-gates before execution — fixing the voiding fixes the whole symptom. No
-publish-on-pending-intent mechanism is needed, and none is added: a refused,
-voided, or journal-blocked intent MUST NOT publish an empty sequence.
+- Ambient churn (IDE fetches, linked-worktree agents, routine commits, daemon
+  pulls) voided the intent three consecutive times across ~2h — the full
+  snapshot binding cannot survive on a live work repo.
+- The gap must be defended against remote truth moving (pull preserving
+  previewed pending vs newer sections), producing the r1-CRITICAL lineage
+  fence, the r2 ingress-path audit, and the r3 composition/representability
+  findings — an ever-widening TOCTOU surface across capture, apply, state
+  composition, and push.
+- Every successful heal tonight had the same shape: quiesce sync, resolve
+  atomically, resume — performed by hand with daemon stop/start choreography.
 
-## Invariant
-
-"What you previewed is what gets discarded." The final report gate already
-re-derives the discard report against the live candidate and authorizes it
-lane-by-lane against the confirmed preview (`reportAuthorized`, hardened in
-v1.7.18). Snapshot-identity equality is stronger than the invariant requires,
-and it is what ambient churn breaks.
+The fix is to make that shape the product: there is no intent gap because
+there is no intent.
 
 ## Mechanism
 
-### 1. Decompose ALL THREE equality gates (r1 finding 3)
+### 1. Synchronous confirm
 
-Current execution performs full-binding equality at plan.ts:734 (pre-capture),
-plan.ts:1002 (post-capture), and plan.ts:1031 (pre-pin). Each decomposes into
-exactly three categories; full-snapshot equality is no longer computed as a
-voiding condition anywhere:
+`rbox git resolve <repo> keep-mine --confirm <token> [--force-discard-incoming]`:
 
-- **Hard fences (void on mismatch, today's "review and confirm again" copy):**
-  `stream`, `stateNonce`, `incomingKey`, `repositoryIdentity`, `repoKind`
-  (r2-3: physical repo identity is a subject fence — an intent confirmed for
-  clone A must never execute after R is replaced by clone B, since capture
-  would publish all of clone B's refs while the report examines only
-  pending's lanes), and the remote-lineage fence (§2). Checked at all three
-  sites.
-- **Semantic branch predicates (refuse, retain intent — r2-4):** the two
-  record-time refusal predicates (git-cmd.ts:887 BASE-tracked incoming branch
-  absent locally; git-cmd.ts:896 divergent incoming branch currently checked
-  out) are re-evaluated against the final candidate and live checkout at
-  execution. Full-refs equality silently kept these true; without it they
-  must be checked explicitly. Failure → refuse with the record-time copy.
-- **Op-state safety (refuse/defer, retain intent — never void):** §3.
-- **Report authorization (refuse, retain intent):** the existing
-  `reportAuthorized` lane gate at plan.ts:1024, unchanged — any lane that
-  would discard more than the confirmed preview refuses.
-- **Pin-time stability endpoint (refuse/defer, retain intent — r2-5):**
-  immediately before preservation pins, re-read refs, HEAD, presence-aware
-  op-state, and index identity and require equality with the captured
-  candidate's values. This replaces the old full-binding equality at
-  plan.ts:1031 with a check scoped to the artifacts actually being published,
-  and its failure mode is refuse-and-retry-next-push, not void — shrinking
-  the race window from user-scale (record→push, minutes) to capture-scale
-  (capture→pin, seconds) instead of pretending it is zero.
+1. **Acquire the workspace sync lock, waiting** (bounded, default 60s, with a
+   progress line "waiting for the current sync cycle to finish…"). Today's
+   instant "daemon/CLI is syncing; retry" refusal becomes wait-then-proceed —
+   also fixing tonight's operator papercut.
+2. **Re-derive the preview against live state** under the lock: same
+   preliminary-report machinery as the preview command. If the re-derived
+   report's discard set differs from what the confirm token binds (token
+   semantics unchanged: it binds the preview content the user saw), refuse
+   with a fresh token and today's "review and confirm again" copy. This is
+   the ONLY confirm-vs-live consistency check — and the window it guards is
+   milliseconds under an exclusive lock, not minutes of ambient life.
+3. **Run the ordinary push pipeline in-process** with the resolution rider:
+   capture, final report, `reportAuthorized` (v1.7.18 semantics), preservation
+   pins, publish, accepted-ACK pending clear. All 176 safety gates run
+   unchanged — they simply run NOW, inside the same lock scope as the
+   re-derived preview, instead of on a future push against a drifted world.
+4. Outcome is synchronous: success ("published; your repo is the synced truth
+   now"), refusal (fresh token + reason), push failure before the commit send
+   (network etc. — no resolution state persisted; preservation pins and caches
+   written pre-ACK are intentionally durable and harmless), or the
+   uncertain-ACK case (§1e).
 
-Drift in reflogs, stash, and config, and any refs/head/index drift BETWEEN
-record and capture, no longer voids; a mismatch in the (still computed)
-binding identity is downgraded to a logged notice:
-`keep-mine proceeding on a changed repository — discard report re-verified`.
+#### 1a. Rider and result contract (r4-2)
 
-### 2. Remote-lineage fence replaces the repoGen fence (r1 finding 1, accepted-modified)
+- `PushManifestOptions` gains `resolution?: { repo: string; verb: "keep-mine";
+  confirmedReport: ResolutionDiscardReport; authorizedLanes: string[];
+  forceDiscardIncoming: boolean }` — the ephemeral, in-memory replacement for
+  `record.resolutionIntent`. `GitPlanOptions` receives it verbatim; planner
+  admission for keep-mine keys off the rider (plan.ts:724's
+  record-intent read is deleted). The rider survives 422 recapture and epoch
+  refresh untouched — it binds the CONFIRMED REPORT, not a snapshot; the
+  final report + `reportAuthorized` re-run on every recapture.
+- `PushResult` gains `resolution?: { outcome: "published" | "refused" |
+  "aborted-remote-moved" | "ack-uncertain"; reason?: string; sequence?:
+  number }`. The resolver never infers success from `committed` (unrelated
+  file changes can commit while the keep-mine candidate was reverted). The
+  planner exposes a typed resolution disposition alongside `resolvedPending`
+  (today failures surface only as generic deferral reasons, plan.ts:1024)
+  that maps 1:1 into `PushResult.resolution`; the rider is retained in
+  `PushAttemptState` across resets and passed at the per-attempt planner
+  call (push.ts:223/:399) (r5-6). `reportAuthorized` narrows its parameter
+  from `GitResolutionIntent` to the `authorizedLanes` it actually uses.
 
-The CRITICAL risk: pull preserves the previewed pending P1 when an intent
-exists (apply.ts:601) while newer remote git truth P2 advances the record
-(pull.ts:273, sync-state.ts:353, repoGen bump at config.ts:638). With repoGen
-soft and incomingKey matching P1, execution would overwrite never-previewed
-P2. With repoGen hard (plan.ts:736 requires exactly `binding.repoGen + 1`),
-every ambient pull kills the intent — the daemon's pull cadence makes the
-fence unsatisfiable outside stop-the-daemon windows, which is the field bug.
+#### 1b. 409 disposition (r4-1, CRITICAL; tightened r5-2/7)
 
-Replacement — void precisely when remote git truth for THIS repo moves.
-Remote heads are full decoded manifests (e2ee-remote.ts:132), so for a repo
-that existed, presence-aware truth is well-defined (r2-1): a manifest whose
-git section for R has the SAME `gitIncomingKey` leaves the intent alone; a
-DIFFERING section voids it; and ABSENCE of R's section also voids it —
-absence is authoritative newer truth (a peer deleted R; apply already clears
-pending/base there to prevent resurrection, apply.ts:619/:624), and a
-surviving intent would resurrect a never-previewed deletion.
+Resolution mode never RETRIES THE RIDER after a 409 — precisely: on 409,
+first run §1e receipt reconciliation (the 409 may be our own landed commit
+echoed by the transport retry); if reconciliation does not resolve it as
+ours, the push aborts the resolution (`aborted-remote-moved`), performs the
+ordinary recovery pull WITHOUT the rider (which may legitimately replace or
+clear the pending — resolution is already aborted, r5-7), and the CLI
+reports: "another machine published while confirming — review the new state
+and confirm again" with a fresh preview/token IF pending remains after the
+pull, or the post-pull resolved/no-incoming state otherwise. No retry loops
+hiding a moving fleet from the user.
 
-- **Enforcement is centralized in state composition (r2-2), not at ingress
-  call sites.** The preserve-pending site (apply.ts:601) is one of at least
-  four paths that move remote git truth into the record — journal-recovery
-  defer paths (apply.ts:545/:571) and the receiver-key-collision/per-repo
-  catch paths (apply.ts:1622/:1636) replace pending before any line-601
-  fence would run. Instead, the record-composition layer (sync-state.ts:239,
-  where `resolutionIntent` is currently preserved by default) applies the
-  lineage rule whenever a state transition carries a new observed remote
-  truth for R: same-key → preserve intent; differing-key or absent → drop
-  the intent (with the "snapshot changed; review and confirm again" user
-  message surfaced via the deferral text) and let pending take the new
-  section per existing no-intent behavior.
-- A **live intent** is defined as intent + pending both present (r2-2);
-  `take-theirs` clears `resolutionIntent` explicitly when it rebuilds the
-  record (git-cmd.ts:1062/:1136 currently copy it forward — a stale-intent
-  bug independently worth fixing).
-- Pulls whose manifests never observed R's stream (file-plane-only sequences
-  for other workspaces' shapes) do not touch the intent; "no section for a
-  repo the manifest DOES cover" is the deletion case above, not this one.
-- `binding.repoGen` is removed from the intent binding; plan.ts:736 drops the
-  `+1` fence. Lineage safety now lives in state composition — the single
-  choke point every ingress path already flows through.
-- Regression test (r1-mandated): confirm intent → another device publishes a
-  newer git section for R → pull → intent is void, pending is the NEW
-  section, keep-mine re-preview shows P2 content; the executing push after
-  re-confirmation discards P2 only.
+#### 1c. Lock contract (r4-4)
 
-### 3. Presence-aware op-state, bracketed (r1 findings 4 + 5)
+- The existing degraded-lock refusal (git-cmd.ts:934: unsupported locking →
+  keep-mine refuses) is retained and tested — a lockless handle excludes
+  nothing and must not admit a resolution.
+- Acquisition gets a wall-clock deadline parameter (default 60s) scoped to
+  confirmed keep-mine (sync-mutex today exposes attempts+delay only). The
+  deadline bounds ACQUISITION exclusively; once held, no timer ever releases
+  mid-work (current wrapper semantics, sync-mutex.ts:313, preserved).
 
-- **Classifier:** record-time (git-cmd.ts:819, :963) and execution-time
-  checks stop using bare `readOpState` key enumeration (refs.ts:33 misses
-  empty in-progress roots). Reuse follow's presence-aware semantics
-  (follow.ts:428, :550): an in-progress root directory counts even when
-  empty. Extract the shared classifier rather than duplicating it.
-- **Bracket:** capture is not atomic (capture.ts:207 stages index/op-state
-  before HEAD/refs/bundle). Per design 176 v6 (held-skip.ts:138 pattern),
-  execution takes a trusted fingerprint of the classification inputs
-  (presence-aware op-state roots + file hashes + index identity) BEFORE the
-  candidate-producing reads and re-verifies it AFTER the final report is
-  authorized, at the §1 pin-time stability endpoint. Fingerprint mismatch,
-  an in-progress root represented in the captured candidate, or an
-  incomplete/indeterminate endpoint observation (r2-5; index projection can
-  return indeterminate on probe failure, index-identity.ts:79) →
-  refuse/defer retaining the intent (next push retries); never void, never
-  publish.
-- **ABA soundness argument (r2-5), pinned here because it is the load-bearing
-  claim:** an operation that starts and fully unwinds strictly inside the
-  bracket (creates `rebase-merge/`, mutates HEAD/refs, aborts, restores)
-  cannot corrupt the published candidate, because every published artifact is
-  either (a) enumerated at bracket start and byte-read from the append-only
-  object store (bundle contents, op-state files listed at capture.ts:279 —
-  files created after enumeration are never published), or (b) re-verified at
-  the endpoint (refs, HEAD, op-state presence, index identity, all required
-  equal to the captured values). An interior op that restores state to
-  exactly the captured values has, by construction, not changed anything the
-  push publishes. What the bracket therefore excludes is not "no operation
-  ran" but "no operation's effects are represented" — which is the safety
-  property 176 v6 actually needs. Test: create-then-delete an operation root
-  inside the bracket window (test hook) both with and without restoring
-  refs — the restored case may publish (endpoint equal), the unrestored case
-  must refuse.
-- Record-time refusal for in-progress operations keeps today's behavior and
-  copy, upgraded to the presence-aware classifier.
+#### 1d. Migration normalizer (r4-5)
+
+State loading spreads unknown record properties intact (config.ts:473/:517,
+sync-state.ts:125), so deleting the TypeScript field does NOT shed persisted
+intents. An explicit record normalizer strips `resolutionIntent` on load, with
+a regression test proving an unrelated repo save also sheds it. Release note
+covers the ≤1.7.18-process-still-running overlap.
+
+#### 1e. Uncertain ACK (r4-3)
+
+The server commit lands before local clears are saved (push.ts:651 vs :688+).
+If the accepted response is lost (process death, network, state-save failure),
+remote truth may exist while local pending survives. Before the commit send,
+resolution mode writes a small durable publication receipt — local state, not
+wire — `{repo, attemptedGitIncomingKey, attemptedSequence,
+confirmedReportHash}`. `attemptedGitIncomingKey` = `gitIncomingKey(candidate)`
+(shared.ts:83) of the exact section being published; the report hash alone is
+NOT decidable — different local states can produce identical discard reports
+(r5-1).
+
+Reconciliation runs at the START of every push and pull while a receipt
+exists (scope deliberately narrowed to push/pull — status has no
+authenticated manifest path, r5-3), and specifically BEFORE any 409 is
+classified: the commit transport's own lost-response retry returns 409 when
+the first POST landed (resilient.ts:20, commits.ts:317), so an unreconciled
+409 can be OUR OWN successful publish, and §1b must not report it as another
+machine (r5-2). Policy (r5-3):
+
+- Head's section for the repo has the EXACT `attemptedGitIncomingKey`:
+  accepted-equivalent (even if another writer independently published
+  identical state). Run the normal pull/state-proof ordering for the full
+  head (unrelated changes apply as usual), then complete the accepted-ACK
+  local clears for the repo and drop the receipt.
+- Mismatch: a different writer won. Retain pending conservatively, apply the
+  head through normal pull, drop the receipt, and surface the fresh-preview
+  message only if pending remains after the pull.
+
+The user-facing contract for a crashed confirm is "run rbox push or rbox
+pull; it reconciles" — never a silent half-state.
+
+### 2. What gets deleted
+
+- The persisted `resolutionIntent` record field and its entire lifecycle:
+  recording, post-capture binding identity comparison, the repoGen +1 fence,
+  void-on-snapshot-change, pull-time preservation of previewed pending
+  (apply.ts:601 reverts to uniform no-intent behavior), and take-theirs'
+  accidental intent copy-forward (moot — nothing to copy).
+- Old-CLI compat: daemons/CLIs never exchange intents (they are local state),
+  so deletion is wire-invisible. A leftover on-disk intent from ≤1.7.18 is
+  ignored and dropped on next state save (one release note line).
+
+### 3. What stays (from 176 + this cycle's reviews)
+
+- Preview/confirm token flow, refusal shapes, plain-English copy — the UX
+  contract is untouched; only WHEN execution happens changes.
+- Presence-aware op-state classification (r2-4): record/confirm-time refusal
+  must count an empty in-progress root directory (bare `rebase-merge/`) as
+  in-progress — reuse follow's lstat semantics (follow.ts:428/:550) via a
+  shared classifier, replacing bare `readOpState` key enumeration at
+  git-cmd.ts:819/:963.
+- The record-time branch predicates (git-cmd.ts:887/:896) need no execution
+  replay — confirm-time re-derivation (§1.2) IS their re-run.
+- Daemon coexistence: the daemon's ordinary pushes never carry resolutions
+  (nothing persisted to carry); a daemon push racing the lock simply serializes
+  behind it.
+
+### 4. Capture stability rider (r3 findings 1-2, survives the pivot)
+
+Even a synchronous push races concurrent git mutation for the seconds capture
+takes. Two hardenings, scoped to keep-mine's capture (ordinary pushes get the
+first as a separate follow-up since it is a latent general defect):
+
+- **Bundle roots are pinned to the captured OIDs via scratch refs** (r4-6:
+  raw `<oid> refname` pairs are not a valid `git bundle create` input form).
+  Extend the existing capture-unique scratch-ref machinery (pins.ts:26): root
+  every recorded ref OID through a synthetic ref, bundle exactly those
+  synthetic roots — a ref moving mid-capture can no longer produce a bundle
+  whose contents disagree with the advertised section refs
+  (capture.ts:224 vs :242).
+- **Stability endpoint against the STAGED snapshot** (r4-6): before
+  pins/publish, compare against a coherent snapshot derived from the staged
+  artifacts — the staged index bytes' identity (NOT the live index that
+  capture.ts:274 currently reads for `indexTree`, which can describe a
+  different state than the uploaded artifact), staged op-state, and the
+  recorded refs/HEAD. Both the staged and live identities include a
+  PRESENCE BIT for every op-state root (r5-4): `readOpState` enumerates
+  files only (refs.ts:31) and cannot see a bare `rebase-merge/` created
+  mid-capture, so presence is observed via follow's lstat semantics
+  (follow.ts:428) on both sides of the comparison. Live re-reads must equal
+  the staged snapshot; mismatch → refuse with "your repository changed while
+  publishing — run the command again"; nothing published. `indexTree`
+  computation moves to the staged bytes as part of this (fixing the existing
+  incoherence). The retry loop is the user pressing enter, on a seconds-wide
+  window, not intent surgery.
+- **Pin roots derive from staged copies** (r5-5): `collectPinShas` currently
+  rereads live pseudo-ref files (MERGE_HEAD, AUTO_MERGE…) during pin
+  collection (pins.ts:86, capture.ts:232) — an A→B→A flip there can pin B
+  while the uploaded staged artifact references A and the endpoint still
+  passes. Pseudo-ref and AUTO_MERGE roots are extracted from the STAGED
+  op-state copies, and those oids join the scratch-ref bundle roots.
+
+## Acknowledged UX regression (r4-7)
+
+The deferred model gave one thing synchronous confirm loses: daemon-side
+retry after a network failure post-confirmation. Now the foreground process
+must survive capture/upload/commit, and a network failure means the user
+re-runs the command (fresh preview if anything moved). This is the right
+trade — the "retry" the old model provided was the same mechanism that voided
+on every ambient change, so in practice it retried into refusals. Confirm
+shows push-style progress; Ctrl-C before the commit send is safe (receipt not
+yet written or reconciled-away); Ctrl-C after is the §1e uncertain-ACK case.
+Offline confirm was never supported (resolver setup requires the
+authenticated remote, git-cmd.ts:605).
 
 ## Non-goals
 
-- No change to preview/confirm token flow, refusal shapes, or user-facing
-  copy (one new log notice aside).
-- No change to take-theirs.
-- No publish-on-intent mechanism (dropped, r1 finding 2).
-- No retroactive re-execution of intents voided in the field.
+- No change to take-theirs semantics (its stale-intent copy-forward dies with
+  the intent field itself).
+- No retroactive handling of intents recorded by ≤1.7.18 beyond the §1d
+  normalizer.
+- The general ordinary-push bundle-pinning fix is filed as its own follow-up,
+  not implemented in this cycle's diff (keep-mine's capture gets it now).
+- CODEMAP ownership lines for push/plan/resolution-intent/apply are updated
+  in the implementation PR (r4-8), not tracked here.
 
 ## Tests the implementation MUST write
 
-1. Ambient churn: record intent; add commits, grow reflogs, rewrite index,
-   touch config between record and push → intent executes, notice logged, no
-   void. (Fails today at plan.ts:734 before capture even starts.)
-2. Remote lineage: record intent → pull applies a newer git section for R →
-   intent void with "snapshot changed" copy, pending replaced by new section;
-   re-preview reflects new content.
-3. File-plane-only pull between record and push → intent survives, executes.
-4. Widened discard: repo change makes a NEW lane discardable (delete a
-   preview-subsumed branch) → refuse "review and confirm again", intent
-   retained, nothing published for it.
-5. Empty in-progress root (bare `rebase-merge/` directory, no files) at
-   record time → refusal with in-progress copy; same at execution time →
-   refuse/defer retaining intent.
-6. Bracket race: mutate op-state between capture reads and pin time (test
-   hook) → refuse/defer retaining intent; no void; no publish.
-7. Quiescent workspace regression (exists, keep green): record → clean-file-
-   plane push executes intent and publishes exactly one sequence
-   (git-sync.test.ts:1526).
+1. Confirm executes synchronously: quiescent workspace, `--confirm` →
+   published sequence, pending cleared, exit 0, no daemon involvement.
+2. Ambient churn immunity: start confirm while a background loop commits and
+   rewrites the index in the repo → either a clean publish (stability
+   endpoint held) or the "changed while publishing" refusal; NEVER a stale
+   discard; a bounded number of retries succeeds.
+3. Lock wait: confirm issued while a push holds the sync lock → waits, then
+   proceeds; bounded-wait expiry produces a plain-English timeout message.
+4. Preview-drift refusal: mutate the repo between preview and confirm so the
+   discard set changes → refusal with fresh token, old token dead.
+5. Presence-aware op-state: bare empty `rebase-merge/` at confirm →
+   in-progress refusal (both preview and confirm doors).
+6. Bundle pinning: move a branch mid-capture (test hook between ref record
+   and bundle) → for an UNRESTORED move, BOTH hold (r5-9): the bundle
+   contains the captured OID (scratch-ref roots) AND the stability endpoint
+   refuses; the published section's refs always correspond to bundle
+   contents.
+7. Leftover ≤1.7.18 intent on disk: stripped by the §1d normalizer, dropped
+   on an UNRELATED repo's save too, no behavior change.
+8. take-theirs unaffected: full suite regression.
+9. Receipt reconciliation (r5-9): lost-ACK then transport-retry-409 →
+   reconciled as ours, clears complete, no "another machine" message;
+   same-report/different-section → receipt key mismatch handled as
+   different-writer; later head with unrelated changes → normal pull
+   ordering applies them before clears; exact-key match from an independent
+   identical writer → accepted-equivalent; mismatching writer → pending
+   retained, fresh preview only if pending remains.
+10. Capture coherence (r5-9): deterministic index replacement mid-capture →
+    endpoint refuses; op-state add/change/delete and BARE-DIRECTORY creation
+    mid-capture → endpoint refuses (presence bits); staged pseudo-ref ABA
+    (MERGE_HEAD A→B→A during pin collection) → pins derive from staged A,
+    bundle coherent, publish proceeds; HEAD drift → refuses; scratch refs
+    cleaned up on every path.
