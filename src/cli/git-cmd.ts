@@ -960,7 +960,9 @@ export async function gitResolveCmd(
         emit({ status: "refused", verb, repo: rel, code: "git-busy", message: "Git became busy; retry keep-mine after the other Git operation finishes" }, json, deps, root);
         return 1;
       }
-      if (Object.keys(await readOpState(ctx.gitDir, hashFile)).length > 0) {
+      const confirmInProgress = Object.keys(await readOpState(ctx.gitDir, hashFile))
+        .filter((rel2) => OP_STATE_CLASSIFICATION[opStateRootOf(rel2)] === "in-progress");
+      if (confirmInProgress.length > 0) {
         emit({ status: "refused", verb, repo: rel, code: "local-operation", message: "a Git operation began before confirmation; finish or abort it, then run keep-mine again" }, json, deps, root);
         return 1;
       }
