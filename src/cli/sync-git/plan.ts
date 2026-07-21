@@ -11,6 +11,7 @@ import { gitFingerprint, gitFingerprintRun } from "./fingerprint.js";
 import { loadGitDivergenceCache, saveGitDivergenceCache, fingerprintHitProbe, buildPlanProbe, writeDivergenceCacheEntry, isGitRepoKind, type FingerprintHitProbeResult, type DivergenceCacheProbeSnapshot, type DivergenceCacheWriteResult } from "./divergence-cache.js";
 import { checkoutJournalBinding, quarantineUnboundFollowJournal, recoverAndLandFollowJournal } from "./follow.js";
 import { normalizeOutgoingGitSections, tombstoneFindingLine } from "./publisher-tombstones.js";
+import { gitPendingSupersedeEnabled, journalAllowsPendingSupersession, pendingSupersessionPreProbe, provePendingSupersession } from "./pending-supersession.js";
 /** The outcome of push-side git orchestration: the outbound `gitRepos` map, whether it
  *  differs from what the last commit carried, the local-only state after this cycle
  *  (persisted only on a successful commit — recomputed idempotently otherwise), and
@@ -41,6 +42,10 @@ export interface GitPushPlan {
   }>;
   captured: string[];
   carried: string[];
+  /** Candidate-bound receipts consumed only by the accepted publisher ACK. */
+  supersededPending: string[];
+  /** Repos whose entire P-bound record is immutable before accepted ACK. */
+  protectedPending: string[];
   deferred: Array<{ relPath: string; reason: string }>;
   captureDeferrals: Record<string, GitDeferralReason>;
   configDeferrals: Record<string, GitDeferralReason>;
@@ -86,15 +91,18 @@ export interface GitPlanOptions {
   now?: () => Date;
   /** Awaited daemon registry observer; errors are observability-only. */
   onGitReposDiscovered?: (repos: readonly DiscoveredGitRepo[]) => Promise<void>;
+  /** Deterministic test seam for a ref race after B's provisional pre-probe. */
+  afterPendingPreProbe?: (relPath: string) => void | Promise<void>;
 }
 
 /**
  * Push-side git orchestration (design 43 §6): discover every repo in the tree, then per
- * repo either CARRY (pending section, needs-resolution checkpoint, or unchanged identity
- * per the §7 shape×scope matrix), CAPTURE (bounded pool), DEFER with base carry (any
+ * repo either CARRY (protected pending, needs-resolution checkpoint, or unchanged identity
+ * per the §7 shape×scope matrix), CAPTURE (including a provisionally superseding P
+ * candidate, bounded pool), DEFER with base carry (any
  * per-repo failure — never abort the push), or REMOVE (repo dir gone entirely, §9).
  * `force` is the per-relPath 422 recapture set [v2, M5]: forced repos skip the carry
- * fast-path; a forced repo that cannot recapture is DROPPED from this commit (the
+ * fast-path; a forced non-P repo that cannot recapture is DROPPED from this commit (the
  * non-looping failure path [v3]) rather than re-referencing blobs the server lost.
  */
 export async function planGitSections(
@@ -133,6 +141,9 @@ export async function planGitSections(
   const configObserved = new Set<string>();
   const skipped: Array<{ relPath: string; reason: string }> = [];
   const out: Record<string, GitSection> = {};
+  let finalizedOutgoing: Record<string, GitSection> | undefined;
+  const pendingSupersessionCandidates = new Set<string>();
+  const supersededPending = new Set<string>();
   const cache = await loadGitDivergenceCache(root);
   const fingerprintRun = gitFingerprintRun("per-decision");
   const fastPathParentRel = new Map<string, string | undefined>();
@@ -154,6 +165,11 @@ export async function planGitSections(
     seen.add(key);
     glog(line);
   };
+  const normalizeCurrentOutgoing = () => {
+    const records = repoRecordsForState(state);
+    const advertised = Object.fromEntries(Object.entries(records).map(([relPath, record]) => [relPath, record.advertised]));
+    return normalizeOutgoingGitSections(out, pending, advertised, (options.now?.() ?? new Date()).toISOString());
+  };
   const noteCredentialSkip = (rel: string) =>
     logOnce(configCredentialSkipLogged, rel, `git-sync WARNING ${rel}: skipped credential-bearing remote URL from config capture`);
   const readConfigForPush = (rel: string, diskCtx?: RepoCtx) =>
@@ -169,8 +185,9 @@ export async function planGitSections(
   };
   const plan = (): GitPushPlan => {
     const records = repoRecordsForState(state);
-    const advertised = Object.fromEntries(Object.entries(records).map(([relPath, record]) => [relPath, record.advertised]));
-    const normalized = normalizeOutgoingGitSections(out, pending, advertised, (options.now?.() ?? new Date()).toISOString());
+    const normalized = finalizedOutgoing === undefined
+      ? normalizeCurrentOutgoing()
+      : { sections: finalizedOutgoing, findings: [] };
     for (const { relPath, finding } of normalized.findings) glog(tombstoneFindingLine(relPath, finding));
     const outgoing = normalized.sections;
     // Changed = the outbound map differs from what the LAST COMMIT carried. For a
@@ -181,7 +198,7 @@ export async function planGitSections(
     for (const [relPath, record] of Object.entries(records)) {
       if (record.advertised) prev[relPath] = record.advertised;
     }
-    let changed = false;
+    let changed = supersededPending.size > 0;
     for (const k of new Set([...Object.keys(outgoing), ...Object.keys(prev)])) {
       if (!outgoing[k] || !prev[k] || (outgoing[k] !== prev[k] && JSON.stringify(outgoing[k]) !== JSON.stringify(prev[k]))) {
         changed = true;
@@ -206,6 +223,8 @@ export async function planGitSections(
       ...(Object.keys(publisherAckBindings).length > 0 ? { publisherAckBindings } : {}),
       captured,
       carried,
+      supersededPending: [...supersededPending].sort(),
+      protectedPending: Object.keys(pending).sort(),
       deferred,
       captureDeferrals,
       configDeferrals,
@@ -261,11 +280,13 @@ export async function planGitSections(
 
   const keys = [...new Set([...kindByPath.keys(), ...Object.keys(base), ...Object.keys(pending)])].sort();
   const recoveryBlocked = new Map<string, string>();
+  const recoveryAllowsSupersession = new Map<string, boolean>();
   for (const rel of keys) {
     const repoDir = repoDirOf(root, rel);
     const ctx = await repoCtxFromDisk(repoDir).catch(() => undefined);
     if (!ctx) {
       const recovery = await quarantineUnboundFollowJournal(root, rel, state.stream, expectedStateNonce(state));
+      recoveryAllowsSupersession.set(rel, journalAllowsPendingSupersession(recovery.status));
       if (recovery.status === "binding-mismatch") glog(`git-sync WARNING ${rel}: journal for an absent/unreadable repository quarantined at ${recovery.quarantinePath}`);
       else if (recovery.status === "defer") recoveryBlocked.set(rel, recovery.reason);
       continue;
@@ -292,6 +313,7 @@ export async function planGitSections(
     const binding = await checkoutJournalBinding(state.stream, expectedStateNonce(state), ctx);
     const landedRecovery = await recoverAndLandFollowJournal(root, rel, binding, state, { land: !options.degradedMutex });
     const recovery = landedRecovery.recovery;
+    recoveryAllowsSupersession.set(rel, journalAllowsPendingSupersession(recovery.status));
     if (recovery.status === "keep") {
       if (options.degradedMutex) {
         recoveryBlocked.set(rel, "published checkout journal awaits non-degraded state save");
@@ -426,10 +448,17 @@ export async function planGitSections(
     authoredCfgHashByRepo[rel] = gitConfigHash(embedded.config);
     return embedded;
   };
-  /** Per-repo failure → defer. Forced (422) repos take the M5 non-looping DROP instead:
-   *  their base section references exactly the blobs the server lost, so carrying it
-   *  would 422 forever — drop from THIS commit; the daemon re-captures when possible. */
+  /** Per-repo failure → defer. P always wins byte-for-byte. A forced non-P repo takes
+   *  the legacy M5 drop because its BASE references the exact blob the server lost. */
   const deferOne = (rel: string, reason: string) => {
+    const protectedSection = pending[rel];
+    if (protectedSection) {
+      out[rel] = protectedSection;
+      if (!carried.includes(rel)) carried.push(rel);
+      deferred.push({ relPath: rel, reason });
+      delete authoredCfgHashByRepo[rel];
+      return;
+    }
     if (force.has(rel)) {
       deferred.push({ relPath: rel, reason: `${reason} — section dropped from this commit (its blobs are missing server-side)` });
       return;
@@ -444,7 +473,7 @@ export async function planGitSections(
     kind: GitRepoKind | undefined,
     baseSec: GitSection | undefined,
     fastLookup?: FingerprintHitProbeResult,
-    opts: { admissionAlreadyCounted?: boolean } = {}
+    opts: { admissionAlreadyCounted?: boolean; forceCapture?: boolean } = {}
   ): Promise<void> => {
     stats.spawnedRepos++;
     const probeBeforeFingerprint = fastLookup?.fingerprint ?? (await gitFingerprint(fingerprintRun, root, rel));
@@ -498,8 +527,9 @@ export async function planGitSections(
     if (needsRes[rel] !== undefined) {
       const id = await gitIdentity(repoDirOf(root, rel));
       if (gitIdentityKey(id) === needsRes[rel]) {
-        if (baseSec) {
-          out[rel] = baseSec;
+        const carry = pending[rel] ?? baseSec;
+        if (carry) {
+          out[rel] = carry;
           carried.push(rel);
         }
         return;
@@ -533,6 +563,10 @@ export async function planGitSections(
       // absence (never touching local .git), and when the user fixes the shape a fresh
       // preflight passes with no base tie to the old bad section.
       if (pf.structural) {
+        if (pending[rel]) {
+          deferOne(rel, `${pf.reason ?? "structural preflight refusal"} — carrying pending section`);
+          return;
+        }
         if (baseSec) removed.push(rel);
         if (baseSec || repoRecordsForState(state)[rel] !== undefined) repoAbsent[rel] = true;
         deferred.push({ relPath: rel, reason: `${pf.reason} — section ${baseSec ? "dropped" : "not captured"}` });
@@ -562,8 +596,9 @@ export async function planGitSections(
     ).catch((): DivergenceCacheWriteResult => ({ kind: liveKind }));
     if (!id) {
       // empty repo (no commits yet): nothing to capture; keep any synced base.
-      if (baseSec) {
-        out[rel] = baseSec;
+      const carry = pending[rel] ?? baseSec;
+      if (carry) {
+        out[rel] = carry;
         carried.push(rel);
       }
       return;
@@ -576,7 +611,7 @@ export async function planGitSections(
     //   pointer/scoped    → carry on scoped-identity match
     //   pointer/all-base  → the explicit wider-carry exception: carry when the base's
     //                       SCOPED PROJECTION matches (terminates the convergence loop)
-    if (baseSec && !force.has(rel)) {
+    if (baseSec && !force.has(rel) && !opts.forceCapture) {
       if (!isGitRepoKind(liveKind)) {
         deferOne(rel, "preflight did not report a usable git repo kind");
         return;
@@ -619,16 +654,28 @@ export async function planGitSections(
       continue;
     }
 
-    // Pending unapplied remote [v5]: carry THE PENDING SECTION (the newest known truth),
-    // capture suppressed. 422-while-pending [v6] → M5 drop; the pending entry stays for
-    // the next pull to refresh (remote re-establishes it or absence-supersedes clears it).
+    // Pending remains exact and authoritative until accepted ACK. The pre-probe
+    // only admits a provisional candidate; final normalized-candidate proof below
+    // decides whether publication is permitted.
     if (pend) {
-      if (force.has(rel)) {
-        deferred.push({ relPath: rel, reason: "pending remote section's blobs are missing server-side — dropped this commit; the next pull refreshes it" });
-      } else {
+      // A baseless P can be composer-owned first-publication state. There is no
+      // accepted predecessor for the ACK to advance, so recapturing it would only
+      // manufacture echo commits. Fail closed and preserve it by identity.
+      if (!baseSec || recoveryAllowsSupersession.get(rel) === false || !gitPendingSupersedeEnabled()) {
         out[rel] = pend;
         carried.push(rel);
+        continue;
       }
+      const probe = await pendingSupersessionPreProbe(root, rel, pend);
+      if (probe.status === "carry") {
+        out[rel] = pend;
+        carried.push(rel);
+        if (probe.busy) deferred.push({ relPath: rel, reason: probe.reason });
+        continue;
+      }
+      pendingSupersessionCandidates.add(rel);
+      await options.afterPendingPreProbe?.(rel);
+      await processRepoSlowPath(rel, kind, baseSec, undefined, { forceCapture: true });
       continue;
     }
 
@@ -821,6 +868,30 @@ export async function planGitSections(
       );
     }
   });
+
+  // Normalize exactly once, then prove and publish that exact object. A failed
+  // proof swaps the row back to the original P object by identity.
+  const normalized = normalizeCurrentOutgoing();
+  for (const { relPath, finding } of normalized.findings) glog(tombstoneFindingLine(relPath, finding));
+  finalizedOutgoing = normalized.sections;
+  for (const rel of [...pendingSupersessionCandidates].sort()) {
+    const p = pending[rel];
+    const candidate = finalizedOutgoing[rel];
+    const ctx = await repoCtxFromDisk(repoDirOf(root, rel)).catch(() => undefined);
+    const proven = captured.includes(rel) && p !== undefined && candidate !== undefined && ctx !== undefined
+      && await provePendingSupersession({ ctx, pending: p, candidate, store: api.blobStore(), kek });
+    if (proven) {
+      supersededPending.add(rel);
+      continue;
+    }
+    if (p) finalizedOutgoing[rel] = p;
+    delete authoredCfgHashByRepo[rel];
+    delete repoAbsent[rel];
+    const capturedIndex = captured.indexOf(rel);
+    if (capturedIndex >= 0) captured.splice(capturedIndex, 1);
+    if (!carried.includes(rel)) carried.push(rel);
+    deferred.push({ relPath: rel, reason: "final candidate did not supersede pending section — carrying pending verbatim" });
+  }
 
   const liveKeys = new Set(keys);
   for (const rel of [...cache.repos.keys()]) {

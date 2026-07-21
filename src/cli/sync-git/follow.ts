@@ -59,6 +59,7 @@ import type {
   GitPartialApply,
   RepoRecord,
   RepoRecordInput,
+  TypedBlocker,
 } from "../config.js";
 import { intentSettled, savePublishedRepoIntent, type PublishedRepoIntentDisposition } from "../sync-state.js";
 import {
@@ -122,6 +123,10 @@ export interface FollowIntended {
 export interface FollowProgress {
   appliedRefs: GitPartialApply["appliedRefs"];
   heldRefs: GitPartialApply["heldRefs"];
+  /** Complete classification seam; orchestration appends protocol/composer blockers. */
+  blockers: TypedBlocker[];
+  /** Exact reflog files consulted while reaching this outcome. */
+  consultedReflogPaths?: string[];
   configApplied: boolean;
   incomingIndexProjection?: string;
   derivedBaseIndexProjection?: string;
@@ -133,7 +138,7 @@ export interface FollowProgress {
   tombstonePrunedThisCycle?: boolean;
 }
 
-type FollowResult =
+export type FollowResult =
   | ({ status: "followed" } & FollowProgress)
   | ({ status: "defer"; reason: GitDeferralReason; detail: string } & FollowProgress)
   | ({ status: "legacy"; reason: GitDeferralReason; detail: string } & FollowProgress);
@@ -238,6 +243,24 @@ interface CheckoutClassification {
   breadcrumbMismatches: BreadcrumbMismatch[];
   breadcrumbWaived: boolean;
   breadcrumbVetoGate?: BreadcrumbVetoGate;
+  blockers: TypedBlocker[];
+}
+
+function blockerForReason(
+  reason: GitDeferralReason,
+  provenance: "checkout" | "boundary",
+  detail?: string,
+): TypedBlocker {
+  return { provenance, reason, ...(detail ? { detail } : {}) };
+}
+
+function progressWithBlocker(
+  progress: FollowProgress,
+  reason: GitDeferralReason,
+  detail: string,
+  provenance: "checkout" | "boundary" = "checkout",
+): FollowProgress {
+  return { ...progress, blockers: [...progress.blockers, blockerForReason(reason, provenance, detail)] };
 }
 
 export async function checkoutJournalBinding(stream: string, stateNonce: string, ctx: RepoCtx): Promise<CheckoutJournalBinding> {
@@ -499,9 +522,11 @@ async function classifyCheckout(args: {
   }
   for (const reason of args.opts.manualResolution?.waivedReasons ?? []) reasons.delete(reason);
   const reason = firstReason(reasons);
+  const provenance = args.boundary ? "boundary" as const : "checkout" as const;
+  const blockers = [...reasons].map((item) => blockerForReason(item, provenance, details.join("; ")));
   return reason
-    ? { safe: false, reason, detail: details.join("; "), breadcrumbMismatches, breadcrumbWaived: false, ...(breadcrumbVetoGate ? { breadcrumbVetoGate } : {}) }
-    : { safe: true, breadcrumbMismatches, breadcrumbWaived, ...(breadcrumbVetoGate ? { breadcrumbVetoGate } : {}) };
+    ? { safe: false, reason, detail: details.join("; "), blockers, breadcrumbMismatches, breadcrumbWaived: false, ...(breadcrumbVetoGate ? { breadcrumbVetoGate } : {}) }
+    : { safe: true, blockers, breadcrumbMismatches, breadcrumbWaived, ...(breadcrumbVetoGate ? { breadcrumbVetoGate } : {}) };
 }
 
 async function ensureStashReflog(repoDir: string, oid: string): Promise<void> {
@@ -590,6 +615,8 @@ async function publishRefPlane(
   const owned = await branchesCheckedOutElsewhere(opts.ctx);
   const appliedRefs: GitPartialApply["appliedRefs"] = {};
   const heldRefs: GitPartialApply["heldRefs"] = {};
+  const blockers: TypedBlocker[] = [];
+  const consultedReflogPaths = new Set<string>();
   const branchWitnesses: Record<string, BranchTransitionWitness> = {};
   const branchLockedProofs: Record<string, LockedBranchProof> = {};
   const safeRefWitnesses: Record<string, SafeRefWitness> = {};
@@ -664,6 +691,11 @@ async function publishRefPlane(
         }
         if (proof.status === "indeterminate") {
           indeterminateRefs.add(ref);
+          blockers.push({
+            provenance: "indeterminate",
+            reason: proof.marker === "shallow-store" ? "unsupported" : "unreadable",
+            detail: `${ref} preservation proof ${proof.marker}`,
+          });
           hold = ref === "refs/stash" ? "local-stash" : "local-commits";
           checkoutRefReason ??= proof.marker === "shallow-store" ? "unsupported" : "unreadable";
           break;
@@ -719,7 +751,14 @@ async function publishRefPlane(
       const proof = await noDropProof(opts.ctx.repoDir, plannedRefs, heldDurable, {}, protectedOids);
       if (proof.status === "proven") continue;
       classifiedHolds.set(ref, ref === "refs/stash" ? "local-stash" : "local-commits");
-      if (proof.status === "indeterminate") checkoutRefReason ??= proof.marker === "shallow-store" ? "unsupported" : "unreadable";
+      if (proof.status === "indeterminate") {
+        checkoutRefReason ??= proof.marker === "shallow-store" ? "unsupported" : "unreadable";
+        blockers.push({
+          provenance: "indeterminate",
+          reason: proof.marker === "shallow-store" ? "unsupported" : "unreadable",
+          detail: `${ref} no-drop proof ${proof.marker}`,
+        });
+      }
       changed = true;
     }
     if (!changed) break;
@@ -830,6 +869,7 @@ async function publishRefPlane(
       let tombstoneFingerprint: string | undefined;
       let branchEpisode: string | undefined;
       if (oldOid && (!newOid || (await tipOwnedByIncoming(opts.ctx.repoDir, oldOid, [newOid])).status !== "owned")) {
+        consultedReflogPaths.add(`logs/${ref}`);
         const durableNow = { ...liveNow };
         delete durableNow[ref];
         branchEpisode = crypto.randomBytes(16).toString("hex");
@@ -909,6 +949,12 @@ async function publishRefPlane(
   }
 
   const configApplied = await opts.runConfig?.().catch(() => false) ?? true;
+  for (const [ref, held] of Object.entries(heldRefs)) blockers.push({
+    provenance: "ref-plane",
+    reason: held === "ownership" ? "worktree-ownership" : held,
+    ref,
+  });
+  if (checkoutRefReason) blockers.push(blockerForReason(checkoutRefReason, "checkout", checkoutRefDetail));
   const checkoutWitnessDisposition = {
     heldRefs: new Set(Object.keys(heldRefs)),
     forcedRefs,
@@ -917,6 +963,8 @@ async function publishRefPlane(
   return {
     appliedRefs,
     heldRefs,
+    blockers,
+    consultedReflogPaths: [...consultedReflogPaths].sort(),
     ...(Object.keys(branchWitnesses).length ? { branchWitnesses } : {}),
     ...(Object.keys(branchLockedProofs).length ? { branchLockedProofs } : {}),
     ...(Object.keys(safeRefWitnesses).length ? { safeRefWitnesses } : {}),
@@ -957,14 +1005,15 @@ function expectedHead(section: GitSection): string {
 
 export async function followDivergedRepo(opts: FollowOptions): Promise<FollowResult> {
   const valid = validateGitSection(opts.incoming);
-  const emptyProgress: FollowProgress = { appliedRefs: {}, heldRefs: {}, configApplied: true };
-  if (!valid.ok) return { status: "defer", reason: "unsupported", detail: `invalid git section: ${valid.reason}`, ...emptyProgress };
+  const emptyProgress: FollowProgress = { appliedRefs: {}, heldRefs: {}, blockers: [], configApplied: true };
+  if (!valid.ok) return { status: "defer", reason: "unsupported", detail: `invalid git section: ${valid.reason}`, ...emptyProgress, blockers: [blockerForReason("unsupported", "checkout", valid.reason)] };
 
   let staged: StagedIncoming;
   try {
     staged = await stageIncoming(opts);
   } catch (error) {
-    return { status: "defer", reason: "artifact", detail: `git artifact fetch/decrypt/import failed: ${String((error as Error)?.message ?? error)}`, ...emptyProgress };
+    const detail = `git artifact fetch/decrypt/import failed: ${String((error as Error)?.message ?? error)}`;
+    return { status: "defer", reason: "artifact", detail, ...emptyProgress, blockers: [blockerForReason("artifact", "checkout", detail)] };
   }
 
   try {
@@ -973,14 +1022,14 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
         const collision = await candidateIndexCollision(opts.workspaceRoot, opts.ctx.repoDir, staged.candidateIndex);
         if (collision) {
           opts.log?.(`git-sync WARNING ${opts.relPath}: incoming index has receiver-equivalent paths (${collision})`);
-          return { status: "defer", reason: "unreadable", detail: "incoming index has receiver path-equivalence collision", ...emptyProgress };
+          return { status: "defer", reason: "unreadable", detail: "incoming index has receiver path-equivalence collision", ...progressWithBlocker(emptyProgress, "unreadable", "incoming index has receiver path-equivalence collision") };
         }
       } catch {
-        return { status: "defer", reason: "unreadable", detail: "incoming index receiver-equivalence check failed", ...emptyProgress };
+        return { status: "defer", reason: "unreadable", detail: "incoming index receiver-equivalence check failed", ...progressWithBlocker(emptyProgress, "unreadable", "incoming index receiver-equivalence check failed") };
       }
     }
     const liveBefore = await readLive(opts.ctx);
-    if (!liveBefore) return { status: "defer", reason: "unreadable", detail: "git metadata could not be read", ...emptyProgress };
+    if (!liveBefore) return { status: "defer", reason: "unreadable", detail: "git metadata could not be read", ...progressWithBlocker(emptyProgress, "unreadable", "git metadata could not be read") };
     const baseProjection = opts.record?.idxProj ?? await deriveBaseIndexProjection(opts, staged.tmpDir).catch(() => undefined);
     const effective = effectiveRefs(opts.ctx, opts.incoming);
     const ownershipSection = { ...opts.incoming, refs: effective.refs };
@@ -994,6 +1043,11 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
     const progress: FollowProgress = {
       appliedRefs: refProgress.appliedRefs,
       heldRefs: refProgress.heldRefs,
+      blockers: refProgress.blockers,
+      consultedReflogPaths: [
+        ...(opts.ctx.kind === "dir" ? ["logs/refs/stash"] : []),
+        ...(refProgress.consultedReflogPaths ?? []),
+      ],
       ...(refProgress.branchWitnesses ? { branchWitnesses: refProgress.branchWitnesses } : {}),
       ...(refProgress.branchLockedProofs ? { branchLockedProofs: refProgress.branchLockedProofs } : {}),
       ...(refProgress.safeRefWitnesses ? { safeRefWitnesses: refProgress.safeRefWitnesses } : {}),
@@ -1010,11 +1064,11 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
     // R2-7 adjudication preserves design 43 [v2,M2] here: exact =0 keeps the
     // legacy conflict-checkpoint disposition; only capability unsupported is
     // converted to a typed retryable defer below.
-    if (!opts.followEnabled && !opts.manualResolution) return { status: "legacy", reason: "conflict", detail: "automatic checkout follow disabled", ...progress };
+    if (!opts.followEnabled && !opts.manualResolution) return { status: "legacy", reason: "conflict", detail: "automatic checkout follow disabled", ...progressWithBlocker(progress, "conflict", "automatic checkout follow disabled") };
     const capabilitySupported = opts.capabilityProbe
       ? await opts.capabilityProbe(await git(opts.ctx.repoDir, ["--version"]))
       : await checkoutTransactionSupported(opts.ctx.repoDir);
-    if (!capabilitySupported) return { status: "defer", reason: "unsupported", detail: "git lacks prepared transactional symref-update", ...progress };
+    if (!capabilitySupported) return { status: "defer", reason: "unsupported", detail: "git lacks prepared transactional symref-update", ...progressWithBlocker(progress, "unsupported", "git lacks prepared transactional symref-update") };
 
     // Scratch refs and held incoming values are not durable roots. Authorize
     // checkout only from incoming refs that are already published (plus the
@@ -1050,7 +1104,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
       checkoutRefDetail: refProgress.checkoutRefDetail,
       heldRefs: progress.heldRefs,
     });
-    if (!first.safe) return { status: "defer", reason: first.reason!, detail: first.detail ?? "checkout follow proof failed", ...progress };
+    if (!first.safe) return { status: "defer", reason: first.reason!, detail: first.detail ?? "checkout follow proof failed", ...progress, blockers: [...progress.blockers, ...first.blockers] };
 
     let origHeadPreservation: OrigHeadPreservation | undefined;
     if (first.breadcrumbWaived) {
@@ -1061,7 +1115,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
         origHeadPreservation = await preserveOrigHead(opts, origHeadMismatch);
       } catch (error) {
         opts.log?.(origHeadPreservationFailureLine(opts.relPath, error));
-        return { status: "defer", reason: "local-operation", detail: "operation state differs at ORIG_HEAD", ...progress };
+        return { status: "defer", reason: "local-operation", detail: "operation state differs at ORIG_HEAD", ...progressWithBlocker(progress, "local-operation", "operation state differs at ORIG_HEAD") };
       }
     }
 
@@ -1087,6 +1141,10 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
       const newOid = effective.refs[liveBefore.currentRef];
       let pinLines: string[] = [];
       if (oldOid && (!newOid || (await tipOwnedByIncoming(opts.ctx.repoDir, oldOid, [newOid])).status !== "owned")) {
+        progress.consultedReflogPaths = [...new Set([
+          ...(progress.consultedReflogPaths ?? []),
+          `logs/${liveBefore.currentRef}`,
+        ])].sort();
         const durableNow = { ...liveBefore.refs };
         delete durableNow[liveBefore.currentRef];
         const pins = await prepareDisplacementPins(
@@ -1097,13 +1155,13 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
           humanDisplacementOrigin(liveBefore.currentRef, opts.incoming),
         );
         if (pins.status === "indeterminate") {
-          return { status: "defer", reason: "unreadable", detail: `current-ref reflog reachability ${pins.marker}`, ...progress };
+          return { status: "defer", reason: "unreadable", detail: `current-ref reflog reachability ${pins.marker}`, ...progressWithBlocker(progress, "unreadable", `current-ref reflog reachability ${pins.marker}`) };
         }
         pinLines = pins.transactionLines;
         checkoutBranchReflogFingerprint = pins.reflogFingerprint;
       }
       if (oldOid && ((newOid && oldOid !== newOid) || (!newOid && effective.deleteAbsent))) {
-        if (!opts.branchProtocol) return { status: "defer", reason: "artifact", detail: "checked-out branch transition lacks lineage authority", ...progress };
+        if (!opts.branchProtocol) return { status: "defer", reason: "artifact", detail: "checked-out branch transition lacks lineage authority", ...progressWithBlocker(progress, "artifact", "checked-out branch transition lacks lineage authority") };
         checkoutBranchPlan = opts.manualResolution
           ? await planManualBranchTransition({
               repoDir: opts.ctx.repoDir, binding: opts.branchProtocol.binding, ref: liveBefore.currentRef,
@@ -1135,7 +1193,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
       : { kind: "detached" as const, newOid: opts.incoming.head.trim(), oldOid: liveBefore.currentTip! };
     if (incomingHeadRef && incomingHeadRef !== liveBefore.currentRef) {
       const targetOid = effective.refs[incomingHeadRef];
-      if (!targetOid) return { status: "defer", reason: "unsupported", detail: "incoming HEAD branch is filtered or absent", ...progress };
+      if (!targetOid) return { status: "defer", reason: "unsupported", detail: "incoming HEAD branch is filtered or absent", ...progressWithBlocker(progress, "unsupported", "incoming HEAD branch is filtered or absent") };
       reserveRef(incomingHeadRef, targetOid);
     }
 
@@ -1225,10 +1283,15 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
     });
     opts.crashAt?.("after-journal-write");
 
-    let boundaryFailure: Pick<CheckoutClassification, "safe" | "reason" | "detail"> | undefined;
+    let boundaryFailure: Pick<CheckoutClassification, "safe" | "reason" | "detail" | "blockers"> | undefined;
     const noteBoundaryFailure = (reason: GitDeferralReason, detail: string): void => {
       const chosen = firstReason(new Set([...(boundaryFailure?.reason ? [boundaryFailure.reason] : []), reason]));
-      if (!boundaryFailure || chosen === reason) boundaryFailure = { safe: false, reason, detail };
+      if (!boundaryFailure || chosen === reason) boundaryFailure = {
+        safe: false,
+        reason,
+        detail,
+        blockers: [blockerForReason(reason, "boundary", detail)],
+      };
     };
     const result = await commitCheckout(opts.ctx, {
       ...(staged.candidateIndex ? { candidateIndexPath: staged.candidateIndex } : { removeIndex: true }),
@@ -1409,6 +1472,10 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
         reason,
         detail: result.reason === ORIG_HEAD_CHANGED_AT_CHECKOUT_BOUNDARY ? "operation state differs at ORIG_HEAD" : boundaryFailure?.detail ?? result.reason,
         ...progress,
+        blockers: [
+          ...progress.blockers,
+          ...(boundaryFailure?.blockers ?? [blockerForReason(reason, "boundary", result.reason)]),
+        ],
       };
     }
     if (checkoutBranchPlan) {

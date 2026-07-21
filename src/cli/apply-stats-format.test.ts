@@ -26,6 +26,7 @@ const metricsWith = (repoTimings: GitApplyRepoTiming[], resultCounts: Partial<Re
   commonDirGroups: 0,
   results: results(resultCounts),
   repoTimings,
+  skippedHeld: resultCounts.skipped ?? 0,
 });
 
 function exemplarIndexes(detail: string): number[] {
@@ -49,6 +50,7 @@ test("apply and git metric formats are numeric and path-free", () => {
   const metrics: GitApplyMetrics = {
     runKind: "fresh", repos: 1, commonDirGroups: 0,
     results: { unchanged: 0, applied: 1, deferred: 0, conflict: 0, removed: 0, skipped: 0 },
+    skippedHeld: 0,
     repoTimings: [{ index: 0, queueMs: 5, wallMs: 1234, result: "applied", chain: {
       chainLength: 3, fetchDecryptMs: 820.2, bundleVerifyMs: 40.4, gitImportMs: 3200.1, indexOpStateMs: 30.2,
     } }],
@@ -57,6 +59,7 @@ test("apply and git metric formats are numeric and path-free", () => {
   expect(gitDetail).toContain("queueMs p50=5 p95=5 max=5 wallMs p50=1234 p95=1234 max=1234");
   expect(gitDetail).toContain("fetchDecryptMs p50=820 p95=820 max=820 bundleVerifyMs p50=40 p95=40 max=40 gitImportMs p50=3200 p95=3200 max=3200 indexOpStateMs p50=30 p95=30 max=30");
   expect(gitDetail).toContain("L3fd820bv40gi3200io30");
+  expect(gitDetail).toContain("skippedHeld=0");
   expect(gitDetail).not.toContain("private-repo");
   expect(gitDetail).not.toContain("/");
 });

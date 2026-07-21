@@ -85,6 +85,23 @@ describe("design 130 publisher chain and generation walk", () => {
     expect(result.findings).toContainEqual({ kind: "generation-overflow", count: 1 });
     expect(tombstoneFindingLine("repo", result.findings[0]!)).toContain("slow followers may hold");
   });
+
+  test("superseding normalization retains tombstones and high-water carried only by pending", () => {
+    const ref = "refs/heads/old";
+    const pending = section({ "refs/heads/main": oid(8) }, {
+      refTombstones: { [ref]: [entry(7, 41, at(1))] },
+      refTombstoneGeneration: 41,
+    });
+    const advertised = section({ "refs/heads/main": oid(8) }, {
+      refTombstones: {}, refTombstoneGeneration: 3,
+    });
+    const candidate = section({ "refs/heads/main": oid(9) }, {
+      refTombstones: {}, refTombstoneGeneration: 5,
+    });
+    const normalized = normalizePublishedGitSection(advertised, candidate, at(2), pending).section;
+    expect(normalized.refTombstones?.[ref]).toEqual([entry(7, 41, at(1))]);
+    expect(normalized.refTombstoneGeneration).toBe(42);
+  });
 });
 
 describe("design 130 all-to-all authoring and the final boundary", () => {
