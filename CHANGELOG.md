@@ -6,6 +6,28 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.7.19] — 2026-07-21 — "status tells you what's actually wrong"
+
+### Added
+- `rbox status` shows the running daemon's version next to the daemon line,
+  and warns plainly when it differs from the CLI: "daemon is running v1.7.18
+  but this CLI is v1.7.19 — restart to finish the upgrade". A binary swap
+  without a restart is no longer invisible.
+
+### Changed
+- Brief sync holds no longer cry wolf: transient deferrals younger than
+  10 minutes (peer echoes that resolve themselves on the next push) are
+  hidden from human status output. `--json` still reports everything.
+- The conflict-snapshots line appears only when snapshots are actually
+  prunable — a fully time-locked count you can't act on is noise.
+
+### Fixed
+- The Bun ref-watch release/CI probe no longer fails when a starved CI
+  runner can't generate watcher load: an unprovable test premise now retries
+  with escalating pressure and reports "inconclusive" instead of masquerading
+  as a real failure. Genuine watcher regressions under real load still fail
+  hard. (This one flake cost three pipeline legs in a single day.)
+
 ## [1.7.18] — 2026-07-21 — "keep-mine works even when history is gone"
 
 ### Fixed
