@@ -1,6 +1,6 @@
 # 174 — Apply-side performance: held-repo livelock, git-apply dark time, and pull/push tails
 
-Status: DRAFT v0 (evidence + problem statement complete; mechanism/contracts in progress)
+Status: DRAFT v1 — ready for adversarial review round 1
 Author: Claude (session 2026-07-21), field evidence from the live fleet
 Relates: 172 (event-driven capture), 175 (ref side-channel), 130 (follow/ownership model),
 173 (reserved: two-writer spurious divergence — this doc's item B is the ONE-writer sibling)
@@ -135,9 +135,12 @@ the initial "local-stash" hold via the same ownership proof.
   extend `GitChainTimings` (shared.ts:17-27) + the `git-apply` log token so a
   regression here is never invisible again. Cheap, ships with A.
 - **D. rbox-conflict ref retention** — 810 conflict refs inflate every ref
-  transaction, fingerprint, and capture forever. Define a retention/pruning
-  policy (age? superseded-by-resolution? cap?) — founder input wanted on
-  retention semantics before mechanism.
+  transaction, fingerprint, and capture forever. Policy (founder-ratified
+  2026-07-21): **prune-on-supersession** — a conflict ref whose commit is
+  reachable from a current branch is deleted (the work made it back in);
+  everything else falls under a generous **age floor (90 days)**; the live
+  snapshot count is surfaced in `rbox status` so retention is never silent.
+  No prune ever runs on refs younger than the floor unless superseded.
 - **E. Notify-pull scan-skip** — when the pull was event-triggered and the
   file plane reports no candidate changes, skip/downgrade the full scanManifest.
 - **F. Push-tail** — `missing` probe and `commit` cost on no-change pushes;
@@ -148,24 +151,232 @@ beyond the supersession distinction; two-writer divergence (173); any change to
 conflict-ref CREATION; APFS-specific filesystem tuning (the generic-APFS theory
 is dead — savvy-core's cost is ref-surface × follow-work, not the filesystem).
 
-## 3. Open questions (for review rounds)
+## 3. Open questions — resolutions pinned in §4 (review anchors)
 
-1. Exact idempotence key for A: incoming section key + local HEAD/refs
-   fingerprint + index/opState projection? Must be strictly cheaper than the
-   work it skips and NEVER skip a follow that could make progress (e.g. local
-   state changed in a way that unblocks the hold).
-2. B's supersession proof: is "every pending root owned by local tips"
-   sufficient on all lanes (branches, tags, stash, opState commit candidates)?
-   What about pending sections carrying config/index artifacts newer than local?
-3. Does B subsume the 22:19 stash-lane hold, or does the rbox-created-stash
-   case ("receiver-only" stash oid that rbox itself minted locally) need its
-   own ownership annotation?
-4. D retention semantics — founder call.
-5. Where does the safety floor sit for A if the fingerprint lies (defense in
-   depth: periodic full follow anyway? every Nth pull?).
+1. A's idempotence key → §4.1: `gitIncomingKey` + reused `gitFingerprint`,
+   with the git-state-only reason allowlist doing the "could this follow make
+   progress" gating. Reviewers: attack the allowlist's coverage claim.
+2. B's supersession proof → §4.2: per-lane, same-name fast-forward
+   subsumption only; index/config differences BLOCK supersession (v1
+   conservative). Reviewers: hunt lanes where "refs subsumed" still loses
+   information.
+3. The rbox-created-stash hold → subsumed by B iff the stash oid is locally
+   reachable (§4.2 stash lane); no special-case annotation. Reviewers: check
+   the 07-16 quarantine-stash shape against that rule.
+4. ~~D retention semantics~~ RESOLVED (founder, 2026-07-21): supersession +
+   90-day age floor + status surfacing (see §2 D).
+5. A's fingerprint-lie defense → §4.1 safety floor: 1h forced re-follow +
+   loud divergence WARNING (canary, not silent self-heal).
 
-## 4. Mechanism (TODO — next draft)
+## 4. Mechanism
 
-To be written after a full read of the design-130 follow/base-composer model:
-exact state machine for pending supersession, the idempotence fingerprint
-contract, telemetry token schema, and the MUST-test list.
+Design-130 constraints this section obeys (non-negotiable): a PENDING section
+carries byte-for-byte and is exempt from normalization while it exists
+(changing it would orphan `gitIncomingKey`-bound partial progress and deferral
+episodes); persisted `RepoRecord.base` moves ONLY through
+`composeRepoBase(...)`'s closed authority union; branch mutations route
+through the typed transition planner. Nothing below touches BASE composition
+or adds an authority arm: **A skips work; B clears sidecar state and lets the
+EXISTING capture→commit→fold path re-establish truth.**
+
+### 4.1 A — Held-repo idempotence short-circuit (apply side)
+
+New per-repo sidecar (in `RepoRecord`, alongside the existing partial/pending
+bookkeeping; never wire-visible):
+
+```ts
+attempt?: {
+  incomingKey: string;          // gitIncomingKey of the section this attempt saw
+  localFingerprint: string;     // gitFingerprint of local git state at attempt time
+  reasons: GitDeferralReason[]; // hold reasons produced by that attempt
+  at: string;                   // ISO timestamp of the attempt
+}
+```
+
+- `localFingerprint` REUSES the existing capture-side `gitFingerprint`
+  machinery (`src/cli/sync-git/fingerprint.ts`, incl. its racy-clean margin
+  and `GIT_FINGERPRINT_VERSION` coupling) — no new fingerprint scheme. The
+  divergence cache already proves this primitive sound for skip decisions on
+  the push side.
+- **Skip rule.** On apply, for a repo with `pending[rel]` present, the full
+  follow is SKIPPED iff ALL of:
+  1. incoming section's `gitIncomingKey` equals `attempt.incomingKey`;
+  2. current `gitFingerprint` (trusted, non-racy) equals
+     `attempt.localFingerprint`;
+  3. every recorded reason is in the **git-state-only** set
+     `{"local-commits", "local-stash"}` — reasons whose classification inputs
+     (ownership proofs over refs/reflogs) are fully covered by the git
+     fingerprint. Any other reason (`local-edits`, `local-index`,
+     `local-operation`, `unreadable`, …) depends on inputs the fingerprint
+     does not cover → always re-follow.
+  4. the safety floor has not elapsed (below).
+- A skip preserves everything: deferral episode, pending, partial, BASE,
+  status banner. It emits no `git-sync followed` line; it bumps a counter
+  surfaced in the pull summary (`git-apply … skippedHeld=N`).
+- **Invalidation** is automatic: any local commit, ref move, stash change,
+  or incoming-section change alters one of the two keys → full follow. A
+  successful follow or any terminal transition clears `attempt`.
+- **Safety floor:** a skipped repo is force-re-followed when
+  `now - attempt.at > 1h` (constant, not configurable). If the forced
+  re-follow produces a DIFFERENT outcome with both keys unchanged, that is a
+  fingerprint-coverage bug: log loudly
+  (`git-sync WARNING <rel>: held-skip fingerprint miss`) — this is the
+  canary, not a silent self-heal.
+- The attempt record is lineage-scoped like all 130 sidecar state: a state
+  nonce change, repo identity change, or `GIT_FINGERPRINT_VERSION` bump
+  discards it (fail open to full follow).
+
+Effect: steady-state deferral cost drops from O(full follow) (~30s on
+savvy-core) to one fingerprint computation (~ms), for EVERY deferral reason
+in the git-state-only set, independent of B.
+
+### 4.2 B — Pending supersession (push side: probe before carry)
+
+Definition. A pending section `P` for repo `rel` is **superseded by local**
+iff every piece of information it carries is already reflected in the local
+repository, per-lane:
+
+- for every `R ∈ P.refs` with `R.startsWith("refs/heads/")`: the LOCAL live
+  ref `R` exists and `P.refs[R]` is equal to or an ancestor of local `R`
+  (`git merge-base --is-ancestor`, the same primitive as
+  `tipOwnedByIncoming` — errors/shallow/missing-object → NOT superseded);
+- for every tag in `P.refs`: local tag exists at the SAME oid (tags don't
+  fast-forward; any mismatch → not superseded);
+- `refs/stash` in `P`: the stash oid is reachable from local stash reflog
+  oids or local branch tips (its content is present locally);
+- every opState commit candidate in `P`: owned by local tips;
+- `P.head`, index artifact, config: compared for information content —
+  v1 rule: symbolic `P.head` names a branch that exists locally; a pending
+  index artifact or config DIFFERENT from local's current projection blocks
+  supersession (conservative: only refs-plane staleness is provable cheaply).
+
+Same-name fast-forward subsumption is deliberately per-ref: a pending branch
+`X` that the local repo lacks (or holds non-fast-forward) keeps the pending
+section and the hold — that is exactly the "receiver-only work at risk" case
+the hold exists for. No ancestry-through-another-ref laundering.
+
+Where it runs: `planGitSections`, at the current pending-carry decision
+(plan.ts:622-633). For each pending repo, BEFORE carrying:
+
+1. Fingerprint-gate the probe with the same `attempt` sidecar (don't re-probe
+   unchanged state every push).
+2. If NOT superseded → carry pending verbatim (today's behavior, unchanged).
+3. If superseded → **clear the pending state and capture fresh**:
+   - delete `gitPendingRemote[rel]`, `partial[rel]`, the apply deferral
+     record, and the `attempt` sidecar;
+   - quarantine-then-clear any standing follow journal for `rel` exactly the
+     way absence-supersession does today (a stale journal must not be
+     resurrectable by later recovery);
+   - BASE is NOT touched (it stays the pre-pending value; the composer's
+     post-commit fold advances it wholesale when the fresh capture commits —
+     the existing terminal path);
+   - the repo enters the normal capture pool this same push
+     (`git-sync superseded pending for <rel>: local history subsumes the
+     unapplied remote section` — one bounded log line).
+
+Livelock resolution trace (savvy-core): push probe proves pending.main ⊑
+local main → pending cleared → fresh capture publishes current refs → remote
+section now contains local tip → next pull: incoming roots own local tip →
+no hold → deferral clears → `unchanged` thereafter. One push + one pull,
+no manual intervention, no data destroyed (every oid in the old pending was
+provably already in local history).
+
+Non-interaction with 130's tombstone plane: supersession authors no
+tombstones and deletes no refs — capture advertises exactly what exists
+locally, and `RepoRecord.advertised` continues to gate deletion authoring
+as today. Multi-writer safety: if another writer HAS advanced the remote
+section beyond `P` meanwhile, our commit's parent-sequence guard (409) makes
+the push lose, the next pull delivers the NEWER section as pending, and the
+probe re-evaluates against that — supersession never overwrites unseen
+remote truth.
+
+### 4.3 C — Follow instrumentation (ships with A)
+
+Extend `GitChainTimings` (`src/engine/git/shared.ts:17-27`) with:
+`refTxnMs` (checkout-txn prepare+commit), `ownershipMs` (all
+`tipOwnedByIncoming`/`partitionOwnedByIncoming` calls), `reflogMs` (stash +
+preservation enumeration), `fsckMs` (apply.ts:712), `classifyMs`
+(classifyCheckout total). Emit in the existing per-repo `repoMs` token
+(`L4fd…bv…gi…` gains `rt…ow…rl…fk…cl…`) and the p50/p95 aggregates. Budget:
+timer plumbing only, no behavior. Acceptance for the dark-time question is
+that the savvy-core repro's 30s becomes fully attributed (sum of sub-timers
+≥ 90% of repo wall).
+
+### 4.4 D — Conflict-ref retention (policy ratified §2)
+
+At the end of a successful capture (push side, repo already quiet), a bounded
+retention pass over `refs/rbox-conflict/*`:
+
+- prune when the snapshot commit is reachable from any current local branch
+  tip (supersession — work made it back in);
+- else prune when older than 90 days (namespace timestamp segment);
+- else keep. Cap the pass (e.g. 64 deletions per push) so one push never
+  stalls on a 810-ref backlog; the backlog drains across pushes.
+- `rbox status` gains `conflict snapshots: N (M prunable)` when N > 0.
+- Deletions use plain `update-ref -d` batches — conflict refs are
+  non-syncable scratch (already allowlisted for raw update-ref in 130's
+  structural tests) and never appear in BASE/capture.
+
+### 4.5 E — Notify-pull scan-skip
+
+When `doPull` runs with a watcher in healthy event mode and the file plane
+reports no dirty candidates since the last completed scan (the same
+authority 172/175 established: watcher generation current + no pending
+debounce + no safety-floor breach), `pull()` reuses `lastSyncedManifest`'s
+scan output instead of re-walking (pull.ts:131-142 gains the same
+`mode=steady` reuse the git plane already has). The safety scan cadence and
+deep-scan carriers are UNTOUCHED — this only removes the per-notify-pull
+full walk. Fleet effect: Mac −7.5s, flat-meadow −4.6s per pull. A reused
+scan is marked in the summary (`scan 0.0s reuse=watcher`) so forensics can
+always tell.
+
+### 4.6 F — Push tail: instrumentation only in 174
+
+`missing` (server existence probe) and `commit` get sub-timing detail
+(chunk count, per-chunk p95, payload bytes) in the push summary. Any
+optimization (e.g. manifest-diff-scoped missing-set) is a separate design
+seeded by that data. Explicit non-goal here.
+
+## 5. Tests the implementation MUST write
+
+1. **Livelock end-to-end regression** (the savvy-core shape): writer repo
+   with pending section older than local main (local ahead ≥1 commit) +
+   rbox-created stash whose parent is off a side branch → assert: push
+   probe clears pending, capture publishes, follower converges, deferral
+   clears, NO ref/stash content lost (every old pending oid still reachable).
+2. **A-skip correctness**: held repo (local-commits), unchanged keys →
+   second pull performs zero git subprocesses for that repo (spawn-count
+   probe); any local commit/ref-move/stash mutation → full follow resumes.
+3. **A never skips non-git-state reasons**: local-edits / local-index /
+   local-operation holds re-follow every pull even with unchanged keys.
+4. **A safety floor**: elapsed floor forces re-follow; divergent outcome
+   with unchanged keys emits the fingerprint-miss WARNING.
+5. **B refuses partial subsumption**: pending contains branch X absent
+   locally (or non-ff) → carry + hold persist exactly as today; pending
+   with equal-oid refs everywhere → superseded.
+6. **B multi-writer race**: concurrent remote advance (parent-sequence 409)
+   → superseded-clear does not clobber; next pull re-establishes newer
+   pending; probe re-evaluates.
+7. **B journal hygiene**: standing follow journal for the superseded repo is
+   quarantined, not recoverable into a resurrection of the cleared pending.
+8. **D reachability prune**: conflict ref reachable from a branch tip →
+   pruned; unreachable + young → kept; unreachable + >90d → pruned; cap
+   respected across pushes; status line counts match.
+9. **E manifests equality**: notify-pull with healthy watcher and no dirty
+   paths produces byte-identical manifest to a full walk (differential test
+   under concurrent file mutation → reuse DISABLED when dirty).
+10. **C attribution**: instrumented follow on a many-ref fixture attributes
+    ≥90% of wall to named sub-timers.
+11. **Structural**: `attempt` sidecar discarded on stateNonce / identity /
+    fingerprint-version change; skip path emits no BASE writes (composer
+    call-count zero for skipped repos).
+
+## 6. Rollout
+
+Default ON (founder default-on rule; kill switches per surface):
+`RBOX_GIT_HELD_SKIP=0` (A), `RBOX_GIT_PENDING_SUPERSEDE=0` (B),
+`RBOX_PULL_SCAN_REUSE=0` (E). C/D have no switches (instrumentation +
+bounded hygiene). Validation on the LIVE repro: upgrade the Mac dev build
+while savvy-core is still wedged; watch it self-heal (§4.2 trace) — the
+strongest possible field test, already provisioned by leaving the wedge in
+place. Then the rig scenario (test 1) guards it forever.
