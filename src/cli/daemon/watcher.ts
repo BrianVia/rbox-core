@@ -5,9 +5,19 @@ import path from "node:path";
 // dlopens nothing, so it's safe at module load on every platform. The NATIVE binding
 // is loaded lazily, per-host, in loadParcelWrapper() below. Types: parcel-watcher.d.ts.
 import { createWrapper } from "@parcel/watcher/wrapper";
-import { nativePruneGlobs, type IgnoreMatcher, type WatchEvent, type WatchEventKind } from "../../engine/index.js";
+import {
+  discoverGitRepos,
+  isGitRefSignal,
+  nativePruneGlobs,
+  type IgnoreMatcher,
+  type WatchEvent,
+  type WatchEventKind,
+} from "../../engine/index.js";
 
 export interface Watcher {
+  /** True only when Parcel found an in-tree directory-backed repo whose refs are
+   *  inside this watch. Chokidar intentionally remains safety-scan-only for Git. */
+  readonly gitRefWatchActive?: boolean;
   close(): Promise<void>;
 }
 
@@ -28,6 +38,8 @@ export interface WatchOptions {
   onError?: (err: Error) => void;
   /** Fires after matcher filtering and before debounce coalescing. */
   onRawEvent?: (event: WatchEvent) => void;
+  /** Ref-surface activity is a push signal only; it never enters the file batch. */
+  onGitSignal?: () => void;
 }
 
 const EVENT_KIND: Record<string, WatchEventKind | undefined> = {
@@ -83,6 +95,11 @@ export interface Batcher {
   dispose(): void;
 }
 
+export interface SignalDebouncer {
+  push(): void;
+  dispose(): void;
+}
+
 /**
  * last-kind-wins per path; the engine re-derives true state from disk on flush.
  * Flush immediately once a sustained burst runs past `maxWaitMs`; otherwise wait
@@ -116,6 +133,34 @@ export function createBatcher(onSettle: (events: WatchEvent[]) => void, debounce
     dispose() {
       if (timer) clearTimeout(timer);
       timer = undefined;
+    },
+  };
+}
+
+/** Independent debounce for watch-only signals that must never enter file batches. */
+export function createSignalDebouncer(onSignal: (() => void) | undefined, debounceMs: number, maxWaitMs: number): SignalDebouncer {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let firstSignalAt = 0;
+
+  const flush = () => {
+    if (timer) clearTimeout(timer);
+    timer = undefined;
+    firstSignalAt = 0;
+    onSignal?.();
+  };
+
+  return {
+    push() {
+      const now = Date.now();
+      if (firstSignalAt === 0) firstSignalAt = now;
+      if (timer) clearTimeout(timer);
+      if (now - firstSignalAt >= maxWaitMs) flush();
+      else timer = setTimeout(flush, debounceMs);
+    },
+    dispose() {
+      if (timer) clearTimeout(timer);
+      timer = undefined;
+      firstSignalAt = 0;
     },
   };
 }
@@ -211,6 +256,7 @@ async function startParcel(
   const maxWaitMs = opts.maxWaitMs ?? 3000;
   const wrapper = loadParcelWrapper();
   const batcher = createBatcher(onSettle, debounceMs, maxWaitMs);
+  const signalDebouncer = createSignalDebouncer(opts.onGitSignal, debounceMs, maxWaitMs);
   // @parcel/watcher reports event paths as REAL paths (symlinks resolved). If the
   // watched root has a symlinked component (e.g. macOS `/tmp` → `/private/tmp`),
   // relativizing against the un-resolved root yields `../…` and silently drops
@@ -218,6 +264,7 @@ async function startParcel(
   // thus the daemon's manifest keys — is unchanged by realpath.
   const realRoot = safeRealpath(root);
   const toRel = toRelFor(realRoot);
+  const gitRefWatchActive = (await discoverGitRepos(realRoot, matcher)).some((repo) => repo.kind === "dir");
 
   const sub = await wrapper.subscribe(
     realRoot,
@@ -234,10 +281,19 @@ async function startParcel(
         const rel = toRel(ev.path);
         if (rel === "" || escapesRoot(rel)) continue;
 
+        // This classification is deliberately before BOTH Parcel's delete fork
+        // and the authoritative sync matcher. A ref signal is routed through its
+        // own seam and can therefore never become a file WatchEvent.
+        if (isGitRefSignal(rel)) {
+          signalDebouncer.push();
+          continue;
+        }
+
         if (ev.type === "delete") {
           // Parcel doesn't say file-vs-dir on delete (the path is gone). `unlinkDir`
           // removes the exact path AND any `path/**` children (see applyWatchEvents),
           // so it correctly covers both a deleted file and a deleted directory.
+          if (matcher.ignores(rel) || (matcher.prunes?.(`${rel}/`) ?? matcher.ignores(`${rel}/`))) continue;
           pushWatchEvent(batcher, opts, rel, "unlinkDir");
           continue;
         }
@@ -261,8 +317,10 @@ async function startParcel(
   );
 
   return {
+    gitRefWatchActive,
     async close() {
       batcher.dispose();
+      signalDebouncer.dispose();
       await sub.unsubscribe();
     },
   };
@@ -279,6 +337,7 @@ function startChokidar(
   const debounceMs = opts.debounceMs ?? 400;
   const maxWaitMs = opts.maxWaitMs ?? 3000;
   const batcher = createBatcher(onSettle, debounceMs, maxWaitMs);
+  const signalDebouncer = createSignalDebouncer(opts.onGitSignal, debounceMs, maxWaitMs);
   const toRel = toRelFor(root);
 
   const watcher = chokidar.watch(root, {
@@ -288,6 +347,9 @@ function startChokidar(
     ignored: (p: string, stats?: { isDirectory(): boolean }) => {
       const rel = toRel(p);
       if (rel === "" || escapesRoot(rel)) return false; // the root itself
+      // The classifier stays ahead of the shared matcher, but `.git/` itself is
+      // still pruned below, so Chokidar remains intentionally scan-bound for Git.
+      if (isGitRefSignal(rel)) return true;
       return stats?.isDirectory() ? (matcher.prunes?.(`${rel}/`) ?? matcher.ignores(`${rel}/`)) : matcher.ignores(rel);
     },
   });
@@ -304,6 +366,7 @@ function startChokidar(
   return {
     async close() {
       batcher.dispose();
+      signalDebouncer.dispose();
       await watcher.close();
     },
   };

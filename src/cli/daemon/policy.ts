@@ -105,7 +105,8 @@ export function reconnectDelayMs(attempt: number, random: () => number = Math.ra
  * scan is the sync mechanism there), → back to the 60s floor. Pure — the
  * doubling/cap/reset table is unit-tested without timers.
  */
-export function nextSafetyDelay(current: number, opts: { watcherLive: boolean; churned: boolean; degradedBackoffEligible?: boolean }): number {
+export function nextSafetyDelay(current: number, opts: { watcherLive: boolean; churned: boolean; degradedBackoffEligible?: boolean; pinToFloor?: boolean }): number {
+  if (opts.pinToFloor) return SAFETY_SYNC_MS;
   if (opts.churned) return SAFETY_SYNC_MS;
   if (!opts.watcherLive && !opts.degradedBackoffEligible) return SAFETY_SYNC_MS;
   return Math.min(current * 2, SAFETY_SYNC_MAX_MS);

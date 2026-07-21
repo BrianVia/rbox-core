@@ -338,6 +338,9 @@ export class RboxDaemon {
   private syncStateHeartbeatTimer?: ReturnType<typeof setInterval>;
   /** Current safety-scan delay (60s floor, backs off to 5m while idle — design 49). */
   private safetyDelay = SAFETY_SYNC_MS;
+  /** Linux Parcel can silently lose inotify events. While it is watching an
+   *  in-tree Git ref surface, never let the independent safety scan exceed 60s. */
+  private gitSafetyFloorPinned = false;
   /** Watcher events seen since the last safety tick — churn pins the scan to its floor. */
   private churnSinceSafety = false;
   /** Flips false on ANY post-init backend error and stays false: a watcher that has
@@ -567,6 +570,11 @@ export class RboxDaemon {
               else audit.overflow = true;
             }
           },
+          onGitSignal: () => {
+            if (this.resetLifecycle !== "ready") return;
+            this.noteChurn();
+            this.request("push");
+          },
           onError: (err) => {
             if (!retrustEnabled()) {
               // Design-104 flag OFF (default): today's body, verbatim — one backend
@@ -621,6 +629,8 @@ export class RboxDaemon {
           },
         }
       );
+      this.gitSafetyFloorPinned = process.platform === "linux" && this.watcher.gitRefWatchActive === true;
+      if (this.gitSafetyFloorPinned) this.pinSafetyFloor();
       this.watcherSessionId = crypto.randomBytes(16).toString("hex");
     } catch (e) {
       this.log(`live watch unavailable: ${e instanceof Error ? e.message : String(e)} — degrading to periodic scan every ${Math.round(SAFETY_SYNC_MS / 1000)}s`);
@@ -683,6 +693,7 @@ export class RboxDaemon {
       watcherLive: this.watcher !== undefined && this.watcherHealthy,
       churned: this.churnSinceSafety,
       degradedBackoffEligible,
+      pinToFloor: this.gitSafetyFloorPinned,
     });
   }
 

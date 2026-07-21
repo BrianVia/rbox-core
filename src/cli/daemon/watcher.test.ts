@@ -1,9 +1,11 @@
 import { afterEach, expect, test } from "bun:test";
+import { execFile } from "node:child_process";
 import fs from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
-import { buildIgnoreMatcher, type WatchEvent } from "../../engine/index.js";
+import { promisify } from "node:util";
+import { buildIgnoreMatcher, captureGitState, type BlobStore, type WatchEvent } from "../../engine/index.js";
 import { createBatcher, startWatcher, type Watcher } from "./watcher.js";
 
 // These exercise the DEFAULT (@parcel/watcher) backend end-to-end on a real temp
@@ -17,6 +19,17 @@ import { createBatcher, startWatcher, type Watcher } from "./watcher.js";
 // on Linux CI (inotify) and dev machines the probe succeeds and the suite runs.
 
 const DEBOUNCE = 40;
+const exec = promisify(execFile);
+const TEST_GIT_ENV = {
+  ...process.env,
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_CONFIG_NOSYSTEM: "1",
+  GIT_AUTHOR_NAME: "rbox test",
+  GIT_AUTHOR_EMAIL: "rbox-test@local",
+  GIT_COMMITTER_NAME: "rbox test",
+  GIT_COMMITTER_EMAIL: "rbox-test@local",
+};
+const git = (dir: string, ...args: string[]) => exec("git", ["-C", dir, ...args], { env: TEST_GIT_ENV });
 let active: Watcher | undefined;
 let roots: string[] = [];
 
@@ -72,15 +85,21 @@ function tmpRoot(): string {
 async function watch(root: string, extraIgnore = "") {
   if (extraIgnore) fs.writeFileSync(path.join(root, ".rboxignore"), extraIgnore);
   const settled: WatchEvent[] = [];
+  const raw: WatchEvent[] = [];
+  const gitSignals: number[] = [];
   const matcher = buildIgnoreMatcher(root);
   const t0 = Date.now();
-  active = await startWatcher(root, matcher, (evs) => settled.push(...evs), { debounceMs: DEBOUNCE });
+  active = await startWatcher(root, matcher, (evs) => settled.push(...evs), {
+    debounceMs: DEBOUNCE,
+    onRawEvent: (event) => raw.push(event),
+    onGitSignal: () => gitSignals.push(Date.now()),
+  });
   const readyMs = Date.now() - t0;
   // Let the OS watch's initial snapshot settle before the test mutates, so a
   // mutation isn't raced against baseline establishment (would surface a spurious
   // create instead of the update). Realistic: nothing edits files µs after boot.
   await new Promise((r) => setTimeout(r, 200));
-  return { settled, readyMs };
+  return { settled, raw, gitSignals, readyMs, gitRefWatchActive: active.gitRefWatchActive === true };
 }
 
 /** Poll until `pred()` or timeout; returns whether it became true. Generous default so a
@@ -220,6 +239,147 @@ test("batcher maxWait cap flushes a sustained burst even without a quiet gap", a
   // The cap forced a flush that included the earlier events (not stuck behind the long debounce).
   expect(batches.length).toBeGreaterThanOrEqual(1);
   expect(batches.flat().some((e) => e.relPath === "x.ts")).toBe(true);
+});
+
+wtest("design 172: git commit reaches the isolated signal debounce well before the 60s safety tick", async () => {
+  const root = tmpRoot();
+  await git(root, "init", "-qb", "main");
+  fs.writeFileSync(path.join(root, "tracked.txt"), "one");
+  await git(root, "add", "tracked.txt");
+  await git(root, "commit", "-qm", "initial");
+  const { settled, raw, gitSignals, gitRefWatchActive } = await watch(root);
+  expect(gitRefWatchActive).toBe(true);
+
+  const committedAt = Date.now();
+  await git(root, "commit", "--allow-empty", "-qm", "event-driven");
+  expect(await waitFor(() => gitSignals.length > 0, 10_000)).toBe(true);
+  expect(gitSignals[0]! - committedAt).toBeLessThan(10_000);
+  expect(gitSignals[0]! - committedAt).toBeLessThan(60_000);
+  expect(settled).toEqual([]);
+  expect(raw).toEqual([]);
+});
+
+wtest("design 172: signal-only ref activity never enters raw/file settle accounting", async () => {
+  const root = tmpRoot();
+  fs.mkdirSync(path.join(root, ".git", "refs", "heads"), { recursive: true });
+  fs.writeFileSync(path.join(root, ".git", "HEAD"), "ref: refs/heads/main\n");
+  const { settled, raw, gitSignals } = await watch(root);
+  fs.writeFileSync(path.join(root, ".git", "refs", "heads", "main"), "a".repeat(40));
+  expect(await waitFor(() => gitSignals.length === 1)).toBe(true);
+  await new Promise((resolve) => setTimeout(resolve, DEBOUNCE * 3));
+  expect(settled).toEqual([]);
+  expect(raw).toEqual([]);
+});
+
+wtest("design 172: capture scratch-pin creation/deletion produces no signal or file event", async () => {
+  const root = tmpRoot();
+  await git(root, "init", "-qb", "main");
+  fs.writeFileSync(path.join(root, "tracked.txt"), "one");
+  await git(root, "add", "tracked.txt");
+  await git(root, "commit", "-qm", "initial");
+  const { settled, raw, gitSignals } = await watch(root);
+  const blobs = new Map<string, Buffer>();
+  const store: BlobStore = {
+    has: async (sha) => blobs.has(sha),
+    put: async (sha, bytes) => void blobs.set(sha, Buffer.from(bytes)),
+    get: async (sha) => blobs.get(sha) ?? Promise.reject(new Error(`missing ${sha}`)),
+    putFile: async (sha, src) => void blobs.set(sha, fs.readFileSync(src)),
+  };
+  expect(await captureGitState(root, store, Buffer.alloc(32, 7))).toBeDefined();
+  await new Promise((resolve) => setTimeout(resolve, DEBOUNCE * 5));
+  expect(gitSignals).toEqual([]);
+  expect(settled).toEqual([]);
+  expect(raw).toEqual([]);
+});
+
+wtest("design 172: a real reftable commit stays scan-bound with no git signal", async () => {
+  const root = tmpRoot();
+  await git(root, "init", "--ref-format=reftable", "-qb", "main");
+  await git(root, "commit", "--allow-empty", "-qm", "initial");
+  const { settled, raw, gitSignals } = await watch(root);
+  await git(root, "commit", "--allow-empty", "-qm", "reftable event remains scan-bound");
+  await new Promise((resolve) => setTimeout(resolve, DEBOUNCE * 5));
+  expect(gitSignals).toEqual([]);
+  expect(settled).toEqual([]);
+  expect(raw).toEqual([]);
+});
+
+wtest("design 172: linked-worktree and submodule commits plus branch-named logs/objects refs are detected", async () => {
+  const root = tmpRoot();
+  const source = tmpRoot();
+  await git(source, "init", "-qb", "main");
+  await git(source, "commit", "--allow-empty", "-qm", "submodule initial");
+  await git(root, "init", "-qb", "main");
+  await git(root, "-c", "protocol.file.allow=always", "submodule", "add", "-q", source, "sub");
+  await git(root, "commit", "-qam", "root initial");
+  const wt = path.join(root, "wt");
+  await git(root, "worktree", "add", "-q", "-b", "wtbranch", wt);
+  await git(wt, "checkout", "-q", "--detach");
+
+  const { settled, raw, gitSignals } = await watch(root);
+  const operations: Array<() => Promise<unknown>> = [
+    () => git(wt, "commit", "--allow-empty", "-qm", "worktree detached commit"),
+    () => git(path.join(root, "sub"), "commit", "--allow-empty", "-qm", "submodule detached commit"),
+    () => git(path.join(root, "sub"), "branch", "logs"),
+    () => git(path.join(root, "sub"), "branch", "objects"),
+  ];
+  for (const operation of operations) {
+    await operation();
+    expect(await waitFor(() => gitSignals.length > 0)).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, DEBOUNCE * 2));
+    gitSignals.length = 0;
+  }
+  expect(settled).toEqual([]);
+  expect(raw).toEqual([]);
+});
+
+wtest("design 172: lock churn coalesces with the real ref update and never fires independently", async () => {
+  const root = tmpRoot();
+  fs.mkdirSync(path.join(root, ".git", "refs", "heads"), { recursive: true });
+  const { settled, raw, gitSignals } = await watch(root);
+  const ref = path.join(root, ".git", "refs", "heads", "main");
+  const lock = `${ref}.lock`;
+  fs.writeFileSync(lock, "a".repeat(40));
+  fs.rmSync(lock);
+  await new Promise((resolve) => setTimeout(resolve, DEBOUNCE * 4));
+  expect(gitSignals).toEqual([]);
+  expect(settled).toEqual([]);
+  expect(raw).toEqual([]);
+
+  fs.writeFileSync(ref, "a".repeat(40));
+  expect(await waitFor(() => gitSignals.length === 1)).toBe(true);
+  await new Promise((resolve) => setTimeout(resolve, DEBOUNCE * 4));
+  expect(gitSignals).toHaveLength(1);
+  expect(settled).toEqual([]);
+  expect(raw).toEqual([]);
+});
+
+wtest("design 172: ref deletion takes Parcel's delete path; non-ref delete is filtered", async () => {
+  const root = tmpRoot();
+  fs.mkdirSync(path.join(root, ".git", "refs", "heads"), { recursive: true });
+  const branch = path.join(root, ".git", "refs", "heads", "topic");
+  const nonRef = path.join(root, ".git", "index.lock");
+  fs.writeFileSync(branch, "a".repeat(40));
+  fs.writeFileSync(nonRef, "lock");
+  const { settled, raw, gitSignals } = await watch(root);
+  fs.rmSync(branch);
+  expect(await waitFor(() => gitSignals.length === 1)).toBe(true);
+  fs.rmSync(nonRef);
+  await new Promise((resolve) => setTimeout(resolve, DEBOUNCE * 4));
+  expect(gitSignals).toHaveLength(1);
+  expect(settled).toEqual([]);
+  expect(raw).toEqual([]);
+});
+
+wtest("design 172: packed-refs rewrite is a signal even when refs are unchanged", async () => {
+  const root = tmpRoot();
+  await git(root, "init", "-qb", "main");
+  fs.writeFileSync(path.join(root, "tracked.txt"), "one");
+  await git(root, "add", "tracked.txt");
+  await git(root, "commit", "-qm", "initial");
+  const { gitSignals } = await watch(root);
+  await git(root, "pack-refs", "--all");
+  expect(await waitFor(() => gitSignals.length > 0)).toBe(true);
 });
 
 wtest("SCALE (design §41): monorepo-shaped tree — ready fast, memory flat, node_modules subtree pruned", async () => {
