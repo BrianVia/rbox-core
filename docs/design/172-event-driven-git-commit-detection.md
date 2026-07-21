@@ -1,11 +1,13 @@
 # 172 — Event-driven git-commit detection
 
-Status: **v3 — pending review**
+Status: **v4 — pending review**
 Owner: Claude (founder-directed, 2026-07-21)
 Origin: two-machine propagation measurement (design-170 follow-up). A commit on
 host A took ~52 s to reach host B; **~31 s of that was host A's daemon simply not
 noticing the commit.** The WebSocket + receive path is healthy
 (`notify_latency_ms=224`); this is pure *send-side detection* latency.
+
+**v4 fold (final2 — 3/5 MAJORs confirmed CLOSED; 2 coupled Linux):** the realizable overflow guarantee — on Linux hold the safety-scan floor at 60s while git repos are watched (queue-overflow is undetectable & independent of descriptor count, so degrade-to-60s not 5min is the honest bound); native-prune completed for nested `.git/modules`/`worktrees` object+log stores; git-detection scoped to the Parcel backend (Chokidar falls back to scan); onGitSignal gets the resetLifecycle guard + dual-close disposal; discriminant unified to `gitSignal`.
 
 **v3 fold (final serial review — BLOCKER confirmed CLOSED, 5 MAJORs folded):**
 (1) ref *deletions* now classified before Parcel's `unlinkDir` branch via a
@@ -90,18 +92,34 @@ watcher differs from the scanner:
    use them. Parcel's `ignore` has **no cross-entry negation** (confirmed against
    `@parcel/watcher/wrapper.js` — each entry is an independent `picomatch` OR-term),
    so we cannot say "prune `.git/**` except refs". Instead prune the *specific
-   noisy subtrees* and admit the ref surface: prune `**/.git/objects/**`,
-   `**/.git/logs/**`; admit `**/.git/HEAD`, `**/.git/packed-refs`,
-   `**/.git/refs/**`, `**/.git/worktrees/*/{HEAD,refs/**}`,
-   `**/.git/modules/**/{HEAD,packed-refs,refs/**}`. Consequence (stated honestly):
-   the *other* non-ref `.git` files (`index`, `FETCH_HEAD`, `COMMIT_EDITMSG`,
-   `ORIG_HEAD`, top-level `*.lock`) now reach the JS layer on commit/fetch and are
-   dropped there (step 2); and on Linux inotify places descriptors on the admitted
-   `.git` ref subdirs (see Descriptor budget).
+   noisy subtrees* (both the dir and its contents, so `FTS_SKIP` fires — see
+   Watcher-health) and admit the ref surface. The prune set must be **complete for
+   nested control stores** (final2 finding 5) — `.git/modules/<m>/`,
+   recursively-nested `.git/modules/…/modules/<n>/`, and `.git/worktrees/<w>/` each
+   have their OWN `objects/` and `logs/`:
+   - Prune: `**/.git/objects` + `**/.git/objects/**`, `**/.git/logs` +
+     `**/.git/logs/**`, `**/.git/modules/**/objects` + `…/objects/**`,
+     `**/.git/modules/**/logs` + `…/logs/**`, `**/.git/worktrees/*/logs` +
+     `…/logs/**`. (A missed nested `objects` re-admits a high-volume store — the
+     exact prior MAJOR.)
+   - Admit (residual): `**/.git/HEAD`, `**/.git/packed-refs`, `**/.git/refs/**`,
+     `**/.git/worktrees/*/{HEAD,refs/**}`, `**/.git/modules/**/{HEAD,packed-refs,refs/**}`.
+   Consequence (stated honestly): the *other* non-ref `.git` files (`index`,
+   `FETCH_HEAD`, `COMMIT_EDITMSG`, `ORIG_HEAD`, top-level `*.lock`) reach the JS
+   layer on commit/fetch and are dropped there (step 2).
+
+   **Backend scope (final2 finding 5b):** this is a **Parcel-backend feature.** The
+   Chokidar fallback prunes `.git/` via `matcher.prunes` *before* traversal
+   (`watcher.ts:284-292`) and cannot be made to descend to `refs` by an event-stage
+   classifier, so on Chokidar (opt-in `RBOX_WATCHER=chokidar`; also the
+   Intel-Mac/Windows degrade-to-scan case) **git detection falls back to the safety
+   scan** — explicitly narrowed, not silently broken. (Extending Chokidar would need
+   an ancestor-aware `ignored` predicate; deferred, since Chokidar is discouraged at
+   monorepo scale.)
 2. **A ref-signal classifier in `watcher.ts`, BEFORE `matcher.ignores`
    (`watcher.ts:253` and `:291`).** For each delivered event: if the path is a
    **git-ref-signal** (predicate below), emit it as a distinct event kind
-   (`gitRefSignal`) routed to the daemon's push-request path and **do not** run it
+   (`gitSignal`) routed to the daemon's push-request path and **do not** run it
    through `matcher.ignores`; otherwise fall through to today's `matcher.ignores`
    (which still drops every `.git/*`). The shared matcher is untouched, so the
    scanner/apply/purge planes remain fully `.git`-excluded.
@@ -157,9 +175,16 @@ finding 4/2): `onSettle`'s batch drives settled-state/`pendingEvents` accounting
 and a signal-only batch (no file events) corrupts it. Instead, add a dedicated
 `onGitSignal?: () => void` to `WatchOptions` (`watcher.ts:16-30`, alongside the
 existing `onError`/`onRawEvent`), with its **own** debounce independent of the file
-batcher. The daemon binds it to `() => { this.noteChurn(); this.request("push"); }`.
-git-signal paths are classified in `watcher.ts` and routed to `onGitSignal` **only** —
-they never enter the file batcher, `pendingEvents`, the manifest, or upload.
+batcher. The daemon binds it mirroring `onSettle`'s guard (final2 finding 7):
+`() => { if (this.resetLifecycle !== "ready") return; this.noteChurn();
+this.request("push"); }` (same `resetLifecycle === "ready"` gate as
+`daemon.ts:554-568`, since `request()` sets the want before its own reset check,
+`daemon.ts:744-753`). git-signal paths are classified in `watcher.ts` and routed to
+`onGitSignal` **only** — they never enter the file batcher, `pendingEvents`, the
+manifest, or upload. **Lifecycle:** the signal debounce timer must be disposed from
+BOTH backend `close()` paths (`watcher.ts:263-268,304-309`) alongside the file
+batcher. **Naming:** one discriminant — the event kind is `gitSignal` throughout
+(v3 mixed `gitSignal`/`gitSignal`).
 
 **Classification runs for every event kind, including deletes** (final-review
 finding 1): a deleted branch/tag (`git branch -d`, `update-ref -d`) is a valid
@@ -190,15 +215,46 @@ This is a **degradation**, not a correctness break: the safety scan
 just falls back to today's ~60 s (or backed-off) latency **without knowing it**.
 Degrade-not-worse holds; active detection does not.
 
-The design response is therefore **prevention, not recovery**: keep the watch set
-**small enough to not overflow** in the first place. Per Descriptor-bounded watch
-set above, admit only `HEAD` + `packed-refs` + `refs/heads` (+ optional
-`refs/tags`/`refs/stash`) — a handful of paths per repo, not the recursive `refs/**`
-subtree — so even at `MAX_GIT_REPOS = 256` the added inotify descriptors stay a
-small fraction of `fs.inotify.max_user_watches` (Open decision 2 quantifies).
+The design response is a **realizable guarantee, not detection** (final2 finding 4):
+descriptor-bounding alone is NOT sufficient, because `IN_Q_OVERFLOW` is the inotify
+*event-queue* overflowing on a burst — **independent of the descriptor count**. A
+burst can silently drop events with few watches, and the daemon (still "trusted")
+would let the safety scan back off toward 5 min. So the concrete mitigation is:
+
+> **On Linux, while any git repo is under the ref-watch, hold the safety-scan floor
+> at `SAFETY_SYNC_MS` (60 s) — do NOT let it back off toward `SAFETY_SYNC_MAX_MS`
+> (5 min).** (Wire alongside the existing floor-pin, `daemon.ts:592-610`,
+> `nextSafetyDelay` `policy.ts:107-111`.)
+
+This bounds the worst case to **60 s even if the fast path silently dies** —
+identical to today's non-git floor, never worse — without needing to detect the
+undetectable. macOS/FSEvents keeps its normal back-off (single stream, no inotify
+queue). Descriptor-bounding still applies as defence-in-depth: express it as
+*exclusion* (Parcel `ignore` is exclusion-only — prune every noisy `.git` subtree;
+the residual `.git/` dir + `refs/heads` [+tags/stash] IS the watch set, ≈2-3
+descriptors/repo), NOT a positive admit-list.
 macOS/FSEvents is unaffected (single stream, no per-dir descriptors). The `onError`
 routing for the errors Parcel *does* surface (init failure, backend death) stays
 wired as today; we simply don't claim to catch the ones it swallows.
+
+**Why the bounded set actually saves descriptors (source-verified).** Parcel's
+crawler prunes ignored dirs from the watched tree via `FTS_SKIP`
+(`node_modules/@parcel/watcher/src/unix/fts.cc:40-41`: `if (isIgnored(path))
+fts_set(fts, node, FTS_SKIP);`), and `subscribe` only `inotify_add_watch`es dirs
+that made it into the tree (`InotifyBackend.cc:66-80`). So `ignore` prevents watch
+*registration*, not merely event delivery — pruning `.git/objects` costs **zero**
+descriptors, and admitting the ref surface adds only the `.git/` dir + the ref
+subdir(s) ≈ **2-3 descriptors/repo** (`.git/` covers HEAD + packed-refs as files;
+`.git/refs/heads` covers branch refs). This is what makes the overflow-prevention
+strategy sound. Two implementation musts follow:
+- **`.git/` itself must NOT be pruned** (so the crawl descends to `refs/`), which
+  means the `.git/` dir watch delivers *every* `.git/*` file event (HEAD, index,
+  FETCH_HEAD, COMMIT_EDITMSG, `*.lock`, packed-refs) to the JS classifier. One
+  descriptor, cheap picomatch filter, but non-zero JS work per git op — acceptable.
+- **Prune globs must cover both the dir and its contents** — `**/.git/objects` AND
+  `**/.git/objects/**` (and same for `logs`) — or `FTS_SKIP` won't fire on the dir
+  and the subtree leaks back into the watch (matches the existing
+  `nativePruneGlobs` `**/${d}` + `**/${d}/**` pattern, `ignore.ts:168`).
 
 ## Contracts
 
