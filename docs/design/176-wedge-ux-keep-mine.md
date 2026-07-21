@@ -1,6 +1,6 @@
 # 176 — Wedge UX: `keep-mine`, legible deferrals, and the held-skip eligibility defect
 
-Status: ALIGNED v4 — r3 confirmed 3/7 closed + 4 orchestrator edit-failures; all 4 re-fixed exactly as prescribed with per-edit grep verification, self-certified (2026-07-21)
+Status: v5 — §4 allowlist amendment (rig-forced: local-index is structural to the wedge) UNDER FOCUSED REVIEW; v4 was ALIGNED 2026-07-21
 Relates: 174 (livelock self-heal; this ships its manual escape hatch),
 130 (publisher-ack composition — the arm keep-mine lands through),
 128 (show-me/take-theirs token flow — the scaffolding keep-mine completes),
@@ -172,6 +172,21 @@ including foreign artifacts and veto gates, remain blocking; a composer
 pending disposition without a classification blocker remains ineligible via
 the non-empty rule. The rig gains a non-opportunistic assertion: with the
 daemon otherwise idle, the second held pull MUST report `skippedHeld>=1`.
+
+### §4 AMENDMENT v5 (rig-forced, 2026-07-21): allowlist admits `local-index`
+
+With the fixture's file plane settled, the rig proved the wedge steady state
+carries a THIRD standing blocker: `local-index` — an ahead writer's clean
+index projects its own newer HEAD's tree, matching neither the stale base nor
+the stale incoming artifact. It is structural to the shape (present on the
+live Mac), so `{local-commits, local-stash}` can never fire in the field.
+SOUNDNESS: unlike the working tree (never fingerprinted → `local-edits`
+stays excluded), the index file IS inside the attempt's gitFingerprint
+bracket — any index mutation voids the attempt and forces a full follow.
+The allowlist becomes `{local-commits, local-stash, local-index}`; every
+other rule (merged non-empty set, composer hold mapping, floor, canary)
+unchanged. The rig's non-opportunistic assertion now exercises exactly this
+triple. 174 §4.1's allowlist is superseded by this amendment.
 
 ## 5. Tests (MUST)
 
