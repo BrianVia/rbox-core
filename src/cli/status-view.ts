@@ -121,6 +121,8 @@ export type BriefStatusSnapshot =
       behindRemote: boolean;
       halt?: BriefHaltReason;
       planQuota: PlanQuotaAttention;
+      daemonVersion?: string;
+      cliVersion: string;
       daemonVersionSkew: boolean;
       locking: LockingHealth;
       git?: BriefGitAttention;
@@ -699,7 +701,7 @@ export function renderBriefStatus(snapshot: BriefStatusSnapshot): BriefStatusRen
     lines.push("⚠ background sync is stopped · rbox start");
   }
   if (snapshot.daemonVersionSkew) {
-    lines.push("⚠ rbox was updated; restart background sync · rbox stop && rbox start");
+    lines.push(`⚠ daemon is running v${snapshot.daemonVersion} but this CLI is v${snapshot.cliVersion} — restart to finish the upgrade: rbox stop && rbox start`);
   }
   const locking = lockingAttentionLine(snapshot.locking);
   if (locking) lines.push(locking);

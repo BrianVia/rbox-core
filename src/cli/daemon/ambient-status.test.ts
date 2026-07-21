@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   formatPromptStatus,
+  pausedAmbientDaemonStatus,
   projectAmbientDaemonStatus,
   promptStatusJson,
   readAmbientDaemonStatusRecord,
@@ -14,6 +15,7 @@ import {
 import { daemonPidPath, daemonRuntimeDir, daemonStatusPath } from "../rbox-paths.js";
 import type { DaemonActivity } from "../activity.js";
 import { saveAmbientDaemonStatus } from "./ambient-status-writer.js";
+import { RBOX_VERSION } from "../version.js";
 
 const NOW = Date.parse("2026-07-08T12:00:00.000Z");
 const freshAt = new Date(NOW - 1_000).toISOString();
@@ -152,6 +154,16 @@ test("ambient writer aborts silently when ownership is lost before rename", asyn
 
   expect(checked).toBe(true);
   expect(await fs.readFile(daemonStatusPath(root), "utf8")).toBe(before);
+});
+
+test("every persisted projection carries the daemon's build version", () => {
+  const activity: DaemonActivity = {
+    at: freshAt,
+    lastPush: { at: "2026-07-08T11:59:00.000Z", files: 3, sequence: 41 },
+  };
+  const projected = projectAmbientDaemonStatus({ activity, settled: true, now: NOW, sequence: 41 });
+  expect(projected.daemonVersion).toBe(RBOX_VERSION);
+  expect(pausedAmbientDaemonStatus(NOW, projected).daemonVersion).toBe(RBOX_VERSION);
 });
 
 test("state projection table follows design-88 precedence and operation shape", () => {
@@ -326,7 +338,7 @@ test("future producer timestamps sort last and never become a fresh zero age", (
   expect(projected.deferrals?.[0]?.deferredSince).toBe(future);
 });
 
-test("ambient reader retains an optional daemonVersion and accepts pre-1.6.3 records", async () => {
+test("ambient reader retains an optional daemonVersion and accepts older records without it", async () => {
   await writeStatus({ daemonVersion: "1.6.3" });
   expect(readPromptStatus(root, NOW)).toMatchObject({ kind: "workspace", state: "synced" });
   const stored = JSON.parse(await fs.readFile(daemonStatusPath(root), "utf8"));

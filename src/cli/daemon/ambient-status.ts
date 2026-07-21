@@ -11,6 +11,7 @@ import {
   type GitDeferralRemediationClass,
 } from "../status-view.js";
 import { parseSemver } from "../semver.js";
+import { RBOX_VERSION } from "../version.js";
 import {
   AMBIENT_STATUS_STALE_MS,
   hasFreshPopulateHeartbeat,
@@ -248,6 +249,7 @@ export function projectAmbientDaemonStatus(input: AmbientStatusProjectionInput):
 
   return stripUndefined({
     schemaVersion: 1,
+    daemonVersion: RBOX_VERSION,
     state,
     heartbeatAt: new Date(input.now).toISOString(),
     sequence: input.sequence ?? null,
@@ -284,6 +286,7 @@ export function pausedAmbientDaemonStatus(
 ): AmbientDaemonStatusV1 {
   return {
     schemaVersion: 1,
+    daemonVersion: RBOX_VERSION,
     state: "paused",
     heartbeatAt: new Date(now).toISOString(),
     sequence: previous?.sequence ?? null,

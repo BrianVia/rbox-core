@@ -31,6 +31,8 @@ const full = (over: Partial<Full> = {}): Full => ({
   pendingChanges: 0,
   behindRemote: false,
   planQuota: { kind: "none" },
+  daemonVersion: "1.7.18",
+  cliVersion: "1.7.18",
   daemonVersionSkew: false,
   locking: { status: "ok" },
   now: NOW,
@@ -136,7 +138,7 @@ test("locking, version, git, trash, and update keep rows use exact copy", () => 
     [{ status: "starved", reason: "fence" }, "⚠ workspace recovery is holding the sync lock · rbox doctor"],
   ] as const;
   for (const [locking, copy] of lockCases) expect(lines(full({ locking }))).toContain(copy);
-  expect(lines(full({ daemonVersionSkew: true }))).toContain("⚠ rbox was updated; restart background sync · rbox stop && rbox start");
+  expect(lines(full({ daemonVersion: "1.7.17", daemonVersionSkew: true }))).toContain("⚠ daemon is running v1.7.17 but this CLI is v1.7.18 — restart to finish the upgrade: rbox stop && rbox start");
   expect(lines(full({ git: { count: 1, oldestDeferredSince: ago(86400_000), allLocalEditDeferrals: true } })))
     .toContain("⚠ 1 git repo waiting on uncommitted changes (oldest: 1 day) · rbox status --git");
   expect(lines(full({ git: { count: 2, oldestDeferredSince: ago(2 * 3600_000), allLocalEditDeferrals: false } })))
@@ -209,7 +211,7 @@ test("headline blocker predicate is closed and attention ordering is total", () 
   const blockers: Partial<Full>[] = [
     { halt: { kind: "unknown" } },
     { planQuota: { kind: "storage-limit" } },
-    { daemonVersionSkew: true },
+    { daemonVersion: "1.7.17", daemonVersionSkew: true },
     { locking: { status: "starved", reason: "foreign" } },
   ];
   for (const blocker of blockers) expect(headlineBlocked(full(blocker))).toBe(true);
@@ -231,6 +233,7 @@ test("headline blocker predicate is closed and attention ordering is total", () 
     daemonStale: true,
     halt: { kind: "unknown" },
     planQuota: { kind: "no-active-plan" },
+    daemonVersion: "1.7.17",
     daemonVersionSkew: true,
     locking: { status: "starved", reason: "fence" },
     behindRemote: true,
@@ -243,7 +246,7 @@ test("headline blocker predicate is closed and attention ordering is total", () 
     "⛔ sync halted — see rbox logs",
     "⛔ no active plan · rbox subscribe",
     "⚠ background sync is attached to a previous workspace · rbox start",
-    "⚠ rbox was updated; restart background sync · rbox stop && rbox start",
+    "⚠ daemon is running v1.7.17 but this CLI is v1.7.18 — restart to finish the upgrade: rbox stop && rbox start",
     "⚠ workspace recovery is holding the sync lock · rbox doctor",
     "⚠ remote changes waiting to download · rbox pull",
     "⚠ 2 git repos need attention (oldest: 7 days) · rbox status --git",
