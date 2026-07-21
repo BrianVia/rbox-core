@@ -247,7 +247,7 @@ interface BreadcrumbMismatch {
   incoming: string | null;
 }
 
-function opStateRootOf(rel: string): OpStateRoot {
+export function opStateRootOf(rel: string): OpStateRoot {
   return rel.split("/")[0] as OpStateRoot;
 }
 

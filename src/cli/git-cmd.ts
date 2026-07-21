@@ -21,6 +21,8 @@ import {
   resumeLockedAcceptedPRepair,
   runLockedPRepairAttempt,
 } from "../engine/index.js";
+import { OP_STATE_CLASSIFICATION } from "../engine/manifest-validate.js";
+import { opStateRootOf } from "./sync-git/follow.js";
 import { pinDisplaced } from "../engine/git/keep-pins.js";
 import { branchesCheckedOutElsewhere } from "../engine/git/apply.js";
 import { quarantineLocal } from "../engine/git/quarantine.js";
@@ -811,7 +813,12 @@ export async function gitResolveCmd(
       emit({ status: "refused", verb, repo: rel, code: "git-busy", message: "Git is busy; retry keep-mine after the other Git operation finishes" }, json, deps, root);
       return 1;
     }
-    if (verb === "keep-mine" && Object.keys(await readOpState(ctx.gitDir, hashFile)).length > 0) {
+    // Breadcrumbs (ORIG_HEAD-class, design 126) are inert leftovers, not
+    // operations — refusing on them blocked the founder's live unwedge on a
+    // stale ORIG_HEAD. Only genuinely in-progress op-state refuses.
+    const inProgressOps = Object.keys(await readOpState(ctx.gitDir, hashFile))
+      .filter((rel) => OP_STATE_CLASSIFICATION[opStateRootOf(rel)] === "in-progress");
+    if (verb === "keep-mine" && inProgressOps.length > 0) {
       emit({ status: "refused", verb, repo: rel, code: "local-operation", message: "a Git operation is in progress; finish or abort it, then run keep-mine again" }, json, deps, root);
       return 1;
     }
@@ -953,7 +960,9 @@ export async function gitResolveCmd(
         emit({ status: "refused", verb, repo: rel, code: "git-busy", message: "Git became busy; retry keep-mine after the other Git operation finishes" }, json, deps, root);
         return 1;
       }
-      if (Object.keys(await readOpState(ctx.gitDir, hashFile)).length > 0) {
+      const confirmInProgress = Object.keys(await readOpState(ctx.gitDir, hashFile))
+        .filter((rel2) => OP_STATE_CLASSIFICATION[opStateRootOf(rel2)] === "in-progress");
+      if (confirmInProgress.length > 0) {
         emit({ status: "refused", verb, repo: rel, code: "local-operation", message: "a Git operation began before confirmation; finish or abort it, then run keep-mine again" }, json, deps, root);
         return 1;
       }
