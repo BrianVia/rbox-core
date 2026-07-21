@@ -138,3 +138,17 @@ what happened, what it cost, fix hint if obvious.
   only by SSH log forensics; no wire kind carries phase timings. Fixed by
   design 174 C2 (`sync_phase`), but the meta-lesson stands: any new
   retry/deferral loop needs a fleet-visible counter from day one.
+
+## 2026-07-21 (night — keep-mine heal round 2)
+
+- **`rbox push` while the daemon is mid-cycle hard-fails** ("daemon/CLI is
+  syncing; retry, or run `rbox stop` first") instead of queueing or waiting
+  briefly. Every scripted heal tonight had to wrap pushes in stop/start
+  choreography; a plain `--wait` (or default short lock-wait) would have
+  removed a whole class of operator error.
+- **The keep-mine preview buries its confirm command.** ~19KB of per-tag
+  "nothing would be lost — incoming value is retained" lines (one per
+  pegasus deploy tag, hundreds) scroll between the summary and the final
+  confirm line. Collapse subsumed lanes into one count line
+  ("1,412 tags/branches retained — nothing lost") and show only the
+  would-be-discarded and unprovable lanes in full.
