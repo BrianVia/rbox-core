@@ -1,11 +1,23 @@
 # 172 — Event-driven git-commit detection
 
-Status: **v2 — pending review**
+Status: **v3 — pending review**
 Owner: Claude (founder-directed, 2026-07-21)
 Origin: two-machine propagation measurement (design-170 follow-up). A commit on
 host A took ~52 s to reach host B; **~31 s of that was host A's daemon simply not
 noticing the commit.** The WebSocket + receive path is healthy
 (`notify_latency_ms=224`); this is pure *send-side detection* latency.
+
+**v3 fold (final serial review — BLOCKER confirmed CLOSED, 5 MAJORs folded):**
+(1) ref *deletions* now classified before Parcel's `unlinkDir` branch via a
+watcher-local discriminated event type; (2) git-signals routed through a **new,
+separate `onGitSignal` callback** (not the file `onSettle` batch, which they'd
+corrupt); (3) **reftable removed from the watch** entirely (co-mingled binary refs
+can't be path-filtered → pin self-echo) — reftable repos are scan-bound + a
+pre-existing fingerprint gap; `refs/stash` added to the syncable set; (4) **Parcel
+2.5.6 silently swallows inotify overflow** — v2's "routes through onError" was
+false, so the design pivots to a **descriptor-bounded watch set** (HEAD +
+packed-refs + refs/heads, not recursive refs/**) to prevent overflow rather than
+recover from an undetectable one; (5) native-prune completeness for nested modules.
 
 **v2 fold (parallel review: codex + opus + fable, all CHANGES-REQUIRED, core
 approach affirmed):** the ref-signal admit is moved OUT of the shared
@@ -103,9 +115,10 @@ the seam is the same.
 
 A relPath is a git-ref-signal iff, relative to some ancestor git-control dir
 `G ∈ { <repo>/.git, <repo>/.git/worktrees/<w>, <base>/.git/modules/<name>[/modules/<n2>…] }`,
-the tail is exactly `HEAD`, `packed-refs`, or under `refs/heads/` / `refs/tags/`
-(the `isSyncableRef` namespaces + HEAD/stash, `manifest-validate.ts:263`) — AND
-none of the exclusions:
+the tail is exactly `HEAD`, `packed-refs`, under `refs/heads/`, under `refs/tags/`,
+or exactly `refs/stash` — the full `isSyncableRef` set (`refs/heads/*` |
+`refs/tags/*` | `refs/stash`, `manifest-validate.ts:263`) plus HEAD/packed-refs —
+AND none of the exclusions:
 - **NOT `*.lock`** (git writes every ref via lock+atomic-rename; the lock is the
   common case, not an edge — r1 opus F2/codex 4).
 - **NOT `refs/rbox-*`** (rbox's own scratch pins `refs/rbox-wip/<…>`, `pins.ts:21`,
@@ -113,29 +126,79 @@ none of the exclusions:
   push, r1 fable 2; mirrors `RBOX_INTERNAL_REFS_EXCLUDE`, `capture.ts:31`).
 - **NOT `refs/remotes/**`** (not an `isSyncableRef`; carries no sync signal, so
   watching it turns every `git fetch` into a slow-probe push, r1 fable 6).
-- **NOT `refs/tags/**` if we choose heads-only** — kept in v2 (tags ARE syncable),
-  but flagged in Open decisions for the descriptor-budget tradeoff.
+- **NOT `.git/reftable/**`** (final-review finding 3): a reftable stores syncable +
+  remote + `refs/rbox-*` scratch updates **co-mingled in one binary file**, so a
+  path-only predicate cannot admit "a head changed" while excluding a scratch-pin
+  rewrite — watching it re-introduces the pin self-echo and can't be filtered.
+  Reftable repos are therefore **scan-bound** (and a pre-existing fingerprint gap;
+  see Consciously scan-bound). v2's "add reftable defensively" was inconsistent and
+  is removed.
 
-Used by BOTH the native admit-globs and the watcher classifier, so they cannot drift.
+`refs/remotes` note: because `packed-refs` is always a signal but its rewrite may
+concern only remotes, a `git fetch` that repacks refs CAN fire one carry-only push
+(slow probe, no upload). The validation goal is "no *capture/upload* on fetch," not
+"no push signal" — stated honestly (final-review finding on remotes).
 
-### Trigger wiring
+**Descriptor-bounded watch set (final-review finding 4).** The *predicate* above
+classifies events; the *watch set* (which paths we register / admit through the
+native prune) is deliberately narrower to bound inotify descriptors on Linux:
+admit `HEAD`, `packed-refs`, and `refs/heads` (+ `refs/tags`, `refs/stash`) — NOT
+the entire recursive `refs/**` tree, whose per-namespace subdirs multiply
+descriptors. See Watcher-health + Open decision 2 for why this matters for
+*correctness of the fast path*, not just perf.
 
-A `gitRefSignal` event routes to `daemon.ts` (the `onSettle`/event seam,
-`daemon.ts:554-558`) and calls `this.noteChurn(); this.request("push")` — and is
-**never** pushed into `pendingEvents` (it is not a workspace file to reconcile).
-No new timer/stream: it rides the existing watcher (`startLiveWatch`,
-`daemon.ts:507-511`), torn down in `stop()` (`daemon.ts:649-677`). The existing
-batcher (debounce 400 ms / maxWait 3000 ms, `watcher.ts:210-211`) coalesces the
-multi-file burst of one commit (HEAD + ref + packed-refs + transient lock) into
-one settle → one push.
+The predicate is used by BOTH the native admit-globs and the watcher classifier, so
+they cannot drift.
 
-### Watcher-health for the new surface (r1 codex 6)
+### Trigger wiring — a SEPARATE callback, not the file settle batch
 
-Parcel's post-start errors (inotify overflow when the admitted ref subdirs push
-the descriptor count up) must route through the existing `onError` → untrusted-
-watcher → `pinSafetyFloor` machinery (`daemon.ts:530-577`, `classifyWatcherError`
-`policy.ts:72-75`) so a dropped/overflowed stream can't sit backed off — identical
-to today's file-watcher health handling.
+A git-signal must **not** flow through the file-event `onSettle` batch (final-review
+finding 4/2): `onSettle`'s batch drives settled-state/`pendingEvents` accounting,
+and a signal-only batch (no file events) corrupts it. Instead, add a dedicated
+`onGitSignal?: () => void` to `WatchOptions` (`watcher.ts:16-30`, alongside the
+existing `onError`/`onRawEvent`), with its **own** debounce independent of the file
+batcher. The daemon binds it to `() => { this.noteChurn(); this.request("push"); }`.
+git-signal paths are classified in `watcher.ts` and routed to `onGitSignal` **only** —
+they never enter the file batcher, `pendingEvents`, the manifest, or upload.
+
+**Classification runs for every event kind, including deletes** (final-review
+finding 1): a deleted branch/tag (`git branch -d`, `update-ref -d`) is a valid
+committed-state signal. Parcel emits deletes as `unlinkDir` covering the path +
+`path/**` (`watcher.ts:237-243`), so the git-signal predicate must be evaluated at
+the *normalized-event* stage **before** the add/change/delete fork, and a matching
+delete of a watched ref path routes to `onGitSignal`. Use a watcher-local
+discriminated event type (`{kind:"file"|"gitSignal", …}`) so *only* file-kind
+events can ever inhabit `pendingEvents`.
+
+No new stream: it rides the existing single recursive watcher (`startLiveWatch`,
+`daemon.ts:507-511`), torn down in `stop()` (`daemon.ts:649-677`). A commit's
+multi-file burst (HEAD + ref + packed-refs + transient lock create/delete)
+coalesces via the signal debounce into one `request("push")`.
+
+### Watcher-health / the Parcel silent-overflow reality (final-review finding 4/5)
+
+**Correction from v2:** Parcel 2.5.6 **silently** discards inotify `IN_Q_OVERFLOW`
+and silently returns on a failed `inotify_add_watch` for a new directory
+(`node_modules/@parcel/watcher/src/linux/InotifyBackend.cc`, verified in the final
+review). Those failures **cannot** reach `onError` / the untrusted-watcher health
+transition (`daemon.ts:530-577`). So v2's "overflow routes through `onError`" was
+**false** — the daemon cannot actively detect that the ref-watch fast path has
+silently died on Linux.
+
+This is a **degradation**, not a correctness break: the safety scan
+(`policy.ts:6`, independent of the watcher) still catches the commit — the machine
+just falls back to today's ~60 s (or backed-off) latency **without knowing it**.
+Degrade-not-worse holds; active detection does not.
+
+The design response is therefore **prevention, not recovery**: keep the watch set
+**small enough to not overflow** in the first place. Per Descriptor-bounded watch
+set above, admit only `HEAD` + `packed-refs` + `refs/heads` (+ optional
+`refs/tags`/`refs/stash`) — a handful of paths per repo, not the recursive `refs/**`
+subtree — so even at `MAX_GIT_REPOS = 256` the added inotify descriptors stay a
+small fraction of `fs.inotify.max_user_watches` (Open decision 2 quantifies).
+macOS/FSEvents is unaffected (single stream, no per-dir descriptors). The `onError`
+routing for the errors Parcel *does* surface (init failure, backend death) stays
+wired as today; we simply don't claim to catch the ones it swallows.
 
 ## Contracts
 
@@ -175,9 +238,12 @@ path; they remain detected by the safety scan, not the fast path. Accepted for a
   reads `packed-refs`+`refs/`, inert under reftable), so the "scan backstop heals
   it" claim FAILS for them (a trusted stale fingerprint can carry a reftable commit
   forever). This is a **pre-existing** fingerprint gap, not introduced here.
-  **Recommendation (separate follow-up): refuse reftable in `gitPreflight`** until
-  fingerprint+watch both learn `.git/reftable/**`. v2 adds `.git/reftable/**` to the
-  watch predicate defensively but does not fix the fingerprint side — flagged.
+  **Recommendation (separate follow-up): refuse reftable in `gitPreflight`
+  (`preflight.ts:29-69`)** until fingerprint+watch both learn `.git/reftable/**`.
+  v3 does **not** watch reftable (a path-only predicate cannot exclude co-mingled
+  scratch-pin updates in the binary table → pin self-echo, final-review finding 3);
+  reftable repos are consistently scan-bound here, with the real fix (preflight
+  refusal or teaching the fingerprint) flagged as separate.
 
 ## Tests the implementation MUST write
 
@@ -203,7 +269,14 @@ path; they remain detected by the safety scan, not the fast path. Accepted for a
    `modules/<name>/`).
 9. **Lock churn**: `refs/heads/x.lock` create+delete during a commit neither fires
    an independent signal nor wedges (debounce coalesces).
-10. **Watcher overflow** routes through `onError` → untrusted → safety-floor.
+10. **Ref deletion** (`git branch -d`, `update-ref -d`) is classified as a signal —
+    including via Parcel's `unlinkDir` delete path — and triggers a push; a delete
+    of a non-ref/lock `.git` path does not.
+11. **Signal-only batch isolation**: a burst containing *only* git-signal events
+    routes to `onGitSignal` and leaves the file `onSettle`/`pendingEvents`/settled-
+    state accounting untouched (regression guard on the separate-seam requirement).
+12. **Reftable repo**: a commit in a reftable repo produces NO git-signal (not
+    watched) and is left to the safety scan (documents the accepted gap).
 
 ## Non-goals
 
@@ -231,10 +304,15 @@ the Linux host shows no inotify-overflow regression under a fetch-heavy repo.
 1. **Tags in the watch set** — `refs/tags/**` is syncable but rarely the
    latency-critical path; keeping it adds descriptors. Watch heads+tags (v2 default)
    vs heads-only? Decide on the descriptor-budget evidence (#2).
-2. **Linux inotify descriptor budget** — quantify watches added by admitting the
-   ref surface for up to `MAX_GIT_REPOS = 256` repos (`manifest-validate.ts:22`)
-   against `fs.inotify.max_user_watches`. If tight: prefer `HEAD` + `packed-refs` +
-   `refs/heads` only, or the separate-watch fallback (approach b).
+2. **Linux inotify descriptor budget — now correctness-adjacent, not just perf**
+   (because Parcel silently swallows overflow, §Watcher-health): quantify watches
+   added by admitting the ref surface for up to `MAX_GIT_REPOS = 256` repos
+   (`manifest-validate.ts:22`) against `fs.inotify.max_user_watches`. The v3 default
+   is the **bounded** set (`HEAD` + `packed-refs` + `refs/heads`, ~3 paths/repo ≈
+   <800 descriptors at 256 repos) precisely to stay far under the limit so overflow
+   never happens. Decide whether to also admit `refs/tags`/`refs/stash` (a few more
+   per repo) or hold them scan-bound. Fallback if still tight: `logs/HEAD`
+   single-file (Open decision 3) or the separate-watch approach (b).
 3. **`logs/HEAD` single-file signal** — one path per repo, moves on every commit;
    a lower-descriptor alternative to the `refs/` subtree at the cost of watching a
    `logs/` path. Weigh vs the refs subtree once #2 is measured.
