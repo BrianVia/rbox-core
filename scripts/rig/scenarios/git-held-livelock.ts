@@ -199,7 +199,7 @@ export const gitHeldLivelock: Scenario = {
         await new Promise((resolve) => setTimeout(resolve, 2_100));
         // RBOX_METRICS=1: the skippedHeld token lives in the metrics summary
         // line, which the rig's default injection (RBOX_METRICS=0) suppresses.
-        const pull = await ctx.a.rboxShell(`cd '${GUEST.workDir}' && RBOX_METRICS=1 RBOX_GIT_PENDING_SUPERSEDE=0 bun ${GUEST.cliEntry} pull --verbose`);
+        const pull = await ctx.a.rboxShell(`cd '${GUEST.workDir}' && RBOX_METRICS=1 RBOX_DEBUG=1 RBOX_GIT_PENDING_SUPERSEDE=0 bun ${GUEST.cliEntry} pull --verbose`);
         skipWindow = pull.stdout + pull.stderr;
       });
       rec.assert("held window: second idle pull reports skippedHeld>=1", skippedHeldRe.test(skipWindow),
