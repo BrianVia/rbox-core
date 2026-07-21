@@ -502,10 +502,17 @@ function printShow(show: GitResolveShow, write: (line: string) => void): void {
   write(`  Confirmation token: ${show.snapshot}`);
 }
 
+function laneLabel(lane: string): string {
+  if (lane.startsWith("branch:")) return `branch ${lane.slice("branch:".length).replace(/^refs\/heads\//, "")}`;
+  if (lane.startsWith("tag:")) return `tag ${lane.slice("tag:".length).replace(/^refs\/tags\//, "")}`;
+  const names: Record<string, string> = { stash: "stash", head: "checked-out branch", refscope: "sync scope", index: "staging area", opstate: "in-progress operation state", config: "repo settings" };
+  return names[lane] ?? lane;
+}
+
 function printDiscardReport(report: ResolutionDiscardReport, write: (line: string) => void): void {
-  write("Preliminary incoming-discard report (the final report is confirmed at publish time):");
-  for (const lane of report.lanes) write(`  ${lane.lane}: ${lane.disposition} — ${lane.detail}`);
-  if (report.forceRequired) write("  At least one incoming lane is not retained; confirmation requires --force-discard-incoming.");
+  write("What the old synced snapshot has that your repo doesn't (final check happens at publish):");
+  for (const lane of report.lanes) write(`  ${laneLabel(lane.lane)}: ${lane.disposition === "subsumed" ? "nothing would be lost" : lane.disposition === "not-subsumed" ? "would be discarded" : "couldn't be checked"} — ${lane.detail}`);
+  if (report.forceRequired) write("  Some of the old snapshot would be discarded — confirming requires --force-discard-incoming. (Your local files, branches, and history are untouched either way.)");
 }
 
 function keepMineConfirmCommand(repo: string, snapshot: string, force: boolean): string {
@@ -875,7 +882,7 @@ export async function gitResolveCmd(
       if (absentPublisherBranch) {
         emit({
           status: "refused", verb, repo: rel, code: "conflict",
-          message: `keep-mine cannot publish branch absence for ${absentPublisherBranch[0]} while BASE still holds it; restore or resolve that branch first`,
+          message: `keep-mine can't remove branch ${absentPublisherBranch[0]} — it is deleted here but rbox still tracks it as synced. Restore the branch, or resolve it explicitly, then retry`,
         }, json, deps, root);
         return 1;
       }
@@ -887,7 +894,7 @@ export async function gitResolveCmd(
       if (divergentBranch) {
         emit({
           status: "refused", verb, repo: rel, code: "conflict",
-          message: `incoming and local history diverge for ${divergentBranch.lane.slice("branch:".length)}; resolve this reserved two-writer case with Git before retrying`,
+          message: `branch ${divergentBranch.lane.slice("branch:".length)} was changed on another machine AND here — rbox won't pick a side. Reconcile it with git (merge or rebase), then retry`,
         }, json, deps, root);
         return 1;
       }
