@@ -186,17 +186,19 @@ export const gitHeldLivelock: Scenario = {
         `window must not contain 'git-sync followed ${REPO}' while held`);
 
       // ── ROUND self-heal (item B): supersession publishes A's truth ────────
-      const healAt = Date.now();
-      await rec.step("[A] local change → push runs capture-then-prove-then-swap", async () => {
+      // The heal is AUTONOMOUS: the daemon's own pull→push cycle supersedes within
+      // seconds of the hold (run-2 lesson: it beat the scripted nudge by 3s), so the
+      // watch window opens at RESTART, and the local change below is only a belt.
+      await rec.step("[A] capture-then-prove-then-swap supersedes (autonomous or nudged)", async () => {
         await ctx.a.exec(["sh", "-c", `printf 'heal\\n' > '${GUEST.workDir}/heal-174.txt'`]);
-        const out = await pollUntil({ probe: async () => supersededRe.test(linesSince(await readLogs(ctx.a), healAt)), done: (v) => v === true, timeoutMs: PROPAGATE_TIMEOUT_MS, intervalMs: HEAD_POLL_MS });
+        const out = await pollUntil({ probe: async () => supersededRe.test(linesSince(await readLogs(ctx.a), restartAt)), done: (v) => v === true, timeoutMs: PROPAGATE_TIMEOUT_MS, intervalMs: HEAD_POLL_MS });
         if (!out.ok) throw new Error("A never logged the superseded-pending line");
       });
       await rec.step("[B] converges to Y", async () => {
         const out = await pollUntil({ probe: async () => (await gitHead(ctx.b, repoDir)) === headY, done: (v) => v === true, timeoutMs: PROPAGATE_TIMEOUT_MS, intervalMs: HEAD_POLL_MS });
         if (!out.ok) throw new Error(`B never reached Y (${headY.slice(0, 8)})`);
       });
-      const healWindowB = linesSince(await readLogs(ctx.b), healAt);
+      const healWindowB = linesSince(await readLogs(ctx.b), restartAt);
       rec.assert("heal: B followed the superseding section", followedRe.test(healWindowB),
         "B must follow repo-174 to Y via the ordinary path");
 
