@@ -169,7 +169,9 @@ export const gitHeldLivelock: Scenario = {
       // the fix). Push the file plane out first, then assert on git-only holds.
       await rec.step("[A] file plane settles (push publishes offline files)", async () => {
         const out = await pollUntil({ probe: async () => {
-          const push = await ctx.a.rbox(["push"], { cwd: GUEST.workDir, allowFail: true });
+          // Supersession OFF for the settle pushes: a default CLI push runs the
+          // full plan and heals the wedge before the skip is observable (run-6).
+          const push = await ctx.a.rboxShell(`cd '${GUEST.workDir}' && RBOX_GIT_PENDING_SUPERSEDE=0 bun ${GUEST.cliEntry} push`, { allowFail: true });
           const pull = await ctx.a.rbox(["pull", "--verbose"], { cwd: GUEST.workDir, allowFail: true });
           const text = pull.stdout + pull.stderr;
           return !/working tree differs|index differs/.test(text);
