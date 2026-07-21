@@ -1,6 +1,6 @@
 # 176 — Wedge UX: `keep-mine`, legible deferrals, and the held-skip eligibility defect
 
-Status: DRAFT v2 — r1 folded (2-review parallel), awaiting serial confirmation
+Status: DRAFT v3 — r2 serial findings folded (all 7, as prescribed), awaiting r3 confirmation
 Relates: 174 (livelock self-heal; this ships its manual escape hatch),
 130 (publisher-ack composition — the arm keep-mine lands through),
 128 (show-me/take-theirs token flow — the scaffolding keep-mine completes),
@@ -39,10 +39,11 @@ grokkable." Three deliverables:
 ### Semantics
 For a repo with a pending (unapplied incoming) section and/or apply deferral:
 confirm an INTENT to publish CURRENT LOCAL git state as the new remote truth.
-The intent is executed only by the next ordinary push. Local refs, index,
-stash, worktrees, BASE, pending, and sidecars remain untouched until that push
-is accepted; keep-mine mutates rbox's belief only in the accepted-ACK
-transition 174-B already uses.
+The intent is executed only by the next ordinary push. Confirmation's ONLY
+mutation is creating/replacing the `RESOLUTION-INTENT` sidecar itself; local
+refs, index, stash, worktrees, BASE, P, and every OTHER pre-existing sidecar
+remain untouched until that push is accepted — belief changes land only in
+the accepted-ACK transition 174-B already uses. [r2: 1]
 
 ### Mechanism
 1. **Inspect, preview, then record intent**: `rbox git resolve <repo>
@@ -51,7 +52,10 @@ transition 174-B already uses.
    and labeled "final report is confirmed at publish time." The confirmation
    token binds refs/reflogs, HEAD, index, op-state, stash, oracle receipt,
    canonical config plus its read/ownership disposition, effective ref scope
-   and capture policy, repo kind and identity, and the actual pending key.
+   and capture policy, repo kind and identity, `stream`, `stateNonce`,
+   `repoGen`, and the pending section's `gitIncomingKey(P)` (the section key,
+   not the repo map key) — the full show-me binding set PLUS these, never
+   replacing it. [r2: 2]
    Those inputs are recomputed immediately before the intent write.
    `--confirm <token>` (with `--force-discard-incoming` when the preliminary
    report contains a non-subsumed lane) writes a token-bound, single-use
@@ -65,12 +69,15 @@ transition 174-B already uses.
    candidate in hand, push computes a new directional per-lane discard report
    from pending to candidate. The report is a small typed predicate built on
    `equalOrFastForward` and exact-equality helpers; 174 v6's boolean is not
-   reused as a report. Each lane is `subsumed`, `not-subsumed`, or
-   `indeterminate`; one-sided absence is directional, and indeterminate
-   evidence refuses. A pending-absent lane is vacuous; pending refs use the
-   equal-or-descendant relation, while index, stash, config, and other exact
-   lanes report loss only when pending content is absent or unequal in the
-   candidate. Rendering may bound detail without dropping the force decision.
+   reused as a report. CLOSED lane list [r2: 3]: branches =
+   pending-to-candidate equal-or-descendant; tags = exact; stash = exact;
+   HEAD = exact; ref scope = exact; index presence/content = exact
+   directional; complete op-state map = exact directional; canonical config =
+   exact directional. Tombstone fields are EXCLUDED from the report because
+   the normalizer carries them from P (174-I3) — they are never discarded.
+   Each lane is `subsumed`, `not-subsumed`, or `indeterminate`; a
+   pending-absent lane is vacuous; indeterminate evidence refuses. Rendering
+   may bound detail without dropping the force decision.
    Only lanes recorded by the confirmed intent are exempted from the
    supersession refusal. Every discarded incoming oid reachable locally
    receives take-theirs-grade preservation pins. The 174-I3 tombstone
@@ -95,8 +102,19 @@ transition 174-B already uses.
    worktree-ownership hold on the current checkout ref states the reason and
    retry condition in one sentence.
 
+### Eligibility
+keep-mine requires a REAL pending section. An apply-deferral-only record
+with no P is a typed `no-incoming` refusal with plain copy ("nothing is
+waiting to apply here — this hold clears on its own or names a different
+fix"). [r2: 4, option b — the simpler arm]
+
 ### Non-goals
-- No ref mutation, no working-file mutation, no stash mutation.
+- No USER-VISIBLE ref mutation, no working-file mutation, no stash mutation.
+  rbox-internal keep/pin refs (`refs/rbox-local/keep/*`) ARE created — the
+  take-theirs-grade preservation pins — and must be durably written,
+  fail-closed, BEFORE publication can commit; a failed publication may leave
+  harmless over-protective pins while intent and P remain byte-intact.
+  [r2: 5]
 - No change to automatic supersession (174-B) or its lanes.
 - Not a fleet-wide force: exactly one repo per invocation, token-confirmed.
 - 173 (two-writer spurious divergence) stays reserved.
@@ -129,7 +147,9 @@ transition 174-B already uses.
    never reshaped. Current consumers are explicitly pinned: follow and
    follow-matrix exact assertions, git-sync scheduling/concurrency parsers,
    sync-cmd routing, status parsers, doctor redaction, shared rig fixtures,
-   git-held-livelock, git-commit-propagation, and git-shapes.
+   git-held-livelock, git-commit-propagation, git-shapes, daemon-control
+   deferral collapse (its snapshot suite pins the shared line), and
+   git-entanglement. [r2: 7]
 
 ## 4. C — Held-skip eligibility defect (field: skippedHeld=0 on idle Mac)
 
@@ -157,8 +177,9 @@ daemon otherwise idle, the second held pull MUST report `skippedHeld>=1`.
    follower convergence and resolving-host refs/index/stash identity remain
    unchanged.
 2. A pre-ACK failure table covers capture, upload, 422, 409, state-save,
-   process crash, and daemon stop; every case leaves intent and P byte-intact,
-   and retry can publish normally.
+   process crash, and daemon stop; every case leaves intent, P, and every
+   OTHER pre-existing sidecar byte-identical (only idempotent rbox-internal
+   preservation pins may exist), and retry can publish normally. [r2: 1,5]
 3. Refused shapes and pre-probe refusals: BASE-present/pending-present/local-
    absent branch, reserved-173 non-FF-divergent remote, journal non-terminal,
    git-busy, in-progress operation, and contested checkout ref each produce a
