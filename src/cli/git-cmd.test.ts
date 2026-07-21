@@ -861,8 +861,9 @@ test("keep-mine previews despite breadcrumb op-state (ORIG_HEAD) but refuses in-
   await git(receiver, "fetch", "-q", sender, incomingTip);
   await git(receiver, "reset", "--hard", incomingTip);
   await git(receiver, "-c", "user.email=resolve@example.invalid", "-c", "user.name=resolve", "commit", "--allow-empty", "-qm", "keep local ahead");
-  // ORIG_HEAD (breadcrumb, design 126) exists from the reset — the preview must NOT refuse on it.
-  await expect(fs.access(path.join(receiver, ".git", "ORIG_HEAD"))).resolves.toBeUndefined();
+  // ORIG_HEAD (breadcrumb, design 126) — written explicitly so the fixture never
+  // depends on reset's environment-varying side effect (CI's git skipped it).
+  await fs.writeFile(path.join(receiver, ".git", "ORIG_HEAD"), `${incomingTip}\n`);
   cfg.git = { incremental: true };
   const previewLines: string[] = [];
   expect(await gitResolveCmd(root, receiver, "keep-mine", { json: true }, deps(previewLines))).toBe(1);
