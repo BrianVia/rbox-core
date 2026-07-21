@@ -571,6 +571,85 @@ test("typed divergence seam deferrals gate health even when local detail records
   expect(out.split("\n").filter((line) => line.includes("git deferred "))).toHaveLength(0);
 });
 
+test("human status quiets only transient deferrals younger than ten minutes while JSON retains every lane", async () => {
+  const young = new Date(NOW - 9 * 60_000).toISOString();
+  const boundary = new Date(NOW - 10 * 60_000).toISOString();
+  await saveStateUnsafeLegacyOrTest(root, {
+    stream: syncStreamId(cfg),
+    lastSyncedSequence: 7,
+    lastSyncedManifest: { generatedAt: new Date(NOW - 20_000).toISOString(), files: [] },
+    repoRecords: {
+      "young-transient": {
+        repoGen: 1,
+        sourceSeq: 7,
+        deferrals: { capture: { lane: "capture", reason: "local-commits", deferredSince: young, reasonSince: young, lastSeen: young } },
+      },
+      "boundary-transient": {
+        repoGen: 1,
+        sourceSeq: 7,
+        deferrals: { capture: { lane: "capture", reason: "local-commits", deferredSince: boundary, reasonSince: boundary, lastSeen: boundary } },
+      },
+      "young-durable": {
+        repoGen: 1,
+        sourceSeq: 7,
+        deferrals: { apply: { lane: "apply", reason: "conflict", deferredSince: young, reasonSince: young, lastSeen: young } },
+      },
+      mixed: {
+        repoGen: 1,
+        sourceSeq: 7,
+        deferrals: {
+          capture: { lane: "capture", reason: "local-commits", deferredSince: young, reasonSince: young, lastSeen: young },
+          apply: { lane: "apply", reason: "conflict", deferredSince: young, reasonSince: young, lastSeen: young },
+        },
+      },
+    },
+  });
+
+  const human = await captureStatus({ git: true });
+  expect(human).toContain("⚠ 3 git repos need attention");
+  expect(human).not.toContain("(young-transient)");
+  expect(human).toContain("(boundary-transient)");
+  expect(human).toContain("(young-durable)");
+  expect(human).toContain("(mixed)");
+
+  const json = JSON.parse(await captureStatus({ json: true }));
+  expect(json.git.deferrals.map((lane: { repo: string }) => lane.repo)).toEqual([
+    "boundary-transient",
+    "mixed",
+    "mixed",
+    "young-durable",
+    "young-transient",
+  ]);
+  expect(json.git.deferredRepos).toHaveLength(4);
+});
+
+test("human status shows conflict snapshots only when pruning is actionable while JSON always keeps counts", async () => {
+  cfg.syncGit = true;
+  await saveConfig(root, cfg);
+  const d = cleanScanDeps();
+  d.gitDivergenceStatus = async () => ({
+    count: 0,
+    deferrals: [],
+    configChecking: [],
+    configDisabled: [],
+    conflictSnapshots: { total: 1710, prunable: 0 },
+  });
+
+  expect(await captureStatusWithDeps({}, d)).not.toContain("conflict snapshots:");
+  expect(await captureStatusWithDeps({ verbose: true }, d)).not.toContain("conflict snapshots:");
+  expect(JSON.parse(await captureStatusWithDeps({ json: true }, d)).git.conflictSnapshots).toEqual({ total: 1710, prunable: 0 });
+
+  d.gitDivergenceStatus = async () => ({
+    count: 0,
+    deferrals: [],
+    configChecking: [],
+    configDisabled: [],
+    conflictSnapshots: { total: 1710, prunable: 12 },
+  });
+  expect(await captureStatusWithDeps({}, d)).toContain("conflict snapshots: 1710 (12 prunable)");
+  expect(await captureStatusWithDeps({ verbose: true }, d)).toContain("conflict snapshots: 1710 (12 prunable)");
+});
+
 test("status returns the effective daemon state in text and json modes", async () => {
   const d = cleanScanDeps();
   d.daemonBindingStatus = () => ({ alive: { running: true, pid: 1234, bootId: "boot_status" }, bound: cfg.remoteWorkspaceId, stale: false });
@@ -674,13 +753,13 @@ test("CLI dispatch rejects every conflicting presentation pair after boolean fla
   }
 });
 
-test("live daemon version skew is closed in text and JSON; stopped records are ignored", async () => {
+test("live daemon version is rendered and exact skew warning is closed in human and JSON output", async () => {
   const d = cleanScanDeps();
   d.daemonBindingStatus = () => ({ alive: { running: true, pid: 1234, bootId: "boot_status" }, bound: cfg.remoteWorkspaceId, stale: false });
   d.readDaemonPidRecord = () => ({ present: true });
   d.readAmbientDaemonStatusRecord = () => ({
     kind: "ok",
-    status: { schemaVersion: 1, daemonVersion: "1.6.1", state: "synced", heartbeatAt: new Date(NOW).toISOString(), sequence: 7, lastSyncedAt: null },
+    status: { schemaVersion: 1, daemonVersion: "1.7.17", state: "synced", heartbeatAt: new Date(NOW).toISOString(), sequence: 7, lastSyncedAt: null },
   });
   const logs: string[] = [];
   const oldLog = console.log;
@@ -690,10 +769,18 @@ test("live daemon version skew is closed in text and JSON; stopped records are i
   process.stdout.write = ((chunk: string | Uint8Array) => { stdout.push(String(chunk)); return true; }) as typeof process.stdout.write;
   try {
     await statusCmdWithDeps(root, { verbose: true }, d);
-    expect(logs.join("\n")).toContain("daemon v1.6.1, CLI v");
-    expect(logs.join("\n")).toContain("restart: rbox stop && rbox start");
+    expect(logs.join("\n")).toContain("background sync: running (v1.7.17) (pid 1234)");
+    expect(logs.join("\n")).toContain(`daemon is running v1.7.17 but this CLI is v${RBOX_VERSION} — restart to finish the upgrade: rbox stop && rbox start`);
     await statusCmdWithDeps(root, { json: true }, d);
-    expect(JSON.parse(stdout.at(-1)!)).toMatchObject({ daemon: { version: "1.6.1", versionSkew: true } });
+    expect(JSON.parse(stdout.at(-1)!)).toMatchObject({ daemon: { version: "1.7.17", cliVersion: RBOX_VERSION, versionSkew: true } });
+    d.readAmbientDaemonStatusRecord = () => ({
+      kind: "ok",
+      status: { schemaVersion: 1, daemonVersion: RBOX_VERSION, state: "synced", heartbeatAt: new Date(NOW).toISOString(), sequence: 7, lastSyncedAt: null },
+    });
+    logs.length = 0;
+    await statusCmdWithDeps(root, { verbose: true }, d);
+    expect(logs.join("\n")).toContain(`(v${RBOX_VERSION})`);
+    expect(logs.join("\n")).not.toContain("restart to finish the upgrade");
     d.daemonBindingStatus = () => ({ alive: { running: false }, stale: false });
     stdout.length = 0;
     await statusCmdWithDeps(root, { json: true }, d);
@@ -704,7 +791,7 @@ test("live daemon version skew is closed in text and JSON; stopped records are i
   }
 });
 
-test("live ambient record without daemonVersion renders pre-1.6.3 skew", async () => {
+test("live ambient record without daemonVersion is tolerated without display or warning", async () => {
   const d = cleanScanDeps();
   d.daemonBindingStatus = () => ({ alive: { running: true, pid: 1234 }, bound: cfg.remoteWorkspaceId, stale: false });
   d.readAmbientDaemonStatusRecord = () => ({
@@ -719,7 +806,9 @@ test("live ambient record without daemonVersion renders pre-1.6.3 skew", async (
   } finally {
     console.log = oldLog;
   }
-  expect(logs.join("\n")).toContain("daemon pre-1.6.3, CLI v");
+  expect(logs.join("\n")).toContain("background sync: running (pid 1234)");
+  expect(logs.join("\n")).not.toContain(" (v");
+  expect(logs.join("\n")).not.toContain("restart to finish the upgrade");
 });
 
 test("one repo with multiple lanes renders one repo-level line and count", async () => {

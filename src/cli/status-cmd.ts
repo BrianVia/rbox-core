@@ -29,6 +29,7 @@ import {
   type BriefAccountSummary,
   type BriefIdentitySource,
   type BriefStatusSnapshot,
+  type GitDeferralDisplayEntry,
   type StatusRemoteHead,
 } from "./status-view.js";
 import {
@@ -124,6 +125,24 @@ const defaultStatusDeps: StatusCmdDeps = {
 };
 
 const LOCAL_TRUST_MS = 60_000;
+const TRANSIENT_DEFERRAL_QUIET_MS = 10 * 60_000;
+
+function humanGitDeferralEntries<T extends GitDeferralDisplayEntry>(
+  entries: T[],
+  now: number,
+): T[] {
+  return entries.filter((entry) => {
+    const projected = projectGitDeferralRepos([entry], now)[0];
+    if (projected?.remediationClass !== "transient") return true;
+    const deferredAt = Date.parse(entry.deferral.deferredSince);
+    // Peer echoes on an actively committed repo arrive seconds behind local
+    // state and self-supersede on the next push. Showing those brief holds as
+    // attention trains users to ignore the banner or reach for take-theirs.
+    return !Number.isFinite(deferredAt)
+      || deferredAt > now
+      || now - deferredAt >= TRANSIENT_DEFERRAL_QUIET_MS;
+  });
+}
 
 async function cachedAccountSummary(
   loaded: CredentialLoadResult,
@@ -517,37 +536,33 @@ export async function statusCmdWithDeps(
   const gitDeferrals = localGitDeferrals(state);
   const projectedGitDeferrals = counts.gitDeferrals;
   const statusRecords = repoRecordsForState(state);
-  const projectedGitRepos = projectGitDeferralRepos(projectedGitDeferrals.map((deferral) => ({
+  const projectedGitEntries = projectedGitDeferrals.map((deferral) => ({
     repo: deferral.relPath,
     deferral,
     record: statusRecords[deferral.relPath],
-  })), now);
-  const localGitRepoProjections = projectGitDeferralRepos(gitDeferrals.map((deferral) => ({
+  }));
+  const localGitEntries = gitDeferrals.map((deferral) => ({
     repo: deferral.repo,
     deferral,
     record: statusRecords[deferral.repo],
-  })), now);
+  }));
+  const projectedGitRepos = projectGitDeferralRepos(projectedGitEntries, now);
+  const localGitRepoProjections = projectGitDeferralRepos(localGitEntries, now);
+  const humanProjectedGitRepos = projectGitDeferralRepos(humanGitDeferralEntries(projectedGitEntries, now), now);
+  const humanLocalGitRepoProjections = projectGitDeferralRepos(humanGitDeferralEntries(localGitEntries, now), now);
   const gitDeferredRepos = projectedGitRepos.length;
   const gitBytesChangedDeferrals = projectedGitRepos.filter((repo) => repo.bytesChanged).length;
-  const gitOldestDeferral = projectedGitRepos[0];
   const gitCapability: CheckoutTransactionCapability | undefined = projectedGitRepos.some((repo) => repo.displayReason === "unsupported")
     ? await (deps.checkoutTransactionCapability ?? checkoutTransactionCapability)(root)
     : undefined;
   let daemonVersion: string | undefined;
-  let daemonVersionKnown = false;
-  if (alive.running) {
+  if (bg.running) {
     const record = (deps.readAmbientDaemonStatusRecord ?? readAmbientDaemonStatusRecord)(root);
-    if (record.kind === "ok") {
-      if (record.status.daemonVersion === undefined) {
-        daemonVersion = "pre-1.6.3";
-        daemonVersionKnown = true;
-      } else if (validDaemonVersion(record.status.daemonVersion)) {
-        daemonVersion = record.status.daemonVersion;
-        daemonVersionKnown = true;
-      }
+    if (record.kind === "ok" && validDaemonVersion(record.status.daemonVersion)) {
+      daemonVersion = record.status.daemonVersion;
     }
   }
-  const daemonVersionSkew = daemonVersionKnown && daemonVersion !== RBOX_VERSION;
+  const daemonVersionSkew = daemonVersion !== undefined && daemonVersion !== RBOX_VERSION;
 
   if (opts.json) {
     const statusJson = {
@@ -658,14 +673,16 @@ export async function statusCmdWithDeps(
       behindRemote: briefBehindRemote(state.lastSyncedSequence, remote),
       ...(halt ? { halt } : {}),
       planQuota,
+      daemonVersion,
+      cliVersion: RBOX_VERSION,
       daemonVersionSkew,
       locking,
-      ...(projectedGitRepos.length > 0
+      ...(humanProjectedGitRepos.length > 0
         ? {
           git: {
-            count: projectedGitRepos.length,
-            oldestDeferredSince: projectedGitRepos[0]!.oldestDeferredSince,
-            allLocalEditDeferrals: projectedGitRepos.every((repo) => repo.displayReason === "local-edits"),
+            count: humanProjectedGitRepos.length,
+            oldestDeferredSince: humanProjectedGitRepos[0]!.oldestDeferredSince,
+            allLocalEditDeferrals: humanProjectedGitRepos.every((repo) => repo.displayReason === "local-edits"),
           },
         }
         : {}),
@@ -675,11 +692,11 @@ export async function statusCmdWithDeps(
     };
     const rendered = renderBriefStatus(brief);
     for (const line of rendered.lines) console.log(line);
-    if (counts.conflictSnapshots.total > 0) {
+    if (counts.conflictSnapshots.prunable > 0) {
       console.log(`  conflict snapshots: ${counts.conflictSnapshots.total} (${counts.conflictSnapshots.prunable} prunable)`);
     }
     if (opts.git) {
-      for (const deferral of projectedGitRepos) {
+      for (const deferral of humanProjectedGitRepos) {
         console.log(`  ${renderGitDeferralLine({
           relPath: deferral.repo,
           reason: deferral.displayReason,
@@ -708,10 +725,10 @@ export async function statusCmdWithDeps(
     changed: counts.changed,
     deleted: counts.deleted,
     gitChanged: counts.gitChanged,
-    gitDeferrals: gitDeferredRepos,
-    gitBytesChangedDeferrals,
-    gitOldestDeferral: gitOldestDeferral
-      ? { deferredSince: gitOldestDeferral.oldestDeferredSince, reason: gitOldestDeferral.displayReason }
+    gitDeferrals: humanProjectedGitRepos.length,
+    gitBytesChangedDeferrals: humanProjectedGitRepos.filter((repo) => repo.bytesChanged).length,
+    gitOldestDeferral: humanProjectedGitRepos[0]
+      ? { deferredSince: humanProjectedGitRepos[0].oldestDeferredSince, reason: humanProjectedGitRepos[0].displayReason }
       : undefined,
     trackedFiles: counts.trackedFiles,
     daemonRunning: bg.running,
@@ -741,13 +758,12 @@ export async function statusCmdWithDeps(
         : daemonStale
         ? style.yellow(`running but bound to a previous workspace (pid ${alive.pid}) — run \`rbox start\` to rebind`)
         : bg.running
-          ? style.green(`running (pid ${bg.pid})`)
+          ? style.green(`${daemonVersion === undefined ? "running" : `running (v${daemonVersion})`} (pid ${bg.pid})`)
           : style.yellow("stopped")
     }`
   );
   if (daemonVersionSkew) {
-    const daemonLabel = daemonVersion === "pre-1.6.3" ? daemonVersion : `v${daemonVersion}`;
-    console.log(`  ${style.yellow(`daemon ${daemonLabel}, CLI v${RBOX_VERSION} — restart: rbox stop && rbox start`)}`);
+    console.log(`  ${style.yellow(`daemon is running v${daemonVersion} but this CLI is v${RBOX_VERSION} — restart to finish the upgrade: rbox stop && rbox start`)}`);
   }
   console.log(`  ${style.dim("locking:")} ${locking.status === "ok"
     ? style.green("ok (.rbox/state/sync.lock)")
@@ -774,7 +790,7 @@ export async function statusCmdWithDeps(
     }
     if (pending) parts.push(style.yellow(`${pending} pending`));
     if (conflicts) parts.push(style.yellow(`${conflicts} conflict${conflicts === 1 ? "" : "s"}`));
-    if (projectedGitRepos.length) parts.push(style.yellow(`${projectedGitRepos.length} deferred`));
+    if (humanProjectedGitRepos.length) parts.push(style.yellow(`${humanProjectedGitRepos.length} deferred`));
     if (counts.gitConfigChecking?.length) {
       const names = counts.gitConfigChecking.filter((rel) => rel !== "*");
       parts.push(style.yellow(`config: checking${names.length ? ` (${names.join(", ")})` : ""}`));
@@ -783,10 +799,10 @@ export async function statusCmdWithDeps(
       parts.push(style.yellow(`config: disabled (${counts.gitConfigDisabled.map((issue) => `${issue.relPath}: ${issue.reason}`).join("; ")})`));
     }
     console.log(`  ${style.dim("git-sync:")} ${parts.join(" · ")}`);
-    if (counts.conflictSnapshots.total > 0) {
+    if (counts.conflictSnapshots.prunable > 0) {
       console.log(`  conflict snapshots: ${counts.conflictSnapshots.total} (${counts.conflictSnapshots.prunable} prunable)`);
     }
-    for (const deferral of localGitRepoProjections) {
+    for (const deferral of humanLocalGitRepoProjections) {
       console.log(`    ${renderGitDeferralLine({
         relPath: deferral.repo,
         reason: deferral.displayReason,
