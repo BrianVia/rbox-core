@@ -1,6 +1,6 @@
 # 174 — Apply-side performance: held-repo livelock, git-apply dark time, and pull/push tails
 
-Status: v5 — index-lane amendment (rig-found vacuity) UNDER FOCUSED REVIEW; v4 was ALIGNED 2026-07-21
+Status: ALIGNED v6 — v5 index-lane amendment folded per r4 focused review (4 findings, all accepted as prescribed); base ALIGNED v4 2026-07-21
 Author: Claude (session 2026-07-21), field evidence from the live fleet
 Relates: 172 (event-driven capture), 175 (ref side-channel), 130 (follow/ownership model),
 173 (reserved: two-writer spurious divergence — this doc's item B is the ONE-writer sibling)
@@ -329,17 +329,37 @@ iff every lane passes: [r1: C6,C7,O7,B4b]
 - `refs/stash` is exactly equal in `P` and `C`;
 - HEAD is exactly equal, both for symbolic and detached forms;
 - `refScope` is exactly equal;
-- the index lane is subsumed. AMENDED v5 (maiden rig run, 2026-07-21): exact
-  `indexIdentityV2` equality between `P` and `C` — the r1 rule — is VACUOUS for
-  the healing case: a writer that is ahead holds a clean index at its newer
-  tree, so equality can never hold and B never fires (rig-proven:
-  "final candidate did not supersede pending section" on the seeded wedge).
-  The sound rule: `P`'s index is subsumed iff it is CLEAN AGAINST ITS OWN
-  HEAD — `git diff-index --cached --quiet <P.mainOid>` with `GIT_INDEX_FILE`
-  pointing at `P`'s fetched index artifact (graphEnv; exit 0 = clean). A clean
-  pending index carries no information beyond `P`'s committed history, which
-  the branch lane has already proven subsumed. A DIRTY pending index (staged
-  uncommitted work unique to `P`) still blocks supersession; any error blocks.
+- the index lane is subsumed. AMENDED v6 (maiden rig run + r4 focused review,
+  2026-07-21): exact `indexIdentityV2` equality between `P` and `C` — the r1
+  rule — is VACUOUS for the healing case (rig-proven: an ahead writer's clean
+  index can never equal the stale pending's; "final candidate did not
+  supersede pending section" on the seeded wedge). The sound rule is
+  **clean-and-plain against `P`'s own head** [r4: 1,2,3]:
+  * `pendingHeadOid`: resolved from `P` ALONE after `validateGitSection(P)` —
+    detached `P.head` is the trimmed 40-hex value itself; symbolic `P.head`
+    parses the exact `refs/heads/…` target and reads `P.refs[target]`
+    (validation guarantees the key). Never live refs, never a hard-coded
+    `main`. Peel `${pendingHeadOid}^{commit}` under `graphEnv`; missing/
+    non-commit/unpeelable → block. [r4: 2]
+  * CLEAN: `git diff-index --cached --quiet <peeledPendingHead> --` with the
+    absolute `GIT_INDEX_FILE` at `P`'s materialized index artifact + graphEnv.
+    Exit 0 alone passes; exit 1 (dirty) blocks; ANY other status or thrown
+    error blocks. Artifact materialization must succeed and the fetched file
+    must be a regular file BEFORE Git runs — a nonexistent `GIT_INDEX_FILE`
+    reads as a new empty index and could false-pass on an empty tree. The
+    old `null === null` absent-lane equality does not survive; an absent
+    index lane on either side keeps the r1 exact-presence rule (both absent
+    → lane vacuously subsumed; one-sided absence → block). [r4: 3]
+  * PLAIN: reject any non-stage-0 entry, intent-to-add, assume-unchanged
+    (`CE_VALID`), skip-worktree, sparse-directory entry, or resolve-undo
+    data in `P`'s index — a tree-clean index can still carry these
+    index-only semantics, which design 116 counts as follower-visible state
+    (`indexIdentityV2` includes them; losing them is `local-index` data
+    loss). Reuse the existing index-identity parser to decide plain-ness —
+    no new index parsing. A metadata-preserving supersession may be designed
+    later; v6 blocks. [r4: 1]
+  A clean-and-plain pending index carries no information beyond `P`'s
+  committed history, which the branch lane has already proven subsumed.
   `C`'s own index needs no comparison — it is this writer's current truth,
   published as-is;
 - the complete op-state path→artifact map is exactly equal;
@@ -458,7 +478,9 @@ seeded by that data. Explicit non-goal here.
    the predecessor-bound apply deferral episode cleared, while an omitted
    prior branch and its origin remain retained in BASE; then follower
    convergence. Do not construct the fixture from the retracted seq-83
-   schema-bump narrative. [r1: C14; r2: 5]
+   schema-bump narrative. The fixture's local-ahead commit MUST change tree
+   content so `indexIdentityV2(P) !== indexIdentityV2(C)` is asserted — the
+   rig stays a direct v6 vacuity regression. [r1: C14; r2: 5; r4: 4]
 2. **A-skip correctness**: held repo (local-commits), unchanged keys →
    after the mandatory prepass (journal recovery, protocol/P settlement,
    partial revalidation — which MAY invoke git and MUST be asserted to have
@@ -473,6 +495,14 @@ seeded by that data. Explicit non-goal here.
 5. **B refuses partial subsumption**: pending contains branch X absent
    locally (or non-ff) → carry + hold persist exactly as today; pending
    with equal-oid refs everywhere → superseded.
+5b. **B index lane (v6, real artifacts)**: (a) P clean-and-plain at commit A,
+   C clean at fast-forward B, `indexIdentityV2` values asserted UNEQUAL →
+   supersession succeeds; (b) P with staged work relative to its head →
+   blocks; (c) tree-clean P carrying each of assume-unchanged, skip-worktree,
+   sparse-directory, and resolve-undo → blocks; (d) non-main symbolic head,
+   detached head, head unresolvable from P, and corrupt/missing index
+   artifact → blocks (never a false-pass via the empty-index read).
+   [r4: 1,2,3,4]
 6. **B tombstone retention**: three-device case where P alone carries a
    branch tombstone chain/generation and advertised lacks it → superseding
    normalization preserves the chain and high-water mark. [r1: C8,O1]
