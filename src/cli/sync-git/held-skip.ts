@@ -14,11 +14,13 @@ import {
   type TypedBlocker,
 } from "../config.js";
 import { carryRepoBaseProof, recordOriginLineage } from "./base-composer.js";
+import type { ComposeRepoBaseResult, RepoBaseLockedProof } from "./base-composer.js";
 import {
   GIT_FINGERPRINT_RACY_CLEAN_MARGIN_MS,
   GIT_FINGERPRINT_VERSION,
   gitFingerprint,
   gitFingerprintRun,
+  type GitFingerprint,
 } from "./fingerprint.js";
 
 const HELD_SKIP_SAFETY_FLOOR_MS = 60 * 60 * 1000;
@@ -34,11 +36,64 @@ export function sortedTypedBlockers(blockers: readonly TypedBlocker[]): TypedBlo
 
 export function heldBlockersAllowSkip(blockers: readonly TypedBlocker[]): boolean {
   return blockers.length > 0 && blockers.every((blocker) =>
-    blocker.reason === "local-commits" || blocker.reason === "local-stash");
+    blocker.reason === "local-commits" || blocker.reason === "local-stash" || blocker.reason === "local-index");
+}
+
+/**
+ * Convert a pending BASE-composer disposition into durable typed blockers while
+ * dropping only the synthetic blockers caused by the same allowlisted ref holds.
+ * The mapping is deliberately provenance/ref based: human text is never authority.
+ */
+export function blockersAfterComposer(input: {
+  classification: readonly TypedBlocker[];
+  disposition: ComposeRepoBaseResult["disposition"];
+  holds: readonly ComposeRepoBaseResult["holds"][number][];
+  checkoutComplete: RepoBaseLockedProof["checkoutComplete"];
+}): TypedBlocker[] {
+  const classification = sortedTypedBlockers(input.classification);
+  if (input.disposition !== "pending") return classification;
+
+  const allowlisted = heldBlockersAllowSkip(classification);
+  const causallyMapped = (hold: ComposeRepoBaseResult["holds"][number]): boolean =>
+    classification.some((blocker) => blocker.provenance === "ref-plane"
+      && blocker.ref === hold.ref
+      && ((blocker.reason === "local-commits" && hold.code === "missing-branch-proof")
+        || (blocker.reason === "local-stash" && hold.code === "missing-safe-ref-proof")));
+  const unmatchedHolds = allowlisted && input.checkoutComplete
+    ? input.holds.filter((hold) => !causallyMapped(hold))
+    : [...input.holds];
+  const composer: TypedBlocker[] = unmatchedHolds.map((hold) => ({
+    provenance: "composer",
+    reason: "artifact",
+    ref: hold.ref,
+    code: hold.code,
+    detail: `BASE composer hold ${hold.code} at ${hold.ref}`,
+  }));
+  if (!input.checkoutComplete) {
+    composer.push({
+      provenance: "composer",
+      reason: "artifact",
+      code: "checkout-incomplete",
+      detail: "BASE composer checkout proof is incomplete",
+    });
+  }
+  // A pending disposition with no concrete hold and no incomplete-checkout
+  // evidence must remain non-vacuously blocking rather than gaining eligibility.
+  if (composer.length === 0 && classification.length === 0) {
+    composer.push({
+      provenance: "composer",
+      reason: "artifact",
+      detail: "BASE composer retained an unexplained pending disposition",
+    });
+  }
+  return sortedTypedBlockers([...classification, ...composer]);
 }
 
 export interface HeldInputObservation {
   incomingKey: string;
+  effectiveBaseIndexProjection: string | null;
+  effectiveIncomingIndexProjection: string | null;
+  incomingIndexArtifactDescriptor: string;
   localFingerprint: string;
   fingerprintVersion: string;
   maxFingerprintTimestampMs: number;
@@ -60,14 +115,33 @@ export interface ObserveHeldInputsOptions {
   boundOrigins?: RepoRecord["branchBaseOrigins"];
   partial?: GitPartialApply;
   stateNonce: string;
+  /** The exact projections consumed by the classifier. Undefined is
+   * indeterminate; absence must be represented explicitly as null. */
+  effectiveBaseIndexProjection: string | null | undefined;
+  effectiveIncomingIndexProjection: string | null | undefined;
+  /** When supplied, this is the trusted edge immediately before classification. */
+  trustedFingerprint?: GitFingerprint;
   /** Exact paths consulted by the completed follow, or by the stored attempt on recheck. */
   reflogPaths: readonly string[];
+}
+
+export function incomingIndexArtifactDescriptor(incoming: GitSection): string {
+  return canonicalString(incoming.indexSha === undefined ? null : {
+    indexSha: incoming.indexSha,
+    indexEncSha: incoming.indexEncSha ?? null,
+    indexCipherSize: incoming.indexCipherSize ?? null,
+    indexComp: incoming.indexComp ?? null,
+    indexPayloadSha: incoming.indexPayloadSha ?? null,
+  });
 }
 
 /** Stable before/after bracket over every held-skip input. Any read/race fails open. */
 export async function observeHeldInputs(opts: ObserveHeldInputsOptions): Promise<HeldInputObservation | undefined> {
   try {
-    const before = await gitFingerprint(gitFingerprintRun("per-decision"), opts.root, opts.relPath);
+    if (opts.effectiveBaseIndexProjection === undefined || opts.effectiveIncomingIndexProjection === undefined) return undefined;
+    const before = opts.trustedFingerprint
+      ?? await gitFingerprint(gitFingerprintRun("per-decision"), opts.root, opts.relPath, { includeIndexDependencies: true });
+    if (!before.dependenciesComplete) return undefined;
     const ctx = before.diskCtx;
     if (!ctx) return undefined;
     const reflogs: Array<{ path: string; digest: string }> = [];
@@ -87,12 +161,15 @@ export async function observeHeldInputs(opts: ObserveHeldInputsOptions): Promise
       opts.boundOrigins ?? opts.record?.branchBaseOrigins ?? null,
     ])));
     const partialDisposition = canonicalString(opts.partial ?? null);
-    const after = await gitFingerprint(gitFingerprintRun("per-decision"), opts.root, opts.relPath);
-    if (before.hash !== after.hash || before.diskCtx?.kind !== after.diskCtx?.kind
+    const after = await gitFingerprint(gitFingerprintRun("per-decision"), opts.root, opts.relPath, { includeIndexDependencies: true });
+    if (!after.dependenciesComplete || before.hash !== after.hash || before.diskCtx?.kind !== after.diskCtx?.kind
       || before.diskCtx?.gitDir !== after.diskCtx?.gitDir
       || before.diskCtx?.commonDir !== after.diskCtx?.commonDir) return undefined;
     return {
       incomingKey: opts.incomingKey,
+      effectiveBaseIndexProjection: opts.effectiveBaseIndexProjection,
+      effectiveIncomingIndexProjection: opts.effectiveIncomingIndexProjection,
+      incomingIndexArtifactDescriptor: incomingIndexArtifactDescriptor(opts.incoming),
       localFingerprint: after.hash,
       fingerprintVersion: GIT_FINGERPRINT_VERSION,
       maxFingerprintTimestampMs: Math.max(before.maxTsMs, after.maxTsMs),
@@ -169,6 +246,11 @@ export async function rebindHeldAttemptsAfterSettlement(input: {
       record,
       partial: record.partial,
       stateNonce: expectedStateNonce(input.state),
+      effectiveBaseIndexProjection: record.idxProj
+        ?? (record.base?.indexSha === undefined ? null : undefined),
+      effectiveIncomingIndexProjection: incomingIndexArtifactDescriptor(incoming) === attempt.incomingIndexArtifactDescriptor
+        ? attempt.effectiveIncomingIndexProjection
+        : undefined,
       reflogPaths: attempt.reflogs.map((entry) => entry.path),
     });
     const { repoGen, attempt: _attempt, ...recordWithoutAttempt } = record;

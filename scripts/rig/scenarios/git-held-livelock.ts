@@ -14,9 +14,10 @@
  *   `local-commits` hold, pending set. That is the livelock precondition —
  *   pre-174 this repo re-follows at full cost on EVERY pull, forever.
  *
- *   ROUND skip (item A) — another notify pull on A while held: the pull summary
- *   must carry `skippedHeld=1` and the window must NOT contain a second
- *   `git-sync followed repo-174` (the re-follow is skipped, deferral retained).
+ *   ROUND skip (items A/176-C) — while A's daemon remains stopped, two explicit
+ *   pulls create and then revisit the hold. The second pull MUST carry a nonzero
+ *   `skippedHeld` and must not re-follow the repo. This is deliberately
+ *   non-opportunistic: no daemon push can heal P between the two pulls.
  *
  *   ROUND self-heal (item B) — A pushes: capture-then-prove-then-swap publishes
  *   A's truth, the accepted ACK emits the one bounded
@@ -161,44 +162,64 @@ export const gitHeldLivelock: Scenario = {
         await ctx.a.exec(["sh", "-c", detScript(ADVANCE_Y)]);
         headY = await gitHead(ctx.a, repoDir);
       });
-      const restartAt = Date.now();
-      await rec.step("[A] rbox start — pulls B's section, HOLDS (pending ⊑ local)", async () => {
-        await ctx.a.daemonStart(GUEST.workDir);
-        const out = await pollUntil({ probe: async () => heldRe.test(linesSince(await readLogs(ctx.a), restartAt)), done: (v) => v === true, timeoutMs: PROPAGATE_TIMEOUT_MS, intervalMs: HEAD_POLL_MS });
-        if (!out.ok) throw new Error(`A never held ${REPO} after restart — seed did not take`);
+      // The skip is only legal once the FILE plane has settled: the offline
+      // seed minted c.txt/d.txt that the daemon hasn't published yet, so the
+      // oracle reports local-edits/local-index — NON-allowlisted blockers that
+      // must never skip (the run-4 assertion failure was this fixture gap, not
+      // the fix). Push the file plane out first, then assert on git-only holds.
+      await rec.step("[A] file plane settles (push publishes offline files)", async () => {
+        const out = await pollUntil({ probe: async () => {
+          // Supersession OFF for the settle pushes: a default CLI push runs the
+          // full plan and heals the wedge before the skip is observable (run-6).
+          const push = await ctx.a.rboxShell(`cd '${GUEST.workDir}' && RBOX_GIT_PENDING_SUPERSEDE=0 bun ${GUEST.cliEntry} push`, { allowFail: true });
+          const pull = await ctx.a.rbox(["pull", "--verbose"], { cwd: GUEST.workDir, allowFail: true });
+          const text = pull.stdout + pull.stderr;
+          // Settled = the full follow's deferral names ONLY git-plane blockers,
+          // OR the pull already skips silently (v6 allowlist: a skipping pull
+          // prints no deferral line at all — that IS the hold working cheaply).
+          return (heldRe.test(text) && !/working tree differs/.test(text)) || skippedHeldRe.test(text);
+        }, done: (v) => v === true, timeoutMs: PROPAGATE_TIMEOUT_MS, intervalMs: HEAD_POLL_MS });
+        if (!out.ok) throw new Error("A's file plane never settled — oracle blockers persist");
+      });
+      await rec.step("[A] explicit pull while daemon idle — HOLDS (pending ⊑ local)", async () => {
+        const pull = await ctx.a.rbox(["pull", "--verbose"], { cwd: GUEST.workDir });
+        const firstHeldPull = pull.stdout + pull.stderr;
+        if (!heldRe.test(firstHeldPull) && !skippedHeldRe.test(firstHeldPull)) {
+          throw new Error(`A never held ${REPO} on the first idle pull — seed did not take`);
+        }
       });
       rec.assert("seed: A holds with local main untouched", (await gitHead(ctx.a, repoDir)) === headY,
         `A HEAD must remain Y (${headY.slice(0, 8)}) while the incoming section is held`);
 
       // ── ROUND skip (item A): a held pull skips the re-follow ──────────────
-      const skipAt = Date.now();
-      await rec.step("[B] unrelated change → A notify pull while held", async () => {
-        await ctx.b.exec(["sh", "-c", `printf 'ping\\n' > '${GUEST.workDir}/loose-174.txt'`]);
-        const out = await pollUntil({ probe: async () => /rbox pull /.test(linesSince(await readLogs(ctx.a), skipAt)), done: (v) => v === true, timeoutMs: PROPAGATE_TIMEOUT_MS, intervalMs: HEAD_POLL_MS });
-        if (!out.ok) throw new Error("A never pulled while held");
+      let skipWindow = "";
+      await rec.step("[A] second explicit pull while daemon idle — MUST skip held repo", async () => {
+        // Clear the fingerprint timestamp's conservative racy-clean margin while
+        // the stopped daemon guarantees no intervening push can consume P.
+        await new Promise((resolve) => setTimeout(resolve, 2_100));
+        // RBOX_METRICS=1: the skippedHeld token lives in the metrics summary
+        // line, which the rig's default injection (RBOX_METRICS=0) suppresses.
+        const pull = await ctx.a.rboxShell(`cd '${GUEST.workDir}' && RBOX_METRICS=1 RBOX_DEBUG=1 RBOX_GIT_PENDING_SUPERSEDE=0 bun ${GUEST.cliEntry} pull --verbose`);
+        skipWindow = pull.stdout + pull.stderr;
       });
-      // skippedHeld is OPPORTUNISTIC here: item B may heal on A's very first
-      // post-restart push, leaving no held pull to skip — the A-skip contract is
-      // suite-owned (held-skip tests); the rig only refuses a full RE-FOLLOW.
-      const skipWindow = linesSince(await readLogs(ctx.a), skipAt);
-      ctx.log(`  held-window skippedHeld observed: ${skippedHeldRe.test(skipWindow)}`);
+      rec.assert("held window: second idle pull reports skippedHeld>=1", skippedHeldRe.test(skipWindow),
+        `second pull must report a nonzero skippedHeld token; output: ${skipWindow.trim().slice(-800)}`);
       rec.assert("held window: no full re-follow of the held repo", !followedRe.test(skipWindow),
         `window must not contain 'git-sync followed ${REPO}' while held`);
 
       // ── ROUND self-heal (item B): supersession publishes A's truth ────────
-      // The heal is AUTONOMOUS: the daemon's own pull→push cycle supersedes within
-      // seconds of the hold (run-2 lesson: it beat the scripted nudge by 3s), so the
-      // watch window opens at RESTART, and the local change below is only a belt.
+      const healAt = Date.now();
       await rec.step("[A] capture-then-prove-then-swap supersedes (autonomous or nudged)", async () => {
         await ctx.a.exec(["sh", "-c", `printf 'heal\\n' > '${GUEST.workDir}/heal-174.txt'`]);
-        const out = await pollUntil({ probe: async () => supersededRe.test(linesSince(await readLogs(ctx.a), restartAt)), done: (v) => v === true, timeoutMs: PROPAGATE_TIMEOUT_MS, intervalMs: HEAD_POLL_MS });
+        await ctx.a.daemonStart(GUEST.workDir);
+        const out = await pollUntil({ probe: async () => supersededRe.test(linesSince(await readLogs(ctx.a), healAt)), done: (v) => v === true, timeoutMs: PROPAGATE_TIMEOUT_MS, intervalMs: HEAD_POLL_MS });
         if (!out.ok) throw new Error("A never logged the superseded-pending line");
       });
       await rec.step("[B] converges to Y", async () => {
         const out = await pollUntil({ probe: async () => (await gitHead(ctx.b, repoDir)) === headY, done: (v) => v === true, timeoutMs: PROPAGATE_TIMEOUT_MS, intervalMs: HEAD_POLL_MS });
         if (!out.ok) throw new Error(`B never reached Y (${headY.slice(0, 8)})`);
       });
-      const healWindowB = linesSince(await readLogs(ctx.b), restartAt);
+      const healWindowB = linesSince(await readLogs(ctx.b), healAt);
       rec.assert("heal: B followed the superseding section", followedRe.test(healWindowB),
         "B must follow repo-174 to Y via the ordinary path");
 

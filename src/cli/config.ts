@@ -277,11 +277,35 @@ export type TypedBlocker =
   | { provenance: "ref-plane"; reason: "local-commits" | "local-stash" | "worktree-ownership"; ref: string }
   | { provenance: "checkout" | "boundary"; reason: GitDeferralReason; detail?: string }
   | { provenance: "indeterminate"; reason: "unreadable" | "unsupported"; detail: string }
-  | { provenance: "protocol" | "composer"; reason: "artifact"; detail: string };
+  | { provenance: "protocol"; reason: "artifact"; detail: string }
+  | {
+      provenance: "composer";
+      reason: "artifact";
+      detail: string;
+      /** Present on design-176 attempts. Optional fields retain compatibility with
+       * attempts persisted by design 174's former aggregate composer blocker. */
+      ref?: string;
+      code?:
+        | "missing-branch-proof"
+        | "mismatched-branch-proof"
+        | "missing-safe-ref-proof"
+        | "mismatched-safe-ref-proof"
+        | "wrong-ref-class"
+        | "scope-refused"
+        | "manual-proof-mismatch"
+        | "p-repair-shape-mismatch"
+        | "checkout-incomplete";
+    };
 
 /** Local-only held-follow observation. This is never projected onto a manifest. */
 export interface GitHeldAttempt {
   incomingKey: string;
+  /** Exact effective semantic projections used by the persisted classifier;
+   * null means the corresponding section has no index artifact. */
+  effectiveBaseIndexProjection: string | null;
+  effectiveIncomingIndexProjection: string | null;
+  /** Canonical exact transport descriptor, including an explicit absent case. */
+  incomingIndexArtifactDescriptor: string;
   localFingerprint: string;
   fingerprintVersion: string;
   reflogs: Array<{ path: string; digest: string }>;
@@ -291,6 +315,46 @@ export interface GitHeldAttempt {
   baseOriginsHash: string;
   partialDisposition: string;
   at: string;
+}
+
+export type GitResolutionLaneDisposition = "subsumed" | "not-subsumed" | "indeterminate";
+
+/** Complete, privacy-bounded keep-mine confirmation binding. Hashes stand in for
+ * canonical config and repository identity bytes; every field is local-only. */
+export interface GitResolutionBinding {
+  stream: string;
+  stateNonce: string;
+  incomingKey: string;
+  repoGen: number;
+  refs: Array<[string, string]>;
+  reflogs: Array<[string, string[]]>;
+  head: string;
+  index: { kind: "absent" | "indeterminate" | "projected"; value?: string };
+  opState: Array<[string, string]>;
+  stash: string[];
+  oracleReceipt: string | null;
+  config: {
+    ownership: "owned" | "unowned" | "indeterminate";
+    read: "ok" | "over-bounds" | "failed" | "not-owned";
+    hash?: string;
+    detail?: string;
+    shape?: string;
+  };
+  effectiveRefScope: "all" | "scoped";
+  capturePolicy: { syncGit: boolean; respectGitignore: boolean; incremental?: boolean };
+  repoKind: "dir" | "pointer";
+  repositoryIdentity: string;
+}
+
+/** Single-use confirmation intent. The record generation is the predecessor
+ * generation: installing this sidecar is the sole transition to repoGen + 1. */
+export interface GitResolutionIntent {
+  v: 1;
+  verb: "keep-mine";
+  snapshot: string;
+  binding: GitResolutionBinding;
+  authorizedLanes: string[];
+  createdAt: string;
 }
 
 export interface RepoRecord {
@@ -317,6 +381,9 @@ export interface RepoRecord {
   partial?: GitPartialApply;
   /** Local-only design-174 held-follow observation; never wire-visible. */
   attempt?: GitHeldAttempt;
+  /** Local-only design-176 publish-my-work confirmation; consumed only by an
+   * accepted publisher ACK. */
+  resolutionIntent?: GitResolutionIntent;
   /** D4's projected-index cache; stored here so RepoRecord's shape lands once. */
   idxProj?: string;
 }

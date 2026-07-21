@@ -340,6 +340,7 @@ export interface GitDeferralRepoProjection {
   repairText: string;
   remediationClass: GitDeferralRemediationClass;
   canResolve: boolean;
+  canKeepMine: boolean;
   alsoDeferred?: string;
   bytesChanged: boolean;
   checkout?: GitDeferral["checkout"];
@@ -385,6 +386,7 @@ export function projectGitDeferralRepos(entries: Iterable<GitDeferralDisplayEntr
     const presentation = gitDeferralReasonPresentation(display.reason);
     const knownReason = isKnownGitDeferralReason(display.reason);
     const canResolve = knownReason && hasGitResolutionIncoming(record);
+    const canKeepMine = knownReason && Boolean(record?.pending);
     const remediationClass: GitDeferralRemediationClass = !knownReason
       ? "apply-unavailable"
       : presentation.transient
@@ -406,6 +408,7 @@ export function projectGitDeferralRepos(entries: Iterable<GitDeferralDisplayEntr
       repairText: presentation.repair,
       remediationClass,
       canResolve,
+      canKeepMine,
       ...(additional.length ? { alsoDeferred: `Also deferred: ${additional.join("; ")}.` } : {}),
       bytesChanged: lanes.some((lane) => lane.bytesChanged === true),
       ...(checkout === undefined ? {} : { checkout }),
@@ -438,6 +441,25 @@ export function renderGitDeferralLine(input: {
     ? `needs Git >= 2.46 transactional symref-update${input.capability.version ? `; found ${truncateDetail(input.capability.version)}` : `; ${input.capability.status}`}`
     : gitDeferralReasonText(input.reason);
   return `git deferred ${ageBucket(input.deferredSince, input.now)}: ${reason} on ${checkout} (${truncateDetail(input.relPath)})${changed}`;
+}
+
+/** Status-only explanation for the byte-frozen `git deferred` record above.
+ * This line is never written to daemon logs or diagnostics, so the parsers of
+ * the shared record keep their exact grammar and privacy boundary. */
+export function renderGitDeferralCompanion(input: {
+  reason: string;
+  canResolve: boolean;
+  canKeepMine: boolean;
+}): string {
+  const presentation = gitDeferralReasonPresentation(input.reason);
+  const reassurance = `Your repository is healthy; only rbox's bookkeeping is paused (${presentation.label}).`;
+  if (!input.canResolve) return `${reassurance} ${presentation.repair}`;
+  if (!input.canKeepMine) {
+    return `${reassurance} Nothing is waiting to publish with \`keep-mine\`; ` +
+      "`take-theirs` discards my local changes and follows the available incoming snapshot.";
+  }
+  return `${reassurance} To publish my work, run \`rbox git resolve <repo> keep-mine\`; ` +
+    "`take-theirs` discards my local changes and follows incoming.";
 }
 
 const ageLabel = (ageMs: number | undefined): string => {

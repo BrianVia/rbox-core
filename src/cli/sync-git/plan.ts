@@ -1,11 +1,13 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { GitCaptureDeferredError, artifactBinding, discoverGitRepos, gitIdentity, gitIdentityKey, gitPreflight, inTreeWorktreeParentRel, isGitBusy, isPresentButUnreadableError, gitSectionBlobRefs, readRepoIdentityV1, readStateLineageV1, repoCtxFromDisk, poolMap, type DiscoveredGitRepo, type GitRepoKind, type GitSection, type IgnoreMatcher, type RepoCtx } from "../../engine/index.js";
+import { GitCaptureDeferredError, artifactBinding, checkoutJournalDir, discoverGitRepos, gitIdentity, gitIdentityKey, gitPreflight, inTreeWorktreeParentRel, isGitBusy, isPresentButUnreadableError, gitSectionBlobRefs, oracleFromState, readRepoIdentityV1, readStateLineageV1, repoCtxFromDisk, poolMap, type DiscoveredGitRepo, type GitRepoKind, type GitSection, type IgnoreMatcher, type RepoCtx } from "../../engine/index.js";
+import { pinDisplaced } from "../../engine/git/keep-pins.js";
+import { git } from "../../engine/git/shared.js";
 import { type GitConfigRunner } from "../../engine/git/config-txn.js";
 import { expectedStateNonce, repoRecordsForState, type GitDeferralReason, type SyncState, type WorkspaceConfig } from "../config.js";
 import type { SyncRemote } from "../remote.js";
 import type { TransferProgress } from "../transfer-progress.js";
-import { GIT_CAPTURE_CONCURRENCY, configCredentialSkipLogged, configOwnershipSkipLogged, pendingCarryLogged, gitRepoCap, repoDirOf, carryMatrixMatches, emptyToUndef, errMsg, capturePlannedGitSection } from "./shared.js";
+import { GIT_CAPTURE_CONCURRENCY, configCredentialSkipLogged, configOwnershipSkipLogged, pendingCarryLogged, gitRepoCap, repoDirOf, carryMatrixMatches, emptyToUndef, errMsg, gitIncomingKey, capturePlannedGitSection } from "./shared.js";
 import { configReceiver, gitConfigHash, readLocalGitConfig, shouldPublishGitConfig, type LocalCfgRead } from "./config-lane.js";
 import { gitFingerprint, gitFingerprintRun } from "./fingerprint.js";
 import { loadGitDivergenceCache, saveGitDivergenceCache, fingerprintHitProbe, buildPlanProbe, writeDivergenceCacheEntry, isGitRepoKind, type FingerprintHitProbeResult, type DivergenceCacheProbeSnapshot, type DivergenceCacheWriteResult } from "./divergence-cache.js";
@@ -13,6 +15,7 @@ import { checkoutJournalBinding, quarantineUnboundFollowJournal, recoverAndLandF
 import { normalizeOutgoingGitSections, tombstoneFindingLine } from "./publisher-tombstones.js";
 import { gitPendingSupersedeEnabled, journalAllowsPendingSupersession, pendingSupersessionPreProbe, provePendingSupersession } from "./pending-supersession.js";
 import { CONFLICT_REF_PRUNE_LIMIT, pruneConflictRefs } from "./conflict-retention.js";
+import { discardedIncomingOids, finalResolutionReport, reportAuthorized, resolutionBindingIdentity } from "./resolution-intent.js";
 /** The outcome of push-side git orchestration: the outbound `gitRepos` map, whether it
  *  differs from what the last commit carried, the local-only state after this cycle
  *  (persisted only on a successful commit — recomputed idempotently otherwise), and
@@ -45,6 +48,8 @@ export interface GitPushPlan {
   carried: string[];
   /** Candidate-bound receipts consumed only by the accepted publisher ACK. */
   supersededPending: string[];
+  /** Design-176 intents whose exact final candidate passed its directional report. */
+  resolvedPending?: string[];
   /** Repos whose entire P-bound record is immutable before accepted ACK. */
   protectedPending: string[];
   deferred: Array<{ relPath: string; reason: string }>;
@@ -162,6 +167,8 @@ export async function planGitSections(
   };
   const pendingSupersessionCandidates = new Set<string>();
   const supersededPending = new Set<string>();
+  const resolutionIntentCandidates = new Set<string>();
+  const resolvedPending = new Set<string>();
   const stableCarryHygiene = new Set<string>();
   const cache = await loadGitDivergenceCache(root);
   const fingerprintRun = gitFingerprintRun("per-decision");
@@ -217,7 +224,7 @@ export async function planGitSections(
     for (const [relPath, record] of Object.entries(records)) {
       if (record.advertised) prev[relPath] = record.advertised;
     }
-    let changed = supersededPending.size > 0;
+    let changed = supersededPending.size > 0 || resolvedPending.size > 0;
     for (const k of new Set([...Object.keys(outgoing), ...Object.keys(prev)])) {
       if (!outgoing[k] || !prev[k] || (outgoing[k] !== prev[k] && JSON.stringify(outgoing[k]) !== JSON.stringify(prev[k]))) {
         changed = true;
@@ -243,6 +250,7 @@ export async function planGitSections(
       captured,
       carried,
       supersededPending: [...supersededPending].sort(),
+      resolvedPending: [...resolvedPending].sort(),
       protectedPending: Object.keys(pending).sort(),
       deferred,
       captureDeferrals,
@@ -271,14 +279,24 @@ export async function planGitSections(
     // propagates), and the local-only bookkeeping is abandoned with it — a surviving
     // pending entry would otherwise re-trigger the per-repo base restore every push
     // (changed forever → echo-commit loop).
+    const intentProtected = new Set(Object.entries(repoRecordsForState(state))
+      .filter(([, record]) => record.resolutionIntent !== undefined && record.pending !== undefined)
+      .map(([relPath]) => relPath));
     for (const k of new Set([...Object.keys(state.repoRecords ?? {}), ...Object.keys(base), ...Object.keys(pending)])) {
       captureObserved.add(k);
       configObserved.add(k);
+      if (intentProtected.has(k)) {
+        if (pending[k]) {
+          out[k] = pending[k]!;
+          carried.push(k);
+        }
+        continue;
+      }
       repoAbsent[k] = true;
     }
-    for (const k of Object.keys(pending)) delete pending[k];
-    for (const k of Object.keys(needsRes)) delete needsRes[k];
-    for (const k of Object.keys(removedMem)) delete removedMem[k];
+    for (const k of Object.keys(pending)) if (!intentProtected.has(k)) delete pending[k];
+    for (const k of Object.keys(needsRes)) if (!intentProtected.has(k)) delete needsRes[k];
+    for (const k of Object.keys(removedMem)) if (!intentProtected.has(k)) delete removedMem[k];
     return plan();
   }
   if (!cfg.kek) throw new Error("git-sync requires an encryption key (E2EE)"); // §28: artifacts are encrypted
@@ -303,6 +321,21 @@ export async function planGitSections(
   for (const rel of keys) {
     const repoDir = repoDirOf(root, rel);
     const ctx = await repoCtxFromDisk(repoDir).catch(() => undefined);
+    const recordBeforeRecovery = repoRecordsForState(state)[rel];
+    if (recordBeforeRecovery?.resolutionIntent && recordBeforeRecovery.pending) {
+      const journalPresent = await fs.lstat(checkoutJournalDir(root, rel)).then(
+        () => true,
+        (error: NodeJS.ErrnoException) => {
+          if (error.code === "ENOENT") return false;
+          throw error;
+        },
+      );
+      if (journalPresent) {
+        recoveryAllowsSupersession.set(rel, false);
+        recoveryBlocked.set(rel, "checkout journal must be recovered before keep-mine can publish");
+        continue;
+      }
+    }
     if (!ctx) {
       const recovery = await quarantineUnboundFollowJournal(root, rel, state.stream, expectedStateNonce(state));
       recoveryAllowsSupersession.set(rel, journalAllowsPendingSupersession(recovery.status));
@@ -370,12 +403,12 @@ export async function planGitSections(
     configObserved.add(rel);
     const diskCtx = knownCtx ?? (await repoCtxFromDisk(repoDirOf(root, rel)).catch(() => undefined));
     if (!diskCtx || diskCtx.kind !== "dir") {
-      logOnce(configOwnershipSkipLogged, rel, `git-sync config skipped ${rel}: local ${diskCtx?.kind ?? "unreadable"} shape does not own the common config`);
+      logOnce(configOwnershipSkipLogged, rel, `git-sync config skipped ${rel}: local ${diskCtx?.kind ?? "unreadable"} shape does not own the common config. rbox left shared Git settings alone; Git history can still sync.`);
       return;
     }
     const receiver = await configReceiver(root, diskCtx).catch(() => undefined);
     if (!receiver?.owned) {
-      logOnce(configOwnershipSkipLogged, rel, `git-sync config skipped ${rel}: local common config is outside workspace ownership`);
+      logOnce(configOwnershipSkipLogged, rel, `git-sync config skipped ${rel}: local common config is outside workspace ownership. rbox left shared Git settings alone; Git history can still sync.`);
       return;
     }
     const localCfg = bracketed ?? (await readConfigForPush(rel));
@@ -417,7 +450,7 @@ export async function planGitSections(
       logOnce(
         configOwnershipSkipLogged,
         rel,
-        `git-sync config skipped ${rel}: capture repository is ${diskCtx?.kind ?? "unreadable"}/scoped and does not own the common config`
+        `git-sync config skipped ${rel}: capture repository is ${diskCtx?.kind ?? "unreadable"}/scoped and does not own the common config. rbox left shared Git settings alone; Git history can still sync.`
       );
       const unowned = { ...section };
       delete unowned.config;
@@ -427,11 +460,11 @@ export async function planGitSections(
     try {
       receiver = await configReceiver(root, diskCtx);
     } catch (error) {
-      logOnce(configOwnershipSkipLogged, rel, `git-sync config skipped ${rel}: capture ownership could not be proven (${errMsg(error)})`);
+      logOnce(configOwnershipSkipLogged, rel, `git-sync config skipped ${rel}: capture ownership could not be proven (${errMsg(error)}). rbox left shared Git settings alone; Git history can still sync.`);
       return carryBaseConfig(section, undefined);
     }
     if (!receiver.owned) {
-      logOnce(configOwnershipSkipLogged, rel, `git-sync config skipped ${rel}: capture common config is outside workspace ownership`);
+      logOnce(configOwnershipSkipLogged, rel, `git-sync config skipped ${rel}: capture common config is outside workspace ownership. rbox left shared Git settings alone; Git history can still sync.`);
       return carryBaseConfig(section, undefined);
     }
 
@@ -492,7 +525,7 @@ export async function planGitSections(
     kind: GitRepoKind | undefined,
     baseSec: GitSection | undefined,
     fastLookup?: FingerprintHitProbeResult,
-    opts: { admissionAlreadyCounted?: boolean; forceCapture?: boolean } = {}
+    opts: { admissionAlreadyCounted?: boolean; forceCapture?: boolean; resolutionIntent?: boolean } = {}
   ): Promise<void> => {
     stats.spawnedRepos++;
     const probeBeforeFingerprint = fastLookup?.fingerprint ?? (await gitFingerprint(fingerprintRun, root, rel));
@@ -535,7 +568,7 @@ export async function planGitSections(
     // user worked there → re-adding is intentional; clear the memory and fall through.
     // An UNREADABLE leftover (dangling pointer, transient) keeps its guard and is
     // skipped — clearing on a transient would re-add unchanged git once it heals.
-    if (!baseSec && removedMem[rel] !== undefined) {
+    if (!baseSec && removedMem[rel] !== undefined && !opts.resolutionIntent) {
       const id = await gitIdentity(repoDirOf(root, rel));
       if (!id || gitIdentityKey(id) === removedMem[rel]) return;
       delete removedMem[rel];
@@ -543,7 +576,7 @@ export async function planGitSections(
 
     // needsResolution [v2, M2]: carry the checkpointed base until the local identity
     // CHANGES from the recorded conflict-time value (republish must be intentional).
-    if (needsRes[rel] !== undefined) {
+    if (needsRes[rel] !== undefined && !opts.resolutionIntent) {
       const id = await gitIdentity(repoDirOf(root, rel));
       if (gitIdentityKey(id) === needsRes[rel]) {
         const carry = pending[rel] ?? baseSec;
@@ -689,6 +722,57 @@ export async function planGitSections(
     // only admits a provisional candidate; final normalized-candidate proof below
     // decides whether publication is permitted.
     if (pend) {
+      const record = repoRecordsForState(state)[rel];
+      const intent = record?.resolutionIntent;
+      if (intent) {
+        if (options.degradedMutex) {
+          out[rel] = pend;
+          carried.push(rel);
+          deferred.push({ relPath: rel, reason: "workspace locking is degraded; keep-mine publication requires safe serialization" });
+          continue;
+        }
+        let bindingMatches = false;
+        try {
+          if (intent.v === 1 && intent.verb === "keep-mine"
+            && record.repoGen === intent.binding.repoGen + 1
+            && intent.binding.stream === state.stream
+            && intent.binding.stateNonce === expectedStateNonce(state)
+            && intent.binding.incomingKey === gitIncomingKey(pend)) {
+            const oracle = oracleFromState({ base: state.lastSyncedManifest, matcher, root });
+            const current = await resolutionBindingIdentity({
+              root,
+              rel,
+              ctx: await repoCtxFromDisk(repoDirOf(root, rel)).then((value) => {
+                if (!value) throw new Error("repository context unavailable");
+                return value;
+              }),
+              state,
+              // The install transition itself is not a bound-input race.
+              record: { ...record, repoGen: intent.binding.repoGen },
+              incoming: pend,
+              oracle,
+              cfg,
+              boundary: true,
+            });
+            bindingMatches = JSON.stringify(current) === JSON.stringify(intent.binding);
+          }
+        } catch {
+          bindingMatches = false;
+        }
+        if (!bindingMatches) {
+          out[rel] = pend;
+          carried.push(rel);
+          deferred.push({ relPath: rel, reason: "keep-mine snapshot changed; review the current repository and confirm again" });
+          continue;
+        }
+        resolutionIntentCandidates.add(rel);
+        await processRepoSlowPath(rel, kind, baseSec, undefined, {
+          forceCapture: true,
+          admissionAlreadyCounted: true,
+          resolutionIntent: true,
+        });
+        continue;
+      }
       // A baseless P can be composer-owned first-publication state. There is no
       // accepted predecessor for the ACK to advance, so recapturing it would only
       // manufacture echo commits. Fail closed and preserve it by identity.
@@ -704,7 +788,7 @@ export async function planGitSections(
         if (probe.busy) deferred.push({ relPath: rel, reason: probe.reason });
         // Field-forensics lesson (Mac wedge, 2026-07-21): a silent carry made the
         // no-heal diagnosis require SSH log archaeology. One bounded line per push.
-        else logOnce(pendingCarryLogged, rel, `git-sync pending carry ${rel}: ${probe.reason}`);
+        else logOnce(pendingCarryLogged, rel, `git-sync pending carry ${rel}: ${probe.reason}. Your local Git work is safe while rbox retries.`);
         continue;
       }
       pendingSupersessionCandidates.add(rel);
@@ -905,6 +989,73 @@ export async function planGitSections(
   const normalized = normalizeCurrentOutgoing();
   for (const { relPath, finding } of normalized.findings) glog(tombstoneFindingLine(relPath, finding));
   finalizedOutgoing = normalized.sections;
+  for (const rel of [...resolutionIntentCandidates].sort()) {
+    const record = repoRecordsForState(state)[rel];
+    const intent = record?.resolutionIntent;
+    const p = pending[rel];
+    const candidate = finalizedOutgoing[rel];
+    const ctx = await repoCtxFromDisk(repoDirOf(root, rel)).catch(() => undefined);
+    if (!intent || !p || !candidate || !ctx || !captured.includes(rel)) {
+      if (p) revertCapture(rel, p, "keep-mine capture did not produce a final candidate — intent and incoming state remain unchanged");
+      continue;
+    }
+    let postCaptureBindingMatches = false;
+    try {
+      const oracle = oracleFromState({ base: state.lastSyncedManifest, matcher, root });
+      const postCaptureBinding = await resolutionBindingIdentity({
+        root,
+        rel,
+        ctx,
+        state,
+        record: { ...record, repoGen: intent.binding.repoGen },
+        incoming: p,
+        oracle,
+        cfg,
+        boundary: true,
+      });
+      postCaptureBindingMatches = JSON.stringify(postCaptureBinding) === JSON.stringify(intent.binding);
+    } catch {
+      postCaptureBindingMatches = false;
+    }
+    if (!postCaptureBindingMatches) {
+      revertCapture(rel, p, "keep-mine snapshot changed during capture — intent and incoming state remain unchanged");
+      continue;
+    }
+    const report = await finalResolutionReport({ ctx, pending: p, candidate, store: api.blobStore(), kek });
+    if (!reportAuthorized(intent, report)) {
+      revertCapture(rel, p, report.lanes.some((lane) => lane.disposition === "indeterminate")
+        ? "keep-mine final discard report was indeterminate — intent and incoming state remain unchanged"
+        : "keep-mine final candidate would discard a lane that was not confirmed — review and confirm again");
+      continue;
+    }
+    let prePinBindingMatches = false;
+    try {
+      const oracle = oracleFromState({ base: state.lastSyncedManifest, matcher, root });
+      const prePinBinding = await resolutionBindingIdentity({
+        root, rel, ctx, state, record: { ...record, repoGen: intent.binding.repoGen }, incoming: p, oracle, cfg, boundary: true,
+      });
+      prePinBindingMatches = JSON.stringify(prePinBinding) === JSON.stringify(intent.binding);
+    } catch {
+      prePinBindingMatches = false;
+    }
+    if (!prePinBindingMatches) {
+      revertCapture(rel, p, "keep-mine snapshot changed during final reporting — intent and incoming state remain unchanged");
+      continue;
+    }
+    const reachable: string[] = [];
+    for (const oid of discardedIncomingOids(report)) {
+      if (await git(ctx.repoDir, ["cat-file", "-e", `${oid}^{object}`]).then(() => true, () => false)) reachable.push(oid);
+    }
+    if (reachable.length > 0) {
+      await pinDisplaced(ctx.repoDir, reachable, {
+        ref: `keep-mine:${rel}`,
+        episode: intent.snapshot,
+        time: (options.now?.() ?? new Date()).toISOString(),
+        class: "human",
+      });
+    }
+    resolvedPending.add(rel);
+  }
   for (const rel of [...pendingSupersessionCandidates].sort()) {
     const p = pending[rel];
     const candidate = finalizedOutgoing[rel];
@@ -923,7 +1074,9 @@ export async function planGitSections(
   // needs-resolution, policy, or failure carry never spends this authority.
   let conflictDeleteBudget = CONFLICT_REF_PRUNE_LIMIT;
   const cleanedCommonDirs = new Set<string>();
-  for (const rel of [...new Set([...stableCarryHygiene, ...captured])].sort()) {
+  for (const rel of [...new Set([...stableCarryHygiene, ...captured])]
+    .filter((candidate) => !resolutionIntentCandidates.has(candidate))
+    .sort()) {
     if (conflictDeleteBudget === 0) break;
     const ctx = await repoCtxFromDisk(repoDirOf(root, rel)).catch(() => undefined);
     if (!ctx) continue;

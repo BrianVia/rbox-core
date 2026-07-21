@@ -157,8 +157,9 @@ test("the full design-138 loadState caller inventory remains on the hard-refusal
     "ignore-cmd.ts": 1,
     "chain-repair.ts": 2,
     "daemon/daemon.ts": 1,
-    // Six direct reloads plus gitDeferralsCmd's dependency-injectable call.
-    "git-cmd.ts": 7,
+    // Seven direct reloads (including keep-mine's immediate pre-write reload)
+    // plus gitDeferralsCmd's dependency-injectable call.
+    "git-cmd.ts": 8,
   };
   const cli = path.dirname(new URL(import.meta.url).pathname);
   let total = 0;
@@ -169,7 +170,7 @@ test("the full design-138 loadState caller inventory remains on the hard-refusal
     expect(direct + injected, relative).toBe(expected);
     total += direct + injected;
   }
-  expect(total).toBe(19);
+  expect(total).toBe(20);
 });
 
 test("nonce advance after witness validation is a zero-reset-write barrier including Git refs", async () => {

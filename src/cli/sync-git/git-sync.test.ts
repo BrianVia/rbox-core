@@ -8,9 +8,10 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { pull, push, pushManifest, sync, type SyncDeps } from "../sync.js";
 import { loadState, repoRecordsForState, saveStateUnsafeLegacyOrTest, type RepoRecord, type SyncState, type WorkspaceConfig } from "../config.js";
+import { gitResolveCmd } from "../git-cmd.js";
 import { changedSidecarRepoKeys, orderedDeferralUpdates, type GitDeferralUpdates, type OrderedGitDeferralUpdates } from "../sync-state.js";
 import { BlobShaMismatchError, type CommitResult, type SyncRemote } from "../remote.js";
-import { buildIgnoreMatcher, captureGitState, gitIdentity, gitIdentityKey, gitPreflight, gitSectionBlobRefs, gitSectionNewestLink, MAX_PACK_CHAIN, scanManifest, setGitSpawnObserver, type BlobStore, type FileEntry, type GitSection, type Manifest } from "../../engine/index.js";
+import { buildIgnoreMatcher, captureGitState, checkoutJournalDir, gitIdentity, gitIdentityKey, gitPreflight, gitSectionBlobRefs, gitSectionNewestLink, MAX_PACK_CHAIN, scanManifest, setGitSpawnObserver, type BlobStore, type FileEntry, type GitSection, type Manifest } from "../../engine/index.js";
 import {
   MAX_GIT_CONFIG_KEYS,
   MAX_GIT_CONFIG_KEY_BYTES,
@@ -54,6 +55,7 @@ const sidecarSnapshot = (record: RepoRecord): string => JSON.stringify({
   partial: record.partial,
   attempt: record.attempt,
   deferrals: record.deferrals,
+  resolutionIntent: record.resolutionIntent,
 });
 
 test("D2 deferral writer preserves chronic age across newer incoming keys and resets reason age", () => {
@@ -1383,6 +1385,8 @@ async function prepareSupersedingPending(rel: string): Promise<{
   };
   record.attempt = {
     incomingKey: gitIncomingKey(pending), localFingerprint: "pre-ack", fingerprintVersion: GIT_FINGERPRINT_VERSION,
+    effectiveBaseIndexProjection: null, effectiveIncomingIndexProjection: null,
+    incomingIndexArtifactDescriptor: "null",
     reflogs: [], blockers: [{ provenance: "checkout", reason: "local-commits" }],
     repoIdentity: "pre-ack", stateNonce: state.stateNonce!, baseOriginsHash: "pre-ack",
     partialDisposition: "pre-ack", at: "2026-07-21T00:00:00.000Z",
@@ -1490,6 +1494,8 @@ test("design 174 B: real pending is superseded by an ahead main with exact off-b
   };
   pendingRecord.attempt = {
     incomingKey: gitIncomingKey(pending), localFingerprint: "pre-ack", fingerprintVersion: GIT_FINGERPRINT_VERSION,
+    effectiveBaseIndexProjection: null, effectiveIncomingIndexProjection: null,
+    incomingIndexArtifactDescriptor: "null",
     reflogs: [], blockers: [{ provenance: "checkout", reason: "local-commits" }],
     repoIdentity: "pre-ack", stateNonce: pendingState.stateNonce!, baseOriginsHash: "pre-ack",
     partialDisposition: "pre-ack", at: "2026-07-21T00:00:00.000Z",
@@ -1515,6 +1521,138 @@ test("design 174 B: real pending is superseded by an ahead main with exact off-b
   const c = path.join(rootC, rel);
   expect(await git(c, "rev-parse", "refs/heads/main")).toBe(await git(b, "rev-parse", "refs/heads/main"));
   expect(await git(c, "rev-parse", priorRef)).toBe(await git(b, "rev-parse", priorRef));
+}, 90_000);
+
+test("design 176: keep-mine intent survives a pre-ACK failure and accepted publisher ACK consumes it", async () => {
+  const rel = "keep-mine-e2e";
+  const { b } = await prepareSupersedingPending(rel);
+  const withDiscard = await st(rootB);
+  const pendingRecord = withDiscard.repoRecords![rel]!;
+  const discardedIncomingOid = pendingRecord.pending!.refs["refs/heads/main"]!;
+  pendingRecord.pending = {
+    ...pendingRecord.pending!,
+    refs: { ...pendingRecord.pending!.refs, "refs/tags/stale-incoming": discardedIncomingOid },
+    refTombstones: {
+      ...pendingRecord.pending!.refTombstones,
+      "refs/heads/retained-tombstone": [{ oid: discardedIncomingOid, ts: "2026-07-20T00:00:00.000Z", generation: 7 }],
+    },
+    refTombstoneGeneration: 7,
+  };
+  await saveStateUnsafeLegacyOrTest(rootB, withDiscard);
+  await fs.writeFile(path.join(b, "local-stash.txt"), "keep this stash\n");
+  await git(b, "stash", "push", "-u", "-m", "keep-mine local stash");
+  await fs.rm(path.join(b, ".git", "ORIG_HEAD"), { force: true });
+  const userRefsBefore = await git(b, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads", "refs/tags", "refs/stash");
+  const indexBefore = await fs.readFile(path.join(b, ".git", "index"));
+  const resolverDeps = {
+    build: async () => ({ cfg: cfgB, store: remote.blobStore() }),
+    capabilityProbe: async () => true,
+    now: () => new Date("2026-07-21T12:00:00.000Z"),
+  };
+  const previewLines: string[] = [];
+  expect(await gitResolveCmd(rootB, b, "keep-mine", { json: true, forceDiscardIncoming: true }, {
+    ...resolverDeps, stdout: (line) => previewLines.push(line), stderr: (line) => previewLines.push(line),
+  })).toBe(1);
+  const preview = JSON.parse(previewLines.at(-1)!);
+  expect(preview).toMatchObject({
+    status: "preview", verb: "keep-mine", current: { status: "show-me" },
+    confirm: { forceDiscardIncoming: true }, discardReport: { forceRequired: true },
+  });
+
+  const beforeConfirm = repoRecordsForState(await st(rootB))[rel]!;
+  const { repoGen: beforeGen, resolutionIntent: _beforeIntent, ...beforeOther } = beforeConfirm;
+  const confirmedLines: string[] = [];
+  expect(await gitResolveCmd(rootB, b, "keep-mine", {
+    json: true, confirm: preview.current.snapshot, forceDiscardIncoming: true,
+  }, {
+    ...resolverDeps, stdout: (line) => confirmedLines.push(line), stderr: (line) => confirmedLines.push(line),
+  })).toBe(0);
+  const intended = repoRecordsForState(await st(rootB))[rel]!;
+  const { repoGen: intendedGen, resolutionIntent, ...intendedOther } = intended;
+  expect(intendedGen).toBe(beforeGen + 1);
+  expect(intendedOther).toEqual(beforeOther);
+  expect(resolutionIntent).toMatchObject({ verb: "keep-mine", snapshot: preview.current.snapshot });
+  const preAckBytes = sidecarSnapshot(intended);
+
+  const degradedPlan = await planGitSections(
+    rootB, cfgB, await st(rootB), remote, new Set(), buildIgnoreMatcher(rootB), undefined, noBackoff,
+    { degradedMutex: true, disableConfigLane: true },
+  );
+  expect(degradedPlan.gitRepos?.[rel]).toEqual(intended.pending);
+  expect(degradedPlan.resolvedPending).not.toContain(rel);
+  expect(degradedPlan.deferred).toContainEqual({
+    relPath: rel,
+    reason: "workspace locking is degraded; keep-mine publication requires safe serialization",
+  });
+  expect(sidecarSnapshot(repoRecordsForState(await st(rootB))[rel]!)).toBe(preAckBytes);
+
+  const journalDir = checkoutJournalDir(rootB, rel);
+  await fs.mkdir(journalDir, { recursive: true });
+  await fs.writeFile(path.join(journalDir, "journal.json"), "{nonterminal\n");
+  const beforeJournalPush = remote.headSeq();
+  await push(rootB, cfgB, depsB);
+  expect(remote.headSeq()).toBe(beforeJournalPush);
+  expect(sidecarSnapshot(repoRecordsForState(await st(rootB))[rel]!)).toBe(preAckBytes);
+  expect(await fs.readFile(path.join(journalDir, "journal.json"), "utf8")).toBe("{nonterminal\n");
+  await fs.rm(journalDir, { recursive: true, force: true });
+
+  const conflictRef = "refs/rbox-conflict/0/pre-ack";
+  await git(b, "update-ref", conflictRef, discardedIncomingOid);
+
+  const busyLock = path.join(b, ".git", "index.lock");
+  await fs.writeFile(busyLock, "busy\n");
+  const beforeBusyPush = remote.headSeq();
+  await push(rootB, cfgB, depsB);
+  expect(remote.headSeq()).toBe(beforeBusyPush);
+  expect(sidecarSnapshot(repoRecordsForState(await st(rootB))[rel]!)).toBe(preAckBytes);
+  await fs.rm(busyLock);
+
+  remote.failNextGitPut = true;
+  await push(rootB, cfgB, depsB);
+  expect(sidecarSnapshot(repoRecordsForState(await st(rootB))[rel]!)).toBe(preAckBytes);
+  expect(await git(b, "rev-parse", conflictRef)).toBe(discardedIncomingOid);
+
+  const realCommit = remote.commit.bind(remote);
+  remote.commit = async () => ({ conflict: true, head: remote.headSeq() });
+  await expect(push(rootB, cfgB, { ...depsB, backoff: async () => { throw new Error("stop after 409"); } })).rejects.toThrow(/stop after 409/);
+  expect(sidecarSnapshot(repoRecordsForState(await st(rootB))[rel]!)).toBe(preAckBytes);
+
+  remote.commit = async () => ({ unsatisfiedBlobs: ["f".repeat(64)] });
+  await expect(push(rootB, cfgB, depsB)).rejects.toThrow(/keeps reporting missing blobs/);
+  expect(sidecarSnapshot(repoRecordsForState(await st(rootB))[rel]!)).toBe(preAckBytes);
+  remote.commit = realCommit;
+
+  remote.commit = async () => { throw new Error("keep-mine transport failed before ACK"); };
+  await expect(push(rootB, cfgB, depsB)).rejects.toThrow(/before ACK/);
+  expect(sidecarSnapshot(repoRecordsForState(await st(rootB))[rel]!)).toBe(preAckBytes);
+  expect(await git(b, "rev-parse", `refs/rbox-local/keep/${discardedIncomingOid}`)).toBe(discardedIncomingOid);
+  remote.commit = realCommit;
+
+  const beforeSeq = remote.headSeq();
+  await push(rootB, cfgB, depsB);
+  expect(remote.headSeq()).toBe(beforeSeq + 1);
+  const acked = repoRecordsForState(await st(rootB))[rel]!;
+  expect(acked.pending).toBeUndefined();
+  expect(acked.partial).toBeUndefined();
+  expect(acked.attempt).toBeUndefined();
+  expect(acked.deferrals?.apply).toBeUndefined();
+  expect(acked.resolutionIntent).toBeUndefined();
+  expect(acked.base?.refs["refs/heads/main"]).toBe(await git(b, "rev-parse", "refs/heads/main"));
+  expect(acked.base?.refTombstones?.["refs/heads/retained-tombstone"]).toEqual([
+    { oid: discardedIncomingOid, ts: "2026-07-20T00:00:00.000Z", generation: 7 },
+  ]);
+  expect(acked.base?.refTombstoneGeneration).toBe(7);
+  expect(await git(b, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads", "refs/tags", "refs/stash")).toBe(userRefsBefore);
+  expect(await fs.readFile(path.join(b, ".git", "index"))).toEqual(indexBefore);
+
+  const rootC = path.join(tmp, "keep-mine-follower");
+  await fs.mkdir(path.join(rootC, ".rbox", "state"), { recursive: true });
+  const cfgC: WorkspaceConfig = { ...cfgB, rootPath: rootC, deviceId: "devC-keep-mine" };
+  await pull(rootC, cfgC, { remote, backoff: noBackoff, onGitLog: () => {} });
+  const follower = path.join(rootC, rel);
+  expect(await git(follower, "rev-parse", "refs/heads/main")).toBe(await git(b, "rev-parse", "refs/heads/main"));
+  expect(await git(follower, "rev-parse", "refs/stash")).toBe(await git(b, "rev-parse", "refs/stash"));
+  await expect(git(follower, "rev-parse", "refs/tags/stale-incoming")).rejects.toThrow();
 }, 90_000);
 
 test("D2 apply deferral keeps chronic age across newer truth and resets reason age", async () => {

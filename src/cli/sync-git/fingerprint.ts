@@ -3,8 +3,9 @@ import path from "node:path";
 import { hashBytes, repoCtxFromDisk, type RepoCtx } from "../../engine/index.js";
 import { OP_STATE_DIRS, OP_STATE_FILES } from "../../engine/manifest-validate.js";
 import { MAX_GIT_CONFIG_KEYS, MAX_GIT_CONFIG_KEY_BYTES, MAX_GIT_CONFIG_SERIALIZED_BYTES, MAX_GIT_CONFIG_VALUE_BYTES } from "../../engine/git/config-sync.js";
+import { git } from "../../engine/git/shared.js";
 import { repoDirOf } from "./shared.js";
-export const GIT_FINGERPRINT_SCHEMA_VERSION = 5;
+export const GIT_FINGERPRINT_SCHEMA_VERSION = 6;
 export interface GitConfigWireBounds {
   maxKeys: number;
   maxSerializedBytes: number;
@@ -44,6 +45,9 @@ export const GIT_FINGERPRINT_RACY_CLEAN_MARGIN_MS = 2000;
 export interface GitFingerprint {
   hash: string;
   maxTsMs: number;
+  /** False means a semantic index dependency could not be enumerated. Held-skip
+   * decisions must fail open instead of trusting the hash in that case. */
+  dependenciesComplete: boolean;
   diskCtx?: RepoCtx;
 }
 
@@ -128,6 +132,30 @@ async function indexToken(abs: string): Promise<IndexToken> {
   return { exists: true, type, mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs, size: st.size };
 }
 
+type SharedIndexToken =
+  | { enumerable: false }
+  | { enumerable: true; referenced: false }
+  | { enumerable: true; referenced: true; name: string; token: IndexToken };
+
+/** Ask Git for the exact split-index dependency rather than globbing every
+ * sharedindex.* sibling. An unparseable answer is an incomplete fingerprint,
+ * never evidence for a held-skip hit. */
+async function sharedIndexToken(repoDir: string, gitDir: string): Promise<SharedIndexToken> {
+  let raw: string;
+  try {
+    raw = await git(repoDir, ["rev-parse", "--path-format=absolute", "--shared-index-path"]);
+  } catch {
+    return { enumerable: false };
+  }
+  if (raw === "") return { enumerable: true, referenced: false };
+  const absolute = path.resolve(repoDir, raw);
+  const name = path.basename(absolute);
+  if (path.dirname(absolute) !== path.resolve(gitDir) || !/^sharedindex\.[0-9a-f]+$/.test(name)) {
+    return { enumerable: false };
+  }
+  return { enumerable: true, referenced: true, name, token: await indexToken(absolute) };
+}
+
 async function dotGitToken(abs: string, diskCtx: RepoCtx | undefined): Promise<DotGitToken> {
   const st = await fs.lstat(abs).catch(() => undefined);
   if (!st) return { exists: false };
@@ -202,7 +230,7 @@ async function opStateFingerprint(gitDir: string): Promise<unknown> {
 }
 
 async function commonDirFingerprint(ctx: RepoCtx): Promise<unknown> {
-  const [shallow, alternates, config, modules, worktrees, gcPid, packedRefs, packedRefsLock, refs] = await Promise.all([
+  const [shallow, alternates, config, modules, worktrees, gcPid, packedRefs, packedRefsLock, refs, reflogs] = await Promise.all([
     statToken(path.join(ctx.commonDir, "shallow")),
     statToken(path.join(ctx.commonDir, "objects", "info", "alternates")),
     statToken(path.join(ctx.commonDir, "config")),
@@ -212,6 +240,7 @@ async function commonDirFingerprint(ctx: RepoCtx): Promise<unknown> {
     statToken(path.join(ctx.commonDir, "packed-refs"), { hashFileMaxBytes: PACKED_REFS_HASH_MAX_BYTES }),
     statToken(path.join(ctx.commonDir, "packed-refs.lock")),
     statTree(path.join(ctx.commonDir, "refs"), "", { hashFileMaxBytes: LOOSE_REF_HASH_MAX_BYTES }),
+    statTree(path.join(ctx.commonDir, "logs", "refs"), "", { hashFileMaxBytes: LOOSE_REF_HASH_MAX_BYTES }),
   ]);
   return {
     shallow,
@@ -223,6 +252,7 @@ async function commonDirFingerprint(ctx: RepoCtx): Promise<unknown> {
     packedRefs,
     packedRefsLock,
     refs,
+    reflogs,
   };
 }
 
@@ -265,34 +295,52 @@ function maxFingerprintTimestampMs(v: unknown): number {
   visit(v);
   return max;
 }
-async function gitDirFingerprint(gitDir: string): Promise<unknown> {
-  const [head, index, indexLock, headLock, configWorktree, opState] = await Promise.all([
+async function gitDirFingerprint(
+  repoDir: string,
+  gitDir: string,
+  includeIndexDependencies: boolean,
+): Promise<{ value: unknown; dependenciesComplete: boolean }> {
+  const [head, index, sharedIndex, indexLock, headLock, configWorktree, opState] = await Promise.all([
     statToken(path.join(gitDir, "HEAD"), { hashFileMaxBytes: LOOSE_REF_HASH_MAX_BYTES }),
     indexToken(path.join(gitDir, "index")),
+    includeIndexDependencies ? sharedIndexToken(repoDir, gitDir) : Promise.resolve(undefined),
     statToken(path.join(gitDir, "index.lock")),
     statToken(path.join(gitDir, "HEAD.lock")),
     statToken(path.join(gitDir, "config.worktree")),
     opStateFingerprint(gitDir),
   ]);
-  return { head, index, indexLock, headLock, configWorktree, opState };
+  return {
+    value: { head, index, sharedIndex, indexLock, headLock, configWorktree, opState },
+    dependenciesComplete: sharedIndex?.enumerable ?? true,
+  };
 }
 
-export async function gitFingerprint(run: GitFingerprintRun, root: string, rel: string): Promise<GitFingerprint> {
+export async function gitFingerprint(
+  run: GitFingerprintRun,
+  root: string,
+  rel: string,
+  opts: { includeIndexDependencies?: boolean } = {},
+): Promise<GitFingerprint> {
   beginFingerprintDecision(run, rel);
   const repoDir = repoDirOf(root, rel);
   const dotGit = path.join(repoDir, ".git");
   const diskCtx = await repoCtxFromDisk(repoDir).catch(() => undefined);
-  const [dotGitPart, gitDirPart, commonDirPart] = await Promise.all([
+  const [dotGitPart, gitDirResult, commonDirPart] = await Promise.all([
     dotGitToken(dotGit, diskCtx),
-    diskCtx ? gitDirFingerprint(diskCtx.gitDir) : Promise.resolve(null),
+    diskCtx ? gitDirFingerprint(repoDir, diskCtx.gitDir, opts.includeIndexDependencies === true) : Promise.resolve({ value: null, dependenciesComplete: true }),
     diskCtx ? memoizedCommonDirFingerprint(run, diskCtx) : Promise.resolve(null),
   ]);
   const parts = {
     version: GIT_FINGERPRINT_VERSION,
     dotGit: dotGitPart,
     ctx: diskCtx ? { kind: diskCtx.kind, gitDir: diskCtx.gitDir, commonDir: diskCtx.commonDir } : null,
-    gitDir: gitDirPart,
+    gitDir: gitDirResult.value,
     commonDir: commonDirPart,
   };
-  return { hash: hashBytes(Buffer.from(JSON.stringify(parts))), maxTsMs: maxFingerprintTimestampMs(parts), diskCtx };
+  return {
+    hash: hashBytes(Buffer.from(JSON.stringify(parts))),
+    maxTsMs: maxFingerprintTimestampMs(parts),
+    dependenciesComplete: gitDirResult.dependenciesComplete,
+    diskCtx,
+  };
 }
