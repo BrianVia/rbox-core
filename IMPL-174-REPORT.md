@@ -120,3 +120,26 @@ QUALITY-COMPLETE
   explicit-only).
 - Gates (native): typecheck 0; cli+engine 2636/0 across 217 files; API green.
 IMPL2-COMPLETE
+
+## Index-lane v6
+
+- Replaced pending/candidate `indexIdentityV2` equality with the amended v6
+  presence rule and a proof over the pending index alone: both lanes absent are
+  subsumed, one-sided absence blocks, and two present lanes require P to be
+  clean-and-plain against its own exact HEAD.
+- Resolve P's detached or symbolic HEAD exclusively from the validated pending
+  section, peel it under the literal graph environment, materialize and verify
+  P's artifact as a regular file, and accept only a zero exit from
+  `diff-index --cached --quiet` against that peeled commit.
+- Reused `indexIdentityV2` for plainness by comparing P with a fresh, explicitly
+  non-sparse `read-tree` index for the peeled commit. No candidate-index read or
+  new index parser was added.
+- Added real encrypted index-artifact coverage for §5 test 5b(a)-(d): unequal
+  clean fast-forward indexes, staged work, assume-unchanged, skip-worktree,
+  sparse-directory, resolve-undo, non-main symbolic and detached HEADs,
+  unresolvable HEADs, corrupt/missing artifacts, and both/one-sided absence.
+- Acceptance passed: `bun run typecheck`; `bun test src/cli/sync-git` (419
+  passed, 6 skipped, 0 failed); `bun test src/cli src/engine` (2,628 passed,
+  16 skipped, 0 failed).
+
+V6-COMPLETE

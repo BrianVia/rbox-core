@@ -12,7 +12,7 @@ import {
   type JournalRecoveryResult,
 } from "../../engine/index.js";
 import { canonicalString } from "../../engine/e2ee/index.js";
-import { getGitArtifact, git, type RepoCtx } from "../../engine/git/shared.js";
+import { getGitArtifact, git, headBranchOf, type RepoCtx } from "../../engine/git/shared.js";
 import { graphEnv } from "../../engine/git/reachability.js";
 import { validateCanonicalGitConfig } from "../../engine/git/config-sync.js";
 import { gitFingerprint, gitFingerprintRun } from "./fingerprint.js";
@@ -98,22 +98,41 @@ function exactCanonicalConfig(a: GitSection["config"], b: GitSection["config"]):
   return av.ok && bv.ok && canonicalString(av.config) === canonicalString(bv.config);
 }
 
-async function semanticIndex(
+async function pendingIndexIsCleanAndPlain(
   ctx: RepoCtx,
   section: GitSection,
   store: BlobStore,
   kek: Buffer,
-  label: string,
-): Promise<string | null> {
+): Promise<boolean> {
   const artifact = indexArtifact(section, { strict: true });
-  if (!artifact) return null;
-  const tmpDir = await fs.mkdtemp(path.join(ctx.gitDir, `.rbox-supersession-${label}-`));
+  if (!artifact) return false;
+  const tmpDir = await fs.mkdtemp(path.join(ctx.gitDir, ".rbox-supersession-index-"));
   try {
     const indexPath = path.join(tmpDir, "index");
     await getGitArtifact(store, kek, artifact, indexPath, tmpDir);
-    const projection = await indexIdentityV2(ctx.repoDir, indexPath);
-    if (projection === undefined) throw new Error("semantic index proof failed");
-    return projection;
+    if (!(await fs.lstat(indexPath)).isFile()) return false;
+
+    const headBranch = headBranchOf(section.head);
+    const pendingHeadOid = headBranch ? section.refs[headBranch] : section.head.trim();
+    if (!pendingHeadOid) return false;
+    const peeledPendingHead = await git(ctx.repoDir, ["rev-parse", "--verify", `${pendingHeadOid}^{commit}`], { env: graphEnv });
+    const indexEnv = { ...graphEnv, GIT_INDEX_FILE: path.resolve(indexPath) };
+    await git(ctx.repoDir, ["diff-index", "--cached", "--quiet", peeledPendingHead, "--"], { env: indexEnv });
+
+    const plainIndexPath = path.join(tmpDir, "plain-index");
+    await git(ctx.repoDir, [
+      "-c", "core.sparseCheckout=false",
+      "-c", "core.sparseCheckoutCone=false",
+      "-c", "index.sparse=false",
+      "read-tree", peeledPendingHead,
+    ], {
+      env: { ...graphEnv, GIT_INDEX_FILE: path.resolve(plainIndexPath) },
+    });
+    const [pendingProjection, plainProjection] = await Promise.all([
+      indexIdentityV2(ctx.repoDir, indexPath),
+      indexIdentityV2(ctx.repoDir, plainIndexPath),
+    ]);
+    return pendingProjection !== undefined && pendingProjection === plainProjection;
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   }
@@ -162,11 +181,10 @@ export async function provePendingSupersession(input: {
     }));
     if (refProofs.some((proven) => !proven)) return false;
     if ((input.pending.refs["refs/stash"] ?? null) !== (input.candidate.refs["refs/stash"] ?? null)) return false;
-    const [pendingIndex, candidateIndex] = await Promise.all([
-      semanticIndex(input.ctx, input.pending, input.store, input.kek, "pending"),
-      semanticIndex(input.ctx, input.candidate, input.store, input.kek, "candidate"),
-    ]);
-    return pendingIndex === candidateIndex;
+    const pendingIndex = indexArtifact(input.pending, { strict: true });
+    const candidateIndex = indexArtifact(input.candidate, { strict: true });
+    if (!pendingIndex || !candidateIndex) return pendingIndex === undefined && candidateIndex === undefined;
+    return await pendingIndexIsCleanAndPlain(input.ctx, input.pending, input.store, input.kek);
   } catch {
     return false;
   }

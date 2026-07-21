@@ -9,6 +9,7 @@ import {
   SERVER_CORPUS_BUCKETS,
   SERVER_GIT_DEFERRAL_REASONS,
   SERVER_SYNC_STATE_NUMERIC_DOMAINS,
+  SERVER_SYNC_PHASE_NAMES,
   SERVER_TELEMETRY_SAMPLE_SCHEMAS,
   TELEMETRY_BATCH_CAP as SERVER_TELEMETRY_BATCH_CAP,
 } from "../src/telemetry-ingest.js";
@@ -17,6 +18,7 @@ import {
   BINDING_ID_RE,
   GIT_DEFERRAL_REASONS,
   SYNC_STATE_NUMERIC_DOMAINS,
+  SYNC_PHASE_NAMES,
   TELEMETRY_BATCH_CAP,
   TELEMETRY_SAMPLE_SCHEMAS,
 } from "../../../src/cli/telemetry/contract.js";
@@ -63,6 +65,8 @@ describe("telemetry contract drift guard", () => {
     const serverShape = Object.fromEntries(Object.entries(SERVER_TELEMETRY_SAMPLE_SCHEMAS).map(([kind, schema]) => [kind, {
       numbers: Object.fromEntries(schema.numbers.map(({ field, ...domain }) => [field, domain])),
       enums: Object.fromEntries(schema.enums.map(({ field, values }) => [field, values])),
+      ...(schema.optionalNumbers ? { optionalNumbers: Object.fromEntries(schema.optionalNumbers.map(({ field, ...domain }) => [field, domain])) } : {}),
+      ...(schema.numericRecords ? { numericRecords: Object.fromEntries(schema.numericRecords.map(({ field, keys, domain }) => [field, { keys, domain }])) } : {}),
     }]));
     expect(serverShape).toEqual(TELEMETRY_SAMPLE_SCHEMAS);
     expect(Object.keys(SERVER_TELEMETRY_SAMPLE_SCHEMAS)).toEqual(Object.keys(TELEMETRY_SAMPLE_SCHEMAS));
@@ -70,7 +74,10 @@ describe("telemetry contract drift guard", () => {
       const clientSchema = TELEMETRY_SAMPLE_SCHEMAS[kind as keyof typeof TELEMETRY_SAMPLE_SCHEMAS];
       expect(serverSchema.numbers.map(({ field }) => field), `${kind} number field order`).toEqual(Object.keys(clientSchema.numbers));
       expect(serverSchema.enums.map(({ field }) => field), `${kind} enum field order`).toEqual(Object.keys(clientSchema.enums));
+      expect((serverSchema.optionalNumbers ?? []).map(({ field }) => field), `${kind} optional number field order`).toEqual(Object.keys("optionalNumbers" in clientSchema ? clientSchema.optionalNumbers : {}));
+      expect((serverSchema.numericRecords ?? []).map(({ field }) => field), `${kind} numeric record field order`).toEqual(Object.keys("numericRecords" in clientSchema ? clientSchema.numericRecords : {}));
     }
+    expect(SERVER_SYNC_PHASE_NAMES).toEqual(SYNC_PHASE_NAMES);
     expect(SERVER_CORPUS_BUCKETS).toEqual(CORPUS_BUCKETS);
     expect(SERVER_GIT_DEFERRAL_REASONS).toEqual(GIT_DEFERRAL_REASONS);
     expect(SERVER_SYNC_STATE_NUMERIC_DOMAINS).toEqual(SYNC_STATE_NUMERIC_DOMAINS);
@@ -91,9 +98,10 @@ describe("POST /v1/telemetry", () => {
       { kind: "safety_event", eventType: "scan_fault", count: 3 },
       { kind: "git_capture", signalPushes: 5, candidatePushes: 6, scanPushes: 7 },
       { kind: "ws_health", windowMs: 120_000, wsConnectedMs: 110_000, wsReconnects: 1, wsHalfOpenDetected: 2, backstopAttempts: 3, backstopAppliedPulls: 4, cursorAppliedPulls: 0, notifyAppliedPulls: 5, notifyLatencyCount: 6, notifyLatencySumMs: 7_000, notifyLatencyMaxMs: 2_000 },
+      { kind: "sync_phase", op: "pull", wallMs: 99, phases: { latest: 3, "git-apply": 8 }, gitApplyMaxRepoMs: 7, gitApplySkippedHeld: 2 },
     ] }), testEnv(points), devicePrincipal(a));
     expect(res.status).toBe(202);
-    expect(await res.json()).toEqual({ accepted: 7, dropped: 0 });
+    expect(await res.json()).toEqual({ accepted: 8, dropped: 0 });
     expect(points).toEqual([
       { indexes: ["client.propagation"], blobs: ["client.propagation"], doubles: [7] },
       { indexes: ["client.first_publish"], blobs: ["client.first_publish", "s"], doubles: [11, 12, 101, 9] },
@@ -102,6 +110,7 @@ describe("POST /v1/telemetry", () => {
       { indexes: ["client.safety_event"], blobs: ["client.safety_event", "scan_fault"], doubles: [3] },
       { indexes: ["client.git_capture"], blobs: ["client.git_capture"], doubles: [5, 6, 7] },
       { indexes: ["client.ws_health"], blobs: ["client.ws_health"], doubles: [120_000, 110_000, 1, 2, 3, 4, 0, 5, 6, 7_000, 2_000] },
+      { indexes: ["client.sync_phase"], blobs: ["client.sync_phase", "pull"], doubles: [99, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 7, 2] },
     ]);
   });
 
@@ -144,8 +153,10 @@ describe("POST /v1/telemetry", () => {
       { kind: "propagation", deliveryToApplyMs: -1 },
       { kind: "upload_lane", transport: "single", bytes: 1, uploadMs: 0, opCount: 1, fillVersion: "v1" },
       { kind: "upload_lane", transport: "single", bytes: 10_000_000_000_000, uploadMs: 1, opCount: 1, fillVersion: "v1" },
+      { kind: "sync_phase", op: "pull", wallMs: 1, phases: { [hostile]: 1 } },
+      { kind: "sync_phase", op: "push", wallMs: 1, phases: { latest: "slow" } },
     ] }), testEnv(points), devicePrincipal(a));
-    expect(await res.json()).toEqual({ accepted: 0, dropped: 10 });
+    expect(await res.json()).toEqual({ accepted: 0, dropped: 12 });
     expect(JSON.stringify(points)).not.toContain(hostile);
     expect(points.every((point) => point.indexes?.[0] === "client.telemetry.drops")).toBe(true);
     expect(points.map((point) => point.blobs?.[1])).toEqual(expect.arrayContaining(["bad_enum", "unknown_field", "unknown_kind", "bad_number"]));
