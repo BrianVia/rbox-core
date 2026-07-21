@@ -6,6 +6,25 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.7.15] — 2026-07-21 — "stuck repos heal themselves"
+
+### Fixed
+- A repository whose local git history moved ahead of its last-published state
+  could livelock: every pull re-processed it at full cost (30s+ on large
+  repos), forever, while its fresh state was never republished. rbox now
+  proves when your local history fully contains the stale unapplied state and
+  publishes yours — the repo heals itself in one sync cycle. Repos held for
+  other reasons skip the expensive re-processing entirely between changes.
+
+### Added
+- Conflict snapshot retention: old conflict-preservation refs are pruned once
+  their work is back in a branch (or after 90 days); `rbox status` now shows
+  `conflict snapshots: N (M prunable)`.
+- Fleet phase telemetry (`sync_phase`): pull/push phase timings now reach the
+  dashboard, so a slow phase can never hide in local logs again.
+- Deeper timing detail in daemon logs: per-step git-apply attribution and
+  push missing/commit chunk timings.
+
 ## [1.7.14] — 2026-07-21 — new repos sync fast too
 
 ### Fixed
