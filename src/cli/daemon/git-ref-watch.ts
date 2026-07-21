@@ -19,9 +19,9 @@ export type GitRefEventClass = "target" | "lockPreSignal" | "structure" | "none"
 /** The single construction gate used by the daemon and native release smoke. */
 export function gitRefSideChannelEligible(
   platform = process.platform,
-  backend = process.env.RBOX_WATCHER,
+  selectedBackend?: "parcel" | "chokidar",
 ): boolean {
-  return platform === "linux" && backend?.toLowerCase() !== "chokidar";
+  return platform === "linux" && selectedBackend === "parcel";
 }
 
 /**
@@ -424,7 +424,10 @@ export class GitRefWatchRegistry {
     const failedReplacements = new Set<string>();
     for (const desired of built.desired.values()) {
       const current = this.#active.get(desired.key);
-      const changed = !current || this.#forcedTargets.has(desired.key) || this.#retries.has(desired.key) || !sameContributors(current.contributors, desired.contributors);
+      // Contributor/filter changes do not replace a live physical root. The
+      // complete next graph is already built, so they can be published in place;
+      // only a generation-dirty root or an actual attach retry needs a new handle.
+      const changed = !current || this.#forcedTargets.has(desired.key) || this.#retries.has(desired.key);
       if (!changed) continue;
       const retry = this.#retries.get(desired.key);
       if (retry && retry.nextAttemptAt > this.#clock.now()) continue;
@@ -552,7 +555,25 @@ export class GitRefWatchRegistry {
         continue;
       }
       this.#retries.delete(resolveKey);
-      const storage = await this.#refStorage(repoDir).catch(() => undefined);
+      const storageKey = `storage\0${owner.relPath}`;
+      const storageRetry = this.#retries.get(storageKey);
+      if (storageRetry && storageRetry.nextAttemptAt > this.#clock.now()) {
+        pendingRetryKeys.add(storageKey);
+        ownerFailures.set(owner.relPath, "failed");
+        continue;
+      }
+      let storage: string | undefined;
+      try {
+        storage = await this.#refStorage(repoDir);
+      } catch (error) {
+        if (this.#closed || generation !== this.#requestedGeneration) return undefined;
+        ownerFailures.set(owner.relPath, "failed");
+        this.#recordRetry(storageKey, new Set([owner.relPath]));
+        pendingRetryKeys.add(storageKey);
+        this.#onLog?.(`git ref watcher config authority unavailable for ${owner.relPath}: ${errorMessage(error)}`);
+        continue;
+      }
+      this.#retries.delete(storageKey);
       if (this.#closed || generation !== this.#requestedGeneration) return undefined;
       if (storage === "reftable") {
         ownerFailures.set(owner.relPath, "refused");
@@ -565,14 +586,32 @@ export class GitRefWatchRegistry {
         { rawRoot: ctx.commonDir, mode: "shallow", role: "commonDir" },
         { rawRoot: path.join(ctx.commonDir, "refs"), mode: "shallow", role: "refsRoot" },
       ];
-      let admission = admissionCache.get(ctx.commonDir);
-      if (!admission) {
-        admission = this.#admitNamespaces(ctx.commonDir, generation);
-        admissionCache.set(ctx.commonDir, admission);
+      const admissionKey = `namespace\0${path.resolve(ctx.commonDir)}`;
+      const admissionRetry = this.#retries.get(admissionKey);
+      let admittedNamespaces: AdmissionResult;
+      if (admissionRetry && admissionRetry.nextAttemptAt > this.#clock.now()) {
+        admissionRetry.owners.add(owner.relPath);
+        pendingRetryKeys.add(admissionKey);
+        admittedNamespaces = { ok: false, reason: "admission retry pending" };
+      } else {
+        let admission = admissionCache.get(ctx.commonDir);
+        if (!admission) {
+          admission = this.#admitNamespaces(ctx.commonDir, generation);
+          admissionCache.set(ctx.commonDir, admission);
+        }
+        const result = await admission;
+        if (!result) return undefined;
+        admittedNamespaces = result;
+        if (result.ok) {
+          this.#retries.delete(admissionKey);
+        } else {
+          const recorded = this.#retries.get(admissionKey);
+          if (recorded && recorded.nextAttemptAt > this.#clock.now()) recorded.owners.add(owner.relPath);
+          else this.#recordRetry(admissionKey, new Set([owner.relPath]));
+          pendingRetryKeys.add(admissionKey);
+        }
       }
-      const admittedNamespaces = await admission;
       if (this.#closed || generation !== this.#requestedGeneration) return undefined;
-      if (!admittedNamespaces) return undefined;
       if (admittedNamespaces.ok) {
         specs.push(
           { rawRoot: path.join(ctx.commonDir, "refs", "heads"), mode: "recursive", role: "refsNamespace" },
@@ -644,6 +683,16 @@ export class GitRefWatchRegistry {
     const pending = [path.join(commonDir, "refs", "heads"), path.join(commonDir, "refs", "tags")];
     while (pending.length > 0) {
       const dir = pending.pop()!;
+      let stat: Awaited<ReturnType<typeof fsp.lstat>>;
+      try {
+        stat = await fsp.lstat(dir);
+      } catch (error) {
+        if (this.#closed || generation !== this.#requestedGeneration) return undefined;
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        return { ok: false, reason: `read fault at ${dir}` };
+      }
+      if (this.#closed || generation !== this.#requestedGeneration) return undefined;
+      if (stat.isSymbolicLink() || !stat.isDirectory()) return { ok: false, reason: `namespace root is not a real directory at ${dir}` };
       let handle: Awaited<ReturnType<typeof fsp.opendir>>;
       try {
         handle = await fsp.opendir(dir);
@@ -779,15 +828,6 @@ const within = (rootReal: string, targetReal: string): boolean => {
 };
 
 const targetKey = (canonicalRoot: string, mode: GitRefWatchMode): string => `${mode}\0${canonicalRoot}`;
-
-function sameContributors(a: Map<string, Contributor>, b: Map<string, Contributor>): boolean {
-  if (a.size !== b.size) return false;
-  for (const [key, value] of a) {
-    const other = b.get(key);
-    if (!other || other.owner !== value.owner || other.role !== value.role || other.generation !== value.generation) return false;
-  }
-  return true;
-}
 
 async function closeHandle(handle: GitRefWatchHandle): Promise<void> {
   try { await handle.close(); } catch { /* close is an idempotent fence */ }

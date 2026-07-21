@@ -46,6 +46,22 @@ The retry audit specifically exercises the lower and upper ±20% jitter edges,
 1s doubling through the 60s base cap, the single-earliest-timer invariant, and
 retention of live coverage during a sleeping replacement retry.
 
+## Fix round — SCRUTINY-175
+
+All seven findings were accepted. Finding 6 follows the orchestrator's modified
+ruling: eligibility is based on the backend actually selected and reported by
+the watcher, not on a platform-string prediction.
+
+| Finding | Fix | Adversarial regression |
+|---|---|---|
+| 1. Ref-storage authority failed open | `gitRefStorage` now distinguishes an absent key (Git exit 1) from probe faults, `gitPreflight` turns authority faults into transient failures, and registry authority faults enter a dedicated retry target without opening handles or running the arm handshake. | `shared.test.ts` covers absent versus malformed authority and preflight failure. `git-ref-watch.test.ts` injects a first-probe rejection followed by authoritative `reftable`, proving zero handles/handshakes before the retry and refusal afterward. |
+| 2. Plan discovery could not raise the backend-independent floor | The daemon records additive plan-discovered dir owners independently of the optional registry, includes them in floor computation, and clears that claim only on a complete scan snapshot. | `daemon-safety.test.ts` starts with no registry, an empty authoritative snapshot, and a 300s delay; plan discovery pins the delay to 60s and the complete shrinking snapshot releases it. |
+| 3. Namespace admission did not retry | Namespace admission faults/budget failures now retain desired ownership under a per-namespace retry key, obey the shared exponential due-time gate, and reset retry state after successful admission. | `git-ref-watch.test.ts` forces a fail-shallow directory-budget result, proves one pending target/one timer and non-preemption by an unrelated upsert, removes the crowding directory, and proves recursive coverage arms at +1s. |
+| 4. Contributor-only changes reopened physical handles | Physical-handle replacement no longer depends on contributor-map equality; unchanged `(canonicalRoot, mode)` handles receive role/refcount filters in place and close only after their final contributor disappears. | `git-ref-watch.test.ts` keeps the exact common-root handle across owner removal and role transfer, asserts no close/reopen, and verifies the live filter changes. |
+| 5. Admission followed symlinked namespace roots | Each pending `refs/heads`/`refs/tags` root is now `lstat`-checked and refused unless it is a real directory before `opendir` can follow it. | `git-ref-watch.test.ts` points `refs/heads` at a deep external tree and proves refusal as a non-real namespace root, no budget traversal failure, and no recursive external handle. |
+| 6. Construction eligibility predicted unsupported targets | Watchers report the backend they actually selected. Initial discovery is retained until watcher startup returns, and the registry is constructed only on Linux when that reported backend is `parcel`; the self-test uses the same observed result. | `daemon-safety.test.ts` returns a watcher-reported `chokidar` backend on Linux and proves no registry is constructed while the safety floor remains pinned. The Parcel self-test reports and checks its actual backend. |
+| 7. Mandatory lock/busy episode regression was absent | The daemon's existing absolute +2s/+8s episode is exposed through an injectable clock for deterministic lifecycle verification; normal runtime still uses native timers. | `daemon-git-capture.test.ts` runs real branch-ref and `packed-refs.lock` episodes through actual registry listener routing and the real debounce/max-wait path. Both locks remain held past max-wait, only the pre-signal is delivered, the final target callback is suppressed, +2s remains busy without resetting the episode/timers, +8s captures the exact OID, the second retry resets, and daemon close cancels the next episode's timers and prevents a late push. |
+
 ## Required acceptance outputs
 
 ### `bun run typecheck`
@@ -61,11 +77,11 @@ Exit status: 0.
 ```text
 bun test v1.3.14 (0d9b296a)
 
-2583 pass
+2590 pass
 16 skip
 0 fail
-30841 expect() calls
-Ran 2599 tests across 211 files. [269.66s]
+30915 expect() calls
+Ran 2606 tests across 211 files. [273.67s]
 ```
 
 ### `cd apps/api && WRANGLER_LOG_PATH=/tmp/w.log bunx vitest run --configLoader runner`
@@ -75,8 +91,8 @@ RUN  v4.1.10 /home/via/Development/Personal/rbox-core/.claude/worktrees/172b-ref
 
 Test Files  46 passed (46)
 Tests  781 passed | 4 skipped (785)
-Start at  01:42:12
-Duration  59.27s (transform 643ms, setup 0ms, import 1.26s, tests 57.26s, environment 0ms)
+Start at  02:29:20
+Duration  59.42s (transform 653ms, setup 0ms, import 1.27s, tests 57.42s, environment 0ms)
 ```
 
 ### `bun scripts/probe/bun-refwatch-contract.ts`

@@ -18,6 +18,8 @@ import {
 import { classifyRepoCandidate, type RepoCandidateWork } from "./git-ref-watch.js";
 
 export interface Watcher {
+  /** Backend that was actually selected and successfully started. */
+  readonly backend: WatcherBackend;
   /** True only when Parcel found an in-tree directory-backed repo whose refs are
    *  inside this watch. Chokidar intentionally remains safety-scan-only for Git. */
   readonly gitRefWatchActive?: boolean;
@@ -402,6 +404,7 @@ async function startParcel(
   }
 
   return {
+    backend: "parcel",
     gitRefWatchActive,
     async close() {
       batcher.dispose();
@@ -458,6 +461,7 @@ function startChokidar(
   });
 
   return {
+    backend: "chokidar",
     async close() {
       batcher.dispose();
       signalDebouncer.dispose();

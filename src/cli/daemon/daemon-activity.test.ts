@@ -367,7 +367,7 @@ function captureWatcherErrors(daemon: DaemonInternals): { fire(err: Error): void
   let onError: ((err: Error) => void) | undefined;
   daemon.startWatcherFn = async (_root, _matcher, _onSettle, opts = {}) => {
     onError = opts.onError;
-    return { close: async () => {} };
+    return { backend: "parcel", close: async () => {} };
   };
   return {
     fire(err) {
@@ -831,7 +831,7 @@ test("raw watcher event persists local unsettled before the debounced pump runs"
   const daemon = await makeDaemon(new MiniRemote());
   daemon.startWatcherFn = async (_root, _matcher, _onSettle, opts = {}) => {
     opts.onRawEvent?.({ relPath: "a.txt", kind: "add" });
-    return { close: async () => {} };
+    return { backend: "parcel", close: async () => {} };
   };
 
   try {

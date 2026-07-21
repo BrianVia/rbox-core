@@ -46,7 +46,7 @@ interface SafetyInternals {
       signalDebouncer?: { push(reason: "signal" | "candidate" | "other"): void };
       onInitialGitRepos?: (repos: readonly { relPath: string; kind: "dir" | "pointer" }[]) => Promise<void>;
     }
-  ) => Promise<{ gitRefWatchActive?: boolean; close(): Promise<void> }>;
+  ) => Promise<{ backend: "parcel" | "chokidar"; gitRefWatchActive?: boolean; close(): Promise<void> }>;
   startLiveWatch(): Promise<void>;
   advanceSafetyCadenceForTick(): void;
   churnSinceSafety: boolean;
@@ -61,7 +61,7 @@ interface SafetyInternals {
   want: { push: boolean; fullScan: boolean };
   pendingEvents: unknown[];
   watcherUnsettled: boolean;
-  watcher?: { gitRefWatchActive?: boolean; close(): Promise<void> };
+  watcher?: { backend: "parcel" | "chokidar"; gitRefWatchActive?: boolean; close(): Promise<void> };
   safetyTimer?: ReturnType<typeof setTimeout>;
   deepTimer?: ReturnType<typeof setInterval>;
   matcher: { ignores(path: string): boolean };
@@ -70,6 +70,9 @@ interface SafetyInternals {
   gitSafetyFloorRequired: boolean;
   gitBackendFallbackPending: boolean;
   authoritativeGitRepos: readonly { relPath: string; kind: "dir" | "pointer" }[];
+  planDiscoveredGitDirOwners: Set<string>;
+  observePlanGitRepos(repos: readonly { relPath: string; kind: "dir" | "pointer" }[]): Promise<void>;
+  gitRefRegistry?: unknown;
   refreshGitSafetyFloor(reason: string): void;
 }
 
@@ -79,12 +82,13 @@ test("design 175: ref signal requests push without pending/file-settle state", a
   let signal: (() => void) | undefined;
   daemon.startWatcherFn = (_root, _matcher, _cb, opts) => {
     signal = () => opts?.signalDebouncer?.push("signal");
-    return Promise.resolve({ gitRefWatchActive: true, close: async () => {} });
+    return Promise.resolve({ backend: "parcel", gitRefWatchActive: true, close: async () => {} });
   };
   daemon.pumping = true;
 
   try {
     await daemon.startLiveWatch();
+    expect(daemon.gitRefRegistry !== undefined).toBe(process.platform === "linux");
     signal!();
     await new Promise((resolve) => setTimeout(resolve, 450));
     expect(daemon.want.push).toBe(true);
@@ -104,7 +108,7 @@ test("design 175: a directory-backed repo holds the git safety floor only on Lin
   const daemon = makeDaemon(root);
   daemon.startWatcherFn = async (_root, _matcher, _cb, opts) => {
     await opts?.onInitialGitRepos?.([{ relPath: ".", kind: "dir" }]);
-    return { gitRefWatchActive: true, close: async () => {} };
+    return { backend: "parcel", gitRefWatchActive: true, close: async () => {} };
   };
   daemon.pumping = true;
 
@@ -114,6 +118,47 @@ test("design 175: a directory-backed repo holds the git safety floor only on Lin
     await new Promise((resolve) => setTimeout(resolve, 0));
     daemon.advanceSafetyCadenceForTick();
     expect(daemon.safetyDelay).toBe(process.platform === "linux" ? FLOOR : 120_000);
+  } finally {
+    if (daemon.safetyTimer) clearTimeout(daemon.safetyTimer);
+    if (daemon.deepTimer) clearInterval(daemon.deepTimer);
+    await daemon.watcher?.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test.skipIf(process.platform !== "linux")("design 175 fix: plan discovery pins the floor without a registry until a shrinking snapshot", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-git-plan-floor-")));
+  const daemon = makeDaemon(root);
+  try {
+    daemon.safetyDelay = CAP;
+    daemon.authoritativeGitRepos = [];
+    expect(daemon.gitRefRegistry).toBeUndefined();
+    await daemon.observePlanGitRepos([{ relPath: "late", kind: "dir" }]);
+    expect(daemon.planDiscoveredGitDirOwners).toEqual(new Set(["late"]));
+    expect(daemon.gitSafetyFloorRequired).toBe(true);
+    expect(daemon.safetyDelay).toBe(FLOOR);
+
+    daemon.planDiscoveredGitDirOwners.clear();
+    daemon.refreshGitSafetyFloor("complete-zero-snapshot");
+    expect(daemon.gitSafetyFloorRequired).toBe(false);
+  } finally {
+    if (daemon.safetyTimer) clearTimeout(daemon.safetyTimer);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test.skipIf(process.platform !== "linux")("design 175 fix: registry construction follows the watcher-reported backend", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-git-backend-report-")));
+  const daemon = makeDaemon(root);
+  daemon.startWatcherFn = async (_root, _matcher, _cb, opts) => {
+    await opts?.onInitialGitRepos?.([{ relPath: ".", kind: "dir" }]);
+    return { backend: "chokidar", gitRefWatchActive: false, close: async () => {} };
+  };
+  daemon.pumping = true;
+  try {
+    await daemon.startLiveWatch();
+    expect(daemon.gitRefRegistry).toBeUndefined();
+    expect(daemon.gitSafetyFloorRequired).toBe(true);
   } finally {
     if (daemon.safetyTimer) clearTimeout(daemon.safetyTimer);
     if (daemon.deepTimer) clearInterval(daemon.deepTimer);
@@ -161,7 +206,7 @@ test("watcher events mark churn AND pull a backed-off timer forward (codex R1)",
   let deliver: ((events: unknown[]) => void) | undefined;
   daemon.startWatcherFn = (_root, _matcher, cb) => {
     deliver = cb;
-    return Promise.resolve({ close: async () => {} });
+    return Promise.resolve({ backend: "parcel", close: async () => {} });
   };
   // Block the pump so delivering an event exercises ONLY the callback's
   // bookkeeping (churn flag + queued want) — this minimal daemon has no deps.
@@ -194,7 +239,7 @@ test("pull-only daemon watcher path never queues push", async () => {
   let deliver: ((events: unknown[]) => void) | undefined;
   daemon.startWatcherFn = (_root, _matcher, cb) => {
     deliver = cb;
-    return Promise.resolve({ close: async () => {} });
+    return Promise.resolve({ backend: "parcel", close: async () => {} });
   };
   daemon.pumping = true;
 
@@ -218,7 +263,7 @@ test("a post-init watcher error revokes trust: backoff treats the watcher as dea
   let onError: ((err: Error) => void) | undefined;
   daemon.startWatcherFn = (_root, _matcher, _cb, opts) => {
     onError = opts?.onError;
-    return Promise.resolve({ close: async () => {} });
+    return Promise.resolve({ backend: "parcel", close: async () => {} });
   };
   daemon.pumping = true;
 
@@ -255,7 +300,7 @@ test("a transient post-init watcher error is suspect and recoverable with the fl
   let onError: ((err: Error) => void) | undefined;
   daemon.startWatcherFn = (_root, _matcher, _cb, opts) => {
     onError = opts?.onError;
-    return Promise.resolve({ close: async () => {} });
+    return Promise.resolve({ backend: "parcel", close: async () => {} });
   };
   daemon.pumping = true;
   try {

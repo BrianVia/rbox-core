@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { cleanGitEnv, gitBusy, gitRaw, readLocalGitConfigEntries, setGitSpawnObserver, type RepoCtx } from "./shared.js";
+import { cleanGitEnv, gitBusy, gitRaw, readLocalGitConfigEntries, repoCtx, setGitSpawnObserver, type RepoCtx } from "./shared.js";
 import { gitPreflight, gitRefStorage } from "./preflight.js";
 
 const exec = promisify(execFile);
@@ -143,4 +143,19 @@ test("reftable refusal uses extensions.refStorage config authority and a teachab
     structural: true,
     reason: expect.stringMatching(/reftable.*unsupported.*convert/i),
   }));
+});
+
+test("ref-storage authority distinguishes an absent key from a failed Git probe", async () => {
+  const repo = await initRepo();
+  expect(await gitRefStorage(repo)).toBeUndefined();
+  const knownCtx = await repoCtx(repo);
+  expect(knownCtx).toBeDefined();
+  await fs.appendFile(path.join(repo, ".git", "config"), "\n[extensions\n");
+  await expect(gitRefStorage(repo)).rejects.toThrow();
+  const preflight = await gitPreflight(repo, knownCtx);
+  expect(preflight).toEqual(expect.objectContaining({
+    ok: false,
+    reason: expect.stringMatching(/config.*could not be read/i),
+  }));
+  expect(preflight.structural).toBeUndefined();
 });

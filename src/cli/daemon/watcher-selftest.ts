@@ -76,14 +76,24 @@ export async function watcherSelfTest(dirArg?: string, opts: { timeoutMs?: numbe
 /** Native release assertion for the deliberately unsupported Darwin side-channel. */
 export async function gitRefWatchPlatformSelfTest(): Promise<number> {
   const createdTemp = fs.mkdtempSync(path.join(os.tmpdir(), "rbox-refwatch-platform-"));
-  const eligible = gitRefSideChannelEligible();
-  const registry = eligible ? new GitRefWatchRegistry({ root: fs.realpathSync(createdTemp) }) : undefined;
-  const handles = registry?.state.activeHandles ?? 0;
-  await registry?.close();
-  fs.rmSync(createdTemp, { recursive: true, force: true });
-  const ok = process.platform !== "darwin" || (!eligible && handles === 0);
-  console.log(`GIT_REFWATCH_SELFTEST ${ok ? "ok" : "fail"} eligible=${eligible} handles=${handles} platform=${process.platform}-${process.arch}`);
-  return ok ? 0 : 1;
+  let watcher: Watcher | undefined;
+  let registry: GitRefWatchRegistry | undefined;
+  try {
+    watcher = await startWatcher(createdTemp, buildIgnoreMatcher(createdTemp), () => {}, { backend: "parcel" });
+    const eligible = gitRefSideChannelEligible(process.platform, watcher.backend);
+    registry = eligible ? new GitRefWatchRegistry({ root: fs.realpathSync(createdTemp) }) : undefined;
+    const handles = registry?.state.activeHandles ?? 0;
+    const ok = process.platform !== "darwin" || (!eligible && handles === 0);
+    console.log(`GIT_REFWATCH_SELFTEST ${ok ? "ok" : "fail"} eligible=${eligible} handles=${handles} backend=${watcher.backend} platform=${process.platform}-${process.arch}`);
+    return ok ? 0 : 1;
+  } catch (error) {
+    console.log(`GIT_REFWATCH_SELFTEST fail=start-error err=${error instanceof Error ? error.message : String(error)} platform=${process.platform}-${process.arch}`);
+    return 1;
+  } finally {
+    await registry?.close().catch(() => {});
+    await watcher?.close().catch(() => {});
+    fs.rmSync(createdTemp, { recursive: true, force: true });
+  }
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));

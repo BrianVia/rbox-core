@@ -15,7 +15,7 @@ import {
 import { createSignalDebouncer, type GitSignalBatch } from "./watcher.js";
 
 test("side-channel construction is Linux Parcel-only", () => {
-  expect(gitRefSideChannelEligible("linux", undefined)).toBe(true);
+  expect(gitRefSideChannelEligible("linux", undefined)).toBe(false);
   expect(gitRefSideChannelEligible("linux", "parcel")).toBe(true);
   expect(gitRefSideChannelEligible("linux", "chokidar")).toBe(false);
   expect(gitRefSideChannelEligible("darwin", undefined)).toBe(false);
@@ -147,7 +147,9 @@ function tempRoot(): string {
 function makeGitDir(gitDir: string): void {
   fs.mkdirSync(path.join(gitDir, "refs", "heads"), { recursive: true });
   fs.mkdirSync(path.join(gitDir, "refs", "tags"), { recursive: true });
+  fs.mkdirSync(path.join(gitDir, "objects"), { recursive: true });
   fs.writeFileSync(path.join(gitDir, "HEAD"), "ref: refs/heads/main\n");
+  fs.writeFileSync(path.join(gitDir, "config"), "[core]\n\trepositoryformatversion = 0\n\tbare = false\n");
 }
 
 class TestHandle implements GitRefWatchHandle {
@@ -237,6 +239,7 @@ test("registry aggregates role filters by physical root and preserves shared own
   const registry = new GitRefWatchRegistry({
     root,
     resolveRepo: async (repoDir) => contexts.get(repoDir),
+    refStorage: async () => undefined,
     watch: watches.watch,
     onSignal: () => signals.push(1),
     onArmed: (owner) => armed.push(owner),
@@ -246,6 +249,7 @@ test("registry aggregates role filters by physical root and preserves shared own
   expect(registry.state.activeHandles).toBe(5);
   expect(armed.sort()).toEqual(["main", "wt"]);
   const shared = watches.latest(common, "shallow");
+  const sharedHandleCount = watches.handles.filter((handle) => handle.target === common).length;
   shared.listener("change", "HEAD");
   shared.listener("change", "packed-refs");
   expect(signals).toHaveLength(2); // union of gitDir + commonDir roles
@@ -254,6 +258,9 @@ test("registry aggregates role filters by physical root and preserves shared own
   await registry.applySnapshot([{ relPath: "wt", kind: "pointer" }], snapshot, true);
   expect(registry.state.activeHandles).toBe(5); // common roots remain owned by the pointer
   const pointerOnlyCommon = watches.latest(common, "shallow");
+  expect(pointerOnlyCommon).toBe(shared);
+  expect(shared.closed).toBe(0);
+  expect(watches.handles.filter((handle) => handle.target === common)).toHaveLength(sharedHandleCount);
   pointerOnlyCommon.listener("change", "HEAD");
   pointerOnlyCommon.listener("change", "packed-refs");
   expect(signals).toHaveLength(3); // HEAD no longer accepted; packed-refs still is
@@ -271,7 +278,7 @@ test("registry aggregates role filters by physical root and preserves shared own
   await registry.close();
 });
 
-test("an unrelated reconcile cannot retire live coverage while a contributor replacement backs off", async () => {
+test("a contributor-only ownership update never reopens a still-owned physical handle", async () => {
   const root = tempRoot();
   const main = path.join(root, "main");
   const worktree = path.join(root, "wt");
@@ -290,6 +297,7 @@ test("an unrelated reconcile cannot retire live coverage while a contributor rep
     root,
     clock,
     resolveRepo: async (repoDir) => contexts.get(repoDir),
+    refStorage: async () => undefined,
     watch: watches.watch,
   });
   await registry.upsert([{ relPath: "main", kind: "dir" }]);
@@ -297,7 +305,7 @@ test("an unrelated reconcile cannot retire live coverage while a contributor rep
   watches.fail.set(common, 1);
   await registry.upsert([{ relPath: "wt", kind: "pointer" }]);
   expect(liveCommon.closed).toBe(0);
-  expect(registry.state.pendingTargets).toBe(1);
+  expect(registry.state.pendingTargets).toBe(0);
 
   await registry.upsert([{ relPath: "main", kind: "dir" }]);
   expect(liveCommon.closed).toBe(0);
@@ -305,7 +313,7 @@ test("an unrelated reconcile cannot retire live coverage while a contributor rep
 
   await clock.advance(1_000);
   await registry.idle();
-  expect(liveCommon.closed).toBe(1);
+  expect(liveCommon.closed).toBe(0);
   expect(registry.state.pendingTargets).toBe(0);
   await registry.close();
 });
@@ -331,7 +339,7 @@ test("candidate generation dirtiness and root-self rename force replacement even
   const heads = watches.latest(path.join(gitDir, "refs", "heads"), "recursive");
   heads.listener("rename", null);
   await registry.idle();
-  expect(watches.handles.length).toBe(firstCount + 8);
+  expect(watches.handles.length).toBe(firstCount + 5);
   expect(heads.closed).toBe(1);
   expect(armed).toEqual(["repo", "repo", "repo"]); // initial, candidate generation, structure generation
   await registry.close();
@@ -603,6 +611,7 @@ test("containment refuses out-of-root pointer targets without pinning the dir-on
   const registry = new GitRefWatchRegistry({
     root,
     resolveRepo: async () => ({ repoDir: repo, kind: "pointer", gitDir: external, commonDir: external }),
+    refStorage: async () => undefined,
     watch: new TestWatches().watch,
   });
   await registry.upsert([{ relPath: "wt", kind: "pointer" }]);
@@ -630,6 +639,44 @@ test("registry pre-attach refuses config-authoritative reftable without opening 
   await registry.close();
 });
 
+test("config-authority failure stays pending and cannot admit a reftable repo before the authoritative retry", async () => {
+  const root = tempRoot();
+  const repo = path.join(root, "repo");
+  const gitDir = path.join(repo, ".git");
+  makeGitDir(gitDir);
+  const watches = new TestWatches();
+  const clock = new FakeClock();
+  const armed: string[] = [];
+  let probes = 0;
+  const registry = new GitRefWatchRegistry({
+    root,
+    clock,
+    resolveRepo: async () => ({ repoDir: repo, kind: "dir", gitDir, commonDir: gitDir }),
+    refStorage: async () => {
+      probes++;
+      if (probes === 1) throw new Error("injected config read fault");
+      return "reftable";
+    },
+    watch: watches.watch,
+    onArmed: (owner) => armed.push(owner),
+  });
+  await registry.upsert([{ relPath: "repo", kind: "dir" }]);
+  expect(registry.state).toMatchObject({ activeHandles: 0, pendingTargets: 1 });
+  expect(registry.state.owners[0]?.state).toBe("failed");
+  expect(armed).toEqual([]);
+  expect(clock.timers.size).toBe(1);
+  await clock.advance(999);
+  await registry.upsert([{ relPath: "repo", kind: "dir" }]);
+  expect(probes).toBe(1);
+
+  await clock.advance(1);
+  await registry.idle();
+  expect(registry.state).toMatchObject({ activeHandles: 0, pendingTargets: 0 });
+  expect(registry.state.owners[0]?.state).toBe("refused");
+  expect(armed).toEqual([]);
+  await registry.close();
+});
+
 test("namespace admission is combined and fail-shallow; growth after count remains documented best effort", async () => {
   const root = tempRoot();
   const repo = path.join(root, "repo");
@@ -648,6 +695,7 @@ test("namespace admission is combined and fail-shallow; growth after count remai
   expect(registry.state.activeHandles).toBe(2); // shared control root + refs root only
   expect(bounded.attempts.some((attempt) => attempt.mode === "recursive")).toBe(false);
   expect(registry.state.owners[0]?.state).toBe("failed");
+  expect(registry.state.pendingTargets).toBe(1);
   await registry.close();
 
   const growth = new TestWatches();
@@ -665,4 +713,66 @@ test("namespace admission is combined and fail-shallow; growth after count remai
   fs.mkdirSync(path.join(gitDir, "refs", "heads", "post-arm-populated", "deep"), { recursive: true });
   expect(growthRegistry.state.activeHandles).toBe(4); // Bun owns post-arm descendant exposure
   await growthRegistry.close();
+});
+
+test("namespace admission failure retries on the shared backoff timer and resets after success", async () => {
+  const root = tempRoot();
+  const repo = path.join(root, "repo");
+  const gitDir = path.join(repo, ".git");
+  makeGitDir(gitDir);
+  const crowded = path.join(gitDir, "refs", "heads", "crowded");
+  fs.mkdirSync(crowded);
+  const clock = new FakeClock();
+  const watches = new TestWatches();
+  const registry = new GitRefWatchRegistry({
+    root,
+    clock,
+    namespaceDirBudget: 2,
+    resolveRepo: async () => ({ repoDir: repo, kind: "dir", gitDir, commonDir: gitDir }),
+    watch: watches.watch,
+  });
+  await registry.upsert([{ relPath: "repo", kind: "dir" }]);
+  expect(registry.state).toMatchObject({ activeHandles: 2, pendingTargets: 1 });
+  expect(clock.timers.size).toBe(1);
+  await registry.upsert([{ relPath: "repo", kind: "dir" }]);
+  expect(clock.timers.size).toBe(1);
+  expect(watches.attempts.filter((attempt) => attempt.mode === "recursive")).toHaveLength(0);
+
+  fs.rmdirSync(crowded);
+  await clock.advance(1_000);
+  await registry.idle();
+  expect(registry.state).toMatchObject({ activeHandles: 4, pendingTargets: 0 });
+  expect(registry.state.owners[0]?.state).toBe("armed");
+  await registry.close();
+});
+
+test("namespace admission refuses a symlinked heads root without traversing its external tree", async () => {
+  const root = tempRoot();
+  const external = tempRoot();
+  const repo = path.join(root, "repo");
+  const gitDir = path.join(repo, ".git");
+  makeGitDir(gitDir);
+  fs.rmSync(path.join(gitDir, "refs", "heads"), { recursive: true });
+  fs.rmSync(path.join(gitDir, "refs", "tags"), { recursive: true });
+  fs.mkdirSync(path.join(external, "deep", "deeper"), { recursive: true });
+  fs.symlinkSync(external, path.join(gitDir, "refs", "heads"), "dir");
+  const clock = new FakeClock();
+  const watches = new TestWatches();
+  const logs: string[] = [];
+  const registry = new GitRefWatchRegistry({
+    root,
+    clock,
+    namespaceDirBudget: 0,
+    namespaceEntryBudget: 0,
+    resolveRepo: async () => ({ repoDir: repo, kind: "dir", gitDir, commonDir: gitDir }),
+    watch: watches.watch,
+    onLog: (message) => logs.push(message),
+  });
+  await registry.upsert([{ relPath: "repo", kind: "dir" }]);
+  expect(registry.state).toMatchObject({ activeHandles: 2, pendingTargets: 1 });
+  expect(watches.attempts.some((attempt) => attempt.target.startsWith(external))).toBe(false);
+  expect(watches.attempts.some((attempt) => attempt.mode === "recursive")).toBe(false);
+  expect(logs.some((message) => message.includes("namespace root is not a real directory"))).toBe(true);
+  expect(logs.some((message) => message.includes("directory budget"))).toBe(false);
+  await registry.close();
 });

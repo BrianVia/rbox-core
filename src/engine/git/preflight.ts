@@ -22,8 +22,12 @@ export async function gitRefStorage(repoDir: string): Promise<string | undefined
   try {
     const value = await git(repoDir, ["config", "--local", "--get", "extensions.refStorage"]);
     return value || undefined;
-  } catch {
-    return undefined;
+  } catch (error) {
+    // `git config --get` uses status 1 for an authoritatively absent key. Every
+    // other failure means authority could not be established and must remain
+    // distinguishable from absence so callers fail closed.
+    if ((error as { code?: unknown }).code === 1) return undefined;
+    throw error;
   }
 }
 
@@ -48,7 +52,17 @@ export async function gitPreflight(repoDir: string, knownCtx?: RepoCtx | null): 
   if (!ctx) {
     return { ok: false, reason: kind === "pointer" ? "dangling .git pointer (main clone missing?)" : "unreadable .git — unsupported", kind };
   }
-  if (await gitRefStorage(repoDir) === "reftable") {
+  let refStorage: string | undefined;
+  try {
+    refStorage = await gitRefStorage(repoDir);
+  } catch {
+    return {
+      ok: false,
+      reason: "repository ref-storage config could not be read — retry after Git configuration is readable",
+      kind,
+    };
+  }
+  if (refStorage === "reftable") {
     return {
       ok: false,
       reason: "reftable ref storage is unsupported — convert this repository to files refs before syncing Git history",

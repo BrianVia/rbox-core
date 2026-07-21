@@ -156,7 +156,7 @@ test("poisoned startup arms handles once, skips the direct scan, and heal does n
   d.startWatcherFn = async (...args: unknown[]) => {
     watcherStarts++;
     deliverWatcher = args[2] as (events: unknown[]) => void;
-    return { close: async () => {} };
+    return { backend: "parcel", close: async () => {} };
   };
   d.replaceManifestFromScan = async () => { startupScans++; return undefined; };
   await fs.mkdir(path.dirname(resetJournalPath(root)), { recursive: true });

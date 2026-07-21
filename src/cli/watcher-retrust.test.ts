@@ -21,7 +21,7 @@ afterEach(() => {
 });
 
 interface Internals {
-  startWatcherFn: (root: string, matcher: unknown, cb: (events: unknown[]) => void, opts?: { onError?: (err: Error) => void }) => Promise<{ close(): Promise<void> }>;
+  startWatcherFn: (root: string, matcher: unknown, cb: (events: unknown[]) => void, opts?: { onError?: (err: Error) => void }) => Promise<{ backend: "parcel"; close(): Promise<void> }>;
   startLiveWatch(): Promise<void>;
   maybeClearWatcherDegradedAfterScan(opWatcherErrorGeneration: number, cov: { coverage: "full-tree" | "pruned"; errorGenAtStart: number }): void;
   advanceSafetyCadenceForTick(): void;
@@ -54,7 +54,7 @@ function daemonHarness(): { daemon: Internals; error(err?: string): void; close(
   let onError: ((err: Error) => void) | undefined;
   daemon.startWatcherFn = (_root, _matcher, _cb, opts) => {
     onError = opts?.onError;
-    return Promise.resolve({ close: async () => {} });
+    return Promise.resolve({ backend: "parcel", close: async () => {} });
   };
   daemon.pumping = true;
   return {
@@ -225,13 +225,13 @@ test("drop-spanning survivor is unattributable via a subsequent re-trusted audit
     const d = new RboxDaemon(root, cfg as never, {} as never, { bootId: "boot" }) as never as {
       cache: HashCache; manifest: unknown; matcher: unknown; watcher?: unknown; watcherSessionId?: string;
       trustState: string; watcherHealthy: boolean; watcherErrorGeneration: number; lastTransientDropMs: number; recoveryHoldMs: number;
-      startWatcherFn: (r: string, m: unknown, cb: unknown, o?: { onError?: (e: Error) => void }) => Promise<{ close(): Promise<void> }>;
+      startWatcherFn: (r: string, m: unknown, cb: unknown, o?: { onError?: (e: Error) => void }) => Promise<{ backend: "parcel"; close(): Promise<void> }>;
       startLiveWatch(): Promise<void>; doDeepScan(): Promise<unknown>; runDriftAuditNow(): Promise<void>;
       maybeClearWatcherDegradedAfterScan(g: number, c: { coverage: "full-tree" | "pruned"; errorGenAtStart: number }): void;
       safetyTimer?: ReturnType<typeof setTimeout>; deepTimer?: ReturnType<typeof setInterval>;
     };
     let onError: ((e: Error) => void) | undefined;
-    d.startWatcherFn = (_r, _m, _cb, o) => { onError = o?.onError; return Promise.resolve({ close: async () => {} }); };
+    d.startWatcherFn = (_r, _m, _cb, o) => { onError = o?.onError; return Promise.resolve({ backend: "parcel", close: async () => {} }); };
     d.cache = await HashCache.load(root);
     d.manifest = await scanManifest(root, d.matcher as never, d.cache);
     await d.startLiveWatch();

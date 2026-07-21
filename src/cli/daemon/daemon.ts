@@ -133,6 +133,11 @@ const CAPABILITY_INITIAL_DELAY_MS = 5 * 60_000;
 const CAPABILITY_INTERVAL_MS = 6 * 60 * 60_000;
 const SYNC_STATE_HEARTBEAT_MS = 60 * 60_000;
 export const GIT_BUSY_RETRY_DELAYS_MS = [2_000, 8_000] as const;
+
+export interface GitBusyRetryClock {
+  setTimeout(fn: () => void, ms: number): unknown;
+  clearTimeout(handle: unknown): void;
+}
 export type PushProvenance = Readonly<{ signal: boolean; candidate: boolean; scan: boolean; other: boolean }>;
 
 export function gitCaptureSampleForProvenance(provenance: PushProvenance): GitCaptureSample | undefined {
@@ -309,9 +314,11 @@ export class RboxDaemon {
   private gitSafetyFloorRequired = false;
   private gitBackendFallbackPending = false;
   private authoritativeGitRepos: readonly DiscoveredGitRepo[] = [];
+  /** Additive dir discoveries since the latest shrinking safety snapshot. */
+  private planDiscoveredGitDirOwners = new Set<string>();
   private hasAuthoritativeGitSnapshot = false;
   private pendingPushReasons = { signal: false, candidate: false, scan: false, other: false };
-  private gitBusyEpisode?: { timers: Array<ReturnType<typeof setTimeout>>; queuedStages: Array<1 | 2> };
+  private gitBusyEpisode?: { timers: unknown[]; queuedStages: Array<1 | 2> };
 
   private watcher?: Watcher;
   private ws?: WebSocket;
@@ -435,6 +442,7 @@ export class RboxDaemon {
   private readonly pullOnly: boolean;
   private readonly acquireSyncMutexFn: (root: string) => Promise<DaemonMutexResult>;
   private readonly now: () => number;
+  private readonly gitBusyRetryClock: GitBusyRetryClock;
   private lockStarvationEpisode?: LockStarvationEpisode;
   private mutexHolderKey?: string;
   private mutexBackoffTier = 0;
@@ -461,11 +469,16 @@ export class RboxDaemon {
       acquireSyncMutex?: (root: string) => Promise<DaemonMutexResult>;
       now?: () => number;
       monotonicNow?: () => number;
+      gitBusyRetryClock?: GitBusyRetryClock;
       log?: DaemonLogSink;
       onStopped?: () => void;
     } = {},
   ) {
     this.log = opts.log ?? ((message) => console.log(`${new Date().toISOString()} ${message}`));
+    this.gitBusyRetryClock = opts.gitBusyRetryClock ?? {
+      setTimeout: (fn, ms) => setTimeout(fn, ms),
+      clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+    };
     this.onStopped = opts.onStopped;
     this.api = new RboxApi(cfg.remoteUrl, cfg.token, cfg.remoteWorkspaceId, cfg.projectId, this.log);
     this.telemetry = new TelemetryQueue(this.api, this.log);
@@ -571,20 +584,7 @@ export class RboxDaemon {
     this.deepTimer = setInterval(() => this.request("deepScan"), jitter(DEEP_SCAN_MS));
     const signalDebouncer = createSignalDebouncer((batch) => this.handleGitSignalBatch(batch), 400, 3000);
     this.gitSignalDebouncer = signalDebouncer;
-    const registryEligible = gitRefSideChannelEligible();
-    if (process.platform === "linux" && !registryEligible) {
-      this.gitBackendFallbackPending = true;
-      this.refreshGitSafetyFloor("backend-fallback-pending");
-    }
-    if (registryEligible) {
-      this.gitRefRegistry = new GitRefWatchRegistry({
-        root: this.root,
-        onSignal: () => signalDebouncer.push("signal"),
-        onArmed: () => signalDebouncer.push("other"),
-        onFloorChange: () => this.refreshGitSafetyFloor("registry"),
-        onLog: this.log,
-      });
-    }
+    let initialGitRepos: readonly DiscoveredGitRepo[] = [];
     try {
       this.watcher = await this.startWatcherFn(
         this.root,
@@ -606,7 +606,7 @@ export class RboxDaemon {
             }
           },
           signalDebouncer,
-          onInitialGitRepos: async (repos) => { await this.gitRefRegistry?.upsert(repos); },
+          onInitialGitRepos: async (repos) => { initialGitRepos = repos; },
           onError: (err) => {
             if (!retrustEnabled()) {
               // Design-104 flag OFF (default): today's body, verbatim — one backend
@@ -661,6 +661,20 @@ export class RboxDaemon {
           },
         }
       );
+      const registryEligible = gitRefSideChannelEligible(process.platform, this.watcher.backend);
+      if (registryEligible) {
+        this.gitRefRegistry = new GitRefWatchRegistry({
+          root: this.root,
+          onSignal: () => signalDebouncer.push("signal"),
+          onArmed: () => signalDebouncer.push("other"),
+          onFloorChange: () => this.refreshGitSafetyFloor("registry"),
+          onLog: this.log,
+        });
+        await this.gitRefRegistry.upsert(initialGitRepos);
+      } else if (process.platform === "linux") {
+        this.gitBackendFallbackPending = true;
+        this.refreshGitSafetyFloor("backend-fallback");
+      }
       this.watcherSessionId = crypto.randomBytes(16).toString("hex");
     } catch (e) {
       await this.gitRefRegistry?.close();
@@ -728,12 +742,22 @@ export class RboxDaemon {
     const next = process.platform === "linux" && (
       this.gitBackendFallbackPending
       || this.authoritativeGitRepos.some((repo) => repo.kind === "dir")
+      || this.planDiscoveredGitDirOwners.size > 0
       || this.gitRefRegistry?.state.floorRequired === true
     );
     if (next === this.gitSafetyFloorRequired) return;
     this.gitSafetyFloorRequired = next;
     if (next) this.pinSafetyFloor();
     this.log(`git safety floor ${next ? "required" : "released"}: ${reason}`);
+  }
+
+  /** Backend-independent additive plan observation. A registry, when present,
+   * owns arming; this daemon-owned claim independently pins Chokidar/fallback
+   * until the next complete safety snapshot is allowed to shrink it. */
+  private async observePlanGitRepos(repos: readonly DiscoveredGitRepo[]): Promise<void> {
+    for (const repo of repos) if (repo.kind === "dir") this.planDiscoveredGitDirOwners.add(repo.relPath);
+    await this.gitRefRegistry?.upsert(repos);
+    this.refreshGitSafetyFloor("plan-discovery");
   }
 
   /**
@@ -847,17 +871,17 @@ export class RboxDaemon {
 
   private noteGitBusyDeferred(): void {
     if (this.stopped || this.gitBusyEpisode) return;
-    const episode = { timers: [] as Array<ReturnType<typeof setTimeout>>, queuedStages: [] as Array<1 | 2> };
+    const episode = { timers: [] as unknown[], queuedStages: [] as Array<1 | 2> };
     this.gitBusyEpisode = episode;
     const schedule = (stage: 1 | 2, delayMs: number) => {
-      const timer = setTimeout(() => {
+      const timer = this.gitBusyRetryClock.setTimeout(() => {
         if (this.stopped || this.gitBusyEpisode !== episode) return;
         episode.queuedStages.push(stage);
         this.requestPush("other");
         this.writeAmbientStatus();
         void this.pump();
       }, delayMs);
-      timer.unref?.();
+      (timer as { unref?: () => void }).unref?.();
       episode.timers.push(timer);
     };
     schedule(1, GIT_BUSY_RETRY_DELAYS_MS[0]);
@@ -878,7 +902,7 @@ export class RboxDaemon {
 
   private clearGitBusyEpisode(): void {
     if (!this.gitBusyEpisode) return;
-    for (const timer of this.gitBusyEpisode.timers) clearTimeout(timer);
+    for (const timer of this.gitBusyEpisode.timers) this.gitBusyRetryClock.clearTimeout(timer);
     this.gitBusyEpisode = undefined;
   }
 
@@ -1327,10 +1351,7 @@ export class RboxDaemon {
         report,
         onGitLog: this.log, // design 43 §10: capture/carry/defer/remove forensics in the daemon log
         onGitDeferralsSaved: (state) => this.observeDurableGitState(state),
-        onGitReposDiscovered: async (repos) => {
-          await this.gitRefRegistry?.upsert(repos);
-          this.refreshGitSafetyFloor("plan-discovery");
-        },
+        onGitReposDiscovered: (repos) => this.observePlanGitRepos(repos),
         onGitBusyDeferred: (repos) => { if (repos.length > 0) this.noteGitBusyDeferred(); },
         onProgress: (done, total, phase, detail, bytes) => this.onTransferProgress(done, total, phase, detail, bytes), // design 45 + 88: progress plus local status path
         onPullApplied: (a) => this.recordPullApplied(a), // design 45: the 409-recovery pull mutates the tree too
@@ -2229,6 +2250,7 @@ export class RboxDaemon {
       .sort((a, b) => a.relPath.localeCompare(b.relPath));
     if (scanKind) {
       this.authoritativeGitRepos = repos;
+      this.planDiscoveredGitDirOwners.clear();
       this.hasAuthoritativeGitSnapshot = true;
       this.gitBackendFallbackPending = false;
       if (registrySnapshotEpoch !== undefined) await this.gitRefRegistry?.applySnapshot(repos, registrySnapshotEpoch, true);

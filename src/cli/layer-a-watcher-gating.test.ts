@@ -71,7 +71,7 @@ function harness(): {
   daemon.startWatcherFn = async (_root, _matcher, _cb, opts) => {
     if (initFails) throw new Error("forced watcher init failure");
     onError = opts?.onError;
-    return { close: async () => {} };
+    return { backend: "parcel", close: async () => {} };
   };
   daemon.replaceManifestFromScan = async (_cache, _previous, _stats, _kind, mode) => {
     modes.push(mode);
