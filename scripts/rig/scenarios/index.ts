@@ -12,6 +12,7 @@ import { gitConfigSync } from "./git-config-sync.js";
 import { gitShapes } from "./git-shapes.js";
 import { gitFf } from "./git-ff.js";
 import { gitJoinAhead } from "./git-join-ahead.js";
+import { gitCommitPropagation } from "./git-commit-propagation.js";
 
 export const SCENARIOS: Record<string, Scenario> = {
   "onboard-smoke": onboardSmoke,
@@ -24,6 +25,7 @@ export const SCENARIOS: Record<string, Scenario> = {
   "git-shapes": gitShapes,
   "git-ff": gitFf,
   "git-join-ahead": gitJoinAhead,
+  "git-commit-propagation": gitCommitPropagation,
   "conductor-initial-sync": conductorInitialSync,
   "chaos-restart": chaosRestart,
 };
@@ -36,7 +38,11 @@ export const SCENARIOS: Record<string, Scenario> = {
  * container 1.0.0 has a known tendency to wedge on kill/start. That risk does not belong
  * in the every-PR gate; run it explicitly + nightly instead (design 56 §11's fast/nightly
  * split also omits it). Its wall time is additionally network-variable (resume push + B
- * pull), so it's a poor fit for a tight PR loop regardless.
+ * pull), so it's a poor fit for a tight PR loop regardless. git-commit-propagation is
+ * EXCLUDED too (explicit/nightly): it runs a change-shape matrix (commits, file-plane
+ * edits, and a ~200MB repo moved through the dev API) and, until design 172 lands, its
+ * empty-commit rounds wait out the 60s safety scan — too slow and red-by-design for the
+ * every-PR gate. Run it explicitly to guard design 172.
  */
 export const FAST_SUITE = ["onboard-smoke", "two-device-live", "mass-delete-guard", "type-flip", "daemon-idle-cpu", "git-entanglement", "git-join-ahead"] as const;
 

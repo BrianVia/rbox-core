@@ -29,14 +29,22 @@ test("no live watcher never backs off — the periodic scan IS the sync mechanis
   expect(nextSafetyDelay(CAP, { watcherLive: false, churned: false })).toBe(FLOOR);
 });
 
+test("design 172: an active Linux git ref-watch pins quiet safety cadence to 60s", () => {
+  expect(nextSafetyDelay(CAP, { watcherLive: true, churned: false, pinToFloor: true })).toBe(FLOOR);
+  expect(nextSafetyDelay(FLOOR, { watcherLive: true, churned: false, pinToFloor: true })).toBe(FLOOR);
+  // The non-git case is byte-for-byte policy-equivalent to the existing backoff.
+  expect(nextSafetyDelay(FLOOR, { watcherLive: true, churned: false, pinToFloor: false })).toBe(120_000);
+});
+
 interface SafetyInternals {
   startWatcherFn: (
     root: string,
     matcher: unknown,
     cb: (events: unknown[]) => void,
-    opts?: { onError?: (err: Error) => void }
-  ) => Promise<{ close(): Promise<void> }>;
+    opts?: { onError?: (err: Error) => void; onGitSignal?: () => void }
+  ) => Promise<{ gitRefWatchActive?: boolean; close(): Promise<void> }>;
   startLiveWatch(): Promise<void>;
+  advanceSafetyCadenceForTick(): void;
   churnSinceSafety: boolean;
   watcherHealthy: boolean;
   trustState: "trusted" | "suspect" | "fused";
@@ -46,14 +54,60 @@ interface SafetyInternals {
   maybeClearWatcherDegradedAfterScan(opWatcherErrorGeneration: number, cov: { coverage: "full-tree" | "pruned"; errorGenAtStart: number }): void;
   safetyDelay: number;
   pumping: boolean;
-  want: { push: boolean };
-  watcher?: { close(): Promise<void> };
+  want: { push: boolean; fullScan: boolean };
+  pendingEvents: unknown[];
+  watcherUnsettled: boolean;
+  watcher?: { gitRefWatchActive?: boolean; close(): Promise<void> };
   safetyTimer?: ReturnType<typeof setTimeout>;
   deepTimer?: ReturnType<typeof setInterval>;
   matcher: { ignores(path: string): boolean };
   cfg: { respectGitignore?: boolean };
   reloadWorkspaceConfigIfChanged(): Promise<void>;
 }
+
+test("design 172: onGitSignal requests push without pending/file-settle state", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-git-signal-")));
+  const daemon = makeDaemon(root);
+  let signal: (() => void) | undefined;
+  daemon.startWatcherFn = (_root, _matcher, _cb, opts) => {
+    signal = opts?.onGitSignal;
+    return Promise.resolve({ gitRefWatchActive: true, close: async () => {} });
+  };
+  daemon.pumping = true;
+
+  try {
+    await daemon.startLiveWatch();
+    signal!();
+    expect(daemon.want.push).toBe(true);
+    expect(daemon.churnSinceSafety).toBe(true);
+    expect(daemon.pendingEvents).toEqual([]);
+    expect(daemon.watcherUnsettled).toBe(false);
+  } finally {
+    if (daemon.safetyTimer) clearTimeout(daemon.safetyTimer);
+    if (daemon.deepTimer) clearInterval(daemon.deepTimer);
+    await daemon.watcher?.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("design 172: daemon holds the git safety floor only on Linux", async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-git-floor-")));
+  const daemon = makeDaemon(root);
+  daemon.startWatcherFn = () => Promise.resolve({ gitRefWatchActive: true, close: async () => {} });
+  daemon.pumping = true;
+
+  try {
+    await daemon.startLiveWatch();
+    daemon.safetyDelay = FLOOR;
+    daemon.advanceSafetyCadenceForTick();
+    expect(daemon.safetyDelay).toBe(process.platform === "linux" ? FLOOR : 120_000);
+  } finally {
+    if (daemon.safetyTimer) clearTimeout(daemon.safetyTimer);
+    if (daemon.deepTimer) clearInterval(daemon.deepTimer);
+    await daemon.watcher?.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 function makeDaemon(root: string, opts: { pullOnly?: boolean } = {}): SafetyInternals {
   const cfg = { remoteWorkspaceId: "w", projectId: "root", deviceId: "d", rootPath: root, remoteUrl: "https://example.invalid", token: "" };

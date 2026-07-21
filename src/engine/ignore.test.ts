@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { buildIgnoreMatcher, nativePruneGlobs } from "./ignore.js";
+import { buildIgnoreMatcher, isGitRefSignal, isHardExcluded, nativePruneGlobs } from "./ignore.js";
 import { scanManifest } from "./manifest.js";
 
 const exec = promisify(execFile);
@@ -67,6 +67,58 @@ describe("ignore matcher — .rbox hard exclusion (design 12 C8)", () => {
   });
 });
 
+describe("design 172 — Git ref signals stay outside the sync plane", () => {
+  test("ref-signal predicate accepts the complete supported surface and rejects non-signals", () => {
+    const signals = [
+      ".git/HEAD",
+      ".git/packed-refs",
+      ".git/refs/heads/x",
+      ".git/refs/tags/x",
+      ".git/refs/stash",
+      ".git/worktrees/w/HEAD",
+      ".git/worktrees/w/refs/heads/x",
+      ".git/modules/m/refs/heads/x",
+      ".git/modules/a/modules/b/HEAD",
+      "nested/repo/.git/refs/tags/v1",
+    ];
+    const nonSignals = [
+      ".git/refs/heads/x.lock",
+      ".git/packed-refs.lock",
+      ".git/refs/rbox-wip/pin",
+      ".git/refs/remotes/origin/x",
+      ".git/objects/ab/cd",
+      ".git/logs/HEAD",
+      ".git/index",
+      ".git/config",
+      ".git/reftable/tables.list",
+      ".git/modules/m/logs/refs/heads/x",
+      "HEAD",
+      "refs/heads/x",
+      "src/.git-state/refs/heads/x",
+    ];
+    for (const rel of signals) expect(isGitRefSignal(rel), rel).toBe(true);
+    for (const rel of nonSignals) expect(isGitRefSignal(rel), rel).toBe(false);
+  });
+
+  test("seam isolation: hard excludes and a manifest scan still reject every .git path", async () => {
+    const d = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-git-seam-"));
+    try {
+      await fs.mkdir(path.join(d, ".git", "refs", "heads"), { recursive: true });
+      await fs.writeFile(path.join(d, ".git", "HEAD"), "ref: refs/heads/main\n");
+      await fs.writeFile(path.join(d, ".git", "refs", "heads", "main"), "a".repeat(40));
+      await fs.writeFile(path.join(d, "kept.txt"), "kept");
+      const matcher = buildIgnoreMatcher(d);
+      expect(matcher.ignores(".git/refs/heads/main")).toBe(true);
+      expect(isHardExcluded(".git/refs/heads/main")).toBe(true);
+      const manifest = await scanManifest(d, matcher);
+      expect(manifest.files.map((entry) => entry.path)).toEqual(["kept.txt"]);
+      expect(manifest.files.some((entry) => entry.path === ".git" || entry.path.startsWith(".git/"))).toBe(false);
+    } finally {
+      await fs.rm(d, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("nativePruneGlobs — coarse native watcher prune, negation-aware (design §41)", () => {
   const mkroot = async (rboxignore?: string): Promise<string> => {
     const d = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-np-"));
@@ -75,14 +127,21 @@ describe("nativePruneGlobs — coarse native watcher prune, negation-aware (desi
   };
   const prunes = (globs: string[], dir: string) => globs.includes(`**/${dir}`) && globs.includes(`**/${dir}/**`);
 
-  test("a DEFAULT tree native-prunes node_modules, .git, .rbox AND the build dirs", async () => {
+  test("a DEFAULT tree admits .git refs but prunes only its top-level objects/logs stores", async () => {
     const d = await mkroot();
     try {
       const g = nativePruneGlobs(d);
       // The regression guard: the built-in `!.env.*` negations must NOT un-prune build dirs.
-      for (const dir of ["node_modules", ".git", ".rbox", "dist", "build", ".next", "target"]) {
+      for (const dir of ["node_modules", ".rbox", "dist", "build", ".next", "target"]) {
         expect(prunes(g, dir)).toBe(true);
       }
+      expect(prunes(g, ".git")).toBe(false);
+      expect(g).toContain("**/.git/objects");
+      expect(g).toContain("**/.git/objects/**");
+      expect(g).toContain("**/.git/logs");
+      expect(g).toContain("**/.git/logs/**");
+      expect(g.some((glob) => glob.includes(".git/modules"))).toBe(false);
+      expect(g.some((glob) => glob.includes("**/{objects,logs}"))).toBe(false);
       // subtree form is present so a native watcher's CHILD events are pruned too
       expect(g).toContain("**/node_modules/**");
     } finally {
@@ -115,9 +174,10 @@ describe("nativePruneGlobs — coarse native watcher prune, negation-aware (desi
     const d = await mkroot("!.env.example\n!keep.txt\n");
     try {
       const g = nativePruneGlobs(d);
-      for (const dir of ["node_modules", ".git", ".rbox", "dist", "build", ".next", "target"]) {
+      for (const dir of ["node_modules", ".rbox", "dist", "build", ".next", "target"]) {
         expect(prunes(g, dir)).toBe(true);
       }
+      expect(prunes(g, ".git")).toBe(false);
     } finally {
       await fs.rm(d, { recursive: true, force: true });
     }

@@ -148,6 +148,7 @@ export { hashFile, hashBytes } from "./hash.js";
 export {
   BUILTIN_IGNORE,
   HARD_PRUNE_DIRS,
+  isGitRefSignal,
   nativePruneGlobs,
   buildIgnoreMatcher,
   effectiveIgnoreRules,
