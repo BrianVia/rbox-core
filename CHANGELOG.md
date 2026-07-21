@@ -6,6 +6,21 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.7.13] — 2026-07-21 — commits sync in seconds
+
+### Changed
+- Git commits now sync to your other machines in a few seconds instead of up
+  to a minute. rbox watches each repository's ref surface (branch tips, tags,
+  HEAD) directly, so a commit, amend, branch switch, or tag — even one that
+  changes no working-tree files — triggers an immediate sync instead of
+  waiting for the periodic safety scan. Repository contents under `.git` are
+  still never synced as files.
+
+### Known limitation
+- A repository created or cloned into the workspace *after* the daemon
+  started falls back to the (now always ≤60s) safety scan for commit-only
+  changes until the daemon restarts. A dedicated fix is in design (172B).
+
 ## [1.7.12] — 2026-07-20 — faster sync recovery
 
 ### Fixed
