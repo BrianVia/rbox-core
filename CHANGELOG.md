@@ -6,6 +6,23 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.7.16] — 2026-07-21 — "your repo explains itself"
+
+### Added
+- `rbox git resolve <repo> keep-mine` — when rbox is holding an old synced
+  snapshot your repo has moved past, keep-mine publishes YOUR local git state
+  as the truth. It previews exactly what the old snapshot has that your repo
+  doesn't (in plain English), asks for confirmation, and applies safely on the
+  next sync — your files, branches, and history are never touched.
+- Held repositories now explain themselves: `rbox status` says why a repo is
+  paused, reassures you the repo itself is healthy, and names the exact
+  command to fix it.
+
+### Fixed
+- Repositories held for sync-bookkeeping reasons no longer re-process at full
+  cost on every sync — the skip that shipped in 1.7.15 now actually engages
+  for the common held shapes (it never could before).
+
 ## [1.7.15] — 2026-07-21 — "stuck repos heal themselves"
 
 ### Fixed
