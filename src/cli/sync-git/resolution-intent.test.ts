@@ -5,7 +5,7 @@ import path from "node:path";
 import { captureGitState, LocalBlobStore, type BlobStore, type GitSection } from "../../engine/index.js";
 import { git, repoCtx } from "../../engine/git/shared.js";
 import type { GitResolutionBinding, GitResolutionIntent } from "../config.js";
-import { discardedIncomingOids, finalResolutionReport, preliminaryResolutionReport, reportAuthorized } from "./resolution-intent.js";
+import { discardedIncomingOids, finalResolutionReport, preliminaryResolutionReport, reportAuthorized, type ResolutionDiscardReport } from "./resolution-intent.js";
 
 const roots: string[] = [];
 const store = {} as BlobStore;
@@ -117,6 +117,38 @@ test("design 176 final report permits only lanes recorded by the confirmed inten
   expect(reportAuthorized(intent, report)).toBe(false);
   intent.authorizedLanes = ["tag:refs/tags/release"];
   expect(reportAuthorized(intent, report)).toBe(true);
+});
+
+test("an indeterminate lane passes only when the confirmed intent covers that exact lane, and its oids stay preserved", async () => {
+  const { ctx, b, unrelated } = await fixture();
+  // Field shape (2026-07-21): the pending branch oid no longer exists anywhere
+  // (squash-merged PR, deleted worktree, deleted origin branch), so ancestry
+  // can never be proven and the lane is permanently indeterminate.
+  const missingOid = "f".repeat(40);
+  const report = await finalResolutionReport({
+    ctx,
+    pending: section({ "refs/heads/main": b, "refs/heads/gone": missingOid }),
+    candidate: section({ "refs/heads/main": b, "refs/heads/gone": unrelated }),
+    store,
+    kek,
+  });
+  expect(report.lanes.find((lane) => lane.lane === "branch:refs/heads/gone")?.disposition).toBe("indeterminate");
+  const intent = { authorizedLanes: [] } as unknown as GitResolutionIntent;
+  expect(reportAuthorized(intent, report)).toBe(false);
+  intent.authorizedLanes = ["branch:refs/heads/main"];
+  expect(reportAuthorized(intent, report)).toBe(false);
+  intent.authorizedLanes = ["branch:refs/heads/gone"];
+  expect(reportAuthorized(intent, report)).toBe(true);
+  expect(discardedIncomingOids(report)).toContain(missingOid);
+});
+
+test("indeterminate index and op-state lanes refuse even when authorized — their preservation set cannot be enumerated", () => {
+  const base = { detail: "could not be proven" };
+  for (const lane of ["index", "op-state"]) {
+    const report = { forceRequired: true, lanes: [{ lane, disposition: "indeterminate", ...base }] } as unknown as ResolutionDiscardReport;
+    const intent = { authorizedLanes: [lane] } as unknown as GitResolutionIntent;
+    expect(reportAuthorized(intent, report)).toBe(false);
+  }
 });
 
 test("design 176 closed exact lanes report stash, HEAD, scope, index, op-state, config, and every discarded root", async () => {

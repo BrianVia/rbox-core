@@ -330,12 +330,19 @@ export async function finalResolutionReport(args: {
 
 export function reportAuthorized(intent: GitResolutionIntent, report: ResolutionDiscardReport): boolean {
   const authorized = new Set(intent.authorizedLanes);
+  // An indeterminate branch lane (ancestry unprovable because the incoming oid
+  // no longer resolves anywhere) is acceptable only when the user already
+  // confirmed discarding that exact lane in the preview; branch lanes always
+  // carry their pending oid, so preservation via discardedIncomingOids still
+  // holds. Index/op-state indeterminacy loses the oid enumeration entirely, so
+  // those lanes keep refusing — preservation completeness cannot be shown.
   return report.lanes.every((lane) => lane.disposition === "subsumed"
-    || (lane.disposition === "not-subsumed" && authorized.has(lane.lane)));
+    || (lane.disposition === "not-subsumed" && authorized.has(lane.lane))
+    || (lane.disposition === "indeterminate" && lane.lane.startsWith("branch:refs/heads/") && authorized.has(lane.lane)));
 }
 
 export function discardedIncomingOids(report: ResolutionDiscardReport): string[] {
   return [...new Set(report.lanes
-    .filter((lane) => lane.disposition === "not-subsumed")
+    .filter((lane) => lane.disposition === "not-subsumed" || lane.disposition === "indeterminate")
     .flatMap((lane) => lane.incomingOids ?? []))].sort();
 }
