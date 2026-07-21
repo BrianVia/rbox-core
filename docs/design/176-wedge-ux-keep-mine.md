@@ -1,8 +1,8 @@
 # 176 — Wedge UX: `keep-mine`, legible deferrals, and the held-skip eligibility defect
 
-Status: DRAFT v1 — ready for review round 1
+Status: DRAFT v2 — r1 folded (2-review parallel), awaiting serial confirmation
 Relates: 174 (livelock self-heal; this ships its manual escape hatch),
-130 (manual resolution authority — the arm keep-mine lands through),
+130 (publisher-ack composition — the arm keep-mine lands through),
 128 (show-me/take-theirs token flow — the scaffolding keep-mine completes),
 173 (two-writer divergence — still reserved; 176 does not touch it)
 
@@ -38,115 +38,148 @@ grokkable." Three deliverables:
 
 ### Semantics
 For a repo with a pending (unapplied incoming) section and/or apply deferral:
-confirm a snapshot of CURRENT LOCAL git state; publish it as the new remote
-truth through the EXISTING capture path; drop the pending section and its
-sidecars in the same accepted-ACK transition 174-B already uses. Local refs,
-index, stash, worktrees: untouched — keep-mine never mutates the repo, it
-mutates rbox's belief.
+confirm an INTENT to publish CURRENT LOCAL git state as the new remote truth.
+The intent is executed only by the next ordinary push. Local refs, index,
+stash, worktrees, BASE, pending, and sidecars remain untouched until that push
+is accepted; keep-mine mutates rbox's belief only in the accepted-ACK
+transition 174-B already uses.
 
-### Mechanism (all existing machinery, wired end-to-end)
-1. **Snapshot + token**: reuse show-me's snapshot/token flow verbatim
-   (128). `rbox git resolve <repo> keep-mine` prints the snapshot summary +
-   confirmation command; `--confirm <token>` binds the action to exactly the
-   state the user saw (token mismatch → re-show, same as take-theirs).
-2. **Incoming-artifact acknowledgment**: the pending section may carry
-   artifacts local does not (the non-subsumed branch tips, a remote index/
-   stash). keep-mine REQUIRES `--force-discard-incoming` whenever any pending
-   lane is not subsumed by local (the 174 v6 proof, reused as a REPORT):
-   the confirmation output lists, in plain English, exactly what the stale
-   snapshot contains that local does not (per lane, bounded count), e.g.
-   "the old snapshot has branch codex/deploy-stack-matrix at a version your
-   repo rewrote — confirming discards the old version's sync metadata; your
-   local branch and its history are untouched (git reflog still has
-   everything)." With every lane subsumed, the flag is not required.
-3. **State transition**: under the workspace mutex — clear
-   `gitPendingRemote[rel]`, `partial[rel]`, `attempt`, the apply deferral
-   (ordered predecessor-bound clear), through the design-130 `manual`
-   authority for any BASE effect (the composer arm exists; keep-mine lands
-   the confirmed LOCAL snapshot as the manual candidate — for refs this is
-   authority to RETAIN present local truth, never to invent P/A artifacts;
-   130's rule "an already-terminal positive branch … receives a new `manual`
-   origin rather than invented P authority" is the exact clause this uses).
-4. **Republish**: request an immediate push. With pending gone, the ordinary
-   plan captures fresh local truth; the 130 normalizer authors tombstones for
-   every branch this device previously advertised and has since rewritten
-   (advertised-based authoring — ALREADY the shipped behavior), so followers
-   converge with the standard preservation guarantees. No new wire semantics.
-5. **Refusals (fail closed, plain English)**: journal recovery non-terminal;
-   git busy; repo mid-operation (merge/rebase in progress); degraded mutex;
-   worktree-ownership holds on the CURRENT checkout ref (the checkout plane
-   keeps its own rules — keep-mine resolves the SECTION, not a contested
-   checkout). Each refusal states the reason and the retry condition in one
-   sentence.
+### Mechanism
+1. **Inspect, preview, then record intent**: `rbox git resolve <repo>
+   keep-mine` inspects the repo and prints the plain summary plus a
+   **PRELIMINARY discard preview**, best-effort from pending versus LIVE state
+   and labeled "final report is confirmed at publish time." The confirmation
+   token binds refs/reflogs, HEAD, index, op-state, stash, oracle receipt,
+   canonical config plus its read/ownership disposition, effective ref scope
+   and capture policy, repo kind and identity, and the actual pending key.
+   Those inputs are recomputed immediately before the intent write.
+   `--confirm <token>` (with `--force-discard-incoming` when the preliminary
+   report contains a non-subsumed lane) writes a token-bound, single-use
+   `RESOLUTION-INTENT` sidecar on the RepoRecord, lineage-bound like every 130
+   sidecar. It changes no BASE, pending, ref, partial, attempt, or deferral.
+   Any bound-input change voids the intent with a plain snapshot-mismatch
+   message rather than performing a differently reasoned action.
+2. **The next push executes the intent**: intent presence makes the pending
+   arm enter capture unconditionally; the pre-probe still refuses a busy repo
+   or non-terminal journal recovery per 174. With the FINAL normalized
+   candidate in hand, push computes a new directional per-lane discard report
+   from pending to candidate. The report is a small typed predicate built on
+   `equalOrFastForward` and exact-equality helpers; 174 v6's boolean is not
+   reused as a report. Each lane is `subsumed`, `not-subsumed`, or
+   `indeterminate`; one-sided absence is directional, and indeterminate
+   evidence refuses. A pending-absent lane is vacuous; pending refs use the
+   equal-or-descendant relation, while index, stash, config, and other exact
+   lanes report loss only when pending content is absent or unequal in the
+   candidate. Rendering may bound detail without dropping the force decision.
+   Only lanes recorded by the confirmed intent are exempted from the
+   supersession refusal. Every discarded incoming oid reachable locally
+   receives take-theirs-grade preservation pins. The 174-I3 tombstone
+   retention rule treats P as a normalizer retention source and carries the
+   pending section's tombstone chains and generation.
+3. **Publish, then clear**: publication proceeds through the ordinary push.
+   Only its accepted ACK performs 174-B's ordered clears of pending, partial,
+   attempt, predecessor-bound apply deferral, and `RESOLUTION-INTENT`. Every
+   capture, upload, HTTP, conflict, state-save, crash, or daemon-stop failure
+   before accepted ACK leaves the intent and P intact.
+4. **BASE stays on existing authority**: keep-mine never routes BASE through
+   manual authority and never invents A/P artifacts. The committed section
+   folds through the existing publisher-ack composer arm. At intent time it
+   refuses, with a plain explanation, the branch presence/absence shape that
+   arm cannot express — a pending branch absent locally that BASE holds
+   present — and the reserved-173 non-FF-divergent remote. It does not clear
+   either shape.
+5. **No locked-proof claim**: keep-mine makes no locked ref assertions. The
+   push pipeline's existing brackets are the concurrency boundary; the
+   intent token is the staleness guard. Other fail-closed refusals remain
+   plain and typed: an in-progress Git operation, degraded mutex, or a
+   worktree-ownership hold on the current checkout ref states the reason and
+   retry condition in one sentence.
 
 ### Non-goals
 - No ref mutation, no working-file mutation, no stash mutation.
 - No change to automatic supersession (174-B) or its lanes.
 - Not a fleet-wide force: exactly one repo per invocation, token-confirmed.
 - 173 (two-writer spurious divergence) stays reserved.
+- A divergent branch that is the current checked-out branch remains subject
+  to the checkout plane and is refused for 173/manual Git; the field wedge is
+  on stale side branches.
 
 ## 3. B — Legible deferral surfacing
 
-1. **`rbox status` deferral lines get a second, plain sentence.** Today:
-   `git deferred 1h: local commits on branch main (Dfinitiv/savvy-core)`.
-   Add: `→ your repo moved ahead of the last synced snapshot; your work is
-   safe. Fix: rbox git resolve Dfinitiv/savvy-core` (reason-specific
-   templates; bounded set — one per GitDeferralReason).
+1. **`rbox status` gets a separate, plain-English companion line.** The
+   shared `git deferred` line keeps its exact current byte shape for daemon
+   logs and doctor's fail-closed privacy redaction. Human status rendering adds a
+   reason-templated companion line only (including the `--git` surface,
+   without duplicating its existing guidance); JSON does not change. It says
+   the repo is healthy and only rbox's bookkeeping is paused, then presents
+   the two verbs: `keep-mine` means "publish my work" and `take-theirs` means
+   "discard my local changes and follow incoming." The named fix for keeping
+   work is `rbox git resolve <repo> keep-mine`.
 2. **show-me output rewrite**: lead with a three-line summary (what happened,
    what is safe, what to do) BEFORE the per-ref detail; per-ref lines get
    human phrasing ("branch X was rewritten locally after the snapshot" not
    "local-only heads/X reflog:"). The detail stays (it is the evidence), the
-   summary is the interface.
+   summary is the interface. Replace the current "keep-mine is unavailable"
+   copy with the same explicit two-verb choice and the named `keep-mine`
+   publish-my-work command.
 3. **Log-language pass** (bounded): the ~12 highest-frequency git-sync glog
-   lines get the same treatment — mechanism stays greppable via a stable
-   prefix token, the human clause follows. Grep-compat: existing prefixes
-   (`git-sync deferred`, `git-sync followed`, `git deferred`) are FROZEN —
-   additions only after the colon. The rig scenarios' regexes must not break
-   (test 5 below).
+   lines get the same treatment without changing any frozen grammar, not
+   merely a prefix. A human clause may use only fields that the grammar's
+   consumers already ignore, or a new status-only line; parsed segments are
+   never reshaped. Current consumers are explicitly pinned: follow and
+   follow-matrix exact assertions, git-sync scheduling/concurrency parsers,
+   sync-cmd routing, status parsers, doctor redaction, shared rig fixtures,
+   git-held-livelock, git-commit-propagation, and git-shapes.
 
 ## 4. C — Held-skip eligibility defect (field: skippedHeld=0 on idle Mac)
 
-Hypothesis to verify FIRST (implementation begins with this): a held
-"applied" follow records the composer's pending disposition as a merged
-blocker (apply.ts merges composer state per 174 r2 finding 1); that blocker
-is outside the `{local-commits, local-stash}` allowlist, so every held repo
-with a pending section — i.e. EVERY repo the skip was built for — is
-permanently ineligible. The rig scenario could not catch it: its skip
-observation was opportunistic (run-3 note "skippedHeld observed: false").
+The field topology records the held repo's own composer-pending disposition
+as a merged blocker when its composition is pending. That synthetic blocker
+sits outside the `{local-commits, local-stash}` classification allowlist and
+prevents the skip even when the repo's own classification blockers are all
+allowlisted. This affects that proven field shape, not every pending held
+repo.
 
-Fix direction (pending verification): the composer-pending disposition of the
-HELD REPO ITSELF is not an independent blocker — it is the *consequence* of
-the allowlisted hold. Eligibility must treat `composer-pending` as neutral
-when every CAUSAL blocker is allowlisted, while a composer-pending WITHOUT any
-classification blocker (the r2 vacuity case) still refuses via the non-empty
-rule. If verification finds a different cause, document and fix that instead.
-MUST add: a non-opportunistic rig assertion — with the daemon otherwise idle,
-the second held pull MUST report `skippedHeld>=1` (this closes the assertion
-gap that let the defect ship).
+Neutralize only a blocker with `provenance:"composer"` when the disposition
+is pending and the repo's own classification blockers are all allowlisted.
+Never key neutralization on the reason string. Independent composer failures,
+including foreign artifacts and veto gates, remain blocking; a composer
+pending disposition without a classification blocker remains ineligible via
+the non-empty rule. The rig gains a non-opportunistic assertion: with the
+daemon otherwise idle, the second held pull MUST report `skippedHeld>=1`.
 
 ## 5. Tests (MUST)
 
-1. keep-mine end-to-end on the 174 rig wedge shape: seed → keep-mine with
-   token → pending/partial/attempt/deferral cleared → next push publishes →
-   follower converges → steady-state unchanged; repo refs/index/stash
-   byte-identical before/after on the resolving host.
-2. keep-mine with non-subsumed pending lanes refuses without
-   `--force-discard-incoming`; the report names each non-subsumed lane; with
-   the flag it proceeds; with all lanes subsumed the flag is not required.
-3. keep-mine refusals: journal non-terminal, git-busy, in-progress operation,
-   contested checkout ref → typed refusal + plain-English line; nothing
-   cleared.
-4. Deferral templates: every GitDeferralReason renders a plain sentence +
-   fix command; snapshot tests.
-5. Log-language: frozen prefixes unchanged (rig regexes green against the
-   reworded lines); the 174 rig scenario passes unmodified.
-6. Held-skip: the C fix verified by the new non-opportunistic rig assertion
-   plus a unit test of the exact composer-pending + local-commits merge.
+1. Intent lifecycle end-to-end on the 174 rig wedge shape: confirmation
+   writes a lineage- and token-bound intent without changing P or sidecars;
+   config-only, scope-only, pending-key, and other bound-input races void it;
+   accepted ACK alone consumes it and clears pending/partial/attempt/deferral;
+   follower convergence and resolving-host refs/index/stash identity remain
+   unchanged.
+2. A pre-ACK failure table covers capture, upload, 422, 409, state-save,
+   process crash, and daemon stop; every case leaves intent and P byte-intact,
+   and retry can publish normally.
+3. Refused shapes and pre-probe refusals: BASE-present/pending-present/local-
+   absent branch, reserved-173 non-FF-divergent remote, journal non-terminal,
+   git-busy, in-progress operation, and contested checkout ref each produce a
+   typed plain-English refusal and clear nothing.
+4. The rig wedge fixture proves directional report correctness for every
+   lane, including one-sided absence and indeterminate evidence; force is
+   required exactly for authorized non-subsumed lanes. Preservation tests
+   prove pins for every locally reachable discarded incoming oid and carry
+   of P's tombstone chains plus generation.
+5. Grammar-freeze tests pin every consumer enumerated in §3, the exact shared
+   daemon/doctor `git deferred` line and privacy boundary, status-only reason
+   templates and two-verb guidance, `--git` deduplication, and JSON non-change.
+6. Held-skip covers the provenance-gated composer-pending fix, an allowlisted
+   field-shape case, composer-pending vacuity, and independent foreign-
+   artifact/veto controls, plus the non-opportunistic rig assertion.
 7. Field validation: keep-mine on the LIVE savvy-core wedge (founder
    present) — the dry-run that scripts B's copy.
 
 ## 6. Rollout
 
 keep-mine ships enabled (it is explicit-invocation only). C's fix rides the
-same release; expected Mac effect once BOTH land: pulls ~13s immediately from
-the skip (idle), and the wedge resolvable in one confirmed command.
+same release; expected Mac effect once BOTH land: idle pulls skip at ~13s
+between safety-floor validations, with one full ~43s re-follow per one-hour
+safety floor, and the wedge is resolvable in one confirmed command.
