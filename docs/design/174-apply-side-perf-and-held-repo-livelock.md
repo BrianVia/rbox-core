@@ -1,6 +1,6 @@
 # 174 — Apply-side performance: held-repo livelock, git-apply dark time, and pull/push tails
 
-Status: DRAFT v3 — r2 serial findings folded (all 7, as prescribed), awaiting r3 confirmation
+Status: ALIGNED v4 — r3 confirmed 6/7 closed; sole residual (one missing test-10 adversary) fixed exactly as prescribed and self-certified (2026-07-21)
 Author: Claude (session 2026-07-21), field evidence from the live fleet
 Relates: 172 (event-driven capture), 175 (ref side-channel), 130 (follow/ownership model),
 173 (reserved: two-writer spurious divergence — this doc's item B is the ONE-writer sibling)
@@ -477,7 +477,9 @@ seeded by that data. Explicit non-goal here.
     unsupported; `local-commits + indeterminate/unreadable` never skips;
     `local-stash + worktree-ownership` never skips; a composer-only pending
     outcome (empty classification blockers) never skips (non-empty
-    requirement); a `refs/replace/*` entry making a divergent pending tip
+    requirement); a held-ref (`local-commits`) follow whose composer
+    INDEPENDENTLY returns pending records the composer blocker in the merged
+    set and never skips; a `refs/replace/*` entry making a divergent pending tip
     appear ancestral → B carries P; and a journal-present pull performs
     recovery rather than skipping. [r1: C1,C2,C3,C4; r2: 1,2]
 11. **B journal precondition**: terminal none/rolled-back/landed-and-cleared/
