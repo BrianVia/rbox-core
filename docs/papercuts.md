@@ -5,6 +5,19 @@ sessions. Founder-requested (2026-07-18): proactively appended by agents as
 they work; signal for what to fix. Newest first. Keep entries to 2–4 lines:
 what happened, what it cost, fix hint if obvious.
 
+## 2026-07-20
+
+- **Shallow-clone peer state (`M a.txt`… files but no HEAD) reads as
+  corruption — but it's an intended guard.** A `git clone --depth 1` in the
+  workspace lands its files on the peer via the file plane while git-sync
+  *deliberately* defers the section (`preflight.ts`, design 43 §14 v6.1): a
+  shallow repo's `git bundle --all` silently omits history, so rbox
+  fail-closes rather than shipping a corrupt bundle. Correct behavior, NOT a
+  bug. Residual is UX only: the peer looks file-complete with no `git log`,
+  which surprises a user. Small polish: a source-side "shallow clone won't
+  sync history until `--unshallow`" notice. Surfaced by the design-172 rig
+  burst round (which correctly re-inits non-shallow to exercise git-sync).
+
 ## 2026-07-19 (day/evening batch)
 
 - **Mid-run review artifacts caused a false ALIGNED merge.** A long codex
@@ -28,7 +41,6 @@ what happened, what it cost, fix hint if obvious.
   matched) — combined with sandbox cwd resets, this manufactured a phantom
   hang investigation. Print pwd or use absolute paths in automated test
   invocations.
-
 ## 2026-07-19 (overnight)
 
 - **RESOLVED same night (#pending): `scripts/ux/tui.test.ts` required an
