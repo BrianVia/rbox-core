@@ -1,6 +1,6 @@
 # 177 — keep-mine executes at confirm time (kill the intent gap)
 
-Status: DRAFT v7 — architectural pivot holding. History: r1/r2 hardened the
+Status: IMPLEMENTED — v7 ALIGNED (7 review rounds), shipped in PR #390 (merged 2026-07-21); on main awaiting the v1.7.20 train. History: r1/r2 hardened the
 deferred-intent model; r3's nine deepening findings triggered the founder
 "growing complexity = wrong layer" rule; v4 deleted the intent gap
 (synchronous confirm). r4 (gpt-5.6-sol, high) verdict CHANGES-REQUIRED but
