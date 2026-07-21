@@ -122,3 +122,19 @@ what happened, what it cost, fix hint if obvious.
 - **`pgrep -f "codex exec"` matches the watcher's own command line** when the
   watcher polls for codex — self-keeping-alive loop. Use pid files or
   sentinel files instead of process-name grep.
+- **rbox's own quarantine stash can wedge git-plane publish** (2026-07-21,
+  savvy-core): a `git stash create` minted by rbox on 2026-07-16 later
+  surfaced as "stash reflog contains receiver-only work; incoming checkout
+  ref could not be published safely" — rbox refusing to publish because of an
+  artifact rbox itself created. Design 174's supersession handles the
+  follow-on livelock; the stash-authorship blind spot (own-stash vs
+  user-stash) deserves its own look.
+- **`refs/rbox-conflict/*` accumulates unbounded** — savvy-core reached 810
+  conflict refs (July 6-13 episodes), inflating every ref transaction (~8.5s
+  observed), fingerprint, and capture forever. Retention lands in design 174
+  (supersession + 90d floor + status count).
+- **A repo can burn 30s/pull for 10+ hours with ZERO remote telemetry
+  signal** — the savvy-core held-repo loop (123 re-follows/day) was found
+  only by SSH log forensics; no wire kind carries phase timings. Fixed by
+  design 174 C2 (`sync_phase`), but the meta-lesson stands: any new
+  retry/deferral loop needs a fleet-visible counter from day one.
