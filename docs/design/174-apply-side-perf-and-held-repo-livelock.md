@@ -1,6 +1,6 @@
 # 174 — Apply-side performance: held-repo livelock, git-apply dark time, and pull/push tails
 
-Status: DRAFT v2 — r1 folded (3-review parallel round), awaiting serial confirmation round
+Status: DRAFT v3 — r2 serial findings folded (all 7, as prescribed), awaiting r3 confirmation
 Author: Claude (session 2026-07-21), field evidence from the live fleet
 Relates: 172 (event-driven capture), 175 (ref side-channel), 130 (follow/ownership model),
 173 (reserved: two-writer spurious divergence — this doc's item B is the ONE-writer sibling)
@@ -157,7 +157,7 @@ only after a real remote transition entered follow. [r1: C14]
 - **F. Push-tail** — `missing` probe and `commit` cost on no-change pushes;
   measurement-first (one more instrumentation level), likely its own follow-up.
 
-Non-goals (v0, to be ratified): notify-pull scan reuse — designs 172/175
+Non-goals: notify-pull scan reuse — designs 172/175
 deliberately keep watcher signals latency-only because Parcel can silently drop
 events and startup has a scan-to-watch gap; `lastSyncedManifest` is BASE rather
 than local truth, so reuse can corrupt reconcile semantics and distort the
@@ -196,18 +196,28 @@ episodes); persisted `RepoRecord.base` moves ONLY through
 through the typed transition planner. Nothing below adds a BASE authority arm:
 **A skips only after recovery/settlement; B stages a candidate while P remains
 intact, then uses the EXISTING capture→commit→publisher-ACK path to re-establish
-truth and clear sidecars atomically with acceptance.** [r1: C4,C5,C9]
+truth — sidecars clear only after an accepted commit, in the generation-CAS
+publisher-ACK state transition (push.ts:680-738). Remote acceptance and the
+local clear are NOT one atomic transaction: a crash between them safely leaves
+the old sidecars for ordinary recovery.** [r1: C4,C5,C9; r2: 6]
 
 ### 4.1 A — Held-repo idempotence short-circuit (apply side)
 
-Classification gains a complete typed blocker-set seam. `FollowResult` carries
-`blockers: TypedBlocker[]`, where each blocker retains its source/provenance;
-the existing singular display reason is derived from that set and is never an
-eligibility input. Indeterminate ownership, object-preservation, or graph
+Classification gains a complete typed blocker-set seam. `TypedBlocker` is a
+CLOSED provenance-bearing union spanning BOTH classification and orchestration:
+ref-plane and checkout blockers come from `FollowResult.blockers`, and the
+apply orchestrator merges in composer disposition (a composer `pending` even
+with empty `heldRefs`, apply.ts:1207-1222) and pre-follow protocol/artifact
+holds (apply.ts:948-956) before the attempt outcome is recorded — the attempt
+stores the MERGED set, never `FollowResult` alone. The existing singular
+display reason is derived from that set and is never an eligibility input.
+The skip predicate requires `blockers.length > 0 && blockers.every(allowlisted)`
+— an empty set (e.g. composer-only pending recorded nowhere) can never
+vacuously qualify. Indeterminate ownership, object-preservation, or graph
 proofs produce an `indeterminate` blocker outside the allowlist, never a
 `local-commits` or `local-stash` blocker. Preflight structurally rejects
 `info/grafts` and shallow-adjacent graft files: the repo becomes `unsupported`,
-which is never skippable. [r1: C2,C3]
+which is never skippable. [r1: C2,C3; r2: 1]
 
 New per-repo sidecar (in `RepoRecord`, alongside the existing partial/pending
 bookkeeping; never wire-visible): [r1: C1,C4,O2,O4]
@@ -295,9 +305,13 @@ the existing +2s/+8s retries. [r1: C5,C6,O3,B2,C15]
 The existing plan-side recovery preamble
 (`src/cli/sync-git/plan.ts:262-317`) is a hard precondition. B proceeds only
 after recovery reaches one of: none, rolled-back, landed-and-cleared, or
-quarantined-binding-mismatch. Recovery defer, corruption, or required human
-intervention blocks supersession and carries `P`; B invents no journal clear or
-absence-supersession quarantine primitive. [r1: C10,B4a,B3,O9]
+quarantined-binding-mismatch. Recovery defer, corruption, required human
+intervention, or `fresh-quarantined` (journal.ts:89-96 — the push prepass
+already blocks capture for it, plan.ts:308-316) blocks supersession and
+carries `P`. The B gate switches exhaustively over
+`JournalRecoveryResult.status` with a compile-time `never` check so a future
+disposition cannot default to proceeding. B invents no journal clear or
+absence-supersession quarantine primitive. [r1: C10,B4a,B3,O9; r2: 4]
 
 Capture and normal outbound normalization then produce the exact final
 candidate `C`.
@@ -319,11 +333,15 @@ iff every lane passes: [r1: C6,C7,O7,B4b]
 - the complete op-state path→artifact map is exactly equal;
 - canonical config is exactly equal.
 
-No ancestry-through-another-ref laundering is allowed. Any proof error,
-shallow repository, missing object, absent lane, or mismatch fails closed and
-discards `C` in favor of carrying `P` byte-for-byte. This candidate-bound proof
-is the only publication authority; the cheap pre-probe is never spent as one.
-[r1: C6,C7]
+No ancestry-through-another-ref laundering is allowed, and ancestry is defined
+over the LITERAL object graph: every peel/walk/ancestor subprocess in the
+supersession proof runs with `GIT_NO_REPLACE_OBJECTS=1` (alongside the existing
+`GIT_NO_LAZY_FETCH=1`), because `refs/replace/*` is non-syncable and absent
+from the published candidate — a local replacement must not make a divergent
+pending tip appear ancestral. Any proof error, shallow repository, missing
+object, absent lane, or mismatch fails closed and discards `C` in favor of
+carrying `P` byte-for-byte. This candidate-bound proof is the only publication
+authority; the cheap pre-probe is never spent as one. [r1: C6,C7; r2: 2]
 
 On any failure—preflight, config, capture, upload, 422, commit, or 409—`P` and
 all its sidecars remain byte-for-byte intact and the today-path carries `P`; no
@@ -410,7 +428,7 @@ D does not run on a still-wedged repo until B clears it; A removes the interim
 per-pull cost. Once B lands, independent carry-side hygiene drains the backlog
 without waiting for unrelated captures. [r1: C17,O6]
 
-### 4.6 F — Push tail: instrumentation only in 174
+### 4.5 F — Push tail: instrumentation only in 174
 
 `missing` (server existence probe) and `commit` get sub-timing detail
 (chunk count, per-chunk p95, payload bytes) in the push summary. Any
@@ -423,12 +441,18 @@ seeded by that data. Explicit non-goal here.
    reaches pending through a real transition—a second writer advancing the
    section or the documented accepted-commit/state-save crash-recovery path—
    then has local main ahead ≥1 commit plus an rbox-created stash whose parent
-   is off a side branch. Assert capture, candidate proof, accepted ACK clear,
-   and follower convergence; do not construct the fixture from the retracted
-   seq-83 schema-bump narrative. [r1: C14]
+   is off a side branch. Assert capture, candidate proof, and the accepted ACK
+   clearing EXACTLY: pending absent, `partial[rel]=null`, `attempt=null`, only
+   the predecessor-bound apply deferral episode cleared, while an omitted
+   prior branch and its origin remain retained in BASE; then follower
+   convergence. Do not construct the fixture from the retracted seq-83
+   schema-bump narrative. [r1: C14; r2: 5]
 2. **A-skip correctness**: held repo (local-commits), unchanged keys →
-   second pull performs zero git subprocesses for that repo (spawn-count
-   probe); any local commit/ref-move/stash mutation → full follow resumes.
+   after the mandatory prepass (journal recovery, protocol/P settlement,
+   partial revalidation — which MAY invoke git and MUST be asserted to have
+   run first), the second pull performs zero fetch/decrypt/import/follow/
+   ref-transaction work for that repo; any local commit/ref-move/stash
+   mutation → full follow resumes. [r2: 3]
 3. **A never skips non-git-state reasons**: local-edits / local-index /
    local-operation holds re-follow every pull even with unchanged keys.
 4. **A safety floor**: elapsed floor forces re-follow; divergent outcome
@@ -440,8 +464,9 @@ seeded by that data. Explicit non-goal here.
 6. **B tombstone retention**: three-device case where P alone carries a
    branch tombstone chain/generation and advertised lacks it → superseding
    normalization preserves the chain and high-water mark. [r1: C8,O1]
-7. **B capture failure**: capture failure during a superseding push carries P
-   byte-for-byte and publishes no regression section. [r1: C5]
+7. **B pre-ACK failure table**: each failure class — capture, upload, 422,
+   commit error, and 409 — leaves pending, partial, attempt, AND the deferral
+   byte-for-byte intact and publishes no regression section. [r1: C5; r2: 5]
 8. **B candidate-vs-probe race**: reset a ref between the maybe pre-probe and
    capture so the final candidate no longer subsumes P → carry P. [r1: C6]
 9. **B multi-writer 409**: a 409 during a superseding push leaves pending and
@@ -449,11 +474,17 @@ seeded by that data. Explicit non-goal here.
    newer pending according to normal follow semantics. [r1: O3]
 10. **A key/ordering adversaries**: dropping `stash@{1}` in a T→U→T
     reflog-only mutation invalidates the attempt; `info/grafts` makes the repo
-    unsupported; `local-commits + indeterminate/unreadable` never skips; and a
-    journal-present pull performs recovery rather than skipping. [r1: C1,C2,C3,C4]
+    unsupported; `local-commits + indeterminate/unreadable` never skips;
+    `local-stash + worktree-ownership` never skips; a composer-only pending
+    outcome (empty classification blockers) never skips (non-empty
+    requirement); a `refs/replace/*` entry making a divergent pending tip
+    appear ancestral → B carries P; and a journal-present pull performs
+    recovery rather than skipping. [r1: C1,C2,C3,C4; r2: 1,2]
 11. **B journal precondition**: terminal none/rolled-back/landed-and-cleared/
     quarantined-binding-mismatch dispositions may proceed; defer, corruption,
-    and human-intervention dispositions carry P. [r1: C10,B4a,B3]
+    human-intervention, AND fresh-quarantined dispositions carry P; the gate's
+    switch is exhaustive over `JournalRecoveryResult.status`.
+    [r1: C10,B4a,B3; r2: 4]
 12. **D reachability prune**: conflict ref reachable from a branch tip →
     pruned; unreachable + young → kept; unreachable + >90d → pruned; cap
     respected across carry pushes; each prune batch refreshes/invalidates the
@@ -464,8 +495,9 @@ seeded by that data. Explicit non-goal here.
     `repoWall − union(leafIntervals) ≤ 10%`; nested `classifyMs` is excluded
     from the sum and residual is explicit. [r1: C16,O5]
 15. **Structural**: `attempt` sidecar discarded on stateNonce / identity /
-    fingerprint-version change; skip path emits no BASE writes (composer
-    call-count zero for skipped repos).
+    fingerprint-version change; the FINAL skip performs no BASE mutation
+    (prerequisite composer/git calls from the mandatory prepass are allowed
+    and asserted to have run first). [r2: 3]
 
 ## 6. Rollout
 
