@@ -302,6 +302,31 @@ timer plumbing only, no behavior. Acceptance for the dark-time question is
 that the savvy-core repro's 30s becomes fully attributed (sum of sub-timers
 ≥ 90% of repo wall).
 
+**C2 — fleet phase telemetry (founder ask, 2026-07-21).** Today NO phase
+timing leaves the device: the wire kinds are propagation / first_publish /
+upload_lane / ws_health / safety_event / git_capture — coarse or count-only.
+The savvy-core loop (62 min/day of churn) produced zero remote signal; it was
+found only by SSH log forensics. New telemetry kind:
+
+```ts
+interface SyncPhaseSample {
+  kind: "sync_phase";
+  op: "pull" | "push";
+  wallMs: number;
+  phases: Record<string, number>;   // PhaseName -> ms, straight from PhaseReport.toJSON()
+  gitApplyMaxRepoMs?: number;       // max per-repo wall inside git-apply
+  gitApplySkippedHeld?: number;     // A's skip counter
+}
+```
+
+Sampling: emit every Nth completed op (N=8) AND unconditionally when
+`wallMs` exceeds a per-op static outlier bound (pull > 20s, push > 15s) so
+tails are never sampled away. Rides the existing design-120 ingest queue,
+accumulator, and fleet-only privacy model unchanged; no new endpoint. The
+admin cockpit chart (phase p50/p95 over time per device) consumes it — this
+also supplies the before/after drop-off chart for 174 itself. Repo PATHS are
+never in the sample (privacy: durations and counts only).
+
 ### 4.4 D — Conflict-ref retention (policy ratified §2)
 
 At the end of a successful capture (push side, repo already quiet), a bounded
