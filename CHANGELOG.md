@@ -6,6 +6,17 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.7.18] — 2026-07-21 — "keep-mine works even when history is gone"
+
+### Fixed
+- `keep-mine` no longer gets permanently stuck when the old synced snapshot
+  references commits that no longer exist anywhere (for example a squash-merged
+  PR whose branch and worktree were deleted). If you explicitly confirmed
+  discarding that branch in the preview, the unprovable lane is now accepted
+  and its objects are still preserved. Staging-area and operation-state lanes
+  keep the strict behavior — their contents can't be safely enumerated when
+  unprovable.
+
 ## [1.7.17] — 2026-07-21 — "leftovers don't block you"
 
 ### Fixed
