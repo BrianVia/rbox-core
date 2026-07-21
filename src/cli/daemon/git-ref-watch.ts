@@ -31,7 +31,11 @@ export function gitRefSideChannelEligible(
 export function classifyRefEvent(role: GitRefWatchRole, tail: string): GitRefEventClass {
   if (!safeTail(tail)) return "none";
 
-  if (role !== "refsNamespace" && GIT_REF_SIGNAL_TAIL_TABLE[role].structures.some((name) => tail === name)) return "structure";
+  return classifySafeRefEvent(role, tail);
+}
+
+function classifySafeRefEvent(role: GitRefWatchRole, tail: string): GitRefEventClass {
+  if (role !== "refsNamespace" && (GIT_REF_SIGNAL_TAIL_TABLE[role].structures as readonly string[]).includes(tail)) return "structure";
 
   if (tail.endsWith(".lock")) {
     const target = tail.slice(0, -".lock".length);
@@ -46,18 +50,8 @@ function safeTail(tail: string): boolean {
 }
 
 function isTarget(role: GitRefWatchRole, tail: string): boolean {
-  switch (role) {
-    case "gitDir":
-      return GIT_REF_SIGNAL_TAIL_TABLE.gitDir.targets.some((name) => tail === name);
-    case "commonDir":
-      return GIT_REF_SIGNAL_TAIL_TABLE.commonDir.targets.some((name) => tail === name);
-    case "refsRoot":
-      return GIT_REF_SIGNAL_TAIL_TABLE.refsRoot.targets.some((name) => tail === name);
-    case "refsNamespace":
-      // Both recursive namespace roots (heads and tags) share the same committed
-      // descendant grammar, so project through heads to the shared tail table.
-      return GIT_REF_SIGNAL_TAIL_TABLE.refsNamespace.parents.some((root) => isGitRefSignalTail(`${root}/${tail}`));
-  }
+  if (role === "refsNamespace") return isGitRefSignalTail(`refs/heads/${tail}`);
+  return (GIT_REF_SIGNAL_TAIL_TABLE[role].targets as readonly string[]).includes(tail);
 }
 
 export type RepoCandidateEventKind = "create" | "update" | "delete";
@@ -76,6 +70,9 @@ export interface RepoCandidateWork {
  * such as `.github`/`.git-old` are deliberately not candidates.
  */
 export function classifyRepoCandidate(relPath: string, kind: RepoCandidateEventKind): RepoCandidateWork | undefined {
+  // Fast bail for the hot path: this runs on EVERY watcher event, and almost
+  // all paths are unrelated to a repository lifecycle entry.
+  if (relPath !== ".git" && !relPath.endsWith("/.git")) return undefined;
   if (!relPath || relPath.startsWith("/") || relPath.endsWith("/")) return undefined;
   const parts = relPath.split("/");
   if (parts.at(-1) !== ".git" || parts.some((part) => part.length === 0 || part === "." || part === "..")) return undefined;
@@ -251,6 +248,8 @@ export class GitRefWatchRegistry {
   }
 
   get epoch(): number { return this.#inputEpoch; }
+  get floorRequired(): boolean { return this.#floorRequired; }
+  get activeHandles(): number { return this.#active.size; }
 
   get state(): GitRefWatchRegistryState {
     return {
@@ -272,22 +271,10 @@ export class GitRefWatchRegistry {
   upsert(repos: readonly DiscoveredGitRepo[]): Promise<void> {
     if (this.#closed) return Promise.resolve();
     const epoch = ++this.#inputEpoch;
-    for (const repo of [...repos].sort(ownerOrder)) {
-      const prior = this.#owners.get(repo.relPath);
-      if (prior) {
-        prior.touchedEpoch = epoch;
-        if (prior.kind !== repo.kind) {
-          prior.kind = repo.kind;
-          prior.generation++;
-          prior.state = "pending";
-        }
-      } else {
-        this.#owners.set(repo.relPath, { ...repo, generation: 1, touchedEpoch: epoch, state: "pending", handshakeGeneration: 0, floorDir: repo.kind === "dir" });
-      }
-      this.#owners.get(repo.relPath)!.floorDir ||= repo.kind === "dir";
-    }
+    let changed = false;
+    for (const repo of orderedUniqueRepos(repos)) changed = this.#mergeOwner(repo, epoch) || changed;
     this.#refreshFloor("discovery");
-    return this.#requestReconcile();
+    return this.#reconcileIfNeeded(changed);
   }
 
   /** Snapshot horizon captured before a safety discovery walk starts. */
@@ -297,63 +284,57 @@ export class GitRefWatchRegistry {
   applySnapshot(repos: readonly DiscoveredGitRepo[], startEpoch: number, complete: boolean): Promise<void> {
     if (this.#closed) return Promise.resolve();
     const mayShrink = complete && startEpoch === this.#inputEpoch;
-    const found = new Set(repos.map((repo) => repo.relPath));
+    const ordered = orderedUniqueRepos(repos);
+    const found = new Set(ordered.map((repo) => repo.relPath));
     const epoch = ++this.#inputEpoch;
-    for (const repo of [...repos].sort(ownerOrder)) {
-      const prior = this.#owners.get(repo.relPath);
-      if (prior) {
-        prior.touchedEpoch = epoch;
-        if (prior.kind !== repo.kind) { prior.kind = repo.kind; prior.generation++; prior.state = "pending"; }
-      } else {
-        this.#owners.set(repo.relPath, { ...repo, generation: 1, touchedEpoch: epoch, state: "pending", handshakeGeneration: 0, floorDir: repo.kind === "dir" });
-      }
-      this.#owners.get(repo.relPath)!.floorDir ||= repo.kind === "dir";
-    }
+    let changed = false;
+    for (const repo of ordered) changed = this.#mergeOwner(repo, epoch) || changed;
     if (mayShrink) {
       for (const [relPath, owner] of this.#owners) {
-        if (!found.has(relPath) && owner.touchedEpoch <= startEpoch) this.#owners.delete(relPath);
+        if (!found.has(relPath) && owner.touchedEpoch <= startEpoch) {
+          this.#owners.delete(relPath);
+          changed = true;
+        }
       }
-      this.#snapshotDirOwners = new Set(repos.filter((repo) => repo.kind === "dir").map((repo) => repo.relPath));
-      for (const repo of repos) this.#owners.get(repo.relPath)!.floorDir = repo.kind === "dir";
+      this.#snapshotDirOwners = new Set(ordered.filter((repo) => repo.kind === "dir").map((repo) => repo.relPath));
+      for (const repo of ordered) this.#owners.get(repo.relPath)!.floorDir = repo.kind === "dir";
     }
     this.#refreshFloor(mayShrink ? "complete-snapshot" : "nonshrinking-snapshot");
-    return this.#requestReconcile();
+    return this.#reconcileIfNeeded(changed);
   }
 
   /** Candidate update/delete dirties the entire owner generation monotonically. */
   markCandidates(candidates: readonly RepoCandidateWork[]): Promise<void> {
     if (this.#closed) return Promise.resolve();
     const epoch = ++this.#inputEpoch;
+    let changed = false;
     for (const candidate of candidates) {
       const owner = this.#owners.get(candidate.owner);
       if (!owner) continue;
-      owner.touchedEpoch = epoch;
       if (candidate.dirty) {
-        owner.generation++;
-        owner.state = "pending";
+        this.#dirtyOwner(owner, epoch);
+        changed = true;
         for (const [key, target] of this.#active) {
-          if ([...target.contributors.values()].some((contributor) => contributor.owner === owner.relPath)) this.#forcedTargets.add(key);
+          for (const contributor of target.contributors.values()) {
+            if (contributor.owner !== owner.relPath) continue;
+            this.#forcedTargets.add(key);
+            break;
+          }
         }
-      }
+      } else owner.touchedEpoch = epoch;
     }
     this.#refreshFloor("candidate");
-    return this.#requestReconcile();
+    return this.#reconcileIfNeeded(changed);
   }
 
   /** Candidate-map overflow conservatively dirties every bounded owner. */
   markAllCandidatesDirty(): Promise<void> {
     if (this.#closed) return Promise.resolve();
     const epoch = ++this.#inputEpoch;
-    for (const owner of this.#owners.values()) {
-      owner.touchedEpoch = epoch;
-      owner.generation++;
-      owner.state = "pending";
-      for (const [key, target] of this.#active) {
-        if ([...target.contributors.values()].some((contributor) => contributor.owner === owner.relPath)) this.#forcedTargets.add(key);
-      }
-    }
+    for (const owner of this.#owners.values()) this.#dirtyOwner(owner, epoch);
+    for (const key of this.#active.keys()) this.#forcedTargets.add(key);
     this.#refreshFloor("candidate-overflow");
-    return this.#requestReconcile();
+    return this.#reconcileIfNeeded(this.#owners.size > 0 || this.#active.size > 0);
   }
 
   /** Fatal process-global Bun reader failure: restart is the only recovery. */
@@ -388,6 +369,40 @@ export class GitRefWatchRegistry {
     const settled = new Promise<void>((resolve) => this.#waiters.push({ generation, resolve }));
     this.#ensurePump();
     return settled;
+  }
+
+  #reconcileIfNeeded(changed: boolean): Promise<void> {
+    // Refused/outside owners intentionally defer re-probe to the next dirty input
+    // or any due retry; retryable failures are independently re-armed by their timer.
+    if (!changed && !this.#retryDue()) return Promise.resolve();
+    return this.#requestReconcile();
+  }
+
+  #retryDue(): boolean {
+    const now = this.#clock.now();
+    for (const retry of this.#retries.values()) if (retry.nextAttemptAt <= now) return true;
+    return false;
+  }
+
+  #mergeOwner(repo: DiscoveredGitRepo, epoch: number): boolean {
+    const prior = this.#owners.get(repo.relPath);
+    if (!prior) {
+      this.#owners.set(repo.relPath, { ...repo, generation: 1, touchedEpoch: epoch, state: "pending", handshakeGeneration: 0, floorDir: repo.kind === "dir" });
+      return true;
+    }
+    prior.touchedEpoch = epoch;
+    prior.floorDir ||= repo.kind === "dir";
+    if (prior.kind === repo.kind) return false;
+    prior.kind = repo.kind;
+    prior.generation++;
+    prior.state = "pending";
+    return true;
+  }
+
+  #dirtyOwner(owner: OwnerRecord, epoch: number): void {
+    owner.generation++;
+    owner.touchedEpoch = epoch;
+    owner.state = "pending";
   }
 
   #ensurePump(): void {
@@ -733,12 +748,17 @@ export class GitRefWatchRegistry {
         this.#dirtyTarget(desired.key);
         return;
       }
-      const classes = [...(active?.contributors ?? desired.contributors).values()].map((contributor) => classifyRefEvent(contributor.role, tail));
-      if (classes.includes("structure")) {
-        this.#dirtyTarget(desired.key);
-      } else if (classes.includes("target") || classes.includes("lockPreSignal")) {
-        this.#onSignal?.();
+      if (!safeTail(tail)) return;
+      let signal = false;
+      for (const contributor of (active?.contributors ?? desired.contributors).values()) {
+        const eventClass = classifySafeRefEvent(contributor.role, tail);
+        if (eventClass === "structure") {
+          this.#dirtyTarget(desired.key);
+          return;
+        }
+        if (eventClass === "target" || eventClass === "lockPreSignal") signal = true;
       }
+      if (signal) this.#onSignal?.();
     });
     active = { ...desired, contributors: new Map(desired.contributors), handle };
     handle.on?.("error", (error) => this.readerDied(error));
@@ -751,13 +771,12 @@ export class GitRefWatchRegistry {
     this.#forcedTargets.add(key);
     const target = this.#active.get(key);
     if (target) {
-      const owners = new Set([...target.contributors.values()].map((contributor) => contributor.owner));
-      for (const relPath of owners) {
-        const owner = this.#owners.get(relPath);
-        if (!owner) continue;
-        owner.generation++;
-        owner.touchedEpoch = this.#inputEpoch;
-        owner.state = "pending";
+      for (const owner of this.#owners.values()) {
+        for (const contributor of target.contributors.values()) {
+          if (contributor.owner !== owner.relPath) continue;
+          this.#dirtyOwner(owner, this.#inputEpoch);
+          break;
+        }
       }
     }
     this.#refreshFloor("structure");
@@ -819,8 +838,11 @@ export class GitRefWatchRegistry {
   }
 }
 
-const ownerOrder = (a: Pick<DiscoveredGitRepo, "relPath">, b: Pick<DiscoveredGitRepo, "relPath">): number =>
+export const ownerOrder = (a: Pick<DiscoveredGitRepo, "relPath">, b: Pick<DiscoveredGitRepo, "relPath">): number =>
   a.relPath < b.relPath ? -1 : a.relPath > b.relPath ? 1 : 0;
+
+const orderedUniqueRepos = (repos: readonly DiscoveredGitRepo[]): DiscoveredGitRepo[] =>
+  [...new Map(repos.map((repo) => [repo.relPath, repo])).values()].sort(ownerOrder);
 
 const within = (rootReal: string, targetReal: string): boolean => {
   const rel = path.relative(rootReal, targetReal);

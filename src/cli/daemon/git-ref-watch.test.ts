@@ -318,6 +318,29 @@ test("a contributor-only ownership update never reopens a still-owned physical h
   await registry.close();
 });
 
+test("two identical upserts do not reconcile the second input", async () => {
+  const root = tempRoot();
+  const repo = path.join(root, "repo");
+  const gitDir = path.join(repo, ".git");
+  makeGitDir(gitDir);
+  let probes = 0;
+  const registry = new GitRefWatchRegistry({
+    root,
+    resolveRepo: async () => {
+      probes++;
+      return { repoDir: repo, kind: "dir", gitDir, commonDir: gitDir };
+    },
+    refStorage: async () => undefined,
+    watch: new TestWatches().watch,
+  });
+  const repos = [{ relPath: "repo", kind: "dir" as const }];
+  await registry.upsert(repos);
+  expect(probes).toBe(1);
+  await registry.upsert(repos);
+  expect(probes).toBe(1);
+  await registry.close();
+});
+
 test("candidate generation dirtiness and root-self rename force replacement even at the same path", async () => {
   const root = tempRoot();
   const repo = path.join(root, "repo");

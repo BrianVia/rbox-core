@@ -176,9 +176,9 @@ export function isGitRefSignalTail(tail: string): boolean {
   if (tail === "reftable" || tail.startsWith("reftable/")) return false;
   if (tail === "refs/remotes" || tail.startsWith("refs/remotes/")) return false;
   if (RBOX_SCRATCH_REF_RE.test(tail)) return false;
-  return GIT_REF_SIGNAL_TAIL_TABLE.gitDir.targets.some((name) => tail === name)
-    || GIT_REF_SIGNAL_TAIL_TABLE.commonDir.targets.some((name) => tail === name)
-    || GIT_REF_SIGNAL_TAIL_TABLE.refsRoot.targets.some((name) => tail === `refs/${name}`)
+  return (GIT_REF_SIGNAL_TAIL_TABLE.gitDir.targets as readonly string[]).includes(tail)
+    || (GIT_REF_SIGNAL_TAIL_TABLE.commonDir.targets as readonly string[]).includes(tail)
+    || tail.startsWith("refs/") && (GIT_REF_SIGNAL_TAIL_TABLE.refsRoot.targets as readonly string[]).includes(tail.slice("refs/".length))
     || GIT_REF_SIGNAL_TAIL_TABLE.refsNamespace.parents.some((root) => tail.startsWith(`${root}/`) && tail.length > root.length + 1);
 }
 

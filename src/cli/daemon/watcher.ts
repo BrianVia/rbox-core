@@ -20,9 +20,6 @@ import { classifyRepoCandidate, type RepoCandidateWork } from "./git-ref-watch.j
 export interface Watcher {
   /** Backend that was actually selected and successfully started. */
   readonly backend: WatcherBackend;
-  /** True only when Parcel found an in-tree directory-backed repo whose refs are
-   *  inside this watch. Chokidar intentionally remains safety-scan-only for Git. */
-  readonly gitRefWatchActive?: boolean;
   close(): Promise<void>;
 }
 
@@ -43,8 +40,6 @@ export interface WatchOptions {
   onError?: (err: Error) => void;
   /** Fires after matcher filtering and before debounce coalescing. */
   onRawEvent?: (event: WatchEvent) => void;
-  /** Ref/candidate activity is signal-only; it never enters the file batch. */
-  onGitSignal?: (batch: GitSignalBatch) => void | Promise<void>;
   /** Daemon-owned shared debouncer, also used by registry arm handshakes. */
   signalDebouncer?: SignalDebouncer;
   /** Initial watcher-start discovery, awaited before readiness. */
@@ -318,7 +313,7 @@ async function startParcel(
   const maxWaitMs = opts.maxWaitMs ?? 3000;
   const wrapper = loadParcelWrapper();
   const batcher = createBatcher(onSettle, debounceMs, maxWaitMs);
-  const signalDebouncer = opts.signalDebouncer ?? createSignalDebouncer(opts.onGitSignal, debounceMs, maxWaitMs);
+  const signalDebouncer = opts.signalDebouncer;
   // @parcel/watcher reports event paths as REAL paths (symlinks resolved). If the
   // watched root has a symlinked component (e.g. macOS `/tmp` → `/private/tmp`),
   // relativizing against the un-resolved root yields `../…` and silently drops
@@ -327,11 +322,10 @@ async function startParcel(
   const realRoot = safeRealpath(root);
   const toRel = toRelFor(realRoot);
   // Kicked off before subscribe and awaited after: the ignore-pruned repo walk
-  // feeds initial registry ownership (and the legacy activity bit) without
+  // feeds initial registry ownership without
   // delaying native subscription startup on large workspaces.
-  const gitRefWatchActivePromise = discoverGitRepos(realRoot, matcher).then(async (repos) => {
+  const initialGitReposPromise = discoverGitRepos(realRoot, matcher).then(async (repos) => {
     await opts.onInitialGitRepos?.(repos);
-    return repos.some((repo) => repo.kind === "dir");
   });
 
   const sub = await wrapper.subscribe(
@@ -351,7 +345,7 @@ async function startParcel(
 
         const candidate = classifyRepoCandidate(rel, ev.type);
         if (candidate) {
-          signalDebouncer.push("candidate", candidate);
+          signalDebouncer?.push("candidate", candidate);
           continue;
         }
 
@@ -359,7 +353,7 @@ async function startParcel(
         // and the authoritative sync matcher. A ref signal is routed through its
         // own seam and can therefore never become a file WatchEvent.
         if (isGitRefSignal(rel)) {
-          signalDebouncer.push("signal");
+          signalDebouncer?.push("signal");
           continue;
         }
 
@@ -390,25 +384,23 @@ async function startParcel(
     { ignore: nativePruneGlobs(root) }
   );
 
-  let gitRefWatchActive: boolean;
   try {
-    gitRefWatchActive = await gitRefWatchActivePromise;
+    await initialGitReposPromise;
   } catch (e) {
     // Preserve the sequential-walk failure semantics: a discovery failure fails
     // startParcel (daemon degrades to periodic scan) without leaking the live
     // subscription that now starts before the walk finishes.
     batcher.dispose();
-    signalDebouncer.dispose();
+    signalDebouncer?.dispose();
     await sub.unsubscribe().catch(() => {});
     throw e;
   }
 
   return {
     backend: "parcel",
-    gitRefWatchActive,
     async close() {
       batcher.dispose();
-      signalDebouncer.dispose();
+      signalDebouncer?.dispose();
       await sub.unsubscribe();
     },
   };
@@ -425,7 +417,7 @@ function startChokidar(
   const debounceMs = opts.debounceMs ?? 400;
   const maxWaitMs = opts.maxWaitMs ?? 3000;
   const batcher = createBatcher(onSettle, debounceMs, maxWaitMs);
-  const signalDebouncer = opts.signalDebouncer ?? createSignalDebouncer(opts.onGitSignal, debounceMs, maxWaitMs);
+  const signalDebouncer = opts.signalDebouncer;
   const toRel = toRelFor(root);
 
   const watcher = chokidar.watch(root, {
@@ -454,7 +446,7 @@ function startChokidar(
       : "delete";
     const candidate = classifyRepoCandidate(rel, candidateKind);
     if (candidate) {
-      signalDebouncer.push("candidate", candidate);
+      signalDebouncer?.push("candidate", candidate);
       return;
     }
     pushWatchEvent(batcher, opts, rel, kind);
@@ -464,7 +456,7 @@ function startChokidar(
     backend: "chokidar",
     async close() {
       batcher.dispose();
-      signalDebouncer.dispose();
+      signalDebouncer?.dispose();
       await watcher.close();
     },
   };

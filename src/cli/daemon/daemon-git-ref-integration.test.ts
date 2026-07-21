@@ -55,7 +55,7 @@ test.skipIf(process.platform !== "linux")(
       fs.mkdirSync(repo);
       await new Promise((resolve) => setTimeout(resolve, 250));
       await exec("git", ["-C", repo, "init", "--initial-branch=main", "--quiet"], { env: GIT_ENV });
-      await waitFor(() => (daemon.gitRefRegistry?.state.activeHandles ?? 0) >= 4);
+      await waitFor(() => (daemon.gitRefRegistry?.activeHandles ?? 0) >= 4);
       await new Promise((resolve) => setTimeout(resolve, 650)); // drain the arm handshake batch
       expect(daemon.want.push).toBe(true);
 

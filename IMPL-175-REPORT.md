@@ -62,6 +62,23 @@ the watcher, not on a platform-string prediction.
 | 6. Construction eligibility predicted unsupported targets | Watchers report the backend they actually selected. Initial discovery is retained until watcher startup returns, and the registry is constructed only on Linux when that reported backend is `parcel`; the self-test uses the same observed result. | `daemon-safety.test.ts` returns a watcher-reported `chokidar` backend on Linux and proves no registry is constructed while the safety floor remains pinned. The Parcel self-test reports and checks its actual backend. |
 | 7. Mandatory lock/busy episode regression was absent | The daemon's existing absolute +2s/+8s episode is exposed through an injectable clock for deterministic lifecycle verification; normal runtime still uses native timers. | `daemon-git-capture.test.ts` runs real branch-ref and `packed-refs.lock` episodes through actual registry listener routing and the real debounce/max-wait path. Both locks remain held past max-wait, only the pre-signal is delivered, the final target callback is suppressed, +2s remains busy without resetting the episode/timers, +8s captures the exact OID, the second retry resets, and daemon close cancels the next episode's timers and prevents a late push. |
 
+## Simplify fold
+
+| Finding | Change |
+|---|---|
+| EFFICIENCY-1 | Registry inputs retain epoch/touch ordering but request reconciliation only for ownership/kind/generation/forced-target changes, snapshot removal, or a currently due retry. Future retries remain timer-driven; refused/outside owners defer re-probe to the next dirty input or any due retry. Added an identical-upsert probe-count regression. |
+| EFFICIENCY-2 | `classifyRepoCandidate` now rejects paths that are not `.git` entries before splitting or allocating. |
+| EFFICIENCY-3 | Added narrow `floorRequired` and `activeHandles` getters and moved daemon/self-test hot readers off the sorted diagnostic state snapshot. |
+| EFFICIENCY-4+5 | Contributor scans are allocation-free, candidate/target scans exit once matched, overflow dirtiness forces active keys in one target pass, listener tails are validated once, and equality table lookups use `includes`. |
+| REUSE-7 / SIMPL-1 | Shared owner insertion/kind-flip handling moved to `#mergeOwner`. |
+| SIMPL-2 | The three owner generation-dirty paths now share `#dirtyOwner`. |
+| SIMPL-3 / EFF-6 | Daemon candidate discovery passes unsorted/undeduped repositories to the registry, which normalizes inputs; authoritative snapshots use exported `ownerOrder`. |
+| SIMPL-4 | Removed `Watcher.gitRefWatchActive`; initial discovery continues through `onInitialGitRepos`, which the watcher tests now assert directly. |
+| SIMPL-5 | Removed the `onGitSignal` fallback seam; watcher signal tests inject `createSignalDebouncer`. |
+| SIMPL-7 | Collapsed `isTarget` to the namespace projection and shared table lookup. |
+| SIMPL-9 | Busy-retry stages are generated from `GIT_BUSY_RETRY_DELAYS_MS`, with the terminal stage derived from its length. |
+| SIMPL-11 | `packed-refs.lock` now uses its stat identity token without content hashing. |
+
 ## Required acceptance outputs
 
 ### `bun run typecheck`

@@ -82,7 +82,7 @@ export async function gitRefWatchPlatformSelfTest(): Promise<number> {
     watcher = await startWatcher(createdTemp, buildIgnoreMatcher(createdTemp), () => {}, { backend: "parcel" });
     const eligible = gitRefSideChannelEligible(process.platform, watcher.backend);
     registry = eligible ? new GitRefWatchRegistry({ root: fs.realpathSync(createdTemp) }) : undefined;
-    const handles = registry?.state.activeHandles ?? 0;
+    const handles = registry?.activeHandles ?? 0;
     const ok = process.platform !== "darwin" || (!eligible && handles === 0);
     console.log(`GIT_REFWATCH_SELFTEST ${ok ? "ok" : "fail"} eligible=${eligible} handles=${handles} backend=${watcher.backend} platform=${process.platform}-${process.arch}`);
     return ok ? 0 : 1;

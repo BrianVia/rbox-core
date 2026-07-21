@@ -46,7 +46,7 @@ interface SafetyInternals {
       signalDebouncer?: { push(reason: "signal" | "candidate" | "other"): void };
       onInitialGitRepos?: (repos: readonly { relPath: string; kind: "dir" | "pointer" }[]) => Promise<void>;
     }
-  ) => Promise<{ backend: "parcel" | "chokidar"; gitRefWatchActive?: boolean; close(): Promise<void> }>;
+  ) => Promise<{ backend: "parcel" | "chokidar"; close(): Promise<void> }>;
   startLiveWatch(): Promise<void>;
   advanceSafetyCadenceForTick(): void;
   churnSinceSafety: boolean;
@@ -61,7 +61,7 @@ interface SafetyInternals {
   want: { push: boolean; fullScan: boolean };
   pendingEvents: unknown[];
   watcherUnsettled: boolean;
-  watcher?: { backend: "parcel" | "chokidar"; gitRefWatchActive?: boolean; close(): Promise<void> };
+  watcher?: { backend: "parcel" | "chokidar"; close(): Promise<void> };
   safetyTimer?: ReturnType<typeof setTimeout>;
   deepTimer?: ReturnType<typeof setInterval>;
   matcher: { ignores(path: string): boolean };
@@ -82,7 +82,7 @@ test("design 175: ref signal requests push without pending/file-settle state", a
   let signal: (() => void) | undefined;
   daemon.startWatcherFn = (_root, _matcher, _cb, opts) => {
     signal = () => opts?.signalDebouncer?.push("signal");
-    return Promise.resolve({ backend: "parcel", gitRefWatchActive: true, close: async () => {} });
+    return Promise.resolve({ backend: "parcel", close: async () => {} });
   };
   daemon.pumping = true;
 
@@ -108,7 +108,7 @@ test("design 175: a directory-backed repo holds the git safety floor only on Lin
   const daemon = makeDaemon(root);
   daemon.startWatcherFn = async (_root, _matcher, _cb, opts) => {
     await opts?.onInitialGitRepos?.([{ relPath: ".", kind: "dir" }]);
-    return { backend: "parcel", gitRefWatchActive: true, close: async () => {} };
+    return { backend: "parcel", close: async () => {} };
   };
   daemon.pumping = true;
 
@@ -152,7 +152,7 @@ test.skipIf(process.platform !== "linux")("design 175 fix: registry construction
   const daemon = makeDaemon(root);
   daemon.startWatcherFn = async (_root, _matcher, _cb, opts) => {
     await opts?.onInitialGitRepos?.([{ relPath: ".", kind: "dir" }]);
-    return { backend: "chokidar", gitRefWatchActive: false, close: async () => {} };
+    return { backend: "chokidar", close: async () => {} };
   };
   daemon.pumping = true;
   try {

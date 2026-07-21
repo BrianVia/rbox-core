@@ -210,7 +210,7 @@ async function commonDirFingerprint(ctx: RepoCtx): Promise<unknown> {
     worktreesToken(path.join(ctx.commonDir, "worktrees")),
     statToken(path.join(ctx.commonDir, "gc.pid")),
     statToken(path.join(ctx.commonDir, "packed-refs"), { hashFileMaxBytes: PACKED_REFS_HASH_MAX_BYTES }),
-    statToken(path.join(ctx.commonDir, "packed-refs.lock"), { hashFileMaxBytes: PACKED_REFS_HASH_MAX_BYTES }),
+    statToken(path.join(ctx.commonDir, "packed-refs.lock")),
     statTree(path.join(ctx.commonDir, "refs"), "", { hashFileMaxBytes: LOOSE_REF_HASH_MAX_BYTES }),
   ]);
   return {

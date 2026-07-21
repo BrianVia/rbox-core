@@ -62,7 +62,7 @@ import { QuotaExceededError, RboxApi } from "../remote.js";
 import { envInt } from "../remote/resilient.js";
 import { CommitRejectedError } from "../remote.js";
 import { createSignalDebouncer, startWatcher, type GitSignalBatch, type SignalDebouncer, type Watcher } from "./watcher.js";
-import { GitRefWatchRegistry, gitRefSideChannelEligible } from "./git-ref-watch.js";
+import { GitRefWatchRegistry, gitRefSideChannelEligible, ownerOrder } from "./git-ref-watch.js";
 import { runUpdateCheckIfDue } from "../update-check.js";
 import {
   AMBIENT_STATUS_HEARTBEAT_MS,
@@ -318,7 +318,7 @@ export class RboxDaemon {
   private planDiscoveredGitDirOwners = new Set<string>();
   private hasAuthoritativeGitSnapshot = false;
   private pendingPushReasons = { signal: false, candidate: false, scan: false, other: false };
-  private gitBusyEpisode?: { timers: unknown[]; queuedStages: Array<1 | 2> };
+  private gitBusyEpisode?: { timers: unknown[]; queuedStages: number[] };
 
   private watcher?: Watcher;
   private ws?: WebSocket;
@@ -703,8 +703,7 @@ export class RboxDaemon {
           for (const owner of owners) discovered.push(...await discoverGitReposUnder(this.root, owner, this.matcher));
         }
         if (discovered.length > 0) {
-          const unique = new Map(discovered.map((repo) => [repo.relPath, repo]));
-          await this.gitRefRegistry.upsert([...unique.values()].sort((a, b) => a.relPath.localeCompare(b.relPath)));
+          await this.gitRefRegistry.upsert(discovered);
         }
       }
     } catch (error) {
@@ -743,7 +742,7 @@ export class RboxDaemon {
       this.gitBackendFallbackPending
       || this.authoritativeGitRepos.some((repo) => repo.kind === "dir")
       || this.planDiscoveredGitDirOwners.size > 0
-      || this.gitRefRegistry?.state.floorRequired === true
+      || this.gitRefRegistry?.floorRequired === true
     );
     if (next === this.gitSafetyFloorRequired) return;
     this.gitSafetyFloorRequired = next;
@@ -871,9 +870,9 @@ export class RboxDaemon {
 
   private noteGitBusyDeferred(): void {
     if (this.stopped || this.gitBusyEpisode) return;
-    const episode = { timers: [] as unknown[], queuedStages: [] as Array<1 | 2> };
+    const episode = { timers: [] as unknown[], queuedStages: [] as number[] };
     this.gitBusyEpisode = episode;
-    const schedule = (stage: 1 | 2, delayMs: number) => {
+    const schedule = (stage: number, delayMs: number) => {
       const timer = this.gitBusyRetryClock.setTimeout(() => {
         if (this.stopped || this.gitBusyEpisode !== episode) return;
         episode.queuedStages.push(stage);
@@ -884,11 +883,10 @@ export class RboxDaemon {
       (timer as { unref?: () => void }).unref?.();
       episode.timers.push(timer);
     };
-    schedule(1, GIT_BUSY_RETRY_DELAYS_MS[0]);
-    schedule(2, GIT_BUSY_RETRY_DELAYS_MS[1]);
+    GIT_BUSY_RETRY_DELAYS_MS.forEach((delayMs, index) => schedule(index + 1, delayMs));
   }
 
-  private takeGitBusyRetryStage(): 0 | 1 | 2 {
+  private takeGitBusyRetryStage(): number {
     const stage = this.gitBusyEpisode?.queuedStages.shift() ?? 0;
     if (this.gitBusyEpisode && this.gitBusyEpisode.queuedStages.length > 0) {
       this.requestPush("other");
@@ -896,8 +894,8 @@ export class RboxDaemon {
     return stage;
   }
 
-  private finishGitBusyRetry(stage: 0 | 1 | 2): void {
-    if (stage === 2) this.clearGitBusyEpisode();
+  private finishGitBusyRetry(stage: number): void {
+    if (stage === GIT_BUSY_RETRY_DELAYS_MS.length) this.clearGitBusyEpisode();
   }
 
   private clearGitBusyEpisode(): void {
@@ -2246,8 +2244,7 @@ export class RboxDaemon {
       deferErrnos.onErrno, this.log);
     deferErrnos.flush();
     await dircache?.save(this.root);
-    const repos = [...new Map(discoveredGitRepos.map((repo) => [repo.relPath, repo])).values()]
-      .sort((a, b) => a.relPath.localeCompare(b.relPath));
+    const repos = [...discoveredGitRepos].sort(ownerOrder);
     if (scanKind) {
       this.authoritativeGitRepos = repos;
       this.planDiscoveredGitDirOwners.clear();

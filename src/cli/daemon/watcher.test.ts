@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { buildIgnoreMatcher, captureGitState, type BlobStore, type WatchEvent } from "../../engine/index.js";
-import { createBatcher, startWatcher, type GitSignalBatch, type Watcher } from "./watcher.js";
+import { createBatcher, createSignalDebouncer, startWatcher, type GitSignalBatch, type Watcher } from "./watcher.js";
 
 // These exercise the DEFAULT (@parcel/watcher) backend end-to-end on a real temp
 // tree: the design-§41 swap that took the founder's workspace from ~11 GB / 330 s
@@ -87,19 +87,21 @@ async function watch(root: string, extraIgnore = "") {
   const settled: WatchEvent[] = [];
   const raw: WatchEvent[] = [];
   const gitSignals: number[] = [];
+  let initialGitRepos: readonly { relPath: string; kind: "dir" | "pointer" }[] = [];
   const matcher = buildIgnoreMatcher(root);
   const t0 = Date.now();
   active = await startWatcher(root, matcher, (evs) => settled.push(...evs), {
     debounceMs: DEBOUNCE,
     onRawEvent: (event) => raw.push(event),
-    onGitSignal: () => gitSignals.push(Date.now()),
+    signalDebouncer: createSignalDebouncer(() => gitSignals.push(Date.now()), DEBOUNCE, 3000),
+    onInitialGitRepos: async (repos) => { initialGitRepos = repos; },
   });
   const readyMs = Date.now() - t0;
   // Let the OS watch's initial snapshot settle before the test mutates, so a
   // mutation isn't raced against baseline establishment (would surface a spurious
   // create instead of the update). Realistic: nothing edits files µs after boot.
   await new Promise((r) => setTimeout(r, 200));
-  return { settled, raw, gitSignals, readyMs, gitRefWatchActive: active.gitRefWatchActive === true };
+  return { settled, raw, gitSignals, readyMs, initialGitRepos };
 }
 
 /** Poll until `pred()` or timeout; returns whether it became true. Generous default so a
@@ -230,7 +232,7 @@ test("chokidar keeps exact .git lifecycle events signal-only", async () => {
     backend: "chokidar",
     debounceMs: 30,
     onRawEvent: (event) => raw.push(event),
-    onGitSignal: (batch) => signals.push(batch),
+    signalDebouncer: createSignalDebouncer((batch) => signals.push(batch), 30, 3000),
   });
   await new Promise((resolve) => setTimeout(resolve, 150));
   await git(repo, "init", "--initial-branch=main", "--quiet");
@@ -267,8 +269,8 @@ wtest("design 172: git commit reaches the isolated signal debounce well before t
   fs.writeFileSync(path.join(root, "tracked.txt"), "one");
   await git(root, "add", "tracked.txt");
   await git(root, "commit", "-qm", "initial");
-  const { settled, raw, gitSignals, gitRefWatchActive } = await watch(root);
-  expect(gitRefWatchActive).toBe(true);
+  const { settled, raw, gitSignals, initialGitRepos } = await watch(root);
+  expect(initialGitRepos).toContainEqual({ relPath: ".", kind: "dir" });
 
   const committedAt = Date.now();
   await git(root, "commit", "--allow-empty", "-qm", "event-driven");
