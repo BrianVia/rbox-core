@@ -792,11 +792,26 @@ test("D fast pull evidence mismatches fall back to the exact cold chain walk", a
     const originalGet = server.store.get.bind(server.store);
     let inFlightGets = 0;
     let peakInFlightGets = 0;
+    let chainStarted!: Promise<void>;
+    let releaseChain!: () => void;
+    let chainRelease!: Promise<void>;
+    let chainEntered = 0;
+    let announceChainStarted!: () => void;
+    const resetChainGate = () => {
+      chainEntered = 0;
+      chainStarted = new Promise<void>((resolve) => { announceChainStarted = resolve; });
+      chainRelease = new Promise<void>((resolve) => { releaseChain = resolve; });
+    };
+    const chainShas = new Set(third.manifestMeta!.chain);
     server.store.get = async (sha: string) => {
       inFlightGets++;
       peakInFlightGets = Math.max(peakInFlightGets, inFlightGets);
-      await new Promise((resolve) => setTimeout(resolve, 5));
       try {
+        if (chainShas.has(sha)) {
+          chainEntered++;
+          if (chainEntered === third.manifestMeta!.chain.length) announceChainStarted();
+          await chainRelease;
+        }
         return await originalGet(sha);
       } finally {
         inFlightGets--;
@@ -807,7 +822,11 @@ test("D fast pull evidence mismatches fall back to the exact cold chain walk", a
       server.store.getCalls = [];
       peakInFlightGets = 0;
       let fold: string | undefined;
-      await expect(peer.latest({ fastFoldBase: { manifest: middle, meta }, onLatestTimings: (timings) => { fold = timings.fold; } })).resolves.toMatchObject({ manifest: target });
+      resetChainGate();
+      const latest = peer.latest({ fastFoldBase: { manifest: middle, meta }, onLatestTimings: (timings) => { fold = timings.fold; } });
+      await chainStarted;
+      releaseChain();
+      await expect(latest).resolves.toMatchObject({ manifest: target });
       expect(fold).toBe("coldwalk");
       expect(server.store.getCalls).toEqual([third.manifestMeta!.encManifestSha, ...third.manifestMeta!.chain]);
       expect(peakInFlightGets).toBe(third.manifestMeta!.chain.length);

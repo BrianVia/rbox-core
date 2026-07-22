@@ -64,6 +64,8 @@ test("design 177 pins recorded branch OIDs and refuses an unrestored ref move", 
 test("design 177 ambient index churn can only refuse at the endpoint and a bounded retry succeeds", async () => {
   let running = false;
   let churn: Promise<void> | undefined;
+  let announceChurn!: () => void;
+  const churnedOnce = new Promise<void>((resolve) => { announceChurn = resolve; });
   await expect(captureGitState(repo, store, KEK, {
     workspaceRoot: root,
     resolution: true,
@@ -78,6 +80,7 @@ test("design 177 ambient index churn can only refuse at the endpoint and a bound
             await fs.writeFile(path.join(repo, "tracked"), `churn-${n++}\n`);
             try {
               await git(repo, ["add", "tracked"]);
+              announceChurn();
             } catch (error) {
               if (!String(error).includes("index.lock")) throw error;
             }
@@ -85,7 +88,7 @@ test("design 177 ambient index churn can only refuse at the endpoint and a bound
         })();
       },
       beforeStabilityCheck: async () => {
-        await new Promise((resolve) => setTimeout(resolve, 10));
+        await churnedOnce;
         running = false;
         await churn;
       },
