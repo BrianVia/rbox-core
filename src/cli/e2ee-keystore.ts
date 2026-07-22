@@ -1,8 +1,9 @@
-import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fromB64url, toB64url, type DeviceSecrets, type Wrap } from "../engine/e2ee/index.js";
+import { hardenedWrite } from "./genesis-durable.js";
+import { acquireGenesisLockSync } from "./genesis-locks.js";
 
 /**
  * Per-machine E2EE key material (design 12 §13.1), mode 600 under
@@ -25,9 +26,6 @@ import { fromB64url, toB64url, type DeviceSecrets, type Wrap } from "../engine/e
 const home = () => process.env.RBOX_HOME || os.homedir();
 const root = (accountId: string) => path.join(home(), ".rbox", "e2ee", accountId);
 const FILE_MODE = 0o600;
-const DIR_MODE = 0o700;
-const GENESIS_LOCK_CONTENTION_MESSAGE =
-  "another rbox process is already setting up encryption for this account — let it finish, then re-run.";
 
 interface DeviceJson {
   deviceId: string;
@@ -38,9 +36,7 @@ interface DeviceJson {
 }
 
 async function writeSecret(file: string, data: string): Promise<void> {
-  await fs.mkdir(path.dirname(file), { recursive: true, mode: DIR_MODE });
-  await fs.writeFile(file, data, { mode: FILE_MODE });
-  await fs.chmod(file, FILE_MODE).catch(() => {});
+  await hardenedWrite(file, data, { mode: FILE_MODE });
 }
 
 async function readMaybe(file: string): Promise<string | undefined> {
@@ -109,33 +105,7 @@ export async function saveMasterKey(accountId: string, mk: Uint8Array): Promise<
 
 /** Cross-process per-account genesis lock: O_EXCL acquire, pid liveness stale detection, remove on release. */
 export function acquireGenesisLock(accountId: string): () => void {
-  fsSync.mkdirSync(root(accountId), { recursive: true, mode: DIR_MODE });
-  const lock = path.join(root(accountId), "genesis.lock");
-  const take = () => {
-    const fd = fsSync.openSync(lock, "wx");
-    fsSync.writeSync(fd, String(process.pid));
-    fsSync.closeSync(fd);
-  };
-  try {
-    take();
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
-    const holder = Number(fsSync.readFileSync(lock, "utf8").trim());
-    const alive =
-      Number.isInteger(holder) &&
-      (() => {
-        try {
-          process.kill(holder, 0);
-          return true;
-        } catch (k) {
-          return (k as NodeJS.ErrnoException).code === "EPERM";
-        }
-      })();
-    if (alive) throw new Error(GENESIS_LOCK_CONTENTION_MESSAGE);
-    fsSync.rmSync(lock, { force: true });
-    take();
-  }
-  return () => fsSync.rmSync(lock, { force: true });
+  return acquireGenesisLockSync(accountId);
 }
 
 export async function forgetLocalDeviceMaterial(accountId: string): Promise<void> {

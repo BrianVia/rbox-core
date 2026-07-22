@@ -42,7 +42,7 @@ import type { CommitChainResult, CurrentWriteKek, E2eeApi, E2eeContext, HeadPin,
 import type { ReceiptPort } from "./publish-pipeline/receipt-drainer.js";
 import { CommitRejectedError, NeedsRebaselineError, type CommitOptions, type CommitResult, type LatestOptions, type LatestTimings, type SyncRemote } from "./remote.js";
 
-export type { AccountKeysDTO, CommitChainResult, CurrentWriteKek, E2eeApi, E2eeContext, HeadPin, PinStore, VerifiedSuffixEntry, VersionInfo, WsKeyDTO } from "./e2ee-remote-types.js";
+export type { AccountKeysDTO, GenesisAccountObservation, GenesisPresence, CommitChainResult, CurrentWriteKek, E2eeApi, E2eeContext, HeadPin, PinStore, VerifiedSuffixEntry, VersionInfo, WsKeyDTO } from "./e2ee-remote-types.js";
 
 /** Bounded concurrency for the per-commit manifest fetch+decrypt in `pathHistory`
  *  (each is one blob round-trip + an AEAD open — latency-bound on a real server). */

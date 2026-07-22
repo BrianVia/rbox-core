@@ -10,7 +10,7 @@ import os from "node:os";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { credentialsForStrictFlow, loadCredentials, type CredentialLoadResult, type Credentials } from "./credentials.js";
-import { createRemoteWorkspace } from "./remote.js";
+import { createRemoteWorkspace, RboxApi } from "./remote.js";
 import { loadConfig, loadConfigIfPresent, loadRawState, resetSyncState, saveConfig, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
 import { enrolledDeviceId, hasDevice } from "./e2ee-keystore.js";
@@ -40,6 +40,7 @@ import { continueAdoption, startAdoption } from "./adopt-lifecycle.js";
 import { acknowledgeCacheGeneration } from "./adopt-cache.js";
 import { DirCache, HashCache } from "../engine/index.js";
 import type { AdoptJournal } from "./adopt-journal.js";
+import { pendingGenesisState } from "./genesis-enrollment.js";
 
 export const WORKSPACE_DEFINITION =
   "a workspace can be a single repository or a folder of many repositories, or just a folder.";
@@ -200,6 +201,11 @@ export async function runInit(
 ): Promise<InitOutcome | undefined> {
   const credentialResult = opts.credentialResult ?? await loadCredentials();
   const creds = credentialsForStrictFlow(credentialResult);
+  if(creds?.accountId&&await pendingGenesisState(creds.accountId)){
+    if(!creds.deviceId)throw new Error("pending encryption setup has no bound device credential — run `rbox setup`");
+    const {runGenesisEnrollment}=await import("./auth-cmd.js");
+    await runGenesisEnrollment(new RboxApi(creds.remoteUrl,creds.token,"",""),{accountId:creds.accountId,deviceId:creds.deviceId},recoveryKitOptionsFromFlags(flags));
+  }
   const interactive = process.stdin.isTTY === true && flags["no-interactive"] !== "true";
 
   let gathered = flags;

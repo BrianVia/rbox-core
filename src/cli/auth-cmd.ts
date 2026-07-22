@@ -3,11 +3,11 @@ import { clearCredentials, credentialsForStrictFlow, loadCredentials, PROD_WEB, 
 import { clearAccountProfile } from "./account-profile.js";
 import { isInteractive, promptConfirm, promptInput, promptPassword } from "./prompt.js";
 import { copyToClipboard, openInBrowser, waitForKeypress } from "./browser-open.js";
-import { AccountAlreadyBootstrappedError, RboxApi } from "./remote.js";
+import { RboxApi } from "./remote.js";
 import { emitJson } from "./json.js";
-import { bootstrapNewAccount, enrollViaPairing, enrollViaRecovery } from "./e2ee-client.js";
+import { assertRecoveryGenesisReady, beginAtomicGenesis, completeAtomicGenesis, enrollViaPairing, enrollViaRecovery } from "./e2ee-client.js";
 import { buildPairing, randomBytes, toB64url } from "../engine/e2ee/index.js";
-import { acquireGenesisLock, forgetLocalDeviceMaterial, loadDevice, loadRecoveryKey } from "./e2ee-keystore.js";
+import { loadDevice, loadRecoveryKey } from "./e2ee-keystore.js";
 import { isAutostartEnabled } from "./autostart-cmd.js";
 import { readStdinTrimmed } from "./read-stdin.js";
 import { friendlyHttpError } from "./http-error.js";
@@ -20,6 +20,8 @@ import {
   writeRecoveryKit,
   type RecoveryKitOptions,
 } from "./recovery-kit.js";
+import { pendingGenesisState } from "./genesis-enrollment.js";
+import { GENESIS_PENDING_MESSAGE } from "./genesis-durable.js";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const MIN_LOGIN_BACKOFF_MS = 1000;
@@ -109,7 +111,7 @@ async function startDeviceCode(remoteUrl: string, label: string): Promise<Device
   }
 }
 
-type GenesisApi = Pick<RboxApi, "getAccountKeys" | "bootstrapKeys">;
+type GenesisApi = Pick<RboxApi, "getAccountKeys" | "getGenesisObservation" | "bootstrapKeys">;
 type GenesisEnrollmentResult = "enrolled" | "already-setup";
 
 interface GenesisEnrollmentDeps {
@@ -123,24 +125,10 @@ export async function runGenesisEnrollment(
   kitOpts: RecoveryKitOptions = NO_KIT,
   deps: GenesisEnrollmentDeps = {}
 ): Promise<GenesisEnrollmentResult> {
-  const releaseGenesisLock = acquireGenesisLock(creds.accountId);
-  try {
-    if (await api.getAccountKeys()) return "already-setup";
-
-    try {
-      const phrase = await bootstrapNewAccount(api, creds.accountId, creds.deviceId, { now: (deps.now ?? Date.now)() });
-      await (deps.showRecoveryPhrase ?? showRecoveryPhrase)(phrase, creds, kitOpts);
-      return "enrolled";
-    } catch (err) {
-      if (err instanceof AccountAlreadyBootstrappedError) {
-        await forgetLocalDeviceMaterial(creds.accountId);
-        if (await api.getAccountKeys()) return "already-setup";
-      }
-      throw err;
-    }
-  } finally {
-    releaseGenesisLock();
-  }
+  const started=await beginAtomicGenesis(api,creds.accountId,creds.deviceId,{now:(deps.now??Date.now)()});
+  if(started.kind==="already-setup")return"already-setup";
+  await completeAtomicGenesis(started,(phrase)=>(deps.showRecoveryPhrase??showRecoveryPhrase)(phrase,creds,kitOpts),(deps.now??Date.now)());
+  return"enrolled";
 }
 
 interface DeviceCodePostApprovalDeps {
@@ -447,6 +435,7 @@ export async function recoverCmd(kitOpts: RecoveryKitOptions = NO_KIT): Promise<
   const loaded = await loadCredentials();
   const creds = credentialsForStrictFlow(loaded);
   if (!creds?.accountId) throw new Error("`rbox key recover` needs an account login first — run `rbox login` (web/device-code), then recover.");
+  await assertRecoveryGenesisReady(loaded);
   let phrase: string;
   if (isInteractive()) {
     // Visible input: a 24-word phrase is long and paste-error-prone, and it's
@@ -472,16 +461,19 @@ export async function keyStatus(opts: { json?: boolean } = {}): Promise<void> {
   const enrolled = Boolean(loaded && "secrets" in loaded);
   const cachedRk = creds.accountId ? await loadRecoveryKey(creds.accountId) : undefined;
   const kitRecord = creds.accountId ? await readRecoveryKitRecord(creds.accountId) : undefined;
+  const genesisPending=Boolean(creds.accountId&&await pendingGenesisState(creds.accountId));
   if (opts.json) {
     emitJson({
-      enrolled,
+      enrolled:enrolled&&!genesisPending,
       recoveryKit: kitRecord ? { path: kitRecord.path, writtenAt: kitRecord.writtenAt } : null,
+      ...(genesisPending?{genesisPending:true,resumeInstruction:GENESIS_PENDING_MESSAGE}:{}),
     });
     return;
   }
   console.log(`device:   ${creds.deviceId}`);
   console.log(`account:  ${creds.accountId ?? "(unknown — re-login)"}`);
   if (!creds.accountId) return;
+  if(genesisPending){console.log(`encryption: pending\n${GENESIS_PENDING_MESSAGE}`);return;}
   console.log(`encryption: ${enrolled ? "enrolled (master key present)" : loaded ? "device key present, master key missing — will self-heal on next sync" : "NOT enrolled — run `rbox pair` or `rbox key recover`"}`);
   console.log(`recovery phrase cached locally: ${cachedRk ? "yes (`rbox key backup` can re-show)" : "no (use the phrase you saved at setup)"}`);
   console.log(await recoveryKitStatusLine(creds.accountId, Boolean(cachedRk)));

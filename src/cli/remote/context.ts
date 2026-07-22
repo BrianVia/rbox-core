@@ -135,6 +135,10 @@ export class RemoteContext {
     return this.fetch(`${this.baseUrl}${path}`, { method: "POST", headers: { ...this.auth, "content-type": "application/json" }, body: JSON.stringify(body) }, opts);
   }
 
+  async postExactJson(path:string,body:string,opts:ResilientOpts={}):Promise<Response>{
+    return this.fetch(`${this.baseUrl}${path}`,{method:"POST",headers:{...this.auth,"content-type":"application/json","x-rbox-genesis-capability":"1"},body},opts);
+  }
+
   async missingBlobs(shas: string[]): Promise<string[]> {
     if (shas.length === 0) return [];
     const requestBody = JSON.stringify({ shas });
