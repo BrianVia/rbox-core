@@ -3,7 +3,9 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AccountWorkspace } from "./workspace-picker.js";
-import { runExportCore, type ExportSeams } from "./export-cmd.js";
+import { runExport, runExportCore, type ExportSeams } from "./export-cmd.js";
+import { saveCredentials } from "./credentials.js";
+import { GENESIS_PENDING_MESSAGE, publishPrepublishMarker } from "./genesis-durable.js";
 
 const ACCOUNT = "acct_0123456789abcdef";
 const DATE = new Date(2026, 6, 4, 10, 20, 30);
@@ -290,4 +292,29 @@ describe("runExportCore", () => {
     await expect(fs.stat(path.dirname(out))).rejects.toThrow();
     await expect(fs.stat(out)).rejects.toThrow();
   });
+});
+
+test("whole rbox export command gates pending genesis before the hasDevice shortcut", async () => {
+  const priorRboxHome = process.env.RBOX_HOME;
+  const priorHome = process.env.HOME;
+  process.env.RBOX_HOME = tmp;
+  process.env.HOME = tmp;
+  try {
+    await saveCredentials({ token: "tok", deviceId: "dev_pending", remoteUrl: "https://api.test", accountId: ACCOUNT });
+    await publishPrepublishMarker({
+      version: 1,
+      accountId: ACCOUNT,
+      deviceId: "dev_pending",
+      repairId: null,
+      startedAt: "2026-07-22T12:00:00.000Z",
+      phase: "prepublish",
+    });
+
+    await expect(runExport({ all: "true" })).rejects.toThrow(GENESIS_PENDING_MESSAGE);
+  } finally {
+    if (priorRboxHome === undefined) delete process.env.RBOX_HOME;
+    else process.env.RBOX_HOME = priorRboxHome;
+    if (priorHome === undefined) delete process.env.HOME;
+    else process.env.HOME = priorHome;
+  }
 });

@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { canonicalString, parseStrict, sha256Hex, utf8 } from "../engine/e2ee/index.js";
 import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory } from "../engine/fsutil.js";
-import { GENESIS_REPAIR_ID_RE, GENESIS_REQUEST_SHA_RE, assertGenesisAccountId, genesisPaths, hardenedRename, hardenedWrite } from "./genesis-durable.js";
+import { GENESIS_REPAIR_ID_RE, GENESIS_REQUEST_SHA_RE, assertGenesisAccountId, genesisPaths, hardenedRename, hardenedWrite, type HardenedWriteOptions } from "./genesis-durable.js";
 
 export type GenesisQuarantinePurpose="repaired-legacy"|"abandoned-attempt";
 export interface GenesisQuarantineEntry{source:"rk.key.staged"|"device.json"|"mk.key";destination:"rk.key.staged"|"device.json"|"mk.key";sha256:string}
@@ -30,8 +30,31 @@ export function parseGenesisQuarantineCompleted(raw:string,manifest:GenesisQuara
 async function fileHash(file:string):Promise<string>{const stat=await fs.lstat(file);if(!stat.isFile()||stat.isSymbolicLink()||stat.size>4*1024*1024)throw new Error(`unsafe genesis quarantine source: ${path.basename(file)}`);return sha256Hex(new Uint8Array(await fs.readFile(file)));}
 async function exists(file:string):Promise<boolean>{try{await fs.lstat(file);return true;}catch(error){if((error as NodeJS.ErrnoException).code==="ENOENT")return false;throw error;}}
 
+export type GenesisQuarantineStatus = "absent" | "active" | "completed";
+
+/** Read-only validation used by the classifier and cleanup path. A completed
+ * archive is terminal evidence; an active archive must already be executable. */
+export async function genesisQuarantineStatus(accountId:string,purpose:GenesisQuarantinePurpose,key:string):Promise<GenesisQuarantineStatus>{
+  const dir=genesisQuarantineDir(accountId,purpose,key);
+  if(!(await exists(dir)))return"absent";
+  const stat=await fs.lstat(dir);if(!stat.isDirectory()||stat.isSymbolicLink())throw new Error("unsafe genesis quarantine directory");
+  const manifestPath=path.join(dir,"quarantine-resume.json"),completedPath=path.join(dir,"completed.json"),diskEntries=await fs.readdir(dir);
+  if(!(await exists(manifestPath))){if(diskEntries.length===0)return"absent";throw new Error("nonempty manifest-less genesis quarantine");}
+  const manifestRaw=await fs.readFile(manifestPath,"utf8"),manifest=parseGenesisQuarantineManifest(manifestRaw,accountId,purpose,key);
+  const allowed=new Set(["quarantine-resume.json","completed.json",...manifest.entries.map((entry)=>entry.destination)]);
+  if(diskEntries.some((entry)=>!allowed.has(entry)))throw new Error("unexpected genesis quarantine entry");
+  const root=genesisPaths(accountId).dir;
+  if(await exists(completedPath)){
+    await parseGenesisQuarantineCompleted(await fs.readFile(completedPath,"utf8"),manifest,manifestRaw);
+    for(const entry of manifest.entries){if(await exists(path.join(root,entry.source)))throw new Error("completed genesis quarantine retained a source");if(await fileHash(path.join(dir,entry.destination))!==entry.sha256)throw new Error("completed genesis quarantine hash mismatch");}
+    return"completed";
+  }
+  for(const entry of manifest.entries){const source=path.join(root,entry.source),destination=path.join(dir,entry.destination),sourceExists=await exists(source),destinationExists=await exists(destination);if(sourceExists===destinationExists)throw new Error("invalid genesis quarantine rename state");if(await fileHash(sourceExists?source:destination)!==entry.sha256)throw new Error("genesis quarantine hash mismatch");}
+  return"active";
+}
+
 /** Create the durable manifest before any secret source is renamed. Caller owns lock choreography. */
-export async function startGenesisQuarantine(args:{accountId:string;purpose:GenesisQuarantinePurpose;uniquenessKey:string;createdAt:string;expectedHashes?:Record<string,string>}):Promise<GenesisQuarantineManifest>{
+export async function startGenesisQuarantine(args:{accountId:string;purpose:GenesisQuarantinePurpose;uniquenessKey:string;createdAt:string;expectedHashes?:Record<string,string>;writeOptions?:HardenedWriteOptions}):Promise<GenesisQuarantineManifest>{
   const dir=genesisQuarantineDir(args.accountId,args.purpose,args.uniquenessKey),paths=genesisPaths(args.accountId);
   const names=args.purpose==="repaired-legacy"?["device.json","mk.key"] as const:["rk.key.staged","device.json","mk.key"] as const;
   if(await exists(dir)){
@@ -41,25 +64,23 @@ export async function startGenesisQuarantine(args:{accountId:string;purpose:Gene
   const entries:GenesisQuarantineEntry[]=[];
   for(const name of names){const digest=await fileHash(path.join(paths.dir,name));if(args.expectedHashes?.[name]&&args.expectedHashes[name]!==digest)throw new Error("genesis quarantine source hash mismatch");entries.push({source:name,destination:name,sha256:digest});}
   const manifest:GenesisQuarantineManifest={version:1,accountId:args.accountId,purpose:args.purpose,uniquenessKey:args.uniquenessKey,createdAt:args.createdAt,entries};
-  await hardenedWrite(path.join(dir,"quarantine-resume.json"),canonicalString(manifest));return manifest;
+  await hardenedWrite(path.join(dir,"quarantine-resume.json"),canonicalString(manifest),args.writeOptions);return manifest;
 }
 
-export async function resumeGenesisQuarantine(accountId:string,purpose:GenesisQuarantinePurpose,key:string,completedAt:string):Promise<GenesisQuarantineCompleted>{
+export async function resumeGenesisQuarantine(accountId:string,purpose:GenesisQuarantinePurpose,key:string,completedAt:string,writeOptions?:HardenedWriteOptions):Promise<GenesisQuarantineCompleted>{
   const dir=genesisQuarantineDir(accountId,purpose,key),manifestPath=path.join(dir,"quarantine-resume.json"),completedPath=path.join(dir,"completed.json");
   const manifestRaw=await fs.readFile(manifestPath,"utf8");const manifest=parseGenesisQuarantineManifest(manifestRaw,accountId,purpose,key);
   const allowed=new Set(["quarantine-resume.json","completed.json",...manifest.entries.map((e)=>e.destination)]);for(const name of await fs.readdir(dir)){if(!allowed.has(name))throw new Error("unexpected genesis quarantine entry");}
   if(await exists(completedPath)){return parseGenesisQuarantineCompleted(await fs.readFile(completedPath,"utf8"),manifest,manifestRaw);}
   const root=genesisPaths(accountId).dir;
   for(const entry of manifest.entries){const source=path.join(root,entry.source),destination=path.join(dir,entry.destination);const sourceExists=await exists(source),destinationExists=await exists(destination);if(sourceExists===destinationExists)throw new Error("invalid genesis quarantine rename state");const current=sourceExists?source:destination;if(await fileHash(current)!==entry.sha256)throw new Error("genesis quarantine hash mismatch");if(sourceExists){await hardenedRename(source,destination);if(await fileHash(destination)!==entry.sha256)throw new Error("genesis quarantine destination validation failed");}}
-  const completed:GenesisQuarantineCompleted={version:1,accountId,purpose,uniquenessKey:key,manifestSha256:await sha256Hex(utf8(manifestRaw)),completedAt};await hardenedWrite(completedPath,canonicalString(completed));return completed;
+  const completed:GenesisQuarantineCompleted={version:1,accountId,purpose,uniquenessKey:key,manifestSha256:await sha256Hex(utf8(manifestRaw)),completedAt};await hardenedWrite(completedPath,canonicalString(completed),writeOptions);return completed;
 }
 
 export async function activeGenesisQuarantines(accountId:string):Promise<Array<{purpose:GenesisQuarantinePurpose;key:string}>>{
   const root=genesisPaths(accountId).quarantine;let names:string[];try{names=await fs.readdir(root);}catch(error){if((error as NodeJS.ErrnoException).code==="ENOENT")return[];throw error;}const active:Array<{purpose:GenesisQuarantinePurpose;key:string}>=[];
   for(const name of names){let purpose:GenesisQuarantinePurpose,key:string;if(name.startsWith("genesis-legacy-")){purpose="repaired-legacy";key=name.slice("genesis-legacy-".length);}else if(name.startsWith("genesis-attempt-")){purpose="abandoned-attempt";key=name.slice("genesis-attempt-".length);}else throw new Error("unexpected genesis quarantine directory");
     genesisQuarantineDir(accountId,purpose,key);const dir=path.join(root,name),stat=await fs.lstat(dir);if(!stat.isDirectory()||stat.isSymbolicLink())throw new Error("unsafe genesis quarantine directory");
-    const manifestPath=path.join(dir,"quarantine-resume.json"),completedPath=path.join(dir,"completed.json"),entries=await fs.readdir(dir);
-    if(await exists(completedPath)){if(!(await exists(manifestPath)))throw new Error("completed genesis quarantine has no manifest");const raw=await fs.readFile(manifestPath,"utf8"),manifest=parseGenesisQuarantineManifest(raw,accountId,purpose,key);await parseGenesisQuarantineCompleted(await fs.readFile(completedPath,"utf8"),manifest,raw);const allowed=new Set(["quarantine-resume.json","completed.json",...manifest.entries.map((entry)=>entry.destination)]);if(entries.some((entry)=>!allowed.has(entry)))throw new Error("unexpected genesis quarantine entry");for(const entry of manifest.entries){if(await exists(path.join(genesisPaths(accountId).dir,entry.source)))throw new Error("completed genesis quarantine retained a source");if(await fileHash(path.join(dir,entry.destination))!==entry.sha256)throw new Error("completed genesis quarantine hash mismatch");}continue;}
-    if(await exists(manifestPath))active.push({purpose,key});else if(entries.length!==0)throw new Error("nonempty manifest-less genesis quarantine");}
+    const status=await genesisQuarantineStatus(accountId,purpose,key);if(status==="active")active.push({purpose,key});}
   return active;
 }

@@ -55,6 +55,14 @@ export class AccountAlreadyBootstrappedError extends Error {
   }
 }
 
+/** A genesis publication response that retries cannot repair. */
+export class GenesisBootstrapTerminalError extends Error {
+  constructor(readonly status: number, readonly code: string, message: string) {
+    super(message);
+    this.name = "GenesisBootstrapTerminalError";
+  }
+}
+
 /** A network call exhausted its transient-retry budget (or hit a non-retryable
  *  transient like a caller cancellation surfacing as a fault). Carries a HUMAN message so the
  *  raw Bun fetch string ("pass `verbose: true` in the second argument to fetch()") never reaches
