@@ -573,6 +573,79 @@ async function existsNoFollow(p: string): Promise<boolean> {
   }
 }
 
+export interface GitBusyLock {
+  path: string;
+  dev: string;
+  ino: string;
+  size: number;
+  mtimeMs: number;
+}
+
+export type GitBusySharedInspection =
+  | { status: "ok"; locks: GitBusyLock[] }
+  | { status: "indeterminate"; detail: string };
+
+export type GitBusyInspection = GitBusySharedInspection;
+
+async function inspectBusyLock(lockPath: string): Promise<GitBusyLock | undefined> {
+  try {
+    const stat = await fs.lstat(lockPath, { bigint: true });
+    return {
+      path: lockPath,
+      dev: String(stat.dev),
+      ino: String(stat.ino),
+      size: Number(stat.size),
+      mtimeMs: Number(stat.mtimeNs) / 1_000_000,
+    };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+/** Inspect the store-wide half of the ordinary fail-closed busy probe. Callers
+ * sweeping linked worktrees may cache this result by canonical commonDir. */
+export async function inspectGitBusyShared(commonDir: string): Promise<GitBusySharedInspection> {
+  try {
+    const locks: GitBusyLock[] = [];
+    for (const name of ["config.lock", "packed-refs.lock", "gc.pid"]) {
+      const lock = await inspectBusyLock(path.join(commonDir, name));
+      if (lock) locks.push(lock);
+    }
+    const refsDir = path.join(commonDir, "refs");
+    if (await existsNoFollow(refsDir)) {
+      for (const rel of await walkFiles(refsDir)) {
+        if (!rel.endsWith(".lock")) continue;
+        const lock = await inspectBusyLock(path.join(refsDir, rel));
+        if (lock) locks.push(lock);
+      }
+    }
+    return { status: "ok", locks };
+  } catch (error) {
+    return { status: "indeterminate", detail: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/** Structured form of gitBusy(). Shared inspection is injectable so a workspace
+ * hygiene pass reads a linked-worktree common directory exactly once. */
+export async function inspectGitBusy(
+  ctx: RepoCtx,
+  shared: GitBusySharedInspection | Promise<GitBusySharedInspection> = inspectGitBusyShared(ctx.commonDir),
+): Promise<GitBusyInspection> {
+  try {
+    const worktreeLocks: GitBusyLock[] = [];
+    for (const name of ["index.lock", "HEAD.lock"]) {
+      const lock = await inspectBusyLock(path.join(ctx.gitDir, name));
+      if (lock) worktreeLocks.push(lock);
+    }
+    const common = await shared;
+    if (common.status === "indeterminate") return common;
+    return { status: "ok", locks: [...worktreeLocks, ...common.locks] };
+  } catch (error) {
+    return { status: "indeterminate", detail: error instanceof Error ? error.message : String(error) };
+  }
+}
+
 /** rename, with an EXDEV fallback (copy to a temp in the DEST dir, then rename) — a
  *  pointer repo's resolved gitdir (the main clone) may live on a different mount than
  *  the worktree where the apply staged its temp files. */
@@ -589,14 +662,18 @@ export async function moveFileAtomic(src: string, dest: string): Promise<void> {
 }
 
 export async function gitBusy(ctx: RepoCtx): Promise<boolean> {
-  // per-worktree locks live in the resolved gitdir; store-wide locks in the common dir
+  // Keep the ordinary planner/apply probe short-circuiting. Hygiene uses the
+  // exhaustive structured inspector above because it needs the whole cohort.
   for (const lock of [path.join(ctx.gitDir, "index.lock"), path.join(ctx.gitDir, "HEAD.lock"), path.join(ctx.commonDir, "config.lock"), path.join(ctx.commonDir, "packed-refs.lock"), path.join(ctx.commonDir, "gc.pid")]) {
     if (await existsNoFollow(lock)) return true;
   }
-  // any *.lock under the SHARED refs/
   const refsDir = path.join(ctx.commonDir, "refs");
   if (await existsNoFollow(refsDir)) {
-    for (const rel of await walkFiles(refsDir)) if (rel.endsWith(".lock")) return true;
+    try {
+      for (const rel of await walkFiles(refsDir)) if (rel.endsWith(".lock")) return true;
+    } catch {
+      return true;
+    }
   }
   return false;
 }

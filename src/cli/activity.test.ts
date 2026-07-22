@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { ACTIVE_STALE_MS, loadActivity, renderShellDeferrals, renderShellLine, saveActivity, saveShellDeferrals, saveShellLine, type DaemonActivity } from "./activity.js";
+import { ACTIVE_STALE_MS, loadActivity, renderShellDeferrals, renderShellLine, saveActivity, saveShellDeferrals, saveShellLine, shellStateOf, type DaemonActivity } from "./activity.js";
 import { resetSyncState } from "./config.js";
 import type { SyncState } from "./config.js";
 import { ageBucket } from "./status-view.js";
@@ -29,7 +29,18 @@ test("round-trips the full record", async () => {
     lastPush: { at: "2026-07-02T11:58:00.000Z", files: 3, sequence: 78 },
     lastPull: { at: "2026-07-02T11:57:00.000Z", writes: 2, deletes: 1, conflicts: 0 },
     active: { at: "2026-07-02T12:00:00.000Z", phase: "upload", done: 1, total: 3, detail: "repo", bytesDone: 512, bytesTotal: 1024 },
-    halt: { at: "2026-07-02T11:00:00.000Z", reason: "mass-delete guard", count: 2, op: "pull", typedReason: { kind: "mass-delete", op: "pull" }, terminal: { fingerprint: "sidecar-sha" } },
+    halt: {
+      at: "2026-07-02T11:00:00.000Z", reason: "push conflict", count: 2, op: "push",
+      firstFailureAt: "2026-07-02T11:00:00.000Z", lastFailureAt: "2026-07-02T11:01:00.000Z",
+      consecutiveFailures: 2, nextProbeAt: "2026-07-02T11:02:00.000Z", lastProbeAt: "2026-07-02T11:00:30.000Z",
+      recoveryState: "armed",
+      typedReason: { kind: "push-conflict" },
+    },
+    suspendedPushHalt: {
+      at: "2026-07-02T10:00:00.000Z", reason: "earlier push conflict", count: 1, op: "push",
+      firstFailureAt: "2026-07-02T10:00:00.000Z", recoveryState: "suspended",
+      typedReason: { kind: "push-conflict" },
+    },
     outOfStorage: { at: "2026-07-02T11:30:00.000Z", kind: "storage", used: 2147483648, cap: 2147483648 },
     local: {
       at: "2026-07-02T12:00:02.000Z",
@@ -89,6 +100,17 @@ test("malformed typed halt classifications are dropped without classifying raw s
     halt: { at, reason: "pull mass-delete guard too_many_refs", count: 1, op: "pull", typedReason: { kind: "mass-delete", op: "fullScan" } },
   }));
   expect(await loadActivity(root)).toEqual({ at, halt: { at, reason: "pull mass-delete guard too_many_refs", count: 1, op: "pull" } });
+});
+
+test("suspended push halt uses the halt validator and rejects non-push episodes", async () => {
+  const p = path.join(root, ".rbox", "state", "activity.json");
+  await fs.mkdir(path.dirname(p), { recursive: true });
+  const at = "2026-07-02T12:00:00.000Z";
+  await fs.writeFile(p, JSON.stringify({
+    at,
+    suspendedPushHalt: { at, reason: "not a push", count: 1, op: "pull", typedReason: { kind: "push-conflict" } },
+  }));
+  expect(await loadActivity(root)).toEqual({ at });
 });
 
 test("malformed local slot is dropped alone", async () => {
@@ -300,6 +322,26 @@ test("renderShellLine name is LAST and verbatim (spaces kept), control chars neu
   expect(line).not.toContain("\n"); // stays exactly one line
   // Everything before the name is a fixed 7-field header; the rest is the name verbatim.
   expect(line.split(" ").slice(7).join(" ")).toBe("My Cool Repo?rm -rf?/");
+});
+
+test.each([
+  ["too-many-refs"],
+  ["body-too-large"],
+] as const)("fingerprint-less %s halt stays a halt even with an armed recovery probe (178 t2 final review)", (kind) => {
+  // The API can reject without a blob-ref sidecar, so `terminal` is absent.
+  // An armed probe timer must not demote the safety refusal to "pending".
+  const a: DaemonActivity = {
+    at: "2026-07-22T00:00:00.000Z",
+    halt: {
+      at: "2026-07-22T00:00:00.000Z",
+      reason: "commit rejected",
+      count: 1,
+      op: "push",
+      typedReason: { kind },
+      nextProbeAt: "2026-07-22T00:01:00.000Z",
+    },
+  };
+  expect(shellStateOf(a, true)).toBe("halt");
 });
 
 test("save is best-effort: an unwritable destination is swallowed", async () => {

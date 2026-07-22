@@ -2,7 +2,9 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { saveConfig, saveStateUnsafeLegacyOrTest, syncStreamId, type WorkspaceConfig } from "./config.js";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { loadState, repoRecordsForState, saveConfig, saveStateUnsafeLegacyOrTest, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { populateStatusPath, type PopulateStatusV1 } from "./populate-status.js";
 import { statusCmdWithDeps, type StatusCmdDeps } from "./status-cmd.js";
 import { lockingHealthPath } from "./sync-mutex.js";
@@ -10,9 +12,11 @@ import { daemonDatedLogPath } from "./rbox-paths.js";
 import { main } from "./main-dispatch.js";
 import { writeResetHaltHealth } from "./reset-health.js";
 import { RBOX_VERSION } from "./version.js";
+import { saveActivity } from "./activity.js";
 
 const OLD_ENV = { ...process.env };
 const NOW = Date.parse("2026-07-08T12:00:00Z");
+const exec = promisify(execFile);
 
 let root = "";
 let runtime = "";
@@ -200,6 +204,31 @@ async function captureDispatch(args: string[]): Promise<string> {
     process.stdout.write = oldWrite;
   }
 }
+
+test("design 178 C: computed status clears an idle capture-busy lane without a push", async () => {
+  const repo = path.join(root, "repo");
+  await fs.mkdir(repo);
+  await exec("git", ["-C", repo, "init", "-q"]);
+  const lock = path.join(repo, ".git", "index.lock");
+  await fs.writeFile(lock, "");
+  const at = new Date(NOW - 60_000).toISOString();
+  await saveStateUnsafeLegacyOrTest(root, {
+    stream: syncStreamId(cfg),
+    lastSyncedSequence: 7,
+    lastSyncedManifest: { generatedAt: at, files: [] },
+    repoRecords: {
+      repo: {
+        repoGen: 1,
+        sourceSeq: 7,
+        deferrals: { capture: { lane: "capture", reason: "git-busy", deferredSince: at, reasonSince: at, lastSeen: at } },
+      },
+    },
+  });
+  await fs.rm(lock);
+  const output = await captureStatusWithDeps({ git: true }, cleanScanDeps());
+  expect(output).not.toContain("git deferred");
+  expect(repoRecordsForState(await loadState(root, syncStreamId(cfg))).repo?.deferrals).toBeUndefined();
+});
 
 test("reset-journal halt renders text and JSON without dereferencing state", async () => {
   const journal = path.join(root, ".rbox", "state", "reset-v1.json");
@@ -713,6 +742,64 @@ test("JSON adds optional top-level haltReason and otherwise keeps the detailed p
   }));
   const halted = JSON.parse(await captureStatusWithDeps({ json: true }, d));
   expect(halted).toEqual({ ...healthy, health: "halt", haltReason: "private raw daemon reason" });
+});
+
+test("review M4: stopped daemon renders a persisted recovery as a halt, not an armed timer", async () => {
+  await saveActivity(root, {
+    at: new Date(NOW).toISOString(),
+    halt: {
+      at: new Date(NOW - 30_000).toISOString(),
+      reason: "push conflict",
+      count: 1,
+      op: "push",
+      nextProbeAt: new Date(NOW + 60_000).toISOString(),
+      recoveryState: "armed",
+      typedReason: { kind: "push-conflict" },
+    },
+  });
+
+  const out = await captureStatusWithDeps({}, cleanScanDeps());
+
+  expect(out).toContain("sync halted — see rbox logs");
+  expect(out).toContain("background sync is stopped · rbox start");
+  expect(out).not.toContain("retrying after conflict");
+  expect(out).not.toContain("next probe");
+});
+
+test("review M6: status hygiene failures retain deferrals through both call sites", async () => {
+  const at = new Date(NOW - 15 * 86400_000).toISOString();
+  const stream = syncStreamId(cfg);
+  await saveStateUnsafeLegacyOrTest(root, {
+    stream,
+    lastSyncedSequence: 7,
+    lastSyncedManifest: { generatedAt: at, files: [] },
+    repoRecords: {
+      repo: {
+        repoGen: 1,
+        sourceSeq: 7,
+        deferrals: { capture: { lane: "capture", reason: "git-busy", deferredSince: at, reasonSince: at, lastSeen: at } },
+      },
+    },
+  });
+  await saveActivity(root, {
+    at: new Date(NOW).toISOString(),
+    local: {
+      at: new Date(NOW).toISOString(), stream, baseSequence: 6, trackedFiles: 0,
+      added: 0, changed: 0, deleted: 0, settled: true, sourceVersion: 1,
+    },
+  });
+  let calls = 0;
+  const d = cleanScanDeps();
+  d.reconcileGitDeferrals = async () => {
+    calls++;
+    throw new Error("hygiene unavailable");
+  };
+
+  const out = await captureStatusWithDeps({}, d);
+
+  expect(calls).toBe(2);
+  expect(out).toContain("1 git repo needs attention");
+  expect(repoRecordsForState(await loadState(root, stream)).repo?.deferrals?.capture?.reason).toBe("git-busy");
 });
 
 test("all conflicting status presentation flag pairs are rejected", async () => {

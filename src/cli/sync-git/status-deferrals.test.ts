@@ -36,6 +36,7 @@ test("gitDivergenceStatus projects durable lanes read-only even when git sync is
   const cfg = { syncGit: false } as WorkspaceConfig;
   expect(await gitDivergenceStatus("/unused", cfg, state)).toEqual({
     count: 0,
+    indeterminate: false,
     configChecking: [],
     configDisabled: [],
     conflictSnapshots: { total: 0, prunable: 0 },

@@ -186,7 +186,7 @@ _rbox_deferrals() {
       return 0
     fi
     case \$reason in
-      local-edits|local-index|local-operation|local-commits|local-stash|conflict|git-busy|worktree-ownership|ignored-target|unreadable|artifact|config|containment|unsupported|other) ;;
+      local-edits|local-index|local-operation|local-commits|local-stash|conflict|git-busy|stale-unattributed|worktree-ownership|ignored-target|unreadable|artifact|config|containment|unsupported|other) ;;
       *) exec {fd}<&-; return 0 ;;
     esac
     [[ \$age == ([0-9]m|[1-5][0-9]m|1h|1d|7d|14d|30d) && \$changed == (0|1) ]] || {

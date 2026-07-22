@@ -19,6 +19,7 @@ const ENV_KEYS = [
 ] as const;
 
 interface DaemonInternals {
+  recoveryDue: boolean;
   ws?: WebSocket;
   pongDeadlineMs: number;
   backstopMs: number;
@@ -315,6 +316,7 @@ test("failed catch-up pull restores its generation until a healing pull", async 
   expect(daemon.pendingCatchUpGeneration).toBeDefined();
 
   daemon.want.pull = true;
+  daemon.recoveryDue = true;
   await daemon.pump();
   expect(daemon.activity.ws?.caughtUp).toBe(true);
 });
@@ -537,6 +539,7 @@ test("a failed notify is discarded and a fresh applying backstop gets the credit
   expect(daemon.notifyAppliedPulls).toBe(0);
   expect(daemon.backstopAppliedPulls).toBe(0);
 
+  daemon.recoveryDue = true;
   daemon.onBackstopTick();
   await daemon.pumpRun;
   expect(await fs.readFile(path.join(root, "healed.txt"), "utf8")).toBe("backstop");

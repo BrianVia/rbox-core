@@ -11,7 +11,7 @@
  * actual local-vs-baseline diff and the daemon's recorded activity — never from
  * "the command ran to completion".
  */
-import { ACTIVE_STALE_MS, type DaemonActivity } from "./activity.js";
+import { ACTIVE_STALE_MS, isSafetyHaltReason, type DaemonActivity } from "./activity.js";
 import type { GitDeferral, GitDeferralReason, RepoRecord } from "./config.js";
 import { formatBinaryBytes, formatDecimalBytes, quotaUsage } from "./quota-format.js";
 import { style } from "./style.js";
@@ -120,6 +120,7 @@ export type BriefStatusSnapshot =
       populate?: BriefPopulateProgress;
       behindRemote: boolean;
       halt?: BriefHaltReason;
+      recovery?: { nextProbeAt?: string; running?: true };
       planQuota: PlanQuotaAttention;
       daemonVersion?: string;
       cliVersion: string;
@@ -287,6 +288,7 @@ const DEFERRAL_REASON_PRESENTATION: Record<GitDeferralReason, GitDeferralReasonP
   "local-stash": { label: "local stash", text: "The local stash changed here.", repair: "Stop stash mutation, then let normal sync retry.", transient: true },
   conflict: { label: "conflict", text: "Incoming and local Git state conflict.", repair: "Repair the conflicting repository state, then let sync retry.", transient: false },
   "git-busy": { label: "git busy", text: "Another Git process is using this repository.", repair: "Let the other Git process finish, then let sync retry.", transient: false },
+  "stale-unattributed": { label: "stale Git locks", text: "A stable lock cohort remains without a known live owner.", repair: "Confirm no Git process owns the reported locks, then remove only the stale lock files and let sync retry.", transient: false },
   "worktree-ownership": { label: "worktree ownership", text: "Another worktree owns a required Git ref.", repair: "Repair the worktree ownership conflict, then let sync retry.", transient: false },
   "ignored-target": { label: "ignored target", text: "The incoming checkout targets an ignored repository.", repair: "Correct the ignore rule or repository target, then let sync retry.", transient: false },
   unreadable: { label: "unreadable repository", text: "Git metadata could not be read completely.", repair: "Restore repository readability and permissions, then let sync retry.", transient: false },
@@ -452,9 +454,20 @@ export function renderGitDeferralCompanion(input: {
   reason: string;
   canResolve: boolean;
   canKeepMine: boolean;
+  staleLockDetail?: { lockCount: number; oldestAgeMs: number; samplePath: string };
 }): string {
   const presentation = gitDeferralReasonPresentation(input.reason);
   const reassurance = `Your repository is healthy; only rbox's bookkeeping is paused (${presentation.label}).`;
+  if (input.reason === "stale-unattributed" && input.staleLockDetail) {
+    const detail = input.staleLockDetail;
+    const count = `${detail.lockCount} stable lock${detail.lockCount === 1 ? "" : "s"}`;
+    const oldestSeconds = Math.max(0, Math.floor(detail.oldestAgeMs / 1000));
+    const oldest = oldestSeconds < 60 ? `${oldestSeconds}s` : oldestSeconds < 3600
+      ? `${Math.floor(oldestSeconds / 60)}m`
+      : `${Math.floor(oldestSeconds / 3600)}h`;
+    return `rbox found ${count} without a known live owner; oldest ${oldest} (for example ${truncateDetail(detail.samplePath)}). ` +
+      "Confirm no Git process owns the reported locks, then remove only the verified stale lock files and let sync retry.";
+  }
   if (!input.canResolve) return `${reassurance} ${presentation.repair}`;
   if (!input.canKeepMine) {
     return `${reassurance} Nothing is waiting to publish with \`keep-mine\`; ` +
@@ -692,6 +705,13 @@ export function renderBriefStatus(snapshot: BriefStatusSnapshot): BriefStatusRen
   }
 
   const lines = [fullBriefHeadline(snapshot)];
+  if (snapshot.recovery) {
+    if (snapshot.recovery.running) lines.push("↻ retrying after conflict");
+    else {
+      const seconds = Math.max(0, Math.ceil((Date.parse(snapshot.recovery.nextProbeAt!) - snapshot.now) / 1000));
+      lines.push(`⚠ retrying after conflict; next probe in ${seconds}s`);
+    }
+  }
   if (snapshot.halt) lines.push(briefHaltLine(snapshot.halt));
   const quota = planQuotaLine(snapshot.planQuota);
   if (quota) lines.push(quota);
@@ -764,8 +784,18 @@ export function healthLine(s: StatusSnapshot): string {
   //    below it. The one surgical exception is a fresh retry transfer: it
   //    leads over an older halt, with the halt rendered as secondary context.
   const out = s.daemonRunning ? s.activity?.outOfStorage : undefined;
+  const nonSafetyRetry = halt
+    && !halt.terminal
+    && !isSafetyHaltReason(halt.typedReason?.kind);
+  if (nonSafetyRetry && halt.recoveryState === "running") {
+    return style.cyan("↻ retrying after conflict");
+  }
+  if (nonSafetyRetry && halt.recoveryState !== "suspended" && halt.nextProbeAt) {
+    const seconds = Math.max(0, Math.ceil((Date.parse(halt.nextProbeAt ?? halt.at) - s.now) / 1000));
+    return style.yellow(`⚠ retrying after conflict; next probe in ${seconds}s`);
+  }
   if (halt?.terminal) return haltLine(halt, s.now);
-  if (halt && (!active || out)) return haltLine(halt, s.now);
+  if (halt && (!nonSafetyRetry || halt.recoveryState !== "suspended") && (!active || out)) return haltLine(halt, s.now);
   if (out) {
     if (out.reason === "no_plan") return `${style.red("⛔ no active plan")} · run \`rbox subscribe\``;
     const usage = quotaUsage(out.kind, out.used, out.cap);
@@ -834,7 +864,7 @@ export function healthDetailLines(s: StatusSnapshot): string[] {
   const active = freshActive(s);
   const out = s.daemonRunning ? s.activity?.outOfStorage : undefined;
   const lines: string[] = [];
-  if (halt && !halt.terminal && active && !out) {
+  if (halt && halt.typedReason?.kind !== "push-conflict" && !halt.terminal && active && !out) {
     lines.push(`${style.yellow("⚠ last attempt failed")} ${style.dim(`(${relTime(halt.at, s.now)})`)} ${halt.reason} ${style.yellow("— will be retried")}`);
   }
   if ((s.gitDeferrals ?? 0) > 0 && s.gitOldestDeferral) {

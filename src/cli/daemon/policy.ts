@@ -55,12 +55,19 @@ export class DaemonChainRepairPolicy {
       this.terminalHeadFingerprint = `${error.head.seq}:${error.head.hash}`;
       this.terminalHaltMessage = message;
     }
-    return new Error(message);
+    return new ChainRepairHaltError(message);
   }
 
   clear(): void {
     this.terminalHeadFingerprint = "";
     this.terminalHaltMessage = "";
+  }
+}
+
+export class ChainRepairHaltError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ChainRepairHaltError";
   }
 }
 
@@ -80,6 +87,28 @@ export interface Wants {
   push: boolean;
   fullScan: boolean;
   deepScan: boolean;
+}
+
+export type PumpOperation = keyof Wants | "recoveryProbe";
+export const RECOVERY_PROBE_SERVICE_BOUND = 8;
+export const RECOVERY_PROBE_BASE_MS = 5_000;
+export const RECOVERY_PROBE_CAP_MS = 120_000;
+
+/** Design 178 B full-jitter episode delay. Failure 1 has a 5s ceiling. */
+export function recoveryProbeDelayMs(consecutiveFailures: number, random: () => number = Math.random): number {
+  const exponent = Math.max(0, Math.trunc(consecutiveFailures) - 1);
+  const ceiling = Math.min(RECOVERY_PROBE_CAP_MS, RECOVERY_PROBE_BASE_MS * 2 ** exponent);
+  return Math.floor(Math.max(0, Math.min(0.999999999999, random())) * ceiling);
+}
+
+export function selectPumpOperation(
+  want: Wants,
+  recoveryDue: boolean,
+  dequeuedSinceDue: number,
+): PumpOperation | undefined {
+  const ambient: keyof Wants | undefined = want.deepScan ? "deepScan" : want.fullScan ? "fullScan" : want.pull ? "pull" : want.push ? "push" : undefined;
+  if (recoveryDue && (ambient === undefined || dequeuedSinceDue >= RECOVERY_PROBE_SERVICE_BOUND)) return "recoveryProbe";
+  return ambient;
 }
 
 /** Contention disposition pin: only a successful acquire authorizes consuming

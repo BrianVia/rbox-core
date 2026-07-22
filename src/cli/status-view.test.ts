@@ -90,6 +90,15 @@ test("status companion explains the hold without changing the shared deferred gr
   expect(actionable).not.toMatch(/^git(?:-sync)? deferred/);
   expect(renderGitDeferralCompanion({ reason: "git-busy", canResolve: false, canKeepMine: false }))
     .toBe("Your repository is healthy; only rbox's bookkeeping is paused (git busy). Let the other Git process finish, then let sync retry.");
+  const stale = renderGitDeferralCompanion({
+    reason: "stale-unattributed",
+    canResolve: false,
+    canKeepMine: false,
+    staleLockDetail: { lockCount: 2, oldestAgeMs: 90_000, samplePath: "repo/.git/index.lock" },
+  });
+  expect(stale).toContain("rbox found 2 stable locks without a known live owner; oldest 1m");
+  expect(stale).toContain("remove only the verified stale lock files");
+  expect(stale).not.toContain("rm --");
 });
 
 test("projectGitDeferralRepos collapses lanes by oldest age, reason precedence, and bytes OR", () => {
@@ -131,7 +140,7 @@ test("projection derives resolver capability from the complete record and sorts 
 });
 
 test("the reason vocabulary is exhaustive and unknown reasons stay opaque and non-actionable", () => {
-  const reasons = ["local-edits", "local-index", "local-operation", "local-commits", "local-stash", "conflict", "git-busy", "worktree-ownership", "ignored-target", "unreadable", "artifact", "config", "containment", "unsupported", "other"];
+  const reasons = ["local-edits", "local-index", "local-operation", "local-commits", "local-stash", "conflict", "git-busy", "stale-unattributed", "worktree-ownership", "ignored-target", "unreadable", "artifact", "config", "containment", "unsupported", "other"];
   for (const reason of reasons) {
     const presentation = gitDeferralReasonPresentation(reason);
     expect(presentation.label.length).toBeGreaterThan(0);
@@ -265,6 +274,40 @@ test("fresh active progress outranks a standing halt and renders the halt as ret
   expect(healthDetailLines(snapshot)).toEqual([
     "⚠ last attempt failed (2m ago) ENOENT: no such file or directory — will be retried",
   ]);
+});
+
+test("design 178 B: armed conflict recovery reports the next probe and is not halted", () => {
+  const activity: DaemonActivity = {
+    at: iso(10),
+    halt: {
+      at: iso(120), reason: "push conflict", count: 2, op: "push",
+      typedReason: { kind: "push-conflict" },
+      nextProbeAt: new Date(NOW + 7_100).toISOString(),
+    },
+  };
+  const line = healthLine(base({ activity }));
+  expect(line).toContain("retrying after conflict; next probe in 8s");
+  expect(line).not.toContain("halt");
+  expect(healthDetailLines(base({ activity }))).toEqual([]);
+});
+
+test("design 178 B: running and pull-only-suspended recovery never claim an armed timer", () => {
+  const running: DaemonActivity = {
+    at: iso(10),
+    halt: {
+      at: iso(120), reason: "push conflict", count: 2, op: "push",
+      typedReason: { kind: "push-conflict" }, nextProbeAt: iso(1), recoveryState: "running",
+    },
+  };
+  expect(healthLine(base({ activity: running }))).toBe("↻ retrying after conflict");
+
+  const suspended: DaemonActivity = {
+    at: iso(10),
+    halt: { ...running.halt!, recoveryState: "suspended" },
+  };
+  const suspendedLine = healthLine(base({ activity: suspended }));
+  expect(suspendedLine).not.toContain("next probe");
+  expect(suspendedLine).not.toContain("halt");
 });
 
 test("fresh populate marker suppresses local-change verdict", () => {

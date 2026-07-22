@@ -61,7 +61,8 @@ export function breadcrumbGateForReason(reason: GitDeferralReason): BreadcrumbVe
     case "local-commits": return "reason-local-commits";
     case "local-stash": return "reason-local-stash";
     case "worktree-ownership": return "reason-worktree-ownership";
-    case "git-busy": return "reason-git-busy";
+    case "git-busy":
+    case "stale-unattributed": return "reason-git-busy";
     case "unreadable": return "reason-unreadable";
     case "artifact": return "reason-artifact";
     case "containment": return "reason-containment";

@@ -600,6 +600,7 @@ function refusalMessage(reason: GitDeferralReason): string {
     unreadable: "Git metadata could not be read completely",
     unsupported: "this repository shape or Git version cannot perform the journaled checkout",
     "git-busy": "Git became busy during resolution; retry after the other Git operation finishes",
+    "stale-unattributed": "stable Git locks remain without a known owner; inspect and repair the stale lock files first",
     containment: "the repository containment proof failed",
     "worktree-ownership": "another worktree owns a ref required by the confirmed checkout",
     "ignored-target": "the confirmed checkout targets an ignored repository",

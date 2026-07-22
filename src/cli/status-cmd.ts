@@ -2,7 +2,7 @@ import path from "node:path";
 import { PassThrough } from "node:stream";
 import { buildIgnoreMatcher, checkoutTransactionCapability, cryptoPoolStatus, diffManifests, HashCache, scanManifest, type CheckoutTransactionCapability, type DiscoveredGitRepo, type IgnoreMatcher } from "../engine/index.js";
 import { trashStats } from "../engine/trash.js";
-import { loadActivity, shellStateOf, type DaemonActivity } from "./activity.js";
+import { isSafetyHaltReason, loadActivity, shellStateOf, type DaemonActivity } from "./activity.js";
 import { RBOX_VERSION } from "./version.js";
 import { fetchAccountSummary, formatAccountSummary } from "./account-cmd.js";
 import { readAccountProfile } from "./account-profile.js";
@@ -48,6 +48,7 @@ import { readLockingHealth, type LockingHealth } from "./sync-mutex.js";
 import { readAmbientDaemonStatusRecord, validDaemonVersion } from "./daemon/ambient-status.js";
 import type { DaemonMode } from "./daemon/ambient-status.js";
 import { serializeGitDeferralLanes } from "./sync-git/git-deferral-json.js";
+import { deferralHygieneDetailKey, reconcileGitDeferrals, type GitBusyDisplayDetail } from "./sync-git/deferral-hygiene.js";
 import { inspectResetJournalSafety } from "./reset-halt-inspection.js";
 import { readResetHaltHealth } from "./reset-health.js";
 import { promotePendingModeIntent } from "./autostart-cmd.js";
@@ -111,6 +112,7 @@ export interface StatusCmdDeps {
   readAmbientDaemonStatusRecord?: typeof readAmbientDaemonStatusRecord;
   readBriefIdentity?: (accountId: string) => Promise<BriefIdentitySource | undefined>;
   promotePendingModeIntent?: typeof promotePendingModeIntent;
+  reconcileGitDeferrals?: typeof reconcileGitDeferrals;
 }
 
 const defaultStatusDeps: StatusCmdDeps = {
@@ -126,6 +128,7 @@ const defaultStatusDeps: StatusCmdDeps = {
   checkoutTransactionCapability,
   readAmbientDaemonStatusRecord,
   promotePendingModeIntent,
+  reconcileGitDeferrals,
 };
 
 const LOCAL_TRUST_MS = 60_000;
@@ -313,6 +316,12 @@ function runningDaemonLabel(version?: string, mode?: DaemonMode): string {
   return details.length === 0 ? "running" : `running (${details.join(", ")})`;
 }
 
+function statusStaleLockDetail(root: string, detail: GitBusyDisplayDetail | undefined): GitBusyDisplayDetail | undefined {
+  if (!detail) return undefined;
+  const relative = path.relative(root, detail.samplePath);
+  return { ...detail, samplePath: relative && !relative.startsWith("..") ? relative : path.basename(detail.samplePath) };
+}
+
 export async function statusCmd(root: string, opts: StatusCmdOptions = {}): Promise<StatusCmdResult> {
   assertPresentationFlags(opts);
   const deps = opts.now === undefined
@@ -408,6 +417,17 @@ export async function statusCmdWithDeps(
 
   const accountSummaryP = opts.verbose ? fetchAccountSummary(3500, loadedCredentials) : Promise.resolve(null);
   let state = await loadState(root, syncStreamId(cfg));
+  let hygieneDetails = new Map<string, GitBusyDisplayDetail>();
+  const runDeferralHygiene = async (): Promise<void> => {
+    const result = await (deps.reconcileGitDeferrals ?? reconcileGitDeferrals)(root, cfg, state);
+    state = result.state;
+    hygieneDetails = result.displayDetails;
+  };
+  try {
+    await runDeferralHygiene();
+  } catch {
+    // Fail closed: retain the durable lanes already loaded and keep rendering.
+  }
 
   const activityP = daemonStale ? Promise.resolve(undefined) : loadActivity(root);
   const trashP = trashStats(root).catch(() => undefined);
@@ -430,6 +450,11 @@ export async function statusCmdWithDeps(
   let mustComputeLocal = false;
   if (localBaseSequenceMismatched(activity, state)) {
     state = await loadState(root, syncStreamId(cfg));
+    try {
+      await runDeferralHygiene();
+    } catch {
+      // Fail closed after the reload too; status remains available.
+    }
     attributed = attributeActivity(state);
     activity = attributed.activity;
     mustComputeLocal = true;
@@ -455,13 +480,14 @@ export async function statusCmdWithDeps(
     source?: readonly GitDivergenceRepoHint[] | AsyncIterable<GitDivergenceRepoHint>,
     includeBaseRepos = true
   ): Promise<GitDivergenceStatus> => {
-    if (!cfg.syncGit) return { count: 0, deferrals: localGitDeferrals(state).map(({ repo, ...d }) => ({ relPath: repo, ...d })), configChecking: [], configDisabled: [], conflictSnapshots: { total: 0, prunable: 0 } };
+    if (!cfg.syncGit) return { count: 0, indeterminate: false, deferrals: localGitDeferrals(state).map(({ repo, ...d }) => ({ relPath: repo, ...d })), configChecking: [], configDisabled: [], conflictSnapshots: { total: 0, prunable: 0 } };
     try {
       if (deps.gitDivergenceStatus) {
         return await deps.gitDivergenceStatus(root, cfg, state, matcher, source, includeBaseRepos);
       }
       return {
         count: await deps.gitDivergenceCount(root, cfg, state, matcher, source, includeBaseRepos),
+        indeterminate: false,
         deferrals: localGitDeferrals(state).map(({ repo, ...d }) => ({ relPath: repo, ...d })),
         configChecking: [],
         configDisabled: [],
@@ -470,7 +496,7 @@ export async function statusCmdWithDeps(
     } catch {
       // Design 93 §6: an indeterminate config lane is conservatively divergent;
       // status must never collapse an evaluation failure to zero.
-      return { count: 1, deferrals: localGitDeferrals(state).map(({ repo, ...d }) => ({ relPath: repo, ...d })), configChecking: ["*"], configDisabled: [], conflictSnapshots: { total: 0, prunable: 0 } };
+      return { count: 1, indeterminate: true, deferrals: localGitDeferrals(state).map(({ repo, ...d }) => ({ relPath: repo, ...d })), configChecking: ["*"], configDisabled: [], conflictSnapshots: { total: 0, prunable: 0 } };
     }
   };
 
@@ -665,7 +691,20 @@ export async function statusCmdWithDeps(
     const nextVersion = updateAvailableVersion(updateState);
     const planQuota = aggregatePlanQuotaAttention(account, activity?.outOfStorage);
     const typedHalt = activity?.halt?.typedReason;
-    const halt: BriefHaltReason | undefined = activity?.halt
+    const retryArmed = Boolean(bg.running
+      && activity?.halt?.nextProbeAt
+      && activity.halt.recoveryState !== "suspended"
+      && activity.halt.recoveryState !== "running"
+      && !activity.halt.terminal
+      && !isSafetyHaltReason(typedHalt?.kind));
+    const retrySuspended = activity?.halt?.recoveryState === "suspended"
+      && typedHalt?.kind !== "mass-delete"
+      && typedHalt?.kind !== "chain-repair";
+    const retryRunning = activity?.halt?.recoveryState === "running"
+      && !activity.halt.terminal
+      && typedHalt?.kind !== "mass-delete"
+      && typedHalt?.kind !== "chain-repair";
+    const halt: BriefHaltReason | undefined = activity?.halt && !retryArmed && !retrySuspended && !retryRunning
       ? typedHalt?.kind === "mass-delete"
         ? { kind: "mass-delete", op: typedHalt.op }
         : typedHalt?.kind === "too-many-refs"
@@ -687,6 +726,11 @@ export async function statusCmdWithDeps(
       ...(populate ? { populate: { filesDone: populate.operation.filesDone, filesTotal: populate.operation.filesTotal } } : {}),
       behindRemote: briefBehindRemote(state.lastSyncedSequence, remote),
       ...(halt ? { halt } : {}),
+      ...(retryArmed && activity?.halt?.nextProbeAt && daemonMode !== "pull-only"
+        ? { recovery: { nextProbeAt: activity.halt.nextProbeAt } }
+        : retryRunning
+          ? { recovery: { running: true as const } }
+        : {}),
       planQuota,
       daemonVersion,
       cliVersion: RBOX_VERSION,
@@ -725,6 +769,7 @@ export async function statusCmdWithDeps(
           reason: deferral.displayReason,
           canResolve: deferral.canResolve,
           canKeepMine: deferral.canKeepMine,
+          staleLockDetail: statusStaleLockDetail(root, hygieneDetails.get(deferralHygieneDetailKey(deferral.repo, deferral.displayLane))),
         })}`);
       }
     }
@@ -831,6 +876,7 @@ export async function statusCmdWithDeps(
         reason: deferral.displayReason,
         canResolve: deferral.canResolve,
         canKeepMine: deferral.canKeepMine,
+        staleLockDetail: statusStaleLockDetail(root, hygieneDetails.get(deferralHygieneDetailKey(deferral.repo, deferral.displayLane))),
       })}`);
     }
   }

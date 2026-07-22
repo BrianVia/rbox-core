@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { daemonPidPath, daemonStatusPath } from "../rbox-paths.js";
-import type { DaemonActivity } from "../activity.js";
+import { isSafetyHaltReason, type DaemonActivity } from "../activity.js";
 import type { TransferPhase } from "../transfer-progress.js";
 import { syncStreamId, type RepoRecord, type WorkspaceConfig } from "../config.js";
 import {
@@ -98,7 +98,7 @@ export type PromptStatusVerdict =
       inferred: boolean;
     };
 
-type PumpOp = "pull" | "push" | "fullScan" | "deepScan";
+type PumpOp = "pull" | "push" | "fullScan" | "deepScan" | "recoveryProbe";
 type PromptWorkspaceIdentity = Pick<WorkspaceConfig, "remoteUrl" | "remoteWorkspaceId" | "projectId">;
 
 export interface AmbientStatusProjectionInput {
@@ -194,7 +194,11 @@ function parseAmbientDeferral(value: unknown): AmbientGitDeferral | undefined {
 
 function attentionReason(input: AmbientStatusProjectionInput): AmbientAttentionReason | undefined {
   if (input.ownershipLost) return "ownership-lost";
-  if (input.activity.halt) return "halt";
+  if (input.activity.halt
+    && input.activity.halt.recoveryState !== "suspended"
+    && !(input.activity.halt.nextProbeAt
+      && !input.activity.halt.terminal
+      && !isSafetyHaltReason(input.activity.halt.typedReason?.kind))) return "halt";
   if (input.activity.outOfStorage) return "out-of-storage";
   if (input.watcherDegraded) return "watcher-degraded";
   return undefined;
@@ -219,6 +223,12 @@ function isSyncing(input: AmbientStatusProjectionInput): boolean {
     input.activePumpOp === "push" ||
     input.activePumpOp === "fullScan" ||
     input.activePumpOp === "deepScan" ||
+    input.activePumpOp === "recoveryProbe" ||
+    Boolean(input.activity.halt?.nextProbeAt
+      && input.activity.halt.recoveryState !== "suspended"
+      && !input.activity.halt.terminal
+      && input.activity.halt.typedReason?.kind !== "mass-delete"
+      && input.activity.halt.typedReason?.kind !== "chain-repair") ||
     input.activity.active !== undefined ||
     input.want?.pull === true ||
     input.want?.push === true ||

@@ -23,6 +23,29 @@ import type { TransferPhase } from "./transfer-progress.js";
 const TRANSFER_PHASES: readonly TransferPhase[] = ["scan", "gitcap", "encrypt", "upload", "download"];
 const isTransferPhase = (v: unknown): v is TransferPhase => TRANSFER_PHASES.includes(v as TransferPhase);
 
+export interface DaemonRecoveryHalt {
+  at: string;
+  reason: string;
+  count: number;
+  firstFailureAt?: string;
+  lastFailureAt?: string;
+  consecutiveFailures?: number;
+  nextProbeAt?: string;
+  lastProbeAt?: string;
+  /** Timer lifecycle. Missing means a legacy armed episode when nextProbeAt exists. */
+  recoveryState?: "armed" | "running" | "suspended";
+  op: "pull" | "push" | "fullScan" | "deepScan";
+  /** Producer-authored classification. Missing/invalid legacy values are
+   * deliberately unknown; readers never classify the raw reason string. */
+  typedReason?:
+    | { kind: "mass-delete"; op: "pull" | "push" }
+    | { kind: "push-conflict" }
+    | { kind: "chain-repair" }
+    | { kind: "too-many-refs" }
+    | { kind: "body-too-large" };
+  terminal?: { fingerprint: string };
+}
+
 export interface DaemonActivity {
   /** Heartbeat — last time the pump completed an op (throttled; see daemon). */
   at: string;
@@ -72,19 +95,9 @@ export interface DaemonActivity {
    *  of the SAME op kind (`op`) — a mass-delete-guard halt from a pull must survive
    *  no-op push successes and safety scans. This is how a guard refusal (design 44)
    *  becomes visible. */
-  halt?: {
-    at: string;
-    reason: string;
-    count: number;
-    op: "pull" | "push" | "fullScan" | "deepScan";
-    /** Producer-authored classification. Missing/invalid legacy values are
-     * deliberately unknown; readers never classify the raw reason string. */
-    typedReason?:
-      | { kind: "mass-delete"; op: "pull" | "push" }
-      | { kind: "too-many-refs" }
-      | { kind: "body-too-large" };
-    terminal?: { fingerprint: string };
-  };
+  halt?: DaemonRecoveryHalt;
+  /** Push recovery preserved while a pull-only daemon uses `halt` for live pull failures. */
+  suspendedPushHalt?: DaemonRecoveryHalt;
   /** Quota exhaustion blocks pushes, but it is soft state: halt still wins. */
   outOfStorage?: { at: string; kind: "storage" | "workspaces"; used?: number; cap?: number; reason?: "no_plan" };
 }
@@ -106,6 +119,7 @@ export async function loadActivity(root: string): Promise<DaemonActivity | undef
     const num = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
     const uint = (v: unknown): v is number => Number.isInteger(v) && (v as number) >= 0;
     const positiveInt = (v: unknown): v is number => Number.isInteger(v) && (v as number) > 0;
+    const timestamp = (v: unknown): v is string => typeof v === "string" && Number.isFinite(Date.parse(v));
     const a: DaemonActivity = { at: raw.at };
     const local = raw.local;
     if (
@@ -181,16 +195,30 @@ export async function loadActivity(root: string): Promise<DaemonActivity | undef
       }
       if (uint(act.etaSeconds)) a.active.etaSeconds = act.etaSeconds;
     }
-    const halt = raw.halt;
-    if (halt && typeof halt.at === "string" && typeof halt.reason === "string" && num(halt.count) && (halt.op === "pull" || halt.op === "push" || halt.op === "fullScan" || halt.op === "deepScan")) {
+    const parseHalt = (halt: DaemonRecoveryHalt | undefined, requiredOp?: DaemonRecoveryHalt["op"]): DaemonRecoveryHalt | undefined => {
+      if (!halt || !timestamp(halt.at) || typeof halt.reason !== "string" || !positiveInt(halt.count)
+        || !(halt.op === "pull" || halt.op === "push" || halt.op === "fullScan" || halt.op === "deepScan")
+        || (requiredOp !== undefined && halt.op !== requiredOp)) return undefined;
       const terminal = halt.terminal;
-      a.halt = {
+      return {
         at: halt.at,
         reason: halt.reason,
         count: halt.count,
         op: halt.op,
+        ...(timestamp(halt.firstFailureAt) ? { firstFailureAt: halt.firstFailureAt } : {}),
+        ...(timestamp(halt.lastFailureAt) ? { lastFailureAt: halt.lastFailureAt } : {}),
+        ...(positiveInt(halt.consecutiveFailures) ? { consecutiveFailures: halt.consecutiveFailures } : {}),
+        ...(timestamp(halt.nextProbeAt) ? { nextProbeAt: halt.nextProbeAt } : {}),
+        ...(timestamp(halt.lastProbeAt) ? { lastProbeAt: halt.lastProbeAt } : {}),
+        ...(halt.recoveryState === "armed" || halt.recoveryState === "running" || halt.recoveryState === "suspended"
+          ? { recoveryState: halt.recoveryState }
+          : {}),
         ...(halt.typedReason?.kind === "mass-delete" && (halt.typedReason.op === "pull" || halt.typedReason.op === "push")
           ? { typedReason: { kind: "mass-delete" as const, op: halt.typedReason.op } }
+          : halt.typedReason?.kind === "push-conflict"
+            ? { typedReason: { kind: "push-conflict" as const } }
+          : halt.typedReason?.kind === "chain-repair"
+            ? { typedReason: { kind: "chain-repair" as const } }
           : halt.typedReason?.kind === "too-many-refs"
             ? { typedReason: { kind: "too-many-refs" as const } }
             : halt.typedReason?.kind === "body-too-large"
@@ -200,7 +228,11 @@ export async function loadActivity(root: string): Promise<DaemonActivity | undef
           ? { terminal: { fingerprint: terminal.fingerprint } }
           : {}),
       };
-    }
+    };
+    const halt = parseHalt(raw.halt);
+    if (halt) a.halt = halt;
+    const suspendedPushHalt = parseHalt(raw.suspendedPushHalt, "push");
+    if (suspendedPushHalt) a.suspendedPushHalt = suspendedPushHalt;
     const out = raw.outOfStorage;
     if (
       out &&
@@ -234,10 +266,35 @@ export async function saveActivity(root: string, a: DaemonActivity): Promise<voi
   }
 }
 
+/** Typed reasons that are safety refusals rather than transient contention:
+ *  they must keep the ⛔ typed-halt surface even when a recovery probe is
+ *  armed, and regardless of whether the server attached a fingerprint
+ *  (too-many-refs/body-too-large arrive fingerprint-less without a blob-ref
+ *  sidecar). */
+export const isSafetyHaltReason = (kind: string | undefined): boolean =>
+  kind === "mass-delete"
+  || kind === "chain-repair"
+  || kind === "too-many-refs"
+  || kind === "body-too-large";
+
 /** The machine-facing activity state — halt > outofstorage > active > pending
  *  (unsettled) > ok. `status --json` mirrors this verbatim. */
+const isTimerOwnedRetry = (halt: DaemonActivity["halt"]): boolean => Boolean(
+  halt?.nextProbeAt
+    && halt.recoveryState !== "suspended"
+    && !halt.terminal
+    && !isSafetyHaltReason(halt.typedReason?.kind),
+);
+const isSuspendedRetry = (halt: DaemonActivity["halt"]): boolean => Boolean(
+  halt?.recoveryState === "suspended"
+    && !halt.terminal
+    && !isSafetyHaltReason(halt.typedReason?.kind),
+);
+
 export const shellStateOf = (a: DaemonActivity, settled: boolean): "halt" | "outofstorage" | "active" | "pending" | "ok" =>
-  a.halt ? "halt" : a.outOfStorage ? "outofstorage" : a.active ? "active" : settled ? "ok" : "pending";
+  isTimerOwnedRetry(a.halt) ? "pending"
+    : isSuspendedRetry(a.halt) ? (settled ? "ok" : "pending")
+    : a.halt ? "halt" : a.outOfStorage ? "outofstorage" : a.active ? "active" : settled ? "ok" : "pending";
 
 const freshActive = (a: DaemonActivity, now: number): DaemonActivity["active"] | undefined => {
   const active = a.active;
@@ -252,6 +309,8 @@ export const shellLineStateOf = (
   now: number
 ): "halt" | "outofstorage" | "active" | "pending" | "ok" => {
   const active = freshActive(a, now);
+  if (isTimerOwnedRetry(a.halt)) return active ? "active" : "pending";
+  if (isSuspendedRetry(a.halt)) return a.outOfStorage ? "outofstorage" : active ? "active" : settled ? "ok" : "pending";
   if (a.halt?.terminal) return "halt";
   if (a.halt && (!active || a.outOfStorage)) return "halt";
   if (a.outOfStorage) return "outofstorage";

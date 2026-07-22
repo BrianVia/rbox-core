@@ -187,14 +187,14 @@ describe("POST /v1/fleet/sync-state", () => {
     const a = await bootstrap("sync-state-upsert");
     const wsA = `ws_state_${sequence}_a`;
     await env.rbox_dev_db.prepare("INSERT INTO workspaces(workspace_id, project_id, created_at, account_id) VALUES (?, 'root', ?, ?)").bind(wsA, Date.now(), a.accountId).run();
-    const valid = { workspaceId: wsA, projectId: "root", bindingId: "0123456789abcdef", fileSeq: 12, reposTotal: 2, reposDeferred: 1, oldestDeferralAgeMs: 99, deferralReasons: ["local-edits"] };
+    const valid = { workspaceId: wsA, projectId: "root", bindingId: "0123456789abcdef", fileSeq: 12, reposTotal: 2, reposDeferred: 1, oldestDeferralAgeMs: 99, deferralReasons: ["stale-unattributed"] };
     const req = new Request(`${BASE}/v1/fleet/sync-state`, { method: "POST", body: JSON.stringify({ v: 1, states: [valid] }) });
     const before = Date.now();
     const res = await ingestSyncState(req, testEnv(), devicePrincipal(a));
     expect(res.status).toBe(202);
     expect(await res.json()).toEqual({ accepted: 1, dropped: 0 });
     const row = await env.rbox_dev_db.prepare("SELECT * FROM device_sync_state WHERE device_id = ?").bind(a.deviceId).first<Record<string, unknown>>();
-    expect(row).toMatchObject({ workspace_id: wsA, project_id: "root", binding_id: valid.bindingId, file_seq: 12, repos_total: 2, repos_deferred: 1, oldest_deferral_age_ms: 99, deferral_reasons: "local-edits" });
+    expect(row).toMatchObject({ workspace_id: wsA, project_id: "root", binding_id: valid.bindingId, file_seq: 12, repos_total: 2, repos_deferred: 1, oldest_deferral_age_ms: 99, deferral_reasons: "stale-unattributed" });
     expect(Number(row?.reported_at)).toBeGreaterThanOrEqual(before);
   });
 
@@ -259,7 +259,7 @@ describe("POST /v1/fleet/sync-state", () => {
       { ...base, oldestDeferralAgeMs: null },
       { ...base, deferralReasons: [] },
       { ...base, deferralReasons: ["not-a-reason"] },
-      { ...base, deferralReasons: Array.from({ length: 16 }, () => "local-edits") },
+      { ...base, deferralReasons: Array.from({ length: 17 }, () => "local-edits") },
     ];
     const response = await ingestSyncState(new Request(`${BASE}/v1/fleet/sync-state`, { method: "POST", body: JSON.stringify({ v: 1, states: invalid }) }), testEnv(), devicePrincipal(a));
     expect(await response.json()).toEqual({ accepted: 0, dropped: invalid.length });

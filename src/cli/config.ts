@@ -237,7 +237,7 @@ export interface ConfigShapeIdentity {
 
 export type GitDeferralReason =
   | "local-edits" | "local-index" | "local-operation" | "local-commits" | "local-stash"
-  | "conflict" | "git-busy" | "worktree-ownership" | "ignored-target" | "unreadable"
+  | "conflict" | "git-busy" | "stale-unattributed" | "worktree-ownership" | "ignored-target" | "unreadable"
   | "artifact" | "config" | "containment" | "unsupported" | "other";
 
 export interface GitDeferral {

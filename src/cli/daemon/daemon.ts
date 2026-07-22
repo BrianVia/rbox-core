@@ -29,11 +29,11 @@ import {
   writeFileAtomic,
 } from "../../engine/index.js";
 import type { Action } from "../../engine/reconcile.js";
-import { renderShellDeferrals, renderShellLine, saveActivity, saveShellDeferrals, saveShellLine, shellLineStateOf, type DaemonActivity } from "../activity.js";
+import { loadActivity, renderShellDeferrals, renderShellLine, saveActivity, saveShellDeferrals, saveShellLine, shellLineStateOf, type DaemonActivity } from "../activity.js";
 import { expectedStateNonce, loadConfig, loadState, repoRecordsForState, syncStreamId, trashConfig, type SyncState, type WorkspaceConfig } from "../config.js";
 import { pruneTrash } from "../../engine/trash.js";
 import { DAEMON_BOOT_ID_ENV, readDaemonPidRecord, recordDaemonBinding } from "../daemon-control.js";
-import { MassDeleteGuardError, makeDeferErrnoReporter, pull, pushManifest, type SyncDeps } from "../sync.js";
+import { MassDeleteGuardError, PushConflictExhaustedError, makeDeferErrnoReporter, pull, pushManifest, type SyncDeps } from "../sync.js";
 import { deferManifest } from "../sync-recovery.js";
 import type { TransferPhase, TransferProgressBytes } from "../transfer-progress.js";
 import { buildAuthedRemote } from "../e2ee-client.js";
@@ -86,11 +86,14 @@ import {
 import { repairChain, type SuffixInfo } from "../chain-repair.js";
 import {
   ACTIVITY_HEARTBEAT_MS,
+  ChainRepairHaltError,
   classifyWatcherError,
   DaemonChainRepairPolicy,
   DEEP_SCAN_MS,
   GC_FENCE_RETRY_MS,
   jitter,
+  recoveryProbeDelayMs,
+  selectPumpOperation,
   nextSafetyDelay,
   POLL_BACKSTOP_DEFAULT_MS,
   reconnectDelayMs,
@@ -101,6 +104,7 @@ import {
   retrustEnabled,
   SAFETY_SYNC_MS,
   type TrustState,
+  type PumpOperation,
   UPDATE_CHECK_TICK_MS,
   type Wants,
   worseTrust,
@@ -119,6 +123,8 @@ import { inspectResetJournalSafety } from "../reset-halt-inspection.js";
 import { clearResetHaltHealth, readResetHaltHealth, writeResetHaltHealth } from "../reset-health.js";
 import { RESET_RECOVERY_RETRY_MS, ResetHaltLogGate } from "./reset-halt-policy.js";
 import { acknowledgeCacheGeneration, readCacheGeneration } from "../adopt-cache.js";
+import { reconcileGitDeferrals, type DeferralHygieneCursor } from "../sync-git/deferral-hygiene.js";
+import { gitDivergenceStatus } from "../sync-git/status.js";
 
 type RboxBarAmbientStatus = AmbientDaemonStatusV1 & {
   fileCount: number;
@@ -143,6 +149,28 @@ export interface GitBusyRetryClock {
   setTimeout(fn: () => void, ms: number): unknown;
   clearTimeout(handle: unknown): void;
 }
+export interface RecoveryProbeClock extends GitBusyRetryClock {}
+class RecoveryProbePreflightError extends Error {
+  constructor(readonly cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause));
+    this.name = "RecoveryProbePreflightError";
+  }
+}
+class RecoveryConditionPersistsError extends Error {
+  constructor(readonly halt: NonNullable<DaemonActivity["halt"]>) {
+    super(halt.reason);
+    this.name = "RecoveryConditionPersistsError";
+  }
+}
+type ClassifiedOperationFailure =
+  | { kind: "quota"; error: QuotaExceededError }
+  | {
+    kind: "halt";
+    error: unknown;
+    typedReason?: NonNullable<DaemonActivity["halt"]>["typedReason"];
+    terminal?: { fingerprint: string };
+    blocked: boolean;
+  };
 export type PushProvenance = Readonly<{ signal: boolean; candidate: boolean; scan: boolean; other: boolean }>;
 
 export function gitCaptureSampleForProvenance(provenance: PushProvenance): GitCaptureSample | undefined {
@@ -410,7 +438,7 @@ export class RboxDaemon {
   private readonly gcFenceRetryPaths = new Set<string>();
   private watcherUnsettled = false;
   private watcherUnsettledGeneration = 0;
-  private activePumpOp?: keyof Wants;
+  private activePumpOp?: PumpOperation;
   private appliedPendingEventsInOp = false;
   /** Pump-error dedup (see the pump catch) + last logged commit sequence (doPush). */
   private lastErrMsg = "";
@@ -448,6 +476,14 @@ export class RboxDaemon {
   private readonly pullOnly: boolean;
   private readonly acquireSyncMutexFn: (root: string) => Promise<DaemonMutexResult>;
   private readonly now: () => number;
+  private readonly recoveryRandom: () => number;
+  private readonly recoveryClock: RecoveryProbeClock;
+  private readonly deferralHygieneCursor: DeferralHygieneCursor = {};
+  private deferralHygieneRunning = false;
+  private readonly deferralHygieneBudgetMs: number;
+  private recoveryTimer?: unknown;
+  private recoveryDue = false;
+  private recoveryDequeuesSinceDue = 0;
   private readonly gitBusyRetryClock: GitBusyRetryClock;
   private lockStarvationEpisode?: LockStarvationEpisode;
   private mutexHolderKey?: string;
@@ -476,6 +512,9 @@ export class RboxDaemon {
       now?: () => number;
       monotonicNow?: () => number;
       gitBusyRetryClock?: GitBusyRetryClock;
+      recoveryRandom?: () => number;
+      recoveryClock?: RecoveryProbeClock;
+      deferralHygieneBudgetMs?: number;
       log?: DaemonLogSink;
       onStopped?: () => void;
     } = {},
@@ -495,6 +534,16 @@ export class RboxDaemon {
     this.chainRepairPolicy = new DaemonChainRepairPolicy(cfg.deviceId);
     this.acquireSyncMutexFn = opts.acquireSyncMutex ?? ((workspaceRoot) => acquireWorkspaceSyncMutex(workspaceRoot, "daemon"));
     this.now = opts.now ?? Date.now;
+    this.recoveryRandom = opts.recoveryRandom ?? Math.random;
+    this.recoveryClock = opts.recoveryClock ?? {
+      setTimeout: (fn, ms) => {
+        const handle = setTimeout(fn, ms);
+        handle.unref?.();
+        return handle;
+      },
+      clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+    };
+    this.deferralHygieneBudgetMs = opts.deferralHygieneBudgetMs ?? 2_000;
     this.monotonicNow = opts.monotonicNow ?? (() => performance.now());
     const monotonicStart = this.monotonicNow();
     this.monotonicLastMs = Number.isFinite(monotonicStart) ? Math.max(0, monotonicStart) : 0;
@@ -524,6 +573,15 @@ export class RboxDaemon {
 
     this.cache = await HashCache.load(this.root);
     this.metrics = await loadMetrics(this.root);
+    const persistedActivity = await loadActivity(this.root);
+    if (persistedActivity) {
+      this.activity.halt = persistedActivity.halt;
+      this.activity.suspendedPushHalt = persistedActivity.suspendedPushHalt;
+      this.activity.lastPush = persistedActivity.lastPush;
+      this.activity.lastPull = persistedActivity.lastPull;
+      this.activity.local = persistedActivity.local;
+      this.activity.outOfStorage = persistedActivity.outOfStorage;
+    }
     this.lockStarvationEpisode = await readLockStarvationEpisode(this.root);
     this.log(`rbox daemon starting: ${this.root} → workspace ${this.cfg.remoteWorkspaceId} (device ${this.cfg.deviceId})${this.pullOnly ? " [pull-only]" : ""}`);
     // Record the binding so `rbox start` can tell a live daemon from a STALE one
@@ -565,7 +623,9 @@ export class RboxDaemon {
       this.want.fullScan = true;
     }
 
-    if (!this.pullOnly) await this.startLiveWatch();
+    this.armStandingRecovery();
+    if (this.pullOnly) this.scheduleSafetyScan();
+    else await this.startLiveWatch();
     this.maybeConnect();
     this.startBackstop();
     this.startUpdateChecks();
@@ -777,12 +837,21 @@ export class RboxDaemon {
    */
   private scheduleSafetyScan(): void {
     this.safetyTimer = setTimeout(() => {
-      if (this.stopped) return;
+      this.safetyTimer = undefined;
+      void this.runSafetyCadenceTick();
+    }, jitter(this.safetyDelay));
+  }
+
+  private async runSafetyCadenceTick(): Promise<void> {
+    if (this.stopped) return;
+    try {
       this.advanceSafetyCadenceForTick();
       this.churnSinceSafety = false;
-      this.request("fullScan");
-      this.scheduleSafetyScan();
-    }, jitter(this.safetyDelay));
+      if (this.pullOnly) await this.runDeferralHygiene();
+      else this.request("fullScan");
+    } finally {
+      if (!this.stopped) this.scheduleSafetyScan();
+    }
   }
 
   private advanceSafetyCadenceForTick(): void {
@@ -810,6 +879,7 @@ export class RboxDaemon {
     this.abortMutexBackoff();
     if (firstStop) await this.writePausedAmbientStatusImmediate().catch(() => {});
     if (this.safetyTimer) clearTimeout(this.safetyTimer);
+    if (this.recoveryTimer) this.recoveryClock.clearTimeout(this.recoveryTimer);
     if (this.deepTimer) clearInterval(this.deepTimer);
     if (this.resetRetryTimer) clearTimeout(this.resetRetryTimer);
     for (const audit of this.openDriftAudits) if (audit.timer) clearTimeout(audit.timer);
@@ -1122,12 +1192,210 @@ export class RboxDaemon {
     return run;
   }
 
+  private nextPumpOperation(): PumpOperation | undefined {
+    const eligible = { ...this.want };
+    const halt = this.activity.halt;
+    if (halt) eligible[halt.op] = false;
+    return selectPumpOperation(eligible, this.recoveryDue, this.recoveryDequeuesSinceDue);
+  }
+
+  private armStandingRecovery(): void {
+    if (!this.pullOnly && this.activity.suspendedPushHalt && this.activity.halt?.op !== "push") {
+      this.activity.halt = this.activity.suspendedPushHalt;
+      this.activity.suspendedPushHalt = undefined;
+      this.writeActivity();
+    }
+    const halt = this.activity.halt;
+    if (!halt) return;
+    if (this.recoveryTimer) this.recoveryClock.clearTimeout(this.recoveryTimer);
+    if (this.pullOnly && halt.op === "push") {
+      this.activity.suspendedPushHalt ??= { ...halt, recoveryState: "suspended" };
+      this.activity.halt = undefined;
+      this.recoveryTimer = undefined;
+      this.recoveryDue = false;
+      this.recoveryDequeuesSinceDue = 0;
+      this.writeActivity();
+      return;
+    }
+    halt.recoveryState = "armed";
+    const dueAt = Date.parse(halt.nextProbeAt ?? halt.lastFailureAt ?? halt.at);
+    const delayMs = Number.isFinite(dueAt) ? Math.max(0, dueAt - this.now()) : 0;
+    const witness = halt.nextProbeAt ?? halt.at;
+    this.recoveryTimer = this.recoveryClock.setTimeout(() => {
+      this.recoveryTimer = undefined;
+      if (this.activity.halt && (this.activity.halt.nextProbeAt ?? this.activity.halt.at) === witness) {
+        this.recoveryDue = true;
+        this.recoveryDequeuesSinceDue = 0;
+        void this.pump();
+      }
+    }, delayMs);
+  }
+
+  private recordRecoveryFailure(
+    op: keyof Wants,
+    error: unknown,
+    typedReason?: NonNullable<DaemonActivity["halt"]>["typedReason"],
+    terminal?: { fingerprint: string },
+  ): void {
+    const reason = error instanceof Error ? error.message : String(error);
+    const now = this.now();
+    const prior = this.activity.halt;
+    const same = prior?.op === op && (prior.typedReason && typedReason
+      ? prior.typedReason.kind === typedReason.kind
+      : !prior.typedReason && !typedReason && prior.reason === reason);
+    const firstFailureAt = same ? prior.firstFailureAt ?? prior.at : new Date(now).toISOString();
+    const consecutiveFailures = same ? (prior.consecutiveFailures ?? prior.count) + 1 : 1;
+    const lastFailureAt = new Date(now).toISOString();
+    const nextProbeAt = new Date(now + recoveryProbeDelayMs(consecutiveFailures, this.recoveryRandom)).toISOString();
+    this.activity.halt = {
+      at: firstFailureAt,
+      reason,
+      count: consecutiveFailures,
+      op,
+      firstFailureAt,
+      lastFailureAt,
+      consecutiveFailures,
+      nextProbeAt,
+      recoveryState: this.pullOnly && op === "push" ? "suspended" : "armed",
+      ...(prior?.lastProbeAt ? { lastProbeAt: prior.lastProbeAt } : {}),
+      ...(typedReason ? { typedReason } : {}),
+      ...(terminal ? { terminal } : {}),
+    };
+    if (!(this.pullOnly && op === "push")) this.want[op] = true;
+    this.recoveryDue = false;
+    this.armStandingRecovery();
+    this.writeActivity();
+  }
+
+  private classifyOperationFailure(error: unknown): ClassifiedOperationFailure {
+    const actual = error instanceof RecoveryProbePreflightError ? error.cause : error;
+    if (actual instanceof QuotaExceededError) return { kind: "quota", error: actual };
+    if (actual instanceof CommitRejectedError) {
+      const typedReason: NonNullable<DaemonActivity["halt"]>["typedReason"] = actual.reason === "too_many_refs"
+        ? { kind: "too-many-refs" }
+        : actual.reason === "body_too_large"
+          ? { kind: "body-too-large" }
+          : undefined;
+      return {
+        kind: "halt",
+        error: actual,
+        typedReason,
+        ...(actual.fingerprint ? { terminal: { fingerprint: actual.fingerprint } } : {}),
+        blocked: true,
+      };
+    }
+    if (actual instanceof RecoveryConditionPersistsError) {
+      return {
+        kind: "halt",
+        error: actual,
+        typedReason: actual.halt.typedReason,
+        terminal: actual.halt.terminal,
+        blocked: false,
+      };
+    }
+    return {
+      kind: "halt",
+      error: actual,
+      typedReason: actual instanceof PushConflictExhaustedError
+        ? { kind: "push-conflict" }
+        : actual instanceof MassDeleteGuardError
+          ? { kind: "mass-delete", op: actual.op }
+          : actual instanceof ChainRepairHaltError
+            ? { kind: "chain-repair" }
+            : undefined,
+      blocked: false,
+    };
+  }
+
+  private recordClassifiedFailure(
+    op: keyof Wants,
+    failure: ClassifiedOperationFailure,
+  ): { kind: "quota"; visibleChanged: boolean } | { kind: "halt"; blocked: boolean } {
+    if (failure.kind === "quota") {
+      return { kind: "quota", visibleChanged: this.recordOutOfStorage(failure.error, op) };
+    }
+    this.activity.active = undefined;
+    this.activeProgressPath = undefined;
+    const failureOp = failure.typedReason?.kind === "mass-delete" ? failure.typedReason.op : op;
+    this.recordRecoveryFailure(
+      failureOp,
+      failure.error,
+      failure.typedReason,
+      failure.terminal,
+    );
+    return { kind: "halt", blocked: failure.blocked };
+  }
+
+  private clearRecoveryHalt(): void {
+    if (this.recoveryTimer) this.recoveryClock.clearTimeout(this.recoveryTimer);
+    this.recoveryTimer = undefined;
+    this.recoveryDue = false;
+    this.recoveryDequeuesSinceDue = 0;
+    this.activity.halt = undefined;
+    this.lastErrMsg = "";
+    this.errRepeat = 0;
+    this.writeActivity();
+  }
+
+  private async hasPublishableLocalDivergence(): Promise<"none" | "some" | "indeterminate"> {
+    const base = this.syncBase;
+    if (!base) return "some";
+    const diff = diffManifests(base.lastSyncedManifest, this.manifest);
+    if (diff.added.length || diff.changed.length || diff.deleted.some((item) => !this.matcher.ignores(item))) return "some";
+    const git = await gitDivergenceStatus(this.root, this.cfg, base, this.matcher);
+    return git.count > 0 ? "some" : git.indeterminate ? "indeterminate" : "none";
+  }
+
+  private async runRecoveryProbe(syncMutex: WorkspaceSyncMutex, halt: NonNullable<DaemonActivity["halt"]>): Promise<void> {
+    if (halt.typedReason?.kind === "push-conflict" || (halt.op === "push" && !halt.typedReason && !halt.terminal)) {
+      let publishable: "none" | "some" | "indeterminate";
+      try {
+        await this.doPull(syncMutex, undefined, undefined, "none");
+        publishable = await this.hasPublishableLocalDivergence();
+      } catch (error) {
+        throw new RecoveryProbePreflightError(error);
+      }
+      if (publishable === "none") {
+        this.clearRecoveryHalt();
+        return;
+      }
+      await this.doPush(syncMutex, this.takePushProvenance());
+      if (this.pushTerminalBlocked) throw new RecoveryConditionPersistsError(this.activity.halt ?? halt);
+      this.clearRecoveryHalt();
+      return;
+    }
+    if (halt.op === "pull") {
+      const catchUpGeneration = this.pendingCatchUpGeneration;
+      this.pendingCatchUpGeneration = undefined;
+      try {
+        await this.doPull(syncMutex, undefined, undefined, this.takeQueuedCarrier());
+      } catch (error) {
+        if (catchUpGeneration !== undefined) this.pendingCatchUpGeneration ??= catchUpGeneration;
+        throw error;
+      }
+      if (catchUpGeneration !== undefined) this.markWsCaughtUp(catchUpGeneration);
+      if (await this.hasPublishableLocalDivergence() !== "none") this.requestPush("other");
+    } else if (halt.op === "push") await this.doPush(syncMutex, this.takePushProvenance());
+    else if (halt.op === "fullScan") {
+      await this.doFullScan();
+      await this.runDeferralHygiene();
+      this.requestPush("scan");
+    } else {
+      await this.doDeepScan();
+      await this.runDeferralHygiene();
+      this.requestPush("scan");
+    }
+    if (this.pushTerminalBlocked) throw new RecoveryConditionPersistsError(this.activity.halt ?? halt);
+    this.clearRecoveryHalt();
+  }
+
   private async pumpLoop(): Promise<void> {
     try {
-      while (!this.stopped && (this.want.pull || this.want.push || this.want.fullScan || this.want.deepScan)) {
+      while (!this.stopped) {
         // Resolve WHICH op this iteration runs up front — the halt bookkeeping below
         // is keyed on it (a halt is only healed by a success of the SAME kind).
-        const op: keyof Wants = this.want.deepScan ? "deepScan" : this.want.fullScan ? "fullScan" : this.want.pull ? "pull" : "push";
+        const op = this.nextPumpOperation();
+        if (!op) break;
         const acquired = await this.acquireSyncMutexFn(this.root);
         if (acquired.status === "contended") {
           // Do not clear want[op]: contention must requeue, never consume, this tick.
@@ -1159,7 +1427,22 @@ export class RboxDaemon {
           try {
             let pushedToRemote = false;
             this.pushTerminalBlocked = false;
-            this.want[op] = false;
+            const recoveryHalt = op === "recoveryProbe" ? this.activity.halt : undefined;
+            if (op === "recoveryProbe") {
+              if (!recoveryHalt) continue;
+              this.recoveryDue = false;
+              this.recoveryDequeuesSinceDue = 0;
+              this.want[recoveryHalt.op] = false;
+              this.activity.halt = {
+                ...recoveryHalt,
+                lastProbeAt: new Date(this.now()).toISOString(),
+                recoveryState: "running",
+              };
+              this.writeActivity();
+            } else {
+              this.want[op] = false;
+              if (this.recoveryDue) this.recoveryDequeuesSinceDue++;
+            }
             const pushProvenance = op === "push" ? this.takePushProvenance() : undefined;
             const gitBusyRetryStage = op === "push" ? this.takeGitBusyRetryStage() : 0;
             const activeCarrier = op === "pull" ? this.takeQueuedCarrier() : "none";
@@ -1167,12 +1450,16 @@ export class RboxDaemon {
             this.writeAmbientStatus();
             this.appliedPendingEventsInOp = false;
             try {
-              if (op === "deepScan") {
+              if (op === "recoveryProbe") {
+                await this.runRecoveryProbe(syncMutex, recoveryHalt!);
+              } else if (op === "deepScan") {
                 const cov = await this.doDeepScan();
+                await this.runDeferralHygiene();
                 this.maybeClearWatcherDegradedAfterScan(opWatcherErrorGeneration, cov);
                 this.requestPush("scan");
               } else if (op === "fullScan") {
                 const cov = await this.doFullScan();
+                await this.runDeferralHygiene();
                 this.maybeClearWatcherDegradedAfterScan(opWatcherErrorGeneration, cov);
                 if (this.activity.outOfStorage) this.outOfStorageProbeArmed = true;
                 this.requestPush("scan");
@@ -1200,7 +1487,7 @@ export class RboxDaemon {
                   throw e;
                 }
                 if (catchUpGeneration !== undefined) this.markWsCaughtUp(catchUpGeneration);
-                this.requestPush("other"); // publish any local divergence after taking remote
+                if (await this.hasPublishableLocalDivergence() !== "none") this.requestPush("other");
               } else {
                 const quotaProbe = this.activity.outOfStorage !== undefined && this.outOfStorageProbeArmed;
                 this.outOfStorageProbeArmed = false;
@@ -1211,7 +1498,7 @@ export class RboxDaemon {
                   pushedToRemote = true;
                 }
               }
-              this.maybeClearWatcherUnsettledAfterOp(op, opWatcherGeneration);
+              if (op !== "recoveryProbe") this.maybeClearWatcherUnsettledAfterOp(op, opWatcherGeneration);
               if (this.syncBase) this.syncStateReporter.afterSyncTick(this.syncBase);
             } finally {
               if (op === "push") this.finishGitBusyRetry(gitBusyRetryStage);
@@ -1226,7 +1513,7 @@ export class RboxDaemon {
             // Persist when something visible changed (or as a throttled heartbeat, so
             // `rbox status` can say "last checked: Ns ago" without idle disk churn).
             const terminalBlocked = op === "push" && this.pushTerminalBlocked;
-            const heals = !terminalBlocked && this.activity.halt !== undefined && this.activity.halt.op === op;
+            const heals = false;
             const clearsOutOfStorage = pushedToRemote && this.activity.outOfStorage !== undefined;
             const cleared = this.activity.active !== undefined || heals || clearsOutOfStorage || terminalBlocked;
             this.activity.active = undefined;
@@ -1265,59 +1552,59 @@ export class RboxDaemon {
             this.errRepeat = msg === this.lastErrMsg ? this.errRepeat + 1 : 1;
             this.lastErrMsg = msg;
             const shouldLogRepeat = this.errRepeat === 1 || this.errRepeat % 10 === 0;
-            if (e instanceof QuotaExceededError) {
-              const visibleChanged = this.recordOutOfStorage(e, op);
+            if (op === "recoveryProbe") {
+              const standing = this.activity.halt;
+              if (standing) {
+                const failure = this.classifyOperationFailure(e);
+                if ((standing.typedReason?.kind === "push-conflict"
+                  || (standing.op === "push" && !standing.typedReason && !standing.terminal))
+                  && e instanceof RecoveryProbePreflightError
+                  && failure.kind === "halt"
+                  && !failure.typedReason
+                  && !failure.terminal) {
+                  const nextProbeAt = new Date(this.now() + recoveryProbeDelayMs(
+                    standing.consecutiveFailures ?? standing.count,
+                    this.recoveryRandom,
+                  )).toISOString();
+                  this.activity.halt = { ...standing, nextProbeAt, recoveryState: "armed" };
+                  this.want[standing.op] = true;
+                  this.recoveryDue = false;
+                  this.armStandingRecovery();
+                  this.writeActivity();
+                } else {
+                  const recorded = this.recordClassifiedFailure(standing.op, failure);
+                  if (recorded.kind === "quota" && standing.op === "push") {
+                    // A recovery probe discovered a new quota condition. Retire the
+                    // conflict episode so it cannot remain permanently "running".
+                    this.clearRecoveryHalt();
+                  }
+                }
+              }
+              if (shouldLogRepeat) this.log(`recovery probe failed: ${msg}${this.errRepeat > 1 ? ` (x${this.errRepeat})` : ""}`);
+              continue;
+            }
+            const failure = this.classifyOperationFailure(e);
+            const recorded = this.recordClassifiedFailure(op, failure);
+            if (recorded.kind === "quota") {
               if (shouldLogRepeat) this.log(`pump op quota: ${msg}${this.errRepeat > 1 ? ` (x${this.errRepeat})` : ""}`);
-              if (visibleChanged || shouldLogRepeat) this.writeActivity();
+              if (recorded.visibleChanged || shouldLogRepeat) this.writeActivity();
               await sleep(jitter(1000));
               continue;
             }
-            if (e instanceof CommitRejectedError) {
-              this.activity.active = undefined;
-              this.activeProgressPath = undefined;
-              let typedReason: NonNullable<DaemonActivity["halt"]>["typedReason"];
-              switch (e.reason) {
-                case "too_many_refs":
-                  typedReason = { kind: "too-many-refs" };
-                  break;
-                case "body_too_large":
-                  typedReason = { kind: "body-too-large" };
-                  break;
-                default:
-                  typedReason = undefined;
-              }
-              this.activity.halt = {
-                at: new Date().toISOString(),
-                reason: msg,
-                count: this.errRepeat,
-                op,
-                ...(typedReason ? { typedReason } : {}),
-                ...(e.fingerprint ? { terminal: { fingerprint: e.fingerprint } } : {}),
-              };
+            if (recorded.blocked) {
               if (shouldLogRepeat) {
                 this.log(`pump op blocked: ${msg}${this.errRepeat > 1 ? ` (x${this.errRepeat})` : ""}`);
                 this.writeActivity();
               }
-              await sleep(jitter(1000));
               continue;
             }
             // The halt record is the failure's user-visible surface (design 45): without
             // it a mass-delete-guard refusal (design 44) stalls background sync with no
             // indicator anywhere but this log. Persisted on the log-line schedule.
-            this.activity.active = undefined;
-            this.activeProgressPath = undefined;
-            this.activity.halt = {
-              at: new Date().toISOString(),
-              reason: msg,
-              count: this.errRepeat,
-              op,
-              ...(e instanceof MassDeleteGuardError ? { typedReason: { kind: "mass-delete" as const, op: e.op } } : {}),
-            };
             if (shouldLogRepeat) {
               this.log(`pump op error: ${msg}${this.errRepeat > 1 ? ` (x${this.errRepeat})` : ""}`);
               this.writeActivity();
             }
-            await sleep(jitter(1000)); // brief backoff so a persistent error can't hot-loop
           }
         } finally {
           await releaseWorkspaceSyncMutex(syncMutex);
@@ -1333,6 +1620,10 @@ export class RboxDaemon {
       if (shellLineStateOf(this.activity, settledNow, Date.now()) !== this.lastShellState) this.writeActivity();
     } finally {
       this.pumping = false;
+      // A timer/watcher can queue work after the loop observes no operation but
+      // before exit-time persistence completes. Re-enter after dropping the
+      // single-flight guard so that wakeup cannot be lost.
+      if (!this.stopped && this.resetLifecycle === "ready" && this.nextPumpOperation()) await this.pump();
     }
   }
 
@@ -1455,7 +1746,7 @@ export class RboxDaemon {
       prev.reason !== next.reason;
     this.activity.active = undefined;
     this.activeProgressPath = undefined;
-    if (clearsStaleQuotaHalt) this.activity.halt = undefined;
+    if (clearsStaleQuotaHalt) this.clearRecoveryHalt();
     this.activity.outOfStorage = next;
     this.outOfStorageProbeArmed = false;
     return visibleChanged;
@@ -1670,6 +1961,29 @@ export class RboxDaemon {
     if (before !== renderShellDeferrals(state, now, ageBucket, projectedRepoRecords(state))) this.writeActivity();
   }
 
+  /** Design 178 C: the existing scan cadence also revalidates durable busy
+   * assertions. Accepted saves and CAS winners replace syncBase immediately. */
+  private async runDeferralHygiene(): Promise<void> {
+    if (this.deferralHygieneRunning) return;
+    const base = this.syncBase;
+    if (!base) return;
+    this.deferralHygieneRunning = true;
+    try {
+      const result = await reconcileGitDeferrals(this.root, this.cfg, base, {
+        now: this.now,
+        timeBudgetMs: this.deferralHygieneBudgetMs,
+        cursor: this.deferralHygieneCursor,
+      });
+      if (result.state !== base) this.observeDurableGitState(result.state, this.now());
+    } catch {
+      // Hygiene is fail-closed and must never turn a presentation refresh into a
+      // failed sync operation. The standing deferral remains authoritative.
+      this.log("git deferral hygiene unavailable; retaining current assertions");
+    } finally {
+      this.deferralHygieneRunning = false;
+    }
+  }
+
   /** Persist the activity record and bump the pump heartbeat. */
   private writeActivity(): void {
     this.enqueueActivityWrite(true);
@@ -1847,6 +2161,11 @@ export class RboxDaemon {
       local: this.activity.local ? { ...this.activity.local } : undefined,
       ws: this.activity.ws ? { ...this.activity.ws } : undefined,
       active: this.activity.active ? { ...this.activity.active } : undefined,
+      halt: this.activity.halt ? {
+        ...this.activity.halt,
+        ...(this.activity.halt.typedReason ? { typedReason: { ...this.activity.halt.typedReason } } : {}),
+        ...(this.activity.halt.terminal ? { terminal: { ...this.activity.halt.terminal } } : {}),
+      } : undefined,
     };
   }
 
