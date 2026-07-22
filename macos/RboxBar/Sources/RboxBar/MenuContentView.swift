@@ -402,7 +402,7 @@ struct MenuContentView: View {
     private func stateSummary(_ workspace: WorkspaceStatus) -> String {
         switch workspace.severityTier {
         case .degraded:
-            return workspace.attentionReason == .watcherDegraded ? "periodic scans active" : "git deferred"
+            return "periodic scans active"
         case .critical:
             return "not syncing"
         case .ok:

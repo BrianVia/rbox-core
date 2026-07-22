@@ -77,7 +77,7 @@ final class StatusReaderTests: XCTestCase {
         XCTAssertEqual(ws.name, "current-root")
         XCTAssertEqual(ws.deferredRepos, 2)
         XCTAssertEqual(ws.oldestDeferralAgeSeconds, 259_200)
-        XCTAssertEqual(ws.severityTier, .degraded)
+        XCTAssertEqual(ws.severityTier, .ok, "deferrals are secondary detail, never a headline tier")
     }
 
     func testInvalidDeferralFieldsRejectStatus() {
@@ -261,7 +261,7 @@ final class StatusReaderTests: XCTestCase {
         XCTAssertEqual(ws.state, .syncing)
         XCTAssertEqual(ws.deferredRepos, 3)
         XCTAssertEqual(ws.oldestDeferralAgeSeconds, 604_800)
-        XCTAssertEqual(ws.severityTier, .degraded)
+        XCTAssertEqual(ws.severityTier, .ok, "active sync with deferrals reads as syncing, not degraded")
         XCTAssertEqual(ws.deferralProvenance, .populate)
     }
 
