@@ -31,7 +31,7 @@ import { applyGitSections, settleCommittedBranchArtifacts, withRevalidatedGitPar
 import { checkoutJournalBinding, FollowCrashInjectedError, followDivergedRepo, recoverFollowJournal, selectCheckoutSelfRootWitness, type FollowCrashPoint } from "./follow.js";
 import { boundedOrigHeadPreservationError, origHeadPreservationFailureLine, origHeadWorktreeDiscriminator } from "./orig-head.js";
 import { planGitSections } from "./plan.js";
-import { gitFingerprint, gitFingerprintRun } from "./fingerprint.js";
+import { GIT_FINGERPRINT_RACY_CLEAN_MARGIN_MS, gitFingerprint, gitFingerprintRun } from "./fingerprint.js";
 import { fingerprintHitProbe, type GitDivergenceCache } from "./divergence-cache.js";
 import { configCredentialSkipLogged, configInvalidSkipLogged, configOwnershipSkipLogged, gitFollowEnabled, gitIncomingKey, repoEquivalenceWarningLogged } from "./shared.js";
 
@@ -45,6 +45,7 @@ const TEST_GIT_ENV = {
 const gitExec = (args: string[]) => exec("git", args, { env: TEST_GIT_ENV });
 const git = (dir: string, ...args: string[]) => gitExec(["-C", dir, ...args]).then(({ stdout }) => stdout.toString().trim());
 const KEK = Buffer.alloc(32, 19);
+const heldNowAfterRacyWindow = () => Date.now() + GIT_FINGERPRINT_RACY_CLEAN_MARGIN_MS + 100;
 
 const hostReceiverEquivalence = await (async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-follow-equivalence-"));
@@ -1252,14 +1253,12 @@ test("design 174 A: unchanged allowlisted hold skips only after the mandatory pr
     provenance: "ref-plane", reason: "local-commits", ref: "refs/heads/local-side",
   });
   const saved = await landOutcome(state, first.outcome, 2);
-  await Bun.sleep(2_100);
-
   let exceptionHookCalled = false;
   const exceptional = await applyIncoming(
     saved,
     { ...incoming, config: { "remote.origin.url": [] } },
     matchingOracle,
-    { afterHeldSkipPrepass: () => { exceptionHookCalled = true; throw new Error("injected outer apply exception"); } },
+    { heldNow: heldNowAfterRacyWindow, afterHeldSkipPrepass: () => { exceptionHookCalled = true; throw new Error("injected outer apply exception"); } },
   );
   expect(exceptionHookCalled).toBe(true);
   expect(exceptional.outcome.gitPendingRemote?.repo?.config).toBeUndefined();
@@ -1269,6 +1268,7 @@ test("design 174 A: unchanged allowlisted hold skips only after the mandatory pr
   const ordering: string[] = [];
   const skipped = await applyIncoming(saved, incoming, matchingOracle, {
     collectMetrics: true,
+    heldNow: heldNowAfterRacyWindow,
     afterHeldSkipPrepass: () => { ordering.push("prepass"); },
     capabilityProbe: async () => { capabilityCalls++; ordering.push("follow"); return true; },
     afterBranchPinsPrepared: () => { pinCalls++; },
@@ -1284,6 +1284,7 @@ test("design 174 A: unchanged allowlisted hold skips only after the mandatory pr
   capabilityCalls = 0;
   const resumed = await applyIncoming(saved, incoming, matchingOracle, {
     collectMetrics: true,
+    heldNow: heldNowAfterRacyWindow,
     capabilityProbe: async () => { capabilityCalls++; return true; },
   });
   expect(resumed.outcome.gitApplyMetrics?.results.skipped).toBe(0);
@@ -1323,10 +1324,10 @@ test("design 176: own composer-pending hold maps to its causal ref blocker and b
   expect(first.outcome.attempt?.repo?.blockers.some((blocker) => blocker.provenance === "composer")).toBe(false);
 
   const saved = await landOutcome(state, first.outcome, 2);
-  await Bun.sleep(2_100);
   let followCalls = 0;
   const second = await applyIncoming(saved, incoming, matchingOracle, {
     collectMetrics: true,
+    heldNow: heldNowAfterRacyWindow,
     capabilityProbe: async () => { followCalls++; return true; },
   });
   expect(second.outcome.gitApplyMetrics?.results.skipped).toBe(1);
@@ -1351,10 +1352,10 @@ for (const [label, expectedReason, prepare] of [
     expect(first.outcome.deferrals?.repo?.apply?.reason).toBe(expectedReason);
     expect(first.outcome.attempt?.repo).toBeDefined();
     const saved = await landOutcome(state, first.outcome, 2);
-    await Bun.sleep(2_100);
     let capabilityCalls = 0;
     const retried = await applyIncoming(saved, incoming, oracle, {
       collectMetrics: true,
+      heldNow: heldNowAfterRacyWindow,
       capabilityProbe: async () => { capabilityCalls++; return true; },
     });
     expect(retried.outcome.gitApplyMetrics?.results.skipped).toBe(0);
@@ -1371,10 +1372,10 @@ test("design 176 v6: unchanged local-index hold is eligible for held-skip", asyn
     provenance: "checkout", reason: "local-index",
   }));
   const saved = await landOutcome(state, first.outcome, 2);
-  await Bun.sleep(2_100);
   let capabilityCalls = 0;
   const retried = await applyIncoming(saved, incoming, matchingOracle, {
     collectMetrics: true,
+    heldNow: heldNowAfterRacyWindow,
     capabilityProbe: async () => { capabilityCalls++; return true; },
   });
   expect(retried.outcome.gitApplyMetrics?.results.skipped).toBe(1);
@@ -1396,10 +1397,10 @@ test("design 176 v6: index repair after classification records no stale attempt"
   expect(seamCalls).toBe(1);
   expect(first.outcome.attempt?.repo).toBeNull();
   const saved = await landOutcome(state, first.outcome, 2);
-  await Bun.sleep(2_100);
   let capabilityCalls = 0;
   const retried = await applyIncoming(saved, incoming, matchingOracle, {
     collectMetrics: true,
+    heldNow: heldNowAfterRacyWindow,
     capabilityProbe: async () => { capabilityCalls++; return true; },
   });
   expect(retried.outcome.gitApplyMetrics?.results.skipped).toBe(0);
@@ -1412,11 +1413,11 @@ test("design 176 v6: rejected attempt is cleared when full follow defers before 
   await git(receiver, "add", "held-index.txt");
   const first = await applyIncoming(state, incoming, matchingOracle, { collectMetrics: true });
   const saved = await landOutcome(state, first.outcome, 2);
-  await Bun.sleep(2_100);
   saved.repoRecords!.repo!.attempt!.at = new Date(Date.now() - 3_700_000).toISOString();
 
   const deferred = await applyIncoming(saved, incoming, matchingOracle, {
     collectMetrics: true,
+    heldNow: heldNowAfterRacyWindow,
     capabilityProbe: async () => false,
   });
   expect(deferred.outcome.gitApplyMetrics?.results.skipped).toBe(0);
@@ -1431,11 +1432,10 @@ test("design 174 A: elapsed floor re-follows and refreshes the same held outcome
   await git(receiver, "update-ref", "refs/heads/local-side", local);
   const first = await applyIncoming(state, incoming);
   const saved = await landOutcome(state, first.outcome, 2);
-  await Bun.sleep(2_100);
   const expiredAt = new Date(Date.now() - 3_700_000).toISOString();
   saved.repoRecords!.repo!.attempt!.at = expiredAt;
 
-  const same = await applyIncoming(saved, incoming, matchingOracle, { collectMetrics: true });
+  const same = await applyIncoming(saved, incoming, matchingOracle, { collectMetrics: true, heldNow: heldNowAfterRacyWindow });
   expect(same.outcome.gitApplyMetrics?.results.skipped).toBe(0);
   expect(Date.parse(same.outcome.attempt!.repo!.at)).toBeGreaterThan(Date.parse(expiredAt));
   expect(same.logs.some((line) => line.includes("held-skip fingerprint miss"))).toBe(false);
@@ -1449,14 +1449,13 @@ test("design 174 A: elapsed floor warns when unchanged bound inputs yield a diff
   await git(receiver, "update-ref", "refs/heads/local-side", local);
   const first = await applyIncoming(state, incoming);
   const saved = await landOutcome(state, first.outcome, 2);
-  await Bun.sleep(2_100);
   saved.repoRecords!.repo!.attempt!.at = new Date(Date.now() - 3_700_000).toISOString();
   const unreadable: AppliedManifestOracle = {
     proveRepo: async () => ({ kind: "indeterminate", why: "floor adversary" }),
     reproveRepo: async () => ({ kind: "indeterminate", why: "floor adversary" }),
     receiptHash: () => undefined,
   };
-  const changed = await applyIncoming(saved, incoming, unreadable, { collectMetrics: true });
+  const changed = await applyIncoming(saved, incoming, unreadable, { collectMetrics: true, heldNow: heldNowAfterRacyWindow });
   expect(changed.outcome.gitApplyMetrics?.results.skipped).toBe(0);
   expect(changed.logs.some((line) => line.includes("held-skip fingerprint miss"))).toBe(true);
 });
