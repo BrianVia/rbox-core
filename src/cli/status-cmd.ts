@@ -682,7 +682,20 @@ export async function statusCmdWithDeps(
     const nextVersion = updateAvailableVersion(updateState);
     const planQuota = aggregatePlanQuotaAttention(account, activity?.outOfStorage);
     const typedHalt = activity?.halt?.typedReason;
-    const halt: BriefHaltReason | undefined = activity?.halt
+    const retryArmed = Boolean(activity?.halt?.nextProbeAt
+      && activity.halt.recoveryState !== "suspended"
+      && activity.halt.recoveryState !== "running"
+      && !activity.halt.terminal
+      && typedHalt?.kind !== "mass-delete"
+      && typedHalt?.kind !== "chain-repair");
+    const retrySuspended = activity?.halt?.recoveryState === "suspended"
+      && typedHalt?.kind !== "mass-delete"
+      && typedHalt?.kind !== "chain-repair";
+    const retryRunning = activity?.halt?.recoveryState === "running"
+      && !activity.halt.terminal
+      && typedHalt?.kind !== "mass-delete"
+      && typedHalt?.kind !== "chain-repair";
+    const halt: BriefHaltReason | undefined = activity?.halt && !retryArmed && !retrySuspended && !retryRunning
       ? typedHalt?.kind === "mass-delete"
         ? { kind: "mass-delete", op: typedHalt.op }
         : typedHalt?.kind === "too-many-refs"
@@ -704,6 +717,11 @@ export async function statusCmdWithDeps(
       ...(populate ? { populate: { filesDone: populate.operation.filesDone, filesTotal: populate.operation.filesTotal } } : {}),
       behindRemote: briefBehindRemote(state.lastSyncedSequence, remote),
       ...(halt ? { halt } : {}),
+      ...(retryArmed && activity?.halt?.nextProbeAt && daemonMode !== "pull-only"
+        ? { recovery: { nextProbeAt: activity.halt.nextProbeAt } }
+        : retryRunning
+          ? { recovery: { running: true as const } }
+        : {}),
       planQuota,
       daemonVersion,
       cliVersion: RBOX_VERSION,

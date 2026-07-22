@@ -5,6 +5,7 @@ export { scanManifestForPush, pull, pullWithMetadata, applyPulledManifest } from
 export {
   push,
   pushManifest,
+  PushConflictExhaustedError,
   accumulateRecoveryPage,
   stampManifestSchemaForCommit,
   type PushResult,

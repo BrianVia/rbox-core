@@ -120,6 +120,7 @@ export type BriefStatusSnapshot =
       populate?: BriefPopulateProgress;
       behindRemote: boolean;
       halt?: BriefHaltReason;
+      recovery?: { nextProbeAt?: string; running?: true };
       planQuota: PlanQuotaAttention;
       daemonVersion?: string;
       cliVersion: string;
@@ -704,6 +705,13 @@ export function renderBriefStatus(snapshot: BriefStatusSnapshot): BriefStatusRen
   }
 
   const lines = [fullBriefHeadline(snapshot)];
+  if (snapshot.recovery) {
+    if (snapshot.recovery.running) lines.push("↻ retrying after conflict");
+    else {
+      const seconds = Math.max(0, Math.ceil((Date.parse(snapshot.recovery.nextProbeAt!) - snapshot.now) / 1000));
+      lines.push(`⚠ retrying after conflict; next probe in ${seconds}s`);
+    }
+  }
   if (snapshot.halt) lines.push(briefHaltLine(snapshot.halt));
   const quota = planQuotaLine(snapshot.planQuota);
   if (quota) lines.push(quota);
@@ -776,8 +784,19 @@ export function healthLine(s: StatusSnapshot): string {
   //    below it. The one surgical exception is a fresh retry transfer: it
   //    leads over an older halt, with the halt rendered as secondary context.
   const out = s.daemonRunning ? s.activity?.outOfStorage : undefined;
+  const nonSafetyRetry = halt
+    && !halt.terminal
+    && halt.typedReason?.kind !== "mass-delete"
+    && halt.typedReason?.kind !== "chain-repair";
+  if (nonSafetyRetry && halt.recoveryState === "running") {
+    return style.cyan("↻ retrying after conflict");
+  }
+  if (nonSafetyRetry && halt.recoveryState !== "suspended" && halt.nextProbeAt) {
+    const seconds = Math.max(0, Math.ceil((Date.parse(halt.nextProbeAt ?? halt.at) - s.now) / 1000));
+    return style.yellow(`⚠ retrying after conflict; next probe in ${seconds}s`);
+  }
   if (halt?.terminal) return haltLine(halt, s.now);
-  if (halt && (!active || out)) return haltLine(halt, s.now);
+  if (halt && (!nonSafetyRetry || halt.recoveryState !== "suspended") && (!active || out)) return haltLine(halt, s.now);
   if (out) {
     if (out.reason === "no_plan") return `${style.red("⛔ no active plan")} · run \`rbox subscribe\``;
     const usage = quotaUsage(out.kind, out.used, out.cap);
@@ -846,7 +865,7 @@ export function healthDetailLines(s: StatusSnapshot): string[] {
   const active = freshActive(s);
   const out = s.daemonRunning ? s.activity?.outOfStorage : undefined;
   const lines: string[] = [];
-  if (halt && !halt.terminal && active && !out) {
+  if (halt && halt.typedReason?.kind !== "push-conflict" && !halt.terminal && active && !out) {
     lines.push(`${style.yellow("⚠ last attempt failed")} ${style.dim(`(${relTime(halt.at, s.now)})`)} ${halt.reason} ${style.yellow("— will be retried")}`);
   }
   if ((s.gitDeferrals ?? 0) > 0 && s.gitOldestDeferral) {

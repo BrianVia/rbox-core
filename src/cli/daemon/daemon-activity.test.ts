@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { HashCache, scanManifest, type BlobStore, type FileEntry, type IgnoreMatcher, type Manifest, type WatchEvent } from "../../engine/index.js";
 import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
-import { loadActivity, renderShellLine, type DaemonActivity } from "../activity.js";
+import { loadActivity, renderShellLine, saveActivity, type DaemonActivity } from "../activity.js";
 import { loadState, saveStateUnsafeLegacyOrTest, syncStreamId, type SyncState, type WorkspaceConfig } from "../config.js";
 import { RboxDaemon } from "../daemon.js";
 import { daemonRuntimeDir, daemonStatusPath, readDaemonBindingRecord, readDaemonPidRecord, recordDaemonBinding } from "../daemon-control.js";
@@ -88,6 +88,10 @@ interface DaemonInternals {
   activity: DaemonActivity;
   syncBase?: SyncState;
   want: { pull: boolean; push: boolean; fullScan: boolean; deepScan: boolean };
+  recoveryDue: boolean;
+  recoveryDequeuesSinceDue: number;
+  recoveryTimer?: ReturnType<typeof setTimeout>;
+  armStandingRecovery(): void;
   startWatcherFn: TestStartWatcher;
   startLiveWatch(): Promise<void>;
   watcher?: Watcher;
@@ -98,6 +102,7 @@ interface DaemonInternals {
   onTransferProgress(done: number, total: number, phase: TransferPhase, detailOrBytes?: string | TransferProgressBytes, bytes?: TransferProgressBytes): void;
   lastProgressWrite: number;
   pump(): Promise<void>;
+  start(): Promise<void>;
   stop(): Promise<void>;
   loadSyncBase(): Promise<SyncState>;
   runDeferralHygiene(): Promise<void>;
@@ -125,10 +130,13 @@ interface DaemonInternals {
 }
 
 let root: string;
+let daemons: DaemonInternals[];
 beforeEach(async () => {
+  daemons = [];
   root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "rbox-daemon-activity-")));
 });
 afterEach(async () => {
+  await Promise.all(daemons.map((daemon) => daemon.stop().catch(() => {})));
   await fs.rm(root, { recursive: true, force: true });
 });
 
@@ -149,9 +157,14 @@ function testConfig(): WorkspaceConfig {
   };
 }
 
-async function makeDaemon(remote: MiniRemote, bootId = "boot-test"): Promise<DaemonInternals> {
+async function makeDaemon(
+  remote: MiniRemote,
+  bootId = "boot-test",
+  opts: ConstructorParameters<typeof RboxDaemon>[3] = {},
+): Promise<DaemonInternals> {
   const cfg = testConfig();
-  const daemon = new RboxDaemon(root, cfg, { remote, backoff: async () => {} }, { bootId }) as unknown as DaemonInternals;
+  const daemon = new RboxDaemon(root, cfg, { remote, backoff: async () => {} }, { bootId, ...opts }) as unknown as DaemonInternals;
+  daemons.push(daemon);
   daemon.cache = await HashCache.load(root);
   daemon.manifest = await scanManifest(root);
   await daemon.loadSyncBase();
@@ -239,6 +252,275 @@ class StillBlockedRemote extends MiniRemote {
   }
 }
 
+class AlwaysConflictRemote extends MiniRemote {
+  commitCalls = 0;
+  override async commit(): Promise<CommitResult> {
+    this.commitCalls++;
+    return { conflict: true, head: this.head };
+  }
+}
+
+class OrderedPullRemote extends MiniRemote {
+  pullCalls = 0;
+  constructor(private readonly order: string[]) {
+    super();
+  }
+  override async latest(): Promise<{ sequence: number; manifest: Manifest }> {
+    this.pullCalls++;
+    this.order.push("recovery");
+    return super.latest();
+  }
+}
+
+class BlockingLatestRemote extends MiniRemote {
+  readonly entered = deferred<void>();
+  readonly release = deferred<void>();
+  override async latest(): Promise<{ sequence: number; manifest: Manifest }> {
+    this.entered.resolve();
+    await this.release.promise;
+    return super.latest();
+  }
+}
+
+class ManualRecoveryClock {
+  private next = 0;
+  readonly callbacks = new Map<number, () => void>();
+  setTimeout(fn: () => void): number {
+    const id = ++this.next;
+    this.callbacks.set(id, fn);
+    return id;
+  }
+  clearTimeout(handle: unknown): void {
+    this.callbacks.delete(handle as number);
+  }
+  fireAll(): void {
+    const callbacks = [...this.callbacks.values()];
+    this.callbacks.clear();
+    for (const callback of callbacks) callback();
+  }
+}
+
+test("design 178 B: the pump serves one coalesced due probe within eight continuously replenished ambient dequeues", async () => {
+  const order: string[] = [];
+  const remote = new OrderedPullRemote(order);
+  const daemon = await makeDaemon(remote);
+  daemon.activity.halt = {
+    at: iso(10), reason: "pull failed", count: 1, op: "pull",
+    firstFailureAt: iso(10), lastFailureAt: iso(10), consecutiveFailures: 1,
+  };
+  daemon.recoveryDue = true;
+  daemon.want.deepScan = true;
+  let scans = 0;
+  daemon.doDeepScan = async () => {
+    scans++;
+    order.push("ambient");
+    if (scans <= 8) daemon.want.deepScan = true;
+    return { coverage: "full-tree", errorGenAtStart: 0 };
+  };
+
+  // Repeated timer firings still describe one standing episode and one composite
+  // slot: recoveryDue is deliberately a boolean, not a queued count.
+  daemon.recoveryDue = true;
+  daemon.recoveryDue = true;
+  await daemon.pump();
+
+  expect(order.slice(0, 9)).toEqual([...Array(8).fill("ambient"), "recovery"]);
+  expect(remote.pullCalls).toBe(1);
+  expect(daemon.activity.halt).toBeUndefined();
+});
+
+test("design 178 B: repeated timer rearming coalesces to one composite probe", async () => {
+  const clock = new ManualRecoveryClock();
+  const order: string[] = [];
+  const remote = new OrderedPullRemote(order);
+  const daemon = await makeDaemon(remote, "boot-test", { recoveryClock: clock });
+  daemon.activity.halt = {
+    at: iso(10), reason: "pull failed", count: 1, op: "pull",
+    nextProbeAt: new Date(Date.now() + 60_000).toISOString(),
+  };
+  daemon.armStandingRecovery();
+  daemon.armStandingRecovery();
+  daemon.armStandingRecovery();
+  expect(clock.callbacks.size).toBe(1);
+
+  clock.fireAll();
+  for (let i = 0; i < 100 && daemon.activity.halt !== undefined; i++) await sleep(2);
+
+  expect(remote.pullCalls).toBe(1);
+  expect(daemon.activity.halt).toBeUndefined();
+});
+
+test("design 178 B: mutex-contention loops do not consume the recovery service budget", async () => {
+  const order: string[] = [];
+  let acquisitions = 0;
+  const remote = new OrderedPullRemote(order);
+  const daemon = await makeDaemon(remote, "boot-test", {
+    pullOnly: true,
+    acquireSyncMutex: async (workspaceRoot) => {
+      acquisitions++;
+      if (acquisitions <= 2) return { status: "contended", holderKey: "test-holder", blockerKind: "live" };
+      return { status: "acquired", handle: { root: workspaceRoot, incarnation: `test-${acquisitions}` } };
+    },
+    log: () => {},
+  });
+  daemon.activity.halt = { at: iso(10), reason: "pull failed", count: 1, op: "pull" };
+  daemon.recoveryDue = true;
+  daemon.recoveryDequeuesSinceDue = 7;
+  daemon.want.deepScan = true;
+  daemon.doDeepScan = async () => {
+    order.push("ambient");
+    return { coverage: "full-tree", errorGenAtStart: 0 };
+  };
+
+  await daemon.pump();
+
+  expect(acquisitions).toBe(4); // two contended loops, ambient dequeue, recovery dequeue
+  expect(order).toEqual(["ambient", "recovery"]);
+});
+
+test("design 178 B: a recovery wakeup arriving during pump exit persistence is not lost", async () => {
+  const order: string[] = [];
+  const remote = new OrderedPullRemote(order);
+  const daemon = await makeDaemon(remote);
+  daemon.activity.halt = { at: iso(10), reason: "pull failed", count: 1, op: "pull" };
+  const originalSave = daemon.cache.save.bind(daemon.cache);
+  let injected = false;
+  daemon.cache.save = async (workspaceRoot) => {
+    if (!injected) {
+      injected = true;
+      daemon.recoveryDue = true;
+    }
+    await originalSave(workspaceRoot);
+  };
+
+  await daemon.pump();
+  for (let i = 0; i < 100 && daemon.activity.halt !== undefined; i++) await sleep(2);
+
+  expect(remote.pullCalls).toBe(1);
+  expect(daemon.activity.halt).toBeUndefined();
+});
+
+test("design 178 B: conflict preflight failure rearms without escalating the exhausted-push episode", async () => {
+  const remote = new AlwaysConflictRemote();
+  remote.latestError = new Error("preflight unavailable");
+  const daemon = await makeDaemon(remote);
+  daemon.activity.halt = {
+    at: iso(30), reason: "push conflict", count: 2, op: "push",
+    firstFailureAt: iso(30), lastFailureAt: iso(10), consecutiveFailures: 2,
+    nextProbeAt: iso(1), typedReason: { kind: "push-conflict" },
+  };
+  daemon.recoveryDue = true;
+
+  await daemon.pump();
+
+  expect(daemon.activity.halt).toMatchObject({
+    firstFailureAt: iso(30), lastFailureAt: iso(10), consecutiveFailures: 2,
+    recoveryState: "armed", typedReason: { kind: "push-conflict" },
+  });
+  expect(remote.commitCalls).toBe(0);
+});
+
+test("design 178 B: probe dequeue durably records running state and lastProbeAt before remote work completes", async () => {
+  const remote = new BlockingLatestRemote();
+  const daemon = await makeDaemon(remote);
+  daemon.activity.halt = {
+    at: iso(30), reason: "push conflict", count: 1, op: "push",
+    firstFailureAt: iso(30), lastFailureAt: iso(10), consecutiveFailures: 1,
+    nextProbeAt: iso(1), typedReason: { kind: "push-conflict" }, recoveryState: "armed",
+  };
+  daemon.recoveryDue = true;
+  const run = daemon.pump();
+  await remote.entered.promise;
+  await daemon.activityWrite;
+
+  expect((await loadActivity(root))?.halt).toMatchObject({
+    recoveryState: "running",
+    lastProbeAt: expect.any(String),
+  });
+
+  remote.release.resolve();
+  await run;
+});
+
+test("design 178 B: restart rearms a persisted episode but resets its in-memory starvation counter", async () => {
+  await withIsolatedDaemonHome(async () => {
+  const persisted: NonNullable<DaemonActivity["halt"]> = {
+    at: iso(10), reason: "pull failed", count: 3, op: "pull",
+    firstFailureAt: iso(30), lastFailureAt: iso(10), consecutiveFailures: 3,
+    nextProbeAt: new Date(Date.now() + 60_000).toISOString(),
+  };
+  await saveActivity(root, { at: new Date().toISOString(), halt: persisted });
+  const restarted = await makeDaemon(new MiniRemote(), "restart-boot", { pullOnly: true });
+  await restarted.start();
+
+  expect(restarted.recoveryDequeuesSinceDue).toBe(0);
+  expect(restarted.recoveryTimer).toBeDefined();
+  expect(restarted.activity.halt).toMatchObject({ ...persisted, recoveryState: "armed" });
+  await restarted.stop();
+  });
+});
+
+test("design 178 B: restart in pull-only keeps a persisted push recovery dormant until read-write restart", async () => {
+  await withIsolatedDaemonHome(async () => {
+  const halt: NonNullable<DaemonActivity["halt"]> = {
+    at: new Date(TEST_NOW - 10_000).toISOString(), reason: "push conflict", count: 1, op: "push",
+    typedReason: { kind: "push-conflict" }, nextProbeAt: new Date(Date.now() + 60_000).toISOString(),
+  };
+  await saveActivity(root, { at: new Date().toISOString(), halt });
+  const pullOnlyRemote = new AlwaysConflictRemote();
+  const dormant = await makeDaemon(pullOnlyRemote, "pull-only-restart", { pullOnly: true });
+  await dormant.start();
+  expect(dormant.recoveryDue).toBe(false);
+  expect(dormant.want.push).toBe(false);
+  expect(dormant.activity.halt).toMatchObject({ ...halt, recoveryState: "suspended" });
+  expect(pullOnlyRemote.commitCalls).toBe(0);
+  await dormant.stop();
+
+  const writableRemote = new AlwaysConflictRemote();
+  const writable = await makeDaemon(writableRemote, "read-write-restart");
+  writable.startWatcherFn = async () => ({ backend: "parcel", close: async () => {} });
+  await writable.start();
+  expect(writable.recoveryTimer).toBeDefined();
+  expect(writable.activity.halt?.recoveryState).toBe("armed");
+  await writable.stop();
+  });
+});
+
+test("design 178 B: idle-host conflict recovery clears after pull without another publication", async () => {
+  await fs.writeFile(path.join(root, "local.txt"), "local\n");
+  await fs.utimes(path.join(root, "local.txt"), new Date(TEST_NOW - 60_000), new Date(TEST_NOW - 60_000));
+  const remote = new AlwaysConflictRemote();
+  const daemon = await makeDaemon(remote);
+  daemon.want.push = true;
+  await daemon.pump();
+  expect(daemon.activity.halt?.typedReason).toEqual({ kind: "push-conflict" });
+  expect(remote.commitCalls).toBeGreaterThan(0);
+  const firstFailureAt = daemon.activity.halt?.firstFailureAt;
+  const firstLastFailureAt = daemon.activity.halt?.lastFailureAt;
+  await sleep(2);
+  daemon.recoveryDue = true;
+  await daemon.pump();
+  expect(daemon.activity.halt?.firstFailureAt).toBe(firstFailureAt);
+  expect(daemon.activity.halt?.consecutiveFailures).toBe(2);
+  expect(Date.parse(daemon.activity.halt?.lastFailureAt ?? "")).toBeGreaterThan(Date.parse(firstLastFailureAt ?? ""));
+  expect(daemon.activity.halt?.lastProbeAt).toBeDefined();
+  const exhaustedCalls = remote.commitCalls;
+  await fs.rm(path.join(root, "local.txt"));
+  daemon.recoveryDue = true;
+  await daemon.pump();
+  expect(daemon.activity.halt).toBeUndefined();
+  expect(remote.commitCalls).toBe(exhaustedCalls);
+  expect(firstFailureAt).toBeDefined();
+
+  // A healed/no-op transaction ends the episode: the next independent
+  // exhaustion starts at tier one instead of inheriting the old backoff count.
+  await fs.writeFile(path.join(root, "new-local.txt"), "new\n");
+  daemon.manifest = await scanManifest(root);
+  daemon.want.push = true;
+  await daemon.pump();
+  expect(daemon.activity.halt?.consecutiveFailures).toBe(1);
+});
+
 test("design 178 C: daemon hygiene updates the next ambient heartbeat projection", async () => {
   await withIsolatedDaemonHome(async () => {
     const repo = path.join(root, "repo");
@@ -270,7 +552,7 @@ test("design 178 C: daemon hygiene updates the next ambient heartbeat projection
   });
 });
 
-test("pump error records a halt; only a same-kind success clears it", async () => {
+test("design 178 B: safety halt clears only when its own recovery predicate stops reproducing", async () => {
   const remote = new MiniRemote();
   remote.latestError = new MassDeleteGuardError("pull", "pull would delete 8603 of 8603 tracked files — refusing (mass-delete guard).");
   const daemon = await makeDaemon(remote);
@@ -283,6 +565,9 @@ test("pump error records a halt; only a same-kind success clears it", async () =
   expect(halted?.halt?.count).toBe(1);
   expect(halted?.halt?.op).toBe("pull");
   expect(halted?.halt?.typedReason).toEqual({ kind: "mass-delete", op: "pull" });
+  expect(halted?.halt?.firstFailureAt).toBe(halted?.halt?.at);
+  expect(halted?.halt?.consecutiveFailures).toBe(1);
+  expect(halted?.halt?.nextProbeAt).toBeDefined();
 
   // Regression guard: a successful op of a DIFFERENT kind (the queued
   // no-op push, every safety scan) must NOT heal a pull halt — the guard warning
@@ -292,8 +577,8 @@ test("pump error records a halt; only a same-kind success clears it", async () =
   await daemon.activityWrite;
   expect((await loadActivity(root))?.halt?.reason).toContain("mass-delete guard");
 
-  remote.latestError = undefined; // heal → a SUCCESSFUL PULL is what clears it
-  daemon.want.pull = true;
+  remote.latestError = undefined;
+  daemon.recoveryDue = true;
   await daemon.pump();
   await daemon.activityWrite;
   const healed = await loadActivity(root);
@@ -430,16 +715,16 @@ test("a committed push writes shell.line: v1, state ok, committed sequence (desi
   expect(line).toContain("ws_act"); // name falls back to the workspace id
 });
 
-test("a pump error writes shell.line state halt (design 46)", async () => {
+test("design 178 B: a timer-owned generic retry writes shell.line pending, not halted", async () => {
   const remote = new MiniRemote();
-  remote.latestError = new Error("pull would delete 8603 of 8603 tracked files — refusing (mass-delete guard).");
+  remote.latestError = new Error("temporary pull failure");
   const daemon = await makeDaemon(remote);
 
   daemon.want.pull = true;
   await daemon.pump();
   await daemon.activityWrite;
 
-  expect((await readShellLine()).split(" ")[2]).toBe("halt");
+  expect((await readShellLine()).split(" ")[2]).toBe("pending");
 });
 
 test("ambient status writes beside the pidfile and carries local-only currentPath", async () => {
@@ -633,7 +918,7 @@ test.each([
 
   const activity = await loadActivity(root);
   expect(remote.commitCalls).toBe(1);
-  expect(activity?.halt).toEqual({
+  expect(activity?.halt).toMatchObject({
     at: expect.any(String),
     reason: err.message,
     count: 1,
@@ -652,6 +937,7 @@ test("push mass-delete refusal persists the producer-authored push classificatio
   daemon.manifest = await scanManifest(root);
 
   daemon.want.push = true;
+  daemon.recoveryDue = true;
   await daemon.pump();
   await daemon.activityWrite;
 
@@ -676,6 +962,7 @@ test("terminal push halt passes blocked fingerprint into the push and preserves 
   };
 
   daemon.want.push = true;
+  daemon.recoveryDue = true;
   await daemon.pump();
   await daemon.activityWrite;
 
@@ -685,7 +972,8 @@ test("terminal push halt passes blocked fingerprint into the push and preserves 
     halt: {
       at: "2026-07-02T12:00:00.000Z",
       reason: "workspace needs 250,001 blob refs per commit; the server cap is 250,000.",
-      count: 1,
+      count: 2,
+      consecutiveFailures: 2,
       op: "push",
       terminal: { fingerprint: "blocked-sidecar-sha" },
     },
@@ -695,6 +983,7 @@ test("terminal push halt passes blocked fingerprint into the push and preserves 
   await fs.writeFile(path.join(root, "a.txt"), "changed");
   daemon.manifest = await scanManifest(root);
   daemon.want.push = true;
+  daemon.recoveryDue = true;
   await daemon.pump();
   await daemon.activityWrite;
 
@@ -716,7 +1005,7 @@ test("a quota probe refreshes outOfStorage without clearing a real pull halt", a
   expect(firstQuota?.outOfStorage?.used).toBe(2 * 1024 * 1024 * 1024);
   expect(firstQuota?.halt).toBeUndefined();
 
-  remote.latestError = new Error("pull would delete 8603 of 8603 tracked files — refusing (mass-delete guard).");
+  remote.latestError = new MassDeleteGuardError("pull", "pull would delete 8603 of 8603 tracked files — refusing (mass-delete guard).");
   daemon.want.pull = true;
   await daemon.pump();
   await daemon.activityWrite;

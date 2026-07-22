@@ -100,6 +100,10 @@ export type PushResult = { sequence: number; manifest: Manifest; deferred?: stri
   gitDeferred?: boolean };
 export interface RepairPushMode { kind: "repair"; parentSequence: number }
 
+export class PushConflictExhaustedError extends Error {
+  readonly name = "PushConflictExhaustedError";
+}
+
 /**
  * The one typed recovery structure behind pushManifest's bounded retry loop. A failed
  * commit attempt classifies into exactly one of these, and the loop applies it — this
@@ -285,7 +289,10 @@ async function pushManifestInner(
     previousUnsatisfiedTotal = outcome.action.kind === "reupload" ? outcome.action.unsatisfiedTotal : undefined;
     // Shared budget: throw once we've exhausted MAX_ATTEMPTS (the just-failed attempt is
     // `attempt`), matching the original recursion's throw-before-retry ordering.
-    if (consumesAttempt && attempt >= MAX_ATTEMPTS) throw new Error(outcome.exhaustedError);
+    if (consumesAttempt && attempt >= MAX_ATTEMPTS) {
+      if (outcome.action.kind === "pull-first") throw new PushConflictExhaustedError(outcome.exhaustedError);
+      throw new Error(outcome.exhaustedError);
+    }
     if (outcome.action.kind !== "reupload") {
       // Design 108 §3.2/§3.4: a 409/pull-first or epoch-stale discovery latches
       // files-first OFF for the rest of the run — the refreshed parentSequence will be

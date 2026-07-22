@@ -76,11 +76,20 @@ export interface DaemonActivity {
     at: string;
     reason: string;
     count: number;
+    firstFailureAt?: string;
+    lastFailureAt?: string;
+    consecutiveFailures?: number;
+    nextProbeAt?: string;
+    lastProbeAt?: string;
+    /** Timer lifecycle. Missing means a legacy armed episode when nextProbeAt exists. */
+    recoveryState?: "armed" | "running" | "suspended";
     op: "pull" | "push" | "fullScan" | "deepScan";
     /** Producer-authored classification. Missing/invalid legacy values are
      * deliberately unknown; readers never classify the raw reason string. */
     typedReason?:
       | { kind: "mass-delete"; op: "pull" | "push" }
+      | { kind: "push-conflict" }
+      | { kind: "chain-repair" }
       | { kind: "too-many-refs" }
       | { kind: "body-too-large" };
     terminal?: { fingerprint: string };
@@ -106,6 +115,7 @@ export async function loadActivity(root: string): Promise<DaemonActivity | undef
     const num = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
     const uint = (v: unknown): v is number => Number.isInteger(v) && (v as number) >= 0;
     const positiveInt = (v: unknown): v is number => Number.isInteger(v) && (v as number) > 0;
+    const timestamp = (v: unknown): v is string => typeof v === "string" && Number.isFinite(Date.parse(v));
     const a: DaemonActivity = { at: raw.at };
     const local = raw.local;
     if (
@@ -182,15 +192,27 @@ export async function loadActivity(root: string): Promise<DaemonActivity | undef
       if (uint(act.etaSeconds)) a.active.etaSeconds = act.etaSeconds;
     }
     const halt = raw.halt;
-    if (halt && typeof halt.at === "string" && typeof halt.reason === "string" && num(halt.count) && (halt.op === "pull" || halt.op === "push" || halt.op === "fullScan" || halt.op === "deepScan")) {
+    if (halt && timestamp(halt.at) && typeof halt.reason === "string" && positiveInt(halt.count) && (halt.op === "pull" || halt.op === "push" || halt.op === "fullScan" || halt.op === "deepScan")) {
       const terminal = halt.terminal;
       a.halt = {
         at: halt.at,
         reason: halt.reason,
         count: halt.count,
         op: halt.op,
+        ...(timestamp(halt.firstFailureAt) ? { firstFailureAt: halt.firstFailureAt } : {}),
+        ...(timestamp(halt.lastFailureAt) ? { lastFailureAt: halt.lastFailureAt } : {}),
+        ...(positiveInt(halt.consecutiveFailures) ? { consecutiveFailures: halt.consecutiveFailures } : {}),
+        ...(timestamp(halt.nextProbeAt) ? { nextProbeAt: halt.nextProbeAt } : {}),
+        ...(timestamp(halt.lastProbeAt) ? { lastProbeAt: halt.lastProbeAt } : {}),
+        ...(halt.recoveryState === "armed" || halt.recoveryState === "running" || halt.recoveryState === "suspended"
+          ? { recoveryState: halt.recoveryState }
+          : {}),
         ...(halt.typedReason?.kind === "mass-delete" && (halt.typedReason.op === "pull" || halt.typedReason.op === "push")
           ? { typedReason: { kind: "mass-delete" as const, op: halt.typedReason.op } }
+          : halt.typedReason?.kind === "push-conflict"
+            ? { typedReason: { kind: "push-conflict" as const } }
+          : halt.typedReason?.kind === "chain-repair"
+            ? { typedReason: { kind: "chain-repair" as const } }
           : halt.typedReason?.kind === "too-many-refs"
             ? { typedReason: { kind: "too-many-refs" as const } }
             : halt.typedReason?.kind === "body-too-large"
@@ -236,8 +258,24 @@ export async function saveActivity(root: string, a: DaemonActivity): Promise<voi
 
 /** The machine-facing activity state — halt > outofstorage > active > pending
  *  (unsettled) > ok. `status --json` mirrors this verbatim. */
+const isTimerOwnedRetry = (halt: DaemonActivity["halt"]): boolean => Boolean(
+  halt?.nextProbeAt
+    && halt.recoveryState !== "suspended"
+    && !halt.terminal
+    && halt.typedReason?.kind !== "mass-delete"
+    && halt.typedReason?.kind !== "chain-repair",
+);
+const isSuspendedRetry = (halt: DaemonActivity["halt"]): boolean => Boolean(
+  halt?.recoveryState === "suspended"
+    && !halt.terminal
+    && halt.typedReason?.kind !== "mass-delete"
+    && halt.typedReason?.kind !== "chain-repair",
+);
+
 export const shellStateOf = (a: DaemonActivity, settled: boolean): "halt" | "outofstorage" | "active" | "pending" | "ok" =>
-  a.halt ? "halt" : a.outOfStorage ? "outofstorage" : a.active ? "active" : settled ? "ok" : "pending";
+  isTimerOwnedRetry(a.halt) ? "pending"
+    : isSuspendedRetry(a.halt) ? (settled ? "ok" : "pending")
+    : a.halt ? "halt" : a.outOfStorage ? "outofstorage" : a.active ? "active" : settled ? "ok" : "pending";
 
 const freshActive = (a: DaemonActivity, now: number): DaemonActivity["active"] | undefined => {
   const active = a.active;
@@ -252,6 +290,8 @@ export const shellLineStateOf = (
   now: number
 ): "halt" | "outofstorage" | "active" | "pending" | "ok" => {
   const active = freshActive(a, now);
+  if (isTimerOwnedRetry(a.halt)) return active ? "active" : "pending";
+  if (isSuspendedRetry(a.halt)) return a.outOfStorage ? "outofstorage" : active ? "active" : settled ? "ok" : "pending";
   if (a.halt?.terminal) return "halt";
   if (a.halt && (!active || a.outOfStorage)) return "halt";
   if (a.outOfStorage) return "outofstorage";

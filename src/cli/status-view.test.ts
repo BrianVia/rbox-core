@@ -276,6 +276,40 @@ test("fresh active progress outranks a standing halt and renders the halt as ret
   ]);
 });
 
+test("design 178 B: armed conflict recovery reports the next probe and is not halted", () => {
+  const activity: DaemonActivity = {
+    at: iso(10),
+    halt: {
+      at: iso(120), reason: "push conflict", count: 2, op: "push",
+      typedReason: { kind: "push-conflict" },
+      nextProbeAt: new Date(NOW + 7_100).toISOString(),
+    },
+  };
+  const line = healthLine(base({ activity }));
+  expect(line).toContain("retrying after conflict; next probe in 8s");
+  expect(line).not.toContain("halt");
+  expect(healthDetailLines(base({ activity }))).toEqual([]);
+});
+
+test("design 178 B: running and pull-only-suspended recovery never claim an armed timer", () => {
+  const running: DaemonActivity = {
+    at: iso(10),
+    halt: {
+      at: iso(120), reason: "push conflict", count: 2, op: "push",
+      typedReason: { kind: "push-conflict" }, nextProbeAt: iso(1), recoveryState: "running",
+    },
+  };
+  expect(healthLine(base({ activity: running }))).toBe("↻ retrying after conflict");
+
+  const suspended: DaemonActivity = {
+    at: iso(10),
+    halt: { ...running.halt!, recoveryState: "suspended" },
+  };
+  const suspendedLine = healthLine(base({ activity: suspended }));
+  expect(suspendedLine).not.toContain("next probe");
+  expect(suspendedLine).not.toContain("halt");
+});
+
 test("fresh populate marker suppresses local-change verdict", () => {
   const line = healthLine(base({
     daemonRunning: false,

@@ -202,6 +202,20 @@ test("state projection table follows design-88 precedence and operation shape", 
     state: "attention",
     attentionReason: "halt",
   });
+  expect(projectAmbientDaemonStatus({
+    ...base,
+    activity: { ...activity, halt: { at: freshAt, reason: "conflict", count: 1, op: "push", typedReason: { kind: "push-conflict" }, nextProbeAt: freshAt } },
+  })).toMatchObject({ state: "syncing", operation: { kind: "push" } });
+  expect(projectAmbientDaemonStatus({
+    ...base,
+    activity: {
+      ...activity,
+      halt: {
+        at: freshAt, reason: "conflict", count: 1, op: "push",
+        typedReason: { kind: "push-conflict" }, nextProbeAt: freshAt, recoveryState: "suspended",
+      },
+    },
+  })).toMatchObject({ state: "synced" });
   expect(projectAmbientDaemonStatus({ ...base, activity: { ...activity, outOfStorage: { at: freshAt, kind: "storage" } } })).toMatchObject({
     state: "attention",
     attentionReason: "out-of-storage",
