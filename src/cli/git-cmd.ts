@@ -77,6 +77,11 @@ interface ResolveEnvironment {
   remote?: SyncRemote;
 }
 
+interface ProgressScheduler {
+  setInterval(fn: () => void, ms: number): unknown;
+  clearInterval(handle: unknown): void;
+}
+
 interface GitResolveDeps {
   build?: (root: string) => Promise<ResolveEnvironment>;
   capabilityProbe?: CheckoutCapabilityProbe;
@@ -94,6 +99,8 @@ interface GitResolveDeps {
   stderr?: (line: string) => void;
   /** Test seam for heartbeat scheduling; production remains ten seconds. */
   progressIntervalMs?: number;
+  /** Test seam for proving heartbeat lifecycle without waiting on wall time. */
+  progressScheduler?: ProgressScheduler;
 }
 
 export interface GitDeferralsCmdDeps {
@@ -870,17 +877,21 @@ export async function gitResolveCmd(
       incoming = preflight.incoming;
       branchProtocol = preflight.protocol;
     }
-    let progressTimer: ReturnType<typeof setInterval> | undefined;
+    const progressScheduler = deps.progressScheduler ?? {
+      setInterval: (fn: () => void, ms: number) => setInterval(fn, ms),
+      clearInterval: (handle: unknown) => clearInterval(handle as ReturnType<typeof setInterval>),
+    };
+    let progressTimer: unknown;
     let progressStarted = 0;
     const progressWrite = deps.stderr ?? console.error;
     const setProgressPhase = verb === "show-me" ? (phase: "staging" | "proving" | "found", count?: number) => {
-      if (progressTimer) { clearInterval(progressTimer); progressTimer = undefined; }
+      if (progressTimer !== undefined) { progressScheduler.clearInterval(progressTimer); progressTimer = undefined; }
       progressStarted = Date.now();
       if (phase === "staging") progressWrite("show-me: staging incoming bundle…");
       else if (phase === "proving") progressWrite(`show-me: proving ownership of ${count ?? 0} candidates…`);
       else progressWrite(`show-me: ${count ?? 0} local-only commits found`);
       if (phase !== "found") {
-        progressTimer = setInterval(() => {
+        progressTimer = progressScheduler.setInterval(() => {
           progressWrite(`show-me: still working (${Math.max(0, Math.floor((Date.now() - progressStarted) / 1000))}s)`);
         }, deps.progressIntervalMs ?? 10_000);
       }
@@ -896,7 +907,7 @@ export async function gitResolveCmd(
     try {
       snapshot = await takeSnapshot();
     } finally {
-      if (progressTimer) clearInterval(progressTimer);
+      if (progressTimer !== undefined) progressScheduler.clearInterval(progressTimer);
     }
     if (verb === "show-me") {
       emit(snapshot.public, json, deps, root);
