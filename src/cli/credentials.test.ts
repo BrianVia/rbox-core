@@ -21,6 +21,28 @@ const credential = { token: "tok_secret", deviceId: "dev_1", remoteUrl: "https:/
 const credentialPath = () => path.join(home, ".rbox", "credentials.json");
 const lockPath = () => path.join(home, ".rbox", "credentials.lock");
 
+async function waitUntil(condition: () => boolean | Promise<boolean>, label: string, timeoutMs = 10_000): Promise<void> {
+  const deadline = performance.now() + timeoutMs;
+  while (!(await condition())) {
+    if (performance.now() >= deadline) throw new Error(`timed out waiting for ${label}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+async function beforeDeadline<T>(promise: Promise<T>, label: string, timeoutMs = 10_000): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`timed out waiting for ${label}`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 async function writeCorruptCredential(raw = "{lock-mutation-evidence"): Promise<void> {
   await fs.mkdir(path.dirname(credentialPath()), { recursive: true, mode: 0o700 });
   await fs.writeFile(credentialPath(), raw, { mode: 0o600 });
@@ -402,12 +424,15 @@ test("a long fenced operation refreshes the main marker while retaining its fenc
   const loading = loadCredentials();
   await entered;
   const before = (await fs.stat(lockPath())).mtimeMs;
-  await new Promise((resolve) => setTimeout(resolve, 60));
-  const after = (await fs.stat(lockPath())).mtimeMs;
-  expect(after).toBeGreaterThan(before);
-  expect(await fs.lstat(`${lockPath()}.fence`).then((stat) => stat.isFile())).toBe(true);
-  releaseResolve();
-  expect((await loading).state).toBe("corrupt");
+  let loaded: Awaited<ReturnType<typeof loadCredentials>>;
+  try {
+    await waitUntil(async () => (await fs.stat(lockPath())).mtimeMs > before, "credential lock heartbeat");
+    expect(await fs.lstat(`${lockPath()}.fence`).then((stat) => stat.isFile())).toBe(true);
+  } finally {
+    releaseResolve();
+    loaded = await loading;
+  }
+  expect(loaded.state).toBe("corrupt");
 });
 
 test("fresh main contention and a live exact-incarnation fence fail closed without reaping", async () => {
@@ -714,30 +739,63 @@ test("logout waits for a normal in-flight credential writer and clears definitiv
   await fs.mkdir(path.dirname(credentialPath()), { mode: 0o700 });
   await fs.writeFile(credentialPath(), "{writer-evidence", { mode: 0o600 });
   const modulePath = path.join(process.cwd(), "src", "cli", "credentials.ts");
+  const writerOwnedPath = path.join(home, ".writer-lock-owned");
   const child = Bun.spawn({
     cmd: [process.execPath, "-e", `
+      import fs from "node:fs/promises";
       import { installCredentialTestHook, loadCredentials } from ${JSON.stringify(modulePath)};
-      installCredentialTestHook(async (seam) => { if (seam === "quarantine-copy-durable") await new Promise(r => setTimeout(r, 350)); });
+      installCredentialTestHook(async (seam) => {
+        if (seam !== "quarantine-copy-durable") return;
+        await fs.writeFile(${JSON.stringify(writerOwnedPath)}, "owned");
+        await Bun.stdin.text();
+      });
       await loadCredentials();
     `],
     cwd: process.cwd(),
     env: { ...process.env, HOME: home },
+    stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
   });
-  for (let n = 0; n < 1_000; n++) {
-    if (await fs.lstat(lockPath()).then(() => true).catch(() => false)) break;
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
+  let childReleased = false;
+  const releaseChild = () => {
+    if (childReleased) return;
+    childReleased = true;
+    child.stdin.end();
+  };
+  const childStdout = new Response(child.stdout).text();
+  const childStderr = new Response(child.stderr).text();
+  await Promise.race([
+    waitUntil(() => fs.lstat(writerOwnedPath).then(() => true, () => false), "child-owned credential lock"),
+    child.exited.then(async (code) => {
+      throw new Error(`credential writer exited before owning the lock (${code}): ${await childStderr}`);
+    }),
+  ]);
+
+  let contentionObserved!: () => void;
+  const contended = new Promise<void>((resolve) => { contentionObserved = resolve; });
+  restoreHook = installCredentialTestHook((seam) => {
+    if (seam === "lock-contended") contentionObserved();
+  });
   const warnings: string[] = [];
   const oldWarn = console.warn;
   console.warn = (value?: unknown) => void warnings.push(String(value));
+  let clearing: Promise<void> | undefined;
   try {
-    await clearCredentials();
+    clearing = clearCredentials();
+    await beforeDeadline(Promise.race([
+      contended,
+      clearing.then(() => { throw new Error("logout completed before observing the in-flight writer"); }),
+    ]), "logout contention");
+    releaseChild();
+    await clearing;
   } finally {
+    releaseChild();
+    await clearing?.catch(() => {});
     console.warn = oldWarn;
   }
-  expect(await child.exited).toBe(0);
+  const [childExit, stdout, stderr] = await Promise.all([child.exited, childStdout, childStderr]);
+  expect({ childExit, stdout, stderr }).toEqual({ childExit: 0, stdout: "", stderr: "" });
   expect(warnings.join("\n")).not.toContain("destructive-recovery override");
   await expect(fs.lstat(credentialPath())).rejects.toThrow();
   await expect(fs.lstat(lockPath())).rejects.toThrow();
