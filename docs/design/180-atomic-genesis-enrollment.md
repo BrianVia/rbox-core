@@ -1,8 +1,6 @@
 # 180 — atomic genesis enrollment
 
-Status: ALIGNED v13 — r13 verdict ALIGNED (gpt-5.6-sol high, joint with 179
-v18). Thirteen rounds; the repair fence pivoted from permit/witness/expiry to
-tombstone-claim at r4 per the wrong-layer rule. Ruling records r1-r12 below.
+Status: ALIGNED v14 — post-field-validation amendments r14
 
 Pinned r1 ruling record (2026-07-22; binding):
 
@@ -257,6 +255,18 @@ earlier mismatch-reselection wording, the r12 rulings control.
    closed, consistent with the journal failure contract and pending-artifact
    gate. A valid RETARGET witness authorizes reconciliation only between its
    exact two bound values; it does not turn any other value into absence.
+
+Pinned r14 post-field-validation amendments (2026-07-22; binding):
+
+1. ACCEPT — a hardened, byte-bound local enrollment witness removes the
+   per-invocation server observation for unchanged enrolled device/MK material;
+   every pending artifact, malformed witness, byte mismatch, or account mismatch
+   falls back to authenticated consultation.
+2. ACCEPT — exact pre-180 404 and AccountKeysDTO response shapes raise a
+   dedicated terminal rollout error, while every genuinely malformed response
+   retains strict corruption handling and no legacy bootstrap mode exists.
+3. ACCEPT — the design-180 server vocabulary deploys and is verified before any
+   client that depends on it is released or fleet-installed.
 
 Owner: Claude (founder-directed, 2026-07-21)
 
@@ -903,6 +913,17 @@ table updates the inventory, wire version/count, the dry-run classifier and
 execute conditional-update predicate, CODEMAP
 ownership where applicable, and tests in the same change.
 
+An absent `genesisPresenceVersion` has one rollout-only distinction. The exact
+legacy 404 body `{ "error": "not_found" }` and the exact pre-180
+`AccountKeysDTO` key set (`recoveryWrap`, `recoveryWrapId`, `rosters`,
+`keyStates`, and `devices`) raise a dedicated typed terminal error with the
+verbatim message: "this rbox version requires the upgraded sync service; the
+service upgrade is rolling out — retry shortly or use the previous rbox
+version". Entry points surface it without retry or local mutation. Any other
+missing-version, malformed, inconsistent, or unknown-version response retains
+the ordinary strict malformed-response error. There is no dual-mode bootstrap
+against a legacy server.
+
 ### 3. Shared verified enrollment classifier
 
 `e2ee-client.ts` owns one pure-with-crypto classifier over the parsed account
@@ -1090,6 +1111,19 @@ genesis artifact fails closed with a repairable-local-state diagnostic; it is
 never ignored. Pairing is the exception only to the *scope* of this
 pre-redemption check: its opaque token cannot identify the target account until
 the consuming response, so pairing uses the machine-global arbitration below.
+
+After a complete cryptographic `enrolled` classification validates the local
+device against the roster and authenticates its MK wrap, the client publishes
+`genesis-enrolled.json` beside `device.json` and `mk.key` through the full
+hardened-writer contract. Its exact version-1 record contains `accountId`, SHA-256
+hashes of the current raw bytes of both files, and `verifiedAt`. Consultation may
+be skipped only when this strict bounded record parses, its account matches, its
+two hashes match the current bytes, and marker, journal, staged RK, completion
+intent, RETARGET witness, and active quarantine state are all absent. Any
+failure consults the server. Key recovery, pairing replacement, local-material
+quarantine, MK/device replacement, and credential account switch durably unlink
+the witness before their mutation. The witness is a local routing cache only;
+it is never repair authority or enrollment evidence for the server.
 
 The following are mandatory consumers, not optional inner seams:
 
@@ -1992,6 +2026,18 @@ completion-intent schemas, and sends `x-rbox-genesis-capability: 1`. The
 capability is the rollout boundary; those persisted schemas remain v1. Until that capable
 CLI is available, operators do not execute repair. Compare-don't-assume remains
 mandatory after promotion because an atomic commit can still lose its response.
+
+### 11. Deployment ordering
+
+The design-180 server MUST be live before any CLI carrying design 180 is
+released or fleet-installed: merge `main` to deploy DEV, verify it there, then
+use the explicit production promotion described in `docs/DEPLOYMENTS.md` before
+shipping clients. Fresh setups against older servers fail closed with the
+dedicated rollout error above. Already-enrolled users are insulated from that
+transition by the byte-bound local enrollment witness. Old clients against the
+new server remain certified safe by the section-2 old-client analysis. As with
+the telemetry allowlist, the ordering rule is simple: server vocabulary deploys
+before clients emit it.
 
 ## Security and privacy
 

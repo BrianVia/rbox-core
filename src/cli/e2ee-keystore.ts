@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fromB64url, toB64url, type DeviceSecrets, type Wrap } from "../engine/e2ee/index.js";
-import { hardenedWrite, type HardenedWriteOptions } from "./genesis-durable.js";
+import { GENESIS_ACCOUNT_ID_RE, hardenedWrite, invalidateGenesisEnrollmentWitness, type HardenedWriteOptions } from "./genesis-durable.js";
 import { acquireGenesisLockSync } from "./genesis-locks.js";
 
 /**
@@ -87,6 +87,7 @@ export async function loadDevice(accountId: string): Promise<{ secrets: DeviceSe
 }
 
 export async function saveDevice(secrets: DeviceSecrets, writeOptions: { device?: HardenedWriteOptions; masterKey?: HardenedWriteOptions } = {}): Promise<void> {
+  if(GENESIS_ACCOUNT_ID_RE.test(secrets.accountId))await invalidateGenesisEnrollmentWitness(secrets.accountId);
   const dir = root(secrets.accountId);
   const device: DeviceJson = {
     deviceId: secrets.deviceId,
@@ -100,6 +101,7 @@ export async function saveDevice(secrets: DeviceSecrets, writeOptions: { device?
 }
 
 export async function saveMasterKey(accountId: string, mk: Uint8Array, writeOptions?: HardenedWriteOptions): Promise<void> {
+  if(GENESIS_ACCOUNT_ID_RE.test(accountId))await invalidateGenesisEnrollmentWitness(accountId);
   await writeSecret(path.join(root(accountId), "mk.key"), toB64url(mk), writeOptions);
 }
 
@@ -110,6 +112,7 @@ export function acquireGenesisLock(accountId: string): () => void {
 
 export async function forgetLocalDeviceMaterial(accountId: string): Promise<void> {
   const dir = root(accountId);
+  if(GENESIS_ACCOUNT_ID_RE.test(accountId))await invalidateGenesisEnrollmentWitness(accountId);
   await Promise.all([
     fs.rm(path.join(dir, "device.json"), { force: true }),
     fs.rm(path.join(dir, "mk.key"), { force: true }),

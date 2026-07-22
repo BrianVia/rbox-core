@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { canonicalString, parseStrict, sha256Hex, utf8 } from "../engine/e2ee/index.js";
 import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory } from "../engine/fsutil.js";
-import { GENESIS_REPAIR_ID_RE, GENESIS_REQUEST_SHA_RE, assertGenesisAccountId, genesisPaths, hardenedRename, hardenedWrite, type HardenedWriteOptions } from "./genesis-durable.js";
+import { GENESIS_REPAIR_ID_RE, GENESIS_REQUEST_SHA_RE, assertGenesisAccountId, genesisPaths, hardenedRename, hardenedWrite, invalidateGenesisEnrollmentWitness, type HardenedWriteOptions } from "./genesis-durable.js";
 
 export type GenesisQuarantinePurpose="repaired-legacy"|"abandoned-attempt";
 export interface GenesisQuarantineEntry{source:"rk.key.staged"|"device.json"|"mk.key";destination:"rk.key.staged"|"device.json"|"mk.key";sha256:string}
@@ -60,6 +60,7 @@ export async function startGenesisQuarantine(args:{accountId:string;purpose:Gene
   if(await exists(dir)){
     const namesOnDisk=await fs.readdir(dir);if(namesOnDisk.length===0){await fs.rmdir(dir);await fsyncDirectory(path.dirname(dir));}else throw new Error("genesis quarantine already exists and must be resumed");
   }
+  await invalidateGenesisEnrollmentWitness(args.accountId);
   const created=await ensureDirectoryChain(dir,"genesis quarantine directory");for(const entry of created)await fs.chmod(entry,0o700);await fsyncCreatedDirectoryAncestors(dir,created);
   const entries:GenesisQuarantineEntry[]=[];
   for(const name of names){const digest=await fileHash(path.join(paths.dir,name));if(args.expectedHashes?.[name]&&args.expectedHashes[name]!==digest)throw new Error("genesis quarantine source hash mismatch");entries.push({source:name,destination:name,sha256:digest});}
@@ -72,6 +73,7 @@ export async function resumeGenesisQuarantine(accountId:string,purpose:GenesisQu
   const manifestRaw=await fs.readFile(manifestPath,"utf8");const manifest=parseGenesisQuarantineManifest(manifestRaw,accountId,purpose,key);
   const allowed=new Set(["quarantine-resume.json","completed.json",...manifest.entries.map((e)=>e.destination)]);for(const name of await fs.readdir(dir)){if(!allowed.has(name))throw new Error("unexpected genesis quarantine entry");}
   if(await exists(completedPath)){return parseGenesisQuarantineCompleted(await fs.readFile(completedPath,"utf8"),manifest,manifestRaw);}
+  await invalidateGenesisEnrollmentWitness(accountId);
   const root=genesisPaths(accountId).dir;
   for(const entry of manifest.entries){const source=path.join(root,entry.source),destination=path.join(dir,entry.destination);const sourceExists=await exists(source),destinationExists=await exists(destination);if(sourceExists===destinationExists)throw new Error("invalid genesis quarantine rename state");const current=sourceExists?source:destination;if(await fileHash(current)!==entry.sha256)throw new Error("genesis quarantine hash mismatch");if(sourceExists){await hardenedRename(source,destination);if(await fileHash(destination)!==entry.sha256)throw new Error("genesis quarantine destination validation failed");}}
   const completed:GenesisQuarantineCompleted={version:1,accountId,purpose,uniquenessKey:key,manifestSha256:await sha256Hex(utf8(manifestRaw)),completedAt};await hardenedWrite(completedPath,canonicalString(completed),writeOptions);return completed;

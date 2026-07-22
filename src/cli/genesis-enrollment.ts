@@ -3,7 +3,7 @@ import { assertMkWrapAuthorized, canonicalString, fromB64url, openOwnMasterKey, 
 import type { AccountKeysDTO, GenesisAccountObservation, GenesisPresence } from "./e2ee-remote.js";
 import { loadDevice } from "./e2ee-keystore.js";
 import { activeGenesisQuarantines, genesisQuarantineStatus } from "./genesis-quarantine.js";
-import { GENESIS_ACCOUNT_ID_RE, GENESIS_REPAIR_ID_RE, CompletionIntent, CompletionIntentRetargetWitness, GenesisJournal, GenesisPrepublishMarker, genesisPaths, loadStagedRecoveryKey, parseCompletionIntent, parseGenesisBootstrapRequest, parseGenesisJournal, parsePrepublishMarker, parseRetargetWitness } from "./genesis-durable.js";
+import { GENESIS_ACCOUNT_ID_RE, GENESIS_REPAIR_ID_RE, CompletionIntent, CompletionIntentRetargetWitness, GenesisJournal, GenesisPrepublishMarker, genesisEnrollmentWitnessMatches, genesisEnrollmentWitnessPresent, genesisPaths, loadStagedRecoveryKey, parseCompletionIntent, parseGenesisBootstrapRequest, parseGenesisJournal, parsePrepublishMarker, parseRetargetWitness, publishGenesisEnrollmentWitness } from "./genesis-durable.js";
 
 export type EnrollmentClassification=
   |{kind:"pristine"}|{kind:"restart-prepublication";marker:GenesisPrepublishMarker}|{kind:"resume-attempt";journal:GenesisJournal}
@@ -40,10 +40,15 @@ export async function hasExactLegacyGenesisPair(accountId:string):Promise<boolea
   try{if(fromB64url(mkRaw.trim()).length!==32)return false;const loaded=await loadDevice(accountId);return!!loaded&&"secrets" in loaded&&loaded.secrets.mk.length===32;}catch{return false;}
 }
 
-/** Routing consultation is broader than active pending state: an exact legacy
- * device+MK pair needs a server observation to distinguish enrolled from a
- * newly tombstoned old-flow orphan. */
-export async function genesisClassifierConsultationNeeded(accountId:string):Promise<boolean>{if(!GENESIS_ACCOUNT_ID_RE.test(accountId))return false;return await pendingGenesisState(accountId)||await hasExactLegacyGenesisPair(accountId);}
+/** Pending state always wins. Otherwise an exact, byte-bound local enrollment
+ * witness removes the network dependency; absent or invalid witnesses retain
+ * the conservative legacy-pair consultation behavior. */
+export async function genesisClassifierConsultationNeeded(accountId:string):Promise<boolean>{
+  if(!GENESIS_ACCOUNT_ID_RE.test(accountId))return false;
+  if(await pendingGenesisState(accountId))return true;
+  if(await genesisEnrollmentWitnessPresent(accountId))return!(await genesisEnrollmentWitnessMatches(accountId));
+  return await hasExactLegacyGenesisPair(accountId);
+}
 
 const allZero=(p:GenesisPresence)=>Object.values(p).every((n)=>n===0);
 const sentinel="rbox:genesis-repair-tombstone:v1";
@@ -118,7 +123,7 @@ export async function classifyEnrollment(accountId:string,observation:GenesisAcc
     if(local.marker){if(hasPartial&&(local.intentRaw||local.witnessRaw))return{kind:"integrity-failure",reason:"completion state without journal"};if(!claim&&allZero(observation.present)&&local.marker.repairId===null)return{kind:"restart-prepublication",marker:local.marker};if(tomb&&allZero(observation.present)&&local.marker.repairId===tomb.repairId)return{kind:"restart-prepublication",marker:local.marker};return{kind:"integrity-failure",reason:"prepublish marker expected-previous mismatch"};}
     if(!claim)return hasPartial?{kind:"integrity-failure",reason:"unmarked local genesis material"}:{kind:"pristine"};
     if(tomb){if(!allZero(observation.present))return{kind:"integrity-failure",reason:"child-bearing repair tombstone"};if(local.device&&local.mk&&!local.stagedRk&&!local.intentRaw&&!local.witnessRaw)return await hasExactLegacyGenesisPair(accountId)?{kind:"repaired-legacy",repairId:tomb.repairId}:{kind:"integrity-failure",reason:"malformed repaired legacy local state"};return hasPartial?{kind:"integrity-failure",reason:"malformed repaired legacy local state"}:{kind:"repair-ready",repairId:tomb.repairId};}
-    if(tombstoneFamily(claim))return{kind:"integrity-failure",reason:"malformed repair tombstone"};if(legacyOrphan(claim,observation.present))return{kind:"legacy-orphan"};const account=await validateCompleteAccount(accountId,claim,observation.present);if(local.stagedRk||local.intentRaw||local.witnessRaw)return{kind:"integrity-failure",reason:"unmarked pending material beside enrolled account"};if(local.device&&local.mk)await validateLocalEnrolledPair(accountId,claim,account);return{kind:"enrolled",dto:claim};
+    if(tombstoneFamily(claim))return{kind:"integrity-failure",reason:"malformed repair tombstone"};if(legacyOrphan(claim,observation.present))return{kind:"legacy-orphan"};const account=await validateCompleteAccount(accountId,claim,observation.present);if(local.stagedRk||local.intentRaw||local.witnessRaw)return{kind:"integrity-failure",reason:"unmarked pending material beside enrolled account"};if(local.device&&local.mk){await validateLocalEnrolledPair(accountId,claim,account);await publishGenesisEnrollmentWitness(accountId);}return{kind:"enrolled",dto:claim};
   }catch(error){return{kind:"integrity-failure",reason:error instanceof Error?error.message:"genesis classification failed"};}
 }
 

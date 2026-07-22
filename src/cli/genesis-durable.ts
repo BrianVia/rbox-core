@@ -179,6 +179,17 @@ export interface CompletionIntentRetargetWitness {
   witnessedAt: string;
 }
 
+/** Durable local proof that the current device/MK bytes were verified against a
+ * complete server enrollment. It is only a routing optimization: any parse or
+ * byte-binding failure falls back to a fresh server consultation. */
+export interface GenesisEnrollmentWitness {
+  version: 1;
+  accountId: string;
+  deviceSha256: string;
+  mkSha256: string;
+  verifiedAt: string;
+}
+
 const exactKeys = (value: object, keys: readonly string[]): boolean => {
   const actual = Object.keys(value);
   return actual.length === keys.length && actual.every((key) => keys.includes(key));
@@ -222,6 +233,15 @@ export function parsePrepublishMarker(raw: string, accountId?: string): GenesisP
     || typeof v.deviceId !== "string" || !v.deviceId || !iso(v.startedAt) || v.phase !== "prepublish"
     || !(v.repairId === null || (typeof v.repairId === "string" && GENESIS_REPAIR_ID_RE.test(v.repairId)))) throw new Error("invalid genesis prepublish marker");
   return v as unknown as GenesisPrepublishMarker;
+}
+
+export function parseGenesisEnrollmentWitness(raw:string,accountId?:string):GenesisEnrollmentWitness{
+  const v=parseBounded(raw);
+  if(!plain(v)||!exactKeys(v,["version","accountId","deviceSha256","mkSha256","verifiedAt"])||v.version!==1
+    ||typeof v.accountId!=="string"||!GENESIS_ACCOUNT_ID_RE.test(v.accountId)||(accountId!==undefined&&v.accountId!==accountId)
+    ||typeof v.deviceSha256!=="string"||!GENESIS_REQUEST_SHA_RE.test(v.deviceSha256)
+    ||typeof v.mkSha256!=="string"||!GENESIS_REQUEST_SHA_RE.test(v.mkSha256)||!iso(v.verifiedAt))throw new Error("invalid genesis enrollment witness");
+  return v as unknown as GenesisEnrollmentWitness;
 }
 
 export async function parseGenesisJournal(raw: string, accountId?: string): Promise<GenesisJournal> {
@@ -273,8 +293,34 @@ export async function parseRetargetWitness(raw:string,journal:GenesisJournal):Pr
 
 export const genesisPaths=(accountId:string)=>{const dir=genesisAccountRoot(accountId);return{
   dir, marker:path.join(dir,"genesis-prepublish.json"), stagedRk:path.join(dir,"rk.key.staged"), journal:path.join(dir,"genesis-attempt.json"),
-  intent:path.join(dir,"genesis-completion-intent.json"), witness:path.join(dir,"genesis-completion-intent.retarget.json"), device:path.join(dir,"device.json"), mk:path.join(dir,"mk.key"), rk:path.join(dir,"rk.key"), quarantine:path.join(dir,"quarantine"),
+  intent:path.join(dir,"genesis-completion-intent.json"), witness:path.join(dir,"genesis-completion-intent.retarget.json"), enrolledWitness:path.join(dir,"genesis-enrolled.json"), device:path.join(dir,"device.json"), mk:path.join(dir,"mk.key"), rk:path.join(dir,"rk.key"), quarantine:path.join(dir,"quarantine"),
 };};
+
+async function enrollmentMaterialHashes(accountId:string):Promise<{deviceSha256:string;mkSha256:string}>{
+  const paths=genesisPaths(accountId),[device,mk]=await Promise.all([fs.readFile(paths.device),fs.readFile(paths.mk)]);
+  return{deviceSha256:await sha256Hex(new Uint8Array(device)),mkSha256:await sha256Hex(new Uint8Array(mk))};
+}
+
+export async function publishGenesisEnrollmentWitness(accountId:string,verifiedAt=new Date().toISOString(),options?:HardenedWriteOptions):Promise<GenesisEnrollmentWitness>{
+  assertGenesisAccountId(accountId);const hashes=await enrollmentMaterialHashes(accountId);const witness:GenesisEnrollmentWitness={version:1,accountId,...hashes,verifiedAt};
+  const raw=canonicalString(witness);parseGenesisEnrollmentWitness(raw,accountId);await hardenedWrite(genesisPaths(accountId).enrolledWitness,raw,options);return witness;
+}
+
+/** False includes absence, malformed bytes, unsafe file shape, missing material,
+ * and content drift. Callers deliberately fail toward server consultation. */
+export async function genesisEnrollmentWitnessMatches(accountId:string):Promise<boolean>{
+  try{
+    const file=genesisPaths(accountId).enrolledWitness,stat=await fs.lstat(file);if(!stat.isFile()||stat.isSymbolicLink())return false;
+    const witness=parseGenesisEnrollmentWitness(await fs.readFile(file,"utf8"),accountId),hashes=await enrollmentMaterialHashes(accountId);
+    return witness.deviceSha256===hashes.deviceSha256&&witness.mkSha256===hashes.mkSha256;
+  }catch{return false;}
+}
+
+export async function genesisEnrollmentWitnessPresent(accountId:string):Promise<boolean>{
+  try{await fs.lstat(genesisPaths(accountId).enrolledWitness);return true;}catch(error){if((error as NodeJS.ErrnoException).code==="ENOENT")return false;return true;}
+}
+
+export async function invalidateGenesisEnrollmentWitness(accountId:string):Promise<void>{assertGenesisAccountId(accountId);await hardenedUnlink(genesisPaths(accountId).enrolledWitness);}
 
 export async function publishPrepublishMarker(marker:GenesisPrepublishMarker,options?:HardenedWriteOptions):Promise<void>{parsePrepublishMarker(canonicalString(marker),marker.accountId);await hardenedWrite(genesisPaths(marker.accountId).marker,canonicalString(marker),options);}
 export async function stageRecoveryKey(accountId:string,rk:Uint8Array,options?:HardenedWriteOptions):Promise<void>{assertGenesisAccountId(accountId);if(rk.length!==32)throw new Error("staged recovery key must be 32 bytes");const encoded=toB64url(rk);const decoded=fromB64url(encoded);if(await rkToPhrase(decoded)!==await rkToPhrase(rk))throw new Error("staged recovery key round-trip failed");await hardenedWrite(genesisPaths(accountId).stagedRk,encoded,options);}

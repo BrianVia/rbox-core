@@ -31,7 +31,7 @@ import {
 import { resolveKeyedWorkspace, ensureKeyedTargetDir, persistKeyedCredentials } from "./setup-keyed.js";
 import type { AccountKeysDTO } from "./e2ee-remote.js";
 import { promptPath } from "./prompt.js";
-import { NetworkError, WORKSPACE_MINT_RERUN_HINT } from "./remote/errors.js";
+import { LEGACY_GENESIS_SERVICE_MESSAGE, LegacyGenesisServiceError, NetworkError, WORKSPACE_MINT_RERUN_HINT } from "./remote/errors.js";
 import { loadRawState, loadState, resetSyncState, saveConfig, StreamMismatchError } from "./config.js";
 import { inspectResetConsent, type ResetConsentWitness } from "./reset-consent.js";
 import { beginResetJournal, recoverResetJournal, resetArchivePath, resetJournalPath } from "./reset-journal.js";
@@ -39,6 +39,9 @@ import { resetJournalDoctorCmd } from "./reset-journal-doctor.js";
 import { createHash } from "node:crypto";
 import { bootstrapAccount } from "../engine/e2ee/index.js";
 import { saveDevice } from "./e2ee-keystore.js";
+import { genesisPaths, publishGenesisEnrollmentWitness } from "./genesis-durable.js";
+import { pendingGenesisState } from "./genesis-enrollment.js";
+import { loadCredentials, saveCredentials } from "./credentials.js";
 
 const ACCOUNT_KEYS: AccountKeysDTO = { recoveryWrap: null, recoveryWrapId: null, rosters: [], keyStates: [], devices: [] };
 
@@ -90,6 +93,25 @@ test("resolveEnrollment sends the exact legacy device+MK shape through runGenesi
     expect(calls).toBe(1);
     expect(result).toBe(true);
   });
+});
+
+test("setup with a local enrollment witness performs zero observation fetches",async()=>{
+  const priorFetch=globalThis.fetch;
+  try{await withLegacyGenesisPair("acct_2020202020202020","dev_witness_setup",async loaded=>{await publishGenesisEnrollmentWitness(loaded.credentials.accountId!);let fetches=0;globalThis.fetch=(async()=>{fetches++;throw new Error("witness must keep setup offline");}) as typeof fetch;expect(await enrolledAccountId(loaded)).toBe(loaded.credentials.accountId);expect(fetches).toBe(0);});}
+  finally{globalThis.fetch=priorFetch;}
+});
+
+test("fresh setup against a legacy server surfaces the exact terminal error and remains retryable after upgrade",async()=>{
+  const priorRboxHome=process.env.RBOX_HOME,priorHome=process.env.HOME,priorFetch=globalThis.fetch,home=await fs.mkdtemp(path.join(os.tmpdir(),"rbox-legacy-server-setup-")),accountId="acct_2121212121212122",deviceId="dev_fresh";process.env.RBOX_HOME=home;process.env.HOME=home;let fetches=0;
+  const loaded={state:"valid" as const,source:"disk" as const,credentials:{v:1 as const,token:"tok",deviceId,remoteUrl:"https://api.test",accountId},legacy:false,extensions:{}};
+  try{
+    await saveCredentials(loaded.credentials);
+    globalThis.fetch=(async()=>{fetches++;return new Response(JSON.stringify({error:"not_found"}),{status:404});}) as typeof fetch;
+    const error=await resolveEnrollment("https://api.test",{promptSelect:async()=>"genesis"}).catch(value=>value);expect(error).toBeInstanceOf(LegacyGenesisServiceError);expect(error.message).toBe(LEGACY_GENESIS_SERVICE_MESSAGE);
+    expect(fetches).toBe(2);expect((await loadCredentials()).state).toBe("valid");expect(await pendingGenesisState(accountId)).toBe(false);for(const file of [genesisPaths(accountId).device,genesisPaths(accountId).mk,genesisPaths(accountId).marker,genesisPaths(accountId).journal,genesisPaths(accountId).stagedRk])await expect(fs.access(file)).rejects.toThrow();
+    let upgradedObservations=0;const upgraded={getAccountKeys:async()=>null,getGenesisObservation:async()=>{upgradedObservations++;return{genesisPresenceVersion:1 as const,claim:null,present:{rosters:0,keyStates:0,devices:0,workspaces:0,workspaceKeys:0,e2eePairingTokens:0}};},bootstrapKeys:async()=>{}};
+    const resumed=await resolveEnrollment("https://api.test",{makeApi:()=>upgraded,promptSelect:async()=>"genesis",runGenesisEnrollment:async api=>{await api.getGenesisObservation();await saveDevice((await bootstrapAccount(accountId,deviceId,1_900_000_000_000)).secrets);return"enrolled";}});expect(resumed).toBe(true);expect(upgradedObservations).toBe(1);
+  }finally{globalThis.fetch=priorFetch;if(priorRboxHome===undefined)delete process.env.RBOX_HOME;else process.env.RBOX_HOME=priorRboxHome;if(priorHome===undefined)delete process.env.HOME;else process.env.HOME=priorHome;await fs.rm(home,{recursive:true,force:true});}
 });
 
 test("setup step header numbers fresh and enrolled flows", () => {

@@ -63,6 +63,17 @@ export class GenesisBootstrapTerminalError extends Error {
   }
 }
 
+export const LEGACY_GENESIS_SERVICE_MESSAGE = "this rbox version requires the upgraded sync service; the service upgrade is rolling out — retry shortly or use the previous rbox version";
+
+/** The authenticated server answered with the exact pre-design-180 account-key
+ * vocabulary. This is a rollout-order terminal, distinct from corrupt v1 data. */
+export class LegacyGenesisServiceError extends Error {
+  constructor() {
+    super(LEGACY_GENESIS_SERVICE_MESSAGE);
+    this.name = "LegacyGenesisServiceError";
+  }
+}
+
 /** A network call exhausted its transient-retry budget (or hit a non-retryable
  *  transient like a caller cancellation surfacing as a fault). Carries a HUMAN message so the
  *  raw Bun fetch string ("pass `verbose: true` in the second argument to fetch()") never reaches

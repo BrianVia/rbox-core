@@ -58,7 +58,7 @@ test("inside workspace renders status before picker and Exit runs no action", as
   expect(calls).toEqual(["status:/work/root", "prompt"]);
 });
 
-test("front door routes an exact old-flow device+MK pair through server classification before rendering status", async () => {
+test("front door verifies an old-flow pair once, then its enrollment witness makes the next restart fetch-free", async () => {
   const priorHome = process.env.RBOX_HOME;
   const priorFetch = globalThis.fetch;
   const home = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-front-door-genesis-"));
@@ -107,6 +107,15 @@ test("front door routes an exact old-flow device+MK pair through server classifi
 
     expect(fetches).toBe(1);
     expect(rendered).toBe(1);
+    globalThis.fetch = (async () => { fetches++; throw new Error("enrollment witness must suppress observation fetch"); }) as typeof fetch;
+    await runFrontDoor("/work/root", {
+      loadCredentials: async () => loaded,
+      readAccountProfile: async () => ({ accountId, email: null, signInMethod: null, plan: "pro" }),
+      statusCmd: async () => { rendered++; return { daemonRunning: false }; },
+      promptSelect: async () => "exit",
+    });
+    expect(fetches).toBe(1);
+    expect(rendered).toBe(2);
   } finally {
     globalThis.fetch = priorFetch;
     if (priorHome === undefined) delete process.env.RBOX_HOME;

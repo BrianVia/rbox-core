@@ -15,6 +15,8 @@ export {
   AccountAlreadyBootstrappedError,
   QuotaExceededError,
   NetworkError,
+  LegacyGenesisServiceError,
+  LEGACY_GENESIS_SERVICE_MESSAGE,
 } from "./remote/errors.js";
 export { isTransientNetworkError, transferTimeoutMs } from "./remote/resilient.js";
 export { CommitRejectedError, type CommitOptions, type CommitResult, type CommitTimings, type ServerTimings, type LatestOptions, type LatestTimings } from "./remote/commits.js";

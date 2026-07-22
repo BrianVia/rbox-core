@@ -5,6 +5,7 @@ import path from "node:path";
 import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
 import { systemLockIdentity } from "../engine/git/lockfile.js";
 import { homeDir } from "./rbox-paths.js";
+import { GENESIS_ACCOUNT_ID_RE, invalidateGenesisEnrollmentWitness } from "./genesis-durable.js";
 
 /** The whitelisted, versioned credential document written to disk. */
 export interface CredentialsV1 {
@@ -761,16 +762,19 @@ export async function saveCredentials(c: Credentials): Promise<void> {
   const lock = await acquireCredentialLock();
   try {
     const classified = await classifyDisk();
-    let expectedDestination: PathObservation | undefined;
+    let expectedDestination: PathObservation | undefined,previousAccountId:string|undefined;
     if (!("absent" in classified)) {
       try {
         if (classified.parsed.state !== "valid") await quarantine(lock, classified.source);
-        else expectedDestination = classified.source.identity;
+        else {expectedDestination = classified.source.identity;previousAccountId=classified.parsed.credentials.accountId;}
       } finally {
         await classified.source.handle.close();
       }
     }
     await lock.fenced(async () => {
+      if(previousAccountId!==c.accountId){
+        if(previousAccountId&&GENESIS_ACCOUNT_ID_RE.test(previousAccountId))await invalidateGenesisEnrollmentWitness(previousAccountId);
+      }
       const parentIdentity = await secureCredentialDirectory(false);
       if (!parentIdentity) throw new Error("credential directory disappeared before save");
       try {

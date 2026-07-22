@@ -1,5 +1,5 @@
 import type { AccountKeysDTO, GenesisAccountObservation, GenesisPresence } from "../e2ee-remote.js";
-import { AccountAlreadyBootstrappedError, GenesisBootstrapTerminalError, PAIR_TOKEN_MINT_RERUN_HINT, translateRemoteError } from "./errors.js";
+import { AccountAlreadyBootstrappedError, GenesisBootstrapTerminalError, LegacyGenesisServiceError, PAIR_TOKEN_MINT_RERUN_HINT, translateRemoteError } from "./errors.js";
 import type { RemoteContext } from "./context.js";
 
 // ---- E2EE key + signed-commit transport (design 12 §13.2) ----------------
@@ -34,11 +34,17 @@ export async function getAccountKeys(ctx: RemoteContext): Promise<AccountKeysDTO
 const keys=(value:object,expected:string[])=>{const actual=Object.keys(value);return actual.length===expected.length&&actual.every((k)=>expected.includes(k));};
 const plain=(value:unknown):value is Record<string,unknown>=>typeof value==="object"&&value!==null&&!Array.isArray(value);
 function parsePresence(value:unknown):GenesisPresence{if(!plain(value)||!keys(value,["rosters","keyStates","devices","workspaces","workspaceKeys","e2eePairingTokens"]))throw new Error("invalid genesis presence");for(const n of Object.values(value))if(typeof n!=="number"||!Number.isSafeInteger(n)||n<0)throw new Error("invalid genesis presence count");return value as unknown as GenesisPresence;}
+function legacyGenesisResponse(status:number,body:Record<string,unknown>):boolean{
+  if(status===404)return keys(body,["error"])&&body.error==="not_found";
+  if(status<200||status>=300||!keys(body,["recoveryWrap","recoveryWrapId","rosters","keyStates","devices"]))return false;
+  return(body.recoveryWrap===null||typeof body.recoveryWrap==="string")&&(body.recoveryWrapId===null||typeof body.recoveryWrapId==="string")
+    &&Array.isArray(body.rosters)&&Array.isArray(body.keyStates)&&Array.isArray(body.devices);
+}
 
 export async function getGenesisObservation(ctx:RemoteContext):Promise<GenesisAccountObservation>{
   const r=await ctx.fetch(`${ctx.baseUrl}/v1/keys/account`,{headers:{...ctx.auth,"x-rbox-genesis-capability":"1"}},{op:"fetching account keys"});
   if(r.status!==404&&!r.ok)throw new Error(translateRemoteError(r.status,"keys/account failed",undefined,"account keys not found"));
-  const body=await r.json() as unknown;if(!plain(body)||body.genesisPresenceVersion!==1)throw new Error("unsupported or malformed genesis presence response");const present=parsePresence(body.present);
+  const body=await r.json() as unknown;if(plain(body)&&!Object.hasOwn(body,"genesisPresenceVersion")&&legacyGenesisResponse(r.status,body))throw new LegacyGenesisServiceError();if(!plain(body)||body.genesisPresenceVersion!==1)throw new Error("unsupported or malformed genesis presence response");const present=parsePresence(body.present);
   if(r.status===404){if(!keys(body,["error","genesisPresenceVersion","present"])||body.error!=="not_found")throw new Error("malformed absent genesis observation");return{genesisPresenceVersion:1,claim:null,present};}
   const required=["genesisPresenceVersion","recoveryWrap","recoveryWrapId","claimCreatedAt","genesisDeviceId","rosters","keyStates","devices","present","repairTombstone"];
   if(!keys(body,required)||!Array.isArray(body.rosters)||!Array.isArray(body.keyStates)||!Array.isArray(body.devices)||body.rosters.length!==present.rosters||body.keyStates.length!==present.keyStates||body.devices.length!==present.devices)throw new Error("malformed genesis account observation");
