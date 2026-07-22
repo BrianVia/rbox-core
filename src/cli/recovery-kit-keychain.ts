@@ -223,7 +223,10 @@ export function buildSecurityAddInput(canonicalPhrase: string, accountId: string
 
 export async function resolveLoginKeychain(seams: KeychainSeams = defaultKeychainSeams): Promise<string> {
   if (seams.platform !== "darwin" || !(await seams.securityBinExists())) throw new Error("macOS Keychain is unavailable");
-  const result = await seams.runSecurity(["login-keychain", "-d", "user"], undefined, {
+  // Bare `login-keychain`: the `-d user` form exits 1 on real macOS (field,
+  // 2026-07-22, Sequoia-era). Output is `    "/path/to/login.keychain-db"\n`
+  // — leading indentation is part of the real contract.
+  const result = await seams.runSecurity(["login-keychain"], undefined, {
     timeoutMs: 15_000,
     stdoutBytes: STDIO_LIMIT,
     stderrBytes: STDIO_LIMIT,
@@ -232,7 +235,7 @@ export async function resolveLoginKeychain(seams: KeychainSeams = defaultKeychai
     requireExit(result, "login Keychain resolution");
     const line = parseExactlyOneOutputLine(result.stdout);
     if (!line) throw new Error("login Keychain resolution returned an invalid path");
-    const raw = Buffer.from(line.buffer, line.byteOffset, line.byteLength).toString("utf8");
+    const raw = Buffer.from(line.buffer, line.byteOffset, line.byteLength).toString("utf8").trim();
     const token = raw.startsWith('"') && raw.endsWith('"') ? raw.slice(1, -1).replace(/\\([\\"])/g, "$1") : raw;
     if (!token) throw new Error("login Keychain resolution returned an invalid path");
     return validateKeychainPath(await seams.realpath(validateKeychainPath(token)));
