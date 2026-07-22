@@ -363,7 +363,7 @@ const ROUTE_VOCAB = new Set([
   "auth", "device", "start", "poll", "bootstrap", "approve", "devices", "revoke", "pair", "create", "redeem",
   "billing", "checkout", "portal", "stripe", "webhook", "web", "session",
   "account", "usage", "admin", "gc", "plan", "overview", "delta-soak", "workspaces", "diagnostics", "pack-tombstones", "resweep",
-  "keys", "api", "roster", "admit", "keystate", "workspace",
+  "keys", "api", "roster", "admit", "keystate", "workspace", "genesis-repair",
   "blobs", "blob-batch", "blob-pack", "check", "get", "put", "multipart", "part", "complete",
   "ws", "proj", "manifests", "latest", "connect", "commits", "versions", "roots", "prune",
   "telemetry", "fleet", "sync-state",

@@ -42,7 +42,7 @@ export async function keysRoutes({ req, env, seg }: RouteCtx, p: Principal): Pro
     if (req.method === "POST" && seg.length === 5 && seg[2] === "api" && seg[4] === "revoke") return revokeApiKey(env, p, seg[3]!);
     if (req.method === "POST" && eq(seg, ["v1", "keys", "bootstrap"])) {
       const body = await parsed(req, KEY_BOOTSTRAP_MAX_BYTES, validateKeyBootstrapBody);
-      return body instanceof Response ? body : bootstrapAccountKeys(env, p, body);
+      return body instanceof Response ? body : bootstrapAccountKeys(env, p, body, req.headers.get("x-rbox-genesis-capability"));
     }
     if (req.method === "GET" && eq(seg, ["v1", "keys", "account"])) return getAccountKeys(env, p);
     if (req.method === "POST" && eq(seg, ["v1", "keys", "device"])) {

@@ -5,6 +5,7 @@ import { accountDevices, accountWorkspaces } from "../auth.js";
 import { countWorkspaces, planLimitsFor, usage } from "../billing.js";
 import { createWorkspace, type Principal } from "../authz.js";
 import { deleteAccount } from "../account-delete.js";
+import { tombstoneFenceResponse } from "../genesis-repair.js";
 
 /**
  * Account linking (design 21) — start/status/confirm are PUBLIC: authenticated by
@@ -35,6 +36,8 @@ export async function accountRoutes({ req, env, url, seg }: RouteCtx, p: Princip
   // Self-serve account + data deletion (design 37) — OWNER-ONLY, confirmation-gated.
   if (req.method === "DELETE" && eq(seg, ["v1", "account"])) return deleteAccount(env, p, req, Date.now());
   if (req.method === "POST" && eq(seg, ["v1", "workspaces"])) {
+    const fence = await tombstoneFenceResponse(env, p.accountId);
+    if (fence) return fence;
     const limits = await planLimitsFor(env, p.accountId); // workspace-count quota (M7b)
     if ((await countWorkspaces(env, p.accountId)) >= limits.workspaces) {
       return json({ error: "quota_exceeded", limit: "workspaces", cap: limits.workspaces }, 402);

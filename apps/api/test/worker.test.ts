@@ -917,7 +917,7 @@ describe("worker integration (real DO + D1 + R2)", () => {
       }),
     });
 
-  test("keys bootstrap → account read returns genesis material; second bootstrap → 409", async () => {
+  test("keys bootstrap → account read returns genesis material; exact replay → idempotent 200", async () => {
     const a = await bootstrap("acct-keys");
     expect((await keysBootstrap(a.token, a.deviceId)).status).toBe(200);
 
@@ -929,7 +929,7 @@ describe("worker integration (real DO + D1 + R2)", () => {
     expect(body.keyStates).toEqual(["keystate-0"]);
     expect(body.devices.map((d) => d.deviceId)).toContain(a.deviceId);
 
-    expect((await keysBootstrap(a.token, a.deviceId)).status).toBe(409); // already bootstrapped
+    expect((await keysBootstrap(a.token, a.deviceId)).status).toBe(200); // exact opaque replay
   });
 
   test("keys bootstrap with a device that isn't the caller's → 403", async () => {
@@ -966,6 +966,7 @@ describe("worker integration (real DO + D1 + R2)", () => {
 
   test("workspace keys: put + get round-trips; cross-account get → 404", async () => {
     const a = await bootstrap("acct-wskey");
+    await keysBootstrap(a.token,a.deviceId);
     const ws = ((await (await SELF.fetch(`${BASE}/v1/workspaces?project=root`, { method: "POST", headers: authed(a.token) })).json()) as { workspaceId: string }).workspaceId;
     const put = await SELF.fetch(`${BASE}/v1/keys/workspace`, { method: "POST", headers: authed(a.token, { "content-type": "application/json" }), body: JSON.stringify({ workspaceId: ws, keyEpoch: 0, kekWrap: "kek-0" }) });
     expect(put.status).toBe(200);
@@ -983,6 +984,7 @@ describe("worker integration (real DO + D1 + R2)", () => {
   // caller with a DIFFERENT wrap gets the first one back (adopts it, never an UPDATE).
   test("workspace key CAS: second writer with a different wrap gets the FIRST wrap back", async () => {
     const a = await bootstrap("acct-wskey-cas");
+    await keysBootstrap(a.token,a.deviceId);
     const ws = ((await (await SELF.fetch(`${BASE}/v1/workspaces?project=root`, { method: "POST", headers: authed(a.token) })).json()) as { workspaceId: string }).workspaceId;
     const put = (kekWrap: string) =>
       SELF.fetch(`${BASE}/v1/keys/workspace`, { method: "POST", headers: authed(a.token, { "content-type": "application/json" }), body: JSON.stringify({ workspaceId: ws, keyEpoch: 0, kekWrap }) });
@@ -1032,6 +1034,7 @@ describe("worker integration (real DO + D1 + R2)", () => {
   // server stores keyed by it and redeem looks it up.
   test("pair/create with a client tokenId redeems by that same tokenId", async () => {
     const a = await bootstrap("acct-pair-tokenid");
+    await keysBootstrap(a.token,a.deviceId);
     const tokenId = "clientchosen_tokenid_0001"; // 16–64 url-safe chars
     const cr = await SELF.fetch(`${BASE}/v1/auth/pair/create`, {
       method: "POST",
@@ -1064,6 +1067,7 @@ describe("worker integration (real DO + D1 + R2)", () => {
 
   test("pairing token carries opaque E2EE material through create → redeem", async () => {
     const a = await bootstrap("acct-pair-e2ee");
+    await keysBootstrap(a.token,a.deviceId);
     const cr = await SELF.fetch(`${BASE}/v1/auth/pair/create`, {
       method: "POST",
       headers: authed(a.token, { "content-type": "application/json" }),
@@ -1303,7 +1307,7 @@ describe("worker integration (real DO + D1 + R2)", () => {
     // append-only forensic log (§3.4) + the design-37 deletion ledger — operational rows, never
     // reclaim state (a tombstoned account is already access-dead and gets hard-purged, not
     // link-reclaimed), so neither blocks reclaim.
-    const EXCLUDED = ["audit_log", "account_deletions"];
+    const EXCLUDED = ["audit_log", "account_deletions", "genesis_repair_audit"];
     const known = new Set([...COVERED, ...EXPECTED_CLEANED, ...EXCLUDED]);
     const uncategorized = accountScoped.filter((t) => !known.has(t));
     expect(uncategorized).toEqual([]); // ← a NEW account_id table: categorize it in loadShellState/judgeReclaimable + here

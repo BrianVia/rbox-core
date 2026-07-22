@@ -2,6 +2,18 @@ import type { Env } from "./env.js";
 import { exactObject, json, utf8Bytes } from "./util.js";
 import type { Principal } from "./authz.js";
 import { dbFor } from "./db.js";
+import {
+  GENESIS_CAPABILITY_VALUE,
+  GENESIS_TOMBSTONE_SENTINEL,
+  REPAIR_ID_RE,
+  deletionLedgerBlocks,
+  isExactTombstone,
+  isTombstoneFamily,
+  presenceOf,
+  readGenesisObservation,
+  reconcileGenesisRepairAudits,
+  tombstoneFenceResponse,
+} from "./genesis-repair.js";
 
 /**
  * E2EE key storage/serving (design 12, v4) — a DUMB ZERO-KNOWLEDGE STORE.
@@ -32,7 +44,9 @@ function nat(v: unknown): number | null {
 }
 
 export function validateKeyBootstrapBody(value: unknown): Record<string, unknown> | null {
-  if (!exactObject(value, ["recoveryWrap", "recoveryWrapId", "genesisRoster", "genesisKeyState", "device"])) return null;
+  if (!exactObject(value, ["recoveryWrap", "recoveryWrapId", "genesisRoster", "genesisKeyState", "device"])
+    && !exactObject(value, ["recoveryWrap", "recoveryWrapId", "genesisRoster", "genesisKeyState", "device", "repairId"])) return null;
+  if (Object.hasOwn(value, "repairId") && (typeof value.repairId !== "string" || !REPAIR_ID_RE.test(value.repairId))) return null;
   if (!str(value.recoveryWrap) || !str(value.recoveryWrapId) || !str(value.genesisRoster) || !str(value.genesisKeyState)) return null;
   if (!exactObject(value.device, ["deviceId", "sigPubKey", "encPubKey", "mkWrap"])) return null;
   return str(value.device.deviceId) && str(value.device.sigPubKey) && str(value.device.encPubKey) && str(value.device.mkWrap) ? value : null;
@@ -89,7 +103,7 @@ async function ownsWorkspace(env: Env, accountId: string, workspaceId: string): 
  * 0), and the bootstrapping device's keys. The device MUST be the caller's own
  * device (anti-spoof). 409 if already bootstrapped (idempotency, not overwrite).
  */
-export async function bootstrapAccountKeys(env: Env, p: Principal, body: unknown): Promise<Response> {
+export async function bootstrapAccountKeys(env: Env, p: Principal, body: unknown, genesisCapability?: string | null, auditRetry = 0): Promise<Response> {
   const b = (body ?? {}) as Record<string, unknown>;
   const recoveryWrap = str(b.recoveryWrap);
   const recoveryWrapId = str(b.recoveryWrapId);
@@ -100,29 +114,117 @@ export async function bootstrapAccountKeys(env: Env, p: Principal, body: unknown
   const sigPubKey = str(device.sigPubKey);
   const encPubKey = str(device.encPubKey);
   const mkWrap = str(device.mkWrap);
+  const repairId = typeof b.repairId === "string" && REPAIR_ID_RE.test(b.repairId) ? b.repairId : null;
   if (!recoveryWrap || !recoveryWrapId || !genesisRoster || !genesisKeyState || !deviceId || !sigPubKey || !encPubKey || !mkWrap) {
     return json({ error: "bad_request", message: "missing or oversized field" }, 400);
   }
   // The bootstrapping device must be the authenticated caller's own device.
   if (deviceId !== p.deviceId) return json({ error: "forbidden", message: "device mismatch" }, 403);
 
-  const now = Date.now();
-  // Claim the account_keys row first; changes===0 means already bootstrapped.
-  const claim = await dbFor(env, p.accountId)
-    .prepare("INSERT OR IGNORE INTO account_keys (account_id, recovery_wrap, recovery_wrap_id, created_at) VALUES (?, ?, ?, ?)")
-    .bind(p.accountId, recoveryWrap, recoveryWrapId, now)
-    .run();
-  if ((claim.meta.changes ?? 0) === 0) return json({ error: "already_bootstrapped" }, 409);
+  await reconcileGenesisRepairAudits(env, p.accountId);
+  const before = await readGenesisObservation(env, p.accountId);
+  if (isTombstoneFamily(before)) {
+    if (!repairId || !isExactTombstone(before) || before.repairId !== repairId) return json({ error: "repair_in_progress" }, 423);
+    if (genesisCapability !== GENESIS_CAPABILITY_VALUE) {
+      return json({ error: "genesis_capability_required", requiredHeader: "x-rbox-genesis-capability", requiredValue: "1" }, 428);
+    }
+  }
 
-  // Genesis roster (v0) + genesis key-state (epoch 0) + the device's keys.
-  await dbFor(env, p.accountId).batch([
-    dbFor(env, p.accountId).prepare("INSERT OR IGNORE INTO rosters (account_id, version, signed, created_at) VALUES (?, 0, ?, ?)").bind(p.accountId, genesisRoster, now),
-    dbFor(env, p.accountId).prepare("INSERT OR IGNORE INTO account_key_states (account_id, account_epoch, signed, created_at) VALUES (?, 0, ?, ?)").bind(p.accountId, genesisKeyState, now),
-    dbFor(env, p.accountId)
-      .prepare("INSERT OR IGNORE INTO device_keys (device_id, account_id, sig_pubkey, enc_pubkey, mk_wrap, created_at) VALUES (?, ?, ?, ?, ?, ?)")
-      .bind(deviceId, p.accountId, sigPubKey, encPubKey, mkWrap, now),
-  ]);
-  return json({ ok: true });
+  const db = dbFor(env, p.accountId);
+  const now = Date.now();
+  const noAudit = "NOT EXISTS (SELECT 1 FROM genesis_repair_audit WHERE account_id = ?1 AND outcome = 'attempted')";
+  const noErase = "NOT EXISTS (SELECT 1 FROM account_deletions WHERE account_id = ?1 AND status IN ('purging','done'))";
+  let results: D1Result<unknown>[];
+  if (!repairId) {
+    const noClaim = "NOT EXISTS (SELECT 1 FROM account_keys WHERE account_id = ?1)";
+    const noChildren = `NOT EXISTS (SELECT 1 FROM rosters WHERE account_id = ?1) AND NOT EXISTS (SELECT 1 FROM account_key_states WHERE account_id = ?1)
+      AND NOT EXISTS (SELECT 1 FROM device_keys WHERE account_id = ?1) AND NOT EXISTS (SELECT 1 FROM workspace_keys WHERE account_id = ?1)
+      AND NOT EXISTS (SELECT 1 FROM workspaces WHERE account_id = ?1)
+      AND NOT EXISTS (SELECT 1 FROM pairing_tokens WHERE account_id = ?1 AND (mk_wrap IS NOT NULL OR admission_grant IS NOT NULL))`;
+    const claim = "EXISTS (SELECT 1 FROM account_keys WHERE account_id = ?1 AND recovery_wrap = ?2 AND recovery_wrap_id = ?3 AND created_at = ?4 AND genesis_device_id = ?5 AND repair_id IS NULL AND repaired_at IS NULL)";
+    results = await db.batch([
+      db.prepare(`INSERT INTO account_keys (account_id,recovery_wrap,recovery_wrap_id,created_at,genesis_device_id)
+        SELECT ?1,?2,?3,?4,?5 WHERE ${noClaim} AND ${noChildren} AND ${noAudit} AND ${noErase}`)
+        .bind(p.accountId, recoveryWrap, recoveryWrapId, now, deviceId),
+      db.prepare(`INSERT INTO rosters (account_id,version,signed,created_at) SELECT ?1,0,?6,?4
+        WHERE ${claim} AND ${noChildren} AND ${noAudit} AND ${noErase}`)
+        .bind(p.accountId, recoveryWrap, recoveryWrapId, now, deviceId, genesisRoster),
+      db.prepare(`INSERT INTO account_key_states (account_id,account_epoch,signed,created_at) SELECT ?1,0,?7,?4
+        WHERE ${claim} AND EXISTS (SELECT 1 FROM rosters WHERE account_id=?1 AND version=0 AND signed=?6 AND created_at=?4)
+        AND NOT EXISTS (SELECT 1 FROM rosters WHERE account_id=?1 AND NOT(version=0 AND signed=?6 AND created_at=?4))
+        AND NOT EXISTS (SELECT 1 FROM account_key_states WHERE account_id=?1) AND NOT EXISTS (SELECT 1 FROM device_keys WHERE account_id=?1)
+        AND NOT EXISTS (SELECT 1 FROM workspace_keys WHERE account_id=?1) AND NOT EXISTS (SELECT 1 FROM workspaces WHERE account_id=?1)
+        AND NOT EXISTS (SELECT 1 FROM pairing_tokens WHERE account_id=?1 AND (mk_wrap IS NOT NULL OR admission_grant IS NOT NULL)) AND ${noAudit} AND ${noErase}`)
+        .bind(p.accountId, recoveryWrap, recoveryWrapId, now, deviceId, genesisRoster, genesisKeyState),
+      db.prepare(`INSERT INTO device_keys (device_id,account_id,sig_pubkey,enc_pubkey,mk_wrap,created_at) SELECT ?5,?1,?8,?9,?10,?4
+        WHERE ${claim} AND EXISTS (SELECT 1 FROM rosters WHERE account_id=?1 AND version=0 AND signed=?6 AND created_at=?4)
+        AND EXISTS (SELECT 1 FROM account_key_states WHERE account_id=?1 AND account_epoch=0 AND signed=?7 AND created_at=?4)
+        AND NOT EXISTS (SELECT 1 FROM rosters WHERE account_id=?1 AND NOT(version=0 AND signed=?6 AND created_at=?4))
+        AND NOT EXISTS (SELECT 1 FROM account_key_states WHERE account_id=?1 AND NOT(account_epoch=0 AND signed=?7 AND created_at=?4))
+        AND NOT EXISTS (SELECT 1 FROM device_keys WHERE account_id=?1) AND NOT EXISTS (SELECT 1 FROM workspace_keys WHERE account_id=?1)
+        AND NOT EXISTS (SELECT 1 FROM workspaces WHERE account_id=?1)
+        AND NOT EXISTS (SELECT 1 FROM pairing_tokens WHERE account_id=?1 AND (mk_wrap IS NOT NULL OR admission_grant IS NOT NULL)) AND ${noAudit} AND ${noErase}`)
+        .bind(p.accountId, recoveryWrap, recoveryWrapId, now, deviceId, genesisRoster, genesisKeyState, sigPubKey, encPubKey, mkWrap),
+    ]);
+  } else {
+    const tomb = `EXISTS (SELECT 1 FROM account_keys WHERE account_id=?1 AND recovery_wrap=?11 AND recovery_wrap_id=?11
+      AND genesis_device_id IS NULL AND repair_id=?12 AND repaired_at IS NOT NULL)`;
+    const noWs = `NOT EXISTS (SELECT 1 FROM workspace_keys WHERE account_id=?1) AND NOT EXISTS (SELECT 1 FROM workspaces WHERE account_id=?1)
+      AND NOT EXISTS (SELECT 1 FROM pairing_tokens WHERE account_id=?1 AND (mk_wrap IS NOT NULL OR admission_grant IS NOT NULL))`;
+    results = await db.batch([
+      db.prepare(`INSERT INTO rosters (account_id,version,signed,created_at) SELECT ?1,0,?6,?4 WHERE ${tomb}
+        AND NOT EXISTS (SELECT 1 FROM rosters WHERE account_id=?1) AND NOT EXISTS (SELECT 1 FROM account_key_states WHERE account_id=?1)
+        AND NOT EXISTS (SELECT 1 FROM device_keys WHERE account_id=?1) AND ${noWs} AND ${noAudit} AND ${noErase}`)
+        .bind(p.accountId,recoveryWrap,recoveryWrapId,now,deviceId,genesisRoster,genesisKeyState,sigPubKey,encPubKey,mkWrap,GENESIS_TOMBSTONE_SENTINEL,repairId),
+      db.prepare(`INSERT INTO account_key_states (account_id,account_epoch,signed,created_at) SELECT ?1,0,?7,?4 WHERE ${tomb}
+        AND EXISTS (SELECT 1 FROM rosters WHERE account_id=?1 AND version=0 AND signed=?6 AND created_at=?4)
+        AND NOT EXISTS (SELECT 1 FROM rosters WHERE account_id=?1 AND NOT(version=0 AND signed=?6 AND created_at=?4))
+        AND NOT EXISTS (SELECT 1 FROM account_key_states WHERE account_id=?1) AND NOT EXISTS (SELECT 1 FROM device_keys WHERE account_id=?1)
+        AND ${noWs} AND ${noAudit} AND ${noErase}`)
+        .bind(p.accountId,recoveryWrap,recoveryWrapId,now,deviceId,genesisRoster,genesisKeyState,sigPubKey,encPubKey,mkWrap,GENESIS_TOMBSTONE_SENTINEL,repairId),
+      db.prepare(`INSERT INTO device_keys (device_id,account_id,sig_pubkey,enc_pubkey,mk_wrap,created_at) SELECT ?5,?1,?8,?9,?10,?4 WHERE ${tomb}
+        AND EXISTS (SELECT 1 FROM rosters WHERE account_id=?1 AND version=0 AND signed=?6 AND created_at=?4)
+        AND EXISTS (SELECT 1 FROM account_key_states WHERE account_id=?1 AND account_epoch=0 AND signed=?7 AND created_at=?4)
+        AND NOT EXISTS (SELECT 1 FROM rosters WHERE account_id=?1 AND NOT(version=0 AND signed=?6 AND created_at=?4))
+        AND NOT EXISTS (SELECT 1 FROM account_key_states WHERE account_id=?1 AND NOT(account_epoch=0 AND signed=?7 AND created_at=?4))
+        AND NOT EXISTS (SELECT 1 FROM device_keys WHERE account_id=?1) AND ${noWs} AND ${noAudit} AND ${noErase}`)
+        .bind(p.accountId,recoveryWrap,recoveryWrapId,now,deviceId,genesisRoster,genesisKeyState,sigPubKey,encPubKey,mkWrap,GENESIS_TOMBSTONE_SENTINEL,repairId),
+      db.prepare(`UPDATE account_keys SET recovery_wrap=?2,recovery_wrap_id=?3,genesis_device_id=?5,repair_id=NULL,repaired_at=NULL WHERE account_id=?1
+        AND recovery_wrap=?11 AND recovery_wrap_id=?11 AND genesis_device_id IS NULL AND repair_id=?12 AND repaired_at IS NOT NULL
+        AND EXISTS (SELECT 1 FROM rosters WHERE account_id=?1 AND version=0 AND signed=?6 AND created_at=?4)
+        AND EXISTS (SELECT 1 FROM account_key_states WHERE account_id=?1 AND account_epoch=0 AND signed=?7 AND created_at=?4)
+        AND EXISTS (SELECT 1 FROM device_keys WHERE account_id=?1 AND device_id=?5 AND sig_pubkey=?8 AND enc_pubkey=?9 AND mk_wrap=?10 AND created_at=?4)
+        AND (SELECT COUNT(*) FROM rosters WHERE account_id=?1)=1 AND (SELECT COUNT(*) FROM account_key_states WHERE account_id=?1)=1
+        AND (SELECT COUNT(*) FROM device_keys WHERE account_id=?1)=1 AND ${noWs} AND ${noAudit} AND ${noErase}`)
+        .bind(p.accountId,recoveryWrap,recoveryWrapId,now,deviceId,genesisRoster,genesisKeyState,sigPubKey,encPubKey,mkWrap,GENESIS_TOMBSTONE_SENTINEL,repairId),
+    ]);
+  }
+  const vector = results.map((r) => r.meta.changes ?? 0).join("/");
+  if (vector === "1/1/1/1") return json({ ok: true });
+  if (await deletionLedgerBlocks(env, p.accountId)) return json({ error: "account_erased" }, 410);
+  const attempted = await db.prepare(
+    "SELECT 1 FROM genesis_repair_audit WHERE account_id = ? AND outcome = 'attempted' LIMIT 1"
+  ).bind(p.accountId).first();
+  if (attempted) {
+    await reconcileGenesisRepairAudits(env, p.accountId);
+    if (auditRetry >= 8) return json({ error: "genesis_audit_busy" }, 503);
+    return bootstrapAccountKeys(env, p, body, genesisCapability, auditRetry + 1);
+  }
+  await reconcileGenesisRepairAudits(env, p.accountId);
+  const current = await readGenesisObservation(env, p.accountId);
+  if (isTombstoneFamily(current)) return json({ error: "repair_in_progress" }, 423);
+
+  const exact = await db.prepare(
+    `SELECT 1 FROM account_keys a JOIN rosters r ON r.account_id=a.account_id AND r.version=0
+      JOIN account_key_states k ON k.account_id=a.account_id AND k.account_epoch=0
+      JOIN device_keys d ON d.account_id=a.account_id AND d.device_id=?2
+     WHERE a.account_id=?1 AND a.repair_id IS NULL AND a.repaired_at IS NULL
+       AND a.recovery_wrap=?3 AND a.recovery_wrap_id=?4 AND r.signed=?5 AND k.signed=?6
+       AND d.sig_pubkey=?7 AND d.enc_pubkey=?8 AND d.mk_wrap=?9
+       AND (a.genesis_device_id=?2 OR (a.genesis_device_id IS NULL AND a.created_at=r.created_at AND a.created_at=k.created_at
+         AND a.created_at=d.created_at AND (SELECT COUNT(*) FROM device_keys x WHERE x.account_id=?1 AND x.created_at=a.created_at)=1))`
+  ).bind(p.accountId,deviceId,recoveryWrap,recoveryWrapId,genesisRoster,genesisKeyState,sigPubKey,encPubKey,mkWrap).first();
+  return exact ? json({ ok: true, idempotent: true }) : json({ error: "already_bootstrapped" }, 409);
 }
 
 /**
@@ -131,11 +233,10 @@ export async function bootstrapAccountKeys(env: Env, p: Principal, body: unknown
  * and every device's public keys + MK wrap. All account-scoped, all opaque.
  */
 export async function getAccountKeys(env: Env, p: Principal): Promise<Response> {
-  const acct = await dbFor(env, p.accountId)
-    .prepare("SELECT recovery_wrap, recovery_wrap_id FROM account_keys WHERE account_id = ?")
-    .bind(p.accountId)
-    .first<{ recovery_wrap: string | null; recovery_wrap_id: string | null }>();
-  if (!acct) return json({ error: "not_found" }, 404);
+  await reconcileGenesisRepairAudits(env, p.accountId);
+  const observed = await readGenesisObservation(env, p.accountId);
+  const present = presenceOf(observed);
+  if (observed.claimPresent === 0) return json({ error: "not_found", genesisPresenceVersion: 1, present }, 404);
 
   const rosters = await dbFor(env, p.accountId).prepare("SELECT signed FROM rosters WHERE account_id = ? ORDER BY version").bind(p.accountId).all<{ signed: string }>();
   const keyStates = await dbFor(env, p.accountId).prepare("SELECT signed FROM account_key_states WHERE account_id = ? ORDER BY account_epoch").bind(p.accountId).all<{ signed: string }>();
@@ -145,11 +246,16 @@ export async function getAccountKeys(env: Env, p: Principal): Promise<Response> 
     .all<{ device_id: string; sig_pubkey: string | null; enc_pubkey: string | null; mk_wrap: string | null }>();
 
   return json({
-    recoveryWrap: acct.recovery_wrap,
-    recoveryWrapId: acct.recovery_wrap_id,
+    genesisPresenceVersion: 1,
+    recoveryWrap: observed.recoveryWrap,
+    recoveryWrapId: observed.recoveryWrapId,
+    claimCreatedAt: observed.claimCreatedAt,
+    genesisDeviceId: observed.genesisDeviceId,
     rosters: (rosters.results ?? []).map((r) => r.signed),
     keyStates: (keyStates.results ?? []).map((r) => r.signed),
     devices: (devices.results ?? []).map((d) => ({ deviceId: d.device_id, sigPubkey: d.sig_pubkey, encPubkey: d.enc_pubkey, mkWrap: d.mk_wrap })),
+    present,
+    repairTombstone: isExactTombstone(observed) ? { version: 1, repairId: observed.repairId, repairedAt: observed.repairedAt } : null,
   });
 }
 
@@ -165,10 +271,21 @@ export async function putDeviceKeys(env: Env, p: Principal, body: unknown): Prom
   const encPubKey = str(b.encPubKey);
   const mkWrap = str(b.mkWrap);
   if (!deviceId || !sigPubKey || !encPubKey || !mkWrap) return json({ error: "bad_request", message: "missing or oversized field" }, 400);
-  await dbFor(env, p.accountId)
-    .prepare("INSERT OR IGNORE INTO device_keys (device_id, account_id, sig_pubkey, enc_pubkey, mk_wrap, created_at) VALUES (?, ?, ?, ?, ?, ?)")
-    .bind(deviceId, p.accountId, sigPubKey, encPubKey, mkWrap, Date.now())
-    .run();
+  const preflight = await tombstoneFenceResponse(env, p.accountId);
+  if (preflight) return preflight;
+  const res = await dbFor(env, p.accountId)
+    .prepare(`INSERT OR IGNORE INTO device_keys (device_id,account_id,sig_pubkey,enc_pubkey,mk_wrap,created_at)
+      SELECT ?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM account_keys WHERE account_id=? AND recovery_wrap<>? AND recovery_wrap_id<>? AND repair_id IS NULL AND repaired_at IS NULL)
+      AND NOT EXISTS (SELECT 1 FROM account_deletions WHERE account_id=? AND status IN ('purging','done'))`)
+    .bind(deviceId,p.accountId,sigPubKey,encPubKey,mkWrap,Date.now(),p.accountId,GENESIS_TOMBSTONE_SENTINEL,GENESIS_TOMBSTONE_SENTINEL,p.accountId).run();
+  if ((res.meta.changes ?? 0) === 0) {
+    const fence = await tombstoneFenceResponse(env, p.accountId);
+    if (fence) return fence;
+    const real=await dbFor(env,p.accountId).prepare(`SELECT 1 FROM account_keys WHERE account_id=? AND recovery_wrap<>? AND recovery_wrap_id<>? AND repair_id IS NULL AND repaired_at IS NULL`).bind(p.accountId,GENESIS_TOMBSTONE_SENTINEL,GENESIS_TOMBSTONE_SENTINEL).first();
+    if(!real)return json({error:"account_keys_missing"},409);
+    const existing=await dbFor(env,p.accountId).prepare("SELECT 1 FROM device_keys WHERE device_id=? AND account_id=?").bind(deviceId,p.accountId).first();
+    if(!existing)return json({error:"device_write_conflict"},409);
+  }
   return json({ ok: true });
 }
 
@@ -187,11 +304,13 @@ export async function appendRoster(env: Env, p: Principal, body: unknown): Promi
     .prepare(
       `INSERT INTO rosters (account_id, version, signed, created_at)
        SELECT ?, ?, ?, ?
-       WHERE (SELECT COALESCE(MAX(version), -1) + 1 FROM rosters WHERE account_id = ?) = ?`
+       WHERE (SELECT COALESCE(MAX(version), -1) + 1 FROM rosters WHERE account_id = ?) = ?
+       AND EXISTS (SELECT 1 FROM account_keys WHERE account_id=? AND recovery_wrap<>? AND recovery_wrap_id<>? AND repair_id IS NULL AND repaired_at IS NULL)
+       AND NOT EXISTS (SELECT 1 FROM account_deletions WHERE account_id=? AND status IN ('purging','done'))`
     )
-    .bind(p.accountId, version, signed, Date.now(), p.accountId, version)
+    .bind(p.accountId,version,signed,Date.now(),p.accountId,version,p.accountId,GENESIS_TOMBSTONE_SENTINEL,GENESIS_TOMBSTONE_SENTINEL,p.accountId)
     .run();
-  if ((res.meta.changes ?? 0) === 0) return json({ error: "conflict", message: "roster version not next" }, 409);
+  if ((res.meta.changes ?? 0) === 0) return (await tombstoneFenceResponse(env,p.accountId)) ?? json({ error: "conflict", message: "roster version not next" }, 409);
   return json({ ok: true, version });
 }
 
@@ -208,11 +327,13 @@ export async function appendKeyState(env: Env, p: Principal, body: unknown): Pro
     .prepare(
       `INSERT INTO account_key_states (account_id, account_epoch, signed, created_at)
        SELECT ?, ?, ?, ?
-       WHERE (SELECT COALESCE(MAX(account_epoch), -1) + 1 FROM account_key_states WHERE account_id = ?) = ?`
+       WHERE (SELECT COALESCE(MAX(account_epoch), -1) + 1 FROM account_key_states WHERE account_id = ?) = ?
+       AND EXISTS (SELECT 1 FROM account_keys WHERE account_id=? AND recovery_wrap<>? AND recovery_wrap_id<>? AND repair_id IS NULL AND repaired_at IS NULL)
+       AND NOT EXISTS (SELECT 1 FROM account_deletions WHERE account_id=? AND status IN ('purging','done'))`
     )
-    .bind(p.accountId, accountEpoch, signed, Date.now(), p.accountId, accountEpoch)
+    .bind(p.accountId,accountEpoch,signed,Date.now(),p.accountId,accountEpoch,p.accountId,GENESIS_TOMBSTONE_SENTINEL,GENESIS_TOMBSTONE_SENTINEL,p.accountId)
     .run();
-  if ((res.meta.changes ?? 0) === 0) return json({ error: "conflict", message: "epoch not next" }, 409);
+  if ((res.meta.changes ?? 0) === 0) return (await tombstoneFenceResponse(env,p.accountId)) ?? json({ error: "conflict", message: "epoch not next" }, 409);
   return json({ ok: true, accountEpoch });
 }
 
@@ -231,18 +352,26 @@ export async function putWorkspaceKey(env: Env, p: Principal, body: unknown): Pr
   const keyEpoch = nat(b.keyEpoch);
   const kekWrap = str(b.kekWrap);
   if (!workspaceId || keyEpoch === null || !kekWrap) return json({ error: "bad_request", message: "missing or oversized field" }, 400);
+  const preflight = await tombstoneFenceResponse(env,p.accountId);
+  if (preflight) return preflight;
   if (!(await ownsWorkspace(env, p.accountId, workspaceId))) return json({ error: "not_found" }, 404);
-  await dbFor(env, p.accountId)
-    .prepare("INSERT OR IGNORE INTO workspace_keys (workspace_id, account_id, key_epoch, kek_wrap, created_at) VALUES (?, ?, ?, ?, ?)")
-    .bind(workspaceId, p.accountId, keyEpoch, kekWrap, Date.now())
-    .run();
+  const inserted = await dbFor(env,p.accountId).prepare(`INSERT OR IGNORE INTO workspace_keys (workspace_id,account_id,key_epoch,kek_wrap,created_at)
+    SELECT ?,?,?,?,? WHERE EXISTS (SELECT 1 FROM account_keys WHERE account_id=? AND recovery_wrap<>? AND recovery_wrap_id<>? AND repair_id IS NULL AND repaired_at IS NULL)
+    AND NOT EXISTS (SELECT 1 FROM account_deletions WHERE account_id=? AND status IN ('purging','done'))`)
+    .bind(workspaceId,p.accountId,keyEpoch,kekWrap,Date.now(),p.accountId,GENESIS_TOMBSTONE_SENTINEL,GENESIS_TOMBSTONE_SENTINEL,p.accountId).run();
+  if ((inserted.meta.changes ?? 0) === 0) {
+    const fence = await tombstoneFenceResponse(env,p.accountId);
+    if (fence) return fence;
+    const real=await dbFor(env,p.accountId).prepare(`SELECT 1 FROM account_keys WHERE account_id=? AND recovery_wrap<>? AND recovery_wrap_id<>? AND repair_id IS NULL AND repaired_at IS NULL`).bind(p.accountId,GENESIS_TOMBSTONE_SENTINEL,GENESIS_TOMBSTONE_SENTINEL).first();
+    if(!real)return json({error:"account_keys_missing"},409);
+  }
   // Read back the winning wrap (D1 serializes writes, so this is the value that
   // survived the CAS — ours iff we were first-writer, else the pre-existing one).
   const row = await dbFor(env, p.accountId)
     .prepare("SELECT kek_wrap FROM workspace_keys WHERE workspace_id = ? AND key_epoch = ?")
     .bind(workspaceId, keyEpoch)
     .first<{ kek_wrap: string }>();
-  return json({ keyEpoch, kekWrap: row?.kek_wrap ?? kekWrap });
+  return row?json({keyEpoch,kekWrap:row.kek_wrap}):json({error:"account_keys_missing"},409);
 }
 
 /**
@@ -271,18 +400,20 @@ export async function admitDevice(env: Env, p: Principal, body: unknown): Promis
   }
   const now = Date.now();
   const guard = `(SELECT COALESCE(MAX(version), -1) + 1 FROM rosters WHERE account_id = ?) = ?`;
+  const mutationGuard = `EXISTS (SELECT 1 FROM account_keys WHERE account_id=? AND recovery_wrap<>? AND recovery_wrap_id<>? AND repair_id IS NULL AND repaired_at IS NULL)
+    AND NOT EXISTS (SELECT 1 FROM account_deletions WHERE account_id=? AND status IN ('purging','done'))`;
   const results = await dbFor(env, p.accountId).batch([
     // Device first — its guard sees MAX(version) before the roster append below.
     dbFor(env, p.accountId)
-      .prepare(`INSERT INTO device_keys (device_id, account_id, sig_pubkey, enc_pubkey, mk_wrap, created_at) SELECT ?, ?, ?, ?, ?, ? WHERE ${guard}`)
-      .bind(deviceId, p.accountId, sigPubKey, encPubKey, mkWrap, now, p.accountId, version),
+      .prepare(`INSERT INTO device_keys (device_id, account_id, sig_pubkey, enc_pubkey, mk_wrap, created_at) SELECT ?, ?, ?, ?, ?, ? WHERE ${guard} AND ${mutationGuard}`)
+      .bind(deviceId,p.accountId,sigPubKey,encPubKey,mkWrap,now,p.accountId,version,p.accountId,GENESIS_TOMBSTONE_SENTINEL,GENESIS_TOMBSTONE_SENTINEL,p.accountId),
     dbFor(env, p.accountId)
-      .prepare(`INSERT INTO rosters (account_id, version, signed, created_at) SELECT ?, ?, ?, ? WHERE ${guard}`)
-      .bind(p.accountId, version, signed, now, p.accountId, version),
+      .prepare(`INSERT INTO rosters (account_id, version, signed, created_at) SELECT ?, ?, ?, ? WHERE ${guard} AND ${mutationGuard}`)
+      .bind(p.accountId,version,signed,now,p.accountId,version,p.accountId,GENESIS_TOMBSTONE_SENTINEL,GENESIS_TOMBSTONE_SENTINEL,p.accountId),
   ]);
   // Roster guard matched zero rows → version wasn't next → nothing applied. Client
   // refetches, rebuilds the roster parent/version (reusing its keypair), retries.
-  if ((results[1]?.meta.changes ?? 0) === 0) return json({ error: "conflict", message: "roster version not next" }, 409);
+  if ((results[1]?.meta.changes ?? 0) === 0) return (await tombstoneFenceResponse(env,p.accountId)) ?? json({ error: "conflict", message: "roster version not next" }, 409);
   return json({ ok: true, version });
 }
 
