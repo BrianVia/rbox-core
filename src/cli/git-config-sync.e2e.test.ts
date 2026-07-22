@@ -622,16 +622,59 @@ test("§11 E2E: concurrent daemon/CLI process saves preserve newer-source atomic
       `const seq = Number(seqText);\n` +
       `const snapshot = await loadState(root, stream);\n` +
       `await fs.writeFile(path.join(root, \`.ready-\${role}\`), "ready");\n` +
-      `while (!(await Promise.all(["daemon", "cli"].map(r => fs.access(path.join(root, \`.ready-\${r}\`)).then(() => true).catch(() => false)))).every(Boolean)) await Bun.sleep(2);\n` +
-      `if (role === "daemon") await Bun.sleep(40);\n` +
+      `while (!(await fs.stat(path.join(root, \`.release-\${role}\`)).then(() => true, () => false))) await Bun.sleep(2);\n` +
       `const fill = role === "daemon" ? "d" : "c";\n` +
       `const section = { bundleSha: fill.repeat(64), bundleEncSha: (role === "daemon" ? "e" : "f").repeat(64), bundleCipherSize: 1, head: "ref: refs/heads/main", refs: { "refs/heads/main": "1".repeat(40) }, refScope: "all", generatedAt: role };\n` +
       `await saveStateSource(root, snapshot, { expectedStream: stream, sourceGlobalSeq: seq, globalManifest: { generatedAt: role, files: [], manifestSchema: 2, gitRepos: { repo: section } }, observedRepos: ["repo"], values: { bases: { repo: section } } });\n`
   );
   const daemon = Bun.spawn([process.execPath, worker, rootA, stream, "daemon", "1"], { stdout: "pipe", stderr: "pipe" });
   const cli = Bun.spawn([process.execPath, worker, rootA, stream, "cli", "2"], { stdout: "pipe", stderr: "pipe" });
-  const [daemonExit, cliExit] = await Promise.all([daemon.exited, cli.exited]);
-  expect({ daemonExit, cliExit }).toEqual({ daemonExit: 0, cliExit: 0 });
+  const daemonStdout = new Response(daemon.stdout).text();
+  const daemonStderr = new Response(daemon.stderr).text();
+  const cliStdout = new Response(cli.stdout).text();
+  const cliStderr = new Response(cli.stderr).text();
+  const ceilingMs = 10_000;
+  const waitForMarker = async (marker: string, child: typeof daemon, stderr: Promise<string>): Promise<void> => {
+    const deadline = Date.now() + ceilingMs;
+    while (!(await fs.stat(marker).then(() => true, () => false))) {
+      if (child.exitCode !== null) {
+        throw new Error(`state-save child exited ${child.exitCode} before ${path.basename(marker)}: ${await stderr}`);
+      }
+      if (Date.now() >= deadline) {
+        child.kill();
+        await child.exited;
+        throw new Error(`timed out waiting for ${path.basename(marker)}: ${await stderr}`);
+      }
+      await Bun.sleep(5);
+    }
+  };
+  const waitForExit = async (role: string, child: typeof daemon, stderr: Promise<string>): Promise<number> => {
+    const deadline = Date.now() + ceilingMs;
+    while (child.exitCode === null && Date.now() < deadline) await Bun.sleep(5);
+    if (child.exitCode === null) {
+      child.kill();
+      await child.exited;
+      throw new Error(`timed out waiting for ${role} state-save child: ${await stderr}`);
+    }
+    return child.exitCode;
+  };
+  try {
+    await Promise.all([
+      waitForMarker(path.join(rootA, ".ready-daemon"), daemon, daemonStderr),
+      waitForMarker(path.join(rootA, ".ready-cli"), cli, cliStderr),
+    ]);
+    await fs.writeFile(path.join(rootA, ".release-cli"), "release");
+    const cliExit = await waitForExit("cli", cli, cliStderr);
+    if (cliExit !== 0) throw new Error(`cli state-save child exited ${cliExit}: ${await cliStderr}`);
+    await fs.writeFile(path.join(rootA, ".release-daemon"), "release");
+    const daemonExit = await waitForExit("daemon", daemon, daemonStderr);
+    if (daemonExit !== 0) throw new Error(`daemon state-save child exited ${daemonExit}: ${await daemonStderr}`);
+    expect({ daemonExit, cliExit }).toEqual({ daemonExit: 0, cliExit: 0 });
+  } finally {
+    if (daemon.exitCode === null) daemon.kill();
+    if (cli.exitCode === null) cli.kill();
+    await Promise.allSettled([daemon.exited, cli.exited, daemonStdout, daemonStderr, cliStdout, cliStderr]);
+  }
   const final = await state(rootA, cfgA);
   expect(final.lastSyncedSequence).toBe(2);
   expect(final.lastSyncedManifest.generatedAt).toBe("cli");
