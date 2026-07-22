@@ -7,6 +7,7 @@ import { RBOX_VERSION } from "./version.js";
 import { parseSemver, semverGt } from "./semver.js";
 import { isStandaloneBinary } from "./runtime.js";
 import { currentWorkspaceId, isDaemonProcess, parseDaemonPid, startDaemon, stopDaemon } from "./daemon-control.js";
+import { readAmbientDaemonStatusRecord } from "./daemon/ambient-status.js";
 import { readDesiredDaemonRows, resumeDesiredDaemon, type DesiredStateRow } from "./autostart-cmd.js";
 import { workspaceKey } from "./rbox-paths.js";
 import { fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
@@ -49,7 +50,21 @@ export interface UpgradeDaemonDeps {
   log?: (line: string) => void;
 }
 
-export async function restartDaemonsAfterUpgrade(deps: UpgradeDaemonDeps = {}): Promise<void> {
+export interface UpgradeCommandDeps {
+  isStandaloneBinary?: typeof isStandaloneBinary;
+  verifyAndParseManifest?: typeof verifyAndParseManifest;
+}
+
+class UpgradeDaemonRestartError extends Error {
+  constructor(readonly attempted: number) {
+    super("upgrade installed, but one or more live daemons could not be restarted");
+  }
+}
+
+export async function restartDaemonsAfterUpgrade(
+  deps: UpgradeDaemonDeps = {},
+  opts: { staleOnly?: boolean } = {},
+): Promise<number> {
   const desiredRows = await (deps.readDesiredDaemonRows ?? readDesiredDaemonRows)();
   const desiredByKey = new Map<string, DesiredStateRow>(desiredRows.map((row) => [row.key, row]));
   const owned = deps.isDaemonProcess ?? isDaemonProcess;
@@ -59,10 +74,11 @@ export async function restartDaemonsAfterUpgrade(deps: UpgradeDaemonDeps = {}): 
   const log = deps.log ?? console.log;
   let entries: import("node:fs").Dirent[] = [];
   try { entries = await fsp.readdir(daemonsDir(), { withFileTypes: true }); } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
     throw error;
   }
   let failed = false;
+  let attempted = 0;
   for (const entry of entries.filter((item) => item.isDirectory()).sort((a, b) => a.name.localeCompare(b.name))) {
     const key = entry.name;
     let pid: number | undefined;
@@ -87,6 +103,11 @@ export async function restartDaemonsAfterUpgrade(deps: UpgradeDaemonDeps = {}): 
       log(`daemon ${key}: not restarted (live runtime has no valid desired workspace binding)`);
       continue;
     }
+    if (opts.staleOnly) {
+      const ambient = readAmbientDaemonStatusRecord(root);
+      if (ambient.kind === "ok" && ambient.status.daemonVersion === RBOX_VERSION) continue;
+    }
+    attempted++;
     try {
       await stop(root);
       if (row.desired.state === "stopped") {
@@ -105,7 +126,30 @@ export async function restartDaemonsAfterUpgrade(deps: UpgradeDaemonDeps = {}): 
       log(`daemon ${key}: restart failed; run rbox stop && rbox start in that workspace`);
     }
   }
-  if (failed) throw new Error("upgrade installed, but one or more live daemons could not be restarted");
+  if (failed) throw new UpgradeDaemonRestartError(attempted);
+  return attempted;
+}
+
+export async function restartStaleDaemonsIfAny(deps: UpgradeDaemonDeps = {}): Promise<void> {
+  const log = deps.log ?? console.log;
+  const buffered: string[] = [];
+  let attempted = 0;
+  try {
+    attempted = await restartDaemonsAfterUpgrade({ ...deps, log: (line) => buffered.push(line) }, { staleOnly: true });
+  } catch (error) {
+    if (error instanceof UpgradeDaemonRestartError) attempted = error.attempted;
+    if (attempted > 0) {
+      log(`binary already ${RBOX_VERSION}; restarting daemon(s) still running an older version`);
+    }
+    for (const line of buffered) log(line);
+    throw error;
+  }
+  if (attempted > 0) {
+    log(`binary already ${RBOX_VERSION}; restarting daemon(s) still running an older version`);
+  } else {
+    log(`already up to date (${RBOX_VERSION})`);
+  }
+  for (const line of buffered) log(line);
 }
 
 async function recordVerifiedRelease(version: string): Promise<void> {
@@ -188,8 +232,8 @@ async function downloadToTemp(url: string, dir: string): Promise<{ tmp: string; 
   }
 }
 
-export async function upgradeCmd(remoteUrl: string, opts: { check?: boolean; daemonDeps?: UpgradeDaemonDeps } = {}): Promise<void> {
-  if (!isStandaloneBinary()) {
+export async function upgradeCmd(remoteUrl: string, opts: { check?: boolean; daemonDeps?: UpgradeDaemonDeps; commandDeps?: UpgradeCommandDeps } = {}): Promise<void> {
+  if (!(opts.commandDeps?.isStandaloneBinary ?? isStandaloneBinary)()) {
     throw new Error("`rbox upgrade` only works on an installed binary — you're running from source. Use git, or install via the one-liner.");
   }
   if (!/^https:\/\//.test(remoteUrl) && !/^http:\/\/localhost(:|\/|$)/.test(remoteUrl)) {
@@ -201,12 +245,13 @@ export async function upgradeCmd(remoteUrl: string, opts: { check?: boolean; dae
 
   // 1. Fetch manifest + detached signature (RAW bytes) and verify BEFORE trusting.
   const [manifestBytes, sigBytes] = await Promise.all([fetchBytes(`${remoteUrl}/version`), fetchBytes(`${remoteUrl}/version.sig`)]);
-  const manifest = verifyAndParseManifest(manifestBytes, sigBytes);
+  const manifest = (opts.commandDeps?.verifyAndParseManifest ?? verifyAndParseManifest)(manifestBytes, sigBytes);
 
   // 2. Forward-only: never "upgrade" to an older/equal version (anti-rollback).
   const floor = await highestVerified();
   if (!semverGt(manifest.version, floor)) {
-    console.log(`already up to date (${RBOX_VERSION})`);
+    if (opts.check) console.log(`already up to date (${RBOX_VERSION})`);
+    else await restartStaleDaemonsIfAny(opts.daemonDeps);
     return;
   }
   const art = manifest.artifacts[name];
@@ -239,7 +284,7 @@ export async function upgradeCmd(remoteUrl: string, opts: { check?: boolean; dae
   const releaseLock = acquireUpgradeLock();
   try {
     if (!semverGt(manifest.version, await highestVerified())) {
-      console.log(`already up to date (${RBOX_VERSION})`);
+      await restartStaleDaemonsIfAny(opts.daemonDeps);
       return;
     }
     const { tmp, sha256 } = await downloadToTemp(`${remoteUrl}/bin/${art.path}`, dir);

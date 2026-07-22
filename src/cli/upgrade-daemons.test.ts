@@ -2,9 +2,10 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { restartDaemonsAfterUpgrade } from "./upgrade-cmd.js";
+import { restartDaemonsAfterUpgrade, restartStaleDaemonsIfAny } from "./upgrade-cmd.js";
 import { workspaceKey } from "./rbox-paths.js";
 import type { DesiredStateRow } from "./autostart-cmd.js";
+import { RBOX_VERSION } from "./version.js";
 
 let home: string;
 const rows: DesiredStateRow[] = [];
@@ -42,6 +43,121 @@ async function runtime(name: string, pid: number, options: { state?: "running" |
   }
   return { root, key };
 }
+
+async function writeAmbient(key: string, daemonVersion?: string): Promise<void> {
+  await fs.writeFile(path.join(home, ".rbox", "daemons", key, "daemon.status.json"), `${JSON.stringify({
+    schemaVersion: 1,
+    ...(daemonVersion === undefined ? {} : { daemonVersion }),
+    state: "synced",
+    heartbeatAt: "2026-07-22T00:00:00.000Z",
+    sequence: null,
+    lastSyncedAt: null,
+  })}\n`);
+}
+
+test("current binary restarts an older daemon in its pending pull-only mode before printing restart details", async () => {
+  const target = await runtime("older", 81, { pendingModeIntent: "pull-only" });
+  await writeAmbient(target.key, "1.7.18");
+  const actions: string[] = [];
+  const logs: string[] = [];
+  await restartStaleDaemonsIfAny({
+    readDesiredDaemonRows: async () => rows,
+    isDaemonProcess: () => true,
+    currentWorkspaceId: () => "ws-older",
+    stopDaemon: async () => void actions.push("stop"),
+    startDaemon: async (_root, opts) => { actions.push(`start:${opts.pullOnly === true}:${opts.modeIntent}`); return "started"; },
+    log: (line) => logs.push(line),
+  });
+  expect(actions).toEqual(["stop", "start:true:pending"]);
+  expect(logs[0]).toBe(`binary already ${RBOX_VERSION}; restarting daemon(s) still running an older version`);
+  expect(logs[1]).toContain("restarted (pull-only)");
+  expect(logs.join("\n")).not.toContain("already up to date");
+});
+
+test("current binary leaves a live current-version daemon untouched and prints already up to date", async () => {
+  const target = await runtime("current", 82);
+  await writeAmbient(target.key, RBOX_VERSION);
+  const actions: string[] = [];
+  const logs: string[] = [];
+  await restartStaleDaemonsIfAny({
+    readDesiredDaemonRows: async () => rows,
+    isDaemonProcess: () => true,
+    currentWorkspaceId: () => "ws-current",
+    stopDaemon: async () => void actions.push("stop"),
+    startDaemon: async () => { actions.push("start"); return "started"; },
+    log: (line) => logs.push(line),
+  });
+  expect(actions).toEqual([]);
+  expect(logs).toEqual([`already up to date (${RBOX_VERSION})`]);
+});
+
+test("stale-only restart treats absent malformed and versionless ambient status as stale", async () => {
+  for (const [index, status] of ["absent", "malformed", "versionless"].entries()) {
+    rows.length = 0;
+    const target = await runtime(`legacy-${status}`, 90 + index);
+    if (status === "malformed") {
+      await fs.writeFile(path.join(home, ".rbox", "daemons", target.key, "daemon.status.json"), "{not-json\n");
+    } else if (status === "versionless") {
+      await writeAmbient(target.key);
+    }
+    const actions: string[] = [];
+    await restartDaemonsAfterUpgrade({
+      readDesiredDaemonRows: async () => rows,
+      isDaemonProcess: (pid) => pid === 90 + index,
+      currentWorkspaceId: () => `ws-legacy-${status}`,
+      stopDaemon: async () => void actions.push("stop"),
+      startDaemon: async () => { actions.push("start"); return "started"; },
+      log: () => {},
+    }, { staleOnly: true });
+    expect(actions).toEqual(["stop", "start"]);
+  }
+});
+
+test("current binary with no live daemons prints already up to date without restart output", async () => {
+  await runtime("dead", 83);
+  const logs: string[] = [];
+  const actions: string[] = [];
+  await restartStaleDaemonsIfAny({
+    readDesiredDaemonRows: async () => rows,
+    isDaemonProcess: () => false,
+    stopDaemon: async () => void actions.push("stop"),
+    startDaemon: async () => { actions.push("start"); return "started"; },
+    log: (line) => logs.push(line),
+  });
+  expect(actions).toEqual([]);
+  expect(logs).toEqual([`already up to date (${RBOX_VERSION})`]);
+});
+
+test("stale-only restart failure prints the stale summary first and preserves the aggregate error", async () => {
+  const target = await runtime("stale-failure", 84);
+  await writeAmbient(target.key, "1.7.18");
+  const logs: string[] = [];
+  await expect(restartStaleDaemonsIfAny({
+    readDesiredDaemonRows: async () => rows,
+    isDaemonProcess: () => true,
+    currentWorkspaceId: () => "ws-stale-failure",
+    stopDaemon: async () => { throw new Error("private failure"); },
+    log: (line) => logs.push(line),
+  })).rejects.toThrow("upgrade installed, but one or more live daemons could not be restarted");
+  expect(logs[0]).toBe(`binary already ${RBOX_VERSION}; restarting daemon(s) still running an older version`);
+  expect(logs[1]).toContain("restart failed; run rbox stop && rbox start");
+  expect(logs.join("\n")).not.toContain("already up to date");
+});
+
+test("full-upgrade restart ignores a current ambient daemon version", async () => {
+  const target = await runtime("full-swap", 85);
+  await writeAmbient(target.key, RBOX_VERSION);
+  const actions: string[] = [];
+  await restartDaemonsAfterUpgrade({
+    readDesiredDaemonRows: async () => rows,
+    isDaemonProcess: () => true,
+    currentWorkspaceId: () => "ws-full-swap",
+    stopDaemon: async () => void actions.push("stop"),
+    startDaemon: async () => { actions.push("start"); return "started"; },
+    log: () => {},
+  });
+  expect(actions).toEqual(["stop", "start"]);
+});
 
 test("managed upgrade restarts every live workspace in stable key order and preserves pull-only", async () => {
   await runtime("zeta", 101, { pullOnly: true });
