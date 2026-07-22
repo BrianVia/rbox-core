@@ -16,6 +16,8 @@ import {
 } from "./doctor-cmd.js";
 import { saveDevice } from "./e2ee-keystore.js";
 import { bootstrapAccount } from "../engine/e2ee/index.js";
+import { saveCredentials } from "./credentials.js";
+import { GENESIS_PENDING_MESSAGE, publishPrepublishMarker } from "./genesis-durable.js";
 
 let home: string;
 let logs: string[];
@@ -106,6 +108,34 @@ function recordFetches(): string[] {
   }) as typeof fetch;
   return calls;
 }
+
+test("doctor remains available during pending genesis, reports the resume path, and refuses diagnostics upload", async () => {
+  const root = await makeWorkspace();
+  const accountId = "acct_cccccccccccccccc";
+  await saveCredentials({ token: "tok", deviceId: "dev_1", accountId, remoteUrl: "https://api.test" });
+  await publishPrepublishMarker({
+    version: 1,
+    accountId,
+    deviceId: "dev_1",
+    repairId: null,
+    startedAt: "2026-07-22T12:00:00.000Z",
+    phase: "prepublish",
+  });
+  const calls = recordFetches();
+  try {
+    const context = await collectDoctorContext(root);
+    expect(context.checks.enrollment).toMatchObject({
+      ok: false,
+      message: "genesis enrollment is pending",
+      hint: GENESIS_PENDING_MESSAGE,
+    });
+
+    await expect(doctorCmd(root, { report: true, yes: true, diagnostics: true })).rejects.toThrow(GENESIS_PENDING_MESSAGE);
+    expect(calls.some((url) => url.endsWith("/v1/diagnostics"))).toBe(false);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
 
 test("review L1: diagnostics classifies stale-unattributed before generic lock fallback", () => {
   const redacted = redactGitLogLines(

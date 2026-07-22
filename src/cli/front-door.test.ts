@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -10,6 +11,8 @@ import {
   type FrontDoorAction,
   type UntrackedMenuAction,
 } from "./front-door.js";
+import { bootstrapAccount } from "../engine/e2ee/index.js";
+import { saveDevice } from "./e2ee-keystore.js";
 
 function simulatedExitPromptError(): Error {
   const err = new Error("prompt aborted");
@@ -53,6 +56,63 @@ test("inside workspace renders status before picker and Exit runs no action", as
     },
   });
   expect(calls).toEqual(["status:/work/root", "prompt"]);
+});
+
+test("front door routes an exact old-flow device+MK pair through server classification before rendering status", async () => {
+  const priorHome = process.env.RBOX_HOME;
+  const priorFetch = globalThis.fetch;
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-front-door-genesis-"));
+  const accountId = "acct_eeeeeeeeeeeeeeee";
+  const deviceId = "dev_legacy";
+  process.env.RBOX_HOME = home;
+  try {
+    const boot = await bootstrapAccount(accountId, deviceId, 1_900_000_000_000);
+    await saveDevice(boot.secrets);
+    const present = { rosters: 1, keyStates: 1, devices: 1, workspaces: 0, workspaceKeys: 0, e2eePairingTokens: 0 };
+    let fetches = 0;
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      fetches++;
+      expect(String(input)).toBe("https://api.test/v1/keys/account");
+      return new Response(JSON.stringify({
+        genesisPresenceVersion: 1,
+        recoveryWrap: JSON.stringify(boot.upload.recoveryWrap),
+        recoveryWrapId: boot.upload.recoveryWrapId,
+        claimCreatedAt: 1_900_000_000_000,
+        genesisDeviceId: deviceId,
+        rosters: [JSON.stringify(boot.upload.genesisRoster)],
+        keyStates: [JSON.stringify(boot.upload.genesisKeyState)],
+        devices: [{ deviceId, sigPubkey: boot.upload.device.sigPubKey, encPubkey: boot.upload.device.encPubKey, mkWrap: JSON.stringify(boot.upload.device.mkWrap) }],
+        present,
+        repairTombstone: null,
+      }));
+    }) as typeof fetch;
+    let rendered = 0;
+    const loaded = {
+      state: "valid" as const,
+      source: "disk" as const,
+      credentials: { v: 1 as const, accountId, deviceId, token: "tok", remoteUrl: "https://api.test" },
+      legacy: false,
+      extensions: {},
+    };
+
+    await runFrontDoor("/work/root", {
+      loadCredentials: async () => loaded,
+      readAccountProfile: async () => ({ accountId, email: null, signInMethod: null, plan: "pro" }),
+      statusCmd: async () => {
+        rendered++;
+        return { daemonRunning: false };
+      },
+      promptSelect: async () => "exit",
+    });
+
+    expect(fetches).toBe(1);
+    expect(rendered).toBe(1);
+  } finally {
+    globalThis.fetch = priorFetch;
+    if (priorHome === undefined) delete process.env.RBOX_HOME;
+    else process.env.RBOX_HOME = priorHome;
+    await fs.rm(home, { recursive: true, force: true });
+  }
 });
 
 for (const [action, expected] of [

@@ -15,6 +15,8 @@ import { semverGt } from "./semver.js";
 import { style } from "./style.js";
 import { friendlyHttpError } from "./http-error.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
+import { pendingGenesisState } from "./genesis-enrollment.js";
+import { GENESIS_PENDING_MESSAGE } from "./genesis-durable.js";
 import type { E2eeRemote } from "./e2ee-remote.js";
 import { readLockingHealth } from "./sync-mutex.js";
 import { ResetCorruptionError } from "./reset-io.js";
@@ -238,6 +240,7 @@ async function checkCredentials(creds: Credentials | undefined): Promise<DoctorC
 async function checkEnrollment(creds: Credentials | undefined): Promise<DoctorCheck> {
   if (!creds?.accountId) return { ok: false, label: "encryption", message: "credential has no account id", hint: "run `rbox login` again" };
   try {
+    if(await pendingGenesisState(creds.accountId))return{ok:false,label:"encryption",message:"genesis enrollment is pending",hint:GENESIS_PENDING_MESSAGE};
     const loaded = await loadDevice(creds.accountId);
     if (!loaded) return { ok: false, label: "encryption", message: "device key is missing", hint: "run `rbox pair` or `rbox key recover`" };
     if (!("secrets" in loaded)) return { ok: false, label: "encryption", message: "device key is present but master key is missing", hint: "run `rbox key recover` or sync once to self-heal if possible" };
@@ -647,6 +650,7 @@ export async function doctorCmd(root: string, opts: DoctorCmdOptions): Promise<v
         const loaded = ctx.credentialResult ?? (ctx.creds
           ? { state: "valid" as const, source: "disk" as const, credentials: { v: 1, ...ctx.creds }, legacy: false, extensions: {} }
           : { state: "absent" as const, path: "credentials.json" });
+        if(loaded.state==="valid"&&loaded.credentials.accountId&&await pendingGenesisState(loaded.credentials.accountId))throw new Error(GENESIS_PENDING_MESSAGE);
         await uploadDiagnostics(loaded, bundle);
       }
       else console.log("diagnostics report not uploaded");

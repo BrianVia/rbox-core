@@ -52,6 +52,8 @@ import { deferralHygieneDetailKey, reconcileGitDeferrals, type GitBusyDisplayDet
 import { inspectResetJournalSafety } from "./reset-halt-inspection.js";
 import { readResetHaltHealth } from "./reset-health.js";
 import { promotePendingModeIntent } from "./autostart-cmd.js";
+import { pendingGenesisState } from "./genesis-enrollment.js";
+import { GENESIS_PENDING_MESSAGE } from "./genesis-durable.js";
 
 interface StatusAccountJson {
   plan: string | null;
@@ -347,6 +349,7 @@ export async function statusCmdWithDeps(
   assertPresentationFlags(opts);
   const loadedCredentials = await (deps.loadCredentials ?? loadCredentials)();
   const creds = loadedCredentials.state === "valid" ? loadedCredentials.credentials : undefined;
+  const genesisPending=Boolean(creds?.accountId&&await pendingGenesisState(creds.accountId));
   const rawCfg = await loadConfig(root);
   const cfg = { ...rawCfg, remoteUrl: creds?.remoteUrl ?? rawCfg.remoteUrl };
   const daemonBinding = deps.daemonBindingStatus(root, cfg.remoteWorkspaceId);
@@ -647,6 +650,7 @@ export async function statusCmdWithDeps(
       trash: trash && trash.files > 0 ? { bytes: trash.bytes, count: trash.files } : null,
       account: accountJson,
       credential: credentialStatusJson(loadedCredentials),
+      ...(genesisPending?{genesisPending:true,resumeInstruction:GENESIS_PENDING_MESSAGE}:{}),
       crypto,
       git: {
         ...(gitCapability ? { capability: gitCapability } : {}),
@@ -751,6 +755,7 @@ export async function statusCmdWithDeps(
     };
     const rendered = renderBriefStatus(brief);
     for (const line of rendered.lines) console.log(line);
+    if(genesisPending)console.log(`  ${style.yellow(GENESIS_PENDING_MESSAGE)}`);
     if (counts.conflictSnapshots.prunable > 0) {
       console.log(`  conflict snapshots: ${counts.conflictSnapshots.total} (${counts.conflictSnapshots.prunable} prunable)`);
     }
@@ -780,6 +785,7 @@ export async function statusCmdWithDeps(
     ? `${style.cyan(cfg.name)} ${style.dim("@")} ${root} ${style.dim(`(${shortWorkspaceId(cfg.remoteWorkspaceId)})`)}`
     : `${style.cyan(cfg.remoteWorkspaceId)} ${style.dim("@")} ${root}`;
   console.log(`${style.bold("workspace")} ${wsLabel} ${style.dim(`· rbox ${RBOX_VERSION}`)}`);
+  if(genesisPending)console.log(`  ${style.yellow(GENESIS_PENDING_MESSAGE)}`);
   const statusSnapshot = {
     added: counts.added,
     changed: counts.changed,

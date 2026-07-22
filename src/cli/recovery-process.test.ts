@@ -28,7 +28,7 @@ test("key recover reaches enrollment instead of silently exiting after phrase pa
         NO_COLOR: "1",
         RBOX_API: `http://127.0.0.1:${server.port}`,
         RBOX_API_QUIET: "1",
-        RBOX_ACCOUNT_ID: "acct_recoveryprocess",
+        RBOX_ACCOUNT_ID: "acct_7265636f76657279",
         RBOX_DEVICE_ID: "dev_recovery_process",
         RBOX_HOME: home,
         RBOX_TOKEN: "token_recovery_process",

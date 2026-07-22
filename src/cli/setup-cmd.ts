@@ -30,7 +30,7 @@ import { rootHasAdoptableContent } from "./adopt-inventory.js";
 import { collapseHome, interpretWorkspaceNameAnswer } from "./init-plan.js";
 import { EXISTING_ACCOUNT_ENROLLMENT_MESSAGE, login, pairCreate, redeemPair, runGenesisEnrollment } from "./auth-cmd.js";
 import { enrollViaPrevalidatedRecovery, PairingTokenShapeError, parsePairingToken } from "./e2ee-client.js";
-import { pendingGenesisState } from "./genesis-enrollment.js";
+import { genesisClassifierConsultationNeeded, pendingGenesisState } from "./genesis-enrollment.js";
 import { phraseToRk } from "../engine/e2ee/index.js";
 import { enableAutostart, startDaemonAndRecordDesired } from "./autostart-cmd.js";
 import { credentialsForStrictFlow, loadCredentials, type CredentialLoadResult } from "./credentials.js";
@@ -284,7 +284,12 @@ export async function runSetup(opts: {
 /** The enrolled account id, or undefined when signed out / not enrolled. */
 export async function enrolledAccountId(loaded?: CredentialLoadResult): Promise<string | undefined> {
   const creds = credentialsForStrictFlow(loaded ?? await loadCredentials());
-  if(!creds?.accountId||await pendingGenesisState(creds.accountId))return undefined;
+  if(!creds?.accountId)return undefined;
+  if(await genesisClassifierConsultationNeeded(creds.accountId)){
+    if(!creds.deviceId)return undefined;
+    const result=await runGenesisEnrollment(new RboxApi(creds.remoteUrl,creds.token,"",""),{accountId:creds.accountId,deviceId:creds.deviceId});
+    if(result==="enrolled")return creds.accountId;
+  }
   return await hasDevice(creds.accountId)?creds.accountId:undefined;
 }
 
@@ -516,7 +521,7 @@ export async function resolveEnrollment(remote: string, deps: ResolveEnrollmentD
   // There must be credentials here — this is only reached once we know we're authorized.
   const loadedCredentials = await (deps.loadCredentials ?? loadCredentials)();
   const creds = credentialsForStrictFlow(loadedCredentials);
-  if(creds?.accountId&&creds.deviceId&&await pendingGenesisState(creds.accountId)){
+  if(creds?.accountId&&creds.deviceId&&await genesisClassifierConsultationNeeded(creds.accountId)){
     const resumeApi=(deps.makeApi??((remoteUrl,token)=>new RboxApi(remoteUrl,token,"","")))(creds.remoteUrl??remote,creds.token);
     const resumed=await(deps.runGenesisEnrollment??runGenesisEnrollment)(resumeApi,{accountId:creds.accountId,deviceId:creds.deviceId});
     if(resumed==="enrolled")return true;

@@ -8,6 +8,7 @@ import { loadCredentials } from "./credentials.js";
 import { loadDevice } from "./e2ee-keystore.js";
 import { readRecoveryKitRecord } from "./recovery-kit.js";
 import { style } from "./style.js";
+import { pendingGenesisState } from "./genesis-enrollment.js";
 
 interface UninstallDeps {
   home?: string;
@@ -26,6 +27,7 @@ async function keystoreBackupAtRisk(): Promise<boolean | "unknown"> {
   if (loaded.state !== "valid") return loaded.state === "absent" ? false : "unknown";
   const creds = loaded.credentials;
   if (!creds.accountId) return false;
+  if (await pendingGenesisState(creds.accountId)) return true;
   const [device, kit] = await Promise.all([loadDevice(creds.accountId), readRecoveryKitRecord(creds.accountId)]);
   return device !== undefined && kit === undefined;
 }

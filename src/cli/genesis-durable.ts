@@ -30,7 +30,15 @@ export type HardenedWriteStep =
 
 export interface HardenedWriteOptions {
   mode?: number;
+  /** Legacy pre-operation hook retained for existing callers. */
   onStep?: (step: HardenedWriteStep) => void | Promise<void>;
+  /** Crash-test seam on both sides of every durability operation. */
+  onBoundary?: (step: HardenedWriteStep, boundary: "before" | "after") => void | Promise<void>;
+}
+
+async function writeBoundary(options:HardenedWriteOptions,step:HardenedWriteStep,boundary:"before"|"after"):Promise<void>{
+  await options.onBoundary?.(step,boundary);
+  if(boundary==="before")await options.onStep?.(step);
 }
 
 async function regularOrAbsent(file: string): Promise<void> {
@@ -46,40 +54,50 @@ async function regularOrAbsent(file: string): Promise<void> {
 export async function hardenedWrite(file: string, bytes: string | Uint8Array, options: HardenedWriteOptions = {}): Promise<void> {
   const data = typeof bytes === "string" ? utf8(bytes) : bytes;
   const dir = path.dirname(file);
-  await options.onStep?.("ancestor-mkdir");
+  await writeBoundary(options,"ancestor-mkdir","before");
   const created = await ensureDirectoryChain(dir, "genesis directory");
   for (const createdDir of created) await fs.chmod(createdDir, DIR_MODE);
-  await options.onStep?.("ancestor-fsync");
+  await writeBoundary(options,"ancestor-mkdir","after");
+  await writeBoundary(options,"ancestor-fsync","before");
   await fsyncCreatedDirectoryAncestors(dir, created);
+  await writeBoundary(options,"ancestor-fsync","after");
   await regularOrAbsent(file);
   const tmp = path.join(dir, `.rbox-genesis-tmp-${process.pid}-${tempCounter++}-${path.basename(file)}`);
   let handle: fs.FileHandle | undefined;
   try {
-    await options.onStep?.("temp-create");
+    await writeBoundary(options,"temp-create","before");
     handle = await fs.open(tmp, "wx", options.mode ?? FILE_MODE);
-    await options.onStep?.("temp-write");
+    await writeBoundary(options,"temp-create","after");
+    await writeBoundary(options,"temp-write","before");
     await handle.writeFile(data);
     await handle.chmod(options.mode ?? FILE_MODE);
-    await options.onStep?.("temp-fsync");
+    await writeBoundary(options,"temp-write","after");
+    await writeBoundary(options,"temp-fsync","before");
     await handle.sync();
-    await options.onStep?.("temp-close");
+    await writeBoundary(options,"temp-fsync","after");
+    await writeBoundary(options,"temp-close","before");
     await handle.close();
     handle = undefined;
-    await options.onStep?.("rename");
+    await writeBoundary(options,"temp-close","after");
+    await writeBoundary(options,"rename","before");
     await fs.rename(tmp, file);
+    await writeBoundary(options,"rename","after");
   } catch (error) {
     await handle?.close().catch(() => {});
     await fs.rm(tmp, { force: true }).catch(() => {});
     throw error;
   }
-  await options.onStep?.("read-back");
+  await writeBoundary(options,"read-back","before");
   const readBack = await fs.readFile(file);
   if (!Buffer.from(readBack).equals(Buffer.from(data))) throw new Error(`genesis exact read-back failed: ${path.basename(file)}`);
-  await options.onStep?.("published-file-fsync");
+  await writeBoundary(options,"read-back","after");
+  await writeBoundary(options,"published-file-fsync","before");
   const published = await fs.open(file, "r");
   try { await published.sync(); } finally { await published.close(); }
-  await options.onStep?.("parent-fsync");
+  await writeBoundary(options,"published-file-fsync","after");
+  await writeBoundary(options,"parent-fsync","before");
   await fsyncDirectory(dir);
+  await writeBoundary(options,"parent-fsync","after");
 }
 
 export async function hardenedUnlink(file: string): Promise<void> {
@@ -105,6 +123,11 @@ export async function hardenedRename(source: string, destination: string): Promi
   if (path.dirname(destination) !== path.dirname(source)) await fsyncDirectory(path.dirname(source));
 }
 
+/** Re-establish the durability suffix for an already-published exact survivor. */
+export async function hardenedFsyncExisting(file:string):Promise<void>{
+  await regularOrAbsent(file);const handle=await fs.open(file,"r");try{await handle.sync();}finally{await handle.close();}await fsyncDirectory(path.dirname(file));
+}
+
 export interface GenesisPrepublishMarker {
   version: 1;
   accountId: string;
@@ -114,10 +137,9 @@ export interface GenesisPrepublishMarker {
   phase: "prepublish";
 }
 
-export type GenesisCompletionReceipt = {
-  outcome: "phrase-delivered" | "artifact-committed" | "competing-cleaned";
-  at: string;
-};
+export type GenesisCompletionReceipt =
+  | { outcome: "phrase-delivered" | "competing-cleaned"; at: string }
+  | { outcome: "artifact-committed"; at: string; artifact: { mode: "keychain"; service: "rbox recovery phrase"; account: string; keychainPath: string } | { mode: "kit-path"; path: string } };
 
 export interface GenesisJournal {
   version: 1;
@@ -130,6 +152,15 @@ export interface GenesisJournal {
   originalCacheRecovery: boolean;
   completionHolds: ["recovery-kit-staging"];
   completionReceipts: { "recovery-kit-staging"?: GenesisCompletionReceipt };
+}
+
+export interface GenesisBootstrapRequest {
+  recoveryWrap: string;
+  recoveryWrapId: string;
+  genesisRoster: string;
+  genesisKeyState: string;
+  device: { deviceId: string; sigPubKey: string; encPubKey: string; mkWrap: string };
+  repairId?: string;
 }
 
 export type CompletionIntent =
@@ -160,6 +191,30 @@ function parseBounded(raw: string): unknown {
   return parseStrict(raw);
 }
 
+const boundedOpaque = (value: unknown): value is string =>
+  typeof value === "string" && value.length > 0 && Buffer.byteLength(value, "utf8") <= 64 * 1024;
+
+/** Strict client-side copy of the bootstrap wire schema. Journals are authority to
+ * replay exact bytes, so a digest-valid but malformed body must never be replayed. */
+export function parseGenesisBootstrapRequest(raw: string, deviceId?: string): GenesisBootstrapRequest {
+  const v = parseBounded(raw);
+  if (!plain(v) || (!exactKeys(v, ["recoveryWrap", "recoveryWrapId", "genesisRoster", "genesisKeyState", "device"])
+    && !exactKeys(v, ["recoveryWrap", "recoveryWrapId", "genesisRoster", "genesisKeyState", "device", "repairId"]))) {
+    throw new Error("invalid genesis bootstrap request shape");
+  }
+  if (!boundedOpaque(v.recoveryWrap) || !boundedOpaque(v.recoveryWrapId)
+    || !boundedOpaque(v.genesisRoster) || !boundedOpaque(v.genesisKeyState)
+    || !plain(v.device) || !exactKeys(v.device, ["deviceId", "sigPubKey", "encPubKey", "mkWrap"])
+    || !boundedOpaque(v.device.deviceId) || (deviceId !== undefined && v.device.deviceId !== deviceId)
+    || !boundedOpaque(v.device.sigPubKey) || !boundedOpaque(v.device.encPubKey) || !boundedOpaque(v.device.mkWrap)) {
+    throw new Error("invalid genesis bootstrap request fields");
+  }
+  if (Object.hasOwn(v, "repairId") && (typeof v.repairId !== "string" || !GENESIS_REPAIR_ID_RE.test(v.repairId))) {
+    throw new Error("invalid genesis bootstrap repair binding");
+  }
+  return v as unknown as GenesisBootstrapRequest;
+}
+
 export function parsePrepublishMarker(raw: string, accountId?: string): GenesisPrepublishMarker {
   const v = parseBounded(raw);
   if (!plain(v) || !exactKeys(v, ["version","accountId","deviceId","repairId","startedAt","phase"]) || v.version !== 1
@@ -179,8 +234,18 @@ export async function parseGenesisJournal(raw: string, accountId?: string): Prom
     || typeof v.originalCacheRecovery!=="boolean" || !Array.isArray(v.completionHolds) || v.completionHolds.length!==1 || v.completionHolds[0]!=="recovery-kit-staging"
     || !plain(v.completionReceipts) || !Object.keys(v.completionReceipts).every((k)=>k==="recovery-kit-staging")) throw new Error("invalid genesis journal");
   const receipt=v.completionReceipts["recovery-kit-staging"];
-  if (receipt!==undefined && (!plain(receipt)||!exactKeys(receipt,["outcome","at"])||!["phrase-delivered","artifact-committed","competing-cleaned"].includes(String(receipt.outcome))||!iso(receipt.at))) throw new Error("invalid genesis completion receipt");
+  if (receipt!==undefined) {
+    if(!plain(receipt)||!iso(receipt.at))throw new Error("invalid genesis completion receipt");
+    if(receipt.outcome==="phrase-delivered"||receipt.outcome==="competing-cleaned"){if(!exactKeys(receipt,["outcome","at"]))throw new Error("invalid genesis completion receipt");}
+    else if(receipt.outcome==="artifact-committed"){
+      if(!exactKeys(receipt,["outcome","at","artifact"])||!plain(receipt.artifact))throw new Error("invalid genesis artifact receipt");
+      const artifact=receipt.artifact;if(artifact.mode==="kit-path"){if(!exactKeys(artifact,["mode","path"])||typeof artifact.path!=="string"||!path.isAbsolute(artifact.path))throw new Error("invalid genesis artifact receipt");}
+      else if(artifact.mode==="keychain"){if(!exactKeys(artifact,["mode","service","account","keychainPath"])||artifact.service!=="rbox recovery phrase"||artifact.account!==v.accountId||typeof artifact.keychainPath!=="string"||!path.isAbsolute(artifact.keychainPath))throw new Error("invalid genesis artifact receipt");}
+      else throw new Error("invalid genesis artifact receipt");
+    }else throw new Error("invalid genesis completion receipt");
+  }
   if ((v.phase==="active") !== (receipt===undefined)) throw new Error("genesis journal phase/receipt mismatch");
+  parseGenesisBootstrapRequest(v.requestBody, v.deviceId);
   return v as unknown as GenesisJournal;
 }
 
@@ -221,6 +286,7 @@ export async function publishRetargetWitness(witness:CompletionIntentRetargetWit
 export async function retargetCompletionIntent(journal:GenesisJournal,oldIntent:CompletionIntent,newIntent:CompletionIntent,now:string,options?:HardenedWriteOptions):Promise<void>{
   if(journal.phase!=="active"||journal.completionReceipts["recovery-kit-staging"]||oldIntent.mode!=="keychain"||newIntent.mode!=="kit-path")throw new Error("completion RETARGET is not authorized");
   const oldRaw=serializeCompletionIntent(oldIntent),newRaw=serializeCompletionIntent(newIntent);
+  const canonicalRaw=await fs.readFile(genesisPaths(journal.accountId).intent,"utf8");parseCompletionIntent(canonicalRaw,journal);if(canonicalRaw!==oldRaw)throw new Error("completion RETARGET old intent is not the exact canonical record");
   const witness:CompletionIntentRetargetWitness={version:1,accountId:journal.accountId,requestSha256:journal.requestSha256,oldIntent,oldIntentSha256:await sha256Hex(utf8(oldRaw)),newIntent,newIntentSha256:await sha256Hex(utf8(newRaw)),witnessedAt:now};
   await publishRetargetWitness(witness,journal,options);
   await hardenedWrite(genesisPaths(journal.accountId).intent,newRaw,options);

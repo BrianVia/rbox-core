@@ -1,3 +1,4 @@
+import fs from "node:fs/promises";
 import {
   assertMkWrapAuthorized,
   bootstrapAccount,
@@ -9,6 +10,7 @@ import {
   openOwnMasterKey,
   phraseToRk,
   randomBytes,
+  recoverMasterKey,
   redeemPairing,
   toB64url,
   verifyAccount,
@@ -34,20 +36,25 @@ import {
   GENESIS_PENDING_MESSAGE,
   genesisPaths,
   hardenedRename,
+  hardenedFsyncExisting,
   hardenedUnlink,
   publishCompletionIntent,
   publishGenesisJournal,
   publishPrepublishMarker,
   recordGenesisReceipt,
+  reconcileRetargetIntent,
+  retargetCompletionIntent,
+  parseCompletionIntent,
   stageRecoveryKey,
   type CompletionIntent,
   type GenesisJournal,
   type GenesisPrepublishMarker,
 } from "./genesis-durable.js";
 import { acquireAccountGenesisLock, acquireGenesisLockPair, acquireGlobalGenesisLock, type GenesisLock } from "./genesis-locks.js";
-import { classifyEnrollment, inspectPendingGenesis, pendingGenesisState, type EnrollmentClassification } from "./genesis-enrollment.js";
-import { resumeGenesisQuarantine, startGenesisQuarantine } from "./genesis-quarantine.js";
+import { classifyEnrollment, genesisClassifierConsultationNeeded, inspectPendingGenesis, pendingGenesisState, type EnrollmentClassification } from "./genesis-enrollment.js";
+import { genesisQuarantineStatus, resumeGenesisQuarantine, startGenesisQuarantine } from "./genesis-quarantine.js";
 import { e2eeRoot } from "./genesis-durable.js";
+import { GenesisBootstrapTerminalError } from "./remote/errors.js";
 
 const ACCOUNT_ID_RE = /^acct_[0-9a-f]{16}$/; // strict grammar before path/lock naming
 const ADMIT_RETRIES = 4;
@@ -147,17 +154,34 @@ export async function bootstrapNewAccount(api: Pick<RboxApi, "bootstrapKeys">, a
 }
 
 export interface GenesisCapableApi extends Pick<RboxApi,"bootstrapKeys"> { getGenesisObservation():Promise<GenesisAccountObservation> }
-export interface AtomicGenesisCommit {kind:"committed";journal:GenesisJournal;phrase:string;lock:GenesisLock}
+export interface AtomicGenesisCommit {kind:"committed";journal:GenesisJournal;phrase:string;lock:GenesisLock;globalLock:GenesisLock}
 export type AtomicGenesisStartResult=AtomicGenesisCommit|{kind:"already-setup"};
 
 async function removePrepublicationBundle(accountId:string):Promise<void>{const p=genesisPaths(accountId);await hardenedUnlink(p.device);await hardenedUnlink(p.mk);await hardenedUnlink(p.stagedRk);await hardenedUnlink(p.intent);await hardenedUnlink(p.witness);await hardenedUnlink(p.marker);}
 
-async function cleanupWinningJournal(journal:GenesisJournal):Promise<void>{const p=genesisPaths(journal.accountId);if(journal.originalCacheRecovery){try{await hardenedRename(p.stagedRk,p.rk);}catch(error){const staged=await fsRead(p.stagedRk),dest=await fsRead(p.rk);if(staged!==undefined||dest===undefined)throw error;}}else await hardenedUnlink(p.stagedRk);await hardenedUnlink(p.intent);await hardenedUnlink(p.witness);await hardenedUnlink(p.marker);await hardenedUnlink(p.journal);}
+async function validateRecoveryKeyBytes(journal:GenesisJournal,bytes:Uint8Array):Promise<void>{
+  const rk=fromB64url(Buffer.from(bytes).toString("utf8").trim());if(rk.length!==32)throw new Error("promoted recovery key has invalid length");
+  const request=JSON.parse(journal.requestBody) as {recoveryWrap?:unknown};if(typeof request.recoveryWrap!=="string")throw new Error("journal recovery wrap missing");
+  const loaded=await loadDevice(journal.accountId);if(!loaded||!("secrets" in loaded)||loaded.secrets.deviceId!==journal.deviceId)throw new Error("journal device material mismatch");
+  const mk=await recoverMasterKey(journal.accountId,0,rk,JSON.parse(request.recoveryWrap) as Wrap);if(!Buffer.from(mk).equals(Buffer.from(loaded.secrets.mk)))throw new Error("promoted recovery key does not authenticate journal MK");
+}
+
+async function cleanupWinningJournal(journal:GenesisJournal):Promise<void>{
+  const p=genesisPaths(journal.accountId);
+  if(journal.originalCacheRecovery){
+    const staged=await fsRead(p.stagedRk),dest=await fsRead(p.rk);
+    if(staged&&dest)throw new Error("winning recovery-key promotion has both source and destination");
+    if(staged){await validateRecoveryKeyBytes(journal,staged);await hardenedRename(p.stagedRk,p.rk);const promoted=await fsRead(p.rk);if(!promoted)throw new Error("winning recovery-key promotion lost destination");await validateRecoveryKeyBytes(journal,promoted);}
+    else{if(!dest)throw new Error("winning recovery-key promotion has neither source nor destination");await validateRecoveryKeyBytes(journal,dest);await hardenedFsyncExisting(p.rk);}
+  }else await hardenedUnlink(p.stagedRk);
+  await hardenedUnlink(p.intent);await hardenedUnlink(p.witness);await hardenedUnlink(p.marker);await hardenedUnlink(p.journal);
+}
 async function fsRead(file:string):Promise<Uint8Array|undefined>{try{return new Uint8Array(await fs.readFile(file));}catch(error){if((error as NodeJS.ErrnoException).code==="ENOENT")return undefined;throw error;}}
 
-async function cleanupCompetingJournal(journal:GenesisJournal):Promise<void>{const now=new Date().toISOString();let active=(await inspectPendingGenesis(journal.accountId)).activeQuarantines.find((q)=>q.purpose==="abandoned-attempt"&&q.key===journal.requestSha256);if(!active){await startGenesisQuarantine({accountId:journal.accountId,purpose:"abandoned-attempt",uniquenessKey:journal.requestSha256,createdAt:now});active={purpose:"abandoned-attempt",key:journal.requestSha256};}await resumeGenesisQuarantine(journal.accountId,"abandoned-attempt",journal.requestSha256,now);const p=genesisPaths(journal.accountId);await hardenedUnlink(p.intent);await hardenedUnlink(p.witness);await hardenedUnlink(p.marker);await hardenedUnlink(p.journal);}
+async function cleanupCompetingJournal(journal:GenesisJournal):Promise<void>{const now=new Date().toISOString();const status=await genesisQuarantineStatus(journal.accountId,"abandoned-attempt",journal.requestSha256);if(status==="absent")await startGenesisQuarantine({accountId:journal.accountId,purpose:"abandoned-attempt",uniquenessKey:journal.requestSha256,createdAt:now});if(status!=="completed")await resumeGenesisQuarantine(journal.accountId,"abandoned-attempt",journal.requestSha256,now);const p=genesisPaths(journal.accountId);await hardenedUnlink(p.intent);await hardenedUnlink(p.witness);await hardenedUnlink(p.marker);await hardenedUnlink(p.journal);}
 
 export async function resumeGenesisCleanup(journal:GenesisJournal):Promise<void>{const receipt=journal.completionReceipts["recovery-kit-staging"];if(!receipt)throw new Error("cleanup journal has no receipt");if(receipt.outcome==="competing-cleaned")await cleanupCompetingJournal(journal);else await cleanupWinningJournal(journal);}
+async function resumeClassifiedGenesisCleanup(journal:GenesisJournal):Promise<void>{try{await resumeGenesisCleanup(journal);}catch(error){throw new Error(`genesis integrity failure: cleanup precondition changed: ${error instanceof Error?error.message:String(error)}`,{cause:error});}}
 
 /** Durable first-attempt/resume protocol. The returned account lock remains held until completion is recorded. */
 export async function beginAtomicGenesis(api:GenesisCapableApi,accountId:string,deviceId:string,opts:{cacheRecovery?:boolean;now:number}):Promise<AtomicGenesisStartResult>{
@@ -167,14 +191,14 @@ export async function beginAtomicGenesis(api:GenesisCapableApi,accountId:string,
     for(;;){
       let observation=await api.getGenesisObservation();let state=await classifyEnrollment(accountId,observation);
       if(state.kind==="enrolled"){await global.release();await accountLock.release();return{kind:"already-setup"};}
-      if(state.kind==="cleanup-resume"){await global.release();await resumeGenesisCleanup(state.journal);await accountLock.release();pair=await acquireGenesisLockPair(accountId);accountLock=pair.account;global=pair.global;continue;}
+      if(state.kind==="cleanup-resume"){await resumeClassifiedGenesisCleanup(state.journal);await accountLock.release();await global.release();pair=await acquireGenesisLockPair(accountId);accountLock=pair.account;global=pair.global;continue;}
       if(state.kind==="repaired-legacy"){await startGenesisQuarantine({accountId,purpose:"repaired-legacy",uniquenessKey:state.repairId,createdAt:new Date(opts.now).toISOString()});await resumeGenesisQuarantine(accountId,"repaired-legacy",state.repairId,new Date(opts.now).toISOString());continue;}
       if(state.kind==="quarantine-resume"){await resumeGenesisQuarantine(accountId,"repaired-legacy",state.repairId,new Date(opts.now).toISOString());continue;}
       if(state.kind==="restart-prepublication"){await removePrepublicationBundle(accountId);continue;}
       let journal:GenesisJournal|undefined;
       if(state.kind==="resume-attempt")journal=state.journal;
-      else if(state.kind==="committed-this-attempt"){await global.release();return{kind:"committed",journal:state.journal,phrase:state.phrase,lock:accountLock};}
-      else if(state.kind==="competing-genesis"){await global.release();const cleanup=await recordGenesisReceipt(state.journal,{outcome:"competing-cleaned",at:new Date(opts.now).toISOString()});await cleanupCompetingJournal(cleanup);await accountLock.release();return{kind:"already-setup"};}
+      else if(state.kind==="committed-this-attempt")return{kind:"committed",journal:state.journal,phrase:state.phrase,lock:accountLock,globalLock:global};
+      else if(state.kind==="competing-genesis"){const cleanup=await recordGenesisReceipt(state.journal,{outcome:"competing-cleaned",at:new Date(opts.now).toISOString()});await cleanupCompetingJournal(cleanup);await accountLock.release();await global.release();return{kind:"already-setup"};}
       else if(state.kind==="legacy-orphan")throw new Error("legacy_orphan: account encryption setup is incomplete; contact rbox support");
       else if(state.kind==="integrity-failure")throw new Error(`genesis integrity failure: ${state.reason}`);
       else if(state.kind==="pristine"||state.kind==="repair-ready"){
@@ -183,29 +207,86 @@ export async function beginAtomicGenesis(api:GenesisCapableApi,accountId:string,
         const body={recoveryWrap:JSON.stringify(boot.upload.recoveryWrap),recoveryWrapId:boot.upload.recoveryWrapId,genesisRoster:JSON.stringify(boot.upload.genesisRoster),genesisKeyState:JSON.stringify(boot.upload.genesisKeyState),device:{deviceId,sigPubKey:boot.upload.device.sigPubKey,encPubKey:boot.upload.device.encPubKey,mkWrap:JSON.stringify(boot.upload.device.mkWrap)},...(repairId?{repairId}:{})};const requestBody=JSON.stringify(body);journal={version:1,accountId,deviceId,startedAt,phase:"active",requestBody,requestSha256:await sha256Hex(utf8(requestBody)),originalCacheRecovery:opts.cacheRecovery??false,completionHolds:["recovery-kit-staging"],completionReceipts:{}};
         await accountLock.release();pair=await acquireGenesisLockPair(accountId);accountLock=pair.account;global=pair.global;observation=await api.getGenesisObservation();state=await classifyEnrollment(accountId,observation);if(state.kind!=="restart-prepublication")throw new Error("genesis state changed before journal publication");await publishGenesisJournal(journal);await global.release();
       }
-      await global.release();try{await api.bootstrapKeys(journal!.requestBody);}catch{}
+      await global.release();try{await api.bootstrapKeys(journal!.requestBody);}catch(error){if(error instanceof GenesisBootstrapTerminalError)throw error;}
       observation=await api.getGenesisObservation();state=await classifyEnrollment(accountId,observation);
-      if(state.kind==="committed-this-attempt")return{kind:"committed",journal:state.journal,phrase:state.phrase,lock:accountLock};
+      if(state.kind==="committed-this-attempt"){
+        await accountLock.release();pair=await acquireGenesisLockPair(accountId);accountLock=pair.account;global=pair.global;
+        const locked=await classifyEnrollment(accountId,await api.getGenesisObservation());if(locked.kind!=="committed-this-attempt")throw new Error(locked.kind==="integrity-failure"?`genesis integrity failure: ${locked.reason}`:"genesis state changed before completion");
+        return{kind:"committed",journal:locked.journal,phrase:locked.phrase,lock:accountLock,globalLock:global};
+      }
       if(state.kind==="resume-attempt")throw new Error("genesis publication remains unconfirmed — re-run setup to resume");
-      if(state.kind==="competing-genesis"){const cleanup=await recordGenesisReceipt(state.journal,{outcome:"competing-cleaned",at:new Date(opts.now).toISOString()});await cleanupCompetingJournal(cleanup);await accountLock.release();return{kind:"already-setup"};}
+      if(state.kind==="competing-genesis"){
+        await accountLock.release();pair=await acquireGenesisLockPair(accountId);accountLock=pair.account;global=pair.global;const locked=await classifyEnrollment(accountId,await api.getGenesisObservation());
+        if(locked.kind!=="competing-genesis")throw new Error(locked.kind==="integrity-failure"?`genesis integrity failure: ${locked.reason}`:"genesis state changed before competing cleanup");
+        const cleanup=await recordGenesisReceipt(locked.journal,{outcome:"competing-cleaned",at:new Date(opts.now).toISOString()});await cleanupCompetingJournal(cleanup);await accountLock.release();await global.release();return{kind:"already-setup"};
+      }
       throw new Error(state.kind==="integrity-failure"?`genesis integrity failure: ${state.reason}`:`genesis publication failed: ${state.kind}`);
     }
   }catch(error){await global.release().catch(()=>{});await accountLock.release().catch(()=>{});throw error;}
 }
 
-export async function completeAtomicGenesis(commit:AtomicGenesisCommit,deliver:(phrase:string)=>Promise<void>,now=Date.now()):Promise<void>{try{const intent:CompletionIntent={version:1,accountId:commit.journal.accountId,requestSha256:commit.journal.requestSha256,mode:"phrase-display",intentAt:new Date(now).toISOString()};const pending=await inspectPendingGenesis(commit.journal.accountId);if(pending.intentRaw===undefined&&pending.witnessRaw===undefined)await publishCompletionIntent(intent,commit.journal);await deliver(commit.phrase);const cleanup=await recordGenesisReceipt(commit.journal,{outcome:"phrase-delivered",at:new Date(now).toISOString()});await cleanupWinningJournal(cleanup);}finally{await commit.lock.release();}}
+export interface AtomicGenesisCompletionHandlers{
+  deliverPhrase:(phrase:string)=>Promise<void>;
+  selectIntent?:(journal:GenesisJournal,phrase:string,now:number)=>Promise<CompletionIntent>;
+  commitArtifact?:(intent:Extract<CompletionIntent,{mode:"keychain"|"kit-path"}>,phrase:string)=>Promise<void>;
+  retargetKeychainFailure?:(error:unknown,intent:Extract<CompletionIntent,{mode:"keychain"}>,phrase:string)=>Promise<Extract<CompletionIntent,{mode:"kit-path"}>|undefined>;
+}
 
-export async function assertNoPendingGenesis(accountId:string):Promise<void>{if(await pendingGenesisState(accountId))throw new Error(GENESIS_PENDING_MESSAGE);}
+/** Consume the durable selection. Absence alone selects phrase-display; a present
+ * intent or RETARGET witness is reconciled before any sink runs. */
+export async function completeAtomicGenesis(commit:AtomicGenesisCommit,deliverOrHandlers:((phrase:string)=>Promise<void>)|AtomicGenesisCompletionHandlers,now=Date.now()):Promise<void>{
+  const handlers:AtomicGenesisCompletionHandlers=typeof deliverOrHandlers==="function"?{deliverPhrase:deliverOrHandlers}:deliverOrHandlers;
+  try{
+    const pending=await inspectPendingGenesis(commit.journal.accountId);let intent:CompletionIntent|undefined;
+    if(pending.witnessRaw!==undefined)intent=await reconcileRetargetIntent(commit.journal);
+    else if(pending.intentRaw!==undefined)intent=parseCompletionIntent(pending.intentRaw,commit.journal);
+    if(!intent){intent=handlers.selectIntent?await handlers.selectIntent(commit.journal,commit.phrase,now):{version:1,accountId:commit.journal.accountId,requestSha256:commit.journal.requestSha256,mode:"phrase-display",intentAt:new Date(now).toISOString()};await publishCompletionIntent(intent,commit.journal);}
+    if(intent.mode==="phrase-display"){await handlers.deliverPhrase(commit.phrase);}
+    else{
+      if(!handlers.commitArtifact)throw new Error(`cannot resume ${intent.mode} completion without its artifact sink`);
+      try{await handlers.commitArtifact(intent,commit.phrase);}
+      catch(error){if(intent.mode!=="keychain"||!handlers.retargetKeychainFailure)throw error;const next=await handlers.retargetKeychainFailure(error,intent,commit.phrase);if(!next)throw error;await retargetCompletionIntent(commit.journal,intent,next,new Date(now).toISOString());const survivor=await reconcileRetargetIntent(commit.journal);if(!survivor||survivor.mode!=="kit-path")throw new Error("completion RETARGET did not select the fallback artifact");await handlers.commitArtifact(survivor,commit.phrase);intent=survivor;}
+    }
+    const at=new Date(now).toISOString();const receipt=intent.mode==="phrase-display"?{outcome:"phrase-delivered" as const,at}:{outcome:"artifact-committed" as const,at,artifact:intent.mode==="keychain"?{mode:"keychain" as const,...intent.keychain}:{mode:"kit-path" as const,path:intent.path}};
+    const cleanup=await recordGenesisReceipt(commit.journal,receipt);await cleanupWinningJournal(cleanup);
+  }finally{await commit.lock.release();await commit.globalLock.release();}
+}
+
+export async function assertNoPendingGenesis(accountId:string):Promise<void>{
+  if(await pendingGenesisState(accountId))throw new Error(GENESIS_PENDING_MESSAGE);
+  if(await genesisClassifierConsultationNeeded(accountId)){
+    const creds=credentialsForStrictFlow(await loadCredentials());if(!creds||creds.accountId!==accountId)throw new Error(GENESIS_PENDING_MESSAGE);
+    const lock=await acquireClearKnownAccountGenesis(new RboxApi(creds.remoteUrl,creds.token,"",""),accountId);await lock.release();
+  }
+}
 
 async function accountDirectories():Promise<string[]>{try{const entries=await fs.readdir(e2eeRoot(),{withFileTypes:true});return entries.filter((entry)=>entry.isDirectory()).map((entry)=>entry.name).sort();}catch(error){if((error as NodeJS.ErrnoException).code==="ENOENT")return[];throw error;}}
 
 /** Caller retains the global lock through opaque token redemption. */
 export async function acquireClearMachineGenesisForPairing():Promise<GenesisLock>{
-  const global=await acquireGlobalGenesisLock();try{for(const accountId of await accountDirectories()){if(!ACCOUNT_ID_RE.test(accountId)){const entries=await fs.readdir(`${e2eeRoot()}/${accountId}`).catch(()=>[]);if(entries.some((name)=>name.startsWith("genesis-")||name==="rk.key.staged"||name==="quarantine"))throw new Error(GENESIS_PENDING_MESSAGE);continue;}const lock=await acquireAccountGenesisLock(accountId);try{if(await pendingGenesisState(accountId))throw new Error(`${GENESIS_PENDING_MESSAGE} (${accountId})`);}finally{await lock.release();}}return global;}catch(error){await global.release();throw error;}
+  const global=await acquireGlobalGenesisLock();try{
+    const creds=credentialsForStrictFlow(await loadCredentials());
+    scan:for(;;){
+      for(const accountId of await accountDirectories()){
+        if(!ACCOUNT_ID_RE.test(accountId)){const entries=await fs.readdir(`${e2eeRoot()}/${accountId}`).catch(()=>[]);if(entries.some((name)=>name.startsWith("genesis-")||name==="rk.key.staged"||name==="quarantine"))throw new Error(GENESIS_PENDING_MESSAGE);continue;}
+        const lock=await acquireAccountGenesisLock(accountId);try{
+          if(!(await genesisClassifierConsultationNeeded(accountId)))continue;
+          if(!creds||creds.accountId!==accountId)throw new Error(`${GENESIS_PENDING_MESSAGE} (${accountId})`);
+          const api=new RboxApi(creds.remoteUrl,creds.token,"","");const state=await classifyEnrollment(accountId,await api.getGenesisObservation());
+          if(state.kind==="enrolled")continue;
+          if(state.kind==="cleanup-resume"){await resumeClassifiedGenesisCleanup(state.journal);continue scan;}
+          if(state.kind==="repaired-legacy"){const now=new Date().toISOString();await startGenesisQuarantine({accountId,purpose:"repaired-legacy",uniquenessKey:state.repairId,createdAt:now});await resumeGenesisQuarantine(accountId,"repaired-legacy",state.repairId,now);continue scan;}
+          if(state.kind==="quarantine-resume"){await resumeGenesisQuarantine(accountId,"repaired-legacy",state.repairId,new Date().toISOString());continue scan;}
+          throw new Error(`${GENESIS_PENDING_MESSAGE} (${accountId})`);
+        }finally{await lock.release();}
+      }
+      return global;
+    }
+  }catch(error){await global.release();throw error;}
 }
 
 async function acquireClearKnownAccountGenesis(api:Pick<RboxApi,"getGenesisObservation">,accountId:string):Promise<GenesisLock>{
-  const lock=await acquireAccountGenesisLock(accountId);try{if(!(await pendingGenesisState(accountId)))return lock;const state=await classifyEnrollment(accountId,await api.getGenesisObservation());if(state.kind==="cleanup-resume"){await resumeGenesisCleanup(state.journal);if(!(await pendingGenesisState(accountId)))return lock;}throw new Error(GENESIS_PENDING_MESSAGE);}catch(error){await lock.release();throw error;}
+  const lock=await acquireAccountGenesisLock(accountId);try{if(!(await genesisClassifierConsultationNeeded(accountId)))return lock;for(;;){const state=await classifyEnrollment(accountId,await api.getGenesisObservation());if(state.kind==="enrolled")return lock;if(state.kind==="cleanup-resume"){await resumeClassifiedGenesisCleanup(state.journal);continue;}throw new Error(GENESIS_PENDING_MESSAGE);}}catch(error){await lock.release();throw error;}
 }
 
 /** Self-verify the candidate extended chain + wrap authorization BEFORE publishing
@@ -434,4 +515,3 @@ export async function buildAuthedRemote(root: string, now: () => number = Date.n
 }
 
 export { hasDevice };
-import fs from "node:fs/promises";

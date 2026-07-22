@@ -9,18 +9,22 @@ import {
   login,
   logout,
   pairingRedemptionSuccessMessages,
+  pairCreate,
   readPairingTokenInteractive,
   recoverCmd,
   runGenesisEnrollment,
+  keyBackup,
+  keyStatus,
   WORKSPACE_SYNC_NEXT_STEP,
 } from "./auth-cmd.js";
 import { accountProfilePath, flushAccountProfileWrites, scheduleAccountProfileWrite } from "./account-profile.js";
 import { saveCredentials } from "./credentials.js";
 import { _setSpawner } from "./browser-open.js";
 import { AccountAlreadyBootstrappedError } from "./remote.js";
-import { acquireGenesisLock, hasDevice, loadRecoveryKey, saveRecoveryKey } from "./e2ee-keystore.js";
+import { acquireGenesisLock, hasDevice, loadRecoveryKey, saveDevice, saveRecoveryKey } from "./e2ee-keystore.js";
 import type { AccountKeysDTO, GenesisAccountObservation, GenesisPresence } from "./e2ee-remote.js";
 import { bootstrapAccount } from "../engine/e2ee/index.js";
+import { GENESIS_PENDING_MESSAGE, genesisPaths, publishPrepublishMarker } from "./genesis-durable.js";
 
 const ACCOUNT_KEYS: AccountKeysDTO = { recoveryWrap: null, recoveryWrapId: null, rosters: [], keyStates: [], devices: [] };
 
@@ -182,6 +186,17 @@ function installImmediateTimers(): number[] {
   return sleeps;
 }
 
+async function markGenesisPending(accountId: string, deviceId = "dev_pending"): Promise<void> {
+  await publishPrepublishMarker({
+    version: 1,
+    accountId,
+    deviceId,
+    repairId: null,
+    startedAt: "2026-07-22T12:00:00.000Z",
+    phase: "prepublish",
+  });
+}
+
 test("logout clears credentials and the queued account profile", async () => {
   await saveCredentials({ token: "tok", deviceId: "dev", remoteUrl: "https://api.test", accountId: "acct_logout" });
   scheduleAccountProfileWrite({ accountId: "acct_logout", email: "owner@example.com", signInMethod: "github" });
@@ -238,7 +253,7 @@ describe("runGenesisEnrollment", () => {
     });
 
     expect(result).toBe("already-setup");
-    expect(api.getCalls).toBe(3);
+    expect(api.getCalls).toBe(4);
     expect(await hasDevice(accountId)).toBe(false);
     expect(await loadRecoveryKey(accountId)).toBeDefined();
   });
@@ -448,6 +463,31 @@ test("bootstrap login success prints the shared workspace step", async () => {
 });
 
 describe("device-code post-approval encryption handling", () => {
+  test("an exact old-flow device+MK pair routes through the classifier enrollment path before the keyless shortcut", async () => {
+    const accountId = "acct_7777777777777777";
+    const boot = await bootstrapAccount(accountId, "dev_legacy", 1_900_000_000_000);
+    await saveDevice(boot.secrets);
+    let enrolled = 0;
+    const api = {
+      getAccountKeys: async (): Promise<AccountKeysDTO | null> => {
+        throw new Error("legacy routing must consult enrollment before the keyless shortcut");
+      },
+      getGenesisObservation: async () => { throw new Error("unused fake"); },
+      bootstrapKeys: async () => { throw new Error("unused fake"); },
+    };
+
+    const result = await handleDeviceCodePostApprovalEncryption(api, { accountId, deviceId: "dev_legacy" }, { kit: false }, {
+      isInteractive: () => false,
+      runGenesisEnrollment: async () => {
+        enrolled++;
+        return "already-setup";
+      },
+    });
+
+    expect(result).toBe("already-setup");
+    expect(enrolled).toBe(1);
+  });
+
   test("existing keys prints the device-code pair/recover note", async () => {
     const api = new FakeGenesisApi([ACCOUNT_KEYS]);
     const err: string[] = [];
@@ -507,5 +547,56 @@ describe("device-code post-approval encryption handling", () => {
     expect(result).toBe("enrolled");
     expect(confirmed).toBe(true);
     expect(genesisCalls).toBe(1);
+  });
+});
+
+describe("whole-command pending-genesis gates", () => {
+  test("rbox pair rejects before loading key material or minting a token", async () => {
+    const accountId = "acct_8888888888888888";
+    await saveCredentials({ token: "tok", deviceId: "dev_pending", remoteUrl: "https://api.test", accountId });
+    await markGenesisPending(accountId);
+    let fetches = 0;
+    globalThis.fetch = (async () => {
+      fetches++;
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+
+    await expect(pairCreate()).rejects.toThrow(GENESIS_PENDING_MESSAGE);
+    expect(fetches).toBe(0);
+  });
+
+  test("rbox key backup rejects before reading or displaying the recovery key", async () => {
+    const accountId = "acct_9999999999999999";
+    await saveCredentials({ token: "tok", deviceId: "dev_pending", remoteUrl: "https://api.test", accountId });
+    await saveRecoveryKey(accountId, new Uint8Array(32).fill(7));
+    await markGenesisPending(accountId);
+
+    await expect(keyBackup({ kit: false })).rejects.toThrow(GENESIS_PENDING_MESSAGE);
+  });
+
+  test("rbox key status is read-only and reports pending without parsing unsafe device or RK bytes", async () => {
+    const accountId = "acct_aaaaaaaaaaaaaaab";
+    await saveCredentials({ token: "tok", deviceId: "dev_pending", remoteUrl: "https://api.test", accountId });
+    await markGenesisPending(accountId);
+    const paths = genesisPaths(accountId);
+    await fs.writeFile(paths.device, "{malformed-device", { mode: 0o600 });
+    await fs.writeFile(paths.rk, "not-a-recovery-key", { mode: 0o600 });
+    let stdout = "";
+    const oldWrite = process.stdout.write;
+    process.stdout.write = ((chunk: string | Uint8Array) => {
+      stdout += String(chunk);
+      return true;
+    }) as typeof process.stdout.write;
+    try {
+      await keyStatus({ json: true });
+    } finally {
+      process.stdout.write = oldWrite;
+    }
+
+    expect(JSON.parse(stdout)).toMatchObject({
+      enrolled: false,
+      genesisPending: true,
+      resumeInstruction: GENESIS_PENDING_MESSAGE,
+    });
   });
 });

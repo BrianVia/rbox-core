@@ -3,8 +3,10 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { bootstrapAccount, toB64url, utf8 } from "../engine/e2ee/index.js";
-import { materializeCmd } from "./key-cmd.js";
+import { createCiKey, materializeCmd } from "./key-cmd.js";
 import { materializeAgentKey, decodeAgentKeyBundle } from "./agent-key-bundle.js";
+import { saveCredentials } from "./credentials.js";
+import { GENESIS_PENDING_MESSAGE, publishPrepublishMarker } from "./genesis-durable.js";
 
 const OLD_ENV = { ...process.env };
 
@@ -108,4 +110,26 @@ describe("rbox key materialize", () => {
     expect((await fs.stat(path.join(target, ".rbox", "e2ee", "acct_agentfile", "mk.key"))).mode & 0o777).toBe(0o600);
     await fs.rm(tmp, { recursive: true, force: true });
   });
+});
+
+test("whole rbox key create-ci command gates pending genesis before device or API-key mutation", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-key-pending-"));
+  const accountId = "acct_aaaaaaaaaaaaaaaa";
+  process.env.RBOX_HOME = tmp;
+  process.env.HOME = tmp;
+  try {
+    await saveCredentials({ token: "tok", deviceId: "dev_pending", remoteUrl: "https://api.test", accountId });
+    await publishPrepublishMarker({
+      version: 1,
+      accountId,
+      deviceId: "dev_pending",
+      repairId: null,
+      startedAt: "2026-07-22T12:00:00.000Z",
+      phase: "prepublish",
+    });
+
+    await expect(createCiKey({ "accept-root-key": "true", expires: "1d" })).rejects.toThrow(GENESIS_PENDING_MESSAGE);
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
 });

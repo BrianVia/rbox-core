@@ -3,21 +3,41 @@ import { Buffer } from "node:buffer";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { enrollViaPairing, parsePairingToken } from "./e2ee-client.js";
+import { acquireClearMachineGenesisForPairing, assertNoPendingGenesis, enrollViaPairing, parsePairingToken } from "./e2ee-client.js";
+import { bootstrapAccount } from "../engine/e2ee/index.js";
+import { saveDevice } from "./e2ee-keystore.js";
+import { e2eeRoot, GENESIS_PENDING_MESSAGE, publishPrepublishMarker } from "./genesis-durable.js";
+import { acquireGlobalGenesisLock } from "./genesis-locks.js";
 
 const origFetch = globalThis.fetch;
 const origRboxHome = process.env.RBOX_HOME;
+const origHome = process.env.HOME;
+const origToken = process.env.RBOX_TOKEN;
+const origDeviceId = process.env.RBOX_DEVICE_ID;
+const origAccountId = process.env.RBOX_ACCOUNT_ID;
+const origApi = process.env.RBOX_API;
 let testHome: string;
 
 beforeEach(async () => {
   testHome = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-e2ee-client-"));
   process.env.RBOX_HOME = testHome;
+  process.env.HOME = testHome;
+  delete process.env.RBOX_TOKEN;
+  delete process.env.RBOX_DEVICE_ID;
+  delete process.env.RBOX_ACCOUNT_ID;
+  delete process.env.RBOX_API;
 });
 
 afterEach(async () => {
   globalThis.fetch = origFetch;
   if (origRboxHome === undefined) delete process.env.RBOX_HOME;
   else process.env.RBOX_HOME = origRboxHome;
+  if (origHome === undefined) delete process.env.HOME;
+  else process.env.HOME = origHome;
+  if (origToken === undefined) delete process.env.RBOX_TOKEN; else process.env.RBOX_TOKEN = origToken;
+  if (origDeviceId === undefined) delete process.env.RBOX_DEVICE_ID; else process.env.RBOX_DEVICE_ID = origDeviceId;
+  if (origAccountId === undefined) delete process.env.RBOX_ACCOUNT_ID; else process.env.RBOX_ACCOUNT_ID = origAccountId;
+  if (origApi === undefined) delete process.env.RBOX_API; else process.env.RBOX_API = origApi;
   await fs.rm(testHome, { recursive: true, force: true });
 });
 
@@ -77,4 +97,67 @@ test("shared pairing parser rejects malformed vectors locally with zero redeem f
     await expect(enrollViaPairing("https://api.test", vector, 1)).rejects.toThrow(/malformed pairing token/);
     expect(fetches).toBe(0);
   }
+});
+
+test("normal enrolled device+MK material passes the common gate after coherent server verification", async () => {
+  const accountId = "acct_dddddddddddddddd";
+  const deviceId = "dev_enrolled";
+  const boot = await bootstrapAccount(accountId, deviceId, 1_900_000_000_000);
+  await saveDevice(boot.secrets);
+  process.env.RBOX_TOKEN = "tok";
+  process.env.RBOX_DEVICE_ID = deviceId;
+  process.env.RBOX_ACCOUNT_ID = accountId;
+  process.env.RBOX_API = "https://api.test";
+  const present = { rosters: 1, keyStates: 1, devices: 1, workspaces: 0, workspaceKeys: 0, e2eePairingTokens: 0 };
+  const dto = {
+    genesisPresenceVersion: 1,
+    recoveryWrap: JSON.stringify(boot.upload.recoveryWrap),
+    recoveryWrapId: boot.upload.recoveryWrapId,
+    claimCreatedAt: 1_900_000_000_000,
+    genesisDeviceId: deviceId,
+    rosters: [JSON.stringify(boot.upload.genesisRoster)],
+    keyStates: [JSON.stringify(boot.upload.genesisKeyState)],
+    devices: [{
+      deviceId,
+      sigPubkey: boot.upload.device.sigPubKey,
+      encPubkey: boot.upload.device.encPubKey,
+      mkWrap: JSON.stringify(boot.upload.device.mkWrap),
+    }],
+    present,
+    repairTombstone: null,
+  };
+  let fetches = 0;
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    fetches++;
+    expect(String(input)).toBe("https://api.test/v1/keys/account");
+    return new Response(JSON.stringify(dto));
+  }) as typeof fetch;
+
+  await expect(assertNoPendingGenesis(accountId)).resolves.toBeUndefined();
+  expect(fetches).toBe(1);
+});
+
+test("pairing global scan checks every local account and releases the global fence when a foreign pending account blocks", async () => {
+  const cleanAccount = "acct_1111111111111111";
+  const pendingAccount = "acct_ffffffffffffffff";
+  await fs.mkdir(path.join(e2eeRoot(), cleanAccount), { recursive: true });
+  await publishPrepublishMarker({
+    version: 1,
+    accountId: pendingAccount,
+    deviceId: "dev_pending",
+    repairId: null,
+    startedAt: "2026-07-22T12:00:00.000Z",
+    phase: "prepublish",
+  });
+  // Use an explicit valid current identity so this test exercises the
+  // all-account scan independently of any credential-file fixtures running in
+  // other Bun test files.
+  process.env.RBOX_TOKEN = "tok";
+  process.env.RBOX_DEVICE_ID = "dev_current";
+  process.env.RBOX_ACCOUNT_ID = cleanAccount;
+  process.env.RBOX_API = "https://api.test";
+
+  await expect(acquireClearMachineGenesisForPairing()).rejects.toThrow(`${GENESIS_PENDING_MESSAGE} (${pendingAccount})`);
+  const global = await acquireGlobalGenesisLock(0);
+  await global.release();
 });

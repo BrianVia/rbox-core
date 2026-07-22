@@ -101,6 +101,11 @@ export async function defaultKitPath(accountId: string, date = new Date(), homeD
   return path.join(await defaultKitTargetDir(homeDir), kitFileName(accountId, date));
 }
 
+/** Resolve the exact absolute artifact selected for durable genesis completion. */
+export async function resolveRecoveryKitPath(accountId: string, explicitPath?: string, now = new Date()): Promise<string> {
+  return explicitPath ? resolveUserPath(explicitPath) : defaultKitPath(accountId, now);
+}
+
 export function displayPath(file: string, homeDir = os.homedir()): string {
   const absHome = path.resolve(homeDir);
   const absFile = path.resolve(file);
@@ -116,7 +121,7 @@ export async function writeRecoveryKit(
   now = new Date()
 ): Promise<{ path: string; writtenAt: string; recordError?: Error }> {
   if (!creds.accountId) throw new Error("credential has no account id; cannot write a recovery kit");
-  const file = explicitPath ? resolveUserPath(explicitPath) : await defaultKitPath(creds.accountId, now);
+  const file = await resolveRecoveryKitPath(creds.accountId, explicitPath, now);
   const content = renderKit({ accountId: creds.accountId, deviceId: creds.deviceId, phrase, hostname: os.hostname(), generatedAt: now });
   await secretSafeWrite(file, content);
   const actual = await fs.readFile(file, "utf8");

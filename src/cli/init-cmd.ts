@@ -40,7 +40,7 @@ import { continueAdoption, startAdoption } from "./adopt-lifecycle.js";
 import { acknowledgeCacheGeneration } from "./adopt-cache.js";
 import { DirCache, HashCache } from "../engine/index.js";
 import type { AdoptJournal } from "./adopt-journal.js";
-import { pendingGenesisState } from "./genesis-enrollment.js";
+import { genesisClassifierConsultationNeeded } from "./genesis-enrollment.js";
 
 export const WORKSPACE_DEFINITION =
   "a workspace can be a single repository or a folder of many repositories, or just a folder.";
@@ -201,7 +201,7 @@ export async function runInit(
 ): Promise<InitOutcome | undefined> {
   const credentialResult = opts.credentialResult ?? await loadCredentials();
   const creds = credentialsForStrictFlow(credentialResult);
-  if(creds?.accountId&&await pendingGenesisState(creds.accountId)){
+  if(creds?.accountId&&await genesisClassifierConsultationNeeded(creds.accountId)){
     if(!creds.deviceId)throw new Error("pending encryption setup has no bound device credential — run `rbox setup`");
     const {runGenesisEnrollment}=await import("./auth-cmd.js");
     await runGenesisEnrollment(new RboxApi(creds.remoteUrl,creds.token,"",""),{accountId:creds.accountId,deviceId:creds.deviceId},recoveryKitOptionsFromFlags(flags));

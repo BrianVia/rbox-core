@@ -13,6 +13,7 @@ import { main } from "./main-dispatch.js";
 import { writeResetHaltHealth } from "./reset-health.js";
 import { RBOX_VERSION } from "./version.js";
 import { saveActivity } from "./activity.js";
+import { GENESIS_PENDING_MESSAGE, publishPrepublishMarker } from "./genesis-durable.js";
 
 const OLD_ENV = { ...process.env };
 const NOW = Date.parse("2026-07-08T12:00:00Z");
@@ -204,6 +205,32 @@ async function captureDispatch(args: string[]): Promise<string> {
     process.stdout.write = oldWrite;
   }
 }
+
+test("status remains read-only during pending genesis and surfaces the resume instruction in text and JSON", async () => {
+  const accountId = "acct_bbbbbbbbbbbbbbbb";
+  await publishPrepublishMarker({
+    version: 1,
+    accountId,
+    deviceId: cfg.deviceId,
+    repairId: null,
+    startedAt: "2026-07-22T12:00:00.000Z",
+    phase: "prepublish",
+  });
+  const d = cleanScanDeps();
+  d.loadCredentials = async () => ({
+    state: "valid",
+    source: "disk",
+    credentials: { v: 1, token: "tok", deviceId: cfg.deviceId, accountId, remoteUrl: "https://api.test" },
+    legacy: false,
+    extensions: {},
+  });
+
+  const human = await captureStatusWithDeps({ verbose: true }, d);
+  expect(human).toContain(GENESIS_PENDING_MESSAGE);
+  const json = JSON.parse(await captureStatusWithDeps({ json: true }, d));
+  expect(json.genesisPending).toBe(true);
+  expect(json.resumeInstruction).toBe(GENESIS_PENDING_MESSAGE);
+});
 
 test("design 178 C: computed status clears an idle capture-busy lane without a push", async () => {
   const repo = path.join(root, "repo");

@@ -15,6 +15,7 @@ import { withWorkspaceSyncMutex } from "./sync-mutex.js";
 import { enrolledDeviceId } from "./e2ee-keystore.js";
 import { resolveWorkspaceDeviceId } from "./init-plan.js";
 import { RebindConsentRequiredError } from "./reset-consent.js";
+import { assertNoPendingGenesis } from "./e2ee-client.js";
 
 export interface TrackResult {
   cfg: WorkspaceConfig;
@@ -46,6 +47,7 @@ export async function track(
   const projectId = flags.project ?? "root";
   const { credentialsForStrictFlow, loadCredentials } = await import("./credentials.js");
   const creds = credentialsForStrictFlow(await (deps.loadCredentials ?? loadCredentials)());
+  if (creds?.accountId) await assertNoPendingGenesis(creds.accountId);
   const initialPrev = await loadConfig(root).catch(() => undefined);
   const initialState = await loadRawState(root);
   const initialStream = initialState?.stream ?? (initialPrev ? syncStreamId(initialPrev) : undefined);

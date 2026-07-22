@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pull } from "./sync.js";
-import { buildAuthedRemote, hasDevice } from "./e2ee-client.js";
+import { assertNoPendingGenesis, buildAuthedRemote, hasDevice } from "./e2ee-client.js";
 import { findRoot, RBOX_DIR, saveConfig, type WorkspaceConfig } from "./config.js";
 import { requireCredentials, type Credentials } from "./credentials.js";
 import { fetchAccountWorkspaces, type AccountWorkspace } from "./workspace-picker.js";
@@ -367,6 +367,7 @@ export async function runExport(flags: Record<string, string>): Promise<void> {
 
   const creds = await requireCredentials();
   if (!creds.accountId) throw new Error("credential has no account; run `rbox login`.");
+  await assertNoPendingGenesis(creds.accountId);
   const enrolled = await hasDevice(creds.accountId);
 
   const sp = spinner("exporting");
