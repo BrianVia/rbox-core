@@ -1,6 +1,6 @@
 # 179 — recovery kit: macOS Keychain instead of a plaintext Downloads file
 
-Status: v5 — DRAFT (round-1 through round-3 findings folded under founder-pinned rulings; post-fold adversarial review aligned, 2026-07-21).
+Status: v6 — DRAFT (round-1 through round-4 findings folded under founder-pinned rulings; post-fold adversarial review aligned, 2026-07-21).
 
 Round-1 ruling record (pinned; one line per finding):
 
@@ -32,6 +32,13 @@ Round-3 ruling record (pinned; one line per finding):
 3. Restore merge — rediscovery preserves the independent staging axis unchanged; under the locked re-read it merges only a same-identity Keychain artifact, while a concurrent different identity is preserved and warned about. Tests cover both staging preservation and identity conflict.
 4. Cache preference — capture the user's original `cacheRecovery` value before genesis staging forces caching, persist that original value, and restore it only after commitment.
 5. Manual stdin wording — the unchanged non-interactive manual-recovery stdin path is not described as bounded; only newly introduced bounded readers carry that guarantee.
+
+Round-4 ruling record (pinned; one line per finding):
+
+1. Atomic genesis — `apps/api/src/keys.ts` publishes `account_keys`, genesis roster, genesis key state, and the first device in one D1 batch/transaction; clients still compare rather than assume across a lost response, while a legacy orphaned `account_keys` row is verified, diagnosed, and repaired explicitly instead of being called set up.
+2. Durable classifier — staging durably records the exact attempt's non-secret hashes and public material before publication, so a restarted process can classify a matching lost response versus a competing genesis.
+3. Explicit-file commitment — `--kit-path` uses the hardened write, exact read-back, published-file fsync, and containing-directory fsync contract before locator publication or staged-RK cleanup.
+4. Durable directory chain — a fresh `RBOX_HOME` is created and published through every new ancestor with the existing `ensureDirectoryChain` / `fsyncCreatedDirectoryAncestors` primitives before staging can count as a foothold.
 
 Owner: Claude (founder-directed, 2026-07-20)
 Origin: onboarding-ux backlog item #6 (macOS keychain), referenced from
@@ -190,15 +197,18 @@ before this flow overrides the bootstrap option to `cacheRecovery: true` to
 force staging. An omitted preference is normalized to `false`; command/wizard
 plumbing passes the explicit user value into this orchestration instead of
 trying to reconstruct it after bootstrap. The accompanying non-secret staging
-state records `startedAt` and that captured original value. The state transition
-order is crash-safe:
+state records `startedAt`, that captured original value, and the exact attempt
+descriptor defined below. The state transition order is crash-safe:
 
-1. atomically record staging intent, durably write/verify `rk.key`, then permit
-   bootstrap publication;
+1. durably publish any newly created `RBOX_HOME` / `e2ee` / account directory
+   chain, atomically record staging intent including the attempt descriptor,
+   then durably write/verify `rk.key`; all three complete before bootstrap
+   publication is permitted;
 2. validate the published current recovery envelope and attempt the selected
    Keychain or explicit `--kit-path` save;
-3. require the existing exact read-back verification of that Keychain/file
-   artifact — command success alone is not a commitment;
+3. require exact read-back verification of that Keychain/file artifact; an
+   explicit file additionally requires the published file and its containing
+   directory to be fsynced — command success alone is not a commitment;
 4. under the record lock, atomically persist the verified commitment locator as
    the exact Keychain artifact metadata or plaintext artifact path; failure to
    persist leaves both staging state and `rk.key` intact;
@@ -206,22 +216,73 @@ order is crash-safe:
    original preference: retain `rk.key` when `cacheRecovery` was true, or
    durably remove it when false; then atomically clear staging state.
 
-Bootstrap publication keeps the transport's automatic retries. The generated
-attempt descriptor remains available through response classification and
-contains the exact submitted `recoveryWrap`, `recoveryWrapId`, genesis roster,
-genesis key state, and device tuple (`deviceId`, signing/encryption public keys,
-and `mkWrap`). If any publication attempt returns `already_bootstrapped`, never
-infer a competing genesis from the status alone. Fetch `AccountKeysDTO`, verify
-the returned account chain as usual, and compare each descriptor field
-byte-for-byte with its corresponding published genesis entry and exact device.
-If every field matches, this attempt already committed and the 409 is the
-lost-response result of a transport retry: treat publication as successful,
-continue commitment, and retain staged RK until the normal verified commitment
-cleanup. If any field is absent or differs, treat it as a genuine competing
-genesis and take the existing `already-setup` cleanup path for this attempt's
-local device/MK/RK and staging state. Fetch, verification, or classification
-failure is neither case: fail closed and retain staged RK/state for diagnosis
-and retry.
+Before the first request, bootstrap derives a strict versioned attempt
+descriptor from the exact transport strings it will submit. The descriptor is
+non-secret: it stores SHA-256 hashes of the exact `recoveryWrap`, serialized
+genesis roster, serialized genesis key state, and serialized `mkWrap`, plus the
+public `recoveryWrapId`, `deviceId`, signing public key, and encryption public
+key. It stores neither RK, MK, phrase text, nor wrap plaintext. Hashes are over
+the submitted UTF-8 bytes, not reserialized objects. The complete descriptor is
+persisted **inside `staging` before publication**, under the same strict parser
+and hardened locator-write contract as the rest of `kit.json`.
+
+Bootstrap publication keeps the transport's automatic retries. On
+`already_bootstrapped`, and on a later invocation whose preflight fetch is
+non-null while this staging record exists, fetch `AccountKeysDTO`, verify the
+returned signed account chain as usual, find the exact device, hash the returned
+opaque strings with the same rules, and compare every descriptor field. If all
+fields match, this attempt already committed and the response was lost: treat
+publication as successful, continue commitment, and retain staged RK until the
+normal verified commitment cleanup. This classification therefore survives
+process death. If the verified chain is complete but any field is absent or
+differs, treat it as a genuine competing genesis and take the existing
+`already-setup` cleanup path for this attempt's local device/MK/RK and staging
+state. Fetch or classification failure is neither case: fail closed and retain
+staged RK/state for diagnosis and retry.
+
+Genesis publication itself becomes atomic server-side. In
+`apps/api/src/keys.ts`, `bootstrapAccountKeys` uses one `dbFor` handle and one
+D1 atomic batch/transaction containing the `account_keys` insert, roster v0,
+account-key-state epoch 0, and first `device_keys` insert. A constraint or
+execution failure rolls back all four; `ok: true` is returned only after the
+whole transaction commits. A concurrent pre-existing `account_keys` claim maps
+to `already_bootstrapped`, but there is no committed state in which that new
+claim exists without its three genesis rows. API tests inject/fail each
+statement boundary and assert that a subsequent read sees either all four rows
+or none, then retry successfully from the none case.
+
+The non-null preflight at `src/cli/auth-cmd.ts:126` must stop treating mere DTO
+presence as proof that an account is set up. It runs the same full signed-chain
+verification before returning `already-setup` or performing the descriptor
+comparison. A DTO with `account_keys` but empty roster and key-state chains —
+including the same shape fetched after `already_bootstrapped` — is the exact
+signature of an account already wedged by the old split publication path. The
+client preserves staged/local material and emits a distinct actionable error:
+the account's encryption setup
+is incomplete, normal pairing/recovery cannot repair it, and the user must
+contact rbox support for orphan-bootstrap repair before retrying setup. It must
+not silently return `already-setup`, discard local material, or loop on
+`already_bootstrapped`.
+
+Any non-empty chain that fails cryptographic/account verification remains a
+fatal integrity error and is not eligible for orphan repair.
+
+The repair runbook is narrow and server-side: an operator first proves in one
+D1 read/transaction that the account has exactly the orphan shape — one
+`account_keys` row and zero roster, account-key-state, and device-key rows — and
+that no later encrypted-account rows depend on it; only then delete that lone
+`account_keys` row transactionally. Any non-empty or ambiguous shape is refused
+and escalated rather than guessed at. The user can then rerun genesis, which
+uses the new atomic endpoint. Tests seed the exact legacy orphan, require the
+actionable client error with no cleanup, exercise guarded repair, and prove the
+next bootstrap commits a complete verified genesis.
+
+This API correction is a release prerequisite, not an independently shippable
+CLI assumption. Per `docs/DEPLOYMENTS.md`, deploy and verify the API change in
+dev, promote it to production on the API's promotion cadence, and only then
+release a CLI that relies on atomic genesis. The compare-don't-assume client
+logic remains required after promotion because it covers the distinct window
+where the atomic transaction commits but its successful response is lost.
 
 A crash or save failure after publication therefore leaves the staged `rk.key`
 available to `rbox key save`/backup resolution. Startup and human
@@ -234,11 +295,19 @@ state. A marker without a readable verified `rk.key` is reported as unavailable
 and never as backed up. The temporary stage is not treated as an off-keystore
 backup and does not make uninstall safe.
 
-### Hardened RK/staging/locator file contract
+### Hardened RK/staging/locator/file contract
 
 This design adds a normative durability contract for `rk.key`, the non-secret
-staging marker, and the `kit.json` commitment locator. A write creates a
-mode-correct `O_CREAT | O_EXCL` temporary file in the destination directory,
+staging marker, the `kit.json` commitment locator, and every explicit
+`--kit-path` plaintext commitment. Before writing any of the first three below
+a fresh `RBOX_HOME`, create the complete plain-directory chain without following
+symlinks using `ensureDirectoryChain`, then call
+`fsyncCreatedDirectoryAncestors` to publish each newly created child through
+the first pre-existing ancestor. Fsyncing only the leaf account directory is
+insufficient and does not establish the pre-publication foothold.
+
+Each governed write creates a mode-correct `O_CREAT | O_EXCL` temporary file in
+the destination directory,
 writes the complete bytes, fsyncs the file, closes it, atomically renames it
 over the destination, reopens the published path without following symlinks,
 requires exact byte-for-byte read-back, fsyncs the published file, and fsyncs
@@ -247,13 +316,23 @@ success only after the unlink succeeds and the parent directory is fsynced.
 Failure at any step leaves the state machine conservative: it does not advance
 commitment or clear staging, and reconciliation may retry idempotently.
 
+For `--kit-path`, that entire sequence — including post-rename read-back,
+published-file fsync, and containing-directory fsync — must finish before its
+plaintext locator is published in `kit.json`. The locator must then itself meet
+the same durability contract before staged `rk.key` can be removed or staging
+cleared. The existing `writeRecoveryKit` content read-back and
+`writeFileAtomic` temp-file fsync/rename are only pieces of this contract; they
+do not currently make the containing directory entry durable.
+
 This is new implementation work. Today's `writeSecret`/`saveRecoveryKey` uses
 an in-place `writeFile` with no atomic publication, read-back, file fsync, or
 parent-directory fsync (`src/cli/e2ee-keystore.ts:40-43`,
 `src/cli/e2ee-keystore.ts:170-172`), while `forgetRecoveryKey` removes the entry
 without fsyncing its parent (`src/cli/e2ee-keystore.ts:179-181`). Those helpers
 are the gap this contract must close; they are not evidence that the invariant
-already holds.
+already holds. The directory-chain primitives already exist at
+`src/engine/fsutil.ts:81-124`; implementation reuses them rather than adding a
+second recursive-mkdir durability scheme.
 
 `validatePhraseForAccount` is read-only: fetch account keys, verify the signed
 roster/key-state chain, require its account id to equal the authenticated
@@ -437,7 +516,18 @@ axes:
   },
   "staging": {
     "startedAt": "2026-07-21T16:28:00.000Z",
-    "originalCacheRecovery": false
+    "originalCacheRecovery": false,
+    "attempt": {
+      "version": 1,
+      "recoveryWrapSha256": "<lowercase-hex-sha256>",
+      "recoveryWrapId": "<published-wrap-id>",
+      "genesisRosterSha256": "<lowercase-hex-sha256>",
+      "genesisKeyStateSha256": "<lowercase-hex-sha256>",
+      "deviceId": "dev_…",
+      "sigPubKey": "<public-key>",
+      "encPubKey": "<public-key>",
+      "mkWrapSha256": "<lowercase-hex-sha256>"
+    }
   }
 }
 ```
@@ -461,6 +551,10 @@ axes:
   non-interactive macOS genesis no-loss state machine. Its strict timestamp and
   original boolean preference distinguish a temporarily retained `rk.key` from
   an ordinary opted-in cache and drive idempotent cleanup after verification.
+  Its required, strictly parsed `attempt` object contains the exact fixed set of
+  non-secret hashes/public fields above. No partial descriptor is accepted, and
+  record mutation/restore merge preserves it as part of the independent staging
+  axis until commitment cleanup durably clears staging.
 
 Parsing is strict and account-bound. A legacy object with absent `kind` and
 exactly valid `path` + `writtenAt` is normalized to a v2 envelope with one
@@ -724,6 +818,9 @@ per-account mutation lock/atomic writes, plaintext parsing, aggregate safety,
 and target dispatcher. `src/cli/auth-cmd.ts` owns command UX and phrase-source
 selection. `src/cli/setup-cmd.ts` explicitly passes wizard's in-hand phrase.
 `src/cli/uninstall-cmd.ts` consumes aggregate safety, not mere record presence.
+`src/cli/e2ee-client.ts` owns attempt construction and verified DTO/descriptor
+comparison. `apps/api/src/keys.ts` owns the single atomic D1 genesis publication;
+the CLI cannot emulate or compensate for a split server commit.
 
 Add `key save` to dispatch (`src/cli/main-dispatch.ts:482-495`), command/group
 help (`src/cli/help-registry.ts:412-458`), completions through the help registry,
@@ -802,31 +899,48 @@ tables — remain side-effect free and receive exhaustive unit coverage.
    identity propagation; full OSStatus/timeout/signal/overflow probe table;
    bounded-output redaction; source matrix; target decision table; strict v2 +
    legacy parsing and unknown/mixed rejection; atomic-claim concurrency; JSON
-   mutation-free behavior; staging state parsing and crash-point transitions;
-   hardened RK/staging/locator write publication, exact read-back, file and
-   parent-directory fsync, and post-unlink parent-directory fsync failures;
+   mutation-free behavior; complete attempt-descriptor parsing, exact-byte hash
+   comparison, and staging crash-point transitions; hardened RK/staging/locator/
+   explicit-file publication, exact read-back, file and parent-directory fsync,
+   and post-unlink parent-directory fsync failures; fresh empty `RBOX_HOME`
+   creation through every ancestor with injected failure at each ancestor fsync;
    cleanup precheck + second pre-unlink check; and uninstall state precedence,
    including staged-only state plus plaintext and custom-Keychain backing paths
    inside the removal root.
-2. **Command tests:** add dispatch/help/completion coverage for `key save`,
+2. **API atomic-publication tests:** exercise `bootstrapAccountKeys` against D1
+   with a failure injected after each logical insert/statement boundary. Every
+   failed request leaves zero `account_keys`, roster-v0, key-state-0, and first-
+   device rows; every success leaves exactly the mutually consistent four-row
+   genesis. Cover a lost success response followed by 409, concurrent bootstrap
+   claims, constraint failure rollback, retry after rollback, and the guarded
+   legacy-orphan repair transaction. These are API crash/partial-commit tests,
+   not mocks of client behavior.
+3. **Command tests:** add dispatch/help/completion coverage for `key save`,
    cached no-stdin save, no-cache hidden TTY input, bounded non-TTY stdin,
    invalid/wrong-account phrase stores nothing, validation performs no
    admission/cache mutation, substituted and historical-but-authorized recovery
    wraps fail before unwrap, non-interactive macOS genesis captures the original
-   cache preference before forcing `cacheRecovery: true` and durably stages before
-   publish, stage failure prevents publish, exact verification and atomic
-   commitment-locator persistence both precede stage cleanup, crashes at each
-   ordering boundary retain or reconcile RK safely, a lost successful response
-   followed by retry and `already_bootstrapped` fetches published material, an
-   exact match proceeds with staged RK retained, a mismatch takes competing-
-   genesis cleanup, transport retries remain enabled, both original
+   cache preference before forcing `cacheRecovery: true`, durably creates the
+   directory chain, and durably persists both RK and the complete attempt before
+   publish; stage/ancestor-fsync failure prevents publish; exact Keychain or
+   explicit-file verification, file fsync, containing-directory fsync, and
+   atomic commitment-locator persistence all precede stage cleanup; crashes at
+   each ordering boundary retain or reconcile RK safely; a lost successful
+   response followed by retry and `already_bootstrapped` fetches published
+   material; an exact match proceeds with staged RK retained; a mismatch takes
+   competing-genesis cleanup; a forced fetch/classification failure retains the
+   descriptor, then process restart classifies both a matching committed attempt
+   and a competing committed genesis correctly; a non-null verified preflight
+   performs the same classification; a legacy non-null empty-chain DTO emits the
+   actionable orphan-bootstrap error and deletes nothing; transport retries
+   remain enabled; both original
    `cacheRecovery` preferences are restored, staged status copy is emitted,
    `showRecoveryPhrase` is never called, offer copy adapts, JSON emits no
    nudge/write, and wizard offers before dropping phrase.
    Relevant existing surfaces are `src/cli/auth-cmd.test.ts`,
    `src/cli/help-registry.test.ts:31-42`, and
    `src/cli/setup-cmd.test.ts:1094-1133`.
-3. **Restore command matrix:** deterministic command tests use injected probe,
+4. **Restore command matrix:** deterministic command tests use injected probe,
    read, resolver, validation, admission-persistence, and record-write seams:
 
    | Case | Required assertion |
@@ -846,44 +960,51 @@ tables — remain side-effect free and receive exhaustive unit coverage.
    | Rediscovery record lock/read/write failure | Safe warning only; enrollment remains successful. |
    | Unknown record | Resolver is called exactly once and read/recovery may proceed, but the record remains byte-for-byte untouched and a safe metadata warning is emitted. |
 
-4. **Darwin integration:** create a throwaway temp Keychain and pass its path
+5. **Darwin integration:** create a throwaway temp Keychain and pass its path
    explicitly to the exact production byte stream. Test add, exact verify,
    `-U`, duplicate service/account isolation, present/missing classification,
    restore read, rediscovery records `discoveredAt` without inventing
    `writtenAt`, locked metadata probe, wrong identity, timeout/kill, and delete.
    Never touch the user's login/default/search-list Keychain.
-5. **Real-Mac validation:** fresh genesis, cached and typed `key save`, standalone
+6. **Real-Mac validation:** fresh genesis from an empty `RBOX_HOME`, cached and
+   typed `key save`, standalone
    and wizard recover, Keychain Access findability/search/show-password,
    reinstall/deleted-kit.json restore, locked GUI, unlocked GUI, SSH into a GUI
    session, truly headless/locked SSH, user cancellation, timeout, and plaintext
    fallback. Observe rather than assume SecurityAgent prompt behavior.
-6. **Deletion/uninstall validation:** race-replace file during cleanup prompt,
+7. **Deletion/uninstall validation:** race-replace file during cleanup prompt,
    symlink swap, handle/path inode mismatch, wrong account, same banner/wrong
    phrase, oversized/unreadable file, declined cleanup, missing item, unavailable
    Keychain, unknown future record, artifact inside the uninstall root, and
    surviving-present-artifact precedence.
-7. **Repo validation:** unit/typecheck plus `bun run rig` or a dev build shipped
+8. **Repo validation:** unit/typecheck plus `bun run rig` or a dev build shipped
    to the local fleet, per repository flow; documentation/usage snapshots and
    any CODEMAP ownership line stay in sync.
 
 ## Slices
 
-1. `recovery-kit-keychain.ts`: shared spawn runner, explicit identity resolve,
+1. Atomic API genesis transaction, all-or-nothing/legacy-orphan tests, guarded
+   repair runbook, dev verification, and production promotion before dependent
+   CLI release.
+2. `recovery-kit-keychain.ts`: shared spawn runner, explicit identity resolve,
    one-line add/verify/read/probe, OSStatus classifier, seams, and darwin test.
-2. `recovery-kit.ts`: v2 envelope/migration/parser, atomic claim, orthogonal
-   artifact mutations, bounded plaintext parser, cleanup revalidation, and
-   aggregate safety.
-3. `rbox key save` + phrase-envelope validation + cached/typed source selection;
+3. `recovery-kit.ts`: v2 envelope/migration/parser, durable attempt staging,
+   atomic claim, orthogonal artifact mutations, hardened directory/file
+   publication, bounded plaintext parser, cleanup revalidation, and aggregate
+   safety.
+4. `rbox key save` + phrase-envelope validation + cached/typed source selection;
    dispatch/help/completions/usage and no-echo/TTY tests.
-4. Genesis durable staging plus genesis/backup/standalone-recover/wizard-recover
-   zero-typing offer plumbing; status human/JSON rendering and
+5. Genesis durable staging, restart-safe descriptor classification, verified
+   preflight/legacy-wedge error, and genesis/backup/standalone-recover/
+   wizard-recover zero-typing offer plumbing; status human/JSON rendering and
    once-per-installation claim tests.
-5. Restore-from-Keychain read/fallback/rediscovery flow, uninstall consumer,
+6. Restore-from-Keychain read/fallback/rediscovery flow, uninstall consumer,
    exact-match plaintext migration, integration matrix, and changelog note for
    non-interactive `--kit`.
 
 ## Open questions (for review)
 
-None in v5. The phrase-source, ACL, process, identity, state, offer, cleanup,
-probe, uninstall, restore, and wording rulings above are pinned and are not
-reopened by implementation review.
+None in v6. The phrase-source, ACL, process, identity, state, offer, cleanup,
+probe, uninstall, restore, atomic-publication, restart-classification,
+durability, repair, promotion-order, and wording rulings above are pinned and
+are not reopened by implementation review.
