@@ -5,12 +5,19 @@ import type { ReceiptPort } from "./publish-pipeline/receipt-drainer.js";
 import type { CommitResult } from "./remote.js";
 
 export interface AccountKeysDTO {
+  genesisPresenceVersion?: 1;
   recoveryWrap: string | null;
   recoveryWrapId: string | null;
+  claimCreatedAt?: number;
+  genesisDeviceId?: string | null;
   rosters: string[]; // canonical SignedRoster JSON, ordered by version
   keyStates: string[]; // canonical SignedKeyState JSON, ordered by epoch
   devices: Array<{ deviceId: string; sigPubkey: string | null; encPubkey: string | null; mkWrap: string | null }>;
+  present?: GenesisPresence;
+  repairTombstone?: { version: 1; repairId: string; repairedAt: number } | null;
 }
+export interface GenesisPresence { rosters:number;keyStates:number;devices:number;workspaces:number;workspaceKeys:number;e2eePairingTokens:number }
+export type GenesisAccountObservation={genesisPresenceVersion:1;claim:null;present:GenesisPresence}|{genesisPresenceVersion:1;claim:AccountKeysDTO;present:GenesisPresence;repairTombstone:{version:1;repairId:string;repairedAt:number}|null};
 export interface WsKeyDTO {
   keyEpoch: number;
   kekWrap: string; // Wrap JSON

@@ -36,6 +36,7 @@ apps/api/src/fleet-alerts.ts — persisted fleet drift/reporting-stopped alert e
 apps/api/src/metrics.ts — privacy-bounded server observability: operation spans, D1/R2/DO timings, commit/redeem/pack/batch phase records, and Analytics Engine emission. Never: feature/domain policy or raw identifiers in dimensions.
 apps/api/src/util.ts — dependency-light Worker helpers: JSON responses, SHA/key formatting, constant-time comparison, hashing/HMAC, chunking, capped-body reads, and blob/pack/manifest object keys. Never: domain policy or persistence.
 apps/api/src/db.ts — the single D1 routing seam between account-data (dbFor) and pre-account directory (dirDb) planes. Never: SQL queries or domain decisions.
+apps/api/src/genesis-repair.ts — atomic-genesis tombstone observation, privileged repair/audit protocol, reconciliation, N=1 assertion, and shared mutation fences. Never: client cryptographic interpretation or command UX.
 ```
 
 ### Sanctioned cross-package protocol modules
@@ -141,7 +142,11 @@ src/cli/upload-lane-timing.ts — push-side timing instrumentation: the process-
 src/cli/push-tail-timing.ts — AsyncLocalStorage-scoped missing/commit chunk timing and exact request-payload byte accumulation for one complete push retry loop. Never: retry, request, or upload policy.
 src/cli/e2ee-remote.ts        — E2eeRemote (§2.7 — ordering-sensitive anti-rollback): verified head + pins, manifest fetch/decrypt/fold, history/restore/suffix/rebaseline, commit orchestration, blob delegation, KEK cache + its implementation policy (sidecar threshold, write-caps, manifest blob traversal). Never: raw HTTP (remote/), crypto primitives (engine/e2ee), pure contracts (e2ee-remote-types.ts).
 src/cli/e2ee-remote-types.ts  — pure shared contracts: E2eeApi, AccountKeysDTO, WsKeyDTO, CommitChainResult, VersionInfo, VerifiedSuffixEntry, HeadPin, PinStore, E2eeContext, CurrentWriteKek. Never: behavior, policy constants.
-src/cli/e2ee-client.ts        — E2EE account/device bootstrap + pairing client flows (bootstrap, redemption, admission, verifyAccount glue). Never: transport (RboxApi/E2eeRemote), key storage (e2ee-keystore.ts).
+src/cli/e2ee-client.ts        — atomic genesis orchestration, verified enrollment classification consumption, exact-attempt replay/completion, plus pairing/recovery admission glue. Never: raw HTTP transport or generic workspace sync policy.
+src/cli/genesis-durable.ts    — hardened genesis artifact writer, staged RK, journal phases, completion intent, and RETARGET witness schemas. Never: server observation classification or command UX.
+src/cli/genesis-locks.ts      — non-materializing global/account genesis lock namespaces and global-to-account acquisition order. Never: enrollment classification or credential mutation.
+src/cli/genesis-quarantine.ts — manifest-first, hash-checked repaired-legacy and abandoned-attempt archival with durable terminal markers. Never: deciding whether quarantine is authorized.
+src/cli/genesis-enrollment.ts — strict pending-artifact inspection and the shared crypto-backed closed enrollment classifier. Never: transport or interactive completion choices.
 ```
 
 ## `src/cli/remote/` — HTTP transport to the API worker

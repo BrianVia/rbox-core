@@ -17,6 +17,7 @@ import {
   bootstrapKeys,
   createApiKey,
   getAccountKeys,
+  getGenesisObservation,
   getWorkspaceKeys,
   listApiKeys,
   pairCreate,
@@ -122,6 +123,10 @@ export class RboxApi implements SyncRemote {
 
   getAccountKeys(): Promise<AccountKeysDTO | null> {
     return getAccountKeys(this.ctx);
+  }
+
+  getGenesisObservation() {
+    return getGenesisObservation(this.ctx);
   }
 
   putDeviceKeys(body: unknown): Promise<void> {
