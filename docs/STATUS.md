@@ -24,11 +24,26 @@ capture Linux-first with a governed attempt budget; B demand-driven flush
 demoted to its own phase-2 design with a hard requirement set; E2 agent
 stop-verdict with an always-live criticalPhase witness + reservation entry
 protocol — both named interface requirements ON 178 t3). **178 t3**
-(workstream A locks + graceful stop + E-live + pr8 ghost) is mid-
-implementation via codex in `.claude/worktrees/178-t3` (survived a codex
-credits outage; continuation run in progress) — review must check the two
-182 interface requirements. NEXT release train carries: #402 key-status
-fix (+ t3 when merged). Then: tell Max._ the 180 client + 179 Keychain feature shipped
+(workstream A locks + graceful stop + E-live + pr8 ghost): codex
+implementation COMPLETE in `.claude/worktrees/178-t3` (23 files, ~1350
+insertions; survived a codex credits outage mid-run — 14MB retry-spam log
+was the tell). Gates independently re-verified green (1,143 tests) — and
+then the three-reviewer wave (codex lock-lens, codex stop-lens, Fable
+structural) found it NOT mergeable: **all seven L1–L7 invariants FAIL**
+(5 blockers; one L2 violation REPRODUCED — recovery unlinked a replaced
+foreign inode that merely contained a copied marker), post-CAS settlement
+runs outside the gate (the exact kill-inside-mutation class the tranche
+closes), the new `rbox stop` hangs FOREVER against pre-t3 daemons (=
+every host's upgrade path — fleet-critical), and ordinary pulls would
+fsync-rewrite status ~3× per applied file. Root pattern: journal
+authority persisted at the wrong moments. GOOD news from the wave: t3's
+gate/witness shape extends cleanly to 182's E2/A0 interface requirements
+— no wire rework. All findings consolidated in the worktree's
+FIX-ROUND-2.md (items A–K, binding acceptance incl. re-verifying the
+reproduced deletion); codex fix round 2 IN FLIGHT → then re-review of
+fixed areas → one final serial review before merge. **Pending founder
+call (default: wait)**: #402 key-status fix is on main unreleased — cut
+v1.7.25 now or let it ride the t3 train. Then: tell Max._ the 180 client + 179 Keychain feature shipped
 (tag f6e945e9, release run success, api.rbox.to = 1.7.23). Founder waived the
 dev-build Keychain pre-validation (his call — testing with the released CLI on
 his real account; NOTE his Mac has no cached rk.key, so `rbox key save` will
@@ -492,6 +507,23 @@ Design 89 §6 named ~07-15 as the purge review date — resolved early, above.
 
 ## Standing rules (hard-won)
 
+- **Seam fakes encode OBSERVED contracts, never imagined ones**
+  (2026-07-22, cost two release trains): the 179 Keychain feature shipped
+  with four bugs because test fakes encoded an imagined `security(1)` —
+  real macOS: bare `login-keychain` (the `-d user` form exits 1), output
+  is indented `    "path"\n`, exit-0 find-generic-password prints a
+  ~20-line attribute dump (probe demanded one line → every present item
+  read "unavailable", #402). Before shipping any subprocess integration,
+  capture the real tool's output shape on real hardware and encode THAT
+  in the fake.
+- **Test-green ≠ invariant-holding for safety machinery** (2026-07-22,
+  178 t3): 1,143 tests passed while all seven lock-lifecycle invariants
+  failed — the suite covered the classification tables, not the
+  intermediate journal shapes, replacement races, and gate-crossing
+  windows. Reviews of crash-safety code must attack intermediate durable
+  states and adversarial substitutions, not re-run the matrix the
+  implementation was written against. (Same session: reviewer REPRODUCED
+  an L2 violation the tests missed.)
 - Agents: always work in `.claude/worktrees/<slug>` off main, never the primary
   checkout; rebase before merging (design-number collisions happen).
 - Prod D1/R2 mutations: always account-scoped, never blind — coworker
