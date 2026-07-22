@@ -294,11 +294,11 @@ removed; the redacted result is retained at
 
 ## New candidates (2026-07-22 evening, v1.7.24 release train)
 
-- `daemon-activity.test.ts` — "design 178 B: the pump serves one coalesced
-  due probe within eight continuously replenished ambient dequeues" and
-  "review H2: pull-only safety cadence clears a stale lane without a scan or
-  status call". Both failed on shard 1 of the v1.7.24 release-SHA run
-  (starved runner), both 3/3 green locally in isolation, green rerun same
-  SHA — proof complete. Written earlier today (178 t2); next deterministic
-  pass should convert their timing waits to the injected-clock pattern the
-  sweep established.
+- RESOLVED 2026-07-22 (PR #403): `daemon-activity.test.ts` — "design 178 B:
+  the pump serves one coalesced due probe within eight continuously
+  replenished ambient dequeues" and "review H2: pull-only safety cadence
+  clears a stale lane without a scan or status call". Both failed on shard 1
+  of the v1.7.24 release-SHA run (starved runner, proof completed there);
+  "review H2" recurred on PR #401 CI. Converted to injected clocks
+  (SafetyCadenceClock seam + ManualRecoveryClock) with assertions unchanged;
+  looped 10x green.
