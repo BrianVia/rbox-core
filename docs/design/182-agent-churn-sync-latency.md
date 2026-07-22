@@ -1,13 +1,15 @@
 # 182 — sync latency under continuous agent churn (capture in the gaps)
 
-Status: DRAFT v8 — round 7 (gpt-5.6-sol, high) accepted the publish-or-
-defer fix but found the entry protocol unlinearized with stop (3
-findings). Folded: synchronous gate reservation before awaiting
-publication + post-await closed-gate re-check + unconditional (finally)
-reservation release (r7-1); defer/retry liveness — retained want, busy-
-retry pacing, shutdown-aware cancelation, no drain blocking (r7-2);
-deterministic entry-protocol acceptance matrix incl. the stop race
-(r7-3). Round 8 verifies the entry protocol only.
+Status: ALIGNED v8 — round 8 (gpt-5.6-sol, high) certified r7-1/2/3
+closed with zero findings. Eight-round loop, strictly narrowing:
+19/5 → 9/3 → 7/2 → 7/2 → 5/1 → 1 blocker → 3 protocol findings → 0.
+Ship order stands (E1 → A0 → A1 → E2 → B's own design rounds → C → A2);
+A0 and the E2 witness carry named interface requirements ON 178 t3
+(always-live criticalPhase witness with the reservation entry protocol;
+pin-journal ownership discipline).
+
+History (loop): v7 folded r6 (fail-closed publish-or-defer); v8 folded
+r7 (entry/stop linearization, retry liveness, acceptance matrix).
 
 History: v5 folded round 4 (7/2: journal-pin sweep, E2 gating, doPush
 governor, argv cliff, fanout behind debounce, distinct-OID benchmark).
