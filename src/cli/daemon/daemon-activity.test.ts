@@ -6,7 +6,7 @@ import { HashCache, scanManifest, type BlobStore, type FileEntry, type IgnoreMat
 import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
 import { loadActivity, renderShellLine, saveActivity, type DaemonActivity } from "../activity.js";
 import { loadState, saveStateUnsafeLegacyOrTest, syncStreamId, type SyncState, type WorkspaceConfig } from "../config.js";
-import { RboxDaemon } from "../daemon.js";
+import { RboxDaemon, type SafetyCadenceClock } from "../daemon.js";
 import { daemonRuntimeDir, daemonStatusPath, readDaemonBindingRecord, readDaemonPidRecord, recordDaemonBinding } from "../daemon-control.js";
 import { MassDeleteGuardError, pull } from "../sync.js";
 import { CommitRejectedError, QuotaExceededError, type CommitOptions, type CommitResult, type SyncRemote } from "../remote.js";
@@ -96,12 +96,14 @@ interface DaemonInternals {
   startLiveWatch(): Promise<void>;
   watcher?: Watcher;
   watcherDegraded: boolean;
-  safetyTimer?: ReturnType<typeof setTimeout>;
+  safetyTimer?: unknown;
+  scheduleSafetyScan(): void;
   deepTimer?: ReturnType<typeof setInterval>;
   doFullScan(): Promise<{ coverage: "full-tree" | "pruned"; errorGenAtStart: number }>;
   onTransferProgress(done: number, total: number, phase: TransferPhase, detailOrBytes?: string | TransferProgressBytes, bytes?: TransferProgressBytes): void;
   lastProgressWrite: number;
   pump(): Promise<void>;
+  pumpRun: Promise<void>;
   start(): Promise<void>;
   stop(): Promise<void>;
   loadSyncBase(): Promise<SyncState>;
@@ -323,15 +325,35 @@ class ManualRecoveryClock {
   }
 }
 
+class ManualSafetyClock implements SafetyCadenceClock {
+  private next = 0;
+  readonly callbacks = new Map<number, () => void | Promise<void>>();
+  setTimeout(fn: () => void | Promise<void>): number {
+    const id = ++this.next;
+    this.callbacks.set(id, fn);
+    return id;
+  }
+  clearTimeout(handle: unknown): void {
+    this.callbacks.delete(handle as number);
+  }
+  async fireAll(): Promise<void> {
+    const callbacks = [...this.callbacks.values()];
+    this.callbacks.clear();
+    await Promise.all(callbacks.map((callback) => callback()));
+  }
+}
+
 test("design 178 B: the pump serves one coalesced due probe within eight continuously replenished ambient dequeues", async () => {
   const order: string[] = [];
   const remote = new OrderedPullRemote(order);
-  const daemon = await makeDaemon(remote);
+  const clock = new ManualRecoveryClock();
+  const daemon = await makeDaemon(remote, "boot-test", { now: () => TEST_NOW, recoveryClock: clock });
   daemon.activity.halt = {
     at: iso(10), reason: "pull failed", count: 1, op: "pull",
     firstFailureAt: iso(10), lastFailureAt: iso(10), consecutiveFailures: 1,
+    nextProbeAt: new Date(TEST_NOW + 60_000).toISOString(),
   };
-  daemon.recoveryDue = true;
+  daemon.armStandingRecovery();
   daemon.want.deepScan = true;
   let scans = 0;
   daemon.doDeepScan = async () => {
@@ -341,11 +363,12 @@ test("design 178 B: the pump serves one coalesced due probe within eight continu
     return { coverage: "full-tree", errorGenAtStart: 0 };
   };
 
-  // Repeated timer firings still describe one standing episode and one composite
-  // slot: recoveryDue is deliberately a boolean, not a queued count.
+  // Repeated wakeups still describe one standing episode and one composite slot:
+  // recoveryDue is deliberately a boolean, not a queued count.
+  clock.fireAll();
   daemon.recoveryDue = true;
   daemon.recoveryDue = true;
-  await daemon.pump();
+  await daemon.pumpRun;
 
   expect(order.slice(0, 9)).toEqual([...Array(8).fill("ambient"), "recovery"]);
   expect(remote.pullCalls).toBe(1);
@@ -668,7 +691,12 @@ test("review H2: pull-only safety cadence clears a stale lane without a scan or 
       const child = Bun.spawn(["git", "-C", repo, "init", "-q"]);
       child.exited.then((code) => code === 0 ? resolve() : reject(new Error(`git init exited ${code}`)));
     });
-    const daemon = await makeDaemon(new MiniRemote(), "pull-only-hygiene", { pullOnly: true });
+    const clock = new ManualSafetyClock();
+    const daemon = await makeDaemon(new MiniRemote(), "pull-only-hygiene", {
+      pullOnly: true,
+      now: () => TEST_NOW,
+      safetyClock: clock,
+    });
     const at = new Date(TEST_NOW - 60_000).toISOString();
     const seeded: SyncState = {
       ...(daemon.syncBase ?? await daemon.loadSyncBase()),
@@ -682,12 +710,9 @@ test("review H2: pull-only safety cadence clears a stale lane without a scan or 
     };
     await saveStateUnsafeLegacyOrTest(root, seeded);
     daemon.syncBase = await loadState(root, seeded.stream);
-    await daemon.start();
+    daemon.scheduleSafetyScan();
     expect(daemon.safetyTimer).toBeDefined();
-    if (daemon.safetyTimer) clearTimeout(daemon.safetyTimer);
-    daemon.safetyTimer = undefined;
-
-    await daemon.runSafetyCadenceTick();
+    await clock.fireAll();
 
     expect(daemon.syncBase?.repoRecords?.repo?.deferrals).toBeUndefined();
     expect((await loadState(root, seeded.stream)).repoRecords?.repo?.deferrals).toBeUndefined();
