@@ -106,6 +106,9 @@ interface DaemonInternals {
   stop(): Promise<void>;
   loadSyncBase(): Promise<SyncState>;
   runDeferralHygiene(): Promise<void>;
+  runSafetyCadenceTick(): Promise<void>;
+  hasPublishableLocalDivergence(): Promise<"none" | "some" | "indeterminate">;
+  doPush(...args: unknown[]): Promise<void>;
   ambientStatusFrom(activity: DaemonActivity, settled: boolean, now: number): { deferredRepos: number };
   writeHeartbeatSurfaces(): void;
   scheduleWriteFinishRetry(paths: Set<string>): void;
@@ -118,6 +121,7 @@ interface DaemonInternals {
   handleWsMessageData(data: string): void;
   markWsOpen(ws: WebSocket): number;
   markWsCaughtUp(generation: number): void;
+  markWsStartupDisconnected(): void;
   markWsDisconnected(ws: WebSocket, reason: "close" | "error"): boolean;
   handleWsClose(ws: WebSocket): void;
   refreshWsAtThrottled(): void;
@@ -140,7 +144,7 @@ afterEach(async () => {
   await fs.rm(root, { recursive: true, force: true });
 });
 
-function testConfig(): WorkspaceConfig {
+function testConfig(overrides: Partial<WorkspaceConfig> = {}): WorkspaceConfig {
   return {
     schema: "e2ee/v1",
     remoteWorkspaceId: "ws_act",
@@ -154,6 +158,7 @@ function testConfig(): WorkspaceConfig {
     accountId: "acct_act",
     accountEpoch: 0,
     keyEpoch: 0,
+    ...overrides,
   };
 }
 
@@ -161,8 +166,9 @@ async function makeDaemon(
   remote: MiniRemote,
   bootId = "boot-test",
   opts: ConstructorParameters<typeof RboxDaemon>[3] = {},
+  cfgOverrides: Partial<WorkspaceConfig> = {},
 ): Promise<DaemonInternals> {
-  const cfg = testConfig();
+  const cfg = testConfig(cfgOverrides);
   const daemon = new RboxDaemon(root, cfg, { remote, backoff: async () => {} }, { bootId, ...opts }) as unknown as DaemonInternals;
   daemons.push(daemon);
   daemon.cache = await HashCache.load(root);
@@ -183,6 +189,23 @@ function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => voi
 
 const fakeWs = () => ({ readyState: WebSocket.OPEN, send: () => {}, close: () => {} }) as unknown as WebSocket;
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+async function git(repo: string, ...args: string[]): Promise<void> {
+  const child = Bun.spawn(["git", "-C", repo, ...args], { stdout: "ignore", stderr: "pipe" });
+  const code = await child.exited;
+  if (code !== 0) throw new Error(`git ${args.join(" ")} failed: ${await new Response(child.stderr).text()}`);
+}
+
+async function makeCommittedRepo(rel = "repo"): Promise<string> {
+  const repo = path.join(root, rel);
+  await fs.mkdir(repo);
+  await git(repo, "init", "-q");
+  await git(repo, "config", "user.email", "test@example.com");
+  await git(repo, "config", "user.name", "Test");
+  await fs.writeFile(path.join(repo, "tracked.txt"), "base\n");
+  await git(repo, "add", "tracked.txt");
+  await git(repo, "commit", "-qm", "base");
+  return repo;
+}
 async function withIsolatedDaemonHome<T>(fn: (home: string) => Promise<T>): Promise<T> {
   const oldHome = process.env.RBOX_HOME;
   const home = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-daemon-owner-home-"));
@@ -464,15 +487,23 @@ test("design 178 B: restart in pull-only keeps a persisted push recovery dormant
   await withIsolatedDaemonHome(async () => {
   const halt: NonNullable<DaemonActivity["halt"]> = {
     at: new Date(TEST_NOW - 10_000).toISOString(), reason: "push conflict", count: 1, op: "push",
+    firstFailureAt: new Date(TEST_NOW - 30_000).toISOString(),
     typedReason: { kind: "push-conflict" }, nextProbeAt: new Date(Date.now() + 60_000).toISOString(),
   };
-  await saveActivity(root, { at: new Date().toISOString(), halt });
+  await saveActivity(root, {
+    at: new Date().toISOString(),
+    halt,
+    ws: { connected: true, at: new Date().toISOString(), caughtUp: true, bootId: "prior-boot", pid: 9999 },
+  });
   const pullOnlyRemote = new AlwaysConflictRemote();
+  pullOnlyRemote.latestError = new Error("temporary pull failure");
   const dormant = await makeDaemon(pullOnlyRemote, "pull-only-restart", { pullOnly: true });
   await dormant.start();
   expect(dormant.recoveryDue).toBe(false);
   expect(dormant.want.push).toBe(false);
-  expect(dormant.activity.halt).toMatchObject({ ...halt, recoveryState: "suspended" });
+  expect(dormant.activity.halt).toMatchObject({ op: "pull", reason: "temporary pull failure" });
+  expect(dormant.activity.suspendedPushHalt).toMatchObject({ ...halt, recoveryState: "suspended" });
+  expect(dormant.activity.ws?.bootId).toBe("pull-only-restart");
   expect(pullOnlyRemote.commitCalls).toBe(0);
   await dormant.stop();
 
@@ -481,8 +512,45 @@ test("design 178 B: restart in pull-only keeps a persisted push recovery dormant
   writable.startWatcherFn = async () => ({ backend: "parcel", close: async () => {} });
   await writable.start();
   expect(writable.recoveryTimer).toBeDefined();
-  expect(writable.activity.halt?.recoveryState).toBe("armed");
+  expect(writable.activity.halt).toMatchObject({
+    op: "push",
+    firstFailureAt: halt.firstFailureAt,
+    typedReason: { kind: "push-conflict" },
+    recoveryState: "armed",
+  });
+  expect(writable.activity.suspendedPushHalt).toBeUndefined();
   await writable.stop();
+  });
+});
+
+test("review L3: startup resurrects only the intended prior activity slots", async () => {
+  await withIsolatedDaemonHome(async () => {
+    const oldDisabled = process.env.RBOX_DAEMON_WS_DISABLED;
+    process.env.RBOX_DAEMON_WS_DISABLED = "1";
+    try {
+      const oldAt = "2025-01-01T00:00:00.000Z";
+      const lastPush = { at: "2025-01-01T00:01:00.000Z", files: 2, sequence: 7 };
+      await saveActivity(root, {
+        at: oldAt,
+        active: { at: oldAt, phase: "upload", done: 1, total: 2 },
+        ws: { connected: true, at: oldAt, caughtUp: true, bootId: "prior-boot", pid: 9999 },
+        lastPush,
+      });
+      const daemon = await makeDaemon(new MiniRemote(), "selective-resurrection", { pullOnly: true });
+      // Observe the resurrection boundary itself rather than letting the normal
+      // startup WS marker overwrite any wrongly copied prior-boot slot.
+      daemon.markWsStartupDisconnected = () => {};
+
+      await daemon.start();
+
+      expect(daemon.activity.at).not.toBe(oldAt);
+      expect(daemon.activity.active).toBeUndefined();
+      expect(daemon.activity.ws).toBeUndefined();
+      expect(daemon.activity.lastPush).toEqual(lastPush);
+    } finally {
+      if (oldDisabled === undefined) delete process.env.RBOX_DAEMON_WS_DISABLED;
+      else process.env.RBOX_DAEMON_WS_DISABLED = oldDisabled;
+    }
   });
 });
 
@@ -521,6 +589,45 @@ test("design 178 B: idle-host conflict recovery clears after pull without anothe
   expect(daemon.activity.halt?.consecutiveFailures).toBe(1);
 });
 
+test("review M2: locked divergent repo is indeterminate and conflict recovery still probes once", async () => {
+  const repo = await makeCommittedRepo();
+  const remote = new MiniRemote();
+  const daemon = await makeDaemon(remote, "locked-recovery", {}, { syncGit: true });
+  await fs.writeFile(path.join(repo, ".git", "index.lock"), "");
+  daemon.manifest = daemon.syncBase!.lastSyncedManifest;
+  expect(await daemon.hasPublishableLocalDivergence()).toBe("indeterminate");
+  daemon.hasPublishableLocalDivergence = async () => "indeterminate";
+  daemon.activity.halt = {
+    at: iso(30), reason: "push conflict", count: 1, op: "push",
+    firstFailureAt: iso(30), lastFailureAt: iso(10), consecutiveFailures: 1,
+    nextProbeAt: iso(1), typedReason: { kind: "push-conflict" }, recoveryState: "armed",
+  };
+  let pushAttempts = 0;
+  daemon.doPush = async () => { pushAttempts++; };
+  daemon.recoveryDue = true;
+
+  await daemon.pump();
+
+  expect(pushAttempts).toBe(1);
+  expect(daemon.activity.halt).toBeUndefined();
+});
+
+test("review M2: post-pull indeterminate divergence does not suppress the push", async () => {
+  const repo = await makeCommittedRepo();
+  const daemon = await makeDaemon(new MiniRemote(), "locked-post-pull", {}, { syncGit: true });
+  await fs.writeFile(path.join(repo, ".git", "index.lock"), "");
+  daemon.manifest = daemon.syncBase!.lastSyncedManifest;
+  expect(await daemon.hasPublishableLocalDivergence()).toBe("indeterminate");
+  daemon.hasPublishableLocalDivergence = async () => "indeterminate";
+  let pushAttempts = 0;
+  daemon.doPush = async () => { pushAttempts++; };
+  daemon.want.pull = true;
+
+  await daemon.pump();
+
+  expect(pushAttempts).toBe(1);
+});
+
 test("design 178 C: daemon hygiene updates the next ambient heartbeat projection", async () => {
   await withIsolatedDaemonHome(async () => {
     const repo = path.join(root, "repo");
@@ -549,6 +656,42 @@ test("design 178 C: daemon hygiene updates the next ambient heartbeat projection
     daemon.writeHeartbeatSurfaces();
     await daemon.activityWrite;
     expect((await readAmbientStatus()).deferredRepos).toBe(0);
+  });
+});
+
+test("review H2: pull-only safety cadence clears a stale lane without a scan or status call", async () => {
+  await withIsolatedDaemonHome(async () => {
+    const repo = path.join(root, "repo");
+    await fs.mkdir(repo);
+    await new Promise<void>((resolve, reject) => {
+      const child = Bun.spawn(["git", "-C", repo, "init", "-q"]);
+      child.exited.then((code) => code === 0 ? resolve() : reject(new Error(`git init exited ${code}`)));
+    });
+    const daemon = await makeDaemon(new MiniRemote(), "pull-only-hygiene", { pullOnly: true });
+    const at = new Date(TEST_NOW - 60_000).toISOString();
+    const seeded: SyncState = {
+      ...(daemon.syncBase ?? await daemon.loadSyncBase()),
+      repoRecords: {
+        repo: {
+          repoGen: 1,
+          sourceSeq: 0,
+          deferrals: { capture: { lane: "capture", reason: "git-busy", deferredSince: at, reasonSince: at, lastSeen: at } },
+        },
+      },
+    };
+    await saveStateUnsafeLegacyOrTest(root, seeded);
+    daemon.syncBase = await loadState(root, seeded.stream);
+    await daemon.start();
+    expect(daemon.safetyTimer).toBeDefined();
+    if (daemon.safetyTimer) clearTimeout(daemon.safetyTimer);
+    daemon.safetyTimer = undefined;
+
+    await daemon.runSafetyCadenceTick();
+
+    expect(daemon.syncBase?.repoRecords?.repo?.deferrals).toBeUndefined();
+    expect((await loadState(root, seeded.stream)).repoRecords?.repo?.deferrals).toBeUndefined();
+    expect(daemon.want.fullScan).toBe(false);
+    expect(daemon.want.push).toBe(false);
   });
 });
 
@@ -595,6 +738,26 @@ test("design 178 B: safety halt clears only when its own recovery predicate stop
   const rehalted = await loadActivity(root);
   expect(rehalted?.halt?.reason).toContain("mass-delete guard");
   expect(rehalted?.halt?.count).toBe(1);
+});
+
+test("review M3: typed mass-delete episode identity survives changing count text", async () => {
+  const remote = new MiniRemote();
+  remote.latestError = new MassDeleteGuardError("pull", "pull would delete 8000 of 9000 tracked files — refusing (mass-delete guard).");
+  const daemon = await makeDaemon(remote);
+  daemon.want.pull = true;
+  await daemon.pump();
+  const firstFailureAt = daemon.activity.halt?.firstFailureAt;
+
+  remote.latestError = new MassDeleteGuardError("pull", "pull would delete 8100 of 9000 tracked files — refusing (mass-delete guard).");
+  daemon.recoveryDue = true;
+  await daemon.pump();
+
+  expect(daemon.activity.halt).toMatchObject({
+    reason: expect.stringContaining("8100 of 9000"),
+    firstFailureAt,
+    consecutiveFailures: 2,
+    typedReason: { kind: "mass-delete", op: "pull" },
+  });
 });
 
 test("a committed push records the last-sync trail; a no-op push does not", async () => {
@@ -901,6 +1064,74 @@ test("quota errors record outOfStorage, suppress watcher uploads, probe on safet
   expect(activity?.outOfStorage).toBeUndefined();
   expect(activity?.halt).toBeUndefined();
   expect(activity?.lastPush?.sequence).toBe(1);
+});
+
+test("review M1: quota thrown by a conflict recovery probe is reclassified", async () => {
+  const remote = new QuotaCommitRemote();
+  const daemon = await makeDaemon(remote);
+  await fs.writeFile(path.join(root, "local.txt"), "publish me");
+  daemon.manifest = await scanManifest(root);
+  daemon.activity.halt = {
+    at: iso(30), reason: "push conflict", count: 2, op: "push",
+    firstFailureAt: iso(30), lastFailureAt: iso(10), consecutiveFailures: 2,
+    nextProbeAt: iso(1), typedReason: { kind: "push-conflict" }, recoveryState: "armed",
+  };
+  daemon.recoveryDue = true;
+
+  await daemon.pump();
+  await daemon.activityWrite;
+
+  expect(remote.commitCalls).toBe(1);
+  expect(daemon.activity.outOfStorage?.kind).toBe("storage");
+  expect(daemon.activity.halt).toBeUndefined();
+  expect((await loadActivity(root))?.halt).toBeUndefined();
+});
+
+test("review M1: unrelated generic probe error starts a message-only episode", async () => {
+  const remote = new RejectedCommitRemote(new Error("unrelated upload failure"));
+  const daemon = await makeDaemon(remote);
+  await fs.writeFile(path.join(root, "local.txt"), "publish me");
+  daemon.manifest = await scanManifest(root);
+  const originalFirstFailureAt = iso(30);
+  daemon.activity.halt = {
+    at: originalFirstFailureAt, reason: "push conflict", count: 3, op: "push",
+    firstFailureAt: originalFirstFailureAt, lastFailureAt: iso(10), consecutiveFailures: 3,
+    nextProbeAt: iso(1), typedReason: { kind: "push-conflict" }, recoveryState: "armed",
+  };
+  daemon.recoveryDue = true;
+
+  await daemon.pump();
+
+  expect(daemon.activity.halt).toMatchObject({
+    reason: "unrelated upload failure",
+    consecutiveFailures: 1,
+    op: "push",
+  });
+  expect(daemon.activity.halt?.typedReason).toBeUndefined();
+  expect(daemon.activity.halt?.firstFailureAt).not.toBe(originalFirstFailureAt);
+});
+
+test("review M1: commit rejection during a conflict probe captures the new fingerprint", async () => {
+  const rejected = new CommitRejectedError("too_many_refs", 250_001, 250_000, "probe-fingerprint");
+  const remote = new RejectedCommitRemote(rejected);
+  const daemon = await makeDaemon(remote);
+  await fs.writeFile(path.join(root, "local.txt"), "publish me");
+  daemon.manifest = await scanManifest(root);
+  daemon.activity.halt = {
+    at: iso(30), reason: "push conflict", count: 2, op: "push",
+    firstFailureAt: iso(30), lastFailureAt: iso(10), consecutiveFailures: 2,
+    nextProbeAt: iso(1), typedReason: { kind: "push-conflict" }, recoveryState: "armed",
+  };
+  daemon.recoveryDue = true;
+
+  await daemon.pump();
+
+  expect(daemon.activity.halt).toMatchObject({
+    reason: rejected.message,
+    consecutiveFailures: 1,
+    typedReason: { kind: "too-many-refs" },
+    terminal: { fingerprint: "probe-fingerprint" },
+  });
 });
 
 test.each([

@@ -29,7 +29,7 @@ const NOTICE =
 const bunVersion = () => (process.versions as NodeJS.ProcessVersions & { bun?: string }).bun ?? "unknown";
 const GIT_DEFERRAL_REASONS = new Set([
   "local-edits", "local-index", "local-operation", "local-commits", "local-stash",
-  "conflict", "git-busy", "worktree-ownership", "ignored-target", "unreadable",
+  "conflict", "git-busy", "stale-unattributed", "worktree-ownership", "ignored-target", "unreadable",
   "artifact", "config", "containment", "unsupported", "other",
 ]);
 

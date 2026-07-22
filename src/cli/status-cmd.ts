@@ -423,7 +423,11 @@ export async function statusCmdWithDeps(
     state = result.state;
     hygieneDetails = result.displayDetails;
   };
-  await runDeferralHygiene();
+  try {
+    await runDeferralHygiene();
+  } catch {
+    // Fail closed: retain the durable lanes already loaded and keep rendering.
+  }
 
   const activityP = daemonStale ? Promise.resolve(undefined) : loadActivity(root);
   const trashP = trashStats(root).catch(() => undefined);
@@ -446,7 +450,11 @@ export async function statusCmdWithDeps(
   let mustComputeLocal = false;
   if (localBaseSequenceMismatched(activity, state)) {
     state = await loadState(root, syncStreamId(cfg));
-    await runDeferralHygiene();
+    try {
+      await runDeferralHygiene();
+    } catch {
+      // Fail closed after the reload too; status remains available.
+    }
     attributed = attributeActivity(state);
     activity = attributed.activity;
     mustComputeLocal = true;
@@ -472,13 +480,14 @@ export async function statusCmdWithDeps(
     source?: readonly GitDivergenceRepoHint[] | AsyncIterable<GitDivergenceRepoHint>,
     includeBaseRepos = true
   ): Promise<GitDivergenceStatus> => {
-    if (!cfg.syncGit) return { count: 0, deferrals: localGitDeferrals(state).map(({ repo, ...d }) => ({ relPath: repo, ...d })), configChecking: [], configDisabled: [], conflictSnapshots: { total: 0, prunable: 0 } };
+    if (!cfg.syncGit) return { count: 0, indeterminate: false, deferrals: localGitDeferrals(state).map(({ repo, ...d }) => ({ relPath: repo, ...d })), configChecking: [], configDisabled: [], conflictSnapshots: { total: 0, prunable: 0 } };
     try {
       if (deps.gitDivergenceStatus) {
         return await deps.gitDivergenceStatus(root, cfg, state, matcher, source, includeBaseRepos);
       }
       return {
         count: await deps.gitDivergenceCount(root, cfg, state, matcher, source, includeBaseRepos),
+        indeterminate: false,
         deferrals: localGitDeferrals(state).map(({ repo, ...d }) => ({ relPath: repo, ...d })),
         configChecking: [],
         configDisabled: [],
@@ -487,7 +496,7 @@ export async function statusCmdWithDeps(
     } catch {
       // Design 93 §6: an indeterminate config lane is conservatively divergent;
       // status must never collapse an evaluation failure to zero.
-      return { count: 1, deferrals: localGitDeferrals(state).map(({ repo, ...d }) => ({ relPath: repo, ...d })), configChecking: ["*"], configDisabled: [], conflictSnapshots: { total: 0, prunable: 0 } };
+      return { count: 1, indeterminate: true, deferrals: localGitDeferrals(state).map(({ repo, ...d }) => ({ relPath: repo, ...d })), configChecking: ["*"], configDisabled: [], conflictSnapshots: { total: 0, prunable: 0 } };
     }
   };
 
@@ -682,7 +691,8 @@ export async function statusCmdWithDeps(
     const nextVersion = updateAvailableVersion(updateState);
     const planQuota = aggregatePlanQuotaAttention(account, activity?.outOfStorage);
     const typedHalt = activity?.halt?.typedReason;
-    const retryArmed = Boolean(activity?.halt?.nextProbeAt
+    const retryArmed = Boolean(bg.running
+      && activity?.halt?.nextProbeAt
       && activity.halt.recoveryState !== "suspended"
       && activity.halt.recoveryState !== "running"
       && !activity.halt.terminal

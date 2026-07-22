@@ -72,6 +72,41 @@ test("design 178 C: idle durable repo absent from discovery/base/pending is swep
   expect(repoRecordsForState(await loadState(root, STREAM)).gone?.deferrals).toBeUndefined();
 });
 
+test("review M5: bounded hygiene resumes from the next repo on the following pass", async () => {
+  const initial = stateWith(Object.fromEntries(["a", "b", "c"].map((repo) => [repo, {
+    repoGen: 1,
+    sourceSeq: 3,
+    deferrals: { capture: busy() },
+  }])));
+  await saveStateUnsafeLegacyOrTest(root, initial);
+  const cursor: { nextRepo?: string } = {};
+  const inspected: string[] = [];
+  let budgetTick = 0;
+  const overrides = depsFor({ status: "ok", locks: [] }, {
+    cursor,
+    timeBudgetMs: 1,
+    budgetNow: () => budgetTick++ * 2,
+    inspectRepo: async (repo: RepoCtx) => {
+      inspected.push(path.basename(repo.repoDir));
+      return { status: "ok" as const, locks: [] };
+    },
+  });
+
+  const first = await reconcileGitDeferrals(root, CFG, initial, overrides);
+  expect(inspected).toEqual(["a"]);
+  expect(cursor.nextRepo).toBe("b");
+  expect(repoRecordsForState(first.state).a?.deferrals).toBeUndefined();
+  expect(repoRecordsForState(first.state).b?.deferrals?.capture).toBeDefined();
+  expect(repoRecordsForState(first.state).c?.deferrals?.capture).toBeDefined();
+
+  budgetTick = 0;
+  const second = await reconcileGitDeferrals(root, CFG, first.state, overrides);
+  expect(inspected).toEqual(["a", "b"]);
+  expect(cursor.nextRepo).toBe("c");
+  expect(repoRecordsForState(second.state).b?.deferrals).toBeUndefined();
+  expect(repoRecordsForState(second.state).c?.deferrals?.capture).toBeDefined();
+});
+
 test("design 178 C: exact stale lane clears without pending/partial/attempt/attention or mixed-lane damage", async () => {
   const apply = busy("apply", "local-commits");
   const pending = {

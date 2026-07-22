@@ -130,6 +130,9 @@ const episodeKey = (root: string, repo: string, deferral: GitDeferral): string =
 
 export interface DeferralHygieneDeps {
   now: () => number;
+  budgetNow: () => number;
+  timeBudgetMs: number;
+  cursor?: DeferralHygieneCursor;
   resolveRepoContext: (repoDir: string) => Promise<RepoCtx | undefined>;
   inspectShared: (commonDir: string) => Promise<GitBusySharedInspection>;
   inspectRepo: (ctx: RepoCtx, shared: GitBusySharedInspection | Promise<GitBusySharedInspection>) => Promise<GitBusyInspection>;
@@ -138,8 +141,15 @@ export interface DeferralHygieneDeps {
   classifier: GitBusyClassifier;
 }
 
+export interface DeferralHygieneCursor {
+  /** Lexical repo name at which the next bounded pass resumes. */
+  nextRepo?: string;
+}
+
 const defaultDeps: DeferralHygieneDeps = {
   now: () => Date.now(),
+  budgetNow: () => performance.now(),
+  timeBudgetMs: 2_000,
   resolveRepoContext: repoCtx,
   inspectShared: inspectGitBusyShared,
   inspectRepo: inspectGitBusy,
@@ -180,20 +190,35 @@ export async function reconcileGitDeferrals(
     }
   }
   if (candidates.size === 0) {
+    if (deps.cursor) deps.cursor.nextRepo = undefined;
     return { state, changed: false, accepted: false, displayDetails: new Map(), commonDirsInspected: 0 };
   }
 
+  const orderedRepos = [...candidates.keys()].sort();
+  const cursorRepo = deps.cursor?.nextRepo;
+  const exactCursorIndex = cursorRepo === undefined ? -1 : orderedRepos.indexOf(cursorRepo);
+  const nextCursorIndex = cursorRepo === undefined
+    ? -1
+    : orderedRepos.findIndex((repo) => repo >= cursorRepo);
+  const startIndex = exactCursorIndex >= 0 ? exactCursorIndex : nextCursorIndex >= 0 ? nextCursorIndex : 0;
+  const passRepos = [...orderedRepos.slice(startIndex), ...orderedRepos.slice(0, startIndex)];
+  const budgetStartedAt = deps.budgetNow();
+
   const sharedInspections = new Map<string, Promise<GitBusySharedInspection>>();
   const inspections = new Map<string, GitBusyInspection>();
-  for (const repo of candidates.keys()) {
+  let inspectedCount = 0;
+  for (const repo of passRepos) {
+    if (inspectedCount > 0 && deps.budgetNow() - budgetStartedAt >= deps.timeBudgetMs) break;
     const repoDir = path.resolve(root, repo);
     if (repoDir !== root && !repoDir.startsWith(`${path.resolve(root)}${path.sep}`)) {
       inspections.set(repo, { status: "indeterminate", detail: "repository path leaves workspace" });
+      inspectedCount++;
       continue;
     }
     const ctx = await deps.resolveRepoContext(repoDir).catch(() => undefined);
     if (!ctx) {
       inspections.set(repo, { status: "indeterminate", detail: "repository context unavailable" });
+      inspectedCount++;
       continue;
     }
     const commonKey = path.resolve(ctx.commonDir);
@@ -206,11 +231,14 @@ export async function reconcileGitDeferrals(
       status: "indeterminate" as const,
       detail: error instanceof Error ? error.message : String(error),
     })));
+    inspectedCount++;
   }
+  if (deps.cursor) deps.cursor.nextRepo = inspectedCount < passRepos.length ? passRepos[inspectedCount] : undefined;
 
   const planned: Array<{ repo: string; predecessor: GitDeferral; replacement: GitDeferral | null }> = [];
   const displayDetails = new Map<string, GitBusyDisplayDetail>();
-  for (const [repo, deferrals] of candidates) {
+  for (const repo of passRepos.slice(0, inspectedCount)) {
+    const deferrals = candidates.get(repo)!;
     const inspection = inspections.get(repo) ?? { status: "indeterminate" as const, detail: "inspection missing" };
     const detail = inspection.status === "ok" ? displayDetail(inspection.locks, now) : undefined;
     for (const predecessor of deferrals) {

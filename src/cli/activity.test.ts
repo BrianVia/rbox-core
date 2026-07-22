@@ -36,6 +36,11 @@ test("round-trips the full record", async () => {
       recoveryState: "armed",
       typedReason: { kind: "push-conflict" },
     },
+    suspendedPushHalt: {
+      at: "2026-07-02T10:00:00.000Z", reason: "earlier push conflict", count: 1, op: "push",
+      firstFailureAt: "2026-07-02T10:00:00.000Z", recoveryState: "suspended",
+      typedReason: { kind: "push-conflict" },
+    },
     outOfStorage: { at: "2026-07-02T11:30:00.000Z", kind: "storage", used: 2147483648, cap: 2147483648 },
     local: {
       at: "2026-07-02T12:00:02.000Z",
@@ -95,6 +100,17 @@ test("malformed typed halt classifications are dropped without classifying raw s
     halt: { at, reason: "pull mass-delete guard too_many_refs", count: 1, op: "pull", typedReason: { kind: "mass-delete", op: "fullScan" } },
   }));
   expect(await loadActivity(root)).toEqual({ at, halt: { at, reason: "pull mass-delete guard too_many_refs", count: 1, op: "pull" } });
+});
+
+test("suspended push halt uses the halt validator and rejects non-push episodes", async () => {
+  const p = path.join(root, ".rbox", "state", "activity.json");
+  await fs.mkdir(path.dirname(p), { recursive: true });
+  const at = "2026-07-02T12:00:00.000Z";
+  await fs.writeFile(p, JSON.stringify({
+    at,
+    suspendedPushHalt: { at, reason: "not a push", count: 1, op: "pull", typedReason: { kind: "push-conflict" } },
+  }));
+  expect(await loadActivity(root)).toEqual({ at });
 });
 
 test("malformed local slot is dropped alone", async () => {

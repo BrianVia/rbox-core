@@ -107,6 +107,15 @@ function recordFetches(): string[] {
   return calls;
 }
 
+test("review L1: diagnostics classifies stale-unattributed before generic lock fallback", () => {
+  const redacted = redactGitLogLines(
+    "2026-07-13T12:00:00.000Z git deferred 14d: stale-unattributed locks remain on checkout unavailable (private/repo)\n",
+  );
+  expect(redacted).toContain("git-sync deferred reason=stale-unattributed age=14d");
+  expect(redacted).not.toContain("reason=git-busy");
+  expect(redacted).not.toContain("private/repo");
+});
+
 test("device identity check reports match, mismatch, and no enrollment", async () => {
   const enrolled = await bootstrapAccount("acct_doctor_device", "dev_enrolled", 1_900_000_000_000);
   await saveDevice(enrolled.secrets);

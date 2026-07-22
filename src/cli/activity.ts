@@ -23,6 +23,29 @@ import type { TransferPhase } from "./transfer-progress.js";
 const TRANSFER_PHASES: readonly TransferPhase[] = ["scan", "gitcap", "encrypt", "upload", "download"];
 const isTransferPhase = (v: unknown): v is TransferPhase => TRANSFER_PHASES.includes(v as TransferPhase);
 
+export interface DaemonRecoveryHalt {
+  at: string;
+  reason: string;
+  count: number;
+  firstFailureAt?: string;
+  lastFailureAt?: string;
+  consecutiveFailures?: number;
+  nextProbeAt?: string;
+  lastProbeAt?: string;
+  /** Timer lifecycle. Missing means a legacy armed episode when nextProbeAt exists. */
+  recoveryState?: "armed" | "running" | "suspended";
+  op: "pull" | "push" | "fullScan" | "deepScan";
+  /** Producer-authored classification. Missing/invalid legacy values are
+   * deliberately unknown; readers never classify the raw reason string. */
+  typedReason?:
+    | { kind: "mass-delete"; op: "pull" | "push" }
+    | { kind: "push-conflict" }
+    | { kind: "chain-repair" }
+    | { kind: "too-many-refs" }
+    | { kind: "body-too-large" };
+  terminal?: { fingerprint: string };
+}
+
 export interface DaemonActivity {
   /** Heartbeat — last time the pump completed an op (throttled; see daemon). */
   at: string;
@@ -72,28 +95,9 @@ export interface DaemonActivity {
    *  of the SAME op kind (`op`) — a mass-delete-guard halt from a pull must survive
    *  no-op push successes and safety scans. This is how a guard refusal (design 44)
    *  becomes visible. */
-  halt?: {
-    at: string;
-    reason: string;
-    count: number;
-    firstFailureAt?: string;
-    lastFailureAt?: string;
-    consecutiveFailures?: number;
-    nextProbeAt?: string;
-    lastProbeAt?: string;
-    /** Timer lifecycle. Missing means a legacy armed episode when nextProbeAt exists. */
-    recoveryState?: "armed" | "running" | "suspended";
-    op: "pull" | "push" | "fullScan" | "deepScan";
-    /** Producer-authored classification. Missing/invalid legacy values are
-     * deliberately unknown; readers never classify the raw reason string. */
-    typedReason?:
-      | { kind: "mass-delete"; op: "pull" | "push" }
-      | { kind: "push-conflict" }
-      | { kind: "chain-repair" }
-      | { kind: "too-many-refs" }
-      | { kind: "body-too-large" };
-    terminal?: { fingerprint: string };
-  };
+  halt?: DaemonRecoveryHalt;
+  /** Push recovery preserved while a pull-only daemon uses `halt` for live pull failures. */
+  suspendedPushHalt?: DaemonRecoveryHalt;
   /** Quota exhaustion blocks pushes, but it is soft state: halt still wins. */
   outOfStorage?: { at: string; kind: "storage" | "workspaces"; used?: number; cap?: number; reason?: "no_plan" };
 }
@@ -191,10 +195,12 @@ export async function loadActivity(root: string): Promise<DaemonActivity | undef
       }
       if (uint(act.etaSeconds)) a.active.etaSeconds = act.etaSeconds;
     }
-    const halt = raw.halt;
-    if (halt && timestamp(halt.at) && typeof halt.reason === "string" && positiveInt(halt.count) && (halt.op === "pull" || halt.op === "push" || halt.op === "fullScan" || halt.op === "deepScan")) {
+    const parseHalt = (halt: DaemonRecoveryHalt | undefined, requiredOp?: DaemonRecoveryHalt["op"]): DaemonRecoveryHalt | undefined => {
+      if (!halt || !timestamp(halt.at) || typeof halt.reason !== "string" || !positiveInt(halt.count)
+        || !(halt.op === "pull" || halt.op === "push" || halt.op === "fullScan" || halt.op === "deepScan")
+        || (requiredOp !== undefined && halt.op !== requiredOp)) return undefined;
       const terminal = halt.terminal;
-      a.halt = {
+      return {
         at: halt.at,
         reason: halt.reason,
         count: halt.count,
@@ -222,7 +228,11 @@ export async function loadActivity(root: string): Promise<DaemonActivity | undef
           ? { terminal: { fingerprint: terminal.fingerprint } }
           : {}),
       };
-    }
+    };
+    const halt = parseHalt(raw.halt);
+    if (halt) a.halt = halt;
+    const suspendedPushHalt = parseHalt(raw.suspendedPushHalt, "push");
+    if (suspendedPushHalt) a.suspendedPushHalt = suspendedPushHalt;
     const out = raw.outOfStorage;
     if (
       out &&
