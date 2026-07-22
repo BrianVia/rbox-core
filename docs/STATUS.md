@@ -5,7 +5,39 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
-_Last updated: 2026-07-22 (~02:45 UTC — v1.7.20 fleet-live): **v1.7.20 "resolutions land when you confirm them"** shipped and fleet-live (Mac + flat-meadow): design-177 synchronous keep-mine + **178 tranche 1** (PR #391 — echo-loop kill via PENDING-final precedence, universal sanitizer, ACK-composer supersession proof, capture idempotence; durable daemon modes with boot-bound witness + pendingModeIntent semantics after TWO field-failure fix rounds on flat-meadow). Field-validated on the incident host: storm conditions = 1 publish per 3.5min (was 1/36s); bare restart on the SIGNED release preserves pull-only (verified post-upgrade: mode witness pull-only). 178 doc now ALIGNED v5; tranches 2-3 (C+B deferral-hygiene/halt-recovery, then A graceful-stop/lock-journal + E-live) queued. **Design 179 (recovery kit → macOS Keychain + re-save + restore, Max's #6) ALIGNED v7 after 5 review rounds + a wrong-layer split**; **design 180 (atomic genesis enrollment) v1 DRAFT owns the pre-existing bootstrap-wedge production defect — its r1 (REVIEW-180-R1.md, 9 findings incl. an ordinary-bootstrap phrase-loss BLOCKER) is the NEXT CYCLE'S first fold**. 179A appendix: iCloud Keychain sync verified infeasible for the standalone CLI (probe data; signed-app/RboxBar route someday — founder ack'd). Release-train lesson banked: never push to main between a release commit and its tag (concurrency group cancelled the exact-SHA run; rerun recovered). Prior block below (the robustness night) has the incident + design-178 details._
+_Last updated: 2026-07-22 (~11:30 UTC — 178 t2 merged, 180 ALIGNED): **178
+tranche 2 is on main** (PR #392, squash 07b87872): C deferral-hygiene
+reconciler (re-probes every git-busy lane incl. repos gone from discovery,
+exact-lane CAS clears, categorical `stale-unattributed` after two stable
+≥30s observations with display-time detail, autonomous pull-only cadence,
+per-pass time budget) + B halt recovery (first-class `recoveryProbe`
+pull→reconcile→conditional-push, full-jitter ≤2min, K=8 dequeued-op fairness,
+want restored not consumed, immediate clear only on PROVEN no-delta —
+indeterminate/busy never clears, dormant push episodes survive pull-only in a
+dedicated slot, safety refusals keep ⛔ regardless of fingerprint). Review:
+3 parallel reviewers → fix batch → final serial review → 13/13 CI.
+Changelog under [Unreleased]. **CLI release intentionally HELD: promote
+`main → production` first (founder: `git push origin main:production`) so the
+prod API telemetry allowlist precedes clients emitting `stale-unattributed`;
+DEV already auto-deployed.** Then the normal release train ships t2.
+**Design 180 (atomic genesis enrollment) is ALIGNED v13 after THIRTEEN
+rounds** (commit 9df99af7; rounds+rulings in `.claude/review-180-r*`): the
+r4 wrong-layer pivot replaced the permit/witness/expiry repair fence with
+TOMBSTONE-CLAIM repair (claim row always exists — orphan/tombstone/real —
+single-row observation kills the split-read race; no expiry; capable
+bootstrap atomically replaces the exact tombstone). Load-bearing pieces:
+staged-RK pre-POST foothold + completion hold (fixes the phrase-loss
+BLOCKER), deletion-ledger NOT-EXISTS guards on EVERY account-linked mutation
+(bootstrap/repair/workspace-creation incl. its audit row — no post-purge
+resurrection), shared manifest-first quarantine primitive with completed
+marker, global→account pairing lock handoff, RETARGET transition witness +
+absence-only reselection, 423 as the only repair-fencing status, scrub-on-
+purge audits (design-37 compatible). 179 carried along to v18 (seam: 180
+owns rk.key.staged + completion intent; 179 layers keychain/cache on top).
+**Next: implement 180 (it gates 179's implementation), then 178 tranche 3
+(A lock journal/graceful stop + E-live).** Prior block: v1.7.20 night._
+
+_Previous: 2026-07-22 (~02:45 UTC — v1.7.20 fleet-live): **v1.7.20 "resolutions land when you confirm them"** shipped and fleet-live (Mac + flat-meadow): design-177 synchronous keep-mine + **178 tranche 1** (PR #391 — echo-loop kill via PENDING-final precedence, universal sanitizer, ACK-composer supersession proof, capture idempotence; durable daemon modes with boot-bound witness + pendingModeIntent semantics after TWO field-failure fix rounds on flat-meadow). Field-validated on the incident host: storm conditions = 1 publish per 3.5min (was 1/36s); bare restart on the SIGNED release preserves pull-only (verified post-upgrade: mode witness pull-only). 178 doc now ALIGNED v5; tranches 2-3 (C+B deferral-hygiene/halt-recovery, then A graceful-stop/lock-journal + E-live) queued. **Design 179 (recovery kit → macOS Keychain + re-save + restore, Max's #6) ALIGNED v7 after 5 review rounds + a wrong-layer split**; **design 180 (atomic genesis enrollment) v1 DRAFT owns the pre-existing bootstrap-wedge production defect — its r1 (REVIEW-180-R1.md, 9 findings incl. an ordinary-bootstrap phrase-loss BLOCKER) is the NEXT CYCLE'S first fold**. 179A appendix: iCloud Keychain sync verified infeasible for the standalone CLI (probe data; signed-app/RboxBar route someday — founder ack'd). Release-train lesson banked: never push to main between a release commit and its tag (concurrency group cancelled the exact-SHA run; rerun recovered). Prior block below (the robustness night) has the incident + design-178 details._
 
 _Previous: 2026-07-22 (post-midnight — the robustness night): after v1.7.19 shipped, a second incident unfolded LIVE and became the best forensic material rbox has ever produced. Chain: my scripted `rbox stop` at 21:33 UTC → 60s SIGKILL escalation landed inside the UNJOURNALED state-CAS witness-lock bracket (apply.ts:1737) → ~140 orphaned refs/**/*.lock → existence-only busy probe deferred the 10-repo savvy-core family 2h → stale base lost every push CAS race → halt latched (only a same-op success clears it; the failed want is consumed, retries ambient-only, pull-priority starved them) → SEPARATELY my fleet upgrade's bare stop/start dropped flat-meadow's --pull-only flag, and the advertised-over-pending comparison bug (plan.ts:226) turned its carried pendings into 280 echo publications in 2h50m that kept the remote moving. Manual heal: deleted stale locks, stopped FM, Mac pushed seq 427, restarted FM `--pull-only`. Fleet HEALTHY (Mac active, FM pull-only, loop dead). **Five codex forensic reports** (archived .claude/forensics-0721/ with raw logs) root-caused every link; **design 178 "transient hiccups heal themselves" is ALIGNED at v4 after 3 review rounds** — six workstreams: A crash-safe lock lifecycle (ownership journal, classify+reap, graceful stop, never clock-SIGKILL a critical section), B halt-as-reproducing-condition (composite recoveryProbe scheduler op, K=8 bounded service, pull-only dormancy), C deferral hygiene reconciler (shared classifier→action table, categorical stale-unattributed), D pending state machine (PENDING-final precedence over advertised, universal pure sanitizer, ACK-composer dry-run deep-equality for supersession), E mode durability (tri-state intent, bootId-bound mode witness in daemon.status.json, stop preserves mode), F sync-state reporter retry. **Ship order: tranche 1 = D + E-resume (kills the echo-loop class), then C+B, then A + E-live.** Also merged tonight: PR #390 design-177 synchronous keep-mine (7-round ALIGNED, rig-validated twice, on main for v1.7.20). Operator rules banked to memory: FM is pull-only BY CONFIG — bare stop/start DROPS the flag, use `rbox upgrade` or explicit `--pull-only`; never stop a daemon that may be mid-apply._
 
