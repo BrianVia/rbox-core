@@ -176,3 +176,14 @@ what happened, what it cost, fix hint if obvious.
   clean host. Two fixes wanted: find + fix the test writing to real RBOX_HOME;
   and the restart pass should treat a DEAD-pid daemon dir with an unreadable
   record as ignorable debris, not a restart failure.
+
+- 2026-07-22 (founder, from Mac menu bar): the bar shows "Degraded" (orange)
+  because 2 git repos are deferred even while sync is actively healthy —
+  needless user concern. Proposed precedence for the bar's headline state:
+  active transfers → "Syncing"; deferrals alone (esp. under the transient
+  quiet window) → secondary line only; "Degraded" reserved for halt /
+  out-of-storage / watcher-degraded. Fix spans the ambient projection's
+  exported state (this repo) + the bar app's mapping (external). Bonus: both
+  rows in the founder's screenshot were stale-or-ghost (pre-resolve
+  savvy-core + the pr8 gone-directory ghost) — t3's ghost fix shrinks this
+  panel too.
