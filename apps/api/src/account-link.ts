@@ -288,7 +288,11 @@ export async function confirmLink(req: Request, env: Env, nowMs: number): Promis
       dbFor(env, shell).prepare(`DELETE FROM fairuse_workspace_streams WHERE account_id = ? AND ${orphan}`).bind(shell, shell),
       dbFor(env, shell).prepare(`DELETE FROM fairuse_scans WHERE account_id = ? AND ${orphan}`).bind(shell, shell),
       dbFor(env, shell).prepare(`DELETE FROM fairuse_leases WHERE account_id = ? AND ${orphan}`).bind(shell, shell),
-      dbFor(env, shell).prepare(`DELETE FROM fairuse_account_queue WHERE account_id = ? AND ${orphan}`).bind(shell, shell)
+      dbFor(env, shell).prepare(`DELETE FROM fairuse_account_queue WHERE account_id = ? AND ${orphan}`).bind(shell, shell),
+      // SPEC-PER-ACCOUNT-LATENCY: the per-account latency rollup is derived, rebuildable
+      // telemetry (30-day self-pruning) — cleaned on reclaim like the fairuse ledger, never
+      // a reclaim blocker. account-data plane (origin shell's shard).
+      dbFor(env, shell).prepare(`DELETE FROM account_op_latency WHERE account_id = ? AND ${orphan}`).bind(shell, shell)
     );
   }
   try {

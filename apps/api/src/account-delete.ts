@@ -357,6 +357,8 @@ export async function finishD1(env: Env, accountId: string, clerkIds: string[], 
     data.prepare("DELETE FROM notification_deliveries WHERE token_hash IN (SELECT token_hash FROM device_notifications WHERE account_id = ?)").bind(a),
     data.prepare("DELETE FROM device_notifications WHERE account_id = ?").bind(a),
     data.prepare("DELETE FROM account_notify_prefs WHERE account_id = ?").bind(a),
+    // SPEC-PER-ACCOUNT-LATENCY: per-account latency rollup (account-scoped, data plane).
+    data.prepare("DELETE FROM account_op_latency WHERE account_id = ?").bind(a),
     data.prepare("DELETE FROM device_keys WHERE account_id = ?").bind(a),
     data.prepare("DELETE FROM account_keys WHERE account_id = ? AND NOT EXISTS (SELECT 1 FROM genesis_repair_audit WHERE account_id = ?)").bind(a,a),
     data.prepare("DELETE FROM workspace_keys WHERE account_id = ?").bind(a),
