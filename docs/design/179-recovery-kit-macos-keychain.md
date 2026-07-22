@@ -1,6 +1,6 @@
 # 179 — recovery kit: macOS Keychain instead of a plaintext Downloads file
 
-Status: v4 — DRAFT (round-1 and round-2 findings folded under founder-pinned rulings, 2026-07-21). Pending adversarial review.
+Status: v5 — DRAFT (round-1 through round-3 findings folded under founder-pinned rulings; post-fold adversarial review aligned, 2026-07-21).
 
 Round-1 ruling record (pinned; one line per finding):
 
@@ -24,6 +24,14 @@ Round-2 ruling record (pinned; one line per finding):
 4. Restore metadata — only a recognized record containing validated Keychain metadata supplies an identity; otherwise resolve login Keychain exactly once, and after recovery atomically merge `discoveredAt` metadata without disturbing plaintext/offer axes; record failure is nonfatal and unknown records remain untouched.
 5. Restore tests — cover the four-way TTY matrix, decline, valid-but-wrong fallback, one-shot resolution and identity propagation, exact account selection, merge preservation, and nonfatal record-write failure.
 6. Daemon rationale — only device/MK operational material is required by daemon/sync; optional `rk.key` is loaded by status/backup, not used as daemon rationale.
+
+Round-3 ruling record (pinned; one line per finding):
+
+1. Lost bootstrap response — retain transport retries; on `already_bootstrapped`, fetch and compare the published genesis material with this attempt: an exact match is this attempt's lost-response success and continues with staged RK intact, while a mismatch is a genuine competing genesis and takes the existing cleanup path.
+2. Durable keystore mutations — RK, staging, and commitment-locator writes require same-directory atomic temp+rename publication, exact read-back, and file plus parent-directory fsync; unlink requires parent-directory fsync. This is a new contract, not a property of today's `e2ee-keystore` helpers.
+3. Restore merge — rediscovery preserves the independent staging axis unchanged; under the locked re-read it merges only a same-identity Keychain artifact, while a concurrent different identity is preserved and warned about. Tests cover both staging preservation and identity conflict.
+4. Cache preference — capture the user's original `cacheRecovery` value before genesis staging forces caching, persist that original value, and restore it only after commitment.
+5. Manual stdin wording — the unchanged non-interactive manual-recovery stdin path is not described as bounded; only newly introduced bounded readers carry that guarantee.
 
 Owner: Claude (founder-directed, 2026-07-20)
 Origin: onboarding-ux backlog item #6 (macOS keychain), referenced from
@@ -66,7 +74,9 @@ These files remain mode-600 files per design 12 §13.1.
 1. On macOS, the default "save a recovery kit" action stores the phrase as a
    Keychain generic-password item, not a plaintext file.
 2. rbox never places the phrase in process argv, shell history, a temp file, or
-   ordinary command output on its way into Keychain.
+   ordinary command output on its way into Keychain. The mandatory genesis
+   no-loss exception stages encoded RK, not phrase text, through the hardened
+   same-directory keystore temp+rename contract specified below.
 3. `rbox key status` reports every recorded artifact and its live state without
    requesting secret data or turning an unavailable Keychain into "deleted."
 4. Explicit file output remains available (`--kit-path`), and non-macOS
@@ -124,13 +134,19 @@ macOS it may offer the exact-account Keychain item first:
   default/search list or invoke the resolver a second time. Invalid/unknown
   records still remain untouched as required below.
 - After successful recovery through that resolved identity, take the record
-  mutation lock, re-read, and atomically create/merge a Keychain artifact with
-  `discoveredAt` (never a fabricated `writtenAt`). Preserve existing
-  `plaintextArtifacts` and `offer` byte-for-byte at the value level. Failure to
-  lock, re-read, validate, or write emits a safe warning but never changes the
-  successful enrollment result. An unknown record is never overwritten or
-  normalized; leave it untouched and warn that rediscovery metadata was not
-  recorded.
+  mutation lock and re-read before deciding the merge. If the recognized record
+  still has no Keychain artifact, atomically add this identity with
+  `discoveredAt` (never a fabricated `writtenAt`). If it has the same service,
+  account, and canonical `keychainPath`, merge only the missing discovery
+  metadata without replacing an existing `writtenAt` or `discoveredAt`. If a
+  different Keychain identity appeared concurrently, preserve the record
+  unchanged and emit a safe conflict warning. Every successful merge preserves
+  existing `plaintextArtifacts`, `offer`, and `staging` byte-for-byte at the
+  value level; rediscovery does not complete or clear the staging commitment
+  protocol. Failure to lock, re-read, validate, or write emits a safe warning
+  but never changes the successful enrollment result. An unknown record is
+  never overwritten or normalized; leave it untouched and warn that rediscovery
+  metadata was not recorded.
 - This rescues this Mac after reinstall, deleted local state, or re-setup. The
   item is not iCloud Keychain-synchronized; the 24-word phrase remains the
   deliberate cross-machine recovery story.
@@ -163,14 +179,19 @@ The phrase-source matrix is therefore explicit:
 
 Non-interactive macOS genesis with `--kit` MUST NOT publish the account genesis
 until RK has a durable local foothold. Before bootstrap publication begins, it
-persists RK using the existing opt-in `rk.key` cache mechanism and its durability
-contract in the same mode-600 keystore trust domain as `mk.key`. This is a
-temporary use of the existing secret class: it creates no new plaintext format,
-temp file, or Downloads artifact. If durable staging fails, genesis aborts
-before any publish.
+persists RK in the existing opt-in `rk.key` format and mode-600 keystore trust
+domain as `mk.key`, but through the new hardened mutation contract below. This
+is a temporary use of the existing secret class: it creates no new persistent
+plaintext format or Downloads artifact. If durable staging fails, genesis
+aborts before any publish.
 
-The accompanying non-secret staging state records `startedAt` and the caller's
-original `cacheRecovery` preference. The state transition order is crash-safe:
+The genesis caller captures the user's original `cacheRecovery` preference
+before this flow overrides the bootstrap option to `cacheRecovery: true` to
+force staging. An omitted preference is normalized to `false`; command/wizard
+plumbing passes the explicit user value into this orchestration instead of
+trying to reconstruct it after bootstrap. The accompanying non-secret staging
+state records `startedAt` and that captured original value. The state transition
+order is crash-safe:
 
 1. atomically record staging intent, durably write/verify `rk.key`, then permit
    bootstrap publication;
@@ -185,6 +206,23 @@ original `cacheRecovery` preference. The state transition order is crash-safe:
    original preference: retain `rk.key` when `cacheRecovery` was true, or
    durably remove it when false; then atomically clear staging state.
 
+Bootstrap publication keeps the transport's automatic retries. The generated
+attempt descriptor remains available through response classification and
+contains the exact submitted `recoveryWrap`, `recoveryWrapId`, genesis roster,
+genesis key state, and device tuple (`deviceId`, signing/encryption public keys,
+and `mkWrap`). If any publication attempt returns `already_bootstrapped`, never
+infer a competing genesis from the status alone. Fetch `AccountKeysDTO`, verify
+the returned account chain as usual, and compare each descriptor field
+byte-for-byte with its corresponding published genesis entry and exact device.
+If every field matches, this attempt already committed and the 409 is the
+lost-response result of a transport retry: treat publication as successful,
+continue commitment, and retain staged RK until the normal verified commitment
+cleanup. If any field is absent or differs, treat it as a genuine competing
+genesis and take the existing `already-setup` cleanup path for this attempt's
+local device/MK/RK and staging state. Fetch, verification, or classification
+failure is neither case: fail closed and retain staged RK/state for diagnosis
+and retry.
+
 A crash or save failure after publication therefore leaves the staged `rk.key`
 available to `rbox key save`/backup resolution. Startup and human
 `rbox key status` reconcile a leftover marker conservatively: they never delete
@@ -195,6 +233,27 @@ idempotently; otherwise the marker remains and human status prints
 state. A marker without a readable verified `rk.key` is reported as unavailable
 and never as backed up. The temporary stage is not treated as an off-keystore
 backup and does not make uninstall safe.
+
+### Hardened RK/staging/locator file contract
+
+This design adds a normative durability contract for `rk.key`, the non-secret
+staging marker, and the `kit.json` commitment locator. A write creates a
+mode-correct `O_CREAT | O_EXCL` temporary file in the destination directory,
+writes the complete bytes, fsyncs the file, closes it, atomically renames it
+over the destination, reopens the published path without following symlinks,
+requires exact byte-for-byte read-back, fsyncs the published file, and fsyncs
+the parent directory before reporting success. A cleanup unlink reports durable
+success only after the unlink succeeds and the parent directory is fsynced.
+Failure at any step leaves the state machine conservative: it does not advance
+commitment or clear staging, and reconciliation may retry idempotently.
+
+This is new implementation work. Today's `writeSecret`/`saveRecoveryKey` uses
+an in-place `writeFile` with no atomic publication, read-back, file fsync, or
+parent-directory fsync (`src/cli/e2ee-keystore.ts:40-43`,
+`src/cli/e2ee-keystore.ts:170-172`), while `forgetRecoveryKey` removes the entry
+without fsyncing its parent (`src/cli/e2ee-keystore.ts:179-181`). Those helpers
+are the gap this contract must close; they are not evidence that the invariant
+already holds.
 
 `validatePhraseForAccount` is read-only: fetch account keys, verify the signed
 roster/key-state chain, require its account id to equal the authenticated
@@ -499,8 +558,8 @@ TTY/input rules are exact:
   |---|---|---|---|
   | yes | yes | Probe and offer when an exact item is present; decline or pre-admission candidate failure falls through. | Use today's interactive manual prompt on decline/fallback. |
   | yes | no | Do not probe/read/offer Keychain. | Use today's interactive manual prompt unchanged, even with stderr redirected. |
-  | no | yes | Do not probe/read/offer Keychain. | Use today's bounded non-interactive stdin phrase path. |
-  | no | no | Do not probe/read/offer Keychain. | Use today's bounded non-interactive stdin phrase path. |
+  | no | yes | Do not probe/read/offer Keychain. | Use today's non-interactive stdin phrase path unchanged. |
+  | no | no | Do not probe/read/offer Keychain. | Use today's non-interactive stdin phrase path unchanged. |
 
   Keychain gating therefore never converts a formerly valid manual-recovery
   invocation into an error or hang.
@@ -744,6 +803,8 @@ tables — remain side-effect free and receive exhaustive unit coverage.
    bounded-output redaction; source matrix; target decision table; strict v2 +
    legacy parsing and unknown/mixed rejection; atomic-claim concurrency; JSON
    mutation-free behavior; staging state parsing and crash-point transitions;
+   hardened RK/staging/locator write publication, exact read-back, file and
+   parent-directory fsync, and post-unlink parent-directory fsync failures;
    cleanup precheck + second pre-unlink check; and uninstall state precedence,
    including staged-only state plus plaintext and custom-Keychain backing paths
    inside the removal root.
@@ -751,10 +812,14 @@ tables — remain side-effect free and receive exhaustive unit coverage.
    cached no-stdin save, no-cache hidden TTY input, bounded non-TTY stdin,
    invalid/wrong-account phrase stores nothing, validation performs no
    admission/cache mutation, substituted and historical-but-authorized recovery
-   wraps fail before unwrap, non-interactive macOS genesis durably stages before
+   wraps fail before unwrap, non-interactive macOS genesis captures the original
+   cache preference before forcing `cacheRecovery: true` and durably stages before
    publish, stage failure prevents publish, exact verification and atomic
    commitment-locator persistence both precede stage cleanup, crashes at each
-   ordering boundary retain or reconcile RK safely, both original
+   ordering boundary retain or reconcile RK safely, a lost successful response
+   followed by retry and `already_bootstrapped` fetches published material, an
+   exact match proceeds with staged RK retained, a mismatch takes competing-
+   genesis cleanup, transport retries remain enabled, both original
    `cacheRecovery` preferences are restored, staged status copy is emitted,
    `showRecoveryPhrase` is never called, offer copy adapts, JSON emits no
    nudge/write, and wizard offers before dropping phrase.
@@ -768,14 +833,16 @@ tables — remain side-effect free and receive exhaustive unit coverage.
    |---|---|
    | stdin TTY / stderr TTY | Exact-account item is offered; decline enters the unchanged interactive manual prompt. |
    | stdin TTY / stderr non-TTY | No Keychain probe/read/offer; unchanged interactive manual recovery runs. |
-   | stdin non-TTY / stderr TTY | No Keychain probe/read/offer; bounded stdin recovery runs. |
-   | stdin non-TTY / stderr non-TTY | No Keychain probe/read/offer; bounded stdin recovery runs. |
+   | stdin non-TTY / stderr TTY | No Keychain probe/read/offer; unchanged stdin recovery runs. |
+   | stdin non-TTY / stderr non-TTY | No Keychain probe/read/offer; unchanged stdin recovery runs. |
    | Keychain phrase is BIP39-valid but wrong for current wrap | Redacted warning, zero admission writes, then manual entry; the manual candidate can succeed. |
    | Failure after admission persistence | Ordinary recovery error semantics; no fallback prompt or second phrase attempt. |
    | Recognized record with validated Keychain metadata | Resolver is never called; the same persisted canonical path reaches probe and read. |
    | No record or recognized record without Keychain metadata | Resolver is called exactly once; its one canonical path reaches probe and read. |
    | Exact account selection | Lookup uses the authenticated full account id; a different account's same-service item is never read or offered. |
-   | Successful recovery through resolved identity | Atomic `discoveredAt` merge preserves existing plaintext artifacts and offer values and invents no `writtenAt`. |
+   | Successful recovery; no Keychain artifact at locked re-read | Atomic `discoveredAt` merge preserves existing plaintext artifacts, offer, and staging values and invents no `writtenAt`. |
+   | Successful recovery; same identity at locked re-read | Merge preserves existing timestamps plus plaintext, offer, and staging axes; it adds only missing discovery metadata. |
+   | Successful recovery; different identity appeared before locked re-read | Concurrent identity and every other axis remain unchanged; emit a safe conflict warning. |
    | Rediscovery record lock/read/write failure | Safe warning only; enrollment remains successful. |
    | Unknown record | Resolver is called exactly once and read/recovery may proceed, but the record remains byte-for-byte untouched and a safe metadata warning is emitted. |
 
@@ -817,6 +884,6 @@ tables — remain side-effect free and receive exhaustive unit coverage.
 
 ## Open questions (for review)
 
-None in v4. The phrase-source, ACL, process, identity, state, offer, cleanup,
+None in v5. The phrase-source, ACL, process, identity, state, offer, cleanup,
 probe, uninstall, restore, and wording rulings above are pinned and are not
 reopened by implementation review.
