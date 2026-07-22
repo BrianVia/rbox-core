@@ -14,6 +14,7 @@ import {
   formatInteractiveGitPushSummary,
   preflightInitRebind,
   writeGuidedGenesisPullNotice,
+  runInit,
 } from "./init-cmd.js";
 import { saveConfig } from "./config.js";
 import type { InitPlan } from "./init-plan.js";
@@ -21,6 +22,8 @@ import { resolveInitPlan } from "./init-plan.js";
 import { mintSetupCreateConsent, mintSetupExistingConsent } from "./reset-consent.js";
 import { promptPath } from "./prompt.js";
 import { formatGitPushLine, type GitPushPlan } from "./sync-git.js";
+import { bootstrapAccount } from "../engine/e2ee/index.js";
+import { saveDevice } from "./e2ee-keystore.js";
 
 function gitPushPlan(overrides: Partial<GitPushPlan> = {}): GitPushPlan {
   return {
@@ -42,6 +45,31 @@ function gitPushPlan(overrides: Partial<GitPushPlan> = {}): GitPushPlan {
 test("git-history attachment progress uses the founder-specified per-repo label", () => {
   expect(attachingGitHistoryLabel(2, 101, "Dfinitiv/savvy-core"))
     .toBe("attaching git history (2/101 — Dfinitiv/savvy-core)");
+});
+
+test("init --bootstrap sends an existing exact legacy device+MK shape through the classifier before auth planning", async () => {
+  const priorHome = process.env.RBOX_HOME;
+  const priorFetch = globalThis.fetch;
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-init-legacy-entry-"));
+  process.env.RBOX_HOME = home;
+  const accountId = "acct_2020202020202020";
+  const deviceId = "dev_legacy_init";
+  try {
+    await saveDevice((await bootstrapAccount(accountId, deviceId, 1_900_000_000_000)).secrets);
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      expect(String(input)).toBe("https://api.test/v1/keys/account");
+      throw new Error("init classifier reached");
+    }) as typeof fetch;
+    await expect(runInit({ bootstrap: "secret", new: "true", root: home, "no-interactive": "true", "no-sync": "true" }, {
+      cwd: home,
+      defaultRemote: "https://api.test",
+      credentialResult: { state: "valid", source: "disk", credentials: { v: 1, token: "tok", deviceId, remoteUrl: "https://api.test", accountId }, legacy: false, extensions: {} },
+    })).rejects.toThrow("init classifier reached");
+  } finally {
+    globalThis.fetch = priorFetch;
+    if (priorHome === undefined) delete process.env.RBOX_HOME; else process.env.RBOX_HOME = priorHome;
+    await fs.rm(home, { recursive: true, force: true });
+  }
 });
 
 test("interactive git capture summary is compact, bulleted, and truncates captured and skipped repos", () => {

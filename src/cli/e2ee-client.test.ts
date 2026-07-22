@@ -3,12 +3,13 @@ import { Buffer } from "node:buffer";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { acquireClearMachineGenesisForPairing, assertNoPendingGenesis, enrollViaPairing, parsePairingToken } from "./e2ee-client.js";
-import { bootstrapAccount } from "../engine/e2ee/index.js";
+import { acquireClearMachineGenesisForPairing, assertNoPendingGenesis, beginAtomicGenesis, enrollViaPairing, parsePairingToken } from "./e2ee-client.js";
+import { bootstrapAccount, buildPairing } from "../engine/e2ee/index.js";
 import { saveDevice } from "./e2ee-keystore.js";
 import { e2eeRoot, genesisPaths, GENESIS_PENDING_MESSAGE, publishPrepublishMarker } from "./genesis-durable.js";
-import { acquireAccountGenesisLock, acquireGenesisLockPair, acquireGlobalGenesisLock, genesisLockRoot } from "./genesis-locks.js";
-import { genesisQuarantineDir, startGenesisQuarantine } from "./genesis-quarantine.js";
+import { acquireGlobalGenesisLock, genesisLockRoot, globalGenesisLockPath } from "./genesis-locks.js";
+import { genesisQuarantineDir, genesisQuarantineStatus } from "./genesis-quarantine.js";
+import { saveCredentials } from "./credentials.js";
 
 const origFetch = globalThis.fetch;
 const origRboxHome = process.env.RBOX_HOME;
@@ -168,13 +169,61 @@ test("pairing global scan checks every local account and releases the global fen
   await global.release();
 });
 
-test("pairing final-empty scan serializes first marker and repaired-legacy manifest publishers",async()=>{
-  const accountId="acct_2222222222222222",repairId=`gra_${"a".repeat(32)}`,sleep=(ms:number)=>new Promise<void>(resolve=>setTimeout(resolve,ms));
-  for(const kind of ["marker","quarantine"] as const){await fs.rm(genesisPaths(accountId).dir,{recursive:true,force:true});if(kind==="quarantine"){await fs.mkdir(genesisPaths(accountId).dir,{recursive:true});await fs.writeFile(genesisPaths(accountId).device,"{}");await fs.writeFile(genesisPaths(accountId).mk,"mk");}
-    const pairingGlobal=await acquireClearMachineGenesisForPairing();let published=false;const publisher=(async()=>{const pair=await acquireGenesisLockPair(accountId,2_000);try{if(kind==="marker")await publishPrepublishMarker({version:1,accountId,deviceId:"dev_new",repairId:null,startedAt:"2026-07-22T12:00:00.000Z",phase:"prepublish"});else await startGenesisQuarantine({accountId,purpose:"repaired-legacy",uniquenessKey:repairId,createdAt:"2026-07-22T12:00:00.000Z"});published=true;}finally{await pair.account.release();await pair.global.release();}})();await sleep(100);expect(published).toBe(false);if(kind==="quarantine"){await expect(fs.access(path.join(genesisQuarantineDir(accountId,"repaired-legacy",repairId),"quarantine-resume.json"))).rejects.toThrow();expect(await fs.readFile(genesisPaths(accountId).device,"utf8")).toBe("{}");}await pairingGlobal.release();await publisher;expect(published).toBe(true);}
+test("pairing sends the exact legacy device+MK shape through the classifier before redeeming its opaque token", async () => {
+  const accountId = "acct_2323232323232323";
+  const deviceId = "dev_legacy_pairing";
+  await saveCredentials({ token: "tok", deviceId, remoteUrl: "https://api.test", accountId });
+  await saveDevice((await bootstrapAccount(accountId, deviceId, 1_900_000_000_000)).secrets);
+  let requests = 0;
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    requests++;
+    expect(String(input)).toBe("https://api.test/v1/keys/account");
+    throw new Error("pairing classifier reached");
+  }) as typeof fetch;
+  const secret = Buffer.alloc(32).toString("base64url");
+
+  await expect(enrollViaPairing("https://api.test", `rbox-pair_${"a".repeat(16)}.${secret}`, 1)).rejects.toThrow("pairing classifier reached");
+  expect(requests).toBe(1);
 });
 
-test("post-redeem handoff lets a marker publisher take global but blocks it on the retained target lock",async()=>{
-  const accountId="acct_3333333333333333",sleep=(ms:number)=>new Promise<void>(resolve=>setTimeout(resolve,ms)),global=await acquireClearMachineGenesisForPairing(),target=await acquireAccountGenesisLock(accountId);let published=false;
-  const publisher=(async()=>{const pair=await acquireGenesisLockPair(accountId,2_000);try{await publishPrepublishMarker({version:1,accountId,deviceId:"dev_new",repairId:null,startedAt:"2026-07-22T12:00:00.000Z",phase:"prepublish"});published=true;}finally{await pair.account.release();await pair.global.release();}})();await global.release();await sleep(100);expect(published).toBe(false);await expect(fs.access(genesisPaths(accountId).marker)).rejects.toThrow();await target.release();await publisher;expect(published).toBe(true);
+test("real pairing handoff excludes real first-marker and repaired-legacy publication through admission",async()=>{
+  const accountId="acct_3333333333333333",issuerId="dev_issuer",pairedDeviceId="dev_paired",tokenId="a".repeat(16),tokenSecret=Buffer.alloc(32,7),repairId=`gra_${"b".repeat(32)}`;
+  const waitFor=async(predicate:()=>Promise<boolean>)=>{for(let i=0;i<100;i++){if(await predicate())return;await new Promise<void>(resolve=>setTimeout(resolve,10));}throw new Error("timed out waiting for race seam");};
+  for(const kind of ["marker","repaired-legacy"] as const){
+    await fs.rm(path.join(testHome,".rbox"),{recursive:true,force:true});
+    const boot=await bootstrapAccount(accountId,issuerId,1_900_000_000_000),material=await buildPairing(boot.secrets,{accountEpoch:0,tokenId,tokenSecret,notAfter:1_900_000_600_000});
+    const present={rosters:1,keyStates:1,devices:1,workspaces:0,workspaceKeys:0,e2eePairingTokens:0};
+    const dto={genesisPresenceVersion:1,recoveryWrap:JSON.stringify(boot.upload.recoveryWrap),recoveryWrapId:boot.upload.recoveryWrapId,claimCreatedAt:1_900_000_000_000,genesisDeviceId:issuerId,rosters:[JSON.stringify(boot.upload.genesisRoster)],keyStates:[JSON.stringify(boot.upload.genesisKeyState)],devices:[{deviceId:issuerId,sigPubkey:boot.upload.device.sigPubKey,encPubkey:boot.upload.device.encPubKey,mkWrap:JSON.stringify(boot.upload.device.mkWrap)}],present,repairTombstone:null};
+    const tombstone={genesisPresenceVersion:1,recoveryWrap:"rbox:genesis-repair-tombstone:v1",recoveryWrapId:"rbox:genesis-repair-tombstone:v1",claimCreatedAt:1_900_000_000_001,genesisDeviceId:null,rosters:[],keyStates:[],devices:[],present:{rosters:0,keyStates:0,devices:0,workspaces:0,workspaceKeys:0,e2eePairingTokens:0},repairTombstone:{version:1,repairId,repairedAt:1_900_000_000_001}};
+    let releaseAdmission!:()=>void,admissionStarted!:()=>void,serverTombstoned=false;
+    const admissionGate=new Promise<void>(resolve=>{releaseAdmission=()=>{serverTombstoned=true;resolve();};}),atAdmission=new Promise<void>(resolve=>{admissionStarted=resolve;});
+    globalThis.fetch=(async(input:string|URL|Request)=>{const url=String(input);
+      if(url.endsWith("/v1/auth/pair/redeem"))return new Response(JSON.stringify({token:"paired-token",deviceId:pairedDeviceId,accountId,mkWrap:JSON.stringify(material.mkWrap),admissionGrant:JSON.stringify(material.admissionGrant)}));
+      if(url.endsWith("/v1/keys/account"))return new Response(JSON.stringify(serverTombstoned?tombstone:dto));
+      if(url.endsWith("/v1/keys/admit")){admissionStarted();await admissionGate;return new Response("{}");}
+      throw new Error(`unexpected fetch ${url}`);
+    }) as typeof fetch;
+    const markerPath=genesisPaths(accountId).marker,quarantineDir=genesisQuarantineDir(accountId,"repaired-legacy",repairId),quarantineManifest=path.join(quarantineDir,"quarantine-resume.json");
+    await expect(fs.access(markerPath)).rejects.toThrow();await expect(fs.access(quarantineDir)).rejects.toThrow();
+    const pairing=enrollViaPairing("https://api.test",`rbox-pair_${tokenId}.${tokenSecret.toString("base64url")}`,1_900_000_000_100);
+    await atAdmission;
+    let publisherObservations=0;
+    const publisherApi={getGenesisObservation:async()=>{publisherObservations++;if(kind==="marker")return{genesisPresenceVersion:1 as const,claim:null,present:{rosters:0,keyStates:0,devices:0,workspaces:0,workspaceKeys:0,e2eePairingTokens:0}};if(!serverTombstoned)throw new Error("publisher observed before repair");if(publisherObservations>1)throw new Error("stop after repaired-legacy publication");return{genesisPresenceVersion:1 as const,claim:tombstone,present:tombstone.present,repairTombstone:tombstone.repairTombstone};},bootstrapKeys:async()=>{throw new Error("bootstrap must not run in handoff race");}};
+    const publisher=beginAtomicGenesis(publisherApi,accountId,"dev_genesis",{now:1_900_000_000_200}).catch(error=>error as Error);
+    await waitFor(async()=>fs.access(globalGenesisLockPath()).then(()=>true,()=>false));
+    const artifact=kind==="marker"?markerPath:quarantineManifest;
+    await expect(fs.access(artifact)).rejects.toThrow();
+    expect(await fs.access(genesisPaths(accountId).device).then(()=>true,()=>false)).toBe(true);
+    releaseAdmission();
+    await expect(pairing).resolves.toEqual({accountId,deviceId:pairedDeviceId});
+    const publisherResult=await publisher;
+    if(kind==="marker"){
+      expect(publisherResult.message).toBe("genesis integrity failure: unmarked local genesis material");
+      expect(publisherObservations).toBe(1);await expect(fs.access(markerPath)).rejects.toThrow();await expect(fs.access(quarantineDir)).rejects.toThrow();
+    }else{
+      expect(publisherResult.message).toBe("stop after repaired-legacy publication");expect(publisherObservations).toBe(2);
+      expect(await genesisQuarantineStatus(accountId,"repaired-legacy",repairId)).toBe("completed");await fs.access(quarantineManifest);await fs.access(path.join(quarantineDir,"device.json"));await fs.access(path.join(quarantineDir,"mk.key"));
+      await expect(fs.access(genesisPaths(accountId).device)).rejects.toThrow();await expect(fs.access(genesisPaths(accountId).mk)).rejects.toThrow();await expect(fs.access(markerPath)).rejects.toThrow();
+    }
+  }
 });

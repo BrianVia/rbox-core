@@ -4,6 +4,7 @@ import {GENESIS_TOMBSTONE_SENTINEL,genesisRepair} from "../src/genesis-repair.js
 import {bootstrapAccountKeys,getAccountKeys} from "../src/keys.js";
 import {finishD1} from "../src/account-delete.js";
 import {createWorkspace} from "../src/authz.js";
+import {syncRoutes} from "../src/routes/sync.js";
 
 const BASE="https://example.com";const PLATFORM={"x-rbox-platform":"test-platform-secret","content-type":"application/json"};
 beforeAll(async()=>{await applyD1Migrations(env.rbox_dev_db,env.TEST_MIGRATIONS);});
@@ -24,6 +25,27 @@ describe("design 180 atomic genesis",()=>{
   test("every logical statement failure rolls back ordinary and tombstone-replacement batches",async()=>{
     const statements=[{table:"account_keys",event:"INSERT"},{table:"rosters",event:"INSERT"},{table:"account_key_states",event:"INSERT"},{table:"device_keys",event:"INSERT"}] as const;
     for(const mode of ["ordinary","repair"] as const)for(const [index,statement] of statements.entries()){const a=await account(`g180-batch-fail-${mode}-${index}`),repairId=`gra_b${index.toString(16)}${"0".repeat(30)}`;if(mode==="repair")await env.rbox_dev_db.prepare("INSERT INTO account_keys(account_id,recovery_wrap,recovery_wrap_id,created_at,repair_id,repaired_at) VALUES(?,?,?,?,?,?)").bind(a.accountId,GENESIS_TOMBSTONE_SENTINEL,GENESIS_TOMBSTONE_SENTINEL,1,repairId,2).run();const trigger=`g180_fail_${mode}_${index}`,event=mode==="repair"&&statement.table==="account_keys"?"UPDATE":statement.event,row=event==="UPDATE"?"OLD":"NEW";await env.rbox_dev_db.prepare(`CREATE TRIGGER ${trigger} BEFORE ${event} ON ${statement.table} WHEN ${row}.account_id='${a.accountId}' BEGIN SELECT RAISE(ABORT,'g180 injected statement failure'); END`).run();try{await expect(bootstrapAccountKeys(env,{accountId:a.accountId,deviceId:a.deviceId} as never,body(a.deviceId,mode==="repair"?repairId:undefined),"1")).rejects.toThrow(/injected statement failure/);}finally{await env.rbox_dev_db.prepare(`DROP TRIGGER ${trigger}`).run();}const counts=await env.rbox_dev_db.prepare(`SELECT (SELECT COUNT(*) FROM account_keys WHERE account_id=?1) a,(SELECT COUNT(*) FROM rosters WHERE account_id=?1) r,(SELECT COUNT(*) FROM account_key_states WHERE account_id=?1) k,(SELECT COUNT(*) FROM device_keys WHERE account_id=?1) d`).bind(a.accountId).first();expect(counts,`${mode}:${statement.table}`).toEqual({a:mode==="repair"?1:0,r:0,k:0,d:0});if(mode==="repair")expect(await env.rbox_dev_db.prepare("SELECT recovery_wrap,repair_id FROM account_keys WHERE account_id=?").bind(a.accountId).first()).toEqual({recovery_wrap:GENESIS_TOMBSTONE_SENTINEL,repair_id:repairId});}
+  });
+
+  test("every repair-bootstrap statement repeats the state predicate and refuses the whole batch",async()=>{
+    const captured:string[]=[];const captureAccount=await account("g180-repair-predicate-capture"),captureRepairId=`gra_d0${"0".repeat(30)}`;await env.rbox_dev_db.prepare("INSERT INTO account_keys(account_id,recovery_wrap,recovery_wrap_id,created_at,repair_id,repaired_at) VALUES(?,?,?,?,?,?)").bind(captureAccount.accountId,GENESIS_TOMBSTONE_SENTINEL,GENESIS_TOMBSTONE_SENTINEL,1,captureRepairId,2).run();
+    const realDb=env.rbox_dev_db,captureDb={prepare(sql:string){if(/^\s*(?:INSERT INTO (?:rosters|account_key_states|device_keys)|UPDATE account_keys SET)/.test(sql))captured.push(sql);return realDb.prepare(sql);},batch:async()=>Array.from({length:4},()=>({meta:{changes:0}} as D1Result))} as unknown as D1Database;
+    const capturedRefusal=await bootstrapAccountKeys({...env,rbox_dev_db:captureDb},{accountId:captureAccount.accountId,deviceId:captureAccount.deviceId} as never,body(captureAccount.deviceId,captureRepairId),"1");expect(capturedRefusal.status).toBe(423);expect(captured).toHaveLength(4);
+    const now=1_800_000_000_000,roster="target-roster",keyState="target-state",sig="target-sig",enc="target-enc",mk="target-mk";
+    const seedPrefix=async(index:number,accountId:string,deviceId:string)=>{if(index>=1)await realDb.prepare("INSERT INTO rosters(account_id,version,signed,created_at) VALUES(?,0,?,?)").bind(accountId,roster,now).run();if(index>=2)await realDb.prepare("INSERT INTO account_key_states(account_id,account_epoch,signed,created_at) VALUES(?,0,?,?)").bind(accountId,keyState,now).run();if(index>=3)await realDb.prepare("INSERT INTO device_keys(device_id,account_id,sig_pubkey,enc_pubkey,mk_wrap,created_at) VALUES(?,?,?,?,?,?)").bind(deviceId,accountId,sig,enc,mk,now).run();};
+    const falsify=[
+      (id:string)=>realDb.prepare("INSERT INTO rosters(account_id,version,signed,created_at) VALUES(?,7,'foreign-roster',7)").bind(id).run(),
+      (id:string)=>realDb.prepare("INSERT INTO account_key_states(account_id,account_epoch,signed,created_at) VALUES(?,7,'foreign-state',7)").bind(id).run(),
+      (id:string)=>realDb.prepare("INSERT INTO device_keys(device_id,account_id,sig_pubkey,enc_pubkey,mk_wrap,created_at) VALUES(?,?,'foreign-sig','foreign-enc','foreign-mk',7)").bind(`dev_foreign_${id}`,id).run(),
+      (id:string)=>realDb.prepare("INSERT INTO workspaces(workspace_id,project_id,account_id,created_at) VALUES(?,'root',?,7)").bind(`ws_foreign_${id}`,id).run(),
+    ];
+    for(const [index,label] of ["roster insert","key-state insert","device insert","claim update"].entries()){
+      const a=await account(`g180-repair-predicate-${index}`),repairId=`gra_d${(index+1).toString(16)}${"0".repeat(30)}`;await realDb.prepare("INSERT INTO account_keys(account_id,recovery_wrap,recovery_wrap_id,created_at,repair_id,repaired_at) VALUES(?,?,?,?,?,?)").bind(a.accountId,GENESIS_TOMBSTONE_SENTINEL,GENESIS_TOMBSTONE_SENTINEL,1,repairId,2).run();await seedPrefix(index,a.accountId,a.deviceId);await falsify[index]!(a.accountId);
+      const snapshot=await getAccountKeys(env,{accountId:a.accountId,deviceId:a.deviceId} as never);const before=await snapshot.text();
+      const isolated=await realDb.prepare(captured[index]!).bind(a.accountId,"rw","rwid",now,a.deviceId,roster,keyState,sig,enc,mk,GENESIS_TOMBSTONE_SENTINEL,repairId,1).run();expect(isolated.meta.changes,label).toBe(0);
+      const response=await bootstrapAccountKeys(env,{accountId:a.accountId,deviceId:a.deviceId} as never,{recoveryWrap:"rw",recoveryWrapId:"rwid",genesisRoster:roster,genesisKeyState:keyState,device:{deviceId:a.deviceId,sigPubKey:sig,encPubKey:enc,mkWrap:mk},repairId},"1");expect(response.status,label).toBe(423);expect(await response.json(),label).toEqual({error:"repair_in_progress"});
+      const after=await getAccountKeys(env,{accountId:a.accountId,deviceId:a.deviceId} as never);expect(await after.text(),label).toBe(before);
+    }
   });
 
   test("exact idempotency rejects mutations of all eight fields after replay wins ordering",async()=>{const a=await account("g180-eight-fields");expect((await bootstrapKeys(a)).status).toBe(200);expect((await bootstrapKeys(a)).status).toBe(200);const base=body(a.deviceId),variants=[{...base,recoveryWrap:"x"},{...base,recoveryWrapId:"x"},{...base,genesisRoster:"x"},{...base,genesisKeyState:"x"},{...base,device:{...base.device,deviceId:"dev_other"}},{...base,device:{...base.device,sigPubKey:"x"}},{...base,device:{...base.device,encPubKey:"x"}},{...base,device:{...base.device,mkWrap:"x"}}];for(const variant of variants){const r=await SELF.fetch(`${BASE}/v1/keys/bootstrap`,{method:"POST",headers:auth(a.token,{"content-type":"application/json","x-rbox-genesis-capability":"1"}),body:JSON.stringify(variant)});expect(r.status).toBe(409);expect(await r.json()).toEqual({error:"already_bootstrapped"});}});
@@ -105,6 +127,19 @@ describe("design 180 atomic genesis",()=>{
     for(const url of [manifestUrl,receiptUrl]){const response=await SELF.fetch(url,{method:"POST",headers:auth(a.token,{"content-type":"application/json"}),body:"{}"});expect(response.status,url).toBe(423);expect(await response.json()).toEqual({error:"repair_in_progress"});}
     await env.rbox_dev_db.prepare("INSERT INTO account_deletions(account_id,requested_at,purge_after,status) VALUES(?,?,?,'purging')").bind(a.accountId,1,1).run();
     for(const url of [manifestUrl,receiptUrl]){const response=await SELF.fetch(url,{method:"POST",headers:auth(a.token,{"content-type":"application/json"}),body:"{}"});expect(response.status,url).toBe(410);expect(await response.json()).toEqual({error:"account_erased"});}
+  });
+
+  test("workspace write fence observes a tombstone injected at the immediate pre-DO-forwarding query",async()=>{
+    for(const path of ["manifests","receipts/redeem"]){
+      const a=await account(`g180-sync-injected-${path.replace("/","-")}`);const principal={accountId:a.accountId,deviceId:a.deviceId,userId:"user_injected",role:"owner",kind:"device"} as const;
+      const created=await createWorkspace(env,principal,"root");expect(created.status,path).toBe(200);const {workspaceId}=await created.json() as {workspaceId:string};
+      let injected=0,forwarded=0;const repairId=`gra_e${path.startsWith("manifests")?"0":"1"}${"0".repeat(30)}`,realDb=env.rbox_dev_db;
+      const injectedDb={prepare(sql:string){const statement=realDb.prepare(sql);if(!sql.includes("SELECT 1 FROM account_keys WHERE account_id = ? AND"))return statement;return {bind(...values:unknown[]){const bound=statement.bind(...values);return {first:async()=>{injected++;await realDb.prepare("INSERT INTO account_keys(account_id,recovery_wrap,recovery_wrap_id,created_at,repair_id,repaired_at) VALUES(?,?,?,?,?,?)").bind(a.accountId,GENESIS_TOMBSTONE_SENTINEL,GENESIS_TOMBSTONE_SENTINEL,1,repairId,2).run();return bound.first();}};}} as unknown as D1PreparedStatement;}} as D1Database;
+      const testEnv={...env,rbox_dev_db:injectedDb,WORKSPACE_SYNC:{idFromName:()=>({}) as DurableObjectId,get:()=>({fetch:async()=>{forwarded++;return Response.json({ok:true});}})} as unknown as DurableObjectNamespace};
+      const url=new URL(`${BASE}/v1/ws/${workspaceId}/proj/root/${path}`),request=new Request(url,{method:"POST",headers:{"content-type":"application/json"},body:"{}"});
+      const response=await syncRoutes({req:request,env:testEnv,exports:{} as never,executionCtx:{waitUntil:()=>{}},url,seg:url.pathname.split("/").filter(Boolean)},principal);
+      expect(injected,path).toBe(1);expect(response?.status,path).toBe(423);expect(await response!.json(),path).toEqual({error:"repair_in_progress"});expect(forwarded,path).toBe(0);
+    }
   });
 
   test("account observation returns arrays coherent with the same batch's presence counts",async()=>{

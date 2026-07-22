@@ -25,6 +25,7 @@ import { acquireGenesisLock, hasDevice, loadRecoveryKey, saveDevice, saveRecover
 import type { AccountKeysDTO, GenesisAccountObservation, GenesisPresence } from "./e2ee-remote.js";
 import { bootstrapAccount } from "../engine/e2ee/index.js";
 import { GENESIS_PENDING_MESSAGE, genesisPaths, publishPrepublishMarker } from "./genesis-durable.js";
+import { acquireGenesisLockPair } from "./genesis-locks.js";
 
 const ACCOUNT_KEYS: AccountKeysDTO = { recoveryWrap: null, recoveryWrapId: null, rosters: [], keyStates: [], devices: [] };
 
@@ -570,9 +571,30 @@ describe("device-code post-approval encryption handling", () => {
 });
 
 describe("whole-command pending-genesis gates", () => {
-  test("key recover rechecks an injected prompt-seam artifact under the retained lock before phrase read",async()=>{
-    const accountId="acct_7777777777777777";await saveCredentials({token:"tok",deviceId:"dev_recover",remoteUrl:"https://api.test",accountId});let reads=0;globalThis.fetch=(async(input:string|URL|Request)=>{expect(String(input)).toBe("https://api.test/v1/keys/account");return new Response(JSON.stringify({error:"not_found",genesisPresenceVersion:1,present:{rosters:0,keyStates:0,devices:0,workspaces:0,workspaceKeys:0,e2eePairingTokens:0}}),{status:404});}) as typeof fetch;
-    await expect(recoverCmd({kit:false},{isInteractive:()=>false,readStdin:async()=>{reads++;return"must-not-read";},beforePhraseRead:async()=>{await markGenesisPending(accountId,"dev_recover");}})).rejects.toThrow(GENESIS_PENDING_MESSAGE);expect(reads).toBe(0);
+  test("key recover sends the exact legacy device+MK shape through the classifier before phrase read", async () => {
+    const accountId = "acct_2121212121212121";
+    const deviceId = "dev_legacy_recovery";
+    await saveCredentials({ token: "tok", deviceId, remoteUrl: "https://api.test", accountId });
+    await saveDevice((await bootstrapAccount(accountId, deviceId, 1_900_000_000_000)).secrets);
+    let reads = 0;
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      expect(String(input)).toBe("https://api.test/v1/keys/account");
+      throw new Error("recovery classifier reached");
+    }) as typeof fetch;
+
+    await expect(recoverCmd({ kit: false }, { isInteractive: () => false, readStdin: async () => { reads++; return "must-not-read"; } })).rejects.toThrow("recovery classifier reached");
+    expect(reads).toBe(0);
+  });
+
+  test("key recover reads zero phrase when a lock-honoring publisher wins the prompt race",async()=>{
+    const accountId="acct_7777777777777777";await saveCredentials({token:"tok",deviceId:"dev_recover",remoteUrl:"https://api.test",accountId});let reads=0,fetches=0;
+    globalThis.fetch=(async(input:string|URL|Request)=>{expect(String(input)).toBe("https://api.test/v1/keys/account");fetches++;return new Response(JSON.stringify({error:"not_found",genesisPresenceVersion:1,present:{rosters:0,keyStates:0,devices:0,workspaces:0,workspaceKeys:0,e2eePairingTokens:0}}),{status:404});}) as typeof fetch;
+    const publisherLocks=await acquireGenesisLockPair(accountId),recovery=recoverCmd({kit:false},{isInteractive:()=>false,readStdin:async()=>{reads++;return"must-not-read";}});
+    await new Promise<void>(resolve=>setTimeout(resolve,75));
+    await publishPrepublishMarker({version:1,accountId,deviceId:"dev_recover",repairId:null,startedAt:"2026-07-22T12:00:00.000Z",phase:"prepublish"});
+    await publisherLocks.account.release();await publisherLocks.global.release();
+    await expect(recovery).rejects.toThrow(GENESIS_PENDING_MESSAGE);
+    expect(reads).toBe(0);expect(fetches).toBe(1);
   });
   test("rbox pair rejects before loading key material or minting a token", async () => {
     const accountId = "acct_8888888888888888";
