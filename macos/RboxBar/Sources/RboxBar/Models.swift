@@ -129,11 +129,15 @@ struct WorkspaceStatus: Identifiable, Equatable {
 }
 
 extension WorkspaceStatus {
+    /// Deferred repos never escalate the headline tier: they render as secondary
+    /// detail (Git row + per-repo rows) while the pill/badge track sync activity.
+    /// "Degraded"/"Attention" are reserved for attention reasons (halt, storage,
+    /// watcher, ownership) — the states where sync is actually impaired.
     var severityTier: SeverityTier {
         if state == .attention {
             return attentionReason?.severityTier ?? .critical
         }
-        return (deferredRepos ?? 0) > 0 ? .degraded : .ok
+        return .ok
     }
 
     static var empty: WorkspaceStatus {
