@@ -1,15 +1,13 @@
 # 182 — sync latency under continuous agent churn (capture in the gaps)
 
-Status: DRAFT v7 — round 6 (gpt-5.6-sol, high) certified r5-2..5 closed;
-one remaining blocker (r6-1): v6's witness failure path was fail-OPEN
-(active-write failure let critical work proceed behind a same-boot idle
-record for up to the stale window, with an error-suppressed writer and a
-possibly-never-visible degraded bit). Folded fail-closed: publish
-`active` (awaited) OR an explicit `degraded` witness state before entry;
-if neither publishes, the critical entry DEFERS with reason. Durability
-scope clarified (same-boot visibility; power loss ends the boot and
-invalidates the witness by bootId — no parent-dir fsync required).
-Round 7 verifies the single changed contract.
+Status: DRAFT v8 — round 7 (gpt-5.6-sol, high) accepted the publish-or-
+defer fix but found the entry protocol unlinearized with stop (3
+findings). Folded: synchronous gate reservation before awaiting
+publication + post-await closed-gate re-check + unconditional (finally)
+reservation release (r7-1); defer/retry liveness — retained want, busy-
+retry pacing, shutdown-aware cancelation, no drain blocking (r7-2);
+deterministic entry-protocol acceptance matrix incl. the stop race
+(r7-3). Round 8 verifies the entry protocol only.
 
 History: v5 folded round 4 (7/2: journal-pin sweep, E2 gating, doPush
 governor, argv cliff, fanout behind debounce, distinct-OID benchmark).
@@ -397,6 +395,23 @@ doomed-work bandwidth cheap. Hygiene = ghost-record cleanup (pr8 class, in
      and retries later. Work never runs behind a same-boot `idle` record.
      Exit publishes `idle` best-effort AFTER the section (a crash
      mid-section leaves `active`, which reads conservative).
+   - Entry/stop linearization (r7-1): the gate's close-vs-enter safety
+     currently assumes synchronous run-to-completion
+     (`mutation-gate.ts:32` in the t3 worktree), and awaiting a
+     publication breaks that. Protocol: (1) take a SYNCHRONOUS gate
+     reservation before awaiting any publication — stop's drain counts
+     reservations, so it cannot complete under a tentative entrant;
+     (2) after the awaited publication, re-check the gate — if it closed
+     while awaiting, release the reservation and defer WITHOUT doing
+     work; (3) reservation release is unconditional (finally) on every
+     path — success, publication failure, and gate-closed — so a failed
+     entrant can never wedge drain.
+   - Defer/retry liveness (r7-2): a publication-failure defer RETAINS the
+     operation (the want is not lost), retries under the existing
+     busy-retry pacing (bounded backoff, coalescing with other pending
+     wants — never a hot loop), and is shutdown-aware: once the gate
+     closes, the retry is canceled and never re-arms; a deferred entrant
+     holds no reservation and never blocks drain.
    - Durability scope (r6-editorial): "durable" means atomically visible
      to same-boot readers (fsync of the temp file + rename); parent-dir
      fsync / power-loss durability is NOT required — a power loss ends
@@ -475,4 +490,11 @@ doomed-work bandwidth cheap. Hygiene = ghost-record cleanup (pr8 class, in
   `unknown`); BOTH `waits` AND `stops-cleanly` absent (→ `unknown`) until
   the boot-bound `criticalPhase` witness exists and is bootId-valid;
   witnessDegraded bit forces `unknown` for the rest of the boot.
+  Entry-protocol matrix (r7-3), deterministic (injected writer + clock):
+  active-publish success → work runs behind `active`; active fails +
+  degraded succeeds → no work, status `unknown`, one retained retry;
+  both publications fail → ZERO mutation, one retained paced retry;
+  stop racing an awaited publication → drain waits for the reservation,
+  the entrant observes the closed gate post-await, releases, and no
+  retry re-arms post-stop.
 - B/C: test lists live in their own design rounds.
