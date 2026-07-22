@@ -937,23 +937,26 @@ export async function keySave(kitOpts: RecoveryKitOptions = { kit: true }, deps:
     finally { cached.fill(0) }
   } else if (process.stdin.isTTY === true) {
     if (process.stderr.isTTY !== true) throw new Error("re-run in a terminal with stderr attached, or pipe the phrase on stdin");
-    phrase = (await (deps.promptPassword ?? promptPassword)({ message: "Enter your 24-word recovery phrase" })).trim();
+    // Visible on purpose: a 24-word phrase typed blind is how typos and
+    // truncated pastes happen; the phrase is being handled deliberately.
+    phrase = (await (deps.promptPassword ?? promptInput)({ message: "Enter your 24-word recovery phrase (input is visible — make sure no one is looking over your shoulder)" })).trim();
   } else {
     phrase = await (deps.readPhraseStdin ?? readBoundedRecoveryPhraseStdin)();
   }
+  const wordCount = phrase.split(/\s+/).filter(Boolean).length;
+  if (wordCount !== 24) throw new Error(`expected 24 words but got ${wordCount} — that usually means a partial or wrapped paste; enter the phrase as one line`);
   phrase = await canonicalRecoveryPhrase(phrase);
   await (deps.validatePhrase ?? validatePhraseForAccount)(phrase, loaded);
   await (deps.savePhrase ?? saveValidatedRecoveryPhrase)(phrase, { accountId: creds.accountId, deviceId: creds.deviceId }, kitOpts, deps.seams);
 }
 
 async function readBoundedRecoveryPhraseStdin(): Promise<string> {
-  const chunks: Buffer[] = []; let size = 0;
-  for await (const value of process.stdin) {
-    const chunk = Buffer.from(value as Buffer); size += chunk.length;
-    if (size > 1024) throw new Error("recovery phrase input exceeds 1 KiB");
-    chunks.push(chunk);
-  }
-  const combined = Buffer.concat(chunks);
+  // Read fd 0 directly: the compiled binary's process.stdin async iterator
+  // yields nothing for a regular-file redirect (`rbox key save < file`),
+  // while readFileSync(0) handles both pipes and files (field, 2026-07-22).
+  const fs = await import("node:fs");
+  const combined = fs.readFileSync(0);
+  if (combined.length > 1024) { combined.fill(0); throw new Error("recovery phrase input exceeds 1 KiB"); }
   try {
     const raw = combined.toString("utf8");
     if (/\r|\n/.test(raw.replace(/\r?\n$/, ""))) throw new Error("recovery phrase input contains trailing extra data");
@@ -962,7 +965,6 @@ async function readBoundedRecoveryPhraseStdin(): Promise<string> {
     return phrase;
   } finally {
     combined.fill(0);
-    for (const chunk of chunks) chunk.fill(0);
   }
 }
 

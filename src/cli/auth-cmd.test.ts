@@ -1213,7 +1213,7 @@ describe("key save phrase sources", () => {
       securityBinExists: async () => true,
       realpath: async (value: string) => value,
       runSecurity: async (args: readonly string[], stdin: Uint8Array | undefined) => {
-        if (args[0] === "login-keychain") return { outcome: "exit" as const, code: 0, stdout: Buffer.from(`"${keychainPath}"\n`), stderr: new Uint8Array() };
+        if (args[0] === "login-keychain") return { outcome: "exit" as const, code: 0, stdout: Buffer.from(`    "${keychainPath}"\n`), stderr: new Uint8Array() };
         if (args[0] === "-i") {
           adds++;
           expect(Buffer.from(stdin!).toString("utf8")).toContain("add-generic-password -U");

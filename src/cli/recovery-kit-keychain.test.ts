@@ -45,10 +45,10 @@ describe("macOS recovery Keychain", () => {
     const calls: readonly string[][] = [];
     const fake = seams(async (args) => {
       (calls as string[][]).push([...args]);
-      return result({ stdout: Buffer.from(`\"${KEYCHAIN}\"\n`) });
+      return result({ stdout: Buffer.from(`    \"${KEYCHAIN}\"\n`) }); // real security(1) indents its output
     });
     expect(await resolveLoginKeychain(fake)).toBe(KEYCHAIN);
-    expect(calls).toEqual([["login-keychain", "-d", "user"]]);
+    expect(calls).toEqual([["login-keychain"]]);
   });
 
   test("resolver rejects surrounding blank lines and multiline output", async () => {
