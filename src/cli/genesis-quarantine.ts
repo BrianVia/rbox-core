@@ -43,12 +43,12 @@ export async function genesisQuarantineStatus(accountId:string,purpose:GenesisQu
   const manifestRaw=await fs.readFile(manifestPath,"utf8"),manifest=parseGenesisQuarantineManifest(manifestRaw,accountId,purpose,key);
   const allowed=new Set(["quarantine-resume.json","completed.json",...manifest.entries.map((entry)=>entry.destination)]);
   if(diskEntries.some((entry)=>!allowed.has(entry)))throw new Error("unexpected genesis quarantine entry");
-  const root=genesisPaths(accountId).dir;
   if(await exists(completedPath)){
     await parseGenesisQuarantineCompleted(await fs.readFile(completedPath,"utf8"),manifest,manifestRaw);
-    for(const entry of manifest.entries){if(await exists(path.join(root,entry.source)))throw new Error("completed genesis quarantine retained a source");if(await fileHash(path.join(dir,entry.destination))!==entry.sha256)throw new Error("completed genesis quarantine hash mismatch");}
+    for(const entry of manifest.entries){if(await fileHash(path.join(dir,entry.destination))!==entry.sha256)throw new Error("completed genesis quarantine hash mismatch");}
     return"completed";
   }
+  const root=genesisPaths(accountId).dir;
   for(const entry of manifest.entries){const source=path.join(root,entry.source),destination=path.join(dir,entry.destination),sourceExists=await exists(source),destinationExists=await exists(destination);if(sourceExists===destinationExists)throw new Error("invalid genesis quarantine rename state");if(await fileHash(sourceExists?source:destination)!==entry.sha256)throw new Error("genesis quarantine hash mismatch");}
   return"active";
 }
