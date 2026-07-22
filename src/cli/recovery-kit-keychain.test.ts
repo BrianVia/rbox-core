@@ -78,6 +78,8 @@ describe("macOS recovery Keychain", () => {
 
   test("probe classifies only exit 44 as missing", async () => {
     for (const [shape, expected] of [
+      // exit 0 emits a multi-line attribute dump on real macOS — presence is the exit code
+      [result({ stdout: Buffer.from(`keychain: "${KEYCHAIN}"\nversion: 512\nclass: "genp"\nattributes:\n    "acct"<blob>="${ACCOUNT}"\n`) }), "present"],
       [result({ stdout: Buffer.from("keychain: attributes\n") }), "present"],
       [result({ code: 44 }), "missing"],
       [result({ code: 1 }), "unavailable"],
@@ -90,10 +92,7 @@ describe("macOS recovery Keychain", () => {
     }
   });
 
-  test("probe and secret read require exactly one nonempty output line", async () => {
-    for (const stdout of ["\nattributes\n", "attributes\n\n", "one\ntwo\n", "\n", "bad\0line\n"]) {
-      expect(await probeKeychainKit(artifact, seams(async () => result({ stdout: Buffer.from(stdout) })))).toBe("unavailable");
-    }
+  test("secret read requires exactly one nonempty output line", async () => {
     for (const stdout of [`\n${PHRASE}\n`, `${PHRASE}\n\n`, `${PHRASE}\nextra\n`, "\n"]) {
       await expect(readKeychainKit(artifact, seams(async () => result({ stdout: Buffer.from(stdout) })))).rejects.toThrow(/malformed secret/);
     }

@@ -1130,7 +1130,7 @@ async function recoveryKitStatusLines(
       const date = (record.keychain.writtenAt ?? record.keychain.discoveredAt)!.slice(0, 10);
       if (keychainState === "present") lines.push(`recovery kit: macOS Keychain \"${record.keychain.service}\" (${record.keychain.writtenAt ? "written" : "discovered"} ${date})`);
       else if (keychainState === "missing") lines.push("recovery kit: macOS Keychain item missing — re-run rbox key save");
-      else lines.push("recovery kit: macOS Keychain unavailable — backup state unknown; retry in a GUI session");
+      else lines.push("recovery kit: macOS Keychain could not be checked — backup state unknown; try again or re-run `rbox key save`");
     }
     record.plaintextArtifacts.forEach((artifact, index) => {
       const shown = displayPath(artifact.path); const state = plaintextStates[index];
