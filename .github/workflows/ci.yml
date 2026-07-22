@@ -269,6 +269,7 @@ jobs:
 
       - name: Regress flows (report only)
         if: steps.regress-changes.outputs.changed == 'true'
+        continue-on-error: true
         env:
           RBOX_DEV_BOOTSTRAP: ${{ secrets.RBOX_DEV_BOOTSTRAP }}
         run: |
