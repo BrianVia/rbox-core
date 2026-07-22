@@ -8,10 +8,12 @@ import {
   deviceApprovalUrl,
   login,
   logout,
+  keySave,
   pairingRedemptionSuccessMessages,
   pairCreate,
   readPairingTokenInteractive,
   recoverCmd,
+  recoveryPhraseFromKeychain,
   runGenesisEnrollment,
   keyBackup,
   keyStatus,
@@ -23,9 +25,10 @@ import { _setSpawner } from "./browser-open.js";
 import { AccountAlreadyBootstrappedError } from "./remote.js";
 import { acquireGenesisLock, hasDevice, loadRecoveryKey, saveDevice, saveRecoveryKey } from "./e2ee-keystore.js";
 import type { AccountKeysDTO, GenesisAccountObservation, GenesisPresence } from "./e2ee-remote.js";
-import { bootstrapAccount } from "../engine/e2ee/index.js";
+import { bootstrapAccount, phraseToRk } from "../engine/e2ee/index.js";
 import { GENESIS_PENDING_MESSAGE, genesisPaths, publishPrepublishMarker } from "./genesis-durable.js";
 import { acquireGenesisLockPair } from "./genesis-locks.js";
+import type { GenesisSeam } from "./genesis-seam.js";
 
 const ACCOUNT_KEYS: AccountKeysDTO = { recoveryWrap: null, recoveryWrapId: null, rosters: [], keyStates: [], devices: [] };
 
@@ -290,6 +293,36 @@ describe("runGenesisEnrollment", () => {
 
   test("declining the production kit offer records phrase-display before delivery",async()=>{
     const accountId="acct_4444444444444449",api=new FakeGenesisApi([null],"ok",accountId,"dev_decline"),target=path.join(home,"declined-kit.txt");let prompts=0;await runGenesisEnrollment(api,{accountId,deviceId:"dev_decline"},{kit:false},{now:()=>1_900_000_000_000,isInteractive:()=>true,promptConfirm:async()=>{prompts++;return false;},resolveKitPath:async()=>target,deliverPhrase:async()=>{expect(JSON.parse(await fs.readFile(genesisPaths(accountId).intent,"utf8"))).toMatchObject({mode:"phrase-display"});}});expect(prompts).toBe(1);await expect(fs.access(target)).rejects.toThrow();
+  });
+
+  test("an unreleased design-180 hold runs staged completion instead of the legacy phrase path", async () => {
+    const accountId = "acct_staged";
+    const requestSha256 = "b".repeat(64);
+    const stagedPhrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
+    const trace: string[] = [];
+    const seam: GenesisSeam = {
+      readValidatedStagedRecoveryKey: async () => ({ accountId, requestSha256, originalCacheRecovery: false, rk: await phraseToRk(stagedPhrase) }),
+      readAndReconcileCompletionIntent: async () => ({ state: "absent" }),
+      writeCompletionIntent: async () => { trace.push("intent"); },
+      retargetKeychainIntent: async (old) => old,
+      pendingGenesis: async () => "unreleased-recovery-kit-hold",
+      commitVerifiedRecoveryKitArtifact: async () => { trace.push("receipt"); },
+      commitDeliveredRecoveryPhrase: async () => { trace.push("phrase-receipt"); },
+      quarantineAbandonedAttempt: async () => {},
+    };
+    const result = await runGenesisEnrollment(new FakeGenesisApi([null]), { accountId, deviceId: "dev" }, { kit: true }, {
+      genesisSeam: seam,
+      showRecoveryPhrase: async () => { throw new Error("legacy phrase path must not run"); },
+      genesisCompletion: {
+        validatePhrase: async () => { trace.push("validate"); },
+        select: async () => ({ version: 1, accountId, requestSha256, mode: "kit-path", path: "/tmp/kit", intentAt: "2026-07-22T12:00:00.000Z" }),
+        displayPhrase: async () => { throw new Error("wrong mode"); },
+        saveKeychain: async () => { throw new Error("wrong mode"); },
+        saveFile: async () => { trace.push("file"); },
+      },
+    });
+    expect(result).toBe("enrolled");
+    expect(trace).toEqual(["validate", "intent", "file", "receipt"]);
   });
 });
 
@@ -643,5 +676,100 @@ describe("whole-command pending-genesis gates", () => {
       genesisPending: true,
       resumeInstruction: GENESIS_PENDING_MESSAGE,
     });
+  });
+});
+
+describe("Keychain recovery selection", () => {
+  const accountId = "acct_0123456789abcdef";
+  const phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
+
+  test("the new offer requires both stdin and stderr TTYs", async () => {
+    for (const [stdinTTY, stderrTTY, expectedCalls] of [[true, true, 1], [true, false, 0], [false, true, 0], [false, false, 0]] as const) {
+      let resolveCalls = 0;
+      const selected = await recoveryPhraseFromKeychain(accountId, {
+        stdinTTY,
+        stderrTTY,
+        readRecord: async () => ({ state: "missing" }),
+        resolve: async () => { resolveCalls++; return "/tmp/login.keychain-db"; },
+        probe: async () => "present",
+        confirm: async () => true,
+        read: async () => Buffer.from(phrase),
+        validate: async () => {},
+      });
+      expect(resolveCalls).toBe(expectedCalls);
+      expect(Boolean(selected)).toBe(expectedCalls === 1);
+    }
+  });
+
+  test("a checksum-valid wrong-account candidate warns redacted and falls back before admission", async () => {
+    const warnings: string[] = [];
+    let reads = 0;
+    const selected = await recoveryPhraseFromKeychain(accountId, {
+      stdinTTY: true,
+      stderrTTY: true,
+      readRecord: async () => ({ state: "missing" }),
+      resolve: async () => "/tmp/login.keychain-db",
+      probe: async () => "present",
+      confirm: async () => true,
+      read: async () => { reads++; return Buffer.from(phrase); },
+      validate: async () => { throw new Error(`wrong wrap for ${phrase}`); },
+      warn: (message) => warnings.push(message),
+    });
+    expect(selected).toBeUndefined();
+    expect(reads).toBe(1);
+    expect(warnings).toEqual(["Keychain recovery phrase could not be used; enter the phrase manually."]);
+    expect(warnings.join(" ")).not.toContain("abandon");
+  });
+
+  test("validated persisted metadata supplies the exact identity without resolving again", async () => {
+    let resolves = 0;
+    const selected = await recoveryPhraseFromKeychain(accountId, {
+      stdinTTY: true,
+      stderrTTY: true,
+      readRecord: async () => ({ state: "recognized", record: {
+        version: 2,
+        accountId,
+        plaintextArtifacts: [],
+        keychain: { service: "rbox recovery phrase", account: accountId, keychainPath: "/exact/login.keychain-db", writtenAt: "2026-07-22T12:00:00.000Z" },
+      } }),
+      resolve: async () => { resolves++; return "/wrong"; },
+      realpath: async (value) => value,
+      probe: async (artifact) => artifact.keychainPath === "/exact/login.keychain-db" ? "present" : "missing",
+      confirm: async () => true,
+      read: async (artifact) => { expect(artifact.keychainPath).toBe("/exact/login.keychain-db"); return Buffer.from(phrase); },
+      validate: async () => {},
+    });
+    expect(selected?.phrase).toBe(phrase);
+    expect(resolves).toBe(0);
+  });
+});
+
+describe("key save phrase sources", () => {
+  const accountId = "acct_0123456789abcdef";
+  const phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
+  const loaded = async () => ({ state: "valid", source: "env", credentials: { v: 1, token: "tok", deviceId: "dev", remoteUrl: "https://api.test", accountId }, legacy: false, extensions: {} } as const);
+
+  test("cached RK never reads stdin and is validated before save", async () => {
+    const events: string[] = [];
+    await keySave({ kit: true }, {
+      loadCredentials: loaded,
+      loadRecoveryKey: async () => phraseToRk(phrase),
+      readPhraseStdin: async () => { throw new Error("stdin must not be read"); },
+      validatePhrase: async (candidate) => { expect(candidate).toBe(phrase); events.push("validated"); },
+      savePhrase: async (candidate) => { expect(candidate).toBe(phrase); events.push("saved"); },
+    });
+    expect(events).toEqual(["validated", "saved"]);
+  });
+
+  test("typed/piped wrong-account phrase stores nothing", async () => {
+    let saves = 0;
+    await expect(keySave({ kit: true }, {
+      loadCredentials: loaded,
+      loadRecoveryKey: async () => undefined,
+      readPhraseStdin: async () => phrase,
+      validatePhrase: async () => { throw new Error("current envelope mismatch"); },
+      savePhrase: async () => { saves++; },
+    })).rejects.toThrow(/current envelope mismatch/);
+    expect(saves).toBe(0);
   });
 });

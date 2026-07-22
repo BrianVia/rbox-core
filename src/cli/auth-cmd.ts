@@ -1,4 +1,5 @@
 import os from "node:os";
+import fs from "node:fs/promises";
 import { clearCredentials, credentialsForStrictFlow, loadCredentials, PROD_WEB, saveCredentials } from "./credentials.js";
 import { clearAccountProfile } from "./account-profile.js";
 import { isInteractive, promptConfirm, promptInput, promptPassword } from "./prompt.js";
@@ -6,23 +7,41 @@ import { copyToClipboard, openInBrowser, waitForKeypress } from "./browser-open.
 import { RboxApi } from "./remote.js";
 import { emitJson } from "./json.js";
 import { assertNoPendingGenesis, beginAtomicGenesis, completeAtomicGenesis, enrollViaPairing, enrollViaRecoveryWithPhraseInput } from "./e2ee-client.js";
-import { buildPairing, randomBytes, toB64url } from "../engine/e2ee/index.js";
+import { preflightRecoveryEnvelope, validatePhraseForAccount } from "./e2ee-client.js";
+import { buildPairing, randomBytes, rkToPhrase, toB64url } from "../engine/e2ee/index.js";
 import { loadDevice, loadRecoveryKey } from "./e2ee-keystore.js";
 import { isAutostartEnabled } from "./autostart-cmd.js";
 import { readStdinTrimmed } from "./read-stdin.js";
 import { friendlyHttpError } from "./http-error.js";
 import {
   defaultKitTargetDir,
+  defaultKitPath,
+  deleteMatchingPlaintextArtifact,
   displayPath,
-  readRecoveryKitRecord,
+  claimRecoveryKitOffer,
+  mergeDiscoveredKeychainArtifact,
+  markPlaintextCleanup,
+  readRecoveryKitRecordState,
+  recordKeychainArtifact,
   recoveryKitAction,
   recoveryKitFileState,
   resolveRecoveryKitPath,
+  updateRecoveryKitOfferOutcome,
   writeRecoveryKit,
   type RecoveryKitOptions,
 } from "./recovery-kit.js";
 import { genesisClassifierConsultationNeeded, pendingGenesisState } from "./genesis-enrollment.js";
 import { GENESIS_PENDING_MESSAGE } from "./genesis-durable.js";
+import {
+  canonicalRecoveryPhrase,
+  probeKeychainKit,
+  readKeychainKit,
+  resolveLoginKeychain,
+  writeKeychainKit,
+  type KeychainArtifact,
+  type KeychainSeams,
+} from "./recovery-kit-keychain.js";
+import { currentGenesisSeam, retargetThenWriteFallback, type CompletionIntent, type GenesisSeam, type ValidatedStagedRecoveryKey } from "./genesis-seam.js";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const MIN_LOGIN_BACKOFF_MS = 1000;
@@ -45,21 +64,34 @@ const GENESIS_COMMAND = "rbox key genesis --yes";
 const HEADLESS_GENESIS_COMMAND_NOTE = `note: no encryption keys yet — run \`${GENESIS_COMMAND}\` to set up this first machine.`;
 const ENCRYPTION_ENROLLED_MESSAGE = "encryption enrolled — this workspace will be end-to-end encrypted.";
 
+class KeychainLocatorWriteError extends Error {
+  constructor(cause: unknown) {
+    super(`recovery phrase is present in Keychain, but status metadata could not be saved: ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = "KeychainLocatorWriteError";
+  }
+}
+
 /** Show the recovery phrase once with a forced acknowledgement (no escrow). The
  *  confirm re-asks until it's a deliberate yes — pressing enter (default No) won't
  *  slip past it — preserving the "you must acknowledge" beat without the literal
  *  "yes" typing of the old readline loop. */
-async function showRecoveryPhrase(phrase: string, creds: { accountId?: string; deviceId?: string }, kitOpts: RecoveryKitOptions = NO_KIT): Promise<void> {
+async function showRecoveryPhrase(phrase: string, creds: { accountId?: string; deviceId?: string }, kitOpts: RecoveryKitOptions = NO_KIT, surface: "genesis" | "backup" = "genesis"): Promise<void> {
   if (!isInteractive() && recoveryKitAction(false, kitOpts) === "write-suppress-echo") {
     await writeKitOrThrow(phrase, creds, kitOpts, true);
     return;
   }
-  if(isInteractive()&&await offerOrWriteKit(phrase,creds,kitOpts))return;
-
-  await deliverRecoveryPhrase(phrase);
+  process.stderr.write(`\n⚠️  rbox is END-TO-END ENCRYPTED. This recovery phrase is the ONLY way back in\n    if you lose every signed-in device. There is NO escrow — we cannot recover it.\n\n    ${phrase}\n\n`);
+  if (isInteractive()) {
+    if (await offerOrWriteKit(phrase, creds, kitOpts, surface)) return;
+    while (!(await promptConfirm({ message: "Have you saved this recovery phrase somewhere safe?", default: false }))) {
+      process.stderr.write(`    Save it first — it's the ONLY way back in if you lose every device.\n`);
+    }
+  } else {
+    process.stderr.write(`(non-interactive: SAVE THE PHRASE ABOVE — it will not be shown again)\n`);
+  }
 }
 
-async function deliverRecoveryPhrase(phrase:string):Promise<void>{
+async function deliverRecoveryPhrase(phrase: string): Promise<void> {
   process.stderr.write(`\n⚠️  rbox is END-TO-END ENCRYPTED. This recovery phrase is the ONLY way back in\n    if you lose every signed-in device. There is NO escrow — we cannot recover it.\n\n    ${phrase}\n\n`);
   if (isInteractive()) {
     while (!(await promptConfirm({ message: "Have you saved this recovery phrase somewhere safe?", default: false }))) {
@@ -127,6 +159,8 @@ interface GenesisEnrollmentDeps {
   promptConfirm?: typeof promptConfirm;
   resolveKitPath?: typeof resolveRecoveryKitPath;
   writeKit?: typeof writeKitOrThrow;
+  genesisSeam?: GenesisSeam;
+  genesisCompletion?: GenesisRecoveryKitCompletionDeps;
 }
 
 export async function runGenesisEnrollment(
@@ -151,6 +185,100 @@ export async function runGenesisEnrollment(
     commitArtifact:async(intent,phrase)=>{if(intent.mode!=="kit-path")throw new Error(`unsupported genesis completion artifact: ${intent.mode}`);await (deps.writeKit??writeKitOrThrow)(phrase,creds,{kit:true,kitPath:intent.path},!interactive);},
   },now);
   return"enrolled";
+}
+
+interface GenesisRecoveryKitCompletionDeps {
+  select(phrase: string, staged: ValidatedStagedRecoveryKey): Promise<CompletionIntent>;
+  validatePhrase(phrase: string): Promise<void>;
+  displayPhrase(phrase: string, intent: Extract<CompletionIntent, { mode: "phrase-display" }>): Promise<void>;
+  saveKeychain(phrase: string, intent: Extract<CompletionIntent, { mode: "keychain" }>): Promise<void>;
+  saveFile(phrase: string, intent: Extract<CompletionIntent, { mode: "kit-path" }>): Promise<void>;
+  retargetAfterKeychainFailure?(phrase: string, intent: Extract<CompletionIntent, { mode: "keychain" }>): Promise<Extract<CompletionIntent, { mode: "kit-path" }> | undefined>;
+}
+
+function defaultGenesisRecoveryKitCompletion(
+  creds: { accountId: string; deviceId: string },
+  kitOpts: RecoveryKitOptions,
+  display: typeof showRecoveryPhrase = showRecoveryPhrase
+): GenesisRecoveryKitCompletionDeps {
+  return {
+    validatePhrase: (phrase) => validatePhraseForAccount(phrase),
+    select: async (_phrase, staged) => {
+      const base = { version: 1 as const, accountId: creds.accountId, requestSha256: staged.requestSha256, intentAt: new Date().toISOString() };
+      if (kitOpts.kitPath) return { ...base, mode: "kit-path" as const, path: resolveRecoveryKitPath(kitOpts.kitPath) };
+      if (kitOpts.kit && process.platform === "darwin") {
+        const keychainPath = await resolveLoginKeychain();
+        return { ...base, mode: "keychain" as const, keychain: { service: "rbox recovery phrase" as const, account: creds.accountId, keychainPath } };
+      }
+      if (kitOpts.kit) return { ...base, mode: "kit-path" as const, path: await defaultKitPath(creds.accountId) };
+      return { ...base, mode: "phrase-display" as const };
+    },
+    displayPhrase: (phrase) => display(phrase, creds, NO_KIT),
+    saveKeychain: async (phrase, intent) => {
+      const artifact = await writeKeychainKit(phrase, creds.accountId, intent.keychain.keychainPath);
+      try { await recordKeychainArtifact(creds.accountId, artifact) }
+      catch (error) { throw new KeychainLocatorWriteError(error) }
+      await offerPlaintextCleanupAfterKeychainSave(creds.accountId, phrase);
+    },
+    saveFile: async (phrase, intent) => {
+      const written = await writeRecoveryKit(phrase, creds, intent.path);
+      if (written.recordError) throw written.recordError;
+    },
+    retargetAfterKeychainFailure: async (_phrase, intent) => {
+      if (process.stdin.isTTY !== true || process.stderr.isTTY !== true) return undefined;
+      const target = await defaultKitPath(creds.accountId);
+      if (!(await promptConfirm({ message: `Keychain save failed (unavailable) — save a PLAINTEXT file to ${displayPath(target)} instead?`, default: true }))) return undefined;
+      return { version: 1, accountId: intent.accountId, requestSha256: intent.requestSha256, mode: "kit-path", path: target, intentAt: new Date().toISOString() };
+    },
+  };
+}
+
+/** Design-179's completion layer over design 180. The injected seam owns every
+ * staged/journal/intent/receipt transition; callbacks own only exact artifact
+ * delivery and must return only after verification plus locator durability. */
+export async function completeStagedGenesisRecoveryKit(
+  accountId: string,
+  seam: GenesisSeam,
+  deps: GenesisRecoveryKitCompletionDeps
+): Promise<CompletionIntent> {
+  const staged = await seam.readValidatedStagedRecoveryKey(accountId);
+  if (!staged) throw new Error("active genesis has no validated staged recovery key");
+  const attempt = { accountId: staged.accountId, requestSha256: staged.requestSha256 };
+  if (staged.accountId !== accountId) throw new Error("staged recovery key account mismatch");
+  const state = await seam.readAndReconcileCompletionIntent(attempt);
+  let intent = state.state === "intent" ? state.intent : undefined;
+  const phrase = await rkToPhrase(staged.rk);
+  try {
+    await deps.validatePhrase(phrase);
+    if (!intent) {
+      intent = await deps.select(phrase, staged);
+      if (intent.accountId !== accountId || intent.requestSha256 !== staged.requestSha256) throw new Error("completion selection does not match the active genesis attempt");
+      await seam.writeCompletionIntent(intent);
+    }
+    if (intent.mode === "phrase-display") {
+      await deps.displayPhrase(phrase, intent);
+      await seam.commitDeliveredRecoveryPhrase(attempt);
+    } else if (intent.mode === "keychain") {
+      try {
+        await deps.saveKeychain(phrase, intent);
+      } catch (error) {
+        if (error instanceof KeychainLocatorWriteError || !deps.retargetAfterKeychainFailure) throw error;
+        const fallback = await deps.retargetAfterKeychainFailure(phrase, intent);
+        if (!fallback) throw error;
+        const result = await retargetThenWriteFallback(seam, intent, fallback, async () => deps.saveFile(phrase, fallback));
+        if (result === "keychain-retained") throw error;
+        await seam.commitVerifiedRecoveryKitArtifact(attempt);
+        return fallback;
+      }
+      await seam.commitVerifiedRecoveryKitArtifact(attempt);
+    } else {
+      await deps.saveFile(phrase, intent);
+      await seam.commitVerifiedRecoveryKitArtifact(attempt);
+    }
+    return intent;
+  } finally {
+    staged.rk.fill(0);
+  }
 }
 
 interface DeviceCodePostApprovalDeps {
@@ -462,20 +590,85 @@ export async function recoverCmd(kitOpts: RecoveryKitOptions = NO_KIT,deps:Recov
   const loaded = await loadCredentials();
   const creds = credentialsForStrictFlow(loaded);
   if (!creds?.accountId) throw new Error("`rbox key recover` needs an account login first — run `rbox login` (web/device-code), then recover.");
+  let keychainCandidate: Awaited<ReturnType<typeof recoveryPhraseFromKeychain>>;
+  let recoveredViaKeychain = false;
   const result=await enrollViaRecoveryWithPhraseInput(async()=>{
-  if ((deps.isInteractive??isInteractive)()) {
+    keychainCandidate = await recoveryPhraseFromKeychain(creds.accountId);
+    if (keychainCandidate) {
+      recoveredViaKeychain = true;
+      return keychainCandidate.phrase;
+    }
+    if ((deps.isInteractive??isInteractive)()) {
     // Visible input: a 24-word phrase is long and paste-error-prone, and it's
     // entered once on the owner's own machine — showing it lets the user catch
     // a bad paste (the phrase is displayed at genesis anyway).
     return (deps.promptInput??promptInput)({ message: "Enter your 24-word recovery phrase" });
-  } else {
+    } else {
     // Piped (`echo "<phrase>" | rbox key recover`) — drain stdin like `connect` does so
     // recovery still works in CI / non-TTY, where inquirer can't run.
     return (deps.readStdin??readStdinTrimmed)();
-  }
+    }
   },(deps.now??Date.now)(),loaded,deps.beforePhraseRead);
   console.log(`recovered + enrolled this device: ${result.deviceId}`);
+  if (recoveredViaKeychain && keychainCandidate?.artifact) await mergeDiscoveredKeychain(result.accountId, keychainCandidate.artifact);
   await offerRecoveryKitAfterRecover(result.phrase, result, kitOpts);
+}
+
+interface KeychainRecoveryDeps {
+  stdinTTY?: boolean;
+  stderrTTY?: boolean;
+  readRecord?: typeof readRecoveryKitRecordState;
+  resolve?: typeof resolveLoginKeychain;
+  probe?: typeof probeKeychainKit;
+  read?: typeof readKeychainKit;
+  confirm?: typeof promptConfirm;
+  validate?: typeof validatePhraseForAccount;
+  warn?: (message: string) => void;
+  seams?: KeychainSeams;
+  realpath?: (value: string) => Promise<string>;
+}
+
+/** Selects a Keychain phrase only before admission. Every failure is redacted and
+ * returns undefined so the unchanged manual recovery path remains available. */
+export async function recoveryPhraseFromKeychain(accountId: string, deps: KeychainRecoveryDeps = {}): Promise<{ phrase: string; artifact: KeychainArtifact } | undefined> {
+  if ((deps.stdinTTY ?? process.stdin.isTTY === true) !== true || (deps.stderrTTY ?? process.stderr.isTTY === true) !== true) return undefined;
+  const loaded = await (deps.readRecord ?? readRecoveryKitRecordState)(accountId);
+  let artifact: KeychainArtifact;
+  try {
+    if (loaded.state === "recognized" && loaded.record.keychain) {
+      const persisted = loaded.record.keychain;
+      const canonical = await (deps.realpath ?? deps.seams?.realpath ?? fs.realpath)(persisted.keychainPath);
+      if (canonical === persisted.keychainPath) artifact = persisted;
+      else {
+        const keychainPath = await (deps.resolve ?? resolveLoginKeychain)(deps.seams);
+        artifact = { service: "rbox recovery phrase", account: accountId, keychainPath, discoveredAt: new Date().toISOString() };
+      }
+    } else {
+      const keychainPath = await (deps.resolve ?? resolveLoginKeychain)(deps.seams);
+      artifact = { service: "rbox recovery phrase", account: accountId, keychainPath, discoveredAt: new Date().toISOString() };
+    }
+    if (await (deps.probe ?? probeKeychainKit)(artifact, deps.seams) !== "present") return undefined;
+    if (!(await (deps.confirm ?? promptConfirm)({ message: "Found a recovery phrase for this account in the macOS Keychain — use it?", default: true }))) return undefined;
+    const bytes = await (deps.read ?? readKeychainKit)(artifact, deps.seams);
+    const secret = Buffer.from(bytes);
+    try {
+      const phrase = await canonicalRecoveryPhrase(secret.toString("utf8"));
+      await (deps.validate ?? validatePhraseForAccount)(phrase);
+      return { phrase, artifact };
+    } finally { secret.fill(0); bytes.fill(0) }
+  } catch {
+    (deps.warn ?? ((message) => process.stderr.write(`${message}\n`)))("Keychain recovery phrase could not be used; enter the phrase manually.");
+    return undefined;
+  }
+}
+
+async function mergeDiscoveredKeychain(accountId: string, artifact: KeychainArtifact): Promise<void> {
+  try {
+    const outcome = await mergeDiscoveredKeychainArtifact(accountId, { service: artifact.service, account: artifact.account, keychainPath: artifact.keychainPath, discoveredAt: artifact.discoveredAt ?? new Date().toISOString() });
+    if (outcome === "conflict") process.stderr.write("  ! recovery Keychain identity changed concurrently; rediscovery metadata was not recorded\n");
+  } catch {
+    process.stderr.write("  ! recovery succeeded, but Keychain rediscovery metadata was not recorded\n");
+  }
 }
 
 /** `rbox key status` — local E2EE enrollment state for the current account. */
@@ -486,11 +679,29 @@ export async function keyStatus(opts: { json?: boolean } = {}): Promise<void> {
   const loaded = creds.accountId&&!genesisPending ? await loadDevice(creds.accountId) : undefined;
   const enrolled = Boolean(loaded && "secrets" in loaded);
   const cachedRk = creds.accountId&&!genesisPending ? await loadRecoveryKey(creds.accountId) : undefined;
-  const kitRecord = creds.accountId&&!genesisPending ? await readRecoveryKitRecord(creds.accountId) : undefined;
+  const kitRead = creds.accountId ? await readRecoveryKitRecordState(creds.accountId) : { state: "missing" as const };
+  const kitRecord = kitRead.state === "recognized" ? kitRead.record : undefined;
+  const keychainState = kitRecord?.keychain ? await probeKeychainKit(kitRecord.keychain) : undefined;
+  const plaintextStates = kitRecord ? await Promise.all(kitRecord.plaintextArtifacts.map(recoveryKitFileState)) : [];
+  const pendingGenesis = creds.accountId ? (await currentGenesisSeam().pendingGenesis(creds.accountId)) === "unreleased-recovery-kit-hold" : false;
   if (opts.json) {
+    const firstFile = kitRecord?.plaintextArtifacts[0];
     emitJson({
-      enrolled:enrolled&&!genesisPending,
-      recoveryKit: kitRecord ? { path: kitRecord.path, writtenAt: kitRecord.writtenAt } : null,
+      enrolled: enrolled&&!genesisPending,
+      recoveryKit: kitRecord ? {
+        version: 2,
+        recordState: "recognized",
+        ...(kitRecord.keychain ? { keychain: { ...kitRecord.keychain, state: keychainState } } : {}),
+        plaintextArtifacts: kitRecord.plaintextArtifacts.map((artifact, index) => ({ ...artifact, state: plaintextStates[index] })),
+        ...(kitRecord.offer ? { offer: kitRecord.offer } : {}),
+        ...(firstFile ? { path: firstFile.path, writtenAt: firstFile.writtenAt } : {}),
+        pendingGenesis,
+      } : {
+        version: 2,
+        recordState: kitRead.state,
+        plaintextArtifacts: [],
+        pendingGenesis,
+      },
       ...(genesisPending?{genesisPending:true,resumeInstruction:GENESIS_PENDING_MESSAGE}:{}),
     });
     return;
@@ -501,7 +712,8 @@ export async function keyStatus(opts: { json?: boolean } = {}): Promise<void> {
   if(genesisPending){console.log(`encryption: pending\n${GENESIS_PENDING_MESSAGE}`);return;}
   console.log(`encryption: ${enrolled ? "enrolled (master key present)" : loaded ? "device key present, master key missing — will self-heal on next sync" : "NOT enrolled — run `rbox pair` or `rbox key recover`"}`);
   console.log(`recovery phrase cached locally: ${cachedRk ? "yes (`rbox key backup` can re-show)" : "no (use the phrase you saved at setup)"}`);
-  console.log(await recoveryKitStatusLine(creds.accountId, Boolean(cachedRk)));
+  for (const line of await recoveryKitStatusLines(creds.accountId, Boolean(cachedRk), kitRead, keychainState, plaintextStates, pendingGenesis)) console.log(line);
+  await maybePrintRecoveryKitNudge(creds.accountId, Boolean(cachedRk));
 }
 
 /** `rbox key genesis --yes` — explicit non-interactive first-machine genesis. */
@@ -529,7 +741,72 @@ export async function keyBackup(kitOpts: RecoveryKitOptions = NO_KIT): Promise<v
     return;
   }
   const { rkToPhrase } = await import("../engine/e2ee/index.js");
-  await showRecoveryPhrase(await rkToPhrase(rk), creds, kitOpts);
+  await showRecoveryPhrase(await rkToPhrase(rk), creds, kitOpts, "backup");
+}
+
+export interface KeySaveDeps {
+  json?: boolean;
+  seams?: KeychainSeams;
+  loadCredentials?: typeof loadCredentials;
+  loadRecoveryKey?: typeof loadRecoveryKey;
+  promptPassword?: typeof promptPassword;
+  readPhraseStdin?: () => Promise<string>;
+  validatePhrase?: typeof validatePhraseForAccount;
+  savePhrase?: (phrase: string, creds: { accountId: string; deviceId?: string }, kitOpts: RecoveryKitOptions, seams?: KeychainSeams) => Promise<void>;
+}
+
+export async function keySave(kitOpts: RecoveryKitOptions = { kit: true }, deps: KeySaveDeps = {}): Promise<void> {
+  if (deps.json) throw new Error("`--json` is not supported by `rbox key save`");
+  const loaded = await (deps.loadCredentials ?? loadCredentials)();
+  const creds = credentialsForStrictFlow(loaded);
+  if (!creds?.accountId) throw new Error("`rbox key save` needs an account login first — run `rbox login`");
+  const cached = await (deps.loadRecoveryKey ?? loadRecoveryKey)(creds.accountId);
+  let phrase: string;
+  if (cached) {
+    try { phrase = await (await import("../engine/e2ee/index.js")).rkToPhrase(cached) }
+    finally { cached.fill(0) }
+  } else if (process.stdin.isTTY === true) {
+    if (process.stderr.isTTY !== true) throw new Error("re-run in a terminal with stderr attached, or pipe the phrase on stdin");
+    phrase = (await (deps.promptPassword ?? promptPassword)({ message: "Enter your 24-word recovery phrase" })).trim();
+  } else {
+    phrase = await (deps.readPhraseStdin ?? readBoundedRecoveryPhraseStdin)();
+  }
+  phrase = await canonicalRecoveryPhrase(phrase);
+  await (deps.validatePhrase ?? validatePhraseForAccount)(phrase, loaded);
+  await (deps.savePhrase ?? saveValidatedRecoveryPhrase)(phrase, { accountId: creds.accountId, deviceId: creds.deviceId }, kitOpts, deps.seams);
+}
+
+async function readBoundedRecoveryPhraseStdin(): Promise<string> {
+  const chunks: Buffer[] = []; let size = 0;
+  for await (const value of process.stdin) {
+    const chunk = Buffer.from(value as Buffer); size += chunk.length;
+    if (size > 1024) throw new Error("recovery phrase input exceeds 1 KiB");
+    chunks.push(chunk);
+  }
+  const combined = Buffer.concat(chunks);
+  try {
+    const raw = combined.toString("utf8");
+    if (/\r|\n/.test(raw.replace(/\r?\n$/, ""))) throw new Error("recovery phrase input contains trailing extra data");
+    const phrase = raw.replace(/\r?\n$/, "").trim();
+    if (!phrase) throw new Error("no phrase entered");
+    return phrase;
+  } finally {
+    combined.fill(0);
+    for (const chunk of chunks) chunk.fill(0);
+  }
+}
+
+async function saveValidatedRecoveryPhrase(phrase: string, creds: { accountId: string; deviceId?: string }, kitOpts: RecoveryKitOptions, seams?: KeychainSeams): Promise<void> {
+  if (kitOpts.kitPath || (seams?.platform ?? process.platform) !== "darwin") {
+    await writeKitSuccess(phrase, creds, kitOpts, false);
+    return;
+  }
+  const keychainPath = await resolveLoginKeychain(seams);
+  const artifact = await writeKeychainKit(phrase, creds.accountId, keychainPath, seams);
+  await recordKeychainArtifact(creds.accountId, artifact);
+  await offerPlaintextCleanupAfterKeychainSave(creds.accountId, phrase);
+  process.stderr.write("  ✓ recovery phrase saved to the macOS Keychain (search \"rbox\" in Keychain Access)\n");
+  process.stderr.write("    note: this item is not iCloud Keychain-synchronized — keep an off-machine copy too.\n");
 }
 
 export async function revokeDevice(deviceId: string): Promise<void> {
@@ -539,17 +816,28 @@ export async function revokeDevice(deviceId: string): Promise<void> {
   console.log(`revoked ${deviceId}`);
 }
 
-async function offerOrWriteKit(phrase: string, creds: { accountId?: string; deviceId?: string }, kitOpts: RecoveryKitOptions): Promise<boolean> {
+async function offerOrWriteKit(phrase: string, creds: { accountId?: string; deviceId?: string }, kitOpts: RecoveryKitOptions, surface: "genesis" | "backup"): Promise<boolean> {
   const action = recoveryKitAction(true, kitOpts);
   if (action === "write") return writeKitOrWarn(phrase, creds, kitOpts, false);
   if (action !== "offer") return false;
+  if (process.platform === "darwin" && (process.stdin.isTTY !== true || process.stderr.isTTY !== true)) return false;
+  if (process.platform === "darwin" && creds.accountId && !(await claimRecoveryKitOffer(creds.accountId, surface, "in-hand"))) return false;
 
   const target = displayPath(await defaultKitTargetDir());
-  const save = await promptConfirm({ message: `Save a recovery kit (writes the phrase in PLAINTEXT to ${target})?`, default: true });
-  return save ? writeKitOrWarn(phrase, creds, kitOpts, false) : false;
+  const message = process.platform === "darwin"
+    ? "Save this recovery phrase to the macOS Keychain (view later in Keychain Access — search \"rbox\")?"
+    : `Save a recovery kit (writes the phrase in PLAINTEXT to ${target})?`;
+  const save = await promptConfirm({ message, default: true });
+  if (!save) {
+    if (process.platform === "darwin" && creds.accountId) await updateRecoveryKitOfferOutcome(creds.accountId, "declined").catch(() => {});
+    return false;
+  }
+  const saved = await writeKitOrWarn(phrase, creds, kitOpts, false);
+  if (process.platform === "darwin" && creds.accountId) await updateRecoveryKitOfferOutcome(creds.accountId, saved ? "accepted" : "shown").catch(() => {});
+  return saved;
 }
 
-async function offerRecoveryKitAfterRecover(phrase: string, creds: { accountId?: string; deviceId?: string }, kitOpts: RecoveryKitOptions): Promise<void> {
+export async function offerRecoveryKitAfterRecover(phrase: string, creds: { accountId?: string; deviceId?: string }, kitOpts: RecoveryKitOptions, surface: "recover" | "wizard-recover" = "recover"): Promise<void> {
   const action = recoveryKitAction(isInteractive(), kitOpts);
   if (action === "none") return;
   if (action === "write-suppress-echo") {
@@ -560,10 +848,16 @@ async function offerRecoveryKitAfterRecover(phrase: string, creds: { accountId?:
     await writeKitOrWarn(phrase, creds, kitOpts, false);
     return;
   }
+  if (process.platform === "darwin" && (process.stdin.isTTY !== true || process.stderr.isTTY !== true)) return;
+  if (process.platform === "darwin" && creds.accountId && !(await claimRecoveryKitOffer(creds.accountId, surface, "in-hand"))) return;
   const target = displayPath(await defaultKitTargetDir());
-  if (await promptConfirm({ message: `Save a recovery kit (writes the phrase in PLAINTEXT to ${target})?`, default: true })) {
-    await writeKitOrWarn(phrase, creds, kitOpts, false);
-  }
+  const message = process.platform === "darwin"
+    ? "Save this recovery phrase to the macOS Keychain now (view later in Keychain Access — search \"rbox\")?"
+    : `Save a recovery kit (writes the phrase in PLAINTEXT to ${target})?`;
+  if (await promptConfirm({ message, default: true })) {
+    const saved = await writeKitOrWarn(phrase, creds, kitOpts, false);
+    if (process.platform === "darwin" && creds.accountId) await updateRecoveryKitOfferOutcome(creds.accountId, saved ? "accepted" : "shown").catch(() => {});
+  } else if (process.platform === "darwin" && creds.accountId) await updateRecoveryKitOfferOutcome(creds.accountId, "declined").catch(() => {});
 }
 
 async function writeKitOrWarn(phrase: string, creds: { accountId?: string; deviceId?: string }, kitOpts: RecoveryKitOptions, suppressEcho: boolean): Promise<boolean> {
@@ -572,6 +866,18 @@ async function writeKitOrWarn(phrase: string, creds: { accountId?: string; devic
     return true;
   } catch (e) {
     process.stderr.write(`  ! recovery kit write failed: ${e instanceof Error ? e.message : String(e)}\n`);
+    if (e instanceof KeychainLocatorWriteError) return false;
+    if (process.platform === "darwin" && !kitOpts.kitPath && process.stdin.isTTY === true && process.stderr.isTTY === true && creds.accountId) {
+      const fallback = await defaultKitTargetDir();
+      if (await promptConfirm({ message: `Keychain save failed (unavailable) — save a PLAINTEXT file to ${displayPath(fallback)} instead?`, default: true })) {
+        try {
+          await writeKitSuccess(phrase, creds, { kit: true, kitPath: await (await import("./recovery-kit.js")).defaultKitPath(creds.accountId) }, suppressEcho);
+          return true;
+        } catch (fallbackError) {
+          process.stderr.write(`  ! plaintext recovery kit write failed: ${fallbackError instanceof Error ? fallbackError.message : String(fallbackError)}\n`);
+        }
+      }
+    }
     return false;
   }
 }
@@ -585,23 +891,89 @@ async function writeKitOrThrow(phrase: string, creds: { accountId?: string; devi
 }
 
 async function writeKitSuccess(phrase: string, creds: { accountId?: string; deviceId?: string }, kitOpts: RecoveryKitOptions, suppressEcho: boolean): Promise<void> {
+  if (process.platform === "darwin" && !kitOpts.kitPath) {
+    if (!creds.accountId) throw new Error("credential has no account id; cannot write a recovery kit");
+    const keychainPath = await resolveLoginKeychain();
+    const artifact = await writeKeychainKit(phrase, creds.accountId, keychainPath);
+    try { await recordKeychainArtifact(creds.accountId, artifact) }
+    catch (error) { throw new KeychainLocatorWriteError(error) }
+    await offerPlaintextCleanupAfterKeychainSave(creds.accountId, phrase);
+    process.stderr.write("  ✓ recovery phrase saved to the macOS Keychain (search \"rbox\" in Keychain Access)\n");
+    process.stderr.write("    note: this item is not iCloud Keychain-synchronized — keep an off-machine copy too.\n");
+    return;
+  }
   const written = await writeRecoveryKit(phrase, creds, kitOpts.kitPath);
   const shown = displayPath(written.path);
   process.stderr.write(suppressEcho ? `recovery phrase written to ${shown} — not echoed (--kit)\n` : `  ✓ recovery kit written: ${shown}\n`);
   if (written.recordError) process.stderr.write(`  ! recovery kit status record failed: ${written.recordError.message}\n`);
 }
 
-async function recoveryKitStatusLine(accountId: string, hasCachedRk: boolean): Promise<string> {
-  const record = await readRecoveryKitRecord(accountId);
-  if (!record) {
-    return hasCachedRk
-      ? "recovery kit: none recorded — run `rbox key backup --kit`"
-      : "recovery kit: none recorded — no cached phrase on this device; use the copy you saved at setup, or `rbox key recover` (which will offer a kit)";
+async function offerPlaintextCleanupAfterKeychainSave(accountId: string, canonicalPhrase: string): Promise<void> {
+  if (process.stdin.isTTY !== true || process.stderr.isTTY !== true) return;
+  const record = await readRecoveryKitRecordState(accountId);
+  if (record.state !== "recognized") return;
+  for (const artifact of record.record.plaintextArtifacts) {
+    const parsed = await recoveryKitFileState({ version: 2, accountId, plaintextArtifacts: [artifact] });
+    if (parsed !== "present") continue;
+    const remove = await promptConfirm({ message: `Delete the matching old plaintext kit at ${displayPath(artifact.path)}?`, default: true });
+    if (!remove) {
+      await markPlaintextCleanup(accountId, artifact.path, "declined").catch(() => {});
+      continue;
+    }
+    try {
+      if (!(await deleteMatchingPlaintextArtifact(accountId, artifact, canonicalPhrase))) await markPlaintextCleanup(accountId, artifact.path, "failed");
+    } catch {
+      await markPlaintextCleanup(accountId, artifact.path, "failed").catch(() => {});
+      process.stderr.write(`  ! old plaintext recovery kit was not deleted: ${displayPath(artifact.path)}\n`);
+    }
   }
-  const written = record.writtenAt.slice(0, 10);
-  const shown = displayPath(record.path);
-  const state = await recoveryKitFileState(record);
-  if (state === "present") return `recovery kit: ${shown} (written ${written})`;
-  if (state === "missing") return `recovery kit: ${shown} (file missing — moved or deleted; re-run rbox key backup --kit)`;
-  return `recovery kit: ${shown} (file present but content unrecognized — replaced?)`;
+}
+
+async function recoveryKitStatusLines(
+  _accountId: string,
+  hasCachedRk: boolean,
+  loaded: Awaited<ReturnType<typeof readRecoveryKitRecordState>>,
+  keychainState: Awaited<ReturnType<typeof probeKeychainKit>> | undefined,
+  plaintextStates: Awaited<ReturnType<typeof recoveryKitFileState>>[],
+  pendingGenesis: boolean
+): Promise<string[]> {
+  const lines: string[] = [];
+  if (loaded.state === "unknown") lines.push("recovery kit: status record unavailable or unrecognized — backup state unknown");
+  else if (loaded.state === "missing") lines.push(hasCachedRk ? "recovery kit: none recorded — run `rbox key save`" : "recovery kit: none recorded — use the copy you saved at setup, or run `rbox key save`");
+  else {
+    const record = loaded.record;
+    if (record.keychain) {
+      const date = (record.keychain.writtenAt ?? record.keychain.discoveredAt)!.slice(0, 10);
+      if (keychainState === "present") lines.push(`recovery kit: macOS Keychain \"${record.keychain.service}\" (${record.keychain.writtenAt ? "written" : "discovered"} ${date})`);
+      else if (keychainState === "missing") lines.push("recovery kit: macOS Keychain item missing — re-run rbox key save");
+      else lines.push("recovery kit: macOS Keychain unavailable — backup state unknown; retry in a GUI session");
+    }
+    record.plaintextArtifacts.forEach((artifact, index) => {
+      const shown = displayPath(artifact.path); const state = plaintextStates[index];
+      if (state === "present") lines.push(`recovery kit: ${shown} (written ${artifact.writtenAt.slice(0, 10)})`);
+      else if (state === "missing") lines.push(`recovery kit: ${shown} (file missing — moved or deleted)`);
+      else if (state === "unavailable") lines.push(`recovery kit: ${shown} (file unavailable — backup state unknown)`);
+      else lines.push(`recovery kit: ${shown} (file content unrecognized — replaced?)`);
+    });
+    if (!record.keychain && record.plaintextArtifacts.length === 0) lines.push("recovery kit: none recorded — run `rbox key save`");
+  }
+  if (pendingGenesis) lines.push("recovery phrase staged, not yet saved");
+  return lines;
+}
+
+async function maybePrintRecoveryKitNudge(accountId: string, hasCachedRk: boolean): Promise<void> {
+  if (process.platform !== "darwin" || process.stdin.isTTY !== true || process.stderr.isTTY !== true) return;
+  try {
+    await preflightRecoveryEnvelope();
+    const keychainPath = await resolveLoginKeychain();
+    const state = await probeKeychainKit({ service: "rbox recovery phrase", account: accountId, keychainPath, discoveredAt: new Date().toISOString() });
+    if (state !== "missing") return;
+    if (!(await claimRecoveryKitOffer(accountId, "status", hasCachedRk ? "cached-rk" : "typed"))) return;
+    process.stderr.write(hasCachedRk
+      ? "Save your cached recovery phrase to the macOS Keychain without typing it: rbox key save\n"
+      : "Save your recovery phrase to the macOS Keychain: rbox key save (you'll enter the phrase you saved; rbox validates it before storing)\n");
+    await updateRecoveryKitOfferOutcome(accountId, "shown");
+  } catch {
+    // A nudge is never allowed to make status fail.
+  }
 }

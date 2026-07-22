@@ -8,6 +8,7 @@ import { saveConfig, saveStateUnsafeLegacyOrTest, syncStreamId, type WorkspaceCo
 import { accountStatus } from "./account-cmd.js";
 import { flushAccountProfileWrites } from "./account-profile.js";
 import { listDevices, keyStatus } from "./auth-cmd.js";
+import { installGenesisSeamForTests, type GenesisSeam } from "./genesis-seam.js";
 import { daemonRuntimeDir } from "./daemon-control.js";
 import type { DaemonActivity } from "./activity.js";
 import { statusCmd, statusCmdWithDeps, type StatusCmdDeps } from "./status-cmd.js";
@@ -429,8 +430,45 @@ test("key status --json emits enrollment and recovery-kit state", async () => {
   const dto = JSON.parse(await captureStdout(() => keyStatus({ json: true })));
   expect(dto).toEqual({
     enrolled: false,
-    recoveryKit: { path: "/tmp/rbox-kit.txt", writtenAt: "2026-07-04T12:00:00.000Z" },
+    recoveryKit: {
+      version: 2,
+      recordState: "recognized",
+      plaintextArtifacts: [{
+        path: "/tmp/rbox-kit.txt",
+        writtenAt: "2026-07-04T12:00:00.000Z",
+        cleanup: "pending",
+        state: "missing",
+      }],
+      path: "/tmp/rbox-kit.txt",
+      writtenAt: "2026-07-04T12:00:00.000Z",
+      pendingGenesis: false,
+    },
   });
+});
+
+test("key status --json projects an unreleased genesis hold without mutating an offer", async () => {
+  process.env.RBOX_TOKEN = "tok";
+  process.env.RBOX_API = "https://api.test";
+  process.env.RBOX_DEVICE_ID = "dev_a";
+  process.env.RBOX_ACCOUNT_ID = "acct_a";
+  process.env.RBOX_HOME = tmp;
+  const unused = async (): Promise<never> => { throw new Error("unused"); };
+  const seam: GenesisSeam = {
+    readValidatedStagedRecoveryKey: async () => undefined,
+    readAndReconcileCompletionIntent: async () => ({ state: "absent" }),
+    writeCompletionIntent: unused,
+    retargetKeychainIntent: unused,
+    pendingGenesis: async () => "unreleased-recovery-kit-hold",
+    commitVerifiedRecoveryKitArtifact: unused,
+    commitDeliveredRecoveryPhrase: unused,
+    quarantineAbandonedAttempt: unused,
+  };
+  const restore = installGenesisSeamForTests(seam);
+  try {
+    const dto = JSON.parse(await captureStdout(() => keyStatus({ json: true })));
+    expect(dto.recoveryKit).toEqual({ version: 2, recordState: "missing", plaintextArtifacts: [], pendingGenesis: true });
+    expect(await fs.exists(path.join(tmp, ".rbox", "e2ee", "acct_a", "kit.json"))).toBe(false);
+  } finally { restore() }
 });
 
 test("json error mode emits {error} to stderr", () => {

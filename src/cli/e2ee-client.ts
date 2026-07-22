@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import {
+  assertCurrentRecoveryWrap,
   assertMkWrapAuthorized,
   bootstrapAccount,
   buildPairing,
@@ -58,6 +59,13 @@ import { GenesisBootstrapTerminalError } from "./remote/errors.js";
 
 const ACCOUNT_ID_RE = /^acct_[0-9a-f]{16}$/; // strict grammar before path/lock naming
 const ADMIT_RETRIES = 4;
+
+export class RecoveryPreAdmissionError extends Error {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause));
+    this.name = "RecoveryPreAdmissionError";
+  }
+}
 
 export function newAgentId(): string {
   return `agent_${toB64url(randomBytes(16))}`;
@@ -377,7 +385,50 @@ export async function enrollViaPairing(remoteUrl: string, fullToken: string, now
 /** Recover this machine from the phrase (D10): needs an existing device credential
  *  (the caller logged in first); RK unlocks MK + RSK to self-admit. */
 export async function enrollViaRecovery(phrase: string, now: number, loaded?: CredentialLoadResult): Promise<{ accountId: string; deviceId: string }> {
-  return enrollViaPrevalidatedRecovery(await phraseToRk(phrase), now, loaded);
+  let rk: Uint8Array;
+  try { rk = await phraseToRk(phrase) }
+  catch (error) { throw new RecoveryPreAdmissionError(error) }
+  try { return await enrollViaPrevalidatedRecovery(rk, now, loaded) }
+  finally { rk.fill(0) }
+}
+
+/** Read-only validation used before saving a typed/cached phrase. It authenticates
+ * the signed account, exact current recovery-wrap identity, and the candidate's
+ * ability to decrypt that envelope, but never persists or admits anything. */
+export async function validatePhraseForAccount(
+  phrase: string,
+  loaded?: CredentialLoadResult,
+  deps: { api?: Pick<RboxApi, "getAccountKeys"> } = {}
+): Promise<void> {
+  const { accountId, account, wrap } = await currentRecoveryContext(loaded, deps);
+  const rk = await phraseToRk(phrase);
+  let mk: Uint8Array | undefined;
+  try {
+    mk = await recoverMasterKey(accountId, account.currentEpoch, rk, wrap);
+  } finally {
+    rk.fill(0);
+    mk?.fill(0);
+  }
+}
+
+async function currentRecoveryContext(loaded?: CredentialLoadResult, deps: { api?: Pick<RboxApi, "getAccountKeys"> } = {}) {
+  const creds = credentialsForStrictFlow(loaded ?? await loadCredentials());
+  if (!creds?.accountId) throw new Error("`rbox key save` needs an account login first — run `rbox login`");
+  const api = deps.api ?? new RboxApi(creds.remoteUrl, creds.token, "", "");
+  const dto = await api.getAccountKeys();
+  if (!dto) throw new Error("account has no key material (fatal)");
+  const { account } = await verifyDto(dto);
+  assertSignedAccountId(creds.accountId, account.currentRoster.accountId);
+  if (!dto.recoveryWrap) throw new Error("no recovery wrap stored for this account");
+  const wrap = JSON.parse(dto.recoveryWrap) as Wrap;
+  await assertCurrentRecoveryWrap(wrap, account);
+  return { accountId: creds.accountId, account, wrap };
+}
+
+/** Read-only actionable-offer preflight: signed account and exact current wrap
+ * are available, without trying a candidate or mutating admission state. */
+export async function preflightRecoveryEnvelope(loaded?: CredentialLoadResult, deps: { api?: Pick<RboxApi, "getAccountKeys"> } = {}): Promise<void> {
+  await currentRecoveryContext(loaded, deps);
 }
 
 export async function assertRecoveryGenesisReady(loaded?:CredentialLoadResult):Promise<void>{const creds=credentialsForStrictFlow(loaded??await loadCredentials());if(!creds?.accountId)throw new Error("`rbox key recover` needs an account login first — run `rbox login` (web/device-code), then recover.");const api=new RboxApi(creds.remoteUrl,creds.token,"","");const lock=await acquireClearKnownAccountGenesis(api,creds.accountId);await lock.release();}
@@ -399,26 +450,33 @@ export async function enrollViaPrevalidatedRecovery(rk: Uint8Array, now: number,
 }
 
 async function enrollViaPrevalidatedRecoveryLocked(rk:Uint8Array,now:number,creds:NonNullable<ReturnType<typeof credentialsForStrictFlow>>,accountId:string,api:RboxApi):Promise<{accountId:string;deviceId:string}>{
-  const dto = await api.getAccountKeys();
-  if (!dto) throw new Error("account has no key material (fatal)");
-  const { account } = await verifyDto(dto);
-  assertSignedAccountId(accountId, account.currentRoster.accountId);
-  if (!dto.recoveryWrap) throw new Error("no recovery wrap stored for this account");
+  let prepared: { deviceId: string; initial: RedeemResult; build: (curDto: AccountKeysDTO) => Promise<RedeemResult> };
+  try {
+    const dto = await api.getAccountKeys();
+    if (!dto) throw new Error("account has no key material (fatal)");
+    const { account } = await verifyDto(dto);
+    assertSignedAccountId(accountId, account.currentRoster.accountId);
+    if (!dto.recoveryWrap) throw new Error("no recovery wrap stored for this account");
 
-  const recoveryWrap = JSON.parse(dto.recoveryWrap) as Wrap;
-  // A recovered device is a FRESH roster principal — never reuse the credential's
-  // deviceId (it may already be an entry, e.g. recovering on the same machine that
-  // lost its keystore) which would collide as a duplicate roster deviceId.
-  const deviceId = `rec_${toB64url(randomBytes(6))}`;
-  const keys = { sig: generateSignKeyPair(), enc: generateWrapKeyPair() }; // one keypair, reused across 409 retries (D3)
-  const build = async (curDto: AccountKeysDTO): Promise<RedeemResult> => {
-    const r = await buildRecoveryAdmission({ accountId, accountEpoch: account.currentEpoch, deviceId, recoveryKey: rk, recoveryWrap, prevRoster: headRoster(curDto), now, deviceKeys: keys });
-    await selfVerifyAdmission(curDto, r.admissionRoster, r.device.mkWrap);
-    return r;
-  };
-  const initial = await build(dto);
-  await admitWithRetry(api, deviceId, initial, build);
-  return { accountId, deviceId };
+    const recoveryWrap = JSON.parse(dto.recoveryWrap) as Wrap;
+    await assertCurrentRecoveryWrap(recoveryWrap, account);
+    // A recovered device is a FRESH roster principal — never reuse the credential's
+    // deviceId (it may already be an entry, e.g. recovering on the same machine that
+    // lost its keystore) which would collide as a duplicate roster deviceId.
+    const deviceId = `rec_${toB64url(randomBytes(6))}`;
+    const keys = { sig: generateSignKeyPair(), enc: generateWrapKeyPair() }; // one keypair, reused across 409 retries (D3)
+    const build = async (curDto: AccountKeysDTO): Promise<RedeemResult> => {
+      const r = await buildRecoveryAdmission({ accountId, accountEpoch: account.currentEpoch, deviceId, recoveryKey: rk, recoveryWrap, prevRoster: headRoster(curDto), now, deviceKeys: keys });
+      await selfVerifyAdmission(curDto, r.admissionRoster, r.device.mkWrap);
+      return r;
+    };
+    const initial = await build(dto);
+    prepared = { deviceId, initial, build };
+  } catch (error) {
+    throw new RecoveryPreAdmissionError(error);
+  }
+  await admitWithRetry(api, prepared.deviceId, prepared.initial, prepared.build);
+  return { accountId, deviceId: prepared.deviceId };
 }
 
 /** Admit a locally generated agent/API-key device without replacing the issuing

@@ -6,7 +6,12 @@ import {
   KIT_BANNER,
   kitFileName,
   kitTargetDir,
+  parseRecoveryKitRecord,
+  pathIsInsideRemovalRoot,
+  claimRecoveryKitOffer,
   readRecoveryKitRecord,
+  readRecoveryKitRecordState,
+  recoveryKitSafety,
   recoveryKitAction,
   recoveryKitFileState,
   recoveryKitOptionsFromFlags,
@@ -17,7 +22,7 @@ import {
 
 const ACCOUNT = "acct_0123456789abcdef";
 const DATE = new Date(2026, 6, 3, 9, 8, 7);
-const PHRASE = "abandon ability able about above absent absorb abstract absurd abuse access accident account accuse achieve acid acoustic acquire across act action actor actress actual";
+const PHRASE = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
 
 let tmp: string;
 
@@ -76,7 +81,11 @@ describe("recovery kit", () => {
     expect((await fs.stat(file)).mode & 0o777).toBe(0o600);
 
     const record = await readRecoveryKitRecord(ACCOUNT);
-    expect(record).toEqual({ path: file, writtenAt: DATE.toISOString() });
+    expect(record).toEqual({
+      version: 2,
+      accountId: ACCOUNT,
+      plaintextArtifacts: [{ path: file, writtenAt: DATE.toISOString(), cleanup: "pending" }],
+    });
     expect((await fs.stat(recoveryKitRecordPath(ACCOUNT))).mode & 0o777).toBe(0o600);
     expect(await recoveryKitFileState(record!)).toBe("present");
   });
@@ -99,5 +108,57 @@ describe("recovery kit", () => {
     await fs.writeFile(target, "old");
     await fs.symlink(target, link);
     await expect(writeRecoveryKit(PHRASE, { accountId: ACCOUNT }, link, DATE)).rejects.toThrow(/symlink/);
+  });
+
+  test("strict parser normalizes only the exact legacy shape and rejects unknown or mixed records", () => {
+    expect(parseRecoveryKitRecord({ path: "/tmp/kit", writtenAt: DATE.toISOString() }, ACCOUNT)).toEqual({
+      version: 2,
+      accountId: ACCOUNT,
+      plaintextArtifacts: [{ path: "/tmp/kit", writtenAt: DATE.toISOString(), cleanup: "pending" }],
+    });
+    expect(parseRecoveryKitRecord({ path: "/tmp/kit", writtenAt: DATE.toISOString(), extra: true }, ACCOUNT)).toBeUndefined();
+    expect(parseRecoveryKitRecord({ version: 3, accountId: ACCOUNT, plaintextArtifacts: [] }, ACCOUNT)).toBeUndefined();
+    expect(parseRecoveryKitRecord({ version: 2, accountId: "acct_ffffffffffffffff", plaintextArtifacts: [] }, ACCOUNT)).toBeUndefined();
+    expect(parseRecoveryKitRecord({ version: 2, accountId: ACCOUNT, plaintextArtifacts: [], path: "/tmp/legacy" }, ACCOUNT)).toBeUndefined();
+  });
+
+  test("unknown records are distinguished and never overwritten", async () => {
+    await fs.mkdir(path.dirname(recoveryKitRecordPath(ACCOUNT)), { recursive: true });
+    await fs.writeFile(recoveryKitRecordPath(ACCOUNT), '{"version":99}\n');
+    expect(await readRecoveryKitRecordState(ACCOUNT)).toEqual({ state: "unknown" });
+    const file = path.join(tmp, "new-kit.txt");
+    const write = await writeRecoveryKit(PHRASE, { accountId: ACCOUNT }, file, DATE);
+    expect(write.recordError?.message).toContain("unknown");
+    expect(await fs.readFile(recoveryKitRecordPath(ACCOUNT), "utf8")).toBe('{"version":99}\n');
+  });
+
+  test("containment uses a separator boundary", () => {
+    expect(pathIsInsideRemovalRoot("/tmp/rbox/e2ee/kit", "/tmp/rbox")).toBe(true);
+    expect(pathIsInsideRemovalRoot("/tmp/rbox-other/kit", "/tmp/rbox")).toBe(false);
+  });
+
+  test("uninstall safety gives surviving present evidence precedence and never treats unavailable as safe", () => {
+    const record = parseRecoveryKitRecord({
+      version: 2,
+      accountId: ACCOUNT,
+      keychain: { service: "rbox recovery phrase", account: ACCOUNT, keychainPath: "/Users/a/login.keychain-db", writtenAt: DATE.toISOString() },
+      plaintextArtifacts: [{ path: "/tmp/rbox/inside.txt", writtenAt: DATE.toISOString(), cleanup: "declined" }],
+    }, ACCOUNT)!;
+    const loaded = { state: "recognized" as const, record };
+    expect(recoveryKitSafety(loaded, { keychain: "present", plaintext: ["unavailable"] }, "/tmp/rbox")).toBe("backed-up");
+    expect(recoveryKitSafety(loaded, { keychain: "missing", plaintext: ["unavailable"] }, "/tmp/rbox")).toBe("unknown");
+    expect(recoveryKitSafety(loaded, { keychain: "missing", plaintext: ["present"] }, "/tmp/rbox")).toBe("at-risk");
+    expect(recoveryKitSafety({ state: "unknown" }, { plaintext: [] }, "/tmp/rbox")).toBe("unknown");
+    expect(recoveryKitSafety({ state: "missing" }, { plaintext: [] }, "/tmp/rbox")).toBe("at-risk");
+  });
+
+  test("concurrent once-only offer claims have exactly one winner", async () => {
+    const results = await Promise.all([
+      claimRecoveryKitOffer(ACCOUNT, "status", "cached-rk", DATE),
+      claimRecoveryKitOffer(ACCOUNT, "login", "typed", DATE),
+    ]);
+    expect(results.sort()).toEqual([false, true]);
+    const record = await readRecoveryKitRecord(ACCOUNT);
+    expect(record?.offer?.outcome).toBe("claimed");
   });
 });

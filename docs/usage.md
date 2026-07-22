@@ -258,6 +258,7 @@ rbox account status [--json]
 rbox account unlink
 
 rbox key status [--json]       # encryption status (+ recovery-kit record)
+rbox key save                  # validate and save the recovery phrase
 rbox key backup                # re-show recovery phrase
 rbox key genesis --yes         # mint this account's first encryption keys
 ```
@@ -270,29 +271,29 @@ required because this defines the key world every device inherits.
 
 ### Recovery kit (`--kit` / `--kit-path`)
 
-The commands that surface your 24-word phrase can also write it to disk as a
-**recovery kit** — a plaintext file with the phrase, your account id, this
-device, step-by-step recovery instructions, and the no-escrow warning. It's
-supported on `rbox login --bootstrap ... --kit`, `rbox init ... --kit`, `rbox key
-backup --kit`, `rbox recover --kit`, and `rbox key genesis --kit`.
+On macOS, the default recovery-kit action stores the validated 24-word phrase
+in the login Keychain. The item is searchable as “rbox recovery phrase” in
+Keychain Access. It is not iCloud Keychain-synchronized, so keep an off-machine
+copy too. On other platforms, the default remains a plaintext recovery-kit
+file. `--kit-path` always requests a plaintext file on every platform.
 
 ```bash
-rbox key backup --kit                      # write to the default kit location
-rbox key backup --kit-path ~/vault/rbox.txt  # write to a specific file
+rbox key save                              # Keychain on macOS; default file elsewhere
+rbox key backup --kit                      # save while re-showing a cached phrase
+rbox key save --kit-path ~/vault/rbox.txt  # explicit plaintext file
 ```
 
-- **Where it lands.** `--kit` writes to `~/Downloads` when that directory
-  exists, otherwise `$HOME`, named
-  `rbox-recovery-kit-<8-hex-account-suffix>-<YYYYMMDD>.txt`. `--kit-path <path>`
-  writes exactly where you point it.
-- **How it's written.** Atomically (temp file + rename) at mode `0600`
-  (owner-read/write only); it refuses to write through a symlink and re-reads the
-  file to verify the written contents.
-- **Tracking it.** After a successful write, rbox records the path and timestamp.
-  `rbox key status` reports the last-written kit — its path and date, or that no
-  kit is recorded, or that the recorded file has since gone missing.
+- **Explicit files.** The resolved absolute path is persisted. Default file
+  output uses `~/Downloads` when it exists, otherwise `$HOME`, named
+  `rbox-recovery-kit-<16-hex-account-suffix>-<YYYYMMDD>.txt`.
+- **How files are written.** Mode `0600`, exclusive sibling temp, fsync, atomic
+  rename, exact read-back, published-file fsync, and containing-directory fsync.
+  Symlink targets are refused.
+- **Tracking it.** `rbox key status` reports every recorded Keychain and file
+  artifact with a live `present`, `missing`, `unrecognized`, or `unavailable`
+  state. JSON status is read-only and never emits a save nudge.
 
-The kit is plaintext by design: anyone who holds it can decrypt your rbox data,
+An explicit file kit is plaintext: anyone who holds it can decrypt your rbox data,
 and rbox has no escrow and can never reset the phrase for you. Treat it like the
 phrase itself — store it somewhere you'd store a password backup, not next to
 the machine it unlocks.

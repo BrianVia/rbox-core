@@ -415,7 +415,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "key",
     group: "DEVICES & ACCOUNT",
     summary: "encryption and agent sync keys",
-    usage: "rbox key <status | backup | genesis | recover | create-ci | materialize | list | revoke>",
+    usage: "rbox key <status | save | backup | genesis | recover | create-ci | materialize | list | revoke>",
     flags: [
       { flag: "--json", desc: "with `status`, print JSON" },
       { flag: "--kit", desc: "with `backup`, write the cached recovery phrase to the default recovery kit path" },
@@ -428,6 +428,13 @@ export const COMMAND_HELP: CommandHelp[] = [
     summary: "show this machine's encryption enrollment state",
     usage: "rbox key status [--json]",
     flags: [{ flag: "--json", desc: "print JSON" }],
+  },
+  {
+    name: "key save",
+    group: "DEVICES & ACCOUNT",
+    summary: "save a validated recovery phrase to Keychain or an explicit file",
+    usage: "rbox key save [--kit-path <path>]",
+    flags: [{ flag: "--kit-path <path>", desc: "save to this resolved plaintext file instead of the platform default" }],
   },
   {
     name: "key backup",

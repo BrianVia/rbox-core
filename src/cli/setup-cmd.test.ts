@@ -1199,6 +1199,22 @@ test("checksum-valid but wrong recovery phrase reaches exactly one prevalidated 
   expect(enrolls).toBe(1);
 });
 
+test("wizard recovery offers the canonical in-hand phrase before dropping it", async () => {
+  const phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
+  const events: string[] = [];
+  const result = await recoverInWizard({
+    promptInput: (async () => phrase) as never,
+    enroll: async () => { events.push("enrolled"); return { accountId: "acct_0123456789abcdef", deviceId: "dev" }; },
+    offerRecoveryKit: async (received, creds) => {
+      events.push("offered");
+      expect(received).toBe(phrase);
+      expect(creds.accountId).toBe("acct_0123456789abcdef");
+    },
+  });
+  expect(result).toBe("enrolled");
+  expect(events).toEqual(["enrolled", "offered"]);
+});
+
 test("keyed setup requires key input when --workspace is present", async () => {
   const oldKey = process.env.RBOX_KEY;
   delete process.env.RBOX_KEY;
