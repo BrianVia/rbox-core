@@ -1,9 +1,13 @@
 # 182 — sync latency under continuous agent churn (capture in the gaps)
 
-Status: DRAFT v1 — contract-level mechanisms, grounded in code recon
-2026-07-22 (all anchors verified that day). Supersedes v0's sketch. Ready
-for the adversarial review loop; no rounds yet. Implementation queued
-behind 178 t3.
+Status: DRAFT v2 — round 1 (gpt-5.6-sol, high) verdict CHANGES-REQUIRED with
+19 findings (5 blockers); all accepted or accepted-modified, none overruled,
+folded here. Structural consequence: a new prerequisite A0 (generalize
+design 177's capture-stability hardening to ordinary pushes) gates every
+mechanism that raises capture frequency; B and C are reframed as phase-2
+designs with their round-1 constraints pinned as requirements; E is
+narrowed and half-gated on 178 t3. Round 2 should re-attack A0/A1/E and the
+B/C requirement sets.
 
 ## The paradigm (founder, lightly compressed — kept verbatim from v0)
 
@@ -27,218 +31,245 @@ causes agent behavior loops.
 1. **"Busy" is measured too coarsely.** Git holds locks for milliseconds;
    agent workloads create thousands of tiny lock windows with real quiet
    gaps between tool calls. The busy probe is existence-only and fail-closed
-   (`src/engine/git/shared.ts:664` `gitBusy`; plan site
-   `src/engine/git/preflight.ts:123`, apply site
-   `src/engine/git/apply.ts:320`), sampled only when a push attempt runs —
-   so "deferred 1h" usually means "sampled unluckily," not "no safe moment
-   existed." The unsafe windows (ref transactions, index writes) are
-   milliseconds; the object store is immutable and always safe to read.
+   (`src/engine/git/shared.ts:664` `gitBusy`), sampled once per push attempt
+   at plan time (`src/cli/sync-git/plan.ts:573-594`) — so "deferred 1h"
+   usually means "sampled unluckily," not "no safe moment existed."
 2. **The deadline is not continuous — it's handoff.** Freshness matters at
    the moment another machine asks. That moment is observable (the peer
    pulls / comes alive on WS).
+3. **BUT (r1-1): the probe is a POINT probe, not a bracket.** Capture
+   launches later (`plan.ts:942-985`) and reads index/op-state/refs across
+   seconds (`src/engine/git/capture.ts:234-304`); the end-to-end stability
+   endpoint exists only for `opts.resolution` (`capture.ts:353-380`).
+   Design 177 records this as a latent ordinary-push defect and hardened
+   keep-mine only (`177:192-258`). Any mechanism that raises capture
+   frequency raises exposure to it — hence A0 below.
 
-## What the code actually provides today (recon 2026-07-22)
+## What the code actually provides today (recon 2026-07-22, corrected r1)
 
-- **Content watcher excludes `.git/**` entirely** (`watcher.ts:427-435`
-  prunes `.git/`; only the `.git` lifecycle entry itself is admitted,
-  `git-ref-watch.ts:72-85`).
+- **Content watcher policy differs by backend (r1-3):** Chokidar prunes
+  `.git/` and admits only ref-signal paths (`watcher.ts:427-435`); default
+  Parcel deliberately DESCENDS into `.git`, pruning only objects/logs
+  (`src/engine/ignore.ts:227-242`), and routes matching Git targets before
+  the ignore matcher (`watcher.ts:331-384`). The tail table
+  (`GIT_REF_SIGNAL_TAIL_TABLE`, `ignore.ts:166-169`) is shared by BOTH
+  classifiers — a "Linux-only" extension of it is not actually isolated
+  from darwin.
 - **A git-ref side-channel already watches lock files** —
-  `GitRefWatchRegistry` (`git-ref-watch.ts:198`) attaches `fs.watch` roots
-  per repo and classifies `.lock` events (`classifySafeRefEvent`,
-  `git-ref-watch.ts:37-45`) into `lockPreSignal` → `onSignal` → debounced
-  `requestPush("signal")` (`daemon.ts:744-753`, `:793`). BUT:
-  - It is **Linux + Parcel only** (`gitRefSideChannelEligible`,
-    `git-ref-watch.ts:20-25`). The founder's Mac has no lock-event plane at
-    all; git there is fully scan-bound (60s safety floor).
-  - The observed tail set (`GIT_REF_SIGNAL_TAIL_TABLE`,
-    `src/engine/ignore.ts:166-169`) covers `HEAD.lock`, `packed-refs.lock`,
-    `stash`, and per-ref locks — **NOT `index.lock`, `config.lock`, or
-    `gc.pid`**, all of which the busy probe treats as busy. `index.lock` is
-    the dominant agent-churn lock (every add/commit/checkout), so the
-    highest-frequency gap-closing edge generates no event today.
-  - Signals are **edge-agnostic** (create and remove both fire); the
-    fail-closed busy probe downstream is what makes that safe.
-- **There is no capture-side retry floor to relax.** Capture deferrals carry
-  no suppression timer; they are re-probed on every push. The lever is push
-  frequency: watcher signals (Linux) + the 60s safety scan
-  (`SAFETY_SYNC_MS`, `policy.ts:6`). The hours-scale floor the v0 sketch
-  worried about is apply-side held-skip (`held-skip.ts:26`), out of scope.
-- **WS plane is notification-only broadcast.** One payload:
-  `{type:"committed", sequence, deviceId}` (`workspace-sync.ts:715`,
-  fan-out `apps/api/src/ws-fanout.ts:20`); clients react by pulling
-  (`daemon.ts:2909-2915`). No peer relay exists, but each socket is tagged
-  with its `deviceId` attachment (`ws-fanout.ts:16`) — a targeted send is
-  buildable on that.
-- **Deferral state already flows to the server, aggregated.**
-  `SyncStateReporter` → `POST /v1/fleet/sync-state` with `reposDeferred`,
-  `oldestDeferralAgeMs`, `deferralReasons` (`sync-state.ts:6-39`, contract
-  `telemetry/contract.ts:168-176`), landing in `device_sync_state` for
-  fleet alerts only. The reporter's change fingerprint already computes
-  per-repo per-lane boundaries (`sync-state.ts:79-82`) — the detail exists
-  client-side and is collapsed before upload.
-- **Bounding machinery exists**: signal debouncer
-  (`watcher.ts:153-211`), single-flight pump (`daemon.ts:1201-1203`),
-  per-target reconcile backoff (`git-ref-watch.ts:798-806`, exp cap 60s),
-  repo admission cap (`gitRepoCap`, `git-ref-watch.ts:233`).
+  `GitRefWatchRegistry` (`git-ref-watch.ts:198`), Linux + Parcel only
+  (`gitRefSideChannelEligible`, `git-ref-watch.ts:20-25`), signal wiring
+  `daemon.ts:754-760` → debounced `requestPush` `daemon.ts:803`. The
+  founder's Mac has no lock-event plane; git there is scan-bound (60s
+  safety floor). Observed tails today: `HEAD.lock`, `packed-refs.lock`,
+  `stash`, per-ref locks — NOT `index.lock` / `config.lock` / `gc.pid`,
+  though the busy probe blocks on all of them. Busy-set physical roots
+  (r1-2): `index.lock`+`HEAD.lock` under gitDir; `config.lock`,
+  `packed-refs.lock`, `gc.pid` under commonDir (`shared.ts:664-678`) — a
+  linked worktree has gitDir ≠ commonDir. `gc.pid` is not a `.lock` tail;
+  it needs ordinary-target classification, not `lockPreSignal`.
+- **No capture-side retry floor exists to relax.** Capture deferrals are
+  re-probed on every push; the lever is push frequency (watcher signals on
+  Linux + the 60s safety scan, `SAFETY_SYNC_MS`, `policy.ts:6`). Apply-side
+  held-skip floors (`held-skip.ts:26`) are out of scope. Existing busy
+  retries at 2s/8s add attempts (`daemon.ts:146,971-999`).
+- **Debouncer bounds emission, not ingestion (r1-4):** every raw event
+  still iterates contributors (`git-ref-watch.ts:742-762`) and resets
+  timers (`watcher.ts:189-210`); 400ms of quiet emits a batch; maxWait 3s
+  is not a minimum attempt interval (`daemon.ts:672-676`). Commands spaced
+  ~400ms apart can each trigger a whole-workspace push; single-flight
+  (`daemon.ts:1211-1216`) coalesces only while the pump runs.
+- **WS plane is notification-only broadcast**: `{type:"committed",
+  sequence, deviceId}` (`workspace-sync.ts:715`); clients pull on it
+  (`daemon.ts:2917-2925`). Old servers ignore non-`cursor` inbound messages
+  (`workspace-sync.ts:1319-1327`) and old clients ignore unknown JSON types
+  — wire-compat for NEW message types is safe in both directions (r1-7).
+  BUT the socket's `deviceId` attachment is the CLIENT'S query parameter,
+  serialized untouched (`ws-fanout.ts:10-16`; `routes/sync.ts:48-54`
+  forwards unchanged) — it authenticates nothing (r1-9). Connect is
+  read-level authz including viewers (`authz.ts:32-40`), and inbound
+  messages are not session-age-checked (r1-10).
+- **Deferral state reaches the server as aggregates only**, per
+  (device, workspace, project, binding) row (`0027_device_sync_state.sql`),
+  POST-only (`worker.ts:374-384`) with an exact-`v:1`, unknown-key-rejecting
+  envelope (`telemetry-ingest.ts:257-336`) — a new field is NOT additive
+  for old servers (state dropped on 202 / 400 on v2), and the reporter
+  fingerprints before checking `dropped` (`sync-state.ts:90-102`),
+  suppressing retries (r1-7). There is no read/delivery path back to
+  clients (r1-6). API-key principals cannot POST sync-state at all
+  (`worker.ts:367-371`, `telemetry-ingest.ts:260-267`) — a coverage gap
+  for agent-churn machines (r1-18).
+- **Design 120's metadata threat model** rejected repo paths AND path
+  hashes leaving the machine (`120:230-238`); design 105 pinned the WS
+  information ceiling to sequence integers (`105:85-103`). Any per-repo
+  advertisement supersedes both and must say so (r1-5).
 
 ## Mechanisms
 
-### A. Event-driven micro-gap capture (extend the existing side-channel)
+### A0 (prerequisite, from r1-1): capture-stability hardening for ordinary pushes
 
-Not a new plane — two extensions of `GitRefWatchRegistry`:
+Generalize design 177's keep-mine capture hardening — scratch-ref-pinned
+bundle roots, stability endpoint against the STAGED snapshot (staged index
+bytes, staged op-state, presence bits), staged pin roots, in-progress
+presence veto (`177:192-258`) — to ordinary capture. 177 already names this
+"a separate follow-up since it is a latent general defect"; 182 makes it
+the gate: **no mechanism that increases capture frequency ships before
+A0.** A0 is valuable standalone (it closes a today-defect that agent churn
+already tickles at 60s cadence). Acceptance: the 177 crash/flip matrix
+rerun against ordinary capture; mismatch → defer-with-reason (base carry),
+never publish.
 
-**A1 (small, Linux ships first): observe the busy-set locks.** Add `index`,
-`config` to the `gitDir` targets and `gc.pid`'s base to the common-dir
-targets in `GIT_REF_SIGNAL_TAIL_TABLE`, so their create AND remove edges
-emit `lockPreSignal`. The remove edge is the micro-gap detector: lock
-clears → debounced signal → `requestPush("signal")` → the fail-closed
-`gitBusy` probe either captures in the gap or bounces off the next lock.
-No new scheduling code: the debouncer coalesces bursts, the single-flight
-pump serializes attempts, and the probe preserves never-capture-mid-
-operation. Expected effect: capture latency for churny repos on Linux drops
-from worst-case 60s-per-sample-with-bad-luck to
-first-quiet-gap-after-debounce.
+### A1: event-driven micro-gap capture (after A0)
 
-- Contract: tail-table extension only; no changes to `classifySafeRefEvent`
-  shape, no new signal kinds. The debounce window and pump remain the
-  attempt bound; no per-lock-event capture attempts.
-- Risk pinned: `index.lock` churn is high-frequency; the debouncer's
-  maxWait must keep signal cost O(window), not O(events). Measure with the
-  rig before/after (attempts/min under a synthetic agent-churn loop).
+Extend lock observation to the busy set, with corrected placement (r1-2)
+and explicit bounds (r1-3, r1-4):
 
-**A2 (gated): macOS eligibility.** The founder's primary machine gets zero
-benefit from A1. Expanding `gitRefSideChannelEligible` to darwin requires a
-source-verification spike FIRST (standing rule: read the dependency's
-source when a design hinges on its behavior): does `fs.watch` on darwin
-(FSEvents/kqueue under Bun) deliver create+remove events for dotfile-
-adjacent paths with the same shallow/recursive semantics the registry
-assumes (`git-ref-watch.ts:599-634`)? Deliverable of the spike is a
-platform-behavior test in the rig, not a doc claim. Until then A2 is
-explicitly unshipped and the Mac stays scan-bound.
+- **Targets:** `index` → gitDir root; `config` → commonDir root; literal
+  `gc.pid` → commonDir root as an ordinary target (not a `.lock` tail).
+  Linked-worktree test required (gitDir ≠ commonDir).
+- **Table split (r1-3):** lock-base targets live in a NEW side-channel-only
+  table consumed by `GitRefWatchRegistry`'s classifier; the shared
+  `GIT_REF_SIGNAL_TAIL_TABLE` used by the content-watcher classifiers is
+  unchanged, so darwin Parcel behavior does not silently change and Linux
+  cannot double-signal one edge on two planes.
+- **Attempt budget (r1-4), the actual contract:** a per-workspace
+  minimum-interval floor between signal-triggered push attempts (default
+  5s) plus a global ceiling (default 12 attempts/min) enforced where the
+  debounced signal converts to `requestPush` — not in the debouncer.
+  Raw-event ingestion cost must be O(1) per event with no allocation
+  growth; acceptance ceiling measured on the rig under a synthetic
+  agent-churn loop (git commit every 300ms for 5min): signal-triggered
+  attempts ≤ the ceiling, CPU delta < 5% vs baseline.
+- Safety: every attempt still passes the point probe AND (post-A0) the
+  staged-snapshot stability endpoint; the remove edge finds gaps, the
+  bracket proves them.
 
-### B. Demand-driven flush (deferral becomes "until demanded")
+### A2 (gated): darwin eligibility
 
-**B1: advertise per-repo deferred lanes.** Promote the per-repo, per-lane
-boundary detail the reporter already computes into the sync-state envelope
-as an additive, versioned field (bounded: top-N repos by age, N=8, repo
-paths NOT included — a stable repo digest + lane + deferredSince; paths are
-workspace-local information the server does not need). Server stores
-latest-per-device alongside the existing `device_sync_state` row.
+Unchanged from v1: expanding `gitRefSideChannelEligible` to darwin requires
+a source-verification spike (Bun `fs.watch` on darwin: create+remove
+delivery, shallow/recursive semantics vs `git-ref-watch.ts:599-634`),
+delivered as a rig platform test. Until then the Mac stays scan-bound —
+which also means A1's benefit is Linux-only and the founder's primary
+machine needs A2 or B to feel anything.
 
-**B2: targeted demand relay.** New client→server WS message
-`{type:"flushDemand", targetDeviceId, repoDigest}` sent by device B when it
-(a) connects or completes a pull, and (b) the server-advertised state shows
-device A holding deferred lanes for repos B tracks. The DO relays it to A's
-socket(s) selected by the existing `deviceId` attachment — first targeted
-send on this plane, same notification-only contract: **delivery is never
-required for correctness**; the 60s safety floor and ordinary push path
-remain the guarantee. No ACK protocol.
+### B (phase 2 — separate design rounds required): demand-driven flush
 
-**B3: demand escalation on A.** Receiving a `flushDemand` for a repo with a
-deferred capture lane arms a bounded escalation window for that repo:
-elevated gap-hunting (tight re-probe cadence, e.g. 2s interval, window
-≤60s, one window at a time per repo, re-arm only by a fresh demand) inside
-the existing pump/single-flight machinery. Success = capture + push →
-ordinary `committed` broadcast tells B; failure = window expires, repo
-returns to ambient cadence. Escalation respects the registry's per-target
-backoff (`#recordRetry`) — a repo whose reconciles are failing does not get
-hammered because a peer is impatient.
+Round 1 established B's v1 sketch was under-specified on five fronts.
+B stays in this doc as a REQUIREMENT SET; its wire contract gets its own
+design rounds before any implementation:
 
-- Flood control: per-device inbound demand budget on A (per-repo window
-  dedup + global cap, e.g. ≤4 concurrent escalation windows); DO drops
-  demands for devices not currently connected (no queueing — the next
-  sync-state upload re-advertises anyway).
-- Deployment ordering: server (B1 ingest + B2 relay) deploys before any
-  client sends `flushDemand` — same server-first contract as design 180.
-  Old servers receiving unknown WS message types must ignore them (verify,
-  don't assume — review round item).
-- UX (B, receiving side): while a demanded pull is pending, status may show
-  "catching up from <device>…" — copy in a later round; mechanism first.
+1. **Identity (r1-9, r1-12):** the Worker overwrites the socket attachment
+   with the AUTHENTICATED `p.deviceId` + bindingId; the DO rejects
+   attachments it did not stamp. Routing is binding-scoped end to end
+   (advertisement, attachment, demand), never device-only.
+2. **Authorization + session (r1-10):** demand-senders must hold write-level
+   authz (viewers cannot induce work); inbound demand frames AND targeted
+   sends apply the same fail-closed session-age check as outbound
+   broadcast (`ws-fanout.ts:20-58`).
+3. **DO work bounds (r1-11):** fixed frame-size limit, schema with
+   fixed-width fields, per-sender token bucket, bounded target lookup via
+   WebSocket tags (not a full `getWebSockets()` scan), capped fanout.
+4. **Advertisement (r1-5, r1-6, r1-8, r1-7, r1-18):** capture-lane-only
+   (apply/config lanes are not demandable); repo identity is a fixed-width
+   domain-separated MAC under a workspace E2EE secret (never a bare hash —
+   supersedes 120's prohibition explicitly, with rotation + collision
+   rules, and accepts equality-cardinality leakage in the doc); ages not
+   timestamps (120's rule); a defined DELIVERY path to B (candidates:
+   pull-response piggyback like the §27 download grant, or an initial WS
+   frame — decided in B's own round 1); envelope evolution handled as a
+   v2 envelope with server-first deploy AND old-server dual-post fallback,
+   fixing the fingerprint-before-drop-check suppression
+   (`sync-state.ts:90-102`) first; an API-key-principal story (least-
+   privilege state reporting or explicit device-credential-only scope).
+5. **Loop prevention (r1-13) + service guarantee (r1-14):** demands are
+   deduped by advertisement generation; resend cooldown; an active window
+   never re-arms from its own traffic; only a CLEARED advertisement (not a
+   `committed` frame) counts as success. On A, the demand escalation is a
+   first-class scheduler operation with 178-recoveryProbe-style fairness
+   (bounded service guarantee, K-dequeue outrank) — not a `want.push`
+   boolean, which is whole-workspace and lowest-priority
+   (`policy.ts:104-111`) and could receive zero service inside the window.
 
-### C. Churn-as-heat scheduling
+### C (phase 2, after A1 field data): churn-as-heat
 
-A repo generating constant lock traffic is the most valuable repo on the
-machine, not the least. With A1 in place, heat = debounced signal count per
-repo per window (in-memory, decayed). Heat only REORDERS capture attention
-within existing budgets: hot repos get probed first within a pump pass and
-keep their side-channel attention under the admission cap
-(`gitRepoCap`) — heat never bypasses per-target backoff, never adds
-attempts beyond the debounce/pump bound, and failure is not heat (probe
-bounces don't raise it). This inverts today's implicit defer-and-back-off
-without touching safety.
+Round 1 (r1-15) showed the current signal shape cannot support it:
+`onSignal` carries no owner, the debouncer keeps a boolean, over-cap repos
+emit nothing (lexicographic admission, `git-ref-watch.ts:522-535`), and
+capture-pool reordering cannot help a repo already bounced at the busy
+probe. C's requirement set: attributed signals (repo identity on the
+side-channel callback), a decayed bounded heat map, shared-common-dir
+attribution policy, admission hysteresis so hot repos can enter the cap,
+an aging bound preventing cold-repo starvation, and a defined scheduler
+seam. Not designed further until A1 ships and field data shows reordering
+matters.
 
-### D. Don't guess transience (policy, unchanged from v0)
+### D. Don't guess transience (policy, unchanged)
 
-Agent worktrees that get squash-merged and deleted an hour later are
-indistinguishable in advance from the one that matters. Sync everything;
-let deletion propagate; content-addressing makes doomed-work bandwidth
-cheap. The hygiene work is ghost-record cleanup (pr8 class, in 178 t3) and
-remnant pruning — not prediction.
+Sync everything; let deletion propagate; content-addressing makes
+doomed-work bandwidth cheap. Hygiene = ghost-record cleanup (pr8 class, in
+178 t3) and remnant pruning — not prediction.
 
-### E. Agent-readable status contract
+### E. Agent-readable status contract (narrowed r1-16, r1-17)
 
-Status output is an agent API (two documented agent daemon-stops in two
-days). Two parts:
-
-1. **Calm copy everywhere** — deferral language never implies malfunction.
-   The bar half shipped (PR #401: deferrals no longer render "Degraded");
-   CLI `rbox status` copy gets the same audit (deferral lines state what,
-   since when, and that no action is needed).
-2. **An explicit machine-parseable verdict line** in `rbox status` (and
-   `--json`): `agent: safe-to-leave-running` /
-   `agent: do-not-stop (mid-apply, ~Ns remaining)` — one stable line whose
-   vocabulary is versioned in the shell/telemetry allowlist like 178's mode
-   witness vocabulary. Agents told "do not stop" need a reason and a bound,
-   or they stop anyway.
+1. **Calm copy, bounded by 176's frozen grammar (r1-17):** the shared
+   `git deferred` line keeps exact bytes (logs, doctor redaction, parsers,
+   rig fixtures — `176:127-154`); only companion/status lines change. CLI
+   `rbox status` deferral companions state what, since when, no action
+   needed.
+2. **Structured agent verdict, gated on 178 t3 (r1-16):** a JSON field (not
+   a prose line) in `rbox status --json` + one stable text line:
+   `agent-verdict: safe-to-leave-running | stop-will-wait (<phase>) |
+   unknown`. No ETA — there is no bounded estimator (pull does not wire
+   `onGitProgress`; ambient phases are coarse). "stop-will-wait" is only
+   truthful once t3's graceful stop ships (today's stop still SIGKILLs at
+   60s, `daemon-control.ts:510-563`); until then the field ships with
+   `safe-to-leave-running | unknown` only. Vocabulary compile-enforced in
+   the shell/telemetry allowlist like 178's mode witness.
 
 ## Relationship to existing work
 
-- 178 t2 (shipped v1.7.21): deferrals self-clear and report honestly — the
-  hygiene floor this builds on.
-- 178 t3 (in implementation): lock ownership classification + gone-directory
-  ghost clearing — prerequisite for trusting lock-plane signals; also the
-  graceful-stop half of E2's "do-not-stop" honesty.
-- 176/177: resolution semantics unchanged; A/B/C move CAPTURE timing only.
-- Design 174's held-apply bounds are apply-side and untouched.
+- 177: A0 IS 177's named ordinary-push follow-up; keep-mine machinery
+  (scratch refs, staged snapshot) is the implementation substrate.
+- 178 t2 (shipped): deferral hygiene floor. 178 t3 (in implementation):
+  lock classification + graceful stop — prerequisite for E2's
+  "stop-will-wait" and for trusting lock-plane signals.
+- 176: frozen deferral grammar bounds E1. 174: held-apply floors untouched.
+- 120/105: B's advertisement supersedes their metadata ceilings and must
+  say so explicitly in B's own design doc.
 
-## Priorities / ship order (proposed, for review)
+## Priorities / ship order (v2)
 
-1. **E** (copy audit + agent verdict line) + **A1** (tail-table extension,
-   Linux) — small, independent, immediate value.
-2. **B1** (advertisement) then **B2+B3** (relay + escalation), server
-   first — the handoff-latency fix; needs its own review round on the wire
-   contract before implementation.
-3. **C** (heat reordering) — after A1 field data shows where reordering
-   matters.
-4. **A2** (darwin) — gated on the fs.watch source-verification spike.
+1. **E1** (copy companions) — small, no gates.
+2. **A0** (ordinary-capture stability hardening) — closes a today-defect;
+   gates everything else.
+3. **A1** (side-channel busy-set observation, Linux) — after A0.
+4. **E2** (agent verdict) — `safe/unknown` immediately post-A0 review;
+   `stop-will-wait` after 178 t3 ships.
+5. **B** — own design doc + rounds against the requirement set above.
+6. **C** — after A1 field data. **A2** — after the darwin spike.
 
 ## Non-goals (pinned)
 
-- No capture of mid-operation git state, ever. Latency is bought with
-  better gap detection and demand signals, not weakened safety — every new
-  trigger path still funnels through the fail-closed `gitBusy` probe.
+- No capture of mid-operation git state: post-A0 this is enforced by a
+  staged-snapshot bracket, not a point probe.
 - No transience prediction / selective sync.
-- No new daemon-stop choreography; the whole point is that stopping is
-  never the answer.
-- No correctness dependence on WS delivery (preserves the ws-fanout
-  notification-only contract).
+- No new daemon-stop choreography.
+- No correctness dependence on WS delivery (105's contract).
 - No relaxation of the 60s safety floor; event planes are additive.
+- No repo paths or reversible path hashes off-machine (120's rule; B may
+  supersede it only with the MAC'd-digest contract).
 
-## Tests the implementation must write (per mechanism)
+## Tests the implementation must write
 
-- A1: tail-table classification for index/config/gc create+remove; debounce
-  coalescing under synthetic index.lock churn (injected clock); a signal
-  arriving mid-capture does not re-enter (single-flight); busy probe still
-  bounces a mid-operation attempt triggered by a signal.
-- B1: envelope stays within bounds at >N deferred repos; digest stability;
-  old-server tolerance (unknown field ignored) — contract test.
-- B2: DO relays only to sockets whose attachment matches targetDeviceId;
-  unknown message types ignored by old clients/servers; disconnected target
-  drops silently.
-- B3: escalation window arms once per demand, expires, respects per-target
-  backoff, honors the concurrent-window cap; success clears via the
-  ordinary push path.
-- C: heat reorders within a pass without changing attempt counts; probe
-  bounces do not accumulate heat.
-- E: verdict-line vocabulary compile-enforced against the allowlist;
-  `--json` parity.
+- A0: 177 crash/flip matrix generalized to ordinary capture (A→B→A index
+  flip, ref move mid-capture, op-state root appearing mid-capture →
+  defer-with-reason, nothing published).
+- A1: root-mapping classification incl. linked worktrees (gitDir ≠
+  commonDir); table split leaves content-watcher classification unchanged
+  on both backends; attempt floor + global ceiling under synthetic churn
+  (injected clock); O(1) raw-event ingestion (allocation/CPU assertion on
+  the rig); busy-probe bounce on signal-triggered attempt.
+- E1: frozen-grammar bytes unchanged (fixture diff); companions present.
+- E2: vocabulary compile-enforced; `--json` parity; `unknown` on stale
+  status; `stop-will-wait` absent until the t3 witness exists.
+- B/C: test lists live in their own design rounds.
