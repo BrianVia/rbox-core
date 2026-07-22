@@ -152,3 +152,19 @@ what happened, what it cost, fix hint if obvious.
   confirm line. Collapse subsumed lanes into one count line
   ("1,412 tags/branches retained — nothing lost") and show only the
   would-be-discarded and unprovable lanes in full.
+
+- 2026-07-22 (v1.7.21 rollout): `rbox upgrade` after an installer binary swap
+  says "already up to date (1.7.21)" and leaves the RUNNING daemon on the old
+  version — the skew warning then tells the user to restart manually. If the
+  binary is current but a live daemon reports an older daemonVersion, upgrade
+  should offer/do the restart itself.
+- 2026-07-22: a pull-only daemon's status says "1 change waiting to upload"
+  with no hint that pull-only will never upload it. Copy should say
+  "1 local change held (pull-only)".
+- 2026-07-22 (t2 field check): a stale `git busy` lane on a repo whose
+  DIRECTORY is gone (savvy-core-pr8, deleted worktree) is retained forever by
+  the hygiene reconciler's fail-closed rule (context resolution fails →
+  indeterminate). Correct per contract, but the pr8 ghost the incident exposed
+  still can't die. Needs a ruled mechanism: e.g. absent-from-discovery + N
+  consecutive gone-directory observations clears busy-class lanes (178 t3
+  candidate).
