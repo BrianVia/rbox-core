@@ -70,6 +70,7 @@ import {
   pausedAmbientDaemonStatus,
   projectAmbientDaemonStatus,
   type AmbientDaemonStatusV1,
+  type DaemonMode,
 } from "./ambient-status.js";
 import { saveAmbientDaemonStatus } from "./ambient-status-writer.js";
 import { RBOX_VERSION } from "../version.js";
@@ -123,6 +124,8 @@ type RboxBarAmbientStatus = AmbientDaemonStatusV1 & {
   fileCount: number;
   totalBytes: number;
   daemonVersion: string;
+  mode: DaemonMode;
+  bootId: string;
   workspaceRoot: string;
 };
 
@@ -1832,6 +1835,8 @@ export class RboxDaemon {
       fileCount: this.manifest.files.length,
       totalBytes: this.manifest.files.reduce((n, f) => n + f.size, 0),
       daemonVersion: RBOX_VERSION,
+      mode: this.pullOnly ? "pull-only" : "read-write",
+      bootId: this.bootId,
       workspaceRoot: this.root,
     };
   }
@@ -1874,6 +1879,8 @@ export class RboxDaemon {
       fileCount: previous.fileCount,
       totalBytes: previous.totalBytes,
       daemonVersion: previous.daemonVersion,
+      mode: previous.mode,
+      bootId: previous.bootId,
       workspaceRoot: previous.workspaceRoot,
     };
   }

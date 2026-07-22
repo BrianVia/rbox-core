@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { applyGitState, assertGitTargetWithinRoot, finalizeGitChainTimings, gitIdentity, gitIdentityKey, gitPreflight, indexIdentityV2, inspectLockedPRepairReceipt, isGitBusy, persistPRepairTerminal, preserveGitConflict, receiverEquivalentCollisionNames, repoCtxFromDisk, poolMap, readBaseAbsentArtifact, readBasePresentArtifact, runLockedPRepairAttempt, resumeLockedAcceptedPRepair, refreshLockedAcceptedPRepair, settleBaseAbsentArtifact, type AppliedManifestOracle, type ApplyBranchTransitionAdapter, type ApplyBranchTransitionInput, type CheckoutCapabilityProbe, type GitIdentity, type GitChainTimings, type GitSection, type IgnoreMatcher, type Manifest, type BlobStore, zeroGitChainTimings } from "../../engine/index.js";
-import { canonicalizeGitConfig, validateCanonicalGitConfig, type GitConfig } from "../../engine/git/config-sync.js";
+import { canonicalizeGitConfig, sanitizeGitSectionForPersistence, validateCanonicalGitConfig, type GitConfig } from "../../engine/git/config-sync.js";
 import { applyConfigTransaction, materializeFreshGitConfig, readConfigSnapshot, readParsedConfigSnapshot, sameConfigStatToken, type ConfigStatToken, type ConfigTransactionResult } from "../../engine/git/config-txn.js";
 import { readAllRefs } from "../../engine/git/refs.js";
 import { git, readHead, warnOnce } from "../../engine/git/shared.js";
@@ -9,7 +9,7 @@ import { DEFERRAL_LANES, expectedStateNonce, loadRawState, repoRecordsForState, 
 import { completeConfigApply, configLaneState, inputRecord, type ConfigLaneState, type GitDeferralUpdates } from "../sync-state.js";
 import { checkoutJournalBinding, clearFollowJournal, deriveBaseIndexProjection, followDivergedRepo, FollowCrashInjectedError, quarantineUnboundFollowJournal, recoverAndLandFollowJournal, type FollowCrashPoint, type FollowIntended, type FollowProgress } from "./follow.js";
 import { checkoutLabel, configInvalidSkipLogged, configOwnershipSkipLogged, repoDirOf, narrowerScope, projectedKey, emptyToUndef, errMsg, chainLock, gitApplyMutationKey, nestedRepoChains, gitApplyConcurrency, gitFollowEnabled, gitIncomingKey, nextDeferral, repoEquivalenceWarningLogged, sectionOpState } from "./shared.js";
-import { gitConfigHash, sameConfigShape, configReceiver } from "./config-lane.js";
+import { gitConfigHash, readLocalGitConfig, sameConfigShape, configReceiver } from "./config-lane.js";
 import { prepareFollowerBranchProtocol } from "./follower-protocol.js";
 import { createPRepairStatePort } from "./p-repair-state.js";
 import { settleExactPresentArtifact } from "./p-settlement.js";
@@ -309,11 +309,13 @@ opts: {
     warningSink?: (message: string) => void;
   } = {}
 ): Promise<GitPullOutcome> {
-  const baseRepos = { ...(state.lastSyncedManifest.gitRepos ?? {}) };
+  const sanitizeSections = (sections: Record<string, GitSection> | undefined): Record<string, GitSection> =>
+    Object.fromEntries(Object.entries(sections ?? {}).map(([relPath, section]) => [relPath, sanitizeGitSectionForPersistence(section)]));
+  const baseRepos = sanitizeSections(state.lastSyncedManifest.gitRepos);
   const applied: Record<string, GitSection> = { ...baseRepos };
   const removedMem = { ...(state.gitReposRemoved ?? {}) };
   const needsRes = { ...(state.gitNeedsResolution ?? {}) };
-  const pending = { ...(state.gitPendingRemote ?? {}) };
+  const pending = sanitizeSections(state.gitPendingRemote);
   const records = repoRecordsForState(state);
   const configLane: Record<string, ConfigLaneState> = {};
   const deferrals: Record<string, GitDeferralUpdates | null> = {};
@@ -326,10 +328,10 @@ opts: {
   let commonDirGroups: Map<string, number> | undefined;
   let metrics: GitApplyMetrics | undefined;
   const pack = (): GitPullOutcome => ({
-    gitRepos: emptyToUndef(applied),
+    gitRepos: emptyToUndef(sanitizeSections(applied)),
     gitReposRemoved: emptyToUndef(removedMem),
     gitNeedsResolution: emptyToUndef(needsRes),
-    gitPendingRemote: emptyToUndef(pending),
+    gitPendingRemote: emptyToUndef(sanitizeSections(pending)),
     configLane: emptyToUndef(configLane),
     deferrals: emptyToUndef(deferrals),
     partial: emptyToUndef(partial),
@@ -514,24 +516,20 @@ opts: {
 
   const processRepo = async (rel: string, chainTimings?: GitChainTimings): Promise<{ result: GitApplyRepoResult; commonDirGroup?: number }> => {
     const wireRemoteSec = remote.gitRepos?.[rel];
-    let remoteSec = wireRemoteSec;
+    const remoteSec = wireRemoteSec === undefined ? undefined : sanitizeGitSectionForPersistence(wireRemoteSec);
+    let sanitizedConfigReason: string | undefined;
     if (wireRemoteSec?.config !== undefined) {
       const config = validateCanonicalGitConfig(wireRemoteSec.config);
-      const invalidReason = !config.ok
+      sanitizedConfigReason = !config.ok
         ? config.reason
         : wireRemoteSec.refScope === "scoped"
           ? "scoped git section cannot carry config"
           : undefined;
-      if (invalidReason) {
-        // Treat the field as truly absent for every downstream decision and for
-        // the persisted base/pending section. This prevents a later push from
-        // carrying the invalid field back onto the wire.
-        remoteSec = { ...wireRemoteSec };
-        delete remoteSec.config;
+      if (sanitizedConfigReason) {
         const logKey = `${root}\0${rel}`;
         if (!configInvalidSkipLogged.has(logKey)) {
           configInvalidSkipLogged.add(logKey);
-          glog(`git-sync WARNING ${rel}: ignored invalid incoming config (${invalidReason}); Git state continues`);
+          glog(`git-sync WARNING ${rel}: ignored invalid incoming config (${sanitizedConfigReason}); Git state continues`);
         }
       }
     }
@@ -541,6 +539,59 @@ opts: {
     const repoDir = repoDirOf(root, rel);
     let dotGit = await fs.lstat(path.join(repoDir, ".git")).catch(() => undefined);
     const commonDirGroup = await commonDirGroupFor(repoDir, dotGit !== undefined);
+
+    // Sanitizing an invalid incoming config must not make the next push author a
+    // corrective echo. Record the unchanged owned local config as the config-lane
+    // baseline; only a later genuine local edit is publishable.
+    if (sanitizedConfigReason && !opts.disableConfigLane && dotGit) {
+      const diskCtx = await repoCtxFromDisk(repoDir).catch(() => undefined);
+      if (diskCtx?.kind === "dir") {
+        const receiver = await configReceiver(root, diskCtx).catch(() => undefined);
+        if (receiver?.owned) {
+          const local = await readLocalGitConfig(root, rel, diskCtx, undefined, () => {
+            const logKey = `${root}\0${rel}`;
+            if (!configInvalidSkipLogged.has(`${logKey}\0credential`)) {
+              configInvalidSkipLogged.add(`${logKey}\0credential`);
+              glog(`git-sync WARNING ${rel}: skipped credential-bearing remote URL from config baseline`);
+            }
+          });
+          if (local.status === "ok") {
+            const beforeLane = laneRecord(rel);
+            const lane = invalidateLaneShape(rel, receiver.shape);
+            const priorBaseline = beforeLane.cfgShape === undefined || sameConfigShape(beforeLane.cfgShape, receiver.shape)
+              ? beforeLane.cfgSynced
+              : undefined;
+            replaceLane(rel, {
+              ...lane,
+              // Preserve an existing same-shape baseline: if the user changed
+              // A→B before this pull, B must remain publishable. Seed the current
+              // hash only for the first sanitation observation.
+              cfgSynced: priorBaseline ?? local.cached.hash,
+              cfgShape: receiver.shape,
+            });
+          }
+        }
+      }
+    } else if (wireRemoteSec && wireRemoteSec.config === undefined && !opts.disableConfigLane && dotGit) {
+      // Genuine wire absence is not sanitation. Clear an old authorship/baseline
+      // marker so the established presence rule can heal an old writer that
+      // stripped a valid config field. Invalid-present input takes the branch
+      // above and deliberately retains the local hash instead.
+      const diskCtx = await repoCtxFromDisk(repoDir).catch(() => undefined);
+      if (diskCtx?.kind === "dir") {
+        const receiver = await configReceiver(root, diskCtx).catch(() => undefined);
+        if (receiver?.owned) {
+          const beforeLane = laneRecord(rel);
+          // Ordinary wire absence only consumes an existing authorship
+          // baseline. It must not materialize cfgShape in an otherwise empty
+          // lane merely because this receiver happens to own config.
+          if (beforeLane.cfgSynced !== undefined) {
+            const { cfgSynced: _cfgSynced, ...withoutSynced } = beforeLane;
+            replaceLane(rel, withoutSynced);
+          }
+        }
+      }
+    }
 
     // Design 116 recovery is the first per-repo operation in every arm. The
     // surrounding runRepo chain lock is already keyed by this common dir.
@@ -1604,7 +1655,8 @@ opts: {
   const indexes = new Map(keys.map((rel, i) => [rel, i]));
   let progressDone = 0;
   const runRepo = async (rel: string): Promise<void> => {
-    const remoteSec = remote.gitRepos?.[rel];
+    const wireRemoteSec = remote.gitRepos?.[rel];
+    const remoteSec = wireRemoteSec === undefined ? undefined : sanitizeGitSectionForPersistence(wireRemoteSec);
     const incomingKey = remoteSec === undefined ? undefined : gitIncomingKey(remoteSec);
     const i = indexes.get(rel)!;
     let startedAt = Date.now();

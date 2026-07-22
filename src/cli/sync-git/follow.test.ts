@@ -1254,6 +1254,16 @@ test("design 174 A: unchanged allowlisted hold skips only after the mandatory pr
   const saved = await landOutcome(state, first.outcome, 2);
   await Bun.sleep(2_100);
 
+  let exceptionHookCalled = false;
+  const exceptional = await applyIncoming(
+    saved,
+    { ...incoming, config: { "remote.origin.url": [] } },
+    matchingOracle,
+    { afterHeldSkipPrepass: () => { exceptionHookCalled = true; throw new Error("injected outer apply exception"); } },
+  );
+  expect(exceptionHookCalled).toBe(true);
+  expect(exceptional.outcome.gitPendingRemote?.repo?.config).toBeUndefined();
+
   let capabilityCalls = 0;
   let pinCalls = 0;
   const ordering: string[] = [];
@@ -2036,6 +2046,7 @@ test.skipIf(!hostReceiverEquivalence.caseAliases)("R2-9: actual case-aliasing re
 test("R2-10: NFC/NFD-twin repo keys are all deferred before either target mutates", async () => {
   await commit("base\n", "base");
   const section = await capture();
+  const wireSection = { ...section, config: { "remote.origin.url": [] } };
   const first = "repos/é";
   const second = "repos/e\u0301";
   const logs: string[] = [];
@@ -2043,7 +2054,7 @@ test("R2-10: NFC/NFD-twin repo keys are all deferred before either target mutate
     generatedAt: "",
     files: [],
     manifestSchema: 2,
-    gitRepos: { [first]: section, [second]: section },
+    gitRepos: { [first]: wireSection, [second]: wireSection },
   };
 
   const outcome = await applyGitSections(workspace, cfg, stateWith(), remote, store, buildIgnoreMatcher(workspace), (line) => logs.push(line));

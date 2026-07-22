@@ -1,11 +1,11 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { hashBytes, repoCtxFromDisk, type RepoCtx } from "../../engine/index.js";
+import { hashBytes, isSyncableRef, repoCtxFromDisk, type RepoCtx } from "../../engine/index.js";
 import { OP_STATE_DIRS, OP_STATE_FILES } from "../../engine/manifest-validate.js";
 import { MAX_GIT_CONFIG_KEYS, MAX_GIT_CONFIG_KEY_BYTES, MAX_GIT_CONFIG_SERIALIZED_BYTES, MAX_GIT_CONFIG_VALUE_BYTES } from "../../engine/git/config-sync.js";
 import { git } from "../../engine/git/shared.js";
 import { repoDirOf } from "./shared.js";
-export const GIT_FINGERPRINT_SCHEMA_VERSION = 6;
+export const GIT_FINGERPRINT_SCHEMA_VERSION = 7;
 export interface GitConfigWireBounds {
   maxKeys: number;
   maxSerializedBytes: number;
@@ -33,7 +33,6 @@ export const GIT_FINGERPRINT_VERSION = gitFingerprintVersionForBounds({
   maxKeyBytes: MAX_GIT_CONFIG_KEY_BYTES,
   maxValueBytes: MAX_GIT_CONFIG_VALUE_BYTES,
 });
-const PACKED_REFS_HASH_MAX_BYTES = 1024 * 1024;
 const LOOSE_REF_HASH_MAX_BYTES = 4096;
 // Large indexes fall back to stat+ctime under the racy-clean margin. Real index
 // rewrites change stat and content, so the bracket converges identically; hashing
@@ -61,7 +60,7 @@ type DotGitToken =
   | { exists: true; type: "symlink" | "other"; target?: string };
 type TreeToken =
   | { exists: false }
-  | { exists: true; type: "dir"; mtimeMs: number; ctimeMs: number; size: number }
+  | { exists: true; type: "dir" }
   | { exists: true; type: "file"; size: number; mtimeMs: number; ctimeMs: number; contentSha256?: string }
   | { exists: true; type: "symlink" | "other"; size: number; mtimeMs: number; ctimeMs: number; target?: string };
 type IndexToken =
@@ -176,10 +175,44 @@ async function dotGitToken(abs: string, diskCtx: RepoCtx | undefined): Promise<D
 async function treeToken(abs: string, opts: { hashFileMaxBytes?: number } = {}): Promise<TreeToken> {
   const st = await fs.lstat(abs).catch(() => undefined);
   if (!st) return { exists: false };
-  if (st.isDirectory()) return { exists: true, type: "dir", size: st.size, mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs };
+  // Directory timestamps are traversal byproducts, not Git semantic identity.
+  if (st.isDirectory()) return { exists: true, type: "dir" };
   if (st.isFile()) return { exists: true, type: "file", size: st.size, mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs, contentSha256: await fileContentSha256(abs, st.size, opts.hashFileMaxBytes) };
   if (st.isSymbolicLink()) return { exists: true, type: "symlink", size: st.size, mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs, target: await fs.readlink(abs).catch(() => "") };
   return { exists: true, type: "other", size: st.size, mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs };
+}
+
+/** Loose identity refs only: internal rbox refs and directory metadata are
+ * capture byproducts, while reflogs are deliberately not fingerprint inputs. */
+async function identityRefsToken(abs: string): Promise<Array<{ ref: string; stat: TreeToken }>> {
+  const tree = await statTree(abs, "", { hashFileMaxBytes: LOOSE_REF_HASH_MAX_BYTES });
+  return tree.flatMap(({ rel, stat }) => {
+    if (rel === "." || (stat.exists && stat.type === "dir")) return [];
+    const ref = `refs/${rel}`;
+    return isSyncableRef(ref) ? [{ ref, stat }] : [];
+  });
+}
+
+async function packedRefsIdentityToken(abs: string): Promise<unknown> {
+  const raw = await fs.readFile(abs, "utf8").catch(() => undefined);
+  if (raw === undefined) return [];
+  const kept: string[] = [];
+  let keepPeeled = false;
+  for (const line of raw.split("\n")) {
+    if (line === "" || line.startsWith("#")) {
+      keepPeeled = false;
+      continue;
+    }
+    if (line.startsWith("^")) {
+      if (keepPeeled) kept.push(line);
+      continue;
+    }
+    const separator = line.indexOf(" ");
+    const ref = separator < 0 ? "" : line.slice(separator + 1);
+    keepPeeled = isSyncableRef(ref);
+    if (keepPeeled) kept.push(line);
+  }
+  return kept;
 }
 
 async function statTree(abs: string, base = "", opts: { hashFileMaxBytes?: number } = {}): Promise<Array<{ rel: string; stat: TreeToken }>> {
@@ -230,17 +263,16 @@ async function opStateFingerprint(gitDir: string): Promise<unknown> {
 }
 
 async function commonDirFingerprint(ctx: RepoCtx): Promise<unknown> {
-  const [shallow, alternates, config, modules, worktrees, gcPid, packedRefs, packedRefsLock, refs, reflogs] = await Promise.all([
+  const [shallow, alternates, config, modules, worktrees, gcPid, packedRefs, packedRefsLock, refs] = await Promise.all([
     statToken(path.join(ctx.commonDir, "shallow")),
     statToken(path.join(ctx.commonDir, "objects", "info", "alternates")),
     statToken(path.join(ctx.commonDir, "config")),
     existenceToken(path.join(ctx.commonDir, "modules")),
     worktreesToken(path.join(ctx.commonDir, "worktrees")),
     statToken(path.join(ctx.commonDir, "gc.pid")),
-    statToken(path.join(ctx.commonDir, "packed-refs"), { hashFileMaxBytes: PACKED_REFS_HASH_MAX_BYTES }),
+    packedRefsIdentityToken(path.join(ctx.commonDir, "packed-refs")),
     statToken(path.join(ctx.commonDir, "packed-refs.lock")),
-    statTree(path.join(ctx.commonDir, "refs"), "", { hashFileMaxBytes: LOOSE_REF_HASH_MAX_BYTES }),
-    statTree(path.join(ctx.commonDir, "logs", "refs"), "", { hashFileMaxBytes: LOOSE_REF_HASH_MAX_BYTES }),
+    identityRefsToken(path.join(ctx.commonDir, "refs")),
   ]);
   return {
     shallow,
@@ -252,7 +284,6 @@ async function commonDirFingerprint(ctx: RepoCtx): Promise<unknown> {
     packedRefs,
     packedRefsLock,
     refs,
-    reflogs,
   };
 }
 

@@ -352,6 +352,11 @@ test("§11 E2E: old-writer strip and structural drop both recover through presen
     })),
   }));
   await pull(rootA, cfgA, depsA);
+  const strippedState = await state(rootA, cfgA);
+  expect(strippedState.repoRecords?.repo?.cfgSynced).toBeUndefined();
+  expect(strippedState.repoRecords?.repo?.cfgShape).toBeUndefined();
+  const presencePlan = await planGitSections(rootA, cfgA, strippedState, remote, new Set(), buildIgnoreMatcher(rootA));
+  expect(presencePlan.gitRepos?.repo?.config?.["remote.origin.url"]).toEqual(["https://example.test/present.git"]);
   await push(rootA, cfgA, depsA);
   expect((await remote.latest()).manifest.gitRepos!.repo!.config!["remote.origin.url"]).toEqual([
     "https://example.test/present.git",
@@ -365,6 +370,59 @@ test("§11 E2E: old-writer strip and structural drop both recover through presen
   await push(rootA, cfgA, depsA);
   expect((await remote.latest()).manifest.gitRepos!.repo!.config!["remote.origin.url"]).toEqual([
     "https://example.test/present.git",
+  ]);
+});
+
+test("design 178 D.2: persisted invalid incoming config does not author a corrective echo", async () => {
+  const repoA = path.join(rootA, "repo");
+  await initRepo(repoA);
+  await commitFile(repoA, "tracked.txt", "one\n", "initial");
+  await runGit(repoA, "remote", "add", "origin", "https://example.test/present.git");
+  await push(rootA, cfgA, depsA);
+
+  remote.rewriteHead((manifest) => ({
+    ...manifest,
+    gitRepos: Object.fromEntries(Object.entries(manifest.gitRepos ?? {}).map(([rel, section]) => [
+      rel,
+      { ...section, config: { "remote.origin.url": [] } },
+    ])),
+  }));
+  const invalidSequence = remote.headSeq();
+  await pull(rootA, cfgA, depsA);
+  const sanitized = await state(rootA, cfgA);
+  expect(sanitized.lastSyncedManifest.gitRepos?.repo?.config).toBeUndefined();
+  expect(sanitized.repoRecords?.repo?.cfgSynced).toBeDefined();
+
+  await push(rootA, cfgA, depsA);
+  expect(remote.headSeq()).toBe(invalidSequence);
+});
+
+test("design 178 D.2: invalid incoming preserves the baseline so a genuine A-to-B edit publishes", async () => {
+  const repoA = path.join(rootA, "repo");
+  await initRepo(repoA);
+  await commitFile(repoA, "tracked.txt", "one\n", "initial");
+  await runGit(repoA, "remote", "add", "origin", "https://example.test/a.git");
+  await push(rootA, cfgA, depsA);
+  const beforeEdit = await state(rootA, cfgA);
+  const baselineA = beforeEdit.repoRecords?.repo?.cfgSynced;
+  expect(baselineA).toBeDefined();
+
+  await runGit(repoA, "remote", "set-url", "origin", "https://example.test/b.git");
+  remote.rewriteHead((manifest) => ({
+    ...manifest,
+    gitRepos: Object.fromEntries(Object.entries(manifest.gitRepos ?? {}).map(([rel, section]) => [
+      rel,
+      { ...section, config: { "remote.origin.url": [] } },
+    ])),
+  }));
+  const invalidSequence = remote.headSeq();
+  await pull(rootA, cfgA, depsA);
+  expect((await state(rootA, cfgA)).repoRecords?.repo?.cfgSynced).toBe(baselineA);
+
+  await push(rootA, cfgA, depsA);
+  expect(remote.headSeq()).toBe(invalidSequence + 1);
+  expect((await remote.latest()).manifest.gitRepos?.repo?.config?.["remote.origin.url"]).toEqual([
+    "https://example.test/b.git",
   ]);
 });
 

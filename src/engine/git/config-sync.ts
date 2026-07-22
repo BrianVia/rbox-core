@@ -1,3 +1,5 @@
+import type { GitSection } from "../types.js";
+
 /** Pure grammar, projection, and canonical-wire helpers for design 93 git config sync.
  * Keep this module node-free: manifest validation is also bundled into the Worker. */
 
@@ -220,6 +222,21 @@ export function validateCanonicalGitConfig(input: unknown): GitConfigValidation 
     return { ok: false, reason: `config exceeds ${MAX_GIT_CONFIG_SERIALIZED_BYTES} serialized bytes` };
   }
   return { ok: true, config: config as GitConfig };
+}
+
+/**
+ * The single persistence sanitizer for Git PENDING/BASE sections. Config is an
+ * additive lane: an invalid value (or any config on a scoped section) is treated
+ * as absent without mutating the caller's wire/checkpoint object. All other
+ * section bytes remain exact.
+ */
+export function sanitizeGitSectionForPersistence(section: GitSection): GitSection {
+  if (section.config === undefined) return section;
+  const validation = validateCanonicalGitConfig(section.config);
+  if (validation.ok && section.refScope === "all") return section;
+  const sanitized = { ...section };
+  delete sanitized.config;
+  return sanitized;
 }
 
 /**

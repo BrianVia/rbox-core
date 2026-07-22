@@ -261,8 +261,15 @@ export async function captureGitState(repoDir: string, store: BlobStore, kek: Bu
     await opts.testHooks?.afterRefsRecorded?.();
 
     // 3. Make dirty+staged state + pseudo-ref commits reachable, then bundle.
-    //    `git stash create` works from a worktree context unchanged.
-    const wip = (await git(repoDir, ["stash", "create"]).catch(() => "")).trim();
+    //    Stash against the private staged index. Git may refresh index stat data
+    //    while creating the synthetic commit; the live index must remain outside
+    //    capture's write set.
+    const privateStashIndex = path.resolve(stagedIndex ?? path.join(tmpDir, "absent-index"));
+    const wip = (await git(
+      repoDir,
+      ["stash", "create"],
+      { env: { GIT_INDEX_FILE: privateStashIndex } },
+    ).catch(() => "")).trim();
     await opts.testHooks?.afterStashCreated?.();
     const pinShas = new Set(await collectPinShas(ctx, head, path.join(tmpDir, "op")));
     if (wip) pinShas.add(wip);

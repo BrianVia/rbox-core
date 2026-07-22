@@ -425,6 +425,8 @@ test("ambient status writes beside the pidfile and carries local-only currentPat
       fileCount: 0,
       totalBytes: 0,
       daemonVersion: RBOX_VERSION,
+      mode: "read-write",
+      bootId: "boot-test",
       workspaceRoot: root,
       operation: { kind: "push", phase: "encrypt", filesDone: 1, filesTotal: 3, currentPath: "src/private-file.ts" },
     });
@@ -1185,6 +1187,8 @@ test("graceful daemon stop writes paused ambient status even after stopDaemon re
       state: "paused",
       fileCount: 0,
       daemonVersion: RBOX_VERSION,
+      mode: "read-write",
+      bootId: "boot-test",
       workspaceRoot: root,
     });
   });

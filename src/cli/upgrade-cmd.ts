@@ -7,7 +7,7 @@ import { RBOX_VERSION } from "./version.js";
 import { parseSemver, semverGt } from "./semver.js";
 import { isStandaloneBinary } from "./runtime.js";
 import { currentWorkspaceId, isDaemonProcess, parseDaemonPid, startDaemon, stopDaemon } from "./daemon-control.js";
-import { readDesiredDaemonRows, type DesiredStateRow } from "./autostart-cmd.js";
+import { readDesiredDaemonRows, resumeDesiredDaemon, type DesiredStateRow } from "./autostart-cmd.js";
 import { workspaceKey } from "./rbox-paths.js";
 import { fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
 import { verifyAndParseManifest } from "./release-verify.js";
@@ -93,9 +93,13 @@ export async function restartDaemonsAfterUpgrade(deps: UpgradeDaemonDeps = {}): 
         log(`daemon ${key}: stopped (desired state is stopped)`);
         continue;
       }
-      const result = await start(root, { pullOnly: row.desired.pullOnly === true });
-      if (result === "retry-later") throw new Error("start deferred");
-      log(`daemon ${key}: restarted${row.desired.pullOnly === true ? " (pull-only)" : ""}`);
+      const resumeMode = row.desired.pendingModeIntent ?? (row.desired.pullOnly === true ? "pull-only" : "read-write");
+      const resumed = await resumeDesiredDaemon(row.desired, { startDaemon: start });
+      if (!resumed) {
+        log(`daemon ${key}: not restarted (desired state changed)`);
+        continue;
+      }
+      log(`daemon ${key}: restarted${resumeMode === "pull-only" ? " (pull-only)" : ""}`);
     } catch {
       failed = true;
       log(`daemon ${key}: restart failed; run rbox stop && rbox start in that workspace`);

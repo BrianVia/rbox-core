@@ -260,7 +260,9 @@ test("exact consulted stash reflog bytes invalidate T→U→T reflog-only mutati
   await fs.writeFile(logPath, `${tip} ${tip} Test <test@example.com> 3 +0000\tthree\n`);
   const after = await observeHeldInputs(opts);
   expect(after).toBeDefined();
-  expect(after!.localFingerprint).not.toBe(before!.localFingerprint);
+  // Generic divergence fingerprints intentionally exclude reflog side effects;
+  // held-skip still invalidates through the exact consulted reflog digest above.
+  expect(after!.localFingerprint).toBe(before!.localFingerprint);
   expect(heldAttemptMatches(attempt, after!, Date.now() + 6_000)).toBe(false);
 });
 

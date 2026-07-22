@@ -18,6 +18,7 @@ import { MAX_GIT_CONFIG_KEYS, type GitConfig } from "../../engine/git/config-syn
 import type { ConfigShapeIdentity, RepoRecord, SyncState, WorkspaceConfig } from "../config.js";
 import { composeStateSavePacket, observedRepoKeys } from "../sync-state.js";
 import { applyGitSections, gitConfigHash } from "../sync-git.js";
+import { readLocalGitConfig } from "./config-lane.js";
 
 const exec = promisify(execFile);
 const TEST_GIT_ENV = {
@@ -212,6 +213,7 @@ test("over-current-bound incoming config validates, is ignored once, and Git app
 });
 
 test("grammar-invalid incoming config is ignored while Git state applies", async () => {
+  await git(receiver, "remote", "add", "local", "git@example.com:local/repo.git");
   await commit(source, "two\n", "two");
   const incoming = { ...(await capture()), config: { "remote.origin.url": [] } };
   const wire = manifest(incoming);
@@ -228,6 +230,9 @@ test("grammar-invalid incoming config is ignored while Git state applies", async
   expect(configApplyCalls).toBe(0);
   expect(outcome.gitPendingRemote).toBeUndefined();
   expect(outcome.gitRepos?.["."]?.config).toBeUndefined();
+  const local = await readLocalGitConfig(receiver, ".");
+  expect(local.status).toBe("ok");
+  expect(outcome.configLane?.["."]?.cfgSynced).toBe(local.status === "ok" ? local.cached.hash : undefined);
   expect(await git(receiver, "rev-parse", "HEAD")).toBe(incoming.refs["refs/heads/main"]);
   expect(logs.filter((line) => line.includes("ignored invalid incoming config") && line.includes("values are empty or malformed"))).toHaveLength(1);
 });

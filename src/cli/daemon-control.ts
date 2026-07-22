@@ -6,6 +6,7 @@ import path from "node:path";
 import { isStandaloneBinary } from "./runtime.js";
 import { daemonBoundPath, daemonCrashLogPath, daemonPidPath, daemonRuntimeDir, daemonStatusPath, workspaceKey } from "./rbox-paths.js";
 import { parseDaemonDatedLogBasename } from "./daemon/logger.js";
+import { readAmbientDaemonStatusRecord, type DaemonMode } from "./daemon/ambient-status.js";
 export { daemonBoundPath, daemonCrashLogPath, daemonPidPath, daemonRuntimeDir, daemonStatusPath, workspaceKey } from "./rbox-paths.js";
 
 const RBOX_DIR = ".rbox";
@@ -297,9 +298,84 @@ export interface StopDaemonDeps {
   killTimeoutMs?: number;
 }
 
-export type StartDaemonResult = "started" | "already-running" | "retry-later";
+export type StartDaemonResult = "started" | "already-running" | "already-running-unknown-mode" | "retry-later";
+export type DaemonModeIntent = "preserve" | "explicit" | "pending";
+export interface DaemonLiveObservation {
+  pid: number;
+  bootId?: string;
+}
 export interface StartDaemonOptions {
   pullOnly?: boolean;
+  /** Whether the operator supplied --pull-only/--read-write. Unknown legacy live mode is safe only for preserve. */
+  modeIntent?: DaemonModeIntent;
+  /** Awaited after a current-workspace live daemon is confirmed, before mode admission. */
+  onLive?: (observation: DaemonLiveObservation) => void | Promise<void>;
+  /** Awaited after the fresh v2 pidfile is published, before witness polling. */
+  onSpawned?: (observation: Required<DaemonLiveObservation>) => void | Promise<void>;
+  /** Awaited only for a boot-bound witness that matches the requested mode. */
+  onModeWitness?: (witness: Extract<DaemonModeWitness, { kind: "known" }>) => void | Promise<void>;
+  /** Test seam; production waits for the newly spawned daemon's boot-bound mode witness. */
+  modeWitnessTimeoutMs?: number;
+  modeWitnessPollMs?: number;
+}
+
+export const DAEMON_MODE_WITNESS_TIMEOUT_MS = 15_000;
+
+export type DaemonModeWitness = { kind: "known"; mode: DaemonMode; bootId: string } | { kind: "unknown" };
+
+/** Read the daemon-owned mode witness only when it belongs to the same incarnation
+ * as the v2 pidfile. A missing field, legacy pidfile, corrupt status, or a status
+ * left by an earlier boot is UNKNOWN rather than an inferred mode. */
+export function readDaemonModeWitness(root: string, expectedBootId?: string): DaemonModeWitness {
+  const pidfile = readDaemonPidRecord(root);
+  if (pidfile.version !== "v2" || pidfile.bootId === undefined) return { kind: "unknown" };
+  if (expectedBootId !== undefined && pidfile.bootId !== expectedBootId) return { kind: "unknown" };
+  const record = readAmbientDaemonStatusRecord(root);
+  if (record.kind !== "ok" || record.status.bootId !== pidfile.bootId || record.status.mode === undefined) return { kind: "unknown" };
+  return { kind: "known", mode: record.status.mode, bootId: pidfile.bootId };
+}
+
+function modeFlag(mode: DaemonMode): "--pull-only" | "--read-write" {
+  return mode === "pull-only" ? "--pull-only" : "--read-write";
+}
+
+function modeRestartRequired(requested: DaemonMode, actual?: DaemonMode): Error {
+  const detail = actual === undefined ? "the live daemon's mode is unknown" : `the live daemon is ${actual}`;
+  return new Error(`${detail}; restart required: rbox stop && rbox start ${modeFlag(requested)}`);
+}
+
+export function admitLiveDaemonMode(
+  requested: DaemonMode,
+  intent: DaemonModeIntent,
+  witness: DaemonModeWitness,
+): "matched" | "preserve-unknown" | "pending-unknown" {
+  if (witness.kind === "known") {
+    if (witness.mode !== requested) throw modeRestartRequired(requested, witness.mode);
+    return "matched";
+  }
+  if (intent === "pending") return "pending-unknown";
+  if (intent === "explicit") throw modeRestartRequired(requested);
+  return "preserve-unknown";
+}
+
+export async function waitForDaemonModeWitness(
+  root: string,
+  bootId: string,
+  timeoutMs: number,
+  pollMs: number,
+  deps: { daemonOwned?: (pid: number, root: string) => boolean; sleep?: (ms: number) => Promise<void> } = {},
+): Promise<DaemonModeWitness> {
+  const deadline = Date.now() + timeoutMs;
+  const daemonOwned = deps.daemonOwned ?? isOurDaemon;
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  for (;;) {
+    const witness = readDaemonModeWitness(root, bootId);
+    if (witness.kind === "known") return witness;
+    const pidfile = readDaemonPidRecord(root);
+    if (pidfile.version !== "v2" || pidfile.bootId !== bootId || pidfile.pid === undefined || !daemonOwned(pidfile.pid, root)) return { kind: "unknown" };
+    if (Date.now() >= deadline) return { kind: "unknown" };
+    await sleep(pollMs);
+  }
 }
 
 const CRASH_LOG_MAX_BYTES = 5_000_000;
@@ -328,6 +404,7 @@ export function guardDaemonCrashLog(root: string): void {
 }
 
 export async function startDaemon(root: string, opts: StartDaemonOptions = {}): Promise<StartDaemonResult> {
+  const requestedMode: DaemonMode = opts.pullOnly === true ? "pull-only" : "read-write";
   const existing = readPid(root);
   if (existing && isOurDaemon(existing, root)) {
     // A live daemon is only "already running" if it's bound to the CURRENT workspace.
@@ -355,8 +432,17 @@ export async function startDaemon(root: string, opts: StartDaemonOptions = {}): 
       }
       await fsp.rm(pidPath(root), { force: true });
     } else {
+      const pidfile = readDaemonPidRecord(root);
+      await opts.onLive?.({ pid: existing, ...(pidfile.bootId === undefined ? {} : { bootId: pidfile.bootId }) });
+      const witness = readDaemonModeWitness(root);
+      const admission = admitLiveDaemonMode(requestedMode, opts.modeIntent ?? "preserve", witness);
+      if (admission === "pending-unknown") {
+        console.log(`background sync (process ${existing}) is running, but its mode is not witnessed yet — re-run \`rbox start\` in a moment`);
+        return "retry-later";
+      }
+      if (admission === "matched" && witness.kind === "known") await opts.onModeWitness?.(witness);
       console.log(`background sync already running (process ${existing})`);
-      return "already-running";
+      return admission === "matched" ? "already-running" : "already-running-unknown-mode";
     }
   } else if (existing) {
     // Stale pidfile (process died, or pid reused by something else) — clean it.
@@ -391,6 +477,32 @@ export async function startDaemon(root: string, opts: StartDaemonOptions = {}): 
   child.unref();
 
   if (child.pid) fs.writeFileSync(pidPath(root), `v2 ${child.pid} ${bootId}\n`);
+  if (!child.pid) {
+    console.log("background sync did not report a process id — re-run `rbox start` in a moment");
+    return "retry-later";
+  }
+  try {
+    await opts.onSpawned?.({ pid: child.pid, bootId });
+  } catch (error) {
+    try {
+      if (isOurDaemon(child.pid, root)) process.kill(child.pid, "SIGTERM");
+    } catch {
+      /* the child already exited or was stopped while desired persistence waited */
+    }
+    throw error;
+  }
+  const witness = await waitForDaemonModeWitness(
+    root,
+    bootId,
+    opts.modeWitnessTimeoutMs ?? DAEMON_MODE_WITNESS_TIMEOUT_MS,
+    opts.modeWitnessPollMs ?? 50,
+  );
+  if (witness.kind === "unknown") {
+    console.log(`background sync (process ${child.pid}) started, but its mode is not witnessed yet — re-run \`rbox start\` in a moment`);
+    return "retry-later";
+  }
+  if (witness.mode !== requestedMode) throw modeRestartRequired(requestedMode, witness.mode);
+  await opts.onModeWitness?.(witness);
   console.log(`background sync started (process ${child.pid}). view logs with: rbox logs`);
   return "started";
 }

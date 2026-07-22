@@ -27,7 +27,7 @@ export function shouldPublishGitConfig(
   local: CachedLocalCfg,
   cfgSynced: string | undefined
 ): boolean {
-  if (baseConfig === undefined) return local.nonEmpty;
+  if (baseConfig === undefined) return local.nonEmpty && local.hash !== cfgSynced;
   const baseHash = gitConfigHash(baseConfig);
   return local.hash !== baseHash && local.hash !== cfgSynced;
 }

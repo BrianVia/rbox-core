@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import {
   gitIdentity,
   gitIdentityKey,
@@ -16,12 +17,48 @@ import { getGitArtifact, git, headBranchOf, type RepoCtx } from "../../engine/gi
 import { graphEnv } from "../../engine/git/reachability.js";
 import { validateCanonicalGitConfig } from "../../engine/git/config-sync.js";
 import { gitFingerprint, gitFingerprintRun } from "./fingerprint.js";
-import { sectionOpState } from "./shared.js";
+import { gitIncomingKey, sectionOpState } from "./shared.js";
 import { indexArtifact } from "./follow.js";
 import type { FingerprintHitProbeResult } from "./divergence-cache.js";
+import { composeRepoBase, type BranchBaseOrigin } from "./base-composer.js";
 
 export const gitPendingSupersedeEnabled = (env: NodeJS.ProcessEnv = process.env): boolean =>
   env.RBOX_GIT_PENDING_SUPERSEDE !== "0";
+
+/**
+ * Dry-run the exact publisher-ACK composer used after commit admission. The
+ * source sequence is a documented sentinel: zero is valid publisher provenance
+ * and cannot affect the composed BASE bytes being compared here. Object member
+ * order is deliberately ignored by isDeepStrictEqual.
+ */
+export function pendingSupersessionAckConverges(input: {
+  previousBase?: GitSection;
+  previousOrigins?: Record<string, BranchBaseOrigin>;
+  candidate: GitSection;
+  binding: { lineageHash: string; repositoryIdentityHash: string; repoKind: "dir" | "pointer" };
+}): boolean {
+  const DRY_RUN_SOURCE_SEQ = 0;
+  const composed = composeRepoBase(
+    { base: input.previousBase, branchBaseOrigins: input.previousOrigins },
+    { base: input.candidate },
+    {
+      kind: "publisher-ack",
+      lineageHash: input.binding.lineageHash,
+      repositoryIdentityHash: input.binding.repositoryIdentityHash,
+      incomingKey: gitIncomingKey(input.candidate),
+      sourceSeq: DRY_RUN_SOURCE_SEQ,
+      advertisedRefs: input.candidate.refs,
+    },
+    {
+      repoKind: input.binding.repoKind,
+      effectiveRefScope: input.candidate.refScope,
+      checkoutComplete: true,
+      branches: {},
+      safeRefs: {},
+    },
+  );
+  return composed.disposition === "terminal" && isDeepStrictEqual(composed.base, input.candidate);
+}
 
 export function journalAllowsPendingSupersession(status: JournalRecoveryResult["status"]): boolean {
   switch (status) {

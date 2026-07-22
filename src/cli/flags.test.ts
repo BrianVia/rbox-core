@@ -33,6 +33,7 @@ test("unknown flags are rejected against command and subcommand help", () => {
   expect(unknownFlagError("start", [], { pullonly: "true" })).toContain("--pullonly");
   expect(unknownFlagError("start", [], { pullonly: "true" })).toContain("rbox start --help");
   expect(unknownFlagError("start", [], { "pull-only": "true" })).toBeUndefined();
+  expect(unknownFlagError("start", [], { "read-write": "true" })).toBeUndefined();
   expect(unknownFlagError("key", ["materialize"], { "key-file": "x" })).toBeUndefined();
   expect(unknownFlagError("git", ["deferrals"], { brief: "true" })).toBeUndefined();
   expect(unknownFlagError("git", ["deferrals"], { confirm: "x" })).toContain("--confirm");

@@ -429,6 +429,36 @@ describe("design 93 §6 transactional unit", () => {
     expect(saved.lastSyncedManifest.gitRepos?.r).toEqual(section("new"));
   });
 
+  test("state persistence sanitizes carried and composer-synthesized P/BASE without mutating inputs", async () => {
+    const invalidBase = { ...section("old"), config: { "remote.origin.url": [] } };
+    const invalidPending = { ...section("pending"), config: { "remote.origin.url": [] } };
+    const invalidCandidate = { ...section("candidate"), refs: {}, config: { "remote.origin.url": [] } };
+    const baseSnapshot = structuredClone(invalidBase);
+    const pendingSnapshot = structuredClone(invalidPending);
+    await saveStateUnsafeLegacyOrTest(root, baseState({
+      carried: { repoGen: 0, sourceSeq: 0, base: invalidBase, pending: invalidPending },
+      composed: { repoGen: 0, sourceSeq: 0, base: section("previous") },
+    }));
+
+    const result = await applyStateSavePacket(root, {
+      expectedStream: stream,
+      expectedNonce: nonce,
+      sourceGlobalSeq: 1,
+      repos: [{
+        relPath: "composed",
+        expectedRepoGen: 0,
+        newRecord: { sourceSeq: 1, base: invalidCandidate },
+      }],
+    }, { lock: lock() });
+    expect(result.status).toBe("accepted");
+    const records = repoRecordsForState(await loadState(root, stream));
+    expect(records.carried?.base?.config).toBeUndefined();
+    expect(records.carried?.pending?.config).toBeUndefined();
+    expect(records.composed?.pending?.config).toBeUndefined();
+    expect(invalidBase).toEqual(baseSnapshot);
+    expect(invalidPending).toEqual(pendingSnapshot);
+  });
+
   test("both pending-regression landing orders converge on the newer success", async () => {
     const initial = baseState({ r: { repoGen: 0, sourceSeq: 0, base: section("base") } });
     const older: StateSource = { expectedStream: stream, sourceGlobalSeq: 1, globalManifest: manifest("one"), observedRepos: ["r"], values: { bases: { r: section("base") }, pending: { r: section("pending-old") } } };

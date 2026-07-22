@@ -25,6 +25,7 @@ export { AMBIENT_STATUS_HEARTBEAT_MS, AMBIENT_STATUS_STALE_MS } from "../populat
 export type AmbientDaemonState = "synced" | "syncing" | "attention" | "paused";
 export type AmbientAttentionReason = "halt" | "out-of-storage" | "watcher-degraded" | "ownership-lost" | "unknown-error";
 export type AmbientOperationKind = "pull" | "push";
+export type DaemonMode = "pull-only" | "read-write";
 
 export interface AmbientGitDeferral {
   repo: string;
@@ -40,6 +41,10 @@ export interface AmbientGitDeferral {
 export interface AmbientDaemonStatusV1 {
   schemaVersion: 1;
   daemonVersion?: string;
+  /** Optional for compatibility with daemon.status.json records written before design 178. */
+  mode?: DaemonMode;
+  /** Mode is authoritative only when this incarnation equals the live v2 pidfile. */
+  bootId?: string;
   state: AmbientDaemonState;
   heartbeatAt: string;
   sequence: number | null;
@@ -110,6 +115,7 @@ export interface AmbientStatusProjectionInput {
 }
 
 const STATES = new Set<AmbientDaemonState>(["synced", "syncing", "attention", "paused"]);
+const MODES = new Set<DaemonMode>(["pull-only", "read-write"]);
 const REASONS = new Set<AmbientAttentionReason>(["halt", "out-of-storage", "watcher-degraded", "ownership-lost", "unknown-error"]);
 const PHASES = new Set<TransferPhase>(["scan", "gitcap", "encrypt", "upload", "download"]);
 
@@ -324,6 +330,8 @@ function parseStatus(raw: string): AmbientDaemonStatusV1 | undefined {
     if (!(j.sequence === null || uint(j.sequence))) return undefined;
     if (!(j.lastSyncedAt === null || ambientIso(j.lastSyncedAt))) return undefined;
     if (j.daemonVersion !== undefined && !validDaemonVersion(j.daemonVersion)) return undefined;
+    if (j.mode !== undefined && !MODES.has(j.mode as DaemonMode)) return undefined;
+    if (j.bootId !== undefined && (typeof j.bootId !== "string" || j.bootId.length < 1 || j.bootId.length > 128 || /[\r\n\p{Cc}]/u.test(j.bootId))) return undefined;
     if (j.attentionReason !== undefined && !REASONS.has(j.attentionReason)) return undefined;
     if (j.deferredRepos !== undefined && !uint(j.deferredRepos)) return undefined;
     if (!(j.oldestDeferralAgeSeconds === undefined || j.oldestDeferralAgeSeconds === null || uint(j.oldestDeferralAgeSeconds))) return undefined;
@@ -335,6 +343,8 @@ function parseStatus(raw: string): AmbientDaemonStatusV1 | undefined {
       lastSyncedAt: j.lastSyncedAt,
     };
     if (j.daemonVersion !== undefined) out.daemonVersion = j.daemonVersion;
+    if (j.mode !== undefined) out.mode = j.mode as DaemonMode;
+    if (j.bootId !== undefined) out.bootId = j.bootId;
     if (j.attentionReason !== undefined) out.attentionReason = j.attentionReason;
     if (j.deferredRepos !== undefined) out.deferredRepos = j.deferredRepos;
     if (j.oldestDeferralAgeSeconds !== undefined) out.oldestDeferralAgeSeconds = j.oldestDeferralAgeSeconds;
