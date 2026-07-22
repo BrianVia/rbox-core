@@ -447,7 +447,7 @@ test("key status --json emits enrollment and recovery-kit state", async () => {
   });
 });
 
-test("key status --json marks a cross-account plaintext artifact unavailable", async () => {
+test("key status --json marks a cross-account plaintext artifact unrecognized", async () => {
   const accountId = "acct_aaaaaaaaaaaaaaaa";
   const otherAccount = "acct_bbbbbbbbbbbbbbbb";
   const phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
@@ -462,7 +462,7 @@ test("key status --json marks a cross-account plaintext artifact unavailable", a
   await fs.writeFile(file, renderKit({ accountId: otherAccount, phrase, hostname: "other", generatedAt: now }), { mode: 0o600 });
 
   const dto = JSON.parse(await captureStdout(() => keyStatus({ json: true })));
-  expect(dto.recoveryKit.plaintextArtifacts[0].state).toBe("unavailable");
+  expect(dto.recoveryKit.plaintextArtifacts[0].state).toBe("unrecognized");
 });
 
 test("key status --json projects an unreleased genesis hold without mutating an offer", async () => {
