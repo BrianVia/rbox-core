@@ -2,7 +2,7 @@ import type { Env } from "./env.js";
 import { ctEqual, json } from "./util.js";
 import { dbFor } from "./db.js";
 import { batchedInLookup } from "./d1-batch.js";
-import { fairUseQueueStatement } from "./fairuse.js";
+import { GENESIS_TOMBSTONE_SENTINEL, tombstoneFenceResponse } from "./genesis-repair.js";
 
 /** The authenticated caller: a device, its account, user, and role. */
 export interface Principal {
@@ -91,17 +91,29 @@ export function sanitizeWorkspaceName(raw: string | null | undefined, max = MAX_
  *  `name` is the OPT-IN, server-visible dashboard label (default-off): set once here on
  *  the single INSERT (first-writer-wins); absent → NULL (zero-knowledge default). */
 export async function createWorkspace(env: Env, p: Principal, projectId: string, name?: string | null): Promise<Response> {
+  const fence = await tombstoneFenceResponse(env, p.accountId);
+  if (fence) return fence;
   if (p.role === "viewer") return json({ error: "forbidden" }, 403);
   const ws = `ws_${crypto.randomUUID().replace(/-/g, "")}`; // high-entropy, unguessable
   const cleanName = sanitizeWorkspaceName(name);
   const now = Date.now();
   const db = dbFor(env, p.accountId);
-  await db.batch([
-    db.prepare("INSERT INTO workspaces (workspace_id, project_id, account_id, created_at, name) VALUES (?, ?, ?, ?, ?)")
-      .bind(ws, projectId, p.accountId, now, cleanName),
-    fairUseQueueStatement(db, p.accountId, now, "workspace_created"),
+  const guard = `NOT EXISTS (SELECT 1 FROM account_keys WHERE account_id=?1 AND
+    (recovery_wrap=?2 OR recovery_wrap_id=?2 OR repair_id IS NOT NULL OR repaired_at IS NOT NULL))
+    AND NOT EXISTS (SELECT 1 FROM account_deletions WHERE account_id=?1 AND status IN ('purging','done'))`;
+  const results = await db.batch([
+    db.prepare(`INSERT INTO workspaces (workspace_id,project_id,account_id,created_at,name) SELECT ?3,?4,?1,?5,?6 WHERE ${guard}`)
+      .bind(p.accountId,GENESIS_TOMBSTONE_SENTINEL,ws,projectId,now,cleanName),
+    db.prepare(`INSERT INTO fairuse_account_queue(account_id,next_run_at,reason,updated_at)
+      SELECT ?1,?5,'workspace_created',?5 WHERE ${guard}
+      ON CONFLICT(account_id) DO UPDATE SET next_run_at=MIN(fairuse_account_queue.next_run_at,excluded.next_run_at),reason=excluded.reason,updated_at=excluded.updated_at`)
+      .bind(p.accountId,GENESIS_TOMBSTONE_SENTINEL,ws,projectId,now),
+    db.prepare(`INSERT INTO audit_log(account_id,actor_device,actor_user,action,target,at)
+      SELECT ?1,?7,?8,'workspace.create',?3,?5 WHERE ${guard}`)
+      .bind(p.accountId,GENESIS_TOMBSTONE_SENTINEL,ws,projectId,now,cleanName,p.deviceId,p.userId),
   ]);
-  await audit(env, p, "workspace.create", ws);
+  const vector = results.map((r) => r.meta.changes ?? 0).join("/");
+  if (vector !== "1/1/1") return (await tombstoneFenceResponse(env,p.accountId)) ?? json({ error: "workspace_create_conflict" }, 409);
   return json({ workspaceId: ws, projectId, name: cleanName });
 }
 

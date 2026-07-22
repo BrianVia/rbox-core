@@ -1,5 +1,6 @@
 import type { Env } from "./env.js";
 import { audit, type Principal } from "./authz.js";
+import { reconcileGenesisRepairAudits } from "./genesis-repair.js";
 import { ctEqual, json, logErr, chunked } from "./util.js";
 import { dbFor, dirDb } from "./db.js";
 import { purgeStripeForAccount } from "./stripe.js";
@@ -340,16 +341,24 @@ async function releaseAndProgress(env: Env, accountId: string, leaseToken: strin
  *  account-data binding (the data erasure is the headline). One atomic write at N=1; under real
  *  sharding §6a splits it into a dirDb directory-purge + a dbFor(shard) data-purge. */
 async function finishD1(env: Env, accountId: string, clerkIds: string[], deviceIds: string[], nowMs: number): Promise<void> {
+  await reconcileGenesisRepairAudits(env, accountId);
   const a = accountId;
   const data = dbFor(env, a); // account-data plane
   const dir = dirDb(env); // directory plane
   const stmts: D1PreparedStatement[] = [
+    data.prepare(`UPDATE genesis_repair_audit SET
+      account_id=NULL,operator=NULL,reason=NULL,observed_classification=NULL,proof_json=NULL,
+      original_claim_present=NULL,original_claim_snapshot=NULL,original_recovery_wrap=NULL,original_recovery_wrap_id=NULL,
+      original_created_at=NULL,original_genesis_device_id=NULL,original_repair_id=NULL,original_repaired_at=NULL,
+      completion_observation_json=NULL,scrubbed_at=?
+      WHERE account_id=? AND outcome<>'attempted' AND completed_at IS NOT NULL AND scrubbed_evidence_sha256 IS NOT NULL`)
+      .bind(nowMs,a),
     // notification_deliveries BEFORE its device_notifications parent (subquery needs it). (data)
     data.prepare("DELETE FROM notification_deliveries WHERE token_hash IN (SELECT token_hash FROM device_notifications WHERE account_id = ?)").bind(a),
     data.prepare("DELETE FROM device_notifications WHERE account_id = ?").bind(a),
     data.prepare("DELETE FROM account_notify_prefs WHERE account_id = ?").bind(a),
     data.prepare("DELETE FROM device_keys WHERE account_id = ?").bind(a),
-    data.prepare("DELETE FROM account_keys WHERE account_id = ?").bind(a),
+    data.prepare("DELETE FROM account_keys WHERE account_id = ? AND NOT EXISTS (SELECT 1 FROM genesis_repair_audit WHERE account_id = ? AND outcome = 'attempted')").bind(a,a),
     data.prepare("DELETE FROM workspace_keys WHERE account_id = ?").bind(a),
     data.prepare("DELETE FROM rosters WHERE account_id = ?").bind(a),
     data.prepare("DELETE FROM account_key_states WHERE account_id = ?").bind(a),
@@ -402,9 +411,15 @@ async function finishD1(env: Env, accountId: string, clerkIds: string[], deviceI
     data.prepare("DELETE FROM diagnostics_reports WHERE account_id = ?").bind(a),
     // The account row LAST, then close the ledger. (data)
     data.prepare("DELETE FROM accounts WHERE id = ?").bind(a),
-    data.prepare("UPDATE account_deletions SET status = 'done', last_attempt_at = ? WHERE account_id = ?").bind(nowMs, a),
+    data.prepare(`UPDATE account_deletions SET status='done',last_attempt_at=? WHERE account_id=?
+      AND NOT EXISTS (SELECT 1 FROM genesis_repair_audit WHERE account_id=?)`).bind(nowMs,a,a),
   ];
-  await data.batch(stmts);
+  const results = await data.batch(stmts);
+  if ((results.at(-1)?.meta.changes ?? 0) === 0) {
+    await reconcileGenesisRepairAudits(env, accountId);
+    const blocked = await data.prepare("SELECT 1 FROM genesis_repair_audit WHERE account_id=?").bind(accountId).first();
+    if (blocked) throw new Error("genesis repair audit reconciliation blocked account purge completion");
+  }
 }
 
 // ── cron backstop (worker.ts scheduled) + queue consumer ─────────────────────

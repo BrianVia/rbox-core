@@ -6,6 +6,7 @@ import { dbFor, dirDb } from "../db.js";
 import { randomHex, TOKEN_BYTES } from "./shared.js";
 import { AccountGoneError, checkDeviceCap, DeviceLimitError, mintDeviceWithNotification } from "./mint.js";
 import { ipKey, rateLimited } from "../ratelimit.js";
+import { GENESIS_TOMBSTONE_SENTINEL, assertGenesisSingleDatabase, tombstoneFenceResponse } from "../genesis-repair.js";
 
 // A client-supplied opaque pairing tokenId (design 12, C6): url-safe, 16–64 chars.
 // A legacy server-generated 64-hex token also matches, so redeem accepts both.
@@ -85,15 +86,24 @@ export async function createPairToken(req: Request, env: Env, p: Principal): Pro
   // Atomic active-token cap: insert ONLY while the account is under the cap, in a
   // single INSERT…SELECT…WHERE. D1 serializes writes, so concurrent creates can't
   // both pass a stale count (closes the check-then-insert race). changes===0 → over cap.
-  const res = await dirDb(env)
-    .prepare(
-      `INSERT INTO pairing_tokens (token_hash, account_id, user_id, created_by, label, created_at, expires_at, mk_wrap, admission_grant)
-       SELECT ?, ?, ?, ?, 'pair', ?, ?, ?, ?
-       WHERE (SELECT COUNT(*) FROM pairing_tokens WHERE account_id = ? AND consumed_at IS NULL AND expires_at > ?) < ?`
-    )
-    .bind(hash, p.accountId, p.userId, p.deviceId, now, expiresAt, mkWrap, admissionGrant, p.accountId, now, PAIR_ACTIVE_CAP)
-    .run();
-  if ((res.meta.changes ?? 0) === 0) return json({ error: "too_many_pairing_tokens", cap: PAIR_ACTIVE_CAP }, 429);
+  const e2eeBearing = mkWrap !== null || admissionGrant !== null;
+  if (e2eeBearing) assertGenesisSingleDatabase(env, p.accountId);
+  const res = await dirDb(env).prepare(
+    `INSERT INTO pairing_tokens (token_hash,account_id,user_id,created_by,label,created_at,expires_at,mk_wrap,admission_grant)
+     SELECT ?,?,?,?,'pair',?,?,?,? WHERE
+       (SELECT COUNT(*) FROM pairing_tokens WHERE account_id=? AND consumed_at IS NULL AND expires_at>?)<?
+       AND (?=0 OR (EXISTS (SELECT 1 FROM account_keys WHERE account_id=? AND recovery_wrap<>? AND recovery_wrap_id<>? AND repair_id IS NULL AND repaired_at IS NULL)
+         AND NOT EXISTS (SELECT 1 FROM account_deletions WHERE account_id=? AND status IN ('purging','done'))))`
+  ).bind(hash,p.accountId,p.userId,p.deviceId,now,expiresAt,mkWrap,admissionGrant,p.accountId,now,PAIR_ACTIVE_CAP,e2eeBearing?1:0,p.accountId,GENESIS_TOMBSTONE_SENTINEL,GENESIS_TOMBSTONE_SENTINEL,p.accountId).run();
+  if ((res.meta.changes ?? 0) === 0) {
+    if (e2eeBearing) {
+      const fence = await tombstoneFenceResponse(env,p.accountId);
+      if (fence) return fence;
+      const real=await dbFor(env,p.accountId).prepare(`SELECT 1 FROM account_keys WHERE account_id=? AND recovery_wrap<>? AND recovery_wrap_id<>? AND repair_id IS NULL AND repaired_at IS NULL`).bind(p.accountId,GENESIS_TOMBSTONE_SENTINEL,GENESIS_TOMBSTONE_SENTINEL).first();
+      if(!real)return json({error:"account_keys_missing"},409);
+    }
+    return json({ error: "too_many_pairing_tokens", cap: PAIR_ACTIVE_CAP }, 429);
+  }
   return json({ token: `${PAIR_PREFIX}${tokenId}`, expiresAt });
 }
 

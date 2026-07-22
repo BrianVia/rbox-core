@@ -5,6 +5,7 @@ import { dbFor } from "../db.js";
 import { authorizeWorkspace, type Principal } from "../authz.js";
 import { versionsList } from "../versions.js";
 import { mintGrant } from "../grants.js";
+import { tombstoneFenceResponse } from "../genesis-repair.js";
 
 /**
  * /v1/ws/:ws/proj/:proj/... — the workspace-sync surface. authorize (cross-account
@@ -28,6 +29,8 @@ export async function syncRoutes({ req, env, url, seg }: RouteCtx, p: Principal)
     if (action === "manifests" || action === "latest" || action === "connect" || action === "commits" || action === "receipts") {
       const stub = env.WORKSPACE_SYNC.get(env.WORKSPACE_SYNC.idFromName(`${ws}/${proj}`));
       if (write) {
+        const fence = await tombstoneFenceResponse(env, p.accountId);
+        if (fence) return fence;
         // Commit: forward with the authenticated account (DO does account-scoped
         // blob-existence). Clean header set by the Worker (overrides any client value).
         const headers = new Headers(req.headers);

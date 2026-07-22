@@ -1,5 +1,5 @@
 import { eq, type RouteCtx } from "./shared.js";
-import { json, logErr } from "../util.js";
+import { cappedJson, json, logErr } from "../util.js";
 import { isPlatform } from "../authz.js";
 import { retentionPrune } from "../retention.js";
 import { phase1Audit, runPhase1 } from "../gc-phase1.js";
@@ -12,6 +12,7 @@ import { packGcMode, packTombstones, resweepPackTombstones } from "../blob-pack.
 import { runPackGc } from "../pack-gc.js";
 import { dbFor } from "../db.js";
 import type { Env } from "../env.js";
+import { genesisRepair, GENESIS_REPAIR_MAX_BYTES, validateGenesisRepairRequest } from "../genesis-repair.js";
 
 interface InspectDroppedRow { sha: string; lastSeq: number }
 interface InspectSeqRootRow { seq: number; manifestSha: string; carrierSha?: string }
@@ -128,6 +129,12 @@ export async function adminRootsInspect(env: Env, url: URL): Promise<Response> {
  * (defense in depth; NOT the rbox bearer) — so these routes sit BEFORE authenticate().
  */
 export async function adminRoutes({ req, env, url, seg }: RouteCtx): Promise<Response | null> {
+  if (req.method === "POST" && seg.length === 5 && seg[0] === "v1" && seg[1] === "admin" && seg[2] === "account" && seg[4] === "genesis-repair") {
+    if (!isPlatform(req, env)) return json({ error: "not_found" }, 404);
+    const parsed = await cappedJson(req, { maxBytes: GENESIS_REPAIR_MAX_BYTES }, validateGenesisRepairRequest);
+    if (!parsed.ok) return parsed.response;
+    return genesisRepair(env, seg[3]!, parsed.value);
+  }
   if (req.method === "GET" && eq(seg, ["v1", "admin", "gc"]) && url.searchParams.get("phase") === "health") {
     if (!isPlatform(req, env)) return json({ error: "not_found" }, 404);
     return gcHealth(env);
