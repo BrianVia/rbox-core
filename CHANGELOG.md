@@ -6,6 +6,8 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.7.21] — 2026-07-22 — "transient hiccups heal themselves"
+
 ### Changed
 - Stale "git busy" warnings clean themselves up: rbox now re-checks every
   recorded git-lock deferral before showing status and on a daemon cadence
