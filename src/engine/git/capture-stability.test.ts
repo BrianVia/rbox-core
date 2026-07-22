@@ -66,34 +66,42 @@ test("design 177 ambient index churn can only refuse at the endpoint and a bound
   let churn: Promise<void> | undefined;
   let announceChurn!: () => void;
   const churnedOnce = new Promise<void>((resolve) => { announceChurn = resolve; });
-  await expect(captureGitState(repo, store, KEK, {
-    workspaceRoot: root,
-    resolution: true,
-    testHooks: {
-      afterRefsRecorded: async () => {
-        await fs.writeFile(path.join(repo, "tracked"), "churn-0\n");
-        await git(repo, ["add", "tracked"]);
-        running = true;
-        churn = (async () => {
-          let n = 1;
-          while (running) {
-            await fs.writeFile(path.join(repo, "tracked"), `churn-${n++}\n`);
-            try {
-              await git(repo, ["add", "tracked"]);
-              announceChurn();
-            } catch (error) {
-              if (!String(error).includes("index.lock")) throw error;
+  try {
+    await expect(captureGitState(repo, store, KEK, {
+      workspaceRoot: root,
+      resolution: true,
+      testHooks: {
+        afterRefsRecorded: async () => {
+          await fs.writeFile(path.join(repo, "tracked"), "churn-0\n");
+          await git(repo, ["add", "tracked"]);
+          running = true;
+          churn = (async () => {
+            let n = 1;
+            while (running) {
+              await fs.writeFile(path.join(repo, "tracked"), `churn-${n++}\n`);
+              try {
+                await git(repo, ["add", "tracked"]);
+                announceChurn();
+              } catch (error) {
+                if (!String(error).includes("index.lock")) throw error;
+              }
             }
-          }
-        })();
+          })();
+        },
+        beforeStabilityCheck: async () => {
+          await Promise.race([
+            churnedOnce,
+            churn!.then(() => { throw new Error("index churn stopped before its first successful update"); }),
+          ]);
+          running = false;
+          await churn;
+        },
       },
-      beforeStabilityCheck: async () => {
-        await churnedOnce;
-        running = false;
-        await churn;
-      },
-    },
-  })).rejects.toThrow("your repository changed while publishing — run the command again");
+    })).rejects.toThrow("your repository changed while publishing — run the command again");
+  } finally {
+    running = false;
+    await churn?.catch(() => {});
+  }
   const retry = await captureGitState(repo, store, KEK, { workspaceRoot: root, resolution: true });
   expect(retry).toBeDefined();
   expect(await scratchRefs()).toEqual([]);

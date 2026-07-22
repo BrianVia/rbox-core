@@ -1764,16 +1764,20 @@ test("graceful stop writes paused ambient status before a slow pump drains", asy
     const pump = daemon.pump();
     await remote.commitEntered.promise;
 
-    const stop = daemon.stop();
-    const early = await Promise.race([
-      waitForAmbientState("paused", 1000),
-      stop.then(() => { throw new Error("daemon stop settled while the pump was still blocked"); }),
-    ]);
-    expect(early).toMatchObject({ schemaVersion: 1, state: "paused" });
-
-    remote.releaseCommit.resolve();
+    let stop: Promise<void> | undefined;
+    try {
+      stop = daemon.stop();
+      const early = await Promise.race([
+        waitForAmbientState("paused", 1000),
+        stop.then(() => { throw new Error("daemon stop settled while the pump was still blocked"); }),
+      ]);
+      expect(early).toMatchObject({ schemaVersion: 1, state: "paused" });
+    } finally {
+      remote.releaseCommit.resolve();
+      await Promise.allSettled([pump, ...(stop ? [stop] : [])]);
+    }
     await pump;
-    await stop;
+    await stop!;
     expect(await readAmbientStatus()).toMatchObject({ schemaVersion: 1, state: "paused" });
   });
 });

@@ -765,23 +765,24 @@ test("logout waits for a normal in-flight credential writer and clears definitiv
   };
   const childStdout = new Response(child.stdout).text();
   const childStderr = new Response(child.stderr).text();
-  await Promise.race([
-    waitUntil(() => fs.lstat(writerOwnedPath).then(() => true, () => false), "child-owned credential lock"),
-    child.exited.then(async (code) => {
-      throw new Error(`credential writer exited before owning the lock (${code}): ${await childStderr}`);
-    }),
-  ]);
-
-  let contentionObserved!: () => void;
-  const contended = new Promise<void>((resolve) => { contentionObserved = resolve; });
-  restoreHook = installCredentialTestHook((seam) => {
-    if (seam === "lock-contended") contentionObserved();
-  });
   const warnings: string[] = [];
   const oldWarn = console.warn;
-  console.warn = (value?: unknown) => void warnings.push(String(value));
   let clearing: Promise<void> | undefined;
+  let childResult: { childExit: number; stdout: string; stderr: string } | undefined;
   try {
+    await Promise.race([
+      waitUntil(() => fs.lstat(writerOwnedPath).then(() => true, () => false), "child-owned credential lock"),
+      child.exited.then(async (code) => {
+        throw new Error(`credential writer exited before owning the lock (${code}): ${await childStderr}`);
+      }),
+    ]);
+
+    let contentionObserved!: () => void;
+    const contended = new Promise<void>((resolve) => { contentionObserved = resolve; });
+    restoreHook = installCredentialTestHook((seam) => {
+      if (seam === "lock-contended") contentionObserved();
+    });
+    console.warn = (value?: unknown) => void warnings.push(String(value));
     clearing = clearCredentials();
     await beforeDeadline(Promise.race([
       contended,
@@ -791,11 +792,17 @@ test("logout waits for a normal in-flight credential writer and clears definitiv
     await clearing;
   } finally {
     releaseChild();
+    try {
+      await beforeDeadline(child.exited, "credential writer exit", 2_000);
+    } catch {
+      if (child.exitCode === null) child.kill();
+    }
+    const [childExit, stdout, stderr] = await Promise.all([child.exited, childStdout, childStderr]);
+    childResult = { childExit, stdout, stderr };
     await clearing?.catch(() => {});
     console.warn = oldWarn;
   }
-  const [childExit, stdout, stderr] = await Promise.all([child.exited, childStdout, childStderr]);
-  expect({ childExit, stdout, stderr }).toEqual({ childExit: 0, stdout: "", stderr: "" });
+  expect(childResult).toEqual({ childExit: 0, stdout: "", stderr: "" });
   expect(warnings.join("\n")).not.toContain("destructive-recovery override");
   await expect(fs.lstat(credentialPath())).rejects.toThrow();
   await expect(fs.lstat(lockPath())).rejects.toThrow();

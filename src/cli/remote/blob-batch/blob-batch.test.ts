@@ -47,6 +47,20 @@ const shaBytes = (bytes: Uint8Array | string) => createHash("sha256").update(byt
 const bytes = (s: string) => new TextEncoder().encode(s);
 const api = () => new RboxApi("https://api.test", "durable-token", "ws_1", "proj_1");
 
+async function beforeDeadline<T>(promise: Promise<T>, label: string, timeoutMs = 5_000): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`timed out waiting for ${label}`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 let tmpDir = "";
 let calls: Array<{ url: string; method: string; headers: Record<string, string>; body?: unknown }> = [];
 let singles = new Map<string, Uint8Array>();
@@ -500,13 +514,19 @@ describe("BlobBatchUploader queueing", () => {
       }) });
     };
     const pending = Promise.all(files.map((f) => a.putBlobFile(f.sha, f.file, f.size)));
-    await firstDispatched;
-    expect(batchPutCalls()).toHaveLength(1);
-    expect(decodeBatchPutFrames(batchPutCalls()[0]!.body as Uint8Array)).toHaveLength(2);
-    releaseFirst();
-    await pending;
-    expect(batchPutCalls()).toHaveLength(2);
-    expect(decodeBatchPutFrames(batchPutCalls()[1]!.body as Uint8Array)).toHaveLength(1);
+    try {
+      await beforeDeadline(firstDispatched, "first blob-batch dispatch entry");
+      expect(batchPutCalls()).toHaveLength(1);
+      expect(decodeBatchPutFrames(batchPutCalls()[0]!.body as Uint8Array)).toHaveLength(2);
+      releaseFirst();
+      await pending;
+      expect(batchPutCalls()).toHaveLength(2);
+      expect(decodeBatchPutFrames(batchPutCalls()[1]!.body as Uint8Array)).toHaveLength(1);
+    } finally {
+      releaseFirst?.();
+      await a.closeUploader(new Error("test cleanup")).catch(() => {});
+      await Promise.allSettled([pending]);
+    }
   });
 
   test("RBOX_BATCH_BLOBS=0 bypasses batch PUT", async () => {

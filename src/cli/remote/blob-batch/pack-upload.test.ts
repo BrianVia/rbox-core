@@ -42,6 +42,20 @@ interface CapturedCall {
   parsed: Extract<ReturnType<typeof parsePack>, { ok: true }>;
 }
 
+async function beforeDeadline<T>(promise: Promise<T>, label: string, timeoutMs = 5_000): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`timed out waiting for ${label}`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 beforeEach(async () => {
   for (const key of ENV_KEYS) {
     if (!savedEnv.has(key)) savedEnv.set(key, process.env[key]);
@@ -264,19 +278,26 @@ describe("client pack writer", () => {
     const packed = await makeFile("wake-pack", 64 * 1024);
     const batched = await makeFile("wake-batch", 64 * 1024 + 1);
     const packPromise = uploader.putFile(packed.sha, packed.path, packed.size, tmpDir);
-    await packStarted;
-    const batchPromise = uploader.putFile(batched.sha, batched.path, batched.size, tmpDir);
-    expect(arbiter.inFlight).toBe(1);
-    expect(batchTimer).toBeDefined();
-    const fireBatchTimer = batchTimer!;
-    batchTimer = undefined;
-    fireBatchTimer();
-    expect(batchCalls).toBe(0);
-    releasePack();
-    await batchStarted;
-    await Promise.all([packPromise, batchPromise]);
-    expect(batchCalls).toBe(1);
-    await waitFor(() => arbiter.inFlight === 0);
+    let batchPromise: Promise<void> | undefined;
+    try {
+      await beforeDeadline(packStarted, "pack upload dispatch entry");
+      batchPromise = uploader.putFile(batched.sha, batched.path, batched.size, tmpDir);
+      expect(arbiter.inFlight).toBe(1);
+      expect(batchTimer).toBeDefined();
+      const fireBatchTimer = batchTimer!;
+      batchTimer = undefined;
+      fireBatchTimer();
+      expect(batchCalls).toBe(0);
+      releasePack();
+      await beforeDeadline(batchStarted, "batch upload dispatch after pack release");
+      await Promise.all([packPromise, batchPromise]);
+      expect(batchCalls).toBe(1);
+      await waitFor(() => arbiter.inFlight === 0);
+    } finally {
+      releasePack();
+      await uploader.close(new Error("test cleanup")).catch(() => {});
+      await Promise.allSettled([packPromise, ...(batchPromise ? [batchPromise] : [])]);
+    }
   });
 
   test.each(["batch", "pack"] as const)("limit-1 arbiter interleaves dual backlogs from a %s-first owner", async (initialLane) => {

@@ -178,15 +178,21 @@ function deps(lines: string[], extra: Parameters<typeof gitResolveCmd>[4] = {}) 
 
 class ManualProgressScheduler {
   private nextId = 0;
+  private announceScheduled!: () => void;
   readonly active = new Map<number, () => void>();
   readonly delays: number[] = [];
+  readonly scheduled: Promise<void>;
   cleared = 0;
+
+  constructor() {
+    this.scheduled = new Promise<void>((resolve) => { this.announceScheduled = resolve; });
+  }
 
   readonly setInterval = (fn: () => void, ms: number): number => {
     const id = ++this.nextId;
     this.active.set(id, fn);
     this.delays.push(ms);
-    fn();
+    this.announceScheduled();
     return id;
   };
 
@@ -350,9 +356,12 @@ test("show-me heartbeat timers are cleared in finally", async () => {
   await fixture();
   const stderr: string[] = [];
   const scheduler = new ManualProgressScheduler();
-  expect(await gitResolveCmd(root, receiver, "show-me", { json: true }, deps([], {
+  const resolving = gitResolveCmd(root, receiver, "show-me", { json: true }, deps([], {
     stderr: (line) => stderr.push(line), progressScheduler: scheduler,
-  }))).toBe(0);
+  }));
+  await scheduler.scheduled;
+  scheduler.fireActive();
+  expect(await resolving).toBe(0);
   expect(stderr.some((line) => /^show-me: still working \(\d+s\)$/.test(line))).toBe(true);
   expect(scheduler.delays.every((ms) => ms === 10_000)).toBe(true);
   expect(scheduler.cleared).toBe(scheduler.delays.length);
@@ -366,13 +375,16 @@ test("show-me heartbeat timers are cleared when a phase transition throws", asyn
   await fixture();
   const stderr: string[] = [];
   const scheduler = new ManualProgressScheduler();
-  expect(await gitResolveCmd(root, receiver, "show-me", { json: true }, deps([], {
+  const resolving = gitResolveCmd(root, receiver, "show-me", { json: true }, deps([], {
     progressScheduler: scheduler,
     stderr: (line) => {
       if (line.startsWith("show-me: proving")) throw new Error("progress sink failed");
       stderr.push(line);
     },
-  }))).toBe(1);
+  }));
+  await scheduler.scheduled;
+  scheduler.fireActive();
+  expect(await resolving).toBe(1);
   expect(scheduler.delays.length).toBeGreaterThan(0);
   expect(scheduler.cleared).toBe(scheduler.delays.length);
   expect(scheduler.active.size).toBe(0);

@@ -452,6 +452,8 @@ test("a blackholed cursor is bounded, single-flight, does not cycle the socket, 
   const ws = fakeWs(() => closes++, (message) => { if (message === "cursor") cursorSends++; });
   daemon.ws = ws;
   daemon.markWsOpen(ws);
+  daemon.scheduleNextBackstop();
+  const scheduledBackstop = daemon.backstopTimer;
 
   cursorClock.advance(23);
   expect(cursorSends).toBe(1);
@@ -461,15 +463,14 @@ test("a blackholed cursor is bounded, single-flight, does not cycle the socket, 
   await waitUntil(() => daemon.cursorTimer !== undefined); // timeout completion re-arms
   expect(cursorSends).toBe(1);
 
-  daemon.onBackstopTick();
-  await daemon.pumpRun;
   cursorClock.advance(22);
   expect(cursorSends).toBe(1);
   cursorClock.advance(1);
   expect(cursorSends).toBe(2); // next send occurs only after timeout + fresh cadence
   expect(closes).toBe(0);
   expect(daemon.ws).toBe(ws);
-  expect(daemon.wsBackstopPulls).toBe(1);
+  expect(daemon.backstopTimer).toBe(scheduledBackstop);
+  expect(daemon.wsBackstopPulls).toBe(0);
   expect(daemon.cursorAppliedPulls).toBe(0);
 });
 

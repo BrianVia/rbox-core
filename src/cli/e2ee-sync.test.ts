@@ -39,6 +39,21 @@ const remoteFor = (server: FakeServer, secrets: DeviceSecrets): E2eeRemote => ha
 const cfgFor = (root: string, secrets: DeviceSecrets, remote: E2eeRemote): Promise<WorkspaceConfig> => harnessCfg(root, secrets, remote, WS);
 const hex = (n: number) => n.toString(16).padStart(64, "0");
 const shaBytes = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
+
+async function beforeDeadline<T>(promise: Promise<T>, label: string, timeoutMs = 2_000): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`timed out waiting for ${label}`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 const largeManifest = (): Manifest => ({
   generatedAt: "",
   files: Array.from({ length: SIDECAR_THRESHOLD }, (_, i) => ({
@@ -824,12 +839,20 @@ test("D fast pull evidence mismatches fall back to the exact cold chain walk", a
       let fold: string | undefined;
       resetChainGate();
       const latest = peer.latest({ fastFoldBase: { manifest: middle, meta }, onLatestTimings: (timings) => { fold = timings.fold; } });
-      await chainStarted;
-      releaseChain();
-      await expect(latest).resolves.toMatchObject({ manifest: target });
-      expect(fold).toBe("coldwalk");
-      expect(server.store.getCalls).toEqual([third.manifestMeta!.encManifestSha, ...third.manifestMeta!.chain]);
-      expect(peakInFlightGets).toBe(third.manifestMeta!.chain.length);
+      try {
+        await beforeDeadline(Promise.race([
+          chainStarted,
+          latest.then(() => { throw new Error("latest settled before all parallel chain reads started"); }),
+        ]), "parallel chain reads");
+        releaseChain();
+        await expect(latest).resolves.toMatchObject({ manifest: target });
+        expect(fold).toBe("coldwalk");
+        expect(server.store.getCalls).toEqual([third.manifestMeta!.encManifestSha, ...third.manifestMeta!.chain]);
+        expect(peakInFlightGets).toBe(third.manifestMeta!.chain.length);
+      } finally {
+        releaseChain();
+        await latest.catch(() => {});
+      }
     }
   });
 });

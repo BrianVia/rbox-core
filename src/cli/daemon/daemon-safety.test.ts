@@ -13,6 +13,20 @@ const FLOOR = 60_000;
 const CAP = 5 * 60_000;
 const quiet = { watcherLive: true, churned: false };
 
+async function beforeDeadline<T>(promise: Promise<T>, label: string, timeoutMs = 2_000): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`timed out waiting for ${label}`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 test("nextSafetyDelay doubles quiet intervals and caps at 5m", () => {
   expect(nextSafetyDelay(FLOOR, quiet)).toBe(120_000);
   expect(nextSafetyDelay(120_000, quiet)).toBe(240_000);
@@ -83,14 +97,21 @@ test("design 175: ref signal requests push without pending/file-settle state", a
   const daemon = makeDaemon(root);
   let signal: (() => void) | undefined;
   let signalHandled!: () => void;
-  const handled = new Promise<void>((resolve) => { signalHandled = resolve; });
+  let signalFailed!: (error: unknown) => void;
+  const handled = new Promise<void>((resolve, reject) => {
+    signalHandled = resolve;
+    signalFailed = reject;
+  });
   const handleGitSignalBatch = daemon.handleGitSignalBatch.bind(daemon);
   daemon.handleGitSignalBatch = async (batch) => {
     try {
       await handleGitSignalBatch(batch);
-    } finally {
-      signalHandled();
+    } catch (error) {
+      if (!batch.reasons.signal) throw error;
+      signalFailed(error);
+      return;
     }
+    if (batch.reasons.signal) signalHandled();
   };
   daemon.startWatcherFn = (_root, _matcher, _cb, opts) => {
     signal = () => opts?.signalDebouncer?.push("signal");
@@ -108,7 +129,7 @@ test("design 175: ref signal requests push without pending/file-settle state", a
       signal!();
       Date.now = () => signalAt + 3_000;
       signal!();
-      await handled;
+      await beforeDeadline(handled, "git signal batch");
     } finally {
       Date.now = realNow;
     }
