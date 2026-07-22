@@ -5,7 +5,29 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
-_Last updated: 2026-07-22 (~13:15 UTC — **v1.7.22 fleet-live**): founder
+_Last updated: 2026-07-22 (~19:30 UTC — **design 180 LIVE IN PROD**): the
+atomic-genesis implementation (ALIGNED v14 after field amendments) is on main
+(9aec0906..0e7397bc — landed via direct push after a cwd mishap, content =
+the fully-reviewed PR #394 branch, gates green on the exact tree; PR closed
+with paper trail; new rule: git -C everywhere in background chains), main CI
+green, DEV validated with 10/10 regress flows (new client + new server), and
+**production promoted 500fc5a3→0e7397bc** (founder-authorized; test-gated
+workflow applied migration 0031 + deployed + versions green). Field-verified:
+Mac 1.7.22 old client syncs normally against the new prod server. The
+enrollment crash-wedge defect class is CLOSED in production. Round-3 field
+amendments: local enrollment witness (enrolled users never fetch the
+observation — no per-invocation network coupling, offline-safe, skew-immune)
++ typed legacy-server terminal error + explicit deployment-ordering contract
+(server before any CLI carrying 180 — NO CLI release until prod has it: DONE).
+ux regress CI step made genuinely report-only (#395). IN FLIGHT: 179 phase-2
+integration (rebase-conflict resolution = seam swap, codex); flake sweep
+(registry + deterministic fixes, codex). QUEUED: 179 review wave + merge,
+release train for 180+179 client, 178 t3, design 182 (agent-churn latency —
+founder problem statement committed). Founder's Mac has a fresh
+agent-workspace local-commits deferral (conductor-workspaces/savvy-core-v1)
+— normal 182-paradigm operation, his call when he cares._
+
+_Previous: 2026-07-22 (~13:15 UTC — **v1.7.22 fleet-live**): founder
 follow-up "make sure rbox upgrade swaps the daemon fully" → design 181 +
 PR #393 (merged 637bebd6): `restartDaemonsAfterUpgrade` gains `staleOnly`
 (reads the daemonVersion witness AFTER binding validation; absent/malformed/
