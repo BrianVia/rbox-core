@@ -100,6 +100,7 @@ test("machine A driver pins device approval, immediate genesis, workspace, daemo
     "Press Enter to sign up in your browser",
     "https://app.rbox.to/cli-login?code=ABCD-EFGH",
     "Set up encryption on this first machine now?",
+    "Save a recovery kit (writes the phrase in PLAINTEXT to ~)?",
     "Have you saved this recovery phrase somewhere safe?",
     "What do you want to track here?",
     "Which directory should rbox sync?",
@@ -120,7 +121,7 @@ test("machine A driver pins device approval, immediate genesis, workspace, daemo
   expect(events).toEqual([
     "start:a", "keys:a:Enter", "keys:a:Enter",
     `approve:${DEV_API}:web-secret:ABCD-EFGH`, "keys:approve:",
-    "keys:a:Enter", "keys:a:y+Enter", "keys:a:Enter", "keys:a:Enter",
+    "keys:a:Enter", "keys:a:n+Enter", "keys:a:y+Enter", "keys:a:Enter", "keys:a:Enter",
     "keys:a:dev-e2e+Enter", "keys:a:Enter", "keys:a:Down+Enter", "keys:a:Enter",
   ]);
 });

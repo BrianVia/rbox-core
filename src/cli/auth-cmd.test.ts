@@ -271,6 +271,25 @@ describe("runGenesisEnrollment", () => {
     expect(await hasDevice(accountId)).toBe(true);
     expect(await loadRecoveryKey(accountId)).toBeDefined();
   });
+
+  test("production kit selection records the actual absolute artifact before commitment",async()=>{
+    for(const row of [{accountId:"acct_4444444444444445",kit:{kit:true,kitPath:"relative-kit.txt"},offer:false},{accountId:"acct_4444444444444446",kit:{kit:false},offer:true}] as const){const api=new FakeGenesisApi([null],"ok",row.accountId,"dev_kit"),target=path.join(home,`${row.accountId}.txt`),seen:string[]=[];await runGenesisEnrollment(api,{accountId:row.accountId,deviceId:"dev_kit"},row.kit,{now:()=>1_900_000_000_000,isInteractive:()=>true,promptConfirm:async()=>row.offer,resolveKitPath:async()=>target,writeKit:async(_phrase,_creds,opts)=>{seen.push(opts.kitPath!);const intent=JSON.parse(await fs.readFile(genesisPaths(row.accountId).intent,"utf8"));expect(intent).toMatchObject({mode:"kit-path",path:target});}});expect(seen).toEqual([target]);}
+  });
+
+  test("ordinary resume supplies the persisted kit-path sink after a commitment crash",async()=>{
+    const accountId="acct_4444444444444447",target=path.join(home,"persisted-kit.txt"),api=new FakeGenesisApi([null],"ok",accountId,"dev_resume");
+    await expect(runGenesisEnrollment(api,{accountId,deviceId:"dev_resume"},{kit:true,kitPath:"ignored"},{now:()=>1_900_000_000_000,isInteractive:()=>false,resolveKitPath:async()=>target,writeKit:async()=>{throw new Error("crash after intent");}})).rejects.toThrow("crash after intent");
+    expect(JSON.parse(await fs.readFile(genesisPaths(accountId).intent,"utf8"))).toMatchObject({mode:"kit-path",path:target});let resumed="";
+    await expect(runGenesisEnrollment(api,{accountId,deviceId:"dev_resume"},{kit:false},{now:()=>1_900_000_000_001,isInteractive:()=>false,writeKit:async(_phrase,_creds,opts)=>{resumed=opts.kitPath!;}})).resolves.toBe("enrolled");expect(resumed).toBe(target);
+  });
+
+  test("phrase-display production intent survives a delivery crash and resumes without reselection",async()=>{
+    const accountId="acct_4444444444444448",api=new FakeGenesisApi([null],"ok",accountId,"dev_phrase");await expect(runGenesisEnrollment(api,{accountId,deviceId:"dev_phrase"},{kit:false},{now:()=>1_900_000_000_000,isInteractive:()=>false,showRecoveryPhrase:async()=>{throw new Error("crash during phrase delivery");}})).rejects.toThrow("crash during phrase delivery");expect(JSON.parse(await fs.readFile(genesisPaths(accountId).intent,"utf8"))).toMatchObject({mode:"phrase-display"});let deliveries=0;await expect(runGenesisEnrollment(api,{accountId,deviceId:"dev_phrase"},{kit:true,kitPath:"must-not-be-selected"},{now:()=>1_900_000_000_001,isInteractive:()=>false,showRecoveryPhrase:async()=>{deliveries++;}})).resolves.toBe("enrolled");expect(deliveries).toBe(1);
+  });
+
+  test("declining the production kit offer records phrase-display before delivery",async()=>{
+    const accountId="acct_4444444444444449",api=new FakeGenesisApi([null],"ok",accountId,"dev_decline"),target=path.join(home,"declined-kit.txt");let prompts=0;await runGenesisEnrollment(api,{accountId,deviceId:"dev_decline"},{kit:false},{now:()=>1_900_000_000_000,isInteractive:()=>true,promptConfirm:async()=>{prompts++;return false;},resolveKitPath:async()=>target,deliverPhrase:async()=>{expect(JSON.parse(await fs.readFile(genesisPaths(accountId).intent,"utf8"))).toMatchObject({mode:"phrase-display"});}});expect(prompts).toBe(1);await expect(fs.access(target)).rejects.toThrow();
+  });
 });
 
 describe("genesis lock", () => {
@@ -551,6 +570,10 @@ describe("device-code post-approval encryption handling", () => {
 });
 
 describe("whole-command pending-genesis gates", () => {
+  test("key recover rechecks an injected prompt-seam artifact under the retained lock before phrase read",async()=>{
+    const accountId="acct_7777777777777777";await saveCredentials({token:"tok",deviceId:"dev_recover",remoteUrl:"https://api.test",accountId});let reads=0;globalThis.fetch=(async(input:string|URL|Request)=>{expect(String(input)).toBe("https://api.test/v1/keys/account");return new Response(JSON.stringify({error:"not_found",genesisPresenceVersion:1,present:{rosters:0,keyStates:0,devices:0,workspaces:0,workspaceKeys:0,e2eePairingTokens:0}}),{status:404});}) as typeof fetch;
+    await expect(recoverCmd({kit:false},{isInteractive:()=>false,readStdin:async()=>{reads++;return"must-not-read";},beforePhraseRead:async()=>{await markGenesisPending(accountId,"dev_recover");}})).rejects.toThrow(GENESIS_PENDING_MESSAGE);expect(reads).toBe(0);
+  });
   test("rbox pair rejects before loading key material or minting a token", async () => {
     const accountId = "acct_8888888888888888";
     await saveCredentials({ token: "tok", deviceId: "dev_pending", remoteUrl: "https://api.test", accountId });

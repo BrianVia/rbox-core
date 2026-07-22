@@ -6,8 +6,9 @@ import path from "node:path";
 import { acquireClearMachineGenesisForPairing, assertNoPendingGenesis, enrollViaPairing, parsePairingToken } from "./e2ee-client.js";
 import { bootstrapAccount } from "../engine/e2ee/index.js";
 import { saveDevice } from "./e2ee-keystore.js";
-import { e2eeRoot, GENESIS_PENDING_MESSAGE, publishPrepublishMarker } from "./genesis-durable.js";
-import { acquireGlobalGenesisLock } from "./genesis-locks.js";
+import { e2eeRoot, genesisPaths, GENESIS_PENDING_MESSAGE, publishPrepublishMarker } from "./genesis-durable.js";
+import { acquireAccountGenesisLock, acquireGenesisLockPair, acquireGlobalGenesisLock, genesisLockRoot } from "./genesis-locks.js";
+import { genesisQuarantineDir, startGenesisQuarantine } from "./genesis-quarantine.js";
 
 const origFetch = globalThis.fetch;
 const origRboxHome = process.env.RBOX_HOME;
@@ -99,6 +100,11 @@ test("shared pairing parser rejects malformed vectors locally with zero redeem f
   }
 });
 
+test("malformed redeem account ids fail before target lock naming or keystore creation",async()=>{
+  const secret=Buffer.alloc(32).toString("base64url"),valid={token:"paired",deviceId:"dev_new",accountId:"acct_0123456789abcdef",mkWrap:"wrap",admissionGrant:"grant"};
+  for(const candidate of ["acct_../escape","acct_01234567/abcdef","acct_０123456789abcdef","acct_"+"a".repeat(200),{...valid,extra:true}] as const){globalThis.fetch=(async()=>new Response(JSON.stringify(typeof candidate==="string"?{...valid,accountId:candidate}:candidate))) as typeof fetch;await expect(enrollViaPairing("https://api.test",`rbox-pair_${"a".repeat(16)}.${secret}`,1)).rejects.toThrow(/malformed pairing response/);await expect(fs.access(e2eeRoot())).rejects.toThrow();expect(await fs.readdir(genesisLockRoot())).toEqual([]);}
+});
+
 test("normal enrolled device+MK material passes the common gate after coherent server verification", async () => {
   const accountId = "acct_dddddddddddddddd";
   const deviceId = "dev_enrolled";
@@ -160,4 +166,15 @@ test("pairing global scan checks every local account and releases the global fen
   await expect(acquireClearMachineGenesisForPairing()).rejects.toThrow(`${GENESIS_PENDING_MESSAGE} (${pendingAccount})`);
   const global = await acquireGlobalGenesisLock(0);
   await global.release();
+});
+
+test("pairing final-empty scan serializes first marker and repaired-legacy manifest publishers",async()=>{
+  const accountId="acct_2222222222222222",repairId=`gra_${"a".repeat(32)}`,sleep=(ms:number)=>new Promise<void>(resolve=>setTimeout(resolve,ms));
+  for(const kind of ["marker","quarantine"] as const){await fs.rm(genesisPaths(accountId).dir,{recursive:true,force:true});if(kind==="quarantine"){await fs.mkdir(genesisPaths(accountId).dir,{recursive:true});await fs.writeFile(genesisPaths(accountId).device,"{}");await fs.writeFile(genesisPaths(accountId).mk,"mk");}
+    const pairingGlobal=await acquireClearMachineGenesisForPairing();let published=false;const publisher=(async()=>{const pair=await acquireGenesisLockPair(accountId,2_000);try{if(kind==="marker")await publishPrepublishMarker({version:1,accountId,deviceId:"dev_new",repairId:null,startedAt:"2026-07-22T12:00:00.000Z",phase:"prepublish"});else await startGenesisQuarantine({accountId,purpose:"repaired-legacy",uniquenessKey:repairId,createdAt:"2026-07-22T12:00:00.000Z"});published=true;}finally{await pair.account.release();await pair.global.release();}})();await sleep(100);expect(published).toBe(false);if(kind==="quarantine"){await expect(fs.access(path.join(genesisQuarantineDir(accountId,"repaired-legacy",repairId),"quarantine-resume.json"))).rejects.toThrow();expect(await fs.readFile(genesisPaths(accountId).device,"utf8")).toBe("{}");}await pairingGlobal.release();await publisher;expect(published).toBe(true);}
+});
+
+test("post-redeem handoff lets a marker publisher take global but blocks it on the retained target lock",async()=>{
+  const accountId="acct_3333333333333333",sleep=(ms:number)=>new Promise<void>(resolve=>setTimeout(resolve,ms)),global=await acquireClearMachineGenesisForPairing(),target=await acquireAccountGenesisLock(accountId);let published=false;
+  const publisher=(async()=>{const pair=await acquireGenesisLockPair(accountId,2_000);try{await publishPrepublishMarker({version:1,accountId,deviceId:"dev_new",repairId:null,startedAt:"2026-07-22T12:00:00.000Z",phase:"prepublish"});published=true;}finally{await pair.account.release();await pair.global.release();}})();await global.release();await sleep(100);expect(published).toBe(false);await expect(fs.access(genesisPaths(accountId).marker)).rejects.toThrow();await target.release();await publisher;expect(published).toBe(true);
 });

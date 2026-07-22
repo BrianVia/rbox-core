@@ -78,6 +78,12 @@ async function validateLocalEnrolledPair(accountId:string,dto:AccountKeysDTO,acc
 function requestObject(journal:GenesisJournal):Record<string,unknown>{return parseGenesisBootstrapRequest(journal.requestBody,journal.deviceId) as unknown as Record<string,unknown>;}
 function exactAttempt(dto:AccountKeysDTO,journal:GenesisJournal):boolean{const b=requestObject(journal),dev=b.device as Record<string,unknown>|undefined;return dto.recoveryWrap===b.recoveryWrap&&dto.recoveryWrapId===b.recoveryWrapId&&dto.rosters[0]===b.genesisRoster&&dto.keyStates[0]===b.genesisKeyState&&!!dev&&dto.devices.some((row)=>row.deviceId===dev.deviceId&&row.sigPubkey===dev.sigPubKey&&row.encPubkey===dev.encPubKey&&row.mkWrap===dev.mkWrap);}
 
+async function validateJournalDeviceMaterial(accountId:string,journal:GenesisJournal):Promise<void>{
+  const loaded=await loadDevice(accountId);if(!loaded||!("secrets" in loaded)||loaded.secrets.deviceId!==journal.deviceId)throw new Error("journal device material mismatch");
+  const request=requestObject(journal),device=request.device;if(!plain(device)||device.deviceId!==journal.deviceId||device.sigPubKey!==toB64url(loaded.secrets.sigPubKey)||device.encPubKey!==toB64url(loaded.secrets.encPubSpki)||typeof device.mkWrap!=="string")throw new Error("journal device material mismatch");
+  const opened=await openOwnMasterKey(loaded.secrets,0,JSON.parse(device.mkWrap) as Wrap);if(!Buffer.from(opened).equals(Buffer.from(loaded.secrets.mk)))throw new Error("journal MK material mismatch");
+}
+
 async function validateAttemptMaterial(accountId:string,journal:GenesisJournal):Promise<string>{
   const loaded=await loadDevice(accountId);if(!loaded||!("secrets" in loaded)||loaded.secrets.deviceId!==journal.deviceId)throw new Error("journal device material mismatch");const rk=await loadStagedRecoveryKey(accountId),request=requestObject(journal);if(typeof request.recoveryWrap!=="string")throw new Error("journal recovery wrap missing");const mk=await recoverMasterKey(accountId,0,rk,JSON.parse(request.recoveryWrap) as Wrap);if(!Buffer.from(mk).equals(Buffer.from(loaded.secrets.mk)))throw new Error("staged recovery key does not authenticate journal MK");return rkToPhrase(rk);
 }
@@ -100,6 +106,7 @@ export async function classifyEnrollment(accountId:string,observation:GenesisAcc
         if(status==="absent"&&!(local.stagedRk&&local.device&&local.mk))throw new Error("competing cleanup has neither complete sources nor quarantine");
       }
       else if(journal.originalCacheRecovery){const destination=await present(genesisPaths(accountId).rk);if(local.stagedRk===destination)throw new Error("winning recovery-key promotion requires exactly one of source or destination");if(destination)await validatePromotedRecoveryKey(accountId,journal);else await validateAttemptMaterial(accountId,journal);}
+      else await validateJournalDeviceMaterial(accountId,journal);
       return{kind:"cleanup-resume",journal};
     }
     if(local.activeQuarantines.length){if(!tomb||!allZero(observation.present)||local.activeQuarantines.length!==1||local.activeQuarantines[0]!.purpose!=="repaired-legacy"||local.activeQuarantines[0]!.key!==tomb.repairId)return{kind:"integrity-failure",reason:"quarantine/tombstone mismatch"};return{kind:"quarantine-resume",repairId:tomb.repairId};}

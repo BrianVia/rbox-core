@@ -5,7 +5,7 @@ import { isInteractive, promptConfirm, promptInput, promptPassword } from "./pro
 import { copyToClipboard, openInBrowser, waitForKeypress } from "./browser-open.js";
 import { RboxApi } from "./remote.js";
 import { emitJson } from "./json.js";
-import { assertNoPendingGenesis, assertRecoveryGenesisReady, beginAtomicGenesis, completeAtomicGenesis, enrollViaPairing, enrollViaRecovery } from "./e2ee-client.js";
+import { assertNoPendingGenesis, beginAtomicGenesis, completeAtomicGenesis, enrollViaPairing, enrollViaRecoveryWithPhraseInput } from "./e2ee-client.js";
 import { buildPairing, randomBytes, toB64url } from "../engine/e2ee/index.js";
 import { loadDevice, loadRecoveryKey } from "./e2ee-keystore.js";
 import { isAutostartEnabled } from "./autostart-cmd.js";
@@ -54,10 +54,14 @@ async function showRecoveryPhrase(phrase: string, creds: { accountId?: string; d
     await writeKitOrThrow(phrase, creds, kitOpts, true);
     return;
   }
+  if(isInteractive()&&await offerOrWriteKit(phrase,creds,kitOpts))return;
 
+  await deliverRecoveryPhrase(phrase);
+}
+
+async function deliverRecoveryPhrase(phrase:string):Promise<void>{
   process.stderr.write(`\n⚠️  rbox is END-TO-END ENCRYPTED. This recovery phrase is the ONLY way back in\n    if you lose every signed-in device. There is NO escrow — we cannot recover it.\n\n    ${phrase}\n\n`);
   if (isInteractive()) {
-    if (await offerOrWriteKit(phrase, creds, kitOpts)) return;
     while (!(await promptConfirm({ message: "Have you saved this recovery phrase somewhere safe?", default: false }))) {
       process.stderr.write(`    Save it first — it's the ONLY way back in if you lose every device.\n`);
     }
@@ -117,7 +121,12 @@ type GenesisEnrollmentResult = "enrolled" | "already-setup";
 
 interface GenesisEnrollmentDeps {
   showRecoveryPhrase?: typeof showRecoveryPhrase;
+  deliverPhrase?: (phrase: string) => Promise<void>;
   now?: () => number;
+  isInteractive?: typeof isInteractive;
+  promptConfirm?: typeof promptConfirm;
+  resolveKitPath?: typeof resolveRecoveryKitPath;
+  writeKit?: typeof writeKitOrThrow;
 }
 
 export async function runGenesisEnrollment(
@@ -129,20 +138,18 @@ export async function runGenesisEnrollment(
   const now=(deps.now??Date.now)();
   const started=await beginAtomicGenesis(api,creds.accountId,creds.deviceId,{now});
   if(started.kind==="already-setup")return"already-setup";
-  const durableKit=!deps.showRecoveryPhrase&&!isInteractive()&&recoveryKitAction(false,kitOpts)==="write-suppress-echo";
-  if(durableKit){
-    const target=await resolveRecoveryKitPath(creds.accountId,kitOpts.kitPath,new Date(now));
-    await completeAtomicGenesis(started,{
-      deliverPhrase:async()=>{throw new Error("durable kit completion selected phrase display unexpectedly");},
-      selectIntent:async(journal,_phrase,intentNow)=>({version:1,accountId:journal.accountId,requestSha256:journal.requestSha256,mode:"kit-path",path:target,intentAt:new Date(intentNow).toISOString()}),
-      commitArtifact:async(intent,phrase)=>{
-        if(intent.mode!=="kit-path")throw new Error(`unsupported genesis completion artifact: ${intent.mode}`);
-        await writeKitOrThrow(phrase,creds,{kit:true,kitPath:intent.path},true);
-      },
-    },now);
-  }else{
-    await completeAtomicGenesis(started,(phrase)=>(deps.showRecoveryPhrase??showRecoveryPhrase)(phrase,creds,kitOpts),now);
-  }
+  const interactive=(deps.isInteractive??isInteractive)(),action=deps.showRecoveryPhrase?"none":recoveryKitAction(interactive,kitOpts);
+  await completeAtomicGenesis(started,{
+    deliverPhrase:(phrase)=>deps.deliverPhrase?.(phrase)??(deps.showRecoveryPhrase??deliverRecoveryPhrase)(phrase,creds,NO_KIT),
+    selectIntent:async(journal,_phrase,intentNow)=>{
+      let selected=action==="write"||action==="write-suppress-echo";
+      let target:string|undefined;
+      if(selected||action==="offer")target=await (deps.resolveKitPath??resolveRecoveryKitPath)(creds.accountId,kitOpts.kitPath,new Date(now));
+      if(action==="offer")selected=await (deps.promptConfirm??promptConfirm)({message:`Save a recovery kit (writes the phrase in PLAINTEXT to ${displayPath(target!)})?`,default:true});
+      return selected?{version:1 as const,accountId:journal.accountId,requestSha256:journal.requestSha256,mode:"kit-path" as const,path:target!,intentAt:new Date(intentNow).toISOString()}:{version:1 as const,accountId:journal.accountId,requestSha256:journal.requestSha256,mode:"phrase-display" as const,intentAt:new Date(intentNow).toISOString()};
+    },
+    commitArtifact:async(intent,phrase)=>{if(intent.mode!=="kit-path")throw new Error(`unsupported genesis completion artifact: ${intent.mode}`);await (deps.writeKit??writeKitOrThrow)(phrase,creds,{kit:true,kitPath:intent.path},!interactive);},
+  },now);
   return"enrolled";
 }
 
@@ -450,26 +457,25 @@ export async function readPairingTokenInteractive(deps: PairingTokenInputDeps = 
 
 /** `rbox key recover` — re-enroll this machine from the recovery phrase (needs an
  *  account login first; the phrase unlocks MK, not server auth — §14.7/D10). */
-export async function recoverCmd(kitOpts: RecoveryKitOptions = NO_KIT): Promise<void> {
+interface RecoverCmdDeps{isInteractive?:typeof isInteractive;promptInput?:typeof promptInput;readStdin?:typeof readStdinTrimmed;now?:()=>number;beforePhraseRead?:()=>Promise<void>}
+export async function recoverCmd(kitOpts: RecoveryKitOptions = NO_KIT,deps:RecoverCmdDeps={}): Promise<void> {
   const loaded = await loadCredentials();
   const creds = credentialsForStrictFlow(loaded);
   if (!creds?.accountId) throw new Error("`rbox key recover` needs an account login first — run `rbox login` (web/device-code), then recover.");
-  await assertRecoveryGenesisReady(loaded);
-  let phrase: string;
-  if (isInteractive()) {
+  const result=await enrollViaRecoveryWithPhraseInput(async()=>{
+  if ((deps.isInteractive??isInteractive)()) {
     // Visible input: a 24-word phrase is long and paste-error-prone, and it's
     // entered once on the owner's own machine — showing it lets the user catch
     // a bad paste (the phrase is displayed at genesis anyway).
-    phrase = (await promptInput({ message: "Enter your 24-word recovery phrase" })).trim();
+    return (deps.promptInput??promptInput)({ message: "Enter your 24-word recovery phrase" });
   } else {
     // Piped (`echo "<phrase>" | rbox key recover`) — drain stdin like `connect` does so
     // recovery still works in CI / non-TTY, where inquirer can't run.
-    phrase = await readStdinTrimmed();
+    return (deps.readStdin??readStdinTrimmed)();
   }
-  if (!phrase) throw new Error("no phrase entered");
-  const { accountId, deviceId } = await enrollViaRecovery(phrase, Date.now(), loaded);
-  console.log(`recovered + enrolled this device: ${deviceId}`);
-  await offerRecoveryKitAfterRecover(phrase, { accountId, deviceId }, kitOpts);
+  },(deps.now??Date.now)(),loaded,deps.beforePhraseRead);
+  console.log(`recovered + enrolled this device: ${result.deviceId}`);
+  await offerRecoveryKitAfterRecover(result.phrase, result, kitOpts);
 }
 
 /** `rbox key status` — local E2EE enrollment state for the current account. */
