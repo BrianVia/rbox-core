@@ -47,6 +47,7 @@ import { diagnosticsRoutes } from "./routes/diagnostics.js";
 import { syncRoutes } from "./routes/sync.js";
 import { runPackGc } from "./pack-gc.js";
 import { ingestSyncState, ingestTelemetry } from "./telemetry-ingest.js";
+import { recordAccountLatency } from "./account-latency.js";
 import { evaluateFleetAlerts } from "./fleet-alerts.js";
 export { WorkspaceSync } from "./workspace-sync.js";
 
@@ -79,10 +80,15 @@ export default {
     // account-epoch lookups in route()) is timed + counted into the `request` row.
     // Per-op handlers (blobs.ts) wrap again → their row counts their own D1; the
     // overlap with `request` is intended (request = total worker-side D1).
-    const op = startOp(env, "request", `${req.method} ${routeTemplate(new URL(req.url).pathname)}`);
+    const routeName = `${req.method} ${routeTemplate(new URL(req.url).pathname)}`;
+    const op = startOp(env, "request", routeName);
+    // route() fills this in once it resolves an authenticated identity (grant fast-paths
+    // carry an account only; the bearer path carries account+device). Left empty for
+    // public/unauthenticated routes, which record nothing.
+    const identity: RequestIdentity = {};
     let res: Response;
     try {
-      res = await route(req, op.env, ctx);
+      res = await route(req, op.env, ctx, identity);
     } catch (e) {
       if (e instanceof Response) res = e; // thrown 4xx flows out as itself
       else {
@@ -91,6 +97,21 @@ export default {
       }
     }
     op.done(String(res.status));
+    // Per-account/device latency rollup into our own D1 (dark unless RBOX_ACCOUNT_LATENCY=1).
+    // Reuses the `request` span's timings; bytes are best-effort from Content-Length.
+    if (identity.accountId) {
+      recordAccountLatency(env, ctx, {
+        accountId: identity.accountId,
+        deviceId: identity.deviceId ?? "",
+        route: routeName,
+        ms: op.span.ms,
+        dbMs: op.span.dbMs,
+        storeMs: op.span.storeMs,
+        bytes: contentLengthBytes(req, res),
+        ok: res.status < 400,
+        nowMs: Date.now(),
+      });
+    }
     // WebSocket upgrades cannot be re-wrapped; pass the DO fanout path through.
     if (res.status === 101 || res.webSocket) return res;
     // Echo CORS headers on the real response (incl. errors) and default-deny
@@ -256,7 +277,22 @@ export default {
  * the documented overlapping-prefix cases (e.g. blobs/check before blobs/:sha);
  * exact-match routes across groups are mutually exclusive.
  */
-async function route(req: Request, env: Env, executionCtx: ExecutionContext & { exports: WorkerEntrypointExports }): Promise<Response> {
+/** Mutable sink: route() records the resolved account/device here for the caller's latency
+ *  rollup. Kept off RouteCtx so it's visible to the fetch handler that owns the request span. */
+interface RequestIdentity {
+  accountId?: string;
+  deviceId?: string;
+}
+
+/** Best-effort payload size for throughput, from request (uploads) + response (downloads)
+ *  Content-Length. Absent/streamed bodies contribute 0 — this is a signal, not accounting. */
+function contentLengthBytes(req: Request, res: Response): number {
+  const reqCl = Number(req.headers.get("content-length"));
+  const resCl = Number(res.headers.get("content-length"));
+  return (Number.isFinite(reqCl) ? reqCl : 0) + (Number.isFinite(resCl) ? resCl : 0);
+}
+
+async function route(req: Request, env: Env, executionCtx: ExecutionContext & { exports: WorkerEntrypointExports }, identity: RequestIdentity = {}): Promise<Response> {
   const url = new URL(req.url);
   const seg = url.pathname.split("/").filter(Boolean);
   const ctx: RouteCtx = { req, env, exports: executionCtx.exports, executionCtx, url, seg };
@@ -285,6 +321,7 @@ async function route(req: Request, env: Env, executionCtx: ExecutionContext & { 
     if (grant) {
       const verified = await verifyGrantCredential(env, grant, { nowMs: Date.now() });
       if (verified.ok) {
+        identity.accountId = verified.accountId; // grant credential has no device id
         if (isGrantBlobGet) return blobGetWithVerifiedGrant(env, seg[2]!, verified.accountId);
         return blobBatchGetWithVerifiedGrant(req, env, verified.accountId);
       }
@@ -301,7 +338,10 @@ async function route(req: Request, env: Env, executionCtx: ExecutionContext & { 
     const grant = req.headers.get("x-rbox-upload-grant");
     if (grant && usesReceipts(req)) {
       const verified = await verifyUploadGrantCredential(env, grant, { nowMs: Date.now() });
-      if (verified.ok) return blobBatchPutWithVerifiedGrant(req, env, verified.accountId);
+      if (verified.ok) {
+        identity.accountId = verified.accountId; // grant credential has no device id
+        return blobBatchPutWithVerifiedGrant(req, env, verified.accountId);
+      }
       batchPutAuthFallback = verified.reason === "expired" ? "fallback_expired" : "fallback_invalid";
     } else {
       batchPutAuthFallback = grant ? "fallback_invalid" : "fallback_missing";
@@ -311,6 +351,8 @@ async function route(req: Request, env: Env, executionCtx: ExecutionContext & { 
   // Everything else requires a valid (non-revoked) device token → full Principal.
   const p = await authenticate(req, env);
   if (!p) throw jsonResponse({ error: "unauthorized" }, 401);
+  identity.accountId = p.accountId;
+  identity.deviceId = p.deviceId;
 
   // DEFAULT-DENY token-kind route gate (design 21 §1.1): a short-lived browser
   // `web` session may touch ONLY the exact-match allowlist below. Everything else —

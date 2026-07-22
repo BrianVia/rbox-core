@@ -103,6 +103,10 @@ export interface Env {
    *  `"prod"` on rbox-prod-api. Observability labels collapse absent/misconfigured values
    *  to `"dev"`, but security gates must only take the dev path on explicit `"dev"`. */
   RBOX_ENV?: "dev" | "prod";
+  /** Dark-launch flag for the per-account/device latency rollup (SPEC-PER-ACCOUNT-LATENCY).
+   *  When "1", each authenticated request additionally upserts an hourly latency bucket into
+   *  our own D1 (`account_op_latency`) — never AE, never the wire. Any other value: dark. */
+  RBOX_ACCOUNT_LATENCY?: string;
   /** HMAC pepper for the per-recipient delivery idempotency key (internal dedupe tag, §4.4). */
   NOTIFY_IDEMPOTENCY_PEPPER?: string;
   /** Explicit kill-switch (local/dev only). When "1", deliveries terminally `skipped` —
