@@ -154,6 +154,8 @@ export async function runSetup(opts: {
   defaultRemote: string;
   flags?: Record<string, string>;
   preselectedWorkspaceKind?: WorkspaceKind;
+  /** Test seam: callers normally inherit the real stdin TTY state. */
+  interactive?: () => boolean;
   /** The untracked menu is only reachable after `resolveBareRboxTarget` verifies
    * enrollment, so this path skips the welcome banner and account step. */
   viaUntrackedMenu?: boolean;
@@ -170,7 +172,7 @@ export async function runSetup(opts: {
   if (["dir", "daemon", "pull-only", "force"].some((flag) => flags[flag] !== undefined)) {
     process.stderr.write("note: --dir/--daemon/--pull-only/--force only apply to keyed setup (--workspace <name|id> with a key) — ignored in the guided flow.\n");
   }
-  if (process.stdin.isTTY !== true) {
+  if (!(opts.interactive ?? (() => process.stdin.isTTY === true))()) {
     process.stderr.write(
       "rbox setup is interactive. For scripts/CI use `rbox init` " +
         "(e.g. `rbox init --new --root <path> --bootstrap <secret>`). Run `rbox help init` for details.\n"

@@ -1151,7 +1151,7 @@ test("guided setup warns about keyed-only flags before the non-TTY exit", async 
     return true;
   }) as typeof process.stderr.write;
   try {
-    await runSetup({ cwd: process.cwd(), defaultRemote: "https://api.test", flags: { daemon: "true" } });
+    await runSetup({ cwd: process.cwd(), defaultRemote: "https://api.test", flags: { daemon: "true" }, interactive: () => false });
     expect(writes.join("")).toContain("note: --dir/--daemon/--pull-only/--force only apply to keyed setup");
   } finally {
     process.stderr.write = originalWrite;
