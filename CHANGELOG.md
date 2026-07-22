@@ -6,6 +6,18 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.7.24] — 2026-07-22 — "the keychain save actually saves"
+
+### Fixed
+- `rbox key save` now works on real Macs: the tool rbox uses to find your
+  login Keychain was being called in a way modern macOS rejects, so every
+  save failed with "Keychain resolution failed". Found live by the founder;
+  fixed and verified against real `security` output.
+- The recovery-phrase prompt now shows what you type (typing 24 words blind
+  caused typos and silently truncated pastes) and tells you when a paste
+  came through partial ("expected 24 words but got 10").
+- `rbox key save < phrase-file` no longer reads empty input.
+
 ## [1.7.23] — 2026-07-22 — "your recovery key gets a home"
 
 ### Added
