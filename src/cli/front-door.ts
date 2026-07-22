@@ -6,7 +6,7 @@ import { DEFAULT_REMOTE } from "./api-base.js";
 import { findRoot } from "./config.js";
 import { loadCredentials } from "./credentials.js";
 import { pendingGenesisState } from "./genesis-enrollment.js";
-import { GENESIS_PENDING_MESSAGE } from "./genesis-durable.js";
+import { RboxApi } from "./remote.js";
 import { DEFAULT_LOG_LINES, logsDaemon } from "./daemon-control.js";
 import { collapseHome } from "./init-plan.js";
 import { promptSelect } from "./prompt.js";
@@ -107,7 +107,11 @@ async function promptCancelable<V>(select: SelectPrompt, cfg: { message: string;
 
 export async function runFrontDoor(root: string, deps: FrontDoorDeps = {}): Promise<void> {
   const loaded = await (deps.loadCredentials ?? loadCredentials)();
-  if(loaded.state==="valid"&&loaded.credentials.accountId&&await pendingGenesisState(loaded.credentials.accountId))throw new Error(GENESIS_PENDING_MESSAGE);
+  if(loaded.state==="valid"&&loaded.credentials.accountId&&await pendingGenesisState(loaded.credentials.accountId)){
+    const creds=loaded.credentials;if(!creds.accountId||!creds.deviceId||!creds.token)throw new Error("pending encryption setup has no bound device credential — run `rbox setup`");
+    const {runGenesisEnrollment}=await import("./auth-cmd.js");
+    await runGenesisEnrollment(new RboxApi(creds.remoteUrl??DEFAULT_REMOTE,creds.token,"",""),{accountId:creds.accountId,deviceId:creds.deviceId});
+  }
   const signedIn = loaded.state === "valid" && Boolean(loaded.credentials.accountId);
   const freshIdentity = await fetchColdFrontDoorIdentity(deps);
   const renderStatus = deps.statusCmd ?? ((r: string, identity?: BriefIdentitySource) =>
