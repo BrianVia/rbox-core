@@ -11,11 +11,26 @@ import {
 import { phraseToRk, rkToPhrase } from "../engine/e2ee/index.js";
 import { RECOVERY_KIT_SERVICE } from "./genesis-seam.js";
 import type { KeychainArtifact, KeychainProbe } from "./recovery-kit-keychain.js";
+import { assertAccountId } from "./account-id.js";
 
 export const KIT_BANNER = "rbox RECOVERY KIT — keep this somewhere safe";
 const FILE_MODE = 0o600;
 const MAX_KIT_BYTES = 16 * 1024;
 const OFFER_LOCK_MESSAGE = "another rbox process is updating recovery-kit state — retry";
+
+type RecoveryKitWriteStep =
+  | "parent-validated" | "before-temp-parent-check" | "before-rename-parent-check"
+  | `atomic-${"temp-opened" | "temp-written" | "temp-synced" | "temp-closed" | "before-rename" | "after-rename"}`
+  | "before-readback" | "after-readback" | "after-published-fsync" | "after-directory-fsync";
+type RecoveryKitWriteTestHook = (step: RecoveryKitWriteStep, file: string) => void | Promise<void>;
+let recoveryKitWriteTestHook: RecoveryKitWriteTestHook | undefined;
+
+/** @internal Deterministic fault/race injection for the governed writer. */
+export function installRecoveryKitWriteTestHook(hook: RecoveryKitWriteTestHook | undefined): () => void {
+  const previous = recoveryKitWriteTestHook;
+  recoveryKitWriteTestHook = hook;
+  return () => { recoveryKitWriteTestHook = previous };
+}
 
 export interface RecoveryKitOptions { kit: boolean; kitPath?: string }
 export interface KitTargetEnv { homeDir: string; downloadsExists: boolean }
@@ -164,20 +179,47 @@ async function hardenedWrite(file: string, data: string | Uint8Array): Promise<v
   const dir = path.dirname(file);
   const created = await ensureDirectoryChain(dir, "recovery-kit directory");
   await fsyncCreatedDirectoryAncestors(dir, created);
+  const parent = await fs.lstat(dir, { bigint: true });
+  if (!parent.isDirectory() || parent.isSymbolicLink()) throw new Error(`unsafe recovery-kit parent directory: ${dir}`);
+  const verifyParent = async () => {
+    const current = await fs.lstat(dir, { bigint: true });
+    if (!current.isDirectory() || current.isSymbolicLink() || current.dev !== parent.dev || current.ino !== parent.ino) {
+      throw new Error(`recovery-kit parent directory changed during publication: ${dir}`);
+    }
+  };
+  await recoveryKitWriteTestHook?.("parent-validated", file);
   const existing = await fs.lstat(file).catch((error) => {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw error;
   });
   if (existing?.isSymbolicLink()) throw new Error(`refusing to write recovery kit through a symlink: ${file}`);
   if (existing && !existing.isFile()) throw new Error(`refusing to replace non-file recovery kit path: ${file}`);
-  await writeFileAtomic(file, data, { flag: "wx", mode: FILE_MODE, exactMode: true });
+  await writeFileAtomic(file, data, {
+    flag: "wx",
+    mode: FILE_MODE,
+    exactMode: true,
+    beforeTempCreate: async () => {
+      await recoveryKitWriteTestHook?.("before-temp-parent-check", file);
+      await verifyParent();
+    },
+    beforeRename: async () => {
+      await recoveryKitWriteTestHook?.("before-rename-parent-check", file);
+      await verifyParent();
+      return true;
+    },
+    onStep: (step) => recoveryKitWriteTestHook?.(`atomic-${step}`, file),
+  });
+  await recoveryKitWriteTestHook?.("before-readback", file);
   const handle = await fs.open(file, fsSync.constants.O_RDONLY | (fsSync.constants.O_NOFOLLOW ?? 0));
   try {
     const actual = await handle.readFile();
     if (!Buffer.from(actual).equals(Buffer.from(data))) throw new Error("recovery-kit exact read-back failed");
+    await recoveryKitWriteTestHook?.("after-readback", file);
     await handle.sync();
+    await recoveryKitWriteTestHook?.("after-published-fsync", file);
   } finally { await handle.close() }
   await fsyncDirectory(dir);
+  await recoveryKitWriteTestHook?.("after-directory-fsync", file);
 }
 
 async function withRecordLock<T>(accountId: string, operation: () => Promise<T>): Promise<T> {
@@ -209,12 +251,15 @@ export async function mutateRecoveryKitRecord(accountId: string, mutate: (curren
     const loaded = await readRecoveryKitRecordState(accountId);
     if (loaded.state === "unknown") throw new Error("refusing to overwrite an unknown recovery-kit record");
     const current = loaded.state === "recognized" ? loaded.record : { version: 2 as const, accountId, plaintextArtifacts: [] };
-    const next = mutate(current);
-    const validated = parseRecoveryKitRecord(next, accountId);
-    if (!validated) throw new Error("invalid recovery-kit record mutation");
-    await hardenedWrite(recordPath(accountId), `${JSON.stringify(validated, null, 2)}\n`);
-    return validated;
+    return writeRecoveryKitRecordUnlocked(accountId, mutate(current));
   });
+}
+
+async function writeRecoveryKitRecordUnlocked(accountId: string, next: RecoveryKitRecord): Promise<RecoveryKitRecord> {
+  const validated = parseRecoveryKitRecord(next, accountId);
+  if (!validated) throw new Error("invalid recovery-kit record mutation");
+  await hardenedWrite(recordPath(accountId), `${JSON.stringify(validated, null, 2)}\n`);
+  return validated;
 }
 
 export async function writeRecoveryKit(
@@ -253,18 +298,28 @@ export async function mergeDiscoveredKeychainArtifact(accountId: string, artifac
   return outcome;
 }
 
-export async function claimRecoveryKitOffer(accountId: string, surface: RecoveryKitOfferSurface, phraseSource: RecoveryKitPhraseSource, now = new Date()): Promise<boolean> {
+export async function claimRecoveryKitOffer(
+  accountId: string,
+  surface: RecoveryKitOfferSurface,
+  phraseSource: RecoveryKitPhraseSource,
+  actionablePreflight: () => Promise<boolean>,
+  now = new Date()
+): Promise<boolean> {
+  // A verified-live claimant may spend the Keychain timeout, termination
+  // grace, and durable publication time under this lock. Keep waiting until
+  // it releases or publishes; a dead holder is reclaimed by withRecordLock.
   for (let attempt = 0; ; attempt++) {
-    let claimed = false;
     try {
-      await mutateRecoveryKitRecord(accountId, (current) => {
-        if (current.offer) return current;
-        claimed = true;
-        return { ...current, offer: { claimedAt: now.toISOString(), surface, phraseSource, outcome: "claimed" } };
+      return await withRecordLock(accountId, async () => {
+        const loaded = await readRecoveryKitRecordState(accountId);
+        if (loaded.state === "unknown") throw new Error("refusing to overwrite an unknown recovery-kit record");
+        const current = loaded.state === "recognized" ? loaded.record : { version: 2 as const, accountId, plaintextArtifacts: [] };
+        if (current.offer || !(await actionablePreflight())) return false;
+        await writeRecoveryKitRecordUnlocked(accountId, { ...current, offer: { claimedAt: now.toISOString(), surface, phraseSource, outcome: "claimed" } });
+        return true;
       });
-      return claimed;
     } catch (error) {
-      if (!(error instanceof Error) || error.message !== OFFER_LOCK_MESSAGE || attempt >= 50) throw error;
+      if (!(error instanceof Error) || error.message !== OFFER_LOCK_MESSAGE) throw error;
       await new Promise((resolve) => setTimeout(resolve, 10));
       const current = await readRecoveryKitRecordState(accountId);
       if (current.state === "recognized" && current.record.offer) return false;
@@ -276,16 +331,12 @@ export async function updateRecoveryKitOfferOutcome(accountId: string, outcome: 
   await mutateRecoveryKitRecord(accountId, (current) => current.offer ? { ...current, offer: { ...current.offer, outcome } } : current);
 }
 
-function artifactFrom(recordOrArtifact: RecoveryKitRecord | PlaintextArtifact): { artifact?: PlaintextArtifact; accountId?: string } {
-  return "version" in recordOrArtifact ? { artifact: recordOrArtifact.plaintextArtifacts[0], accountId: recordOrArtifact.accountId } : { artifact: recordOrArtifact };
-}
-
-export async function recoveryKitFileState(recordOrArtifact: RecoveryKitRecord | PlaintextArtifact): Promise<RecoveryKitFileState> {
-  const { artifact, accountId } = artifactFrom(recordOrArtifact);
+export async function recoveryKitFileState(accountId: string, artifact: PlaintextArtifact | undefined): Promise<RecoveryKitFileState> {
+  assertAccountId(accountId);
   if (!artifact) return "missing";
   const parsed = await readPlaintextKit(artifact.path);
   if (parsed.state !== "present") return parsed.state;
-  if (accountId && parsed.accountId !== accountId) return "unrecognized";
+  if (parsed.accountId !== accountId) return "unavailable";
   return "present";
 }
 
@@ -356,7 +407,15 @@ export function recoveryKitSafety(recordState: RecoveryKitRecordRead, states: { 
 }
 
 export function recoveryKitRecordPath(accountId: string): string { return recordPath(accountId) }
-function recordPath(accountId: string): string { return path.join(process.env.RBOX_HOME || os.homedir(), ".rbox", "e2ee", accountId, "kit.json") }
+function recordPath(accountId: string): string {
+  assertAccountId(accountId);
+  const e2eeDir = path.resolve(process.env.RBOX_HOME || os.homedir(), ".rbox", "e2ee");
+  const accountDir = path.resolve(e2eeDir, accountId);
+  if (path.dirname(accountDir) !== e2eeDir) throw new Error("recovery-kit account directory escaped containment");
+  const file = path.resolve(accountDir, "kit.json");
+  if (path.dirname(file) !== accountDir) throw new Error("recovery-kit record path escaped account directory");
+  return file;
+}
 function resolveUserPath(value: string): string {
   if (value === "~") return os.homedir();
   if (value.startsWith(`~${path.sep}`) || value.startsWith("~/")) return path.resolve(os.homedir(), value.slice(2));

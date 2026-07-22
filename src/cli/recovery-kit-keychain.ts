@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import path from "node:path";
 import { phraseToRk, rkToPhrase } from "../engine/e2ee/index.js";
 import { RECOVERY_KIT_SERVICE } from "./genesis-seam.js";
+import { assertAccountId } from "./account-id.js";
 
 export type KeychainProbe = "present" | "missing" | "unavailable";
 
@@ -41,24 +42,36 @@ export interface KeychainArtifact extends KeychainIdentity {
 const SECURITY_BIN = "/usr/bin/security";
 const STDIO_LIMIT = 64 * 1024;
 const PHRASE_LIMIT = 1024;
-const ACCOUNT_RE = /^acct_([0-9a-f]{16})$/;
 const PHRASE_RE = /^[a-z]+( [a-z]+){23}$/;
 
 function wipe(bytes: Uint8Array): void {
   bytes.fill(0);
 }
 
-function appendBounded(chunks: Buffer[], chunk: Buffer, state: { size: number }, max: number): boolean {
+function appendBounded(chunks: Buffer[], chunk: Buffer, state: { size: number }, max: number, onCopy?: (copy: Uint8Array) => void): boolean {
   state.size += chunk.length;
   if (state.size > max) return false;
-  chunks.push(Buffer.from(chunk));
+  const copy = Buffer.from(chunk);
+  chunks.push(copy);
+  onCopy?.(copy);
   return true;
+}
+
+function wipeChunks(chunks: Buffer[]): void {
+  for (const chunk of chunks) chunk.fill(0);
+  chunks.length = 0;
+}
+
+function concatAndWipe(chunks: Buffer[]): Buffer {
+  try { return Buffer.concat(chunks) }
+  finally { wipeChunks(chunks) }
 }
 
 export async function runSecurityProcess(
   args: readonly string[],
   stdin: Uint8Array | undefined,
-  limits: SecurityLimits
+  limits: SecurityLimits,
+  testOptions: { executable?: string; onChunkCopy?: (copy: Uint8Array) => void } = {}
 ): Promise<SecurityResult> {
   return await new Promise<SecurityResult>((resolve) => {
     const stdout: Buffer[] = [];
@@ -71,7 +84,7 @@ export async function runSecurityProcess(
     let spawned = false;
     let killTimer: ReturnType<typeof setTimeout> | undefined;
 
-    const child = spawn(SECURITY_BIN, [...args], {
+    const child = spawn(testOptions.executable ?? SECURITY_BIN, [...args], {
       shell: false,
       stdio: [stdin ? "pipe" : "ignore", "pipe", "pipe"],
     });
@@ -95,13 +108,15 @@ export async function runSecurityProcess(
       }
     });
     child.stdout?.on("data", (chunk: Buffer) => {
-      if (!appendBounded(stdout, chunk, stdoutSize, limits.stdoutBytes)) {
+      if (settled) return;
+      if (!appendBounded(stdout, chunk, stdoutSize, limits.stdoutBytes, testOptions.onChunkCopy)) {
         overflow = true;
         terminate();
       }
     });
     child.stderr?.on("data", (chunk: Buffer) => {
-      if (!appendBounded(stderr, chunk, stderrSize, limits.stderrBytes)) {
+      if (settled) return;
+      if (!appendBounded(stderr, chunk, stderrSize, limits.stderrBytes, testOptions.onChunkCopy)) {
         overflow = true;
         terminate();
       }
@@ -111,6 +126,8 @@ export async function runSecurityProcess(
       settled = true;
       clearTimeout(timeout);
       if (killTimer) clearTimeout(killTimer);
+      wipeChunks(stdout);
+      wipeChunks(stderr);
       resolve({ outcome: "spawn-error", stdout: new Uint8Array(), stderr: new Uint8Array() });
     });
     child.once("close", (code, signal) => {
@@ -118,8 +135,8 @@ export async function runSecurityProcess(
       settled = true;
       clearTimeout(timeout);
       if (killTimer) clearTimeout(killTimer);
-      const out = Buffer.concat(stdout);
-      const err = Buffer.concat(stderr);
+      const out = concatAndWipe(stdout);
+      const err = concatAndWipe(stderr);
       if (!spawned) resolve({ outcome: "spawn-error", stdout: out, stderr: err });
       else if (overflow) resolve({ outcome: "overflow", stdout: out, stderr: err });
       else if (timedOut) resolve({ outcome: "timeout", stdout: out, stderr: err });
@@ -167,8 +184,7 @@ export function encodeSecurityInteractiveToken(value: string): string {
 }
 
 function strictAccount(accountId: string): string {
-  if (!ACCOUNT_RE.test(accountId)) throw new Error("malformed account id for recovery Keychain item");
-  return accountId;
+  return assertAccountId(accountId, "account id for recovery Keychain item");
 }
 
 export async function canonicalRecoveryPhrase(phrase: string): Promise<string> {
@@ -214,9 +230,11 @@ export async function resolveLoginKeychain(seams: KeychainSeams = defaultKeychai
   });
   try {
     requireExit(result, "login Keychain resolution");
-    const raw = Buffer.from(result.stdout).toString("utf8").trim();
+    const line = parseExactlyOneOutputLine(result.stdout);
+    if (!line) throw new Error("login Keychain resolution returned an invalid path");
+    const raw = Buffer.from(line.buffer, line.byteOffset, line.byteLength).toString("utf8");
     const token = raw.startsWith('"') && raw.endsWith('"') ? raw.slice(1, -1).replace(/\\([\\"])/g, "$1") : raw;
-    if (!token || token.split(/\r?\n/).length !== 1) throw new Error("login Keychain resolution returned an invalid path");
+    if (!token) throw new Error("login Keychain resolution returned an invalid path");
     return validateKeychainPath(await seams.realpath(validateKeychainPath(token)));
   } finally {
     wipe(result.stdout);
@@ -237,13 +255,17 @@ function identityArgs(artifact: KeychainIdentity, includeSecret: boolean): strin
   ];
 }
 
-function stripOneTerminalNewline(bytes: Uint8Array): Uint8Array {
+function parseExactlyOneOutputLine(bytes: Uint8Array): Uint8Array | undefined {
   let end = bytes.length;
   if (end > 0 && bytes[end - 1] === 0x0a) {
     end--;
     if (end > 0 && bytes[end - 1] === 0x0d) end--;
   }
-  return bytes.slice(0, end);
+  if (end === 0) return undefined;
+  for (let index = 0; index < end; index++) {
+    if (bytes[index] === 0x00 || bytes[index] === 0x0a || bytes[index] === 0x0d) return undefined;
+  }
+  return bytes.subarray(0, end);
 }
 
 export async function writeKeychainKit(
@@ -265,10 +287,10 @@ export async function writeKeychainKit(
     requireExit(add, "Keychain save");
     verify = await seams.runSecurity(identityArgs(identity, true), undefined, { timeoutMs, stdoutBytes: PHRASE_LIMIT, stderrBytes: STDIO_LIMIT });
     requireExit(verify, "Keychain verification");
-    const actual = stripOneTerminalNewline(verify.stdout);
+    const actual = parseExactlyOneOutputLine(verify.stdout);
     const expected = Buffer.from(canonical, "utf8");
     try {
-      if (!Buffer.from(actual).equals(expected)) throw new Error("Keychain verification mismatch");
+      if (!actual || !Buffer.from(actual.buffer, actual.byteOffset, actual.byteLength).equals(expected)) throw new Error("Keychain verification mismatch");
     } finally { expected.fill(0) }
     return { ...identity, writtenAt: now.toISOString() };
   } finally {
@@ -286,8 +308,7 @@ export async function probeKeychainKit(record: KeychainArtifact, seams: Keychain
     result = await seams.runSecurity(identityArgs(record, false), undefined, { timeoutMs: 5_000, stdoutBytes: STDIO_LIMIT, stderrBytes: STDIO_LIMIT });
     if (result.outcome !== "exit") return "unavailable";
     if (result.code === 0) {
-      const output = Buffer.from(result.stdout).toString("utf8");
-      return output.length > 0 && !output.includes("\0") ? "present" : "unavailable";
+      return parseExactlyOneOutputLine(result.stdout) ? "present" : "unavailable";
     }
     return result.code === 44 ? "missing" : "unavailable";
   } catch {
@@ -303,8 +324,8 @@ export async function readKeychainKit(record: KeychainArtifact, seams: KeychainS
   const result = await seams.runSecurity(identityArgs(record, true), undefined, { timeoutMs: 60_000, stdoutBytes: PHRASE_LIMIT, stderrBytes: STDIO_LIMIT });
   try {
     requireExit(result, "Keychain read");
-    const secret = stripOneTerminalNewline(result.stdout);
-    if (!secret.length || secret.length > PHRASE_LIMIT) throw new Error("Keychain read returned a malformed secret");
+    const secret = parseExactlyOneOutputLine(result.stdout);
+    if (!secret || secret.length > PHRASE_LIMIT) throw new Error("Keychain read returned a malformed secret");
     return Uint8Array.from(secret);
   } finally {
     wipe(result.stdout);

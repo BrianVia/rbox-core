@@ -369,17 +369,21 @@ export async function recoverInWizard(deps: WizardRecoveryDeps = {}): Promise<"e
       writeStderr(`${e.yellow(error instanceof Error ? error.message : String(error))}\n`);
       continue;
     }
+    let enrolled: { accountId: string; deviceId: string };
     try {
-      const enrolled = await enroll(recoveryKey, (deps.now ?? Date.now)(), deps.loadedCredentials);
-      const canonicalPhrase = await rkToPhrase(recoveryKey);
-      await (deps.offerRecoveryKit ?? offerRecoveryKitAfterRecover)(canonicalPhrase, enrolled, { kit: false }, "wizard-recover");
-      return "enrolled";
+      enrolled = await enroll(recoveryKey, (deps.now ?? Date.now)(), deps.loadedCredentials);
     } catch (error) {
       writeStderr(`${e.yellow(error instanceof Error ? error.message : String(error))}\n`);
-      return "parent";
-    } finally {
       recoveryKey.fill(0);
+      return "parent";
     }
+    try {
+      const canonicalPhrase = await rkToPhrase(recoveryKey);
+      await (deps.offerRecoveryKit ?? offerRecoveryKitAfterRecover)(canonicalPhrase, enrolled, { kit: false }, "wizard-recover");
+    } catch (error) {
+      writeStderr(`${e.yellow(`recovery succeeded, but the optional recovery-kit offer failed: ${error instanceof Error ? error.message : String(error)}`)}\n`);
+    } finally { recoveryKey.fill(0) }
+    return "enrolled";
   }
   return "parent";
 }

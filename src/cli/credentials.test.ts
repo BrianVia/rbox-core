@@ -17,7 +17,7 @@ let priorEnv: NodeJS.ProcessEnv;
 let restoreHook: (() => void) | undefined;
 let restoreHeartbeat: (() => void) | undefined;
 const fixedNow = new Date("2026-07-17T12:34:56.789Z");
-const credential = { token: "tok_secret", deviceId: "dev_1", remoteUrl: "https://api.test", accountId: "acct_1" };
+const credential = { token: "tok_secret", deviceId: "dev_1", remoteUrl: "https://api.test", accountId: "acct_0000000000000001" };
 const credentialPath = () => path.join(home, ".rbox", "credentials.json");
 const lockPath = () => path.join(home, ".rbox", "credentials.lock");
 
@@ -100,6 +100,9 @@ test("parser distinguishes malformed versions, future integer versions, and malf
     { v: 1, ...credential, deviceId: 2 },
     { v: 1, ...credential, remoteUrl: "file:///tmp/x" },
     { v: 1, ...credential, accountId: "" },
+    { v: 1, ...credential, accountId: "acct_a" },
+    { v: 1, ...credential, accountId: "acct_A123456789abcdef" },
+    { v: 1, ...credential, accountId: "acct_../../escape" },
   ]) expect(parseCredentialDocument(JSON.stringify(value)).state).toBe("corrupt");
 });
 
@@ -273,16 +276,16 @@ test("valid env override and every invalid auxiliary env value leave corrupt dis
   process.env.RBOX_TOKEN = "env-token";
   process.env.RBOX_DEVICE_ID = "env-device";
   process.env.RBOX_API = "https://env.test";
-  process.env.RBOX_ACCOUNT_ID = "env-account";
+  process.env.RBOX_ACCOUNT_ID = "acct_eeeeeeeeeeeeeeee";
   const valid = await loadCredentials();
   expect(valid.state).toBe("valid");
   if (valid.state === "valid") expect(valid.source).toBe("env");
   expect(await fs.readFile(credentialPath())).toEqual(raw);
 
-  for (const [variable, value] of [["RBOX_DEVICE_ID", ""], ["RBOX_API", "relative"], ["RBOX_ACCOUNT_ID", ""]] as const) {
+  for (const [variable, value] of [["RBOX_DEVICE_ID", ""], ["RBOX_API", "relative"], ["RBOX_ACCOUNT_ID", ""], ["RBOX_ACCOUNT_ID", "acct_a"]] as const) {
     process.env.RBOX_DEVICE_ID = "env-device";
     process.env.RBOX_API = "https://env.test";
-    process.env.RBOX_ACCOUNT_ID = "env-account";
+    process.env.RBOX_ACCOUNT_ID = "acct_eeeeeeeeeeeeeeee";
     process.env[variable] = value;
     const result = await loadCredentials();
     expect(result.state).toBe("invalid-environment");
@@ -381,7 +384,7 @@ test("separate save processes serialize and leave one complete v1 document", asy
   setSystemTime();
   const modulePath = path.join(process.cwd(), "src", "cli", "credentials.ts");
   const spawnSave = (token: string) => Bun.spawn({
-    cmd: [process.execPath, "-e", `import { saveCredentials } from ${JSON.stringify(modulePath)}; await saveCredentials({token:${JSON.stringify(token)},deviceId:"dev",remoteUrl:"https://api.test",accountId:"acct"});`],
+    cmd: [process.execPath, "-e", `import { saveCredentials } from ${JSON.stringify(modulePath)}; await saveCredentials({token:${JSON.stringify(token)},deviceId:"dev",remoteUrl:"https://api.test",accountId:"acct_cccccccccccccccc"});`],
     cwd: process.cwd(),
     env: { ...process.env, HOME: home },
     stdout: "pipe",
@@ -464,7 +467,7 @@ test("separately spawned load and save serialize one corrupt evidence quarantine
     stderr: "pipe",
   });
   const loader = spawn("await c.loadCredentials();");
-  const saver = spawn('await c.saveCredentials({token:"saved",deviceId:"dev",remoteUrl:"https://api.test",accountId:"acct"});');
+  const saver = spawn('await c.saveCredentials({token:"saved",deviceId:"dev",remoteUrl:"https://api.test",accountId:"acct_cccccccccccccccc"});');
   expect(await Promise.all([loader.exited, saver.exited])).toEqual([0, 0]);
   expect(JSON.parse(await fs.readFile(credentialPath(), "utf8")).token).toBe("saved");
   const quarantines = (await fs.readdir(path.dirname(credentialPath()))).filter((name) => name.includes(".corrupt-"));

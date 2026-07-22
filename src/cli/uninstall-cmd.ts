@@ -37,7 +37,7 @@ export async function keystoreBackupAtRisk(removalRoot: string): Promise<boolean
   if (kit.state !== "recognized") return kit.state === "unknown" ? "unknown" : true;
   const [keychain, plaintext] = await Promise.all([
     kit.record.keychain ? probeKeychainKit(kit.record.keychain) : Promise.resolve(undefined),
-    Promise.all(kit.record.plaintextArtifacts.map(recoveryKitFileState)),
+    Promise.all(kit.record.plaintextArtifacts.map((artifact) => recoveryKitFileState(creds.accountId!, artifact))),
   ]);
   let canonicalRoot: string;
   try { canonicalRoot = await fs.realpath(removalRoot) } catch { canonicalRoot = path.resolve(removalRoot) }

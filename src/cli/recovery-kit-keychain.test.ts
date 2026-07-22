@@ -5,6 +5,7 @@ import {
   probeKeychainKit,
   readKeychainKit,
   resolveLoginKeychain,
+  runSecurityProcess,
   writeKeychainKit,
   type KeychainSeams,
   type SecurityResult,
@@ -50,6 +51,12 @@ describe("macOS recovery Keychain", () => {
     expect(calls).toEqual([["login-keychain", "-d", "user"]]);
   });
 
+  test("resolver rejects surrounding blank lines and multiline output", async () => {
+    for (const stdout of [`\n"${KEYCHAIN}"\n`, `"${KEYCHAIN}"\n\n`, `"${KEYCHAIN}"\nextra\n`]) {
+      await expect(resolveLoginKeychain(seams(async () => result({ stdout: Buffer.from(stdout) })))).rejects.toThrow(/invalid path/);
+    }
+  });
+
   test("add uses stdin only and verification propagates the exact identity", async () => {
     const calls: Array<{ args: readonly string[]; stdin?: Uint8Array }> = [];
     const fake = seams(async (args, stdin) => {
@@ -83,9 +90,37 @@ describe("macOS recovery Keychain", () => {
     }
   });
 
+  test("probe and secret read require exactly one nonempty output line", async () => {
+    for (const stdout of ["\nattributes\n", "attributes\n\n", "one\ntwo\n", "\n", "bad\0line\n"]) {
+      expect(await probeKeychainKit(artifact, seams(async () => result({ stdout: Buffer.from(stdout) })))).toBe("unavailable");
+    }
+    for (const stdout of [`\n${PHRASE}\n`, `${PHRASE}\n\n`, `${PHRASE}\nextra\n`, "\n"]) {
+      await expect(readKeychainKit(artifact, seams(async () => result({ stdout: Buffer.from(stdout) })))).rejects.toThrow(/malformed secret/);
+    }
+  });
+
   test("read returns secret bytes without one terminal CRLF", async () => {
     const bytes = await readKeychainKit(artifact, seams(async () => result({ stdout: Buffer.from(`${PHRASE}\r\n`) })));
     expect(Buffer.from(bytes).toString("utf8")).toBe(PHRASE);
     bytes.fill(0);
+  });
+
+  test("subprocess chunk copies are wiped on successful and failed exits", async () => {
+    for (const exitCode of [0, 1]) {
+      const copies: Uint8Array[] = [];
+      const script = `process.stdout.write("secret-out");process.stderr.write("secret-err");process.exit(${exitCode})`;
+      const completed = await runSecurityProcess(
+        ["-e", script],
+        undefined,
+        { timeoutMs: 5_000, stdoutBytes: 1024, stderrBytes: 1024 },
+        { executable: process.execPath, onChunkCopy: (copy) => copies.push(copy) }
+      );
+      expect(completed.outcome).toBe("exit");
+      expect(completed.code).toBe(exitCode);
+      expect(copies.length).toBeGreaterThan(0);
+      expect(copies.every((copy) => copy.every((byte) => byte === 0))).toBe(true);
+      completed.stdout.fill(0);
+      completed.stderr.fill(0);
+    }
   });
 });

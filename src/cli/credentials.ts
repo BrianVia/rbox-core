@@ -6,6 +6,7 @@ import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory, w
 import { systemLockIdentity } from "../engine/git/lockfile.js";
 import { homeDir } from "./rbox-paths.js";
 import { GENESIS_ACCOUNT_ID_RE, invalidateGenesisEnrollmentWitness } from "./genesis-durable.js";
+import { isAccountId } from "./account-id.js";
 
 /** The whitelisted, versioned credential document written to disk. */
 export interface CredentialsV1 {
@@ -164,8 +165,8 @@ export function parseCredentialDocument(raw: string | Uint8Array): ParsedCredent
   if (!nonempty(value.token)) return { state: "corrupt", detail: "credential token is missing or empty" };
   if (!nonempty(value.deviceId)) return { state: "corrupt", detail: "credential deviceId is missing or empty" };
   if (!validRemote(value.remoteUrl)) return { state: "corrupt", detail: "credential remoteUrl must be an absolute HTTP(S) URL" };
-  if (value.accountId !== undefined && !nonempty(value.accountId)) {
-    return { state: "corrupt", detail: "credential accountId must be nonempty when present" };
+  if (value.accountId !== undefined && !isAccountId(value.accountId)) {
+    return { state: "corrupt", detail: "credential accountId must match acct_<16 lowercase hex> when present" };
   }
 
   const known = new Set(["v", "token", "deviceId", "remoteUrl", "accountId"]);
@@ -197,8 +198,8 @@ function envResult(): CredentialLoadResult | undefined {
   if (explicit("RBOX_API") && !validRemote(remoteUrl)) {
     return { state: "invalid-environment", variable: "RBOX_API", detail: "RBOX_API must be an absolute HTTP(S) URL" };
   }
-  if (explicit("RBOX_ACCOUNT_ID") && !nonempty(accountId)) {
-    return { state: "invalid-environment", variable: "RBOX_ACCOUNT_ID", detail: "RBOX_ACCOUNT_ID must be nonempty" };
+  if (explicit("RBOX_ACCOUNT_ID") && !isAccountId(accountId)) {
+    return { state: "invalid-environment", variable: "RBOX_ACCOUNT_ID", detail: "RBOX_ACCOUNT_ID must match acct_<16 lowercase hex>" };
   }
   return {
     state: "valid",

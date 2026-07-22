@@ -6,6 +6,7 @@
  * classifier, witness, or quarantine implementation.
  */
 import { isDeepStrictEqual } from "node:util";
+import { acquireGenesisLock } from "./e2ee-keystore.js";
 
 export const RECOVERY_KIT_SERVICE = "rbox recovery phrase" as const;
 
@@ -54,6 +55,26 @@ export interface GenesisAttemptRef {
   requestSha256: string;
 }
 
+/** Structural projection of design 180's complete enrollment classifier. The
+ * payload-bearing variants deliberately expose only the fields design 179
+ * consumes so the phase-2 integration remains an import/adapter swap. */
+export type GenesisClassification =
+  | { kind: "pristine" }
+  | { kind: "restart-prepublication"; marker: unknown }
+  | { kind: "resume-attempt"; journal: GenesisAttemptRef }
+  | { kind: "cleanup-resume"; journal: GenesisAttemptRef }
+  | { kind: "committed-this-attempt"; journal: GenesisAttemptRef; phrase: string; intent?: CompletionIntent; witness?: CompletionIntentRetargetWitness }
+  | { kind: "competing-genesis"; journal: GenesisAttemptRef }
+  | { kind: "enrolled"; dto: unknown }
+  | { kind: "legacy-orphan" }
+  | { kind: "repaired-legacy"; repairId: string }
+  | { kind: "quarantine-resume"; repairId: string }
+  | { kind: "repair-ready"; repairId: string }
+  | { kind: "integrity-failure"; reason: string };
+
+export type CommittedGenesisClassification = Extract<GenesisClassification, { kind: "committed-this-attempt" }>;
+export type PendingGenesisClassification = "none" | GenesisClassification;
+
 export interface ValidatedStagedRecoveryKey extends GenesisAttemptRef {
   /** Authenticated bytes from design 180's rk.key.staged. */
   rk: Uint8Array;
@@ -61,20 +82,25 @@ export interface ValidatedStagedRecoveryKey extends GenesisAttemptRef {
 }
 
 export interface GenesisSeam {
+  /** TODO(180-integration): acquire design 180's account-scoped lock. */
+  withAccountGenesisLock<T>(accountId: string, operation: () => Promise<T>): Promise<T>;
+  /** TODO(180-integration): return the uncollapsed shared-classifier result. */
+  pendingGenesis(accountId: string): Promise<PendingGenesisClassification>;
+  /** TODO(180-integration): drive the classifier's exact resume/cleanup path.
+   * Success means the journal has been durably retired. */
+  resumeOrCleanupPendingGenesis(accountId: string, classification: GenesisClassification): Promise<void>;
   /** TODO(180-integration): strict staged-RK load + journal/envelope validation. */
-  readValidatedStagedRecoveryKey(accountId: string): Promise<ValidatedStagedRecoveryKey | undefined>;
+  readValidatedStagedRecoveryKey(classification: CommittedGenesisClassification): Promise<ValidatedStagedRecoveryKey | undefined>;
   /** TODO(180-integration): strict canonical-intent and witness load. */
-  readAndReconcileCompletionIntent(attempt: GenesisAttemptRef): Promise<{ state: "absent" } | { state: "intent"; intent: CompletionIntent }>;
+  readAndReconcileCompletionIntent(classification: CommittedGenesisClassification): Promise<{ state: "absent" } | { state: "intent"; intent: CompletionIntent }>;
   /** TODO(180-integration): hardened first publication owned by design 180. */
-  writeCompletionIntent(intent: CompletionIntent): Promise<void>;
+  writeCompletionIntent(classification: CommittedGenesisClassification, intent: CompletionIntent): Promise<void>;
   /** TODO(180-integration): witness-first Keychain-to-file RETARGET. */
-  retargetKeychainIntent(oldIntent: Extract<CompletionIntent, { mode: "keychain" }>, newIntent: Extract<CompletionIntent, { mode: "kit-path" }>): Promise<Extract<CompletionIntent, { mode: "keychain" | "kit-path" }>>;
-  /** TODO(180-integration): strict pending projection; invalid state rejects. */
-  pendingGenesis(accountId: string): Promise<"none" | "unreleased-recovery-kit-hold" | "cleanup">;
+  retargetKeychainIntent(classification: CommittedGenesisClassification, oldIntent: Extract<CompletionIntent, { mode: "keychain" }>, newIntent: Extract<CompletionIntent, { mode: "kit-path" }>): Promise<Extract<CompletionIntent, { mode: "keychain" | "kit-path" }>>;
   /** TODO(180-integration): writes artifact-committed and owns resulting cleanup. */
-  commitVerifiedRecoveryKitArtifact(attempt: GenesisAttemptRef): Promise<void>;
+  commitVerifiedRecoveryKitArtifact(classification: CommittedGenesisClassification): Promise<void>;
   /** TODO(180-integration): writes phrase-delivered and owns resulting cleanup. */
-  commitDeliveredRecoveryPhrase(attempt: GenesisAttemptRef): Promise<void>;
+  commitDeliveredRecoveryPhrase(classification: CommittedGenesisClassification): Promise<void>;
   /** TODO(180-integration): derives the exact three-entry manifest from its journal. */
   quarantineAbandonedAttempt(attempt: GenesisAttemptRef): Promise<void>;
 }
@@ -85,11 +111,16 @@ const unavailable = async (): Promise<never> => {
 
 /** Fail-closed placeholder until design 180 is merged. */
 export const pre180GenesisSeam: GenesisSeam = {
+  withAccountGenesisLock: async (accountId, operation) => {
+    const release = acquireGenesisLock(accountId);
+    try { return await operation() } finally { release() }
+  },
+  pendingGenesis: async () => "none",
+  resumeOrCleanupPendingGenesis: unavailable,
   readValidatedStagedRecoveryKey: async () => undefined,
   readAndReconcileCompletionIntent: async () => ({ state: "absent" }),
   writeCompletionIntent: unavailable,
   retargetKeychainIntent: unavailable,
-  pendingGenesis: async () => "none",
   commitVerifiedRecoveryKitArtifact: unavailable,
   commitDeliveredRecoveryPhrase: unavailable,
   quarantineAbandonedAttempt: unavailable,
@@ -112,22 +143,23 @@ export function installGenesisSeamForTests(seam: GenesisSeam): () => void {
  * local offer cannot suppress continuation of the same unresolved journal. */
 export function shouldPresentGenesisCompletion(
   offerClaimed: boolean,
-  pending: "none" | "unreleased-recovery-kit-hold" | "cleanup",
+  pending: PendingGenesisClassification,
   state: { state: "absent" } | { state: "intent"; intent: CompletionIntent }
 ): boolean {
-  if (pending !== "unreleased-recovery-kit-hold") return pending === "none" && !offerClaimed;
-  return state.state === "absent";
+  if (pending === "none") return !offerClaimed;
+  return pending.kind === "committed-this-attempt" && state.state === "absent";
 }
 
 /** The failing RETARGET invocation is forbidden from writing the fallback.
  * Only the exact durable new survivor returned by design 180 enables it. */
 export async function retargetThenWriteFallback(
   seam: GenesisSeam,
+  classification: CommittedGenesisClassification,
   oldIntent: Extract<CompletionIntent, { mode: "keychain" }>,
   newIntent: Extract<CompletionIntent, { mode: "kit-path" }>,
   writeFallback: (absolutePath: string) => Promise<void>
 ): Promise<"keychain-retained" | "file-written"> {
-  const survivor = await seam.retargetKeychainIntent(oldIntent, newIntent);
+  const survivor = await seam.retargetKeychainIntent(classification, oldIntent, newIntent);
   if (isDeepStrictEqual(survivor, oldIntent)) return "keychain-retained";
   if (!isDeepStrictEqual(survivor, newIntent)) throw new Error("RETARGET returned an unexpected completion intent");
   await writeFallback(newIntent.path);
