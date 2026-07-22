@@ -54,11 +54,7 @@ export function assertGenesisSingleDatabase(env: Env, accountId: string): void {
   if (dbFor(env, accountId) !== dirDb(env)) throw new Error("atomic genesis requires dbFor(env, accountId) === dirDb(env)");
 }
 
-/** One account-row/count observation: a repair update cannot appear as claim absence. */
-export async function readGenesisObservation(env: Env, accountId: string): Promise<GenesisObservationRow> {
-  assertGenesisSingleDatabase(env, accountId);
-  const row = await dbFor(env, accountId).prepare(
-    `SELECT
+export const GENESIS_OBSERVATION_SQL = `SELECT
        EXISTS(SELECT 1 FROM account_keys WHERE account_id = ?1) AS claimPresent,
        (SELECT recovery_wrap FROM account_keys WHERE account_id = ?1) AS recoveryWrap,
        (SELECT recovery_wrap_id FROM account_keys WHERE account_id = ?1) AS recoveryWrapId,
@@ -71,23 +67,22 @@ export async function readGenesisObservation(env: Env, accountId: string): Promi
        (SELECT COUNT(*) FROM device_keys WHERE account_id = ?1) AS devices,
        (SELECT COUNT(*) FROM workspaces WHERE account_id = ?1) AS workspaces,
        (SELECT COUNT(*) FROM workspace_keys WHERE account_id = ?1) AS workspaceKeys,
-       (SELECT COUNT(*) FROM pairing_tokens WHERE account_id = ?1 AND (mk_wrap IS NOT NULL OR admission_grant IS NOT NULL)) AS e2eePairingTokens`
-  ).bind(accountId).first<Record<string, unknown>>();
+       (SELECT COUNT(*) FROM pairing_tokens WHERE account_id = ?1 AND (mk_wrap IS NOT NULL OR admission_grant IS NOT NULL)) AS e2eePairingTokens`;
+
+export function genesisObservationFromRow(row: Record<string, unknown> | undefined): GenesisObservationRow {
   return {
-    claimPresent: count(row?.claimPresent),
-    recoveryWrap: row?.recoveryWrap ?? null,
-    recoveryWrapId: row?.recoveryWrapId ?? null,
-    claimCreatedAt: row?.claimCreatedAt ?? null,
-    genesisDeviceId: row?.genesisDeviceId ?? null,
-    repairId: row?.repairId ?? null,
-    repairedAt: row?.repairedAt ?? null,
-    rosters: count(row?.rosters),
-    keyStates: count(row?.keyStates),
-    devices: count(row?.devices),
-    workspaces: count(row?.workspaces),
-    workspaceKeys: count(row?.workspaceKeys),
-    e2eePairingTokens: count(row?.e2eePairingTokens),
+    claimPresent: count(row?.claimPresent), recoveryWrap: row?.recoveryWrap ?? null, recoveryWrapId: row?.recoveryWrapId ?? null,
+    claimCreatedAt: row?.claimCreatedAt ?? null, genesisDeviceId: row?.genesisDeviceId ?? null, repairId: row?.repairId ?? null,
+    repairedAt: row?.repairedAt ?? null, rosters: count(row?.rosters), keyStates: count(row?.keyStates), devices: count(row?.devices),
+    workspaces: count(row?.workspaces), workspaceKeys: count(row?.workspaceKeys), e2eePairingTokens: count(row?.e2eePairingTokens),
   };
+}
+
+/** One account-row/count observation: a repair update cannot appear as claim absence. */
+export async function readGenesisObservation(env: Env, accountId: string): Promise<GenesisObservationRow> {
+  assertGenesisSingleDatabase(env, accountId);
+  const row = await dbFor(env, accountId).prepare(GENESIS_OBSERVATION_SQL).bind(accountId).first<Record<string, unknown>>();
+  return genesisObservationFromRow(row ?? undefined);
 }
 
 export function presenceOf(row: GenesisObservationRow): GenesisPresence {
@@ -302,6 +297,12 @@ export async function genesisRepair(env: Env, pathAccountId: string, body: Genes
       `UPDATE account_keys SET recovery_wrap = ?3, recovery_wrap_id = ?3, repair_id = ?2, repaired_at = ?4
        WHERE account_id = ?1 AND ${proofSql}
        AND EXISTS (SELECT 1 FROM genesis_repair_audit WHERE audit_id = ?2 AND account_id = ?1 AND outcome = 'attempted')
+       AND CAST(recovery_wrap AS BLOB) = (SELECT original_recovery_wrap FROM genesis_repair_audit WHERE audit_id=?2)
+       AND CAST(recovery_wrap_id AS BLOB) = (SELECT original_recovery_wrap_id FROM genesis_repair_audit WHERE audit_id=?2)
+       AND created_at IS (SELECT original_created_at FROM genesis_repair_audit WHERE audit_id=?2)
+       AND genesis_device_id IS (SELECT original_genesis_device_id FROM genesis_repair_audit WHERE audit_id=?2)
+       AND repair_id IS (SELECT original_repair_id FROM genesis_repair_audit WHERE audit_id=?2)
+       AND repaired_at IS (SELECT original_repaired_at FROM genesis_repair_audit WHERE audit_id=?2)
        AND NOT EXISTS (SELECT 1 FROM genesis_repair_audit WHERE account_id = ?1 AND outcome = 'attempted' AND audit_id <> ?2)
        AND NOT EXISTS (SELECT 1 FROM account_deletions WHERE account_id = ?1 AND status IN ('purging','done'))`
     ).bind(accountId, id, GENESIS_TOMBSTONE_SENTINEL, now),
@@ -318,7 +319,7 @@ export async function genesisRepair(env: Env, pathAccountId: string, body: Genes
   const post = classifyRepairObservation(await readGenesisObservation(env, accountId)).proof;
   const observation = { observational: true, claimShape: post.claimShape, dependents: post.dependents, ownsWorkspace: post.ownsWorkspace };
   await completeAudit(env, accountId, id, "refused", vector, observation);
-  if (competingAttempt) {
+  if (competingAttempt || post.eligible) {
     await reconcileGenesisRepairAudits(env, accountId);
     if (auditRetry >= 8) return json({ ok: false, dryRun: false, classification: "repair_audit_busy", result: "refused" }, 503);
     return genesisRepair(env, pathAccountId, body, auditRetry + 1);

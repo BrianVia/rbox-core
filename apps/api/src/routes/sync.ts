@@ -29,13 +29,11 @@ export async function syncRoutes({ req, env, url, seg }: RouteCtx, p: Principal)
     if (action === "manifests" || action === "latest" || action === "connect" || action === "commits" || action === "receipts") {
       const stub = env.WORKSPACE_SYNC.get(env.WORKSPACE_SYNC.idFromName(`${ws}/${proj}`));
       if (write) {
-        const fence = await tombstoneFenceResponse(env, p.accountId);
-        if (fence) return fence;
         // Commit: forward with the authenticated account (DO does account-scoped
         // blob-existence). Clean header set by the Worker (overrides any client value).
         const headers = new Headers(req.headers);
         headers.set("x-rbox-account", p.accountId);
-        if (action === "receipts") return stub.fetch(new Request(req, { headers }));
+        if (action === "receipts") {const fence=await tombstoneFenceResponse(env,p.accountId);if(fence)return fence;return stub.fetch(new Request(req, { headers }));}
         // C4: also forward the account's CURRENT key epoch (MAX(account_epoch), 0 if
         // none); the DO asserts the commit's accountEpoch == this inside the txn.
         const epochRow = await dbFor(env, p.accountId)
@@ -43,6 +41,8 @@ export async function syncRoutes({ req, env, url, seg }: RouteCtx, p: Principal)
           .bind(p.accountId)
           .first<{ epoch: number | null }>();
         headers.set("x-rbox-account-epoch", String(epochRow?.epoch ?? 0));
+        const fence = await tombstoneFenceResponse(env, p.accountId);
+        if (fence) return fence;
         return stub.fetch(new Request(req, { headers }));
       }
       const res = await stub.fetch(req);
