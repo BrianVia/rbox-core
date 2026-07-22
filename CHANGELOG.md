@@ -6,11 +6,27 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.7.20] — 2026-07-22 — "resolutions land when you confirm them"
+
 ### Changed
 - Confirmed `keep-mine` now waits for the current sync cycle and publishes in
-  the foreground under the same workspace lock. Local intents written by
+  the foreground under the same workspace lock — no more waiting for a future
+  sync to act on your decision, and no more "snapshot changed, confirm again"
+  loops from ordinary repo activity while you waited. A crashed confirm
+  reconciles safely on the next push or pull. Local intents written by
   rbox <=1.7.18 are ignored and dropped on the next state save; restart any
   still-running older daemon before confirming with the new CLI.
+- Replica machines no longer re-publish unchanged synced state in a loop: a
+  carried remote section now compares as unchanged. (This loop could flood
+  the workspace with sequences and starve the machine you were actually
+  working on.)
+
+### Added
+- Daemon modes are durable: `rbox start` resumes the mode the daemon last
+  ran in (pull-only stays pull-only across restarts and upgrades), an
+  explicit `--read-write` flag is the inverse of `--pull-only`, and a mode
+  change against a running daemon asks for a restart instead of silently
+  recording a lie.
 
 ## [1.7.19] — 2026-07-21 — "status tells you what's actually wrong"
 
