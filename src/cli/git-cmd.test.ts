@@ -176,6 +176,35 @@ function deps(lines: string[], extra: Parameters<typeof gitResolveCmd>[4] = {}) 
   };
 }
 
+class ManualProgressScheduler {
+  private nextId = 0;
+  private announceScheduled!: () => void;
+  readonly active = new Map<number, () => void>();
+  readonly delays: number[] = [];
+  readonly scheduled: Promise<void>;
+  cleared = 0;
+
+  constructor() {
+    this.scheduled = new Promise<void>((resolve) => { this.announceScheduled = resolve; });
+  }
+
+  readonly setInterval = (fn: () => void, ms: number): number => {
+    const id = ++this.nextId;
+    this.active.set(id, fn);
+    this.delays.push(ms);
+    this.announceScheduled();
+    return id;
+  };
+
+  readonly clearInterval = (handle: unknown): void => {
+    if (this.active.delete(handle as number)) this.cleared++;
+  };
+
+  fireActive(): void {
+    for (const fn of [...this.active.values()]) fn();
+  }
+}
+
 async function show(lines: string[]): Promise<GitResolveShow> {
   expect(await gitResolveCmd(root, receiver, "show-me", { json: true }, deps(lines))).toBe(0);
   return JSON.parse(lines.at(-1)!) as GitResolveShow;
@@ -326,27 +355,41 @@ test("show-me JSON is exhaustive while only human local-only presentation is cap
 test("show-me heartbeat timers are cleared in finally", async () => {
   await fixture();
   const stderr: string[] = [];
-  expect(await gitResolveCmd(root, receiver, "show-me", { json: true }, deps([], {
-    stderr: (line) => stderr.push(line), progressIntervalMs: 1,
-  }))).toBe(0);
+  const scheduler = new ManualProgressScheduler();
+  const resolving = gitResolveCmd(root, receiver, "show-me", { json: true }, deps([], {
+    stderr: (line) => stderr.push(line), progressScheduler: scheduler,
+  }));
+  await scheduler.scheduled;
+  scheduler.fireActive();
+  expect(await resolving).toBe(0);
   expect(stderr.some((line) => /^show-me: still working \(\d+s\)$/.test(line))).toBe(true);
+  expect(scheduler.delays.every((ms) => ms === 10_000)).toBe(true);
+  expect(scheduler.cleared).toBe(scheduler.delays.length);
+  expect(scheduler.active.size).toBe(0);
   const atReturn = stderr.length;
-  await new Promise((resolve) => setTimeout(resolve, 10));
+  scheduler.fireActive();
   expect(stderr).toHaveLength(atReturn);
 });
 
 test("show-me heartbeat timers are cleared when a phase transition throws", async () => {
   await fixture();
   const stderr: string[] = [];
-  expect(await gitResolveCmd(root, receiver, "show-me", { json: true }, deps([], {
-    progressIntervalMs: 1,
+  const scheduler = new ManualProgressScheduler();
+  const resolving = gitResolveCmd(root, receiver, "show-me", { json: true }, deps([], {
+    progressScheduler: scheduler,
     stderr: (line) => {
       if (line.startsWith("show-me: proving")) throw new Error("progress sink failed");
       stderr.push(line);
     },
-  }))).toBe(1);
+  }));
+  await scheduler.scheduled;
+  scheduler.fireActive();
+  expect(await resolving).toBe(1);
+  expect(scheduler.delays.length).toBeGreaterThan(0);
+  expect(scheduler.cleared).toBe(scheduler.delays.length);
+  expect(scheduler.active.size).toBe(0);
   const atReturn = stderr.length;
-  await new Promise((resolve) => setTimeout(resolve, 10));
+  scheduler.fireActive();
   expect(stderr).toHaveLength(atReturn);
 });
 

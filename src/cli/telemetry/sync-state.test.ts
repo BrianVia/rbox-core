@@ -91,13 +91,13 @@ test("reporter gates unchanged ticks despite advancing age and still sends a hea
       postJson: async () => { calls++; return new Response('{"accepted":1,"dropped":0}', { status: 202 }); },
     }, () => {}, () => now);
     reporter.afterSyncTick(state);
-    await Bun.sleep(10);
+    await reporter.flushForTests();
     now += 5_000;
     reporter.afterSyncTick(state);
-    await Bun.sleep(10);
+    await reporter.flushForTests();
     expect(calls).toBe(1);
     reporter.heartbeat(state);
-    await Bun.sleep(10);
+    await reporter.flushForTests();
     expect(calls).toBe(2);
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
@@ -112,7 +112,7 @@ test("reporter kill switch performs no network call", async () => {
       postJson: async () => { calls++; return new Response(null, { status: 202 }); },
     });
     reporter.afterSyncTick(state);
-    await Bun.sleep(10);
+    await reporter.flushForTests();
     expect(calls).toBe(0);
   } finally {
     delete process.env.RBOX_TELEMETRY;

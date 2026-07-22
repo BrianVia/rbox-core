@@ -113,8 +113,13 @@ describe("retryTransient — bounded retry with idempotency discipline", () => {
   test("abort mid-backoff aborts the retry (cancellation, not a NetworkError)", async () => {
     const ctrl = new AbortController();
     let calls = 0;
-    // A sleep that lets us fire the abort WHILE the backoff is pending.
-    const controllableSleep = () => new Promise<void>((resolve) => setTimeout(resolve, 10_000));
+    let announceSleep!: () => void;
+    const sleepEntered = new Promise<void>((resolve) => { announceSleep = resolve; });
+    // Stay pending without leaving a real timer behind after abort wins the race.
+    const controllableSleep = () => {
+      announceSleep();
+      return new Promise<void>(() => {});
+    };
     const p = retryTransient(
       async () => {
         calls++;
@@ -122,8 +127,7 @@ describe("retryTransient — bounded retry with idempotency discipline", () => {
       },
       { retries: 5, sleep: controllableSleep, signal: ctrl.signal }
     ).catch((e) => e);
-    // Let attempt 0 fail and enter the backoff, then cancel.
-    await Promise.resolve();
+    await sleepEntered;
     ctrl.abort();
     const err = await p;
     expect(err).toBeInstanceOf(DOMException);

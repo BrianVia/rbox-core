@@ -306,6 +306,9 @@ opts: {
     afterHeldSkipPrepass?: (relPath: string) => void | Promise<void>;
     /** Test seam after the persisted classifier but before attempt completion. */
     afterHeldClassification?: (relPath: string) => void | Promise<void>;
+    /** Shared logical time for held-attempt tests; omitted production call sites
+     * retain the helpers' individual wall-clock reads. */
+    heldNow?: () => number;
     warningSink?: (message: string) => void;
   } = {}
 ): Promise<GitPullOutcome> {
@@ -1155,6 +1158,7 @@ opts: {
         return { result: "deferred", commonDirGroup };
       }
       await opts.afterHeldSkipPrepass?.(rel);
+      const heldNowMs = opts.heldNow?.();
       const effectivePartial = currentPartial(rel);
       const priorAttempt = pend && !standingPInvalidatedAttempt ? records[rel]?.attempt : undefined;
       const priorObservation = priorAttempt
@@ -1172,8 +1176,12 @@ opts: {
           })
         : undefined;
       const priorInputsMatch = priorAttempt !== undefined && priorObservation !== undefined
-        && heldAttemptMatches(priorAttempt, priorObservation);
-      const priorFloorElapsed = priorAttempt !== undefined && heldAttemptFloorElapsed(priorAttempt);
+        && (heldNowMs === undefined
+          ? heldAttemptMatches(priorAttempt, priorObservation)
+          : heldAttemptMatches(priorAttempt, priorObservation, heldNowMs));
+      const priorFloorElapsed = priorAttempt !== undefined && (heldNowMs === undefined
+        ? heldAttemptFloorElapsed(priorAttempt)
+        : heldAttemptFloorElapsed(priorAttempt, heldNowMs));
       const standingApply = currentDeferral(rel, "apply");
       if (gitHeldSkipEnabled() && pend && priorAttempt && priorInputsMatch && !priorFloorElapsed
         && heldBlockersAllowSkip(priorAttempt.blockers) && standingApply) {
@@ -1220,7 +1228,9 @@ opts: {
         if (priorFloorElapsed && priorInputsMatch && priorAttempt && !sameHeldOutcome(priorAttempt.blockers, merged)) {
           glog(`git-sync WARNING ${rel}: held-skip fingerprint miss`);
         }
-        attempt[rel] = createHeldAttempt(observed, merged);
+        attempt[rel] = heldNowMs === undefined
+          ? createHeldAttempt(observed, merged)
+          : createHeldAttempt(observed, merged, new Date(heldNowMs).toISOString());
       };
       const proofFor = (progress: FollowProgress, checkoutComplete: boolean): RepoBaseProof => {
         const branches: RepoBaseLockedProof["branches"] = { ...(progress.branchLockedProofs ?? {}) };

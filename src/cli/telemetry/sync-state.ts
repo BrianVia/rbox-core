@@ -58,6 +58,10 @@ export class SyncStateReporter {
   afterSyncTick(state: LocalSyncState): void { this.enqueue(state, false); }
   heartbeat(state: LocalSyncState): void { this.enqueue(state, true); }
 
+  /** Await all reports enqueued so far. Tests use this instead of guessing when
+   *  the deliberately fire-and-forget daemon path has drained. */
+  flushForTests(): Promise<void> { return this.chain; }
+
   private enqueue(state: LocalSyncState, force: boolean): void {
     if (!telemetryEnabled()) return;
     this.chain = this.chain.then(() => this.send(state, force)).catch(() => {});

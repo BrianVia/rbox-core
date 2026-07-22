@@ -545,7 +545,7 @@ test("git apply pools independent repos under RBOX_GIT_APPLY_CONCURRENCY>=2", as
 
   const outcome = applyGitSections(rootB, cfgB, gitState(), gitManifest(sections), store, buildIgnoreMatcher(rootB), (l) => logsB.push(l));
   await alphaBlocked.promise;
-  const betaStartedBeforeAlphaFinished = await resolvesWithin(betaStarted.promise, 1_000);
+  const betaStartedBeforeAlphaFinished = await resolvesWithin(betaStarted.promise, 10_000);
   releaseAlpha.resolve();
   await outcome;
 

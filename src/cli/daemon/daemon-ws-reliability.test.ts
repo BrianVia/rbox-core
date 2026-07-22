@@ -5,7 +5,7 @@ import path from "node:path";
 import { HashCache, scanManifest, type BlobStore, type FileEntry, type Manifest } from "../../engine/index.js";
 import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
 import type { SyncState, WorkspaceConfig } from "../config.js";
-import { reconnectDelayMs, RboxDaemon } from "../daemon.js";
+import { reconnectDelayMs, RboxDaemon, type CursorClock } from "../daemon.js";
 import type { CommitResult, SyncRemote } from "../remote.js";
 import type { TelemetryRecorder } from "../telemetry/queue.js";
 import type { WsHealthSample } from "../telemetry/contract.js";
@@ -41,7 +41,7 @@ interface DaemonInternals {
   pendingCatchUpGeneration?: number;
   wsPongDeadlineTimer?: ReturnType<typeof setTimeout>;
   backstopTimer?: ReturnType<typeof setTimeout>;
-  cursorTimer?: ReturnType<typeof setTimeout>;
+  cursorTimer?: unknown;
   cursorEpoch: number;
   cursorAbortController?: AbortController;
   wsGeneration: number;
@@ -148,6 +148,8 @@ afterEach(async () => {
 async function makeDaemon(remote: MiniRemote = new MiniRemote(), opts: {
   now?: () => number;
   monotonicNow?: () => number;
+  cursorClock?: CursorClock;
+  cursorRandom?: () => number;
   log?: (line: string) => void;
 } = {}): Promise<DaemonInternals> {
   const cfg: WorkspaceConfig = {
@@ -169,6 +171,41 @@ async function makeDaemon(remote: MiniRemote = new MiniRemote(), opts: {
 function fakeWs(close = () => {}, send = (_message: string) => {}): WebSocket {
   return { readyState: WebSocket.OPEN, send, close } as unknown as WebSocket;
 }
+
+class ManualCursorClock implements CursorClock {
+  nowMs = 0;
+  private nextHandle = 1;
+  private readonly timers = new Map<number, { at: number; fn: () => void }>();
+
+  setTimeout(fn: () => void, ms: number): number {
+    const handle = this.nextHandle++;
+    this.timers.set(handle, { at: this.nowMs + ms, fn });
+    return handle;
+  }
+
+  clearTimeout(handle: unknown): void {
+    this.timers.delete(handle as number);
+  }
+
+  advance(ms: number): void {
+    const target = this.nowMs + ms;
+    for (;;) {
+      let next: { handle: number; at: number; fn: () => void } | undefined;
+      for (const [handle, timer] of this.timers) {
+        if (timer.at > target) continue;
+        if (!next || timer.at < next.at || (timer.at === next.at && handle < next.handle)) {
+          next = { handle, ...timer };
+        }
+      }
+      if (!next) break;
+      this.nowMs = next.at;
+      this.timers.delete(next.handle);
+      next.fn();
+    }
+    this.nowMs = target;
+  }
+}
+
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 // Poll until a condition holds rather than sleeping a fixed interval and asserting
 // an exact count — the cursor timer fires at cadence ±25% jitter + event-loop
@@ -191,7 +228,7 @@ test("pong deadline closes a silent socket and counts the half-open", async () =
   daemon.ws = ws;
   daemon.scheduleReconnect = () => {};
   daemon.markWsOpen(ws);
-  await sleep(100);
+  await waitUntil(() => closes === 1);
   expect(closes).toBe(1);
   expect(daemon.wsHalfOpenDetected).toBe(1);
 });
@@ -254,7 +291,8 @@ test("backstop pulls and reschedules itself", async () => {
   process.env.RBOX_DAEMON_WS_PONG_DEADLINE_MS = "0";
   const daemon = await makeDaemon();
   daemon.startBackstop();
-  await sleep(90);
+  await waitUntil(() => daemon.wsBackstopPulls >= 1);
+  await daemon.pumpRun;
   expect(daemon.wsBackstopPulls).toBeGreaterThanOrEqual(1);
   expect(daemon.backstopAppliedPulls).toBe(0); // every tick was a no-op pull
   expect(daemon.backstopTimer).toBeDefined();
@@ -352,19 +390,17 @@ test("reliability master switch disables deadline, backstop, and notify token", 
 
 test("a missed committed frame is recovered by cursor before the backstop and credited once", async () => {
   process.env.RBOX_DAEMON_WS_CURSOR_CHECK_MS = "30";
-  process.env.RBOX_DAEMON_POLL_BACKSTOP_MS = "1000";
+  process.env.RBOX_DAEMON_POLL_BACKSTOP_MS = "10000";
   process.env.RBOX_DAEMON_WS_PONG_DEADLINE_MS = "0";
   const remote = new MiniRemote();
   remote.injectCommit([await remote.seedEntry("cursor.txt", "recovered")]);
-  const daemon = await makeDaemon(remote);
+  const cursorClock = new ManualCursorClock();
+  const daemon = await makeDaemon(remote, { cursorClock, cursorRandom: () => 0 });
   const sent: string[] = [];
-  const startedAt = Date.now();
-  let firstCursorAt: number | undefined;
   let ws!: WebSocket;
   ws = fakeWs(() => {}, (message) => {
     sent.push(message);
     if (message === "cursor") {
-      firstCursorAt ??= Date.now();
       queueMicrotask(() => daemon.handleWsMessageData(JSON.stringify({ head: remote.head }), ws));
     }
   });
@@ -372,11 +408,11 @@ test("a missed committed frame is recovered by cursor before the backstop and cr
   daemon.markWsOpen(ws);
   daemon.scheduleNextBackstop();
 
+  cursorClock.advance(23); // 30ms cadence at fixed minimum jitter: round(30 * 0.75)
   await waitUntil(() => daemon.cursorAppliedPulls === 1);
   await daemon.pumpRun;
 
   expect(sent).toContain("cursor");
-  expect(firstCursorAt! - startedAt).toBeLessThan(100);
   expect(await fs.readFile(path.join(root, "cursor.txt"), "utf8")).toBe("recovered");
   expect(daemon.cursorAppliedPulls).toBe(1);
   expect(daemon.notifyAppliedPulls).toBe(0);
@@ -387,20 +423,19 @@ test("a missed committed frame is recovered by cursor before the backstop and cr
 test("live committed frames reset the cursor cadence before it can wake the DO", async () => {
   process.env.RBOX_DAEMON_WS_CURSOR_CHECK_MS = "200";
   process.env.RBOX_DAEMON_WS_PONG_DEADLINE_MS = "0";
-  const daemon = await makeDaemon();
+  const cursorClock = new ManualCursorClock();
+  const daemon = await makeDaemon(new MiniRemote(), { cursorClock, cursorRandom: () => 0 });
   const sent: string[] = [];
   const ws = fakeWs(() => {}, (message) => sent.push(message));
   daemon.ws = ws;
   daemon.markWsOpen(ws);
-  // A committed frame resets the cursor cadence. Deliver them every 40ms — far
-  // below the 200ms cadence (even at its 150ms jittered minimum) — for a span
-  // covering multiple cadences. The cursor timer is reset before it can ever
-  // expire, so no "cursor" frame is sent. This proves suppression by domination
-  // rather than threading a single jitter window (which raced ±25% jitter).
+  // Advance 480 logical milliseconds (>3 minimum-jitter cadences) while each
+  // committed frame replaces the timer after only 40ms. Any uncleared timer
+  // would fire synchronously during advance(), making the exact zero fail.
   for (let i = 0; i < 12; i++) {
     daemon.handleWsMessageData(JSON.stringify({ type: "committed", sequence: i }), ws);
     await daemon.pumpRun;
-    await sleep(40);
+    cursorClock.advance(40);
   }
 
   expect(sent.filter((message) => message === "cursor")).toHaveLength(0);
@@ -408,28 +443,34 @@ test("live committed frames reset the cursor cadence before it can wake the DO",
 
 test("a blackholed cursor is bounded, single-flight, does not cycle the socket, and preserves backstop", async () => {
   process.env.RBOX_DAEMON_WS_CURSOR_CHECK_MS = "30";
-  process.env.RBOX_DAEMON_POLL_BACKSTOP_MS = "40";
+  process.env.RBOX_DAEMON_POLL_BACKSTOP_MS = "10000";
   process.env.RBOX_DAEMON_WS_PONG_DEADLINE_MS = "0";
-  const daemon = await makeDaemon();
-  const sendTimes: number[] = [];
+  const cursorClock = new ManualCursorClock();
+  const daemon = await makeDaemon(new MiniRemote(), { cursorClock, cursorRandom: () => 0 });
+  let cursorSends = 0;
   let closes = 0;
-  const ws = fakeWs(() => closes++, (message) => { if (message === "cursor") sendTimes.push(Date.now()); });
+  const ws = fakeWs(() => closes++, (message) => { if (message === "cursor") cursorSends++; });
   daemon.ws = ws;
   daemon.markWsOpen(ws);
   daemon.scheduleNextBackstop();
+  const scheduledBackstop = daemon.backstopTimer;
 
-  await waitUntil(() => sendTimes.length >= 1);
-  await sleep(120);
+  cursorClock.advance(23);
+  expect(cursorSends).toBe(1);
+  cursorClock.advance(28);
+  expect(cursorSends).toBe(1); // still one in flight immediately before timeout
+  cursorClock.advance(1);
+  await waitUntil(() => daemon.cursorTimer !== undefined); // timeout completion re-arms
+  expect(cursorSends).toBe(1);
 
-  // Single-flight: a blackholed cursor must time out before the next is sent, so
-  // consecutive sends never overlap. Count is a loose range (real-timer bounded),
-  // but the invariants below are exact: no socket cycle, backstop preserved.
-  expect(sendTimes.length).toBeGreaterThanOrEqual(1);
-  expect(sendTimes.length).toBeLessThanOrEqual(6);
-  expect(sendTimes.slice(1).every((at, index) => at - sendTimes[index]! >= 20)).toBe(true);
+  cursorClock.advance(22);
+  expect(cursorSends).toBe(1);
+  cursorClock.advance(1);
+  expect(cursorSends).toBe(2); // next send occurs only after timeout + fresh cadence
   expect(closes).toBe(0);
   expect(daemon.ws).toBe(ws);
-  expect(daemon.wsBackstopPulls).toBeGreaterThanOrEqual(1);
+  expect(daemon.backstopTimer).toBe(scheduledBackstop);
+  expect(daemon.wsBackstopPulls).toBe(0);
   expect(daemon.cursorAppliedPulls).toBe(0);
 });
 
@@ -438,7 +479,8 @@ test("cursor epoch fences committed, reconnect, and stop overlaps", async () => 
   process.env.RBOX_DAEMON_WS_PONG_DEADLINE_MS = "0";
   const remote = new MiniRemote();
   remote.injectCommit([await remote.seedEntry("overlap.txt", "once")]);
-  const daemon = await makeDaemon(remote);
+  const cursorClock = new ManualCursorClock();
+  const daemon = await makeDaemon(remote, { cursorClock, cursorRandom: () => 0 });
   let sendsA = 0;
   let wsA!: WebSocket;
   wsA = fakeWs(() => {}, (message) => {
@@ -455,6 +497,7 @@ test("cursor epoch fences committed, reconnect, and stop overlaps", async () => 
   daemon.handleWsMessageData(JSON.stringify({ type: "committed", sequence: 0 }), wsA);
   await committedRun;
   await daemon.pumpRun;
+  cursorClock.advance(75);
   await waitUntil(() => sendsA === 2);
   expect(await fs.readFile(path.join(root, "overlap.txt"), "utf8")).toBe("once");
   expect(daemon.notifyAppliedPulls).toBe(1);
@@ -470,12 +513,13 @@ test("cursor epoch fences committed, reconnect, and stop overlaps", async () => 
   daemon.ws = wsB;
   daemon.markWsOpen(wsB);
   await reconnectRun;
-  await waitUntil(() => sendsB === 1);
+  cursorClock.advance(75);
+  expect(sendsB).toBe(1);
   expect(sendsA).toBe(3);
   expect(daemon.cursorAppliedPulls).toBe(0);
 
   await daemon.stop();
-  await sleep(140);
+  cursorClock.advance(1_000);
   expect(sendsB).toBe(1);
   expect(daemon.cursorTimer).toBeUndefined();
 });
@@ -504,7 +548,6 @@ test("WS-disabled plus zero backstop is the pure-polling falsification config", 
   daemon.maybeConnect();
   expect(connectCalls).toBe(0);
   daemon.startBackstop();
-  await sleep(50);
   expect(daemon.wsDisabled).toBe(true);
   expect(daemon.backstopMs).toBe(0);
   expect(daemon.backstopTimer).toBeUndefined();

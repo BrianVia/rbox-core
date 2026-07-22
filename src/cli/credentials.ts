@@ -77,7 +77,7 @@ const PROCESS_START_RE = /^\d+(?:\.\d+)?$/;
 const NOFOLLOW = constants.O_NOFOLLOW ?? 0;
 
 type CredentialTestSeam =
-  | "lock-before-acquire" | "load-before-mutation-lock"
+  | "lock-before-acquire" | "lock-contended" | "load-before-mutation-lock"
   | "marker-temp-opened" | "marker-temp-written" | "marker-temp-synced" | "marker-temp-closed"
   | "marker-before-link" | "marker-after-link" | "marker-before-temp-cleanup" | "marker-after-temp-cleanup"
   | "source-after-lstat" | "source-after-open" | "source-after-fstat" | "source-after-read"
@@ -403,6 +403,7 @@ async function acquireFence(): Promise<{ path: string; observation: MarkerObserv
       await unlinkObserved(markerPath, held, true);
       continue;
     }
+    if (credentialTestHook) await testSeam("lock-contended", { lockPath: markerPath, attempt: String(attempt) });
     if (attempt + 1 < LOCK_RETRIES) await sleep(LOCK_RETRY_MS);
   }
   throw new Error(`credential fence is held or its owner cannot be proved dead: ${markerPath}`);
@@ -530,6 +531,7 @@ async function acquireCredentialLock(): Promise<OwnedCredentialLock> {
   for (let attempt = 0; attempt < LOCK_RETRIES; attempt++) {
     const fence = await acquireFence();
     let acquired: OwnedCredentialLock | undefined;
+    let contended = false;
     let releaseError: unknown;
     try {
       const current = await readMarker(markerPath);
@@ -537,6 +539,7 @@ async function acquireCredentialLock(): Promise<OwnedCredentialLock> {
         const created = await markerForCurrentProcess();
         if (await publishMarker(markerPath, created.raw) === "created") acquired = await openOwnedLock(markerPath, created.marker, created.raw);
       } else {
+        contended = true;
         const now = Date.now();
         if (current.mtimeMs > now || Date.parse(current.marker.acquiredAt) > now) throw new Error(`future-dated credential lock marker: ${markerPath}`);
         if (now - current.mtimeMs >= LOCK_STALE_MS) {
@@ -561,6 +564,7 @@ async function acquireCredentialLock(): Promise<OwnedCredentialLock> {
       throw releaseError;
     }
     if (acquired) return acquired;
+    if (contended && credentialTestHook) await testSeam("lock-contended", { lockPath: markerPath, attempt: String(attempt) });
     if (attempt + 1 < LOCK_RETRIES) await sleep(LOCK_RETRY_MS);
   }
   throw new Error(`credential lock contention did not clear: ${markerPath}`);

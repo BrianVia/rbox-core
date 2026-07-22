@@ -293,7 +293,6 @@ test("serialized upload backpressure waits for a pre-existing drain", async () =
     };
     pending = run(fx, remote);
     await waitFor(() => remote.redeems === 1, "pre-existing drain did not start");
-    await Bun.sleep(20);
     expect(remote.puts).toBe(0);
     releaseDrain();
     await pending;

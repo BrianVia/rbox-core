@@ -37,6 +37,20 @@ const context = (): RemoteContext => new RemoteContext("https://api.test", "dura
 const json = (body: unknown, headers: Record<string, string> = {}): Response =>
   new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json", ...headers } });
 
+async function waitFor(condition: () => boolean, label: string, timeoutMs = 5_000): Promise<void> {
+  const deadline = performance.now() + timeoutMs;
+  while (!condition()) {
+    if (performance.now() >= deadline) throw new Error(`timed out waiting for ${label}`);
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+}
+
+function activeUploadGrantRefresh(ctx: RemoteContext): Promise<void> {
+  const refresh = (ctx as unknown as { uploadGrantRefresh?: Promise<void> }).uploadGrantRefresh;
+  if (!refresh) throw new Error("expected an active upload-grant refresh");
+  return refresh;
+}
+
 async function file(name: string): Promise<{ path: string; bytes: Uint8Array; sha: string }> {
   const bytes = new TextEncoder().encode(name);
   const filePath = path.join(tmpDir, name);
@@ -177,7 +191,6 @@ describe("upload grants", () => {
     }) as typeof fetch;
 
     await uploader(ctx).putFile(payload.sha, payload.path, payload.bytes.byteLength);
-    await new Promise((resolve) => setTimeout(resolve, 0));
 
     const put = calls.find((call) => call.url.endsWith("/v1/blob-batch/put"))!;
     expect(put.headers["x-rbox-upload-grant"]).toBeUndefined();
@@ -212,8 +225,7 @@ describe("upload grants", () => {
     expect(refreshes[0]!.headers["x-rbox-protocol"]).toBe("upload-receipts-v1");
 
     release(json({ missing: [], uploadGrant: "new" }));
-    await pendingRefresh;
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await waitFor(() => ctx.batchPutAuth["x-rbox-upload-grant"] === "new", "refreshed upload grant");
     expect(ctx.batchPutAuth["x-rbox-upload-grant"]).toBe("new");
 
     const later = await file("refresh-later");
@@ -237,10 +249,10 @@ describe("upload grants", () => {
     }) as typeof fetch;
 
     ctx.maybeRefreshUploadGrant();
+    const refresh = activeUploadGrantRefresh(ctx);
     await ctx.missingBlobs(["a".repeat(64)]);
     release(json({ missing: [], uploadGrant: "stale" }));
-    await pendingRefresh;
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await refresh;
     expect(ctx.batchPutAuth["x-rbox-upload-grant"]).toBe("newer");
   });
 
@@ -258,10 +270,10 @@ describe("upload grants", () => {
     }) as typeof fetch;
 
     ctx.maybeRefreshUploadGrant();
+    const refresh = activeUploadGrantRefresh(ctx);
     await ctx.missingBlobs(["b".repeat(64)]);
     release(json({ missing: [] }));
-    await pendingRefresh;
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await refresh;
     expect(ctx.batchPutAuth["x-rbox-upload-grant"]).toBe("newer");
   });
 
@@ -276,12 +288,12 @@ describe("upload grants", () => {
     }) as typeof fetch;
 
     ctx.maybeRefreshUploadGrant();
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await activeUploadGrantRefresh(ctx);
     ctx.maybeRefreshUploadGrant();
     expect(attempts).toBe(1);
     now += UPLOAD_GRANT_RETRY_INTERVAL_MS;
     ctx.maybeRefreshUploadGrant();
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await activeUploadGrantRefresh(ctx);
     expect(attempts).toBe(2);
   });
 
@@ -301,7 +313,7 @@ describe("upload grants", () => {
     expect(calls).toHaveLength(0);
     now += UPLOAD_GRANT_REFRESH_AFTER_MS + 1;
     ctx.maybeRefreshUploadGrant();
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await waitFor(() => ctx.batchPutAuth["x-rbox-upload-grant"] === undefined, "server-off grant clear");
     expect(ctx.batchPutAuth["x-rbox-upload-grant"]).toBeUndefined();
     await uploader(ctx).putFile(payload.sha, payload.path, payload.bytes.byteLength);
     const put = calls.find((call) => call.url.endsWith("/v1/blob-batch/put"))!;
@@ -317,18 +329,34 @@ describe("upload grants", () => {
     const payload = await file("close-refresh");
     let release!: (response: Response) => void;
     const pendingRefresh = new Promise<Response>((resolve) => { release = resolve; });
-    pendingReleases.push(() => release(json({ missing: [], uploadGrant: "new" })));
+    let refreshReleased = false;
+    pendingReleases.push(() => {
+      refreshReleased = true;
+      release(json({ missing: [], uploadGrant: "new" }));
+    });
+    let markRefreshStarted!: () => void;
+    const refreshStarted = new Promise<void>((resolve) => { markRefreshStarted = resolve; });
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
-      if (url.endsWith("/v1/blobs/check")) return pendingRefresh;
+      if (url.endsWith("/v1/blobs/check")) {
+        markRefreshStarted();
+        return pendingRefresh;
+      }
       return batchOkForBody(init?.body, "grant");
     }) as typeof fetch;
     const value = uploader(ctx);
     await value.putFile(payload.sha, payload.path, payload.bytes.byteLength);
-    await Promise.race([
-      value.close(new Error("stop")),
-      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("close awaited refresh")), 100)),
-    ]);
+    await refreshStarted;
+    let closeSettled = false;
+    const closing = value.close(new Error("stop"));
+    void closing.then(
+      () => { closeSettled = true; },
+      () => { closeSettled = true; },
+    );
+    await waitFor(() => closeSettled, "uploader close settlement while refresh is pending");
+    await closing;
+    expect(refreshReleased).toBe(false);
+    refreshReleased = true;
     release(json({ missing: [], uploadGrant: "new" }));
   });
 

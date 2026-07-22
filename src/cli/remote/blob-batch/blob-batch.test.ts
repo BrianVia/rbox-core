@@ -18,6 +18,7 @@ import {
   uploadBatchConfig,
   uploaderDispatchCount,
 } from "../blob-batch.js";
+import { setUploaderClockForTests } from "./uploader.js";
 
 const origFetch = globalThis.fetch;
 // per-sha: serve this many CORRUPT (bit-flipped, same-length) single-GET responses first.
@@ -45,6 +46,20 @@ const savedEnv = new Map<(typeof ENV_KEYS)[number], string | undefined>();
 const shaBytes = (bytes: Uint8Array | string) => createHash("sha256").update(bytes).digest("hex");
 const bytes = (s: string) => new TextEncoder().encode(s);
 const api = () => new RboxApi("https://api.test", "durable-token", "ws_1", "proj_1");
+
+async function beforeDeadline<T>(promise: Promise<T>, label: string, timeoutMs = 5_000): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`timed out waiting for ${label}`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
 
 let tmpDir = "";
 let calls: Array<{ url: string; method: string; headers: Record<string, string>; body?: unknown }> = [];
@@ -107,6 +122,7 @@ afterEach(async () => {
   corruptNextGets.clear();
   globalThis.fetch = origFetch;
   Date.now = origDateNow;
+  setUploaderClockForTests();
   for (const k of ENV_KEYS) {
     const v = savedEnv.get(k);
     if (v === undefined) delete process.env[k];
@@ -404,6 +420,17 @@ describe("BlobBatchDownloader fallback behavior", () => {
 describe("BlobBatchUploader queueing", () => {
   test("close rejects queued groups and prevents later dispatch", async () => {
     process.env.RBOX_BATCH_RECORDS = "32";
+    let timer: { fn: () => void } | undefined;
+    setUploaderClockForTests({
+      now: () => 0,
+      setTimeout: (fn) => {
+        timer = { fn };
+        return timer as unknown as ReturnType<typeof setTimeout>;
+      },
+      clearTimeout: (handle) => {
+        if (handle === timer as unknown as ReturnType<typeof setTimeout>) timer = undefined;
+      },
+    });
     const f = await uploadFile("queued-close", "queued");
     const a = api();
     const pending = a.putBlobFile(f.sha, f.file, f.size);
@@ -411,7 +438,7 @@ describe("BlobBatchUploader queueing", () => {
     const err = new Error("stopped");
     await a.closeUploader(err);
     await expect(pending).rejects.toBe(err);
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(timer).toBeUndefined();
     expect(uploaderDispatchCount() - before).toBe(0);
     expect(batchPutCalls()).toHaveLength(0);
   });
@@ -473,22 +500,33 @@ describe("BlobBatchUploader queueing", () => {
     const files = await Promise.all([uploadFile("q0", "zero"), uploadFile("q1", "one"), uploadFile("q2", "two")]);
     const a = api();
     let releaseFirst!: () => void;
+    let firstEntered!: () => void;
+    const firstDispatched = new Promise<void>((resolve) => { firstEntered = resolve; });
     batchPutHandler = async (body) => {
       const records = decodeBatchPutFrames(body)!;
-      if (batchPutCalls().length === 1) await new Promise<void>((resolve) => (releaseFirst = resolve));
+      if (batchPutCalls().length === 1) {
+        firstEntered();
+        await new Promise<void>((resolve) => (releaseFirst = resolve));
+      }
       return jsonResponse(200, { results: records.map(({ sha, payload }) => {
         singles.set(sha, new Uint8Array(payload));
         return { sha256: sha, ok: true, sizeBytes: payload.byteLength, receipt: `receipt:${sha}` };
       }) });
     };
     const pending = Promise.all(files.map((f) => a.putBlobFile(f.sha, f.file, f.size)));
-    await new Promise((r) => setTimeout(r, 30));
-    expect(batchPutCalls()).toHaveLength(1);
-    expect(decodeBatchPutFrames(batchPutCalls()[0]!.body as Uint8Array)).toHaveLength(2);
-    releaseFirst();
-    await pending;
-    expect(batchPutCalls()).toHaveLength(2);
-    expect(decodeBatchPutFrames(batchPutCalls()[1]!.body as Uint8Array)).toHaveLength(1);
+    try {
+      await beforeDeadline(firstDispatched, "first blob-batch dispatch entry");
+      expect(batchPutCalls()).toHaveLength(1);
+      expect(decodeBatchPutFrames(batchPutCalls()[0]!.body as Uint8Array)).toHaveLength(2);
+      releaseFirst();
+      await pending;
+      expect(batchPutCalls()).toHaveLength(2);
+      expect(decodeBatchPutFrames(batchPutCalls()[1]!.body as Uint8Array)).toHaveLength(1);
+    } finally {
+      releaseFirst?.();
+      await a.closeUploader(new Error("test cleanup")).catch(() => {});
+      await Promise.allSettled([pending]);
+    }
   });
 
   test("RBOX_BATCH_BLOBS=0 bypasses batch PUT", async () => {

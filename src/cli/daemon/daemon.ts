@@ -150,6 +150,7 @@ export interface GitBusyRetryClock {
   clearTimeout(handle: unknown): void;
 }
 export interface RecoveryProbeClock extends GitBusyRetryClock {}
+export interface CursorClock extends GitBusyRetryClock {}
 class RecoveryProbePreflightError extends Error {
   constructor(readonly cause: unknown) {
     super(cause instanceof Error ? cause.message : String(cause));
@@ -358,7 +359,7 @@ export class RboxDaemon {
   private ws?: WebSocket;
   private wsKeepaliveTimer?: ReturnType<typeof setInterval>;
   private wsPongDeadlineTimer?: ReturnType<typeof setTimeout>;
-  private cursorTimer?: ReturnType<typeof setTimeout>;
+  private cursorTimer?: unknown;
   private cursorEpoch = 0;
   private cursorAbortController?: AbortController;
   private cursorReplyResolve?: (head: number) => void;
@@ -495,6 +496,8 @@ export class RboxDaemon {
   private readonly wsReliabilityDisabled: boolean;
   private readonly pongDeadlineMs: number;
   private readonly cursorCheckMs: number;
+  private readonly cursorClock: CursorClock;
+  private readonly cursorRandom: () => number;
   private readonly backstopMs: number;
   private readonly log: DaemonLogSink;
   private readonly onStopped?: () => void;
@@ -514,6 +517,8 @@ export class RboxDaemon {
       gitBusyRetryClock?: GitBusyRetryClock;
       recoveryRandom?: () => number;
       recoveryClock?: RecoveryProbeClock;
+      cursorClock?: CursorClock;
+      cursorRandom?: () => number;
       deferralHygieneBudgetMs?: number;
       log?: DaemonLogSink;
       onStopped?: () => void;
@@ -543,6 +548,15 @@ export class RboxDaemon {
       },
       clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
     };
+    this.cursorClock = opts.cursorClock ?? {
+      setTimeout: (fn, ms) => {
+        const handle = globalThis.setTimeout(fn, ms);
+        handle.unref?.();
+        return handle;
+      },
+      clearTimeout: (handle) => globalThis.clearTimeout(handle as ReturnType<typeof setTimeout>),
+    };
+    this.cursorRandom = opts.cursorRandom ?? (() => Math.random());
     this.deferralHygieneBudgetMs = opts.deferralHygieneBudgetMs ?? 2_000;
     this.monotonicNow = opts.monotonicNow ?? (() => performance.now());
     const monotonicStart = this.monotonicNow();
@@ -2958,7 +2972,7 @@ export class RboxDaemon {
 
   private invalidateCursorSchedule(): void {
     this.cursorEpoch++;
-    if (this.cursorTimer) clearTimeout(this.cursorTimer);
+    if (this.cursorTimer !== undefined) this.cursorClock.clearTimeout(this.cursorTimer);
     this.cursorTimer = undefined;
     const controller = this.cursorAbortController;
     this.cursorAbortController = undefined;
@@ -2976,11 +2990,10 @@ export class RboxDaemon {
   }
 
   private armCursorCheck(ws: WebSocket, generation: number, epoch: number): void {
-    this.cursorTimer = setTimeout(() => {
+    this.cursorTimer = this.cursorClock.setTimeout(() => {
       this.cursorTimer = undefined;
       void this.runCursorCheck(ws, generation, epoch);
-    }, jitter(this.cursorCheckMs));
-    this.cursorTimer.unref?.();
+    }, jitter(this.cursorCheckMs, this.cursorRandom));
   }
 
   /** A cursor check captured at (ws, generation, epoch) is stale — no longer the
@@ -2996,12 +3009,11 @@ export class RboxDaemon {
     const controller = new AbortController();
     this.cursorAbortController = controller;
     const timeoutMs = Math.min(10_000, Math.max(1, this.cursorCheckMs - 1));
-    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let timeout: unknown;
     const reply = new Promise<number>((resolve, reject) => {
       this.cursorReplyResolve = resolve;
       controller.signal.addEventListener("abort", () => reject(controller.signal.reason), { once: true });
-      timeout = setTimeout(() => controller.abort(new Error(`cursor reply timed out after ${timeoutMs}ms`)), timeoutMs);
-      timeout.unref?.();
+      timeout = this.cursorClock.setTimeout(() => controller.abort(new Error(`cursor reply timed out after ${timeoutMs}ms`)), timeoutMs);
     });
     try {
       ws.send("cursor");
@@ -3016,7 +3028,7 @@ export class RboxDaemon {
         this.log(`ws cursor check failed: ${error instanceof Error ? error.message : String(error)}`);
       }
     } finally {
-      if (timeout) clearTimeout(timeout);
+      if (timeout !== undefined) this.cursorClock.clearTimeout(timeout);
       if (this.cursorAbortController === controller) {
         this.cursorAbortController = undefined;
         this.cursorReplyResolve = undefined;

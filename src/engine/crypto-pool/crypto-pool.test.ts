@@ -245,7 +245,6 @@ describe("crypto worker pool", () => {
 
       await __cryptoPoolTestHooks.reset();
       process.env.RBOX_CRYPTO_WORKERS = "0";
-      await sleep(25);
       expect(cryptoPoolStatus().state).toBe("off");
     } finally {
       await fs.rm(root, { recursive: true, force: true });
