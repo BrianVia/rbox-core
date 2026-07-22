@@ -7,6 +7,23 @@ All notable changes to rbox are recorded here. The format follows
 ## [Unreleased]
 
 ### Added
+- Your recovery key can now live in the macOS Keychain: after signing in,
+  rbox offers once to save it (no typing if this machine still has its
+  cached key; otherwise you type your phrase once and rbox checks it against
+  your account before saving). `rbox key recover` can restore your account
+  directly from the Keychain on a fresh machine login. You can also export a
+  recovery kit file with `rbox key save`. Uninstalling warns before removing
+  the last copy of your key, wherever it lives.
+
+### Fixed
+- Account setup can no longer lose your recovery phrase or half-create your
+  account if anything crashes at the wrong moment: the phrase is safely
+  staged on disk before rbox talks to the server, the server creates your
+  account in one all-or-nothing step, and an interrupted setup resumes
+  exactly where it left off the next time you run rbox. Wedged half-created
+  accounts (from the old flow) now have a supported repair path.
+
+### Added
 - macOS recovery-kit saves now use an explicit login Keychain item by default,
   with validated `rbox key save`, Keychain-first recovery, strict live status,
   and `--kit-path` retained for deliberate plaintext export (design 179).
