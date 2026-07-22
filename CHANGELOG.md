@@ -6,6 +6,24 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- Stale "git busy" warnings clean themselves up: rbox now re-checks every
+  recorded git-lock deferral before showing status and on a daemon cadence
+  (including pull-only daemons), and clears the exact stale entry the moment
+  the locks are gone — even for repos that have since disappeared from the
+  workspace. Locks that sit unchanged for 30+ seconds with no known owner are
+  labeled "stable Git locks without a known live owner" with a live lock
+  count and age, instead of an eternal generic "git busy".
+- A failed sync no longer waits for luck to retry: every halt now owns its
+  own recovery schedule (exponential backoff, 2-minute cap) that pulls,
+  re-checks, and clears itself the moment the cause is gone — an idle machine
+  can't stay "halted" just because a push lost a race two hours ago. While a
+  retry is scheduled, status says "retrying after conflict; next probe in Ns";
+  "halted" is reserved for real safety refusals, which still clear only when
+  their own condition stops reproducing.
+- Pull-only machines keep a standing push problem dormant instead of losing
+  it, and wake it up only if you switch the daemon back to read-write.
+
 ## [1.7.20] — 2026-07-22 — "resolutions land when you confirm them"
 
 ### Changed
