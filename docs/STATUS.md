@@ -5,7 +5,27 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
-_Last updated: 2026-07-22 (~11:30 UTC — 178 t2 merged, 180 ALIGNED): **178
+_Last updated: 2026-07-22 (~12:15 UTC — **v1.7.21 fleet-live + prod
+promoted**): founder authorized merge/release/prod. Sequence: promoted
+`main → production` at 500fc5a3 (deploy-api run green: tests → prod D1
+migrations → deploy — prod API accepts `stale-unattributed` BEFORE any client
+emits it), then released **v1.7.21 "transient hiccups heal themselves"**
+(release commit 0a885435; main CI flaked once on
+daemon-ws-reliability.test.ts "live committed frames reset the cursor
+cadence" — flake proven: green rerun same SHA + green in isolation, add to
+registry; tag → release run success → api.rbox.to/version = 1.7.21). Fleet:
+Mac read-write v1.7.21 (needed manual stop/start — `rbox upgrade` said
+"already up to date" and left the 1.7.20 daemon running, papercut logged),
+flat-meadow v1.7.21 with witness-verified `mode: pull-only` across a BARE
+restart, desktop binary 1.7.21 (workspace intentionally unbound). Field
+check: the pr8 ghost ("git busy", checkout unavailable, 14h) SURVIVES t2
+hygiene — gone-directory probes fail closed by contract, so the incident's
+disappeared-repo case still can't clear; ruled follow-up filed in papercuts
+for 178 t3 (absent-from-discovery + N gone observations → clear busy-class
+lanes). savvy-core itself shows a genuine `local commits` deferral (founder
+decision: keep-mine or take-theirs when he cares)._
+
+_Previous: 2026-07-22 (~11:30 UTC — 178 t2 merged, 180 ALIGNED): **178
 tranche 2 is on main** (PR #392, squash 07b87872): C deferral-hygiene
 reconciler (re-probes every git-busy lane incl. repos gone from discovery,
 exact-lane CAS clears, categorical `stale-unattributed` after two stable
