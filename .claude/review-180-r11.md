@@ -1,0 +1,5 @@
+1. **HIGH — RETARGET has no valid post-rename failure reconciliation.** The canonical intent is replaced before read-back, file fsync, and directory fsync complete supersession ([design 180](/home/via/Development/Personal/rbox-core/docs/design/180-atomic-genesis-enrollment.md:564)). If any later step fails, the new `kit-path` intent may already be canonical and the old inode unavailable, contradicting the claim that the old Keychain intent remains authoritative. Design 179 and the tests preserve the same false old-before/new-after binary ([design 179](/home/via/Development/Personal/rbox-core/docs/design/179-recovery-kit-macos-keychain.md:261), [tests](/home/via/Development/Personal/rbox-core/docs/design/180-atomic-genesis-enrollment.md:1983)). Require: no fallback write in the failing invocation; on locked resume, reload and accept either the exact old Keychain intent or exact new file intent, finish durability before proceeding, and fail closed on any other state. Add stage-specific reconciliation tests after rename, read-back, file fsync, and directory fsync.
+
+Verdict: **CHANGES-REQUIRED**
+
+WORK-COMPLETE

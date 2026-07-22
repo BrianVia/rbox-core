@@ -1,6 +1,6 @@
 # 179 — recovery kit: macOS Keychain instead of a plaintext Downloads file
 
-Status: v7 — ALIGNED (founder wrong-layer split moved the pre-existing atomic-genesis subsystem to design 180; the recovery-kit and local staged-RK scope retains its certified findings, 2026-07-21).
+Status: v18 — r12 retarget witness
 
 Round-1 ruling record (pinned; one line per finding):
 
@@ -18,7 +18,7 @@ Round-1 ruling record (pinned; one line per finding):
 
 Round-2 ruling record (pinned; one line per finding):
 
-1. No-loss genesis — non-interactive macOS genesis with `--kit` durably stages RK through the existing `rk.key` cache before publish; only a verified Keychain/file commitment permits cleanup, after which the original `cacheRecovery` preference is restored, with staged state visible in `key status` until resolved.
+1. No-loss genesis — non-interactive macOS genesis with `--kit` reuses design 180's `rk.key.staged`; only a verified Keychain/file commitment releases its hold, after which the original `cacheRecovery` preference is restored, with pending state visible in `key status` until resolved.
 2. Wrong Keychain phrase — a checksum-valid Keychain candidate that fails account-envelope validation emits only a redacted warning and falls through to manual entry before admission persistence; failures after persistence retain ordinary recovery semantics.
 3. TTY gates — two TTYs gate only new Keychain offers/prompts; the existing stdin-only manual-recovery gate is unchanged, with all four stdin/stderr combinations specified below.
 4. Restore metadata — only a recognized record containing validated Keychain metadata supplies an identity; otherwise resolve login Keychain exactly once, and after recovery atomically merge `discoveredAt` metadata without disturbing plaintext/offer axes; record failure is nonfatal and unknown records remain untouched.
@@ -27,17 +27,65 @@ Round-2 ruling record (pinned; one line per finding):
 
 Round-3 retained ruling record (original finding numbers preserved):
 
-2. Durable keystore mutations — RK, staging, and commitment-locator writes require same-directory atomic temp+rename publication, exact read-back, and file plus parent-directory fsync; unlink requires parent-directory fsync. This is a new contract, not a property of today's `e2ee-keystore` helpers.
-3. Restore merge — rediscovery preserves the independent staging axis unchanged; under the locked re-read it merges only a same-identity Keychain artifact, while a concurrent different identity is preserved and warned about. Tests cover both staging preservation and identity conflict.
-4. Cache preference — capture the user's original `cacheRecovery` value before genesis staging forces caching, persist that original value, and restore it only after commitment.
+2. Durable keystore mutations — design 180 owns staged-RK durability; this design's cache promotion and commitment-locator writes require same-directory atomic temp+rename publication, exact read-back, and file plus parent-directory fsync; unlink requires parent-directory fsync.
+3. Restore merge — under the locked re-read, rediscovery merges only a same-identity Keychain artifact, while a concurrent different identity is preserved and warned about; it never mutates design 180's journal state.
+4. Cache preference — capture the user's original `cacheRecovery` value in design 180's journal before publication and restore it only after commitment.
 5. Manual stdin wording — the unchanged non-interactive manual-recovery stdin path is not described as bounded; only newly introduced bounded readers carry that guarantee.
 
 Round-4 retained ruling record (original finding numbers preserved):
 
 3. Explicit-file commitment — `--kit-path` uses the hardened write, exact read-back, published-file fsync, and containing-directory fsync contract before locator publication or staged-RK cleanup.
-4. Durable directory chain — a fresh `RBOX_HOME` is created and published through every new ancestor with the existing `ensureDirectoryChain` / `fsyncCreatedDirectoryAncestors` primitives before staging can count as a foothold.
+4. Durable directory chain — design 180 creates and publishes a fresh `RBOX_HOME` through every new ancestor with the existing `ensureDirectoryChain` / `fsyncCreatedDirectoryAncestors` primitives before `rk.key.staged` can count as a foothold.
 
-Founder split record: round-3 finding 1, round-4 findings 1–2, and round-5 findings 1–4 are genesis publication/classification/repair concerns that predate this feature and now seed `docs/design/180-atomic-genesis-enrollment.md`; round 5 did not certify that subsystem inside design 179 and v7 makes no such claim.
+Founder split record: round-3 finding 1, round-4 findings 1–2, and round-5 findings 1–4 are genesis publication/classification/repair concerns that predate this feature and now seed `docs/design/180-atomic-genesis-enrollment.md`; round 5 did not certify that subsystem inside design 179, and these seam amendments make no such claim.
+
+Round-10 seam ruling record (2026-07-22; binding; original finding numbers
+preserved):
+
+Where these lines conflict with the round-1 once-only-offer wording or an
+earlier fixed-target completion-intent statement, these r10 seam rulings
+control.
+
+4. ACCEPT — design 180's reselection controls genesis: the once-only offer
+   binds to journal resolution, not prompt emission. `outcome:"claimed"` does
+   not suppress re-presentation while the same active enrollment journal lacks
+   a satisfied completion intent; this is continuation of one episode, not a
+   duplicate offer.
+5. ACCEPT — after explicit interactive consent, a pre-receipt Keychain failure
+   may RETARGET to plaintext only after a replacement file completion intent
+   durably supersedes the Keychain intent under design 180's hardened
+   write-new-then-supersede contract and before any fallback file commitment.
+
+Round-11 seam ruling record (2026-07-22; binding):
+
+Where this line corrects the r10 RETARGET supersession boundary, the r11 seam
+ruling controls.
+
+1. ACCEPT — RETARGET no longer claims an old-before/new-after binary. The
+   failing invocation performs no fallback write. On locked resume, design 180
+   reloads the canonical intent and accepts either the exact old Keychain
+   intent or the exact new file intent, completes exact read-back,
+   published-file fsync, and parent-directory fsync for whichever it found
+   before proceeding, and fails closed on any other state. Tests reconcile
+   crashes after rename, after read-back, after file fsync, and after directory
+   fsync.
+
+Round-12 seam ruling record (2026-07-22; binding):
+
+Where these lines strengthen r11's RETARGET provenance and correct any earlier
+mismatch-reselection wording, the r12 seam rulings control.
+
+1. ACCEPT — before canonical replacement, design 180 durably publishes a
+   full-hardened-writer RETARGET witness binding the exact old and new intents
+   and both digests. Locked resume reads it first, accepts only those exact two
+   values, completes durability for the surviving canonical intent, fails
+   closed on every other state, and retires the witness only after the survivor
+   is fully durable. The four stage-specific crash cases cover witness-present
+   and witness-absent boundaries.
+2. ACCEPT-MODIFIED — absence is the only reselection case. Every structurally
+   invalid or version/account/digest/shape/target-mismatched present completion
+   intent fails closed as preserved integrity evidence. A valid RETARGET
+   witness authorizes only its exact two-value reconciliation.
 
 Owner: Claude (founder-directed, 2026-07-20)
 Origin: onboarding-ux backlog item #6 (macOS keychain), referenced from
@@ -82,7 +130,7 @@ These files remain mode-600 files per design 12 §13.1.
 2. rbox never places the phrase in process argv, shell history, a temp file, or
    ordinary command output on its way into Keychain. The mandatory genesis
    no-loss exception stages encoded RK, not phrase text, through the hardened
-   same-directory keystore temp+rename contract specified below.
+   `rk.key.staged` contract owned by design 180.
 3. `rbox key status` reports every recorded artifact and its live state without
    requesting secret data or turning an unavailable Keychain into "deleted."
 4. Explicit file output remains available (`--kit-path`), and non-macOS
@@ -100,6 +148,16 @@ The read side uses the same item and the same explicit-keychain and subprocess
 contracts as the write side. `rbox key recover` today accepts visible
 interactive input or non-interactive stdin (`src/cli/auth-cmd.ts:444-465`). On
 macOS it may offer the exact-account Keychain item first:
+
+Before any manual or Keychain restore work, `rbox key recover` follows
+[design 180 v13](180-atomic-genesis-enrollment.md)'s mandatory pending-state
+arbitration. Once the account is known it
+acquires the genesis lock and, if a journal is active, first resolves that
+journal through the shared classifier's resume/cleanup path. It may probe/read
+Keychain, accept a phrase, replace credentials, persist device/MK material, or
+admit only after the journal has been durably retired. Every nonterminal or
+failed classification leaves the existing journal and local material intact;
+design 180 owns the whole-command zero-side-effect matrix.
 
 - Only when both stdin and stderr are TTYs, a metadata probe returns `present`,
   and the account id is strict: `Found a recovery phrase for this account in
@@ -147,9 +205,9 @@ macOS it may offer the exact-account Keychain item first:
   metadata without replacing an existing `writtenAt` or `discoveredAt`. If a
   different Keychain identity appeared concurrently, preserve the record
   unchanged and emit a safe conflict warning. Every successful merge preserves
-  existing `plaintextArtifacts`, `offer`, and `staging` byte-for-byte at the
-  value level; rediscovery does not complete or clear the staging commitment
-  protocol. Failure to lock, re-read, validate, or write emits a safe warning
+  existing `plaintextArtifacts` and `offer` byte-for-byte at the value level;
+  rediscovery does not complete or alter design 180's genesis journal. Failure
+  to lock, re-read, validate, or write emits a safe warning
   but never changes the successful enrollment result. An unknown record is
   never overwritten or normalized; leave it untouched and warn that rediscovery
   metadata was not recorded.
@@ -176,64 +234,105 @@ The phrase-source matrix is therefore explicit:
 |---|---|---|
 | `rbox key save`, cached `rk.key` present | Render cached RK with `rkToPhrase` | No typing and no echo; validate against this account's current verified recovery envelope. |
 | `rbox key save`, no cached RK | No-echo TTY prompt, or bounded stdin when stdin is not a TTY | Parse/canonicalize the 24 words, then validate against this account's current verified recovery envelope. |
-| genesis | Fresh phrase held across bootstrap (`src/cli/auth-cmd.ts:130-132`) | Interactive flows offer an immediate zero-typing save. Non-interactive macOS `--kit` first follows the durable staging invariant below; bootstrap's persisted envelope plus immediate validation proves the account binding before final storage. |
+| genesis | In-memory fresh phrase on the uninterrupted path (`src/cli/auth-cmd.ts:130-132`); canonical phrase reconstructed from design 180's `rk.key.staged` on resume | Interactive flows offer an immediate zero-typing save. Non-interactive macOS `--kit` follows the shared durable staging invariant below; bootstrap's persisted envelope plus immediate validation proves the account binding before final storage. |
 | `rbox key backup` | Cached RK already rendered (`src/cli/auth-cmd.ts:503-515`) | Offer an immediate zero-typing save; revalidate because the cached value could be stale. |
 | standalone recover | Phrase that just passed recovery (`src/cli/auth-cmd.ts:444-465`) | Offer an immediate zero-typing save while the phrase is still in scope. |
 | wizard recover | Phrase/RK in `recoverInWizard` (`src/cli/setup-cmd.ts:348-370`) | Plumb the canonical phrase to the offer before returning and discarding it. |
 
 ### Non-interactive macOS genesis no-loss invariant
 
-Non-interactive macOS genesis with `--kit` MUST NOT publish the account genesis
-until RK has a durable local foothold. Before bootstrap publication begins, it
-persists RK in the existing opt-in `rk.key` format and mode-600 keystore trust
-domain as `mk.key`, but through the new hardened mutation contract below. This
-is a temporary use of the existing secret class: it creates no new persistent
-plaintext format or Downloads artifact. If durable staging fails, genesis
-aborts before any publish.
+Design 180 solely owns the prepublication foothold, `rk.key.staged`, completion
+intent, hold, cleanup authorization, and crash migration through its journal
+phases.
+Non-interactive macOS genesis with `--kit` reuses that exact artifact; it does
+not force a temporary `rk.key` cache and does not add staging state to
+`kit.json`. If design 180 cannot durably publish and authenticate
+`rk.key.staged`, genesis aborts before POST.
 
-The genesis caller captures the user's original `cacheRecovery` preference
-before this flow overrides the bootstrap option to `cacheRecovery: true` to
-force staging. An omitted preference is normalized to `false`; command/wizard
-plumbing passes the explicit user value into this orchestration instead of
-trying to reconstruct it after bootstrap. The accompanying non-secret staging
-state records `startedAt` and that captured original value. The local state
-transition order is crash-safe:
+This design adds only the macOS save delta. Before publication, the caller
+records the user's original `cacheRecovery` preference in design 180's journal
+(omitted means false). After `committed-this-attempt`, it reconstructs the
+canonical phrase from `rk.key.staged`, validates the published recovery
+envelope, and durably asks design 180 to record the selected completion intent
+in its own `genesis-completion-intent.json` beside the journal, using the same
+hardened durability contract, before attempting it: phrase display; Keychain
+with the already resolved exact service/account/canonical `keychainPath`
+identity; or `--kit-path` with the exact selected path. It then saves to that
+selected Keychain or explicit path,
+exactly verifies that artifact, and durably commits its locator in `kit.json`.
+Only then may it request design 180's `artifact-committed` receipt. During
+design 180's `cleanup` phase, the staged file is promoted atomically to
+ordinary `rk.key` when the original preference was true, but journal retirement
+requires the destination bytes to validate exactly against the intended staged
+RK. If both the source and a valid destination are absent, cleanup is
+`integrity-failure`, not successful preference restoration. It is removed when
+the preference was false only on the winning/ordinary path.
+`competing-cleaned` is explicitly excluded from both promotion and bare unlink
+regardless of cache preference: the losing staged RK, device file, and MK file
+are always durably renamed together through design 180's one-manifest shared
+local-quarantine primitive, keyed by the journal request digest and completed
+only after all three hash-checked renames and the durable terminal marker.
+Design 180's full hardened writer contract applies to that
+primitive's quarantine directory chain, `quarantine-resume.json`, and
+`completed.json`, including ancestor publication, same-directory exclusive
+temporary-file creation, complete writes, temporary-file fsync and close,
+atomic rename, exact read-back, published-file fsync, and parent-directory
+fsync; design 180's tests inject every writer-stage failure for both JSON files
+and both quarantine users. A failed save or locator write leaves the hold,
+completion intent, and `rk.key.staged` intact.
 
-1. durably publish any newly created `RBOX_HOME` / `e2ee` / account directory
-   chain, atomically record staging intent, then durably write/verify `rk.key`;
-   all three complete before bootstrap
-   publication is permitted;
-2. validate the published current recovery envelope and attempt the selected
-   Keychain or explicit `--kit-path` save;
-3. require exact read-back verification of that Keychain/file artifact; an
-   explicit file additionally requires the published file and its containing
-   directory to be fsynced — command success alone is not a commitment;
-4. under the record lock, atomically persist the verified commitment locator as
-   the exact Keychain artifact metadata or plaintext artifact path; failure to
-   persist leaves both staging state and `rk.key` intact;
-5. only after verification **and** durable locator persistence, honor the
-   original preference: retain `rk.key` when `cacheRecovery` was true, or
-   durably remove it when false; then atomically clear staging state.
+On resume, a valid completion-intent record retries that exact mode and target
+under this design's Keychain or file rules, except for the one legal
+pre-receipt Keychain-to-file RETARGET below. If no record exists because the
+process crashed before the choice was durably published, the resume UI
+deterministically re-presents the completion options and reconstructs the
+canonical phrase from `rk.key.staged`; it does not claim to know or resume the
+original selection. This true absence, with no RETARGET witness, is the only
+reselection case. A present intent that is structurally invalid or has a
+version, account, request-digest, shape, or target mismatch is preserved and
+fails closed as integrity evidence; it is never replaced by reselection.
 
-Atomic publication, exact-attempt restart replay, shared preflight verification, lost-response/competing-genesis classification, and wedged-account repair are governed by [design 180](180-atomic-genesis-enrollment.md), whose exact-attempt journal retains this design's `recovery-kit-staging` completion hold until durable acknowledgement; this local state machine preserves staged RK across `committed-this-attempt`, indeterminate, and orphan outcomes until its own verified artifact commitment, and permits abandoned-attempt cleanup only for design 180's verified `competing-genesis` result.
+After an interactive Keychain write failure and separate explicit plaintext
+consent, the caller resolves the exact absolute fallback path and asks design
+180 to durably supersede the Keychain intent with that `kit-path` intent under
+the account genesis lock. Before any canonical replacement, design 180 durably
+publishes `genesis-completion-intent.retarget.json` under its full hardened
+writer contract. The witness embeds the exact old Keychain intent and exact new
+resolved-path intent, binds both to the active account and request digest, and
+stores a digest for each exact intent. Only after its exact read-back,
+published-file fsync, and parent-directory fsync may replacement proceed.
+Rename may expose the new canonical record before
+read-back, published-file fsync, and parent-directory fsync finish, so this seam
+does not claim an old-before/new-after supersession binary. A failing RETARGET
+invocation creates or writes no fallback file, including when failure occurs
+after rename. On locked resume, design 180 strictly loads the witness first and
+accepts only either its exact old account/request-bound Keychain intent or its
+exact new account/request-bound resolved file intent as canonical. It
+idempotently completes
+exact read-back, published-file fsync, and parent-directory fsync for whichever
+exact value it found, then durably retires the witness only after that survivor
+is fully durable. An absent canonical intent while the witness exists, an
+invalid witness, or any canonical value outside its exact two-value allowlist
+fails closed and preserves all evidence. The old value retains the Keychain
+target with no fallback write; only the reconciled new value permits this
+design to begin commitment to that exact file target after witness retirement.
+No other retarget is legal, and no retarget is legal after
+`artifact-committed` or any other completion receipt.
 
-A crash or save failure after publication therefore leaves the staged `rk.key`
-available to `rbox key save`/backup resolution. Startup and human
-`rbox key status` reconcile a leftover marker conservatively: they never delete
-staged RK without a durably recorded locator and fresh verification of that
-exact Keychain/file commitment. If commitment exists, cleanup can finish
-idempotently; otherwise the marker remains and human status prints
-`recovery phrase staged, not yet saved`. JSON exposes the same non-secret staged
-state. A marker without a readable verified `rk.key` is reported as unavailable
-and never as backed up. The temporary stage is not treated as an off-keystore
-backup and does not make uninstall safe.
+`rbox key status` reads design 180's journal state and reports `recovery phrase
+staged, not yet saved`; it does not infer pending state from `kit.json` or
+mutate either record. Keychain locator reconciliation layers on the same
+artifact and never defines a second recovery path. Verified
+`competing-cleaned` authorization and every crash-resume/cleanup decision remain
+entirely design 180 concerns.
 
-### Hardened RK/staging/locator/file contract
+### Hardened cache/locator/file contract
 
-This design adds a normative durability contract for `rk.key`, the non-secret
-staging marker, the `kit.json` commitment locator, and every explicit
-`--kit-path` plaintext commitment. Before writing any of the first three below
-a fresh `RBOX_HOME`, create the complete plain-directory chain without following
+Design 180 owns the durability contract for `rk.key.staged` and its journal.
+This design adds a normative durability contract for promotion to `rk.key`, the
+`kit.json` commitment locator, and every explicit `--kit-path` plaintext
+commitment. When any of those is the first write below a fresh `RBOX_HOME`,
+create the complete plain-directory chain without following
 symlinks using `ensureDirectoryChain`, then call
 `fsyncCreatedDirectoryAncestors` to publish each newly created child through
 the first pre-existing ancestor. Fsyncing only the leaf account directory is
@@ -247,13 +346,13 @@ requires exact byte-for-byte read-back, fsyncs the published file, and fsyncs
 the parent directory before reporting success. A cleanup unlink reports durable
 success only after the unlink succeeds and the parent directory is fsynced.
 Failure at any step leaves the state machine conservative: it does not advance
-commitment or clear staging, and reconciliation may retry idempotently.
+artifact commitment, and design 180 may retry idempotently.
 
 For `--kit-path`, that entire sequence — including post-rename read-back,
 published-file fsync, and containing-directory fsync — must finish before its
 plaintext locator is published in `kit.json`. The locator must then itself meet
-the same durability contract before staged `rk.key` can be removed or staging
-cleared. The existing `writeRecoveryKit` content read-back and
+the same durability contract before design 180's hold can be released. The
+existing `writeRecoveryKit` content read-back and
 `writeFileAtomic` temp-file fsync/rename are only pieces of this contract; they
 do not currently make the containing directory entry durable.
 
@@ -275,15 +374,16 @@ passes `assertMkWrapAuthorized` before attempting `recoverMasterKey`; the
 existing signed-wrap authorization primitive is
 `src/engine/e2ee/session.ts:245-275`. Only then does it parse the candidate with
 `phraseToRk` and authenticate-decrypt that current recovery wrap. The underlying
-unwrap is `src/engine/e2ee/session.ts:516-520`; correct/wrong-envelope coverage
-already exists at `src/engine/e2ee/session.test.ts:76-95`. The same new helper,
+unwrap is `src/engine/e2ee/session.ts:516-520`; existing tests at
+`src/engine/e2ee/session.test.ts:76-95` cover successful unwrap and a wrong
+phrase/key against the correct envelope, not substitution of a wrong or
+historical envelope. The same new helper,
 `assertCurrentRecoveryWrap`, gates ordinary restore/recovery too, fixing the
 current gap rather than making validation safer than the admission path.
 Validation does **not** build or publish an admission roster, cache RK, or write
 kit metadata. The Keychain add begins only after every binding and validation
-succeeds; every error stores nothing. The narrowly scoped pre-publication
-genesis staging above is an ordering invariant, not a side effect of this
-validation helper.
+succeeds; every error stores nothing. Design 180's prepublication staged-RK
+invariant is not a side effect of this validation helper.
 
 New explicit command: `rbox key save`. It requires an authenticated account.
 With cached RK it does not read stdin. Without cached RK it uses the separate
@@ -306,6 +406,8 @@ The first actionable login/status/genesis/backup/recover/wizard-recover
 touchpoint wins the atomic per-installation claim in §3. A failure before the
 backend/account-envelope preflight does not claim the offer. This is a nudge,
 not a new RK source and not a fleet-wide promise.
+For genesis, “wins” is scoped to one resolved design-180 enrollment episode:
+offer metadata cannot turn an unresolved journal into a resolved one.
 
 After a verified Keychain save, any recorded plaintext artifact remains
 recorded until exact-match deletion is confirmed. Decline, non-interactive
@@ -446,10 +548,6 @@ axes:
     "surface": "status",
     "phraseSource": "cached-rk",
     "outcome": "shown"
-  },
-  "staging": {
-    "startedAt": "2026-07-21T16:28:00.000Z",
-    "originalCacheRecovery": false
   }
 }
 ```
@@ -469,14 +567,9 @@ axes:
   not a decline. `surface` is one of
   `login | status | genesis | backup | recover | wizard-recover`, and
   `phraseSource` is `cached-rk | typed | in-hand`.
-- `staging` is optional, non-secret, and independent. It exists only for the
-  non-interactive macOS genesis no-loss state machine. Its strict timestamp and
-  original boolean preference distinguish a temporarily retained `rk.key` from
-  an ordinary opted-in cache and drive idempotent cleanup after verification.
-  Record mutation/restore merge preserves it as the independent staging axis
-  until commitment cleanup durably clears staging. Design 180's generic,
-  platform-independent exact bootstrap-attempt journal is deliberately not
-  embedded in this Keychain record.
+- `kit.json` has no genesis-staging field. Design 180's journal records the
+  original cache preference and owns all pending/cleanup state; record mutation
+  and restore never embed, copy, complete, or clear that state.
 
 Parsing is strict and account-bound. A legacy object with absent `kind` and
 exactly valid `path` + `writtenAt` is normalized to a v2 envelope with one
@@ -496,7 +589,15 @@ release and print/prompt. Only the claimant emits. After UI completion it takes
 the lock again and advances to shown/accepted/declined without overwriting
 artifact changes. Claim-before-output gives an honest **at-most-once per account
 per local installation** guarantee; a crash after claim can lose the nudge but
-cannot duplicate it. `kit.json` is local
+cannot duplicate it for ordinary non-genesis offers. Genesis is the controlled
+exception: while design 180's same enrollment journal remains active with both
+the completion-intent record and RETARGET witness absent, its resume handler
+may re-present the completion UI even when `kit.json` says
+`outcome:"claimed"`. A present invalid record fails closed. The genesis lock
+serializes that decision; the existing claim is reused rather than recorded as
+a second offer, and journal resolution—not prompt emission—ends the episode. Once a
+valid matching completion intent exists, restart resumes that target rather
+than offering a new selection. `kit.json` is local
 (`src/cli/recovery-kit.ts:179-182`), so no fleet-wide promise is made.
 
 `rbox key status` human output lists each artifact and live state. Keychain
@@ -513,15 +614,15 @@ requires a bounded regular-file parse with current account and canonical valid
 (`src/cli/recovery-kit.ts:145-154`). Permission/I/O/size failures are
 `unavailable`; malformed or mismatched content is `unrecognized`.
 
-When `staging` is present, the staged warning is emitted in addition to artifact
-states until reconciliation clears it; staged RK alone never renders as a saved
+When design 180 reports an unreleased recovery-kit hold, the staged warning is
+emitted in addition to artifact states; staged RK alone never renders as a saved
 recovery kit. `rbox key status --json` returns before any offer claim or nudge,
 preserving the current JSON/human boundary (`src/cli/auth-cmd.ts:468-488`). It
 may perform read-only probes. `recoveryKit` gains `version`, `keychain`
 (including live state), `plaintextArtifacts` (each with live state), `offer`,
-and `staging`; for a file it also preserves the existing `path`/`writtenAt`
-compatibility fields.
-Status JSON never invokes staging reconciliation: it writes nothing, prints no
+and, for a file, it also preserves the existing `path`/`writtenAt` compatibility
+fields, plus a read-only pending-genesis projection sourced from design 180.
+Status JSON never invokes genesis reconciliation: it writes nothing, prints no
 nudge, and is covered by `src/cli/json-output.test.ts:419-434`.
 
 Uninstall is a mandatory consumer. Today `keystoreBackupAtRisk` treats any
@@ -639,13 +740,24 @@ and output/process failures.
   plaintext choice explicit:
   `Keychain save failed (<safe class>) — save a PLAINTEXT file to ~/Downloads instead?`
   Default remains Yes for parity with today's recovery-kit offer. Nothing is
-  written until the user separately consents.
+  written until the user separately consents. During staged genesis, consent
+  still does not authorize a file write by itself: while the journal is active
+  and receipt-free, design 180 must RETARGET the exact Keychain completion
+  intent to the resolved plaintext path using its hardened write-new-then-
+  supersede replacement and witness-first reconciliation protocol. A retarget
+  failure writes no fallback file. On locked resume, a valid witness permits
+  only its exact old or exact new canonical intent, and the survivor's read-back/
+  file-fsync/directory-fsync suffix plus durable witness retirement must
+  complete before the Keychain target is retained or exact fallback commitment
+  may begin. Any other state fails closed; a receipt-bearing journal forbids
+  retarget and follows its existing cleanup outcome.
 - **Non-interactive genesis with `--kit`:** after the mandatory pre-publish
-  `rk.key` stage, a Keychain failure returns nonzero but retains staged RK and
-  staging metadata for a later `rbox key save`/backup retry. It never silently
-  creates a Downloads file and never removes staging before a verified
-  Keychain or explicit-file commitment. After commitment, it restores the
-  caller's original `cacheRecovery` preference as specified above.
+  design-180 `rk.key.staged` publication, a Keychain failure returns nonzero but
+  leaves that artifact and its unreleased journal hold for the setup/genesis
+  resume handler. It never silently creates a Downloads file. Only a
+  verified Keychain or explicit-file locator requests `artifact-committed`;
+  design 180 then restores the recorded `cacheRecovery` preference during
+  cleanup.
 - **Other non-interactive `--kit` / `rbox key save`:** fail nonzero and suggest
   an explicit `--kit-path <path>` or a GUI-session retry. Never silently write a
   file because Keychain happened to be unavailable.
@@ -658,9 +770,9 @@ and output/process failures.
   semantics rather than asking for the phrase again.
 - **Record failure after verified add:** report that the secret is present but
   status metadata could not be saved. Do not claim offer completion or delete
-  plaintext. During staged genesis, also retain staged RK and its marker because
-  the commitment locator is not yet durable. A later exact probe/re-save can
-  repair metadata.
+  plaintext. During staged genesis, leave design 180's `rk.key.staged` and
+  unreleased completion hold intact because the commitment locator is not yet
+  durable. A later exact probe/re-save can repair metadata.
 
 ### 6. Migrating off an existing plaintext kit
 
@@ -740,9 +852,11 @@ per-account mutation lock/atomic writes, plaintext parsing, aggregate safety,
 and target dispatcher. `src/cli/auth-cmd.ts` owns command UX and phrase-source
 selection. `src/cli/setup-cmd.ts` explicitly passes wizard's in-hand phrase.
 `src/cli/uninstall-cmd.ts` consumes aggregate safety, not mere record presence.
-Design 180 owns bootstrap-attempt persistence, verified enrollment
-classification, API publication, and repair; this design consumes only its
-typed publication outcome at the staged-RK boundary.
+Design 180 owns `rk.key.staged` creation/durability/hold/cleanup, the separate
+completion-intent record, bootstrap-attempt persistence, verified enrollment
+classification, API publication, and repair; this design consumes its journal
+phases and exact completion target only to layer cache-preference restoration
+and verified Keychain/file locator commitment.
 
 Add `key save` to dispatch (`src/cli/main-dispatch.ts:482-495`), command/group
 help (`src/cli/help-registry.ts:412-458`), completions through the help registry,
@@ -821,34 +935,65 @@ tables — remain side-effect free and receive exhaustive unit coverage.
    identity propagation; full OSStatus/timeout/signal/overflow probe table;
    bounded-output redaction; source matrix; target decision table; strict v2 +
    legacy parsing and unknown/mixed rejection; atomic-claim concurrency; JSON
-   mutation-free behavior; staging crash-point transitions and typed design-180
-   outcome handling; hardened RK/staging/locator/
+   mutation-free behavior; typed design-180 journal/cleanup outcomes; hardened cache/locator/
    explicit-file publication, exact read-back, file and parent-directory fsync,
    and post-unlink parent-directory fsync failures; fresh empty `RBOX_HOME`
    creation through every ancestor with injected failure at each ancestor fsync;
    cleanup precheck + second pre-unlink check; and uninstall state precedence,
-   including staged-only state plus plaintext and custom-Keychain backing paths
+   including design-180 pending state plus plaintext and custom-Keychain backing paths
    inside the removal root.
 2. **Command tests:** add dispatch/help/completion coverage for `key save`,
    cached no-stdin save, no-cache hidden TTY input, bounded non-TTY stdin,
    invalid/wrong-account phrase stores nothing, validation performs no
-   admission/cache mutation, substituted and historical-but-authorized recovery
-   wraps fail before unwrap, non-interactive macOS genesis captures the original
-   cache preference before forcing `cacheRecovery: true`, durably creates the
-   directory chain, and durably persists RK plus staging before handing
-   publication to design 180; stage/ancestor-fsync failure prevents publish;
-   exact Keychain or
+   admission/cache mutation, and explicit wrong-envelope and historical-
+   envelope substitution tests fail before unwrap even when the substituted
+   context is otherwise well-formed or historically authorized.
+   Non-interactive macOS genesis records the original
+   cache preference in design 180's journal without forcing a temporary
+   `rk.key`, and design 180 durably publishes `rk.key.staged` before POST;
+   stage/ancestor-fsync failure prevents publish;
+   completion intent is durably published before phrase display, Keychain add,
+   or explicit-file write; a restart with intent retries the exact resolved
+   identity/path, while a restart without intent visibly re-presents the
+   choices from staged RK only when no RETARGET witness exists. Every present
+   structurally invalid or version/account/digest/shape/target-mismatched intent
+   is preserved and fails closed. Persist `outcome:"claimed"`, crash after the claim
+   but before prompt emission or intent publication, and restart with the same
+   active journal: the completion prompt is visibly re-presented as continuation
+   of that enrollment episode without a second independent offer claim. Once a
+   valid matching intent exists, restart resumes that target instead of
+   re-offering. Exact Keychain or
    explicit-file verification, file fsync, containing-directory fsync, and
-   atomic commitment-locator persistence all precede stage cleanup; crashes at
-   each ordering boundary retain or reconcile RK safely; design 180's
-   `committed-this-attempt` result continues with staged RK retained,
-   `competing-genesis` alone permits abandoned-attempt cleanup, and
-   indeterminate/orphan/integrity failures preserve staged state; the
-   `recovery-kit-staging` completion hold is acknowledged only after durable
-   staged-state clearance; both original
-   `cacheRecovery` preferences are restored, staged status copy is emitted,
+   atomic commitment-locator persistence all precede the `artifact-committed`
+   receipt; crashes at each ordering boundary retain or reconcile RK safely;
+   design 180 alone authorizes cleanup and handles indeterminate/orphan/
+   integrity outcomes; both original `cacheRecovery` preferences are restored
+   by promotion/removal during ordinary winning cleanup, with exact destination
+   RK bytes required before promotion retirement; source absent plus invalid or
+   absent destination fails closed. `competing-cleaned` always quarantines
+   the losing staged RK, device file, and MK file together, regardless of
+   preference, and never promotes or bare-unlinks them; journal retirement
+   waits for the completed three-entry manifest. Staged status copy is emitted,
    `showRecoveryPhrase` is never called, offer copy adapts, JSON emits no
    nudge/write, and wizard offers before dropping phrase.
+   For interactive staged genesis, inject Keychain failure, explicit plaintext
+   consent, every crash/failure boundary of the hardened intent replacement,
+   fallback file publication and verification boundaries, locator publication,
+   and receipt publication. Add stage-specific locked-resume reconciliation
+   cases for crashes after replacement rename, after exact read-back, after
+   published-file fsync, and after parent-directory fsync. Extend that four-stage
+   matrix with crashes immediately before and after durable witness publication,
+   require the witness through every replacement durability stage and the pre-
+   retirement point, then cover post-unlink and post-parent-fsync witness absence
+   only after the survivor is fully durable.
+   Assert the failing invocation performs no fallback write; resume reads the
+   witness first and accepts either its exact old Keychain intent or exact new
+   file intent, completes the remaining read-back/file-fsync/directory-fsync
+   steps for whichever it found, and only then durably retires the witness and
+   proceeds. Missing canonical state with a witness, an invalid witness, and
+   every third canonical state fail closed. The exact old intent
+   retains the Keychain target, only the reconciled exact new intent permits
+   the exact fallback file target, and no retarget is allowed after a receipt.
    Relevant existing surfaces are `src/cli/auth-cmd.test.ts`,
    `src/cli/help-registry.test.ts:31-42`, and
    `src/cli/setup-cmd.test.ts:1094-1133`.
@@ -866,8 +1011,8 @@ tables — remain side-effect free and receive exhaustive unit coverage.
    | Recognized record with validated Keychain metadata | Resolver is never called; the same persisted canonical path reaches probe and read. |
    | No record or recognized record without Keychain metadata | Resolver is called exactly once; its one canonical path reaches probe and read. |
    | Exact account selection | Lookup uses the authenticated full account id; a different account's same-service item is never read or offered. |
-   | Successful recovery; no Keychain artifact at locked re-read | Atomic `discoveredAt` merge preserves existing plaintext artifacts, offer, and staging values and invents no `writtenAt`. |
-   | Successful recovery; same identity at locked re-read | Merge preserves existing timestamps plus plaintext, offer, and staging axes; it adds only missing discovery metadata. |
+   | Successful recovery; no Keychain artifact at locked re-read | Atomic `discoveredAt` merge preserves existing plaintext artifacts and offer and invents no `writtenAt`; design 180's journal is untouched. |
+   | Successful recovery; same identity at locked re-read | Merge preserves existing timestamps plus plaintext and offer axes; it adds only missing discovery metadata and leaves design 180 untouched. |
    | Successful recovery; different identity appeared before locked re-read | Concurrent identity and every other axis remain unchanged; emit a safe conflict warning. |
    | Rediscovery record lock/read/write failure | Safe warning only; enrollment remains successful. |
    | Unknown record | Resolver is called exactly once and read/recovery may proceed, but the record remains byte-for-byte untouched and a safe metadata warning is emitted. |
@@ -897,7 +1042,7 @@ tables — remain side-effect free and receive exhaustive unit coverage.
 
 1. `recovery-kit-keychain.ts`: shared spawn runner, explicit identity resolve,
    one-line add/verify/read/probe, OSStatus classifier, seams, and darwin test.
-2. `recovery-kit.ts`: v2 envelope/migration/parser, durable staged-RK state,
+2. `recovery-kit.ts`: v2 envelope/migration/parser without genesis staging,
    atomic claim, orthogonal artifact mutations, hardened directory/file
    publication, bounded plaintext parser, cleanup revalidation, and aggregate
    safety.
@@ -905,15 +1050,20 @@ tables — remain side-effect free and receive exhaustive unit coverage.
    dispatch/help/completions/usage and no-echo/TTY tests.
 4. Genesis staged-RK integration with design 180's typed outcome plus
    genesis/backup/standalone-recover/wizard-recover zero-typing offer plumbing;
-   status human/JSON rendering and once-per-installation claim tests.
+   status human/JSON rendering, once-per-installation claim tests, and the
+   unresolved-genesis journal-resolution exception.
 5. Restore-from-Keychain read/fallback/rediscovery flow, uninstall consumer,
    exact-match plaintext migration, integration matrix, and changelog note for
    non-interactive `--kit`.
 
 ## Open questions (for review)
 
-None in v7. The phrase-source, ACL, process, identity, state, offer, cleanup,
+None in v18. The phrase-source, ACL, process, identity, state, offer, cleanup,
 probe, uninstall, restore, staged-RK durability, explicit-file durability,
 directory-chain durability, and wording rulings above remain pinned and are not
 reopened by the design-180 split. Genesis publication, replay, classification,
-repair, and promotion order are reviewed only in design 180.
+repair, and promotion order are reviewed only in design 180. Both binding r10
+seam rulings are folded above and control the genesis offer-resolution. The
+binding r11 seam ruling and both binding r12 seam rulings are folded above; r12
+controls pre-receipt fallback-retarget provenance, witness reconciliation, and
+absence-only reselection.
