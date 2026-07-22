@@ -19,7 +19,8 @@ import { saveCredentials } from "./credentials.js";
 import { _setSpawner } from "./browser-open.js";
 import { AccountAlreadyBootstrappedError } from "./remote.js";
 import { acquireGenesisLock, hasDevice, loadRecoveryKey, saveRecoveryKey } from "./e2ee-keystore.js";
-import type { AccountKeysDTO } from "./e2ee-remote.js";
+import type { AccountKeysDTO, GenesisAccountObservation, GenesisPresence } from "./e2ee-remote.js";
+import { bootstrapAccount } from "../engine/e2ee/index.js";
 
 const ACCOUNT_KEYS: AccountKeysDTO = { recoveryWrap: null, recoveryWrapId: null, rosters: [], keyStates: [], devices: [] };
 
@@ -29,18 +30,26 @@ class FakeGenesisApi {
 
   constructor(
     private readonly keys: Array<AccountKeysDTO | null>,
-    private readonly bootstrapResult: "ok" | "already" | "network" = "ok"
+    private readonly bootstrapResult: "ok" | "already" | "network" = "ok",
+    private readonly accountId="acct_0123456789abcdef",
+    private readonly deviceId="dev_genesis",
   ) {}
+
+  private committed?:AccountKeysDTO;
+  private async completeDto():Promise<AccountKeysDTO>{const boot=await bootstrapAccount(this.accountId,this.deviceId,1_900_000_000_000);const present:GenesisPresence={rosters:1,keyStates:1,devices:1,workspaces:0,workspaceKeys:0,e2eePairingTokens:0};return{genesisPresenceVersion:1,recoveryWrap:JSON.stringify(boot.upload.recoveryWrap),recoveryWrapId:boot.upload.recoveryWrapId,claimCreatedAt:1_900_000_000_000,genesisDeviceId:this.deviceId,rosters:[JSON.stringify(boot.upload.genesisRoster)],keyStates:[JSON.stringify(boot.upload.genesisKeyState)],devices:[{deviceId:this.deviceId,sigPubkey:boot.upload.device.sigPubKey,encPubkey:boot.upload.device.encPubKey,mkWrap:JSON.stringify(boot.upload.device.mkWrap)}],present,repairTombstone:null};}
+
+  async getGenesisObservation():Promise<GenesisAccountObservation>{this.getCalls++;if(this.committed){const present=this.committed.present!;return{genesisPresenceVersion:1,claim:this.committed,present,repairTombstone:null};}const current=this.keys.length>1?this.keys.shift()!:this.keys[0]!;if(current===null)return{genesisPresenceVersion:1,claim:null,present:{rosters:0,keyStates:0,devices:0,workspaces:0,workspaceKeys:0,e2eePairingTokens:0}};const claim=await this.completeDto();return{genesisPresenceVersion:1,claim,present:claim.present!,repairTombstone:null};}
 
   async getAccountKeys(): Promise<AccountKeysDTO | null> {
     this.getCalls++;
     return this.keys.length > 1 ? this.keys.shift()! : this.keys[0]!;
   }
 
-  async bootstrapKeys(): Promise<void> {
+  async bootstrapKeys(raw?:unknown): Promise<void> {
     this.bootstrapCalls++;
-    if (this.bootstrapResult === "already") throw new AccountAlreadyBootstrappedError();
+    if (this.bootstrapResult === "already") {this.committed=await this.completeDto();throw new AccountAlreadyBootstrappedError();}
     if (this.bootstrapResult === "network") throw new Error("network down");
+    const b=JSON.parse(String(raw)) as Record<string,any>;const present:GenesisPresence={rosters:1,keyStates:1,devices:1,workspaces:0,workspaceKeys:0,e2eePairingTokens:0};this.committed={genesisPresenceVersion:1,recoveryWrap:b.recoveryWrap,recoveryWrapId:b.recoveryWrapId,claimCreatedAt:1_900_000_000_000,genesisDeviceId:b.device.deviceId,rosters:[b.genesisRoster],keyStates:[b.genesisKeyState],devices:[{deviceId:b.device.deviceId,sigPubkey:b.device.sigPubKey,encPubkey:b.device.encPubKey,mkWrap:b.device.mkWrap}],present,repairTombstone:null};
   }
 }
 
@@ -185,10 +194,10 @@ test("logout clears credentials and the queued account profile", async () => {
 
 describe("runGenesisEnrollment", () => {
   test("null account keys mints genesis, shows the phrase, and leaves local device material", async () => {
-    const api = new FakeGenesisApi([null]);
+    const api = new FakeGenesisApi([null],"ok","acct_0123456789abcdef","dev_genesis");
     let shown = "";
 
-    const result = await runGenesisEnrollment(api, { accountId: "acct_genesis", deviceId: "dev_genesis" }, { kit: false }, {
+    const result = await runGenesisEnrollment(api, { accountId: "acct_0123456789abcdef", deviceId: "dev_genesis" }, { kit: false }, {
       now: () => 1_900_000_000_000,
       showRecoveryPhrase: async (phrase) => {
         shown = phrase;
@@ -198,14 +207,14 @@ describe("runGenesisEnrollment", () => {
     expect(result).toBe("enrolled");
     expect(api.bootstrapCalls).toBe(1);
     expect(shown.split(/\s+/).length).toBe(24);
-    expect(await hasDevice("acct_genesis")).toBe(true);
+    expect(await hasDevice("acct_0123456789abcdef")).toBe(true);
   });
 
   test("existing account keys returns the pair/recover signal without minting", async () => {
-    const api = new FakeGenesisApi([ACCOUNT_KEYS]);
+    const api = new FakeGenesisApi([ACCOUNT_KEYS],"ok","acct_1111111111111111","dev_existing");
     let shown = false;
 
-    const result = await runGenesisEnrollment(api, { accountId: "acct_existing", deviceId: "dev_existing" }, { kit: false }, {
+    const result = await runGenesisEnrollment(api, { accountId: "acct_1111111111111111", deviceId: "dev_existing" }, { kit: false }, {
       showRecoveryPhrase: async () => {
         shown = true;
       },
@@ -214,14 +223,14 @@ describe("runGenesisEnrollment", () => {
     expect(result).toBe("already-setup");
     expect(api.bootstrapCalls).toBe(0);
     expect(shown).toBe(false);
-    expect(await hasDevice("acct_existing")).toBe(false);
+    expect(await hasDevice("acct_1111111111111111")).toBe(false);
   });
 
-  test("409 already_bootstrapped removes pre-persisted device material and cached recovery key", async () => {
-    const api = new FakeGenesisApi([null, ACCOUNT_KEYS], "already");
-    await saveRecoveryKey("acct_race", new Uint8Array([1, 2, 3]));
+  test("409 competing bootstrap quarantines the losing attempt but preserves unrelated cached recovery", async () => {
+    const accountId="acct_2222222222222222";const api = new FakeGenesisApi([null], "already",accountId,"dev_race");
+    await saveRecoveryKey(accountId, new Uint8Array([1, 2, 3]));
 
-    const result = await runGenesisEnrollment(api, { accountId: "acct_race", deviceId: "dev_race" }, { kit: false }, {
+    const result = await runGenesisEnrollment(api, { accountId, deviceId: "dev_race" }, { kit: false }, {
       now: () => 1_900_000_000_000,
       showRecoveryPhrase: async () => {
         throw new Error("phrase should not be shown after a 409");
@@ -229,43 +238,43 @@ describe("runGenesisEnrollment", () => {
     });
 
     expect(result).toBe("already-setup");
-    expect(api.getCalls).toBe(2);
-    expect(await hasDevice("acct_race")).toBe(false);
-    expect(await loadRecoveryKey("acct_race")).toBeUndefined();
+    expect(api.getCalls).toBe(3);
+    expect(await hasDevice(accountId)).toBe(false);
+    expect(await loadRecoveryKey(accountId)).toBeDefined();
   });
 
   test("non-409 bootstrap failures leave crash-safety material for retry", async () => {
-    const api = new FakeGenesisApi([null], "network");
-    await saveRecoveryKey("acct_retry", new Uint8Array([4, 5, 6]));
+    const accountId="acct_3333333333333333";const api = new FakeGenesisApi([null], "network",accountId,"dev_retry");
+    await saveRecoveryKey(accountId, new Uint8Array([4, 5, 6]));
 
     await expect(
-      runGenesisEnrollment(api, { accountId: "acct_retry", deviceId: "dev_retry" }, { kit: false }, {
+      runGenesisEnrollment(api, { accountId, deviceId: "dev_retry" }, { kit: false }, {
         now: () => 1_900_000_000_000,
       })
-    ).rejects.toThrow(/network/);
+    ).rejects.toThrow(/unconfirmed/);
 
-    expect(await hasDevice("acct_retry")).toBe(true);
-    expect(await loadRecoveryKey("acct_retry")).toBeDefined();
+    expect(await hasDevice(accountId)).toBe(true);
+    expect(await loadRecoveryKey(accountId)).toBeDefined();
   });
 });
 
 describe("genesis lock", () => {
   test("second acquire while held reports setup contention", () => {
-    const release = acquireGenesisLock("acct_lock");
+    const accountId="acct_4444444444444444";const release = acquireGenesisLock(accountId);
     try {
-      expect(() => acquireGenesisLock("acct_lock")).toThrow("another rbox process is already setting up encryption for this account");
+      expect(() => acquireGenesisLock(accountId)).toThrow("another rbox process is already setting up encryption for this account");
     } finally {
       release();
     }
 
-    const releaseAgain = acquireGenesisLock("acct_lock");
+    const releaseAgain = acquireGenesisLock(accountId);
     releaseAgain();
   });
 
   test("stale dead-pid lock is taken over", async () => {
-    const accountId = "acct_stale_lock";
-    const dir = path.join(home, ".rbox", "e2ee", accountId);
-    const lock = path.join(dir, "genesis.lock");
+    const accountId = "acct_5555555555555555";
+    const dir = path.join(home, ".rbox", "locks", "genesis");
+    const lock = path.join(dir, `${accountId}.lock`);
     await fs.mkdir(dir, { recursive: true, mode: 0o700 });
     await fs.writeFile(lock, "2147483647");
 
@@ -409,12 +418,13 @@ test("bootstrap login success prints the shared workspace step", async () => {
   console.log = (...args: unknown[]) => void output.push(args.map(String).join(" "));
   const priorError = console.error;
   console.error = (...args: unknown[]) => void errors.push(args.map(String).join(" "));
+  const existing=await bootstrapAccount("acct_6666666666666666","dev_bootstrap",1_900_000_000_000);const existingPresence={rosters:1,keyStates:1,devices:1,workspaces:0,workspaceKeys:0,e2eePairingTokens:0};const existingDto={genesisPresenceVersion:1,recoveryWrap:JSON.stringify(existing.upload.recoveryWrap),recoveryWrapId:existing.upload.recoveryWrapId,claimCreatedAt:1_900_000_000_000,genesisDeviceId:"dev_bootstrap",rosters:[JSON.stringify(existing.upload.genesisRoster)],keyStates:[JSON.stringify(existing.upload.genesisKeyState)],devices:[{deviceId:"dev_bootstrap",sigPubkey:existing.upload.device.sigPubKey,encPubkey:existing.upload.device.encPubKey,mkWrap:JSON.stringify(existing.upload.device.mkWrap)}],present:existingPresence,repairTombstone:null};
   globalThis.fetch = (async (input: string | URL | Request) => {
     const url = String(input);
     if (url.endsWith("/v1/auth/device/bootstrap")) {
-      return new Response(JSON.stringify({ token: "tok", deviceId: "dev_bootstrap", accountId: "acct_bootstrap" }));
+      return new Response(JSON.stringify({ token: "tok", deviceId: "dev_bootstrap", accountId: "acct_6666666666666666" }));
     }
-    if (url.endsWith("/v1/keys/account")) return new Response(JSON.stringify(ACCOUNT_KEYS));
+    if (url.endsWith("/v1/keys/account")) return new Response(JSON.stringify(existingDto));
     throw new Error(`unexpected fetch: ${url}`);
   }) as typeof fetch;
 

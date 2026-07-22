@@ -10,7 +10,7 @@
   "scripts": {
     "dev:install": "bun scripts/dev-install.ts",
     "test": "bun test ./src/ ./scripts/gc-drain.test.ts",
-    "test:api": "cd apps/api && vitest run",
+    "test:api": "cd apps/api && XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-/tmp/rbox-wrangler-config} vitest run --configLoader runner",
     "test:affected": "bun scripts/test-affected.ts",
     "test:storage-truth": "bun test ./scripts/storage-truth.test.ts ./scripts/storage-truth-live-unit.test.ts ./scripts/storage-truth-live.test.ts",
     "test:all": "bun test ./src/ ./scripts/gc-drain.test.ts && bun run test:storage-truth && cd apps/api && vitest run",
