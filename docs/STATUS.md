@@ -5,7 +5,22 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
-_Last updated: 2026-07-22 (~12:15 UTC — **v1.7.21 fleet-live + prod
+_Last updated: 2026-07-22 (~13:15 UTC — **v1.7.22 fleet-live**): founder
+follow-up "make sure rbox upgrade swaps the daemon fully" → design 181 +
+PR #393 (merged 637bebd6): `restartDaemonsAfterUpgrade` gains `staleOnly`
+(reads the daemonVersion witness AFTER binding validation; absent/malformed/
+versionless = stale), both "already up to date" exits now restart stale
+daemons, `--check` untouched. Released **v1.7.22 "upgrade finishes the job"**
+(e69caf04, CI green first try, release run success). Fleet via pure
+`rbox upgrade` — its own field test: Mac 1.7.21→1.7.22 both daemons
+restarted; FM "restarted (pull-only)", witness `pull-only 1.7.22`; desktop
+exposed NEW papercut — 36 dead `rbox-daemon-activity-*` test-litter dirs in
+the real ~/.rbox/daemons, one unreadable record → non-zero exit (litter
+removed after verifying 0 live pids; papercut filed: fix the test writing to
+real RBOX_HOME + treat dead-pid unreadable records as debris). Fleet:
+Mac RW 1.7.22, FM pull-only 1.7.22, desktop binary 1.7.22 (unbound)._
+
+_Previous: 2026-07-22 (~12:15 UTC — **v1.7.21 fleet-live + prod
 promoted**): founder authorized merge/release/prod. Sequence: promoted
 `main → production` at 500fc5a3 (deploy-api run green: tests → prod D1
 migrations → deploy — prod API accepts `stale-unattributed` BEFORE any client
