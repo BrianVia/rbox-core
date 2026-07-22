@@ -8,6 +8,7 @@ import { saveConfig, saveStateUnsafeLegacyOrTest, syncStreamId, type WorkspaceCo
 import { accountStatus } from "./account-cmd.js";
 import { flushAccountProfileWrites } from "./account-profile.js";
 import { listDevices, keyStatus } from "./auth-cmd.js";
+import { publishPrepublishMarker } from "./genesis-durable.js";
 import { daemonRuntimeDir } from "./daemon-control.js";
 import type { DaemonActivity } from "./activity.js";
 import { statusCmd, statusCmdWithDeps, type StatusCmdDeps } from "./status-cmd.js";
@@ -15,6 +16,7 @@ import { trashCmd } from "./trash-cmd.js";
 import { RBOX_VERSION } from "./version.js";
 import { versionsCmd } from "./versions-cmd.js";
 import { fail, setJsonErrorMode } from "./style.js";
+import { renderKit, writeRecoveryKit } from "./recovery-kit.js";
 
 const origFetch = globalThis.fetch;
 const origStdout = process.stdout.write.bind(process.stdout);
@@ -379,12 +381,12 @@ test("account status --json emits JSON", async () => {
   process.env.RBOX_DEVICE_ID = "dev_a";
   stubFetch((url) =>
     url.endsWith("/v1/account/status")
-      ? { status: 200, body: { accountId: "acct_a", linked: true, plan: "none", email: "owner@example.com", signInMethod: "github" } }
+      ? { status: 200, body: { accountId: "acct_aaaaaaaaaaaaaaaa", linked: true, plan: "none", email: "owner@example.com", signInMethod: "github" } }
       : { status: 200, body: { plan: "pro", graceUntil: 123, readOnly: true } }
   );
 
   const dto = JSON.parse(await captureStdout(() => accountStatus({ json: true })));
-  expect(dto).toEqual({ accountId: "acct_a", plan: "pro", graceUntil: 123, readOnly: true, linked: true, email: "owner@example.com", signInMethod: "github" });
+  expect(dto).toEqual({ accountId: "acct_aaaaaaaaaaaaaaaa", plan: "pro", graceUntil: 123, readOnly: true, linked: true, email: "owner@example.com", signInMethod: "github" });
 });
 
 test("versions --json emits JSON", async () => {
@@ -420,17 +422,67 @@ test("key status --json emits enrollment and recovery-kit state", async () => {
   process.env.RBOX_TOKEN = "tok";
   process.env.RBOX_API = "https://api.test";
   process.env.RBOX_DEVICE_ID = "dev_a";
-  process.env.RBOX_ACCOUNT_ID = "acct_a";
+  process.env.RBOX_ACCOUNT_ID = "acct_aaaaaaaaaaaaaaaa";
   process.env.RBOX_HOME = tmp;
-  const kit = path.join(tmp, ".rbox", "e2ee", "acct_a", "kit.json");
+  const kit = path.join(tmp, ".rbox", "e2ee", "acct_aaaaaaaaaaaaaaaa", "kit.json");
   await fs.mkdir(path.dirname(kit), { recursive: true });
   await fs.writeFile(kit, JSON.stringify({ path: "/tmp/rbox-kit.txt", writtenAt: "2026-07-04T12:00:00.000Z" }));
 
   const dto = JSON.parse(await captureStdout(() => keyStatus({ json: true })));
   expect(dto).toEqual({
     enrolled: false,
-    recoveryKit: { path: "/tmp/rbox-kit.txt", writtenAt: "2026-07-04T12:00:00.000Z" },
+    recoveryKit: {
+      version: 2,
+      recordState: "recognized",
+      plaintextArtifacts: [{
+        path: "/tmp/rbox-kit.txt",
+        writtenAt: "2026-07-04T12:00:00.000Z",
+        cleanup: "pending",
+        state: "missing",
+      }],
+      path: "/tmp/rbox-kit.txt",
+      writtenAt: "2026-07-04T12:00:00.000Z",
+      pendingGenesis: false,
+    },
   });
+});
+
+test("key status --json marks a cross-account plaintext artifact unrecognized", async () => {
+  const accountId = "acct_aaaaaaaaaaaaaaaa";
+  const otherAccount = "acct_bbbbbbbbbbbbbbbb";
+  const phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
+  const now = new Date("2026-07-04T12:00:00.000Z");
+  process.env.RBOX_TOKEN = "tok";
+  process.env.RBOX_API = "https://api.test";
+  process.env.RBOX_DEVICE_ID = "dev_a";
+  process.env.RBOX_ACCOUNT_ID = accountId;
+  process.env.RBOX_HOME = tmp;
+  const file = path.join(tmp, "kit.txt");
+  await writeRecoveryKit(phrase, { accountId }, file, now);
+  await fs.writeFile(file, renderKit({ accountId: otherAccount, phrase, hostname: "other", generatedAt: now }), { mode: 0o600 });
+
+  const dto = JSON.parse(await captureStdout(() => keyStatus({ json: true })));
+  expect(dto.recoveryKit.plaintextArtifacts[0].state).toBe("unrecognized");
+});
+
+test("key status --json projects an unreleased genesis hold without mutating an offer", async () => {
+  process.env.RBOX_TOKEN = "tok";
+  process.env.RBOX_API = "https://api.test";
+  process.env.RBOX_DEVICE_ID = "dev_a";
+  process.env.RBOX_ACCOUNT_ID = "acct_aaaaaaaaaaaaaaaa";
+  process.env.RBOX_HOME = tmp;
+  await publishPrepublishMarker({
+    version: 1,
+    accountId: "acct_aaaaaaaaaaaaaaaa",
+    deviceId: "dev_a",
+    repairId: null,
+    startedAt: "2026-07-04T12:00:00.000Z",
+    phase: "prepublish",
+  });
+
+  const dto = JSON.parse(await captureStdout(() => keyStatus({ json: true })));
+  expect(dto.recoveryKit).toEqual({ version: 2, recordState: "missing", plaintextArtifacts: [], pendingGenesis: true });
+  expect(await fs.exists(path.join(tmp, ".rbox", "e2ee", "acct_aaaaaaaaaaaaaaaa", "kit.json"))).toBe(false);
 });
 
 test("json error mode emits {error} to stderr", () => {

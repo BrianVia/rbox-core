@@ -48,7 +48,7 @@ const ACCOUNT_KEYS: AccountKeysDTO = { recoveryWrap: null, recoveryWrapId: null,
 const validSetupCredentials = async () => ({
   state: "valid" as const,
   source: "disk" as const,
-  credentials: { v: 1 as const, token: "tok", deviceId: "dev_setup", remoteUrl: "https://api.test", accountId: "acct_setup" },
+  credentials: { v: 1 as const, token: "tok", deviceId: "dev_setup", remoteUrl: "https://api.test", accountId: "acct_100000000000000b" },
   legacy: false,
   extensions: {},
 });
@@ -332,7 +332,7 @@ test("resolveEnrollment: existing key world keeps the current three choices and 
     { name: "Recover with my 24-word phrase", value: "recover" },
     { name: "I'll do this later", value: "later", description: "re-run `rbox setup` once you've paired or recovered" },
   ]);
-  expect(err[0]).toBe("\n⚠  This machine is authorized (acct_setup) but NOT yet enrolled for encryption. Enroll it now:\n");
+  expect(err[0]).toBe("\n⚠  This machine is authorized (acct_100000000000000b) but NOT yet enrolled for encryption. Enroll it now:\n");
 });
 
 test("resolveEnrollment pairing and recovery exhaust their own local budget back to enrollment menu", async () => {
@@ -435,7 +435,7 @@ test("keyed setup persists credentials with private file mode", async () => {
   process.env.HOME = home;
   try {
     await persistKeyedCredentials(
-      { token: "rbox_pat_keyed", deviceId: "agent_dev", accountId: "acct_keyed" },
+      { token: "rbox_pat_keyed", deviceId: "agent_dev", accountId: "acct_100000000000000c" },
       "https://api.test"
     );
     const file = path.join(home, ".rbox", "credentials.json");
@@ -444,7 +444,7 @@ test("keyed setup persists credentials with private file mode", async () => {
       token: "rbox_pat_keyed",
       deviceId: "agent_dev",
       remoteUrl: "https://api.test",
-      accountId: "acct_keyed",
+      accountId: "acct_100000000000000c",
     });
     expect((await fs.stat(file)).mode & 0o777).toBe(0o600);
   } finally {
@@ -1197,6 +1197,36 @@ test("checksum-valid but wrong recovery phrase reaches exactly one prevalidated 
   expect(result).toBe("parent");
   expect(prompts).toBe(1);
   expect(enrolls).toBe(1);
+});
+
+test("wizard recovery offers the canonical in-hand phrase before dropping it", async () => {
+  const phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
+  const events: string[] = [];
+  const result = await recoverInWizard({
+    promptInput: (async () => phrase) as never,
+    enroll: async () => { events.push("enrolled"); return { accountId: "acct_0123456789abcdef", deviceId: "dev" }; },
+    offerRecoveryKit: async (received, creds) => {
+      events.push("offered");
+      expect(received).toBe(phrase);
+      expect(creds.accountId).toBe("acct_0123456789abcdef");
+    },
+  });
+  expect(result).toBe("enrolled");
+  expect(events).toEqual(["enrolled", "offered"]);
+});
+
+test("wizard recovery keeps enrollment successful when the optional kit offer fails", async () => {
+  const phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
+  const warnings: string[] = [];
+  const result = await recoverInWizard({
+    promptInput: (async () => phrase) as never,
+    enroll: async () => ({ accountId: "acct_0123456789abcdef", deviceId: "dev" }),
+    offerRecoveryKit: async () => { throw new Error("Keychain unavailable") },
+    writeStderr: (line) => warnings.push(line),
+  });
+  expect(result).toBe("enrolled");
+  expect(warnings.join(" ")).toContain("recovery succeeded");
+  expect(warnings.join(" ")).toContain("Keychain unavailable");
 });
 
 test("keyed setup requires key input when --workspace is present", async () => {

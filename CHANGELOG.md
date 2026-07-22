@@ -6,6 +6,11 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+- macOS recovery-kit saves now use an explicit login Keychain item by default,
+  with validated `rbox key save`, Keychain-first recovery, strict live status,
+  and `--kit-path` retained for deliberate plaintext export (design 179).
+
 ## [1.7.22] — 2026-07-22 — "upgrade finishes the job"
 
 ### Fixed

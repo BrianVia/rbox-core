@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  assertCurrentRecoveryWrap,
   bootstrapAccount,
   buildCommit,
   createWorkspaceKey,
@@ -9,6 +10,7 @@ import {
   recoverMasterKey,
   verifyAccount,
 } from "./session.js";
+import { wrapHash } from "./keys.js";
 import { GENESIS_PARENT_HASH } from "./commit.js";
 import { phraseToRk, toB64url, utf8 } from "./index.js";
 
@@ -92,5 +94,18 @@ describe("session — recovery + own-device MK unwrap", () => {
     const boot = await bootedAccount();
     const wrong = await phraseToRk((await bootstrapAccount("x", "y", NOW)).recoveryPhrase);
     await expect(recoverMasterKey("acct_s", 0, wrong, boot.upload.recoveryWrap)).rejects.toThrow();
+  });
+
+  test("current recovery-wrap binding rejects foreign and historically authorized substitution", async () => {
+    const current = await bootedAccount();
+    const foreign = await bootstrapAccount("acct_foreign", "devB", NOW + 1);
+    const verified = await verifyAccount([current.upload.genesisRoster], [current.upload.genesisKeyState]);
+    await expect(assertCurrentRecoveryWrap(foreign.upload.recoveryWrap, verified)).rejects.toThrow(/current wrap/);
+
+    // Model a previously authorized wrap retained in signed history: generic C7
+    // authorization is insufficient; the latest recoveryWrapId still controls.
+    verified.authorizedMkWrapHashes.add(await wrapHash(foreign.upload.recoveryWrap));
+    await expect(assertCurrentRecoveryWrap(foreign.upload.recoveryWrap, verified)).rejects.toThrow(/current wrap/);
+    await expect(assertCurrentRecoveryWrap(current.upload.recoveryWrap, verified)).resolves.toBeUndefined();
   });
 });

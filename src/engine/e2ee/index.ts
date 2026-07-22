@@ -94,6 +94,7 @@ export {
   type SignedKeyState,
 } from "./epoch.js";
 export {
+  assertCurrentRecoveryWrap,
   assertMkWrapAuthorized,
   bootstrapAccount,
   buildCommit,

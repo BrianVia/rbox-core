@@ -28,10 +28,10 @@ import { GITIGNORE_CHOICES, WORKSPACE_DEFINITION, continueInitWithPrecreatedWork
 import { mintWizardAdoptConsent, type AdoptConsentWitness } from "./adopt-consent.js";
 import { rootHasAdoptableContent } from "./adopt-inventory.js";
 import { collapseHome, interpretWorkspaceNameAnswer } from "./init-plan.js";
-import { EXISTING_ACCOUNT_ENROLLMENT_MESSAGE, login, pairCreate, redeemPair, runGenesisEnrollment } from "./auth-cmd.js";
+import { EXISTING_ACCOUNT_ENROLLMENT_MESSAGE, login, offerRecoveryKitAfterRecover, pairCreate, redeemPair, runGenesisEnrollment } from "./auth-cmd.js";
 import { enrollViaPrevalidatedRecovery, PairingTokenShapeError, parsePairingToken } from "./e2ee-client.js";
 import { genesisClassifierConsultationNeeded, pendingGenesisState } from "./genesis-enrollment.js";
-import { phraseToRk } from "../engine/e2ee/index.js";
+import { phraseToRk, rkToPhrase } from "../engine/e2ee/index.js";
 import { enableAutostart, startDaemonAndRecordDesired } from "./autostart-cmd.js";
 import { credentialsForStrictFlow, loadCredentials, type CredentialLoadResult } from "./credentials.js";
 import { loadConfigIfPresent, loadRawState, syncStreamId } from "./config.js";
@@ -351,6 +351,7 @@ interface WizardRecoveryDeps {
   writeStderr?: (text: string) => void;
   now?: () => number;
   loadedCredentials?: CredentialLoadResult;
+  offerRecoveryKit?: typeof offerRecoveryKitAfterRecover;
 }
 
 /** Validate the phrase locally up to three times, then make one continuation attempt. */
@@ -368,13 +369,21 @@ export async function recoverInWizard(deps: WizardRecoveryDeps = {}): Promise<"e
       writeStderr(`${e.yellow(error instanceof Error ? error.message : String(error))}\n`);
       continue;
     }
+    let enrolled: { accountId: string; deviceId: string };
     try {
-      await enroll(recoveryKey, (deps.now ?? Date.now)(), deps.loadedCredentials);
-      return "enrolled";
+      enrolled = await enroll(recoveryKey, (deps.now ?? Date.now)(), deps.loadedCredentials);
     } catch (error) {
       writeStderr(`${e.yellow(error instanceof Error ? error.message : String(error))}\n`);
+      recoveryKey.fill(0);
       return "parent";
     }
+    try {
+      const canonicalPhrase = await rkToPhrase(recoveryKey);
+      await (deps.offerRecoveryKit ?? offerRecoveryKitAfterRecover)(canonicalPhrase, enrolled, { kit: false }, "wizard-recover");
+    } catch (error) {
+      writeStderr(`${e.yellow(`recovery succeeded, but the optional recovery-kit offer failed: ${error instanceof Error ? error.message : String(error)}`)}\n`);
+    } finally { recoveryKey.fill(0) }
+    return "enrolled";
   }
   return "parent";
 }

@@ -274,6 +274,17 @@ export async function assertMkWrapAuthorized(wrap: Wrap, account: VerifiedAccoun
   if (!account.authorizedMkWrapHashes.has(h)) throw new Error("MK wrap not authorized by the signed roster/key-state (possible server substitution)");
 }
 
+/** Recovery is stricter than generic historical wrap authorization: the server
+ * must return the exact wrap named by the latest verified key state. */
+export async function assertCurrentRecoveryWrap(wrap: Wrap, account: VerifiedAccount): Promise<void> {
+  const actual = await wrapHash(wrap);
+  const expected = account.keyStates[account.keyStates.length - 1]?.recoveryWrapId;
+  if (!expected || actual !== expected) {
+    throw new Error("recovery wrap is not the current wrap authorized by the signed key state (possible server substitution)");
+  }
+  await assertMkWrapAuthorized(wrap, account);
+}
+
 /** Verify a commit's signature against the device active in ITS OWN roster version
  *  (authentic history — a link may predate a rotation). Throws on an unknown roster,
  *  an inactive/unknown signer, or a bad signature. Shared by chain + history-segment

@@ -32,6 +32,7 @@ test("per-command help: a command with registered sub-verbs includes them", () =
   expect(helpFor("key")?.map((entry) => entry.name)).toEqual([
     "key",
     "key status",
+    "key save",
     "key backup",
     "key recover",
     "key genesis",

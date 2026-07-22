@@ -6,7 +6,13 @@ import {
   KIT_BANNER,
   kitFileName,
   kitTargetDir,
+  installRecoveryKitWriteTestHook,
+  parseRecoveryKitRecord,
+  pathIsInsideRemovalRoot,
+  claimRecoveryKitOffer,
   readRecoveryKitRecord,
+  readRecoveryKitRecordState,
+  recoveryKitSafety,
   recoveryKitAction,
   recoveryKitFileState,
   recoveryKitOptionsFromFlags,
@@ -17,9 +23,10 @@ import {
 
 const ACCOUNT = "acct_0123456789abcdef";
 const DATE = new Date(2026, 6, 3, 9, 8, 7);
-const PHRASE = "abandon ability able about above absent absorb abstract absurd abuse access accident account accuse achieve acid acoustic acquire across act action actor actress actual";
+const PHRASE = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
 
 let tmp: string;
+let restoreWriteHook: (() => void) | undefined;
 
 beforeEach(async () => {
   tmp = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-kit-"));
@@ -27,6 +34,8 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  restoreWriteHook?.();
+  restoreWriteHook = undefined;
   delete process.env.RBOX_HOME;
   await fs.rm(tmp, { recursive: true, force: true });
 });
@@ -76,9 +85,13 @@ describe("recovery kit", () => {
     expect((await fs.stat(file)).mode & 0o777).toBe(0o600);
 
     const record = await readRecoveryKitRecord(ACCOUNT);
-    expect(record).toEqual({ path: file, writtenAt: DATE.toISOString() });
+    expect(record).toEqual({
+      version: 2,
+      accountId: ACCOUNT,
+      plaintextArtifacts: [{ path: file, writtenAt: DATE.toISOString(), cleanup: "pending" }],
+    });
     expect((await fs.stat(recoveryKitRecordPath(ACCOUNT))).mode & 0o777).toBe(0o600);
-    expect(await recoveryKitFileState(record!)).toBe("present");
+    expect(await recoveryKitFileState(ACCOUNT, record!.plaintextArtifacts[0])).toBe("present");
   });
 
   test("status detects missing and replaced kit files", async () => {
@@ -87,10 +100,24 @@ describe("recovery kit", () => {
     const record = (await readRecoveryKitRecord(ACCOUNT))!;
 
     await fs.writeFile(file, "not a kit\n", { mode: 0o600 });
-    expect(await recoveryKitFileState(record)).toBe("unrecognized");
+    expect(await recoveryKitFileState(ACCOUNT, record.plaintextArtifacts[0])).toBe("unrecognized");
 
     await fs.rm(file);
-    expect(await recoveryKitFileState(record)).toBe("missing");
+    expect(await recoveryKitFileState(ACCOUNT, record.plaintextArtifacts[0])).toBe("missing");
+  });
+
+  test("plaintext probes bind every artifact to the current account", async () => {
+    const file = path.join(tmp, "cross-account.txt");
+    await fs.writeFile(file, renderKit({ accountId: "acct_ffffffffffffffff", phrase: PHRASE, hostname: "other", generatedAt: DATE }), { mode: 0o600 });
+    expect(await recoveryKitFileState(ACCOUNT, { path: file, writtenAt: DATE.toISOString(), cleanup: "pending" })).toBe("unrecognized");
+  });
+
+  test("record paths reject malformed accounts before interpolation and stay in the exact account directory", () => {
+    expect(() => recoveryKitRecordPath("acct_../escape")).toThrow(/malformed account id/);
+    expect(() => recoveryKitRecordPath("acct_A123456789abcdef")).toThrow(/malformed account id/);
+    const record = recoveryKitRecordPath(ACCOUNT);
+    expect(record).toBe(path.join(tmp, ".rbox", "e2ee", ACCOUNT, "kit.json"));
+    expect(path.dirname(record)).toBe(path.join(tmp, ".rbox", "e2ee", ACCOUNT));
   });
 
   test("writer refuses an existing symlink target", async () => {
@@ -99,5 +126,129 @@ describe("recovery kit", () => {
     await fs.writeFile(target, "old");
     await fs.symlink(target, link);
     await expect(writeRecoveryKit(PHRASE, { accountId: ACCOUNT }, link, DATE)).rejects.toThrow(/symlink/);
+  });
+
+  test("strict parser normalizes only the exact legacy shape and rejects unknown or mixed records", () => {
+    expect(parseRecoveryKitRecord({ path: "/tmp/kit", writtenAt: DATE.toISOString() }, ACCOUNT)).toEqual({
+      version: 2,
+      accountId: ACCOUNT,
+      plaintextArtifacts: [{ path: "/tmp/kit", writtenAt: DATE.toISOString(), cleanup: "pending" }],
+    });
+    expect(parseRecoveryKitRecord({ path: "/tmp/kit", writtenAt: DATE.toISOString(), extra: true }, ACCOUNT)).toBeUndefined();
+    expect(parseRecoveryKitRecord({ version: 3, accountId: ACCOUNT, plaintextArtifacts: [] }, ACCOUNT)).toBeUndefined();
+    expect(parseRecoveryKitRecord({ version: 2, accountId: "acct_ffffffffffffffff", plaintextArtifacts: [] }, ACCOUNT)).toBeUndefined();
+    expect(parseRecoveryKitRecord({ version: 2, accountId: ACCOUNT, plaintextArtifacts: [], path: "/tmp/legacy" }, ACCOUNT)).toBeUndefined();
+  });
+
+  test("unknown records are distinguished and never overwritten", async () => {
+    await fs.mkdir(path.dirname(recoveryKitRecordPath(ACCOUNT)), { recursive: true });
+    await fs.writeFile(recoveryKitRecordPath(ACCOUNT), '{"version":99}\n');
+    expect(await readRecoveryKitRecordState(ACCOUNT)).toEqual({ state: "unknown" });
+    const file = path.join(tmp, "new-kit.txt");
+    const write = await writeRecoveryKit(PHRASE, { accountId: ACCOUNT }, file, DATE);
+    expect(write.recordError?.message).toContain("unknown");
+    expect(await fs.readFile(recoveryKitRecordPath(ACCOUNT), "utf8")).toBe('{"version":99}\n');
+  });
+
+  test("containment uses a separator boundary", () => {
+    expect(pathIsInsideRemovalRoot("/tmp/rbox/e2ee/kit", "/tmp/rbox")).toBe(true);
+    expect(pathIsInsideRemovalRoot("/tmp/rbox-other/kit", "/tmp/rbox")).toBe(false);
+  });
+
+  test("uninstall safety gives surviving present evidence precedence and never treats unavailable as safe", () => {
+    const record = parseRecoveryKitRecord({
+      version: 2,
+      accountId: ACCOUNT,
+      keychain: { service: "rbox recovery phrase", account: ACCOUNT, keychainPath: "/Users/a/login.keychain-db", writtenAt: DATE.toISOString() },
+      plaintextArtifacts: [{ path: "/tmp/rbox/inside.txt", writtenAt: DATE.toISOString(), cleanup: "declined" }],
+    }, ACCOUNT)!;
+    const loaded = { state: "recognized" as const, record };
+    expect(recoveryKitSafety(loaded, { keychain: "present", plaintext: ["unavailable"] }, "/tmp/rbox")).toBe("backed-up");
+    expect(recoveryKitSafety(loaded, { keychain: "missing", plaintext: ["unavailable"] }, "/tmp/rbox")).toBe("unknown");
+    expect(recoveryKitSafety(loaded, { keychain: "missing", plaintext: ["present"] }, "/tmp/rbox")).toBe("at-risk");
+    expect(recoveryKitSafety({ state: "unknown" }, { plaintext: [] }, "/tmp/rbox")).toBe("unknown");
+    expect(recoveryKitSafety({ state: "missing" }, { plaintext: [] }, "/tmp/rbox")).toBe("at-risk");
+  });
+
+  test("concurrent once-only offer claims have exactly one winner", async () => {
+    const results = await Promise.all([
+      claimRecoveryKitOffer(ACCOUNT, "status", "cached-rk", async () => true, DATE),
+      claimRecoveryKitOffer(ACCOUNT, "login", "typed", async () => true, DATE),
+    ]);
+    expect(results.sort()).toEqual([false, true]);
+    const record = await readRecoveryKitRecord(ACCOUNT);
+    expect(record?.offer?.outcome).toBe("claimed");
+  });
+
+  test("a concurrent claim waits beyond the former short retry window", async () => {
+    let releasePreflight!: () => void;
+    const preflightGate = new Promise<void>((resolve) => { releasePreflight = resolve });
+    let enteredPreflight!: () => void;
+    const preflightEntered = new Promise<void>((resolve) => { enteredPreflight = resolve });
+    const winner = claimRecoveryKitOffer(ACCOUNT, "status", "cached-rk", async () => {
+      enteredPreflight();
+      await preflightGate;
+      return true;
+    }, DATE);
+    await preflightEntered;
+    const loser = claimRecoveryKitOffer(ACCOUNT, "login", "typed", async () => true, DATE);
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    releasePreflight();
+    expect(await Promise.all([winner, loser])).toEqual([true, false]);
+  });
+
+  test("non-actionable offer preflights do not consume the once-only claim", async () => {
+    expect(await claimRecoveryKitOffer(ACCOUNT, "status", "cached-rk", async () => false, DATE)).toBe(false);
+    expect((await readRecoveryKitRecordState(ACCOUNT)).state).toBe("missing");
+    await expect(claimRecoveryKitOffer(ACCOUNT, "status", "cached-rk", async () => { throw new Error("probe unavailable") }, DATE)).rejects.toThrow(/probe unavailable/);
+    expect((await readRecoveryKitRecordState(ACCOUNT)).state).toBe("missing");
+  });
+
+  test("hardened publication exposes and fails closed at every governed stage", async () => {
+    const stages = [
+      "before-temp-parent-check", "atomic-temp-opened", "atomic-temp-written", "atomic-temp-synced", "atomic-temp-closed",
+      "before-rename-parent-check", "atomic-before-rename", "atomic-after-rename", "before-readback", "after-readback",
+      "after-published-fsync", "after-directory-fsync",
+    ] as const;
+    for (const surface of ["plaintext", "locator"] as const) {
+      for (const [index, failedStage] of stages.entries()) {
+        process.env.RBOX_HOME = path.join(tmp, `${surface}-fault-${index}`);
+        const file = path.join(tmp, `${surface}-kit-${index}.txt`);
+        const locator = recoveryKitRecordPath(ACCOUNT);
+        const target = surface === "plaintext" ? file : locator;
+        restoreWriteHook = installRecoveryKitWriteTestHook((step, candidate) => {
+          if (candidate === target && step === failedStage) throw new Error(`injected ${surface} ${failedStage}`);
+        });
+        if (surface === "plaintext") {
+          await expect(writeRecoveryKit(PHRASE, { accountId: ACCOUNT }, file, DATE)).rejects.toThrow(`injected ${surface} ${failedStage}`);
+        } else {
+          const written = await writeRecoveryKit(PHRASE, { accountId: ACCOUNT }, file, DATE);
+          expect(written.recordError?.message).toContain(`injected ${surface} ${failedStage}`);
+        }
+        restoreWriteHook();
+        restoreWriteHook = undefined;
+      }
+    }
+    process.env.RBOX_HOME = tmp;
+  });
+
+  test("parent replacement before temp creation and before rename is rejected by identity", async () => {
+    for (const boundary of ["parent-validated", "before-rename-parent-check"] as const) {
+      const parent = path.join(tmp, `swap-${boundary}`);
+      const displaced = `${parent}-old`;
+      const file = path.join(parent, "kit.txt");
+      let swapped = false;
+      restoreWriteHook = installRecoveryKitWriteTestHook(async (step, candidate) => {
+        if (candidate !== file || step !== boundary || swapped) return;
+        swapped = true;
+        await fs.rename(parent, displaced);
+        await fs.mkdir(parent, { mode: 0o700 });
+      });
+      await expect(writeRecoveryKit(PHRASE, { accountId: ACCOUNT }, file, DATE)).rejects.toThrow(/parent directory changed/);
+      expect(swapped).toBe(true);
+      await expect(fs.access(file)).rejects.toThrow();
+      restoreWriteHook();
+      restoreWriteHook = undefined;
+    }
   });
 });

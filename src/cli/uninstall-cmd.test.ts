@@ -2,19 +2,29 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { uninstallCmd } from "./uninstall-cmd.js";
+import { keystoreBackupAtRisk, uninstallCmd } from "./uninstall-cmd.js";
+import { bootstrapAccount } from "../engine/e2ee/index.js";
+import { saveDevice } from "./e2ee-keystore.js";
+import { saveCredentials } from "./credentials.js";
+import { renderKit, writeRecoveryKit } from "./recovery-kit.js";
+import { publishPrepublishMarker } from "./genesis-durable.js";
 
 let home: string;
 let rboxHome: string;
 let lines: string[];
+let previousEnv: NodeJS.ProcessEnv;
 
 beforeEach(async () => {
+  previousEnv = { ...process.env };
   home = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-uninstall-home-"));
   rboxHome = path.join(home, ".rbox");
+  process.env.HOME = home;
+  process.env.RBOX_HOME = home;
   lines = [];
 });
 
 afterEach(async () => {
+  process.env = previousEnv;
   await fs.rm(home, { recursive: true, force: true });
 });
 
@@ -154,4 +164,52 @@ test("unknown credential risk warns explicitly and uninstall continues", async (
   });
   expect(lines.join("\n")).toContain("credential degraded; backup risk unknown");
   expect(removed).toBe(true);
+});
+
+test("real uninstall consumer enforces the five-state matrix and rejects a cross-account kit", async () => {
+  const accountId = "acct_0123456789abcdef";
+  const otherAccount = "acct_ffffffffffffffff";
+  const phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
+  const now = new Date("2026-07-22T12:00:00.000Z");
+  const boot = await bootstrapAccount(accountId, "dev", now.getTime());
+  await saveCredentials({ token: "tok", deviceId: "dev", remoteUrl: "https://api.test", accountId });
+  await saveDevice(boot.secrets);
+
+  const outside = path.join(home, "surviving-kit.txt");
+  await writeRecoveryKit(phrase, { accountId, deviceId: "dev" }, outside, now);
+  expect(await keystoreBackupAtRisk(rboxHome)).toBe(false);
+
+  // v18: another account's kit is "unrecognized" — the strong at-risk warning,
+  // never the softer risk-unknown (179 final-review finding 3).
+  await fs.writeFile(outside, renderKit({ accountId: otherAccount, deviceId: "other", phrase, hostname: "other", generatedAt: now }), { mode: 0o600 });
+  expect(await keystoreBackupAtRisk(rboxHome)).toBe(true);
+
+  await fs.writeFile(outside, "not a recovery kit\n", { mode: 0o600 });
+  expect(await keystoreBackupAtRisk(rboxHome)).toBe(true);
+  await fs.rm(outside);
+  expect(await keystoreBackupAtRisk(rboxHome)).toBe(true);
+
+  const inside = path.join(rboxHome, "inside-kit.txt");
+  await writeRecoveryKit(phrase, { accountId, deviceId: "dev" }, inside, now);
+  expect(await keystoreBackupAtRisk(rboxHome)).toBe(true);
+
+  const record = path.join(rboxHome, "e2ee", accountId, "kit.json");
+  await fs.writeFile(record, '{"version":99}\n', { mode: 0o600 });
+  expect(await keystoreBackupAtRisk(rboxHome)).toBe("unknown");
+});
+
+test("real uninstall consumer treats design-180 pending material as at risk", async () => {
+  const accountId = "acct_abababababababab";
+  await saveCredentials({ token: "tok", deviceId: "dev_pending", remoteUrl: "https://api.test", accountId });
+  await publishPrepublishMarker({
+    version: 1,
+    accountId,
+    deviceId: "dev_pending",
+    repairId: null,
+    startedAt: "2026-07-22T12:00:00.000Z",
+    phase: "prepublish",
+  });
+  expect(await keystoreBackupAtRisk(rboxHome)).toBe(true);
+  await uninstallCmd({}, { home, rboxHome, log: (line) => lines.push(line) });
+  expect(lines.join("\n")).toContain("UNRECOVERABLE");
 });

@@ -6,9 +6,10 @@ import { parseDaemonPid, stopDaemon } from "./daemon-control.js";
 import { homeDir } from "./rbox-paths.js";
 import { loadCredentials } from "./credentials.js";
 import { loadDevice } from "./e2ee-keystore.js";
-import { readRecoveryKitRecord } from "./recovery-kit.js";
-import { style } from "./style.js";
+import { readRecoveryKitRecordState, recoveryKitFileState, recoveryKitSafety } from "./recovery-kit.js";
+import { probeKeychainKit } from "./recovery-kit-keychain.js";
 import { pendingGenesisState } from "./genesis-enrollment.js";
+import { style } from "./style.js";
 
 interface UninstallDeps {
   home?: string;
@@ -19,21 +20,45 @@ interface UninstallDeps {
   rm?: typeof fs.rm;
   log?: (line: string) => void;
   readDesiredDaemonRows?: typeof readDesiredDaemonRows;
-  keystoreBackupAtRisk?: () => Promise<boolean | "unknown">;
+  keystoreBackupAtRisk?: (removalRoot: string) => Promise<boolean | "unknown">;
 }
 
-async function keystoreBackupAtRisk(): Promise<boolean | "unknown"> {
+export async function keystoreBackupAtRisk(removalRoot: string): Promise<boolean | "unknown"> {
   const loaded = await loadCredentials();
   if (loaded.state !== "valid") return loaded.state === "absent" ? false : "unknown";
   const creds = loaded.credentials;
   if (!creds.accountId) return false;
-  if (await pendingGenesisState(creds.accountId)) return true;
-  const [device, kit] = await Promise.all([loadDevice(creds.accountId), readRecoveryKitRecord(creds.accountId)]);
-  return device !== undefined && kit === undefined;
+  const [device, kit, pending] = await Promise.all([
+    loadDevice(creds.accountId),
+    readRecoveryKitRecordState(creds.accountId),
+    pendingGenesisState(creds.accountId),
+  ]);
+  if (device === undefined && !pending) return false;
+  if (kit.state !== "recognized") return kit.state === "unknown" ? "unknown" : true;
+  const [keychain, plaintext] = await Promise.all([
+    kit.record.keychain ? probeKeychainKit(kit.record.keychain) : Promise.resolve(undefined),
+    Promise.all(kit.record.plaintextArtifacts.map((artifact) => recoveryKitFileState(creds.accountId!, artifact))),
+  ]);
+  let canonicalRoot: string;
+  try { canonicalRoot = await fs.realpath(removalRoot) } catch { canonicalRoot = path.resolve(removalRoot) }
+  const canonicalRecord = structuredClone(kit.record);
+  let canonicalKeychain = keychain;
+  const canonicalPlaintext = [...plaintext];
+  if (canonicalRecord.keychain && keychain === "present") {
+    try { canonicalRecord.keychain.keychainPath = await fs.realpath(canonicalRecord.keychain.keychainPath) }
+    catch { canonicalKeychain = "unavailable" }
+  }
+  for (let index = 0; index < canonicalRecord.plaintextArtifacts.length; index++) {
+    if (canonicalPlaintext[index] !== "present") continue;
+    try { canonicalRecord.plaintextArtifacts[index]!.path = await fs.realpath(canonicalRecord.plaintextArtifacts[index]!.path) }
+    catch { canonicalPlaintext[index] = "unavailable" }
+  }
+  const safety = recoveryKitSafety({ state: "recognized", record: canonicalRecord }, { ...(canonicalKeychain ? { keychain: canonicalKeychain } : {}), plaintext: canonicalPlaintext }, canonicalRoot);
+  return safety === "backed-up" ? false : safety === "unknown" ? "unknown" : true;
 }
 
-async function warnIfKeystoreAtRisk(log: (line: string) => void, deps: UninstallDeps): Promise<void> {
-  const atRisk = await (deps.keystoreBackupAtRisk ?? keystoreBackupAtRisk)().catch(() => "unknown" as const);
+async function warnIfKeystoreAtRisk(log: (line: string) => void, deps: UninstallDeps, removalRoot: string): Promise<void> {
+  const atRisk = await (deps.keystoreBackupAtRisk ?? keystoreBackupAtRisk)(removalRoot).catch(() => "unknown" as const);
   if (atRisk === "unknown") {
     log(style.yellow("WARNING: credential degraded; backup risk unknown. Continuing uninstall."));
     return;
@@ -111,12 +136,12 @@ export async function uninstallCmd(flags: Record<string, string>, deps: Uninstal
   const rc = targetRc(home);
 
   if (flags.yes !== "true") {
-    await warnIfKeystoreAtRisk(log, deps);
+    await warnIfKeystoreAtRisk(log, deps, rboxHome);
     printDryRun(log, rboxHome, rc);
     return;
   }
 
-  await warnIfKeystoreAtRisk(log, deps);
+  await warnIfKeystoreAtRisk(log, deps, rboxHome);
   const stopped = await stopTrackedDaemons(rboxHome, deps);
   await (deps.disableAutostart ?? disableAutostart)().catch(() => {});
   await (deps.rm ?? fs.rm)(rboxHome, { recursive: true, force: true });

@@ -1,7 +1,9 @@
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fromB64url, toB64url, type DeviceSecrets, type Wrap } from "../engine/e2ee/index.js";
+import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
 import { GENESIS_ACCOUNT_ID_RE, hardenedWrite, invalidateGenesisEnrollmentWitness, type HardenedWriteOptions } from "./genesis-durable.js";
 import { acquireGenesisLockSync } from "./genesis-locks.js";
 
@@ -141,7 +143,19 @@ export async function saveWsKek(accountId: string, workspaceId: string, keyEpoch
 // ---- recovery key (opt-in caching, C9) ------------------------------------
 
 export async function saveRecoveryKey(accountId: string, rk: Uint8Array): Promise<void> {
-  await writeSecret(path.join(root(accountId), "rk.key"), toB64url(rk));
+  const file = path.join(root(accountId), "rk.key");
+  const dir = path.dirname(file);
+  const created = await ensureDirectoryChain(dir, "recovery-key directory");
+  await fsyncCreatedDirectoryAncestors(dir, created);
+  const encoded = toB64url(rk);
+  await writeFileAtomic(file, encoded, { flag: "wx", mode: FILE_MODE, exactMode: true });
+  const handle = await fs.open(file, fsSync.constants.O_RDONLY | (fsSync.constants.O_NOFOLLOW ?? 0));
+  try {
+    const actual = await handle.readFile("utf8");
+    if (actual !== encoded) throw new Error("recovery-key exact read-back failed");
+    await handle.sync();
+  } finally { await handle.close() }
+  await fsyncDirectory(dir);
 }
 
 export async function loadRecoveryKey(accountId: string): Promise<Uint8Array | undefined> {
@@ -150,7 +164,13 @@ export async function loadRecoveryKey(accountId: string): Promise<Uint8Array | u
 }
 
 export async function forgetRecoveryKey(accountId: string): Promise<void> {
-  await fs.rm(path.join(root(accountId), "rk.key"), { force: true });
+  const file = path.join(root(accountId), "rk.key");
+  try {
+    await fs.unlink(file);
+    await fsyncDirectory(path.dirname(file));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
 }
 
 // ---- head pin (anti-rollback, C1/C2) --------------------------------------

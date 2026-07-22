@@ -7,7 +7,7 @@ import { beginReport, logDebugSummary } from "./metrics.js";
 import { DEFAULT_LOG_LINES, logsDaemon } from "./daemon-control.js";
 import { autostartCmd, bootResume, BOOT_RESUME_MARKER, startDaemonAndRecordDesired, stopDaemonAndRecordDesired } from "./autostart-cmd.js";
 import { addIgnorePattern, listIgnoreRules, purgeIgnored, setRespectGitignore } from "./ignore-cmd.js";
-import { approveDevice, keyBackup, keyGenesis, keyStatus, listDevices, login, logout, recoverCmd, revokeDevice } from "./auth-cmd.js";
+import { approveDevice, keyBackup, keyGenesis, keySave, keyStatus, listDevices, login, logout, recoverCmd, revokeDevice } from "./auth-cmd.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
 import { DEFAULT_REMOTE } from "./api-base.js";
 import { fail, setJsonErrorMode, style } from "./style.js";
@@ -490,6 +490,7 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
     case "key": {
       const sub = positional[0];
       if (sub === "status") await keyStatus({ json: jsonMode });
+      else if (sub === "save") await keySave(recoveryKitOptionsFromFlags({ ...flags, kit: "true" }), { json: rawJsonMode });
       else if (sub === "backup") await keyBackup(recoveryKitOptionsFromFlags(flags));
       else if (sub === "genesis") await keyGenesis(flags.yes === "true", recoveryKitOptionsFromFlags(flags));
       else if (sub === "recover") await recoverCmd(recoveryKitOptionsFromFlags(flags));
@@ -499,7 +500,7 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
         else if (sub === "materialize") await materializeCmd(flags);
         else if (sub === "list") await listKeys({ json: jsonMode });
         else if (sub === "revoke") await revokeKey(positional[1] ?? "");
-        else fail("usage: rbox key <status | backup | genesis --yes | recover | create-ci --expires <dur> | materialize | list | revoke <id>>");
+        else fail("usage: rbox key <status | save | backup | genesis --yes | recover | create-ci --expires <dur> | materialize | list | revoke <id>>");
       }
       break;
     }

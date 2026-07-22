@@ -17,6 +17,7 @@ export async function writeFileAtomic(
   absPath: string,
   data: string | Uint8Array,
   opts: {
+    beforeTempCreate?: () => void | Promise<void>;
     beforeRename?: () => boolean | Promise<boolean>;
     mode?: number;
     flag?: string;
@@ -31,6 +32,7 @@ export async function writeFileAtomic(
   let fh: fs.FileHandle | undefined;
   try {
     try {
+      await opts.beforeTempCreate?.();
       fh = await fs.open(tmp, opts.flag ?? "w", opts.mode);
       await opts.onStep?.("temp-opened");
       await fh.writeFile(data);
