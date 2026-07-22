@@ -1,6 +1,14 @@
 # 178 — transient hiccups heal themselves
 
-Status: DRAFT v3 — r2 certified D.3 (pure composer dry-run implementable;
+Status: ALIGNED v4 — r3 verdict ALIGNED with three minor notes, folded:
+vocabulary inventory completed (API allowlist telemetry-ingest.ts:118 —
+deploy before/alongside the CLI addition — plus compile-enforced mappings
+breadcrumb-veto.ts:56, git-cmd.ts:592); the mode witness carries `bootId`
+in daemon.status.json compared against the live pidfile, with a
+stale-status/new-boot rejection test; explicit mode-matrix tests
+(bare/explicit × matching/different/unknown, spawn-before-witness, stopped
+legacy-mode preservation). Implementation tranche 1 = workstream D +
+workstream E's stopped-daemon-resume half. History: r3 was preceded by v3 — r2 certified D.3 (pure composer dry-run implementable;
 order-insensitive semantic equality; sentinel sourceSeq documented) and
 returned four substantive + two moderate gaps, all folded in v3: one pure
 sanitizer applied at EVERY persistence site + config-lane baseline so
