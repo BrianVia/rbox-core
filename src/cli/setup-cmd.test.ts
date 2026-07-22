@@ -26,6 +26,7 @@ import {
   GENESIS_BOOTSTRAP_HINT,
   AUTHORIZATION_RECOVERY_FOOTER,
   authorizeExistingAccount,
+  enrolledAccountId,
 } from "./setup-cmd.js";
 import { resolveKeyedWorkspace, ensureKeyedTargetDir, persistKeyedCredentials } from "./setup-keyed.js";
 import type { AccountKeysDTO } from "./e2ee-remote.js";
@@ -36,6 +37,8 @@ import { inspectResetConsent, type ResetConsentWitness } from "./reset-consent.j
 import { beginResetJournal, recoverResetJournal, resetArchivePath, resetJournalPath } from "./reset-journal.js";
 import { resetJournalDoctorCmd } from "./reset-journal-doctor.js";
 import { createHash } from "node:crypto";
+import { bootstrapAccount } from "../engine/e2ee/index.js";
+import { saveDevice } from "./e2ee-keystore.js";
 
 const ACCOUNT_KEYS: AccountKeysDTO = { recoveryWrap: null, recoveryWrapId: null, rosters: [], keyStates: [], devices: [] };
 
@@ -45,6 +48,48 @@ const validSetupCredentials = async () => ({
   credentials: { v: 1 as const, token: "tok", deviceId: "dev_setup", remoteUrl: "https://api.test", accountId: "acct_setup" },
   legacy: false,
   extensions: {},
+});
+
+async function withLegacyGenesisPair<T>(accountId: string, deviceId: string, run: (loaded: Awaited<ReturnType<typeof validSetupCredentials>>) => Promise<T>): Promise<T> {
+  const prior = process.env.RBOX_HOME;
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-legacy-entry-"));
+  process.env.RBOX_HOME = home;
+  try {
+    await saveDevice((await bootstrapAccount(accountId, deviceId, 1_900_000_000_000)).secrets);
+    return await run({ state: "valid", source: "disk", credentials: { v: 1, token: "tok", deviceId, remoteUrl: "https://api.test", accountId }, legacy: false, extensions: {} });
+  } finally {
+    if (prior === undefined) delete process.env.RBOX_HOME; else process.env.RBOX_HOME = prior;
+    await fs.rm(home, { recursive: true, force: true });
+  }
+}
+
+test("setup enrolledAccountId sends the exact legacy device+MK shape through the classifier", async () => {
+  const priorFetch = globalThis.fetch;
+  try {
+    await withLegacyGenesisPair("acct_1818181818181818", "dev_legacy_setup", async (loaded) => {
+      globalThis.fetch = (async (input: string | URL | Request) => {
+        expect(String(input)).toBe("https://api.test/v1/keys/account");
+        throw new Error("setup classifier reached");
+      }) as typeof fetch;
+      await expect(enrolledAccountId(loaded)).rejects.toThrow("setup classifier reached");
+    });
+  } finally {
+    globalThis.fetch = priorFetch;
+  }
+});
+
+test("resolveEnrollment sends the exact legacy device+MK shape through runGenesisEnrollment", async () => {
+  await withLegacyGenesisPair("acct_1919191919191919", "dev_legacy_resolve", async (loaded) => {
+    let calls = 0;
+    const result = await resolveEnrollment("https://api.test", {
+      loadCredentials: async () => loaded,
+      makeApi: () => ({ getAccountKeys: async () => { throw new Error("must resume first"); }, getGenesisObservation: async () => { throw new Error("unused"); }, bootstrapKeys: async () => {} }),
+      runGenesisEnrollment: async () => { calls++; return "already-setup"; },
+      promptSelect: async () => "later",
+    });
+    expect(calls).toBe(1);
+    expect(result).toBe(true);
+  });
 });
 
 test("setup step header numbers fresh and enrolled flows", () => {

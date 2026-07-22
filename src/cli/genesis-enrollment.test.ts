@@ -16,6 +16,47 @@ describe("design 180 enrollment classifier",()=>{
     const marker={version:1 as const,accountId:ACCOUNT,deviceId:DEVICE,repairId:null,startedAt:"2026-07-22T12:00:00.000Z",phase:"prepublish" as const};
     for(let mask=0;mask<32;mask++){const pending:PendingGenesisArtifacts={stagedRk:!!(mask&1),device:!!(mask&2),mk:!!(mask&4),...(mask&8?{intentRaw:"present"}:{}),...(mask&16?{witnessRaw:"present"}:{}),activeQuarantines:[]};const bare=await classifyEnrollment(ACCOUNT,absent(),pending);expect(bare.kind,`unmarked mask ${mask}`).toBe(mask===0?"pristine":"integrity-failure");const marked=await classifyEnrollment(ACCOUNT,absent(),{...pending,marker});expect(marked.kind,`marked mask ${mask}`).toBe(mask&24?"integrity-failure":"restart-prepublication");}
   });
+  test("classifier exhausts the reachable marker, journal, quarantine, and receipt lifecycle states",async()=>{
+    const {boot,observation}=await complete(),competingObservation=(await complete()).observation;await saveDevice(boot.secrets);await stageRecoveryKey(ACCOUNT,await phraseToRk(boot.recoveryPhrase));
+    const body={recoveryWrap:JSON.stringify(boot.upload.recoveryWrap),recoveryWrapId:boot.upload.recoveryWrapId,genesisRoster:JSON.stringify(boot.upload.genesisRoster),genesisKeyState:JSON.stringify(boot.upload.genesisKeyState),device:{deviceId:DEVICE,sigPubKey:boot.upload.device.sigPubKey,encPubKey:boot.upload.device.encPubKey,mkWrap:JSON.stringify(boot.upload.device.mkWrap)}};
+    const journalFor=async(requestBody:string):Promise<GenesisJournal>=>({version:1,accountId:ACCOUNT,deviceId:DEVICE,startedAt:"2026-07-22T12:00:00.000Z",phase:"active",requestBody,requestSha256:await sha256Hex(utf8(requestBody)),originalCacheRecovery:false,completionHolds:["recovery-kit-staging"],completionReceipts:{}});
+    const ordinaryJournal=await journalFor(JSON.stringify(body)),repairJournal=await journalFor(JSON.stringify({...body,repairId:REPAIR}));
+    const ordinaryMarker={version:1 as const,accountId:ACCOUNT,deviceId:DEVICE,repairId:null,startedAt:"2026-07-22T11:59:00.000Z",phase:"prepublish" as const},repairMarker={...ordinaryMarker,repairId:REPAIR};
+    const local=(extra:Partial<PendingGenesisArtifacts>):PendingGenesisArtifacts=>({stagedRk:true,device:true,mk:true,activeQuarantines:[],...extra});
+    const cleanup=(journal:GenesisJournal,receipt:GenesisJournal["completionReceipts"]["recovery-kit-staging"]):GenesisJournal=>({...journal,phase:"cleanup",completionReceipts:{"recovery-kit-staging":receipt}});
+    const at="2026-07-22T12:01:00.000Z";
+    type Row={name:string;phase:"marker"|"journal"|"receipt"|"quarantine";mode:"ordinary"|"repair";server:GenesisAccountObservation;pending:PendingGenesisArtifacts;kind:string};const rows:Row[]=[];
+    const add=(row:Row)=>rows.push(row);
+    // These are the four crash-survivors produced by the actual publication order:
+    // marker -> device.json -> mk.key -> rk.key.staged -> journal.  They are
+    // generated for both legal expected-previous states, ordinary and repair.
+    const preJournalMaterials=[{device:false,mk:false,stagedRk:false},{device:true,mk:false,stagedRk:false},{device:true,mk:true,stagedRk:false},{device:true,mk:true,stagedRk:true}];
+    for(const variant of [{mode:"ordinary" as const,marker:ordinaryMarker,journal:ordinaryJournal,server:absent()},{mode:"repair" as const,marker:repairMarker,journal:repairJournal,server:tomb()}]){
+      for(const [index,materials] of preJournalMaterials.entries())add({name:`${variant.mode} pre-journal step ${index}`,phase:"marker",mode:variant.mode,server:variant.server,pending:local({marker:variant.marker,...materials}),kind:"restart-prepublication"});
+      // Journal publication precedes marker retirement, so both-present is the
+      // normal active snapshot, not merely a corruption counterexample.
+      add({name:`${variant.mode} marker+journal overlap`,phase:"journal",mode:variant.mode,server:variant.server,pending:local({marker:variant.marker,journal:variant.journal}),kind:"resume-attempt"});
+    }
+    // Once the journal is durable, the only transactionally observable server
+    // results are expected-previous, this exact attempt, or another valid genesis.
+    for(const variant of [{mode:"ordinary" as const,journal:ordinaryJournal,expected:absent(),wrongPrevious:tomb()},{mode:"repair" as const,journal:repairJournal,expected:tomb(),wrongPrevious:absent()}]){
+      for(const [label,server,kind] of [["expected previous",variant.expected,"resume-attempt"],["exact commit",observation,"committed-this-attempt"],["competing commit",competingObservation,"competing-genesis"],["lost expected previous",variant.wrongPrevious,"integrity-failure"]] as const)add({name:`${variant.mode} journal ${label}`,phase:"journal",mode:variant.mode,server,pending:local({journal:variant.journal}),kind});
+    }
+    // A winning receipt is reachable only after the exact commit. Both receipt
+    // families and both staged-RK cleanup sides are generated for both modes.
+    for(const variant of [{mode:"ordinary" as const,journal:ordinaryJournal},{mode:"repair" as const,journal:repairJournal}])for(const receipt of [{outcome:"phrase-delivered" as const,at},{outcome:"artifact-committed" as const,at,artifact:{mode:"kit-path" as const,path:path.join(home,`${variant.mode}.kit`)}}])for(const stagedRk of [true,false])add({name:`${variant.mode} ${receipt.outcome} staged=${stagedRk}`,phase:"receipt",mode:variant.mode,server:observation,pending:local({journal:cleanup(variant.journal,receipt),stagedRk}),kind:"cleanup-resume"});
+    // A losing receipt precedes abandoned-attempt manifest publication; while
+    // active, the cleanup journal intentionally takes precedence over quarantine.
+    add({name:"ordinary competing receipt before quarantine",phase:"receipt",mode:"ordinary",server:competingObservation,pending:local({journal:cleanup(ordinaryJournal,{outcome:"competing-cleaned",at})}),kind:"cleanup-resume"});
+    add({name:"ordinary competing receipt with active quarantine",phase:"quarantine",mode:"ordinary",server:competingObservation,pending:local({journal:cleanup(ordinaryJournal,{outcome:"competing-cleaned",at}),activeQuarantines:[{purpose:"abandoned-attempt",key:ordinaryJournal.requestSha256}]}),kind:"cleanup-resume"});
+    // Repair quarantine has no journal: active manifests resume; completed
+    // archives are omitted by inspectPendingGenesis and expose repair-ready.
+    add({name:"repair active legacy quarantine",phase:"quarantine",mode:"repair",server:tomb(),pending:local({stagedRk:false,activeQuarantines:[{purpose:"repaired-legacy",key:REPAIR}]}),kind:"quarantine-resume"});
+    add({name:"repair completed legacy quarantine",phase:"quarantine",mode:"repair",server:tomb(),pending:local({stagedRk:false,device:false,mk:false,activeQuarantines:[]}),kind:"repair-ready"});
+    for(const row of rows)expect((await classifyEnrollment(ACCOUNT,row.server,row.pending)).kind,row.name).toBe(row.kind);
+    expect(new Set(rows.map((row)=>row.name)).size).toBe(rows.length);expect(rows).toHaveLength(30);
+    expect(new Set(rows.map((row)=>row.phase))).toEqual(new Set(["marker","journal","receipt","quarantine"]));expect(new Set(rows.map((row)=>row.mode))).toEqual(new Set(["ordinary","repair"]));
+  });
   test("repaired legacy requires the exact realistic old-flow device and MK",async()=>{const {boot}=await complete();await saveDevice(boot.secrets);expect(await hasExactLegacyGenesisPair(ACCOUNT)).toBe(true);expect((await classifyEnrollment(ACCOUNT,tomb())).kind).toBe("repaired-legacy");const raw=JSON.parse(await fs.readFile(genesisPaths(ACCOUNT).device,"utf8"));await fs.writeFile(genesisPaths(ACCOUNT).device,JSON.stringify({...raw,extra:true}));expect((await classifyEnrollment(ACCOUNT,tomb())).kind).toBe("integrity-failure");});
   test("abandoned cleanup classifies cleanup-resume on both quarantine crash boundaries",async()=>{const {boot,observation}=await complete();await saveDevice(boot.secrets);await stageRecoveryKey(ACCOUNT,await phraseToRk(boot.recoveryPhrase));const requestBody=JSON.stringify({recoveryWrap:JSON.stringify(boot.upload.recoveryWrap),recoveryWrapId:boot.upload.recoveryWrapId,genesisRoster:JSON.stringify(boot.upload.genesisRoster),genesisKeyState:JSON.stringify(boot.upload.genesisKeyState),device:{deviceId:DEVICE,sigPubKey:boot.upload.device.sigPubKey,encPubKey:boot.upload.device.encPubKey,mkWrap:JSON.stringify(boot.upload.device.mkWrap)}}),active:GenesisJournal={version:1,accountId:ACCOUNT,deviceId:DEVICE,startedAt:"2026-07-22T12:00:00.000Z",phase:"active",requestBody,requestSha256:await sha256Hex(utf8(requestBody)),originalCacheRecovery:false,completionHolds:["recovery-kit-staging"],completionReceipts:{}};const cleanup=await recordGenesisReceipt(active,{outcome:"competing-cleaned",at:"2026-07-22T12:01:00.000Z"});await startGenesisQuarantine({accountId:ACCOUNT,purpose:"abandoned-attempt",uniquenessKey:cleanup.requestSha256,createdAt:"2026-07-22T12:02:00.000Z"});expect((await classifyEnrollment(ACCOUNT,observation)).kind).toBe("cleanup-resume");await resumeGenesisQuarantine(ACCOUNT,"abandoned-attempt",cleanup.requestSha256,"2026-07-22T12:03:00.000Z");expect((await classifyEnrollment(ACCOUNT,observation)).kind).toBe("cleanup-resume");});
   test("no-claim and tombstone local-presence powersets are closed and conservative",async()=>{
