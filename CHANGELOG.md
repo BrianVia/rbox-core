@@ -6,6 +6,8 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.7.23] — 2026-07-22 — "your recovery key gets a home"
+
 ### Added
 - Your recovery key can now live in the macOS Keychain: after signing in,
   rbox offers once to save it (no typing if this machine still has its
