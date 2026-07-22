@@ -6,6 +6,16 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.7.22] — 2026-07-22 — "upgrade finishes the job"
+
+### Fixed
+- `rbox upgrade` now finishes the job even when the binary is already
+  current: if a running daemon is still on an older version (for example
+  after the install script swapped the binary), upgrade restarts exactly
+  those daemons — preserving pull-only — instead of saying "already up to
+  date" and leaving them stale. Daemons already on the current version are
+  left untouched, and `rbox upgrade --check` still never restarts anything.
+
 ## [1.7.21] — 2026-07-22 — "transient hiccups heal themselves"
 
 ### Changed
