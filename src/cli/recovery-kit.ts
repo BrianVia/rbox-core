@@ -336,7 +336,7 @@ export async function recoveryKitFileState(accountId: string, artifact: Plaintex
   if (!artifact) return "missing";
   const parsed = await readPlaintextKit(artifact.path);
   if (parsed.state !== "present") return parsed.state;
-  if (parsed.accountId !== accountId) return "unavailable";
+  if (parsed.accountId !== accountId) return "unrecognized";
   return "present";
 }
 

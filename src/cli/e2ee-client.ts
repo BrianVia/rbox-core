@@ -435,7 +435,7 @@ export async function assertRecoveryGenesisReady(loaded?:CredentialLoadResult):P
 
 export async function enrollViaRecoveryWithPhraseInput(readPhrase:()=>Promise<string>,now:number,loaded?:CredentialLoadResult,beforePhraseRead?:()=>Promise<void>):Promise<{accountId:string;deviceId:string;phrase:string}>{
   const creds=credentialsForStrictFlow(loaded??await loadCredentials());if(!creds?.accountId)throw new Error("`rbox key recover` needs an account login first — run `rbox login` (web/device-code), then recover.");const api=new RboxApi(creds.remoteUrl,creds.token,"","");const pair=await acquireClearKnownAccountGenesisPair(api,creds.accountId);
-  try{await beforePhraseRead?.();await settleKnownAccountGenesisLocked(api,creds.accountId);const phrase=(await readPhrase()).trim();if(!phrase)throw new Error("no phrase entered");const result=await enrollViaPrevalidatedRecoveryLocked(await phraseToRk(phrase),now,creds,creds.accountId,api);return{...result,phrase};}
+  try{await beforePhraseRead?.();await settleKnownAccountGenesisLocked(api,creds.accountId);const phrase=(await readPhrase()).trim();if(!phrase)throw new Error("no phrase entered");const rk=await phraseToRk(phrase);try{const result=await enrollViaPrevalidatedRecoveryLocked(rk,now,creds,creds.accountId,api);return{...result,phrase};}finally{rk.fill(0);}}
   finally{await pair.account.release();await pair.global.release();}
 }
 

@@ -179,11 +179,10 @@ test("real uninstall consumer enforces the five-state matrix and rejects a cross
   await writeRecoveryKit(phrase, { accountId, deviceId: "dev" }, outside, now);
   expect(await keystoreBackupAtRisk(rboxHome)).toBe(false);
 
+  // v18: another account's kit is "unrecognized" — the strong at-risk warning,
+  // never the softer risk-unknown (179 final-review finding 3).
   await fs.writeFile(outside, renderKit({ accountId: otherAccount, deviceId: "other", phrase, hostname: "other", generatedAt: now }), { mode: 0o600 });
-  expect(await keystoreBackupAtRisk(rboxHome)).toBe("unknown");
-  lines = [];
-  await uninstallCmd({}, { home, rboxHome, log: (line) => lines.push(line) });
-  expect(lines.join("\n")).toContain("backup risk unknown");
+  expect(await keystoreBackupAtRisk(rboxHome)).toBe(true);
 
   await fs.writeFile(outside, "not a recovery kit\n", { mode: 0o600 });
   expect(await keystoreBackupAtRisk(rboxHome)).toBe(true);

@@ -231,7 +231,11 @@ export async function runGenesisEnrollment(
         const continuingClaim = record.state === "recognized" &&
           record.record.offer?.surface === "genesis" &&
           record.record.offer.outcome === "claimed";
-        if (!shouldPresentGenesisCompletion(record.state === "recognized" && record.record.offer !== undefined, started, { state: "absent" })) {
+        // A declined genesis offer is terminal only once the journal resolves:
+        // a crash between this decline and intent publication must re-present.
+        const offerBlocks = record.state === "recognized" && record.record.offer !== undefined
+          && !(record.record.offer.surface === "genesis" && record.record.offer.outcome === "declined");
+        if (!shouldPresentGenesisCompletion(offerBlocks, started, { state: "absent" })) {
           return { ...base, mode: "phrase-display" as const };
         }
         const claimed = continuingClaim || await claimRecoveryKitOffer(journal.accountId, "genesis", "in-hand", async () =>

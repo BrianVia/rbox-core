@@ -109,7 +109,7 @@ describe("recovery kit", () => {
   test("plaintext probes bind every artifact to the current account", async () => {
     const file = path.join(tmp, "cross-account.txt");
     await fs.writeFile(file, renderKit({ accountId: "acct_ffffffffffffffff", phrase: PHRASE, hostname: "other", generatedAt: DATE }), { mode: 0o600 });
-    expect(await recoveryKitFileState(ACCOUNT, { path: file, writtenAt: DATE.toISOString(), cleanup: "pending" })).toBe("unavailable");
+    expect(await recoveryKitFileState(ACCOUNT, { path: file, writtenAt: DATE.toISOString(), cleanup: "pending" })).toBe("unrecognized");
   });
 
   test("record paths reject malformed accounts before interpolation and stay in the exact account directory", () => {
