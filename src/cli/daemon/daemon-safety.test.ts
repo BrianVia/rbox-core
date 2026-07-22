@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { nextSafetyDelay, RboxDaemon } from "../daemon.js";
+import type { GitSignalBatch } from "./watcher.js";
 
 // Design 49: the safety scan heals DROPPED watcher events, and drops happen under
 // churn — so quiet intervals back the scan off (60s → 5m cap) instead of
@@ -73,6 +74,7 @@ interface SafetyInternals {
   planDiscoveredGitDirOwners: Set<string>;
   observePlanGitRepos(repos: readonly { relPath: string; kind: "dir" | "pointer" }[]): Promise<void>;
   gitRefRegistry?: unknown;
+  handleGitSignalBatch(batch: GitSignalBatch): Promise<void>;
   refreshGitSafetyFloor(reason: string): void;
 }
 
@@ -80,6 +82,16 @@ test("design 175: ref signal requests push without pending/file-settle state", a
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-git-signal-")));
   const daemon = makeDaemon(root);
   let signal: (() => void) | undefined;
+  let signalHandled!: () => void;
+  const handled = new Promise<void>((resolve) => { signalHandled = resolve; });
+  const handleGitSignalBatch = daemon.handleGitSignalBatch.bind(daemon);
+  daemon.handleGitSignalBatch = async (batch) => {
+    try {
+      await handleGitSignalBatch(batch);
+    } finally {
+      signalHandled();
+    }
+  };
   daemon.startWatcherFn = (_root, _matcher, _cb, opts) => {
     signal = () => opts?.signalDebouncer?.push("signal");
     return Promise.resolve({ backend: "parcel", close: async () => {} });
@@ -89,8 +101,17 @@ test("design 175: ref signal requests push without pending/file-settle state", a
   try {
     await daemon.startLiveWatch();
     expect(daemon.gitRefRegistry !== undefined).toBe(process.platform === "linux");
-    signal!();
-    await new Promise((resolve) => setTimeout(resolve, 450));
+    const realNow = Date.now;
+    const signalAt = realNow();
+    try {
+      Date.now = () => signalAt;
+      signal!();
+      Date.now = () => signalAt + 3_000;
+      signal!();
+      await handled;
+    } finally {
+      Date.now = realNow;
+    }
     expect(daemon.want.push).toBe(true);
     expect(daemon.churnSinceSafety).toBe(true);
     expect(daemon.pendingEvents).toEqual([]);
@@ -115,7 +136,7 @@ test("design 175: a directory-backed repo holds the git safety floor only on Lin
   try {
     await daemon.startLiveWatch();
     daemon.safetyDelay = FLOOR;
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(daemon.gitSafetyFloorRequired).toBe(process.platform === "linux");
     daemon.advanceSafetyCadenceForTick();
     expect(daemon.safetyDelay).toBe(process.platform === "linux" ? FLOOR : 120_000);
   } finally {

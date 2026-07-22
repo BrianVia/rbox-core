@@ -558,14 +558,15 @@ test("design 178 B: idle-host conflict recovery clears after pull without anothe
   await fs.writeFile(path.join(root, "local.txt"), "local\n");
   await fs.utimes(path.join(root, "local.txt"), new Date(TEST_NOW - 60_000), new Date(TEST_NOW - 60_000));
   const remote = new AlwaysConflictRemote();
-  const daemon = await makeDaemon(remote);
+  let logicalNow = TEST_NOW;
+  const daemon = await makeDaemon(remote, "boot-test", { now: () => logicalNow });
   daemon.want.push = true;
   await daemon.pump();
   expect(daemon.activity.halt?.typedReason).toEqual({ kind: "push-conflict" });
   expect(remote.commitCalls).toBeGreaterThan(0);
   const firstFailureAt = daemon.activity.halt?.firstFailureAt;
   const firstLastFailureAt = daemon.activity.halt?.lastFailureAt;
-  await sleep(2);
+  logicalNow += 1;
   daemon.recoveryDue = true;
   await daemon.pump();
   expect(daemon.activity.halt?.firstFailureAt).toBe(firstFailureAt);
@@ -1763,14 +1764,12 @@ test("graceful stop writes paused ambient status before a slow pump drains", asy
     const pump = daemon.pump();
     await remote.commitEntered.promise;
 
-    let stopped = false;
-    const stop = daemon.stop().then(() => {
-      stopped = true;
-    });
-    const early = await waitForAmbientState("paused", 1000);
+    const stop = daemon.stop();
+    const early = await Promise.race([
+      waitForAmbientState("paused", 1000),
+      stop.then(() => { throw new Error("daemon stop settled while the pump was still blocked"); }),
+    ]);
     expect(early).toMatchObject({ schemaVersion: 1, state: "paused" });
-    await sleep(50);
-    expect(stopped).toBe(false);
 
     remote.releaseCommit.resolve();
     await pump;
