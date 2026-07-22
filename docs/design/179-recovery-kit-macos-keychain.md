@@ -1,6 +1,6 @@
 # 179 — recovery kit: macOS Keychain instead of a plaintext Downloads file
 
-Status: v3 — DRAFT (round-1 findings folded under founder-pinned rulings, 2026-07-21). Pending adversarial review.
+Status: v4 — DRAFT (round-1 and round-2 findings folded under founder-pinned rulings, 2026-07-21). Pending adversarial review.
 
 Round-1 ruling record (pinned; one line per finding):
 
@@ -15,6 +15,15 @@ Round-1 ruling record (pinned; one line per finding):
 9. Probe — return `present | missing | unavailable`; only the classified `errSecItemNotFound` exit means missing.
 10. Process/flows — use a shell-free bounded spawn contract, a separate no-echo `key save` path, explicit TTY rules, and wizard plumbing while its phrase is live.
 11. Wording/citations — say not iCloud Keychain-synchronized, use Keychain Access as the supported UI, drop universal login-password claims, and refresh all source lines.
+
+Round-2 ruling record (pinned; one line per finding):
+
+1. No-loss genesis — non-interactive macOS genesis with `--kit` durably stages RK through the existing `rk.key` cache before publish; only a verified Keychain/file commitment permits cleanup, after which the original `cacheRecovery` preference is restored, with staged state visible in `key status` until resolved.
+2. Wrong Keychain phrase — a checksum-valid Keychain candidate that fails account-envelope validation emits only a redacted warning and falls through to manual entry before admission persistence; failures after persistence retain ordinary recovery semantics.
+3. TTY gates — two TTYs gate only new Keychain offers/prompts; the existing stdin-only manual-recovery gate is unchanged, with all four stdin/stderr combinations specified below.
+4. Restore metadata — only a recognized record containing validated Keychain metadata supplies an identity; otherwise resolve login Keychain exactly once, and after recovery atomically merge `discoveredAt` metadata without disturbing plaintext/offer axes; record failure is nonfatal and unknown records remain untouched.
+5. Restore tests — cover the four-way TTY matrix, decline, valid-but-wrong fallback, one-shot resolution and identity propagation, exact account selection, merge preservation, and nonfatal record-write failure.
+6. Daemon rationale — only device/MK operational material is required by daemon/sync; optional `rk.key` is loaded by status/backup, not used as daemon rationale.
 
 Owner: Claude (founder-directed, 2026-07-20)
 Origin: onboarding-ux backlog item #6 (macOS keychain), referenced from
@@ -47,9 +56,10 @@ gating, and a GUI in Keychain Access where the user can retrieve the phrase.
 Design 12 already called OS-keychain storage "future hardening"
 (`docs/design/12-full-e2ee.md:647-649`). This design does that hardening for the
 **recovery kit** only. It does NOT move `device.json` / `mk.key` / `rk.key`
-(`src/cli/e2ee-keystore.ts:8-21`) into Keychain. Those are read on daemon start
-and sync; gating them on Keychain availability would break headless operation.
-They remain mode-600 files per design 12 §13.1.
+(`src/cli/e2ee-keystore.ts:8-21`) into Keychain. Device/MK operational material
+is required by daemon start and sync; gating it on Keychain availability would
+break headless operation. Optional `rk.key` is loaded only by status/backup.
+These files remain mode-600 files per design 12 §13.1.
 
 ## Goals
 
@@ -94,15 +104,33 @@ macOS it may offer the exact-account Keychain item first:
   not rendered as missing.
 - Account matching is exact. Recover already knows the authenticated account;
   the item account attribute must equal it, and the recovered phrase still goes
-  through BIP39 parsing and the existing signed-chain/recovery-envelope path
-  (`src/cli/e2ee-client.ts:195-225`). A wrong or colliding item stores and admits
-  nothing.
-- If a recognized v2 record exists, restore uses its validated persisted
-  Keychain identity. After a reinstall or deleted `~/.rbox`, no record exists;
-  restore resolves the current user's login Keychain exactly once, then uses
-  that explicit identity for both probe and read. It never falls back to the
-  mutable default/search list. A successful recovery can recreate the v2
-  metadata record without changing the Keychain item.
+  through BIP39 parsing and the hardened signed-chain/recovery-envelope path
+  required below. The current recovery path verifies the account chain but does
+  not yet bind the fetched recovery wrap to it
+  (`src/cli/e2ee-client.ts:195-225`); implementation adds that fail-closed check
+  before any unwrap or admission. If a Keychain-sourced candidate is BIP39
+  checksum-valid but fails this current-account/current-wrap authentication,
+  emit the same redacted fallback warning and continue to manual entry before
+  building or persisting any admission. A wrong, colliding, historical, or
+  server-substituted item/wrap stores and admits nothing. Once admission has
+  been persisted, later network or enrollment failures follow ordinary recovery
+  semantics and do not loop back to phrase selection.
+- Restore uses a persisted identity only from a recognized record containing
+  **validated** Keychain metadata. Every other on-disk case — no record, a
+  recognized record without a `keychain` artifact (including a normalized
+  legacy plaintext record), or an invalid/unknown record — resolves the current
+  user's login Keychain exactly once per recovery invocation. Use that one
+  canonical identity for probe and read; never fall back to the mutable
+  default/search list or invoke the resolver a second time. Invalid/unknown
+  records still remain untouched as required below.
+- After successful recovery through that resolved identity, take the record
+  mutation lock, re-read, and atomically create/merge a Keychain artifact with
+  `discoveredAt` (never a fabricated `writtenAt`). Preserve existing
+  `plaintextArtifacts` and `offer` byte-for-byte at the value level. Failure to
+  lock, re-read, validate, or write emits a safe warning but never changes the
+  successful enrollment result. An unknown record is never overwritten or
+  normalized; leave it untouched and warn that rediscovery metadata was not
+  recorded.
 - This rescues this Mac after reinstall, deleted local state, or re-setup. The
   item is not iCloud Keychain-synchronized; the 24-word phrase remains the
   deliberate cross-machine recovery story.
@@ -126,19 +154,65 @@ The phrase-source matrix is therefore explicit:
 |---|---|---|
 | `rbox key save`, cached `rk.key` present | Render cached RK with `rkToPhrase` | No typing and no echo; validate against this account's current verified recovery envelope. |
 | `rbox key save`, no cached RK | No-echo TTY prompt, or bounded stdin when stdin is not a TTY | Parse/canonicalize the 24 words, then validate against this account's current verified recovery envelope. |
-| genesis | Fresh phrase still in hand after successful bootstrap (`src/cli/auth-cmd.ts:130-132`) | Offer an immediate zero-typing save; bootstrap's persisted envelope plus an immediate validation proves the account binding. |
+| genesis | Fresh phrase held across bootstrap (`src/cli/auth-cmd.ts:130-132`) | Interactive flows offer an immediate zero-typing save. Non-interactive macOS `--kit` first follows the durable staging invariant below; bootstrap's persisted envelope plus immediate validation proves the account binding before final storage. |
 | `rbox key backup` | Cached RK already rendered (`src/cli/auth-cmd.ts:503-515`) | Offer an immediate zero-typing save; revalidate because the cached value could be stale. |
 | standalone recover | Phrase that just passed recovery (`src/cli/auth-cmd.ts:444-465`) | Offer an immediate zero-typing save while the phrase is still in scope. |
 | wizard recover | Phrase/RK in `recoverInWizard` (`src/cli/setup-cmd.ts:348-370`) | Plumb the canonical phrase to the offer before returning and discarding it. |
 
+### Non-interactive macOS genesis no-loss invariant
+
+Non-interactive macOS genesis with `--kit` MUST NOT publish the account genesis
+until RK has a durable local foothold. Before bootstrap publication begins, it
+persists RK using the existing opt-in `rk.key` cache mechanism and its durability
+contract in the same mode-600 keystore trust domain as `mk.key`. This is a
+temporary use of the existing secret class: it creates no new plaintext format,
+temp file, or Downloads artifact. If durable staging fails, genesis aborts
+before any publish.
+
+The accompanying non-secret staging state records `startedAt` and the caller's
+original `cacheRecovery` preference. The state transition order is crash-safe:
+
+1. atomically record staging intent, durably write/verify `rk.key`, then permit
+   bootstrap publication;
+2. validate the published current recovery envelope and attempt the selected
+   Keychain or explicit `--kit-path` save;
+3. require the existing exact read-back verification of that Keychain/file
+   artifact — command success alone is not a commitment;
+4. under the record lock, atomically persist the verified commitment locator as
+   the exact Keychain artifact metadata or plaintext artifact path; failure to
+   persist leaves both staging state and `rk.key` intact;
+5. only after verification **and** durable locator persistence, honor the
+   original preference: retain `rk.key` when `cacheRecovery` was true, or
+   durably remove it when false; then atomically clear staging state.
+
+A crash or save failure after publication therefore leaves the staged `rk.key`
+available to `rbox key save`/backup resolution. Startup and human
+`rbox key status` reconcile a leftover marker conservatively: they never delete
+staged RK without a durably recorded locator and fresh verification of that
+exact Keychain/file commitment. If commitment exists, cleanup can finish
+idempotently; otherwise the marker remains and human status prints
+`recovery phrase staged, not yet saved`. JSON exposes the same non-secret staged
+state. A marker without a readable verified `rk.key` is reported as unavailable
+and never as backed up. The temporary stage is not treated as an off-keystore
+backup and does not make uninstall safe.
+
 `validatePhraseForAccount` is read-only: fetch account keys, verify the signed
 roster/key-state chain, require its account id to equal the authenticated
-account, parse the candidate with `phraseToRk`, and authenticate-decrypt that
-account's current recovery wrap with `recoverMasterKey`. The underlying unwrap
-is `src/engine/e2ee/session.ts:516-520`; correct/wrong-envelope coverage already
-exists at `src/engine/e2ee/session.test.ts:76-95`. Validation does **not** build
-or publish an admission roster, cache RK, or write kit metadata. The Keychain
-add begins only after validation succeeds; every error stores nothing.
+account, parse the fetched recovery wrap, compute its hash, and require that
+hash to equal the verified latest key state's exact `recoveryWrapId`. It also
+passes `assertMkWrapAuthorized` before attempting `recoverMasterKey`; the
+existing signed-wrap authorization primitive is
+`src/engine/e2ee/session.ts:245-275`. Only then does it parse the candidate with
+`phraseToRk` and authenticate-decrypt that current recovery wrap. The underlying
+unwrap is `src/engine/e2ee/session.ts:516-520`; correct/wrong-envelope coverage
+already exists at `src/engine/e2ee/session.test.ts:76-95`. The same new helper,
+`assertCurrentRecoveryWrap`, gates ordinary restore/recovery too, fixing the
+current gap rather than making validation safer than the admission path.
+Validation does **not** build or publish an admission roster, cache RK, or write
+kit metadata. The Keychain add begins only after every binding and validation
+succeeds; every error stores nothing. The narrowly scoped pre-publication
+genesis staging above is an ordering invariant, not a side effect of this
+validation helper.
 
 New explicit command: `rbox key save`. It requires an authenticated account.
 With cached RK it does not read stdin. Without cached RK it uses the separate
@@ -301,12 +375,20 @@ axes:
     "surface": "status",
     "phraseSource": "cached-rk",
     "outcome": "shown"
+  },
+  "staging": {
+    "startedAt": "2026-07-21T16:28:00.000Z",
+    "originalCacheRecovery": false
   }
 }
 ```
 
 - `keychain` is optional metadata for the one exact item; live
-  `present | missing | unavailable` is probed, not persisted as truth.
+  `present | missing | unavailable` is probed, not persisted as truth. A save
+  performed by rbox records `writtenAt`. A rediscovery after `kit.json` loss
+  records `discoveredAt` instead; `writtenAt` and `discoveredAt` are strict
+  optional ISO dates with at least one required. The metadata-only probe/read
+  does not invent or scrape a Keychain creation date.
 - `plaintextArtifacts` is zero-or-more because explicit saves and legacy paths
   can coexist. `cleanup` is `pending | declined | failed`; an entry disappears
   only after confirmed unlink. Explicit later file output never erases
@@ -316,6 +398,10 @@ axes:
   not a decline. `surface` is one of
   `login | status | genesis | backup | recover | wizard-recover`, and
   `phraseSource` is `cached-rk | typed | in-hand`.
+- `staging` is optional, non-secret, and independent. It exists only for the
+  non-interactive macOS genesis no-loss state machine. Its strict timestamp and
+  original boolean preference distinguish a temporarily retained `rk.key` from
+  an ordinary opted-in cache and drive idempotent cleanup after verification.
 
 Parsing is strict and account-bound. A legacy object with absent `kind` and
 exactly valid `path` + `writtenAt` is normalized to a v2 envelope with one
@@ -344,6 +430,7 @@ examples:
 - `recovery kit: macOS Keychain "rbox recovery phrase" (written 2026-07-21)`
 - `… (item missing — re-run rbox key save)`
 - `… (Keychain unavailable — backup state unknown; retry in a GUI session)`
+- `recovery phrase staged, not yet saved`
 
 File states become `present | missing | unrecognized | unavailable`. Present
 requires a bounded regular-file parse with current account and canonical valid
@@ -351,12 +438,16 @@ requires a bounded regular-file parse with current account and canonical valid
 (`src/cli/recovery-kit.ts:145-154`). Permission/I/O/size failures are
 `unavailable`; malformed or mismatched content is `unrecognized`.
 
-`rbox key status --json` returns before any offer claim or nudge, preserving the
-current JSON/human boundary (`src/cli/auth-cmd.ts:468-488`). It may perform
-read-only probes. `recoveryKit` gains `version`, `keychain` (including live
-state), `plaintextArtifacts` (each with live state), and `offer`; for a file it
-also preserves the existing `path`/`writtenAt` compatibility fields. It writes
-nothing, prints no nudge, and is covered by `src/cli/json-output.test.ts:419-434`.
+When `staging` is present, the staged warning is emitted in addition to artifact
+states until reconciliation clears it; staged RK alone never renders as a saved
+recovery kit. `rbox key status --json` returns before any offer claim or nudge,
+preserving the current JSON/human boundary (`src/cli/auth-cmd.ts:468-488`). It
+may perform read-only probes. `recoveryKit` gains `version`, `keychain`
+(including live state), `plaintextArtifacts` (each with live state), `offer`,
+and `staging`; for a file it also preserves the existing `path`/`writtenAt`
+compatibility fields.
+Status JSON never invokes staging reconciliation: it writes nothing, prints no
+nudge, and is covered by `src/cli/json-output.test.ts:419-434`.
 
 Uninstall is a mandatory consumer. Today `keystoreBackupAtRisk` treats any
 parseable kit record as safe (`src/cli/uninstall-cmd.ts:24-31`) before uninstall
@@ -365,14 +456,18 @@ recursively removes `.rbox`, including cached RK
 
 | Observed evidence | Uninstall interpretation |
 |---|---|
-| At least one recognized artifact probes `present` | backed up; no unrecoverability warning |
+| At least one recognized artifact probes `present` **and its canonical backing path is outside the canonical removal root** | backed up; no unrecoverability warning |
 | No present artifact; candidates are missing/unrecognized, offer was declined, or no artifact exists | at risk; print the existing strong warning |
 | No present artifact and any candidate/record/probe is unavailable or unknown | risk unknown; print an explicit yellow warning, never treat as safe |
 
 This precedence distinguishes present, missing, unrecognized, declined, and
 unavailable. Unknown future records and probe failure cannot suppress the
-warning. Status, JSON, cleanup, and uninstall all consume the same strict parser
-and probe results.
+warning. The aggregate receives uninstall's canonical `rboxHome` removal root.
+A plaintext artifact path inside that tree is at risk because uninstall will
+delete it; the same applies to a custom Keychain whose canonical
+`keychainPath` is inside the tree. Containment uses resolved absolute paths and
+a separator boundary, not string prefixing. Status, JSON, cleanup, and uninstall
+all consume the same strict parser and probe results.
 
 ### 4. Flag, command, TTY, and process semantics
 
@@ -392,16 +487,31 @@ Keychain default; scripts requiring a file use `--kit-path`.
 
 TTY/input rules are exact:
 
-- Prompts and one-time offers require `process.stdin.isTTY === true` **and**
-  `process.stderr.isTTY === true`, because prompts render on stderr. stdout need
-  not be a TTY. This is stricter than today's stdin-only helper
+- New Keychain confirmations and offers, including the Keychain-target
+  `rbox key save` phrase prompt, require
+  `process.stdin.isTTY === true` **and** `process.stderr.isTTY === true`, because
+  their UI renders on stderr. stdout need not be a TTY. This two-TTY rule does
+  not alter the existing manual-recovery gate, which remains stdin-only
   (`src/cli/prompt.ts:37-40`).
+- Restore behavior for all four combinations is normative:
+
+  | stdin TTY | stderr TTY | New Keychain offer | Existing manual recovery |
+  |---|---|---|---|
+  | yes | yes | Probe and offer when an exact item is present; decline or pre-admission candidate failure falls through. | Use today's interactive manual prompt on decline/fallback. |
+  | yes | no | Do not probe/read/offer Keychain. | Use today's interactive manual prompt unchanged, even with stderr redirected. |
+  | no | yes | Do not probe/read/offer Keychain. | Use today's bounded non-interactive stdin phrase path. |
+  | no | no | Do not probe/read/offer Keychain. | Use today's bounded non-interactive stdin phrase path. |
+
+  Keychain gating therefore never converts a formerly valid manual-recovery
+  invocation into an error or hang.
 - `rbox key save` with cached RK consumes no stdin and never echoes the phrase.
-- Without cached RK, interactive save uses `promptPassword` (no echo;
-  `src/cli/prompt.ts:72-75`) on the TTY pair. If stdin is not a TTY, it reads at
-  most 1 KiB to EOF, rejects overflow/empty/trailing extra data, canonicalizes,
-  validates, and saves without echo. If stdin is a TTY but stderr is not, it
-  fails with guidance instead of reading visibly or hanging.
+- Without cached RK, an interactive Keychain-target save uses `promptPassword`
+  (no echo; `src/cli/prompt.ts:72-75`) on the TTY pair. If stdin is not a TTY,
+  it reads at most 1 KiB to EOF, rejects overflow/empty/trailing extra data,
+  canonicalizes, validates, and saves without echo. If stdin is a TTY but
+  stderr is not, that new Keychain prompt fails with guidance instead of
+  reading visibly or hanging. These rules do not replace the manual-recovery
+  behavior in the table above.
 - `--json` is invalid for `key save`; `key status --json` remains read-only and
   nudge-free. No offer runs in non-TTY mode.
 - Wizard recovery must call the shared zero-typing offer while the phrase is in
@@ -455,21 +565,37 @@ and output/process failures.
   `Keychain save failed (<safe class>) — save a PLAINTEXT file to ~/Downloads instead?`
   Default remains Yes for parity with today's recovery-kit offer. Nothing is
   written until the user separately consents.
-- **Non-interactive `--kit` / `rbox key save`:** fail nonzero and suggest an
-  explicit `--kit-path <path>` or a GUI-session retry. Never silently write a
+- **Non-interactive genesis with `--kit`:** after the mandatory pre-publish
+  `rk.key` stage, a Keychain failure returns nonzero but retains staged RK and
+  staging metadata for a later `rbox key save`/backup retry. It never silently
+  creates a Downloads file and never removes staging before a verified
+  Keychain or explicit-file commitment. After commitment, it restores the
+  caller's original `cacheRecovery` preference as specified above.
+- **Other non-interactive `--kit` / `rbox key save`:** fail nonzero and suggest
+  an explicit `--kit-path <path>` or a GUI-session retry. Never silently write a
   file because Keychain happened to be unavailable.
-- **Restore read:** missing/declined/unavailable/read failure falls through to
-  manual phrase entry. After the user explicitly chose a present item, a short
-  safe warning explains the fallback; secret/process output stays hidden.
+- **Restore read/candidate:** missing, declined, unavailable, read failure,
+  malformed phrase, or a checksum-valid candidate that fails current-account
+  envelope authentication falls through to manual phrase entry before any
+  admission persistence. After the user explicitly chose a present item, a
+  short safe warning explains the fallback; secret/process output stays hidden.
+  Failures after admission persistence retain today's ordinary recovery
+  semantics rather than asking for the phrase again.
 - **Record failure after verified add:** report that the secret is present but
   status metadata could not be saved. Do not claim offer completion or delete
-  plaintext. A later exact probe/re-save can repair metadata.
+  plaintext. During staged genesis, also retain staged RK and its marker because
+  the commitment locator is not yet durable. A later exact probe/re-save can
+  repair metadata.
 
 ### 6. Migrating off an existing plaintext kit
 
 After a verified Keychain save, inspect every recorded plaintext artifact with
-a bounded (maximum 16 KiB), no-follow regular-file read. Parse the rendered
-format (`src/cli/recovery-kit.ts:58-87`) and require all of:
+a bounded (maximum 16 KiB), no-follow regular-file read. Each validation pass
+uses this exact order: path `lstat`; open with `O_RDONLY | O_NOFOLLOW`; `fstat`
+the open handle; require regular file, size bound, and the first path stat's
+`dev + ino` to equal the handle; read only from that handle; path `lstat` again;
+require its `dev + ino` still equals the open handle; then close. Parse the
+rendered format (`src/cli/recovery-kit.ts:58-87`) and require all of:
 
 1. `lstat` says regular file, not symlink;
 2. parsed `Account:` equals the current strict account exactly;
@@ -481,10 +607,14 @@ Only then offer:
 
 > `Delete the matching old plaintext kit at ~/Downloads/rbox-recovery-kit-….txt?` [Y/n]
 
-After consent and immediately before unlink, repeat `lstat`, bounded read,
-account parse, canonical phrase equality, and file-identity checks. Any
-prompt-time replacement, symlink swap, mismatch, missing file, or unavailable
-read cancels deletion. Never authorize cleanup from
+After consent, repeat that entire open/fstat/handle-read/path-identity/content
+sequence, then perform one final path `lstat` / `dev + ino` comparison and call
+`unlink(path)` immediately. Any replacement or symlink swap detected before the
+final compare, mismatch, missing file, or unavailable read cancels deletion.
+POSIX/macOS has no portable conditional-unlink-by-inode primitive, so there is
+an unavoidable final compare→unlink name race against a malicious same-user
+process; the design states that residual honestly rather than claiming every
+possible swap is caught. Never authorize cleanup from
 `recoveryKitFileState === "present"`; today's implementation checks only the
 banner (`src/cli/recovery-kit.ts:145-154`).
 
@@ -572,8 +702,10 @@ tables — remain side-effect free and receive exhaustive unit coverage.
 - **Account/collision safety:** strict account/service/identity fields plus
   post-add exact secret verification prevent recording the wrong search-list
   item. A colliding item may retain its ACL under `-U`, but that does not weaken
-  the stated same-user boundary. Typed candidates are cryptographically bound
-  to the account recovery envelope before add.
+  the stated same-user boundary. The fetched recovery wrap's hash must equal the
+  verified current key state's `recoveryWrapId` and be in the signed authorized
+  set before a typed candidate is tried, so a server cannot manufacture a wrap
+  that validates an attacker-chosen phrase.
 - **Machine scope:** the legacy `security(1)` item is not iCloud
   Keychain-synchronized. Ordinary full-Mac backup/migration may carry it, but
   rbox neither requests nor verifies that. Copy explicitly says to retain an
@@ -611,31 +743,59 @@ tables — remain side-effect free and receive exhaustive unit coverage.
    identity propagation; full OSStatus/timeout/signal/overflow probe table;
    bounded-output redaction; source matrix; target decision table; strict v2 +
    legacy parsing and unknown/mixed rejection; atomic-claim concurrency; JSON
-   mutation-free behavior; cleanup precheck + second pre-unlink check; and
-   uninstall state precedence.
+   mutation-free behavior; staging state parsing and crash-point transitions;
+   cleanup precheck + second pre-unlink check; and uninstall state precedence,
+   including staged-only state plus plaintext and custom-Keychain backing paths
+   inside the removal root.
 2. **Command tests:** add dispatch/help/completion coverage for `key save`,
    cached no-stdin save, no-cache hidden TTY input, bounded non-TTY stdin,
    invalid/wrong-account phrase stores nothing, validation performs no
-   admission/cache mutation, `showRecoveryPhrase` is never called, offer copy
-   adapts, JSON emits no nudge/write, and wizard offers before dropping phrase.
+   admission/cache mutation, substituted and historical-but-authorized recovery
+   wraps fail before unwrap, non-interactive macOS genesis durably stages before
+   publish, stage failure prevents publish, exact verification and atomic
+   commitment-locator persistence both precede stage cleanup, crashes at each
+   ordering boundary retain or reconcile RK safely, both original
+   `cacheRecovery` preferences are restored, staged status copy is emitted,
+   `showRecoveryPhrase` is never called, offer copy adapts, JSON emits no
+   nudge/write, and wizard offers before dropping phrase.
    Relevant existing surfaces are `src/cli/auth-cmd.test.ts`,
    `src/cli/help-registry.test.ts:31-42`, and
    `src/cli/setup-cmd.test.ts:1094-1133`.
-3. **Darwin integration:** create a throwaway temp Keychain and pass its path
+3. **Restore command matrix:** deterministic command tests use injected probe,
+   read, resolver, validation, admission-persistence, and record-write seams:
+
+   | Case | Required assertion |
+   |---|---|
+   | stdin TTY / stderr TTY | Exact-account item is offered; decline enters the unchanged interactive manual prompt. |
+   | stdin TTY / stderr non-TTY | No Keychain probe/read/offer; unchanged interactive manual recovery runs. |
+   | stdin non-TTY / stderr TTY | No Keychain probe/read/offer; bounded stdin recovery runs. |
+   | stdin non-TTY / stderr non-TTY | No Keychain probe/read/offer; bounded stdin recovery runs. |
+   | Keychain phrase is BIP39-valid but wrong for current wrap | Redacted warning, zero admission writes, then manual entry; the manual candidate can succeed. |
+   | Failure after admission persistence | Ordinary recovery error semantics; no fallback prompt or second phrase attempt. |
+   | Recognized record with validated Keychain metadata | Resolver is never called; the same persisted canonical path reaches probe and read. |
+   | No record or recognized record without Keychain metadata | Resolver is called exactly once; its one canonical path reaches probe and read. |
+   | Exact account selection | Lookup uses the authenticated full account id; a different account's same-service item is never read or offered. |
+   | Successful recovery through resolved identity | Atomic `discoveredAt` merge preserves existing plaintext artifacts and offer values and invents no `writtenAt`. |
+   | Rediscovery record lock/read/write failure | Safe warning only; enrollment remains successful. |
+   | Unknown record | Resolver is called exactly once and read/recovery may proceed, but the record remains byte-for-byte untouched and a safe metadata warning is emitted. |
+
+4. **Darwin integration:** create a throwaway temp Keychain and pass its path
    explicitly to the exact production byte stream. Test add, exact verify,
    `-U`, duplicate service/account isolation, present/missing classification,
-   restore read, locked metadata probe, wrong identity, timeout/kill, and delete.
+   restore read, rediscovery records `discoveredAt` without inventing
+   `writtenAt`, locked metadata probe, wrong identity, timeout/kill, and delete.
    Never touch the user's login/default/search-list Keychain.
-4. **Real-Mac validation:** fresh genesis, cached and typed `key save`, standalone
+5. **Real-Mac validation:** fresh genesis, cached and typed `key save`, standalone
    and wizard recover, Keychain Access findability/search/show-password,
    reinstall/deleted-kit.json restore, locked GUI, unlocked GUI, SSH into a GUI
    session, truly headless/locked SSH, user cancellation, timeout, and plaintext
    fallback. Observe rather than assume SecurityAgent prompt behavior.
-5. **Deletion/uninstall validation:** race-replace file during cleanup prompt,
-   symlink swap, wrong account, same banner/wrong phrase, oversized/unreadable
-   file, declined cleanup, missing item, unavailable Keychain, unknown future
-   record, and at least one-present-artifact precedence.
-6. **Repo validation:** unit/typecheck plus `bun run rig` or a dev build shipped
+6. **Deletion/uninstall validation:** race-replace file during cleanup prompt,
+   symlink swap, handle/path inode mismatch, wrong account, same banner/wrong
+   phrase, oversized/unreadable file, declined cleanup, missing item, unavailable
+   Keychain, unknown future record, artifact inside the uninstall root, and
+   surviving-present-artifact precedence.
+7. **Repo validation:** unit/typecheck plus `bun run rig` or a dev build shipped
    to the local fleet, per repository flow; documentation/usage snapshots and
    any CODEMAP ownership line stay in sync.
 
@@ -648,13 +808,15 @@ tables — remain side-effect free and receive exhaustive unit coverage.
    aggregate safety.
 3. `rbox key save` + phrase-envelope validation + cached/typed source selection;
    dispatch/help/completions/usage and no-echo/TTY tests.
-4. Genesis/backup/standalone-recover/wizard-recover zero-typing offer plumbing;
-   status human/JSON rendering and once-per-installation claim tests.
-5. Restore-from-Keychain read flow, uninstall consumer, exact-match plaintext
-   migration, integration matrix, and changelog note for non-interactive `--kit`.
+4. Genesis durable staging plus genesis/backup/standalone-recover/wizard-recover
+   zero-typing offer plumbing; status human/JSON rendering and
+   once-per-installation claim tests.
+5. Restore-from-Keychain read/fallback/rediscovery flow, uninstall consumer,
+   exact-match plaintext migration, integration matrix, and changelog note for
+   non-interactive `--kit`.
 
 ## Open questions (for review)
 
-None in v3. The phrase-source, ACL, process, identity, state, offer, cleanup,
+None in v4. The phrase-source, ACL, process, identity, state, offer, cleanup,
 probe, uninstall, restore, and wording rulings above are pinned and are not
 reopened by implementation review.
