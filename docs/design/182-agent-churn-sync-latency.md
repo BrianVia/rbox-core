@@ -1,21 +1,20 @@
 # 182 — sync latency under continuous agent churn (capture in the gaps)
 
-Status: DRAFT v6 — round 5 (gpt-5.6-sol, high) verdict CHANGES-REQUIRED
-with 1 blocker + 1 major + 3 editorial (r4-4/5/7 certified closed). All
-folded: the t3 witness is now a CONCRETE interface (standing
-`criticalPhase` idle/active field, bootId-valid, durable-write-awaited
-BEFORE critical entry, witnessDegraded → unknown on write failure) —
-closing the race where a synchronous void gate hook queues an unawaited
-status write and a critical section starts behind an idle witness
-(r5-1); the rig ceiling applies to ordinary GOVERNED attempts with
-recovery overrides counted-but-executing and asserted separately (r5-2);
-indeterminate journal pins preserved indefinitely (r5-3); benchmark test
-summary mirrors the three-part requirement (r5-4); relationship section
-gates both positives on the witness (r5-5). Round 6 verifies; expecting
-ALIGNED or editorial residue.
+Status: DRAFT v7 — round 6 (gpt-5.6-sol, high) certified r5-2..5 closed;
+one remaining blocker (r6-1): v6's witness failure path was fail-OPEN
+(active-write failure let critical work proceed behind a same-boot idle
+record for up to the stale window, with an error-suppressed writer and a
+possibly-never-visible degraded bit). Folded fail-closed: publish
+`active` (awaited) OR an explicit `degraded` witness state before entry;
+if neither publishes, the critical entry DEFERS with reason. Durability
+scope clarified (same-boot visibility; power loss ends the boot and
+invalidates the witness by bootId — no parent-dir fsync required).
+Round 7 verifies the single changed contract.
 
 History: v5 folded round 4 (7/2: journal-pin sweep, E2 gating, doPush
 governor, argv cliff, fanout behind debounce, distinct-OID benchmark).
+v6 folded round 5 (concrete criticalPhase interface; governed-attempt
+ceiling; indeterminate pins preserved indefinitely).
 
 History: v2 folded round 1 (19 findings, 5 blockers; A0 prerequisite
 created; B/C demoted to phase-2 requirement sets; E narrowed and
@@ -379,21 +378,29 @@ doomed-work bandwidth cheap. Hygiene = ghost-record cleanup (pr8 class, in
    Concrete interface (r5-1), a named requirement ON t3:
    - Standing field in `daemon.status.json`:
      `criticalPhase: {"state":"idle"} | {"state":"active",
-     "phase":<t3 enum>, "since":<iso>}`, valid only when the record's
+     "phase":<t3 enum>, "since":<iso>} | {"state":"degraded"}`
+     (`degraded` → `"unknown"`), valid only when the record's
      `bootId` matches the live v2 pidfile (same rule as 178's mode
      witness). Field ABSENT (old daemon) → both positive outcomes
      unavailable → `"unknown"`.
-   - Happens-before rule: the `active` publication is durably written
-     (atomic rename) and AWAITED before critical-section work begins —
-     entry into the mutation gate blocks on the acknowledged status
-     write, replacing the current fire-and-forget callback shape (a
-     synchronous void hook queuing an unawaited write lets a critical
-     section start while status still shows idle → false
-     `"stops-cleanly"`). If the write fails, entry proceeds but the
-     daemon marks the witness unreliable for the rest of the boot
-     (heartbeat carries a `witnessDegraded` bit) → status returns
-     `"unknown"`. Exit publishes `idle` best-effort AFTER the section
-     (a crash mid-section leaves `active`, which reads conservative).
+   - Happens-before rule (r6-1, fail-CLOSED): the `active` publication is
+     written (fsync + atomic rename) and AWAITED before critical-section
+     work begins — entry into the mutation gate blocks on the
+     acknowledged status write, replacing the current fire-and-forget
+     callback shape (a synchronous void hook queuing an unawaited,
+     error-suppressed write lets a critical section start while status
+     still shows idle → false `"stops-cleanly"` for up to the stale
+     window). If the `active` write FAILS, the daemon attempts to publish
+     an explicit degraded witness (`criticalPhase:{"state":"degraded"}` +
+     the boot-sticky `witnessDegraded` bit); if THAT also fails, the
+     critical entry does not proceed — the operation DEFERS with reason
+     and retries later. Work never runs behind a same-boot `idle` record.
+     Exit publishes `idle` best-effort AFTER the section (a crash
+     mid-section leaves `active`, which reads conservative).
+   - Durability scope (r6-editorial): "durable" means atomically visible
+     to same-boot readers (fsync of the temp file + rename); parent-dir
+     fsync / power-loss durability is NOT required — a power loss ends
+     the boot, and the witness is bootId-invalid on the next one.
    Pre-t3, E2 ships `"not-running" | "unknown"` only. Vocabulary
    compile-enforced in the shell/telemetry allowlist like 178's mode
    witness.
