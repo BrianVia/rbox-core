@@ -38,7 +38,7 @@ Statuses used below:
 | First / last seen | 2026-07-20 / 2026-07-22 |
 | Failure | expected zero cursor sends, received nonzero after `[2773.07ms]` in v1.7.21 release CI, shard 4; adjacent log context included `ws cursor check failed: cursor reply timed out after 29ms` |
 | Root cause | The test sleeps 40 ms between committed frames and assumes a starved runner will resume before the jittered cursor's 150 ms minimum; the exact 29 ms diagnostic is expected output from the adjacent 30 ms blackhole test, not this daemon's 199 ms deadline. |
-| Status / fix | **CONFIRMED — FIX PENDING.** Replace wall-time domination with an injected cursor clock and logical cadence/timeout advances; no production behavior change. |
+| Status / fix | **CONFIRMED — FIXED** in `25da94b2` (final barrier hardening `f1d56a55`). Wall-time domination is replaced by an injected cursor clock/random source and logical cadence/timeout advances; defaults preserve native timers, jitter, and `unref`. |
 | Proof | First failure [2026-07-20 run](https://github.com/BrianVia/rbox-core/actions/runs/29786152966); [failed and same-SHA rerun run](https://github.com/BrianVia/rbox-core/actions/runs/29913968169), exact SHA `0a88543538901c8d96b924c7bbf54cf0b1681083`; rerun green; isolation green. |
 
 ### FLAKE-002 — logout waits for an in-flight credential writer
@@ -50,7 +50,7 @@ Statuses used below:
 | First / last seen | 2026-07-20 / 2026-07-22 |
 | Failure | `[50.51ms]` on PR #373; `[56.48ms]` on PR #394, shard 4 |
 | Root cause | A child holds the credential lock for a fixed 350 ms while the parent polls every 10 ms; neither sleep establishes that logout actually encounters the live writer. |
-| Status / fix | **CONFIRMED historical flake — FIX PENDING; 2026-07-22 recurrence SUSPECTED.** Child-owned-lock and parent-observed-contention handshakes replace both timing windows. The PR #394 protected-path diff does not include `credentials.ts` or this test. |
+| Status / fix | **CONFIRMED historical flake — FIXED** in `734d87f4` (teardown hardening `f1d56a55`); the 2026-07-22 recurrence remains **SUSPECTED** because its same-SHA rerun is pending. Child-owned-lock and parent-observed-contention handshakes replace both timing windows. The PR #394 protected-path diff does not include `credentials.ts` or this test. |
 | Proof | [2026-07-20 failure and green failed-job rerun](https://github.com/BrianVia/rbox-core/actions/runs/29753317433); [2026-07-22 recurrence](https://github.com/BrianVia/rbox-core/actions/runs/29937523471) has 5× isolation and two green full local runs, but its same-SHA CI rerun remains pending. |
 
 ### FLAKE-003 — design-93 §11 concurrent saves
@@ -62,8 +62,8 @@ Statuses used below:
 | First / last seen | 2026-07-12 / 2026-07-21 |
 | Failure | final state expected sequence 2 but received sequence 1; observed `[284ms]`, `[267ms]`, `[398.10ms]`, `[859.11ms]`, `[205.70ms]`, `[529.06ms]`, `[342.57ms]`, `[458.01ms]`, and `[491.08ms]` |
 | Root cause | Two child processes load the same snapshot, then the daemon merely sleeps 40 ms in the hope that the newer CLI writer finishes first; scheduler order and one-shot lock acquisition are uncontrolled. |
-| Status / fix | **SUSPECTED — FIX PENDING.** Coordinate both snapshot-ready events, release/await CLI sequence 2, then release stale daemon sequence 1. Production save logic unchanged. The current registry lacks a complete three-witness proof for one historical occurrence and does not promote it on repetition alone. |
-| Proof | [2026-07-21 failed run and failed-job rerun](https://github.com/BrianVia/rbox-core/actions/runs/29854135760); earlier exact-SHA reruns include [2026-07-20](https://github.com/BrianVia/rbox-core/actions/runs/29758980906). `docs/STATUS.md` says “FOUR strikes” on July 21, but the retained log shows two executions whose failure body was duplicated in each job summary, not four distinct runs. Local isolation proof will be refreshed by this sweep. |
+| Status / fix | **SUSPECTED — FIXED** in `afd948c9`. Both child snapshot-ready events are coordinated; the parent releases/awaits CLI sequence 2 before releasing stale daemon sequence 1, with both stderr streams drained. Production save logic is unchanged. The historical incident remains suspected because one three-witness set is incomplete. |
+| Proof | [2026-07-21 failed run and failed-job rerun](https://github.com/BrianVia/rbox-core/actions/runs/29854135760); earlier exact-SHA reruns include [2026-07-20](https://github.com/BrianVia/rbox-core/actions/runs/29758980906). `docs/STATUS.md` says “FOUR strikes” on July 21, but the retained log shows two executions whose failure body was duplicated in each job summary, not four distinct runs. The sweep's refreshed isolation proof is below. |
 
 ### FLAKE-004 — original design-170 cursor timer cluster
 
@@ -91,29 +91,29 @@ Statuses used below:
 ## Same-class audit candidates
 
 These are the actionable occurrences found by the `src/**/*.test.ts` and
-`apps/api/test` sweep. “Fix pending” means the test contains a sleep or
-unawaited producer that directly controls an exact assertion; final status is
-updated after implementation review.
+`apps/api/test` sweep. Each fixed row originally contained a sleep or unawaited
+producer that directly controlled an exact assertion; the status records its
+deterministic disposition after implementation review.
 
 | ID | File / test area | Risk and deterministic disposition | Status |
 |---|---|---|---|
-| AUDIT-001 | `src/cli/telemetry/sync-state.test.ts` — `reporter gates unchanged ticks...` and `kill switch...` | Fire-and-forget tick/heartbeat followed by 10 ms then exact call counts; await the reporter's internal chain through a test flush. | **FIX PENDING** |
-| AUDIT-002 | `src/cli/git-cmd.test.ts` — resolve heartbeat teardown | Sleeps 10 ms after return then asserts no later output; inject/record timer lifecycle and assert clear structurally. | **FIX PENDING** |
-| AUDIT-003 | `src/cli/remote/blob-batch/blob-batch.test.ts` — queued close and pull-first tail | 20/30 ms sleeps control exact dispatch counts; use existing uploader clock and dispatch-entry gates. | **FIX PENDING** |
-| AUDIT-004 | `src/cli/remote/blob-batch/pack-upload.test.ts` — pack release wakes batch | 20 ms negative window before exact no-batch assertion; use pack/batch entry gates. | **FIX PENDING** |
-| AUDIT-005 | `src/cli/remote/blob-batch/upload-grant.test.ts` — refresh and close cases | Unawaited refresh followed by `setTimeout(0)`/100 ms race; use test-only mocked-fetch completion/condition polling. `src/cli/remote/context.ts` is protected, so seam-dependent cases are **DEFERRED: POST-394**. | **FIX PENDING / DEFER POLICY** |
-| AUDIT-006 | `src/engine/crypto-pool/crypto-pool.test.ts` — post-reset status | A 25 ms sleep follows an already-awaited reset and is redundant; remove it. | **FIX PENDING** |
-| AUDIT-007 | `src/cli/e2ee-sync.test.ts` — `D fast pull evidence mismatches...` | Fake chain GET sleeps 5 ms to manufacture overlap; entered/release gates prove the expected chain reads (not the sequential head read) are in flight. | **FIX PENDING** |
-| AUDIT-008 | `src/engine/git/capture-stability.test.ts` — ambient index churn | Unawaited churn producer plus 10 ms startup guess; wait for first churn and await controlled shutdown. | **FIX PENDING** |
-| AUDIT-009 | `src/cli/sync-git/follow.test.ts` — held fingerprint aging | Eight 2.1 s sleeps age a 2 s racy-clean margin; inject one `heldNow` per repo decision, defaulting to `Date.now`. | **FIX PENDING** |
-| AUDIT-010 | `src/cli/redeem-drain-upload.test.ts` — serialized backpressure | 20 ms negative window before exact PUT count despite an existing drain gate; assert through that gate. | **FIX PENDING** |
-| AUDIT-011 | `src/cli/daemon/daemon-safety.test.ts` — signal/state and safety cadence cases | A 450 ms signal wait and `setTimeout(0)` scheduler turn precede exact assertions; drive/await explicit state and scheduler events. | **FIX PENDING** |
-| AUDIT-012 | `src/cli/daemon/daemon-activity.test.ts` — `lastFailureAt` ordering and stop-settlement cases | A 2 ms timestamp guess and 50 ms negative stop window precede exact assertions; inject logical now and await stop settlement. Existing condition polling remains note-only. | **FIX PENDING** |
+| AUDIT-001 | `src/cli/telemetry/sync-state.test.ts` — `reporter gates unchanged ticks...` and `kill switch...` | Fire-and-forget tick/heartbeat followed by 10 ms then exact call counts; await the reporter's internal chain through a test flush. | **FIXED** `e353fcff` |
+| AUDIT-002 | `src/cli/git-cmd.test.ts` — resolve heartbeat teardown | Sleeps 10 ms after return then asserts no later output; inject/record timer lifecycle and assert clear structurally. | **FIXED** `0a09bb93`, `f1d56a55` |
+| AUDIT-003 | `src/cli/remote/blob-batch/blob-batch.test.ts` — queued close and pull-first tail | 20/30 ms sleeps control exact dispatch counts; use existing uploader clock and dispatch-entry gates. | **FIXED** `f0559760`, `f1d56a55` |
+| AUDIT-004 | `src/cli/remote/blob-batch/pack-upload.test.ts` — pack release wakes batch | 20 ms negative window before exact no-batch assertion; use pack/batch entry gates. | **FIXED** `f0559760`, `f1d56a55` |
+| AUDIT-005 | `src/cli/remote/blob-batch/upload-grant.test.ts` — refresh and close cases | Unawaited refresh followed by `setTimeout(0)`/100 ms race; observe the actual in-flight refresh promise or positive state and structurally drain close. The protected `src/cli/remote/context.ts` needed no edit; the disabled overlap case remains note-only. | **FIXED / NOTE-ONLY SKIP** `f0559760`, `f1d56a55` |
+| AUDIT-006 | `src/engine/crypto-pool/crypto-pool.test.ts` — post-reset status | A 25 ms sleep follows an already-awaited reset and is redundant; remove it. | **FIXED** `30aa28cd` |
+| AUDIT-007 | `src/cli/e2ee-sync.test.ts` — `D fast pull evidence mismatches...` | Fake chain GET sleeps 5 ms to manufacture overlap; entered/release gates prove the expected chain reads (not the sequential head read) are in flight. | **FIXED** `30aa28cd`, `f1d56a55` |
+| AUDIT-008 | `src/engine/git/capture-stability.test.ts` — ambient index churn | Unawaited churn producer plus 10 ms startup guess; wait for first churn and stop/drain the producer on every exit. | **FIXED** `30aa28cd`, `f1d56a55` |
+| AUDIT-009 | `src/cli/sync-git/follow.test.ts` — held fingerprint aging | Eight 2.1 s sleeps age a 2 s racy-clean margin; inject one shared logical `heldNow` for tests while omitted production call sites retain their original independent wall-clock reads. | **FIXED** `aecf3634`, `f1d56a55` |
+| AUDIT-010 | `src/cli/redeem-drain-upload.test.ts` — serialized backpressure | 20 ms negative window before exact PUT count despite an existing drain gate; assert through that gate. | **FIXED** `30aa28cd` |
+| AUDIT-011 | `src/cli/daemon/daemon-safety.test.ts` — signal/state and safety cadence cases | A 450 ms signal wait and `setTimeout(0)` scheduler turn precede exact assertions; drive/await the exact signal batch and scheduler state. | **FIXED** `15d98beb`, `f1d56a55` |
+| AUDIT-012 | `src/cli/daemon/daemon-activity.test.ts` — `lastFailureAt` ordering and stop-settlement cases | A 2 ms timestamp guess and 50 ms negative stop window precede exact assertions; inject logical now and race the owned stop-settlement promise. Existing condition polling remains note-only. | **FIXED** `15d98beb`, `f1d56a55` |
 | AUDIT-013 | PR #394 protected files | The authoritative 56-path diff was scanned. No clear live fix above needs a protected path; any later candidate there is **DEFERRED: POST-394**, never edited in this sweep. | **NOTE-ONLY / DEFER POLICY** |
-| AUDIT-014 | `src/cli/daemon/daemon-ws-reliability.test.ts` — pong deadline, backstop positive, WS-disabled zero-backstop | Fixed 100/90/50 ms sleeps precede exact counts/state; await the positive events and remove the causally unnecessary disabled-path sleep. | **FIX PENDING** |
-| AUDIT-015 | `src/cli/credentials.test.ts` — `a long fenced operation refreshes the main marker...` | Sleeps 60 ms after a 10 ms heartbeat then asserts mtime advanced; condition-poll the mtime event under a generous ceiling. | **FIX PENDING** |
-| AUDIT-016 | `src/cli/sync-git/git-sync.test.ts` — `git apply pools independent repos...` | The positive `betaStarted` event uses a 1 s failure ceiling; preserve the causal promise and raise only this starvation ceiling to 10 s. The three negative non-overlap windows below stay note-only as concurrency contracts. | **FIX PENDING** |
-| AUDIT-017 | `src/cli/remote/resilient.test.ts` — `abort mid-backoff aborts the retry` | A microtask guess precedes abort and the losing sleep leaves a real 10 s timer detached; announce sleep entry and return a resource-free never-settling promise before abort. | **FIX PENDING** |
+| AUDIT-014 | `src/cli/daemon/daemon-ws-reliability.test.ts` — pong deadline, backstop positive, WS-disabled zero-backstop | Fixed 100/90/50 ms sleeps precede exact counts/state; await positive events, inspect scheduled backstop preservation, and remove the causally unnecessary disabled-path sleep. | **FIXED** `25da94b2`, `f1d56a55` |
+| AUDIT-015 | `src/cli/credentials.test.ts` — `a long fenced operation refreshes the main marker...` | Sleeps 60 ms after a 10 ms heartbeat then asserts mtime advanced; condition-poll the mtime event under a generous ceiling. | **FIXED** `734d87f4`, `f1d56a55` |
+| AUDIT-016 | `src/cli/sync-git/git-sync.test.ts` — `git apply pools independent repos...` | The positive `betaStarted` event uses a 1 s failure ceiling; preserve the causal promise and raise only this starvation ceiling to 10 s. The three negative non-overlap windows below stay note-only as concurrency contracts. | **FIXED** `30aa28cd` |
+| AUDIT-017 | `src/cli/remote/resilient.test.ts` — `abort mid-backoff aborts the retry` | A microtask guess precedes abort and the losing sleep leaves a real 10 s timer detached; announce sleep entry and return a resource-free never-settling promise before abort. | **FIXED** `e353fcff` |
 
 ## Note-only timing contracts and acceptable ceilings
 
@@ -157,12 +157,137 @@ Additional note-only audit entries:
 | `src/cli/sync-git/git-sync.test.ts` — shared-common-dir, nested parent/child, and concurrency=1 non-overlap | The held first operation plus 1 s negative window is the concurrency contract; elapsed delay cannot turn a correct implementation positive, and structural scheduler inspection would exceed this sweep. |
 | Skipped upload-grant overlap test | It contains timing risk but is disabled; retain as a note until re-enabled. |
 
+## `Date.now()` census
+
+The audit found `Date.now()` in 58 in-scope files. Every occurrence is covered
+below; none revealed another tight real-time assertion beyond the actionable or
+note-only loci already registered.
+
+- API fixture/logical-input only (row creation, explicit expiry/age inputs, or
+  injected handler time): `apps/api/test/abuse-hardening.test.ts`,
+  `account-delete.test.ts`, `admin.test.ts`, `api-keys.test.ts`,
+  `auth-version.test.ts`, `blob-batch-auth-grant.test.ts`,
+  `blob-batch.test.ts`, `blob-pack-put.test.ts`, `blob-pack-read.test.ts`,
+  `blob-pack-redeem.test.ts`, `blobs-grant.test.ts`,
+  `commit-delta-shadow.test.ts`, `fairuse-scan.test.ts`, `gc-phase1.test.ts`,
+  `gc-purge.test.ts`, `multipart-inventory.test.ts`, `notify.test.ts`,
+  `receipts-flow.test.ts`, `sidecar-flow.test.ts`, `slackpipes.test.ts`,
+  `worker.test.ts`, `ws-purge.test.ts`, and `ws-session-cap.test.ts`.
+- API reviewed timing observations: `apps/api/test/diagnostics.test.ts` has a
+  days-wide expiry margin; `telemetry-ingest.test.ts` checks only that a
+  server-stamped row is no earlier than the request; and `pack-gc.test.ts` is
+  the deliberate security-ordering timing contract listed above.
+- CLI/engine fixture, injected-clock, or cache-buster only:
+  `src/cli/remote/blob-batch/blob-batch.test.ts`,
+  `src/cli/remote/resilient.test.ts`,
+  `src/cli/sync-git/conflict-retention.test.ts`, `fingerprint.test.ts`,
+  `held-skip.test.ts`, `pending-supersession.test.ts`,
+  `sync-git-config-push.test.ts`, `src/cli/telemetry/sync-phase.test.ts`,
+  `src/engine/apply-receipt.test.ts`, `engine-m1.test.ts`, `engine.test.ts`,
+  `git-state.test.ts`, `src/engine/git/config-txn.test.ts`,
+  `index-identity.test.ts`, and `src/engine/trash.test.ts`.
+- CLI/engine reviewed timing loci already represented by an actionable or
+  note-only row: `src/cli/credentials.test.ts`,
+  `src/cli/daemon/daemon-activity.test.ts`, `daemon-git-capture.test.ts`,
+  `daemon-git-ref-integration.test.ts`, `watcher.test.ts`,
+  `src/cli/design85-layer-a.test.ts`, `git-config-sync.e2e.test.ts`,
+  `redeem-drain-upload.test.ts`,
+  `src/cli/remote/blob-batch/pack-upload.test.ts`, `src/cli/shell-init.test.ts`,
+  `src/cli/sync-git/follow.test.ts`, `git-sync.test.ts`,
+  `src/cli/watcher-retrust.test.ts`,
+  `src/engine/crypto-pool/crypto-fused.test.ts`,
+  `src/engine/darwin-bulk-walk.test.ts`, `dircache.test.ts`, and
+  `src/engine/git/lockfile.test.ts`.
+
 The audit found four unawaited-producer families requiring fixes
 (AUDIT-001, AUDIT-005, AUDIT-008, AUDIT-017). Reviewed D1 helper arrows ending in
 `.run()` return their promise to an awaited caller and are false positives,
 not unawaited producers. Reviewed plain `Date.now()` uses that only seed
 database rows, grants, expiries, or logical fixtures without a tight delta
 assertion are likewise false positives, not timing candidates. The explicit
-sleep/setTimeout census now accounts for all 34 matching test files; the
-fixture-only `Date.now()` file census is completed and enumerated with the
-final audit proof after implementation.
+sleep/setTimeout census accounts for all 34 matching test files.
+
+## Sweep proof — 2026-07-22
+
+### Ten-process isolation matrix
+
+Each changed test file ran as a whole in ten fresh Bun processes with no retry.
+All 170 processes passed. The retained transcript is
+`/tmp/rbox-flake-sweep-isolation.log` and ends in
+`ISOLATION_MATRIX_COMPLETE`.
+
+| Test file | Passes | Wall spread (seconds) |
+|---|---:|---:|
+| `src/cli/credentials.test.ts` | 10/10 | 4.54–4.57 |
+| `src/cli/daemon/daemon-activity.test.ts` | 10/10 | 5.14–6.13 |
+| `src/cli/daemon/daemon-safety.test.ts` | 10/10 | 0.11–0.12 |
+| `src/cli/daemon/daemon-ws-reliability.test.ts` | 10/10 | 0.36–0.40 |
+| `src/cli/e2ee-sync.test.ts` | 10/10 | 10.57–13.83 |
+| `src/cli/git-cmd.test.ts` | 10/10 | 22.10–22.28 |
+| `src/cli/git-config-sync.e2e.test.ts` | 10/10 | 3.84–3.88 |
+| `src/cli/redeem-drain-upload.test.ts` | 10/10 | 0.16–0.18 |
+| `src/cli/remote/blob-batch/blob-batch.test.ts` | 10/10 | 3.92–6.10 |
+| `src/cli/remote/blob-batch/pack-upload.test.ts` | 10/10 | 0.95–0.97 |
+| `src/cli/remote/blob-batch/upload-grant.test.ts` | 10/10 | 0.09–0.11 |
+| `src/cli/remote/resilient.test.ts` | 10/10 | 0.03–0.04 |
+| `src/cli/sync-git/follow.test.ts` | 10/10 | 66.68–67.21 |
+| `src/cli/sync-git/git-sync.test.ts` | 10/10 | 44.62–46.42 |
+| `src/cli/telemetry/sync-state.test.ts` | 10/10 | 0.08–0.10 |
+| `src/engine/crypto-pool/crypto-pool.test.ts` | 10/10 | 0.45–0.48 |
+| `src/engine/git/capture-stability.test.ts` | 10/10 | 0.78–0.81 |
+
+### Repository gates
+
+- `bun run test` expands the repository's canonical root command,
+  `bun test ./src/ ./scripts/gc-drain.test.ts`: **2814 passed, 16 skipped,
+  0 failed**, 31,893 assertions across 2,830 tests / 226 files in 327.24 s.
+  Bare no-argument `bun test` is not the package gate: Bun recursively discovers
+  nested Vitest suites and runner-specific utility scripts. This sweep did not
+  change test configuration to disguise that pre-existing monorepo-runner
+  boundary.
+- `bun run test:api -- --configLoader runner`: **46 files passed; 781 tests
+  passed, 4 skipped**, in 64.48 s. The runner loader is an environment-only workaround:
+  the sandbox otherwise makes Vite write `.vite-temp` beside dependencies in the
+  read-only primary checkout. No API or test source changed.
+- `bun run typecheck`: **passed** (root and API incremental TypeScript checks).
+- `git diff --check`: **passed**.
+
+### Compiled live integration proof
+
+`bun run rig doctor --runner docker` passed dev-secret resolution and dev API
+health (HTTP 200), but the execution sandbox denied access to the local Docker
+socket; the Desktop context had no running daemon, and user namespaces were
+disabled, so neither the checked-in Docker rig nor a private rootless daemon
+could start. The doctor evidence is retained at
+`/tmp/rbox-flake-sweep-rig-doctor.log`.
+
+The repository-sanctioned non-container alternative was therefore exercised
+with a compiled dev CLI on this local host against the dev worker, using two
+isolated homes/workspaces and a throwaway account. It passed bootstrap and plan
+grant; initial Git remote/tracking materialization; config-only encrypted-wire
+propagation to both devices without changing HEAD; two idle cycles with zero
+new sequences; compiled-daemon heartbeats; A→B propagation in 4.257 s; B→A
+propagation in 4.006 s; healthy activity state on both daemons; graceful stops;
+and account deletion HTTP 200. The temporary harness and device homes were
+removed; the redacted result is retained at
+`/tmp/rbox-flake-sweep-live-proof.log`.
+
+### Scope and behavior audit
+
+- Recomputed PR #394 as
+  `git diff --name-only origin/main...origin/feat/180-atomic-genesis` (56 paths).
+  Its intersection with every tracked and untracked sweep path is **empty**.
+- No candidate required a protected path, so there are **no deferred post-394
+  fixes**. AUDIT-013 remains the standing defer policy, not a deferred edit.
+- The six PR #331 timing-contract families remain note-only. The disabled
+  upload-grant overlap case also remains note-only.
+- Non-test production changes are limited to five testability seams:
+  `RboxDaemon` cursor clock/random injection; the credentials test hook's
+  lock-contention notification; Git resolve's injectable progress scheduler;
+  telemetry reporter `flushForTests`; and optional held-attempt time injection.
+  Omitted/default arguments preserve the original native timers, random jitter,
+  lock behavior, progress cadence, reporter behavior, and independent
+  `Date.now()` reads. No product behavior or API contract changed.
+- Four adversarial design rounds reached alignment. Final simplify/default-
+  equivalence and anti-slop/correctness reviews were clean after teardown,
+  scheduler, signal-filtering, and producer-drain hardening.
