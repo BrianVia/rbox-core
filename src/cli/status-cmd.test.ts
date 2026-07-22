@@ -755,11 +755,17 @@ test("CLI dispatch rejects every conflicting presentation pair after boolean fla
 
 test("live daemon version is rendered and exact skew warning is closed in human and JSON output", async () => {
   const d = cleanScanDeps();
+  let promotions = 0;
+  d.promotePendingModeIntent = async (promotedRoot) => {
+    expect(promotedRoot).toBe(root);
+    promotions++;
+    return true;
+  };
   d.daemonBindingStatus = () => ({ alive: { running: true, pid: 1234, bootId: "boot_status" }, bound: cfg.remoteWorkspaceId, stale: false });
   d.readDaemonPidRecord = () => ({ present: true });
   d.readAmbientDaemonStatusRecord = () => ({
     kind: "ok",
-    status: { schemaVersion: 1, daemonVersion: "1.7.17", state: "synced", heartbeatAt: new Date(NOW).toISOString(), sequence: 7, lastSyncedAt: null },
+    status: { schemaVersion: 1, daemonVersion: "1.7.17", mode: "pull-only", bootId: "boot_status", state: "synced", heartbeatAt: new Date(NOW).toISOString(), sequence: 7, lastSyncedAt: null },
   });
   const logs: string[] = [];
   const oldLog = console.log;
@@ -769,22 +775,35 @@ test("live daemon version is rendered and exact skew warning is closed in human 
   process.stdout.write = ((chunk: string | Uint8Array) => { stdout.push(String(chunk)); return true; }) as typeof process.stdout.write;
   try {
     await statusCmdWithDeps(root, { verbose: true }, d);
-    expect(logs.join("\n")).toContain("background sync: running (v1.7.17) (pid 1234)");
+    expect(promotions).toBe(1);
+    expect(logs.join("\n")).toContain("background sync: running (v1.7.17, pull-only) (pid 1234)");
     expect(logs.join("\n")).toContain(`daemon is running v1.7.17 but this CLI is v${RBOX_VERSION} — restart to finish the upgrade: rbox stop && rbox start`);
     await statusCmdWithDeps(root, { json: true }, d);
-    expect(JSON.parse(stdout.at(-1)!)).toMatchObject({ daemon: { version: "1.7.17", cliVersion: RBOX_VERSION, versionSkew: true } });
+    expect(promotions).toBe(2);
+    expect(JSON.parse(stdout.at(-1)!)).toMatchObject({ daemon: { version: "1.7.17", mode: "pull-only", cliVersion: RBOX_VERSION, versionSkew: true } });
     d.readAmbientDaemonStatusRecord = () => ({
       kind: "ok",
-      status: { schemaVersion: 1, daemonVersion: RBOX_VERSION, state: "synced", heartbeatAt: new Date(NOW).toISOString(), sequence: 7, lastSyncedAt: null },
+      status: { schemaVersion: 1, daemonVersion: RBOX_VERSION, mode: "read-write", bootId: "boot_status", state: "synced", heartbeatAt: new Date(NOW).toISOString(), sequence: 7, lastSyncedAt: null },
     });
     logs.length = 0;
     await statusCmdWithDeps(root, { verbose: true }, d);
-    expect(logs.join("\n")).toContain(`(v${RBOX_VERSION})`);
+    expect(promotions).toBe(3);
+    expect(logs.join("\n")).toContain(`(v${RBOX_VERSION}, read-write)`);
     expect(logs.join("\n")).not.toContain("restart to finish the upgrade");
+    d.readAmbientDaemonStatusRecord = () => ({
+      kind: "ok",
+      status: { schemaVersion: 1, daemonVersion: RBOX_VERSION, mode: "pull-only", bootId: "boot_stale", state: "synced", heartbeatAt: new Date(NOW).toISOString(), sequence: 7, lastSyncedAt: null },
+    });
+    logs.length = 0;
+    await statusCmdWithDeps(root, { verbose: true }, d);
+    expect(promotions).toBe(4);
+    expect(logs.join("\n")).toContain(`background sync: running (v${RBOX_VERSION}) (pid 1234)`);
+    expect(logs.join("\n")).not.toContain("pull-only");
     d.daemonBindingStatus = () => ({ alive: { running: false }, stale: false });
     stdout.length = 0;
     await statusCmdWithDeps(root, { json: true }, d);
-    expect(JSON.parse(stdout.at(-1)!)).toMatchObject({ daemon: { version: null, versionSkew: false } });
+    expect(promotions).toBe(4);
+    expect(JSON.parse(stdout.at(-1)!)).toMatchObject({ daemon: { version: null, mode: null, versionSkew: false } });
   } finally {
     console.log = oldLog;
     process.stdout.write = oldWrite;

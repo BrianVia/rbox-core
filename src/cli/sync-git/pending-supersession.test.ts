@@ -15,6 +15,7 @@ import { cleanGitEnv, git, putGitArtifact, repoCtx } from "../../engine/git/shar
 import {
   gitPendingSupersedeEnabled,
   journalAllowsPendingSupersession,
+  pendingSupersessionAckConverges,
   provePendingSupersession,
 } from "./pending-supersession.js";
 
@@ -46,6 +47,23 @@ function section(main: string, extra: Partial<GitSection> = {}): GitSection {
     ...extra,
   };
 }
+
+test("ACK-composer dry-run rejects BASE-only preservation and ignores object key order", () => {
+  const main = "a".repeat(40);
+  const prior = "b".repeat(40);
+  const binding = {
+    lineageHash: "c".repeat(64),
+    repositoryIdentityHash: "d".repeat(64),
+    repoKind: "dir" as const,
+  };
+  const previous = section(main, { refs: { "refs/heads/main": main, "refs/heads/prior": prior } });
+  const omitted = section(main, { refs: { "refs/heads/main": main } });
+  expect(pendingSupersessionAckConverges({ previousBase: previous, candidate: omitted, binding })).toBe(false);
+  expect(pendingSupersessionAckConverges({ candidate: omitted, binding })).toBe(true);
+
+  const reordered = section(main, { refs: { "refs/heads/prior": prior, "refs/heads/main": main } });
+  expect(pendingSupersessionAckConverges({ previousBase: previous, candidate: reordered, binding })).toBe(true);
+});
 
 const unusedStore = {} as BlobStore;
 

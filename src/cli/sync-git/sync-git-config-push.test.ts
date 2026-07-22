@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { LocalBlobStore, buildIgnoreMatcher, gitIdentity, gitIdentityKey, type GitSection } from "../../engine/index.js";
-import { MAX_GIT_CONFIG_KEYS, type GitConfig } from "../../engine/git/config-sync.js";
+import { MAX_GIT_CONFIG_KEYS, sanitizeGitSectionForPersistence, type GitConfig } from "../../engine/git/config-sync.js";
 import { gitRaw } from "../../engine/git/shared.js";
 import type { SyncState, WorkspaceConfig } from "../config.js";
 import type { SyncRemote } from "../remote.js";
@@ -120,11 +120,45 @@ test("design 93 §6 publish predicate truth table distinguishes presence, edits,
   const emptyHash = { hash: gitConfigHash(empty), nonEmpty: false };
 
   expect(shouldPublishGitConfig(undefined, ah, undefined)).toBe(true); // presence
+  expect(shouldPublishGitConfig(undefined, ah, ah.hash)).toBe(false); // sanitized incoming baseline
   expect(shouldPublishGitConfig(undefined, emptyHash, undefined)).toBe(false);
   expect(shouldPublishGitConfig(a, ah, undefined)).toBe(false); // unchanged
   expect(shouldPublishGitConfig(a, bh, undefined)).toBe(true); // edit, unset marker
   expect(shouldPublishGitConfig(a, bh, bh.hash)).toBe(false); // our already-authored edit
   expect(shouldPublishGitConfig(a, emptyHash, undefined)).toBe(true); // publish removal to {}
+});
+
+test("persistence sanitizer is deterministic, pure, and strips only invalid config", () => {
+  const invalid = { ...baseSection, config: { "remote.origin.url": [] } };
+  const snapshot = structuredClone(invalid);
+  const first = sanitizeGitSectionForPersistence(invalid);
+  const second = sanitizeGitSectionForPersistence(invalid);
+  expect(first).toEqual(second);
+  expect(first.config).toBeUndefined();
+  expect(invalid).toEqual(snapshot);
+  expect(first.refs).toEqual(invalid.refs);
+  const validScoped = { ...baseSection, refScope: "scoped" as const, config: { "remote.origin.url": ["git@example.com:repo.git"] } };
+  expect(sanitizeGitSectionForPersistence(validScoped).config).toBeUndefined();
+  expect(validScoped.config).toBeDefined();
+});
+
+test("durable P has final comparison precedence and survives planner-local opt-out deletion", async () => {
+  const main = baseSection.refs["refs/heads/master"] ?? baseSection.refs["refs/heads/main"]!;
+  const base = { ...baseSection, generatedAt: "base" };
+  const advertised = { ...baseSection, generatedAt: "advertised" };
+  const pending = { ...baseSection, generatedAt: "pending", refs: { ...baseSection.refs, "refs/heads/missing": main } };
+  const state = stateWith(base);
+  state.repoRecords!["."]!.advertised = advertised;
+  state.repoRecords!["."]!.pending = pending;
+  state.gitPendingRemote = { ".": pending };
+
+  const carried = await planGitSections(root, cfg, state, remote, new Set(), buildIgnoreMatcher(root));
+  expect(carried.gitRepos?.["."]).toEqual(pending);
+  expect(carried.changed).toBe(false);
+
+  const optedOut = await planGitSections(root, { ...cfg, syncGit: false }, state, remote, new Set(), buildIgnoreMatcher(root));
+  expect(optedOut.gitRepos).toBeUndefined();
+  expect(optedOut.changed).toBe(true);
 });
 
 test("trusted fast carry cannot hide the presence rule and authorship is wire-exact", async () => {
@@ -464,4 +498,28 @@ test("old-writer strip presence republishes config after a real capture", async 
   const healed = await planGitSections(root, cfg, stateWith(stripped), remote, new Set(), buildIgnoreMatcher(root));
   expect(healed.gitRepos?.["."]?.config).toEqual(wire.config);
   expect(healed.authoredCfgHashByRepo["."]).toBe(gitConfigHash(wire.config!));
+}, 20_000);
+
+test("capture refreshes a reusable post-cleanup divergence-cache entry", async () => {
+  const captured = await planGitSections(
+    root,
+    cfg,
+    stateWith(baseSection),
+    captureRemote(),
+    new Set(["."]),
+    buildIgnoreMatcher(root),
+  );
+  const section = captured.gitRepos!["."]!;
+  await trustCache();
+  const next = await planGitSections(
+    root,
+    cfg,
+    stateWith(section, captured.authoredCfgHashByRepo["."]),
+    remote,
+    new Set(),
+    buildIgnoreMatcher(root),
+  );
+  expect(next.gitPlanStats?.fpHits).toBe(1);
+  expect(next.captured).toEqual([]);
+  expect(next.changed).toBe(false);
 }, 20_000);

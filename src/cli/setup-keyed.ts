@@ -111,6 +111,6 @@ export async function runKeyedSetup(cwd: string, defaultRemote: string, flags: R
     } else {
       process.stderr.write(`${e.yellow("!")} Shared agent keys are pull-only fleet credentials. A writing agent needs its own key.\n`);
     }
-    await startDaemonAndRecordDesired(outcome.root, { pullOnly: flags["pull-only"] === "true" });
+    await startDaemonAndRecordDesired(outcome.root, { mode: flags["pull-only"] === "true" ? "pull-only" : "read-write" });
   }
 }

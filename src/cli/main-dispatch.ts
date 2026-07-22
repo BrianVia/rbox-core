@@ -384,13 +384,21 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
       break;
     }
     case "start": {
+      if (flags["pull-only"] === "true" && flags["read-write"] === "true") {
+        throw new Error("choose only one background sync mode: --pull-only or --read-write");
+      }
+      const mode = flags["pull-only"] === "true"
+        ? "pull-only" as const
+        : flags["read-write"] === "true"
+          ? "read-write" as const
+          : undefined;
       if (positional[0]) {
-        await startDaemonAndRecordDesired(await resolveRoot(positional[0]), { pullOnly: flags["pull-only"] === "true" });
+        await startDaemonAndRecordDesired(await resolveRoot(positional[0]), { mode });
         break;
       }
       const root = await findRoot(process.cwd());
       if (root) {
-        await startDaemonAndRecordDesired(root, { pullOnly: flags["pull-only"] === "true" });
+        await startDaemonAndRecordDesired(root, { mode });
       } else if (process.stdin.isTTY) {
         await runGuidedFrontDoor(deps.frontDoorImport);
       } else {

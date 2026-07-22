@@ -249,7 +249,7 @@ export async function runSetup(opts: {
   });
   const actions = startSyncActions(startChoice);
   if (actions.startDaemon) {
-    await startDaemonAndRecordDesired(outcome.root);
+    await startDaemonAndRecordDesired(outcome.root, { mode: "read-write" });
     process.stderr.write(`${e.green("✓")} Background sync started. Stop anytime with \`rbox stop\`.\n`);
     if (actions.enableAutostart) {
       await enableAutostart();

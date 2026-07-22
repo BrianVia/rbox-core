@@ -133,6 +133,8 @@ test("design 130 persisted BASE and branch-origin writes are a closed allowlist"
     "src/cli/sync-git/follow.ts": 1,
     "src/cli/sync-git/p-repair-state.ts": 1,
     "src/cli/sync-git/p-settlement.ts": 1,
+    // Design 178 D.3 read-only publisher-ACK composer dry-run inputs/result.
+    "src/cli/sync-git/pending-supersession.ts": 3,
     "src/cli/sync-state.ts": 14,
     "src/cli/sync/pull.ts": 2,
   });

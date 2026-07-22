@@ -799,8 +799,9 @@ async function runPushAttempt(
     // Design 174 §4.2: the one bounded supersession line — emitted ONLY here, after
     // the accepted commit, so it never claims a supersession a pre-ACK failure undid.
     for (const relPath of [...supersededPending].sort()) {
+      const keys = gitPlan.supersessionIdentityKeys?.[relPath];
       (deps.onGitLog ?? ((l: string) => console.error(l)))(
-        `git-sync superseded pending ${relPath}: local history subsumes the unapplied remote section. rbox will publish the local history instead.`,
+        `git-sync superseded pending ${relPath}${keys ? ` [P=${keys.pending} candidate=${keys.candidate} composed=${keys.composed}]` : ""}: local history subsumes the unapplied remote section. rbox will publish the local history instead.`,
       );
     }
     for (const relPath of [...resolvedPending].sort()) {

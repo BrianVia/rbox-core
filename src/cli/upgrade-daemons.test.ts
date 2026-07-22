@@ -20,24 +20,26 @@ afterEach(async () => {
   await fs.rm(home, { recursive: true, force: true });
 });
 
-async function runtime(name: string, pid: number, options: { state?: "running" | "stopped"; pullOnly?: boolean; desired?: boolean } = {}): Promise<{ root: string; key: string }> {
+async function runtime(name: string, pid: number, options: { state?: "running" | "stopped"; pullOnly?: boolean; pendingModeIntent?: "pull-only" | "read-write"; desired?: boolean } = {}): Promise<{ root: string; key: string }> {
   const root = path.join(home, name);
   const key = workspaceKey(root);
   const dir = path.join(home, ".rbox", "daemons", key);
   await fs.mkdir(dir, { recursive: true });
   await fs.writeFile(path.join(dir, "daemon.pid"), `v2 ${pid} boot-${pid}\n`);
-  if (options.desired !== false) rows.push({
-    key,
-    path: path.join(dir, "desired.json"),
-    desired: {
+  if (options.desired !== false) {
+    const desired = {
       rootPath: root,
       state: options.state ?? "running",
       accountId: "acct",
       workspaceId: `ws-${name}`,
       at: "2026-07-15T00:00:00.000Z",
       ...(options.pullOnly ? { pullOnly: true } : {}),
-    },
-  });
+      ...(options.pendingModeIntent === undefined ? {} : { pendingModeIntent: options.pendingModeIntent }),
+    } as const;
+    const desiredPath = path.join(dir, "desired.json");
+    await fs.writeFile(desiredPath, `${JSON.stringify(desired, null, 2)}\n`);
+    rows.push({ key, path: desiredPath, desired });
+  }
   return { root, key };
 }
 
@@ -58,6 +60,47 @@ test("managed upgrade restarts every live workspace in stable key order and pres
     const pullOnly = rows.find((row) => row.key === key)!.desired.pullOnly === true;
     return [`stop:${key}`, `start:${key}:${pullOnly}`];
   }));
+});
+
+test("managed upgrade gives a durable pending mode intent precedence", async () => {
+  const pending = await runtime("pending", 151, { pendingModeIntent: "pull-only" });
+  const starts: string[] = [];
+  await restartDaemonsAfterUpgrade({
+    readDesiredDaemonRows: async () => rows,
+    isDaemonProcess: () => true,
+    currentWorkspaceId: () => "ws-pending",
+    stopDaemon: async () => {},
+    startDaemon: async (root, opts) => {
+      starts.push(`${root}:${opts.pullOnly === true}:${opts.modeIntent}`);
+      return "started";
+    },
+    log: () => {},
+  });
+  expect(starts).toEqual([`${pending.root}:true:pending`]);
+  const promoted = JSON.parse(await fs.readFile(rows[0]!.path, "utf8"));
+  expect(promoted).toMatchObject({ state: "running", pullOnly: true });
+  expect(promoted.pendingModeIntent).toBeUndefined();
+});
+
+test("managed upgrade does not restart a cached running row after desired state becomes stopped", async () => {
+  const target = await runtime("stop-race", 171);
+  let starts = 0;
+  const logs: string[] = [];
+  await restartDaemonsAfterUpgrade({
+    readDesiredDaemonRows: async () => rows,
+    isDaemonProcess: () => true,
+    currentWorkspaceId: () => "ws-stop-race",
+    stopDaemon: async () => {
+      const desiredPath = rows[0]!.path;
+      const desired = JSON.parse(await fs.readFile(desiredPath, "utf8"));
+      await fs.writeFile(desiredPath, `${JSON.stringify({ ...desired, state: "stopped", at: "2026-07-15T00:01:00.000Z" }, null, 2)}\n`);
+    },
+    startDaemon: async () => { starts++; return "started"; },
+    log: (line) => logs.push(line),
+  });
+  expect(target.root).toContain("stop-race");
+  expect(starts).toBe(0);
+  expect(logs.join("\n")).toContain("not restarted (desired state changed)");
 });
 
 test("live legacy runtime without desired state is reported and never stopped", async () => {

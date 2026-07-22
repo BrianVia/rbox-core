@@ -338,13 +338,13 @@ test("future producer timestamps sort last and never become a fresh zero age", (
   expect(projected.deferrals?.[0]?.deferredSince).toBe(future);
 });
 
-test("ambient reader retains an optional daemonVersion and accepts older records without it", async () => {
-  await writeStatus({ daemonVersion: "1.6.3" });
+test("ambient reader retains optional daemon identity fields and accepts older records without them", async () => {
+  await writeStatus({ daemonVersion: "1.6.3", mode: "pull-only", bootId: "boot-mode" });
   expect(readPromptStatus(root, NOW)).toMatchObject({ kind: "workspace", state: "synced" });
-  const stored = JSON.parse(await fs.readFile(daemonStatusPath(root), "utf8"));
-  expect(stored.daemonVersion).toBe("1.6.3");
+  const record = readAmbientDaemonStatusRecord(root);
+  expect(record).toMatchObject({ kind: "ok", status: { daemonVersion: "1.6.3", mode: "pull-only", bootId: "boot-mode" } });
 
-  await writeStatus({ daemonVersion: undefined });
+  await writeStatus({ daemonVersion: undefined, mode: undefined, bootId: undefined });
   expect(readPromptStatus(root, NOW)).toMatchObject({ kind: "workspace", state: "synced" });
 });
 
@@ -352,5 +352,12 @@ test("ambient reader rejects malformed daemonVersion records", async () => {
   await writeStatus({ daemonVersion: "1.6.3\nforged" });
   expect(readAmbientDaemonStatusRecord(root).kind).toBe("corrupt");
   await writeStatus({ daemonVersion: "" });
+  expect(readAmbientDaemonStatusRecord(root).kind).toBe("corrupt");
+});
+
+test("ambient reader rejects malformed mode and boot witnesses", async () => {
+  await writeStatus({ mode: "writer" as "read-write" });
+  expect(readAmbientDaemonStatusRecord(root).kind).toBe("corrupt");
+  await writeStatus({ mode: "read-write", bootId: "boot\nforged" });
   expect(readAmbientDaemonStatusRecord(root).kind).toBe("corrupt");
 });

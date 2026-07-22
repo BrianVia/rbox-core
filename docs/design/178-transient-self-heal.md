@@ -1,6 +1,11 @@
 # 178 — transient hiccups heal themselves
 
-Status: ALIGNED v4 — r3 verdict ALIGNED with three minor notes, folded:
+Status: ALIGNED v5 — second field-trace R9 verdict ALIGNED after two review
+passes. Pending mode is now an orthogonal durable user-intent register: stop
+preserves it, bare start never authors it, explicit flags replace it before
+daemon work, and matching boot-bound witnesses may promote it at start, stop,
+or status without promotion being required for survival. v4's r3 verdict was
+ALIGNED with three minor notes, folded:
 vocabulary inventory completed (API allowlist telemetry-ingest.ts:118 —
 deploy before/alongside the CLI addition — plus compile-enforced mappings
 breadcrumb-veto.ts:56, git-cmd.ts:592); the mode witness carries `bootId`
@@ -216,17 +221,92 @@ from that witness, never inferred from the spawn request. Legacy daemons
 without the field → mode UNKNOWN: bare start treats the persisted desired
 mode as the intent but never silently rewrites it; explicit-flag start
 against an unknown-mode live daemon refuses with the restart instruction.
-Desired state persists ONLY after the witness matches the request
-(daemon-control.ts:330 today returns `already-running` without any mode
-comparison and the caller records the requested mode anyway — a lie).
+The desired record separates daemon liveness from accepted mode. A successful
+spawn immediately publishes `state: "running"`; that fact never waits for an
+ambient-status heartbeat. The accepted mode keeps its compatibility encoding
+(`pullOnly: true` for pull-only, absence for the historical read-write
+default), and changes ONLY after the daemon-owned witness matches. Before any
+daemon admission work, an explicit request is durably parked as
+`pendingModeIntent: "pull-only" | "read-write"`, distinct from the accepted
+mode. The exact parked desired generation fences all later live/spawn callbacks,
+so a newer explicit request or stop cannot be overwritten by stale work.
+`startDaemon` exposes an awaited post-pidfile spawn hook so the desired writer
+can publish running state before witness polling begins; production waits
+exactly 15s and retains injectable timeout/poll seams through the desired-state
+wrapper. Hook failure is fatal: `startDaemon` best-effort terminates the child
+whose pidfile it just published and propagates the persistence error, rather
+than returning an ordinary retry with an unrecorded live daemon.
+
+A bare `rbox start` resolves its resume mode as
+`pendingModeIntent ?? acceptedMode ?? "read-write"`. It never authors or
+replaces `pendingModeIntent`: only an explicit `--pull-only` or `--read-write`
+request may do that. A bare spawn therefore publishes `state: "running"` while
+carrying the exact accepted and pending fields it read; it cannot manufacture a
+read-write pending merely because read-write is the compatibility default.
+Matching a live, boot-bound witness may opportunistically promote pending into
+accepted mode and clear `pendingModeIntent`; differing refuses and reports the
+restart-required actual/requested modes without rewriting accepted mode;
+still-unknown leaves the running+pending record intact and asks for another
+retry. Promotion is an optimization, never a prerequisite for intent survival.
+
+Boot resume and managed restart likewise choose pending ahead of accepted mode,
+so a reboot or upgrade cannot turn an unresolved pull-only request into a
+writer. Each resume carries the exact enumerated desired generation into the
+shared reconciler; if a user stop changes that generation before the resume
+claims it, the stale resumer skips (or terminates a child spawned in the
+eligibility race) rather than publishing running again. Promotion rechecks
+under the desired-record mutation lock that the same pending intent remains and
+that the current pidfile plus ambient witness name the exact admitted boot. All
+desired mutations use the same per-workspace cross-process lock plus
+same-directory fsync+rename publication, so the parked intent is neither a
+truncate-write corruption risk nor a lost update. Stop holds that mutation lock
+across witness observation, daemon stop, and stopped-record publication;
+ordering therefore makes stop win on liveness while preserving the latest user
+mode intent, and a spawn hook that loses the race to stop rejects the stale
+boot.
+
+Repeated flags complete the matrix: the same explicit mode as the parked
+intent reconciles as pending (UNKNOWN retains pending and asks to retry; MATCH
+promotes). A conflicting explicit mode replaces `pendingModeIntent` under the
+desired lock before daemon work: the operator changed their mind, so a
+hookless deferral, UNKNOWN, or MISMATCH retains the replacement intent while
+reporting/retrying, and only a live MATCH may accept it. A non-spawning
+deferral (for example, a prior rebound daemon still exiting) does not
+manufacture `running`; a bare call authors no pending value, while an explicit
+call leaves its already-parked user intent durable. `already-running` with a witnessed
+match also promotes. For every confirmed current-workspace live daemon,
+including DIFFERENT and UNKNOWN admission outcomes, the live-observation hook
+first records independent `state: "running"` while preserving accepted and
+pending mode fields; mismatch may then throw its restart instruction. An
+unknown legacy daemon with no pending request therefore keeps accepted mode but
+still records the independently observed desired state as running.
+If a bare start racing a newer explicit request has already spawned the older
+mode, it carries the newer pending value but may not promote the older witness
+over it; restart remains required to realize the newer intent.
+
+Desired accepted mode therefore persists ONLY after the witness matches the
+request (daemon-control.ts:330 previously returned `already-running` without
+any mode comparison and the caller recorded the requested mode anyway — a
+lie), while desired running state persists as soon as spawn succeeds.
 `already-running` with a DIFFERENT witnessed mode → refuse with "restart
 required: rbox stop && rbox start --<mode>" — the restart is
 OPERATOR-DRIVEN until workstream A's graceful stop ships; no automatic
 restart is promised anywhere in E.
 
-**Stop preserves mode (r2-4):** `stopDaemonAndRecordDesired`
-(autostart-cmd.ts:196) carries the prior valid persisted mode forward into
-the stopped record; absent/legacy mode is interpreted as read-write.
+**Stop preserves accepted mode and pending user intent (r2-4, corrected by the
+second slow-witness field trace):** `stopDaemonAndRecordDesired` carries both
+fields into the stopped record. Before stopping, while holding the desired
+mutation lock, it may promote a matching boot-bound witness; without such a
+match it preserves the pending value byte-for-byte. Consequently an explicit
+pull-only start whose witness is slow, followed directly by stop and a bare
+start, still launches pull-only even though no start re-run ever promoted the
+request. Status and start re-run use the same conditional promotion helper;
+none is required for survival.
+
+Parsing accepts `pendingModeIntent` only as the closed two-mode union on both
+running and stopped records. Park, live-observation, promotion, and stop each
+mint their operation timestamp when their locked mutation publishes; promotion
+is conditional rather than an unconditional rewrite of an earlier snapshot.
 
 Ship split (r1-5): the stopped-daemon resume half (bare start resumes the
 persisted mode) is independent and ships early with D. The LIVE-transition
@@ -267,6 +347,12 @@ probe/clear/idle-host cases, R4's nine reconciler cases + the
 pull-only/dormant-halt case, R5's convergence + comparison regressions),
 plus one end-to-end incident replay in the rig, made constructible per
 r1-8:
+
+- Mode durability regressions pin the second field trace exactly: explicit
+  pull-only -> slow/unseen witness -> stop -> bare start launches pull-only and
+  leaves either pending or accepted pull-only; an explicit opposite flag
+  replaces the pending intent; and stop promotes when it observes the matching
+  boot-bound witness before shutdown.
 
 - A one-shot TEST-ONLY rendezvous hook in the state-CAS bracket (env-gated,
   like capture's testHooks) that signals lock acquisition and blocks until

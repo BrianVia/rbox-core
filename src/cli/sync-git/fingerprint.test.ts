@@ -35,6 +35,31 @@ test("packed-refs.lock participates in fingerprint invalidation", async () => {
   expect(during.hash).not.toBe(before.hash);
 });
 
+test("internal refs, reflogs, and ref-directory mtimes are excluded while syncable refs invalidate", async () => {
+  const root = await tempRoot();
+  await exec("git", ["-C", root, "init", "-q"]);
+  await exec("git", ["-C", root, "config", "user.email", "test@example.com"]);
+  await exec("git", ["-C", root, "config", "user.name", "Test"]);
+  await fs.writeFile(path.join(root, "tracked"), "one\n");
+  await exec("git", ["-C", root, "add", "tracked"]);
+  await exec("git", ["-C", root, "commit", "-qm", "one"]);
+  const head = (await exec("git", ["-C", root, "rev-parse", "HEAD"])).stdout.trim();
+  const before = await gitFingerprint(gitFingerprintRun("per-decision"), root, ".");
+
+  await exec("git", ["-C", root, "update-ref", "--create-reflog", "refs/rbox-wip/test", head]);
+  const internal = await gitFingerprint(gitFingerprintRun("per-decision"), root, ".");
+  expect(internal.hash).toBe(before.hash);
+
+  const packed = path.join(root, ".git", "packed-refs");
+  await fs.appendFile(packed, `${head} refs/rbox-wip/packed\n`);
+  const internalPacked = await gitFingerprint(gitFingerprintRun("per-decision"), root, ".");
+  expect(internalPacked.hash).toBe(before.hash);
+
+  await exec("git", ["-C", root, "branch", "visible"]);
+  const visible = await gitFingerprint(gitFingerprintRun("per-decision"), root, ".");
+  expect(visible.hash).not.toBe(before.hash);
+});
+
 test("schema-4 trusted preflight cache is invalidated before config-authoritative reftable refusal", async () => {
   const root = await tempRoot();
   const repo = path.join(root, "repo");

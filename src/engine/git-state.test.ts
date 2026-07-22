@@ -704,6 +704,29 @@ test("gitIdentity is stable across captures when nothing changed (no echo)", asy
   expect(gitIdentityKey(id3 as never)).not.toBe(gitIdentityKey(id1 as never));
 });
 
+test("capture stash construction never refreshes the live staged index", async () => {
+  await initRepo(A);
+  await commitFile(A, "tracked.txt", "base\n", "base");
+  await fs.writeFile(path.join(A, "staged.txt"), "staged\n");
+  await git(A, "add", "staged.txt");
+  await fs.writeFile(path.join(A, "tracked.txt"), "dirty\n");
+  const before = await indexSnapshot(A);
+
+  await captureGitState(A, store, KEK, { workspaceRoot: A });
+
+  expectSameIndexSnapshot(await indexSnapshot(A), before);
+});
+
+test("capture with an absent index never creates the live index", async () => {
+  await initRepo(A);
+  await commitFile(A, "tracked.txt", "base\n", "base");
+  await fs.rm(path.join(A, ".git", "index"));
+
+  await captureGitState(A, store, KEK, { workspaceRoot: A });
+
+  await expect(fs.lstat(path.join(A, ".git", "index"))).rejects.toThrow();
+});
+
 test("gitIdentity write-tree probe leaves the resolved index untouched for dir repos and worktree pointers", async () => {
   const dirRepo = path.join(tmp, "dir-index");
   await fs.mkdir(dirRepo, { recursive: true });

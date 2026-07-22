@@ -46,9 +46,11 @@ import { shortWorkspaceId } from "./workspace-picker.js";
 import { readFreshPopulateStatus } from "./populate-status.js";
 import { readLockingHealth, type LockingHealth } from "./sync-mutex.js";
 import { readAmbientDaemonStatusRecord, validDaemonVersion } from "./daemon/ambient-status.js";
+import type { DaemonMode } from "./daemon/ambient-status.js";
 import { serializeGitDeferralLanes } from "./sync-git/git-deferral-json.js";
 import { inspectResetJournalSafety } from "./reset-halt-inspection.js";
 import { readResetHaltHealth } from "./reset-health.js";
+import { promotePendingModeIntent } from "./autostart-cmd.js";
 
 interface StatusAccountJson {
   plan: string | null;
@@ -108,6 +110,7 @@ export interface StatusCmdDeps {
   checkoutTransactionCapability?: typeof checkoutTransactionCapability;
   readAmbientDaemonStatusRecord?: typeof readAmbientDaemonStatusRecord;
   readBriefIdentity?: (accountId: string) => Promise<BriefIdentitySource | undefined>;
+  promotePendingModeIntent?: typeof promotePendingModeIntent;
 }
 
 const defaultStatusDeps: StatusCmdDeps = {
@@ -122,6 +125,7 @@ const defaultStatusDeps: StatusCmdDeps = {
   readLockingHealth,
   checkoutTransactionCapability,
   readAmbientDaemonStatusRecord,
+  promotePendingModeIntent,
 };
 
 const LOCAL_TRUST_MS = 60_000;
@@ -304,6 +308,11 @@ function assertPresentationFlags(opts: StatusCmdOptions): void {
   if (selected > 1) throw new Error("choose only one status presentation flag: --json, --verbose, or --git");
 }
 
+function runningDaemonLabel(version?: string, mode?: DaemonMode): string {
+  const details = [version === undefined ? undefined : `v${version}`, mode].filter((item): item is string => item !== undefined);
+  return details.length === 0 ? "running" : `running (${details.join(", ")})`;
+}
+
 export async function statusCmd(root: string, opts: StatusCmdOptions = {}): Promise<StatusCmdResult> {
   assertPresentationFlags(opts);
   const deps = opts.now === undefined
@@ -335,6 +344,20 @@ export async function statusCmdWithDeps(
   const alive = daemonBinding.alive;
   const daemonStale = daemonBinding.stale;
   const bg = { running: alive.running && !daemonStale, pid: alive.pid };
+  let daemonVersion: string | undefined;
+  let daemonMode: DaemonMode | undefined;
+  if (bg.running) {
+    const record = (deps.readAmbientDaemonStatusRecord ?? readAmbientDaemonStatusRecord)(root);
+    if (record.kind === "ok") {
+      if (validDaemonVersion(record.status.daemonVersion)) daemonVersion = record.status.daemonVersion;
+      if (alive.bootId !== undefined && record.status.bootId === alive.bootId) daemonMode = record.status.mode;
+    }
+    // Desired-mode promotion is best-effort bookkeeping. The boot-bound
+    // witness remains authoritative and status must still render if the
+    // desired-state side file is temporarily unavailable.
+    await deps.promotePendingModeIntent?.(root).catch(() => false);
+  }
+  const daemonVersionSkew = daemonVersion !== undefined && daemonVersion !== RBOX_VERSION;
 
   // Design 138 F2b: this branch precedes every loadState/state-dependent
   // section. The classifier and health reader are both read-only; a direct
@@ -379,7 +402,7 @@ export async function statusCmdWithDeps(
     console.log(`  ${style.yellow(`sync halted: a state-recovery record can't be processed (${reason}). Files on disk are untouched; run \`rbox doctor reset-journal\`.`)}`);
     console.log(`  ${style.dim("background sync:")} ${daemonStale
       ? style.yellow(`running but bound to a previous workspace (pid ${alive.pid})`)
-      : bg.running ? style.green(`running (pid ${bg.pid})`) : style.yellow("stopped")}`);
+      : bg.running ? style.green(`${runningDaemonLabel(daemonVersion, daemonMode)} (pid ${bg.pid})`) : style.yellow("stopped")}`);
     return { daemonRunning: bg.running };
   }
 
@@ -555,15 +578,6 @@ export async function statusCmdWithDeps(
   const gitCapability: CheckoutTransactionCapability | undefined = projectedGitRepos.some((repo) => repo.displayReason === "unsupported")
     ? await (deps.checkoutTransactionCapability ?? checkoutTransactionCapability)(root)
     : undefined;
-  let daemonVersion: string | undefined;
-  if (bg.running) {
-    const record = (deps.readAmbientDaemonStatusRecord ?? readAmbientDaemonStatusRecord)(root);
-    if (record.kind === "ok" && validDaemonVersion(record.status.daemonVersion)) {
-      daemonVersion = record.status.daemonVersion;
-    }
-  }
-  const daemonVersionSkew = daemonVersion !== undefined && daemonVersion !== RBOX_VERSION;
-
   if (opts.json) {
     const statusJson = {
       workspace: { id: cfg.remoteWorkspaceId, name: cfg.name ?? null, root },
@@ -582,6 +596,7 @@ export async function statusCmdWithDeps(
         running: bg.running,
         pid: bg.pid ?? null,
         version: daemonVersion ?? null,
+        mode: daemonMode ?? null,
         cliVersion: RBOX_VERSION,
         versionSkew: daemonVersionSkew,
       },
@@ -758,7 +773,7 @@ export async function statusCmdWithDeps(
         : daemonStale
         ? style.yellow(`running but bound to a previous workspace (pid ${alive.pid}) — run \`rbox start\` to rebind`)
         : bg.running
-          ? style.green(`${daemonVersion === undefined ? "running" : `running (v${daemonVersion})`} (pid ${bg.pid})`)
+          ? style.green(`${runningDaemonLabel(daemonVersion, daemonMode)} (pid ${bg.pid})`)
           : style.yellow("stopped")
     }`
   );

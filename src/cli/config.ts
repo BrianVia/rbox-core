@@ -16,6 +16,7 @@ import { acquireLock, type AcquireLockOptions, type OwnedLock } from "../engine/
 import { assertProtocolLockHeld } from "../engine/git/protocol-locks.js";
 import { gitRaw } from "../engine/git/shared.js";
 import type { ConfigStatToken } from "../engine/git/config-txn.js";
+import { sanitizeGitSectionForPersistence } from "../engine/git/config-sync.js";
 import type { PRepairReceipt } from "../engine/git/p-repair.js";
 import { acquireWorkspaceSyncMutex, assertSyncMutex, releaseWorkspaceSyncMutex, workspaceSyncMutexDegraded, type WorkspaceSyncMutex } from "./sync-mutex.js";
 import {
@@ -575,11 +576,13 @@ function mapFromRecords<T>(records: Record<string, RepoRecord>, pick: (record: R
 
 export function stateFromRepoRecords(state: SyncState, records: Record<string, RepoRecord>): SyncState {
   const normalized: Record<string, RepoRecord> = Object.fromEntries(Object.entries(records).map(([relPath, record]) => {
+    const sanitizedBase = record.base === undefined ? undefined : sanitizeGitSectionForPersistence(record.base);
+    const sanitizedPending = record.pending === undefined ? undefined : sanitizeGitSectionForPersistence(record.pending);
     const lineageHash = recordOriginLineage(record.branchBaseOrigins) ?? "legacy-untrusted";
     const proof = carryRepoBaseProof(lineageHash);
     const composed = composeRepoBase(
-      { base: record.base, branchBaseOrigins: record.branchBaseOrigins },
-      { base: record.base, branchBaseOrigins: record.branchBaseOrigins },
+      { base: sanitizedBase, branchBaseOrigins: record.branchBaseOrigins },
+      { base: sanitizedBase, branchBaseOrigins: record.branchBaseOrigins },
       proof.authority,
       proof.lockedProof,
     );
@@ -587,6 +590,7 @@ export function stateFromRepoRecords(state: SyncState, records: Record<string, R
     if (composed.base === undefined) delete next.base; else next.base = composed.base;
     if (composed.branchBaseOrigins === undefined) delete next.branchBaseOrigins;
     else next.branchBaseOrigins = composed.branchBaseOrigins;
+    if (sanitizedPending === undefined) delete next.pending; else next.pending = sanitizedPending;
     return [relPath, next];
   }));
   // Removal/suppression hides the repository from the last-synced projection
@@ -663,18 +667,27 @@ export async function applyStateSavePacket(root: string, packet: StateSavePacket
     for (const transition of packet.repos) {
       const previous = records[transition.relPath] ?? { repoGen: 0, sourceSeq: 0 };
       const proof = transition.baseProof ?? migrationRepoBaseProof();
+      const sanitizedPreviousBase = previous.base === undefined ? undefined : sanitizeGitSectionForPersistence(previous.base);
+      const sanitizedCandidateBase = transition.newRecord.base === undefined
+        ? undefined
+        : sanitizeGitSectionForPersistence(transition.newRecord.base);
       const composed = composeRepoBase(
-        { base: previous.base, branchBaseOrigins: previous.branchBaseOrigins },
-        { base: transition.newRecord.base, branchBaseOrigins: transition.newRecord.branchBaseOrigins },
+        { base: sanitizedPreviousBase, branchBaseOrigins: previous.branchBaseOrigins },
+        { base: sanitizedCandidateBase, branchBaseOrigins: transition.newRecord.branchBaseOrigins },
         proof.authority,
         proof.lockedProof,
       );
-      const newRecord = { ...transition.newRecord };
+      const newRecord = {
+        ...transition.newRecord,
+        ...(transition.newRecord.pending === undefined
+          ? {}
+          : { pending: sanitizeGitSectionForPersistence(transition.newRecord.pending) }),
+      };
       if (composed.base === undefined) delete newRecord.base; else newRecord.base = composed.base;
       if (composed.branchBaseOrigins === undefined) delete newRecord.branchBaseOrigins;
       else newRecord.branchBaseOrigins = composed.branchBaseOrigins;
-      if (composed.disposition === "pending" && transition.newRecord.base && newRecord.pending === undefined) {
-        newRecord.pending = transition.newRecord.base;
+      if (composed.disposition === "pending" && sanitizedCandidateBase && newRecord.pending === undefined) {
+        newRecord.pending = sanitizedCandidateBase;
       }
       records[transition.relPath] = { ...newRecord, repoGen: transition.expectedRepoGen + 1 };
     }
@@ -688,6 +701,20 @@ export async function applyStateSavePacket(root: string, packet: StateSavePacket
           manifestMeta: packet.global?.manifestMeta,
         }
       : current;
+    // A state save rewrites the complete record file, so sanitize every carried
+    // P/BASE too—not only records named by this packet. This makes sanitation a
+    // persistence invariant across collision, exception, recovery, and CAS-retry
+    // paths instead of an apply-path tendency.
+    for (const [relPath, record] of Object.entries(records)) {
+      const base = record.base === undefined ? undefined : sanitizeGitSectionForPersistence(record.base);
+      const pending = record.pending === undefined ? undefined : sanitizeGitSectionForPersistence(record.pending);
+      if (base === record.base && pending === record.pending) continue;
+      records[relPath] = {
+        ...record,
+        ...(base === undefined ? {} : { base }),
+        ...(pending === undefined ? {} : { pending }),
+      };
+    }
     const next = stateFromRepoRecords({
       ...base,
       stateNonce: current.stateNonce ?? crypto.randomBytes(16).toString("hex"),
@@ -885,7 +912,36 @@ function stateContainsGitPersistence(state: SyncState): boolean {
 
 async function writeWholeStateUnsafe(root: string, state: SyncState): Promise<void> {
   await fs.mkdir(path.join(root, RBOX_DIR), { recursive: true });
-  await writeFileAtomic(statePath(root), JSON.stringify(state, null, 2));
+  const sanitizeSectionMap = (sections: Record<string, GitSection> | undefined) => sections === undefined
+    ? undefined
+    : Object.fromEntries(Object.entries(sections)
+      .map(([relPath, section]) => [relPath, sanitizeGitSectionForPersistence(section)]));
+  const sanitized = state.repoRecords === undefined
+    ? {
+        ...state,
+        lastSyncedManifest: {
+          ...state.lastSyncedManifest,
+          ...(state.lastSyncedManifest.gitRepos === undefined ? {} : { gitRepos: sanitizeSectionMap(state.lastSyncedManifest.gitRepos) }),
+        },
+        ...(state.gitPendingRemote === undefined ? {} : { gitPendingRemote: sanitizeSectionMap(state.gitPendingRemote) }),
+      }
+    : (() => {
+        // Route authoritative records through the universal sanitizer/composer,
+        // while preserving this explicitly unsafe API's caller-supplied legacy
+        // projections (tests and degraded compatibility intentionally exercise
+        // mismatched snapshots).
+        const projected = stateFromRepoRecords(state, repoRecordsForState(state));
+        return {
+          ...state,
+          repoRecords: projected.repoRecords,
+          lastSyncedManifest: {
+            ...state.lastSyncedManifest,
+            ...(state.lastSyncedManifest.gitRepos === undefined ? {} : { gitRepos: sanitizeSectionMap(state.lastSyncedManifest.gitRepos) }),
+          },
+          ...(state.gitPendingRemote === undefined ? {} : { gitPendingRemote: sanitizeSectionMap(state.gitPendingRemote) }),
+        };
+      })();
+  await writeFileAtomic(statePath(root), JSON.stringify(sanitized, null, 2));
 }
 
 /** Fresh, non-Git initialization only. Git BASE and every repository sidecar are

@@ -1065,10 +1065,16 @@ test("design 68 V11: a skip-eligible pointer with an EXISTING captured base is C
   expect((await st(rootA)).gitReposRemoved?.["wt"]).toBeUndefined(); // M4: base-carry, never a removal-memory stamp
   expect(logsA.some((l) => l.includes("skipped") && l.includes("wt"))).toBe(true);
 
-  // steady state: the carry echoes nothing (the section bytes are stable across cycles)
+  // The legacy fixture has no publisher binding on its first ACK, so the new
+  // main section is conservatively pending. Once the ACK creates a capable
+  // lineage, the baseless composer proof converges it in exactly one commit.
   const head = remote.headSeq();
   await push(rootA, cfgA, depsA);
-  expect(remote.headSeq()).toBe(head);
+  expect(remote.headSeq()).toBe(head + 1);
+  expect(repoRecordsForState(await st(rootA)).main?.pending).toBeUndefined();
+  const converged = remote.headSeq();
+  await push(rootA, cfgA, depsA);
+  expect(remote.headSeq()).toBe(converged);
   await pull(rootB, cfgB, depsB);
   expect((await st(rootA)).gitReposRemoved?.["wt"]).toBeUndefined();
   expect((await st(rootB)).gitReposRemoved?.["wt"]).toBeUndefined();
@@ -1585,6 +1591,23 @@ test("design 174 B: real pending is superseded by an ahead main with exact off-b
   expect(acked.deferrals?.capture).toEqual(captureEpisode);
   expect(acked.base?.refs[priorRef]).toBeDefined();
   expect(acked.branchBaseOrigins?.[priorRef]).toBeDefined();
+  const acknowledgedCandidate = (await remote.latest()).manifest.gitRepos![rel]!;
+  expect(acked.base).toEqual(acknowledgedCandidate);
+  const pendingKey = gitIncomingKey(pending);
+  const candidateKey = gitIncomingKey(acknowledgedCandidate);
+  expect(logsB.some((line) => line.includes(
+    `git-sync superseded pending supersede-e2e [P=${pendingKey} candidate=${candidateKey} composed=${candidateKey}]`,
+  ))).toBe(true);
+
+  // D.4 convergence: the ACKed candidate is the exact composed BASE, a
+  // self-pull is unchanged, and the following push is a no-op.
+  const ackSeq = remote.headSeq();
+  await pull(rootB, cfgB, depsB);
+  const afterSelfPull = repoRecordsForState(await st(rootB))[rel]!;
+  expect(afterSelfPull.pending).toBeUndefined();
+  expect(afterSelfPull.base).toEqual(acknowledgedCandidate);
+  await push(rootB, cfgB, depsB);
+  expect(remote.headSeq()).toBe(ackSeq);
 
   const rootC = path.join(tmp, "C");
   await fs.mkdir(path.join(rootC, ".rbox", "state"), { recursive: true });
@@ -3028,6 +3051,10 @@ test("design 83: trusted warm plan is zero-spawn and uses cached parentRel for p
   const s0 = await st(rootA);
   await saveStateUnsafeLegacyOrTest(rootA, { ...s0, lastSyncedManifest: { ...s0.lastSyncedManifest, manifestSchema: 2, gitRepos: { wt: wtSection } } });
   await push(rootA, cfgA, depsA);
+  // D.3 makes the newly discovered main clone baseless PENDING after the
+  // legacy fixture's first ACK. Let the exact composer proof converge it before
+  // this test measures steady-state cache behavior.
+  await push(rootA, cfgA, depsA);
 
   await fs.rm(divergenceCachePath(rootA), { force: true });
   const state = await st(rootA);
@@ -3123,8 +3150,11 @@ test("design 83: pending, needs-resolution, and force baseless pointers never pr
   );
   expect(pending.value.gitPlanStats?.pointerPreSkips).toBe(0);
   expect(pending.value.skipped.map((s) => s.relPath)).not.toContain("wt");
-  expect(pending.value.gitRepos?.["wt"]).toEqual(wtSection);
-  expect(pending.targetSpawns).toBe(0);
+  // D.3: pending still bypasses the pointer pre-skip, but an exact ACK-composer
+  // dry run may admit a fresh candidate instead of forcing a byte carry.
+  expect(pending.value.captured).toContain("wt");
+  expect(pending.value.supersededPending).toContain("wt");
+  expect(pending.targetSpawns).toBeGreaterThan(0);
 
   await markDivergenceCacheTrusted(rootA);
   const needsResolution = await observeGitSpawnsForRoot(W, async () =>

@@ -1,6 +1,7 @@
 import type { GitSection, Manifest } from "../engine/index.js";
 import { isDeepStrictEqual } from "node:util";
 import type { ConfigStatToken } from "../engine/git/config-txn.js";
+import { sanitizeGitSectionForPersistence } from "../engine/git/config-sync.js";
 import {
   composeRepoBase,
   migrationRepoBaseProof,
@@ -127,6 +128,17 @@ export const inputRecord = (record: RepoRecord): RepoRecordInput => {
   return input;
 };
 
+function sanitizeRepoRecordInput(record: RepoRecordInput): RepoRecordInput {
+  const base = record.base === undefined ? undefined : sanitizeGitSectionForPersistence(record.base);
+  const pending = record.pending === undefined ? undefined : sanitizeGitSectionForPersistence(record.pending);
+  if (base === record.base && pending === record.pending) return record;
+  return {
+    ...record,
+    ...(base === undefined ? {} : { base }),
+    ...(pending === undefined ? {} : { pending }),
+  };
+}
+
 const isStrictlyNewer = (candidate: string, bound: string): boolean => {
   const candidateMs = Date.parse(candidate);
   const boundMs = Date.parse(bound);
@@ -200,7 +212,7 @@ function sourceRecord(source: StateSource, relPath: string, current: RepoRecord)
     const retained = inputRecord(current);
     if (mergedDeferrals === undefined) delete retained.deferrals;
     else retained.deferrals = mergedDeferrals;
-    return retained;
+    return sanitizeRepoRecordInput(retained);
   }
   const lane = source.values.configLane?.[relPath] ?? current;
   const hasAdvertisedValue = Object.prototype.hasOwnProperty.call(source.values.advertised ?? {}, relPath);
@@ -246,7 +258,7 @@ function sourceRecord(source: StateSource, relPath: string, current: RepoRecord)
   if (composed.disposition === "pending" && source.values.bases?.[relPath] && next.pending === undefined) {
     next.pending = source.values.bases[relPath];
   }
-  return next;
+  return sanitizeRepoRecordInput(next);
 }
 
 export function composeStateSavePacket(snapshot: SyncState, source: StateSource): StateSavePacket {
@@ -278,6 +290,9 @@ function legacyState(snapshot: SyncState, source: StateSource): SyncState {
   const packet = composeStateSavePacket(snapshot, source);
   const records = repoRecordsForState(snapshot);
   for (const transition of packet.repos) records[transition.relPath] = { ...transition.newRecord, repoGen: transition.expectedRepoGen + 1 };
+  for (const [relPath, record] of Object.entries(records)) {
+    records[relPath] = { ...sanitizeRepoRecordInput(record), repoGen: record.repoGen };
+  }
   const manifest = packet.global?.manifest ?? snapshot.lastSyncedManifest;
   const legacyMap = <T>(pick: (record: RepoRecord) => T | undefined): Record<string, T> | undefined => {
     const result: Record<string, T> = {};
@@ -500,7 +515,10 @@ export async function savePublishedRepoIntent(
 
     if (options.forceLegacy) {
       const records = repoRecordsForState(currentSnapshot);
-      records[relPath] = { ...merged, repoGen: current.repoGen + 1 };
+      records[relPath] = { ...sanitizeRepoRecordInput(merged), repoGen: current.repoGen + 1 };
+      for (const [carriedRelPath, record] of Object.entries(records)) {
+        records[carriedRelPath] = { ...sanitizeRepoRecordInput(record), repoGen: record.repoGen };
+      }
       const next = stateFromRepoRecords(currentSnapshot, records);
       await saveStateUnsafeLegacyOrTest(root, next);
       return { state: next, disposition: superseded ? "superseded" : "landed" };

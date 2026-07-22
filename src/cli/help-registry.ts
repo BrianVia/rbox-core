@@ -131,8 +131,11 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "start",
     group: "SYNCING",
     summary: "start background sync for this workspace",
-    usage: "rbox start [path] [--pull-only]",
-    flags: [{ flag: "--pull-only", desc: "watch remote changes without pushing local changes" }],
+    usage: "rbox start [path] [--pull-only | --read-write]",
+    flags: [
+      { flag: "--pull-only", desc: "watch remote changes without pushing local changes" },
+      { flag: "--read-write", desc: "pull and push changes" },
+    ],
     notes: ["Run outside a workspace with no path, on a terminal, and rbox opens the guided setup to create or join one."],
   },
   {

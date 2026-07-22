@@ -1,9 +1,11 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { GitCaptureDeferredError, artifactBinding, checkoutJournalDir, discoverGitRepos, gitIdentity, gitIdentityKey, gitPreflight, inTreeWorktreeParentRel, isGitBusy, isPresentButUnreadableError, gitSectionBlobRefs, oracleFromState, readRepoIdentityV1, readStateLineageV1, repoCtxFromDisk, poolMap, type DiscoveredGitRepo, type GitRepoKind, type GitSection, type IgnoreMatcher, type RepoCtx } from "../../engine/index.js";
 import { pinDisplaced } from "../../engine/git/keep-pins.js";
 import { git } from "../../engine/git/shared.js";
 import { type GitConfigRunner } from "../../engine/git/config-txn.js";
+import { sanitizeGitSectionForPersistence } from "../../engine/git/config-sync.js";
 import { expectedStateNonce, repoRecordsForState, type GitDeferralReason, type SyncState, type WorkspaceConfig } from "../config.js";
 import type { SyncRemote } from "../remote.js";
 import type { TransferProgress } from "../transfer-progress.js";
@@ -13,7 +15,7 @@ import { gitFingerprint, gitFingerprintRun } from "./fingerprint.js";
 import { loadGitDivergenceCache, saveGitDivergenceCache, fingerprintHitProbe, buildPlanProbe, writeDivergenceCacheEntry, isGitRepoKind, type FingerprintHitProbeResult, type DivergenceCacheProbeSnapshot, type DivergenceCacheWriteResult } from "./divergence-cache.js";
 import { checkoutJournalBinding, quarantineUnboundFollowJournal, recoverAndLandFollowJournal } from "./follow.js";
 import { normalizeOutgoingGitSections, tombstoneFindingLine } from "./publisher-tombstones.js";
-import { gitPendingSupersedeEnabled, journalAllowsPendingSupersession, pendingSupersessionPreProbe, provePendingSupersession } from "./pending-supersession.js";
+import { gitPendingSupersedeEnabled, journalAllowsPendingSupersession, pendingSupersessionAckConverges, pendingSupersessionPreProbe, provePendingSupersession } from "./pending-supersession.js";
 import { CONFLICT_REF_PRUNE_LIMIT, pruneConflictRefs } from "./conflict-retention.js";
 import { discardedIncomingOids, finalResolutionReport, reportAuthorized, resolutionReportHash, type GitResolutionRider } from "./resolution-intent.js";
 /** The outcome of push-side git orchestration: the outbound `gitRepos` map, whether it
@@ -48,6 +50,8 @@ export interface GitPushPlan {
   carried: string[];
   /** Candidate-bound receipts consumed only by the accepted publisher ACK. */
   supersededPending: string[];
+  /** Privacy-safe section identity keys proven by the ACK-composer dry run. */
+  supersessionIdentityKeys?: Record<string, { pending: string; candidate: string; composed: string }>;
   /** Synchronous keep-mine candidate whose final directional report was authorized. */
   resolvedPending?: string[];
   /** Explicit disposition for the foreground resolver. Never infer this from changed. */
@@ -132,7 +136,9 @@ export async function planGitSections(
   backoff?: (attempt: number) => Promise<void>,
   options: GitPlanOptions = {}
 ): Promise<GitPushPlan> {
-  const base = { ...(state.lastSyncedManifest.gitRepos ?? {}) };
+  const sanitizeSections = (sections: Record<string, GitSection> | undefined): Record<string, GitSection> =>
+    Object.fromEntries(Object.entries(sections ?? {}).map(([relPath, section]) => [relPath, sanitizeGitSectionForPersistence(section)]));
+  const base = sanitizeSections(state.lastSyncedManifest.gitRepos);
   const repoAbsent: Record<string, true> = Object.fromEntries(
     Object.entries(repoRecordsForState(state))
       .filter(([, record]) => record.repoAbsent === true)
@@ -140,7 +146,11 @@ export async function planGitSections(
   );
   const removedMem = { ...(state.gitReposRemoved ?? {}) };
   const needsRes = { ...(state.gitNeedsResolution ?? {}) };
-  const pending = { ...(state.gitPendingRemote ?? {}) };
+  // Immutable durable pre-plan checkpoint. Planner-local `pending` is allowed to
+  // change (including syncGit:false deletion), but it can never rewrite the
+  // expected-previous truth used by the final comparison.
+  const durablePending = sanitizeSections(state.gitPendingRemote);
+  const pending = { ...durablePending };
   const captured: string[] = [];
   let carried: string[] = [];
   const authoredCfgHashByRepo: Record<string, string> = {};
@@ -173,6 +183,7 @@ export async function planGitSections(
   };
   const pendingSupersessionCandidates = new Set<string>();
   const supersededPending = new Set<string>();
+  const supersessionIdentityKeys: NonNullable<GitPushPlan["supersessionIdentityKeys"]> = {};
   const resolutionCandidates = new Set<string>();
   const resolvedPending = new Set<string>();
   let resolutionDisposition: GitPushPlan["resolution"];
@@ -200,7 +211,10 @@ export async function planGitSections(
   };
   const normalizeCurrentOutgoing = () => {
     const records = repoRecordsForState(state);
-    const advertised = Object.fromEntries(Object.entries(records).map(([relPath, record]) => [relPath, record.advertised]));
+    const advertised = Object.fromEntries(Object.entries(records).map(([relPath, record]) => [
+      relPath,
+      record.advertised === undefined ? undefined : sanitizeGitSectionForPersistence(record.advertised),
+    ]));
     return normalizeOutgoingGitSections(out, pending, advertised, (options.now?.() ?? new Date()).toISOString());
   };
   const noteCredentialSkip = (rel: string) =>
@@ -227,13 +241,31 @@ export async function planGitSections(
     // pending repo the last commit carried the pending section itself (see the per-repo
     // base-advance in pushManifest), so the expected-previous map is base ∪ pending —
     // a steady pending carry is NOT a change (no echo-commit storm).
-    const prev: Record<string, GitSection> = { ...base, ...(state.gitPendingRemote ?? {}) };
+    const prev: Record<string, GitSection> = { ...base };
     for (const [relPath, record] of Object.entries(records)) {
-      if (record.advertised) prev[relPath] = record.advertised;
+      if (record.advertised) {
+        const expected = sanitizeGitSectionForPersistence(record.advertised);
+        // A cfgSynced baseline over config-absent BASE is the pull lane's durable
+        // witness that an invalid-present field was sanitized. Do not compare a
+        // safe carry against this publisher's older config-present ACK and author
+        // the very corrective echo the baseline suppresses. Genuine wire absence
+        // clears cfgSynced during pull, preserving old-writer presence healing.
+        if (base[relPath]?.config === undefined && record.cfgSynced !== undefined && expected.config !== undefined) {
+          const withoutConfig = { ...expected };
+          delete withoutConfig.config;
+          prev[relPath] = withoutConfig;
+        } else prev[relPath] = expected;
+      }
     }
-    let changed = supersededPending.size > 0 || resolvedPending.size > 0;
+    Object.assign(prev, durablePending); // PENDING has final precedence.
+    // Config authorship is selected against the current BASE/cfgSynced lane. It
+    // may intentionally restore bytes equal to this publisher's older advertised
+    // checkpoint after another writer stripped them, so authorship itself is a
+    // one-shot publication reason (the ACK stamps cfgSynced and bounds it).
+    let changed = supersededPending.size > 0 || resolvedPending.size > 0
+      || Object.keys(authoredCfgHashByRepo).length > 0;
     for (const k of new Set([...Object.keys(outgoing), ...Object.keys(prev)])) {
-      if (!outgoing[k] || !prev[k] || (outgoing[k] !== prev[k] && JSON.stringify(outgoing[k]) !== JSON.stringify(prev[k]))) {
+      if (!outgoing[k] || !prev[k] || (outgoing[k] !== prev[k] && !isDeepStrictEqual(outgoing[k], prev[k]))) {
         changed = true;
         break;
       }
@@ -257,6 +289,7 @@ export async function planGitSections(
       captured,
       carried,
       supersededPending: [...supersededPending].sort(),
+      ...(Object.keys(supersessionIdentityKeys).length > 0 ? { supersessionIdentityKeys } : {}),
       resolvedPending: [...resolvedPending].sort(),
       ...(resolutionDisposition ? { resolution: resolutionDisposition } : {}),
       protectedPending: Object.keys(pending).sort(),
@@ -740,10 +773,7 @@ export async function planGitSections(
         });
         continue;
       }
-      // A baseless P can be composer-owned first-publication state. There is no
-      // accepted predecessor for the ACK to advance, so recapturing it would only
-      // manufacture echo commits. Fail closed and preserve it by identity.
-      if (!baseSec || recoveryAllowsSupersession.get(rel) === false || !gitPendingSupersedeEnabled()) {
+      if (recoveryAllowsSupersession.get(rel) === false || !gitPendingSupersedeEnabled()) {
         out[rel] = pend;
         carried.push(rel);
         continue;
@@ -1000,10 +1030,26 @@ export async function planGitSections(
     const p = pending[rel];
     const candidate = finalizedOutgoing[rel];
     const ctx = await repoCtxFromDisk(repoDirOf(root, rel)).catch(() => undefined);
+    const binding = publisherAckBindings[rel];
     const proven = captured.includes(rel) && p !== undefined && candidate !== undefined && ctx !== undefined
-      && await provePendingSupersession({ ctx, pending: p, candidate, store: api.blobStore(), kek });
+      && binding !== undefined
+      && await provePendingSupersession({ ctx, pending: p, candidate, store: api.blobStore(), kek })
+      && pendingSupersessionAckConverges({
+        previousBase: base[rel],
+        previousOrigins: repoRecordsForState(state)[rel]?.branchBaseOrigins,
+        candidate,
+        binding,
+      });
     if (proven) {
       supersededPending.add(rel);
+      const candidateKey = gitIncomingKey(candidate!);
+      supersessionIdentityKeys[rel] = {
+        pending: gitIncomingKey(p!),
+        candidate: candidateKey,
+        // Admission proved order-insensitive deep equality with the exact
+        // composer output, so its section identity is necessarily identical.
+        composed: candidateKey,
+      };
       continue;
     }
     if (p) revertCapture(rel, p, "final candidate did not supersede pending section — carrying pending verbatim");
@@ -1014,6 +1060,7 @@ export async function planGitSections(
   // needs-resolution, policy, or failure carry never spends this authority.
   let conflictDeleteBudget = CONFLICT_REF_PRUNE_LIMIT;
   const cleanedCommonDirs = new Set<string>();
+  const postCleanupCacheRefresh = new Set(captured);
   for (const rel of [...new Set([...stableCarryHygiene, ...captured])]
     .filter((candidate) => !resolutionCandidates.has(candidate))
     .sort()) {
@@ -1029,13 +1076,45 @@ export async function planGitSections(
       onBatch: async () => {
         for (const cachedRel of [...cache.repos.keys()]) {
           const cachedCtx = await repoCtxFromDisk(repoDirOf(root, cachedRel)).catch(() => undefined);
-          if (cachedCtx && path.resolve(cachedCtx.commonDir) === commonDir) cache.repos.delete(cachedRel);
+          if (cachedCtx && path.resolve(cachedCtx.commonDir) === commonDir) {
+            postCleanupCacheRefresh.add(cachedRel);
+            cache.repos.delete(cachedRel);
+          }
         }
         cache.dirty = true;
         fingerprintRun.commonDirFingerprints.delete(commonDir);
       },
     }).catch(() => undefined);
     conflictDeleteBudget -= result?.deleted ?? 0;
+  }
+
+  // Refresh captured entries only after every capture-side cleanup, including
+  // conflict-ref pruning above. A per-repo fingerprint run avoids reusing the
+  // full-plan common-dir memo that predates capture scratch refs.
+  const refreshOrder = [...postCleanupCacheRefresh].sort();
+  for (const rel of refreshOrder) {
+    cache.repos.delete(rel);
+    cache.dirty = true;
+    try {
+      const postCaptureFingerprintRun = gitFingerprintRun("per-decision");
+      const beforeFingerprint = await gitFingerprint(postCaptureFingerprintRun, root, rel);
+      const pf = await gitPreflight(repoDirOf(root, rel));
+      const built = await buildPlanProbe(root, rel, beforeFingerprint.diskCtx, pf);
+      await writeDivergenceCacheEntry(
+        postCaptureFingerprintRun,
+        root,
+        rel,
+        cache,
+        built.probe,
+        pf.kind ?? kindByPath.get(rel),
+        beforeFingerprint,
+        undefined,
+        () => noteCredentialSkip(rel),
+        options.disableConfigLane,
+      );
+    } catch {
+      // Cache absence is the safe fallback; it is never correctness-bearing.
+    }
   }
 
   const liveKeys = new Set(keys);

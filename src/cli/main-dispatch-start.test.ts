@@ -57,3 +57,9 @@ test("start outside a workspace invokes the guided front door for TTY stdin", as
   await main({ frontDoorImport });
   expect(frontDoorCalls).toBe(1);
 });
+
+test("start rejects mutually exclusive explicit mode flags", async () => {
+  process.argv = [process.execPath, "rbox", "start", "--pull-only", "--read-write"];
+  await expect(main({ frontDoorImport })).rejects.toThrow("choose only one background sync mode: --pull-only or --read-write");
+  expect(frontDoorCalls).toBe(0);
+});
