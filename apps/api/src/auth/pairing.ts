@@ -6,7 +6,7 @@ import { dbFor, dirDb } from "../db.js";
 import { randomHex, TOKEN_BYTES } from "./shared.js";
 import { AccountGoneError, checkDeviceCap, DeviceLimitError, mintDeviceWithNotification } from "./mint.js";
 import { ipKey, rateLimited } from "../ratelimit.js";
-import { GENESIS_TOMBSTONE_SENTINEL, assertGenesisSingleDatabase, tombstoneFenceResponse } from "../genesis-repair.js";
+import { GENESIS_TOMBSTONE_SENTINEL, assertGenesisSingleDatabase, deletionLedgerBlocks, tombstoneFenceResponse } from "../genesis-repair.js";
 
 // A client-supplied opaque pairing tokenId (design 12, C6): url-safe, 16–64 chars.
 // A legacy server-generated 64-hex token also matches, so redeem accepts both.
@@ -87,15 +87,17 @@ export async function createPairToken(req: Request, env: Env, p: Principal): Pro
   // single INSERT…SELECT…WHERE. D1 serializes writes, so concurrent creates can't
   // both pass a stale count (closes the check-then-insert race). changes===0 → over cap.
   const e2eeBearing = mkWrap !== null || admissionGrant !== null;
-  if (e2eeBearing) assertGenesisSingleDatabase(env, p.accountId);
+  assertGenesisSingleDatabase(env, p.accountId);
   const res = await dirDb(env).prepare(
     `INSERT INTO pairing_tokens (token_hash,account_id,user_id,created_by,label,created_at,expires_at,mk_wrap,admission_grant)
      SELECT ?,?,?,?,'pair',?,?,?,? WHERE
        (SELECT COUNT(*) FROM pairing_tokens WHERE account_id=? AND consumed_at IS NULL AND expires_at>?)<?
-       AND (?=0 OR (EXISTS (SELECT 1 FROM account_keys WHERE account_id=? AND recovery_wrap<>? AND recovery_wrap_id<>? AND repair_id IS NULL AND repaired_at IS NULL)
-         AND NOT EXISTS (SELECT 1 FROM account_deletions WHERE account_id=? AND status IN ('purging','done'))))`
-  ).bind(hash,p.accountId,p.userId,p.deviceId,now,expiresAt,mkWrap,admissionGrant,p.accountId,now,PAIR_ACTIVE_CAP,e2eeBearing?1:0,p.accountId,GENESIS_TOMBSTONE_SENTINEL,GENESIS_TOMBSTONE_SENTINEL,p.accountId).run();
+       AND NOT EXISTS (SELECT 1 FROM account_deletions WHERE account_id=? AND status IN ('purging','done'))
+       AND (?=0 OR EXISTS (SELECT 1 FROM account_keys WHERE account_id=? AND recovery_wrap<>? AND recovery_wrap_id<>? AND repair_id IS NULL AND repaired_at IS NULL))`
+  ).bind(hash,p.accountId,p.userId,p.deviceId,now,expiresAt,mkWrap,admissionGrant,p.accountId,now,PAIR_ACTIVE_CAP,p.accountId,e2eeBearing?1:0,p.accountId,GENESIS_TOMBSTONE_SENTINEL,GENESIS_TOMBSTONE_SENTINEL).run();
   if ((res.meta.changes ?? 0) === 0) {
+    const erased = await deletionLedgerBlocks(env,p.accountId);
+    if (erased) return json({ error: "account_erased" }, 410);
     if (e2eeBearing) {
       const fence = await tombstoneFenceResponse(env,p.accountId);
       if (fence) return fence;

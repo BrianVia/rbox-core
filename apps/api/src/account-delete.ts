@@ -358,7 +358,7 @@ async function finishD1(env: Env, accountId: string, clerkIds: string[], deviceI
     data.prepare("DELETE FROM device_notifications WHERE account_id = ?").bind(a),
     data.prepare("DELETE FROM account_notify_prefs WHERE account_id = ?").bind(a),
     data.prepare("DELETE FROM device_keys WHERE account_id = ?").bind(a),
-    data.prepare("DELETE FROM account_keys WHERE account_id = ? AND NOT EXISTS (SELECT 1 FROM genesis_repair_audit WHERE account_id = ? AND outcome = 'attempted')").bind(a,a),
+    data.prepare("DELETE FROM account_keys WHERE account_id = ? AND NOT EXISTS (SELECT 1 FROM genesis_repair_audit WHERE account_id = ?)").bind(a,a),
     data.prepare("DELETE FROM workspace_keys WHERE account_id = ?").bind(a),
     data.prepare("DELETE FROM rosters WHERE account_id = ?").bind(a),
     data.prepare("DELETE FROM account_key_states WHERE account_id = ?").bind(a),

@@ -4,11 +4,13 @@ import type { Principal } from "./authz.js";
 import { dbFor } from "./db.js";
 import {
   GENESIS_CAPABILITY_VALUE,
+  GENESIS_OBSERVATION_SQL,
   GENESIS_TOMBSTONE_SENTINEL,
   REPAIR_ID_RE,
   deletionLedgerBlocks,
   isExactTombstone,
   isTombstoneFamily,
+  genesisObservationFromRow,
   presenceOf,
   readGenesisObservation,
   reconcileGenesisRepairAudits,
@@ -122,6 +124,7 @@ export async function bootstrapAccountKeys(env: Env, p: Principal, body: unknown
   if (deviceId !== p.deviceId) return json({ error: "forbidden", message: "device mismatch" }, 403);
 
   await reconcileGenesisRepairAudits(env, p.accountId);
+  if (await deletionLedgerBlocks(env, p.accountId)) return json({ error: "account_erased" }, 410);
   const before = await readGenesisObservation(env, p.accountId);
   if (isTombstoneFamily(before)) {
     if (!repairId || !isExactTombstone(before) || before.repairId !== repairId) return json({ error: "repair_in_progress" }, 423);
@@ -168,35 +171,37 @@ export async function bootstrapAccountKeys(env: Env, p: Principal, body: unknown
     ]);
   } else {
     const tomb = `EXISTS (SELECT 1 FROM account_keys WHERE account_id=?1 AND recovery_wrap=?11 AND recovery_wrap_id=?11
-      AND genesis_device_id IS NULL AND repair_id=?12 AND repaired_at IS NOT NULL)`;
+      AND typeof(created_at)='integer' AND created_at>0 AND genesis_device_id IS NULL AND repair_id=?12
+      AND typeof(repaired_at)='integer' AND repaired_at>0) AND ?13=1`;
+    const capable = genesisCapability === GENESIS_CAPABILITY_VALUE ? 1 : 0;
     const noWs = `NOT EXISTS (SELECT 1 FROM workspace_keys WHERE account_id=?1) AND NOT EXISTS (SELECT 1 FROM workspaces WHERE account_id=?1)
       AND NOT EXISTS (SELECT 1 FROM pairing_tokens WHERE account_id=?1 AND (mk_wrap IS NOT NULL OR admission_grant IS NOT NULL))`;
     results = await db.batch([
       db.prepare(`INSERT INTO rosters (account_id,version,signed,created_at) SELECT ?1,0,?6,?4 WHERE ${tomb}
         AND NOT EXISTS (SELECT 1 FROM rosters WHERE account_id=?1) AND NOT EXISTS (SELECT 1 FROM account_key_states WHERE account_id=?1)
         AND NOT EXISTS (SELECT 1 FROM device_keys WHERE account_id=?1) AND ${noWs} AND ${noAudit} AND ${noErase}`)
-        .bind(p.accountId,recoveryWrap,recoveryWrapId,now,deviceId,genesisRoster,genesisKeyState,sigPubKey,encPubKey,mkWrap,GENESIS_TOMBSTONE_SENTINEL,repairId),
+        .bind(p.accountId,recoveryWrap,recoveryWrapId,now,deviceId,genesisRoster,genesisKeyState,sigPubKey,encPubKey,mkWrap,GENESIS_TOMBSTONE_SENTINEL,repairId,capable),
       db.prepare(`INSERT INTO account_key_states (account_id,account_epoch,signed,created_at) SELECT ?1,0,?7,?4 WHERE ${tomb}
         AND EXISTS (SELECT 1 FROM rosters WHERE account_id=?1 AND version=0 AND signed=?6 AND created_at=?4)
         AND NOT EXISTS (SELECT 1 FROM rosters WHERE account_id=?1 AND NOT(version=0 AND signed=?6 AND created_at=?4))
         AND NOT EXISTS (SELECT 1 FROM account_key_states WHERE account_id=?1) AND NOT EXISTS (SELECT 1 FROM device_keys WHERE account_id=?1)
         AND ${noWs} AND ${noAudit} AND ${noErase}`)
-        .bind(p.accountId,recoveryWrap,recoveryWrapId,now,deviceId,genesisRoster,genesisKeyState,sigPubKey,encPubKey,mkWrap,GENESIS_TOMBSTONE_SENTINEL,repairId),
+        .bind(p.accountId,recoveryWrap,recoveryWrapId,now,deviceId,genesisRoster,genesisKeyState,sigPubKey,encPubKey,mkWrap,GENESIS_TOMBSTONE_SENTINEL,repairId,capable),
       db.prepare(`INSERT INTO device_keys (device_id,account_id,sig_pubkey,enc_pubkey,mk_wrap,created_at) SELECT ?5,?1,?8,?9,?10,?4 WHERE ${tomb}
         AND EXISTS (SELECT 1 FROM rosters WHERE account_id=?1 AND version=0 AND signed=?6 AND created_at=?4)
         AND EXISTS (SELECT 1 FROM account_key_states WHERE account_id=?1 AND account_epoch=0 AND signed=?7 AND created_at=?4)
         AND NOT EXISTS (SELECT 1 FROM rosters WHERE account_id=?1 AND NOT(version=0 AND signed=?6 AND created_at=?4))
         AND NOT EXISTS (SELECT 1 FROM account_key_states WHERE account_id=?1 AND NOT(account_epoch=0 AND signed=?7 AND created_at=?4))
         AND NOT EXISTS (SELECT 1 FROM device_keys WHERE account_id=?1) AND ${noWs} AND ${noAudit} AND ${noErase}`)
-        .bind(p.accountId,recoveryWrap,recoveryWrapId,now,deviceId,genesisRoster,genesisKeyState,sigPubKey,encPubKey,mkWrap,GENESIS_TOMBSTONE_SENTINEL,repairId),
+        .bind(p.accountId,recoveryWrap,recoveryWrapId,now,deviceId,genesisRoster,genesisKeyState,sigPubKey,encPubKey,mkWrap,GENESIS_TOMBSTONE_SENTINEL,repairId,capable),
       db.prepare(`UPDATE account_keys SET recovery_wrap=?2,recovery_wrap_id=?3,genesis_device_id=?5,repair_id=NULL,repaired_at=NULL WHERE account_id=?1
-        AND recovery_wrap=?11 AND recovery_wrap_id=?11 AND genesis_device_id IS NULL AND repair_id=?12 AND repaired_at IS NOT NULL
+        AND ${tomb}
         AND EXISTS (SELECT 1 FROM rosters WHERE account_id=?1 AND version=0 AND signed=?6 AND created_at=?4)
         AND EXISTS (SELECT 1 FROM account_key_states WHERE account_id=?1 AND account_epoch=0 AND signed=?7 AND created_at=?4)
         AND EXISTS (SELECT 1 FROM device_keys WHERE account_id=?1 AND device_id=?5 AND sig_pubkey=?8 AND enc_pubkey=?9 AND mk_wrap=?10 AND created_at=?4)
         AND (SELECT COUNT(*) FROM rosters WHERE account_id=?1)=1 AND (SELECT COUNT(*) FROM account_key_states WHERE account_id=?1)=1
         AND (SELECT COUNT(*) FROM device_keys WHERE account_id=?1)=1 AND ${noWs} AND ${noAudit} AND ${noErase}`)
-        .bind(p.accountId,recoveryWrap,recoveryWrapId,now,deviceId,genesisRoster,genesisKeyState,sigPubKey,encPubKey,mkWrap,GENESIS_TOMBSTONE_SENTINEL,repairId),
+        .bind(p.accountId,recoveryWrap,recoveryWrapId,now,deviceId,genesisRoster,genesisKeyState,sigPubKey,encPubKey,mkWrap,GENESIS_TOMBSTONE_SENTINEL,repairId,capable),
     ]);
   }
   const vector = results.map((r) => r.meta.changes ?? 0).join("/");
@@ -234,16 +239,17 @@ export async function bootstrapAccountKeys(env: Env, p: Principal, body: unknown
  */
 export async function getAccountKeys(env: Env, p: Principal): Promise<Response> {
   await reconcileGenesisRepairAudits(env, p.accountId);
-  const observed = await readGenesisObservation(env, p.accountId);
+  const db=dbFor(env,p.accountId);
+  const batch=await db.batch([
+    db.prepare(GENESIS_OBSERVATION_SQL).bind(p.accountId),
+    db.prepare("SELECT signed FROM rosters WHERE account_id = ? ORDER BY version").bind(p.accountId),
+    db.prepare("SELECT signed FROM account_key_states WHERE account_id = ? ORDER BY account_epoch").bind(p.accountId),
+    db.prepare("SELECT device_id, sig_pubkey, enc_pubkey, mk_wrap FROM device_keys WHERE account_id = ? ORDER BY created_at").bind(p.accountId),
+  ]);
+  const observed = genesisObservationFromRow((batch[0]?.results?.[0] ?? undefined) as Record<string,unknown>|undefined);
   const present = presenceOf(observed);
   if (observed.claimPresent === 0) return json({ error: "not_found", genesisPresenceVersion: 1, present }, 404);
-
-  const rosters = await dbFor(env, p.accountId).prepare("SELECT signed FROM rosters WHERE account_id = ? ORDER BY version").bind(p.accountId).all<{ signed: string }>();
-  const keyStates = await dbFor(env, p.accountId).prepare("SELECT signed FROM account_key_states WHERE account_id = ? ORDER BY account_epoch").bind(p.accountId).all<{ signed: string }>();
-  const devices = await dbFor(env, p.accountId)
-    .prepare("SELECT device_id, sig_pubkey, enc_pubkey, mk_wrap FROM device_keys WHERE account_id = ? ORDER BY created_at")
-    .bind(p.accountId)
-    .all<{ device_id: string; sig_pubkey: string | null; enc_pubkey: string | null; mk_wrap: string | null }>();
+  const rosters=(batch[1]?.results??[]) as Array<{signed:string}>,keyStates=(batch[2]?.results??[]) as Array<{signed:string}>,devices=(batch[3]?.results??[]) as Array<{device_id:string;sig_pubkey:string|null;enc_pubkey:string|null;mk_wrap:string|null}>;
 
   return json({
     genesisPresenceVersion: 1,
@@ -251,9 +257,9 @@ export async function getAccountKeys(env: Env, p: Principal): Promise<Response> 
     recoveryWrapId: observed.recoveryWrapId,
     claimCreatedAt: observed.claimCreatedAt,
     genesisDeviceId: observed.genesisDeviceId,
-    rosters: (rosters.results ?? []).map((r) => r.signed),
-    keyStates: (keyStates.results ?? []).map((r) => r.signed),
-    devices: (devices.results ?? []).map((d) => ({ deviceId: d.device_id, sigPubkey: d.sig_pubkey, encPubkey: d.enc_pubkey, mkWrap: d.mk_wrap })),
+    rosters: rosters.map((r) => r.signed),
+    keyStates: keyStates.map((r) => r.signed),
+    devices: devices.map((d) => ({ deviceId: d.device_id, sigPubkey: d.sig_pubkey, encPubkey: d.enc_pubkey, mkWrap: d.mk_wrap })),
     present,
     repairTombstone: isExactTombstone(observed) ? { version: 1, repairId: observed.repairId, repairedAt: observed.repairedAt } : null,
   });

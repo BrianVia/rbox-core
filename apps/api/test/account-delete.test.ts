@@ -607,3 +607,48 @@ describe("grace window", () => {
     expect(await count("SELECT COUNT(*) AS n FROM blob_refs WHERE account_id = ?", a.accountId)).toBe(0);
   });
 });
+
+describe("design 180 repair-audit purge fencing", () => {
+  test("audit-first deletion scrubs completed evidence before deleting the genesis claim", async () => {
+    const a = await bootstrap("repair-audit-scrub");
+    const auditId = `gra_${"7".repeat(32)}`;
+    await db().batch([
+      db().prepare("INSERT INTO account_keys(account_id,recovery_wrap,recovery_wrap_id,created_at,repair_id,repaired_at) VALUES(?,?,?,?,?,?)")
+        .bind(a.accountId, "rbox:genesis-repair-tombstone:v1", "rbox:genesis-repair-tombstone:v1", 1, auditId, 2),
+      db().prepare(`INSERT INTO genesis_repair_audit
+        (audit_id,account_id,operator,reason,requested_at,dry_run,observed_classification,proof_json,
+         original_claim_present,original_claim_snapshot,original_recovery_wrap,original_recovery_wrap_id,
+         original_created_at,outcome,result_vector,completed_at,scrubbed_evidence_sha256)
+        VALUES(?,?,?,?,1,0,'exact_legacy_orphan','{}',1,X'01',X'02',X'03',1,'tombstone_claim_installed','audit=1,update=1',2,?)`)
+        .bind(auditId, a.accountId, "operator@example.com", "support evidence", sha("canonical repair evidence")),
+    ]);
+    const now = Date.now();
+    expect((await deleteAccount(env, ownerPrincipal(a.accountId, a.ownerUserId, a.deviceId), delReq(a.accountId), now)).status).toBe(200);
+    expect(await driveAccountDeletion(env, a.accountId, now + DELETION_GRACE_MS + 1, OK_DEPS)).toBe("done");
+    expect(await count("SELECT COUNT(*) AS n FROM account_keys WHERE account_id = ?", a.accountId)).toBe(0);
+    const audit = await db().prepare(`SELECT account_id,operator,reason,proof_json,original_claim_snapshot,
+      outcome,result_vector,completed_at,scrubbed_at,scrubbed_evidence_sha256 FROM genesis_repair_audit WHERE audit_id=?`).bind(auditId).first();
+    expect(audit).toEqual({
+      account_id: null, operator: null, reason: null, proof_json: null, original_claim_snapshot: null,
+      outcome: "tombstone_claim_installed", result_vector: "audit=1,update=1", completed_at: 2,
+      scrubbed_at: now + DELETION_GRACE_MS + 1, scrubbed_evidence_sha256: sha("canonical repair evidence"),
+    });
+  });
+
+  test("unscrubbable completed audit blocks genesis-claim deletion and done transition", async () => {
+    const a = await bootstrap("repair-audit-unscrubbable");
+    const auditId = `gra_${"8".repeat(32)}`;
+    await db().batch([
+      db().prepare("INSERT INTO account_keys(account_id,recovery_wrap,recovery_wrap_id,created_at) VALUES(?,?,?,1)").bind(a.accountId, "legacy-wrap", "legacy-id"),
+      // Missing scrubbed_evidence_sha256 makes this completed row deliberately ineligible
+      // for the set-wise scrub. The finish batch must preserve the claim as its retry handle.
+      db().prepare("INSERT INTO genesis_repair_audit(audit_id,account_id,requested_at,dry_run,outcome,completed_at) VALUES(?,?,1,0,'refused',2)").bind(auditId, a.accountId),
+    ]);
+    const now = Date.now();
+    expect((await deleteAccount(env, ownerPrincipal(a.accountId, a.ownerUserId, a.deviceId), delReq(a.accountId), now)).status).toBe(200);
+    await expect(driveAccountDeletion(env, a.accountId, now + DELETION_GRACE_MS + 1, OK_DEPS)).rejects.toThrow(/repair audit reconciliation blocked/i);
+    expect(await count("SELECT COUNT(*) AS n FROM account_keys WHERE account_id = ?", a.accountId)).toBe(1);
+    expect(await db().prepare("SELECT status FROM account_deletions WHERE account_id=?").bind(a.accountId).first()).toEqual({ status: "purging" });
+    expect(await db().prepare("SELECT account_id,scrubbed_at,scrubbed_evidence_sha256 FROM genesis_repair_audit WHERE audit_id=?").bind(auditId).first()).toEqual({ account_id: a.accountId, scrubbed_at: null, scrubbed_evidence_sha256: null });
+  });
+});
