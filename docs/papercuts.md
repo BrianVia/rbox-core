@@ -168,3 +168,11 @@ what happened, what it cost, fix hint if obvious.
   still can't die. Needs a ruled mechanism: e.g. absent-from-discovery + N
   consecutive gone-directory observations clears busy-class lanes (178 t3
   candidate).
+
+- 2026-07-22 (v1.7.22 rollout): the desktop's real `~/.rbox/daemons` held 36
+  dead `rbox-daemon-activity-*` dirs — test-suite litter (some daemon-activity
+  test path runs against the real RBOX_HOME instead of a temp dir). One had an
+  unreadable pid record, making `rbox upgrade` exit non-zero on an otherwise
+  clean host. Two fixes wanted: find + fix the test writing to real RBOX_HOME;
+  and the restart pass should treat a DEAD-pid daemon dir with an unreadable
+  record as ignorable debris, not a restart failure.
