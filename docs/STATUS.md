@@ -5,7 +5,29 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
-_Last updated: 2026-07-22 (~19:30 UTC — **design 180 LIVE IN PROD**): the
+_Last updated: 2026-07-22 (~21:00 UTC — **THE 180/179 PROGRAM IS COMPLETE ON
+MAIN**): PR #397 (design 179 recovery kit + macOS Keychain, v18) MERGED at
+09070ed9 after: security review ALIGNED (zero substantive findings — stdin-only
+phrase transport, unwrap-validated re-save, fallback-never-harder), phase-1
+fix batch (10 items incl. seam strengthening), phase-2 integration onto the
+real 180 modules (rebase-conflict resolution = seam swap), final serial review
+(3 findings hand-fixed: declined genesis offer continues until journal
+resolution; RK wipe on the phrase-input path; cross-account kits are
+`unrecognized` = at-risk, plus the json-output expectation the pipe-exit-code
+lie briefly hid — bitten AGAIN, check conclusion explicitly). Flake program
+also merged (#396, c563b6c3): docs/flaky-tests.md registry + deterministic
+fixes for all three live flakes + 17-file sweep; CursorClock injectable seam.
+Changelog staged under [Unreleased] for both 179 and the 180 client.
+**RELEASE GATE (deliberate)**: the Keychain flow has never run on a REAL Mac
+(all CI/local validation used injected security(1) runners — the 179 residual
+risk). Per the dev-build-first rule, stage a dev build on the founder's Mac
+and run `rbox key save` + a Keychain restore ONCE interactively before
+tagging v1.7.23. Prod server already runs 180 (ordering contract satisfied).
+QUEUED after release: 178 t3 (graceful stop + lock journal + pr8 ghost),
+design 182 agent-churn latency loop, bar Degraded-vs-Syncing papercut,
+RboxBar signed-app someday (iCloud Keychain)._
+
+_Previous: 2026-07-22 (~19:30 UTC — **design 180 LIVE IN PROD**): the
 atomic-genesis implementation (ALIGNED v14 after field amendments) is on main
 (9aec0906..0e7397bc — landed via direct push after a cwd mishap, content =
 the fully-reviewed PR #394 branch, gates green on the exact tree; PR closed
