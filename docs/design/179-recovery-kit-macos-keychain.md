@@ -48,6 +48,29 @@ operation. They remain mode-600 files per design 12 §13.1.
 5. Honest UX: a Keychain item is machine-local. Saving it must not be oversold
    as an off-machine backup.
 
+## v2 addition: restore FROM the Keychain (founder, 2026-07-22)
+
+The read side of the same item. `rbox key recover` today requires typing the
+24-word phrase. On macOS, when a Keychain item for the account exists,
+recovery offers it first:
+
+- Interactive TTY only: `found your recovery phrase in the macOS Keychain —
+  use it? [Y/n]`; decline falls through to today's manual entry unchanged.
+- Read via `/usr/bin/security find-generic-password -w` (absolute path;
+  secret arrives on stdout, never argv). The Keychain's own auth prompt is
+  the consent gate for the read; a locked/denied/absent item degrades
+  silently to manual entry — the offer must never make recovery HARDER.
+- Account matching: the item is keyed by accountId (§ mechanism); recover
+  knows the accountId post-login, so lookup is exact — never present an
+  item for a different account.
+- Scope honesty in copy: this rescues THIS machine (reinstall, deleted
+  ~/.rbox, re-setup). It is not a cross-device transfer; `security(1)`
+  cannot set kSecAttrSynchronizable (see Non-goals), so the phrase remains
+  the cross-machine story.
+- Phrase handling on the read path follows the same hygiene as entry:
+  in-memory only, zeroized buffers where the existing recover path does so,
+  never logged.
+
 ## v2 addition: re-save for already-logged-in users (the Max path)
 
 Existing users predate this design entirely — their phrase was either written
