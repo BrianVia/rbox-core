@@ -1,17 +1,21 @@
 # 182 — sync latency under continuous agent churn (capture in the gaps)
 
-Status: DRAFT v5 — round 4 (gpt-5.6-sol, high) verdict CHANGES-REQUIRED, 7
-findings (2 blockers). All accepted and folded: age sweep never deletes
-journal-bearing pins (r4-1); BOTH positive E2 outcomes gate on a t3
-always-live boot-bound critical-phase witness — a named interface
-requirement ON t3, whose current in-flight implementation publishes the
-witness only at shutdown (r4-2, found by reviewing the t3 worktree);
-governor sits at every doPush entrance incl. recovery probes (r4-3);
-bundle revision input moves off argv to --stdin, killing the ARG_MAX
-cliff (r4-4); contributor fanout moves behind the debounce boundary so
-raw-event ingestion is truly O(1) (r4-5); benchmark requires 10k DISTINCT
-OIDs + multi-chunk pins + publication (r4-6); precedence prose matches
-tests (r4-7). Round 5 verifies.
+Status: DRAFT v6 — round 5 (gpt-5.6-sol, high) verdict CHANGES-REQUIRED
+with 1 blocker + 1 major + 3 editorial (r4-4/5/7 certified closed). All
+folded: the t3 witness is now a CONCRETE interface (standing
+`criticalPhase` idle/active field, bootId-valid, durable-write-awaited
+BEFORE critical entry, witnessDegraded → unknown on write failure) —
+closing the race where a synchronous void gate hook queues an unawaited
+status write and a critical section starts behind an idle witness
+(r5-1); the rig ceiling applies to ordinary GOVERNED attempts with
+recovery overrides counted-but-executing and asserted separately (r5-2);
+indeterminate journal pins preserved indefinitely (r5-3); benchmark test
+summary mirrors the three-part requirement (r5-4); relationship section
+gates both positives on the witness (r5-5). Round 6 verifies; expecting
+ALIGNED or editorial residue.
+
+History: v5 folded round 4 (7/2: journal-pin sweep, E2 gating, doPush
+governor, argv cliff, fanout behind debounce, distinct-OID benchmark).
 
 History: v2 folded round 1 (19 findings, 5 blockers; A0 prerequisite
 created; B/C demoted to phase-2 requirement sets; E narrowed and
@@ -164,9 +168,10 @@ Resource contract at ordinary-push volume (r2-2, tightened r3-1..4):
   `live` (owner alive → preserve; linked-worktree siblings share the ref
   store, so a live sibling capture's pins are untouchable) /
   `recoverable-rbox` (valid record + dead owner → reap under the
-  common-dir fence) / `indeterminate` (preserve; the existing age-guarded
-  sweep at `pins.ts:33-74` remains the slow-path backstop). "Restart → no
-  stale refs" applies only to provably-owned dead pins.
+  common-dir fence) / `indeterminate` (preserved INDEFINITELY — r5-3:
+  never age-reaped; the age-guarded sweep at `pins.ts:33-74` applies to
+  legacy journal-less namespaces only). "Restart → no stale refs" applies
+  only to provably-owned dead pins.
 - Benchmarks required before ship: ref-heavy repo with 10k DISTINCT
   captured OIDs (r4-6: pin roots dedup through a Set, `capture.ts:274` —
   10k refs on one OID exercises nothing), forcing multiple
@@ -245,7 +250,11 @@ and explicit bounds (r1-3, r1-4):
   the entire point of A1 — lands inside it and is lost.
 - Raw-event ingestion cost O(1) per event, no allocation growth;
   acceptance on the rig under a synthetic agent-churn loop (git commit
-  every 300ms for 5min): signal-attributed attempts ≤ ceiling, CPU delta
+  every 300ms for 5min): ordinary GOVERNED signal-attributed attempts ≤
+  ceiling (r5-2: recovery-probe overrides execute regardless, are counted,
+  and may push the counted total past the ceiling — asserted separately:
+  overrides run, are counted, and suppress subsequent ordinary attempts),
+  CPU delta
   < 5% vs baseline.
 - Safety: every attempt still passes the point probe AND (post-A0) the
   staged-snapshot stability endpoint; the remove edge finds gaps, the
@@ -363,13 +372,28 @@ doomed-work bandwidth cheap. Hygiene = ghost-record cleanup (pr8 class, in
    estimator (pull does not wire `onGitProgress`).
    BOTH positive live outcomes gate on 178 t3 (r4-2): `"waits"` AND
    `"stops-cleanly"` require t3's critical-phase witness to be ALWAYS-LIVE
-   and boot-bound — published at daemon start and on every critical-phase
-   transition, readable by status BEFORE any stop begins — not a
-   shutdown-time record (a witness first published after the mutation
-   gate closes cannot answer the pre-stop question, and pre-t3
-   `"stops-cleanly"` is unprovable while stop can still SIGKILL at 60s,
-   `daemon-control.ts:510-563`). This is a named interface requirement ON
-   t3: its witness must be the standing record, not a stop artifact.
+   and boot-bound — not a shutdown-time record (a witness first published
+   after the mutation gate closes cannot answer the pre-stop question,
+   and pre-t3 `"stops-cleanly"` is unprovable while stop can still
+   SIGKILL at 60s, `daemon-control.ts:510-563`).
+   Concrete interface (r5-1), a named requirement ON t3:
+   - Standing field in `daemon.status.json`:
+     `criticalPhase: {"state":"idle"} | {"state":"active",
+     "phase":<t3 enum>, "since":<iso>}`, valid only when the record's
+     `bootId` matches the live v2 pidfile (same rule as 178's mode
+     witness). Field ABSENT (old daemon) → both positive outcomes
+     unavailable → `"unknown"`.
+   - Happens-before rule: the `active` publication is durably written
+     (atomic rename) and AWAITED before critical-section work begins —
+     entry into the mutation gate blocks on the acknowledged status
+     write, replacing the current fire-and-forget callback shape (a
+     synchronous void hook queuing an unawaited write lets a critical
+     section start while status still shows idle → false
+     `"stops-cleanly"`). If the write fails, entry proceeds but the
+     daemon marks the witness unreliable for the rest of the boot
+     (heartbeat carries a `witnessDegraded` bit) → status returns
+     `"unknown"`. Exit publishes `idle` best-effort AFTER the section
+     (a crash mid-section leaves `active`, which reads conservative).
    Pre-t3, E2 ships `"not-running" | "unknown"` only. Vocabulary
    compile-enforced in the shell/telemetry allowlist like 178's mode
    witness.
@@ -379,8 +403,9 @@ doomed-work bandwidth cheap. Hygiene = ghost-record cleanup (pr8 class, in
 - 177: A0 IS 177's named ordinary-push follow-up; keep-mine machinery
   (scratch refs, staged snapshot) is the implementation substrate.
 - 178 t2 (shipped): deferral hygiene floor. 178 t3 (in implementation):
-  lock classification + graceful stop — prerequisite for E2's `"waits"`
-  outcome and for trusting lock-plane signals.
+  lock classification + graceful stop — its always-live standing witness
+  gates BOTH positive E2 outcomes, and it is the prerequisite for
+  trusting lock-plane signals.
 - 176: frozen deferral grammar bounds E1. 174: held-apply floors untouched.
 - 120/105: B's advertisement supersedes their metadata ceilings and must
   say so explicitly in B's own design doc.
@@ -416,16 +441,20 @@ doomed-work bandwidth cheap. Hygiene = ghost-record cleanup (pr8 class, in
   op-state root APPEARING mid-capture defers via instability — AND the
   carve-out: a STABLE paused rebase/merge publishes and round-trips as
   today (the design-43 E2E stays green). Chunked batched pin transactions
-  (abuse valve honored, no publication cliff; 10k-ref benchmark asserts
-  publication); stability-check strictly before upload; pin-ownership
+  (abuse valve honored, no publication cliff; benchmark = 10k DISTINCT
+  captured OIDs forcing multiple pin-transaction chunks, publication
+  asserted); bundle revisions via --stdin (an over-ARG_MAX ref set
+  publishes); stability-check strictly before upload; pin-ownership
   classification (dead-owner reap under fence, live-sibling pins
-  preserved, indeterminate preserved for the age-guarded backstop);
+  preserved, journal-bearing INDETERMINATE pins preserved indefinitely —
+  the age backstop applies to legacy journal-less namespaces only);
   kill-mid-capture → restart → provably-owned dead pins reaped.
 - A1: root-mapping classification for in-workspace linked worktrees
   (gitDir ≠ commonDir); external-commonDir worktree degrades to scan-bound
   (no signal, no error); table split leaves content-watcher classification
-  unchanged on both backends; attempt accounting at dequeue with busy-
-  retry token inheritance (a 2s/8s follow-up cannot exceed the window);
+  unchanged on both backends; token consumption observed at every doPush
+  entrance (ordinary and recovery-probe) with busy-retry token
+  inheritance (a 2s/8s follow-up cannot escape the window's accounting);
   trailing-edge retention (create-edge inside floor → remove-edge still
   yields exactly one attempt at floor expiry; timer cleared on shutdown);
   floor + rolling ceiling under synthetic churn (injected clock); O(1)
@@ -436,5 +465,7 @@ doomed-work bandwidth cheap. Hygiene = ghost-record cleanup (pr8 class, in
   asserted (`not-running` before `unknown` before `waits` before
   `stops-cleanly`: no live daemon → `not-running` even when halt/reset
   records exist; stale heartbeat or version skew with a live pidfile →
-  `unknown`); `waits` absent until the t3 witness exists.
+  `unknown`); BOTH `waits` AND `stops-cleanly` absent (→ `unknown`) until
+  the boot-bound `criticalPhase` witness exists and is bootId-valid;
+  witnessDegraded bit forces `unknown` for the rest of the boot.
 - B/C: test lists live in their own design rounds.
