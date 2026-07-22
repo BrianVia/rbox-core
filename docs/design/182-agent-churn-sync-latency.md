@@ -1,20 +1,23 @@
 # 182 — sync latency under continuous agent churn (capture in the gaps)
 
-Status: DRAFT v3 — round 2 (gpt-5.6-sol, high) verdict CHANGES-REQUIRED, 9
-findings (3 blockers), strictly narrower than round 1's 19/5 — convergence
-real. All nine accepted (r2-5 accepted-modified: external-commonDir
-worktrees are explicitly OUT of A1 coverage rather than newly admitted),
-folded here. Key corrections: A0 generalizes staged/live EQUALITY and
-staged-derived roots only — the in-progress presence veto stays
-resolution-specific (ordinary sync intentionally transfers paused op-state,
-design 43:160); A1's budget counts formed attempts at dequeue with tokens
-inherited by causally-derived busy retries; E2 became a discriminated JSON
-contract. Round 3 target: A0 semantics, A1 attempt/root contracts, E2
-schema.
+Status: DRAFT v4 — round 3 (gpt-5.6-sol, high) verdict CHANGES-REQUIRED, 7
+findings (2 blockers), narrower again (19→9→7; blockers 5→3→2), residue
+confined to A0/A1 contract mechanics + E2 editorial. All seven accepted and
+folded: pin-ownership contract for scratch-ref reaping (r3-1, rides t3's
+journal discipline; live-sibling pins untouchable); no publication cliff at
+a pin bound (r3-2, abuse valve + benchmark asserts publication);
+check-before-upload unconditional (r3-3, escape hatch removed); ABA adopts
+177's publish-coherently semantics (r3-4); governor token stickiness +
+ceiling retention (r3-5); role mask eliminates the contributor loop from
+raw-event classification (r3-6); E2 vocabulary unified + precedence pinned
+(r3-7). Round 4 should be a verification pass — if only editorial residue
+remains, ALIGNED.
 
 History: v2 folded round 1 (19 findings, 5 blockers; A0 prerequisite
 created; B/C demoted to phase-2 requirement sets; E narrowed and
-half-gated on 178 t3).
+half-gated on 178 t3). v3 folded round 2 (9/3: A0 presence-veto carve-out,
+dequeue-token budget, external-commonDir out of coverage, E2 discriminated
+stop-verdict).
 
 ## The paradigm (founder, lightly compressed — kept verbatim from v0)
 
@@ -126,22 +129,35 @@ resolution-specific (`capture.ts:252`). For ordinary capture, a STABLE
 in-progress state publishes as today; only INSTABILITY (staged ≠ live)
 defers.
 
-Resource contract at ordinary-push volume (r2-2):
-- Scratch-ref pinning uses ONE batched `git update-ref --stdin` transaction
-  per repo per capture (creation and cleanup), never a subprocess per OID
-  (`pins.ts:36,53` is per-call today); an explicit per-repo pinned-ref
-  bound (default 512; beyond it, defer with reason rather than degrade).
-- Check placement: the keep-mine substrate uploads artifacts BEFORE the
-  stability check (`capture.ts:283-353`); at ordinary volume that lets
-  churn repeatedly upload refused bytes. Ordinary capture runs the
-  stability comparison BEFORE artifact upload (staged bytes are local at
-  that point); if reordering is infeasible for a path, a per-repo
-  rejected-bytes budget per hour bounds waste and defers beyond it.
-- Crash bounds: pins from a killed capture are reaped at the next startup
-  recovery pass (rides 178 t3's classification machinery); acceptance
-  includes a kill-mid-capture → restart → no stale scratch refs test.
-- Benchmarks required before ship: ref-heavy repo (10k refs) and shared
-  common-dir (N worktrees) capture cost, before/after, on the rig.
+Resource contract at ordinary-push volume (r2-2, tightened r3-1..4):
+- Scratch-ref pinning uses batched `git update-ref --stdin` transactions
+  (chunked; never a subprocess per OID — `pins.ts:36,53` is per-call
+  today). No publication-blocking cardinality cliff (r3-2): the bound is
+  an abuse valve only (default 100k pins), far above legitimate ref
+  counts; the 10k-ref benchmark must assert SUCCESSFUL publication, not
+  just cost.
+- Check placement (r3-3): the stability endpoint runs BEFORE every
+  artifact upload for ordinary capture, unconditionally. No escape hatch —
+  the staged bytes are local at comparison time; there is no path that
+  needs to upload first.
+- ABA semantics (r3-4): A0 adopts 177's contract — an index/ref A→B→A flip
+  around a capture whose staged closure is pinned publishes COHERENTLY
+  (`177:290-298`); instability-defer applies when the final live state
+  does not equal the staged snapshot. The acceptance matrix encodes both:
+  ABA-publishes-coherently, A→B-defers.
+- Pin ownership (r3-1, blocker): scratch-ref reaping gets the same
+  ownership discipline as t3's lock journal — pins are created under a
+  namespace carrying owner incarnation (host/boot/pid/start) and a
+  journal record listing the pinned names; startup reap classifies
+  `live` (owner alive → preserve; linked-worktree siblings share the ref
+  store, so a live sibling capture's pins are untouchable) /
+  `recoverable-rbox` (valid record + dead owner → reap under the
+  common-dir fence) / `indeterminate` (preserve; the existing age-guarded
+  sweep at `pins.ts:33-74` remains the slow-path backstop). "Restart → no
+  stale refs" applies only to provably-owned dead pins.
+- Benchmarks required before ship: ref-heavy repo (10k refs, asserting
+  publication) and shared common-dir (N worktrees) capture cost,
+  before/after, on the rig.
 
 182 makes A0 the gate: **no mechanism that increases capture frequency
 ships before A0.** A0 is valuable standalone (agent churn tickles the
@@ -158,10 +174,13 @@ and explicit bounds (r1-3, r1-4):
   indexed structures — `lockBases` (`index`, `config` → their `.lock`
   tails; `index` under the gitDir role, `config` under the commonDir role)
   and `literalTargets` (`gc.pid` under the commonDir role). The registry
-  classifier consults a precomputed per-root role mask; classification
-  cost is independent of contributor count (contributor iteration at
-  `git-ref-watch.ts:751` is bounded by the shared-root owner set, which is
-  what the O(1)-per-event ingestion assertion measures). The shared
+  classifier consults a precomputed per-root role mask that ELIMINATES
+  contributor iteration from raw-event classification (r3-6: the current
+  hot path loops contributors per event, `git-ref-watch.ts:742-761` —
+  that loop must not run for a raw-event classify/reject decision;
+  contributor fanout happens only for events that classify as signals).
+  Ingestion cost is asserted across INCREASING shared-worktree counts
+  (1/4/16), not only under a fixed cap. The shared
   `GIT_REF_SIGNAL_TAIL_TABLE` used by content-watcher classifiers is
   untouched, so darwin Parcel behavior does not change and the NEW busy
   targets cannot double-signal (existing HEAD/packed-refs/ref signals are
@@ -180,15 +199,23 @@ and explicit bounds (r1-3, r1-4):
   not a `requestPush` admission (`requestPush` only ORs a want bit,
   `daemon.ts:951`). Per-daemon (one workspace root): a minimum-interval
   floor between signal-attributed attempts (default 5s) and a rolling
-  60s-window ceiling (default 12 attempts). A signal-attributed attempt's
-  causally-derived busy retries (the 2s/8s follow-ups, `daemon.ts:971`)
-  inherit the originating token — they count against the same window and
-  cannot bypass the governor by reclassifying as `other`. Coalescing
-  under-counts are fine; bypass over-counts are not.
-- **Trailing-edge retention (r2-4):** the governor RETAINS (never drops) a
-  suppressed signal: a signal arriving inside the floor arms a next-
-  eligible timer that fires one attempt when the floor expires (cleared on
-  shutdown). Otherwise a create-edge burns the floor and the remove-edge —
+  60s-window ceiling (default 12 attempts). Token state machine (r3-5):
+  the signal token is STICKY on the pending want until dequeue — merging
+  with non-signal causes into the single push-want boolean
+  (`daemon.ts:951-963`) never erases it; the formed attempt is
+  signal-attributed if ANY contributing cause was. Causally-derived busy
+  retries (the 2s/8s follow-ups, `daemon.ts:971-994`, which today
+  re-enter as `other`) inherit the token and count against the same
+  window. Coalescing that under-counts is fine; attempts that escape
+  counting (an uncounted bypass) are not (r3-5 phrasing fix: a bypass is
+  an undercount of the governor, and undercounted ATTEMPTS are the
+  hazard).
+- **Retention (r2-4, r3-5) — floor AND ceiling:** the governor RETAINS
+  (never drops) suppressed work. A signal inside the floor arms a
+  next-eligible timer that fires one attempt at floor expiry; work
+  suppressed by CEILING exhaustion stays pending and re-arms at the
+  earliest rolling-window eligibility. Both timers are cleared on
+  shutdown. Otherwise a create-edge burns the budget and the remove-edge —
   the entire point of A1 — lands inside it and is lost.
 - Raw-event ingestion cost O(1) per event, no allocation growth;
   acceptance on the rig under a synthetic agent-churn loop (git commit
@@ -317,8 +344,8 @@ doomed-work bandwidth cheap. Hygiene = ghost-record cleanup (pr8 class, in
 - 177: A0 IS 177's named ordinary-push follow-up; keep-mine machinery
   (scratch refs, staged snapshot) is the implementation substrate.
 - 178 t2 (shipped): deferral hygiene floor. 178 t3 (in implementation):
-  lock classification + graceful stop — prerequisite for E2's
-  "stop-will-wait" and for trusting lock-plane signals.
+  lock classification + graceful stop — prerequisite for E2's `"waits"`
+  outcome and for trusting lock-plane signals.
 - 176: frozen deferral grammar bounds E1. 174: held-apply floors untouched.
 - 120/105: B's advertisement supersedes their metadata ceilings and must
   say so explicitly in B's own design doc.
@@ -329,8 +356,8 @@ doomed-work bandwidth cheap. Hygiene = ghost-record cleanup (pr8 class, in
 2. **A0** (ordinary-capture stability hardening) — closes a today-defect;
    gates everything else.
 3. **A1** (side-channel busy-set observation, Linux) — after A0.
-4. **E2** (agent verdict) — `safe/unknown` immediately post-A0 review;
-   `stop-will-wait` after 178 t3 ships.
+4. **E2** (agent verdict) — `stops-cleanly`/`not-running`/`unknown`
+   immediately post-A0 review; `waits` after 178 t3 ships.
 5. **B** — own design doc + rounds against the requirement set above.
 6. **C** — after A1 field data. **A2** — after the darwin spike.
 
@@ -347,14 +374,17 @@ doomed-work bandwidth cheap. Hygiene = ghost-record cleanup (pr8 class, in
 
 ## Tests the implementation must write
 
-- A0: 177 crash/flip matrix generalized to ordinary capture (A→B→A index
-  flip, ref move mid-capture, op-state root APPEARING mid-capture →
-  defer-with-reason via instability, nothing published) — AND the
+- A0: 177 crash/flip matrix generalized to ordinary capture with 177's
+  semantics (r3-4): A→B→A index/ref flip around a pinned staged closure
+  publishes COHERENTLY; A→B (final live ≠ staged) defers via instability;
+  op-state root APPEARING mid-capture defers via instability — AND the
   carve-out: a STABLE paused rebase/merge publishes and round-trips as
-  today (the design-43 E2E stays green). Batched pin transaction (one
-  update-ref --stdin per repo, pinned-ref bound honored);
-  stability-check-before-upload ordering (or the rejected-bytes budget);
-  kill-mid-capture → restart → no stale scratch refs.
+  today (the design-43 E2E stays green). Chunked batched pin transactions
+  (abuse valve honored, no publication cliff; 10k-ref benchmark asserts
+  publication); stability-check strictly before upload; pin-ownership
+  classification (dead-owner reap under fence, live-sibling pins
+  preserved, indeterminate preserved for the age-guarded backstop);
+  kill-mid-capture → restart → provably-owned dead pins reaped.
 - A1: root-mapping classification for in-workspace linked worktrees
   (gitDir ≠ commonDir); external-commonDir worktree degrades to scan-bound
   (no signal, no error); table split leaves content-watcher classification
@@ -366,6 +396,9 @@ doomed-work bandwidth cheap. Hygiene = ghost-record cleanup (pr8 class, in
   raw-event ingestion (allocation/CPU assertion on the rig); busy-probe
   bounce on signal-attributed attempt.
 - E1: frozen-grammar bytes unchanged (fixture diff); companions present.
-- E2: vocabulary compile-enforced; `--json` parity; `unknown` on stale
-  status; `stop-will-wait` absent until the t3 witness exists.
+- E2: vocabulary compile-enforced; `--json` parity; precedence order
+  asserted (`not-running` before `unknown` before `waits` before
+  `stops-cleanly`: no live daemon → `not-running` even when halt/reset
+  records exist; stale heartbeat or version skew with a live pidfile →
+  `unknown`); `waits` absent until the t3 witness exists.
 - B/C: test lists live in their own design rounds.
