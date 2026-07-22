@@ -38,7 +38,7 @@ describe("design 180 enrollment classifier",()=>{
 
   test("active journal reaches resume-attempt and receipt reaches cleanup-resume",async()=>{
     const {boot}=await complete();await saveDevice(boot.secrets);await stageRecoveryKey(ACCOUNT,await phraseToRk(boot.recoveryPhrase));
-    const requestBody=JSON.stringify({recoveryWrap:JSON.stringify(boot.upload.recoveryWrap),recoveryWrapId:boot.upload.recoveryWrapId,genesisRoster:JSON.stringify(boot.upload.genesisRoster),genesisKeyState:JSON.stringify(boot.upload.genesisKeyState),device:{deviceId:DEVICE,sigPubKey:boot.upload.device.sigPubKey,encPubKey:boot.upload.device.encPubKey,mkWrap:JSON.stringify(boot.upload.device.mkWrap)}});
+    const requestBody=JSON.stringify({recoveryWrap:JSON.stringify(boot.upload.recoveryWrap),recoveryWrapId:boot.upload.recoveryWrapId,genesisRoster:JSON.stringify(boot.upload.genesisRoster),genesisKeyState:JSON.stringify(boot.upload.genesisKeyState),device:{deviceId:DEVICE,sigPubKey:boot.upload.device.sigPubKey,encPubKey:boot.upload.device.encPubKey,mkWrap:JSON.stringify(boot.upload.device.mkWrap)},repairId:REPAIR});
     const active:GenesisJournal={version:1,accountId:ACCOUNT,deviceId:DEVICE,startedAt:"2026-07-22T12:00:00.000Z",phase:"active",requestBody,requestSha256:await sha256Hex(utf8(requestBody)),originalCacheRecovery:false,completionHolds:["recovery-kit-staging"],completionReceipts:{}};
     await publishGenesisJournal(active);expect((await classifyEnrollment(ACCOUNT,absent())).kind).toBe("resume-attempt");
     await recordGenesisReceipt(active,{outcome:"phrase-delivered",at:"2026-07-22T12:01:00.000Z"});expect((await classifyEnrollment(ACCOUNT,absent())).kind).toBe("cleanup-resume");
@@ -57,6 +57,17 @@ describe("design 180 enrollment classifier",()=>{
     expect((await classifyEnrollment(ACCOUNT,tomb())).kind).toBe("quarantine-resume");
     for(const entry of manifest.entries){await fs.rename(path.join(genesisPaths(ACCOUNT).dir,entry.source),path.join(dir,entry.destination));expect((await classifyEnrollment(ACCOUNT,tomb())).kind).toBe("quarantine-resume");}
     await resumeGenesisQuarantine(ACCOUNT,"repaired-legacy",REPAIR,"2026-07-22T12:01:00.000Z");expect((await classifyEnrollment(ACCOUNT,tomb())).kind).toBe("repair-ready");
+  });
+
+  test("completed repaired-legacy archive is inert while a new attempt owns the same source paths",async()=>{
+    const prior=await complete();await saveDevice(prior.boot.secrets);
+    await startGenesisQuarantine({accountId:ACCOUNT,purpose:"repaired-legacy",uniquenessKey:REPAIR,createdAt:"2026-07-22T12:00:00.000Z"});
+    await resumeGenesisQuarantine(ACCOUNT,"repaired-legacy",REPAIR,"2026-07-22T12:01:00.000Z");
+    const {boot}=await complete();await saveDevice(boot.secrets);await stageRecoveryKey(ACCOUNT,await phraseToRk(boot.recoveryPhrase));
+    const requestBody=JSON.stringify({recoveryWrap:JSON.stringify(boot.upload.recoveryWrap),recoveryWrapId:boot.upload.recoveryWrapId,genesisRoster:JSON.stringify(boot.upload.genesisRoster),genesisKeyState:JSON.stringify(boot.upload.genesisKeyState),device:{deviceId:DEVICE,sigPubKey:boot.upload.device.sigPubKey,encPubKey:boot.upload.device.encPubKey,mkWrap:JSON.stringify(boot.upload.device.mkWrap)}});
+    const journal:GenesisJournal={version:1,accountId:ACCOUNT,deviceId:DEVICE,startedAt:"2026-07-22T12:02:00.000Z",phase:"active",requestBody,requestSha256:await sha256Hex(utf8(requestBody)),originalCacheRecovery:false,completionHolds:["recovery-kit-staging"],completionReceipts:{}};
+    await publishGenesisJournal(journal);
+    expect((await classifyEnrollment(ACCOUNT,tomb())).kind).toBe("resume-attempt");
   });
 
   test("abandoned-attempt quarantine stays cleanup-resume after every rename",async()=>{
