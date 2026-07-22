@@ -1,11 +1,24 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Buffer } from "node:buffer";
+import { promises as fs } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { enrollViaPairing, parsePairingToken } from "./e2ee-client.js";
 
 const origFetch = globalThis.fetch;
+const origRboxHome = process.env.RBOX_HOME;
+let testHome: string;
 
-afterEach(() => {
+beforeEach(async () => {
+  testHome = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-e2ee-client-"));
+  process.env.RBOX_HOME = testHome;
+});
+
+afterEach(async () => {
   globalThis.fetch = origFetch;
+  if (origRboxHome === undefined) delete process.env.RBOX_HOME;
+  else process.env.RBOX_HOME = origRboxHome;
+  await fs.rm(testHome, { recursive: true, force: true });
 });
 
 describe("enrollViaPairing redeem errors", () => {
