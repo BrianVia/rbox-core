@@ -8,7 +8,7 @@ import { loadCredentials } from "./credentials.js";
 import { loadDevice } from "./e2ee-keystore.js";
 import { readRecoveryKitRecordState, recoveryKitFileState, recoveryKitSafety } from "./recovery-kit.js";
 import { probeKeychainKit } from "./recovery-kit-keychain.js";
-import { currentGenesisSeam } from "./genesis-seam.js";
+import { pendingGenesisState } from "./genesis-enrollment.js";
 import { style } from "./style.js";
 
 interface UninstallDeps {
@@ -31,9 +31,9 @@ export async function keystoreBackupAtRisk(removalRoot: string): Promise<boolean
   const [device, kit, pending] = await Promise.all([
     loadDevice(creds.accountId),
     readRecoveryKitRecordState(creds.accountId),
-    currentGenesisSeam().pendingGenesis(creds.accountId),
+    pendingGenesisState(creds.accountId),
   ]);
-  if (device === undefined && pending === "none") return false;
+  if (device === undefined && !pending) return false;
   if (kit.state !== "recognized") return kit.state === "unknown" ? "unknown" : true;
   const [keychain, plaintext] = await Promise.all([
     kit.record.keychain ? probeKeychainKit(kit.record.keychain) : Promise.resolve(undefined),

@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import {
+  design180GenesisSeam,
   retargetThenWriteFallback,
   shouldPresentGenesisCompletion,
   type CompletionIntent,
@@ -8,6 +9,13 @@ import {
 } from "./genesis-seam.js";
 import { completeStagedGenesisRecoveryKit } from "./auth-cmd.js";
 import { phraseToRk } from "../engine/e2ee/index.js";
+import { beginAtomicGenesis } from "./e2ee-client.js";
+import type { AccountKeysDTO, GenesisAccountObservation, GenesisPresence } from "./e2ee-remote.js";
+import { genesisPaths } from "./genesis-durable.js";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { saveCredentials } from "./credentials.js";
 
 const oldIntent: Extract<CompletionIntent, { mode: "keychain" }> = {
   version: 1, accountId: "acct_0123456789abcdef", requestSha256: "a".repeat(64), mode: "keychain",
@@ -153,4 +161,74 @@ test("production staged RETARGET failure writes no fallback file or receipt", as
   })).rejects.toThrow(/retarget durability failed/);
   expect({ files, receipts }).toEqual({ files: 0, receipts: 0 });
   expect(stagedRk.every((byte) => byte === 0)).toBe(true);
+});
+
+test("the production seam delegates intent, RETARGET, receipt, and cleanup to design 180", async () => {
+  const previousHome = process.env.RBOX_HOME;
+  const previousOsHome = process.env.HOME;
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-genesis-seam-real-"));
+  process.env.RBOX_HOME = home;
+  process.env.HOME = home;
+  let claim: AccountKeysDTO | undefined;
+  const present: GenesisPresence = { rosters: 1, keyStates: 1, devices: 1, workspaces: 0, workspaceKeys: 0, e2eePairingTokens: 0 };
+  const api = {
+    getGenesisObservation: async (): Promise<GenesisAccountObservation> => claim
+      ? { genesisPresenceVersion: 1, claim, present, repairTombstone: null }
+      : { genesisPresenceVersion: 1, claim: null, present: { rosters: 0, keyStates: 0, devices: 0, workspaces: 0, workspaceKeys: 0, e2eePairingTokens: 0 } },
+    bootstrapKeys: async (raw: unknown) => {
+      const body = JSON.parse(String(raw)) as { recoveryWrap: string; recoveryWrapId: string; genesisRoster: string; genesisKeyState: string; device: { deviceId: string; sigPubKey: string; encPubKey: string; mkWrap: string } };
+      claim = {
+        genesisPresenceVersion: 1,
+        recoveryWrap: body.recoveryWrap,
+        recoveryWrapId: body.recoveryWrapId,
+        claimCreatedAt: 1_900_000_000_000,
+        genesisDeviceId: body.device.deviceId,
+        rosters: [body.genesisRoster],
+        keyStates: [body.genesisKeyState],
+        devices: [{ deviceId: body.device.deviceId, sigPubkey: body.device.sigPubKey, encPubkey: body.device.encPubKey, mkWrap: body.device.mkWrap }],
+        present,
+        repairTombstone: null,
+      };
+    },
+  };
+  const started = await beginAtomicGenesis(api, oldIntent.accountId, "dev_real_seam", { now: 1_900_000_000_000 });
+  expect(started.kind).toBe("committed");
+  if (started.kind !== "committed") throw new Error("expected committed genesis");
+  const keychainIntent = { ...oldIntent, requestSha256: started.journal.requestSha256, intentAt: "2030-03-17T17:46:40.000Z" };
+  const fileIntent = { ...newIntent, requestSha256: started.journal.requestSha256, intentAt: "2030-03-17T17:46:41.000Z" };
+  await started.lock.release();
+  await started.globalLock.release();
+  await saveCredentials({ token: "tok", deviceId: "dev_real_seam", remoteUrl: "https://api.test", accountId: oldIntent.accountId });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(JSON.stringify({ ...claim!, genesisPresenceVersion: 1, present, repairTombstone: null }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  })) as typeof fetch;
+  try {
+    const stale: CommittedGenesisClassification = { kind: "committed-this-attempt", journal: started.journal, phrase: started.phrase };
+    await expect(design180GenesisSeam.readAndReconcileCompletionIntent(stale)).rejects.toThrow(/requires the account lock/);
+    await design180GenesisSeam.withAccountGenesisLock(oldIntent.accountId, async () => {
+      const classification = await design180GenesisSeam.pendingGenesis(oldIntent.accountId);
+      expect(classification).not.toBe("none");
+      if (classification === "none" || classification.kind !== "committed-this-attempt") throw new Error("expected committed classification");
+      const staged = await design180GenesisSeam.readValidatedStagedRecoveryKey(classification);
+      expect(staged?.requestSha256).toBe(started.journal.requestSha256);
+      staged?.rk.fill(0);
+      expect(await design180GenesisSeam.readAndReconcileCompletionIntent(classification)).toEqual({ state: "absent" });
+      await design180GenesisSeam.writeCompletionIntent(classification, keychainIntent);
+      expect(await design180GenesisSeam.readAndReconcileCompletionIntent(classification)).toEqual({ state: "intent", intent: keychainIntent });
+      expect(await design180GenesisSeam.retargetKeychainIntent(classification, keychainIntent, fileIntent)).toEqual(fileIntent);
+      await design180GenesisSeam.commitVerifiedRecoveryKitArtifact(classification);
+    });
+    await expect(fs.access(genesisPaths(oldIntent.accountId).journal)).rejects.toThrow();
+    await expect(fs.access(genesisPaths(oldIntent.accountId).intent)).rejects.toThrow();
+    await expect(fs.access(genesisPaths(oldIntent.accountId).stagedRk)).rejects.toThrow();
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (previousHome === undefined) delete process.env.RBOX_HOME;
+    else process.env.RBOX_HOME = previousHome;
+    if (previousOsHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousOsHome;
+    await fs.rm(home, { recursive: true, force: true });
+  }
 });

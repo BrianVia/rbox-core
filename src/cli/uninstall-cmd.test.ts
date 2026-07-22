@@ -7,6 +7,7 @@ import { bootstrapAccount } from "../engine/e2ee/index.js";
 import { saveDevice } from "./e2ee-keystore.js";
 import { saveCredentials } from "./credentials.js";
 import { renderKit, writeRecoveryKit } from "./recovery-kit.js";
+import { publishPrepublishMarker } from "./genesis-durable.js";
 
 let home: string;
 let rboxHome: string;
@@ -196,4 +197,20 @@ test("real uninstall consumer enforces the five-state matrix and rejects a cross
   const record = path.join(rboxHome, "e2ee", accountId, "kit.json");
   await fs.writeFile(record, '{"version":99}\n', { mode: 0o600 });
   expect(await keystoreBackupAtRisk(rboxHome)).toBe("unknown");
+});
+
+test("real uninstall consumer treats design-180 pending material as at risk", async () => {
+  const accountId = "acct_abababababababab";
+  await saveCredentials({ token: "tok", deviceId: "dev_pending", remoteUrl: "https://api.test", accountId });
+  await publishPrepublishMarker({
+    version: 1,
+    accountId,
+    deviceId: "dev_pending",
+    repairId: null,
+    startedAt: "2026-07-22T12:00:00.000Z",
+    phase: "prepublish",
+  });
+  expect(await keystoreBackupAtRisk(rboxHome)).toBe(true);
+  await uninstallCmd({}, { home, rboxHome, log: (line) => lines.push(line) });
+  expect(lines.join("\n")).toContain("UNRECOVERABLE");
 });

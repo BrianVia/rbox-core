@@ -421,7 +421,6 @@ function resolveUserPath(value: string): string {
   if (value.startsWith(`~${path.sep}`) || value.startsWith("~/")) return path.resolve(os.homedir(), value.slice(2));
   return path.resolve(value);
 }
-export function resolveRecoveryKitPath(value: string): string { return resolveUserPath(value) }
 export function accountHex16(accountId: string): string {
   const match = accountId.match(/^acct_([0-9a-f]{16})$/);
   if (!match) throw new Error(`account id does not contain a 16-hex suffix: ${accountId}`);

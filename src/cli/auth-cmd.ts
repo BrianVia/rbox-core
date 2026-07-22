@@ -6,9 +6,9 @@ import { isInteractive, promptConfirm, promptInput, promptPassword } from "./pro
 import { copyToClipboard, openInBrowser, waitForKeypress } from "./browser-open.js";
 import { RboxApi } from "./remote.js";
 import { emitJson } from "./json.js";
-import { assertNoPendingGenesis, beginAtomicGenesis, completeAtomicGenesis, enrollViaPairing, enrollViaRecoveryWithPhraseInput } from "./e2ee-client.js";
+import { assertNoPendingGenesis, beginAtomicGenesis, completeAtomicGenesis, enrollViaPairing, enrollViaRecovery, enrollViaRecoveryWithPhraseInput, RecoveryPreAdmissionError } from "./e2ee-client.js";
 import { preflightRecoveryEnvelope, validatePhraseForAccount } from "./e2ee-client.js";
-import { buildPairing, randomBytes, rkToPhrase, toB64url } from "../engine/e2ee/index.js";
+import { buildPairing, phraseToRk, randomBytes, rkToPhrase, toB64url } from "../engine/e2ee/index.js";
 import { loadDevice, loadRecoveryKey } from "./e2ee-keystore.js";
 import { isAutostartEnabled } from "./autostart-cmd.js";
 import { readStdinTrimmed } from "./read-stdin.js";
@@ -41,7 +41,7 @@ import {
   type KeychainArtifact,
   type KeychainSeams,
 } from "./recovery-kit-keychain.js";
-import { currentGenesisSeam, retargetThenWriteFallback, shouldPresentGenesisCompletion, type CommittedGenesisClassification, type CompletionIntent, type GenesisSeam, type ValidatedStagedRecoveryKey } from "./genesis-seam.js";
+import { retargetThenWriteFallback, shouldPresentGenesisCompletion, type CommittedGenesisClassification, type CompletionIntent, type GenesisSeam, type ValidatedStagedRecoveryKey } from "./genesis-seam.js";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const MIN_LOGIN_BACKOFF_MS = 1000;
@@ -165,8 +165,12 @@ interface GenesisEnrollmentDeps {
   promptConfirm?: typeof promptConfirm;
   resolveKitPath?: typeof resolveRecoveryKitPath;
   writeKit?: typeof writeKitOrThrow;
-  genesisSeam?: GenesisSeam;
   genesisCompletion?: GenesisRecoveryKitCompletionDeps;
+  platform?: NodeJS.Platform;
+  stdinTTY?: boolean;
+  stderrTTY?: boolean;
+  keychainOfferTarget?: (accountId: string) => Promise<KeychainArtifact | undefined>;
+  probeKeychain?: typeof probeKeychainKit;
 }
 
 export async function runGenesisEnrollment(
@@ -175,22 +179,96 @@ export async function runGenesisEnrollment(
   kitOpts: RecoveryKitOptions = NO_KIT,
   deps: GenesisEnrollmentDeps = {}
 ): Promise<GenesisEnrollmentResult> {
-  const now=(deps.now??Date.now)();
-  const started=await beginAtomicGenesis(api,creds.accountId,creds.deviceId,{now});
-  if(started.kind==="already-setup")return"already-setup";
-  const interactive=(deps.isInteractive??isInteractive)(),action=deps.showRecoveryPhrase?"none":recoveryKitAction(interactive,kitOpts);
-  await completeAtomicGenesis(started,{
-    deliverPhrase:(phrase)=>deps.deliverPhrase?.(phrase)??(deps.showRecoveryPhrase??deliverRecoveryPhrase)(phrase,creds,NO_KIT),
-    selectIntent:async(journal,_phrase,intentNow)=>{
-      let selected=action==="write"||action==="write-suppress-echo";
-      let target:string|undefined;
-      if(selected||action==="offer")target=await (deps.resolveKitPath??resolveRecoveryKitPath)(creds.accountId,kitOpts.kitPath,new Date(now));
-      if(action==="offer")selected=await (deps.promptConfirm??promptConfirm)({message:`Save a recovery kit (writes the phrase in PLAINTEXT to ${displayPath(target!)})?`,default:true});
-      return selected?{version:1 as const,accountId:journal.accountId,requestSha256:journal.requestSha256,mode:"kit-path" as const,path:target!,intentAt:new Date(intentNow).toISOString()}:{version:1 as const,accountId:journal.accountId,requestSha256:journal.requestSha256,mode:"phrase-display" as const,intentAt:new Date(intentNow).toISOString()};
+  const now = (deps.now ?? Date.now)();
+  const started = await beginAtomicGenesis(api, creds.accountId, creds.deviceId, { now });
+  if (started.kind === "already-setup") return "already-setup";
+  const interactive = (deps.isInteractive ?? isInteractive)();
+  const stdinTTY = deps.stdinTTY ?? interactive;
+  const stderrTTY = deps.stderrTTY ?? process.stderr.isTTY === true;
+  const platform = deps.platform ?? process.platform;
+  const completion = deps.genesisCompletion ?? defaultGenesisRecoveryKitCompletion(creds, kitOpts, deps.showRecoveryPhrase);
+  const updateGenesisOffer = async (outcome: "shown" | "accepted" | "declined"): Promise<void> => {
+    const record = await readRecoveryKitRecordState(creds.accountId);
+    const current = record.state === "recognized" ? record.record.offer : undefined;
+    const mayAdvance = current?.surface === "genesis" &&
+      (current.outcome === "claimed" || outcome === "accepted" && current.outcome === "shown");
+    if (mayAdvance) {
+      await updateRecoveryKitOfferOutcome(creds.accountId, outcome);
+    }
+  };
+  await completeAtomicGenesis(started, {
+    deliverPhrase: (phrase) => deps.deliverPhrase?.(phrase) ?? completion.displayPhrase(phrase, {
+      version: 1,
+      accountId: started.journal.accountId,
+      requestSha256: started.journal.requestSha256,
+      mode: "phrase-display",
+      intentAt: new Date(now).toISOString(),
+    }),
+    selectIntent: async (journal, phrase, intentNow) => {
+      const base = { version: 1 as const, accountId: journal.accountId, requestSha256: journal.requestSha256, intentAt: new Date(intentNow).toISOString() };
+      if (deps.showRecoveryPhrase) return { ...base, mode: "phrase-display" as const };
+      if (kitOpts.kitPath) {
+        const target = await (deps.resolveKitPath ?? resolveRecoveryKitPath)(journal.accountId, kitOpts.kitPath, new Date(now));
+        return { ...base, mode: "kit-path" as const, path: target };
+      }
+      if (kitOpts.kit) {
+        const rk = await phraseToRk(phrase);
+        try {
+          return await completion.select(phrase, { accountId: journal.accountId, requestSha256: journal.requestSha256, originalCacheRecovery: journal.originalCacheRecovery, rk });
+        } finally { rk.fill(0) }
+      }
+      if (!interactive) return { ...base, mode: "phrase-display" as const };
+      if (platform === "darwin") {
+        if (!stdinTTY || !stderrTTY) return { ...base, mode: "phrase-display" as const };
+        let target: KeychainArtifact | undefined;
+        try {
+          target = await (deps.keychainOfferTarget ?? actionableKeychainOfferTarget)(journal.accountId);
+        } catch {
+          target = undefined;
+        }
+        if (!target) return { ...base, mode: "phrase-display" as const };
+        const record = await readRecoveryKitRecordState(journal.accountId);
+        const continuingClaim = record.state === "recognized" &&
+          record.record.offer?.surface === "genesis" &&
+          record.record.offer.outcome === "claimed";
+        if (!shouldPresentGenesisCompletion(record.state === "recognized" && record.record.offer !== undefined, started, { state: "absent" })) {
+          return { ...base, mode: "phrase-display" as const };
+        }
+        const claimed = continuingClaim || await claimRecoveryKitOffer(journal.accountId, "genesis", "in-hand", async () =>
+          await (deps.probeKeychain ?? probeKeychainKit)(target) === "missing");
+        if (claimed && await (deps.promptConfirm ?? promptConfirm)({ message: "Save this recovery phrase to the macOS Keychain now (view later in Keychain Access — search \"rbox\")?", default: true })) {
+          return { ...base, mode: "keychain" as const, keychain: { service: target.service, account: target.account, keychainPath: target.keychainPath } };
+        }
+        if (claimed) await updateGenesisOffer("declined").catch(() => {});
+        return { ...base, mode: "phrase-display" as const };
+      }
+      const target = await (deps.resolveKitPath ?? resolveRecoveryKitPath)(journal.accountId, undefined, new Date(now));
+      const selected = await (deps.promptConfirm ?? promptConfirm)({ message: `Save a recovery kit (writes the phrase in PLAINTEXT to ${displayPath(target)})?`, default: true });
+      return selected ? { ...base, mode: "kit-path" as const, path: target } : { ...base, mode: "phrase-display" as const };
     },
-    commitArtifact:async(intent,phrase)=>{if(intent.mode!=="kit-path")throw new Error(`unsupported genesis completion artifact: ${intent.mode}`);await (deps.writeKit??writeKitOrThrow)(phrase,creds,{kit:true,kitPath:intent.path},!interactive);},
-  },now);
-  return"enrolled";
+    commitArtifact: async (intent, phrase) => {
+      if (intent.mode === "keychain") {
+        try {
+          await completion.saveKeychain(phrase, intent);
+          await updateGenesisOffer("accepted").catch(() => {});
+        } catch (error) {
+          await updateGenesisOffer("shown").catch(() => {});
+          throw error;
+        }
+      } else if (deps.writeKit) {
+        await deps.writeKit(phrase, creds, { kit: true, kitPath: intent.path }, !interactive);
+        await updateGenesisOffer("accepted").catch(() => {});
+      } else {
+        await completion.saveFile(phrase, intent);
+        await updateGenesisOffer("accepted").catch(() => {});
+      }
+    },
+    retargetKeychainFailure: async (error, intent, phrase) => {
+      if (error instanceof KeychainLocatorWriteError) return undefined;
+      return completion.retargetAfterKeychainFailure?.(phrase, intent);
+    },
+  }, now);
+  return "enrolled";
 }
 
 interface GenesisRecoveryKitCompletionDeps {
@@ -212,7 +290,7 @@ export function defaultGenesisRecoveryKitCompletion(
     validatePhrase: (phrase) => validatePhraseForAccount(phrase),
     select: async (_phrase, staged) => {
       const base = { version: 1 as const, accountId: creds.accountId, requestSha256: staged.requestSha256, intentAt: new Date().toISOString() };
-      if (kitOpts.kitPath) return { ...base, mode: "kit-path" as const, path: resolveRecoveryKitPath(kitOpts.kitPath) };
+      if (kitOpts.kitPath) return { ...base, mode: "kit-path" as const, path: await resolveRecoveryKitPath(creds.accountId, kitOpts.kitPath) };
       if (kitOpts.kit && process.platform === "darwin") {
         const keychainPath = await resolveLoginKeychain();
         return { ...base, mode: "keychain" as const, keychain: { service: "rbox recovery phrase" as const, account: creds.accountId, keychainPath } };
@@ -608,7 +686,12 @@ export interface RecoverCmdDeps {
   promptInput?: typeof promptInput;
   readStdin?: typeof readStdinTrimmed;
   beforePhraseRead?: () => Promise<void>;
+  /** Explicit fake-only unit seam; production leaves this undefined. */
+  genesisSeam?: GenesisSeam;
+  genesisCompletion?: GenesisRecoveryKitCompletionDeps;
   keychainPhrase?: typeof recoveryPhraseFromKeychain;
+  manualPhrase?: () => Promise<string>;
+  enroll?: typeof enrollViaRecovery;
   enrollWithPhraseInput?: typeof enrollViaRecoveryWithPhraseInput;
   mergeDiscovered?: typeof mergeDiscoveredKeychain;
   offerRecoveryKit?: typeof offerRecoveryKitAfterRecover;
@@ -619,19 +702,75 @@ export async function recoverCmd(kitOpts: RecoveryKitOptions = NO_KIT, deps: Rec
   const loaded = await (deps.loadCredentials ?? loadCredentials)();
   const creds = credentialsForStrictFlow(loaded);
   if (!creds?.accountId) throw new Error("`rbox key recover` needs an account login first — run `rbox login` (web/device-code), then recover.");
+  if (deps.genesisSeam) {
+    const seam = deps.genesisSeam;
+    const selected = await seam.withAccountGenesisLock(creds.accountId, async () => {
+      const pending = await seam.pendingGenesis(creds.accountId!);
+      if (pending !== "none") {
+        if (pending.kind === "committed-this-attempt") {
+          await completeStagedGenesisRecoveryKit(
+            creds.accountId!,
+            pending,
+            seam,
+            deps.genesisCompletion ?? defaultGenesisRecoveryKitCompletion({ accountId: creds.accountId!, deviceId: creds.deviceId }, kitOpts)
+          );
+        } else {
+          await seam.resumeOrCleanupPendingGenesis(creds.accountId!, pending);
+        }
+        if (await seam.pendingGenesis(creds.accountId!) !== "none") throw new Error("pending encryption setup must be resolved before recovery");
+      }
+      const candidate = await (deps.keychainPhrase ?? recoveryPhraseFromKeychain)(creds.accountId!);
+      let phrase = candidate?.phrase ?? await (deps.manualPhrase ?? (async () => {
+        if ((deps.isInteractive ?? isInteractive)()) return (deps.promptInput ?? promptInput)({ message: "Enter your 24-word recovery phrase" });
+        return (deps.readStdin ?? readStdinTrimmed)();
+      }))();
+      if (!phrase) throw new Error("no phrase entered");
+      let recoveredViaKeychain = Boolean(candidate);
+      let recovered: { accountId: string; deviceId: string };
+      try {
+        recovered = await (deps.enroll ?? enrollViaRecovery)(phrase, (deps.now ?? Date.now)(), loaded);
+      } catch (error) {
+        if (!candidate || !(error instanceof RecoveryPreAdmissionError)) throw error;
+        process.stderr.write("Keychain recovery phrase could not be used; enter the phrase manually.\n");
+        recoveredViaKeychain = false;
+        phrase = await (deps.manualPhrase ?? (async () => (deps.readStdin ?? readStdinTrimmed)()))();
+        if (!phrase) throw new Error("no phrase entered");
+        recovered = await (deps.enroll ?? enrollViaRecovery)(phrase, (deps.now ?? Date.now)(), loaded);
+      }
+      return { phrase, recovered, recoveredViaKeychain, candidate };
+    });
+    console.log(`recovered + enrolled this device: ${selected.recovered.deviceId}`);
+    if (selected.recoveredViaKeychain && selected.candidate?.artifact) await (deps.mergeDiscovered ?? mergeDiscoveredKeychain)(selected.recovered.accountId, selected.candidate.artifact);
+    await (deps.offerRecoveryKit ?? offerRecoveryKitAfterRecover)(selected.phrase, selected.recovered, kitOpts);
+    return;
+  }
   let keychainCandidate: Awaited<ReturnType<typeof recoveryPhraseFromKeychain>>;
   let recoveredViaKeychain = false;
-  const result = await (deps.enrollWithPhraseInput ?? enrollViaRecoveryWithPhraseInput)(async () => {
-    keychainCandidate = await (deps.keychainPhrase ?? recoveryPhraseFromKeychain)(creds.accountId!);
-    if (keychainCandidate) {
-      recoveredViaKeychain = true;
-      return keychainCandidate.phrase;
-    }
+  const enrollWithPhraseInput = deps.enrollWithPhraseInput ?? enrollViaRecoveryWithPhraseInput;
+  const readManualPhrase = async (): Promise<string> => {
+    if (deps.manualPhrase) return deps.manualPhrase();
     if ((deps.isInteractive ?? isInteractive)()) {
       return (deps.promptInput ?? promptInput)({ message: "Enter your 24-word recovery phrase" });
     }
     return (deps.readStdin ?? readStdinTrimmed)();
-  }, (deps.now ?? Date.now)(), loaded, deps.beforePhraseRead);
+  };
+  let result: Awaited<ReturnType<typeof enrollViaRecoveryWithPhraseInput>>;
+  try {
+    result = await enrollWithPhraseInput(async () => {
+      keychainCandidate = await (deps.keychainPhrase ?? recoveryPhraseFromKeychain)(creds.accountId!);
+      if (keychainCandidate) {
+        recoveredViaKeychain = true;
+        return keychainCandidate.phrase;
+      }
+      return readManualPhrase();
+    }, (deps.now ?? Date.now)(), loaded, deps.beforePhraseRead);
+  } catch (error) {
+    if (!recoveredViaKeychain || !(error instanceof RecoveryPreAdmissionError)) throw error;
+    process.stderr.write("Keychain recovery phrase could not be used; enter the phrase manually.\n");
+    recoveredViaKeychain = false;
+    keychainCandidate = undefined;
+    result = await enrollWithPhraseInput(readManualPhrase, (deps.now ?? Date.now)(), loaded, deps.beforePhraseRead);
+  }
   console.log(`recovered + enrolled this device: ${result.deviceId}`);
   if (recoveredViaKeychain && keychainCandidate?.artifact) await (deps.mergeDiscovered ?? mergeDiscoveredKeychain)(result.accountId, keychainCandidate.artifact);
   await (deps.offerRecoveryKit ?? offerRecoveryKitAfterRecover)(result.phrase, result, kitOpts);
@@ -706,7 +845,7 @@ export async function keyStatus(opts: { json?: boolean } = {}): Promise<void> {
   const kitRecord = kitRead.state === "recognized" ? kitRead.record : undefined;
   const keychainState = kitRecord?.keychain ? await probeKeychainKit(kitRecord.keychain) : undefined;
   const plaintextStates = kitRecord ? await Promise.all(kitRecord.plaintextArtifacts.map((artifact) => recoveryKitFileState(creds.accountId!, artifact))) : [];
-  const pendingGenesis = creds.accountId ? (await currentGenesisSeam().pendingGenesis(creds.accountId)) !== "none" : false;
+  const pendingGenesis = genesisPending;
   if (opts.json) {
     const firstFile = kitRecord?.plaintextArtifacts[0];
     emitJson({
@@ -732,7 +871,11 @@ export async function keyStatus(opts: { json?: boolean } = {}): Promise<void> {
   console.log(`device:   ${creds.deviceId}`);
   console.log(`account:  ${creds.accountId ?? "(unknown — re-login)"}`);
   if (!creds.accountId) return;
-  if(genesisPending){console.log(`encryption: pending\n${GENESIS_PENDING_MESSAGE}`);return;}
+  if(genesisPending){
+    console.log(`encryption: pending\n${GENESIS_PENDING_MESSAGE}`);
+    for (const line of await recoveryKitStatusLines(creds.accountId, false, kitRead, keychainState, plaintextStates, true)) console.log(line);
+    return;
+  }
   console.log(`encryption: ${enrolled ? "enrolled (master key present)" : loaded ? "device key present, master key missing — will self-heal on next sync" : "NOT enrolled — run `rbox pair` or `rbox key recover`"}`);
   console.log(`recovery phrase cached locally: ${cachedRk ? "yes (`rbox key backup` can re-show)" : "no (use the phrase you saved at setup)"}`);
   for (const line of await recoveryKitStatusLines(creds.accountId, Boolean(cachedRk), kitRead, keychainState, plaintextStates, pendingGenesis)) console.log(line);

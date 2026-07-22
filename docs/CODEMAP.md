@@ -147,6 +147,7 @@ src/cli/genesis-durable.ts    — hardened genesis artifact writer, staged RK, j
 src/cli/genesis-locks.ts      — non-materializing global/account genesis lock namespaces and global-to-account acquisition order. Never: enrollment classification or credential mutation.
 src/cli/genesis-quarantine.ts — manifest-first, hash-checked repaired-legacy and abandoned-attempt archival with durable terminal markers. Never: deciding whether quarantine is authorized.
 src/cli/genesis-enrollment.ts — strict pending-artifact inspection and the shared crypto-backed closed enrollment classifier. Never: transport or interactive completion choices.
+src/cli/genesis-seam.ts       — thin injectable design-179 adapter over design-180 global→account locking, classification, staged-RK, completion-intent, RETARGET, receipt, and cleanup APIs; lower-level proofs are scoped to the held lock. Never: independent genesis state, fallback production behavior, or command UX.
 ```
 
 ## `src/cli/remote/` — HTTP transport to the API worker

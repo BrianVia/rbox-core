@@ -1,79 +1,44 @@
 /**
- * Narrow design-180 capability boundary consumed by design 179.
+ * Narrow design-180 capability adapter consumed by design 179.
  *
- * TODO(180-integration): replace with the real module from
- * feat/180-atomic-genesis. This file deliberately contains no journal, lock,
- * classifier, witness, or quarantine implementation.
+ * Design 180 owns classification, locking, durable intent/RETARGET state,
+ * receipts, and cleanup. This module only binds those real interfaces to the
+ * small injectable surface used by recovery-kit policy and unit tests.
  */
 import { isDeepStrictEqual } from "node:util";
-import { acquireGenesisLock } from "./e2ee-keystore.js";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { rkToPhrase } from "../engine/e2ee/index.js";
+import { credentialsForStrictFlow, loadCredentials } from "./credentials.js";
+import { resumeGenesisCleanup, type AtomicGenesisCommit } from "./e2ee-client.js";
+import {
+  inspectPendingGenesis,
+  classifyEnrollment,
+  genesisClassifierConsultationNeeded,
+  type EnrollmentClassification,
+} from "./genesis-enrollment.js";
+import {
+  loadStagedRecoveryKey,
+  parseCompletionIntent,
+  publishCompletionIntent,
+  reconcileRetargetIntent,
+  recordGenesisReceipt,
+  retargetCompletionIntent,
+  type CompletionIntent as DurableCompletionIntent,
+  type CompletionIntentRetargetWitness as DurableCompletionIntentRetargetWitness,
+  type GenesisJournal,
+} from "./genesis-durable.js";
+import { RboxApi } from "./remote.js";
+import { acquireGenesisLockPair } from "./genesis-locks.js";
+import { resumeGenesisQuarantine } from "./genesis-quarantine.js";
 
 export const RECOVERY_KIT_SERVICE = "rbox recovery phrase" as const;
 
-export type CompletionIntent =
-  | {
-      version: 1;
-      accountId: string;
-      requestSha256: string;
-      mode: "phrase-display";
-      intentAt: string;
-    }
-  | {
-      version: 1;
-      accountId: string;
-      requestSha256: string;
-      mode: "keychain";
-      keychain: {
-        service: typeof RECOVERY_KIT_SERVICE;
-        account: string;
-        keychainPath: string;
-      };
-      intentAt: string;
-    }
-  | {
-      version: 1;
-      accountId: string;
-      requestSha256: string;
-      mode: "kit-path";
-      path: string;
-      intentAt: string;
-    };
-
-export type CompletionIntentRetargetWitness = {
-  version: 1;
-  accountId: string;
-  requestSha256: string;
-  oldIntent: CompletionIntent;
-  oldIntentSha256: string;
-  newIntent: CompletionIntent;
-  newIntentSha256: string;
-  witnessedAt: string;
-};
-
-export interface GenesisAttemptRef {
-  accountId: string;
-  requestSha256: string;
-}
-
-/** Structural projection of design 180's complete enrollment classifier. The
- * payload-bearing variants deliberately expose only the fields design 179
- * consumes so the phase-2 integration remains an import/adapter swap. */
-export type GenesisClassification =
-  | { kind: "pristine" }
-  | { kind: "restart-prepublication"; marker: unknown }
-  | { kind: "resume-attempt"; journal: GenesisAttemptRef }
-  | { kind: "cleanup-resume"; journal: GenesisAttemptRef }
-  | { kind: "committed-this-attempt"; journal: GenesisAttemptRef; phrase: string; intent?: CompletionIntent; witness?: CompletionIntentRetargetWitness }
-  | { kind: "competing-genesis"; journal: GenesisAttemptRef }
-  | { kind: "enrolled"; dto: unknown }
-  | { kind: "legacy-orphan" }
-  | { kind: "repaired-legacy"; repairId: string }
-  | { kind: "quarantine-resume"; repairId: string }
-  | { kind: "repair-ready"; repairId: string }
-  | { kind: "integrity-failure"; reason: string };
-
-export type CommittedGenesisClassification = Extract<GenesisClassification, { kind: "committed-this-attempt" }>;
-export type PendingGenesisClassification = "none" | GenesisClassification;
+export type CompletionIntent = DurableCompletionIntent;
+export type CompletionIntentRetargetWitness = DurableCompletionIntentRetargetWitness;
+export type GenesisAttemptRef = Pick<GenesisJournal, "accountId" | "requestSha256">;
+export type GenesisClassification = EnrollmentClassification;
+export type CommittedGenesisClassification = Extract<EnrollmentClassification, { kind: "committed-this-attempt" }>;
+export type PendingGenesisClassification = "none" | EnrollmentClassification;
 
 export interface ValidatedStagedRecoveryKey extends GenesisAttemptRef {
   /** Authenticated bytes from design 180's rk.key.staged. */
@@ -82,76 +47,246 @@ export interface ValidatedStagedRecoveryKey extends GenesisAttemptRef {
 }
 
 export interface GenesisSeam {
-  /** TODO(180-integration): acquire design 180's account-scoped lock. */
+  /** Hold design 180's global→account lock pair for every lower-level capability. */
   withAccountGenesisLock<T>(accountId: string, operation: () => Promise<T>): Promise<T>;
-  /** TODO(180-integration): return the uncollapsed shared-classifier result. */
+  /** Return the real, uncollapsed design-180 classifier result when consultation is required. */
   pendingGenesis(accountId: string): Promise<PendingGenesisClassification>;
-  /** TODO(180-integration): drive the classifier's exact resume/cleanup path.
-   * Success means the journal has been durably retired. */
+  /** Resume only a transition authorized by a classification minted under this lock. */
   resumeOrCleanupPendingGenesis(accountId: string, classification: GenesisClassification): Promise<void>;
-  /** TODO(180-integration): strict staged-RK load + journal/envelope validation. */
+  /** Strict staged-RK load, bound to a real committed-this-attempt classification. */
   readValidatedStagedRecoveryKey(classification: CommittedGenesisClassification): Promise<ValidatedStagedRecoveryKey | undefined>;
-  /** TODO(180-integration): strict canonical-intent and witness load. */
+  /** Strict canonical-intent load, reconciling a RETARGET witness first. */
   readAndReconcileCompletionIntent(classification: CommittedGenesisClassification): Promise<{ state: "absent" } | { state: "intent"; intent: CompletionIntent }>;
-  /** TODO(180-integration): hardened first publication owned by design 180. */
+  /** Hardened first intent publication owned by design 180. */
   writeCompletionIntent(classification: CommittedGenesisClassification, intent: CompletionIntent): Promise<void>;
-  /** TODO(180-integration): witness-first Keychain-to-file RETARGET. */
+  /** Witness-first Keychain-to-file RETARGET owned by design 180. */
   retargetKeychainIntent(classification: CommittedGenesisClassification, oldIntent: Extract<CompletionIntent, { mode: "keychain" }>, newIntent: Extract<CompletionIntent, { mode: "kit-path" }>): Promise<Extract<CompletionIntent, { mode: "keychain" | "kit-path" }>>;
-  /** TODO(180-integration): writes artifact-committed and owns resulting cleanup. */
+  /** Publish artifact-committed and run design 180's cleanup. */
   commitVerifiedRecoveryKitArtifact(classification: CommittedGenesisClassification): Promise<void>;
-  /** TODO(180-integration): writes phrase-delivered and owns resulting cleanup. */
+  /** Publish phrase-delivered and run design 180's cleanup. */
   commitDeliveredRecoveryPhrase(classification: CommittedGenesisClassification): Promise<void>;
-  /** TODO(180-integration): derives the exact three-entry manifest from its journal. */
+  /** Require a fresh real competing-genesis proof, then receipt + quarantine cleanup. */
   quarantineAbandonedAttempt(attempt: GenesisAttemptRef): Promise<void>;
 }
 
-const unavailable = async (): Promise<never> => {
-  throw new Error("atomic genesis integration is unavailable in this build");
-};
+interface GenesisLockContext {
+  accountId: string;
+  proofs: WeakSet<object>;
+}
 
-/** Fail-closed placeholder until design 180 is merged. */
-export const pre180GenesisSeam: GenesisSeam = {
+const genesisLockContext = new AsyncLocalStorage<GenesisLockContext>();
+
+function lockedContext(accountId: string): GenesisLockContext {
+  const context = genesisLockContext.getStore();
+  if (!context || context.accountId !== accountId) throw new Error("design-180 genesis capability requires the account lock");
+  return context;
+}
+
+function requireLockedProof(classification: GenesisClassification): void {
+  const context = genesisLockContext.getStore();
+  if (!context) throw new Error("design-180 genesis capability requires the account lock");
+  if ("journal" in classification && classification.journal.accountId !== context.accountId) throw new Error("genesis classification account lock mismatch");
+  if ("marker" in classification && classification.marker.accountId !== context.accountId) throw new Error("genesis classification account lock mismatch");
+  if (!context.proofs.has(classification)) throw new Error("genesis classification was not minted under the held account lock");
+}
+
+function sameAttempt(classification: CommittedGenesisClassification, accountId: string, requestSha256: string): boolean {
+  return classification.journal.accountId === accountId && classification.journal.requestSha256 === requestSha256;
+}
+
+async function classifyCurrentAccount(accountId: string): Promise<EnrollmentClassification> {
+  const loaded = credentialsForStrictFlow(await loadCredentials());
+  if (!loaded || loaded.accountId !== accountId) {
+    throw new Error("pending encryption setup requires credentials for the same account");
+  }
+  const api = new RboxApi(loaded.remoteUrl, loaded.token, "", "");
+  return classifyEnrollment(accountId, await api.getGenesisObservation());
+}
+
+async function canonicalIntent(classification: CommittedGenesisClassification): Promise<CompletionIntent | undefined> {
+  const pending = await inspectPendingGenesis(classification.journal.accountId);
+  if (pending.witnessRaw !== undefined) {
+    const reconciled = await reconcileRetargetIntent(classification.journal);
+    if (!reconciled) throw new Error("RETARGET witness did not reconcile a completion intent");
+    return reconciled;
+  }
+  return pending.intentRaw === undefined ? undefined : parseCompletionIntent(pending.intentRaw, classification.journal);
+}
+
+async function commitReceipt(
+  classification: CommittedGenesisClassification,
+  outcome: "artifact" | "phrase"
+): Promise<void> {
+  const intent = await canonicalIntent(classification);
+  if (!intent) throw new Error("genesis completion intent is absent");
+  const at = new Date().toISOString();
+  const receipt = outcome === "phrase"
+    ? (() => {
+        if (intent.mode !== "phrase-display") throw new Error("phrase delivery does not match the completion intent");
+        return { outcome: "phrase-delivered" as const, at };
+      })()
+    : (() => {
+        if (intent.mode === "phrase-display") throw new Error("artifact commitment does not match the completion intent");
+        return {
+          outcome: "artifact-committed" as const,
+          at,
+          artifact: intent.mode === "keychain"
+            ? { mode: "keychain" as const, ...intent.keychain }
+            : { mode: "kit-path" as const, path: intent.path },
+        };
+      })();
+  await resumeGenesisCleanup(await recordGenesisReceipt(classification.journal, receipt));
+}
+
+export const design180GenesisSeam: GenesisSeam = {
   withAccountGenesisLock: async (accountId, operation) => {
-    const release = acquireGenesisLock(accountId);
-    try { return await operation() } finally { release() }
+    const inherited = genesisLockContext.getStore();
+    if (inherited) {
+      if (inherited.accountId !== accountId) throw new Error("cannot nest genesis locks for different accounts");
+      return operation();
+    }
+    const pair = await acquireGenesisLockPair(accountId);
+    try {
+      return await genesisLockContext.run({ accountId, proofs: new WeakSet() }, operation);
+    } finally {
+      await pair.account.release();
+      await pair.global.release();
+    }
   },
-  pendingGenesis: async () => "none",
-  resumeOrCleanupPendingGenesis: unavailable,
-  readValidatedStagedRecoveryKey: async () => undefined,
-  readAndReconcileCompletionIntent: async () => ({ state: "absent" }),
-  writeCompletionIntent: unavailable,
-  retargetKeychainIntent: unavailable,
-  commitVerifiedRecoveryKitArtifact: unavailable,
-  commitDeliveredRecoveryPhrase: unavailable,
-  quarantineAbandonedAttempt: unavailable,
+
+  pendingGenesis: async (accountId) => {
+    const context = lockedContext(accountId);
+    if (!(await genesisClassifierConsultationNeeded(accountId))) return "none";
+    const classification = await classifyCurrentAccount(accountId);
+    context.proofs.add(classification);
+    return classification;
+  },
+
+  resumeOrCleanupPendingGenesis: async (accountId, classification) => {
+    if (lockedContext(accountId).accountId !== accountId) throw new Error("genesis account lock mismatch");
+    requireLockedProof(classification);
+    if (classification.kind === "cleanup-resume") {
+      await resumeGenesisCleanup(classification.journal);
+      return;
+    }
+    if (classification.kind === "competing-genesis") {
+      const cleanup = await recordGenesisReceipt(classification.journal, { outcome: "competing-cleaned", at: new Date().toISOString() });
+      await resumeGenesisCleanup(cleanup);
+      return;
+    }
+    if (classification.kind === "quarantine-resume") {
+      await resumeGenesisQuarantine(accountId, "repaired-legacy", classification.repairId, new Date().toISOString());
+      return;
+    }
+    throw new Error(`genesis classification ${classification.kind} requires its design-180 high-level flow`);
+  },
+
+  readValidatedStagedRecoveryKey: async (classification) => {
+    requireLockedProof(classification);
+    const rk = await loadStagedRecoveryKey(classification.journal.accountId);
+    try {
+      if (await rkToPhrase(rk) !== classification.phrase) {
+        throw new Error("staged recovery key does not match committed classification");
+      }
+      return {
+        accountId: classification.journal.accountId,
+        requestSha256: classification.journal.requestSha256,
+        originalCacheRecovery: classification.journal.originalCacheRecovery,
+        rk,
+      };
+    } catch (error) {
+      rk.fill(0);
+      throw error;
+    }
+  },
+
+  readAndReconcileCompletionIntent: async (classification) => {
+    requireLockedProof(classification);
+    const intent = await canonicalIntent(classification);
+    return intent ? { state: "intent", intent } : { state: "absent" };
+  },
+
+  writeCompletionIntent: async (classification, intent) => {
+    requireLockedProof(classification);
+    if (!sameAttempt(classification, intent.accountId, intent.requestSha256)) {
+      throw new Error("completion intent does not match committed genesis classification");
+    }
+    await publishCompletionIntent(intent, classification.journal);
+  },
+
+  retargetKeychainIntent: async (classification, oldIntent, newIntent) => {
+    requireLockedProof(classification);
+    if (!sameAttempt(classification, oldIntent.accountId, oldIntent.requestSha256) ||
+        !sameAttempt(classification, newIntent.accountId, newIntent.requestSha256)) {
+      throw new Error("RETARGET intents do not match committed genesis classification");
+    }
+    const pending = await inspectPendingGenesis(classification.journal.accountId);
+    if (pending.witnessRaw !== undefined) {
+      const survivor = await reconcileRetargetIntent(classification.journal);
+      if (!survivor || (!isDeepStrictEqual(survivor, oldIntent) && !isDeepStrictEqual(survivor, newIntent))) {
+        throw new Error("RETARGET reconciled an unexpected completion intent");
+      }
+      if (survivor.mode === "phrase-display") throw new Error("RETARGET reconciled a phrase-display intent");
+      return survivor;
+    }
+    if (pending.intentRaw === undefined || !isDeepStrictEqual(parseCompletionIntent(pending.intentRaw, classification.journal), oldIntent)) {
+      throw new Error("RETARGET source intent is not canonical");
+    }
+    await retargetCompletionIntent(classification.journal, oldIntent, newIntent, new Date().toISOString());
+    const survivor = await reconcileRetargetIntent(classification.journal);
+    if (!survivor || (!isDeepStrictEqual(survivor, oldIntent) && !isDeepStrictEqual(survivor, newIntent))) {
+      throw new Error("RETARGET reconciled an unexpected completion intent");
+    }
+    if (survivor.mode === "phrase-display") throw new Error("RETARGET reconciled a phrase-display intent");
+    return survivor;
+  },
+
+  commitVerifiedRecoveryKitArtifact: (classification) => {
+    requireLockedProof(classification);
+    return commitReceipt(classification, "artifact");
+  },
+  commitDeliveredRecoveryPhrase: (classification) => {
+    requireLockedProof(classification);
+    return commitReceipt(classification, "phrase");
+  },
+
+  quarantineAbandonedAttempt: async (attempt) => {
+    const context = lockedContext(attempt.accountId);
+    const classification = await classifyCurrentAccount(attempt.accountId);
+    context.proofs.add(classification);
+    if (classification.kind !== "competing-genesis" || classification.journal.requestSha256 !== attempt.requestSha256) {
+      throw new Error("abandoned-attempt quarantine requires an exact competing-genesis classification");
+    }
+    const cleanup = await recordGenesisReceipt(classification.journal, {
+      outcome: "competing-cleaned",
+      at: new Date().toISOString(),
+    });
+    await resumeGenesisCleanup(cleanup);
+  },
 };
 
-let activeGenesisSeam: GenesisSeam = pre180GenesisSeam;
+let activeGenesisSeam: GenesisSeam = design180GenesisSeam;
 
-/** Process-local injection point. TODO(180-integration): initialize this binding
- * from the real feat/180-atomic-genesis adapter at module load. */
 export function currentGenesisSeam(): GenesisSeam { return activeGenesisSeam }
 
-/** Tests install one stateful fake; callers never read 180-owned files directly. */
+/** Tests install stateful fakes; production always starts on the real adapter. */
 export function installGenesisSeamForTests(seam: GenesisSeam): () => void {
   const previous = activeGenesisSeam;
   activeGenesisSeam = seam;
   return () => { activeGenesisSeam = previous };
 }
 
-/** Design-179 policy layered over the injected design-180 state. A claimed
- * local offer cannot suppress continuation of the same unresolved journal. */
+/** A claimed local offer cannot suppress continuation of the same unresolved journal. */
 export function shouldPresentGenesisCompletion(
   offerClaimed: boolean,
-  pending: PendingGenesisClassification,
+  pending: PendingGenesisClassification | AtomicGenesisCommit,
   state: { state: "absent" } | { state: "intent"; intent: CompletionIntent }
 ): boolean {
   if (pending === "none") return !offerClaimed;
-  return pending.kind === "committed-this-attempt" && state.state === "absent";
+  return (pending.kind === "committed-this-attempt" || pending.kind === "committed") && state.state === "absent";
 }
 
-/** The failing RETARGET invocation is forbidden from writing the fallback.
- * Only the exact durable new survivor returned by design 180 enables it. */
+/** Only the exact durable new survivor returned by design 180 enables fallback output. */
 export async function retargetThenWriteFallback(
   seam: GenesisSeam,
   classification: CommittedGenesisClassification,

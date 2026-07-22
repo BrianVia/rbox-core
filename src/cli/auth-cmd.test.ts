@@ -6,6 +6,7 @@ import {
   handleDeviceCodePostApprovalEncryption,
   deviceCodeLoginShouldPrintWorkspaceStep,
   deviceApprovalUrl,
+  completeStagedGenesisRecoveryKit,
   defaultGenesisRecoveryKitCompletion,
   login,
   logout,
@@ -24,10 +25,10 @@ import { accountProfilePath, flushAccountProfileWrites, scheduleAccountProfileWr
 import { saveCredentials } from "./credentials.js";
 import { _setSpawner } from "./browser-open.js";
 import { AccountAlreadyBootstrappedError } from "./remote.js";
-import { acquireGenesisLock, hasDevice, loadRecoveryKey, saveDevice, saveRecoveryKey } from "./e2ee-keystore.js";
+import { acquireGenesisLock, hasDevice, loadDevice, loadRecoveryKey, saveDevice, saveRecoveryKey } from "./e2ee-keystore.js";
 import type { AccountKeysDTO, GenesisAccountObservation, GenesisPresence } from "./e2ee-remote.js";
 import { bootstrapAccount, buildKeyState, phraseToRk, signPrivateFromPkcs8, wrapHash } from "../engine/e2ee/index.js";
-import { GENESIS_PENDING_MESSAGE, genesisPaths, publishPrepublishMarker } from "./genesis-durable.js";
+import { GENESIS_PENDING_MESSAGE, genesisPaths, publishGenesisEnrollmentWitness, publishPrepublishMarker } from "./genesis-durable.js";
 import { acquireGenesisLockPair } from "./genesis-locks.js";
 import type { GenesisSeam } from "./genesis-seam.js";
 import { RecoveryPreAdmissionError } from "./e2ee-client.js";
@@ -311,6 +312,127 @@ describe("runGenesisEnrollment", () => {
     const accountId="acct_4444444444444449",api=new FakeGenesisApi([null],"ok",accountId,"dev_decline"),target=path.join(home,"declined-kit.txt");let prompts=0;await runGenesisEnrollment(api,{accountId,deviceId:"dev_decline"},{kit:false},{now:()=>1_900_000_000_000,isInteractive:()=>true,promptConfirm:async()=>{prompts++;return false;},resolveKitPath:async()=>target,deliverPhrase:async()=>{expect(JSON.parse(await fs.readFile(genesisPaths(accountId).intent,"utf8"))).toMatchObject({mode:"phrase-display"});}});expect(prompts).toBe(1);await expect(fs.access(target)).rejects.toThrow();
   });
 
+  test("real staged genesis re-presents a claimed offer after a crash before intent publication", async () => {
+    const accountId = "acct_4646464646464646";
+    const api = new FakeGenesisApi([null], "ok", accountId, "dev_claim_resume");
+    const target = { service: "rbox recovery phrase" as const, account: accountId, keychainPath: path.join(home, "login.keychain-db"), discoveredAt: "2030-03-17T17:46:40.000Z" };
+    let prompts = 0;
+    const common = {
+      platform: "darwin" as const,
+      stdinTTY: true,
+      stderrTTY: true,
+      isInteractive: () => true,
+      keychainOfferTarget: async () => target,
+      probeKeychain: async () => "missing" as const,
+      now: () => 1_900_000_000_000,
+    };
+    await expect(runGenesisEnrollment(api, { accountId, deviceId: "dev_claim_resume" }, { kit: false }, {
+      ...common,
+      promptConfirm: async () => { prompts++; throw new Error("crash after claim") },
+    })).rejects.toThrow("crash after claim");
+    expect((await readRecoveryKitRecord(accountId))?.offer?.outcome).toBe("claimed");
+    await expect(fs.access(genesisPaths(accountId).intent)).rejects.toThrow();
+
+    let delivered = 0;
+    await runGenesisEnrollment(api, { accountId, deviceId: "dev_claim_resume" }, { kit: false }, {
+      ...common,
+      now: () => 1_900_000_000_001,
+      promptConfirm: async () => { prompts++; return false },
+      deliverPhrase: async () => { delivered++ },
+    });
+    expect({ prompts, delivered }).toEqual({ prompts: 2, delivered: 1 });
+    expect((await readRecoveryKitRecord(accountId))?.offer?.outcome).toBe("declined");
+  });
+
+  test("staged genesis Keychain offer requires both TTYs and swallows unavailable preflight", async () => {
+    const rows = [[true, true, 1], [true, false, 0], [false, true, 0], [false, false, 0]] as const;
+    for (let index = 0; index < rows.length; index++) {
+      const [stdinTTY, stderrTTY, expectedPreflights] = rows[index]!;
+      const accountId = `acct_474747474747474${index}`;
+      const api = new FakeGenesisApi([null], "ok", accountId, `dev_tty_${index}`);
+      let preflights = 0;
+      await runGenesisEnrollment(api, { accountId, deviceId: `dev_tty_${index}` }, { kit: false }, {
+        platform: "darwin",
+        stdinTTY,
+        stderrTTY,
+        isInteractive: () => stdinTTY,
+        keychainOfferTarget: async () => { preflights++; throw new Error("Keychain unavailable") },
+        deliverPhrase: async () => {},
+        now: () => 1_900_000_000_000 + index,
+      });
+      expect(preflights).toBe(expectedPreflights);
+      expect(await readRecoveryKitRecord(accountId)).toBeUndefined();
+    }
+  });
+
+  test("a verified staged-genesis Keychain save advances the offer to accepted", async () => {
+    const accountId = "acct_4848484848484848";
+    const api = new FakeGenesisApi([null], "ok", accountId, "dev_offer_accept");
+    const target = { service: "rbox recovery phrase" as const, account: accountId, keychainPath: path.join(home, "login.keychain-db"), discoveredAt: "2030-03-17T17:46:40.000Z" };
+    await runGenesisEnrollment(api, { accountId, deviceId: "dev_offer_accept" }, { kit: false }, {
+      platform: "darwin",
+      stdinTTY: true,
+      stderrTTY: true,
+      isInteractive: () => true,
+      keychainOfferTarget: async () => target,
+      probeKeychain: async () => "missing",
+      promptConfirm: async () => true,
+      now: () => 1_900_000_000_000,
+      genesisCompletion: {
+        validatePhrase: async () => {},
+        select: async () => { throw new Error("runGenesisEnrollment owns selection") },
+        displayPhrase: async () => { throw new Error("wrong mode") },
+        saveKeychain: async () => {},
+        saveFile: async () => { throw new Error("wrong mode") },
+      },
+    });
+    expect((await readRecoveryKitRecord(accountId))?.offer?.outcome).toBe("accepted");
+  });
+
+  test("real design-180 completion RETARGETs a failed Keychain intent before the file sink", async () => {
+    const accountId = "acct_4545454545454545";
+    const api = new FakeGenesisApi([null], "ok", accountId, "dev_keychain");
+    const fallback = path.join(home, "retargeted-kit.txt");
+    const trace: string[] = [];
+    await runGenesisEnrollment(api, { accountId, deviceId: "dev_keychain" }, { kit: false }, {
+      now: () => 1_900_000_000_000,
+      isInteractive: () => true,
+      platform: "darwin",
+      stdinTTY: true,
+      stderrTTY: true,
+      keychainOfferTarget: async () => ({ service: "rbox recovery phrase", account: accountId, keychainPath: path.join(home, "login.keychain-db"), discoveredAt: "2030-03-17T17:46:40.000Z" }),
+      probeKeychain: async () => "missing",
+      promptConfirm: async () => true,
+      genesisCompletion: {
+        validatePhrase: async () => {},
+        select: async (_phrase, staged) => ({
+          version: 1,
+          accountId,
+          requestSha256: staged.requestSha256,
+          mode: "keychain",
+          keychain: { service: "rbox recovery phrase", account: accountId, keychainPath: path.join(home, "login.keychain-db") },
+          intentAt: "2030-03-17T17:46:40.000Z",
+        }),
+        displayPhrase: async () => { throw new Error("wrong mode") },
+        saveKeychain: async () => { trace.push("keychain"); throw new Error("security unavailable") },
+        retargetAfterKeychainFailure: async (_phrase, intent) => {
+          trace.push("consent");
+          return { version: 1, accountId, requestSha256: intent.requestSha256, mode: "kit-path", path: fallback, intentAt: "2030-03-17T17:46:41.000Z" };
+        },
+        saveFile: async () => {
+          trace.push("file");
+          expect(JSON.parse(await fs.readFile(genesisPaths(accountId).intent, "utf8"))).toMatchObject({ mode: "kit-path", path: fallback });
+          await expect(fs.access(genesisPaths(accountId).witness)).rejects.toThrow();
+        },
+      },
+    });
+    expect(trace).toEqual(["keychain", "consent", "file"]);
+    await expect(fs.access(genesisPaths(accountId).journal)).rejects.toThrow();
+    await expect(fs.access(genesisPaths(accountId).intent)).rejects.toThrow();
+    await expect(fs.access(genesisPaths(accountId).stagedRk)).rejects.toThrow();
+    expect((await readRecoveryKitRecord(accountId))?.offer?.outcome).toBe("accepted");
+  });
+
   test("an unreleased design-180 hold runs staged completion instead of the legacy phrase path", async () => {
     const accountId = "acct_1000000000000006";
     const requestSha256 = "b".repeat(64);
@@ -318,8 +440,6 @@ describe("runGenesisEnrollment", () => {
     const trace: string[] = [];
     const committed = { kind: "committed-this-attempt" as const, journal: { accountId, requestSha256 }, phrase: stagedPhrase };
     const seam: GenesisSeam = {
-      withAccountGenesisLock: async (_accountId, operation) => operation(),
-      resumeOrCleanupPendingGenesis: async () => {},
       readValidatedStagedRecoveryKey: async () => ({ accountId, requestSha256, originalCacheRecovery: false, rk: await phraseToRk(stagedPhrase) }),
       readAndReconcileCompletionIntent: async () => ({ state: "absent" }),
       writeCompletionIntent: async () => { trace.push("intent"); },
@@ -330,18 +450,14 @@ describe("runGenesisEnrollment", () => {
       quarantineAbandonedAttempt: async () => {},
     };
     expect(await claimRecoveryKitOffer(accountId, "genesis", "in-hand", async () => true)).toBe(true);
-    const result = await runGenesisEnrollment(new FakeGenesisApi([null]), { accountId, deviceId: "dev" }, { kit: true }, {
-      genesisSeam: seam,
-      showRecoveryPhrase: async () => { throw new Error("legacy phrase path must not run"); },
-      genesisCompletion: {
+    const result = await completeStagedGenesisRecoveryKit(accountId, committed as any, seam, {
         validatePhrase: async () => { trace.push("validate"); },
         select: async () => { trace.push("select"); return { version: 1, accountId, requestSha256, mode: "kit-path", path: "/tmp/kit", intentAt: "2026-07-22T12:00:00.000Z" } },
         displayPhrase: async () => { throw new Error("wrong mode"); },
         saveKeychain: async () => { throw new Error("wrong mode"); },
         saveFile: async () => { trace.push("file"); },
-      },
     });
-    expect(result).toBe("enrolled");
+    expect(result.mode).toBe("kit-path");
     expect(trace).toEqual(["validate", "select", "intent", "file", "receipt"]);
     expect((await readRecoveryKitRecord(accountId))?.offer?.outcome).toBe("claimed");
   });
@@ -355,9 +471,7 @@ describe("runGenesisEnrollment", () => {
     const fileIntent = { version: 1 as const, accountId, requestSha256, mode: "kit-path" as const, path: "/tmp/fallback-kit.txt", intentAt: "2026-07-22T12:00:01.000Z" };
     const trace: string[] = [];
     const seam: GenesisSeam = {
-      withAccountGenesisLock: async (_id, operation) => { trace.push("lock"); return operation() },
       pendingGenesis: async () => committed,
-      resumeOrCleanupPendingGenesis: async () => { throw new Error("unused") },
       readValidatedStagedRecoveryKey: async () => ({ accountId, requestSha256, originalCacheRecovery: false, rk: await phraseToRk(stagedPhrase) }),
       readAndReconcileCompletionIntent: async () => { trace.push("reconcile"); return { state: "absent" } },
       writeCompletionIntent: async () => { trace.push("intent") },
@@ -366,9 +480,7 @@ describe("runGenesisEnrollment", () => {
       commitDeliveredRecoveryPhrase: async () => { throw new Error("wrong receipt") },
       quarantineAbandonedAttempt: async () => { throw new Error("unused") },
     };
-    await runGenesisEnrollment(new FakeGenesisApi([null]), { accountId, deviceId: "dev" }, { kit: true }, {
-      genesisSeam: seam,
-      genesisCompletion: {
+    await completeStagedGenesisRecoveryKit(accountId, committed as any, seam, {
         validatePhrase: async () => { trace.push("validate") },
         select: async () => { trace.push("select"); return keychainIntent },
         displayPhrase: async () => { throw new Error("wrong mode") },
@@ -376,9 +488,8 @@ describe("runGenesisEnrollment", () => {
         retargetAfterKeychainFailure: async () => { trace.push("consent"); return fileIntent },
         saveFile: async () => { trace.push("file") },
         offerClaimed: async () => true,
-      },
     });
-    expect(trace).toEqual(["lock", "reconcile", "validate", "select", "intent", "keychain", "consent", "retarget", "file", "receipt"]);
+    expect(trace).toEqual(["reconcile", "validate", "select", "intent", "keychain", "consent", "retarget", "file", "receipt"]);
   });
 });
 
@@ -824,6 +935,80 @@ describe("recoverCmd production boundary", () => {
     };
   }
 
+  test("real design-180 recovery lock flow restores from a selected Keychain phrase", async () => {
+    const current = await bootstrapAccount(accountId, "dev_current", 1_900_000_000_000);
+    await saveDevice(current.secrets);
+    await publishGenesisEnrollmentWitness(accountId);
+    const dto: AccountKeysDTO = {
+      recoveryWrap: JSON.stringify(current.upload.recoveryWrap),
+      recoveryWrapId: current.upload.recoveryWrapId,
+      rosters: [JSON.stringify(current.upload.genesisRoster)],
+      keyStates: [JSON.stringify(current.upload.genesisKeyState)],
+      devices: [{
+        deviceId: "dev_current",
+        sigPubkey: current.upload.device.sigPubKey,
+        encPubkey: current.upload.device.encPubKey,
+        mkWrap: JSON.stringify(current.upload.device.mkWrap),
+      }],
+    };
+    const methods: string[] = [];
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      methods.push(`${init?.method ?? "GET"} ${String(input)}`);
+      if (String(input).endsWith("/v1/keys/account")) return new Response(JSON.stringify(dto));
+      if (String(input).endsWith("/v1/keys/admit")) return new Response("{}", { status: 200 });
+      throw new Error(`unexpected fetch: ${String(input)}`);
+    }) as typeof fetch;
+    await recoverCmd({ kit: false }, {
+      loadCredentials: async () => loaded,
+      keychainPhrase: async () => ({ phrase: current.recoveryPhrase, artifact }),
+      offerRecoveryKit: async () => {},
+      now: () => 1_900_000_000_001,
+    });
+    expect(methods.map((entry) => entry.split(" ")[0])).toEqual(["GET", "POST"]);
+    const recovered = await loadDevice(accountId);
+    expect(recovered && "secrets" in recovered ? recovered.secrets.deviceId : "").toStartWith("rec_");
+    await expect(fs.access(genesisPaths(accountId).enrolledWitness)).rejects.toThrow();
+    expect((await readRecoveryKitRecord(accountId))?.keychain).toMatchObject({ account: accountId, keychainPath: artifact.keychainPath });
+  });
+
+  test("the production branch retries the real lock-holding helper only after Keychain pre-admission failure", async () => {
+    const seen: string[] = [];
+    let passes = 0;
+    let offered = "";
+    await recoverCmd({ kit: false }, {
+      loadCredentials: async () => loaded,
+      keychainPhrase: async () => ({ phrase: keychainPhrase, artifact }),
+      manualPhrase: async () => manualPhrase,
+      enrollWithPhraseInput: async (readPhrase) => {
+        passes++;
+        const phrase = await readPhrase();
+        seen.push(phrase);
+        if (passes === 1) throw new RecoveryPreAdmissionError(new Error("current wrap changed"));
+        return { accountId, deviceId: "rec_manual", phrase };
+      },
+      mergeDiscovered: async () => { throw new Error("manual fallback must not merge Keychain metadata") },
+      offerRecoveryKit: async (phrase) => { offered = phrase },
+    });
+    expect({ passes, seen, offered }).toEqual({ passes: 2, seen: [keychainPhrase, manualPhrase], offered: manualPhrase });
+  });
+
+  test("the production branch never retries an ordinary post-persistence failure", async () => {
+    let passes = 0;
+    let manuals = 0;
+    await expect(recoverCmd({ kit: false }, {
+      loadCredentials: async () => loaded,
+      keychainPhrase: async () => ({ phrase: keychainPhrase, artifact }),
+      manualPhrase: async () => { manuals++; return manualPhrase },
+      enrollWithPhraseInput: async (readPhrase) => {
+        passes++;
+        await readPhrase();
+        throw new Error("admission failed after persistence");
+      },
+      offerRecoveryKit: async () => {},
+    })).rejects.toThrow("admission failed after persistence");
+    expect({ passes, manuals }).toEqual({ passes: 1, manuals: 0 });
+  });
+
   test("holds the account lock across pending cleanup, selection, persistence, and admission", async () => {
     const trace: string[] = [];
     const pending = { kind: "cleanup-resume" as const, journal: { accountId, requestSha256: "a".repeat(64) } };
@@ -1018,5 +1203,39 @@ describe("key save phrase sources", () => {
       savePhrase: async () => { saves++; },
     })).rejects.toThrow(/current envelope mismatch/);
     expect(saves).toBe(0);
+  });
+
+  test("production key save and re-save use the real Keychain and record modules", async () => {
+    const keychainPath = path.join(home, "login.keychain-db");
+    let adds = 0;
+    const keychainSeams = {
+      platform: "darwin" as const,
+      securityBinExists: async () => true,
+      realpath: async (value: string) => value,
+      runSecurity: async (args: readonly string[], stdin: Uint8Array | undefined) => {
+        if (args[0] === "login-keychain") return { outcome: "exit" as const, code: 0, stdout: Buffer.from(`"${keychainPath}"\n`), stderr: new Uint8Array() };
+        if (args[0] === "-i") {
+          adds++;
+          expect(Buffer.from(stdin!).toString("utf8")).toContain("add-generic-password -U");
+          return { outcome: "exit" as const, code: 0, stdout: new Uint8Array(), stderr: new Uint8Array() };
+        }
+        expect(args[0]).toBe("find-generic-password");
+        return { outcome: "exit" as const, code: 0, stdout: Buffer.from(`${phrase}\n`), stderr: new Uint8Array() };
+      },
+    };
+    const deps = {
+      loadCredentials: loaded,
+      loadRecoveryKey: async () => phraseToRk(phrase),
+      validatePhrase: async () => {},
+      seams: keychainSeams,
+    };
+    await keySave({ kit: true }, deps);
+    const first = await readRecoveryKitRecord(accountId);
+    expect(first?.keychain).toMatchObject({ account: accountId, keychainPath });
+    await keySave({ kit: true }, deps);
+    const second = await readRecoveryKitRecord(accountId);
+    expect(adds).toBe(2);
+    expect(second?.keychain).toMatchObject({ service: "rbox recovery phrase", account: accountId, keychainPath });
+    expect(second?.plaintextArtifacts).toEqual(first?.plaintextArtifacts);
   });
 });

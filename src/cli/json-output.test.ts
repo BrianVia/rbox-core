@@ -8,7 +8,7 @@ import { saveConfig, saveStateUnsafeLegacyOrTest, syncStreamId, type WorkspaceCo
 import { accountStatus } from "./account-cmd.js";
 import { flushAccountProfileWrites } from "./account-profile.js";
 import { listDevices, keyStatus } from "./auth-cmd.js";
-import { installGenesisSeamForTests, type GenesisSeam } from "./genesis-seam.js";
+import { publishPrepublishMarker } from "./genesis-durable.js";
 import { daemonRuntimeDir } from "./daemon-control.js";
 import type { DaemonActivity } from "./activity.js";
 import { statusCmd, statusCmdWithDeps, type StatusCmdDeps } from "./status-cmd.js";
@@ -471,25 +471,18 @@ test("key status --json projects an unreleased genesis hold without mutating an 
   process.env.RBOX_DEVICE_ID = "dev_a";
   process.env.RBOX_ACCOUNT_ID = "acct_aaaaaaaaaaaaaaaa";
   process.env.RBOX_HOME = tmp;
-  const unused = async (): Promise<never> => { throw new Error("unused"); };
-  const seam: GenesisSeam = {
-    withAccountGenesisLock: async (_accountId, operation) => operation(),
-    resumeOrCleanupPendingGenesis: unused,
-    readValidatedStagedRecoveryKey: async () => undefined,
-    readAndReconcileCompletionIntent: async () => ({ state: "absent" }),
-    writeCompletionIntent: unused,
-    retargetKeychainIntent: unused,
-    pendingGenesis: async () => ({ kind: "committed-this-attempt", journal: { accountId: "acct_aaaaaaaaaaaaaaaa", requestSha256: "a".repeat(64) }, phrase: "unused" }),
-    commitVerifiedRecoveryKitArtifact: unused,
-    commitDeliveredRecoveryPhrase: unused,
-    quarantineAbandonedAttempt: unused,
-  };
-  const restore = installGenesisSeamForTests(seam);
-  try {
-    const dto = JSON.parse(await captureStdout(() => keyStatus({ json: true })));
-    expect(dto.recoveryKit).toEqual({ version: 2, recordState: "missing", plaintextArtifacts: [], pendingGenesis: true });
-    expect(await fs.exists(path.join(tmp, ".rbox", "e2ee", "acct_aaaaaaaaaaaaaaaa", "kit.json"))).toBe(false);
-  } finally { restore() }
+  await publishPrepublishMarker({
+    version: 1,
+    accountId: "acct_aaaaaaaaaaaaaaaa",
+    deviceId: "dev_a",
+    repairId: null,
+    startedAt: "2026-07-04T12:00:00.000Z",
+    phase: "prepublish",
+  });
+
+  const dto = JSON.parse(await captureStdout(() => keyStatus({ json: true })));
+  expect(dto.recoveryKit).toEqual({ version: 2, recordState: "missing", plaintextArtifacts: [], pendingGenesis: true });
+  expect(await fs.exists(path.join(tmp, ".rbox", "e2ee", "acct_aaaaaaaaaaaaaaaa", "kit.json"))).toBe(false);
 });
 
 test("json error mode emits {error} to stderr", () => {
