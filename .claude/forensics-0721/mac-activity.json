@@ -1,0 +1,45 @@
+{
+  "at": "2026-07-21T23:44:02.301Z",
+  "ws": {
+    "connected": true,
+    "at": "2026-07-21T23:44:04.097Z",
+    "caughtUp": true,
+    "bootId": "fe2b10dd2cc365e0311b382a77c9a441",
+    "pid": 53809,
+    "lastBroadcastSequence": 415
+  },
+  "local": {
+    "at": "2026-07-21T23:44:04.097Z",
+    "stream": "https://api.rbox.to::ws_e4abbfc6e42e432db6f33ae3ad4a2010::root",
+    "baseSequence": 412,
+    "trackedFiles": 108283,
+    "added": 0,
+    "changed": 0,
+    "deleted": 4331,
+    "settled": false,
+    "sourceVersion": 1
+  },
+  "active": {
+    "at": "2026-07-21T23:43:40.648Z",
+    "phase": "scan",
+    "done": 105500,
+    "total": 0
+  },
+  "lastPush": {
+    "at": "2026-07-21T21:36:36.452Z",
+    "files": 112614,
+    "sequence": 204
+  },
+  "lastPull": {
+    "at": "2026-07-21T23:43:09.112Z",
+    "writes": 1,
+    "deletes": 0,
+    "conflicts": 0
+  },
+  "halt": {
+    "at": "2026-07-21T23:20:38.877Z",
+    "reason": "push: too many conflicts, remote is moving faster than we can reconcile",
+    "count": 13,
+    "op": "push"
+  }
+}
