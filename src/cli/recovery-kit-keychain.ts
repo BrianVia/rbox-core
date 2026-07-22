@@ -310,9 +310,10 @@ export async function probeKeychainKit(record: KeychainArtifact, seams: Keychain
     if (await seams.realpath(record.keychainPath) !== record.keychainPath) return "unavailable";
     result = await seams.runSecurity(identityArgs(record, false), undefined, { timeoutMs: 5_000, stdoutBytes: STDIO_LIMIT, stderrBytes: STDIO_LIMIT });
     if (result.outcome !== "exit") return "unavailable";
-    if (result.code === 0) {
-      return parseExactlyOneOutputLine(result.stdout) ? "present" : "unavailable";
-    }
+    // Without -w, exit 0 prints a multi-line attribute dump (~20 lines on real
+    // macOS, field 2026-07-22) with no secret material — the exit code is the
+    // presence verdict. The exactly-one-line contract applies only to -w reads.
+    if (result.code === 0) return "present";
     return result.code === 44 ? "missing" : "unavailable";
   } catch {
     return "unavailable";
