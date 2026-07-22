@@ -1,6 +1,17 @@
 # 178 — transient hiccups heal themselves
 
-Status: DRAFT v2 — synthesis of the 2026-07-21 incident's five forensic
+Status: DRAFT v3 — r2 certified D.3 (pure composer dry-run implementable;
+order-insensitive semantic equality; sentinel sourceSeq documented) and
+returned four substantive + two moderate gaps, all folded in v3: one pure
+sanitizer applied at EVERY persistence site + config-lane baseline so
+sanitation never authors a corrective echo (r2-1); a first-class composite
+`recoveryProbe` scheduler operation with defined K and budget semantics
+(r2-2); daemon-owned mode witness in the ambient status file, boot-bound,
+with legacy-unknown handling and operator-driven restart on mismatch
+(r2-3); stop carries the prior mode forward (r2-4); stale-unattributed is a
+durable CATEGORICAL reason with display-time recomputed detail (r2-5);
+unknown-reason byte preservation + shell/telemetry vocabulary updates
+(r2-6). Previously v2 — synthesis of the 2026-07-21 incident's five forensic
 reports (archived with evidence in `.claude/forensics-0721/`; cite them as
 R1-timeline, R2-locks, R3-halt, R4-deferrals, R5-captureloop). r1
 (gpt-5.6-sol, high) verdict CHANGES-REQUIRED; all eight findings accepted
@@ -79,16 +90,26 @@ have been the software's.
    an operator to clear the FLAG (only ever the cause).
 5. Status copy: "retrying after conflict; next probe in Ns" while armed;
    "halted" is reserved for a currently-reproduced safety refusal.
-6. **Fairness + bounded probe service (r1-4, restoring R3 §4.5; fixes R1
-   decision 8):** an armed recovery probe gets BOUNDED service — after K
-   consecutive scheduler passes where a due probe loses to pulls, the probe
-   wins the next slot (the strict deepScan>fullScan>pull>push order at
-   daemon.ts:1124 otherwise starves it indefinitely, tonight's exact
-   pattern). Episode-level contention backoff escalates across exhausted
-   push episodes and resets only on success/no-op; the unconditional
-   post-pull push request is suppressed when reconciliation proves no
-   publishable local delta; server-side randomized Retry-After on 409 is
-   the durable fairness follow-up (own workstream, apps/api).
+6. **Fairness + bounded probe service (r1-4, restoring R3 §4.5; mechanism
+   per r2-2; fixes R1 decision 8):** recovery is a FIRST-CLASS composite
+   scheduler operation, `recoveryProbe` = pull → reconcile → conditional
+   push, distinct from the four ordinary wants (policy.ts:78) — never
+   represented as a bare restored `want.push` that re-enters at the bottom
+   of the strict priority order. Service bound: once due, after **K = 8
+   actually DEQUEUED non-probe operations** (scans count — r2-2: deep/full
+   scans self-replenish and would defeat a pulls-only count), the probe
+   outranks all ambient operations for one slot. Mutex-contention loops
+   that dequeue nothing do not consume the budget; multiple due probes
+   coalesce into one composite run; `nextProbeAt` persists in the episode,
+   the K counter is in-memory (a restart re-arms the timer, not the
+   starvation count). Episode-level contention backoff escalates across
+   exhausted push episodes and resets only on success/no-op; the
+   unconditional post-pull push request is suppressed when reconciliation
+   proves no publishable local delta; server-side randomized Retry-After on
+   409 is the durable fairness follow-up (own workstream, apps/api).
+   Deterministic scheduler tests drive the pump loop directly (the
+   continuous-peer rig case is corroboration, not the proof — wants
+   coalesce into booleans and are timing-sensitive).
 7. **Pull-only discipline (r1-6):** push recovery (want restoration and
    probes) is SUSPENDED in pull-only mode and rearms only on an explicit
    read-write transition; a durable push-halt episode surviving a restart
@@ -118,8 +139,17 @@ AND C's reconciler** (the deferral reason union in config.ts:237 grows a
 | `quiescent` | clear the exact stale lane |
 | `recoverable-rbox` | fenced recovery (A), then re-probe and clear |
 | `live` | retain — genuine busy |
-| `stale-unattributed` | retain lane, upgrade reason to the durable diagnosis (lock count/sample/oldest age + repair command), and KEEP re-probing on the hygiene cadence so external resolution clears it — a latched diagnosis is the same disease as a latched git-busy |
+| `stale-unattributed` | retain lane, upgrade reason to the durable CATEGORICAL `stale-unattributed` (r2-5: `GitDeferral` carries no evidence payload and doesn't grow one — lock count/sample/oldest age and the repair command are RECOMPUTED at display time by the same cheap probe status already runs), and KEEP re-probing on the hygiene cadence so external resolution clears it — a latched diagnosis is the same disease as a latched git-busy |
 | `indeterminate` | retain byte-for-byte, escalate if chronic |
+
+**Vocabulary + compatibility (r2-6):** the reconciler selects ONLY exact
+`git-busy` and `stale-unattributed` records and preserves every
+unknown/future reason byte-for-byte (state loading is an unchecked cast,
+config.ts:470 — forward records must round-trip). The new reason is added
+to every closed vocabulary: shell reader (shell-init.ts:188), telemetry
+contract's exhaustive reason list (telemetry/contract.ts:120), and
+status-view's display mapping (unknown reasons stay opaque/non-actionable
+per the existing convention).
 
 ### D. Pending state machine correctness (R5 — the loop's actual cause)
 
@@ -131,16 +161,20 @@ AND C's reconciler** (the deferral reason union in config.ts:237 grows a
    (r1-3: `syncGit:false` legitimately deletes planner entries at
    plan.ts:285, and a baseless removal must not masquerade as unchanged);
    regression pins the distinction.
-2. **Sanitized vs wire pending (r1-2):** apply strips invalid incoming
-   config before persisting P (apply.ts:516), so persisted P is not always
-   the byte-exact wire predecessor. Ruling: comparison uses the SANITIZED
-   form on both sides — the sanitizer is deterministic, so re-deriving the
-   comparator's expected-previous through the same sanitation makes exact
-   carries compare unchanged, and corrective sanitation of the remote's
-   invalid field deliberately waits for the next genuine local change
-   (publishing solely to strip an invalid field is echo-class noise, the
-   disease this workstream cures). Pin the sanitizer-determinism assumption
-   with a test.
+2. **Sanitized vs wire pending (r1-2, tightened r2-1):** the sanitizer
+   becomes ONE pure, input-immutable helper applied at EVERY P/BASE
+   persistence site — including the outer collision and exception paths
+   that today persist the raw wire section (apply.ts:1607/:1615/:1629) —
+   so "persisted state is sanitized" is an invariant, not a tendency. The
+   comparator compares sanitized-to-sanitized and exact carries are
+   unchanged. The corrective-echo hole r2-1 found is closed in the config
+   lane itself: `shouldPublishGitConfig` (config-lane.ts:23) additionally
+   consults the config-lane baseline (`cfgSynced`) — an unchanged local
+   config over a sanitized-away incoming one is NOT republished; corrective
+   sanitation of the remote's invalid field waits for the next genuine
+   local config change. Tests: sanitizer determinism + purity; collision
+   and exception persistence paths; unchanged-nonempty-local-config over
+   invalid-incoming publishes nothing.
 3. **Supersession admission proves BASE convergence (r1-1):** "terminal
    disposition" is insufficient — the composer deliberately preserves
    BASE-only branches (base-composer.ts:335/:494), so a candidate omitting
@@ -164,12 +198,27 @@ AND C's reconciler** (the deferral reason union in config.ts:237 grows a
 
 Tri-state start intent: ABSENT (= preserve the persisted mode — today's
 `main-dispatch.ts:386` collapses absence to `false`, the exact trap),
-`--pull-only`, and a new explicit `--read-write` inverse. Desired state
-persists ONLY after the live daemon's actual mode matches the request
-(daemon-control.ts:330 currently returns `already-running` without a mode
+`--pull-only`, and a new explicit `--read-write` inverse.
+
+**Mode witness (r2-3):** the daemon writes its ACTUAL running mode into the
+ambient status file each persistence (`mode: "pull-only" | "read-write"` —
+same additive pattern as the `daemonVersion` field shipped in v1.7.19),
+bound to the existing boot-id record. "Actual live mode matches" is read
+from that witness, never inferred from the spawn request. Legacy daemons
+without the field → mode UNKNOWN: bare start treats the persisted desired
+mode as the intent but never silently rewrites it; explicit-flag start
+against an unknown-mode live daemon refuses with the restart instruction.
+Desired state persists ONLY after the witness matches the request
+(daemon-control.ts:330 today returns `already-running` without any mode
 comparison and the caller records the requested mode anyway — a lie).
-`already-running` with a DIFFERENT mode → refuse with "restart required:
-rbox stop && rbox start --<mode>", never silently record.
+`already-running` with a DIFFERENT witnessed mode → refuse with "restart
+required: rbox stop && rbox start --<mode>" — the restart is
+OPERATOR-DRIVEN until workstream A's graceful stop ships; no automatic
+restart is promised anywhere in E.
+
+**Stop preserves mode (r2-4):** `stopDaemonAndRecordDesired`
+(autostart-cmd.ts:196) carries the prior valid persisted mode forward into
+the stopped record; absent/legacy mode is interpreted as read-write.
 
 Ship split (r1-5): the stopped-daemon resume half (bare start resumes the
 persisted mode) is independent and ships early with D. The LIVE-transition
