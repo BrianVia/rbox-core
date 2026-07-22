@@ -5,7 +5,22 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
-_Last updated: 2026-07-22 (~21:00 UTC — **THE 180/179 PROGRAM IS COMPLETE ON
+_Last updated: 2026-07-22 (~22:15 UTC — **v1.7.23 "your recovery key gets a
+home" RELEASED + FLEET-LIVE**): the 180 client + 179 Keychain feature shipped
+(tag f6e945e9, release run success, api.rbox.to = 1.7.23). Founder waived the
+dev-build Keychain pre-validation (his call — testing with the released CLI on
+his real account; NOTE his Mac has no cached rk.key, so `rbox key save` will
+ask for his real phrase ONCE — same for Max). Fleet: Mac RW 1.7.23 (daemon
+resumed via the generation fence after upgrade's stop — benign), FM
+pull-only 1.7.23 (witness-verified), desktop binary 1.7.23. Desktop
+daemons-dir test litter RECURRED (fresh rbox-daemon-activity-* from today's
+test runs — the filed papercut reproduces; fix the test writing to real
+RBOX_HOME). AWAITING: founder's real-Mac `rbox key save` result — the first
+real-security(1) execution ever; if it misbehaves, the flow fails closed
+(phrase validation precedes any write). Then: tell Max. Next work: 178 t3,
+design 182 loop, bar papercut._
+
+_Previous: 2026-07-22 (~21:00 UTC — **THE 180/179 PROGRAM IS COMPLETE ON
 MAIN**): PR #397 (design 179 recovery kit + macOS Keychain, v18) MERGED at
 09070ed9 after: security review ALIGNED (zero substantive findings — stdin-only
 phrase transport, unwrap-validated re-save, fallback-never-harder), phase-1
