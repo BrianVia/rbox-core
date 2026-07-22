@@ -151,6 +151,10 @@ export interface GitBusyRetryClock {
 }
 export interface RecoveryProbeClock extends GitBusyRetryClock {}
 export interface CursorClock extends GitBusyRetryClock {}
+export interface SafetyCadenceClock {
+  setTimeout(fn: () => void | Promise<void>, ms: number): unknown;
+  clearTimeout(handle: unknown): void;
+}
 class RecoveryProbePreflightError extends Error {
   constructor(readonly cause: unknown) {
     super(cause instanceof Error ? cause.message : String(cause));
@@ -393,7 +397,7 @@ export class RboxDaemon {
   private wsGeneration = 0;
   private pendingCatchUpGeneration?: number;
   private lastWsKeepaliveWrite = 0;
-  private safetyTimer?: ReturnType<typeof setTimeout>;
+  private safetyTimer?: unknown;
   private deepTimer?: ReturnType<typeof setInterval>;
   private updateCheckTimer?: ReturnType<typeof setInterval>;
   private telemetryFlushTimer?: ReturnType<typeof setInterval>;
@@ -479,6 +483,7 @@ export class RboxDaemon {
   private readonly now: () => number;
   private readonly recoveryRandom: () => number;
   private readonly recoveryClock: RecoveryProbeClock;
+  private readonly safetyClock: SafetyCadenceClock;
   private readonly deferralHygieneCursor: DeferralHygieneCursor = {};
   private deferralHygieneRunning = false;
   private readonly deferralHygieneBudgetMs: number;
@@ -517,6 +522,7 @@ export class RboxDaemon {
       gitBusyRetryClock?: GitBusyRetryClock;
       recoveryRandom?: () => number;
       recoveryClock?: RecoveryProbeClock;
+      safetyClock?: SafetyCadenceClock;
       cursorClock?: CursorClock;
       cursorRandom?: () => number;
       deferralHygieneBudgetMs?: number;
@@ -547,6 +553,10 @@ export class RboxDaemon {
         return handle;
       },
       clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+    };
+    this.safetyClock = opts.safetyClock ?? {
+      setTimeout: (fn, ms) => globalThis.setTimeout(fn, ms),
+      clearTimeout: (handle) => globalThis.clearTimeout(handle as ReturnType<typeof setTimeout>),
     };
     this.cursorClock = opts.cursorClock ?? {
       setTimeout: (fn, ms) => {
@@ -812,7 +822,7 @@ export class RboxDaemon {
   private pinSafetyFloor(): void {
     if (this.safetyDelay > SAFETY_SYNC_MS && !this.stopped) {
       this.safetyDelay = SAFETY_SYNC_MS;
-      if (this.safetyTimer) clearTimeout(this.safetyTimer);
+      if (this.safetyTimer !== undefined) this.safetyClock.clearTimeout(this.safetyTimer);
       this.scheduleSafetyScan();
     }
   }
@@ -850,9 +860,9 @@ export class RboxDaemon {
    * deep scan stays the unconditional floor beneath both.
    */
   private scheduleSafetyScan(): void {
-    this.safetyTimer = setTimeout(() => {
+    this.safetyTimer = this.safetyClock.setTimeout(async () => {
       this.safetyTimer = undefined;
-      void this.runSafetyCadenceTick();
+      await this.runSafetyCadenceTick();
     }, jitter(this.safetyDelay));
   }
 
@@ -892,7 +902,7 @@ export class RboxDaemon {
     this.invalidateCursorSchedule();
     this.abortMutexBackoff();
     if (firstStop) await this.writePausedAmbientStatusImmediate().catch(() => {});
-    if (this.safetyTimer) clearTimeout(this.safetyTimer);
+    if (this.safetyTimer !== undefined) this.safetyClock.clearTimeout(this.safetyTimer);
     if (this.recoveryTimer) this.recoveryClock.clearTimeout(this.recoveryTimer);
     if (this.deepTimer) clearInterval(this.deepTimer);
     if (this.resetRetryTimer) clearTimeout(this.resetRetryTimer);
