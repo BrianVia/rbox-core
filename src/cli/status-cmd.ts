@@ -48,6 +48,7 @@ import { readLockingHealth, type LockingHealth } from "./sync-mutex.js";
 import { readAmbientDaemonStatusRecord, validDaemonVersion } from "./daemon/ambient-status.js";
 import type { DaemonMode } from "./daemon/ambient-status.js";
 import { serializeGitDeferralLanes } from "./sync-git/git-deferral-json.js";
+import { deferralHygieneDetailKey, reconcileGitDeferrals, type GitBusyDisplayDetail } from "./sync-git/deferral-hygiene.js";
 import { inspectResetJournalSafety } from "./reset-halt-inspection.js";
 import { readResetHaltHealth } from "./reset-health.js";
 import { promotePendingModeIntent } from "./autostart-cmd.js";
@@ -111,6 +112,7 @@ export interface StatusCmdDeps {
   readAmbientDaemonStatusRecord?: typeof readAmbientDaemonStatusRecord;
   readBriefIdentity?: (accountId: string) => Promise<BriefIdentitySource | undefined>;
   promotePendingModeIntent?: typeof promotePendingModeIntent;
+  reconcileGitDeferrals?: typeof reconcileGitDeferrals;
 }
 
 const defaultStatusDeps: StatusCmdDeps = {
@@ -126,6 +128,7 @@ const defaultStatusDeps: StatusCmdDeps = {
   checkoutTransactionCapability,
   readAmbientDaemonStatusRecord,
   promotePendingModeIntent,
+  reconcileGitDeferrals,
 };
 
 const LOCAL_TRUST_MS = 60_000;
@@ -313,6 +316,12 @@ function runningDaemonLabel(version?: string, mode?: DaemonMode): string {
   return details.length === 0 ? "running" : `running (${details.join(", ")})`;
 }
 
+function statusStaleLockDetail(root: string, detail: GitBusyDisplayDetail | undefined): GitBusyDisplayDetail | undefined {
+  if (!detail) return undefined;
+  const relative = path.relative(root, detail.samplePath);
+  return { ...detail, samplePath: relative && !relative.startsWith("..") ? relative : path.basename(detail.samplePath) };
+}
+
 export async function statusCmd(root: string, opts: StatusCmdOptions = {}): Promise<StatusCmdResult> {
   assertPresentationFlags(opts);
   const deps = opts.now === undefined
@@ -408,6 +417,13 @@ export async function statusCmdWithDeps(
 
   const accountSummaryP = opts.verbose ? fetchAccountSummary(3500, loadedCredentials) : Promise.resolve(null);
   let state = await loadState(root, syncStreamId(cfg));
+  let hygieneDetails = new Map<string, GitBusyDisplayDetail>();
+  const runDeferralHygiene = async (): Promise<void> => {
+    const result = await (deps.reconcileGitDeferrals ?? reconcileGitDeferrals)(root, cfg, state);
+    state = result.state;
+    hygieneDetails = result.displayDetails;
+  };
+  await runDeferralHygiene();
 
   const activityP = daemonStale ? Promise.resolve(undefined) : loadActivity(root);
   const trashP = trashStats(root).catch(() => undefined);
@@ -430,6 +446,7 @@ export async function statusCmdWithDeps(
   let mustComputeLocal = false;
   if (localBaseSequenceMismatched(activity, state)) {
     state = await loadState(root, syncStreamId(cfg));
+    await runDeferralHygiene();
     attributed = attributeActivity(state);
     activity = attributed.activity;
     mustComputeLocal = true;
@@ -725,6 +742,7 @@ export async function statusCmdWithDeps(
           reason: deferral.displayReason,
           canResolve: deferral.canResolve,
           canKeepMine: deferral.canKeepMine,
+          staleLockDetail: statusStaleLockDetail(root, hygieneDetails.get(deferralHygieneDetailKey(deferral.repo, deferral.displayLane))),
         })}`);
       }
     }
@@ -831,6 +849,7 @@ export async function statusCmdWithDeps(
         reason: deferral.displayReason,
         canResolve: deferral.canResolve,
         canKeepMine: deferral.canKeepMine,
+        staleLockDetail: statusStaleLockDetail(root, hygieneDetails.get(deferralHygieneDetailKey(deferral.repo, deferral.displayLane))),
       })}`);
     }
   }

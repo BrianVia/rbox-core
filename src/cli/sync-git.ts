@@ -31,6 +31,15 @@ export {
 } from "./sync-git/apply.js";
 export { conflictSnapshotStatus, gitDivergenceStatus, gitDivergenceCount, type GitDivergenceStatus, type GitDivergenceStatusOptions } from "./sync-git/status.js";
 export {
+  DEFERRAL_HYGIENE_ACTION,
+  GitBusyClassifier,
+  deferralHygieneDetailKey,
+  reconcileGitDeferrals,
+  type DeferralHygieneResult,
+  type GitBusyClassification,
+  type GitBusyDisplayDetail,
+} from "./sync-git/deferral-hygiene.js";
+export {
   CONFLICT_REF_PREFIX,
   CONFLICT_REF_PRUNE_LIMIT,
   CONFLICT_REF_RETENTION_MS,

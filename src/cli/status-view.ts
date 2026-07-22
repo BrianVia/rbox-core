@@ -287,6 +287,7 @@ const DEFERRAL_REASON_PRESENTATION: Record<GitDeferralReason, GitDeferralReasonP
   "local-stash": { label: "local stash", text: "The local stash changed here.", repair: "Stop stash mutation, then let normal sync retry.", transient: true },
   conflict: { label: "conflict", text: "Incoming and local Git state conflict.", repair: "Repair the conflicting repository state, then let sync retry.", transient: false },
   "git-busy": { label: "git busy", text: "Another Git process is using this repository.", repair: "Let the other Git process finish, then let sync retry.", transient: false },
+  "stale-unattributed": { label: "stale Git locks", text: "A stable lock cohort remains without a known live owner.", repair: "Confirm no Git process owns the reported locks, then remove only the stale lock files and let sync retry.", transient: false },
   "worktree-ownership": { label: "worktree ownership", text: "Another worktree owns a required Git ref.", repair: "Repair the worktree ownership conflict, then let sync retry.", transient: false },
   "ignored-target": { label: "ignored target", text: "The incoming checkout targets an ignored repository.", repair: "Correct the ignore rule or repository target, then let sync retry.", transient: false },
   unreadable: { label: "unreadable repository", text: "Git metadata could not be read completely.", repair: "Restore repository readability and permissions, then let sync retry.", transient: false },
@@ -452,9 +453,20 @@ export function renderGitDeferralCompanion(input: {
   reason: string;
   canResolve: boolean;
   canKeepMine: boolean;
+  staleLockDetail?: { lockCount: number; oldestAgeMs: number; samplePath: string };
 }): string {
   const presentation = gitDeferralReasonPresentation(input.reason);
   const reassurance = `Your repository is healthy; only rbox's bookkeeping is paused (${presentation.label}).`;
+  if (input.reason === "stale-unattributed" && input.staleLockDetail) {
+    const detail = input.staleLockDetail;
+    const count = `${detail.lockCount} stable lock${detail.lockCount === 1 ? "" : "s"}`;
+    const oldestSeconds = Math.max(0, Math.floor(detail.oldestAgeMs / 1000));
+    const oldest = oldestSeconds < 60 ? `${oldestSeconds}s` : oldestSeconds < 3600
+      ? `${Math.floor(oldestSeconds / 60)}m`
+      : `${Math.floor(oldestSeconds / 3600)}h`;
+    return `rbox found ${count} without a known live owner; oldest ${oldest} (for example ${truncateDetail(detail.samplePath)}). ` +
+      "Confirm no Git process owns the reported locks, then remove only the verified stale lock files and let sync retry.";
+  }
   if (!input.canResolve) return `${reassurance} ${presentation.repair}`;
   if (!input.canKeepMine) {
     return `${reassurance} Nothing is waiting to publish with \`keep-mine\`; ` +

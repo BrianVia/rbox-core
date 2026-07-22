@@ -2,7 +2,9 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { saveConfig, saveStateUnsafeLegacyOrTest, syncStreamId, type WorkspaceConfig } from "./config.js";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { loadState, repoRecordsForState, saveConfig, saveStateUnsafeLegacyOrTest, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { populateStatusPath, type PopulateStatusV1 } from "./populate-status.js";
 import { statusCmdWithDeps, type StatusCmdDeps } from "./status-cmd.js";
 import { lockingHealthPath } from "./sync-mutex.js";
@@ -13,6 +15,7 @@ import { RBOX_VERSION } from "./version.js";
 
 const OLD_ENV = { ...process.env };
 const NOW = Date.parse("2026-07-08T12:00:00Z");
+const exec = promisify(execFile);
 
 let root = "";
 let runtime = "";
@@ -200,6 +203,31 @@ async function captureDispatch(args: string[]): Promise<string> {
     process.stdout.write = oldWrite;
   }
 }
+
+test("design 178 C: computed status clears an idle capture-busy lane without a push", async () => {
+  const repo = path.join(root, "repo");
+  await fs.mkdir(repo);
+  await exec("git", ["-C", repo, "init", "-q"]);
+  const lock = path.join(repo, ".git", "index.lock");
+  await fs.writeFile(lock, "");
+  const at = new Date(NOW - 60_000).toISOString();
+  await saveStateUnsafeLegacyOrTest(root, {
+    stream: syncStreamId(cfg),
+    lastSyncedSequence: 7,
+    lastSyncedManifest: { generatedAt: at, files: [] },
+    repoRecords: {
+      repo: {
+        repoGen: 1,
+        sourceSeq: 7,
+        deferrals: { capture: { lane: "capture", reason: "git-busy", deferredSince: at, reasonSince: at, lastSeen: at } },
+      },
+    },
+  });
+  await fs.rm(lock);
+  const output = await captureStatusWithDeps({ git: true }, cleanScanDeps());
+  expect(output).not.toContain("git deferred");
+  expect(repoRecordsForState(await loadState(root, syncStreamId(cfg))).repo?.deferrals).toBeUndefined();
+});
 
 test("reset-journal halt renders text and JSON without dereferencing state", async () => {
   const journal = path.join(root, ".rbox", "state", "reset-v1.json");

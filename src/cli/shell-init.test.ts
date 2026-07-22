@@ -164,15 +164,17 @@ test("shell.deferrals routes on component boundaries and chooses the deepest enc
   const now = Math.floor(Date.now() / 1000);
   const ws = makeWorkspace(
     `v1 ${now} ok - 80 - - ws\n`,
-    "v1\nrepo\tlocal-edits\t14d\t0\nrepo%2Fnested\tlocal-commits\t30m\t1\n",
+    "v1\nrepo\tlocal-edits\t14d\t0\nrepo%2Fnested\tlocal-commits\t30m\t1\nstale\tstale-unattributed\t1h\t0\n",
   );
   mkdirSync(join(ws, "repo", "nested", "src"), { recursive: true });
+  mkdirSync(join(ws, "stale"), { recursive: true });
   mkdirSync(join(ws, "repository"), { recursive: true });
   const nested = driveHooks(writeScript(), ws, join(ws, "repo", "nested", "src"));
   expect(nested.glyph).toContain("⚠git:30m+files");
   expect(nested.banner).toContain("git deferred 30m · working files changed");
   expect(nested.banner).not.toContain("in sync");
   expect(driveHooks(writeScript(), ws, join(ws, "repo")).glyph).toContain("⚠git:14d");
+  expect(driveHooks(writeScript(), ws, join(ws, "stale")).glyph).toContain("⚠git:1h");
   expect(driveHooks(writeScript(), ws, join(ws, "repository")).glyph).toContain("✓");
 });
 

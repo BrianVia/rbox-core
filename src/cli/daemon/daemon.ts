@@ -119,6 +119,7 @@ import { inspectResetJournalSafety } from "../reset-halt-inspection.js";
 import { clearResetHaltHealth, readResetHaltHealth, writeResetHaltHealth } from "../reset-health.js";
 import { RESET_RECOVERY_RETRY_MS, ResetHaltLogGate } from "./reset-halt-policy.js";
 import { acknowledgeCacheGeneration, readCacheGeneration } from "../adopt-cache.js";
+import { reconcileGitDeferrals } from "../sync-git/deferral-hygiene.js";
 
 type RboxBarAmbientStatus = AmbientDaemonStatusV1 & {
   fileCount: number;
@@ -1169,10 +1170,12 @@ export class RboxDaemon {
             try {
               if (op === "deepScan") {
                 const cov = await this.doDeepScan();
+                await this.runDeferralHygiene();
                 this.maybeClearWatcherDegradedAfterScan(opWatcherErrorGeneration, cov);
                 this.requestPush("scan");
               } else if (op === "fullScan") {
                 const cov = await this.doFullScan();
+                await this.runDeferralHygiene();
                 this.maybeClearWatcherDegradedAfterScan(opWatcherErrorGeneration, cov);
                 if (this.activity.outOfStorage) this.outOfStorageProbeArmed = true;
                 this.requestPush("scan");
@@ -1668,6 +1671,21 @@ export class RboxDaemon {
     this.syncBase = state;
     this.emitDurableGitDeferrals(state, now);
     if (before !== renderShellDeferrals(state, now, ageBucket, projectedRepoRecords(state))) this.writeActivity();
+  }
+
+  /** Design 178 C: the existing scan cadence also revalidates durable busy
+   * assertions. Accepted saves and CAS winners replace syncBase immediately. */
+  private async runDeferralHygiene(): Promise<void> {
+    const base = this.syncBase;
+    if (!base) return;
+    try {
+      const result = await reconcileGitDeferrals(this.root, this.cfg, base, { now: this.now });
+      if (result.state !== base) this.observeDurableGitState(result.state, this.now());
+    } catch {
+      // Hygiene is fail-closed and must never turn a presentation refresh into a
+      // failed sync operation. The standing deferral remains authoritative.
+      this.log("git deferral hygiene unavailable; retaining current assertions");
+    }
   }
 
   /** Persist the activity record and bump the pump heartbeat. */

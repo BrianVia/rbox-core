@@ -5,7 +5,7 @@ import path from "node:path";
 import { HashCache, scanManifest, type BlobStore, type FileEntry, type IgnoreMatcher, type Manifest, type WatchEvent } from "../../engine/index.js";
 import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
 import { loadActivity, renderShellLine, type DaemonActivity } from "../activity.js";
-import { loadState, syncStreamId, type SyncState, type WorkspaceConfig } from "../config.js";
+import { loadState, saveStateUnsafeLegacyOrTest, syncStreamId, type SyncState, type WorkspaceConfig } from "../config.js";
 import { RboxDaemon } from "../daemon.js";
 import { daemonRuntimeDir, daemonStatusPath, readDaemonBindingRecord, readDaemonPidRecord, recordDaemonBinding } from "../daemon-control.js";
 import { MassDeleteGuardError, pull } from "../sync.js";
@@ -86,6 +86,7 @@ interface DaemonInternals {
   manifest: Manifest;
   pendingEvents: WatchEvent[];
   activity: DaemonActivity;
+  syncBase?: SyncState;
   want: { pull: boolean; push: boolean; fullScan: boolean; deepScan: boolean };
   startWatcherFn: TestStartWatcher;
   startLiveWatch(): Promise<void>;
@@ -99,6 +100,9 @@ interface DaemonInternals {
   pump(): Promise<void>;
   stop(): Promise<void>;
   loadSyncBase(): Promise<SyncState>;
+  runDeferralHygiene(): Promise<void>;
+  ambientStatusFrom(activity: DaemonActivity, settled: boolean, now: number): { deferredRepos: number };
+  writeHeartbeatSurfaces(): void;
   scheduleWriteFinishRetry(paths: Set<string>): void;
   writeWsActivity(): void;
   startActivityHeartbeat(intervalMs?: number): void;
@@ -234,6 +238,37 @@ class StillBlockedRemote extends MiniRemote {
     return super.commit(parentSequence, device, manifest);
   }
 }
+
+test("design 178 C: daemon hygiene updates the next ambient heartbeat projection", async () => {
+  await withIsolatedDaemonHome(async () => {
+    const repo = path.join(root, "repo");
+    await fs.mkdir(repo);
+    await new Promise<void>((resolve, reject) => {
+      const child = Bun.spawn(["git", "-C", repo, "init", "-q"]);
+      child.exited.then((code) => code === 0 ? resolve() : reject(new Error(`git init exited ${code}`)));
+    });
+    const daemon = await makeDaemon(new MiniRemote());
+    const at = new Date(TEST_NOW - 60_000).toISOString();
+    const seeded: SyncState = {
+      ...(daemon.syncBase ?? await daemon.loadSyncBase()),
+      repoRecords: {
+        repo: {
+          repoGen: 1,
+          sourceSeq: 0,
+          deferrals: { capture: { lane: "capture", reason: "git-busy", deferredSince: at, reasonSince: at, lastSeen: at } },
+        },
+      },
+    };
+    await saveStateUnsafeLegacyOrTest(root, seeded);
+    daemon.syncBase = await loadState(root, seeded.stream);
+    await daemon.runDeferralHygiene();
+    expect(daemon.syncBase?.repoRecords?.repo?.deferrals).toBeUndefined();
+    await writeOwnedDaemonPid();
+    daemon.writeHeartbeatSurfaces();
+    await daemon.activityWrite;
+    expect((await readAmbientStatus()).deferredRepos).toBe(0);
+  });
+});
 
 test("pump error records a halt; only a same-kind success clears it", async () => {
   const remote = new MiniRemote();
