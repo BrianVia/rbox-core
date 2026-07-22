@@ -3,3 +3,7 @@
 # old default and remain the kill-switch coverage. files-first.test.ts opts back in
 # per-test, and asserts the real (unset-env) default is ON.
 preload = ["./scripts/test-preload.ts"]
+# App tests require their Vitest framework integrations (Miniflare for the API,
+# SvelteKit aliases for the web app). Keep bare `bun test` scoped to tests that
+# are executable by Bun's native runner; the app suites retain their own gates.
+pathIgnorePatterns = ["apps/api/test/**", "apps/web/src/**"]

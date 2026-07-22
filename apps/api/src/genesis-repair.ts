@@ -51,7 +51,7 @@ const count = (value: unknown): number => {
 
 /** N=1 is a binding invariant until a reviewed cross-plane fence replaces it. */
 export function assertGenesisSingleDatabase(env: Env, accountId: string): void {
-  if (dbFor(env, accountId) !== dirDb(env)) throw new Error("atomic genesis requires dbFor(env, accountId) === dirDb(env)");
+  if (dbFor(env, accountId) !== dirDb(env)) throw new Error("atomic genesis N=1 sharding blocker: dbFor(env, accountId) must equal dirDb(env)");
 }
 
 export const GENESIS_OBSERVATION_SQL = `SELECT
@@ -238,7 +238,8 @@ const proofSql = `
   NOT EXISTS (SELECT 1 FROM pairing_tokens WHERE account_id = ?1 AND (mk_wrap IS NOT NULL OR admission_grant IS NOT NULL)) AND
   NOT EXISTS (SELECT 1 FROM workspaces WHERE account_id = ?1)`;
 
-export async function genesisRepair(env: Env, pathAccountId: string, body: GenesisRepairRequest, auditRetry = 0): Promise<Response> {
+export interface GenesisRepairTestHooks{beforeExecuteBatch?:()=>Promise<void>;afterExecuteBatch?:()=>Promise<void>}
+export async function genesisRepair(env: Env, pathAccountId: string, body: GenesisRepairRequest, auditRetry = 0, hooks?:GenesisRepairTestHooks): Promise<Response> {
   if (pathAccountId !== body.accountId) return json({ error: "bad_request_shape" }, 400);
   const accountId = body.accountId;
   assertGenesisSingleDatabase(env, accountId);
@@ -277,6 +278,7 @@ export async function genesisRepair(env: Env, pathAccountId: string, body: Genes
     return json({ ok: false, dryRun: true, auditId: id, classification: classified.classification, proof: classified.proof, result: "refused" }, 409);
   }
 
+  if(auditRetry===0)await hooks?.beforeExecuteBatch?.();
   const results = await db.batch([
     db.prepare(
       `INSERT INTO genesis_repair_audit
@@ -307,6 +309,7 @@ export async function genesisRepair(env: Env, pathAccountId: string, body: Genes
        AND NOT EXISTS (SELECT 1 FROM account_deletions WHERE account_id = ?1 AND status IN ('purging','done'))`
     ).bind(accountId, id, GENESIS_TOMBSTONE_SENTINEL, now),
   ]);
+  if(auditRetry===0)await hooks?.afterExecuteBatch?.();
   const vector = `audit=${results[0]?.meta.changes ?? 0},update=${results[1]?.meta.changes ?? 0}`;
   if (vector === "audit=0,update=0") return json({ ok: false, dryRun: false, classification: "account_erased", result: "refused" }, 410);
   if (vector === "audit=1,update=1") {
@@ -316,13 +319,15 @@ export async function genesisRepair(env: Env, pathAccountId: string, body: Genes
   const competingAttempt = await db.prepare(
     "SELECT 1 FROM genesis_repair_audit WHERE account_id = ? AND outcome = 'attempted' AND audit_id <> ? LIMIT 1"
   ).bind(accountId, id).first();
-  const post = classifyRepairObservation(await readGenesisObservation(env, accountId)).proof;
+  const postRow=await readGenesisObservation(env,accountId),post = classifyRepairObservation(postRow).proof;
+  const completedCompetitor=isExactTombstone(postRow)?await db.prepare("SELECT audit_id FROM genesis_repair_audit WHERE account_id=? AND audit_id=? AND audit_id<>? AND outcome='tombstone_claim_installed' AND completed_at IS NOT NULL LIMIT 1").bind(accountId,postRow.repairId,id).first<{audit_id:string}>():null;
   const observation = { observational: true, claimShape: post.claimShape, dependents: post.dependents, ownsWorkspace: post.ownsWorkspace };
   await completeAudit(env, accountId, id, "refused", vector, observation);
-  if (competingAttempt || post.eligible) {
+  if (competingAttempt || completedCompetitor || post.eligible) {
     await reconcileGenesisRepairAudits(env, accountId);
+    if(auditRetry>0&&completedCompetitor)return json({ok:true,dryRun:false,auditId:completedCompetitor.audit_id,classification:"already_tombstoned",result:"tombstone_claim_installed",repairId:completedCompetitor.audit_id,repairedAt:postRow.repairedAt});
     if (auditRetry >= 8) return json({ ok: false, dryRun: false, classification: "repair_audit_busy", result: "refused" }, 503);
-    return genesisRepair(env, pathAccountId, body, auditRetry + 1);
+    return genesisRepair(env, pathAccountId, body, auditRetry + 1, hooks);
   }
   return json({ ok: false, dryRun: false, auditId: id, classification: "repair_refused_state_changed", observation, result: "refused" }, 409);
 }

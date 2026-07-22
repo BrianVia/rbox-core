@@ -7,6 +7,7 @@ import {
   GENESIS_OBSERVATION_SQL,
   GENESIS_TOMBSTONE_SENTINEL,
   REPAIR_ID_RE,
+  assertGenesisSingleDatabase,
   deletionLedgerBlocks,
   isExactTombstone,
   isTombstoneFamily,
@@ -120,9 +121,6 @@ export async function bootstrapAccountKeys(env: Env, p: Principal, body: unknown
   if (!recoveryWrap || !recoveryWrapId || !genesisRoster || !genesisKeyState || !deviceId || !sigPubKey || !encPubKey || !mkWrap) {
     return json({ error: "bad_request", message: "missing or oversized field" }, 400);
   }
-  // The bootstrapping device must be the authenticated caller's own device.
-  if (deviceId !== p.deviceId) return json({ error: "forbidden", message: "device mismatch" }, 403);
-
   await reconcileGenesisRepairAudits(env, p.accountId);
   if (await deletionLedgerBlocks(env, p.accountId)) return json({ error: "account_erased" }, 410);
   const before = await readGenesisObservation(env, p.accountId);
@@ -132,6 +130,10 @@ export async function bootstrapAccountKeys(env: Env, p: Principal, body: unknown
       return json({ error: "genesis_capability_required", requiredHeader: "x-rbox-genesis-capability", requiredValue: "1" }, 428);
     }
   }
+  // A committed exact-field replay (including a lost-response repair replay)
+  // is interpreted below before principal mismatch. Only a request that could
+  // still publish new rows is rejected here.
+  if ((before.claimPresent===0||isTombstoneFamily(before))&&deviceId!==p.deviceId)return json({error:"forbidden",message:"device mismatch"},403);
 
   const db = dbFor(env, p.accountId);
   const now = Date.now();
@@ -229,7 +231,8 @@ export async function bootstrapAccountKeys(env: Env, p: Principal, body: unknown
        AND (a.genesis_device_id=?2 OR (a.genesis_device_id IS NULL AND a.created_at=r.created_at AND a.created_at=k.created_at
          AND a.created_at=d.created_at AND (SELECT COUNT(*) FROM device_keys x WHERE x.account_id=?1 AND x.created_at=a.created_at)=1))`
   ).bind(p.accountId,deviceId,recoveryWrap,recoveryWrapId,genesisRoster,genesisKeyState,sigPubKey,encPubKey,mkWrap).first();
-  return exact ? json({ ok: true, idempotent: true }) : json({ error: "already_bootstrapped" }, 409);
+  if(exact)return deviceId===p.deviceId?json({ok:true,idempotent:true}):json({error:"forbidden",message:"device mismatch"},403);
+  return json({ error: "already_bootstrapped" }, 409);
 }
 
 /**
@@ -238,6 +241,7 @@ export async function bootstrapAccountKeys(env: Env, p: Principal, body: unknown
  * and every device's public keys + MK wrap. All account-scoped, all opaque.
  */
 export async function getAccountKeys(env: Env, p: Principal): Promise<Response> {
+  assertGenesisSingleDatabase(env,p.accountId);
   await reconcileGenesisRepairAudits(env, p.accountId);
   const db=dbFor(env,p.accountId);
   const batch=await db.batch([

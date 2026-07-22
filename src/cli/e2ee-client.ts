@@ -173,7 +173,11 @@ async function cleanupWinningJournal(journal:GenesisJournal):Promise<void>{
     if(staged&&dest)throw new Error("winning recovery-key promotion has both source and destination");
     if(staged){await validateRecoveryKeyBytes(journal,staged);await hardenedRename(p.stagedRk,p.rk);const promoted=await fsRead(p.rk);if(!promoted)throw new Error("winning recovery-key promotion lost destination");await validateRecoveryKeyBytes(journal,promoted);}
     else{if(!dest)throw new Error("winning recovery-key promotion has neither source nor destination");await validateRecoveryKeyBytes(journal,dest);await hardenedFsyncExisting(p.rk);}
-  }else await hardenedUnlink(p.stagedRk);
+  }else{
+    const loaded=await loadDevice(journal.accountId),request=JSON.parse(journal.requestBody) as {device?:{deviceId?:unknown;sigPubKey?:unknown;encPubKey?:unknown;mkWrap?:unknown}};const device=request.device;
+    if(!loaded||!("secrets" in loaded)||loaded.secrets.deviceId!==journal.deviceId||device?.deviceId!==journal.deviceId||device.sigPubKey!==toB64url(loaded.secrets.sigPubKey)||device.encPubKey!==toB64url(loaded.secrets.encPubSpki)||typeof device.mkWrap!=="string")throw new Error("journal device material mismatch");
+    const opened=await openOwnMasterKey(loaded.secrets,0,JSON.parse(device.mkWrap) as Wrap);if(!Buffer.from(opened).equals(Buffer.from(loaded.secrets.mk)))throw new Error("journal MK material mismatch");await hardenedUnlink(p.stagedRk);
+  }
   await hardenedUnlink(p.intent);await hardenedUnlink(p.witness);await hardenedUnlink(p.marker);await hardenedUnlink(p.journal);
 }
 async function fsRead(file:string):Promise<Uint8Array|undefined>{try{return new Uint8Array(await fs.readFile(file));}catch(error){if((error as NodeJS.ErrnoException).code==="ENOENT")return undefined;throw error;}}
@@ -192,7 +196,12 @@ export async function beginAtomicGenesis(api:GenesisCapableApi,accountId:string,
       let observation=await api.getGenesisObservation();let state=await classifyEnrollment(accountId,observation);
       if(state.kind==="enrolled"){await global.release();await accountLock.release();return{kind:"already-setup"};}
       if(state.kind==="cleanup-resume"){await resumeClassifiedGenesisCleanup(state.journal);await accountLock.release();await global.release();pair=await acquireGenesisLockPair(accountId);accountLock=pair.account;global=pair.global;continue;}
-      if(state.kind==="repaired-legacy"){await startGenesisQuarantine({accountId,purpose:"repaired-legacy",uniquenessKey:state.repairId,createdAt:new Date(opts.now).toISOString()});await resumeGenesisQuarantine(accountId,"repaired-legacy",state.repairId,new Date(opts.now).toISOString());continue;}
+      if(state.kind==="repaired-legacy"){
+        // The manifest is a first pending artifact. Re-enter through the same
+        // all-account global scan used by pairing, which classifies/cleans and
+        // rescans before publishing it, then hand global back to this target.
+        await accountLock.release();await global.release();global=await acquireClearMachineGenesisForPairing();accountLock=await acquireAccountGenesisLock(accountId);continue;
+      }
       if(state.kind==="quarantine-resume"){await resumeGenesisQuarantine(accountId,"repaired-legacy",state.repairId,new Date(opts.now).toISOString());continue;}
       if(state.kind==="restart-prepublication"){await removePrepublicationBundle(accountId);continue;}
       let journal:GenesisJournal|undefined;
@@ -289,6 +298,9 @@ async function acquireClearKnownAccountGenesis(api:Pick<RboxApi,"getGenesisObser
   const lock=await acquireAccountGenesisLock(accountId);try{if(!(await genesisClassifierConsultationNeeded(accountId)))return lock;for(;;){const state=await classifyEnrollment(accountId,await api.getGenesisObservation());if(state.kind==="enrolled")return lock;if(state.kind==="cleanup-resume"){await resumeClassifiedGenesisCleanup(state.journal);continue;}throw new Error(GENESIS_PENDING_MESSAGE);}}catch(error){await lock.release();throw error;}
 }
 
+async function settleKnownAccountGenesisLocked(api:Pick<RboxApi,"getGenesisObservation">,accountId:string):Promise<void>{if(!(await genesisClassifierConsultationNeeded(accountId)))return;for(;;){const state=await classifyEnrollment(accountId,await api.getGenesisObservation());if(state.kind==="enrolled")return;if(state.kind==="cleanup-resume"){await resumeClassifiedGenesisCleanup(state.journal);continue;}throw new Error(GENESIS_PENDING_MESSAGE);}}
+async function acquireClearKnownAccountGenesisPair(api:Pick<RboxApi,"getGenesisObservation">,accountId:string):Promise<{global:GenesisLock;account:GenesisLock}>{const pair=await acquireGenesisLockPair(accountId);try{await settleKnownAccountGenesisLocked(api,accountId);return pair;}catch(error){await pair.account.release();await pair.global.release();throw error;}}
+
 /** Self-verify the candidate extended chain + wrap authorization BEFORE publishing
  *  (D4) — a chain that wouldn't verify must never wedge other clients. */
 async function selfVerifyAdmission(dto: AccountKeysDTO, admissionRoster: SignedRoster, deviceWrap: Wrap): Promise<void> {
@@ -370,17 +382,27 @@ export async function enrollViaRecovery(phrase: string, now: number, loaded?: Cr
 
 export async function assertRecoveryGenesisReady(loaded?:CredentialLoadResult):Promise<void>{const creds=credentialsForStrictFlow(loaded??await loadCredentials());if(!creds?.accountId)throw new Error("`rbox key recover` needs an account login first — run `rbox login` (web/device-code), then recover.");const api=new RboxApi(creds.remoteUrl,creds.token,"","");const lock=await acquireClearKnownAccountGenesis(api,creds.accountId);await lock.release();}
 
+export async function enrollViaRecoveryWithPhraseInput(readPhrase:()=>Promise<string>,now:number,loaded?:CredentialLoadResult,beforePhraseRead?:()=>Promise<void>):Promise<{accountId:string;deviceId:string;phrase:string}>{
+  const creds=credentialsForStrictFlow(loaded??await loadCredentials());if(!creds?.accountId)throw new Error("`rbox key recover` needs an account login first — run `rbox login` (web/device-code), then recover.");const api=new RboxApi(creds.remoteUrl,creds.token,"","");const pair=await acquireClearKnownAccountGenesisPair(api,creds.accountId);
+  try{await beforePhraseRead?.();await settleKnownAccountGenesisLocked(api,creds.accountId);const phrase=(await readPhrase()).trim();if(!phrase)throw new Error("no phrase entered");const result=await enrollViaPrevalidatedRecoveryLocked(await phraseToRk(phrase),now,creds,creds.accountId,api);return{...result,phrase};}
+  finally{await pair.account.release();await pair.global.release();}
+}
+
 /** Recovery continuation for callers that already passed the local BIP39 gate. */
 export async function enrollViaPrevalidatedRecovery(rk: Uint8Array, now: number, loaded?: CredentialLoadResult): Promise<{ accountId: string; deviceId: string }> {
   const creds = credentialsForStrictFlow(loaded ?? await loadCredentials());
   if (!creds?.accountId) throw new Error("`rbox key recover` needs an account login first — run `rbox login` (web/device-code), then recover.");
   const api = new RboxApi(creds.remoteUrl, creds.token, "", "");
-  const genesisLock=await acquireClearKnownAccountGenesis(api,creds.accountId);
-  try{
+  const genesisLocks=await acquireClearKnownAccountGenesisPair(api,creds.accountId);
+  try{return await enrollViaPrevalidatedRecoveryLocked(rk,now,creds,creds.accountId,api);}
+  finally{await genesisLocks.account.release();await genesisLocks.global.release();}
+}
+
+async function enrollViaPrevalidatedRecoveryLocked(rk:Uint8Array,now:number,creds:NonNullable<ReturnType<typeof credentialsForStrictFlow>>,accountId:string,api:RboxApi):Promise<{accountId:string;deviceId:string}>{
   const dto = await api.getAccountKeys();
   if (!dto) throw new Error("account has no key material (fatal)");
   const { account } = await verifyDto(dto);
-  assertSignedAccountId(creds.accountId, account.currentRoster.accountId);
+  assertSignedAccountId(accountId, account.currentRoster.accountId);
   if (!dto.recoveryWrap) throw new Error("no recovery wrap stored for this account");
 
   const recoveryWrap = JSON.parse(dto.recoveryWrap) as Wrap;
@@ -390,14 +412,13 @@ export async function enrollViaPrevalidatedRecovery(rk: Uint8Array, now: number,
   const deviceId = `rec_${toB64url(randomBytes(6))}`;
   const keys = { sig: generateSignKeyPair(), enc: generateWrapKeyPair() }; // one keypair, reused across 409 retries (D3)
   const build = async (curDto: AccountKeysDTO): Promise<RedeemResult> => {
-    const r = await buildRecoveryAdmission({ accountId: creds.accountId!, accountEpoch: account.currentEpoch, deviceId, recoveryKey: rk, recoveryWrap, prevRoster: headRoster(curDto), now, deviceKeys: keys });
+    const r = await buildRecoveryAdmission({ accountId, accountEpoch: account.currentEpoch, deviceId, recoveryKey: rk, recoveryWrap, prevRoster: headRoster(curDto), now, deviceKeys: keys });
     await selfVerifyAdmission(curDto, r.admissionRoster, r.device.mkWrap);
     return r;
   };
   const initial = await build(dto);
   await admitWithRetry(api, deviceId, initial, build);
-  return { accountId: creds.accountId, deviceId };
-  }finally{await genesisLock.release();}
+  return { accountId, deviceId };
 }
 
 /** Admit a locally generated agent/API-key device without replacing the issuing

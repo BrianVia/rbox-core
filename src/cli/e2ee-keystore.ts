@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fromB64url, toB64url, type DeviceSecrets, type Wrap } from "../engine/e2ee/index.js";
-import { hardenedWrite } from "./genesis-durable.js";
+import { hardenedWrite, type HardenedWriteOptions } from "./genesis-durable.js";
 import { acquireGenesisLockSync } from "./genesis-locks.js";
 
 /**
@@ -35,8 +35,8 @@ interface DeviceJson {
   encPrivPkcs8: string;
 }
 
-async function writeSecret(file: string, data: string): Promise<void> {
-  await hardenedWrite(file, data, { mode: FILE_MODE });
+async function writeSecret(file: string, data: string, options: HardenedWriteOptions = {}): Promise<void> {
+  await hardenedWrite(file, data, { ...options, mode: FILE_MODE });
 }
 
 async function readMaybe(file: string): Promise<string | undefined> {
@@ -86,7 +86,7 @@ export async function loadDevice(accountId: string): Promise<{ secrets: DeviceSe
   return { secrets: { ...device, mk: fromB64url(mkB64) } };
 }
 
-export async function saveDevice(secrets: DeviceSecrets): Promise<void> {
+export async function saveDevice(secrets: DeviceSecrets, writeOptions: { device?: HardenedWriteOptions; masterKey?: HardenedWriteOptions } = {}): Promise<void> {
   const dir = root(secrets.accountId);
   const device: DeviceJson = {
     deviceId: secrets.deviceId,
@@ -95,12 +95,12 @@ export async function saveDevice(secrets: DeviceSecrets): Promise<void> {
     encPubSpki: toB64url(secrets.encPubSpki),
     encPrivPkcs8: toB64url(secrets.encPrivPkcs8),
   };
-  await writeSecret(path.join(dir, "device.json"), JSON.stringify(device, null, 2));
-  await saveMasterKey(secrets.accountId, secrets.mk);
+  await writeSecret(path.join(dir, "device.json"), JSON.stringify(device, null, 2), writeOptions.device);
+  await saveMasterKey(secrets.accountId, secrets.mk, writeOptions.masterKey);
 }
 
-export async function saveMasterKey(accountId: string, mk: Uint8Array): Promise<void> {
-  await writeSecret(path.join(root(accountId), "mk.key"), toB64url(mk));
+export async function saveMasterKey(accountId: string, mk: Uint8Array, writeOptions?: HardenedWriteOptions): Promise<void> {
+  await writeSecret(path.join(root(accountId), "mk.key"), toB64url(mk), writeOptions);
 }
 
 /** Cross-process per-account genesis lock: O_EXCL acquire, pid liveness stale detection, remove on release. */

@@ -340,7 +340,7 @@ async function releaseAndProgress(env: Env, accountId: string, leaseToken: strin
  *  account_link_*). Each statement is built via its plane helper; the batch runs on the
  *  account-data binding (the data erasure is the headline). One atomic write at N=1; under real
  *  sharding §6a splits it into a dirDb directory-purge + a dbFor(shard) data-purge. */
-async function finishD1(env: Env, accountId: string, clerkIds: string[], deviceIds: string[], nowMs: number): Promise<void> {
+export async function finishD1(env: Env, accountId: string, clerkIds: string[], deviceIds: string[], nowMs: number): Promise<void> {
   await reconcileGenesisRepairAudits(env, accountId);
   const a = accountId;
   const data = dbFor(env, a); // account-data plane
