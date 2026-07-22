@@ -2,7 +2,7 @@ import path from "node:path";
 import { PassThrough } from "node:stream";
 import { buildIgnoreMatcher, checkoutTransactionCapability, cryptoPoolStatus, diffManifests, HashCache, scanManifest, type CheckoutTransactionCapability, type DiscoveredGitRepo, type IgnoreMatcher } from "../engine/index.js";
 import { trashStats } from "../engine/trash.js";
-import { loadActivity, shellStateOf, type DaemonActivity } from "./activity.js";
+import { isSafetyHaltReason, loadActivity, shellStateOf, type DaemonActivity } from "./activity.js";
 import { RBOX_VERSION } from "./version.js";
 import { fetchAccountSummary, formatAccountSummary } from "./account-cmd.js";
 import { readAccountProfile } from "./account-profile.js";
@@ -696,8 +696,7 @@ export async function statusCmdWithDeps(
       && activity.halt.recoveryState !== "suspended"
       && activity.halt.recoveryState !== "running"
       && !activity.halt.terminal
-      && typedHalt?.kind !== "mass-delete"
-      && typedHalt?.kind !== "chain-repair");
+      && !isSafetyHaltReason(typedHalt?.kind));
     const retrySuspended = activity?.halt?.recoveryState === "suspended"
       && typedHalt?.kind !== "mass-delete"
       && typedHalt?.kind !== "chain-repair";

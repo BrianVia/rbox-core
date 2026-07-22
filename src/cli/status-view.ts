@@ -11,7 +11,7 @@
  * actual local-vs-baseline diff and the daemon's recorded activity — never from
  * "the command ran to completion".
  */
-import { ACTIVE_STALE_MS, type DaemonActivity } from "./activity.js";
+import { ACTIVE_STALE_MS, isSafetyHaltReason, type DaemonActivity } from "./activity.js";
 import type { GitDeferral, GitDeferralReason, RepoRecord } from "./config.js";
 import { formatBinaryBytes, formatDecimalBytes, quotaUsage } from "./quota-format.js";
 import { style } from "./style.js";
@@ -786,8 +786,7 @@ export function healthLine(s: StatusSnapshot): string {
   const out = s.daemonRunning ? s.activity?.outOfStorage : undefined;
   const nonSafetyRetry = halt
     && !halt.terminal
-    && halt.typedReason?.kind !== "mass-delete"
-    && halt.typedReason?.kind !== "chain-repair";
+    && !isSafetyHaltReason(halt.typedReason?.kind);
   if (nonSafetyRetry && halt.recoveryState === "running") {
     return style.cyan("↻ retrying after conflict");
   }

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { ACTIVE_STALE_MS, loadActivity, renderShellDeferrals, renderShellLine, saveActivity, saveShellDeferrals, saveShellLine, type DaemonActivity } from "./activity.js";
+import { ACTIVE_STALE_MS, loadActivity, renderShellDeferrals, renderShellLine, saveActivity, saveShellDeferrals, saveShellLine, shellStateOf, type DaemonActivity } from "./activity.js";
 import { resetSyncState } from "./config.js";
 import type { SyncState } from "./config.js";
 import { ageBucket } from "./status-view.js";
@@ -322,6 +322,26 @@ test("renderShellLine name is LAST and verbatim (spaces kept), control chars neu
   expect(line).not.toContain("\n"); // stays exactly one line
   // Everything before the name is a fixed 7-field header; the rest is the name verbatim.
   expect(line.split(" ").slice(7).join(" ")).toBe("My Cool Repo?rm -rf?/");
+});
+
+test.each([
+  ["too-many-refs"],
+  ["body-too-large"],
+] as const)("fingerprint-less %s halt stays a halt even with an armed recovery probe (178 t2 final review)", (kind) => {
+  // The API can reject without a blob-ref sidecar, so `terminal` is absent.
+  // An armed probe timer must not demote the safety refusal to "pending".
+  const a: DaemonActivity = {
+    at: "2026-07-22T00:00:00.000Z",
+    halt: {
+      at: "2026-07-22T00:00:00.000Z",
+      reason: "commit rejected",
+      count: 1,
+      op: "push",
+      typedReason: { kind },
+      nextProbeAt: "2026-07-22T00:01:00.000Z",
+    },
+  };
+  expect(shellStateOf(a, true)).toBe("halt");
 });
 
 test("save is best-effort: an unwritable destination is swallowed", async () => {

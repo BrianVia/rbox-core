@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { daemonPidPath, daemonStatusPath } from "../rbox-paths.js";
-import type { DaemonActivity } from "../activity.js";
+import { isSafetyHaltReason, type DaemonActivity } from "../activity.js";
 import type { TransferPhase } from "../transfer-progress.js";
 import { syncStreamId, type RepoRecord, type WorkspaceConfig } from "../config.js";
 import {
@@ -198,8 +198,7 @@ function attentionReason(input: AmbientStatusProjectionInput): AmbientAttentionR
     && input.activity.halt.recoveryState !== "suspended"
     && !(input.activity.halt.nextProbeAt
       && !input.activity.halt.terminal
-      && input.activity.halt.typedReason?.kind !== "mass-delete"
-      && input.activity.halt.typedReason?.kind !== "chain-repair")) return "halt";
+      && !isSafetyHaltReason(input.activity.halt.typedReason?.kind))) return "halt";
   if (input.activity.outOfStorage) return "out-of-storage";
   if (input.watcherDegraded) return "watcher-degraded";
   return undefined;

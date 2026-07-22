@@ -266,20 +266,29 @@ export async function saveActivity(root: string, a: DaemonActivity): Promise<voi
   }
 }
 
+/** Typed reasons that are safety refusals rather than transient contention:
+ *  they must keep the ⛔ typed-halt surface even when a recovery probe is
+ *  armed, and regardless of whether the server attached a fingerprint
+ *  (too-many-refs/body-too-large arrive fingerprint-less without a blob-ref
+ *  sidecar). */
+export const isSafetyHaltReason = (kind: string | undefined): boolean =>
+  kind === "mass-delete"
+  || kind === "chain-repair"
+  || kind === "too-many-refs"
+  || kind === "body-too-large";
+
 /** The machine-facing activity state — halt > outofstorage > active > pending
  *  (unsettled) > ok. `status --json` mirrors this verbatim. */
 const isTimerOwnedRetry = (halt: DaemonActivity["halt"]): boolean => Boolean(
   halt?.nextProbeAt
     && halt.recoveryState !== "suspended"
     && !halt.terminal
-    && halt.typedReason?.kind !== "mass-delete"
-    && halt.typedReason?.kind !== "chain-repair",
+    && !isSafetyHaltReason(halt.typedReason?.kind),
 );
 const isSuspendedRetry = (halt: DaemonActivity["halt"]): boolean => Boolean(
   halt?.recoveryState === "suspended"
     && !halt.terminal
-    && halt.typedReason?.kind !== "mass-delete"
-    && halt.typedReason?.kind !== "chain-repair",
+    && !isSafetyHaltReason(halt.typedReason?.kind),
 );
 
 export const shellStateOf = (a: DaemonActivity, settled: boolean): "halt" | "outofstorage" | "active" | "pending" | "ok" =>
