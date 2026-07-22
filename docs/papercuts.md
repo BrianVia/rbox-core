@@ -177,6 +177,10 @@ what happened, what it cost, fix hint if obvious.
   and the restart pass should treat a DEAD-pid daemon dir with an unreadable
   record as ignorable debris, not a restart failure.
 
+- FIXED 2026-07-22 (PR #401, deployed to the founder's /Applications same day):
+  deferrals no longer escalate the bar's headline tier — pill/badge track sync
+  activity; "Degraded" reserved for watcher-degraded, red for critical.
+  Original report follows; the 178-t3 ghost-row bonus below is still open.
 - 2026-07-22 (founder, from Mac menu bar): the bar shows "Degraded" (orange)
   because 2 git repos are deferred even while sync is actively healthy —
   needless user concern. Proposed precedence for the bar's headline state:
