@@ -5,8 +5,30 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
-_Last updated: 2026-07-22 (~22:15 UTC — **v1.7.23 "your recovery key gets a
-home" RELEASED + FLEET-LIVE**): the 180 client + 179 Keychain feature shipped
+_Last updated: 2026-07-23 (~00:30 UTC — **179 HUMAN-VALIDATED (v1.7.24) ·
+BAR FIX LIVE · 182 ALIGNED v8 · 178 T3 IN FLIGHT**): founder's real-Mac
+`rbox key save` SUCCEEDED on v1.7.24 after four real-security(1) field
+fixes (bare `login-keychain`; indented-output trim; visible prompt by
+founder directive; readFileSync(0) for compiled-Bun stdin) — PR #398. The
+`key status` false-negative root-caused and fixed (#402, on main,
+unreleased): probe demanded one stdout line but real find-generic-password
+prints a ~20-line attribute dump; exit code is now the verdict. Bar
+Degraded-vs-Syncing papercut FIXED (#401) and deployed to the founder's
+/Applications same evening — deferrals never escalate the headline tier.
+Both registered daemon-activity flakes converted to injected clocks (#403,
+SafetyCadenceClock seam) and marked resolved in the registry. **Design 182
+(agent-churn sync latency) is ALIGNED v8** after an eight-round codex loop
+(19/5 → 0; key outcomes: A0 = generalize 177's capture-stability hardening
+to ordinary pushes as the gate for everything; A1 lock-event micro-gap
+capture Linux-first with a governed attempt budget; B demand-driven flush
+demoted to its own phase-2 design with a hard requirement set; E2 agent
+stop-verdict with an always-live criticalPhase witness + reservation entry
+protocol — both named interface requirements ON 178 t3). **178 t3**
+(workstream A locks + graceful stop + E-live + pr8 ghost) is mid-
+implementation via codex in `.claude/worktrees/178-t3` (survived a codex
+credits outage; continuation run in progress) — review must check the two
+182 interface requirements. NEXT release train carries: #402 key-status
+fix (+ t3 when merged). Then: tell Max._ the 180 client + 179 Keychain feature shipped
 (tag f6e945e9, release run success, api.rbox.to = 1.7.23). Founder waived the
 dev-build Keychain pre-validation (his call — testing with the released CLI on
 his real account; NOTE his Mac has no cached rk.key, so `rbox key save` will
