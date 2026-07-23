@@ -253,9 +253,13 @@ Pivoted M2 from file-mirroring `.git` (copying a live `.git` is never atomic) to
   runs AFTER and fails closed (burning a token whose source is revoked is correct).
   Mint-failure-after-consume = logged availability loss, never escalation; validate
   token/label format BEFORE consuming.
-- **Never put a bearer in argv** (shell history + `ps`): redeem reads from an
-  interactive paste, stdin, or `RBOX_PAIR_TOKEN` env — not a flag. Redact it from
-  logs/errors. (M4's user_code in argv was fine because it can't mint alone.)
+- **Original rule (superseded for pairing tokens by design 184): never put a
+  bearer in argv.** The canonical onboarding path now accepts the short-lived,
+  single-use token in `rbox connect <pairing-token>` because setup completion is
+  the higher product priority. Bare `rbox connect` retains interactive/stdin
+  input. Long-lived credentials, recovery phrases, and workspace keys remain
+  forbidden in argv, and pairing redemption still redacts the token from
+  logs/errors.
 - **Caps aren't optional for an auth-minting path:** per-account active-token cap
   (≤5 → 429) bounds a create-spam foothold even before request-rate limiting.
 - **`user_id` NOT NULL + require a real membership at create** — the auth layer

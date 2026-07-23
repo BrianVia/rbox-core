@@ -1,6 +1,9 @@
 # Design 10 — Pairing Tokens (low-friction "connect a new machine")
 
 **Status:** v2 — IMPLEMENTED. Codex security review (NEEDS-PASS → all 5 resolved).
+Design 184 supersedes resolution 4's no-argv rule for short-lived pairing tokens:
+the canonical convenience path is now `rbox connect <pairing-token>`, while bare
+`rbox connect` retains the masked prompt/stdin form.
 Verified by 7 Miniflare integration tests (real D1): create-requires-auth,
 create→redeem mints a same-account device, single-use (2nd redeem 401),
 malformed/unknown 401, expired 401, **revoked-creator → token dead at redeem**,

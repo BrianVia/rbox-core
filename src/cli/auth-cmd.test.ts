@@ -11,8 +11,10 @@ import {
   login,
   logout,
   keySave,
+  pairingConnectCommand,
   pairingRedemptionSuccessMessages,
   pairCreate,
+  presentPairingConnectCommand,
   readPairingTokenInteractive,
   recoverCmd,
   recoveryPhraseFromKeychain,
@@ -70,6 +72,52 @@ const origLog = console.log;
 const origFetch = globalThis.fetch;
 const origSetTimeout = globalThis.setTimeout;
 const origHome = process.env.HOME;
+
+test("pairing command is built only from the exact client-requested token id", () => {
+  const secret = Buffer.alloc(32, 7);
+  expect(pairingConnectCommand("rbox-pair_tclient", "tclient", secret)).toBe(
+    `rbox connect rbox-pair_tclient.${secret.toString("base64url")}`
+  );
+  for (const hostile of [
+    "rbox-pair_other",
+    "rbox-pair_tclient; touch /tmp/pwned",
+    "rbox-pair_tclient\nrbox logout",
+    "\u001b]8;;https://evil.test\u0007rbox-pair_tclient",
+    undefined,
+  ]) {
+    expect(() => pairingConnectCommand(hostile, "tclient", secret)).toThrow("token id mismatch");
+  }
+});
+
+test("pairing presentation copies exactly the complete connect command", async () => {
+  const command = `rbox connect rbox-pair_${"a".repeat(16)}.${Buffer.alloc(32, 5).toString("base64url")}`;
+  const logs: string[] = [];
+  const writes: string[] = [];
+  const copied: string[] = [];
+  await presentPairingConnectCommand(command, {
+    isInteractive: () => true,
+    waitForKeypress: async () => "c",
+    copyToClipboard: (value) => { copied.push(value); return true; },
+    log: (message) => logs.push(message),
+    write: (message) => writes.push(message),
+  });
+  expect(copied).toEqual([command]);
+  expect(logs.join("\n")).toContain(command);
+  expect(logs).toContain("Copied command to clipboard.");
+  expect(writes.join("")).toContain("Press [c] to copy the command");
+});
+
+test("non-interactive pairing presentation prints the command without touching clipboard", async () => {
+  let copied = false;
+  const logs: string[] = [];
+  await presentPairingConnectCommand("rbox connect token", {
+    isInteractive: () => false,
+    copyToClipboard: () => { copied = true; return true; },
+    log: (message) => logs.push(message),
+  });
+  expect(copied).toBe(false);
+  expect(logs.join("\n")).toContain("rbox connect token");
+});
 
 test("pairing token input prompts without echo on an interactive terminal", async () => {
   let promptMessage = "";

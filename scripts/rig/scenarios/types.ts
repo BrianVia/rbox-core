@@ -136,19 +136,11 @@ export function renderReportTable(report: ScenarioReport): string {
 }
 
 /**
- * Parse the pairing token from `rbox pair` stdout. `pairCreate` prints a header
- * line ("Pairing token …"), a blank line, then the token indented on its own line
- * (`<redeemToken>.<tokenSecret>`). We take the first non-empty line after the
- * header. PURE. Throws if no token line is found. */
+ * Parse the pairing token only from the executable command printed by
+ * `rbox pair`. Requiring the `rbox connect` prefix makes the rig prove the exact
+ * design-184 handoff rather than merely finding token-shaped output. PURE. */
 export function parsePairToken(stdout: string): string {
-  const lines = stdout.split("\n");
-  const headerIdx = lines.findIndex((l) => l.includes("Pairing token"));
-  const start = headerIdx >= 0 ? headerIdx + 1 : 0;
-  for (let i = start; i < lines.length; i++) {
-    const t = lines[i]!.trim();
-    // The token carries the split secret as `<redeemToken>.<tokenSecret>` — a dot
-    // and no spaces distinguish it from the surrounding prose lines.
-    if (t && t.includes(".") && !t.includes(" ")) return t;
-  }
+  const match = stdout.match(/^\s*rbox connect (rbox-pair_[A-Za-z0-9_-]{16,64}\.[A-Za-z0-9_-]{43})\s*$/m);
+  if (match?.[1]) return match[1];
   throw new Error("rig: could not parse a pairing token from `rbox pair` output");
 }

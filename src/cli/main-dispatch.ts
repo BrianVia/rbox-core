@@ -102,6 +102,7 @@ async function runGuidedFrontDoor(importFrontDoor: FrontDoorImport = () => impor
 export interface MainDispatchDeps {
   now?: () => Date;
   frontDoorImport?: FrontDoorImport;
+  authCommandImport?: () => Promise<Pick<typeof import("./auth-cmd.js"), "pairCreate" | "readPairingTokenInteractive" | "redeemPair">>;
 }
 
 export async function main(deps: MainDispatchDeps = {}): Promise<void> {
@@ -219,7 +220,8 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
       break;
     }
     case "pair": {
-      const { pairCreate } = await import("./auth-cmd.js");
+      if (positional.length !== 0) throw new Error("usage: rbox pair");
+      const { pairCreate } = await (deps.authCommandImport ?? (() => import("./auth-cmd.js")))();
       await pairCreate();
       break;
     }
@@ -437,12 +439,12 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
       break;
     }
     case "connect": {
-      // Enroll this machine from a pairing token read on STDIN (never argv, C11):
-      //   rbox pair        # on a signed-in machine → prints the token
-      //   echo <token> | rbox connect
-      const { readPairingTokenInteractive, redeemPair } = await import("./auth-cmd.js");
-      const token = await readPairingTokenInteractive();
-      if (!token) throw new Error("no pairing token provided (run `rbox pair` on a signed-in machine, then paste the token here or pipe it: echo <token> | rbox connect)");
+      // The canonical onboarding path accepts the short-lived, single-use token
+      // in argv for one-shot setup. Bare `connect` retains masked prompt/stdin.
+      if (positional.length > 1) throw new Error("usage: rbox connect [<pairing-token>] [--remote <url>]");
+      const { readPairingTokenInteractive, redeemPair } = await (deps.authCommandImport ?? (() => import("./auth-cmd.js")))();
+      const token = positional[0] ?? await readPairingTokenInteractive();
+      if (!token) throw new Error("no pairing token provided (run `rbox pair` on a signed-in machine, then run the displayed `rbox connect <pairing-token>` command here)");
       await redeemPair(flags.remote ?? DEFAULT_REMOTE, token);
       break;
     }

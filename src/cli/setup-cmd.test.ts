@@ -227,8 +227,8 @@ test("non-interactive setup completion keeps the existing static handoff and doe
   const output = writes.join("");
   expect(output).toContain("✓  rbox is set up.");
   expect(output).toContain("Bring another machine online:");
-  expect(output).toContain("rbox pair      (here — prints a token)");
-  expect(output).toContain('rbox setup     (there — choose "Log into an existing account" → paste the token)');
+  expect(output).toContain("rbox pair      (here — prints the command; press c to copy)");
+  expect(output).toContain("rbox connect … (there — paste the displayed command)");
   expect(output).not.toContain("To pair more devices later");
   expect({ prompts, pairs }).toEqual({ prompts: 0, pairs: 0 });
 });

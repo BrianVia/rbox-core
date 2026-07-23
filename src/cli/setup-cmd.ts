@@ -918,8 +918,8 @@ export async function finishSetup(workspaceName: string, deps: FinishSetupDeps =
 
   if (!interactive) {
     writeStderr(`\n   ${e.bold("Bring another machine online:")}\n`);
-    writeStderr(`     rbox pair      ${e.dim("(here — prints a token)")}\n`);
-    writeStderr(`     rbox setup     ${e.dim('(there — choose "Log into an existing account" → paste the token)')}\n`);
+    writeStderr(`     rbox pair      ${e.dim("(here — prints the command; press c to copy)")}\n`);
+    writeStderr(`     rbox connect … ${e.dim("(there — paste the displayed command)")}\n`);
     return;
   }
 

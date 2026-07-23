@@ -878,7 +878,7 @@ must rotate (recovery is admin-capable).
 missing → refuse to sign/sync; route to pairing/recovery only. Any inconsistency
 (device not `active` in the latest roster) → refuse + explain.
 
-**C11 [SHOULD-FIX] Keep the pairing secret out of argv/history.** Read the pasted
+**C11 [SUPERSEDED BY DESIGN 184] Keep the pairing secret out of argv/history.** Read the pasted
 token via **prompt/stdin** (not `--pair <token>` in argv); validate `tokenSecret`
 base64url-decodes to exactly 32 bytes before any network call. Printed-token
 scrollback on device A stays a documented residual (short TTL + single-use).
@@ -973,7 +973,8 @@ secrets/MK → fail closed (14.2). Constructs `RboxApi` + `E2eeRemote`
   `tokenSecret`; `buildPairing(secrets, {tokenId, tokenSecret, notAfter})`;
   `POST /v1/auth/pair/create { tokenId, mkWrap, admissionGrant }`; print
   `rbox-pair_<tokenId>.<base64url(tokenSecret)>` (valid ~N min, single use).
-- connect/redeem: read the token via **prompt/stdin** (never argv, C11); split on
+- connect/redeem: design 184 makes `rbox connect <pairing-token>` the canonical
+  convenience path; bare `rbox connect` retains **prompt/stdin**; split on
   the LAST `.` → `rbox-pair_<tokenId>` + `tokenSecret`; validate `tokenSecret`
   decodes to exactly 32 bytes; `POST /v1/auth/pair/redeem { token:
   rbox-pair_<tokenId> }` → `{ token, deviceId, accountId, mkWrap, admissionGrant }`;

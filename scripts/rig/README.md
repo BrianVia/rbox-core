@@ -57,8 +57,8 @@ prune. `up` retains the newest 30 run directories, and `gc` also enforces the wo
    `tiny`) + a symlink (historic regression shapes: empty, duplicate, symlink).
 3. **A** `rbox init --new`; read the workspace id from `.rbox/workspace.json`.
 4. **A** `rbox push` (`RBOX_UPLOAD_CONCURRENCY=16` — the design-34 WAF rail).
-5. **A** `rbox pair` → parse the token.
-6. **B** redeem the token headlessly (`RBOX_PAIR_TOKEN`, via env).
+5. **A** `rbox pair` → require and parse the emitted `rbox connect <token>` command.
+6. **B** execute that canonical one-shot connect path (token redacted in artifacts).
 7. **B** `rbox init --workspace <id>` + `rbox pull` (`RBOX_DOWNLOAD_CONCURRENCY=16`).
 8. **Assert** A and B trees are byte-identical (excluding `.rbox/`), file count > 90,
    and the empty file + symlink survived.

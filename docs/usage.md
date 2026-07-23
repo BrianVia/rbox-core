@@ -245,8 +245,9 @@ device confirmation code to authorize a login without carrying encryption, or a
 dashboard account-link code to connect your web login for management and billing.
 
 ```bash
-rbox pair                      # mint a token to add another machine (~2 steps)
-echo <token> | rbox connect    # redeem it on the new machine
+rbox pair                      # mint a connect command; press c to copy it
+rbox connect <pairing-token>   # authorize + encryption-enroll the new machine
+rbox connect                   # lower-exposure alternative: masked prompt / stdin
 rbox recover                   # re-enroll this machine from your recovery phrase
 
 rbox device approve <user-code>

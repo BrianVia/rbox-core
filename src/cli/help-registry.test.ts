@@ -111,7 +111,7 @@ SYNC
 
 ADD A MACHINE
   pair     create a token on a signed-in machine
-  connect  join this machine from a pasted token
+  connect  authorize + encrypt this machine with a pairing token
 
 IF SOMETHING'S WRONG
   doctor  check workspace health

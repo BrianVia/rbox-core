@@ -497,7 +497,7 @@ async function executeInitPlan(
     //    guidance up front rather than failing mid-spinner.
     if (creds.accountId && !(await hasDevice(creds.accountId))) {
       fail("this machine isn't enrolled for encryption yet.");
-      process.stderr.write(`${stderrStyle.dim("on a set-up machine run")} rbox pair${stderrStyle.dim(", then here:")} echo <token> | rbox connect${stderrStyle.dim(", then re-run init.")}\n`);
+      process.stderr.write(`${stderrStyle.dim("on a set-up machine run")} rbox pair${stderrStyle.dim(", then run its displayed `rbox connect …` command here, then re-run init.")}\n`);
       process.exitCode = 1;
       return undefined;
     }
