@@ -110,7 +110,7 @@ try {
     await waitFor("enter secret");
     keys("hush", "Enter");
     await waitFor("finish?");
-    keys("y");
+    keys("y", "Enter");
     await waitFor("tui-selftest ok");
     await waitForExit(0);
     process.stdout.write("tui-compiled-smoke success ok\n");

@@ -92,9 +92,10 @@ describe("Ink prompt runtime", () => {
       choices: [{ name: "File", value: "file" }, { name: "Clipboard", value: "clipboard" }],
       validate: (values) => values.length > 0 || "Choose at least one",
     }, h.streams);
-    await send(h.input, ["\r", " ", "\x1b[B", " ", "\r"]);
+    await send(h.input, ["\r"]);
+    await waitForOutput(h, "Choose at least one");
+    await send(h.input, [" ", "\x1b[B", " ", "\r"]);
     expect(await pending).toEqual(["file", "clipboard"]);
-    expect(h.output()).toContain("Choose at least one");
   });
 
   test("visible input edits around the cursor", async () => {
@@ -198,6 +199,39 @@ describe("Ink prompt runtime", () => {
     const pending = inkConfirm({ message: "Continue?", default: true }, h.streams);
     await send(h.input, ["\r"]);
     expect(await pending).toBe(true);
+  });
+
+  test("confirm requires Enter to submit a typed answer — a bare key must not settle", async () => {
+    const h = harness();
+    const pending = inkConfirm({ message: "Create it?", default: false }, h.streams);
+    await send(h.input, ["n"]);
+    let settled = false;
+    void pending.then(() => { settled = true; }, () => { settled = true; });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(settled).toBe(false);
+    await send(h.input, ["\r"]);
+    expect(await pending).toBe(false);
+  });
+
+  test("an aborted keypress waiter releases stdin for the next prompt", async () => {
+    const h = harness();
+    const controller = new AbortController();
+    const waiting = inkKeypress({ signal: controller.signal }, h.streams);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    controller.abort();
+    expect(await waiting).toBeUndefined();
+    const next = inkInput({ message: "Name" }, h.streams);
+    await send(h.input, ["ok", "\r"]);
+    expect(await next).toBe("ok");
+  });
+
+  test("a second prompt on a busy stdin fails fast instead of corrupting the terminal", async () => {
+    const h = harness();
+    const first = inkInput({ message: "First" }, h.streams);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await expect(inkConfirm({ message: "Second?" }, h.streams)).rejects.toThrow("already active");
+    await send(h.input, ["done", "\r"]);
+    expect(await first).toBe("done");
   });
 
   test("search ignores stale async results and selects the latest projection", async () => {

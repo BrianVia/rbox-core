@@ -96,6 +96,17 @@ describe("repository guards", () => {
     expect(result.stderr).toContain(TUI_IMPORT_ERROR);
   });
 
+  test("rejects ink subpath imports and raw-key readers outside the runtime", async () => {
+    const root = await makeFixture();
+    await put(root, "src/stray-subpath.ts", 'const ink = await import("ink/build/index.js");\nvoid ink;\n');
+    await put(root, "src/stray-rawkey.ts", 'import * as readline from "node:readline";\nreadline.emitKeypressEvents(process.stdin);\n');
+    const result = await runFixture(root);
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toContain("src/stray-subpath.ts:1:");
+    expect(result.stdout).toContain("src/stray-rawkey.ts:2:");
+    expect(result.stderr).toContain(TUI_IMPORT_ERROR);
+  });
+
   test("checks hidden src paths like the original recursive grep", async () => {
     const result = await runFixture(await makeFixture({ hiddenStrayImport: true }));
     expect(result.exitCode).toBe(1);

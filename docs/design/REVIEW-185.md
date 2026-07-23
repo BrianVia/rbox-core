@@ -97,3 +97,44 @@ No blocker or high-severity finding remains. The reviewer independently ran the
 15-test real-Ink prompt suite, root/API and rig typechecks, and whitespace
 validation, and verified the exact-artifact, performance, compiled UX/rig, and
 secret-failure gates.
+
+## Round 6 — post-implementation two-reviewer wave (Fable + opus, independent)
+
+**Verdict:** NOT-MERGEABLE as submitted — PR CI was red; two blockers plus
+infra defects the GPT rounds and local runs missed.
+
+1. **BLOCKER — stdin-mutex collision crashed browser-login genesis (opus).**
+   The fire-and-forget "press [c] to copy" keypress waiter held the new
+   exclusive per-stdin prompt lock for the whole approval poll loop; the
+   enrollment prompts that mount right after approval threw "another
+   interactive prompt is already active on this terminal" — exactly the
+   phone/other-browser approval path design 47 targets. Fixed: the copy-key
+   handle is now `close(): Promise<void>` (abort + await full stdin release),
+   awaited before post-approval enrollment; regression tests cover the aborted
+   waiter → next prompt sequence and the fail-fast collision.
+2. **BLOCKER — two 38-char pinned action SHAs (both reviewers).** ci.yml's
+   compiled-TUI matrix checkout and release.yml's new smoke checkout pinned a
+   truncated `actions/checkout` SHA; the compiled acceptance suite never ran
+   and, post-merge, no release could publish (`publish` needs `smoke`).
+   Fixed to the 40-char pin.
+3. **Gate wiring (Fable, from the red run):** the onboarding-rig job exported
+   `RBOX_DEV_BOOTSTRAP` but the rig requires `RBOX_DEV_PLATFORM_SECRET`
+   (now passed; repo secret added); the perf-budget baseline hand-rolled
+   `bun build` without the crypto-worker generation preamble (now builds via
+   `scripts/release.ts --dev` in the baseline checkout).
+4. **Behavior parity, caught by the flow specs (Fable):** the directory prompt
+   rendered typed input on its own line — flows assert inline echo on the
+   question line (fixed via the Frame `inline` slot); confirm submitted on a
+   bare `y`/`n` keystroke, leaking the flow's trailing Enter into the next
+   prompt (typo-no-phantom's phantom-accept) — restored Inquirer parity:
+   typed answer + Enter, with tests and smoke updated.
+5. **Determinism + hygiene:** checkbox validation test raced React render
+   batching (now waits for the error frame); bun.lock referenced an untracked
+   `file:vendor/react-devtools-core` (removed; frozen install verified); the
+   promised raw-key guard now exists (`emitKeypressEvents` banned in src/) and
+   the ink import guard covers subpath/`require` forms.
+
+All 11 UX regress flows pass against a freshly compiled linux-x64 binary with
+these fixes. Lesson recorded: compiled-gate workflows are code — they need the
+same review scrutiny as src/, and a gate that has never run green proves
+nothing.

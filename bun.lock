@@ -521,7 +521,6 @@
 
     "@cloudflare/vitest-pool-workers/wrangler": ["wrangler@4.112.0", "", { "dependencies": { "@cloudflare/kv-asset-handler": "0.5.0", "@cloudflare/unenv-preset": "2.16.1", "blake3-wasm": "2.1.5", "esbuild": "0.28.1", "miniflare": "4.20260714.0", "path-to-regexp": "6.3.0", "unenv": "2.0.0-rc.24", "workerd": "1.20260714.1" }, "optionalDependencies": { "fsevents": "2.3.3" }, "peerDependencies": { "@cloudflare/workers-types": "^5.20260714.1" }, "optionalPeers": ["@cloudflare/workers-types"], "bin": { "cf-wrangler": "bin/cf-wrangler.js", "wrangler": "bin/wrangler.js", "wrangler2": "bin/wrangler.js" } }, "sha512-5H+XUD0TySCv1LuktFHDIEOkboH2nTfQs+35L+USt3MtntjDTMVIJprLgQcL2WBjulOyjxpd1vyTiSTJVW5MjQ=="],
 
-    "ink/react-devtools-core": ["react-devtools-core@file:vendor/react-devtools-core", {}],
 
     "miniflare/workerd": ["workerd@1.20260714.1", "", { "optionalDependencies": { "@cloudflare/workerd-darwin-64": "1.20260714.1", "@cloudflare/workerd-darwin-arm64": "1.20260714.1", "@cloudflare/workerd-linux-64": "1.20260714.1", "@cloudflare/workerd-linux-arm64": "1.20260714.1", "@cloudflare/workerd-windows-64": "1.20260714.1" }, "bin": { "workerd": "bin/workerd" } }, "sha512-oIbQzfdyl9UQUnG6XLegcSq0Mgt/7WKDbFOoqGgOWCS+/fhyGB460uKEgdAQQ9RHCO/ttcNCX/KiMIQzdoeu3Q=="],
 

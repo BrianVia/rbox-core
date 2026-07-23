@@ -42,7 +42,12 @@ export async function findTuiImportViolations(root: string): Promise<string[]> {
     if (normalizedPath === ALLOWED_TUI_IMPORT) continue;
     const lines = (await Bun.file(join(root, relativePath)).text()).split("\n");
     for (let index = 0; index < lines.length; index++) {
-      if (/(?:from|import\()\s*[\"'](?:ink|react(?:\/[^\"']*)?)[\"']/.test(lines[index]!)) {
+      if (/(?:from|import\(|require\()\s*[\"'](?:ink|react)(?:\/[^\"']*)?[\"']/.test(lines[index]!)) {
+        violations.push(`${normalizedPath}:${index + 1}:${lines[index]}`);
+      }
+      // The bespoke raw-key reader pattern (deleted from browser-open.ts) must
+      // not return: all keypress handling goes through the shared runtime.
+      if (/emitKeypressEvents/.test(lines[index]!)) {
         violations.push(`${normalizedPath}:${index + 1}:${lines[index]}`);
       }
     }

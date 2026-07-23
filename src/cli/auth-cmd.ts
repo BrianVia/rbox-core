@@ -998,6 +998,7 @@ export async function login(
         assertValidDeviceCodeApproval(p);
         await saveCredentials({ token: p.token, deviceId: p.deviceId, remoteUrl, accountId: p.accountId });
         console.log(`device authorized: ${p.deviceId}`);
+        await copyKey?.close();
         const enrollment = await handleDeviceCodePostApprovalEncryption(
           new RboxApi(remoteUrl, p.token, "", ""),
           { accountId: p.accountId, deviceId: p.deviceId },
@@ -1014,26 +1015,31 @@ export async function login(
     }
     throw new Error("authorization timed out");
   } finally {
-    try {
-      copyKey?.cancel();
-    } catch {
+    await copyKey?.close().catch(() => {
       // already resolved / non-interactive → nothing to close
-    }
+    });
   }
 }
 
 /** Opportunistically open the approval page and listen for a single copy key
- *  concurrently with polling. The cancel handle restores stdin as soon as the
- *  grant completes, so the key listener never outlives the login flow. */
-function offerApprovalCopy(url: string): { cancel: () => void } | undefined {
+ *  concurrently with polling. `close()` aborts the listener and resolves only
+ *  after the prompt runtime has fully released stdin — callers MUST await it
+ *  before mounting any follow-on prompt on the same terminal, because the
+ *  runtime holds an exclusive per-stdin lock while a prompt is live. */
+function offerApprovalCopy(url: string): { close: () => Promise<void> } | undefined {
   openInBrowser(url); // opportunistic; silently no-ops on a headless box
   if (!isInteractive()) return undefined;
   console.log("    press [c] to copy the URL");
   const controller = new AbortController();
-  void promptKeypress({ signal: controller.signal }).then((key) => {
+  const settled = promptKeypress({ signal: controller.signal }).then((key) => {
     if (key === "c") console.log(copyToClipboard(url) ? "Copied to clipboard." : "Couldn't reach the clipboard — copy the URL above manually.");
-  });
-  return { cancel: () => controller.abort() };
+  }).catch(() => {});
+  return {
+    close: async () => {
+      controller.abort();
+      await settled;
+    },
+  };
 }
 
 export async function logout(): Promise<void> {

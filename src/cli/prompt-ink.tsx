@@ -88,15 +88,18 @@ function useCancel(inputHandler: (input: string, key: Key) => void, onCancel: ()
   }, { isActive: active });
 }
 
-function Frame({ message, children, hint, error }: {
+function Frame({ message, inline, children, hint, error }: {
   message: string;
+  /** Rendered on the message line itself — typed answers echo inline there,
+   * matching the flow assertions that treat "? question answer" as one line. */
+  inline?: React.ReactNode;
   children?: React.ReactNode;
   hint?: string;
   error?: string;
 }) {
   return (
     <Box flexDirection="column">
-      <Text>{stderrStyle.cyan("?")} {message}</Text>
+      <Text>{stderrStyle.cyan("?")} {message}{inline}</Text>
       {children}
       {error ? <Text>{stderrStyle.red(`  ${error}`)}</Text> : undefined}
       {hint ? <Text>{stderrStyle.dim(`  ${hint}`)}</Text> : undefined}
@@ -315,13 +318,31 @@ function ConfirmPrompt({ config, submit, cancel }: {
   submit: Submit<boolean>;
   cancel: () => void;
 }) {
+  // Inquirer parity: type an answer, Enter submits. A single "n" keystroke must
+  // NOT settle the prompt — flows send "n" then "Enter", and a single-key
+  // confirm would leak that trailing Enter into whatever prompt mounts next.
+  const [value, setValue] = useState("");
   useCancel((input, key) => {
-    if (key.return && config.default !== undefined) submit(config.default, config.default ? "Yes" : "No");
-    else if (input.toLowerCase() === "y") submit(true, "Yes");
-    else if (input.toLowerCase() === "n") submit(false, "No");
+    if (key.return) {
+      const answer = value.trim().toLowerCase();
+      if (answer === "") {
+        if (config.default !== undefined) submit(config.default, config.default ? "Yes" : "No");
+        return;
+      }
+      if (answer.startsWith("y")) submit(true, "Yes");
+      else if (answer.startsWith("n")) submit(false, "No");
+      else setValue("");
+      return;
+    }
+    if (key.backspace || key.delete) {
+      setValue((current) => current.slice(0, -1));
+      return;
+    }
+    const printable = input.replace(/[\r\n\u0000-\u001f\u007f]/g, "");
+    if (printable) setValue((current) => current + printable);
   }, cancel);
   const suffix = config.default === true ? "(Y/n)" : config.default === false ? "(y/N)" : "(y/n)";
-  return <Frame message={`${config.message} ${suffix}`} />;
+  return <Frame message={`${config.message} ${suffix}`} inline={<> {value}<Text inverse> </Text></>} />;
 }
 
 function SearchPrompt<V>({ config, submit, fail, cancel }: {
@@ -428,8 +449,11 @@ function DirectoryPrompt({ config, submit, cancel }: {
   });
 
   return (
-    <Frame message={config.message} hint="Enter = this directory · type to filter · Tab completes">
-      <Text>{`  ${raw}`}<Text inverse> </Text></Text>
+    <Frame
+      message={config.message}
+      inline={<> {raw}<Text inverse> </Text></>}
+      hint="Enter = this directory · type to filter · Tab completes"
+    >
       <Box flexDirection="column">
         {rows.map((row, index) => {
           const text = `${index === active ? "  ❯" : "   "} ${row.label}`;
