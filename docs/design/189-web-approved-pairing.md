@@ -221,7 +221,7 @@ keyDelivery pending|ready so the poll continues after the auth claim
 - Lifecycle (round-2 B#8): a NEW scheduled key_delivery sweep (add to
   worker.ts's scheduled handler alongside sweepNotifications — NOT reusing it);
   account purge deletes key_delivery (add to account-delete.ts). Migration
-  **0033_key_delivery.sql** (round-2 B#7 BLOCKER: 0032 is taken by
+  **0034_key_delivery.sql** (round-2 B#7 BLOCKER: 0032 is taken by
   account_op_latency; append-only, re-check after rebase — migrations/README.md).
 
 ## 7. Daemon / CLI surface
