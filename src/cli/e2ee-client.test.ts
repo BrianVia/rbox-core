@@ -3,8 +3,22 @@ import { Buffer } from "node:buffer";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { acquireClearMachineGenesisForPairing, assertNoPendingGenesis, beginAtomicGenesis, enrollViaPairing, parsePairingToken } from "./e2ee-client.js";
-import { bootstrapAccount, buildPairing } from "../engine/e2ee/index.js";
+import { acquireClearMachineGenesisForPairing, assertNoPendingGenesis, beginAtomicGenesis, enrollViaPairing, enrollViaWebDelivery, parsePairingToken } from "./e2ee-client.js";
+import {
+  bootstrapAccount,
+  buildAdminRoster,
+  buildPairing,
+  ENC_ALG,
+  generateSignKeyPair,
+  rsaDeviceWrap,
+  SIG_ALG,
+  signPrivateFromPkcs8,
+  toB64url,
+  wrapHash,
+  type RosterBody,
+  type RosterEntry,
+} from "../engine/e2ee/index.js";
+import { generateLoginAttemptKeys } from "./login-attempt-journal.js";
 import { loadDevice, saveDevice } from "./e2ee-keystore.js";
 import { e2eeRoot, genesisPaths, GENESIS_PENDING_MESSAGE, publishPrepublishMarker } from "./genesis-durable.js";
 import { acquireGlobalGenesisLock, genesisLockRoot, globalGenesisLockPath } from "./genesis-locks.js";
@@ -58,6 +72,165 @@ describe("enrollViaPairing redeem errors", () => {
       "device limit reached (2/2 on none) — revoke a device or upgrade; pairing token still valid"
     );
     expect(calls).toBe(1);
+  });
+});
+
+async function webDeliveryFixture() {
+  const accountId = "acct_1891891891891891";
+  const sourceDeviceId = "dev_existing_admin";
+  const targetDeviceId = "dev_web_delivery";
+  const boot = await bootstrapAccount(accountId, sourceDeviceId, 1_900_000_000_000);
+  const keys = generateLoginAttemptKeys();
+  const mkWrap = await rsaDeviceWrap(keys.encPubKeySpki, boot.secrets.mk, {
+    accountId,
+    accountEpoch: 0,
+    wrappedKeyKind: "MK",
+    purpose: "rbox/mk-wrap/device/v1",
+  });
+  const entry: RosterEntry = {
+    deviceId: targetDeviceId,
+    sigAlg: SIG_ALG,
+    encAlg: ENC_ALG,
+    sigPubKey: toB64url(keys.sigPubKey),
+    encPubKey: toB64url(keys.encPubKeySpki),
+    role: "admin",
+    kind: "device",
+    addedAt: 1_900_000_000_001,
+    status: "active",
+    mkWrapHash: await wrapHash(mkWrap),
+  };
+  const previous = JSON.parse(boot.upload.genesisRoster.body) as RosterBody;
+  const signer = {
+    publicKey: boot.secrets.sigPubKey,
+    privateKey: signPrivateFromPkcs8(boot.secrets.sigPrivPkcs8),
+  };
+  const roster = await buildAdminRoster(previous, [...previous.devices, entry], sourceDeviceId, signer);
+  const mkWrapDevice = JSON.stringify(mkWrap);
+  const dto = {
+    recoveryWrap: JSON.stringify(boot.upload.recoveryWrap),
+    recoveryWrapId: boot.upload.recoveryWrapId,
+    rosters: [JSON.stringify(boot.upload.genesisRoster), JSON.stringify(roster)],
+    keyStates: [JSON.stringify(boot.upload.genesisKeyState)],
+    devices: [
+      {
+        deviceId: sourceDeviceId,
+        sigPubkey: boot.upload.device.sigPubKey,
+        encPubkey: boot.upload.device.encPubKey,
+        mkWrap: JSON.stringify(boot.upload.device.mkWrap),
+      },
+      {
+        deviceId: targetDeviceId,
+        sigPubkey: entry.sigPubKey,
+        encPubkey: entry.encPubKey,
+        mkWrap: mkWrapDevice,
+      },
+    ],
+  };
+  const input = {
+    remoteUrl: "https://api.test",
+    token: "device-token",
+    accountId,
+    deviceId: targetDeviceId,
+    requestId: "d".repeat(64),
+    mkWrapDevice,
+    publishedRosterVersion: 1,
+    accountEpoch: 0,
+    keys,
+  };
+  return { accountId, boot, dto, entry, input, keys, previous };
+}
+
+const noOpEnrollmentLocks = async () => ({
+  global: { path: "global", release: async () => {} },
+  account: { path: "account", release: async () => {} },
+});
+
+describe("enrollViaWebDelivery verification", () => {
+  test("verifies the full account chain, unwraps MK, and persists the staged identity once", async () => {
+    const fixture = await webDeliveryFixture();
+    const boundaries: string[] = [];
+    const checkpoints: string[] = [];
+    let saved: Parameters<typeof saveDevice>[0] | undefined;
+    await expect(enrollViaWebDelivery(fixture.input, {
+      api: { getAccountKeys: async () => fixture.dto },
+      acquireLocks: noOpEnrollmentLocks,
+      loadDevice: async () => undefined,
+      saveDevice: async (secrets) => { saved = { ...secrets, mk: new Uint8Array(secrets.mk) }; },
+      persistCheckpoint: async () => { checkpoints.push("persisted"); },
+      onBoundary: async (boundary) => { boundaries.push(boundary); },
+    })).resolves.toEqual({
+      accountId: fixture.accountId,
+      deviceId: fixture.input.deviceId,
+    });
+    expect(saved?.deviceId).toBe(fixture.input.deviceId);
+    expect(Buffer.from(saved!.mk)).toEqual(Buffer.from(fixture.boot.secrets.mk));
+    expect(boundaries).toEqual(["keys-ready", "persisted"]);
+    expect(checkpoints).toEqual(["persisted"]);
+  });
+
+  test("rejects a published roster that does not admit its own exact staged keys", async () => {
+    const fixture = await webDeliveryFixture();
+    const other = generateLoginAttemptKeys();
+    await expect(enrollViaWebDelivery({ ...fixture.input, keys: other }, {
+      api: { getAccountKeys: async () => fixture.dto },
+      acquireLocks: noOpEnrollmentLocks,
+    })).rejects.toThrow("published roster does not admit this device's exact keys");
+  });
+
+  test("rejects wrong current epoch and missing published roster version", async () => {
+    const fixture = await webDeliveryFixture();
+    const deps = {
+      api: { getAccountKeys: async () => fixture.dto },
+      acquireLocks: noOpEnrollmentLocks,
+    };
+    await expect(enrollViaWebDelivery({ ...fixture.input, accountEpoch: 1 }, deps))
+      .rejects.toThrow("account epoch is no longer current");
+    await expect(enrollViaWebDelivery({ ...fixture.input, publishedRosterVersion: 7 }, deps))
+      .rejects.toThrow("published key-delivery roster version is missing");
+  });
+
+  test("rejects a delivered wrap whose hash differs from the published roster commitment", async () => {
+    const fixture = await webDeliveryFixture();
+    const substituted = await rsaDeviceWrap(fixture.keys.encPubKeySpki, fixture.boot.secrets.mk, {
+      accountId: fixture.accountId,
+      accountEpoch: 0,
+      wrappedKeyKind: "MK",
+      purpose: "rbox/mk-wrap/device/v1",
+    });
+    const mkWrapDevice = JSON.stringify(substituted);
+    const dto = {
+      ...fixture.dto,
+      devices: fixture.dto.devices.map((row) =>
+        row.deviceId === fixture.input.deviceId ? { ...row, mkWrap: mkWrapDevice } : row),
+    };
+    await expect(enrollViaWebDelivery({ ...fixture.input, mkWrapDevice }, {
+      api: { getAccountKeys: async () => dto },
+      acquireLocks: noOpEnrollmentLocks,
+    })).rejects.toThrow("delivered MK wrap hash does not match the published roster");
+  });
+
+  test("rejects a chain whose new roster signer was not an active prior admin", async () => {
+    const fixture = await webDeliveryFixture();
+    const stranger = generateSignKeyPair();
+    const invalid = await buildAdminRoster(
+      fixture.previous,
+      [
+        ...fixture.previous.devices,
+        {
+          ...fixture.entry,
+        },
+      ],
+      "dev_stranger",
+      stranger,
+    );
+    const dto = {
+      ...fixture.dto,
+      rosters: [fixture.dto.rosters[0]!, JSON.stringify(invalid)],
+    };
+    await expect(enrollViaWebDelivery(fixture.input, {
+      api: { getAccountKeys: async () => dto },
+      acquireLocks: noOpEnrollmentLocks,
+    })).rejects.toThrow("signer not active in prev");
   });
 });
 

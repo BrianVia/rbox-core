@@ -13,6 +13,8 @@ import type {
   DirectoryPromptConfig,
   InputPromptConfig,
   KeypressPromptConfig,
+  LoginFallbackAnswer,
+  LoginFallbackPromptConfig,
   PasswordPromptConfig,
   PromptChoice,
   PromptValidation,
@@ -455,6 +457,60 @@ function InputPrompt({ config, secret, submit, fail, cancel }: {
   );
 }
 
+function LoginFallbackPrompt({ config, submit, cancel }: {
+  config: LoginFallbackPromptConfig;
+  submit: Submit<LoginFallbackAnswer>;
+  cancel: () => void;
+}) {
+  const [phase, setPhase] = useState<"pairing" | "recovery">("pairing");
+  const [value, setValue] = useState("");
+  const [cursor, setCursor] = useState(0);
+  useCancel((input, key) => {
+    if (key.return) {
+      const answer = value.trim();
+      if (phase === "pairing") {
+        if (answer && config.validPairingToken(answer)) {
+          submit({ kind: "pairing", token: answer }, "pairing token received");
+          setValue("");
+          setCursor(0);
+          return;
+        }
+        setPhase("recovery");
+        setValue("");
+        setCursor(0);
+        return;
+      }
+      if (answer) {
+        submit({ kind: "recovery", phrase: answer }, "recovery phrase received");
+        setValue("");
+        setCursor(0);
+      }
+      return;
+    }
+    const next = editBuffer(value, cursor, input, key);
+    setValue(next.value);
+    setCursor(next.cursor);
+  }, cancel);
+  usePaste((text) => {
+    const next = editBuffer(value, cursor, text, {});
+    setValue(next.value);
+    setCursor(next.cursor);
+  });
+
+  const visible = Array.from(value);
+  const before = phase === "pairing" ? "" : visible.slice(0, cursor).join("");
+  const after = phase === "pairing" ? "" : visible.slice(cursor).join("");
+  const message = phase === "pairing"
+    ? "No key delivery — paste a pairing token, or press Enter for recovery phrase"
+    : "No key delivery — enter your 24-word recovery phrase";
+  return (
+    <Text>
+      {stderrStyle.cyan("?")} {message}{"  "}
+      {phase === "pairing" ? "" : before}<Text inverse> </Text>{after}
+    </Text>
+  );
+}
+
 function ConfirmPrompt({ config, submit, cancel }: {
   config: ConfirmPromptConfig;
   submit: Submit<boolean>;
@@ -809,6 +865,19 @@ export function inkPassword(config: PasswordPromptConfig, streams?: PromptStream
     signal: config.signal,
     ...streamArgs(streams),
     component: ({ submit, fail, cancel }) => <InputPrompt config={config} secret submit={submit} fail={fail} cancel={cancel} />,
+  });
+}
+
+export function inkLoginFallback(
+  config: LoginFallbackPromptConfig,
+  streams?: PromptStreams,
+): Promise<LoginFallbackAnswer> {
+  return mountPrompt({
+    message: "Encryption enrollment fallback",
+    secret: true,
+    ...streamArgs(streams),
+    component: ({ submit, cancel }) =>
+      <LoginFallbackPrompt config={config} submit={submit} cancel={cancel} />,
   });
 }
 

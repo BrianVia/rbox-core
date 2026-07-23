@@ -47,12 +47,22 @@ export interface PasswordPromptConfig {
   signal?: AbortSignal;
 }
 
+export interface LoginFallbackPromptConfig {
+  /** Local grammar gate. Only a true result may leave the prompt as a token. */
+  validPairingToken: (value: string) => boolean;
+}
+
+export type LoginFallbackAnswer =
+  | { kind: "pairing"; token: string }
+  | { kind: "recovery"; phrase: string };
+
 export type SelectPrompt = <V>(config: SelectPromptConfig<V>) => Promise<V>;
 export type CheckboxPrompt = <V>(config: CheckboxPromptConfig<V>) => Promise<V[]>;
 export type SearchPrompt = <V>(config: SearchPromptConfig<V>) => Promise<V>;
 export type InputPrompt = (config: InputPromptConfig) => Promise<string>;
 export type ConfirmPrompt = (config: ConfirmPromptConfig) => Promise<boolean>;
 export type PasswordPrompt = (config: PasswordPromptConfig) => Promise<string>;
+export type LoginFallbackPrompt = (config: LoginFallbackPromptConfig) => Promise<LoginFallbackAnswer>;
 
 export interface KeypressPromptConfig {
   signal?: AbortSignal;
