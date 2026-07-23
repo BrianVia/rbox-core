@@ -262,6 +262,13 @@ test("in sync — clean local diff, remote agrees", () => {
   expect(line).toContain("8,603 files");
 });
 
+test("case-fold path collisions remain an advisory healthy state", () => {
+  const snapshot = base({ pathWarnings: { groupCount: 1, pathCount: 2 } });
+  expect(healthLine(snapshot)).toContain("in sync");
+  expect(healthLine(snapshot)).toContain("1 warning");
+  expect(healthDetailLines(snapshot).join("\n")).toContain("skipped 2 case-conflicting paths");
+});
+
 test("fresh active progress outranks a standing halt and renders the halt as retry context", () => {
   const activity: DaemonActivity = {
     at: iso(10),

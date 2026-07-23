@@ -41,6 +41,9 @@ export interface StatusSnapshot {
   /** Best-effort remote head evidence; undefined = offline/unknown. */
   remote?: StatusRemoteHead;
   activity?: DaemonActivity;
+  /** Local-only advisory: ambiguous case-fold path groups are skipped while the
+   * rest of the file plane continues syncing. Never promotes to a halt. */
+  pathWarnings?: { groupCount: number; pathCount: number };
   populate?: {
     phase: TransferPhase;
     filesDone: number;
@@ -127,6 +130,7 @@ export type BriefStatusSnapshot =
       daemonVersionSkew: boolean;
       locking: LockingHealth;
       git?: BriefGitAttention;
+      pathWarnings?: { groupCount: number; pathCount: number };
       trash?: { files: number; bytes: number };
       update?: { current: string; next: string };
       now: number;
@@ -688,6 +692,10 @@ function fullBriefHeadline(snapshot: Extract<BriefStatusSnapshot, { kind: "full"
     const action = snapshot.active?.phase === "upload" ? "uploading now" : "waiting to upload";
     return `${workspace} · syncing normally — ${changes} ${action}`;
   }
+  if ((snapshot.pathWarnings?.groupCount ?? 0) > 0) {
+    const count = snapshot.pathWarnings!.groupCount;
+    return `${workspace} · synced with ${n(count)} warning${count === 1 ? "" : "s"}`;
+  }
   return `${workspace} · syncing normally`;
 }
 
@@ -726,6 +734,11 @@ export function renderBriefStatus(snapshot: BriefStatusSnapshot): BriefStatusRen
   const locking = lockingAttentionLine(snapshot.locking);
   if (locking) lines.push(locking);
   if (snapshot.behindRemote) lines.push("⚠ remote changes waiting to download · rbox pull");
+  if ((snapshot.pathWarnings?.groupCount ?? 0) > 0) {
+    const groups = snapshot.pathWarnings!.groupCount;
+    const paths = snapshot.pathWarnings!.pathCount;
+    lines.push(`⚠ skipped ${n(paths)} case-conflicting path${paths === 1 ? "" : "s"} in ${n(groups)} group${groups === 1 ? "" : "s"} · rename or remove one; background sync will pick it up`);
+  }
   if (snapshot.git && snapshot.git.count > 0) {
     const repos = `${n(snapshot.git.count)} git repo${snapshot.git.count === 1 ? "" : "s"}`;
     const condition = snapshot.git.allLocalEditDeferrals
@@ -855,6 +868,10 @@ export function healthLine(s: StatusSnapshot): string {
   }
 
   // 6. In sync: no local divergence, and the remote (when reachable) agrees.
+  if ((s.pathWarnings?.groupCount ?? 0) > 0) {
+    const count = s.pathWarnings!.groupCount;
+    return `${style.green("✓ in sync")} — ${n(s.trackedFiles)} files · ${style.yellow(`⚠ ${n(count)} warning${count === 1 ? "" : "s"}`)}`;
+  }
   return `${style.green("✓ in sync")} — ${n(s.trackedFiles)} files`;
 }
 
@@ -864,6 +881,11 @@ export function healthDetailLines(s: StatusSnapshot): string[] {
   const active = freshActive(s);
   const out = s.daemonRunning ? s.activity?.outOfStorage : undefined;
   const lines: string[] = [];
+  if ((s.pathWarnings?.groupCount ?? 0) > 0) {
+    const groups = s.pathWarnings!.groupCount;
+    const paths = s.pathWarnings!.pathCount;
+    lines.push(`${style.yellow("path warning:")} skipped ${n(paths)} case-conflicting path${paths === 1 ? "" : "s"} in ${n(groups)} group${groups === 1 ? "" : "s"}; rename or remove one and background sync will pick it up`);
+  }
   if (halt && halt.typedReason?.kind !== "push-conflict" && !halt.terminal && active && !out) {
     lines.push(`${style.yellow("⚠ last attempt failed")} ${style.dim(`(${relTime(halt.at, s.now)})`)} ${halt.reason} ${style.yellow("— will be retried")}`);
   }

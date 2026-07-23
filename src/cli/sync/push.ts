@@ -7,6 +7,7 @@ import {
   type IgnoreMatcher,
   type GitSection,
   type Manifest,
+  type CaseFoldCollisionGroup,
 } from "../../engine/index.js";
 import { applyStateSavePacket, ensureCapableStateLineage, expectedStateNonce, loadState, manifestFromMeta, repoRecordsForState, stateWasStreamMismatch, syncStreamId, validManifestMeta, type GitResolutionPublicationReceipt, type WorkspaceConfig } from "../config.js";
 import { type CommitOptions, type CommitTimings } from "../remote.js";
@@ -35,10 +36,12 @@ import { beginFirstPublishTiming, finishFirstPublishStats, firstPublishMeasureme
 import { type SyncDeps, withReportScanStats, withCache, withDircache, refreshWriteContext } from "./deps.js";
 import { withPushLaneAccumulator } from "../telemetry/lane-accumulator.js";
 import { withPushTailTiming } from "../push-tail-timing.js";
+import { savePathWarnings } from "../path-warnings.js";
 import { formatCommitTimings, formatScanStats, scanDetailsOf } from "./format.js";
 import { apiFor, MAX_ATTEMPTS, MassDeleteGuardError, NO_GIT_FORCE, pushMassDeleteTrips, makeDeferErrnoReporter, defaultBackoff, filesFirstFlagEnabled, matcherForState, plaintextBytesOf, fileCountOf, scanTick } from "./policy.js";
-import { finishResolutionReceipt, pull, reconcileResolutionReceipt, scanManifestForPush, surfaceResolutionReceiptReconciliation } from "./pull.js";
+import { finishResolutionReceipt, pull, reconcileResolutionReceipt, scanManifestForPushResult, surfaceResolutionReceiptReconciliation } from "./pull.js";
 import { MutationGateClosedError } from "../../engine/mutation-gate.js";
+import { projectLocalManifest } from "../local-file-projection.js";
 
 export function stampManifestSchemaForCommit(manifest: Manifest): Manifest {
   const schema = Math.max(gitReposManifestSchema(manifest.gitRepos) ?? 0, manifestRequiresSchema4(manifest) ? 4 : 0);
@@ -57,8 +60,18 @@ export async function push(
   cfg: WorkspaceConfig,
   deps: SyncDeps = {},
   purgeIgnored = false
-): Promise<{ sequence: number; committed: boolean; gitDeferred?: boolean }> {
+): Promise<{ sequence: number; committed: boolean; gitDeferred?: boolean; caseCollisions: CaseFoldCollisionGroup[] }> {
   if (deps.syncMutex) assertSyncMutex(deps.syncMutex, root);
+  const callerObservation = deps.onCaseCollisionObservation;
+  deps = {
+    ...deps,
+    onCaseCollisionObservation: async (observation) => {
+      if (deps.syncMutex && observation.authority === "authoritative") {
+        await savePathWarnings(root, observation.caseCollisions);
+      }
+      await callerObservation?.(observation);
+    },
+  };
   const reconciliation = await reconcileResolutionReceipt(root, cfg, deps);
   surfaceResolutionReceiptReconciliation(reconciliation, deps);
   const report = deps.report ?? PhaseReport.disabled("push");
@@ -85,8 +98,11 @@ export async function push(
       report.recordDetails("scan", { ...details }, formatScanStats(details));
     }
   }
-  const { sequence, committed, gitDeferred } = await pushManifest(root, cfg, local, deps, { purgeIgnored });
-  return { sequence, committed, ...(gitDeferred ? { gitDeferred } : {}) };
+  const { sequence, committed, gitDeferred, caseCollisions } = await pushManifest(root, cfg, local, deps, {
+    purgeIgnored,
+    localFileObservation: localFileObservationForScan(scanDeferred.size === 0),
+  });
+  return { sequence, committed, caseCollisions, ...(gitDeferred ? { gitDeferred } : {}) };
 }
 
 /** What a push commit reports back to callers holding an in-memory manifest.
@@ -96,6 +112,11 @@ export async function push(
  *  flow once printed "published → sequence 75" for a push that uploaded nothing). */
 export type ResolutionPushResult = { outcome: "published" | "refused" | "aborted-remote-moved" | "ack-uncertain"; reason?: string; sequence?: number };
 export type PushResult = { sequence: number; manifest: Manifest; deferred?: string[]; retryLater?: string[]; committed: boolean; repairConflict?: boolean; resolution?: ResolutionPushResult;
+  /** Complete, deterministic raw collision groups observed for this candidate.
+   * Separate from `deferred`, whose retry contract means source churn. */
+  caseCollisions: CaseFoldCollisionGroup[];
+  /** Final authority after any 409/epoch rescan in this push run. */
+  localFileObservationAuthority: "authoritative" | "preserve";
   /** Design 108 §3.1: set true only on a successful, sequence-advancing files-only
    *  genesis commit (commit 1) with git still owed — signals init to run commit 2. */
   gitDeferred?: boolean };
@@ -201,6 +222,20 @@ export interface PushManifestOptions {
   /** §3.6.3: publish as the PIN's child, snapshot-only, short-circuits bypassed. */
   repair?: RepairPushMode;
   resolution?: GitResolutionRider;
+  /** Whether this caller owns a complete local-file observation. Preserve-mode
+   * callers may supply a prior episode which this publication must not clear. */
+  localFileObservation?:
+    | { authority: "authoritative" }
+    | { authority: "preserve"; caseCollisions?: readonly CaseFoldCollisionGroup[] };
+}
+
+export function localFileObservationForScan(
+  observationComplete: boolean,
+  preserved: readonly CaseFoldCollisionGroup[] = [],
+): NonNullable<PushManifestOptions["localFileObservation"]> {
+  return observationComplete
+    ? { authority: "authoritative" }
+    : { authority: "preserve", caseCollisions: cloneCollisionGroups(preserved) };
 }
 
 export async function pushManifest(
@@ -233,9 +268,23 @@ async function pushManifestInner(
   // Loop-carried attempt state, mutated by the RecoveryAction transitions below.
   const reconciled = await reconcileResolutionReceipt(root, cfg, deps);
   surfaceResolutionReceiptReconciliation(reconciled, deps);
-  if (reconciled.status !== "none") local = await scanManifestForPush(root, cfg, deps, purgeIgnored);
+  let initialObservation = options.localFileObservation;
+  if (reconciled.status !== "none") {
+    const scanned = await scanManifestForPushResult(root, cfg, deps, purgeIgnored);
+    local = scanned.manifest;
+    initialObservation = localFileObservationForScan(
+      scanned.observationComplete,
+      initialObservation?.authority === "preserve" ? initialObservation.caseCollisions : [],
+    );
+  }
   const state: PushAttemptState = {
     local,
+    rawScannedFilePaths: filePathsForCache(local),
+    candidateProjected: false,
+    caseCollisions: initialObservation?.authority === "preserve"
+      ? cloneCollisionGroups(initialObservation.caseCollisions ?? [])
+      : [],
+    observationAuthority: initialObservation?.authority ?? "preserve",
     purgeIgnored,
     forceGitRecapture: options.forceGitRecapture ?? NO_GIT_FORCE,
     recoverAddresses: new Set<string>(),
@@ -250,7 +299,16 @@ async function pushManifestInner(
   // Shared "discard the attempt, rebuild from disk truth" reset — used by the
   // pull-first/epoch-stale arm AND the files-first fallback arm below.
   const rescanReset = async (): Promise<void> => {
-    state.local = await scanManifestForPush(root, cfg, deps, purgeIgnored);
+    const scanned = await scanManifestForPushResult(root, cfg, deps, purgeIgnored);
+    state.local = scanned.manifest;
+    state.rawScannedFilePaths = filePathsForCache(state.local);
+    state.candidateProjected = false;
+    if (scanned.observationComplete) {
+      state.caseCollisions = [];
+      state.observationAuthority = "authoritative";
+    } else {
+      state.observationAuthority = "preserve";
+    }
     state.forceGitRecapture = NO_GIT_FORCE;
     // The manifest was rebuilt; recovery pages from the discarded attempt no longer apply.
     state.recoverAddresses.clear();
@@ -269,7 +327,7 @@ async function pushManifestInner(
       // Repair conflicts deliberately escape this inner budget immediately. The
       // outer repairChain budget owns 409 races; this loop only spends retries on
       // bounded 422 reuploads and epoch refreshes while in repair mode.
-      return { sequence: repair!.parentSequence, manifest: state.local, committed: false, repairConflict: true };
+      return { sequence: repair!.parentSequence, manifest: state.local, committed: false, repairConflict: true, ...resultCollisionMetadata(state) };
     }
     if (outcome.action.kind === "files-first-fallback") {
       // Design 108 §3.2: a files-first attempt committed nothing (every file deferred).
@@ -330,6 +388,10 @@ async function pushManifestInner(
  *  object instead of seven positionals, mutated by the RecoveryAction arms. */
 interface PushAttemptState {
   local: Manifest;
+  rawScannedFilePaths: Set<string>;
+  candidateProjected: boolean;
+  caseCollisions: CaseFoldCollisionGroup[];
+  observationAuthority: "authoritative" | "preserve";
   purgeIgnored: boolean;
   forceGitRecapture: ReadonlySet<string>;
   recoverAddresses: Set<string>;
@@ -343,6 +405,37 @@ interface PushAttemptState {
   filesFirstFallbackUsed: boolean;
   repair?: RepairPushMode;
   resolution?: GitResolutionRider;
+}
+
+function filePathsForCache(manifest: Manifest): Set<string> {
+  return new Set(manifest.files.filter((entry) => entry.type === "file").map((entry) => entry.path));
+}
+
+function cloneCollisionGroups(groups: readonly CaseFoldCollisionGroup[]): CaseFoldCollisionGroup[] {
+  return groups.map((group) => ({ paths: [...group.paths] }));
+}
+
+function mergeCollisionGroups(
+  previous: readonly CaseFoldCollisionGroup[],
+  discovered: readonly CaseFoldCollisionGroup[],
+): CaseFoldCollisionGroup[] {
+  const groups = new Map<string, CaseFoldCollisionGroup>();
+  for (const group of [...previous, ...discovered]) {
+    const paths = [...new Set(group.paths)].sort();
+    groups.set(paths.join("\0"), { paths });
+  }
+  return [...groups.values()].sort((a, b) => {
+    const ak = a.paths.join("\0");
+    const bk = b.paths.join("\0");
+    return ak < bk ? -1 : ak > bk ? 1 : 0;
+  });
+}
+
+function resultCollisionMetadata(state: PushAttemptState): Pick<PushResult, "caseCollisions" | "localFileObservationAuthority"> {
+  return {
+    caseCollisions: cloneCollisionGroups(state.caseCollisions),
+    localFileObservationAuthority: state.observationAuthority,
+  };
 }
 
 async function runPushAttempt(
@@ -370,17 +463,30 @@ async function runPushAttempt(
   const appliedSequence = state.lastSyncedSequence;
   const appliedBase = state.lastSyncedManifest;
   const matcher = matcherForState(root, cfg, state, { purgeSafety: purgeIgnored }); // shared: forward-only ignore carry + git discovery
-  const scannedFilePaths = new Set(local.files.filter((f) => f.type === "file").map((f) => f.path));
+  const scannedFilePaths = attemptState.rawScannedFilePaths;
 
-  // Forward-only ignore (M3b): a file that was synced but is now ignored should
-  // NOT read as a deletion on other machines. Carry forward its last-synced entry
-  // unless --purge explicitly requests propagating the deletion. (A real `rm` of a
-  // non-ignored file is still absent-and-not-ignored → a genuine deletion.)
-  if (!purgeIgnored) {
-    const present = new Set(local.files.map((f) => f.path));
-    const carried = appliedBase.files.filter((e) => !present.has(e.path) && matcher.ignores(e.path));
-    if (carried.length) {
-      local = { ...local, files: [...local.files, ...carried].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0)) };
+  // A 422 retries the already-projected candidate verbatim. A fresh input or a
+  // 409/epoch rescan is projected exactly once against the newly loaded applied
+  // base, after forward-ignore carry and before every publication decision.
+  if (!attemptState.candidateProjected) {
+    const projected = projectLocalManifest(local, appliedBase, matcher, purgeIgnored);
+    attemptState.caseCollisions = attemptState.observationAuthority === "authoritative"
+      ? cloneCollisionGroups(projected.caseCollisions)
+      : mergeCollisionGroups(attemptState.caseCollisions, projected.caseCollisions);
+    attemptState.local = projected.manifest;
+    attemptState.candidateProjected = true;
+    local = projected.manifest;
+    try {
+      await deps.onCaseCollisionObservation?.({
+        authority: attemptState.observationAuthority,
+        caseCollisions: cloneCollisionGroups(attemptState.caseCollisions),
+      });
+    } catch (error) {
+      try {
+        deps.warningSink?.(`rbox: could not record path-collision warning: ${error instanceof Error ? error.message : String(error)}`);
+      } catch {
+        // The warning observer and its diagnostic are advisory by contract.
+      }
     }
   }
 
@@ -575,7 +681,7 @@ async function runPushAttempt(
       }
     }
     if (cfg.encrypted) await pruneEncryptAddressCache(root, cfg, scannedFilePaths);
-    return { done: true, result: { sequence: appliedSequence, manifest: local, committed: false, ...(gitPlan.resolution ? { resolution: gitPlan.resolution } : {}) } };
+    return { done: true, result: { sequence: appliedSequence, manifest: local, committed: false, ...resultCollisionMetadata(attemptState), ...(gitPlan.resolution ? { resolution: gitPlan.resolution } : {}) } };
   }
   // §10 forensic line — only when git-sync did something beyond a steady carry.
   if (cfg.syncGit && (gitPlan.captured.length || gitPlan.deferred.length || gitPlan.removed.length)) {
@@ -652,7 +758,7 @@ async function runPushAttempt(
           return { done: false, action: { kind: "files-first-fallback" }, exhaustedError: "push: files-first fallback exceeded its independent cap" };
         }
         reportDeferred(deferred, deps.warningSink);
-        return { done: true, result: { sequence: appliedSequence, manifest: committed, deferred: [...deferred], retryLater: [...retryLater], committed: false, ...(gitPlan.resolution ? { resolution: gitPlan.resolution } : {}) } };
+        return { done: true, result: { sequence: appliedSequence, manifest: committed, deferred: [...deferred], retryLater: [...retryLater], committed: false, ...resultCollisionMetadata(attemptState), ...(gitPlan.resolution ? { resolution: gitPlan.resolution } : {}) } };
       }
     }
 
@@ -722,6 +828,7 @@ async function runPushAttempt(
           sequence: appliedSequence,
           manifest: committed,
           committed: false,
+          ...resultCollisionMetadata(attemptState),
           resolution: { outcome: "ack-uncertain", reason: "the publish acknowledgement was lost; run rbox push or rbox pull to reconcile" },
         } };
       }
@@ -751,6 +858,7 @@ async function runPushAttempt(
                 sequence: reconciled.sequence,
                 manifest: reconciled.manifest,
                 committed: false,
+                ...resultCollisionMetadata(attemptState),
                 resolution: { outcome: "published", sequence: reconciled.sequence },
               } };
             }
@@ -759,6 +867,7 @@ async function runPushAttempt(
                 sequence: reconciled.sequence,
                 manifest: reconciled.manifest,
                 committed: false,
+                ...resultCollisionMetadata(attemptState),
                 resolution: { outcome: "aborted-remote-moved", reason: "another machine published while confirming" },
               } };
             }
@@ -769,6 +878,7 @@ async function runPushAttempt(
             sequence: postPull.lastSyncedSequence,
             manifest: postPull.lastSyncedManifest,
             committed: false,
+            ...resultCollisionMetadata(attemptState),
             resolution: { outcome: "aborted-remote-moved", reason: "another machine published while confirming" },
           } };
         } catch {
@@ -776,6 +886,7 @@ async function runPushAttempt(
             sequence: appliedSequence,
             manifest: committed,
             committed: false,
+            ...resultCollisionMetadata(attemptState),
             resolution: { outcome: "ack-uncertain", reason: "remote truth could not be authenticated; run rbox push or rbox pull to reconcile" },
           } };
         }
@@ -903,6 +1014,7 @@ async function runPushAttempt(
           sequence: res.sequence!,
           manifest: committed,
           committed: true,
+          ...resultCollisionMetadata(attemptState),
           resolution: { outcome: "ack-uncertain", reason: "the publish landed but local acknowledgement could not be saved; run rbox push or rbox pull" },
         } };
       }
@@ -925,7 +1037,7 @@ async function runPushAttempt(
     }
 
     if (deferred.size > 0) reportDeferred(deferred, deps.warningSink);
-    return { done: true, result: { sequence: res.sequence!, manifest: committed, deferred: [...deferred], retryLater: [...retryLater], committed: true, ...(gitPlan.filesFirstDeferred ? { gitDeferred: true } : {}), ...(gitPlan.resolution ? { resolution: {
+    return { done: true, result: { sequence: res.sequence!, manifest: committed, deferred: [...deferred], retryLater: [...retryLater], committed: true, ...resultCollisionMetadata(attemptState), ...(gitPlan.filesFirstDeferred ? { gitDeferred: true } : {}), ...(gitPlan.resolution ? { resolution: {
       outcome: gitPlan.resolution.outcome,
       ...(gitPlan.resolution.reason ? { reason: gitPlan.resolution.reason } : {}),
       sequence: res.sequence!,

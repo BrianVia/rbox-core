@@ -3,7 +3,9 @@
  * on BOTH devices, then:
  *   1. A writes a new file → assert it lands on B (convergence waiter).
  *   2. B writes a new file → assert it lands on A.
- *   3. CONCURRENT same-path edit on A and B (~1s apart) → wait for settle, then assert
+ *   3. A creates a case-only duplicate pair + safe sibling → safe sibling lands,
+ *      neither ambiguous member lands; remove one → survivor lands automatically.
+ *   4. CONCURRENT same-path edit on A and B (~1s apart) → wait for settle, then assert
  *      design-55 semantics: exactly one winner, at most one `.conflict` sibling, no
  *      conflict blast (conflict-file count ≤ 2), daemons still healthy (no halt).
  *
@@ -64,7 +66,35 @@ export const twoDeviceLive: Scenario = {
         if (!out.ok) throw new Error("B→A propagation timed out");
       });
 
-      // 3. Concurrent same-path edit → settle → design-55 conflict assertions.
+      // 3. A case-only duplicate must not block unrelated passive sync. Both
+      // ambiguous members stay local until the user resolves the group; deleting
+      // one is itself a watcher event and must publish the survivor automatically.
+      const caseUpper = `${GUEST.workDir}/Lucky Meat.md`;
+      const caseLower = `${GUEST.workDir}/Lucky meat.md`;
+      const caseSafe = `${GUEST.workDir}/collision-safe.txt`;
+      await rec.step("[A→B] case collision skips only the ambiguous group", async () => {
+        await Promise.all([
+          ctx.a.writeFile(caseUpper, "upper-case-member"),
+          ctx.a.writeFile(caseLower, "lower-case-member"),
+          ctx.a.writeFile(caseSafe, "safe-beside-collision"),
+        ]);
+        const safe = await waitForPath(ctx.b, caseSafe, (c) => c === "safe-beside-collision", PROPAGATE_TIMEOUT_MS);
+        rec.assert("safe sibling landed while collision was active", safe.ok, safe.ok ? `${safe.elapsedMs}ms` : "safe sibling timed out");
+        rec.assert("neither ambiguous member was published",
+          await ctx.b.readFileIfExists(caseUpper) === undefined && await ctx.b.readFileIfExists(caseLower) === undefined,
+          "receiver contains neither case variant");
+        const status = await ctx.a.rbox(["status", "--json"], { cwd: GUEST.workDir });
+        const warning = JSON.parse(status.stdout) as { pathWarnings?: { groupCount?: number; pathCount?: number } | null };
+        rec.assert("source status exposes advisory collision", warning.pathWarnings?.groupCount === 1 && warning.pathWarnings.pathCount === 2, status.stdout.trim().slice(0, 300));
+      });
+
+      await rec.step("[A→B] resolving collision publishes survivor passively", async () => {
+        await ctx.a.exec(["rm", caseLower]);
+        const survivor = await waitForPath(ctx.b, caseUpper, (c) => c === "upper-case-member", PROPAGATE_TIMEOUT_MS);
+        rec.assert("surviving member landed without manual sync", survivor.ok, survivor.ok ? `${survivor.elapsedMs}ms` : "survivor timed out");
+      });
+
+      // 4. Concurrent same-path edit → settle → design-55 conflict assertions.
       const clash = `${GUEST.workDir}/clash.txt`;
       const clashA = "clash-content-from-A";
       const clashB = "clash-content-from-B";

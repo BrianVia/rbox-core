@@ -1,5 +1,5 @@
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
-import { attachGitSyncProgress } from "./sync-cmd.js";
+import { attachGitSyncProgress, summarizeCaseCollisions } from "./sync-cmd.js";
 import type { SyncDeps } from "./sync.js";
 import type { Spinner } from "./spinner.js";
 
@@ -66,4 +66,19 @@ describe("attachGitSyncProgress", () => {
     expect(errors).toEqual(["git-sync applied foo/repo", "git-sync CONFLICT bar/repo — local kept; remote preserved. Your local Git work is safe; inspect the preserved incoming state before resolving."]);
     expect(deps.onGitProgress).toBeUndefined();
   });
+});
+
+test("case collision summary is successful, bounded, and terminal-safe", () => {
+  const lines: string[] = [];
+  const original = console.log;
+  console.log = (...args: unknown[]) => void lines.push(args.map(String).join(" "));
+  try {
+    summarizeCaseCollisions([{ paths: ["Lucky\nMeat.md", "Lucky\u001b[31mmeat.md"] }]);
+  } finally {
+    console.log = original;
+  }
+  expect(lines[0]).toContain("synced with 1 warning");
+  expect(lines.join("\n")).toContain("background sync will pick it up automatically");
+  expect(lines.join("\n")).not.toContain("\u001b[31m");
+  expect(lines.join("\n").split("\n")).toHaveLength(lines.length);
 });

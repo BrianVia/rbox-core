@@ -33,7 +33,7 @@ import { type SyncDeps, withReportScanStats, withCache, withDircache } from "./d
 import { formatLatestTimings, formatScanStats, scanDetailsOf, formatApplyStats } from "./format.js";
 import { apiFor, makeDeferErrnoReporter, MASS_DELETE_MIN_FILES, MassDeleteGuardError, matcherForState, plaintextBytesOf, fileCountOf, scanTick } from "./policy.js";
 
-export async function scanManifestForPush(root: string, cfg: WorkspaceConfig, deps: SyncDeps, purgeIgnored = false): Promise<Manifest> {
+export async function scanManifestForPushResult(root: string, cfg: WorkspaceConfig, deps: SyncDeps, purgeIgnored = false): Promise<{ manifest: Manifest; observationComplete: boolean }> {
   const report = deps.report ?? PhaseReport.disabled("push");
   const { cache, save } = await withCache(root, deps.cache);
   const { dircache, save: dircacheSave } = await withDircache(root, deps.dircache);
@@ -52,7 +52,11 @@ export async function scanManifestForPush(root: string, cfg: WorkspaceConfig, de
     report.recordDetails("scan", { ...details }, formatScanStats(details));
   }
   await Promise.all([save(), dircacheSave()]);
-  return local;
+  return { manifest: local, observationComplete: scanDeferred.size === 0 };
+}
+
+export async function scanManifestForPush(root: string, cfg: WorkspaceConfig, deps: SyncDeps, purgeIgnored = false): Promise<Manifest> {
+  return (await scanManifestForPushResult(root, cfg, deps, purgeIgnored)).manifest;
 }
 
 /**

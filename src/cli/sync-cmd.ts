@@ -52,6 +52,25 @@ export function summarize(label: string, actions: { kind: string; path?: string;
   for (const c of conflicts) console.log(`  ${style.sym.warn} conflict: ${style.yellow(c.path ?? "?")} ${style.dim(`(local kept as ${c.keepLocalAs})`)}`);
 }
 
+export function summarizeCaseCollisions(groups: readonly { paths: readonly string[] }[]): void {
+  if (groups.length === 0) return;
+  console.log(style.yellow(`synced with ${groups.length} warning${groups.length === 1 ? "" : "s"}`));
+  const shown = groups.slice(0, 5);
+  for (const group of shown) {
+    const paths = group.paths.slice(0, 4).map(safeWarningPath).join(", ");
+    const omitted = Math.max(0, group.paths.length - 4);
+    console.log(`  ${style.sym.warn} skipped case-conflicting paths: ${style.yellow(paths)}${omitted ? style.dim(` (+${omitted} more)`) : ""}`);
+  }
+  if (groups.length > shown.length) console.log(style.dim(`  …and ${groups.length - shown.length} more collision groups`));
+  console.log(style.dim("  rename or remove one; background sync will pick it up automatically"));
+}
+
+function safeWarningPath(value: string): string {
+  return value
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, "�");
+}
+
 export async function runSyncCommand(root: string, opts: { allowMassDelete?: boolean; pullOnly?: boolean; verbose?: boolean } = {}): Promise<void> {
   const sp = spinner("syncing");
   try {
@@ -73,7 +92,7 @@ export async function runSyncCommand(root: string, opts: { allowMassDelete?: boo
         await postSyncNudge(root, pulled, cfg);
         return;
       }
-      const { pulled, pushedSequence, pushCommitted } = await sync(root, cfg, deps);
+      const { pulled, pushedSequence, pushCommitted, caseCollisions } = await sync(root, cfg, deps);
       sp.stop();
       summarize("pulled", pulled, root);
       console.log(
@@ -81,6 +100,7 @@ export async function runSyncCommand(root: string, opts: { allowMassDelete?: boo
           ? `${style.bold("pushed")} ${style.sym.arrow} sequence ${style.cyan(String(pushedSequence))}`
           : `${style.bold("push")}: already in sync ${style.dim(`(sequence ${pushedSequence})`)}`
       );
+      summarizeCaseCollisions(caseCollisions);
       logDebugSummary(report, (l) => console.log(style.dim(l)));
       await postSyncNudge(root, pulled, cfg);
     });

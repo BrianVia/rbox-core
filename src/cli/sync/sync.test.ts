@@ -25,6 +25,7 @@ import {
 } from "../../engine/index.js";
 import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
 import { listTrash } from "../../engine/trash.js";
+import { projectLocalManifest } from "../local-file-projection.js";
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 const shaBytes = (b: Buffer) => createHash("sha256").update(b).digest("hex");
@@ -45,6 +46,36 @@ const fakeGitSection = (): GitSection => ({
 // hands sync.ts. `enc()` mirrors the V4-5 convergent blob derivation.
 const KEK = Buffer.alloc(32, 7);
 const enc = (content: string | Buffer) => encryptFileNameProbe(new Uint8Array(KEK), new Uint8Array(Buffer.from(content)));
+const localEntry = (entryPath: string, content = entryPath, type: "file" | "symlink" = "file"): FileEntry => ({
+  path: entryPath,
+  type,
+  sha256: sha(content),
+  size: Buffer.byteLength(content),
+  mode: type === "symlink" ? 0o777 : 0o644,
+  mtimeMs: 1,
+  ...(type === "symlink" ? { symlinkTarget: content } : {}),
+});
+
+test("projectLocalManifest deterministically skips complete file/symlink case-fold groups", () => {
+  const local: Manifest = {
+    generatedAt: "local",
+    files: [
+      localEntry("z.txt"),
+      localEntry("BETA", "target", "symlink"),
+      localEntry("alpha"),
+      localEntry("Alpha"),
+      localEntry("beta"),
+      localEntry("ALPHA"),
+    ],
+  };
+  const projected = projectLocalManifest(local, { generatedAt: "base", files: [] }, { ignores: () => false });
+
+  expect(projected.caseCollisions).toEqual([
+    { paths: ["ALPHA", "Alpha", "alpha"] },
+    { paths: ["BETA", "beta"] },
+  ]);
+  expect(projected.manifest.files.map((entry) => entry.path)).toEqual(["z.txt"]);
+});
 
 test("stampManifestSchemaForCommit stamps schema 4 only when file or git compression descriptors are present", () => {
   const raw: Manifest = { generatedAt: "", files: [] };
@@ -507,7 +538,7 @@ test("no-op push prunes departed encrypt-cache paths absent from the scan", asyn
 
   const res = await push(root, cfg, deps(remote));
 
-  expect(res).toEqual({ sequence: 0, committed: false });
+  expect(res).toEqual({ sequence: 0, committed: false, caseCollisions: [] });
   expect(remote.commitCalls).toBe(0);
   expect((await readEncryptCache()).entries[stale.plaintextSha]).toBeUndefined();
 });
@@ -959,6 +990,210 @@ test("sha_mismatch once: a file that changes under the push RE-SCANS + retries +
   expect(remote.headSeq()).toBe(1);
   expect(remote.hasBlob((await enc(content)).encSha)).toBe(true); // ciphertext landed on retry
   expect((await remote.latest()).manifest.files.some((f) => f.path === "f.txt")).toBe(true);
+});
+
+// ── case-collision partial progress ──────────────────────────────────────────
+
+test("case-colliding genesis paths are both skipped while a safe sibling commits", async () => {
+  const remote = new FakeRemote();
+  await write("safe.txt", "safe\n");
+  const scanned = await scanManifest(root);
+  const local = { ...scanned, files: [...scanned.files, localEntry("Lucky Meat.md"), localEntry("Lucky meat.md")] };
+  const observed: Array<{ authority: string; paths: string[][] }> = [];
+
+  const result = await pushManifest(root, cfg, local, {
+    ...deps(remote),
+    onCaseCollisionObservation: ({ authority, caseCollisions }) => observed.push({
+      authority,
+      paths: caseCollisions.map((group) => [...group.paths]),
+    }),
+  }, { localFileObservation: { authority: "authoritative" } });
+
+  expect(result.committed).toBe(true);
+  expect(result.caseCollisions).toEqual([{ paths: ["Lucky Meat.md", "Lucky meat.md"] }]);
+  expect(observed).toEqual([{ authority: "authoritative", paths: [["Lucky Meat.md", "Lucky meat.md"]] }]);
+  expect((await remote.latest()).manifest.files.map((entry) => entry.path)).toEqual(["safe.txt"]);
+});
+
+test("collision projection keeps raw disk paths live in the encryption-address cache", async () => {
+  const remote = new FakeRemote();
+  await write("safe.txt", "safe\n");
+  const upper = await enc("upper");
+  const lower = await enc("lower");
+  await writeEncryptCache({
+    [upper.plaintextSha]: { encSha: upper.encSha, cipherSize: upper.ciphertext.length, paths: ["A"] },
+    [lower.plaintextSha]: { encSha: lower.encSha, cipherSize: lower.ciphertext.length, paths: ["a"] },
+  });
+  const scanned = await scanManifest(root);
+  const local = { ...scanned, files: [...scanned.files, localEntry("A", "upper"), localEntry("a", "lower")] };
+
+  await pushManifest(root, cfg, local, deps(remote), {
+    localFileObservation: { authority: "authoritative" },
+  });
+
+  const cache = await readEncryptCache();
+  expect(cache.entries[upper.plaintextSha]?.paths).toEqual(["A"]);
+  expect(cache.entries[lower.plaintextSha]?.paths).toEqual(["a"]);
+});
+
+test("case collision carries the exact prior spelling and bytes while safe changes continue", async () => {
+  const remote = new FakeRemote();
+  await write("Legacy.txt", "v1\n");
+  await write("delete-me.txt", "gone next\n");
+  await push(root, cfg, deps(remote));
+  const base = (await remote.latest()).manifest.files.find((entry) => entry.path === "Legacy.txt")!;
+
+  await write("Legacy.txt", "v2\n");
+  await fs.rm(path.join(root, "delete-me.txt"));
+  await write("safe.txt", "safe\n");
+  const scanned = await scanManifest(root);
+  const local = { ...scanned, files: [...scanned.files, localEntry("legacy.txt", "other\n")] };
+  const result = await pushManifest(root, cfg, local, deps(remote), {
+    localFileObservation: { authority: "authoritative" },
+  });
+
+  const published = await remote.latest();
+  expect(result.committed).toBe(true);
+  expect(result.caseCollisions).toEqual([{ paths: ["Legacy.txt", "legacy.txt"] }]);
+  expect(published.manifest.files.find((entry) => entry.path === "Legacy.txt")?.sha256).toBe(base.sha256);
+  expect(published.manifest.files.some((entry) => entry.path === "legacy.txt")).toBe(false);
+  expect(published.manifest.files.some((entry) => entry.path === "safe.txt")).toBe(true);
+  expect(published.manifest.files.some((entry) => entry.path === "delete-me.txt")).toBe(false);
+});
+
+test("case collision carries a differently-spelled base member and ignore carry can expose the group", async () => {
+  const remote = new FakeRemote();
+  await write("FOO", "base\n");
+  await push(root, cfg, deps(remote));
+  await fs.rm(path.join(root, "FOO"));
+  await write(".rboxignore", "FOO\n");
+  const scanned = await scanManifest(root);
+  const local = { ...scanned, files: [...scanned.files, localEntry("foo", "local\n")] };
+
+  const result = await pushManifest(root, cfg, local, deps(remote), {
+    localFileObservation: { authority: "authoritative" },
+  });
+
+  expect(result.caseCollisions).toEqual([{ paths: ["FOO", "foo"] }]);
+  const paths = (await remote.latest()).manifest.files.map((entry) => entry.path);
+  expect(paths).toContain("FOO");
+  expect(paths).not.toContain("foo");
+  expect(paths).toContain(".rboxignore");
+});
+
+test("an all-collision candidate observes a warning but makes no empty commit", async () => {
+  const remote = new FakeRemote();
+  const local: Manifest = { generatedAt: "local", files: [localEntry("A"), localEntry("a")] };
+  const observations: string[][][] = [];
+
+  const result = await pushManifest(root, cfg, local, {
+    ...deps(remote),
+    onCaseCollisionObservation: ({ caseCollisions }) => observations.push(caseCollisions.map((group) => [...group.paths])),
+  }, { localFileObservation: { authority: "authoritative" } });
+
+  expect(result.committed).toBe(false);
+  expect(remote.commitCalls).toBe(0);
+  expect(result.caseCollisions).toEqual([{ paths: ["A", "a"] }]);
+  expect(observations).toEqual([[['A', 'a']]]);
+});
+
+test("422 retries preserve the raw collision observation and do not re-observe", async () => {
+  const remote = new FakeRemote();
+  remote.forceUnsatisfiedOnce = true;
+  await write("safe.txt", "safe\n");
+  const scanned = await scanManifest(root);
+  const local = { ...scanned, files: [...scanned.files, localEntry("A"), localEntry("a")] };
+  const observations: string[][][] = [];
+
+  const result = await pushManifest(root, cfg, local, {
+    ...deps(remote),
+    onCaseCollisionObservation: ({ caseCollisions }) => observations.push(caseCollisions.map((group) => [...group.paths])),
+  }, { localFileObservation: { authority: "authoritative" } });
+
+  expect(remote.commitCalls).toBe(2);
+  expect(result.caseCollisions).toEqual([{ paths: ["A", "a"] }]);
+  expect(observations).toEqual([[['A', 'a']]]);
+});
+
+test("409 recovery replaces an authoritative collision observation from its fresh rescan", async () => {
+  const remote = new FakeRemote();
+  await write("safe.txt", "safe\n");
+  const scanned = await scanManifest(root);
+  const local = { ...scanned, files: [...scanned.files, localEntry("A"), localEntry("a")] };
+  const observations: string[][][] = [];
+  let injected = false;
+  remote.beforeCommit = async () => {
+    if (injected) return;
+    injected = true;
+    remote.injectCommit([await remote.seedEntry("remote.txt", "remote\n")]);
+  };
+
+  const result = await pushManifest(root, cfg, local, {
+    ...deps(remote),
+    onCaseCollisionObservation: ({ caseCollisions }) => observations.push(caseCollisions.map((group) => [...group.paths])),
+  }, { localFileObservation: { authority: "authoritative" } });
+
+  expect(result.committed).toBe(true);
+  expect(result.caseCollisions).toEqual([]);
+  expect(observations).toEqual([[['A', 'a']], []]);
+});
+
+test("preserve-mode publication retains a prior collision episode", async () => {
+  const remote = new FakeRemote();
+  await write("safe.txt", "safe\n");
+  const local = await scanManifest(root);
+  const prior = [{ paths: ["Old", "old"] }];
+
+  const result = await pushManifest(root, cfg, local, deps(remote), {
+    localFileObservation: { authority: "preserve", caseCollisions: prior },
+  });
+
+  expect(result.caseCollisions).toEqual(prior);
+});
+
+test("a 409 disk rescan upgrades preserve mode to authoritative warning truth", async () => {
+  const remote = new FakeRemote();
+  await write("safe.txt", "safe\n");
+  const local = await scanManifest(root);
+  const prior = [{ paths: ["Old", "old"] }];
+  const observations: Array<{ authority: string; groups: string[][] }> = [];
+  let injected = false;
+  remote.beforeCommit = async () => {
+    if (injected) return;
+    injected = true;
+    remote.injectCommit([await remote.seedEntry("remote.txt", "remote\n")]);
+  };
+
+  const result = await pushManifest(root, cfg, local, {
+    ...deps(remote),
+    onCaseCollisionObservation: ({ authority, caseCollisions }) => observations.push({
+      authority,
+      groups: caseCollisions.map((group) => [...group.paths]),
+    }),
+  }, { localFileObservation: { authority: "preserve", caseCollisions: prior } });
+
+  expect(result.caseCollisions).toEqual([]);
+  expect(observations).toEqual([
+    { authority: "preserve", groups: [["Old", "old"]] },
+    { authority: "authoritative", groups: [] },
+  ]);
+});
+
+test("collision observation failures are advisory and cannot fail safe publication", async () => {
+  const remote = new FakeRemote();
+  await write("safe.txt", "safe\n");
+  const scanned = await scanManifest(root);
+  const local = { ...scanned, files: [...scanned.files, localEntry("A"), localEntry("a")] };
+  const warnings: string[] = [];
+
+  const result = await pushManifest(root, cfg, local, {
+    ...deps(remote),
+    onCaseCollisionObservation: async () => { throw new Error("sidecar unavailable"); },
+    warningSink: (line) => warnings.push(line),
+  }, { localFileObservation: { authority: "authoritative" } });
+
+  expect(result.committed).toBe(true);
+  expect(warnings).toEqual(["rbox: could not record path-collision warning: sidecar unavailable"]);
 });
 
 // ── live-folder partial progress: a churning file is DEFERRED, the rest commits ──

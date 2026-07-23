@@ -4,10 +4,12 @@ import { buildIgnoreMatcher, effectiveIgnoreRules, HashCache, scanManifest } fro
 import { loadConfig, loadState, saveConfig, syncStreamId } from "./config.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
 import { promptConfirm } from "./prompt.js";
-import { makeDeferErrnoReporter, pushManifest } from "./sync.js";
+import { localFileObservationForScan, makeDeferErrnoReporter, pushManifest } from "./sync.js";
 import { deferManifest } from "./sync-recovery.js";
 import { withWorkspaceSyncMutex } from "./sync-mutex.js";
 import { style } from "./style.js";
+import { savePathWarnings } from "./path-warnings.js";
+import { summarizeCaseCollisions } from "./sync-cmd.js";
 
 const RBOXIGNORE = ".rboxignore";
 
@@ -97,16 +99,23 @@ export async function purgeIgnored(root: string, opts: { yes?: boolean; allowMas
     }
     deps.syncMutex = syncMutex;
     deps.allowMassDeletePush = opts.allowMassDelete === true;
-    const res = await pushManifest(root, cfg, final.local, deps, { purgeIgnored: true });
+    deps.onCaseCollisionObservation = async (observation) => {
+      if (observation.authority === "authoritative") await savePathWarnings(root, observation.caseCollisions);
+    };
+    const res = await pushManifest(root, cfg, final.local, deps, {
+      purgeIgnored: true,
+      localFileObservation: localFileObservationForScan(final.observationComplete),
+    });
     console.log(
       res.committed
         ? `purged ${final.purged.length} ignored path${final.purged.length === 1 ? "" : "s"} -> sequence ${res.sequence}`
         : `purge made no remote change (sequence ${res.sequence})`
     );
+    summarizeCaseCollisions(res.caseCollisions);
   });
 }
 
-async function computePurgeCandidate(root: string, cfg: Awaited<ReturnType<typeof buildAuthedRemote>>["cfg"]): Promise<{ local: Awaited<ReturnType<typeof scanManifest>>; purged: string[] }> {
+async function computePurgeCandidate(root: string, cfg: Awaited<ReturnType<typeof buildAuthedRemote>>["cfg"]): Promise<{ local: Awaited<ReturnType<typeof scanManifest>>; purged: string[]; observationComplete: boolean }> {
   const state = await loadState(root, syncStreamId(cfg));
   const matcher = buildIgnoreMatcher(root, {
     respectGitignore: cfg.respectGitignore === true,
@@ -134,7 +143,7 @@ async function computePurgeCandidate(root: string, cfg: Awaited<ReturnType<typeo
     );
   }
   const purged = deleted.filter((p) => matcher.ignores(p)).sort();
-  return { local, purged };
+  return { local, purged, observationComplete: deferred.size === 0 };
 }
 
 function parseOnOff(raw: string | undefined): boolean | undefined {

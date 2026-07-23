@@ -99,6 +99,37 @@ export function isSafeRelPath(p: unknown): p is string {
 
 export type ValidationResult = { ok: true } | { ok: false; error: string };
 
+/** The exact case-equivalence contract used by manifest wire validation. Keep
+ * local publication projection on this helper: locale/filesystem-specific
+ * folding would let a writer author a manifest a reader rejects. */
+export function manifestPathCaseFold(path: string): string {
+  return path.toLowerCase();
+}
+
+export interface CaseFoldCollisionGroup {
+  /** Distinct raw paths in deterministic code-point order. */
+  paths: string[];
+}
+
+/** Return every group of distinct paths that aliases under the wire manifest's
+ * case-insensitive path rule. Exact duplicate paths remain the validator's
+ * separate `duplicate path` error and are intentionally not classified here. */
+export function caseFoldCollisionGroups(
+  entries: readonly { path: string }[],
+): CaseFoldCollisionGroup[] {
+  const byFold = new Map<string, Set<string>>();
+  for (const entry of entries) {
+    const fold = manifestPathCaseFold(entry.path);
+    let paths = byFold.get(fold);
+    if (!paths) byFold.set(fold, paths = new Set());
+    paths.add(entry.path);
+  }
+  return [...byFold.entries()]
+    .filter(([, paths]) => paths.size > 1)
+    .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
+    .map(([, paths]) => ({ paths: [...paths].sort() }));
+}
+
 /** Validate the standalone gitRepos map using the same rules as a manifest.
  * `schema` and `filePaths` let validateManifest additionally enforce its schema
  * gates and file/repo collision rule; persisted fold evidence uses the newest
@@ -155,7 +186,7 @@ export function validateManifest(m: unknown): ValidationResult {
     const p = e.path as string;
 
     if (seen.has(p)) return { ok: false, error: `duplicate path: ${p}` };
-    const lower = p.toLowerCase();
+    const lower = manifestPathCaseFold(p);
     if (seenLower.has(lower)) return { ok: false, error: `case-insensitive duplicate path: ${p}` };
     seen.add(p);
     seenLower.add(lower);

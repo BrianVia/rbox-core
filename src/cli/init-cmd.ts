@@ -41,6 +41,7 @@ import { acknowledgeCacheGeneration } from "./adopt-cache.js";
 import { DirCache, HashCache } from "../engine/index.js";
 import type { AdoptJournal } from "./adopt-journal.js";
 import { genesisClassifierConsultationNeeded } from "./genesis-enrollment.js";
+import { summarizeCaseCollisions } from "./sync-cmd.js";
 
 export const WORKSPACE_DEFINITION =
   "a workspace can be a single repository or a folder of many repositories, or just a folder.";
@@ -549,6 +550,7 @@ async function executeInitPlan(
             ? `published ${style.sym.arrow} sequence ${style.cyan(String(r1.sequence))}`
             : `already in sync — nothing to upload ${style.dim(`(sequence ${r1.sequence})`)}`
         );
+        summarizeCaseCollisions(r1.caseCollisions);
         flushGitSummaries();
         logDebugSummary(report1, (l) => console.log(style.dim(l)));
 
