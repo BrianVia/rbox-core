@@ -47,11 +47,16 @@ export async function getClerk(): Promise<Clerk> {
 	return c;
 }
 
-/** Mount the prebuilt sign-in (with sign-up) component into `el`. */
-export function mountAuth(clerk: Clerk, el: HTMLDivElement): void {
+/** Mount the prebuilt sign-in (with sign-up) component into `el`. `redirectTarget`
+ *  is a caller-validated same-origin path (see safeInternalPath) — forced so the
+ *  full-page Clerk flows (email verification, OAuth) land on the intended deep
+ *  link too, agreeing with the SPA's own post-auth effect. */
+export function mountAuth(clerk: Clerk, el: HTMLDivElement, redirectTarget: string = '/dashboard'): void {
 	clerk.mountSignIn(el, {
 		// Single component that also offers "create account" → covers the marketing funnel.
 		withSignUp: true,
+		forceRedirectUrl: redirectTarget,
+		signUpForceRedirectUrl: redirectTarget,
 		fallbackRedirectUrl: '/dashboard',
 		signUpFallbackRedirectUrl: '/dashboard'
 	});

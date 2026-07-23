@@ -25,8 +25,11 @@ export function requireAuth(): void {
 	});
 }
 
-export function redirectIfSignedIn(): void {
+// `target` defaults to /dashboard; the root route passes a validated
+// `redirect_url` so a signed-out deep link (e.g. /cli-login?code=…) survives the
+// Clerk sign-in bounce instead of being force-sent to /dashboard.
+export function redirectIfSignedIn(target: string = '/dashboard'): void {
 	$effect(() => {
-		if (authState.signedIn) goto('/dashboard');
+		if (authState.signedIn) goto(target);
 	});
 }

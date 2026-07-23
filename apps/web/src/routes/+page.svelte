@@ -4,6 +4,7 @@
 	import { authState, redirectIfSignedIn } from '$lib/auth.svelte';
 	import { mountAuth } from '$lib/clerk';
 	import { peekPlanIntent, stashPlanIntent } from '$lib/plan-intent';
+	import { safeInternalPath } from '$lib/redirect';
 
 	let host = $state<HTMLDivElement>();
 	const PLANS = {
@@ -34,10 +35,16 @@
 			}
 		: null;
 
-	redirectIfSignedIn(); // already signed in → /dashboard
+	// A signed-out deep link (e.g. /cli-login?code=…) redirects here as
+	// /?redirect_url=<that path>. Capture it at script-eval time — before any
+	// redirect race can strip the URL — validated against open-redirect, and feed
+	// it to BOTH the signed-in effect and Clerk so the two agree on one target.
+	const redirectTarget = safeInternalPath(page.url.searchParams.get('redirect_url')) ?? '/dashboard';
+
+	redirectIfSignedIn(redirectTarget);
 
 	onMount(() => {
-		if (authState.clerk && !authState.signedIn && host) mountAuth(authState.clerk, host);
+		if (authState.clerk && !authState.signedIn && host) mountAuth(authState.clerk, host, redirectTarget);
 	});
 </script>
 
