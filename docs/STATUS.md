@@ -22,7 +22,17 @@ design-number collision — 184-front-door-look (uncommitted, other agent's
 worktree) must renumber to 185. Queued: 182 ship order (E1 copy → A0
 capture bracket → A1), beta feedback item 3 (initial-sync filename
 collision — likely new papercut), regress pairing flow fixed for #405
-copy. Time to tell Max — AND the new beta tester._ founder's real-Mac
+copy. Time to tell Max — AND the new beta tester._
+
+_User base (2026-07-23): **four external users** — Max, Ryan (Brian's
+coworker, the engineer/paying customer), plus **two newer less-technical
+users** (one is the 2026-07-22 onboarding-feedback tester). The two
+less-technical users are the best onboarding-feedback source we have —
+treat their friction reports as first-class input (the audits/ pattern:
+capture verbatim, file per-item, fix the sharpest edge per release).
+Non-developer users raise the stakes on copy, error messages, and the
+front-door/setup flow; the compat rule (client skew story for breaking
+changes) now covers four machines we don't control._ founder's real-Mac
 `rbox key save` SUCCEEDED on v1.7.24 after four real-security(1) field
 fixes (bare `login-keychain`; indented-output trim; visible prompt by
 founder directive; readFileSync(0) for compiled-Bun stdin) — PR #398. The
