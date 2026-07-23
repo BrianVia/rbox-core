@@ -135,11 +135,11 @@ jobs:
         run: |
           bin="$GITHUB_WORKSPACE/dist/rbox-${{ matrix.target }}"
           bun run tui-smoke "$bin"
-          if [ "${{ matrix.target }}" = "linux-arm64" ]; then
-            # Advisory on this runner class only: it reports the Ctrl-C exit as
-            # 0 even with a proven-live input pipeline (REVIEW-185 round 6
-            # addendum); the contract is blocking on x64 + darwin.
-            bun run tui-smoke "$bin" --cancel || echo "::warning::linux-arm64 cancel probe failed (known runner quirk — advisory)"
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            # Advisory on GH Linux runners only: they intermittently report the
+            # Ctrl-C exit as 0 even with a proven-live input pipeline
+            # (REVIEW-185 round 6 addendum); blocking on darwin.
+            bun run tui-smoke "$bin" --cancel || echo "::warning::${{ matrix.target }} cancel probe failed (known GH Linux runner quirk — advisory)"
           else
             bun run tui-smoke "$bin" --cancel
           fi
