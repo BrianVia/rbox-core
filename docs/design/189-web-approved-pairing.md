@@ -1,9 +1,9 @@
 # 189 — Web-approved pairing: auto-fulfilled key delivery
 
-Status: DRAFT v4 — after review round 2 (3 parallel codex reviewers, all
-CHANGES-REQUIRED, tightly converged). v4 fixes every round-2 finding; the
-mechanism (§3) is corrected to the verified roster primitives. Ready for the
-final serial review.
+Status: DRAFT v5 — after the serial gate (1 BLOCKER + 3 MAJORs, all
+integration-seam issues vs the existing roster-publish path). v5 SIMPLIFIES:
+the daemon produces the persisted wrap directly and publishes the roster
+server-side at fulfillment; revoke fences delivery. Ready for the serial re-gate.
 
 Related: 47, 184, 180, 12 (roster), 187, 191 (epoch rotation — deferred, §12.1),
 190 (passkey escrow — DECOUPLED, §9), #412 (Clerk redirect fix — MERGED; §8).
@@ -72,32 +72,42 @@ private key + a token-derived admission key the daemon lacks).
 5. Fulfilling daemon fetches the request, verifies approval-authed + pubkey
    binding + current epoch + active source-device, then:
    - fetches the current head roster + verifies the chain it already trusts;
-   - `buildAdminRoster(prevBody, [...active, newEntry], daemonDeviceId,
-     daemonSignKey)` (roster.ts:123) — admits the new device's exact sig+enc
-     pubkeys + mkWrapHash; NO admission proof needed (the daemon is active in
-     prev, so verifyTransition's admin-signature branch validates it,
-     roster.ts:266-272);
    - wraps MK to the new device's enc pubkey via rsaDeviceWrap (keys.ts:93,
-     foreign SPKI confirmed) under a TRANSPORT context "rbox/mk-wrap/web-pair/v1"
-     (domain-separated; never a persisted context);
-   - posts {mkWrapTransport, newSignedRoster, rosterChainRef, accountEpoch}.
+     foreign SPKI confirmed) ONCE, under the PERSISTED device context
+     "rbox/mk-wrap/device/v1" — the daemon holds the device's PUBLIC key, so it
+     produces the exact wrap the new device will store; there is no separate
+     transport context and NO client re-wrap (serial BLOCKER-1: RSA wrapping is
+     randomized, so a client re-wrap could never match the roster's committed
+     mkWrapHash, and assertMkWrapAuthorized would reject it, session.ts:270-275).
+     Only the target device can unwrap it (bound to its pubkey + account/epoch);
+   - `buildAdminRoster(prevBody, [...active, newEntry], daemonDeviceId,
+     daemonSignKey)` (roster.ts:124) with newEntry.mkWrapHash = hash OF THAT
+     wrap — NO admission proof needed (the daemon is active in prev, so
+     verifyTransition's admin-signature branch validates it, roster.ts:266-272);
+   - PUBLISHES the new roster + device row to the server atomically at
+     fulfillment via the existing monotone append (keys.ts:398-426), which 409s
+     on a stale parent. The daemon owns re-fetch-head/rebase/re-sign on 409
+     (it holds the signing key; the client cannot). By the time the client picks
+     up, the admin-signed roster is the PUBLISHED head (serial MAJOR-4: closes
+     the head-race — the client never has to publish a roster it can't sign);
+   - posts {mkWrapDevice, publishedRosterVersion, accountEpoch}.
 6. New CLI polls, receives it, and:
-   - fetches + verifies the FULL roster chain (verifyRosterChain) up to a head it
-     binds through the account key-state/MK trust path (round-2 C#3/A#2: a lone
-     signed roster is NOT self-proving — the device must confirm the DELIVERING
-     daemon was a genuinely active admin via the chain, else a server could
-     supply a bogus roster signed by a key it controls);
-   - confirms the new roster admits its OWN exact pubkeys at the current epoch;
-   - unwraps MK with its enc private key (transport context);
-   - RE-SELF-WRAPS MK to its own enc pubkey under the PERSISTED context
-     "rbox/mk-wrap/device/v1" and stores that (round-2 A#3/B/C: openOwnMasterKey
-     only accepts the device context, session.ts:578 — the transport wrap would
-     fail on reload; mirror redeemPairing's self-wrap, session.ts:493);
-   - persists device.json + the verified roster via the existing enrollment path;
+   - fetches + verifies the FULL roster chain (verifyRosterChain) up to the
+     published head, binding it through the account key-state/MK trust path
+     (round-2 C#3/A#2: a lone signed roster is NOT self-proving — the device must
+     confirm the DELIVERING daemon was a genuinely active admin via the chain,
+     else a server could supply a bogus roster signed by a key it controls);
+   - confirms the published roster admits its OWN exact pubkeys at the current
+     epoch and that mkWrapDevice hashes to the roster's mkWrapHash;
+   - unwraps MK with its enc private key and stores mkWrapDevice AS-IS
+     (openOwnMasterKey accepts it directly — device context, session.ts:578);
+   - persists device.json via the existing keystore;
    - ACKs the server (§7.3).
 
-This resolves the round-2 BLOCKERs: correct admin-roster primitive (all),
-chain-verified signer authority (C#3), transport-vs-persist wrap contexts (all).
+This resolves the round-2 BLOCKERs (admin-roster primitive, chain-verified
+authority) AND the serial BLOCKER-1/MAJOR-4: the daemon commits and delivers ONE
+device-context wrap and publishes the roster itself, so hash commitment and head
+ordering both hold without the client ever signing or re-wrapping.
 
 ## 4. Flow
 
@@ -136,9 +146,13 @@ keyDelivery pending|ready so the poll continues after the auth claim
    (A#4/A#6/B#2). Approval bound to the re-authed session.
 4. Notification: extend the new-device email outbox (mint.ts:176) with
    granted-keys wording + fingerprint.
-5. Single-use + TTL + caps: EVERY transition (approve, fetch, fulfill, poll,
-   ACK, sweep) guards `expires_at > now`; expired/delivered rows never revive
-   (round-2 A#8/B#5). Concrete caps §6.
+5. Single-use + TTL + caps + REVOKE FENCE: EVERY transition (approve, fetch,
+   fulfill, poll, ACK, sweep) guards `expires_at > now` AND the target device is
+   non-revoked; expired/delivered rows never revive (round-2 A#8/B#5; serial
+   MAJOR-3). `rbox device revoke` cancels+scrubs the target's undelivered
+   key_delivery rows in the SAME transaction as the revoke, so "revoke blocks new
+   access" is true for the delivery path (devices.ts revoke must gain this).
+   Concrete caps §6.
 6. Full-strength fingerprint: JCS + validated key encodings, sha256 (A#7).
 7. Approval-page XSS: text-only, no {@html}/innerHTML, a ROUTE-SPECIFIC strict
    CSP for the approval page (round-2 B#10: the global _headers policy allows
@@ -151,11 +165,14 @@ keyDelivery pending|ready so the poll continues after the auth claim
 - `device_auth` gains nullable `enc_pub_key`, `sig_pub_key`, captured-at. `status`
   NOT extended (B#8 — account-link counts pending/approved, account-link.ts:344,
   0014_account_linking.sql:77).
-- Target-ID stability (round-2 B#9): `device/start` proposes an id but poll can
-  RE-MINT on a uniqueness collision (device-code.ts:117-142). The delivery must
-  bind to the request identity (sha256(device_code)) and RETARGET to the actual
-  minted deviceId at claim, before fulfillment, so a queued delivery can't admit
-  the wrong id or reject the real device's ACK.
+- Target-ID stability (round-2 B#9; serial MAJOR-2 crash-safety): `device/start`
+  proposes an id but poll can RE-MINT on a uniqueness collision
+  (device-code.ts:117-142). The delivery binds to the request identity
+  (sha256(device_code)); mint + actual-deviceId recording + delivery retarget are
+  ONE atomic D1 batch at claim (a crash after mint but before retarget must not
+  leave the delivery bound to the discarded proposed id). Fulfillment reads the
+  retargeted id keyed by requestId; if retarget is absent the request is not yet
+  fulfillable (durable reconcile by requestId, not the proposed id).
 - `key_delivery` {requestId=sha256(device_code) PK, account, targetDeviceId
   (retargeted at claim), encPubKeyHash, sigPubKeyHash, approvalTokenHash, state
   `queued|fulfilled|delivered|expired`, wrap_blob, roster_blob, accountEpoch,
@@ -180,6 +197,9 @@ keyDelivery pending|ready so the poll continues after the auth claim
   into each DO via ws-fanout.broadcast (ws-fanout.ts:20) under waitUntil; old
   daemons ignore unknown frames (daemon/daemon.ts:3111). No bound workspace ->
   poll fallback.
+- Revoke fence (serial MAJOR-3): revokeDevice cancels+scrubs the target's
+  undelivered key_delivery rows atomically with the revoke; fetch/fulfill/pickup/
+  ACK all re-check `devices.revoked=0` for the target.
 - Lifecycle (round-2 B#8): a NEW scheduled key_delivery sweep (add to
   worker.ts's scheduled handler alongside sweepNotifications — NOT reusing it);
   account purge deletes key_delivery (add to account-delete.ts). Migration
@@ -232,14 +252,17 @@ pairing token -> phrase until 190 is redesigned + aligned on its own timeline.
 
 ## 10. Verified anchors (rounds 1-2)
 
-- Admin path: buildAdminRoster (roster.ts:123), verified via the prevSigner-active
-  branch (roster.ts:266-272) — daemon needs no admission proof.
+- Admin path: buildAdminRoster (roster.ts:124; :123 is its comment), verified via
+  the prevSigner-active branch (roster.ts:266-272) — no admission proof.
+- Roster monotone publish + 409-on-stale-parent (keys.ts:398-426) — daemon owns
+  rebase/re-sign on 409.
 - rsaDeviceWrap foreign SPKI (keys.ts:93). openOwnMasterKey requires the device
   context (session.ts:578) -> re-self-wrap on receipt.
 - device-code has no pubkey today (device-code.ts:50-72; 0004_auth.sql:17);
   poll can re-mint the id (device-code.ts:117-142).
-- Grants bypass bearer auth, ~5 min, no device binding (grants.ts:22;
-  worker.ts:311; blob-batch-auth-grant.test.ts:101) — §2 correction.
+- Grants bypass bearer auth, ~5 min (GRANT_TTL_MS grants.ts:22), no device
+  binding (worker.ts:311); revoked-download evidence test/worker.test.ts:172 —
+  §2 correction.
 - ws per-workspace DO (src/cli/remote/api.ts:181; routes/sync.ts:30); nudge =
   fan-out into the account's DOs.
 - `rbox device revoke` access-only (devices.ts:16-21); `rbox key revoke` = API
