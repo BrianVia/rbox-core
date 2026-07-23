@@ -12,7 +12,7 @@ import {
 } from "../engine/index.js";
 import { ENCRYPT_ADDRESS_CACHE_REL } from "../engine/encrypt-address-cache.js";
 import { fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
-import { acquireLock, type AcquireLockOptions, type OwnedLock } from "../engine/git/lockfile.js";
+import { acquireLock, captureCommonDirIdentity, type AcquireLockOptions, type OwnedLock } from "../engine/git/lockfile.js";
 import { assertProtocolLockHeld } from "../engine/git/protocol-locks.js";
 import { gitRaw } from "../engine/git/shared.js";
 import type { ConfigStatToken } from "../engine/git/config-txn.js";
@@ -1090,6 +1090,7 @@ async function prepareResetArtifactsUnderFence<T>(
       const journalBinding = {
         stream: state.stream, stateNonce: state.stateNonce!,
         gitDirReal: identity.gitDirReal, commonDirReal: identity.commonDirReal, worktreeId: identity.worktreeId,
+        commonDirIdentity: await captureCommonDirIdentity(identity.commonDirReal),
       };
       const checkout = await recoverJournal(root, relPath, journalBinding);
       if (checkout.status === "keep") throw new Error(`reset refused: published checkout journal for ${relPath}`);

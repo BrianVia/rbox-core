@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import { constants } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fsyncDirectory, writeFileAtomic } from "../fsutil.js";
+import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory, writeFileAtomic } from "../fsutil.js";
 
 const MARKER_PREFIX = "rbox-93";
 const MARKER_MAX_BYTES = 1024;
@@ -65,6 +65,9 @@ export interface DarwinMountStat extends LockStorageStat {
 export interface LockfileHooks {
   link?: (existingPath: string, newPath: string) => Promise<void>;
   afterTempFsync?: (tempPath: string, marker: string) => void | Promise<void>;
+  /** Final cooperative-abort seam after durable staging and immediately before
+   * the hardlink publishes the visible lock. */
+  beforeLink?: (lockPath: string, marker: string) => void | Promise<void>;
   afterCreate?: (lockPath: string, marker: string) => void | Promise<void>;
   beforeCreatedCleanup?: (lockPath: string) => void | Promise<void>;
   beforeReapInspect?: (lockPath: string) => void | Promise<void>;
@@ -72,13 +75,39 @@ export interface LockfileHooks {
   beforeReleaseUnlink?: (lockPath: string) => void | Promise<void>;
 }
 
-interface MarkerObservation {
+export interface MarkerObservation {
   dev: bigint;
   inode: bigint;
   size: bigint;
   mtimeNs: bigint;
+  /** Byte-preserving latin1 prefix (ASCII for rbox markers). */
   raw: string;
 }
+
+/** JSON-safe form of the exact no-follow observation used as unlink authority. */
+export interface SerializedMarkerObservation {
+  dev: string;
+  inode: string;
+  size: string;
+  mtimeNs: string;
+  raw: string;
+}
+
+/** Filesystem identity fence for a canonical Git common directory. */
+export interface CommonDirIdentity {
+  path: string;
+  realpath: string;
+  dev: string;
+  ino: string;
+  birthtimeNs: string;
+}
+
+export type ProcessIncarnationClassification = "alive" | "dead" | "unknown";
+
+export type MarkerPublishResult =
+  | { status: "created"; observation: MarkerObservation }
+  | { status: "exists" }
+  | { status: "error"; error: unknown };
 
 export type LockInspection =
   | { kind: "absent" }
@@ -140,6 +169,115 @@ const darwinFallbackOwnStart = Math.max(1, Math.floor((Date.now() - process.upti
 
 function errno(error: unknown): string | undefined {
   return (error as NodeJS.ErrnoException | undefined)?.code;
+}
+
+/** Shared strict validator for journal-carried process incarnations. */
+export function validProcessIncarnation(value: unknown): value is ProcessIncarnation {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const owner = value as Partial<ProcessIncarnation>;
+  return typeof owner.hostId === "string" && owner.hostId.length > 0 && owner.hostId.length <= 256
+    && typeof owner.bootId === "string" && owner.bootId.length > 0 && owner.bootId.length <= 256
+    && Number.isSafeInteger(owner.pid) && (owner.pid ?? 0) > 0
+    && typeof owner.startTime === "string" && owner.startTime.length > 0 && owner.startTime.length <= 128;
+}
+
+/** Classify an owner by host, boot, PID, and process-start identity. A host
+ * mismatch or any unavailable evidence is unknown; neither authorizes reap. */
+export async function classifyProcessIncarnation(
+  owner: ProcessIncarnation,
+  identity: LockIdentitySource = systemLockIdentity,
+): Promise<ProcessIncarnationClassification> {
+  if (!validProcessIncarnation(owner)) return "unknown";
+  let current: ProcessIncarnation;
+  try {
+    current = await identity.current();
+  } catch {
+    return "unknown";
+  }
+  if (current.hostId !== owner.hostId) return "unknown";
+  if (current.bootId !== owner.bootId) return "dead";
+  try {
+    const probe = await identity.probe(owner.pid);
+    if (probe.status === "unknown") return "unknown";
+    return probe.status === "dead" || probe.startTime !== owner.startTime ? "dead" : "alive";
+  } catch {
+    return "unknown";
+  }
+}
+
+/** Capture a path-and-inode fence without accepting a symlink alias. */
+export async function captureCommonDirIdentity(commonDir: string): Promise<CommonDirIdentity> {
+  const absolute = path.resolve(commonDir);
+  const realpath = await fs.realpath(absolute);
+  if (realpath !== absolute) throw new Error(`symlinked Git common directory is unsupported: ${absolute}`);
+  const stat = await fs.lstat(realpath, { bigint: true });
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`invalid Git common directory: ${absolute}`);
+  return {
+    path: absolute,
+    realpath,
+    dev: stat.dev.toString(),
+    ino: stat.ino.toString(),
+    birthtimeNs: stat.birthtimeNs.toString(),
+  };
+}
+
+/** Revalidate both canonical pathname and filesystem identity. */
+export async function commonDirIdentityMatches(expected: CommonDirIdentity): Promise<boolean> {
+  try {
+    const current = await captureCommonDirIdentity(expected.path);
+    return current.realpath === expected.realpath && current.dev === expected.dev
+      && current.ino === expected.ino && current.birthtimeNs === expected.birthtimeNs;
+  } catch {
+    return false;
+  }
+}
+
+/** Validate/create a lock's bounded parent without following symlink
+ * components. Missing parents are explicit absence for recovery callers. */
+export async function safeBoundLockParent(
+  root: string,
+  leaf: string,
+  options: { create: boolean },
+): Promise<"safe" | "absent"> {
+  const boundedRoot = path.resolve(root);
+  const boundedLeaf = path.resolve(leaf);
+  if (!path.isAbsolute(root) || !path.isAbsolute(leaf) || boundedLeaf !== leaf || !boundedLeaf.endsWith(".lock")
+    || !boundedLeaf.startsWith(`${boundedRoot}${path.sep}`)) {
+    throw new Error(`Git lock path escaped common directory: ${leaf}`);
+  }
+  let rootStat;
+  try {
+    rootStat = await fs.lstat(boundedRoot);
+  } catch (error) {
+    if (errno(error) === "ENOENT") return "absent";
+    throw error;
+  }
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw new Error(`unsafe Git lock root: ${boundedRoot}`);
+  const rootReal = await fs.realpath(boundedRoot);
+  if (rootReal !== boundedRoot) throw new Error(`symlinked Git lock root is unsupported: ${boundedRoot}`);
+
+  const parent = path.dirname(boundedLeaf);
+  if (options.create) {
+    const created = await ensureDirectoryChain(parent, "Git lock parent");
+    await fsyncCreatedDirectoryAncestors(parent, created);
+  }
+  let cursor = boundedRoot;
+  for (const component of path.relative(boundedRoot, parent).split(path.sep).filter(Boolean)) {
+    cursor = path.join(cursor, component);
+    let stat;
+    try {
+      stat = await fs.lstat(cursor);
+    } catch (error) {
+      if (errno(error) === "ENOENT" && !options.create) return "absent";
+      throw error;
+    }
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`unsafe Git lock parent: ${cursor}`);
+  }
+  const parentReal = await fs.realpath(parent);
+  if (parentReal !== rootReal && !parentReal.startsWith(`${rootReal}${path.sep}`)) {
+    throw new Error(`Git lock parent escaped common directory: ${parent}`);
+  }
+  return "safe";
 }
 
 function isLinkUnsupported(error: unknown): boolean {
@@ -548,6 +686,45 @@ function statToken(stat: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigi
   return { dev: stat.dev, inode: stat.ino, size: stat.size, mtimeNs: stat.mtimeNs };
 }
 
+export function serializeMarkerObservation(observation: MarkerObservation): SerializedMarkerObservation {
+  return {
+    dev: observation.dev.toString(),
+    inode: observation.inode.toString(),
+    size: observation.size.toString(),
+    mtimeNs: observation.mtimeNs.toString(),
+    raw: observation.raw,
+  };
+}
+
+const UNSIGNED_INTEGER = /^(?:0|[1-9]\d*)$/;
+const SIGNED_INTEGER = /^(?:0|-?[1-9]\d*)$/;
+
+/** Parse journal authority without accepting numbers (which lose inode
+ * precision), noncanonical decimals, oversized prefixes, or inconsistent
+ * sizes. Files larger than MARKER_MAX_BYTES carry the exact stat tuple plus
+ * the bounded prefix returned by the no-follow reader. */
+export function deserializeMarkerObservation(value: unknown): MarkerObservation | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const observation = value as Partial<SerializedMarkerObservation>;
+  if (Object.keys(observation).sort().join(",") !== "dev,inode,mtimeNs,raw,size"
+    || typeof observation.dev !== "string" || !UNSIGNED_INTEGER.test(observation.dev)
+    || typeof observation.inode !== "string" || !UNSIGNED_INTEGER.test(observation.inode)
+    || typeof observation.size !== "string" || !UNSIGNED_INTEGER.test(observation.size)
+    || typeof observation.mtimeNs !== "string" || !SIGNED_INTEGER.test(observation.mtimeNs)
+    || typeof observation.raw !== "string" || observation.raw.length > MARKER_MAX_BYTES) return undefined;
+  const parsed: MarkerObservation = {
+    dev: BigInt(observation.dev),
+    inode: BigInt(observation.inode),
+    size: BigInt(observation.size),
+    mtimeNs: BigInt(observation.mtimeNs),
+    raw: observation.raw,
+  };
+  const prefixBytes = BigInt(parsed.raw.length);
+  if (parsed.size < prefixBytes) return undefined;
+  if (parsed.size <= BigInt(MARKER_MAX_BYTES)) return parsed.size === prefixBytes ? parsed : undefined;
+  return prefixBytes === BigInt(MARKER_MAX_BYTES) ? parsed : undefined;
+}
+
 function sameStat(a: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint }, b: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint }): boolean {
   return a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeNs === b.mtimeNs;
 }
@@ -573,14 +750,14 @@ async function readMarkerNoFollow(lockPath: string): Promise<MarkerRead | undefi
       const { bytesRead } = await handle.read(bounded, 0, bounded.length, 0);
       const after = await handle.stat({ bigint: true });
       if (!sameStat(opened, after)) return { ...token, raw: "", reason: "lock changed during inspection" };
-      return { ...statToken(opened), raw: bounded.subarray(0, bytesRead).toString("utf8"), reason: "oversized lock marker" };
+      return { ...statToken(opened), raw: bounded.subarray(0, bytesRead).toString("latin1"), reason: "oversized lock marker" };
     }
     const bytes = Buffer.alloc(MARKER_MAX_BYTES + 1);
     const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
     const after = await handle.stat({ bigint: true });
     if (!sameStat(opened, after) || BigInt(bytesRead) !== opened.size) return { ...token, raw: "", reason: "lock changed during inspection" };
     if (bytesRead > MARKER_MAX_BYTES) return { ...token, raw: "", reason: "oversized lock marker" };
-    const raw = bytes.subarray(0, bytesRead).toString("utf8");
+    const raw = bytes.subarray(0, bytesRead).toString("latin1");
     const marker = parseLockMarker(raw);
     return { ...statToken(opened), raw, marker, reason: marker ? undefined : "malformed or foreign lock marker" };
   } catch (error) {
@@ -589,6 +766,14 @@ async function readMarkerNoFollow(lockPath: string): Promise<MarkerRead | undefi
   } finally {
     await handle?.close().catch(() => {});
   }
+}
+
+/** No-follow observation seam for journal-backed Git reservations. Unlike
+ * acquireLock(), this primitive never decides that an existing marker is stale
+ * and never reaps it: recovery authority belongs to the caller's durable
+ * journal. */
+export async function observeLockMarker(lockPath: string): Promise<MarkerRead | undefined> {
+  return readMarkerNoFollow(lockPath);
 }
 
 interface DarwinMountEntry {
@@ -747,6 +932,7 @@ async function atomicCreateMarker(lockPath: string, raw: string, hooks?: Lockfil
     handle = undefined;
     await hooks?.afterTempFsync?.(tempPath, raw);
     try {
+      await hooks?.beforeLink?.(lockPath, raw);
       await (hooks?.link ?? fs.link)(tempPath, lockPath);
       return { status: "created" };
     } catch (error) {
@@ -762,23 +948,57 @@ async function atomicCreateMarker(lockPath: string, raw: string, hooks?: Lockfil
   }
 }
 
-function sameObservation(actual: MarkerRead, expected: MarkerObservation): boolean {
+/** Publish one caller-generated marker with the same durable hardlink/O_EXCL
+ * protocol as acquireLock(), but without its dead-owner auto-reap policy. */
+export async function publishLockMarker(
+  lockPath: string,
+  raw: string,
+  hooks?: LockfileHooks,
+): Promise<MarkerPublishResult> {
+  if (!parseLockMarker(raw)) return { status: "error", error: new Error("invalid rbox lock marker") };
+  const created = await atomicCreateMarker(lockPath, raw, hooks);
+  if (created.status === "exists") return { status: "exists" };
+  if (created.status !== "created") return { status: "error", error: created.error ?? new Error("lock marker publication failed") };
+  const finalized = await finalizeCreated(lockPath, raw, hooks);
+  if (!finalized.ok) return { status: "error", error: finalized.error ?? new Error("created lock verification failed") };
+  return { status: "created", observation: finalized.observation };
+}
+
+export function sameMarkerObservation(actual: MarkerObservation, expected: MarkerObservation): boolean {
   return actual.raw === expected.raw && actual.dev === expected.dev && actual.inode === expected.inode
     && actual.size === expected.size && actual.mtimeNs === expected.mtimeNs;
 }
 
 async function unlinkIfExact(lockPath: string, expected: string | MarkerObservation, hook?: () => void | Promise<void>): Promise<boolean> {
   const before = await readMarkerNoFollow(lockPath);
-  if (!before || (typeof expected === "string" ? before.raw !== expected : !sameObservation(before, expected))) return false;
+  if (!before || (typeof expected === "string" ? before.raw !== expected : !sameMarkerObservation(before, expected))) return false;
   await hook?.();
   const after = await readMarkerNoFollow(lockPath);
-  if (!after || (typeof expected === "string" ? after.raw !== expected : !sameObservation(after, expected))) return false;
+  if (!after || (typeof expected === "string" ? after.raw !== expected : !sameMarkerObservation(after, expected))) return false;
   try {
     await fs.unlink(lockPath);
     return true;
   } catch (error) {
     if (errno(error) === "ENOENT") return false;
     throw error;
+  }
+}
+
+/** Exact observation-based release for journal-backed Git reservations. The
+ * inode/marker/size/mtime tuple is re-read twice and the containing directory is
+ * fsynced after unlink. A successor or symlink replacement is preserved. */
+export async function releaseObservedLock(
+  lockPath: string,
+  expected: MarkerObservation,
+  hook?: () => void | Promise<void>,
+): Promise<LockReleaseResult> {
+  try {
+    const released = await unlinkIfExact(lockPath, expected, hook);
+    if (!released) return { released: false, durable: false };
+    const durable = await fsyncDirectory(path.dirname(lockPath)).then(() => true, () => false);
+    return { released: true, durable };
+  } catch (error) {
+    return { released: false, durable: false, error };
   }
 }
 
@@ -805,23 +1025,30 @@ function blockerFor(inspection: Exclude<LockInspection, { kind: "absent" }>): Re
   return { inspection, kind: "foreign", reason: "foreign" };
 }
 
-async function verifyCreated(lockPath: string, raw: string): Promise<boolean> {
-  const read = await readMarkerNoFollow(lockPath);
-  return read?.raw === raw;
-}
-
-async function finalizeCreated(lockPath: string, raw: string, hooks?: LockfileHooks): Promise<{ ok: true } | { ok: false; cleaned: boolean; error?: unknown }> {
+async function finalizeCreated(lockPath: string, raw: string, hooks?: LockfileHooks): Promise<{ ok: true; observation: MarkerObservation } | { ok: false; cleaned: boolean; error?: unknown }> {
+  let created: MarkerRead | undefined;
+  try {
+    created = await readMarkerNoFollow(lockPath);
+  } catch (error) {
+    return { ok: false, cleaned: false, error };
+  }
+  if (!created || created.raw !== raw) {
+    return { ok: false, cleaned: false, error: new Error("created lock changed before finalization") };
+  }
   let failure: unknown;
   try {
     await fsyncDirectory(path.dirname(lockPath));
     await hooks?.afterCreate?.(lockPath, raw);
-    if (await verifyCreated(lockPath, raw)) return { ok: true };
+    const verified = await readMarkerNoFollow(lockPath);
+    if (verified && sameMarkerObservation(verified, created)) return { ok: true, observation: created };
     failure = new Error("created lock verification failed");
   } catch (error) {
     failure = error;
   }
   try {
-    return { ok: false, cleaned: await unlinkIfExact(lockPath, raw, () => hooks?.beforeCreatedCleanup?.(lockPath)), error: failure };
+    const cleaned = await unlinkIfExact(lockPath, created, () => hooks?.beforeCreatedCleanup?.(lockPath));
+    if (cleaned) await fsyncDirectory(path.dirname(lockPath));
+    return { ok: false, cleaned, error: failure };
   } catch (error) {
     return { ok: false, cleaned: false, error };
   }
@@ -841,7 +1068,7 @@ async function acquireFence(
     const created = await atomicCreateMarker(fencePath, raw, hooks);
     if (created.status === "created") {
       const finalized = await finalizeCreated(fencePath, raw, hooks);
-      if (finalized.ok) return { status: "acquired", lock: new OwnedLock(fencePath, marker, raw, identity, hooks) };
+      if (finalized.ok) return { status: "acquired", lock: new OwnedLock(fencePath, marker, raw, finalized.observation, identity, hooks) };
       if (finalized.cleaned) return { status: "retry" };
       staleOwnedMarkers.set(fencePath, raw);
       const inspection = await inspectLock(fencePath, identity, storageLocal);
@@ -919,13 +1146,15 @@ export class OwnedLock {
     readonly path: string,
     readonly marker: LockMarker,
     readonly raw: string,
+    private readonly observation: MarkerObservation,
     private readonly identity: LockIdentitySource,
     private readonly hooks?: LockfileHooks,
   ) {}
 
   async isOwner(): Promise<boolean> {
     try {
-      return (await readMarkerNoFollow(this.path))?.raw === this.raw;
+      const current = await readMarkerNoFollow(this.path);
+      return current !== undefined && sameMarkerObservation(current, this.observation);
     } catch {
       return false;
     }
@@ -938,7 +1167,7 @@ export class OwnedLock {
 
   async release(): Promise<LockReleaseResult> {
     try {
-      const released = await unlinkIfExact(this.path, this.raw, () => this.hooks?.beforeReleaseUnlink?.(this.path));
+      const released = await unlinkIfExact(this.path, this.observation, () => this.hooks?.beforeReleaseUnlink?.(this.path));
       if (!released) {
         const read = await readMarkerNoFollow(this.path).catch(() => undefined);
         if (read?.raw === this.raw) staleOwnedMarkers.set(this.path, this.raw);
@@ -978,7 +1207,7 @@ export async function acquireLock(lockPath: string, options: AcquireLockOptions 
     const created = await atomicCreateMarker(lockPath, raw, options.hooks);
     if (created.status === "created") {
       const finalized = await finalizeCreated(lockPath, raw, options.hooks);
-      if (finalized.ok) return { status: "acquired", lock: new OwnedLock(lockPath, marker, raw, identity, options.hooks) };
+      if (finalized.ok) return { status: "acquired", lock: new OwnedLock(lockPath, marker, raw, finalized.observation, identity, options.hooks) };
       if (finalized.cleaned) return { status: "error", error: finalized.error ?? new Error("created lock verification failed") };
       staleOwnedMarkers.set(lockPath, raw);
     } else if (created.status === "unsupported") return { status: "unsupported", error: created.error };

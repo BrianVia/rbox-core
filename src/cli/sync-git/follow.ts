@@ -29,6 +29,7 @@ import {
   type GitSection,
   basePresentKeepRef,
 } from "../../engine/index.js";
+import { captureCommonDirIdentity } from "../../engine/git/lockfile.js";
 import { branchesCheckedOutElsewhere } from "../../engine/git/apply.js";
 import {
   humanDisplacementOrigin,
@@ -38,6 +39,7 @@ import {
   runUpdateRefTransaction,
 } from "../../engine/git/keep-pins.js";
 import { hashFile } from "../../engine/hash.js";
+import type { MutationBoundary } from "../../engine/mutation-gate.js";
 import { pruneStaleScratchRefs } from "../../engine/git/pins.js";
 import { listRefs, readAllRefs, readOpState, readOpStateSnapshot } from "../../engine/git/refs.js";
 import { OP_STATE_CLASSIFICATION, OP_STATE_DIRS, OP_STATE_FILES, type OpStateRoot } from "../../engine/manifest-validate.js";
@@ -169,6 +171,7 @@ interface FollowOptions {
   forcedHeldRefs?: GitPartialApply["heldRefs"];
   /** Deterministic preservation-boundary race injection for §130 tests. */
   afterBranchPinsPrepared?: (ref: string) => void | Promise<void>;
+  mutationBoundary?: MutationBoundary;
   /** Runs after the exact initial classifier and before staged scratch refs are
    * cleaned. The callback may persist an attempt only if its trusted edge still
    * matches after all orchestration/composer inputs have been consumed. */
@@ -288,11 +291,13 @@ function deferResult(
 }
 
 export async function checkoutJournalBinding(stream: string, stateNonce: string, ctx: RepoCtx): Promise<CheckoutJournalBinding> {
+  const commonDirReal = await fs.realpath(ctx.commonDir);
   return {
     stream,
     stateNonce,
     gitDirReal: await fs.realpath(ctx.gitDir),
-    commonDirReal: await fs.realpath(ctx.commonDir),
+    commonDirReal,
+    commonDirIdentity: await captureCommonDirIdentity(commonDirReal),
     worktreeId: await fs.realpath(ctx.repoDir).catch(() => path.resolve(ctx.repoDir)),
   };
 }
@@ -335,6 +340,7 @@ export async function quarantineUnboundFollowJournal(workspaceRoot: string, relP
     stateNonce,
     gitDirReal: "",
     commonDirReal: "",
+    commonDirIdentity: { path: "", realpath: "", dev: "", ino: "", birthtimeNs: "" },
     worktreeId: "",
   });
 }
@@ -1406,6 +1412,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
       capabilityProbe: opts.capabilityProbe,
       capabilitySupported: true,
       journal: { workspaceRoot: opts.workspaceRoot, relPath: opts.relPath, value: journal },
+      mutationBoundary: opts.mutationBoundary,
       secondProof: async () => {
         const freshCtx = await repoCtx(opts.ctx.repoDir);
         const freshBinding = freshCtx ? await checkoutJournalBinding(opts.binding.stream, opts.binding.stateNonce, freshCtx) : undefined;

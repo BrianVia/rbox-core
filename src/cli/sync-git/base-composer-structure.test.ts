@@ -112,11 +112,11 @@ test("design 130 raw update-ref command sites are a closed allowlist", async () 
     "src/engine/git/apply.ts": 3,
     "src/engine/git/base-artifacts.ts": 1,
     "src/engine/git/checkout-txn.ts": 1,
-    "src/engine/git/journal.ts": 2,
     "src/engine/git/keep-pins.ts": 2,
     "src/engine/git/pins.ts": 4,
     "src/engine/git/quarantine.ts": 3,
     "src/engine/git/rollback.ts": 4,
+    "src/engine/git/v1724-journal-fixture.test-helper.ts": 1,
   });
 });
 

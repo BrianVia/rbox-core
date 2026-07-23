@@ -10,6 +10,7 @@ import { conflictName, type Action } from "./reconcile.js";
 import { poolMap } from "./pool.js";
 import type { TrashBatch } from "./trash.js";
 import type { FileEntry, Manifest } from "./types.js";
+import { MutationGateClosedError, type MutationBoundary } from "./mutation-gate.js";
 import {
   addDirComponentWalks, addPreflightMs, addUniqueDirs, addWritePoolMs,
   applyStatsEnabled, countLstat, countMkdir, countRename, countStage, mkdirCounted,
@@ -58,6 +59,7 @@ export interface ApplyOptions {
    *  ancestor file moved aside). The daemon logs it and counts `lastPull.conflicts`. */
   onTypeFlip?: (relPath: string) => void;
   warningSink?: (line: string) => void;
+  mutationBoundary?: MutationBoundary;
 }
 
 /**
@@ -158,11 +160,15 @@ export async function applyActions(
         for (const a of rest) {
           const obstruction = shallowestObstructedAncestor(a.entry.path, obstructed);
           if (!obstruction) continue;
+          const stageLease = opts.mutationBoundary?.enter({ phase: "file-apply", repository: a.entry.path });
+          if (stageLease && !stageLease.beginCommit()) { stageLease.finish(); throw new MutationGateClosedError(); }
           const tmp = tmpName(path.join(destRoot, obstruction));
           try {
             await stageEntryToTemp(tmp, a.entry, store, opts.kek);
           } catch (e) {
             throw stagingError(a.entry.path, e);
+          } finally {
+            stageLease?.finish();
           }
           prepared.set(a, tmp);
         }
@@ -172,8 +178,14 @@ export async function applyActions(
       // one obstruction; every affected entry is already staged+verified above.
       for (const comp of shallowFirst) {
         if (!obstructed.has(comp)) continue;
-        opts.onTypeFlip?.(comp);
-        await moveAside(destRoot, comp, conflictName(comp, device, now));
+        const lease = opts.mutationBoundary?.enter({ phase: "file-apply", repository: comp });
+        if (lease && !lease.beginCommit()) { lease.finish(); throw new MutationGateClosedError(); }
+        try {
+          opts.onTypeFlip?.(comp);
+          await moveAside(destRoot, comp, conflictName(comp, device, now));
+        } finally {
+          lease?.finish();
+        }
       }
 
       if (measured) addPreflightMs(performance.now() - preT0);
@@ -183,13 +195,13 @@ export async function applyActions(
         await poolMap(rest, dlConc, async (a) => {
           if (a.kind === "write") {
             await writeEntry(destRoot, a.entry, a.expectedLocal, store, device, now, {
-              kek: opts.kek, trash: opts.trash, onTypeFlip: opts.onTypeFlip, preparedTmp: prepared.get(a),
+              kek: opts.kek, trash: opts.trash, onTypeFlip: opts.onTypeFlip, preparedTmp: prepared.get(a), mutationBoundary: opts.mutationBoundary,
             });
           } else if (a.kind === "conflict") {
             // Reconcile already decided both sides diverged. Stage and verify the
             // remote first; only then preserve the local at its chosen conflict name.
             await writeEntry(destRoot, a.entry, undefined, store, device, now, {
-              kek: opts.kek, trash: opts.trash, onTypeFlip: opts.onTypeFlip, keepLocalAs: a.keepLocalAs, preparedTmp: prepared.get(a),
+              kek: opts.kek, trash: opts.trash, onTypeFlip: opts.onTypeFlip, keepLocalAs: a.keepLocalAs, preparedTmp: prepared.get(a), mutationBoundary: opts.mutationBoundary,
             });
           }
           bytesDone += transferBytesForEntry(a.entry, opts.kek);
@@ -207,7 +219,13 @@ export async function applyActions(
     await Promise.all([...prepared.values()].map((tmp) => fs.rm(tmp, { force: true }).catch(() => {})));
   }
   for (const a of deletes) {
-    await deleteEntry(destRoot, a.path, a.expectedLocal, device, now, opts.trash);
+    const lease = opts.mutationBoundary?.enter({ phase: "file-apply", repository: a.path });
+    if (lease && !lease.beginCommit()) { lease.finish(); throw new MutationGateClosedError(); }
+    try {
+      await deleteEntry(destRoot, a.path, a.expectedLocal, device, now, opts.trash);
+    } finally {
+      lease?.finish();
+    }
   }
 }
 
@@ -228,6 +246,7 @@ type WriteEntryOptions = {
   onTypeFlip?: (relPath: string) => void;
   keepLocalAs?: string;
   preparedTmp?: string;
+  mutationBoundary?: MutationBoundary;
 };
 async function writeEntry(
   destRoot: string,
@@ -236,14 +255,14 @@ async function writeEntry(
   store: BlobStore,
   device: string,
   now: string,
-  { kek, trash, onTypeFlip, keepLocalAs, preparedTmp }: WriteEntryOptions = {}
+  { kek, trash, onTypeFlip, keepLocalAs, preparedTmp, mutationBoundary }: WriteEntryOptions = {}
 ): Promise<void> {
   const abs = path.join(destRoot, entry.path);
   await assertWithinRoot(destRoot, abs); // defend symlink+file traversal combo
-  await mkdirCounted(path.dirname(abs));
-
+  const lease = mutationBoundary?.enter({ phase: "file-apply", repository: entry.path });
   const tmp = tmpName(abs);
   try {
+    await mkdirCounted(path.dirname(abs));
     if (preparedTmp) {
       countRename();
       await fs.rename(preparedTmp, tmp);
@@ -256,14 +275,16 @@ async function writeEntry(
       }
     }
 
-    // Final precondition: does the target still match what reconcile assumed?
-    const current = await currentEntryAt(destRoot, entry.path);
-    if (current && keepLocalAs) {
-      await moveAside(destRoot, entry.path, keepLocalAs);
-    } else if (!sameContent(current, expectedLocal) && current) {
-      // The user created/edited it in the window — preserve those bytes.
-      await moveAside(destRoot, entry.path, conflictName(entry.path, device, now));
-    }
+    if (lease && !lease.beginCommit()) { lease.finish(); throw new MutationGateClosedError(); }
+    try {
+      // Final precondition: does the target still match what reconcile assumed?
+      const current = await currentEntryAt(destRoot, entry.path);
+      if (current && keepLocalAs) {
+        await moveAside(destRoot, entry.path, keepLocalAs);
+      } else if (!sameContent(current, expectedLocal) && current) {
+        // The user created/edited it in the window — preserve those bytes.
+        await moveAside(destRoot, entry.path, conflictName(entry.path, device, now));
+      }
 
     // Type-flip eviction (§3): currentEntryAt returns undefined for a directory,
     // so the conflict-copy branch above never sees one. A materialized directory
@@ -271,18 +292,23 @@ async function writeEntry(
     // rename (else `rename(tmp, dir)` is EISDIR — the flat-meadow outage). It goes
     // to trash when present (a visible in-workspace conflict copy would re-push the
     // entire subtree as new adds — a churn bomb), else to a visible conflict copy.
-    countLstat();
-    const obstruction = await fs.lstat(abs).catch(() => undefined);
-    if (obstruction?.isDirectory()) {
-      onTypeFlip?.(entry.path);
-      if (trash) await trash.put(entry.path);
-      else await moveAside(destRoot, entry.path, conflictName(entry.path, device, now));
+      countLstat();
+      const obstruction = await fs.lstat(abs).catch(() => undefined);
+      if (obstruction?.isDirectory()) {
+        onTypeFlip?.(entry.path);
+        if (trash) await trash.put(entry.path);
+        else await moveAside(destRoot, entry.path, conflictName(entry.path, device, now));
+      }
+      countRename();
+      await fs.rename(tmp, abs);
+    } finally {
+      lease?.finish();
     }
-    countRename();
-    await fs.rename(tmp, abs);
   } catch (e) {
     await fs.rm(tmp, { force: true }).catch(() => {});
     throw e;
+  } finally {
+    lease?.finish();
   }
 }
 

@@ -3,6 +3,7 @@ import path from "node:path";
 import { daemonPidPath, daemonStatusPath } from "../rbox-paths.js";
 import { isSafetyHaltReason, type DaemonActivity } from "../activity.js";
 import type { TransferPhase } from "../transfer-progress.js";
+import type { MutationPhase } from "../../engine/mutation-gate.js";
 import { syncStreamId, type RepoRecord, type WorkspaceConfig } from "../config.js";
 import {
   gitDeferralReasonPresentation,
@@ -62,6 +63,13 @@ export interface AmbientDaemonStatusV1 {
   deferredRepos?: number;
   oldestDeferralAgeSeconds?: number | null;
   deferrals?: AmbientGitDeferral[];
+  /** Boot-bound graceful-stop proof consumed by `rbox stop`. */
+  shutdown?: {
+    gateClosed: true;
+    phase?: MutationPhase;
+    repository?: string;
+    committed?: boolean;
+  };
 }
 
 export function validDaemonVersion(value: unknown): value is string {
@@ -118,6 +126,7 @@ const STATES = new Set<AmbientDaemonState>(["synced", "syncing", "attention", "p
 const MODES = new Set<DaemonMode>(["pull-only", "read-write"]);
 const REASONS = new Set<AmbientAttentionReason>(["halt", "out-of-storage", "watcher-degraded", "ownership-lost", "unknown-error"]);
 const PHASES = new Set<TransferPhase>(["scan", "gitcap", "encrypt", "upload", "download"]);
+const MUTATION_PHASES = new Set<MutationPhase>(["file-apply", "git-prepare", "git-commit", "state-cas"]);
 
 const finite = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
 const uint = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v >= 0;
@@ -363,6 +372,18 @@ function parseStatus(raw: string): AmbientDaemonStatusV1 | undefined {
       out.deferrals = items.slice(0, 5).flatMap((item) => {
         const parsed = parseAmbientDeferral(item);
         return parsed ? [parsed] : [];
+      });
+    }
+    if (j.shutdown !== undefined) {
+      if (!j.shutdown || typeof j.shutdown !== "object" || j.shutdown.gateClosed !== true) return undefined;
+      if (j.shutdown.phase !== undefined && !MUTATION_PHASES.has(j.shutdown.phase as MutationPhase)) return undefined;
+      if (j.shutdown.repository !== undefined && typeof j.shutdown.repository !== "string") return undefined;
+      if (j.shutdown.committed !== undefined && typeof j.shutdown.committed !== "boolean") return undefined;
+      out.shutdown = stripUndefined({
+        gateClosed: true as const,
+        phase: j.shutdown.phase as MutationPhase | undefined,
+        repository: j.shutdown.repository,
+        committed: j.shutdown.committed,
       });
     }
     const op = j.operation;

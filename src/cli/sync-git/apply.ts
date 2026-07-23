@@ -15,6 +15,7 @@ import { createPRepairStatePort } from "./p-repair-state.js";
 import { settleExactPresentArtifact } from "./p-settlement.js";
 import { commitPlannedBranchTransition, planBranchTransition } from "./branch-transition.js";
 import { runUpdateRefTransaction } from "../../engine/git/keep-pins.js";
+import { MutationGateClosedError, type MutationBoundary } from "../../engine/mutation-gate.js";
 import { blockersAfterComposer, createHeldAttempt, gitHeldSkipEnabled, heldAttemptFloorElapsed, heldAttemptMatches, heldBlockersAllowSkip, incomingIndexArtifactDescriptor, observeHeldInputs, rebindHeldAttemptsAfterSettlement, sameHeldOutcome, sortedTypedBlockers } from "./held-skip.js";
 import {
   carryRepoBaseProof,
@@ -23,6 +24,8 @@ import {
   type RepoBaseProof,
   type RepoBaseLockedProof,
 } from "./base-composer.js";
+import { acquirePreparedStateCasLocks, markStateCasCommitted, prepareStateCasLocks, releaseStateCasLocks, type HeldStateCasLock, type StateCasLockRequest } from "./state-cas-locks.js";
+import type { LockfileHooks } from "../../engine/git/lockfile.js";
 /** Local-vs-base divergence, projected onto the narrower of the two scopes (§7).
  *  No base → ANY local git identity is divergence-from-nothing (an independently
  *  created local repo must never be clobbered). No local identity (no repo, empty
@@ -310,6 +313,7 @@ opts: {
      * retain the helpers' individual wall-clock reads. */
     heldNow?: () => number;
     warningSink?: (message: string) => void;
+    mutationBoundary?: MutationBoundary;
   } = {}
 ): Promise<GitPullOutcome> {
   const sanitizeSections = (sections: Record<string, GitSection> | undefined): Record<string, GitSection> =>
@@ -459,6 +463,18 @@ opts: {
   };
   const configFailure = (result: Exclude<ConfigTransactionResult, { status: "completed" }>): Error =>
     new Error(`config ${result.status}: ${result.fault.reason}`);
+  const runMutation = async <T>(repository: string, fn: () => Promise<T>): Promise<T> => {
+    const lease = opts.mutationBoundary?.enter({ phase: "git-commit", repository });
+    if (lease && !lease.beginCommit()) {
+      lease.finish();
+      throw new MutationGateClosedError();
+    }
+    try {
+      return await fn();
+    } finally {
+      lease?.finish();
+    }
+  };
 
   /** Run the config mutation only after the caller has selected the correct Git
    * disposition. Existing repos use the optimistic locked transaction; a truly
@@ -471,7 +487,8 @@ opts: {
     receiver: { fresh: true } | { fresh: false; shape: ConfigShapeIdentity; configPath: string }
   ): Promise<void> => {
     if (receiver.fresh) {
-      await (opts.materializeFreshConfig ?? materializeFreshGitConfig)(repoDir, incoming, path.join(repoDir, ".git"));
+      await runMutation(repoDir, () =>
+        (opts.materializeFreshConfig ?? materializeFreshGitConfig)(repoDir, incoming, path.join(repoDir, ".git")));
       const ctx = await repoCtxFromDisk(repoDir);
       if (!ctx) throw new Error("fresh config apply lost repository context");
       const owned = await configReceiver(root, ctx);
@@ -490,7 +507,8 @@ opts: {
       return;
     }
 
-    const result = await (opts.applyConfig ?? applyConfigTransaction)(repoDir, receiver.configPath, incoming, { baseConfig });
+    const result = await runMutation(repoDir, () =>
+      (opts.applyConfig ?? applyConfigTransaction)(repoDir, receiver.configPath, incoming, { baseConfig }));
     if (result.status !== "completed") throw configFailure(result);
     for (const warning of result.warnings) {
       try {
@@ -602,10 +620,10 @@ opts: {
     const recoveryCtx = dotGit ? await repoCtxFromDisk(repoDir).catch(() => undefined) : undefined;
     if (recoveryCtx) {
       const binding = await checkoutJournalBinding(state.stream, expectedStateNonce(state), recoveryCtx);
-      const landed = await recoverAndLandFollowJournal(root, rel, binding, state, {
+      const landed = await runMutation(repoDir, () => recoverAndLandFollowJournal(root, rel, binding, state, {
         land: !opts.degradedMutex,
         crashAt: opts.crashAt,
-      });
+      }));
       const recovery = landed.recovery;
       if (recovery.status === "keep") {
         if (opts.degradedMutex) {
@@ -639,7 +657,8 @@ opts: {
         dotGit = await fs.lstat(path.join(repoDir, ".git")).catch(() => undefined);
       }
     } else {
-      const recovery = await quarantineUnboundFollowJournal(root, rel, state.stream, expectedStateNonce(state));
+      const recovery = await runMutation(repoDir, () =>
+        quarantineUnboundFollowJournal(root, rel, state.stream, expectedStateNonce(state)));
       if (recovery.status === "binding-mismatch") {
         glog(`git-sync WARNING ${rel}: journal for an absent/unreadable repository quarantined at ${recovery.quarantinePath}`);
       } else if (recovery.status === "defer") {
@@ -1087,7 +1106,7 @@ opts: {
         const p = protocolResult.protocol.presentArtifacts[0]!;
         const exact = await settleExactPresentArtifact({
           root, stream: state.stream, state, relPath: rel, ctx,
-          binding: protocolResult.protocol.binding, p,
+          binding: protocolResult.protocol.binding, p, mutationBoundary: opts.mutationBoundary,
         });
         if (exact.status === "hold") {
           await defer(exact.reason, "artifact");
@@ -1299,7 +1318,7 @@ opts: {
         };
         return { record, expectedRepoGen: records[rel]?.repoGen ?? 0, relPath: rel, baseProof: proof, ...(previousRecord ? { previousRecord } : {}) };
       };
-      const follow = await followDivergedRepo({
+      const follow = await runMutation(repoDir, () => followDivergedRepo({
         workspaceRoot: root,
         relPath: rel,
         ctx,
@@ -1307,7 +1326,8 @@ opts: {
         incoming: remoteSec,
         store,
         kek,
-        oracle: opts.oracle,
+        // applyGitSections establishes the oracle before any follow path runs.
+        oracle: opts.oracle!,
         record: idxProj[rel] && records[rel]
           ? { ...records[rel], idxProj: idxProj[rel]! }
           : records[rel],
@@ -1322,6 +1342,7 @@ opts: {
         log: glog,
         forcedHeldRefs,
         afterBranchPinsPrepared: opts.afterBranchPinsPrepared,
+        mutationBoundary: opts.mutationBoundary,
         afterHeldClassification: async (classification) => {
           await opts.afterHeldClassification?.(rel);
           if (classification.phase === "followed") {
@@ -1351,7 +1372,7 @@ opts: {
             });
           }
         },
-      });
+      }));
       if (follow.derivedBaseIndexProjection) idxProj[rel] = follow.derivedBaseIndexProjection;
       if (follow.status === "legacy") {
         clearAttempt(rel);
@@ -1528,7 +1549,7 @@ opts: {
         await runUpdateRefTransaction(repoDir, transition.inverseLines);
       },
     };
-    const res = await applyGitState(
+    const res = await runMutation(repoDir, () => applyGitState(
       repoDir,
       remoteSec,
       store,
@@ -1540,7 +1561,7 @@ opts: {
         ...(chainTimings ? { chainTimings } : {}),
         ...(opts.warningSink ? { warningSink: opts.warningSink } : {}),
       }
-    );
+    ));
     if (res.applied) {
       // Belt-and-braces post-init containment re-verify (§7 [v2, B5; v3]).
       try {
@@ -1754,6 +1775,17 @@ export async function withRevalidatedGitPartialApplies<T>(
   state: SyncState,
   outcome: GitPullOutcome,
   save: () => Promise<T>,
+  options: {
+    mutationBoundary?: MutationBoundary;
+    /** Deterministic shutdown seam after journaled first-lock ownership. */
+    afterFirstStateCasLockAcquired?: () => void | Promise<void>;
+    /** Real-process crash seams; tests only. */
+    afterStateCasJournalPrepared?: () => void | Promise<void>;
+    afterStateCasLockPersisted?: (count: number, lockPath: string) => void | Promise<void>;
+    afterStateCasLocksAcquired?: () => void | Promise<void>;
+    afterStateCasCommitted?: () => void | Promise<void>;
+    stateCasLockHooks?: LockfileHooks;
+  } = {},
 ): Promise<T> {
   const records = repoRecordsForState(state);
   const partials = [...new Set([
@@ -1764,7 +1796,7 @@ export async function withRevalidatedGitPartialApplies<T>(
     const partial = transition === null ? undefined : transition ?? records[rel]?.partial;
     return partial ? [{ rel, partial }] : [];
   });
-  const requested = new Map<string, Set<string>>();
+  const requested = new Map<string, { commonDir: string; rels: Set<string>; proofs: StateCasLockRequest["proofs"] }>();
   for (const { rel, partial } of partials) {
     const ctx = await repoCtxFromDisk(repoDirOf(root, rel)).catch(() => undefined);
     if (!ctx) {
@@ -1772,15 +1804,20 @@ export async function withRevalidatedGitPartialApplies<T>(
       continue;
     }
     const commonDir = path.resolve(ctx.commonDir);
-    for (const ref of Object.keys(partial.appliedRefs)) {
+    for (const [ref, expected] of Object.entries(partial.appliedRefs)) {
       const lockPath = path.resolve(ctx.commonDir, `${ref}.lock`);
       if (!lockPath.startsWith(`${commonDir}${path.sep}`)) {
         outcome.partial = { ...(outcome.partial ?? {}), [rel]: null };
         continue;
       }
-      const rels = requested.get(lockPath) ?? new Set<string>();
-      rels.add(rel);
-      requested.set(lockPath, rels);
+      const current = requested.get(lockPath) ?? { commonDir, rels: new Set<string>(), proofs: [] };
+      current.rels.add(rel);
+      current.proofs.push({
+        repo: rel,
+        ref,
+        expectedOid: "oid" in expected ? expected.oid : expected.kind === "safe-ref" ? expected.afterOid : null,
+      });
+      requested.set(lockPath, current);
     }
   }
   for (const [rel, proof] of Object.entries(outcome.repoProofs ?? {})) {
@@ -1791,20 +1828,48 @@ export async function withRevalidatedGitPartialApplies<T>(
     for (const witness of Object.values(proof.authority.branchWitnesses)) {
       const lockPath = path.resolve(commonDir, `${witness.artifactRef}.lock`);
       if (!lockPath.startsWith(`${commonDir}${path.sep}`)) throw new Error(`artifact lock escaped common dir for ${rel}:${witness.ref}`);
-      const rels = requested.get(lockPath) ?? new Set<string>();
-      rels.add(rel);
-      requested.set(lockPath, rels);
+      const current = requested.get(lockPath) ?? { commonDir, rels: new Set<string>(), proofs: [] };
+      current.rels.add(rel);
+      current.proofs.push({ repo: rel, ref: witness.ref, expectedOid: witness.kind === "present" ? witness.nextOid : null });
+      requested.set(lockPath, current);
     }
   }
-  const held: Array<{ lockPath: string; handle: Awaited<ReturnType<typeof fs.open>> }> = [];
+  const mutationRepos = [...new Set([
+    ...partials.map(({ rel }) => rel),
+    ...Object.keys(outcome.repoProofs ?? {}),
+  ])].sort();
+  const lease = options.mutationBoundary?.enter({
+    phase: "state-cas",
+    ...(mutationRepos.length > 0 ? { repository: mutationRepos.join(",") } : {}),
+  });
+  let prepared: Awaited<ReturnType<typeof prepareStateCasLocks>>;
+  let held: HeldStateCasLock[] = [];
   try {
-    for (const [lockPath, rels] of [...requested.entries()].sort(([a], [b]) => a.localeCompare(b))) {
-      try {
-        await fs.mkdir(path.dirname(lockPath), { recursive: true });
-        held.push({ lockPath, handle: await fs.open(lockPath, "wx") });
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        for (const rel of rels) outcome.partial = { ...(outcome.partial ?? {}), [rel]: null };
+    prepared = await prepareStateCasLocks(
+      root,
+      { stream: state.stream, stateNonce: expectedStateNonce(state) },
+      [...requested.entries()].map(([lockPath, request]) => ({ lockPath, commonDir: request.commonDir, proofs: request.proofs })),
+    );
+    await options.afterStateCasJournalPrepared?.();
+    if (lease?.abortRequested) throw new MutationGateClosedError();
+    if (prepared) {
+      const acquired = await acquirePreparedStateCasLocks(prepared, {
+        beforeLockPublish: () => {
+          if (lease?.abortRequested) throw new MutationGateClosedError();
+        },
+        onFirstAcquired: async () => {
+          if (lease && !lease.beginCommit()) throw new MutationGateClosedError();
+          await options.afterFirstStateCasLockAcquired?.();
+        },
+        afterAcquisitionPersisted: options.afterStateCasLockPersisted,
+        hooks: options.stateCasLockHooks,
+      });
+      held = acquired.held;
+      await options.afterStateCasLocksAcquired?.();
+      for (const lockPath of acquired.blocked) {
+        for (const rel of requested.get(lockPath)?.rels ?? []) {
+          outcome.partial = { ...(outcome.partial ?? {}), [rel]: null };
+        }
       }
     }
     await revalidateGitPartialApplies(root, state, outcome);
@@ -1830,14 +1895,15 @@ export async function withRevalidatedGitPartialApplies<T>(
         }
       }
     }
+    if (lease && !lease.beginCommit()) throw new MutationGateClosedError();
     const saved = await save();
+    await markStateCasCommitted(prepared);
+    await options.afterStateCasCommitted?.();
     for (const rel of outcome.publishedJournals ?? []) await clearFollowJournal(root, rel, outcome.journalCrashAt);
     return saved;
   } finally {
-    for (const { lockPath, handle } of held.reverse()) {
-      await handle.close().catch(() => {});
-      await fs.rm(lockPath, { force: true }).catch(() => {});
-    }
+    await releaseStateCasLocks(prepared, held).catch(() => false);
+    lease?.finish();
   }
 }
 
@@ -1848,39 +1914,59 @@ export async function settleCommittedBranchArtifacts(
   root: string,
   initialState: SyncState,
   outcome: GitPullOutcome,
+  mutationBoundary?: MutationBoundary,
 ): Promise<SyncState> {
   let state = initialState;
   const attemptsToRebind: Array<{ relPath: string; attempt: GitHeldAttempt }> = [];
-  for (const [rel, proof] of Object.entries(outcome.repoProofs ?? {}).sort(([a], [b]) => a.localeCompare(b))) {
-    if (proof.authority.kind !== "pull-ref-transaction" && proof.authority.kind !== "journal-recovery") continue;
-    const ctx = await repoCtxFromDisk(repoDirOf(root, rel));
-    if (!ctx) throw new Error(`P settlement repository disappeared for ${rel}`);
-    for (const [ref, witness] of Object.entries(proof.authority.branchWitnesses).sort(([a], [b]) => a.localeCompare(b))) {
-      const binding = { lineageHash: witness.lineageHash, repositoryIdentityHash: witness.repositoryIdentityHash };
-      if (witness.kind === "absent") {
-        if (witness.source === "z") continue;
-        const read = await readBaseAbsentArtifact(ctx.repoDir, binding, ref);
-        if (read.status !== "valid" || read.artifact.targetOid !== witness.artifactOid) {
-          throw new Error(`A settlement artifact mismatch for ${rel}:${ref}`);
+  const settlementRepos = Object.entries(outcome.repoProofs ?? {})
+    .filter(([, proof]) => proof.authority.kind === "pull-ref-transaction" || proof.authority.kind === "journal-recovery")
+    .map(([rel]) => rel)
+    .sort();
+  const lease = settlementRepos.length > 0 ? mutationBoundary?.enter({
+    phase: "git-prepare",
+    repository: settlementRepos.join(","),
+  }) : undefined;
+  const beginSettlement = (): void => {
+    if (lease && !lease.beginCommit("git-commit")) throw new MutationGateClosedError();
+  };
+  try {
+    for (const [rel, proof] of Object.entries(outcome.repoProofs ?? {}).sort(([a], [b]) => a.localeCompare(b))) {
+      if (proof.authority.kind !== "pull-ref-transaction" && proof.authority.kind !== "journal-recovery") continue;
+      const ctx = await repoCtxFromDisk(repoDirOf(root, rel));
+      if (!ctx) throw new Error(`P settlement repository disappeared for ${rel}`);
+      for (const [ref, witness] of Object.entries(proof.authority.branchWitnesses).sort(([a], [b]) => a.localeCompare(b))) {
+        const binding = { lineageHash: witness.lineageHash, repositoryIdentityHash: witness.repositoryIdentityHash };
+        if (witness.kind === "absent") {
+          if (witness.source === "z") continue;
+          const read = await readBaseAbsentArtifact(ctx.repoDir, binding, ref);
+          if (read.status !== "valid" || read.artifact.targetOid !== witness.artifactOid) {
+            throw new Error(`A settlement artifact mismatch for ${rel}:${ref}`);
+          }
+          beginSettlement();
+          await settleBaseAbsentArtifact(ctx.repoDir, binding, ref);
+          continue;
         }
-        await settleBaseAbsentArtifact(ctx.repoDir, binding, ref);
-        continue;
+        const read = await readBasePresentArtifact(ctx.repoDir, binding, ref);
+        if (read.status === "absent") continue;
+        if (read.status !== "valid" || read.artifact.targetOid !== witness.artifactOid) {
+          throw new Error(`P settlement artifact mismatch for ${rel}:${ref}`);
+        }
+        beginSettlement();
+        const settled = await settleExactPresentArtifact({
+          root, stream: state.stream, state, relPath: rel, ctx, binding, p: read.artifact,
+          mutationBoundary,
+        });
+        if (settled.status === "settled") state = settled.state;
+        else if (settled.status === "absent" || settled.status === "moved") continue;
+        else throw new Error(`P settlement refused for ${rel}:${ref}: ${settled.reason}`);
       }
-      const read = await readBasePresentArtifact(ctx.repoDir, binding, ref);
-      if (read.status === "absent") continue;
-      if (read.status !== "valid" || read.artifact.targetOid !== witness.artifactOid) {
-        throw new Error(`P settlement artifact mismatch for ${rel}:${ref}`);
-      }
-      const settled = await settleExactPresentArtifact({
-        root, stream: state.stream, state, relPath: rel, ctx, binding, p: read.artifact,
-      });
-      if (settled.status === "settled") state = settled.state;
-      else if (settled.status === "absent" || settled.status === "moved") continue;
-      else throw new Error(`P settlement refused for ${rel}:${ref}: ${settled.reason}`);
-    }
 
-    const completedAttempt = outcome.attempt?.[rel];
-    if (completedAttempt) attemptsToRebind.push({ relPath: rel, attempt: completedAttempt });
+      const completedAttempt = outcome.attempt?.[rel];
+      if (completedAttempt) attemptsToRebind.push({ relPath: rel, attempt: completedAttempt });
+    }
+    if (attemptsToRebind.length > 0) beginSettlement();
+    return await rebindHeldAttemptsAfterSettlement({ root, state, attempts: attemptsToRebind });
+  } finally {
+    lease?.finish();
   }
-  return rebindHeldAttemptsAfterSettlement({ root, state, attempts: attemptsToRebind });
 }

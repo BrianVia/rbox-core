@@ -375,3 +375,28 @@ test("ambient reader rejects malformed mode and boot witnesses", async () => {
   await writeStatus({ mode: "read-write", bootId: "boot\nforged" });
   expect(readAmbientDaemonStatusRecord(root).kind).toBe("corrupt");
 });
+
+test("ambient reader preserves a valid graceful-shutdown phase witness", async () => {
+  await writeStatus({
+    bootId: "boot-shutdown",
+    shutdown: { gateClosed: true, phase: "state-cas", repository: "repo", committed: true },
+  });
+  expect(readAmbientDaemonStatusRecord(root)).toMatchObject({
+    kind: "ok",
+    status: {
+      shutdown: { gateClosed: true, phase: "state-cas", repository: "repo", committed: true },
+    },
+  });
+});
+
+test("ambient reader rejects malformed graceful-shutdown witnesses", async () => {
+  for (const shutdown of [
+    { gateClosed: false },
+    { gateClosed: true, phase: "network" },
+    { gateClosed: true, repository: 42 },
+    { gateClosed: true, committed: "yes" },
+  ]) {
+    await writeStatus({ shutdown: shutdown as AmbientDaemonStatusV1["shutdown"] });
+    expect(readAmbientDaemonStatusRecord(root).kind).toBe("corrupt");
+  }
+});

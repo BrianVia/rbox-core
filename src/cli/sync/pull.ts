@@ -290,6 +290,7 @@ export async function applyPulledManifest(
     trash: batch,
     onTypeFlip: deps.onTypeFlip,
     warningSink: deps.warningSink,
+    mutationBoundary: deps.mutationBoundary,
     onProgress: deps.onProgress ? (done: number, total: number, bytesDone: number, bytesTotal: number) =>
       deps.onProgress!(done, total, "download", undefined, { bytesDone, bytesTotal }) : undefined,
   };
@@ -362,6 +363,7 @@ export async function applyPulledManifest(
       disableConfigLane: workspaceSyncMutexDegraded(deps.syncMutex),
       degradedMutex: workspaceSyncMutexDegraded(deps.syncMutex),
       warningSink: deps.warningSink,
+      mutationBoundary: deps.mutationBoundary,
       sourceGlobalSeq: sequence,
     })
   );
@@ -403,8 +405,8 @@ export async function applyPulledManifest(
   }, {
     allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),
     forceLegacy: workspaceSyncMutexDegraded(deps.syncMutex),
-  })));
-  savedState = await settleCommittedBranchArtifacts(root, savedState, gitOutcome);
+  })), { mutationBoundary: deps.mutationBoundary });
+  savedState = await settleCommittedBranchArtifacts(root, savedState, gitOutcome, deps.mutationBoundary);
   try {
     deps.onGitDeferralsSaved?.(savedState);
   } catch {

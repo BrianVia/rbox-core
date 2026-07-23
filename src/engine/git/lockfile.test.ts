@@ -7,20 +7,29 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   acquireLock,
+  captureCommonDirIdentity,
+  classifyProcessIncarnation,
+  commonDirIdentityMatches,
   defaultStorageStat,
+  deserializeMarkerObservation,
   formatLockMarker,
   inspectLock,
   lockStorageLocal,
   mergeHostIdentityBoots,
   parseDarwinMountOutput,
   parseLockMarker,
+  publishLockMarker,
   readHostIdentityLedger,
   refreshHostIdentityLedger,
   resolveDarwinIdentityComponents,
   resolveLinuxHostId,
   runIdentityCommand,
+  safeBoundLockParent,
+  serializeMarkerObservation,
+  validProcessIncarnation,
   type LockIdentitySource,
   type LockMarker,
+  type MarkerObservation,
   type ProcessProbe,
   type ResolvedLockIdentity,
 } from "./lockfile.js";
@@ -47,6 +56,109 @@ async function tempDir(): Promise<string> {
 
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })));
+});
+
+describe("shared journal lock safety machinery", () => {
+  test("bounded-parent validation reports absence, creates safely, and rejects escapes and symlinks", async () => {
+    const root = await tempDir();
+    const common = path.join(root, "common");
+    await fs.mkdir(common);
+    const lockPath = path.join(common, "refs", "heads", "main.lock");
+
+    expect(await safeBoundLockParent(common, lockPath, { create: false })).toBe("absent");
+    expect(await safeBoundLockParent(common, lockPath, { create: true })).toBe("safe");
+    expect((await fs.lstat(path.dirname(lockPath))).isDirectory()).toBe(true);
+    expect(await safeBoundLockParent(common, lockPath, { create: false })).toBe("safe");
+
+    await expect(safeBoundLockParent(common, path.join(root, "outside.lock"), { create: false })).rejects.toThrow("escaped");
+    await expect(safeBoundLockParent(common, "relative.lock", { create: false })).rejects.toThrow("escaped");
+
+    const outside = path.join(root, "outside");
+    const linked = path.join(common, "linked");
+    await fs.mkdir(outside);
+    await fs.symlink(outside, linked);
+    await expect(safeBoundLockParent(common, path.join(linked, "victim.lock"), { create: false })).rejects.toThrow("unsafe");
+    await expect(safeBoundLockParent(common, path.join(linked, "victim.lock"), { create: true })).rejects.toThrow("unsafe");
+  });
+
+  test("common-directory identity detects inode replacement and refuses aliases", async () => {
+    const root = await tempDir();
+    const common = path.join(root, "common");
+    await fs.mkdir(common);
+    const captured = await captureCommonDirIdentity(common);
+    expect(captured).toMatchObject({ path: common, realpath: common });
+    expect(await commonDirIdentityMatches(captured)).toBe(true);
+
+    await fs.rename(common, path.join(root, "old-common"));
+    await fs.mkdir(common);
+    expect(await commonDirIdentityMatches(captured)).toBe(false);
+
+    const alias = path.join(root, "alias");
+    await fs.symlink(common, alias);
+    await expect(captureCommonDirIdentity(alias)).rejects.toThrow("symlinked");
+  });
+
+  test("exact observations serialize without numeric precision loss and reject malformed authority", () => {
+    const observation: MarkerObservation = {
+      dev: 9_007_199_254_740_993n,
+      inode: 18_014_398_509_481_987n,
+      size: 3n,
+      mtimeNs: -1n,
+      raw: "abc",
+    };
+    const serialized = serializeMarkerObservation(observation);
+    expect(serialized).toEqual({
+      dev: "9007199254740993",
+      inode: "18014398509481987",
+      size: "3",
+      mtimeNs: "-1",
+      raw: "abc",
+    });
+    expect(deserializeMarkerObservation(serialized)).toEqual(observation);
+    expect(deserializeMarkerObservation({ ...serialized, dev: 1 })).toBeUndefined();
+    expect(deserializeMarkerObservation({ ...serialized, inode: "01" })).toBeUndefined();
+    expect(deserializeMarkerObservation({ ...serialized, size: "2" })).toBeUndefined();
+    expect(deserializeMarkerObservation({ ...serialized, extra: true })).toBeUndefined();
+
+    const large = { ...serialized, size: "2048", raw: "x".repeat(1024) };
+    expect(deserializeMarkerObservation(large)?.size).toBe(2048n);
+    expect(deserializeMarkerObservation({ ...large, raw: "x".repeat(1023) })).toBeUndefined();
+  });
+
+  test("incarnation validation and classification share fail-closed semantics", async () => {
+    expect(validProcessIncarnation(current)).toBe(true);
+    expect(validProcessIncarnation({ ...current, pid: 0 })).toBe(false);
+    expect(validProcessIncarnation({ ...current, hostId: "" })).toBe(false);
+
+    expect(await classifyProcessIncarnation(current, identity())).toBe("alive");
+    expect(await classifyProcessIncarnation({ ...current, bootId: "other-boot" }, identity())).toBe("dead");
+    expect(await classifyProcessIncarnation({ ...current, pid: 701 }, identity({ 701: { status: "dead" } }))).toBe("dead");
+    expect(await classifyProcessIncarnation({ ...current, pid: 702, startTime: "old" }, identity({ 702: { status: "alive", startTime: "new" } }))).toBe("dead");
+    expect(await classifyProcessIncarnation({ ...current, pid: 703 }, identity({ 703: { status: "unknown" } }))).toBe("unknown");
+    expect(await classifyProcessIncarnation({ ...current, hostId: "foreign" }, identity())).toBe("unknown");
+    expect(await classifyProcessIncarnation(current, {
+      current: async () => { throw new Error("unavailable"); },
+      probe: async () => ({ status: "dead" }),
+    })).toBe("unknown");
+  });
+
+  test("beforeLink is the final abort seam before a visible lock exists", async () => {
+    const root = await tempDir();
+    const lockPath = path.join(root, "gated.lock");
+    let called = false;
+    const result = await publishLockMarker(lockPath, formatLockMarker(marker()), {
+      beforeLink: async (candidate, raw) => {
+        called = true;
+        expect(candidate).toBe(lockPath);
+        expect(raw).toBe(formatLockMarker(marker()));
+        await expect(fs.lstat(lockPath)).rejects.toThrow();
+        throw new Error("gate closed");
+      },
+    });
+    expect(called).toBe(true);
+    expect(result.status).toBe("error");
+    await expect(fs.lstat(lockPath)).rejects.toThrow();
+  });
 });
 
 describe("rbox-93 marker grammar", () => {
@@ -389,6 +501,20 @@ describe("atomic lock construction and ownership", () => {
     });
     expect(result.status).toBe("held");
     expect(await fs.readFile(lockPath, "utf8")).toBe(replacement);
+  });
+
+  test("marker publication never adopts a same-bytes successor inode", async () => {
+    const root = await tempDir();
+    const lockPath = path.join(root, "same-marker.lock");
+    const raw = formatLockMarker(marker({ token: "f".repeat(32) }));
+    const result = await publishLockMarker(lockPath, raw, {
+      afterCreate: async () => {
+        await fs.unlink(lockPath);
+        await fs.writeFile(lockPath, raw);
+      },
+    });
+    expect(result.status).toBe("error");
+    expect(await fs.readFile(lockPath, "utf8")).toBe(raw);
   });
 
   test("a retained exact marker from indeterminate verification heals on the next acquire", async () => {

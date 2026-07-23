@@ -6,7 +6,7 @@ import { HashCache, scanManifest, type BlobStore, type FileEntry, type IgnoreMat
 import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
 import { loadActivity, renderShellLine, saveActivity, type DaemonActivity } from "../activity.js";
 import { loadState, saveStateUnsafeLegacyOrTest, syncStreamId, type SyncState, type WorkspaceConfig } from "../config.js";
-import { RboxDaemon, type SafetyCadenceClock } from "../daemon.js";
+import { RboxDaemon, type ScanCadenceClock } from "../daemon.js";
 import { daemonRuntimeDir, daemonStatusPath, readDaemonBindingRecord, readDaemonPidRecord, recordDaemonBinding } from "../daemon-control.js";
 import { MassDeleteGuardError, pull } from "../sync.js";
 import { CommitRejectedError, QuotaExceededError, type CommitOptions, type CommitResult, type SyncRemote } from "../remote.js";
@@ -99,7 +99,10 @@ interface DaemonInternals {
   safetyTimer?: unknown;
   scheduleSafetyScan(): void;
   deepTimer?: ReturnType<typeof setInterval>;
+  deferralDiscoveryEpoch: number;
+  deferralDiscoveryAuthority?: { epoch: number; discoveredRepos: ReadonlySet<string> };
   doFullScan(): Promise<{ coverage: "full-tree" | "pruned"; errorGenAtStart: number }>;
+  replaceManifestFromScan(cache: HashCache, previous: Manifest, stats: undefined, kind: undefined, mode: "unpruned"): Promise<unknown>;
   onTransferProgress(done: number, total: number, phase: TransferPhase, detailOrBytes?: string | TransferProgressBytes, bytes?: TransferProgressBytes): void;
   lastProgressWrite: number;
   pump(): Promise<void>;
@@ -187,6 +190,38 @@ function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => voi
     reject = rej;
   });
   return { promise, resolve, reject };
+}
+
+class FakeScanCadenceClock implements ScanCadenceClock {
+  private next = 1;
+  private readonly timeouts = new Map<number, () => unknown>();
+  private readonly intervals = new Map<number, () => unknown>();
+
+  setTimeout(fn: () => void): unknown {
+    const id = this.next++;
+    this.timeouts.set(id, fn);
+    return id;
+  }
+  clearTimeout(handle: unknown): void { this.timeouts.delete(handle as number); }
+  setInterval(fn: () => void): unknown {
+    const id = this.next++;
+    this.intervals.set(id, fn);
+    return id;
+  }
+  clearInterval(handle: unknown): void { this.intervals.delete(handle as number); }
+  async fireSafety(): Promise<void> {
+    const entry = this.timeouts.entries().next().value as [number, () => unknown] | undefined;
+    if (!entry) throw new Error("safety timer is not armed");
+    this.timeouts.delete(entry[0]);
+    await entry[1]();
+  }
+  async fireDeep(): Promise<void> {
+    const callback = this.intervals.values().next().value as (() => unknown) | undefined;
+    if (!callback) throw new Error("deep timer is not armed");
+    await callback();
+  }
+  get safetyArmed(): boolean { return this.timeouts.size > 0; }
+  get deepArmed(): boolean { return this.intervals.size > 0; }
 }
 
 const fakeWs = () => ({ readyState: WebSocket.OPEN, send: () => {}, close: () => {} }) as unknown as WebSocket;
@@ -325,7 +360,7 @@ class ManualRecoveryClock {
   }
 }
 
-class ManualSafetyClock implements SafetyCadenceClock {
+class ManualSafetyClock implements ScanCadenceClock {
   private next = 0;
   readonly callbacks = new Map<number, () => void | Promise<void>>();
   setTimeout(fn: () => void | Promise<void>): number {
@@ -336,6 +371,11 @@ class ManualSafetyClock implements SafetyCadenceClock {
   clearTimeout(handle: unknown): void {
     this.callbacks.delete(handle as number);
   }
+  // Intervals are irrelevant to the safety-cadence tests; deep-scan arming is inert.
+  setInterval(): number {
+    return ++this.next;
+  }
+  clearInterval(): void {}
   async fireAll(): Promise<void> {
     const callbacks = [...this.callbacks.values()];
     this.callbacks.clear();
@@ -695,7 +735,7 @@ test("review H2: pull-only safety cadence clears a stale lane without a scan or 
     const daemon = await makeDaemon(new MiniRemote(), "pull-only-hygiene", {
       pullOnly: true,
       now: () => TEST_NOW,
-      safetyClock: clock,
+      scanCadenceClock: clock,
     });
     const at = new Date(TEST_NOW - 60_000).toISOString();
     const seeded: SyncState = {
@@ -718,6 +758,48 @@ test("review H2: pull-only safety cadence clears a stale lane without a scan or 
     expect((await loadState(root, seeded.stream)).repoRecords?.repo?.deferrals).toBeUndefined();
     expect(daemon.want.fullScan).toBe(false);
     expect(daemon.want.push).toBe(false);
+  });
+});
+
+test("pr8: production pull-only timers remint discovery and clear a ghost without pushing", async () => {
+  await withIsolatedDaemonHome(async () => {
+    let now = TEST_NOW;
+    const clock = new FakeScanCadenceClock();
+    const remote = new MiniRemote();
+    const daemon = await makeDaemon(remote, "pull-only-pr8", { pullOnly: true, now: () => now, scanCadenceClock: clock });
+    const at = new Date(TEST_NOW - 60_000).toISOString();
+    const seeded: SyncState = {
+      ...(daemon.syncBase ?? await daemon.loadSyncBase()),
+      repoRecords: {
+        ghost: {
+          repoGen: 1,
+          sourceSeq: 0,
+          deferrals: { capture: { lane: "capture", reason: "git-busy", deferredSince: at, reasonSince: at, lastSeen: at } },
+        },
+      },
+    };
+    await saveStateUnsafeLegacyOrTest(root, seeded);
+    daemon.syncBase = await loadState(root, seeded.stream);
+
+    await daemon.start();
+    expect(clock.safetyArmed).toBe(true);
+    expect(clock.deepArmed).toBe(true);
+    const firstEpoch = daemon.deferralDiscoveryAuthority?.epoch;
+    expect(firstEpoch).toBeDefined();
+
+    await clock.fireSafety();
+    expect(daemon.deferralDiscoveryAuthority?.epoch).toBe(firstEpoch);
+    expect(daemon.syncBase?.repoRecords?.ghost?.deferrals?.capture).toBeDefined();
+
+    now += 30_000;
+    await clock.fireDeep();
+    await Promise.resolve();
+    await daemon.pumpRun;
+    expect(daemon.deferralDiscoveryAuthority?.epoch).toBe(firstEpoch! + 1);
+    expect(daemon.syncBase?.repoRecords?.ghost?.deferrals).toBeUndefined();
+    expect((await loadState(root, seeded.stream)).repoRecords?.ghost?.deferrals).toBeUndefined();
+    expect(daemon.want.push).toBe(false);
+    expect(remote.head).toBe(0);
   });
 });
 
@@ -1775,7 +1857,7 @@ test("graceful daemon stop writes paused ambient status even after stopDaemon re
   });
 });
 
-test("graceful stop writes paused ambient status before a slow pump drains", async () => {
+test("graceful stop exposes a closed gate, drains a slow pump, and settles watcher close failure", async () => {
   await withIsolatedDaemonHome(async () => {
     const remote = new HookedCommitRemote();
     const daemon = await makeDaemon(remote);
@@ -1784,6 +1866,13 @@ test("graceful stop writes paused ambient status before a slow pump drains", asy
     await fs.writeFile(path.join(runtime, "daemon.pid"), `v2 ${process.pid} boot-test\n`);
 
     await fs.writeFile(path.join(root, "slow.txt"), "hello");
+    let watcherCloseCalled = false;
+    daemon.watcher = {
+      close: async () => {
+        watcherCloseCalled = true;
+        throw new Error("injected watcher close rejection");
+      },
+    } as Watcher;
     daemon.manifest = await scanManifest(root);
     daemon.want.push = true;
     const pump = daemon.pump();
@@ -1792,18 +1881,43 @@ test("graceful stop writes paused ambient status before a slow pump drains", asy
     let stop: Promise<void> | undefined;
     try {
       stop = daemon.stop();
-      const early = await Promise.race([
-        waitForAmbientState("paused", 1000),
-        stop.then(() => { throw new Error("daemon stop settled while the pump was still blocked"); }),
-      ]);
-      expect(early).toMatchObject({ schemaVersion: 1, state: "paused" });
+      expect(daemon.stop()).toBe(stop);
+      // The injected activity-write chain is the deterministic persistence
+      // boundary; no wall-clock polling is needed.
+      await daemon.activityWrite;
+      const early = await readAmbientStatus();
+      expect(early).toMatchObject({ schemaVersion: 1, state: "syncing", shutdown: { gateClosed: true } });
+      expect(stop).toBeInstanceOf(Promise);
     } finally {
       remote.releaseCommit.resolve();
       await Promise.allSettled([pump, ...(stop ? [stop] : [])]);
     }
     await pump;
     await stop!;
+    expect(watcherCloseCalled).toBe(true);
     expect(await readAmbientStatus()).toMatchObject({ schemaVersion: 1, state: "paused" });
+  });
+});
+
+test("stop during slow watcher admission closes the late watcher and starts no live resources", async () => {
+  await withIsolatedDaemonHome(async () => {
+    const daemon = await makeDaemon(new MiniRemote());
+    const watcherEntered = deferred<void>();
+    const releaseWatcher = deferred<void>();
+    let watcherClosed = false;
+    daemon.startWatcherFn = async () => {
+      watcherEntered.resolve();
+      await releaseWatcher.promise;
+      return { backend: "parcel", close: async () => { watcherClosed = true; } } as Watcher;
+    };
+
+    const starting = daemon.start();
+    await watcherEntered.promise;
+    await daemon.stop();
+    releaseWatcher.resolve();
+    await starting;
+    expect(watcherClosed).toBe(true);
+    expect(daemon.watcher).toBeUndefined();
   });
 });
 
