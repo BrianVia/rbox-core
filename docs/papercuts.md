@@ -198,3 +198,9 @@ what happened, what it cost, fix hint if obvious.
   pids, verified). Third host bitten. Bump priority on the fix: tests must
   not write to the real RBOX_HOME, and dead-pid unreadable records should be
   treated as debris, not upgrade failures.
+
+- 2026-07-23 (410 TUI gates): the ubuntu-24.04-arm GH runner reports the
+  compiled binary's Ctrl-C death as pane status 0 even with a proven-live
+  input pipeline; x64/darwin/local all give 130. Cancel smoke is advisory on
+  that runner only (ci.yml cancel-advisory + release.yml warning). Root cause
+  unidentified — candidate follow-up: real terminal-emulator harness.

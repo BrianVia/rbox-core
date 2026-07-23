@@ -156,3 +156,16 @@ prompt now restores the terminal and exits 130 synchronously — an async cancel
 path loses the race against ink's signal-exit re-raise. Covered by: coalesced
 checkbox/input unit tests, a child-process SIGINT exit-130 test, six compiled
 smoke scenarios, and 11/11 regress flows on a fresh linux-x64 binary.
+
+### Round 6 addendum 2 — linux-arm64 cancel probe is environment-untestable
+
+After the liveness probe (Down → highlighted row confirmed on screen before
+Ctrl-C), the ubuntu-24.04-arm runner STILL reports the pane dying with status
+0 — while linux-x64, macos-14, every local run, and a real `kill -INT` all
+give the contracted 130. Founder call: accept that this specific assertion is
+not reliably CI-testable on that runner class. It is now advisory on
+linux-arm64 only (ci.yml `cancel-advisory`, release.yml warning path) and
+blocking everywhere else; the pre-attach window remains covered by the
+runtime's synchronous SIGINT handler. If the TUI test surface grows, evaluate
+a real terminal-emulator harness (tui-test / pexpect-class) as a follow-up
+design.
