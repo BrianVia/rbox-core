@@ -26,6 +26,9 @@ import {
   ManifestChainError,
   PhaseReport,
   cryptoPoolStatus,
+  caseFoldCollisionGroups,
+  manifestPathCaseFold,
+  type CaseFoldCollisionGroup,
   writeFileAtomic,
 } from "../../engine/index.js";
 import type { Action } from "../../engine/reconcile.js";
@@ -122,6 +125,7 @@ import { SyncPhaseSampler } from "../telemetry/sync-phase.js";
 import { SyncStateReporter } from "../telemetry/sync-state.js";
 import { inspectResetJournalSafety } from "../reset-halt-inspection.js";
 import { clearResetHaltHealth, readResetHaltHealth, writeResetHaltHealth } from "../reset-health.js";
+import { buildPathWarnings, readPathWarnings, savePathWarnings } from "../path-warnings.js";
 import { RESET_RECOVERY_RETRY_MS, ResetHaltLogGate } from "./reset-halt-policy.js";
 import { acknowledgeCacheGeneration, readCacheGeneration } from "../adopt-cache.js";
 import { reconcileGitDeferrals, type DeferralHygieneCursor } from "../sync-git/deferral-hygiene.js";
@@ -243,6 +247,23 @@ export function lockStarvationAgeBucket(ageMs: number): "15m" | "1h" | "1d" {
 
 interface ScanCoverage { coverage: "full-tree" | "pruned"; errorGenAtStart: number }
 type Carrier = "none" | "backstop" | "cursor" | "notify";
+
+/** A retained safe subset cannot patch collision-related events incrementally:
+ * an omitted sibling may be the survivor. Ancestor directory events count too. */
+export function caseCollisionEventsRequireScan(
+  groups: readonly CaseFoldCollisionGroup[],
+  events: readonly WatchEvent[],
+): boolean {
+  return events.some((event) => {
+    const eventFold = manifestPathCaseFold(event.relPath.replace(/\/$/, ""));
+    return groups.some((group) => group.paths.some((collisionPath) => {
+      const collisionFold = manifestPathCaseFold(collisionPath);
+      return eventFold === collisionFold
+        || collisionFold.startsWith(`${eventFold}/`)
+        || ((event.kind === "addDir" || event.kind === "unlinkDir") && eventFold.startsWith(`${collisionFold}/`));
+    }));
+  });
+}
 const CARRIER_PRECEDENCE: Readonly<Record<Carrier, number>> = { none: 0, backstop: 1, cursor: 2, notify: 3 };
 
 export interface GitDeferralLogSeen { reason: string; boundary: string }
@@ -344,6 +365,12 @@ export class RboxDaemon {
   private matcher: IgnoreMatcher; // rebuilt when .gitignore/.rboxignore changes
   private cache!: HashCache;
   private manifest: Manifest = { generatedAt: "", files: [] };
+  /** After a collision push `manifest` is the safe publication subset, not a
+   * complete observation of the skipped disk paths. Only a fresh scan restores
+   * completeness and may authoritatively clear/revise the episode. */
+  private manifestObservationComplete = true;
+  private activeCaseCollisions: CaseFoldCollisionGroup[] = [];
+  private pathWarningWrite: Promise<void> = Promise.resolve();
   private syncBase?: SyncState;
   private resetLifecycle: "ready" | "halted" | "recovering" | "bootstrapping" = "ready";
   private resetRetryTimer?: ReturnType<typeof setTimeout>;
@@ -1776,6 +1803,11 @@ export class RboxDaemon {
         onTypeFlip: (rel) => this.noteTypeFlip(rel), // design 50: 409-recovery pull can evict a dir too
         telemetry: this.telemetry,
         mutationBoundary: this.mutationGate,
+        onCaseCollisionObservation: (observation) => this.observeCaseCollisions(observation),
+      }, {
+        localFileObservation: this.manifestObservationComplete
+          ? { authority: "authoritative" }
+          : { authority: "preserve", caseCollisions: this.activeCaseCollisions },
       });
     } catch (e) {
       if (e instanceof CommitRejectedError && e.stillBlocked) {
@@ -1793,6 +1825,9 @@ export class RboxDaemon {
     }
     this.recordGitCaptureSuccess(provenance);
     this.manifest = res.manifest; // stays fresh even across a conflict re-scan (committed subset)
+    this.activeCaseCollisions = res.caseCollisions.map((group) => ({ paths: [...group.paths] }));
+    this.manifestObservationComplete = res.localFileObservationAuthority === "authoritative"
+      && this.activeCaseCollisions.length === 0;
     // Forensic record: every ADVANCE of the remote sequence this daemon caused, with the
     // resulting tree size and anything it had to defer. Gated on `committed` (design 44):
     // a push whose internal 409-recovery PULLED a remote sequence and then no-opped must
@@ -1889,20 +1924,54 @@ export class RboxDaemon {
       // If the ignore rules themselves changed, rebuild the matcher and full-rescan
       // so newly-ignored paths are dropped (and re-included ones picked up) — the
       // incremental matcher would otherwise be stale until restart. [M3b]
-      if (events.some((e) => isIgnoreRuleFile(e.relPath))) {
+      const collisionIntersection = caseCollisionEventsRequireScan(this.activeCaseCollisions, events);
+      if (events.some((e) => isIgnoreRuleFile(e.relPath)) || collisionIntersection) {
         this.rebuildMatcher(await this.loadSyncBase());
-        this.rulesChangedSinceDeepScan = true;
+        if (events.some((e) => isIgnoreRuleFile(e.relPath))) this.rulesChangedSinceDeepScan = true;
         const { deferred } = await this.replaceManifestFromScan(this.cache, this.manifest, undefined, undefined, this.watcherScanMode());
         await this.resolveDriftFromAppliedEvents(events, deferred);
       } else {
         const deferred = new Set<string>();
         this.manifest = await applyWatchEvents(this.manifest, this.root, this.matcher, events, this.cache, deferred);
+        if (!this.manifestObservationComplete && caseFoldCollisionGroups(this.manifest.files).length > 0) {
+          // The retained safe subset discovered an independent new collision.
+          // Re-scan to reunite it with every still-active omitted group before
+          // the next push authors warning truth.
+          const scanned = await this.replaceManifestFromScan(this.cache, this.manifest, undefined, undefined, this.watcherScanMode());
+          for (const path of scanned.deferred) deferred.add(path);
+        }
         await this.resolveDriftFromAppliedEvents(events, deferred);
         // A path that hashed cleanly this round is settled — clear any retry it accrued.
         for (const e of events) if (!deferred.has(e.relPath)) this.writeFinishRetries.delete(e.relPath);
         if (deferred.size > 0) this.scheduleWriteFinishRetry(deferred);
       }
     }
+  }
+
+  private async observeCaseCollisions(observation: { authority: "authoritative" | "preserve"; caseCollisions: readonly CaseFoldCollisionGroup[] }): Promise<void> {
+    const groups = observation.caseCollisions.map((group) => ({ paths: [...group.paths] }));
+    // This callback runs before failure-capable publication work. Downgrade
+    // immediately so a later throw cannot leave the next retry authoring truth
+    // from the pre-rescan manifest. Only an installed successful PushResult may
+    // upgrade completeness again.
+    this.activeCaseCollisions = groups;
+    if (observation.authority === "preserve" || groups.length > 0) {
+      this.manifestObservationComplete = false;
+    }
+    if (observation.authority !== "authoritative") return;
+    const run = this.pathWarningWrite.then(async () => {
+      const next = buildPathWarnings(groups);
+      // Foreground sync is another authorized writer. Compare to durable truth,
+      // not an instance-local fingerprint that can become stale behind our back.
+      if (next && (await readPathWarnings(this.root))?.fingerprint === next.fingerprint) return;
+      const warnings = await savePathWarnings(this.root, groups);
+      if (!warnings) return;
+      const sample = warnings.collisions[0]?.paths.slice(0, LOG_PATHS_MAX).map(cleanPath).join(" ") ?? "";
+      const omitted = warnings.groupCount > warnings.collisions.length ? `; ${warnings.groupCount - warnings.collisions.length} more groups` : "";
+      this.log(`path warning: skipped ${warnings.pathCount} case-conflicting paths in ${warnings.groupCount} group${warnings.groupCount === 1 ? "" : "s"}${sample ? `: ${sample}` : ""}${omitted} — rename or remove one; background sync will pick it up`);
+    });
+    this.pathWarningWrite = run.catch(() => {});
+    await run;
   }
 
   /**
@@ -2749,6 +2818,10 @@ export class RboxDaemon {
       this.refreshGitSafetyFloor(mode === "pruned" ? "pruned-additive-scan" : "additive-scan");
     }
     this.manifest = deferred.size > 0 ? deferManifest(fresh, previous, deferred) : fresh;
+    // Any deferred path makes collision evidence incomplete: it might be the
+    // unseen case-variant of a path that did hash. Preserve warning authority
+    // until a later scan observes the whole file set.
+    this.manifestObservationComplete = deferred.size === 0;
     if (deferred.size > 0) this.scheduleWriteFinishRetry(deferred);
     if (probe) {
       const summary = probe.summary();

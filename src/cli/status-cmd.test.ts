@@ -725,6 +725,27 @@ test("status returns the effective daemon state in text and json modes", async (
   }
 });
 
+test("status projects case-colliding paths as a healthy advisory in brief, verbose, and JSON", async () => {
+  const d = cleanScanDeps();
+  d.daemonBindingStatus = () => ({ alive: { running: true, pid: 1234, bootId: "boot_status" }, bound: cfg.remoteWorkspaceId, stale: false });
+  d.readDaemonPidRecord = () => ({ present: true });
+  const entry = (path: string) => ({
+    path, type: "file" as const, sha256: "a".repeat(64), size: 1, mode: 0o644, mtimeMs: 1,
+  });
+  d.scanManifest = async () => ({
+    generatedAt: new Date(NOW).toISOString(),
+    files: [entry("Lucky Meat.md"), entry("Lucky meat.md")],
+  });
+  const brief = await captureStatusWithDeps({}, d);
+  expect(brief).toContain("synced with 1 warning");
+  expect(brief).toContain("skipped 2 case-conflicting paths");
+  const verbose = await captureStatusWithDeps({ verbose: true }, d);
+  expect(verbose).toContain("✓ in sync — 0 files · ⚠ 1 warning");
+  const json = JSON.parse(await captureStatusWithDeps({ json: true }, d));
+  expect(json.pathWarnings).toMatchObject({ groupCount: 1, pathCount: 2 });
+  expect(json.health).toBe("ok");
+});
+
 test("default suppresses real legacy daemon/history/footer facts while --verbose retains them", async () => {
   const d = cleanScanDeps();
   d.daemonBindingStatus = () => ({ alive: { running: true, pid: 1234, bootId: "boot_status" }, bound: cfg.remoteWorkspaceId, stale: false });

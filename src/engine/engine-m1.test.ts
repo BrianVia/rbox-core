@@ -10,6 +10,7 @@ import {
   scanManifest,
   validateManifest,
   isSafeRelPath,
+  caseFoldCollisionGroups,
   type WatchEvent,
 } from "./index.js";
 import type { FileEntry } from "./index.js";
@@ -31,6 +32,21 @@ const goodEntry = (over: Partial<FileEntry> = {}): FileEntry => ({
 test("validateManifest accepts a well-formed manifest", () => {
   const m = { generatedAt: "", files: [goodEntry(), goodEntry({ path: "b.ts" })] };
   expect(validateManifest(m).ok).toBe(true);
+});
+
+test("caseFoldCollisionGroups returns complete deterministic groups and leaves exact duplicates to validation", () => {
+  expect(caseFoldCollisionGroups([
+    { path: "beta" },
+    { path: "Alpha" },
+    { path: "ALPHA" },
+    { path: "alpha" },
+    { path: "BETA" },
+    { path: "same" },
+    { path: "same" },
+  ])).toEqual([
+    { paths: ["ALPHA", "Alpha", "alpha"] },
+    { paths: ["BETA", "beta"] },
+  ]);
 });
 
 test("validateManifest rejects path traversal and unsafe paths", () => {

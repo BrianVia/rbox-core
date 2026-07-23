@@ -7,6 +7,7 @@ export {
   pushManifest,
   PushConflictExhaustedError,
   accumulateRecoveryPage,
+  localFileObservationForScan,
   stampManifestSchemaForCommit,
   type PushResult,
   type RepairPushMode,

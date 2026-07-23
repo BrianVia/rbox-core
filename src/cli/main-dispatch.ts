@@ -2,7 +2,7 @@ import path from "node:path";
 import { progressLabel } from "./status-view.js";
 import { findRoot } from "./config.js";
 import { pull, push } from "./sync.js";
-import { attachGitSyncProgress, postSyncNudge, runSyncCommand, summarize } from "./sync-cmd.js";
+import { attachGitSyncProgress, postSyncNudge, runSyncCommand, summarize, summarizeCaseCollisions } from "./sync-cmd.js";
 import { beginReport, logDebugSummary } from "./metrics.js";
 import { DEFAULT_LOG_LINES, logsDaemon } from "./daemon-control.js";
 import { autostartCmd, bootResume, BOOT_RESUME_MARKER, startDaemonAndRecordDesired, stopDaemonAndRecordDesired } from "./autostart-cmd.js";
@@ -287,12 +287,13 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
           deps.allowMassDeletePush = flags["allow-mass-delete"] === "true" || process.env.RBOX_ALLOW_MASS_DELETE === "1";
           const report = beginReport("push");
           deps.report = report;
-          const { sequence: seq, committed } = await push(root, cfg, deps);
+          const { sequence: seq, committed, caseCollisions } = await push(root, cfg, deps);
           sp.succeed(
             committed
               ? `pushed ${style.dim(root)} ${style.sym.arrow} sequence ${style.cyan(String(seq))}`
               : `already in sync — nothing to upload ${style.dim(`(sequence ${seq})`)}`
           );
+          summarizeCaseCollisions(caseCollisions);
           logDebugSummary(report, (l) => console.log(style.dim(l)));
         });
       } catch (e) {

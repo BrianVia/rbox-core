@@ -1424,6 +1424,7 @@ export async function resetSyncState(
       path.join(root, RBOX_DIR, "state", "activity.json"),
       path.join(root, RBOX_DIR, "state", "shell.line"),
       path.join(root, RBOX_DIR, "state", "shell.deferrals"),
+      path.join(root, RBOX_DIR, "state", "path-warnings.json"),
     ]) {
       try {
         await fs.rm(p, { recursive: true });

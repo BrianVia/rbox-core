@@ -54,6 +54,8 @@ import { readResetHaltHealth } from "./reset-health.js";
 import { promotePendingModeIntent } from "./autostart-cmd.js";
 import { pendingGenesisState } from "./genesis-enrollment.js";
 import { GENESIS_PENDING_MESSAGE } from "./genesis-durable.js";
+import { buildPathWarnings, readPathWarnings, type PathWarningsV1 } from "./path-warnings.js";
+import { projectLocalManifest } from "./local-file-projection.js";
 
 interface StatusAccountJson {
   plan: string | null;
@@ -115,6 +117,7 @@ export interface StatusCmdDeps {
   readBriefIdentity?: (accountId: string) => Promise<BriefIdentitySource | undefined>;
   promotePendingModeIntent?: typeof promotePendingModeIntent;
   reconcileGitDeferrals?: typeof reconcileGitDeferrals;
+  readPathWarnings?: typeof readPathWarnings;
 }
 
 const defaultStatusDeps: StatusCmdDeps = {
@@ -131,6 +134,7 @@ const defaultStatusDeps: StatusCmdDeps = {
   readAmbientDaemonStatusRecord,
   promotePendingModeIntent,
   reconcileGitDeferrals,
+  readPathWarnings,
 };
 
 const LOCAL_TRUST_MS = 60_000;
@@ -433,10 +437,12 @@ export async function statusCmdWithDeps(
   }
 
   const activityP = daemonStale ? Promise.resolve(undefined) : loadActivity(root);
+  const pathWarningsP = (deps.readPathWarnings ?? readPathWarnings)(root);
   const trashP = trashStats(root).catch(() => undefined);
   const lockingP = (deps.readLockingHealth ?? readLockingHealth)(root);
   const accountJsonP = opts.json ? fetchStatusAccountJson(loadedCredentials) : Promise.resolve(null);
-  const rawActivity = await activityP;
+  const [rawActivity, durablePathWarnings] = await Promise.all([activityP, pathWarningsP]);
+  let pathWarnings: PathWarningsV1 | undefined = durablePathWarnings;
   const attributionNow = deps.now();
   const attributeActivity = (base: SyncState) =>
     attributeDaemonForStatus({
@@ -554,16 +560,21 @@ export async function statusCmdWithDeps(
     const hashCache = await deps.loadHashCache(root);
     const gitRepoFeed = createGitRepoFeed();
     const gitChangedP = evaluateGit(matcher, gitRepoFeed.iterable);
-    let localManifest;
+    let rawLocalManifest;
     try {
-      localManifest = await deps.scanManifest(root, matcher, hashCache, undefined, (repo) => gitRepoFeed.push(repo));
+      rawLocalManifest = await deps.scanManifest(root, matcher, hashCache, undefined, (repo) => gitRepoFeed.push(repo));
     } finally {
       gitRepoFeed.close();
     }
     if (!deps.readDaemonPidRecord(root).present) {
-      hashCache.prune(new Set(localManifest.files.map((f) => f.path)));
+      hashCache.prune(new Set(rawLocalManifest.files.map((f) => f.path)));
       await hashCache.save(root, { beforeRename: () => !deps.readDaemonPidRecord(root).present }).catch(() => {});
     }
+    const projected = projectLocalManifest(rawLocalManifest, state.lastSyncedManifest, matcher);
+    const localManifest = projected.manifest;
+    // A full status scan owns current read-only disk truth for this invocation.
+    // It never mutates the durable sidecar; the passive loop remains its writer.
+    pathWarnings = buildPathWarnings(projected.caseCollisions);
     const manifestDiff = diffManifests(state.lastSyncedManifest, localManifest);
     const deleted = manifestDiff.deleted.filter((p) => !matcher.ignores(p)).length;
     const gitStatus = await gitChangedP;
@@ -681,6 +692,7 @@ export async function statusCmdWithDeps(
         }
         : {}),
       ...(activity?.halt?.reason !== undefined ? { haltReason: activity.halt.reason } : {}),
+      pathWarnings: pathWarnings ?? null,
     };
     emitJson(statusJson);
     return { daemonRunning: bg.running };
@@ -740,6 +752,7 @@ export async function statusCmdWithDeps(
       cliVersion: RBOX_VERSION,
       daemonVersionSkew,
       locking,
+      ...(pathWarnings ? { pathWarnings } : {}),
       ...(humanProjectedGitRepos.length > 0
         ? {
           git: {
@@ -801,6 +814,7 @@ export async function statusCmdWithDeps(
     localSequence: state.lastSyncedSequence,
     remote,
     activity,
+    pathWarnings,
     populate: populate
       ? {
           phase: populate.operation.phase,

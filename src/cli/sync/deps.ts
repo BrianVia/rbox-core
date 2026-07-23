@@ -5,6 +5,7 @@ import {
   createScanStats,
   scanPruneEnabled,
   type Action,
+  type CaseFoldCollisionGroup,
   type DiscoveredGitRepo,
   type ScanStats,
 } from "../../engine/index.js";
@@ -77,6 +78,13 @@ export interface SyncDeps {
   /** Operational warning/metrics sink. Daemons inject their instance-local dated
    * logger; foreground commands retain their existing stderr defaults. */
   warningSink?: (line: string) => void;
+  /** Advisory local-file observation boundary. The push core awaits it while the
+   * caller's workspace mutex is held, but swallows failures: path warnings can
+   * never change publication correctness or exit status. */
+  onCaseCollisionObservation?: (observation: {
+    authority: "authoritative" | "preserve";
+    caseCollisions: readonly CaseFoldCollisionGroup[];
+  }) => void | Promise<void>;
   /** Called immediately after a state save that may set/clear durable Git
    * deferrals. Observability-only: callers must not throw or mutate the state. */
   onGitDeferralsSaved?: (state: SyncState) => void;
