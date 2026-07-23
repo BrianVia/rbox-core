@@ -537,9 +537,19 @@ async function mountPrompt<T>(args: {
   let abort: (() => void) | undefined;
   let restored = false;
 
+  // Ctrl-C between mount and Ink's raw-mode/input attach arrives as a real
+  // SIGINT (raw mode is not on yet, so the tty driver signals us). Route it
+  // through the same cancel path so the terminal is restored and the process
+  // exits 130 — never the runtime's default signal death. Once raw mode is
+  // active the key comes through useInput and this listener stays inert.
+  const onSigint = () => sigintCancel?.();
+  let sigintCancel: (() => void) | undefined;
+  process.on("SIGINT", onSigint);
+
   const restoreTerminal = () => {
     if (restored) return;
     restored = true;
+    process.removeListener("SIGINT", onSigint);
     stdin.setRawMode?.(wasRaw);
     if (wasPaused) stdin.pause();
     else stdin.resume();
@@ -584,6 +594,7 @@ async function mountPrompt<T>(args: {
         fail: (error) => settle({ kind: "error", error }),
         cancel: () => settle({ kind: "cancel" }),
       };
+      sigintCancel = handlers.cancel;
       try {
         instance = render(<SafeBoundary fail={handlers.fail}>{args.component(handlers)}</SafeBoundary>, {
           stdin,

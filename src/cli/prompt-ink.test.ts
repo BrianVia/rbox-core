@@ -225,6 +225,15 @@ describe("Ink prompt runtime", () => {
     expect(await next).toBe("ok");
   });
 
+  test("a SIGINT before Ink attaches its input handler cancels the prompt", async () => {
+    const h = harness();
+    const pending = inkInput({ message: "Name" }, h.streams);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    process.emit("SIGINT" as never);
+    await expect(pending).rejects.toBeInstanceOf(PromptCancelledError);
+    expect(h.rawModes.at(-1)).toBe(false);
+  });
+
   test("a second prompt on a busy stdin fails fast instead of corrupting the terminal", async () => {
     const h = harness();
     const first = inkInput({ message: "First" }, h.streams);
