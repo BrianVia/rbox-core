@@ -205,6 +205,15 @@ async function startDeviceCode(
       continue;
     }
     if (res.status === 429) throw new Error("login rate-limited — wait a minute and run `rbox login` again");
+    // Client-skew (design 189 §11): a server that predates key delivery rejects
+    // the enrollment pubkey fields as an unknown request shape (400). Fall back
+    // to a legacy label-only start — the poll loop then sees no keyDelivery field
+    // and completes as an ordinary device-code login (enroll via pairing/phrase).
+    // Guard on the retry succeeding so a genuinely bad request still surfaces.
+    if (res.status === 400) {
+      const legacy = await postJson(`${remoteUrl}/v1/auth/device/start`, { label });
+      if (legacy.ok) return (await legacy.json()) as DeviceCodeStart;
+    }
     throw await friendlyHttpError(res, "login");
   }
 }
