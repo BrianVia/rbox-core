@@ -1,9 +1,9 @@
 # 189 — Web-approved pairing: auto-fulfilled key delivery
 
-Status: DRAFT v5 — after the serial gate (1 BLOCKER + 3 MAJORs, all
-integration-seam issues vs the existing roster-publish path). v5 SIMPLIFIES:
-the daemon produces the persisted wrap directly and publishes the roster
-server-side at fulfillment; revoke fences delivery. Ready for the serial re-gate.
+Status: DRAFT v6 — serial re-gate VERIFIED the wrap/hash seam + revoke fence;
+residual = 2 crash-recovery contract edges (both with existing reconcile
+patterns) + a doc scrub. v6 adds idempotent publish-reconcile and request-bound
+token recovery. No open BLOCKER. Ready for the final serial gate.
 
 Related: 47, 184, 180, 12 (roster), 187, 191 (epoch rotation — deferred, §12.1),
 190 (passkey escrow — DECOUPLED, §9), #412 (Clerk redirect fix — MERGED; §8).
@@ -87,9 +87,15 @@ private key + a token-derived admission key the daemon lacks).
    - PUBLISHES the new roster + device row to the server atomically at
      fulfillment via the existing monotone append (keys.ts:398-426), which 409s
      on a stale parent. The daemon owns re-fetch-head/rebase/re-sign on 409
-     (it holds the signing key; the client cannot). By the time the client picks
-     up, the admin-signed roster is the PUBLISHED head (serial MAJOR-4: closes
-     the head-race — the client never has to publish a roster it can't sign);
+     (it holds the signing key; the client cannot). Publish is IDEMPOTENT
+     (serial2 MAJOR-2: device_keys.device_id is a PK, keys.ts:415-422, so a
+     blind re-sign after a lost response would collide): on 409 or retry the
+     daemon REFETCHES, and if the target device+roster row already exists with
+     the exact committed keys+wrap it treats publication as COMPLETE (the
+     e2ee-client.ts:404-408 reconcile pattern), only rebasing/re-signing when the
+     row is genuinely absent. By the time the client picks up, the admin-signed
+     roster is the PUBLISHED head (serial MAJOR-4: closes the head-race — the
+     client never has to publish a roster it can't sign);
    - posts {mkWrapDevice, publishedRosterVersion, accountEpoch}.
 6. New CLI polls, receives it, and:
    - fetches + verifies the FULL roster chain (verifyRosterChain) up to the
@@ -122,12 +128,15 @@ open URL#fp=JCShash --------> step-up; AUTO-verify
 poll: keyDelivery=pending                              -- nudge -----------> verify approval+
                                                                              pubkeys+epoch;
                                                                              fetch+verify chain;
-                                                                             buildAdminRoster;
-                                                                             wrap MK (transport)
-                                                        <-- blob+roster ---- post (CAS)
-poll: keyDelivery=ready{blob,roster} <-- relay
-verify chain->admin authority; roster admits my keys;
-unwrap MK; RE-self-wrap (device ctx); persist; ACK -> delivered
+                                                                             wrap MK (device ctx);
+                                                                             buildAdminRoster w/ that
+                                                                             wrap's hash; PUBLISH
+                                                                             roster (monotone, 409->
+                                                                             reconcile)
+                                                        <-- blob+ver ------- post
+poll: keyDelivery=ready{blob,rosterVer} <-- relay
+verify chain->admin authority; published roster admits my keys;
+unwrap MK; store wrap AS-IS; persist; ACK -> delivered
 ```
 
 Fallback when no daemon in TTL: pairing token -> phrase (190 decoupled, §9).
@@ -220,7 +229,15 @@ real enrollment.
 to poll AFTER the auth claim (round-2 C#6: the current loop returns on approved,
 auth-cmd.ts:1003-1017, and post-claim polls only return `claimed`; the new field
 must be carried on `claimed` too), with deadlines, cancellation, and fallback to
-pairing/phrase, rendered as one state line.
+pairing/phrase, rendered as one state line. TOKEN RECOVERY (serial2 MAJOR-3):
+today a crash after the claim commit but before the HTTP response strands the
+CLI without its once-returned bearer (device-code.ts:95 then returns only
+`claimed`; mint.ts:145-162 stores only the token hash). 189 makes the claim
+REPLAY-SAFE within the device-code TTL: the minted token is recoverable by the
+same authenticated device-code poll (bound to requestId=sha256(device_code)) so
+a re-poll after a crash returns the credential instead of a dead `claimed`. This
+is a device-code hardening 189 requires; outside the window the user re-runs
+login (today's behavior).
 
 7.3 Pickup crash-safety: idempotent — blob stays in `fulfilled` until the client
 ACK confirms durable persist + roster verify; a crash re-fetches the same blob;
@@ -256,8 +273,12 @@ pairing token -> phrase until 190 is redesigned + aligned on its own timeline.
   the prevSigner-active branch (roster.ts:266-272) — no admission proof.
 - Roster monotone publish + 409-on-stale-parent (keys.ts:398-426) — daemon owns
   rebase/re-sign on 409.
-- rsaDeviceWrap foreign SPKI (keys.ts:93). openOwnMasterKey requires the device
-  context (session.ts:578) -> re-self-wrap on receipt.
+- rsaDeviceWrap foreign SPKI (keys.ts:93); wrapHash hashes that exact blob;
+  openOwnMasterKey requires the device context (session.ts:578) -> the daemon
+  produces the device-context wrap directly and the client stores it AS-IS
+  (no re-wrap). assertMkWrapAuthorized checks the delivered blob hash
+  (session.ts:270-275).
+- Idempotent roster publish reconcile pattern: e2ee-client.ts:404-408.
 - device-code has no pubkey today (device-code.ts:50-72; 0004_auth.sql:17);
   poll can re-mint the id (device-code.ts:117-142).
 - Grants bypass bearer auth, ~5 min (GRANT_TTL_MS grants.ts:22), no device
