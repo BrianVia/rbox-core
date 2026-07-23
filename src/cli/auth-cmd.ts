@@ -12,6 +12,7 @@ import { buildPairing, canonicalString, phraseToRk, randomBytes, rkToPhrase, sha
 import { loadDevice, loadRecoveryKey } from "./e2ee-keystore.js";
 import { isAutostartEnabled } from "./autostart-cmd.js";
 import { readStdinTrimmed } from "./read-stdin.js";
+import { rboxBanner } from "./wordmark.js";
 import { friendlyHttpError } from "./http-error.js";
 import {
   defaultKitTargetDir,
@@ -221,7 +222,7 @@ async function chooseGenesisDestinationIntent(args: {
   const fixedKinds = destinationKinds(fixed);
   const discovery = args.opDiscovery ?? await (deps.detectOnePassword ?? detectOnePasswordCli)();
 
-  write(GENESIS_RECOVERY_LEAD_IN);
+  write(rboxBanner() + GENESIS_RECOVERY_LEAD_IN);
   if (discovery.state !== "available") {
     write("\n1Password CLI not found — choose Clipboard to paste the phrase into 1Password yourself.\n");
   }

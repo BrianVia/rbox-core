@@ -28,9 +28,16 @@ function joinLetters(word: string, style: (text: string) => string): string[] {
   return [0, 1, 2].map((row) => style(rendered.map((letter) => letter[row]).join(" ")));
 }
 
+let bannerShown = false;
+
 /** The first-run banner: block "rbox" wordmark plus a one-line welcome.
- * Returns lines ready for stderr; color handling follows stderrStyle. */
+ * Returns lines ready for stderr; color handling follows stderrStyle.
+ * Emits once per process — several front doors call it (setup, the two
+ * front-door menus, the interactive genesis lead-in inside login) and a
+ * flow can pass through more than one of them. */
 export function rboxBanner(): string {
+  if (bannerShown) return "";
+  bannerShown = true;
   const r = joinLetters("r", stderrStyle.dim);
   const box = joinLetters("box", (text) => stderrStyle.bold(text));
   const mark = [0, 1, 2].map((row) => `  ${r[row]} ${box[row]}`);
