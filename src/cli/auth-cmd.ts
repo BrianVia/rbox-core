@@ -2,13 +2,13 @@ import os from "node:os";
 import fs from "node:fs/promises";
 import { clearCredentials, credentialsForStrictFlow, loadCredentials, PROD_WEB, saveCredentials } from "./credentials.js";
 import { clearAccountProfile } from "./account-profile.js";
-import { isInteractive, promptConfirm, promptInput, promptPassword } from "./prompt.js";
+import { isInteractive, promptCheckbox, promptConfirm, promptInput, promptPassword, promptSelect, type CheckboxPrompt } from "./prompt.js";
 import { copyToClipboard, openInBrowser, waitForKeypress } from "./browser-open.js";
 import { RboxApi } from "./remote.js";
 import { emitJson } from "./json.js";
-import { assertNoPendingGenesis, beginAtomicGenesis, completeAtomicGenesis, enrollViaPairing, enrollViaRecovery, enrollViaRecoveryWithPhraseInput, RecoveryPreAdmissionError } from "./e2ee-client.js";
+import { assertNoPendingGenesis, beginAtomicGenesis, completeAtomicGenesis, enrollViaPairing, enrollViaRecovery, enrollViaRecoveryWithPhraseInput, RecoveryPreAdmissionError, type AtomicGenesisDestinationSetContext, type AtomicGenesisDestinationSetResult } from "./e2ee-client.js";
 import { preflightRecoveryEnvelope, validatePhraseForAccount } from "./e2ee-client.js";
-import { buildPairing, phraseToRk, randomBytes, rkToPhrase, toB64url } from "../engine/e2ee/index.js";
+import { buildPairing, canonicalString, phraseToRk, randomBytes, rkToPhrase, sha256Hex, toB64url, utf8 } from "../engine/e2ee/index.js";
 import { loadDevice, loadRecoveryKey } from "./e2ee-keystore.js";
 import { isAutostartEnabled } from "./autostart-cmd.js";
 import { readStdinTrimmed } from "./read-stdin.js";
@@ -21,7 +21,10 @@ import {
   claimRecoveryKitOffer,
   mergeDiscoveredKeychainArtifact,
   markPlaintextCleanup,
+  invalidateOnePasswordArtifact,
+  readPlaintextKit,
   readRecoveryKitRecordState,
+  recordOnePasswordArtifact,
   recordKeychainArtifact,
   recoveryKitAction,
   recoveryKitFileState,
@@ -31,7 +34,7 @@ import {
   type RecoveryKitOptions,
 } from "./recovery-kit.js";
 import { genesisClassifierConsultationNeeded, pendingGenesisState } from "./genesis-enrollment.js";
-import { GENESIS_PENDING_MESSAGE } from "./genesis-durable.js";
+import { GENESIS_PENDING_MESSAGE, foldDestinationProgress, type DestinationCompletion, type DestinationSetCompletionIntent, type RecoveryDestination } from "./genesis-durable.js";
 import {
   canonicalRecoveryPhrase,
   probeKeychainKit,
@@ -42,6 +45,18 @@ import {
   type KeychainSeams,
 } from "./recovery-kit-keychain.js";
 import { retargetThenWriteFallback, shouldPresentGenesisCompletion, type CommittedGenesisClassification, type CompletionIntent, type GenesisSeam, type ValidatedStagedRecoveryKey } from "./genesis-seam.js";
+import {
+  createOnePasswordRecoveryItem,
+  detectOnePasswordCli,
+  listOnePasswordAccounts,
+  listOnePasswordVaults,
+  reconcileOnePasswordRecoveryItem,
+  verifyOnePasswordRecoveryItem,
+  type OnePasswordDiscovery,
+  type OnePasswordLocator,
+  type OnePasswordProvider,
+} from "./recovery-kit-1password.js";
+import { clearRecoverySecretClipboard, copyRecoverySecretToClipboard } from "./recovery-secret-clipboard.js";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const MIN_LOGIN_BACKOFF_MS = 1000;
@@ -157,6 +172,402 @@ async function startDeviceCode(remoteUrl: string, label: string): Promise<Device
 type GenesisApi = Pick<RboxApi, "getAccountKeys" | "getGenesisObservation" | "bootstrapKeys">;
 type GenesisEnrollmentResult = "enrolled" | "already-setup";
 
+type GenesisDestinationChoice = "onepassword" | "keychain" | "kit-path" | "clipboard";
+
+interface GenesisDestinationFlowDeps {
+  checkbox?: CheckboxPrompt;
+  select?: typeof promptSelect;
+  confirm?: typeof promptConfirm;
+  writeStderr?: (text: string) => void;
+  detectOnePassword?: typeof detectOnePasswordCli;
+  listOnePasswordAccounts?: typeof listOnePasswordAccounts;
+  listOnePasswordVaults?: typeof listOnePasswordVaults;
+  reconcileOnePassword?: typeof reconcileOnePasswordRecoveryItem;
+  createOnePassword?: typeof createOnePasswordRecoveryItem;
+  verifyOnePassword?: typeof verifyOnePasswordRecoveryItem;
+  copyClipboard?: typeof copyRecoverySecretToClipboard;
+  clearClipboard?: typeof clearRecoverySecretClipboard;
+}
+
+const GENESIS_RECOVERY_LEAD_IN = `
+First, save your recovery phrase.
+
+Your files stay normal and usable on this computer. Before rbox uploads a copy,
+it encrypts that copy using this phrase. That keeps your files private in the
+cloud — even from us.
+
+GitHub and other source control keep working normally. This phrase protects
+rbox's separate cloud copy, including work you have not committed or pushed yet.
+
+If you lose every signed-in device, this phrase is the only way back in.
+rbox cannot reset it.
+`;
+
+function destinationKinds(destinations: readonly RecoveryDestination[]): Set<GenesisDestinationChoice> {
+  return new Set(destinations.map((destination) => destination.kind));
+}
+
+async function chooseGenesisDestinationIntent(args: {
+  accountId: string;
+  requestSha256: string;
+  now: number;
+  keychainTarget?: KeychainArtifact;
+  filePath: string;
+  fixed?: RecoveryDestination[];
+  opDiscovery?: OnePasswordDiscovery;
+  deps?: GenesisDestinationFlowDeps;
+}): Promise<DestinationSetCompletionIntent> {
+  const deps = args.deps ?? {};
+  const checkbox = deps.checkbox ?? promptCheckbox;
+  const select = deps.select ?? promptSelect;
+  const write = deps.writeStderr ?? ((text: string) => process.stderr.write(text));
+  const fixed = args.fixed ?? [];
+  const fixedKinds = destinationKinds(fixed);
+  const discovery = args.opDiscovery ?? await (deps.detectOnePassword ?? detectOnePasswordCli)();
+
+  write(GENESIS_RECOVERY_LEAD_IN);
+  if (discovery.state !== "available") {
+    write("\n1Password CLI not found — choose Clipboard to paste the phrase into 1Password yourself.\n");
+  }
+
+  for (;;) {
+    const selected = await checkbox<GenesisDestinationChoice>({
+      message: "Where should rbox save your recovery phrase?\n  ↑/↓ move · Space select · Enter continue",
+      choices: [
+        ...(discovery.state === "available" ? [{
+          name: "Save to 1Password",
+          value: "onepassword" as const,
+          description: "creates a secure item in a vault you choose",
+          checked: fixedKinds.has("onepassword"),
+          disabled: fixedKinds.has("onepassword") ? "already saved" : false,
+        }] : []),
+        ...(args.keychainTarget ? [{
+          name: "Save to macOS Keychain",
+          value: "keychain" as const,
+          description: "saves on this Mac; it does not sync through iCloud",
+          checked: fixedKinds.has("keychain") || fixed.length === 0,
+          disabled: fixedKinds.has("keychain") ? "already saved" : false,
+        }] : []),
+        {
+          name: "Save to a plaintext file",
+          value: "kit-path" as const,
+          description: `writes the phrase in plaintext to ${displayPath(args.filePath)} (readable only by your user account)`,
+          checked: fixedKinds.has("kit-path") || fixed.length === 0 && !args.keychainTarget,
+          disabled: fixedKinds.has("kit-path") ? "already saved" : false,
+        },
+        {
+          name: "Copy it to my clipboard",
+          value: "clipboard" as const,
+          description: "copies the 24 words temporarily; clipboard tools or history may retain them until cleared",
+          checked: fixedKinds.has("clipboard"),
+          disabled: fixedKinds.has("clipboard") ? "already saved" : false,
+        },
+      ],
+      validate: (values) => values.length + fixed.length > 0 || "Choose at least one place to save the phrase.",
+    });
+
+    const requested = new Set<GenesisDestinationChoice>([...fixedKinds, ...selected]);
+    const destinations: RecoveryDestination[] = [];
+    if (requested.has("onepassword")) {
+      const existing = fixed.find((destination) => destination.kind === "onepassword");
+      if (existing) {
+        destinations.push(existing);
+      } else {
+        if (discovery.state !== "available") continue;
+        write("\n1Password may ask you to sign in or approve access.\n");
+        const provider: OnePasswordProvider = { executable: discovery.executable, env: process.env };
+        const accountResult = await (deps.listOnePasswordAccounts ?? listOnePasswordAccounts)(provider);
+        if (accountResult.state !== "ok" || accountResult.accounts.length === 0) {
+          write("\nNo 1Password account is available to the CLI. Sign in or add an account in the 1Password app/CLI, then try again.\n");
+          continue;
+        }
+        const accountUuid = accountResult.accounts.length === 1
+          ? accountResult.accounts[0]!.uuid
+          : await select<string>({
+              message: "Choose a 1Password account:",
+              choices: accountResult.accounts.map((account) => ({ name: account.label, value: account.uuid })),
+            });
+        const vaultResult = await (deps.listOnePasswordVaults ?? listOnePasswordVaults)(provider, accountUuid);
+        if (vaultResult.state !== "ok" || vaultResult.vaults.length === 0) {
+          write("\nNo writable 1Password vault is available. Choose another save method or try again.\n");
+          continue;
+        }
+        const back = "__rbox_back__";
+        const vaultUuid = await select<string>({
+          message: "Choose a 1Password vault:",
+          choices: [
+            ...vaultResult.vaults.map((vault) => ({ name: vault.label, value: vault.uuid })),
+            { name: "← Choose another save method", value: back },
+          ],
+        });
+        if (vaultUuid === back) continue;
+        destinations.push({
+          kind: "onepassword",
+          accountUuid,
+          vaultUuid,
+          operationTag: `rbox_${toB64url(randomBytes(12))}`,
+          fieldId: "rboxRecoveryPhrase",
+        });
+      }
+    }
+    if (requested.has("keychain") && args.keychainTarget) {
+      const existing = fixed.find((destination) => destination.kind === "keychain");
+      destinations.push(existing ?? {
+        kind: "keychain",
+        service: args.keychainTarget.service,
+        account: args.keychainTarget.account,
+        keychainPath: args.keychainTarget.keychainPath,
+      });
+    }
+    if (requested.has("kit-path")) {
+      const existing = fixed.find((destination) => destination.kind === "kit-path");
+      destinations.push(existing ?? { kind: "kit-path", path: args.filePath });
+    }
+    if (requested.has("clipboard")) destinations.push({ kind: "clipboard" });
+    return {
+      version: 2,
+      accountId: args.accountId,
+      requestSha256: args.requestSha256,
+      mode: "destination-set",
+      destinations,
+      successThreshold: 1,
+      intentAt: new Date(args.now).toISOString(),
+    };
+  }
+}
+
+function destinationLabel(destination: RecoveryDestination): string {
+  if (destination.kind === "onepassword") return "1Password";
+  if (destination.kind === "keychain") return "macOS Keychain";
+  if (destination.kind === "kit-path") return "plaintext file";
+  return "Clipboard";
+}
+
+async function completeGenesisDestinationSet(
+  initial: AtomicGenesisDestinationSetContext,
+  creds: { accountId: string; deviceId: string },
+  keychainCompletion: GenesisRecoveryKitCompletionDeps,
+  deps: GenesisDestinationFlowDeps = {}
+): Promise<AtomicGenesisDestinationSetResult> {
+  const confirm = deps.confirm ?? promptConfirm;
+  const select = deps.select ?? promptSelect;
+  const write = deps.writeStderr ?? ((text: string) => process.stderr.write(text));
+  let context = initial;
+  let continuedAfterPartial = false;
+  const eventAt = (): string => {
+    const current = new Date().toISOString();
+    return current < context.progress.updatedAt ? context.progress.updatedAt : current;
+  };
+
+  for (;;) {
+    const folded = await foldDestinationProgress(context.intent, context.progress.events);
+    const liveValid = new Set<number>();
+    const failed = new Map<number, string>();
+
+    for (let index = 0; index < context.intent.destinations.length; index++) {
+      const destination = context.intent.destinations[index]!;
+      const prior = folded.completions[index];
+      if (prior) {
+        let state: "valid" | "invalid" | "unverifiable" = "valid";
+        if (prior.kind === "keychain") {
+          const probe = await probeKeychainKit(prior);
+          state = probe === "present" ? "valid" : probe === "missing" ? "invalid" : "unverifiable";
+        } else if (prior.kind === "kit-path") {
+          const probe = await readPlaintextKit(prior.path);
+          state = probe.state === "present" && probe.accountId === creds.accountId && probe.phrase === context.phrase
+            ? "valid"
+            : probe.state === "missing" || probe.state === "present" || probe.state === "unrecognized" ? "invalid" : "unverifiable";
+        } else if (prior.kind === "onepassword") {
+          const discovery = await (deps.detectOnePassword ?? detectOnePasswordCli)();
+          if (discovery.state !== "available") state = "unverifiable";
+          else {
+            const expected = Buffer.from(context.phrase, "utf8");
+            try {
+              const verification = await (deps.verifyOnePassword ?? verifyOnePasswordRecoveryItem)(
+                { executable: discovery.executable, env: process.env },
+                prior,
+                expected
+              );
+              state = verification === "valid" ? "valid" : verification === "mismatch" ? "invalid" : "unverifiable";
+            } finally {
+              expected.fill(0);
+            }
+          }
+        }
+        if (state === "valid") {
+          liveValid.add(index);
+          continue;
+        }
+        if (state === "invalid") {
+          if (prior.kind === "onepassword") {
+            await invalidateOnePasswordArtifact(creds.accountId, {
+              rboxAccountId: creds.accountId,
+              accountUuid: prior.accountUuid,
+              vaultUuid: prior.vaultUuid,
+              itemUuid: prior.itemUuid,
+              fieldId: prior.fieldId,
+              operationTag: prior.operationTag,
+            }, "mismatch");
+          }
+          context.progress = await context.append({
+            kind: "invalidated",
+            destinationIndex: index,
+            priorCompletionSha256: await sha256Hex(utf8(canonicalString(prior))),
+            reason: "mismatch",
+            at: eventAt(),
+          });
+        } else {
+          failed.set(index, "couldn't verify the existing copy");
+          continue;
+        }
+      }
+
+      try {
+        let completion: DestinationCompletion | undefined;
+        if (destination.kind === "keychain") {
+          await keychainCompletion.saveKeychain(context.phrase, {
+            version: 1,
+            accountId: context.intent.accountId,
+            requestSha256: context.intent.requestSha256,
+            mode: "keychain",
+            keychain: destination,
+            intentAt: context.intent.intentAt,
+          });
+          completion = { ...destination, kind: "keychain", completedAt: eventAt() };
+        } else if (destination.kind === "kit-path") {
+          const written = await writeRecoveryKit(context.phrase, creds, destination.path);
+          if (written.recordError) throw written.recordError;
+          completion = { ...destination, kind: "kit-path", completedAt: eventAt() };
+        } else if (destination.kind === "clipboard") {
+          write("\nClipboard history, other apps, or cross-device clipboard sync may retain this phrase.\nPaste it into your password manager now; rbox will clear the clipboard when you confirm.\n");
+          const copied = await (deps.copyClipboard ?? copyRecoverySecretToClipboard)(context.phrase);
+          if (!copied.ok) throw new Error("clipboard copy failed");
+          if (!(await confirm({ message: "Have you pasted and saved the phrase somewhere durable?", default: false }))) {
+            throw new Error("not yet confirmed saved");
+          }
+          const cleared = await (deps.clearClipboard ?? clearRecoverySecretClipboard)();
+          if (!cleared.ok && !(await confirm({ message: "rbox couldn't clear the clipboard. Have you cleared it yourself?", default: false }))) {
+            throw new Error("clipboard was not cleared");
+          }
+          completion = { kind: "clipboard", confirmedAt: eventAt() };
+        } else {
+          const discovery = await (deps.detectOnePassword ?? detectOnePasswordCli)();
+          if (discovery.state !== "available") throw new Error("1Password CLI is unavailable");
+          const provider: OnePasswordProvider = { executable: discovery.executable, env: process.env };
+          const reconciliation = await (deps.reconcileOnePassword ?? reconcileOnePasswordRecoveryItem)(provider, destination);
+          let locator: OnePasswordLocator | undefined;
+          if (reconciliation.state === "found") {
+            if (!folded.attempts[index]) throw new Error("unexpected untracked 1Password item");
+            locator = reconciliation.locator;
+          } else if (reconciliation.state === "missing") {
+            const attempt = folded.attempts[index];
+            if (attempt && attempt.state !== "child-not-started") throw new Error("1Password result is ambiguous; no duplicate was created");
+            const attemptId = `op_${toB64url(randomBytes(12))}`;
+            context.progress = await context.append({ kind: "op-dispatch-prepared", destinationIndex: index, attemptId, at: eventAt() });
+            context.progress = await context.append({ kind: "op-may-have-dispatched", destinationIndex: index, attemptId, at: eventAt() });
+            const created = await (deps.createOnePassword ?? createOnePasswordRecoveryItem)(provider, {
+              ...destination,
+              rboxAccountId: creds.accountId,
+              phrase: context.phrase,
+            });
+            if (created.state === "child-not-started") {
+              context.progress = await context.append({ kind: "op-child-not-started", destinationIndex: index, attemptId, reason: created.reason, at: eventAt() });
+              throw new Error("1Password CLI could not start");
+            }
+            if (created.state !== "created") throw new Error("1Password may have saved an item; rbox will reconcile it before retrying");
+            locator = created.locator;
+          } else {
+            throw new Error(reconciliation.state === "ambiguous"
+              ? "multiple matching 1Password items need attention"
+              : "1Password is unavailable");
+          }
+          const expected = Buffer.from(context.phrase, "utf8");
+          try {
+            const verification = await (deps.verifyOnePassword ?? verifyOnePasswordRecoveryItem)(provider, locator, expected);
+            if (verification !== "valid") throw new Error(verification === "mismatch" ? "1Password item did not match" : "1Password item could not be verified");
+          } finally {
+            expected.fill(0);
+          }
+          const completedAt = eventAt();
+          await recordOnePasswordArtifact(creds.accountId, {
+            rboxAccountId: creds.accountId,
+            ...locator,
+            writtenAt: completedAt,
+            state: "active",
+          });
+          completion = { ...locator, kind: "onepassword", completedAt };
+        }
+        context.progress = await context.append({ kind: "completed", destinationIndex: index, completion, at: eventAt() });
+        liveValid.add(index);
+      } catch (error) {
+        failed.set(index, error instanceof Error ? error.message : "couldn't complete the save");
+      }
+    }
+
+    if (liveValid.size === context.intent.destinations.length) {
+      write(`\n✓ Recovery phrase saved to ${liveValid.size === 1 ? destinationLabel(context.intent.destinations[0]!) : `${liveValid.size} selected places`}\n`);
+      return { intent: context.intent, progress: context.progress, liveValidDestinationIndexes: [...liveValid], continuedAfterPartial };
+    }
+
+    write(`\nSaved recovery phrase to ${liveValid.size} of ${context.intent.destinations.length} selected places:\n`);
+    for (let index = 0; index < context.intent.destinations.length; index++) {
+      const destination = context.intent.destinations[index]!;
+      write(`  ${liveValid.has(index) ? "✓" : "!"} ${destinationLabel(destination)}${failed.has(index) ? ` — ${failed.get(index)}` : ""}\n`);
+    }
+    const action = liveValid.size === 0
+      ? await select<"retry" | "change">({
+          message: "No durable recovery copy is complete yet. What do you want to do?",
+          choices: [
+            { name: "Retry incomplete choices", value: "retry" },
+            { name: "Change incomplete choices", value: "change" },
+          ],
+        })
+      : await select<"retry" | "continue" | "change">({
+          message: "What do you want to do?",
+          choices: [
+            { name: "Retry failed choices", value: "retry" },
+            { name: "Continue with the successful copies", value: "continue" },
+            { name: "Change incomplete choices", value: "change" },
+          ],
+        });
+    if (action === "retry") continue;
+    if (action === "continue") {
+      if (await confirm({ message: "Continue setup with only the successful recovery copies?", default: false })) {
+        continuedAfterPartial = true;
+        return { intent: context.intent, progress: context.progress, liveValidDestinationIndexes: [...liveValid], continuedAfterPartial };
+      }
+      continue;
+    }
+
+    const fixed = [...liveValid].map((index) => context.intent.destinations[index]!);
+    let keychainTarget: KeychainArtifact | undefined = context.intent.destinations.find(
+      (destination): destination is Extract<RecoveryDestination, { kind: "keychain" }> => destination.kind === "keychain"
+    );
+    if (!keychainTarget && process.platform === "darwin") {
+      try { keychainTarget = await actionableKeychainOfferTarget(creds.accountId) } catch {}
+    }
+    const replacement = await chooseGenesisDestinationIntent({
+      accountId: context.intent.accountId,
+      requestSha256: context.intent.requestSha256,
+      now: Date.now(),
+      keychainTarget,
+      filePath: context.intent.destinations.find((destination): destination is Extract<RecoveryDestination, { kind: "kit-path" }> => destination.kind === "kit-path")?.path ?? await defaultKitPath(creds.accountId),
+      fixed,
+      deps,
+    });
+    const newIndexByKind = new Map(replacement.destinations.map((destination, index) => [destination.kind, index]));
+    const carriedCompletions = await Promise.all([...liveValid].map(async (oldDestinationIndex) => {
+      const completion = folded.completions[oldDestinationIndex]!;
+      return {
+        oldDestinationIndex,
+        newDestinationIndex: newIndexByKind.get(completion.kind)!,
+        completionSha256: await sha256Hex(utf8(canonicalString(completion))),
+      };
+    }));
+    context = { ...context, ...(await context.replace({ newIntent: replacement, carriedCompletions, liveValidOldIndexes: [...liveValid] })) };
+  }
+}
+
 interface GenesisEnrollmentDeps {
   showRecoveryPhrase?: typeof showRecoveryPhrase;
   deliverPhrase?: (phrase: string) => Promise<void>;
@@ -171,6 +582,7 @@ interface GenesisEnrollmentDeps {
   stderrTTY?: boolean;
   keychainOfferTarget?: (accountId: string) => Promise<KeychainArtifact | undefined>;
   probeKeychain?: typeof probeKeychainKit;
+  destinationFlow?: GenesisDestinationFlowDeps;
 }
 
 export async function runGenesisEnrollment(
@@ -218,37 +630,59 @@ export async function runGenesisEnrollment(
         } finally { rk.fill(0) }
       }
       if (!interactive) return { ...base, mode: "phrase-display" as const };
-      if (platform === "darwin") {
-        if (!stdinTTY || !stderrTTY) return { ...base, mode: "phrase-display" as const };
-        let target: KeychainArtifact | undefined;
-        try {
-          target = await (deps.keychainOfferTarget ?? actionableKeychainOfferTarget)(journal.accountId);
-        } catch {
-          target = undefined;
-        }
-        if (!target) return { ...base, mode: "phrase-display" as const };
-        const record = await readRecoveryKitRecordState(journal.accountId);
-        const continuingClaim = record.state === "recognized" &&
-          record.record.offer?.surface === "genesis" &&
-          record.record.offer.outcome === "claimed";
-        // A declined genesis offer is terminal only once the journal resolves:
-        // a crash between this decline and intent publication must re-present.
-        const offerBlocks = record.state === "recognized" && record.record.offer !== undefined
-          && !(record.record.offer.surface === "genesis" && record.record.offer.outcome === "declined");
-        if (!shouldPresentGenesisCompletion(offerBlocks, started, { state: "absent" })) {
+      // Preserve the legacy injected prompt seam used by embedders and existing
+      // deterministic tests. Production has no injected confirm and always uses
+      // the destination-set checkbox below.
+      if (!deps.destinationFlow && (deps.promptConfirm || deps.deliverPhrase || deps.genesisCompletion || deps.writeKit)) {
+        if (platform === "darwin" && (deps.keychainOfferTarget !== undefined || deps.resolveKitPath === undefined)) {
+          if (!stdinTTY || !stderrTTY) return { ...base, mode: "phrase-display" as const };
+          let target: KeychainArtifact | undefined;
+          try {
+            target = await (deps.keychainOfferTarget ?? actionableKeychainOfferTarget)(journal.accountId);
+          } catch {
+            target = undefined;
+          }
+          if (!target) return { ...base, mode: "phrase-display" as const };
+          const record = await readRecoveryKitRecordState(journal.accountId);
+          const continuingClaim = record.state === "recognized" &&
+            record.record.offer?.surface === "genesis" &&
+            record.record.offer.outcome === "claimed";
+          const offerBlocks = record.state === "recognized" && record.record.offer !== undefined
+            && !(record.record.offer.surface === "genesis" && record.record.offer.outcome === "declined");
+          if (!shouldPresentGenesisCompletion(offerBlocks, started, { state: "absent" })) {
+            return { ...base, mode: "phrase-display" as const };
+          }
+          const claimed = continuingClaim || await claimRecoveryKitOffer(journal.accountId, "genesis", "in-hand", async () =>
+            await (deps.probeKeychain ?? probeKeychainKit)(target) === "missing");
+          if (claimed && await (deps.promptConfirm ?? promptConfirm)({ message: "Save this recovery phrase to the macOS Keychain now (view later in Keychain Access — search \"rbox\")?", default: true })) {
+            return { ...base, mode: "keychain" as const, keychain: { service: target.service, account: target.account, keychainPath: target.keychainPath } };
+          }
+          if (claimed) await updateGenesisOffer("declined").catch(() => {});
           return { ...base, mode: "phrase-display" as const };
         }
-        const claimed = continuingClaim || await claimRecoveryKitOffer(journal.accountId, "genesis", "in-hand", async () =>
-          await (deps.probeKeychain ?? probeKeychainKit)(target) === "missing");
-        if (claimed && await (deps.promptConfirm ?? promptConfirm)({ message: "Save this recovery phrase to the macOS Keychain now (view later in Keychain Access — search \"rbox\")?", default: true })) {
-          return { ...base, mode: "keychain" as const, keychain: { service: target.service, account: target.account, keychainPath: target.keychainPath } };
-        }
-        if (claimed) await updateGenesisOffer("declined").catch(() => {});
-        return { ...base, mode: "phrase-display" as const };
+        const target = await (deps.resolveKitPath ?? resolveRecoveryKitPath)(journal.accountId, undefined, new Date(now));
+        return await (deps.promptConfirm ?? promptConfirm)({ message: `Save a recovery kit (writes the phrase in PLAINTEXT to ${displayPath(target)})?`, default: true })
+          ? { ...base, mode: "kit-path" as const, path: target }
+          : { ...base, mode: "phrase-display" as const };
       }
-      const target = await (deps.resolveKitPath ?? resolveRecoveryKitPath)(journal.accountId, undefined, new Date(now));
-      const selected = await (deps.promptConfirm ?? promptConfirm)({ message: `Save a recovery kit (writes the phrase in PLAINTEXT to ${displayPath(target)})?`, default: true });
-      return selected ? { ...base, mode: "kit-path" as const, path: target } : { ...base, mode: "phrase-display" as const };
+      if (!stdinTTY || !stderrTTY) return { ...base, mode: "phrase-display" as const };
+      let keychainTarget: KeychainArtifact | undefined;
+      if (platform === "darwin") {
+        try {
+          keychainTarget = await (deps.keychainOfferTarget ?? actionableKeychainOfferTarget)(journal.accountId);
+        } catch {
+          keychainTarget = undefined;
+        }
+      }
+      const filePath = await (deps.resolveKitPath ?? resolveRecoveryKitPath)(journal.accountId, undefined, new Date(now));
+      return chooseGenesisDestinationIntent({
+        accountId: journal.accountId,
+        requestSha256: journal.requestSha256,
+        now: intentNow,
+        keychainTarget,
+        filePath,
+        deps: deps.destinationFlow,
+      });
     },
     commitArtifact: async (intent, phrase) => {
       if (intent.mode === "keychain") {
@@ -271,6 +705,12 @@ export async function runGenesisEnrollment(
       if (error instanceof KeychainLocatorWriteError) return undefined;
       return completion.retargetAfterKeychainFailure?.(phrase, intent);
     },
+    completeDestinationSet: (context) => completeGenesisDestinationSet(
+      context,
+      creds,
+      completion,
+      deps.destinationFlow
+    ),
   }, now);
   return "enrolled";
 }
@@ -888,17 +1328,21 @@ export async function keyStatus(opts: { json?: boolean } = {}): Promise<void> {
     emitJson({
       enrolled: enrolled&&!genesisPending,
       recoveryKit: kitRecord ? {
-        version: 2,
+        version: 3,
         recordState: "recognized",
         ...(kitRecord.keychain ? { keychain: { ...kitRecord.keychain, state: keychainState } } : {}),
         plaintextArtifacts: kitRecord.plaintextArtifacts.map((artifact, index) => ({ ...artifact, state: plaintextStates[index] })),
+        onePasswordArtifacts: kitRecord.onePasswordArtifacts.map((artifact) => artifact.state === "active"
+          ? { ...artifact, state: "recorded" }
+          : artifact),
         ...(kitRecord.offer ? { offer: kitRecord.offer } : {}),
         ...(firstFile ? { path: firstFile.path, writtenAt: firstFile.writtenAt } : {}),
         pendingGenesis,
       } : {
-        version: 2,
+        version: 3,
         recordState: kitRead.state,
         plaintextArtifacts: [],
+        onePasswordArtifacts: [],
         pendingGenesis,
       },
       ...(genesisPending?{genesisPending:true,resumeInstruction:GENESIS_PENDING_MESSAGE}:{}),
@@ -1172,7 +1616,14 @@ async function recoveryKitStatusLines(
       else if (state === "unavailable") lines.push(`recovery kit: ${shown} (file unavailable — backup state unknown)`);
       else lines.push(`recovery kit: ${shown} (file content unrecognized — replaced?)`);
     });
-    if (!record.keychain && record.plaintextArtifacts.length === 0) lines.push("recovery kit: none recorded — run `rbox key save`");
+    record.onePasswordArtifacts.forEach((artifact) => {
+      if (artifact.state === "active") {
+        lines.push(`recovery kit: 1Password item saved ${artifact.writtenAt.slice(0, 10)} (not checked)`);
+      } else {
+        lines.push("recovery kit: previous 1Password item is missing or no longer matches");
+      }
+    });
+    if (!record.keychain && record.plaintextArtifacts.length === 0 && record.onePasswordArtifacts.length === 0) lines.push("recovery kit: none recorded — run `rbox key save`");
   }
   if (pendingGenesis) lines.push("recovery phrase staged, not yet saved");
   return lines;

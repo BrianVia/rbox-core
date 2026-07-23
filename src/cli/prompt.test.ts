@@ -1,6 +1,45 @@
 import { expect, test } from "bun:test";
 import path from "node:path";
-import { expandUserPath, promptPath } from "./prompt.js";
+import { createCheckboxPrompt, expandUserPath, promptPath } from "./prompt.js";
+
+test("checkbox factory preserves generic values and routes the widget to the injected output", async () => {
+  const output = { write() { return true; } } as unknown as NodeJS.WritableStream;
+  const calls: Array<{ config: unknown; output: NodeJS.WritableStream }> = [];
+  const prompt = createCheckboxPrompt({
+    output,
+    invoke: async <V>(config, context) => {
+      calls.push({ config, output: context.output });
+      return ["clipboard" as V];
+    },
+  });
+  const config = {
+    message: "Where should rbox save it?",
+    choices: [
+      { name: "Clipboard", value: "clipboard" as const },
+      { name: "File", value: "file" as const },
+    ],
+  };
+
+  expect(await prompt(config)).toEqual(["clipboard"]);
+  expect(calls).toEqual([{ config, output }]);
+});
+
+test("checkbox factory translates Inquirer Ctrl-C to exit 130", async () => {
+  let exitCode: number | undefined;
+  const exited = new Error("exit seam");
+  const cancelled = new Error("inquirer exit");
+  const prompt = createCheckboxPrompt({
+    invoke: async () => { throw cancelled },
+    exit: (code) => {
+      exitCode = code;
+      throw exited;
+    },
+    isExitPromptError: (error) => error === cancelled,
+  });
+
+  await expect(prompt({ message: "pick", choices: [{ value: "x" }] })).rejects.toBe(exited);
+  expect(exitCode).toBe(130);
+});
 
 test("expandUserPath implements the complete leading-tilde grammar", () => {
   const home = "/home/tester";

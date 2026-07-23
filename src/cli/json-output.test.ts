@@ -433,7 +433,7 @@ test("key status --json emits enrollment and recovery-kit state", async () => {
   expect(dto).toEqual({
     enrolled: false,
     recoveryKit: {
-      version: 2,
+      version: 3,
       recordState: "recognized",
       plaintextArtifacts: [{
         path: "/tmp/rbox-kit.txt",
@@ -441,6 +441,7 @@ test("key status --json emits enrollment and recovery-kit state", async () => {
         cleanup: "pending",
         state: "missing",
       }],
+      onePasswordArtifacts: [],
       path: "/tmp/rbox-kit.txt",
       writtenAt: "2026-07-04T12:00:00.000Z",
       pendingGenesis: false,
@@ -466,6 +467,49 @@ test("key status --json marks a cross-account plaintext artifact unrecognized", 
   expect(dto.recoveryKit.plaintextArtifacts[0].state).toBe("unrecognized");
 });
 
+test("key status reports a recorded 1Password item without opening the provider", async () => {
+  const accountId = "acct_aaaaaaaaaaaaaaaa";
+  process.env.RBOX_TOKEN = "tok";
+  process.env.RBOX_API = "https://api.test";
+  process.env.RBOX_DEVICE_ID = "dev_a";
+  process.env.RBOX_ACCOUNT_ID = accountId;
+  process.env.RBOX_HOME = tmp;
+  const kit = path.join(tmp, ".rbox", "e2ee", accountId, "kit.json");
+  await fs.mkdir(path.dirname(kit), { recursive: true });
+  await fs.writeFile(kit, JSON.stringify({
+    version: 3,
+    accountId,
+    plaintextArtifacts: [],
+    onePasswordArtifacts: [{
+      rboxAccountId: accountId,
+      accountUuid: "account_uuid",
+      vaultUuid: "vault_uuid",
+      itemUuid: "item_uuid",
+      fieldId: "rboxRecoveryPhrase",
+      operationTag: "rbox_operation",
+      writtenAt: "2026-07-04T12:00:00.000Z",
+      state: "active",
+    }],
+  }));
+
+  const dto = JSON.parse(await captureStdout(() => keyStatus({ json: true })));
+  expect(dto.recoveryKit.onePasswordArtifacts[0]).toMatchObject({
+    accountUuid: "account_uuid",
+    vaultUuid: "vault_uuid",
+    itemUuid: "item_uuid",
+    state: "recorded",
+  });
+  const lines: string[] = [];
+  const originalLog = console.log;
+  console.log = (...args: unknown[]) => { lines.push(args.map(String).join(" ")) };
+  try {
+    await keyStatus();
+  } finally {
+    console.log = originalLog;
+  }
+  expect(lines.join("\n")).toContain("1Password item saved 2026-07-04 (not checked)");
+});
+
 test("key status --json projects an unreleased genesis hold without mutating an offer", async () => {
   process.env.RBOX_TOKEN = "tok";
   process.env.RBOX_API = "https://api.test";
@@ -482,7 +526,7 @@ test("key status --json projects an unreleased genesis hold without mutating an 
   });
 
   const dto = JSON.parse(await captureStdout(() => keyStatus({ json: true })));
-  expect(dto.recoveryKit).toEqual({ version: 2, recordState: "missing", plaintextArtifacts: [], pendingGenesis: true });
+  expect(dto.recoveryKit).toEqual({ version: 3, recordState: "missing", plaintextArtifacts: [], onePasswordArtifacts: [], pendingGenesis: true });
   expect(await fs.exists(path.join(tmp, ".rbox", "e2ee", "acct_aaaaaaaaaaaaaaaa", "kit.json"))).toBe(false);
 });
 

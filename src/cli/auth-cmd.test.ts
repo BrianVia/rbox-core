@@ -264,6 +264,131 @@ test("logout clears credentials and the queued account profile", async () => {
 });
 
 describe("runGenesisEnrollment", () => {
+  test("fresh interactive setup uses a true multi-select and explains local files plus source control", async () => {
+    const accountId = "acct_1010101010101010";
+    const target = path.join(home, "multi-recovery.txt");
+    const api = new FakeGenesisApi([null], "ok", accountId, "dev_multi");
+    let rendered = "";
+    let choiceNames: string[] = [];
+    let copied = 0;
+    let cleared = 0;
+
+    await runGenesisEnrollment(api, { accountId, deviceId: "dev_multi" }, { kit: false }, {
+      now: () => 1_900_000_000_000,
+      isInteractive: () => true,
+      stdinTTY: true,
+      stderrTTY: true,
+      platform: "linux",
+      resolveKitPath: async () => target,
+      destinationFlow: {
+        writeStderr: (text) => { rendered += text },
+        detectOnePassword: async () => ({ state: "unavailable", reason: "not-found" }),
+        checkbox: async (config) => {
+          choiceNames = config.choices
+            .filter((choice): choice is { name: string; value: string } => typeof choice === "object" && choice !== null && "name" in choice && "value" in choice)
+            .map((choice) => choice.name);
+          return ["kit-path", "clipboard"];
+        },
+        confirm: async () => true,
+        copyClipboard: async () => { copied++; return { ok: true, command: "fake-copy" } },
+        clearClipboard: async () => { cleared++; return { ok: true, command: "fake-copy" } },
+      },
+    });
+
+    expect(choiceNames).toEqual(["Save to a plaintext file", "Copy it to my clipboard"]);
+    expect(rendered).toContain("Your files stay normal and usable on this computer.");
+    expect(rendered).toContain("GitHub and other source control keep working normally.");
+    expect(rendered).toContain("work you have not committed or pushed yet");
+    expect(rendered).toContain("1Password CLI not found");
+    expect({ copied, cleared }).toEqual({ copied: 1, cleared: 1 });
+    expect((await readRecoveryKitRecord(accountId))?.plaintextArtifacts.map((artifact) => artifact.path)).toContain(target);
+    await expect(fs.access(target)).resolves.toBe(null);
+  });
+
+  test("fresh setup can save to 1Password and a file in one checked submission", async () => {
+    const accountId = "acct_1212121212121212";
+    const target = path.join(home, "onepassword-plus-file.txt");
+    const api = new FakeGenesisApi([null], "ok", accountId, "dev_op_multi");
+    let createdPhraseWords = 0;
+
+    await runGenesisEnrollment(api, { accountId, deviceId: "dev_op_multi" }, { kit: false }, {
+      now: () => 1_900_000_000_000,
+      isInteractive: () => true,
+      stdinTTY: true,
+      stderrTTY: true,
+      platform: "linux",
+      resolveKitPath: async () => target,
+      destinationFlow: {
+        writeStderr: () => {},
+        checkbox: async () => ["onepassword", "kit-path"],
+        select: async () => "vault_uuid",
+        detectOnePassword: async () => ({ state: "available", executable: "/fake/op", version: "2.30.0" }),
+        listOnePasswordAccounts: async () => ({ state: "ok", accounts: [{ uuid: "account_uuid", label: "me@example.test" }] }),
+        listOnePasswordVaults: async () => ({ state: "ok", vaults: [{ uuid: "vault_uuid", name: "Personal", label: "Personal" }] }),
+        reconcileOnePassword: async () => ({ state: "missing" }),
+        createOnePassword: async (_provider, input) => {
+          createdPhraseWords = input.phrase.split(/\s+/).length;
+          return {
+            state: "created",
+            locator: {
+              accountUuid: input.accountUuid,
+              vaultUuid: input.vaultUuid,
+              itemUuid: "item_uuid",
+              fieldId: "rboxRecoveryPhrase",
+              operationTag: input.operationTag,
+            },
+          };
+        },
+        verifyOnePassword: async () => "valid",
+      },
+    });
+
+    const record = await readRecoveryKitRecord(accountId);
+    expect(createdPhraseWords).toBe(24);
+    expect(record?.onePasswordArtifacts).toHaveLength(1);
+    expect(record?.onePasswordArtifacts[0]).toMatchObject({
+      state: "active",
+      accountUuid: "account_uuid",
+      vaultUuid: "vault_uuid",
+      itemUuid: "item_uuid",
+    });
+    expect(record?.plaintextArtifacts.map((artifact) => artifact.path)).toContain(target);
+  });
+
+  test("partial multi-save requires an explicit continue after showing per-destination results", async () => {
+    const accountId = "acct_1313131313131313";
+    const target = path.join(home, "partial-recovery.txt");
+    const api = new FakeGenesisApi([null], "ok", accountId, "dev_partial");
+    let rendered = "";
+    let continued = 0;
+
+    await runGenesisEnrollment(api, { accountId, deviceId: "dev_partial" }, { kit: false }, {
+      now: () => 1_900_000_000_000,
+      isInteractive: () => true,
+      stdinTTY: true,
+      stderrTTY: true,
+      platform: "linux",
+      resolveKitPath: async () => target,
+      destinationFlow: {
+        writeStderr: (text) => { rendered += text },
+        checkbox: async () => ["onepassword", "kit-path"],
+        select: async (config) => config.message === "Choose a 1Password vault:" ? "vault_uuid" : "continue",
+        confirm: async () => { continued++; return true },
+        detectOnePassword: async () => ({ state: "available", executable: "/fake/op", version: "2.30.0" }),
+        listOnePasswordAccounts: async () => ({ state: "ok", accounts: [{ uuid: "account_uuid", label: "Account" }] }),
+        listOnePasswordVaults: async () => ({ state: "ok", vaults: [{ uuid: "vault_uuid", name: "Personal", label: "Personal" }] }),
+        reconcileOnePassword: async () => ({ state: "missing" }),
+        createOnePassword: async () => ({ state: "ambiguous", reason: "timeout" }),
+      },
+    });
+
+    expect(rendered).toContain("Saved recovery phrase to 1 of 2 selected places:");
+    expect(rendered).toContain("! 1Password");
+    expect(rendered).toContain("✓ plaintext file");
+    expect(continued).toBe(1);
+    await expect(fs.access(genesisPaths(accountId).journal)).rejects.toThrow();
+  });
+
   test("the production staged phrase sink suppresses the ordinary recovery-kit offer", async () => {
     const accountId = "acct_1000000000000008";
     const requestSha256 = "e".repeat(64);

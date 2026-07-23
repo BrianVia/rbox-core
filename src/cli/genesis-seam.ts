@@ -17,14 +17,25 @@ import {
   type EnrollmentClassification,
 } from "./genesis-enrollment.js";
 import {
+  appendDestinationEvent,
+  createDestinationProgress,
+  loadDestinationProgress,
   loadStagedRecoveryKey,
   parseCompletionIntent,
   publishCompletionIntent,
+  publishDestinationProgress,
   reconcileRetargetIntent,
   recordGenesisReceipt,
+  recordDestinationSetReceipt,
+  replaceDestinationSetIntent,
   retargetCompletionIntent,
   type CompletionIntent as DurableCompletionIntent,
   type CompletionIntentRetargetWitness as DurableCompletionIntentRetargetWitness,
+  type CarriedDestinationCompletion,
+  type DestinationEvent,
+  type DestinationProgress,
+  type DestinationSetCompletionIntent,
+  type LegacyCompletionIntent,
   type GenesisJournal,
 } from "./genesis-durable.js";
 import { RboxApi } from "./remote.js";
@@ -33,7 +44,9 @@ import { resumeGenesisQuarantine } from "./genesis-quarantine.js";
 
 export const RECOVERY_KIT_SERVICE = "rbox recovery phrase" as const;
 
-export type CompletionIntent = DurableCompletionIntent;
+/** Legacy surface retained for design-179 callers. */
+export type CompletionIntent = LegacyCompletionIntent;
+export type DurableGenesisCompletionIntent = DurableCompletionIntent;
 export type CompletionIntentRetargetWitness = DurableCompletionIntentRetargetWitness;
 export type GenesisAttemptRef = Pick<GenesisJournal, "accountId" | "requestSha256">;
 export type GenesisClassification = EnrollmentClassification;
@@ -67,6 +80,33 @@ export interface GenesisSeam {
   commitDeliveredRecoveryPhrase(classification: CommittedGenesisClassification): Promise<void>;
   /** Require a fresh real competing-genesis proof, then receipt + quarantine cleanup. */
   quarantineAbandonedAttempt(attempt: GenesisAttemptRef): Promise<void>;
+}
+
+export type DestinationSetState =
+  | { state: "absent" }
+  | { state: "legacy"; intent: LegacyCompletionIntent }
+  | { state: "destination-set"; intent: DestinationSetCompletionIntent; progress: DestinationProgress };
+
+/** Design-187 capabilities kept separate so legacy auth callers remain exhaustive. */
+export interface DestinationSetGenesisSeam {
+  readAndReconcileDestinationSet(classification:CommittedGenesisClassification):Promise<DestinationSetState>;
+  writeDestinationSet(classification:CommittedGenesisClassification,intent:DestinationSetCompletionIntent):Promise<DestinationProgress>;
+  appendDestinationEvent(classification:CommittedGenesisClassification,intent:DestinationSetCompletionIntent,current:DestinationProgress,event:DestinationEvent):Promise<DestinationProgress>;
+  replaceDestinationSet(
+    classification:CommittedGenesisClassification,
+    oldIntent:DestinationSetCompletionIntent,
+    oldProgress:DestinationProgress,
+    newIntent:DestinationSetCompletionIntent,
+    carriedCompletions:CarriedDestinationCompletion[],
+    liveValidOldIndexes:readonly number[]
+  ):Promise<{intent:DestinationSetCompletionIntent;progress:DestinationProgress}>;
+  commitDestinationSet(
+    classification:CommittedGenesisClassification,
+    intent:DestinationSetCompletionIntent,
+    progress:DestinationProgress,
+    liveValidDestinationIndexes:readonly number[],
+    continuedAfterPartial:boolean
+  ):Promise<void>;
 }
 
 interface GenesisLockContext {
@@ -103,7 +143,7 @@ async function classifyCurrentAccount(accountId: string): Promise<EnrollmentClas
   return classifyEnrollment(accountId, await api.getGenesisObservation());
 }
 
-async function canonicalIntent(classification: CommittedGenesisClassification): Promise<CompletionIntent | undefined> {
+async function canonicalIntent(classification: CommittedGenesisClassification): Promise<DurableCompletionIntent | undefined> {
   const pending = await inspectPendingGenesis(classification.journal.accountId);
   if (pending.witnessRaw !== undefined) {
     const reconciled = await reconcileRetargetIntent(classification.journal);
@@ -119,6 +159,7 @@ async function commitReceipt(
 ): Promise<void> {
   const intent = await canonicalIntent(classification);
   if (!intent) throw new Error("genesis completion intent is absent");
+  if (intent.version !== 1) throw new Error("destination-set completion requires the design-187 seam");
   const at = new Date().toISOString();
   const receipt = outcome === "phrase"
     ? (() => {
@@ -203,6 +244,7 @@ export const design180GenesisSeam: GenesisSeam = {
   readAndReconcileCompletionIntent: async (classification) => {
     requireLockedProof(classification);
     const intent = await canonicalIntent(classification);
+    if (intent?.version === 2) throw new Error("destination-set completion requires the design-187 seam");
     return intent ? { state: "intent", intent } : { state: "absent" };
   },
 
@@ -226,6 +268,7 @@ export const design180GenesisSeam: GenesisSeam = {
       if (!survivor || (!isDeepStrictEqual(survivor, oldIntent) && !isDeepStrictEqual(survivor, newIntent))) {
         throw new Error("RETARGET reconciled an unexpected completion intent");
       }
+      if (survivor.version !== 1) throw new Error("legacy RETARGET reconciled a destination-set intent");
       if (survivor.mode === "phrase-display") throw new Error("RETARGET reconciled a phrase-display intent");
       return survivor;
     }
@@ -237,6 +280,7 @@ export const design180GenesisSeam: GenesisSeam = {
     if (!survivor || (!isDeepStrictEqual(survivor, oldIntent) && !isDeepStrictEqual(survivor, newIntent))) {
       throw new Error("RETARGET reconciled an unexpected completion intent");
     }
+    if (survivor.version !== 1) throw new Error("legacy RETARGET reconciled a destination-set intent");
     if (survivor.mode === "phrase-display") throw new Error("RETARGET reconciled a phrase-display intent");
     return survivor;
   },
@@ -261,6 +305,52 @@ export const design180GenesisSeam: GenesisSeam = {
       outcome: "competing-cleaned",
       at: new Date().toISOString(),
     });
+    await resumeGenesisCleanup(cleanup);
+  },
+};
+
+export const design187DestinationSetSeam:DestinationSetGenesisSeam={
+  readAndReconcileDestinationSet:async(classification)=>{
+    requireLockedProof(classification);
+    const intent=await canonicalIntent(classification);
+    if(!intent)return{state:"absent"};
+    if(intent.version===1)return{state:"legacy",intent};
+    let progress:DestinationProgress;
+    try{progress=await loadDestinationProgress(intent);}
+    catch(error){
+      if((error as NodeJS.ErrnoException).code!=="ENOENT")throw error;
+      progress=await createDestinationProgress(intent);
+      await publishDestinationProgress(intent,progress);
+    }
+    return{state:"destination-set",intent,progress};
+  },
+  writeDestinationSet:async(classification,intent)=>{
+    requireLockedProof(classification);
+    if(!sameAttempt(classification,intent.accountId,intent.requestSha256))throw new Error("destination-set intent does not match committed genesis classification");
+    await publishCompletionIntent(intent,classification.journal);
+    const progress=await createDestinationProgress(intent);
+    await publishDestinationProgress(intent,progress);
+    return progress;
+  },
+  appendDestinationEvent:async(classification,intent,current,event)=>{
+    requireLockedProof(classification);
+    if(!sameAttempt(classification,intent.accountId,intent.requestSha256)||classification.journal.phase!=="active"||classification.journal.completionReceipts["recovery-kit-staging"])throw new Error("destination event append is not authorized");
+    const canonical=await canonicalIntent(classification);
+    if(!canonical||canonical.version!==2||!isDeepStrictEqual(canonical,intent))throw new Error("destination event intent is not canonical");
+    return appendDestinationEvent(intent,current,event);
+  },
+  replaceDestinationSet:async(classification,oldIntent,oldProgress,newIntent,carriedCompletions,liveValidOldIndexes)=>{
+    requireLockedProof(classification);
+    if(!sameAttempt(classification,oldIntent.accountId,oldIntent.requestSha256)||!sameAttempt(classification,newIntent.accountId,newIntent.requestSha256))throw new Error("destination-set replacement attempt mismatch");
+    await replaceDestinationSetIntent(classification.journal,oldIntent,oldProgress,newIntent,carriedCompletions,liveValidOldIndexes,new Date().toISOString());
+    const survivor=await reconcileRetargetIntent(classification.journal);
+    if(!survivor||survivor.version!==2||!isDeepStrictEqual(survivor,newIntent))throw new Error("destination-set replacement did not select the new plan");
+    return{intent:survivor,progress:await loadDestinationProgress(survivor)};
+  },
+  commitDestinationSet:async(classification,intent,progress,liveValidDestinationIndexes,continuedAfterPartial)=>{
+    requireLockedProof(classification);
+    if(!sameAttempt(classification,intent.accountId,intent.requestSha256))throw new Error("destination-set receipt attempt mismatch");
+    const cleanup=await recordDestinationSetReceipt(classification.journal,intent,progress,liveValidDestinationIndexes,continuedAfterPartial,new Date().toISOString());
     await resumeGenesisCleanup(cleanup);
   },
 };
