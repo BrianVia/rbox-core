@@ -22,7 +22,8 @@
     "tui-smoke": "bun scripts/tui-compiled-smoke.ts",
     "tui-budget": "bun scripts/tui-performance-budget.ts",
     "test:rig": "bun test ./scripts/rig/",
-    "e2e:dev": "bun scripts/e2e/dev-backed-scenario.ts"
+    "e2e:dev": "bun scripts/e2e/dev-backed-scenario.ts",
+    "demo": "bun scripts/dev-demo.ts"
   },
   "dependencies": {
     "@parcel/watcher": "^2.5.6",
