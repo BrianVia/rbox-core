@@ -39,6 +39,18 @@ no apps/api/D1 change; app.rbox.to 200) — CLI-login deep links now survive
 the sign-in bounce. Founder memory: minimize-user-typing law recorded.
 Session totals below._
 
+_Telemetry read (minor, 2026-07-23): first 3 days of `client.sync_phase`
+AE data (since 07-21 midday) — **server plane is not the sync bottleneck;
+the tail is client-side `git-apply` on backlogged repos.** Bias-corrected
+(emitter stores 1-in-8 normal + every outlier, so raw p95/p99 skew high):
+pull p50 ~2.6s / p95 ~185s / p99 ~250s; push p50 ~0.5s / p95 ~13s / p99
+~26s. Slow pulls (>60s) are ~87% `git-apply`, ~0 download — confirmed by
+the live `account_op_latency` D1 table (every route sub-second mean; 4
+accts / 15 devices). One-off: device `agent_inN2` (acct_63de3fd) failing
+100% of telemetry + fleet/sync-state POSTs = a stale daemon, whole fleet's
+error count. Data point for the parked 163/SQLite decision (needs a month
+of evidence). rbox-admin p99 added to the sync-phase panel (PR #10, live)._
+
 _Previous: 2026-07-23 (~18:30 UTC — **v1.8.0 "setup feels brand new"
 RELEASED + FLEET-LIVE — DESIGN 185 (TUI framework) COMPLETE**): tag at
 9b7744ef, release run green INCLUDING the new compiled-TUI smoke gates'
