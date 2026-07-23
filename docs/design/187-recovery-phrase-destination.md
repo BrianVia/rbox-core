@@ -80,9 +80,10 @@ The rows are conditional:
   proves a supported 1Password CLI 2.x is installed.
 - Show Keychain only when the current macOS Keychain preflight is actionable.
 - Plaintext and clipboard remain available on every interactive platform.
-- When the 1Password CLI is absent, print one non-blocking line above the menu:
-  `1Password CLI not found — choose Clipboard to paste the phrase into
-  1Password yourself.`
+- When the 1Password CLI is absent, the option simply does not appear.
+  (Amended 2026-07-23, founder field-review: the former "1Password CLI not
+  found" notice line was cut as first-run noise — the clipboard flow already
+  says "paste it into your password manager now" at copy time.)
 
 The order is optimized for off-machine recoverability, not platform
 convenience. The current platform default remains preselected so pressing Enter

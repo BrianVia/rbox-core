@@ -223,9 +223,9 @@ async function chooseGenesisDestinationIntent(args: {
   const discovery = args.opDiscovery ?? await (deps.detectOnePassword ?? detectOnePasswordCli)();
 
   write(rboxBanner() + GENESIS_RECOVERY_LEAD_IN);
-  if (discovery.state !== "available") {
-    write("\n1Password CLI not found — choose Clipboard to paste the phrase into 1Password yourself.\n");
-  }
+  // No "1Password CLI not found" notice here (founder cut, 2026-07-23): when op
+  // is absent the option simply doesn't appear, and the clipboard flow already
+  // says "paste it into your password manager now" at the moment that matters.
 
   for (;;) {
     const selected = await checkbox<GenesisDestinationChoice>({

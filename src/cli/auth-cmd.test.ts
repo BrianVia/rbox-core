@@ -301,7 +301,7 @@ describe("runGenesisEnrollment", () => {
     // were cut from the first-run lead-in as wall-of-text.
     expect(rendered).not.toContain("GitHub and other source control");
     expect(rendered).not.toContain("If you lose every signed-in device");
-    expect(rendered).toContain("1Password CLI not found");
+    expect(rendered).not.toContain("1Password CLI not found");
     expect({ copied, cleared }).toEqual({ copied: 1, cleared: 1 });
     expect((await readRecoveryKitRecord(accountId))?.plaintextArtifacts.map((artifact) => artifact.path)).toContain(target);
     await expect(fs.access(target)).resolves.toBe(null);
