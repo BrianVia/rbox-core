@@ -100,6 +100,9 @@ export async function push(
   }
   const { sequence, committed, gitDeferred, caseCollisions } = await pushManifest(root, cfg, local, deps, {
     purgeIgnored,
+    // Any unrelated deferral makes this scan non-authoritative, so a discovered
+    // collision is still returned/printed but not persisted to the sidecar until
+    // the next clean push authors durable truth.
     localFileObservation: localFileObservationForScan(scanDeferred.size === 0),
   });
   return { sequence, committed, caseCollisions, ...(gitDeferred ? { gitDeferred } : {}) };

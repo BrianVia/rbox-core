@@ -182,6 +182,8 @@ export async function writePathWarnings(root: string, warnings: PathWarningsV1):
   if (bytes.byteLength > PATH_WARNINGS_MAX_BYTES) throw new Error("path warning record exceeds its encoded bound");
   const file = pathWarningsPath(root);
   const parent = path.dirname(file);
+  // Match read/clear no-follow: an existing but symlinked .rbox/state throws.
+  await requirePlainWarningsParent(root);
   const created = await ensureDirectoryChain(parent, "path warning directory");
   await writeFileAtomic(file, bytes, { mode: 0o600, exactMode: true });
   await fsyncDirectory(parent);

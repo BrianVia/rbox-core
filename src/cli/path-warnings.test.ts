@@ -108,6 +108,16 @@ describe("path warning sidecar", () => {
     expect(await fs.readFile(outsideFile, "utf8")).toContain("outside");
   });
 
+  test("writer refuses a symlinked warning directory instead of following it", async () => {
+    const root = await tempRoot();
+    const outside = await tempRoot();
+    await fs.mkdir(path.join(root, ".rbox"));
+    await fs.symlink(outside, path.join(root, ".rbox", "state"));
+
+    await expect(savePathWarnings(root, [pair("docs")])).rejects.toThrow("unsafe path warning directory");
+    expect(await fs.readdir(outside)).toEqual([]);
+  });
+
   test("atomic racing replacements are never observed torn", async () => {
     const root = await tempRoot();
     await savePathWarnings(root, [pair("seed")]);

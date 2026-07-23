@@ -38,6 +38,11 @@ index remain on their existing fail/defer paths. A Git history cannot be made
 safe by silently removing individual tracked files; a future Git-specific
 change may defer the whole repository while the ordinary file plane proceeds.
 
+Unicode normalization is out of scope: the wire rule folds case only, so an
+NFC/NFD pair of the same name is neither grouped here nor rejected by
+validation, and a normalization-insensitive receiver (macOS APFS) can still get
+an inbound pair it cannot materialize. That remains a separate, pre-existing gap.
+
 ## 3. Invariants
 
 1. `validateManifest` continues to reject case-fold duplicate wire paths.
@@ -205,7 +210,7 @@ synced with 1 warning
 
 The exit status remains zero.
 
-`rbox status` reads the sidecar in brief, verbose, and JSON modes. The brief
+`rbox status` surfaces the warning in brief, verbose, and JSON modes. The brief
 healthy verdict becomes `synced with 1 warning`; stronger states such as a halt,
 active transfer, remote lag, or quota warning retain their precedence and show
 the path warning as secondary advisory detail. JSON exposes a typed
@@ -214,12 +219,15 @@ the path warning as secondary advisory detail. JSON exposes a typed
 Bare `rbox` already invokes the shared brief status before its menu, so the same
 warning appears there without another code path.
 
-Full/verbose status runs its current raw scan through non-purge forward-ignore
-carry and then classifies/uses the safe projection for counts. That live
-read-only observation takes precedence for the current invocation when the
-sidecar is absent or stale; it does not write or clear the sidecar. Brief/bare
-status intentionally uses the durable sidecar and may retain a just-resolved
-warning until the passive loop observes the repair.
+As built, all three display modes share one computed status branch that already
+scans for pending-change counts; it runs that raw scan through non-purge
+forward-ignore carry, classifies the safe projection, and derives the displayed
+`pathWarnings` live. That read-only observation is never written or cleared to
+the sidecar, and because it is recomputed each invocation the display clears a
+just-resolved collision immediately rather than lagging the passive loop. The
+durable sidecar is loaded first and remains the value only when no scan runs
+(the populate/bootstrap status branch); otherwise it serves the daemon's
+log-transition dedup, not display.
 
 ## 9. Production caller contract
 
