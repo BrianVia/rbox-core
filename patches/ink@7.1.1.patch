@@ -1,0 +1,36 @@
+diff --git a/build/reconciler.js b/build/reconciler.js
+index 5b4a9d7bfa488027c30c43e8a1664f8680d7c62d..8f782b87dc92377bfde68dc5d32de6ae6b3c993b 100644
+--- a/build/reconciler.js
++++ b/build/reconciler.js
+@@ -1,28 +1,13 @@
+-import process from 'node:process';
+ import createReconciler from 'react-reconciler';
+ import { DefaultEventPriority, NoEventPriority, } from 'react-reconciler/constants.js';
+ import * as Scheduler from 'scheduler';
+ import Yoga from 'yoga-layout';
+ import { createContext, version as reactVersion } from 'react';
+ import { createTextNode, appendChildNode, insertBeforeNode, removeChildNode, emitLayoutListeners, setStyle, setTextNodeValue, createNode, setAttribute, } from './dom.js';
+ import applyStyles from './styles.js';
+-// We need to conditionally perform devtools connection to avoid
+-// accidentally breaking other third-party code.
+-// See https://github.com/vadimdemedes/ink/issues/384
+-// See https://github.com/vadimdemedes/ink/issues/648
+-if (process.env['DEV'] === 'true') {
+-    // Intentionally no warning when the package is missing.
+-    // DEV may be set for other reasons; devtools is opt-in via installing the package.
+-    let isDevtoolsInstalled = false;
+-    try {
+-        import.meta.resolve('react-devtools-core');
+-        isDevtoolsInstalled = true;
+-    }
+-    catch { }
+-    if (isDevtoolsInstalled) {
+-        await import('./devtools.js');
+-    }
+-}
++// rbox patch: its standalone executable never exposes React DevTools. Keeping
++// Ink's optional peer probe makes Bun compile an unresolved runtime package
++// lookup even though the branch is normally inactive.
+ const diff = (before, after) => {
+     if (before === after) {
+         return;

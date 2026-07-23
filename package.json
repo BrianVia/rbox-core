@@ -19,19 +19,23 @@
     "typecheck:rig": "tsc -p scripts/rig/tsconfig.json",
     "gate:dl-integrity": "bun scripts/dl-integrity-gate.ts",
     "rig": "bun scripts/rig/rig.ts",
+    "tui-smoke": "bun scripts/tui-compiled-smoke.ts",
+    "tui-budget": "bun scripts/tui-performance-budget.ts",
     "test:rig": "bun test ./scripts/rig/",
     "e2e:dev": "bun scripts/e2e/dev-backed-scenario.ts"
   },
   "dependencies": {
-    "@inquirer/prompts": "^8.5",
     "@parcel/watcher": "^2.5.6",
     "chokidar": "^5.0.0",
-    "ignore": "^5.3.2"
+    "ignore": "^5.3.2",
+    "ink": "7.1.1",
+    "react": "19.2.8"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "0.18.6",
     "@cloudflare/workers-types": "^4.20260626.1",
     "@types/node": "^24.13.3",
+    "@types/react": "19.2.17",
     "typescript": "^7.0.2",
     "vitest": "4.1.10",
     "wrangler": "^4.107.0"
@@ -40,5 +44,8 @@
     "@parcel/watcher-darwin-arm64": "^2.5.6",
     "@parcel/watcher-linux-arm64-glibc": "^2.5.6",
     "@parcel/watcher-linux-x64-glibc": "^2.5.6"
+  },
+  "patchedDependencies": {
+    "ink@7.1.1": "patches/ink@7.1.1.patch"
   }
 }

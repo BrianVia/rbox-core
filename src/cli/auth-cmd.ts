@@ -2,8 +2,8 @@ import os from "node:os";
 import fs from "node:fs/promises";
 import { clearCredentials, credentialsForStrictFlow, loadCredentials, PROD_WEB, saveCredentials } from "./credentials.js";
 import { clearAccountProfile } from "./account-profile.js";
-import { isInteractive, promptCheckbox, promptConfirm, promptInput, promptPassword, promptSelect, type CheckboxPrompt } from "./prompt.js";
-import { copyToClipboard, openInBrowser, waitForKeypress } from "./browser-open.js";
+import { isInteractive, promptCheckbox, promptConfirm, promptInput, promptKeypress, promptPassword, promptSelect, type CheckboxPrompt } from "./prompt.js";
+import { copyToClipboard, openInBrowser } from "./browser-open.js";
 import { RboxApi } from "./remote.js";
 import { emitJson } from "./json.js";
 import { assertNoPendingGenesis, beginAtomicGenesis, completeAtomicGenesis, enrollViaPairing, enrollViaRecovery, enrollViaRecoveryWithPhraseInput, RecoveryPreAdmissionError, type AtomicGenesisDestinationSetContext, type AtomicGenesisDestinationSetResult } from "./e2ee-client.js";
@@ -1030,7 +1030,7 @@ function offerApprovalCopy(url: string): { cancel: () => void } | undefined {
   if (!isInteractive()) return undefined;
   console.log("    press [c] to copy the URL");
   const controller = new AbortController();
-  void waitForKeypress(controller.signal).then((key) => {
+  void promptKeypress({ signal: controller.signal }).then((key) => {
     if (key === "c") console.log(copyToClipboard(url) ? "Copied to clipboard." : "Couldn't reach the clipboard — copy the URL above manually.");
   });
   return { cancel: () => controller.abort() };
@@ -1135,7 +1135,7 @@ export function pairingConnectCommand(serverToken: unknown, tokenId: string, tok
 
 interface PairingConnectPresentationDeps {
   isInteractive?: typeof isInteractive;
-  waitForKeypress?: typeof waitForKeypress;
+  waitForKeypress?: () => Promise<string | undefined>;
   copyToClipboard?: typeof copyToClipboard;
   log?: (message: string) => void;
   write?: (message: string) => void;
@@ -1152,7 +1152,7 @@ export async function presentPairingConnectCommand(command: string, deps: Pairin
 
   if ((deps.isInteractive ?? isInteractive)()) {
     write("Press [c] to copy the command to your clipboard, any other key to continue... ");
-    const key = await (deps.waitForKeypress ?? waitForKeypress)();
+    const key = await (deps.waitForKeypress ?? promptKeypress)();
     write("\n");
     if (key === "c") {
       log((deps.copyToClipboard ?? copyToClipboard)(command)

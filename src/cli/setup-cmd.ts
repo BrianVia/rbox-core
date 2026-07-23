@@ -6,8 +6,8 @@
  * `runMenu`; the menu's "just authorize this machine" option is dropped (served
  * directly by `rbox login`).
  *
- * Every interactive widget is an `@inquirer/prompts` `select`/`input`/`confirm`/
- * `password` routed through `./prompt.js` — so menus are arrow-key choices (no
+ * Every interactive widget is an Ink component routed through `./prompt.js` —
+ * so menus are arrow-key choices (no
  * invalid-input loops), Ctrl-C exits cleanly (130), and EVERYTHING renders on
  * STDERR (so `rbox setup > log` never pollutes stdout). The lone pure mapper that
  * remains, `workspaceFlags`, carries the Step-2 transition and is unit-tested.
@@ -88,7 +88,7 @@ export const START_SYNC_CHOICES = [
 ] as const satisfies ReadonlyArray<{ name: string; value: StartSyncChoice }>;
 
 /** Map the Step-3 choice to its two side effects. Pure so the three-way branching is
- *  pinned by a unit test without driving the inquirer widget (mirrors `workspaceFlags`
+ *  pinned by a unit test without driving the TUI widget (mirrors `workspaceFlags`
  *  and `authorizePath`). "both" starts the daemon AND enables autostart; "start" starts
  *  the daemon only; "none" does neither. */
 export function startSyncActions(choice: StartSyncChoice): { startDaemon: boolean; enableAutostart: boolean } {
@@ -484,7 +484,7 @@ async function pollUntilPlanActive(credentialResult: CredentialLoadResult): Prom
 /** Which authorize path an existing-account method takes. "pair" redeems a pairing
  *  token (enrolls encryption inline); "browser" uses the device-code grant.
  *  Pure so the two-way routing is pinned by a unit test
- *  without driving the inquirer widget (mirrors `workspaceFlags`). */
+ *  without driving the TUI widget (mirrors `workspaceFlags`). */
 export function authorizePath(method: "pair" | "browser"): "pair-token" | "device-code" {
   return method === "pair" ? "pair-token" : "device-code";
 }

@@ -4,6 +4,7 @@ import {
   assertGuestMachineHome, containerExecPrefix, containerRboxEnv, guestMachineHome,
   uxContainerName, uxContainerPlan, uxCreateArgs, uxDestroyArgs, uxDestroyScope, uxImageHasLabel, uxListArgs, uxOwnership,
 } from "./container.js";
+import { UX_GUEST_RBOX } from "./binary.js";
 
 test("container execution is the default and --host is the explicit fallback", () => {
   expect(executionMode(false)).toBe("container");
@@ -19,7 +20,7 @@ test("run and guest names are scoped and path-safe", () => {
 });
 
 test("create argv uses bridge, local source mounts, and only UX container labels", () => {
-  const plan = uxContainerPlan("walk", "image-hash", "/repo");
+  const plan = uxContainerPlan("walk", "image-hash", "/repo", undefined);
   const args = uxCreateArgs(plan);
   expect(args.slice(0, 17)).toEqual([
     "create", "--name", "ux-walk", "--network", "bridge", "--cpus", "2", "--memory", "2G",
@@ -30,6 +31,18 @@ test("create argv uses bridge, local source mounts, and only UX container labels
   expect(args).toContain(`RBOX_API=${DEV_API}`);
   expect(args).not.toContain("rig=1");
   expect(args.at(-1)).toBe("rig-device");
+});
+
+test("compiled binary override is mounted read-only over the guest rbox shim", () => {
+  const plan = uxContainerPlan("walk", "image-hash", "/repo", "/artifacts/rbox-linux-arm64");
+  expect(plan.mounts.at(-1)).toEqual({
+    source: "/artifacts/rbox-linux-arm64",
+    target: UX_GUEST_RBOX,
+    readonly: true,
+  });
+  expect(uxCreateArgs(plan)).toContain(
+    `type=bind,source=/artifacts/rbox-linux-arm64,target=${UX_GUEST_RBOX},readonly`,
+  );
 });
 
 test("prefix pins the Docker exec cwd and keeps the logical rbox surface", () => {
@@ -52,7 +65,7 @@ test("list selects live UX-labelled containers", () => {
 });
 
 describe("container ownership", () => {
-  const plan = uxContainerPlan("walk", "hash", "/repo");
+  const plan = uxContainerPlan("walk", "hash", "/repo", undefined);
   const matching = [{
     Config: { Image: plan.image, Env: [`RBOX_API=${DEV_API}`, "PATH=/bin"], Labels: { ux: "1", "ux.run": "walk", "ux.repo": plan.repoId, "ux.spec": plan.specHash } },
     HostConfig: { NetworkMode: "bridge" },
@@ -62,6 +75,19 @@ describe("container ownership", () => {
   test("accepts an exact owned container", () => expect(uxOwnership(matching, plan)).toBe("match"));
   test("permits scoped recreation only after ownership is proven", () => {
     expect(uxOwnership([{ ...matching[0], Config: { ...matching[0]!.Config, Labels: { ux: "1", "ux.run": "walk", "ux.repo": plan.repoId, "ux.spec": "old" } } }], plan)).toBe("owned-stale");
+  });
+  test("treats adding, removing, or replacing only the candidate mount as owned-stale", () => {
+    const candidatePlan = uxContainerPlan("walk", "hash", "/repo", "/artifacts/new-rbox");
+    expect(uxOwnership(matching, candidatePlan)).toBe("owned-stale");
+    const oldCandidate = [{
+      ...matching[0],
+      Mounts: [
+        ...matching[0]!.Mounts,
+        { Source: "/artifacts/old-rbox", Destination: UX_GUEST_RBOX, RW: false },
+      ],
+    }];
+    expect(uxOwnership(oldCandidate, plan)).toBe("owned-stale");
+    expect(uxOwnership(oldCandidate, candidatePlan)).toBe("owned-stale");
   });
   test("rejects an unlabelled same-name collision", () => expect(uxOwnership([{ Config: { Labels: {} } }], plan)).toBe("collision"));
   test("rejects another checkout and any unexpected extra mount", () => {

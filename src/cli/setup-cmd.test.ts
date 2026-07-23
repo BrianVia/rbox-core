@@ -141,7 +141,7 @@ test("enrolled setup skip notice renders cached identity or the exact account-id
   expect(writes.pop()).toBe("Signed in and enrolled (acct_fallback) — skipping account setup.\n");
 });
 
-// The guided flow's menus are now arrow-key `@inquirer` `select`s (thin widgets we
+// The guided flow's menus are arrow-key selects (thin widgets we
 // don't unit-test). The one pure step-transition left is `workspaceFlags` — the
 // map from a Step-2 workspace decision to the exact `runInit` flags.
 

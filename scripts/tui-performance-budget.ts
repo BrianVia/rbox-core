@@ -1,0 +1,122 @@
+#!/usr/bin/env bun
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { performance } from "node:perf_hooks";
+import { resolveRigBinaryOverride } from "./rig/lib/binary.js";
+
+interface Sample {
+  wallMs: number;
+  rssBytes: number;
+}
+
+const workloads = [
+  { name: "status", args: ["status"], expectedExit: 1 },
+  { name: "status-json", args: ["status", "--json"], expectedExit: 1 },
+  { name: "prompt-status", args: ["prompt-status"], expectedExit: 0 },
+  { name: "daemon-startup-selftest", args: ["__watcher-selftest"], expectedExit: 0 },
+] as const;
+
+function percentile(values: number[], fraction: number): number {
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.max(0, Math.ceil(sorted.length * fraction) - 1)]!;
+}
+
+function measure(binary: string, cwd: string, args: readonly string[], expectedExit: number): Sample {
+  const isDarwin = process.platform === "darwin";
+  const timeArgs = isDarwin ? ["-l"] : ["-v"];
+  const started = performance.now();
+  const result = Bun.spawnSync(["/usr/bin/time", ...timeArgs, binary, ...args], {
+    cwd,
+    env: {
+      PATH: process.env.PATH ?? "/usr/bin:/bin",
+      HOME: cwd,
+      RBOX_HOME: cwd,
+      RBOX_ASSERT_INK_NOT_LOADED: "1",
+    },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const wallMs = performance.now() - started;
+  if (result.exitCode !== expectedExit || result.stderr.toString().includes("Ink runtime loaded during a non-interactive command")) {
+    throw new Error(`${path.basename(binary)} ${args.join(" ")} exited ${result.exitCode}, expected ${expectedExit}\n${result.stderr.toString()}`);
+  }
+  const timing = result.stderr.toString();
+  const match = isDarwin
+    ? timing.match(/^\s*(\d+)\s+maximum resident set size$/m)
+    : timing.match(/Maximum resident set size \(kbytes\):\s*(\d+)/);
+  if (!match) throw new Error(`could not read peak RSS from /usr/bin/time output\n${timing}`);
+  return { wallMs, rssBytes: Number(match[1]) * (isDarwin ? 1 : 1024) };
+}
+
+const baseline = resolveRigBinaryOverride({ binary: process.argv[2] });
+const candidate = resolveRigBinaryOverride({ binary: process.argv[3] });
+if (!baseline || !candidate || process.argv.length !== 4) {
+  throw new Error("usage: bun scripts/tui-performance-budget.ts /absolute/baseline/rbox /absolute/candidate/rbox");
+}
+
+const root = fs.mkdtempSync(path.join(os.tmpdir(), "rbox-tui-budget-"));
+const baselineHome = path.join(root, "baseline");
+const candidateHome = path.join(root, "candidate");
+fs.mkdirSync(baselineHome);
+fs.mkdirSync(candidateHome);
+
+try {
+  const sizeDelta = fs.statSync(candidate).size - fs.statSync(baseline).size;
+  if (sizeDelta > 15 * 1024 * 1024) {
+    throw new Error(`binary grew ${(sizeDelta / 1024 / 1024).toFixed(2)} MiB (budget: 15 MiB)`);
+  }
+
+  const report: Record<string, unknown> = {
+    baseline,
+    candidate,
+    binarySize: {
+      baseline: fs.statSync(baseline).size,
+      candidate: fs.statSync(candidate).size,
+      delta: sizeDelta,
+    },
+    workloads: {},
+  };
+  const failures: string[] = [];
+
+  for (const workload of workloads) {
+    for (let iteration = 0; iteration < 5; iteration++) {
+      measure(baseline, baselineHome, workload.args, workload.expectedExit);
+      measure(candidate, candidateHome, workload.args, workload.expectedExit);
+    }
+    const baselineSamples: Sample[] = [];
+    const candidateSamples: Sample[] = [];
+    for (let iteration = 0; iteration < 30; iteration++) {
+      const first = iteration % 2 === 0
+        ? [[baseline, baselineHome, baselineSamples], [candidate, candidateHome, candidateSamples]] as const
+        : [[candidate, candidateHome, candidateSamples], [baseline, baselineHome, baselineSamples]] as const;
+      for (const [binary, cwd, samples] of first) samples.push(measure(binary, cwd, workload.args, workload.expectedExit));
+    }
+
+    const summarize = (samples: Sample[]) => ({
+      wallP50Ms: percentile(samples.map((sample) => sample.wallMs), 0.5),
+      wallP95Ms: percentile(samples.map((sample) => sample.wallMs), 0.95),
+      peakRssBytes: Math.max(...samples.map((sample) => sample.rssBytes)),
+    });
+    const baselineSummary = summarize(baselineSamples);
+    const candidateSummary = summarize(candidateSamples);
+    const wallLimit = Math.max(baselineSummary.wallP95Ms * 1.1, baselineSummary.wallP95Ms + 5);
+    const rssLimit = Math.max(baselineSummary.peakRssBytes * 1.1, baselineSummary.peakRssBytes + 2 * 1024 * 1024);
+    if (candidateSummary.wallP95Ms > wallLimit) {
+      failures.push(`${workload.name} p95 ${candidateSummary.wallP95Ms.toFixed(2)}ms > ${wallLimit.toFixed(2)}ms`);
+    }
+    if (candidateSummary.peakRssBytes > rssLimit) {
+      failures.push(`${workload.name} RSS ${candidateSummary.peakRssBytes} > ${Math.floor(rssLimit)}`);
+    }
+    (report.workloads as Record<string, unknown>)[workload.name] = {
+      baseline: baselineSummary,
+      candidate: candidateSummary,
+      limits: { wallP95Ms: wallLimit, peakRssBytes: rssLimit },
+    };
+  }
+
+  process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+  if (failures.length > 0) throw new Error(`TUI performance budget failed:\n- ${failures.join("\n- ")}`);
+} finally {
+  fs.rmSync(root, { recursive: true, force: true });
+}

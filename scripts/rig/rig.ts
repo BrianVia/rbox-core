@@ -28,6 +28,7 @@ import { waitForConvergence, waitForPath } from "./lib/waiters.js";
 import { ensureWorkloadDir, resolveWorkloadTar } from "./lib/workload.js";
 import { FAST_SUITE, getScenario, scenarioNames } from "./scenarios/index.js";
 import { finalizeReport, renderReportTable, skipReport, type RigCtx, type Scenario, type ScenarioReport } from "./scenarios/types.js";
+import { resolveRigBinaryOverride, rigGuestMounts, stageRigBinaryOverride } from "./lib/binary.js";
 
 const REPO_ROOT = path.resolve(fileURLToPath(import.meta.url), "../../.."); // scripts/rig/rig.ts → repo root
 const RIG_DIR = path.join(REPO_ROOT, "scripts", "rig");
@@ -61,8 +62,8 @@ const USAGE = `rig — design-56 test bench
 
 usage:
   rig doctor [--runner container|docker]  host/runtime preflight
-  rig up [--api-url <url>]            build image + start rig-dev-a/b
-  rig run <scenario> [--keep-account] run one scenario
+  rig up [--api-url <url>] [--binary </absolute/rbox>]  build image + start rig-dev-a/b
+  rig run <scenario> [--keep-account] [--binary </absolute/rbox>] run one scenario
   rig run all                         run the FAST suite (fresh account each; exit 1 if any FAIL)
   rig run conductor-initial-sync [--workload-tar <path>]   real-workload scale (explicit-only)
   rig watch [--api-url <url>]          live interleaved tail: [A]/[B] guests + [srv] wrangler
@@ -106,7 +107,7 @@ async function ensureImage(): Promise<string> {
 
 /** Idempotent: build if stale, create the network + both containers if absent,
  *  (re)start them. Re-running with everything present just reports state. */
-async function ensureUp(apiUrl: string): Promise<void> {
+async function ensureUp(apiUrl: string, binaryOverride?: string): Promise<void> {
   await C.ensureRuntimeReady();
   const trimmed = trimRunDirectories(RUNS_DIR);
   if (trimmed.entries) console.log(`trimmed ${trimmed.entries} old rig runs (${formatBytes(trimmed.bytes)})`);
@@ -118,10 +119,7 @@ async function ensureUp(apiUrl: string): Promise<void> {
     await C.networkCreate(NAMES.network);
   }
 
-  const mounts = [
-    { source: path.join(REPO_ROOT, "src"), target: GUEST.srcMount, readonly: true },
-    { source: path.join(REPO_ROOT, "scripts"), target: GUEST.scriptsMount, readonly: true },
-  ];
+  const mounts = rigGuestMounts(REPO_ROOT, binaryOverride ? stageRigBinaryOverride(binaryOverride) : undefined);
   for (const name of [NAMES.a, NAMES.b]) {
     const spec: C.CreateSpec = { name, image: NAMES.image, imageHash: currentHash, network: NAMES.network, cpus: DEV_CPUS, memory: DEV_MEMORY, mounts, env: { RBOX_API: apiUrl } };
     let exists = await C.containerExists(name);
@@ -315,7 +313,7 @@ async function runScenario(name: string, apiUrl: string, flags: Record<string, s
   // Resolve the secret up front (never printed) so a misconfig fails before any work.
   const bootstrapSecret = resolveBootstrapSecret(REPO_ROOT);
   const platformSecret = resolvePlatformSecret(REPO_ROOT);
-  await ensureUp(apiUrl);
+  await ensureUp(apiUrl, resolveRigBinaryOverride(flags));
   const report = await executeScenario(scenario, apiUrl, flags, bootstrapSecret, platformSecret);
   return reportExit(report);
 }
@@ -328,7 +326,7 @@ async function runScenario(name: string, apiUrl: string, flags: Record<string, s
 async function runSuite(apiUrl: string, flags: Record<string, string>): Promise<number> {
   const bootstrapSecret = resolveBootstrapSecret(REPO_ROOT);
   const platformSecret = resolvePlatformSecret(REPO_ROOT);
-  await ensureUp(apiUrl);
+  await ensureUp(apiUrl, resolveRigBinaryOverride(flags));
 
   const results: ScenarioReport[] = [];
   for (const name of FAST_SUITE) {
@@ -378,11 +376,12 @@ async function prepareConductorWorkload(apiUrl: string, flags: Record<string, st
     network: NAMES.network,
     cpus: DEV_CPUS,
     memory: DEV_MEMORY,
-    mounts: [
-      { source: path.join(REPO_ROOT, "src"), target: GUEST.srcMount, readonly: true },
-      { source: path.join(REPO_ROOT, "scripts"), target: GUEST.scriptsMount, readonly: true },
+    mounts: rigGuestMounts(REPO_ROOT, (() => {
+      const binary = resolveRigBinaryOverride(flags);
+      return binary ? stageRigBinaryOverride(binary) : undefined;
+    })(), [
       { source: staged.dir, target: GUEST.workloadMount, readonly: true },
-    ],
+    ]),
     env: { RBOX_API: apiUrl },
   });
   await C.startContainer(NAMES.a);
@@ -623,7 +622,10 @@ async function main(): Promise<number> {
     case "doctor":
       return doctor(resolveConfig(process.env, flags, REPO_ROOT).apiUrl);
     case "up":
-      await ensureUp(resolveConfig(process.env, flags, REPO_ROOT).apiUrl);
+      await ensureUp(
+        resolveConfig(process.env, flags, REPO_ROOT).apiUrl,
+        resolveRigBinaryOverride(flags),
+      );
       console.log("up complete.");
       return 0;
     case "run": {

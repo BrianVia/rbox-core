@@ -2,7 +2,11 @@ import { afterEach, test, expect } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { daemonLogHarvestScript, daemonWatcherMode, scrubSelfPrinted } from "./device.js";
+import {
+  daemonLogHarvestScript, daemonWatcherMode, detachedPushScript, rboxGuestArgv,
+  scrubSelfPrinted,
+} from "./device.js";
+import { GUEST } from "./config.js";
 
 const tempDirs: string[] = [];
 afterEach(() => {
@@ -16,6 +20,16 @@ afterEach(() => {
 
 const PHRASE = "abandon ability able about above absent absorb abstract absurd abuse access accident account accuse achieve acid acoustic acquire across act action actor actress actual";
 const PAIR = "tQx8mZ2kJ9vLpW3nRb4cYd.Fg7hKm1sTq5uVw9xZa3bCe6fHj8kMn2pRt4vWy7z";
+
+test("all direct and detached CLI argv targets the replaceable guest executable", () => {
+  expect(rboxGuestArgv(["status", "--json"])).toEqual([
+    GUEST.cliExecutable, "status", "--json",
+  ]);
+  expect(detachedPushScript("/tmp/push log")).toBe(
+    `nohup ${GUEST.cliExecutable} push >'/tmp/push log' 2>&1 & echo "detached pid $!"`,
+  );
+  expect(detachedPushScript("/tmp/a'b")).toContain(">'/tmp/a'\"'\"'b'");
+});
 
 test("scrub: a 24-word recovery-phrase line is masked (indentation kept)", () => {
   const out = scrubSelfPrinted(`    ${PHRASE}`);

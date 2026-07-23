@@ -54,7 +54,7 @@ export interface ProvisionResult {
 }
 
 export function rigLoginArgv(side: "a" | "b", scenarioName: string, bootstrap = false): string[] {
-  return ["bun", GUEST.cliEntry, "login", ...(bootstrap ? ["--bootstrap", "$RIG_BOOT"] : []), "--label", `rig-${side}-${scenarioName}`, "--remote", "$RBOX_API"];
+  return [GUEST.cliExecutable, "login", ...(bootstrap ? ["--bootstrap", "$RIG_BOOT"] : []), "--label", `rig-${side}-${scenarioName}`, "--remote", "$RBOX_API"];
 }
 
 function rigLoginShell(side: "a" | "b", scenarioName: string, bootstrap = false): string {

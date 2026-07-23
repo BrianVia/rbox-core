@@ -345,19 +345,37 @@ async function runPicker(
   let rendered = "";
   output.on("data", (chunk) => { rendered += chunk.toString(); });
   const pending = directoryPickerPrompt({ message: "Which directory?", cwd: root, ...overrides }, { input, output });
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  input.write(keys);
+  for (let attempt = 0; attempt < 100 && !rendered.includes("Which directory?"); attempt++) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 5));
+  }
+  if (!rendered.includes("Which directory?")) throw new Error("directory prompt did not mount");
+  await sendTerminalKeys(input, keys);
   const answer = await pending;
   return { answer, output: rendered };
 }
 
-describe("real @inquirer/core directory prompt", () => {
+async function sendTerminalKeys(input: PassThrough, keys: string): Promise<void> {
+  const tokens = keys.match(/\x1b\[[A-D]|\r|\t|[\s\S]/g) ?? [];
+  for (const token of tokens) {
+    input.write(token);
+    await new Promise<void>((resolve) => token === "\r" ? setTimeout(resolve, 40) : setImmediate(resolve));
+  }
+}
+
+describe("real Ink directory prompt", () => {
   test("literal plus Enter has no loading race and returns the literal", async () => {
     const result = await runPicker("typo\r");
     expect(result.answer).toEndWith("/typo");
     expect(result.output).toContain("Which directory?");
     expect(result.output).toContain("Enter = this directory · type to filter · Tab completes");
     expect(result.output).not.toContain("loading");
+  });
+
+  test("default is accepted untouched and replaced by the first typed path", async () => {
+    const untouched = await runPicker("\r", { default: "suggested" });
+    expect(untouched.answer).toEndWith("/suggested");
+    const typed = await runPicker("a\r", { default: "suggested" });
+    expect(typed.answer).toEndWith("/a");
   });
 
   test("Tab completes the best child, ignores highlight, and Enter submits completion", async () => {
@@ -391,11 +409,12 @@ describe("real @inquirer/core directory prompt", () => {
     let rendered = "";
     output.on("data", (chunk) => { rendered += chunk.toString(); });
     const pending = directoryPickerPrompt({ message: "path", cwd: root }, { input, output });
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    for (let attempt = 0; attempt < 20 && !rendered.includes("+9 more"); attempt++) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
     expect(DIRECTORY_PICKER_PAGE_SIZE).toBe(12);
     expect(rendered).toContain("+9 more");
-    input.write("\x1b[B".repeat(DIRECTORY_PICKER_PAGE_SIZE));
-    input.write("\r");
+    await sendTerminalKeys(input, "\x1b[B".repeat(DIRECTORY_PICKER_PAGE_SIZE) + "\r");
     expect(await pending).toBe(root);
   });
 });

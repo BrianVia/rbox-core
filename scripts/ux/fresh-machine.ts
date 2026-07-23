@@ -9,6 +9,7 @@ import {
   ensureUxContainer, execUx, guestMachineHome, listUxContainers, startUxContainerForTeardown, uxDestroyScope,
 } from "./container.js";
 import { assertNoAncestorWorkspace, DEV_API, executionMode, isolatedEnv, safeId, SCRUBBED_ENV, shellQuote, UX_ROOT } from "./lib.js";
+import { resolveUxBinaryOverride } from "./binary.js";
 
 export { assertNoAncestorWorkspace, DEV_API, executionMode, isolatedEnv, safeId, SCRUBBED_ENV, UX_ROOT } from "./lib.js";
 
@@ -80,7 +81,9 @@ export function assertDevRemote(remote: string): void {
 }
 export function envPrefix(home: string): string {
   const unset = SCRUBBED_ENV.map((key) => `-u ${key}`).join(" ");
-  return `cd ${shellQuote(home)} && env ${unset} HOME=${shellQuote(home)} RBOX_HOME=${shellQuote(home)} RBOX_API=${shellQuote(DEV_API)} RBOX_API_QUIET=1 RBOX_APP='' rbox`;
+  const override = resolveUxBinaryOverride();
+  const executable = override ? shellQuote(override) : "rbox";
+  return `cd ${shellQuote(home)} && env ${unset} HOME=${shellQuote(home)} RBOX_HOME=${shellQuote(home)} RBOX_API=${shellQuote(DEV_API)} RBOX_API_QUIET=1 RBOX_APP='' ${executable}`;
 }
 export function normalizedBootstrapEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return { ...env, RBOX_DEV_BOOTSTRAP: env.RBOX_DEV_BOOTSTRAP?.trim() || env.RBOX_DEV_BOOTSTRAP_SECRET?.trim() };
@@ -115,7 +118,7 @@ export function childFailure(stage: string, exit: number, _capturedOutput?: stri
 }
 async function runHostRbox(home: string, args: string[], stage: string): Promise<void> {
   assertDevRemote(DEV_API); await assertNoAncestorWorkspace(home);
-  const child = Bun.spawn(["rbox", ...args], rboxSpawnOptions(home));
+  const child = Bun.spawn([resolveUxBinaryOverride() ?? "rbox", ...args], rboxSpawnOptions(home));
   await Promise.all([new Response(child.stdout).arrayBuffer(), new Response(child.stderr).arrayBuffer()]);
   const exit = await child.exited; if (exit !== 0) throw childFailure(stage, exit);
 }

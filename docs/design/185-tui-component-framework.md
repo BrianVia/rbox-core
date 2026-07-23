@@ -97,7 +97,9 @@ The new runtime preserves these contracts from designs 07c, 135, and 140:
 3. **Exit 130.** Ctrl-C unmounts, restores the terminal, and exits through the
    existing SIGINT convention without a stack trace.
 4. **Cleanup on every settlement.** Success, validation failure, abort,
-   exception, and Ctrl-C restore raw mode and cursor visibility exactly once.
+   exception, and Ctrl-C restore the prior raw-mode state and ensure the cursor
+   is visible exactly once. Terminals do not expose the prior cursor visibility
+   state for reliable introspection.
 5. **Color precedence.** `NO_COLOR` wins. `FORCE_COLOR` remains the only way to
    force ANSI through a pipe. Interactive prompts inherit rbox's stderr color
    decision rather than independently guessing.

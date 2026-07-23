@@ -3,10 +3,9 @@
  * scenario does to a device — run the rbox CLI, read/write a file, seed a corpus —
  * goes through here, built entirely on container.ts (no direct spawns).
  *
- * The rbox CLI inside a guest is `bun /app/src/cli/index.ts <args>` with
- * `RBOX_API` pointing at the resolved dev URL, so module resolution walks up to
- * the image's linux node_modules and the CLI can never reach prod (config.ts
- * already refused any prod URL before this device existed).
+ * The image's `rbox` executable is a source-mode shim by default. A rig binary
+ * override bind-mounts the compiled candidate over that same fixed path, so all
+ * scenario call sites exercise one exact surface without branching.
  */
 import { exec, killContainer, startContainer, type RunResult } from "./container.js";
 import { GUEST } from "./config.js";
@@ -96,6 +95,15 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
+/** One stable argv surface for both the source shim and a mounted candidate. */
+export function rboxGuestArgv(args: readonly string[]): string[] {
+  return [GUEST.cliExecutable, ...args];
+}
+
+export function detachedPushScript(logPath: string): string {
+  return `nohup ${GUEST.cliExecutable} push >${shellQuote(logPath)} 2>&1 & echo "detached pid $!"`;
+}
+
 /**
  * Build the guest-side collector shared by watcher classification and run-artifact
  * capture. Each runtime contributes calendar-valid daily files in filename order,
@@ -135,11 +143,11 @@ export class Device {
     return exec({ name: this.name, cmd, env: opts.env, cwd: opts.cwd, stdin: opts.stdin, allowFail: opts.allowFail, redact: opts.redact });
   }
 
-  /** `bun /app/src/cli/index.ts <args>` with RBOX_API + RBOX_METRICS + RBOX_DIAGNOSTICS
+  /** `rbox <args>` with RBOX_API + RBOX_METRICS + RBOX_DIAGNOSTICS
    *  injected (diagnostics ships OFF for users; the bench keeps the real upload path
    *  continuously exercised — design 56 §10 V4). */
   async rbox(args: string[], opts: RboxOpts = {}): Promise<RunResult> {
-    return this.runRecorded(`rbox ${args.join(" ")}`, ["bun", GUEST.cliEntry, ...args], opts);
+    return this.runRecorded(`rbox ${args.join(" ")}`, rboxGuestArgv(args), opts);
   }
 
   /**
@@ -247,7 +255,7 @@ export class Device {
    * via the log + a foreground resume, never here.
    */
   async pushDetached(workDir: string, logPath: string, env: Record<string, string> = {}): Promise<void> {
-    const script = `nohup bun ${GUEST.cliEntry} push >'${logPath}' 2>&1 & echo "detached pid $!"`;
+    const script = detachedPushScript(logPath);
     await this.exec(["sh", "-c", script], { cwd: workDir, env: { RBOX_API: this.apiUrl, RBOX_METRICS: "1", RBOX_DIAGNOSTICS: "1", ...env } });
   }
 

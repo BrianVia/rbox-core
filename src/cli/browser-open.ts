@@ -1,5 +1,4 @@
 import { spawn, type SpawnOptions } from "node:child_process";
-import * as readline from "node:readline";
 
 /**
  * Cross-platform, TTY-aware, never-throws browser + clipboard helpers, shared by
@@ -80,40 +79,4 @@ export function copyToClipboard(text: string): boolean {
     }
   }
   return false;
-}
-
-/** Wait for a single raw keypress on stdin, resolving with its key name (e.g.
- *  `"c"`), or `undefined` immediately off a TTY. Raw mode suppresses the normal
- *  SIGINT that Ctrl-C would otherwise raise, so we re-raise it ourselves as
- *  `exit(130)` — the same convention `prompt.ts` uses for a cancelled widget.
- *  Restores stdin's prior raw-mode state before resolving; never throws. */
-export function waitForKeypress(signal?: AbortSignal): Promise<string | undefined> {
-  const stdin = process.stdin as NodeJS.ReadStream & { isRaw?: boolean; setRawMode?: (mode: boolean) => unknown };
-  if (!stdin.isTTY) return Promise.resolve(undefined);
-  return new Promise((resolve) => {
-    readline.emitKeypressEvents(stdin);
-    const wasRaw = stdin.isRaw ?? false;
-    stdin.setRawMode?.(true);
-    const cleanup = () => {
-      stdin.removeListener("keypress", onKeypress);
-      signal?.removeEventListener("abort", onAbort);
-      stdin.setRawMode?.(wasRaw);
-      stdin.pause();
-    };
-    const onAbort = () => {
-      cleanup();
-      resolve(undefined);
-    };
-    const onKeypress = (_str: string, key?: { name?: string; ctrl?: boolean }) => {
-      cleanup();
-      if (key?.ctrl && key.name === "c") {
-        process.exit(130);
-        return;
-      }
-      resolve(key?.name);
-    };
-    if (signal?.aborted) return onAbort();
-    signal?.addEventListener("abort", onAbort, { once: true });
-    stdin.once("keypress", onKeypress);
-  });
 }

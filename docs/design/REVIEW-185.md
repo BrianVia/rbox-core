@@ -61,3 +61,10 @@ stderr rendering, `interactive:true` is reached only after that gate and defeats
 Ink's CI auto-disable, the native selftest attaches all three streams to one
 PTY, and the scoped interaction policy structurally blocks
 `--no-interactive` before Ink evaluation.
+
+## Implementation evidence corrections
+
+Runtime reconnaissance found that cursor visibility cannot be snapshotted
+portably. The contract now restores raw mode and explicitly leaves the cursor
+visible. Prompt styling is also precomputed through rbox's stderr color policy
+instead of relying on Ink's stdout-oriented color detection.
