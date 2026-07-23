@@ -411,7 +411,7 @@ async function route(req: Request, env: Env, executionCtx: ExecutionContext & { 
  */
 const ROUTE_VOCAB = new Set([
   "v1", "health", "install.sh", "agent.sh", "changelog.md", "version", "version.sig", "bin",
-  "auth", "device", "start", "poll", "bootstrap", "approve", "pubkeys", "devices", "revoke", "pair", "create", "redeem",
+  "auth", "device", "start", "poll", "bootstrap", "approve", "approve-dev", "pubkeys", "devices", "revoke", "pair", "create", "redeem",
   "key-delivery", "fetch", "submit", "ack",
   "billing", "checkout", "portal", "stripe", "webhook", "web", "session",
   "account", "usage", "admin", "gc", "plan", "overview", "delta-soak", "workspaces", "diagnostics", "pack-tombstones", "resweep",

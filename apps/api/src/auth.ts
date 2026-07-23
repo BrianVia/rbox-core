@@ -28,7 +28,7 @@ export { createPairToken, redeemPairToken } from "./auth/pairing.js";
 export { bootstrap } from "./auth/bootstrap.js";
 
 // CLI device-authorization login flow (start / poll / approve).
-export { startDeviceAuth, pollDeviceAuth, approveDeviceAuth, lookupDeviceAuth, lookupDevicePubkeys } from "./auth/device-code.js";
+export { startDeviceAuth, pollDeviceAuth, approveDeviceAuth, approveDeviceAuthDev, lookupDeviceAuth, lookupDevicePubkeys } from "./auth/device-code.js";
 
 // CLI device management (list / revoke).
 export { listDevices, revokeDevice } from "./auth/devices.js";

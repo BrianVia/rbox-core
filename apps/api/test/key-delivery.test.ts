@@ -4,12 +4,14 @@ import {
   ackKeyDelivery,
   fetchKeyDeliveryRequest,
   pollKeyDelivery,
+  publicKeyFingerprint,
   queueKeyDelivery,
   requestIdForDeviceCode,
   submitKeyDeliveryBlob,
   sweepKeyDeliveries,
   type DevicePublicKeys,
 } from "../src/auth/key-delivery.js";
+import { approveDeviceAuthDev } from "../src/auth/device-code.js";
 import { claimDeviceAuthWithEscrow, recoverEscrowedDeviceToken } from "../src/auth/mint.js";
 import { revokeDevice } from "../src/auth/devices.js";
 import { sha256Hex } from "../src/util.js";
@@ -418,6 +420,85 @@ describe("design 189 key-delivery state machine", () => {
       "UPDATE key_delivery SET state='delivered' WHERE request_id=?",
     ).bind(duplicateRequest).run();
     expect((await queueKeyDelivery(env, sixthInput)).ok).toBe(true);
+  });
+
+  describe("design 192 dev-only scriptable approve (approve-dev)", () => {
+    const DEV_SECRET = "test-bootstrap-secret";
+    async function seedPendingAuth(account: Boot, userCode: string, publicKeys: DevicePublicKeys) {
+      await seedEpoch(account.accountId);
+      const deviceCode = (await sha256Hex(`da-${account.accountId}-${userCode}`)).slice(0, 64);
+      const requestId = await requestIdForDeviceCode(deviceCode);
+      const now = Date.now();
+      await env.rbox_dev_db.prepare(
+        `INSERT INTO device_auth
+           (device_code,user_code,status,device_id,label,created_at,expires_at,account_id,user_id,
+            enc_pub_key,sig_pub_key,pubkeys_captured_at,request_id)
+         VALUES (?,?,'pending',?,'approve-dev-test',?,?,?,?,?,?,?,?)`,
+      ).bind(
+        deviceCode, userCode, `dev_da_${userCode.replace("-", "")}`, now, now + 600_000,
+        null, null, publicKeys.encPubKey, publicKeys.sigPubKey, now, requestId,
+      ).run();
+      return { deviceCode, requestId };
+    }
+
+    test("prod env makes the hook return 404 and never queues a delivery", async () => {
+      const account = await bootstrap("da-prod-gate");
+      const keys192 = keys(101);
+      const { requestId } = await seedPendingAuth(account, "DAAA-AAAB", keys192);
+      const fingerprint = await publicKeyFingerprint(keys192);
+      const res = await approveDeviceAuthDev(
+        jsonRequest("/v1/auth/device/approve-dev", { userCode: "DAAA-AAAB", pubkeyFingerprint: fingerprint, bootstrapSecret: DEV_SECRET }),
+        { ...env, RBOX_ENV: "prod" },
+        account.principal,
+      );
+      expect(res.status).toBe(404);
+      expect(await res.json()).toEqual({ error: "not_found" });
+      expect(await env.rbox_dev_db.prepare("SELECT 1 FROM key_delivery WHERE request_id=?").bind(requestId).first()).toBeNull();
+      const auth = await env.rbox_dev_db.prepare("SELECT status FROM device_auth WHERE request_id=?").bind(requestId).first<{ status: string }>();
+      expect(auth?.status).toBe("pending");
+    });
+
+    test("wrong operator secret is unauthorized and never queues (dev env)", async () => {
+      const account = await bootstrap("da-bad-secret");
+      const keys192 = keys(102);
+      const { requestId } = await seedPendingAuth(account, "DAAC-AAAA", keys192);
+      const fingerprint = await publicKeyFingerprint(keys192);
+      const res = await approveDeviceAuthDev(
+        jsonRequest("/v1/auth/device/approve-dev", { userCode: "DAAC-AAAA", pubkeyFingerprint: fingerprint, bootstrapSecret: "not-the-secret" }),
+        env,
+        account.principal,
+      );
+      expect(res.status).toBe(401);
+      expect(await env.rbox_dev_db.prepare("SELECT 1 FROM key_delivery WHERE request_id=?").bind(requestId).first()).toBeNull();
+    });
+
+    test("dev env + operator secret + exact fingerprint atomically approves and queues", async () => {
+      const account = await bootstrap("da-happy");
+      const keys192 = keys(103);
+      const { requestId } = await seedPendingAuth(account, "DAAD-AAAA", keys192);
+      const fingerprint = await publicKeyFingerprint(keys192);
+      // A fragment mismatch is refused before any queue.
+      const mismatch = await approveDeviceAuthDev(
+        jsonRequest("/v1/auth/device/approve-dev", { userCode: "DAAD-AAAA", pubkeyFingerprint: "A".repeat(43), bootstrapSecret: DEV_SECRET }),
+        env,
+        account.principal,
+      );
+      expect(mismatch.status).toBe(409);
+      expect(await mismatch.json()).toEqual({ error: "pubkey_binding_mismatch" });
+      const res = await approveDeviceAuthDev(
+        jsonRequest("/v1/auth/device/approve-dev", { userCode: "DAAD-AAAA", pubkeyFingerprint: fingerprint, bootstrapSecret: DEV_SECRET }),
+        env,
+        account.principal,
+      );
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ ok: true, keyDelivery: { requestId, status: "pending" } });
+      const [auth, delivery] = await Promise.all([
+        env.rbox_dev_db.prepare("SELECT status,account_id FROM device_auth WHERE request_id=?").bind(requestId).first<{ status: string; account_id: string }>(),
+        env.rbox_dev_db.prepare("SELECT state,account_id FROM key_delivery WHERE request_id=?").bind(requestId).first<{ state: string; account_id: string }>(),
+      ]);
+      expect(auth).toEqual({ status: "approved", account_id: account.accountId });
+      expect(delivery).toEqual({ state: "queued", account_id: account.accountId });
+    });
   });
 
   test("expiry, factor-age, and epoch guards terminalize without leaking the blob", async () => {
