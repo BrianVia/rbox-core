@@ -6,6 +6,34 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.7.26] — 2026-07-23 — "name clashes can't stop sync, your phrase saves anywhere"
+
+### Added
+- **Save your recovery phrase where you actually keep secrets.** First-run
+  setup now shows checkboxes instead of a single yes/no: save to 1Password
+  (when its CLI is installed, rbox creates the item in a vault you pick and
+  verifies it landed correctly), the macOS Keychain, a plaintext file, your
+  clipboard — any combination. If some saves fail, rbox lists exactly what
+  succeeded and only continues with fewer copies after you explicitly agree.
+  Interrupted setups resume without losing progress or creating duplicate
+  1Password items.
+- Setup now explains the security model in plain words before asking: your
+  files stay normal and usable on this computer; rbox encrypts the uploaded
+  copy with this phrase so it stays private in the cloud — even from us;
+  GitHub and other source control keep working; uncommitted work is
+  protected too.
+- `rbox status` and `rbox key status` show 1Password backups you've saved
+  (reported as recorded — rbox doesn't reopen your vault to check them).
+
+### Fixed
+- **One ambiguously-named file can no longer stop sync.** Two paths that
+  differ only by letter case (`README.md` vs `readme.md`) used to block the
+  entire sync cycle. rbox now keeps syncing everything else, holds back just
+  the ambiguous names so one variant can never overwrite the other on a Mac,
+  shows a plain warning in `rbox status` (your workspace stays healthy), and
+  syncs the surviving file automatically once you rename or remove a
+  variant — no manual re-sync needed.
+
 ## [1.7.25] — 2026-07-23 — "stops are safe, pairing is one command"
 
 - **Interrupted syncs can no longer strand your git repos.** Every lock rbox
