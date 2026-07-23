@@ -297,8 +297,10 @@ describe("runGenesisEnrollment", () => {
 
     expect(choiceNames).toEqual(["Save to a plaintext file", "Copy it to my clipboard"]);
     expect(rendered).toContain("Your files stay normal and usable on this computer.");
-    expect(rendered).toContain("GitHub and other source control keep working normally.");
-    expect(rendered).toContain("work you have not committed or pushed yet");
+    // Founder-trimmed 2026-07-23: the GitHub and lost-every-device paragraphs
+    // were cut from the first-run lead-in as wall-of-text.
+    expect(rendered).not.toContain("GitHub and other source control");
+    expect(rendered).not.toContain("If you lose every signed-in device");
     expect(rendered).toContain("1Password CLI not found");
     expect({ copied, cleared }).toEqual({ copied: 1, cleared: 1 });
     expect((await readRecoveryKitRecord(accountId))?.plaintextArtifacts.map((artifact) => artifact.path)).toContain(target);

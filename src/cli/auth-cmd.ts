@@ -189,18 +189,14 @@ interface GenesisDestinationFlowDeps {
   clearClipboard?: typeof clearRecoverySecretClipboard;
 }
 
+// Founder-trimmed after field-testing the 410 TUI (2026-07-23): the GitHub
+// and lost-every-device paragraphs read as a wall of text at first run.
 const GENESIS_RECOVERY_LEAD_IN = `
 First, save your recovery phrase.
 
 Your files stay normal and usable on this computer. Before rbox uploads a copy,
 it encrypts that copy using this phrase. That keeps your files private in the
 cloud — even from us.
-
-GitHub and other source control keep working normally. This phrase protects
-rbox's separate cloud copy, including work you have not committed or pushed yet.
-
-If you lose every signed-in device, this phrase is the only way back in.
-rbox cannot reset it.
 `;
 
 function destinationKinds(destinations: readonly RecoveryDestination[]): Set<GenesisDestinationChoice> {
@@ -232,7 +228,8 @@ async function chooseGenesisDestinationIntent(args: {
 
   for (;;) {
     const selected = await checkbox<GenesisDestinationChoice>({
-      message: "Where should rbox save your recovery phrase?\n  ↑/↓ move · Space select · Enter continue",
+      // The TUI renders its own key-hint line — do not embed one in the message.
+      message: "Where should rbox save your recovery phrase?",
       choices: [
         ...(discovery.state === "available" ? [{
           name: "Save to 1Password",

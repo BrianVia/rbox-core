@@ -50,11 +50,10 @@ Your files stay normal and usable on this computer. Before rbox uploads a copy,
 it encrypts that copy using this phrase. That keeps your files private in the
 cloud — even from us.
 
-GitHub and other source control keep working normally. This phrase protects
-rbox's separate cloud copy, including work you have not committed or pushed yet.
-
-If you lose every signed-in device, this phrase is the only way back in.
-rbox cannot reset it.
+> Amended 2026-07-23 (founder, field-testing the 410 TUI): the GitHub/source-
+> control paragraph and the lose-every-device paragraph are CUT from the
+> first-run lead-in — wall-of-text at the exact moment we need attention.
+> The facts stay documented here and may return in docs/web copy.
 
 ? Where should rbox save your recovery phrase?
 Instructions:
