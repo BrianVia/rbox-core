@@ -5,7 +5,14 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
-_Last updated: 2026-07-23 (~11:00 UTC — **DESIGN 187 COMPLETE ON MAIN —
+_Last updated: 2026-07-23 (~11:30 UTC — **v1.7.26 "name clashes can't
+stop sync, your phrase saves anywhere" RELEASED** — designs 186 + 187):
+tag at 67109ea3, release run success, api.rbox.to/version = 1.7.26
+(all three artifacts). Regress 11/11 (via sg docker). Fleet NOT yet
+upgraded — Mac/FM still on 1.7.25; `rbox upgrade` pending founder
+word. Release details below._
+
+_Same day (~11:00 UTC — **DESIGN 187 COMPLETE ON MAIN —
 multi-select recovery phrase backups**): PR #408 merged (squash ebb58578):
 first-run genesis now offers a checkbox flow saving the recovery phrase to
 any combination of 1Password (new shell-free bounded CLI adapter,
