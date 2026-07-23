@@ -165,6 +165,7 @@ test("status --json emits JSON and uses shellStateOf health values", async () =>
     health: "outofstorage",
     daemon: { running: false, pid: null, version: null, mode: null, cliVersion: RBOX_VERSION, versionSkew: false },
     locking: { status: "ok", reason: null, path: ".rbox/state/sync.lock" },
+    pathWarnings: null,
     remote: null,
     trash: null,
     account: { plan: null, usedBytes: null, capBytes: null },
