@@ -13,6 +13,7 @@ import { loadDevice, loadRecoveryKey } from "./e2ee-keystore.js";
 import { isAutostartEnabled } from "./autostart-cmd.js";
 import { readStdinTrimmed } from "./read-stdin.js";
 import { rboxBanner } from "./wordmark.js";
+import { stderrStyle } from "./style.js";
 import { friendlyHttpError } from "./http-error.js";
 import {
   defaultKitTargetDir,
@@ -190,14 +191,16 @@ interface GenesisDestinationFlowDeps {
   clearClipboard?: typeof clearRecoverySecretClipboard;
 }
 
-// Founder-trimmed after field-testing the 410 TUI (2026-07-23): the GitHub
-// and lost-every-device paragraphs read as a wall of text at first run.
-const GENESIS_RECOVERY_LEAD_IN = `
-First, save your recovery phrase.
+// Copy shaped by two founder field-review rounds (2026-07-23): one clear task,
+// heading bright, two short sentences, no security essay. Cut material lives in
+// design 187 for docs/web use.
+const genesisRecoveryLeadIn = (): string => `
+${stderrStyle.bold("Protect your files")}
 
-Your files stay normal and usable on this computer. Before rbox uploads a copy,
-it encrypts that copy using this phrase. That keeps your files private in the
-cloud — even from us.
+rbox encrypts files before they leave this machine. Save your recovery
+phrase so you can restore access later.
+
+Your files on this machine stay unchanged.
 `;
 
 function destinationKinds(destinations: readonly RecoveryDestination[]): Set<GenesisDestinationChoice> {
@@ -222,7 +225,7 @@ async function chooseGenesisDestinationIntent(args: {
   const fixedKinds = destinationKinds(fixed);
   const discovery = args.opDiscovery ?? await (deps.detectOnePassword ?? detectOnePasswordCli)();
 
-  write(rboxBanner() + GENESIS_RECOVERY_LEAD_IN);
+  write(rboxBanner() + genesisRecoveryLeadIn());
   // No "1Password CLI not found" notice here (founder cut, 2026-07-23): when op
   // is absent the option simply doesn't appear, and the clipboard flow already
   // says "paste it into your password manager now" at the moment that matters.
@@ -230,33 +233,34 @@ async function chooseGenesisDestinationIntent(args: {
   for (;;) {
     const selected = await checkbox<GenesisDestinationChoice>({
       // The TUI renders its own key-hint line — do not embed one in the message.
-      message: "Where should rbox save your recovery phrase?",
+      message: "Save it in one or more places:",
       choices: [
         ...(discovery.state === "available" ? [{
-          name: "Save to 1Password",
+          name: "1Password",
           value: "onepassword" as const,
           description: "creates a secure item in a vault you choose",
           checked: fixedKinds.has("onepassword"),
           disabled: fixedKinds.has("onepassword") ? "already saved" : false,
         }] : []),
         ...(args.keychainTarget ? [{
-          name: "Save to macOS Keychain",
+          name: "macOS Keychain",
           value: "keychain" as const,
           description: "saves on this Mac; it does not sync through iCloud",
           checked: fixedKinds.has("keychain") || fixed.length === 0,
           disabled: fixedKinds.has("keychain") ? "already saved" : false,
         }] : []),
         {
-          name: "Save to a plaintext file",
+          name: "Plain-text file",
           value: "kit-path" as const,
-          description: `writes the phrase in plaintext to ${displayPath(args.filePath)} (readable only by your user account)`,
+          // The exact path prints after the save succeeds — not here.
+          description: "Protect it like a password.",
           checked: fixedKinds.has("kit-path") || fixed.length === 0 && !args.keychainTarget,
           disabled: fixedKinds.has("kit-path") ? "already saved" : false,
         },
         {
-          name: "Copy it to my clipboard",
+          name: "Copy to clipboard",
           value: "clipboard" as const,
-          description: "copies the 24 words temporarily; clipboard tools or history may retain them until cleared",
+          // Exposure disclosure moved to copy time, where it matters.
           checked: fixedKinds.has("clipboard"),
           disabled: fixedKinds.has("clipboard") ? "already saved" : false,
         },
@@ -337,7 +341,7 @@ async function chooseGenesisDestinationIntent(args: {
 function destinationLabel(destination: RecoveryDestination): string {
   if (destination.kind === "onepassword") return "1Password";
   if (destination.kind === "keychain") return "macOS Keychain";
-  if (destination.kind === "kit-path") return "plaintext file";
+  if (destination.kind === "kit-path") return "plain-text file";
   return "Clipboard";
 }
 
@@ -523,6 +527,10 @@ async function completeGenesisDestinationSet(
 
     if (liveValid.size === context.intent.destinations.length) {
       write(`\n✓ Recovery phrase saved to ${liveValid.size === 1 ? destinationLabel(context.intent.destinations[0]!) : `${liveValid.size} selected places`}\n`);
+      for (const index of [...liveValid].sort((a, b) => a - b)) {
+        const destination = context.intent.destinations[index]!;
+        if (destination.kind === "kit-path") write(`  ${displayPath(destination.path)}\n`);
+      }
       return { intent: context.intent, progress: context.progress, liveValidDestinationIndexes: [...liveValid], continuedAfterPartial };
     }
 
@@ -937,7 +945,7 @@ export async function login(
     if (!res.ok) throw await friendlyHttpError(res, "login --bootstrap");
     const { token, deviceId, accountId } = (await res.json()) as { token: string; deviceId: string; accountId: string };
     await saveCredentials({ token, deviceId, remoteUrl, accountId });
-    console.log(`logged in (bootstrapped) as device ${deviceId}`);
+    console.log("logged in");
     const api = new RboxApi(remoteUrl, token, "", "");
     const genesis = await runGenesisEnrollment(api, { accountId, deviceId }, kitOpts);
     if (genesis === "enrolled") {

@@ -759,3 +759,15 @@ remove the disposable item/vault.
 - Making 1Password a setup requirement.
 - Moving device/MK operational material out of the local keystore.
 - A general TUI framework migration.
+
+> Amended 2026-07-23 (second field-review round, codex copy critique,
+> founder-approved): the genesis screen now presents one clear task —
+> bright "Protect your files" heading, two short sentences plus "Your
+> files on this machine stay unchanged.", menu message "Save it in one or
+> more places:", option names shortened (Plain-text file / Copy to
+> clipboard / 1Password / macOS Keychain), the plain-text option warns
+> "Protect it like a password." instead of embedding the generated
+> filename (the exact path prints after the save succeeds), the clipboard
+> exposure disclosure lives at copy time only, bootstrap login prints just
+> "logged in", and the TUI separates key hints from the last option. The
+> block wordmark stays (founder call).

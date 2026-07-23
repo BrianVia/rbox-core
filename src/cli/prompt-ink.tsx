@@ -237,7 +237,14 @@ function Frame({ message, inline, children, hint, error }: {
       <Text>{stderrStyle.cyan("?")} {message}{inline}</Text>
       {children}
       {error ? <Text>{stderrStyle.red(`  ${error}`)}</Text> : undefined}
-      {hint ? <Text>{stderrStyle.dim(`  ${hint}`)}</Text> : undefined}
+      {hint
+        ? (
+          // Menus get a breath between the last option and the key hints.
+          <Box marginTop={children ? 1 : 0}>
+            <Text>{stderrStyle.dim(`  ${hint}`)}</Text>
+          </Box>
+        )
+        : undefined}
     </Box>
   );
 }
