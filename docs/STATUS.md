@@ -5,7 +5,39 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
-_Last updated: 2026-07-23 (~11:30 UTC — **v1.7.26 "name clashes can't
+_Last updated: 2026-07-23 (~18:30 UTC — **v1.8.0 "setup feels brand new"
+RELEASED + FLEET-LIVE — DESIGN 185 (TUI framework) COMPLETE**): tag at
+9b7744ef, release run green INCLUDING the new compiled-TUI smoke gates'
+first real release (all 3 targets), api.rbox.to/version = 1.8.0. Fleet:
+Mac 1.8.0 (healthy; litter noise again; NOTE Mac now shows 2 git repos
+needing attention — savvy-core deferral + one new, founder's call), FM
+1.8.0 pull-only witness-verified, desktop binary 1.8.0. **The 410 arc**:
+two-reviewer wave (Fable + opus) found 2 blockers (stdin-mutex crash in
+browser-login genesis; truncated action SHAs incl. release.yml = every
+future release dead); the compiled gates then caught 3 REAL input bugs on
+their first executions (pty keystroke coalescing eating Enter/Ctrl-C —
+fixed with a stdin-wrapper key splitter; pre-attach Ctrl-C signal death —
+now synchronous SIGINT exit 130; single-key confirm leaking Enter into
+the next prompt — Inquirer parity restored). GH Linux runners misreport
+Ctrl-C death statuses: ONLY the numeric status comparison is advisory
+there (RBOX_TUI_SMOKE_STATUS_ADVISORY); budget gates on median. Then
+FOUR founder field-review UX rounds via the new `bun run demo` loop
+(scripts/dev-demo.ts — builds current tree, fresh throwaway dev account,
+isolated HOME; HOME override is LOAD-BEARING, credentials resolve via
+$HOME/.rbox): block wordmark banner (once/process at every interactive
+front door), genesis = one clear task ("Protect your files", trimmed
+copy, options renamed, path printed after save, disclosures at action
+time), step headers lose the ── rules, `✓ logged in`, PR #411 workspace
+copy cherry-picked (+flow specs updated; #411 closed). **PENDING: PR
+#409 (Stripe coupon Slack ping fix) touched apps/api — on main + DEV,
+needs main→production promotion to reach prod.** Founder must still add
+the compiled-TUI checks to the branch-protection required list. NEXT:
+design 188 — unified state-aware home screen (logo → Login / save
+recovery / main menu by account state; founder-sketched; suggestion
+heuristics must be dev-shaped, never junk drawers). Standing rule: demo
+props must never model Downloads-style dirs as sync candidates._
+
+_Previous: 2026-07-23 (~11:30 UTC — **v1.7.26 "name clashes can't
 stop sync, your phrase saves anywhere" RELEASED** — designs 186 + 187):
 tag at 67109ea3, release run success, api.rbox.to/version = 1.7.26
 (all three artifacts). Regress 11/11 (via sg docker). **FLEET-LIVE
