@@ -72,6 +72,12 @@ try {
   ]);
   if (scenario === "--cancel") {
     await waitFor("choose beta");
+    // Prove the input pipeline is LIVE before asserting the Ctrl-C contract: a
+    // Ctrl-C racing Ink's raw-mode attach is delivered as a signal, whose death
+    // status some tmux/CI environments report as 0. The pre-attach window is
+    // covered separately by the runtime's SIGINT handler (kill -INT → 130).
+    keys("Down");
+    await waitFor("❯ Beta");
     keys("C-c");
     await waitForExit(130);
     process.stdout.write("tui-compiled-smoke cancel ok\n");
