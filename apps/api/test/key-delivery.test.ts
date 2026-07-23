@@ -126,6 +126,7 @@ async function seedQueued(
     approvalFactorVerifiedAt: now,
     accountEpoch: 0,
     now,
+    deviceCodeExpiresAt: expiresAt,
   });
   expect(queued.ok).toBe(true);
   return { deviceCode, requestId, userCode, proposedDeviceId, publicKeys, expiresAt };
@@ -377,6 +378,7 @@ describe("design 189 key-delivery state machine", () => {
       approvalFactorVerifiedAt: Date.now(),
       accountEpoch: 0,
       now: Date.now(),
+      deviceCodeExpiresAt: Date.now() + 600_000,
     };
     const duplicate = await queueKeyDelivery(env, duplicateInput);
     expect(duplicate).toEqual({ ok: false, reason: "duplicate" });
@@ -414,12 +416,54 @@ describe("design 189 key-delivery state machine", () => {
       approvalFactorVerifiedAt: Date.now(),
       accountEpoch: 0,
       now: Date.now(),
+      deviceCodeExpiresAt: Date.now() + 600_000,
     };
     expect(await queueKeyDelivery(env, sixthInput)).toEqual({ ok: false, reason: "cap" });
     await env.rbox_dev_db.prepare(
       "UPDATE key_delivery SET state='delivered' WHERE request_id=?",
     ).bind(duplicateRequest).run();
     expect((await queueKeyDelivery(env, sixthInput)).ok).toBe(true);
+  });
+
+  test("delivery expiry is clamped to the device-code TTL when queued after login start", async () => {
+    // Regression (rig web-pairing, 2026-07-23): device-code expiry is anchored at
+    // login-start, delivery TTL at queue-time. With equal 10min TTLs, an unclamped
+    // `now + TTL` always lands *after* the device-code expiry, so the CLI rejects
+    // the delivery ("outside the device-code TTL") and 189 enroll never completes.
+    // The prior tests all queued at Δ=0 (now == device-code start), landing exactly
+    // on the boundary — the advancing-clock blind spot. This asserts Δ>0 is clamped.
+    const account = await bootstrap("kd-clamp");
+    await seedEpoch(account.accountId, 0);
+    const start = Date.now();
+    const deviceCodeExpiresAt = start + 600_000;
+    const code = (await sha256Hex(`${account.accountId}:clamp`)).slice(0, 64);
+    const request = await requestIdForDeviceCode(code);
+    await env.rbox_dev_db.prepare(
+      `INSERT INTO device_auth
+         (device_code,user_code,status,device_id,created_at,expires_at,enc_pub_key,sig_pub_key,pubkeys_captured_at,request_id)
+       VALUES (?,'CLMP-0001','pending','dev_clmp',?,?,?,?,?,?)`,
+    ).bind(code, start, deviceCodeExpiresAt, keys(51).encPubKey, keys(51).sigPubKey, start, request).run();
+    const queueNow = start + 120_000; // 2min into the 10min window
+    const queued = await queueKeyDelivery(env, {
+      requestId: request,
+      userCode: "CLMP-0001",
+      accountId: account.accountId,
+      userId: account.userId,
+      ...keys(51),
+      fingerprint: b64url(new Uint8Array(32).fill(6)),
+      approvalTokenHash: await sha256Hex("clamp-approval"),
+      approvalFactorVerifiedAt: queueNow,
+      accountEpoch: 0,
+      now: queueNow,
+      deviceCodeExpiresAt,
+    });
+    expect(queued.ok).toBe(true);
+    // Pinned to the device-code expiry, NOT queueNow + 10min (= start + 12min).
+    if (queued.ok) expect(queued.expiresAt).toBe(deviceCodeExpiresAt);
+    const row = await env.rbox_dev_db
+      .prepare("SELECT expires_at FROM key_delivery WHERE request_id=?")
+      .bind(request).first<{ expires_at: number }>();
+    expect(row?.expires_at).toBe(deviceCodeExpiresAt);
   });
 
   describe("design 192 dev-only scriptable approve (approve-dev)", () => {

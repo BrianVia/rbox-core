@@ -39,6 +39,14 @@ export interface QueueDeliveryInput extends DevicePublicKeys {
   approvalFactorVerifiedAt: number;
   accountEpoch: number;
   now: number;
+  /** The device-code's own `expires_at`. The delivery MUST NOT outlive the
+   * device-code login it fulfills (design 189 §7.2: the escrow/delivery shares
+   * the device-code TTL), so its expiry is clamped to this. Both TTLs are 10min
+   * but anchored at different events — device-code at login-start, delivery at
+   * queue-time — so an unclamped `now + TTL` always lands *after* the
+   * device-code expiry and the CLI rejects the delivery ("outside the
+   * device-code TTL"). Clamping aligns them. */
+  deviceCodeExpiresAt: number;
 }
 
 function decodeBase64url(value: string): Uint8Array | null {
@@ -125,7 +133,12 @@ export async function queueKeyDelivery(env: Env, input: QueueDeliveryInput): Pro
   { ok: true; expiresAt: number } | { ok: false; reason: "no_pending_auth" | "cap" | "duplicate" | "epoch_changed" | "disabled" }
 > {
   await expireStaleAccountRequests(env, input.accountId, input.now);
-  const expiresAt = input.now + KEY_DELIVERY_TTL_MS;
+  // Clamp to the device-code expiry: a delivery must never outlive the login
+  // that authorized it (design 189 §7.2). With equal 10min TTLs but a
+  // queue-after-start offset, `now + TTL` is always past `deviceCodeExpiresAt`,
+  // so the clamp aligns the delivery to the device-code window; the CLI's
+  // `deliveryExpiry <= deviceCodeExpiry` invariant then holds.
+  const expiresAt = Math.min(input.now + KEY_DELIVERY_TTL_MS, input.deviceCodeExpiresAt);
   const encHash = await sha256Hex(decodeBase64url(input.encPubKey)!);
   const sigHash = await sha256Hex(decodeBase64url(input.sigPubKey)!);
   const db = dirDb(env);

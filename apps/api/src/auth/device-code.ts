@@ -303,12 +303,12 @@ export async function queueApprovedKeyDelivery(
   const now = Date.now();
   const pending = await dirDb(env)
     .prepare(
-      `SELECT request_id,enc_pub_key,sig_pub_key
+      `SELECT request_id,enc_pub_key,sig_pub_key,expires_at
        FROM device_auth
        WHERE user_code=? AND status='pending' AND expires_at>?`,
     )
     .bind(userCode, now)
-    .first<{ request_id: string | null; enc_pub_key: string | null; sig_pub_key: string | null }>();
+    .first<{ request_id: string | null; enc_pub_key: string | null; sig_pub_key: string | null; expires_at: number }>();
   if (!pending) return json({ error: "no_pending_auth" }, 404);
   if (!pending.request_id || !pending.enc_pub_key || !pending.sig_pub_key) {
     return json({ error: "key_delivery_unavailable" }, 409);
@@ -334,6 +334,7 @@ export async function queueApprovedKeyDelivery(
     approvalFactorVerifiedAt: input.approvalFactorVerifiedAt,
     accountEpoch,
     now,
+    deviceCodeExpiresAt: pending.expires_at,
   });
   if (!queued.ok) {
     if (queued.reason === "disabled") {

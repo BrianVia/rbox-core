@@ -31,7 +31,10 @@ import { finalizeReport } from "./types.js";
 /** How long to wait for `rbox login` to print its approval URL. */
 const APPROVAL_URL_TIMEOUT_MS = 30_000;
 /** How long to wait, after approval, for the daemon to fulfill + B to enroll via 189. */
-const ENROLL_TIMEOUT_MS = 150_000;
+// Observed ~11s live against dev (approve→DO-nudge→daemon wrap+publish→B poll+
+// enroll). 90s is a generous margin for daemon nudge/poll cadence variance and
+// slower CI, while still failing fast instead of the prior 150s hang.
+const ENROLL_TIMEOUT_MS = 90_000;
 /** How long to wait for A's file to land on B after B pulls. */
 const CONVERGE_TIMEOUT_MS = 60_000;
 
