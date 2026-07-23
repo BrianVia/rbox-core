@@ -1,6 +1,6 @@
 import { describe, expect, test, vi } from "vitest";
 import { WorkspaceSync } from "../src/workspace-sync.js";
-import { acceptConnection, broadcast } from "../src/ws-fanout.js";
+import { acceptConnection, broadcast, broadcastKeyDelivery } from "../src/ws-fanout.js";
 
 const sha = (ch: string) => ch.repeat(64);
 const now = Date.parse("2026-07-12T12:00:00Z");
@@ -124,6 +124,24 @@ describe("websocket session cap", () => {
     broadcast(fakeCtx([ws]), "committed", { maxSessionMs: 0, now });
     expect(ws.send).toHaveBeenCalledWith("committed");
     expect(ws.close).not.toHaveBeenCalled();
+  });
+
+  test("key-delivery nudge emits only the fixed opaque request frame", async () => {
+    const ws = socket(now);
+    const requestId = sha("d");
+    expect(broadcastKeyDelivery(fakeCtx([ws]), requestId, { now })).toBe(true);
+    expect(ws.send).toHaveBeenCalledWith(JSON.stringify({ type: "key-delivery", requestId }));
+    expect(broadcastKeyDelivery(fakeCtx([ws]), "not-an-id", { now })).toBe(false);
+
+    const throughDo = socket(now);
+    const durable = new WorkspaceSync(fakeCtx([throughDo]), { RBOX_WS_MAX_SESSION_MS: "0" } as never);
+    const response = await durable.fetch(new Request("https://do/key-delivery-nudge", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ requestId }),
+    }));
+    expect(response.status).toBe(200);
+    expect(throughDo.send).toHaveBeenCalledWith(JSON.stringify({ type: "key-delivery", requestId }));
   });
 
   test("commit broadcast honors configured cap and defaults off when unset", async () => {

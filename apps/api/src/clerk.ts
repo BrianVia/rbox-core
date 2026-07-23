@@ -55,6 +55,9 @@ async function getJwks(env: Env, force = false): Promise<JsonWebKey[]> {
 
 export interface ClerkClaims {
   sub: string;
+  exp: number;
+  iat?: number;
+  fva?: [number, number];
 }
 
 /** Verify a Clerk session JWT. Returns the claims on success, else null. */
@@ -65,7 +68,15 @@ export async function verifyClerkJWT(env: Env, token: string, nowS: number): Pro
   const [h, p, sig] = parts as [string, string, string];
 
   let header: { alg?: string; kid?: string; typ?: string };
-  let payload: { iss?: string; sub?: unknown; exp?: unknown; nbf?: unknown; azp?: unknown };
+  let payload: {
+    iss?: string;
+    sub?: unknown;
+    exp?: unknown;
+    nbf?: unknown;
+    azp?: unknown;
+    iat?: unknown;
+    fva?: unknown;
+  };
   try {
     header = JSON.parse(b64urlToStr(h));
     payload = JSON.parse(b64urlToStr(p));
@@ -104,7 +115,41 @@ export async function verifyClerkJWT(env: Env, token: string, nowS: number): Pro
   } catch {
     return null; // malformed key/signature → reject (never 500)
   }
-  return { sub: payload.sub };
+  const iat = typeof payload.iat === "number" && Number.isSafeInteger(payload.iat)
+    ? payload.iat
+    : undefined;
+  const fva = Array.isArray(payload.fva)
+    && payload.fva.length === 2
+    && payload.fva.every((age) => typeof age === "number" && Number.isSafeInteger(age))
+    ? payload.fva as [number, number]
+    : undefined;
+  return { sub: payload.sub, exp: payload.exp, ...(iat === undefined ? {} : { iat }), ...(fva === undefined ? {} : { fva }) };
+}
+
+/** Server-side Clerk `strict` reverification check for key delivery.
+ *
+ * `fva` is signed factor age in minutes at JWT issue time. A missing second
+ * factor is encoded as -1; Clerk's strict policy gracefully falls back to the
+ * first factor in that case. We also account for time elapsed since token issue,
+ * so a token minted near the 10-minute edge cannot gain another full window. */
+export async function verifyFreshClerkStepUp(
+  env: Env,
+  token: string,
+  nowMs: number,
+  maxAgeMinutes = 10,
+): Promise<{ sub: string; factorVerifiedAt: number; tokenValidUntil: number } | null> {
+  const claims = await verifyClerkJWT(env, token, Math.floor(nowMs / 1000));
+  if (!claims?.iat || !claims.fva) return null;
+  const issuedAt = claims.iat * 1000;
+  if (issuedAt > nowMs + LEEWAY_S * 1000) return null;
+  const [firstAge, secondAge] = claims.fva;
+  if (firstAge < 0 || firstAge > maxAgeMinutes) return null;
+  if (secondAge < -1 || secondAge > maxAgeMinutes) return null;
+  const requiredAge = secondAge === -1 ? firstAge : Math.max(firstAge, secondAge);
+  const factorVerifiedAt = issuedAt - requiredAge * 60_000;
+  if (factorVerifiedAt > nowMs + LEEWAY_S * 1000) return null;
+  if (nowMs - factorVerifiedAt > maxAgeMinutes * 60_000) return null;
+  return { sub: claims.sub, factorVerifiedAt, tokenValidUntil: (claims.exp + LEEWAY_S) * 1000 };
 }
 
 function randomId(prefix: string, bytes: number): string {

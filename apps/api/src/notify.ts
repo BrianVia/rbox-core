@@ -42,6 +42,8 @@ export interface OutboxFields {
   geo: string | null;
   event: "pair" | "device_code";
   createdAt: number;
+  keysGranted?: boolean;
+  keyFingerprint?: string | null;
 }
 
 /** The outbox INSERT, prepared (not run) so the caller can batch it ATOMICALLY with
@@ -57,11 +59,27 @@ export function prepareOutboxInsert(env: Env, o: OutboxFields): D1PreparedStatem
   // matches the device guard.
   return dbFor(env, o.accountId)
     .prepare(
-      `INSERT OR IGNORE INTO device_notifications (token_hash, device_id, account_id, minted_user_id, label, ip, geo, event, created_at)
-       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+      `INSERT OR IGNORE INTO device_notifications
+         (token_hash,device_id,account_id,minted_user_id,label,ip,geo,event,created_at,
+          keys_granted,key_fingerprint)
+       SELECT ?,?,?,?,?,?,?,?,?,?,?
        WHERE EXISTS (SELECT 1 FROM accounts WHERE id = ? AND deleted_at IS NULL) OR ? = 'default'`,
     )
-    .bind(o.tokenHash, o.deviceId, o.accountId, o.mintedUserId, o.label, o.ip, o.geo, o.event, o.createdAt, o.accountId, o.accountId);
+    .bind(
+      o.tokenHash,
+      o.deviceId,
+      o.accountId,
+      o.mintedUserId,
+      o.label,
+      o.ip,
+      o.geo,
+      o.event,
+      o.createdAt,
+      o.keysGranted ? 1 : 0,
+      o.keyFingerprint ?? null,
+      o.accountId,
+      o.accountId,
+    );
 }
 
 /** Best-effort enqueue AFTER the batch commits. Never throws into device creation —
@@ -99,6 +117,8 @@ interface OutboxRow {
   event: string;
   created_at: number;
   resolved_at: number | null;
+  keys_granted: number;
+  key_fingerprint: string | null;
 }
 
 interface DeliveryRow {
@@ -121,7 +141,7 @@ export async function processNotification(env: Env, tokenHash: string, now: numb
   // owning account is unknown until this row is read. Account-less at N=1 (one shard); a
   // sharded world needs the account/shard on the queue message or a token_hash→shard index.
   const row = await dbFor(env, "")
-    .prepare("SELECT token_hash, device_id, account_id, label, ip, geo, event, created_at, resolved_at FROM device_notifications WHERE token_hash = ?")
+    .prepare("SELECT token_hash,device_id,account_id,label,ip,geo,event,created_at,resolved_at,keys_granted,key_fingerprint FROM device_notifications WHERE token_hash = ?")
     .bind(tokenHash)
     .first<OutboxRow>();
   if (!row) return { found: false, sent: 0, skipped: 0, failed: 0 };
@@ -219,7 +239,17 @@ async function deliverOne(env: Env, row: OutboxRow, d: DeliveryRow, now: number,
     return settle(env, row, d.recipient_clerk_id, "failed", null);
   }
 
-  const content = renderEmail({ label: row.label, ip: row.ip, geo: row.geo, event: row.event, createdAt: row.created_at, deviceId: row.device_id, appUrl: env.RBOX_APP_URL });
+  const content = renderEmail({
+    label: row.label,
+    ip: row.ip,
+    geo: row.geo,
+    event: row.event,
+    createdAt: row.created_at,
+    deviceId: row.device_id,
+    keysGranted: row.keys_granted === 1,
+    keyFingerprint: row.key_fingerprint,
+    appUrl: env.RBOX_APP_URL,
+  });
   try {
     const res = await env.EMAIL.send({
       to: email.address,
@@ -356,6 +386,8 @@ export interface RenderInput {
   event: string;
   createdAt: number;
   deviceId: string;
+  keysGranted?: boolean;
+  keyFingerprint?: string | null;
   appUrl?: string;
 }
 
@@ -374,6 +406,15 @@ export function renderEmail(o: RenderInput): RenderedEmail {
   const when = new Date(o.createdAt).toISOString().replace("T", " ").replace(/\.\d{3}Z$/, " UTC");
   const location = o.ip && o.geo ? `${o.ip} · ${o.geo}` : o.ip || o.geo || "location unavailable";
   const how = o.event === "pair" ? "paired from another of your devices" : "approved via a device code";
+  const keyLines = o.keysGranted
+    ? [
+      "Keys:   Encryption-key access was granted",
+      ...(o.keyFingerprint ? [`Key fingerprint: ${o.keyFingerprint}`] : []),
+      "",
+      "Revoke blocks new access; a machine that already received your key keeps what it has, and any in-flight download grant expires within ~5 minutes.",
+      "",
+    ]
+    : [];
   const base = (o.appUrl || DEFAULT_APP_URL).replace(/\/$/, "");
   const revoke = `${base}/devices?highlight=${encodeURIComponent(o.deviceId)}`;
   const settings = `${base}/settings/notifications`;
@@ -387,6 +428,7 @@ export function renderEmail(o: RenderInput): RenderedEmail {
     `Where:  ${location}`,
     `How:    ${how}`,
     "",
+    ...keyLines,
     "If this wasn't you, sign this device out now:",
     revoke,
     "",
@@ -402,7 +444,18 @@ export function renderEmail(o: RenderInput): RenderedEmail {
     `<tr><td style="color:#64748b;padding-right:12px">When</td><td>${escapeHtml(when)} <span style="color:#94a3b8">(approximate)</span></td></tr>`,
     `<tr><td style="color:#64748b;padding-right:12px">Where</td><td>${escapeHtml(location)}</td></tr>`,
     `<tr><td style="color:#64748b;padding-right:12px">How</td><td>${escapeHtml(how)}</td></tr>`,
+    ...(o.keysGranted
+      ? [
+        `<tr><td style="color:#64748b;padding-right:12px">Keys</td><td>Encryption-key access was granted</td></tr>`,
+        ...(o.keyFingerprint
+          ? [`<tr><td style="color:#64748b;padding-right:12px">Key fingerprint</td><td><code>${escapeHtml(o.keyFingerprint)}</code></td></tr>`]
+          : []),
+      ]
+      : []),
     `</table>`,
+    ...(o.keysGranted
+      ? [`<p style="font-size:13px;color:#475569">Revoke blocks new access; a machine that already received your key keeps what it has, and any in-flight download grant expires within ~5 minutes.</p>`]
+      : []),
     `<p style="font-size:14px;margin:20px 0 8px">If this wasn't you, sign this device out now:</p>`,
     `<p><a href="${escapeHtml(revoke)}" style="display:inline-block;background:#dc2626;color:#fff;text-decoration:none;padding:10px 16px;border-radius:8px;font-size:14px">This wasn't me — review devices</a></p>`,
     `<p style="font-size:12px;color:#94a3b8;margin-top:24px">You're receiving this because new-device alerts are on for your account. <a href="${escapeHtml(settings)}" style="color:#64748b">Manage alerts</a>.</p>`,
@@ -439,12 +492,12 @@ export async function sweepNotifications(env: Env, now: number = Date.now()): Pr
     reEnqueued++;
   }
 
-  // PII purge: null label/ip/geo once no non-terminal delivery remains for the event,
+  // Projection purge: null label/ip/geo/fingerprint once no non-terminal delivery remains for the event,
   // or past the TTL. Keep only non-PII audit fields (token_hash, device_id, ids, ts).
   const purge = await dbFor(env, "") // §32 FLAG: global PII purge across all accounts (see above).
     .prepare(
-      `UPDATE device_notifications SET label = NULL, ip = NULL, geo = NULL
-       WHERE (label IS NOT NULL OR ip IS NOT NULL OR geo IS NOT NULL)
+      `UPDATE device_notifications SET label=NULL,ip=NULL,geo=NULL,key_fingerprint=NULL
+       WHERE (label IS NOT NULL OR ip IS NOT NULL OR geo IS NOT NULL OR key_fingerprint IS NOT NULL)
          AND (created_at < ?
               OR (resolved_at IS NOT NULL AND NOT EXISTS (
                     SELECT 1 FROM notification_deliveries d

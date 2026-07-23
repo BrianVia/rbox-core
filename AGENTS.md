@@ -43,7 +43,7 @@ production deploy during that promotion.
 
 **Support diagnostics:** `rbox doctor` / opt-in report upload (`POST /v1/diagnostics`), incl. how to retrieve reports from D1+R2 — see `docs/diagnostics.md`.
 
-**Rate-limit namespace_id registry (design 64 §3.1):** the Workers Rate Limiting bindings in `apps/api/wrangler.jsonc` use client-chosen `namespace_id`s — `2001` RL_DEVICE_START, `2002` RL_DEVICE_POLL, `2003` RL_RELEASE, `2004` RL_LINK_PAIR, `2005` RL_DEVICE_POLL_IP, `2006` RL_TELEMETRY (same ids in dev + prod; the numbers differ per env). Nothing else in the repo reveals these — record any new limiter's id here. A future zone-level WAF rate-limiting rule (§3.4, once `rbox.to` is on Cloudflare) lives in the dash, not the repo; record it here if added.
+**Rate-limit namespace_id registry (design 64 §3.1):** the Workers Rate Limiting bindings in `apps/api/wrangler.jsonc` use client-chosen `namespace_id`s — `2001` RL_DEVICE_START, `2002` RL_DEVICE_POLL, `2003` RL_RELEASE, `2004` RL_LINK_PAIR, `2005` RL_DEVICE_POLL_IP, `2006` RL_TELEMETRY, `2007` RL_KEY_DELIVERY_APPROVE, `2008` RL_KEY_DELIVERY_FETCH, `2009` RL_KEY_DELIVERY_SUBMIT, `2010` RL_KEY_DELIVERY_ACK (same ids in dev + prod; the numbers differ per env). Nothing else in the repo reveals these — record any new limiter's id here. A future zone-level WAF rate-limiting rule (§3.4, once `rbox.to` is on Cloudflare) lives in the dash, not the repo; record it here if added.
 
 <!-- stripe-projects-cli managed:agents-md:start -->
 ## Stripe Projects CLI

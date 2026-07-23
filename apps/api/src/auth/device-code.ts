@@ -1,11 +1,24 @@
 import type { Env } from "../env.js";
-import { cappedJson, exactObject, isWellFormed, json, objectWithKeys, truncateUtf8 } from "../util.js";
+import { cappedJson, ctEqual, exactObject, isWellFormed, json, objectWithKeys, sha256Hex, truncateUtf8, utf8Bytes } from "../util.js";
 import type { Principal } from "../authz.js";
 import { clientGeo, clientIp } from "../notify.js";
 import { dbFor, dirDb } from "../db.js";
 import { DEVICE_ID_BYTES, randomHex, TOKEN_BYTES } from "./shared.js";
-import { AccountGoneError, checkDeviceCap, DeviceLimitError, mintDeviceWithNotification } from "./mint.js";
+import { AccountGoneError, checkDeviceCap, claimDeviceAuthWithEscrow, DeviceLimitError, recoverEscrowedDeviceToken } from "./mint.js";
 import { ipKey, rateLimited } from "../ratelimit.js";
+import {
+  CLERK_STEP_UP_MAX_AGE_MINUTES,
+  currentAccountEpoch,
+  nudgeKeyDelivery,
+  pollKeyDelivery,
+  publicKeyFingerprint,
+  queueKeyDelivery,
+  requestIdForDeviceCode,
+  validateDevicePublicKeys,
+  validFingerprint,
+  type DevicePublicKeys,
+} from "./key-delivery.js";
+import { verifyFreshClerkStepUp } from "../clerk.js";
 
 const AUTH_TTL_MS = 10 * 60 * 1000;
 const POLL_INTERVAL_S = 5;
@@ -13,7 +26,7 @@ const USER_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no ambiguous 0
 const DEVICE_CODE_HEX_RE = /^[0-9a-f]+$/;
 export const DEVICE_START_MAX_BYTES = 8 * 1024;
 export const DEVICE_POLL_MAX_BYTES = 1024;
-export const DEVICE_APPROVE_MAX_BYTES = 1024;
+export const DEVICE_APPROVE_MAX_BYTES = 32 * 1024;
 
 function randomUserCode(): string {
   const b = new Uint8Array(8);
@@ -22,11 +35,21 @@ function randomUserCode(): string {
   return `${c.slice(0, 4)}-${c.slice(4)}`;
 }
 
-export function validateDeviceStartBody(value: unknown): { label?: string } | null {
-  if (!objectWithKeys(value, ["label"])) return null;
-  if (value.label === undefined) return {};
+export function validateDeviceStartBody(value: unknown): ({ label?: string } & Partial<DevicePublicKeys>) | null {
+  if (!objectWithKeys(value, ["label", "encPubKey", "sigPubKey"])) return null;
+  if ((value.encPubKey === undefined) !== (value.sigPubKey === undefined)) return null;
+  if (value.encPubKey !== undefined && (
+    typeof value.encPubKey !== "string"
+    || typeof value.sigPubKey !== "string"
+    || utf8Bytes(value.encPubKey) > 8192
+    || utf8Bytes(value.sigPubKey) > 256
+  )) return null;
+  const keys = value.encPubKey === undefined
+    ? {}
+    : { encPubKey: value.encPubKey as string, sigPubKey: value.sigPubKey as string };
+  if (value.label === undefined) return keys;
   if (typeof value.label !== "string" || !isWellFormed(value.label)) return null;
-  return { label: truncateUtf8(value.label, 600) };
+  return { label: truncateUtf8(value.label, 600), ...keys };
 }
 
 export function validateDevicePollBody(value: unknown): { deviceCode: string } | null {
@@ -38,12 +61,37 @@ export function validateDevicePollBody(value: unknown): { deviceCode: string } |
     : null;
 }
 
-export function validateDeviceApproveBody(value: unknown): { userCode: string } | null {
-  return exactObject(value, ["userCode"])
-    && typeof value.userCode === "string"
-    && /^[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$/i.test(value.userCode)
-    ? { userCode: value.userCode }
-    : null;
+export type DeviceApproveBody =
+  | { userCode: string; keyConsent?: false }
+  | { userCode: string; keyConsent: true; pubkeyFingerprint: string; clerkToken: string };
+
+export function validateDeviceApproveBody(value: unknown): DeviceApproveBody | null {
+  const validCode = (candidate: unknown): candidate is string =>
+    typeof candidate === "string" && /^[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$/i.test(candidate);
+  if (exactObject(value, ["userCode"]) && validCode(value.userCode)) return { userCode: value.userCode };
+  if (
+    exactObject(value, ["userCode", "keyConsent"])
+    && validCode(value.userCode)
+    && value.keyConsent === false
+  ) return { userCode: value.userCode, keyConsent: false };
+  if (
+    exactObject(value, ["userCode", "keyConsent", "pubkeyFingerprint", "clerkToken"])
+    && validCode(value.userCode)
+    && value.keyConsent === true
+    && typeof value.pubkeyFingerprint === "string"
+    && validFingerprint(value.pubkeyFingerprint)
+    && typeof value.clerkToken === "string"
+    && utf8Bytes(value.clerkToken) <= 16_384
+    && /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value.clerkToken)
+  ) {
+    return {
+      userCode: value.userCode,
+      keyConsent: true,
+      pubkeyFingerprint: value.pubkeyFingerprint,
+      clerkToken: value.clerkToken,
+    };
+  }
+  return null;
 }
 
 // POST /v1/auth/device/start { label } -> { deviceCode, userCode, interval, expiresIn }
@@ -54,7 +102,14 @@ export async function startDeviceAuth(req: Request, env: Env): Promise<Response>
   const parsed = await cappedJson(req, { maxBytes: DEVICE_START_MAX_BYTES }, validateDeviceStartBody);
   if (!parsed.ok) return parsed.response;
   const body = parsed.value;
+  if (
+    body.encPubKey !== undefined
+    && !await validateDevicePublicKeys({ encPubKey: body.encPubKey, sigPubKey: body.sigPubKey! })
+  ) {
+    return json({ error: "invalid_device_public_keys" }, 400);
+  }
   const deviceCode = randomHex(TOKEN_BYTES);
+  const requestId = await requestIdForDeviceCode(deviceCode);
   const deviceId = `dev_${randomHex(DEVICE_ID_BYTES)}`; // proposed id; mint is the real uniqueness gate
   const now = Date.now();
   // Collision-retry the human user_code among active auths.
@@ -68,14 +123,34 @@ export async function startDeviceAuth(req: Request, env: Env): Promise<Response>
     userCode = randomUserCode();
   }
   await dirDb(env)
-    .prepare("INSERT INTO device_auth (device_code, user_code, status, device_id, label, created_at, expires_at) VALUES (?, ?, 'pending', ?, ?, ?, ?)")
-    .bind(deviceCode, userCode, deviceId, body.label ?? null, now, now + AUTH_TTL_MS)
+    .prepare(
+      `INSERT INTO device_auth
+         (device_code,user_code,status,device_id,label,created_at,expires_at,
+          enc_pub_key,sig_pub_key,pubkeys_captured_at,request_id)
+       VALUES (?,?,'pending',?,?,?,?,?,?,?,?)`,
+    )
+    .bind(
+      deviceCode,
+      userCode,
+      deviceId,
+      body.label ?? null,
+      now,
+      now + AUTH_TTL_MS,
+      body.encPubKey ?? null,
+      body.sigPubKey ?? null,
+      body.encPubKey === undefined ? null : now,
+      requestId,
+    )
     .run();
   return json({ deviceCode, userCode, interval: POLL_INTERVAL_S, expiresIn: Math.floor(AUTH_TTL_MS / 1000) });
 }
 
 // POST /v1/auth/device/poll { deviceCode } -> { status, token? }
-export async function pollDeviceAuth(req: Request, env: Env): Promise<Response> {
+export async function pollDeviceAuth(
+  req: Request,
+  env: Env,
+  ctx?: Pick<ExecutionContext, "waitUntil">,
+): Promise<Response> {
   const parsed = await cappedJson(req, { maxBytes: DEVICE_POLL_MAX_BYTES }, validateDevicePollBody);
   if (!parsed.ok) return parsed.response;
   const body = parsed.value;
@@ -86,13 +161,24 @@ export async function pollDeviceAuth(req: Request, env: Env): Promise<Response> 
   const limited = await rateLimited(env.RL_DEVICE_POLL, `dp:${body.deviceCode}`);
   if (limited) return limited;
   const row = await dirDb(env)
-    .prepare("SELECT user_code, status, device_id, label, expires_at, account_id, user_id FROM device_auth WHERE device_code = ?")
+    .prepare("SELECT user_code,status,device_id,label,expires_at,account_id,user_id,request_id FROM device_auth WHERE device_code = ?")
     .bind(body.deviceCode)
-    .first<{ user_code: string; status: string; device_id: string; label: string | null; expires_at: number; account_id: string | null; user_id: string | null }>();
+    .first<{ user_code: string; status: string; device_id: string; label: string | null; expires_at: number; account_id: string | null; user_id: string | null; request_id: string | null }>();
   if (!row) return json({ status: "not_found" }, 404);
-  if (Date.now() > row.expires_at && row.status === "pending") return json({ status: "expired" });
-  if (row.status === "pending") return json({ status: "pending", interval: POLL_INTERVAL_S });
-  if (row.status === "claimed") return json({ status: "claimed" }); // token already delivered, never again
+  const requestId = row.request_id ?? await requestIdForDeviceCode(body.deviceCode);
+  const keyDelivery = await pollKeyDelivery(env, requestId);
+  if (Date.now() > row.expires_at && row.status !== "claimed") return json({ status: "expired", keyDelivery });
+  if (row.status === "pending") return json({ status: "pending", interval: POLL_INTERVAL_S, keyDelivery });
+  if (row.status === "claimed") {
+    const escrow = await recoverEscrowedDeviceToken(env, requestId);
+    return json({
+      status: "claimed",
+      ...(escrow
+        ? { token: escrow.token, deviceId: escrow.deviceId, accountId: escrow.accountId }
+        : {}),
+      keyDelivery,
+    });
+  }
   if (row.status === "approved") {
     // design 37: never mint a device into a tombstoned/erased account. The approver's account
     // ('default' legacy excepted) must still exist and be live. Checked before the claim so a
@@ -107,28 +193,18 @@ export async function pollDeviceAuth(req: Request, env: Env): Promise<Response> 
     // the code approved for retry after a device is revoked.
     const cap = await checkDeviceCap(env, acctId);
     if (!cap.ok) return json({ error: "device_limit_reached", cap: cap.cap, plan: cap.plan }, 409);
-    // One-time claim: only the poll that wins the conditional UPDATE mints+returns.
-    const claim = await dirDb(env)
-      .prepare("UPDATE device_auth SET status = 'claimed' WHERE device_code = ? AND status = 'approved'")
-      .bind(body.deviceCode)
-      .run();
-    if (claim.meta.changes !== 1) return json({ status: "claimed" }); // lost the race
-    // Mint into the APPROVER's account/user (device-to-device join). Seed the
-    // proposed id from device_auth as the first candidate, but fall back to a
-    // fresh wide id if it collides (mint is the real uniqueness gate). The device +
-    // notification outbox commit atomically; then enqueue (design 16 §1.1: notify on a
-    // durable mint via device-code claim).
-    let firstCandidate = true;
-    let minted: { token: string; deviceId: string };
+    let minted: Awaited<ReturnType<typeof claimDeviceAuthWithEscrow>>;
     try {
-      minted = await mintDeviceWithNotification(env, {
+      minted = await claimDeviceAuthWithEscrow(env, {
+        deviceCode: body.deviceCode,
+        requestId,
         accountId: row.account_id ?? "default",
         userId: row.user_id ?? "",
         label: row.label,
-        event: "device_code",
         ip: clientIp(req),
         geo: clientGeo(req),
-        genDeviceId: () => (firstCandidate ? ((firstCandidate = false), row.device_id) : `dev_${randomHex(DEVICE_ID_BYTES)}`),
+        proposedDeviceId: row.device_id,
+        expiresAt: row.expires_at,
       });
     } catch (e) {
       // design 37: account tombstoned between the liveness read and the device insert → the
@@ -139,19 +215,107 @@ export async function pollDeviceAuth(req: Request, env: Env): Promise<Response> 
       if (e instanceof DeviceLimitError) return json({ error: "device_limit_reached", cap: e.cap, plan: e.plan }, 409);
       throw e;
     }
-    return json({ status: "approved", token: minted.token, deviceId: minted.deviceId, accountId: row.account_id });
+    if (!minted) return json({ status: "claimed", keyDelivery: await pollKeyDelivery(env, requestId) });
+    if (ctx && keyDelivery) nudgeKeyDelivery(ctx, env, minted.accountId, requestId);
+    return json({
+      status: "approved",
+      token: minted.token,
+      deviceId: minted.deviceId,
+      accountId: row.account_id,
+      keyDelivery: await pollKeyDelivery(env, requestId),
+    });
   }
-  return json({ status: row.status });
+  return json({ status: row.status, keyDelivery });
 }
 
 // POST /v1/auth/device/approve { userCode }  (authed) — the new device joins the approver's account.
-export async function approveDeviceAuth(req: Request, env: Env, approver: Principal): Promise<Response> {
+export async function approveDeviceAuth(
+  req: Request,
+  env: Env,
+  approver: Principal,
+  ctx?: Pick<ExecutionContext, "waitUntil">,
+): Promise<Response> {
+  const limited = await rateLimited(env.RL_KEY_DELIVERY_APPROVE, `kda:${approver.userId ?? approver.deviceId}`);
+  if (limited) return limited;
   const parsed = await cappedJson(req, { maxBytes: DEVICE_APPROVE_MAX_BYTES }, validateDeviceApproveBody);
   if (!parsed.ok) return parsed.response;
   const body = parsed.value;
+  const userCode = body.userCode.toUpperCase();
+  if (body.keyConsent === true) {
+    if (approver.kind !== "web") return json({ error: "fresh_step_up_required" }, 403);
+    const now = Date.now();
+    const stepUp = await verifyFreshClerkStepUp(env, body.clerkToken, now);
+    if (!stepUp) return json({ error: "fresh_step_up_required" }, 403);
+    const mapping = await dirDb(env)
+      .prepare("SELECT account_id,user_id FROM clerk_users WHERE clerk_user_id=?")
+      .bind(stepUp.sub)
+      .first<{ account_id: string; user_id: string }>();
+    if (
+      !mapping
+      || mapping.account_id !== approver.accountId
+      || mapping.user_id !== approver.userId
+    ) return json({ error: "step_up_principal_mismatch" }, 403);
+    const pending = await dirDb(env)
+      .prepare(
+        `SELECT request_id,enc_pub_key,sig_pub_key
+         FROM device_auth
+         WHERE user_code=? AND status='pending' AND expires_at>?`,
+      )
+      .bind(userCode, now)
+      .first<{ request_id: string | null; enc_pub_key: string | null; sig_pub_key: string | null }>();
+    if (!pending) return json({ error: "no_pending_auth" }, 404);
+    if (!pending.request_id || !pending.enc_pub_key || !pending.sig_pub_key) {
+      return json({ error: "key_delivery_unavailable" }, 409);
+    }
+    const expected = await publicKeyFingerprint({
+      encPubKey: pending.enc_pub_key,
+      sigPubKey: pending.sig_pub_key,
+    });
+    if (!ctEqual(expected, body.pubkeyFingerprint)) {
+      return json({ error: "pubkey_binding_mismatch" }, 409);
+    }
+    const accountEpoch = await currentAccountEpoch(env, approver.accountId);
+    if (accountEpoch === null) return json({ error: "key_delivery_unavailable" }, 409);
+    const queueNow = Date.now();
+    if (
+      stepUp.factorVerifiedAt <= queueNow - CLERK_STEP_UP_MAX_AGE_MINUTES * 60_000
+      || queueNow > stepUp.tokenValidUntil
+    ) return json({ error: "fresh_step_up_required" }, 403);
+    const queued = await queueKeyDelivery(env, {
+      requestId: pending.request_id,
+      userCode,
+      accountId: approver.accountId,
+      userId: approver.userId,
+      encPubKey: pending.enc_pub_key,
+      sigPubKey: pending.sig_pub_key,
+      fingerprint: expected,
+      approvalTokenHash: await sha256Hex(body.clerkToken),
+      approvalFactorVerifiedAt: stepUp.factorVerifiedAt,
+      accountEpoch,
+      now: queueNow,
+    });
+    if (!queued.ok) {
+      if (queued.reason === "disabled") {
+        const approved = await dirDb(env)
+          .prepare(
+            `UPDATE device_auth SET status='approved',account_id=?,user_id=?
+             WHERE user_code=? AND status='pending' AND expires_at>?`,
+          )
+          .bind(approver.accountId, approver.userId, userCode, now)
+          .run();
+        if (approved.meta.changes !== 1) return json({ error: "no_pending_auth" }, 404);
+        return json({ ok: true, keyDelivery: null, keyDeliveryDisabled: true });
+      }
+      if (queued.reason === "no_pending_auth") return json({ error: "no_pending_auth" }, 404);
+      if (queued.reason === "epoch_changed") return json({ error: "key_delivery_epoch_changed" }, 409);
+      return json({ error: queued.reason === "cap" ? "key_delivery_cap" : "duplicate_key_delivery" }, 409);
+    }
+    if (ctx) nudgeKeyDelivery(ctx, env, approver.accountId, pending.request_id);
+    return json({ ok: true, keyDelivery: { requestId: pending.request_id, status: "pending", expiresAt: queued.expiresAt } });
+  }
   const res = await dirDb(env)
     .prepare("UPDATE device_auth SET status = 'approved', account_id = ?, user_id = ? WHERE user_code = ? AND status = 'pending' AND expires_at > ?")
-    .bind(approver.accountId, approver.userId, body.userCode.toUpperCase(), Date.now())
+    .bind(approver.accountId, approver.userId, userCode, Date.now())
     .run();
   if (res.meta.changes !== 1) return json({ error: "no_pending_auth" }, 404);
   return json({ ok: true });
@@ -167,9 +331,27 @@ export async function lookupDeviceAuth(req: Request, env: Env): Promise<Response
   const userCode = new URL(req.url).searchParams.get("code")?.toUpperCase();
   if (!userCode) return json({ error: "bad_request" }, 400);
   const row = await dirDb(env)
-    .prepare("SELECT label, status, expires_at FROM device_auth WHERE user_code = ?")
+    .prepare("SELECT label,status,expires_at,enc_pub_key,sig_pub_key FROM device_auth WHERE user_code = ?")
     .bind(userCode)
-    .first<{ label: string | null; status: string; expires_at: number }>();
-  if (!row || (Date.now() > row.expires_at && row.status === "pending")) return json({ error: "not_found" }, 404);
-  return json({ label: row.label, status: row.status });
+    .first<{ label: string | null; status: string; expires_at: number; enc_pub_key: string | null; sig_pub_key: string | null }>();
+  if (!row || Date.now() > row.expires_at) return json({ error: "not_found" }, 404);
+  return json({
+    label: row.label,
+    status: row.status,
+    ...(row.enc_pub_key && row.sig_pub_key
+      ? { encPubKeySpki: row.enc_pub_key, sigPubKey: row.sig_pub_key }
+      : {}),
+  });
+}
+
+// Dedicated public echo used by the fragment-bound approval page.
+export async function lookupDevicePubkeys(req: Request, env: Env): Promise<Response> {
+  const response = await lookupDeviceAuth(req, env);
+  if (!response.ok) return response;
+  const body = await response.json() as {
+    encPubKeySpki?: string;
+    sigPubKey?: string;
+  };
+  if (!body.encPubKeySpki || !body.sigPubKey) return json({ error: "not_found" }, 404);
+  return json({ encPubKeySpki: body.encPubKeySpki, sigPubKey: body.sigPubKey });
 }

@@ -42,6 +42,18 @@ export function broadcast(
   }
 }
 
+/** Fixed design-189 notification frame. Old daemons ignore the unknown type;
+ * correctness remains on the authenticated pull endpoint. */
+export function broadcastKeyDelivery(
+  ctx: DurableObjectState,
+  requestId: string,
+  opts: { maxSessionMs?: number; now?: number } = {},
+): boolean {
+  if (!/^[0-9a-f]{64}$/.test(requestId)) return false;
+  broadcast(ctx, JSON.stringify({ type: "key-delivery", requestId }), opts);
+  return true;
+}
+
 /** Design 105 §3.4 fail-closed: attachment hygiene cannot weaken the guarantee
  * that no committed frame is delivered past the configured session cap. */
 function isOverAge(ws: WebSocket, now: number, maxSessionMs: number): boolean {

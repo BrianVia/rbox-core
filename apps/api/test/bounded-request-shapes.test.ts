@@ -22,6 +22,15 @@ import {
 } from "../src/keys.js";
 import { sanitizeWorkspaceName } from "../src/authz.js";
 import { cappedJson, truncateCodePoints, utf8Bytes } from "../src/util.js";
+import {
+  KEY_DELIVERY_ACK_MAX_BYTES,
+  KEY_DELIVERY_FETCH_MAX_BYTES,
+  KEY_DELIVERY_SUBMIT_MAX_BYTES,
+  KEY_DELIVERY_WRAP_MAX_BYTES,
+  validateKeyDeliveryAckBody,
+  validateKeyDeliveryFetchBody,
+  validateKeyDeliverySubmitBody,
+} from "../src/auth/key-delivery.js";
 
 type Validator = (value: unknown) => unknown | null;
 interface RouteCase {
@@ -46,6 +55,9 @@ const routes: RouteCase[] = [
   { route: "POST /v1/auth/device/poll", cap: DEVICE_POLL_MAX_BYTES, valid: { deviceCode: "a".repeat(64) }, invalid: { deviceCode: `${"a".repeat(64)}b` }, validate: validateDevicePollBody },
   { route: "POST /v1/auth/device/bootstrap", cap: DEVICE_BOOTSTRAP_MAX_BYTES, valid: { secret: "é".repeat(2048), label: "ok", accountName: "ok", plan: "pro" }, invalid: { secret: `${"é".repeat(2048)}a` }, validate: validateBootstrapBody },
   { route: "POST /v1/auth/device/approve", cap: DEVICE_APPROVE_MAX_BYTES, valid: { userCode: "ABCD-EFGH" }, invalid: { userCode: "ABCD-EFGH2" }, validate: validateDeviceApproveBody },
+  { route: "POST /v1/auth/key-delivery/fetch", cap: KEY_DELIVERY_FETCH_MAX_BYTES, valid: { requestId: sha, keyReleaseOptIn: true }, invalid: { requestId: `${sha}a`, keyReleaseOptIn: true }, validate: validateKeyDeliveryFetchBody },
+  { route: "POST /v1/auth/key-delivery/submit", cap: KEY_DELIVERY_SUBMIT_MAX_BYTES, valid: { requestId: sha, mkWrapDevice: "a".repeat(KEY_DELIVERY_WRAP_MAX_BYTES), publishedRosterVersion: Number.MAX_SAFE_INTEGER, accountEpoch: Number.MAX_SAFE_INTEGER }, invalid: { requestId: sha, mkWrapDevice: "a".repeat(KEY_DELIVERY_WRAP_MAX_BYTES + 1), publishedRosterVersion: 0, accountEpoch: 0 }, validate: validateKeyDeliverySubmitBody },
+  { route: "POST /v1/auth/key-delivery/ack", cap: KEY_DELIVERY_ACK_MAX_BYTES, valid: { requestId: sha }, invalid: { requestId: `${sha}a` }, validate: validateKeyDeliveryAckBody },
   { route: "POST /v1/auth/pair/create", cap: PAIR_CREATE_MAX_BYTES, valid: { mkWrap: opaqueMax, admissionGrant: opaqueMax, tokenId: "x".repeat(64) }, invalid: { mkWrap: opaqueOver }, validate: validatePairCreateBody },
   { route: "POST /v1/auth/pair/redeem", cap: PAIR_REDEEM_MAX_BYTES, valid: { token: `rbox-pair_${"x".repeat(64)}`, label: "ok" }, invalid: { token: `rbox-pair_${"x".repeat(65)}` }, validate: validatePairRedeemBody },
   { route: "POST /v1/account/link/start", cap: LINK_START_MAX_BYTES, valid: { clerkToken: jwtMax }, invalid: { clerkToken: jwtOver }, validate: validateLinkStartBody },

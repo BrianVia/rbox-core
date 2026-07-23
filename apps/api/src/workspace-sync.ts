@@ -26,7 +26,7 @@ import {
   type CommitBodyView,
   type SignedCommit,
 } from "./commit-envelope.js";
-import { acceptConnection, broadcast as wsBroadcast } from "./ws-fanout.js";
+import { acceptConnection, broadcast as wsBroadcast, broadcastKeyDelivery } from "./ws-fanout.js";
 
 const ROOTS_PAGE_LIMIT = 20_000;
 // A raw gap commit may itself contain a large inline refset. Keep inspection pages
@@ -134,6 +134,23 @@ export class WorkspaceSync {
     // purges without mis-parsing the action segment (the §3 wedge). deleteAll needs no ws/proj.
     if (req.method === "POST" && url.pathname === "/purge") return this.purge();
     if (req.method === "POST" && url.pathname === "/repair") return this.repair(req, url.searchParams.get("ws") ?? "", url.searchParams.get("proj") ?? "");
+    if (req.method === "POST" && url.pathname === "/key-delivery-nudge") {
+      let body: unknown;
+      try {
+        body = await req.json();
+      } catch {
+        return json({ error: "bad_request" }, 400);
+      }
+      const requestId = body && typeof body === "object"
+        ? (body as { requestId?: unknown }).requestId
+        : undefined;
+      if (typeof requestId !== "string" || !broadcastKeyDelivery(
+        this.ctx,
+        requestId,
+        { maxSessionMs: wsMaxSessionMs(this.env) },
+      )) return json({ error: "bad_request" }, 400);
+      return json({ ok: true });
+    }
 
     // Design 142 Phase 0: fixed, slash-safe, STRICTLY READ-ONLY inspection. This is
     // deliberately before ensureBootstrap: a cold/legacy DO must be reported as
