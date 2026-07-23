@@ -5,7 +5,35 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
-_Last updated: 2026-07-23 (~03:45 UTC — **DESIGN 186 COMPLETE ON MAIN —
+_Last updated: 2026-07-23 (~11:00 UTC — **DESIGN 187 COMPLETE ON MAIN —
+multi-select recovery phrase backups**): PR #408 merged (squash ebb58578):
+first-run genesis now offers a checkbox flow saving the recovery phrase to
+any combination of 1Password (new shell-free bounded CLI adapter,
+stdin-only phrase transport, exact readback verify), macOS Keychain,
+plaintext file, and clipboard — with durable destination plans,
+append-only progress events, witnessed plan replacement, kit.json v3
+(1Password locators recorded-not-verified), and non-technical lead-in
+copy. Addresses the 2026-07-22 onboarding-feedback audit. **Review
+lesson (BIG one for the playbook)**: six GPT design rounds ended PASS,
+but the post-implementation two-reviewer wave (Fable + opus) found the
+flagship 1Password path 100% broken on a real clock — every
+destination-set test pinned `now: () => 1_900_000_000_000` (year 2030),
+which clamped `eventAt()` to a constant and neutralized the
+timestamp-equality invariant it was supposed to exercise. Opus reproduced
+by re-running the PR's own test on `Date.now()`. Fix round a0ecfc7f
+(opus): removed the manufactured `completedAt === at` parser equality
+(founder call — no integrity value, only a manufactured failure mode),
+idempotent 1Password artifact re-record (crash-window resume), retry
+dead-end copy steered to "Change incomplete choices", clipboard cleared
+on declined confirm, real invalidation reasons, orphan-item warning,
+real-clock regression tests now permanent. REVIEW-187 round 7 records
+it. **Standing rule from the lesson: injected test clocks must ADVANCE —
+a pinned far-future `now` can silently disable timestamp invariants.**
+CI 13/13 green pre-merge. No `apps/api` changes. NOT yet in a CLI
+release — 186 + 187 both ride the next release train (fleet on
+v1.7.25). rbox is NOT a Windows target (founder, 2026-07-23)._
+
+_Previous: 2026-07-23 (~03:45 UTC — **DESIGN 186 COMPLETE ON MAIN —
 case-only collisions no longer block sync**): PR #407 merged (squash
 1c461388): case-fold collision groups are excluded from publication as a
 complete group (never a single member — the data-loss case), prior-synced
