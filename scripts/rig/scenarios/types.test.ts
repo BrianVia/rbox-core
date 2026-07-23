@@ -28,16 +28,20 @@ test("renderReportTable includes verdict, each step, and each assertion", () => 
 });
 
 test("parsePairToken extracts the token line from real pairCreate output", () => {
-  // Mirrors auth-cmd.ts pairCreate(): header, blank, indented `<redeemToken>.<tokenSecret>`, prose.
+  const token = `rbox-pair_${"a".repeat(16)}.${"b".repeat(43)}`;
   const stdout = [
     "",
-    "Pairing token (valid ~10 min, single use — carries your encryption key):",
+    "Pairing command (valid ~10 min, single use — carries your encryption key):",
     "",
-    "    tAbC123_redeem.c2VjcmV0LXNlY3JldC1zZWNyZXQtc2VjcmV0LXNlY3JldA",
+    `    rbox connect ${token}`,
     "",
-    'On the new machine: run `rbox`, choose "Paste a pairing token", and paste it.',
+    "Run the command above on the new machine to authorize it and enroll encryption.",
   ].join("\n");
-  expect(parsePairToken(stdout)).toBe("tAbC123_redeem.c2VjcmV0LXNlY3JldC1zZWNyZXQtc2VjcmV0LXNlY3JldA");
+  expect(parsePairToken(stdout)).toBe(token);
+});
+
+test("parsePairToken rejects a bare token because the rig requires executable output", () => {
+  expect(() => parsePairToken(`rbox-pair_${"a".repeat(16)}.${"b".repeat(43)}`)).toThrow(/pairing token/i);
 });
 
 test("parsePairToken throws when no token is present", () => {

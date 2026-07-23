@@ -381,10 +381,11 @@ export const COMMAND_HELP: CommandHelp[] = [
   {
     name: "connect",
     group: "DEVICES & ACCOUNT",
-    summary: "add this machine from a pasted token (stdin)",
-    usage: "rbox connect",
+    summary: "authorize + encrypt this machine with a pairing token",
+    usage: "rbox connect [<pairing-token>]",
     flags: [{ flag: "--remote <url>", desc: "rbox API server (default: production; the RBOX_API env var also overrides)" }],
-    examples: ["rbox connect", "echo <token> | rbox connect"],
+    notes: ["Run `rbox pair` on an enrolled machine and paste its complete command here. Omit the argument for a masked prompt/stdin."],
+    examples: ["rbox connect rbox-pair_<id>.<secret>", "rbox connect", "echo <token> | rbox connect"],
   },
   {
     name: "recover",
@@ -660,7 +661,7 @@ export function renderEssentialHelp(): string {
       heading: "ADD A MACHINE",
       entries: [
         ["pair", "create a token on a signed-in machine"],
-        ["connect", "join this machine from a pasted token"],
+        ["connect", "authorize + encrypt this machine with a pairing token"],
       ],
     },
     {

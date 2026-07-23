@@ -710,13 +710,19 @@ Enforced: `src/cli/e2ee-client.ts:56-60,139-149,164-180`
 Proven: NONE FOUND  
 Since: 12
 
-### Pairing secrets avoid argv and echo
+### Pairing command output is validated and exposure is short-lived
 
-Pairing tokens enter through a masked prompt, stdin, or environment variable—not command-line arguments—and are not logged.
+The canonical onboarding path accepts a pairing token in
+`rbox connect <pairing-token>` for one-shot setup. Before producing that
+executable command, the client requires the server-returned lookup token to
+exactly equal the client-requested id. Shell-history/process-argument exposure
+is accepted only for pairing tokens, which expire after ten minutes and work
+once. Bare `rbox connect` retains masked prompt/stdin input, and redemption does
+not log the token.
 
-Enforced: `src/cli/auth-cmd.ts:194-201,402-423`  
-Proven: `src/cli/auth-cmd.test.ts` for prompt/stdin; NONE FOUND for the complete no-argv/no-log contract  
-Since: 10
+Enforced: `src/cli/auth-cmd.ts`; `src/cli/main-dispatch.ts`
+Proven: `src/cli/auth-cmd.test.ts`; `src/cli/main-dispatch-pair.test.ts`
+Since: 184 (supersedes the design 10 no-argv form)
 
 ### Device credentials are hashed and revocation-aware
 

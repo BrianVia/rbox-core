@@ -31,6 +31,13 @@ test("scrub: a dot-joined pairing-token line is masked", () => {
   expect(out).toContain("On the new machine");
 });
 
+test("scrub: pairing token inside the executable connect command is masked", () => {
+  const token = `rbox-pair_${"a".repeat(16)}.${"b".repeat(43)}`;
+  const out = scrubSelfPrinted(`    rbox connect ${token}`);
+  expect(out).toBe("    rbox connect *** [pairing token redacted] ***");
+  expect(out).not.toContain(token);
+});
+
 test("scrub: pull summaries and corpus filenames pass through untouched", () => {
   const body = [
     "pull applied: 1 write, 0 delete, 0 conflict — +b.txt",

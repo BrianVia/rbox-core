@@ -29,13 +29,13 @@ Prefer flags for CI/scripting? `rbox init` is the headless form of `setup` (see 
 On a machine you're already set up on:
 
 ```bash
-rbox pair            # prints a short-lived pairing token
+rbox pair            # prints a short-lived command; press c to copy it
 ```
 
-On the new machine, paste that token:
+On the new machine, paste the command it gives you:
 
 ```bash
-echo <token> | rbox connect
+rbox connect <pairing-token>
 ```
 
 That enrolls the new machine for encryption in two steps — no re-typing your recovery phrase. (The classic device-code path, `rbox login` then approve it from another device, still works too.)

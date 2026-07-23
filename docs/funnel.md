@@ -61,12 +61,13 @@ rbox            # guided menu
 
 ### 6. Second device — pairing token is the short path
 
-On device 1: `rbox pair` → prints a one-time pairing token.
+On device 1: `rbox pair` → prints a one-time `rbox connect …` command; press `c`
+to copy it.
 On device 2:
 
 ```bash
 curl -fsSL https://rbox.to/install.sh | sh
-rbox            # → "connect this machine" → paste pairing token
+rbox connect <pairing-token>
 ```
 
 The token does **auth + E2EE enrollment in one step** — no browser, no
@@ -104,7 +105,7 @@ exists:
   browser required."
 - `/docs`: install → `rbox setup` narrative, everyday commands, ignore rules,
   git-state sync, and a **Devices & account** command list (`rbox pair`,
-  `echo <token> | rbox connect`, `rbox recover`, `rbox device list/revoke`).
+  `rbox connect <pairing-token>`, `rbox recover`, `rbox device list/revoke`).
 
 Gaps, in order of stuck-state severity:
 

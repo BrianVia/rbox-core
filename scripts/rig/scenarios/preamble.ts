@@ -5,8 +5,9 @@
  * (onboard-smoke keeps its own convergence/teardown assertions — this only owns the
  * provisioning steps + their step names, which stay byte-for-byte what P0 shipped).
  *
- * Secrets ride ENV EXPANSION, never argv (bootstrap secret, pairing token) — the same
- * discipline as before; `rboxShell` masks them in transcripts.
+ * The long-lived bootstrap secret rides ENV expansion. Design 184 intentionally
+ * exercises the short-lived pairing token through the canonical argv command;
+ * the device transcript redacts it.
  */
 import { GUEST } from "../lib/config.js";
 import { deleteAccount, grantProPlan, readCredentials } from "../lib/account.js";
@@ -157,10 +158,10 @@ export async function provisionPair(ctx: RigCtx, rec: Recorder, opts: ProvisionO
     return parsePairToken(res.stdout);
   });
 
-  // 6. B: redeem the pairing token (token via env, never argv).
-  await rec.step("[B] login (redeem pair)", async () => {
-    await ctx.b.rboxShell(rigLoginShell("b", ctx.scenarioName), {
-      env: { RBOX_PAIR_TOKEN: pairToken },
+  // 6. B: execute the canonical one-shot command printed by A. This is the
+  // design-184 contract under test: auth + E2EE enrollment through argv.
+  await rec.step("[B] connect (redeem pair)", async () => {
+    await ctx.b.rbox(["connect", pairToken, "--remote", ctx.apiUrl], {
       redact: [pairToken],
     });
   });

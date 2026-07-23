@@ -637,26 +637,59 @@ export async function pairCreate(): Promise<void> {
   );
   if (res.status === 429) throw new Error("too many active pairing tokens — redeem or wait for one to expire");
   if (!res.ok) throw await friendlyHttpError(res, "pair");
-  const { token } = (await res.json()) as { token: string };
-  const full = `${token}.${toB64url(tokenSecret)}`; // <redeemToken>.<tokenSecret>
-  console.log(`\nPairing token (valid ~10 min, single use — carries your encryption key):\n`);
-  console.log(`    ${full}\n`);
-  console.log(`On the new machine, run \`rbox setup\`, choose "Log into an existing account", then "Paste a pairing token".`);
-
-  if (isInteractive()) {
-    process.stdout.write("Press [c] to copy the token to your clipboard, any other key to continue... ");
-    const key = await waitForKeypress();
-    process.stdout.write("\n");
-    if (key === "c") console.log(copyToClipboard(full) ? "Copied to clipboard." : "Couldn't reach the clipboard — copy the token above manually.");
-  }
+  const body = await res.json() as unknown;
+  const token = typeof body === "object" && body !== null && !Array.isArray(body)
+    ? (body as Record<string, unknown>).token
+    : undefined;
+  const command = pairingConnectCommand(token, tokenId, tokenSecret);
+  await presentPairingConnectCommand(command);
 }
 
 /** Redeem a split-secret pairing token → device credential + E2EE enrollment.
- *  The full token is read from a prompt/stdin (never argv) and never logged. */
+ *  The full token comes from the explicit one-shot argv path or, for bare
+ *  `rbox connect`, a masked prompt/stdin. It is never logged by redemption. */
 export function pairingRedemptionSuccessMessages(deviceId: string, presentation: AuthPresentationContext = "standalone"): readonly string[] {
   return presentation === "wizard"
     ? [`device authorized + encryption enrolled: ${deviceId}`]
     : [`device authorized + encryption enrolled: ${deviceId}`, WORKSPACE_SYNC_NEXT_STEP];
+}
+
+/** Build the executable next-machine command only after proving that the
+ * server echoed the exact client-chosen lookup id. This is a command-output
+ * trust boundary: never interpolate an arbitrary remote response. */
+export function pairingConnectCommand(serverToken: unknown, tokenId: string, tokenSecret: Uint8Array): string {
+  const expected = `rbox-pair_${tokenId}`;
+  if (serverToken !== expected) throw new Error("malformed pairing response (token id mismatch)");
+  return `rbox connect ${expected}.${toB64url(tokenSecret)}`;
+}
+
+interface PairingConnectPresentationDeps {
+  isInteractive?: typeof isInteractive;
+  waitForKeypress?: typeof waitForKeypress;
+  copyToClipboard?: typeof copyToClipboard;
+  log?: (message: string) => void;
+  write?: (message: string) => void;
+}
+
+/** Present and optionally copy the complete one-shot command. Kept separate
+ * from minting so the exact executable output is directly regression-tested. */
+export async function presentPairingConnectCommand(command: string, deps: PairingConnectPresentationDeps = {}): Promise<void> {
+  const log = deps.log ?? ((message: string) => console.log(message));
+  const write = deps.write ?? ((message: string) => process.stdout.write(message));
+  log("\nPairing command (valid ~10 min, single use — carries your encryption key):\n");
+  log(`    ${command}\n`);
+  log("Run the command above on the new machine to authorize it and enroll encryption.");
+
+  if ((deps.isInteractive ?? isInteractive)()) {
+    write("Press [c] to copy the command to your clipboard, any other key to continue... ");
+    const key = await (deps.waitForKeypress ?? waitForKeypress)();
+    write("\n");
+    if (key === "c") {
+      log((deps.copyToClipboard ?? copyToClipboard)(command)
+        ? "Copied command to clipboard."
+        : "Couldn't reach the clipboard — copy the command above manually.");
+    }
+  }
 }
 
 export async function redeemPair(

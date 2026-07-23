@@ -46,8 +46,8 @@ function redactAll(text: string, secrets: string[]): string {
  * Mask secrets the CLI PRINTS ITSELF (unknowable to a redact list at call time):
  * the 24-word E2EE recovery phrase (`login --bootstrap`) and a freshly minted
  * pairing token (`rbox pair`). Both are line-shaped, so this scrubs whole lines:
- * ≥20 all-lowercase words = a BIP39 phrase; a single dot-joined pair of long
- * base64url halves = a `<redeemToken>.<tokenSecret>` pairing token. Corpus
+ * ≥20 all-lowercase words = a BIP39 phrase; a dot-joined pair of long base64url
+ * halves anywhere in the line = a `<redeemToken>.<tokenSecret>` pairing token. Corpus
  * filenames (`file0007.txt`) and pull summaries (`+b.txt`) can't match — their
  * post-dot half is too short. PURE (unit-tested). Transcript-only: the caller
  * still receives the real stdout (scenarios parse the token from it).
@@ -61,8 +61,9 @@ export function scrubSelfPrinted(text: string): string {
       if (words.length >= 20 && words.every((w) => /^[a-z]+$/.test(w))) {
         return line.replace(t, "*** [recovery phrase redacted] ***");
       }
-      if (/^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{20,}$/.test(t)) {
-        return line.replace(t, "*** [pairing token redacted] ***");
+      const pairingToken = t.match(/(?:rbox-pair_)?[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{20,}/)?.[0];
+      if (pairingToken) {
+        return line.replace(pairingToken, "*** [pairing token redacted] ***");
       }
       return line;
     })

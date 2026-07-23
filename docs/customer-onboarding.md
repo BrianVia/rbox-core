@@ -58,9 +58,9 @@ machine · `rbox logs` shows the first push.
 ## Act 2 — Second machine
 
 1. Install with the same curl one-liner.
-2. Machine 1: `rbox pair` → copy the token (10-min TTL, single use — if it
-   expires, just mint another).
-3. Machine 2: `rbox` → **connect this machine** → paste the token.
+2. Machine 1: `rbox pair` → press `c` to copy the complete command (10-min TTL,
+   single use — if it expires, just mint another).
+3. Machine 2: paste and run `rbox connect <pairing-token>`.
    Checkpoint: **no browser, no phrase** — the token is auth + key material
    in one paste.
 4. Choose **sync an existing workspace** → pick it by name → give it a
