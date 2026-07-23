@@ -8,9 +8,16 @@
 _Last updated: 2026-07-23 (~11:30 UTC — **v1.7.26 "name clashes can't
 stop sync, your phrase saves anywhere" RELEASED** — designs 186 + 187):
 tag at 67109ea3, release run success, api.rbox.to/version = 1.7.26
-(all three artifacts). Regress 11/11 (via sg docker). Fleet NOT yet
-upgraded — Mac/FM still on 1.7.25; `rbox upgrade` pending founder
-word. Release details below._
+(all three artifacts). Regress 11/11 (via sg docker). **FLEET-LIVE
+(~11:45 UTC)**: Mac 1.7.26 via `rbox upgrade` — graceful stop drained an
+in-flight git-commit critical phase before restart (178 machinery
+field-verified), Development-f1903d6b healthy/syncing; non-zero exit was
+the test-litter papercut only — **32 dead rbox-daemon-activity-* dirs now
+on the MAC too** (0 live pids, verified; papercut recurs, fix the test
+writing to real RBOX_HOME). FM 1.7.26 pull-only PRESERVED
+(witness-verified: daemonVersion 1.7.26, mode pull-only). Desktop binary
+1.7.26 (no bound workspace). Mac's savvy-core local-commits deferral
+still open (founder's call). Release details below._
 
 _Same day (~11:00 UTC — **DESIGN 187 COMPLETE ON MAIN —
 multi-select recovery phrase backups**): PR #408 merged (squash ebb58578):
