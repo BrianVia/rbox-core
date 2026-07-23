@@ -16,10 +16,11 @@ import type { PageLoad } from './$types';
 // We can't touch the layout or the landing page, so we intercept HERE, before the
 // layout's redirect effect can run: a load function executes at navigation time
 // (client-side; ssr=false), ahead of the layout's onMount/$effect. If the visitor
-// isn't signed in we redirect to '/?redirect_url=<this page, code and all>'. Clerk's
-// prebuilt sign-in honors redirect_url OVER its fallbackRedirectUrl, so it returns the
-// user right back here with ?code= intact once they authenticate. getClerk() is a
-// singleton the layout reuses, so awaiting it here costs nothing extra.
+// isn't signed in we redirect to '/?redirect_url=<this page, code and all>'. The
+// root route validates that redirect_url (safeInternalPath) and feeds it to both
+// its post-auth effect and Clerk's forceRedirectUrl, returning the user right back
+// here with ?code= intact once they authenticate. getClerk() is a singleton the
+// layout reuses, so awaiting it here costs nothing extra.
 export const load: PageLoad = async ({ url }) => {
 	const code = (url.searchParams.get('code') ?? '').toUpperCase();
 	const clerk = await getClerk();
