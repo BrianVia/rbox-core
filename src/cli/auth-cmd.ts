@@ -13,7 +13,7 @@ import { loadDevice, loadRecoveryKey } from "./e2ee-keystore.js";
 import { isAutostartEnabled } from "./autostart-cmd.js";
 import { readStdinTrimmed } from "./read-stdin.js";
 import { rboxBanner } from "./wordmark.js";
-import { stderrStyle } from "./style.js";
+import { style, stderrStyle } from "./style.js";
 import { friendlyHttpError } from "./http-error.js";
 import {
   defaultKitTargetDir,
@@ -945,7 +945,7 @@ export async function login(
     if (!res.ok) throw await friendlyHttpError(res, "login --bootstrap");
     const { token, deviceId, accountId } = (await res.json()) as { token: string; deviceId: string; accountId: string };
     await saveCredentials({ token, deviceId, remoteUrl, accountId });
-    console.log("logged in");
+    console.log(`${style.sym.ok} logged in`);
     const api = new RboxApi(remoteUrl, token, "", "");
     const genesis = await runGenesisEnrollment(api, { accountId, deviceId }, kitOpts);
     if (genesis === "enrolled") {
