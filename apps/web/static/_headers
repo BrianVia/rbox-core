@@ -10,6 +10,14 @@
   Referrer-Policy: strict-origin-when-cross-origin
   Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://clerk.rbox.to https://*.clerk.accounts.dev https://js.stripe.com https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline'; connect-src 'self' https://api.rbox.to https://rbox-dev-api.brian-via.workers.dev https://clerk.rbox.to https://*.clerk.accounts.dev; frame-src https://challenges.cloudflare.com https://js.stripe.com https://checkout.stripe.com https://clerk.rbox.to https://*.clerk.accounts.dev; img-src 'self' data: https://img.clerk.com https://*.clerk.accounts.dev; font-src 'self' data:; worker-src 'self' blob:; base-uri 'self'; form-action 'self' https://checkout.stripe.com
 
+# Approval is a smaller trust boundary than the dashboard: Clerk remains because
+# reverification is required, while Stripe/checkout and script unsafe-inline/eval
+# are excluded. Clerk's challenge host remains for signed-out deep links that
+# SPA-navigate to SignIn under this document policy. The build finalizer replaces
+# the one hash marker with the generated Svelte SPA bootstrap's exact SHA-256.
+/cli-login
+  Content-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval' '__RBOX_SPA_BOOTSTRAP_HASH__' https://clerk.rbox.to https://*.clerk.accounts.dev https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline'; connect-src 'self' https://api.rbox.to https://rbox-dev-api.brian-via.workers.dev https://clerk.rbox.to https://*.clerk.accounts.dev; frame-src https://clerk.rbox.to https://*.clerk.accounts.dev https://challenges.cloudflare.com; img-src 'self' data: https://img.clerk.com https://*.clerk.accounts.dev; font-src 'self' data:; worker-src 'self' blob:; object-src 'none'; media-src 'none'; manifest-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'
+
 /_app/immutable/*
   Cache-Control: public, max-age=31536000, immutable
 

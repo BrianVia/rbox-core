@@ -8,6 +8,7 @@ import {
 	fetchUsage,
 	clearStaleTokens,
 	lookupDeviceAuth,
+	lookupDeviceAuthPubkeys,
 	approveDeviceAuth,
 	startCheckout,
 	fetchApiKeys,
@@ -229,7 +230,24 @@ describe('CLI browser login — device-code (design 47)', () => {
 		expect(await lookupDeviceAuth('ZZZZ-0000')).toBeNull();
 	});
 
-	it('approve POSTs { userCode } with the rbox web bearer (the existing authed() path)', async () => {
+	it('pubkeys echo is public and sends no bearer or session exchange', async () => {
+		const keys = { encPubKeySpki: 'ZW5j', sigPubKey: 'c2ln' };
+		const f = vi
+			.fn()
+			.mockResolvedValue({ ok: true, status: 200, json: async () => keys });
+		(globalThis as unknown as { fetch: unknown }).fetch = f;
+
+		await expect(lookupDeviceAuthPubkeys('ABCD-2345')).resolves.toEqual(keys);
+		expect(sessionCalls(f)).toBe(0);
+		expect(String(f.mock.calls[0][0])).toBe(
+			'https://api.test/v1/auth/device/pubkeys?code=ABCD-2345'
+		);
+		expect((f.mock.calls[0][1] as RequestInit | undefined)?.headers ?? {}).not.toHaveProperty(
+			'authorization'
+		);
+	});
+
+	it('absent fragment uses exact device-auth-only body with the rbox web bearer', async () => {
 		const f = vi
 			.fn()
 			.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ token: 'rbox_A' }) }) // session exchange
@@ -241,6 +259,33 @@ describe('CLI browser login — device-code (design 47)', () => {
 		const init = call![1] as RequestInit;
 		expect(init.method).toBe('POST');
 		expect(JSON.parse(init.body as string)).toEqual({ userCode: 'ABCD-2345' });
+		expect(init.headers).toMatchObject({ authorization: 'Bearer rbox_A' });
+	});
+
+	it('key approval POSTs the exact consent proof with a fresh Clerk JWT', async () => {
+		const f = vi
+			.fn()
+			.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ token: 'rbox_A' }) })
+			.mockResolvedValueOnce({
+				ok: true,
+				status: 200,
+				json: async () => ({ ok: true, keyDelivery: { status: 'pending' } })
+			});
+		(globalThis as unknown as { fetch: unknown }).fetch = f;
+
+		await approveDeviceAuth(clerk('A') as never, 'ABCD-2345', {
+			pubkeyFingerprint: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+			clerkToken: 'fresh_clerk_jwt'
+		});
+
+		const call = f.mock.calls.find((c) => String(c[0]).includes('/v1/auth/device/approve'));
+		const init = call![1] as RequestInit;
+		expect(JSON.parse(init.body as string)).toEqual({
+			userCode: 'ABCD-2345',
+			keyConsent: true,
+			pubkeyFingerprint: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+			clerkToken: 'fresh_clerk_jwt'
+		});
 		expect(init.headers).toMatchObject({ authorization: 'Bearer rbox_A' });
 	});
 

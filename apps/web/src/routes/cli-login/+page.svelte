@@ -2,7 +2,16 @@
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { authState } from '$lib/auth.svelte';
-	import { lookupDeviceAuth, approveDeviceAuth } from '$lib/api';
+	import { lookupDeviceAuth } from '$lib/api';
+	import {
+		fingerprintFromHash,
+		approvalPageDescription,
+		pendingApprovalPhase,
+		submitDeviceApproval,
+		verifyDeviceKeyConsent,
+		type FingerprintFragment,
+		type VerifiedDeviceKeyConsent
+	} from '$lib/device-approval';
 	import { errMsg } from '$lib/format';
 	import { Button } from '$lib/components/ui/button';
 	import PageHeader from '$lib/components/page-header.svelte';
@@ -13,18 +22,25 @@
 	let { data } = $props();
 	const code = $derived(data.code);
 	const DOCS_URL = 'https://rbox.to/docs';
+	const binding: FingerprintFragment = fingerprintFromHash(location.hash);
+	const sendsKeys = binding.kind === 'present';
 
 	// loading  → looking the code up
-	// confirm  → pending code; show the device asking + the Approve button
+	// verify   → fragment present; fresh step-up + invisible binding check
+	// confirm  → verified binding (or no-fragment auth-only); show Approve
+	// mismatch → fragment was invalid or did not bind to the server-returned keys
 	// approved → already approved/claimed, or we just approved it → "return to terminal"
 	// missing  → 404 / no code (terminal — the code expired or never existed)
 	// error    → transient lookup failure (retryable)
-	type Phase = 'loading' | 'confirm' | 'approved' | 'missing' | 'error';
+	type Phase = 'loading' | 'verify' | 'confirm' | 'mismatch' | 'approved' | 'missing' | 'error';
 
 	let phase = $state<Phase>('loading');
 	let label = $state<string | null>(null);
 	let error = $state('');
 	let busy = $state(false);
+	let keyProof = $state<Extract<VerifiedDeviceKeyConsent, { status: 'match' }>['proof'] | null>(
+		null
+	);
 
 	onMount(load);
 
@@ -43,11 +59,34 @@
 				phase = 'approved';
 			} else {
 				label = res.label;
-				phase = 'confirm';
+				phase = pendingApprovalPhase(binding);
 			}
 		} catch (e) {
 			error = errMsg(e);
 			phase = 'error';
+		}
+	}
+
+	async function verifyBinding() {
+		if (!authState.clerk || busy || binding.kind !== 'present') return;
+		busy = true;
+		error = '';
+		try {
+			const result = await verifyDeviceKeyConsent(
+				authState.clerk,
+				code,
+				binding.fingerprint
+			);
+			if (result.status === 'mismatch') {
+				phase = 'mismatch';
+				return;
+			}
+			keyProof = result.proof;
+			phase = 'confirm';
+		} catch (e) {
+			error = errMsg(e);
+		} finally {
+			busy = false;
 		}
 	}
 
@@ -56,10 +95,16 @@
 		busy = true;
 		error = '';
 		try {
-			await approveDeviceAuth(authState.clerk, code);
+			await submitDeviceApproval(authState.clerk, code, binding, keyProof);
 			phase = 'approved';
 		} catch (e) {
 			error = errMsg(e); // stays on the confirm card so the user can read why + retry
+			if (binding.kind === 'present') {
+				// Any key-consent retry gets a new ceremony and JWT rather than
+				// reusing a proof the server may have rejected as stale.
+				keyProof = null;
+				phase = 'verify';
+			}
 		} finally {
 			busy = false;
 		}
@@ -67,8 +112,8 @@
 </script>
 
 <PageHeader
-	title="Approve CLI login"
-	description="A device running `rbox login` is asking to sign in to your rbox account. Confirm it here."
+	title="Connect this machine"
+	description={approvalPageDescription(phase, binding)}
 />
 
 <a href={DOCS_URL} class="mb-4 inline-flex text-xs font-medium text-primary underline-offset-4 hover:underline">
@@ -85,39 +130,77 @@
 	</p>
 {:else if phase === 'confirm'}
 	<div class="rounded-xl border border-border bg-card p-6">
-		<p class="text-sm">
+		<p class="text-base font-medium">
 			{#if label}
-				A device wants to sign in to your rbox account as
-				<strong class="font-mono font-medium">{label}</strong>.
+				Connect <strong class="font-medium">{label}</strong> to your rbox account?
 			{:else}
-				A device wants to sign in to your rbox account.
+				Connect this machine to your rbox account?
 			{/if}
 		</p>
-		<p class="mt-2 text-sm text-muted-foreground">
-			Confirmation code
-			<code class="rounded bg-muted px-1.5 py-0.5 font-mono text-xs">{code}</code>
-			— it should match the one shown in your terminal.
-		</p>
-		<p class="mt-3 text-sm text-muted-foreground">
-			This confirmation code is different from a pairing token: it authorizes the device, while
-			a pairing token also carries encryption.
-		</p>
-		<p class="mt-2 text-sm text-muted-foreground">
-			Approving authorizes this device to reach your account. It does <em>not</em> unlock your
-			encrypted files — you'll still finish pairing on the device itself.
-		</p>
+		{#if sendsKeys}
+			<p class="mt-3 text-sm leading-6 text-muted-foreground">
+				Approving signs this machine in and sends it your encryption keys, so your files can
+				open here.
+			</p>
+		{:else}
+			<p class="mt-3 text-sm leading-6 text-muted-foreground">
+				This link can sign the machine in, but it can’t send encryption keys. You’ll finish
+				setting up encryption on the machine itself.
+			</p>
+		{/if}
 		<div class="mt-5">
-			<Button disabled={busy} onclick={approve}>Approve login</Button>
+			<Button disabled={busy} onclick={approve}>
+				{#if busy}
+					<LoaderIcon class="size-4 animate-spin" />
+					{sendsKeys ? 'Confirming…' : 'Approving…'}
+				{:else}
+					{sendsKeys
+						? 'Approve and send this machine your encryption keys'
+						: 'Approve sign-in'}
+				{/if}
+			</Button>
 		</div>
 	</div>
+{:else if phase === 'verify'}
+	<div class="rounded-xl border border-border bg-card p-6">
+		<p class="text-base font-medium">
+			{#if label}
+				Connect <strong class="font-medium">{label}</strong> to your rbox account?
+			{:else}
+				Connect this machine to your rbox account?
+			{/if}
+		</p>
+		<p class="mt-3 text-sm leading-6 text-muted-foreground">
+			First, confirm it’s you. We’ll then make sure this request came from the same machine
+			before you can approve it.
+		</p>
+		<div class="mt-5">
+			<Button disabled={busy} onclick={verifyBinding}>
+				{#if busy}
+					<LoaderIcon class="size-4 animate-spin" /> Confirming…
+				{:else}
+					Continue
+				{/if}
+			</Button>
+		</div>
+	</div>
+{:else if phase === 'mismatch'}
+	<Callout class="mb-4">
+		<p class="font-medium">This request doesn’t match the machine you started on.</p>
+		<p class="mt-1 text-sm">
+			Do not approve it. Return to that machine and run <code class="font-mono text-xs">rbox login</code>
+			again.
+		</p>
+	</Callout>
+	<Button variant="ghost" onclick={() => goto('/dashboard')}>Go to overview</Button>
 {:else if phase === 'approved'}
 	<div class="rounded-xl border border-border bg-card p-6">
 		<p class="flex items-center gap-2 text-base font-semibold">
-			<CheckIcon class="size-5 text-success" /> Login approved
+			<CheckIcon class="size-5 text-success" /> Machine approved
 		</p>
 		<p class="mt-2 text-sm text-muted-foreground">
-			Return to your terminal — <code class="rounded bg-muted px-1.5 py-0.5 font-mono text-xs">rbox login</code>
-			will finish connecting this device within a few seconds.
+			Return to this machine. <code class="rounded bg-muted px-1.5 py-0.5 font-mono text-xs">rbox login</code>
+			will finish connecting it.
 		</p>
 		<Button class="mt-4" variant="ghost" onclick={() => goto('/dashboard')}>Go to overview</Button>
 	</div>

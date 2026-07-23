@@ -250,6 +250,11 @@ export interface DeviceAuthLookup {
 	status: 'pending' | 'approved' | 'claimed';
 }
 
+export interface DeviceAuthPubkeys {
+	encPubKeySpki: string;
+	sigPubKey: string;
+}
+
 /** PUBLIC, unauthenticated lookup for the /cli-login confirm page. Sends NO bearer:
  *  the userCode is guessable-but-inert and the route returns only a hostname label +
  *  status — never account/user ids or tokens. `null` = 404 (unknown, or expired while
@@ -261,21 +266,72 @@ export async function lookupDeviceAuth(userCode: string): Promise<DeviceAuthLook
 	return res.json() as Promise<DeviceAuthLookup>;
 }
 
+/** Public key-only echo used by the browser to verify the CLI's fragment
+ *  fingerprint. It deliberately sends no bearer and returns no account data. */
+export async function lookupDeviceAuthPubkeys(
+	userCode: string
+): Promise<DeviceAuthPubkeys | null> {
+	const res = await fetch(
+		`${config.apiBase}/v1/auth/device/pubkeys?code=${encodeURIComponent(userCode)}`
+	);
+	if (res.status === 404 || res.status === 400) return null;
+	if (!res.ok) throw new Error(`couldn’t verify this machine (${res.status})`);
+	return res.json() as Promise<DeviceAuthPubkeys>;
+}
+
+export interface DeviceKeyConsent {
+	pubkeyFingerprint: string;
+	clerkToken: string;
+}
+
 /** Approve a pending device-code login from this web session. Uses the rbox web
  *  bearer via authed() — the same POST `rbox device approve` makes; the server now
- *  admits it for kind=='web' principals (design 47 webTokenAllowed change). Grants
- *  only authorized-but-not-E2EE-enrolled access, exactly like CLI-to-CLI approval. */
-export async function approveDeviceAuth(clerk: Clerk, userCode: string): Promise<void> {
+ *  admits it for kind=='web' principals (design 47 webTokenAllowed change).
+ *  Without keyConsent it grants device auth only. A key-consent proof is the exact
+ *  Unit 1 wire shape and must contain a freshly reverified Clerk JWT. */
+export async function approveDeviceAuth(
+	clerk: Clerk,
+	userCode: string,
+	keyConsent?: DeviceKeyConsent
+): Promise<void> {
+	const body = keyConsent
+		? {
+				userCode,
+				keyConsent: true,
+				pubkeyFingerprint: keyConsent.pubkeyFingerprint,
+				clerkToken: keyConsent.clerkToken
+			}
+		: { userCode };
 	const res = await authed(clerk, '/v1/auth/device/approve', {
 		method: 'POST',
 		headers: { 'content-type': 'application/json' },
-		body: JSON.stringify({ userCode })
+		body: JSON.stringify(body)
 	});
 	// no_pending_auth: the row is no longer pending — expired, or already approved/
 	// claimed by another approval between page-load and this click.
 	if (res.status === 404)
 		throw new Error('This code is no longer pending — it may have expired or already been approved. Run `rbox login` again.');
-	if (!res.ok) throw new Error(`couldn’t approve this login (${res.status})`);
+	if (res.status === 403) {
+		const { error } = (await res.json().catch(() => ({}))) as { error?: string };
+		if (error === 'fresh_step_up_required')
+			throw new Error('Please verify your sign-in again before sending encryption keys.');
+		if (error === 'step_up_principal_mismatch')
+			throw new Error('Your signed-in account changed. Start `rbox login` again.');
+	}
+	if (res.status === 409) {
+		const { error } = (await res.json().catch(() => ({}))) as { error?: string };
+		if (error === 'pubkey_binding_mismatch')
+			throw new Error('This request doesn’t match the machine you started on. Nothing was approved.');
+		if (error === 'key_delivery_unavailable')
+			throw new Error('Encryption isn’t set up for this account yet.');
+		if (error === 'key_delivery_cap')
+			throw new Error('Too many machines are waiting for keys. Finish or restart one of them first.');
+		if (error === 'duplicate_key_delivery')
+			throw new Error('This machine is already waiting for encryption keys.');
+		if (error === 'key_delivery_epoch_changed')
+			throw new Error('Your encryption settings changed. Start `rbox login` again.');
+	}
+	if (!res.ok) throw new Error('Something went wrong approving this machine. Please try again, or run `rbox login` again on that machine.');
 }
 
 // ── account linking (design 21) ──────────────────────────────────────────────

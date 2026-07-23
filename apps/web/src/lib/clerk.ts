@@ -66,3 +66,36 @@ export function mountAuth(clerk: Clerk, el: HTMLDivElement, redirectTarget: stri
 export function sessionId(clerk: Clerk): string | null {
 	return clerk.session?.id ?? null;
 }
+
+/** Require a new Clerk reverification ceremony and then mint a non-cached
+ *  session JWT carrying the freshly-updated factor-verification-age claims.
+ *  The API verifies those signed claims; a cached rbox bearer is not proof. */
+export async function freshClerkStepUpToken(clerk: Clerk): Promise<string> {
+	const originalSessionId = clerk.session?.id;
+	if (!originalSessionId) throw new Error('Sign in again before approving this machine.');
+
+	await new Promise<void>((resolve, reject) => {
+		let settled = false;
+		const finish = (result: () => void) => {
+			if (settled) return;
+			settled = true;
+			result();
+		};
+
+		clerk.__internal_openReverification({
+			// Clerk falls back to a fresh first factor when the account has no
+			// second factor. The server applies the same fva interpretation.
+			level: 'multi_factor',
+			afterVerification: () => finish(resolve),
+			afterVerificationCancelled: () =>
+				finish(() => reject(new Error('Verification was cancelled. Nothing was approved.')))
+		});
+	});
+
+	if (clerk.session?.id !== originalSessionId) {
+		throw new Error('Your signed-in session changed. Start the approval again.');
+	}
+	const token = await clerk.session.getToken({ skipCache: true });
+	if (!token) throw new Error('We couldn’t confirm your sign-in. Try again.');
+	return token;
+}
