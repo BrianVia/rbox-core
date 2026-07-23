@@ -465,8 +465,19 @@ async function preparedTransactionIntent(
 
 async function observePreparedLockTokens(transaction: JournalPreparedTransaction): Promise<void> {
   for (const lock of transaction.locks) {
-    const token = await lockToken(lock.path);
-    if (token) lock.token = { dev: token.dev, ino: token.ino };
+    let stat;
+    try {
+      stat = await fs.lstat(lock.path, { bigint: true });
+    } catch {
+      continue;
+    }
+    // Capture birth time alongside dev/ino so recovery can reject a same-bytes
+    // successor that reused this freed inode. 0 = filesystem reports none.
+    lock.token = {
+      dev: Number(stat.dev),
+      ino: Number(stat.ino),
+      ...(stat.birthtimeNs > 0n ? { birthtimeNs: stat.birthtimeNs.toString() } : {}),
+    };
   }
 }
 

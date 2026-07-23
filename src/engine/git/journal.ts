@@ -17,6 +17,7 @@ import {
   parseLockMarker,
   releaseObservedLock,
   safeBoundLockParent,
+  sameMarkerObservation,
   systemLockIdentity,
   validProcessIncarnation,
   type CommonDirIdentity,
@@ -108,7 +109,10 @@ export interface CheckoutJournal<TIntended = unknown> {
       locks: Array<{
         path: string;
         expectedBytes: string[];
-        token?: { dev: number; ino: number };
+        /** birthtimeNs sharpens the dev/ino inode token so a freed-and-reused
+         * inode carrying identical bytes is not mistaken for ours. Absent for
+         * pre-birthtime journals and unsupported filesystems. */
+        token?: { dev: number; ino: number; birthtimeNs?: string };
       }>;
     }>;
     /** Our O_EXCL reservation acquired immediately after a branch-switch
@@ -249,6 +253,26 @@ function validLockToken(value: unknown): value is { dev: number; ino: number } {
     && Number.isSafeInteger(token.ino) && Number(token.ino) >= 0;
 }
 
+/** Current prepared-transaction inode token: the v1.7.24 dev/ino pair plus an
+ * optional birthtimeNs. Legacy records keep the strict two-key shape above. */
+function validCurrentLockToken(value: unknown): value is { dev: number; ino: number; birthtimeNs?: string } {
+  if (!value || typeof value !== "object") return false;
+  const token = value as { dev?: unknown; ino?: unknown; birthtimeNs?: unknown };
+  return Object.keys(token).every((key) => key === "dev" || key === "ino" || key === "birthtimeNs")
+    && Number.isSafeInteger(token.dev) && Number(token.dev) >= 0
+    && Number.isSafeInteger(token.ino) && Number(token.ino) >= 0
+    && (token.birthtimeNs === undefined || (typeof token.birthtimeNs === "string" && /^(?:0|[1-9]\d*)$/.test(token.birthtimeNs)));
+}
+
+/** Compare an inode token's birth time only when the journal token and the live
+ * inode both report one (0/absent = unsupported fs or a pre-birthtime journal);
+ * otherwise dev/ino/bytes stay the authority. */
+function tokenBirthtimeMatches(persisted: string | undefined, live: bigint): boolean {
+  if (persisted === undefined || live === 0n) return true;
+  const value = BigInt(persisted);
+  return value === 0n || value === live;
+}
+
 function validExpectedBytes(value: unknown): value is string[] {
   return Array.isArray(value) && value.length > 0 && value.length <= 32 && value.every((encoded) => {
     if (typeof encoded !== "string" || encoded.length > 2048 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) return false;
@@ -355,7 +379,7 @@ function validPreparedTransactions(journal: CheckoutJournal, legacy: boolean): b
         if (!lock || typeof lock.path !== "string" || !path.isAbsolute(lock.path) || lock.path.length > 4096
           || lockPaths.has(path.resolve(lock.path)) || !(legacy ? validLegacyExpectedBytes(lock.expectedBytes) : validExpectedBytes(lock.expectedBytes))
           || (legacy && Object.keys(lock).some((key) => !["path", "expectedBytes", "token"].includes(key)))
-          || (lock.token !== undefined && (!transaction.prepareStarted || !validLockToken(lock.token)))) return false;
+          || (lock.token !== undefined && (!transaction.prepareStarted || !(legacy ? validLockToken(lock.token) : validCurrentLockToken(lock.token))))) return false;
         lockPaths.add(path.resolve(lock.path));
       }
     }
@@ -618,7 +642,7 @@ async function recoverJournalLocks(
   let liveOwner = false;
   const candidates = new Map<string, Array<{
     expectedBytes: string[];
-    token?: { dev: number; ino: number };
+    token?: { dev: number; ino: number; birthtimeNs?: string };
     observation?: import("./lockfile.js").MarkerObservation;
     ownerDead?: boolean;
   }>>();
@@ -667,11 +691,10 @@ async function recoverJournalLocks(
     // integrity evidence and never rescue a tokenless legacy record.
     const owned = intents.some((intent) => intent.ownerDead === true && intent.token !== undefined
       && BigInt(intent.token.dev) === live.dev && BigInt(intent.token.ino) === live.inode
+      && tokenBirthtimeMatches(intent.token.birthtimeNs, live.birthtimeNs)
       && (legacy || intent.expectedBytes.includes(encoded)))
       || intents.some((intent) => intent.ownerDead === true && intent.observation !== undefined
-        && intent.observation.dev === live.dev && intent.observation.inode === live.inode
-        && intent.observation.size === live.size && intent.observation.mtimeNs === live.mtimeNs
-        && intent.observation.raw === live.raw && intent.expectedBytes.includes(encoded));
+        && sameMarkerObservation(live, intent.observation) && intent.expectedBytes.includes(encoded));
     if (!owned) {
       human.push(legacy ? staleLegacyLockDiagnostic(abs) : `lock:${abs}`);
       continue;

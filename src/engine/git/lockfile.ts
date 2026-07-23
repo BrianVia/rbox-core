@@ -80,6 +80,9 @@ export interface MarkerObservation {
   inode: bigint;
   size: bigint;
   mtimeNs: bigint;
+  /** Inode birth time. 0 when the filesystem reports none (unsupported). It
+   * distinguishes a same-bytes successor that reused a freed inode. */
+  birthtimeNs: bigint;
   /** Byte-preserving latin1 prefix (ASCII for rbox markers). */
   raw: string;
 }
@@ -90,6 +93,7 @@ export interface SerializedMarkerObservation {
   inode: string;
   size: string;
   mtimeNs: string;
+  birthtimeNs: string;
   raw: string;
 }
 
@@ -682,8 +686,8 @@ export function parseLockMarker(raw: string): LockMarker | undefined {
   return { hostId: match[1]!, bootId: match[2]!, pid, startTime: match[4]!, token: match[5]! };
 }
 
-function statToken(stat: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint }): Omit<MarkerObservation, "raw"> {
-  return { dev: stat.dev, inode: stat.ino, size: stat.size, mtimeNs: stat.mtimeNs };
+function statToken(stat: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint; birthtimeNs: bigint }): Omit<MarkerObservation, "raw"> {
+  return { dev: stat.dev, inode: stat.ino, size: stat.size, mtimeNs: stat.mtimeNs, birthtimeNs: stat.birthtimeNs };
 }
 
 export function serializeMarkerObservation(observation: MarkerObservation): SerializedMarkerObservation {
@@ -692,6 +696,7 @@ export function serializeMarkerObservation(observation: MarkerObservation): Seri
     inode: observation.inode.toString(),
     size: observation.size.toString(),
     mtimeNs: observation.mtimeNs.toString(),
+    birthtimeNs: observation.birthtimeNs.toString(),
     raw: observation.raw,
   };
 }
@@ -706,17 +711,22 @@ const SIGNED_INTEGER = /^(?:0|-?[1-9]\d*)$/;
 export function deserializeMarkerObservation(value: unknown): MarkerObservation | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   const observation = value as Partial<SerializedMarkerObservation>;
-  if (Object.keys(observation).sort().join(",") !== "dev,inode,mtimeNs,raw,size"
+  // birthtimeNs is tolerated as absent so an observation persisted by an older
+  // journal within the same release (or the vendored v1.7.24 path) still parses.
+  const keys = Object.keys(observation).sort().join(",");
+  if ((keys !== "dev,inode,mtimeNs,raw,size" && keys !== "birthtimeNs,dev,inode,mtimeNs,raw,size")
     || typeof observation.dev !== "string" || !UNSIGNED_INTEGER.test(observation.dev)
     || typeof observation.inode !== "string" || !UNSIGNED_INTEGER.test(observation.inode)
     || typeof observation.size !== "string" || !UNSIGNED_INTEGER.test(observation.size)
     || typeof observation.mtimeNs !== "string" || !SIGNED_INTEGER.test(observation.mtimeNs)
+    || (observation.birthtimeNs !== undefined && (typeof observation.birthtimeNs !== "string" || !UNSIGNED_INTEGER.test(observation.birthtimeNs)))
     || typeof observation.raw !== "string" || observation.raw.length > MARKER_MAX_BYTES) return undefined;
   const parsed: MarkerObservation = {
     dev: BigInt(observation.dev),
     inode: BigInt(observation.inode),
     size: BigInt(observation.size),
     mtimeNs: BigInt(observation.mtimeNs),
+    birthtimeNs: observation.birthtimeNs === undefined ? 0n : BigInt(observation.birthtimeNs),
     raw: observation.raw,
   };
   const prefixBytes = BigInt(parsed.raw.length);
@@ -964,9 +974,17 @@ export async function publishLockMarker(
   return { status: "created", observation: finalized.observation };
 }
 
+/** Birth time distinguishes a same-bytes successor that reused a freed inode.
+ * Residual: a filesystem that reports no creation time yields 0, so when either
+ * side lacks one we fall back to dev/ino/size/mtime/bytes identity. */
+export function birthtimeMatches(actual: bigint, expected: bigint): boolean {
+  return actual === 0n || expected === 0n || actual === expected;
+}
+
 export function sameMarkerObservation(actual: MarkerObservation, expected: MarkerObservation): boolean {
   return actual.raw === expected.raw && actual.dev === expected.dev && actual.inode === expected.inode
-    && actual.size === expected.size && actual.mtimeNs === expected.mtimeNs;
+    && actual.size === expected.size && actual.mtimeNs === expected.mtimeNs
+    && birthtimeMatches(actual.birthtimeNs, expected.birthtimeNs);
 }
 
 async function unlinkIfExact(lockPath: string, expected: string | MarkerObservation, hook?: () => void | Promise<void>): Promise<boolean> {

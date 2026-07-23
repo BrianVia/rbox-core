@@ -104,6 +104,7 @@ describe("shared journal lock safety machinery", () => {
       inode: 18_014_398_509_481_987n,
       size: 3n,
       mtimeNs: -1n,
+      birthtimeNs: 1_700_000_000_123_456_789n,
       raw: "abc",
     };
     const serialized = serializeMarkerObservation(observation);
@@ -112,12 +113,17 @@ describe("shared journal lock safety machinery", () => {
       inode: "18014398509481987",
       size: "3",
       mtimeNs: "-1",
+      birthtimeNs: "1700000000123456789",
       raw: "abc",
     });
     expect(deserializeMarkerObservation(serialized)).toEqual(observation);
+    // A pre-birthtime observation still parses; its birth time reads back as 0.
+    const { birthtimeNs: _drop, ...legacySerialized } = serialized;
+    expect(deserializeMarkerObservation(legacySerialized)).toEqual({ ...observation, birthtimeNs: 0n });
     expect(deserializeMarkerObservation({ ...serialized, dev: 1 })).toBeUndefined();
     expect(deserializeMarkerObservation({ ...serialized, inode: "01" })).toBeUndefined();
     expect(deserializeMarkerObservation({ ...serialized, size: "2" })).toBeUndefined();
+    expect(deserializeMarkerObservation({ ...serialized, birthtimeNs: "-1" })).toBeUndefined();
     expect(deserializeMarkerObservation({ ...serialized, extra: true })).toBeUndefined();
 
     const large = { ...serialized, size: "2048", raw: "x".repeat(1024) };

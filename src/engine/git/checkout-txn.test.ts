@@ -505,13 +505,20 @@ test("prepared-lock recovery preserves a same-bytes successor when the journal h
   const owner = { hostId: "a".repeat(32), bootId: "b".repeat(32), pid: 4242, startTime: "7" };
   await fs.mkdir(path.dirname(lockPath), { recursive: true });
   await fs.writeFile(lockPath, "");
-  const original = await fs.lstat(lockPath);
+  const original = await fs.lstat(lockPath, { bigint: true });
   journal.expectedNew.preparedTransactions = [{
     id: "primary",
     ownerPid: owner.pid,
     owner,
     prepareStarted: true,
-    locks: [{ path: lockPath, expectedBytes: [Buffer.alloc(0).toString("base64")], token: { dev: original.dev, ino: original.ino } }],
+    locks: [{
+      path: lockPath,
+      expectedBytes: [Buffer.alloc(0).toString("base64")],
+      // A current-schema journal captures the original inode's birth time. After
+      // the freed inode is reused by the successor, that birth time no longer
+      // matches, so recovery must preserve the lock even when dev/ino/bytes do.
+      token: { dev: Number(original.dev), ino: Number(original.ino), birthtimeNs: original.birthtimeNs.toString() },
+    }],
   }];
   await writeCheckoutJournal(root, "repo", journal, { indexPath: path.join(ctx.gitDir, "index"), gitDir: ctx.gitDir });
   await fs.rm(lockPath, { force: true });
