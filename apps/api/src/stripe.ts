@@ -48,15 +48,29 @@ async function stripeApi(env: Env, method: "GET" | "POST" | "DELETE", path: stri
   return data;
 }
 
-/** Best-effort coupon/promo code off a Stripe subscription object — checks the
- *  (still-populated, if deprecated) singular `discount`, then the first entry of the
- *  newer `discounts` array. An unexpanded `discounts` entry is just an opaque id
- *  string, not a human code, so that shape degrades to null (⇒ the ping shows "none"). */
-function extractCoupon(obj: { discount?: unknown; discounts?: unknown[] }): string | null {
-  const discount = obj.discount ?? (Array.isArray(obj.discounts) ? obj.discounts[0] : undefined);
-  if (!discount || typeof discount !== "object") return null;
+function couponFromInlineDiscount(discount: object): string | null {
   const d = discount as { coupon?: { id?: string; name?: string }; promotion_code?: string };
   return d.coupon?.name ?? d.coupon?.id ?? d.promotion_code ?? null;
+}
+
+/** Best-effort coupon/promo code for a Stripe subscription. The singular `discount`
+ *  field is deprecated and unpopulated on this account's API version; the newer
+ *  `discounts` array IS populated, but webhook payloads can't be expanded after the
+ *  fact, so each entry arrives as a bare discount id ("di_...") rather than an object.
+ *  Resolve that id with one follow-up subscription fetch (expanding the nested
+ *  promotion code too, for the human-readable string). Never throws — any failure
+ *  (rate limit, network) just degrades to null, same as "no coupon used". */
+export async function extractCoupon(env: Env, obj: { id: string; discount?: unknown; discounts?: unknown[] }): Promise<string | null> {
+  const inline = obj.discount ?? (Array.isArray(obj.discounts) ? obj.discounts[0] : undefined);
+  if (inline && typeof inline === "object") return couponFromInlineDiscount(inline);
+  if (typeof inline !== "string") return null;
+
+  const discount = await stripeApi(env, "GET", `/subscriptions/${obj.id}`, { "expand[0]": "discounts.promotion_code" })
+    .then((sub) => sub?.discounts?.[0])
+    .catch(() => null);
+  if (!discount || typeof discount !== "object") return null;
+  const d = discount as { coupon?: { id?: string; name?: string }; promotion_code?: { code?: string } };
+  return d.promotion_code?.code ?? d.coupon?.name ?? d.coupon?.id ?? null;
 }
 
 /** Resolve a plan's active price id from its lookup_key (test/live agnostic). */
@@ -289,7 +303,7 @@ async function applyStripeEvent(env: Env, event: { type: string; data: { object:
             .bind(accountId)
             .first<{ email: string }>()
             .catch(() => null);
-          pingNewSubscription(ctx, env, { accountId, plan, email: owner?.email ?? null, coupon: extractCoupon(obj) });
+          pingNewSubscription(ctx, env, { accountId, plan, email: owner?.email ?? null, coupon: await extractCoupon(env, obj) });
         }
       } else {
         // non-paying (past_due/unpaid/canceled-but-not-deleted) → locked + grace + clear extras.
