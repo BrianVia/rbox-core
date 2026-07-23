@@ -1,9 +1,13 @@
 # 189 — Web-approved pairing: auto-fulfilled key delivery
 
-Status: DRAFT v6 — serial re-gate VERIFIED the wrap/hash seam + revoke fence;
-residual = 2 crash-recovery contract edges (both with existing reconcile
-patterns) + a doc scrub. v6 adds idempotent publish-reconcile and request-bound
-token recovery. No open BLOCKER. Ready for the final serial gate.
+Status: ALIGNED (core protocol) — v7. Across two parallel rounds + three serial
+gates the crypto/consent/trust model, admin-roster path, chain verification, and
+revoke fence are VERIFIED. The only residual across the last two gates is one
+theme — crash-recovery idempotency of the daemon<->CLI handoff — now specified
+as a hard requirement pinned to this codebase's existing crash-safe-reuse
+discipline (genesis staging, pairing deviceKeys-across-409). Per that discipline,
+crash-recovery is VERIFIED IN IMPLEMENTATION with boundary crash-injection tests
+(§14), not by enumerating interleavings in prose. Ready to implement.
 
 Related: 47, 184, 180, 12 (roster), 187, 191 (epoch rotation — deferred, §12.1),
 190 (passkey escrow — DECOUPLED, §9), #412 (Clerk redirect fix — MERGED; §8).
@@ -87,15 +91,20 @@ private key + a token-derived admission key the daemon lacks).
    - PUBLISHES the new roster + device row to the server atomically at
      fulfillment via the existing monotone append (keys.ts:398-426), which 409s
      on a stale parent. The daemon owns re-fetch-head/rebase/re-sign on 409
-     (it holds the signing key; the client cannot). Publish is IDEMPOTENT
-     (serial2 MAJOR-2: device_keys.device_id is a PK, keys.ts:415-422, so a
-     blind re-sign after a lost response would collide): on 409 or retry the
-     daemon REFETCHES, and if the target device+roster row already exists with
-     the exact committed keys+wrap it treats publication as COMPLETE (the
-     e2ee-client.ts:404-408 reconcile pattern), only rebasing/re-signing when the
-     row is genuinely absent. By the time the client picks up, the admin-signed
-     roster is the PUBLISHED head (serial MAJOR-4: closes the head-race — the
-     client never has to publish a roster it can't sign);
+     (it holds the signing key; the client cannot). Publish is CRASH-SAFE
+     IDEMPOTENT (serial2 MAJOR-2 + serial3 MAJOR-1: device_keys.device_id is a PK
+     keys.ts:415-422, and rsaDeviceWrap is RANDOMIZED asym.ts:84, so a restart
+     that re-wraps produces different bytes that would fail an exact-match
+     reconcile): BEFORE publishing, the daemon STAGES {wrap, signed-roster} in
+     its attempt journal keyed by requestId (§7.4) and reuses those exact bytes
+     across restart/retry — the SAME crash-safe-reuse discipline pairing uses for
+     deviceKeys across 409 (session.ts deviceKeys param) and genesis uses for
+     staged material. On reconcile, if the target device+roster row already
+     exists, the daemon ADOPTS the committed wrap (reads it back and delivers
+     THAT, keys.ts:381 pattern) rather than requiring its own bytes to match —
+     so recovery never depends on reproducing randomized ciphertext. It re-signs
+     only when the row is genuinely absent. By pickup the admin-signed roster is
+     the PUBLISHED head (serial MAJOR-4: head-race closed);
    - posts {mkWrapDevice, publishedRosterVersion, accountEpoch}.
 6. New CLI polls, receives it, and:
    - fetches + verifies the FULL roster chain (verifyRosterChain) up to the
@@ -229,15 +238,16 @@ real enrollment.
 to poll AFTER the auth claim (round-2 C#6: the current loop returns on approved,
 auth-cmd.ts:1003-1017, and post-claim polls only return `claimed`; the new field
 must be carried on `claimed` too), with deadlines, cancellation, and fallback to
-pairing/phrase, rendered as one state line. TOKEN RECOVERY (serial2 MAJOR-3):
+pairing/phrase, rendered as one state line. TOKEN RECOVERY (serial2 MAJOR-3 + serial3 MAJOR-2):
 today a crash after the claim commit but before the HTTP response strands the
-CLI without its once-returned bearer (device-code.ts:95 then returns only
-`claimed`; mint.ts:145-162 stores only the token hash). 189 makes the claim
-REPLAY-SAFE within the device-code TTL: the minted token is recoverable by the
-same authenticated device-code poll (bound to requestId=sha256(device_code)) so
-a re-poll after a crash returns the credential instead of a dead `claimed`. This
-is a device-code hardening 189 requires; outside the window the user re-runs
-login (today's behavior).
+CLI without its once-returned bearer (device-code.ts:95 returns only `claimed`;
+mint.ts:145-162 stores only token_hash). 189 requires an ATOMIC claim+mint+
+retarget D1 batch, and the minted bearer is ESCROWED ENCRYPTED-AT-REST keyed by
+requestId=sha256(device_code) with the device-code TTL. An authenticated re-poll
+of the same device_code returns the escrowed token (concurrent polls get the
+SAME token — idempotent, no second mint); it is scrubbed on the CLI's ACK or at
+TTL. Outside the window the user re-runs login (today's behavior). This is a
+device-code hardening 189 requires; verified by crash-injection tests (§14).
 
 7.3 Pickup crash-safety: idempotent — blob stays in `fulfilled` until the client
 ACK confirms durable persist + roster verify; a crash re-fetches the same blob;
@@ -312,6 +322,24 @@ stays opt-in regardless.
 12.4 Q4: any authenticated live daemon may fulfill; freshness = approval-token
 age + current epoch, server-verified.
 12.5 Q5: pull-only fulfills only with explicit key-release opt-in.
+
+## 14. Crash-recovery acceptance (implementation gate)
+
+The daemon<->CLI handoff crash-safety is VERIFIED IN IMPLEMENTATION, mirroring
+how genesis staging is proven (a boundary crash-test seam, genesis-durable.ts
+onBoundary). Mandatory crash-injection tests, killing at each boundary and
+resuming:
+- daemon: after stage-attempt / after publish-commit-before-response / after
+  blob-post — resume must reuse staged bytes or adopt the committed row, never
+  double-insert (PK) and never deliver a wrap whose hash != the roster commit.
+- server: after claim+mint+retarget batch but before response — re-poll recovers
+  the escrowed token; concurrent polls converge on one token; no second mint.
+- CLI: after keysReady before persist / after persist before ACK — re-fetch is
+  idempotent; the blob survives until ACK; enrollment completes exactly once.
+- revoke racing an in-flight delivery — the fence cancels undelivered rows and
+  every transition rechecks revoked=0 (no MK delivered to a revoked target).
+These are acceptance criteria for the implementation PR, not further design
+rounds.
 
 ## 13. Out of scope
 
