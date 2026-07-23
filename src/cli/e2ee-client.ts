@@ -36,18 +36,29 @@ import type { GenesisAccountObservation } from "./e2ee-remote.js";
 import {
   GENESIS_PENDING_MESSAGE,
   genesisPaths,
+  appendDestinationEvent,
+  createDestinationProgress,
   hardenedRename,
   hardenedFsyncExisting,
   hardenedUnlink,
+  loadDestinationProgress,
   publishCompletionIntent,
+  publishDestinationProgress,
   publishGenesisJournal,
   publishPrepublishMarker,
+  recordDestinationSetReceipt,
   recordGenesisReceipt,
   reconcileRetargetIntent,
+  replaceDestinationSetIntent,
   retargetCompletionIntent,
   parseCompletionIntent,
+  parseDestinationProgress,
   stageRecoveryKey,
+  type CarriedDestinationCompletion,
   type CompletionIntent,
+  type DestinationEvent,
+  type DestinationProgress,
+  type DestinationSetCompletionIntent,
   type GenesisJournal,
   type GenesisPrepublishMarker,
 } from "./genesis-durable.js";
@@ -165,7 +176,7 @@ export interface GenesisCapableApi extends Pick<RboxApi,"bootstrapKeys"> { getGe
 export interface AtomicGenesisCommit {kind:"committed";journal:GenesisJournal;phrase:string;lock:GenesisLock;globalLock:GenesisLock}
 export type AtomicGenesisStartResult=AtomicGenesisCommit|{kind:"already-setup"};
 
-async function removePrepublicationBundle(accountId:string):Promise<void>{const p=genesisPaths(accountId);await hardenedUnlink(p.device);await hardenedUnlink(p.mk);await hardenedUnlink(p.stagedRk);await hardenedUnlink(p.intent);await hardenedUnlink(p.witness);await hardenedUnlink(p.marker);}
+async function removePrepublicationBundle(accountId:string):Promise<void>{const p=genesisPaths(accountId);await hardenedUnlink(p.device);await hardenedUnlink(p.mk);await hardenedUnlink(p.stagedRk);await hardenedUnlink(p.intent);await hardenedUnlink(p.progress);await hardenedUnlink(p.witness);await hardenedUnlink(p.marker);}
 
 async function validateRecoveryKeyBytes(journal:GenesisJournal,bytes:Uint8Array):Promise<void>{
   const rk=fromB64url(Buffer.from(bytes).toString("utf8").trim());if(rk.length!==32)throw new Error("promoted recovery key has invalid length");
@@ -176,6 +187,19 @@ async function validateRecoveryKeyBytes(journal:GenesisJournal,bytes:Uint8Array)
 
 async function cleanupWinningJournal(journal:GenesisJournal):Promise<void>{
   const p=genesisPaths(journal.accountId);
+  const receipt=journal.completionReceipts["recovery-kit-staging"];
+  if(receipt?.outcome==="destination-set"){
+    const intentBytes=await fsRead(p.intent),progressBytes=await fsRead(p.progress);
+    if(!intentBytes&&progressBytes)throw new Error("destination progress survived without its cleanup authority");
+    if(intentBytes){
+      const intent=parseCompletionIntent(Buffer.from(intentBytes).toString("utf8"),journal);
+      if(intent.version!==2||await sha256Hex(utf8(canonicalString(intent)))!==receipt.intentSha256)throw new Error("destination-set cleanup intent digest mismatch");
+      if(progressBytes){
+        const progress=await parseDestinationProgress(Buffer.from(progressBytes).toString("utf8"),intent);
+        if(await sha256Hex(utf8(canonicalString(progress)))!==receipt.finalProgressSha256)throw new Error("destination-set cleanup progress digest mismatch");
+      }
+    }
+  }
   if(journal.originalCacheRecovery){
     const staged=await fsRead(p.stagedRk),dest=await fsRead(p.rk);
     if(staged&&dest)throw new Error("winning recovery-key promotion has both source and destination");
@@ -186,11 +210,11 @@ async function cleanupWinningJournal(journal:GenesisJournal):Promise<void>{
     if(!loaded||!("secrets" in loaded)||loaded.secrets.deviceId!==journal.deviceId||device?.deviceId!==journal.deviceId||device.sigPubKey!==toB64url(loaded.secrets.sigPubKey)||device.encPubKey!==toB64url(loaded.secrets.encPubSpki)||typeof device.mkWrap!=="string")throw new Error("journal device material mismatch");
     const opened=await openOwnMasterKey(loaded.secrets,0,JSON.parse(device.mkWrap) as Wrap);if(!Buffer.from(opened).equals(Buffer.from(loaded.secrets.mk)))throw new Error("journal MK material mismatch");await hardenedUnlink(p.stagedRk);
   }
-  await hardenedUnlink(p.intent);await hardenedUnlink(p.witness);await hardenedUnlink(p.marker);await hardenedUnlink(p.journal);
+  await hardenedUnlink(p.progress);await hardenedUnlink(p.intent);await hardenedUnlink(p.witness);await hardenedUnlink(p.marker);await hardenedUnlink(p.journal);
 }
 async function fsRead(file:string):Promise<Uint8Array|undefined>{try{return new Uint8Array(await fs.readFile(file));}catch(error){if((error as NodeJS.ErrnoException).code==="ENOENT")return undefined;throw error;}}
 
-async function cleanupCompetingJournal(journal:GenesisJournal):Promise<void>{const now=new Date().toISOString();const status=await genesisQuarantineStatus(journal.accountId,"abandoned-attempt",journal.requestSha256);if(status==="absent")await startGenesisQuarantine({accountId:journal.accountId,purpose:"abandoned-attempt",uniquenessKey:journal.requestSha256,createdAt:now});if(status!=="completed")await resumeGenesisQuarantine(journal.accountId,"abandoned-attempt",journal.requestSha256,now);const p=genesisPaths(journal.accountId);await hardenedUnlink(p.intent);await hardenedUnlink(p.witness);await hardenedUnlink(p.marker);await hardenedUnlink(p.journal);}
+async function cleanupCompetingJournal(journal:GenesisJournal):Promise<void>{const now=new Date().toISOString();const status=await genesisQuarantineStatus(journal.accountId,"abandoned-attempt",journal.requestSha256);if(status==="absent")await startGenesisQuarantine({accountId:journal.accountId,purpose:"abandoned-attempt",uniquenessKey:journal.requestSha256,createdAt:now});if(status!=="completed")await resumeGenesisQuarantine(journal.accountId,"abandoned-attempt",journal.requestSha256,now);const p=genesisPaths(journal.accountId);await hardenedUnlink(p.intent);await hardenedUnlink(p.progress);await hardenedUnlink(p.witness);await hardenedUnlink(p.marker);await hardenedUnlink(p.journal);}
 
 export async function resumeGenesisCleanup(journal:GenesisJournal):Promise<void>{const receipt=journal.completionReceipts["recovery-kit-staging"];if(!receipt)throw new Error("cleanup journal has no receipt");if(receipt.outcome==="competing-cleaned")await cleanupCompetingJournal(journal);else await cleanupWinningJournal(journal);}
 async function resumeClassifiedGenesisCleanup(journal:GenesisJournal):Promise<void>{try{await resumeGenesisCleanup(journal);}catch(error){throw new Error(`genesis integrity failure: cleanup precondition changed: ${error instanceof Error?error.message:String(error)}`,{cause:error});}}
@@ -247,6 +271,22 @@ export interface AtomicGenesisCompletionHandlers{
   selectIntent?:(journal:GenesisJournal,phrase:string,now:number)=>Promise<CompletionIntent>;
   commitArtifact?:(intent:Extract<CompletionIntent,{mode:"keychain"|"kit-path"}>,phrase:string)=>Promise<void>;
   retargetKeychainFailure?:(error:unknown,intent:Extract<CompletionIntent,{mode:"keychain"}>,phrase:string)=>Promise<Extract<CompletionIntent,{mode:"kit-path"}>|undefined>;
+  completeDestinationSet?:(context:AtomicGenesisDestinationSetContext)=>Promise<AtomicGenesisDestinationSetResult>;
+}
+
+export interface AtomicGenesisDestinationSetState{intent:DestinationSetCompletionIntent;progress:DestinationProgress}
+export interface AtomicGenesisDestinationSetContext extends AtomicGenesisDestinationSetState{
+  phrase:string;
+  append(event:DestinationEvent):Promise<DestinationProgress>;
+  replace(args:{
+    newIntent:DestinationSetCompletionIntent;
+    carriedCompletions:CarriedDestinationCompletion[];
+    liveValidOldIndexes:readonly number[];
+  }):Promise<AtomicGenesisDestinationSetState>;
+}
+export interface AtomicGenesisDestinationSetResult extends AtomicGenesisDestinationSetState{
+  liveValidDestinationIndexes:readonly number[];
+  continuedAfterPartial:boolean;
 }
 
 /** Consume the durable selection. Absence alone selects phrase-display; a present
@@ -258,6 +298,33 @@ export async function completeAtomicGenesis(commit:AtomicGenesisCommit,deliverOr
     if(pending.witnessRaw!==undefined)intent=await reconcileRetargetIntent(commit.journal);
     else if(pending.intentRaw!==undefined)intent=parseCompletionIntent(pending.intentRaw,commit.journal);
     if(!intent){intent=handlers.selectIntent?await handlers.selectIntent(commit.journal,commit.phrase,now):{version:1,accountId:commit.journal.accountId,requestSha256:commit.journal.requestSha256,mode:"phrase-display",intentAt:new Date(now).toISOString()};await publishCompletionIntent(intent,commit.journal);}
+    if(intent.version===2){
+      if(!handlers.completeDestinationSet)throw new Error("cannot resume destination-set completion without its handler");
+      let state:AtomicGenesisDestinationSetState;
+      try{state={intent,progress:await loadDestinationProgress(intent)};}
+      catch(error){
+        if((error as NodeJS.ErrnoException).code!=="ENOENT")throw error;
+        const progress=await createDestinationProgress(intent);
+        await publishDestinationProgress(intent,progress);state={intent,progress};
+      }
+      const context:AtomicGenesisDestinationSetContext={
+        ...state,phrase:commit.phrase,
+        append:async(event)=>{
+          state={...state,progress:await appendDestinationEvent(state.intent,state.progress,event)};
+          context.intent=state.intent;context.progress=state.progress;return state.progress;
+        },
+        replace:async(args)=>{
+          await replaceDestinationSetIntent(commit.journal,state.intent,state.progress,args.newIntent,args.carriedCompletions,args.liveValidOldIndexes,new Date(now).toISOString());
+          const survivor=await reconcileRetargetIntent(commit.journal);
+          if(!survivor||survivor.version!==2)throw new Error("destination-set replacement did not reconcile a destination plan");
+          state={intent:survivor,progress:await loadDestinationProgress(survivor)};
+          context.intent=state.intent;context.progress=state.progress;return state;
+        },
+      };
+      const result=await handlers.completeDestinationSet(context);
+      const cleanup=await recordDestinationSetReceipt(commit.journal,result.intent,result.progress,result.liveValidDestinationIndexes,result.continuedAfterPartial,new Date(now).toISOString());
+      await cleanupWinningJournal(cleanup);return;
+    }
     if(intent.mode==="phrase-display"){await handlers.deliverPhrase(commit.phrase);}
     else{
       if(!handlers.commitArtifact)throw new Error(`cannot resume ${intent.mode} completion without its artifact sink`);

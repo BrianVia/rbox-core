@@ -10,6 +10,9 @@ import {
   parseRecoveryKitRecord,
   pathIsInsideRemovalRoot,
   claimRecoveryKitOffer,
+  invalidateOnePasswordArtifact,
+  MAX_ONE_PASSWORD_ARTIFACTS,
+  onePasswordArtifactStatuses,
   readRecoveryKitRecord,
   readRecoveryKitRecordState,
   recoveryKitSafety,
@@ -17,6 +20,7 @@ import {
   recoveryKitFileState,
   recoveryKitOptionsFromFlags,
   recoveryKitRecordPath,
+  recordOnePasswordArtifact,
   renderKit,
   writeRecoveryKit,
 } from "./recovery-kit.js";
@@ -24,6 +28,16 @@ import {
 const ACCOUNT = "acct_0123456789abcdef";
 const DATE = new Date(2026, 6, 3, 9, 8, 7);
 const PHRASE = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
+const ONE_PASSWORD_ARTIFACT = {
+  rboxAccountId: ACCOUNT,
+  accountUuid: "op_account_1",
+  vaultUuid: "op_vault_1",
+  itemUuid: "op_item_1",
+  fieldId: "rboxRecoveryPhrase" as const,
+  operationTag: "rbox-recovery-operation_1",
+  writtenAt: DATE.toISOString(),
+  state: "active" as const,
+};
 
 let tmp: string;
 let restoreWriteHook: (() => void) | undefined;
@@ -86,9 +100,10 @@ describe("recovery kit", () => {
 
     const record = await readRecoveryKitRecord(ACCOUNT);
     expect(record).toEqual({
-      version: 2,
+      version: 3,
       accountId: ACCOUNT,
       plaintextArtifacts: [{ path: file, writtenAt: DATE.toISOString(), cleanup: "pending" }],
+      onePasswordArtifacts: [],
     });
     expect((await fs.stat(recoveryKitRecordPath(ACCOUNT))).mode & 0o777).toBe(0o600);
     expect(await recoveryKitFileState(ACCOUNT, record!.plaintextArtifacts[0])).toBe("present");
@@ -130,14 +145,108 @@ describe("recovery kit", () => {
 
   test("strict parser normalizes only the exact legacy shape and rejects unknown or mixed records", () => {
     expect(parseRecoveryKitRecord({ path: "/tmp/kit", writtenAt: DATE.toISOString() }, ACCOUNT)).toEqual({
-      version: 2,
+      version: 3,
       accountId: ACCOUNT,
       plaintextArtifacts: [{ path: "/tmp/kit", writtenAt: DATE.toISOString(), cleanup: "pending" }],
+      onePasswordArtifacts: [],
     });
     expect(parseRecoveryKitRecord({ path: "/tmp/kit", writtenAt: DATE.toISOString(), extra: true }, ACCOUNT)).toBeUndefined();
     expect(parseRecoveryKitRecord({ version: 3, accountId: ACCOUNT, plaintextArtifacts: [] }, ACCOUNT)).toBeUndefined();
     expect(parseRecoveryKitRecord({ version: 2, accountId: "acct_ffffffffffffffff", plaintextArtifacts: [] }, ACCOUNT)).toBeUndefined();
     expect(parseRecoveryKitRecord({ version: 2, accountId: ACCOUNT, plaintextArtifacts: [], path: "/tmp/legacy" }, ACCOUNT)).toBeUndefined();
+  });
+
+  test("strictly migrates recognized v2 records to v3 without changing their evidence", () => {
+    const v2 = {
+      version: 2,
+      accountId: ACCOUNT,
+      keychain: { service: "rbox recovery phrase", account: ACCOUNT, keychainPath: "/Users/a/login.keychain-db", writtenAt: DATE.toISOString() },
+      plaintextArtifacts: [{ path: "/tmp/kit", writtenAt: DATE.toISOString(), cleanup: "declined" }],
+      offer: { claimedAt: DATE.toISOString(), surface: "login", phraseSource: "typed", outcome: "accepted" },
+    };
+    expect(parseRecoveryKitRecord(v2, ACCOUNT)).toEqual({
+      ...v2,
+      version: 3,
+      onePasswordArtifacts: [],
+    });
+  });
+
+  test("v3 parser enforces exact 1Password locators, bounds, account binding, and deduplication", () => {
+    const base = { version: 3, accountId: ACCOUNT, plaintextArtifacts: [], onePasswordArtifacts: [ONE_PASSWORD_ARTIFACT] };
+    expect(parseRecoveryKitRecord(base, ACCOUNT)?.onePasswordArtifacts).toEqual([ONE_PASSWORD_ARTIFACT]);
+    expect(parseRecoveryKitRecord({
+      ...base,
+      onePasswordArtifacts: [{ ...ONE_PASSWORD_ARTIFACT, fieldId: "notesPlain" }],
+    }, ACCOUNT)).toBeUndefined();
+    expect(parseRecoveryKitRecord({
+      ...base,
+      onePasswordArtifacts: [{ ...ONE_PASSWORD_ARTIFACT, rboxAccountId: "acct_ffffffffffffffff" }],
+    }, ACCOUNT)).toBeUndefined();
+    expect(parseRecoveryKitRecord({
+      ...base,
+      onePasswordArtifacts: [ONE_PASSWORD_ARTIFACT, { ...ONE_PASSWORD_ARTIFACT, operationTag: "different" }],
+    }, ACCOUNT)).toBeUndefined();
+    expect(parseRecoveryKitRecord({
+      ...base,
+      onePasswordArtifacts: Array.from({ length: MAX_ONE_PASSWORD_ARTIFACTS + 1 }, (_, index) => ({
+        ...ONE_PASSWORD_ARTIFACT,
+        itemUuid: `item_${index}`,
+      })),
+    }, ACCOUNT)).toBeUndefined();
+    expect(parseRecoveryKitRecord({
+      ...base,
+      onePasswordArtifacts: [{ ...ONE_PASSWORD_ARTIFACT, operationTag: "bad\ntag" }],
+    }, ACCOUNT)).toBeUndefined();
+    expect(parseRecoveryKitRecord({
+      ...base,
+      onePasswordArtifacts: [{ ...ONE_PASSWORD_ARTIFACT, extra: true }],
+    }, ACCOUNT)).toBeUndefined();
+  });
+
+  test("records active 1Password locators and durably invalidates the exact locator", async () => {
+    expect(await recordOnePasswordArtifact(ACCOUNT, ONE_PASSWORD_ARTIFACT)).toBe("recorded");
+    expect(await recordOnePasswordArtifact(ACCOUNT, ONE_PASSWORD_ARTIFACT)).toBe("unchanged");
+    let record = (await readRecoveryKitRecord(ACCOUNT))!;
+    expect(onePasswordArtifactStatuses(record)).toEqual([{ ...ONE_PASSWORD_ARTIFACT, status: "recorded" }]);
+
+    const invalidatedAt = new Date("2026-07-23T15:00:00.000Z");
+    expect(await invalidateOnePasswordArtifact(ACCOUNT, ONE_PASSWORD_ARTIFACT, "missing", invalidatedAt)).toBe("invalidated");
+    expect(await invalidateOnePasswordArtifact(ACCOUNT, ONE_PASSWORD_ARTIFACT, "missing", invalidatedAt)).toBe("unchanged");
+    record = (await readRecoveryKitRecord(ACCOUNT))!;
+    expect(onePasswordArtifactStatuses(record)).toEqual([{
+      ...ONE_PASSWORD_ARTIFACT,
+      state: "invalidated",
+      invalidatedAt: invalidatedAt.toISOString(),
+      invalidationReason: "missing",
+      status: "invalidated",
+    }]);
+    await expect(invalidateOnePasswordArtifact(ACCOUNT, { ...ONE_PASSWORD_ARTIFACT, operationTag: "wrong" }, "missing")).rejects.toThrow(/does not match/);
+  });
+
+  test("re-recording the same active 1Password item with a drifted writtenAt is idempotent (crash-resume)", async () => {
+    // Regression: a crash between the provider write and the durable progress
+    // append re-records the same verified item on resume, but with a freshly
+    // sampled writtenAt. That used to throw "conflicting 1Password artifact
+    // identity" and wedge the destination forever. It must be idempotent and keep
+    // the original record.
+    expect(await recordOnePasswordArtifact(ACCOUNT, ONE_PASSWORD_ARTIFACT)).toBe("recorded");
+    expect(await recordOnePasswordArtifact(ACCOUNT, { ...ONE_PASSWORD_ARTIFACT, writtenAt: "2026-07-23T16:30:00.000Z" })).toBe("unchanged");
+    const record = (await readRecoveryKitRecord(ACCOUNT))!;
+    expect(record.onePasswordArtifacts).toHaveLength(1);
+    expect(record.onePasswordArtifacts[0]!.writtenAt).toBe(ONE_PASSWORD_ARTIFACT.writtenAt);
+  });
+
+  test("conflicting stable 1Password identities and full bounded history fail closed", async () => {
+    await recordOnePasswordArtifact(ACCOUNT, ONE_PASSWORD_ARTIFACT);
+    await expect(recordOnePasswordArtifact(ACCOUNT, { ...ONE_PASSWORD_ARTIFACT, operationTag: "different" })).rejects.toThrow(/conflicting/);
+    for (let index = 1; index < MAX_ONE_PASSWORD_ARTIFACTS; index++) {
+      await recordOnePasswordArtifact(ACCOUNT, { ...ONE_PASSWORD_ARTIFACT, itemUuid: `op_item_${index + 1}`, operationTag: `operation_${index + 1}` });
+    }
+    await expect(recordOnePasswordArtifact(ACCOUNT, {
+      ...ONE_PASSWORD_ARTIFACT,
+      itemUuid: "op_item_overflow",
+      operationTag: "operation_overflow",
+    })).rejects.toThrow(/history is full/);
   });
 
   test("unknown records are distinguished and never overwritten", async () => {
@@ -168,6 +277,26 @@ describe("recovery kit", () => {
     expect(recoveryKitSafety(loaded, { keychain: "missing", plaintext: ["present"] }, "/tmp/rbox")).toBe("at-risk");
     expect(recoveryKitSafety({ state: "unknown" }, { plaintext: [] }, "/tmp/rbox")).toBe("unknown");
     expect(recoveryKitSafety({ state: "missing" }, { plaintext: [] }, "/tmp/rbox")).toBe("at-risk");
+  });
+
+  test("an unchecked active 1Password locator makes uninstall safety unknown, never backed up", () => {
+    const record = parseRecoveryKitRecord({
+      version: 3,
+      accountId: ACCOUNT,
+      plaintextArtifacts: [],
+      onePasswordArtifacts: [ONE_PASSWORD_ARTIFACT],
+    }, ACCOUNT)!;
+    expect(recoveryKitSafety({ state: "recognized", record }, { plaintext: [] }, "/tmp/rbox")).toBe("unknown");
+    const invalidated = parseRecoveryKitRecord({
+      ...record,
+      onePasswordArtifacts: [{
+        ...ONE_PASSWORD_ARTIFACT,
+        state: "invalidated",
+        invalidatedAt: DATE.toISOString(),
+        invalidationReason: "mismatch",
+      }],
+    }, ACCOUNT)!;
+    expect(recoveryKitSafety({ state: "recognized", record: invalidated }, { plaintext: [] }, "/tmp/rbox")).toBe("at-risk");
   });
 
   test("concurrent once-only offer claims have exactly one winner", async () => {

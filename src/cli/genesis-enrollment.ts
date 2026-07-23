@@ -3,7 +3,7 @@ import { assertMkWrapAuthorized, canonicalString, fromB64url, openOwnMasterKey, 
 import type { AccountKeysDTO, GenesisAccountObservation, GenesisPresence } from "./e2ee-remote.js";
 import { loadDevice } from "./e2ee-keystore.js";
 import { activeGenesisQuarantines, genesisQuarantineStatus } from "./genesis-quarantine.js";
-import { GENESIS_ACCOUNT_ID_RE, GENESIS_REPAIR_ID_RE, CompletionIntent, CompletionIntentRetargetWitness, GenesisJournal, GenesisPrepublishMarker, genesisEnrollmentWitnessMatches, genesisEnrollmentWitnessPresent, genesisPaths, loadStagedRecoveryKey, parseCompletionIntent, parseGenesisBootstrapRequest, parseGenesisJournal, parsePrepublishMarker, parseRetargetWitness, publishGenesisEnrollmentWitness } from "./genesis-durable.js";
+import { GENESIS_ACCOUNT_ID_RE, GENESIS_REPAIR_ID_RE, CompletionIntent, CompletionIntentRetargetWitness, GenesisJournal, GenesisPrepublishMarker, genesisEnrollmentWitnessMatches, genesisEnrollmentWitnessPresent, genesisPaths, loadStagedRecoveryKey, parseCompletionIntent, parseDestinationProgress, parseGenesisBootstrapRequest, parseGenesisJournal, parsePrepublishMarker, parseRetargetWitness, publishGenesisEnrollmentWitness } from "./genesis-durable.js";
 
 export type EnrollmentClassification=
   |{kind:"pristine"}|{kind:"restart-prepublication";marker:GenesisPrepublishMarker}|{kind:"resume-attempt";journal:GenesisJournal}
@@ -12,7 +12,7 @@ export type EnrollmentClassification=
   |{kind:"repaired-legacy";repairId:string}|{kind:"quarantine-resume";repairId:string}|{kind:"repair-ready";repairId:string}
   |{kind:"integrity-failure";reason:string};
 
-export interface PendingGenesisArtifacts{marker?:GenesisPrepublishMarker;journal?:GenesisJournal;stagedRk:boolean;device:boolean;mk:boolean;intentRaw?:string;witnessRaw?:string;activeQuarantines:Array<{purpose:"repaired-legacy"|"abandoned-attempt";key:string}>}
+export interface PendingGenesisArtifacts{marker?:GenesisPrepublishMarker;journal?:GenesisJournal;stagedRk:boolean;device:boolean;mk:boolean;intentRaw?:string;progressRaw?:string;witnessRaw?:string;activeQuarantines:Array<{purpose:"repaired-legacy"|"abandoned-attempt";key:string}>}
 
 async function readOptional(file:string):Promise<string|undefined>{try{return await fs.readFile(file,"utf8");}catch(error){if((error as NodeJS.ErrnoException).code==="ENOENT")return undefined;throw error;}}
 async function present(file:string):Promise<boolean>{try{const stat=await fs.lstat(file);if(!stat.isFile()||stat.isSymbolicLink())throw new Error(`unsafe genesis artifact: ${file}`);return true;}catch(error){if((error as NodeJS.ErrnoException).code==="ENOENT")return false;throw error;}}
@@ -20,11 +20,11 @@ async function present(file:string):Promise<boolean>{try{const stat=await fs.lst
 export async function inspectPendingGenesis(accountId:string):Promise<PendingGenesisArtifacts>{
   const paths=genesisPaths(accountId);const markerRaw=await readOptional(paths.marker),journalRaw=await readOptional(paths.journal);
   const marker=markerRaw===undefined?undefined:parsePrepublishMarker(markerRaw,accountId);const journal=journalRaw===undefined?undefined:await parseGenesisJournal(journalRaw,accountId);
-  const intentRaw=await readOptional(paths.intent),witnessRaw=await readOptional(paths.witness);
-  return{...(marker?{marker}:{}),...(journal?{journal}:{}),stagedRk:await present(paths.stagedRk),device:await present(paths.device),mk:await present(paths.mk),...(intentRaw===undefined?{}:{intentRaw}),...(witnessRaw===undefined?{}:{witnessRaw}),activeQuarantines:await activeGenesisQuarantines(accountId)};
+  const intentRaw=await readOptional(paths.intent),progressRaw=await readOptional(paths.progress),witnessRaw=await readOptional(paths.witness);
+  return{...(marker?{marker}:{}),...(journal?{journal}:{}),stagedRk:await present(paths.stagedRk),device:await present(paths.device),mk:await present(paths.mk),...(intentRaw===undefined?{}:{intentRaw}),...(progressRaw===undefined?{}:{progressRaw}),...(witnessRaw===undefined?{}:{witnessRaw}),activeQuarantines:await activeGenesisQuarantines(accountId)};
 }
 
-export async function pendingGenesisState(accountId:string):Promise<boolean>{if(!GENESIS_ACCOUNT_ID_RE.test(accountId))return false;const p=await inspectPendingGenesis(accountId);return!!(p.marker||p.journal||p.stagedRk||p.intentRaw||p.witnessRaw||p.activeQuarantines.length);}
+export async function pendingGenesisState(accountId:string):Promise<boolean>{if(!GENESIS_ACCOUNT_ID_RE.test(accountId))return false;const p=await inspectPendingGenesis(accountId);return!!(p.marker||p.journal||p.stagedRk||p.intentRaw||p.progressRaw||p.witnessRaw||p.activeQuarantines.length);}
 
 const legacyDeviceKeys=["deviceId","sigPubKey","sigPrivPkcs8","encPubSpki","encPrivPkcs8"] as const;
 const exactKeys=(value:object,keys:readonly string[])=>{const actual=Object.keys(value);return actual.length===keys.length&&actual.every((key)=>keys.includes(key));};
@@ -101,7 +101,7 @@ async function validatePromotedRecoveryKey(accountId:string,journal:GenesisJourn
 
 export async function classifyEnrollment(accountId:string,observation:GenesisAccountObservation,pending?:PendingGenesisArtifacts):Promise<EnrollmentClassification>{
   try{
-    const local=pending??await inspectPendingGenesis(accountId),claim=observation.claim,tomb=exactTombstone(observation),hasPartial=local.device||local.mk||local.stagedRk||!!local.intentRaw||!!local.witnessRaw;
+    const local=pending??await inspectPendingGenesis(accountId),claim=observation.claim,tomb=exactTombstone(observation),hasPartial=local.device||local.mk||local.stagedRk||!!local.intentRaw||!!local.progressRaw||!!local.witnessRaw;
     if(!claim&&!allZero(observation.present))return{kind:"integrity-failure",reason:"claim-absent child state"};
     if(local.journal&&local.journal.phase==="cleanup"){
       const journal=local.journal,receipt=journal.completionReceipts["recovery-kit-staging"];if(!receipt)throw new Error("cleanup journal has no receipt");
@@ -119,11 +119,11 @@ export async function classifyEnrollment(accountId:string,observation:GenesisAcc
       if(!claim){if(!allZero(observation.present)||expectedRepair!==null)return{kind:"integrity-failure",reason:"journal/server expected-previous mismatch"};return{kind:"resume-attempt",journal};}
       if(tomb){if(!allZero(observation.present))return{kind:"integrity-failure",reason:"child-bearing repair tombstone"};if(expectedRepair!==tomb.repairId)return{kind:"integrity-failure",reason:"journal repair id mismatch"};return{kind:"resume-attempt",journal};}
       if(tombstoneFamily(claim))return{kind:"integrity-failure",reason:"malformed repair tombstone"};await validateCompleteAccount(accountId,claim,observation.present);
-      if(!exactAttempt(claim,journal))return{kind:"competing-genesis",journal};let intent:CompletionIntent|undefined,witness:CompletionIntentRetargetWitness|undefined;if(local.witnessRaw!==undefined)witness=await parseRetargetWitness(local.witnessRaw,journal);if(local.intentRaw!==undefined)intent=parseCompletionIntent(local.intentRaw,journal);if(witness&&!intent)throw new Error("RETARGET witness without canonical intent");return{kind:"committed-this-attempt",journal,phrase,...(intent?{intent}:{}),...(witness?{witness}:{})};}
-    if(local.marker){if(hasPartial&&(local.intentRaw||local.witnessRaw))return{kind:"integrity-failure",reason:"completion state without journal"};if(!claim&&allZero(observation.present)&&local.marker.repairId===null)return{kind:"restart-prepublication",marker:local.marker};if(tomb&&allZero(observation.present)&&local.marker.repairId===tomb.repairId)return{kind:"restart-prepublication",marker:local.marker};return{kind:"integrity-failure",reason:"prepublish marker expected-previous mismatch"};}
+      if(!exactAttempt(claim,journal))return{kind:"competing-genesis",journal};let intent:CompletionIntent|undefined,witness:CompletionIntentRetargetWitness|undefined;if(local.witnessRaw!==undefined)witness=await parseRetargetWitness(local.witnessRaw,journal);if(local.intentRaw!==undefined)intent=parseCompletionIntent(local.intentRaw,journal);if(witness&&!intent)throw new Error("RETARGET witness without canonical intent");if(local.progressRaw!==undefined){if(!intent||intent.version!==2)throw new Error("destination progress without destination-set intent");await parseDestinationProgress(local.progressRaw,intent);}return{kind:"committed-this-attempt",journal,phrase,...(intent?{intent}:{}),...(witness?{witness}:{})};}
+    if(local.marker){if(hasPartial&&(local.intentRaw||local.progressRaw||local.witnessRaw))return{kind:"integrity-failure",reason:"completion state without journal"};if(!claim&&allZero(observation.present)&&local.marker.repairId===null)return{kind:"restart-prepublication",marker:local.marker};if(tomb&&allZero(observation.present)&&local.marker.repairId===tomb.repairId)return{kind:"restart-prepublication",marker:local.marker};return{kind:"integrity-failure",reason:"prepublish marker expected-previous mismatch"};}
     if(!claim)return hasPartial?{kind:"integrity-failure",reason:"unmarked local genesis material"}:{kind:"pristine"};
-    if(tomb){if(!allZero(observation.present))return{kind:"integrity-failure",reason:"child-bearing repair tombstone"};if(local.device&&local.mk&&!local.stagedRk&&!local.intentRaw&&!local.witnessRaw)return await hasExactLegacyGenesisPair(accountId)?{kind:"repaired-legacy",repairId:tomb.repairId}:{kind:"integrity-failure",reason:"malformed repaired legacy local state"};return hasPartial?{kind:"integrity-failure",reason:"malformed repaired legacy local state"}:{kind:"repair-ready",repairId:tomb.repairId};}
-    if(tombstoneFamily(claim))return{kind:"integrity-failure",reason:"malformed repair tombstone"};if(legacyOrphan(claim,observation.present))return{kind:"legacy-orphan"};const account=await validateCompleteAccount(accountId,claim,observation.present);if(local.stagedRk||local.intentRaw||local.witnessRaw)return{kind:"integrity-failure",reason:"unmarked pending material beside enrolled account"};if(local.device&&local.mk){await validateLocalEnrolledPair(accountId,claim,account);await publishGenesisEnrollmentWitness(accountId);}return{kind:"enrolled",dto:claim};
+    if(tomb){if(!allZero(observation.present))return{kind:"integrity-failure",reason:"child-bearing repair tombstone"};if(local.device&&local.mk&&!local.stagedRk&&!local.intentRaw&&!local.progressRaw&&!local.witnessRaw)return await hasExactLegacyGenesisPair(accountId)?{kind:"repaired-legacy",repairId:tomb.repairId}:{kind:"integrity-failure",reason:"malformed repaired legacy local state"};return hasPartial?{kind:"integrity-failure",reason:"malformed repaired legacy local state"}:{kind:"repair-ready",repairId:tomb.repairId};}
+    if(tombstoneFamily(claim))return{kind:"integrity-failure",reason:"malformed repair tombstone"};if(legacyOrphan(claim,observation.present))return{kind:"legacy-orphan"};const account=await validateCompleteAccount(accountId,claim,observation.present);if(local.stagedRk||local.intentRaw||local.progressRaw||local.witnessRaw)return{kind:"integrity-failure",reason:"unmarked pending material beside enrolled account"};if(local.device&&local.mk){await validateLocalEnrolledPair(accountId,claim,account);await publishGenesisEnrollmentWitness(accountId);}return{kind:"enrolled",dto:claim};
   }catch(error){return{kind:"integrity-failure",reason:error instanceof Error?error.message:"genesis classification failed"};}
 }
 

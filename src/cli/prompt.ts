@@ -15,7 +15,7 @@
  * banners/summaries keep using `style.ts`; inquirer's default chrome (which already
  * honors FORCE_COLOR) renders the widgets.
  */
-import { select, input, confirm, password, search } from "@inquirer/prompts";
+import { checkbox, select, input, confirm, password, search } from "@inquirer/prompts";
 import { ExitPromptError, createPrompt, isDownKey, isEnterKey, isTabKey, isUpKey, makeTheme, useKeypress, usePrefix, useState } from "@inquirer/core";
 import path from "node:path";
 import {
@@ -39,16 +39,49 @@ export function isInteractive(): boolean {
   return process.stdin.isTTY === true;
 }
 
-async function run<T>(p: Promise<T>): Promise<T> {
+type PromptExit = (code: number) => never;
+type ExitPromptMatcher = (error: unknown) => boolean;
+const isExitPromptError: ExitPromptMatcher = (error) => error instanceof ExitPromptError;
+
+async function run<T>(
+  p: Promise<T>,
+  exit: PromptExit = process.exit,
+  isExit: ExitPromptMatcher = isExitPromptError
+): Promise<T> {
   try {
     return await p;
   } catch (err) {
-    if (err instanceof ExitPromptError) process.exit(CANCEL_EXIT);
+    if (isExit(err)) exit(CANCEL_EXIT);
     throw err;
   }
 }
 
 export const promptSelect = <V>(cfg: Parameters<typeof select<V>>[0]) => run(select<V>(cfg, STDERR));
+
+export type CheckboxPromptConfig<V> = Parameters<typeof checkbox<V>>[0];
+export type CheckboxPrompt = <V>(cfg: CheckboxPromptConfig<V>) => Promise<V[]>;
+type CheckboxInvoker = <V>(
+  cfg: CheckboxPromptConfig<V>,
+  context: { output: NodeJS.WritableStream }
+) => Promise<V[]>;
+
+/** Construct an injected checkbox prompt while retaining the production
+ * stderr/Ctrl-C contract. Most callers should inject `typeof promptCheckbox`;
+ * this factory exists for isolated tests and embedders with their own streams. */
+export function createCheckboxPrompt(deps: {
+  invoke?: CheckboxInvoker;
+  output?: NodeJS.WritableStream;
+  exit?: PromptExit;
+  isExitPromptError?: ExitPromptMatcher;
+} = {}): CheckboxPrompt {
+  const invoke = deps.invoke ?? (checkbox as CheckboxInvoker);
+  const output = deps.output ?? process.stderr;
+  const exit = deps.exit ?? process.exit;
+  const isExit = deps.isExitPromptError ?? isExitPromptError;
+  return <V>(cfg: CheckboxPromptConfig<V>) => run(invoke(cfg, { output }), exit, isExit);
+}
+
+export const promptCheckbox: CheckboxPrompt = createCheckboxPrompt();
 
 /** A fire-and-forget `select` for the rare case where an EXTERNAL event can make the
  *  choice moot before the user answers — the browser-login flow shows this alongside

@@ -2,7 +2,16 @@ import {afterEach,beforeEach,describe,expect,test} from "bun:test";
 import fs from "node:fs/promises";import os from "node:os";import path from "node:path";
 import {bootstrapAccount,canonicalString,generateRecoveryKey,sha256Hex,utf8} from "../engine/e2ee/index.js";
 import {saveDevice,saveMasterKey} from "./e2ee-keystore.js";
-import {genesisPaths,hardenedWrite,loadStagedRecoveryKey,parseCompletionIntent,parseGenesisEnrollmentWitness,parseGenesisJournal,parsePrepublishMarker,parseRetargetWitness,publishCompletionIntent,publishGenesisEnrollmentWitness,publishGenesisJournal,publishPrepublishMarker,reconcileRetargetIntent,recordGenesisReceipt,retargetCompletionIntent,serializeCompletionIntent,stageRecoveryKey,type CompletionIntent,type GenesisJournal,type HardenedWriteOptions} from "./genesis-durable.js";
+import {
+  appendDestinationEvent,buildDestinationSetReceipt,completionIntentSha256,createDestinationProgress,foldDestinationProgress,
+  genesisPaths,hardenedWrite,loadDestinationProgress,loadStagedRecoveryKey,parseCompletionIntent,parseDestinationProgress,
+  parseGenesisEnrollmentWitness,parseGenesisJournal,parsePrepublishMarker,parseRetargetWitness,publishCompletionIntent,
+  publishDestinationProgress,publishGenesisEnrollmentWitness,publishGenesisJournal,publishPrepublishMarker,
+  reconcileRetargetIntent,recordDestinationSetReceipt,recordGenesisReceipt,replaceDestinationSetIntent,
+  retargetCompletionIntent,serializeCompletionIntent,stageRecoveryKey,
+  type CompletionIntent,type DestinationCompletion,type DestinationEvent,type DestinationSetCompletionIntent,
+  type GenesisJournal,type HardenedWriteOptions
+} from "./genesis-durable.js";
 
 const ACCOUNT="acct_0123456789abcdef";let home:string;
 beforeEach(async()=>{home=await fs.mkdtemp(path.join(os.tmpdir(),"rbox-genesis-durable-"));process.env.RBOX_HOME=home;});afterEach(async()=>{delete process.env.RBOX_HOME;await fs.rm(home,{recursive:true,force:true});});
@@ -112,5 +121,117 @@ describe("design 180 durable genesis artifacts",()=>{
     const cleanup=await recordGenesisReceipt(j,{outcome:"artifact-committed",at:"2026-07-22T12:05:00.000Z",artifact:{mode:"keychain",service:"rbox recovery phrase",account:ACCOUNT,keychainPath:path.resolve(home,"login.keychain")}});
     await expect(retargetCompletionIntent(cleanup,oldIntent,newIntent,"2026-07-22T12:06:00.000Z")).rejects.toThrow(/not authorized/);
     await expect(recordGenesisReceipt(cleanup,{outcome:"artifact-committed",at:"2026-07-22T12:07:00.000Z",artifact:{mode:"kit-path",path:path.resolve(home,"kit.txt")}})).rejects.toThrow(/monotone/);
+  });
+});
+
+describe("design 187 durable destination sets",()=>{
+  async function intent(destinations:DestinationSetCompletionIntent["destinations"]):Promise<{j:GenesisJournal;intent:DestinationSetCompletionIntent}>{
+    const j=await journal();
+    return{j,intent:{version:2,accountId:ACCOUNT,requestSha256:j.requestSha256,mode:"destination-set",destinations,successThreshold:1,intentAt:"2026-07-23T12:00:00.000Z"}};
+  }
+  const keychain=()=>({kind:"keychain" as const,service:"rbox recovery phrase" as const,account:ACCOUNT,keychainPath:path.resolve(home,"login.keychain")});
+  const kit=()=>({kind:"kit-path" as const,path:path.resolve(home,"kit.txt")});
+  const onePassword=()=>({kind:"onepassword" as const,accountUuid:"acctUUID_1",vaultUuid:"vaultUUID_1",operationTag:"rbox_op_1",fieldId:"rboxRecoveryPhrase" as const});
+
+  test("v2 intent accepts one-to-four unique canonical destinations and rejects reordered or unsafe fields",async()=>{
+    const {j,intent:valid}=await intent([onePassword(),keychain(),kit(),{kind:"clipboard"}]);
+    expect(parseCompletionIntent(serializeCompletionIntent(valid),j)).toEqual(valid);
+    for(const candidate of [
+      {...valid,destinations:[]},
+      {...valid,destinations:[kit(),kit()]},
+      {...valid,destinations:[kit(),keychain()]},
+      {...valid,destinations:[{...onePassword(),accountUuid:"bad\nuuid"}]},
+      {...valid,destinations:[{...keychain(),account:"acct_ffffffffffffffff"}]},
+      {...valid,destinations:[{kind:"kit-path",path:"relative"}]},
+      {...valid,successThreshold:2},
+      {...valid,extra:true},
+    ])expect(()=>parseCompletionIntent(canonicalString(candidate),j)).toThrow();
+  });
+
+  test("progress is exact-intent-bound, append-only, and folds completion/invalidation",async()=>{
+    const {intent:plan}=await intent([onePassword(),kit()]);
+    await publishCompletionIntent(plan,await journal());
+    let progress=await createDestinationProgress(plan);await publishDestinationProgress(plan,progress);
+    const events:DestinationEvent[]=[
+      {kind:"op-dispatch-prepared",destinationIndex:0,attemptId:"attempt_1",at:"2026-07-23T12:01:00.000Z"},
+      {kind:"op-may-have-dispatched",destinationIndex:0,attemptId:"attempt_1",at:"2026-07-23T12:02:00.000Z"},
+      {kind:"completed",destinationIndex:0,completion:{...onePassword(),itemUuid:"itemUUID_1",completedAt:"2026-07-23T12:03:00.000Z"},at:"2026-07-23T12:03:00.000Z"},
+      {kind:"completed",destinationIndex:1,completion:{...kit(),completedAt:"2026-07-23T12:04:00.000Z"},at:"2026-07-23T12:04:00.000Z"},
+    ];
+    for(const event of events)progress=await appendDestinationEvent(plan,progress,event);
+    expect((await foldDestinationProgress(plan,progress.events)).completions.filter(Boolean)).toHaveLength(2);
+    const prior=progress.events[2] as Extract<DestinationEvent,{kind:"completed"}>;
+    progress=await appendDestinationEvent(plan,progress,{kind:"invalidated",destinationIndex:0,priorCompletionSha256:await sha256Hex(utf8(canonicalString(prior.completion))),reason:"missing",at:"2026-07-23T12:05:00.000Z"});
+    expect((await foldDestinationProgress(plan,progress.events)).completions).toEqual([undefined,events[3] && (events[3] as Extract<DestinationEvent,{kind:"completed"}>).completion]);
+    await expect(appendDestinationEvent(plan,{...progress,events:progress.events.slice(0,-1)}, {kind:"completed",destinationIndex:1,completion:{...kit(),completedAt:"2026-07-23T12:06:00.000Z"},at:"2026-07-23T12:06:00.000Z"})).rejects.toThrow(/exact canonical/);
+    await expect(parseDestinationProgress(canonicalString({...progress,intentSha256:"0".repeat(64)}),plan)).rejects.toThrow();
+  });
+
+  test("a completed event whose completion timestamp precedes its event time still folds (no wall-clock equality)",async()=>{
+    // Regression: parseDestinationEvent used to require completion.completedAt ===
+    // at, which manufactured a "completion event timestamp mismatch" whenever a
+    // durable write between the two samples crossed a millisecond. The completion
+    // carries its own authoritative timestamp; only `at` drives monotonicity.
+    const {intent:plan}=await intent([onePassword()]);
+    await publishCompletionIntent(plan,await journal());
+    let progress=await createDestinationProgress(plan);await publishDestinationProgress(plan,progress);
+    progress=await appendDestinationEvent(plan,progress,{kind:"op-dispatch-prepared",destinationIndex:0,attemptId:"attempt_1",at:"2026-07-23T12:01:00.000Z"});
+    progress=await appendDestinationEvent(plan,progress,{kind:"op-may-have-dispatched",destinationIndex:0,attemptId:"attempt_1",at:"2026-07-23T12:02:00.000Z"});
+    // completion.completedAt (12:03:00.100) is EARLIER than the event `at` (12:03:00.900).
+    progress=await appendDestinationEvent(plan,progress,{kind:"completed",destinationIndex:0,completion:{...onePassword(),itemUuid:"itemUUID_1",completedAt:"2026-07-23T12:03:00.100Z"},at:"2026-07-23T12:03:00.900Z"});
+    const folded=await foldDestinationProgress(plan,progress.events);
+    expect(folded.completions[0]).toMatchObject({kind:"onepassword",itemUuid:"itemUUID_1",completedAt:"2026-07-23T12:03:00.100Z"});
+    // and it survives a round-trip through the strict parser.
+    expect((await parseDestinationProgress(canonicalString(progress),plan)).events).toHaveLength(3);
+  });
+
+  test("1Password retry transitions allow a new attempt only after strict child-not-started",async()=>{
+    const {intent:plan}=await intent([onePassword()]);
+    let progress=await createDestinationProgress(plan);await publishDestinationProgress(plan,progress);
+    progress=await appendDestinationEvent(plan,progress,{kind:"op-dispatch-prepared",destinationIndex:0,attemptId:"attempt_1",at:"2026-07-23T12:01:00.000Z"});
+    await expect(appendDestinationEvent(plan,progress,{kind:"op-dispatch-prepared",destinationIndex:0,attemptId:"attempt_2",at:"2026-07-23T12:02:00.000Z"})).rejects.toThrow(/prepare transition/);
+    progress=await appendDestinationEvent(plan,progress,{kind:"op-may-have-dispatched",destinationIndex:0,attemptId:"attempt_1",at:"2026-07-23T12:02:00.000Z"});
+    await expect(appendDestinationEvent(plan,progress,{kind:"op-child-not-started",destinationIndex:0,attemptId:"attempt_1",reason:"other" as "spawn-enoent",at:"2026-07-23T12:03:00.000Z"})).rejects.toThrow();
+    progress=await appendDestinationEvent(plan,progress,{kind:"op-child-not-started",destinationIndex:0,attemptId:"attempt_1",reason:"spawn-enoent",at:"2026-07-23T12:03:00.000Z"});
+    progress=await appendDestinationEvent(plan,progress,{kind:"op-dispatch-prepared",destinationIndex:0,attemptId:"attempt_2",at:"2026-07-23T12:04:00.000Z"});
+    expect((await foldDestinationProgress(plan,progress.events)).attempts[0]).toEqual({attemptId:"attempt_2",state:"prepared"});
+  });
+
+  test("receipt contains only folded live-valid completions and requires explicit partial continuation",async()=>{
+    const {j,intent:plan}=await intent([keychain(),kit()]);
+    await publishCompletionIntent(plan,j);let progress=await createDestinationProgress(plan);await publishDestinationProgress(plan,progress);
+    progress=await appendDestinationEvent(plan,progress,{kind:"completed",destinationIndex:0,completion:{...keychain(),completedAt:"2026-07-23T12:01:00.000Z"},at:"2026-07-23T12:01:00.000Z"});
+    await expect(buildDestinationSetReceipt(plan,progress,[0],false,"2026-07-23T12:02:00.000Z")).rejects.toThrow(/explicit continuation/);
+    const receipt=await buildDestinationSetReceipt(plan,progress,[0],true,"2026-07-23T12:02:00.000Z");
+    expect(receipt.completions).toEqual([{...keychain(),completedAt:"2026-07-23T12:01:00.000Z"}]);
+    expect(receipt.intentSha256).toBe(await completionIntentSha256(plan));
+    const cleanup=await recordDestinationSetReceipt(j,plan,progress,[0],true,"2026-07-23T12:02:00.000Z");
+    expect((await parseGenesisJournal(canonicalString(cleanup))).completionReceipts["recovery-kit-staging"]).toEqual(receipt);
+  });
+
+  test("witnessed intent+progress replacement carries every live-valid completion and reconciles mixed pairs",async()=>{
+    for(const pair of ["old-old","new-old","old-new","new-new"] as const){
+      await fs.rm(genesisPaths(ACCOUNT).dir,{recursive:true,force:true});
+      const {j,intent:oldPlan}=await intent([keychain(),kit()]);
+      const newPlan:DestinationSetCompletionIntent={...oldPlan,destinations:[kit(),{kind:"clipboard"}],intentAt:"2026-07-23T12:05:00.000Z"};
+      await publishCompletionIntent(oldPlan,j);let oldProgress=await createDestinationProgress(oldPlan);await publishDestinationProgress(oldPlan,oldProgress);
+      const completion:DestinationCompletion={...kit(),completedAt:"2026-07-23T12:01:00.000Z"};
+      oldProgress=await appendDestinationEvent(oldPlan,oldProgress,{kind:"completed",destinationIndex:1,completion,at:"2026-07-23T12:01:00.000Z"});
+      const mapping={oldDestinationIndex:1,newDestinationIndex:0,completionSha256:await sha256Hex(utf8(canonicalString(completion)))};
+      await replaceDestinationSetIntent(j,oldPlan,oldProgress,newPlan,[mapping],[1],"2026-07-23T12:06:00.000Z");
+      const witness=await parseRetargetWitness(await fs.readFile(genesisPaths(ACCOUNT).witness,"utf8"),j);
+      if(witness.version!==2)throw new Error("expected destination-set witness");
+      const [intentSide,progressSide]=pair.split("-") as ["old"|"new","old"|"new"];
+      await hardenedWrite(genesisPaths(ACCOUNT).intent,serializeCompletionIntent(intentSide==="old"?witness.oldIntent:witness.newIntent));
+      await hardenedWrite(genesisPaths(ACCOUNT).progress,canonicalString(progressSide==="old"?witness.oldProgress:witness.newProgress));
+      const survivor=await reconcileRetargetIntent(j);
+      expect(survivor?.version).toBe(2);
+      if(!survivor||survivor.version!==2)throw new Error("expected destination-set survivor");
+      const survivorProgress=await loadDestinationProgress(survivor);
+      const folded=await foldDestinationProgress(survivor,survivorProgress.events);
+      expect(folded.completions.filter(Boolean)).toEqual([completion]);
+      expect(survivor).toEqual(intentSide==="new"?newPlan:oldPlan);
+      await expect(fs.access(genesisPaths(ACCOUNT).witness)).rejects.toThrow();
+    }
   });
 });

@@ -53,11 +53,39 @@ export interface RecoveryKitOffer {
   outcome: RecoveryKitOfferOutcome;
 }
 
+export const ONE_PASSWORD_FIELD_ID = "rboxRecoveryPhrase" as const;
+export const MAX_ONE_PASSWORD_ARTIFACTS = 16;
+
+export interface OnePasswordArtifactIdentity {
+  rboxAccountId: string;
+  accountUuid: string;
+  vaultUuid: string;
+  itemUuid: string;
+  fieldId: typeof ONE_PASSWORD_FIELD_ID;
+  operationTag: string;
+}
+
+export type OnePasswordArtifact = OnePasswordArtifactIdentity & {
+  writtenAt: string;
+} & (
+  | { state: "active" }
+  | {
+      state: "invalidated";
+      invalidatedAt: string;
+      invalidationReason: "missing" | "mismatch";
+    }
+);
+
+export type OnePasswordArtifactStatus =
+  | (OnePasswordArtifact & { status: "recorded" })
+  | (OnePasswordArtifact & { status: "invalidated" });
+
 export interface RecoveryKitRecord {
-  version: 2;
+  version: 3;
   accountId: string;
   keychain?: KeychainArtifact;
   plaintextArtifacts: PlaintextArtifact[];
+  onePasswordArtifacts: OnePasswordArtifact[];
   offer?: RecoveryKitOffer;
 }
 
@@ -116,6 +144,10 @@ function exactKeys(value: object, allowed: readonly string[]): boolean {
 function isObject(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value) }
 function validIso(value: unknown): value is string { return typeof value === "string" && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value }
 function validAbsolute(value: unknown): value is string { return typeof value === "string" && path.isAbsolute(value) && path.normalize(value) === value && !value.includes("\0") && !/[\r\n]/.test(value) }
+function validProviderId(value: unknown): value is string { return typeof value === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(value) }
+function validOperationTag(value: unknown): value is string {
+  return typeof value === "string" && value.length >= 1 && value.length <= 128 && !/[\u0000-\u001f\u007f]/.test(value);
+}
 
 function parsePlaintextArtifact(value: unknown): PlaintextArtifact | undefined {
   if (!isObject(value) || !exactKeys(value, ["path", "writtenAt", "cleanup"])) return undefined;
@@ -142,20 +174,79 @@ function parseOffer(value: unknown): RecoveryKitOffer | undefined {
   return value as unknown as RecoveryKitOffer;
 }
 
+function parseOnePasswordArtifact(value: unknown, accountId: string): OnePasswordArtifact | undefined {
+  if (!isObject(value)) return undefined;
+  const common = ["rboxAccountId", "accountUuid", "vaultUuid", "itemUuid", "fieldId", "operationTag", "writtenAt", "state"];
+  const activeKeys = common;
+  const invalidatedKeys = [...common, "invalidatedAt", "invalidationReason"];
+  if (value.state === "active") {
+    if (!exactKeys(value, activeKeys)) return undefined;
+  } else if (value.state === "invalidated") {
+    if (!exactKeys(value, invalidatedKeys)) return undefined;
+    if (!validIso(value.invalidatedAt) || !["missing", "mismatch"].includes(String(value.invalidationReason))) return undefined;
+  } else {
+    return undefined;
+  }
+  if (value.rboxAccountId !== accountId || value.fieldId !== ONE_PASSWORD_FIELD_ID || !validIso(value.writtenAt)) return undefined;
+  if (!validProviderId(value.accountUuid) || !validProviderId(value.vaultUuid) || !validProviderId(value.itemUuid) || !validOperationTag(value.operationTag)) return undefined;
+  const identity: OnePasswordArtifactIdentity = {
+    rboxAccountId: accountId,
+    accountUuid: value.accountUuid,
+    vaultUuid: value.vaultUuid,
+    itemUuid: value.itemUuid,
+    fieldId: ONE_PASSWORD_FIELD_ID,
+    operationTag: value.operationTag,
+  };
+  return value.state === "active"
+    ? { ...identity, writtenAt: value.writtenAt, state: "active" }
+    : {
+        ...identity,
+        writtenAt: value.writtenAt,
+        state: "invalidated",
+        invalidatedAt: value.invalidatedAt as string,
+        invalidationReason: value.invalidationReason as "missing" | "mismatch",
+      };
+}
+
+function sameOnePasswordIdentity(left: OnePasswordArtifactIdentity, right: OnePasswordArtifactIdentity): boolean {
+  return left.accountUuid === right.accountUuid && left.vaultUuid === right.vaultUuid && left.itemUuid === right.itemUuid;
+}
+
 export function parseRecoveryKitRecord(value: unknown, accountId: string): RecoveryKitRecord | undefined {
   if (!isObject(value)) return undefined;
   if (!("version" in value) && !("kind" in value) && exactKeys(value, ["path", "writtenAt"]) && validAbsolute(value.path) && validIso(value.writtenAt)) {
-    return { version: 2, accountId, plaintextArtifacts: [{ path: value.path, writtenAt: value.writtenAt, cleanup: "pending" }] };
+    return { version: 3, accountId, plaintextArtifacts: [{ path: value.path, writtenAt: value.writtenAt, cleanup: "pending" }], onePasswordArtifacts: [] };
   }
-  const allowed = ["version", "accountId", "keychain", "plaintextArtifacts", "offer"];
-  if (!Object.keys(value).every((key) => allowed.includes(key)) || value.version !== 2 || value.accountId !== accountId || !Array.isArray(value.plaintextArtifacts)) return undefined;
+  const v2Allowed = ["version", "accountId", "keychain", "plaintextArtifacts", "offer"];
+  const v3Allowed = [...v2Allowed, "onePasswordArtifacts"];
+  if (value.version !== 2 && value.version !== 3) return undefined;
+  const allowed = value.version === 2 ? v2Allowed : v3Allowed;
+  if (!Object.keys(value).every((key) => allowed.includes(key)) || value.accountId !== accountId || !Array.isArray(value.plaintextArtifacts)) return undefined;
   if (!("version" in value) || !("accountId" in value) || !("plaintextArtifacts" in value)) return undefined;
+  if (value.version === 3 && !Array.isArray(value.onePasswordArtifacts)) return undefined;
   const plaintextArtifacts = value.plaintextArtifacts.map(parsePlaintextArtifact);
   if (plaintextArtifacts.some((item) => !item)) return undefined;
   const keychain = value.keychain === undefined ? undefined : parseKeychainArtifact(value.keychain, accountId);
   const offer = value.offer === undefined ? undefined : parseOffer(value.offer);
   if (value.keychain !== undefined && !keychain || value.offer !== undefined && !offer) return undefined;
-  return { version: 2, accountId, ...(keychain ? { keychain } : {}), plaintextArtifacts: plaintextArtifacts as PlaintextArtifact[], ...(offer ? { offer } : {}) };
+  const onePasswordArtifacts = value.version === 3
+    ? (value.onePasswordArtifacts as unknown[]).map((artifact) => parseOnePasswordArtifact(artifact, accountId))
+    : [];
+  if (onePasswordArtifacts.length > MAX_ONE_PASSWORD_ARTIFACTS || onePasswordArtifacts.some((artifact) => !artifact)) return undefined;
+  const identities = new Set<string>();
+  for (const artifact of onePasswordArtifacts as OnePasswordArtifact[]) {
+    const identity = `${artifact.accountUuid}\0${artifact.vaultUuid}\0${artifact.itemUuid}`;
+    if (identities.has(identity)) return undefined;
+    identities.add(identity);
+  }
+  return {
+    version: 3,
+    accountId,
+    ...(keychain ? { keychain } : {}),
+    plaintextArtifacts: plaintextArtifacts as PlaintextArtifact[],
+    onePasswordArtifacts: onePasswordArtifacts as OnePasswordArtifact[],
+    ...(offer ? { offer } : {}),
+  };
 }
 
 export async function readRecoveryKitRecordState(accountId: string): Promise<RecoveryKitRecordRead> {
@@ -250,7 +341,7 @@ export async function mutateRecoveryKitRecord(accountId: string, mutate: (curren
   return withRecordLock(accountId, async () => {
     const loaded = await readRecoveryKitRecordState(accountId);
     if (loaded.state === "unknown") throw new Error("refusing to overwrite an unknown recovery-kit record");
-    const current = loaded.state === "recognized" ? loaded.record : { version: 2 as const, accountId, plaintextArtifacts: [] };
+    const current = loaded.state === "recognized" ? loaded.record : { version: 3 as const, accountId, plaintextArtifacts: [], onePasswordArtifacts: [] };
     return writeRecoveryKitRecordUnlocked(accountId, mutate(current));
   });
 }
@@ -298,6 +389,73 @@ export async function mergeDiscoveredKeychainArtifact(accountId: string, artifac
   return outcome;
 }
 
+export async function recordOnePasswordArtifact(accountId: string, artifact: OnePasswordArtifact): Promise<"recorded" | "unchanged"> {
+  const parsed = parseOnePasswordArtifact(artifact, accountId);
+  if (!parsed || parsed.state !== "active") throw new Error("invalid active 1Password artifact metadata");
+  let outcome: "recorded" | "unchanged" = "recorded";
+  await mutateRecoveryKitRecord(accountId, (current) => {
+    const existing = current.onePasswordArtifacts.find((candidate) => sameOnePasswordIdentity(candidate, parsed));
+    if (existing) {
+      // Idempotent re-record: the same active item (same account/vault/item
+      // identity, operationTag, field, and rbox account) may be recorded again on
+      // resume after a crash between the provider write and the durable progress
+      // append. Tolerate a drifted `writtenAt` — keep the original record — rather
+      // than hard-erroring, which previously wedged that destination permanently.
+      if (existing.state === "active"
+        && existing.operationTag === parsed.operationTag
+        && existing.fieldId === parsed.fieldId
+        && existing.rboxAccountId === parsed.rboxAccountId) {
+        outcome = "unchanged";
+        return current;
+      }
+      throw new Error("conflicting 1Password artifact identity");
+    }
+    if (current.onePasswordArtifacts.length >= MAX_ONE_PASSWORD_ARTIFACTS) throw new Error("1Password artifact history is full");
+    return { ...current, onePasswordArtifacts: [...current.onePasswordArtifacts, parsed] };
+  });
+  return outcome;
+}
+
+export async function invalidateOnePasswordArtifact(
+  accountId: string,
+  identity: OnePasswordArtifactIdentity,
+  reason: "missing" | "mismatch",
+  now = new Date(),
+): Promise<"invalidated" | "unchanged"> {
+  const probe = parseOnePasswordArtifact({ ...identity, writtenAt: now.toISOString(), state: "active" }, accountId);
+  if (!probe) throw new Error("invalid 1Password artifact identity");
+  let outcome: "invalidated" | "unchanged" = "invalidated";
+  await mutateRecoveryKitRecord(accountId, (current) => {
+    const index = current.onePasswordArtifacts.findIndex((candidate) => sameOnePasswordIdentity(candidate, probe));
+    if (index < 0) throw new Error("1Password artifact identity is not recorded");
+    const existing = current.onePasswordArtifacts[index]!;
+    if (existing.operationTag !== identity.operationTag || existing.fieldId !== identity.fieldId || existing.rboxAccountId !== identity.rboxAccountId) {
+      throw new Error("1Password artifact locator does not match the recorded active artifact");
+    }
+    if (existing.state === "invalidated") {
+      if (existing.invalidationReason !== reason) throw new Error("1Password artifact has a conflicting invalidation");
+      outcome = "unchanged";
+      return current;
+    }
+    const replacement: OnePasswordArtifact = {
+      ...existing,
+      state: "invalidated",
+      invalidatedAt: now.toISOString(),
+      invalidationReason: reason,
+    };
+    const onePasswordArtifacts = [...current.onePasswordArtifacts];
+    onePasswordArtifacts[index] = replacement;
+    return { ...current, onePasswordArtifacts };
+  });
+  return outcome;
+}
+
+export function onePasswordArtifactStatuses(record: RecoveryKitRecord): OnePasswordArtifactStatus[] {
+  return record.onePasswordArtifacts.map((artifact) => artifact.state === "active"
+    ? { ...artifact, status: "recorded" }
+    : { ...artifact, status: "invalidated" });
+}
+
 export async function claimRecoveryKitOffer(
   accountId: string,
   surface: RecoveryKitOfferSurface,
@@ -313,7 +471,7 @@ export async function claimRecoveryKitOffer(
       return await withRecordLock(accountId, async () => {
         const loaded = await readRecoveryKitRecordState(accountId);
         if (loaded.state === "unknown") throw new Error("refusing to overwrite an unknown recovery-kit record");
-        const current = loaded.state === "recognized" ? loaded.record : { version: 2 as const, accountId, plaintextArtifacts: [] };
+        const current = loaded.state === "recognized" ? loaded.record : { version: 3 as const, accountId, plaintextArtifacts: [], onePasswordArtifacts: [] };
         if (current.offer || !(await actionablePreflight())) return false;
         await writeRecoveryKitRecordUnlocked(accountId, { ...current, offer: { claimedAt: now.toISOString(), surface, phraseSource, outcome: "claimed" } });
         return true;
@@ -403,6 +561,7 @@ export function recoveryKitSafety(recordState: RecoveryKitRecordRead, states: { 
     || Boolean(record.keychain && states.keychain === "present" && !pathIsInsideRemovalRoot(record.keychain.keychainPath, removalRoot));
   if (presentOutside) return "backed-up";
   if (states.keychain === "unavailable" || states.plaintext.includes("unavailable")) return "unknown";
+  if (record.onePasswordArtifacts.some((artifact) => artifact.state === "active")) return "unknown";
   return "at-risk";
 }
 
