@@ -152,3 +152,65 @@ device is lost.
 
 **Result:** PASS — no remaining P1/P2 correctness, security, or onboarding
 blockers.
+
+## Round 7 — post-implementation adversarial review (PR #408)
+
+**Reviewers:** two independent reviewers (Claude/Opus + a second independent
+review), run against the implemented branch, not the design.
+
+**Result:** NOT-MERGEABLE — 2 BLOCKERs, plus MAJOR/MINOR follow-ups. All fixed
+on the branch; entry recorded so the history stays truthful.
+
+**The lesson — the frozen-2030 clock hid the flagship feature being broken.**
+Every destination-set/1Password test pinned `now: () => 1_900_000_000_000`
+(year 2030). `completeGenesisDestinationSet`'s `eventAt()` clamps to
+`max(realNow, progress.updatedAt)`, so with a far-future injected `now` every
+call returned the *same* constant string. That masked all wall-clock behaviour.
+On a real clock (`Date.now()`) the feature failed 100% of the time. A pinned
+far-future clock must never be the only coverage of timestamp-bearing flows.
+
+1. **BLOCKER — 1Password (and latently every) completion failed on a real
+   clock.** `parseDestinationEvent` required `completion.completedAt === at`.
+   The caller sampled the clock twice (once for the completion, once for the
+   event), and for 1Password an `await recordOnePasswordArtifact` (a durable
+   kit.json write) sat between the two samples, so `at` landed a millisecond
+   later → `"completion event timestamp mismatch"` → the verified, recorded save
+   was reported as failed.
+   Fixed per founder guidance by *removing the manufactured strictness*: dropped
+   the equality requirement in the parser (the completion is embedded in and
+   bound to the event; only `at` drives the fold's monotonicity, which is
+   retained) and made the caller derive the event `at` from the completion's own
+   authoritative timestamp (a single sample per completion). Reproduced with a
+   `Date.now()` test that is now a permanent regression.
+2. **BLOCKER — retry/resume wedge.** After a crash between the provider write and
+   the durable progress append, resume re-recorded the same verified item with a
+   freshly sampled `writtenAt`; `recordOnePasswordArtifact` hard-errored on
+   `"conflicting 1Password artifact identity"` and the destination could never
+   complete. Fixed by making the re-record idempotent for a byte-identical active
+   item identity (same account/vault/item UUID, operationTag, field, rbox
+   account), tolerating `writtenAt` drift and keeping the original record. A
+   genuinely different operationTag/field still fails closed.
+3. **MAJOR (UX) — declined/ambiguous 1Password create was a Retry dead-end.**
+   The fail-closed invariant (never create a duplicate once may-have-dispatched)
+   is correct and kept, but the copy promised "rbox will reconcile it before
+   retrying" while plain Retry could only re-throw. Copy now tells the user to
+   pick "Change incomplete choices" to set up 1Password again.
+4. **MINOR — clipboard decline left the phrase on the clipboard.** Declining the
+   "did you paste and save it?" confirmation now best-effort clears the clipboard
+   before failing, honouring the disclosure's promise.
+5. **MINOR — invalidation reason was hardcoded `mismatch`.** Now records
+   `missing` vs `mismatch` from the actual probe (keychain/file missing →
+   `missing`; wrong-content file or 1Password readback mismatch → `mismatch`).
+6. **MINOR — silent orphan on Change.** Replacing an incomplete 1Password choice
+   that reached may-have-dispatched now prints a non-blocking note that an
+   unconfirmed item may remain in the vault (design's failure semantics), without
+   claiming it is absent.
+7. **NIT — `attemptOnePasswordRecoverySave`** is not called by the production
+   genesis flow (which drives the primitives directly to interleave durable
+   progress); documented as test-only. The v3 kit.json bump and `op` 2.x version
+   gate were left as-is.
+
+**Verification:** `bun run typecheck`, `bun run guards`, and the focused suites
+for auth-cmd, genesis-durable, recovery-kit, recovery-kit-1password,
+recovery-secret-clipboard, json-output, prompt (+ genesis-seam/enrollment) all
+green, including the new real-clock regressions.

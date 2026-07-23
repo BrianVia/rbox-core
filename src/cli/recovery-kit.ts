@@ -396,7 +396,15 @@ export async function recordOnePasswordArtifact(accountId: string, artifact: One
   await mutateRecoveryKitRecord(accountId, (current) => {
     const existing = current.onePasswordArtifacts.find((candidate) => sameOnePasswordIdentity(candidate, parsed));
     if (existing) {
-      if (JSON.stringify(existing) === JSON.stringify(parsed)) {
+      // Idempotent re-record: the same active item (same account/vault/item
+      // identity, operationTag, field, and rbox account) may be recorded again on
+      // resume after a crash between the provider write and the durable progress
+      // append. Tolerate a drifted `writtenAt` — keep the original record — rather
+      // than hard-erroring, which previously wedged that destination permanently.
+      if (existing.state === "active"
+        && existing.operationTag === parsed.operationTag
+        && existing.fieldId === parsed.fieldId
+        && existing.rboxAccountId === parsed.rboxAccountId) {
         outcome = "unchanged";
         return current;
       }

@@ -567,6 +567,11 @@ export async function verifyOnePasswordRecoveryItem(
   }
 }
 
+/** Test-only composition of reconcile → verify → create → verify. The production
+ * genesis flow (`completeGenesisDestinationSet`) drives these primitives directly
+ * so it can interleave durable progress events (prepared / may-have-dispatched)
+ * around the create; this convenience wrapper is retained only for unit coverage
+ * of the reconcile/create/verify composition and is not called at runtime. */
 export async function attemptOnePasswordRecoverySave(
   provider: OnePasswordProvider,
   input: {

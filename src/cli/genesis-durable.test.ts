@@ -167,6 +167,24 @@ describe("design 187 durable destination sets",()=>{
     await expect(parseDestinationProgress(canonicalString({...progress,intentSha256:"0".repeat(64)}),plan)).rejects.toThrow();
   });
 
+  test("a completed event whose completion timestamp precedes its event time still folds (no wall-clock equality)",async()=>{
+    // Regression: parseDestinationEvent used to require completion.completedAt ===
+    // at, which manufactured a "completion event timestamp mismatch" whenever a
+    // durable write between the two samples crossed a millisecond. The completion
+    // carries its own authoritative timestamp; only `at` drives monotonicity.
+    const {intent:plan}=await intent([onePassword()]);
+    await publishCompletionIntent(plan,await journal());
+    let progress=await createDestinationProgress(plan);await publishDestinationProgress(plan,progress);
+    progress=await appendDestinationEvent(plan,progress,{kind:"op-dispatch-prepared",destinationIndex:0,attemptId:"attempt_1",at:"2026-07-23T12:01:00.000Z"});
+    progress=await appendDestinationEvent(plan,progress,{kind:"op-may-have-dispatched",destinationIndex:0,attemptId:"attempt_1",at:"2026-07-23T12:02:00.000Z"});
+    // completion.completedAt (12:03:00.100) is EARLIER than the event `at` (12:03:00.900).
+    progress=await appendDestinationEvent(plan,progress,{kind:"completed",destinationIndex:0,completion:{...onePassword(),itemUuid:"itemUUID_1",completedAt:"2026-07-23T12:03:00.100Z"},at:"2026-07-23T12:03:00.900Z"});
+    const folded=await foldDestinationProgress(plan,progress.events);
+    expect(folded.completions[0]).toMatchObject({kind:"onepassword",itemUuid:"itemUUID_1",completedAt:"2026-07-23T12:03:00.100Z"});
+    // and it survives a round-trip through the strict parser.
+    expect((await parseDestinationProgress(canonicalString(progress),plan)).events).toHaveLength(3);
+  });
+
   test("1Password retry transitions allow a new attempt only after strict child-not-started",async()=>{
     const {intent:plan}=await intent([onePassword()]);
     let progress=await createDestinationProgress(plan);await publishDestinationProgress(plan,progress);

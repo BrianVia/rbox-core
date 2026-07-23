@@ -378,9 +378,13 @@ function parseDestinationEvent(value: unknown, intent: DestinationSetCompletionI
   }
   if (value.kind === "completed") {
     if (!exactKeys(value, ["kind","destinationIndex","completion","at"])) throw new Error("invalid completed event");
+    // The completion carries its own authoritative timestamp; the event's `at`
+    // only drives the append-order/monotonicity fold. We deliberately do NOT
+    // require completion.completedAt === at — that equality added no integrity
+    // (the completion is embedded in and bound to the event) and manufactured a
+    // hard failure whenever a durable write between capturing the two crossed a
+    // millisecond boundary during first-run setup.
     const completion=parseDestinationCompletion(value.completion,intent.destinations[index]);
-    const completionAt=completion.kind==="clipboard"?completion.confirmedAt:completion.completedAt;
-    if(completionAt!==value.at)throw new Error("completion event timestamp mismatch");
     return { kind: "completed", destinationIndex: index, completion, at: value.at as string };
   }
   if (value.kind === "invalidated") {

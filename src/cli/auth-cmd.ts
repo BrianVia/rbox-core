@@ -369,14 +369,19 @@ async function completeGenesisDestinationSet(
       const prior = folded.completions[index];
       if (prior) {
         let state: "valid" | "invalid" | "unverifiable" = "valid";
+        // Distinguish authoritative-missing from authoritative-mismatch so the
+        // durable invalidation records the real reason (MINOR 6).
+        let invalidReason: "missing" | "mismatch" = "missing";
         if (prior.kind === "keychain") {
           const probe = await probeKeychainKit(prior);
           state = probe === "present" ? "valid" : probe === "missing" ? "invalid" : "unverifiable";
+          invalidReason = "missing";
         } else if (prior.kind === "kit-path") {
           const probe = await readPlaintextKit(prior.path);
-          state = probe.state === "present" && probe.accountId === creds.accountId && probe.phrase === context.phrase
-            ? "valid"
-            : probe.state === "missing" || probe.state === "present" || probe.state === "unrecognized" ? "invalid" : "unverifiable";
+          if (probe.state === "present" && probe.accountId === creds.accountId && probe.phrase === context.phrase) state = "valid";
+          else if (probe.state === "missing") { state = "invalid"; invalidReason = "missing"; }
+          else if (probe.state === "present" || probe.state === "unrecognized") { state = "invalid"; invalidReason = "mismatch"; }
+          else state = "unverifiable";
         } else if (prior.kind === "onepassword") {
           const discovery = await (deps.detectOnePassword ?? detectOnePasswordCli)();
           if (discovery.state !== "available") state = "unverifiable";
@@ -389,6 +394,7 @@ async function completeGenesisDestinationSet(
                 expected
               );
               state = verification === "valid" ? "valid" : verification === "mismatch" ? "invalid" : "unverifiable";
+              invalidReason = "mismatch";
             } finally {
               expected.fill(0);
             }
@@ -407,13 +413,13 @@ async function completeGenesisDestinationSet(
               itemUuid: prior.itemUuid,
               fieldId: prior.fieldId,
               operationTag: prior.operationTag,
-            }, "mismatch");
+            }, invalidReason);
           }
           context.progress = await context.append({
             kind: "invalidated",
             destinationIndex: index,
             priorCompletionSha256: await sha256Hex(utf8(canonicalString(prior))),
-            reason: "mismatch",
+            reason: invalidReason,
             at: eventAt(),
           });
         } else {
@@ -443,6 +449,10 @@ async function completeGenesisDestinationSet(
           const copied = await (deps.copyClipboard ?? copyRecoverySecretToClipboard)(context.phrase);
           if (!copied.ok) throw new Error("clipboard copy failed");
           if (!(await confirm({ message: "Have you pasted and saved the phrase somewhere durable?", default: false }))) {
+            // The phrase is on the clipboard; best-effort clear it before we bail
+            // so declining doesn't leave it lingering there (the disclosure said
+            // rbox clears the clipboard). Failure to clear is non-fatal here.
+            await (deps.clearClipboard ?? clearRecoverySecretClipboard)().catch(() => {});
             throw new Error("not yet confirmed saved");
           }
           const cleared = await (deps.clearClipboard ?? clearRecoverySecretClipboard)();
@@ -461,7 +471,11 @@ async function completeGenesisDestinationSet(
             locator = reconciliation.locator;
           } else if (reconciliation.state === "missing") {
             const attempt = folded.attempts[index];
-            if (attempt && attempt.state !== "child-not-started") throw new Error("1Password result is ambiguous; no duplicate was created");
+            // Fail closed: once an attempt reached may-have-dispatched, an item
+            // might exist in the vault even though we can't see it, so we never
+            // create a second one. A plain Retry can't get past this — tell the
+            // user to pick "Change incomplete choices" to set up 1Password again.
+            if (attempt && attempt.state !== "child-not-started") throw new Error('1Password didn\'t confirm the earlier save. Choose "Change incomplete choices" to set up 1Password again — rbox won\'t create a duplicate');
             const attemptId = `op_${toB64url(randomBytes(12))}`;
             context.progress = await context.append({ kind: "op-dispatch-prepared", destinationIndex: index, attemptId, at: eventAt() });
             context.progress = await context.append({ kind: "op-may-have-dispatched", destinationIndex: index, attemptId, at: eventAt() });
@@ -474,7 +488,7 @@ async function completeGenesisDestinationSet(
               context.progress = await context.append({ kind: "op-child-not-started", destinationIndex: index, attemptId, reason: created.reason, at: eventAt() });
               throw new Error("1Password CLI could not start");
             }
-            if (created.state !== "created") throw new Error("1Password may have saved an item; rbox will reconcile it before retrying");
+            if (created.state !== "created") throw new Error('1Password didn\'t confirm the save. Choose "Change incomplete choices" to set up 1Password again — rbox won\'t create a duplicate');
             locator = created.locator;
           } else {
             throw new Error(reconciliation.state === "ambiguous"
@@ -497,7 +511,12 @@ async function completeGenesisDestinationSet(
           });
           completion = { ...locator, kind: "onepassword", completedAt };
         }
-        context.progress = await context.append({ kind: "completed", destinationIndex: index, completion, at: eventAt() });
+        // Derive the event's `at` from the completion's own timestamp instead of
+        // sampling the clock a second time — a second sample can land in a later
+        // millisecond (e.g. across the 1Password locator write) and there is no
+        // integrity reason for them to differ.
+        const completedAt = completion.kind === "clipboard" ? completion.confirmedAt : completion.completedAt;
+        context.progress = await context.append({ kind: "completed", destinationIndex: index, completion, at: completedAt });
         liveValid.add(index);
       } catch (error) {
         failed.set(index, error instanceof Error ? error.message : "couldn't complete the save");
@@ -537,6 +556,17 @@ async function completeGenesisDestinationSet(
         return { intent: context.intent, progress: context.progress, liveValidDestinationIndexes: [...liveValid], continuedAfterPartial };
       }
       continue;
+    }
+
+    // If an incomplete 1Password choice ever reached may-have-dispatched, an item
+    // might already exist in the vault even though rbox can't confirm it. Say so
+    // without claiming it is absent (design 187 failure semantics) before the user
+    // replaces that choice.
+    const maybeOrphanedOnePassword = context.intent.destinations.some((destination, index) =>
+      destination.kind === "onepassword" && !liveValid.has(index)
+      && folded.attempts[index] !== undefined && folded.attempts[index]!.state !== "child-not-started");
+    if (maybeOrphanedOnePassword) {
+      write("\nNote: an earlier 1Password save may have created an item rbox can't confirm.\nrbox won't remove it — check 1Password and delete any extra \"rbox recovery phrase\" item you don't want.\n");
     }
 
     const fixed = [...liveValid].map((index) => context.intent.destinations[index]!);

@@ -1,6 +1,7 @@
 # Design 187 — choose where to save the recovery phrase
 
-**Status:** ALIGNED v7 — GPT round 6 PASS; founder rulings folded
+**Status:** IMPLEMENTED — GPT round 6 PASS; two-reviewer post-implementation
+round 7 fixed 2 blockers + follow-ups on PR #408 (see REVIEW-187.md)
 
 **Owner:** Codex, founder-directed 2026-07-23
 
@@ -399,6 +400,16 @@ It is bound to the exact canonical intent digest and can only append a valid
 state transition for an exact selected destination. It cannot remove, replace,
 or reorder an event. A pure fold derives current state.
 
+Event ordering is governed solely by each event's `at`, which must be
+non-decreasing (the fold rejects a regressing timestamp). A `completed` event's
+embedded completion carries its own authoritative `completedAt`/`confirmedAt`;
+the parser does NOT require it to equal the event's `at`. Requiring wall-clock
+equality between the two added no integrity — the completion is bound to the
+event and the destination — and manufactured a hard failure whenever a durable
+write between sampling the two crossed a millisecond during first-run setup
+(round 7 blocker). Callers derive the event `at` from the completion's own
+timestamp so only one clock sample is taken per completion.
+
 Before spawning `op item create`, rbox durably appends
 `op-dispatch-prepared`, then durably appends `op-may-have-dispatched`
 immediately before spawn. Both bind one random nonsecret `attemptId`. A crash
@@ -529,9 +540,15 @@ type OnePasswordArtifact = {
 
 `onePasswordArtifacts` is a bounded array so future provider-journal work can
 add intentional copies without another schema migration.
-Deduplication uses stable account/vault/item UUID identity. No phrase, phrase
-digest, session credential, account email, vault title, item title, secret
-reference containing labels, or raw CLI response is persisted.
+Deduplication uses stable account/vault/item UUID identity. Re-recording the
+same active item is idempotent: on resume after a crash between the provider
+write and the durable progress append, the verified item is re-recorded with a
+freshly sampled `writtenAt`; the record layer keeps the original active entry
+(tolerating the `writtenAt` drift) instead of failing closed on it (round 7
+blocker). A differing operationTag/field for the same item identity still fails
+closed. No phrase, phrase digest, session credential, account email, vault
+title, item title, secret reference containing labels, or raw CLI response is
+persisted.
 
 Before progress appends `invalidated` for a 1Password completion, `kit.json`
 must first atomically replace that exact active locator with its strict

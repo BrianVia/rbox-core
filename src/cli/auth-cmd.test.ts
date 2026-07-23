@@ -664,6 +664,72 @@ describe("runGenesisEnrollment", () => {
     });
     expect(trace).toEqual(["reconcile", "validate", "select", "intent", "keychain", "consent", "retarget", "file", "receipt"]);
   });
+
+  test("1Password + file completes on a REAL wall clock (regression: frozen-2030 masked the timestamp bug)", async () => {
+    // Every other destination-set test pins now to 1_900_000_000_000 (year 2030),
+    // which clamps eventAt() to a constant and hides the completed-event timestamp
+    // failure. This drives the flow on Date.now() so the 1Password save must
+    // actually complete and record, not fall into a partial-failure loop.
+    const accountId = "acct_1414141414141414";
+    const target = path.join(home, "op-realclock.txt");
+    const api = new FakeGenesisApi([null], "ok", accountId, "dev_op_realclock");
+    let rendered = "";
+    await runGenesisEnrollment(api, { accountId, deviceId: "dev_op_realclock" }, { kit: false }, {
+      now: () => Date.now(),
+      isInteractive: () => true, stdinTTY: true, stderrTTY: true, platform: "linux",
+      resolveKitPath: async () => target,
+      destinationFlow: {
+        writeStderr: (text) => { rendered += text; },
+        checkbox: async () => ["onepassword", "kit-path"],
+        select: async () => "vault_uuid",
+        detectOnePassword: async () => ({ state: "available", executable: "/fake/op", version: "2.30.0" }),
+        listOnePasswordAccounts: async () => ({ state: "ok", accounts: [{ uuid: "account_uuid", label: "me@example.test" }] }),
+        listOnePasswordVaults: async () => ({ state: "ok", vaults: [{ uuid: "vault_uuid", name: "Personal", label: "Personal" }] }),
+        reconcileOnePassword: async () => ({ state: "missing" }),
+        createOnePassword: async (_provider, input) => ({
+          state: "created",
+          locator: { accountUuid: input.accountUuid, vaultUuid: input.vaultUuid, itemUuid: "item_uuid", fieldId: "rboxRecoveryPhrase", operationTag: input.operationTag },
+        }),
+        verifyOnePassword: async () => "valid",
+      },
+    });
+    expect(rendered).toContain("✓ Recovery phrase saved to 2 selected places");
+    expect(rendered).not.toContain("! 1Password");
+    expect(rendered).not.toContain("selected places:");
+    const record = await readRecoveryKitRecord(accountId);
+    expect(record?.onePasswordArtifacts).toHaveLength(1);
+    expect(record?.onePasswordArtifacts[0]).toMatchObject({ state: "active", itemUuid: "item_uuid" });
+    expect(record?.plaintextArtifacts.map((artifact) => artifact.path)).toContain(target);
+  });
+
+  test("declining the clipboard confirmation clears the clipboard before failing", async () => {
+    const accountId = "acct_1515151515151515";
+    const target = path.join(home, "clip-decline.txt");
+    const api = new FakeGenesisApi([null], "ok", accountId, "dev_clip_decline");
+    let rendered = "";
+    let copied = 0;
+    let cleared = 0;
+    await runGenesisEnrollment(api, { accountId, deviceId: "dev_clip_decline" }, { kit: false }, {
+      now: () => Date.now(),
+      isInteractive: () => true, stdinTTY: true, stderrTTY: true, platform: "linux",
+      resolveKitPath: async () => target,
+      destinationFlow: {
+        writeStderr: (text) => { rendered += text; },
+        checkbox: async () => ["kit-path", "clipboard"],
+        // "pasted and saved" → decline; the continue confirmation → accept.
+        confirm: async (cfg) => !cfg.message.includes("pasted and saved"),
+        // action menu: continue with the successful (file) copy.
+        select: async () => "continue",
+        detectOnePassword: async () => ({ state: "unavailable", reason: "not-found" }),
+        copyClipboard: async () => { copied++; return { ok: true, command: "fake-copy" }; },
+        clearClipboard: async () => { cleared++; return { ok: true, command: "fake-copy" }; },
+      },
+    });
+    // The phrase was copied, the user declined, and rbox still cleared it before bailing.
+    expect({ copied, cleared }).toEqual({ copied: 1, cleared: 1 });
+    expect(rendered).toContain("! Clipboard");
+    expect(rendered).toContain("✓ plaintext file");
+  });
 });
 
 describe("genesis lock", () => {

@@ -223,6 +223,19 @@ describe("recovery kit", () => {
     await expect(invalidateOnePasswordArtifact(ACCOUNT, { ...ONE_PASSWORD_ARTIFACT, operationTag: "wrong" }, "missing")).rejects.toThrow(/does not match/);
   });
 
+  test("re-recording the same active 1Password item with a drifted writtenAt is idempotent (crash-resume)", async () => {
+    // Regression: a crash between the provider write and the durable progress
+    // append re-records the same verified item on resume, but with a freshly
+    // sampled writtenAt. That used to throw "conflicting 1Password artifact
+    // identity" and wedge the destination forever. It must be idempotent and keep
+    // the original record.
+    expect(await recordOnePasswordArtifact(ACCOUNT, ONE_PASSWORD_ARTIFACT)).toBe("recorded");
+    expect(await recordOnePasswordArtifact(ACCOUNT, { ...ONE_PASSWORD_ARTIFACT, writtenAt: "2026-07-23T16:30:00.000Z" })).toBe("unchanged");
+    const record = (await readRecoveryKitRecord(ACCOUNT))!;
+    expect(record.onePasswordArtifacts).toHaveLength(1);
+    expect(record.onePasswordArtifacts[0]!.writtenAt).toBe(ONE_PASSWORD_ARTIFACT.writtenAt);
+  });
+
   test("conflicting stable 1Password identities and full bounded history fail closed", async () => {
     await recordOnePasswordArtifact(ACCOUNT, ONE_PASSWORD_ARTIFACT);
     await expect(recordOnePasswordArtifact(ACCOUNT, { ...ONE_PASSWORD_ARTIFACT, operationTag: "different" })).rejects.toThrow(/conflicting/);
