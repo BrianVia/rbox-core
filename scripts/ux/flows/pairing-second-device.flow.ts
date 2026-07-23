@@ -11,7 +11,7 @@ export default defineFlow({
     {
       on: "a",
       exec: ["pair"],
-      assertStdout: [/Pairing token \(valid ~10 min, single use/, /On the new machine, run `rbox setup`/],
+      assertStdout: [/Pairing command \(valid ~10 min, single use/, /rbox connect rbox-pair_/, /Run the command above on the new machine/],
     },
     { on: "a", captureVar: { name: "TOKEN", pattern: /(rbox-pair_[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)/ } },
     { on: "b", tui: "setup" },
