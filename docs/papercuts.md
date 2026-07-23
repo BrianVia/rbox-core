@@ -191,3 +191,10 @@ what happened, what it cost, fix hint if obvious.
   rows in the founder's screenshot were stale-or-ghost (pre-resolve
   savvy-core + the pr8 gone-directory ghost) — t3's ghost fix shrinks this
   panel too.
+
+- 2026-07-23 (v1.7.26 fleet upgrade): the rbox-daemon-activity-* test-litter
+  papercut has now spread to the MAC — 32 dead dirs in ~/.rbox/daemons made
+  `rbox upgrade` exit non-zero despite a fully successful upgrade (0 live
+  pids, verified). Third host bitten. Bump priority on the fix: tests must
+  not write to the real RBOX_HOME, and dead-pid unreadable records should be
+  treated as debris, not upgrade failures.
