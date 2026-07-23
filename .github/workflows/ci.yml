@@ -314,6 +314,13 @@ jobs:
     needs: compiled-tui-build
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
+    # GH-hosted Linux runners intermittently report Ctrl-C deaths as status 0
+    # even with a proven-live input pipeline (REVIEW-185 round 6 addendum);
+    # darwin, local Linux, and real kill -INT all give the contracted 130. The
+    # smoke demotes ONLY the numeric status comparison to a warning under this
+    # env — pane death and every echo/sentinel assertion still gate.
+    env:
+      RBOX_TUI_SMOKE_STATUS_ADVISORY: ${{ startsWith(matrix.os, 'ubuntu-') && '1' || '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -322,18 +329,8 @@ jobs:
             os: macos-14
           - target: linux-x64
             os: ubuntu-24.04
-            # GitHub's ubuntu runners (both arches) intermittently report the
-            # Ctrl-C death as status 0 even with a PROVEN live input pipeline
-            # (probe key confirmed on screen), while darwin CI, local Linux,
-            # and a real kill -INT consistently give 130. The contract stays
-            # blocking on darwin and is covered by unit tests plus the runtime
-            # SIGINT handler; on GH Linux the step is advisory so a misreported
-            # status can never mask the blocking secret-failure matrix that
-            # follows. Trail: docs/design/REVIEW-185.md round 6 addendum.
-            cancel-advisory: true
           - target: linux-arm64
             os: ubuntu-24.04-arm
-            cancel-advisory: true
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -359,7 +356,6 @@ jobs:
           chmod +x "$GITHUB_WORKSPACE/dist/rbox-${{ matrix.target }}"
           bun run tui-smoke "$GITHUB_WORKSPACE/dist/rbox-${{ matrix.target }}"
       - name: Exercise Ctrl-C cleanup
-        continue-on-error: ${{ matrix.cancel-advisory == true }}
         run: bun run tui-smoke "$GITHUB_WORKSPACE/dist/rbox-${{ matrix.target }}" --cancel
       - name: Exercise secret failure matrix
         run: |

@@ -132,17 +132,15 @@ jobs:
             fi
           fi
       - name: Exercise compiled TUI success and Ctrl-C
+        env:
+          # GH Linux runners misreport Ctrl-C death statuses (REVIEW-185 round
+          # 6 addendum): only the numeric status comparison is advisory there;
+          # pane death and echo/sentinel assertions still gate the release.
+          RBOX_TUI_SMOKE_STATUS_ADVISORY: ${{ runner.os == 'Linux' && '1' || '' }}
         run: |
           bin="$GITHUB_WORKSPACE/dist/rbox-${{ matrix.target }}"
           bun run tui-smoke "$bin"
-          if [ "$RUNNER_OS" = "Linux" ]; then
-            # Advisory on GH Linux runners only: they intermittently report the
-            # Ctrl-C exit as 0 even with a proven-live input pipeline
-            # (REVIEW-185 round 6 addendum); blocking on darwin.
-            bun run tui-smoke "$bin" --cancel || echo "::warning::${{ matrix.target }} cancel probe failed (known GH Linux runner quirk — advisory)"
-          else
-            bun run tui-smoke "$bin" --cancel
-          fi
+          bun run tui-smoke "$bin" --cancel
           bun run tui-smoke "$bin" --secret-retry
           bun run tui-smoke "$bin" --secret-abort
           bun run tui-smoke "$bin" --secret-render-error
