@@ -454,6 +454,26 @@ function KeypressPrompt({ submit, cancel }: { submit: Submit<string | undefined>
   return null;
 }
 
+function SecretRenderFailurePrompt({ cancel }: { cancel: () => void }) {
+  const [value, setValue] = useState("");
+  const [explode, setExplode] = useState(false);
+  useCancel((input, key) => {
+    if (key.return) {
+      setExplode(true);
+      return;
+    }
+    const printable = input.replace(/[\r\n\u0000-\u001f\u007f]/g, "");
+    if (printable) setValue((current) => current + printable);
+  }, cancel);
+  if (explode) throw new Error("synthetic secret render failure");
+  void value; // The secret intentionally remains only in component state.
+  return (
+    <Frame message="TUI selftest: secret render failure" hint="Enter trigger · Ctrl-C cancel">
+      <Text>  <Text inverse> </Text></Text>
+    </Frame>
+  );
+}
+
 function Completed({ message, answer, secret = false }: { message: string; answer: string; secret?: boolean }) {
   return <Text>{stderrStyle.sym.ok} {message} {secret ? "received" : answer}</Text>;
 }
@@ -604,8 +624,19 @@ export function inkPassword(config: PasswordPromptConfig, streams?: PromptStream
   return mountPrompt({
     message: config.message,
     secret: true,
+    signal: config.signal,
     ...streamArgs(streams),
     component: ({ submit, fail, cancel }) => <InputPrompt config={config} secret submit={submit} fail={fail} cancel={cancel} />,
+  });
+}
+
+/** Hidden compiled-smoke seam: fail while a secret remains in renderer state. */
+export function inkSecretRenderFailureSelftest(streams?: PromptStreams): Promise<never> {
+  return mountPrompt({
+    message: "TUI selftest: secret render failure",
+    secret: true,
+    ...streamArgs(streams),
+    component: ({ cancel }) => <SecretRenderFailurePrompt cancel={cancel} />,
   });
 }
 

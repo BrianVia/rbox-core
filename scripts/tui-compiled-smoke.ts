@@ -6,13 +6,15 @@ import { resolveRigBinaryOverride } from "./rig/lib/binary.js";
 import { shellQuote } from "./ux/lib.js";
 
 const binary = resolveRigBinaryOverride({ binary: process.argv[2] });
-if (!binary || process.argv.length > 4 || (process.argv[3] && process.argv[3] !== "--cancel")) {
-  throw new Error("usage: bun scripts/tui-compiled-smoke.ts /absolute/path/rbox [--cancel]");
+const scenario = process.argv[3] ?? "--full";
+const scenarios = new Set(["--full", "--cancel", "--secret-retry", "--secret-abort", "--secret-render-error", "--secret-cancel"]);
+if (!binary || process.argv.length > 4 || !scenarios.has(scenario)) {
+  throw new Error("usage: bun scripts/tui-compiled-smoke.ts /absolute/path/rbox [--cancel|--secret-retry|--secret-abort|--secret-render-error|--secret-cancel]");
 }
 
-const cancel = process.argv[3] === "--cancel";
 const home = fs.mkdtempSync(path.join(os.tmpdir(), "rbox-tui-smoke-"));
 const isolatedBinary = path.join(home, "bin", "rbox");
+const secret = `rbox-secret-${process.pid}-${Date.now()}-SENTINEL`;
 const session = `rbox-tui-${process.pid}-${Date.now()}`;
 
 function tmux(args: string[], allowFailure = false): string {
@@ -62,20 +64,44 @@ try {
   fs.mkdirSync(path.dirname(isolatedBinary), { recursive: true });
   fs.copyFileSync(binary, isolatedBinary);
   fs.chmodSync(isolatedBinary, 0o755);
-  const command = `tmux set-option -p -t "$TMUX_PANE" remain-on-exit on && exec ${shellQuote(isolatedBinary)} __tui-selftest`;
+  const mode = scenario.startsWith("--secret-") ? scenario.slice(2) : "full";
+  const command = `tmux set-option -p -t "$TMUX_PANE" remain-on-exit on && exec ${shellQuote(isolatedBinary)} __tui-selftest ${shellQuote(mode)}`;
   tmux([
     "new-session", "-d", "-E", "-s", session, "-x", "100", "-y", "30", "-c", home,
     "-e", `HOME=${home}`, "-e", `RBOX_HOME=${home}`, "--", command,
   ]);
-  await waitFor("choose beta");
-
-  if (cancel) {
+  if (scenario === "--cancel") {
+    await waitFor("choose beta");
     keys("C-c");
     await waitForExit(130);
-    const transcript = screen();
-    if (/stack|PromptCancelledError/i.test(transcript)) throw new Error(`cancellation leaked an error\n${transcript}`);
     process.stdout.write("tui-compiled-smoke cancel ok\n");
+  } else if (scenario === "--secret-retry") {
+    await waitFor("retry secret");
+    keys(secret, "Enter");
+    await waitFor("try the same secret again");
+    keys("Enter");
+    await waitFor("secret-retry ok");
+    await waitForExit(0);
+    process.stdout.write("tui-compiled-smoke secret-retry ok\n");
+  } else if (scenario === "--secret-abort") {
+    await waitFor("abort secret");
+    keys(secret);
+    await waitFor("secret-abort ok");
+    await waitForExit(0);
+    process.stdout.write("tui-compiled-smoke secret-abort ok\n");
+  } else if (scenario === "--secret-render-error") {
+    await waitFor("secret render failure");
+    keys(secret, "Enter");
+    await waitFor("secret-render-error ok");
+    await waitForExit(0);
+    process.stdout.write("tui-compiled-smoke secret-render-error ok\n");
+  } else if (scenario === "--secret-cancel") {
+    await waitFor("cancel secret");
+    keys(secret, "C-c");
+    await waitForExit(130);
+    process.stdout.write("tui-compiled-smoke secret-cancel ok\n");
   } else {
+    await waitFor("choose beta");
     keys("Down", "Enter");
     await waitFor("select both");
     keys("Space", "Down", "Space", "Enter");
@@ -87,10 +113,14 @@ try {
     keys("y");
     await waitFor("tui-selftest ok");
     await waitForExit(0);
-    const transcript = screen();
-    if (transcript.includes("hush")) throw new Error(`secret leaked into transcript\n${transcript}`);
     process.stdout.write("tui-compiled-smoke success ok\n");
   }
+  const transcript = screen();
+  const savedArtifact = path.join(home, "captured-artifact.txt");
+  fs.writeFileSync(savedArtifact, transcript, { mode: 0o600 });
+  const captured = fs.readFileSync(savedArtifact, "utf8");
+  if (captured.includes(secret) || captured.includes("hush")) throw new Error(`secret leaked into captured artifact\n${captured}`);
+  if (/stack|PromptCancelledError/i.test(captured)) throw new Error(`terminal cleanup leaked an error\n${captured}`);
 } finally {
   tmux(["kill-session", "-t", session], true);
   fs.rmSync(home, { recursive: true, force: true });

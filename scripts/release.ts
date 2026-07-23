@@ -173,7 +173,7 @@ for (const t of targets) {
     throw new Error(`[release] missing native watcher binding for ${t} (${PARCEL_PKG[t]}); run \`bun install --os=* --cpu=*\``);
   }
   console.log(`[release] build ${t} (embedding ${PARCEL_PKG[t]})`);
-  sh(["bun", "build", "--compile", "--minify", `--target=bun-${t}`, ...externalFlagsFor(t), "./src/cli/index.ts", "--outfile", out]);
+  sh(["bun", "build", "--compile", "--minify", "--splitting", `--target=bun-${t}`, ...externalFlagsFor(t), "./src/cli/index.ts", "--outfile", out]);
   artifacts[`rbox-${t}`] = { sha256: sha256File(out), path: `${tag}/rbox-${t}` };
 }
 

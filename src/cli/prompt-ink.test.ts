@@ -9,6 +9,7 @@ import {
   inkKeypress,
   inkPassword,
   inkSearch,
+  inkSecretRenderFailureSelftest,
   inkSelect,
   type PromptStreams,
 } from "./prompt-ink.js";
@@ -144,6 +145,52 @@ describe("Ink prompt runtime", () => {
     const visible = h.output().replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
     expect(visible).not.toContain(String(secret.length));
     expect(visible).toContain("received");
+  });
+
+  test("secret stays absent through validation retry, abort, render failure, and Ctrl-C", async () => {
+    const secret = "rbox-secret-UNIQUE_FAILURE_SENTINEL";
+
+    const retry = harness();
+    let attempts = 0;
+    const retryPending = inkPassword({
+      message: "Retry secret",
+      validate: () => ++attempts > 1 || "try again",
+    }, retry.streams);
+    await send(retry.input, [secret, "\r", "\r"]);
+    expect(await retryPending).toBe(secret);
+    expect(retry.output()).not.toContain(secret);
+
+    const aborted = harness();
+    const controller = new AbortController();
+    const abortResult = inkPassword(
+      { message: "Abort secret", signal: controller.signal },
+      aborted.streams,
+    ).then(() => undefined, (error: unknown) => error);
+    await waitForOutput(aborted, "Abort secret");
+    await send(aborted.input, [secret]);
+    controller.abort();
+    expect(await abortResult).toBeInstanceOf(DOMException);
+    expect(aborted.output()).not.toContain(secret);
+
+    const renderFailure = harness();
+    const renderResult = inkSecretRenderFailureSelftest(renderFailure.streams)
+      .then(() => undefined, (error: unknown) => error);
+    await waitForOutput(renderFailure, "secret render failure");
+    await send(renderFailure.input, [secret, "\r"]);
+    expect(await renderResult).toBeInstanceOf(Error);
+    expect(renderFailure.output()).not.toContain(secret);
+
+    const cancelled = harness();
+    const cancelResult = inkPassword({ message: "Cancel secret" }, cancelled.streams)
+      .then(() => undefined, (error: unknown) => error);
+    await waitForOutput(cancelled, "Cancel secret");
+    await send(cancelled.input, [secret, "\x03"]);
+    expect(await cancelResult).toBeInstanceOf(PromptCancelledError);
+    expect(cancelled.output()).not.toContain(secret);
+
+    for (const testHarness of [retry, aborted, renderFailure, cancelled]) {
+      expect(testHarness.rawModes.at(-1)).toBe(false);
+    }
   });
 
   test("confirm uses its default on Enter", async () => {

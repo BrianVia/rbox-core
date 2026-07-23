@@ -43,6 +43,8 @@ export interface ConfirmPromptConfig {
 
 export interface PasswordPromptConfig {
   message: string;
+  validate?: (value: string) => MaybePromise<PromptValidation>;
+  signal?: AbortSignal;
 }
 
 export type SelectPrompt = <V>(config: SelectPromptConfig<V>) => Promise<V>;

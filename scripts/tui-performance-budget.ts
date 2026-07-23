@@ -78,18 +78,24 @@ try {
     workloads: {},
   };
   const failures: string[] = [];
+  const isolatedBaseline = path.join(baselineHome, "rbox");
+  const isolatedCandidate = path.join(candidateHome, "rbox");
+  fs.copyFileSync(baseline, isolatedBaseline);
+  fs.copyFileSync(candidate, isolatedCandidate);
+  fs.chmodSync(isolatedBaseline, 0o755);
+  fs.chmodSync(isolatedCandidate, 0o755);
 
   for (const workload of workloads) {
     for (let iteration = 0; iteration < 5; iteration++) {
-      measure(baseline, baselineHome, workload.args, workload.expectedExit);
-      measure(candidate, candidateHome, workload.args, workload.expectedExit);
+      measure(isolatedBaseline, baselineHome, workload.args, workload.expectedExit);
+      measure(isolatedCandidate, candidateHome, workload.args, workload.expectedExit);
     }
     const baselineSamples: Sample[] = [];
     const candidateSamples: Sample[] = [];
     for (let iteration = 0; iteration < 30; iteration++) {
       const first = iteration % 2 === 0
-        ? [[baseline, baselineHome, baselineSamples], [candidate, candidateHome, candidateSamples]] as const
-        : [[candidate, candidateHome, candidateSamples], [baseline, baselineHome, baselineSamples]] as const;
+        ? [[isolatedBaseline, baselineHome, baselineSamples], [isolatedCandidate, candidateHome, candidateSamples]] as const
+        : [[isolatedCandidate, candidateHome, candidateSamples], [isolatedBaseline, baselineHome, baselineSamples]] as const;
       for (const [binary, cwd, samples] of first) samples.push(measure(binary, cwd, workload.args, workload.expectedExit));
     }
 

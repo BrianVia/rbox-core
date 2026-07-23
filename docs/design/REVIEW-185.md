@@ -68,3 +68,32 @@ Runtime reconnaissance found that cursor visibility cannot be snapshotted
 portably. The contract now restores raw mode and explicitly leaves the cursor
 visible. Prompt styling is also precomputed through rbox's stderr color policy
 instead of relying on Ink's stdout-oriented color detection.
+
+## Round 4 — GPT implementation review
+
+**Verdict:** NOT PASS
+
+The prompt implementation was sound after fixing default replacement, Ctrl-C
+during validation, synchronous-failure cleanup, and exact-artifact reuse. The
+review still found three acceptance-gate gaps: the performance budget was not
+blocking CI, compiled UX/rig checks could skip or report-only, and secret
+failure-path coverage was incomplete.
+
+### Disposition
+
+- added a blocking base-SHA versus exact-candidate startup/RSS/size job using
+  identical Bun 1.3.14 compile flags and copied-isolated binaries;
+- made compiled UX regressions and the Docker two-machine onboarding rig
+  blocking and fail-closed when the dev bootstrap secret is absent;
+- added native compiled validation-retry, abort, render-error, and secret-prompt
+  Ctrl-C cases on all three targets, with complete tmux and saved-artifact
+  sentinel checks.
+
+## Round 5 — GPT implementation re-review
+
+**Verdict:** PASS
+
+No blocker or high-severity finding remains. The reviewer independently ran the
+15-test real-Ink prompt suite, root/API and rig typechecks, and whitespace
+validation, and verified the exact-artifact, performance, compiled UX/rig, and
+secret-failure gates.

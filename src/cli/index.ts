@@ -1,5 +1,4 @@
 import "./api-base.js";
-import { interactionPolicyForArgv, withInteractionPolicy } from "./prompt-policy.js";
 
 async function run(): Promise<void> {
   const cmd = process.argv[2];
@@ -31,13 +30,24 @@ async function runWithRuntimeAssertion(): Promise<void> {
     await run();
   } finally {
     if (process.env.RBOX_ASSERT_INK_NOT_LOADED === "1") {
-      const { inkRuntimeWasLoaded } = await import("./prompt-runtime-sentinel.js");
-      if (inkRuntimeWasLoaded()) throw new Error("Ink runtime loaded during a non-interactive command");
+      const marker = Symbol.for("rbox.prompt.ink-runtime-loaded");
+      if ((globalThis as Record<symbol, unknown>)[marker] === true) {
+        throw new Error("Ink runtime loaded during a non-interactive command");
+      }
     }
   }
 }
 
-withInteractionPolicy(interactionPolicyForArgv(process.argv.slice(2)), runWithRuntimeAssertion).catch(async (e) => {
+async function dispatch(): Promise<void> {
+  if (process.argv[2] === "prompt-status") {
+    await runWithRuntimeAssertion();
+    return;
+  }
+  const { interactionPolicyForArgv, withInteractionPolicy } = await import("./prompt-policy.js");
+  await withInteractionPolicy(interactionPolicyForArgv(process.argv.slice(2)), runWithRuntimeAssertion);
+}
+
+dispatch().catch(async (e) => {
   const message = e instanceof Error ? e.message : String(e);
   if (process.argv[2] === "prompt-status") {
     process.stderr.write(`${message}\n`);
