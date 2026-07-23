@@ -35,6 +35,8 @@ import {
 } from "../sync-git.js";
 import { loadGitDivergenceCache } from "./divergence-cache.js";
 import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
+import { ShutdownMutationGate } from "../../engine/mutation-gate.js";
+import { stateCasJournalDir } from "./state-cas-locks.js";
 
 const exec = promisify(execFile);
 const TEST_GIT_ENV = {
@@ -448,14 +450,30 @@ test("D2 pre-save partial revalidation invalidates a human-moved non-current ref
     },
   };
   const outcome = {};
+  const gate = new ShutdownMutationGate();
   let saveRan = false;
+  let drainSettled = false;
+  let drain: Promise<void> | undefined;
   await withRevalidatedGitPartialApplies(rootA, state, outcome, async () => {
     saveRan = true;
+    expect(gate.closed).toBe(true);
+    expect(drainSettled).toBe(false);
     await expect(git(repo, "update-ref", "refs/heads/side", recorded)).rejects.toThrow();
+  }, {
+    mutationBoundary: gate,
+    afterFirstStateCasLockAcquired: async () => {
+      gate.close();
+      drain = gate.drain().then(() => { drainSettled = true; });
+      await Promise.resolve();
+      expect(drainSettled).toBe(false);
+    },
   });
+  await drain;
   expect(saveRan).toBe(true);
+  expect(drainSettled).toBe(true);
   expect(outcome).toEqual({ partial: { r: null } });
   expect(await git(repo, "rev-parse", "side")).toBe(human);
+  expect(await fs.readdir(stateCasJournalDir(rootA)).catch((error: NodeJS.ErrnoException) => error.code === "ENOENT" ? [] : Promise.reject(error))).toEqual([]);
 });
 
 test("D2 capture deferral survives failures and remains exact while pending is outstanding", async () => {

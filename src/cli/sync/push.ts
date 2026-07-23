@@ -38,6 +38,7 @@ import { withPushTailTiming } from "../push-tail-timing.js";
 import { formatCommitTimings, formatScanStats, scanDetailsOf } from "./format.js";
 import { apiFor, MAX_ATTEMPTS, MassDeleteGuardError, NO_GIT_FORCE, pushMassDeleteTrips, makeDeferErrnoReporter, defaultBackoff, filesFirstFlagEnabled, matcherForState, plaintextBytesOf, fileCountOf, scanTick } from "./policy.js";
 import { finishResolutionReceipt, pull, reconcileResolutionReceipt, scanManifestForPush, surfaceResolutionReceiptReconciliation } from "./pull.js";
+import { MutationGateClosedError } from "../../engine/mutation-gate.js";
 
 export function stampManifestSchemaForCommit(manifest: Manifest): Manifest {
   const schema = Math.max(gitReposManifestSchema(manifest.gitRepos) ?? 0, manifestRequiresSchema4(manifest) ? 4 : 0);
@@ -413,17 +414,25 @@ async function runPushAttempt(
   // a git artifact missing server-side can't be satisfied by a file re-upload — ONLY
   // the repos whose sections reference the missing encShas recapture; the force lives
   // at this single site (each retry recomputes the map) or the recovery is dead.
-  const gitPlan = await report.phase("git-plan", () =>
-    planGitSections(root, cfg, state, api, forceGitRecapture, matcher, deps.onProgress, backoff, {
-      onGitLog: deps.onGitLog,
-      disableConfigLane: workspaceSyncMutexDegraded(deps.syncMutex),
-      degradedMutex: workspaceSyncMutexDegraded(deps.syncMutex),
-      filesFirstDefer,
-      onGitReposDiscovered: deps.onGitReposDiscovered,
-      resolution,
-      resolutionCaptureTestHooks: deps.resolutionCaptureTestHooks,
-    })
-  );
+  const gitPlan = await report.phase("git-plan", async () => {
+    // Capture owns scratch/conflict-ref mutations. Register the whole planner
+    // conservatively so a stop drains any read phase that can later reach one.
+    const lease = deps.mutationBoundary?.enter({ phase: "git-commit" });
+    try {
+      if (lease && !lease.beginCommit()) throw new MutationGateClosedError();
+      return await planGitSections(root, cfg, state, api, forceGitRecapture, matcher, deps.onProgress, backoff, {
+        onGitLog: deps.onGitLog,
+        disableConfigLane: workspaceSyncMutexDegraded(deps.syncMutex),
+        degradedMutex: workspaceSyncMutexDegraded(deps.syncMutex),
+        filesFirstDefer,
+        onGitReposDiscovered: deps.onGitReposDiscovered,
+        resolution,
+        resolutionCaptureTestHooks: deps.resolutionCaptureTestHooks,
+      });
+    } finally {
+      lease?.finish();
+    }
+  });
   const busyRepos = Object.entries(gitPlan.captureDeferrals)
     .filter(([, reason]) => reason === "git-busy")
     .map(([relPath]) => relPath)

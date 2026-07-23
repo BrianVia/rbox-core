@@ -29,6 +29,7 @@ import {
   writeFileAtomic,
 } from "../../engine/index.js";
 import type { Action } from "../../engine/reconcile.js";
+import { MutationGateClosedError, ShutdownMutationGate } from "../../engine/mutation-gate.js";
 import { loadActivity, renderShellDeferrals, renderShellLine, saveActivity, saveShellDeferrals, saveShellLine, shellLineStateOf, type DaemonActivity } from "../activity.js";
 import { expectedStateNonce, loadConfig, loadState, repoRecordsForState, syncStreamId, trashConfig, type SyncState, type WorkspaceConfig } from "../config.js";
 import { pruneTrash } from "../../engine/trash.js";
@@ -125,6 +126,7 @@ import { RESET_RECOVERY_RETRY_MS, ResetHaltLogGate } from "./reset-halt-policy.j
 import { acknowledgeCacheGeneration, readCacheGeneration } from "../adopt-cache.js";
 import { reconcileGitDeferrals, type DeferralHygieneCursor } from "../sync-git/deferral-hygiene.js";
 import { gitDivergenceStatus } from "../sync-git/status.js";
+import { recoverStateCasLocks } from "../sync-git/state-cas-locks.js";
 
 type RboxBarAmbientStatus = AmbientDaemonStatusV1 & {
   fileCount: number;
@@ -151,10 +153,13 @@ export interface GitBusyRetryClock {
 }
 export interface RecoveryProbeClock extends GitBusyRetryClock {}
 export interface CursorClock extends GitBusyRetryClock {}
-export interface SafetyCadenceClock {
-  setTimeout(fn: () => void | Promise<void>, ms: number): unknown;
-  clearTimeout(handle: unknown): void;
+/** Superset of #403's SafetyCadenceClock: t3's pull-only deep-scan cadence
+ * needs injectable setInterval too, so one seam drives both timers. */
+export interface ScanCadenceClock extends GitBusyRetryClock {
+  setInterval(fn: () => void, ms: number): unknown;
+  clearInterval(handle: unknown): void;
 }
+export interface DaemonShutdownClock extends GitBusyRetryClock {}
 class RecoveryProbePreflightError extends Error {
   constructor(readonly cause: unknown) {
     super(cause instanceof Error ? cause.message : String(cause));
@@ -356,6 +361,10 @@ export class RboxDaemon {
   /** Additive dir discoveries since the latest shrinking safety snapshot. */
   private planDiscoveredGitDirOwners = new Set<string>();
   private hasAuthoritativeGitSnapshot = false;
+  /** Each completed unpruned scan re-mints an exact pr8 proof, consumable once
+   * per absent repository. */
+  private deferralDiscoveryEpoch = 0;
+  private deferralDiscoveryAuthority?: { epoch: number; discoveredRepos: ReadonlySet<string> };
   private pendingPushReasons = { signal: false, candidate: false, scan: false, other: false };
   private gitBusyEpisode?: { timers: unknown[]; queuedStages: number[] };
 
@@ -398,7 +407,7 @@ export class RboxDaemon {
   private pendingCatchUpGeneration?: number;
   private lastWsKeepaliveWrite = 0;
   private safetyTimer?: unknown;
-  private deepTimer?: ReturnType<typeof setInterval>;
+  private deepTimer?: unknown;
   private updateCheckTimer?: ReturnType<typeof setInterval>;
   private telemetryFlushTimer?: ReturnType<typeof setInterval>;
   private capabilityInitialTimer?: ReturnType<typeof setTimeout>;
@@ -433,6 +442,10 @@ export class RboxDaemon {
   private driftSaveFailedLogged = false;
   private reconnectAttempt = 0;
   private stopped = false;
+  private shutdownPromise?: Promise<void>;
+  private startupBoundaryRun?: Promise<void>;
+  private readonly mutationGate: ShutdownMutationGate;
+  private startupLockRecoveryDone = false;
   /** Per-path retry counter for hot-path write-finish: a mid-write file is re-pushed a
    *  few times before falling back to the safety scan, so a large save isn't stalled 60s. */
   private readonly writeFinishRetries = new Map<string, number>();
@@ -483,7 +496,6 @@ export class RboxDaemon {
   private readonly now: () => number;
   private readonly recoveryRandom: () => number;
   private readonly recoveryClock: RecoveryProbeClock;
-  private readonly safetyClock: SafetyCadenceClock;
   private readonly deferralHygieneCursor: DeferralHygieneCursor = {};
   private deferralHygieneRunning = false;
   private readonly deferralHygieneBudgetMs: number;
@@ -502,6 +514,7 @@ export class RboxDaemon {
   private readonly pongDeadlineMs: number;
   private readonly cursorCheckMs: number;
   private readonly cursorClock: CursorClock;
+  private readonly scanCadenceClock: ScanCadenceClock;
   private readonly cursorRandom: () => number;
   private readonly backstopMs: number;
   private readonly log: DaemonLogSink;
@@ -522,8 +535,8 @@ export class RboxDaemon {
       gitBusyRetryClock?: GitBusyRetryClock;
       recoveryRandom?: () => number;
       recoveryClock?: RecoveryProbeClock;
-      safetyClock?: SafetyCadenceClock;
       cursorClock?: CursorClock;
+      scanCadenceClock?: ScanCadenceClock;
       cursorRandom?: () => number;
       deferralHygieneBudgetMs?: number;
       log?: DaemonLogSink;
@@ -531,6 +544,7 @@ export class RboxDaemon {
     } = {},
   ) {
     this.log = opts.log ?? ((message) => console.log(`${new Date().toISOString()} ${message}`));
+    this.mutationGate = new ShutdownMutationGate(() => this.writeAmbientStatus());
     this.gitBusyRetryClock = opts.gitBusyRetryClock ?? {
       setTimeout: (fn, ms) => setTimeout(fn, ms),
       clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
@@ -554,10 +568,6 @@ export class RboxDaemon {
       },
       clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
     };
-    this.safetyClock = opts.safetyClock ?? {
-      setTimeout: (fn, ms) => globalThis.setTimeout(fn, ms),
-      clearTimeout: (handle) => globalThis.clearTimeout(handle as ReturnType<typeof setTimeout>),
-    };
     this.cursorClock = opts.cursorClock ?? {
       setTimeout: (fn, ms) => {
         const handle = globalThis.setTimeout(fn, ms);
@@ -565,6 +575,12 @@ export class RboxDaemon {
         return handle;
       },
       clearTimeout: (handle) => globalThis.clearTimeout(handle as ReturnType<typeof setTimeout>),
+    };
+    this.scanCadenceClock = opts.scanCadenceClock ?? {
+      setTimeout: (fn, ms) => setTimeout(fn, ms),
+      clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+      setInterval: (fn, ms) => setInterval(fn, ms),
+      clearInterval: (handle) => clearInterval(handle as ReturnType<typeof setInterval>),
     };
     this.cursorRandom = opts.cursorRandom ?? (() => Math.random());
     this.deferralHygieneBudgetMs = opts.deferralHygieneBudgetMs ?? 2_000;
@@ -623,22 +639,34 @@ export class RboxDaemon {
     // execute the universal journal boundary before loadState or scan work.
     const startupMutex = await this.acquireSyncMutexFn(this.root);
     if (startupMutex.status === "acquired") {
-      try {
-        if (await this.resetOperationBoundary(startupMutex.handle)) {
-          const boundaryBootstrapped = this.syncBase !== undefined;
-          const initialState = this.syncBase ?? await this.loadSyncBase(startupMutex.handle);
-          if (boundaryBootstrapped || await this.bootstrapAgreement(initialState)) {
-            if (!boundaryBootstrapped) this.seedFromState(initialState);
-            await this.adoptionCacheGenerationBoundary();
-            await this.replaceManifestFromScan(this.cache, initialState.lastSyncedManifest, undefined, undefined, this.watcherScanMode());
-            this.pruneCache();
-            await this.cache.save(this.root);
-            this.want.pull = true;
-            if (!this.pullOnly) this.requestPush("other");
+      const run = (async () => {
+        try {
+          if (!this.stopped && await this.resetOperationBoundary(startupMutex.handle)) {
+            await this.recoverOwnedLocksAtBoundary();
+            if (this.stopped) return;
+            const boundaryBootstrapped = this.syncBase !== undefined;
+            const initialState = this.syncBase ?? await this.loadSyncBase(startupMutex.handle);
+            if (!this.stopped && (boundaryBootstrapped || await this.bootstrapAgreement(initialState))) {
+              if (!boundaryBootstrapped) this.seedFromState(initialState);
+              await this.adoptionCacheGenerationBoundary();
+              if (this.stopped) return;
+              await this.replaceManifestFromScan(this.cache, initialState.lastSyncedManifest, undefined, undefined, this.watcherScanMode());
+              if (this.stopped) return;
+              this.pruneCache();
+              await this.cache.save(this.root);
+              this.want.pull = true;
+              if (!this.pullOnly) this.requestPush("other");
+            }
           }
+        } finally {
+          await releaseWorkspaceSyncMutex(startupMutex.handle);
         }
+      })();
+      this.startupBoundaryRun = run;
+      try {
+        await run;
       } finally {
-        await releaseWorkspaceSyncMutex(startupMutex.handle);
+        if (this.startupBoundaryRun === run) this.startupBoundaryRun = undefined;
       }
     } else {
       // Startup contention is not a recovery halt. Queue the startup scan; its
@@ -647,9 +675,14 @@ export class RboxDaemon {
       this.want.fullScan = true;
     }
 
+    if (this.stopped) return;
     this.armStandingRecovery();
-    if (this.pullOnly) this.scheduleSafetyScan();
+    if (this.pullOnly) {
+      this.scheduleSafetyScan();
+      this.scheduleDeepScan();
+    }
     else await this.startLiveWatch();
+    if (this.stopped) return;
     this.maybeConnect();
     this.startBackstop();
     this.startUpdateChecks();
@@ -671,12 +704,12 @@ export class RboxDaemon {
    */
   private async startLiveWatch(): Promise<void> {
     this.scheduleSafetyScan();
-    this.deepTimer = setInterval(() => this.request("deepScan"), jitter(DEEP_SCAN_MS));
+    this.scheduleDeepScan();
     const signalDebouncer = createSignalDebouncer((batch) => this.handleGitSignalBatch(batch), 400, 3000);
     this.gitSignalDebouncer = signalDebouncer;
     let initialGitRepos: readonly DiscoveredGitRepo[] = [];
     try {
-      this.watcher = await this.startWatcherFn(
+      const watcher = await this.startWatcherFn(
         this.root,
         this.matcher,
         (events) => {
@@ -751,6 +784,13 @@ export class RboxDaemon {
           },
         }
       );
+      if (this.stopped) {
+        await Promise.resolve().then(() => watcher.close()).catch(() => {});
+        signalDebouncer.dispose();
+        if (this.gitSignalDebouncer === signalDebouncer) this.gitSignalDebouncer = undefined;
+        return;
+      }
+      this.watcher = watcher;
       const registryEligible = gitRefSideChannelEligible(process.platform, this.watcher.backend);
       if (registryEligible) {
         this.gitRefRegistry = new GitRefWatchRegistry({
@@ -822,7 +862,7 @@ export class RboxDaemon {
   private pinSafetyFloor(): void {
     if (this.safetyDelay > SAFETY_SYNC_MS && !this.stopped) {
       this.safetyDelay = SAFETY_SYNC_MS;
-      if (this.safetyTimer !== undefined) this.safetyClock.clearTimeout(this.safetyTimer);
+      if (this.safetyTimer !== undefined) this.scanCadenceClock.clearTimeout(this.safetyTimer);
       this.scheduleSafetyScan();
     }
   }
@@ -860,10 +900,14 @@ export class RboxDaemon {
    * deep scan stays the unconditional floor beneath both.
    */
   private scheduleSafetyScan(): void {
-    this.safetyTimer = this.safetyClock.setTimeout(async () => {
+    this.safetyTimer = this.scanCadenceClock.setTimeout(() => {
       this.safetyTimer = undefined;
-      await this.runSafetyCadenceTick();
+      return this.runSafetyCadenceTick();
     }, jitter(this.safetyDelay));
+  }
+
+  private scheduleDeepScan(): void {
+    this.deepTimer = this.scanCadenceClock.setInterval(() => this.request("deepScan"), jitter(DEEP_SCAN_MS));
   }
 
   private async runSafetyCadenceTick(): Promise<void> {
@@ -896,15 +940,54 @@ export class RboxDaemon {
     });
   }
 
-  async stop(): Promise<void> {
+  /** Workspace-mutex-owned startup boundary for state-CAS journals. The same
+   * method runs on the first eventual pump acquisition when startup contended. */
+  private async recoverOwnedLocksAtBoundary(): Promise<void> {
+    if (this.startupLockRecoveryDone) return;
+    const recovery = await this.recoverStateCasWithGate();
+    if (recovery.recovered > 0) {
+      this.log(`recovered ${recovery.recovered} crash-owned Git lock${recovery.recovered === 1 ? "" : "s"}`);
+      this.want.pull = true;
+      if (!this.pullOnly) this.requestPush("other");
+    }
+    if (recovery.indeterminate > 0) this.log(`Git lock recovery retained ${recovery.indeterminate} indeterminate journal episode${recovery.indeterminate === 1 ? "" : "s"}`);
+    this.startupLockRecoveryDone = true;
+  }
+
+  private async recoverStateCasWithGate(commonDir?: string): Promise<Awaited<ReturnType<typeof recoverStateCasLocks>>> {
+    const lease = this.mutationGate.enter({ phase: "state-cas", ...(commonDir ? { repository: commonDir } : {}) });
+    try {
+      if (!lease.beginCommit()) throw new MutationGateClosedError();
+      return await recoverStateCasLocks(this.root, commonDir ? { commonDir } : {});
+    } finally {
+      lease.finish();
+    }
+  }
+
+  hasCommittedMutation(): boolean {
+    return this.mutationGate.snapshot().some((mutation) => mutation.committed);
+  }
+
+  waitForCommittedMutationDrain(): Promise<void> {
+    return this.mutationGate.drainCommitted();
+  }
+
+  stop(): Promise<void> {
+    if (this.shutdownPromise) return this.shutdownPromise;
     const firstStop = !this.stopped;
     this.stopped = true;
+    this.mutationGate.close();
     this.invalidateCursorSchedule();
     this.abortMutexBackoff();
-    if (firstStop) await this.writePausedAmbientStatusImmediate().catch(() => {});
-    if (this.safetyTimer !== undefined) this.safetyClock.clearTimeout(this.safetyTimer);
+    this.writeAmbientStatus();
+    this.shutdownPromise = this.finishStop(firstStop);
+    return this.shutdownPromise;
+  }
+
+  private async finishStop(firstStop: boolean): Promise<void> {
+    if (this.safetyTimer !== undefined) this.scanCadenceClock.clearTimeout(this.safetyTimer);
     if (this.recoveryTimer) this.recoveryClock.clearTimeout(this.recoveryTimer);
-    if (this.deepTimer) clearInterval(this.deepTimer);
+    if (this.deepTimer) this.scanCadenceClock.clearInterval(this.deepTimer);
     if (this.resetRetryTimer) clearTimeout(this.resetRetryTimer);
     for (const audit of this.openDriftAudits) if (audit.timer) clearTimeout(audit.timer);
     this.openDriftAudits.clear();
@@ -922,23 +1005,30 @@ export class RboxDaemon {
     this.clearGitBusyEpisode();
     this.stopWsKeepalive();
     this.clearBackstop();
-    try {
-      this.ws?.close();
-    } catch {
-      /* ignore */
-    }
-    await this.watcher?.close();
-    await this.gitRefRegistry?.close();
-    this.gitSignalDebouncer?.dispose();
     // DRAIN the in-flight pump before declaring stopped: SIGTERM shutdown awaits
     // stop(), so this is what makes termination actually graceful — the current
     // op (an applyGitState, a write, an upload) COMPLETES; only queued work is
     // skipped (the loop re-checks `stopped`). Without this, `rbox start`'s stale-
     // daemon restart could interrupt a mutation mid-flight.
-    await this.pumpRun.catch(() => {});
-    await this.telemetry.flush(AbortSignal.timeout(1500)).catch(() => {});
-    await this.activityWrite.catch(() => {}); // flush the final sidecar record (best-effort)
-    await this.cache?.save(this.root).catch(() => {});
+    // `rbox stop` extends its wait only for a fresh, same-boot critical-phase
+    // witness. Keep that witness live while the ordinary heartbeat is stopped
+    // and the closed mutation gate drains.
+    const shutdownHeartbeat = setInterval(() => this.writeAmbientStatus(), AMBIENT_STATUS_HEARTBEAT_MS);
+    shutdownHeartbeat.unref?.();
+    try {
+      await Promise.allSettled([this.startupBoundaryRun, this.pumpRun, this.mutationGate.drain()]);
+    } finally {
+      clearInterval(shutdownHeartbeat);
+    }
+    try { this.ws?.close(); } catch { /* ignore */ }
+    this.gitSignalDebouncer?.dispose();
+    await Promise.allSettled([
+      Promise.resolve().then(() => this.watcher?.close()),
+      Promise.resolve().then(() => this.gitRefRegistry?.close()),
+      Promise.resolve().then(() => this.telemetry.flush(AbortSignal.timeout(1500))),
+      Promise.resolve().then(() => this.activityWrite),
+      Promise.resolve().then(() => this.cache?.save(this.root)),
+    ]);
     await this.writePausedAmbientStatus().catch(() => {});
     if (firstStop) {
       this.log("rbox daemon stopped");
@@ -1007,7 +1097,7 @@ export class RboxDaemon {
   private request(kind: keyof Wants): void {
     if (kind === "push") this.requestPush("other");
     else {
-      if (this.pullOnly && kind !== "pull") return;
+      if (this.pullOnly && kind !== "pull" && kind !== "deepScan") return;
       this.want[kind] = true;
       this.signalMutexEarlyReprobe();
     }
@@ -1438,6 +1528,9 @@ export class RboxDaemon {
         const syncMutex = acquired.handle;
         try {
           if (!await this.resetOperationBoundary(syncMutex)) break;
+          if (this.stopped) break;
+          await this.recoverOwnedLocksAtBoundary();
+          if (this.stopped) break;
           await this.adoptionCacheGenerationBoundary();
           const binding = this.syncBase ?? await this.loadSyncBase();
           const bindingMatches = await daemonBindingMatches(this.root, syncStreamId(this.cfg), expectedStateNonce(binding));
@@ -1557,6 +1650,11 @@ export class RboxDaemon {
             }
             if (cleared || this.activityDirty || Date.now() - this.lastActivityWrite > 30_000) this.writeActivity();
           } catch (e) {
+            if (e instanceof MutationGateClosedError && this.stopped) {
+              // Cooperative shutdown cancellation is not an operation failure:
+              // no durable halt, retry counter, or misleading error surface.
+              continue;
+            }
             // A capture/config lane transition is saved before later upload/commit
             // work. If that later work fails, refresh the durable truth here rather
             // than waiting for a successful operation that may never arrive.
@@ -1677,6 +1775,7 @@ export class RboxDaemon {
         onPullApplied: (a) => this.recordPullApplied(a), // design 45: the 409-recovery pull mutates the tree too
         onTypeFlip: (rel) => this.noteTypeFlip(rel), // design 50: 409-recovery pull can evict a dir too
         telemetry: this.telemetry,
+        mutationBoundary: this.mutationGate,
       });
     } catch (e) {
       if (e instanceof CommitRejectedError && e.stillBlocked) {
@@ -1893,6 +1992,7 @@ export class RboxDaemon {
       },
       onTypeFlip: (rel) => this.noteTypeFlip(rel), // design 50 §3: forensic line + conflict count
       telemetry: this.telemetry,
+      mutationBoundary: this.mutationGate,
     };
     let actions: Action[];
     try {
@@ -1997,8 +2097,15 @@ export class RboxDaemon {
         now: this.now,
         timeBudgetMs: this.deferralHygieneBudgetMs,
         cursor: this.deferralHygieneCursor,
+        recoverShared: (_root, commonDir) => this.recoverStateCasWithGate(commonDir),
+        getDiscoveryAuthority: () => this.deferralDiscoveryAuthority,
       });
       if (result.state !== base) this.observeDurableGitState(result.state, this.now());
+      if (result.recoveredLocks > 0) {
+        this.want.pull = true;
+        if (!this.pullOnly) this.requestPush("other");
+        this.log(`Git lock recovery requeued the repository family (${result.recoveredLocks} lock${result.recoveredLocks === 1 ? "" : "s"})`);
+      }
     } catch {
       // Hygiene is fail-closed and must never turn a presentation refresh into a
       // failed sync operation. The standing deferral remains authoritative.
@@ -2006,6 +2113,7 @@ export class RboxDaemon {
     } finally {
       this.deferralHygieneRunning = false;
     }
+    if (!this.stopped && this.nextPumpOperation()) void this.pump();
   }
 
   /** Persist the activity record and bump the pump heartbeat. */
@@ -2157,6 +2265,11 @@ export class RboxDaemon {
   }
 
   private ambientStatusFrom(snapshot: DaemonActivity, settled: boolean, now: number): RboxBarAmbientStatus {
+    // Nested boundaries refine broad repo orchestration (for example the
+    // abortable native git-prepare inside a draining follow). Report the newest,
+    // most specific active lease rather than masking it with its outer scope.
+    const mutations = this.mutationGate.snapshot();
+    const activeMutation = mutations[mutations.length - 1];
     return {
       ...projectAmbientDaemonStatus({
         activity: snapshot,
@@ -2176,6 +2289,16 @@ export class RboxDaemon {
       mode: this.pullOnly ? "pull-only" : "read-write",
       bootId: this.bootId,
       workspaceRoot: this.root,
+      ...(this.mutationGate.closed ? {
+        shutdown: {
+          gateClosed: true as const,
+          ...(activeMutation ? {
+            phase: activeMutation.phase,
+            repository: activeMutation.repository,
+            committed: activeMutation.committed,
+          } : {}),
+        },
+      } : {}),
     };
   }
 
@@ -2226,10 +2349,6 @@ export class RboxDaemon {
       bootId: previous.bootId,
       workspaceRoot: previous.workspaceRoot,
     };
-  }
-
-  private async writePausedAmbientStatusImmediate(): Promise<void> {
-    await this.saveAmbientStatusIfOwned(this.pausedAmbientStatus());
   }
 
   private async writePausedAmbientStatus(): Promise<void> {
@@ -2324,7 +2443,7 @@ export class RboxDaemon {
   }
 
   private canPersistAmbientStatus(status: AmbientDaemonStatusV1): boolean {
-    if (this.stopped && status.state !== "paused") return false;
+    if (this.stopped && status.state !== "paused" && status.shutdown?.gateClosed !== true) return false;
     const pidfile = readDaemonPidRecord(this.root);
     if (pidfile.present) this.ambientStatusSawPidfile = true;
     if (pidfile.version === "v2" && pidfile.bootId !== undefined && pidfile.bootId !== this.bootId) {
@@ -2602,7 +2721,14 @@ export class RboxDaemon {
     deferErrnos.flush();
     await dircache?.save(this.root);
     const repos = [...discoveredGitRepos].sort(ownerOrder);
-    if (scanKind) {
+    if (mode === "unpruned") {
+      const epoch = ++this.deferralDiscoveryEpoch;
+      this.deferralDiscoveryAuthority = { epoch, discoveredRepos: new Set(repos.map((repo) => repo.relPath)) };
+    } else {
+      // Pruned discovery is additive and cannot testify that a missing repo is gone.
+      this.deferralDiscoveryAuthority = undefined;
+    }
+    if (scanKind && mode === "unpruned") {
       this.authoritativeGitRepos = repos;
       this.planDiscoveredGitDirOwners.clear();
       this.hasAuthoritativeGitSnapshot = true;
@@ -2610,14 +2736,17 @@ export class RboxDaemon {
       if (registrySnapshotEpoch !== undefined) await this.gitRefRegistry?.applySnapshot(repos, registrySnapshotEpoch, true);
       else await this.gitRefRegistry?.upsert(repos);
       this.refreshGitSafetyFloor(`${scanKind}-snapshot`);
-    } else if (!this.hasAuthoritativeGitSnapshot) {
+    } else if (!scanKind && mode === "unpruned" && !this.hasAuthoritativeGitSnapshot) {
       this.authoritativeGitRepos = repos;
       this.hasAuthoritativeGitSnapshot = true;
       await this.gitRefRegistry?.upsert(repos);
       this.refreshGitSafetyFloor("initial-snapshot");
     } else {
+      // Pruned scans are additive evidence only: discovery-pruned subtrees do
+      // not report repositories, so their absence can never authorize pr8
+      // gone-directory cleanup or shrink the ref registry.
       await this.gitRefRegistry?.upsert(repos);
-      this.refreshGitSafetyFloor("additive-scan");
+      this.refreshGitSafetyFloor(mode === "pruned" ? "pruned-additive-scan" : "additive-scan");
     }
     this.manifest = deferred.size > 0 ? deferManifest(fresh, previous, deferred) : fresh;
     if (deferred.size > 0) this.scheduleWriteFinishRetry(deferred);
@@ -3145,6 +3274,48 @@ export class RboxDaemon {
   }
 }
 
+export function createDaemonShutdownHandler(deps: {
+  stop: () => Promise<void>;
+  hasCommittedMutation: () => boolean;
+  waitForCommittedMutationDrain: () => Promise<void>;
+  finish: () => void;
+  kill?: () => void;
+  clock?: DaemonShutdownClock;
+}): () => void {
+  const clock = deps.clock ?? {
+    setTimeout: (fn, ms) => setTimeout(fn, ms),
+    clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+  };
+  const kill = deps.kill ?? (() => process.kill(process.pid, "SIGKILL"));
+  let signals = 0;
+  let finished = false;
+  let shutdownDeadline: unknown;
+  const armDeadline = () => {
+    if (finished || shutdownDeadline !== undefined) return;
+    shutdownDeadline = clock.setTimeout(kill, 60_000);
+    (shutdownDeadline as { unref?: () => void } | undefined)?.unref?.();
+  };
+  return () => {
+    signals++;
+    if (signals > 1) {
+      kill();
+      return;
+    }
+    const stopping = deps.stop();
+    if (deps.hasCommittedMutation()) {
+      void deps.waitForCommittedMutationDrain().then(armDeadline, armDeadline);
+    } else {
+      armDeadline();
+    }
+    void stopping.catch(() => {}).finally(() => {
+      finished = true;
+      if (shutdownDeadline !== undefined) clock.clearTimeout(shutdownDeadline);
+      shutdownDeadline = undefined;
+      deps.finish();
+    });
+  };
+}
+
 /** Run the daemon until SIGTERM/SIGINT. Used by the hidden `__daemon-run` command. */
 export async function runDaemon(root: string): Promise<void> {
   const logger = new RotatingDaemonLogger(root, () => new Date(), fsSync);
@@ -3153,9 +3324,12 @@ export async function runDaemon(root: string): Promise<void> {
   let daemon: RboxDaemon | undefined;
   let finish!: () => void;
   const stopped = new Promise<void>((resolve) => { finish = resolve; });
-  const shutdown = async () => {
-    try { await daemon?.stop(); } finally { finish(); }
-  };
+  const shutdown = createDaemonShutdownHandler({
+    stop: () => daemon?.stop() ?? Promise.resolve(),
+    hasCommittedMutation: () => daemon?.hasCommittedMutation() ?? false,
+    waitForCommittedMutationDrain: () => daemon?.waitForCommittedMutationDrain() ?? Promise.resolve(),
+    finish,
+  });
   try {
     const { cfg, deps } = await buildAuthedRemote(root, Date.now, logger.log); // E2EE transport + injected KEK
     daemon = new RboxDaemon(root, cfg, { ...deps, onGitLog: logger.log, warningSink: logger.log }, {
@@ -3164,8 +3338,8 @@ export async function runDaemon(root: string): Promise<void> {
       log: logger.log,
       onStopped: finish,
     });
-    process.once("SIGTERM", shutdown);
-    process.once("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
+    process.on("SIGINT", shutdown);
     await daemon.start();
     await stopped;
   } finally {

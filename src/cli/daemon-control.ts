@@ -3,10 +3,12 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
+import { systemLockIdentity } from "../engine/git/lockfile.js";
 import { isStandaloneBinary } from "./runtime.js";
 import { daemonBoundPath, daemonCrashLogPath, daemonPidPath, daemonRuntimeDir, daemonStatusPath, workspaceKey } from "./rbox-paths.js";
 import { parseDaemonDatedLogBasename } from "./daemon/logger.js";
-import { readAmbientDaemonStatusRecord, type DaemonMode } from "./daemon/ambient-status.js";
+import { AMBIENT_STATUS_STALE_MS, readAmbientDaemonStatusRecord, type DaemonMode } from "./daemon/ambient-status.js";
+import { RBOX_VERSION } from "./version.js";
 export { daemonBoundPath, daemonCrashLogPath, daemonPidPath, daemonRuntimeDir, daemonStatusPath, workspaceKey } from "./rbox-paths.js";
 
 const RBOX_DIR = ".rbox";
@@ -15,6 +17,7 @@ const LOG_FILE = "daemon.log";
 const BOUND_FILE = "workspace.bound";
 const DAEMON_MARKER = "__daemon-run";
 export const DAEMON_BOOT_ID_ENV = "RBOX_DAEMON_BOOT_ID";
+export const DAEMON_HEARTBEAT_FUTURE_SKEW_MS = 2 * 60_000;
 
 const pidPath = daemonPidPath;
 const logPath = daemonCrashLogPath;
@@ -296,6 +299,10 @@ export interface StopDaemonDeps {
   log?: (line: string) => void;
   termTimeoutMs?: number;
   killTimeoutMs?: number;
+  drainPollMs?: number;
+  readStatus?: typeof readAmbientDaemonStatusRecord;
+  now?: () => number;
+  processStartToken?: (pid: number) => Promise<string | undefined>;
 }
 
 export type StartDaemonResult = "started" | "already-running" | "already-running-unknown-mode" | "retry-later";
@@ -513,6 +520,10 @@ export async function stopDaemon(root: string, deps: StopDaemonDeps = {}): Promi
   const kill = deps.forceKill ?? forceKill;
   const signal = deps.signal ?? ((pid, sig) => process.kill(pid, sig));
   const output = deps.log ?? console.log;
+  const processStartToken = deps.processStartToken ?? (async (candidatePid: number) => {
+    const probe = await systemLockIdentity.probe(candidatePid);
+    return probe.status === "alive" ? probe.startTime : undefined;
+  });
   const original = readDaemonPidRecord(root);
   const sameRecord = (record: DaemonPidRecord): boolean =>
     record.present === original.present
@@ -533,6 +544,7 @@ export async function stopDaemon(root: string, deps: StopDaemonDeps = {}): Promi
     await removeOwnedPidfile();
     return;
   }
+  const originalStartToken = await processStartToken(pid).catch(() => undefined);
 
   // Ownership is deliberately re-read immediately before every signal. A PID
   // record is never removed while the daemon it names may still be running.
@@ -545,22 +557,52 @@ export async function stopDaemon(root: string, deps: StopDaemonDeps = {}): Promi
     if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
   }
   output(`stopping background sync (sent SIGTERM to process ${pid})`);
-  if (await wait(pid, deps.termTimeoutMs ?? 60_000)) {
-    await removeOwnedPidfile();
-    return;
+  let timeout = deps.termTimeoutMs ?? 60_000;
+  for (;;) {
+    if (await wait(pid, timeout)) {
+      await removeOwnedPidfile();
+      return;
+    }
+    if (!sameRecord(readDaemonPidRecord(root))) {
+      timeout = deps.drainPollMs ?? Math.min(deps.termTimeoutMs ?? 60_000, 5_000);
+      continue;
+    }
+    const stillOwned = running(root);
+    if (!stillOwned.running || stillOwned.pid !== pid) {
+      await removeOwnedPidfile();
+      return;
+    }
+    const status = (deps.readStatus ?? readAmbientDaemonStatusRecord)(root);
+    const sameBoot = status.kind === "ok" && original.version === "v2"
+      && original.bootId !== undefined && status.status.bootId === original.bootId;
+    const shutdown = sameBoot ? status.status.shutdown : undefined;
+    const heartbeatAt = sameBoot ? Date.parse(status.status.heartbeatAt) : Number.NaN;
+    const now = (deps.now ?? Date.now)();
+    const liveCurrentCritical = sameBoot
+      && status.status.daemonVersion === RBOX_VERSION
+      && Number.isFinite(heartbeatAt)
+      && heartbeatAt <= now + DAEMON_HEARTBEAT_FUTURE_SKEW_MS
+      && now - heartbeatAt <= AMBIENT_STATUS_STALE_MS
+      && shutdown?.gateClosed === true
+      && shutdown.phase !== undefined;
+    if (!liveCurrentCritical) {
+      const currentStartToken = await processStartToken(pid).catch(() => undefined);
+      if (!sameRecord(readDaemonPidRecord(root)) || originalStartToken === undefined || currentStartToken !== originalStartToken) {
+        timeout = deps.drainPollMs ?? Math.min(deps.termTimeoutMs ?? 60_000, 5_000);
+        continue;
+      }
+      output(`background sync did not stop within 60 seconds and has no live same-version critical-section witness — sending SIGKILL to process ${pid}`);
+      kill(pid);
+      if (!(await wait(pid, deps.killTimeoutMs ?? 60_000))) {
+        throw new Error("background sync could not be confirmed stopped; daemon record retained");
+      }
+      await removeOwnedPidfile();
+      return;
+    }
+    const phase = shutdown.phase;
+    output(`background sync is draining critical phase ${phase}${shutdown.repository ? ` (${shutdown.repository})` : ""}; continuing to wait`);
+    timeout = deps.drainPollMs ?? Math.min(deps.termTimeoutMs ?? 60_000, 5_000);
   }
-
-  const beforeKill = running(root);
-  if (!beforeKill.running || beforeKill.pid !== pid) {
-    await removeOwnedPidfile();
-    return;
-  }
-  output(`background sync did not stop within 60 seconds; sending SIGKILL to process ${pid}`);
-  kill(pid);
-  if (!(await wait(pid, deps.killTimeoutMs ?? 60_000))) {
-    throw new Error("background sync could not be confirmed stopped; daemon record retained");
-  }
-  await removeOwnedPidfile();
 }
 
 export const DEFAULT_LOG_LINES = 50;

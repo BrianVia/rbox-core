@@ -22,6 +22,9 @@ test("daemon safety-mode coverage is pruned when warm; deep mode is full-tree an
   type ScanResult = { freshManifest: Manifest; deferred: Set<string>; coverage: "full-tree" | "pruned" };
   type Internals = {
     replaceManifestFromScan(cache: HashCache, previous: Manifest, stats: ReturnType<typeof createScanStats>, kind: "safety scan" | "deep scan", mode: "pruned" | "unpruned"): Promise<ScanResult>;
+    hasAuthoritativeGitSnapshot: boolean;
+    authoritativeGitRepos: unknown[];
+    deferralDiscoveryAuthority?: { epoch: number; discoveredRepos: ReadonlySet<string> };
   };
   const daemon = new RboxDaemon(root, cfg as never, {} as never) as unknown as Internals;
   const empty: Manifest = { generatedAt: "", files: [] };
@@ -41,11 +44,17 @@ test("daemon safety-mode coverage is pruned when warm; deep mode is full-tree an
     expect(deep.coverage).toBe("full-tree");
     expect(deepStats.dircacheOutcome).toBe("unpruned");
     expect(deepStats.dirsReusedFromCache).toBe(0);
+    const authoritativeSentinel = [{ relPath: "repo-hidden-by-pruning" }];
+    daemon.authoritativeGitRepos = authoritativeSentinel;
+    daemon.hasAuthoritativeGitSnapshot = true;
     process.env.RBOX_SCAN_PRUNE = "0";
     const disabledStats = createScanStats();
     const disabled = await daemon.replaceManifestFromScan(new HashCache(), deep.freshManifest, disabledStats, "safety scan", "pruned");
     expect(disabled.coverage).toBe("full-tree");
     expect(disabledStats.dircacheOutcome).toBe("off");
+    expect(daemon.hasAuthoritativeGitSnapshot).toBe(true);
+    expect(daemon.authoritativeGitRepos).toBe(authoritativeSentinel);
+    expect(daemon.deferralDiscoveryAuthority).toBeUndefined();
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }

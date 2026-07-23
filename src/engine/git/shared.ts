@@ -24,6 +24,8 @@ export interface GitChainTimings {
   reflogMs: number;
   connectivityProofMs: number;
   indexOpStateMs: number;
+  /** Checkout ownership-journal durable writes, marker observations, and fsyncs. */
+  journalMs: number;
   /** Nested parent: reported separately and never added to exclusive leaves. */
   classifyMs: number;
   residualMs: number;
@@ -40,6 +42,7 @@ export function zeroGitChainTimings(): GitChainTimings {
     reflogMs: 0,
     connectivityProofMs: 0,
     indexOpStateMs: 0,
+    journalMs: 0,
     classifyMs: 0,
     residualMs: 0,
   };
@@ -61,7 +64,7 @@ export async function addTimedMs<T>(timings: GitChainTimings | undefined, field:
 export function finalizeGitChainTimings(timings: GitChainTimings, repoWallMs: number): void {
   const attributed = timings.fetchDecryptMs + timings.bundleVerifyMs + timings.gitImportMs
     + timings.refTxnExclusiveMs + timings.ownershipMs + timings.reflogMs
-    + timings.connectivityProofMs + timings.indexOpStateMs;
+    + timings.connectivityProofMs + timings.indexOpStateMs + timings.journalMs;
   timings.residualMs = Math.max(0, repoWallMs - attributed);
 }
 

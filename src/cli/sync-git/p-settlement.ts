@@ -24,6 +24,7 @@ import {
   type SyncState,
 } from "../config.js";
 import type { BranchTransitionWitness, RepoBaseProof } from "./base-composer.js";
+import { MutationGateClosedError, type MutationBoundary, type MutationLease } from "../../engine/mutation-gate.js";
 
 export type ExactPSettlementResult =
   | { status: "absent" }
@@ -86,12 +87,16 @@ export async function settleExactPresentArtifact(input: {
   p: PreparedProtocolRef<BasePresentPayload>;
   /** Reset's complete repository fence owns the physical state lock. */
   stateSaveOptions?: StateSaveOptions;
+  /** Daemon-only shutdown boundary. Foreground settlement omits it. */
+  mutationBoundary?: MutationBoundary;
 }): Promise<ExactPSettlementResult> {
   const payload = input.p.payload;
   const currentRecord = repoRecordsForState(input.state)[input.relPath];
   const currentBase = currentRecord?.base?.refs[payload.ref] ?? null;
   if (currentBase !== payload.priorOid && currentBase !== payload.nextOid) return { status: "moved", reason: "base-shape" };
+  let lease: MutationLease | undefined;
   try {
+    lease = input.mutationBoundary?.enter({ phase: "git-prepare", repository: input.ctx.repoDir });
     return await withRepoProtocolLocks(input.ctx.repoDir, { reflogRefs: [payload.ref] }, async () => {
       const first = await readBasePresentArtifact(input.ctx.repoDir, input.binding, payload.ref);
       if (first.status !== "valid" || first.artifact.targetOid !== input.p.targetOid) {
@@ -100,7 +105,11 @@ export async function settleExactPresentArtifact(input: {
       const initialReflog = await readRefReflogFingerprint(input.ctx.repoDir, payload.ref);
       if (!exactEpisodeTop(initialReflog.bytes, payload)) return { status: "moved" as const, reason: "reflog" as const };
       let stateAfter: SyncState | undefined;
+      if (lease?.abortRequested) throw new MutationGateClosedError();
       await runPreparedUpdateRefTransaction(input.ctx.repoDir, retirementLines(input.p), async () => {
+          // Git has prepared P/K locks but has not committed. Shutdown wins here
+          // by throwing, which makes the transaction helper send `abort`.
+          if (lease?.abortRequested) throw new MutationGateClosedError();
           const locked = await readBasePresentArtifact(input.ctx.repoDir, input.binding, payload.ref);
           if (locked.status !== "valid" || locked.artifact.targetOid !== input.p.targetOid) throw new Error("P/K moved at exact settlement boundary");
           const reflog = await readRefReflogFingerprint(input.ctx.repoDir, payload.ref);
@@ -146,6 +155,12 @@ export async function settleExactPresentArtifact(input: {
           };
           const { repoGen: _repoGen, ...withoutGeneration } = record;
           const next: RepoRecordInput = { ...withoutGeneration, base: { ...record.base, refs } };
+          // The prepared ref transaction is still abortable through all reads
+          // above. Cross the irreversible boundary only immediately before the
+          // state CAS whose acceptance requires the ref commit to drain.
+          if (lease?.abortRequested || (lease && !lease.beginCommit("git-commit"))) {
+            throw new MutationGateClosedError();
+          }
           const saved = await withProtocolLockClass("state", path.resolve(statePath(input.root)), () =>
             applyStateSavePacket(input.root, {
               expectedStream: input.stream,
@@ -160,9 +175,12 @@ export async function settleExactPresentArtifact(input: {
       return { status: "settled" as const, state: stateAfter, ref: payload.ref };
     });
   } catch (error) {
+    if (error instanceof MutationGateClosedError) throw error;
     const reason = String((error as Error)?.message ?? error);
     if (error instanceof PSettlementMovementError) return { status: "moved", reason: error.movement };
     if (error instanceof PreparedRefTransactionPrepareError) return { status: "moved", reason: "live" };
     return { status: "hold", reason };
+  } finally {
+    lease?.finish();
   }
 }

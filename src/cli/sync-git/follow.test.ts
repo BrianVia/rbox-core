@@ -2109,8 +2109,9 @@ test("design 174 C: many-ref follow has exclusive leaf coverage and an explicit 
   if (!timing || !chain) throw new Error("missing instrumented repo timing");
   const leafSum = chain.fetchDecryptMs + chain.bundleVerifyMs + chain.gitImportMs
     + chain.refTxnExclusiveMs + chain.ownershipMs + chain.reflogMs
-    + chain.connectivityProofMs + chain.indexOpStateMs;
+    + chain.connectivityProofMs + chain.indexOpStateMs + chain.journalMs;
   expect(chain.classifyMs).toBeGreaterThan(0);
+  expect(chain.journalMs).toBeGreaterThan(0);
   expect(chain.residualMs).toBeCloseTo(Math.max(0, timing.wallMs - leafSum), 5);
   expect(chain.residualMs).toBeLessThanOrEqual(timing.wallMs * 0.10);
 }, 30_000);

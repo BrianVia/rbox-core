@@ -16,6 +16,7 @@ import type { TransferProgress } from "../transfer-progress.js";
 import type { TelemetryRecorder } from "../telemetry/queue.js";
 import type { GitPushPlan } from "../sync-git/plan.js";
 import type { ResolutionCaptureTestHooks } from "../sync-git/shared.js";
+import type { MutationBoundary } from "../../engine/mutation-gate.js";
 
 type CurrentWriteContext = {
   kek: Uint8Array;
@@ -31,6 +32,8 @@ type WriteContextProvider = SyncRemote & { currentKek?: () => Promise<CurrentWri
  * deps object flows through pull/push/pushManifest/sync and its bounded retry loop.
  */
 export interface SyncDeps {
+  /** Daemon-only synchronous shutdown gate. Foreground operations omit it. */
+  mutationBoundary?: MutationBoundary;
   /** Best-effort daemon-owned product telemetry. Record implementations must never throw. */
   telemetry?: TelemetryRecorder;
   /** Held once by the named top-level owner. Nested pull/push/retry operations

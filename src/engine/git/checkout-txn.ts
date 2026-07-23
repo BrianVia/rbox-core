@@ -10,6 +10,18 @@ import { fsyncDirectory } from "../fsutil.js";
 import { addTimedMs, cleanGitEnv, clearIndexResolveUndo, git, moveFileAtomic, readRegularFileNoFollow, walkFiles, ZERO_OID, type GitChainTimings, type RepoCtx } from "./shared.js";
 import { readOpState, pruneEmptyOpStateDirs } from "./refs.js";
 import { updateCheckoutJournal, type CheckoutJournal } from "./journal.js";
+import { MutationGateClosedError, type MutationBoundary, type MutationLease } from "../mutation-gate.js";
+import {
+  formatLockMarker,
+  observeLockMarker,
+  publishLockMarker,
+  releaseObservedLock,
+  safeBoundLockParent,
+  sameMarkerObservation,
+  serializeMarkerObservation,
+  systemLockIdentity,
+  type MarkerObservation,
+} from "./lockfile.js";
 
 const exec = promisify(execFile);
 
@@ -80,6 +92,7 @@ export interface CommitCheckoutOptions<TIntended = unknown> {
   capabilityProbe?: CheckoutCapabilityProbe;
   /** Caller already ran the exact capability probe for this transaction. */
   capabilitySupported?: boolean;
+  mutationBoundary?: MutationBoundary;
 }
 
 export type CommitCheckoutResult =
@@ -359,6 +372,11 @@ function refUpdateLines(updates: readonly CheckoutRefUpdate[], extra: readonly s
   return lines;
 }
 
+function safeReservationRef(ref: string): boolean {
+  return ref.startsWith("refs/") && ref.length <= 1024 && !ref.includes("..")
+    && !ref.includes("\\") && !ref.includes("//") && !ref.endsWith("/") && !ref.endsWith(".lock");
+}
+
 type JournalPreparedTransaction = NonNullable<CheckoutJournal["expectedNew"]["preparedTransactions"]>[number];
 
 function expectedLockBytes(line: string): { ref: string; bytes: string } | undefined {
@@ -384,6 +402,9 @@ async function preparedTransactionIntent(
   lines: readonly string[],
   includeHeadReservation: boolean,
 ): Promise<JournalPreparedTransaction> {
+  const current = await systemLockIdentity.current();
+  const child = await systemLockIdentity.probe(ownerPid);
+  if (child.status !== "alive") throw new Error("prepared Git child incarnation unavailable");
   const byPath = new Map<string, Set<string>>();
   const add = (abs: string, bytes: string) => {
     const key = path.resolve(abs);
@@ -431,6 +452,12 @@ async function preparedTransactionIntent(
   return {
     id,
     ownerPid,
+    owner: {
+      hostId: current.hostId,
+      bootId: current.bootId,
+      pid: ownerPid,
+      startTime: child.startTime,
+    },
     prepareStarted: true,
     locks: [...byPath].map(([lockPath, expectedBytes]) => ({ path: lockPath, expectedBytes: [...expectedBytes] })),
   };
@@ -438,8 +465,19 @@ async function preparedTransactionIntent(
 
 async function observePreparedLockTokens(transaction: JournalPreparedTransaction): Promise<void> {
   for (const lock of transaction.locks) {
-    const token = await lockToken(lock.path);
-    if (token) lock.token = { dev: token.dev, ino: token.ino };
+    let stat;
+    try {
+      stat = await fs.lstat(lock.path, { bigint: true });
+    } catch {
+      continue;
+    }
+    // Capture birth time alongside dev/ino so recovery can reject a same-bytes
+    // successor that reused this freed inode. 0 = filesystem reports none.
+    lock.token = {
+      dev: Number(stat.dev),
+      ino: Number(stat.ino),
+      ...(stat.birthtimeNs > 0n ? { birthtimeNs: stat.birthtimeNs.toString() } : {}),
+    };
   }
 }
 
@@ -519,7 +557,7 @@ async function restoreOpStateWithCrash(ctx: RepoCtx, desired: Array<{ rel: strin
 /** The pinned 10-step checkout commit from design 116 (r1 F3/r2 F4/r3 F6). */
 export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPlan, opts: CommitCheckoutOptions<T>): Promise<CommitCheckoutResult> {
   const persistJournal = (): Promise<void> => opts.journal
-    ? addTimedMs(opts.chainTimings, "indexOpStateMs", () =>
+    ? addTimedMs(opts.chainTimings, "journalMs", () =>
         updateCheckoutJournal(opts.journal!.workspaceRoot, opts.journal!.relPath, opts.journal!.value))
     : Promise.resolve();
   if (!(opts.capabilitySupported ?? await checkoutTransactionSupported(ctx.repoDir, opts.capabilityProbe))) return { status: "unsupported", reason: "git lacks prepared transactional symref-update" };
@@ -527,27 +565,60 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
   if ((plan.candidateIndexPath === undefined) === (plan.removeIndex !== true)) {
     return { status: "defer", reason: "checkout plan must publish index bytes or explicit index absence" };
   }
+  if ((plan.refReservations?.length ?? 0) > 0 && !opts.journal) {
+    return { status: "defer", reason: "checkout ref reservations require a durable intent journal" };
+  }
 
   const staged = path.join(ctx.gitDir, `.rbox-candidate-index-${process.pid}-${crypto.randomBytes(8).toString("hex")}`);
   let tx: RefTransaction | undefined;
   let postHeadTx: RefTransaction | undefined;
   let indexHandle: fs.FileHandle | undefined;
   let indexToken: OwnedGitLock | undefined;
+  let indexObservation: MarkerObservation | undefined;
   let headHandle: fs.FileHandle | undefined;
   let headToken: OwnedGitLock | undefined;
+  let headObservation: MarkerObservation | undefined;
   let origHeadToken: OwnedGitLock | undefined;
   let origHeadCleanupDurabilityPending = false;
-  const reservationHandles: fs.FileHandle[] = [];
+  let reservationCleanupDurabilityPending = false;
+  let checkoutLockCleanupDurabilityPending = false;
   const reservationTokens: OwnedGitLock[] = [];
+  const reservationObservations = new Map<string, MarkerObservation>();
+  const releaseReservations = async (): Promise<void> => {
+    if (reservationTokens.length === 0) return;
+    reservationCleanupDurabilityPending = true;
+    let exact = true;
+    for (const token of [...reservationTokens].reverse()) {
+      const observation = reservationObservations.get(token.path);
+      if (!observation) {
+        exact = false;
+        continue;
+      }
+      const released = await addTimedMs(opts.chainTimings, "journalMs", () => releaseObservedLock(token.path, observation));
+      if (!released.released || !released.durable) exact = false;
+    }
+    if (!exact) throw new Error("checkout reservation exact release was not durable");
+    reservationTokens.length = 0;
+    reservationObservations.clear();
+    reservationCleanupDurabilityPending = false;
+  };
   let refsCommitted = false;
+  let mutationLease: MutationLease | undefined;
   const indexLock = path.join(ctx.gitDir, "index.lock");
+  const releaseExactCheckoutLock = async (lockPath: string, observation: MarkerObservation | undefined): Promise<void> => {
+    if (!observation) throw new Error(`checkout lock lacks exact release observation: ${lockPath}`);
+    checkoutLockCleanupDurabilityPending = true;
+    const released = await addTimedMs(opts.chainTimings, "journalMs", () => releaseObservedLock(lockPath, observation));
+    if (!released.released || !released.durable) throw new Error(`checkout lock exact release failed: ${lockPath}`);
+    checkoutLockCleanupDurabilityPending = false;
+  };
   const releasePlannedOrigHeadLock = async (): Promise<void> => {
     if (!origHeadToken) return;
     // Stays true if unlink or its directory fsync fails. The caller must retain
     // journal.id even when the path currently appears absent: power loss could
     // resurrect an unlink whose directory update was not durable.
     origHeadCleanupDurabilityPending = true;
-    await releaseOrigHeadLock(ctx, plan.origHeadLock?.journalId ?? "", origHeadToken);
+    await addTimedMs(opts.chainTimings, "journalMs", () => releaseOrigHeadLock(ctx, plan.origHeadLock?.journalId ?? "", origHeadToken!));
     origHeadToken = undefined;
     origHeadCleanupDurabilityPending = false;
   };
@@ -578,6 +649,7 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
     }
 
     const primaryLines = transactionLines(plan);
+    mutationLease = opts.mutationBoundary?.enter({ phase: "git-prepare", repository: ctx.repoDir });
     tx = new RefTransaction(ctx.repoDir, plan.reflogMessage);
     let primaryIntent!: JournalPreparedTransaction;
     await addTimedMs(opts.chainTimings, "refTxnExclusiveMs", async () => {
@@ -593,37 +665,63 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
       ];
       await persistJournal();
     }
+    // This is the first operation that can make native Git lockfiles visible.
+    // Check after every setup/journal await so a closed gate never reaches it.
+    if (mutationLease?.abortRequested) throw new MutationGateClosedError();
     await addTimedMs(opts.chainTimings, "refTxnExclusiveMs", () => tx!.prepare());
     const postHeadLines = refUpdateLines(plan.postHeadRefUpdates ?? [], plan.postHeadExtraTransactionLines);
     await opts.afterPrepareChild?.(await tx.processId(), "primary");
-    await observePreparedLockTokens(primaryIntent);
+    await addTimedMs(opts.chainTimings, "journalMs", () => observePreparedLockTokens(primaryIntent));
     if (opts.journal) {
       await persistJournal();
     }
     try { opts.crashAt?.("after-prepare"); } catch (error) { throw new InjectedCheckoutCrash(error); }
+    // A prepared native transaction is still reversible. Cooperate with a
+    // shutdown immediately, before acquiring manual ref/index reservations or
+    // performing the second proof.
+    if (mutationLease?.abortRequested) throw new MutationGateClosedError();
 
+    const reservationMarkers = new Map<string, string>();
+    const reservationPaths = new Map<string, string>();
+    if ((plan.refReservations?.length ?? 0) > 0) {
+      const commonReal = await fs.realpath(ctx.commonDir);
+      const owner = await systemLockIdentity.current();
+      for (const reservation of plan.refReservations ?? []) {
+        if (!safeReservationRef(reservation.ref)) throw new Error(`unsafe checkout ref reservation: ${reservation.ref}`);
+        const lockPath = path.resolve(commonReal, `${reservation.ref}.lock`);
+        if (!lockPath.startsWith(`${commonReal}${path.sep}`)) throw new Error(`checkout ref reservation escaped common dir: ${reservation.ref}`);
+        reservationPaths.set(reservation.ref, lockPath);
+        reservationMarkers.set(reservation.ref, formatLockMarker({ ...owner, token: crypto.randomBytes(16).toString("hex") }));
+      }
+      if (opts.journal) {
+        opts.journal.value.expectedNew.reservedLocks = Object.fromEntries((plan.refReservations ?? []).map((reservation) => [reservation.ref, {
+          marker: reservationMarkers.get(reservation.ref)!,
+        }]));
+        await persistJournal();
+      }
+    }
     for (const reservation of plan.refReservations ?? []) {
-      const lockPath = path.join(ctx.commonDir, `${reservation.ref}.lock`);
-      await fs.mkdir(path.dirname(lockPath), { recursive: true });
-      const handle = await fs.open(lockPath, "wx");
-      reservationHandles.push(handle);
-      const token = await lockToken(lockPath);
-      if (!token) throw new Error(`could not identify owned ${reservation.ref}.lock`);
+      const lockPath = reservationPaths.get(reservation.ref)!;
+      await safeBoundLockParent(await fs.realpath(ctx.commonDir), lockPath, { create: true });
+      if (mutationLease?.abortRequested) throw new MutationGateClosedError();
+      const published = await addTimedMs(opts.chainTimings, "journalMs", () => publishLockMarker(lockPath, reservationMarkers.get(reservation.ref)!));
+      if (published.status !== "created") throw new Error(`could not reserve ${reservation.ref}.lock`);
+      const token = { path: lockPath, dev: Number(published.observation.dev), ino: Number(published.observation.inode) };
       reservationTokens.push(token);
+      reservationObservations.set(lockPath, published.observation);
+      if (opts.journal) {
+        opts.journal.value.expectedNew.reservedLocks![reservation.ref] = {
+          marker: reservationMarkers.get(reservation.ref)!,
+          observation: serializeMarkerObservation(published.observation),
+        };
+        await persistJournal();
+      }
       const oid = await git(ctx.repoDir, ["rev-parse", "--verify", "--quiet", reservation.ref]).catch(() => "");
       if ((oid || null) !== reservation.expectedOid) throw new Error(`reserved ref changed: ${reservation.ref}`);
     }
-    if (opts.journal && reservationTokens.length) {
-      opts.journal.value.expectedNew.reservedLocks = Object.fromEntries((plan.refReservations ?? []).map((reservation, i) => [reservation.ref, {
-        dev: reservationTokens[i]!.dev,
-        ino: reservationTokens[i]!.ino,
-      }]));
-      await persistJournal();
-    }
-
     if (plan.origHeadLock) {
       if (!opts.journal || opts.journal.value.journalId !== plan.origHeadLock.journalId) throw new Error("ORIG_HEAD lock plan lacks matching journal ownership");
-      origHeadToken = await acquireOrigHeadLock(ctx, plan.origHeadLock.journalId);
+      origHeadToken = await addTimedMs(opts.chainTimings, "journalMs", () => acquireOrigHeadLock(ctx, plan.origHeadLock!.journalId));
     }
 
     if (plan.head.kind === "symbolic" && plan.head.newTarget === plan.head.oldTarget) {
@@ -636,11 +734,21 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
     }
 
     // O_EXCL is the writer reservation held across the ref commit (r3 F6).
+    if (opts.journal) {
+      opts.journal.value.expectedNew.indexLock = { acquireStarted: false };
+      await persistJournal();
+    }
+    if (mutationLease?.abortRequested) throw new MutationGateClosedError();
     indexHandle = await fs.open(indexLock, "wx");
     indexToken = await lockToken(indexLock);
     if (!indexToken) throw new Error("could not identify owned index.lock");
+    indexObservation = await addTimedMs(opts.chainTimings, "journalMs", () => observeLockMarker(indexLock));
+    if (!indexObservation) throw new Error("could not observe owned index.lock");
     if (opts.journal) {
-      opts.journal.value.expectedNew.indexLock = { dev: indexToken.dev, ino: indexToken.ino };
+      opts.journal.value.expectedNew.indexLock = {
+        acquireStarted: true,
+        observation: serializeMarkerObservation(indexObservation),
+      };
       await persistJournal();
     }
     try { opts.crashAt?.("after-index-lock"); } catch (error) { throw new InjectedCheckoutCrash(error); }
@@ -668,16 +776,16 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
       postHeadTx = undefined;
       await indexHandle.close();
       indexHandle = undefined;
-      await fs.rm(indexLock, { force: true });
-      for (const handle of reservationHandles) await handle.close().catch(() => {});
-      reservationHandles.length = 0;
-      for (const token of reservationTokens) await fs.rm(token.path, { force: true }).catch(() => {});
-      reservationTokens.length = 0;
+      await releaseExactCheckoutLock(indexLock, indexObservation);
+      indexObservation = undefined;
+      indexToken = undefined;
+      await releaseReservations();
       await releasePlannedOrigHeadLock();
       const reason = becameBusy ? "git became busy at checkout boundary"
         : breadcrumbChanged ? ORIG_HEAD_CHANGED_AT_CHECKOUT_BOUNDARY
         : "checkout boundary proof changed";
-      return origHeadCleanupDurabilityPending || await journalLocksRemain(opts.journal?.value) ? { status: "defer", reason, journalIntact: true } : { status: "defer", reason };
+      return origHeadCleanupDurabilityPending || reservationCleanupDurabilityPending || checkoutLockCleanupDurabilityPending
+        || await journalLocksRemain(opts.journal?.value) ? { status: "defer", reason, journalIntact: true } : { status: "defer", reason };
     }
 
     const branchSwitchTarget = plan.head.kind === "symbolic" && plan.head.newTarget !== plan.head.oldTarget ? plan.head.newTarget : undefined;
@@ -685,11 +793,12 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
     if (branchSwitch && opts.journal) {
       opts.journal.value.expectedNew.headLock = {
         path: path.resolve(ctx.gitDir, "HEAD.lock"),
-        acquireStarted: true,
+        acquireStarted: false,
         expectedBytes: [Buffer.alloc(0).toString("base64")],
       };
       await persistJournal();
     }
+    if (mutationLease && !mutationLease.beginCommit("git-commit")) throw new MutationGateClosedError();
     await addTimedMs(opts.chainTimings, "refTxnExclusiveMs", () => tx!.commit());
     tx = undefined;
     refsCommitted = true;
@@ -699,8 +808,11 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
       headHandle = await fs.open(headLockPath, "wx");
       headToken = await lockToken(headLockPath);
       if (!headToken) throw new Error("could not identify owned HEAD.lock reservation");
+      headObservation = await addTimedMs(opts.chainTimings, "journalMs", () => observeLockMarker(headLockPath));
+      if (!headObservation) throw new Error("could not observe owned HEAD.lock reservation");
       if (opts.journal?.value.expectedNew.headLock) {
-        opts.journal.value.expectedNew.headLock.token = { dev: headToken.dev, ino: headToken.ino };
+        opts.journal.value.expectedNew.headLock.acquireStarted = true;
+        opts.journal.value.expectedNew.headLock.observation = serializeMarkerObservation(headObservation);
         const primary = opts.journal.value.expectedNew.preparedTransactions?.find((entry) => entry.id === "primary");
         if (primary) primary.completed = true;
         await persistJournal();
@@ -734,7 +846,7 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
       await opts.afterPrepareChild?.(await postHeadTx.processId(), "post-head");
       if (opts.journal) {
         const intent = opts.journal.value.expectedNew.preparedTransactions?.find((entry) => entry.id === "post-head");
-        if (intent) await observePreparedLockTokens(intent);
+        if (intent) await addTimedMs(opts.chainTimings, "journalMs", () => observePreparedLockTokens(intent));
         await persistJournal();
       }
       if (opts.postHeadSecondProof && !(await opts.postHeadSecondProof())) {
@@ -759,10 +871,29 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
       }
       await indexHandle!.close();
       indexHandle = undefined;
-      if (candidate) await fs.rename(indexLock, path.join(ctx.gitDir, "index"));
+      if (candidate) {
+        const live = await observeLockMarker(indexLock);
+        if (!live) throw new Error("index.lock disappeared before publication");
+        indexObservation = live;
+        if (opts.journal?.value.expectedNew.indexLock) {
+          opts.journal.value.expectedNew.indexLock = {
+            acquireStarted: true,
+            observation: serializeMarkerObservation(live),
+          };
+          await persistJournal();
+        }
+        const verified = await observeLockMarker(indexLock);
+        if (!verified || !sameMarkerObservation(verified, live)) throw new Error("index.lock ownership changed before publication");
+        await fs.rename(indexLock, path.join(ctx.gitDir, "index"));
+        await fsyncDirectory(ctx.gitDir);
+        indexObservation = undefined;
+        indexToken = undefined;
+      }
       else {
         await fs.rm(path.join(ctx.gitDir, "index"), { force: true });
-        await fs.rm(indexLock, { force: true });
+        await releaseExactCheckoutLock(indexLock, indexObservation);
+        indexObservation = undefined;
+        indexToken = undefined;
       }
     });
     try { opts.crashAt?.("after-index-publish"); } catch (error) { throw new InjectedCheckoutCrash(error); }
@@ -770,37 +901,42 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
     await releasePlannedOrigHeadLock();
     await headHandle?.close();
     headHandle = undefined;
-    if (headToken) await fs.rm(headToken.path, { force: true });
+    if (headToken) await releaseExactCheckoutLock(headToken.path, headObservation);
     headToken = undefined;
-    for (const handle of reservationHandles) await handle.close();
-    reservationHandles.length = 0;
-    for (const token of reservationTokens) await fs.rm(token.path, { force: true });
-    reservationTokens.length = 0;
+    headObservation = undefined;
+    await releaseReservations();
     return { status: "committed" };
   } catch (error) {
     if (!refsCommitted) {
       await tx?.abort().catch(() => {});
       await postHeadTx?.abort().catch(() => {});
       await indexHandle?.close().catch(() => {});
-      if (indexToken) await fs.rm(indexLock, { force: true }).catch(() => {});
+      if (indexToken) await releaseExactCheckoutLock(indexLock, indexObservation).catch(() => {});
+      indexToken = undefined;
+      indexObservation = undefined;
       await headHandle?.close().catch(() => {});
-      if (headToken) await fs.rm(headToken.path, { force: true }).catch(() => {});
-      for (const handle of reservationHandles) await handle.close().catch(() => {});
-      for (const token of reservationTokens) await fs.rm(token.path, { force: true }).catch(() => {});
+      if (headToken) await releaseExactCheckoutLock(headToken.path, headObservation).catch(() => {});
+      headToken = undefined;
+      headObservation = undefined;
+      await releaseReservations().catch(() => {});
       await releasePlannedOrigHeadLock().catch(() => {});
       if (error instanceof InjectedCheckoutCrash) throw error.cause;
       const reason = error instanceof Error ? error.message : "checkout transaction failed";
-      return origHeadCleanupDurabilityPending || await journalLocksRemain(opts.journal?.value) ? { status: "defer", reason, journalIntact: true } : { status: "defer", reason };
+      return origHeadCleanupDurabilityPending || reservationCleanupDurabilityPending || checkoutLockCleanupDurabilityPending
+        || await journalLocksRemain(opts.journal?.value) ? { status: "defer", reason, journalIntact: true } : { status: "defer", reason };
     }
     // After ref commit, never call unconditional restoreLocal (r2 F4). The
     // durable journal's old/new arbitration is the only repair authority.
     await indexHandle?.close().catch(() => {});
     await postHeadTx?.abort().catch(() => {});
-    if (indexToken) await fs.rm(indexLock, { force: true }).catch(() => {});
+    if (indexToken) await releaseExactCheckoutLock(indexLock, indexObservation).catch(() => {});
+    indexToken = undefined;
+    indexObservation = undefined;
     await headHandle?.close().catch(() => {});
-    if (headToken) await fs.rm(headToken.path, { force: true }).catch(() => {});
-    for (const handle of reservationHandles) await handle.close().catch(() => {});
-    for (const token of reservationTokens) await fs.rm(token.path, { force: true }).catch(() => {});
+    if (headToken) await releaseExactCheckoutLock(headToken.path, headObservation).catch(() => {});
+    headToken = undefined;
+    headObservation = undefined;
+    await releaseReservations().catch(() => {});
     // After ref commit, an incomplete staged op-state publication keeps the
     // pseudo-ref fence for journal recovery. Successful publication already
     // released it immediately above.
@@ -808,6 +944,7 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
     if (error instanceof JournalArbitrationDefer) return { status: "defer", reason: error.message, journalIntact: true };
     throw error;
   } finally {
+    mutationLease?.finish();
     await fs.rm(staged, { force: true }).catch(() => {});
   }
 }
