@@ -1376,7 +1376,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
       intended,
       ...(opts.manualResolution ? { episode: { verb: "take-theirs" as const, snapshotId: opts.manualResolution.snapshotId } } : {}),
     };
-    await addTimedMs(opts.chainTimings, "indexOpStateMs", () => writeCheckoutJournal(opts.workspaceRoot, opts.relPath, journal, {
+    await addTimedMs(opts.chainTimings, "journalMs", () => writeCheckoutJournal(opts.workspaceRoot, opts.relPath, journal, {
       indexPath: path.join(opts.ctx.gitDir, "index"),
       gitDir: opts.ctx.gitDir,
     }));
@@ -1564,7 +1564,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
     if (result.status !== "committed") {
       // A dead prepared child or post-symref HEAD arbitration can leave locks
       // and/or committed checkout fields that only intent recovery may touch.
-      if (result.status !== "defer" || !result.journalIntact) await clearCheckoutJournal(opts.workspaceRoot, opts.relPath);
+      if (result.status !== "defer" || !result.journalIntact) await addTimedMs(opts.chainTimings, "journalMs", () => clearCheckoutJournal(opts.workspaceRoot, opts.relPath));
       const reason: GitDeferralReason = result.status === "unsupported" ? "unsupported"
         : /became busy/.test(result.reason) ? "git-busy"
         : /connectivity/.test(result.reason) ? "artifact"
@@ -1585,9 +1585,9 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
       if (!checkoutBranchLockedProof) throw new Error("checkout branch committed without locked proof receipt");
       postProgress.branchLockedProofs![checkoutBranchPlan.ref] = checkoutBranchLockedProof;
       journal.intended = await opts.makeIntended(postProgress);
-      await updateCheckoutJournal(opts.workspaceRoot, opts.relPath, journal);
+      await addTimedMs(opts.chainTimings, "journalMs", () => updateCheckoutJournal(opts.workspaceRoot, opts.relPath, journal));
     }
-    await markCheckoutJournalPublished(opts.workspaceRoot, opts.relPath);
+    await addTimedMs(opts.chainTimings, "journalMs", () => markCheckoutJournalPublished(opts.workspaceRoot, opts.relPath));
     if (opts.manualResolution && effective.refs["refs/stash"]) await ensureStashReflog(opts.ctx.repoDir, effective.refs["refs/stash"]!);
     opts.crashAt?.("after-published-flip");
     if (origHeadPreservation) {

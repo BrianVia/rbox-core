@@ -557,7 +557,7 @@ async function restoreOpStateWithCrash(ctx: RepoCtx, desired: Array<{ rel: strin
 /** The pinned 10-step checkout commit from design 116 (r1 F3/r2 F4/r3 F6). */
 export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPlan, opts: CommitCheckoutOptions<T>): Promise<CommitCheckoutResult> {
   const persistJournal = (): Promise<void> => opts.journal
-    ? addTimedMs(opts.chainTimings, "indexOpStateMs", () =>
+    ? addTimedMs(opts.chainTimings, "journalMs", () =>
         updateCheckoutJournal(opts.journal!.workspaceRoot, opts.journal!.relPath, opts.journal!.value))
     : Promise.resolve();
   if (!(opts.capabilitySupported ?? await checkoutTransactionSupported(ctx.repoDir, opts.capabilityProbe))) return { status: "unsupported", reason: "git lacks prepared transactional symref-update" };
@@ -594,7 +594,7 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
         exact = false;
         continue;
       }
-      const released = await releaseObservedLock(token.path, observation);
+      const released = await addTimedMs(opts.chainTimings, "journalMs", () => releaseObservedLock(token.path, observation));
       if (!released.released || !released.durable) exact = false;
     }
     if (!exact) throw new Error("checkout reservation exact release was not durable");
@@ -608,7 +608,7 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
   const releaseExactCheckoutLock = async (lockPath: string, observation: MarkerObservation | undefined): Promise<void> => {
     if (!observation) throw new Error(`checkout lock lacks exact release observation: ${lockPath}`);
     checkoutLockCleanupDurabilityPending = true;
-    const released = await releaseObservedLock(lockPath, observation);
+    const released = await addTimedMs(opts.chainTimings, "journalMs", () => releaseObservedLock(lockPath, observation));
     if (!released.released || !released.durable) throw new Error(`checkout lock exact release failed: ${lockPath}`);
     checkoutLockCleanupDurabilityPending = false;
   };
@@ -618,7 +618,7 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
     // journal.id even when the path currently appears absent: power loss could
     // resurrect an unlink whose directory update was not durable.
     origHeadCleanupDurabilityPending = true;
-    await releaseOrigHeadLock(ctx, plan.origHeadLock?.journalId ?? "", origHeadToken);
+    await addTimedMs(opts.chainTimings, "journalMs", () => releaseOrigHeadLock(ctx, plan.origHeadLock?.journalId ?? "", origHeadToken!));
     origHeadToken = undefined;
     origHeadCleanupDurabilityPending = false;
   };
@@ -671,7 +671,7 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
     await addTimedMs(opts.chainTimings, "refTxnExclusiveMs", () => tx!.prepare());
     const postHeadLines = refUpdateLines(plan.postHeadRefUpdates ?? [], plan.postHeadExtraTransactionLines);
     await opts.afterPrepareChild?.(await tx.processId(), "primary");
-    await observePreparedLockTokens(primaryIntent);
+    await addTimedMs(opts.chainTimings, "journalMs", () => observePreparedLockTokens(primaryIntent));
     if (opts.journal) {
       await persistJournal();
     }
@@ -704,7 +704,7 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
       const lockPath = reservationPaths.get(reservation.ref)!;
       await safeBoundLockParent(await fs.realpath(ctx.commonDir), lockPath, { create: true });
       if (mutationLease?.abortRequested) throw new MutationGateClosedError();
-      const published = await publishLockMarker(lockPath, reservationMarkers.get(reservation.ref)!);
+      const published = await addTimedMs(opts.chainTimings, "journalMs", () => publishLockMarker(lockPath, reservationMarkers.get(reservation.ref)!));
       if (published.status !== "created") throw new Error(`could not reserve ${reservation.ref}.lock`);
       const token = { path: lockPath, dev: Number(published.observation.dev), ino: Number(published.observation.inode) };
       reservationTokens.push(token);
@@ -721,7 +721,7 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
     }
     if (plan.origHeadLock) {
       if (!opts.journal || opts.journal.value.journalId !== plan.origHeadLock.journalId) throw new Error("ORIG_HEAD lock plan lacks matching journal ownership");
-      origHeadToken = await acquireOrigHeadLock(ctx, plan.origHeadLock.journalId);
+      origHeadToken = await addTimedMs(opts.chainTimings, "journalMs", () => acquireOrigHeadLock(ctx, plan.origHeadLock!.journalId));
     }
 
     if (plan.head.kind === "symbolic" && plan.head.newTarget === plan.head.oldTarget) {
@@ -742,7 +742,7 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
     indexHandle = await fs.open(indexLock, "wx");
     indexToken = await lockToken(indexLock);
     if (!indexToken) throw new Error("could not identify owned index.lock");
-    indexObservation = await observeLockMarker(indexLock);
+    indexObservation = await addTimedMs(opts.chainTimings, "journalMs", () => observeLockMarker(indexLock));
     if (!indexObservation) throw new Error("could not observe owned index.lock");
     if (opts.journal) {
       opts.journal.value.expectedNew.indexLock = {
@@ -808,7 +808,7 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
       headHandle = await fs.open(headLockPath, "wx");
       headToken = await lockToken(headLockPath);
       if (!headToken) throw new Error("could not identify owned HEAD.lock reservation");
-      headObservation = await observeLockMarker(headLockPath);
+      headObservation = await addTimedMs(opts.chainTimings, "journalMs", () => observeLockMarker(headLockPath));
       if (!headObservation) throw new Error("could not observe owned HEAD.lock reservation");
       if (opts.journal?.value.expectedNew.headLock) {
         opts.journal.value.expectedNew.headLock.acquireStarted = true;
@@ -846,7 +846,7 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
       await opts.afterPrepareChild?.(await postHeadTx.processId(), "post-head");
       if (opts.journal) {
         const intent = opts.journal.value.expectedNew.preparedTransactions?.find((entry) => entry.id === "post-head");
-        if (intent) await observePreparedLockTokens(intent);
+        if (intent) await addTimedMs(opts.chainTimings, "journalMs", () => observePreparedLockTokens(intent));
         await persistJournal();
       }
       if (opts.postHeadSecondProof && !(await opts.postHeadSecondProof())) {

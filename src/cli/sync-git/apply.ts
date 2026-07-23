@@ -223,7 +223,7 @@ export function formatGitApplyMetrics(metrics: GitApplyMetrics): string {
     .map((t) => {
       const group = t.commonDirGroup === undefined ? "" : `g${t.commonDirGroup}`;
       const chain = t.chain && hasGitChainTiming(t.chain)
-        ? ` L${t.chain.chainLength}fd${Math.round(chainMetric(t.chain.fetchDecryptMs))}bv${Math.round(chainMetric(t.chain.bundleVerifyMs))}gi${Math.round(chainMetric(t.chain.gitImportMs))}io${Math.round(chainMetric(t.chain.indexOpStateMs))}rt${Math.round(chainMetric(t.chain.refTxnExclusiveMs))}ow${Math.round(chainMetric(t.chain.ownershipMs))}rl${Math.round(chainMetric(t.chain.reflogMs))}cp${Math.round(chainMetric(t.chain.connectivityProofMs))}cl${Math.round(chainMetric(t.chain.classifyMs))}rs${Math.round(chainMetric(t.chain.residualMs))}`
+        ? ` L${t.chain.chainLength}fd${Math.round(chainMetric(t.chain.fetchDecryptMs))}bv${Math.round(chainMetric(t.chain.bundleVerifyMs))}gi${Math.round(chainMetric(t.chain.gitImportMs))}io${Math.round(chainMetric(t.chain.indexOpStateMs))}jr${Math.round(chainMetric(t.chain.journalMs))}rt${Math.round(chainMetric(t.chain.refTxnExclusiveMs))}ow${Math.round(chainMetric(t.chain.ownershipMs))}rl${Math.round(chainMetric(t.chain.reflogMs))}cp${Math.round(chainMetric(t.chain.connectivityProofMs))}cl${Math.round(chainMetric(t.chain.classifyMs))}rs${Math.round(chainMetric(t.chain.residualMs))}`
         : "";
       return `i${t.index}q${t.queueMs}w${t.wallMs}${GIT_APPLY_RESULT_ABBR[t.result]}${group}${chain}`;
     })
@@ -241,6 +241,7 @@ export function formatGitApplyMetrics(metrics: GitApplyMetrics): string {
       formatGitApplyDistribution("bundleVerifyMs", chainTimings.map((chain) => chain.bundleVerifyMs)),
       formatGitApplyDistribution("gitImportMs", chainTimings.map((chain) => chain.gitImportMs)),
       formatGitApplyDistribution("indexOpStateMs", chainTimings.map((chain) => chain.indexOpStateMs)),
+      formatGitApplyDistribution("journalMs", chainTimings.map((chain) => chainMetric(chain.journalMs))),
       formatGitApplyDistribution("refTxnExclusiveMs", chainTimings.map((chain) => chainMetric(chain.refTxnExclusiveMs))),
       formatGitApplyDistribution("ownershipMs", chainTimings.map((chain) => chainMetric(chain.ownershipMs))),
       formatGitApplyDistribution("reflogMs", chainTimings.map((chain) => chainMetric(chain.reflogMs))),
@@ -256,7 +257,7 @@ function hasGitChainTiming(chain: GitChainTimings): boolean {
   return chain.chainLength > 0 || chain.fetchDecryptMs > 0 || chain.bundleVerifyMs > 0
     || chain.gitImportMs > 0 || chain.refTxnExclusiveMs > 0 || chain.ownershipMs > 0
     || chain.reflogMs > 0 || chain.connectivityProofMs > 0 || chain.indexOpStateMs > 0
-    || chain.classifyMs > 0;
+    || chain.journalMs > 0 || chain.classifyMs > 0;
 }
 
 function chainMetric(value: number | undefined): number {
