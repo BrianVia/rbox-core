@@ -63,10 +63,17 @@ if (!fs.existsSync(binary)) fail(`${binary} missing — run without --skip-build
 
 const demoHome = path.join(os.homedir(), ".rbox-dev-demo");
 fs.rmSync(demoHome, { recursive: true, force: true });
+// Seed a realistic-feeling home: the demo overrides HOME for isolation
+// (credentials resolve through $HOME/.rbox), so tilde paths land HERE — give
+// the directory picker believable places to navigate.
 const project = path.join(demoHome, "demo-project");
 fs.mkdirSync(project, { recursive: true });
+fs.mkdirSync(path.join(demoHome, "Downloads"), { recursive: true });
+fs.mkdirSync(path.join(demoHome, "Projects", "side-app", "src"), { recursive: true });
 fs.writeFileSync(path.join(project, "notes.md"), "# demo\n");
 fs.writeFileSync(path.join(project, "hello.txt"), "hello\n");
+fs.writeFileSync(path.join(demoHome, "Downloads", "sample.pdf"), "sample\n");
+fs.writeFileSync(path.join(demoHome, "Projects", "side-app", "src", "index.ts"), "console.log('hi')\n");
 
 const env = {
   ...process.env,
