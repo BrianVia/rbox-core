@@ -295,11 +295,14 @@ describe("runGenesisEnrollment", () => {
       },
     });
 
-    expect(choiceNames).toEqual(["Save to a plaintext file", "Copy it to my clipboard"]);
-    expect(rendered).toContain("Your files stay normal and usable on this computer.");
-    expect(rendered).toContain("GitHub and other source control keep working normally.");
-    expect(rendered).toContain("work you have not committed or pushed yet");
-    expect(rendered).toContain("1Password CLI not found");
+    expect(choiceNames).toEqual(["Plain-text file", "Copy to clipboard"]);
+    expect(rendered).toContain("Protect your files");
+    expect(rendered).toContain("Your files on this machine stay unchanged.");
+    // Founder-trimmed 2026-07-23: the GitHub and lost-every-device paragraphs
+    // were cut from the first-run lead-in as wall-of-text.
+    expect(rendered).not.toContain("GitHub and other source control");
+    expect(rendered).not.toContain("If you lose every signed-in device");
+    expect(rendered).not.toContain("1Password CLI not found");
     expect({ copied, cleared }).toEqual({ copied: 1, cleared: 1 });
     expect((await readRecoveryKitRecord(accountId))?.plaintextArtifacts.map((artifact) => artifact.path)).toContain(target);
     await expect(fs.access(target)).resolves.toBe(null);
@@ -384,7 +387,7 @@ describe("runGenesisEnrollment", () => {
 
     expect(rendered).toContain("Saved recovery phrase to 1 of 2 selected places:");
     expect(rendered).toContain("! 1Password");
-    expect(rendered).toContain("✓ plaintext file");
+    expect(rendered).toContain("✓ plain-text file");
     expect(continued).toBe(1);
     await expect(fs.access(genesisPaths(accountId).journal)).rejects.toThrow();
   });
@@ -728,7 +731,7 @@ describe("runGenesisEnrollment", () => {
     // The phrase was copied, the user declined, and rbox still cleared it before bailing.
     expect({ copied, cleared }).toEqual({ copied: 1, cleared: 1 });
     expect(rendered).toContain("! Clipboard");
-    expect(rendered).toContain("✓ plaintext file");
+    expect(rendered).toContain("✓ plain-text file");
   });
 });
 

@@ -6,8 +6,8 @@
  * `runMenu`; the menu's "just authorize this machine" option is dropped (served
  * directly by `rbox login`).
  *
- * Every interactive widget is an `@inquirer/prompts` `select`/`input`/`confirm`/
- * `password` routed through `./prompt.js` — so menus are arrow-key choices (no
+ * Every interactive widget is an Ink component routed through `./prompt.js` —
+ * so menus are arrow-key choices (no
  * invalid-input loops), Ctrl-C exits cleanly (130), and EVERYTHING renders on
  * STDERR (so `rbox setup > log` never pollutes stdout). The lone pure mapper that
  * remains, `workspaceFlags`, carries the Step-2 transition and is unit-tested.
@@ -45,6 +45,7 @@ import { openAndShow } from "./browser-open.js";
 import { hasKeyInput, runKeyedSetup } from "./setup-keyed.js";
 import { getIdentity, identityText } from "./account-profile.js";
 import { WORKSPACE_MINT_RERUN_HINT } from "./remote/errors.js";
+import { rboxBanner } from "./wordmark.js";
 import {
   acquireWorkspaceSyncMutex,
   releaseWorkspaceSyncMutex,
@@ -88,7 +89,7 @@ export const START_SYNC_CHOICES = [
 ] as const satisfies ReadonlyArray<{ name: string; value: StartSyncChoice }>;
 
 /** Map the Step-3 choice to its two side effects. Pure so the three-way branching is
- *  pinned by a unit test without driving the inquirer widget (mirrors `workspaceFlags`
+ *  pinned by a unit test without driving the TUI widget (mirrors `workspaceFlags`
  *  and `authorizePath`). "both" starts the daemon AND enables autostart; "start" starts
  *  the daemon only; "none" does neither. */
 export function startSyncActions(choice: StartSyncChoice): { startDaemon: boolean; enableAutostart: boolean } {
@@ -128,6 +129,14 @@ const HR = "─".repeat(72);
 // ── the guided flow ───────────────────────────────────────────────────────────
 
 export type WorkspaceKind = "new" | "existing";
+
+/** Name rbox and distinguish a local folder from something already in the account.
+ *  The original generic "new workspace" / "existing workspace" labels left first-time
+ *  users unsure whether they were choosing an rbox concept or a directory on disk. */
+export const WORKSPACE_KIND_CHOICES = [
+  { name: "Create a new rbox workspace from a folder on this machine", value: "new" },
+  { name: "Sync a workspace already in your rbox account", value: "existing", description: "choose one you've synced before" },
+] as const satisfies ReadonlyArray<{ name: string; value: WorkspaceKind; description?: string }>;
 
 /** Steady-state step header. The subscribe-gated path intentionally still says
  *  "of 3": step 3 (start syncing) exists but is deferred until `rbox subscribe`
@@ -195,11 +204,11 @@ export async function runSetup(opts: {
   // Via the untracked menu, enrollment was verified by resolveBareRboxTarget and
   // the menu printed its own banner — skip both.
   if (!viaUntrackedMenu) {
-    process.stderr.write(`\n${e.cyan("◆")}  ${e.bold("Welcome to rbox")} — end-to-end encrypted sync for your dev workspaces.\n`);
+    process.stderr.write(rboxBanner());
     if (accountId) {
       await writeEnrolledSkipNotice(accountId);
     } else {
-      process.stderr.write(`\n── ${e.bold(stepHeader(1, 3, "Account"))} ${HR.slice(0, 46)}\n`);
+      process.stderr.write(`\n${e.bold(stepHeader(1, 3, "Account"))}\n`);
       const hasCreds = Boolean(initialCreds?.accountId);
       const result = hasCreds
         ? {
@@ -245,7 +254,7 @@ export async function runSetup(opts: {
   }
 
   // Step 3 · Start syncing in the background.
-  process.stderr.write(`\n── ${e.bold(shortFlow ? stepHeader(2, 2, "Start syncing") : stepHeader(3, 3, "Start syncing"))} ${HR.slice(0, 38)}\n`);
+  process.stderr.write(`\n${e.bold(shortFlow ? stepHeader(2, 2, "Start syncing") : stepHeader(3, 3, "Start syncing"))}\n`);
   const startChoice = await promptSelect<StartSyncChoice>({
     message: "Keep this workspace syncing in the background?",
     choices: START_SYNC_CHOICES,
@@ -443,7 +452,7 @@ export async function authorizeExistingAccount(remote: string, deps: AuthorizeEx
 }
 
 async function startTrialAfterAccountCreation(credentialResult: CredentialLoadResult): Promise<boolean> {
-  process.stderr.write(`\n── ${e.bold("Start your 14-day free trial")} ${HR.slice(0, 36)}\n`);
+  process.stderr.write(`\n${e.bold("Start your 14-day free trial")}\n`);
   const choice = await promptSelect<`${SubscribePlan}:${BillingCadence}`>({
     message: "Choose a plan for this new account:",
     choices: [
@@ -484,7 +493,7 @@ async function pollUntilPlanActive(credentialResult: CredentialLoadResult): Prom
 /** Which authorize path an existing-account method takes. "pair" redeems a pairing
  *  token (enrolls encryption inline); "browser" uses the device-code grant.
  *  Pure so the two-way routing is pinned by a unit test
- *  without driving the inquirer widget (mirrors `workspaceFlags`). */
+ *  without driving the TUI widget (mirrors `workspaceFlags`). */
 export function authorizePath(method: "pair" | "browser"): "pair-token" | "device-code" {
   return method === "pair" ? "pair-token" : "device-code";
 }
@@ -657,16 +666,13 @@ export async function stepWorkspace(
   const loadedCredentials = setupOpts.credentialResult ?? await readCredentials();
   const creds = credentialsForStrictFlow(loadedCredentials);
 
-  writeStderr(`\n── ${e.bold(setupOpts.header)} ${HR.slice(0, 44)}\n`);
+  writeStderr(`\n${e.bold(setupOpts.header)}\n`);
   writeStderr(`${e.dim(WORKSPACE_DEFINITION)}\n`);
   const choice =
     setupOpts.preselectedKind ??
     (await select<WorkspaceKind>({
       message: "What do you want to track here?",
-      choices: [
-        { name: "Create a new workspace from a directory", value: "new" },
-        { name: "Sync an existing workspace", value: "existing", description: "pick one you've already synced" },
-      ],
+      choices: WORKSPACE_KIND_CHOICES,
     }));
 
   let workspace: string | undefined;

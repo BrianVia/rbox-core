@@ -2,8 +2,8 @@ import os from "node:os";
 import fs from "node:fs/promises";
 import { clearCredentials, credentialsForStrictFlow, loadCredentials, PROD_WEB, saveCredentials } from "./credentials.js";
 import { clearAccountProfile } from "./account-profile.js";
-import { isInteractive, promptCheckbox, promptConfirm, promptInput, promptPassword, promptSelect, type CheckboxPrompt } from "./prompt.js";
-import { copyToClipboard, openInBrowser, waitForKeypress } from "./browser-open.js";
+import { isInteractive, promptCheckbox, promptConfirm, promptInput, promptKeypress, promptPassword, promptSelect, type CheckboxPrompt } from "./prompt.js";
+import { copyToClipboard, openInBrowser } from "./browser-open.js";
 import { RboxApi } from "./remote.js";
 import { emitJson } from "./json.js";
 import { assertNoPendingGenesis, beginAtomicGenesis, completeAtomicGenesis, enrollViaPairing, enrollViaRecovery, enrollViaRecoveryWithPhraseInput, RecoveryPreAdmissionError, type AtomicGenesisDestinationSetContext, type AtomicGenesisDestinationSetResult } from "./e2ee-client.js";
@@ -12,6 +12,8 @@ import { buildPairing, canonicalString, phraseToRk, randomBytes, rkToPhrase, sha
 import { loadDevice, loadRecoveryKey } from "./e2ee-keystore.js";
 import { isAutostartEnabled } from "./autostart-cmd.js";
 import { readStdinTrimmed } from "./read-stdin.js";
+import { rboxBanner } from "./wordmark.js";
+import { style, stderrStyle } from "./style.js";
 import { friendlyHttpError } from "./http-error.js";
 import {
   defaultKitTargetDir,
@@ -189,18 +191,16 @@ interface GenesisDestinationFlowDeps {
   clearClipboard?: typeof clearRecoverySecretClipboard;
 }
 
-const GENESIS_RECOVERY_LEAD_IN = `
-First, save your recovery phrase.
+// Copy shaped by two founder field-review rounds (2026-07-23): one clear task,
+// heading bright, two short sentences, no security essay. Cut material lives in
+// design 187 for docs/web use.
+const genesisRecoveryLeadIn = (): string => `
+${stderrStyle.bold("Protect your files")}
 
-Your files stay normal and usable on this computer. Before rbox uploads a copy,
-it encrypts that copy using this phrase. That keeps your files private in the
-cloud — even from us.
+rbox encrypts files before they leave this machine. Save your recovery
+phrase so you can restore access later.
 
-GitHub and other source control keep working normally. This phrase protects
-rbox's separate cloud copy, including work you have not committed or pushed yet.
-
-If you lose every signed-in device, this phrase is the only way back in.
-rbox cannot reset it.
+Your files on this machine stay unchanged.
 `;
 
 function destinationKinds(destinations: readonly RecoveryDestination[]): Set<GenesisDestinationChoice> {
@@ -225,40 +225,42 @@ async function chooseGenesisDestinationIntent(args: {
   const fixedKinds = destinationKinds(fixed);
   const discovery = args.opDiscovery ?? await (deps.detectOnePassword ?? detectOnePasswordCli)();
 
-  write(GENESIS_RECOVERY_LEAD_IN);
-  if (discovery.state !== "available") {
-    write("\n1Password CLI not found — choose Clipboard to paste the phrase into 1Password yourself.\n");
-  }
+  write(rboxBanner() + genesisRecoveryLeadIn());
+  // No "1Password CLI not found" notice here (founder cut, 2026-07-23): when op
+  // is absent the option simply doesn't appear, and the clipboard flow already
+  // says "paste it into your password manager now" at the moment that matters.
 
   for (;;) {
     const selected = await checkbox<GenesisDestinationChoice>({
-      message: "Where should rbox save your recovery phrase?\n  ↑/↓ move · Space select · Enter continue",
+      // The TUI renders its own key-hint line — do not embed one in the message.
+      message: "Save it in one or more places:",
       choices: [
         ...(discovery.state === "available" ? [{
-          name: "Save to 1Password",
+          name: "1Password",
           value: "onepassword" as const,
           description: "creates a secure item in a vault you choose",
           checked: fixedKinds.has("onepassword"),
           disabled: fixedKinds.has("onepassword") ? "already saved" : false,
         }] : []),
         ...(args.keychainTarget ? [{
-          name: "Save to macOS Keychain",
+          name: "macOS Keychain",
           value: "keychain" as const,
           description: "saves on this Mac; it does not sync through iCloud",
           checked: fixedKinds.has("keychain") || fixed.length === 0,
           disabled: fixedKinds.has("keychain") ? "already saved" : false,
         }] : []),
         {
-          name: "Save to a plaintext file",
+          name: "Plain-text file",
           value: "kit-path" as const,
-          description: `writes the phrase in plaintext to ${displayPath(args.filePath)} (readable only by your user account)`,
+          // The exact path prints after the save succeeds — not here.
+          description: "Protect it like a password.",
           checked: fixedKinds.has("kit-path") || fixed.length === 0 && !args.keychainTarget,
           disabled: fixedKinds.has("kit-path") ? "already saved" : false,
         },
         {
-          name: "Copy it to my clipboard",
+          name: "Copy to clipboard",
           value: "clipboard" as const,
-          description: "copies the 24 words temporarily; clipboard tools or history may retain them until cleared",
+          // Exposure disclosure moved to copy time, where it matters.
           checked: fixedKinds.has("clipboard"),
           disabled: fixedKinds.has("clipboard") ? "already saved" : false,
         },
@@ -339,7 +341,7 @@ async function chooseGenesisDestinationIntent(args: {
 function destinationLabel(destination: RecoveryDestination): string {
   if (destination.kind === "onepassword") return "1Password";
   if (destination.kind === "keychain") return "macOS Keychain";
-  if (destination.kind === "kit-path") return "plaintext file";
+  if (destination.kind === "kit-path") return "plain-text file";
   return "Clipboard";
 }
 
@@ -525,6 +527,10 @@ async function completeGenesisDestinationSet(
 
     if (liveValid.size === context.intent.destinations.length) {
       write(`\n✓ Recovery phrase saved to ${liveValid.size === 1 ? destinationLabel(context.intent.destinations[0]!) : `${liveValid.size} selected places`}\n`);
+      for (const index of [...liveValid].sort((a, b) => a - b)) {
+        const destination = context.intent.destinations[index]!;
+        if (destination.kind === "kit-path") write(`  ${displayPath(destination.path)}\n`);
+      }
       return { intent: context.intent, progress: context.progress, liveValidDestinationIndexes: [...liveValid], continuedAfterPartial };
     }
 
@@ -939,7 +945,7 @@ export async function login(
     if (!res.ok) throw await friendlyHttpError(res, "login --bootstrap");
     const { token, deviceId, accountId } = (await res.json()) as { token: string; deviceId: string; accountId: string };
     await saveCredentials({ token, deviceId, remoteUrl, accountId });
-    console.log(`logged in (bootstrapped) as device ${deviceId}`);
+    console.log(`${style.sym.ok} logged in`);
     const api = new RboxApi(remoteUrl, token, "", "");
     const genesis = await runGenesisEnrollment(api, { accountId, deviceId }, kitOpts);
     if (genesis === "enrolled") {
@@ -998,6 +1004,7 @@ export async function login(
         assertValidDeviceCodeApproval(p);
         await saveCredentials({ token: p.token, deviceId: p.deviceId, remoteUrl, accountId: p.accountId });
         console.log(`device authorized: ${p.deviceId}`);
+        await copyKey?.close();
         const enrollment = await handleDeviceCodePostApprovalEncryption(
           new RboxApi(remoteUrl, p.token, "", ""),
           { accountId: p.accountId, deviceId: p.deviceId },
@@ -1014,26 +1021,31 @@ export async function login(
     }
     throw new Error("authorization timed out");
   } finally {
-    try {
-      copyKey?.cancel();
-    } catch {
+    await copyKey?.close().catch(() => {
       // already resolved / non-interactive → nothing to close
-    }
+    });
   }
 }
 
 /** Opportunistically open the approval page and listen for a single copy key
- *  concurrently with polling. The cancel handle restores stdin as soon as the
- *  grant completes, so the key listener never outlives the login flow. */
-function offerApprovalCopy(url: string): { cancel: () => void } | undefined {
+ *  concurrently with polling. `close()` aborts the listener and resolves only
+ *  after the prompt runtime has fully released stdin — callers MUST await it
+ *  before mounting any follow-on prompt on the same terminal, because the
+ *  runtime holds an exclusive per-stdin lock while a prompt is live. */
+function offerApprovalCopy(url: string): { close: () => Promise<void> } | undefined {
   openInBrowser(url); // opportunistic; silently no-ops on a headless box
   if (!isInteractive()) return undefined;
   console.log("    press [c] to copy the URL");
   const controller = new AbortController();
-  void waitForKeypress(controller.signal).then((key) => {
+  const settled = promptKeypress({ signal: controller.signal }).then((key) => {
     if (key === "c") console.log(copyToClipboard(url) ? "Copied to clipboard." : "Couldn't reach the clipboard — copy the URL above manually.");
-  });
-  return { cancel: () => controller.abort() };
+  }).catch(() => {});
+  return {
+    close: async () => {
+      controller.abort();
+      await settled;
+    },
+  };
 }
 
 export async function logout(): Promise<void> {
@@ -1135,7 +1147,7 @@ export function pairingConnectCommand(serverToken: unknown, tokenId: string, tok
 
 interface PairingConnectPresentationDeps {
   isInteractive?: typeof isInteractive;
-  waitForKeypress?: typeof waitForKeypress;
+  waitForKeypress?: () => Promise<string | undefined>;
   copyToClipboard?: typeof copyToClipboard;
   log?: (message: string) => void;
   write?: (message: string) => void;
@@ -1152,7 +1164,7 @@ export async function presentPairingConnectCommand(command: string, deps: Pairin
 
   if ((deps.isInteractive ?? isInteractive)()) {
     write("Press [c] to copy the command to your clipboard, any other key to continue... ");
-    const key = await (deps.waitForKeypress ?? waitForKeypress)();
+    const key = await (deps.waitForKeypress ?? promptKeypress)();
     write("\n");
     if (key === "c") {
       log((deps.copyToClipboard ?? copyToClipboard)(command)

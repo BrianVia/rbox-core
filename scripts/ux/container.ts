@@ -5,6 +5,7 @@ import * as C from "../rig/lib/container.js";
 import { GUEST, imageHash, NAMES } from "../rig/lib/config.js";
 import { imageHashRecordPath, readImageHashRecord, writeImageHashRecord } from "../rig/lib/image-hash-records.js";
 import { DEV_API, safeId, SCRUBBED_ENV, shellQuote, UX_ROOT } from "./lib.js";
+import { resolveUxBinaryOverride, UX_GUEST_RBOX } from "./binary.js";
 
 export const UX_IMAGE = NAMES.image;
 export const UX_NETWORK = "bridge";
@@ -58,12 +59,18 @@ function specHash(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex").slice(0, 24);
 }
 
-export function uxContainerPlan(runId: string, hash = currentRigImageHash(), repoRoot = REPO_ROOT): UxContainerPlan {
+export function uxContainerPlan(
+  runId: string,
+  hash = currentRigImageHash(),
+  repoRoot = REPO_ROOT,
+  binaryOverride = resolveUxBinaryOverride(),
+): UxContainerPlan {
   const id = safeId("run id", runId);
   const mounts: C.Mount[] = [
     { source: path.join(repoRoot, "src"), target: GUEST.srcMount, readonly: true },
     { source: path.join(repoRoot, "scripts"), target: GUEST.scriptsMount, readonly: true },
   ];
+  if (binaryOverride) mounts.push({ source: binaryOverride, target: UX_GUEST_RBOX, readonly: true });
   const repoId = createHash("sha256").update(path.resolve(repoRoot)).digest("hex").slice(0, 16);
   const base = { runId: id, name: uxContainerName(id), image: UX_IMAGE, network: UX_NETWORK, imageHash: hash, repoId, mounts, env: { RBOX_API: DEV_API } };
   return { ...base, specHash: specHash(base) };
@@ -129,12 +136,22 @@ export function uxOwnership(value: unknown, plan: UxContainerPlan): "match" | "o
   const forbidden = ["HOME", "RBOX_HOME", ...SCRUBBED_ENV].filter((key) => key !== "RBOX_API");
   if (!env.includes(`RBOX_API=${DEV_API}`) || env.some((entry) => typeof entry === "string" && forbidden.some((key) => entry.startsWith(`${key}=`)))) return "collision";
   const mounts = Array.isArray(row.Mounts) ? row.Mounts : [];
-  const exactMounts = mounts.length === plan.mounts.length && plan.mounts.every((want) => mounts.some((candidate) => {
+  const mountMatches = (want: C.Mount, candidate: unknown): boolean => {
     if (!candidate || typeof candidate !== "object") return false;
     const mount = candidate as Record<string, unknown>;
     return mount.Source === want.source && mount.Destination === want.target && mount.RW === !want.readonly;
-  }));
-  if (!exactMounts) return "collision";
+  };
+  const actualCore = mounts.filter((candidate) =>
+    candidate && typeof candidate === "object" &&
+    (candidate as Record<string, unknown>).Destination !== UX_GUEST_RBOX
+  );
+  const desiredCore = plan.mounts.filter((want) => want.target !== UX_GUEST_RBOX);
+  const coreMatches = actualCore.length === desiredCore.length &&
+    desiredCore.every((want) => actualCore.some((candidate) => mountMatches(want, candidate)));
+  if (!coreMatches) return "collision";
+  const exactMounts = mounts.length === plan.mounts.length &&
+    plan.mounts.every((want) => mounts.some((candidate) => mountMatches(want, candidate)));
+  if (!exactMounts) return "owned-stale";
   return map["ux.spec"] === plan.specHash ? "match" : "owned-stale";
 }
 

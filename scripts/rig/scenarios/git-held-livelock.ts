@@ -171,7 +171,7 @@ export const gitHeldLivelock: Scenario = {
         const out = await pollUntil({ probe: async () => {
           // Supersession OFF for the settle pushes: a default CLI push runs the
           // full plan and heals the wedge before the skip is observable (run-6).
-          const push = await ctx.a.rboxShell(`cd '${GUEST.workDir}' && RBOX_GIT_PENDING_SUPERSEDE=0 bun ${GUEST.cliEntry} push`, { allowFail: true });
+          const push = await ctx.a.rboxShell(`cd '${GUEST.workDir}' && RBOX_GIT_PENDING_SUPERSEDE=0 ${GUEST.cliExecutable} push`, { allowFail: true });
           const pull = await ctx.a.rbox(["pull", "--verbose"], { cwd: GUEST.workDir, allowFail: true });
           const text = pull.stdout + pull.stderr;
           // Settled = the full follow's deferral names ONLY git-plane blockers,
@@ -199,7 +199,7 @@ export const gitHeldLivelock: Scenario = {
         await new Promise((resolve) => setTimeout(resolve, 2_100));
         // RBOX_METRICS=1: the skippedHeld token lives in the metrics summary
         // line, which the rig's default injection (RBOX_METRICS=0) suppresses.
-        const pull = await ctx.a.rboxShell(`cd '${GUEST.workDir}' && RBOX_METRICS=1 RBOX_DEBUG=1 RBOX_GIT_PENDING_SUPERSEDE=0 bun ${GUEST.cliEntry} pull --verbose`);
+        const pull = await ctx.a.rboxShell(`cd '${GUEST.workDir}' && RBOX_METRICS=1 RBOX_DEBUG=1 RBOX_GIT_PENDING_SUPERSEDE=0 ${GUEST.cliExecutable} pull --verbose`);
         skipWindow = pull.stdout + pull.stderr;
       });
       rec.assert("held window: second idle pull reports skippedHeld>=1", skippedHeldRe.test(skipWindow),

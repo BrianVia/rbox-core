@@ -1,9 +1,9 @@
 /**
  * The "track an existing workspace" picker (Feature B) — PURE logic plus the tiny
  * display helpers `rbox status` shares, and one impure entry point. Everything the
- * picker's behavior turns on (sorting, labelling, building/filtering the inquirer
+ * picker's behavior turns on (sorting, labelling, building/filtering prompt
  * choices, choosing select-vs-search) is pure and TTY-free, so it's unit-tested
- * without a server or a terminal; only `promptWorkspacePick` (the inquirer widget)
+ * without a server or a terminal; only `promptWorkspacePick` (the TUI widget)
  * and `fetchAccountWorkspaces` (the thin HTTP helper) do I/O.
  *
  * It replaces the old "paste a workspace id copied from another machine" prompt:
@@ -63,10 +63,10 @@ export function sortWorkspacesForPick(list: AccountWorkspace[]): AccountWorkspac
   return [...list].sort((a, b) => b.createdAt - a.createdAt);
 }
 
-// ── inquirer picker: pure choice-building + the one impure entry point ─────────
-// The inquirer wrapper is imported LAZILY inside `promptWorkspacePick` (not at
+// ── workspace picker: pure choice-building + the one impure entry point ────────
+// The shared prompt facade is imported LAZILY inside `promptWorkspacePick` (not at
 // module top) so `rbox status` — which pulls only the pure display helpers from
-// here — never loads inquirer's module graph on that hot path.
+// here — never loads the component runtime on that hot path.
 
 /** Above this many workspaces the picker switches from an arrow-key `select` to a
  *  type-to-filter `search` (a long static list is worse than a search box). */
@@ -77,7 +77,7 @@ export function pickerMode(count: number): "select" | "search" {
   return count > SELECT_MAX ? "search" : "select";
 }
 
-/** An inquirer choice: `value` is the raw workspaceId (what the picker returns),
+/** A prompt choice: `value` is the raw workspaceId (what the picker returns),
  *  `name` is the display line (label · age · short id). */
 export interface WorkspaceChoice {
   name: string;
@@ -167,7 +167,7 @@ interface WorkspacePickerDeps {
  * the list, so callers can cache it locally for `rbox status`), or `undefined` if
  * the user backed out of manual entry (blank).
  *
- * Callers MUST gate on `isInteractive()` — inquirer requires a TTY.
+ * Callers MUST gate on `isInteractive()` — the prompt runtime requires a TTY.
  */
 export function promptWorkspacePick(opts: {
   baseUrl: string;

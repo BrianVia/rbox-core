@@ -50,11 +50,10 @@ Your files stay normal and usable on this computer. Before rbox uploads a copy,
 it encrypts that copy using this phrase. That keeps your files private in the
 cloud — even from us.
 
-GitHub and other source control keep working normally. This phrase protects
-rbox's separate cloud copy, including work you have not committed or pushed yet.
-
-If you lose every signed-in device, this phrase is the only way back in.
-rbox cannot reset it.
+> Amended 2026-07-23 (founder, field-testing the 410 TUI): the GitHub/source-
+> control paragraph and the lose-every-device paragraph are CUT from the
+> first-run lead-in — wall-of-text at the exact moment we need attention.
+> The facts stay documented here and may return in docs/web copy.
 
 ? Where should rbox save your recovery phrase?
 Instructions:
@@ -81,9 +80,10 @@ The rows are conditional:
   proves a supported 1Password CLI 2.x is installed.
 - Show Keychain only when the current macOS Keychain preflight is actionable.
 - Plaintext and clipboard remain available on every interactive platform.
-- When the 1Password CLI is absent, print one non-blocking line above the menu:
-  `1Password CLI not found — choose Clipboard to paste the phrase into
-  1Password yourself.`
+- When the 1Password CLI is absent, the option simply does not appear.
+  (Amended 2026-07-23, founder field-review: the former "1Password CLI not
+  found" notice line was cut as first-run noise — the clipboard flow already
+  says "paste it into your password manager now" at copy time.)
 
 The order is optimized for off-machine recoverability, not platform
 convenience. The current platform default remains preselected so pressing Enter
@@ -759,3 +759,15 @@ remove the disposable item/vault.
 - Making 1Password a setup requirement.
 - Moving device/MK operational material out of the local keystore.
 - A general TUI framework migration.
+
+> Amended 2026-07-23 (second field-review round, codex copy critique,
+> founder-approved): the genesis screen now presents one clear task —
+> bright "Protect your files" heading, two short sentences plus "Your
+> files on this machine stay unchanged.", menu message "Save it in one or
+> more places:", option names shortened (Plain-text file / Copy to
+> clipboard / 1Password / macOS Keychain), the plain-text option warns
+> "Protect it like a password." instead of embedding the generated
+> filename (the exact path prints after the save succeeds), the clipboard
+> exposure disclosure lives at copy time only, bootstrap login prints just
+> "logged in", and the TUI separates key hints from the last option. The
+> block wordmark stays (founder call).

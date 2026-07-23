@@ -81,7 +81,7 @@ export function attachingGitHistoryLabel(done: number, total: number, detail?: s
 /**
  * Gather the missing init inputs interactively (all widgets render on stderr, so
  * `rbox init > out.txt` never pollutes stdout). Callers gate this on a TTY —
- * inquirer requires one. `ctx` carries the creds/remote the join picker needs.
+ * the interactive picker requires one. `ctx` carries the creds/remote it needs.
  */
 export async function promptMissing(
   flags: Record<string, string>,

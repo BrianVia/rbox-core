@@ -154,8 +154,22 @@ on the M2 Max (GitHub-hosted runners can't do macOS 26 + vmnet — design 56 §1
 the `RBOX_DEV_BOOTSTRAP` repo secret (and optionally `CLOUDFLARE_ACCOUNT_ID` /
 `CLOUDFLARE_API_TOKEN` for the AE channel) before the runner goes live.
 
+## Compiled candidate override
+
+`up` and `run` accept `--binary` with an exact canonical absolute path:
+
+```sh
+bun run rig run onboard-smoke --binary /absolute/path/rbox-linux-arm64
+```
+
+The rig validates that the host path is a regular, non-symlink executable before
+creating a container, copies those exact bytes into a content-addressed,
+single-file staging directory, then bind-mounts that directory read-only at
+`/opt/rbox/bin` in both guests. Every foreground, shell-mediated, and
+detached scenario invocation uses that fixed executable. Omitting `--binary`
+preserves the source-mode image shim.
+
 ## What's next
 
-The bootstrap `plan` param (unlocks the `development` tier), `binary` provisioning
-mode, and perf budgets flipped from report-only to gating once burn-in data exists.
-See design 56 §13 for the phase breakdown.
+Perf budgets flip from report-only to gating once burn-in data exists. See
+design 56 §13 for the phase breakdown.

@@ -7,6 +7,23 @@ container. The harness is locked to
 `https://rbox-dev-api.brian-via.workers.dev`. Never weaken that guard or point a
 walkthrough at `api.rbox.to`.
 
+## Run an isolated compiled candidate
+
+Set `RBOX_UX_BINARY` to the exact canonical absolute path of an executable
+compiled for the Linux guest before creating or running a flow:
+
+```sh
+RBOX_UX_BINARY=/absolute/path/rbox-linux-arm64 bun scripts/ux/regress.ts --flow fresh-setup-to-handoff
+```
+
+The harness validates that the path is a regular, non-symlink executable and
+bind-mounts those exact bytes read-only over the image's `rbox` shim. Every
+flow command, helper command, and tmux session then uses the candidate. Without
+the variable, behavior is unchanged and `rbox` remains the source-mode shim.
+Destroy an existing run with the same variable set before changing candidates;
+candidate-mount changes are recognized as owned stale state, never silently
+reused.
+
 ## Mint machines
 
 Run from this repository worktree:
@@ -27,7 +44,8 @@ is refused.
 The two stdout lines identify the guest HOME and give a reusable, shell-quoted
 `docker exec --workdir ... env ... rbox` prefix. The image mounts this checkout's
 `src/` and `scripts/` read-only, and its `rbox` launcher executes the same
-`bun /app/src/cli/index.ts` candidate path used by the rig. The HOME path is
+`bun /app/src/cli/index.ts` source path used by the rig unless a compiled
+candidate override is active. The HOME path is
 inside the container, not a directory to enter or inspect on the host. Always use
 the printed prefix as a complete unit so both the container and cwd stay pinned.
 

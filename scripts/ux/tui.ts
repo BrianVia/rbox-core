@@ -2,6 +2,7 @@
 import { assertMachineHome } from "./fresh-machine.js";
 import { assertGuestMachineHome, configureUxRuntime, containerRboxEnv, execUx, uxContainerName } from "./container.js";
 import { assertNoAncestorWorkspace, DEV_API, executionMode, safeId, SCRUBBED_ENV, shellQuote } from "./lib.js";
+import { resolveUxBinaryOverride } from "./binary.js";
 
 export { shellQuote } from "./lib.js";
 
@@ -173,6 +174,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   if (args.command === "start") {
     const home = mode === "host" ? await assertMachineHome(args.home) : (assertGuestMachineHome(args.home, args.runId), args.home);
     if (mode === "host") await assertNoAncestorWorkspace(home);
+    if (mode === "host") args.child[0] = resolveUxBinaryOverride() ?? args.child[0]!;
     await invoke(tmuxStartArgs(args.session, home, args.cols, args.rows, args.child), false, mode === "container" ? home : undefined);
   } else if (args.command === "keys") await sendKeys(args, (tmuxArgs) => invoke(tmuxArgs));
   else if (args.command === "paste-buffer") {

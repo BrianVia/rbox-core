@@ -2,9 +2,11 @@
 import { join } from "node:path";
 
 export const INQUIRER_IMPORT_ERROR =
-  "::error::@inquirer may only be imported from src/cli/prompt.ts (STDERR + Ctrl-C invariant)";
+  "::error::@inquirer is retired; all interactive widgets must use the shared Ink prompt runtime";
+export const TUI_IMPORT_ERROR =
+  "::error::ink/react may only be imported from src/cli/prompt-ink.tsx";
 
-const ALLOWED_INQUIRER_IMPORT = "src/cli/prompt.ts";
+const ALLOWED_TUI_IMPORT = "src/cli/prompt-ink.tsx";
 
 async function guardSrcTestShardCoverage(root: string): Promise<boolean> {
   const processHandle = Bun.spawn(
@@ -20,12 +22,10 @@ export async function findInquirerImportViolations(root: string): Promise<string
 
   for await (const relativePath of glob.scan({ cwd: root, dot: true, onlyFiles: true })) {
     const normalizedPath = relativePath.replaceAll("\\", "/");
-    if (normalizedPath === ALLOWED_INQUIRER_IMPORT) continue;
-
     const source = await Bun.file(join(root, relativePath)).text();
     const lines = source.split("\n");
     for (let index = 0; index < lines.length; index++) {
-      if (lines[index]!.includes('from "@inquirer')) {
+      if (lines[index]!.includes('from "@inquirer') || lines[index]!.includes('import("@inquirer')) {
         violations.push(`${normalizedPath}:${index + 1}:${lines[index]}`);
       }
     }
@@ -34,19 +34,40 @@ export async function findInquirerImportViolations(root: string): Promise<string
   return violations.sort();
 }
 
-async function guardInquirerImports(root: string): Promise<boolean> {
-  console.log(`inquirer-import guard: checked src/; only ${ALLOWED_INQUIRER_IMPORT} may import @inquirer`);
-  const violations = await findInquirerImportViolations(root);
-  if (violations.length === 0) return true;
+export async function findTuiImportViolations(root: string): Promise<string[]> {
+  const glob = new Bun.Glob("src/**/*");
+  const violations: string[] = [];
+  for await (const relativePath of glob.scan({ cwd: root, dot: true, onlyFiles: true })) {
+    const normalizedPath = relativePath.replaceAll("\\", "/");
+    if (normalizedPath === ALLOWED_TUI_IMPORT) continue;
+    const lines = (await Bun.file(join(root, relativePath)).text()).split("\n");
+    for (let index = 0; index < lines.length; index++) {
+      if (/(?:from|import\(|require\()\s*[\"'](?:ink|react)(?:\/[^\"']*)?[\"']/.test(lines[index]!)) {
+        violations.push(`${normalizedPath}:${index + 1}:${lines[index]}`);
+      }
+      // The bespoke raw-key reader pattern (deleted from browser-open.ts) must
+      // not return: all keypress handling goes through the shared runtime.
+      if (/emitKeypressEvents/.test(lines[index]!)) {
+        violations.push(`${normalizedPath}:${index + 1}:${lines[index]}`);
+      }
+    }
+  }
+  return violations.sort();
+}
 
-  for (const violation of violations) console.log(violation);
-  console.error(INQUIRER_IMPORT_ERROR);
-  return false;
+async function guardTuiImports(root: string): Promise<boolean> {
+  console.log(`tui-import guard: @inquirer forbidden; ink/react only in ${ALLOWED_TUI_IMPORT}`);
+  const inquirer = await findInquirerImportViolations(root);
+  const tui = await findTuiImportViolations(root);
+  for (const violation of [...inquirer, ...tui]) console.log(violation);
+  if (inquirer.length) console.error(INQUIRER_IMPORT_ERROR);
+  if (tui.length) console.error(TUI_IMPORT_ERROR);
+  return inquirer.length === 0 && tui.length === 0;
 }
 
 export async function runGuards(root = process.cwd()): Promise<boolean> {
   if (!(await guardSrcTestShardCoverage(root))) return false;
-  return guardInquirerImports(root);
+  return guardTuiImports(root);
 }
 
 if (import.meta.main && !(await runGuards())) process.exit(1);

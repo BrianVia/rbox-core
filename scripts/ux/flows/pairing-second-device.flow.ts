@@ -24,6 +24,6 @@ export default defineFlow({
     { on: "b", keys: ["Enter"] },
     { on: "b", waitFor: /encryption enrolled/, timeout: 60 },
     { on: "b", waitFor: /What do you want to track here\?/, timeout: 60 },
-    { on: "b", assertScreen: [/Create a new workspace from a directory/, /Sync an existing workspace/] },
+    { on: "b", assertScreen: [/Create a new rbox workspace from a folder on this machine/, /Sync a workspace already in your rbox account/] },
   ],
 });

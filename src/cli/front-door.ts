@@ -1,4 +1,5 @@
 import os from "node:os";
+import { rboxBanner } from "./wordmark.js";
 import { startDaemonAndRecordDesired, stopDaemonAndRecordDesired } from "./autostart-cmd.js";
 import { fetchAccountSummary } from "./account-cmd.js";
 import { getIdentity, identityText, readAccountProfile } from "./account-profile.js";
@@ -116,6 +117,7 @@ export async function runFrontDoor(root: string, deps: FrontDoorDeps = {}): Prom
   const freshIdentity = await fetchColdFrontDoorIdentity(deps);
   const renderStatus = deps.statusCmd ?? ((r: string, identity?: BriefIdentitySource) =>
     identity ? statusCmdWithBriefIdentity(r, identity) : statusCmd(r));
+  process.stderr.write(rboxBanner());
   const { daemonRunning } = await renderStatus(root, freshIdentity);
   console.log();
   const action = await promptCancelable<FrontDoorAction>(deps.promptSelect ?? promptSelect, {
@@ -162,6 +164,7 @@ interface UntrackedMenuDeps {
 export async function runUntrackedMenu(cwd: string, accountId: string, deps: UntrackedMenuDeps = {}): Promise<WorkspaceKind | undefined> {
   const writeStderr = deps.writeStderr ?? ((text: string) => process.stderr.write(text));
   const identity = await (deps.getIdentity ?? getIdentity)(accountId);
+  writeStderr(rboxBanner());
   writeStderr(
     identity
       ? `\n${e.green("✓")}  Signed in as ${e.cyan(identityText(identity.email, identity.signInMethod)!)}. This directory isn't tracked yet.\n\n`

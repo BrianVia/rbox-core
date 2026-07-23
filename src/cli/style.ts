@@ -47,6 +47,11 @@ export const style = makeStyle(colorEnabled(process.stdout));
 /** Styling for stderr (spinners, diagnostics). */
 export const stderrStyle = makeStyle(colorEnabled(process.stderr));
 
+/** Terminal lifecycle escape owned here with the rest of rbox's ANSI policy. */
+export function ensureCursorVisible(stream: NodeJS.WritableStream = process.stderr): void {
+  stream.write("\x1b[?25h");
+}
+
 let jsonErrorMode = false;
 
 /** JSON errors are enabled only by the dispatcher for commands that declare `--json`. */

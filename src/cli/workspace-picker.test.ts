@@ -67,7 +67,7 @@ test("sortWorkspacesForPick orders by createdAt desc without mutating the input"
   expect(input.map((w) => w.workspaceId)).toEqual(["ws_a", "ws_b", "ws_c"]); // unmutated
 });
 
-// ── inquirer picker: pure choice-building + mode selection ─────────────────────
+// ── TUI picker: pure choice-building + mode selection ──────────────────────────
 
 test("pickerMode: a select up to SELECT_MAX, a search once past it", () => {
   expect(pickerMode(1)).toBe("select");

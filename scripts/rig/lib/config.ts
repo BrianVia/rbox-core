@@ -28,6 +28,8 @@ export const GUEST = {
   /** The container-local workspace — sync needs rw and must never touch host data. */
   workDir: "/work/ws",
   cliEntry: "/app/src/cli/index.ts",
+  /** Image source-mode shim; a compiled candidate may be mounted over this path. */
+  cliExecutable: "/opt/rbox/bin/rbox",
   corpusEntry: "/app/scripts/bench/corpus.ts",
   /** HOME is the image default (root); credentials land in /root/.rbox. */
   rboxHome: "/root/.rbox",
