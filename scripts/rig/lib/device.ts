@@ -104,6 +104,14 @@ export function detachedPushScript(logPath: string): string {
   return `nohup ${GUEST.cliExecutable} push >${shellQuote(logPath)} 2>&1 & echo "detached pid $!"`;
 }
 
+/** Launch an arbitrary `rbox <args>` DETACHED, redirecting stdout+stderr to
+ *  `logPath`, and echo its pid. Used by the 189 web-pairing scenario to run the
+ *  blocking device-code `rbox login` in the background while the rig approves it. */
+export function detachedRboxScript(args: readonly string[], logPath: string): string {
+  const cmd = args.map(shellQuote).join(" ");
+  return `nohup ${GUEST.cliExecutable} ${cmd} >${shellQuote(logPath)} 2>&1 & echo "detached pid $!"`;
+}
+
 /**
  * Build the guest-side collector shared by watcher classification and run-artifact
  * capture. Each runtime contributes calendar-valid daily files in filename order,
@@ -257,6 +265,29 @@ export class Device {
   async pushDetached(workDir: string, logPath: string, env: Record<string, string> = {}): Promise<void> {
     const script = detachedPushScript(logPath);
     await this.exec(["sh", "-c", script], { cwd: workDir, env: { RBOX_API: this.apiUrl, RBOX_METRICS: "1", RBOX_DIAGNOSTICS: "1", ...env } });
+  }
+
+  /**
+   * Start `rbox <args>` DETACHED in the guest (nohup, stdout+stderr → `logPath`) and
+   * return its pid. The process keeps running after this exec returns — the caller
+   * polls `logPath` for progress (e.g. the device-code approval URL, then the enroll
+   * result) and stops it with {@link killPid}. RBOX_API + RBOX_METRICS are injected.
+   */
+  async spawnRboxDetached(args: string[], logPath: string, opts: RboxOpts = {}): Promise<number> {
+    const script = detachedRboxScript(args, logPath);
+    const res = await this.exec(["sh", "-c", script], {
+      cwd: opts.cwd,
+      env: { RBOX_API: this.apiUrl, RBOX_METRICS: "1", RBOX_DIAGNOSTICS: "1", ...opts.env },
+      redact: opts.redact,
+    });
+    const pid = res.stdout.match(/detached pid (\d+)/)?.[1];
+    if (!pid) throw new Error(`could not read detached rbox pid from ${JSON.stringify(res.stdout.slice(0, 120))}`);
+    return Number(pid);
+  }
+
+  /** Best-effort `kill <pid>` in the guest (tolerates an already-exited process). */
+  async killPid(pid: number): Promise<void> {
+    await this.exec(["kill", String(pid)], { allowFail: true });
   }
 
   /**

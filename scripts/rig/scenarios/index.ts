@@ -14,10 +14,12 @@ import { gitFf } from "./git-ff.js";
 import { gitJoinAhead } from "./git-join-ahead.js";
 import { gitCommitPropagation } from "./git-commit-propagation.js";
 import { gitHeldLivelock } from "./git-held-livelock.js";
+import { webPairing } from "./web-pairing.js";
 
 export const SCENARIOS: Record<string, Scenario> = {
   "onboard-smoke": onboardSmoke,
   "two-device-live": twoDeviceLive,
+  "web-pairing": webPairing,
   "mass-delete-guard": massDeleteGuard,
   "type-flip": typeFlip,
   "daemon-idle-cpu": daemonIdleCpu,
@@ -47,6 +49,10 @@ export const SCENARIOS: Record<string, Scenario> = {
  * every-PR gate. Run it explicitly to guard design 172. git-held-livelock is likewise
  * EXCLUDED (explicit/pre-merge): it stops/starts a live daemon mid-scenario and runs
  * several propagation rounds — the design-174 guard, run explicitly like its sibling.
+ * web-pairing is EXCLUDED too (explicit/pre-merge): the design-189/192 auto-key-delivery
+ * validation runs a real device-code `rbox login`, waits out the daemon fulfillment +
+ * enroll window (~1-2 min), and drives the dev-only scriptable approve — too slow and
+ * daemon-timing-variable for the every-PR gate. Run it explicitly to guard 189.
  */
 export const FAST_SUITE = ["onboard-smoke", "two-device-live", "mass-delete-guard", "type-flip", "daemon-idle-cpu", "git-entanglement", "git-join-ahead"] as const;
 

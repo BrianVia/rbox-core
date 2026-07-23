@@ -168,6 +168,69 @@ export async function deleteAccount(apiUrl: string, token: string, accountId: st
   return { ok: res.ok, status: res.status, body };
 }
 
+export interface DevApproveResult {
+  ok: boolean;
+  status: number;
+  body: string;
+  /** The queued key-delivery envelope on success (design 189/192), else undefined/null. */
+  keyDelivery?: { requestId: string; status: string; expiresAt: number } | null;
+}
+
+/**
+ * Drive the DEV-ONLY scriptable approve (`POST /v1/auth/device/approve-dev`, design
+ * 192) with the account owner's bearer + the pending device-code's fragment
+ * fingerprint + the dev bootstrap secret. This is the headless twin of the web
+ * key-consent approve; the server 404s it in prod. Refuses prod locally too, and
+ * never logs the secret (it rides the request body only).
+ */
+export async function approveDeviceDev(
+  apiUrl: string,
+  token: string,
+  input: { userCode: string; pubkeyFingerprint: string; bootstrapSecret: string },
+  fetchFn: FetchFn = fetch,
+): Promise<DevApproveResult> {
+  assertNotProd(apiUrl);
+  const res = await fetchFn(`${apiUrl.replace(/\/+$/, "")}/v1/auth/device/approve-dev`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  const body = await res.text();
+  let keyDelivery: DevApproveResult["keyDelivery"];
+  try {
+    keyDelivery = (JSON.parse(body) as { keyDelivery?: DevApproveResult["keyDelivery"] }).keyDelivery;
+  } catch { /* non-JSON error body */ }
+  return { ok: res.ok, status: res.status, body, keyDelivery };
+}
+
+/**
+ * Approve a pending device-code for DEVICE AUTH ONLY (`POST /v1/auth/device/approve`
+ * with just `{ userCode }`, no keyConsent) using the owner's bearer. The 189 negative
+ * case: a bare `{ ok: true }` with NO `keyDelivery` field proves no key was delivered.
+ */
+export async function approveDeviceNoConsent(
+  apiUrl: string,
+  token: string,
+  userCode: string,
+  fetchFn: FetchFn = fetch,
+): Promise<{ ok: boolean; status: number; body: string; hasKeyDelivery: boolean }> {
+  assertNotProd(apiUrl);
+  const res = await fetchFn(`${apiUrl.replace(/\/+$/, "")}/v1/auth/device/approve`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ userCode }),
+  });
+  const body = await res.text();
+  const hasKeyDelivery = (() => {
+    try {
+      return "keyDelivery" in (JSON.parse(body) as object);
+    } catch {
+      return false;
+    }
+  })();
+  return { ok: res.ok, status: res.status, body, hasKeyDelivery };
+}
+
 /** Parse `~/.rbox/credentials.json` contents for the fields teardown needs. */
 export function readCredentials(json: string): { token: string; accountId?: string; deviceId?: string } {
   const c = JSON.parse(json) as { token?: string; accountId?: string; deviceId?: string };

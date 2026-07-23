@@ -255,63 +255,19 @@ export async function approveDeviceAuth(
       || mapping.account_id !== approver.accountId
       || mapping.user_id !== approver.userId
     ) return json({ error: "step_up_principal_mismatch" }, 403);
-    const pending = await dirDb(env)
-      .prepare(
-        `SELECT request_id,enc_pub_key,sig_pub_key
-         FROM device_auth
-         WHERE user_code=? AND status='pending' AND expires_at>?`,
-      )
-      .bind(userCode, now)
-      .first<{ request_id: string | null; enc_pub_key: string | null; sig_pub_key: string | null }>();
-    if (!pending) return json({ error: "no_pending_auth" }, 404);
-    if (!pending.request_id || !pending.enc_pub_key || !pending.sig_pub_key) {
-      return json({ error: "key_delivery_unavailable" }, 409);
-    }
-    const expected = await publicKeyFingerprint({
-      encPubKey: pending.enc_pub_key,
-      sigPubKey: pending.sig_pub_key,
-    });
-    if (!ctEqual(expected, body.pubkeyFingerprint)) {
-      return json({ error: "pubkey_binding_mismatch" }, 409);
-    }
-    const accountEpoch = await currentAccountEpoch(env, approver.accountId);
-    if (accountEpoch === null) return json({ error: "key_delivery_unavailable" }, 409);
+    // Belt-and-suspenders freshness re-check at queue time; queueKeyDelivery's SQL
+    // independently re-enforces the factor age, so the shared path needs no stepUp.
     const queueNow = Date.now();
     if (
       stepUp.factorVerifiedAt <= queueNow - CLERK_STEP_UP_MAX_AGE_MINUTES * 60_000
       || queueNow > stepUp.tokenValidUntil
     ) return json({ error: "fresh_step_up_required" }, 403);
-    const queued = await queueKeyDelivery(env, {
-      requestId: pending.request_id,
+    return queueApprovedKeyDelivery(env, approver, {
       userCode,
-      accountId: approver.accountId,
-      userId: approver.userId,
-      encPubKey: pending.enc_pub_key,
-      sigPubKey: pending.sig_pub_key,
-      fingerprint: expected,
+      pubkeyFingerprint: body.pubkeyFingerprint,
       approvalTokenHash: await sha256Hex(body.clerkToken),
       approvalFactorVerifiedAt: stepUp.factorVerifiedAt,
-      accountEpoch,
-      now: queueNow,
-    });
-    if (!queued.ok) {
-      if (queued.reason === "disabled") {
-        const approved = await dirDb(env)
-          .prepare(
-            `UPDATE device_auth SET status='approved',account_id=?,user_id=?
-             WHERE user_code=? AND status='pending' AND expires_at>?`,
-          )
-          .bind(approver.accountId, approver.userId, userCode, now)
-          .run();
-        if (approved.meta.changes !== 1) return json({ error: "no_pending_auth" }, 404);
-        return json({ ok: true, keyDelivery: null, keyDeliveryDisabled: true });
-      }
-      if (queued.reason === "no_pending_auth") return json({ error: "no_pending_auth" }, 404);
-      if (queued.reason === "epoch_changed") return json({ error: "key_delivery_epoch_changed" }, 409);
-      return json({ error: queued.reason === "cap" ? "key_delivery_cap" : "duplicate_key_delivery" }, 409);
-    }
-    if (ctx) nudgeKeyDelivery(ctx, env, approver.accountId, pending.request_id);
-    return json({ ok: true, keyDelivery: { requestId: pending.request_id, status: "pending", expiresAt: queued.expiresAt } });
+    }, ctx);
   }
   const res = await dirDb(env)
     .prepare("UPDATE device_auth SET status = 'approved', account_id = ?, user_id = ? WHERE user_code = ? AND status = 'pending' AND expires_at > ?")
@@ -319,6 +275,132 @@ export async function approveDeviceAuth(
     .run();
   if (res.meta.changes !== 1) return json({ error: "no_pending_auth" }, 404);
   return json({ ok: true });
+}
+
+export interface ApprovedKeyDeliveryInput {
+  userCode: string;
+  pubkeyFingerprint: string;
+  approvalTokenHash: string;
+  approvalFactorVerifiedAt: number;
+}
+
+/**
+ * The shared approve→queue path (design 189 §3): resolve the pending device-code,
+ * verify the fragment/fingerprint binding against the captured pubkeys, confirm the
+ * account has an E2EE epoch, then run the atomic approve+queue D1 batch and nudge.
+ * Both the real `device/approve` (after its Clerk step-up) and the dev-only
+ * `device/approve-dev` (after its env+secret gate) call this — the 189 binding,
+ * caps, revoke fence, and atomicity are identical across both; only the preceding
+ * AUTHENTICATION differs. `approver` supplies the account/user the delivery binds to.
+ */
+export async function queueApprovedKeyDelivery(
+  env: Env,
+  approver: Principal,
+  input: ApprovedKeyDeliveryInput,
+  ctx?: Pick<ExecutionContext, "waitUntil">,
+): Promise<Response> {
+  const userCode = input.userCode.toUpperCase();
+  const now = Date.now();
+  const pending = await dirDb(env)
+    .prepare(
+      `SELECT request_id,enc_pub_key,sig_pub_key,expires_at
+       FROM device_auth
+       WHERE user_code=? AND status='pending' AND expires_at>?`,
+    )
+    .bind(userCode, now)
+    .first<{ request_id: string | null; enc_pub_key: string | null; sig_pub_key: string | null; expires_at: number }>();
+  if (!pending) return json({ error: "no_pending_auth" }, 404);
+  if (!pending.request_id || !pending.enc_pub_key || !pending.sig_pub_key) {
+    return json({ error: "key_delivery_unavailable" }, 409);
+  }
+  const expected = await publicKeyFingerprint({
+    encPubKey: pending.enc_pub_key,
+    sigPubKey: pending.sig_pub_key,
+  });
+  if (!ctEqual(expected, input.pubkeyFingerprint)) {
+    return json({ error: "pubkey_binding_mismatch" }, 409);
+  }
+  const accountEpoch = await currentAccountEpoch(env, approver.accountId);
+  if (accountEpoch === null) return json({ error: "key_delivery_unavailable" }, 409);
+  const queued = await queueKeyDelivery(env, {
+    requestId: pending.request_id,
+    userCode,
+    accountId: approver.accountId,
+    userId: approver.userId,
+    encPubKey: pending.enc_pub_key,
+    sigPubKey: pending.sig_pub_key,
+    fingerprint: expected,
+    approvalTokenHash: input.approvalTokenHash,
+    approvalFactorVerifiedAt: input.approvalFactorVerifiedAt,
+    accountEpoch,
+    now,
+    deviceCodeExpiresAt: pending.expires_at,
+  });
+  if (!queued.ok) {
+    if (queued.reason === "disabled") {
+      const approved = await dirDb(env)
+        .prepare(
+          `UPDATE device_auth SET status='approved',account_id=?,user_id=?
+           WHERE user_code=? AND status='pending' AND expires_at>?`,
+        )
+        .bind(approver.accountId, approver.userId, userCode, now)
+        .run();
+      if (approved.meta.changes !== 1) return json({ error: "no_pending_auth" }, 404);
+      return json({ ok: true, keyDelivery: null, keyDeliveryDisabled: true });
+    }
+    if (queued.reason === "no_pending_auth") return json({ error: "no_pending_auth" }, 404);
+    if (queued.reason === "epoch_changed") return json({ error: "key_delivery_epoch_changed" }, 409);
+    return json({ error: queued.reason === "cap" ? "key_delivery_cap" : "duplicate_key_delivery" }, 409);
+  }
+  if (ctx) nudgeKeyDelivery(ctx, env, approver.accountId, pending.request_id);
+  return json({ ok: true, keyDelivery: { requestId: pending.request_id, status: "pending", expiresAt: queued.expiresAt } });
+}
+
+export function validateDeviceApproveDevBody(
+  value: unknown,
+): { userCode: string; pubkeyFingerprint: string; bootstrapSecret: string } | null {
+  if (!exactObject(value, ["userCode", "pubkeyFingerprint", "bootstrapSecret"])) return null;
+  if (typeof value.userCode !== "string" || !/^[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$/i.test(value.userCode)) return null;
+  if (typeof value.pubkeyFingerprint !== "string" || !validFingerprint(value.pubkeyFingerprint)) return null;
+  if (typeof value.bootstrapSecret !== "string" || value.bootstrapSecret.length === 0 || utf8Bytes(value.bootstrapSecret) > 4096) return null;
+  return { userCode: value.userCode, pubkeyFingerprint: value.pubkeyFingerprint, bootstrapSecret: value.bootstrapSecret };
+}
+
+// POST /v1/auth/device/approve-dev { userCode, pubkeyFingerprint, bootstrapSecret }
+// DEV-ONLY scriptable twin of the web key-consent approve (design 192). It lets the
+// headless two-machine rig drive the 189 key-delivery flow without a Clerk-authed
+// browser. It swaps ONLY the authentication (Clerk step-up + web-kind session) for a
+// dev-env + operator-secret gate; the fingerprint binding, epoch/caps/revoke fence,
+// and atomic approve+queue are the IDENTICAL queueApprovedKeyDelivery path.
+//
+// PROD-IMPOSSIBLE — three independent gates:
+//   1. env.RBOX_ENV !== "dev" → 404 (hardcoded "prod" in wrangler.jsonc production
+//      vars; same gate as the dev bootstrap plan + device-cap bypass). In prod the
+//      route is indistinguishable from one that does not exist.
+//   2. Reachable only by a durable DEVICE bearer (approve-dev is on neither the web
+//      nor api_key allowlist), so the caller is already an enrolled device.
+//   3. RBOX_BOOTSTRAP_SECRET operator proof via constant-time ctEqual.
+export async function approveDeviceAuthDev(
+  req: Request,
+  env: Env,
+  approver: Principal,
+  ctx?: Pick<ExecutionContext, "waitUntil">,
+): Promise<Response> {
+  if (env.RBOX_ENV !== "dev") return json({ error: "not_found" }, 404);
+  const limited = await rateLimited(env.RL_KEY_DELIVERY_APPROVE, `kda:${approver.userId ?? approver.deviceId}`);
+  if (limited) return limited;
+  const parsed = await cappedJson(req, { maxBytes: DEVICE_APPROVE_MAX_BYTES }, validateDeviceApproveDevBody);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.value;
+  const secret = env.RBOX_BOOTSTRAP_SECRET ?? "";
+  if (!secret || !ctEqual(body.bootstrapSecret, secret)) return json({ error: "unauthorized" }, 401);
+  const userCode = body.userCode.toUpperCase();
+  return queueApprovedKeyDelivery(env, approver, {
+    userCode,
+    pubkeyFingerprint: body.pubkeyFingerprint,
+    approvalTokenHash: await sha256Hex(`dev-approve:${userCode}:${body.pubkeyFingerprint}`),
+    approvalFactorVerifiedAt: Date.now(),
+  }, ctx);
 }
 
 // GET /v1/auth/device/lookup?code=XXXX-XXXX -> { label, status } | 404  (design 47)

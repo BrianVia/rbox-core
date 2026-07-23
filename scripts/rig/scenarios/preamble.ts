@@ -57,7 +57,7 @@ export function rigLoginArgv(side: "a" | "b", scenarioName: string, bootstrap = 
   return [GUEST.cliExecutable, "login", ...(bootstrap ? ["--bootstrap", "$RIG_BOOT"] : []), "--label", `rig-${side}-${scenarioName}`, "--remote", "$RBOX_API"];
 }
 
-function rigLoginShell(side: "a" | "b", scenarioName: string, bootstrap = false): string {
+export function rigLoginShell(side: "a" | "b", scenarioName: string, bootstrap = false): string {
   const argv = rigLoginArgv(side, scenarioName, bootstrap);
   return argv.map((arg) => arg.startsWith("$") ? `"${arg}"` : arg).join(" ");
 }

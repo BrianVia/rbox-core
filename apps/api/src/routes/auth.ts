@@ -1,5 +1,5 @@
 import { eq, isDeviceRevoke, type RouteCtx } from "./shared.js";
-import { approveDeviceAuth, bootstrap, createPairToken, listDevices, lookupDeviceAuth, lookupDevicePubkeys, pollDeviceAuth, redeemPairToken, revokeDevice, startDeviceAuth } from "../auth.js";
+import { approveDeviceAuth, approveDeviceAuthDev, bootstrap, createPairToken, listDevices, lookupDeviceAuth, lookupDevicePubkeys, pollDeviceAuth, redeemPairToken, revokeDevice, startDeviceAuth } from "../auth.js";
 import type { Principal } from "../authz.js";
 import { ackKeyDelivery, fetchKeyDeliveryRequest, submitKeyDeliveryBlob } from "../auth/key-delivery.js";
 
@@ -28,6 +28,9 @@ export async function authPublicRoutes({ req, env, executionCtx, seg }: RouteCtx
 export async function authDeviceRoutes({ req, env, executionCtx, seg }: RouteCtx, p: Principal): Promise<Response | null> {
   if (req.method === "POST" && eq(seg, ["v1", "auth", "pair", "create"])) return createPairToken(req, env, p);
   if (req.method === "POST" && eq(seg, ["v1", "auth", "device", "approve"])) return approveDeviceAuth(req, env, p, executionCtx);
+  // DEV-ONLY (design 192): scriptable approve for the headless 189 rig. Reachable only
+  // by a durable device bearer; approveDeviceAuthDev 404s unless env.RBOX_ENV==="dev".
+  if (req.method === "POST" && eq(seg, ["v1", "auth", "device", "approve-dev"])) return approveDeviceAuthDev(req, env, p, executionCtx);
   if (req.method === "POST" && eq(seg, ["v1", "auth", "key-delivery", "fetch"])) return fetchKeyDeliveryRequest(req, env, p);
   if (req.method === "POST" && eq(seg, ["v1", "auth", "key-delivery", "submit"])) return submitKeyDeliveryBlob(req, env, p);
   if (req.method === "POST" && eq(seg, ["v1", "auth", "key-delivery", "ack"])) return ackKeyDelivery(req, env, p);
