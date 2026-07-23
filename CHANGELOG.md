@@ -17,9 +17,12 @@ All notable changes to rbox are recorded here. The format follows
   consistent key hints throughout.
 - **First run has a new face.** rbox greets you with its wordmark, and
   encryption setup is now one clear task — "Protect your files", two short
-  sentences, then choose where to save your recovery phrase. The workspace
-  step spells out its choices: create a new rbox workspace from a folder on
-  this machine, or sync a workspace already in your rbox account.
+  sentences, then pick where to save your recovery phrase: 1Password (via
+  its `op` CLI, with the save verified), the macOS Keychain, a plain-text
+  file, your clipboard — any combination (arrived in 1.7.26, now with the
+  streamlined flow). The workspace step spells out its choices: create a
+  new rbox workspace from a folder on this machine, or sync a workspace
+  already in your rbox account.
 - Secret entry (your recovery phrase, pairing tokens) never echoes — not even
   as dots — and the receipt line says only "received".
 
