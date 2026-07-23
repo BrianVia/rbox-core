@@ -6,6 +6,35 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.8.0] — 2026-07-23 — "setup feels brand new"
+
+### Changed
+- **The interactive CLI has been rebuilt from the ground up.** Every menu,
+  question, and text prompt now runs on one owned component system: arrow-key
+  menus with clear checkmarks, a live preview under the directory picker that
+  always shows exactly which folder you're about to sync (with Tab
+  completion), completed steps collapsing into tidy one-line receipts, and
+  consistent key hints throughout.
+- **First run has a new face.** rbox greets you with its wordmark, and
+  encryption setup is now one clear task — "Protect your files", two short
+  sentences, then choose where to save your recovery phrase. The workspace
+  step spells out its choices: create a new rbox workspace from a folder on
+  this machine, or sync a workspace already in your rbox account.
+- Secret entry (your recovery phrase, pairing tokens) never echoes — not even
+  as dots — and the receipt line says only "received".
+
+### Fixed
+- Pressing Ctrl-C at any prompt now always exits cleanly (code 130) and
+  restores your terminal — even if you catch a prompt the instant it appears.
+- Fast typing, pasted keys, or a laggy SSH connection can no longer swallow
+  keystrokes: keys that arrive bunched together are now handled one at a
+  time, in order.
+- Answering a yes/no question requires Enter again, so a stray keypress can
+  no longer accept the next screen by accident.
+
+Every release build now drives these prompts on real terminals across all
+three platforms — including secret-entry failure cases — before it can ship.
+
 ## [1.7.26] — 2026-07-23 — "name clashes can't stop sync, your phrase saves anywhere"
 
 ### Added
