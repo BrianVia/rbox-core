@@ -5,8 +5,24 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
-_Last updated: 2026-07-23 (~00:30 UTC — **179 HUMAN-VALIDATED (v1.7.24) ·
-BAR FIX LIVE · 182 ALIGNED v8 · 178 T3 IN FLIGHT**): founder's real-Mac
+_Last updated: 2026-07-23 (~03:30 UTC — **v1.7.25 "stops are safe, pairing
+is one command" RELEASED + FLEET-LIVE — DESIGN 178 COMPLETE**): tag
+e093ffce, release run success. Carries: 178 t3 (#404 — crash-safe lock
+lifecycle w/ L1-L7 invariants + legacy-v1.7.24 journal recovery, graceful
+stop incl. bounded old-daemon escalation, E-live, pr8 ghost fix; 5 codex
+fix rounds + birthtime inode-evidence + journalMs timing leaf after CI
+caught real gaps), 184 one-shot pairing (#405, codex-authored, opus
+ALIGNED, rig onboard-smoke PASS end-to-end — beta-tester friction point
+2), #402 key-status fix, #403 flake determinism. Fleet: Mac 1.7.25
+healthy; FM 1.7.25 pull-only PRESERVED via rbox upgrade (FM daemon id is
+Development-a64d35fe); desktop = binary-only — **this host has NO bound
+workspace anymore** (old memory stale) and its 132 test-litter daemon
+dirs were swept (papercut recurs until the test-hygiene fix). NOTE:
+design-number collision — 184-front-door-look (uncommitted, other agent's
+worktree) must renumber to 185. Queued: 182 ship order (E1 copy → A0
+capture bracket → A1), beta feedback item 3 (initial-sync filename
+collision — likely new papercut), regress pairing flow fixed for #405
+copy. Time to tell Max — AND the new beta tester._ founder's real-Mac
 `rbox key save` SUCCEEDED on v1.7.24 after four real-security(1) field
 fixes (bare `login-keychain`; indented-output trim; visible prompt by
 founder directive; readFileSync(0) for compiled-Bun stdin) — PR #398. The
