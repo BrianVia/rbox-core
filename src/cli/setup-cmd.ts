@@ -130,6 +130,14 @@ const HR = "─".repeat(72);
 
 export type WorkspaceKind = "new" | "existing";
 
+/** Name rbox and distinguish a local folder from something already in the account.
+ *  The original generic "new workspace" / "existing workspace" labels left first-time
+ *  users unsure whether they were choosing an rbox concept or a directory on disk. */
+export const WORKSPACE_KIND_CHOICES = [
+  { name: "Create a new rbox workspace from a folder on this machine", value: "new" },
+  { name: "Sync a workspace already in your rbox account", value: "existing", description: "choose one you've synced before" },
+] as const satisfies ReadonlyArray<{ name: string; value: WorkspaceKind; description?: string }>;
+
 /** Steady-state step header. The subscribe-gated path intentionally still says
  *  "of 3": step 3 (start syncing) exists but is deferred until `rbox subscribe`
  *  (the yellow notice explains), so a fixed denominator stays honest. */
@@ -664,10 +672,7 @@ export async function stepWorkspace(
     setupOpts.preselectedKind ??
     (await select<WorkspaceKind>({
       message: "What do you want to track here?",
-      choices: [
-        { name: "Create a new workspace from a directory", value: "new" },
-        { name: "Sync an existing workspace", value: "existing", description: "pick one you've already synced" },
-      ],
+      choices: WORKSPACE_KIND_CHOICES,
     }));
 
   let workspace: string | undefined;

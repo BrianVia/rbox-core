@@ -7,6 +7,7 @@ import {
   authorizePath,
   stepHeader,
   resolveEnrollment,
+  WORKSPACE_KIND_CHOICES,
   startSyncActions,
   START_SYNC_CHOICES,
   setupCompletionActions,
@@ -176,6 +177,17 @@ test("Step 2 → runInit flags: respectGitignore is forwarded only when true and
   expect(workspaceFlags({ kind: "new", root: "/code/app", respectGitignore: false })["respect-gitignore"]).toBeUndefined();
   expect(workspaceFlags({ kind: "new", root: "/code/app", respectGitignore: true })).toMatchObject({ "respect-gitignore": "true" });
   expect(workspaceFlags({ kind: "join", root: "/code/app", workspace: "ws_abc", respectGitignore: true })["respect-gitignore"]).toBeUndefined();
+});
+
+test("Step 2 workspace choices distinguish a local folder from an existing rbox workspace", () => {
+  expect(WORKSPACE_KIND_CHOICES).toEqual([
+    { name: "Create a new rbox workspace from a folder on this machine", value: "new" },
+    {
+      name: "Sync a workspace already in your rbox account",
+      value: "existing",
+      description: "choose one you've synced before",
+    },
+  ]);
 });
 
 test("Step 2 gitignore prompt defaults to skipping, with both escape hatches and an honest sync-all opt-in", () => {
