@@ -19,6 +19,7 @@ import type {
   SearchPromptConfig,
   SelectPromptConfig,
 } from "./prompt-types.js";
+import { PassThrough } from "node:stream";
 import { ensureCursorVisible, stderrStyle } from "./style.js";
 import { markInkRuntimeLoaded } from "./prompt-runtime-sentinel.js";
 
@@ -86,6 +87,140 @@ function useCancel(inputHandler: (input: string, key: Key) => void, onCancel: ()
     }
     inputHandler(input, key);
   }, { isActive: active });
+}
+
+const ESC = "\u001b";
+const PASTE_START = `${ESC}[200~`;
+const PASTE_END = `${ESC}[201~`;
+const SPLIT_CONTROL = new Set(["\r", "\n", "\t", "\u0003", "\u007f", "\b"]);
+
+/** A slow pty coalesces independent keystrokes into one chunk, and Ink delivers
+ * consecutive plain bytes as ONE input token — so a trailing Enter (\r) or
+ * Ctrl-C (\x03) vanishes inside a text run and the prompt hangs (or dies by
+ * signal). Split a chunk into per-key parts: escape sequences stay whole,
+ * bracketed-paste bodies pass through unsplit, and control bytes become their
+ * own parts so Ink parses each with correct key flags. */
+export function splitKeystrokeChunk(chunk: string, state: { inPaste: boolean }): string[] {
+  const parts: string[] = [];
+  let plain = "";
+  const flushPlain = () => {
+    if (plain) {
+      parts.push(plain);
+      plain = "";
+    }
+  };
+  let index = 0;
+  while (index < chunk.length) {
+    if (state.inPaste) {
+      const end = chunk.indexOf(PASTE_END, index);
+      if (end < 0) {
+        parts.push(chunk.slice(index));
+        index = chunk.length;
+      } else {
+        parts.push(chunk.slice(index, end + PASTE_END.length));
+        state.inPaste = false;
+        index = end + PASTE_END.length;
+      }
+      continue;
+    }
+    const character = chunk[index]!;
+    if (character === ESC) {
+      flushPlain();
+      if (chunk.startsWith(PASTE_START, index)) {
+        state.inPaste = true;
+        parts.push(PASTE_START);
+        index += PASTE_START.length;
+        continue;
+      }
+      let end = index + 1;
+      if (chunk[end] === "[") {
+        end++;
+        while (end < chunk.length && (chunk.charCodeAt(end) < 0x40 || chunk.charCodeAt(end) > 0x7e)) end++;
+        end++;
+      } else if (chunk[end] === "O") {
+        end += 2;
+      } else {
+        end += 1;
+      }
+      end = Math.min(end, chunk.length);
+      parts.push(chunk.slice(index, end));
+      index = end;
+    } else if (SPLIT_CONTROL.has(character)) {
+      flushPlain();
+      parts.push(character);
+      index++;
+    } else {
+      plain += character;
+      index++;
+    }
+  }
+  flushPlain();
+  return parts;
+}
+
+/** Present Ink a stdin whose chunks are one key each: split parts are re-emitted
+ * on separate ticks so React commits state between keystrokes. Raw-mode,
+ * ref/unref, and flow control delegate to the real stream. */
+function wrapPromptStdin(source: NodeJS.ReadStream & { isRaw?: boolean; setRawMode?: (mode: boolean) => unknown }): {
+  wrapped: NodeJS.ReadStream;
+  detach: () => void;
+} {
+  const wrapped = new PassThrough() as unknown as NodeJS.ReadStream & {
+    isRaw: boolean;
+    setRawMode: (mode: boolean) => unknown;
+    write: (chunk: string) => boolean;
+  };
+  wrapped.isTTY = source.isTTY;
+  wrapped.isRaw = source.isRaw ?? false;
+  wrapped.setRawMode = (mode: boolean) => {
+    source.setRawMode?.(mode);
+    wrapped.isRaw = mode;
+    return wrapped;
+  };
+  const basePause = wrapped.pause.bind(wrapped);
+  const baseResume = wrapped.resume.bind(wrapped);
+  wrapped.pause = () => {
+    source.pause();
+    return basePause();
+  };
+  wrapped.resume = () => {
+    source.resume();
+    return baseResume();
+  };
+  wrapped.ref = () => {
+    source.ref?.();
+    return wrapped;
+  };
+  wrapped.unref = () => {
+    source.unref?.();
+    return wrapped;
+  };
+  const state = { inPaste: false };
+  const queue: string[] = [];
+  let draining = false;
+  const drain = () => {
+    const next = queue.shift();
+    if (next === undefined) {
+      draining = false;
+      return;
+    }
+    wrapped.write(next);
+    setImmediate(drain);
+  };
+  const onData = (chunk: Buffer | string) => {
+    queue.push(...splitKeystrokeChunk(chunk.toString(), state));
+    if (!draining && queue.length > 0) {
+      draining = true;
+      drain();
+    }
+  };
+  source.on("data", onData);
+  return {
+    wrapped,
+    detach: () => {
+      source.removeListener("data", onData);
+    },
+  };
 }
 
 function Frame({ message, inline, children, hint, error }: {
@@ -526,36 +661,42 @@ async function mountPrompt<T>(args: {
   component: (handlers: { submit: Submit<T>; fail: Fail; cancel: () => void }) => React.ReactNode;
 }): Promise<T> {
   if (args.signal?.aborted) throw new DOMException("prompt aborted", "AbortError");
-  const stdin = (args.stdin ?? process.stdin) as NodeJS.ReadStream & { isRaw?: boolean; setRawMode?: (mode: boolean) => unknown };
-  if (activeInputs.has(stdin)) throw new Error("another interactive prompt is already active on this terminal");
-  activeInputs.add(stdin);
+  const source = (args.stdin ?? process.stdin) as NodeJS.ReadStream & { isRaw?: boolean; setRawMode?: (mode: boolean) => unknown };
+  if (activeInputs.has(source)) throw new Error("another interactive prompt is already active on this terminal");
+  activeInputs.add(source);
   const output = args.output ?? process.stderr;
-  const wasRaw = stdin.isRaw ?? false;
-  const wasPaused = stdin.isPaused();
+  const wasRaw = source.isRaw ?? false;
+  const wasPaused = source.isPaused();
+  const { wrapped: stdin, detach } = wrapPromptStdin(source);
   let instance: Instance | undefined;
   let settled = false;
   let abort: (() => void) | undefined;
   let restored = false;
 
-  // Ctrl-C between mount and Ink's raw-mode/input attach arrives as a real
-  // SIGINT (raw mode is not on yet, so the tty driver signals us). Route it
-  // through the same cancel path so the terminal is restored and the process
-  // exits 130 — never the runtime's default signal death. Once raw mode is
-  // active the key comes through useInput and this listener stays inert.
-  const onSigint = () => sigintCancel?.();
-  let sigintCancel: (() => void) | undefined;
-  process.on("SIGINT", onSigint);
-
   const restoreTerminal = () => {
     if (restored) return;
     restored = true;
     process.removeListener("SIGINT", onSigint);
-    stdin.setRawMode?.(wasRaw);
-    if (wasPaused) stdin.pause();
-    else stdin.resume();
+    detach();
+    source.setRawMode?.(wasRaw);
+    if (wasPaused) source.pause();
+    else source.resume();
     ensureCursorVisible(output);
-    activeInputs.delete(stdin);
+    activeInputs.delete(source);
   };
+
+  // Ctrl-C between mount and Ink's raw-mode/input attach arrives as a real
+  // SIGINT (raw mode is not on yet, so the tty driver signals us). Restore the
+  // terminal and exit 130 SYNCHRONOUSLY: Ink's signal-exit dependency re-raises
+  // the signal right after our listener returns, so an async cancel path would
+  // lose the race and die by default signal disposition (which some tmux/CI
+  // environments then report as status 0). Once raw mode is active, Ctrl-C
+  // arrives through useInput instead and this listener stays inert.
+  const onSigint = () => {
+    restoreTerminal();
+    process.exit(130);
+  };
+  process.on("SIGINT", onSigint);
 
   try {
     return await new Promise<T>((resolve, reject) => {
@@ -594,7 +735,6 @@ async function mountPrompt<T>(args: {
         fail: (error) => settle({ kind: "error", error }),
         cancel: () => settle({ kind: "cancel" }),
       };
-      sigintCancel = handlers.cancel;
       try {
         instance = render(<SafeBoundary fail={handlers.fail}>{args.component(handlers)}</SafeBoundary>, {
           stdin,

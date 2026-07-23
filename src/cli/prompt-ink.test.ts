@@ -225,13 +225,45 @@ describe("Ink prompt runtime", () => {
     expect(await next).toBe("ok");
   });
 
-  test("a SIGINT before Ink attaches its input handler cancels the prompt", async () => {
+  test("a SIGINT during a mounted prompt restores the terminal and exits 130", async () => {
+    const script = `
+      import { PassThrough } from "node:stream";
+      import { inkInput } from ${JSON.stringify(new URL("./prompt-ink.js", import.meta.url).pathname)};
+      const input = new PassThrough();
+      Object.assign(input, { isTTY: true, isRaw: false, setRawMode(m) { input.isRaw = m; return input; }, ref: () => input, unref: () => input });
+      const output = new PassThrough();
+      Object.assign(output, { isTTY: true, columns: 100, rows: 30 });
+      output.on("data", () => {});
+      void inkInput({ message: "Name" }, { input, output }).catch(() => {});
+      // Fake streams do not hold the event loop open the way a real TTY does;
+      // keep it alive so the queued signal actually dispatches.
+      const keepAlive = setTimeout(() => process.exit(7), 5000);
+      void keepAlive;
+      setTimeout(() => process.kill(process.pid, "SIGINT"), 50);
+    `;
+    const child = Bun.spawn([process.execPath, "-e", script], { stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(130);
+  });
+
+  test("keystrokes coalesced into one pty chunk are re-split in order", async () => {
+    const h = harness();
+    const pending = inkCheckbox({
+      message: "select both",
+      choices: [{ name: "One", value: 1 }, { name: "Two", value: 2 }],
+    }, h.streams);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    // Space toggles One; Ink splits the arrow into its own event; the trailing
+    // "space + Enter" arrives as ONE plain-byte token on a slow pty.
+    h.input.write(" \x1b[B \r");
+    expect(await pending).toEqual([1, 2]);
+  });
+
+  test("an Enter embedded in a coalesced text run submits the typed prefix", async () => {
     const h = harness();
     const pending = inkInput({ message: "Name" }, h.streams);
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    process.emit("SIGINT" as never);
-    await expect(pending).rejects.toBeInstanceOf(PromptCancelledError);
-    expect(h.rawModes.at(-1)).toBe(false);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    h.input.write("ab\r");
+    expect(await pending).toBe("ab");
   });
 
   test("a second prompt on a busy stdin fails fast instead of corrupting the terminal", async () => {

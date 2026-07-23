@@ -138,3 +138,21 @@ All 11 UX regress flows pass against a freshly compiled linux-x64 binary with
 these fixes. Lesson recorded: compiled-gate workflows are code — they need the
 same review scrutiny as src/, and a gate that has never run green proves
 nothing.
+
+### Round 6 addendum — pty keystroke coalescing (found by the compiled gate's
+first Linux executions)
+
+The compiled-TUI gate's first real runs exposed a genuine input-layer defect:
+a slow pty coalesces independent keystrokes into one chunk, and Ink delivers
+consecutive plain bytes as ONE input token — a trailing Enter (\r) or Ctrl-C
+(\x03) vanishes inside a text run, hanging the prompt (arm64) or dying by
+signal disposition reported as status 0 (x64 --cancel). Naively re-dispatching
+split tokens inside useInput breaks React state closures (two synchronous
+events read the same stale state), so the fix wraps the stdin Ink reads:
+`splitKeystrokeChunk` re-chunks input at key boundaries (escape sequences kept
+whole, bracketed-paste bodies passed through unsplit) and re-emits each key on
+its own tick so React commits between keystrokes. SIGINT during a mounted
+prompt now restores the terminal and exits 130 synchronously — an async cancel
+path loses the race against ink's signal-exit re-raise. Covered by: coalesced
+checkbox/input unit tests, a child-process SIGINT exit-130 test, six compiled
+smoke scenarios, and 11/11 regress flows on a fresh linux-x64 binary.
