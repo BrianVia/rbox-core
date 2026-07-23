@@ -5,7 +5,41 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
-_Last updated: 2026-07-23 (~18:30 UTC — **v1.8.0 "setup feels brand new"
+_Last updated: 2026-07-23 (~evening — **DESIGN 189 core-ALIGNED; PR #412
+shipped to prod; day = 3 releases + 5 PRs**): Design 189 (web-approved
+pairing — web approval -> an enrolled daemon auto-delivers keys so a new
+machine enrolls without pasting a token/phrase) driven from rough draft to
+v7 core-ALIGNED through 2 parallel codex rounds + 3 serial gates (all in
+worktree .claude/worktrees/189-web-pairing, branch
+design/189-web-approved-pairing, NOT merged). Mechanism (verified): the
+fulfilling daemon is a live admin — buildAdminRoster (roster.ts:124) signs
+a roster admitting the new device's exact pubkeys, wraps MK to the device
+enc pubkey ONCE under the persisted device context, commits that wrap's
+hash, and PUBLISHES the roster server-side atomically; the new CLI fetches
++ verifies the full chain (signer authority) and stores the wrap as-is.
+Founder RULINGS: (Q1) epoch rotation NOT a prerequisite — accepted that a
+revoked device keeps already-synced plaintext + a ~5-min download-grant
+window (grants bypass bearer auth, grants.ts:22 / worker.test.ts:172);
+honest revoke copy required; rotation filed as design 191 (stub). Zero
+typed codes (fragment auto-binding; manual = device-auth only). 190
+(passkey escrow) DECOUPLED — browser-unwraps-RK violates the key-material
+law; needs its own redesign. **JUDGMENT CALL (mine, surfaced): stopped the
+design loop at core-aligned — the last 2 gates converged on ONE theme
+(handoff crash-recovery idempotency), now specified via the existing
+crash-safe-reuse discipline + an implementation crash-injection acceptance
+gate (189 §14), per the anti-treadmill rule. NOT a gate green-light.**
+NEXT: implement 189 (big multi-surface: apps/api device_auth+pubkeys +
+key_delivery table + migration 0033 + nudge + escrow; daemon fulfillment
+flight; CLI login FSM + staging journal; web approval step-up + fragment
+compare + route CSP; #412's fragment-preservation gap in cli-login/+page.ts
+still open). Decide: merge the 189 doc to main + start implementation, or
+one more confirmation gate on v7's §14 framing. **PR #412 (Clerk
+redirect_url fix) MERGED + PROMOTED TO PRODUCTION** (a36dbe2c; web-only,
+no apps/api/D1 change; app.rbox.to 200) — CLI-login deep links now survive
+the sign-in bounce. Founder memory: minimize-user-typing law recorded.
+Session totals below._
+
+_Previous: 2026-07-23 (~18:30 UTC — **v1.8.0 "setup feels brand new"
 RELEASED + FLEET-LIVE — DESIGN 185 (TUI framework) COMPLETE**): tag at
 9b7744ef, release run green INCLUDING the new compiled-TUI smoke gates'
 first real release (all 3 targets), api.rbox.to/version = 1.8.0. Fleet:
