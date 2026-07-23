@@ -208,7 +208,7 @@ export async function runSetup(opts: {
     if (accountId) {
       await writeEnrolledSkipNotice(accountId);
     } else {
-      process.stderr.write(`\n── ${e.bold(stepHeader(1, 3, "Account"))} ${HR.slice(0, 46)}\n`);
+      process.stderr.write(`\n${e.bold(stepHeader(1, 3, "Account"))}\n`);
       const hasCreds = Boolean(initialCreds?.accountId);
       const result = hasCreds
         ? {
@@ -254,7 +254,7 @@ export async function runSetup(opts: {
   }
 
   // Step 3 · Start syncing in the background.
-  process.stderr.write(`\n── ${e.bold(shortFlow ? stepHeader(2, 2, "Start syncing") : stepHeader(3, 3, "Start syncing"))} ${HR.slice(0, 38)}\n`);
+  process.stderr.write(`\n${e.bold(shortFlow ? stepHeader(2, 2, "Start syncing") : stepHeader(3, 3, "Start syncing"))}\n`);
   const startChoice = await promptSelect<StartSyncChoice>({
     message: "Keep this workspace syncing in the background?",
     choices: START_SYNC_CHOICES,
@@ -452,7 +452,7 @@ export async function authorizeExistingAccount(remote: string, deps: AuthorizeEx
 }
 
 async function startTrialAfterAccountCreation(credentialResult: CredentialLoadResult): Promise<boolean> {
-  process.stderr.write(`\n── ${e.bold("Start your 14-day free trial")} ${HR.slice(0, 36)}\n`);
+  process.stderr.write(`\n${e.bold("Start your 14-day free trial")}\n`);
   const choice = await promptSelect<`${SubscribePlan}:${BillingCadence}`>({
     message: "Choose a plan for this new account:",
     choices: [
@@ -666,7 +666,7 @@ export async function stepWorkspace(
   const loadedCredentials = setupOpts.credentialResult ?? await readCredentials();
   const creds = credentialsForStrictFlow(loadedCredentials);
 
-  writeStderr(`\n── ${e.bold(setupOpts.header)} ${HR.slice(0, 44)}\n`);
+  writeStderr(`\n${e.bold(setupOpts.header)}\n`);
   writeStderr(`${e.dim(WORKSPACE_DEFINITION)}\n`);
   const choice =
     setupOpts.preselectedKind ??

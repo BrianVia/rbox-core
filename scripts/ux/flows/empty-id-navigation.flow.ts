@@ -16,6 +16,6 @@ export default defineFlow({
     { on: "a", waitFor: /no workspaces on this account yet/ },
     { on: "a", waitFor: /What do you want to track here\?/ },
     { on: "a", keys: ["Down"] },
-    { on: "a", assertScreen: [/Create a new workspace from a directory/, /Sync an existing workspace/] },
+    { on: "a", assertScreen: [/Create a new rbox workspace from a folder on this machine/, /Sync a workspace already in your rbox account/] },
   ],
 });
