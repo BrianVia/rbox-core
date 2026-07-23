@@ -5,7 +5,28 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
-_Last updated: 2026-07-23 (~03:30 UTC — **v1.7.25 "stops are safe, pairing
+_Last updated: 2026-07-23 (~03:45 UTC — **DESIGN 186 COMPLETE ON MAIN —
+case-only collisions no longer block sync**): PR #407 merged (squash
+1c461388): case-fold collision groups are excluded from publication as a
+complete group (never a single member — the data-loss case), prior-synced
+spelling preserved, bounded symlink-safe warning sidecar, `rbox status`
+surfaces the warning (human + JSON `pathWarnings`, workspace stays
+healthy), daemon watcher rescan picks up resolution passively; two-device
+rig verified safe-sibling progress + passive survivor pickup. This CLOSES
+the queued beta feedback item 3 (initial-sync filename collision).
+Review: adversarial opus review (verdict MERGEABLE, core invariants
+traced clean incl. no partial-member publish across 409/422/deferral
+paths and no client-skew — validation byte-identical); its 4 minor
+findings all fixed on-branch (207e48a3: writePathWarnings symlink guard +
+test, design §8 reconciled to as-built live-scan status, NFC/NFD
+normalization gap disclosed in §2 — pre-existing wire-contract limit, a
+macOS peer can still receive an unmaterializable NFC/NFD pair inbound;
+intentional foreground-deferral sidecar gap commented). CI 13/13 green.
+No `apps/api` changes — nothing new to verify on dev API for promotion.
+NOT yet in a CLI release — rides the next release train (fleet is on
+v1.7.25 without it)._
+
+_Previous: 2026-07-23 (~03:30 UTC — **v1.7.25 "stops are safe, pairing
 is one command" RELEASED + FLEET-LIVE — DESIGN 178 COMPLETE**): tag
 e093ffce, release run success. Carries: 178 t3 (#404 — crash-safe lock
 lifecycle w/ L1-L7 invariants + legacy-v1.7.24 journal recovery, graceful
