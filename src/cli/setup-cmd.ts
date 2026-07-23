@@ -45,6 +45,7 @@ import { openAndShow } from "./browser-open.js";
 import { hasKeyInput, runKeyedSetup } from "./setup-keyed.js";
 import { getIdentity, identityText } from "./account-profile.js";
 import { WORKSPACE_MINT_RERUN_HINT } from "./remote/errors.js";
+import { rboxBanner } from "./wordmark.js";
 import {
   acquireWorkspaceSyncMutex,
   releaseWorkspaceSyncMutex,
@@ -195,7 +196,7 @@ export async function runSetup(opts: {
   // Via the untracked menu, enrollment was verified by resolveBareRboxTarget and
   // the menu printed its own banner — skip both.
   if (!viaUntrackedMenu) {
-    process.stderr.write(`\n${e.cyan("◆")}  ${e.bold("Welcome to rbox")} — end-to-end encrypted sync for your dev workspaces.\n`);
+    process.stderr.write(rboxBanner());
     if (accountId) {
       await writeEnrolledSkipNotice(accountId);
     } else {
