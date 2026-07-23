@@ -6,6 +6,27 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.7.25] — 2026-07-23 — "stops are safe, pairing is one command"
+
+- **Interrupted syncs can no longer strand your git repos.** Every lock rbox
+  takes is now journaled with proof of ownership before it exists, and
+  recovery after a crash or kill cleans up exactly rbox's own locks — never
+  a lock another tool created. Repos blocked by unknown locks surface an
+  actionable notice instead of silently deferring.
+- **`rbox stop` is now graceful.** A stop waits for in-flight critical work
+  to finish instead of force-killing it mid-operation (a second Ctrl-C or
+  signal still escalates promptly), and stopping older daemons keeps the
+  previous bounded behavior — upgrades never hang.
+- **Pairing a second machine is one command.** `rbox pair` now prints the
+  complete `rbox connect <pairing-token>` command to run on the new machine
+  (press `c` to copy it); the token stays single-use and expires in ten
+  minutes. The masked-prompt flow remains for those who prefer it.
+- **`rbox key status` no longer claims your macOS Keychain backup is
+  missing.** The status probe misread a successful save; it now reports
+  the saved recovery kit correctly.
+- Deleted worktree "ghost" deferrals now clear on their own, including on
+  pull-only machines.
+
 ## [1.7.24] — 2026-07-22 — "the keychain save actually saves"
 
 ### Fixed
