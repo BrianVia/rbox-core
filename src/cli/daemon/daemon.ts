@@ -131,6 +131,14 @@ import { acknowledgeCacheGeneration, readCacheGeneration } from "../adopt-cache.
 import { reconcileGitDeferrals, type DeferralHygieneCursor } from "../sync-git/deferral-hygiene.js";
 import { gitDivergenceStatus } from "../sync-git/status.js";
 import { recoverStateCasLocks } from "../sync-git/state-cas-locks.js";
+import { GENESIS_ACCOUNT_ID_RE } from "../genesis-durable.js";
+import {
+  KeyDeliveryFulfillmentFlight,
+  keyDeliveryPreferenceOverrideFromEnv,
+  parseKeyDeliveryNudge,
+  rboxKeyDeliveryApi,
+  type KeyDeliveryFlightPort,
+} from "./key-delivery-fulfill.js";
 
 type RboxBarAmbientStatus = AmbientDaemonStatusV1 & {
   fileCount: number;
@@ -546,6 +554,9 @@ export class RboxDaemon {
   private readonly backstopMs: number;
   private readonly log: DaemonLogSink;
   private readonly onStopped?: () => void;
+  /** Independent account-key release worker. It never enters the workspace sync
+   * mutex and shutdown only drains its own bounded in-flight request. */
+  private readonly keyDeliveryFlight?: KeyDeliveryFlightPort;
 
   /** `e2ee` is the E2EE sync transport (deps.remote) — every push/pull goes
    *  through it so the daemon syncs encrypted, exactly like the one-shot commands. */
@@ -568,6 +579,8 @@ export class RboxDaemon {
       deferralHygieneBudgetMs?: number;
       log?: DaemonLogSink;
       onStopped?: () => void;
+      /** Test seam; null explicitly disables the production fulfillment flight. */
+      keyDeliveryFlight?: KeyDeliveryFlightPort | null;
     } = {},
   ) {
     this.log = opts.log ?? ((message) => console.log(`${new Date().toISOString()} ${message}`));
@@ -578,6 +591,19 @@ export class RboxDaemon {
     };
     this.onStopped = opts.onStopped;
     this.api = new RboxApi(cfg.remoteUrl, cfg.token, cfg.remoteWorkspaceId, cfg.projectId, this.log);
+    if (opts.keyDeliveryFlight !== undefined) {
+      this.keyDeliveryFlight = opts.keyDeliveryFlight ?? undefined;
+    } else if (cfg.accountId && GENESIS_ACCOUNT_ID_RE.test(cfg.accountId)) {
+      this.keyDeliveryFlight = new KeyDeliveryFulfillmentFlight({
+        accountId: cfg.accountId,
+        deviceId: cfg.deviceId,
+        workspaceId: cfg.remoteWorkspaceId,
+        pullOnly: opts.pullOnly === true,
+        preferenceOverride: keyDeliveryPreferenceOverrideFromEnv(),
+        api: rboxKeyDeliveryApi(this.api),
+        log: this.log,
+      });
+    }
     this.telemetry = new TelemetryQueue(this.api, this.log);
     this.syncStateReporter = new SyncStateReporter(root, cfg, this.api, this.log);
     this.matcher = buildIgnoreMatcher(root, { respectGitignore: cfg.respectGitignore === true });
@@ -662,6 +688,9 @@ export class RboxDaemon {
     this.startActivityHeartbeat();
     this.startAmbientStatusHeartbeat();
     this.startTelemetryTimers();
+    // Pull fallback is account-scoped and intentionally starts outside/before
+    // the workspace mutex. A slow sync startup cannot delay key release.
+    this.keyDeliveryFlight?.enqueue();
     // The direct startup scan is an operation too. Acquire the same mutex and
     // execute the universal journal boundary before loadState or scan work.
     const startupMutex = await this.acquireSyncMutexFn(this.root);
@@ -1012,6 +1041,7 @@ export class RboxDaemon {
   }
 
   private async finishStop(firstStop: boolean): Promise<void> {
+    const keyDeliveryDrain = this.keyDeliveryFlight?.stop();
     if (this.safetyTimer !== undefined) this.scanCadenceClock.clearTimeout(this.safetyTimer);
     if (this.recoveryTimer) this.recoveryClock.clearTimeout(this.recoveryTimer);
     if (this.deepTimer) this.scanCadenceClock.clearInterval(this.deepTimer);
@@ -1043,7 +1073,12 @@ export class RboxDaemon {
     const shutdownHeartbeat = setInterval(() => this.writeAmbientStatus(), AMBIENT_STATUS_HEARTBEAT_MS);
     shutdownHeartbeat.unref?.();
     try {
-      await Promise.allSettled([this.startupBoundaryRun, this.pumpRun, this.mutationGate.drain()]);
+      await Promise.allSettled([
+        this.startupBoundaryRun,
+        this.pumpRun,
+        this.mutationGate.drain(),
+        keyDeliveryDrain,
+      ]);
     } finally {
       clearInterval(shutdownHeartbeat);
     }
@@ -3110,12 +3145,19 @@ export class RboxDaemon {
 
   private handleWsMessageData(data: string, from?: WebSocket): void {
     if (from !== undefined && this.ws !== from) return;
-    if (this.resetLifecycle !== "ready") return;
     if (this.ws) this.armPongDeadline(this.ws);
     if (data === "pong") {
       this.refreshWsAtThrottled();
       return;
     }
+    const keyDeliveryRequestId = parseKeyDeliveryNudge(data);
+    if (keyDeliveryRequestId) {
+      // This branch deliberately precedes the reset/sync readiness gate.
+      this.keyDeliveryFlight?.enqueue(keyDeliveryRequestId);
+      this.refreshWsAtThrottled();
+      return;
+    }
+    if (this.resetLifecycle !== "ready") return;
     try {
       const m = JSON.parse(data) as { type?: string; sequence?: unknown };
       if (m.type === "committed") {
@@ -3281,6 +3323,9 @@ export class RboxDaemon {
 
   private onBackstopTick(): void {
     if (this.stopped || this.backstopMs <= 0) return;
+    // The same ordinary cadence supplies correctness when no workspace socket
+    // is bound/live. This enqueue never joins the sync pump.
+    this.keyDeliveryFlight?.enqueue();
     this.wsBackstopPulls++;
     this.log(`ws backstop pull (ws_backstop_pull=${this.wsBackstopPulls})`);
     this.raiseQueuedCarrier("backstop");
@@ -3321,6 +3366,7 @@ export class RboxDaemon {
       this.log("ws connected");
       const generation = this.markWsOpen(ws);
       this.pendingCatchUpGeneration = generation;
+      this.keyDeliveryFlight?.enqueue();
       if (this.resetLifecycle === "ready") this.request("pull"); // catch up on anything missed while disconnected
       this.scheduleNextBackstop();
     });

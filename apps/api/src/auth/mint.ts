@@ -6,6 +6,7 @@ import { planFor } from "../plans.js";
 import { DEVICE_ID_BYTES, isUniqueViolation, randomHex, TOKEN_BYTES } from "./shared.js";
 
 const MINT_MAX_ATTEMPTS = 5; // bounded retries when a unique INSERT collides (P1)
+const ESCROW_CONTEXT = "rbox/device-token-escrow/v1";
 
 /** Mint a device token into a specific account/user (returns the plaintext once,
  *  plus the generated `device_id`). `expiresAt` (epoch ms) makes it a short-lived
@@ -190,6 +191,313 @@ export async function mintDeviceWithNotification(env: Env, o: MintNotifyOpts): P
   // re-driven by the cron backstop off the durable outbox row (enqueueNotify never throws).
   await enqueueNotify(env, minted.tokenHash);
   return minted;
+}
+
+function bytesToBase64url(bytes: Uint8Array): string {
+  let raw = "";
+  for (const byte of bytes) raw += String.fromCharCode(byte);
+  return btoa(raw).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function base64urlToBytes(value: string): Uint8Array {
+  const b64 = value.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - value.length % 4) % 4);
+  return Uint8Array.from(atob(b64), (char) => char.charCodeAt(0));
+}
+
+async function escrowKey(env: Env): Promise<CryptoKey> {
+  // A dedicated secret can rotate independently. Existing deployments remain
+  // safe during rollout by deriving a domain-separated key from the already
+  // required high-entropy bootstrap secret.
+  const secret = env.RBOX_DEVICE_TOKEN_ESCROW_KEY || env.RBOX_BOOTSTRAP_SECRET;
+  if (!secret) throw new Error("device token escrow key unavailable");
+  const raw = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(`${ESCROW_CONTEXT}\0${secret}`),
+  );
+  return crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["encrypt", "decrypt"]);
+}
+
+function escrowAad(requestId: string, deviceId: string, tokenHash: string): Uint8Array {
+  return new TextEncoder().encode(`${ESCROW_CONTEXT}\0${requestId}\0${deviceId}\0${tokenHash}`);
+}
+
+async function encryptEscrowToken(
+  env: Env,
+  requestId: string,
+  deviceId: string,
+  tokenHash: string,
+  token: string,
+): Promise<{ ciphertext: string; iv: string }> {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const encrypted = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv, additionalData: escrowAad(requestId, deviceId, tokenHash) },
+    await escrowKey(env),
+    new TextEncoder().encode(token),
+  );
+  return { ciphertext: bytesToBase64url(new Uint8Array(encrypted)), iv: bytesToBase64url(iv) };
+}
+
+export interface EscrowedDeviceToken {
+  token: string;
+  tokenHash: string;
+  deviceId: string;
+  accountId: string;
+  expiresAt: number;
+}
+
+/** Recover the exact bearer committed by a winning concurrent/crashed poll. */
+export async function recoverEscrowedDeviceToken(
+  env: Env,
+  requestId: string,
+  now = Date.now(),
+): Promise<EscrowedDeviceToken | null> {
+  const row = await dirDb(env)
+    .prepare(
+      `SELECT e.token_ciphertext,e.token_iv,e.token_hash,e.device_id,e.account_id,e.expires_at
+       FROM device_token_escrow e
+       JOIN device_auth da ON da.request_id=e.request_id
+       WHERE e.request_id=? AND e.expires_at>? AND da.status='claimed'`,
+    )
+    .bind(requestId, now)
+    .first<{
+      token_ciphertext: string;
+      token_iv: string;
+      token_hash: string;
+      device_id: string;
+      account_id: string;
+      expires_at: number;
+    }>();
+  if (!row) return null;
+  try {
+    const plaintext = await crypto.subtle.decrypt(
+      {
+        name: "AES-GCM",
+        iv: base64urlToBytes(row.token_iv),
+        additionalData: escrowAad(requestId, row.device_id, row.token_hash),
+      },
+      await escrowKey(env),
+      base64urlToBytes(row.token_ciphertext),
+    );
+    const token = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(plaintext);
+    if (await sha256Hex(token) !== row.token_hash) return null;
+    return {
+      token,
+      tokenHash: row.token_hash,
+      deviceId: row.device_id,
+      accountId: row.account_id,
+      expiresAt: row.expires_at,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export interface ClaimDeviceAuthOpts {
+  deviceCode: string;
+  requestId: string;
+  accountId: string;
+  userId: string;
+  label: string | null;
+  proposedDeviceId: string;
+  expiresAt: number;
+  ip: string | null;
+  geo: string | null;
+  now?: number;
+  genDeviceId?: () => string;
+  /** Crash-injection seam: runs after the atomic batch and before enqueue/response. */
+  afterCommit?: () => void | Promise<void>;
+}
+
+/** Atomic device-code claim + mint + delivery retarget + encrypted token escrow.
+ *
+ * Every statement after the claim is guarded by this attempt's random
+ * `claim_nonce`. A losing concurrent batch therefore writes zero rows, then
+ * decrypts the winning escrow; a uniqueness throw rolls the whole batch back and
+ * retries with fresh credentials. */
+export async function claimDeviceAuthWithEscrow(
+  env: Env,
+  opts: ClaimDeviceAuthOpts,
+): Promise<EscrowedDeviceToken | null> {
+  const now = opts.now ?? Date.now();
+  const recovered = await recoverEscrowedDeviceToken(env, opts.requestId, now);
+  if (recovered) return recovered;
+
+  const capStatus = await checkDeviceCap(env, opts.accountId);
+  if (!capStatus.ok) throw new DeviceLimitError(capStatus.cap, capStatus.plan);
+  const cap = Number.isFinite(capStatus.cap) ? capStatus.cap : Number.MAX_SAFE_INTEGER;
+  let firstCandidate = true;
+  let lastError: unknown;
+  for (let attempt = 0; attempt < MINT_MAX_ATTEMPTS; attempt++) {
+    const deviceId = firstCandidate
+      ? ((firstCandidate = false), opts.proposedDeviceId)
+      : (opts.genDeviceId?.() ?? `dev_${randomHex(DEVICE_ID_BYTES)}`);
+    const token = randomHex(TOKEN_BYTES);
+    const tokenHash = await sha256Hex(token);
+    const claimNonce = randomHex(TOKEN_BYTES);
+    const encrypted = await encryptEscrowToken(env, opts.requestId, deviceId, tokenHash, token);
+    const db = dirDb(env);
+    const liveAccount = `(EXISTS (SELECT 1 FROM accounts WHERE id=? AND deleted_at IS NULL) OR ?='default')`;
+    try {
+      const results = await db.batch([
+        db.prepare(
+          `UPDATE device_auth
+           SET status='claimed',claim_nonce=?,request_id=COALESCE(request_id,?),device_id=?
+           WHERE device_code=? AND (request_id=? OR request_id IS NULL) AND status='approved' AND expires_at>?
+             AND account_id=? AND ${liveAccount}
+             AND (SELECT COUNT(*) FROM devices
+                  WHERE account_id=? AND expires_at IS NULL AND revoked=0)<?`,
+        ).bind(
+          claimNonce,
+          opts.requestId,
+          deviceId,
+          opts.deviceCode,
+          opts.requestId,
+          now,
+          opts.accountId,
+          opts.accountId,
+          opts.accountId,
+          opts.accountId,
+          cap,
+        ),
+        db.prepare(
+          `INSERT INTO devices
+             (token_hash,device_id,label,account_id,user_id,created_at,expires_at,kind)
+           SELECT ?,?,?,?,?,?,NULL,'device' FROM device_auth
+           WHERE device_code=? AND request_id=? AND claim_nonce=? AND status='claimed'`,
+        ).bind(
+          tokenHash,
+          deviceId,
+          opts.label,
+          opts.accountId,
+          opts.userId,
+          now,
+          opts.deviceCode,
+          opts.requestId,
+          claimNonce,
+        ),
+        db.prepare(
+          `UPDATE key_delivery SET target_device_id=?
+           WHERE request_id=? AND account_id=? AND state='queued' AND expires_at>?
+             AND approval_factor_verified_at>?
+             AND account_epoch=(
+               SELECT MAX(account_epoch) FROM account_key_states
+               WHERE account_id=key_delivery.account_id
+             )
+             AND EXISTS (
+               SELECT 1 FROM device_auth da JOIN devices d ON d.device_id=?
+               WHERE da.device_code=? AND da.request_id=? AND da.claim_nonce=?
+                 AND da.status='claimed' AND d.token_hash=? AND d.revoked=0
+             )`,
+        ).bind(
+          deviceId,
+          opts.requestId,
+          opts.accountId,
+          now,
+          now - 10 * 60_000,
+          deviceId,
+          opts.deviceCode,
+          opts.requestId,
+          claimNonce,
+          tokenHash,
+        ),
+        db.prepare(
+          `INSERT INTO device_notifications
+             (token_hash,device_id,account_id,minted_user_id,label,ip,geo,event,created_at,
+              keys_granted,key_fingerprint)
+           SELECT ?,?,?,?,?,?,?, 'device_code',?,
+             CASE WHEN EXISTS (
+               SELECT 1 FROM key_delivery
+               WHERE request_id=? AND account_id=? AND target_device_id=?
+                 AND state='queued' AND expires_at>?
+             ) THEN 1 ELSE 0 END,
+             (SELECT pubkey_fingerprint FROM key_delivery
+              WHERE request_id=? AND account_id=? AND target_device_id=?
+                AND state='queued' AND expires_at>?)
+           FROM device_auth
+           WHERE device_code=? AND request_id=? AND claim_nonce=? AND status='claimed'`,
+        ).bind(
+          tokenHash,
+          deviceId,
+          opts.accountId,
+          opts.userId,
+          opts.label,
+          opts.ip,
+          opts.geo,
+          now,
+          opts.requestId,
+          opts.accountId,
+          deviceId,
+          now,
+          opts.requestId,
+          opts.accountId,
+          deviceId,
+          now,
+          opts.deviceCode,
+          opts.requestId,
+          claimNonce,
+        ),
+        db.prepare(
+          `INSERT INTO device_token_escrow
+             (request_id,account_id,device_id,token_hash,token_ciphertext,token_iv,created_at,expires_at)
+           SELECT ?,?,?,?,?,?,?,?
+           FROM device_auth
+           WHERE device_code=? AND request_id=? AND claim_nonce=? AND status='claimed'
+             AND EXISTS (SELECT 1 FROM devices WHERE token_hash=? AND device_id=?)`,
+        ).bind(
+          opts.requestId,
+          opts.accountId,
+          deviceId,
+          tokenHash,
+          encrypted.ciphertext,
+          encrypted.iv,
+          now,
+          opts.expiresAt,
+          opts.deviceCode,
+          opts.requestId,
+          claimNonce,
+          tokenHash,
+          deviceId,
+        ),
+      ]);
+      if ((results[0]?.meta.changes ?? 0) === 0) {
+        const winner = await recoverEscrowedDeviceToken(env, opts.requestId, now);
+        if (winner) return winner;
+        const auth = await db
+          .prepare("SELECT status FROM device_auth WHERE device_code=? AND request_id=?")
+          .bind(opts.deviceCode, opts.requestId)
+          .first<{ status: string }>();
+        // A committed winner whose escrow is no longer recoverable remains a
+        // claimed one-time code; never misreport it as a fresh cap/liveness race.
+        if (auth?.status !== "approved") return null;
+        if (opts.accountId !== "default") {
+          const live = await dbFor(env, opts.accountId)
+            .prepare("SELECT 1 FROM accounts WHERE id=? AND deleted_at IS NULL")
+            .bind(opts.accountId)
+            .first();
+          if (!live) throw new AccountGoneError("claimDeviceAuthWithEscrow");
+        }
+        const currentCap = await checkDeviceCap(env, opts.accountId);
+        if (!currentCap.ok) throw new DeviceLimitError(currentCap.cap, currentCap.plan);
+        return null;
+      }
+      const expected = [
+        results[0]?.meta.changes,
+        results[1]?.meta.changes,
+        results[3]?.meta.changes,
+        results[4]?.meta.changes,
+      ];
+      if (expected.some((changes) => changes !== 1)) {
+        throw new Error(`device-code claim batch invariant: ${expected.join("/")}`);
+      }
+      await opts.afterCommit?.();
+      await enqueueNotify(env, tokenHash);
+      return { token, tokenHash, deviceId, accountId: opts.accountId, expiresAt: opts.expiresAt };
+    } catch (error) {
+      lastError = error;
+      if (!isUniqueViolation(error)) throw error;
+    }
+  }
+  throw new Error(`claimDeviceAuthWithEscrow: exhausted ${MINT_MAX_ATTEMPTS} attempts: ${String((lastError as Error)?.message ?? lastError)}`);
 }
 
 /** Mint a SHORT-LIVED web session token (M11) for a Clerk-authenticated user.

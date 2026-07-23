@@ -2,14 +2,15 @@ import os from "node:os";
 import fs from "node:fs/promises";
 import { clearCredentials, credentialsForStrictFlow, loadCredentials, PROD_WEB, saveCredentials } from "./credentials.js";
 import { clearAccountProfile } from "./account-profile.js";
-import { isInteractive, promptCheckbox, promptConfirm, promptInput, promptKeypress, promptPassword, promptSelect, type CheckboxPrompt } from "./prompt.js";
+import { isInteractive, promptCheckbox, promptConfirm, promptInput, promptKeypress, promptLoginFallback, promptPassword, promptSelect, type CheckboxPrompt } from "./prompt.js";
 import { copyToClipboard, openInBrowser } from "./browser-open.js";
 import { RboxApi } from "./remote.js";
 import { emitJson } from "./json.js";
-import { assertNoPendingGenesis, beginAtomicGenesis, completeAtomicGenesis, enrollViaPairing, enrollViaRecovery, enrollViaRecoveryWithPhraseInput, RecoveryPreAdmissionError, type AtomicGenesisDestinationSetContext, type AtomicGenesisDestinationSetResult } from "./e2ee-client.js";
+import { assertNoPendingGenesis, beginAtomicGenesis, completeAtomicGenesis, enrollViaPairing, enrollViaRecovery, enrollViaRecoveryWithPhraseInput, enrollViaWebDelivery, parsePairingToken, RecoveryPreAdmissionError, type AtomicGenesisDestinationSetContext, type AtomicGenesisDestinationSetResult, type WebDeliveryBoundary } from "./e2ee-client.js";
 import { preflightRecoveryEnvelope, validatePhraseForAccount } from "./e2ee-client.js";
 import { buildPairing, canonicalString, phraseToRk, randomBytes, rkToPhrase, sha256Hex, toB64url, utf8 } from "../engine/e2ee/index.js";
 import { loadDevice, loadRecoveryKey } from "./e2ee-keystore.js";
+import { acquireGenesisLockPair } from "./genesis-locks.js";
 import { isAutostartEnabled } from "./autostart-cmd.js";
 import { readStdinTrimmed } from "./read-stdin.js";
 import { rboxBanner } from "./wordmark.js";
@@ -59,6 +60,21 @@ import {
   type OnePasswordProvider,
 } from "./recovery-kit-1password.js";
 import { clearRecoverySecretClipboard, copyRecoverySecretToClipboard } from "./recovery-secret-clipboard.js";
+import {
+  finishLoginAttempt,
+  generateLoginAttemptKeys,
+  LoginAttemptAccountClaimedError,
+  loginAttemptKeys,
+  recordDeliveryExpiry,
+  recordLoginCredentialSaved,
+  recordLoginPersisted,
+  reserveLoginCredential,
+  resumeLoginAttempt,
+  stageLoginAttempt,
+  sweepLoginAttempts,
+  type LoginAttemptActive,
+  type PersistedDelivery,
+} from "./login-attempt-journal.js";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const MIN_LOGIN_BACKOFF_MS = 1000;
@@ -143,8 +159,21 @@ function pollIntervalMs(intervalSeconds: number): number {
 
 /** Parse `Retry-After` seconds into a clamped login backoff. */
 function retryAfterMs(res: Response, fallbackMs: number): number {
-  const secs = Number(res.headers.get("Retry-After"));
+  const header = res.headers.get("Retry-After");
+  const secs = header === null ? Number.NaN : Number(header);
   return clampLoginSleepMs(Number.isFinite(secs) && secs >= 0 ? secs * 1000 : fallbackMs);
+}
+
+async function rateLimitRetryMs(res: Response, fallbackMs: number): Promise<number> {
+  const header = res.headers.get("Retry-After");
+  if (header !== null) return retryAfterMs(res, fallbackMs);
+  const body = await res.clone().json().catch(() => undefined) as { retryAfterSeconds?: unknown } | undefined;
+  const seconds = body?.retryAfterSeconds;
+  return clampLoginSleepMs(
+    typeof seconds === "number" && Number.isFinite(seconds) && seconds >= 0
+      ? seconds * 1000
+      : fallbackMs,
+  );
 }
 
 interface DeviceCodeStart {
@@ -155,18 +184,36 @@ interface DeviceCodeStart {
 }
 
 /** Start device-code login, retrying bounded 429s with `Retry-After` backoff. */
-async function startDeviceCode(remoteUrl: string, label: string): Promise<DeviceCodeStart> {
+async function startDeviceCode(
+  remoteUrl: string,
+  label: string,
+  publicKeys: { encPubKey: string; sigPubKey: string },
+  wait: (ms: number) => Promise<unknown> = sleep,
+): Promise<DeviceCodeStart> {
   const MAX_RETRIES = 4;
   for (let attempt = 0; ; attempt++) {
-    const res = await postJson(`${remoteUrl}/v1/auth/device/start`, { label });
+    const res = await postJson(`${remoteUrl}/v1/auth/device/start`, {
+      label,
+      encPubKey: publicKeys.encPubKey,
+      sigPubKey: publicKeys.sigPubKey,
+    });
     if (res.ok) return (await res.json()) as DeviceCodeStart;
     if (res.status === 429 && attempt < MAX_RETRIES) {
-      const waitMs = retryAfterMs(res, Math.min(2000 * (attempt + 1), 10_000));
+      const waitMs = await rateLimitRetryMs(res, Math.min(2000 * (attempt + 1), 10_000));
       console.error(`login rate-limited; retrying in ${Math.ceil(waitMs / 1000)}s...`);
-      await sleep(waitMs);
+      await wait(waitMs);
       continue;
     }
     if (res.status === 429) throw new Error("login rate-limited — wait a minute and run `rbox login` again");
+    // Client-skew (design 189 §11): a server that predates key delivery rejects
+    // the enrollment pubkey fields as an unknown request shape (400). Fall back
+    // to a legacy label-only start — the poll loop then sees no keyDelivery field
+    // and completes as an ordinary device-code login (enroll via pairing/phrase).
+    // Guard on the retry succeeding so a genuinely bad request still surfaces.
+    if (res.status === 400) {
+      const legacy = await postJson(`${remoteUrl}/v1/auth/device/start`, { label });
+      if (legacy.ok) return (await legacy.json()) as DeviceCodeStart;
+    }
     throw await friendlyHttpError(res, "login");
   }
 }
@@ -916,12 +963,476 @@ export async function handleDeviceCodePostApprovalEncryption(
 /** `rbox login [--bootstrap <secret>] [--plan <solo|pro>] [--label <text>]` — obtain a per-device token. */
 export type AuthPresentationContext = "standalone" | "wizard";
 
-export function deviceApprovalUrl(userCode: string): string {
-  return `${process.env.RBOX_APP || PROD_WEB}/cli-login?code=${userCode}`;
+export function deviceApprovalUrl(userCode: string, fingerprint?: string): string {
+  const url = new URL("/cli-login", process.env.RBOX_APP || PROD_WEB);
+  url.searchParams.set("code", userCode);
+  if (fingerprint) url.hash = `fp=${fingerprint}`;
+  return url.toString();
 }
 
 interface LoginDeps {
   redeemPair?: typeof redeemPair;
+  now?: () => number;
+  sleep?: (ms: number) => Promise<unknown>;
+  isInteractive?: typeof isInteractive;
+  promptLoginFallback?: typeof promptLoginFallback;
+  enrollViaWebDelivery?: typeof enrollViaWebDelivery;
+  enrollViaRecoveryWithPhraseInput?: typeof enrollViaRecoveryWithPhraseInput;
+  onCredentialReserved?: () => void | Promise<void>;
+  onWebDeliveryBoundary?: (boundary: WebDeliveryBoundary) => void | Promise<void>;
+}
+
+interface KeyDeliveryPoll {
+  status: "pending" | "ready" | "delivered" | "expired";
+  requestId: string;
+  expiresAt: number;
+  mkWrapDevice?: string;
+  publishedRosterVersion?: number;
+  accountEpoch?: number;
+}
+
+interface DevicePoll {
+  status: string;
+  token?: string;
+  deviceId?: string;
+  accountId?: string;
+  interval?: number;
+  keyDelivery?: KeyDeliveryPoll | null;
+}
+
+export type DeviceLoginFsmState =
+  | "awaiting-approval"
+  | "key-delivery-pending"
+  | "keys-ready"
+  | "legacy"
+  | "fallback"
+  | "admitted";
+
+export type DeviceLoginFsmEvent =
+  | { kind: "poll"; poll: DevicePoll }
+  | { kind: "deadline" }
+  | { kind: "acknowledged" };
+
+/** Pure transition surface used by the FSM tests. Transport/persistence effects
+ * are deliberately owned by runDeviceCodeLogin below. */
+export function transitionDeviceLogin(
+  state: DeviceLoginFsmState,
+  event: DeviceLoginFsmEvent,
+): DeviceLoginFsmState {
+  if (event.kind === "acknowledged") {
+    if (state !== "keys-ready") throw new Error(`cannot acknowledge login from ${state}`);
+    return "admitted";
+  }
+  if (event.kind === "deadline") {
+    return state === "key-delivery-pending" ? "fallback" : state;
+  }
+  const delivery = event.poll.keyDelivery;
+  if ((event.poll.status === "approved" || event.poll.status === "claimed") && event.poll.token) {
+    if (delivery === undefined || delivery === null) return "legacy";
+    if (delivery.status === "ready") return "keys-ready";
+    if (delivery.status === "pending") return "key-delivery-pending";
+    if (delivery.status === "expired") return "fallback";
+  }
+  if (state === "key-delivery-pending" && delivery?.status === "ready") return "keys-ready";
+  if (state === "key-delivery-pending" && delivery?.status === "expired") return "fallback";
+  return state;
+}
+
+function recordKeys(value: object): string[] {
+  return Object.keys(value).sort();
+}
+
+function parseKeyDelivery(value: unknown, requestId: string): KeyDeliveryPoll | null | undefined {
+  if (value === undefined || value === null) return value;
+  if (typeof value !== "object" || Array.isArray(value)) throw new Error("malformed keyDelivery response");
+  const delivery = value as Record<string, unknown>;
+  if (delivery.requestId !== requestId
+    || typeof delivery.expiresAt !== "number"
+    || !Number.isSafeInteger(delivery.expiresAt)
+    || delivery.expiresAt < 0) {
+    throw new Error("keyDelivery request binding is invalid");
+  }
+  if (delivery.status === "ready") {
+    if (canonicalString(recordKeys(delivery)) !== canonicalString([
+      "accountEpoch", "expiresAt", "mkWrapDevice", "publishedRosterVersion", "requestId", "status",
+    ])
+      || typeof delivery.mkWrapDevice !== "string" || !delivery.mkWrapDevice
+      || typeof delivery.publishedRosterVersion !== "number"
+      || !Number.isSafeInteger(delivery.publishedRosterVersion)
+      || delivery.publishedRosterVersion < 0
+      || typeof delivery.accountEpoch !== "number"
+      || !Number.isSafeInteger(delivery.accountEpoch)
+      || delivery.accountEpoch < 0) {
+      throw new Error("malformed ready keyDelivery response");
+    }
+    return delivery as unknown as KeyDeliveryPoll;
+  }
+  if (!["pending", "delivered", "expired"].includes(String(delivery.status))
+    || canonicalString(recordKeys(delivery)) !== canonicalString([
+      "expiresAt", "requestId", "status",
+    ])) {
+    throw new Error("malformed keyDelivery response");
+  }
+  return delivery as unknown as KeyDeliveryPoll;
+}
+
+interface ClaimedLogin {
+  token: string;
+  deviceId: string;
+  accountId: string;
+}
+
+async function credentialForAttempt(
+  attempt: LoginAttemptActive,
+): Promise<ClaimedLogin | undefined> {
+  if (attempt.phase === "staged") return undefined;
+  const loaded = credentialsForStrictFlow(await loadCredentials());
+  if (!loaded
+    || loaded.remoteUrl !== attempt.remoteUrl
+    || loaded.accountId !== attempt.accountId
+    || loaded.deviceId !== attempt.deviceId) {
+    if (attempt.phase === "credential-reserved") return undefined;
+    throw new Error("saved login credential does not match the resumable attempt");
+  }
+  return { token: loaded.token, deviceId: loaded.deviceId, accountId: loaded.accountId };
+}
+
+async function ackKeyDelivery(
+  attempt: LoginAttemptActive,
+  credential: ClaimedLogin,
+  delivery: Pick<PersistedDelivery, "requestId" | "expiresAt">,
+  deps: LoginDeps,
+): Promise<void> {
+  const wait = deps.sleep ?? sleep;
+  for (let retry = 0; retry <= 4; retry++) {
+    const response = await postJson(
+      `${attempt.remoteUrl}/v1/auth/key-delivery/ack`,
+      { requestId: delivery.requestId },
+      credential.token,
+    );
+    if (response.ok) {
+      const body = await response.json().catch(() => undefined) as unknown;
+      if (typeof body !== "object" || body === null || Array.isArray(body)
+        || canonicalString(recordKeys(body)) !== canonicalString(["alreadyDelivered", "ok"])
+        || (body as { ok?: unknown }).ok !== true
+        || typeof (body as { alreadyDelivered?: unknown }).alreadyDelivered !== "boolean") {
+        throw new Error("malformed key-delivery ACK response");
+      }
+      return;
+    }
+    if (response.status === 429 && retry < 4) {
+      const delay = await rateLimitRetryMs(response, Math.min(1000 * (retry + 1), 5000));
+      if ((deps.now ?? Date.now)() + delay >= delivery.expiresAt) break;
+      await wait(delay);
+      continue;
+    }
+    throw await friendlyHttpError(response, "key-delivery ACK");
+  }
+  throw new Error("key-delivery ACK did not complete before expiry");
+}
+
+async function refetchPersistedDelivery(
+  attempt: Extract<LoginAttemptActive, { phase: "persisted" }>,
+  credential: ClaimedLogin,
+): Promise<void> {
+  const response = await postJson(
+    `${attempt.remoteUrl}/v1/auth/device/poll`,
+    { deviceCode: attempt.deviceCode },
+  );
+  if (!response.ok) throw await friendlyHttpError(response, "key-delivery recovery poll");
+  const poll = await response.json() as DevicePoll;
+  const delivery = parseKeyDelivery(poll.keyDelivery, attempt.requestId);
+  if ((poll.status === "approved" || poll.status === "claimed") && poll.token
+    && (poll.token !== credential.token
+      || poll.deviceId !== credential.deviceId
+      || poll.accountId !== credential.accountId)) {
+    throw new Error("recovered login credential changed after persistence");
+  }
+  if (delivery?.status === "delivered") return;
+  if (delivery?.status !== "ready") {
+    throw new Error("persisted key delivery is no longer ready for ACK");
+  }
+  const recovered: PersistedDelivery = {
+    requestId: delivery.requestId,
+    mkWrapDevice: delivery.mkWrapDevice!,
+    publishedRosterVersion: delivery.publishedRosterVersion!,
+    accountEpoch: delivery.accountEpoch!,
+    expiresAt: delivery.expiresAt,
+  };
+  if (canonicalString(recovered) !== canonicalString(attempt.delivery)) {
+    throw new Error("re-fetched key delivery changed after persistence");
+  }
+}
+
+async function persistClaimedCredential(
+  attempt: LoginAttemptActive,
+  credential: ClaimedLogin,
+  deps: LoginDeps,
+): Promise<LoginAttemptActive> {
+  const pair = await acquireGenesisLockPair(credential.accountId);
+  try {
+    const local = await loadDevice(credential.accountId);
+    if (local) {
+      const localDevice = "secrets" in local ? local.secrets : local.device;
+      if (localDevice.deviceId !== credential.deviceId) {
+        throw new LoginAttemptAccountClaimedError();
+      }
+    }
+    const reserved = await reserveLoginCredential(
+      attempt,
+      credential.accountId,
+      credential.deviceId,
+    );
+    await deps.onCredentialReserved?.();
+    await saveCredentials({ ...credential, remoteUrl: attempt.remoteUrl });
+    return await recordLoginCredentialSaved(
+      reserved,
+      credential.accountId,
+      credential.deviceId,
+    );
+  } finally {
+    await pair.account.release();
+    await pair.global.release();
+  }
+}
+
+async function runDeliveryFallback(
+  attempt: LoginAttemptActive,
+  label: string,
+  presentation: AuthPresentationContext,
+  credential: ClaimedLogin | undefined,
+  deps: LoginDeps,
+): Promise<void> {
+  if (attempt.phase === "persisted") {
+    throw new Error("persisted key delivery must resume ACK; refusing another enrollment path");
+  }
+  if (!(deps.isInteractive ?? isInteractive)()) {
+    await finishLoginAttempt(attempt, "abandoned", (deps.now ?? Date.now)());
+    throw new Error("no enrolled machine delivered keys before expiry — run `rbox login` in a terminal to use a pairing token or recovery phrase");
+  }
+  const answer = await (deps.promptLoginFallback ?? promptLoginFallback)({
+    validPairingToken: (value) => {
+      try {
+        parsePairingToken(value);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+  });
+  await finishLoginAttempt(attempt, "abandoned", (deps.now ?? Date.now)());
+  if (answer.kind === "pairing") {
+    try {
+      await (deps.redeemPair ?? redeemPair)(attempt.remoteUrl, answer.token, label, presentation);
+      return;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`${message}\npairing may have been consumed — do not fall back to the older browser credential; inspect login status or mint a fresh token`);
+    }
+  }
+  if (!credential) throw new Error("delivery fallback is missing the claimed browser credential");
+  const loaded = {
+    state: "valid" as const,
+    source: "disk" as const,
+    credentials: {
+      v: 1 as const,
+      ...credential,
+      remoteUrl: attempt.remoteUrl,
+    },
+    legacy: false,
+    extensions: {},
+  };
+  const result = await (deps.enrollViaRecoveryWithPhraseInput ?? enrollViaRecoveryWithPhraseInput)(
+    async () => answer.phrase,
+    (deps.now ?? Date.now)(),
+    loaded,
+  );
+  console.log(`device authorized + encryption enrolled: ${result.deviceId}`);
+  if (presentation === "standalone") console.log(WORKSPACE_SYNC_NEXT_STEP);
+}
+
+export async function runDeviceCodeLogin(
+  initialAttempt: LoginAttemptActive,
+  kitOpts: RecoveryKitOptions,
+  presentation: AuthPresentationContext,
+  deps: LoginDeps = {},
+): Promise<void> {
+  let attempt = initialAttempt;
+  let credential = await credentialForAttempt(attempt);
+  if (attempt.phase === "credential-reserved" && credential) {
+    attempt = await recordLoginCredentialSaved(
+      attempt,
+      credential.accountId,
+      credential.deviceId,
+    );
+  }
+  const now = deps.now ?? Date.now;
+  const wait = deps.sleep ?? sleep;
+  const enroll = deps.enrollViaWebDelivery ?? enrollViaWebDelivery;
+  let state: DeviceLoginFsmState = attempt.phase === "staged"
+    ? "awaiting-approval"
+    : attempt.phase === "persisted"
+      ? "keys-ready"
+      : "key-delivery-pending";
+
+  if (attempt.phase === "persisted") {
+    if (!credential) throw new Error("persisted login attempt is missing its credential");
+    await refetchPersistedDelivery(attempt, credential);
+    await ackKeyDelivery(attempt, credential, attempt.delivery, deps);
+    await finishLoginAttempt(attempt, "fulfilled", now());
+    console.log(`device authorized + encryption enrolled: ${credential.deviceId}`);
+    if (presentation === "standalone") console.log(WORKSPACE_SYNC_NEXT_STEP);
+    return;
+  }
+
+  const approveUrl = deviceApprovalUrl(attempt.userCode, attempt.pubkeyFingerprint);
+  if (attempt.phase === "staged") {
+    console.log("\nTo authorize this device, visit:\n");
+    console.log(`    ${approveUrl}\n`);
+    console.log(`\nWaiting for approval (expires in ${Math.max(0, Math.ceil((attempt.expiresAt - now()) / 1000))}s)...`);
+  } else {
+    console.log("\nWaiting for encryption keys from an enrolled machine...");
+  }
+  const copyKey = attempt.phase === "staged" ? offerApprovalCopy(approveUrl) : undefined;
+  const basePollWaitMs = pollIntervalMs(attempt.pollIntervalSeconds);
+  let nextPollWaitMs = basePollWaitMs;
+  try {
+    for (;;) {
+      const deadline = Math.min(attempt.expiresAt, attempt.deliveryExpiresAt ?? attempt.expiresAt);
+      if (now() >= deadline) {
+        state = transitionDeviceLogin(state, { kind: "deadline" });
+        await copyKey?.close();
+        if (state === "fallback") {
+          await runDeliveryFallback(attempt, attempt.label, presentation, credential, deps);
+          return;
+        }
+        await finishLoginAttempt(attempt, "abandoned", now());
+        throw new Error("authorization timed out");
+      }
+
+      await wait(Math.min(nextPollWaitMs, Math.max(1, deadline - now())));
+      const pollRes = await postJson(
+        `${attempt.remoteUrl}/v1/auth/device/poll`,
+        { deviceCode: attempt.deviceCode },
+      );
+      if (pollRes.status === 409) {
+        const responseBody = await pollRes.text().catch(() => "");
+        const body = (() => {
+          try {
+            return JSON.parse(responseBody) as { error?: string; cap?: number; plan?: string };
+          } catch {
+            return {};
+          }
+        })();
+        if (body.error === "device_limit_reached") {
+          throw new Error(`device limit reached (${body.cap}/${body.cap} on ${body.plan}) — revoke a device or upgrade`);
+        }
+        throw await friendlyHttpError(pollRes, "login", responseBody);
+      }
+      if (pollRes.status === 404) {
+        await finishLoginAttempt(attempt, "abandoned", now());
+        throw new Error("authorization expired — run `rbox login` again");
+      }
+      if (!pollRes.ok) {
+        nextPollWaitMs = pollRes.status === 429
+          ? await rateLimitRetryMs(pollRes, basePollWaitMs)
+          : retryAfterMs(pollRes, basePollWaitMs);
+        continue;
+      }
+
+      const raw = await pollRes.json() as DevicePoll;
+      nextPollWaitMs = raw.interval === undefined ? basePollWaitMs : pollIntervalMs(raw.interval);
+      raw.keyDelivery = parseKeyDelivery(raw.keyDelivery, attempt.requestId);
+      if (raw.keyDelivery && attempt.deliveryExpiresAt !== raw.keyDelivery.expiresAt) {
+        attempt = await recordDeliveryExpiry(attempt, raw.keyDelivery.expiresAt);
+      }
+      if (raw.status === "not_found"
+        || raw.status === "expired"
+          && !(state === "key-delivery-pending" && raw.keyDelivery?.status === "expired")) {
+        await finishLoginAttempt(attempt, "abandoned", now());
+        throw new Error("authorization expired — run `rbox login` again");
+      }
+      if ((raw.status === "approved" || raw.status === "claimed") && raw.token) {
+        assertValidDeviceCodeApproval(raw);
+        if (credential
+          && (credential.token !== raw.token
+            || credential.deviceId !== raw.deviceId
+            || credential.accountId !== raw.accountId)) {
+          throw new Error("recovered login credential changed across polls");
+        }
+        if (!credential) {
+          credential = { token: raw.token, deviceId: raw.deviceId, accountId: raw.accountId };
+          try {
+            attempt = await persistClaimedCredential(attempt, credential, deps);
+          } catch (error) {
+            if (error instanceof LoginAttemptAccountClaimedError) {
+              await finishLoginAttempt(attempt, "abandoned", now());
+            }
+            throw error;
+          }
+        }
+      }
+
+      state = transitionDeviceLogin(state, { kind: "poll", poll: raw });
+      if (state === "legacy") {
+        if (!credential) throw new Error("legacy device-code claim did not return a credential");
+        await copyKey?.close();
+        await finishLoginAttempt(attempt, "abandoned", now());
+        console.log(`device authorized: ${credential.deviceId}`);
+        const enrollment = await handleDeviceCodePostApprovalEncryption(
+          new RboxApi(attempt.remoteUrl, credential.token, "", ""),
+          { accountId: credential.accountId, deviceId: credential.deviceId },
+          kitOpts,
+          { presentation },
+        );
+        if (presentation === "standalone" && deviceCodeLoginShouldPrintWorkspaceStep(enrollment)) {
+          console.log(WORKSPACE_SYNC_NEXT_STEP);
+        }
+        return;
+      }
+      if (state === "fallback") {
+        await copyKey?.close();
+        await runDeliveryFallback(attempt, attempt.label, presentation, credential, deps);
+        return;
+      }
+      if (state !== "keys-ready") continue;
+      if (!credential || raw.keyDelivery?.status !== "ready") {
+        throw new Error("ready key delivery is missing the recovered device credential");
+      }
+      await copyKey?.close();
+      const delivery: PersistedDelivery = {
+        requestId: raw.keyDelivery.requestId,
+        mkWrapDevice: raw.keyDelivery.mkWrapDevice!,
+        publishedRosterVersion: raw.keyDelivery.publishedRosterVersion!,
+        accountEpoch: raw.keyDelivery.accountEpoch!,
+        expiresAt: raw.keyDelivery.expiresAt,
+      };
+      await enroll({
+        remoteUrl: attempt.remoteUrl,
+        token: credential.token,
+        accountId: credential.accountId,
+        deviceId: credential.deviceId,
+        requestId: attempt.requestId,
+        mkWrapDevice: delivery.mkWrapDevice,
+        publishedRosterVersion: delivery.publishedRosterVersion,
+        accountEpoch: delivery.accountEpoch,
+        keys: loginAttemptKeys(attempt),
+      }, {
+        persistCheckpoint: async () => {
+          attempt = await recordLoginPersisted(attempt, delivery);
+        },
+        onBoundary: deps.onWebDeliveryBoundary,
+      });
+      await ackKeyDelivery(attempt, credential, delivery, deps);
+      await finishLoginAttempt(attempt, "fulfilled", now());
+      state = transitionDeviceLogin(state, { kind: "acknowledged" });
+      console.log(`device authorized + encryption enrolled: ${credential.deviceId}`);
+      if (presentation === "standalone") console.log(WORKSPACE_SYNC_NEXT_STEP);
+      return;
+    }
+  } finally {
+    await copyKey?.close().catch(() => {});
+  }
 }
 
 export async function login(
@@ -931,7 +1442,7 @@ export async function login(
   kitOpts: RecoveryKitOptions = NO_KIT,
   requestedLabel?: string,
   presentation: AuthPresentationContext = "standalone",
-  deps: LoginDeps = {}
+  deps: LoginDeps = {},
 ): Promise<void> {
   const label = requestedLabel?.trim() || os.hostname();
   // Headless pairing: redeem a token from the env (never argv — it's a bearer).
@@ -957,74 +1468,32 @@ export async function login(
     return;
   }
 
-  const start = await startDeviceCode(remoteUrl, label);
-
-  // Browser-optional approval (design 47): print a dashboard URL a web session can
-  // approve from any browser (laptop/phone, need not be this machine — the SSH case),
-  // while keeping the terminal-to-terminal path for those who prefer it. Read RBOX_APP
-  // at the call site so a test/override set after import still wins.
-  const approveUrl = deviceApprovalUrl(start.userCode);
-  console.log(`\nTo authorize this device, visit:\n`);
-  console.log(`    ${approveUrl}\n`);
-  console.log(`    (or run \`rbox device approve ${start.userCode}\` on an already-signed-in machine)`);
-  console.log(`\nWaiting for approval (expires in ${start.expiresIn}s)...`);
-
-  // The copy-key listener runs CONCURRENTLY with polling — it never gates a single
-  // tick. We keep a cancel handle so we can close it the instant approval
-  // lands (or on timeout), so it never blocks or outlives the flow.
-  const copyKey = offerApprovalCopy(approveUrl);
-  try {
-    const deadline = Date.now() + start.expiresIn * 1000;
-    const basePollWaitMs = pollIntervalMs(start.interval);
-    while (Date.now() < deadline) {
-      await sleep(basePollWaitMs);
-      const pollRes = await postJson(`${remoteUrl}/v1/auth/device/poll`, { deviceCode: start.deviceCode });
-      // Device cap does not clear through polling.
-      if (pollRes.status === 409) {
-        const responseBody = await pollRes.text().catch(() => "");
-        const body = (() => {
-          try {
-            return JSON.parse(responseBody) as { error?: string; cap?: number; plan?: string };
-          } catch {
-            return {};
-          }
-        })();
-        if (body.error === "device_limit_reached") {
-          throw new Error(`device limit reached (${body.cap}/${body.cap} on ${body.plan}) — revoke a device or upgrade`);
-        }
-        throw await friendlyHttpError(pollRes, "login", responseBody);
-      }
-      // Non-OK poll responses are transient until the device code expires.
-      if (!pollRes.ok) {
-        await sleep(retryAfterMs(pollRes, basePollWaitMs));
-        continue;
-      }
-      const p = (await pollRes.json()) as { status: string; token?: string; deviceId?: string; accountId?: string; interval?: number };
-      if (p.status === "approved" && p.token) {
-        assertValidDeviceCodeApproval(p);
-        await saveCredentials({ token: p.token, deviceId: p.deviceId, remoteUrl, accountId: p.accountId });
-        console.log(`device authorized: ${p.deviceId}`);
-        await copyKey?.close();
-        const enrollment = await handleDeviceCodePostApprovalEncryption(
-          new RboxApi(remoteUrl, p.token, "", ""),
-          { accountId: p.accountId, deviceId: p.deviceId },
-          kitOpts,
-          { presentation }
-        );
-        if (presentation === "standalone" && deviceCodeLoginShouldPrintWorkspaceStep(enrollment)) {
-          console.log(WORKSPACE_SYNC_NEXT_STEP);
-        }
-        return;
-      }
-      if (p.status === "expired" || p.status === "not_found") throw new Error("authorization expired — run `rbox login` again");
-      // pending → keep polling
-    }
-    throw new Error("authorization timed out");
-  } finally {
-    await copyKey?.close().catch(() => {
-      // already resolved / non-interactive → nothing to close
+  const now = deps.now ?? Date.now;
+  await sweepLoginAttempts(now());
+  let attempt = await resumeLoginAttempt(remoteUrl, label, { now });
+  if (!attempt) {
+    const keys = generateLoginAttemptKeys();
+    const encPubKey = toB64url(keys.encPubKeySpki);
+    const sigPubKey = toB64url(keys.sigPubKey);
+    const start = await startDeviceCode(
+      remoteUrl,
+      label,
+      { encPubKey, sigPubKey },
+      deps.sleep ?? sleep,
+    );
+    const startedAt = now();
+    attempt = await stageLoginAttempt({
+      deviceCode: start.deviceCode,
+      userCode: start.userCode,
+      remoteUrl,
+      label,
+      pollIntervalSeconds: start.interval,
+      createdAt: startedAt,
+      expiresAt: startedAt + start.expiresIn * 1000,
+      keys,
     });
   }
+  await runDeviceCodeLogin(attempt, kitOpts, presentation, deps);
 }
 
 /** Opportunistically open the approval page and listen for a single copy key

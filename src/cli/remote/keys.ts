@@ -26,8 +26,8 @@ export async function bootstrapKeys(ctx: RemoteContext, body: unknown): Promise<
   throw new Error(translateRemoteError(r.status, "keys/bootstrap failed", text, "account key setup not found"));
 }
 
-export async function getAccountKeys(ctx: RemoteContext): Promise<AccountKeysDTO | null> {
-  const r=await ctx.fetch(`${ctx.baseUrl}/v1/keys/account`,{headers:{...ctx.auth,"x-rbox-genesis-capability":"1"}},{op:"fetching account keys"});
+export async function getAccountKeys(ctx: RemoteContext, signal?: AbortSignal): Promise<AccountKeysDTO | null> {
+  const r=await ctx.fetch(`${ctx.baseUrl}/v1/keys/account`,{headers:{...ctx.auth,"x-rbox-genesis-capability":"1"}},{op:"fetching account keys",signal});
   if(r.status===404)return null;if(!r.ok)throw new Error(translateRemoteError(r.status,"keys/account failed",undefined,"account keys not found"));return await r.json() as AccountKeysDTO;
 }
 
@@ -58,8 +58,8 @@ export async function putDeviceKeys(ctx: RemoteContext, body: unknown): Promise<
 }
 
 /** Atomic device-keys + roster admission (C5). 409 → caller refetches + retries. */
-export async function admitDevice(ctx: RemoteContext, body: unknown): Promise<{ ok: boolean; conflict?: boolean }> {
-  const r = await ctx.postJson("/v1/keys/admit", body, { op: "admitting this device" });
+export async function admitDevice(ctx: RemoteContext, body: unknown, signal?: AbortSignal): Promise<{ ok: boolean; conflict?: boolean }> {
+  const r = await ctx.postJson("/v1/keys/admit", body, { op: "admitting this device", signal });
   if (r.status === 409) return { ok: false, conflict: true };
   if (!r.ok) throw new Error(translateRemoteError(r.status, "keys/admit failed", await r.text(), "account keys not found"));
   return { ok: true };

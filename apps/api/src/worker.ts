@@ -49,6 +49,7 @@ import { runPackGc } from "./pack-gc.js";
 import { ingestSyncState, ingestTelemetry } from "./telemetry-ingest.js";
 import { recordAccountLatency } from "./account-latency.js";
 import { evaluateFleetAlerts } from "./fleet-alerts.js";
+import { sweepKeyDeliveries } from "./auth/key-delivery.js";
 export { WorkspaceSync } from "./workspace-sync.js";
 
 export class CachedReleases extends WorkerEntrypoint<Env> {
@@ -204,6 +205,14 @@ export default {
       await sweepNotifications(env);
     } catch (e) {
       logErr("scheduled_notify_sweep_failed", e); // no raw message (touches device/account metadata)
+    }
+    try {
+      // Design 189 has an independent TTL/revoke/epoch fence. Keep it separate
+      // from notification retention: these rows carry an opaque MK wrap and must
+      // terminalize on their own security clock.
+      await sweepKeyDeliveries(env, event.scheduledTime);
+    } catch (e) {
+      logErr("scheduled_key_delivery_sweep_failed", e);
     }
     try {
       // Diagnostics reports are explicitly plaintext support bundles. Keep the R2/D1
@@ -402,7 +411,8 @@ async function route(req: Request, env: Env, executionCtx: ExecutionContext & { 
  */
 const ROUTE_VOCAB = new Set([
   "v1", "health", "install.sh", "agent.sh", "changelog.md", "version", "version.sig", "bin",
-  "auth", "device", "start", "poll", "bootstrap", "approve", "devices", "revoke", "pair", "create", "redeem",
+  "auth", "device", "start", "poll", "bootstrap", "approve", "pubkeys", "devices", "revoke", "pair", "create", "redeem",
+  "key-delivery", "fetch", "submit", "ack",
   "billing", "checkout", "portal", "stripe", "webhook", "web", "session",
   "account", "usage", "admin", "gc", "plan", "overview", "delta-soak", "workspaces", "diagnostics", "pack-tombstones", "resweep",
   "keys", "api", "roster", "admit", "keystate", "workspace", "genesis-repair",

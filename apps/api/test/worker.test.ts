@@ -10,6 +10,7 @@ import { confirmLink } from "../src/account-link.js";
 import { capBytesFor } from "../src/plans.js";
 import type { Env, WorkerEntrypointExports } from "../src/env.js";
 import type { Principal } from "../src/authz.js";
+import { publicKeyFingerprint } from "../src/auth/key-delivery.js";
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 const BASE = "https://example.com";
@@ -644,6 +645,23 @@ describe("worker integration (real DO + D1 + R2)", () => {
     let s = ""; for (const x of b) s += String.fromCharCode(x);
     return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   };
+  let deviceKeysPromise: Promise<{ encPubKey: string; sigPubKey: string }> | undefined;
+  const devicePublicKeys = () => deviceKeysPromise ??= (async () => {
+    const pair = await crypto.subtle.generateKey(
+      {
+        name: "RSA-OAEP",
+        modulusLength: 3072,
+        publicExponent: new Uint8Array([1, 0, 1]),
+        hash: "SHA-256",
+      },
+      true,
+      ["encrypt", "decrypt"],
+    );
+    return {
+      encPubKey: b64url(await crypto.subtle.exportKey("spki", pair.publicKey)),
+      sigPubKey: b64url(new Uint8Array(32).fill(7)),
+    };
+  })();
   let priv: CryptoKey;
   const KID = "test-kid-1";
   const ISS = "https://clerk.test";
@@ -1175,6 +1193,131 @@ describe("worker integration (real DO + D1 + R2)", () => {
     expect(list.status).toBe(200);
   });
 
+  test("189 skew: captured keys plus absent/false consent still perform device-auth only", async () => {
+    const approver = await bootstrap("device-code-no-key-consent");
+    const keys = await devicePublicKeys();
+    for (const approveBody of [
+      (userCode: string) => ({ userCode }),
+      (userCode: string) => ({ userCode, keyConsent: false }),
+    ]) {
+      const start = await SELF.fetch(`${BASE}/v1/auth/device/start`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ label: "new", ...keys }),
+      });
+      const { deviceCode, userCode } = await start.json() as { deviceCode: string; userCode: string };
+      const approve = await SELF.fetch(`${BASE}/v1/auth/device/approve`, {
+        method: "POST",
+        headers: authed(approver.token, { "content-type": "application/json" }),
+        body: JSON.stringify(approveBody(userCode)),
+      });
+      expect(approve.status).toBe(200);
+      const requestId = sha(deviceCode);
+      expect(await env.rbox_dev_db.prepare("SELECT 1 FROM key_delivery WHERE request_id=?").bind(requestId).first()).toBeNull();
+    }
+  });
+
+  test("189 key consent rejects stale Clerk fva and leaves the device auth pending", async () => {
+    const sub = "user_key_delivery_stale";
+    const login = await webExchange(await signJwt(claims({ sub })));
+    const { token } = await login.json() as { token: string };
+    const keys = await devicePublicKeys();
+    const start = await SELF.fetch(`${BASE}/v1/auth/device/start`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(keys),
+    });
+    const { userCode } = await start.json() as { userCode: string };
+    const fingerprint = await publicKeyFingerprint(keys);
+    const stale = await signJwt(claims({ sub, iat: now(), fva: [11, -1] }));
+    const approve = await SELF.fetch(`${BASE}/v1/auth/device/approve`, {
+      method: "POST",
+      headers: authed(token, { "content-type": "application/json" }),
+      body: JSON.stringify({ userCode, keyConsent: true, pubkeyFingerprint: fingerprint, clerkToken: stale }),
+    });
+    expect(approve.status).toBe(403);
+    const row = await env.rbox_dev_db.prepare("SELECT status FROM device_auth WHERE user_code=?").bind(userCode).first<{ status: string }>();
+    expect(row?.status).toBe("pending");
+  });
+
+  test("189 fresh Clerk fva + exact fragment fingerprint atomically approves and queues", async () => {
+    const sub = "user_key_delivery_fresh";
+    const login = await webExchange(await signJwt(claims({ sub })));
+    const { token, accountId } = await login.json() as { token: string; accountId: string };
+    await env.rbox_dev_db.prepare(
+      "INSERT INTO account_key_states(account_id,account_epoch,signed,created_at) VALUES (?,0,'genesis',?)",
+    ).bind(accountId, Date.now()).run();
+    const keys = await devicePublicKeys();
+    const start = await SELF.fetch(`${BASE}/v1/auth/device/start`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(keys),
+    });
+    const { deviceCode, userCode } = await start.json() as { deviceCode: string; userCode: string };
+    const fingerprint = await publicKeyFingerprint(keys);
+    const fresh = await signJwt(claims({ sub, iat: now(), fva: [0, -1] }));
+    const mismatch = await SELF.fetch(`${BASE}/v1/auth/device/approve`, {
+      method: "POST",
+      headers: authed(token, { "content-type": "application/json" }),
+      body: JSON.stringify({ userCode, keyConsent: true, pubkeyFingerprint: "A".repeat(43), clerkToken: fresh }),
+    });
+    expect(mismatch.status).toBe(409);
+    expect(await mismatch.json()).toEqual({ error: "pubkey_binding_mismatch" });
+    const approve = await SELF.fetch(`${BASE}/v1/auth/device/approve`, {
+      method: "POST",
+      headers: authed(token, { "content-type": "application/json" }),
+      body: JSON.stringify({ userCode, keyConsent: true, pubkeyFingerprint: fingerprint, clerkToken: fresh }),
+    });
+    expect(approve.status).toBe(200);
+    const [auth, delivery] = await Promise.all([
+      env.rbox_dev_db.prepare("SELECT status FROM device_auth WHERE device_code=?").bind(deviceCode).first<{ status: string }>(),
+      env.rbox_dev_db.prepare("SELECT state,target_device_id FROM key_delivery WHERE request_id=?").bind(sha(deviceCode)).first<{ state: string; target_device_id: string | null }>(),
+    ]);
+    expect(auth?.status).toBe("approved");
+    expect(delivery).toEqual({ state: "queued", target_device_id: null });
+  });
+
+  test("189 account kill switch degrades true consent to device-auth-only", async () => {
+    const sub = "user_key_delivery_disabled";
+    const login = await webExchange(await signJwt(claims({ sub })));
+    const { token, accountId } = await login.json() as { token: string; accountId: string };
+    await env.rbox_dev_db.batch([
+      env.rbox_dev_db.prepare(
+        "INSERT INTO account_key_states(account_id,account_epoch,signed,created_at) VALUES (?,0,'genesis',?)",
+      ).bind(accountId, Date.now()),
+      env.rbox_dev_db.prepare(
+        "INSERT INTO account_key_delivery_prefs(account_id,enabled) VALUES (?,0)",
+      ).bind(accountId),
+    ]);
+    const keys = await devicePublicKeys();
+    const start = await SELF.fetch(`${BASE}/v1/auth/device/start`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(keys),
+    });
+    const { deviceCode, userCode } = await start.json() as { deviceCode: string; userCode: string };
+    const approve = await SELF.fetch(`${BASE}/v1/auth/device/approve`, {
+      method: "POST",
+      headers: authed(token, { "content-type": "application/json" }),
+      body: JSON.stringify({
+        userCode,
+        keyConsent: true,
+        pubkeyFingerprint: await publicKeyFingerprint(keys),
+        clerkToken: await signJwt(claims({ sub, iat: now(), fva: [0, -1] })),
+      }),
+    });
+    expect(approve.status).toBe(200);
+    expect(await approve.json()).toEqual({ ok: true, keyDelivery: null, keyDeliveryDisabled: true });
+    const [auth, delivery] = await Promise.all([
+      env.rbox_dev_db.prepare("SELECT status FROM device_auth WHERE device_code=?")
+        .bind(deviceCode).first<{ status: string }>(),
+      env.rbox_dev_db.prepare("SELECT 1 FROM key_delivery WHERE request_id=?")
+        .bind(sha(deviceCode)).first(),
+    ]);
+    expect(auth?.status).toBe("approved");
+    expect(delivery).toBeNull();
+  });
+
   test("device/lookup: unknown code -> 404, never leaks account/user ids", async () => {
     const res = await SELF.fetch(`${BASE}/v1/auth/device/lookup?code=ZZZZ-ZZZZ`);
     expect(res.status).toBe(404);
@@ -1300,10 +1443,10 @@ describe("worker integration (real DO + D1 + R2)", () => {
     // Non-empty presence BLOCKS reclaim (counted in loadShellState/judgeReclaimable):
     // diagnostics_reports blocks fail-closed: only DEVICE principals can create reports, so a
     // "web shell" holding one is not the empty shell the destructive reclaim assumes.
-    const COVERED = ["account_keys", "device_keys", "rosters", "account_key_states", "workspace_keys", "devices", "workspaces", "blob_refs", "uploads", "pairing_tokens", "device_auth", "clerk_users", "memberships", "device_notifications", "diagnostics_reports", "api_keys"];
+    const COVERED = ["account_keys", "device_keys", "rosters", "account_key_states", "workspace_keys", "devices", "workspaces", "blob_refs", "uploads", "pairing_tokens", "device_auth", "clerk_users", "memberships", "device_notifications", "diagnostics_reports", "api_keys", "key_delivery", "device_token_escrow"];
     // shell-owned rows DELETEd on reclaim (not blockers); blob_ref_candidates = §33 transient
     // GC marker; fairuse_* = design 149's derived scan ledger (rebuildable, cleaned on reclaim)
-    const EXPECTED_CLEANED = ["users", "account_notify_prefs", "blob_ref_candidates", "fairuse_scans", "fairuse_workspace_streams", "fairuse_root_membership", "fairuse_sha_last", "fairuse_materialize_refs", "fairuse_leases", "fairuse_account_queue", "account_op_latency"];
+    const EXPECTED_CLEANED = ["users", "account_notify_prefs", "account_key_delivery_prefs", "blob_ref_candidates", "fairuse_scans", "fairuse_workspace_streams", "fairuse_root_membership", "fairuse_sha_last", "fairuse_materialize_refs", "fairuse_leases", "fairuse_account_queue", "account_op_latency"];
     // append-only forensic log (§3.4) + the design-37 deletion ledger — operational rows, never
     // reclaim state (a tombstoned account is already access-dead and gets hard-purged, not
     // link-reclaimed), so neither blocks reclaim.

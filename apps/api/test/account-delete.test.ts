@@ -163,6 +163,7 @@ describe("hard purge — enumeration + dedup safety + isolation", () => {
 
     // A clerk identity + an account-link history keyed by it.
     const clerkA = `user_clerkA_${sha(A.accountId).slice(0, 6)}`;
+    const deliveryRequest = sha(`delivery-${A.accountId}`);
     // Seed a row in (nearly) every account-scoped table for A.
     await db().batch([
       db().prepare("INSERT INTO clerk_users (clerk_user_id, account_id, user_id, created_at, email) VALUES (?, ?, ?, ?, ?)").bind(clerkA, A.accountId, A.ownerUserId, now, "a@example.com"),
@@ -172,7 +173,13 @@ describe("hard purge — enumeration + dedup safety + isolation", () => {
       db().prepare("INSERT INTO rosters (account_id, version, signed, created_at) VALUES (?, 0, 's', ?)").bind(A.accountId, now),
       db().prepare("INSERT INTO account_key_states (account_id, account_epoch, signed, created_at) VALUES (?, 0, 's', ?)").bind(A.accountId, now),
       db().prepare("INSERT INTO pairing_tokens (token_hash, account_id, user_id, created_by, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)").bind(`pt_${A.accountId}`, A.accountId, A.ownerUserId, A.deviceId, now, now + 1e6),
-      db().prepare("INSERT INTO device_auth (device_code, user_code, status, device_id, account_id, created_at, expires_at) VALUES (?, 'UC-1', 'approved', ?, ?, ?, ?)").bind(`dc_${A.accountId}`, `dev_x_${A.accountId}`, A.accountId, now, now + 1e6),
+      db().prepare("INSERT INTO device_auth (device_code,user_code,status,device_id,account_id,created_at,expires_at,request_id,enc_pub_key,sig_pub_key) VALUES (?,'UC-1','claimed',?,?,?,?,?,?,?)").bind(`dc_${A.accountId}`, A.deviceId, A.accountId, now, now + 1e6, deliveryRequest, "enc", "sig"),
+      db().prepare(`INSERT INTO key_delivery
+        (request_id,account_id,target_device_id,enc_pub_key_hash,sig_pub_key_hash,pubkey_fingerprint,
+         approval_token_hash,approval_factor_verified_at,state,account_epoch,created_at,expires_at)
+        VALUES (?,?,?,?,?,?,?,?, 'queued',0,?,?)`).bind(deliveryRequest, A.accountId, A.deviceId, sha("enc"), sha("sig"), "fp", sha("approval"), now, now, now + 1e6),
+      db().prepare("INSERT INTO device_token_escrow(request_id,account_id,device_id,token_hash,token_ciphertext,token_iv,created_at,expires_at) VALUES (?,?,?,?,?,?,?,?)").bind(deliveryRequest, A.accountId, A.deviceId, sha("token"), "cipher", "iv", now, now + 1e6),
+      db().prepare("INSERT INTO account_key_delivery_prefs(account_id,enabled) VALUES (?,0)").bind(A.accountId),
       db().prepare("INSERT INTO account_notify_prefs (account_id, notify_new_device) VALUES (?, 0)").bind(A.accountId),
       db().prepare("INSERT INTO audit_log (account_id, action, at) VALUES (?, 'x', ?)").bind(A.accountId, now),
       // §5b: platform audit rows store the account id in `target` with account_id NULL.
@@ -232,6 +239,7 @@ describe("hard purge — enumeration + dedup safety + isolation", () => {
       "account_keys WHERE account_id", "device_keys WHERE account_id", "workspace_keys WHERE account_id",
       "rosters WHERE account_id", "account_key_states WHERE account_id", "devices WHERE account_id",
       "device_auth WHERE account_id", "pairing_tokens WHERE account_id", "uploads WHERE account_id",
+      "key_delivery WHERE account_id", "device_token_escrow WHERE account_id", "account_key_delivery_prefs WHERE account_id",
       "workspaces WHERE account_id", "clerk_users WHERE account_id", "device_notifications WHERE account_id",
       "account_notify_prefs WHERE account_id", "audit_log WHERE account_id", "blob_ref_candidates WHERE account_id",
       "fairuse_materialize_refs WHERE account_id", "fairuse_root_membership WHERE account_id",

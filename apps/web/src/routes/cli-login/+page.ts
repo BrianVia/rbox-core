@@ -1,5 +1,6 @@
 import { redirect } from '@sveltejs/kit';
 import { getClerk } from '$lib/clerk';
+import { cliLoginReturnPath } from '$lib/device-approval';
 import type { PageLoad } from './$types';
 
 // Preserving ?code= across the sign-in bounce is the load-bearing subtlety of this
@@ -25,7 +26,10 @@ export const load: PageLoad = async ({ url }) => {
 	const code = (url.searchParams.get('code') ?? '').toUpperCase();
 	const clerk = await getClerk();
 	if (!clerk.user) {
-		const back = `/cli-login${code ? `?code=${encodeURIComponent(code)}` : ''}`;
+		// ssr=false: the live browser fragment is available here, but never in an
+		// HTTP request to the device-auth API. Keep it through the Clerk bounce so
+		// the approval page can bind consent to the CLI's exact public keys.
+		const back = cliLoginReturnPath(code, location.hash);
 		redirect(307, `/?redirect_url=${encodeURIComponent(back)}`);
 	}
 	return { code };

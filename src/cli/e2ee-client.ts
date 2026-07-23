@@ -5,6 +5,7 @@ import {
   bootstrapAccount,
   buildPairing,
   buildRecoveryAdmission,
+  ENC_ALG,
   fromB64url,
   generateSignKeyPair,
   generateWrapKeyPair,
@@ -18,7 +19,9 @@ import {
   canonicalString,
   phraseToRk as decodeRecoveryPhrase,
   sha256Hex,
+  SIG_ALG,
   utf8,
+  wrapHash,
   type DeviceSecrets,
   type RedeemResult,
   type SignedKeyState,
@@ -383,6 +386,169 @@ async function selfVerifyAdmission(dto: AccountKeysDTO, admissionRoster: SignedR
   const keyStates = dto.keyStates.map((s) => JSON.parse(s) as SignedKeyState);
   const account = await verifyAccount([...rosters, admissionRoster], keyStates);
   await assertMkWrapAuthorized(deviceWrap, account);
+}
+
+export interface WebDeliveryEnrollment {
+  remoteUrl: string;
+  token: string;
+  accountId: string;
+  deviceId: string;
+  requestId: string;
+  mkWrapDevice: string;
+  publishedRosterVersion: number;
+  accountEpoch: number;
+  keys: {
+    sigPubKey: Uint8Array;
+    sigPrivPkcs8: Uint8Array;
+    encPubKeySpki: Uint8Array;
+    encPrivPkcs8: Uint8Array;
+  };
+}
+
+export type WebDeliveryBoundary = "keys-ready" | "persisted";
+
+interface WebDeliveryDeps {
+  api?: Pick<RboxApi, "getAccountKeys">;
+  loadDevice?: typeof loadDevice;
+  saveDevice?: typeof saveDevice;
+  acquireLocks?: typeof acquireGenesisLockPair;
+  /** Durable attempt checkpoint, invoked under the enrollment locks after the
+   * keystore is durable and before the persisted crash boundary is exposed. */
+  persistCheckpoint?: () => Promise<void>;
+  onBoundary?: (boundary: WebDeliveryBoundary) => void | Promise<void>;
+}
+
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  return Buffer.from(a).equals(Buffer.from(b));
+}
+
+function assertSameLocalDevice(
+  local: Omit<DeviceSecrets, "mk">,
+  expected: Omit<DeviceSecrets, "mk">,
+): void {
+  if (local.accountId !== expected.accountId
+    || local.deviceId !== expected.deviceId
+    || !sameBytes(local.sigPubKey, expected.sigPubKey)
+    || !sameBytes(local.sigPrivPkcs8, expected.sigPrivPkcs8)
+    || !sameBytes(local.encPubSpki, expected.encPubSpki)
+    || !sameBytes(local.encPrivPkcs8, expected.encPrivPkcs8)) {
+    throw new Error("this account already has different local device keys — refusing to overwrite them");
+  }
+}
+
+function exactRosterDevice(
+  body: Awaited<ReturnType<typeof verifyDto>>["account"]["currentRoster"],
+  args: Pick<WebDeliveryEnrollment, "deviceId" | "keys">,
+) {
+  const entry = body.devices.find((device) => device.deviceId === args.deviceId);
+  if (!entry
+    || entry.status !== "active"
+    || entry.kind !== "device"
+    || entry.role !== "admin"
+    || entry.sigAlg !== SIG_ALG
+    || entry.encAlg !== ENC_ALG
+    || entry.sigPubKey !== toB64url(args.keys.sigPubKey)
+    || entry.encPubKey !== toB64url(args.keys.encPubKeySpki)) {
+    throw new Error("published roster does not admit this device's exact keys");
+  }
+  return entry;
+}
+
+/** Complete design-189 web delivery without minting keys, signing a roster, or
+ * re-wrapping MK. The daemon-produced device-context wrap is verified and
+ * opened as-is; the existing keystore persists only the identity and MK. */
+export async function enrollViaWebDelivery(
+  input: WebDeliveryEnrollment,
+  deps: WebDeliveryDeps = {},
+): Promise<{ accountId: string; deviceId: string }> {
+  if (!ACCOUNT_ID_RE.test(input.accountId)) throw new Error(`malformed accountId from server: ${input.accountId}`);
+  if (!/^[0-9a-f]{64}$/.test(input.requestId)) throw new Error("malformed key-delivery requestId");
+  if (!Number.isSafeInteger(input.publishedRosterVersion) || input.publishedRosterVersion < 0
+    || !Number.isSafeInteger(input.accountEpoch) || input.accountEpoch < 0) {
+    throw new Error("malformed key-delivery roster metadata");
+  }
+
+  const api = deps.api ?? new RboxApi(input.remoteUrl, input.token, "", "");
+  const pair = await (deps.acquireLocks ?? acquireGenesisLockPair)(input.accountId);
+  let mk: Uint8Array | undefined;
+  try {
+    const dto = await api.getAccountKeys();
+    if (!dto) throw new Error("account key chain missing during web enrollment");
+    const { account } = await verifyDto(dto);
+    assertSignedAccountId(input.accountId, account.currentRoster.accountId);
+    if (account.currentEpoch !== input.accountEpoch) {
+      throw new Error("key-delivery account epoch is no longer current");
+    }
+    if (account.currentRoster.accountEpoch !== account.currentEpoch) {
+      throw new Error("current roster head and key-state epoch disagree");
+    }
+
+    const published = account.rosters[input.publishedRosterVersion];
+    if (!published || published.version !== input.publishedRosterVersion) {
+      throw new Error("published key-delivery roster version is missing");
+    }
+    if (published.accountId !== input.accountId || published.accountEpoch !== input.accountEpoch) {
+      throw new Error("published key-delivery roster account/epoch mismatch");
+    }
+    const publishedEntry = exactRosterDevice(published, input);
+    // A later same-epoch head may exist. It must still admit this exact identity;
+    // accepting a now-revoked target would race the server's revocation fence.
+    // Checked for LIVENESS ONLY (the throw side-effect) — NOT its mkWrapHash: a
+    // same-epoch re-wrap in a later head opens the same MK, and the delivered
+    // wrap is bound to publishedEntry.mkWrapHash + the server device-row equality
+    // check below. Do not "tighten" this to compare the current-head wrap hash.
+    exactRosterDevice(account.currentRoster, input);
+
+    const deviceRow = dto.devices.find((device) => device.deviceId === input.deviceId);
+    if (!deviceRow
+      || deviceRow.sigPubkey !== toB64url(input.keys.sigPubKey)
+      || deviceRow.encPubkey !== toB64url(input.keys.encPubKeySpki)
+      || deviceRow.mkWrap !== input.mkWrapDevice) {
+      throw new Error("published device row does not match the delivered keys and wrap");
+    }
+
+    let mkWrap: Wrap;
+    try {
+      mkWrap = JSON.parse(input.mkWrapDevice) as Wrap;
+    } catch {
+      throw new Error("delivered MK wrap is not valid JSON");
+    }
+    if (!publishedEntry.mkWrapHash || await wrapHash(mkWrap) !== publishedEntry.mkWrapHash) {
+      throw new Error("delivered MK wrap hash does not match the published roster");
+    }
+    await assertMkWrapAuthorized(mkWrap, account);
+
+    const device: Omit<DeviceSecrets, "mk"> = {
+      accountId: input.accountId,
+      deviceId: input.deviceId,
+      sigPubKey: input.keys.sigPubKey,
+      sigPrivPkcs8: input.keys.sigPrivPkcs8,
+      encPubSpki: input.keys.encPubKeySpki,
+      encPrivPkcs8: input.keys.encPrivPkcs8,
+    };
+    mk = await openOwnMasterKey(device, input.accountEpoch, mkWrap);
+    await deps.onBoundary?.("keys-ready");
+
+    const load = deps.loadDevice ?? loadDevice;
+    const save = deps.saveDevice ?? saveDevice;
+    const local = await load(input.accountId);
+    if (local) {
+      const localDevice = "secrets" in local ? local.secrets : local.device;
+      assertSameLocalDevice(localDevice, device);
+      if (!("secrets" in local) || !sameBytes(local.secrets.mk, mk)) {
+        await save({ ...device, mk });
+      }
+    } else {
+      await save({ ...device, mk });
+    }
+    await deps.persistCheckpoint?.();
+    await deps.onBoundary?.("persisted");
+    return { accountId: input.accountId, deviceId: input.deviceId };
+  } finally {
+    mk?.fill(0);
+    await pair.account.release();
+    await pair.global.release();
+  }
 }
 
 /** Persist the device secrets, POST /v1/keys/admit, retrying 409s by rebuilding the

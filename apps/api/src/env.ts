@@ -119,6 +119,10 @@ export interface Env {
   rbox_releases: R2Bucket;
   /** Bootstrap trust anchor for the first device (Wrangler secret, never in git). */
   RBOX_BOOTSTRAP_SECRET: string;
+  /** Optional dedicated AES-GCM root for design-189 device-token escrow. When
+   * absent during rollout, mint.ts derives a domain-separated key from the
+   * required bootstrap secret. */
+  RBOX_DEVICE_TOKEN_ESCROW_KEY?: string;
   /** Dev-only gate for honoring the optional bootstrap `plan` body field. Prod leaves unset. */
   RBOX_ALLOW_BOOTSTRAP_PLAN?: string;
   /** Platform-admin secret for internal ops (GC). Distinct from tenant device tokens. */
@@ -222,4 +226,12 @@ export interface Env {
   RL_LINK_PAIR: RateLimitBinding;
   /** Shared per-device budget for telemetry samples and fleet sync-state reports. */
   RL_TELEMETRY: RateLimitBinding;
+  /** Per-account browser approval budget for key-delivery grants. */
+  RL_KEY_DELIVERY_APPROVE: RateLimitBinding;
+  /** Per-daemon pull budget for queued key-delivery requests. */
+  RL_KEY_DELIVERY_FETCH: RateLimitBinding;
+  /** Per-daemon budget for the single-fulfillment ciphertext CAS. */
+  RL_KEY_DELIVERY_SUBMIT: RateLimitBinding;
+  /** Per-target-device budget for durable-persist acknowledgements. */
+  RL_KEY_DELIVERY_ACK: RateLimitBinding;
 }

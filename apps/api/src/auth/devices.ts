@@ -3,6 +3,16 @@ import { json } from "../util.js";
 import { audit, type Principal } from "../authz.js";
 import { dbFor, dirDb } from "../db.js";
 
+/** Correlated SQL guard shared by every key-delivery transition. */
+export function activeDeviceExistsSql(deliveryAlias = "key_delivery"): string {
+  return `EXISTS (
+    SELECT 1 FROM devices key_delivery_target
+    WHERE key_delivery_target.device_id=${deliveryAlias}.target_device_id
+      AND key_delivery_target.account_id=${deliveryAlias}.account_id
+      AND key_delivery_target.revoked=0
+  )`;
+}
+
 // GET /v1/auth/devices  (authed) -> device list, SCOPED to the caller's account.
 export async function listDevices(env: Env, self: Principal): Promise<Response> {
   const rows = await dirDb(env)
@@ -30,10 +40,28 @@ export async function listDevices(env: Env, self: Principal): Promise<Response> 
  */
 export async function revokeDevice(env: Env, self: Principal, deviceId: string): Promise<Response> {
   const privileged = self.role === "owner" || self.role === "admin" ? 1 : 0;
-  const res = await dirDb(env)
-    .prepare("UPDATE devices SET revoked = 1 WHERE device_id = ? AND account_id = ? AND revoked = 0 AND (device_id = ? OR ? = 1)")
-    .bind(deviceId, self.accountId, self.deviceId, privileged)
-    .run();
+  const db = dirDb(env);
+  const [res] = await db.batch([
+    db.prepare("UPDATE devices SET revoked = 1 WHERE device_id = ? AND account_id = ? AND revoked = 0 AND (device_id = ? OR ? = 1)")
+      .bind(deviceId, self.accountId, self.deviceId, privileged),
+    db.prepare(
+      `UPDATE key_delivery
+       SET state='expired',wrap_blob=NULL,published_roster_version=NULL
+       WHERE target_device_id=? AND account_id=? AND state IN ('queued','fulfilled')
+         AND EXISTS (
+           SELECT 1 FROM devices d
+           WHERE d.device_id=? AND d.account_id=?
+             AND (d.device_id=? OR ?=1)
+         )`,
+    ).bind(deviceId, self.accountId, deviceId, self.accountId, self.deviceId, privileged),
+    db.prepare(
+      `DELETE FROM device_token_escrow
+       WHERE request_id IN (
+         SELECT request_id FROM key_delivery
+         WHERE target_device_id=? AND account_id=? AND state='expired'
+       )`,
+    ).bind(deviceId, self.accountId),
+  ]);
   // Read authorization state from the directory plane, then clean up on the
   // account's data plane. An already-revoked authorized retry still cleans up.
   const row = await dirDb(env)
@@ -47,7 +75,7 @@ export async function revokeDevice(env: Env, self: Principal, deviceId: string):
       data.prepare("DELETE FROM alert_state WHERE device_id = ?").bind(deviceId),
     ]);
   }
-  if ((res.meta.changes ?? 0) === 1) {
+  if ((res?.meta.changes ?? 0) === 1) {
     await audit(env, self, deviceId === self.deviceId ? "device.revoke.self" : "device.revoke", deviceId);
     return json({ ok: true, revoked: 1 });
   }

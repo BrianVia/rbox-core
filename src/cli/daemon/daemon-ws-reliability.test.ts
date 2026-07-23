@@ -159,6 +159,7 @@ async function makeDaemon(remote: MiniRemote = new MiniRemote(), opts: {
   };
   const daemon = new RboxDaemon(root, cfg, { remote, backoff: async () => {} }, {
     bootId: "boot-test",
+    keyDeliveryFlight: null,
     ...opts,
   }) as unknown as DaemonInternals;
   daemon.cache = await HashCache.load(root);

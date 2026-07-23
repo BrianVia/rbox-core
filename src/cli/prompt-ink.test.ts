@@ -7,6 +7,7 @@ import {
   inkConfirm,
   inkInput,
   inkKeypress,
+  inkLoginFallback,
   inkPassword,
   inkSearch,
   inkSecretRenderFailureSelftest,
@@ -120,6 +121,29 @@ describe("Ink prompt runtime", () => {
     const pastedPending = inkInput({ message: "Name", default: "suggested" }, pasted.streams);
     await send(pasted.input, ["\x1b[200~pasted\x1b[201~", "\r"]);
     expect(await pastedPending).toBe("pasted");
+  });
+
+  test("login fallback keeps token and phrase rungs in one Ink mount", async () => {
+    const h = harness();
+    const pending = inkLoginFallback({
+      validPairingToken: (value) => value === "valid-token",
+    }, h.streams);
+    await waitForOutput(h, "paste a pairing token");
+    await send(h.input, ["bad-token", "\r"]);
+    await waitForOutput(h, "24-word recovery phrase");
+    await send(h.input, ["word one two", "\r"]);
+    expect(await pending).toEqual({ kind: "recovery", phrase: "word one two" });
+    expect(h.rawModes.at(-1)).toBe(false);
+  });
+
+  test("login fallback returns a valid pairing token without rendering it", async () => {
+    const h = harness();
+    const pending = inkLoginFallback({
+      validPairingToken: (value) => value === "valid-token",
+    }, h.streams);
+    await send(h.input, ["valid-token", "\r"]);
+    expect(await pending).toEqual({ kind: "pairing", token: "valid-token" });
+    expect(h.output()).not.toContain("valid-token");
   });
 
   test("cursor editing materializes the default before changing it", async () => {

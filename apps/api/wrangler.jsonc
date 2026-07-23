@@ -87,7 +87,11 @@
     { "name": "RL_DEVICE_POLL_IP", "namespace_id": "2005", "simple": { "limit": 600, "period": 60 } },
     { "name": "RL_RELEASE", "namespace_id": "2003", "simple": { "limit": 600, "period": 60 } },
     { "name": "RL_LINK_PAIR", "namespace_id": "2004", "simple": { "limit": 120, "period": 60 } },
-    { "name": "RL_TELEMETRY", "namespace_id": "2006", "simple": { "limit": 120, "period": 60 } }
+    { "name": "RL_TELEMETRY", "namespace_id": "2006", "simple": { "limit": 120, "period": 60 } },
+    { "name": "RL_KEY_DELIVERY_APPROVE", "namespace_id": "2007", "simple": { "limit": 120, "period": 60 } },
+    { "name": "RL_KEY_DELIVERY_FETCH", "namespace_id": "2008", "simple": { "limit": 240, "period": 60 } },
+    { "name": "RL_KEY_DELIVERY_SUBMIT", "namespace_id": "2009", "simple": { "limit": 120, "period": 60 } },
+    { "name": "RL_KEY_DELIVERY_ACK", "namespace_id": "2010", "simple": { "limit": 120, "period": 60 } }
   ],
   // From: for the new-device email; the idempotency pepper is a `wrangler secret`.
   "vars": {
@@ -178,7 +182,11 @@
         { "name": "RL_DEVICE_POLL_IP", "namespace_id": "2005", "simple": { "limit": 120, "period": 60 } },
         { "name": "RL_RELEASE", "namespace_id": "2003", "simple": { "limit": 60, "period": 60 } },
         { "name": "RL_LINK_PAIR", "namespace_id": "2004", "simple": { "limit": 10, "period": 60 } },
-        { "name": "RL_TELEMETRY", "namespace_id": "2006", "simple": { "limit": 20, "period": 60 } }
+        { "name": "RL_TELEMETRY", "namespace_id": "2006", "simple": { "limit": 20, "period": 60 } },
+        { "name": "RL_KEY_DELIVERY_APPROVE", "namespace_id": "2007", "simple": { "limit": 10, "period": 60 } },
+        { "name": "RL_KEY_DELIVERY_FETCH", "namespace_id": "2008", "simple": { "limit": 120, "period": 60 } },
+        { "name": "RL_KEY_DELIVERY_SUBMIT", "namespace_id": "2009", "simple": { "limit": 30, "period": 60 } },
+        { "name": "RL_KEY_DELIVERY_ACK", "namespace_id": "2010", "simple": { "limit": 30, "period": 60 } }
       ],
       // RBOX_ALLOW_BOOTSTRAP_PLAN is EXPLICITLY "0" in prod (the dev-only bootstrap plan
       // override, design 56 §7). Present-but-off because wrangler refuses env-targeted

@@ -17,6 +17,8 @@ import type {
   ConfirmPromptConfig,
   InputPromptConfig,
   KeypressPromptConfig,
+  LoginFallbackAnswer,
+  LoginFallbackPromptConfig,
   PasswordPromptConfig,
   SearchPromptConfig,
   SelectPromptConfig,
@@ -28,6 +30,8 @@ export type {
   CheckboxPromptConfig,
   ConfirmPromptConfig,
   InputPromptConfig,
+  LoginFallbackAnswer,
+  LoginFallbackPromptConfig,
   PasswordPromptConfig,
   PromptChoice,
   SearchPromptConfig,
@@ -87,6 +91,13 @@ export const promptConfirm = (config: ConfirmPromptConfig): Promise<boolean> =>
 /** Pairing/bootstrap bearer values are never echoed or represented by length. */
 export const promptPassword = (config: PasswordPromptConfig): Promise<string> =>
   run((loaded) => loaded.inkPassword(config));
+
+/** Design-189's one-mount fallback ladder. A blank or locally malformed token
+ * replaces the masked editor with visible recovery-phrase entry in-place. */
+export const promptLoginFallback = (
+  config: LoginFallbackPromptConfig,
+): Promise<LoginFallbackAnswer> =>
+  run((loaded) => loaded.inkLoginFallback(config));
 
 export const promptCheckbox: CheckboxPrompt = <V>(config: CheckboxPromptConfig<V>): Promise<V[]> =>
   run((loaded) => loaded.inkCheckbox(config));

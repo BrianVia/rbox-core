@@ -121,8 +121,8 @@ export class RboxApi implements SyncRemote {
     return bootstrapKeys(this.ctx, body);
   }
 
-  getAccountKeys(): Promise<AccountKeysDTO | null> {
-    return getAccountKeys(this.ctx);
+  getAccountKeys(signal?: AbortSignal): Promise<AccountKeysDTO | null> {
+    return getAccountKeys(this.ctx, signal);
   }
 
   getGenesisObservation() {
@@ -134,8 +134,8 @@ export class RboxApi implements SyncRemote {
   }
 
   /** Atomic device-keys + roster admission (C5). 409 → caller refetches + retries. */
-  admitDevice(body: unknown): Promise<{ ok: boolean; conflict?: boolean }> {
-    return admitDevice(this.ctx, body);
+  admitDevice(body: unknown, signal?: AbortSignal): Promise<{ ok: boolean; conflict?: boolean }> {
+    return admitDevice(this.ctx, body, signal);
   }
 
   appendRoster(body: unknown): Promise<{ ok: boolean; conflict?: boolean }> {

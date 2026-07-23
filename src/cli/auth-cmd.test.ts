@@ -192,6 +192,9 @@ test("empty RBOX_APP falls back to the full production approval URL", () => {
   process.env.RBOX_APP = "";
   try {
     expect(deviceApprovalUrl("AAAA-BBBB")).toBe("https://app.rbox.to/cli-login?code=AAAA-BBBB");
+    expect(deviceApprovalUrl("AAAA-BBBB", "fp_value")).toBe(
+      "https://app.rbox.to/cli-login?code=AAAA-BBBB#fp=fp_value",
+    );
   } finally {
     if (previous === undefined) delete process.env.RBOX_APP;
     else process.env.RBOX_APP = previous;
@@ -770,9 +773,14 @@ describe("device-code login rate-limit / device-cap tolerance (design 64 §3.3)"
       const url = String(input);
       if (url.endsWith("/v1/auth/device/start")) {
         startCalls++;
-        expect(JSON.parse(String(init?.body))).toEqual({ label: "rig-a-onboard-smoke" });
-        if (startCalls === 1) return new Response(JSON.stringify({ error: "rate_limited" }), { status: 429, headers: { "Retry-After": "0" } });
-        return new Response(JSON.stringify({ deviceCode: "dc_retry", userCode: "AAAA-BBBB", interval: 0, expiresIn: 60 }));
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        expect(body.label).toBe("rig-a-onboard-smoke");
+        expect(String(body.encPubKey)).toMatch(/^[A-Za-z0-9_-]+$/);
+        expect(String(body.sigPubKey)).toMatch(/^[A-Za-z0-9_-]{43}$/);
+        if (startCalls === 1) {
+          return new Response(JSON.stringify({ error: "rate_limited", retryAfterSeconds: 0 }), { status: 429 });
+        }
+        return new Response(JSON.stringify({ deviceCode: "a".repeat(64), userCode: "AAAA-BBBB", interval: 0, expiresIn: 60 }));
       }
       if (url.endsWith("/v1/auth/device/poll")) return new Response(JSON.stringify({ status: "approved", token: "tok" }));
       throw new Error(`unexpected fetch: ${url}`);
@@ -789,10 +797,12 @@ describe("device-code login rate-limit / device-cap tolerance (design 64 §3.3)"
     let pollCalls = 0;
     globalThis.fetch = (async (input: string | URL | Request) => {
       const url = String(input);
-      if (url.endsWith("/v1/auth/device/start")) return new Response(JSON.stringify({ deviceCode: "dc_poll", userCode: "AAAA-BBBB", interval: 0, expiresIn: 60 }));
+      if (url.endsWith("/v1/auth/device/start")) return new Response(JSON.stringify({ deviceCode: "b".repeat(64), userCode: "AAAA-BBBB", interval: 0, expiresIn: 60 }));
       if (url.endsWith("/v1/auth/device/poll")) {
         pollCalls++;
-        if (pollCalls === 1) return new Response(JSON.stringify({ error: "rate_limited" }), { status: 429, headers: { "Retry-After": "not-a-number" } });
+        if (pollCalls === 1) {
+          return new Response(JSON.stringify({ error: "rate_limited", retryAfterSeconds: 0 }), { status: 429 });
+        }
         return new Response(JSON.stringify({ status: "approved", token: "tok" }));
       }
       throw new Error(`unexpected fetch: ${url}`);
@@ -808,7 +818,7 @@ describe("device-code login rate-limit / device-cap tolerance (design 64 §3.3)"
     const sleeps = installImmediateTimers();
     globalThis.fetch = (async (input: string | URL | Request) => {
       const url = String(input);
-      if (url.endsWith("/v1/auth/device/start")) return new Response(JSON.stringify({ deviceCode: "dc_cap", userCode: "AAAA-BBBB", interval: 0, expiresIn: 60 }));
+      if (url.endsWith("/v1/auth/device/start")) return new Response(JSON.stringify({ deviceCode: "c".repeat(64), userCode: "AAAA-BBBB", interval: 0, expiresIn: 60 }));
       if (url.endsWith("/v1/auth/device/poll")) return new Response(JSON.stringify({ error: "device_limit_reached", cap: 2, plan: "none" }), { status: 409 });
       throw new Error(`unexpected fetch: ${url}`);
     }) as typeof fetch;
@@ -825,7 +835,7 @@ describe("device-code approval validation", () => {
     globalThis.fetch = (async (input: string | URL | Request) => {
       const url = String(input);
       if (url.endsWith("/v1/auth/device/start")) {
-        return new Response(JSON.stringify({ deviceCode: "dc_malformed", userCode: "ABC123", interval: 0, expiresIn: 60 }));
+        return new Response(JSON.stringify({ deviceCode: "d".repeat(64), userCode: "ABC123", interval: 0, expiresIn: 60 }));
       }
       if (url.endsWith("/v1/auth/device/poll")) {
         return new Response(JSON.stringify({ status: "approved", token: "tok", deviceId: "dev_approval" }));
@@ -852,7 +862,7 @@ test("device-code login leaves the shared workspace step to the enrolled-elsewhe
   globalThis.fetch = (async (input: string | URL | Request) => {
     const url = String(input);
     if (url.endsWith("/v1/auth/device/start")) {
-      return new Response(JSON.stringify({ deviceCode: "dc_success", userCode: "AAAA-BBBB", interval: 0, expiresIn: 60 }));
+      return new Response(JSON.stringify({ deviceCode: "e".repeat(64), userCode: "AAAA-BBBB", interval: 0, expiresIn: 60 }));
     }
     if (url.endsWith("/v1/auth/device/poll")) {
       return new Response(JSON.stringify({ status: "approved", token: "tok", deviceId: "dev_success", accountId: "acct_1000000000000007" }));

@@ -174,7 +174,7 @@ async function makeDaemon(
   cfgOverrides: Partial<WorkspaceConfig> = {},
 ): Promise<DaemonInternals> {
   const cfg = testConfig(cfgOverrides);
-  const daemon = new RboxDaemon(root, cfg, { remote, backoff: async () => {} }, { bootId, ...opts }) as unknown as DaemonInternals;
+  const daemon = new RboxDaemon(root, cfg, { remote, backoff: async () => {} }, { bootId, keyDeliveryFlight: null, ...opts }) as unknown as DaemonInternals;
   daemons.push(daemon);
   daemon.cache = await HashCache.load(root);
   daemon.manifest = await scanManifest(root);

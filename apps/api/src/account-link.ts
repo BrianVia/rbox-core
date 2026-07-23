@@ -274,6 +274,7 @@ export async function confirmLink(req: Request, env: Env, nowMs: number): Promis
       // reclaimable shell — it implies a durable device, which blocks below — so it's a
       // COVERED blocker, not a cleaned row.) account-data plane (origin shell's shard).
       dbFor(env, shell).prepare(`DELETE FROM account_notify_prefs WHERE account_id = ? AND ${orphan}`).bind(shell, shell),
+      dbFor(env, shell).prepare(`DELETE FROM account_key_delivery_prefs WHERE account_id = ? AND ${orphan}`).bind(shell, shell),
       // §33/§9.5: blob_ref_candidates is a transient Phase-1 GC marker. It can only exist
       // alongside a blob_refs row (a COVERED blocker → br>0 fails judgeReclaimable), so this
       // is defensive (no-op on a truly-reclaimable shell), but clean it like the other shell
@@ -344,6 +345,8 @@ async function loadShellState(env: Env, accountId: string, nowMs: number): Promi
          (SELECT COUNT(*) FROM pairing_tokens WHERE account_id = ?1 AND consumed_at IS NULL AND expires_at > ?2) AS pt,
          (SELECT COUNT(*) FROM device_auth WHERE account_id = ?1 AND status IN ('pending','approved') AND expires_at > ?2) AS da,
          (SELECT COUNT(*) FROM device_notifications WHERE account_id = ?1) AS dn,
+         (SELECT COUNT(*) FROM key_delivery WHERE account_id = ?1) AS kd,
+         (SELECT COUNT(*) FROM device_token_escrow WHERE account_id = ?1) AS dte,
          (SELECT COUNT(*) FROM diagnostics_reports WHERE account_id = ?1) AS dr,
          (SELECT COUNT(*) FROM commits WHERE workspace_id IN (SELECT workspace_id FROM workspaces WHERE account_id = ?1)) AS cm,
          (SELECT COUNT(*) FROM clerk_users WHERE account_id = ?1) AS cu,
@@ -367,7 +370,7 @@ function judgeReclaimable(r: ShellState | null, opts: { ignoreBilling?: boolean 
   // so a "web shell" holding one is not the empty shell this destructive path assumes.
   // `apik` (api_keys) likewise: keys are minted by device principals AND their devices rows
   // carry expires_at, so `durdev` alone would never see them.
-  for (const k of ["ak", "dk", "ro", "aks", "wk", "durdev", "apik", "ws", "br", "up", "pt", "da", "dn", "cm", "dr"]) if (Number(r[k]) !== 0) return false;
+  for (const k of ["ak", "dk", "ro", "aks", "wk", "durdev", "apik", "ws", "br", "up", "pt", "da", "dn", "kd", "dte", "cm", "dr"]) if (Number(r[k]) !== 0) return false;
   if (Number(r.cu) > 1 || Number(r.own) > 1) return false; // only this Clerk id + its one owner membership
   return true;
 }

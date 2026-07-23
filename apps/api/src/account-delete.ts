@@ -160,6 +160,10 @@ export async function deleteAccount(env: Env, p: Principal, req: Request, nowMs:
   await data.batch([
     data.prepare("UPDATE accounts SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL").bind(nowMs, p.accountId),
     dirDb(env).prepare("UPDATE devices SET revoked = 1 WHERE account_id = ? AND revoked = 0").bind(p.accountId),
+    dirDb(env).prepare(
+      "UPDATE key_delivery SET state='expired',wrap_blob=NULL,published_roster_version=NULL WHERE account_id=? AND state IN ('queued','fulfilled')",
+    ).bind(p.accountId),
+    dirDb(env).prepare("DELETE FROM device_token_escrow WHERE account_id=?").bind(p.accountId),
     data
       .prepare("INSERT OR IGNORE INTO account_deletions (account_id, requested_at, purge_after, status, confirmed_with) VALUES (?, ?, ?, 'pending', ?)")
       .bind(p.accountId, nowMs, purgeAfter, match.with),
@@ -374,6 +378,9 @@ export async function finishD1(env: Env, accountId: string, clerkIds: string[], 
     ),
     // directory plane:
     dir.prepare("DELETE FROM pairing_tokens WHERE account_id = ?").bind(a),
+    dir.prepare("DELETE FROM device_token_escrow WHERE account_id = ?").bind(a),
+    dir.prepare("DELETE FROM key_delivery WHERE account_id = ?").bind(a),
+    dir.prepare("DELETE FROM account_key_delivery_prefs WHERE account_id = ?").bind(a),
     dir.prepare("DELETE FROM device_auth WHERE account_id = ?").bind(a),
     dir.prepare("DELETE FROM api_keys WHERE account_id = ?").bind(a),
     dir.prepare("DELETE FROM devices WHERE account_id = ?").bind(a),
