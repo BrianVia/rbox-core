@@ -6,6 +6,7 @@ import type { DirCache, DirCacheChild } from "./dircache.js";
 import { hashBytes, hashFile } from "./hash.js";
 import { HashCache, type HashCacheStatIdentity } from "./hashcache.js";
 import type { IgnoreMatcher } from "./ignore.js";
+import { isAbsent } from "./fsutil.js";
 import { isSafeRelPath } from "./manifest-validate.js";
 import { statsStableAcrossHash } from "./manifest.js";
 import type { Action } from "./reconcile.js";
@@ -98,15 +99,6 @@ function indeterminate(why: string): Extract<OracleVerdict, { kind: "indetermina
   return { kind: "indeterminate", why };
 }
 
-function errorCode(error: unknown): string | undefined {
-  return (error as NodeJS.ErrnoException | undefined)?.code;
-}
-
-function isAbsentError(error: unknown): boolean {
-  const code = errorCode(error);
-  return code === "ENOENT" || code === "ENOTDIR";
-}
-
 function tokenKind(st: Stats): Exclude<TokenKind, "absent"> {
   if (st.isFile()) return "file";
   if (st.isDirectory()) return "dir";
@@ -130,7 +122,7 @@ async function readToken(abs: string): Promise<FsToken> {
   try {
     return tokenFromStat(await fs.lstat(abs));
   } catch (error) {
-    if (isAbsentError(error)) return { kind: "absent" };
+    if (isAbsent(error)) return { kind: "absent" };
     throw error;
   }
 }
@@ -319,7 +311,7 @@ async function defaultReceiverEquivalenceProbe(root: string): Promise<ReceiverEq
         const [sa, sb] = await Promise.all([fs.lstat(a), fs.lstat(b)]);
         return sa.dev === sb.dev && sa.ino === sb.ino;
       } catch (error) {
-        if (isAbsentError(error)) return false;
+        if (isAbsent(error)) return false;
         throw error;
       } finally {
         await fs.rm(a, { force: true });
@@ -520,7 +512,7 @@ class ManifestOracle implements AppliedManifestOracle {
     try {
       st = await fs.lstat(abs);
     } catch (error) {
-      return isAbsentError(error) ? mismatch([actualPath]) : indeterminate("repo entry could not be read");
+      return isAbsent(error) ? mismatch([actualPath]) : indeterminate("repo entry could not be read");
     }
     if (expected.type === "symlink") {
       if (!st.isSymbolicLink()) return mismatch([actualPath]);

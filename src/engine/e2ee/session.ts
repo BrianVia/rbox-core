@@ -34,6 +34,29 @@ export interface DeviceSecrets {
   encPrivPkcs8: Uint8Array;
 }
 
+/** Assemble the local {@link DeviceSecrets} record from a device's freshly
+ *  generated (or reused) keypairs + MK. Pure field packaging — no key derivation,
+ *  wrapping, or zeroization — shared by bootstrap, pairing redemption, and recovery
+ *  admission, which build the identical shape from the identical inputs. */
+function deviceSecretsFrom(accountId: string, deviceId: string, mk: Uint8Array, sig: SignKeyPair, enc: WrapKeyPair): DeviceSecrets {
+  return {
+    accountId,
+    deviceId,
+    mk,
+    sigPubKey: sig.publicKey,
+    sigPrivPkcs8: signPrivateToPkcs8(sig.privateKey),
+    encPubSpki: enc.publicKeySpki,
+    encPrivPkcs8: wrapPrivateToPkcs8(enc.privateKey),
+  };
+}
+
+/** Assemble the server-facing device upload object (public halves + this device's
+ *  MK wrap) that accompanies each secrets record. Pure field packaging — the wrap
+ *  is produced by the caller; this only b64url-encodes the public keys. */
+function deviceUploadFrom(deviceId: string, sig: SignKeyPair, enc: WrapKeyPair, mkWrap: Wrap): { deviceId: string; sigPubKey: string; encPubKey: string; mkWrap: Wrap } {
+  return { deviceId, sigPubKey: toB64url(sig.publicKey), encPubKey: toB64url(enc.publicKeySpki), mkWrap };
+}
+
 function rosterEntry(deviceId: string, kind: "device" | "recovery", sigPubKey: Uint8Array, encPubSpki: Uint8Array, addedAt: number, mkWrapHash?: string): RosterEntry {
   return {
     deviceId,
@@ -116,22 +139,14 @@ export async function bootstrapAccount(accountId: string, deviceId: string, now:
   });
 
   return {
-    secrets: {
-      accountId,
-      deviceId,
-      mk,
-      sigPubKey: sig.publicKey,
-      sigPrivPkcs8: signPrivateToPkcs8(sig.privateKey),
-      encPubSpki: enc.publicKeySpki,
-      encPrivPkcs8: wrapPrivateToPkcs8(enc.privateKey),
-    },
+    secrets: deviceSecretsFrom(accountId, deviceId, mk, sig, enc),
     recoveryPhrase: await rkToPhrase(rk),
     upload: {
       recoveryWrap,
       recoveryWrapId,
       genesisRoster,
       genesisKeyState,
-      device: { deviceId, sigPubKey: toB64url(sig.publicKey), encPubKey: toB64url(enc.publicKeySpki), mkWrap: deviceWrap },
+      device: deviceUploadFrom(deviceId, sig, enc, deviceWrap),
     },
   };
 }
@@ -510,16 +525,8 @@ export async function redeemPairing(args: {
   });
 
   return {
-    secrets: {
-      accountId: args.accountId,
-      deviceId: args.deviceId,
-      mk,
-      sigPubKey: sig.publicKey,
-      sigPrivPkcs8: signPrivateToPkcs8(sig.privateKey),
-      encPubSpki: enc.publicKeySpki,
-      encPrivPkcs8: wrapPrivateToPkcs8(enc.privateKey),
-    },
-    device: { deviceId: args.deviceId, sigPubKey: toB64url(sig.publicKey), encPubKey: toB64url(enc.publicKeySpki), mkWrap: selfWrap },
+    secrets: deviceSecretsFrom(args.accountId, args.deviceId, mk, sig, enc),
+    device: deviceUploadFrom(args.deviceId, sig, enc, selfWrap),
     admissionRoster,
   };
 }
@@ -561,16 +568,8 @@ export async function buildRecoveryAdmission(args: {
   const admissionRoster = await buildAdminRoster(prevBody, [...prevBody.devices, newEntry], "recovery", rsk);
 
   return {
-    secrets: {
-      accountId: args.accountId,
-      deviceId: args.deviceId,
-      mk,
-      sigPubKey: sig.publicKey,
-      sigPrivPkcs8: signPrivateToPkcs8(sig.privateKey),
-      encPubSpki: enc.publicKeySpki,
-      encPrivPkcs8: wrapPrivateToPkcs8(enc.privateKey),
-    },
-    device: { deviceId: args.deviceId, sigPubKey: toB64url(sig.publicKey), encPubKey: toB64url(enc.publicKeySpki), mkWrap: selfWrap },
+    secrets: deviceSecretsFrom(args.accountId, args.deviceId, mk, sig, enc),
+    device: deviceUploadFrom(args.deviceId, sig, enc, selfWrap),
     admissionRoster,
   };
 }

@@ -5,7 +5,7 @@ import { sameContent } from "./diff.js";
 import { hashBytes, hashFile } from "./hash.js";
 import { BLOB_CIPHERTEXT_TAG_BYTES, decryptFileToPath } from "./crypto.js";
 import { withCryptoPool } from "./crypto-pool.js";
-import { assertWithinRoot, RBOX_TMP_PREFIX } from "./fsutil.js";
+import { assertWithinRoot, claimUnclobberedName, isAbsent, RBOX_TMP_PREFIX } from "./fsutil.js";
 import { conflictName, type Action } from "./reconcile.js";
 import { poolMap } from "./pool.js";
 import type { TrashBatch } from "./trash.js";
@@ -147,7 +147,7 @@ export async function applyActions(
           const st = await fs.lstat(path.join(destRoot, comp));
           if (st.isFile() || st.isSymbolicLink()) obstructed.add(comp);
         } catch (error) {
-          if (hasErrorCode(error, "ENOENT") || hasErrorCode(error, "ENOTDIR")) continue;
+          if (isAbsent(error)) continue;
           throw error;
         }
       }
@@ -411,7 +411,7 @@ export async function restoreEntryToPath(
     let previousCopyTrashed = false;
     if (opts.trash) {
       const exists = await fs.lstat(abs).then(() => true, (error: unknown) => {
-        if (hasErrorCode(error, "ENOENT") || hasErrorCode(error, "ENOTDIR")) return false;
+        if (isAbsent(error)) return false;
         throw error;
       });
       if (exists) {
@@ -464,7 +464,7 @@ async function currentEntryAt(destRoot: string, rel: string): Promise<FileEntry 
   } catch (e) {
     // ENOTDIR: a parent component is a file (or was evicted to trash) — the target
     // can't exist, so it's already gone.
-    if (hasErrorCode(e, "ENOENT") || hasErrorCode(e, "ENOTDIR")) return undefined;
+    if (isAbsent(e)) return undefined;
     throw e;
   }
   if (st.isSymbolicLink()) {
@@ -484,44 +484,17 @@ async function moveAside(destRoot: string, fromRel: string, toRel: string): Prom
   const from = path.join(destRoot, fromRel);
   countLstat();
   const st = await fs.lstat(from);
-  let to = path.join(destRoot, toRel);
-  await mkdirCounted(path.dirname(to));
-  for (let i = 2; ; i++) {
-    if (await moveNoClobber(from, to, st)) return;
-    to = path.join(destRoot, `${toRel}~${i}`);
-  }
-}
-
-/** Move without overwriting an existing conflict name. Each destination claim is
- * exclusive at the filesystem operation itself, avoiding access-then-rename races. */
-async function moveNoClobber(from: string, to: string, st: { isDirectory(): boolean; isSymbolicLink(): boolean }): Promise<boolean> {
-  try {
-    if (st.isDirectory()) {
-      let ok = false;
-      try {
-        await fs.mkdir(to);
-        ok = true;
-      } finally {
-        countMkdir(ok);
-      }
-      await fs.rename(from, to);
-      countRename();
-    } else if (st.isSymbolicLink()) {
-      await fs.symlink(await fs.readlink(from), to);
-      await fs.unlink(from);
-    } else {
-      await fs.link(from, to);
-      await fs.unlink(from);
-    }
-    return true;
-  } catch (e) {
-    if (hasErrorCode(e, "EEXIST")) return false;
-    throw e;
-  }
-}
-
-function hasErrorCode(error: unknown, code: string): boolean {
-  return typeof error === "object" && error !== null && "code" in error && error.code === code;
+  // The conflict destination shares its parent directory with `toRel` (only the
+  // basename gains a `~N` suffix), so the parent is created once here — the
+  // caller (writeEntry/deleteEntry) already ran assertWithinRoot on this subtree.
+  await mkdirCounted(path.dirname(path.join(destRoot, toRel)));
+  await claimUnclobberedName({
+    from,
+    st,
+    baseRel: toRel,
+    toAbs: (rel) => path.join(destRoot, rel),
+    hooks: { onMkdir: countMkdir, onRename: countRename },
+  });
 }
 
 
