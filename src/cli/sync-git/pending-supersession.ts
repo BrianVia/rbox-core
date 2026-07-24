@@ -17,6 +17,7 @@ import { getGitArtifact, git, headBranchOf, type RepoCtx } from "../../engine/gi
 import { graphEnv } from "../../engine/git/reachability.js";
 import { validateCanonicalGitConfig } from "../../engine/git/config-sync.js";
 import { gitFingerprint, gitFingerprintRun } from "./fingerprint.js";
+import { gitCommitAncestry } from "./git-ancestry.js";
 import { gitIncomingKey, sectionOpState } from "./shared.js";
 import { indexArtifact } from "./follow.js";
 import type { FingerprintHitProbeResult } from "./divergence-cache.js";
@@ -176,18 +177,7 @@ async function pendingIndexIsCleanAndPlain(
 }
 
 async function equalOrFastForward(repoDir: string, pendingOid: string, candidateOid: string): Promise<boolean> {
-  const [pendingCommit, candidateCommit] = await Promise.all([
-    git(repoDir, ["rev-parse", "--verify", `${pendingOid}^{commit}`], { env: graphEnv }),
-    git(repoDir, ["rev-parse", "--verify", `${candidateOid}^{commit}`], { env: graphEnv }),
-  ]);
-  if (pendingCommit === candidateCommit) return true;
-  try {
-    await git(repoDir, ["merge-base", "--is-ancestor", pendingCommit, candidateCommit], { env: graphEnv });
-    return true;
-  } catch (error) {
-    if ((error as { code?: unknown }).code === 1) return false;
-    throw error;
-  }
+  return (await gitCommitAncestry(repoDir, pendingOid, candidateOid)) !== "not-ancestor";
 }
 
 /** Candidate-bound, fail-closed proof over the exact final normalized section. */

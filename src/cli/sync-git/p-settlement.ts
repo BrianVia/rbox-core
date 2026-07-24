@@ -25,7 +25,7 @@ import {
   type StateSaveOptions,
   type SyncState,
 } from "../sync-state-model.js";
-import type { BranchTransitionWitness, RepoBaseProof } from "./base-composer.js";
+import { presentWitnessFromPreparedRef, type RepoBaseProof } from "./base-composer.js";
 import { MutationGateClosedError, type MutationBoundary, type MutationLease } from "../../engine/mutation-gate.js";
 
 export type ExactPSettlementResult =
@@ -39,20 +39,6 @@ class PSettlementMovementError extends Error {
     super(message);
     this.name = "PSettlementMovementError";
   }
-}
-
-function witnessFor(p: PreparedProtocolRef<BasePresentPayload>): Extract<BranchTransitionWitness, { kind: "present" }> {
-  return {
-    kind: "present",
-    ref: p.payload.ref,
-    priorOid: p.payload.priorOid,
-    nextOid: p.payload.nextOid,
-    lineageHash: p.payload.lineageHash,
-    repositoryIdentityHash: p.payload.repositoryIdentityHash,
-    artifactRef: p.ref,
-    artifactOid: p.targetOid,
-    episode: p.payload.episode,
-  };
 }
 
 function exactEpisodeTop(bytes: Uint8Array, payload: BasePresentPayload): boolean {
@@ -126,7 +112,7 @@ export async function settleExactPresentArtifact(input: {
           if (before !== payload.priorOid && before !== payload.nextOid) {
             throw new PSettlementMovementError("base-shape", "P settlement BASE is a later value");
           }
-          const witness = witnessFor(input.p);
+          const witness = presentWitnessFromPreparedRef(input.p);
           const refs = { ...record.base.refs, [payload.ref]: payload.nextOid };
           const proof: RepoBaseProof = {
             authority: {

@@ -13,8 +13,11 @@ import type { BasePresentPayload, PreparedProtocolRef } from "../../engine/git/b
 import { parsePRepairReceipt, type PRepairReceipt } from "../../engine/git/p-repair.js";
 import type { PRepairStatePort, PRepairStateSnapshot } from "../../engine/git/p-repair-transaction.js";
 import type { GitRefScope } from "../../engine/types.js";
-import type { BranchTransitionWitness, RepoBaseProof } from "./base-composer.js";
-import { carryRepoBaseProof } from "./base-composer.js";
+import {
+  carryRepoBaseProof,
+  presentWitnessFromPreparedRef,
+  type RepoBaseProof,
+} from "./base-composer.js";
 
 export interface PRepairStatePortInput {
   root: string;
@@ -31,6 +34,16 @@ export type PRepairReceiptStatePortInput = Omit<PRepairStatePortInput, "p"> & { 
 
 const counter = (value: unknown): number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
 
+function defaultPRepairPartial(episode: string): NonNullable<RepoRecord["partial"]> {
+  return {
+    incomingKey: `p:${episode}`,
+    checkoutPending: true,
+    appliedRefs: {},
+    heldRefs: {},
+    configApplied: true,
+  };
+}
+
 function snapshot(stateRevision: number, record: RepoRecord, ref: string): PRepairStateSnapshot {
   return {
     repoGen: record.repoGen,
@@ -45,24 +58,10 @@ function sameSnapshot(left: PRepairStateSnapshot, right: PRepairStateSnapshot): 
     && left.incomingKey === right.incomingKey && left.baseOid === right.baseOid;
 }
 
-function witnessFor(p: PreparedProtocolRef<BasePresentPayload>): Extract<BranchTransitionWitness, { kind: "present" }> {
-  return {
-    kind: "present",
-    ref: p.payload.ref,
-    priorOid: p.payload.priorOid,
-    nextOid: p.payload.nextOid,
-    lineageHash: p.payload.lineageHash,
-    repositoryIdentityHash: p.payload.repositoryIdentityHash,
-    artifactRef: p.ref,
-    artifactOid: p.targetOid,
-    episode: p.payload.episode,
-  };
-}
-
 /** Concrete composer-backed state port used while the final Git transaction is
  * prepared. It changes only BASE[R] and the exact P-bound partial member. */
 export function createPRepairStatePort(input: PRepairStatePortInput): PRepairStatePort {
-  const witness = witnessFor(input.p);
+  const witness = presentWitnessFromPreparedRef(input.p);
   const receiptOnly = async (
     expected: PRepairStateSnapshot,
     mode: "replace" | "compact" | "restore",
@@ -75,13 +74,7 @@ export function createPRepairStatePort(input: PRepairStatePortInput): PRepairSta
     if (!state || state.stream !== input.stream) return "rejected";
     const record = repoRecordsForState(state)[input.relPath];
     if (!record || !sameSnapshot(snapshot(counter(state.stateRevision), record, witness.ref), expected)) return "rejected";
-    const existingPartial = record.partial ?? {
-      incomingKey: `p:${witness.episode}`,
-      checkoutPending: true,
-      appliedRefs: {},
-      heldRefs: {},
-      configApplied: true,
-    };
+    const existingPartial = record.partial ?? defaultPRepairPartial(witness.episode);
     const current = existingPartial.pRepaired?.[witness.ref];
     if ((mode === "replace" || mode === "compact") && JSON.stringify(current) !== JSON.stringify(prior ?? receipt)) return "rejected";
     if (mode === "restore" && current !== undefined) return "rejected";
@@ -132,13 +125,7 @@ export function createPRepairStatePort(input: PRepairStatePortInput): PRepairSta
         || !record.base) return "rejected";
       const refs = { ...record.base.refs };
       if (nextBaseOid === null) delete refs[witness.ref]; else refs[witness.ref] = nextBaseOid;
-      const existingPartial = record.partial ?? {
-        incomingKey: `p:${witness.episode}`,
-        checkoutPending: true,
-        appliedRefs: {},
-        heldRefs: {},
-        configApplied: true,
-      };
+      const existingPartial = record.partial ?? defaultPRepairPartial(witness.episode);
       const appliedRefs = { ...existingPartial.appliedRefs };
       delete appliedRefs[witness.ref];
       const partial = {

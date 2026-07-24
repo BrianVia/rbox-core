@@ -143,6 +143,13 @@ test("final candidate proof accepts equal/FF branches and rejects missing or non
   expect(await provePendingSupersession({ ctx, pending: section(a), candidate: section(b), store: unusedStore, kek: Buffer.alloc(32) })).toBe(true);
   expect(await provePendingSupersession({
     ctx,
+    pending: section("f".repeat(40)),
+    candidate: section(b),
+    store: unusedStore,
+    kek: Buffer.alloc(32),
+  })).toBe(false);
+  expect(await provePendingSupersession({
+    ctx,
     pending: section(a, { refs: { "refs/heads/main": a, "refs/heads/side": a } }),
     candidate: section(b), store: unusedStore, kek: Buffer.alloc(32),
   })).toBe(false);

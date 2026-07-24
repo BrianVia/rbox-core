@@ -1,4 +1,9 @@
-import type { GitRefScope, GitSection } from "../../engine/index.js";
+import type {
+  BasePresentPayload,
+  GitRefScope,
+  GitSection,
+  PreparedProtocolRef,
+} from "../../engine/index.js";
 
 const HEX40 = /^[0-9a-f]{40}$/;
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -61,6 +66,22 @@ export type BranchTransitionWitness =
       artifactOid: string;
       episode: string;
     };
+
+export function presentWitnessFromPreparedRef(
+  p: PreparedProtocolRef<BasePresentPayload>,
+): Extract<BranchTransitionWitness, { kind: "present" }> {
+  return {
+    kind: "present",
+    ref: p.payload.ref,
+    priorOid: p.payload.priorOid,
+    nextOid: p.payload.nextOid,
+    lineageHash: p.payload.lineageHash,
+    repositoryIdentityHash: p.payload.repositoryIdentityHash,
+    artifactRef: p.ref,
+    artifactOid: p.targetOid,
+    episode: p.payload.episode,
+  };
+}
 
 export interface LockedBranchProof {
   liveOid: string | null;
