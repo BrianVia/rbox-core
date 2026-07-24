@@ -58,4 +58,9 @@ behaviors. Then extract `executeOp(op, syncMutex, {recovery})`; the
 push-conflict preflight (:1526-1542) stays a recovery-only wrapper. The
 existing daemon-safety / recovery-policy suites are the harness base.
 
-Status: AWAITING FOUNDER RULINGS on D1-D4 (recommendations above).
+Status: RULED (founder, 2026-07-24) — all four as recommended: D1 unify
+(recovery scans clear watcher-degraded), D2 unify (recovery fullScan arms the
+out-of-storage probe), D3 unify (recovery pull consumes AND records notify
+latency), D4 keep the exclusion, documented at the guard and re-expressed
+explicitly in executeOp. Implementation: characterization tests first, then
+the executeOp extraction.
