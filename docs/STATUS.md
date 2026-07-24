@@ -128,8 +128,73 @@ CODEMAP amendment gates every API split) and roots/rootsInspect is a two-copy
 reachability oracle feeding GC deletion AND fair-use billing. Tier D: `src/wire/`
 shared contract (the CLI has two parsers for one 409; one mis-reads epoch_stale
 as `{head: undefined}`) — the only finding with external-user exposure.
-NEXT: implement 197, the 193 live smoke suite, or sweep Tier 3; Mac's 2 repo
-deferrals still founder-pending._
+**LATE NIGHT PART 2 — codex adversarially reviewed the 8 merged commits and found
+2 SHIPPING REGRESSIONS we introduced; both fixed and merged.** (a) **#442** — #435's
+per-command flag arity broke the deprecated `link` alias: it declares no flags of
+its own, so `rbox link --git false <path>` fell to the union fallback (colliding
+names pinned valueless), tracked `./false`, ignored the real path and turned git
+sync ON. Fixed with one canonical `resolveCommandAlias` consulted by
+`longFlagArityFor`; found a 2nd alias (`daemon`→`start`) and pinned both in the
+registry guard. (b) **#441** — #432's requeue-inside-batch was correct but became
+UNCONDITIONAL, so a late `customer.subscription.deleted` for a deleted account
+inserted a `fairuse_account_queue` row with no FK; the scheduler (one account per
+invocation) acquired the ghost, failed `account_missing`, and requeued it +1h
+forever, permanently consuming capacity. Fixed by conditioning the insert in SQL
+on a live account matching `id` AND `stripe_customer_id` (the sibling UPDATE nulls
+`stripe_subscription_id` but not the customer id), plus draining on
+`account_missing` instead of requeuing — which also clears ghosts already in prod.
+Codex CLEARED #436 (tolerated `mpu.complete()` cannot publish partial bytes — the
+canonical `put` verifies full SHA-256) and independently re-verified #433's
+six no-op call sites. It also caught that #437's black-hole test **passes before
+the fix** (`fetchAccountSummary` already had a timeout) — that agent claimed
+red→green and was wrong. **PROD PROMOTED** (founder `main:production`, 20 commits,
+NO new migrations, dev-verified first): the >90 MiB multipart data-loss fix, viewer
+gate, account-delete guard, ghost fix, Tier 2 API refactor all live; deploy green,
+prod worker 401/200. **RETRUST FLIPPED DEFAULT-ON (#443).** Design 104's named
+bake condition was never run — nobody had executed that code against a real
+FSEvents stream (every test drives an injected seam). Soaked on the Mac and PASSED
+on the first real drop: classifier matched the REAL kernel string, `window=1/6
+wouldFuse=n`, re-trust in 70s, `confirmed=0` AND `unattributable=0` on both deep
+scans, and Layer A pruning restored (37 `dc:hit` vs 1 `dc:unpruned`). Kill switch
+is now `RBOX_WATCHER_RETRUST=0`; suite pins legacy via test-preload
+(`RBOX_FILES_FIRST` precedent) and the 3 OFF-path tests now spell OFF as `"0"`
+(under a kill switch `delete` means ON — `watcher-retrust.test.ts:154` would have
+hard-broken). **MAC**: `/usr/local/bin/rbox` (a Max-Howell-style experiment, 1.7.22,
+resurrected every boot by the launchd plist and un-upgradable) REMOVED, back on
+`~/.rbox/bin` + PATH; both artifacts archived in `~/Downloads`. Running
+`1.9.0-dev+4a96f0d`; revert at `~/.rbox/bin/rbox-1.9.0-release.bak`.
+**DESIGN 200 (PR #440) — worktree lifecycle resilience**, from two live wedges on
+the Mac: a spent worktree defers the whole repo (`sync-git/apply.ts:1447-1450`
+escalates ANY held ref, contradicting design 116 invariant #4) and squash-merge
+makes it unrecognizable (there is **no `--merged`, no patch-id, no cherry anywhere
+in `src/`**); and a published-then-deleted branch leaves BASE positive forever
+(`base-composer.ts:357` publisher-ack cannot remove a BASE member — by design)
+with no manual exit (`resolve-command.ts:658-665` refuses that shape by name).
+Founder RULED: publish the deletion fleet-wide; breaker defers at max(25, 25%);
+no pin CONDITIONAL on recoverability; double-proof not a settling window; **P4
+per-ref pending lane IN SCOPE** (overruled the doc's follow-up rec); doctor gains a
+worktree section, no absolute paths yet. v2 revision found the Q3 premise is true
+only via a SECOND constant (`TOMBSTONE_PIN_RETENTION_MS` keep-pins made by
+FOLLOWERS when they prune, not the tombstone itself) — and **FALSE for
+single-device workspaces**, kept open as **Q3a (needs a founder call)**. Also:
+`expireTombstoneKeepPins` has no production caller. Corrections logged: the
+breaker precedent is design **108** (`max(20%,1000)` push-side), not 44
+(`≥100 ∧ ≥50%` pull-side); `redactGitLogLines` is a grammar allowlist, NOT a path
+scrubber, with 2 holes. P4 stages default-OFF under the named-bake exception —
+not for cost but because a bad merged section publishes fleet-wide and
+`gitIncomingKey` moves, so revert is not free. Codex `/arbitrage` round running.
+Bonus find: the sync path still uses the UNBATCHED per-tip ownership proof
+(`reachability.ts:106-126`) while design 128's batched version is wired only to
+`rbox git resolve` — likely where much of the 9s (and 867s wedged) `ownershipMs`
+lives; follow-up to design 174.
+NEXT: Q3a founder call; implement 200 in landing order P2→P3→P1+P1b→P4; 197;
+the 193 live smoke suite; sweep Tier 3. Mac's 2 repo deferrals persist by design
+until 200 lands (rbox-core = the phantom `fix/coupon-slack-notification`, a real
+squash-merged-then-deleted branch; savvy-core-v1 = `prepared Git child incarnation
+unavailable`, `checkout-txn.ts:420` — three-state probe crammed into two, the
+mirror of #433). Unfixed from codex's review: #438's latch can lose the shutdown
+exception if a progress callback throws (its test forces concurrency=1 so does not
+prove multi-worker drain), and #439 can surface absolute paths in LOCAL logs._
 
 _Previous: 2026-07-24 (**189 SHIPPED — v1.9.0 released + promoted to prod;
 validated end-to-end on two real machines**). Design 189 (web-approved pairing)
