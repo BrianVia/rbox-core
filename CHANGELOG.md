@@ -6,6 +6,23 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.9.0] — 2026-07-23 — "add a machine from the web"
+
+### Added
+- **Add a second machine from your dashboard — no pairing token, no recovery
+  phrase.** Run `rbox login` on the new machine, approve it in the web
+  dashboard, and it automatically receives your encryption keys from a machine
+  that's already connected and online. If no machine is available to hand off
+  the keys, it falls back to the pairing token / recovery phrase as before.
+
+### Fixed
+- A newly-approved machine no longer gets stuck: the delivered key's lifetime is
+  now aligned to the login window, so enrollment completes instead of being
+  rejected as being outside the device-code window.
+- Approving your *first* machine from the web now signs it in cleanly (and then
+  guides you to set up encryption), instead of erroring that encryption isn't
+  set up for the account yet.
+
 ## [1.8.0] — 2026-07-23 — "setup feels brand new"
 
 ### Changed
