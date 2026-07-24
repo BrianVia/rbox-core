@@ -1,14 +1,39 @@
 # 200 — Worktree lifecycle resilience: capturing out-of-band branch deletion
 
-Status: DESIGN v2 — 2026-07-24. Founder rulings on §12 folded in; not yet codex-reviewed.
+Status: DESIGN v3 — 2026-07-24. Codex round 1 returned **NOT-ALIGNED, 7 blockers + 4 majors**;
+all eleven are folded in (§13), together with three further founder rulings (R1–R3, §12).
 Author: Claude, from first-hand field forensics on the founder's Mac, 2026-07-24.
-Changes in v2: §12's open questions are ruled (2026-07-24). The per-ref pending lane
-(`pending ⊕ local`) moves from follow-up into the design as **P4** (§4.4), which
-re-orders the rollout (§11); the deletion semantic is stated (§3.0); the circuit
-breaker's thresholds are fixed against design 108's precedent (§3.5); and the
-recoverability window the "no safety pin" ruling depends on is stated and verified
-in §7.1 — **with one gap the ruling's premise does not cover** (§7.1, "Where the
-window does not hold").
+
+Changes in v3 — the eight that change what gets built:
+
+1. **The mass-deletion breaker was arithmetically broken and is now `OR`** (R1, §3.5).
+   `max(25, ceil(0.25·N))` is a *conjunction*, so it cannot trip at all below 25 heads and
+   its fraction leg is inert below 100 — which covers nearly every repository in the
+   workspace. Deleting all 24 heads of a 24-head repository did not trip it. The
+   counterexample is recorded so nobody re-derives the broken form. One residual small-repo
+   hair-trigger is **STILL OPEN (Q2b)**.
+2. **The deleting device now keeps its own 90-day recovery pin** (R3, §3.7). This reverses
+   §8 item 10 and retires Q3a. The old premise — that a *follower's* prune pin is the
+   recovery path — is false whenever no device prunes; the analysis is kept as the
+   rationale.
+3. **A strict ref read replaces the lossy one on every absence-authority path** (§3.3a).
+   `readAllRefs` maps any `show-ref` failure to an empty map; verified empirically, one
+   malformed loose ref does exactly that while every preflight still passes.
+4. **The publisher ACK becomes held-ref-aware** (§4.4 constraint 6). Without it P4 mints
+   physical-presence provenance for values this device never held, and P1 then reads that
+   provenance as licence to publish a deletion.
+5. **P1's control flow is specified end to end** (§3.6a) — absence reconciliation runs
+   *before* apply's unchanged shortcut, and the deleting cycle's own push lane publishes
+   the omission, so the retired ref cannot be re-created from the section still in hand.
+6. **P3 is demoted to cascade reduction and structurally barred from destructive
+   transitions** (§4.3). It has a real false positive (apply-then-revert) and its
+   "waives holds only" boundary was a description, not a mechanism.
+7. **P4's accepted-ACK state machine gets its third outcome** (§4.4a, `partially-superseded`),
+   and the `gitIncomingKey` question is *decided*: the carried pending section is never
+   rewritten, so nothing keyed on it moves.
+8. **The deletion semantic is honestly scoped to v1.6.8 and newer** (R2, §3.0) — verified
+   against the tag, not assumed — and a recovery command is specified (§7.2), because no
+   existing surface exposes an OID.
 Relates: 130 (follower branch hygiene — closed BASE authority, A/P/K, tombstones;
 this design adds the one authority 130 left unwritten), 176 (wedge UX — §2.4
 *refuses* the exact shape found tonight and says so explicitly), 174 (held-repo
@@ -50,13 +75,16 @@ tombstone path. Nothing on the wire changes.
 
 The semantic that follows from capturing rather than re-materializing is stated once, in
 §3.0, because everything else depends on it: **deleting a branch on one machine removes it
-fleet-wide.** `git branch -D` means what it says inside a synced workspace.
+from every device running v1.6.8 or newer.** `git branch -D` means what it says inside a
+synced workspace. The version floor is verified, not assumed, and a device below it holds
+the branch until it upgrades rather than losing or resurrecting anything (§3.0).
 
-Alongside it, three smaller changes make mode (a) harmless: stop letting a per-ref hold
-gag the repository, make the hold held-skip eligible (with a worktree-registry digest in
-the skip bracket), and teach the no-drop proof that **content already merged by squash is
-not lost work** — using the founder's validated patch-id recipe, generalized to rbox's
-durable-roots model so it needs no `origin/main` concept.
+Alongside it, two smaller changes make mode (a) cheaper: make the ownership hold held-skip
+eligible (with a worktree-registry digest in the skip bracket), and stop a non-HEAD hold
+deferring the whole repository. A third — the founder's validated patch-id recipe,
+generalized to rbox's durable-roots model so it needs no `origin/main` concept — reduces
+the *cascade* a squash-merged branch causes, and v3 is careful not to claim more than that
+(§4.3). **Corrected in v3: none of these ungags the capture lane** (§4.2). Only P4 does.
 
 Finally — ruled in on 2026-07-24, and the largest single change here — the outgoing
 section becomes **`pending ⊕ local`** (§4.4): a held ref carries its pending value while
@@ -64,9 +92,12 @@ every other ref publishes its local value, instead of today's all-or-nothing swa
 is the structural fix that prevents the whole class rather than clearing one instance of
 it, and it is why §11's landing order is inverted from v1's.
 
-Cost is negative for P1–P3: the new checks are O(1) per BASE head in the negative case
-and are gated behind proofs that already failed, while making ownership holds held-skip
-eligible removes a full follow per cycle from exactly the repositories that suffer today.
+Cost is negative for P1–P3 in wall clock: the new checks are O(1) per BASE head in the
+negative case and are gated behind proofs that already failed, while making ownership holds
+held-skip eligible removes a full follow per cycle from exactly the repositories that
+suffer today. **P1 does carry one standing cost** — R3's 90-day recovery pins, ~900 hidden
+refs at steady state on the founder's observed deletion rate, holding their objects against
+`git gc` (§3.7). The founder accepted it explicitly; §11 measures it rather than assuming it.
 **P4 is not free** — it replaces a byte-for-byte pending carry that uploads nothing with
 an ordinary incremental capture per cycle while a hold is outstanding. That is the point
 (local work keeps flowing past a held ref) but it is a real new cost and a real new blast
@@ -371,10 +402,44 @@ neither is a normal user action.
 is now a stated decision rather than a question, because §3.1–§3.6, §4.5, §5 and §7 all
 rest on it.
 
-> **Deleting a published branch on one machine removes it fleet-wide.** Inside a synced
-> workspace `git branch -D` means what it says: the deletion is an event rbox captures and
-> publishes, not a local divergence rbox repairs by re-materializing the branch from the
-> fleet.
+> **Deleting a published branch on one machine removes it from every device running
+> v1.6.8 or newer.** Inside a synced workspace `git branch -D` means what it says: the
+> deletion is an event rbox captures and publishes, not a local divergence rbox repairs by
+> re-materializing the branch from the fleet.
+
+**The version qualifier is not hedging — RULED 2026-07-24 (R2), and verified.** v1 and v2
+said "fleet-wide" without qualification. That is false for devices predating design 130,
+and the honest statement is worth more than the clean one.
+
+- Design 130's tombstone attestation (`src/cli/sync-git/tombstone-attestation.ts`) first
+  shipped in **v1.6.8**, commit `04c2aff8` (#297). `git tag --contains 04c2aff8` puts
+  v1.6.8 first; v1.6.6 and v1.6.7 do not contain it.
+- **What a pre-1.6.8 device actually does, read off the tag rather than assumed.** In
+  `v1.6.6:src/cli/sync-git/follow.ts`, a ref present locally at `X` whose incoming section
+  omits it runs `tipOwnedByIncoming(repoDir, X, roots)` in the first-pass hold loop
+  (`v1.6.6:follow.ts:556-565`). For a **squash-merged** branch `X` is an ancestor of
+  nothing in `roots`, so the proof returns `unowned` and the ref is classified
+  `local-commits` and **held**. There is no tombstone waiver in that version to lift the
+  hold — the waiver loop does not exist. (For a branch whose tip *is* reachable from the
+  incoming roots the same version does delete it, after pinning the displaced OIDs; the
+  hold is specific to the squash-merge shape, which is the shape this design is about.)
+- **It cannot resurrect the branch either.** A held ref sets the whole-repository
+  `pending[rel] = remoteSec` gag in that version too, so the lagging device never captures
+  and never re-advertises `R`. If the user also deletes `R` there, capture omits it, its
+  own BASE re-adds the omitted member (`base-composer.ts:525-527`) and the ACK dry-run
+  refuses — it carries, forever, without publishing anything.
+
+**So the honest semantic is: deletion is eventually fleet-wide, not instantly fleet-wide.**
+A lagging device keeps the branch and defers *that repository's* Git plane until it is
+upgraded; on upgrade the unchanged design-130 attestation path prunes and it converges.
+Nothing is lost and nothing is resurrected; the fleet is briefly inconsistent, and one
+repository on one stale device stops syncing Git in the meantime. That last part is the
+real cost and it is worth stating out loud rather than filing under "degrades gracefully".
+
+The founder's phrasing was "1.7.x and newer". That is a safe superset of the verified
+floor and is the right thing to say to a user — 1.6.x has been superseded for months — but
+the design records **v1.6.8** because that is what the code says, and a future skew
+argument that starts from the wrong constant will reach the wrong conclusion.
 
 The rejected alternative was to retire the BASE member locally and let the next incoming
 section re-create the branch. It is strictly non-destructive, and it is wrong: it makes
@@ -393,11 +458,12 @@ them:
    published tombstone, not an instruction receivers must obey. A follower that has
    advanced the branch beyond the tombstoned OID holds instead of pruning (§3.4). Fleet
    authority is *the deleting device's own history*, never another device's.
-3. **The objects survive the deletion for a bounded window.** Publishing a deletion is
-   only acceptable because the branch tip stays recoverable across the fleet after the
-   prune. That window is the condition the founder attached to the "no safety pin"
-   ruling, and it is stated, verified and bounded in **§7.1** — including where it does
-   not hold.
+3. **The objects survive the deletion for a bounded window, on the device that published
+   it.** Publishing a deletion is only acceptable because the branch tip stays recoverable
+   afterwards. v2 rested that on followers pinning during their prune; ruling **R3**
+   (2026-07-24) replaced it with a pin on the *deleting* device, because the follower path
+   produces nothing whenever nobody prunes. Specified in **§3.7**, with the rejected
+   premise kept as rationale in §7.1 and the recovery command in §7.2.
 
 ### 3.1 The pre-state guard is correct. Keep it.
 
@@ -511,9 +577,13 @@ hold. Any failure, any exception, any unreadable input leaves `R` exactly as it 
 
 1. `record.base.refs[R] = X` is positive, and `record.branchBaseOrigins[R]` is a
    `usableOrigin` for `X` in the **live** lineage (`base-composer.ts:223-225`;
-   `130:214-234`). This is the load-bearing one — see §3.4.
-2. The live repository has no `R` — `readAllRefs`, already read once per cycle, so free —
-   and no `R` again at the locked boundary.
+   `130:214-234`). This is the load-bearing one — see §3.4. Under P4 it additionally
+   requires that the origin was minted from a value this device *captured*, not one it
+   *carried*; that is what §4.4 constraint 6 exists to guarantee.
+2. The live repository has no `R`, read through the **strict** ref reader of §3.3a — never
+   `readAllRefs`. This rule was the design's weakest point in v2: the lossy reader turns
+   any `show-ref` failure into "no refs at all", which is precisely the input that makes
+   every BASE head look deliberately deleted.
 3. The protocol artifacts for `R` are clear: no A, no P/K, no settled absence, no active
    foreign artifact. That is exactly `prepareFollowerBranchProtocol`'s
    `BranchArtifactDisposition` for `R` with all four fields `absent`/`clear`
@@ -523,11 +593,147 @@ hold. Any failure, any exception, any unreadable input leaves `R` exactly as it 
    receiver-equivalent collision group (`receiverEquivalentCollisionNames`).
 5. Git is not busy, preflight is `ok`, and the repository identity/lineage binding
    validates (`readRepoIdentityV1` / `readStateLineageV1`, `follower-protocol.ts:61-67`).
-   A `.git` that was restored, replaced or rebound fails here and never reaches capture.
+   **This rule does *not* catch a restore — see §3.3b.** v2 claimed it did; it does not.
 6. The observation survives the locked second proof inside
-   `commitPlannedBranchTransition` (`branch-transition.ts:301-321`): `R` still absent,
-   still unowned, while the ref transaction holds its locks.
+   `commitPlannedBranchTransition` (`branch-transition.ts:300-321`), which must also be
+   converted to the strict reader (`branch-transition.ts:309` is a `readAllRefs` call):
+   `R` still absent, still unowned, while the ref transaction holds its locks.
 7. The repository-level circuit breaker (§3.5) has not tripped.
+8. **`R` is not the current HEAD symref target.** New in v3 — see §3.3b.
+9. **No ref-database regression signal is present.** New in v3 — see §3.3b.
+
+### 3.3a The strict ref read — absence is only evidence if the read cannot fail silently
+
+This is the single most load-bearing correction in v3, because every other safeguard in
+§3.3 is evaluated against the output of one function.
+
+**The defect.** `readAllRefs` (`src/engine/git/refs.ts:6-15`) is:
+
+```ts
+const out = await git(repoDir, ["show-ref"]).catch(() => "");
+```
+
+Any failure of `git show-ref` — for any reason — yields an **empty ref map**, which is
+byte-for-byte what a repository with no refs yields. Absence capture reads that map and
+concludes that every positive BASE head was deliberately deleted.
+
+**Verified empirically** (Git 2.54.0), because the exact failure mode matters:
+
+| Repository state | `git show-ref` | stderr | `git rev-parse HEAD` | `git status` |
+|---|---|---|---|---|
+| healthy, 3 refs | exit 0, 3 lines | empty | exit 0 | exit 0 |
+| **one malformed loose ref** (`.git/refs/heads/b1` = `not-a-sha`) | **exit 128**, `fatal: git show-ref: bad ref refs/heads/b1 (0000…)` | non-empty | **exit 0** | **exit 0** |
+| freshly `git init`, no commits | exit 1, no output | **empty** | exit 128 | exit 0 |
+
+So: a single corrupt loose ref makes `show-ref` fail hard while the preflight, HEAD read
+and working-tree check all still succeed — exactly the codex blocker, reproduced. And the
+`.catch` is not gratuitous: exit 1 with empty output is Git's documented "no matching
+refs", which a legitimately ref-less repository produces.
+
+**The strict reader.** Add, beside `readAllRefs` and without changing it:
+
+```ts
+export type StrictRefRead =
+  | { status: "ok"; refs: Record<string, string> }
+  | { status: "unreadable"; marker: string };
+
+export async function readAllRefsStrict(repoDir: string): Promise<StrictRefRead>;
+```
+
+- `gitRaw(repoDir, ["show-ref"])` resolves → parse exactly as `readAllRefs` does.
+- rejects with `code === 1` **and empty stderr** → `{ status: "ok", refs: {} }`. Both
+  conditions, because exit 1 *with* stderr is not the documented no-match case.
+- every other rejection → `{ status: "unreadable", marker }`, with `marker` derived from
+  the exit code, never from the message text.
+
+`gitRaw` already attaches the exit status: it rejects with
+`Object.assign(new Error(stderr || …), { code: exitCode })` (`shared.ts:177`). **The
+codebase already contains this exact pattern**, so this is a transposition rather than an
+invention: `readLocalGitConfigEntries` (`shared.ts:261-268`) catches only `code === 1`
+("Git's documented no-match result; every other subprocess failure remains loud") and
+rethrows everything else.
+
+**`git for-each-ref` is not the answer, and the reason is worth recording.** It looks
+stricter — it exits 0 on the corrupt repository above — but that is the problem: it
+**silently omits the broken ref**, emitting only `warning: ignoring broken ref
+refs/heads/b1` on stderr. A reader that drops refs and reports success is strictly worse
+for a fail-closed absence proof than one that fails loudly.
+
+**Where the strict reader is mandatory.** Not a blanket conversion of all ~25 `readAllRefs`
+call sites — that is a separate sweep — but every site where an empty map is read as
+authority over deletion:
+
+| Site | Why |
+|---|---|
+| §3.3 rule 2, plan-time absence read | the witness itself |
+| `branch-transition.ts:309` (inside `commitPlannedBranchTransition`) | the locked second proof. For an absent-target transition `plan.beforeOid` is `null`, so `(refs[plan.ref] ?? null) !== plan.beforeOid` compares `null !== null` and **passes on a totally failed read**. The one check that is supposed to prove "R is still absent under the locks" is exactly the check the lossy read defeats. This is a pre-existing hole for *every* branch transition, not only P1's. |
+| `follow.ts:990` (locked second proof in the publish loop) | same shape |
+| `capture.ts:259`, `capture.ts:357` | a lossy read here produces a section advertising **zero refs**, and `normalizePublishedGitSection` then authors a wire tombstone for every advertised head (`publisher-tombstones.ts:108-122`). A single `show-ref` failure on the publishing device becomes a fleet-wide deletion of the whole repository. This design's deletion semantic rests on capture omission being meaningful, so it must also make capture omission trustworthy. |
+
+`follow.ts:882`, `:917` and `:1548` are deliberately **not** on the list: an empty read
+there over-pins and over-holds, which fails in the safe direction. Say so explicitly so a
+later reader does not assume the omission was an oversight.
+
+**Fail-closed behavior.** `{ status: "unreadable" }` at any of these sites aborts absence
+capture for the whole repository for that cycle, records an `apply` deferral under the
+same reason the circuit breaker uses, and emits one bounded line. It never degrades to
+"assume no refs".
+
+### 3.3b Absence is not evidence of *why* — restore and unborn-branch detection
+
+v2's §3.3 rule 5 claimed that identity and lineage binding catch "a `.git` that was
+restored, replaced or rebound". **It does not, and the design must stop saying it does.**
+
+`repositoryIdentityHash` hashes `relPath`, `kind`, `worktreeId`, `gitDirReal`,
+`commonDirReal`, and the commonDir's `dev`/`ino`/`birthtime`
+(`repo-lineage.ts:69-76`, read by `readRepoIdentityV1`, `:82-95`). Restoring `.git/refs`
+and `.git/packed-refs` **in place** — a `tar -x` over the ref database, a
+`rsync` from a backup, a botched `git gc` recovery — changes none of those. The commonDir
+inode is untouched, so identity is stable, lineage is current, the artifacts are clear,
+preflight passes, and every origin remains usable. §3.4's invariant ("this device held
+that ref at that OID") is still *true* — and irrelevant, because it proves historical
+possession, not that the current absence is a deletion.
+
+Two additions, plus one honest limit.
+
+**(i) Reject the current symref target.** `reserveNonRacingHead` (`branch-transition.ts:72-91`)
+returns `lines: []` with `reservation.currentRef = true` when `HEAD` is `ref: R` and `R` is
+the transition's own ref — i.e. HEAD is permitted to point at the ref being retired. And
+`branchProofMatches` (`base-composer.ts:246-260`) checks `liveOid`, `artifactsClear`,
+`ownershipStable` and `reflogStable`, but **never inspects `locked.currentRef`**, even
+though `commitPlannedBranchTransition` records it (`branch-transition.ts:318-322`).
+
+A repository whose HEAD symref names `R` while `R` is absent is an **unborn branch**, not a
+deletion: `git checkout -b feature` before the first commit, a fresh clone of an empty
+repository, and a restore that lost `refs/` while keeping `HEAD` all produce it. Rule 8 is
+therefore: absence capture refuses any `R` that is the current HEAD symref target, checked
+at plan time **and** enforced in the `local-absence` authority arm by requiring
+`locked.currentRef === false`.
+
+Scoped deliberately to the new authority arm rather than fixing `branchProofMatches`
+globally: that predicate is shared by every branch transition and tightening it is a
+behaviour change for paths this design has not analysed. **The general gap is recorded in
+§10 as a follow-up, not silently closed.**
+
+**(ii) Ref-database regression signals.** All fail-closed, all cheap, none of them a proof:
+
+- **packed-refs identity.** Record `{dev, ino, size, mtimeMs}` for
+  `<commonDir>/packed-refs` in the repo record beside `branchBaseOrigins`. Refuse absence
+  capture when a previously-recorded tuple exists and the current one has a *different
+  inode* or an *older mtime* while BASE-positive heads are absent. An ordinary
+  `git pack-refs` advances mtime and keeps the file; an in-place restore replaces it.
+- **Reflog-store corroboration.** Refuse when `<commonDir>/logs/HEAD` is missing or empty
+  while BASE recorded at least one head. A repository that lost `refs/` almost always lost
+  `logs/` with it, and a repository that has ever had a branch has a HEAD reflog.
+
+**(iii) The honest limit.** Neither signal is a proof, and a sufficiently careful restore
+defeats both. **The actual protection against restore is the circuit breaker** (§3.5) —
+mass simultaneous absence with the repository otherwise intact *is* the restore signature.
+R1's `OR` form is what makes that protection real: under v2's `max()` form a 24-head
+repository could be restored and publish all 24 deletions without tripping. The two
+signals above exist to shrink the residual window in the 5–19-head range that Q2b's
+proposed `heads ≥ 20` guard would otherwise leave uncovered, and they should be
+understood as that and nothing more.
 
 ### 3.4 Why this cannot lose work
 
@@ -550,11 +756,24 @@ It holds for each origin kind:
 - `manual` (`:418`) is minted under a fresh confirmed snapshot and a locked live-OID proof
   (`:409-413`).
 
-Therefore **BASE-positive + P-absent + no A/Z + valid lineage ⇒ the ref was deleted
-out-of-band on this machine, after rbox last observed it.** It cannot mean "never
-delivered here": a ref that never arrived was never in this device's BASE with a usable
-origin. That is the discriminator, and it is checkable locally with no new provenance and
-no new wire field.
+Therefore **BASE-positive + P-absent + no A/Z + valid lineage ⇒ this device held `R` at `X`
+and no longer does.** It cannot mean "never delivered here": a ref that never arrived was
+never in this device's BASE with a usable origin. That is the discriminator, and it is
+checkable locally with no new provenance and no new wire field.
+
+**Two things v2 asserted here that are not true, and are now handled elsewhere.**
+
+- **The invariant proves historical possession, not the cause of the current absence.**
+  "Held it, doesn't now" is compatible with deletion *and* with a restored ref database
+  (§3.3b) *and* with an unborn-branch HEAD (§3.3b (i)). §3.3's rules 8 and 9 and §3.5's
+  breaker are what narrow it to deletion; this section no longer claims to.
+- **The invariant is not self-maintaining under P4.** `publisher-ack` mints an origin
+  whenever the acked value equals the *advertised* value (`base-composer.ts:356-367`), and
+  the advertised set today is the whole committed section (`push.ts:971`,
+  `advertisedRefs: section.refs`). A merged `pending ⊕ local` section contains held refs at
+  values this device never held, so shipping P4 without §4.4 constraint 6 would make this
+  invariant false and hand P1 forged evidence. The invariant survives only because the ACK
+  authority is being made held-ref-aware in the same design.
 
 From there, publishing the deletion cannot lose work:
 
@@ -570,37 +789,83 @@ From there, publishing the deletion cannot lose work:
   A retirement — the guard passes).
 - The local side is already lost: Git deleted the ref *and* its reflog before rbox ever
   ran. rbox is mirroring an accomplished fact, not performing a deletion.
-- **The objects survive the prune across the fleet for a bounded window.** Every follower
-  that prunes `R` pins the tombstoned tip under `refs/rbox-local/keep/<X>` for
-  `TOMBSTONE_PIN_RETENTION_MS`, and pins the rest of that branch's reflog permanently. This
-  is what makes "no safety pin" (§12 Q3) safe rather than merely cheap, and it is stated in
-  full — with its two gaps — in **§7.1**. It is not optional to the argument: without it,
-  the last machine to sync destroys the only copy.
+- **The objects survive the prune, on the deleting device itself, for 90 days.** Absence
+  capture pins `X` under `refs/rbox-local/keep/<X>` with a `tombstone`-class origin, in the
+  same ref transaction that writes the A artifact and strictly before BASE is retired
+  (**§3.7**, ruling R3). Followers that prune under tombstone authority pin it too, as they
+  already do. v2 rested this bullet entirely on the *follower* pin and was wrong to: that
+  path produces nothing when no device prunes, which is a large and ordinary class of
+  cases (§7.1). It is not optional to the argument — without a pin somewhere, the deletion
+  can be the act that destroys the last copy.
 - The alternative (resurrection) is strictly worse and re-opens
   `REVIEW-174-R1-OPUS-B.md:14`.
 
 ### 3.5 The circuit breaker — where a human is genuinely required
 
 The one shape that must not auto-publish is "the repository was replaced": a restore from
-backup, a `.git` swapped in place, a clone that lost its refs. Identity and lineage
-binding (§3.3 rule 5) catches most of it, but not a same-identity repository whose refs
-were mass-deleted.
+backup, a `.git` swapped in place, a clone that lost its refs. §3.3b establishes that
+identity and lineage binding do **not** catch it, so this breaker is not a backstop — it
+is the primary detector.
 
-**Rule — RULED 2026-07-24.** Per repository, per cycle: if the number of BASE-positive
-heads that would be absence-captured reaches `max(K, ceil(F · |BASE heads|))`, capture
-**none** of them, record an `apply` deferral under a new dedicated reason, and print one
-bounded line naming the count. **`K = 25`, `F = 0.25` — both legs, and tripping DEFERS the
-repository rather than warning and proceeding.**
+**Rule — RULED 2026-07-24 (R1), superseding v2's `max()` form.** Per repository, per
+cycle: let `n` be the number of BASE-positive heads that would be absence-captured and `N`
+the number of BASE-positive heads. If
 
-Both legs, because each covers a case the other cannot. The `K` floor **exempts small
-repositories**: a 12-head repository hits 25% at three branches, which is one afternoon's
-cleanup, and nagging there buys nothing because its blast radius is three branches. The `F`
-leg **catches large ones**: a 300-head repository blows past any absolute floor worth
-setting in its first wiped cycle. `max` is the honest way to say "both must be true":
-`n ≥ max(K, ceil(F·N))` ⟺ `n ≥ K ∧ n ≥ ceil(F·N)`. This is design 108's own stated
-rationale, transposed: "the `MIN` floor means workspaces under ~5,000 files … are never
-nagged — their blast radius is small … the 20% leg catches large workspaces before a full
-wipe" (`108-scan-fault-isolation.md:84-88`).
+```
+n >= K   OR   n * 100 >= P * N          // K = 25, P = 25 (i.e. 25%)
+```
+
+capture **none** of them, record an `apply` deferral under a new dedicated reason, and
+print one bounded line naming the count. **Either leg trips it, whichever comes first.**
+Tripping DEFERS the repository; it does not warn and proceed. The integer form (`n*100 ≥
+P*N`) rather than `n ≥ ceil(F·N)` follows design 108's own "integer-safe" phrasing
+(`policy.ts:22-35`) and avoids a float comparison in a safety predicate.
+
+**Why v2's `max(K, ceil(F·N))` was wrong, recorded so nobody re-derives it.** `max` reads
+as "both legs must agree", i.e. `n ≥ K ∧ n ≥ ceil(F·N)` — and the conjunction is dominated
+by whichever leg is larger. For any repository with `N < K/F = 100` heads, `K = 25` is the
+larger leg, so the fraction never contributes anything:
+
+> **Counterexample.** A repository with 24 BASE heads. Delete **all 24**.
+> `max(25, ceil(0.25 · 24) = 6) = 25`, and `24 ≥ 25` is **false**. A total wipe of the
+> repository's entire ref set does not trip the breaker.
+
+The absolute leg dominates every repository under 100 heads, which is essentially all of
+them — the founder's whole Mac carries ~203 heads across 110 repositories (§1). v2's
+prose ("the `K` floor exempts small repositories … the `F` leg catches large ones")
+described the intent correctly and the arithmetic backwards. Under `OR` the mapping
+inverts and is now correct: the **fraction** leg is what protects small repositories from
+a proportional wipe, and the **absolute** leg is what caps blast radius in large ones. On
+the measured 304-head `Personal/rbox-core`, `OR` trips at `min(25, 76) = 25`.
+
+**Design 108's precedent is `AND`, and this design deliberately departs from it.** Worth
+being explicit, because §12 Q2 cited 108 as the shape being copied.
+`pushMassDeleteTrips` is `deletes ≥ min ∧ deletes·100 ≥ pct·baseCount` (`policy.ts:22-35`)
+— a genuine conjunction, defensible there because `min = 1000` against file counts in the
+hundred-thousands leaves the fraction leg dominant for any realistic workspace. Transposed
+to ref counts in the *ones to hundreds*, the same conjunction inverts and the floor eats
+the fraction. **What this design copies from 108 is its posture** — refuse on the
+publishing side, before any encrypt/upload/commit work, fail closed, human consent as the
+only override — not its boolean operator.
+
+> **STILL OPEN — 2b. The `OR` form is a hair-trigger on small repositories.** `n ≥ 0.25·N`
+> means a 4-head repository trips on **one** deletion and an 8-head repository on **two**.
+> The founder's workspace averages ~1.8 BASE heads per repository (203 across 110), so
+> taken literally R1 would defer nearly every repository on the first routine
+> `git branch -D` — which is the exact loop this design exists to make self-healing.
+> **Recommended amendment: gate the fraction leg on `N >= 20`**, so its minimum meaningful
+> trip is 5 deletions:
+>
+> ```
+> n >= 25   OR   (N >= 20 && n * 4 >= N)
+> ```
+>
+> This keeps R1's counterexample resolved (24 heads → trips at 6) and keeps small repos
+> usable. The cost is a 5–19-head window where neither leg fires on a restore; §3.3b's
+> packed-refs and reflog-store signals are what cover it, and they are weaker than a
+> breaker. **The rest of this design assumes the guarded form.** If the founder prefers the
+> unguarded `OR`, §3.3b's signals become load-bearing rather than supplementary and the
+> "no human in the loop" claim of §0 has to be softened for small repositories.
 
 **Precedent.** This is the file plane's shape, scaled for ref counts in the hundreds
 rather than file counts in the hundred-thousands. rbox already runs two mass-delete
@@ -612,13 +877,13 @@ different:
 | Pull-side mass-delete guard | 44 | `deletes ≥ 100 ∧ deletes·2 ≥ baseFiles` (i.e. `≥ 100` **and** `≥ 50%`) | `policy.ts:11-15`, applied at `pull.ts:276` |
 | Push-side mass-delete breaker | 108 (`docs/design/108-scan-fault-isolation.md:79-88` — note it is that 108, not `108-files-first-publish.md`) | `deletes ≥ min ∧ deletes·100 ≥ pct·baseCount`, defaults `min = 1000`, `pct = 20`; env-overridable via `RBOX_MASS_DELETE_MIN` / `RBOX_MASS_DELETE_PCT`. The design states the intent as `deletes >= max(PCT% of last-synced count, MIN)` and the code as the "integer-safe" two-legged form. | `pushMassDeleteTrips`, `policy.ts:22-35`, applied at `push.ts:701` |
 
-The `max(fraction, floor)` shape this design adopts is **design 108's push-side breaker**,
-not design 44's — design 44's is an absolute floor ANDed with a *half*-the-tree fraction,
-and it guards the receiving side. 108 is the right precedent for the additional reason
-that it guards the *publishing* side: like absence capture, it is the point where this
-device's local observation is about to become everyone else's reality, and
-`push.ts:694-708` refuses **before any encrypt/upload/commit work**, exactly as absence
-capture must refuse before any A artifact is written.
+108 is the right precedent for **posture**, not for the predicate: it guards the
+*publishing* side, which is what absence capture is — the point where this device's local
+observation is about to become everyone else's reality — and `push.ts:694-708` refuses
+**before any encrypt/upload/commit work**, exactly as absence capture must refuse before
+any A artifact is written or any keep-pin is created. Design 44's is an absolute floor
+ANDed with a *half*-the-tree fraction and it guards the receiving side, so it is the wrong
+precedent on both counts.
 
 Both file-plane guards fail closed with human consent as the only override — `policy.ts:14`
 states it as "fails closed until a human says otherwise", and the daemon deliberately never
@@ -629,14 +894,26 @@ has `--allow-mass-delete`; this breaker's escape is `rbox git resolve <repo> sho
 followed by the existing resolve arms, because the shape it guards is a repository-level
 question, not a one-flag consent.
 
-**Why `25` and `0.25` and not 108's `1000` and `20%`.** Blast radius per unit. The founder's
+**Why `25` and `25%` and not 108's `1000` and `20%`.** Blast radius per unit. The founder's
 whole Mac carries ~203 branch heads across 110 repositories (§1); `Personal/rbox-core`
 alone has 304 BASE refs. One branch is a unit of human work, not a byte, so the floor has to
 sit near the top of a plausible day's churn — ~10 deleted branches/day observed (§8 item 10)
-— and well below a wipe. `K = 25` is ~2.5 days of the founder's observed rate. `F = 0.25` is
+— and well below a wipe. `K = 25` is ~2.5 days of the founder's observed rate. `P = 25%` is
 tighter than 44's 50% and looser than 108's 20% because ref sets are two to three orders of
-magnitude smaller than file sets, so a quarter of them is still a number no normal cleanup
-reaches. On the measured repository the breaker trips at `max(25, ceil(0.25 · 304)) = 76`.
+magnitude smaller than file sets.
+
+Trip points under the recommended guarded `OR` form, for the sizes that actually occur:
+
+| BASE heads `N` | trips at `n` = | governed by |
+|---:|---:|---|
+| 1–19 | 25 (unreachable — `n ≤ N`) | never trips; §3.3b signals only |
+| 20 | 5 | fraction |
+| 24 | 6 | fraction (**R1's counterexample, now caught**) |
+| 100 | 25 | both, simultaneously |
+| 304 (measured) | 25 | absolute |
+
+The `N ≤ 19` row is the Q2b trade-off made visible: those repositories are protected by
+provenance, artifacts, HEAD-symref and ref-database checks, but not by a breaker.
 
 ### 3.6 Ordering: absence capture must precede capture, not follow it
 
@@ -653,6 +930,186 @@ that omits `R`, and only then does the dry-run converge. The deletion is therefo
 by a durable Git artifact at every instant, exactly as `130:177-187` requires. Any variant
 that lets the pre-probe or the dry-run "just skip" a missing ref without a receipt is
 rejected in §8.
+
+### 3.6a Where absence capture runs — the exact handoff
+
+v2 said only "in the apply lane, before `publishRefPlane`". That placement does not clear
+either field wedge, and the reasons are two distinct control-flow facts.
+
+**Defect 1 — the latent wedge never reaches the hook.** §2.3's shape is a stale positive
+BASE member with **no pending** and an **unchanged remote**. `applyGitRepos` takes the
+unchanged shortcut at `apply.ts:873`:
+
+```ts
+if (!remoteChanged && !pend && !resolutionChanged && !checkpointReproof && !(configDue && configTarget?.fresh)) {
+```
+
+and returns `{ result: "unchanged" }` at `apply.ts:879` — before any follow, and therefore
+before any hook placed "before `publishRefPlane`". §5's promise that the latent wedge is
+"reconciled on the next cycle, before it can arm" is unsatisfiable at that position.
+
+**Defect 2 — retiring BASE inside the pass lets the same pass re-create the branch.** In
+the observed pending wedge the incoming/effective section still says `R = X`. Retire BASE
+for `R` and the very next iteration of the publish loop sees `oldOid = undefined`,
+`logicalBaseOid = null` (retired), `newOid = X` — a perfectly legal **creation**
+(`follow.ts:965-988` → `planBranchTransition` with `beforeOid: null`). The guard passes,
+the branch comes back, and the deletion is never published. That is worse than the wedge:
+it is a silent resurrection loop.
+
+**The specified handoff, in order.**
+
+- **A — Absence reconciliation runs before the unchanged shortcut.** A new per-repository
+  step in `applyGitRepos`, positioned above `apply.ts:873`, not above `publishRefPlane`.
+  - **Cheap gate first, and it is O(1) per BASE head with no subprocess:** the predicate
+    "∃ `R` ∈ `record.base.refs` positive and absent from the live refs". In the
+    overwhelmingly common case the candidate set is empty, the shortcut is taken exactly as
+    today, and no protocol lock is acquired and no extra Git process is spawned. This is
+    what keeps §6's "zero new Git subprocesses in the negative case" true at the new
+    position — but note it now needs a live ref read on the unchanged path, so the strict
+    read of §3.3a must be the one already taken for the cycle, not a new spawn.
+  - Only a **non-empty** candidate set opens `prepareFollowerBranchProtocol`
+    (`follower-protocol.ts:61-71`), evaluates §3.3's nine rules, and applies §3.5's breaker.
+- **B — Durable receipt, then BASE.** For each surviving candidate, in one prepared
+  expected-old ref transaction: the §3.7 keep-pin lines **and** the A artifact. Then, and
+  only after that transaction commits, the state CAS retiring `BASE[R]` under the new
+  `local-absence` authority. The ordering is the whole safety argument (§3.1, §3.6): a
+  durable Git artifact backs the retirement at every instant.
+- **C — End the repository's apply for this cycle.** After any successful retirement,
+  return without applying the section in hand — a new `result: "reconciled"` alongside
+  `unchanged`/`deferred`, which clears the apply deferral, leaves `pending` untouched, and
+  emits one bounded line. It does **not** record a blocker: nothing failed.
+  - *Rejected alternative:* pass a `suppressedRefs` set into `publishRefPlane` so `R` is
+    dropped from `candidates` for this pass. It works, and it introduces a second, weaker
+    source of pre-state truth inside the hottest loop, next to `logicalBaseRefs`. Design
+    130's value is that BASE is the *only* pre-state authority; one extra cycle is a
+    cheaper price than a second one.
+- **D — The same cycle's push lane publishes the omission.** This is what makes C
+  sufficient rather than a one-cycle delay of the same bug. `sync()` is pull-then-push
+  within a single cycle — `sync.ts:9-19`, "One full cycle: take remote changes, then
+  publish local ones" — so the push lane runs **after** step B in the same cycle, with the
+  retired BASE already committed. There:
+  - `pendingSupersessionPreProbe` returns `maybe` for `R` under P1b's new receipt row
+    instead of `carry / local repository lacks pending ref …`;
+  - capture omits `R`, and `normalizePublishedGitSection` authors the wire tombstone at `X`
+    (`publisher-tombstones.ts:108-122`);
+  - `pendingSupersessionAckConverges` now converges, because BASE no longer holds `R` and
+    `base-composer.ts:525-527` therefore has nothing to re-add.
+
+  So the server's newest section for the repository omits `R` **before** the next pull. On
+  cycle N+1 the apply lane sees a section without `R` and there is nothing to re-create.
+
+**What if the remote wins the race and re-delivers `R = X` first?** Then the branch is
+legitimately re-created — and that is correct, because another device is still advertising
+it as present. The loop terminates rather than ping-ponging: this device's published
+tombstone at `X` is what retires `R` on that device, tombstone generations are monotone,
+and once it prunes it stops advertising. Stated here explicitly so the objection is
+answered rather than left to the reader.
+
+### 3.7 The deleting device's recovery pin — RULED 2026-07-24 (R3)
+
+**Ruling: whichever device publishes a deletion also pins the commit locally for 90 days.**
+This reverses §8 item 10 and retires §12 Q3a. The founder explicitly accepted the cost.
+
+**Why the old premise failed.** v2 argued no local pin was needed because "the fleet still
+holds the objects". That is true only when *some device prunes the branch under tombstone
+authority*, because the prune is what calls `prepareTombstonePrunePins`
+(`follow.ts:947-949` → `keep-pins.ts:635-654`). It produces nothing in at least four
+ordinary situations, and the first three are not exotic:
+
+1. A single-device workspace — no follower, no prune, ever.
+2. Both devices delete the branch before either applies the other's tombstone; each side
+   then takes the `!oldOid && !newOid` path and prunes nothing.
+3. A device that never received the ref has nothing to pin.
+4. Every follower is pre-1.6.8 (§3.0): it *holds* rather than pruning, so no pin.
+
+Recovery therefore depended on a coincidence. R3 replaces it with a guarantee on the one
+device that is certain to exist: the one that ran `git branch -D`.
+
+**The pin, concretely.** Reuse design 116's machinery unchanged — no new ref namespace, no
+new retention constant, no new sidecar format.
+
+| Element | Value |
+|---|---|
+| Ref | `keepPinRef(X)` = `refs/rbox-local/keep/<X>` (`keep-pins.ts:66`) |
+| Origin | `{ ref: R, episode, time, class: "tombstone" }` — the shape `prepareTombstonePrunePins` already writes for the authorized tip (`keep-pins.ts:645`); `KeepPinOrigin` is declared at `keep-pins.ts:47-52` and already carries the branch name and timestamp, which §7.2's listing needs |
+| Retention | `TOMBSTONE_PIN_RETENTION_MS` = 90 days (`keep-pins.ts:68`), deliberately equal to `REF_TOMBSTONE_RETENTION_MS` (`publisher-tombstones.ts:10`) |
+| Reaper | `expireTombstoneKeepPins` (`keep-pins.ts:434-457`) — see "who calls it" below |
+
+`class: "tombstone"` rather than `"human"` is the decision that makes 90 days mean 90 days:
+`expireTombstonePinOrigins` ages only `entry.class === "tombstone"` (`keep-pins.ts:119-120`).
+A `human` origin would never expire, which is the accumulation the founder's original
+rejection was worried about.
+
+**Placement, and why it is crash-safe.** The pin is created in the **same prepared ref
+transaction** as the A artifact, and strictly **before** the BASE retirement CAS —
+i.e. inside step B of §3.6a:
+
+1. `prepareKeepPins(repoDir, [X], { ref: R, episode, time, class: "tombstone" })` writes
+   the origin sidecar (fsynced) and returns `create refs/rbox-local/keep/<X> <X>` lines.
+2. Those lines are passed as `extraTransactionLines` to the absence planner, alongside the
+   A artifact's own lines (`branch-transition.ts:217-224` is the absent-branch artifact
+   path; `extraTransactionLines` is already the mechanism `prepareTombstonePrunePins` uses
+   at `follow.ts:962`). One `runPreparedUpdateRefTransaction` commits both.
+3. `commitPlannedBranchTransition` runs the locked second proof (strict ref read, §3.3a;
+   ownership; `currentRef === false`, §3.3b).
+4. **Only then** the state CAS retires `BASE[R]`.
+
+Crash points, exhaustively:
+
+| Crash after | State | Recovery |
+|---|---|---|
+| 1, before 2 | origin sidecar names `X`, no pin ref | over-retention only; the existing originless/pinless reconciliation handles it (`keep-pins.ts:425-428`) |
+| 2/3, before 4 | pin + A artifact durable, BASE still positive | next cycle re-derives the retirement from the durable A artifact (existing A-recovery path); the pin already exists and `keepPinRef` is content-addressed, so re-creating it is a no-op |
+| 4 | converged | — |
+
+**The state that must never exist — BASE retired without a pin — is unreachable**, because
+the pin is in the same transaction as the artifact and the retirement is strictly after it.
+
+**The one case where the pin cannot be created, and what happens then.** The branch was
+deleted with `git branch -D`; §1.2 verified that both `git rev-parse` and `git reflog` fail
+for `R`. The *object* usually still exists — Git only removes unreachable objects at `gc`,
+with `gc.pruneExpire` defaulting to two weeks — but not always, and the founder's own
+phantom ref is weeks old. `git update-ref` refuses to create a ref pointing at a missing
+object, so the pin can fail.
+
+**Decision: probe, proceed without the pin, and record the fact.** Absence capture runs
+`git cat-file -e <X>^{commit}` before planning; if the object is gone it skips the pin,
+emits a distinct bounded log line, and **still publishes the deletion**. The alternative —
+fail closed and refuse the capture — would leave the §1.2 field wedge permanently unfixed,
+because that is exactly a weeks-old OID. The cost is honest and bounded: for that ref the
+answer to "can I get it back?" is "not from here", which §7.2's listing must say in those
+words rather than implying a pin exists. The pin is a *guarantee when the object survives*,
+not a resurrection of objects Git already collected.
+
+**Who calls `expireTombstoneKeepPins`.** Today: nobody. It is exported through
+`src/engine/index.ts:284` and referenced only by `keep-pins.test.ts:166`. Tombstone pins
+are created and never aged, so the 90 days is currently a ceiling, not a window — which
+was safe while nothing depended on it and is not acceptable once the design *promises* 90
+days and the founder has accepted an accumulation cost priced at that number.
+
+The sweep, specified:
+
+- **Where.** At the end of a repository's **push-lane** work, after a successful capture,
+  outside every other lock scope — `expireTombstoneKeepPins` takes its own
+  `withRepoProtocolLocks(repoDir, { origins: true })` (`keep-pins.ts:439`) and must not be
+  nested inside one.
+- **How often.** At most once per repository per 24 h, driven by a `keepPinSweptAt`
+  timestamp in the repo record. 110 repositories × one `for-each-ref` over
+  `refs/rbox-local/keep/*` per cycle is not affordable; once a day is.
+- **Cheap gate first.** Skip entirely when `readKeepPinOrigins` (`keep-pins.ts:400`, one
+  file read) shows no `tombstone`-class origin. Most repositories have none.
+- **Behaviour change, named as one.** Wiring the reaper converts an existing unbounded
+  retention into a 90-day one for pins created by the *follower prune* path as well. That
+  is a real change to already-shipped behaviour and it ships under the same kill switch as
+  P1 (`RBOX_GIT_ABSENCE_CAPTURE=0` disables the sweep too), so a device that opts out of
+  absence capture does not silently start reaping pins it created before the upgrade.
+
+**Cost, accepted by the founder and recorded so it is measurable rather than assumed.** At
+the observed ~10 deleted branches/day, ~900 hidden refs at steady state under a 90-day
+window, spread across repositories. They are ordinary refs under `refs/rbox-local/keep/`,
+so they hold their commits against `git gc` for the window — that is their entire purpose —
+and they participate in `git gc`'s reachability walk. §6 carries the line; §11's bake
+condition measures it.
 
 ## 4. Mode (a): should a spent worktree block at all?
 
@@ -690,25 +1147,51 @@ repository-wide `pending` + deferral.
   (`sync-state-model.ts:228-245`) and require it to match. Cost: one
   `git worktree list --porcelain` per repository per cycle, which the follow already
   spawns five times (`follow.ts:673, 916, 991, 1471, 1549`).
-- **No whole-repo escalation for a non-HEAD ref.** `follow.ts:709-711` (incoming HEAD
+- **No whole-repo escalation for a non-HEAD ref.** `follow.ts:708-711` (incoming HEAD
   owned) must stay a whole-repo defer — rbox cannot attach the primary checkout to a
-  branch a sibling holds. Everything else stays per-ref, and `apply.ts:1447-1450` must
-  distinguish held refs the incoming section actually wants to change from held refs that
-  are already convergent; only the former justifies a deferral record.
-- **Capture is not gagged by a hold alone.** With P1b in place, a repository whose only
-  held ref is worktree-owned reaches `pendingSupersessionPreProbe` and supersedes as soon
-  as local ≥ pending for every other ref, so ordinary local work keeps flowing.
+  branch a sibling holds. Everything else stays per-ref.
 
-P2 makes the hold cheap and stops it gagging the repository. It does **not** make the
-outgoing section per-ref: while a hold is outstanding the whole section is still carried
-verbatim. That last step is **P4**, ruled in scope on 2026-07-24 and specified in §4.4.
+**Two claims v2 made here are false, and correcting them changes what P2 is for.**
 
-### 4.3 Content-equivalence: teach the no-drop proof about squash merges
+- **"Distinguish held refs the incoming section wants to change from held refs that are
+  already convergent" is a no-op for ownership holds.** The publish loop's very first
+  statement is `if (oldOid === newOid) continue;` (`follow.ts:732`), *before*
+  `if (!hold && owned.has(ref))` (`follow.ts:734`). A convergent ref is skipped before
+  ownership is ever consulted, so **every** ordinary sibling-worktree hold is by
+  construction a ref the incoming section wants to change. There is no second category to
+  filter out. (The exceptions are the pre-seeded holds — `ambiguousRefs` at
+  `follow.ts:730` and `forcedHeldRefs` at `:731` — which do bypass the equality skip; they
+  are not the worktree case this bullet was written for.)
+- **"Capture is not gagged by a hold alone" is wrong, and P1b does not fix it.** The held
+  ref's own pending value is, by the point above, different from its live value. Both
+  `pendingSupersessionPreProbe` (`pending-supersession.ts:103-105`) and
+  `provePendingSupersession` (`:198-203`) evaluate **every** pending ref, and for heads the
+  test is `equalOrFastForward(repoDir, pendingOid, candidateOid)` — literally
+  `gitCommitAncestry(pending, candidate) !== "not-ancestor"` (`pending-supersession.ts:179-181`),
+  i.e. the *remote's* value must be an ancestor of the local one. A worktree-held ref the
+  remote advanced fails that, and P1b adds only an **absent + receipt** row, which does not
+  apply to a ref that is present and divergent. So supersession still refuses and
+  `apply.ts:1447-1450` still sets `pending[rel] = remoteSec`.
+
+**What P2 therefore actually delivers:** the ~9 s per-cycle follow disappears (held-skip),
+and a non-HEAD ownership hold stops deferring the whole repository. **It does not unfreeze
+the capture lane.** The bridge from mode (a) to mode (b) described in §1.5 — a hold gagging
+capture while the user keeps deleting merged branches — is closed by **P4 alone**. That is a
+materially stronger argument for P4 being in scope than v2 made, and §4.5, §5 and §11 are
+corrected to match.
+
+### 4.3 Content-equivalence: cascade reduction for squash-merged branches (P3)
 
 Even with P2, a worktree-held branch that is squash-merged is still classified as
 receiver-only work by every proof that touches it, because merged-ness is ancestry-only
 (§2.1). That is what makes an abandoned worktree feel permanent rather than merely untidy,
 and it is where the founder's validated recipe belongs.
+
+**P3 is cascade reduction, not a merged-ness proof.** v3 renames what it claims, because
+codex found both a false positive and a boundary that was prose rather than mechanism. Read
+the rest of this section with that framing: P3's job is to stop a squash-merged branch from
+forcing holds onto *unrelated* refs through the `noDropProof` fixpoint. It is not evidence
+about deletion and it is structurally barred from influencing one.
 
 **Proposal P3.** Extend `noDropProof` (`reachability.ts:208-238`). Today a protected tip
 `T` that is not an ancestor of any durable root `D` returns `{status:"would-drop"}`
@@ -717,12 +1200,19 @@ immediately. Before returning, run a bounded content-equivalence probe for each 
 ```
 base  = git merge-base D T
 # patch-id of the whole base..T range, as one synthetic change:
-pid   = git diff-tree -p --no-commit-id base T | git patch-id --stable
+pid   = git diff-tree -p --no-commit-id base T | git patch-id --verbatim
 # patch-ids of everything D gained since the fork point:
-match = git log -p --format=%H --no-merges base..D | git patch-id --stable | grep pid
+match = git log -p --format=%H --no-merges base..D | git patch-id --verbatim | grep pid
 ```
 
 If any `D` matches, return `{status: "proven", marker: "content-equivalent"}`.
+
+**`--verbatim`, not `--stable`.** `git patch-id --stable` ignores all whitespace within the
+patch, so a branch that differs from its supposed squash only in indentation matches.
+`--verbatim` preserves whitespace and, per Git's own documentation, "implies `--stable`" —
+so it is strictly stronger with no ordering cost. It was added in Git 2.39; rbox already
+requires Git ≥ 2.46 (`checkGitCapability`, `doctor-cmd.ts:372-386`), so it is always
+available. This closes half of codex's objection outright.
 
 This is the founder's recipe with two deliberate changes:
 
@@ -748,13 +1238,55 @@ This is the founder's recipe with two deliberate changes:
 - All Git invocations use the existing `graphEnv` (`GIT_NO_LAZY_FETCH=1`,
   `GIT_NO_REPLACE_OBJECTS=1`, `reachability.ts:32`) — `REVIEW-174-R2-CODEX.md:17` requires
   ancestry over the literal object graph, and the same requirement applies to patch-ids.
-- **Content equivalence may waive a hold. It may never authorize a deletion.** Deleting a
-  branch still requires a design-130 tombstone attestation or a P1 absence receipt.
-  patch-id equality says the *diff* survives; it says nothing about commit SHAs, messages,
-  authorship or signatures, and those are not rbox's to discard on evidence this weak.
 - Cache on `(T, D)`. Both are immutable OIDs, so the answer is a pure function of the key
   and never needs invalidation. Persist alongside `divergence-cache.ts`'s store, bounded
   LRU.
+
+**The remaining false positive, stated rather than hidden.** Searching `base..D` for `T`'s
+range patch-id matches an **apply-then-revert**: if `D` once contained the branch's work
+and later reverted it, the historical commit is still in `git log base..D` even though
+`D`'s tree no longer has the work. The probe answers "did this diff ever appear on the way
+to `D`", not "is this diff present in `D`". Fixing that properly means an exact
+result-state proof — comparing `T`'s tree against `D`'s tree restricted to the paths the
+range touches, and reasoning about intervening edits — which is a different and much larger
+design. **v3 does not attempt it.** It is acceptable to leave because of the boundary
+below, and it is listed as a required negative test in §9.1.
+
+**The boundary, made structural.** v2 wrote "content equivalence may waive a hold; it may
+never authorize a deletion" and left it as a sentence. It is not self-enforcing, and codex
+was right that the sentence is false as written:
+
+- `noDropProof` returning `proven` is precisely how a ref **avoids** being held
+  (`follow.ts:815`, `if (proof.status === "proven") continue;`); and
+- a `refs/heads/*` ref that is not held and whose incoming target is absent flows into
+  `planBranchTransition` with `afterOid: null` (`follow.ts:975-987`), which builds the A
+  artifact and a `delete` line (`branch-transition.ts:109-124`) — with **no** attestation
+  check, because the attestation check at `follow.ts:993-999` is gated on
+  `tombstoneAuthorized.has(ref)`.
+
+So "not holding" *is* the authorization. Two mechanisms, both required:
+
+1. **A `content-equivalent` waiver may not clear a hold on a destructive transition.** In
+   the fixpoint at `follow.ts:806-816`, when `proof.marker === "content-equivalent"`, keep
+   the hold if the ref's planned transition is destructive — `newOid === undefined`
+   (incoming omits it), or `oldOid` is not an ancestor of `newOid`. Only fast-forward and
+   convergent transitions may take the waiver.
+2. **A structural test**, in the spirit of `base-composer-structure.test.ts`: the set of
+   refs whose hold was waived by `content-equivalent` and the set of refs reaching
+   `planBranchTransition` with `afterOid === null` are disjoint, asserted over the real
+   publish loop rather than by inspection.
+
+**How much reach P3 actually has, verified.** Less than v2 implied, and the honest number
+matters for §11's sequencing argument. The *ordinary* squash-merge deletion is already
+caught one stage earlier, by the first-pass `tipOwnedByIncoming` loop at
+`follow.ts:744-765`, which P3 does not touch: a squash-merged tip is an ancestor of nothing
+in `roots`, returns `unowned`, and is held as `local-commits` before `noDropProof` ever
+runs. The only thing that lifts that first-pass hold today is tombstone attestation
+(`follow.ts:768-786`). So P3's realistic effect is confined to the **second-pass fixpoint**,
+where a squash-merged tip that survived the first pass would otherwise cascade holds onto
+unrelated refs — which is exactly the "cascade reduction" framing, and exactly the win §1.1
+measured (4 of 10 worktree branches stop forcing holds). Describing it as "teaching rbox
+about squash merges" oversold it.
 
 ### 4.4 The per-ref pending lane: `pending ⊕ local` (P4)
 
@@ -767,7 +1299,7 @@ carried incoming section and becomes a **merge**: the carried `pending` value ve
 each held ref, the live local value for every ref rbox may publish. Today
 `apply.ts:1447-1450` sets `pending[rel] = remoteSec` for the whole repository and
 `normalizeOutgoingGitSections` republishes it by identity
-(`publisher-tombstones.ts:184-187`: when `gitIncomingKey(pendingSection) ===
+(`publisher-tombstones.ts:183-186`: when `gitIncomingKey(pendingSection) ===
 gitIncomingKey(section)` the pending section is reused unparsed and unnormalized). One
 held ref therefore freezes every other ref's published value for as long as the hold
 lasts. P2 stops that from *deferring* the repository and stops it *gagging capture*; only
@@ -786,17 +1318,35 @@ carry, and each needs its own answer:
    (`createScratchPins`, `capture.ts:282`) at capture time**, not borrowed from the
    apply-time namespace. Publishing a refs map whose tips are absent from the bundle is
    not a deferral, it is a broken section every follower fails to import.
-2. **`gitIncomingKey` stability.** `130:119-123` is explicit that the carry passes
-   byte-for-byte *precisely* so the key does not move, "because normalizing it would
-   change `gitIncomingKey` and orphan partial progress and deferral episodes bound to that
-   key". A merged section has a different key by construction — `refs`, `bundleSha` and
-   `packChain` all participate (`shared.ts:85-103`). Every consumer keyed on it needs a
-   decided story before the first merged section is emitted: `GitHeldAttempt.incomingKey`
-   (`sync-state-model.ts:228-245`), the `partial` record and `setDeferral`'s
-   `subjectKey` (`apply.ts:1448-1450`), and the tombstone attestation binding
-   (`checkTombstoneAttestation({ incomingKey: gitIncomingKey(opts.incoming), … })`,
-   `follow.ts:779-782` and `:995-998`). This is the load-bearing constraint, not the
-   bundle.
+2. **`gitIncomingKey` stability — DECIDED in v3, not left to the implementation.**
+   `130:119-123` is explicit that the carry passes byte-for-byte *precisely* so the key
+   does not move, "because normalizing it would change `gitIncomingKey` and orphan partial
+   progress and deferral episodes bound to that key". A merged section has a different key
+   by construction — `refs`, `bundleSha` and `packChain` all participate
+   (`shared.ts:85-103`). v2 said "whichever key story the implementation chooses", which is
+   not implementable.
+
+   **The decision: the carried pending section is never rewritten.** `pending[rel]` keeps
+   the remote's unapplied section verbatim, exactly as today; the merge produces a
+   *separate outgoing* section. Every consumer keyed on the incoming key therefore does not
+   move at all, because every one of them is an **apply-lane** record keyed on the
+   *pending/incoming* section, never on the outgoing one:
+
+   | Consumer | Key source | Effect of P4 |
+   |---|---|---|
+   | `GitHeldAttempt.incomingKey` (`sync-state-model.ts:228-245`) | incoming section, set in the apply lane | none |
+   | `partial[rel]` | apply lane | none |
+   | `setDeferral(rel, "apply", …, incomingKey, …)` (`apply.ts:1447-1450`) | incoming section | none |
+   | tombstone attestation binding (`follow.ts:779-782`, `:994-998`) | `gitIncomingKey(opts.incoming)` | none |
+
+   What *does* change is that `normalizeOutgoingGitSections` stops taking the
+   reuse-by-identity path (`publisher-tombstones.ts:183-186`: reuse iff
+   `gitIncomingKey(pendingSection) === gitIncomingKey(section)`), which is the intended
+   behaviour of P4 and not a key migration.
+
+   **Enforced, not assumed:** a structural test asserting that no outgoing merged section's
+   `gitIncomingKey` is ever written into `deferrals`, `attempt` or `partial`. If a future
+   change binds anything to the outgoing key, that test is the thing that fails.
 3. **Tombstone authorship on held refs.** The carry is *exempt* from
    `normalizePublishedGitSection`; a merged section is not, so it runs the supersession
    authoring loop at `publisher-tombstones.ts:108-122`, which mints a tombstone for every
@@ -818,23 +1368,99 @@ carry, and each needs its own answer:
    every merged section refuses its own dry-run and carries forever, which is the wedge
    again with extra steps.
 
-**Ordering constraints.** §3.6 already establishes one: P1b's receipt must be committed
-*before* capture, or the ACK dry-run refuses the omitting candidate. P4's are analogous
-and are stated with the same force.
+6. **Held-ref-aware ACK authority — new in v3, and the one that protects P1.** This is the
+   entanglement v2 missed entirely, and it is the most dangerous of the six because it
+   silently falsifies the invariant P1's safety rests on.
 
-- **P1 + P1b must land before P4.** Constraint 4 above. Without the receipt rule, the
-  per-ref lane manufactures exactly the deletion-by-omission that §8 item 3 rejects, at a
-  granularity that makes it harder to see. This inverts v1's landing order, which shipped
-  the authority change last.
-- **P2 must land before P4.** P4 composes over "the set of held refs". If
-  `apply.ts:1447-1450` still promotes any held ref to a repository-wide pending disposition,
-  that set is either empty or everything, and there is nothing to merge. P2's "no whole-repo
-  escalation for a non-HEAD ref" is what produces the per-ref hold set P4 consumes.
-- **P3 is independent, but should land before P4 anyway.** Content equivalence only turns
-  `would-drop` into `proven` inside `noDropProof`; it changes which refs are held, never how
-  the section is composed. Landing it first *shrinks* the held set on the founder's machine
-  (four of ten worktree branches, §1.1), which makes P4's first real exposure smaller. That
-  is a validation argument, not a correctness one.
+   On an accepted push, `push.ts:962-972` mints the `publisher-ack` authority with
+   `advertisedRefs: section.refs` — **every** ref in the committed section. `composeRepoBase`
+   then mints a `publisher-ack` origin for a ref purely because
+   `authority.advertisedRefs[ref] === requested` (`base-composer.ts:356-367`). Under P4 the
+   committed section contains held refs at *carried* values this device never physically
+   held. Those values would therefore acquire physical-presence provenance — and §3.4's
+   invariant, which P1 reads as licence to publish a deletion, becomes false. Excluding held
+   refs from tombstone *authorship* (constraint 3) does not touch this: authorship is about
+   claiming a supersession, provenance is about claiming possession.
+
+   **The fix: the ACK authority carries the captured set and the carried set separately.**
+
+   ```ts
+   { kind: "publisher-ack"; lineageHash; repositoryIdentityHash; incomingKey; sourceSeq;
+     advertisedRefs: Readonly<Record<string, string>>;   // captured from THIS device's P
+     carriedRefs:    Readonly<Record<string, string>>; } // carried from the pending section
+   ```
+
+   - `push.ts` populates `advertisedRefs` with `section.refs` **minus** the held/carried
+     refs, and `carriedRefs` with exactly those.
+   - `base-composer.ts`'s `publisher-ack` arm gains one rule ahead of the existing ones: if
+     `ref ∈ carriedRefs`, then `after = before` and **no origin is minted** — the same
+     shape as today's `requested === null` case at `base-composer.ts:356`. BASE keeps its
+     prior value and prior origin for that ref. No hold code: carrying is legitimate, not a
+     mismatch.
+   - The authority is rejected outright unless `advertisedRefs` and `carriedRefs` are
+     disjoint and their union is exactly `Object.keys(section.refs)`. That closes the
+     obvious attack of moving a ref between the two sets to launder provenance.
+
+   **Consequence, and it is the desirable one:** a ref this device has only ever *carried*
+   never acquires a usable origin, so it can never satisfy §3.3 rule 1, so P1 can never
+   publish a deletion for it. The two features protect each other rather than one
+   undermining the other. Enforced by `base-composer-structure.test.ts`-style exhaustiveness
+   over the widened authority, which `130:286-323`'s closed union already forces.
+
+**Ordering constraints.** §3.6 establishes one: P1b's receipt must be committed *before*
+capture, or the ACK dry-run refuses the omitting candidate. v3 corrects two of v2's three.
+
+- **P1 + P1b must land before P4 — real, and now doubly so.** Constraint 4: without the
+  receipt rule, the per-ref lane manufactures exactly the deletion-by-omission that §8
+  item 3 rejects, at a granularity that makes it harder to see. Constraint 6 adds the
+  converse direction: without the held-ref-aware ACK, P4 forges the provenance P1 trusts.
+  Neither is safe alone; the ordering is P1/P1b first, and constraint 6 ships **with P4**,
+  in sub-step 4a, never after it.
+- **~~P2 must land before P4.~~ Not a real dependency — corrected in v3.** `publishRefPlane`
+  already returns a per-ref held set today: `heldRefs` is built per ref and returned both as
+  a set (`follow.ts:1041`) and as a map (`follow.ts:1047`). `apply.ts:1447` consumes only
+  its cardinality (`held.length > 0`), but the per-ref information is already there for P4
+  to merge over. P2 is a performance and deferral-reporting change; it is neither a
+  prerequisite for P4 nor for P1. It is still landed first in §11, for validation-sequencing
+  reasons, but §11 no longer claims it is required.
+- **P3 is independent, and lands early for exposure reasons only.** Content equivalence only
+  turns `would-drop` into `proven` inside `noDropProof`; it changes which refs are held,
+  never how the section is composed. Landing it first *shrinks* the held set on the
+  founder's machine (four of ten worktree branches, §1.1), which makes P4's first real
+  exposure smaller. That is a validation argument, not a correctness one.
+
+### 4.4a P4's accepted-ACK state machine — the third outcome
+
+v2 left this undecided; it is the difference between a specification and a sketch.
+
+**Today there are exactly two outcomes**, and both are whole-section:
+
+- **settled** — the repo is in `supersededPending ∪ resolvedPending`, so `push.ts:938-941`
+  removes it from `pendingAfterAck` and `gitBaseAfterCommit` (`plan.ts:1155-1167`) lets
+  BASE advance to the whole committed section;
+- **unsettled** — the repo stays in `pendingAfterAck`, and `gitBaseAfterCommit` restores the
+  **old** BASE section wholesale ("the saved git BASE must keep the OLD entry (or none) so
+  the next pull still sees remote != base and retries the apply", `plan.ts:1150-1154`).
+
+A merged section is neither: this device applied and captured most refs but has not applied
+the held ones.
+
+**The third outcome: `partially-superseded`.**
+
+| Facet | Rule |
+|---|---|
+| **Section BASE refs** | advance to the committed section's value for every ref in `advertisedRefs` (the captured set); keep the previous BASE value for every ref in `carriedRefs`. `gitBaseAfterCommit` moves from "pick old or new section" to "merge per ref" **for this outcome only**. |
+| **Section BASE non-ref fields** | `head`, `bundleSha`, `packChain`, `config`, opState and index projection all keep their **previous BASE** values. They describe a state this device has not applied; advancing them would make the next pull read "unchanged" and never retry the apply — the exact regression `plan.ts:1150-1154` was written to prevent. |
+| **Design-130 branch BASE** | handled entirely by §4.4 constraint 6: carried refs get `after = before` and no origin. No separate mechanism. |
+| **`pending[rel]`** | **retained verbatim, never rewritten.** The apply lane still needs the whole section — head, index, bundle — to finish applying. This is also what makes constraint 2's key decision work. |
+| **Deferral subject** | unchanged: the apply deferral keeps the incoming key. The push lane records **no** deferral for a partial settle; it emits one bounded line naming the carried refs. |
+| **Held attempt** | unchanged, keyed on the incoming section. The held-skip bracket is unaffected: held-skip short-circuits the *follow*, and the push lane recomposes the merge from live refs every cycle regardless. |
+| **Partial progress** | unchanged; `partial[rel]` continues to record the follow's applied/held refs. |
+| **Crash recovery** | the partial-settle BASE update is part of the same post-ACK state CAS as everything else in `push.ts`. If the push is accepted and the CAS is lost, the next cycle re-derives from unchanged BASE + unchanged pending + unchanged live refs, recomposes a content-identical merged section, and re-pushes; the existing `supersededPending` path absorbs it. No new recovery code. |
+
+**What "partial progress" means to a follower: nothing.** A merged section is an ordinary
+`GitSection`. The partial-settle outcome is entirely a publisher-side bookkeeping state; no
+receiver can observe it and none needs to.
 - **Inside P4, bundle coverage and key derivation precede the merged emit.** Sub-step 4a:
   pin held pending tips into the capture, decide and migrate the `gitIncomingKey` story,
   and structurally exclude held refs from tombstone authorship — all provable without
@@ -856,16 +1482,27 @@ Ship P2 and P3 together with P1, then P4 as a separate, separately-gated step (�
 the founder's Mac the P1–P3 result is:
 
 - the abandoned `~/.codex` worktrees hold their own branches and nothing else;
-- the repository is not deferred, capture is not gagged, and the follow is skipped on
-  subsequent cycles until the worktree registry actually changes;
-- the four squash-merged branches stop counting as endangered local work, so the
-  `noDropProof` fixpoint stops cascading holds onto unrelated refs;
-- the phantom ref is captured as an absence within one cycle and the wedge clears itself.
+- the repository is not *deferred*, and the follow is skipped on subsequent cycles until the
+  worktree registry actually changes;
+- the four squash-merged branches stop cascading holds onto unrelated refs through the
+  `noDropProof` fixpoint;
+- the phantom ref is captured as an absence, published in the **same cycle's** push lane
+  (§3.6a step D), and the wedge clears itself.
 
-P4 then closes the remaining gap: while any of those holds is outstanding, the repository's
-*outgoing* section stops being frozen at the incoming value and publishes local work for
-every ref that is not held. P1–P3 clear both field wedges; P4 is what stops the class from
-re-forming the next time an agent leaves a worktree behind.
+**Corrected in v3: capture is still gagged after P1–P3.** v2 claimed P2 ungagged it. It does
+not (§4.2): a worktree hold is by construction on a ref the incoming section wants to change,
+so `provePendingSupersession`'s equal-or-fast-forward test refuses and
+`apply.ts:1447-1450` still sets `pending[rel] = remoteSec`. So the honest statement is:
+
+- **P1 + P1b clear both observed field wedges** — mode (b) directly, and mode (a) only once
+  the worktree is actually removed;
+- **P4 is the only change that breaks the §1.5 causal chain**, because it is the only one
+  that lets unrelated local work publish past an outstanding hold. Without it, an agent
+  leaving a worktree behind still gags capture and still manufactures phantom refs — which
+  P1 now cleans up automatically, but only after the fact.
+
+That strengthens the case for P4 rather than weakening it, and it is why §11 keeps P4 in
+scope despite its being the only step that ships default-OFF.
 
 ## 5. The self-healing contract
 
@@ -873,11 +1510,12 @@ re-forming the next time an agent leaves a worktree behind.
 
 | Situation | New behavior |
 |---|---|
-| Published branch deleted locally (`git branch -D`, `git worktree remove`, agent cleanup) | Absence receipt written, BASE retired, deletion published as a tombstone, `pending` superseded. One bounded log line. |
+| Published branch deleted locally (`git branch -D`, `git worktree remove`, agent cleanup) | Tip pinned for 90 days (§3.7), absence receipt written, BASE retired, deletion published as a tombstone in the **same cycle's push lane**, `pending` superseded. One bounded log line. |
 | `pending` carried on a ref the local repository no longer has | Supersedes as soon as the absence receipt exists. |
-| Abandoned worktree holding a branch | Per-ref hold only; the repository keeps syncing; the follow is held-skipped until the worktree registry changes. |
-| Squash-merged branch classified as endangered local work | Recognized as content-preserved; stops forcing holds on other refs. |
-| Stale positive BASE member left by a *past* deletion (the latent wedge, §2.3) | Reconciled on the next cycle, before it can arm. |
+| Abandoned worktree holding a branch | Per-ref hold only; the repository is no longer *deferred* and the follow is held-skipped until the worktree registry changes. **Capture is still gagged until P4** (§4.2) — corrected from v2. |
+| Unrelated local work while a worktree hold is outstanding | **P4 only.** Publishes per-ref past the hold. Nothing before P4 changes this. |
+| Squash-merged branch cascading holds onto unrelated refs | Cascade broken by content equivalence. It does **not** lift the first-pass ownership hold on the merged branch itself (§4.3). |
+| Stale positive BASE member left by a *past* deletion (the latent wedge, §2.3) | Reconciled before apply's unchanged shortcut (§3.6a step A), so it clears without waiting for a divergence to arm it. |
 
 **Still needs a human, and should say so loudly:**
 
@@ -893,13 +1531,38 @@ re-forming the next time an agent leaves a worktree behind.
 **`rbox doctor` gains a leftover-worktree section. Deferral messages do not print absolute
 worktree paths yet.** Two decisions, one shared reason.
 
-**Doctor: yes.** A section listing leftover linked worktrees — count, and per entry the
-branch, the **full absolute path**, `prunable`, and whether it currently holds a synced ref.
-Ten accumulated silently on the founder's Mac and the first signal was a sync deferral.
+**Doctor: yes — but through a local-only projection that never reaches the bundle.** A
+section listing leftover linked worktrees — count, and per entry the branch, the **full
+absolute path**, `prunable`, and whether it currently holds a synced ref. Ten accumulated
+silently on the founder's Mac and the first signal was a sync deferral.
 `path.basename(e.path)` alone (`apply.ts:118`) is useless at that scale precisely because
 the founder's worktrees are all *named after their branches* — the basename repeats the one
 field the message already prints. `rbox doctor` runs locally on the machine that owns those
 paths, so a full path there reveals nothing the operator does not already have.
+
+**The exclusion mechanism — new in v3, because `checks` is uploaded raw.**
+`buildDiagnosticsBundle` (`doctor-cmd.ts:523-541`) applies `redactGitLogLines` only to
+`daemonLogTail` (`:527`) and passes `checks: ctx.checks` **unredacted** (`:535`) — and at
+least one existing check already puts a raw `Error.message` into it
+(`doctor-cmd.ts:351`). Putting absolute worktree paths into a `DoctorCheck` would upload
+them. So:
+
+- The leftover-worktree data lives in a **separate field on `DoctorContext`** — say
+  `ctx.localOnly.leftoverWorktrees` — that is **not** a `DoctorCheck` and is **not** an
+  argument to `buildDiagnosticsBundle`. Only the human printer reads it.
+- The bundle instead receives a redacted projection: the count, and per entry the branch
+  name, `prunable`, and a `holdsSyncedRef` boolean. **No path text, no basename, no
+  parent-directory name.** If path *shape* turns out to be diagnostically useful later, add
+  a salted digest, not a truncation.
+- **Typed, not filtered at runtime.** The local-only projection and the bundle projection
+  are distinct types, and the local-only type is not assignable to the bundle's — so
+  "forgot to strip it" is a compile error rather than a review miss.
+- **Tested:** `JSON.stringify(await buildDiagnosticsBundle(ctx))` contains none of the
+  absolute paths the local section printed (§9.6).
+
+This closes the new exposure. It does **not** close the pre-existing one — `ctx.checks` is
+still uploaded raw, and `doctor-cmd.ts:351` is still a raw `Error.message`. That stays
+scoped out (§10); the rule here is only that this design must not add to it.
 
 **Deferral messages: not yet, and the reason is a redaction gap, not a UX preference.**
 `rbox doctor` output can be uploaded (`POST /v1/diagnostics`), and an independent review
@@ -953,11 +1616,15 @@ for one repository. Scale: ~203 branch heads across 110 repositories.
 | Change | Complexity | Expected wall clock |
 |---|---|---|
 | P1 witness evaluation, negative case | O(BASE heads) in-memory lookups against `live.refs`, already read once per cycle. **Zero new Git subprocesses.** | ~203 property lookups per full pass. Unmeasurable. |
-| P1 absence capture, positive case | One prepared ref transaction + one state CAS per deleted branch — the same shape as any other branch transition. | Tens of ms, once per deletion, not per cycle. |
+| P1 absence capture, positive case | One prepared ref transaction + one state CAS per deleted branch — the same shape as any other branch transition — plus §3.7's `cat-file -e` probe and keep-pin lines inside the *same* transaction. | Tens of ms, once per deletion, not per cycle. |
+| §3.7 keep-pin accumulation | ~10 deletions/day × 90 days ≈ **~900 hidden refs** at steady state, spread across repositories, each holding its commit against `git gc`. **The only unbounded-in-time cost in the design**, and the one the founder explicitly accepted. | Measured, not assumed — §11's separate bake. |
+| §3.7 expiry sweep | One `readKeepPinOrigins` file read per repository per cycle as the gate; a `for-each-ref refs/rbox-local/keep/*` at most once per repository per 24 h, and only when a `tombstone`-class origin exists. | Negligible; most repositories skip at the gate. |
+| §3.3a strict ref read | Same `git show-ref` invocation, different error handling. **Zero additional subprocesses.** | Zero. |
+| §3.6a position change | Moving reconciliation above `apply.ts:873` adds an O(BASE heads) in-memory predicate to the *unchanged* path — the hot path for converged repositories. It must reuse the cycle's existing ref read and must not acquire a protocol lock when the candidate set is empty. | Unmeasurable if implemented as specified; a new spawn per converged repository per cycle if not. This is the line to watch in review. |
 | P1b pending pre-probe | Today's loop plus one artifact-disposition lookup per missing head. | Unmeasurable. |
 | P3 content equivalence | Runs **only** on tips the ancestry proof already rejected — normally 0 per cycle. Per probe: 1 `merge-base` + 1 `diff-tree｜patch-id` + 1 walk of `base..D` capped at 5,000 commits. Cached on immutable `(T, D)`. | Cold worst case (all ~203 heads unowned, e.g. first sync of a heavily squashed workspace): ~600 spawns ≈ 6–12 s **once**. Steady state ≈ 0. |
 | P2 held-skip for `worktree-ownership` | One extra `git worktree list --porcelain` per repository per cycle for the digest. | **Removes** a full follow per cycle for every ownership-held repository — on the observed data, roughly the whole 9 s p95 for `Personal/rbox-core`. |
-| **P4 per-ref pending lane** | **Positive cost, and the only one here.** Today a held repository republishes the carried pending section *by identity* — `normalizeOutgoingGitSections` reuses `pendingSection` unparsed when the incoming keys match (`publisher-tombstones.ts:184-187`), so it re-advertises the same `bundleEncSha` and uploads **nothing**. A merged section is a new section, so every cycle with an outstanding hold now runs an ordinary capture: bundle build, encrypt, upload. | Incremental, so the increment is the local delta plus the pinned held tips, not a full repack — `capturePlannedGitSection` reuses the pack chain until `exceedsPackChainByteBound` forces recompaction (`shared.ts:236-249`). Order of a normal capture for that repository, once per cycle, for as long as the hold lasts. |
+| **P4 per-ref pending lane** | **Positive cost, and the only one here.** Today a held repository republishes the carried pending section *by identity* — `normalizeOutgoingGitSections` reuses `pendingSection` unparsed when the incoming keys match (`publisher-tombstones.ts:183-186`), so it re-advertises the same `bundleEncSha` and uploads **nothing**. A merged section is a new section, so every cycle with an outstanding hold now runs an ordinary capture: bundle build, encrypt, upload. | Incremental, so the increment is the local delta plus the pinned held tips, not a full repack — `capturePlannedGitSection` reuses the pack chain until `exceedsPackChainByteBound` forces recompaction (`shared.ts:236-249`). Order of a normal capture for that repository, once per cycle, for as long as the hold lasts. |
 
 **Net, restated for v2.** P1–P3 are net negative, and the only new per-cycle work among
 them is a hash of a `git worktree list` output the follow already spawns five times.
@@ -994,31 +1661,40 @@ identifier; statement, `Enforced:`, `Proven:`, `Since: 200`):
 1. **Positive BASE provenance implies prior physical presence.** A `refs/heads/*` member
    of BASE carrying a usable current-lineage origin was physically held by this device at
    that OID. *(Today emergent from `base-composer.ts:227-229, 364-367, 418`; now pinned,
-   because §3.4 depends on it.)*
+   because §3.4 depends on it.)* **It proves possession, never the cause of a later
+   absence** — §3.3b. **A carried ref never acquires such an origin** — §4.4 constraint 6.
 2. **A published branch deleted locally is captured, never resurrected.** BASE-positive +
    P-absent + clear artifacts yields a locked absence receipt, never a branch creation.
 3. **Absence capture is fail-closed.** Any missing origin, stale lineage, existing A/P/K,
-   sibling ownership, busy repository, unreadable identity, or unstable second observation
-   leaves the ref untouched.
-4. **Mass absence defers to a human.** More than the configured share of a repository's
-   positive BASE heads vanishing at once captures none of them.
+   sibling ownership, busy repository, unreadable identity, HEAD symref naming the ref,
+   ref-database regression signal, or unstable second observation leaves the ref untouched.
+4. **Mass absence defers to a human.** Either an absolute count **or** a share of a
+   repository's positive BASE heads vanishing at once captures none of them. *(The `OR` is
+   the invariant; a conjunction of the two legs is not equivalent and is unsafe — §3.5.)*
 5. **Content equivalence waives holds, never authorizes deletion.** A patch-id match may
-   only convert `would-drop` to `proven`; deletion authority remains tombstone attestation
-   or an absence receipt.
-6. **A pending section is superseded only against a proved candidate.** Supersession
+   only convert `would-drop` to `proven`, and only for a non-destructive transition; a
+   `content-equivalent` waiver and an `afterOid === null` transition are disjoint by
+   construction. Deletion authority remains tombstone attestation or an absence receipt.
+6. **An absence proof is never derived from a failed ref read.** Every read that feeds a
+   deletion, a locked absence proof, or a published section distinguishes "no refs" from
+   "could not read refs" and fails closed on the latter. *(New in v3 — §3.3a.)*
+7. **A pending section is superseded only against a proved candidate.** Supersession
    requires either local presence at an equal-or-descendant OID or a durable absence
    receipt for every pending head — never mere omission. *(Pins
    `REVIEW-174-R1-OPUS-B.md:14`'s resolution, which is currently unpinned in
    `INVARIANTS.md`.)*
-7. **Worktree ownership is observed regardless of containment.** Sibling worktrees outside
+8. **Worktree ownership is observed regardless of containment.** Sibling worktrees outside
    the workspace still hold their refs; containment affects only reporting.
-8. **A published deletion stays recoverable for a bounded window.** Every device that
-   prunes a branch under tombstone authority pins the tombstoned tip for
-   `TOMBSTONE_PIN_RETENTION_MS`, and pins every other reflog OID for that branch
-   permanently. Publishing a deletion may never be the act that destroys the last copy of
-   the objects. *(This is the condition §12 Q3's ruling rests on; §7.1 states it in full,
-   including where it does not hold.)*
-9. **Held refs are published, never superseded.** In a `pending ⊕ local` outgoing section
+9. **A published deletion stays recoverable for a bounded window, from the device that
+   published it.** The device performing an absence capture pins the tombstoned tip under
+   `refs/rbox-local/keep/<X>` with a `tombstone`-class origin, in the same ref transaction
+   as the A artifact and strictly before BASE is retired — so BASE is never retired without
+   a pin. Devices that prune under tombstone authority pin it too, as they already do.
+   Publishing a deletion may never be the act that destroys the last *reachable* copy of an
+   object that still exists. *(§3.7, ruling R3. The one admitted exception — the object was
+   already `gc`-pruned before rbox looked — is recorded there and surfaced by §7.2 rather
+   than hidden.)*
+10. **Held refs are published, never superseded.** In a `pending ⊕ local` outgoing section
    (P4), a held ref carries its pending value verbatim and is excluded from tombstone
    authorship. Composing a section is never authority over a ref this device does not hold.
 
@@ -1027,13 +1703,14 @@ local-absence receipt is not equality, it is a locked proof of physical absence 
 positive provenance. `follow.ts:894-895` keeps holding; it simply stops being reachable
 for refs absence capture has already reconciled.
 
-### 7.1 The recoverability window — the condition on the "no safety pin" ruling
+### 7.1 The recoverability window — why the follower-pin premise failed
 
-§12 Q3 was ruled **no pin, conditional on tombstone recoverability being stated first**.
-The condition is real: §3.4's argument for skipping the pin is "the fleet still holds the
-objects", and if that stops being true the last machine to sync destroys the only copy.
-This section states what is recoverable, from where, by what command, and for how long —
-verified against the code, including the two places the premise does not hold.
+**Superseded by R3 (§3.7).** v2's §12 Q3 was ruled "no pin, conditional on tombstone
+recoverability being stated first"; codex demolished the condition and the founder reversed
+the ruling on 2026-07-24. This section is kept — reframed — because the *analysis* is the
+rationale for R3, and a future reviewer who deletes it will re-propose the follower-pin
+model. What follows is the mechanism that does exist, followed by the four places it
+produces nothing.
 
 **The mechanism is the keep-pin, not the tombstone record.** This distinction matters and
 the ruling's phrasing elides it. A `GitRefTombstone` is `{ oid, ts, generation }`
@@ -1064,48 +1741,99 @@ So the recoverable thing is a real Git object, reachable by a real ref, on **eve
 in the fleet that pruned the branch**. The prune is what creates the pin — a device that
 never had the branch has nothing to pin and nothing to lose.
 
-**By what command.** The keep-pin ref *names the OID*, so no state-file archaeology is
-needed. On any device that pruned it:
+**Why that is not sufficient — the four cases the follower pin does not cover.** The prune
+is what creates the pin, so no prune means no pin. v2 listed two gaps; there are four, and
+three of them are ordinary rather than exotic.
+
+1. **The deleting device pinned nothing** (before R3). The A artifact does *not* pin the
+   tip. It writes a canonical blob holding
+   `{ lineageHash, priorOid, ref, repositoryIdentityHash, v:2 }` and points
+   `refs/rbox-local/base-absent/v2/<lineage>/<refHash>` at **that blob**
+   (`baseAbsentPayload`, `base-artifacts.ts:145-149`; `:218-224`) — it records the OID as
+   *text*, and nothing keeps the commit reachable. Contrast the P artifact, which creates
+   genuine keep-refs directly at `priorOid` and `nextOid` (`basePresentKeepRef`,
+   `base-artifacts.ts:114-118`, spliced at `:237-244`). **R3 closes exactly this
+   asymmetry**, by giving the A path the keep-refs the P path always had.
+2. **A single-device workspace has no fleet.** No other device applies the section, so none
+   prunes, so no pin is ever created anywhere.
+3. **Concurrent deletion on both devices.** Each side deletes locally before applying the
+   other's tombstone; each then takes the `!oldOid && !newOid` path (`follow.ts:936`) and
+   prunes nothing. Neither pins. This is a *likely* interleaving for the founder's loop —
+   the same agent cleanup runs on both machines — not a race that needs constructing.
+4. **A device that never received the ref, or that runs pre-1.6.8** (§3.0), has nothing to
+   pin or holds instead of pruning.
+
+**So recovery depended on a coincidence**, which is why the ruling was reversed. With R3 the
+guarantee attaches to the one device certain to exist: the one that performed the deletion.
+
+**The 90-day bound was, and until §3.7's sweep lands still is, a ceiling rather than a
+window.** `expireTombstoneKeepPins` (`keep-pins.ts:434-457`) is exported through
+`src/engine/index.ts:284` and has **no production caller**; the only other reference is
+`keep-pins.test.ts:166`. Tombstone pins are created and never aged out today. That errs
+toward over-retention, which was harmless while nothing depended on the number — but R3
+prices an accumulation cost *at* 90 days, so §3.7 specifies the caller, the cadence, the
+cheap gate, and names the resulting change to already-shipped follower-pin behaviour as a
+behaviour change under the same kill switch.
+
+### 7.2 Finding a deleted branch — the command, because none exists today
+
+R3 makes the object recoverable. It does not make it **discoverable**, and v2's instruction
+for finding the OID does not survive contact with the code.
+
+**Why the v2 instruction fails.** It said to read `X` from `rbox git resolve <repo> show-me`
+or from the published tombstone chain. Neither works:
+
+- **`show-me` structurally cannot print an OID.** `buildSnapshot` computes local-only
+  entries with their OIDs internally (`resolve-command.ts:238`, `:259`) and the public
+  projection strips them: `localOnlyCommits: localOnly.map(({ labels, subject }) => …)`
+  (`resolve-command.ts:296`). The JSON path additionally replaces any 40-hex token with
+  `[commit]` (`resolve-command.ts:320-322`), and `git-cmd.test.ts:222-235` pins that
+  contract by name. `refTombstones` appears nowhere in `resolve-command.ts` or
+  `resolve-presentation.ts`.
+- **The tombstone chain evicts before it expires.** Chains are capped at
+  `MAX_REF_TOMBSTONES_PER_REF = 16` and `MAX_REF_TOMBSTONES_PER_REPO = 512`
+  (`manifest-validate.ts:23-24`), and `normalizePublishedGitSection` applies the age cutoff
+  first and then evicts by `evictionOrder` down to those caps
+  (`publisher-tombstones.ts:124-146`). At ~10 deletions/day a busy repository's oldest
+  tombstones are gone long before 90 days. The retention constant is a *maximum*, not a
+  guarantee.
+- **Nothing enumerates keep pins.** `keepPinRef` (`keep-pins.ts:66`) has no importer under
+  `src/cli/`; the only `for-each-ref` over `refs/rbox-local/keep/*` lives inside
+  `keep-pins.ts` itself. `help-registry.ts:188-212` shows the complete `git` surface —
+  `deferrals` and `resolve`, nothing else — and `main-dispatch.ts:527-546` matches it
+  exactly.
+
+So today the only recovery path is state-file archaeology, which is not a recovery path.
+
+**`rbox git deleted <repo>` — new verb, local-only, scriptable.**
+
+- **Source of truth: the keep-pin origin sidecar**, not `state.json` and not the wire.
+  `readKeepPinOrigins` (`keep-pins.ts:400`) is one file read, and `KeepPinOrigin` already
+  carries `{ ref, episode, time, class }` (`keep-pins.ts:47-52`) — the branch name and the
+  timestamp are already there, which is why no new persisted field is needed.
+- **Lists**, newest first: branch name, when it was deleted, whether the pin was created by
+  *this device's own deletion* or by *pruning another device's tombstone*, whether the
+  object is still present, and the OID.
+- **`--restore <branch>` recreates it** without the user typing or pasting an OID —
+  automatic beats acknowledge-a-match beats copy-paste. It refuses if the branch name is
+  taken, and it is a plain `create` ref transaction, nothing more.
+- **`--json` for the scriptable twin**, so an agent or the rig can assert recovery end to
+  end without a human. Unlike `show-me`, this command's entire purpose is to emit the OID,
+  so the 40-hex scrubber must **not** be applied to it — and that difference has to be
+  deliberate and tested, because it is an exception to an existing pinned contract.
+- **Local-only.** It is never part of the diagnostics bundle, under §5.1's rule: branch
+  names and OIDs are user content.
+- **It must say when there is nothing to restore.** For the §3.7 case where the object was
+  already `gc`-pruned, the entry is listed with the deletion recorded and the object marked
+  gone. "No pin exists for this one" is a real answer and is better than an empty list that
+  reads as "nothing was deleted".
+
+Underneath, the manual escape hatch still works and is still worth documenting, because it
+depends on no rbox verb at all:
 
 ```sh
-# X is the tombstoned OID: read it from `rbox git resolve <repo> show-me`, or from the
-# still-published tombstone chain (same 90-day window), or from the A artifact's payload.
 git -C <repo> branch <name> refs/rbox-local/keep/<X>
 ```
-
-That is a plain Git command against a plain Git ref, which is the point: recovery does not
-depend on an rbox verb that does not exist.
-
-**Where the window does not hold.** Three gaps. None of them invalidates the ruling, but
-the ruling's premise is narrower than its phrasing, and the difference should not be
-papered over.
-
-1. **The deleting device pins nothing.** The A artifact does *not* pin the tip. It writes a
-   canonical blob holding `{ lineageHash, priorOid, ref, repositoryIdentityHash, v:2 }` and
-   points `refs/rbox-local/base-absent/v2/<lineage>/<refHash>` at **that blob**
-   (`base-artifacts.ts:145-149`, `:218-224`) — it records the OID as *text*, and nothing
-   keeps the commit reachable. Contrast the P artifact, which creates genuine keep-refs
-   directly at `priorOid` and `nextOid` (`basePresentKeepRef`, `base-artifacts.ts:114-118`,
-   spliced at `:237-244`). This asymmetry is deliberate and it is exactly what §8 item 10
-   proposed changing. **Consequence: recoverability is a fleet property, not a local one.**
-   On the machine that ran `git branch -D`, the objects are unreachable and `git gc` will
-   prune them on its own schedule. §3.4 already concedes this ("the local side is already
-   lost: Git deleted the ref *and* its reflog before rbox ever ran"), and it is consistent
-   — rbox is mirroring an accomplished fact — but it means the answer to "can I get it
-   back?" is always "from another machine", never "from here".
-2. **A single-device workspace has no fleet.** If no other device ever applies the section,
-   no device ever prunes, so no tombstone keep-pin is ever created. Combined with gap 1,
-   a published deletion on a one-device account is recoverable only until that device's
-   next `git gc`. This is the one case where the ruling's premise is simply false, and it
-   is called out as still-open in §12 Q3.
-3. **The 90-day bound is currently a ceiling, not an enforced window.**
-   `expireTombstoneKeepPins` (`keep-pins.ts:434-457`) is exported through
-   `src/engine/index.ts:284` but has **no production caller** — the only reference outside
-   its own definition is `keep-pins.test.ts:166`. Tombstone pins are therefore created and
-   never aged out today. That errs toward over-retention, so it is safe for this ruling;
-   but the design must not claim an *enforced* 90-day window while nothing enforces it,
-   and whoever wires the expiry later is turning a currently-unbounded guarantee into a
-   90-day one. That is a behaviour change and needs to be reasoned about as one.
 
 **Not a recovery path (checked, and recorded so nobody re-derives it).** The objects also
 survive server-side inside historical versions' Git bundle blobs: GC reachability is
@@ -1118,10 +1846,12 @@ that restores a Git ref from a historical version.** `rbox restore <file>@<seq>`
 file-plane only (`help-registry.ts:322-330`). The server copy is a backstop against total
 loss, not an operator-reachable recovery path.
 
-**Conclusion.** The condition holds for the multi-device case, by a mechanism whose
-retention constant was deliberately set equal to the tombstone's, with a one-line plain-Git
-recovery command. **No pin is added.** The residual single-device gap is recorded as open
-in §12 Q3 rather than silently absorbed.
+**Conclusion.** The follower pin is real and stays — it is free, it already ships, and on a
+multi-device fleet it gives a second copy. It is simply not a *guarantee*, because four
+ordinary situations produce no prune. R3 adds the guarantee at the deleting device (§3.7)
+and §7.2 adds the command that makes it reachable. Q3a — the single-device gap v2 recorded
+as open — is **RETIRED**: it was one instance of a general defect, and the general defect is
+now fixed.
 
 ## 8. Rejected alternatives
 
@@ -1162,20 +1892,19 @@ in §12 Q3 rather than silently absorbed.
    already tried the refusal-with-a-good-message approach here (`176:93-99`) and the
    result is the wedge in §1.2. A better refusal message is still worth having for the
    circuit-breaker case.
-10. **Pin every auto-captured deletion under a recovery ref.** **RULED 2026-07-24 —
-    rejected, conditionally, and the condition was checked (§7.1).** The proposal was to
-    pin `X` before retiring BASE, reusing design 116's keep-pin machinery — i.e. to give
-    the A artifact the keep-refs the P artifact already has (`basePresentKeepRef`,
-    `base-artifacts.ts:114-118`, `:237-244`). It is rejected because at ~10 deleted
-    branches/day it accumulates refs and holds objects on the founder's own machine
-    indefinitely, and because the local reflog is already gone by the time rbox looks — the
-    pin would preserve one OID rbox learned from BASE, not the branch's history.
-    The founder ruled "no pin" **conditional on published deletions remaining recoverable**.
-    That condition is verified in §7.1: they are, via the tombstone keep-pin
-    (`TOMBSTONE_PIN_RETENTION_MS`, 90 days, deliberately equal to
-    `REF_TOMBSTONE_RETENTION_MS`) on every device that prunes the branch, recoverable with
-    `git branch <name> refs/rbox-local/keep/<X>`. **It does not hold on a single-device
-    workspace**, which §12 Q3 keeps open.
+10. ~~**Pin every auto-captured deletion under a recovery ref.**~~ **NO LONGER REJECTED —
+    reversed 2026-07-24 by ruling R3, and moved into the design as §3.7.**
+    The v2 rejection rested on two arguments. One was a cost the founder has now explicitly
+    accepted (at ~10 deleted branches/day the pins accumulate — ~900 hidden refs at steady
+    state under the 90-day window, and they hold objects against `git gc`; §3.7 prices it
+    and §11 measures it). The other was **wrong**: "the local reflog is already gone, so the
+    pin preserves one OID rather than the branch's history" is true and irrelevant — one
+    OID *is* the branch tip, and `git branch <name> <tip>` restores the branch. Preserving
+    the tip was always the whole ask.
+    What actually killed the rejection was that its fallback did not exist: recovery via a
+    *follower's* prune pin produces nothing in four ordinary cases (§7.1), so "no pin here,
+    because there is a pin there" was conditional on a coincidence. §12 Q3 records the
+    reversal and retires Q3a.
 
 ## 9. Tests the implementation MUST write
 
@@ -1201,6 +1930,37 @@ history is needed:
   deferral.
 - Assert the **ordering** requirement of §3.6 explicitly: with the A artifact suppressed,
   the dry-run must still refuse the omitting candidate.
+- **§3.6a control flow, asserted at both defects v2 missed:**
+  - *Latent wedge before the shortcut.* A repo with a stale positive BASE member, **no
+    pending**, and an **unchanged** remote must be reconciled — pinning that the unchanged
+    shortcut at `apply.ts:873` is not reached before absence reconciliation. The negative
+    twin matters as much: a repo with no absent BASE heads must still take the shortcut with
+    no new Git subprocess and no protocol lock acquired.
+  - *No re-creation in the same pass.* After a retirement, assert the cycle ends with
+    `result: "reconciled"` and that `publishRefPlane` does **not** create `R` from the
+    section still in hand. Then assert the same cycle's push lane publishes the omitting
+    section plus the tombstone at `X`, so cycle N+1 sees a section without `R`.
+- **§3.7 pin, at every crash point.** Assert `refs/rbox-local/keep/<X>` exists with a
+  `tombstone`-class origin naming `R`; that it is created in the *same* ref transaction as
+  the A artifact (kill the process between the transaction and the BASE CAS and assert the
+  pin and artifact are both durable and BASE is still positive, then assert the next cycle
+  converges); and that BASE is **never** observed retired without the pin.
+- **§3.7 object-already-gone path.** With `X` unreachable and `gc`-pruned, assert the
+  capture still publishes the deletion, records `pinned: false`, and that §7.2's listing
+  reports the object as gone rather than omitting the entry.
+- **§3.3a strict read.** Build a repository with one malformed loose ref (write
+  `not-a-sha` into `.git/refs/heads/<b>`), then assert: `readAllRefs` returns `{}`;
+  `readAllRefsStrict` returns `unreadable`; absence capture refuses for the whole
+  repository; the locked second proof in `commitPlannedBranchTransition` refuses; and a
+  capture in that state does **not** emit a section advertising zero refs. Plus the
+  positive twin: a freshly `git init`-ed repository (exit 1, empty stderr) returns
+  `{ status: "ok", refs: {} }`.
+- **§3.3b restore and unborn branch.** (i) `git checkout -b feature` with HEAD naming an
+  absent `R` must never absence-capture, asserted both at plan time and via
+  `locked.currentRef`. (ii) Replace `.git/refs` and `.git/packed-refs` in place from a
+  snapshot, leaving the commonDir inode untouched, and assert `repositoryIdentityHash` is
+  **unchanged** (this is the test that pins *why* rule 5 is insufficient) while the
+  packed-refs inode signal and the breaker between them refuse the capture.
 
 **Mode (a):**
 
@@ -1221,11 +1981,21 @@ history is needed:
   `marker:"content-equivalent"` after.
 - Negatives that must remain `would-drop`: an unmerged branch; a branch merged with a
   *modified* squash (one extra hunk); a rebased-but-not-merged branch; a branch whose
-  content matches but under `GIT_NO_REPLACE_OBJECTS=0`-style object replacement.
+  content matches but under `GIT_NO_REPLACE_OBJECTS=0`-style object replacement; and a
+  **whitespace-only** difference, which `--stable` would match and `--verbatim` must not.
+- **The known false positive, asserted as known.** Apply the branch's work onto `D` and
+  then revert it. The historical commit is still in `base..D`, so the probe **matches** and
+  returns `proven`. Pin that as the current behaviour with the reason in the test name, so
+  the day someone builds an exact result-state proof the test is the thing that changes
+  deliberately rather than the thing that silently starts failing.
 - Bound: a fork point beyond the walk cap returns `would-drop`, asserted by injecting a
   low cap rather than building a 5,000-commit fixture.
-- Structural test (in the spirit of `base-composer-structure.test.ts`): the
-  `content-equivalent` marker never appears on any deletion-authority path.
+- **Destructive-transition bar (§4.3).** A ref whose incoming target is **absent** and whose
+  tip is content-equivalent to a durable root must stay **held** — the waiver must not
+  clear it. Same for a non-fast-forward target.
+- Structural test (in the spirit of `base-composer-structure.test.ts`): the set of refs
+  whose hold was waived by `content-equivalent` and the set reaching `planBranchTransition`
+  with `afterOid === null` are disjoint, evaluated over the real publish loop.
 
 ### 9.2 Adversarial table
 
@@ -1233,9 +2003,13 @@ Table-driven, in the shape of `tombstone-attestation.test.ts:66-83`. Absence cap
 **not** fire when any single one of these holds, with everything else valid: existing A;
 existing Z / settled absence; existing P/K; foreign artifact; sibling worktree owns the
 ref; receiver-equivalent collision group; origin missing; origin OID mismatched; origin
-lineage stale; `git` busy; preflight failure; repository identity changed; ref absent at
-plan time but present at the locked second proof; circuit breaker tripped. Each case
-asserts BASE unchanged, no artifact written, no wire tombstone authored.
+lineage stale; **origin minted from a *carried* value rather than a captured one** (§4.4
+constraint 6); `git` busy; preflight failure; repository identity changed; **`show-ref`
+unreadable at plan time**; **`show-ref` unreadable at the locked second proof**; **`R` is
+the current HEAD symref target**; **packed-refs inode changed or mtime regressed**;
+**`logs/HEAD` missing while BASE recorded ≥ 1 head**; ref absent at plan time but present at
+the locked second proof; circuit breaker tripped. Each case asserts BASE unchanged, no
+artifact written, **no keep-pin created**, and no wire tombstone authored.
 
 ### 9.3 Multi-writer
 
@@ -1246,9 +2020,24 @@ at `Y` through the ordinary creation path.
 
 ### 9.4 Circuit breaker
 
-Delete `K+1` BASE-positive heads at once; assert zero captures, one deferral with the new
-reason, one bounded log line, and that a single subsequent deletion (after the mass state
-is resolved) captures normally.
+Table-driven over `(N, n)`, because the v2 predicate passed every test anyone thought to
+write and still failed the case that matters:
+
+| `N` | `n` | Expected |
+|---:|---:|---|
+| 24 | 24 | **trips** — R1's counterexample; under v2's `max()` form this case *captured all 24*, and this row is the regression test for it |
+| 24 | 6 | trips (fraction leg) |
+| 24 | 5 | captures |
+| 304 | 25 | trips (absolute leg) |
+| 304 | 24 | captures |
+| 19 | 19 | captures under the recommended Q2b guard; **trips** under the unguarded `OR`. Whichever the founder rules, this row asserts the ruled behaviour explicitly rather than whatever falls out. |
+| 2 | 1 | captures under the guard; trips unguarded — the row that makes Q2b's cost visible in CI |
+
+Plus: on a trip, assert zero captures, zero A artifacts, **zero keep-pins created**, one
+deferral with the new reason, one bounded log line, and that a single subsequent deletion
+(after the mass state is resolved) captures normally. The keep-pin assertion matters because
+§3.7 adds a side effect ahead of the artifact and the breaker must refuse before *all*
+of it (§3.5's 108-posture argument).
 
 ### 9.5 Per-ref pending lane (P4)
 
@@ -1261,12 +2050,27 @@ five entanglements, so a missing test is visible as a missing row.
   and assert it still contains it when the apply-time `refs/rbox-incoming/*` namespace has
   already been torn down (`apply.ts:335-339`). This is the test that fails if the
   implementation borrows the incoming namespace instead of pinning at capture.
-- **`gitIncomingKey` migration.** Assert that emitting a merged section does not orphan
-  in-flight state: a repository with a recorded `GitHeldAttempt`
-  (`sync-state-model.ts:228-245`), a `partial` record and a deferral episode must still
-  resolve all three after the first merged emit. Whichever story §4.4 constraint 2 chooses
-  — stable derivation or deliberate invalidation — the test asserts the *chosen* one
-  explicitly rather than whatever falls out.
+- **`gitIncomingKey` non-migration.** §4.4 constraint 2 decides that the carried pending
+  section is never rewritten, so the assertion is now concrete: after the first merged
+  emit, a repository with a recorded `GitHeldAttempt` (`sync-state-model.ts:228-245`), a
+  `partial` record and a deferral episode still resolves all three, **and**
+  `gitIncomingKey(pending[rel])` is byte-identical to its pre-merge value. Paired with the
+  structural test that no outgoing merged section's key is ever written into `deferrals`,
+  `attempt` or `partial`.
+- **Held-ref-aware ACK (§4.4 constraint 6) — the provenance test.** Publish a merged
+  section whose held ref `H` carries a pending value this device never held; accept the
+  ACK; then assert `branchBaseOrigins[H]` is **unchanged** (no fresh `publisher-ack` origin
+  minted) and BASE keeps its prior value for `H`. Then delete `H` locally and assert
+  absence capture **refuses** it for want of a usable origin. That last step is the whole
+  point: it proves P4 cannot hand P1 forged evidence.
+- **ACK authority shape.** Reject an authority whose `advertisedRefs` and `carriedRefs`
+  overlap, and one whose union is not exactly `Object.keys(section.refs)`.
+- **Third outcome (§4.4a).** Accept a push for a repository with one held ref and assert
+  `partially-superseded`: section BASE refs advanced for the captured set, unchanged for
+  the carried set, **non-ref fields all at their previous BASE values**, `pending[rel]`
+  retained verbatim, no push-lane deferral, one bounded line. Crash between the accepted
+  ACK and the state CAS and assert the next cycle recomposes a content-identical section
+  and converges.
 - **No tombstone authorship on held refs.** Merge a section where a held ref's pending
   value differs from this device's `advertised` value. Assert `refTombstones` gains **no**
   entry for that ref and `refTombstoneGeneration` does not advance on its account. Pair it
@@ -1281,7 +2085,7 @@ five entanglements, so a missing test is visible as a missing row.
   true for a merged candidate whose held refs sit at pending values and whose remaining
   refs sit at local values, and false if any held ref was silently taken from local.
 - **Ordering/regression pair.** Assert today's byte-for-byte carry is still taken when the
-  repository has **no** held refs (`publisher-tombstones.ts:184-187` reuse path), so P4
+  repository has **no** held refs (`publisher-tombstones.ts:183-186` reuse path), so P4
   narrows the carry rather than replacing it.
 
 ### 9.6 Surfaces and rig
@@ -1292,7 +2096,16 @@ five entanglements, so a missing test is visible as a missing row.
   uploaded report (§5.1), so a new line that misses the `git-sync ` prefix is a privacy
   regression, not a cosmetic one — assert the new lines round-trip to closed enums.
 - `rbox doctor` leftover-worktree section: assert it lists absolute paths locally, and
-  assert those paths do **not** appear in the uploaded projection.
+  assert `JSON.stringify(await buildDiagnosticsBundle(ctx))` contains **none** of them —
+  not the full path, not the basename, not the parent directory name (§5.1). Plus a
+  type-level assertion that the local-only projection is not assignable to the bundle's
+  type, so the exclusion cannot regress into a runtime filter someone forgets.
+- **`rbox git deleted` (§7.2):** assert it lists a branch absence-captured on this device
+  with its OID and origin class; that `--restore <branch>` recreates the branch at exactly
+  `X` without the user supplying an OID; that `--json` emits the OID (i.e. is deliberately
+  exempt from `show-me`'s 40-hex scrubber, `resolve-command.ts:320-322`); that an entry
+  whose object was `gc`-pruned is listed as unrecoverable rather than omitted; and that the
+  command's output never enters the diagnostics bundle.
 - `rbox git deferrals` / `rbox status`: the new circuit-breaker reason needs a
   `DEFERRAL_REASON_PRESENTATION` entry (`status-view.ts:287-305`) and a rank in
   `GIT_DEFERRAL_REASON_PRECEDENCE` (`sync-state-model.ts:149-153`; the compile-time
@@ -1304,12 +2117,19 @@ five entanglements, so a missing test is visible as a missing row.
   `B` is outstanding, device A commits to an unrelated branch `D` and asserts `D` reaches
   device B *before* the hold clears — that is the behaviour P4 exists to produce and the
   rig is the only place it is observable end to end.
-- **Recoverability (§7.1), asserted rather than assumed.** After device B prunes `C` under
-  the tombstone, assert `refs/rbox-local/keep/<X>` exists on B, that
-  `git branch c-recovered refs/rbox-local/keep/<X>` restores the branch at exactly `X`, and
-  that the pin's origin class is `tombstone` for the authorized tip and `human` for the
-  rest of `C`'s reflog. This is the test that turns §12 Q3's ruling condition from prose
-  into a gate.
+- **Recoverability (§3.7), asserted rather than assumed, on both sides.** After device B
+  prunes `C` under the tombstone, assert `refs/rbox-local/keep/<X>` exists on B with a
+  `tombstone`-class origin for the authorized tip and `human` for the rest of `C`'s reflog.
+  **And on device A — the one that deleted it** — assert the same pin exists from the
+  absence capture, that `rbox git deleted <repo> --restore C` recreates it at exactly `X`,
+  and that this holds in the **single-device** variant of the rig where no follower ever
+  prunes. That last case is the one that used to have no recovery at all, so it is the gate
+  for R3.
+- **Pin expiry sweep (§3.7).** With an injected clock past `TOMBSTONE_PIN_RETENTION_MS`,
+  assert `expireTombstoneKeepPins` is actually invoked by the push lane, at most once per
+  repository per 24 h, skipped entirely when no `tombstone`-class origin exists, and that
+  `human`-class origins survive. The clock must **advance** across the assertion rather than
+  being pinned far-future — a pinned clock neutralizes the very invariant this tests.
 - Field validation before any release, per the design-169 dev-build-first rule: a dev build
   on the founder's Mac against the live wedge, with `state.json` snapshotted before and
   after.
@@ -1329,6 +2149,21 @@ five entanglements, so a missing test is visible as a missing row.
 - **Touching working-tree bytes.** Unchanged from `116:106-109`: the Git plane never writes
   working bytes, and nothing here introduces a worktree-writing Git command.
 - **Any wire-format change.** Deletions travel as design-130 `refTombstones`, unchanged.
+- **An exact result-state proof for P3.** The apply-then-revert false positive (§4.3) is
+  left standing and pinned by a test. Replacing patch-id matching with a tree-restricted
+  result-state comparison is a separate design; P3's structural bar is what makes leaving it
+  acceptable.
+- **A general strict-ref-read sweep.** §3.3a converts the sites where an empty map is read
+  as deletion authority. The other ~20 `readAllRefs` call sites keep the lossy reader
+  because an empty read there over-pins or over-holds; auditing them one by one is a
+  follow-up, not this design.
+- **Making `branchProofMatches` inspect `locked.currentRef` in general.** §3.3b (i) enforces
+  it only in the new `local-absence` authority arm. `branchProofMatches`
+  (`base-composer.ts:246-260`) is shared by every branch transition and tightening it
+  changes paths this design has not analysed — a real gap, recorded rather than closed.
+- **Retiring the pre-1.6.8 hold behaviour.** §3.0 accepts that a lagging device defers that
+  repository's Git plane until upgraded. Making old clients converge without upgrading would
+  need a wire or protocol change and is out of scope.
 
 ## 11. Rollout
 
@@ -1338,34 +2173,74 @@ deliberate exception**, P4, argued below.
 
 | Switch | Default | Disables |
 |---|---|---|
-| `RBOX_GIT_ABSENCE_CAPTURE=0` | on | P1 + P1b (falls back to today's carry/refuse) |
+| `RBOX_GIT_ABSENCE_CAPTURE=0` | on | P1 + P1b (falls back to today's carry/refuse), **and** §3.7's keep-pin and expiry sweep |
 | `RBOX_GIT_CONTENT_EQUIV=0` | on | P3 (falls back to ancestry-only) |
-| `RBOX_GIT_OWNERSHIP_HELD_SKIP=0` | on | P2 held-skip eligibility |
+| `RBOX_GIT_OWNERSHIP_HELD_SKIP=0` | on | P2's held-skip eligibility **only** |
+| `RBOX_GIT_OWNERSHIP_NO_ESCALATE=0` | on | P2's "no whole-repo defer for a non-HEAD ownership hold" |
 | `RBOX_GIT_PENDING_MERGE=1` | **off, then on at bake** | P4 `pending ⊕ local` (falls back to today's whole-section carry) |
 
-**Landing order — revised in v2, and inverted from v1.** v1 shipped the authority change
-(P1 + P1b) last, on the reasoning that it was the riskiest. With P4 in scope that ordering
-is not merely suboptimal, it is **unsafe**: §4.4 establishes that P4's per-ref omission is
-only legitimate because P1b's receipt rule exists, so P1b must precede P4, and P2 must
-precede both because it is what produces a per-ref hold set at all. Each step remains
-independently shippable and independently revertible.
+**Two switches for P2, corrected in v3.** v2 listed one switch and described it as disabling
+P2. It does not: held-skip eligibility and the no-escalation change are independent code
+paths, and a single `RBOX_GIT_OWNERSHIP_HELD_SKIP=0` leaves the deferral-behaviour change
+live. A kill switch that does not kill what the rollout section claims is worse than none,
+because it is what someone reaches for at 2am.
+
+**Landing order — corrected again in v3.** v1 shipped the authority change last; v2
+inverted that, correctly, but justified it with a dependency that does not exist.
 
 1. **P2 + reporting.** Held-skip eligibility with the worktree digest, no whole-repo
-   escalation for non-HEAD holds, `rbox doctor` leftover-worktree section (absolute paths
-   local-only, §5.1). No authority change; pure performance and UX. *Precondition for
-   steps 3 and 4.*
-2. **P3.** Content equivalence in `noDropProof`. Waives holds only; cannot delete anything.
-   Independent of the rest; landed here because it shrinks the held set P4 will first be
-   exposed to.
-3. **P1 + P1b.** The authority change. Validated on a dev build against the live wedge
-   before any CLI release. *Precondition for step 4 — see §4.4.*
+   escalation for non-HEAD holds, `rbox doctor` leftover-worktree section behind §5.1's
+   local-only projection. No authority change; pure performance and UX. **Not a
+   precondition for anything** — see the correction below. Landed first because it is the
+   cheapest real improvement and it makes the founder's machine observable while the rest
+   bakes.
+2. **P3.** Content equivalence in `noDropProof`, with §4.3's destructive-transition bar.
+   Cascade reduction only. Independent; landed here because it shrinks the held set P4 will
+   first be exposed to.
+3. **P1 + P1b + §3.3a + §3.3b + §3.7 + §7.2.** The authority change and everything that
+   makes it safe: the strict ref read, the restore/unborn-branch rules, the deleting-device
+   pin and its expiry sweep, and the recovery command. These ship **together** — a P1
+   without §3.3a is a fleet-wide deletion waiting for one corrupt loose ref, and a P1
+   without §3.7 publishes deletions that may not be recoverable. Validated on a dev build
+   against the live wedge before any CLI release. *Genuine precondition for step 4.*
 4. **P4, in two sub-steps.**
    - **4a — no behaviour change.** Pin held pending tips into the capture's scratch-pin set,
-     settle and migrate the `gitIncomingKey` story, structurally exclude held refs from
-     tombstone authorship. All of it provable by §9.5's tests without emitting a single
-     merged section.
-   - **4b — the merged emit.** Turn on `pending ⊕ local`. This is the only step in the
-     design that changes what a device publishes for refs it is not authoritative over.
+     structurally exclude held refs from tombstone authorship, and **ship §4.4 constraint
+     6's held-ref-aware ACK authority**. Constraint 6 belongs here and not in 4b: it must be
+     in place before the first merged section is accepted, or that ACK mints forged
+     provenance. All of it provable by §9.5's tests without emitting a merged section.
+   - **4b — the merged emit.** Turn on `pending ⊕ local` and the `partially-superseded`
+     outcome (§4.4a). The only step in the design that changes what a device publishes for
+     refs it is not authoritative over.
+
+**Correction: "P2 must precede P1/P4" was wrong.** `publishRefPlane` already returns a
+per-ref held set — built per ref and returned both as a set (`follow.ts:1041`) and as a map
+(`follow.ts:1047`) — and `apply.ts:1447` merely ignores the detail by consuming
+`held.length`. So P4 has a per-ref hold set to merge over with or without P2, and P1 never
+needed P2 at all. The ordering above is a *validation* sequence, not a dependency graph,
+with exactly one hard edge: **step 3 before step 4**, for the two mutually-reinforcing
+reasons in §4.4 ("Ordering constraints").
+
+**Reverse migration for P4 — required, because "independently revertible" is false for it.**
+v2 claimed each step was independently revertible while simultaneously admitting P4's revert
+is not free. Both cannot be true. The reverse path, specified:
+
+- **Exact carry is always reconstructible.** P4 never rewrites `pending[rel]` (§4.4
+  constraint 2), so the byte-for-byte section the pre-P4 code would have carried is still
+  in state. Turning the flag off returns `normalizeOutgoingGitSections` to its
+  reuse-by-identity path (`publisher-tombstones.ts:183-186`) with no reconstruction step.
+- **No BASE origin needs undoing.** Carried refs never received an origin (constraint 6),
+  which is byte-identical to the pre-P4 shape for a ref this device never advertised.
+- **The one real cost: a redundant apply.** The section BASE may have advanced per-ref under
+  `partially-superseded`. With the flag off, `gitBaseAfterCommit` reverts to whole-section
+  semantics, the next pull sees `remote != base` and re-applies. That is *safe* — re-apply
+  is idempotent — and it is a real extra cycle of work per affected repository. Accepted,
+  and named here rather than discovered during a rollback.
+- **Receipt-disabled fallback, stated as a rule and not only as a test.** With
+  `RBOX_GIT_ABSENCE_CAPTURE=0` and `RBOX_GIT_PENDING_MERGE=1`, a locally-absent BASE-positive
+  head must be **carried at its pending value**, never omitted from the merged section. The
+  merged section degrades to exact carry per ref whenever the receipt that would license an
+  omission is unavailable — for any reason, not only the flag. §9.5 asserts it.
 
 **Why P4 stages OFF-then-ON, when everything else ships default-on.** The founder's standing
 rule is default-on with a kill switch; the named exceptions are wire-compat, breaking, or a
@@ -1385,9 +2260,19 @@ the dev build, before any CLI release carries it on):
 3. The recurring-capture cost measured (§6) on a repository held for ≥ 24 h, and judged
    acceptable against the observed baseline rather than assumed to be.
 4. No `gitIncomingKey`-bound state (partial progress, deferral episodes, held attempts)
-   observed orphaned across the first merged emit.
+   observed orphaned across the first merged emit — and `gitIncomingKey(pending[rel])`
+   verified byte-identical across it (§4.4 constraint 2).
+5. **No carried ref observed with a fresh `publisher-ack` origin** after a merged section is
+   acked. This is constraint 6's field check; it is the one that would show a forged
+   provenance leak before P1 could act on it.
 
 Steps 1–3 do **not** wait on this; they ship default-on as v1 planned.
+
+**A separate, smaller bake for §3.7's pin accumulation**, which does not gate P4: after
+seven days with absence capture on, count `refs/rbox-local/keep/*` on the founder's Mac,
+measure `git gc` wall clock on `Personal/rbox-core` against its pre-change baseline, and
+confirm the expiry sweep actually ran. The founder accepted this cost; the point of
+measuring is to find out whether the number he accepted is the number he gets.
 
 **Wire compatibility.** None of this changes the wire *format*. P4 changes the wire
 *content* for held repositories — a merged section is an ordinary `GitSection`, so every
@@ -1411,10 +2296,20 @@ interoperate today, because a device with no holds publishes per-ref by construc
 
 ## 12. Decisions
 
-All six of v1's open questions were ruled by the founder on **2026-07-24**. They are kept
-here as a decision record rather than deleted; the questions are stated as they were asked,
-followed by the ruling and its reasoning. Anything still genuinely open is marked
-**STILL OPEN** and is the only thing in this section that needs another answer.
+All six of v1's open questions were ruled by the founder on **2026-07-24**. Three further
+rulings (**R1–R3**) were issued the same day, after codex's round-1 review, and two of them
+*change* earlier rulings. They are kept here as a decision record rather than deleted; the
+questions are stated as they were asked, followed by the ruling and its reasoning. Anything
+still genuinely open is marked **STILL OPEN** and is the only thing in this section that
+needs another answer.
+
+**The three later rulings, R1–R3 (2026-07-24), in one place:**
+
+| | Ruling | Changes | Where |
+|---|---|---|---|
+| **R1** | Mass-deletion breaker trips if **either** leg trips, whichever comes first — `n ≥ 25 OR n ≥ 25% of N` | **Supersedes Q2's `max()` form**, which was arithmetically incapable of tripping on any repository under 100 heads | §3.5, Q2 below |
+| **R2** | Deletion is not instantly fleet-wide; state the version floor honestly | Narrows Q1's stated semantic without changing the decision | §3.0, Q1 below |
+| **R3** | The **deleting** device pins the commit locally for 90 days | **Reverses Q3** and **retires Q3a** | §3.7, §8 item 10, Q3 below |
 
 **1. Publish the deletion, or re-materialize the branch from the fleet?**
 *RULED 2026-07-24 — **publish**.* This confirms the design's own recommendation, so nothing
@@ -1426,55 +2321,94 @@ re-create the branch) is non-destructive and wrong — it makes branch deletion 
 no-op on every synced machine, and the founder's development loop's last step is exactly
 branch deletion. §3.0 records the three consequences that follow: deletion is authoritative
 and therefore must be receipted; receivers still hold a veto; and the objects must survive
-the prune for a bounded window (§7.1).
+the prune for a bounded window (§3.7).
+
+***AMENDED 2026-07-24 by R2 — "fleet-wide" is scoped to v1.6.8 and newer.*** The decision is
+unchanged; its *statement* was overclaimed. Design 130's tombstone attestation
+(`src/cli/sync-git/tombstone-attestation.ts`) first shipped in **v1.6.8**, commit
+`04c2aff8` (#297) — verified with `git tag --contains`, not assumed. Read off
+`v1.6.6:src/cli/sync-git/follow.ts`, a pre-130 device meets a squash-deleted branch with
+`tipOwnedByIncoming` returning `unowned`, classifies it `local-commits`, and **holds**;
+there is no attestation path to waive that hold, and the resulting whole-repository pending
+gag means it also never re-advertises the ref, so it cannot resurrect it either. The honest
+semantic is therefore **eventually** fleet-wide: a lagging device keeps the branch and
+defers that repository's Git plane until it upgrades, then converges through the unchanged
+attestation path. Nothing is lost; the fleet is briefly inconsistent; one repository on one
+stale device stops syncing Git in the meantime. §3.0 states all three. The founder's
+phrasing was "1.7.x and newer", which is a safe superset and the right thing to tell a user;
+the design records the verified constant so a future skew argument does not start from the
+wrong one.
 
 **2. Circuit-breaker shape and thresholds.**
-*RULED 2026-07-24 — **defer at `max(K = 25, F = 0.25)`**.* Both legs, not one. Tripping
-**defers** the repository; it does not merely warn and proceed. Recorded in **§3.5** with
-the arithmetic and the precedent.
-The precedent is worth stating carefully because the ruling's framing attributed it to the
-wrong design and the numbers to the wrong guard. rbox runs two file-plane mass-delete
-guards: design **44**'s pull-side guard trips at `deletes ≥ 100 ∧ deletes·2 ≥ baseFiles`
-(≥ 100 files **and** ≥ half the tree — `policy.ts:11-15`, `pull.ts:276`), and design **108**'s
-push-side breaker trips at `max(20%, 1000)` (`pushMassDeleteTrips`, `policy.ts:22-35`,
-`push.ts:701`; framing at `docs/design/108-scan-fault-isolation.md:79-88`). **The
-`max(fraction, floor)` shape this design copies is 108's, not 44's** — 44's is an absolute
-floor ANDed with a *half*-the-tree fraction. The "fails closed until a human says otherwise"
-phrasing is verbatim from the comment on 44's constant (`policy.ts:14`) and is true of both.
-108 is also the better precedent on the merits: it guards the *publishing* side, refusing
-before any encrypt/upload/commit work, which is structurally what absence capture must do.
-The ruled numbers stand — `25` and `0.25` are 108's shape rescaled from file counts in the
-hundred-thousands to ref counts in the hundreds (§3.5).
+*~~RULED 2026-07-24 — defer at `max(K = 25, F = 0.25)`.~~* **SUPERSEDED 2026-07-24 by R1 —
+defer at `n ≥ 25` **OR** `n ≥ 25% of N`, whichever trips first.** Tripping **defers** the
+repository; it does not merely warn and proceed. Recorded in **§3.5** with the arithmetic,
+the counterexample, and the trip table.
+
+**Why the first ruling was withdrawn.** `max()` encodes a conjunction —
+`n ≥ max(K, ceil(F·N))` ⟺ `n ≥ K ∧ n ≥ ceil(F·N)` — and the larger leg dominates. With
+`K = 25` and `F = 0.25`, the absolute leg dominates for every repository under `K/F = 100`
+heads, which is essentially all of them. The verified counterexample: a **24-head repository
+whose entire ref set is deleted** yields `max(25, 6) = 25` and `24 ≥ 25` is false, so a total
+wipe does not trip. The v2 prose ("the `K` floor exempts small repositories, the `F` leg
+catches large ones") described the intent correctly and the arithmetic backwards; under `OR`
+the mapping inverts and becomes correct.
+
+**The precedent claim is also corrected.** v2 said this design copies design 108's
+`max(fraction, floor)` shape. It does not, and 108's shape is not a `max`:
+`pushMassDeleteTrips` is `deletes ≥ min ∧ deletes·100 ≥ pct·baseCount` (`policy.ts:22-35`)
+— a genuine conjunction, defensible at file scale where `min = 1000` against hundreds of
+thousands of files leaves the fraction dominant, and inverted at ref scale where counts are
+in the ones to hundreds. What this design takes from 108 is its **posture** — publishing-side,
+refuse before any encrypt/upload/commit work, fail closed, human consent as the only
+override — not its boolean operator. Design 44's pull-side guard
+(`deletes ≥ 100 ∧ deletes·2 ≥ baseFiles`, `policy.ts:11-15`, `pull.ts:276`) is the wrong
+precedent on both counts. The "fails closed until a human says otherwise" phrasing is
+verbatim from the comment on 44's constant (`policy.ts:14`) and is true of both.
+
+> **STILL OPEN — 2b. Small-repository hair-trigger under the `OR` form.** Stated in full in
+> §3.5. `n ≥ 0.25·N` trips on one deletion in a 4-head repository and two in an 8-head one;
+> the founder's workspace averages ~1.8 BASE heads per repository, so R1 taken literally
+> would defer nearly every repository on the first routine `git branch -D`. Recommended
+> amendment: gate the fraction leg on `N ≥ 20`, giving `n ≥ 25 OR (N ≥ 20 && n·4 ≥ N)`,
+> which keeps R1's 24-head counterexample caught (trips at 6) and leaves a 5–19-head window
+> covered only by §3.3b's weaker ref-database signals. **The design assumes the guarded
+> form**; if the founder prefers the unguarded `OR`, §3.3b's signals become load-bearing and
+> §0's "no human in the loop" claim has to be softened for small repositories.
 
 **3. Safety pin for auto-captured deletions?**
-*RULED 2026-07-24 — **no pin**, conditional on tombstone recoverability being stated first.*
-The pin is rejected in **§8 item 10**; the condition is discharged in **§7.1**, which was
-written for this ruling and verified against the code.
-**The condition holds for the multi-device case, but not by the mechanism the ruling names,
-and not universally.** A tombstone is `{oid, ts, generation}` — metadata only
-(`types.ts:71-75`); `REF_TOMBSTONE_RETENTION_MS` retains the *OID*, not one Git object. What
-actually retains the objects is a second, deliberately equal-valued constant:
-`TOMBSTONE_PIN_RETENTION_MS = 90 days` (`keep-pins.ts:68`). Every device that prunes the
-branch under tombstone authority pins the authorized tip at
-`refs/rbox-local/keep/<X>` for that window and pins the rest of the branch's reflog
-*permanently* (`follow.ts:947-949` → `keep-pins.ts:635-654`). Recovery is
-`git branch <name> refs/rbox-local/keep/<X>` on any such device. Three caveats, all in §7.1:
-the deleting device pins nothing (the A artifact records the prior OID as blob *text*, it
-does not pin the commit — `base-artifacts.ts:145-149`, `:218-224`); the 90-day bound is
-currently a ceiling rather than an enforced window, because `expireTombstoneKeepPins` has no
-production caller (`keep-pins.ts:434`, referenced only from `index.ts:284` and its own test);
-and:
+*~~RULED 2026-07-24 — no pin, conditional on tombstone recoverability being stated first.~~*
+**REVERSED 2026-07-24 by R3 — the deleting device pins the commit locally for 90 days.**
+Specified in **§3.7**; §8 item 10's rejection is struck; §7.1 is kept as the rationale.
 
-> **STILL OPEN — 3a. Single-device workspaces.** The ruling's premise ("the fleet still
-> holds the objects") requires a fleet. On a one-device account no other device ever prunes,
-> so no tombstone keep-pin is ever created, and — because the deleting device pins nothing —
-> a published deletion is recoverable only until that device's next `git gc`. This is the
-> one case where the premise is false. Options: (i) accept it, on the grounds that a
-> one-device workspace has no sync partner to lose work to and `git branch -D` on an
-> unsynced repository behaves identically; (ii) pin only when the account has one device,
-> which is the cheap case precisely because there is no ~10-branches/day fleet churn to
-> accumulate; (iii) pin always, i.e. reverse the ruling. **Recommendation: (ii)** — it costs
-> nothing in the case the founder actually runs and closes the only real hole.
+**Why the reversal.** The conditional ruling's premise was that recovery is available from
+a *follower's* prune pin. Codex showed the premise is not merely narrow but structurally
+unreliable: the pin is created **by the prune** (`follow.ts:947-949` →
+`prepareTombstonePrunePins`, `keep-pins.ts:635-654`), so it does not exist whenever nobody
+prunes — a single-device workspace, both devices deleting before either applies the other's
+tombstone, a device that never received the ref, or a fleet still on pre-1.6.8. The v2
+analysis was also right about the mechanism and worth keeping: a `GitRefTombstone` is
+`{oid, ts, generation}` — metadata only (`types.ts:71-75`) — and
+`REF_TOMBSTONE_RETENTION_MS` retains the *OID*, not one Git object; what retains objects is
+the deliberately equal-valued `TOMBSTONE_PIN_RETENTION_MS = 90 days` (`keep-pins.ts:68`).
+
+R3 gives the A path the keep-refs the P path always had (`basePresentKeepRef`,
+`base-artifacts.ts:114-118`) — closing an asymmetry, not inventing a mechanism. The founder
+explicitly accepted the accumulation cost (~900 hidden refs at steady state, and their
+effect on `git gc`); §6 prices it and §11 measures it. Two consequences recorded in §3.7:
+the object may already have been `gc`-pruned before rbox looks, in which case the deletion
+still publishes and the missing pin is **reported** rather than hidden; and the 90 days only
+means anything once `expireTombstoneKeepPins` (`keep-pins.ts:434`, today referenced only
+from `index.ts:284` and its own test) has a caller, which §3.7 specifies.
+
+> **~~STILL OPEN — 3a. Single-device workspaces.~~ RETIRED 2026-07-24 by R3.** Q3a asked
+> whether to pin only when the account has one device. It is moot: the single-device case
+> was one instance of a general defect — recovery depending on somebody else pruning — and
+> R3 fixes the general case by pinning on the deleting device unconditionally. Recording the
+> retirement rather than deleting the question, because "pin only for single-device
+> accounts" is exactly the kind of narrow optimization a future reviewer will re-propose;
+> the answer is that the multi-device cases (concurrent deletion, never-delivered ref, old
+> followers) are just as unpinned.
 
 **4. Settling window?**
 *Not separately ruled; the design's own recommendation is taken as decided (2026-07-24).*
@@ -1494,12 +2428,15 @@ non-goals. Consequences worth surfacing here rather than leaving spread across t
 - **The landing order inverts.** v1 shipped the authority change (P1 + P1b) last. P4's
   per-ref omission is only legitimate because P1b's receipt rule exists, so P1b must now
   precede P4 — the analogue of §3.6's "the receipt must land before capture, or the ACK
-  dry-run refuses". P2 must precede both, because it is what produces a per-ref hold set to
-  merge over at all. P3 is independent but is landed early because it shrinks P4's first
-  exposure.
+  dry-run refuses". **v3 adds the converse edge and removes a false one:** P4's
+  held-ref-aware ACK (§4.4 constraint 6) is what stops P4 forging the provenance P1 trusts,
+  so it ships *with* P4 and never after; and ~~P2 must precede both~~ was wrong —
+  `publishRefPlane` already returns a per-ref held set (`follow.ts:1041`, `:1047`), so P2 is
+  a validation-sequencing choice, not a dependency. P3 is independent and landed early
+  because it shrinks P4's first exposure.
 - **The cost analysis no longer nets negative.** v1's "net cost is negative" was written
   assuming P4 was deferred. P4 replaces a carry that re-advertises the same bundle and
-  uploads nothing (`publisher-tombstones.ts:184-187`) with an ordinary capture per cycle
+  uploads nothing (`publisher-tombstones.ts:183-186`) with an ordinary capture per cycle
   while a hold is outstanding, and P2's held-skip does not suppress it because held-skip
   short-circuits the follow while capture runs on the push lane. §6 says so plainly.
 - **The blast radius is categorically larger.** P1–P3 change whether this device acts on
@@ -1529,3 +2466,66 @@ non-goals. Consequences worth surfacing here rather than leaving spread across t
   unredacted (`:535`). **Full paths in local `doctor` output are fine; the uploaded path is
   what needs the rule.** Closing that rule is scoped out (§10) and is the precondition for
   putting the path in the deferral message, which remains the better message.
+  ***AMENDED in v3:*** v2 left "local paths are fine" as an assertion about where the output
+  is *displayed*. It is not — `ctx.checks` is bundled and uploaded raw (`doctor-cmd.ts:535`),
+  so a `DoctorCheck` carrying a worktree path *is* an uploaded path. §5.1 now specifies a
+  typed local-only projection that never reaches `buildDiagnosticsBundle`, plus a redacted
+  bundle projection with no path text of any kind.
+
+## 13. Codex review round 1 — what was caught and how it is answered
+
+Recorded so the next reviewer starts from here rather than re-deriving. **Verdict:
+NOT-ALIGNED — 7 blockers, 4 majors.** Every code claim below was re-verified against the
+worktree before being folded in; three of codex's citations were off by a few lines and are
+corrected here rather than propagated. All eleven are answered; **two residual questions are
+left open on purpose** and are marked as such.
+
+### Blockers
+
+| # | Finding | Resolution | Where |
+|---|---|---|---|
+| 1 | Q3's no-pin premise is false even multi-device — recovery depended on a *follower* pruning, which does not happen in several ordinary cases | **Resolved by R3.** §7.1 rewritten around the deleting-device pin; the follower-pin analysis kept as the rationale; Q3a retired | §3.7, §7.1, §12 Q3 |
+| 2 | P1 turns a ref-read error into fleet-wide deletion — `readAllRefs` maps any `show-ref` failure to `{}` | **Resolved.** Strict reader specified with the exit-code discipline the codebase already uses at `shared.ts:261-268`; mandatory site list includes the locked proof at `branch-transition.ts:309` and both capture sites. Reproduced empirically | §3.3a |
+| 3 | P4 destroys P1's provenance invariant — carried values acquire `publisher-ack` origins | **Resolved.** Held-ref-aware ACK authority: `advertisedRefs` (captured) and `carriedRefs` (carried) split, disjointness enforced, carried refs get `after = before` and no origin | §4.4 constraint 6 |
+| 4 | P1's control flow does not clear the field wedge — the unchanged shortcut precedes the hook, and retiring BASE mid-pass lets the section re-create the branch | **Resolved.** Reconciliation moved above `apply.ts:873` with an O(1) cheap gate; `result: "reconciled"` ends the pass; the same cycle's push lane publishes the omission (`sync.ts:9-19` is pull-then-push) | §3.6a |
+| 5 | BASE provenance proves possession, not the cause of absence — an in-place ref restore preserves identity | **Resolved.** §3.4 stops claiming otherwise; HEAD-symref rejection and ref-database regression signals added; the breaker named as the primary restore detector, which R1 is what makes real | §3.3b, §3.4 |
+| 6 | P3 has a false positive and can authorize deletion — "waives holds only" is not a mechanism | **Partly resolved, honestly scoped.** `--verbatim` closes the whitespace half; the apply-then-revert false positive is **left standing and pinned by a test**; the boundary is made structural (waiver barred from destructive transitions + disjointness test); P3 re-described as cascade reduction | §4.3, §9.1 |
+| 7 | P4's accepted-ACK state machine is undecided | **Resolved.** Third outcome `partially-superseded` specified across BASE refs, BASE non-ref fields, pending, deferral subject, held attempt, partial progress and crash recovery; the key question *decided* (pending is never rewritten) | §4.4a, §4.4 constraint 2 |
+
+### Majors
+
+| # | Finding | Resolution | Where |
+|---|---|---|---|
+| 8 | P2/P3 do not fix wedge (a) as claimed — a hold only exists for refs the incoming section wants to change | **Accepted; claims corrected.** `follow.ts:732` precedes `:734`, so the "already convergent" filter is a no-op and supersession still refuses. P4 is now stated as the *only* fix for the capture gag | §4.2, §4.5, §5 |
+| 9 | Rollout ordering and rollback independence overstated | **Accepted; corrected.** P2 demoted from precondition (`follow.ts:1041`, `:1047` already return a per-ref held set); P2's switch split in two; P4 given an explicit reverse migration and a receipt-disabled fallback rule | §11, §4.4 |
+| 10 | 1.6.6 skew is behavioural, not schema | **Resolved by R2**, with the floor corrected to **v1.6.8** (commit `04c2aff8`) from the verified tag rather than assumed | §3.0, §12 Q1 |
+| 11 | Recovery window not discoverable — tombstones evict before they expire and `show-me` structurally omits OIDs | **Resolved.** `rbox git deleted <repo> [--restore <branch>] [--json]` specified against the keep-pin origin sidecar, which already carries branch name and timestamp | §7.2 |
+| 12 | doctor privacy boundary — the bundle uploads `ctx.checks` unredacted | **Resolved for the new surface.** Typed local-only projection excluded from `checks` and from the bundle; the pre-existing `ctx.checks` exposure stays scoped out | §5.1, §10 |
+
+### Corrections to codex's own citations
+
+Kept because a wrong line number propagates further than a wrong argument.
+
+- `push.ts` is `src/cli/sync/push.ts`, not `src/cli/sync-git/push.ts`. `advertisedRefs:
+  section.refs` is at **`:971`** (cited as `:961`); the `publisher-ack` authority block is
+  `:962-972`.
+- The unchanged shortcut's condition is **`apply.ts:873`** (cited as `:869`, which is the
+  start of the comment above it).
+- `buildDiagnosticsBundle` begins at `doctor-cmd.ts:523`; the unredacted field is
+  **`checks: ctx.checks` at `:535`**, and `redactGitLogLines` is applied at `:527`.
+- The `proven` short-circuit is **`follow.ts:815`** (cited as `:807`).
+- The pending-supersession fast-forward test is `equalOrFastForward` at
+  **`pending-supersession.ts:202`**, defined at **`:179-181`** (cited as `:198`, the start of
+  the enclosing block).
+- `plan.ts`'s pending/BASE rule is `gitBaseAfterCommit` at **`:1155-1167`** (cited as
+  `:1150`, the start of its doc comment).
+
+### Still open after this round
+
+1. **Q2b — the small-repository hair-trigger** under R1's `OR` form (§3.5, §12 Q2). Needs a
+   founder decision between the unguarded `OR` and the recommended `N ≥ 20` gate on the
+   fraction leg. The design assumes the gate.
+2. **P3's apply-then-revert false positive** (§4.3). Not a founder question — a scope
+   decision, taken deliberately: an exact result-state proof is a separate design, and P3's
+   structural bar against destructive transitions is what makes leaving it acceptable. If a
+   reviewer disagrees that the bar is sufficient, P3 should be cut rather than expanded.
