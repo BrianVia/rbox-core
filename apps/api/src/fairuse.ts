@@ -29,6 +29,23 @@ export function fairUseQueueStatement(db: D1Database, accountId: string, nowMs: 
   ).bind(accountId, nowMs, reason, nowMs);
 }
 
+export function fairUseQueueIfLiveStripeAccountStatement(
+  db: D1Database,
+  accountId: string,
+  stripeCustomerId: string,
+  nowMs: number,
+  reason: string,
+): D1PreparedStatement {
+  return db.prepare(
+    `INSERT INTO fairuse_account_queue(account_id,next_run_at,reason,updated_at)
+     SELECT ?,?,?,? WHERE EXISTS(
+       SELECT 1 FROM accounts
+       WHERE id=? AND stripe_customer_id=? AND deleted_at IS NULL AND reclaimed_at IS NULL)
+     ON CONFLICT(account_id) DO UPDATE SET next_run_at=MIN(fairuse_account_queue.next_run_at,excluded.next_run_at),
+       reason=excluded.reason,updated_at=excluded.updated_at`,
+  ).bind(accountId, nowMs, reason, nowMs, accountId, stripeCustomerId);
+}
+
 type ScanStatus = "capture_pins" | "materialize_roots" | "classify_entitlements" | "complete" | "aborted_pins";
 
 export interface FairUseLease {
@@ -1116,10 +1133,16 @@ export async function runFairUseObservation(env: Env, nowMs: number = Date.now()
       accountId, accountId, held.value).run();
   } catch (error) {
     if (held) {
-      await db.prepare(
-        `UPDATE fairuse_account_queue SET next_run_at=?,reason='scan_error',updated_at=? WHERE account_id=?
-         AND ${leaseLiveExists()}`,
-      ).bind(nowMs + FAIRUSE_OBSERVATION_INTERVAL_MS, nowMs, accountId, accountId, held.value).run().catch(() => undefined);
+      if (error instanceof Error && error.message === "account_missing") {
+        await db.prepare(
+          `DELETE FROM fairuse_account_queue WHERE account_id=? AND ${leaseLiveExists()}`,
+        ).bind(accountId, accountId, held.value).run().catch(() => undefined);
+      } else {
+        await db.prepare(
+          `UPDATE fairuse_account_queue SET next_run_at=?,reason='scan_error',updated_at=? WHERE account_id=?
+           AND ${leaseLiveExists()}`,
+        ).bind(nowMs + FAIRUSE_OBSERVATION_INTERVAL_MS, nowMs, accountId, accountId, held.value).run().catch(() => undefined);
+      }
     }
     throw error;
   } finally {

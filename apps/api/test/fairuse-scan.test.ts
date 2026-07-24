@@ -234,6 +234,17 @@ describe("design 149 observe-only fair-use scan", () => {
     expect(await db().prepare("SELECT reason FROM fairuse_account_queue WHERE account_id=?").bind(accountId).first())
       .toEqual({ reason: "scan_error" });
   });
+
+  test("missing account drains its orphaned queue row", async () => {
+    const accountId = "acct_000_fairuse_missing_account";
+    await db().prepare("INSERT INTO fairuse_account_queue(account_id,next_run_at,reason,updated_at) VALUES(?,?,?,?)")
+      .bind(accountId, NOW - 1, "test", NOW).run();
+
+    await expect(runFairUseObservation(env, NOW)).rejects.toThrow("account_missing");
+
+    expect(await db().prepare("SELECT 1 FROM fairuse_account_queue WHERE account_id=?").bind(accountId).first())
+      .toBeNull();
+  });
 });
 
 describe("fair-use lease and compact last-location contracts", () => {

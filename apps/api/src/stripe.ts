@@ -5,7 +5,7 @@ import { PLAN_LOOKUP_KEYS, PURCHASABLE_PLANS, planForLookupKey, type BillingCade
 import { GRACE_PERIOD_MS } from "./billing.js";
 import { dbFor, dirDb } from "./db.js";
 import { pingChurn, pingNewSubscription, pingPaymentFailed } from "./slackpipes.js";
-import { fairUseQueueStatement } from "./fairuse.js";
+import { fairUseQueueIfLiveStripeAccountStatement, fairUseQueueStatement } from "./fairuse.js";
 import { ownerEmail, resolveOwners } from "./notify.js";
 
 /**
@@ -332,7 +332,9 @@ async function applyStripeEvent(env: Env, event: { type: string; data: { object:
         const [del] = await db.batch([
           db.prepare(`UPDATE accounts SET plan = 'none', billing_interval = NULL, extra_storage_bytes = 0, stripe_subscription_id = NULL, grace_until = ${graceCase()} WHERE stripe_customer_id = ? AND stripe_subscription_id = ?`)
             .bind(nowMs, nowMs + GRACE_PERIOD_MS, obj.customer, obj.id),
-          ...(obj.metadata?.account_id ? [fairUseQueueStatement(db, obj.metadata.account_id, nowMs, "plan_changed")] : []),
+          ...(obj.metadata?.account_id
+            ? [fairUseQueueIfLiveStripeAccountStatement(db, obj.metadata.account_id, obj.customer, nowMs, "plan_changed")]
+            : []),
         ]);
         // §32 Tier 1 churn ping (best-effort) — only when this delete actually
         // downgraded an account; a stale/duplicate delete that matches no live row
