@@ -1761,7 +1761,20 @@ opts: {
     }
   };
   await poolMap(nestedRepoChains(keys), gitApplyConcurrency(), async (chain) => {
-    for (const rel of chain) await runRepo(rel);
+    for (const rel of chain) {
+      try {
+        await runRepo(rel);
+      } catch (e) {
+        // Once the latch is set, MutationGateClosedError is the ONLY error allowed
+        // out of the pool. Anything else escaping here — a throwing injected git
+        // logger, a throwing onProgress sink — would reject Promise.all first, so
+        // the caller would get THAT error instead of the shutdown signal while the
+        // sibling workers kept mutating disk detached: exactly what the latch
+        // exists to prevent. Outside a shutdown every error still propagates.
+        if (!gateClosure) throw e;
+        return;
+      }
+    }
   });
   if (gateClosure) throw gateClosure;
   return pack();
