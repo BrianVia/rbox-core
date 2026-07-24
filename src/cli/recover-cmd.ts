@@ -4,7 +4,7 @@ import { credentialsForStrictFlow, loadCredentials } from "./credentials.js";
 import { keystorePinStore } from "./e2ee-keystore.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
 import { beginReport, logDebugSummary } from "./metrics.js";
-import { promptConfirm } from "./prompt.js";
+import { confirmDestructive, promptConfirm } from "./prompt.js";
 import { NeedsRebaselineError } from "./remote.js";
 import { pull, push } from "./sync.js";
 import { postSyncNudge, summarize } from "./sync-cmd.js";
@@ -41,15 +41,18 @@ function count(actions: Action[], kind: Action["kind"]): number {
 export async function recoverWorkspaceCmd(pathArg: string | undefined, opts: RecoverOptions = {}, deps: RecoverDeps = {}): Promise<void> {
   const root = await (deps.findRoot ?? findRoot)(pathArg ?? process.cwd());
   if (!root) throw new Error("Not inside an rbox workspace. Run `rbox setup` to get started, or `rbox track <path>` to bind a directory.");
-  if (!opts.yes) {
-    const ok = await (deps.confirm ?? promptConfirm)({
-      message: `Recover ${root}? This re-verifies the server head against the retained local pin, reconciles files, then pushes remaining local diffs.`,
-      default: false,
-    });
-    if (!ok) {
-      (deps.log ?? console.log)("recover cancelled");
-      return;
-    }
+  const confirmation = {
+    message: `Recover ${root}? This re-verifies the server head against the retained local pin, reconciles files, then pushes remaining local diffs.`,
+    default: false,
+  };
+  const ok = opts.yes
+    ? true
+    : deps.confirm
+      ? await deps.confirm(confirmation)
+      : await confirmDestructive({ ...confirmation, headless: "throw" });
+  if (!ok) {
+    (deps.log ?? console.log)("recover cancelled");
+    return;
   }
 
   // Strict credential policy precedes sync-mutex acquisition (a local mutation).

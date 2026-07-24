@@ -143,6 +143,11 @@ function jsonObject(text: string): Record<string, unknown> | undefined {
   }
 }
 
+export function errorCode(text: string): string | undefined {
+  const error = jsonObject(text)?.error;
+  return typeof error === "string" ? error : undefined;
+}
+
 /** 402 with `{"error":"quota_exceeded"}` → typed quota error. Anything else falls
  *  through with the consumed body text preserved for the caller's generic path. */
 export async function readQuotaExceeded(res: Response): Promise<{ quota: QuotaExceededError | null; text: string }> {

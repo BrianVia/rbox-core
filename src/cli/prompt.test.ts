@@ -1,6 +1,65 @@
 import { expect, test } from "bun:test";
 import path from "node:path";
-import { createCheckboxPrompt, expandUserPath, promptPath } from "./prompt.js";
+import { confirmDestructive, createCheckboxPrompt, expandUserPath, PromptUnavailableError, promptPath } from "./prompt.js";
+import { withInteractionPolicy } from "./prompt-policy.js";
+
+test("confirmDestructive preserves each headless policy and the yes bypass", async () => {
+  const descriptor = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+  Object.defineProperty(process.stdin, "isTTY", { configurable: true, value: false });
+  try {
+    expect(await confirmDestructive({ message: "proceed", headless: "proceed" })).toBe(true);
+    expect(await confirmDestructive({ message: "deny", headless: "deny" })).toBe(false);
+    await expect(confirmDestructive({
+      message: "require yes",
+      headless: "require-yes",
+      headlessError: "exact require-yes error",
+    })).rejects.toThrow("exact require-yes error");
+    expect(await confirmDestructive({
+      message: "bypassed",
+      yes: true,
+      headless: "throw",
+      headlessError: "must not throw",
+    })).toBe(true);
+  } finally {
+    if (descriptor) Object.defineProperty(process.stdin, "isTTY", descriptor);
+    else delete (process.stdin as NodeJS.ReadStream & { isTTY?: boolean }).isTTY;
+  }
+
+  await expect(withInteractionPolicy(
+    { enabled: false },
+    () => confirmDestructive({ message: "unavailable", headless: "throw" }),
+  )).rejects.toBeInstanceOf(PromptUnavailableError);
+  await expect(withInteractionPolicy(
+    { enabled: false },
+    () => confirmDestructive({
+      message: "custom unavailable",
+      headless: "throw",
+      headlessError: "exact full-gate error",
+    }),
+  )).rejects.toThrow("exact full-gate error");
+
+  const ttyDescriptor = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+  Object.defineProperty(process.stdin, "isTTY", { configurable: true, value: true });
+  try {
+    for (const opts of [
+      { message: "proceed needs a prompt surface", headless: "proceed" as const },
+      { message: "deny needs a prompt surface", headless: "deny" as const },
+      {
+        message: "require-yes needs a prompt surface",
+        headless: "require-yes" as const,
+        headlessError: "must not replace PromptUnavailableError",
+      },
+    ]) {
+      await expect(withInteractionPolicy(
+        { enabled: false },
+        () => confirmDestructive(opts),
+      )).rejects.toBeInstanceOf(PromptUnavailableError);
+    }
+  } finally {
+    if (ttyDescriptor) Object.defineProperty(process.stdin, "isTTY", ttyDescriptor);
+    else delete (process.stdin as NodeJS.ReadStream & { isTTY?: boolean }).isTTY;
+  }
+});
 
 test("checkbox factory preserves generic values and routes the widget to the injected output", async () => {
   const output = { write() { return true; } } as unknown as NodeJS.WritableStream;

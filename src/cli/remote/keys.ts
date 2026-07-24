@@ -1,5 +1,5 @@
 import type { AccountKeysDTO, GenesisAccountObservation, GenesisPresence } from "../e2ee-remote.js";
-import { AccountAlreadyBootstrappedError, GenesisBootstrapTerminalError, LegacyGenesisServiceError, translateRemoteError } from "./errors.js";
+import { AccountAlreadyBootstrappedError, errorCode, GenesisBootstrapTerminalError, LegacyGenesisServiceError, translateRemoteError } from "./errors.js";
 import type { RemoteContext } from "./context.js";
 
 // ---- E2EE key + signed-commit transport (design 12 §13.2) ----------------
@@ -9,19 +9,14 @@ export async function bootstrapKeys(ctx: RemoteContext, body: unknown): Promise<
   if (r.ok) return;
   const text = await r.text();
   if (r.status === 410) {
-    let code = "account_erased";
-    try { const parsed = JSON.parse(text) as { error?: unknown }; if (typeof parsed.error === "string") code = parsed.error; } catch {}
+    const code = errorCode(text) ?? "account_erased";
     throw new GenesisBootstrapTerminalError(410, code, "this account no longer exists; its encrypted data has been erased");
   }
   if (r.status >= 400 && r.status < 500 && r.status !== 409 && r.status !== 423 && r.status !== 428 && r.status !== 429) {
     throw new GenesisBootstrapTerminalError(r.status, "bootstrap_rejected", translateRemoteError(r.status, "keys/bootstrap failed", text, "account key setup not found"));
   }
   if (r.status === 409) {
-    try {
-      if ((JSON.parse(text) as { error?: string }).error === "already_bootstrapped") throw new AccountAlreadyBootstrappedError();
-    } catch (err) {
-      if (err instanceof AccountAlreadyBootstrappedError) throw err;
-    }
+    if (errorCode(text) === "already_bootstrapped") throw new AccountAlreadyBootstrappedError();
   }
   throw new Error(translateRemoteError(r.status, "keys/bootstrap failed", text, "account key setup not found"));
 }

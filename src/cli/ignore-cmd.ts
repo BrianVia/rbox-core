@@ -3,7 +3,7 @@ import path from "node:path";
 import { buildIgnoreMatcher, effectiveIgnoreRules, HashCache, scanManifest } from "../engine/index.js";
 import { loadConfig, loadState, saveConfig, syncStreamId } from "./config.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
-import { promptConfirm } from "./prompt.js";
+import { confirmDestructive } from "./prompt.js";
 import { localFileObservationForScan, makeDeferErrnoReporter, pushManifest } from "./sync.js";
 import { deferManifest } from "./sync-recovery.js";
 import { withWorkspaceSyncMutex } from "./sync-mutex.js";
@@ -80,13 +80,16 @@ export async function purgeIgnored(root: string, opts: { yes?: boolean; allowMas
   const dirs = [...topLevelDirs].slice(0, 12);
   console.log(`purge dry-run: ${preview.purged.length} path${preview.purged.length === 1 ? "" : "s"} would be deleted from other machines.`);
   console.log(`top-level: ${dirs.join(", ")}${dirs.length < topLevelDirs.size ? ", ..." : ""}`);
-  if (!opts.yes) {
-    if (process.stdin.isTTY !== true) throw new Error("refusing headless purge without --yes");
-    const ok = await promptConfirm({ message: "Purge these ignored paths from synced state?", default: false });
-    if (!ok) {
-      console.log("purge cancelled.");
-      return;
-    }
+  const ok = await confirmDestructive({
+    message: "Purge these ignored paths from synced state?",
+    yes: opts.yes,
+    default: false,
+    headless: "require-yes",
+    headlessError: "refusing headless purge without --yes",
+  });
+  if (!ok) {
+    console.log("purge cancelled.");
+    return;
   }
 
   await withWorkspaceSyncMutex(root, async (syncMutex) => {

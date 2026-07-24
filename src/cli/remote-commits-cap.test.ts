@@ -223,3 +223,15 @@ test("redeem instrumentation counts entries on a definitive generic error respon
   expect(firstPublishTiming.stats.redeemReceiptCount).toBe(2);
   expect(ctx.receipts.size).toBe(2);
 });
+
+test("redeemReceipts preserves the parsed-null TypeError compatibility edge", async () => {
+  const ctx = new RemoteContext("https://rbox.test", "tok", "ws", "root");
+  ctx.receipts.set(key(1), "receipt-1");
+  (ctx as unknown as { fetch: RemoteContext["fetch"] }).fetch = async () =>
+    new Response("null", { status: 400, headers: { "content-type": "application/json" } });
+
+  const error = await redeemReceipts(ctx).catch((cause) => cause);
+  expect(error).toBeInstanceOf(TypeError);
+  expect(error.message).toBe("null is not an object (evaluating 'body.error')");
+  expect(ctx.receipts.size).toBe(1);
+});
