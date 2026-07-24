@@ -3,7 +3,7 @@ import { cappedJson, json, logErr } from "../util.js";
 import { isPlatform } from "../authz.js";
 import { retentionPrune } from "../retention.js";
 import { phase1Audit, runPhase1 } from "../gc-phase1.js";
-import { ADMIN_PURGE_DEADLINE_MS, gcAudit, gcHealth, gcMark, gcPurge } from "../versions.js";
+import { ADMIN_PURGE_DEADLINE_MS, gcAudit, gcHealth, gcMark, gcPurge, gcStagingSweep } from "../versions.js";
 import { adminOverview, fetchDeltaSoak } from "../admin.js";
 import { adminSetPlan } from "../billing.js";
 import { multipartInventory } from "../multipart-inventory.js";
@@ -175,6 +175,7 @@ export async function adminRoutes({ req, env, url, seg }: RouteCtx): Promise<Res
     // Plan-driven retention: set per-workspace prune floors from each account's
     // tier; mark/purge then reclaim. Operational order: retention → mark → purge.
     if (phase === "retention") return retentionPrune(env);
+    if (phase === "staging") return gcStagingSweep(env);
     if (phase === "packs") {
       if (packGcMode(env) === "off") return json({ error: "pack_gc_disabled" }, 409);
       return runPackGc(env, { deadlineMs: ADMIN_PURGE_DEADLINE_MS });
