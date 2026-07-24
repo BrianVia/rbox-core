@@ -20,6 +20,7 @@ import { GENESIS_PENDING_MESSAGE } from "./genesis-durable.js";
 import type { E2eeRemote } from "./e2ee-remote.js";
 import { readLockingHealth } from "./sync-mutex.js";
 import { ResetCorruptionError } from "./reset-io.js";
+import { GIT_DEFERRAL_REASONS } from "./sync-state-model.js";
 
 const REPORT_CAP_BYTES = 512 * 1024;
 const DAEMON_LOG_TAIL_BYTES = 64 * 1024;
@@ -29,11 +30,7 @@ const STALE_EXCLUDED = { excluded: "stale daemon binding" } as const;
 const NOTICE =
   "this includes your daemon log tail, which contains file and folder names/paths from this workspace, your device id, and raw error messages; it is stored UNENCRYPTED for support for 30 days.";
 const bunVersion = () => (process.versions as NodeJS.ProcessVersions & { bun?: string }).bun ?? "unknown";
-const GIT_DEFERRAL_REASONS = new Set([
-  "local-edits", "local-index", "local-operation", "local-commits", "local-stash",
-  "conflict", "git-busy", "stale-unattributed", "worktree-ownership", "ignored-target", "unreadable",
-  "artifact", "config", "containment", "unsupported", "other",
-]);
+const GIT_DEFERRAL_REASON_SET = new Set<string>(GIT_DEFERRAL_REASONS);
 
 type CheckName = "credentials" | "enrollment" | "device" | "daemon" | "remote" | "version" | "state" | "crypto" | "locking" | "git";
 
@@ -108,7 +105,7 @@ function keepLastUtf8(s: string, maxBytes: number): string {
 
 function gitReasonOf(detail: string, fallback = "other"): string {
   const normalized = detail.toLowerCase().replace(/[ _]+/g, "-");
-  for (const reason of GIT_DEFERRAL_REASONS) {
+  for (const reason of GIT_DEFERRAL_REASON_SET) {
     if (normalized.includes(reason)) return reason;
   }
   if (/local edits|working (?:tree|files)|unstaged|porcelain/.test(detail.toLowerCase())) return "local-edits";
@@ -606,15 +603,12 @@ export async function presentDiagnosticsPreview(bundle: DiagnosticsBundle, opts:
   }
 
   console.log(NOTICE);
-  console.log(`\n--- diagnostics preview (${bytes} bytes) ---`);
-  process.stdout.write(preview + "\n");
-  console.log("--- end diagnostics preview ---");
+  printDiagnosticsPreview(preview);
   if (opts.yes) return true;
   return promptConfirm({ message: "Upload this plaintext diagnostics report to rbox support?", default: false });
 }
 
-function printDiagnosticsPreview(bundle: DiagnosticsBundle): void {
-  const preview = JSON.stringify(bundle, null, 2);
+function printDiagnosticsPreview(preview: string): void {
   console.log(`\n--- diagnostics preview (${byteLen(preview)} bytes) ---`);
   process.stdout.write(preview + "\n");
   console.log("--- end diagnostics preview ---");
@@ -655,7 +649,7 @@ export async function doctorCmd(root: string, opts: DoctorCmdOptions): Promise<v
       }
       else console.log("diagnostics report not uploaded");
     } else {
-      printDiagnosticsPreview(bundle);
+      printDiagnosticsPreview(JSON.stringify(bundle, null, 2));
       console.log("nothing was uploaded — add --diagnostics to send this report to rbox support");
     }
   }
