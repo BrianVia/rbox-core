@@ -7,6 +7,25 @@ export const RBOX_TMP_PREFIX = ".rbox-tmp-";
 
 let counter = 0;
 
+/** The errno string of a Node filesystem error, or undefined for a value that
+ *  is not an errno-bearing exception. Single source for the per-file errno
+ *  classification hand-rolled across the engine. */
+export function errCode(e: unknown): string | undefined {
+  return (e as NodeJS.ErrnoException | undefined)?.code;
+}
+
+/** The target does not exist: ENOENT, or ENOTDIR when a parent component is a
+ *  file (or was evicted). Both mean "not there" to a caller resolving a path. */
+export function isAbsent(e: unknown): boolean {
+  const code = errCode(e);
+  return code === "ENOENT" || code === "ENOTDIR";
+}
+
+/** A name-claim collided: the destination already exists (EEXIST). */
+export function isEEXIST(e: unknown): boolean {
+  return errCode(e) === "EEXIST";
+}
+
 /**
  * Write `data` to `absPath` atomically: stage to a sibling temp, fsync it, then
  * rename over the target. A crash can leave a temp (ignore-listed) but never a
@@ -147,5 +166,77 @@ export async function assertWithinRoot(destRoot: string, abs: string): Promise<v
       }
       throw e;
     }
+  }
+}
+
+/** Optional observation hooks for {@link moveNoClobber}'s directory branch — the
+ *  apply path threads its stat counters through these so fsutil stays free of any
+ *  dependency on the apply-stats module. Absent, the branch behaves identically. */
+export interface MoveNoClobberHooks {
+  /** Fired once the directory-name mkdir settles (`created` = it succeeded). */
+  onMkdir?: (created: boolean) => void;
+  /** Fired after the directory rename lands. */
+  onRename?: () => void;
+}
+
+/** Move `from` to `to` iff `to` does not exist, ATOMICALLY (no check-then-rename
+ *  window): files hard-link (EEXIST-atomic) then drop the source; symlinks
+ *  recreate via symlink(2) (EEXIST-atomic); directories claim the name with
+ *  mkdir (EEXIST-atomic) then rename over the just-made empty dir (POSIX allows
+ *  dir→empty-dir). Returns false when the name was already taken. Implements the
+ *  "conflict copies never overwrite" invariant: every destination claim is
+ *  exclusive at the filesystem operation itself, avoiding access-then-rename races. */
+export async function moveNoClobber(
+  from: string,
+  to: string,
+  st: { isDirectory(): boolean; isSymbolicLink(): boolean },
+  hooks: MoveNoClobberHooks = {},
+): Promise<boolean> {
+  try {
+    if (st.isDirectory()) {
+      let ok = false;
+      try {
+        await fs.mkdir(to);
+        ok = true;
+      } finally {
+        hooks.onMkdir?.(ok);
+      }
+      await fs.rename(from, to);
+      hooks.onRename?.();
+    } else if (st.isSymbolicLink()) {
+      await fs.symlink(await fs.readlink(from), to);
+      await fs.unlink(from);
+    } else {
+      await fs.link(from, to);
+      await fs.unlink(from);
+    }
+    return true;
+  } catch (e) {
+    if (isEEXIST(e)) return false;
+    throw e;
+  }
+}
+
+/** Claim the first free `~N`-suffixed name for an atomic no-clobber move: try
+ *  `baseRel`, then `baseRel~2`, `baseRel~3`… (a conflict copy must never clobber
+ *  an EARLIER copy — conflict names are second-precision, so same-second twins
+ *  collide). `toAbs` resolves each candidate to its absolute path; `prepare` runs
+ *  per candidate BEFORE the move attempt (e.g. mkdir parents / within-root guard);
+ *  `hooks` thread {@link moveNoClobber}'s directory counters. Returns the
+ *  workspace-relative name actually claimed. */
+export async function claimUnclobberedName(opts: {
+  from: string;
+  st: { isDirectory(): boolean; isSymbolicLink(): boolean };
+  baseRel: string;
+  toAbs: (rel: string) => string;
+  prepare?: (rel: string, abs: string) => void | Promise<void>;
+  hooks?: MoveNoClobberHooks;
+}): Promise<string> {
+  let rel = opts.baseRel;
+  for (let i = 2; ; i++) {
+    const abs = opts.toAbs(rel);
+    await opts.prepare?.(rel, abs);
+    if (await moveNoClobber(opts.from, abs, opts.st, opts.hooks)) return rel;
+    rel = `${opts.baseRel}~${i}`;
   }
 }

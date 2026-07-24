@@ -7,6 +7,7 @@ import { hashBytes, hashFile } from "./hash.js";
 import type { HashCache } from "./hashcache.js";
 import { DirCache, UNPRUNED_DEADLINE_MS, type DirCacheChild, type DircacheOutcome, type RuleFileRecord } from "./dircache.js";
 import { buildIgnoreMatcher, isIgnoreRuleFile, type IgnoreMatcher } from "./ignore.js";
+import { errCode, isAbsent } from "./fsutil.js";
 import type { FileEntry, Manifest } from "./types.js";
 import { bulkWalkDir, bulkWalkSupported, type BulkStat } from "./darwin-bulk-walk.js";
 
@@ -15,7 +16,7 @@ import { bulkWalkDir, bulkWalkSupported, type BulkStat } from "./darwin-bulk-wal
  *  failure is deliberately NOT here — an unenumerable dir fails the scan loudly. */
 const DEFERRABLE_FILE_ERRNOS = new Set(["EACCES", "EPERM", "EIO", "ENOENT"]);
 function isDeferrableFileError(e: unknown): e is NodeJS.ErrnoException {
-  const code = (e as NodeJS.ErrnoException | undefined)?.code;
+  const code = errCode(e);
   return typeof code === "string" && DEFERRABLE_FILE_ERRNOS.has(code);
 }
 
@@ -23,7 +24,7 @@ function isDeferrableFileError(e: unknown): e is NodeJS.ErrnoException {
  *  absence — mapping these to "gone" is how an unreadable file becomes a deletion. */
 const PRESENT_BUT_UNREADABLE_ERRNOS = new Set(["EACCES", "EPERM", "EIO"]);
 export function isPresentButUnreadableError(e: unknown): e is NodeJS.ErrnoException {
-  const code = (e as NodeJS.ErrnoException | undefined)?.code;
+  const code = errCode(e);
   return typeof code === "string" && PRESENT_BUT_UNREADABLE_ERRNOS.has(code);
 }
 
@@ -580,7 +581,7 @@ async function walk(
       try {
         await walk(ctx, childRel, out, toHash, childDiscoveryPruned);
       } catch (error) {
-        if (reused && ((error as NodeJS.ErrnoException).code === "ENOENT" || (error as NodeJS.ErrnoException).code === "ENOTDIR")) continue;
+        if (reused && isAbsent(error)) continue;
         throw error;
       }
     } else if (child.type === "symlink") {
