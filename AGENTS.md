@@ -15,7 +15,12 @@ Brian's preferred loop — follow it unless told otherwise:
 3. Implement via `codex exec` against the agreed design (spec-first dispatch).
 4. Validate the design is actually working: a dev build shipped to the local
    fleet, or the test rig (`bun run rig`) — not just unit tests.
-5. Run `/simplify` and `/antislop-codebase`.
+5. Run `/simplify` (diff-scoped cleanup of the change). Repo-wide structural
+   review runs on a separate cadence, not per-cycle: every few merged cycles
+   (or when touching a known hotspot), run codex's
+   `/thermo-nuclear-code-quality-review` to refresh the ranked refactor
+   roadmap — it supersedes ad-hoc `/antislop-codebase` runs; act on the
+   roadmap one decomposition cycle at a time.
 6. Merge only after all CI is green and no remaining issues are found.
 7. (Optional) release a new CLI build if the change warrants it
    (`docs/DEPLOYMENTS.md` has the release flow).
