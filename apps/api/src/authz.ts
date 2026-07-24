@@ -1,5 +1,5 @@
 import type { Env } from "./env.js";
-import { ctEqual, json } from "./util.js";
+import { json, platformSecretMatches } from "./util.js";
 import { dbFor } from "./db.js";
 import { batchedInLookup } from "./d1-batch.js";
 import { GENESIS_TOMBSTONE_SENTINEL, tombstoneFenceResponse } from "./genesis-repair.js";
@@ -68,8 +68,7 @@ export async function grantEntitlement(env: Env, accountId: string, sha: string)
 
 /** Platform-admin auth for internal ops (GC). NOT a tenant device token. */
 export function isPlatform(req: Request, env: Env): boolean {
-  const h = req.headers.get("x-rbox-platform") ?? "";
-  return !!env.RBOX_PLATFORM_SECRET && ctEqual(h, env.RBOX_PLATFORM_SECRET);
+  return platformSecretMatches(req.headers.get("x-rbox-platform"), env);
 }
 
 /** Max stored length of the opt-in workspace name (a label, not a path). */

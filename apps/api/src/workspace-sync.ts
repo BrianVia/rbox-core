@@ -1,5 +1,5 @@
 import type { Env } from "./env.js";
-import { ctEqual, json, logErr, readBodyCapped, SHA256_HEX_RE as SHA_RE } from "./util.js";
+import { json, logErr, platformSecretMatches, readBodyCapped, SHA256_HEX_RE as SHA_RE } from "./util.js";
 import { emit as emitMetric, emitDelta, emitRedeemPhases, startOp, type MetricEvent } from "./metrics.js";
 import {
   validateCommitRefs,
@@ -1235,8 +1235,7 @@ export class WorkspaceSync {
   }
 
   private isPlatform(req: Request): boolean {
-    const h = req.headers.get("x-rbox-platform") ?? "";
-    return !!this.env.RBOX_PLATFORM_SECRET && ctEqual(h, this.env.RBOX_PLATFORM_SECRET);
+    return platformSecretMatches(req.headers.get("x-rbox-platform"), this.env);
   }
 
   private hashForSeq(seq: number): string | undefined {

@@ -297,9 +297,15 @@ function encodeMaterializeCursor(page: PendingPage): string {
 
 export function guardSql(alias = "fairuse_scans"): string {
   return `${alias}.account_id=? AND ${alias}.epoch=? AND ${alias}.status=? AND ${alias}.plan_snapshot=? `
-    + `AND EXISTS(SELECT 1 FROM fairuse_leases l WHERE l.account_id=${alias}.account_id AND l.value=? `
-    + `AND CAST(json_extract(l.value,'$.expires') AS INTEGER) `
-    + `> CAST((julianday('now')-2440587.5)*86400000 AS INTEGER))`;
+    + `AND ${leaseLiveExists(`${alias}.account_id`, "l")}`;
+}
+
+function leaseLiveExists(accountIdSql = "?", alias?: string): string {
+  const tableAlias = alias ? ` ${alias}` : "";
+  const columnPrefix = alias ? `${alias}.` : "";
+  return `EXISTS(SELECT 1 FROM fairuse_leases${tableAlias} WHERE ${columnPrefix}account_id=${accountIdSql} `
+    + `AND ${columnPrefix}value=? AND CAST(json_extract(${columnPrefix}value,'$.expires') AS INTEGER)`
+    + `>CAST((julianday('now')-2440587.5)*86400000 AS INTEGER))`;
 }
 
 async function ownsLease(db: D1Database, accountId: string, value: string, nowMs: number): Promise<boolean> {
@@ -398,8 +404,7 @@ async function allocateScan(
     `INSERT INTO fairuse_scans(account_id,epoch,status,plan_snapshot,grace_until_snapshot,roots_format_generation,
        workspace_set_snapshot,started_at,updated_at)
      SELECT ?,?,'capture_pins',?,?,?, ?,?,?
-     WHERE EXISTS(SELECT 1 FROM fairuse_leases WHERE account_id=? AND value=?
-       AND CAST(json_extract(value,'$.expires') AS INTEGER)>CAST((julianday('now')-2440587.5)*86400000 AS INTEGER))`,
+     WHERE ${leaseLiveExists()}`,
   ).bind(accountId, epoch, plan.snapshot, plan.graceUntil, FAIRUSE_ROOTS_FORMAT_GENERATION, snapshot, nowMs, nowMs, accountId, leaseValue).run();
   const scan = await db.prepare("SELECT * FROM fairuse_scans WHERE account_id=? AND epoch=?").bind(accountId, epoch).first<ScanRow>();
   return scan ? { scan, allocated: true } : { requeueReason: "fairuse_lease_lost" };
@@ -1051,24 +1056,21 @@ export async function runFairUseObservation(env: Env, nowMs: number = Date.now()
       await cleanupAbortedPage(db, aborted, held.value);
       await db.prepare(
         `UPDATE fairuse_account_queue SET next_run_at=?,reason='abort_cleanup',updated_at=? WHERE account_id=?
-         AND EXISTS(SELECT 1 FROM fairuse_leases WHERE account_id=? AND value=?
-           AND CAST(json_extract(value,'$.expires') AS INTEGER)>CAST((julianday('now')-2440587.5)*86400000 AS INTEGER))`,
+         AND ${leaseLiveExists()}`,
       ).bind(nowMs, nowMs, accountId, accountId, held.value).run();
       return;
     }
     const allocated = await allocateScan(env, accountId, epoch, held.value, nowMs);
     if ("requeueReason" in allocated) {
       await db.prepare(`UPDATE fairuse_account_queue SET next_run_at=?,reason=?,updated_at=? WHERE account_id=?
-        AND EXISTS(SELECT 1 FROM fairuse_leases WHERE account_id=? AND value=?
-          AND CAST(json_extract(value,'$.expires') AS INTEGER)>CAST((julianday('now')-2440587.5)*86400000 AS INTEGER))`)
+        AND ${leaseLiveExists()}`)
         .bind(nowMs + FAIRUSE_OBSERVATION_INTERVAL_MS, allocated.requeueReason, nowMs, accountId, accountId, held.value).run();
       return;
     }
     if (allocated.allocated) {
       await db.prepare(
         `UPDATE fairuse_account_queue SET next_run_at=?,reason='scan_allocated',updated_at=? WHERE account_id=?
-         AND EXISTS(SELECT 1 FROM fairuse_leases WHERE account_id=? AND value=?
-           AND CAST(json_extract(value,'$.expires') AS INTEGER)>CAST((julianday('now')-2440587.5)*86400000 AS INTEGER))`,
+         AND ${leaseLiveExists()}`,
       ).bind(nowMs, nowMs, accountId, accountId, held.value).run();
     }
     for (let tick = 0; tick < FAIRUSE_PHASE_TICKS_PER_INVOCATION && Date.now() < deadline; tick++) {
@@ -1108,8 +1110,7 @@ export async function runFairUseObservation(env: Env, nowMs: number = Date.now()
     const rest = state?.status === "complete";
     await db.prepare(
       `UPDATE fairuse_account_queue SET next_run_at=?,reason=?,updated_at=? WHERE account_id=?
-       AND EXISTS(SELECT 1 FROM fairuse_leases WHERE account_id=? AND value=?
-         AND CAST(json_extract(value,'$.expires') AS INTEGER)>CAST((julianday('now')-2440587.5)*86400000 AS INTEGER))`,
+       AND ${leaseLiveExists()}`,
     ).bind(rest ? nowMs + FAIRUSE_OBSERVATION_INTERVAL_MS : nowMs,
       state?.status === "aborted_pins" ? "abort_cleanup" : terminal ? String(state?.status ?? "terminal") : "scan", nowMs,
       accountId, accountId, held.value).run();
@@ -1117,8 +1118,7 @@ export async function runFairUseObservation(env: Env, nowMs: number = Date.now()
     if (held) {
       await db.prepare(
         `UPDATE fairuse_account_queue SET next_run_at=?,reason='scan_error',updated_at=? WHERE account_id=?
-         AND EXISTS(SELECT 1 FROM fairuse_leases WHERE account_id=? AND value=?
-           AND CAST(json_extract(value,'$.expires') AS INTEGER)>CAST((julianday('now')-2440587.5)*86400000 AS INTEGER))`,
+         AND ${leaseLiveExists()}`,
       ).bind(nowMs + FAIRUSE_OBSERVATION_INTERVAL_MS, nowMs, accountId, accountId, held.value).run().catch(() => undefined);
     }
     throw error;
