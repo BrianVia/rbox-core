@@ -64,6 +64,7 @@ import type {
   RepoRecordInput,
   TypedBlocker,
 } from "../config.js";
+import { GIT_DEFERRAL_REASON_RANK } from "../sync-state-model.js";
 import { intentSettled, savePublishedRepoIntent, type PublishedRepoIntentDisposition } from "../sync-state.js";
 import {
   origHeadPreservationFailureLine,
@@ -449,12 +450,17 @@ async function readLive(ctx: RepoCtx, chainTimings?: GitChainTimings): Promise<L
   }
 }
 
-function firstReason(reasons: Set<GitDeferralReason>): GitDeferralReason | undefined {
-  const precedence: GitDeferralReason[] = [
-    "local-edits", "local-index", "local-operation", "local-commits", "local-stash",
-    "worktree-ownership", "git-busy", "unreadable", "artifact", "containment", "unsupported", "other",
-  ];
-  return precedence.find((reason) => reasons.has(reason));
+/** Highest-precedence member of `reasons`, or undefined for an EMPTY set only.
+ * classifyCheckout's safe verdict is exactly that emptiness (a deferral reason
+ * the local ranking happened to omit must never read as "safe to check out"), so
+ * selection scans the set against the shared total rank table rather than
+ * searching a locally written list. */
+export function firstReason(reasons: ReadonlySet<GitDeferralReason>): GitDeferralReason | undefined {
+  let selected: GitDeferralReason | undefined;
+  for (const reason of reasons) {
+    if (selected === undefined || GIT_DEFERRAL_REASON_RANK[reason] < GIT_DEFERRAL_REASON_RANK[selected]) selected = reason;
+  }
+  return selected;
 }
 
 async function classifyCheckout(args: {
@@ -570,6 +576,8 @@ async function classifyCheckout(args: {
     for (const mismatch of breadcrumbMismatches) details.push(`operation state differs at ${mismatch.rel}`);
   }
   for (const reason of args.opts.manualResolution?.waivedReasons ?? []) reasons.delete(reason);
+  // Undefined here means the set is empty, never "no rank for this reason":
+  // safe is exactly "nothing blocked", and blockers below are always empty with it.
   const reason = firstReason(reasons);
   const provenance = args.boundary ? "boundary" as const : "checkout" as const;
   const blockers = [...reasons].map((item) => blockerForReason(item, provenance, details.join("; ")));
