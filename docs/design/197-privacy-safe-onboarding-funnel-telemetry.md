@@ -1,6 +1,6 @@
-# 196 — Privacy-safe onboarding funnel telemetry
+# 197 — Privacy-safe onboarding funnel telemetry
 
-Status: DRAFT — implementation-ready, awaiting review.
+Status: ALIGNED (review round 1 folded in, 2026-07-24).
 
 Origin: `docs/audits/2026-07-22-onboarding-feedback.md` and the onboarding
 follow-up on 2026-07-23.
@@ -255,6 +255,9 @@ interface OnboardingFlowSample {
   recoverySelected: "not_reached" | "m00" | "m01" | "m02" | "m03"
     | "m04" | "m05" | "m06" | "m07" | "m08" | "m09" | "m10"
     | "m11" | "m12" | "m13" | "m14" | "m15";
+  firstFailure: "none" | "authorization" | "network" | "workspace"
+    | "scan" | "filesystem" | "upload" | "commit" | "download"
+    | "decrypt" | "apply" | "git" | "conflict" | "cancelled" | "other";
   elapsedMs: number;
 }
 ```
@@ -269,9 +272,25 @@ Emission rules:
 - `interrupted`: on the next invocation when a prior journal remains active
   without a clean terminal marker.
 
+Every record carries `firstFailure`: the first bounded initial-sync failure
+category recorded in the journal (§5.5), or `none` when no failure was observed
+or `initial_sync` was not reached. `started` always carries `none`. Because a
+terminal `exited`/`interrupted` event ships this field, a flow that failed
+initial sync and never recovered — and therefore never emits an
+`onboarding_activation` record — still delivers its bounded failure family to
+the server. Without this, failure categories would be observable only for users
+who recovered, biasing the funnel toward survivors. The value is the same
+allow-listed §5.5 enum used by activation; it adds no free-form data.
+
 `elapsedMs` is integer wall time since the local start, clamped to design 120's
-`[0, 604_800_000]` ms domain. A clock that moves backward produces `0`; a flow
-older than seven days produces the maximum. Absolute timestamps stay local.
+`[0, 604_800_000]` ms domain. It is measured when the milestone occurs locally,
+never elapsed-at-upload: a `started` record is persisted at flow creation and
+uploaded later (after authentication), yet it always carries `elapsedMs = 0`
+because zero time has passed at the local start it marks. Every event follows
+the same rule — the elapsed value is fixed at the milestone's local occurrence,
+not recomputed when the outbox flushes. A clock that moves backward produces
+`0`; a flow older than seven days produces the maximum. Absolute timestamps stay
+local.
 
 ### 6.2 `onboarding_activation`
 
@@ -319,7 +338,7 @@ The server schema remains the sole route to Analytics Engine:
 
 | `index1` | blobs, in order | doubles, in order |
 |---|---|---|
-| `client.onboarding_flow` | `event`, `lastStep`, `entry`, `enrollmentRoute`, `recoveryOffered`, `recoverySelected` | `elapsedMs` |
+| `client.onboarding_flow` | `event`, `lastStep`, `entry`, `enrollmentRoute`, `recoveryOffered`, `recoverySelected`, `firstFailure` | `elapsedMs` |
 | `client.onboarding_activation` | `entry`, `enrollmentRoute`, `activationKind`, `initialResult`, `firstFailure` | `initialSyncAttempts`, `timeToFirstSuccessMs` |
 
 The API duplicates the client enum tables as runtime data and the existing
@@ -371,7 +390,9 @@ The journal contents contain only:
 - local start time and last-update time;
 - the enums and masks defined above;
 - capped attempt count;
-- first bounded failure category;
+- first bounded failure category (feeds both the `onboarding_flow`
+  `firstFailure` blob on terminal events and the `onboarding_activation`
+  record);
 - lifecycle state (`active`, `continuation_expected`, or terminal);
 - terminal/activation state; and
 - at most eight pending wire samples, each carrying a local monotonic receipt
@@ -463,8 +484,13 @@ It contains only a schema version and local `disabledAtMs`. On every future
 journal import, records started at or before that marker are deleted rather than
 queued. The marker remains so a dormant workspace cannot upload pre-opt-out
 history after telemetry is re-enabled; new flows started after the marker are
-eligible. The tombstone is local configuration, never uploaded. Writing or
-reading it must also be best-effort and cannot affect product behavior.
+eligible. Because eligibility compares a record's local start time against
+`disabledAtMs`, a wall-clock rollback after opt-out can make genuinely new
+flows appear pre-marker and be deleted; this over-deletion is the intended
+privacy-safe failure direction (over-deleting suppressed history is acceptable,
+under-deleting it — leaking pre-opt-out data — is not). The tombstone is local
+configuration, never uploaded. Writing or reading it must also be best-effort
+and cannot affect product behavior.
 
 ## 8. Instrumentation points
 
@@ -508,16 +534,24 @@ Ship saved queries or cockpit panels for:
    - selected count per bit;
    - selected/offered rate per bit; and
    - multi-backup rate (`popcount(selectedMask) >= 2`).
-5. Initial activation success versus failed-then-recovered.
-6. First failure category distribution.
-7. Recovery rate after initial failure.
+5. Initial activation success versus failed-then-recovered
+   (activation records only).
+6. First failure category distribution over terminal flow events
+   (`exited`/`interrupted`) plus activations. Defining it over terminal flow
+   events — not activations alone — includes users who failed initial sync and
+   never recovered, which is the population the funnel most needs to expose.
+7. Recovery rate after initial failure. Labeled recovery-conditioned: it is
+   computable only from `onboarding_activation` records, so it excludes
+   never-recovered flows by construction. Read panel 6 for the unconditioned
+   failure distribution.
 8. Setup-to-first-success p50/p90/p99 split by `published` versus
    `converged_without_publish`; only the former is labeled time-to-first-publish.
 
 Every panel includes these footnotes:
 
 - counts represent authenticated, observable events, not unique people;
-- a never-returning pre-auth abandonment is unobservable;
+- a never-returning pre-auth abandonment is unobservable, so failure categories
+  cover only flows that produced a terminal event or an activation;
 - delivery is best-effort and rare crash duplicates are possible; and
 - no raw user content or identifiers are collected.
 
@@ -549,11 +583,12 @@ panels for qualitative prioritization alongside direct interviews.
 ### 11.1 Contract and privacy
 
 - Client/server schema drift test covers both new kinds, field order, enum order,
-  and numeric domains.
+  and numeric domains, including `firstFailure` on `onboarding_flow`.
 - Arbitrary strings, extra keys, identifier-shaped values, paths, tokens, phrase
   words, hashes, NaN/infinity, and out-of-range numbers cannot reach
   `writeDataPoint`.
-- AE layout tests pin exact blob/double positions.
+- AE layout tests pin exact blob/double positions, including `firstFailure` as
+  the last `onboarding_flow` blob before `elapsedMs`.
 - Source guard rejects forbidden free-form fields in onboarding sample types.
 
 ### 11.2 Recorder state machine
@@ -568,6 +603,10 @@ With injected clock, filesystem, lock, and transport:
 - each enrollment route;
 - first-attempt success;
 - failure → repeated failure → later success;
+- a terminal `exited`/`interrupted` after an initial-sync failure carries that
+  first bounded failure category on the flow record, and a terminal event with
+  `initial_sync` never reached carries `firstFailure=none`;
+- `started` records carry `elapsedMs=0` even when uploaded long after creation;
 - create publication and join-without-publication activation;
 - clock rollback, seven-day clamp, attempt saturation, and 30-day expiry;
 - outbox priority/cap behavior;
@@ -636,6 +675,9 @@ must tolerate a permanent 202 drop without affecting onboarding.
 - [ ] Enrollment routes distinguish token command, token prompt, browser pairing,
       browser recovery, first machine, and already-enrolled setup.
 - [ ] Initial failures use only the bounded category table.
+- [ ] Terminal onboarding flow events carry the first bounded initial-sync
+      failure category, so a never-recovered failure reaches the funnel without
+      an activation record; `started` and never-reached cases carry `none`.
 - [ ] A later first success after failure emits one recovery outcome.
 - [ ] Setup-to-first-success time spans process restarts and is capped at seven
       days.
