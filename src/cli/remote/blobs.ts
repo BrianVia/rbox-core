@@ -160,7 +160,6 @@ export async function getBlobToFile(ctx: RemoteContext, sha256: string, destPath
 
 async function downloadToFileOnce(ctx: RemoteContext, sha256: string, destPath: string, expectedSize?: number): Promise<void> {
   const ctrl = new AbortController();
-  const signal = AbortSignal.any([ctrl.signal, AbortSignal.timeout(blobDownloadTimeoutMs(expectedSize))]);
   let idle: ReturnType<typeof setTimeout> | undefined;
   const armIdle = () => {
     if (idle) clearTimeout(idle);
@@ -169,7 +168,7 @@ async function downloadToFileOnce(ctx: RemoteContext, sha256: string, destPath: 
   };
   armIdle();
   try {
-    const res = await fetch(`${ctx.baseUrl}/v1/blobs/${sha256}`, { headers: ctx.authDownload, signal });
+    const res = await fetchWithDeadline(`${ctx.baseUrl}/v1/blobs/${sha256}`, { headers: ctx.authDownload, signal: ctrl.signal }, blobDownloadTimeoutMs(expectedSize));
     if (!res.ok || !res.body) throw new Error(translateRemoteError(res.status, "blob GET failed", undefined, "remote blob not found — run rbox sync again"));
     const reader = (res.body as ReadableStream<Uint8Array>).getReader();
     const hash = createHash("sha256");

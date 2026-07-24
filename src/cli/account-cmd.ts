@@ -3,6 +3,7 @@ import { emitJson } from "./json.js";
 import { style } from "./style.js";
 import { friendlyHttpError } from "./http-error.js";
 import { identityField, identityText, scheduleAccountProfileWrite } from "./account-profile.js";
+import { fetchWithDeadline } from "./remote/resilient.js";
 
 /**
  * `rbox account <link|status|unlink>` (design 21 §4.0) — the web↔CLI account-link
@@ -16,7 +17,7 @@ import { identityField, identityText, scheduleAccountProfileWrite } from "./acco
 export async function accountLink(code: string): Promise<void> {
   if (!code) throw new Error("usage: rbox account link <code>  (copy the code from your rbox dashboard)");
   const c = await requireCredentials();
-  const res = await fetch(`${c.remoteUrl}/v1/account/link/redeem`, {
+  const res = await fetchWithDeadline(`${c.remoteUrl}/v1/account/link/redeem`, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${c.token}` },
     body: JSON.stringify({ code }),
@@ -73,10 +74,9 @@ export async function fetchAccountSummary(timeoutMs = 3500, loaded?: CredentialL
   if (result.state !== "valid") return { state: "credential-degraded", credential: result };
   const c = result.credentials;
   try {
-    const res = await fetch(`${c.remoteUrl}/v1/account/status`, {
+    const res = await fetchWithDeadline(`${c.remoteUrl}/v1/account/status`, {
       headers: { authorization: `Bearer ${c.token}` },
-      signal: AbortSignal.timeout(timeoutMs),
-    });
+    }, timeoutMs);
     if (!res.ok) return { state: "unavailable" };
     const status = accountStatusFromResponse(await res.json());
     scheduleAccountProfileWrite({
@@ -127,7 +127,7 @@ function renderPlan(plan: string | null | undefined): string {
 /** `rbox account status` — is a web login linked to this account? (Also shows plan.) */
 export async function accountStatus(opts: { json?: boolean } = {}): Promise<void> {
   const c = await requireCredentials();
-  const res = await fetch(`${c.remoteUrl}/v1/account/status`, { headers: { authorization: `Bearer ${c.token}` } });
+  const res = await fetchWithDeadline(`${c.remoteUrl}/v1/account/status`, { headers: { authorization: `Bearer ${c.token}` } });
   if (!res.ok) throw await friendlyHttpError(res, "account status");
   const status = accountStatusFromResponse(await res.json());
   scheduleAccountProfileWrite({
@@ -138,7 +138,7 @@ export async function accountStatus(opts: { json?: boolean } = {}): Promise<void
   });
   const { accountId, linked, plan, email, signInMethod } = status;
   if (opts.json) {
-    const usage = await fetch(`${c.remoteUrl}/v1/account/usage`, { headers: { authorization: `Bearer ${c.token}` } });
+    const usage = await fetchWithDeadline(`${c.remoteUrl}/v1/account/usage`, { headers: { authorization: `Bearer ${c.token}` } });
     if (!usage.ok) throw new Error(`usage failed: ${usage.status}`);
     const u = (await usage.json()) as { plan?: string; graceUntil?: number | null; readOnly?: boolean };
     emitJson({
@@ -162,7 +162,7 @@ export async function accountStatus(opts: { json?: boolean } = {}): Promise<void
 /** `rbox account unlink` — detach the web login (rebinds it to a fresh empty shell). */
 export async function accountUnlink(): Promise<void> {
   const c = await requireCredentials();
-  const res = await fetch(`${c.remoteUrl}/v1/account/unlink`, {
+  const res = await fetchWithDeadline(`${c.remoteUrl}/v1/account/unlink`, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${c.token}` },
     body: "{}",

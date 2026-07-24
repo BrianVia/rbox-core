@@ -45,6 +45,7 @@ import { openAndShow } from "./browser-open.js";
 import { hasKeyInput, runKeyedSetup } from "./setup-keyed.js";
 import { getIdentity, identityText } from "./account-profile.js";
 import { WORKSPACE_MINT_RERUN_HINT } from "./remote/errors.js";
+import { fetchWithDeadline } from "./remote/resilient.js";
 import { rboxBanner } from "./wordmark.js";
 import {
   acquireWorkspaceSyncMutex,
@@ -477,7 +478,7 @@ async function pollUntilPlanActive(credentialResult: CredentialLoadResult): Prom
   const deadline = Date.now() + 5 * 60 * 1000;
   while (Date.now() < deadline) {
     try {
-      const res = await fetch(`${creds.remoteUrl}/v1/account/usage`, { headers: { authorization: `Bearer ${creds.token}` } });
+      const res = await fetchWithDeadline(`${creds.remoteUrl}/v1/account/usage`, { headers: { authorization: `Bearer ${creds.token}` } });
       if (res.ok) {
         const body = (await res.json()) as { plan?: string };
         if (body.plan && body.plan !== "none") return true;

@@ -21,6 +21,7 @@ import type { E2eeRemote } from "./e2ee-remote.js";
 import { readLockingHealth } from "./sync-mutex.js";
 import { ResetCorruptionError } from "./reset-io.js";
 import { GIT_DEFERRAL_REASONS } from "./sync-state-model.js";
+import { fetchWithDeadline, transferTimeoutMs } from "./remote/resilient.js";
 
 const REPORT_CAP_BYTES = 512 * 1024;
 const DAEMON_LOG_TAIL_BYTES = 64 * 1024;
@@ -215,7 +216,7 @@ export function redactGitLogLines(tail: string): string {
 
 async function fetchWithTimeout(url: string, init: RequestInit = {}, timeoutMs = FETCH_TIMEOUT_MS): Promise<{ res: Response; latencyMs: number }> {
   const t0 = performance.now();
-  const res = await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+  const res = await fetchWithDeadline(url, init, timeoutMs);
   return { res, latencyMs: Math.round(performance.now() - t0) };
 }
 
@@ -621,11 +622,13 @@ async function uploadDiagnostics(loaded: CredentialLoadResult, bundle: Diagnosti
   }
   const creds = loaded.credentials;
   const body = JSON.stringify(bundle, null, 2);
-  const res = await fetch(`${creds.remoteUrl}/v1/diagnostics`, {
+  // A diagnostics bundle is a variable-size upload (log tails can run to megabytes), so it
+  // gets the canonical size-aware transfer deadline rather than the flat control budget.
+  const res = await fetchWithDeadline(`${creds.remoteUrl}/v1/diagnostics`, {
     method: "POST",
     headers: { authorization: `Bearer ${creds.token}`, "content-type": "application/json" },
     body,
-  });
+  }, transferTimeoutMs(byteLen(body)));
   if (!res.ok) throw await friendlyHttpError(res, "diagnostics upload");
   const uploaded = (await res.json()) as { id: string; expiresAt: string };
   console.log(`report uploaded — reference ${uploaded.id} (auto-deletes ${uploaded.expiresAt.slice(0, 10)})`);

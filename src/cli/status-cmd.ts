@@ -56,6 +56,7 @@ import { pendingGenesisState } from "./genesis-enrollment.js";
 import { GENESIS_PENDING_MESSAGE } from "./genesis-durable.js";
 import { buildPathWarnings, readPathWarnings, type PathWarningsV1 } from "./path-warnings.js";
 import { projectLocalManifest } from "./local-file-projection.js";
+import { fetchWithDeadline } from "./remote/resilient.js";
 
 interface StatusAccountJson {
   plan: string | null;
@@ -221,10 +222,9 @@ async function fetchRemoteSequence(
     const token = creds?.token || cfg.token;
     if (!token) return undefined;
     const base = creds?.remoteUrl ?? cfg.remoteUrl;
-    const res = await fetch(`${base}/v1/ws/${cfg.remoteWorkspaceId}/proj/${cfg.projectId}/latest`, {
+    const res = await fetchWithDeadline(`${base}/v1/ws/${cfg.remoteWorkspaceId}/proj/${cfg.projectId}/latest`, {
       headers: { authorization: `Bearer ${token}` },
-      signal: AbortSignal.timeout(timeoutMs),
-    });
+    }, timeoutMs);
     if (!res.ok) return undefined;
     const seq = ((await res.json()) as { sequence?: number }).sequence;
     return typeof seq === "number" ? seq : undefined;
@@ -238,10 +238,9 @@ async function fetchStatusAccountJson(loaded: CredentialLoadResult, timeoutMs = 
   if (loaded.state !== "valid") return unavailable;
   const creds = loaded.credentials;
   try {
-    const res = await fetch(`${creds.remoteUrl}/v1/account/usage`, {
+    const res = await fetchWithDeadline(`${creds.remoteUrl}/v1/account/usage`, {
       headers: { authorization: `Bearer ${creds.token}` },
-      signal: AbortSignal.timeout(timeoutMs),
-    });
+    }, timeoutMs);
     if (!res.ok) return unavailable;
     const body = (await res.json()) as { plan?: unknown; usedBytes?: unknown; storageCap?: unknown };
     if (typeof body.plan !== "string" || typeof body.usedBytes !== "number") return unavailable;
