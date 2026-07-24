@@ -71,8 +71,19 @@ untracked (server-side ws_2f43377f still exists — dashboard delete is the
 founder's), 32 activity-litter dirs swept; the auth-failing agent_inN2
 daemon is NOT on the Mac — hunt it on another host via /observe-fleet.
 Desktop's 44 litter dirs unswept (permission classifier blocked the rm).
-NEXT: implement 197, the 193 live smoke suite, or Tier 2 of the sweep
-roadmap; Mac's 2 repo deferrals still founder-pending._
+**TIER 2 COMPLETE — #428-#431 all MERGED** (4 parallel batches, codex×3 +
+opus×1, each audited here): #428 API (platformSecretMatches + lease-liveness
+SQL fragment, bind orders preserved), #429 engine (fsutil errno predicates +
+canonical moveNoClobber with hook-threaded counters + device-secrets
+packaging), #430 remote+cmd (errorCode() + confirmDestructive with per-site
+policy fidelity; doctor deliberately unmigrated; one structural source-scan
+anchor updated in sync-mutex.test), #431 sync-git trio (present-witness in
+base-composer, throwing gitCommitAncestry with both fail-closed mappings
+preserved, default-partial hoist). Recurring codex tic: it minted an
+unrequested "design 200" doc in three separate batches — dropped each time;
+number 200 remains FREE. NEXT: implement 197, the 193 live smoke suite, or
+sweep Tier 3 (state-plane consolidation PR); Mac's 2 repo deferrals still
+founder-pending._
 
 _Previous: 2026-07-24 (**189 SHIPPED — v1.9.0 released + promoted to prod;
 validated end-to-end on two real machines**). Design 189 (web-approved pairing)
