@@ -4,7 +4,8 @@ import { daemonPidPath, daemonStatusPath } from "../rbox-paths.js";
 import { isSafetyHaltReason, type DaemonActivity } from "../activity.js";
 import type { TransferPhase } from "../transfer-progress.js";
 import type { MutationPhase } from "../../engine/mutation-gate.js";
-import { syncStreamId, type RepoRecord, type WorkspaceConfig } from "../config.js";
+import type { RepoRecord } from "../sync-state-model.js";
+import { syncStreamId, type WorkspaceConfig } from "../workspace-config.js";
 import {
   gitDeferralReasonPresentation,
   isKnownGitDeferralReason,

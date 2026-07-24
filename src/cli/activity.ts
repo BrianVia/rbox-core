@@ -13,9 +13,10 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { writeFileAtomic } from "../engine/index.js";
-import { RBOX_DIR, repoRecordsForState, type RepoRecord, type SyncState } from "./config.js";
+import { repoRecordsForState, type RepoRecord, type SyncState } from "./sync-state-model.js";
 import { projectGitDeferralRepos } from "./status-view.js";
 import type { TransferPhase } from "./transfer-progress.js";
+import { RBOX_DIR } from "./workspace-config.js";
 
 /** The transfer phases the activity sidecar accepts. The daemon only ever writes a
  *  subset (it never emits `scan` — its full/deep scans don't wire progress), but a
