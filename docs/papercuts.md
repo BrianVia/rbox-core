@@ -204,3 +204,45 @@ what happened, what it cost, fix hint if obvious.
   input pipeline; x64/darwin/local all give 130. Cancel smoke is advisory on
   that runner only (ci.yml cancel-advisory + release.yml warning). Root cause
   unidentified — candidate follow-up: real terminal-emulator harness.
+
+- 2026-07-23 (189 field-test, founder-hit): first-machine enrollment trap.
+  Running `rbox login` on a FRESH account authorizes the device (device-auth)
+  but does NOT do genesis, leaving it "authorized but not enrolled." Re-running
+  `rbox setup` in that state offers ONLY join options (paste pairing token /
+  recover with phrase / do later) — NO "create encryption" (genesis) option,
+  because the authorized-but-unenrolled resume path assumes some other machine
+  already created the account encryption. On a truly fresh account (no genesis
+  anywhere) that's a dead end: nothing to join, no way to create. Founder: "this
+  is easy to mess up." Escape hatch is the non-obvious `rbox key genesis --yes`.
+  FIX: the authorized-but-unenrolled setup menu must offer genesis when the
+  account has NO encryption (server observation = no key state) — i.e. detect
+  "first machine, account unencrypted" and present "Set up encryption on this
+  machine" alongside the join options. Also consider: `rbox login` on a fresh
+  account should either complete genesis inline or clearly tell the user to run
+  `rbox key genesis`. This is design-180/187 enrollment territory, surfaced by
+  the 189 two-machine test.
+
+- 2026-07-23 (189 live two-machine test, founder-hit): the web `/cli-login`
+  approve page offers "Approve and send this machine your encryption keys"
+  whenever the URL carries a `#fp` fragment (`sendsKeys = binding.kind ===
+  'present'`, +page.svelte:26) — WITHOUT checking the account actually has
+  encryption + a live admin to fulfill. For a FIRST device (fresh account, no
+  genesis) `rbox login` still emits a `#fp`, so the page shows the key-consent
+  button, the user clicks it, and the server rejects with "Encryption isn't set
+  up for this account yet" from `/v1/auth/device/approve`. Workaround during the
+  test was to hand-strip `#fp` from the URL (→ "Approve sign-in", device-auth
+  only). FIX: gate `sendsKeys` on the account actually having deliverable keys
+  (server signals no key-state / no live admin) and fall back to "Approve
+  sign-in" automatically. Pairs with the first-machine enrollment trap above.
+
+- 2026-07-23 (189 live two-machine test, founder-hit): a newly-hosted dashboard
+  origin is not in the API's CORS/`azp` allowlist, so its first `/v1/web/session`
+  call is CORS-blocked and, even past CORS, the Clerk-token `azp` check rejects
+  it — both read the SAME `CLERK_ALLOWED_ORIGINS` (worker.ts:537, clerk.ts:99).
+  Hit when testing against the new deployed dev dashboard `main.rbox-app.pages.dev`
+  (the automated e2e ran on the allowlisted `localhost:5173`, so it never saw
+  this). Fixed live by adding the origin to the dev worker's
+  `CLERK_ALLOWED_ORIGINS` secret. NOT a prod bug today (`app.rbox.to` is already
+  allowlisted), but the standing lesson: ANY new hosted dashboard origin must be
+  added to `CLERK_ALLOWED_ORIGINS` before it can talk to the API. Consider a
+  clearer failure signal than a bare browser CORS error.
