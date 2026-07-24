@@ -20,7 +20,6 @@ import {
   getGenesisObservation,
   getWorkspaceKeys,
   listApiKeys,
-  pairCreate,
   putDeviceKeys,
   putWorkspaceKey,
   revokeApiKey,
@@ -160,10 +159,6 @@ export class RboxApi implements SyncRemote {
 
   commitSigned(parentSeq: number, commit: SignedCommit, beforeManifestPost?: () => Promise<void>): Promise<CommitChainResult> {
     return commitSigned(this.ctx, parentSeq, commit, beforeManifestPost);
-  }
-
-  pairCreate(body: { tokenId: string; mkWrap: string; admissionGrant: string }): Promise<{ token: string }> {
-    return pairCreate(this.ctx, body);
   }
 
   createApiKey(body: CreateApiKeyBody): Promise<{ deviceId: string; expiresAt: number }> {

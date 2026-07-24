@@ -1,5 +1,5 @@
 import type { AccountKeysDTO, GenesisAccountObservation, GenesisPresence } from "../e2ee-remote.js";
-import { AccountAlreadyBootstrappedError, GenesisBootstrapTerminalError, LegacyGenesisServiceError, PAIR_TOKEN_MINT_RERUN_HINT, translateRemoteError } from "./errors.js";
+import { AccountAlreadyBootstrappedError, GenesisBootstrapTerminalError, LegacyGenesisServiceError, translateRemoteError } from "./errors.js";
 import type { RemoteContext } from "./context.js";
 
 // ---- E2EE key + signed-commit transport (design 12 §13.2) ----------------
@@ -82,17 +82,6 @@ export async function putWorkspaceKey(ctx: RemoteContext, workspaceId: string, k
   const r = await ctx.postJson("/v1/keys/workspace", { workspaceId, keyEpoch, kekWrap }, { op: "publishing the workspace key" });
   if (!r.ok) throw new Error(translateRemoteError(r.status, "keys/workspace POST failed", await r.text(), "workspace not found — check you're in the right directory"));
   return (await r.json()) as { keyEpoch: number; kekWrap: string };
-}
-
-// ---- pairing (split-secret; tokenSecret never sent — design 12 §13.5) -----
-
-export async function pairCreate(ctx: RemoteContext, body: { tokenId: string; mkWrap: string; admissionGrant: string }): Promise<{ token: string }> {
-  // NOT auto-retried (retries: 0): mints a pairing token; a retry after a socket-close-post-success
-  // could create a second token. Off the sync hot path — a transient here just fails the pair and
-  // the user re-runs the command. Still gets the timeout deadline.
-  const r = await ctx.postJson("/v1/auth/pair/create", body, { retries: 0, op: "creating a pairing token", rerunHint: PAIR_TOKEN_MINT_RERUN_HINT });
-  if (!r.ok) throw new Error(translateRemoteError(r.status, "pair/create failed", await r.text(), "pairing token not found"));
-  return (await r.json()) as { token: string };
 }
 
 // ---- agent/API key management --------------------------------------------

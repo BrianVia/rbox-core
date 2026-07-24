@@ -3,8 +3,10 @@
  * These helpers intentionally return raw Responses. Retry policy, response
  * interpretation, and user-facing errors belong to the command workflows.
  */
+import { fetchWithDeadline } from "./resilient.js";
+
 function postJson(url: string, body: unknown, token?: string): Promise<Response> {
-  return fetch(url, {
+  return fetchWithDeadline(url, {
     method: "POST",
     headers: { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}) },
     body: JSON.stringify(body),
@@ -42,7 +44,7 @@ export function approveDeviceAuth(remoteUrl: string, userCode: string, token: st
 }
 
 export function listDevicesAuth(remoteUrl: string, token: string): Promise<Response> {
-  return fetch(`${remoteUrl}/v1/auth/devices`, { headers: { authorization: `Bearer ${token}` } });
+  return fetchWithDeadline(`${remoteUrl}/v1/auth/devices`, { headers: { authorization: `Bearer ${token}` } });
 }
 
 export function createPairAuth(

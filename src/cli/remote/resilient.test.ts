@@ -244,7 +244,7 @@ describe("fetchResilient — Response pass-through vs thrown-fault retry", () =>
     }
   });
 
-  test("retries: 0 makes exactly one attempt then translates (the complete/pairCreate contract)", async () => {
+  test("retries: 0 makes exactly one attempt then translates (the multipart-complete contract)", async () => {
     let calls = 0;
     globalThis.fetch = (async () => {
       calls++;
