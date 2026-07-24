@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { parseFlags, unknownFlagError } from "./flags.js";
+import { COMMAND_HELP, helpFor } from "./help-registry.js";
 
 test("--json is a boolean long flag before or after a status path", () => {
   expect(parseFlags(["--json", "."])).toEqual({ positional: ["."], flags: { json: "true" } });
@@ -23,10 +24,120 @@ test("known value long flags still consume values", () => {
 });
 
 test("ignore respect-gitignore consumes on/off value", () => {
-  expect(parseFlags(["--respect-gitignore", "on", "--path", "."])).toEqual({
+  expect(parseFlags(["--respect-gitignore", "on", "--path", "."], "ignore")).toEqual({
     positional: [],
     flags: { "respect-gitignore": "on", path: "." },
   });
+});
+
+// ── per-command arity ────────────────────────────────────────────────────────
+// One registry-wide arity map keyed by flag NAME let the last registration win, so
+// `rbox status --git <path>` (valueless `--git`) parsed as `git: "<path>"` and lost
+// BOTH the git detail and the path. Arity is per command; the map must be too.
+
+test("status --git is valueless and never swallows the status path", () => {
+  expect(parseFlags(["--git", "/home/dev/app"], "status")).toEqual({ positional: ["/home/dev/app"], flags: { git: "true" } });
+  expect(parseFlags(["/home/dev/app", "--git"], "status")).toEqual({ positional: ["/home/dev/app"], flags: { git: "true" } });
+});
+
+test("init/track --git <true|false> still consumes its value", () => {
+  expect(parseFlags(["--git", "false"], "init")).toEqual({ positional: [], flags: { git: "false" } });
+  expect(parseFlags(["--git", "false"], "track")).toEqual({ positional: [], flags: { git: "false" } });
+  expect(parseFlags(["--git=false"], "init")).toEqual({ positional: [], flags: { git: "false" } });
+});
+
+test("init/track --respect-gitignore is valueless and never swallows the directory", () => {
+  expect(parseFlags(["--respect-gitignore", "/home/dev/app"], "track")).toEqual({
+    positional: ["/home/dev/app"],
+    flags: { "respect-gitignore": "true" },
+  });
+  expect(parseFlags(["--respect-gitignore", "--root", "/home/dev/app"], "init")).toEqual({
+    positional: [],
+    flags: { "respect-gitignore": "true", root: "/home/dev/app" },
+  });
+});
+
+test("flags a command accepts but does not document keep their registry-wide arity", () => {
+  // `--no-interactive` is a HIDDEN_FLAGS entry for `track` (declared only under `init`).
+  expect(parseFlags(["--no-interactive", "/home/dev/app"], "track")).toEqual({
+    positional: ["/home/dev/app"],
+    flags: { "no-interactive": "true" },
+  });
+});
+
+test("an unresolvable command falls back to the union, valueless for names that collide", () => {
+  expect(parseFlags(["--limit", "25"], "frobnicate")).toEqual({ positional: [], flags: { limit: "25" } });
+  expect(parseFlags(["--git", "/home/dev/app"], "frobnicate")).toEqual({ positional: ["/home/dev/app"], flags: { git: "true" } });
+  expect(parseFlags(["--git", "/home/dev/app"])).toEqual({ positional: ["/home/dev/app"], flags: { git: "true" } });
+});
+
+// ── registry guards (keep the parser's arity source unambiguous) ──────────────
+
+const FLAG_TOKEN = /^(--[a-z0-9][a-z0-9-]*)\b/i;
+
+function declaredFlags(command: { name: string; flags?: { flag: string }[] }): { name: string; takesValue: boolean }[] {
+  const declared: { name: string; takesValue: boolean }[] = [];
+  for (const { flag } of command.flags ?? []) {
+    const token = flag.match(FLAG_TOKEN)?.[1];
+    if (token) declared.push({ name: token.slice(2), takesValue: flag.slice(token.length).trim().length > 0 });
+  }
+  return declared;
+}
+
+const arityWord = (takesValue: boolean) => (takesValue ? "WITH a value" : "WITHOUT a value");
+
+test("registry guard: one resolved help key never declares a flag name at two arities", () => {
+  // `parseFlags` resolves a command to `helpFor(cmd)`, which for a group token unions
+  // every sub-verb. Within one such key the last declaration would silently win — the
+  // exact defect this map was rebuilt to kill — so the registry must not contain one.
+  const keys = new Set(COMMAND_HELP.flatMap((c) => [c.name, c.name.split(" ")[0]!]));
+  const conflicts: string[] = [];
+  for (const key of [...keys].sort()) {
+    const seen = new Map<string, { takesValue: boolean; command: string }>();
+    for (const entry of helpFor(key) ?? []) {
+      for (const { name, takesValue } of declaredFlags(entry)) {
+        const prev = seen.get(name);
+        if (prev && prev.takesValue !== takesValue) {
+          conflicts.push(
+            `--${name} under \`rbox ${key}\`: ${prev.command} declares it ${arityWord(prev.takesValue)}, ${entry.name} declares it ${arityWord(takesValue)} — split the key or align the two declarations`,
+          );
+        }
+        seen.set(name, { takesValue, command: entry.name });
+      }
+    }
+  }
+  expect(conflicts).toEqual([]);
+});
+
+test("registry guard: flag names that collide ACROSS commands are resolved per command", () => {
+  // Cross-command collisions are legitimate (`--git` is a status presentation toggle
+  // and an init/track setting), so this pins the inventory instead of banning it: a new
+  // colliding name must be reviewed here, and every entry must parse per its command.
+  const byFlag = new Map<string, { command: string; takesValue: boolean }[]>();
+  for (const command of COMMAND_HELP) {
+    for (const { name, takesValue } of declaredFlags(command)) {
+      byFlag.set(name, [...(byFlag.get(name) ?? []), { command: command.name, takesValue }]);
+    }
+  }
+  const colliding = [...byFlag].filter(([, decls]) => new Set(decls.map((d) => d.takesValue)).size > 1);
+
+  expect(colliding.map(([name, decls]) => `--${name}: ${decls.map((d) => `${d.command} ${arityWord(d.takesValue)}`).join("; ")}`).sort()).toEqual([
+    "--git: status WITHOUT a value; init WITH a value; track WITH a value",
+    "--respect-gitignore: init WITHOUT a value; track WITHOUT a value; ignore WITH a value",
+  ]);
+
+  for (const [name, decls] of colliding) {
+    for (const { command, takesValue } of decls) {
+      const parsed = parseFlags([`--${name}`, "NEXT"], command.split(" ")[0]!);
+      expect({ command, ...parsed }).toEqual(
+        takesValue
+          ? { command, positional: [], flags: { [name]: "NEXT" } }
+          : { command, positional: ["NEXT"], flags: { [name]: "true" } },
+      );
+    }
+    // Unattributable (no resolvable command): never swallow the following argument.
+    expect({ name, ...parseFlags([`--${name}`, "NEXT"]) }).toEqual({ name, positional: ["NEXT"], flags: { [name]: "true" } });
+  }
 });
 
 test("unknown flags are rejected against command and subcommand help", () => {
