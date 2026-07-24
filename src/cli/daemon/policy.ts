@@ -5,7 +5,7 @@ import type { DaemonMutexResult } from "../sync-mutex.js";
 
 export const SAFETY_SYNC_MS = 60_000; // frequent stat-only reconcile (heals dropped events)
 const SAFETY_SYNC_MAX_MS = 5 * 60_000; // idle-backoff cap for the safety scan (design 49)
-export const retrustEnabled = () => process.env.RBOX_WATCHER_RETRUST === "1";
+export const retrustEnabled = () => process.env.RBOX_WATCHER_RETRUST !== "0";
 // Soak-tunable (design 104 §Constants): W / M / K, floored at 1 (envInt clamps).
 export const RETRUST_DROP_WINDOW_MS = envInt("RBOX_WATCHER_RETRUST_W_MS", 10 * 60_000, 1, Number.MAX_SAFE_INTEGER);
 export const RETRUST_FUSE_DROPS = envInt("RBOX_WATCHER_RETRUST_M", 6, 1, Number.MAX_SAFE_INTEGER);

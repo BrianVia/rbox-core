@@ -299,7 +299,7 @@ test("pull-only daemon watcher path never queues push", async () => {
 
 test("a post-init watcher error revokes trust: backoff treats the watcher as dead (codex R1)", async () => {
   const previous = process.env.RBOX_WATCHER_RETRUST;
-  delete process.env.RBOX_WATCHER_RETRUST;
+  process.env.RBOX_WATCHER_RETRUST = "0";
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-safety-")));
   const daemon = makeDaemon(root);
   let onError: ((err: Error) => void) | undefined;

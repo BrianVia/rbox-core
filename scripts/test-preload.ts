@@ -12,6 +12,7 @@ export function targetsApiTests(argv: string[]): boolean {
 if (targetsApiTests(process.argv)) throw new Error(API_HARNESS_ERROR);
 
 process.env.RBOX_FILES_FIRST = "0";
+process.env.RBOX_WATCHER_RETRUST = "0";
 // Designs 109/111/112 also default ON in production (founder call, single-user fleet);
 // the broad suite predates the flips and pins the legacy paths — kill-switch
 // coverage. The dedicated default tests assert the unset-env defaults are ON.
