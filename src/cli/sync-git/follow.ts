@@ -1020,7 +1020,10 @@ async function publishRefPlane(
       }
     } catch (error) {
       const message = String((error as Error)?.message ?? error);
+      // Classify on the raw message: boundedRefFailure truncates, and a
+      // `lock`/`busy`/`transaction` token past the bound must still count.
       checkoutRefReason ??= /lock|busy|transaction/i.test(message) ? "git-busy" : "other";
+      checkoutRefDetail ??= `publishing ref ${ref} failed: ${boundedRefFailure(error)}`;
     }
   }
 
