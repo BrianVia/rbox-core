@@ -121,7 +121,7 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
     await (deps.refreshSystemLockIdentityLedger ?? refreshSystemLockIdentityLedger)().catch(() => {});
   }
   const rest = process.argv.slice(3);
-  const parsed = parseFlags(rest);
+  const parsed = parseFlags(rest, cmd);
   let positional = parsed.positional;
   const flags = parsed.flags;
   const rawJsonMode = flags.json === "true";
