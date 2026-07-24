@@ -62,6 +62,23 @@ interface EffectiveFloor {
 
 const processIsElevated = (): boolean => typeof process.geteuid === "function" && process.geteuid() === 0;
 
+function causeHasCode(error: unknown, codes: readonly string[]): boolean {
+  const seen = new Set<unknown>();
+  let current = error;
+  while (current !== null && typeof current === "object" && !seen.has(current)) {
+    seen.add(current);
+    if ("code" in current && codes.includes(String(current.code))) return true;
+    current = "cause" in current ? current.cause : undefined;
+  }
+  return false;
+}
+
+function floorMessage(floor: EffectiveFloor): string {
+  return floor.state?.phase === "pending"
+    ? `an upgrade to ${floor.version} is incomplete — run \`rbox upgrade\` again to finish it`
+    : `verified upgrade floor is ${floor.version}; this process is ${RBOX_VERSION} — run \`rbox upgrade\` again from a fresh shell`;
+}
+
 export interface UpgradeDaemonDeps {
   readDesiredDaemonRows?: typeof readDesiredDaemonRows;
   isDaemonProcess?: typeof isDaemonProcess;
@@ -279,6 +296,12 @@ async function acquireUpgradeLock(ctx: UpgradeContext): Promise<OwnedLock> {
     const pid = "marker" in result.inspection ? result.inspection.marker.pid : undefined;
     throw new Error(`another rbox upgrade is already running${pid ? ` (pid ${pid})` : ""} — refusing to run concurrently`);
   }
+  if (!ctx.elevated && causeHasCode(result.error, ["EACCES", "EPERM"])) {
+    throw new Error(
+      `cannot acquire the rbox upgrade lock at ${ctx.lockPath} — if this rbox install is root-owned, retry with \`sudo rbox upgrade\``,
+      { cause: result.error },
+    );
+  }
   throw new Error("cannot acquire the rbox upgrade lock", { cause: result.error });
 }
 
@@ -343,7 +366,7 @@ export async function upgradeCmd(remoteUrl: string, opts: { check?: boolean; dae
 
   const noUpgrade = async (floor: EffectiveFloor): Promise<void> => {
     if (semverGt(floor.version, RBOX_VERSION)) {
-      console.log(`verified upgrade floor is ${floor.version}; this process is ${RBOX_VERSION} — run \`rbox upgrade\` again from a fresh shell`);
+      console.log(floorMessage(floor));
     } else if (ctx.elevated) {
       console.log(`already up to date (${RBOX_VERSION})`);
     } else {
@@ -362,7 +385,7 @@ export async function upgradeCmd(remoteUrl: string, opts: { check?: boolean; dae
   if (!semverGt(manifest.version, floor.version) && !pendingRetry) {
     if (opts.check) {
       if (semverGt(floor.version, RBOX_VERSION)) {
-        console.log(`verified upgrade floor is ${floor.version}; this process is ${RBOX_VERSION} — run \`rbox upgrade\` again from a fresh shell`);
+        console.log(floorMessage(floor));
       } else {
         console.log(`already up to date (${RBOX_VERSION})`);
       }
@@ -446,6 +469,7 @@ export async function upgradeCmd(remoteUrl: string, opts: { check?: boolean; dae
       const releaseError = new Error("upgrade finished without durably releasing its lock; retry after checking the install directory", { cause: released.error });
       if (primaryError instanceof Error && primaryError.cause === undefined) primaryError.cause = releaseError;
       else if (primaryError === undefined) throw releaseError;
+      else console.error(releaseError.message);
     }
   }
 }

@@ -336,7 +336,7 @@ test("pending floor survives failure before rename, blocks intermediates, and pe
   }
   expect(await fs.readFile(executable, "utf8")).toBe("old-binary");
   expect(logs).toEqual([
-    `verified upgrade floor is ${target}; this process is ${RBOX_VERSION} — run \`rbox upgrade\` again from a fresh shell`,
+    `an upgrade to ${target} is incomplete — run \`rbox upgrade\` again to finish it`,
   ]);
 
   serve(targetBinary);
@@ -385,9 +385,87 @@ test("failure after executable rename retains a pending floor that blocks rollba
   }
   expect(await fs.readFile(executable)).toEqual(targetBinary);
   expect(logs).toEqual([
+    `an upgrade to ${target} is incomplete — run \`rbox upgrade\` again to finish it`,
+  ]);
+});
+
+test("check mode distinguishes pending and committed floors above the running version", async () => {
+  const target = nextVersion();
+  serve();
+  const logs: string[] = [];
+  const consoleLog = spyOn(console, "log").mockImplementation((...args) => void logs.push(args.join(" ")));
+  try {
+    await fs.writeFile(`${executable}.release.json`, `${JSON.stringify({ schema: 1, version: target, phase: "pending" })}\n`);
+    await upgradeCmd("https://releases.example", {
+      check: true,
+      commandDeps: { ...commandDeps(manifest(RBOX_VERSION)), isElevated: () => true },
+    });
+    await fs.writeFile(`${executable}.release.json`, `${JSON.stringify({ schema: 1, version: target, phase: "committed" })}\n`);
+    await upgradeCmd("https://releases.example", {
+      check: true,
+      commandDeps: { ...commandDeps(manifest(RBOX_VERSION)), isElevated: () => true },
+    });
+  } finally {
+    consoleLog.mockRestore();
+  }
+  expect(logs).toEqual([
+    `an upgrade to ${target} is incomplete — run \`rbox upgrade\` again to finish it`,
     `verified upgrade floor is ${target}; this process is ${RBOX_VERSION} — run \`rbox upgrade\` again from a fresh shell`,
   ]);
 });
+
+test("non-durable lock release warns without replacing a primary error that already has a cause", async () => {
+  const primary = new Error("injected upgrade failure", { cause: new Error("original cause") });
+  const errors: string[] = [];
+  const consoleError = spyOn(console, "error").mockImplementation((...args) => void errors.push(args.join(" ")));
+  let thrown: unknown;
+  serve();
+  try {
+    await upgradeCmd("https://releases.example", {
+      commandDeps: {
+        ...commandDeps(manifest(nextVersion())),
+        isElevated: () => true,
+        afterPendingState: async () => {
+          await fs.rm(`${executable}.upgrade.lock`);
+          throw primary;
+        },
+      },
+    });
+  } catch (error) {
+    thrown = error;
+  } finally {
+    consoleError.mockRestore();
+  }
+  expect(thrown).toBe(primary);
+  expect(errors).toEqual([
+    "upgrade finished without durably releasing its lock; retry after checking the install directory",
+  ]);
+});
+
+test.skipIf(typeof process.geteuid !== "function" || process.geteuid() === 0)(
+  "non-elevated lock acquisition permission errors suggest sudo",
+  async () => {
+    const installDir = path.dirname(executable);
+    const accessSync = fsSync.accessSync;
+    const access = spyOn(fsSync, "accessSync").mockImplementation((target, mode) => {
+      accessSync(target, mode);
+      if (path.resolve(String(target)) === installDir && mode === fsSync.constants.W_OK) {
+        fsSync.chmodSync(installDir, 0o500);
+      }
+    });
+    serve();
+    try {
+      await expect(upgradeCmd("https://releases.example", {
+        commandDeps: { ...commandDeps(manifest(nextVersion())), isElevated: () => false },
+      })).rejects.toThrow(
+        `cannot acquire the rbox upgrade lock at ${executable}.upgrade.lock — if this rbox install is root-owned, retry with \`sudo rbox upgrade\``,
+      );
+    } finally {
+      access.mockRestore();
+      fsSync.chmodSync(installDir, 0o700);
+    }
+  },
+);
 
 test("elevated and non-elevated contenders share the executable-scoped lock", async () => {
   const high = versionAfter(2);
