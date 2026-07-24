@@ -5,7 +5,7 @@ import type { GlobalManifestMeta } from "../config.js";
 import type { RemoteContext } from "./context.js";
 import { firstPublishMeasurementLive, firstPublishMeasurementToken, firstPublishTiming, uploadActiveOverlapMs } from "../upload-lane-timing.js";
 import { timePushTailRequest } from "../push-tail-timing.js";
-import { NeedsRebaselineError, readQuotaExceeded, translateRemoteError } from "./errors.js";
+import { errorCode, NeedsRebaselineError, readQuotaExceeded, translateRemoteError } from "./errors.js";
 import { readNumericFields } from "./timings.js";
 
 export const RECEIPT_REDEEM_BATCH_MAX = 5_000;
@@ -230,10 +230,15 @@ export async function redeemReceipts(ctx: RemoteContext, recordCommitTail = fals
       : await send();
     if (r.status === 400) {
       const text = await r.text();
-      let body: { error?: unknown; max?: unknown } = {};
+      let body: { max?: unknown } | null = {};
       try { body = JSON.parse(text) as typeof body; } catch { /* generic handling below */ }
-      if (body.error === "too_many_receipts") {
-        const max = body.max;
+      if (body === null) {
+        // Preserve the historical parsed-null property-read TypeError exactly.
+        // @ts-expect-error Deliberate compatibility access on null.
+        void body.error;
+      }
+      if (errorCode(text) === "too_many_receipts") {
+        const max = body!.max;
         if (typeof max !== "number" || !Number.isInteger(max) || max <= 0 || max >= batch.length) {
           throw new Error("receipt redeem failed: server returned an invalid non-shrinking too_many_receipts cap");
         }
@@ -349,17 +354,13 @@ export async function commitSigned(
   }
   if (!r.ok) {
     const text = await r.text();
-    try {
-      const body = JSON.parse(text) as { error?: unknown; count?: unknown; max?: unknown };
-      if (body.error === "body_too_large") {
-        throw new CommitRejectedError(
-          "body_too_large",
-          typeof body.count === "number" ? body.count : undefined,
-          typeof body.max === "number" ? body.max : undefined,
-        );
-      }
-    } catch (e) {
-      if (e instanceof CommitRejectedError) throw e;
+    if (errorCode(text) === "body_too_large") {
+      const body = JSON.parse(text) as { count?: unknown; max?: unknown };
+      throw new CommitRejectedError(
+        "body_too_large",
+        typeof body.count === "number" ? body.count : undefined,
+        typeof body.max === "number" ? body.max : undefined,
+      );
     }
     const consumed = new Response(text, { status: r.status, headers: r.headers });
     const { quota } = await readQuotaExceeded(consumed);

@@ -88,6 +88,32 @@ export const promptInput = (config: InputPromptConfig): Promise<string> =>
 export const promptConfirm = (config: ConfirmPromptConfig): Promise<boolean> =>
   run((loaded) => loaded.inkConfirm(config));
 
+export async function confirmDestructive(opts: {
+  message: string;
+  yes?: boolean;
+  default?: boolean;
+  headless: "proceed" | "deny" | "require-yes" | "throw";
+  headlessError?: string;
+}): Promise<boolean> {
+  if (opts.yes) return true;
+
+  if (opts.headless === "throw") {
+    if (!isInteractive()) {
+      if (opts.headlessError !== undefined) throw new Error(opts.headlessError);
+      throw new PromptUnavailableError();
+    }
+  } else if (process.stdin.isTTY !== true) {
+    if (opts.headless === "proceed") return true;
+    if (opts.headless === "deny") return false;
+    throw new Error(opts.headlessError ?? "explicit confirmation required in non-interactive mode");
+  }
+
+  return promptConfirm({
+    message: opts.message,
+    ...(opts.default !== undefined ? { default: opts.default } : {}),
+  });
+}
+
 /** Pairing/bootstrap bearer values are never echoed or represented by length. */
 export const promptPassword = (config: PasswordPromptConfig): Promise<string> =>
   run((loaded) => loaded.inkPassword(config));

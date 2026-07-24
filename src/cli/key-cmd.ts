@@ -5,7 +5,7 @@ import { admitAgentDevice, assertNoPendingGenesis, newAgentId } from "./e2ee-cli
 import { loadDevice } from "./e2ee-keystore.js";
 import { RboxApi } from "./remote.js";
 import { emitJson } from "./json.js";
-import { isInteractive, promptConfirm } from "./prompt.js";
+import { confirmDestructive } from "./prompt.js";
 import { shQuote } from "./shell-quote.js";
 import { encodeAgentKeyBundle, materializeAgentKey, type AgentKeyBundle } from "./agent-key-bundle.js";
 import { readKeyBundle } from "./setup-keyed.js";
@@ -42,9 +42,13 @@ async function confirmRootKey(accepted: boolean): Promise<void> {
     "Agent keys are account-root equivalent: the RBOX_KEY bundle carries the Master Key and can decrypt account data. " +
     "Share one key only for pull-only fleets; every writer needs its own key.";
   process.stderr.write(`${warning}\n`);
-  if (accepted) return;
-  if (!isInteractive()) throw new Error("refusing to create an account-root key without --accept-root-key in non-interactive mode");
-  const ok = await promptConfirm({ message: "Create this account-root agent key?", default: false });
+  const ok = await confirmDestructive({
+    message: "Create this account-root agent key?",
+    yes: accepted,
+    default: false,
+    headless: "throw",
+    headlessError: "refusing to create an account-root key without --accept-root-key in non-interactive mode",
+  });
   if (!ok) throw new Error("cancelled");
 }
 

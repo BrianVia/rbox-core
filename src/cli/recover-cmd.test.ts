@@ -77,6 +77,7 @@ describe("recover workspace command", () => {
 
   test("--repair-chain bypasses only the chain suffix prompt", async () => {
     let currentPin: HeadPin | undefined = pin(2);
+    const confirmations: unknown[] = [];
     const broken = new ManifestChainError("missing link", { head: { seq: 3, hash: "d".repeat(64) } });
     await recoverWorkspaceCmd("/tmp/ws", { repairChain: true }, {
       findRoot: async () => "/tmp/ws",
@@ -86,13 +87,17 @@ describe("recover workspace command", () => {
       buildAuthedRemote: async () => ({ cfg, deps: {}, remote: {} as never }),
       beginReport: () => ({ logSummaryTo: () => {} } as never),
       pull: async () => { currentPin = pin(3, "d".repeat(64)); throw broken; },
-      confirm: async () => true,
+      confirm: async (config) => { confirmations.push(config); return true; },
       repair: async (_root, _cfg, _deps, _error, opts) => {
         expect(await opts.confirmSupersede([{ seq: 3, deviceId: "dev_1", reason: "missing link" }])).toBe(true);
         return { kind: "repaired", sequence: 4, suffix: [], actions: [] };
       },
       log: () => {},
     });
+    expect(confirmations).toEqual([{
+      message: "Recover /tmp/ws? This re-verifies the server head against the retained local pin, reconciles files, then pushes remaining local diffs.",
+      default: false,
+    }]);
     expect(currentPin?.commitSeq).toBe(3);
   });
 

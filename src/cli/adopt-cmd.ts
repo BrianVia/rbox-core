@@ -17,7 +17,7 @@ import {
   type AdoptJournal,
 } from "./adopt-journal.js";
 import { emitJson } from "./json.js";
-import { promptConfirm } from "./prompt.js";
+import { confirmDestructive } from "./prompt.js";
 import { acquireWorkspaceSyncMutexForAdopt, releaseWorkspaceSyncMutex } from "./sync-mutex.js";
 import { sync } from "./sync.js";
 
@@ -156,7 +156,12 @@ async function clean(root: string, journal: AdoptJournal, yes: boolean): Promise
   const report = await adoptionStatus(root);
   const locations = [...report.retained, ...report.displaced, ...report.unplaced, ...report.retainedGit.map((repo) => repo.location)];
   process.stderr.write(`adoption clean will remove ${locations.length} retained location(s) under ${adoptDir(root)}\n`);
-  const confirmed = yes || process.stdin.isTTY === true && await promptConfirm({ message: "Permanently remove retained adoption recovery data?", default: false });
+  const confirmed = await confirmDestructive({
+    message: "Permanently remove retained adoption recovery data?",
+    yes,
+    default: false,
+    headless: "deny",
+  });
   if (!confirmed) throw new Error("adoption clean requires explicit confirmation (--yes)");
   const mutex = await acquireWorkspaceSyncMutexForAdopt(root, "clean", journal.journalId);
   try {

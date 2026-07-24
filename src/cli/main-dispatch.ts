@@ -206,9 +206,12 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
         root,
         force: flags.force === "true",
         confirm: async () => {
-          if (process.stdin.isTTY !== true) return true; // non-interactive → proceed
-          const { promptConfirm } = await import("./prompt.js");
-          return promptConfirm({ message: `Stop syncing ${root}? Local files stay.`, default: false });
+          const { confirmDestructive } = await import("./prompt.js");
+          return confirmDestructive({
+            message: `Stop syncing ${root}? Local files stay.`,
+            default: false,
+            headless: "proceed",
+          });
         },
       });
       break;

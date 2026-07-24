@@ -7,6 +7,7 @@ import { createCiKey, materializeCmd } from "./key-cmd.js";
 import { materializeAgentKey, decodeAgentKeyBundle } from "./agent-key-bundle.js";
 import { saveCredentials } from "./credentials.js";
 import { GENESIS_PENDING_MESSAGE, publishPrepublishMarker } from "./genesis-durable.js";
+import { withInteractionPolicy } from "./prompt-policy.js";
 
 const OLD_ENV = { ...process.env };
 
@@ -132,4 +133,13 @@ test("whole rbox key create-ci command gates pending genesis before device or AP
   } finally {
     await fs.rm(tmp, { recursive: true, force: true });
   }
+});
+
+test("rbox key create-ci preserves the exact non-interactive root-key refusal", async () => {
+  await expect(withInteractionPolicy(
+    { enabled: false },
+    () => createCiKey({ expires: "1d" }),
+  )).rejects.toThrow(
+    "refusing to create an account-root key without --accept-root-key in non-interactive mode",
+  );
 });

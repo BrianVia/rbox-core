@@ -149,6 +149,20 @@ test("commitSigned maps body_too_large to CommitRejectedError", async () => {
   });
 });
 
+test("commitSigned maps a non-413 body_too_large discriminator with numeric detail", async () => {
+  const ctx = new RemoteContext("https://rbox.test", "tok", "ws", "root");
+  (ctx as unknown as { fetch: RemoteContext["fetch"] }).fetch = async () =>
+    json(400, { error: "body_too_large", count: 9_000_000, max: 8_388_608 });
+
+  const error = await commitSigned(ctx, 0, commit).catch((cause) => cause);
+  expect(error).toBeInstanceOf(CommitRejectedError);
+  expect(error).toMatchObject({
+    reason: "body_too_large",
+    count: 9_000_000,
+    max: 8_388_608,
+  });
+});
+
 test("commitSigned preserves bounded 422 missingTotal", async () => {
   const missing = sha("missing");
   const ctx = new RemoteContext("https://rbox.test", "tok", "ws", "root");
