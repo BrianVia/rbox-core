@@ -81,9 +81,55 @@ anchor updated in sync-mutex.test), #431 sync-git trio (present-witness in
 base-composer, throwing gitCommitAncestry with both fail-closed mappings
 preserved, default-partial hoist). Recurring codex tic: it minted an
 unrequested "design 200" doc in three separate batches — dropped each time;
-number 200 remains FREE. NEXT: implement 197, the 193 live smoke suite, or
-sweep Tier 3 (state-plane consolidation PR); Mac's 2 repo deferrals still
-founder-pending._
+number 200 remains FREE. **LATE NIGHT — SWEEP #2 (8 opus reviewers, post-Tier-2)
+→ docs/design/notes/2026-07-24-thermo-nuclear-sweep-2.md.** Each lane got sweep
+#1's roadmap as an EXCLUSION list and was told to produce an executable plan or
+challenge the framing — so its value is 6 real defects + 4 corrected premises,
+not more cleanup ideas. **ALL 10 TIER-A ITEMS SHIPPED, #432-#438 MERGED**
+(7 parallel worktree opus agents, every fix proven red→green with the fix
+stashed, each diff audited here, main CI 18/18 green on the combined shard
+partition): **#432** viewer gate on workspace-KEK publish + stripe requeue into
+its batch + account-delete guard parity; **#436** multipart `retry_later` 503 no
+longer destroys the resume state (every file >90 MiB needed a full re-upload) +
+the first `staging/` R2 reclaimer; **#433** checkout lock probe fails CLOSED
+(an unreadable index.lock read as "no lock" → journal deleted while its lock
+lived → permanently stale-unattributed, doctor+human to recover); **#438**
+shutdown mutation gate no longer swallowed (a stop mid-pull was destroying
+held-attempt state for repos that never failed) + deferral precedence covered
+12/16 reasons with a fail-OPEN safe verdict, now compile-enforced; **#435**
+long-flag arity resolved per command (`rbox status --git <path>` silently ate
+both flag and path); **#434** `confirmDestructive` honours the interaction
+policy in all four modes (stderr-redirected runs threw instead of proceeding —
+and today's own test PINNED the bug); **#437** 14 command-layer fetches
+deadlined + a `bare-fetch` guard so the class cannot reopen. **Agent findings
+that beat the spec** (all verified here): `poolMap`'s docstring is WRONG — a
+throwing task stops only its own worker while siblings keep pulling, so the
+specified bare re-throw would have left ungated disk work racing the stop
+deadline (latch-and-drain instead); a strict per-command arity map would have
+broken `track --no-interactive` via HIDDEN_FLAGS (union base + per-command
+overlay instead); preserving multipart state alone turns the 404 into a 500
+(tolerate `NoSuchUpload` only when the prior staging object survives).
+**TWO OF MY OWN CLAIMS WERE WRONG:** notify.ts's idempotency_key is NOT dead
+weight — design 16 §4.4 says CF Email exposes no client idempotency key and the
+column is stored deliberately for a future one (correctly refused, not patched);
+and the confirmDestructive trigger is stderr-not-a-TTY, not `--no-interactive`
+(no call-site command even accepts that flag). **NEXT (Tier B, founder calls):**
+6 dark opt-in flags with zero setters — flip or delete, incl. RBOX_PUBLISH_PIPELINE
+(961 non-test lines whose field gate FAILED 2026-07-13) and RBOX_WATCHER_RETRUST
+(the Mac I/O duty-cycle fix, default-off against the default-on rule); delete the
+dead pre-E2EE plaintext transport still wired as the DEFAULT fallback. **Tier C
+roadmap corrections:** INVARIANTS.md has ZERO mechanical coupling (nothing reads
+it; every git-lane anchor stale) — tag+structure-test it BEFORE any queued split;
+daemon needs StatusSurfaceWriter + DriftAuditor on top of the queued four (155
+fields / 14 concerns); state-plane Tier 3 prescribes the wrong cut (the write
+funnel already exists — delete the double-compose, don't extract it); versions.ts
+is one of TWENTY unowned API modules (43% of the API is outside CODEMAP, so the
+CODEMAP amendment gates every API split) and roots/rootsInspect is a two-copy
+reachability oracle feeding GC deletion AND fair-use billing. Tier D: `src/wire/`
+shared contract (the CLI has two parsers for one 409; one mis-reads epoch_stale
+as `{head: undefined}`) — the only finding with external-user exposure.
+NEXT: implement 197, the 193 live smoke suite, or sweep Tier 3; Mac's 2 repo
+deferrals still founder-pending._
 
 _Previous: 2026-07-24 (**189 SHIPPED — v1.9.0 released + promoted to prod;
 validated end-to-end on two real machines**). Design 189 (web-approved pairing)
