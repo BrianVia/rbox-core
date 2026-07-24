@@ -58,11 +58,21 @@ deadline-bounded — closed an unbounded-hang class on the pre-enrollment
 login path — + dead pairCreate lane deleted). CORRECTION folded into the
 roadmap: the journal.ts v1.7.24 legacy-recovery delete is gated on fleet
 adoption past 1.7.24 (Jethro still ON 1.7.24), not on a sweep.
-**AWAITING FOUNDER: D1-D4 rulings** in
-docs/design/notes/2026-07-24-recovery-probe-divergences.md (recovery-probe
-vs pump divergences; D3 corrupts notify-latency telemetry today) — then the
-executeOp extraction runs as a characterization-tested mini-cycle. NEXT:
-implement 197, the 193 live smoke suite, or Tier 2 of the sweep roadmap._
+D1-D4 RULED (all as recommended) →
+**#427 MERGED** (shared executeOp between pump and recovery probe; recovery
+scans now clear watcher-degraded, recovery fullScan arms the quota probe,
+recovery pulls consume+record notify latency — the halt-inflated
+notify-latency telemetry corruption is FIXED; 8 characterization tests).
+**FLEET UPGRADED to 1.9.0** (all 3 hosts via managed rbox upgrade; FM
+pull-only preserved+witness-verified; Mac daemon skew 1.7.22→1.9.0 closed —
+its upgrade declined the restart "desired state changed" but autostart
+reconciled it back unaided). **Mac cleaned**: empty "test sync 2" workspace
+untracked (server-side ws_2f43377f still exists — dashboard delete is the
+founder's), 32 activity-litter dirs swept; the auth-failing agent_inN2
+daemon is NOT on the Mac — hunt it on another host via /observe-fleet.
+Desktop's 44 litter dirs unswept (permission classifier blocked the rm).
+NEXT: implement 197, the 193 live smoke suite, or Tier 2 of the sweep
+roadmap; Mac's 2 repo deferrals still founder-pending._
 
 _Previous: 2026-07-24 (**189 SHIPPED — v1.9.0 released + promoted to prod;
 validated end-to-end on two real machines**). Design 189 (web-approved pairing)
