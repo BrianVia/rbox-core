@@ -160,8 +160,9 @@ test("the full design-138 loadState caller inventory remains on the hard-refusal
     "chain-repair.ts": 2,
     "daemon/daemon.ts": 1,
     // Eight direct reloads (including keep-mine's synchronous confirm reload)
-    // plus gitDeferralsCmd's dependency-injectable call.
-    "git-cmd.ts": 9,
+    // in the resolve workflow, plus gitDeferralsCmd's dependency-injectable call.
+    "git/resolve-command.ts": 8,
+    "git/deferrals-command.ts": 1,
   };
   const cli = path.dirname(new URL(import.meta.url).pathname);
   let total = 0;
