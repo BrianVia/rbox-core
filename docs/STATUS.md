@@ -5,7 +5,35 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
-_Last updated: 2026-07-23 (~evening — **DESIGN 189 core-ALIGNED; PR #412
+_Last updated: 2026-07-24 (**189 SHIPPED — v1.9.0 released + promoted to prod;
+validated end-to-end on two real machines**). Design 189 (web-approved pairing)
+is LIVE: implemented across apps/api + daemon + CLI + web, merged (#414), and
+released as **v1.9.0** — prod API promoted (migrations 0033/0034 applied) and
+CLI binaries published (api.rbox.to/version = 1.9.0). Approve a new machine in
+the dashboard → an online enrolled admin auto-delivers keys; the new machine
+enrolls with no token/phrase. VALIDATED two ways: `bun run rig run web-pairing`
+(headless 2-container, dev-only `approve-dev` hook) AND a real two-machine SSH
+run (Mac = admin, flat-meadow = new device) through the deployed dev dashboard
+`main.rbox-app.pages.dev` with a real Clerk step-up + key-consent approve →
+byte-identical file convergence. Bugs caught + FIXED en route: (1) delivery
+expiry not clamped to the device-code TTL → enroll failed 100% (rig-caught,
+#415); (2) first-device web approve 409'd "encryption isn't set up" → now
+downgrades to a device-auth sign-in (#417); (3) the deployed dashboard origin
+was missing from the dev `CLERK_ALLOWED_ORIGINS` (CORS + `azp`) → added to the
+dev secret (prod `app.rbox.to` already allowlisted, so NOT a prod bug).
+Papercuts logged (docs/papercuts.md). Test HARNESSES preserved on origin:
+branch `189-e2e-full` (composed real-approve E2E — rig containers + Playwright/
+Clerk browser approve) + `design/189-browser-e2e` (Turnstile-under-CSP + `#fp`
+survival gates) — the first scenarios for the live smoke suite (docs/design/
+193-live-smoke-suite.md stub). Persistent dev dashboard: `main.rbox-app.pages.dev`
+(Pages preview env vars → dev API + dev Clerk). Repo hygiene: root scratch `.md`
+relocated to docs/design/notes/ (#416); worktrees + merged branches pruned. NEXT
+(optional): build the 193 live smoke suite (dev-gated `provisionAccount` endpoint
++ a `smoke` runner over the rig + browser scenarios, wired as a pre-promotion
+gate); fix the first-device web button LABEL (still reads "send keys"); delete
+the throwaway dev test account._
+
+_Superseded — 189 core-aligned, pre-implementation (2026-07-23): **DESIGN 189 core-ALIGNED; PR #412
 shipped to prod; day = 3 releases + 5 PRs**): Design 189 (web-approved
 pairing — web approval -> an enrolled daemon auto-delivers keys so a new
 machine enrolls without pasting a token/phrase) driven from rough draft to
