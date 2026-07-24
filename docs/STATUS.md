@@ -22,8 +22,19 @@ with `prompt-ink.test.ts` and fail it deterministically (this PR did); fixed
 by running the whole assertion in a spawned child (codex, per spec).
 **Playbook lesson: an in-process global-state assertion is
 shard-partition-dependent — isolate such tests in a subprocess from day one.**
-Worktrees + codex branches pruned. NEXT: review #418 (193 onboarding-funnel
-telemetry design doc)._
+Afternoon: **#421 MERGED** (design **196** sudo-upgrade home isolation —
+exe-scoped lock/release sidecars via the fenced lockfile primitive,
+pending/committed anti-rollback floor written around the rename, elevated
+runs never touch ~/.rbox; reviewed here, 3 nits fixed via codex: sudo hint
+on EACCES, honest pending-floor copy, no swallowed release warning) and
+**#418 MERGED** (design **197** privacy-safe onboarding funnel telemetry —
+ALIGNED after an opus round folded in the survivorship-bias fix:
+`firstFailure` now rides `onboarding_flow` so never-recovered initial-sync
+failures reach the funnel; REVIEW-197 logs the round). Design numbers now:
+194 daemon-control, 195 auth-cmd, 196 sudo-upgrade, 197 onboarding-funnel.
+Worktrees + codex branches pruned; 197 is design-only — implementation not
+started. NEXT: implement 197 (schemas+drift tests first, then recorder),
+or the 193 live smoke suite._
 
 _Previous: 2026-07-24 (**189 SHIPPED — v1.9.0 released + promoted to prod;
 validated end-to-end on two real machines**). Design 189 (web-approved pairing)
