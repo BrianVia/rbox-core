@@ -1692,18 +1692,14 @@ export class RboxDaemon {
             // Persist when something visible changed (or as a throttled heartbeat, so
             // `rbox status` can say "last checked: Ns ago" without idle disk churn).
             const terminalBlocked = op === "push" && this.pushTerminalBlocked;
-            const heals = false;
             const clearsOutOfStorage = pushedToRemote && this.activity.outOfStorage !== undefined;
-            const cleared = this.activity.active !== undefined || heals || clearsOutOfStorage || terminalBlocked;
+            const cleared = this.activity.active !== undefined || clearsOutOfStorage || terminalBlocked;
             this.activity.active = undefined;
             this.activeProgressPath = undefined;
-            if (heals) {
-              this.activity.halt = undefined;
-            }
             if (clearsOutOfStorage) {
               this.activity.outOfStorage = undefined;
             }
-            if (heals || clearsOutOfStorage) {
+            if (clearsOutOfStorage) {
               // The healed failure's dedup streak ends with it: a LATER failure with the
               // same message is a new episode that must log and persist a fresh visible
               // state, not silently count as repeat 2..9 and leave activity.json healed.
