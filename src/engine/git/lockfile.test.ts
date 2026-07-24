@@ -10,6 +10,7 @@ import {
   captureCommonDirIdentity,
   classifyProcessIncarnation,
   commonDirIdentityMatches,
+  compareProcessStart,
   defaultStorageStat,
   deserializeMarkerObservation,
   formatLockMarker,
@@ -17,6 +18,7 @@ import {
   lockStorageLocal,
   mergeHostIdentityBoots,
   parseDarwinMountOutput,
+  parseDarwinProcessStartListing,
   parseLockMarker,
   publishLockMarker,
   readHostIdentityLedger,
@@ -26,6 +28,7 @@ import {
   runIdentityCommand,
   safeBoundLockParent,
   serializeMarkerObservation,
+  systemLockIdentity,
   validProcessIncarnation,
   type LockIdentitySource,
   type LockMarker,
@@ -864,5 +867,86 @@ describe("liveness recovery classes", () => {
     const acquired = await acquireLock(lockPath, { identity: source, token: () => "2".repeat(32) });
     expect(acquired.status).toBe("acquired");
     if (acquired.status === "acquired") await acquired.lock.release();
+  });
+});
+
+describe("macOS 26 process-start source", () => {
+  // macOS 26 dropped the `kern.proc.pid.<pid>` sysctl OID name, so `ps` is the
+  // only per-process clock a command-line caller has left there.
+  test("a ps listing canonicalizes to whole epoch seconds, identically on every read", () => {
+    expect(parseDarwinProcessStartListing("Fri Jul 24 23:05:12 2026")).toBe(String(Date.UTC(2026, 6, 24, 23, 5, 12) / 1000));
+    // ps space-pads a single-digit day and pads the field on the right.
+    expect(parseDarwinProcessStartListing("Sat Jul  4 00:00:00 2026    ")).toBe(String(Date.UTC(2026, 6, 4, 0, 0, 0) / 1000));
+    expect(parseDarwinProcessStartListing("Fri Jul 24 23:05:12 2026")).toBe(parseDarwinProcessStartListing("Fri Jul 24 23:05:12 2026    \n"));
+    // Whole seconds only: it must never be mistaken for a sysctl reading.
+    expect(parseDarwinProcessStartListing("Fri Jul 24 23:05:12 2026")).toMatch(/^\d+$/);
+  });
+
+  test("an unusable ps listing is rejected rather than canonicalized into a wrong incarnation", () => {
+    for (const line of ["", "not a date", "Fri Jul 24 23:05 2026", "Fri Xyz 24 23:05:12 2026", "Fri Jul 32 23:05:12 2026", "Fri Jul 24 24:05:12 2026"]) {
+      expect(parseDarwinProcessStartListing(line)).toBeUndefined();
+    }
+  });
+
+  test("start-time readings compare at the coarser of their two resolutions", () => {
+    // The same live process read through sysctl and then through ps.
+    expect(compareProcessStart("1785539112.123456", "1785539112")).toBe("same");
+    expect(compareProcessStart("1785539112", "1785539112.123456")).toBe("same");
+    expect(compareProcessStart("1785539112.123456", "1785539112.123456")).toBe("same");
+    // A genuinely different incarnation still reads as different.
+    expect(compareProcessStart("1785539112.123456", "1785539113")).toBe("different");
+    expect(compareProcessStart("1785539112.123456", "1785539112.123457")).toBe("different");
+    // Linux tick-since-boot values are unaffected by the microsecond rule.
+    expect(compareProcessStart("6318242", "6318242")).toBe("same");
+    expect(compareProcessStart("6318242", "6318243")).toBe("different");
+  });
+
+  test("a microsecond-clock reading is incomparable with a second clock, never dead", () => {
+    // What pre-ps binaries recorded for their own pid when sysctl failed.
+    const uptimeFallback = "1785539112000000";
+    expect(compareProcessStart(uptimeFallback, "1785539112")).toBe("incomparable");
+    expect(compareProcessStart(uptimeFallback, "1785539112.123456")).toBe("incomparable");
+    expect(compareProcessStart("1785539112", uptimeFallback)).toBe("incomparable");
+    expect(compareProcessStart(uptimeFallback, uptimeFallback)).toBe("same");
+  });
+
+  test("an incarnation read through the other clock stays alive, and an unreadable one stays unknown", async () => {
+    const owner = { ...current, pid: 900, startTime: "1785539112.123456" };
+    // sysctl-recorded owner, ps-probed: the same live process.
+    expect(await classifyProcessIncarnation(owner, identity({ 900: { status: "alive", startTime: "1785539112" } }))).toBe("alive");
+    // A real restart within the same second is still caught by the fraction.
+    expect(await classifyProcessIncarnation(owner, identity({ 900: { status: "alive", startTime: "1785539113" } }))).toBe("dead");
+    // A pre-ps microsecond reading cannot be reconciled and must not reap.
+    expect(await classifyProcessIncarnation({ ...owner, startTime: "1785539112000000" }, identity({ 900: { status: "alive", startTime: "1785539112" } }))).toBe("unknown");
+  });
+
+  test("a live lock whose marker was written through the other clock is never reaped", async () => {
+    const root = await tempDir();
+    const lockPath = path.join(root, "sync.lock");
+    await fs.writeFile(lockPath, formatLockMarker(marker({ pid: 900, startTime: "1785539112.123456", token: "7".repeat(32) })));
+
+    const live = await inspectLock(lockPath, identity({ 900: { status: "alive", startTime: "1785539112" } }), async () => true);
+    expect(live.kind).toBe("live");
+
+    await fs.writeFile(lockPath, formatLockMarker(marker({ pid: 900, startTime: "1785539112000000", token: "7".repeat(32) })));
+    const unreadable = await inspectLock(lockPath, identity({ 900: { status: "alive", startTime: "1785539112" } }), async () => true);
+    expect(unreadable).toMatchObject({ kind: "foreign", reason: "process start clock unavailable" });
+
+    await fs.writeFile(lockPath, formatLockMarker(marker({ pid: 900, startTime: "1785539112.123456", token: "7".repeat(32) })));
+    const restarted = await inspectLock(lockPath, identity({ 900: { status: "alive", startTime: "1785539200" } }), async () => true);
+    expect(restarted.kind).toBe("dead");
+  });
+
+  test.skipIf(process.platform !== "darwin")("the live darwin probe reads a foreign process and repeats itself exactly", async () => {
+    const child = spawn("sleep", ["30"], { stdio: "ignore" });
+    try {
+      await new Promise<void>((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
+      const first = await systemLockIdentity.probe(child.pid!);
+      const second = await systemLockIdentity.probe(child.pid!);
+      expect(first.status).toBe("alive");
+      expect(second).toEqual(first);
+    } finally {
+      child.kill("SIGKILL");
+    }
   });
 });

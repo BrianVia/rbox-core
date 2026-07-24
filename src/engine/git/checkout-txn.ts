@@ -20,6 +20,7 @@ import {
   sameMarkerObservation,
   serializeMarkerObservation,
   systemLockIdentity,
+  type LockIdentitySource,
   type MarkerObservation,
 } from "./lockfile.js";
 
@@ -89,6 +90,8 @@ export interface CommitCheckoutOptions<TIntended = unknown> {
   crashAt?: (point: "after-connectivity-proof" | "after-prepare" | "after-index-lock" | "after-head-commit" | "after-ref-commit" | "before-index-publish" | "after-index-publish" | "mid-op-state") => void;
   /** Test seam for the real failure mode where Git dies after prepare: ok. */
   afterPrepareChild?: (pid: number, transaction: "primary" | "post-head") => void | Promise<void>;
+  /** Test seam for platforms whose process probe answers dead or unknown. */
+  identity?: LockIdentitySource;
   capabilityProbe?: CheckoutCapabilityProbe;
   /** Caller already ran the exact capability probe for this transaction. */
   capabilitySupported?: boolean;
@@ -414,10 +417,21 @@ async function preparedTransactionIntent(
   ownerPid: number,
   lines: readonly string[],
   includeHeadReservation: boolean,
+  identity: LockIdentitySource = systemLockIdentity,
 ): Promise<JournalPreparedTransaction> {
-  const current = await systemLockIdentity.current();
-  const child = await systemLockIdentity.probe(ownerPid);
-  if (child.status !== "alive") throw new Error("prepared Git child incarnation unavailable");
+  const current = await identity.current();
+  const child = await identity.probe(ownerPid);
+  // The journalled owner must be exact, so anything short of a read incarnation
+  // aborts. That is only ever ONE deferred cycle: the platform probe answers on
+  // the next attempt, and the two outcomes are named apart so a recurring
+  // deferral is diagnosable from the log line alone rather than reading as a
+  // dead child. A permanently unanswerable probe is a platform defect to fix at
+  // the probe (see darwinProcessStart), not a state to record here.
+  if (child.status !== "alive") {
+    throw new Error(child.status === "dead"
+      ? "prepared Git child died before its intent was recorded"
+      : "prepared Git child incarnation could not be read");
+  }
   const byPath = new Map<string, Set<string>>();
   const add = (abs: string, bytes: string) => {
     const key = path.resolve(abs);
@@ -694,7 +708,7 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
       await tx!.start();
       await tx!.write("option no-deref");
       for (const line of primaryLines) await tx!.write(line);
-      primaryIntent = await preparedTransactionIntent(ctx, "primary", await tx!.processId(), primaryLines, plan.head.kind === "symbolic");
+      primaryIntent = await preparedTransactionIntent(ctx, "primary", await tx!.processId(), primaryLines, plan.head.kind === "symbolic", opts.identity);
     });
     if (opts.journal) {
       opts.journal.value.expectedNew.preparedTransactions = [
@@ -880,7 +894,7 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
         for (const line of postHeadLines) await postHeadTx!.write(line);
       });
       if (opts.journal) {
-        const intent = await preparedTransactionIntent(ctx, "post-head", await postHeadTx.processId(), postHeadLines, false);
+        const intent = await preparedTransactionIntent(ctx, "post-head", await postHeadTx.processId(), postHeadLines, false, opts.identity);
         opts.journal.value.expectedNew.preparedTransactions = [
           ...(opts.journal.value.expectedNew.preparedTransactions ?? []).filter((entry) => entry.id !== "post-head"),
           intent,

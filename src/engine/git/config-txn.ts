@@ -6,7 +6,7 @@ import type { BigIntStats } from "node:fs";
 import { fsyncDirectory } from "../fsutil.js";
 import { hashBytes } from "../hash.js";
 import { canonicalizeGitConfig, MAX_GIT_CONFIG_FILE_BYTES, validateCanonicalGitConfig, type GitConfig, type GitConfigCanonicalization } from "./config-sync.js";
-import { acquireLock, systemLockIdentity, type AcquireLockOptions, type LockIdentitySource, type OwnedLock, type ProcessIncarnation } from "./lockfile.js";
+import { acquireLock, compareProcessStart, systemLockIdentity, type AcquireLockOptions, type LockIdentitySource, type OwnedLock, type ProcessIncarnation } from "./lockfile.js";
 import { gitRaw, parseNullDelimitedGitConfig } from "./shared.js";
 
 export type ConfigFaultDisposition = "permanent" | "transient";
@@ -511,7 +511,8 @@ export async function sweepConfigTransactionOrphans(configPath: string, identity
     if (parsed) {
       if (parsed.hostId === current.hostId) {
         const probe = await identity.probe(parsed.pid);
-        remove = probe.status === "dead" || (probe.status === "alive" && probe.startTime !== parsed.startTime);
+        remove = probe.status === "dead"
+          || (probe.status === "alive" && compareProcessStart(parsed.startTime, probe.startTime) === "different");
       }
     } else {
       const stat = await fs.lstat(absolute).catch(() => undefined);
