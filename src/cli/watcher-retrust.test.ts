@@ -5,6 +5,7 @@ import path from "node:path";
 import { HashCache, scanManifest } from "../engine/index.js";
 import { classifyWatcherError, nextSafetyDelay, RboxDaemon } from "./daemon.js";
 import { continuityBroken, diffForDrift, horizonClass, loadDriftAudit, mergePending, saveDriftAudit, type DriftCandidate } from "./daemon/drift-audit.js";
+import { retrustEnabled } from "./daemon/policy.js";
 
 const FLOOR = 60_000;
 const CAP = 300_000;
@@ -46,6 +47,13 @@ interface Internals {
   openDriftAudits: Set<unknown>;
   runDriftAuditNow(audit?: unknown): Promise<void>;
 }
+
+test("watcher re-trust defaults ON with the env unset; =0 disables", () => {
+  delete process.env.RBOX_WATCHER_RETRUST;
+  expect(retrustEnabled()).toBe(true);
+  process.env.RBOX_WATCHER_RETRUST = "0";
+  expect(retrustEnabled()).toBe(false);
+});
 
 function daemonHarness(): { daemon: Internals; error(err?: string): void; close(): Promise<void> } {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rbox-retrust-")));
@@ -151,7 +159,7 @@ test("drift line omits trustState flag-off and stamps suspect flag-on", async ()
     watcherHealthy: trustState === "trusted", trustState, errorGen: 0, sinceSafetyMs: 0, rulesChanged: false,
   });
   try {
-    delete process.env.RBOX_WATCHER_RETRUST;
+    process.env.RBOX_WATCHER_RETRUST = "0";
     const trusted = audit("trusted");
     h.daemon.openDriftAudits.add(trusted);
     await h.daemon.runDriftAuditNow(trusted);

@@ -6,6 +6,12 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- On macOS, the daemon now recovers automatically after a clean full-tree scan
+  when a dropped-events watcher error would previously have degraded it to
+  periodic scans for the rest of the process. Set `RBOX_WATCHER_RETRUST=0` to
+  restore the previous behavior.
+
 ## [1.9.0] — 2026-07-23 — "add a machine from the web"
 
 ### Added

@@ -46,7 +46,7 @@ function setRetrust(enabled: boolean): void {
     priorRetrustCaptured = true;
   }
   if (enabled) process.env.RBOX_WATCHER_RETRUST = "1";
-  else delete process.env.RBOX_WATCHER_RETRUST;
+  else process.env.RBOX_WATCHER_RETRUST = "0";
 }
 
 function harness(): {
