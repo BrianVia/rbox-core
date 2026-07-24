@@ -316,15 +316,4 @@ describe("minting calls — retry-exhausted hint does not claim re-run safety", 
     expect((err as Error).message).not.toContain("already-uploaded data is skipped");
   });
 
-  test("pair create says to check device list for pair tokens before re-running", async () => {
-    globalThis.fetch = (async () => {
-      throw socketClosed();
-    }) as unknown as typeof fetch;
-    const err = await api().pairCreate({ tokenId: "tok_pair_1", mkWrap: "mk", admissionGrant: "grant" }).catch((e) => e);
-    expect(err).toBeInstanceOf(NetworkError);
-    expect((err as Error).message).toContain("creating a pairing token");
-    expect((err as Error).message).toContain("may or may not have completed");
-    expect((err as Error).message).toContain("`rbox device list` for pair tokens");
-    expect((err as Error).message).not.toContain("already-uploaded data is skipped");
-  });
 });

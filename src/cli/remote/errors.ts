@@ -83,7 +83,6 @@ export class LegacyGenesisServiceError extends Error {
  *  this one is a THROWN transport fault. */
 export const DEFAULT_NETWORK_RERUN_HINT = "safe to re-run: already-uploaded data is skipped";
 export const WORKSPACE_MINT_RERUN_HINT = "the request may or may not have completed — check `rbox status` or your workspaces list before re-running";
-export const PAIR_TOKEN_MINT_RERUN_HINT = "the request may or may not have completed — check `rbox device list` for pair tokens before re-running";
 
 export class NetworkError extends Error {
   constructor(

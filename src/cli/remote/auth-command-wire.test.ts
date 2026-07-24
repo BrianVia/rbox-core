@@ -38,6 +38,7 @@ test("public device-code requests preserve their exact URL, body, and content-ty
         method: "POST",
         headers: { "content-type": "application/json" },
         body: '{"label":"l","encPubKey":"e","sigPubKey":"s"}',
+        signal: expect.any(AbortSignal),
       },
     },
     {
@@ -46,6 +47,7 @@ test("public device-code requests preserve their exact URL, body, and content-ty
         method: "POST",
         headers: { "content-type": "application/json" },
         body: '{"deviceCode":"dc"}',
+        signal: expect.any(AbortSignal),
       },
     },
     {
@@ -54,6 +56,7 @@ test("public device-code requests preserve their exact URL, body, and content-ty
         method: "POST",
         headers: { "content-type": "application/json" },
         body: '{"secret":"secret","label":"l","plan":"pro"}',
+        signal: expect.any(AbortSignal),
       },
     },
   ]);
@@ -67,6 +70,7 @@ test("authenticated auth requests preserve bearer placement and request bodies",
   await createPairAuth("https://api.test", { tokenId: "id", mkWrap: "mk", admissionGrant: "grant" }, "tok");
   await revokeDeviceAuth("https://api.test", "dev", "tok");
 
+  expect(calls.every(({ init }) => init?.signal instanceof AbortSignal)).toBe(true);
   expect(calls.map(({ input, init }) => ({ input, method: init?.method, headers: init?.headers, body: init?.body }))).toEqual([
     { input: "https://api.test/v1/auth/key-delivery/ack", method: "POST", headers: { "content-type": "application/json", authorization: "Bearer tok" }, body: '{"requestId":"req"}' },
     { input: "https://api.test/v1/auth/device/approve", method: "POST", headers: { "content-type": "application/json", authorization: "Bearer tok" }, body: '{"userCode":"CODE"}' },
