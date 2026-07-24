@@ -186,6 +186,14 @@ export function ctEqual(a: string, b: string): boolean {
   return r === 0;
 }
 
+/** Match the raw platform-auth header without weakening missing-secret handling. */
+export function platformSecretMatches(
+  headerValue: string | null,
+  env: { RBOX_PLATFORM_SECRET?: string },
+): boolean {
+  return !!env.RBOX_PLATFORM_SECRET && ctEqual(headerValue ?? "", env.RBOX_PLATFORM_SECRET);
+}
+
 /** Lowercase-hex SHA-256 of a string (UTF-8) or raw bytes. */
 export async function sha256Hex(data: string | ArrayBuffer | Uint8Array): Promise<string> {
   const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
