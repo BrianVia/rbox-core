@@ -30,11 +30,25 @@ on EACCES, honest pending-floor copy, no swallowed release warning) and
 **#418 MERGED** (design **197** privacy-safe onboarding funnel telemetry —
 ALIGNED after an opus round folded in the survivorship-bias fix:
 `firstFailure` now rides `onboarding_flow` so never-recovered initial-sync
-failures reach the funnel; REVIEW-197 logs the round). Design numbers now:
-194 daemon-control, 195 auth-cmd, 196 sudo-upgrade, 197 onboarding-funnel.
-Worktrees + codex branches pruned; 197 is design-only — implementation not
-started. NEXT: implement 197 (schemas+drift tests first, then recorder),
-or the 193 live smoke suite._
+failures reach the funnel; REVIEW-197 logs the round). Evening: the codex `/thermo-nuclear-code-quality-review` roadmap (Mac
+session) drove two more decompositions — **#422 MERGED** (design **198**
+config.ts → workspace-config / sync-state-model / sync-state-store /
+reset-state; NOT pure-move: 3 helper renames + new fail-closed preconditions
+on the extracted `installGenesisResetStateUnderHeldLock`, all audited) and
+**#423 MERGED** (design **199** git-cmd → git/deferrals-command +
+git/resolve-command + git/resolve-presentation; opus-implemented, twice
+inventory-gated by the closed allowlist tests in base-composer-structure +
+reset-consent — those gates WORK). Design numbers: 194 daemon-control,
+195 auth-cmd, 196 sudo-upgrade, 197 onboarding-funnel, 198 config,
+199 git-cmd. **Standing flow change (AGENTS.md/CLAUDE.md/dev-cycle skill):**
+`/simplify` stays per-cycle; periodic codex thermo-nuclear review refreshes
+the ranked refactor roadmap and SUPERSEDES `/antislop-codebase`. Remaining
+roadmap (risk-ordered): key-delivery-fulfill (bake first), setup-cmd (couple
+to 197 impl), daemon.ts WS-subsystem-only, then apply/follow/push behind
+characterization harnesses. Telemetry read: Mac ws_e4abbfc6 (110 repos,
+2 deferrals ~24h) is single-handedly the 8-min pull p50 in client sync-phase
+— founder resolve pending; gc pipeline degraded (0 B purged 24h). NEXT:
+implement 197, or the 193 live smoke suite._
 
 _Previous: 2026-07-24 (**189 SHIPPED — v1.9.0 released + promoted to prod;
 validated end-to-end on two real machines**). Design 189 (web-approved pairing)
