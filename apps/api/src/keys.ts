@@ -365,6 +365,9 @@ export async function putWorkspaceKey(env: Env, p: Principal, body: unknown): Pr
   const preflight = await tombstoneFenceResponse(env,p.accountId);
   if (preflight) return preflight;
   if (!(await ownsWorkspace(env, p.accountId, workspaceId))) return json({ error: "not_found" }, 404);
+  // Same order as authorizeWorkspace: cross-account → 404 (no enumeration leak) FIRST,
+  // then the write role gate — a viewer must not publish (and first-writer-wins wedge) an epoch.
+  if (p.role === "viewer") return json({ error: "forbidden" }, 403);
   const inserted = await dbFor(env,p.accountId).prepare(`INSERT OR IGNORE INTO workspace_keys (workspace_id,account_id,key_epoch,kek_wrap,created_at)
     SELECT ?,?,?,?,? WHERE EXISTS (SELECT 1 FROM account_keys WHERE account_id=? AND recovery_wrap<>? AND recovery_wrap_id<>? AND repair_id IS NULL AND repaired_at IS NULL)
     AND NOT EXISTS (SELECT 1 FROM account_deletions WHERE account_id=? AND status IN ('purging','done'))`)
