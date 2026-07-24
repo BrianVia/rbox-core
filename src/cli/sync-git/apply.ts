@@ -828,6 +828,9 @@ opts: {
         clearDeferral(rel, "config");
         return true;
       } catch (error) {
+        // Same rule as the per-repo frame: a closed shutdown gate is not a config
+        // fault and must not be recorded as one — let it abort the pull.
+        if (error instanceof MutationGateClosedError) throw error;
         setDeferral(rel, "config", "config", incomingKey, await checkoutOf(repoDir));
         glog(`git-sync deferred ${rel}: ${errMsg(error)}`);
         return false;
@@ -1686,7 +1689,15 @@ opts: {
   const commonDirLocks = new Map<string, Promise<void>>();
   const indexes = new Map(keys.map((rel, i) => [rel, i]));
   let progressDone = 0;
+  // Shutdown latch. poolMap has no cancellation: a task that throws stops only
+  // its own worker, and the siblings keep pulling repos while the caller has
+  // already unwound — during shutdown that is ungated disk work (pack import,
+  // scratch refs, journal writes) racing the stop deadline. Latching instead
+  // makes every not-yet-started repo a no-op and raises the abort exactly once,
+  // after the pool has fully drained.
+  let gateClosure: MutationGateClosedError | undefined;
   const runRepo = async (rel: string): Promise<void> => {
+    if (gateClosure) return;
     const wireRemoteSec = remote.gitRepos?.[rel];
     const remoteSec = wireRemoteSec === undefined ? undefined : sanitizeGitSectionForPersistence(wireRemoteSec);
     const incomingKey = remoteSec === undefined ? undefined : gitIncomingKey(remoteSec);
@@ -1712,6 +1723,16 @@ opts: {
       });
     } catch (e) {
       if (e instanceof FollowCrashInjectedError) throw e;
+      if (e instanceof MutationGateClosedError) {
+        // Shutdown closed the mutation gate: NOT this repo's failure. Recording a
+        // deferral here would clear held-attempt state for a repo that never
+        // failed, and the whole outcome is discarded anyway — so latch the abort
+        // and let every remaining repo short-circuit (p-settlement.ts re-throws
+        // this same error one level down for the same reason).
+        gateClosure = e;
+        glog(`git-sync aborted ${rel}: ${errMsg(e)}`);
+        return;
+      }
       // Per-repo failures defer only THAT repo — one bad repo (a blob missing mid
       // conflict-preserve, an ENOTDIR/hostile target, an fs error) must never abort
       // the whole pull or block the other repos' base advance.
@@ -1742,6 +1763,7 @@ opts: {
   await poolMap(nestedRepoChains(keys), gitApplyConcurrency(), async (chain) => {
     for (const rel of chain) await runRepo(rel);
   });
+  if (gateClosure) throw gateClosure;
   return pack();
 }
 

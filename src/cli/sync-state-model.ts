@@ -135,6 +135,37 @@ export const GIT_DEFERRAL_REASONS = [
 
 export type GitDeferralReason = (typeof GIT_DEFERRAL_REASONS)[number];
 
+/**
+ * TOTAL precedence over {@link GitDeferralReason}: when one repository accumulates
+ * several reasons, the earliest member here is the one recorded and shown, so this
+ * ordering is user-visible and load-bearing. Human-divergence reasons (the user's
+ * own work) lead, then durable structural conditions, then indeterminate or
+ * environmental ones, with `other` last.
+ *
+ * Deliberately a SEPARATE ordering from {@link GIT_DEFERRAL_REASONS}' declaration
+ * order (an enumeration, not a ranking) — same discipline as BREADCRUMB_VETO_GATES:
+ * a new reason must be ranked on purpose, never inherit a rank by accident.
+ */
+export const GIT_DEFERRAL_REASON_PRECEDENCE = [
+  "local-edits", "local-index", "local-operation", "local-commits", "local-stash", "conflict",
+  "worktree-ownership", "git-busy", "stale-unattributed", "unreadable", "artifact", "config",
+  "ignored-target", "containment", "unsupported", "other",
+] as const satisfies readonly GitDeferralReason[];
+/** Compile-only proof the ranking stays total: a new reason that is not placed
+ * above makes this alias fail to check (it is NOT a runtime-skippable check). */
+type UnrankedGitDeferralReason = Exclude<GitDeferralReason, (typeof GIT_DEFERRAL_REASON_PRECEDENCE)[number]>;
+type Assert<T extends true> = T;
+type _AllGitDeferralReasonsRanked = Assert<[UnrankedGitDeferralReason] extends [never] ? true : false>;
+
+/** Smaller rank wins. Total by construction; the load-time check below is the
+ * second line of defence for what the type level cannot see (a duplicate, which
+ * would silently drop another member's rank). */
+export const GIT_DEFERRAL_REASON_RANK: Record<GitDeferralReason, number> =
+  Object.fromEntries(GIT_DEFERRAL_REASON_PRECEDENCE.map((reason, index) => [reason, index])) as Record<GitDeferralReason, number>;
+if (new Set<string>(GIT_DEFERRAL_REASON_PRECEDENCE).size !== GIT_DEFERRAL_REASONS.length) {
+  throw new Error("GIT_DEFERRAL_REASON_PRECEDENCE must rank every GitDeferralReason exactly once");
+}
+
 export interface GitDeferral {
   lane: "apply" | "capture" | "config";
   deferredSince: string;
