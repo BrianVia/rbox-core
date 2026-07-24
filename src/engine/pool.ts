@@ -4,9 +4,13 @@
  * behind concurrent blob upload (push) and download (pull) — both were sequential
  * per-blob round-trips, which is latency-bound and slow on a real repo.
  *
- * Rejects on the FIRST task failure (fail-fast): already-running tasks settle but
- * no new ones start. That's the right shape for blob transfer — uploads/downloads
- * are idempotent and resumable, so a partial run just resumes next time.
+ * Rejects on the FIRST task failure (fail-fast) and has NO cancellation: a throwing
+ * task ends only its OWN worker loop, and the sibling workers keep pulling new items
+ * after `Promise.all` has already rejected — so the caller unwinds while that work
+ * continues, detached. That's the right shape for blob transfer (uploads/downloads
+ * are idempotent and resumable, so a partial run just resumes next time), but a
+ * caller that needs the pool DRAINED before it unwinds must not throw out of `fn`
+ * — latch instead, and re-throw after this returns (see `applyGitSections`).
  */
 export async function poolMap<T>(items: readonly T[], concurrency: number, fn: (item: T, index: number) => Promise<void>): Promise<void> {
   let next = 0;
