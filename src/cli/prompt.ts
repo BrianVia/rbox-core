@@ -97,15 +97,18 @@ export async function confirmDestructive(opts: {
 }): Promise<boolean> {
   if (opts.yes) return true;
 
-  if (opts.headless === "throw") {
-    if (!isInteractive()) {
-      if (opts.headlessError !== undefined) throw new Error(opts.headlessError);
-      throw new PromptUnavailableError();
-    }
-  } else if (process.stdin.isTTY !== true) {
+  // ONE gate for every policy: `--no-interactive` (and a missing prompt
+  // surface) must mean the same thing whichever policy the command declared.
+  // Gating the non-`throw` policies on `process.stdin.isTTY` alone let a
+  // terminal `--no-interactive` run fall through to the Ink runtime and throw.
+  if (!isInteractive()) {
     if (opts.headless === "proceed") return true;
     if (opts.headless === "deny") return false;
-    throw new Error(opts.headlessError ?? "explicit confirmation required in non-interactive mode");
+    if (opts.headless === "require-yes") {
+      throw new Error(opts.headlessError ?? "explicit confirmation required in non-interactive mode");
+    }
+    if (opts.headlessError !== undefined) throw new Error(opts.headlessError);
+    throw new PromptUnavailableError();
   }
 
   return promptConfirm({

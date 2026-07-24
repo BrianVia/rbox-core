@@ -4,6 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import { track } from "./track-cmd.js";
 import { untrack } from "./untrack-cmd.js";
+import { main } from "./main-dispatch.js";
+import { withInteractionPolicy } from "./prompt-policy.js";
 import { findRoot, loadConfig, saveConfig } from "./config.js";
 import { daemonRuntimeDir } from "./daemon-control.js";
 import { desiredStatePath } from "./autostart-cmd.js";
@@ -147,6 +149,28 @@ test("untrack honors an interactive 'no' (confirm returns false) and changes not
   const { root } = await track(dir, { workspace: "ws_x" }, "https://api.test");
   await untrack({ root, force: false, confirm: async () => false });
   await fs.access(path.join(root, ".rbox", "workspace.json")); // exists (throws if missing)
+});
+
+test("untrack proceeds through the real dispatcher confirm when interaction is disabled", async () => {
+  // End-to-end over main-dispatch's own `confirm` callback (headless: "proceed").
+  // A disabled interaction policy is exactly what `--no-interactive` installs;
+  // untrack must unbind instead of throwing PromptUnavailableError.
+  const { root } = await track(dir, { workspace: "ws_x" }, "https://api.test");
+  const argv = process.argv;
+  const inDescriptor = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+  Object.defineProperty(process.stdin, "isTTY", { configurable: true, value: true });
+  process.argv = [process.execPath, "rbox", "untrack", root];
+  try {
+    await withInteractionPolicy(
+      { enabled: false },
+      () => main({ refreshSystemLockIdentityLedger: async () => {} }),
+    );
+  } finally {
+    process.argv = argv;
+    if (inDescriptor) Object.defineProperty(process.stdin, "isTTY", inDescriptor);
+    else delete (process.stdin as NodeJS.ReadStream & { isTTY?: boolean }).isTTY;
+  }
+  await expect(fs.access(path.join(root, ".rbox"))).rejects.toThrow();
 });
 
 // ── design 138 F1a: track is bind-only, never a consent boundary ────────────
