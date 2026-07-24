@@ -36,7 +36,7 @@ import { MutationGateClosedError, ShutdownMutationGate } from "../../engine/muta
 import { loadActivity, renderShellDeferrals, renderShellLine, saveActivity, saveShellDeferrals, saveShellLine, shellLineStateOf, type DaemonActivity } from "../activity.js";
 import { expectedStateNonce, loadConfig, loadState, repoRecordsForState, syncStreamId, trashConfig, type SyncState, type WorkspaceConfig } from "../config.js";
 import { pruneTrash } from "../../engine/trash.js";
-import { DAEMON_BOOT_ID_ENV, readDaemonPidRecord, recordDaemonBinding } from "../daemon-control.js";
+import { DAEMON_BOOT_ID_ENV, readDaemonPidRecord, recordDaemonBinding } from "./runtime-state.js";
 import { MassDeleteGuardError, PushConflictExhaustedError, makeDeferErrnoReporter, pull, pushManifest, type SyncDeps } from "../sync.js";
 import { deferManifest } from "../sync-recovery.js";
 import type { TransferPhase, TransferProgressBytes } from "../transfer-progress.js";
