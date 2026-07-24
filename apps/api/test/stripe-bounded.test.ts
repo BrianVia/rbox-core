@@ -189,6 +189,21 @@ describe("Stripe bounded raw webhook", () => {
       .toEqual({ reason: "plan_changed" });
   });
 
+  test("subscription.deleted does not queue a nonexistent metadata account", async () => {
+    const accountId = "acct_fairuse_deleted";
+    const bytes = encoder.encode(JSON.stringify({
+      id: "evt_fairuse_deleted",
+      type: "customer.subscription.deleted",
+      data: { object: { id: "sub_deleted", customer: "cus_deleted", metadata: { account_id: accountId } } },
+    }));
+
+    const response = await stripeWebhook(request(bytes), handlerEnv(), NOW_MS, ctx);
+
+    expect(response.status).toBe(200);
+    expect(await env.rbox_dev_db.prepare("SELECT 1 FROM fairuse_account_queue WHERE account_id = ?").bind(accountId).first())
+      .toBeNull();
+  });
+
   test("reader errors rethrow and never emit the overflow anomaly", async () => {
     const failure = new Error("reader failed");
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
