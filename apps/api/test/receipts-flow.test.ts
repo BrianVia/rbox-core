@@ -193,13 +193,16 @@ describe("§23.2 PUT → canonical + receipt (direct-write, zero D1 on the hot p
     };
 
     await db().prepare("INSERT INTO gc_candidates(sha256,kind,marked_at,deleting_at) VALUES (?,'blob',1,2)").bind(s).run();
-    const blocked = await multipartComplete(env, s, await stage("blocked"), a.accountId);
+    const uploadId = await stage("blocked");
+    const blocked = await multipartComplete(env, s, uploadId, a.accountId);
     expect(blocked.status).toBe(503);
     expect(await blocked.json()).toEqual({ error: "retry_later" });
     expect(await db().prepare("SELECT 1 FROM blob_refs WHERE account_id=? AND sha256=?").bind(a.accountId, s).first()).toBeNull();
 
+    // The 503 preserves the resume state, so the unwound retry re-completes the SAME upload
+    // (it used to need a whole fresh multipart — see multipart-resume.test.ts).
     await db().prepare("DELETE FROM gc_candidates WHERE sha256=?").bind(s).run();
-    const ok = await multipartComplete(env, s, await stage("retry"), a.accountId);
+    const ok = await multipartComplete(env, s, uploadId, a.accountId);
     expect(ok.status).toBe(200);
     expect(await db().prepare("SELECT 1 FROM blob_refs WHERE account_id=? AND sha256=?").bind(a.accountId, s).first()).not.toBeNull();
   });

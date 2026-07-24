@@ -25,7 +25,7 @@ import { blobGetWithVerifiedGrant, usesReceipts } from "./blobs.js";
 import { runPhase1 } from "./gc-phase1.js";
 import { retentionPrune } from "./retention.js";
 import { runFairUseObservation } from "./fairuse.js";
-import { emitGcHealthWarning, gcMark, gcPurge } from "./versions.js";
+import { emitGcHealthWarning, gcMark, gcPurge, gcStagingSweep } from "./versions.js";
 import { sweepDiagnostics } from "./diagnostics.js";
 import { json, logErr, SHA256_HEX_RE } from "./util.js";
 import { startOp } from "./metrics.js";
@@ -141,6 +141,14 @@ export default {
         await gcMark(env, GC_PHASE2_GRACE_MS, event.scheduledTime);
       } catch (e) {
         logErr("scheduled_gc_mark_failed", e);
+      }
+      try {
+        // The `staging/` reclaimer: R2's multipart TTL does not cover a staging object once
+        // its MPU completed, and no other sweep lists that prefix. Its OWN try — a mark
+        // failure must not skip it, and vice versa.
+        await gcStagingSweep(env, event.scheduledTime);
+      } catch (e) {
+        logErr("scheduled_gc_staging_sweep_failed", e);
       }
       await emitGcHealthWarning(env);
       return;

@@ -1,5 +1,5 @@
 import type { Env } from "./env.js";
-import { blobKey, cappedJson, exactObject, json, SHA256_HEX_RE } from "./util.js";
+import { blobKey, cappedJson, exactObject, json, logErr, SHA256_HEX_RE } from "./util.js";
 import { entitledSubset, isEntitled } from "./authz.js";
 import { grantEntitlementWithQuota, wouldExceedCap } from "./billing.js";
 import { emitCompletePhases, startOp } from "./metrics.js";
@@ -462,6 +462,11 @@ export async function multipartComplete(env: Env, sha: string, uploadId: string,
   // dbMs/storeMs accumulate across each phase so the dashboard's R2-vs-D1 split is real.
   const op = startOp(env, "multipart.complete"); // span accumulates D1 (incl. helpers) + R2 across every phase, even on throw
   let outcome = "error"; // default ⇒ an UNEXPECTED throw is recorded as "error", not "ok"
+  // The `finally` cleanup DESTROYS the resume state (staging object + BOTH D1 rows), so it
+  // may only run on outcomes the client can never retry. A `retry_later` 503 tells the client
+  // to POST /complete again; wiping the state turned that retry into `unknown_upload` 404 and
+  // forced a full re-upload of a >90 MiB file. Set on exactly the retryable exits.
+  let resumable = false;
   let bytes = 0;
   let count = 0;
   let totalMs = 0;
@@ -489,7 +494,17 @@ export async function multipartComplete(env: Env, sha: string, uploadId: string,
     // From here the MPU is consumed: assemble staging, publish→canonical with R2 verify.
     const mpu = env.rbox_dev_blobs.resumeMultipartUpload(up.staging_key, uploadId);
     const assembleStart = Date.now();
-    await op.span.r2(() => mpu.complete(parts)); // composite etag is NOT the content hash — only for assembly
+    try {
+      await op.span.r2(() => mpu.complete(parts)); // composite etag is NOT the content hash — only for assembly
+    } catch (e) {
+      // A retryable outcome now PRESERVES the staging object (see the `finally` below), so a
+      // client retry re-enters here with the MPU already consumed and R2 answers NoSuchUpload.
+      // That is recoverable exactly when the prior attempt's assembled object is still
+      // there: fall through and publish it (the canonical `put(..., { sha256 })` below still
+      // verifies the whole-object hash, so resumed bytes get no weaker check). With nothing
+      // staged this was a real assembly failure and the original error still throws.
+      if (!(await op.span.r2(() => env.rbox_dev_blobs.head(up.staging_key)))) throw e;
+    }
     assembleMs = Math.max(0, Math.round(Date.now() - assembleStart));
     const rereadPutStart = Date.now();
     const staged = await op.span.r2(() => env.rbox_dev_blobs.get(up.staging_key));
@@ -512,6 +527,7 @@ export async function multipartComplete(env: Env, sha: string, uploadId: string,
     } catch (e) {
       if (isDeleteFenceAbort(e)) {
         outcome = "retry_later";
+        resumable = true;
         return json({ error: "retry_later" }, 503);
       }
       throw e;
@@ -522,6 +538,7 @@ export async function multipartComplete(env: Env, sha: string, uploadId: string,
     } catch (e) {
       if (isDeleteFenceAbort(e)) {
         outcome = "retry_later";
+        resumable = true;
         return json({ error: "retry_later" }, 503);
       }
       throw e;
@@ -536,8 +553,16 @@ export async function multipartComplete(env: Env, sha: string, uploadId: string,
     return json({ ok: true, sha256: sha, sizeBytes: bytes, serverTimings: { totalMs, assembleMs, rereadPutMs, accountingMs } });
   } finally {
     const cleanupStart = Date.now();
-    await op.span.r2(() => env.rbox_dev_blobs.delete(up.staging_key).catch(() => {}));
-    await cleanupUpload(op.env, accountId, uploadId);
+    // TERMINAL outcomes only (ok / sha_mismatch / quota_exceeded / staged_missing / an
+    // unexpected throw): the upload can never succeed as-is, so its state is dead weight.
+    // A `retry_later` 503 keeps everything — that response IS an instruction to retry.
+    if (!resumable) {
+      // A failed staging delete leaks a `staging/` object whose only D1 handle is being
+      // dropped on the next line — report it (versions.ts' staging sweep is its reclaimer)
+      // but never fail the request because cleanup failed.
+      await op.span.r2(() => env.rbox_dev_blobs.delete(up.staging_key).catch((e) => logErr("multipart_staging_delete_failed", e)));
+      await cleanupUpload(op.env, accountId, uploadId);
+    }
     cleanupMs = Math.max(0, Math.round(Date.now() - cleanupStart));
     op.done(outcome, { bytes, count });
     emitCompletePhases(env, outcome, { totalMs, assembleMs, rereadPutMs, cleanupMs });
