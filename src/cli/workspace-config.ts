@@ -159,4 +159,3 @@ export async function saveConfig(root: string, cfg: WorkspaceConfig): Promise<vo
   // at runtime by loadAuthedConfig.
   await writeFileAtomic(configPath(root), JSON.stringify(configForDisk(cfg), null, 2));
 }
-

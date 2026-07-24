@@ -435,4 +435,3 @@ export function stateFromRepoRecords(state: SyncState, records: Record<string, R
     repoRecords: normalized,
   };
 }
-
