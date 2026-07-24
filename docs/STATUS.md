@@ -5,7 +5,27 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
-_Last updated: 2026-07-24 (**189 SHIPPED — v1.9.0 released + promoted to prod;
+_Last updated: 2026-07-24 (**refactor day — two ownership decompositions
+MERGED**): #419 split `daemon-control.ts` (869 lines) into
+`daemon/runtime-state` + `daemon/process-control` + `daemon/log-reader` behind
+a 55-line explicit facade; #420 split `auth-cmd.ts` (2,171 lines) into ten
+`src/cli/auth/` workflow owners + `remote/auth-command-wire` (exact legacy
+wire) behind a 50-line barrel. Both reviewed here as move-fidelity audits
+(line-multiset + per-function body diffs against main — every body
+byte-identical modulo named-helper extraction; export surfaces locked by exact
+facade/surface tests). #420 needed fixes before merge: (1) design-number
+collision with #419 — both claimed 194; auth renumbered to
+**195-auth-command-decomposition.md** + REVIEW-195; (2) a latent CI landmine —
+`prompt-lazy.test.ts` asserted the Ink sentinel **in-process**, but CI shards
+run all files in ONE bun process, so any test-file addition can recolocate it
+with `prompt-ink.test.ts` and fail it deterministically (this PR did); fixed
+by running the whole assertion in a spawned child (codex, per spec).
+**Playbook lesson: an in-process global-state assertion is
+shard-partition-dependent — isolate such tests in a subprocess from day one.**
+Worktrees + codex branches pruned. NEXT: review #418 (193 onboarding-funnel
+telemetry design doc)._
+
+_Previous: 2026-07-24 (**189 SHIPPED — v1.9.0 released + promoted to prod;
 validated end-to-end on two real machines**). Design 189 (web-approved pairing)
 is LIVE: implemented across apps/api + daemon + CLI + web, merged (#414), and
 released as **v1.9.0** — prod API promoted (migrations 0033/0034 applied) and
