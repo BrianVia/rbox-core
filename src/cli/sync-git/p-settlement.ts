@@ -15,14 +15,16 @@ import {
 import { ZERO_OID } from "../../engine/git/shared.js";
 import {
   applyStateSavePacket,
-  expectedStateNonce,
   loadRawState,
-  repoRecordsForState,
   statePath,
+} from "../sync-state-store.js";
+import {
+  expectedStateNonce,
+  repoRecordsForState,
   type RepoRecordInput,
   type StateSaveOptions,
   type SyncState,
-} from "../config.js";
+} from "../sync-state-model.js";
 import type { BranchTransitionWitness, RepoBaseProof } from "./base-composer.js";
 import { MutationGateClosedError, type MutationBoundary, type MutationLease } from "../../engine/mutation-gate.js";
 

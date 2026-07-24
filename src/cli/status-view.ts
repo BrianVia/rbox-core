@@ -12,7 +12,7 @@
  * "the command ran to completion".
  */
 import { ACTIVE_STALE_MS, isSafetyHaltReason, type DaemonActivity } from "./activity.js";
-import type { GitDeferral, GitDeferralReason, RepoRecord } from "./config.js";
+import type { GitDeferral, GitDeferralReason, RepoRecord } from "./sync-state-model.js";
 import { formatBinaryBytes, formatDecimalBytes, quotaUsage } from "./quota-format.js";
 import { style } from "./style.js";
 import type { TransferPhase, TransferProgressBytes } from "./transfer-progress.js";

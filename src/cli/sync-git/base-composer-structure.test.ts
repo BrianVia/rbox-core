@@ -43,7 +43,8 @@ async function productionSources(dir = srcRoot): Promise<string[]> {
   const files = await Promise.all(entries.map(async (entry) => {
     const absolute = path.join(dir, entry.name);
     if (entry.isDirectory()) return productionSources(absolute);
-    if (!entry.name.endsWith(".ts") || entry.name.endsWith(".test.ts") || entry.name.endsWith(".bench-helper.ts")) return [];
+    if (!entry.name.endsWith(".ts") || entry.name.endsWith(".test.ts")
+      || entry.name.endsWith(".typecheck.ts") || entry.name.endsWith(".bench-helper.ts")) return [];
     return [absolute];
   }));
   return files.flat().sort();
@@ -84,20 +85,26 @@ test("design 130 whole-state persistence is a closed allowlist", async () => {
         && site.arguments?.[0]?.startsWith("statePath(") === true)
   ));
   expect(counts(sites)).toEqual({
-    "src/cli/config.ts": 4,
     "src/cli/scan-probe.ts": 1,
+    "src/cli/sync-state-store.ts": 4,
     "src/cli/sync-state.ts": 4,
   });
 });
 
 test("design 130 raw whole-state APIs cannot be aliased into new production sites", async () => {
-  const unsafe = await sweep(/\bsaveStateUnsafeLegacyOrTest\b/g);
+  // The compatibility facade is separately pinned by config-surface.test.ts.
+  // This closed set counts the owner definition and production consumers, so
+  // decomposition cannot inflate the pre/post operation-category total.
+  const outsideFacade = (file: string): boolean => file !== path.join(srcRoot, "cli", "config.ts");
+  const unsafe = await sweep(/\bsaveStateUnsafeLegacyOrTest\b/g, outsideFacade);
   expect(counts(unsafe)).toEqual({
-    "src/cli/config.ts": 1,
+    "src/cli/sync-state-store.ts": 1,
     "src/cli/sync-state.ts": 5,
   });
-  const guarded = await sweep(/\bsaveState\b/g);
-  expect(counts(guarded)).toEqual({ "src/cli/config.ts": 2 });
+  const guarded = await sweep(/\bsaveState\b/g, outsideFacade);
+  expect(counts(guarded)).toEqual({
+    "src/cli/sync-state-store.ts": 2,
+  });
 });
 
 test("design 130 raw update-ref command sites are a closed allowlist", async () => {
@@ -124,7 +131,6 @@ test("design 130 persisted BASE and branch-origin writes are a closed allowlist"
   const sites = await astSweep((site) => site.file.startsWith("src/cli/")
     && ["base", "branchBaseOrigins"].includes(site.name ?? ""));
   expect(counts(sites)).toEqual({
-    "src/cli/config.ts": 19,
     // Design 177 retains read-only oracle proof inputs named `base`; BASE writes
     // still route only through the composer/state transitions guarded below.
     "src/cli/git-cmd.ts": 8,
@@ -135,6 +141,8 @@ test("design 130 persisted BASE and branch-origin writes are a closed allowlist"
     "src/cli/sync-git/p-settlement.ts": 1,
     // Design 178 D.3 read-only publisher-ACK composer dry-run inputs/result.
     "src/cli/sync-git/pending-supersession.ts": 3,
+    "src/cli/sync-state-model.ts": 11,
+    "src/cli/sync-state-store.ts": 8,
     "src/cli/sync-state.ts": 14,
     "src/cli/sync/pull.ts": 2,
   });

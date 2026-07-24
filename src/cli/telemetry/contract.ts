@@ -1,4 +1,4 @@
-import type { GitDeferralReason } from "../config.js";
+import type { GitDeferralReason } from "../sync-state-model.js";
 
 export interface NumericDomain {
   readonly min: number;

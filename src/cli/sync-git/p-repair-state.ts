@@ -1,12 +1,14 @@
 import {
   applyStateSavePacket,
-  expectedStateNonce,
   loadRawState,
-  repoRecordsForState,
   statePath,
+} from "../sync-state-store.js";
+import {
+  expectedStateNonce,
+  repoRecordsForState,
   type RepoRecord,
   type StateSaveOptions,
-} from "../config.js";
+} from "../sync-state-model.js";
 import type { BasePresentPayload, PreparedProtocolRef } from "../../engine/git/base-artifacts.js";
 import { parsePRepairReceipt, type PRepairReceipt } from "../../engine/git/p-repair.js";
 import type { PRepairStatePort, PRepairStateSnapshot } from "../../engine/git/p-repair-transaction.js";
