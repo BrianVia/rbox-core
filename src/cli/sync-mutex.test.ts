@@ -210,7 +210,7 @@ describe("design 93 §6 complete caller disposition drift gate", () => {
 
   test("purge recomputes after confirmation under the mutex", async () => {
     const source = await fs.readFile(path.join(sourceRoot, "cli", "ignore-cmd.ts"), "utf8");
-    const confirm = source.indexOf("await promptConfirm");
+    const confirm = source.indexOf("await confirmDestructive");
     const acquire = source.indexOf("await withWorkspaceSyncMutex", confirm);
     const recompute = source.indexOf("await computePurgeCandidate", acquire);
     const push = source.indexOf("await pushManifest", recompute);
