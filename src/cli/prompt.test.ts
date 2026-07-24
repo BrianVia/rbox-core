@@ -38,26 +38,41 @@ test("confirmDestructive preserves each headless policy and the yes bypass", asy
     }),
   )).rejects.toThrow("exact full-gate error");
 
-  const ttyDescriptor = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+  // `--no-interactive` from a terminal: BOTH streams are TTYs, so only the
+  // interaction policy makes the run headless. Every policy must honour it
+  // identically — the scriptable-path rule. Gating the non-`throw` policies on
+  // `process.stdin.isTTY` alone sent them into the Ink runtime, so
+  // `rbox untrack` under a disabled policy threw instead of proceeding.
+  const inDescriptor = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+  const errDescriptor = Object.getOwnPropertyDescriptor(process.stderr, "isTTY");
   Object.defineProperty(process.stdin, "isTTY", { configurable: true, value: true });
+  Object.defineProperty(process.stderr, "isTTY", { configurable: true, value: true });
   try {
-    for (const opts of [
-      { message: "proceed needs a prompt surface", headless: "proceed" as const },
-      { message: "deny needs a prompt surface", headless: "deny" as const },
-      {
-        message: "require-yes needs a prompt surface",
-        headless: "require-yes" as const,
-        headlessError: "must not replace PromptUnavailableError",
-      },
-    ]) {
-      await expect(withInteractionPolicy(
-        { enabled: false },
-        () => confirmDestructive(opts),
-      )).rejects.toBeInstanceOf(PromptUnavailableError);
-    }
+    expect(await withInteractionPolicy(
+      { enabled: false },
+      () => confirmDestructive({ message: "proceed under --no-interactive", headless: "proceed" }),
+    )).toBe(true);
+    expect(await withInteractionPolicy(
+      { enabled: false },
+      () => confirmDestructive({ message: "deny under --no-interactive", headless: "deny" }),
+    )).toBe(false);
+    await expect(withInteractionPolicy(
+      { enabled: false },
+      () => confirmDestructive({
+        message: "require-yes under --no-interactive",
+        headless: "require-yes",
+        headlessError: "exact policy require-yes error",
+      }),
+    )).rejects.toThrow("exact policy require-yes error");
+    await expect(withInteractionPolicy(
+      { enabled: false },
+      () => confirmDestructive({ message: "throw under --no-interactive", headless: "throw" }),
+    )).rejects.toBeInstanceOf(PromptUnavailableError);
   } finally {
-    if (ttyDescriptor) Object.defineProperty(process.stdin, "isTTY", ttyDescriptor);
+    if (inDescriptor) Object.defineProperty(process.stdin, "isTTY", inDescriptor);
     else delete (process.stdin as NodeJS.ReadStream & { isTTY?: boolean }).isTTY;
+    if (errDescriptor) Object.defineProperty(process.stderr, "isTTY", errDescriptor);
+    else delete (process.stderr as NodeJS.WriteStream & { isTTY?: boolean }).isTTY;
   }
 });
 
