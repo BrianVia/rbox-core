@@ -133,7 +133,7 @@ test("design 130 persisted BASE and branch-origin writes are a closed allowlist"
   expect(counts(sites)).toEqual({
     // Design 177 retains read-only oracle proof inputs named `base`; BASE writes
     // still route only through the composer/state transitions guarded below.
-    "src/cli/git-cmd.ts": 8,
+    "src/cli/git/resolve-command.ts": 8,
     "src/cli/sync-git/apply.ts": 24,
     "src/cli/sync-git/base-composer.ts": 2,
     "src/cli/sync-git/follow.ts": 1,
