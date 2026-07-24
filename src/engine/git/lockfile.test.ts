@@ -545,6 +545,32 @@ describe("atomic lock construction and ownership", () => {
 });
 
 describe("reaper fencing", () => {
+  test("exact marker mode survives umask and propagates to the reap fence", async () => {
+    const root = await tempDir();
+    const lockPath = path.join(root, "readable.lock");
+    await fs.writeFile(lockPath, formatLockMarker(marker({ pid: 700, startTime: "50", token: "4".repeat(32) })));
+    let fenceMode = 0;
+    const previousUmask = process.umask(0o077);
+    try {
+      const acquired = await acquireLock(lockPath, {
+        identity: identity(),
+        markerMode: 0o644,
+        token: () => "5".repeat(32),
+        hooks: {
+          beforeReapUnlink: async () => {
+            fenceMode = (await fs.stat(`${lockPath}.reap`)).mode & 0o777;
+          },
+        },
+      });
+      expect(acquired.status).toBe("acquired");
+      expect(fenceMode).toBe(0o644);
+      expect((await fs.stat(lockPath)).mode & 0o777).toBe(0o644);
+      if (acquired.status === "acquired") await acquired.lock.release();
+    } finally {
+      process.umask(previousUmask);
+    }
+  });
+
   test("two reapers serialize through <lock>.reap", async () => {
     const root = await tempDir();
     const lockPath = path.join(root, "config.lock");

@@ -145,7 +145,9 @@ export interface AcquireLockOptions {
   hooks?: LockfileHooks;
   token?: () => string;
   storageLocal?: (storagePath: string) => Promise<boolean>;
-  /** Used solely by the host-identity ledger's own lock. */
+  /** Exact visible marker mode. Defaults to private 0600. Reap fences inherit it. */
+  markerMode?: number;
+  /** Avoid the optional home-scoped boot-history cache (callers still use live OS identity). */
   skipIdentityRefresh?: boolean;
 }
 
@@ -930,13 +932,14 @@ export async function inspectLock(
   return { kind: "foreign", raw: read.raw, reason: "cross-host lock", observation: read };
 }
 
-async function atomicCreateMarker(lockPath: string, raw: string, hooks?: LockfileHooks): Promise<AtomicCreateResult> {
+async function atomicCreateMarker(lockPath: string, raw: string, hooks?: LockfileHooks, markerMode = 0o600): Promise<AtomicCreateResult> {
   const dir = path.dirname(lockPath);
   const tempPath = path.join(dir, `.${path.basename(lockPath)}.${process.pid}.${crypto.randomBytes(16).toString("hex")}.tmp`);
   let handle: fs.FileHandle | undefined;
   try {
-    handle = await fs.open(tempPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+    handle = await fs.open(tempPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, markerMode);
     await handle.writeFile(raw);
+    await handle.chmod(markerMode);
     await handle.sync();
     await handle.close();
     handle = undefined;
@@ -1079,11 +1082,12 @@ async function acquireFence(
   hooks: LockfileHooks | undefined,
   token: () => string,
   storageLocal: (storagePath: string) => Promise<boolean>,
+  markerMode: number,
 ): Promise<{ status: "acquired"; lock: OwnedLock } | { status: "retry" } | { status: "blocked"; blocker: ReapBlocker }> {
   for (let attempt = 0; attempt < 2; attempt++) {
     const marker: LockMarker = { ...incarnation, token: token() };
     const raw = formatLockMarker(marker);
-    const created = await atomicCreateMarker(fencePath, raw, hooks);
+    const created = await atomicCreateMarker(fencePath, raw, hooks, markerMode);
     if (created.status === "created") {
       const finalized = await finalizeCreated(fencePath, raw, hooks);
       if (finalized.ok) return { status: "acquired", lock: new OwnedLock(fencePath, marker, raw, finalized.observation, identity, hooks) };
@@ -1133,9 +1137,10 @@ async function tryReap(
   token: () => string,
   allowLive: boolean,
   storageLocal: (storagePath: string) => Promise<boolean>,
+  markerMode: number,
 ): Promise<ReapResult> {
   const incarnation = await identity.current();
-  const fence = await acquireFence(`${lockPath}.reap`, incarnation, identity, hooks, token, storageLocal);
+  const fence = await acquireFence(`${lockPath}.reap`, incarnation, identity, hooks, token, storageLocal, markerMode);
   if (fence.status === "blocked") return fence;
   if (fence.status === "retry") return { status: "retry" };
   let result: ReapResult = { status: "retry" };
@@ -1222,7 +1227,7 @@ export async function acquireLock(lockPath: string, options: AcquireLockOptions 
   }
 
   for (let attempt = 0; attempt < 3; attempt++) {
-    const created = await atomicCreateMarker(lockPath, raw, options.hooks);
+    const created = await atomicCreateMarker(lockPath, raw, options.hooks, options.markerMode);
     if (created.status === "created") {
       const finalized = await finalizeCreated(lockPath, raw, options.hooks);
       if (finalized.ok) return { status: "acquired", lock: new OwnedLock(lockPath, marker, raw, finalized.observation, identity, options.hooks) };
@@ -1236,7 +1241,7 @@ export async function acquireLock(lockPath: string, options: AcquireLockOptions 
     const staleRaw = staleOwnedMarkers.get(lockPath);
     const staleOwned = staleRaw !== undefined && inspection.raw === staleRaw;
     if (inspection.kind === "dead" || staleOwned) {
-      const reap = await tryReap(lockPath, inspection, identity, options.hooks, token, staleOwned, storageLocal);
+      const reap = await tryReap(lockPath, inspection, identity, options.hooks, token, staleOwned, storageLocal, options.markerMode ?? 0o600);
       if (reap.status === "reaped" || reap.status === "retry") {
         if (reap.status === "reaped") staleOwnedMarkers.delete(lockPath);
         continue;

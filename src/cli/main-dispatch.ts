@@ -81,6 +81,7 @@ async function resolvePathFlagRoot(arg: string | undefined): Promise<string> {
 }
 
 export type FrontDoorImport = () => Promise<Pick<typeof import("./front-door.js"), "resolveBareRboxTarget" | "runFrontDoor" | "runUntrackedMenu">>;
+export type UpgradeCommandImport = () => Promise<Pick<typeof import("./upgrade-cmd.js"), "upgradeCmd">>;
 
 async function runGuidedFrontDoor(importFrontDoor: FrontDoorImport = () => import("./front-door.js")): Promise<void> {
   const { resolveBareRboxTarget, runFrontDoor, runUntrackedMenu } = await importFrontDoor();
@@ -103,14 +104,22 @@ export interface MainDispatchDeps {
   now?: () => Date;
   frontDoorImport?: FrontDoorImport;
   authCommandImport?: () => Promise<Pick<typeof import("./auth-cmd.js"), "pairCreate" | "readPairingTokenInteractive" | "redeemPair">>;
+  upgradeCommandImport?: UpgradeCommandImport;
+  isElevated?: () => boolean;
+  refreshSystemLockIdentityLedger?: typeof refreshSystemLockIdentityLedger;
 }
 
 export async function main(deps: MainDispatchDeps = {}): Promise<void> {
+  let [cmd] = process.argv.slice(2) as [string | undefined];
+  const elevated = (deps.isElevated ?? (() => typeof process.geteuid === "function" && process.geteuid() === 0))();
   // Resolve and persist this boot even for commands which never acquire a
   // workspace lock. Locking remains availability-biased when identity is
   // unavailable, so non-locking commands must not fail on this health hook.
-  await refreshSystemLockIdentityLedger().catch(() => {});
-  let [cmd] = process.argv.slice(2) as [string | undefined];
+  // Elevated upgrade is deliberately home-isolated: its install-scoped lock
+  // uses live OS identity without refreshing the optional ~/.rbox ledger.
+  if (!(cmd === "upgrade" && elevated)) {
+    await (deps.refreshSystemLockIdentityLedger ?? refreshSystemLockIdentityLedger)().catch(() => {});
+  }
   const rest = process.argv.slice(3);
   const parsed = parseFlags(rest);
   let positional = parsed.positional;
@@ -226,8 +235,11 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
       break;
     }
     case "upgrade": {
-      const { upgradeCmd } = await import("./upgrade-cmd.js");
-      await upgradeCmd(flags.remote ?? DEFAULT_REMOTE, { check: flags.check === "true" });
+      const { upgradeCmd } = await (deps.upgradeCommandImport ?? (() => import("./upgrade-cmd.js")))();
+      await upgradeCmd(flags.remote ?? DEFAULT_REMOTE, {
+        check: flags.check === "true",
+        commandDeps: { isElevated: () => elevated },
+      });
       break;
     }
     case "device": {
