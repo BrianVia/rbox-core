@@ -543,6 +543,42 @@ describe("design 189 key-delivery state machine", () => {
       expect(auth).toEqual({ status: "approved", account_id: account.accountId });
       expect(delivery).toEqual({ state: "queued", account_id: account.accountId });
     });
+
+    test("first device on an unencrypted account downgrades key-consent to a device-auth sign-in (no error, no delivery)", async () => {
+      // Papercut 2026-07-23: the web /cli-login page offers "send keys" whenever
+      // the URL carries a #fp, even on a fresh account with no encryption. A
+      // key-consent approve then used to 409 "encryption isn't set up". It must
+      // instead gracefully sign the device in (device-auth) so the CLI can guide
+      // the user to `rbox key genesis`. NOTE: no seedEpoch → account unencrypted.
+      const account = await bootstrap("da-no-encryption");
+      const keys192 = keys(104);
+      const deviceCode = (await sha256Hex(`da-${account.accountId}-DAAE-AAAA`)).slice(0, 64);
+      const requestId = await requestIdForDeviceCode(deviceCode);
+      const now = Date.now();
+      await env.rbox_dev_db.prepare(
+        `INSERT INTO device_auth
+           (device_code,user_code,status,device_id,label,created_at,expires_at,account_id,user_id,
+            enc_pub_key,sig_pub_key,pubkeys_captured_at,request_id)
+         VALUES (?,?,'pending',?,'approve-dev-test',?,?,?,?,?,?,?,?)`,
+      ).bind(
+        deviceCode, "DAAE-AAAA", "dev_da_DAAEAAAA", now, now + 600_000,
+        null, null, keys192.encPubKey, keys192.sigPubKey, now, requestId,
+      ).run();
+      const fingerprint = await publicKeyFingerprint(keys192);
+      const res = await approveDeviceAuthDev(
+        jsonRequest("/v1/auth/device/approve-dev", { userCode: "DAAE-AAAA", pubkeyFingerprint: fingerprint, bootstrapSecret: DEV_SECRET }),
+        env,
+        account.principal,
+      );
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ ok: true, keyDelivery: null, encryptionAbsent: true });
+      const [auth, delivery] = await Promise.all([
+        env.rbox_dev_db.prepare("SELECT status,account_id FROM device_auth WHERE request_id=?").bind(requestId).first<{ status: string; account_id: string }>(),
+        env.rbox_dev_db.prepare("SELECT 1 FROM key_delivery WHERE request_id=?").bind(requestId).first(),
+      ]);
+      expect(auth).toEqual({ status: "approved", account_id: account.accountId }); // device-auth sign-in
+      expect(delivery).toBeNull(); // NO key delivery queued
+    });
   });
 
   test("expiry, factor-age, and epoch guards terminalize without leaking the blob", async () => {
