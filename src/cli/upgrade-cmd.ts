@@ -11,6 +11,7 @@ import { readAmbientDaemonStatusRecord } from "./daemon/ambient-status.js";
 import { readDesiredDaemonRows, resumeDesiredDaemon, type DesiredStateRow } from "./autostart-cmd.js";
 import { workspaceKey } from "./rbox-paths.js";
 import { fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
+import { acquireLock, type OwnedLock } from "../engine/git/lockfile.js";
 import { verifyAndParseManifest } from "./release-verify.js";
 
 /**
@@ -37,9 +38,29 @@ function artifactName(): string {
 }
 
 const rboxDir = () => path.join(process.env.RBOX_HOME || os.homedir(), ".rbox");
-const releaseStatePath = () => path.join(rboxDir(), "release.json");
-const lockPath = () => path.join(rboxDir(), "upgrade.lock");
+const legacyReleaseStatePath = () => path.join(rboxDir(), "release.json");
 const daemonsDir = () => path.join(rboxDir(), "daemons");
+const RELEASE_STATE_MAX_BYTES = 4096;
+
+interface UpgradeContext {
+  elevated: boolean;
+  dir: string;
+  releaseStatePath: string;
+  lockPath: string;
+}
+
+interface ReleaseState {
+  schema: 1;
+  version: string;
+  phase: "pending" | "committed";
+}
+
+interface EffectiveFloor {
+  version: string;
+  state?: ReleaseState;
+}
+
+const processIsElevated = (): boolean => typeof process.geteuid === "function" && process.geteuid() === 0;
 
 export interface UpgradeDaemonDeps {
   readDesiredDaemonRows?: typeof readDesiredDaemonRows;
@@ -53,6 +74,9 @@ export interface UpgradeDaemonDeps {
 export interface UpgradeCommandDeps {
   isStandaloneBinary?: typeof isStandaloneBinary;
   verifyAndParseManifest?: typeof verifyAndParseManifest;
+  isElevated?: () => boolean;
+  afterPendingState?: () => void | Promise<void>;
+  afterExecutableRename?: () => void | Promise<void>;
 }
 
 class UpgradeDaemonRestartError extends Error {
@@ -152,46 +176,110 @@ export async function restartStaleDaemonsIfAny(deps: UpgradeDaemonDeps = {}): Pr
   for (const line of buffered) log(line);
 }
 
-async function recordVerifiedRelease(version: string): Promise<void> {
-  await fsp.mkdir(rboxDir(), { recursive: true, mode: 0o700 });
-  await writeFileAtomic(releaseStatePath(), JSON.stringify({ version }), { flag: "wx", mode: 0o600 });
-  await fsyncDirectory(rboxDir());
+function sameFileStat(
+  a: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint },
+  b: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint },
+): boolean {
+  return a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeNs === b.mtimeNs;
 }
 
-/** Acquire an exclusive cross-process upgrade lock so two concurrent `rbox
- *  upgrade` runs can't both pass the floor check and rename in reverse order
- *  (which could leave an OLDER signed binary installed). Held from before the
- *  floor read through the rename + state write. Recovers a lock left by a dead
- *  process (stored pid no longer alive) rather than wedging forever. */
-function acquireUpgradeLock(): () => void {
-  fs.mkdirSync(rboxDir(), { recursive: true, mode: 0o700 });
-  const lock = lockPath();
-  const take = () => {
-    const fd = fs.openSync(lock, "wx"); // O_CREAT|O_EXCL — fails if held
-    fs.writeSync(fd, String(process.pid));
-    fs.closeSync(fd);
-  };
+async function readJsonNoFollow(filePath: string, label: string): Promise<unknown | undefined> {
+  let before: Awaited<ReturnType<typeof fsp.lstat>>;
   try {
-    take();
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
-    const holder = Number(fs.readFileSync(lock, "utf8").trim());
-    const alive = Number.isInteger(holder) && (() => { try { process.kill(holder, 0); return true; } catch (k) { return (k as NodeJS.ErrnoException).code === "EPERM"; } })();
-    if (alive) throw new Error(`another rbox upgrade is already running (pid ${holder}) — refusing to run concurrently`);
-    fs.rmSync(lock, { force: true }); // stale lock from a dead process
-    take();
+    before = await fsp.lstat(filePath, { bigint: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw new Error(`${label} is unreadable`, { cause: error });
   }
-  return () => fs.rmSync(lock, { force: true });
+  if (!before.isFile() || before.isSymbolicLink() || before.size > BigInt(RELEASE_STATE_MAX_BYTES)) {
+    throw new Error(`${label} is not a safe regular file`);
+  }
+  let handle: fsp.FileHandle;
+  try {
+    handle = await fsp.open(filePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+  } catch (error) {
+    throw new Error(`${label} is unreadable`, { cause: error });
+  }
+  try {
+    const opened = await handle.stat({ bigint: true });
+    if (!opened.isFile() || !sameFileStat(before, opened)) throw new Error(`${label} changed while opening`);
+    const bytes = Buffer.alloc(RELEASE_STATE_MAX_BYTES + 1);
+    const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
+    const afterHandle = await handle.stat({ bigint: true });
+    const afterPath = await fsp.lstat(filePath, { bigint: true });
+    if (bytesRead > RELEASE_STATE_MAX_BYTES || BigInt(bytesRead) !== opened.size
+      || !sameFileStat(opened, afterHandle) || !sameFileStat(afterHandle, afterPath)) {
+      throw new Error(`${label} changed while reading`);
+    }
+    try {
+      return JSON.parse(bytes.subarray(0, bytesRead).toString("utf8"));
+    } catch (error) {
+      throw new Error(`${label} is malformed`, { cause: error });
+    }
+  } finally {
+    await handle.close();
+  }
 }
 
-async function highestVerified(): Promise<string> {
+function parseCanonicalReleaseState(value: unknown): ReleaseState {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("upgrade release state is malformed");
+  const state = value as Partial<ReleaseState>;
+  if (Object.keys(state).sort().join(",") !== "phase,schema,version"
+    || state.schema !== 1
+    || (state.phase !== "pending" && state.phase !== "committed")
+    || typeof state.version !== "string") {
+    throw new Error("upgrade release state is malformed");
+  }
+  parseSemver(state.version);
+  return state as ReleaseState;
+}
+
+async function readCanonicalReleaseState(ctx: UpgradeContext): Promise<ReleaseState | undefined> {
+  const value = await readJsonNoFollow(ctx.releaseStatePath, "upgrade release state");
+  return value === undefined ? undefined : parseCanonicalReleaseState(value);
+}
+
+async function readLegacyFloor(): Promise<string | undefined> {
   try {
-    const { version } = JSON.parse(await fsp.readFile(releaseStatePath(), "utf8")) as { version: string };
-    parseSemver(version); // validate
-    return semverGt(version, RBOX_VERSION) ? version : RBOX_VERSION;
+    const value = await readJsonNoFollow(legacyReleaseStatePath(), "legacy upgrade release state");
+    if (value === undefined) return undefined;
+    if (!value || typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).join(",") !== "version"
+      || typeof (value as { version?: unknown }).version !== "string") return undefined;
+    const version = (value as { version: string }).version;
+    parseSemver(version);
+    return version;
   } catch {
-    return RBOX_VERSION;
+    // Compatibility-only input: older sudo updaters may have left this
+    // user-home record root-owned. Canonical install-scoped state fails closed;
+    // an unreadable/malformed legacy hint retains the old best-effort behavior.
+    return undefined;
   }
+}
+
+async function effectiveFloor(ctx: UpgradeContext): Promise<EffectiveFloor> {
+  const state = await readCanonicalReleaseState(ctx);
+  if (state) return { version: semverGt(state.version, RBOX_VERSION) ? state.version : RBOX_VERSION, state };
+  const legacy = ctx.elevated ? undefined : await readLegacyFloor();
+  return { version: legacy && semverGt(legacy, RBOX_VERSION) ? legacy : RBOX_VERSION };
+}
+
+async function writeReleaseState(ctx: UpgradeContext, version: string, phase: ReleaseState["phase"]): Promise<void> {
+  await writeFileAtomic(ctx.releaseStatePath, `${JSON.stringify({ schema: 1, version, phase })}\n`, {
+    mode: 0o644,
+    exactMode: true,
+  });
+  await fsyncDirectory(ctx.dir);
+}
+
+async function acquireUpgradeLock(ctx: UpgradeContext): Promise<OwnedLock> {
+  const result = await acquireLock(ctx.lockPath, { skipIdentityRefresh: true, markerMode: 0o644 });
+  if (result.status === "acquired") return result.lock;
+  if (result.status === "held") {
+    const pid = "marker" in result.inspection ? result.inspection.marker.pid : undefined;
+    throw new Error(`another rbox upgrade is already running${pid ? ` (pid ${pid})` : ""} — refusing to run concurrently`);
+  }
+  throw new Error("cannot acquire the rbox upgrade lock", { cause: result.error });
 }
 
 async function fetchBytes(url: string): Promise<Uint8Array> {
@@ -241,17 +329,46 @@ export async function upgradeCmd(remoteUrl: string, opts: { check?: boolean; dae
   }
   const exe = fs.realpathSync(process.execPath);
   const dir = path.dirname(exe);
+  const ctx: UpgradeContext = Object.freeze({
+    elevated: (opts.commandDeps?.isElevated ?? processIsElevated)(),
+    dir,
+    releaseStatePath: `${exe}.release.json`,
+    lockPath: `${exe}.upgrade.lock`,
+  });
   const name = artifactName();
 
   // 1. Fetch manifest + detached signature (RAW bytes) and verify BEFORE trusting.
   const [manifestBytes, sigBytes] = await Promise.all([fetchBytes(`${remoteUrl}/version`), fetchBytes(`${remoteUrl}/version.sig`)]);
   const manifest = (opts.commandDeps?.verifyAndParseManifest ?? verifyAndParseManifest)(manifestBytes, sigBytes);
 
-  // 2. Forward-only: never "upgrade" to an older/equal version (anti-rollback).
-  const floor = await highestVerified();
-  if (!semverGt(manifest.version, floor)) {
-    if (opts.check) console.log(`already up to date (${RBOX_VERSION})`);
-    else await restartStaleDaemonsIfAny(opts.daemonDeps);
+  const noUpgrade = async (floor: EffectiveFloor): Promise<void> => {
+    if (semverGt(floor.version, RBOX_VERSION)) {
+      console.log(`verified upgrade floor is ${floor.version}; this process is ${RBOX_VERSION} — run \`rbox upgrade\` again from a fresh shell`);
+    } else if (ctx.elevated) {
+      console.log(`already up to date (${RBOX_VERSION})`);
+    } else {
+      await restartStaleDaemonsIfAny(opts.daemonDeps);
+    }
+  };
+  const isPendingRetry = (floor: EffectiveFloor): boolean =>
+    floor.state?.phase === "pending"
+    && floor.state.version === manifest.version
+    && semverGt(floor.state.version, RBOX_VERSION);
+
+  // 2. Forward-only: never install below the executable-scoped durable floor.
+  // An exact pending target may be retried by an older still-running process.
+  const floor = await effectiveFloor(ctx);
+  const pendingRetry = isPendingRetry(floor);
+  if (!semverGt(manifest.version, floor.version) && !pendingRetry) {
+    if (opts.check) {
+      if (semverGt(floor.version, RBOX_VERSION)) {
+        console.log(`verified upgrade floor is ${floor.version}; this process is ${RBOX_VERSION} — run \`rbox upgrade\` again from a fresh shell`);
+      } else {
+        console.log(`already up to date (${RBOX_VERSION})`);
+      }
+    } else {
+      await noUpgrade(floor);
+    }
     return;
   }
   const art = manifest.artifacts[name];
@@ -266,7 +383,7 @@ export async function upgradeCmd(remoteUrl: string, opts: { check?: boolean; dae
     throw new Error(`release artifact path ${art.path} doesn't match v${manifest.version}/${name} — refusing`);
   }
   if (opts.check) {
-    console.log(`update available: ${manifest.version} (you have ${RBOX_VERSION}) — run \`rbox upgrade\``);
+    console.log(`${pendingRetry ? "update repair pending" : "update available"}: ${manifest.version} (you have ${RBOX_VERSION}) — run \`rbox upgrade\``);
     return;
   }
 
@@ -281,15 +398,21 @@ export async function upgradeCmd(remoteUrl: string, opts: { check?: boolean; dae
   // Serialize the mutating section: take the exclusive upgrade lock, then RE-READ
   // the floor under it (a concurrent upgrade may have finished and bumped it) so
   // two racing runs can't rename in reverse order and leave an older binary.
-  const releaseLock = acquireUpgradeLock();
+  const releaseLock = await acquireUpgradeLock(ctx);
+  let primaryError: unknown;
   try {
-    if (!semverGt(manifest.version, await highestVerified())) {
-      await restartStaleDaemonsIfAny(opts.daemonDeps);
+    const lockedFloor = await effectiveFloor(ctx);
+    if (!semverGt(manifest.version, lockedFloor.version) && !isPendingRetry(lockedFloor)) {
+      await noUpgrade(lockedFloor);
       return;
     }
     const { tmp, sha256 } = await downloadToTemp(`${remoteUrl}/bin/${art.path}`, dir);
     try {
       if (sha256 !== art.sha256) throw new Error("downloaded binary sha256 did not match the signed manifest — refusing");
+      // Make the verified target a durable rollback floor BEFORE replacement.
+      await writeReleaseState(ctx, manifest.version, "pending");
+      await opts.commandDeps?.afterPendingState?.();
+
       // 4. Atomic replace: chmod, fsync (mode durable), rename over the live binary,
       //    fsync the dir. The running process keeps its inode; next exec uses the new file.
       fs.chmodSync(tmp, 0o755);
@@ -300,16 +423,29 @@ export async function upgradeCmd(remoteUrl: string, opts: { check?: boolean; dae
       const d = fs.openSync(dir, "r");
       fs.fsyncSync(d);
       fs.closeSync(d);
+      await opts.commandDeps?.afterExecutableRename?.();
     } catch (e) {
       await fsp.rm(tmp, { force: true }).catch(() => {});
       throw e;
     }
 
-    // 5. Record the highest verified version ONLY after a successful replace.
-    await recordVerifiedRelease(manifest.version);
+    // 5. Mark the pre-published rollback floor committed after durable replace.
+    await writeReleaseState(ctx, manifest.version, "committed");
     console.log(`upgraded ${RBOX_VERSION} → ${manifest.version}`);
-    await restartDaemonsAfterUpgrade(opts.daemonDeps);
+    if (ctx.elevated) {
+      console.log("run `rbox upgrade` once without sudo to restart user daemons on the new version");
+    } else {
+      await restartDaemonsAfterUpgrade(opts.daemonDeps);
+    }
+  } catch (error) {
+    primaryError = error;
+    throw error;
   } finally {
-    releaseLock();
+    const released = await releaseLock.release();
+    if (!released.released || !released.durable) {
+      const releaseError = new Error("upgrade finished without durably releasing its lock; retry after checking the install directory", { cause: released.error });
+      if (primaryError instanceof Error && primaryError.cause === undefined) primaryError.cause = releaseError;
+      else if (primaryError === undefined) throw releaseError;
+    }
   }
 }
