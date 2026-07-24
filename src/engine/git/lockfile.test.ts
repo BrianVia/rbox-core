@@ -18,6 +18,7 @@ import {
   lockStorageLocal,
   mergeHostIdentityBoots,
   parseDarwinMountOutput,
+  darwinProcessStartForTests,
   parseDarwinProcessStartListing,
   parseLockMarker,
   publishLockMarker,
@@ -34,6 +35,7 @@ import {
   type LockMarker,
   type MarkerObservation,
   type ProcessProbe,
+  type PsLstartRun,
   type ResolvedLockIdentity,
 } from "./lockfile.js";
 
@@ -883,9 +885,50 @@ describe("macOS 26 process-start source", () => {
   });
 
   test("an unusable ps listing is rejected rather than canonicalized into a wrong incarnation", () => {
-    for (const line of ["", "not a date", "Fri Jul 24 23:05 2026", "Fri Xyz 24 23:05:12 2026", "Fri Jul 32 23:05:12 2026", "Fri Jul 24 24:05:12 2026"]) {
-      expect(parseDarwinProcessStartListing(line)).toBeUndefined();
+    for (const line of [
+      "", "not a date", "Fri Jul 24 23:05 2026", "Fri Xyz 24 23:05:12 2026",
+      "Fri Jul 32 23:05:12 2026", "Fri Jul 24 24:05:12 2026", "Fri Jul 24 23:60:12 2026", "Fri Jul 24 23:05:60 2026",
+      // Impossible calendar dates: Date.UTC would roll these into the next month
+      // and hand back a plausible-looking, wrong incarnation.
+      "Sat Feb 31 12:00:00 2026", "Sun Feb 29 12:00:00 2026", "Tue Apr 31 12:00:00 2026", "Wed Jun 00 12:00:00 2026",
+    ]) {
+      expect(parseDarwinProcessStartListing(line), line).toBeUndefined();
     }
+    // A real leap day still parses.
+    expect(parseDarwinProcessStartListing("Fri Feb 29 12:00:00 2024")).toBe(String(Date.UTC(2024, 1, 29, 12, 0, 0) / 1000));
+  });
+
+
+
+  test("no ps failure against a live process is ever converted into proof of death", async () => {
+    // `pid` is this very process, so the kernel can always contradict a wrong
+    // absence claim. Every shape of failed run must stay indeterminate.
+    const ambiguous: Array<[string, PsLstartRun]> = [
+      ["timed out and killed, no output", { stdout: "", failed: true, incomplete: true }],
+      ["failed to spawn", { stdout: "", failed: true, incomplete: true }],
+      ["non-zero exit with no output", { stdout: "", failed: true, incomplete: false }],
+      ["non-zero exit with output", { stdout: "Fri Jul 24 23:05:12 2026\n", failed: true, incomplete: false }],
+      ["completed but unparsable", { stdout: "who knows\n", failed: false, incomplete: false }],
+    ];
+    for (const [label, run] of ambiguous) {
+      const failure = await darwinProcessStartForTests(process.pid, async () => run).then(() => undefined, (error: unknown) => error);
+      expect(failure, label).toBeInstanceOf(Error);
+      // ESRCH is the one code probeProcess accepts as death without asking the
+      // kernel a second time, so no ambiguous run may ever carry it.
+      expect((failure as NodeJS.ErrnoException).code, label).not.toBe("ESRCH");
+    }
+  });
+
+  test("an empty listing reports death only when the kernel confirms the process is gone", async () => {
+    const empty: PsLstartRun = { stdout: "", failed: true, incomplete: false };
+
+    // A pid the kernel confirms is gone: 0 is never a probeable process id here.
+    const gone = await darwinProcessStartForTests(2_147_483_646, async () => empty).then(() => undefined, (error: unknown) => error);
+    expect((gone as NodeJS.ErrnoException).code).toBe("ESRCH");
+
+    // The same empty listing against a live pid must NOT claim death.
+    const live = await darwinProcessStartForTests(process.pid, async () => empty).then(() => undefined, (error: unknown) => error);
+    expect((live as NodeJS.ErrnoException).code).not.toBe("ESRCH");
   });
 
   test("start-time readings compare at the coarser of their two resolutions", () => {

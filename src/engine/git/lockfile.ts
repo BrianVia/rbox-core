@@ -407,8 +407,47 @@ const PS_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep"
  * sysctl OID name. `TZ=UTC` makes the reading independent of the caller's zone
  * and removes the repeated-hour ambiguity a local-time rendering would carry, so
  * two reads of one process are byte-identical. */
-async function darwinPsProcessStart(pid: number): Promise<string> {
-  const run = await new Promise<{ stdout: string; failed: boolean; spawnError?: NodeJS.ErrnoException }>((resolve) => {
+async function darwinPsProcessStart(pid: number, run: PsRunner = runPsLstart): Promise<string> {
+  const listing = await run(pid);
+  // A run that never completed says nothing at all about the process. Only a
+  // completed run may even SUGGEST absence, and never on its own: `ps` also
+  // exits non-zero when it refuses the request, so the kernel has to corroborate
+  // through kill(pid, 0) before anything here reports a dead process. Getting
+  // this order wrong turns "the probe broke" into proof of death, which would
+  // authorize reaping a live owner's locks, fences, and journals.
+  if (listing.incomplete) throw new Error("process start listing did not complete");
+  const line = listing.stdout.trim();
+  if (!line) {
+    try {
+      process.kill(pid, 0);
+    } catch (killError) {
+      if (errno(killError) === "ESRCH") {
+        const error = new Error("process incarnation unavailable");
+        (error as NodeJS.ErrnoException).code = "ESRCH";
+        throw error;
+      }
+    }
+    // The listing named no process but the kernel will not confirm absence:
+    // indeterminate, which every caller reads as "leave it alone".
+    throw new Error("process start listing named no process");
+  }
+  if (listing.failed) throw new Error("process start listing failed");
+  const start = parseDarwinProcessStartListing(line);
+  if (start === undefined) throw new Error("unparsable process start listing");
+  return start;
+}
+
+/** A completed `ps` run reports `failed` for a non-zero exit; `incomplete` marks
+ * a run that never reached one — a failure to spawn, a timeout, or a signal. */
+export interface PsLstartRun {
+  stdout: string;
+  failed: boolean;
+  incomplete: boolean;
+}
+export type PsRunner = (pid: number) => Promise<PsLstartRun>;
+
+async function runPsLstart(pid: number): Promise<PsLstartRun> {
+  return await new Promise<PsLstartRun>((resolve) => {
     execFile("/bin/ps", ["-p", String(pid), "-o", "lstart="], {
       encoding: "utf8",
       maxBuffer: 4 * 1024,
@@ -416,26 +455,20 @@ async function darwinPsProcessStart(pid: number): Promise<string> {
       killSignal: "SIGKILL",
       env: { PATH: "/usr/bin:/bin", LC_ALL: "C", TZ: "UTC" },
     }, (error, stdout) => {
-      // A non-zero exit carries a numeric `code`; only a failure to run the
-      // command at all carries an errno string. The two must not be conflated:
-      // the first can still be a truthful "no such process".
-      const spawnError = error && typeof (error as NodeJS.ErrnoException).code === "string" ? error as NodeJS.ErrnoException : undefined;
-      resolve({ stdout, failed: !!error, ...(spawnError ? { spawnError } : {}) });
+      // A non-zero exit carries a numeric `code`; a failure to run the command
+      // at all carries an errno string, and a timeout carries `killed`/`signal`.
+      // Only the first ran to completion.
+      const failure = error as (NodeJS.ErrnoException & { killed?: boolean; signal?: string }) | null;
+      const incomplete = !!failure && (typeof failure.code === "string" || failure.killed === true || failure.signal != null);
+      resolve({ stdout, failed: !!error, incomplete });
     });
   });
-  if (run.spawnError) throw run.spawnError;
-  const line = run.stdout.trim();
-  if (!line) {
-    // ps prints nothing and exits non-zero when no process matches. That is a
-    // proven-absent process, exactly what an ESRCH sysctl read means.
-    const error = new Error("process incarnation unavailable");
-    (error as NodeJS.ErrnoException).code = "ESRCH";
-    throw error;
-  }
-  if (run.failed) throw new Error("process start listing failed");
-  const start = parseDarwinProcessStartListing(line);
-  if (start === undefined) throw new Error("unparsable process start listing");
-  return start;
+}
+
+/** Exported for adversarial platform tests: the `ps` reading must be able to
+ * fail in every ambiguous way without any of them becoming proof of death. */
+export async function darwinProcessStartForTests(pid: number, run: PsRunner): Promise<string> {
+  return await darwinPsProcessStart(pid, run);
 }
 
 /** Canonicalize one `TZ=UTC LC_ALL=C ps -o lstart=` line into whole epoch
@@ -446,13 +479,21 @@ export function parseDarwinProcessStartListing(line: string): string | undefined
   const match = PS_LSTART_RE.exec(line.trim());
   const month = match ? PS_MONTHS.indexOf(match[1]!) : -1;
   if (!match || month < 0) return undefined;
+  const year = Number(match[6]);
   const day = Number(match[2]);
   const hours = Number(match[3]);
   const minutes = Number(match[4]);
   const seconds = Number(match[5]);
-  if (day < 1 || day > 31 || hours > 23 || minutes > 59 || seconds > 60) return undefined;
-  const ms = Date.UTC(Number(match[6]), month, day, hours, minutes, seconds);
-  return Number.isFinite(ms) && ms >= 0 ? String(Math.floor(ms / 1000)) : undefined;
+  if (day < 1 || hours > 23 || minutes > 59 || seconds > 59) return undefined;
+  const ms = Date.UTC(year, month, day, hours, minutes, seconds);
+  if (!Number.isFinite(ms) || ms < 0) return undefined;
+  // Date.UTC silently rolls an impossible calendar date forward (Feb 31 becomes
+  // March 3), which would canonicalize a nonsense listing into a plausible-looking
+  // and WRONG incarnation. Round-trip the components instead of trusting them.
+  const round = new Date(ms);
+  if (round.getUTCFullYear() !== year || round.getUTCMonth() !== month || round.getUTCDate() !== day
+    || round.getUTCHours() !== hours || round.getUTCMinutes() !== minutes || round.getUTCSeconds() !== seconds) return undefined;
+  return String(Math.floor(ms / 1000));
 }
 
 async function darwinProcessStart(pid: number): Promise<string> {

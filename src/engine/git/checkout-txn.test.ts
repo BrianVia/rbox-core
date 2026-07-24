@@ -799,7 +799,7 @@ for (const [status, reason] of [
 }
 
 test("the post-HEAD transaction probes its own child and surfaces the same unreadable-incarnation reason", async () => {
-  const { journal } = await checkoutJournal("ref: refs/heads/side\n");
+  const { binding, journal } = await checkoutJournal("ref: refs/heads/side\n");
   await git(repo, "branch", "side", oldOid);
   let probes = 0;
   // The post-HEAD intent is recorded after the primary transaction has already
@@ -827,4 +827,13 @@ test("the post-HEAD transaction probes its own child and surfaces the same unrea
   expect(await git(repo, "symbolic-ref", "HEAD")).toBe("refs/heads/side");
   expect(await git(repo, "rev-parse", "refs/heads/main")).toBe(oldOid);
   expect((await fs.readdir(ctx.commonDir, { recursive: true })).filter((entry) => entry.toString().endsWith(".lock"))).toEqual([]);
+
+  // Leaving HEAD switched is only acceptable because the journal can finish the
+  // job. Prove that end to end rather than inferring it from lock cleanliness.
+  const recovery = await recoverJournal(root, "repo", binding);
+  expect(recovery.status).toBe("rolled-back");
+  expect(await git(repo, "symbolic-ref", "HEAD")).toBe("refs/heads/main");
+  expect(await git(repo, "rev-parse", "refs/heads/main")).toBe(oldOid);
+  expect(await fs.readFile(path.join(ctx.gitDir, "index"))).toEqual(oldIndex);
+  expect(await fs.readdir(path.join(root, ".rbox", "state", "git-journal"))).toEqual([]);
 });
