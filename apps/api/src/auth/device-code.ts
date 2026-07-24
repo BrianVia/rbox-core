@@ -321,7 +321,24 @@ export async function queueApprovedKeyDelivery(
     return json({ error: "pubkey_binding_mismatch" }, 409);
   }
   const accountEpoch = await currentAccountEpoch(env, approver.accountId);
-  if (accountEpoch === null) return json({ error: "key_delivery_unavailable" }, 409);
+  if (accountEpoch === null) {
+    // First device on an account whose encryption isn't set up yet (genesis
+    // hasn't run): there are no keys to deliver, so a key-consent approve
+    // gracefully DOWNGRADES to a plain device-auth sign-in instead of erroring
+    // "encryption isn't set up for this account yet". The CLI then guides the
+    // user to `rbox key genesis`. Mirrors the `disabled` branch below.
+    // (Papercut 2026-07-23: the web /cli-login page offers "send keys" whenever
+    // the URL carries a #fp, even for a first device on an unencrypted account.)
+    const approved = await dirDb(env)
+      .prepare(
+        `UPDATE device_auth SET status='approved',account_id=?,user_id=?
+         WHERE user_code=? AND status='pending' AND expires_at>?`,
+      )
+      .bind(approver.accountId, approver.userId, userCode, now)
+      .run();
+    if (approved.meta.changes !== 1) return json({ error: "no_pending_auth" }, 404);
+    return json({ ok: true, keyDelivery: null, encryptionAbsent: true });
+  }
   const queued = await queueKeyDelivery(env, {
     requestId: pending.request_id,
     userCode,
