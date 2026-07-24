@@ -15,7 +15,6 @@ import { canonicalString } from "../../engine/e2ee/index.js";
 import { enumerateRefReflogOids } from "../../engine/git/keep-pins.js";
 import { readAllRefs, readOpState } from "../../engine/git/refs.js";
 import { exists, getGitArtifact, git } from "../../engine/git/shared.js";
-import { graphEnv } from "../../engine/git/reachability.js";
 import { hashFile } from "../../engine/hash.js";
 import {
   expectedStateNonce,
@@ -26,6 +25,7 @@ import {
   type WorkspaceConfig,
 } from "../config.js";
 import { configReceiver, gitConfigHash, readLocalGitConfig } from "./config-lane.js";
+import { gitCommitAncestry } from "./git-ancestry.js";
 import { indexArtifact } from "./follow.js";
 import { gitIncomingKey, sectionOpState } from "./shared.js";
 
@@ -132,17 +132,8 @@ export async function resolutionBindingIdentity(args: {
 
 async function equalOrDescendant(repoDir: string, pendingOid: string, candidateOid: string): Promise<GitResolutionLaneDisposition> {
   try {
-    const [pendingCommit, candidateCommit] = await Promise.all([
-      git(repoDir, ["rev-parse", "--verify", `${pendingOid}^{commit}`], { env: graphEnv }),
-      git(repoDir, ["rev-parse", "--verify", `${candidateOid}^{commit}`], { env: graphEnv }),
-    ]);
-    if (pendingCommit === candidateCommit) return "subsumed";
-    try {
-      await git(repoDir, ["merge-base", "--is-ancestor", pendingCommit, candidateCommit], { env: graphEnv });
-      return "subsumed";
-    } catch (error) {
-      return (error as { code?: unknown }).code === 1 ? "not-subsumed" : "indeterminate";
-    }
+    const ancestry = await gitCommitAncestry(repoDir, pendingOid, candidateOid);
+    return ancestry === "not-ancestor" ? "not-subsumed" : "subsumed";
   } catch {
     return "indeterminate";
   }
