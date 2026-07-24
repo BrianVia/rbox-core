@@ -42,6 +42,29 @@ function exactEventBytes(size: number, id: string): Uint8Array {
   return bytes;
 }
 
+/** A D1 handle whose fair-use queue write always fails (a transient D1 error on that one
+ *  statement). Poisoned statements are tracked, so `batch()` fails as a UNIT — matching D1's
+ *  transactional batch, where a failing statement commits none of its siblings. */
+function failingFairUseDb(real: D1Database): D1Database {
+  const FAIL = "D1_ERROR: fairuse_account_queue write failed";
+  const poisoned = new WeakSet<object>();
+  const badStatement = (): D1PreparedStatement => {
+    const st = {
+      bind: () => st,
+      first: () => Promise.reject(new Error(FAIL)),
+      run: () => Promise.reject(new Error(FAIL)),
+      all: () => Promise.reject(new Error(FAIL)),
+      raw: () => Promise.reject(new Error(FAIL)),
+    } as unknown as D1PreparedStatement;
+    poisoned.add(st);
+    return st;
+  };
+  return {
+    prepare: (sql: string) => (sql.includes("fairuse_account_queue") ? badStatement() : real.prepare(sql)),
+    batch: (stmts: D1PreparedStatement[]) => (stmts.some((s) => poisoned.has(s)) ? Promise.reject(new Error(FAIL)) : real.batch(stmts)),
+  } as unknown as D1Database;
+}
+
 describe("Stripe bounded raw webhook", () => {
   test("validated environment cap defaults safely and accepts only positive decimal safe integers", () => {
     expect(stripeWebhookMaxBytes({})).toBe(CAP);
@@ -132,6 +155,38 @@ describe("Stripe bounded raw webhook", () => {
     expect(badResponse.status).toBe(400);
     expect(await badResponse.json()).toEqual({ error: "bad_signature" });
     await expect(stripeWebhook(request(malformed), handlerEnv(), NOW_MS, ctx)).rejects.toBeInstanceOf(SyntaxError);
+  });
+
+  // The `customer.subscription.deleted` downgrade and its fair-use requeue must land in ONE
+  // batch. If the requeue is a separate statement, its failure 500s the webhook AFTER the
+  // UPDATE committed — Stripe's redelivery then matches 0 rows (stripe_subscription_id is
+  // already NULL) and the requeue plus the churn ping are lost permanently.
+  test("subscription.deleted requeue failure leaves NO torn state (downgrade rolls back, redelivery repairs)", async () => {
+    const accountId = "acct_fairuse_torn";
+    await env.rbox_dev_db
+      .prepare("INSERT INTO accounts (id,name,plan,created_at,stripe_customer_id,stripe_subscription_id) VALUES (?,?,?,?,?,?)")
+      .bind(accountId, "torn", "pro", NOW_MS, "cus_torn", "sub_torn")
+      .run();
+    const bytes = encoder.encode(JSON.stringify({
+      id: "evt_fairuse_torn",
+      type: "customer.subscription.deleted",
+      data: { object: { id: "sub_torn", customer: "cus_torn", metadata: { account_id: accountId } } },
+    }));
+    const brokenEnv = { ...handlerEnv(), rbox_dev_db: failingFairUseDb(env.rbox_dev_db) } as Env;
+    await expect(stripeWebhook(request(bytes), brokenEnv, NOW_MS, ctx)).rejects.toThrow(/fairuse_account_queue/);
+
+    // Nothing may have committed: the row Stripe's redelivery matches on is untouched…
+    expect(await env.rbox_dev_db.prepare("SELECT plan, stripe_subscription_id FROM accounts WHERE id = ?").bind(accountId).first())
+      .toEqual({ plan: "pro", stripe_subscription_id: "sub_torn" });
+    // …and the event was never recorded as processed, so redelivery re-applies it.
+    expect(await env.rbox_dev_db.prepare("SELECT 1 FROM stripe_events WHERE id = 'evt_fairuse_torn'").first()).toBeNull();
+
+    const redelivered = await stripeWebhook(request(bytes), handlerEnv(), NOW_MS, ctx);
+    expect(redelivered.status).toBe(200);
+    expect(await env.rbox_dev_db.prepare("SELECT plan, stripe_subscription_id FROM accounts WHERE id = ?").bind(accountId).first())
+      .toEqual({ plan: "none", stripe_subscription_id: null });
+    expect(await env.rbox_dev_db.prepare("SELECT reason FROM fairuse_account_queue WHERE account_id = ?").bind(accountId).first())
+      .toEqual({ reason: "plan_changed" });
   });
 
   test("reader errors rethrow and never emit the overflow anomaly", async () => {

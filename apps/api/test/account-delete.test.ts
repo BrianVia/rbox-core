@@ -656,6 +656,10 @@ describe("design 180 repair-audit purge fencing", () => {
     expect((await deleteAccount(env, ownerPrincipal(a.accountId, a.ownerUserId, a.deviceId), delReq(a.accountId), now)).status).toBe(200);
     await expect(driveAccountDeletion(env, a.accountId, now + DELETION_GRACE_MS + 1, OK_DEPS)).rejects.toThrow(/repair audit reconciliation blocked/i);
     expect(await count("SELECT COUNT(*) AS n FROM account_keys WHERE account_id = ?", a.accountId)).toBe(1);
+    // The accounts DELETE carries the SAME surviving-audit guard as the ledger's 'done'
+    // UPDATE: without it the account row vanishes while the ledger stays 'purging' forever —
+    // a stuck row that re-throws on every daily tick and permanently burns a sweep slot.
+    expect(await count("SELECT COUNT(*) AS n FROM accounts WHERE id = ?", a.accountId)).toBe(1);
     expect(await db().prepare("SELECT status FROM account_deletions WHERE account_id=?").bind(a.accountId).first()).toEqual({ status: "purging" });
     expect(await db().prepare("SELECT account_id,scrubbed_at,scrubbed_evidence_sha256 FROM genesis_repair_audit WHERE audit_id=?").bind(auditId).first()).toEqual({ account_id: a.accountId, scrubbed_at: null, scrubbed_evidence_sha256: null });
   });

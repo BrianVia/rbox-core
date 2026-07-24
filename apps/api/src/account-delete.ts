@@ -418,8 +418,10 @@ export async function finishD1(env: Env, accountId: string, clerkIds: string[], 
     data.prepare("DELETE FROM uploads WHERE account_id = ?").bind(a),
     data.prepare("DELETE FROM workspaces WHERE account_id = ?").bind(a),
     data.prepare("DELETE FROM diagnostics_reports WHERE account_id = ?").bind(a),
-    // The account row LAST, then close the ledger. (data)
-    data.prepare("DELETE FROM accounts WHERE id = ?").bind(a),
+    // The account row LAST, then close the ledger. (data) Both carry the SAME surviving-audit
+    // guard so they commit or skip TOGETHER: deleting the account while repair evidence
+    // survives would strand the ledger at 'purging' forever (unbounded stuck sweep slot).
+    data.prepare("DELETE FROM accounts WHERE id = ? AND NOT EXISTS (SELECT 1 FROM genesis_repair_audit WHERE account_id = ?)").bind(a, a),
     data.prepare(`UPDATE account_deletions SET status='done',last_attempt_at=? WHERE account_id=?
       AND NOT EXISTS (SELECT 1 FROM genesis_repair_audit WHERE account_id=?)`).bind(nowMs,a,a),
   ];

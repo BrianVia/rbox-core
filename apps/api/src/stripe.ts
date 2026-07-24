@@ -322,17 +322,22 @@ async function applyStripeEvent(env: Env, event: { type: string; data: { object:
         // §32 FLAG: this resolves the account by stripe_customer_id (a shard column under the
         // placement-constraint model) with NO account id in scope. Account-less at N=1 (one
         // shard); a sharded world needs a (stripe_customer_id → shard) directory index.
-        const del = await dbFor(env, "")
-          .prepare(`UPDATE accounts SET plan = 'none', billing_interval = NULL, extra_storage_bytes = 0, stripe_subscription_id = NULL, grace_until = ${graceCase()} WHERE stripe_customer_id = ? AND stripe_subscription_id = ?`)
-          .bind(nowMs, nowMs + GRACE_PERIOD_MS, obj.customer, obj.id)
-          .run();
-        if ((del.meta.changes ?? 0) > 0 && obj.metadata?.account_id) {
-          await fairUseQueueStatement(dbFor(env, obj.metadata.account_id), obj.metadata.account_id, nowMs, "plan_changed").run();
-        }
+        // ONE route for both statements: the requeue must be in the SAME atomic batch as its
+        // UPDATE (a standalone follow-up throw 500s the webhook, and the redelivery finds
+        // stripe_subscription_id already NULL → 0 rows → the requeue is lost forever), and a
+        // batch is one transaction on one handle. The account here is only resolvable by
+        // stripe_customer_id, so both ride the flagged account-less route — the requeued row
+        // belongs to the account the UPDATE matched, i.e. the same shard by construction.
+        const db = dbFor(env, "");
+        const [del] = await db.batch([
+          db.prepare(`UPDATE accounts SET plan = 'none', billing_interval = NULL, extra_storage_bytes = 0, stripe_subscription_id = NULL, grace_until = ${graceCase()} WHERE stripe_customer_id = ? AND stripe_subscription_id = ?`)
+            .bind(nowMs, nowMs + GRACE_PERIOD_MS, obj.customer, obj.id),
+          ...(obj.metadata?.account_id ? [fairUseQueueStatement(db, obj.metadata.account_id, nowMs, "plan_changed")] : []),
+        ]);
         // §32 Tier 1 churn ping (best-effort) — only when this delete actually
         // downgraded an account; a stale/duplicate delete that matches no live row
         // (changes == 0) must not emit a FALSE churn alert.
-        if ((del.meta.changes ?? 0) > 0) pingChurn(ctx, env, { accountId: obj.metadata?.account_id ?? null });
+        if ((del?.meta.changes ?? 0) > 0) pingChurn(ctx, env, { accountId: obj.metadata?.account_id ?? null });
       }
       break;
     }

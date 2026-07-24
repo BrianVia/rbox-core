@@ -998,6 +998,27 @@ describe("worker integration (real DO + D1 + R2)", () => {
     expect((await SELF.fetch(`${BASE}/v1/keys/workspace`, { method: "POST", headers: authed(b.token, { "content-type": "application/json" }), body: JSON.stringify({ workspaceId: ws, keyEpoch: 0, kekWrap: "evil" }) })).status).toBe(404);
   });
 
+  // The KEK-wrap publish is a WORKSPACE WRITE, so it carries the same role gate as every
+  // other one (authz.ts authorizeWorkspace: cross-account 404 first, then 403 for a viewer).
+  // Without it a viewer could win the first-writer-wins CAS and wedge an unpublished epoch.
+  test("workspace key publish is role-gated: viewer → 403 (reads still allowed)", async () => {
+    const a = await bootstrap("acct-wskey-viewer");
+    await keysBootstrap(a.token, a.deviceId);
+    const ws = ((await (await SELF.fetch(`${BASE}/v1/workspaces?project=root`, { method: "POST", headers: authed(a.token) })).json()) as { workspaceId: string }).workspaceId;
+    const viewerUser = "user_wskey_viewer";
+    await env.rbox_dev_db.prepare("INSERT INTO memberships (account_id, user_id, role) VALUES (?, ?, 'viewer')").bind(a.accountId, viewerUser).run();
+    const viewer = (await mintDevice(env, a.accountId, viewerUser, "dev", "viewer")).token;
+
+    const put = await SELF.fetch(`${BASE}/v1/keys/workspace`, { method: "POST", headers: authed(viewer, { "content-type": "application/json" }), body: JSON.stringify({ workspaceId: ws, keyEpoch: 0, kekWrap: "viewer-kek" }) });
+    expect(put.status).toBe(403);
+    // Nothing was published — the epoch is still free for a real writer.
+    expect(await env.rbox_dev_db.prepare("SELECT COUNT(*) AS n FROM workspace_keys WHERE workspace_id = ?").bind(ws).first<{ n: number }>()).toEqual({ n: 0 });
+    // The viewer keeps READ access (getWorkspaceKeys is a read: account-scoped, no role gate).
+    expect((await SELF.fetch(`${BASE}/v1/keys/workspace/${ws}`, { headers: authed(viewer) })).status).toBe(200);
+    // And an owner still publishes normally.
+    expect((await SELF.fetch(`${BASE}/v1/keys/workspace`, { method: "POST", headers: authed(a.token, { "content-type": "application/json" }), body: JSON.stringify({ workspaceId: ws, keyEpoch: 0, kekWrap: "owner-kek" }) })).status).toBe(200);
+  });
+
   // C3: putWorkspaceKey is an immutable CAS — the FIRST wrap wins and a later
   // caller with a DIFFERENT wrap gets the first one back (adopts it, never an UPDATE).
   test("workspace key CAS: second writer with a different wrap gets the FIRST wrap back", async () => {
