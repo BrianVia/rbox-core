@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { ALIAS_COMMANDS } from "./command-catalog.js";
 import { parseFlags, unknownFlagError } from "./flags.js";
 import { COMMAND_HELP, helpFor } from "./help-registry.js";
 
@@ -65,6 +66,16 @@ test("flags a command accepts but does not document keep their registry-wide ari
   });
 });
 
+test("a deprecated alias parses its target's flags at the target's arity", () => {
+  // `link` forwards the SAME argv to `track` (deprecations.ts) but declares no flags of
+  // its own, so resolving arity from the alias entry alone left `--git` on the colliding
+  // fallback (valueless): `rbox link --git false <path>` lost the path AND inverted --git.
+  expect(parseFlags(["--git", "false", "/desired/project"], "link")).toEqual({
+    positional: ["/desired/project"],
+    flags: { git: "false" },
+  });
+});
+
 test("an unresolvable command falls back to the union, valueless for names that collide", () => {
   expect(parseFlags(["--limit", "25"], "frobnicate")).toEqual({ positional: [], flags: { limit: "25" } });
   expect(parseFlags(["--git", "/home/dev/app"], "frobnicate")).toEqual({ positional: ["/home/dev/app"], flags: { git: "true" } });
@@ -85,6 +96,9 @@ function declaredFlags(command: { name: string; flags?: { flag: string }[] }): {
 }
 
 const arityWord = (takesValue: boolean) => (takesValue ? "WITH a value" : "WITHOUT a value");
+
+/** Deprecated alias → the command path it forwards the same argv to (`link` → `track`). */
+const ALIAS_TARGETS = new Map(ALIAS_COMMANDS.map((name) => [name, COMMAND_HELP.find((c) => c.name === name)!.alias!]));
 
 test("registry guard: one resolved help key never declares a flag name at two arities", () => {
   // `parseFlags` resolves a command to `helpFor(cmd)`, which for a group token unions
@@ -120,6 +134,8 @@ test("registry guard: flag names that collide ACROSS commands are resolved per c
     }
   }
   const colliding = [...byFlag].filter(([, decls]) => new Set(decls.map((d) => d.takesValue)).size > 1);
+  // Alias arity is resolved in ONE hop, so no alias may forward to another alias.
+  for (const target of ALIAS_TARGETS.values()) expect(ALIAS_TARGETS.has(target.split(" ")[0]!)).toBe(false);
 
   expect(colliding.map(([name, decls]) => `--${name}: ${decls.map((d) => `${d.command} ${arityWord(d.takesValue)}`).join("; ")}`).sort()).toEqual([
     "--git: status WITHOUT a value; init WITH a value; track WITH a value",
@@ -134,6 +150,18 @@ test("registry guard: flag names that collide ACROSS commands are resolved per c
           ? { command, positional: [], flags: { [name]: "NEXT" } }
           : { command, positional: ["NEXT"], flags: { [name]: "true" } },
       );
+    }
+    // A deprecated alias declares no flags of its own but forwards the SAME argv to its
+    // target, so it must parse a colliding name at the TARGET's arity — never at the
+    // unattributable fallback arity below (the `rbox link --git false <path>` defect).
+    for (const [alias, target] of ALIAS_TARGETS) {
+      const declared = decls.find((d) => d.command === target.split(" ")[0]);
+      if (!declared) continue;
+      expect({ alias, name, ...parseFlags([`--${name}`, "NEXT"], alias) }).toEqual({
+        alias,
+        name,
+        ...parseFlags([`--${name}`, "NEXT"], declared.command),
+      });
     }
     // Unattributable (no resolvable command): never swallow the following argument.
     expect({ name, ...parseFlags([`--${name}`, "NEXT"]) }).toEqual({ name, positional: ["NEXT"], flags: { [name]: "true" } });

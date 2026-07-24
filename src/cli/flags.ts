@@ -1,4 +1,4 @@
-import { COMMAND_HELP, helpFor, helpKeyFor } from "./help-registry.js";
+import { COMMAND_HELP, helpFor, helpKeyFor, resolveCommandAlias } from "./help-registry.js";
 
 const SHORT_FLAGS: Record<string, { key: string; takesValue?: true }> = {
   "-f": { key: "follow" },
@@ -47,9 +47,12 @@ const FALLBACK_LONG_FLAG_ARITY = ((): Map<string, boolean> => {
  * --no-interactive`) parsing exactly as the registry-wide union always did.
  * `helpFor` unions a group's sub-verbs, which is unambiguous only because no single
  * help key declares one name at two arities — enforced by a guard in `flags.test.ts`.
+ * A deprecated alias is resolved to its target first: the dispatcher rewrites `link` to
+ * `track` only AFTER parsing, so without that hop `rbox link --git false <path>` parsed
+ * against the alias's empty declarations and lost the path.
  */
 function longFlagArityFor(cmd: string | undefined): Map<string, boolean> {
-  const entries = cmd ? helpFor(cmd) : undefined;
+  const entries = cmd ? helpFor(resolveCommandAlias(cmd)) : undefined;
   if (!entries) return FALLBACK_LONG_FLAG_ARITY;
   const arity = new Map(FALLBACK_LONG_FLAG_ARITY);
   for (const entry of entries) {

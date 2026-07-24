@@ -613,6 +613,17 @@ export function helpFor(commandPath: string): CommandHelp[] | undefined {
   return subs.length ? subs : undefined;
 }
 
+/**
+ * Resolve a deprecated alias entry (`link`, `daemon`) to the command path it forwards to.
+ * An alias runs the target's exact operation on the same argv (`deprecations.ts`) but
+ * declares no flags of its own, so anything reading a command's flag DECLARATIONS — the
+ * parser's per-command arity — must read the target's. Help rendering deliberately does
+ * NOT resolve: `rbox link --help` shows the alias entry and its "deprecated → …" line.
+ */
+export function resolveCommandAlias(commandPath: string): string {
+  return byName.get(commandPath)?.alias ?? commandPath;
+}
+
 /** Render one command's detailed help block. */
 export function renderCommand(c: CommandHelp): string {
   const lines: string[] = [];
