@@ -81,6 +81,9 @@ interface DaemonInternals {
   wsKeepaliveTimer?: ReturnType<typeof setInterval>;
   wsGeneration: number;
   pendingCatchUpGeneration?: number;
+  notifyPullPendingAt?: number;
+  outOfStorageProbeArmed: boolean;
+  watcherErrorGeneration: number;
   ownershipWindDownStarted: boolean;
   cache: HashCache;
   manifest: Manifest;
@@ -102,6 +105,10 @@ interface DaemonInternals {
   deferralDiscoveryEpoch: number;
   deferralDiscoveryAuthority?: { epoch: number; discoveredRepos: ReadonlySet<string> };
   doFullScan(): Promise<{ coverage: "full-tree" | "pruned"; errorGenAtStart: number }>;
+  doDeepScan(): Promise<{ coverage: "full-tree" | "pruned"; errorGenAtStart: number }>;
+  doPull(...args: unknown[]): Promise<void>;
+  observeNotifyLatency(latencyMs: number): void;
+  maybeClearWatcherUnsettledAfterOp(op: string, opWatcherGeneration: number): void;
   replaceManifestFromScan(cache: HashCache, previous: Manifest, stats: undefined, kind: undefined, mode: "unpruned"): Promise<unknown>;
   onTransferProgress(done: number, total: number, phase: TransferPhase, detailOrBytes?: string | TransferProgressBytes, bytes?: TransferProgressBytes): void;
   lastProgressWrite: number;
@@ -1991,4 +1998,159 @@ test("transfer-progress throttle: byte-only ticks use the existing write cadence
   expect(persisted).toMatchObject({ phase: "upload", done: 1, total: 2, bytesDone: 10, bytesTotal: 40, bytesPerSecond: 5_000_000, etaSeconds: 6 });
   expect(persisted!.bytesDone!).toBeLessThanOrEqual(persisted!.bytesTotal!);
   expect(renderShellLine({ at: "", active: persisted }, { settled: false, name: "ws", now: Date.now() }).split(" ")[3]).toBe("25");
+});
+
+// ── executeOp extraction: characterization + ruled-behavior pins ──────────────
+// The recovery probe (runRecoveryProbe) re-implements the pump's op bodies. These
+// pin the shared contract before/through the extraction into a private executeOp:
+// #1 catch-up-generation restore-on-failure (both callers), #2 single notify-latency
+// recording per notify, and the founder-ruled divergences D1–D3 (recovery ops must
+// behave like ordinary ops for scan-degraded clear, out-of-storage arming, and
+// notify-latency bookkeeping). D4 pins the ONE deliberate exclusion that survives.
+// Spec: docs/design/notes/2026-07-24-recovery-probe-divergences.md (RULED).
+
+test("executeOp #1a: a failed ORDINARY pump pull restores pendingCatchUpGeneration", async () => {
+  const daemon = await makeDaemon(new MiniRemote());
+  daemon.doPull = async () => { throw new Error("ordinary pull boom"); };
+  daemon.pendingCatchUpGeneration = 7;
+  daemon.want.pull = true;
+
+  await daemon.pump();
+
+  // The pump clears the generation before doPull and must restore it when the pull
+  // throws, so a later healing pull can still mark the socket caught up.
+  expect(daemon.pendingCatchUpGeneration).toBe(7);
+});
+
+test("executeOp #1b: a failed RECOVERY-probe pull restores pendingCatchUpGeneration", async () => {
+  const daemon = await makeDaemon(new MiniRemote());
+  daemon.doPull = async () => { throw new Error("recovery pull boom"); };
+  daemon.pendingCatchUpGeneration = 9;
+  daemon.activity.halt = { at: iso(10), reason: "pull failed", count: 1, op: "pull" };
+  daemon.recoveryDue = true;
+
+  await daemon.pump();
+
+  expect(daemon.pendingCatchUpGeneration).toBe(9);
+});
+
+test("executeOp #2: one notify yields exactly one observeNotifyLatency across the servicing pull", async () => {
+  const daemon = await makeDaemon(new MiniRemote(), "boot-test", { now: () => TEST_NOW });
+  const records: number[] = [];
+  const realObserve = daemon.observeNotifyLatency.bind(daemon);
+  daemon.observeNotifyLatency = (ms) => { records.push(ms); realObserve(ms); };
+  daemon.doPull = async () => {}; // successful no-op pull
+
+  daemon.notifyPullPendingAt = TEST_NOW - 250;
+  daemon.want.pull = true;
+  await daemon.pump();
+
+  // Recorded exactly once, at dequeue, and the pending timestamp is consumed.
+  expect(records).toEqual([250]);
+  expect(daemon.notifyPullPendingAt).toBeUndefined();
+});
+
+test("executeOp D1a: a successful recovery-probe fullScan clears watcher-degraded like an ordinary scan", async () => {
+  await withIsolatedDaemonHome(async () => {
+    const daemon = await makeDaemon(new MiniRemote());
+    const errors = captureWatcherErrors(daemon);
+    await writeOwnedDaemonPid();
+
+    try {
+      await daemon.startLiveWatch();
+      errors.fire(new Error("Events were dropped by the FSEvents client"));
+      await daemon.activityWrite;
+      expect(daemon.watcherDegraded).toBe(true);
+
+      // A fullScan halt drives the recovery probe (the halt masks want.fullScan, so
+      // the ONLY scan this pump runs is the recovery scan).
+      daemon.activity.halt = { at: iso(10), reason: "scan failed", count: 1, op: "fullScan" };
+      daemon.recoveryDue = true;
+      await daemon.pump();
+      await daemon.activityWrite;
+
+      expect(daemon.watcherDegraded).toBe(false);
+      expect(daemon.activity.halt).toBeUndefined();
+    } finally {
+      await closeWatcherTimers(daemon);
+    }
+  });
+});
+
+test("executeOp D1b: a successful recovery-probe deepScan clears watcher-degraded like an ordinary scan", async () => {
+  await withIsolatedDaemonHome(async () => {
+    const daemon = await makeDaemon(new MiniRemote());
+    const errors = captureWatcherErrors(daemon);
+    await writeOwnedDaemonPid();
+
+    try {
+      await daemon.startLiveWatch();
+      errors.fire(new Error("Events were dropped by the FSEvents client"));
+      await daemon.activityWrite;
+      expect(daemon.watcherDegraded).toBe(true);
+
+      daemon.activity.halt = { at: iso(10), reason: "scan failed", count: 1, op: "deepScan" };
+      daemon.recoveryDue = true;
+      await daemon.pump();
+      await daemon.activityWrite;
+
+      expect(daemon.watcherDegraded).toBe(false);
+      expect(daemon.activity.halt).toBeUndefined();
+    } finally {
+      await closeWatcherTimers(daemon);
+    }
+  });
+});
+
+test("executeOp D2: a recovery-probe fullScan arms outOfStorageProbeArmed when out of storage", async () => {
+  // Pull-only so the scan's requestPush("scan") is a no-op — no follow-up push runs
+  // to consume the armed flag, so the arming survives to the assertion.
+  const daemon = await makeDaemon(new MiniRemote(), "boot-test", { pullOnly: true });
+  daemon.activity.outOfStorage = { at: iso(5), kind: "storage", used: 1, cap: 1 };
+  daemon.activity.halt = { at: iso(10), reason: "scan failed", count: 1, op: "fullScan" };
+  daemon.recoveryDue = true;
+  expect(daemon.outOfStorageProbeArmed).toBe(false);
+
+  await daemon.pump();
+
+  expect(daemon.outOfStorageProbeArmed).toBe(true);
+});
+
+test("executeOp D3: a recovery-probe pull records notify latency and does not inflate the next ordinary pull", async () => {
+  let logicalNow = TEST_NOW;
+  const daemon = await makeDaemon(new MiniRemote(), "boot-test", { now: () => logicalNow });
+  const records: number[] = [];
+  const realObserve = daemon.observeNotifyLatency.bind(daemon);
+  daemon.observeNotifyLatency = (ms) => { records.push(ms); realObserve(ms); };
+  daemon.doPull = async () => {}; // successful no-op pull
+
+  daemon.notifyPullPendingAt = TEST_NOW - 300;
+  daemon.activity.halt = { at: iso(10), reason: "pull failed", count: 1, op: "pull" };
+  daemon.recoveryDue = true;
+  await daemon.pump();
+
+  // The recovery pull consumes + records the notify latency itself…
+  expect(records).toEqual([300]);
+  expect(daemon.notifyPullPendingAt).toBeUndefined();
+
+  // …so a much later ordinary pull sees NO surviving halt-era timestamp and does
+  // not record a halt-inflated (~10min) latency.
+  logicalNow = TEST_NOW + 10 * 60_000;
+  daemon.want.pull = true;
+  await daemon.pump();
+  expect(records).toEqual([300]);
+});
+
+test("executeOp D4: recovery-probe ops do NOT invoke maybeClearWatcherUnsettledAfterOp (deliberate exclusion)", async () => {
+  const daemon = await makeDaemon(new MiniRemote());
+  const calls: string[] = [];
+  daemon.maybeClearWatcherUnsettledAfterOp = (op) => { calls.push(op); };
+  daemon.doPull = async () => {};
+  daemon.activity.halt = { at: iso(10), reason: "pull failed", count: 1, op: "pull" };
+  daemon.recoveryDue = true;
+
+  await daemon.pump();
+
+  // Recovery ops run outside the watcher-generation bracketing the guard assumes.
+  expect(calls).toEqual([]);
 });

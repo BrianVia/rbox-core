@@ -1522,7 +1522,62 @@ export class RboxDaemon {
     return git.count > 0 ? "some" : git.indeterminate ? "indeterminate" : "none";
   }
 
-  private async runRecoveryProbe(syncMutex: WorkspaceSyncMutex, halt: NonNullable<DaemonActivity["halt"]>): Promise<void> {
+  /** The op bodies the pump and the recovery probe run IDENTICALLY: pull (notify-latency
+   *  bookkeeping + catch-up-generation protocol + publishable-divergence re-push) and the
+   *  fullScan/deepScan bodies (scan → deferral hygiene → watcher-degraded clear →
+   *  out-of-storage arming for fullScan → requestPush). Push is deliberately NOT here — the
+   *  pump's push branch carries two pump-only concerns the recovery push lacks (the
+   *  quota-probe/applyPendingWatchEvents suppression, and the `pushedToRemote` signal the
+   *  pump's out-of-storage settle consumes afterward), so each caller keeps its own push
+   *  dispatch rather than forcing an asymmetric branch through here.
+   *
+   *  `recovery` records which caller this is (design note 2026-07-24 D4): recovery ops run
+   *  outside the watcher-unsettled generation bracketing, so `maybeClearWatcherUnsettledAfterOp`
+   *  stays with the pump's guarded call and is never invoked for a recovery op. */
+  private async executeOp(
+    op: "pull" | "fullScan" | "deepScan",
+    syncMutex: WorkspaceSyncMutex,
+    opts: { recovery: boolean; opWatcherErrorGeneration: number; carrier: Carrier },
+  ): Promise<void> {
+    if (op === "pull") {
+      const notifyPendingAt = this.notifyPullPendingAt;
+      const notifyLatencyMs = notifyPendingAt !== undefined
+        ? Math.min(TELEMETRY_SAMPLE_SCHEMAS.ws_health.numbers.notifyLatencyMaxMs.max, Math.max(0, Math.floor(this.now() - notifyPendingAt)))
+        : undefined;
+      this.notifyPullPendingAt = undefined;
+      // §6: the standalone metric event fires at dequeue — measured latency is recorded
+      // even if the pull below fails (the pull-line token then simply never prints).
+      if (notifyLatencyMs !== undefined) {
+        this.observeNotifyLatency(notifyLatencyMs);
+        this.log(`notify_latency_ms=${notifyLatencyMs}`);
+      }
+      const catchUpGeneration = this.pendingCatchUpGeneration;
+      this.pendingCatchUpGeneration = undefined;
+      try {
+        await this.doPull(syncMutex, notifyLatencyMs, notifyPendingAt, opts.carrier);
+      } catch (e) {
+        // A failed catch-up pull must not orphan its generation: restore it so the eventual
+        // healing pull (backstop / next frame) can still mark the socket caught up.
+        // markWsCaughtUp discards stale generations, so restoring a superseded one is harmless.
+        if (catchUpGeneration !== undefined) this.pendingCatchUpGeneration ??= catchUpGeneration;
+        throw e;
+      }
+      if (catchUpGeneration !== undefined) this.markWsCaughtUp(catchUpGeneration);
+      if (await this.hasPublishableLocalDivergence() !== "none") this.requestPush("other");
+      return;
+    }
+    const cov = op === "fullScan" ? await this.doFullScan() : await this.doDeepScan();
+    await this.runDeferralHygiene();
+    this.maybeClearWatcherDegradedAfterScan(opts.opWatcherErrorGeneration, cov);
+    if (op === "fullScan" && this.activity.outOfStorage) this.outOfStorageProbeArmed = true;
+    this.requestPush("scan");
+  }
+
+  private async runRecoveryProbe(
+    syncMutex: WorkspaceSyncMutex,
+    halt: NonNullable<DaemonActivity["halt"]>,
+    opWatcherErrorGeneration: number,
+  ): Promise<void> {
     if (halt.typedReason?.kind === "push-conflict" || (halt.op === "push" && !halt.typedReason && !halt.terminal)) {
       let publishable: "none" | "some" | "indeterminate";
       try {
@@ -1541,26 +1596,9 @@ export class RboxDaemon {
       return;
     }
     if (halt.op === "pull") {
-      const catchUpGeneration = this.pendingCatchUpGeneration;
-      this.pendingCatchUpGeneration = undefined;
-      try {
-        await this.doPull(syncMutex, undefined, undefined, this.takeQueuedCarrier());
-      } catch (error) {
-        if (catchUpGeneration !== undefined) this.pendingCatchUpGeneration ??= catchUpGeneration;
-        throw error;
-      }
-      if (catchUpGeneration !== undefined) this.markWsCaughtUp(catchUpGeneration);
-      if (await this.hasPublishableLocalDivergence() !== "none") this.requestPush("other");
+      await this.executeOp("pull", syncMutex, { recovery: true, opWatcherErrorGeneration, carrier: this.takeQueuedCarrier() });
     } else if (halt.op === "push") await this.doPush(syncMutex, this.takePushProvenance());
-    else if (halt.op === "fullScan") {
-      await this.doFullScan();
-      await this.runDeferralHygiene();
-      this.requestPush("scan");
-    } else {
-      await this.doDeepScan();
-      await this.runDeferralHygiene();
-      this.requestPush("scan");
-    }
+    else await this.executeOp(halt.op, syncMutex, { recovery: true, opWatcherErrorGeneration, carrier: "none" });
     if (this.pushTerminalBlocked) throw new RecoveryConditionPersistsError(this.activity.halt ?? halt);
     this.clearRecoveryHalt();
   }
@@ -1630,44 +1668,8 @@ export class RboxDaemon {
             this.appliedPendingEventsInOp = false;
             try {
               if (op === "recoveryProbe") {
-                await this.runRecoveryProbe(syncMutex, recoveryHalt!);
-              } else if (op === "deepScan") {
-                const cov = await this.doDeepScan();
-                await this.runDeferralHygiene();
-                this.maybeClearWatcherDegradedAfterScan(opWatcherErrorGeneration, cov);
-                this.requestPush("scan");
-              } else if (op === "fullScan") {
-                const cov = await this.doFullScan();
-                await this.runDeferralHygiene();
-                this.maybeClearWatcherDegradedAfterScan(opWatcherErrorGeneration, cov);
-                if (this.activity.outOfStorage) this.outOfStorageProbeArmed = true;
-                this.requestPush("scan");
-              } else if (op === "pull") {
-                const notifyPendingAt = this.notifyPullPendingAt;
-                const notifyLatencyMs = notifyPendingAt !== undefined
-                  ? Math.min(TELEMETRY_SAMPLE_SCHEMAS.ws_health.numbers.notifyLatencyMaxMs.max, Math.max(0, Math.floor(this.now() - notifyPendingAt)))
-                  : undefined;
-                this.notifyPullPendingAt = undefined;
-                // §6: the standalone metric event fires at dequeue — measured latency is recorded
-                // even if the pull below fails (the pull-line token then simply never prints).
-                if (notifyLatencyMs !== undefined) {
-                  this.observeNotifyLatency(notifyLatencyMs);
-                  this.log(`notify_latency_ms=${notifyLatencyMs}`);
-                }
-                const catchUpGeneration = this.pendingCatchUpGeneration;
-                this.pendingCatchUpGeneration = undefined;
-                try {
-                  await this.doPull(syncMutex, notifyLatencyMs, notifyPendingAt, activeCarrier);
-                } catch (e) {
-                  // A failed catch-up pull must not orphan its generation: restore it so the eventual
-                  // healing pull (backstop / next frame) can still mark the socket caught up.
-                  // markWsCaughtUp discards stale generations, so restoring a superseded one is harmless.
-                  if (catchUpGeneration !== undefined) this.pendingCatchUpGeneration ??= catchUpGeneration;
-                  throw e;
-                }
-                if (catchUpGeneration !== undefined) this.markWsCaughtUp(catchUpGeneration);
-                if (await this.hasPublishableLocalDivergence() !== "none") this.requestPush("other");
-              } else {
+                await this.runRecoveryProbe(syncMutex, recoveryHalt!, opWatcherErrorGeneration);
+              } else if (op === "push") {
                 const quotaProbe = this.activity.outOfStorage !== undefined && this.outOfStorageProbeArmed;
                 this.outOfStorageProbeArmed = false;
                 if (this.activity.outOfStorage && !quotaProbe) {
@@ -1676,7 +1678,12 @@ export class RboxDaemon {
                   await this.doPush(syncMutex, pushProvenance!);
                   pushedToRemote = true;
                 }
+              } else {
+                await this.executeOp(op, syncMutex, { recovery: false, opWatcherErrorGeneration, carrier: activeCarrier });
               }
+              // D4 (design note 2026-07-24): the exclusion is deliberate — a recovery op runs
+              // outside the watcher-unsettled generation bracketing this guard's generation
+              // argument assumes, so it must never clear the unsettled surface here.
               if (op !== "recoveryProbe") this.maybeClearWatcherUnsettledAfterOp(op, opWatcherGeneration);
               if (this.syncBase) this.syncStateReporter.afterSyncTick(this.syncBase);
             } finally {
