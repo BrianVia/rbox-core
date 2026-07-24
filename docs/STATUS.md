@@ -47,8 +47,22 @@ roadmap (risk-ordered): key-delivery-fulfill (bake first), setup-cmd (couple
 to 197 impl), daemon.ts WS-subsystem-only, then apply/follow/push behind
 characterization harnesses. Telemetry read: Mac ws_e4abbfc6 (110 repos,
 2 deferrals ~24h) is single-handedly the 8-min pull p50 in client sync-phase
-— founder resolve pending; gc pipeline degraded (0 B purged 24h). NEXT:
-implement 197, or the 193 live smoke suite._
+— founder resolve pending; gc pipeline degraded (0 B purged 24h). Night:
+**8-reviewer thermo-nuclear sweep** → ranked roadmap at
+docs/design/notes/2026-07-24-thermo-nuclear-sweep.md (~40 verified findings,
+4 tiers, ~15 cleared-with-reasons; WS-extraction seam pinned for the
+daemon.ts cycle). Quick batch SHIPPED same night: **#424** (dead `heals`
+scaffolding), **#425** (canonical GIT_DEFERRAL_REASONS tuple + adopt
+emitJson + doctor preview dedupe), **#426** (auth-wire fetches now
+deadline-bounded — closed an unbounded-hang class on the pre-enrollment
+login path — + dead pairCreate lane deleted). CORRECTION folded into the
+roadmap: the journal.ts v1.7.24 legacy-recovery delete is gated on fleet
+adoption past 1.7.24 (Jethro still ON 1.7.24), not on a sweep.
+**AWAITING FOUNDER: D1-D4 rulings** in
+docs/design/notes/2026-07-24-recovery-probe-divergences.md (recovery-probe
+vs pump divergences; D3 corrupts notify-latency telemetry today) — then the
+executeOp extraction runs as a characterization-tested mini-cycle. NEXT:
+implement 197, the 193 live smoke suite, or Tier 2 of the sweep roadmap._
 
 _Previous: 2026-07-24 (**189 SHIPPED — v1.9.0 released + promoted to prod;
 validated end-to-end on two real machines**). Design 189 (web-approved pairing)
