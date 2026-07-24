@@ -70,6 +70,7 @@ import { classifyEnrollment, genesisClassifierConsultationNeeded, inspectPending
 import { genesisQuarantineStatus, resumeGenesisQuarantine, startGenesisQuarantine } from "./genesis-quarantine.js";
 import { e2eeRoot } from "./genesis-durable.js";
 import { GenesisBootstrapTerminalError } from "./remote/errors.js";
+import { fetchWithDeadline } from "./remote/resilient.js";
 
 const ACCOUNT_ID_RE = /^acct_[0-9a-f]{16}$/; // strict grammar before path/lock naming
 const ADMIT_RETRIES = 4;
@@ -582,7 +583,7 @@ async function admitWithRetry(api: RboxApi, deviceId: string, initial: RedeemRes
 export async function enrollViaPairing(remoteUrl: string, fullToken: string, now: number, label?: string): Promise<{ accountId: string; deviceId: string }> {
   const { redeemToken, tokenSecret } = parsePairingToken(fullToken);
   const global=await acquireClearMachineGenesisForPairing();let targetLock:GenesisLock|undefined;
-  try{const res = await fetch(`${remoteUrl}/v1/auth/pair/redeem`, {
+  try{const res = await fetchWithDeadline(`${remoteUrl}/v1/auth/pair/redeem`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ token: redeemToken, ...(label ? { label } : {}) }),

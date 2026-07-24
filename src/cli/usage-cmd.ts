@@ -1,6 +1,7 @@
 import { requireCredentials } from "./credentials.js";
 import { formatBinaryBytes } from "./quota-format.js";
 import { friendlyHttpError } from "./http-error.js";
+import { fetchWithDeadline } from "./remote/resilient.js";
 
 export interface AccountUsageDTO {
   plan: string;
@@ -21,7 +22,7 @@ function renderPlan(plan: string): string {
 
 export async function usageCmd(opts: { json?: boolean } = {}): Promise<void> {
   const c = await requireCredentials();
-  const res = await fetch(`${c.remoteUrl}/v1/account/usage`, {
+  const res = await fetchWithDeadline(`${c.remoteUrl}/v1/account/usage`, {
     headers: { authorization: `Bearer ${c.token}` },
   });
   const text = await res.text();

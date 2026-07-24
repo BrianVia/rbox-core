@@ -1,6 +1,7 @@
 import { credentialsForStrictFlow, requireCredentials, type CredentialLoadResult } from "./credentials.js";
 import { openAndShow } from "./browser-open.js";
 import { friendlyHttpError } from "./http-error.js";
+import { fetchWithDeadline } from "./remote/resilient.js";
 
 /**
  * `rbox subscribe [plan]` / `rbox billing` (design 21 §3.4.1) — the PRIMARY billing
@@ -31,7 +32,7 @@ export async function checkoutUrl(
   const c = credentialResult ? credentialsForStrictFlow(credentialResult) : await requireCredentials();
   if (!c) throw new Error("not logged in — run `rbox login`");
   const q = new URLSearchParams({ plan, cadence });
-  const res = await fetch(`${c.remoteUrl}/v1/billing/checkout?${q}`, {
+  const res = await fetchWithDeadline(`${c.remoteUrl}/v1/billing/checkout?${q}`, {
     method: "POST",
     headers: { authorization: `Bearer ${c.token}` },
   });
@@ -64,7 +65,7 @@ export async function subscribe(plan: string | undefined, opts: { annual?: boole
 /** `rbox billing` — open the Stripe customer portal for THIS account (manage/cancel). */
 export async function billingPortal(): Promise<void> {
   const c = await requireCredentials();
-  const res = await fetch(`${c.remoteUrl}/v1/billing/portal`, {
+  const res = await fetchWithDeadline(`${c.remoteUrl}/v1/billing/portal`, {
     method: "POST",
     headers: { authorization: `Bearer ${c.token}` },
   });

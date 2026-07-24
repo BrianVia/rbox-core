@@ -5,8 +5,15 @@ import { semverGt } from "./semver.js";
 import { homeDir } from "./rbox-paths.js";
 import { style } from "./style.js";
 import { verifyAndParseManifest, type Manifest } from "./release-verify.js";
+import { fetchWithDeadline } from "./remote/resilient.js";
 
 const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
+/**
+ * The update poll is a background nicety fired from the daemon tick — it must fail fast
+ * and silently, never sit on a black-holed socket for the 60s control budget. 3.5s matches
+ * the best-effort network budget `rbox status` and `rbox doctor` already use.
+ */
+const UPDATE_CHECK_TIMEOUT_MS = 3500;
 
 export interface UpdateCheckState {
   lastCheckedAt: string;
@@ -33,7 +40,7 @@ const rboxHome = () => path.join(process.env.RBOX_HOME || homeDir(), ".rbox");
 const updateCheckPath = (): string => path.join(rboxHome(), "update-check.json");
 
 async function defaultFetchBytes(url: string): Promise<Uint8Array> {
-  const res = await fetch(url, { redirect: "follow" });
+  const res = await fetchWithDeadline(url, { redirect: "follow" }, UPDATE_CHECK_TIMEOUT_MS);
   if (!res.ok) throw new Error(`fetch ${url} → ${res.status}`);
   return new Uint8Array(await res.arrayBuffer());
 }
