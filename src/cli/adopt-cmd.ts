@@ -16,6 +16,7 @@ import {
   loadAdoptJournal,
   type AdoptJournal,
 } from "./adopt-journal.js";
+import { emitJson } from "./json.js";
 import { promptConfirm } from "./prompt.js";
 import { acquireWorkspaceSyncMutexForAdopt, releaseWorkspaceSyncMutex } from "./sync-mutex.js";
 import { sync } from "./sync.js";
@@ -179,7 +180,7 @@ export async function adoptCmd(
   if (!journal) throw new Error("adoption journal disappeared");
   if (subcommand === "status") {
     const report = await adoptionStatus(root);
-    if (options.json) console.log(JSON.stringify(report));
+    if (options.json) emitJson(report);
     else {
       console.log(`adoption ${report.phase}${report.resumePhase ? ` (resume: ${report.resumePhase})` : ""}`);
       for (const reason of report.pauseReasons) console.log(`  paused: ${reason}`);

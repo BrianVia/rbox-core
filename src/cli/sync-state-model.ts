@@ -127,10 +127,13 @@ export interface ConfigShapeIdentity {
   commonDir: { realpath: string; dev: string; ino: string; birthtime: string };
 }
 
-export type GitDeferralReason =
-  | "local-edits" | "local-index" | "local-operation" | "local-commits" | "local-stash"
-  | "conflict" | "git-busy" | "stale-unattributed" | "worktree-ownership" | "ignored-target" | "unreadable"
-  | "artifact" | "config" | "containment" | "unsupported" | "other";
+export const GIT_DEFERRAL_REASONS = [
+  "local-edits", "local-index", "local-operation", "local-commits", "local-stash",
+  "conflict", "git-busy", "stale-unattributed", "worktree-ownership", "ignored-target", "unreadable",
+  "artifact", "config", "containment", "unsupported", "other",
+] as const;
+
+export type GitDeferralReason = (typeof GIT_DEFERRAL_REASONS)[number];
 
 export interface GitDeferral {
   lane: "apply" | "capture" | "config";
