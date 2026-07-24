@@ -303,12 +303,23 @@ async function defaultConnectivityProof(repoDir: string, roots: readonly string[
   }
 }
 
-async function lockToken(abs: string): Promise<OwnedGitLock | undefined> {
+/** A lock path is only ever proven absent, proven present with its exact
+ * ownership token, or unknown. Collapsing the third state into "absent" fails
+ * open: an EACCES/EIO/ELOOP `index.lock` would read as "no lock" and let the
+ * caller discard the journal that is the lock's only attribution authority. */
+type LockProbe = { kind: "absent" } | { kind: "present"; token: OwnedGitLock } | { kind: "indeterminate" };
+
+/** Deliberately NOT `fsutil.isAbsent`, which folds ENOTDIR into ENOENT. On a
+ * lock path an ENOTDIR means a component the journal recorded as a directory is
+ * now a file — the repository layout moved under us, which is evidence of
+ * concurrent mutation, not evidence that the lock is gone. Only ENOENT (final
+ * component missing, every parent still a directory) proves absence. */
+async function probeLock(abs: string): Promise<LockProbe> {
   try {
     const st = await fs.lstat(abs);
-    return { path: path.resolve(abs), dev: st.dev, ino: st.ino };
-  } catch {
-    return undefined;
+    return { kind: "present", token: { path: path.resolve(abs), dev: st.dev, ino: st.ino } };
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? { kind: "absent" } : { kind: "indeterminate" };
   }
 }
 
@@ -328,8 +339,10 @@ export async function ownershipAwareGitBusy(ctx: RepoCtx, owned: readonly OwnedG
   const allow = new Map(owned.map((token) => [token.path, `${token.dev}:${token.ino}`]));
   for (const abs of await allGitLocks(ctx)) {
     if (abs === "<unreadable>") return true;
-    const token = await lockToken(abs);
-    if (!token || allow.get(token.path) !== `${token.dev}:${token.ino}`) return true;
+    // Busy unless the lock is provably ours: an indeterminate probe cannot
+    // produce the token this allow-list matches on, so it stays busy.
+    const probe = await probeLock(abs);
+    if (probe.kind !== "present" || allow.get(probe.token.path) !== `${probe.token.dev}:${probe.token.ino}`) return true;
   }
   return false;
 }
@@ -492,11 +505,23 @@ function activeJournalLockPaths(journal: CheckoutJournal): string[] {
   return [...out];
 }
 
+/** Retention is one-directional: this journal is the only authority that can
+ * attribute and release the locks it names, so anything short of proven absence
+ * keeps it. A discarded journal turns its surviving lock into a permanently
+ * stale-unattributed lock that needs `rbox doctor` and a human. */
 async function journalLocksRemain(journal: CheckoutJournal | undefined): Promise<boolean> {
   if (!journal) return false;
-  for (const abs of activeJournalLockPaths(journal)) if (await lockToken(abs)) return true;
-  const origHeadLock = await readRegularFileNoFollow(path.join(journal.binding.gitDirReal, "ORIG_HEAD.lock"));
-  if (origHeadLock?.bytes.equals(Buffer.from(journal.journalId))) return true;
+  for (const abs of activeJournalLockPaths(journal)) if ((await probeLock(abs)).kind !== "absent") return true;
+  try {
+    const origHeadLock = await readRegularFileNoFollow(path.join(journal.binding.gitDirReal, "ORIG_HEAD.lock"));
+    if (origHeadLock?.bytes.equals(Buffer.from(journal.journalId))) return true;
+  } catch {
+    // readRegularFileNoFollow reports only ENOENT as absence and throws on
+    // everything else. An unreadable or non-regular ORIG_HEAD.lock is the same
+    // indeterminate state as above, and must not escape as a rejection from a
+    // caller that is already handling a deferral.
+    return true;
+  }
   return false;
 }
 
@@ -512,9 +537,11 @@ async function acquireOrigHeadLock(ctx: RepoCtx, journalId: string): Promise<Own
     handle = undefined;
     await fs.link(tmp, lockPath);
     await fsyncDirectory(ctx.gitDir);
-    const token = await lockToken(lockPath);
-    if (!token) throw new Error("could not identify owned ORIG_HEAD.lock");
-    return token;
+    // The link above succeeded, so absence and unreadability are both anomalies.
+    // Neither may hand back a lock we cannot later prove we still own.
+    const probe = await probeLock(lockPath);
+    if (probe.kind !== "present") throw new Error(`could not identify owned ORIG_HEAD.lock: ${probe.kind}`);
+    return probe.token;
   } finally {
     await handle?.close().catch(() => {});
     await fs.rm(tmp, { force: true }).catch(() => {});
@@ -582,6 +609,13 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
   let origHeadCleanupDurabilityPending = false;
   let reservationCleanupDurabilityPending = false;
   let checkoutLockCleanupDurabilityPending = false;
+  /** Single source of the deferral verdict: any pending cleanup durability or
+   * any not-provably-gone journal lock keeps the journal for intent recovery. */
+  const deferWith = async (reason: string): Promise<CommitCheckoutResult> =>
+    origHeadCleanupDurabilityPending || reservationCleanupDurabilityPending || checkoutLockCleanupDurabilityPending
+      || await journalLocksRemain(opts.journal?.value)
+      ? { status: "defer", reason, journalIntact: true }
+      : { status: "defer", reason };
   const reservationTokens: OwnedGitLock[] = [];
   const reservationObservations = new Map<string, MarkerObservation>();
   const releaseReservations = async (): Promise<void> => {
@@ -644,8 +678,12 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
 
     const locksBeforePrepare = new Map<string, string>();
     for (const abs of await allGitLocks(ctx)) {
-      const token = await lockToken(abs);
-      if (token) locksBeforePrepare.set(token.path, `${token.dev}:${token.ino}`);
+      const probe = await probeLock(abs);
+      // Membership alone decides ownership below. Record an indeterminate path
+      // as pre-existing so a lock we could not prove absent before prepare is
+      // never later claimed as one this sequence created.
+      if (probe.kind === "present") locksBeforePrepare.set(probe.token.path, `${probe.token.dev}:${probe.token.ino}`);
+      else if (probe.kind === "indeterminate") locksBeforePrepare.set(path.resolve(abs), "indeterminate");
     }
 
     const primaryLines = transactionLines(plan);
@@ -728,7 +766,8 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
       // Git forbids putting HEAD and its unchanged referent in one transaction.
       // Updating the checked-out referent nevertheless makes update-ref prepare
       // HEAD.lock; verify the symbolic bytes under that transaction-owned lock.
-      if (!(await lockToken(path.join(ctx.gitDir, "HEAD.lock")))) throw new Error("prepared transaction did not reserve unchanged symbolic HEAD");
+      // Only a proven-present reservation authorizes reading HEAD under it.
+      if ((await probeLock(path.join(ctx.gitDir, "HEAD.lock"))).kind !== "present") throw new Error("prepared transaction did not reserve unchanged symbolic HEAD");
       const head = (await fs.readFile(path.join(ctx.gitDir, "HEAD"), "utf8")).trim();
       if (head !== `ref: ${plan.head.oldTarget}`) throw new Error("symbolic HEAD changed before checkout commit");
     }
@@ -740,8 +779,11 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
     }
     if (mutationLease?.abortRequested) throw new MutationGateClosedError();
     indexHandle = await fs.open(indexLock, "wx");
-    indexToken = await lockToken(indexLock);
-    if (!indexToken) throw new Error("could not identify owned index.lock");
+    // O_EXCL just created it; absence or unreadability are both anomalies that
+    // must not yield an unverifiable writer reservation.
+    const indexProbe = await probeLock(indexLock);
+    if (indexProbe.kind !== "present") throw new Error(`could not identify owned index.lock: ${indexProbe.kind}`);
+    indexToken = indexProbe.token;
     indexObservation = await addTimedMs(opts.chainTimings, "journalMs", () => observeLockMarker(indexLock));
     if (!indexObservation) throw new Error("could not observe owned index.lock");
     if (opts.journal) {
@@ -762,8 +804,10 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
     const expectedLocks = new Set(primaryIntent.locks.map((lock) => lock.path));
     for (const abs of await allGitLocks(ctx)) {
       if (!expectedLocks.has(abs) || abs === indexToken.path) continue;
-      const token = await lockToken(abs);
-      if (token && !locksBeforePrepare.has(token.path)) owned.push(token);
+      // Claim ownership only on proof. An indeterminate probe stays unclaimed
+      // and therefore reads as a foreign lock in the busy probe below.
+      const probe = await probeLock(abs);
+      if (probe.kind === "present" && !locksBeforePrepare.has(probe.token.path)) owned.push(probe.token);
     }
     const proofContext: SecondProofContext = { ownedLocks: owned, busy: () => ownershipAwareGitBusy(ctx, owned) };
     const becameBusy = await proofContext.busy();
@@ -781,11 +825,9 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
       indexToken = undefined;
       await releaseReservations();
       await releasePlannedOrigHeadLock();
-      const reason = becameBusy ? "git became busy at checkout boundary"
+      return await deferWith(becameBusy ? "git became busy at checkout boundary"
         : breadcrumbChanged ? ORIG_HEAD_CHANGED_AT_CHECKOUT_BOUNDARY
-        : "checkout boundary proof changed";
-      return origHeadCleanupDurabilityPending || reservationCleanupDurabilityPending || checkoutLockCleanupDurabilityPending
-        || await journalLocksRemain(opts.journal?.value) ? { status: "defer", reason, journalIntact: true } : { status: "defer", reason };
+        : "checkout boundary proof changed");
     }
 
     const branchSwitchTarget = plan.head.kind === "symbolic" && plan.head.newTarget !== plan.head.oldTarget ? plan.head.newTarget : undefined;
@@ -806,8 +848,11 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
     if (branchSwitch) {
       const headLockPath = path.join(ctx.gitDir, "HEAD.lock");
       headHandle = await fs.open(headLockPath, "wx");
-      headToken = await lockToken(headLockPath);
-      if (!headToken) throw new Error("could not identify owned HEAD.lock reservation");
+      // As with index.lock: O_EXCL created it, so only proven presence may
+      // stand in as the reservation token released after publication.
+      const headProbe = await probeLock(headLockPath);
+      if (headProbe.kind !== "present") throw new Error(`could not identify owned HEAD.lock reservation: ${headProbe.kind}`);
+      headToken = headProbe.token;
       headObservation = await addTimedMs(opts.chainTimings, "journalMs", () => observeLockMarker(headLockPath));
       if (!headObservation) throw new Error("could not observe owned HEAD.lock reservation");
       if (opts.journal?.value.expectedNew.headLock) {
@@ -921,9 +966,7 @@ export async function commitCheckout<T = unknown>(ctx: RepoCtx, plan: CheckoutPl
       await releaseReservations().catch(() => {});
       await releasePlannedOrigHeadLock().catch(() => {});
       if (error instanceof InjectedCheckoutCrash) throw error.cause;
-      const reason = error instanceof Error ? error.message : "checkout transaction failed";
-      return origHeadCleanupDurabilityPending || reservationCleanupDurabilityPending || checkoutLockCleanupDurabilityPending
-        || await journalLocksRemain(opts.journal?.value) ? { status: "defer", reason, journalIntact: true } : { status: "defer", reason };
+      return await deferWith(error instanceof Error ? error.message : "checkout transaction failed");
     }
     // After ref commit, never call unconditional restoreLocal (r2 F4). The
     // durable journal's old/new arbitration is the only repair authority.

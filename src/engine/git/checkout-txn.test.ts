@@ -661,6 +661,75 @@ test("the held index.lock rejects a concurrent git add before ref commit", async
   expect(await git(repo, "ls-files", "--error-unmatch", "concurrent.txt").then(() => true, () => false)).toBe(false);
 });
 
+// The journal names lock paths it alone may attribute and release. These four
+// tests pin every state of that probe, because follow.ts clears the journal on
+// any defer that does not report journalIntact.
+const probeRef = "refs/heads/probe-dir/x";
+const probeLockDir = () => path.join(ctx.commonDir, "refs", "heads", "probe-dir");
+const probeLockPath = () => path.join(probeLockDir(), "x.lock");
+const runningAsRoot = typeof process.getuid === "function" && process.getuid() === 0;
+
+async function deferWithProbeLock(duringSecondProof: () => Promise<void>) {
+  const { journal } = await checkoutJournal();
+  journal.expectedNew.reservedLocks = { [probeRef]: { marker: "probe-marker" } };
+  return commitCheckout(ctx, plan(await candidateFor(newOid)), {
+    capabilityProbe: supported,
+    connectivityProof: proof,
+    journal: { workspaceRoot: root, relPath: "repo", value: journal },
+    // Runs after the ownership-aware busy probe, so the fixture below perturbs
+    // only the post-abort journal-retention decision.
+    secondProof: async () => {
+      await duringSecondProof();
+      return false;
+    },
+  });
+}
+
+test("a journal lock still on disk keeps the journal intact", async () => {
+  const result = await deferWithProbeLock(async () => {
+    await fs.mkdir(probeLockDir(), { recursive: true });
+    await fs.writeFile(probeLockPath(), "");
+  });
+
+  expect(result).toEqual({ status: "defer", reason: "checkout boundary proof changed", journalIntact: true });
+});
+
+test("a provably absent journal lock releases the journal", async () => {
+  const result = await deferWithProbeLock(async () => {});
+
+  expect(result).toEqual({ status: "defer", reason: "checkout boundary proof changed" });
+});
+
+test.skipIf(runningAsRoot)("an unreadable journal lock path keeps the journal instead of reading as absent", async () => {
+  const dir = probeLockDir();
+  try {
+    const result = await deferWithProbeLock(async () => {
+      await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(probeLockPath(), "");
+      await fs.chmod(dir, 0o000);
+    });
+
+    expect(result).toEqual({ status: "defer", reason: "checkout boundary proof changed", journalIntact: true });
+  } finally {
+    await fs.chmod(dir, 0o755).catch(() => {});
+  }
+});
+
+test("an unreadable ORIG_HEAD.lock defers with the journal instead of escaping as a rejection", async () => {
+  const { journal } = await checkoutJournal();
+  const result = await commitCheckout(ctx, plan(await candidateFor(newOid)), {
+    capabilityProbe: supported,
+    connectivityProof: proof,
+    journal: { workspaceRoot: root, relPath: "repo", value: journal },
+    secondProof: async () => {
+      await fs.mkdir(path.join(ctx.gitDir, "ORIG_HEAD.lock"));
+      return false;
+    },
+  });
+
+  expect(result).toEqual({ status: "defer", reason: "checkout boundary proof changed", journalIntact: true });
+});
+
 test("capability result is cached once per git version", async () => {
   let calls = 0;
   const probe = async (version: string) => {
