@@ -1,4 +1,4 @@
-# 194 — Privacy-safe onboarding funnel telemetry
+# 196 — Privacy-safe onboarding funnel telemetry
 
 Status: DRAFT — implementation-ready, awaiting review.
 
