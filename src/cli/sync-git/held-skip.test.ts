@@ -11,10 +11,13 @@ import {
   blockersAfterComposer,
   createHeldAttempt,
   gitHeldSkipEnabled,
+  gitOwnershipHeldSkipEnabled,
+  gitOwnershipNoEscalateEnabled,
   heldAttemptFloorElapsed,
   heldAttemptMatches,
   heldBlockersAllowSkip,
   observeHeldInputs,
+  readWorktreeRegistryDigest,
 } from "./held-skip.js";
 
 const roots: string[] = [];
@@ -24,6 +27,9 @@ const localCommit: TypedBlocker = { provenance: "checkout", reason: "local-commi
 const localStash: TypedBlocker = { provenance: "ref-plane", reason: "local-stash", ref: "refs/stash" };
 const deletionPending: TypedBlocker = { provenance: "ref-plane", reason: "deletion-pending", ref: "refs/heads/deleted" };
 const localIndex: TypedBlocker = { provenance: "checkout", reason: "local-index" };
+const ownership: TypedBlocker = {
+  provenance: "ref-plane", reason: "worktree-ownership", ref: "refs/heads/topic",
+};
 
 test("held skip is non-vacuous and every blocker must be allowlisted", () => {
   expect(heldBlockersAllowSkip([])).toBe(false);
@@ -31,8 +37,38 @@ test("held skip is non-vacuous and every blocker must be allowlisted", () => {
   expect(heldBlockersAllowSkip([deletionPending])).toBe(true);
   expect(heldBlockersAllowSkip([localCommit, localStash, localIndex])).toBe(true);
   expect(heldBlockersAllowSkip([localCommit, { provenance: "indeterminate", reason: "unreadable", detail: "missing object" }])).toBe(false);
-  expect(heldBlockersAllowSkip([localStash, { provenance: "checkout", reason: "worktree-ownership" }])).toBe(false);
+  expect(heldBlockersAllowSkip([ownership])).toBe(true);
+  expect(heldBlockersAllowSkip([ownership], { RBOX_GIT_OWNERSHIP_HELD_SKIP: "0" })).toBe(false);
+  expect(heldBlockersAllowSkip([{ provenance: "checkout", reason: "worktree-ownership" }])).toBe(true);
   expect(gitHeldSkipEnabled({ RBOX_GIT_HELD_SKIP: "0" })).toBe(false);
+  expect(gitOwnershipHeldSkipEnabled({})).toBe(true);
+  expect(gitOwnershipHeldSkipEnabled({ RBOX_GIT_OWNERSHIP_HELD_SKIP: "0" })).toBe(false);
+  expect(gitOwnershipHeldSkipEnabled({ RBOX_GIT_OWNERSHIP_HELD_SKIP: "false" })).toBe(true);
+  expect(gitOwnershipNoEscalateEnabled({})).toBe(true);
+  expect(gitOwnershipNoEscalateEnabled({ RBOX_GIT_OWNERSHIP_NO_ESCALATE: "0" })).toBe(false);
+  expect(gitOwnershipNoEscalateEnabled({ RBOX_GIT_OWNERSHIP_NO_ESCALATE: "false" })).toBe(true);
+});
+
+test("worktree ownership neutralizes only its causal missing branch proof", () => {
+  const mapped = blockersAfterComposer({
+    classification: [ownership],
+    disposition: "pending",
+    holds: [{ ref: "refs/heads/topic", code: "missing-branch-proof" }],
+    checkoutComplete: true,
+  });
+  expect(mapped).toEqual([ownership]);
+  expect(heldBlockersAllowSkip(mapped)).toBe(true);
+
+  const mismatched = blockersAfterComposer({
+    classification: [ownership],
+    disposition: "pending",
+    holds: [{ ref: "refs/heads/topic", code: "mismatched-branch-proof" }],
+    checkoutComplete: true,
+  });
+  expect(mismatched).toContainEqual(expect.objectContaining({
+    provenance: "composer", code: "mismatched-branch-proof",
+  }));
+  expect(heldBlockersAllowSkip(mismatched)).toBe(false);
 });
 
 test("deletion-pending maps only to the matching missing branch proof", () => {
@@ -208,6 +244,7 @@ test("attempt matching binds nonce/version and the one-hour floor", () => {
     incomingKey: "incoming", localFingerprint: "fp", fingerprintVersion: GIT_FINGERPRINT_VERSION,
     effectiveBaseIndexProjection: null, effectiveIncomingIndexProjection: null,
     incomingIndexArtifactDescriptor: "null",
+    worktreeRegistryDigest: "worktrees",
     maxFingerprintTimestampMs: now - 10_000, reflogs: [], repoIdentity: "repo", stateNonce: "nonce",
     baseOriginsHash: "base", partialDisposition: "null",
   };
@@ -215,6 +252,9 @@ test("attempt matching binds nonce/version and the one-hour floor", () => {
   expect(heldAttemptMatches(attempt, observation, now)).toBe(true);
   expect(heldAttemptMatches({ ...attempt, stateNonce: "other" }, observation, now)).toBe(false);
   expect(heldAttemptMatches({ ...attempt, repoIdentity: "other-repo" }, observation, now)).toBe(false);
+  const { worktreeRegistryDigest: _digest, ...legacyAttempt } = attempt;
+  expect(heldAttemptMatches(legacyAttempt, observation, now)).toBe(false);
+  expect(heldAttemptMatches(attempt, { ...observation, worktreeRegistryDigest: "changed" }, now)).toBe(false);
   expect(heldAttemptMatches({ ...attempt, fingerprintVersion: "old" }, observation, now)).toBe(false);
   expect(heldAttemptFloorElapsed(attempt, now)).toBe(false);
   expect(heldAttemptFloorElapsed({ ...attempt, at: new Date(now - 3_600_001).toISOString() }, now)).toBe(true);
@@ -226,6 +266,7 @@ test("idxProj-only effective BASE repair invalidates an attempt", () => {
     incomingKey: "incoming", localFingerprint: "fp", fingerprintVersion: GIT_FINGERPRINT_VERSION,
     effectiveBaseIndexProjection: "v2:stale", effectiveIncomingIndexProjection: "v2:incoming",
     incomingIndexArtifactDescriptor: "null", maxFingerprintTimestampMs: now - 10_000,
+    worktreeRegistryDigest: "worktrees",
     reflogs: [], repoIdentity: "repo", stateNonce: "nonce", baseOriginsHash: "base", partialDisposition: "null",
   };
   const attempt = createHeldAttempt(observation, [localIndex], new Date(now - 1_000).toISOString());
@@ -253,6 +294,91 @@ test("same indexSha with a changed incoming locator invalidates an attempt", asy
   const after = await observeHeldInputs({ ...common, incoming: changedLocator });
   expect(after).toBeDefined();
   expect(heldAttemptMatches(attempt, after!, Date.now() + 6_000)).toBe(false);
+});
+
+test("worktree removal changes the registry digest without changing refs, HEAD, or index", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-held-worktree-"));
+  const sibling = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-held-worktree-sibling-parent-"));
+  roots.push(root, sibling);
+  const linked = path.join(sibling, "linked");
+  await git(root, ["init", "-b", "main"]);
+  await git(root, ["config", "user.email", "test@example.com"]);
+  await git(root, ["config", "user.name", "Test"]);
+  await fs.writeFile(path.join(root, "f"), "a");
+  await git(root, ["add", "f"]);
+  await git(root, ["commit", "-m", "a"]);
+  await git(root, ["branch", "side"]);
+  await git(root, ["worktree", "add", "-q", linked, "side"]);
+
+  const stableBefore = {
+    refs: await git(root, ["show-ref"]),
+    head: await git(root, ["symbolic-ref", "HEAD"]),
+    index: await git(root, ["ls-files", "-s"]),
+  };
+  const digestBefore = await readWorktreeRegistryDigest(root);
+  await git(root, ["worktree", "remove", "--force", linked]);
+  const digestAfter = await readWorktreeRegistryDigest(root);
+  expect(digestAfter).not.toBe(digestBefore);
+  expect({
+    refs: await git(root, ["show-ref"]),
+    head: await git(root, ["symbolic-ref", "HEAD"]),
+    index: await git(root, ["ls-files", "-s"]),
+  }).toEqual(stableBefore);
+});
+
+test("a linked-worktree branch switch inside the observation bracket refuses the attempt", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-held-worktree-race-"));
+  const siblingParent = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-held-worktree-race-parent-"));
+  roots.push(root, siblingParent);
+  const linked = path.join(siblingParent, "linked");
+  await git(root, ["init", "-b", "main"]);
+  await git(root, ["config", "user.email", "test@example.com"]);
+  await git(root, ["config", "user.name", "Test"]);
+  await fs.writeFile(path.join(root, "f"), "a");
+  await git(root, ["add", "f"]);
+  await git(root, ["commit", "-m", "a"]);
+  const tip = (await git(root, ["rev-parse", "HEAD"])).trim();
+  await git(root, ["branch", "side"]);
+  await git(root, ["branch", "other"]);
+  await git(root, ["worktree", "add", "-q", linked, "side"]);
+  const incoming = {
+    bundleSha: "1".repeat(64),
+    bundleEncSha: "2".repeat(64),
+    bundleCipherSize: 1,
+    head: "ref: refs/heads/main\n",
+    refs: {
+      "refs/heads/main": tip,
+      "refs/heads/side": tip,
+      "refs/heads/other": tip,
+    },
+    refScope: "all" as const,
+  };
+  const opts = {
+    root,
+    relPath: ".",
+    incomingKey: "incoming",
+    incoming,
+    stateNonce: "nonce",
+    effectiveBaseIndexProjection: null,
+    effectiveIncomingIndexProjection: null,
+    reflogPaths: [],
+  };
+  const before = await observeHeldInputs(opts);
+  expect(before).toBeDefined();
+  await git(linked, ["switch", "-q", "other"]);
+  const after = await observeHeldInputs(opts);
+  expect(after).toBeDefined();
+  expect(after!.localFingerprint).toBe(before!.localFingerprint);
+  expect(after!.worktreeRegistryDigest).not.toBe(before!.worktreeRegistryDigest);
+
+  await git(linked, ["switch", "-q", "side"]);
+  const raced = await observeHeldInputs({
+    ...opts,
+    afterWorktreeRegistryRead: async () => {
+      await git(linked, ["switch", "-q", "other"]);
+    },
+  });
+  expect(raced).toBeUndefined();
 });
 
 test("exact consulted stash reflog bytes invalidate T→U→T reflog-only mutation", async () => {

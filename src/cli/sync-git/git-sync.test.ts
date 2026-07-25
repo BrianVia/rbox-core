@@ -1281,7 +1281,7 @@ test("repo dir GONE ENTIRELY → pusher drops the section (§9); receiver drops 
 
 // ── (c) design §13.5 pending tests ────────────────────────────────────────────────
 
-test("design 116 phase-0: linked-worktree partial apply stays pending, retries without conflict, then completes after removal", async () => {
+test("design 200 P2: linked-worktree partial apply stays pending without repo deferral, then completes after removal", async () => {
   const a = path.join(rootA, "r");
   await initRepo(a);
   await commitFile(a, "base.txt", "base", "base");
@@ -1324,8 +1324,7 @@ test("design 116 phase-0: linked-worktree partial apply stays pending, retries w
     heldRefs: { "refs/heads/side": "ownership" },
     configApplied: true,
   });
-  const chronicSince = record.deferrals?.apply?.deferredSince;
-  expect(record.deferrals?.apply).toMatchObject({ lane: "apply", reason: "worktree-ownership", checkout: { kind: "branch", label: "main" } });
+  expect(record.deferrals?.apply).toBeUndefined();
   expect(logsB.some((line) => line === "git-sync followed r")).toBe(true);
 
   // A newer wire section may arrive after the v2 partial. The proof is against persisted
@@ -1341,7 +1340,7 @@ test("design 116 phase-0: linked-worktree partial apply stays pending, retries w
   expect(state.gitNeedsResolution?.["r"]).toBeUndefined();
   record = repoRecordsForState(state).r!;
   expect(record.partial?.incomingKey).toBe(gitIncomingKey(state.gitPendingRemote!["r"]!));
-  expect(record.deferrals?.apply?.deferredSince).toBe(chronicSince);
+  expect(record.deferrals?.apply).toBeUndefined();
   expect(logsB.some((line) => line.includes("CONFLICT r"))).toBe(false);
   expect(logsB.some((line) => line === "git-sync followed r")).toBe(true);
 

@@ -1068,6 +1068,172 @@ test("degraded clean arm defers a sibling-owned intersection as a whole section"
   expect(await git(sibling, "rev-parse", "refs/heads/side")).toBe(baseTip);
 });
 
+for (const location of ["inside", "outside"] as const) {
+  test(`design 200 P2: ${location}-workspace non-HEAD ownership stays per-ref, skips, and removal invalidates the digest`, async () => {
+    await commit("one\n", "p2-c1");
+    const baseTip = await commit("two\n", "p2-c2");
+    await git(sender, "branch", "side", baseTip);
+    const base = await capture();
+    await materialize(base);
+
+    const sibling = location === "inside"
+      ? path.join(workspace, "linked-side")
+      : path.join(tmp, "linked-side");
+    await git(receiver, "worktree", "add", "-q", sibling, "side");
+    const incomingTip = await commit("three\n", "p2-c3");
+    await git(sender, "branch", "-f", "side", incomingTip);
+    const incoming = await capture();
+    await fs.writeFile(path.join(receiver, "tracked.txt"), "three\n");
+
+    const first = await applyIncoming(stateWith(base), incoming, matchingOracle, { collectMetrics: true });
+    expect(first.outcome.deferrals?.repo?.apply).toBeUndefined();
+    expect(first.outcome.gitPendingRemote?.repo).toEqual(incoming);
+    expect(first.outcome.partial?.repo?.heldRefs["refs/heads/side"]).toBe("ownership");
+    expect(first.outcome.partial?.repo?.appliedRefs["refs/heads/main"]).toBeDefined();
+    expect(first.outcome.attempt?.repo?.worktreeRegistryDigest).toMatch(/^[0-9a-f]{64}$/);
+    expect(first.outcome.attempt?.repo?.blockers).toEqual([{
+      provenance: "ref-plane", reason: "worktree-ownership", ref: "refs/heads/side",
+    }]);
+    expect(await git(receiver, "rev-parse", "refs/heads/main")).toBe(incoming.refs["refs/heads/main"]);
+    expect(await git(sibling, "rev-parse", "refs/heads/side")).toBe(baseTip);
+
+    const saved = await landOutcome(stateWith(base), first.outcome, 2);
+    let capabilityCalls = 0;
+    const skipped = await applyIncoming(saved, incoming, matchingOracle, {
+      collectMetrics: true,
+      heldNow: heldNowAfterRacyWindow,
+      capabilityProbe: async () => { capabilityCalls++; return true; },
+    });
+    expect(skipped.outcome.gitApplyMetrics?.results.skipped).toBe(1);
+    expect(skipped.outcome.deferrals?.repo?.apply).toBeUndefined();
+    expect(capabilityCalls).toBe(0);
+
+    await git(receiver, "worktree", "remove", "--force", sibling);
+    capabilityCalls = 0;
+    const released = await applyIncoming(saved, incoming, matchingOracle, {
+      collectMetrics: true,
+      heldNow: heldNowAfterRacyWindow,
+      capabilityProbe: async () => { capabilityCalls++; return true; },
+    });
+    expect(released.outcome.gitApplyMetrics?.results.skipped).toBe(0);
+    expect(capabilityCalls).toBeGreaterThan(0);
+    expect(released.outcome.gitPendingRemote?.repo).toBeUndefined();
+    expect(await git(receiver, "rev-parse", "refs/heads/side")).toBe(incomingTip);
+  });
+}
+
+test("design 200 P2: a sibling branch switch during classification records no stale ownership attempt", async () => {
+  await commit("one\n", "p2-race-c1");
+  const baseTip = await commit("two\n", "p2-race-c2");
+  await git(sender, "branch", "side", baseTip);
+  await git(sender, "branch", "other", baseTip);
+  const base = await capture();
+  await materialize(base);
+  const sibling = path.join(tmp, "race-linked-side");
+  await git(receiver, "worktree", "add", "-q", sibling, "side");
+  const incomingTip = await commit("three\n", "p2-race-c3");
+  await git(sender, "branch", "-f", "side", incomingTip);
+  const incoming = await capture();
+  await fs.writeFile(path.join(receiver, "tracked.txt"), "three\n");
+
+  let hookCalls = 0;
+  const raced = await applyIncoming(stateWith(base), incoming, matchingOracle, {
+    afterHeldClassification: async () => {
+      hookCalls++;
+      await git(sibling, "switch", "-q", "other");
+    },
+  });
+  expect(hookCalls).toBe(1);
+  expect(raced.outcome.partial?.repo?.heldRefs["refs/heads/side"]).toBe("ownership");
+  expect(raced.outcome.attempt?.repo).toBeNull();
+
+  const saved = await landOutcome(stateWith(base), raced.outcome, 2);
+  let capabilityCalls = 0;
+  const released = await applyIncoming(saved, incoming, matchingOracle, {
+    collectMetrics: true,
+    heldNow: heldNowAfterRacyWindow,
+    capabilityProbe: async () => { capabilityCalls++; return true; },
+  });
+  expect(released.outcome.gitApplyMetrics?.results.skipped).toBe(0);
+  expect(capabilityCalls).toBeGreaterThan(0);
+  expect(released.outcome.gitPendingRemote?.repo).toBeUndefined();
+  expect(await git(receiver, "rev-parse", "refs/heads/side")).toBe(incomingTip);
+});
+
+test("design 200 P2 kill switches independently restore legacy ownership behavior", async () => {
+  await commit("one\n", "p2-switch-c1");
+  const baseTip = await commit("two\n", "p2-switch-c2");
+  await git(sender, "branch", "side", baseTip);
+  const base = await capture();
+  await materialize(base);
+  const sibling = path.join(tmp, "switch-linked-side");
+  await git(receiver, "worktree", "add", "-q", sibling, "side");
+  const incomingTip = await commit("three\n", "p2-switch-c3");
+  await git(sender, "branch", "-f", "side", incomingTip);
+  const incoming = await capture();
+  await fs.writeFile(path.join(receiver, "tracked.txt"), "three\n");
+
+  const first = await applyIncoming(stateWith(base), incoming);
+  const saved = await landOutcome(stateWith(base), first.outcome, 2);
+  let followedState: SyncState;
+  process.env.RBOX_GIT_OWNERSHIP_HELD_SKIP = "0";
+  try {
+    let capabilityCalls = 0;
+    const fullFollow = await applyIncoming(saved, incoming, matchingOracle, {
+      collectMetrics: true,
+      heldNow: heldNowAfterRacyWindow,
+      capabilityProbe: async () => { capabilityCalls++; return true; },
+    });
+    expect(fullFollow.outcome.gitApplyMetrics?.results.skipped).toBe(0);
+    expect(fullFollow.outcome.attempt?.repo?.blockers).toEqual([{
+      provenance: "ref-plane", reason: "worktree-ownership", ref: "refs/heads/side",
+    }]);
+    expect(fullFollow.outcome.deferrals?.repo?.apply).toBeUndefined();
+    expect(capabilityCalls).toBeGreaterThan(0);
+    followedState = await landOutcome(saved, fullFollow.outcome, 3);
+  } finally {
+    delete process.env.RBOX_GIT_OWNERSHIP_HELD_SKIP;
+  }
+
+  let legacyState: SyncState;
+  process.env.RBOX_GIT_OWNERSHIP_NO_ESCALATE = "0";
+  try {
+    const legacyEscalation = await applyIncoming(followedState!, incoming);
+    expect(legacyEscalation.outcome.deferrals?.repo?.apply?.reason).toBe("worktree-ownership");
+    legacyState = await landOutcome(followedState!, legacyEscalation.outcome, 4);
+  } finally {
+    delete process.env.RBOX_GIT_OWNERSHIP_NO_ESCALATE;
+  }
+
+  let capabilityCalls = 0;
+  const reenabled = await applyIncoming(legacyState!, incoming, matchingOracle, {
+    collectMetrics: true,
+    heldNow: heldNowAfterRacyWindow,
+    capabilityProbe: async () => { capabilityCalls++; return true; },
+  });
+  expect(reenabled.outcome.gitApplyMetrics?.results.skipped).toBe(1);
+  expect(reenabled.outcome.deferrals?.repo?.apply == null).toBe(true);
+  expect(capabilityCalls).toBe(0);
+});
+
+test("design 200 P2: incoming HEAD ownership remains a whole-repository defer", async () => {
+  await commit("one\n", "p2-head-c1");
+  const baseTip = await commit("two\n", "p2-head-c2");
+  await git(sender, "branch", "side", baseTip);
+  const base = await capture();
+  await materialize(base);
+  const sibling = path.join(tmp, "head-linked-side");
+  await git(receiver, "worktree", "add", "-q", sibling, "side");
+  await git(sender, "switch", "-q", "side");
+  await commit("side incoming\n", "p2-head-c3");
+  const incoming = await capture();
+
+  const held = await applyIncoming(stateWith(base), incoming);
+  expect(held.outcome.deferrals?.repo?.apply?.reason).toBe("worktree-ownership");
+  expect(held.outcome.gitRepos?.repo).toEqual(base);
+  expect(held.outcome.gitPendingRemote?.repo).toEqual(incoming);
+});
+
 test("field incident follows a contained stale tip to detached incoming HEAD", async () => {
   const { c1, state, incoming } = await baseAndIncoming("detached");
   const old = await git(receiver, "rev-parse", "refs/heads/main");

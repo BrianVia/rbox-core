@@ -16,11 +16,12 @@ import { settleExactPresentArtifact } from "./p-settlement.js";
 import { commitPlannedBranchTransition, planBranchTransition } from "./branch-transition.js";
 import { runUpdateRefTransaction } from "../../engine/git/keep-pins.js";
 import { MutationGateClosedError, type MutationBoundary } from "../../engine/mutation-gate.js";
-import { blockersAfterComposer, createHeldAttempt, gitHeldSkipEnabled, heldAttemptFloorElapsed, heldAttemptMatches, heldBlockersAllowSkip, incomingIndexArtifactDescriptor, observeHeldInputs, rebindHeldAttemptsAfterSettlement, sameHeldOutcome, sortedTypedBlockers } from "./held-skip.js";
+import { blockersAfterComposer, createHeldAttempt, gitHeldSkipEnabled, gitOwnershipNoEscalateEnabled, heldAttemptFloorElapsed, heldAttemptMatches, heldBlockersAllowSkip, incomingIndexArtifactDescriptor, observeHeldInputs, ownershipBlockersArePerRefOnly, readWorktreeRegistryDigest, rebindHeldAttemptsAfterSettlement, sameHeldOutcome, sortedTypedBlockers } from "./held-skip.js";
 import {
   carryRepoBaseProof,
   composeRepoBase,
   recordOriginLineage,
+  type ComposeRepoBaseResult,
   type RepoBaseProof,
   type RepoBaseLockedProof,
 } from "./base-composer.js";
@@ -758,6 +759,20 @@ opts: {
         : persisted.includes("local-stash") ? "local-stash"
         : "worktree-ownership";
     };
+    const ownershipOnlyDisposition = (
+      progress: Pick<FollowProgress, "heldRefs" | "blockers">,
+      composed: ComposeRepoBaseResult,
+      checkoutComplete: boolean,
+    ): boolean => {
+      const heldReasons = Object.values(progress.heldRefs);
+      if (heldReasons.length === 0 || heldReasons.some((reason) => reason !== "ownership")) return false;
+      return ownershipBlockersArePerRefOnly(blockersAfterComposer({
+        classification: progress.blockers,
+        disposition: composed.disposition,
+        holds: composed.holds,
+        checkoutComplete,
+      }));
+    };
 
     // Removal memory: a leftover whose identity still EQUALS the memory is treated as
     // ABSENT (clean materialization target [v3/v4]); a leftover that CHANGED re-enters
@@ -1212,10 +1227,19 @@ opts: {
         ? heldAttemptFloorElapsed(priorAttempt)
         : heldAttemptFloorElapsed(priorAttempt, heldNowMs));
       const standingApply = currentDeferral(rel, "apply");
+      const priorOwnershipOnly = priorAttempt !== undefined
+        && ownershipBlockersArePerRefOnly(priorAttempt.blockers);
       if (gitHeldSkipEnabled() && pend && priorAttempt && priorInputsMatch && !priorFloorElapsed
-        && heldBlockersAllowSkip(priorAttempt.blockers) && standingApply) {
+        && heldBlockersAllowSkip(priorAttempt.blockers)
+        && (standingApply || (gitOwnershipNoEscalateEnabled() && priorOwnershipOnly))) {
         // Sidecar-only ordered refresh: pending, partial, BASE, and attempt remain exact.
-        setDeferral(rel, "apply", standingApply.reason, standingApply.subjectKey, standingApply.checkout);
+        if (gitOwnershipNoEscalateEnabled() && priorOwnershipOnly) {
+          clearDeferral(rel, "apply");
+        } else if (standingApply) {
+          setDeferral(rel, "apply", standingApply.reason, standingApply.subjectKey, standingApply.checkout);
+        } else {
+          clearDeferral(rel, "apply");
+        }
         return { result: "skipped", commonDirGroup };
       }
       // Once a full follow is required, omission must not preserve the rejected
@@ -1231,10 +1255,11 @@ opts: {
         boundBase?: GitSection;
         boundOrigins?: RepoRecord["branchBaseOrigins"];
         observationPartial?: GitPartialApply;
+        expectedWorktreeRegistryDigest?: string;
       }): Promise<void> => {
         const priorRecord = records[rel];
         const observationPartial = input.observationPartial ?? currentPartial(rel);
-        if (!input.trustedFingerprint) {
+        if (!input.trustedFingerprint || !input.expectedWorktreeRegistryDigest) {
           clearAttempt(rel);
           return;
         }
@@ -1248,6 +1273,7 @@ opts: {
           trustedFingerprint: input.trustedFingerprint,
           effectiveBaseIndexProjection: input.effectiveBaseIndexProjection,
           effectiveIncomingIndexProjection: input.effectiveIncomingIndexProjection,
+          expectedWorktreeRegistryDigest: input.expectedWorktreeRegistryDigest,
         });
         if (!observed) {
           clearAttempt(rel);
@@ -1297,6 +1323,11 @@ opts: {
           proof.lockedProof,
         );
         const held = Object.keys(progress.heldRefs).length > 0 || composed.disposition === "pending";
+        const ownershipOnly = ownershipOnlyDisposition(
+          progress,
+          composed,
+          proof.lockedProof.checkoutComplete,
+        );
         const effectiveDeferrals = { ...(records[rel]?.deferrals ?? {}) };
         const transition = deferrals[rel];
         if (transition === null) {
@@ -1307,7 +1338,7 @@ opts: {
             else if (transition[lane]) effectiveDeferrals[lane] = transition[lane]!;
           }
         }
-        if (held) {
+        if (held && !(gitOwnershipNoEscalateEnabled() && ownershipOnly)) {
           const heldReason = heldReasonOf(progress);
           const next = nextDeferral("apply", effectiveDeferrals.apply, heldReason, new Date().toISOString(), incomingKey, await checkoutOf(repoDir));
           effectiveDeferrals.apply = next;
@@ -1328,6 +1359,7 @@ opts: {
         };
         return { record, expectedRepoGen: records[rel]?.repoGen ?? 0, relPath: rel, baseProof: proof, ...(previousRecord ? { previousRecord } : {}) };
       };
+      const classificationWorktreeRegistryDigest = await readWorktreeRegistryDigest(repoDir);
       const follow = await runMutation(repoDir, () => followDivergedRepo({
         workspaceRoot: root,
         relPath: rel,
@@ -1365,6 +1397,7 @@ opts: {
             );
             await recordAttempt({
               ...classification,
+              expectedWorktreeRegistryDigest: classificationWorktreeRegistryDigest,
               ...(finalComposed.base ? { boundBase: finalComposed.base } : {}),
               ...(finalComposed.branchBaseOrigins ? { boundOrigins: finalComposed.branchBaseOrigins } : {}),
               observationPartial: partialFrom(classification.progress, false),
@@ -1378,6 +1411,7 @@ opts: {
           } else {
             await recordAttempt({
               ...classification,
+              expectedWorktreeRegistryDigest: classificationWorktreeRegistryDigest,
               observationPartial: partialFrom(classification.progress, true),
             });
           }
@@ -1451,9 +1485,15 @@ opts: {
       if (composedFollow.branchBaseOrigins) branchBaseOrigins[rel] = composedFollow.branchBaseOrigins;
       idxProj[rel] = follow.incomingIndexProjection ?? null;
       if (held.length > 0 || composedFollow.disposition === "pending") {
+        const ownershipOnly = ownershipOnlyDisposition(
+          follow,
+          composedFollow,
+          settledProof.lockedProof.checkoutComplete,
+        );
         pending[rel] = remoteSec;
         partial[rel] = partialFrom(follow, false);
-        setDeferral(rel, "apply", held.length ? heldReasonOf(follow) : "artifact", incomingKey, await checkoutOf(repoDir));
+        if (gitOwnershipNoEscalateEnabled() && ownershipOnly) clearDeferral(rel, "apply");
+        else setDeferral(rel, "apply", held.length ? heldReasonOf(follow) : "artifact", incomingKey, await checkoutOf(repoDir));
       } else {
         delete pending[rel];
         clearAttempt(rel);

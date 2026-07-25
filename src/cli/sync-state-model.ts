@@ -235,6 +235,9 @@ export interface GitHeldAttempt {
   incomingIndexArtifactDescriptor: string;
   localFingerprint: string;
   fingerprintVersion: string;
+  /** Optional only for compatibility with attempts written before design 200 P2.
+   * A missing digest is never eligible for held-skip. */
+  worktreeRegistryDigest?: string;
   reflogs: Array<{ path: string; digest: string }>;
   blockers: TypedBlocker[];
   repoIdentity: string;

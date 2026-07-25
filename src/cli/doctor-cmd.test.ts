@@ -7,13 +7,17 @@ import {
   buildDiagnosticsBundle,
   checkDeviceIdentity,
   collectDoctorContext,
+  collectLeftoverWorktrees,
   doctorCmd,
   presentDiagnosticsPreview,
   redactGitLogLines,
+  renderDoctor,
   type DiagnosticsBundle,
   type DoctorChecks,
   type DoctorContext,
 } from "./doctor-cmd.js";
+import { git } from "../engine/git/shared.js";
+import { saveStateUnsafeLegacyOrTest, syncStreamId } from "./config.js";
 import { saveDevice } from "./e2ee-keystore.js";
 import { bootstrapAccount } from "../engine/e2ee/index.js";
 import { saveCredentials } from "./credentials.js";
@@ -38,6 +42,10 @@ const checks: DoctorChecks = {
   crypto: { ok: true, label: "crypto workers", message: "idle", status: "idle" },
   locking: { ok: true, label: "locking", message: "ok (.rbox/state/sync.lock)", status: "ok" },
   git: { ok: true, label: "git", message: "transactional symref-update supported", status: "supported", current: "git version 2.46.0" },
+};
+const emptyWorktrees = {
+  localOnly: { leftoverWorktrees: { count: 0, entries: [] } },
+  diagnostics: { leftoverWorktrees: { count: 0, entries: [] } },
 };
 
 beforeEach(async () => {
@@ -75,6 +83,7 @@ function sampleBundle(): DiagnosticsBundle {
     metrics: { syncs: 1, commitConflicts409: 0, fileConflicts: 0, lockStarved: 1 },
     activity: { at: "2026-07-03T00:00:00.000Z" },
     workspaceShape: { fileCount: 1, totalBytes: 42 },
+    leftoverWorktrees: { count: 0, entries: [] },
   };
 }
 
@@ -228,6 +237,7 @@ test("stale daemon binding excludes daemon log, metrics, and activity sections",
       checks,
       workspaceShape: { fileCount: 2, totalBytes: 99 },
       daemonStale: true,
+      ...emptyWorktrees,
     };
     const bundle = await buildDiagnosticsBundle(ctx);
     expect(bundle.daemonLogTail).toEqual({ excluded: "stale daemon binding" });
@@ -236,6 +246,100 @@ test("stale daemon binding excludes daemon log, metrics, and activity sections",
     expect(bundle.workspaceShape).toEqual({ fileCount: 2, totalBytes: 99 });
   } finally {
     await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("design 200 P2: doctor prints absolute leftover paths but the bundle contains only the redacted projection", async () => {
+  const root = await makeWorkspace();
+  const privateParent = await fs.mkdtemp(path.join(os.tmpdir(), "doctor-private-parent-"));
+  const linked = path.join(privateParent, "private-linked-name");
+  try {
+    const repo = path.join(root, "repo");
+    await fs.mkdir(repo, { recursive: true });
+    await git(repo, ["init", "-qb", "main"]);
+    await git(repo, ["config", "user.email", "doctor@example.invalid"]);
+    await git(repo, ["config", "user.name", "doctor"]);
+    await fs.writeFile(path.join(repo, "tracked"), "one\n");
+    await git(repo, ["add", "tracked"]);
+    await git(repo, ["commit", "-qm", "one"]);
+    const tip = (await git(repo, ["rev-parse", "HEAD"])).trim();
+    await git(repo, ["branch", "held", tip]);
+    await git(repo, ["worktree", "add", "-q", linked, "held"]);
+
+    const cfg = {
+      schema: "e2ee/v1" as const,
+      remoteWorkspaceId: "ws_diag",
+      projectId: "root",
+      rootPath: root,
+      remoteUrl: "https://api.test",
+      token: "",
+      deviceId: "dev_1",
+      syncGit: true,
+    };
+    const section = {
+      bundleSha: "1".repeat(64),
+      bundleEncSha: "2".repeat(64),
+      bundleCipherSize: 1,
+      head: "ref: refs/heads/main\n",
+      refs: { "refs/heads/main": tip, "refs/heads/held": tip },
+      refScope: "all" as const,
+    };
+    await saveStateUnsafeLegacyOrTest(root, {
+      stream: syncStreamId(cfg),
+      stateNonce: "a".repeat(32),
+      lastSyncedSequence: 1,
+      lastSyncedManifest: {
+        generatedAt: "2026-07-25T00:00:00.000Z",
+        files: [],
+        manifestSchema: 2,
+        gitRepos: { repo: section },
+      },
+    });
+
+    const worktrees = await collectLeftoverWorktrees(root, cfg);
+    expect(worktrees.localOnly).toEqual({
+      count: 1,
+      entries: [{
+        branch: "refs/heads/held",
+        path: linked,
+        prunable: false,
+        holdsSyncedRef: true,
+      }],
+    });
+    expect(worktrees.diagnostics).toEqual({
+      count: 1,
+      entries: [{
+        branch: "refs/heads/held",
+        prunable: false,
+        holdsSyncedRef: true,
+      }],
+    });
+
+    const ctx: DoctorContext = {
+      root,
+      cfg,
+      checks,
+      workspaceShape: { fileCount: 1, totalBytes: 4 },
+      daemonStale: true,
+      localOnly: { leftoverWorktrees: worktrees.localOnly },
+      diagnostics: { leftoverWorktrees: worktrees.diagnostics },
+    };
+    const printed = renderDoctor(ctx.checks, ctx.localOnly);
+    expect(printed).toContain("leftover worktrees: 1");
+    expect(printed).toContain(linked);
+    expect(printed).toContain("refs/heads/held");
+    expect(printed).toContain("prunable no");
+    expect(printed).toContain("holds synced ref yes");
+
+    const payload = JSON.stringify(await buildDiagnosticsBundle(ctx));
+    expect(payload).toContain("\"leftoverWorktrees\"");
+    expect(payload).toContain("\"holdsSyncedRef\":true");
+    for (const secret of [linked, path.basename(linked), path.basename(privateParent)]) {
+      expect(payload).not.toContain(secret);
+    }
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+    await fs.rm(privateParent, { recursive: true, force: true });
   }
 });
 
@@ -261,6 +365,7 @@ test("stopped daemon bound to another workspace excludes daemon-owned diagnostic
       checks: { ...checks, daemon: { ok: false, label: "background sync", message: "stopped", status: "stopped" } },
       workspaceShape: { fileCount: 1, totalBytes: 42 },
       daemonStale: false,
+      ...emptyWorktrees,
     };
 
     const bundle = await buildDiagnosticsBundle(ctx);
@@ -335,6 +440,7 @@ test("git daemon forensics are fail-closed and privacy-safe in diagnostics", asy
       checks: { ...checks, daemon: { ok: true, label: "background sync", message: "running", status: "running" } },
       workspaceShape: { fileCount: 1, totalBytes: 42 },
       daemonStale: false,
+      ...emptyWorktrees,
     };
     const payload = JSON.stringify(await buildDiagnosticsBundle(ctx));
     expect(payload).toContain("git-sync deferred reason=local-edits age=14d");
@@ -368,6 +474,7 @@ test("a byte-truncated Git log record cannot leak a continuation", async () => {
       checks,
       workspaceShape: { fileCount: 1, totalBytes: 42 },
       daemonStale: false,
+      ...emptyWorktrees,
     };
     const payload = JSON.stringify(await buildDiagnosticsBundle(ctx));
     // The byte tail begins within the unsafe Git record, so neither its raw
@@ -395,6 +502,7 @@ test("diagnostics merges bounded dated and crash channels before redaction", asy
       checks,
       workspaceShape: { fileCount: 1, totalBytes: 42 },
       daemonStale: false,
+      ...emptyWorktrees,
     };
     const tail = (await buildDiagnosticsBundle(ctx)).daemonLogTail;
     expect(tail).toContain("crash diagnostic");
@@ -419,6 +527,7 @@ test("diagnostics retains the bounded tail of an oversized daemon source", async
       checks,
       workspaceShape: { fileCount: 1, totalBytes: 42 },
       daemonStale: false,
+      ...emptyWorktrees,
     };
     const tail = (await buildDiagnosticsBundle(ctx)).daemonLogTail;
     expect(tail).toContain("_FINAL_TAIL_SENTINEL");
