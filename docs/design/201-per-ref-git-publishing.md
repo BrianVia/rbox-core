@@ -8,6 +8,14 @@ failed three adversarial codex rounds. Read
 [200 §4.4](./200-worktree-lifecycle-resilience.md) (the superseded record, with the three
 shapes and the code that killed each) and [200 §13.3](./200-worktree-lifecycle-resilience.md)
 (the round-3 findings) before proposing anything here.
+**Amended 2026-07-24 for design 200 v7.** 200 no longer retires a BASE member locally ahead of the
+wire: the capture omits the ref, the publication carries the tombstone, and the **publisher ACK**
+retires `BASE[R]` (200 §3.2, invariant 11). Two consequences for this design, both load-bearing:
+the ACK can now *remove* branch members, so a per-ref model that relays values must never let a
+relayed omission reach that path (new landmine below); and 200 inherited **one more member of this
+design's residual class** — a ref deleted here while another writer advanced it holds, and its
+repository keeps carrying, until a human or a change resolves it (200 §3.6 case (b), §13.4 item 7).
+That case is this design's to remove, for exactly the reason the worktree case is.
 Relates: 200 (the cut), 174 (pending supersession — the mechanism that already covers the
 fast-forward case), 130 (BASE authority, A/P/K artifacts, tombstones), 116 phase-0 (per-ref
 worktree ownership), 163 (SQLite state plane — the likely 2.0-era home for per-ref state).
@@ -74,7 +82,11 @@ From the founder's ruled semantics, and deliberately stated as outcomes rather t
   `P2 no-escalation: capture must not be gagged (no carried pending section)` to tolerate a
   carried pending section while the hold lives. **This design REVERSES that relaxation** — the
   stricter original assertion becomes the gate again, and is the scenario-level definition of
-  done.
+  done. **Reversing it must not break design 200's deletion path**, which since v7 leans on the
+  relaxation for exactly one cycle: the deletion's own per-ref hold sets `pending[rel] = remoteSec`,
+  and the omission supersedes it in the same cycle (200 §3.6). Under per-ref publishing that cycle of
+  carried bookkeeping should become unnecessary rather than merely tolerated — the omission is one
+  ref's transition, and it should publish without the repository's section being involved at all.
 
 ## Landmines for the implementer
 
@@ -95,6 +107,17 @@ shape. None is optional reading.
   (`base-composer.ts:356-367`), and `advertised` is the whole committed section
   (`push.ts:962`, `:971`). Design 200 §3.3 rule 1 reads that provenance as licence to publish a
   **deletion**, so a forged origin here becomes a fleet-wide branch deletion two designs later.
+- **The publisher ACK can now retire branch members, and a relayed omission must never reach it.**
+  Since design 200 v7, `publisher-ack` accepts `absentBranchProofs` and turns a positive BASE member
+  absent when the accepted section omits the ref, a locked expected-absent proof named that exact
+  value, and the section carries the matching tombstone (200 §3.2). Every one of those conditions is
+  about a ref **this device captured from its own refs**. A per-ref model that emits a section
+  composed of captured *and* relayed refs must therefore prove, structurally, that no relayed
+  partition member can contribute an `absentBranchProofs` entry — a relayed absence is another
+  writer's fact, and retiring a BASE member from it is a fleet-wide deletion authored by a device
+  that never observed the deletion. Design 200 §9.2's structural row (the outgoing section is either
+  the reused pending section or a wholly local capture, never a mixture) is the assertion that makes
+  this impossible today; whatever replaces that row must be strictly stronger, not merely different.
 - **Bundle coverage for any BASE that advances past held refs.** `incrementalCapturePlan`
   (`src/cli/sync-git/shared.ts:135-141`) derives the negative basis and the chain from BASE, and
   `captureGitState` passes those tips as `^tip` exclusions (`capture.ts:296-304`). Any model in
