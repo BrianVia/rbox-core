@@ -365,6 +365,79 @@ test("§130 follower prune crosses publishRefPlane, survives carry, fingerprints
   expect((await git(receiver, "for-each-ref", "--format=%(refname)", SETTLED_ABSENCE_PREFIX)).split("\n").filter(Boolean)).toHaveLength(1);
 });
 
+test("design 200 P3 real publish loop waives only a non-destructive cascade and never feeds a branch deletion", async () => {
+  const topicRef = "refs/heads/topic-p3";
+  const carrierRef = "refs/heads/carrier-p3";
+  const baseTip = await commit("base\n", "p3 base");
+
+  await git(sender, "checkout", "-qb", "topic-p3", baseTip);
+  const topicTip = await commit("topic\n", "p3 topic");
+  await git(sender, "checkout", "-qb", "stash-line", baseTip);
+  const stashOld = await commit("stash old\n", "p3 stash old");
+  await git(sender, "update-ref", "refs/stash", stashOld);
+  await git(sender, "checkout", "-qb", "carrier-p3", baseTip);
+  await commit("carrier old\n", "p3 carrier old");
+  await git(sender, "checkout", "-q", "main");
+
+  const base = await capture();
+  await materialize(base);
+  const state = stateWith(base);
+
+  // Receiver-only stash history contains the squash-equivalent topic tip. Its
+  // current value still advances by fast-forward, so this is the non-destructive
+  // ref whose second-pass cascade P3 may waive.
+  await git(receiver, "update-ref", "--create-reflog", "refs/stash", topicTip, stashOld);
+  await git(receiver, "update-ref", "refs/stash", stashOld, topicTip);
+
+  await git(sender, "checkout", "-q", "main");
+  await git(sender, "merge", "--squash", "topic-p3");
+  await git(sender, "commit", "-qm", "p3 squash topic");
+  await git(sender, "checkout", "-q", "stash-line");
+  const stashNew = await commit("stash new\n", "p3 stash new");
+  await git(sender, "update-ref", "refs/stash", stashNew, stashOld);
+  await git(sender, "branch", "-f", "carrier-p3", "topic-p3");
+  await git(sender, "checkout", "-q", "carrier-p3");
+  await commit("carrier new\n", "p3 carrier new");
+  await git(sender, "checkout", "-q", "main");
+  await git(sender, "branch", "-D", "topic-p3");
+  const incoming = await capture();
+
+  // The file plane precedes Git follow in production.
+  await fs.writeFile(path.join(receiver, "tracked.txt"), "topic\n");
+  const ctx = await repoCtx(receiver);
+  if (!ctx) throw new Error("receiver context missing");
+  const waived = new Set<string>();
+  const destructiveHolds = new Set<string>();
+  const plannedDeletions = new Set<string>();
+  const result = await followDivergedRepo({
+    workspaceRoot: workspace,
+    relPath: "repo",
+    ctx,
+    base,
+    incoming,
+    store,
+    kek: KEK,
+    oracle: matchingOracle,
+    record: state.repoRecords!.repo,
+    binding: await checkoutJournalBinding(state.stream, state.stateNonce!, ctx),
+    followEnabled: true,
+    forcedHeldRefs: { [carrierRef]: "ownership" },
+    capabilityProbe: async () => true,
+    makeIntended: () => ({ record: { sourceSeq: 2, base: incoming }, expectedRepoGen: 1, relPath: "repo" }),
+    onContentEquivalentWaiver: (ref) => waived.add(ref),
+    onContentEquivalentDestructiveHold: (ref) => destructiveHolds.add(ref),
+    beforePlanBranchTransition: (ref, afterOid) => { if (afterOid === null) plannedDeletions.add(ref); },
+  });
+
+  expect(waived).toContain("refs/stash");
+  expect(destructiveHolds).toContain(topicRef);
+  expect(result.heldRefs["refs/stash"]).toBeUndefined();
+  expect(await git(receiver, "rev-parse", "refs/stash")).toBe(stashNew);
+  expect(result.heldRefs[topicRef]).toBe("local-commits");
+  expect([...waived].filter((ref) => plannedDeletions.has(ref))).toEqual([]);
+  expect(plannedDeletions.has(topicRef)).toBe(false);
+});
+
 test("§130 crash after prune reconstructs the breadcrumb veto from A exactly once", async () => {
   const topic = "refs/heads/crash-topic";
   const main = await commit("crash main\n", "crash main");

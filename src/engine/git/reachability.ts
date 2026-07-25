@@ -23,9 +23,22 @@ export interface PartitionedOwnership {
 }
 
 export type NoDropProof =
-  | { status: "proven" }
+  | { status: "proven"; marker?: "content-equivalent" }
   | { status: "would-drop"; tip: string }
   | { status: "indeterminate"; marker: "shallow-store" | "missing-object" | "walk-error" };
+
+export interface ContentEquivalenceCache {
+  get(tip: string, durableRoot: string): boolean | undefined;
+  set(tip: string, durableRoot: string, equivalent: boolean): void;
+}
+
+export interface NoDropProofOptions {
+  /** Injectable only so the 5,000-commit production bound has a cheap test. */
+  contentEquivalenceCommitCap?: number;
+  contentEquivalenceCache?: ContentEquivalenceCache;
+}
+
+export const CONTENT_EQUIVALENCE_COMMIT_CAP = 5_000;
 
 // r1 F5: graph classification must never turn a promisor fetch into an
 // apparently complete local proof.
@@ -211,6 +224,7 @@ export async function noDropProof(
   heldRefs: Readonly<Record<string, string>> | readonly string[],
   recoveryPins: Readonly<Record<string, string>> | readonly string[],
   protectedTips: readonly string[],
+  options: NoDropProofOptions = {},
 ): Promise<NoDropProof> {
   const isShallow = await shallow(repoDir);
   if (isShallow !== false) return { status: "indeterminate", marker: isShallow ? "shallow-store" : "walk-error" };
@@ -220,6 +234,7 @@ export async function noDropProof(
   if ("marker" in graph) return { status: "indeterminate", marker: graph.marker };
   const durable = graph.commits.slice(0, durableRoots.length);
   const protectedCommits = graph.commits.slice(durableRoots.length);
+  let contentEquivalent = false;
   for (let i = 0; i < protectedCommits.length; i++) {
     const tip = protectedCommits[i]!;
     let reachable = false;
@@ -232,9 +247,73 @@ export async function noDropProof(
         if (errorCode(error) !== 1) return { status: "indeterminate", marker: errorCode(error) === 128 ? "missing-object" : "walk-error" };
       }
     }
-    if (!reachable) return { status: "would-drop", tip: protectedTips[i]! };
+    if (!reachable) {
+      if (process.env.RBOX_GIT_CONTENT_EQUIV === "0") return { status: "would-drop", tip: protectedTips[i]! };
+      const equivalent = await contentEquivalenceProbe(repoDir, tip, durable, options);
+      if (!equivalent) return { status: "would-drop", tip: protectedTips[i]! };
+      contentEquivalent = true;
+    }
   }
-  return { status: "proven" };
+  return contentEquivalent ? { status: "proven", marker: "content-equivalent" } : { status: "proven" };
+}
+
+function parsePatchIdOutput(raw: string): string[] | undefined {
+  // Empty output is a legitimately empty commit range, not a parse failure —
+  // a durable root sitting at the fork point must not abort the whole probe.
+  const trimmed = raw.trim();
+  if (!trimmed) return [];
+  const result: string[] = [];
+  for (const line of trimmed.split("\n")) {
+    const match = /^([0-9a-f]{40}) [0-9a-f]{40}$/.exec(line);
+    if (!match) return undefined;
+    result.push(match[1]!);
+  }
+  return result;
+}
+
+async function contentEquivalenceProbe(
+  repoDir: string,
+  tip: string,
+  durableRoots: readonly string[],
+  options: NoDropProofOptions,
+): Promise<boolean> {
+  const cap = options.contentEquivalenceCommitCap ?? CONTENT_EQUIVALENCE_COMMIT_CAP;
+  if (!Number.isSafeInteger(cap) || cap < 0) return false;
+  for (const durableRoot of durableRoots) {
+    const cached = options.contentEquivalenceCache?.get(tip, durableRoot);
+    if (cached !== undefined) {
+      if (cached) return true;
+      continue;
+    }
+    try {
+      const base = await git(repoDir, ["merge-base", durableRoot, tip], { env: graphEnv });
+      if (!HEX40.test(base)) return false;
+      const countRaw = await git(repoDir, ["rev-list", "--count", `${base}..${durableRoot}`], { env: graphEnv });
+      if (!/^(0|[1-9][0-9]*)$/.test(countRaw)) return false;
+      const count = Number(countRaw);
+      if (!Number.isSafeInteger(count) || count > cap) return false;
+
+      const tipDiff = await gitRaw(repoDir, ["diff-tree", "-p", "--no-commit-id", base, tip], { env: graphEnv });
+      const tipPatchIds = parsePatchIdOutput(await gitRaw(repoDir, ["patch-id", "--verbatim"], { env: graphEnv, stdin: tipDiff }));
+      if (!tipPatchIds) return false;
+      if (tipPatchIds.length !== 1) {
+        options.contentEquivalenceCache?.set(tip, durableRoot, false);
+        continue;
+      }
+
+      const durableLog = await gitRaw(repoDir, ["log", "-p", "--format=%H", "--no-merges", `${base}..${durableRoot}`], { env: graphEnv });
+      const durablePatchIds = parsePatchIdOutput(await gitRaw(repoDir, ["patch-id", "--verbatim"], { env: graphEnv, stdin: durableLog }));
+      if (!durablePatchIds) return false;
+      const matched = durablePatchIds.includes(tipPatchIds[0]!);
+      options.contentEquivalenceCache?.set(tip, durableRoot, matched);
+      if (matched) return true;
+    } catch {
+      // This probe only improves an already-negative ancestry answer. Missing
+      // objects, shallow/corrupt walks, and subprocess failures remain negative.
+      return false;
+    }
+  }
+  return false;
 }
 
 /** Every stash reflog old/new OID is protection input for owning dir repos. */

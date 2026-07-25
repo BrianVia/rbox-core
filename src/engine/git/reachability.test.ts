@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { execFile } from "node:child_process";
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -24,6 +25,7 @@ const TEST_GIT_ENV = {
 
 let tmp: string;
 let repo: string;
+let priorContentEquivalence: string | undefined;
 
 async function gitAt(dir: string, ...args: string[]): Promise<string> {
   const result = await exec("git", ["-C", dir, ...args], { env: TEST_GIT_ENV });
@@ -63,11 +65,15 @@ function section(head: string, refs: Record<string, string>): GitSection {
 }
 
 beforeEach(async () => {
+  priorContentEquivalence = process.env.RBOX_GIT_CONTENT_EQUIV;
+  delete process.env.RBOX_GIT_CONTENT_EQUIV;
   tmp = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-reachability-"));
   repo = await initRepo();
 });
 
 afterEach(async () => {
+  if (priorContentEquivalence === undefined) delete process.env.RBOX_GIT_CONTENT_EQUIV;
+  else process.env.RBOX_GIT_CONTENT_EQUIV = priorContentEquivalence;
   setGitSpawnObserver(undefined);
   // No subprocess survives its fixture assertion; recursive removal is bounded.
   await fs.rm(tmp, { recursive: true, force: true });
@@ -226,6 +232,172 @@ describe("fail-closed reachability proofs", () => {
 
     expect(await tipOwnedByIncoming(repo, stale, [incoming])).toEqual({ status: "owned" });
     expect(await noDropProof(repo, { "refs/heads/main": incoming }, {}, {}, [stale])).toEqual({ status: "proven" });
+  });
+
+  test("proves a three-commit squash by the whole-range verbatim patch-id", async () => {
+    const base = await commit("base.txt", "base\n");
+    await git("checkout", "-qb", "topic", base);
+    await commit("one.txt", "one\n");
+    await commit("two.txt", "two\n");
+    const topic = await commit("three.txt", "three\n");
+    await git("checkout", "-q", "main");
+    await git("merge", "--squash", "topic");
+    await git("commit", "-qm", "squash topic");
+    const durable = await git("rev-parse", "HEAD");
+
+    expect(await noDropProof(repo, [durable], [], [], [topic])).toEqual({
+      status: "proven",
+      marker: "content-equivalent",
+    });
+
+    // A durable root sitting exactly at the fork point yields an empty
+    // base..D range; the probe must move on to the next root, not abort.
+    expect(await noDropProof(repo, [base, durable], [], [], [topic])).toEqual({
+      status: "proven",
+      marker: "content-equivalent",
+    });
+  });
+
+  test("does not match unmerged, modified-squash, or rebased-but-unmerged work", async () => {
+    const base = await commit("base.txt", "base\n");
+    await git("checkout", "-qb", "topic", base);
+    const topic = await commit("topic.txt", "topic\n");
+    await git("checkout", "-q", "main");
+    const unrelated = await commit("main.txt", "main\n");
+    expect(await noDropProof(repo, [unrelated], [], [], [topic])).toEqual({ status: "would-drop", tip: topic });
+
+    await git("cherry-pick", "-n", topic);
+    await fs.appendFile(path.join(repo, "topic.txt"), "modified\n");
+    await git("add", "topic.txt");
+    await git("commit", "-qm", "modified squash");
+    const modified = await git("rev-parse", "HEAD");
+    expect(await noDropProof(repo, [modified], [], [], [topic])).toEqual({ status: "would-drop", tip: topic });
+
+    await git("checkout", "-qb", "rebase-topic", base);
+    await commit("rebase.txt", "rebased work\n");
+    await git("rebase", "main");
+    const rebased = await git("rev-parse", "HEAD");
+    expect(await noDropProof(repo, [modified], [], [], [rebased])).toEqual({ status: "would-drop", tip: rebased });
+  });
+
+  test("--verbatim refuses a whitespace-only near-match that --stable would accept", async () => {
+    const base = await commit("code.txt", "root\n");
+    await git("checkout", "-qb", "topic", base);
+    const topic = await commit("code.txt", "  indented\n");
+    await git("checkout", "-q", "main");
+    const durable = await commit("code.txt", "    indented\n");
+
+    expect(await noDropProof(repo, [durable], [], [], [topic])).toEqual({ status: "would-drop", tip: topic });
+  });
+
+  test("content equivalence reads the literal graph and ignores replacement objects", async () => {
+    const base = await commit("base.txt", "base\n");
+    await git("checkout", "-qb", "topic", base);
+    const topic = await commit("topic.txt", "topic\n");
+    await git("checkout", "-q", "main");
+    const durable = await commit("main.txt", "main\n");
+    const topicTree = await git("rev-parse", `${topic}^{tree}`);
+    const replacement = await git("commit-tree", topicTree, "-p", base, "-m", "replacement durable");
+    await git("replace", durable, replacement);
+
+    expect(await noDropProof(repo, [durable], [], [], [topic])).toEqual({ status: "would-drop", tip: topic });
+  });
+
+  test("pins the known apply-then-revert false positive as content-equivalent", async () => {
+    const base = await commit("base.txt", "base\n");
+    await git("checkout", "-qb", "topic", base);
+    const topic = await commit("topic.txt", "topic\n");
+    await git("checkout", "-q", "main");
+    await git("merge", "--squash", "topic");
+    await git("commit", "-qm", "squash topic");
+    const squash = await git("rev-parse", "HEAD");
+    await git("revert", "--no-edit", squash);
+    const durable = await git("rev-parse", "HEAD");
+
+    expect(await noDropProof(repo, [durable], [], [], [topic])).toEqual({
+      status: "proven",
+      marker: "content-equivalent",
+    });
+  });
+
+  test("the content-equivalence walk cap preserves would-drop", async () => {
+    const base = await commit("base.txt", "base\n");
+    await git("checkout", "-qb", "topic", base);
+    const topic = await commit("topic.txt", "topic\n");
+    await git("checkout", "-q", "main");
+    await git("merge", "--squash", "topic");
+    await git("commit", "-qm", "squash topic");
+    const durable = await git("rev-parse", "HEAD");
+    expect(await noDropProof(repo, [durable], [], [], [topic], { contentEquivalenceCommitCap: 0 }))
+      .toEqual({ status: "would-drop", tip: topic });
+  });
+
+  test("probe failures stay would-drop and never manufacture indeterminate", async () => {
+    const base = await commit("base.txt", "base\n");
+    await git("checkout", "-qb", "topic", base);
+    const topic = await commit("topic.txt", "topic\n");
+    await git("checkout", "-q", "main");
+    await git("merge", "--squash", "topic");
+    await git("commit", "-qm", "squash topic");
+    const durable = await git("rev-parse", "HEAD");
+    setGitSpawnObserver((_root, args) => {
+      if (args[0] === "diff-tree") throw new Error("forced content-equivalence failure");
+    });
+    const result = await noDropProof(repo, [durable], [], [], [topic]);
+    expect(result).toEqual({ status: "would-drop", tip: topic });
+    expect(result.status).not.toBe("indeterminate");
+  });
+
+  test("an object disappearing inside the probe stays would-drop", async () => {
+    const base = await commit("base.txt", "base\n");
+    await git("checkout", "-qb", "topic", base);
+    const topic = await commit("topic.txt", "topic\n");
+    const topicBlob = await git("rev-parse", `${topic}:topic.txt`);
+    await git("checkout", "-q", "main");
+    await git("merge", "--squash", "topic");
+    await git("commit", "-qm", "squash topic");
+    const durable = await git("rev-parse", "HEAD");
+    setGitSpawnObserver((_root, args) => {
+      if (args[0] !== "diff-tree") return;
+      fsSync.rmSync(path.join(repo, ".git", "objects", topicBlob.slice(0, 2), topicBlob.slice(2)));
+    });
+    const result = await noDropProof(repo, [durable], [], [], [topic]);
+    expect(result).toEqual({ status: "would-drop", tip: topic });
+    expect(result.status).not.toBe("indeterminate");
+  });
+
+  test("RBOX_GIT_CONTENT_EQUIV=0 restores the ancestry-only answer", async () => {
+    const base = await commit("base.txt", "base\n");
+    await git("checkout", "-qb", "topic", base);
+    const topic = await commit("topic.txt", "topic\n");
+    await git("checkout", "-q", "main");
+    await git("merge", "--squash", "topic");
+    await git("commit", "-qm", "squash topic");
+    const durable = await git("rev-parse", "HEAD");
+    process.env.RBOX_GIT_CONTENT_EQUIV = "0";
+    expect(await noDropProof(repo, [durable], [], [], [topic])).toEqual({ status: "would-drop", tip: topic });
+  });
+
+  test("an immutable (tip,durable-root) cache runs the probe only once", async () => {
+    const base = await commit("base.txt", "base\n");
+    await git("checkout", "-qb", "topic", base);
+    const topic = await commit("topic.txt", "topic\n");
+    await git("checkout", "-q", "main");
+    await git("merge", "--squash", "topic");
+    await git("commit", "-qm", "squash topic");
+    const durable = await git("rev-parse", "HEAD");
+    const entries = new Map<string, boolean>();
+    const cache = {
+      get: (tip: string, root: string) => entries.get(`${tip}:${root}`),
+      set: (tip: string, root: string, equivalent: boolean) => { entries.set(`${tip}:${root}`, equivalent); },
+    };
+    let patchIdCalls = 0;
+    setGitSpawnObserver((_root, args) => { if (args[0] === "patch-id") patchIdCalls++; });
+    const first = await noDropProof(repo, [durable], [], [], [topic], { contentEquivalenceCache: cache });
+    const second = await noDropProof(repo, [durable], [], [], [topic], { contentEquivalenceCache: cache });
+    expect(first).toEqual({ status: "proven", marker: "content-equivalent" });
+    expect(second).toEqual(first);
+    expect(patchIdCalls).toBe(2);
   });
 
   test("explicitly peels annotated tag ownership roots", async () => {
