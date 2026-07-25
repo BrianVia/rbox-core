@@ -198,6 +198,23 @@ describe("POST /v1/fleet/sync-state", () => {
     expect(Number(row?.reported_at)).toBeGreaterThanOrEqual(before);
   });
 
+  test("accepts deletion-pending and rejects an unknown deferral reason", async () => {
+    const a = await bootstrap("sync-state-deletion-pending");
+    const ws = `ws_state_${sequence}_deletion`;
+    await env.rbox_dev_db.prepare("INSERT INTO workspaces(workspace_id, project_id, created_at, account_id) VALUES (?, 'root', ?, ?)").bind(ws, Date.now(), a.accountId).run();
+    const base = { workspaceId: ws, projectId: "root", bindingId: "0123456789abcdef", fileSeq: 12, reposTotal: 1, reposDeferred: 1, oldestDeferralAgeMs: 99 };
+    const response = await ingestSyncState(new Request(`${BASE}/v1/fleet/sync-state`, {
+      method: "POST",
+      body: JSON.stringify({ v: 1, states: [
+        { ...base, deferralReasons: ["deletion-pending"] },
+        { ...base, bindingId: "1111111111111111", deferralReasons: ["unknown-reason"] },
+      ] }),
+    }), testEnv(), devicePrincipal(a));
+    expect(await response.json()).toEqual({ accepted: 1, dropped: 1 });
+    expect(await env.rbox_dev_db.prepare("SELECT deferral_reasons FROM device_sync_state WHERE device_id = ?").bind(a.deviceId).first())
+      .toMatchObject({ deferral_reasons: "deletion-pending" });
+  });
+
   test("canonicalizes reasons and reports invalid and unauthorized state drops", async () => {
     const a = await bootstrap("sync-state-reasons-a");
     const b = await bootstrap("sync-state-reasons-b");
@@ -259,7 +276,7 @@ describe("POST /v1/fleet/sync-state", () => {
       { ...base, oldestDeferralAgeMs: null },
       { ...base, deferralReasons: [] },
       { ...base, deferralReasons: ["not-a-reason"] },
-      { ...base, deferralReasons: Array.from({ length: 17 }, () => "local-edits") },
+      { ...base, deferralReasons: Array.from({ length: 18 }, () => "local-edits") },
     ];
     const response = await ingestSyncState(new Request(`${BASE}/v1/fleet/sync-state`, { method: "POST", body: JSON.stringify({ v: 1, states: invalid }) }), testEnv(), devicePrincipal(a));
     expect(await response.json()).toEqual({ accepted: 0, dropped: invalid.length });

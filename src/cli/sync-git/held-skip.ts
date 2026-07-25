@@ -36,7 +36,8 @@ export function sortedTypedBlockers(blockers: readonly TypedBlocker[]): TypedBlo
 
 export function heldBlockersAllowSkip(blockers: readonly TypedBlocker[]): boolean {
   return blockers.length > 0 && blockers.every((blocker) =>
-    blocker.reason === "local-commits" || blocker.reason === "local-stash" || blocker.reason === "local-index");
+    blocker.reason === "local-commits" || blocker.reason === "local-stash"
+      || blocker.reason === "deletion-pending" || blocker.reason === "local-index");
 }
 
 /**
@@ -58,6 +59,7 @@ export function blockersAfterComposer(input: {
     classification.some((blocker) => blocker.provenance === "ref-plane"
       && blocker.ref === hold.ref
       && ((blocker.reason === "local-commits" && hold.code === "missing-branch-proof")
+        || (blocker.reason === "deletion-pending" && hold.code === "missing-branch-proof")
         || (blocker.reason === "local-stash" && hold.code === "missing-safe-ref-proof")));
   const unmatchedHolds = allowlisted && input.checkoutComplete
     ? input.holds.filter((hold) => !causallyMapped(hold))

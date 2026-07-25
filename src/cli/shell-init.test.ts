@@ -178,6 +178,19 @@ test("shell.deferrals routes on component boundaries and chooses the deepest enc
   expect(driveHooks(writeScript(), ws, join(ws, "repository")).glyph).toContain("✓");
 });
 
+test("shell.deferrals accepts deletion-pending without dropping the sidecar", () => {
+  if (!ZSH) return;
+  const now = Math.floor(Date.now() / 1000);
+  const ws = makeWorkspace(
+    `v1 ${now} ok - 80 - - ws\n`,
+    "v1\nrepo\tdeletion-pending\t1h\t0\n",
+  );
+  mkdirSync(join(ws, "repo"), { recursive: true });
+  const driven = driveHooks(writeScript(), ws, join(ws, "repo"));
+  expect(driven.glyph).toContain("⚠git:1h");
+  expect(driven.banner).toContain("git deferred 1h");
+});
+
 test("shell.deferrals root overflow row warns an omitted 51st repo while explicit rows win", () => {
   if (!ZSH) return;
   const now = Math.floor(Date.now() / 1000);

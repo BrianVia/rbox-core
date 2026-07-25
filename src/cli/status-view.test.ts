@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import type { DaemonActivity } from "./activity.js";
+import { GIT_DEFERRAL_REASONS } from "./sync-state-model.js";
 import {
   ageBucket,
   attributeDaemonForStatus,
@@ -122,6 +123,17 @@ test("projectGitDeferralRepos collapses lanes by oldest age, reason precedence, 
   expect(projected[1]).toMatchObject({ repo: "other", displayReason: "config", remediationClass: "config" });
 });
 
+test("deletion-pending gets its deliberate display slot without changing legacy ties", () => {
+  const project = (other: "local-commits" | "conflict" | "worktree-ownership") =>
+    projectGitDeferralRepos([
+      { repo: "repo", deferral: { lane: "capture", reason: other, deferredSince: iso(3600), reasonSince: iso(3600) } },
+      { repo: "repo", deferral: { lane: "apply", reason: "deletion-pending", deferredSince: iso(60), reasonSince: iso(60) } },
+    ], NOW)[0]!;
+  expect(project("local-commits")).toMatchObject({ displayReason: "local-commits" });
+  expect(project("conflict")).toMatchObject({ displayReason: "deletion-pending", reasonLabel: "finishing a branch deletion" });
+  expect(project("worktree-ownership")).toMatchObject({ displayReason: "deletion-pending", reasonLabel: "finishing a branch deletion" });
+});
+
 test("projection derives resolver capability from the complete record and sorts invalid times last", () => {
   const valid = { lane: "apply" as const, reason: "conflict" as const, deferredSince: iso(60), reasonSince: iso(30) };
   const record = {
@@ -140,8 +152,7 @@ test("projection derives resolver capability from the complete record and sorts 
 });
 
 test("the reason vocabulary is exhaustive and unknown reasons stay opaque and non-actionable", () => {
-  const reasons = ["local-edits", "local-index", "local-operation", "local-commits", "local-stash", "conflict", "git-busy", "stale-unattributed", "worktree-ownership", "ignored-target", "unreadable", "artifact", "config", "containment", "unsupported", "other"];
-  for (const reason of reasons) {
+  for (const reason of GIT_DEFERRAL_REASONS) {
     const presentation = gitDeferralReasonPresentation(reason);
     expect(presentation.label.length).toBeGreaterThan(0);
     expect(presentation.text.length).toBeGreaterThan(0);

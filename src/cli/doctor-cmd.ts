@@ -112,6 +112,7 @@ function gitReasonOf(detail: string, fallback = "other"): string {
   if (/local edits|working (?:tree|files)|unstaged|porcelain/.test(detail.toLowerCase())) return "local-edits";
   if (/local index|\bstaged\b|\bindex\b/.test(detail.toLowerCase())) return "local-index";
   if (/operation|rebase|cherry-pick|sequencer|bisect|revert/.test(detail.toLowerCase())) return "local-operation";
+  if (/branch (?:was )?deleted here|deleted (?:local )?branch|finishing (?:a )?branch deletion/.test(detail.toLowerCase())) return "deletion-pending";
   if (/local commits?|diverg|held refs?|\bheads?\b/.test(detail.toLowerCase())) return "local-commits";
   if (/stash/.test(detail.toLowerCase())) return "local-stash";
   if (/conflict/.test(detail.toLowerCase())) return "conflict";

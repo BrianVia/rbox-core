@@ -22,15 +22,36 @@ afterEach(async () => Promise.all(roots.splice(0).map((root) => fs.rm(root, { re
 
 const localCommit: TypedBlocker = { provenance: "checkout", reason: "local-commits" };
 const localStash: TypedBlocker = { provenance: "ref-plane", reason: "local-stash", ref: "refs/stash" };
+const deletionPending: TypedBlocker = { provenance: "ref-plane", reason: "deletion-pending", ref: "refs/heads/deleted" };
 const localIndex: TypedBlocker = { provenance: "checkout", reason: "local-index" };
 
 test("held skip is non-vacuous and every blocker must be allowlisted", () => {
   expect(heldBlockersAllowSkip([])).toBe(false);
   expect(heldBlockersAllowSkip([localCommit, localStash])).toBe(true);
+  expect(heldBlockersAllowSkip([deletionPending])).toBe(true);
   expect(heldBlockersAllowSkip([localCommit, localStash, localIndex])).toBe(true);
   expect(heldBlockersAllowSkip([localCommit, { provenance: "indeterminate", reason: "unreadable", detail: "missing object" }])).toBe(false);
   expect(heldBlockersAllowSkip([localStash, { provenance: "checkout", reason: "worktree-ownership" }])).toBe(false);
   expect(gitHeldSkipEnabled({ RBOX_GIT_HELD_SKIP: "0" })).toBe(false);
+});
+
+test("deletion-pending maps only to the matching missing branch proof", () => {
+  const matching = blockersAfterComposer({
+    classification: [deletionPending],
+    disposition: "pending",
+    holds: [{ ref: "refs/heads/deleted", code: "missing-branch-proof" }],
+    checkoutComplete: true,
+  });
+  expect(matching).toEqual([deletionPending]);
+  const wrongProof = blockersAfterComposer({
+    classification: [deletionPending],
+    disposition: "pending",
+    holds: [{ ref: "refs/heads/deleted", code: "mismatched-branch-proof" }],
+    checkoutComplete: true,
+  });
+  expect(wrongProof).toContainEqual(expect.objectContaining({
+    provenance: "composer", ref: "refs/heads/deleted", code: "mismatched-branch-proof",
+  }));
 });
 
 test("exact mixed classifier triple grants no extra composer authority", () => {

@@ -12,7 +12,7 @@ import {
 const VERBATIM = [
   "held-refs", "tombstone-pruned-this-cycle", "in-progress-present",
   "reason-local-edits", "reason-local-index", "reason-local-operation",
-  "reason-local-commits", "reason-local-stash", "reason-worktree-ownership",
+  "reason-local-commits", "reason-local-stash", "reason-deletion-pending", "reason-worktree-ownership",
   "reason-git-busy", "reason-unreadable", "reason-artifact",
   "reason-containment", "reason-unsupported", "reason-other", "indeterminate", "boundary",
 ] as const satisfies readonly BreadcrumbVetoGate[];
@@ -32,7 +32,8 @@ describe("BreadcrumbVetoGate", () => {
     expect([
       breadcrumbGateForReason("local-edits"), breadcrumbGateForReason("local-index"),
       breadcrumbGateForReason("local-operation"), breadcrumbGateForReason("local-commits"),
-      breadcrumbGateForReason("local-stash"), breadcrumbGateForReason("worktree-ownership"),
+      breadcrumbGateForReason("local-stash"), breadcrumbGateForReason("deletion-pending"),
+      breadcrumbGateForReason("worktree-ownership"),
       breadcrumbGateForReason("git-busy"), breadcrumbGateForReason("unreadable"),
       breadcrumbGateForReason("artifact"), breadcrumbGateForReason("containment"),
       breadcrumbGateForReason("unsupported"), breadcrumbGateForReason("conflict"),
@@ -40,7 +41,7 @@ describe("BreadcrumbVetoGate", () => {
       breadcrumbGateForReason("other"),
     ]).toEqual([
       "reason-local-edits", "reason-local-index", "reason-local-operation", "reason-local-commits",
-      "reason-local-stash", "reason-worktree-ownership", "reason-git-busy", "reason-unreadable",
+      "reason-local-stash", "reason-deletion-pending", "reason-worktree-ownership", "reason-git-busy", "reason-unreadable",
       "reason-artifact", "reason-containment", "reason-unsupported", "reason-other",
       "reason-other", "reason-other", "reason-other",
     ]);

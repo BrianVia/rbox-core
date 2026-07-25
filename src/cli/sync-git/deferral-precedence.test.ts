@@ -28,6 +28,13 @@ test("a conflict-only reason set is never safe and never loses to a lower-preced
   expect(firstReason(new Set<GitDeferralReason>(["conflict", "local-edits"]))).toBe("local-edits");
 });
 
+test("deletion-pending ranks after human divergence and before structural blockers", () => {
+  const winner = (reasons: GitDeferralReason[]): GitDeferralReason | undefined => firstReason(new Set(reasons));
+  expect(winner(["deletion-pending", "local-commits"])).toBe("local-commits");
+  expect(winner(["conflict", "deletion-pending"])).toBe("deletion-pending");
+  expect(winner(["worktree-ownership", "deletion-pending"])).toBe("deletion-pending");
+});
+
 test("the shipped precedence of the original reasons is unchanged", () => {
   // Ordering is user-visible: it decides which reason a multi-blocker repo
   // reports. The four members added with the totality fix may only be inserted
