@@ -37,6 +37,7 @@ export function pendingSupersessionAckConverges(input: {
   previousOrigins?: Record<string, BranchBaseOrigin>;
   candidate: GitSection;
   binding: { lineageHash: string; repositoryIdentityHash: string; repoKind: "dir" | "pointer" };
+  absentBranchProofs?: Readonly<Record<string, { priorOid: string }>>;
 }): boolean {
   const DRY_RUN_SOURCE_SEQ = 0;
   const composed = composeRepoBase(
@@ -49,6 +50,7 @@ export function pendingSupersessionAckConverges(input: {
       incomingKey: gitIncomingKey(input.candidate),
       sourceSeq: DRY_RUN_SOURCE_SEQ,
       advertisedRefs: input.candidate.refs,
+      ...(input.absentBranchProofs ? { absentBranchProofs: input.absentBranchProofs } : {}),
     },
     {
       repoKind: input.binding.repoKind,
@@ -88,6 +90,7 @@ export async function pendingSupersessionPreProbe(
   root: string,
   relPath: string,
   pending: GitSection,
+  base?: GitSection,
 ): Promise<PendingPreProbeResult> {
   try {
     const before = await gitFingerprint(gitFingerprintRun("per-decision"), root, relPath);
@@ -102,7 +105,12 @@ export async function pendingSupersessionPreProbe(
     }
     for (const [ref, oid] of Object.entries(pending.refs)) {
       const live = identity.refs[ref];
-      if (live === undefined) return { status: "carry", reason: `local repository lacks pending ref ${ref}` };
+      if (live === undefined) {
+        if (process.env.RBOX_GIT_ABSENCE_CAPTURE !== "0"
+          && ref.startsWith("refs/heads/")
+          && base?.refs[ref] === oid) continue;
+        return { status: "carry", reason: `local repository lacks pending ref ${ref}` };
+      }
       if ((ref.startsWith("refs/tags/") || ref === "refs/stash") && live !== oid) {
         return { status: "carry", reason: `local repository mismatches exact pending ref ${ref}` };
       }
@@ -120,6 +128,7 @@ export async function pendingSupersessionPreProbe(
           preflightStructural: false,
           preflightKind: preflight.kind,
           identityKey: gitIdentityKey(identity),
+          identityRefs: identity.refs,
         },
         ...(preflight.kind ? { kind: preflight.kind } : {}),
       },
@@ -187,6 +196,8 @@ export async function provePendingSupersession(input: {
   candidate: GitSection;
   store: BlobStore;
   kek: Buffer;
+  base?: GitSection;
+  absentBranchProofs?: Readonly<Record<string, { priorOid: string }>>;
 }): Promise<boolean> {
   try {
     if (!validateGitSection(input.pending).ok || !validateGitSection(input.candidate).ok) return false;
@@ -197,7 +208,12 @@ export async function provePendingSupersession(input: {
 
     const refProofs = await Promise.all(Object.entries(input.pending.refs).map(async ([ref, pendingOid]) => {
       const candidateOid = input.candidate.refs[ref];
-      if (candidateOid === undefined) return false;
+      if (candidateOid === undefined) {
+        const absence = input.absentBranchProofs?.[ref];
+        return ref.startsWith("refs/heads/")
+          && absence?.priorOid === pendingOid
+          && input.base?.refs[ref] === pendingOid;
+      }
       if (ref.startsWith("refs/heads/")) {
         return equalOrFastForward(input.ctx.repoDir, pendingOid, candidateOid);
       } else if (ref.startsWith("refs/tags/") || ref === "refs/stash") {

@@ -56,6 +56,7 @@ export function normalizePublishedGitSection(
   candidate: GitSection,
   now: string,
   pendingRetention?: GitSection,
+  absentBranchProofs: Readonly<Record<string, { priorOid: string }>> = {},
 ): TombstoneNormalizationResult {
   const nowMs = Date.parse(now);
   if (!Number.isFinite(nowMs) || new Date(nowMs).toISOString() !== now) {
@@ -120,6 +121,19 @@ export function normalizePublishedGitSection(
       chains.set(ref, byOid);
     }
   }
+  if (candidate.refScope === "all") {
+    for (const [ref, proof] of Object.entries(absentBranchProofs).sort(([a], [b]) => bytewise(a, b))) {
+      if (!ref.startsWith("refs/heads/") || candidate.refs[ref] !== undefined || !/^[0-9a-f]{40}$/.test(proof.priorOid)) continue;
+      const byOid = chains.get(ref) ?? new Map<string, GitRefTombstone>();
+      if (generation === Number.MAX_SAFE_INTEGER) {
+        overflow++;
+        continue;
+      }
+      generation++;
+      byOid.set(proof.priorOid, { oid: proof.priorOid, ts: now, generation });
+      chains.set(ref, byOid);
+    }
+  }
   if (overflow) findings.push({ kind: "generation-overflow", count: overflow });
 
   const cutoff = nowMs - REF_TOMBSTONE_RETENTION_MS;
@@ -175,6 +189,7 @@ export function normalizeOutgoingGitSections(
   pending: Readonly<Record<string, GitSection>>,
   advertised: Readonly<Record<string, GitSection | undefined>>,
   now: string,
+  absentBranchProofs: Readonly<Record<string, Readonly<Record<string, { priorOid: string }>>>> = {},
 ): { sections: Record<string, GitSection>; findings: Array<{ relPath: string; finding: TombstoneNormalizationFinding }> } {
   const sections: Record<string, GitSection> = {};
   const findings: Array<{ relPath: string; finding: TombstoneNormalizationFinding }> = [];
@@ -185,7 +200,7 @@ export function normalizeOutgoingGitSections(
       sections[relPath] = pendingSection;
       continue;
     }
-    const normalized = normalizePublishedGitSection(advertised[relPath], section, now, pendingSection);
+    const normalized = normalizePublishedGitSection(advertised[relPath], section, now, pendingSection, absentBranchProofs[relPath]);
     sections[relPath] = normalized.section;
     findings.push(...normalized.findings.map((finding) => ({ relPath, finding })));
   }

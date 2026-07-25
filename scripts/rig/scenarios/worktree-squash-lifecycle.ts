@@ -371,9 +371,16 @@ git switch -q main
       rec.assert("P2 no-escalation: repo must not carry a whole-repo apply deferral while one ref is held",
         heldRecord?.deferrals?.apply === undefined,
         `A deferrals=${JSON.stringify(heldRecord?.deferrals ?? {})} (heldRefs=${JSON.stringify(heldRecord?.partial?.heldRefs ?? {})})`);
-      rec.assert("P2 no-escalation: capture must not be gagged (no carried pending section)",
-        heldRecord?.pending === undefined || heldRecord?.pending === null,
-        heldRecord?.pending ? `pending.refs=[${refNames(heldRecord.pending).join(" ")}] — apply.ts:1447 escalation` : "pending absent");
+      // RELAXED per design 200 §9.6 (R5: P4 cut): holding a divergent ref for a
+      // live worktree's lifetime is legitimate, and the carried WHOLE pending
+      // section is its bookkeeping — the per-ref split lives in record.partial.
+      // Design 201 reverses this relaxation. The section must still disappear
+      // after the worktree+branch go (asserted by the post-deletion gate below).
+      rec.assert("P2 no-escalation (relaxed): a carried pending section is bookkeeping — partial must split it per-ref",
+        heldRecord?.pending === undefined || heldRecord?.pending === null
+          || (Object.keys(heldRecord?.partial?.heldRefs ?? {}).includes(BRANCH_REF)
+            && Object.keys(heldRecord?.partial?.appliedRefs ?? {}).some((r) => r !== BRANCH_REF)),
+        `pending.refs=[${refNames(heldRecord?.pending ?? undefined).join(" ")}] heldRefs=${JSON.stringify(heldRecord?.partial?.heldRefs ?? {})} appliedRefs=${JSON.stringify(heldRecord?.partial?.appliedRefs ?? [])}`);
       rec.assert("P2 no-escalation: unrelated incoming ref applies while one ref is held",
         (await gitRev(ctx.a, PEER_BRANCH)) === peerTip,
         `A ${PEER_BRANCH}=${(await gitRev(ctx.a, PEER_BRANCH)).slice(0, 12) || "(absent)"} want=${peerTip.slice(0, 12)}`);

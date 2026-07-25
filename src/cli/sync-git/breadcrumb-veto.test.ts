@@ -13,7 +13,7 @@ const VERBATIM = [
   "held-refs", "tombstone-pruned-this-cycle", "in-progress-present",
   "reason-local-edits", "reason-local-index", "reason-local-operation",
   "reason-local-commits", "reason-local-stash", "reason-deletion-pending", "reason-worktree-ownership",
-  "reason-git-busy", "reason-unreadable", "reason-artifact",
+  "reason-git-busy", "reason-ref-read-unreadable", "reason-unreadable", "reason-artifact",
   "reason-containment", "reason-unsupported", "reason-other", "indeterminate", "boundary",
 ] as const satisfies readonly BreadcrumbVetoGate[];
 
@@ -34,14 +34,15 @@ describe("BreadcrumbVetoGate", () => {
       breadcrumbGateForReason("local-operation"), breadcrumbGateForReason("local-commits"),
       breadcrumbGateForReason("local-stash"), breadcrumbGateForReason("deletion-pending"),
       breadcrumbGateForReason("worktree-ownership"),
-      breadcrumbGateForReason("git-busy"), breadcrumbGateForReason("unreadable"),
+      breadcrumbGateForReason("git-busy"), breadcrumbGateForReason("ref-read-unreadable"), breadcrumbGateForReason("unreadable"),
       breadcrumbGateForReason("artifact"), breadcrumbGateForReason("containment"),
       breadcrumbGateForReason("unsupported"), breadcrumbGateForReason("conflict"),
       breadcrumbGateForReason("ignored-target"), breadcrumbGateForReason("config"),
       breadcrumbGateForReason("other"),
     ]).toEqual([
       "reason-local-edits", "reason-local-index", "reason-local-operation", "reason-local-commits",
-      "reason-local-stash", "reason-deletion-pending", "reason-worktree-ownership", "reason-git-busy", "reason-unreadable",
+      "reason-local-stash", "reason-deletion-pending", "reason-worktree-ownership", "reason-git-busy",
+      "reason-ref-read-unreadable", "reason-unreadable",
       "reason-artifact", "reason-containment", "reason-unsupported", "reason-other",
       "reason-other", "reason-other", "reason-other",
     ]);

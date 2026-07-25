@@ -35,6 +35,35 @@ const section = (
 const entry = (n: number, generation = n, ts = at(1)): GitRefTombstone => ({ oid: oid(n), ts, generation });
 
 describe("design 130 publisher chain and generation walk", () => {
+  test("design 200 proof authors the exact BASE OID without advertised-diff authority", () => {
+    const ref = "refs/heads/deleted";
+    const prior = oid(77);
+    const result = normalizePublishedGitSection(undefined, section({}), at(2), undefined, {
+      [ref]: { priorOid: prior },
+    });
+    expect(result.section.refTombstones?.[ref]).toEqual([{ oid: prior, ts: at(2), generation: 1 }]);
+    expect(result.section.refTombstoneGeneration).toBe(1);
+    const refreshed = normalizePublishedGitSection(result.section, result.section, at(3), undefined, {
+      [ref]: { priorOid: prior },
+    });
+    expect(refreshed.section.refTombstones?.[ref]).toHaveLength(1);
+  });
+
+  test("proof-backed re-deletion refreshes an inherited tombstone timestamp and generation", () => {
+    const ref = "refs/heads/deleted";
+    const prior = oid(77);
+    const inherited = section({}, {
+      refTombstones: { [ref]: [{ oid: prior, ts: at(1), generation: 4 }] },
+      refTombstoneGeneration: 4,
+    });
+    const refreshed = normalizePublishedGitSection(inherited, inherited, at(9), undefined, {
+      [ref]: { priorOid: prior },
+    });
+    expect(refreshed.section.refTombstones?.[ref]).toEqual([
+      { oid: prior, ts: at(9), generation: 5 },
+    ]);
+    expect(refreshed.section.refTombstoneGeneration).toBe(5);
+  });
   test("S0:Q → S1:T → S2:absent retains the complete supersession chain", () => {
     const ref = "refs/heads/topic";
     const s0 = section({ [ref]: oid(1) });

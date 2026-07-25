@@ -4,7 +4,7 @@ import type { BlobStore, ByteProgressCallback } from "../blobstore.js";
 import { validateGitSection } from "../manifest-validate.js";
 import type { GitArtifactRef, GitSection } from "../types.js";
 import { clearIndexResolveUndo, exists, git, gitOk, headBranchOf, listWorktrees, putGitArtifact, readHead, type RepoCtx, repoCtx } from "./shared.js";
-import { hasInProgressOpState, readAllRefs, readOpStateSnapshot, readScopedRefs } from "./refs.js";
+import { hasInProgressOpState, readAllRefsStrict, readOpStateSnapshot, readScopedRefs } from "./refs.js";
 import { type ScratchPins, WIP_NS, collectPinShas, createScratchPins, deleteScratchPins, pruneStaleScratchRefs } from "./pins.js";
 import { indexTreeOfPath } from "./identity.js";
 import { hashFile } from "../hash.js";
@@ -26,6 +26,14 @@ import { hashFile } from "../hash.js";
 
 export class GitCaptureDeferredError extends Error {
   override name = "GitCaptureDeferredError";
+}
+
+async function readCaptureRefsStrict(repoDir: string): Promise<Record<string, string>> {
+  const result = await readAllRefsStrict(repoDir);
+  if (result.status === "unreadable") {
+    throw new GitCaptureDeferredError(`ref-read-unreadable: ${result.marker}`);
+  }
+  return result.refs;
 }
 
 const WORKTREE_AWARE_CAPTURE_REASON = "git >= 2.15 required for worktree-aware capture";
@@ -256,7 +264,7 @@ export async function captureGitState(repoDir: string, store: BlobStore, kek: Bu
 
     // 2. refs + HEAD (scope-aware) — read via git / atomic file from the resolved gitdir.
     let head = await readHead(ctx);
-    const refs = ctx.kind === "dir" ? await readAllRefs(repoDir) : await readScopedRefs(repoDir, head);
+    const refs = ctx.kind === "dir" ? await readCaptureRefsStrict(repoDir) : await readScopedRefs(repoDir, head);
     head = normalizeSymbolicHeadCasing(head, refs);
     await opts.testHooks?.afterRefsRecorded?.();
 
@@ -354,7 +362,7 @@ export async function captureGitState(repoDir: string, store: BlobStore, kek: Bu
       await opts.testHooks?.beforeStabilityCheck?.();
       try {
         let liveHead = await readHead(ctx);
-        const liveRefs = ctx.kind === "dir" ? await readAllRefs(repoDir) : await readScopedRefs(repoDir, liveHead);
+        const liveRefs = ctx.kind === "dir" ? await readCaptureRefsStrict(repoDir) : await readScopedRefs(repoDir, liveHead);
         liveHead = normalizeSymbolicHeadCasing(liveHead, liveRefs);
         const liveIndexPath = path.join(ctx.gitDir, "index");
         const liveIndex = await exists(liveIndexPath);
@@ -374,7 +382,8 @@ export async function captureGitState(repoDir: string, store: BlobStore, kek: Bu
           && canonical(liveOpSnapshot.files) === canonical(stagedOpSnapshot.files)
           && JSON.stringify([...liveOpSnapshot.rootsPresent].sort()) === JSON.stringify([...stagedOpSnapshot.rootsPresent].sort());
         if (!stable) throw new Error("snapshot mismatch");
-      } catch {
+      } catch (error) {
+        if (error instanceof GitCaptureDeferredError && error.message.startsWith("ref-read-unreadable:")) throw error;
         throw new GitCaptureDeferredError("your repository changed while publishing — run the command again");
       }
     }

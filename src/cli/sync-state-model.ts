@@ -129,7 +129,7 @@ export interface ConfigShapeIdentity {
 
 export const GIT_DEFERRAL_REASONS = [
   "local-edits", "local-index", "local-operation", "local-commits", "local-stash",
-  "deletion-pending", "conflict", "git-busy", "stale-unattributed", "worktree-ownership", "ignored-target", "unreadable",
+  "deletion-pending", "conflict", "git-busy", "stale-unattributed", "worktree-ownership", "ignored-target", "ref-read-unreadable", "unreadable",
   "artifact", "config", "containment", "unsupported", "other",
 ] as const;
 
@@ -148,7 +148,7 @@ export type GitDeferralReason = (typeof GIT_DEFERRAL_REASONS)[number];
  */
 export const GIT_DEFERRAL_REASON_PRECEDENCE = [
   "local-edits", "local-index", "local-operation", "local-commits", "local-stash", "deletion-pending", "conflict",
-  "worktree-ownership", "git-busy", "stale-unattributed", "unreadable", "artifact", "config",
+  "worktree-ownership", "git-busy", "stale-unattributed", "ref-read-unreadable", "unreadable", "artifact", "config",
   "ignored-target", "containment", "unsupported", "other",
 ] as const satisfies readonly GitDeferralReason[];
 /** Compile-only proof the ranking stays total: a new reason that is not placed
@@ -293,6 +293,8 @@ export interface RepoRecord {
   advertised?: GitSection;
   /** Positive provenance exists only for refs/heads/* and must match BASE exactly. */
   branchBaseOrigins?: Record<string, BranchBaseOrigin>;
+  /** Refuse-only restore detector for the common store's packed refs. */
+  packedRefsIdentity?: { mtimeMs: number };
   pending?: GitSection;
   /** The publisher intentionally omitted this repository without performing any
    * follower branch CAS (for example, structural refusal or syncGit:false).

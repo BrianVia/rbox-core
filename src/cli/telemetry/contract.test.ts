@@ -45,7 +45,7 @@ describe("telemetry wire contract", () => {
     expect(TELEMETRY_SAMPLE_SCHEMAS.ws_health.numbers.notifyLatencySumMs.max).toBe(1_000_000_000_000);
     expect(TELEMETRY_SAMPLE_SCHEMAS.ws_health.numbers.notifyLatencyMaxMs.max).toBe(604_800_000);
     expect(SYNC_STATE_NUMERIC_DOMAINS.fileSeq.max).toBe(2 ** 48);
-    expect(GIT_DEFERRAL_REASONS).toHaveLength(17);
+    expect(GIT_DEFERRAL_REASONS).toHaveLength(18);
     expect(BINDING_ID_RE.test("0123456789abcdef")).toBe(true);
     expect(BINDING_ID_RE.test("0123456789abcdeF")).toBe(false);
   });

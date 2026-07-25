@@ -11,8 +11,8 @@ import {
   type ArtifactBinding,
 } from "../../engine/index.js";
 import type { GitPartialApply } from "../config.js";
-import { branchesCheckedOutElsewhere } from "../../engine/git/apply.js";
-import { readAllRefs } from "../../engine/git/refs.js";
+import { branchesCheckedOutElsewhereStrict } from "../../engine/git/apply.js";
+import { readAllRefsStrict } from "../../engine/git/refs.js";
 import { addTimedMs, readHead, repoCtx, type GitChainTimings } from "../../engine/git/shared.js";
 import type { BranchTransitionWitness, LockedBranchProof } from "./base-composer.js";
 
@@ -39,6 +39,58 @@ export interface PlannedBranchTransition {
 export interface CommittedBranchTransition {
   witness: BranchTransitionWitness;
   lockedProof: LockedBranchProof & { witness: BranchTransitionWitness };
+}
+
+/** A prepared, verify-only proof that a branch is absent. It reserves HEAD and
+ * verifies the ref at the zero OID, but authors no artifact and mutates no ref. */
+export interface PlannedAbsentBranchVerification {
+  repoDir: string;
+  ref: string;
+  lines: string[];
+  headReservation: NonNullable<PlannedBranchTransition["headReservation"]>;
+}
+
+export async function planAbsentBranchVerification(
+  repoDir: string,
+  ref: string,
+): Promise<PlannedAbsentBranchVerification> {
+  branchRefHash(ref);
+  const head = await reserveNonRacingHead(repoDir, ref, true);
+  if (!head.reservation) throw new Error("absence verification lacks a reserved HEAD observation");
+  if (head.reservation.currentRef) throw new Error("current branch cannot be verified as a deletion");
+  return {
+    repoDir,
+    ref,
+    lines: sortedUniqueLines([...head.lines, `verify ${ref} ${ZERO_OID}`]),
+    headReservation: head.reservation,
+  };
+}
+
+export async function commitAbsentBranchVerification(
+  plan: PlannedAbsentBranchVerification,
+  lockedSecondProof: () => Promise<void> = async () => {},
+  chainTimings?: GitChainTimings,
+): Promise<void> {
+  if (plan.headReservation.currentRef) throw new Error("current branch cannot be verified as a deletion");
+  await runPreparedUpdateRefTransaction(plan.repoDir, plan.lines, async () => {
+    const ctx = await addTimedMs(chainTimings, "ownershipMs", () => repoCtx(plan.repoDir));
+    if (!ctx) throw new Error("repository disappeared at prepared absence boundary");
+    const [strict, owned, head] = await addTimedMs(chainTimings, "ownershipMs", () => Promise.all([
+      readAllRefsStrict(plan.repoDir),
+      branchesCheckedOutElsewhereStrict(ctx).then((result) => {
+        if (result.status === "unreadable") throw result.cause;
+        return result.owned;
+      }),
+      readHead(ctx),
+    ]));
+    if (strict.status === "unreadable") throw new Error(`ref-read-unreadable: ${strict.marker}`);
+    if (strict.refs[plan.ref] !== undefined) throw new Error("branch appeared at prepared absence boundary");
+    if (head !== plan.headReservation.content) throw new Error("HEAD changed at prepared absence boundary");
+    if (owned.has(plan.ref)) throw new Error("absent branch became sibling-owned at prepared absence boundary");
+    await addTimedMs(chainTimings, "ownershipMs", lockedSecondProof);
+  }, {
+    ...(chainTimings ? { onExclusiveMs: (ms: number) => { chainTimings.refTxnExclusiveMs += ms; } } : {}),
+  });
 }
 
 export interface PlanBranchTransitionInput {
@@ -306,8 +358,14 @@ export async function commitPlannedBranchTransition(
     const ctx = await addTimedMs(chainTimings, "ownershipMs", () => repoCtx(plan.repoDir));
     if (!ctx) throw new Error("repository disappeared at prepared transaction boundary");
     const [refs, owned, head] = await addTimedMs(chainTimings, "ownershipMs", () => Promise.all([
-      readAllRefs(plan.repoDir),
-      branchesCheckedOutElsewhere(ctx),
+      readAllRefsStrict(plan.repoDir).then((result) => {
+        if (result.status === "unreadable") throw new Error(`ref-read-unreadable: ${result.marker}`);
+        return result.refs;
+      }),
+      branchesCheckedOutElsewhereStrict(ctx).then((result) => {
+        if (result.status === "unreadable") throw result.cause;
+        return result.owned;
+      }),
       readHead(ctx),
     ]));
     if ((refs[plan.ref] ?? null) !== plan.beforeOid) throw new Error("branch changed at prepared transaction boundary");

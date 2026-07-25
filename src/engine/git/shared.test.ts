@@ -1,10 +1,10 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { cleanGitEnv, gitBusy, gitRaw, readLocalGitConfigEntries, repoCtx, setGitSpawnObserver, type RepoCtx } from "./shared.js";
+import { cleanGitEnv, gitBusy, gitRaw, gitStatus, listWorktrees, listWorktreesStrict, readLocalGitConfigEntries, repoCtx, setGitSpawnObserver, type RepoCtx } from "./shared.js";
 import { gitPreflight, gitRefStorage } from "./preflight.js";
 
 const exec = promisify(execFile);
@@ -47,6 +47,100 @@ test("gitRaw feeds stdin, streams stdout without returning it, and retains obser
   expect(returned).toBe("");
   expect(chunks.join("").trim()).toBe(oid);
   expect(observed).toEqual([["rev-list", "--stdin"]]);
+});
+
+async function fakeGitPath(): Promise<{ bin: string; env: NodeJS.ProcessEnv }> {
+  const bin = await tempDir();
+  const executable = path.join(bin, "git");
+  await fs.writeFile(executable, `#!/bin/sh
+mode="$3"
+case "$mode" in
+  ok) printf 'ok-out' ;;
+  fail) printf 'partial-out'; printf 'bounded-error' >&2; exit 7 ;;
+  signal) kill -TERM $$ ;;
+  stdout-overflow) printf '0123456789abcdef' ;;
+  stderr-overflow) printf '0123456789abcdef' >&2; exit 9 ;;
+  stream) printf 'stream-output' ;;
+  incomplete) printf '\\342\\202' ;;
+esac
+`);
+  await fs.chmod(executable, 0o755);
+  return { bin, env: { ...TEST_GIT_ENV, PATH: bin } };
+}
+
+describe("gitStatus structured outcomes", () => {
+  test("exec and spawn lanes preserve successful stdout", async () => {
+    const fake = await fakeGitPath();
+    expect(await gitStatus(".", ["ok"], { env: fake.env })).toEqual({ status: "ok", stdout: "ok-out" });
+    expect(await gitStatus(".", ["ok"], { env: fake.env, stdin: "" })).toEqual({ status: "ok", stdout: "ok-out" });
+  });
+
+  test("exec and spawn lanes retain exit, stdout, stderr, and exact cause", async () => {
+    const fake = await fakeGitPath();
+    for (const opts of [{ env: fake.env }, { env: fake.env, stdin: "" }]) {
+      const result = await gitStatus(".", ["fail"], opts);
+      expect(result).toEqual(expect.objectContaining({
+        status: "failed", exit: 7, stdout: "partial-out", stderr: "bounded-error",
+      }));
+      if (result.status === "failed") {
+        expect(result.cause).toBeInstanceOf(Error);
+        expect((result.cause as { code?: unknown }).code).toBe(7);
+      }
+    }
+  });
+
+  test("signal, ENOENT, and both maxBuffer failures remain non-success data", async () => {
+    const fake = await fakeGitPath();
+    const missing = await tempDir();
+    const rows = [
+      await gitStatus(".", ["signal"], { env: fake.env, stdin: "" }),
+      await gitStatus(".", ["ok"], { env: { ...TEST_GIT_ENV, PATH: missing } }),
+      await gitStatus(".", ["ok"], { env: { ...TEST_GIT_ENV, PATH: missing }, stdin: "" }),
+      await gitStatus(".", ["stdout-overflow"], { env: fake.env, maxBuffer: 4 }),
+      await gitStatus(".", ["stderr-overflow"], { env: fake.env, stdin: "", maxBuffer: 4 }),
+    ];
+    for (const result of rows) {
+      expect(result.status).toBe("failed");
+      if (result.status === "failed") expect(result.cause).toBeInstanceOf(Error);
+    }
+    expect(rows[0]).toEqual(expect.objectContaining({ status: "failed", exit: null }));
+    expect(rows[1]).toEqual(expect.objectContaining({ status: "failed", exit: null }));
+    expect(rows[2]).toEqual(expect.objectContaining({ status: "failed", exit: null }));
+  });
+
+  test("stream callback and observer throws preserve the exact cause object", async () => {
+    const fake = await fakeGitPath();
+    const callbackCause = new Error("callback exploded");
+    const callback = await gitStatus(".", ["stream"], {
+      env: fake.env,
+      onStdoutChunk: () => { throw callbackCause; },
+    });
+    expect(callback).toEqual(expect.objectContaining({ status: "failed", exit: null, cause: callbackCause }));
+
+    const observerCause = new Error("observer exploded");
+    setGitSpawnObserver(() => { throw observerCause; });
+    const observer = await gitStatus(".", ["ok"], { env: fake.env });
+    expect(observer).toEqual(expect.objectContaining({ status: "failed", exit: null, cause: observerCause }));
+  });
+
+  test("stream decoder end and stdin cleanup failures preserve their exact causes", async () => {
+    const fake = await fakeGitPath();
+    const endCause = new Error("decoder end callback exploded");
+    const ended = await gitStatus(".", ["incomplete"], {
+      env: fake.env,
+      onStdoutChunk: () => { throw endCause; },
+    });
+    expect(ended).toEqual(expect.objectContaining({ status: "failed", exit: null, cause: endCause }));
+
+    const cleanupCause = new Error("stdin cleanup exploded");
+    const rm = spyOn(fs, "rm").mockRejectedValueOnce(cleanupCause);
+    try {
+      const cleanup = await gitStatus(".", ["ok"], { env: fake.env, stdin: "" });
+      expect(cleanup).toEqual(expect.objectContaining({ status: "failed", exit: null, cause: cleanupCause }));
+    } finally {
+      rm.mockRestore();
+    }
+  });
 });
 
 test("cleanGitEnv supplies reflog identity fallbacks without replacing caller identity", () => {
@@ -158,4 +252,15 @@ test("ref-storage authority distinguishes an absent key from a failed Git probe"
     reason: expect.stringMatching(/config.*could not be read/i),
   }));
   expect(preflight.structural).toBeUndefined();
+});
+
+test("strict worktree enumeration distinguishes unreadable evidence from an empty list", async () => {
+  const notARepo = await tempDir();
+  expect(await listWorktreesStrict(notARepo)).toEqual(expect.objectContaining({ status: "unreadable" }));
+  expect(await listWorktrees(notARepo)).toEqual([]);
+  const repo = await initRepo();
+  expect(await listWorktreesStrict(repo)).toEqual(expect.objectContaining({
+    status: "ok",
+    entries: expect.arrayContaining([expect.objectContaining({ path: repo })]),
+  }));
 });

@@ -133,19 +133,29 @@ test("design 130 persisted BASE and branch-origin writes are a closed allowlist"
   expect(counts(sites)).toEqual({
     // Design 177 retains read-only oracle proof inputs named `base`; BASE writes
     // still route only through the composer/state transitions guarded below.
-    "src/cli/git/resolve-command.ts": 8,
-    "src/cli/sync-git/apply.ts": 24,
+    "src/cli/git/resolve-command.ts": 9,
+    "src/cli/sync-git/apply.ts": 25,
     "src/cli/sync-git/base-composer.ts": 2,
     "src/cli/sync-git/follow.ts": 1,
     "src/cli/sync-git/p-repair-state.ts": 1,
     "src/cli/sync-git/p-settlement.ts": 1,
     // Design 178 D.3 read-only publisher-ACK composer dry-run inputs/result.
     "src/cli/sync-git/pending-supersession.ts": 3,
+    "src/cli/sync-git/plan.ts": 2,
     "src/cli/sync-state-model.ts": 11,
     "src/cli/sync-state-store.ts": 8,
     "src/cli/sync-state.ts": 14,
     "src/cli/sync/pull.ts": 2,
   });
+});
+
+test("design 200 publisher ACK derives identity, advertised refs, and effective scope from one accepted section", async () => {
+  const source = await fs.readFile(path.join(srcRoot, "cli", "sync", "push.ts"), "utf8");
+  const constructor = source.match(
+    /const section = committed\.gitRepos\?\.\[relPath\];[\s\S]*?kind: "publisher-ack",[\s\S]*?incomingKey: gitIncomingKey\(section\),[\s\S]*?advertisedRefs: section\.refs,[\s\S]*?effectiveRefScope: section\.refScope,/,
+  );
+  expect(constructor).not.toBeNull();
+  expect(source.match(/kind: "publisher-ack"/g)).toHaveLength(1);
 });
 
 test("saveState rejects Git state outside the explicit legacy/test escape hatch", async () => {

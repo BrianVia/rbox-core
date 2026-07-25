@@ -475,6 +475,59 @@ test("§130 crash after prune reconstructs the breadcrumb veto from A exactly on
   expect(nextCycle.outcome.deferrals?.repo?.apply?.reason).not.toBe("local-operation");
 });
 
+test("design 200 accepted-residual 24-ref prune is non-latching after a dropped state save", async () => {
+  const tip = await commit("residual base\n", "residual base");
+  const tree = await git(sender, "rev-parse", `${tip}^{tree}`);
+  const refs: Record<string, string> = {};
+  for (let index = 0; index < 24; index++) {
+    const ref = `refs/heads/residual-${index.toString().padStart(2, "0")}`;
+    const oid = await gitExec([
+      "-C", sender, "-c", "user.email=t@t.t", "-c", "user.name=t",
+      "commit-tree", tree, "-p", tip, "-m", `residual ${index}`,
+    ]).then(({ stdout }) => stdout.toString().trim());
+    refs[ref] = oid;
+    await git(sender, "update-ref", ref, oid);
+  }
+  const base = await capture();
+  await materialize(base);
+
+  // Establish ordinary publisher-ACK origins before simulating the accepted
+  // omission whose local ACK state save is lost.
+  let state = stateWith(base);
+  state = await landOutcome(state, (await applyIncoming(state, base)).outcome, 2);
+  for (const ref of Object.keys(refs)) await git(sender, "update-ref", "-d", ref);
+  const omitted = await capture();
+  const tombstoned: GitSection = {
+    ...omitted,
+    refTombstones: Object.fromEntries(Object.entries(refs).map(([ref, oid]) => [
+      ref,
+      [{ oid, ts: "2026-07-25T00:00:00.000Z", generation: 1 }],
+    ])),
+    refTombstoneGeneration: 1,
+  };
+
+  // First applying pull consumes every exact-X ref. Deliberately drop its
+  // state save, leaving serialized BASE positive: the accepted residual.
+  const first = await applyIncoming(state, tombstoned);
+  for (const ref of Object.keys(refs)) {
+    expect(await git(receiver, "rev-parse", "--verify", "--quiet", ref).catch(() => "")).toBe("");
+    const oid = refs[ref]!;
+    expect(await git(receiver, "rev-parse", keepPinRef(oid))).toBe(oid);
+    expect((await readKeepPinOrigins(receiver))[oid]?.some(
+      (origin) => origin.ref === ref && origin.class === "tombstone",
+    )).toBe(true);
+  }
+
+  // Re-create every X before retry. The owning A artifacts from the first
+  // transaction prevent a second consumption; the retry retires BASE without
+  // pruning the re-creations, proving the failure does not latch per ref.
+  for (const ref of Object.keys(refs)) await git(receiver, "update-ref", ref, tip);
+  const retry = await applyIncoming(state, tombstoned);
+  for (const ref of Object.keys(refs)) expect(await git(receiver, "rev-parse", ref)).toBe(tip);
+  state = await landOutcome(state, retry.outcome, 3);
+  for (const ref of Object.keys(refs)) expect(state.repoRecords?.repo?.base?.refs[ref]).toBeUndefined();
+}, 30_000);
+
 test("design 126: all-distinct ORIG_HEAD is adopted only after preserving the exact old object", async () => {
   const { c2, c3, state, incoming } = await breadcrumbBaseAndIncoming();
   const result = await applyIncoming(state, incoming);
@@ -670,9 +723,10 @@ test("design 126 raw preservation supports a healthy detached repository with no
   const before = await git(receiver, "rev-parse", "HEAD");
 
   const result = await applyIncoming(state, detachedIncoming);
-  expect(result.outcome.deferrals?.repo?.apply?.reason).toBe("local-operation");
-  expect(await git(receiver, "rev-parse", "HEAD")).toBe(before);
-  expect(result.logs.some((line) => line.startsWith("git-sync: adopted stale ORIG_HEAD"))).toBe(false);
+  expect(result.outcome.deferrals?.repo?.apply).toBeUndefined();
+  expect(await git(receiver, "rev-parse", "HEAD")).toBe(detachedIncoming.head);
+  expect(await git(receiver, "rev-parse", "HEAD")).not.toBe(before);
+  expect(result.logs.some((line) => line.startsWith("git-sync: adopted stale ORIG_HEAD"))).toBe(true);
 });
 
 test("design 126 preservation: ninth adoption prunes the oldest recovery ref but never the current ref", async () => {
@@ -943,6 +997,65 @@ test("design 165 local-ahead tip unreachable from every admissible root still de
   expect(await git(receiver, "rev-parse", "HEAD")).toBe(localTip);
 });
 
+test("design 200 locally deleted published branch is held per-ref, then converged omission retires BASE", async () => {
+  await commit("main\n", "base");
+  await git(sender, "branch", "published");
+  const base = await capture();
+  await materialize(base);
+  const state = stateWith(base);
+  const ref = "refs/heads/published";
+  const prior = base.refs[ref]!;
+  await git(receiver, "update-ref", "-d", ref, prior);
+
+  await git(sender, "commit", "--allow-empty", "-qm", "reassert");
+  const reasserted = await capture();
+  const held = await applyIncoming(state, reasserted);
+  expect(held.outcome.partial?.repo?.heldRefs[ref]).toBe("local-commits");
+  expect(held.outcome.deferrals?.repo?.apply?.reason).toBe("deletion-pending");
+  expect(await git(receiver, "rev-parse", "--verify", "--quiet", ref).catch(() => "")).toBe("");
+
+  await git(sender, "branch", "-D", "published");
+  const omitted = await capture();
+  const converged = await applyIncoming(state, omitted);
+  expect(converged.outcome.gitRepos?.repo?.refs[ref]).toBeUndefined();
+  expect(converged.outcome.partial?.repo?.heldRefs[ref]).toBeUndefined();
+  expect(converged.outcome.deferrals?.repo?.apply).toBeNull();
+});
+
+test("corrupt loose ref during converged deletion keeps durable ref-read-unreadable reason", async () => {
+  await commit("main\n", "base");
+  await git(sender, "branch", "published");
+  const base = await capture();
+  await materialize(base);
+  const state = stateWith(base);
+  const ref = "refs/heads/published";
+  const prior = base.refs[ref]!;
+  await git(receiver, "update-ref", "-d", ref, prior);
+  await git(sender, "branch", "-D", "published");
+  const omitted = await capture();
+
+  const result = await applyIncoming(state, omitted, matchingOracle, {
+    beforeManualAbsentTransition: async (_rel, candidateRef) => {
+      if (candidateRef !== ref) return;
+      await fs.mkdir(path.join(receiver, ".git", "refs", "heads"), { recursive: true });
+      await fs.writeFile(path.join(receiver, ".git", "refs", "heads", "broken-during-proof"), "not-an-oid\n");
+    },
+  });
+  expect(result.outcome.deferrals?.repo?.apply?.reason).toBe("ref-read-unreadable");
+  expect(result.outcome.deferrals?.repo?.apply?.reason).not.toBe("deletion-pending");
+});
+
+test("apply-side worktree ownership evidence failure refuses instead of authorizing an empty map", async () => {
+  const { state, incoming } = await baseAndIncoming();
+  const result = await applyIncoming(state, incoming, matchingOracle, {
+    beforeWorktreeOwnershipRead: async () => {
+      throw new Error("simulated git worktree list failure");
+    },
+  });
+  expect(result.outcome.gitPendingRemote?.repo).toEqual(incoming);
+  expect(result.outcome.deferrals?.repo?.apply?.reason).toBe("unreadable");
+});
+
 test("design 165 local-ahead tip remains owned through another durable descendant root", async () => {
   const mainTip = await commit("main\n", "ahead-main");
   await git(sender, "checkout", "-qb", "ahead");
@@ -1080,6 +1193,10 @@ for (const withContainingRoot of [false, true]) {
       await expect(git(receiver, "merge-base", "--is-ancestor", deletedTip, containingRoot!)).resolves.toBe("");
       expect(await git(receiver, "symbolic-ref", "HEAD")).toBe("refs/heads/main");
       expect(await git(receiver, "rev-parse", "HEAD")).toBe(mainTip);
+      expect(await git(receiver, "rev-parse", keepPinRef(deletedTip))).toBe(deletedTip);
+      const origins = (await readKeepPinOrigins(receiver))[deletedTip] ?? [];
+      expect(origins.some((origin) => origin.ref === "refs/heads/delete-me" && origin.class === "human")).toBe(true);
+      expect(origins.some((origin) => origin.ref === "refs/heads/delete-me" && origin.class === "tombstone")).toBe(false);
     }
   });
 }
@@ -2160,6 +2277,50 @@ test("crash before journal clear leaves published state recoverable without dupl
   expect(await git(receiver, "rev-parse", "HEAD")).toBe(tip);
   expect(retry.logs.some((line) => line.startsWith("git-sync recovered published checkout repo"))).toBe(true);
   expect((await loadState(workspace, "test-stream")).repoRecords?.repo?.repoGen).toBeGreaterThanOrEqual(landedGen!);
+});
+
+test("terminal state-save ref failure uses carry authority while retaining artifact settlement", async () => {
+  const { state, incoming } = await baseAndIncoming();
+  const first = await applyIncoming(state, incoming);
+  expect(first.outcome.repoProofs?.repo).toBeDefined();
+  await fs.mkdir(path.join(receiver, ".git", "refs", "heads"), { recursive: true });
+  await fs.writeFile(path.join(receiver, ".git", "refs", "heads", "broken"), "not-an-oid\n");
+
+  await withRevalidatedGitPartialApplies(workspace, state, first.outcome, async () => undefined);
+
+  expect(first.outcome.deferrals?.repo?.apply?.reason).toBe("ref-read-unreadable");
+  expect(first.outcome.repoProofs?.repo?.authority.kind).toBe("pull-carry");
+  expect(first.outcome.artifactSettlementProofs?.repo?.authority.kind).toBe("pull-ref-transaction");
+  expect(first.outcome.gitRepos?.repo).toEqual(repoRecordsForState(state).repo?.base);
+  expect(first.outcome.gitPendingRemote?.repo).toEqual(incoming);
+  await fs.rm(path.join(receiver, ".git", "refs", "heads", "broken"));
+  await expect(settleCommittedBranchArtifacts(workspace, state, first.outcome)).resolves.toBeDefined();
+});
+
+test("checkout-boundary excluded ref read is lossy and over-holds instead of throwing", async () => {
+  const { state, incoming } = await baseAndIncoming();
+  const result = await applyIncoming(state, incoming, matchingOracle, {
+    beforeCheckoutSecondProof: async () => {
+      await fs.mkdir(path.join(receiver, ".git", "refs", "heads"), { recursive: true });
+      await fs.writeFile(path.join(receiver, ".git", "refs", "heads", "boundary-broken"), "not-an-oid\n");
+    },
+  });
+  expect(result.outcome.deferrals?.repo?.apply?.reason).not.toBe("other");
+});
+
+test("post-commit finalLive bookkeeping ref failure cannot convert a committed cycle to other", async () => {
+  const { state, incoming } = await baseAndIncoming();
+  let injected = false;
+  const result = await applyIncoming(state, incoming, matchingOracle, {
+    afterHeldClassification: async () => {},
+    beforeFinalLive: async () => {
+      injected = true;
+      await fs.mkdir(path.join(receiver, ".git", "refs", "heads"), { recursive: true });
+      await fs.writeFile(path.join(receiver, ".git", "refs", "heads", "final-broken"), "not-an-oid\n");
+    },
+  });
+  expect(injected).toBe(true);
+  expect(result.outcome.deferrals?.repo?.apply?.reason).not.toBe("other");
 });
 
 test("push planning completes a published journal and publishes the tombstone schema once", async () => {

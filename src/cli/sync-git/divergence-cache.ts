@@ -17,6 +17,7 @@ export interface CachedDivergenceProbe {
   preflightStructural?: boolean;
   preflightKind?: GitRepoKind;
   identityKey: string;
+  identityRefs?: Record<string, string>;
   parentRel?: string;
 }
 
@@ -137,6 +138,7 @@ export async function buildPlanProbe(root: string, rel: string, diskCtx: RepoCtx
       preflightStructural: pf.structural === true,
       preflightKind: pf.kind,
       identityKey: gitIdentityKey(identity),
+      ...(identity ? { identityRefs: identity.refs } : {}),
       parentRel,
     },
     identity,
@@ -160,6 +162,7 @@ async function probeDivergenceRepo(root: string, rel: string, ctx: RepoCtx | nul
     preflightStructural: pf.structural === true,
     preflightKind: pf.kind,
     identityKey: gitIdentityKey(id),
+    ...(id ? { identityRefs: id.refs } : {}),
     parentRel,
   };
 }
@@ -236,6 +239,7 @@ function sameDivergenceProbe(a: CachedDivergenceProbe | undefined, b: CachedDive
     a.preflightStructural === b.preflightStructural &&
     a.preflightKind === b.preflightKind &&
     a.identityKey === b.identityKey &&
+    JSON.stringify(a.identityRefs) === JSON.stringify(b.identityRefs) &&
     a.parentRel === b.parentRel
   );
 }

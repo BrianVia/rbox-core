@@ -21,6 +21,7 @@ import {
   headBranchOf,
   importGitPackChain,
   listWorktrees,
+  listWorktreesStrict,
   moveFileAtomic,
   repoCtx,
   warnOnce,
@@ -110,9 +111,26 @@ export interface ApplyBranchTransitionAdapter {
  *  Prunable (stale) entries are ignored so they can't produce phantom collisions
  *  (design 68 V13). From `git worktree list --porcelain`. */
 export async function branchesCheckedOutElsewhere(ctx: RepoCtx): Promise<Map<string, string>> {
+  return branchesCheckedOutElsewhereFrom(ctx, await listWorktrees(ctx.repoDir));
+}
+
+/** Strict authorization-path variant: enumeration failure is a refusal, never
+ * evidence that no sibling worktree owns a branch. */
+export async function branchesCheckedOutElsewhereStrict(
+  ctx: RepoCtx,
+): Promise<{ status: "ok"; owned: Map<string, string> } | { status: "unreadable"; cause: unknown }> {
+  const worktrees = await listWorktreesStrict(ctx.repoDir);
+  if (worktrees.status === "unreadable") return worktrees;
+  return { status: "ok", owned: await branchesCheckedOutElsewhereFrom(ctx, worktrees.entries) };
+}
+
+async function branchesCheckedOutElsewhereFrom(
+  ctx: RepoCtx,
+  worktrees: Awaited<ReturnType<typeof listWorktrees>>,
+): Promise<Map<string, string>> {
   const selfReal = await fs.realpath(ctx.repoDir).catch(() => path.resolve(ctx.repoDir));
   const owned = new Map<string, string>();
-  for (const e of await listWorktrees(ctx.repoDir)) {
+  for (const e of worktrees) {
     if (e.prunable || !e.branch) continue;
     const real = await fs.realpath(e.path).catch(() => path.resolve(e.path));
     if (real !== selfReal) owned.set(e.branch, path.basename(e.path));

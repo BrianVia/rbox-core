@@ -59,6 +59,8 @@ export interface RepoStateValues {
    * entries clear repoAbsent; omitting the map preserves the current lane. */
   repoAbsent?: Record<string, true>;
   branchBaseOrigins?: Record<string, Record<string, BranchBaseOrigin>>;
+  /** null explicitly clears a baseline after packed-refs disappears; omission retains it. */
+  packedRefsIdentity?: Record<string, NonNullable<RepoRecord["packedRefsIdentity"]> | null>;
   pending?: Record<string, GitSection>;
   removed?: Record<string, string>;
   resolutions?: Record<string, string>;
@@ -203,6 +205,19 @@ function mergeDeferrals(
   return Object.keys(merged).length === 0 ? undefined : merged;
 }
 
+/** Sidecar tri-state: key absent → retain current; explicit null → delete; value → replace. */
+function selectPackedRefsIdentity(
+  values: RepoStateValues["packedRefsIdentity"],
+  relPath: string,
+  current: RepoRecord["packedRefsIdentity"],
+): { packedRefsIdentity?: NonNullable<RepoRecord["packedRefsIdentity"]> } {
+  if (!Object.prototype.hasOwnProperty.call(values ?? {}, relPath)) {
+    return current === undefined ? {} : { packedRefsIdentity: current };
+  }
+  const next = values![relPath];
+  return next === null ? {} : { packedRefsIdentity: next };
+}
+
 function sourceRecord(source: StateSource, relPath: string, current: RepoRecord): RepoRecordInput {
   // A recompute from an older source retains the entire newer record. This is the
   // ordering half of the generation CAS: older pending/absence cannot regress a
@@ -231,6 +246,7 @@ function sourceRecord(source: StateSource, relPath: string, current: RepoRecord)
     sourceSeq: source.sourceGlobalSeq,
     ...(composed.base === undefined ? {} : { base: composed.base }),
     ...(composed.branchBaseOrigins === undefined ? {} : { branchBaseOrigins: composed.branchBaseOrigins }),
+    ...selectPackedRefsIdentity(source.values.packedRefsIdentity, relPath, current.packedRefsIdentity),
     ...(hasAdvertisedValue
       ? (advertisedValue === null ? {} : { advertised: advertisedValue })
       : (current.advertised === undefined ? {} : { advertised: current.advertised })),
@@ -366,6 +382,7 @@ export function observedRepoKeys(state: SyncState, manifestGit?: Record<string, 
     ...Object.keys(values.advertised ?? {}),
     ...Object.keys(values.repoAbsent ?? {}),
     ...Object.keys(values.branchBaseOrigins ?? {}),
+    ...Object.keys(values.packedRefsIdentity ?? {}),
     ...Object.keys(values.pending ?? {}),
     ...Object.keys(values.removed ?? {}),
     ...Object.keys(values.resolutions ?? {}),
@@ -403,7 +420,7 @@ export async function savePublishedRepoIntent(
   if (intended.relPath !== relPath) throw new Error("published journal relPath mismatch");
   const select = (record: RepoRecordInput | undefined, fields: readonly (keyof RepoRecordInput)[]): object =>
     Object.fromEntries(fields.map((field) => [field, record?.[field]]));
-  const applyFields = ["base", "branchBaseOrigins", "pending", "repoAbsent", "removedKey", "resolutionKey", "partial", "idxProj"] as const;
+  const applyFields = ["base", "branchBaseOrigins", "packedRefsIdentity", "pending", "repoAbsent", "removedKey", "resolutionKey", "partial", "idxProj"] as const;
   const configFields = ["cfgSynced", "cfgApplied", "cfgToken", "cfgShape"] as const;
   const replace = (target: RepoRecordInput, desired: RepoRecordInput, fields: readonly (keyof RepoRecordInput)[]): void => {
     for (const field of fields) {
@@ -556,12 +573,15 @@ export function changedSidecarRepoKeys(state: SyncState, values: RepoStateValues
     ...Object.keys(values.deferrals ?? {}),
     ...Object.keys(values.partial ?? {}),
     ...Object.keys(values.resolutionReceipt ?? {}),
+    ...Object.keys(values.packedRefsIdentity ?? {}),
   ]);
   const same = (a: unknown, b: unknown) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
   return [...keys].filter((relPath) => {
     const record = records[relPath];
     const receiptTransition = values.resolutionReceipt?.[relPath];
     return !same(record?.pending, values.pending?.[relPath])
+      || (Object.prototype.hasOwnProperty.call(values.packedRefsIdentity ?? {}, relPath)
+        && !same(record?.packedRefsIdentity, values.packedRefsIdentity?.[relPath]))
       || (values.repoAbsent !== undefined && record?.repoAbsent !== values.repoAbsent[relPath])
       || record?.removedKey !== values.removed?.[relPath]
       || record?.resolutionKey !== values.resolutions?.[relPath]

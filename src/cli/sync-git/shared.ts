@@ -34,6 +34,35 @@ export const configCredentialSkipLogged = new Set<string>();
  * logged only once per workspace for a long-lived daemon. */
 export const repoEquivalenceWarningLogged = new Set<string>();
 
+export type PackedRefsIdentity = { mtimeMs: number };
+export type PackedRefsObservation =
+  | { status: "present"; identity: PackedRefsIdentity }
+  | { status: "absent" }
+  | { status: "unreadable"; error: unknown };
+
+/** Observe the only packed-refs fact that is meaningful across Git's normal
+ * lock+rename rewrites. Missing is an explicit clear; other failures retain the
+ * prior baseline and must be handled fail-closed by authorizing callers. */
+export async function observePackedRefsIdentity(commonDir: string): Promise<PackedRefsObservation> {
+  try {
+    const stat = await fs.stat(path.join(commonDir, "packed-refs"));
+    return { status: "present", identity: { mtimeMs: stat.mtimeMs } };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { status: "absent" };
+    return { status: "unreadable", error };
+  }
+}
+
+/** The single restore-refusal predicate shared by plan, follow, and keep-mine. */
+export function packedRefsMtimeRegressed(
+  previous: PackedRefsIdentity | undefined,
+  current: PackedRefsObservation,
+): boolean {
+  return previous !== undefined
+    && current.status === "present"
+    && current.identity.mtimeMs < previous.mtimeMs;
+}
+
 const envInt = (name: string, fallback: number, min: number, max: number): number => {
   const raw = process.env[name]?.trim();
   if (!raw || !/^-?\d+$/.test(raw)) return fallback;

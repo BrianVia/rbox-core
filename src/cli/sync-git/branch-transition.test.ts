@@ -5,7 +5,12 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { baseAbsentArtifactRef, basePresentArtifactRef, readBasePresentArtifact, type ArtifactBinding } from "../../engine/index.js";
-import { commitPlannedBranchTransition, planBranchTransition } from "./branch-transition.js";
+import {
+  commitAbsentBranchVerification,
+  commitPlannedBranchTransition,
+  planAbsentBranchVerification,
+  planBranchTransition,
+} from "./branch-transition.js";
 import { buildTombstoneAttestations, checkTombstoneAttestation } from "./tombstone-attestation.js";
 
 const exec = promisify(execFile);
@@ -21,6 +26,47 @@ beforeEach(async () => {
   await git("add", "f"); await git("commit", "-qm", "one");
 });
 afterEach(() => fs.rm(root, { recursive: true, force: true }));
+
+test("design 200 absence proof is verify-only and races fail closed", async () => {
+  const ref = "refs/heads/deleted";
+  const beforeRefs = await git("for-each-ref", "--format=%(refname)%00%(objectname)");
+  const plan = await planAbsentBranchVerification(root, ref);
+  expect(plan.lines).toContain(`verify ${ref} ${"0".repeat(40)}`);
+  expect(plan.lines.every((line) => /^(?:verify|symref-verify) /.test(line))).toBe(true);
+  await commitAbsentBranchVerification(plan);
+  expect(await git("for-each-ref", "--format=%(refname)%00%(objectname)")).toBe(beforeRefs);
+
+  const raced = await planAbsentBranchVerification(root, ref);
+  await git("update-ref", ref, await git("rev-parse", "HEAD"));
+  await expect(commitAbsentBranchVerification(raced)).rejects.toThrow();
+  expect(await git("rev-parse", ref)).toMatch(/^[0-9a-f]{40}$/);
+});
+
+test("locked absence transaction refuses unreadable worktree ownership evidence", async () => {
+  const ref = "refs/heads/deleted";
+  const plan = await planAbsentBranchVerification(root, ref);
+  await fs.appendFile(path.join(root, ".git", "config"), "\n[broken\n");
+  await expect(commitAbsentBranchVerification(plan)).rejects.toThrow();
+  await expect(git("rev-parse", "--verify", ref)).rejects.toThrow();
+});
+
+test("design 200 refuses an unborn current branch in both planner and commit defense", async () => {
+  const unborn = "refs/heads/unborn";
+  await git("symbolic-ref", "HEAD", unborn);
+  await expect(planAbsentBranchVerification(root, unborn)).rejects.toThrow("current branch");
+
+  const forged = await planAbsentBranchVerification(root, "refs/heads/other");
+  forged.headReservation.currentRef = true;
+  await expect(commitAbsentBranchVerification(forged)).rejects.toThrow("current branch");
+});
+
+test("design 200 locked absence proof refuses an unreadable unrelated ref", async () => {
+  const ref = "refs/heads/deleted";
+  const plan = await planAbsentBranchVerification(root, ref);
+  await fs.writeFile(path.join(root, ".git", "refs", "heads", "broken"), "not-an-oid\n");
+  await expect(commitAbsentBranchVerification(plan)).rejects.toThrow("ref-read-unreadable");
+  expect(await git("rev-parse", "--verify", "--quiet", ref).catch(() => "")).toBe("");
+});
 
 test("§130 delete creates A and removes R in one expected-old transaction", async () => {
   const old = await git("rev-parse", "refs/heads/main");

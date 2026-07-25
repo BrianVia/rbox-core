@@ -3,7 +3,7 @@ import path from "node:path";
 import { applyGitState, assertGitTargetWithinRoot, finalizeGitChainTimings, gitIdentity, gitIdentityKey, gitPreflight, indexIdentityV2, inspectLockedPRepairReceipt, isGitBusy, persistPRepairTerminal, preserveGitConflict, receiverEquivalentCollisionNames, repoCtxFromDisk, poolMap, readBaseAbsentArtifact, readBasePresentArtifact, runLockedPRepairAttempt, resumeLockedAcceptedPRepair, refreshLockedAcceptedPRepair, settleBaseAbsentArtifact, type AppliedManifestOracle, type ApplyBranchTransitionAdapter, type ApplyBranchTransitionInput, type CheckoutCapabilityProbe, type GitIdentity, type GitChainTimings, type GitSection, type IgnoreMatcher, type Manifest, type BlobStore, zeroGitChainTimings } from "../../engine/index.js";
 import { canonicalizeGitConfig, sanitizeGitSectionForPersistence, validateCanonicalGitConfig, type GitConfig } from "../../engine/git/config-sync.js";
 import { applyConfigTransaction, materializeFreshGitConfig, readConfigSnapshot, readParsedConfigSnapshot, sameConfigStatToken, type ConfigStatToken, type ConfigTransactionResult } from "../../engine/git/config-txn.js";
-import { readAllRefs } from "../../engine/git/refs.js";
+import { readAllRefs, readAllRefsStrict } from "../../engine/git/refs.js";
 import { git, readHead, warnOnce } from "../../engine/git/shared.js";
 import { DEFERRAL_LANES, expectedStateNonce, loadRawState, repoRecordsForState, type ConfigShapeIdentity, type GitDeferral, type GitDeferralReason, type GitHeldAttempt, type GitPartialApply, type RepoRecord, type RepoRecordInput, type SyncState, type TypedBlocker, type WorkspaceConfig } from "../config.js";
 import { completeConfigApply, configLaneState, inputRecord, type ConfigLaneState, type GitDeferralUpdates } from "../sync-state.js";
@@ -92,6 +92,9 @@ export interface GitPullOutcome {
   attempt?: Record<string, GitHeldAttempt | null>;
   idxProj?: Record<string, string | null>;
   repoProofs?: Record<string, RepoBaseProof>;
+  /** Transactional proofs retained only for post-save A/P settlement when the
+   * terminal ref read forced the state composer onto carry authority. */
+  artifactSettlementProofs?: Record<string, RepoBaseProof>;
   branchBaseOrigins?: Record<string, NonNullable<RepoRecord["branchBaseOrigins"]>>;
   /** Published checkout journals clear only after the surrounding state CAS. */
   publishedJournals?: string[];
@@ -311,6 +314,11 @@ opts: {
     afterHeldSkipPrepass?: (relPath: string) => void | Promise<void>;
     /** Test seam after the persisted classifier but before attempt completion. */
     afterHeldClassification?: (relPath: string) => void | Promise<void>;
+    /** Tests only: fault injection at deliberately lossy follow read sites. */
+    beforeCheckoutSecondProof?: (relPath: string) => void | Promise<void>;
+    beforeFinalLive?: (relPath: string) => void | Promise<void>;
+    beforeManualAbsentTransition?: (relPath: string, ref: string) => void | Promise<void>;
+    beforeWorktreeOwnershipRead?: (relPath: string) => void | Promise<void>;
     /** Shared logical time for held-attempt tests; omitted production call sites
      * retain the helpers' individual wall-clock reads. */
     heldNow?: () => number;
@@ -1384,6 +1392,10 @@ opts: {
         log: glog,
         forcedHeldRefs,
         afterBranchPinsPrepared: opts.afterBranchPinsPrepared,
+        beforeCheckoutSecondProof: () => opts.beforeCheckoutSecondProof?.(rel),
+        beforeFinalLive: () => opts.beforeFinalLive?.(rel),
+        beforeManualAbsentTransition: (ref) => opts.beforeManualAbsentTransition?.(rel, ref),
+        beforeWorktreeOwnershipRead: () => opts.beforeWorktreeOwnershipRead?.(rel),
         mutationBoundary: opts.mutationBoundary,
         afterHeldClassification: async (classification) => {
           await opts.afterHeldClassification?.(rel);
@@ -1959,7 +1971,51 @@ export async function withRevalidatedGitPartialApplies<T>(
       if (proof.authority.kind !== "pull-ref-transaction" && proof.authority.kind !== "journal-recovery") continue;
       const ctx = await repoCtxFromDisk(repoDirOf(root, rel));
       if (!ctx) throw new Error(`branch proof repository disappeared for ${rel}`);
-      const live = await readAllRefs(ctx.repoDir);
+      const strict = await readAllRefsStrict(ctx.repoDir);
+      if (strict.status === "unreadable") {
+        const candidate = outcome.gitRepos?.[rel];
+        if (candidate) {
+          outcome.gitPendingRemote = { ...(outcome.gitPendingRemote ?? {}), [rel]: candidate };
+        }
+        const prior = records[rel];
+        if (prior?.base) outcome.gitRepos = { ...(outcome.gitRepos ?? {}), [rel]: prior.base };
+        else if (outcome.gitRepos) delete outcome.gitRepos[rel];
+        if (prior?.branchBaseOrigins) {
+          outcome.branchBaseOrigins = { ...(outcome.branchBaseOrigins ?? {}), [rel]: prior.branchBaseOrigins };
+        } else if (outcome.branchBaseOrigins) {
+          delete outcome.branchBaseOrigins[rel];
+        }
+        outcome.partial = { ...(outcome.partial ?? {}), [rel]: null };
+        outcome.artifactSettlementProofs = {
+          ...(outcome.artifactSettlementProofs ?? {}),
+          [rel]: proof,
+        };
+        const retainedLineage = recordOriginLineage(prior?.branchBaseOrigins) ?? "legacy-untrusted";
+        outcome.repoProofs = {
+          ...(outcome.repoProofs ?? {}),
+          [rel]: carryRepoBaseProof(retainedLineage),
+        };
+        const existingTransition = outcome.deferrals?.[rel];
+        const existing = existingTransition === null
+          ? undefined
+          : existingTransition?.apply ?? prior?.deferrals?.apply;
+        const now = new Date().toISOString();
+        outcome.deferrals = {
+          ...(outcome.deferrals ?? {}),
+          [rel]: {
+            ...(existingTransition && existingTransition !== null ? existingTransition : {}),
+            apply: nextDeferral(
+              "apply",
+              existing,
+              "ref-read-unreadable",
+              now,
+              candidate ? gitIncomingKey(candidate) : undefined,
+            ),
+          },
+        };
+        continue;
+      }
+      const live = strict.refs;
       for (const [ref, witness] of Object.entries(proof.authority.branchWitnesses)) {
         const locked = proof.lockedProof.branches[ref];
         const terminal = witness.kind === "present" ? witness.nextOid : null;
@@ -2000,7 +2056,11 @@ export async function settleCommittedBranchArtifacts(
 ): Promise<SyncState> {
   let state = initialState;
   const attemptsToRebind: Array<{ relPath: string; attempt: GitHeldAttempt }> = [];
-  const settlementRepos = Object.entries(outcome.repoProofs ?? {})
+  const settlementProofs = {
+    ...(outcome.repoProofs ?? {}),
+    ...(outcome.artifactSettlementProofs ?? {}),
+  };
+  const settlementRepos = Object.entries(settlementProofs)
     .filter(([, proof]) => proof.authority.kind === "pull-ref-transaction" || proof.authority.kind === "journal-recovery")
     .map(([rel]) => rel)
     .sort();
@@ -2012,7 +2072,7 @@ export async function settleCommittedBranchArtifacts(
     if (lease && !lease.beginCommit("git-commit")) throw new MutationGateClosedError();
   };
   try {
-    for (const [rel, proof] of Object.entries(outcome.repoProofs ?? {}).sort(([a], [b]) => a.localeCompare(b))) {
+    for (const [rel, proof] of Object.entries(settlementProofs).sort(([a], [b]) => a.localeCompare(b))) {
       if (proof.authority.kind !== "pull-ref-transaction" && proof.authority.kind !== "journal-recovery") continue;
       const ctx = await repoCtxFromDisk(repoDirOf(root, rel));
       if (!ctx) throw new Error(`P settlement repository disappeared for ${rel}`);

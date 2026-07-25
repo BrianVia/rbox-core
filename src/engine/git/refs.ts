@@ -1,17 +1,37 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { OP_STATE_CLASSIFICATION, OP_STATE_DIRS, OP_STATE_FILES, isSyncableRef, type OpStateRoot } from "../manifest-validate.js";
-import { HEX40, exists, git, headBranchOf, moveFileAtomic, walkFiles } from "./shared.js";
+import { HEX40, exists, git, gitStatus, headBranchOf, moveFileAtomic, walkFiles } from "./shared.js";
 
-export async function readAllRefs(repoDir: string): Promise<Record<string, string>> {
-  const out = await git(repoDir, ["show-ref"]).catch(() => "");
+function parseAllRefs(out: string): Record<string, string> {
   const refs: Record<string, string> = {};
-  for (const line of out.split("\n")) {
+  for (const line of out.trim().split("\n")) {
     if (!line) continue;
     const [sha, ref] = line.split(" ");
     if (sha && ref && isSyncableRef(ref)) refs[ref] = sha;
   }
   return refs;
+}
+
+export async function readAllRefs(repoDir: string): Promise<Record<string, string>> {
+  const out = await git(repoDir, ["show-ref"]).catch(() => "");
+  return parseAllRefs(out);
+}
+
+export type StrictRefRead =
+  | { status: "ok"; refs: Record<string, string> }
+  | { status: "unreadable"; marker: string };
+
+/** Evidence-grade ref read: Git's documented no-ref exit is distinct from a
+ * corrupt, interrupted, or otherwise unreadable ref database. */
+export async function readAllRefsStrict(repoDir: string): Promise<StrictRefRead> {
+  const result = await gitStatus(repoDir, ["show-ref"]);
+  if (result.status === "ok") return { status: "ok", refs: parseAllRefs(result.stdout) };
+  if (result.exit === 1 && result.stderr.trim() === "") return { status: "ok", refs: {} };
+  return {
+    status: "unreadable",
+    marker: result.exit === null ? "no-exit" : `exit-${result.exit}`,
+  };
 }
 
 /** Pointer-repo (scoped) refs: ONLY `refs/heads/<current-branch>` — the shared store's

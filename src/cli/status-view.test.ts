@@ -134,6 +134,14 @@ test("deletion-pending gets its deliberate display slot without changing legacy 
   expect(project("worktree-ownership")).toMatchObject({ displayReason: "deletion-pending", reasonLabel: "finishing a branch deletion" });
 });
 
+test("ref-read-unreadable explicitly outranks unreadable in display projection", () => {
+  const projected = projectGitDeferralRepos([
+    { repo: "repo", deferral: { lane: "capture", reason: "unreadable", deferredSince: iso(3600), reasonSince: iso(3600) } },
+    { repo: "repo", deferral: { lane: "apply", reason: "ref-read-unreadable", deferredSince: iso(60), reasonSince: iso(60) } },
+  ], NOW)[0]!;
+  expect(projected).toMatchObject({ displayReason: "ref-read-unreadable", reasonLabel: "unreadable Git refs" });
+});
+
 test("projection derives resolver capability from the complete record and sorts invalid times last", () => {
   const valid = { lane: "apply" as const, reason: "conflict" as const, deferredSince: iso(60), reasonSince: iso(30) };
   const record = {

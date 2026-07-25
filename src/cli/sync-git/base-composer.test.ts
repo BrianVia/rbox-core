@@ -335,6 +335,100 @@ describe("design 130 mandatory BASE composer", () => {
     expect(migrated.branchBaseOrigins).toBeUndefined();
   });
 
+  test("publisher ACK retires an omitted branch only with the exact six-part absence receipt", () => {
+    const ref = "refs/heads/deleted";
+    const previous = { base: section({ [ref]: L }) };
+    const candidateSection = {
+      ...section({}, "next"),
+      refTombstones: { [ref]: [{ oid: L, ts: "2026-01-01T00:00:00.000Z", generation: 1 }] },
+      refTombstoneGeneration: 1,
+    };
+    const authority: ComposeRepoBaseAuthority = {
+      kind: "publisher-ack", lineageHash: LIN, repositoryIdentityHash: REPO,
+      incomingKey: "ack", sourceSeq: 9, advertisedRefs: {},
+      absentBranchProofs: { [ref]: { priorOid: L } },
+    };
+    const retired = composeRepoBase(previous, { base: candidateSection }, authority, locked());
+    expect(retired.disposition).toBe("terminal");
+    expect(retired.base?.refs[ref]).toBeUndefined();
+
+    for (const bad of [
+      { ...candidateSection, refTombstones: {} },
+      { ...candidateSection, refScope: "scoped" as const },
+    ]) {
+      const held = composeRepoBase(previous, { base: bad }, authority, locked());
+      expect(held.disposition).toBe("pending");
+      expect(held.base?.refs[ref]).toBe(L);
+    }
+    const wrongOid = composeRepoBase(previous, { base: candidateSection }, {
+      ...authority, absentBranchProofs: { [ref]: { priorOid: U } },
+    }, locked());
+    expect(wrongOid.disposition).toBe("pending");
+    expect(wrongOid.base?.refs[ref]).toBe(L);
+  });
+
+  test("publisher ACK absence receipt rejects every single-factor contract violation", () => {
+    const ref = "refs/heads/deleted";
+    const tombstoned = {
+      ...section({}, "next"),
+      refTombstones: { [ref]: [{ oid: L, ts: "2026-01-01T00:00:00.000Z", generation: 1 }] },
+      refTombstoneGeneration: 1,
+    };
+    const authority: Extract<ComposeRepoBaseAuthority, { kind: "publisher-ack" }> = {
+      kind: "publisher-ack",
+      lineageHash: LIN,
+      repositoryIdentityHash: REPO,
+      incomingKey: "ack",
+      sourceSeq: 9,
+      advertisedRefs: {},
+      absentBranchProofs: { [ref]: { priorOid: L } },
+    };
+    const assertHeld = (
+      previous: GitSection,
+      candidate: GitSection,
+      ack: Extract<ComposeRepoBaseAuthority, { kind: "publisher-ack" }> = authority,
+      proof: RepoBaseLockedProof = locked(),
+      heldRef = ref,
+    ) => {
+      const result = composeRepoBase({ base: previous }, { base: candidate }, ack, proof);
+      expect(result.disposition).toBe("pending");
+      expect(result.holds).toContainEqual(expect.objectContaining({ ref: heldRef }));
+      expect(result.base?.refs[ref]).toBe(previous.refs[ref]);
+    };
+
+    assertHeld(section({ [ref]: L }), tombstoned, { ...authority, advertisedRefs: { [ref]: L } });
+    assertHeld(section({ [ref]: L }), { ...tombstoned, refs: { [ref]: L } });
+    assertHeld(section({ [ref]: L }), tombstoned, authority, locked({ effectiveRefScope: "scoped" }));
+    assertHeld(section({ [ref]: L }), tombstoned, authority, locked({ repoKind: "pointer" }));
+    assertHeld(section({ [ref]: L }), {
+      ...tombstoned,
+      refTombstones: { [ref]: [{ oid: U, ts: "2026-01-01T00:00:00.000Z", generation: 1 }] },
+    });
+    assertHeld(section({ [ref]: L }), tombstoned, { ...authority, lineageHash: "not-a-lineage" });
+    assertHeld(section({ [ref]: L }), tombstoned, { ...authority, repositoryIdentityHash: "not-an-identity" });
+    assertHeld(section({ [ref]: L }), tombstoned, { ...authority, sourceSeq: -1 });
+    assertHeld(section({ [ref]: L }), tombstoned, { ...authority, incomingKey: "" });
+
+    const malformed = "not-an-oid";
+    assertHeld(
+      section({ [ref]: malformed }),
+      {
+        ...tombstoned,
+        refTombstones: { [ref]: [{ oid: malformed, ts: "2026-01-01T00:00:00.000Z", generation: 1 }] },
+      },
+      { ...authority, absentBranchProofs: { [ref]: { priorOid: malformed } } },
+    );
+
+    const tag = "refs/tags/not-a-branch";
+    assertHeld(
+      section({ [ref]: L }),
+      tombstoned,
+      { ...authority, absentBranchProofs: { [tag]: { priorOid: L } } },
+      locked(),
+      tag,
+    );
+  });
+
   test("P-repair advances only pre-state, repairs already-next, and preserves absence/third", () => {
     const ref = "refs/heads/topic";
     const witness = present(ref, L, N);
