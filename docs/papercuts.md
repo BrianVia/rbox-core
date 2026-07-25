@@ -246,3 +246,29 @@ what happened, what it cost, fix hint if obvious.
   allowlisted), but the standing lesson: ANY new hosted dashboard origin must be
   added to `CLERK_ALLOWED_ORIGINS` before it can talk to the API. Consider a
   clearer failure signal than a bare browser CORS error.
+
+## 2026-07-25 — design 200 P1 live-validation session
+
+- **Opaque witness refusal line.** Step D's seven-clause witness refusal
+  collapsed to `branch deletion witness refused <ref>` with no clause name;
+  diagnosing the founder's Mac required reading 60MB of state.json by hand.
+  Fixed same-day (#453) — every fail-closed compound refusal should name its
+  failing clause from day one.
+- **`wrangler deployments list` shows stale data.** It reported a 7/23
+  deployment as latest while the Cloudflare API showed current deploys from
+  today. Burned ~20 minutes chasing a "broken" DEV pipeline that was fine.
+  Verify against `GET /workers/scripts/<name>/deployments` before concluding
+  anything from wrangler's list output.
+- **macOS SIGKILLs a binary `cp`'d over an existing signed one.** Replacing
+  `~/.rbox/bin/rbox` in place poisons the signature cache (exit 137 on exec).
+  Dev deploys must `rm` + `cp` to a new name + `mv` (fresh inode). The
+  installer already does an atomic swap; hand deploys must too.
+- **ACK origins only re-stamp when a ref MOVES** (`requested !== before` in
+  base-composer). A branch resurrected at the same OID can never refresh a
+  stale-lineage receipt; recovery needs a no-op `commit-tree` advance first.
+  Worth a doctor hint or an origin-refresh path if lineage-stale receipts
+  recur (they exist only for branches deleted before the 1.9.1 upgrade).
+- **Codex `--output-last-message` pointed at the review file clobbers it.**
+  The last message overwrote the full review the prompt asked codex to write
+  to the same path; findings had to be recovered from the 38MB session
+  stream. Keep the two paths distinct.
