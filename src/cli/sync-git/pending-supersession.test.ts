@@ -161,6 +161,28 @@ test("final candidate proof accepts equal/FF branches and rejects missing or non
   expect(await provePendingSupersession({ ctx, pending: section(a), candidate: section(unrelated), store: unusedStore, kek: Buffer.alloc(32) })).toBe(false);
 });
 
+test("design 200 P1b accepts a missing pending head only when proof and BASE bind the exact pending OID", async () => {
+  const { ctx, a } = await fixture();
+  const ref = "refs/heads/side";
+  const pending = section(a, { refs: { "refs/heads/main": a, [ref]: a } });
+  const candidate = section(a);
+  const proof = { [ref]: { priorOid: a } };
+  expect(await provePendingSupersession({
+    ctx, pending, candidate, base: pending, absentBranchProofs: proof,
+    store: unusedStore, kek: Buffer.alloc(32),
+  })).toBe(true);
+  expect(await provePendingSupersession({
+    ctx, pending, candidate,
+    base: section("f".repeat(40)), absentBranchProofs: proof,
+    store: unusedStore, kek: Buffer.alloc(32),
+  })).toBe(false);
+  expect(await provePendingSupersession({
+    ctx, pending, candidate, base: pending,
+    absentBranchProofs: { [ref]: { priorOid: "e".repeat(40) } },
+    store: unusedStore, kek: Buffer.alloc(32),
+  })).toBe(false);
+});
+
 test("exact lanes fail closed and local replace refs cannot launder ancestry", async () => {
   const { root, ctx, a, b } = await fixture();
   const exact = section(a, {

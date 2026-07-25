@@ -119,7 +119,7 @@ export type CorpusBucket = (typeof CORPUS_BUCKETS)[number]["bucket"];
 
 export const GIT_DEFERRAL_REASONS = [
   "local-edits", "local-index", "local-operation", "local-commits", "local-stash",
-  "deletion-pending", "conflict", "git-busy", "stale-unattributed", "worktree-ownership", "ignored-target", "unreadable",
+  "deletion-pending", "conflict", "git-busy", "stale-unattributed", "worktree-ownership", "ignored-target", "ref-read-unreadable", "unreadable",
   "artifact", "config", "containment", "unsupported", "other",
 ] as const satisfies readonly GitDeferralReason[];
 type MissingGitDeferralReason = Exclude<GitDeferralReason, (typeof GIT_DEFERRAL_REASONS)[number]>;

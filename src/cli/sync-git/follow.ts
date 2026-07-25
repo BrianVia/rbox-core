@@ -41,7 +41,7 @@ import {
 import { hashFile } from "../../engine/hash.js";
 import type { MutationBoundary } from "../../engine/mutation-gate.js";
 import { pruneStaleScratchRefs } from "../../engine/git/pins.js";
-import { listRefs, readAllRefs, readOpState, readOpStateSnapshot } from "../../engine/git/refs.js";
+import { listRefs, readAllRefs, readAllRefsStrict, readOpState, readOpStateSnapshot } from "../../engine/git/refs.js";
 import { OP_STATE_CLASSIFICATION, OP_STATE_DIRS, OP_STATE_FILES, type OpStateRoot } from "../../engine/manifest-validate.js";
 import {
   clearIndexResolveUndo,
@@ -76,7 +76,7 @@ import { gitIncomingKey, sectionOpState } from "./shared.js";
 import { checkTombstoneAttestation } from "./tombstone-attestation.js";
 import type { FollowerBranchProtocol } from "./follower-protocol.js";
 import { commitPlannedBranchTransition, planBranchTransition, planManualBranchTransition, type PlannedBranchTransition } from "./branch-transition.js";
-import type { BranchTransitionWitness, LockedBranchProof, RepoBaseProof, SafeRefWitness } from "./base-composer.js";
+import { branchBaseOriginMatches, type BranchTransitionWitness, type LockedBranchProof, type RepoBaseProof, type SafeRefWitness } from "./base-composer.js";
 import {
   breadcrumbGateForReason,
   highestBreadcrumbVetoGate,
@@ -431,7 +431,9 @@ async function readLive(ctx: RepoCtx, chainTimings?: GitChainTimings): Promise<L
     const { headContent, currentRef, refs, currentTip } = await addTimedMs(chainTimings, "ownershipMs", async () => {
       const headContent = await fs.readFile(path.join(ctx.gitDir, "HEAD"), "utf8");
       const currentRef = /^ref:\s*(refs\/\S+)\s*$/.exec(headContent)?.[1];
-      const refs = await readAllRefs(ctx.repoDir);
+      const strict = await readAllRefsStrict(ctx.repoDir);
+      if (strict.status === "unreadable") throw new RefReadUnreadableError(strict.marker);
+      const refs = strict.refs;
       const currentTip = currentRef
         ? refs[currentRef] ?? await git(ctx.repoDir, ["rev-parse", "--verify", currentRef]).catch(() => undefined)
         : await git(ctx.repoDir, ["rev-parse", "--verify", "HEAD"]).catch(() => undefined);
@@ -450,8 +452,15 @@ async function readLive(ctx: RepoCtx, chainTimings?: GitChainTimings): Promise<L
       return { indexPresent, indexProjection, opState, opStateRootsPresent };
     });
     return { headContent, currentRef, currentTip, refs, indexPresent, indexProjection, opState, opStateRootsPresent };
-  } catch {
+  } catch (error) {
+    if (error instanceof RefReadUnreadableError) throw error;
     return undefined;
+  }
+}
+
+class RefReadUnreadableError extends Error {
+  constructor(readonly marker: string) {
+    super(`ref-read-unreadable: ${marker}`);
   }
 }
 
@@ -720,6 +729,34 @@ async function publishRefPlane(
     for (const ref of Object.keys(opts.base?.refs ?? {})) candidates.add(ref);
   }
 
+  // Design 200 apply-side witness. Unlike push W/L/D this is intentionally not
+  // kill-switched: it prevents a follower from recreating a published branch
+  // during the publisher's capture-to-ACK window and licenses converged case (c).
+  const deletionWitnessRefs = new Set<string>();
+  if (opts.ctx.kind === "dir" && opts.incoming.refScope === "all" && opts.branchProtocol) {
+    const priorPacked = opts.record?.packedRefsIdentity;
+    const currentPackedStat = await fs.stat(path.join(opts.ctx.commonDir, "packed-refs"), { bigint: true })
+      .catch((error: NodeJS.ErrnoException) => error.code === "ENOENT" ? undefined : null);
+    const packedRegressed = currentPackedStat === null || (priorPacked !== undefined && (!currentPackedStat
+      || priorPacked.dev !== currentPackedStat.dev.toString()
+      || priorPacked.ino !== currentPackedStat.ino.toString()
+      || Number(currentPackedStat.mtimeMs) < priorPacked.mtimeMs));
+    const headLog = await fs.readFile(path.join(opts.ctx.commonDir, "logs", "HEAD")).catch(() => undefined);
+    if (!packedRegressed && headLog && headLog.byteLength > 0) {
+      for (const [ref, baseOid] of Object.entries(opts.base?.refs ?? {})) {
+        if (!ref.startsWith("refs/heads/") || live.refs[ref] !== undefined
+          || ref === live.currentRef || owned.has(ref) || ambiguousRefs.has(ref)) continue;
+        const origin = opts.record?.branchBaseOrigins?.[ref];
+        const disposition = opts.branchProtocol.artifacts[ref];
+        const artifactsClear = disposition === undefined || (disposition.absence === "absent"
+          && disposition.present === "absent" && disposition.keeps === "clear"
+          && disposition.settledAbsence === "absent");
+        if (artifactsClear && branchBaseOriginMatches(origin, baseOid)
+          && origin.lineageHash === opts.branchProtocol.lineageHash) deletionWitnessRefs.add(ref);
+      }
+    }
+  }
+
   const classifiedHolds = new Map<string, "local-commits" | "local-stash" | "worktree-ownership">();
   const indeterminateRefs = new Set<string>();
   const forcedRefs = new Set(Object.keys(opts.forcedHeldRefs ?? {}));
@@ -728,6 +765,9 @@ async function publishRefPlane(
     const classified = reason === "ownership" ? "worktree-ownership" : reason;
     classifiedHolds.set(ref, classified);
     if (ref === live.currentRef) checkoutRefReason ??= classified;
+  }
+  for (const ref of deletionWitnessRefs) {
+    if (effective.refs[ref] !== undefined) classifiedHolds.set(ref, "local-commits");
   }
   const protectedByRef = new Map<string, string[]>();
   for (const ref of candidates) {
@@ -893,14 +933,17 @@ async function publishRefPlane(
         } else if (opts.manualResolution && newOid && logicalBaseOid !== null && artifactsClear) {
           manualBranchTerminals[ref] = { beforeBaseOid: logicalBaseOid, afterOid: newOid };
           appliedRefs[ref] = { kind: "direct", oid: newOid };
-        } else if (opts.manualResolution && !newOid && logicalBaseOid !== null && opts.branchProtocol) {
+        } else if ((opts.manualResolution || deletionWitnessRefs.has(ref))
+          && !newOid && logicalBaseOid !== null && opts.branchProtocol) {
           try {
             const plan = await addTimedMs(opts.chainTimings, "refTxnExclusiveMs", () => planManualBranchTransition({
               repoDir: opts.ctx.repoDir, binding: opts.branchProtocol!.binding, ref,
               physicalBeforeOid: null, afterOid: null, logicalBaseOid,
             }));
             const committed = await commitPlannedBranchTransition(plan, async () => {
-              const lockedRefs = await readAllRefs(opts.ctx.repoDir);
+              const strict = await readAllRefsStrict(opts.ctx.repoDir);
+              if (strict.status === "unreadable") throw new Error(`ref-read-unreadable: ${strict.marker}`);
+              const lockedRefs = strict.refs;
               const lockedOwned = await branchesCheckedOutElsewhere(opts.ctx);
               if (lockedRefs[ref] !== undefined || lockedOwned.has(ref)) throw new Error("manual absent branch changed at locked proof");
             }, opts.chainTimings);
@@ -909,7 +952,9 @@ async function publishRefPlane(
             appliedRefs[ref] = plan.partial;
           } catch (error) {
             heldRefs[ref] = "local-commits";
-            checkoutRefReason ??= "other";
+            checkoutRefReason ??= String((error as Error)?.message ?? error).includes("ref-read-unreadable")
+              ? "ref-read-unreadable"
+              : "other";
             checkoutRefDetail ??= `manual absent branch proof failed for ${ref}: ${boundedRefFailure(error)}`;
           }
         } else if (baseOid !== (newOid ?? null)) {
@@ -1009,7 +1054,9 @@ async function publishRefPlane(
               ...(tombstoneFingerprint ? { expectedReflogFingerprint: tombstoneFingerprint } : {}),
             }));
         const committed = await commitPlannedBranchTransition(plan, async () => {
-          const lockedRefs = await readAllRefs(opts.ctx.repoDir);
+          const strict = await readAllRefsStrict(opts.ctx.repoDir);
+          if (strict.status === "unreadable") throw new Error(`ref-read-unreadable: ${strict.marker}`);
+          const lockedRefs = strict.refs;
           const lockedOwned = await branchesCheckedOutElsewhere(opts.ctx);
           if ((lockedRefs[ref] ?? null) !== (oldOid ?? null) || lockedOwned.has(ref)) throw new Error("branch changed at locked second proof");
           if (tombstoneAuthorized.has(ref) && oldOid) {
@@ -1044,7 +1091,9 @@ async function publishRefPlane(
       const message = String((error as Error)?.message ?? error);
       // Classify on the raw message: boundedRefFailure truncates, and a
       // `lock`/`busy`/`transaction` token past the bound must still count.
-      checkoutRefReason ??= /lock|busy|transaction/i.test(message) ? "git-busy" : "other";
+      checkoutRefReason ??= message.includes("ref-read-unreadable")
+        ? "ref-read-unreadable"
+        : /lock|busy|transaction/i.test(message) ? "git-busy" : "other";
       checkoutRefDetail ??= `publishing ref ${ref} failed: ${boundedRefFailure(error)}`;
     }
   }
@@ -1054,7 +1103,9 @@ async function publishRefPlane(
     if (indeterminateRefs.has(ref)) continue;
     blockers.push({
       provenance: "ref-plane",
-      reason: held === "ownership" ? "worktree-ownership" : held,
+      reason: deletionWitnessRefs.has(ref)
+        ? "deletion-pending"
+        : held === "ownership" ? "worktree-ownership" : held,
       ref,
     });
   }
@@ -1144,7 +1195,13 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
         ? await indexIdentityV2(opts.ctx.repoDir, staged.candidateIndex)
         : undefined
       : null;
-    const liveBefore = await readLive(opts.ctx, opts.chainTimings);
+    const liveBefore = await readLive(opts.ctx, opts.chainTimings).catch((error) => {
+      if (error instanceof RefReadUnreadableError) return error;
+      throw error;
+    });
+    if (liveBefore instanceof RefReadUnreadableError) {
+      return deferResult(emptyProgress, "ref-read-unreadable", liveBefore.message);
+    }
     if (!liveBefore) return deferResult(emptyProgress, "unreadable", "git metadata could not be read");
     const baseProjection = opts.record?.idxProj ?? await addTimedMs(opts.chainTimings, "indexOpStateMs", () =>
       deriveBaseIndexProjection(opts, staged.tmpDir).catch(() => undefined));
@@ -1566,11 +1623,16 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
         return proof.safe;
       },
       ...(checkoutBranchPlanIsPostHead && checkoutBranchPlan ? { postHeadSecondProof: async () => {
-        const [refs, owned, headContent] = await Promise.all([
-          readAllRefs(opts.ctx.repoDir),
+        const [strict, owned, headContent] = await Promise.all([
+          readAllRefsStrict(opts.ctx.repoDir),
           addTimedMs(opts.chainTimings, "ownershipMs", () => branchesCheckedOutElsewhere(opts.ctx)),
           readHead(opts.ctx),
         ]);
+        if (strict.status === "unreadable") {
+          noteBoundaryFailure("ref-read-unreadable", `ref-read-unreadable: ${strict.marker}`);
+          return false;
+        }
+        const refs = strict.refs;
         if ((refs[checkoutBranchPlan!.ref] ?? null) !== checkoutBranchPlan!.beforeOid
           || owned.has(checkoutBranchPlan!.ref)
           || headBranchOf(headContent) === checkoutBranchPlan!.ref) return false;

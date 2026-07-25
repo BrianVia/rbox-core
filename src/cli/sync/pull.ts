@@ -375,7 +375,6 @@ export async function applyPulledManifest(
   if (gitOutcome.gitApplyMetrics) {
     report.recordDetails("git-apply", { gitApply: gitOutcome.gitApplyMetrics }, formatGitApplyMetrics(gitOutcome.gitApplyMetrics));
   }
-  const deferralUpdates = orderedRepoDeferralUpdates(repoRecordsForState(state), gitOutcome.deferrals);
   let savedState = await withRevalidatedGitPartialApplies(root, state, gitOutcome, () => report.phase("state-save", () => saveStateSource(root, state, {
     expectedStream: syncStreamId(cfg),
     sourceGlobalSeq: sequence,
@@ -388,7 +387,7 @@ export async function applyPulledManifest(
       removed: gitOutcome.gitReposRemoved,
       resolutions: gitOutcome.gitNeedsResolution,
       configLane: gitOutcome.configLane,
-      deferrals: deferralUpdates,
+      deferrals: orderedRepoDeferralUpdates(repoRecordsForState(state), gitOutcome.deferrals),
       partial: gitOutcome.partial,
       attempt: gitOutcome.attempt,
       idxProj: gitOutcome.idxProj,
@@ -400,7 +399,7 @@ export async function applyPulledManifest(
       removed: gitOutcome.gitReposRemoved,
       resolutions: gitOutcome.gitNeedsResolution,
       configLane: gitOutcome.configLane,
-      deferrals: deferralUpdates,
+      deferrals: orderedRepoDeferralUpdates(repoRecordsForState(state), gitOutcome.deferrals),
       partial: gitOutcome.partial,
       attempt: gitOutcome.attempt,
       idxProj: gitOutcome.idxProj,

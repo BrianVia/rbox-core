@@ -120,6 +120,7 @@ export function refusalMessage(reason: GitDeferralReason): string {
     "deletion-pending": "rbox is still finishing a branch deletion before the confirmed checkout can be published safely",
     conflict: "the confirmed checkout still conflicts with local Git state",
     artifact: "incoming Git artifacts could not be fetched and verified",
+    "ref-read-unreadable": "Git refs could not be read completely, so rbox refused ref authority",
     unreadable: "Git metadata could not be read completely",
     unsupported: "this repository shape or Git version cannot perform the journaled checkout",
     "git-busy": "Git became busy during resolution; retry after the other Git operation finishes",

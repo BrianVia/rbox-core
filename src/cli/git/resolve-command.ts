@@ -7,8 +7,10 @@ import {
   checkoutJournalDir,
   incomingOwnershipRoots,
   isGitBusy,
+  gitPreflight,
   oracleFromState,
   partitionOwnedByIncoming,
+  receiverEquivalentCollisionNames,
   type AppliedManifestOracle,
   type BlobStore,
   type CheckoutCapabilityProbe,
@@ -24,7 +26,7 @@ import {
 import { pinDisplaced } from "../../engine/git/keep-pins.js";
 import { branchesCheckedOutElsewhere } from "../../engine/git/apply.js";
 import { quarantineLocal } from "../../engine/git/quarantine.js";
-import { hasInProgressOpState, readAllRefs, readOpStateSnapshot } from "../../engine/git/refs.js";
+import { hasInProgressOpState, readAllRefs, readAllRefsStrict, readOpStateSnapshot } from "../../engine/git/refs.js";
 import { git, headBranchOf, repoCtx, type RepoCtx } from "../../engine/git/shared.js";
 import { hashBytes, hashFile } from "../../engine/hash.js";
 import {
@@ -56,7 +58,7 @@ import {
   type FollowProgress,
 } from "../sync-git/follow.js";
 import { checkoutLabel, gitIncomingKey, repoDirOf, sectionOpState } from "../sync-git/shared.js";
-import { composeRepoBase, type ManualBranchDecision, type RepoBaseLockedProof, type RepoBaseProof } from "../sync-git/base-composer.js";
+import { branchBaseOriginMatches, composeRepoBase, type ManualBranchDecision, type RepoBaseLockedProof, type RepoBaseProof } from "../sync-git/base-composer.js";
 import { prepareFollowerBranchProtocol, type FollowerBranchProtocol } from "../sync-git/follower-protocol.js";
 import { settleExactPresentArtifact } from "../sync-git/p-settlement.js";
 import { createPRepairStatePort, createPRepairStatePortFromReceipt } from "../sync-git/p-repair-state.js";
@@ -654,9 +656,52 @@ export async function gitResolveCmd(
         emit({ status: "refused", verb, repo: rel, code: "proof-indeterminate", message: "the incoming-versus-local comparison could not complete; retry after Git state settles", current: snapshot.public }, json, deps, root);
         return 1;
       }
-      const localRefs = new Map(snapshot.identity.refs);
+      const strictRefs = await readAllRefsStrict(ctx!.repoDir);
+      if (strictRefs.status === "unreadable") {
+        emit({ status: "refused", verb, repo: rel, code: "proof-indeterminate", message: refusalMessage("ref-read-unreadable") }, json, deps, root);
+        return 1;
+      }
+      const localRefs = new Map(Object.entries(strictRefs.refs));
+      const protocolResult = await prepareFollowerBranchProtocol({
+        workspaceRoot: root, relPath: rel, state, ctx: ctx!, record,
+        base: record!.base, incoming, liveRefs: strictRefs.refs,
+      });
+      const owned = await branchesCheckedOutElsewhere(ctx!);
+      const priorPacked = record!.packedRefsIdentity;
+      const currentPacked = await fs.stat(path.join(ctx!.commonDir, "packed-refs"), { bigint: true })
+        .catch((error: NodeJS.ErrnoException) => error.code === "ENOENT" ? undefined : null);
+      const packedRegressed = currentPacked === null || (priorPacked !== undefined && (!currentPacked
+        || priorPacked.dev !== currentPacked.dev.toString()
+        || priorPacked.ino !== currentPacked.ino.toString()
+        || Number(currentPacked.mtimeMs) < priorPacked.mtimeMs));
+      const headLog = await fs.readFile(path.join(ctx!.commonDir, "logs", "HEAD")).catch(() => undefined);
+      const [busyNow, preflightNow] = await Promise.all([isGitBusy(ctx!.repoDir), gitPreflight(ctx!.repoDir)]);
+      const collisions = receiverEquivalentCollisionNames([
+        ...Object.keys(strictRefs.refs),
+        ...Object.keys(record!.base?.refs ?? {}),
+        ...Object.keys(incoming.refs),
+        ...owned.keys(),
+      ]);
+      const absenceCaptureEnabled = process.env.RBOX_GIT_ABSENCE_CAPTURE !== "0";
       const absentPublisherBranch = Object.entries(incoming.refs).find(([ref]) =>
-        ref.startsWith("refs/heads/") && record!.base?.refs[ref] !== undefined && localRefs.get(ref) === undefined);
+        ref.startsWith("refs/heads/")
+        && record!.base?.refs[ref] !== undefined
+        && localRefs.get(ref) === undefined
+        && (() => {
+          if (!absenceCaptureEnabled || ctx!.kind !== "dir" || incoming!.refScope !== "all"
+            || protocolResult.status !== "ready" || packedRegressed
+            || busyNow || !preflightNow.ok || collisions.has(ref)
+            || !headLog || headLog.byteLength === 0
+            || snapshot.identity.head === `ref: ${ref}` || owned.has(ref)) return true;
+          const baseOid = record!.base!.refs[ref]!;
+          const origin = record!.branchBaseOrigins?.[ref];
+          const artifact = protocolResult.protocol.artifacts[ref];
+          const artifactsClear = artifact === undefined || (artifact.absence === "absent"
+            && artifact.present === "absent" && artifact.keeps === "clear"
+            && artifact.settledAbsence === "absent");
+          return !artifactsClear || !branchBaseOriginMatches(origin, baseOid)
+            || origin.lineageHash !== protocolResult.protocol.lineageHash;
+        })());
       if (absentPublisherBranch) {
         emit({
           status: "refused", verb, repo: rel, code: "conflict",

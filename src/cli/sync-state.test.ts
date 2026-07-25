@@ -787,6 +787,20 @@ describe("design 93 §6 transactional unit", () => {
     expect(packet.repos[0]?.newRecord.partial).toBeUndefined();
   });
 
+  test("design 200 packed-refs tuple is refuse-only sidecar state and reappears after an old writer strips it", () => {
+    const tuple = { dev: "1", ino: "2", size: 3, mtimeMs: 4 };
+    const stripped = baseState({ r: { repoGen: 2, sourceSeq: 4, base: section("base") } });
+    expect(changedSidecarRepoKeys(stripped, { packedRefsIdentity: { r: tuple } })).toEqual(["r"]);
+    const packet = composeStateSavePacket(stripped, {
+      expectedStream: stream,
+      sourceGlobalSeq: 4,
+      observedRepos: ["r"],
+      values: { bases: { r: section("base") }, packedRefsIdentity: { r: tuple } },
+    });
+    expect(packet.repos[0]?.newRecord.packedRefsIdentity).toEqual(tuple);
+    expect(packet.repos[0]?.newRecord.base).toEqual(section("base"));
+  });
+
   test("reset refuses an unbound checkout journal and preserves all reset sidecars", async () => {
     await saveStateUnsafeLegacyOrTest(root, baseState());
     const journal = path.join(root, ".rbox", "state", "git-journal");

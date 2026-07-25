@@ -191,6 +191,17 @@ test("shell.deferrals accepts deletion-pending without dropping the sidecar", ()
   expect(driven.banner).toContain("git deferred 1h");
 });
 
+test("shell.deferrals accepts ref-read-unreadable without dropping the sidecar", () => {
+  if (!ZSH) return;
+  const now = Math.floor(Date.now() / 1000);
+  const ws = makeWorkspace(
+    `v1 ${now} ok - 80 - - ws\n`,
+    "v1\nrepo\tref-read-unreadable\t1h\t0\n",
+  );
+  mkdirSync(join(ws, "repo"), { recursive: true });
+  expect(driveHooks(writeScript(), ws, join(ws, "repo")).glyph).toContain("⚠git:1h");
+});
+
 test("shell.deferrals root overflow row warns an omitted 51st repo while explicit rows win", () => {
   if (!ZSH) return;
   const now = Math.floor(Date.now() / 1000);

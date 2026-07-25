@@ -215,6 +215,21 @@ describe("POST /v1/fleet/sync-state", () => {
       .toMatchObject({ deferral_reasons: "deletion-pending" });
   });
 
+  test("accepts ref-read-unreadable", async () => {
+    const a = await bootstrap("sync-state-ref-read-unreadable");
+    const ws = `ws_state_${sequence}_ref_read`;
+    await env.rbox_dev_db.prepare("INSERT INTO workspaces(workspace_id, project_id, created_at, account_id) VALUES (?, 'root', ?, ?)").bind(ws, Date.now(), a.accountId).run();
+    const response = await ingestSyncState(new Request(`${BASE}/v1/fleet/sync-state`, {
+      method: "POST",
+      body: JSON.stringify({ v: 1, states: [{
+        workspaceId: ws, projectId: "root", bindingId: "0123456789abcdef",
+        fileSeq: 12, reposTotal: 1, reposDeferred: 1, oldestDeferralAgeMs: 99,
+        deferralReasons: ["ref-read-unreadable"],
+      }] }),
+    }), testEnv(), devicePrincipal(a));
+    expect(await response.json()).toEqual({ accepted: 1, dropped: 0 });
+  });
+
   test("canonicalizes reasons and reports invalid and unauthorized state drops", async () => {
     const a = await bootstrap("sync-state-reasons-a");
     const b = await bootstrap("sync-state-reasons-b");
@@ -276,7 +291,7 @@ describe("POST /v1/fleet/sync-state", () => {
       { ...base, oldestDeferralAgeMs: null },
       { ...base, deferralReasons: [] },
       { ...base, deferralReasons: ["not-a-reason"] },
-      { ...base, deferralReasons: Array.from({ length: 18 }, () => "local-edits") },
+      { ...base, deferralReasons: Array.from({ length: 19 }, () => "local-edits") },
     ];
     const response = await ingestSyncState(new Request(`${BASE}/v1/fleet/sync-state`, { method: "POST", body: JSON.stringify({ v: 1, states: invalid }) }), testEnv(), devicePrincipal(a));
     expect(await response.json()).toEqual({ accepted: 0, dropped: invalid.length });

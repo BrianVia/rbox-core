@@ -129,6 +129,7 @@ export type ComposeRepoBaseAuthority =
       incomingKey: string;
       sourceSeq: number;
       advertisedRefs: Readonly<Record<string, string>>;
+      absentBranchProofs?: Readonly<Record<string, { priorOid: string }>>;
     }
   | {
       kind: "manual";
@@ -354,7 +355,23 @@ export function composeRepoBase(
         holds.push({ ref, code: "missing-branch-proof" });
       }
     } else if (authority.kind === "publisher-ack") {
-      if (requested === null) after = before;
+      if (requested === null) {
+        const absence = authority.absentBranchProofs?.[ref];
+        const tombstone = candidate.base?.refTombstones?.[ref]?.some((entry) => entry.oid === before);
+        const valid = before !== null && absence?.priorOid === before
+          && authority.advertisedRefs[ref] === undefined
+          && lockedProof.repoKind === "dir"
+          && candidate.base?.refScope === "all"
+          && lockedProof.effectiveRefScope === "all"
+          && tombstone === true
+          && HEX40.test(before)
+          && HEX64.test(authority.lineageHash)
+          && HEX64.test(authority.repositoryIdentityHash)
+          && Number.isSafeInteger(authority.sourceSeq) && authority.sourceSeq >= 0
+          && authority.incomingKey.length > 0;
+        after = valid ? null : before;
+        if (!valid && absence !== undefined) holds.push({ ref, code: "mismatched-branch-proof" });
+      }
       else if (authority.advertisedRefs[ref] !== requested || !HEX40.test(requested)
         || !HEX64.test(authority.lineageHash) || !HEX64.test(authority.repositoryIdentityHash)
         || !Number.isSafeInteger(authority.sourceSeq) || authority.sourceSeq < 0 || authority.incomingKey.length === 0) {
@@ -507,6 +524,14 @@ export function composeRepoBase(
     ? authority.safeRefWitnesses : authority.kind === "manual" ? authority.safeRefWitnesses : {})) {
     if (!isSafeRef(ref)) holds.push({ ref, code: "wrong-ref-class" });
   }
+  if (authority.kind === "publisher-ack") {
+    for (const ref of Object.keys(authority.absentBranchProofs ?? {})) {
+      if (!isBranch(ref)) holds.push({ ref, code: "wrong-ref-class" });
+      else if (previousRefs[ref] === undefined || candidateRefs[ref] !== undefined) {
+        holds.push({ ref, code: "mismatched-branch-proof" });
+      }
+    }
+  }
   for (const ref of Object.keys((authority.kind === "pull-ref-transaction" || authority.kind === "journal-recovery")
     ? authority.branchWitnesses : authority.kind === "manual" ? authority.branchDecisions : {})) {
     if (!isBranch(ref)) holds.push({ ref, code: "wrong-ref-class" });
@@ -523,7 +548,9 @@ export function composeRepoBase(
   for (const ref of Object.keys(refs)) if (isBranch(ref)) delete refs[ref];
   Object.assign(refs, composedBranchRefs);
   if (!pending && authority.kind === "publisher-ack") {
-    for (const [ref, value] of Object.entries(previousRefs)) if (candidateRefs[ref] === undefined) refs[ref] = value;
+    for (const [ref, value] of Object.entries(previousRefs)) {
+      if (candidateRefs[ref] === undefined && authority.absentBranchProofs?.[ref] === undefined) refs[ref] = value;
+    }
   }
   if (!pending && authority.kind === "migration") {
     for (const [ref, value] of Object.entries(previousRefs)) if (candidateRefs[ref] === undefined) refs[ref] = value;

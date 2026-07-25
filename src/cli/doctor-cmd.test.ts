@@ -164,6 +164,13 @@ test("diagnostics classifies a deleted branch before the local-commits fallback"
   expect(redacted).not.toContain("private/repo");
 });
 
+test("diagnostics preserves the strict ref-read refusal class", () => {
+  const redacted = redactGitLogLines(
+    "2026-07-13T12:00:00.000Z git-sync deferred repo: ref-read-unreadable exit-128\n",
+  );
+  expect(redacted).toContain("git-sync deferred reason=ref-read-unreadable age=-");
+});
+
 test("device identity check reports match, mismatch, and no enrollment", async () => {
   const enrolled = await bootstrapAccount("acct_doctor_device", "dev_enrolled", 1_900_000_000_000);
   await saveDevice(enrolled.secrets);

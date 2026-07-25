@@ -3,7 +3,7 @@ import path from "node:path";
 import { applyGitState, assertGitTargetWithinRoot, finalizeGitChainTimings, gitIdentity, gitIdentityKey, gitPreflight, indexIdentityV2, inspectLockedPRepairReceipt, isGitBusy, persistPRepairTerminal, preserveGitConflict, receiverEquivalentCollisionNames, repoCtxFromDisk, poolMap, readBaseAbsentArtifact, readBasePresentArtifact, runLockedPRepairAttempt, resumeLockedAcceptedPRepair, refreshLockedAcceptedPRepair, settleBaseAbsentArtifact, type AppliedManifestOracle, type ApplyBranchTransitionAdapter, type ApplyBranchTransitionInput, type CheckoutCapabilityProbe, type GitIdentity, type GitChainTimings, type GitSection, type IgnoreMatcher, type Manifest, type BlobStore, zeroGitChainTimings } from "../../engine/index.js";
 import { canonicalizeGitConfig, sanitizeGitSectionForPersistence, validateCanonicalGitConfig, type GitConfig } from "../../engine/git/config-sync.js";
 import { applyConfigTransaction, materializeFreshGitConfig, readConfigSnapshot, readParsedConfigSnapshot, sameConfigStatToken, type ConfigStatToken, type ConfigTransactionResult } from "../../engine/git/config-txn.js";
-import { readAllRefs } from "../../engine/git/refs.js";
+import { readAllRefs, readAllRefsStrict } from "../../engine/git/refs.js";
 import { git, readHead, warnOnce } from "../../engine/git/shared.js";
 import { DEFERRAL_LANES, expectedStateNonce, loadRawState, repoRecordsForState, type ConfigShapeIdentity, type GitDeferral, type GitDeferralReason, type GitHeldAttempt, type GitPartialApply, type RepoRecord, type RepoRecordInput, type SyncState, type TypedBlocker, type WorkspaceConfig } from "../config.js";
 import { completeConfigApply, configLaneState, inputRecord, type ConfigLaneState, type GitDeferralUpdates } from "../sync-state.js";
@@ -1959,7 +1959,43 @@ export async function withRevalidatedGitPartialApplies<T>(
       if (proof.authority.kind !== "pull-ref-transaction" && proof.authority.kind !== "journal-recovery") continue;
       const ctx = await repoCtxFromDisk(repoDirOf(root, rel));
       if (!ctx) throw new Error(`branch proof repository disappeared for ${rel}`);
-      const live = await readAllRefs(ctx.repoDir);
+      const strict = await readAllRefsStrict(ctx.repoDir);
+      if (strict.status === "unreadable") {
+        const candidate = outcome.gitRepos?.[rel];
+        if (candidate) {
+          outcome.gitPendingRemote = { ...(outcome.gitPendingRemote ?? {}), [rel]: candidate };
+        }
+        const prior = records[rel];
+        if (prior?.base) outcome.gitRepos = { ...(outcome.gitRepos ?? {}), [rel]: prior.base };
+        else if (outcome.gitRepos) delete outcome.gitRepos[rel];
+        if (prior?.branchBaseOrigins) {
+          outcome.branchBaseOrigins = { ...(outcome.branchBaseOrigins ?? {}), [rel]: prior.branchBaseOrigins };
+        } else if (outcome.branchBaseOrigins) {
+          delete outcome.branchBaseOrigins[rel];
+        }
+        outcome.partial = { ...(outcome.partial ?? {}), [rel]: null };
+        if (outcome.repoProofs) delete outcome.repoProofs[rel];
+        const existingTransition = outcome.deferrals?.[rel];
+        const existing = existingTransition === null
+          ? undefined
+          : existingTransition?.apply ?? prior?.deferrals?.apply;
+        const now = new Date().toISOString();
+        outcome.deferrals = {
+          ...(outcome.deferrals ?? {}),
+          [rel]: {
+            ...(existingTransition && existingTransition !== null ? existingTransition : {}),
+            apply: nextDeferral(
+              "apply",
+              existing,
+              "ref-read-unreadable",
+              now,
+              candidate ? gitIncomingKey(candidate) : undefined,
+            ),
+          },
+        };
+        continue;
+      }
+      const live = strict.refs;
       for (const [ref, witness] of Object.entries(proof.authority.branchWitnesses)) {
         const locked = proof.lockedProof.branches[ref];
         const terminal = witness.kind === "present" ? witness.nextOid : null;

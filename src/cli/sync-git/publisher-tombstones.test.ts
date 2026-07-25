@@ -35,6 +35,20 @@ const section = (
 const entry = (n: number, generation = n, ts = at(1)): GitRefTombstone => ({ oid: oid(n), ts, generation });
 
 describe("design 130 publisher chain and generation walk", () => {
+  test("design 200 proof authors the exact BASE OID once without advertised-diff authority", () => {
+    const ref = "refs/heads/deleted";
+    const prior = oid(77);
+    const result = normalizePublishedGitSection(undefined, section({}), at(2), undefined, {
+      [ref]: { priorOid: prior },
+    });
+    expect(result.section.refTombstones?.[ref]).toEqual([{ oid: prior, ts: at(2), generation: 1 }]);
+    expect(result.section.refTombstoneGeneration).toBe(1);
+    const deduped = normalizePublishedGitSection(result.section, result.section, at(3), undefined, {
+      [ref]: { priorOid: prior },
+    });
+    expect(deduped.section.refTombstones?.[ref]).toHaveLength(1);
+    expect(deduped.section.refTombstoneGeneration).toBe(1);
+  });
   test("S0:Q → S1:T → S2:absent retains the complete supersession chain", () => {
     const ref = "refs/heads/topic";
     const s0 = section({ [ref]: oid(1) });

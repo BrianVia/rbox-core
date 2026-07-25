@@ -156,6 +156,7 @@ function gitReasonOf(detail: string, fallback = "other"): string {
   if (/\bbusy\b|lock/.test(detail.toLowerCase())) return "git-busy";
   if (/ownership|non-owned|does not own|outside workspace/.test(detail.toLowerCase())) return "worktree-ownership";
   if (/ignor/.test(detail.toLowerCase())) return "ignored-target";
+  if (/ref-read-unreadable|refs? (?:could not|cannot) be read/.test(detail.toLowerCase())) return "ref-read-unreadable";
   if (/unreadable|cannot read|could not read/.test(detail.toLowerCase())) return "unreadable";
   if (/artifact|bundle|op-state/.test(detail.toLowerCase())) return "artifact";
   if (/config/.test(detail.toLowerCase())) return "config";

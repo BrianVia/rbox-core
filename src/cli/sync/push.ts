@@ -612,6 +612,7 @@ async function runPushAttempt(
   writeBytesChanged();
   const deferralValues = {
     bases: state.lastSyncedManifest.gitRepos,
+    packedRefsIdentity: gitPlan.packedRefsIdentity,
     pending: state.gitPendingRemote,
     removed: state.gitReposRemoved,
     resolutions: state.gitNeedsResolution,
@@ -664,6 +665,7 @@ async function runPushAttempt(
     if (cfg.syncGit) {
       const values = {
         bases: appliedBase.gitRepos,
+        packedRefsIdentity: gitPlan.packedRefsIdentity,
         repoAbsent: gitPlan.repoAbsent ?? {},
         pending: gitPlan.gitPendingRemote,
         removed: gitPlan.gitReposRemoved,
@@ -969,6 +971,9 @@ async function runPushAttempt(
           incomingKey: gitIncomingKey(section),
           sourceSeq: res.sequence!,
           advertisedRefs: section.refs,
+          ...(gitPlan.absentBranchProofs?.[relPath]
+            ? { absentBranchProofs: gitPlan.absentBranchProofs[relPath] }
+            : {}),
         },
         lockedProof: {
           repoKind: binding.repoKind,
@@ -987,6 +992,7 @@ async function runPushAttempt(
     }
     const ackValues = {
       bases: stateGit,
+      packedRefsIdentity: gitPlan.packedRefsIdentity,
       advertised,
       repoAbsent: gitPlan.repoAbsent ?? {},
       pending: pendingAfterAck,

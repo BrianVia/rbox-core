@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { GitCaptureDeferredError, artifactBinding, checkoutJournalDir, discoverGitRepos, gitIdentity, gitIdentityKey, gitPreflight, inTreeWorktreeParentRel, isGitBusy, isPresentButUnreadableError, gitSectionBlobRefs, oracleFromState, readRepoIdentityV1, readStateLineageV1, repoCtxFromDisk, poolMap, type DiscoveredGitRepo, type GitRepoKind, type GitSection, type IgnoreMatcher, type RepoCtx } from "../../engine/index.js";
+import { GitCaptureDeferredError, artifactBinding, checkoutJournalDir, discoverGitRepos, gitIdentity, gitIdentityKey, gitPreflight, inTreeWorktreeParentRel, isGitBusy, isPresentButUnreadableError, gitSectionBlobRefs, oracleFromState, readRepoIdentityV1, readStateLineageV1, receiverEquivalentCollisionNames, repoCtxFromDisk, poolMap, type DiscoveredGitRepo, type GitRepoKind, type GitSection, type IgnoreMatcher, type RepoCtx } from "../../engine/index.js";
 import { pinDisplaced } from "../../engine/git/keep-pins.js";
 import { git } from "../../engine/git/shared.js";
 import { type GitConfigRunner } from "../../engine/git/config-txn.js";
@@ -18,6 +18,11 @@ import { normalizeOutgoingGitSections, tombstoneFindingLine } from "./publisher-
 import { gitPendingSupersedeEnabled, journalAllowsPendingSupersession, pendingSupersessionAckConverges, pendingSupersessionPreProbe, provePendingSupersession } from "./pending-supersession.js";
 import { CONFLICT_REF_PRUNE_LIMIT, pruneConflictRefs } from "./conflict-retention.js";
 import { discardedIncomingOids, finalResolutionReport, reportAuthorized, resolutionReportHash, type GitResolutionRider } from "./resolution-intent.js";
+import { branchesCheckedOutElsewhere } from "../../engine/git/apply.js";
+import { readHead } from "../../engine/git/shared.js";
+import { branchBaseOriginMatches } from "./base-composer.js";
+import { prepareFollowerBranchProtocol } from "./follower-protocol.js";
+import { commitAbsentBranchVerification, planAbsentBranchVerification } from "./branch-transition.js";
 /** The outcome of push-side git orchestration: the outbound `gitRepos` map, whether it
  *  differs from what the last commit carried, the local-only state after this cycle
  *  (persisted only on a successful commit — recomputed idempotently otherwise), and
@@ -46,6 +51,8 @@ export interface GitPushPlan {
     repositoryIdentityHash: string;
     repoKind: "dir" | "pointer";
   }>;
+  absentBranchProofs?: Record<string, Record<string, { priorOid: string }>>;
+  packedRefsIdentity?: Record<string, { dev: string; ino: string; size: number; mtimeMs: number }>;
   captured: string[];
   carried: string[];
   /** Candidate-bound receipts consumed only by the accepted publisher ACK. */
@@ -58,7 +65,7 @@ export interface GitPushPlan {
   resolution?: { outcome: "published" | "refused"; reason?: string; confirmedReportHash?: string };
   /** Repos whose entire P-bound record is immutable before accepted ACK. */
   protectedPending: string[];
-  deferred: Array<{ relPath: string; reason: string }>;
+  deferred: Array<{ relPath: string; reason: string; typedReason?: GitDeferralReason }>;
   captureDeferrals: Record<string, GitDeferralReason>;
   configDeferrals: Record<string, GitDeferralReason>;
   captureObserved: string[];
@@ -145,6 +152,7 @@ export async function planGitSections(
       .map(([relPath]) => [relPath, true as const]),
   );
   const removedMem = { ...(state.gitReposRemoved ?? {}) };
+  const initialRemovedMem = { ...removedMem };
   const needsRes = { ...(state.gitNeedsResolution ?? {}) };
   // Immutable durable pre-plan checkpoint. Planner-local `pending` is allowed to
   // change (including syncGit:false deletion), but it can never rewrite the
@@ -155,8 +163,10 @@ export async function planGitSections(
   let carried: string[] = [];
   const authoredCfgHashByRepo: Record<string, string> = {};
   const publisherAckBindings: NonNullable<GitPushPlan["publisherAckBindings"]> = {};
+  const absentBranchProofs: NonNullable<GitPushPlan["absentBranchProofs"]> = {};
+  const packedRefsIdentity: NonNullable<GitPushPlan["packedRefsIdentity"]> = {};
   const removed: string[] = [];
-  const deferred: Array<{ relPath: string; reason: string }> = [];
+  const deferred: Array<{ relPath: string; reason: string; typedReason?: GitDeferralReason }> = [];
   const configLaneDefers = new Set<(typeof deferred)[number]>();
   const configLaneItems = new Set<(typeof deferred)[number]>();
   const captureObserved = new Set<string>();
@@ -172,6 +182,7 @@ export async function planGitSections(
     captured.push(rel);
   };
   const revertCapture = (rel: string, fallback: GitSection, reason: string): void => {
+    delete absentBranchProofs[rel];
     out[rel] = fallback;
     if (finalizedOutgoing) finalizedOutgoing[rel] = fallback;
     delete authoredCfgHashByRepo[rel];
@@ -180,6 +191,19 @@ export async function planGitSections(
     if (capturedIndex >= 0) captured.splice(capturedIndex, 1);
     if (!carried.includes(rel)) carried.push(rel);
     deferred.push({ relPath: rel, reason });
+  };
+  const discardHiddenCapture = (rel: string, record: ReturnType<typeof repoRecordsForState>[string]): void => {
+    delete absentBranchProofs[rel];
+    delete out[rel];
+    if (finalizedOutgoing) delete finalizedOutgoing[rel];
+    delete authoredCfgHashByRepo[rel];
+    if (record?.repoAbsent === true) repoAbsent[rel] = true;
+    else delete repoAbsent[rel];
+    const removedKey = record?.removedKey ?? initialRemovedMem[rel];
+    if (removedKey !== undefined) removedMem[rel] = removedKey;
+    else delete removedMem[rel];
+    const capturedIndex = captured.indexOf(rel);
+    if (capturedIndex >= 0) captured.splice(capturedIndex, 1);
   };
   const pendingSupersessionCandidates = new Set<string>();
   const supersededPending = new Set<string>();
@@ -215,13 +239,16 @@ export async function planGitSections(
       relPath,
       record.advertised === undefined ? undefined : sanitizeGitSectionForPersistence(record.advertised),
     ]));
-    return normalizeOutgoingGitSections(out, pending, advertised, (options.now?.() ?? new Date()).toISOString());
+    return normalizeOutgoingGitSections(
+      out, pending, advertised, (options.now?.() ?? new Date()).toISOString(), absentBranchProofs,
+    );
   };
   const noteCredentialSkip = (rel: string) =>
     logOnce(configCredentialSkipLogged, rel, `git-sync WARNING ${rel}: skipped credential-bearing remote URL from config capture`);
   const readConfigForPush = (rel: string, diskCtx?: RepoCtx) =>
     readLocalGitConfig(root, rel, diskCtx, options.gitConfigRunner, () => noteCredentialSkip(rel));
   const captureReason = (reason: string): GitDeferralReason => {
+    if (/ref-read-unreadable/i.test(reason)) return "ref-read-unreadable";
     if (/\bbusy\b/i.test(reason)) return "git-busy";
     if (/ownership|worktree/i.test(reason)) return "worktree-ownership";
     if (/containment|outside.*root/i.test(reason)) return "containment";
@@ -275,7 +302,7 @@ export async function planGitSections(
     for (const item of deferred) {
       if (configLaneDefers.has(item)) configDeferrals[item.relPath] = "config";
       else if (configLaneItems.has(item)) continue;
-      else captureDeferrals[item.relPath] = captureReason(item.reason);
+      else captureDeferrals[item.relPath] = item.typedReason ?? captureReason(item.reason);
     }
     return {
       gitRepos: emptyToUndef(outgoing),
@@ -286,6 +313,8 @@ export async function planGitSections(
       gitPendingRemote: emptyToUndef(pending),
       authoredCfgHashByRepo,
       ...(Object.keys(publisherAckBindings).length > 0 ? { publisherAckBindings } : {}),
+      ...(Object.keys(absentBranchProofs).length > 0 ? { absentBranchProofs } : {}),
+      ...(Object.keys(packedRefsIdentity).length > 0 ? { packedRefsIdentity } : {}),
       captured,
       carried,
       supersededPending: [...supersededPending].sort(),
@@ -532,22 +561,27 @@ export async function planGitSections(
   };
   /** Per-repo failure → defer. P always wins byte-for-byte. A forced non-P repo takes
    *  the legacy M5 drop because its BASE references the exact blob the server lost. */
-  const deferOne = (rel: string, reason: string) => {
+  const deferOne = (rel: string, reason: string, typedReason?: GitDeferralReason) => {
     const protectedSection = pending[rel];
     if (protectedSection) {
       out[rel] = protectedSection;
       if (!carried.includes(rel)) carried.push(rel);
-      deferred.push({ relPath: rel, reason });
+      deferred.push({ relPath: rel, reason, ...(typedReason ? { typedReason } : {}) });
       delete authoredCfgHashByRepo[rel];
       return;
     }
-    if (force.has(rel)) {
-      deferred.push({ relPath: rel, reason: `${reason} — section dropped from this commit (its blobs are missing server-side)` });
+    // A forced repair may drop an ordinary failed section because its referenced
+    // blobs are known missing server-side. An unreadable ref store is different:
+    // treating that failed observation as a repository omission would turn local
+    // corruption into deletion authority, so the active BASE must still carry.
+    if (force.has(rel) && typedReason !== "ref-read-unreadable") {
+      deferred.push({ relPath: rel, reason: `${reason} — section dropped from this commit (its blobs are missing server-side)`, ...(typedReason ? { typedReason } : {}) });
       return;
     }
     const b = base[rel];
     if (b) out[rel] = b; // defer-with-base-carry: never regress a synced repo (§6.4)
-    deferred.push({ relPath: rel, reason });
+    if (b && !carried.includes(rel)) carried.push(rel);
+    deferred.push({ relPath: rel, reason, ...(typedReason ? { typedReason } : {}) });
   };
   const pendingPointerPreSkips: Array<{ relPath: string; parentRel: string; admissionAlreadyCounted: boolean }> = [];
   const processRepoSlowPath = async (
@@ -778,7 +812,7 @@ export async function planGitSections(
         carried.push(rel);
         continue;
       }
-      const probe = await pendingSupersessionPreProbe(root, rel, pend);
+      const probe = await pendingSupersessionPreProbe(root, rel, pend, baseSec);
       if (probe.status === "carry") {
         out[rel] = pend;
         carried.push(rel);
@@ -841,7 +875,9 @@ export async function planGitSections(
       } else if (fastLookup.status === "hit") {
         const probe = fastLookup.probe;
         const pfKind = probe.preflightKind;
-        if (!probe.busy && probe.preflightOk && !probe.preflightStructural && isGitRepoKind(pfKind) && carryMatrixMatches(baseSec, pfKind, probe.identityKey)) {
+        const baseHeadMissing = Object.keys(baseSec.refs).some((ref) =>
+          ref.startsWith("refs/heads/") && probe.identityRefs?.[ref] === undefined);
+        if (!baseHeadMissing && !probe.busy && probe.preflightOk && !probe.preflightStructural && isGitRepoKind(pfKind) && carryMatrixMatches(baseSec, pfKind, probe.identityKey)) {
           // A trusted summary can prove a verbatim carry. If publication is due,
           // fall through: the wire needs the canonical config, not merely its hash.
           if (options.disableConfigLane || (fastLookup.cachedLocalCfg && !shouldPublishGitConfig(baseSec.config, fastLookup.cachedLocalCfg, state.repoRecords?.[rel]?.cfgSynced))) {
@@ -971,7 +1007,8 @@ export async function planGitSections(
         deferOne(rel, reason ?? "capture returned nothing (repo vanished mid-capture or failed self-validation)");
       }
     } catch (e) {
-      deferOne(rel, e instanceof GitCaptureDeferredError ? errMsg(e) : `capture failed: ${errMsg(e)}`);
+      const reason = e instanceof GitCaptureDeferredError ? errMsg(e) : `capture failed: ${errMsg(e)}`;
+      deferOne(rel, reason, reason.startsWith("ref-read-unreadable:") ? "ref-read-unreadable" : undefined);
     } finally {
       // Root repo (rel ".") shows the workspace folder name rather than a bare ".".
       onProgress?.(
@@ -984,9 +1021,148 @@ export async function planGitSections(
     }
   });
 
+  // Design 200 W/L/D: a strict capture may turn a BASE-positive branch into an
+  // omission only after the nine-rule witness and a prepared verify-only lock.
+  // This is deliberately after all captures and before tombstone normalization.
+  if (process.env.RBOX_GIT_ABSENCE_CAPTURE !== "0") {
+    for (const rel of [...captured].sort()) {
+      const candidate = out[rel];
+      const record = repoRecordsForState(state)[rel];
+      const baseSection = record?.base ?? base[rel];
+      const ctx = await repoCtxFromDisk(repoDirOf(root, rel)).catch(() => undefined);
+      if (!candidate || !ctx || ctx.kind !== "dir") continue;
+
+      const packedPath = path.join(ctx.commonDir, "packed-refs");
+      const packedStat = await fs.stat(packedPath, { bigint: true }).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return undefined;
+        throw error;
+      }).catch(() => null);
+      if (packedStat && packedStat !== null) {
+        packedRefsIdentity[rel] = {
+          dev: packedStat.dev.toString(), ino: packedStat.ino.toString(),
+          size: Number(packedStat.size), mtimeMs: Number(packedStat.mtimeMs),
+        };
+      }
+
+      const missing = Object.entries(baseSection?.refs ?? {})
+        .filter(([ref]) => ref.startsWith("refs/heads/"))
+        .filter(([ref]) => candidate.refs[ref] === undefined);
+      if (missing.length === 0) continue;
+
+      let refusal: string | undefined = packedStat === null
+        ? "packed-refs identity could not be read"
+        : undefined;
+      const previousPacked = record?.packedRefsIdentity;
+      const currentPacked = packedRefsIdentity[rel];
+      if (previousPacked && (!currentPacked
+        || previousPacked.dev !== currentPacked.dev
+        || previousPacked.ino !== currentPacked.ino
+        || currentPacked.mtimeMs < previousPacked.mtimeMs)) {
+        refusal = "packed-refs identity regressed while a BASE branch was absent";
+      }
+      const headLog = await fs.readFile(path.join(ctx.commonDir, "logs", "HEAD")).catch(() => undefined);
+      if (!headLog || headLog.byteLength === 0) refusal ??= "HEAD reflog is absent or empty";
+      const protocol = refusal ? undefined : await prepareFollowerBranchProtocol({
+        workspaceRoot: root, relPath: rel, state, ctx, record,
+        base: baseSection, incoming: candidate, liveRefs: candidate.refs,
+      });
+      if (protocol?.status !== "ready") refusal ??= protocol?.reason ?? "BASE artifact/lineage proof unavailable";
+      const readyProtocol = protocol?.status === "ready" ? protocol.protocol : undefined;
+      const binding = publisherAckBindings[rel];
+      if (readyProtocol && (!binding
+        || binding.lineageHash !== readyProtocol.lineageHash
+        || binding.repositoryIdentityHash !== readyProtocol.repositoryIdentityHash)) {
+        refusal ??= "publisher repository binding changed before absence proof";
+      }
+      const [busy, preflight, owned, head] = refusal
+        ? [false, { ok: true } as const, new Map<string, string>(), ""]
+        : await Promise.all([
+          isGitBusy(ctx.repoDir),
+          gitPreflight(ctx.repoDir),
+          branchesCheckedOutElsewhere(ctx),
+          readHead(ctx),
+        ]);
+      if (busy) refusal ??= "repository operation began before absence proof";
+      if (!preflight.ok) refusal ??= preflight.reason;
+      const collisions = receiverEquivalentCollisionNames([
+        ...Object.keys(baseSection?.refs ?? {}),
+        ...Object.keys(candidate.refs),
+        ...owned.keys(),
+      ]);
+      const proofs: Record<string, { priorOid: string }> = {};
+
+      for (const [ref, priorOid] of missing) {
+        if (refusal) break;
+        const origin = record?.branchBaseOrigins?.[ref];
+        const artifacts = readyProtocol!.artifacts[ref];
+        const artifactsClear = artifacts === undefined || (artifacts.absence === "absent"
+          && artifacts.present === "absent"
+          && artifacts.keeps === "clear"
+          && artifacts.settledAbsence === "absent");
+        if (candidate.refScope !== "all"
+          || !branchBaseOriginMatches(origin, priorOid)
+          || origin.lineageHash !== readyProtocol!.lineageHash
+          || !artifactsClear
+          || owned.has(ref)
+          || collisions.has(ref)
+          || head === `ref: ${ref}`) {
+          refusal = `branch deletion witness refused ${ref}`;
+          break;
+        }
+        try {
+          const verification = await planAbsentBranchVerification(ctx.repoDir, ref);
+          await commitAbsentBranchVerification(verification);
+          proofs[ref] = { priorOid };
+        } catch (error) {
+          refusal = errMsg(error);
+          break;
+        }
+      }
+
+      if (!refusal && Object.keys(proofs).length === missing.length) {
+        absentBranchProofs[rel] = proofs;
+        continue;
+      }
+
+      glog(`git-sync deletion witness deferred ${rel}: ${refusal ?? "branch deletion proof unavailable"}`);
+      delete absentBranchProofs[rel];
+      const hidden = record?.repoAbsent === true || record?.removedKey !== undefined;
+      if (hidden) {
+        discardHiddenCapture(rel, record);
+      } else if (pending[rel] ?? baseSection) {
+        revertCapture(rel, (pending[rel] ?? baseSection)!, refusal ?? "branch deletion proof unavailable");
+      }
+      deferred.push({
+        relPath: rel,
+        reason: refusal ?? "branch deletion proof unavailable",
+        typedReason: (refusal ?? "").includes("ref-read-unreadable") ? "ref-read-unreadable" : "deletion-pending",
+      });
+    }
+  }
+
   const normalized = normalizeCurrentOutgoing();
   for (const { relPath, finding } of normalized.findings) glog(tombstoneFindingLine(relPath, finding));
   finalizedOutgoing = normalized.sections;
+  for (const [rel, proofs] of Object.entries(absentBranchProofs)) {
+    const section = finalizedOutgoing[rel];
+    const exact = section !== undefined && Object.entries(proofs).every(([ref, proof]) =>
+      section.refTombstones?.[ref]?.some((entry) => entry.oid === proof.priorOid) === true);
+    if (exact) continue;
+    delete absentBranchProofs[rel];
+    const record = repoRecordsForState(state)[rel];
+    const hidden = record?.repoAbsent === true || record?.removedKey !== undefined;
+    if (hidden) {
+      discardHiddenCapture(rel, record);
+    } else {
+      const fallback = pending[rel] ?? base[rel];
+      if (fallback) revertCapture(rel, fallback, "proof-backed tombstone could not be authored exactly");
+    }
+    deferred.push({
+      relPath: rel,
+      reason: "proof-backed tombstone could not be authored exactly",
+      typedReason: "deletion-pending",
+    });
+  }
   for (const rel of [...resolutionCandidates].sort()) {
     const rider = options.resolution?.repo === rel ? options.resolution : undefined;
     const p = pending[rel];
@@ -1033,12 +1209,16 @@ export async function planGitSections(
     const binding = publisherAckBindings[rel];
     const proven = captured.includes(rel) && p !== undefined && candidate !== undefined && ctx !== undefined
       && binding !== undefined
-      && await provePendingSupersession({ ctx, pending: p, candidate, store: api.blobStore(), kek })
+      && await provePendingSupersession({
+        ctx, pending: p, candidate, store: api.blobStore(), kek,
+        base: base[rel], absentBranchProofs: absentBranchProofs[rel],
+      })
       && pendingSupersessionAckConverges({
         previousBase: base[rel],
         previousOrigins: repoRecordsForState(state)[rel]?.branchBaseOrigins,
         candidate,
         binding,
+        absentBranchProofs: absentBranchProofs[rel],
       });
     if (proven) {
       supersededPending.add(rel);

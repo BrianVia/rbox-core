@@ -1128,4 +1128,92 @@ Enforced: `apps/api/src/notify.ts:115-206`
 Proven: `apps/api/test/notify.test.ts`  
 Since: 30
 
+### Positive Git BASE is locally held truth
+
+A positive branch BASE with usable provenance names an OID this device holds or held; BASE never advances merely by relaying another device's value.
+
+Enforced: `src/cli/sync-git/base-composer.ts`
+Proven: `src/cli/sync-git/base-composer.test.ts`
+Since: 200
+
+### Published local branch deletion is not resurrected
+
+A witnessed local deletion is held per ref while publication is in flight, and an acknowledged omission retires BASE without later republishing it.
+
+Enforced: `src/cli/sync-git/follow.ts`; `src/cli/sync-git/base-composer.ts`
+Proven: `src/cli/sync-git/follow.test.ts`; `src/cli/sync-git/base-composer.test.ts`
+Since: 200
+
+### Git absence capture fails closed
+
+Missing provenance, stale lineage, artifacts, ownership, unreadable refs, restore signals, scoped capture, current-branch status, or a failed locked proof cannot publish deletion authority.
+
+Enforced: `src/cli/sync-git/plan.ts`; `src/cli/sync-git/follow.ts`
+Proven: `src/cli/sync-git/git-sync.test.ts`; `src/cli/sync-git/follow.test.ts`
+Since: 200
+
+### Content equivalence never authorizes deletion
+
+Content equivalence may waive a non-destructive no-drop hold but cannot authorize an absent terminal.
+
+Enforced: `src/cli/sync-git/follow.ts`; `src/engine/git/reachability.ts`
+Proven: `src/cli/sync-git/follow.test.ts`; `src/engine/git/reachability.test.ts`
+Since: 200
+
+### Failed ref reads never prove absence
+
+Every evidence-grade ref read distinguishes an empty ref store from an unreadable one and refuses authority on the latter.
+
+Enforced: `src/engine/git/refs.ts`; `src/engine/git/capture.ts`; `src/cli/sync-git/branch-transition.ts`; `src/cli/sync-git/follow.ts`; `src/cli/sync-git/apply.ts`
+Proven: `src/engine/git/refs.test.ts`; `src/cli/sync-git/branch-transition.test.ts`; `src/cli/sync-git/follow.test.ts`
+Since: 200
+
+### Pending Git supersession is locally proved
+
+Every pending ref is locally present at an equal-or-descendant value, or its exact pending OID equals BASE and carries a deletion proof.
+
+Enforced: `src/cli/sync-git/pending-supersession.ts`
+Proven: `src/cli/sync-git/pending-supersession.test.ts`
+Since: 200
+
+### Worktree ownership ignores workspace containment
+
+Sibling worktrees outside the workspace still own their checked-out refs; containment changes reporting only.
+
+Enforced: `src/engine/git/apply.ts`; `src/cli/sync-git/follow.ts`
+Proven: `src/engine/git/apply.test.ts`; `src/cli/sync-git/follow.test.ts`
+Since: 200
+
+### Publishing deletion destroys no reachable Git object
+
+Capture omits a ref without deleting it or its objects; follower pruning retains the existing atomic displacement pins.
+
+Enforced: `src/cli/sync-git/plan.ts`; `src/cli/sync-git/follow.ts`; `src/engine/git/keep-pins.ts`
+Proven: `src/cli/sync-git/branch-transition.test.ts`; `src/engine/git/keep-pins.test.ts`
+Since: 200
+
+### Section composition cannot claim an unheld ref
+
+A held ref is neither superseded nor tombstoned on this device's behalf and contributes no uncaptured published value.
+
+Enforced: `src/cli/sync-git/plan.ts`; `src/cli/sync-git/publisher-tombstones.ts`
+Proven: `src/cli/sync-git/pending-supersession.test.ts`; `src/cli/sync-git/publisher-tombstones.test.ts`
+Since: 200
+
+### Enabled absence capture names the exact retired OID
+
+With `RBOX_GIT_ABSENCE_CAPTURE` enabled, every newly published BASE-positive branch omission has a locked proof and exact-OID tombstone; otherwise the whole repository capture carries.
+
+Enforced: `src/cli/sync-git/plan.ts`; `src/cli/sync-git/publisher-tombstones.ts`; `src/cli/sync-git/base-composer.ts`
+Proven: `src/cli/sync-git/publisher-tombstones.test.ts`; `src/cli/sync-git/base-composer.test.ts`
+Since: 200
+
+### Local state never pre-authorizes Git BASE retirement
+
+BASE becomes absent only in its blessed apply transaction or at publisher ACK with a locked expected-absent proof; reporting and cache fields are never publication authority.
+
+Enforced: `src/cli/sync-git/base-composer.ts`; `src/cli/sync-state.ts`
+Proven: `src/cli/sync-git/base-composer.test.ts`; `src/cli/sync-state.test.ts`
+Since: 200
+
 <!-- Audit completed read-only in 3m 20s; no files were written. -->
