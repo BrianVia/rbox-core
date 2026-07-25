@@ -14,6 +14,7 @@ import { gitFf } from "./git-ff.js";
 import { gitJoinAhead } from "./git-join-ahead.js";
 import { gitCommitPropagation } from "./git-commit-propagation.js";
 import { gitHeldLivelock } from "./git-held-livelock.js";
+import { worktreeSquashLifecycle } from "./worktree-squash-lifecycle.js";
 import { webPairing } from "./web-pairing.js";
 
 export const SCENARIOS: Record<string, Scenario> = {
@@ -30,6 +31,7 @@ export const SCENARIOS: Record<string, Scenario> = {
   "git-join-ahead": gitJoinAhead,
   "git-commit-propagation": gitCommitPropagation,
   "git-held-livelock": gitHeldLivelock,
+  "worktree-squash-lifecycle": worktreeSquashLifecycle,
   "conductor-initial-sync": conductorInitialSync,
   "chaos-restart": chaosRestart,
 };
@@ -53,6 +55,12 @@ export const SCENARIOS: Record<string, Scenario> = {
  * validation runs a real device-code `rbox login`, waits out the daemon fulfillment +
  * enroll window (~1-2 min), and drives the dev-only scriptable approve — too slow and
  * daemon-timing-variable for the every-PR gate. Run it explicitly to guard 189.
+ * worktree-squash-lifecycle is EXCLUDED and additionally kept out of every CI workflow:
+ * it is design 200's acceptance gate and is **RED BY CONSTRUCTION** until 200 lands (the
+ * founder's zero-surviving-deferral ruling for the create-worktree → squash-merge →
+ * delete lifecycle). Registering it in FAST_SUITE — or in `.github/workflows/e2e.yml`'s
+ * `all` — would wire a known failure into the gate. Run it on demand:
+ * `bun run rig run worktree-squash-lifecycle`.
  */
 export const FAST_SUITE = ["onboard-smoke", "two-device-live", "mass-delete-guard", "type-flip", "daemon-idle-cpu", "git-entanglement", "git-join-ahead"] as const;
 

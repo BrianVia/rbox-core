@@ -145,6 +145,54 @@ bun run rig run git-entanglement
    re-assert fsck + ref equality + HEAD now on `feature`.
 6. Manifest convergence (the plain-file half) closes it out.
 
+### `worktree-squash-lifecycle` (explicit-only — **EXPECTED RED until design 200 lands**)
+
+Design 200's acceptance gate, as the founder ruled it: a full agent lifecycle — **create
+worktree → branch → commit → squash-merge to main → delete branch + worktree — with zero
+surviving deferrals.** It is red BY CONSTRUCTION on current main; the failures are the
+spec. Not in `FAST_SUITE` and deliberately not reachable from `e2e.yml`'s default `all`,
+so a known failure never gates a PR.
+
+```bash
+bun run rig run worktree-squash-lifecycle
+```
+
+Acceptance semantics: **the clearing event is worktree DELETION, not the squash-merge.**
+While a worktree holds a branch, holding that one ref is legitimate — something genuinely
+has it checked out. Two phases follow from that:
+
+- **Phase 1 (worktree alive, branch squash-merged)** — design 200 P2's *no-escalation*
+  contract. The per-ref hold is allowed; escalating it is not. Asserts no whole-repo apply
+  deferral, no carried `pending` (the capture gag at `src/cli/sync-git/apply.ts:1447-1450`),
+  that an unrelated incoming ref still applies, and that an unrelated commit on `main`
+  still propagates A→B.
+- **Phase 2 (after `git worktree remove` + `git branch -D`)** — the gate proper: zero
+  deferrals on both devices within 4 explicit round-trips *and* across a bounded
+  live-daemon settle window, refs converged, and **no phantom** `refs/heads/…` left in
+  A's persisted BASE/`pending`. Plus the field's two error signatures:
+  `branch transition does not match logical BASE pre-state` (never legitimate anywhere)
+  and `is checked out in linked worktree` (legitimate only while the worktree lives, so
+  that check is windowed to after its removal).
+
+Two fixture details are load-bearing and were learned by running it:
+
+1. **The ownership hold is only reachable with a diverging peer.** `follow.ts` skips any
+   candidate whose incoming value equals its local value, so a repository whose only
+   writer is A never fires the hold. The rig does what the fleet does: the agent keeps
+   committing in its worktree (`--allow-empty`, a ref-only advance that keeps A's tree
+   clean so the reason stays `worktree-ownership` and not `local-edits`) while the peer
+   publishes unrelated Git work.
+2. **The gag must still be outstanding when the branch is deleted.** Design 174
+   supersession heals the hold once A's local history subsumes the carried section, so the
+   scenario re-arms the gag immediately before `git worktree remove` + `git branch -D`.
+   That ordering is design 200 §1.5's mode (a) → mode (b) bridge and is what turns the
+   deletion into a phantom rather than a clean retirement.
+
+Note the surface asymmetry it exposes: `rbox push` has no `onGitLog` wiring
+(`sync-cmd.ts:19` is pull-only, and `--verbose` is a pull-only flag), so the **capture**
+lane's per-repo forensics exist only in the daemon log. That is why the scenario ends with
+a live-daemon soak and asserts on both devices' daemon logs.
+
 ### CI — `.github/workflows/e2e.yml`
 
 Manual (`workflow_dispatch`, input `scenario`, default `all`) + nightly
