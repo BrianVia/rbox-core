@@ -187,6 +187,14 @@ Bonus find: the sync path still uses the UNBATCHED per-tip ownership proof
 (`reachability.ts:106-126`) while design 128's batched version is wired only to
 `rbox git resolve` — likely where much of the 9s (and 867s wedged) `ownershipMs`
 lives; follow-up to design 174.
+**STANDING RULE (founder, 2026-07-24): rbox-core + Dfinitiv/conductor-workspaces/*
+on the MacBook are the designated problem areas** — highest worktree/branch/
+squash/agent turnover, where wedges appear first. No git-sync fix is "done" at
+merge; it is done when deployed to the MacBook and the specific error is gone
+from the daemon log, and design 200's implementation gate is a full agent
+lifecycle (worktree → branch → squash-merge → delete) in those repos with ZERO
+surviving deferrals over 24h. ~8 prior "this unwedges the machine" claims were
+declared at merge time and were wrong — narrow, field-verified claims only.
 NEXT: Q3a founder call; implement 200 in landing order P2→P3→P1+P1b→P4; 197;
 the 193 live smoke suite; sweep Tier 3. Mac's 2 repo deferrals persist by design
 until 200 lands (rbox-core = the phantom `fix/coupon-slack-notification`, a real
