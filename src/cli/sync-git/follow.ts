@@ -84,6 +84,7 @@ import {
   type BreadcrumbVetoGate,
 } from "./breadcrumb-veto.js";
 import { gitFingerprint, gitFingerprintRun, type GitFingerprint } from "./fingerprint.js";
+import { loadContentEquivalenceCache } from "./content-equivalence-cache.js";
 
 const refEquivalenceWarnings = new Set<string>();
 const receiverEquivalenceByWorkspace = new Map<string, ReturnType<typeof probeReceiverEquivalence>>();
@@ -172,6 +173,10 @@ interface FollowOptions {
   forcedHeldRefs?: GitPartialApply["heldRefs"];
   /** Deterministic preservation-boundary race injection for §130 tests. */
   afterBranchPinsPrepared?: (ref: string) => void | Promise<void>;
+  /** Structural P3 test seams; observations only, never policy inputs. */
+  onContentEquivalentWaiver?: (ref: string) => void;
+  onContentEquivalentDestructiveHold?: (ref: string) => void;
+  beforePlanBranchTransition?: (ref: string, afterOid: string | null) => void;
   mutationBoundary?: MutationBoundary;
   /** Runs after the exact initial classifier and before staged scratch refs are
    * cleaned. The callback may persist an attempt only if its trusted edge still
@@ -791,6 +796,9 @@ async function publishRefPlane(
   // checkout ref is deliberately a held root here because checkout may defer.
   let plannedRefs: Record<string, string> = {};
   let heldDurable: Record<string, string> = {};
+  const contentEquivalenceCache = process.env.RBOX_GIT_CONTENT_EQUIV === "0"
+    ? undefined
+    : await loadContentEquivalenceCache(opts.workspaceRoot).catch(() => undefined);
   for (;;) {
     plannedRefs = {};
     for (const ref of candidates) {
@@ -811,8 +819,20 @@ async function publishRefPlane(
       if (tombstoneAuthorized.has(ref)) continue;
       if (opts.manualResolution && protectedOids.every((oid) => manualProtected.has(oid))) continue;
       const proof = await addTimedMs(opts.chainTimings, "ownershipMs", () =>
-        noDropProof(opts.ctx.repoDir, plannedRefs, heldDurable, {}, protectedOids));
-      if (proof.status === "proven") continue;
+        noDropProof(opts.ctx.repoDir, plannedRefs, heldDurable, {}, protectedOids, { contentEquivalenceCache }));
+      if (proof.status === "proven") {
+        if (proof.marker !== "content-equivalent") continue;
+        const oldOid = live.refs[ref];
+        const newOid = effective.refs[ref];
+        const nonDestructive = oldOid !== undefined && newOid !== undefined
+          && (await addTimedMs(opts.chainTimings, "ownershipMs", () =>
+            tipOwnedByIncoming(opts.ctx.repoDir, oldOid, [newOid]))).status === "owned";
+        if (nonDestructive) {
+          opts.onContentEquivalentWaiver?.(ref);
+          continue;
+        }
+        opts.onContentEquivalentDestructiveHold?.(ref);
+      }
       classifiedHolds.set(ref, ref === "refs/stash" ? "local-stash" : "local-commits");
       if (proof.status === "indeterminate") {
         indeterminateRefs.add(ref);
@@ -830,6 +850,7 @@ async function publishRefPlane(
     }
     if (!changed) break;
   }
+  await contentEquivalenceCache?.save().catch(() => {});
 
   for (const ref of [...candidates].sort()) {
     if (ref === live.currentRef) continue; // current branch belongs to checkout txn.
@@ -964,6 +985,7 @@ async function publishRefPlane(
         await opts.afterBranchPinsPrepared?.(ref);
       }
       if (ref.startsWith("refs/heads/")) {
+        if (!opts.manualResolution) opts.beforePlanBranchTransition?.(ref, newOid ?? null);
         // Artifact/HEAD preparation is exclusive ref-transaction setup: no
         // ownership/reflog leaf runs inside these planners.
         const plan = await addTimedMs(opts.chainTimings, "refTxnExclusiveMs", () => opts.manualResolution
