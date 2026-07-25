@@ -367,6 +367,7 @@ async function writeWholeStateUnsafe(root: string, state: SyncState): Promise<vo
         };
       })();
   await writeFileAtomic(statePath(root), JSON.stringify(sanitized, null, 2));
+  await fsyncDirectory(path.dirname(statePath(root)));
 }
 
 /** Fresh, non-Git initialization only. Git BASE and every repository sidecar are
@@ -410,6 +411,7 @@ export async function ensureTelemetryBindingId(
       beforeRename: async () => (owner = await acquired.lock.isOwner()),
     });
     if (!owner) throw new Error("sync state telemetry lock ownership was lost");
+    await fsyncDirectory(path.dirname(statePath(root)));
     return { state: next, bindingId };
   } finally {
     await acquired.lock.release();
@@ -447,10 +449,12 @@ export async function installGenesisResetStateUnderHeldLock(
     repoRecords: {},
   };
   await writeFileAtomic(statePath(root), JSON.stringify(genesis, null, 2));
+  await fsyncDirectory(path.dirname(statePath(root)));
   await writeFileAtomic(stateIncarnationPath(root), JSON.stringify({
     stream: genesis.stream,
     stateNonce: genesis.stateNonce,
     stateRevision: 0,
   }, null, 2));
+  await fsyncDirectory(path.dirname(stateIncarnationPath(root)));
   return genesis;
 }
