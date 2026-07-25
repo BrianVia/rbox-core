@@ -4620,13 +4620,21 @@ stronger contract and round 6 falsified it in code; v8 asserted step G made it t
 falsified step G. The contract itself was the overclaim.** §9.1 and §9.6 assert the true one,
 including the row that the omission *is* published with the switch off.
 
-**No new persisted field at all, and that is the whole downgrade story.** v6 added
+**No new persisted field *defending the residual*, and that is the whole downgrade story.**
+*(Scoped in v13.3 — implementation round: the original "at all" was falsified by §3.3b(ii)'s
+packed-refs identity tuple, which this section had not counted. The distinction that matters
+survives: the C3-class fields below were dangerous because losing one on downgrade widened a
+window they existed to defend; the §3.3b tuple only ever refuses an absence capture, so a
+client that strips it degrades to no-hardening and the next newer-binary cycle re-records
+it.)* v6 added
 `record.absenceOmission` with a window to defend; v7 removed both; v8 added
 `record.absencePublicationAttempt`; **v11 removes that too (§12 C3 WITHDRAWN, §3.2c)**. What remains
-additive is the **reported reasons** (§5.2, §9.6), while `heldRefs` keeps `local-commits` verbatim for
+additive is the **reported reasons** (§5.2, §9.6) and §3.3b(ii)'s refuse-only packed-refs
+tuple, while `heldRefs` keeps `local-commits` verbatim for
 the deletion hold. Downgrade, in each direction:
 
-- **Older client, newer state.** There is no new record field to preserve or strip. It renders an
+- **Older client, newer state.** The only new record field is §3.3b(ii)'s packed-refs tuple,
+  and stripping it is harmless by construction (refuse-only, re-recorded). It renders an
   unknown deferral reason as
   `UNKNOWN_GIT_DEFERRAL_PRESENTATION` (`status-view.ts:280-285`, `:306-308`,
   `ambient-status.ts:191-198`) and treats an unknown persisted `TypedBlocker` reason as not
