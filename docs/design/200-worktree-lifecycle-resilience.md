@@ -2328,11 +2328,24 @@ behaviour change for paths this design has not analysed. **The general gap is re
 
 **(ii) Ref-database regression signals.** All fail-closed, all cheap, none of them a proof:
 
-- **packed-refs identity.** Record `{dev, ino, size, mtimeMs}` for
-  `<commonDir>/packed-refs` in the repo record beside `branchBaseOrigins`. Refuse absence
-  capture when a previously-recorded tuple exists and the current one has a *different
-  inode* or an *older mtime* while BASE-positive heads are absent. An ordinary
-  `git pack-refs` advances mtime and keeps the file; an in-place restore replaces it.
+- **packed-refs identity — REWRITTEN in v13.4 (implementation round), because the original
+  premise was falsified by measurement.** v13 said "an ordinary `git pack-refs` advances mtime
+  and keeps the file; an in-place restore replaces it" and keyed the refusal on inode identity.
+  Measured on git 2.54: **every** packed-refs mutation — `pack-refs` and `branch -D` of a packed
+  ref alike — rewrites the file via lock+rename, so the inode changes on the exact operation this
+  design exists to capture, and an inode predicate refuses by default (three independent reviewers
+  reproduced ordinary-deletion misfires, a permanent case-(b) latch through the never-refreshed
+  carry path, and a permanent ENOENT wedge after a reftable migration). The signal that survives
+  measurement is **mtime regression**: record `{mtimeMs}` for `<commonDir>/packed-refs` in the
+  repo record beside `branchBaseOrigins`, and refuse absence capture only when a recorded value
+  exists, the file exists, the current mtime is *strictly older*, and BASE-positive heads are
+  absent — a backdated in-place restore (`tar -x`, `rsync -a`) is what regresses mtime; normal
+  git writes set it to now. The baseline advances monotonically on every step-D observation
+  (captured and carried repos alike, ungated by the kill switch); on regression the old baseline
+  is KEPT, so the refusal is *standing* until a genuine ref write clears it. ENOENT clears the
+  baseline explicitly and never refuses on its own (`git refs migrate` legitimately deletes the
+  file); a non-ENOENT stat failure refuses without touching the baseline. `dev`/`ino`/`size` are
+  dropped — under rename-rewrite they carry no signal.
 - **Reflog-store corroboration.** Refuse when `<commonDir>/logs/HEAD` is missing or empty
   while BASE recorded at least one head. A repository that lost `refs/` almost always lost
   `logs/` with it, and a repository that has ever had a branch has a HEAD reflog.
