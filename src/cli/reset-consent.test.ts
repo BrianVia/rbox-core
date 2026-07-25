@@ -155,7 +155,9 @@ test("the full design-138 loadState caller inventory remains on the hard-refusal
     // a reload after the durable arm would reopen a pre-POST failure window.
     "sync/push.ts": 6,
     "status-cmd.ts": 2,
-    "doctor-cmd.ts": 1,
+    // Workspace shape and the local-only linked-worktree inventory each read
+    // through the same stream-mismatch hard-refusal API.
+    "doctor-cmd.ts": 2,
     "ignore-cmd.ts": 1,
     "chain-repair.ts": 2,
     "daemon/daemon.ts": 1,
@@ -173,7 +175,7 @@ test("the full design-138 loadState caller inventory remains on the hard-refusal
     expect(direct + injected, relative).toBe(expected);
     total += direct + injected;
   }
-  expect(total).toBe(27);
+  expect(total).toBe(28);
 });
 
 test("nonce advance after witness validation is a zero-reset-write barrier including Git refs", async () => {

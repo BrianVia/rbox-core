@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { buildIgnoreMatcher, checkoutTransactionCapability, cryptoPoolStatus, ManifestChainError, MAX_MANIFEST_DELTA_CHAIN, type IgnoreMatcher } from "../engine/index.js";
 import { loadActivity, type DaemonActivity } from "./activity.js";
-import { loadConfig, loadRawState, loadState, syncStreamId, type WorkspaceConfig } from "./config.js";
+import { loadConfig, loadRawState, loadState, repoRecordsForState, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { credentialFailureMessage, loadCredentials, type CredentialLoadResult, type Credentials } from "./credentials.js";
 import { currentWorkspaceId, daemonBindingStatus, readDaemonBindingRecord, readMergedDaemonLogTail } from "./daemon-control.js";
 import { enrolledDeviceId, loadDevice } from "./e2ee-keystore.js";
@@ -22,6 +22,7 @@ import { readLockingHealth } from "./sync-mutex.js";
 import { ResetCorruptionError } from "./reset-io.js";
 import { GIT_DEFERRAL_REASONS } from "./sync-state-model.js";
 import { fetchWithDeadline, transferTimeoutMs } from "./remote/resilient.js";
+import { listWorktrees } from "../engine/git/shared.js";
 
 const REPORT_CAP_BYTES = 512 * 1024;
 const DAEMON_LOG_TAIL_BYTES = 64 * 1024;
@@ -68,7 +69,37 @@ export interface DiagnosticsBundle {
   metrics: MetricsSection;
   activity: ActivitySection;
   workspaceShape: WorkspaceShape;
+  leftoverWorktrees: DiagnosticsLeftoverWorktreeSection;
 }
+
+export interface LocalOnlyLeftoverWorktreeEntry {
+  branch?: string;
+  path: string;
+  prunable: boolean;
+  holdsSyncedRef: boolean;
+}
+
+export interface DiagnosticsLeftoverWorktreeEntry {
+  branch?: string;
+  path?: never;
+  prunable: boolean;
+  holdsSyncedRef: boolean;
+}
+
+export interface LocalOnlyLeftoverWorktreeSection {
+  count: number;
+  entries: LocalOnlyLeftoverWorktreeEntry[];
+}
+
+export interface DiagnosticsLeftoverWorktreeSection {
+  count: number;
+  entries: DiagnosticsLeftoverWorktreeEntry[];
+}
+
+type Assert<T extends true> = T;
+type _LocalWorktreesExcludedFromBundle = Assert<
+  LocalOnlyLeftoverWorktreeSection extends DiagnosticsLeftoverWorktreeSection ? false : true
+>;
 
 export interface DoctorContext {
   root: string;
@@ -78,6 +109,12 @@ export interface DoctorContext {
   checks: DoctorChecks;
   workspaceShape: WorkspaceShape;
   daemonStale: boolean;
+  localOnly: {
+    leftoverWorktrees: LocalOnlyLeftoverWorktreeSection;
+  };
+  diagnostics: {
+    leftoverWorktrees: DiagnosticsLeftoverWorktreeSection;
+  };
 }
 
 interface DoctorCmdOptions {
@@ -398,6 +435,59 @@ async function workspaceShape(root: string, cfg: WorkspaceConfig): Promise<Works
   return shape;
 }
 
+export async function collectLeftoverWorktrees(
+  root: string,
+  cfg: WorkspaceConfig,
+): Promise<{
+  localOnly: LocalOnlyLeftoverWorktreeSection;
+  diagnostics: DiagnosticsLeftoverWorktreeSection;
+}> {
+  const state = await loadState(root, syncStreamId(cfg));
+  const records = repoRecordsForState(state);
+  const repos = [...new Set([
+    ...Object.keys(state.lastSyncedManifest.gitRepos ?? {}),
+    ...Object.keys(records),
+  ])].sort();
+  const byEntry = new Map<string, LocalOnlyLeftoverWorktreeEntry>();
+  for (const rel of repos) {
+    const repoDir = rel === "." ? root : path.join(root, rel);
+    const self = await fsp.realpath(repoDir).catch(() => path.resolve(repoDir));
+    const syncedRefs = new Set([
+      ...Object.keys(state.lastSyncedManifest.gitRepos?.[rel]?.refs ?? {}),
+      ...Object.keys(records[rel]?.base?.refs ?? {}),
+      ...Object.keys(records[rel]?.pending?.refs ?? {}),
+      ...Object.keys(records[rel]?.advertised?.refs ?? {}),
+    ]);
+    for (const entry of await listWorktrees(repoDir)) {
+      const absolutePath = path.resolve(entry.path);
+      const entryReal = await fsp.realpath(absolutePath).catch(() => absolutePath);
+      if (entryReal === self) continue;
+      const key = `${absolutePath}\0${entry.branch ?? ""}\0${entry.prunable ? "1" : "0"}`;
+      const previous = byEntry.get(key);
+      byEntry.set(key, {
+        ...(entry.branch ? { branch: entry.branch } : {}),
+        path: absolutePath,
+        prunable: entry.prunable,
+        holdsSyncedRef: previous?.holdsSyncedRef === true
+          || (entry.branch !== undefined && syncedRefs.has(entry.branch)),
+      });
+    }
+  }
+  const entries = [...byEntry.values()].sort((a, b) =>
+    `${a.path}\0${a.branch ?? ""}`.localeCompare(`${b.path}\0${b.branch ?? ""}`));
+  return {
+    localOnly: { count: entries.length, entries },
+    diagnostics: {
+      count: entries.length,
+      entries: entries.map(({ branch, prunable, holdsSyncedRef }) => ({
+        ...(branch ? { branch } : {}),
+        prunable,
+        holdsSyncedRef,
+      })),
+    },
+  };
+}
+
 async function addWorkspaceShape(root: string, relDir: string, matcher: IgnoreMatcher, shape: WorkspaceShape): Promise<void> {
   const absDir = relDir ? path.join(root, relDir) : root;
   let entries: Array<import("node:fs").Dirent>;
@@ -453,7 +543,7 @@ export async function collectDoctorContext(root: string): Promise<DoctorContext>
   const creds = loaded.state === "valid" ? loaded.credentials : undefined;
   const cfg = { ...rawCfg, remoteUrl: creds?.remoteUrl ?? rawCfg.remoteUrl };
   const daemon = checkDaemon(root, cfg);
-  const [credentials, enrollment, device, remote, version, state, locking, git, shape, chain] = await Promise.all([
+  const [credentials, enrollment, device, remote, version, state, locking, git, shape, chain, leftoverWorktrees] = await Promise.all([
     loaded.state !== "valid" && loaded.state !== "absent"
       ? Promise.resolve({ ok: false, label: "credentials", message: `credential-degraded: ${credentialFailureMessage(loaded)}`, hint: "repair the credential source, then retry" })
       : checkCredentials(creds),
@@ -468,6 +558,10 @@ export async function collectDoctorContext(root: string): Promise<DoctorContext>
     buildAuthedRemote(root, Date.now, undefined, loaded).then((built) => checkManifestChain(built.remote)).catch((error: unknown) => ({
       ok: false, label: "manifest chain", message: error instanceof Error ? error.message : String(error),
     })),
+    collectLeftoverWorktrees(root, cfg).catch(() => ({
+      localOnly: { count: 0, entries: [] },
+      diagnostics: { count: 0, entries: [] },
+    })),
   ]);
   return {
     root,
@@ -477,6 +571,8 @@ export async function collectDoctorContext(root: string): Promise<DoctorContext>
     daemonStale: daemon.stale,
     workspaceShape: shape,
     checks: { credentials, enrollment, device, daemon: daemon.check, remote, version, state, crypto: checkCryptoWorkers(), locking, git, chain },
+    localOnly: { leftoverWorktrees: leftoverWorktrees.localOnly },
+    diagnostics: { leftoverWorktrees: leftoverWorktrees.diagnostics },
   };
 }
 
@@ -538,6 +634,7 @@ export async function buildDiagnosticsBundle(ctx: DoctorContext): Promise<Diagno
     metrics: sidecars.metrics,
     activity: sidecars.activity,
     workspaceShape: ctx.workspaceShape,
+    leftoverWorktrees: ctx.diagnostics.leftoverWorktrees,
   });
 }
 
@@ -562,13 +659,25 @@ function fitBundle(bundle: DiagnosticsBundle): DiagnosticsBundle {
   return { ...next, daemonLogTail: marker };
 }
 
-export function renderDoctor(checks: DoctorChecks): string {
+export function renderDoctor(
+  checks: DoctorChecks,
+  localOnly?: DoctorContext["localOnly"],
+): string {
   const lines = [`${style.bold("doctor")} — workspace health`];
   for (const key of ["credentials", "enrollment", "device", "daemon", "remote", "version", "state", "crypto", "locking", "git", "chain"] as const) {
     const c = checks[key];
     if (!c) continue;
     lines.push(`  ${c.ok ? style.sym.ok : style.sym.err} ${c.label}: ${c.message}`);
     if (!c.ok && c.hint) lines.push(`      ${style.dim("fix:")} ${c.hint}`);
+  }
+  if (localOnly) {
+    const worktrees = localOnly.leftoverWorktrees;
+    lines.push(`  leftover worktrees: ${worktrees.count}`);
+    for (const entry of worktrees.entries) {
+      lines.push(
+        `      branch ${entry.branch ?? "(detached)"} · ${entry.path} · prunable ${entry.prunable ? "yes" : "no"} · holds synced ref ${entry.holdsSyncedRef ? "yes" : "no"}`,
+      );
+    }
   }
   return lines.join("\n");
 }
@@ -640,7 +749,7 @@ export async function doctorCmd(root: string, opts: DoctorCmdOptions): Promise<v
     throw new Error("--diagnostics uploads the support report — combine it with --report: rbox doctor --report --diagnostics");
   }
   const ctx = await collectDoctorContext(root);
-  console.log(renderDoctor(ctx.checks));
+  console.log(renderDoctor(ctx.checks, ctx.localOnly));
   if (opts.report) {
     const bundle = await buildDiagnosticsBundle(ctx);
     if (diagnosticsUploadEnabled(opts)) {
