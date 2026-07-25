@@ -205,6 +205,19 @@ function mergeDeferrals(
   return Object.keys(merged).length === 0 ? undefined : merged;
 }
 
+/** Sidecar tri-state: key absent → retain current; explicit null → delete; value → replace. */
+function selectPackedRefsIdentity(
+  values: RepoStateValues["packedRefsIdentity"],
+  relPath: string,
+  current: RepoRecord["packedRefsIdentity"],
+): { packedRefsIdentity?: NonNullable<RepoRecord["packedRefsIdentity"]> } {
+  if (!Object.prototype.hasOwnProperty.call(values ?? {}, relPath)) {
+    return current === undefined ? {} : { packedRefsIdentity: current };
+  }
+  const next = values![relPath];
+  return next === null ? {} : { packedRefsIdentity: next };
+}
+
 function sourceRecord(source: StateSource, relPath: string, current: RepoRecord): RepoRecordInput {
   // A recompute from an older source retains the entire newer record. This is the
   // ordering half of the generation CAS: older pending/absence cannot regress a
@@ -233,11 +246,7 @@ function sourceRecord(source: StateSource, relPath: string, current: RepoRecord)
     sourceSeq: source.sourceGlobalSeq,
     ...(composed.base === undefined ? {} : { base: composed.base }),
     ...(composed.branchBaseOrigins === undefined ? {} : { branchBaseOrigins: composed.branchBaseOrigins }),
-    ...(!Object.prototype.hasOwnProperty.call(source.values.packedRefsIdentity ?? {}, relPath)
-      ? (current.packedRefsIdentity === undefined ? {} : { packedRefsIdentity: current.packedRefsIdentity })
-      : (source.values.packedRefsIdentity?.[relPath] === null
-        ? {}
-        : { packedRefsIdentity: source.values.packedRefsIdentity![relPath]! })),
+    ...selectPackedRefsIdentity(source.values.packedRefsIdentity, relPath, current.packedRefsIdentity),
     ...(hasAdvertisedValue
       ? (advertisedValue === null ? {} : { advertised: advertisedValue })
       : (current.advertised === undefined ? {} : { advertised: current.advertised })),

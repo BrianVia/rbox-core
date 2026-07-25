@@ -437,12 +437,18 @@ export async function stageIncoming(opts: StageIncomingOptions): Promise<StagedI
   }
 }
 
-async function readLive(ctx: RepoCtx, chainTimings?: GitChainTimings): Promise<LiveMetadata | undefined> {
+async function readLive(
+  ctx: RepoCtx,
+  chainTimings?: GitChainTimings,
+  /** Evidence-grade refs already read by the caller's strict pass. When given,
+   * the map consumed IS the map the strict read proved — no second lossy read. */
+  strictRefs?: Record<string, string>,
+): Promise<LiveMetadata | undefined> {
   try {
     const { headContent, currentRef, refs, currentTip } = await addTimedMs(chainTimings, "ownershipMs", async () => {
       const headContent = await fs.readFile(path.join(ctx.gitDir, "HEAD"), "utf8");
       const currentRef = /^ref:\s*(refs\/\S+)\s*$/.exec(headContent)?.[1];
-      const refs = await readAllRefs(ctx.repoDir);
+      const refs = strictRefs ?? await readAllRefs(ctx.repoDir);
       const currentTip = currentRef
         ? refs[currentRef] ?? await git(ctx.repoDir, ["rev-parse", "--verify", currentRef]).catch(() => undefined)
         : await git(ctx.repoDir, ["rev-parse", "--verify", "HEAD"]).catch(() => undefined);
@@ -1219,7 +1225,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
     if (strictLiveRefs.status === "unreadable") {
       return deferResult(emptyProgress, "ref-read-unreadable", `ref-read-unreadable: ${strictLiveRefs.marker}`);
     }
-    const liveBefore = await readLive(opts.ctx, opts.chainTimings);
+    const liveBefore = await readLive(opts.ctx, opts.chainTimings, strictLiveRefs.refs);
     if (!liveBefore) return deferResult(emptyProgress, "unreadable", "git metadata could not be read");
     const baseProjection = opts.record?.idxProj ?? await addTimedMs(opts.chainTimings, "indexOpStateMs", () =>
       deriveBaseIndexProjection(opts, staged.tmpDir).catch(() => undefined));

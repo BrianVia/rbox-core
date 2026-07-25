@@ -1029,7 +1029,11 @@ export async function planGitSections(
       // repository at the same path must flow through the normal re-add path.
       if (record?.repoAbsent === true || record?.removedKey !== undefined) continue;
       const baseSection = record?.base ?? base[rel];
-      const missing = Object.entries(baseSection?.refs ?? {})
+      // W/L/D and absence proofs are CAPTURE authority only. A carried pending
+      // section legitimately omits held BASE heads (it is protected inbound
+      // state, not this cycle's evidence) — carried repos take the packed-refs
+      // baseline observation below and nothing else.
+      const missing = !captured.includes(rel) ? [] : Object.entries(baseSection?.refs ?? {})
         .filter(([ref]) => ref.startsWith("refs/heads/"))
         .filter(([ref]) => candidate.refs[ref] === undefined);
 

@@ -667,7 +667,6 @@ export async function gitResolveCmd(
         emit({ status: "refused", verb, repo: rel, code: "proof-indeterminate", message: refusalMessage("ref-read-unreadable") }, json, deps, root);
         return 1;
       }
-      const localRefs = new Map(Object.entries(strictRefs.refs));
       const protocolResult = await prepareFollowerBranchProtocol({
         workspaceRoot: root, relPath: rel, state, ctx: ctx!, record,
         base: record!.base, incoming, liveRefs: strictRefs.refs,
@@ -689,7 +688,7 @@ export async function gitResolveCmd(
       const absentPublisherBranch = Object.entries(incoming.refs).find(([ref]) =>
         ref.startsWith("refs/heads/")
         && record!.base?.refs[ref] !== undefined
-        && localRefs.get(ref) === undefined
+        && strictRefs.refs[ref] === undefined
         && (() => {
           if (!absenceCaptureEnabled || ctx!.kind !== "dir" || incoming!.refScope !== "all"
             || protocolResult.status !== "ready" || packedRegressed
@@ -716,7 +715,7 @@ export async function gitResolveCmd(
       const divergentBranch = discardReport.lanes.find((lane) =>
         lane.lane === `branch:${currentCheckoutRef}`
         && lane.disposition === "not-subsumed"
-        && localRefs.has(lane.lane.slice("branch:".length)));
+        && strictRefs.refs[lane.lane.slice("branch:".length)] !== undefined);
       if (divergentBranch) {
         emit({
           status: "refused", verb, repo: rel, code: "conflict",

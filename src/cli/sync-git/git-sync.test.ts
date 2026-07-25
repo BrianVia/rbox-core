@@ -2440,6 +2440,37 @@ test("design 200 kill switch restores pre-200 omission publication without proof
   expect(switchedOffRecord.packedRefsIdentity!.mtimeMs).toBeGreaterThanOrEqual(initialPackedMtime);
 }, 20_000);
 
+test("Step D never runs witness math on a carried pending omission (busy carry keeps one deferral, no proofs)", async () => {
+  const rel = "carried-pending-omission";
+  const repo = path.join(rootA, rel);
+  await initRepo(repo);
+  await commitFile(repo, "f.txt", "one", "c1");
+  await git(repo, "branch", "topic");
+  await push(rootA, cfgA, depsA);
+  const state = await st(rootA);
+  const record = repoRecordsForState(state)[rel]!;
+  // A peer deletion in flight: pending omits the BASE-positive head (§3.6's
+  // one-cycle carried window). Pending is protected inbound state, never this
+  // cycle's capture evidence.
+  const { "refs/heads/topic": _omitted, ...restRefs } = record.base!.refs;
+  const pendingSection = { ...record.base!, refs: restRefs };
+  state.gitPendingRemote = { ...state.gitPendingRemote, [rel]: pendingSection };
+  state.repoRecords![rel] = { ...state.repoRecords![rel]!, pending: pendingSection };
+  await fs.writeFile(path.join(repo, ".git", "index.lock"), "");
+  try {
+    const plan = await planGitSections(
+      rootA, cfgA, state, remote, new Set(), buildIgnoreMatcher(rootA),
+    );
+    expect(plan.carried).toContain(rel);
+    expect(plan.absentBranchProofs?.[rel]).toBeUndefined();
+    expect(plan.gitRepos?.[rel]?.refs["refs/heads/topic"]).toBeUndefined();
+    expect(plan.deferred.filter((item) => item.relPath === rel)).toHaveLength(1);
+    expect(plan.captureDeferrals[rel]).not.toBe("deletion-pending");
+  } finally {
+    await fs.rm(path.join(repo, ".git", "index.lock"), { force: true });
+  }
+}, 20_000);
+
 test("carried repositories refresh the packed-refs baseline even when absence capture is switched off", async () => {
   const repo = path.join(rootA, "carried-packed-baseline");
   await initRepo(repo);
