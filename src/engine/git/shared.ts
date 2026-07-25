@@ -141,7 +141,7 @@ export interface GitRunOptions {
   onStdoutChunk?: (chunk: string) => void;
 }
 
-export async function gitRaw(root: string, args: string[], opts: GitRunOptions = {}): Promise<string> {
+async function gitRawLegacy(root: string, args: string[], opts: GitRunOptions = {}): Promise<string> {
   gitSpawnObserver?.(root, args);
   if (opts.stdin !== undefined || opts.onStdoutChunk) {
     // Match runUpdateRefTransaction's Node-spawn path so stdin is reliable under Bun.
@@ -172,9 +172,22 @@ export async function gitRaw(root: string, args: string[], opts: GitRunOptions =
         const finish = () => {
           if (settled || exitCode === undefined || !stdoutEnded || !stderrEnded) return;
           settled = true;
-          if (bufferError) reject(bufferError);
+          if (bufferError) {
+            Object.assign(bufferError, {
+              stdout: Buffer.concat(stdout).toString(),
+              stderr: Buffer.concat(stderr).toString(),
+            });
+            reject(bufferError);
+          }
           else if (exitCode === 0) resolve(opts.onStdoutChunk ? "" : Buffer.concat(stdout).toString());
-          else reject(Object.assign(new Error(Buffer.concat(stderr).toString() || `git exited with status ${exitCode ?? "unknown"}`), { code: exitCode }));
+          else reject(Object.assign(
+            new Error(Buffer.concat(stderr).toString() || `git exited with status ${exitCode ?? "unknown"}`),
+            {
+              code: exitCode,
+              stdout: opts.onStdoutChunk ? "" : Buffer.concat(stdout).toString(),
+              stderr: Buffer.concat(stderr).toString(),
+            },
+          ));
         };
         child.stdout!.on("data", (value: Buffer) => {
           if (settled) return;
@@ -239,6 +252,37 @@ export async function gitRaw(root: string, args: string[], opts: GitRunOptions =
   return stdout.toString();
 }
 
+export type GitRunResult =
+  | { status: "ok"; stdout: string }
+  | { status: "failed"; exit: number | null; stdout: string; stderr: string; cause: unknown };
+
+/** Structured Git runner for evidence-sensitive reads. Every outcome is data,
+ * and `cause` is the exact object the legacy throwing runner produced. */
+export async function gitStatus(root: string, args: string[], opts: GitRunOptions = {}): Promise<GitRunResult> {
+  try {
+    return { status: "ok", stdout: await gitRawLegacy(root, args, opts) };
+  } catch (cause) {
+    const error = cause as { code?: unknown; stdout?: unknown; stderr?: unknown };
+    return {
+      status: "failed",
+      exit: typeof error?.code === "number" && Number.isInteger(error.code) ? error.code : null,
+      stdout: typeof error?.stdout === "string"
+        ? error.stdout
+        : Buffer.isBuffer(error?.stdout) ? error.stdout.toString() : "",
+      stderr: typeof error?.stderr === "string"
+        ? error.stderr
+        : Buffer.isBuffer(error?.stderr) ? error.stderr.toString() : "",
+      cause,
+    };
+  }
+}
+
+export async function gitRaw(root: string, args: string[], opts: GitRunOptions = {}): Promise<string> {
+  const result = await gitStatus(root, args, opts);
+  if (result.status === "ok") return result.stdout;
+  throw result.cause;
+}
+
 export async function git(root: string, args: string[], opts: GitRunOptions = {}): Promise<string> {
   return (await gitRaw(root, args, opts)).trim();
 }
@@ -259,14 +303,10 @@ export function parseNullDelimitedGitConfig(raw: string): Array<[key: string, va
 /** Read candidate design-93 keys from the local common config. Exit 1 is Git's
  * documented no-match result; every other subprocess failure remains loud. */
 export async function readLocalGitConfigEntries(root: string): Promise<Array<[key: string, value: string]>> {
-  let raw: string;
-  try {
-    raw = await gitRaw(root, ["config", "--local", "--no-includes", "--get-regexp", "-z", "^(remote|branch)\\."]);
-  } catch (error) {
-    if ((error as { code?: unknown }).code === 1) return [];
-    throw error;
-  }
-  return parseNullDelimitedGitConfig(raw);
+  const result = await gitStatus(root, ["config", "--local", "--no-includes", "--get-regexp", "-z", "^(remote|branch)\\."]);
+  if (result.status === "ok") return parseNullDelimitedGitConfig(result.stdout);
+  if (result.exit === 1) return [];
+  throw result.cause;
 }
 
 export async function gitWithIndexFile(root: string, indexFile: string, args: string[], opts: { maxBuffer?: number } = {}): Promise<string> {
