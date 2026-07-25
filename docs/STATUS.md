@@ -195,7 +195,37 @@ from the daemon log, and design 200's implementation gate is a full agent
 lifecycle (worktree → branch → squash-merge → delete) in those repos with ZERO
 surviving deferrals over 24h. ~8 prior "this unwedges the machine" claims were
 declared at merge time and were wrong — narrow, field-verified claims only.
-NEXT: Q3a founder call; implement 200 in landing order P2→P3→P1+P1b→P4; 197;
+**DESIGN 200 ALIGNED AND MERGED (2026-07-25, #440 → f7845e8b) after 12 codex
+adversarial rounds / 13 revisions — the full /dev-cycle loop, and it earned it.**
+Final shape: deletion is an ORDINARY captured transition (witness → verify-only
+locked proof → exact-OID tombstone at capture → BASE retires only at the
+publisher-ACK, one-sentence design-130 amendment with fencing that survived
+review); the window is a per-ref hold; recovery is the per-ref keep-pin proven
+atomic with the delete. Killed en route, each with recorded evidence (11
+REVIEW-200-R*.md files on main): breaker math (founder: "some math is just not
+gonna prevent it"), pins (file-history contract), P4 (parked as design 201
+placeholder with landmines + AC), early BASE retirement (the primitive behind 5
+failed rounds — step-out-a-layer call), the C3 field (4 rounds of churn, then
+WITHDRAWN under founder principles; residual property-quantified instead).
+Accepted residual, stated at true width: lost-ACK + same-OID re-creation within
+one cycle consumes own tombstones once per window, per-ref keep-pinned;
+family-(ii) (degraded-unlocked overwrite) FLEET-MEASURED ABSENT (zero degraded
+workspaces; all hosts link()-capable) and the post-rename durability half FIXED
+IN CODE — **#448 merged**: state.json's parent was NEVER fsynced and the marker
+unlink was flushed first (one crash window could lose new state AND fallback
+baseline); + 3 more unpublished state.json renames fixed; pre-merge codex review
+zero blockers. CLASS-C QUESTION parked for founder (no urgency, state absent
+from fleet): should git publication fail closed on a degraded-unlocked
+workspace instead of accepting the widened residual? Loop mechanics lesson:
+harness kills orphaned codex mid-run twice (pipe-block zombies) → detached
+setsid + file-redirected output + Monitor on the verdict file is the reliable
+shape; codex resume of multi-agent v2 sub-agent sessions is NOT possible
+(-32600) — relaunch fresh instead.
+NEXT: implement 200 in landing order P2→P3→P1+P1b (each phase gated on
+`sg docker -c 'bun run rig run worktree-squash-lifecycle'` progress toward
+green — the merged expected-RED scenario is the acceptance gate) then the 24h
+zero-deferral MacBook soak per the standing rule before ANY "unwedged" claim;
+197; the 193 live smoke suite; sweep Tier 3. NEXT: Q3a founder call; implement 200 in landing order P2→P3→P1+P1b→P4; 197;
 the 193 live smoke suite; sweep Tier 3. Mac's 2 repo deferrals persist by design
 until 200 lands (rbox-core = the phantom `fix/coupon-slack-notification`, a real
 squash-merged-then-deleted branch; savvy-core-v1 = `prepared Git child incarnation
