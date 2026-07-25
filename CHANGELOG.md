@@ -6,11 +6,50 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.9.1] — 2026-07-25 — "worktrees come and go, sync keeps up"
+
 ### Fixed
+- **Deleting a git branch now syncs like any other change.** When you delete a
+  branch (or an agent tears down its worktree and branch), rbox first proves
+  the deletion is real — the branch is verifiably absent under a lock, on a
+  healthy ref database, with a receipt that this machine held exactly that
+  branch — and only then publishes it. Your other machines prune the branch
+  automatically. Previously this exact workflow could wedge a repository's git
+  sync permanently. Set `RBOX_GIT_ABSENCE_CAPTURE=0` to restore the old
+  behavior.
+- **A linked worktree no longer stalls the whole repository.** A branch checked
+  out in a worktree is held individually; every other branch and commit keeps
+  syncing past it, and the repeated re-checking that cost ~9s per cycle on
+  held repositories is gone. (`RBOX_GIT_OWNERSHIP_HELD_SKIP=0` /
+  `RBOX_GIT_OWNERSHIP_NO_ESCALATE=0` restore the old behavior.)
+- **Squash-merged branches are recognized.** A branch whose changes already
+  landed on another branch via squash-merge no longer forces holds onto
+  unrelated branches. (`RBOX_GIT_CONTENT_EQUIV=0` restores ancestry-only.)
+- `rbox doctor` now lists leftover linked worktrees — branch, full path,
+  whether git considers them prunable, and whether they hold a synced branch.
+  (Absolute paths stay on your machine; uploaded diagnostics carry a redacted
+  summary.)
+- On macOS 26, stale-lock cleanup works again: Apple removed the system call
+  rbox used to read process start times, which made lock owners unreadable
+  and could park a repository behind locks nobody held.
+- A crash at exactly the wrong moment after saving sync state can no longer
+  lose both the newest save and its fallback (the save's directory entry is
+  now flushed before the fallback marker is removed).
+- Clearer statuses: a deleted branch mid-publish shows "finishing a branch
+  deletion" (instead of "local commits changed here"), and an unreadable ref
+  database is reported as exactly that instead of being treated as "no
+  branches" — a failed read can never turn into a published deletion.
 - On macOS, the daemon now recovers automatically after a clean full-tree scan
   when a dropped-events watcher error would previously have degraded it to
   periodic scans for the rest of the process. Set `RBOX_WATCHER_RETRUST=0` to
   restore the previous behavior.
+
+### Known
+- A branch that was already deleted while a repository was wedged on an older
+  version carries a stale possession receipt and won't publish its deletion by
+  itself. One-time fix: re-create the branch at its last-known commit, let one
+  sync complete, then delete it again. `rbox status --git` names the affected
+  branch.
 
 ## [1.9.0] — 2026-07-23 — "add a machine from the web"
 
