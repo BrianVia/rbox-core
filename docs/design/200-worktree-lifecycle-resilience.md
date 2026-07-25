@@ -1290,7 +1290,8 @@ never reaches the apply lane at all, because `applyGitRepos` returns `{ result: 
 `apply.ts:873-879`. v6 answered by moving absence reconciliation above that shortcut, which is where
 its ordering problems began. v7 does not need to: **deletion is a push-lane event, and the push lane
 runs every cycle regardless of the apply shortcut.** The one gate v7 adds there is on the *plan*
-side: `plan.ts:836-861`'s trusted-fingerprint carry must not skip a repository that has a positive
+side: the trusted-fingerprint carry — gate at `plan.ts:837`, carry decision at `:844`, `out[rel] =
+baseSec` at `:848` — must not skip a repository that has a positive
 BASE head absent from the live refs. That is an O(1) predicate over `record.base.refs` against the
 probe's own identity refs — no new subprocess, evaluated only on repositories whose fingerprint hit
 — and it is the entire cost of covering the latent wedge (§6).
