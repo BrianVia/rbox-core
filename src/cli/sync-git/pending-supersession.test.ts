@@ -15,6 +15,7 @@ import { cleanGitEnv, git, putGitArtifact, repoCtx } from "../../engine/git/shar
 import {
   gitPendingSupersedeEnabled,
   journalAllowsPendingSupersession,
+  pendingSupersessionPreProbe,
   pendingSupersessionAckConverges,
   provePendingSupersession,
 } from "./pending-supersession.js";
@@ -389,4 +390,29 @@ test("pending supersession kill switch is exact-zero only", () => {
   expect(gitPendingSupersedeEnabled({})).toBe(true);
   expect(gitPendingSupersedeEnabled({ RBOX_GIT_PENDING_SUPERSEDE: "0" })).toBe(false);
   expect(gitPendingSupersedeEnabled({ RBOX_GIT_PENDING_SUPERSEDE: "false" })).toBe(true);
+});
+
+test("absence-capture switch-off keeps a BASE-bound missing pending head on the pre-200 carry path", async () => {
+  const { root, a, b } = await fixture();
+  const pending = section(b, {
+    head: "ref: refs/heads/main",
+    refs: { "refs/heads/main": b, "refs/heads/deleted": a },
+  });
+  const base = section(b, {
+    head: "ref: refs/heads/main",
+    refs: { "refs/heads/main": b, "refs/heads/deleted": a },
+  });
+  const previous = process.env.RBOX_GIT_ABSENCE_CAPTURE;
+  try {
+    delete process.env.RBOX_GIT_ABSENCE_CAPTURE;
+    expect((await pendingSupersessionPreProbe(root, ".", pending, base)).status).toBe("maybe");
+    process.env.RBOX_GIT_ABSENCE_CAPTURE = "0";
+    expect(await pendingSupersessionPreProbe(root, ".", pending, base)).toMatchObject({
+      status: "carry",
+      reason: "local repository lacks pending ref refs/heads/deleted",
+    });
+  } finally {
+    if (previous === undefined) delete process.env.RBOX_GIT_ABSENCE_CAPTURE;
+    else process.env.RBOX_GIT_ABSENCE_CAPTURE = previous;
+  }
 });

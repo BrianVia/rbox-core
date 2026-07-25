@@ -399,6 +399,11 @@ describe("design 130 mandatory BASE composer", () => {
     assertHeld(section({ [ref]: L }), tombstoned, { ...authority, advertisedRefs: { [ref]: L } });
     assertHeld(section({ [ref]: L }), { ...tombstoned, refs: { [ref]: L } });
     assertHeld(section({ [ref]: L }), tombstoned, authority, locked({ effectiveRefScope: "scoped" }));
+    assertHeld(section({ [ref]: L }), tombstoned, authority, locked({ repoKind: "pointer" }));
+    assertHeld(section({ [ref]: L }), {
+      ...tombstoned,
+      refTombstones: { [ref]: [{ oid: U, ts: "2026-01-01T00:00:00.000Z", generation: 1 }] },
+    });
     assertHeld(section({ [ref]: L }), tombstoned, { ...authority, lineageHash: "not-a-lineage" });
     assertHeld(section({ [ref]: L }), tombstoned, { ...authority, repositoryIdentityHash: "not-an-identity" });
     assertHeld(section({ [ref]: L }), tombstoned, { ...authority, sourceSeq: -1 });

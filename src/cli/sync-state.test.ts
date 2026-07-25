@@ -787,8 +787,8 @@ describe("design 93 §6 transactional unit", () => {
     expect(packet.repos[0]?.newRecord.partial).toBeUndefined();
   });
 
-  test("design 200 packed-refs tuple is refuse-only sidecar state and reappears after an old writer strips it", () => {
-    const tuple = { dev: "1", ino: "2", size: 3, mtimeMs: 4 };
+  test("design 200 packed-refs mtime is refuse-only sidecar state and reappears after an old writer strips it", () => {
+    const tuple = { mtimeMs: 4 };
     const stripped = baseState({ r: { repoGen: 2, sourceSeq: 4, base: section("base") } });
     expect(changedSidecarRepoKeys(stripped, { packedRefsIdentity: { r: tuple } })).toEqual(["r"]);
     const packet = composeStateSavePacket(stripped, {
@@ -799,6 +799,27 @@ describe("design 93 §6 transactional unit", () => {
     });
     expect(packet.repos[0]?.newRecord.packedRefsIdentity).toEqual(tuple);
     expect(packet.repos[0]?.newRecord.base).toEqual(section("base"));
+  });
+
+  test("packed-refs ENOENT explicitly clears its baseline while omission retains it", () => {
+    const tuple = { mtimeMs: 4 };
+    const state = baseState({ r: { repoGen: 2, sourceSeq: 4, base: section("base"), packedRefsIdentity: tuple } });
+    expect(changedSidecarRepoKeys(state, {})).toEqual([]);
+    expect(changedSidecarRepoKeys(state, { packedRefsIdentity: { r: null } })).toEqual(["r"]);
+    const cleared = composeStateSavePacket(state, {
+      expectedStream: stream,
+      sourceGlobalSeq: 4,
+      observedRepos: ["r"],
+      values: { bases: { r: section("base") }, packedRefsIdentity: { r: null } },
+    });
+    expect(cleared.repos[0]?.newRecord.packedRefsIdentity).toBeUndefined();
+    const retained = composeStateSavePacket(state, {
+      expectedStream: stream,
+      sourceGlobalSeq: 4,
+      observedRepos: ["r"],
+      values: { bases: { r: section("base") } },
+    });
+    expect(retained.repos[0]?.newRecord.packedRefsIdentity).toEqual(tuple);
   });
 
   test("reset refuses an unbound checkout journal and preserves all reset sidecars", async () => {

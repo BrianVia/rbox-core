@@ -294,8 +294,7 @@ export interface RepoRecord {
   /** Positive provenance exists only for refs/heads/* and must match BASE exactly. */
   branchBaseOrigins?: Record<string, BranchBaseOrigin>;
   /** Refuse-only restore detector for the common store's packed refs. */
-  /** Decimal strings keep device/inode identity lossless across JSON and JS runtimes. */
-  packedRefsIdentity?: { dev: string; ino: string; size: number; mtimeMs: number };
+  packedRefsIdentity?: { mtimeMs: number };
   pending?: GitSection;
   /** The publisher intentionally omitted this repository without performing any
    * follower branch CAS (for example, structural refusal or syncGit:false).

@@ -42,6 +42,14 @@ test("design 200 absence proof is verify-only and races fail closed", async () =
   expect(await git("rev-parse", ref)).toMatch(/^[0-9a-f]{40}$/);
 });
 
+test("locked absence transaction refuses unreadable worktree ownership evidence", async () => {
+  const ref = "refs/heads/deleted";
+  const plan = await planAbsentBranchVerification(root, ref);
+  await fs.appendFile(path.join(root, ".git", "config"), "\n[broken\n");
+  await expect(commitAbsentBranchVerification(plan)).rejects.toThrow();
+  await expect(git("rev-parse", "--verify", ref)).rejects.toThrow();
+});
+
 test("design 200 refuses an unborn current branch in both planner and commit defense", async () => {
   const unborn = "refs/heads/unborn";
   await git("symbolic-ref", "HEAD", unborn);

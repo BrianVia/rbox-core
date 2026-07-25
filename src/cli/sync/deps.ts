@@ -70,6 +70,8 @@ export interface SyncDeps {
   encryptCacheFlushMs?: number;
   /** Test-only race seam for synchronous keep-mine's actual publication capture. */
   resolutionCaptureTestHooks?: ResolutionCaptureTestHooks;
+  /** Tests only: awaited after capture and before design-200 Step-D reads. */
+  beforeAbsenceWitness?: (relPath: string) => void | Promise<void>;
   /** Forensic git-sync log sink (design 43 §10): capture/carry/defer/remove summaries on
    *  push, per-repo apply/conflict lines on pull. Push summaries include their structured
    *  plan as optional presentation context; grep-oriented sinks can ignore it and retain

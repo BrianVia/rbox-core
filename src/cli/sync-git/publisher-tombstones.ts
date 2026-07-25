@@ -125,7 +125,6 @@ export function normalizePublishedGitSection(
     for (const [ref, proof] of Object.entries(absentBranchProofs).sort(([a], [b]) => bytewise(a, b))) {
       if (!ref.startsWith("refs/heads/") || candidate.refs[ref] !== undefined || !/^[0-9a-f]{40}$/.test(proof.priorOid)) continue;
       const byOid = chains.get(ref) ?? new Map<string, GitRefTombstone>();
-      if (byOid.has(proof.priorOid)) continue;
       if (generation === Number.MAX_SAFE_INTEGER) {
         overflow++;
         continue;

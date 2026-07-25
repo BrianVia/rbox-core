@@ -453,11 +453,11 @@ export interface WorktreeEntry {
   branch?: string;
   prunable: boolean;
 }
+export type WorktreeListResult =
+  | { status: "ok"; entries: WorktreeEntry[] }
+  | { status: "unreadable"; cause: unknown };
 
-/** Parse `git worktree list --porcelain` into structured entries. Never throws (a repo
- *  with no worktrees dir simply lists its single main entry; an error → []). */
-export async function listWorktrees(repoDir: string): Promise<WorktreeEntry[]> {
-  const out = await git(repoDir, ["worktree", "list", "--porcelain"]).catch(() => "");
+function parseWorktrees(out: string): WorktreeEntry[] {
   const entries: WorktreeEntry[] = [];
   let cur: (Partial<WorktreeEntry> & { path?: string }) | undefined;
   const flush = () => {
@@ -478,6 +478,20 @@ export async function listWorktrees(repoDir: string): Promise<WorktreeEntry[]> {
   }
   flush();
   return entries;
+}
+
+/** Evidence-sensitive worktree enumeration. A failed Git read is not an empty
+ * ownership map: callers using this to authorize ref mutation must refuse. */
+export async function listWorktreesStrict(repoDir: string): Promise<WorktreeListResult> {
+  const result = await gitStatus(repoDir, ["worktree", "list", "--porcelain"]);
+  if (result.status === "failed") return { status: "unreadable", cause: result.cause };
+  return { status: "ok", entries: parseWorktrees(result.stdout) };
+}
+
+/** Lossy worktree enumeration for diagnostics and non-authorizing callers. */
+export async function listWorktrees(repoDir: string): Promise<WorktreeEntry[]> {
+  const result = await listWorktreesStrict(repoDir);
+  return result.status === "ok" ? result.entries : [];
 }
 
 /** "ref: refs/heads/x" → "refs/heads/x"; detached (40-hex) → undefined. */

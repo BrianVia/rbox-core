@@ -30,7 +30,7 @@ import {
   basePresentKeepRef,
 } from "../../engine/index.js";
 import { captureCommonDirIdentity } from "../../engine/git/lockfile.js";
-import { branchesCheckedOutElsewhere } from "../../engine/git/apply.js";
+import { branchesCheckedOutElsewhere, branchesCheckedOutElsewhereStrict } from "../../engine/git/apply.js";
 import {
   humanDisplacementOrigin,
   prepareDisplacementPins,
@@ -72,7 +72,7 @@ import {
   pruneOrigHeadRecoveryRefs,
   type OrigHeadPreservation,
 } from "./orig-head.js";
-import { gitIncomingKey, sectionOpState } from "./shared.js";
+import { gitIncomingKey, observePackedRefsIdentity, packedRefsMtimeRegressed, sectionOpState } from "./shared.js";
 import { checkTombstoneAttestation } from "./tombstone-attestation.js";
 import type { FollowerBranchProtocol } from "./follower-protocol.js";
 import { commitPlannedBranchTransition, planBranchTransition, planManualBranchTransition, type PlannedBranchTransition } from "./branch-transition.js";
@@ -88,6 +88,12 @@ import { loadContentEquivalenceCache } from "./content-equivalence-cache.js";
 
 const refEquivalenceWarnings = new Set<string>();
 const receiverEquivalenceByWorkspace = new Map<string, ReturnType<typeof probeReceiverEquivalence>>();
+
+class WorktreeOwnershipUnreadableError extends Error {
+  constructor(cause: unknown) {
+    super(`worktree ownership evidence could not be read: ${String((cause as Error)?.message ?? cause)}`);
+  }
+}
 
 function boundedRefFailure(error: unknown): string {
   const clean = String((error as Error)?.message ?? error)
@@ -177,6 +183,11 @@ interface FollowOptions {
   onContentEquivalentWaiver?: (ref: string) => void;
   onContentEquivalentDestructiveHold?: (ref: string) => void;
   beforePlanBranchTransition?: (ref: string, afterOid: string | null) => void;
+  beforeManualAbsentTransition?: (ref: string) => void | Promise<void>;
+  beforeWorktreeOwnershipRead?: () => void | Promise<void>;
+  /** Tests only: fault injection at the two deliberately lossy readLive sites. */
+  beforeCheckoutSecondProof?: () => void | Promise<void>;
+  beforeFinalLive?: () => void | Promise<void>;
   mutationBoundary?: MutationBoundary;
   /** Runs after the exact initial classifier and before staged scratch refs are
    * cleaned. The callback may persist an attempt only if its trusted edge still
@@ -431,9 +442,7 @@ async function readLive(ctx: RepoCtx, chainTimings?: GitChainTimings): Promise<L
     const { headContent, currentRef, refs, currentTip } = await addTimedMs(chainTimings, "ownershipMs", async () => {
       const headContent = await fs.readFile(path.join(ctx.gitDir, "HEAD"), "utf8");
       const currentRef = /^ref:\s*(refs\/\S+)\s*$/.exec(headContent)?.[1];
-      const strict = await readAllRefsStrict(ctx.repoDir);
-      if (strict.status === "unreadable") throw new RefReadUnreadableError(strict.marker);
-      const refs = strict.refs;
+      const refs = await readAllRefs(ctx.repoDir);
       const currentTip = currentRef
         ? refs[currentRef] ?? await git(ctx.repoDir, ["rev-parse", "--verify", currentRef]).catch(() => undefined)
         : await git(ctx.repoDir, ["rev-parse", "--verify", "HEAD"]).catch(() => undefined);
@@ -452,15 +461,8 @@ async function readLive(ctx: RepoCtx, chainTimings?: GitChainTimings): Promise<L
       return { indexPresent, indexProjection, opState, opStateRootsPresent };
     });
     return { headContent, currentRef, currentTip, refs, indexPresent, indexProjection, opState, opStateRootsPresent };
-  } catch (error) {
-    if (error instanceof RefReadUnreadableError) throw error;
+  } catch {
     return undefined;
-  }
-}
-
-class RefReadUnreadableError extends Error {
-  constructor(readonly marker: string) {
-    super(`ref-read-unreadable: ${marker}`);
   }
 }
 
@@ -684,7 +686,19 @@ async function publishRefPlane(
   authoredRefChanges: Array<{ ref: string; before?: string; after?: string }>;
 }> {
   const effective = effectiveRefs(opts.ctx, opts.incoming);
-  const owned = await addTimedMs(opts.chainTimings, "ownershipMs", () => branchesCheckedOutElsewhere(opts.ctx));
+  const owned = classifyOnly
+    ? await addTimedMs(opts.chainTimings, "ownershipMs", () => branchesCheckedOutElsewhere(opts.ctx))
+    : await (async () => {
+        let ownedRead: Awaited<ReturnType<typeof branchesCheckedOutElsewhereStrict>>;
+        try {
+          await opts.beforeWorktreeOwnershipRead?.();
+          ownedRead = await addTimedMs(opts.chainTimings, "ownershipMs", () => branchesCheckedOutElsewhereStrict(opts.ctx));
+        } catch (error) {
+          throw new WorktreeOwnershipUnreadableError(error);
+        }
+        if (ownedRead.status === "unreadable") throw new WorktreeOwnershipUnreadableError(ownedRead.cause);
+        return ownedRead.owned;
+      })();
   const appliedRefs: GitPartialApply["appliedRefs"] = {};
   const heldRefs: GitPartialApply["heldRefs"] = {};
   const blockers: TypedBlocker[] = [];
@@ -733,14 +747,12 @@ async function publishRefPlane(
   // kill-switched: it prevents a follower from recreating a published branch
   // during the publisher's capture-to-ACK window and licenses converged case (c).
   const deletionWitnessRefs = new Set<string>();
+  const deletionWitnessHeldRefs = new Set<string>();
   if (opts.ctx.kind === "dir" && opts.incoming.refScope === "all" && opts.branchProtocol) {
     const priorPacked = opts.record?.packedRefsIdentity;
-    const currentPackedStat = await fs.stat(path.join(opts.ctx.commonDir, "packed-refs"), { bigint: true })
-      .catch((error: NodeJS.ErrnoException) => error.code === "ENOENT" ? undefined : null);
-    const packedRegressed = currentPackedStat === null || (priorPacked !== undefined && (!currentPackedStat
-      || priorPacked.dev !== currentPackedStat.dev.toString()
-      || priorPacked.ino !== currentPackedStat.ino.toString()
-      || Number(currentPackedStat.mtimeMs) < priorPacked.mtimeMs));
+    const currentPacked = await observePackedRefsIdentity(opts.ctx.commonDir);
+    const packedRegressed = currentPacked.status === "unreadable"
+      || packedRefsMtimeRegressed(priorPacked, currentPacked);
     const headLog = await fs.readFile(path.join(opts.ctx.commonDir, "logs", "HEAD")).catch(() => undefined);
     if (!packedRegressed && headLog && headLog.byteLength > 0) {
       for (const [ref, baseOid] of Object.entries(opts.base?.refs ?? {})) {
@@ -767,7 +779,10 @@ async function publishRefPlane(
     if (ref === live.currentRef) checkoutRefReason ??= classified;
   }
   for (const ref of deletionWitnessRefs) {
-    if (effective.refs[ref] !== undefined) classifiedHolds.set(ref, "local-commits");
+    if (effective.refs[ref] !== undefined) {
+      classifiedHolds.set(ref, "local-commits");
+      deletionWitnessHeldRefs.add(ref);
+    }
   }
   const protectedByRef = new Map<string, string[]>();
   for (const ref of candidates) {
@@ -936,6 +951,7 @@ async function publishRefPlane(
         } else if ((opts.manualResolution || deletionWitnessRefs.has(ref))
           && !newOid && logicalBaseOid !== null && opts.branchProtocol) {
           try {
+            await opts.beforeManualAbsentTransition?.(ref);
             const plan = await addTimedMs(opts.chainTimings, "refTxnExclusiveMs", () => planManualBranchTransition({
               repoDir: opts.ctx.repoDir, binding: opts.branchProtocol!.binding, ref,
               physicalBeforeOid: null, afterOid: null, logicalBaseOid,
@@ -944,7 +960,9 @@ async function publishRefPlane(
               const strict = await readAllRefsStrict(opts.ctx.repoDir);
               if (strict.status === "unreadable") throw new Error(`ref-read-unreadable: ${strict.marker}`);
               const lockedRefs = strict.refs;
-              const lockedOwned = await branchesCheckedOutElsewhere(opts.ctx);
+              const lockedOwnedRead = await branchesCheckedOutElsewhereStrict(opts.ctx);
+              if (lockedOwnedRead.status === "unreadable") throw lockedOwnedRead.cause;
+              const lockedOwned = lockedOwnedRead.owned;
               if (lockedRefs[ref] !== undefined || lockedOwned.has(ref)) throw new Error("manual absent branch changed at locked proof");
             }, opts.chainTimings);
             branchWitnesses[ref] = committed.witness;
@@ -1057,7 +1075,9 @@ async function publishRefPlane(
           const strict = await readAllRefsStrict(opts.ctx.repoDir);
           if (strict.status === "unreadable") throw new Error(`ref-read-unreadable: ${strict.marker}`);
           const lockedRefs = strict.refs;
-          const lockedOwned = await branchesCheckedOutElsewhere(opts.ctx);
+          const lockedOwnedRead = await branchesCheckedOutElsewhereStrict(opts.ctx);
+          if (lockedOwnedRead.status === "unreadable") throw lockedOwnedRead.cause;
+          const lockedOwned = lockedOwnedRead.owned;
           if ((lockedRefs[ref] ?? null) !== (oldOid ?? null) || lockedOwned.has(ref)) throw new Error("branch changed at locked second proof");
           if (tombstoneAuthorized.has(ref) && oldOid) {
             const checked = checkTombstoneAttestation(opts.branchProtocol!.attestations, {
@@ -1103,7 +1123,7 @@ async function publishRefPlane(
     if (indeterminateRefs.has(ref)) continue;
     blockers.push({
       provenance: "ref-plane",
-      reason: deletionWitnessRefs.has(ref)
+      reason: deletionWitnessHeldRefs.has(ref)
         ? "deletion-pending"
         : held === "ownership" ? "worktree-ownership" : held,
       ref,
@@ -1195,13 +1215,11 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
         ? await indexIdentityV2(opts.ctx.repoDir, staged.candidateIndex)
         : undefined
       : null;
-    const liveBefore = await readLive(opts.ctx, opts.chainTimings).catch((error) => {
-      if (error instanceof RefReadUnreadableError) return error;
-      throw error;
-    });
-    if (liveBefore instanceof RefReadUnreadableError) {
-      return deferResult(emptyProgress, "ref-read-unreadable", liveBefore.message);
+    const strictLiveRefs = await readAllRefsStrict(opts.ctx.repoDir);
+    if (strictLiveRefs.status === "unreadable") {
+      return deferResult(emptyProgress, "ref-read-unreadable", `ref-read-unreadable: ${strictLiveRefs.marker}`);
     }
+    const liveBefore = await readLive(opts.ctx, opts.chainTimings);
     if (!liveBefore) return deferResult(emptyProgress, "unreadable", "git metadata could not be read");
     const baseProjection = opts.record?.idxProj ?? await addTimedMs(opts.chainTimings, "indexOpStateMs", () =>
       deriveBaseIndexProjection(opts, staged.tmpDir).catch(() => undefined));
@@ -1214,7 +1232,17 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
     // displaced value is incoming-owned, remains reachable, and the design's
     // idempotency clause covers the retry. Do not move this behind the checkout
     // journal absent a new normative design change.
-    const refProgress = await publishRefPlane(opts, liveBefore, roots);
+    let refProgress: Awaited<ReturnType<typeof publishRefPlane>>;
+    try {
+      refProgress = await publishRefPlane(opts, liveBefore, roots);
+    } catch (error) {
+      if (!(error instanceof WorktreeOwnershipUnreadableError)) throw error;
+      return deferResult(
+        emptyProgress,
+        "unreadable",
+        error.message,
+      );
+    }
     const progress: FollowProgress = {
       appliedRefs: refProgress.appliedRefs,
       heldRefs: refProgress.heldRefs,
@@ -1504,6 +1532,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
       journal: { workspaceRoot: opts.workspaceRoot, relPath: opts.relPath, value: journal },
       mutationBoundary: opts.mutationBoundary,
       secondProof: async () => {
+        await opts.beforeCheckoutSecondProof?.();
         const freshCtx = await repoCtx(opts.ctx.repoDir);
         const freshBinding = freshCtx ? await checkoutJournalBinding(opts.binding.stream, opts.binding.stateNonce, freshCtx) : undefined;
         const sameIncarnation = freshCtx !== undefined && freshBinding !== undefined
@@ -1704,6 +1733,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
         ? opts.record?.idxProj ?? await addTimedMs(opts.chainTimings, "indexOpStateMs", () =>
           deriveBaseIndexProjection(opts, staged.tmpDir).catch(() => undefined))
         : null;
+      await opts.beforeFinalLive?.();
       const finalLive = await readLive(opts.ctx, opts.chainTimings);
       if (finalLive) {
         const finalRef = await publishRefPlane(opts, finalLive, roots, true);

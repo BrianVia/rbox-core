@@ -9,7 +9,7 @@ import { sanitizeGitSectionForPersistence } from "../../engine/git/config-sync.j
 import { expectedStateNonce, repoRecordsForState, type GitDeferralReason, type SyncState, type WorkspaceConfig } from "../config.js";
 import type { SyncRemote } from "../remote.js";
 import type { TransferProgress } from "../transfer-progress.js";
-import { GIT_CAPTURE_CONCURRENCY, configCredentialSkipLogged, configOwnershipSkipLogged, pendingCarryLogged, gitRepoCap, repoDirOf, carryMatrixMatches, emptyToUndef, errMsg, gitIncomingKey, capturePlannedGitSection, type ResolutionCaptureTestHooks } from "./shared.js";
+import { GIT_CAPTURE_CONCURRENCY, configCredentialSkipLogged, configOwnershipSkipLogged, pendingCarryLogged, gitRepoCap, repoDirOf, carryMatrixMatches, emptyToUndef, errMsg, gitIncomingKey, capturePlannedGitSection, observePackedRefsIdentity, packedRefsMtimeRegressed, type ResolutionCaptureTestHooks } from "./shared.js";
 import { configReceiver, gitConfigHash, readLocalGitConfig, shouldPublishGitConfig, type LocalCfgRead } from "./config-lane.js";
 import { gitFingerprint, gitFingerprintRun } from "./fingerprint.js";
 import { loadGitDivergenceCache, saveGitDivergenceCache, fingerprintHitProbe, buildPlanProbe, writeDivergenceCacheEntry, isGitRepoKind, type FingerprintHitProbeResult, type DivergenceCacheProbeSnapshot, type DivergenceCacheWriteResult } from "./divergence-cache.js";
@@ -18,7 +18,7 @@ import { normalizeOutgoingGitSections, tombstoneFindingLine } from "./publisher-
 import { gitPendingSupersedeEnabled, journalAllowsPendingSupersession, pendingSupersessionAckConverges, pendingSupersessionPreProbe, provePendingSupersession } from "./pending-supersession.js";
 import { CONFLICT_REF_PRUNE_LIMIT, pruneConflictRefs } from "./conflict-retention.js";
 import { discardedIncomingOids, finalResolutionReport, reportAuthorized, resolutionReportHash, type GitResolutionRider } from "./resolution-intent.js";
-import { branchesCheckedOutElsewhere } from "../../engine/git/apply.js";
+import { branchesCheckedOutElsewhereStrict } from "../../engine/git/apply.js";
 import { readHead } from "../../engine/git/shared.js";
 import { branchBaseOriginMatches } from "./base-composer.js";
 import { prepareFollowerBranchProtocol } from "./follower-protocol.js";
@@ -52,7 +52,7 @@ export interface GitPushPlan {
     repoKind: "dir" | "pointer";
   }>;
   absentBranchProofs?: Record<string, Record<string, { priorOid: string }>>;
-  packedRefsIdentity?: Record<string, { dev: string; ino: string; size: number; mtimeMs: number }>;
+  packedRefsIdentity?: Record<string, { mtimeMs: number } | null>;
   captured: string[];
   carried: string[];
   /** Candidate-bound receipts consumed only by the accepted publisher ACK. */
@@ -112,6 +112,10 @@ export interface GitPlanOptions {
   onGitReposDiscovered?: (repos: readonly DiscoveredGitRepo[]) => Promise<void>;
   /** Deterministic test seam for a ref race after B's provisional pre-probe. */
   afterPendingPreProbe?: (relPath: string) => void | Promise<void>;
+  /** Deterministic test seam after capture and immediately before Step-D reads. */
+  beforeAbsenceWitness?: (relPath: string) => void | Promise<void>;
+  /** Tests only: after context/protocol reads, before authorization preflight. */
+  beforeAbsencePreflight?: (relPath: string) => void | Promise<void>;
   /** Ephemeral foreground confirmation authority, retained by the push loop. */
   resolution?: GitResolutionRider;
   /** Publication-capture race seam. Tests only; ordinary/preliminary capture never receives it. */
@@ -152,7 +156,6 @@ export async function planGitSections(
       .map(([relPath]) => [relPath, true as const]),
   );
   const removedMem = { ...(state.gitReposRemoved ?? {}) };
-  const initialRemovedMem = { ...removedMem };
   const needsRes = { ...(state.gitNeedsResolution ?? {}) };
   // Immutable durable pre-plan checkpoint. Planner-local `pending` is allowed to
   // change (including syncGit:false deletion), but it can never rewrite the
@@ -181,7 +184,12 @@ export async function planGitSections(
     delete repoAbsent[rel];
     captured.push(rel);
   };
-  const revertCapture = (rel: string, fallback: GitSection, reason: string): void => {
+  const revertCapture = (
+    rel: string,
+    fallback: GitSection,
+    reason: string,
+    typedReason?: GitDeferralReason,
+  ): void => {
     delete absentBranchProofs[rel];
     out[rel] = fallback;
     if (finalizedOutgoing) finalizedOutgoing[rel] = fallback;
@@ -190,20 +198,7 @@ export async function planGitSections(
     const capturedIndex = captured.indexOf(rel);
     if (capturedIndex >= 0) captured.splice(capturedIndex, 1);
     if (!carried.includes(rel)) carried.push(rel);
-    deferred.push({ relPath: rel, reason });
-  };
-  const discardHiddenCapture = (rel: string, record: ReturnType<typeof repoRecordsForState>[string]): void => {
-    delete absentBranchProofs[rel];
-    delete out[rel];
-    if (finalizedOutgoing) delete finalizedOutgoing[rel];
-    delete authoredCfgHashByRepo[rel];
-    if (record?.repoAbsent === true) repoAbsent[rel] = true;
-    else delete repoAbsent[rel];
-    const removedKey = record?.removedKey ?? initialRemovedMem[rel];
-    if (removedKey !== undefined) removedMem[rel] = removedKey;
-    else delete removedMem[rel];
-    const capturedIndex = captured.indexOf(rel);
-    if (capturedIndex >= 0) captured.splice(capturedIndex, 1);
+    deferred.push({ relPath: rel, reason, ...(typedReason ? { typedReason } : {}) });
   };
   const pendingSupersessionCandidates = new Set<string>();
   const supersededPending = new Set<string>();
@@ -1021,45 +1016,61 @@ export async function planGitSections(
     }
   });
 
-  // Design 200 W/L/D: a strict capture may turn a BASE-positive branch into an
-  // omission only after the nine-rule witness and a prepared verify-only lock.
-  // This is deliberately after all captures and before tombstone normalization.
-  if (process.env.RBOX_GIT_ABSENCE_CAPTURE !== "0") {
-    for (const rel of [...captured].sort()) {
+  // Design 200 W/L/D: observe the packed-refs mtime baseline on captured and
+  // carried dir repos regardless of the kill switch. A strict capture may turn
+  // a BASE-positive branch into an omission only after the full witness and a
+  // prepared verify-only lock.
+  const absenceCaptureEnabled = process.env.RBOX_GIT_ABSENCE_CAPTURE !== "0";
+  for (const rel of [...new Set([...captured, ...carried])].sort()) {
       const candidate = out[rel];
+      if (!candidate) continue;
       const record = repoRecordsForState(state)[rel];
+      // A hidden BASE is provenance, never W/L/D refusal authority. A fresh
+      // repository at the same path must flow through the normal re-add path.
+      if (record?.repoAbsent === true || record?.removedKey !== undefined) continue;
       const baseSection = record?.base ?? base[rel];
-      const ctx = await repoCtxFromDisk(repoDirOf(root, rel)).catch(() => undefined);
-      if (!candidate || !ctx || ctx.kind !== "dir") continue;
-
-      const packedPath = path.join(ctx.commonDir, "packed-refs");
-      const packedStat = await fs.stat(packedPath, { bigint: true }).catch((error: NodeJS.ErrnoException) => {
-        if (error.code === "ENOENT") return undefined;
-        throw error;
-      }).catch(() => null);
-      if (packedStat && packedStat !== null) {
-        packedRefsIdentity[rel] = {
-          dev: packedStat.dev.toString(), ino: packedStat.ino.toString(),
-          size: Number(packedStat.size), mtimeMs: Number(packedStat.mtimeMs),
-        };
-      }
-
       const missing = Object.entries(baseSection?.refs ?? {})
         .filter(([ref]) => ref.startsWith("refs/heads/"))
         .filter(([ref]) => candidate.refs[ref] === undefined);
-      if (missing.length === 0) continue;
 
-      let refusal: string | undefined = packedStat === null
-        ? "packed-refs identity could not be read"
-        : undefined;
-      const previousPacked = record?.packedRefsIdentity;
-      const currentPacked = packedRefsIdentity[rel];
-      if (previousPacked && (!currentPacked
-        || previousPacked.dev !== currentPacked.dev
-        || previousPacked.ino !== currentPacked.ino
-        || currentPacked.mtimeMs < previousPacked.mtimeMs)) {
-        refusal = "packed-refs identity regressed while a BASE branch was absent";
+      if (absenceCaptureEnabled && missing.length > 0) await options.beforeAbsenceWitness?.(rel);
+      let ctx: RepoCtx | undefined;
+      let ctxFailure: unknown;
+      try {
+        ctx = await repoCtxFromDisk(repoDirOf(root, rel));
+      } catch (error) {
+        ctxFailure = error;
       }
+      if (!ctx) {
+        if (absenceCaptureEnabled && missing.length > 0) {
+          const reason = `repository context became unreadable before branch deletion proof: ${errMsg(ctxFailure)}`;
+          glog(`git-sync deferred ${rel}: finishing branch deletion: ${reason}`);
+          const fallback = pending[rel] ?? baseSection;
+          if (fallback) revertCapture(rel, fallback, reason, "unreadable");
+        }
+        continue;
+      }
+      if (ctx.kind !== "dir") continue;
+
+      const packedObservation = await observePackedRefsIdentity(ctx.commonDir);
+      const previousPacked = record?.packedRefsIdentity;
+      const packedRegressed = packedRefsMtimeRegressed(previousPacked, packedObservation);
+      if (packedObservation.status === "absent") {
+        packedRefsIdentity[rel] = null;
+      } else if (packedObservation.status === "present"
+        && !packedRegressed) {
+        packedRefsIdentity[rel] = packedObservation.identity;
+      }
+
+      if (!absenceCaptureEnabled || missing.length === 0) continue;
+
+      let refusal: string | undefined = packedObservation.status === "unreadable"
+        ? `packed-refs baseline could not be read: ${errMsg(packedObservation.error)}`
+        : packedRegressed
+          ? "packed-refs mtime regressed while a BASE branch was absent"
+          : undefined;
+      let refusalType: GitDeferralReason | undefined =
+        packedObservation.status === "unreadable" ? "unreadable" : undefined;
       const headLog = await fs.readFile(path.join(ctx.commonDir, "logs", "HEAD")).catch(() => undefined);
       if (!headLog || headLog.byteLength === 0) refusal ??= "HEAD reflog is absent or empty";
       const protocol = refusal ? undefined : await prepareFollowerBranchProtocol({
@@ -1074,14 +1085,29 @@ export async function planGitSections(
         || binding.repositoryIdentityHash !== readyProtocol.repositoryIdentityHash)) {
         refusal ??= "publisher repository binding changed before absence proof";
       }
-      const [busy, preflight, owned, head] = refusal
-        ? [false, { ok: true } as const, new Map<string, string>(), ""]
-        : await Promise.all([
-          isGitBusy(ctx.repoDir),
-          gitPreflight(ctx.repoDir),
-          branchesCheckedOutElsewhere(ctx),
-          readHead(ctx),
-        ]);
+      let busy = false;
+      let preflight: Awaited<ReturnType<typeof gitPreflight>> = { ok: true };
+      let owned = new Map<string, string>();
+      let head = "";
+      if (!refusal) {
+        try {
+          await options.beforeAbsencePreflight?.(rel);
+          const [busyRead, preflightRead, ownedRead, headRead] = await Promise.all([
+            isGitBusy(ctx.repoDir),
+            gitPreflight(ctx.repoDir),
+            branchesCheckedOutElsewhereStrict(ctx),
+            readHead(ctx),
+          ]);
+          if (ownedRead.status === "unreadable") throw ownedRead.cause;
+          busy = busyRead;
+          preflight = preflightRead;
+          owned = ownedRead.owned;
+          head = headRead;
+        } catch (error) {
+          refusal = `branch deletion authorization evidence could not be read: ${errMsg(error)}`;
+          refusalType = "unreadable";
+        }
+      }
       if (busy) refusal ??= "repository operation began before absence proof";
       if (!preflight.ok) refusal ??= preflight.reason;
       const collisions = receiverEquivalentCollisionNames([
@@ -1124,20 +1150,16 @@ export async function planGitSections(
         continue;
       }
 
-      glog(`git-sync deletion witness deferred ${rel}: ${refusal ?? "branch deletion proof unavailable"}`);
+      const reason = refusal ?? "branch deletion proof unavailable";
+      glog(`git-sync deferred ${rel}: finishing branch deletion: ${reason}`);
       delete absentBranchProofs[rel];
-      const hidden = record?.repoAbsent === true || record?.removedKey !== undefined;
-      if (hidden) {
-        discardHiddenCapture(rel, record);
-      } else if (pending[rel] ?? baseSection) {
-        revertCapture(rel, (pending[rel] ?? baseSection)!, refusal ?? "branch deletion proof unavailable");
-      }
-      deferred.push({
-        relPath: rel,
-        reason: refusal ?? "branch deletion proof unavailable",
-        typedReason: (refusal ?? "").includes("ref-read-unreadable") ? "ref-read-unreadable" : "deletion-pending",
-      });
-    }
+      const fallback = pending[rel] ?? baseSection;
+      if (fallback) revertCapture(
+        rel,
+        fallback,
+        reason,
+        refusalType ?? (reason.includes("ref-read-unreadable") ? "ref-read-unreadable" : "deletion-pending"),
+      );
   }
 
   const normalized = normalizeCurrentOutgoing();
@@ -1149,19 +1171,13 @@ export async function planGitSections(
       section.refTombstones?.[ref]?.some((entry) => entry.oid === proof.priorOid) === true);
     if (exact) continue;
     delete absentBranchProofs[rel];
-    const record = repoRecordsForState(state)[rel];
-    const hidden = record?.repoAbsent === true || record?.removedKey !== undefined;
-    if (hidden) {
-      discardHiddenCapture(rel, record);
-    } else {
-      const fallback = pending[rel] ?? base[rel];
-      if (fallback) revertCapture(rel, fallback, "proof-backed tombstone could not be authored exactly");
-    }
-    deferred.push({
-      relPath: rel,
-      reason: "proof-backed tombstone could not be authored exactly",
-      typedReason: "deletion-pending",
-    });
+    const fallback = pending[rel] ?? base[rel];
+    if (fallback) revertCapture(
+      rel,
+      fallback,
+      "proof-backed tombstone could not be authored exactly",
+      "deletion-pending",
+    );
   }
   for (const rel of [...resolutionCandidates].sort()) {
     const rider = options.resolution?.repo === rel ? options.resolution : undefined;

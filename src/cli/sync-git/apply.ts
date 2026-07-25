@@ -92,6 +92,9 @@ export interface GitPullOutcome {
   attempt?: Record<string, GitHeldAttempt | null>;
   idxProj?: Record<string, string | null>;
   repoProofs?: Record<string, RepoBaseProof>;
+  /** Transactional proofs retained only for post-save A/P settlement when the
+   * terminal ref read forced the state composer onto carry authority. */
+  artifactSettlementProofs?: Record<string, RepoBaseProof>;
   branchBaseOrigins?: Record<string, NonNullable<RepoRecord["branchBaseOrigins"]>>;
   /** Published checkout journals clear only after the surrounding state CAS. */
   publishedJournals?: string[];
@@ -311,6 +314,11 @@ opts: {
     afterHeldSkipPrepass?: (relPath: string) => void | Promise<void>;
     /** Test seam after the persisted classifier but before attempt completion. */
     afterHeldClassification?: (relPath: string) => void | Promise<void>;
+    /** Tests only: fault injection at deliberately lossy follow read sites. */
+    beforeCheckoutSecondProof?: (relPath: string) => void | Promise<void>;
+    beforeFinalLive?: (relPath: string) => void | Promise<void>;
+    beforeManualAbsentTransition?: (relPath: string, ref: string) => void | Promise<void>;
+    beforeWorktreeOwnershipRead?: (relPath: string) => void | Promise<void>;
     /** Shared logical time for held-attempt tests; omitted production call sites
      * retain the helpers' individual wall-clock reads. */
     heldNow?: () => number;
@@ -1384,6 +1392,10 @@ opts: {
         log: glog,
         forcedHeldRefs,
         afterBranchPinsPrepared: opts.afterBranchPinsPrepared,
+        beforeCheckoutSecondProof: () => opts.beforeCheckoutSecondProof?.(rel),
+        beforeFinalLive: () => opts.beforeFinalLive?.(rel),
+        beforeManualAbsentTransition: (ref) => opts.beforeManualAbsentTransition?.(rel, ref),
+        beforeWorktreeOwnershipRead: () => opts.beforeWorktreeOwnershipRead?.(rel),
         mutationBoundary: opts.mutationBoundary,
         afterHeldClassification: async (classification) => {
           await opts.afterHeldClassification?.(rel);
@@ -1974,7 +1986,15 @@ export async function withRevalidatedGitPartialApplies<T>(
           delete outcome.branchBaseOrigins[rel];
         }
         outcome.partial = { ...(outcome.partial ?? {}), [rel]: null };
-        if (outcome.repoProofs) delete outcome.repoProofs[rel];
+        outcome.artifactSettlementProofs = {
+          ...(outcome.artifactSettlementProofs ?? {}),
+          [rel]: proof,
+        };
+        const retainedLineage = recordOriginLineage(prior?.branchBaseOrigins) ?? "legacy-untrusted";
+        outcome.repoProofs = {
+          ...(outcome.repoProofs ?? {}),
+          [rel]: carryRepoBaseProof(retainedLineage),
+        };
         const existingTransition = outcome.deferrals?.[rel];
         const existing = existingTransition === null
           ? undefined
@@ -2036,7 +2056,11 @@ export async function settleCommittedBranchArtifacts(
 ): Promise<SyncState> {
   let state = initialState;
   const attemptsToRebind: Array<{ relPath: string; attempt: GitHeldAttempt }> = [];
-  const settlementRepos = Object.entries(outcome.repoProofs ?? {})
+  const settlementProofs = {
+    ...(outcome.repoProofs ?? {}),
+    ...(outcome.artifactSettlementProofs ?? {}),
+  };
+  const settlementRepos = Object.entries(settlementProofs)
     .filter(([, proof]) => proof.authority.kind === "pull-ref-transaction" || proof.authority.kind === "journal-recovery")
     .map(([rel]) => rel)
     .sort();
@@ -2048,7 +2072,7 @@ export async function settleCommittedBranchArtifacts(
     if (lease && !lease.beginCommit("git-commit")) throw new MutationGateClosedError();
   };
   try {
-    for (const [rel, proof] of Object.entries(outcome.repoProofs ?? {}).sort(([a], [b]) => a.localeCompare(b))) {
+    for (const [rel, proof] of Object.entries(settlementProofs).sort(([a], [b]) => a.localeCompare(b))) {
       if (proof.authority.kind !== "pull-ref-transaction" && proof.authority.kind !== "journal-recovery") continue;
       const ctx = await repoCtxFromDisk(repoDirOf(root, rel));
       if (!ctx) throw new Error(`P settlement repository disappeared for ${rel}`);

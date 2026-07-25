@@ -1022,6 +1022,40 @@ test("design 200 locally deleted published branch is held per-ref, then converge
   expect(converged.outcome.deferrals?.repo?.apply).toBeNull();
 });
 
+test("corrupt loose ref during converged deletion keeps durable ref-read-unreadable reason", async () => {
+  await commit("main\n", "base");
+  await git(sender, "branch", "published");
+  const base = await capture();
+  await materialize(base);
+  const state = stateWith(base);
+  const ref = "refs/heads/published";
+  const prior = base.refs[ref]!;
+  await git(receiver, "update-ref", "-d", ref, prior);
+  await git(sender, "branch", "-D", "published");
+  const omitted = await capture();
+
+  const result = await applyIncoming(state, omitted, matchingOracle, {
+    beforeManualAbsentTransition: async (_rel, candidateRef) => {
+      if (candidateRef !== ref) return;
+      await fs.mkdir(path.join(receiver, ".git", "refs", "heads"), { recursive: true });
+      await fs.writeFile(path.join(receiver, ".git", "refs", "heads", "broken-during-proof"), "not-an-oid\n");
+    },
+  });
+  expect(result.outcome.deferrals?.repo?.apply?.reason).toBe("ref-read-unreadable");
+  expect(result.outcome.deferrals?.repo?.apply?.reason).not.toBe("deletion-pending");
+});
+
+test("apply-side worktree ownership evidence failure refuses instead of authorizing an empty map", async () => {
+  const { state, incoming } = await baseAndIncoming();
+  const result = await applyIncoming(state, incoming, matchingOracle, {
+    beforeWorktreeOwnershipRead: async () => {
+      throw new Error("simulated git worktree list failure");
+    },
+  });
+  expect(result.outcome.gitPendingRemote?.repo).toEqual(incoming);
+  expect(result.outcome.deferrals?.repo?.apply?.reason).toBe("unreadable");
+});
+
 test("design 165 local-ahead tip remains owned through another durable descendant root", async () => {
   const mainTip = await commit("main\n", "ahead-main");
   await git(sender, "checkout", "-qb", "ahead");
@@ -2245,7 +2279,7 @@ test("crash before journal clear leaves published state recoverable without dupl
   expect((await loadState(workspace, "test-stream")).repoRecords?.repo?.repoGen).toBeGreaterThanOrEqual(landedGen!);
 });
 
-test("terminal state-save revalidation turns a corrupt ref read into a typed apply deferral", async () => {
+test("terminal state-save ref failure uses carry authority while retaining artifact settlement", async () => {
   const { state, incoming } = await baseAndIncoming();
   const first = await applyIncoming(state, incoming);
   expect(first.outcome.repoProofs?.repo).toBeDefined();
@@ -2255,9 +2289,38 @@ test("terminal state-save revalidation turns a corrupt ref read into a typed app
   await withRevalidatedGitPartialApplies(workspace, state, first.outcome, async () => undefined);
 
   expect(first.outcome.deferrals?.repo?.apply?.reason).toBe("ref-read-unreadable");
-  expect(first.outcome.repoProofs?.repo).toBeUndefined();
+  expect(first.outcome.repoProofs?.repo?.authority.kind).toBe("pull-carry");
+  expect(first.outcome.artifactSettlementProofs?.repo?.authority.kind).toBe("pull-ref-transaction");
   expect(first.outcome.gitRepos?.repo).toEqual(repoRecordsForState(state).repo?.base);
   expect(first.outcome.gitPendingRemote?.repo).toEqual(incoming);
+  await fs.rm(path.join(receiver, ".git", "refs", "heads", "broken"));
+  await expect(settleCommittedBranchArtifacts(workspace, state, first.outcome)).resolves.toBeDefined();
+});
+
+test("checkout-boundary excluded ref read is lossy and over-holds instead of throwing", async () => {
+  const { state, incoming } = await baseAndIncoming();
+  const result = await applyIncoming(state, incoming, matchingOracle, {
+    beforeCheckoutSecondProof: async () => {
+      await fs.mkdir(path.join(receiver, ".git", "refs", "heads"), { recursive: true });
+      await fs.writeFile(path.join(receiver, ".git", "refs", "heads", "boundary-broken"), "not-an-oid\n");
+    },
+  });
+  expect(result.outcome.deferrals?.repo?.apply?.reason).not.toBe("other");
+});
+
+test("post-commit finalLive bookkeeping ref failure cannot convert a committed cycle to other", async () => {
+  const { state, incoming } = await baseAndIncoming();
+  let injected = false;
+  const result = await applyIncoming(state, incoming, matchingOracle, {
+    afterHeldClassification: async () => {},
+    beforeFinalLive: async () => {
+      injected = true;
+      await fs.mkdir(path.join(receiver, ".git", "refs", "heads"), { recursive: true });
+      await fs.writeFile(path.join(receiver, ".git", "refs", "heads", "final-broken"), "not-an-oid\n");
+    },
+  });
+  expect(injected).toBe(true);
+  expect(result.outcome.deferrals?.repo?.apply?.reason).not.toBe("other");
 });
 
 test("push planning completes a published journal and publishes the tombstone schema once", async () => {

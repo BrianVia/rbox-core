@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { cleanGitEnv, gitBusy, gitRaw, gitStatus, readLocalGitConfigEntries, repoCtx, setGitSpawnObserver, type RepoCtx } from "./shared.js";
+import { cleanGitEnv, gitBusy, gitRaw, gitStatus, listWorktrees, listWorktreesStrict, readLocalGitConfigEntries, repoCtx, setGitSpawnObserver, type RepoCtx } from "./shared.js";
 import { gitPreflight, gitRefStorage } from "./preflight.js";
 
 const exec = promisify(execFile);
@@ -252,4 +252,15 @@ test("ref-storage authority distinguishes an absent key from a failed Git probe"
     reason: expect.stringMatching(/config.*could not be read/i),
   }));
   expect(preflight.structural).toBeUndefined();
+});
+
+test("strict worktree enumeration distinguishes unreadable evidence from an empty list", async () => {
+  const notARepo = await tempDir();
+  expect(await listWorktreesStrict(notARepo)).toEqual(expect.objectContaining({ status: "unreadable" }));
+  expect(await listWorktrees(notARepo)).toEqual([]);
+  const repo = await initRepo();
+  expect(await listWorktreesStrict(repo)).toEqual(expect.objectContaining({
+    status: "ok",
+    entries: expect.arrayContaining([expect.objectContaining({ path: repo })]),
+  }));
 });

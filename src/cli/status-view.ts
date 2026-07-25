@@ -326,7 +326,8 @@ function gitDeferralReasonPrecedence(reason: string): number {
     case "local-commits": return 3;
     case "local-stash": return 4;
     case "deletion-pending": return 5;
-    default: return 6;
+    case "ref-read-unreadable": return 6;
+    default: return 7;
   }
 }
 

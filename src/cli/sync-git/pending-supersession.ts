@@ -106,7 +106,9 @@ export async function pendingSupersessionPreProbe(
     for (const [ref, oid] of Object.entries(pending.refs)) {
       const live = identity.refs[ref];
       if (live === undefined) {
-        if (ref.startsWith("refs/heads/") && base?.refs[ref] === oid) continue;
+        if (process.env.RBOX_GIT_ABSENCE_CAPTURE !== "0"
+          && ref.startsWith("refs/heads/")
+          && base?.refs[ref] === oid) continue;
         return { status: "carry", reason: `local repository lacks pending ref ${ref}` };
       }
       if ((ref.startsWith("refs/tags/") || ref === "refs/stash") && live !== oid) {

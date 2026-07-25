@@ -24,7 +24,7 @@ import {
   runLockedPRepairAttempt,
 } from "../../engine/index.js";
 import { pinDisplaced } from "../../engine/git/keep-pins.js";
-import { branchesCheckedOutElsewhere } from "../../engine/git/apply.js";
+import { branchesCheckedOutElsewhereStrict } from "../../engine/git/apply.js";
 import { quarantineLocal } from "../../engine/git/quarantine.js";
 import { hasInProgressOpState, readAllRefs, readAllRefsStrict, readOpStateSnapshot } from "../../engine/git/refs.js";
 import { git, headBranchOf, repoCtx, type RepoCtx } from "../../engine/git/shared.js";
@@ -57,7 +57,7 @@ import {
   type FollowIntended,
   type FollowProgress,
 } from "../sync-git/follow.js";
-import { checkoutLabel, gitIncomingKey, repoDirOf, sectionOpState } from "../sync-git/shared.js";
+import { checkoutLabel, gitIncomingKey, observePackedRefsIdentity, packedRefsMtimeRegressed, repoDirOf, sectionOpState } from "../sync-git/shared.js";
 import { branchBaseOriginMatches, composeRepoBase, type ManualBranchDecision, type RepoBaseLockedProof, type RepoBaseProof } from "../sync-git/base-composer.js";
 import { prepareFollowerBranchProtocol, type FollowerBranchProtocol } from "../sync-git/follower-protocol.js";
 import { settleExactPresentArtifact } from "../sync-git/p-settlement.js";
@@ -67,6 +67,12 @@ import { preliminaryResolutionReport, resolutionBindingIdentity, type Resolution
 import { printShow, printDiscardReport, keepMineConfirmCommand, safeResolveOutput, refusalMessage, type GitResolveShow } from "./resolve-presentation.js";
 
 type GitResolveVerb = "show-me" | "take-theirs" | "keep-mine";
+
+async function strictOwnedBranches(ctx: RepoCtx): Promise<Map<string, string>> {
+  const result = await branchesCheckedOutElsewhereStrict(ctx);
+  if (result.status === "unreadable") throw result.cause;
+  return result.owned;
+}
 
 interface ResolveEnvironment {
   cfg: WorkspaceConfig;
@@ -593,7 +599,7 @@ export async function gitResolveCmd(
     }
     if (verb === "keep-mine") {
       const incomingCheckoutRef = headBranchOf(incoming.head);
-      const ownedElsewhere = await branchesCheckedOutElsewhere(ctx);
+      const ownedElsewhere = await strictOwnedBranches(ctx);
       if (incomingCheckoutRef && ownedElsewhere.has(incomingCheckoutRef)) {
         emit({
           status: "refused", verb, repo: rel, code: "worktree-ownership",
@@ -666,14 +672,11 @@ export async function gitResolveCmd(
         workspaceRoot: root, relPath: rel, state, ctx: ctx!, record,
         base: record!.base, incoming, liveRefs: strictRefs.refs,
       });
-      const owned = await branchesCheckedOutElsewhere(ctx!);
+      const owned = await strictOwnedBranches(ctx!);
       const priorPacked = record!.packedRefsIdentity;
-      const currentPacked = await fs.stat(path.join(ctx!.commonDir, "packed-refs"), { bigint: true })
-        .catch((error: NodeJS.ErrnoException) => error.code === "ENOENT" ? undefined : null);
-      const packedRegressed = currentPacked === null || (priorPacked !== undefined && (!currentPacked
-        || priorPacked.dev !== currentPacked.dev.toString()
-        || priorPacked.ino !== currentPacked.ino.toString()
-        || Number(currentPacked.mtimeMs) < priorPacked.mtimeMs));
+      const currentPacked = await observePackedRefsIdentity(ctx!.commonDir);
+      const packedRegressed = currentPacked.status === "unreadable"
+        || packedRefsMtimeRegressed(priorPacked, currentPacked);
       const headLog = await fs.readFile(path.join(ctx!.commonDir, "logs", "HEAD")).catch(() => undefined);
       const [busyNow, preflightNow] = await Promise.all([isGitBusy(ctx!.repoDir), gitPreflight(ctx!.repoDir)]);
       const collisions = receiverEquivalentCollisionNames([
@@ -782,7 +785,7 @@ export async function gitResolveCmd(
         return 1;
       }
       const boundaryCheckoutRef = headBranchOf(incoming.head);
-      if (boundaryCheckoutRef && (await branchesCheckedOutElsewhere(ctx)).has(boundaryCheckoutRef)) {
+      if (boundaryCheckoutRef && (await strictOwnedBranches(ctx)).has(boundaryCheckoutRef)) {
         emit({ status: "refused", verb, repo: rel, code: "worktree-ownership", message: "the incoming checkout branch became active in another linked worktree; switch or detach that worktree, then retry keep-mine" }, json, deps, root);
         return 1;
       }
@@ -793,7 +796,7 @@ export async function gitResolveCmd(
         return 1;
       }
       const finalCheckoutRef = headBranchOf(incoming.head);
-      if (finalCheckoutRef && (await branchesCheckedOutElsewhere(ctx)).has(finalCheckoutRef)) {
+      if (finalCheckoutRef && (await strictOwnedBranches(ctx)).has(finalCheckoutRef)) {
         emit({ status: "refused", verb, repo: rel, code: "worktree-ownership", message: "the incoming checkout branch became active in another linked worktree; switch or detach that worktree, then retry keep-mine" }, json, deps, root);
         return 1;
       }

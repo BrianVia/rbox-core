@@ -11,7 +11,7 @@ import {
   type ArtifactBinding,
 } from "../../engine/index.js";
 import type { GitPartialApply } from "../config.js";
-import { branchesCheckedOutElsewhere } from "../../engine/git/apply.js";
+import { branchesCheckedOutElsewhereStrict } from "../../engine/git/apply.js";
 import { readAllRefsStrict } from "../../engine/git/refs.js";
 import { addTimedMs, readHead, repoCtx, type GitChainTimings } from "../../engine/git/shared.js";
 import type { BranchTransitionWitness, LockedBranchProof } from "./base-composer.js";
@@ -77,7 +77,10 @@ export async function commitAbsentBranchVerification(
     if (!ctx) throw new Error("repository disappeared at prepared absence boundary");
     const [strict, owned, head] = await addTimedMs(chainTimings, "ownershipMs", () => Promise.all([
       readAllRefsStrict(plan.repoDir),
-      branchesCheckedOutElsewhere(ctx),
+      branchesCheckedOutElsewhereStrict(ctx).then((result) => {
+        if (result.status === "unreadable") throw result.cause;
+        return result.owned;
+      }),
       readHead(ctx),
     ]));
     if (strict.status === "unreadable") throw new Error(`ref-read-unreadable: ${strict.marker}`);
@@ -359,7 +362,10 @@ export async function commitPlannedBranchTransition(
         if (result.status === "unreadable") throw new Error(`ref-read-unreadable: ${result.marker}`);
         return result.refs;
       }),
-      branchesCheckedOutElsewhere(ctx),
+      branchesCheckedOutElsewhereStrict(ctx).then((result) => {
+        if (result.status === "unreadable") throw result.cause;
+        return result.owned;
+      }),
       readHead(ctx),
     ]));
     if ((refs[plan.ref] ?? null) !== plan.beforeOid) throw new Error("branch changed at prepared transaction boundary");

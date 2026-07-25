@@ -537,6 +537,7 @@ async function runPushAttempt(
         onGitReposDiscovered: deps.onGitReposDiscovered,
         resolution,
         resolutionCaptureTestHooks: deps.resolutionCaptureTestHooks,
+        beforeAbsenceWitness: deps.beforeAbsenceWitness,
       });
     } finally {
       lease?.finish();

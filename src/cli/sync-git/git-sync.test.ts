@@ -1705,6 +1705,53 @@ test("design 177: confirmed keep-mine publishes synchronously and clears pending
   await expect(git(follower, "rev-parse", "refs/tags/stale-incoming")).rejects.toThrow();
 }, 90_000);
 
+test("packed plus peer-diverged case stays per-ref for three cycles and keep-mine succeeds", async () => {
+  const rel = "packed-case-b";
+  const a = path.join(rootA, rel);
+  await initRepo(a);
+  await commitFile(a, "f.txt", "one", "c1");
+  await git(a, "branch", "topic");
+  await push(rootA, cfgA, depsA);
+  await pull(rootB, cfgB, depsB);
+  const b = path.join(rootB, rel);
+  await git(b, "pack-refs", "--all");
+  await push(rootB, cfgB, depsB); // records B's local monotonic baseline
+  await git(b, "branch", "-D", "topic");
+
+  await commitFile(a, "f.txt", "two", "peer advanced");
+  await push(rootA, cfgA, depsA);
+  for (let cycle = 0; cycle < 3; cycle++) {
+    await pull(rootB, cfgB, depsB);
+    const record = repoRecordsForState(await st(rootB))[rel]!;
+    expect(record.partial?.heldRefs["refs/heads/topic"]).toBe("local-commits");
+    expect(record.deferrals?.apply?.reason).toBe("deletion-pending");
+    expect(record.deferrals?.apply?.reason).not.toBe("other");
+  }
+
+  const resolverDeps = {
+    build: async () => ({ cfg: cfgB, store: remote.blobStore(), remote }),
+    capabilityProbe: async () => true,
+  };
+  const previewLines: string[] = [];
+  expect(await gitResolveCmd(rootB, b, "keep-mine", { json: true }, {
+    ...resolverDeps,
+    stdout: (line) => previewLines.push(line),
+    stderr: (line) => previewLines.push(line),
+  })).toBe(1);
+  const preview = JSON.parse(previewLines.at(-1)!);
+  const confirmedLines: string[] = [];
+  expect(await gitResolveCmd(rootB, b, "keep-mine", {
+    json: true,
+    confirm: preview.current.snapshot,
+    forceDiscardIncoming: preview.discardReport?.forceRequired === true,
+  }, {
+    ...resolverDeps,
+    stdout: (line) => confirmedLines.push(line),
+    stderr: (line) => confirmedLines.push(line),
+  })).toBe(0);
+  expect(JSON.parse(confirmedLines.at(-1)!)).toMatchObject({ status: "published", verb: "keep-mine" });
+}, 90_000);
+
 test("design 177: ambient commits and wholesale index rewrites never publish a stale keep-mine candidate", async () => {
   const rel = "keep-mine-ambient-churn";
   const { b } = await prepareSupersedingPending(rel);
@@ -2275,13 +2322,14 @@ test("pending + LOCAL divergence + remote deletion: conflict path wins FIRST, th
   expect((await st(rootB)).gitReposRemoved?.["r"]).toBeUndefined(); // memory cleared
 }, 20_000);
 
-test("design 200 publishes a witnessed branch omission with an exact tombstone and retires BASE at ACK", async () => {
+test("ordinary deletion of a packed branch publishes without whole-repository refusal", async () => {
   const repo = path.join(rootA, "branch-delete");
   await initRepo(repo);
   await commitFile(repo, "f.txt", "one", "c1");
   await git(repo, "checkout", "-qb", "topic");
   await commitFile(repo, "topic.txt", "topic", "topic c1");
   await git(repo, "checkout", "-q", "main");
+  await git(repo, "pack-refs", "--all");
   await push(rootA, cfgA, depsA);
   await pull(rootB, cfgB, depsB);
   const before = repoRecordsForState(await st(rootA))["branch-delete"]!.base!;
@@ -2294,6 +2342,7 @@ test("design 200 publishes a witnessed branch omission with an exact tombstone a
   expect(accepted.refs["refs/heads/topic"]).toBeUndefined();
   expect(accepted.refTombstones?.["refs/heads/topic"]?.filter((entry) => entry.oid === topicOid)).toHaveLength(1);
   const record = repoRecordsForState(await st(rootA))["branch-delete"]!;
+  expect(record.deferrals?.capture).toBeUndefined();
   expect(record.base?.refs["refs/heads/topic"]).toBeUndefined();
   expect(record.pending).toBeUndefined();
 
@@ -2307,14 +2356,13 @@ test("design 200 publishes a witnessed branch omission with an exact tombstone a
   )).toBe(true);
 }, 20_000);
 
-test("design 200 Step D defers the whole 24-head repository for one cycle when one repository proof refuses", async () => {
+test("design 200 Step D atomically defers a 24-head repository on real ref-lock contention", async () => {
   const repo = path.join(rootA, "branch-delete-lock");
   await initRepo(repo);
   await commitFile(repo, "f.txt", "one", "c1");
   const deletedRefs = Array.from({ length: 24 }, (_, index) =>
     `refs/heads/topic-${index.toString().padStart(2, "0")}`);
   for (const ref of deletedRefs) await git(repo, "update-ref", ref, "HEAD");
-  await git(repo, "pack-refs", "--all");
   await push(rootA, cfgA, depsA);
   const beforeRecord = repoRecordsForState(await st(rootA))["branch-delete-lock"]!;
   const beforeSection = beforeRecord.base!;
@@ -2323,7 +2371,16 @@ test("design 200 Step D defers the whole 24-head repository for one cycle when o
   for (const ref of deletedRefs) await git(repo, "update-ref", "-d", ref);
   await commitFile(repo, "f.txt", "two", "main c2");
   const advancedMain = await git(repo, "rev-parse", "refs/heads/main");
-  await push(rootA, cfgA, depsA);
+  const lockPath = path.join(repo, ".git", "refs", "heads", "topic-00.lock");
+  await push(rootA, cfgA, {
+    ...depsA,
+    beforeAbsenceWitness: async (rel) => {
+      if (rel === "branch-delete-lock") {
+        await fs.mkdir(path.dirname(lockPath), { recursive: true });
+        await fs.writeFile(lockPath, "prepared transaction");
+      }
+    },
+  });
 
   const carried = (await remote.latest()).manifest.gitRepos!["branch-delete-lock"]!;
   expect(carried.refs["refs/heads/main"]).toBe(priorMain); // unrelated work waits with the repository
@@ -2339,8 +2396,9 @@ test("design 200 Step D defers the whole 24-head repository for one cycle when o
     expect(deferredRecord.branchBaseOrigins?.[ref]).toEqual(beforeRecord.branchBaseOrigins?.[ref]);
   }
 
-  // The new refuse-only tuple is persisted; with a stable next observation,
-  // the verify-only proof can authorize the ordinary omission.
+  await fs.rm(lockPath);
+  // Once the real contention clears, the verify-only proof authorizes the
+  // ordinary omission.
   await push(rootA, cfgA, depsA);
   const accepted = (await remote.latest()).manifest.gitRepos!["branch-delete-lock"]!;
   expect(accepted.refs["refs/heads/main"]).toBe(advancedMain);
@@ -2358,8 +2416,11 @@ test("design 200 kill switch restores pre-200 omission publication without proof
   await initRepo(repo);
   await commitFile(repo, "f.txt", "one", "c1");
   await git(repo, "branch", "topic");
+  await git(repo, "pack-refs", "--all");
   await push(rootA, cfgA, depsA);
-  const topicOid = repoRecordsForState(await st(rootA))["branch-delete-switch"]!.base!.refs["refs/heads/topic"]!;
+  const initialRecord = repoRecordsForState(await st(rootA))["branch-delete-switch"]!;
+  const topicOid = initialRecord.base!.refs["refs/heads/topic"]!;
+  const initialPackedMtime = initialRecord.packedRefsIdentity!.mtimeMs;
   await git(repo, "branch", "-D", "topic");
 
   const previous = process.env.RBOX_GIT_ABSENCE_CAPTURE;
@@ -2374,7 +2435,31 @@ test("design 200 kill switch restores pre-200 omission publication without proof
   const accepted = (await remote.latest()).manifest.gitRepos!["branch-delete-switch"]!;
   expect(accepted.refs["refs/heads/topic"]).toBeUndefined();
   expect(accepted.refTombstones?.["refs/heads/topic"]?.some((entry) => entry.oid === topicOid)).toBe(true);
-  expect(repoRecordsForState(await st(rootA))["branch-delete-switch"]!.base!.refs["refs/heads/topic"]).toBe(topicOid);
+  const switchedOffRecord = repoRecordsForState(await st(rootA))["branch-delete-switch"]!;
+  expect(switchedOffRecord.base!.refs["refs/heads/topic"]).toBe(topicOid);
+  expect(switchedOffRecord.packedRefsIdentity!.mtimeMs).toBeGreaterThanOrEqual(initialPackedMtime);
+}, 20_000);
+
+test("carried repositories refresh the packed-refs baseline even when absence capture is switched off", async () => {
+  const repo = path.join(rootA, "carried-packed-baseline");
+  await initRepo(repo);
+  await commitFile(repo, "f.txt", "one", "c1");
+  await git(repo, "pack-refs", "--all");
+  await push(rootA, cfgA, depsA);
+  const previous = process.env.RBOX_GIT_ABSENCE_CAPTURE;
+  process.env.RBOX_GIT_ABSENCE_CAPTURE = "0";
+  try {
+    const plan = await planGitSections(
+      rootA, cfgA, await st(rootA), remote, new Set(), buildIgnoreMatcher(rootA),
+    );
+    expect(plan.carried).toContain("carried-packed-baseline");
+    expect(plan.packedRefsIdentity?.["carried-packed-baseline"]).toEqual(
+      expect.objectContaining({ mtimeMs: expect.any(Number) }),
+    );
+  } finally {
+    if (previous === undefined) delete process.env.RBOX_GIT_ABSENCE_CAPTURE;
+    else process.env.RBOX_GIT_ABSENCE_CAPTURE = previous;
+  }
 }, 20_000);
 
 test("design 200 forced recapture cannot turn an unreadable ref store into a zero-ref repository omission", async () => {
@@ -2401,6 +2486,110 @@ test("design 200 forced recapture cannot turn an unreadable ref store into a zer
   expect(plan.absentBranchProofs?.["strict-force"]).toBeUndefined();
 }, 20_000);
 
+test("Step D context loss after capture carries the section with one typed refusal and no tombstone", async () => {
+  const repo = path.join(rootA, "step-d-context-loss");
+  await initRepo(repo);
+  await commitFile(repo, "f.txt", "one", "c1");
+  await git(repo, "branch", "topic");
+  await push(rootA, cfgA, depsA);
+  const state = await st(rootA);
+  const base = repoRecordsForState(state)["step-d-context-loss"]!.base!;
+  await git(repo, "branch", "-D", "topic");
+  const gitDir = path.join(repo, ".git");
+  const hiddenGitDir = path.join(repo, ".git-step-d-hidden");
+  let moved = false;
+  const plan = await planGitSections(
+    rootA,
+    cfgA,
+    state,
+    remote,
+    new Set(),
+    buildIgnoreMatcher(rootA),
+    undefined,
+    undefined,
+    {
+      beforeAbsenceWitness: async (rel) => {
+        if (rel === "step-d-context-loss") {
+          await fs.rename(gitDir, hiddenGitDir);
+          moved = true;
+        }
+      },
+    },
+  ).finally(async () => {
+    if (moved) await fs.rename(hiddenGitDir, gitDir);
+  });
+  expect(plan.gitRepos?.["step-d-context-loss"]).toEqual(base);
+  expect(plan.captureDeferrals["step-d-context-loss"]).toBe("unreadable");
+  expect(plan.deferred.filter((item) => item.relPath === "step-d-context-loss")).toHaveLength(1);
+  expect(plan.absentBranchProofs?.["step-d-context-loss"]).toBeUndefined();
+  expect(plan.gitRepos?.["step-d-context-loss"]?.refTombstones?.["refs/heads/topic"]).toBeUndefined();
+}, 20_000);
+
+test("Step D HEAD read failure refuses only that repository and never aborts the push plan", async () => {
+  const refusedRepo = path.join(rootA, "head-read-refused");
+  const healthyRepo = path.join(rootA, "head-read-healthy");
+  for (const repo of [refusedRepo, healthyRepo]) {
+    await initRepo(repo);
+    await commitFile(repo, "f.txt", "one", "c1");
+  }
+  await git(refusedRepo, "branch", "topic");
+  await push(rootA, cfgA, depsA);
+  const state = await st(rootA);
+  const refusedBase = repoRecordsForState(state)["head-read-refused"]!.base!;
+  await git(refusedRepo, "branch", "-D", "topic");
+  await commitFile(healthyRepo, "f.txt", "two", "healthy c2");
+  const healthyTip = await git(healthyRepo, "rev-parse", "HEAD");
+  const headPath = path.join(refusedRepo, ".git", "HEAD");
+  const hiddenHead = path.join(refusedRepo, ".git", "HEAD.step-d-hidden");
+  let moved = false;
+  const plan = await planGitSections(
+    rootA, cfgA, state, remote, new Set(), buildIgnoreMatcher(rootA),
+    undefined, undefined, {
+      beforeAbsencePreflight: async (rel) => {
+        if (rel === "head-read-refused") {
+          await fs.rename(headPath, hiddenHead);
+          moved = true;
+        }
+      },
+    },
+  ).finally(async () => {
+    if (moved) await fs.rename(hiddenHead, headPath);
+  });
+  expect(plan.gitRepos?.["head-read-refused"]).toEqual(refusedBase);
+  expect(plan.captureDeferrals["head-read-refused"]).toBe("unreadable");
+  expect(plan.gitRepos?.["head-read-healthy"]?.refs["refs/heads/main"]).toBe(healthyTip);
+}, 30_000);
+
+test("Step D unreadable worktree registry is a per-repository refusal, never an empty ownership map", async () => {
+  const repo = path.join(rootA, "worktree-registry-refused");
+  await initRepo(repo);
+  await commitFile(repo, "f.txt", "one", "c1");
+  await git(repo, "branch", "topic");
+  await push(rootA, cfgA, depsA);
+  const state = await st(rootA);
+  const base = repoRecordsForState(state)["worktree-registry-refused"]!.base!;
+  await git(repo, "branch", "-D", "topic");
+  const configPath = path.join(repo, ".git", "config");
+  const originalConfig = await fs.readFile(configPath);
+  let corrupted = false;
+  const plan = await planGitSections(
+    rootA, cfgA, state, remote, new Set(), buildIgnoreMatcher(rootA),
+    undefined, undefined, {
+      beforeAbsencePreflight: async (rel) => {
+        if (rel === "worktree-registry-refused") {
+          await fs.appendFile(configPath, "\n[broken\n");
+          corrupted = true;
+        }
+      },
+    },
+  ).finally(async () => {
+    if (corrupted) await fs.writeFile(configPath, originalConfig);
+  });
+  expect(plan.gitRepos?.["worktree-registry-refused"]).toEqual(base);
+  expect(plan.captureDeferrals["worktree-registry-refused"]).toBe("unreadable");
+  expect(plan.absentBranchProofs?.["worktree-registry-refused"]).toBeUndefined();
+}, 20_000);
+
 test("design 200 a standing missing-origin refusal remains a typed whole-repository carry", async () => {
   const repo = path.join(rootA, "standing-refusal");
   await initRepo(repo);
@@ -2424,6 +2613,84 @@ test("design 200 a standing missing-origin refusal remains a typed whole-reposit
   }
 }, 20_000);
 
+test("backdated packed-refs restore is a standing refusal until a ref rewrite advances mtime", async () => {
+  const repo = path.join(rootA, "backdated-packed");
+  await initRepo(repo);
+  await commitFile(repo, "f.txt", "one", "c1");
+  await git(repo, "branch", "topic");
+  await git(repo, "update-ref", "refs/heads/mtime-nudge", "HEAD");
+  await git(repo, "pack-refs", "--all");
+  await push(rootA, cfgA, depsA);
+  const record = repoRecordsForState(await st(rootA))["backdated-packed"]!;
+  const topicOid = record.base!.refs["refs/heads/topic"]!;
+  const baseline = record.packedRefsIdentity!.mtimeMs;
+
+  await git(repo, "branch", "-D", "topic");
+  const packedPath = path.join(repo, ".git", "packed-refs");
+  const older = new Date(baseline - 60_000);
+  await fs.utimes(packedPath, older, older);
+  for (let cycle = 0; cycle < 2; cycle++) {
+    await push(rootA, cfgA, depsA);
+    const current = repoRecordsForState(await st(rootA))["backdated-packed"]!;
+    expect(current.base?.refs["refs/heads/topic"]).toBe(topicOid);
+    expect(current.packedRefsIdentity?.mtimeMs).toBe(baseline);
+    expect(current.deferrals?.capture?.reason).toBe("deletion-pending");
+  }
+
+  await git(repo, "update-ref", "refs/heads/mtime-clear", "HEAD");
+  await git(repo, "pack-refs", "--all");
+  await push(rootA, cfgA, depsA);
+  const accepted = repoRecordsForState(await st(rootA))["backdated-packed"]!;
+  expect(accepted.base?.refs["refs/heads/topic"]).toBeUndefined();
+  expect(accepted.deferrals?.capture).toBeUndefined();
+}, 30_000);
+
+test("packed-refs ENOENT clears the baseline and never wedges branch deletion across three cycles", async () => {
+  const repo = path.join(rootA, "packed-enoent");
+  await initRepo(repo);
+  await commitFile(repo, "f.txt", "one", "c1");
+  await git(repo, "branch", "topic");
+  await git(repo, "pack-refs", "--all");
+  await push(rootA, cfgA, depsA);
+  const before = repoRecordsForState(await st(rootA))["packed-enoent"]!;
+  const mainOid = before.base!.refs["refs/heads/main"]!;
+  const topicOid = before.base!.refs["refs/heads/topic"]!;
+  await fs.mkdir(path.join(repo, ".git", "refs", "heads"), { recursive: true });
+  await fs.writeFile(path.join(repo, ".git", "refs", "heads", "main"), `${mainOid}\n`);
+  await fs.writeFile(path.join(repo, ".git", "refs", "heads", "topic"), `${topicOid}\n`);
+  await fs.rm(path.join(repo, ".git", "packed-refs"));
+  await git(repo, "branch", "-D", "topic");
+
+  for (let cycle = 0; cycle < 3; cycle++) {
+    await push(rootA, cfgA, depsA);
+    const current = repoRecordsForState(await st(rootA))["packed-enoent"]!;
+    expect(current.packedRefsIdentity).toBeUndefined();
+    expect(current.base?.refs["refs/heads/topic"]).toBeUndefined();
+    expect(current.deferrals?.capture).toBeUndefined();
+  }
+}, 30_000);
+
+test("new repository at a previously removed path publishes in one cycle without deletion-pending and clears repoAbsent", async () => {
+  const repo = path.join(rootA, "one-cycle-readd");
+  await initRepo(repo);
+  await commitFile(repo, "old.txt", "old", "old");
+  await git(repo, "branch", "old-side");
+  await push(rootA, cfgA, depsA);
+  await fs.rm(repo, { recursive: true, force: true });
+  await push(rootA, cfgA, depsA);
+  expect(repoRecordsForState(await st(rootA))["one-cycle-readd"]?.repoAbsent).toBe(true);
+
+  await initRepo(repo);
+  await commitFile(repo, "new.txt", "new", "new");
+  await push(rootA, cfgA, depsA);
+  const remoteSection = (await remote.latest()).manifest.gitRepos?.["one-cycle-readd"];
+  const record = repoRecordsForState(await st(rootA))["one-cycle-readd"]!;
+  expect(remoteSection).toBeDefined();
+  expect(record.repoAbsent).toBeUndefined();
+  expect(record.removedKey).toBeUndefined();
+  expect(record.deferrals?.capture?.reason).not.toBe("deletion-pending");
+}, 30_000);
+
 // ── (d) removal memory: fresh re-create at the same path = CLEAN materialization ──
 
 test("fresh re-create at a removed path: dir leftover is QUARANTINED then wiped, fresh state applies, memory clears", async () => {
@@ -2446,14 +2713,6 @@ test("fresh re-create at a removed path: dir leftover is QUARANTINED then wiped,
   await initRepo(a);
   await commitFile(a, "n.txt", "new", "new c1");
   await push(rootA, cfgA, depsA);
-  // The hidden BASE is provenance, not a wire section: an unproven missing
-  // protected head suppresses this capture and preserves removal memory.
-  expect((await remote.latest()).manifest.gitRepos?.["r"]).toBeUndefined();
-  expect(repoRecordsForState(await st(rootA))["r"]?.repoAbsent).toBe(true);
-
-  // Once the re-add no longer omits that protected name it publishes normally.
-  await git(a, "branch", "leftover-branch");
-  await push(rootA, cfgA, depsA);
   await pull(rootB, cfgB, depsB);
 
   // clean materialization: quarantine exists, old refs are GONE, new state applied
@@ -2461,8 +2720,7 @@ test("fresh re-create at a removed path: dir leftover is QUARANTINED then wiped,
   const qFiles = await fs.readdir(qDir);
   expect(qFiles.some((f) => f.endsWith(".bundle"))).toBe(true); // full recovery quarantined
   expect(await git(b, "rev-parse", "main")).toBe(await git(a, "rev-parse", "main"));
-  expect(await git(b, "rev-parse", "leftover-branch")).toBe(await git(a, "rev-parse", "leftover-branch"));
-  expect(await git(b, "rev-parse", "leftover-branch")).not.toBe(oldHead); // old value wiped — no side-door resurrection
+  await expect(git(b, "rev-parse", "--verify", "leftover-branch")).rejects.toThrow(); // wiped — no side-door resurrection
   const sB = await st(rootB);
   expect(sB.gitReposRemoved?.["r"]).toBeUndefined(); // memory cleared
   expect(sB.lastSyncedManifest.gitRepos?.["r"]).toBeDefined(); // based again
@@ -2543,7 +2801,6 @@ test("clean materialization wipes ONLY after artifacts verify — a missing bund
   await push(rootA, cfgA, depsA);
   await pull(rootB, cfgB, depsB);
   const b = path.join(rootB, "r");
-  const oldLeftover = await git(b, "rev-parse", "leftover-branch");
   await fs.rm(a, { recursive: true, force: true });
   await push(rootA, cfgA, depsA);
   await pull(rootB, cfgB, depsB); // memory recorded, leftover intact
@@ -2551,7 +2808,6 @@ test("clean materialization wipes ONLY after artifacts verify — a missing bund
   // A re-creates a fresh repo at the same path; the server then LOSES its bundle
   await initRepo(a);
   await commitFile(a, "n.txt", "new", "n1");
-  await git(a, "branch", "leftover-branch");
   await push(rootA, cfgA, depsA);
   const newSec = (await remote.latest()).manifest.gitRepos!["r"]!;
   const saved = await remote.blobStore().get(newSec.bundleEncSha);
@@ -2568,8 +2824,7 @@ test("clean materialization wipes ONLY after artifacts verify — a missing bund
   await remote.blobStore().put(newSec.bundleEncSha, saved);
   await pull(rootB, cfgB, depsB);
   expect(await git(b, "rev-parse", "main")).toBe(await git(a, "rev-parse", "main"));
-  expect(await git(b, "rev-parse", "leftover-branch")).toBe(await git(a, "rev-parse", "leftover-branch"));
-  expect(await git(b, "rev-parse", "leftover-branch")).not.toBe(oldLeftover); // old value wiped post-verify
+  await expect(git(b, "rev-parse", "--verify", "leftover-branch")).rejects.toThrow(); // wiped post-verify
   sB = await st(rootB);
   expect(sB.gitReposRemoved?.["r"]).toBeUndefined();
   expect(sB.gitPendingRemote?.["r"]).toBeUndefined();

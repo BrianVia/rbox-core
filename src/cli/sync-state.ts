@@ -59,7 +59,8 @@ export interface RepoStateValues {
    * entries clear repoAbsent; omitting the map preserves the current lane. */
   repoAbsent?: Record<string, true>;
   branchBaseOrigins?: Record<string, Record<string, BranchBaseOrigin>>;
-  packedRefsIdentity?: Record<string, NonNullable<RepoRecord["packedRefsIdentity"]>>;
+  /** null explicitly clears a baseline after packed-refs disappears; omission retains it. */
+  packedRefsIdentity?: Record<string, NonNullable<RepoRecord["packedRefsIdentity"]> | null>;
   pending?: Record<string, GitSection>;
   removed?: Record<string, string>;
   resolutions?: Record<string, string>;
@@ -232,9 +233,11 @@ function sourceRecord(source: StateSource, relPath: string, current: RepoRecord)
     sourceSeq: source.sourceGlobalSeq,
     ...(composed.base === undefined ? {} : { base: composed.base }),
     ...(composed.branchBaseOrigins === undefined ? {} : { branchBaseOrigins: composed.branchBaseOrigins }),
-    ...(source.values.packedRefsIdentity?.[relPath] === undefined
+    ...(!Object.prototype.hasOwnProperty.call(source.values.packedRefsIdentity ?? {}, relPath)
       ? (current.packedRefsIdentity === undefined ? {} : { packedRefsIdentity: current.packedRefsIdentity })
-      : { packedRefsIdentity: source.values.packedRefsIdentity[relPath] }),
+      : (source.values.packedRefsIdentity?.[relPath] === null
+        ? {}
+        : { packedRefsIdentity: source.values.packedRefsIdentity![relPath]! })),
     ...(hasAdvertisedValue
       ? (advertisedValue === null ? {} : { advertised: advertisedValue })
       : (current.advertised === undefined ? {} : { advertised: current.advertised })),
@@ -568,8 +571,8 @@ export function changedSidecarRepoKeys(state: SyncState, values: RepoStateValues
     const record = records[relPath];
     const receiptTransition = values.resolutionReceipt?.[relPath];
     return !same(record?.pending, values.pending?.[relPath])
-      || (values.packedRefsIdentity?.[relPath] !== undefined
-        && !same(record?.packedRefsIdentity, values.packedRefsIdentity[relPath]))
+      || (Object.prototype.hasOwnProperty.call(values.packedRefsIdentity ?? {}, relPath)
+        && !same(record?.packedRefsIdentity, values.packedRefsIdentity?.[relPath]))
       || (values.repoAbsent !== undefined && record?.repoAbsent !== values.repoAbsent[relPath])
       || record?.removedKey !== values.removed?.[relPath]
       || record?.resolutionKey !== values.resolutions?.[relPath]
