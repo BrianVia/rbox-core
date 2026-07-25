@@ -117,6 +117,7 @@ export function refusalMessage(reason: GitDeferralReason): string {
     "local-operation": "a local Git operation prevents the confirmed checkout from being published safely",
     "local-commits": "local commits changed while the checkout was being confirmed",
     "local-stash": "the local stash changed while the checkout was being confirmed",
+    "deletion-pending": "rbox is still finishing a branch deletion before the confirmed checkout can be published safely",
     conflict: "the confirmed checkout still conflicts with local Git state",
     artifact: "incoming Git artifacts could not be fetched and verified",
     unreadable: "Git metadata could not be read completely",

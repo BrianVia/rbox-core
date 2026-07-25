@@ -14,6 +14,7 @@ export type BreadcrumbVetoGate =
   | "reason-local-operation"
   | "reason-local-commits"
   | "reason-local-stash"
+  | "reason-deletion-pending"
   | "reason-worktree-ownership"
   | "reason-git-busy"
   | "reason-unreadable"
@@ -33,6 +34,7 @@ export const BREADCRUMB_VETO_GATES = [
   "reason-local-operation",
   "reason-local-commits",
   "reason-local-stash",
+  "reason-deletion-pending",
   "reason-worktree-ownership",
   "reason-git-busy",
   "reason-unreadable",
@@ -60,6 +62,7 @@ export function breadcrumbGateForReason(reason: GitDeferralReason): BreadcrumbVe
     case "local-operation": return "reason-local-operation";
     case "local-commits": return "reason-local-commits";
     case "local-stash": return "reason-local-stash";
+    case "deletion-pending": return "reason-deletion-pending";
     case "worktree-ownership": return "reason-worktree-ownership";
     case "git-busy":
     case "stale-unattributed": return "reason-git-busy";

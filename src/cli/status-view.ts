@@ -290,6 +290,7 @@ const DEFERRAL_REASON_PRESENTATION: Record<GitDeferralReason, GitDeferralReasonP
   "local-operation": { label: "local Git operation", text: "A Git operation is active or changed here.", repair: "Finish or stop the Git operation, then let normal sync retry.", transient: true },
   "local-commits": { label: "local commits", text: "Local commits changed here.", repair: "Stop Git mutation, then let normal sync retry.", transient: true },
   "local-stash": { label: "local stash", text: "The local stash changed here.", repair: "Stop stash mutation, then let normal sync retry.", transient: true },
+  "deletion-pending": { label: "finishing a branch deletion", text: "rbox is finishing a branch you deleted here.", repair: "rbox retries this on its own. If it stays, run `rbox doctor`.", transient: true },
   conflict: { label: "conflict", text: "Incoming and local Git state conflict.", repair: "Repair the conflicting repository state, then let sync retry.", transient: false },
   "git-busy": { label: "git busy", text: "Another Git process is using this repository.", repair: "Let the other Git process finish, then let sync retry.", transient: false },
   "stale-unattributed": { label: "stale Git locks", text: "A stable lock cohort remains without a known live owner.", repair: "Run `rbox doctor`, confirm no Git process owns the reported locks, then remove only the stale lock files and let sync retry.", transient: false },
@@ -315,7 +316,7 @@ function gitDeferralReasonText(reason: string): string {
   return gitDeferralReasonPresentation(reason).label;
 }
 
-/** Human-divergence reasons lead operational reasons when chronic ages tie. */
+/** Preserve the legacy operational tie while giving deletion-pending its deliberate display slot. */
 function gitDeferralReasonPrecedence(reason: string): number {
   switch (reason) {
     case "local-edits": return 0;
@@ -323,7 +324,8 @@ function gitDeferralReasonPrecedence(reason: string): number {
     case "local-operation": return 2;
     case "local-commits": return 3;
     case "local-stash": return 4;
-    default: return 5;
+    case "deletion-pending": return 5;
+    default: return 6;
   }
 }
 

@@ -7,7 +7,7 @@ import { readAllRefs } from "../../engine/git/refs.js";
 import { git, readHead, warnOnce } from "../../engine/git/shared.js";
 import { DEFERRAL_LANES, expectedStateNonce, loadRawState, repoRecordsForState, type ConfigShapeIdentity, type GitDeferral, type GitDeferralReason, type GitHeldAttempt, type GitPartialApply, type RepoRecord, type RepoRecordInput, type SyncState, type TypedBlocker, type WorkspaceConfig } from "../config.js";
 import { completeConfigApply, configLaneState, inputRecord, type ConfigLaneState, type GitDeferralUpdates } from "../sync-state.js";
-import { checkoutJournalBinding, clearFollowJournal, deriveBaseIndexProjection, followDivergedRepo, FollowCrashInjectedError, quarantineUnboundFollowJournal, recoverAndLandFollowJournal, type FollowCrashPoint, type FollowIntended, type FollowProgress } from "./follow.js";
+import { checkoutJournalBinding, clearFollowJournal, deriveBaseIndexProjection, firstReason, followDivergedRepo, FollowCrashInjectedError, quarantineUnboundFollowJournal, recoverAndLandFollowJournal, type FollowCrashPoint, type FollowIntended, type FollowProgress } from "./follow.js";
 import { checkoutLabel, configInvalidSkipLogged, configOwnershipSkipLogged, repoDirOf, narrowerScope, projectedKey, emptyToUndef, errMsg, chainLock, gitApplyMutationKey, nestedRepoChains, gitApplyConcurrency, gitFollowEnabled, gitIncomingKey, nextDeferral, repoEquivalenceWarningLogged, sectionOpState } from "./shared.js";
 import { gitConfigHash, readLocalGitConfig, sameConfigShape, configReceiver } from "./config-lane.js";
 import { prepareFollowerBranchProtocol } from "./follower-protocol.js";
@@ -746,10 +746,16 @@ opts: {
       configApplied: progress.configApplied,
       ...(!progress.configApplied && inheritedConfigBase !== undefined ? { configBase: inheritedConfigBase } : {}),
     });
-    const heldReasonOf = (heldRefs: GitPartialApply["heldRefs"]): GitDeferralReason => {
-      const reasons = Object.values(heldRefs);
-      return reasons.includes("local-commits") ? "local-commits"
-        : reasons.includes("local-stash") ? "local-stash"
+    const heldReasonOf = (progress: Pick<FollowProgress, "blockers" | "heldRefs">): GitDeferralReason => {
+      const classified = firstReason(new Set<GitDeferralReason>(
+        progress.blockers
+          .filter((blocker) => blocker.provenance === "ref-plane")
+          .map((blocker) => blocker.reason),
+      ));
+      if (classified) return classified;
+      const persisted = Object.values(progress.heldRefs);
+      return persisted.includes("local-commits") ? "local-commits"
+        : persisted.includes("local-stash") ? "local-stash"
         : "worktree-ownership";
     };
 
@@ -1302,7 +1308,7 @@ opts: {
           }
         }
         if (held) {
-          const heldReason = heldReasonOf(progress.heldRefs);
+          const heldReason = heldReasonOf(progress);
           const next = nextDeferral("apply", effectiveDeferrals.apply, heldReason, new Date().toISOString(), incomingKey, await checkoutOf(repoDir));
           effectiveDeferrals.apply = next;
         } else delete effectiveDeferrals.apply;
@@ -1447,7 +1453,7 @@ opts: {
       if (held.length > 0 || composedFollow.disposition === "pending") {
         pending[rel] = remoteSec;
         partial[rel] = partialFrom(follow, false);
-        setDeferral(rel, "apply", held.length ? heldReasonOf(follow.heldRefs) : "artifact", incomingKey, await checkoutOf(repoDir));
+        setDeferral(rel, "apply", held.length ? heldReasonOf(follow) : "artifact", incomingKey, await checkoutOf(repoDir));
       } else {
         delete pending[rel];
         clearAttempt(rel);

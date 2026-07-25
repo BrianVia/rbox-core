@@ -129,7 +129,7 @@ export interface ConfigShapeIdentity {
 
 export const GIT_DEFERRAL_REASONS = [
   "local-edits", "local-index", "local-operation", "local-commits", "local-stash",
-  "conflict", "git-busy", "stale-unattributed", "worktree-ownership", "ignored-target", "unreadable",
+  "deletion-pending", "conflict", "git-busy", "stale-unattributed", "worktree-ownership", "ignored-target", "unreadable",
   "artifact", "config", "containment", "unsupported", "other",
 ] as const;
 
@@ -147,7 +147,7 @@ export type GitDeferralReason = (typeof GIT_DEFERRAL_REASONS)[number];
  * a new reason must be ranked on purpose, never inherit a rank by accident.
  */
 export const GIT_DEFERRAL_REASON_PRECEDENCE = [
-  "local-edits", "local-index", "local-operation", "local-commits", "local-stash", "conflict",
+  "local-edits", "local-index", "local-operation", "local-commits", "local-stash", "deletion-pending", "conflict",
   "worktree-ownership", "git-busy", "stale-unattributed", "unreadable", "artifact", "config",
   "ignored-target", "containment", "unsupported", "other",
 ] as const satisfies readonly GitDeferralReason[];
@@ -201,7 +201,7 @@ export interface GitPartialApply {
 }
 
 export type TypedBlocker =
-  | { provenance: "ref-plane"; reason: "local-commits" | "local-stash" | "worktree-ownership"; ref: string }
+  | { provenance: "ref-plane"; reason: "local-commits" | "local-stash" | "deletion-pending" | "worktree-ownership"; ref: string }
   | { provenance: "checkout" | "boundary"; reason: GitDeferralReason; detail?: string }
   | { provenance: "indeterminate"; reason: "unreadable" | "unsupported"; detail: string }
   | { provenance: "protocol"; reason: "artifact"; detail: string }

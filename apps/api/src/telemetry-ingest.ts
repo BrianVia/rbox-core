@@ -117,7 +117,7 @@ export const SERVER_CORPUS_BUCKETS = [
 
 export const SERVER_GIT_DEFERRAL_REASONS = [
   "local-edits", "local-index", "local-operation", "local-commits", "local-stash",
-  "conflict", "git-busy", "stale-unattributed", "worktree-ownership", "ignored-target", "unreadable",
+  "deletion-pending", "conflict", "git-busy", "stale-unattributed", "worktree-ownership", "ignored-target", "unreadable",
   "artifact", "config", "containment", "unsupported", "other",
 ] as const;
 

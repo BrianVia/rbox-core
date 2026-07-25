@@ -146,6 +146,15 @@ test("review L1: diagnostics classifies stale-unattributed before generic lock f
   expect(redacted).not.toContain("private/repo");
 });
 
+test("diagnostics classifies a deleted branch before the local-commits fallback", () => {
+  const redacted = redactGitLogLines(
+    "2026-07-13T12:00:00.000Z git-sync deferred private/repo: branch deleted here (held refs: refs/heads/private)\n",
+  );
+  expect(redacted).toContain("git-sync deferred reason=deletion-pending age=-");
+  expect(redacted).not.toContain("reason=local-commits");
+  expect(redacted).not.toContain("private/repo");
+});
+
 test("device identity check reports match, mismatch, and no enrollment", async () => {
   const enrolled = await bootstrapAccount("acct_doctor_device", "dev_enrolled", 1_900_000_000_000);
   await saveDevice(enrolled.secrets);
