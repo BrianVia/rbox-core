@@ -1129,14 +1129,17 @@ export async function planGitSections(
           && artifacts.present === "absent"
           && artifacts.keeps === "clear"
           && artifacts.settledAbsence === "absent");
-        if (candidate.refScope !== "all"
-          || !branchBaseOriginMatches(origin, priorOid)
-          || origin.lineageHash !== readyProtocol!.lineageHash
-          || !artifactsClear
-          || owned.has(ref)
-          || collisions.has(ref)
-          || head === `ref: ${ref}`) {
-          refusal = `branch deletion witness refused ${ref}`;
+        const witnessRefusals = [
+          ...(candidate.refScope !== "all" ? ["scoped-capture"] : []),
+          ...(!branchBaseOriginMatches(origin, priorOid) ? ["origin-mismatch"] : []),
+          ...(branchBaseOriginMatches(origin, priorOid) && origin.lineageHash !== readyProtocol!.lineageHash ? ["lineage-changed"] : []),
+          ...(!artifactsClear ? ["artifacts-standing"] : []),
+          ...(owned.has(ref) ? ["worktree-owned"] : []),
+          ...(collisions.has(ref) ? ["name-collision"] : []),
+          ...(head === `ref: ${ref}` ? ["head-symref"] : []),
+        ];
+        if (witnessRefusals.length > 0) {
+          refusal = `branch deletion witness refused ${ref} (${witnessRefusals.join("+")})`;
           break;
         }
         try {
