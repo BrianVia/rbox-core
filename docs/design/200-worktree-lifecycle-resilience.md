@@ -10,8 +10,9 @@ Changes in v3 — the eight that change what gets built:
    `max(25, ceil(0.25·N))` is a *conjunction*, so it cannot trip at all below 25 heads and
    its fraction leg is inert below 100 — which covers nearly every repository in the
    workspace. Deleting all 24 heads of a 24-head repository did not trip it. The
-   counterexample is recorded so nobody re-derives the broken form. One residual small-repo
-   hair-trigger is **STILL OPEN (Q2b)**.
+   counterexample is recorded so nobody re-derives the broken form. The residual small-repo
+   hair-trigger was subsequently **RULED (Q2b, §"Still open" item 1)**: fraction leg gated
+   on `N ≥ 20`, absolute floor 25.
 2. **The deleting device now keeps its own 90-day recovery pin** (R3, §3.7). This reverses
    §8 item 10 and retires Q3a. The old premise — that a *follower's* prune pin is the
    recovery path — is false whenever no device prunes; the analysis is kept as the
@@ -2522,9 +2523,14 @@ Kept because a wrong line number propagates further than a wrong argument.
 
 ### Still open after this round
 
-1. **Q2b — the small-repository hair-trigger** under R1's `OR` form (§3.5, §12 Q2). Needs a
-   founder decision between the unguarded `OR` and the recommended `N ≥ 20` gate on the
-   fraction leg. The design assumes the gate.
+1. **Q2b — RULED (founder, 2026-07-24): the guarded form.** Trip if `n ≥ 25`, OR if
+   `N ≥ 20 && n ≥ 0.25·N` — the fraction leg engages only once a repository has ≥ 20
+   heads. Chosen against the measured workspace shape (110 repos, median **1** BASE head,
+   84% ≤ 4): an unguarded fraction leg fires on a single routine `git branch -D` in most
+   repositories, which is the loop this design exists to automate. Accepted gap, stated
+   at ruling time: a 5–19-head repository losing all heads at once is protected by the
+   §3.3b signals, the strict ref read, and restore detection — not by the breaker. The
+   design already assumes this form throughout; this entry closes it.
 2. **P3's apply-then-revert false positive** (§4.3). Not a founder question — a scope
    decision, taken deliberately: an exact result-state proof is a separate design, and P3's
    structural bar against destructive transitions is what makes leaving it acceptable. If a
