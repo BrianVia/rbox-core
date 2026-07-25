@@ -1527,13 +1527,15 @@ paths has now failed twice and a third enumeration would be a third guess (round
 > family is new in v13 and it is round-11 blocker 1.** `saveStateUnsafeLegacyOrTest`
 > (`sync-state-store.ts:375` → `writeWholeStateUnsafe`, `:330-372`) writes the **whole** state file from
 > the **caller's in-memory snapshot** with **no state lock, no generation CAS and no re-read of the
-> durable file**. **Four** arms reach it: `saveStateSource`'s `forceLegacy`, which push passes whenever
+> durable file**. **Three** production arms reach it (a fourth exists but is test-only, below): `saveStateSource`'s `forceLegacy`, which push passes whenever
 > the workspace sync mutex is degraded (`sync-state.ts:332-335`; `push.ts:1012`,
 > `workspaceSyncMutexDegraded`); the `unsupported` fallback (`sync-state.ts:342-345`); the allowed
-> stream-replacement fallback (`:348-351`, option supplied at `push.ts:1011`); and — **not in round 11's
-> list, found while verifying it** — `savePublishedRepoIntent`'s own `forceLegacy` arm
-> (`sync-state.ts:396`, `:516-524`), which is how a recovered checkout journal lands its published intent
-> (`follow.ts:330`). So: operation A accepts an
+> stream-replacement fallback (`:348-351`, option supplied at `push.ts:1011`); and a fourth arm that exists in
+> the code but is **unreachable in production** — `savePublishedRepoIntent`'s own `forceLegacy` option
+> (`sync-state.ts:396`, `:516-524`) has **no production caller that selects it** (round-12 verification:
+> `follow.ts:330` passes no options; the option is test-only), consistent with §13.3's earlier finding
+> that this branch is dead. **Three** live arms, therefore, plus one dead one recorded so nobody
+> re-counts it. So: operation A accepts an
 > omitting publication and **successfully** saves its ACK, retiring BASE; a concurrent operation B,
 > composed from a snapshot taken **before** A's save, finishes second through any of those four arms and
 > whole-file overwrites A's state; BASE is back at `priorOid` for every ref B's stale snapshot covered,
@@ -1632,7 +1634,7 @@ Every conjunct is load-bearing and each one is code:
    (the prior ordering flushed the marker's unlink while the superseding rename was not
    durable, so one crash window could lose both the new state and the fallback baseline),
    and adds the absent parent fsync to the file's three other `state.json` publications.
-   Once merged, the power-loss member of family (i) narrows to the fsync-to-crash gap of
+   Merged as `2a7f821e`, so the power-loss member of family (i) has narrowed to the fsync-to-crash gap of
    an ordinary published rename — the same durability every other `writeFileAtomic` +
    `fsyncDirectory` caller in the tree has. The design does not depend on that PR; the
    trigger property already covers the window either way.
@@ -1713,9 +1715,10 @@ founder's principles are being invoked:
   not a fail-closed degraded writer.
 
   **Fleet measurement (2026-07-25), folded in as fact rather than argument:** zero `degraded`
-  occurrences in the current daemon logs of every fleet host, and all three run local
-  filesystems with working `link()` (APFS on the MacBook; ext4 on via-desktop-ubuntu and
-  flat-meadow-prod-main-01). **No degraded-unlocked workspace exists in the fleet today**, so
+  occurrences in the current daemon logs of the MacBook and flat-meadow-prod-main-01 (the
+  desktop had no current daemon log to inspect at measurement time), and all three hosts run
+  local filesystems with working `link()` (APFS on the MacBook; ext4 on via-desktop-ubuntu and
+  flat-meadow-prod-main-01) — the property that decides degraded-unlocked, independent of logs. **No degraded-unlocked workspace exists in the fleet today**, so
   family (ii)'s precondition is currently unreachable in the field; the honest rate statement
   above is about the class of workspace, not about any workspace this product currently runs on.
   The measurement is a snapshot, not an invariant — a future network-mount workspace re-opens it,
@@ -3900,10 +3903,10 @@ history is needed:
     the round-11 blocker.** Accept the omission, let the ACK save **succeed** (assert `record.base.refs[R]`
     is retired), then have a **second** operation composed from a snapshot taken *before* that save land
     through the unlocked whole-file writer, and assert `record.base.refs[R]` is **positive again**. Run it
-    once per arm that reaches the writer: `saveStateSource`'s `forceLegacy`
+    once per production arm that reaches the writer: `saveStateSource`'s `forceLegacy`
     (`sync-state.ts:332-335`, as push passes it at `push.ts:1012`), the `unsupported` fallback (`:342-345`),
-    the allowed stream-replacement fallback (`:348-351`), and `savePublishedRepoIntent`'s own `forceLegacy`
-    arm (`:516-524`). Then re-create `R` at exactly `X` and pull, and assert the **prune happens** —
+    and the allowed stream-replacement fallback (`:348-351`). (`savePublishedRepoIntent`'s `forceLegacy`
+    option has no production caller — round 12 — and is covered by the existing dead-branch note, not a row.) Then re-create `R` at exactly `X` and pull, and assert the **prune happens** —
     i.e. that a window which had closed reopened. Name this row for the finding; it is the executable form
     of §3.2c's family (ii) and the thing a future "the ACK succeeded, so we're safe" claim must argue with.
     **The negative rows, restated to what the code guarantees.** A **single** `repo-generation` /
