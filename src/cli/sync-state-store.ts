@@ -216,11 +216,19 @@ export async function applyStateSavePacket(root: string, packet: StateSavePacket
       beforeRename: async () => (owner = await lock.isOwner()),
     });
     if (!owner) return { status: "rejected", reason: "owner-lost", state: current };
+    // writeFileAtomic syncs the temp's BYTES, but the rename that publishes them
+    // as state.json is only durable once state.json's OWN parent is flushed — a
+    // different directory from the incarnation marker's. Flush it before retiring
+    // the marker, so no crash window can leave the marker's removal durable while
+    // the state it was superseded by is not: that loses both the new state and the
+    // fallback baseline after an accepted save.
+    await fsyncDirectory(path.dirname(statePath(root)));
     const markerExisted = await fs.lstat(stateIncarnationPath(root)).then(() => true, (error) => {
       if (isENOENT(error)) return false;
       throw error;
     });
     await fs.rm(stateIncarnationPath(root), { force: true });
+    // …and this publishes that unlink in the marker's own parent.
     if (markerExisted) await fsyncDirectory(path.dirname(stateIncarnationPath(root)));
     return { status: "accepted", state: next };
   } finally {
