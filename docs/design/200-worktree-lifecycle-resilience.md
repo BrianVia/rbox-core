@@ -1627,6 +1627,16 @@ Every conjunct is load-bearing and each one is code:
      ordinary member of family (i) under the same property, with no special case required — which is the
      argument for stating the trigger as a property rather than a list.
 
+   **Update (2026-07-25): the missing parent fsync is fixed in code** — PR #448 inserts
+   `fsyncDirectory(dirname(statePath))` after the rename and *before* the marker removal
+   (the prior ordering flushed the marker's unlink while the superseding rename was not
+   durable, so one crash window could lose both the new state and the fallback baseline),
+   and adds the absent parent fsync to the file's three other `state.json` publications.
+   Once merged, the power-loss member of family (i) narrows to the fsync-to-crash gap of
+   an ordinary published rename — the same durability every other `writeFileAtomic` +
+   `fsyncDirectory` caller in the tree has. The design does not depend on that PR; the
+   trigger property already covers the window either way.
+
    §9.1's negative row is corrected to assert only the first bullet. Nothing in this design may call
    `state.json` crash-durable on the strength of the rename, and no claim here needs it to be: the
    residual's consequence and recovery are identical whichever way the entry lands.
@@ -1701,6 +1711,15 @@ founder's principles are being invoked:
   workspace" and concludes the answer must change is asking for the founder to reverse R4 for the Git
   plane, and that remains the recorded escalation path (§12 C3, §13.4 item 8) — not a smaller field, and
   not a fail-closed degraded writer.
+
+  **Fleet measurement (2026-07-25), folded in as fact rather than argument:** zero `degraded`
+  occurrences in the current daemon logs of every fleet host, and all three run local
+  filesystems with working `link()` (APFS on the MacBook; ext4 on via-desktop-ubuntu and
+  flat-meadow-prod-main-01). **No degraded-unlocked workspace exists in the fleet today**, so
+  family (ii)'s precondition is currently unreachable in the field; the honest rate statement
+  above is about the class of workspace, not about any workspace this product currently runs on.
+  The measurement is a snapshot, not an invariant — a future network-mount workspace re-opens it,
+  which is exactly what the flag surfaces.
 
 **It does not recur, and the precision matters — two different transactions are involved and v11 says
 which. v12 adds that both arguments are per-ref, which is what makes the widened bound safe.** The
