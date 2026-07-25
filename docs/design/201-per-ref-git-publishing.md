@@ -55,9 +55,20 @@ From the founder's ruled semantics, and deliberately stated as outcomes rather t
   normally**, with **no carried pending section** for the repository.
 - The **held ref itself waits** — it is neither published at a value this device does not hold
   nor superseded — and its waiting produces **no whole-repository surface**: no repo-level
-  deferral, no repo-level gag, nothing a user or agent has to act on.
-- **Everything still clears at worktree deletion**, through design 200's absence-capture gate
-  (P1/P1b) — this design must not weaken or bypass it.
+  deferral, no repo-level gag, nothing a user or agent has to act on. *"Waits" is stated
+  positively, because the negative form alone would permit publishing this device's local
+  divergent value:* the held incoming transition **remains pending** for as long as the hold
+  lives, and **no replacement value for that ref is authored** — not this device's divergent
+  local value, not a merge, not a tombstone. *(Tightened 2026-07-24 after codex round 4 on design
+  200, minor 3.)*
+- **Everything clears once the worktree goes *and the branch is deleted*** — through design 200's
+  absence-capture gate (P1/P1b), which this design must not weaken or bypass. *(Corrected
+  2026-07-24 after codex round 4 on design 200, major 2: `git worktree remove` changes **no ref**
+  — design 200 §9.1's fixture says so explicitly — so removing a worktree alone never triggers
+  P1/P1b. If the branch survives the worktree, the hold clears through ordinary ownership follow
+  instead, because nothing owns the ref any more; absence capture is the gate for the *deleted*
+  branch, not for the removed worktree. The earlier wording promised absence capture for a
+  present branch, which design 200 §4.2 never claimed.)*
 - **No regression of the rig scenario** `scripts/rig/scenarios/worktree-squash-lifecycle.ts`.
   Specifically: design 200 §9.6 **relaxes** that scenario's phase-1 assertion
   `P2 no-escalation: capture must not be gagged (no carried pending section)` to tolerate a
