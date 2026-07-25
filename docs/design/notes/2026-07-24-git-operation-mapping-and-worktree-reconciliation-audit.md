@@ -1,8 +1,12 @@
 # Git operation mapping and worktree reconciliation audit
 
-Date: 2026-07-24
+Date: 2026-07-24; re-evaluated 2026-07-25
 
-Audited commit: `621aed460c7ac3bcc8e1d18c460c2d3425837334` (`origin/main`)
+Original audited commit:
+`621aed460c7ac3bcc8e1d18c460c2d3425837334` (`origin/main`)
+
+Re-evaluation commit:
+`f6013f2dc313c79f27268a280bedc40ac76fd096` (`origin/main`, v1.9.1)
 
 Scope: CLI/daemon Git capture, apply, follow, manual resolution, worktree
 ownership, and Git BASE persistence
@@ -37,12 +41,21 @@ of merge, reset, cherry-pick, and commit operations can produce indistinguishabl
 endpoints. rbox is correctly built as a state replicator, but the mapping from
 state decisions to concrete Git mutations is not currently explicit enough.
 
-The audit also found a current correctness failure in the exact squash-merge
-and branch-deletion reconciliation path. The physical Git transaction succeeds,
-but the landed logical BASE retains the deleted branch. This is the highest
-priority finding.
+The original audit also found a correctness failure in the exact squash-merge
+and branch-deletion reconciliation path: the physical Git transaction
+succeeded, but the landed logical BASE retained the deleted branch. That
+finding is no longer current on v1.9.1. Design 200 materially changed this
+path, and the unchanged focused regression now passes on the re-evaluation
+commit.
 
-## P0: squash pruning can leave physical Git and logical BASE split
+The remaining architectural finding is therefore not "squash reconciliation
+is currently broken." It is that correct behavior is distributed across
+increasingly large planning, proof, mutation, and BASE-composition modules
+without one typed semantic-effect boundary. Design 200 improves the safety
+model and recovery behavior, while making that consolidation more—not
+less—valuable.
+
+## Re-evaluation: the prior P0 is resolved on latest main
 
 The focused integration test
 `§130 follower prune crosses publishRefPlane, survives carry, fingerprints
@@ -55,30 +68,45 @@ reflog, and compacts A to Z` models the common workflow:
 5. Prune `topic` on the follower.
 6. Preserve a raced reflog-only commit.
 
-On the audited `origin/main`, the Git-side assertions succeed:
+On the original audited commit, the Git-side assertions succeeded:
 
 - the follower branch is deleted;
 - the raced commit is retained under a keep pin;
 - its human-origin record is present; and
 - the successful prune log is emitted.
 
-The final persisted-state assertion fails:
+The final persisted-state assertion failed:
 
 ```text
 Physical Git: refs/heads/topic is absent
 Logical BASE: refs/heads/topic still equals the old topic tip
 ```
 
-The companion safety test,
-`§130 checked-out branch without live/BASE equality holds and never invents P
-authority`, passes. The pure publisher-tombstone, tombstone-attestation, and
-BASE-composer suites also pass. This localizes the observed failure after
-successful ref publication, around the transition from `applyGitSections`
-through `saveStateSource` and artifact settlement.
+On the re-evaluation commit, that same test passes with 17 expectations. Blame
+shows that the test body and terminal physical-ref/BASE assertions are unchanged
+from their pre-design-200 form, so this is a behavioral fix rather than a
+weakened regression. This audit did not bisect the smallest fixing commit;
+the supported conclusion is that current `origin/main`, including the shipped
+design 200 work, resolves the reproduced failure.
 
-This should be treated as a correctness failure rather than merely an
-observability or refactoring concern. A follower that physically deleted a ref
-but retained it in BASE begins the next sync from a false predecessor.
+Design 200 also addresses the broader local lifecycle that produced the
+incident:
+
+1. A branch deleted outside rbox is omitted from capture.
+2. A multi-clause witness proves that the omission is an authentic local
+   deletion rather than an unreadable or incomplete ref observation.
+3. A verify-only prepared ref transaction proves absence while holding the
+   relevant ref lock.
+4. Capture authors an exact-OID tombstone.
+5. Publisher acknowledgement retires BASE only after the accepted wire state,
+   under the same compare-and-swap.
+6. If proof is incomplete, Step D carries the last synced section and defers
+   the entire capture rather than publishing ambiguous absence.
+
+This changes the operational conclusion: a squash-merged branch may remain
+held while a linked worktree owns it, but once the worktree is gone and the
+branch is deleted, the ordinary capture/tombstone protocol can reconcile the
+fleet without manual BASE repair.
 
 ### Focused validation
 
@@ -86,17 +114,16 @@ The following isolated tests were run:
 
 | Test area | Result |
 |---|---:|
-| Publisher tombstone protocol | 31 passed |
-| Tombstone attestation | 4 passed |
-| Pure BASE composer | 12 passed |
-| Checked-out branch safety hold | passed |
-| Squash prune and BASE landing | failed at final persisted BASE assertion |
+| Formerly failing §130 squash prune and BASE landing | passed, 17 expectations |
+| Design 200 local deletion, tombstone, and BASE retirement | passed |
+| Design 200 linked-worktree partial apply and completion | passed |
+| Design 200 Step D atomic defer under real ref-lock contention | passed |
+| Held-skip pure suite | 14 passed |
+| Content-equivalence cache | 2 passed |
+| Strict ref observation | 2 passed |
+| Reachability classification | 25 passed |
 
-The source-structure allowlist suite could not be evaluated in this worktree
-because it invokes Node directly and the worktree has no local `node_modules`;
-Node resolved an older home-level TypeScript package without
-`typescript/unstable/sync`. That is a validation-environment limitation, not a
-product finding.
+The three design 200 integration cases passed together with 201 expectations.
 
 ## Current semantic operations and actual effects
 
@@ -160,6 +187,38 @@ The manifest identity is based on endpoint state, not bundle bytes. This is
 important because `git stash create` may mint a new synthetic commit on each
 capture.
 
+### Authenticated out-of-band branch deletion
+
+Design 200 added a semantic operation that was missing from the original
+mapping: turn a locally absent, previously published branch into an
+authenticated replicated deletion.
+
+Representative effects include:
+
+```text
+git show-ref
+git update-ref --stdin
+  start
+  option no-deref
+  verify refs/heads/<branch> 0000000000000000000000000000000000000000
+  prepare
+  <locked second proofs>
+  commit
+  # abort instead if a locked proof fails
+```
+
+The strict ref reader distinguishes a legitimately empty ref store (Git exit
+1 with empty stderr) from an unreadable ref store. The planner then requires
+the deletion witness: scoped capture, origin agreement, unchanged lineage,
+settled artifacts, no worktree owner, no name collision, and stable HEAD
+symref are among the named clauses exposed by current diagnostics.
+
+The verify-only transaction is not the deletion itself. It is a locked
+second proof that the ref is still absent before capture publishes the
+tombstone-bearing state. BASE retirement happens only after publisher
+acknowledgement. This is a good example of one rbox operation legitimately
+mapping to several coordinated Git and state effects.
+
 ### Import
 
 For each bundle link:
@@ -194,6 +253,12 @@ The result is intentionally tri-state:
 
 Missing objects, shallow stores, corrupt walks, and unexpected Git exit statuses
 fail closed rather than being treated as proof that a ref is safe to replace.
+
+At the process boundary, `gitStatus` now preserves successful output or returns
+a structured failed result containing exit status, stdout, stderr, and the
+original cause. `readAllRefsStrict` uses that distinction for proof-sensitive
+ref observation. This is a meaningful improvement over treating every
+non-zero result as "no refs," although it is not yet a semantic effect API.
 
 ### Branch and safe-ref publication
 
@@ -298,9 +363,19 @@ Current worktree support is tier 1:
 Per-worktree HEAD, index, operation-state, identity, and lifecycle remain an
 explicit tier-2 non-goal.
 
-Consequently, design 130 can automatically clean a stale squash-merged branch
-only when it is not checked out in another worktree. If it remains active in a
-linked worktree, rbox lacks authenticated intent to decide whether that
+Design 200 makes this tier materially less disruptive:
+
+- a sibling-worktree ownership hold is eligible for a race-bracketed
+  per-ref held-skip;
+- that hold no longer escalates by itself into whole-repository deferral;
+- unrelated fast-forwardable ref changes can continue through the design 174
+  partial-apply path;
+- `rbox doctor` reports leftover linked worktrees; and
+- once the worktree and branch are removed, authenticated out-of-band deletion
+  lets the repository self-heal.
+
+The safety boundary remains appropriate. While a branch is active in a linked
+worktree, rbox still lacks authenticated intent to decide whether that
 worktree should:
 
 - remain on the deleted branch;
@@ -308,17 +383,24 @@ worktree should:
 - detach at its current commit; or
 - be removed.
 
-The current safety hold is correct. Seamless fleet behavior requires a product
-model for worktree intent.
+The remaining synchronization limitation is narrower than the original audit
+stated. A divergent held ref combined with an unrelated non-fast-forward
+transition can still keep the larger pending section carried. The honest fix
+is per-ref publishing/state, currently parked as design 201, rather than
+pretending the worktree hold is repository-wide intent.
+
+Replicating worktree identity and lifecycle would be a separate product
+capability. It is no longer a prerequisite for the common
+worktree-create/squash/delete/teardown lifecycle to converge.
 
 ## Structural findings
 
 ### 1. No semantic Git-effect boundary
 
-`gitRaw`, `git`, `gitWithIndexFile`, and `gitOk` accept arbitrary argument
-arrays. There are 122 direct wrapper invocations across the relevant production
-trees. Raw `update-ref` authority remains spread across numerous production
-modules.
+`gitRaw`, `git`, `gitWithIndexFile`, `gitStatus`, and `gitOk` accept arbitrary
+argument arrays. There are now 131 direct wrapper invocations across the
+relevant production trees. Raw `update-ref` authority remains spread across
+11 production modules.
 
 The existing structure test counts approved source sites. It does not establish:
 
@@ -329,24 +411,26 @@ The existing structure test counts approved source sites. It does not establish:
 - inverse/recovery effects; or
 - the required state receipt.
 
-`gitOk` is particularly weak for proof-sensitive operations because it
-collapses all failures into a boolean. Some callers correctly distinguish Git
-exit status 1 from I/O, missing-object, and process failures, but that discipline
-is not encoded at the command boundary.
+`gitStatus` is genuine progress: it makes exit status, output, stderr, and
+process cause data, and the strict ref reader uses it to distinguish an empty
+repository from an unreadable one. `gitOk` still collapses failures to a
+boolean, however, and callers can still issue arbitrary argv. The process
+result type does not encode the semantic operation, accepted statuses,
+namespace authority, preconditions, or matching BASE transition.
 
 ### 2. Planning, effects, and state construction are interleaved
 
-Relevant module sizes at the audited commit:
+Relevant module sizes at the re-evaluation commit:
 
 | Module | Lines |
 |---|---:|
 | `src/cli/daemon/daemon.ts` | 3,475 |
-| `src/cli/sync-git/apply.ts` | 1,995 |
-| `src/cli/sync-git/follow.ts` | 1,664 |
-| `src/cli/sync-git/plan.ts` | 1,180 |
-| `src/cli/git/resolve-command.ts` | 1,018 |
-| `src/engine/git/lockfile.ts` | 1,261 |
-| `src/engine/git/checkout-txn.ts` | 999 |
+| `src/cli/sync-git/apply.ts` | 2,114 |
+| `src/cli/sync-git/follow.ts` | 1,784 |
+| `src/cli/sync-git/plan.ts` | 1,383 |
+| `src/cli/git/resolve-command.ts` | 1,065 |
+| `src/engine/git/lockfile.ts` | 1,425 |
+| `src/engine/git/checkout-txn.ts` | 1,013 |
 
 `apply.ts` and `follow.ts` mix:
 
@@ -376,12 +460,13 @@ The existing thermo-nuclear roadmap recommends extracting
 canonical branch/safe-ref transaction API used by all three user-facing paths,
 with specialized executors beneath one mutation-authority boundary.
 
-### 4. Operator visibility is symptom-oriented
+### 4. Operator visibility improved, but is not end-to-end
 
-The audited HEAD commit fixed a case where a concrete ref-publication error was
-classified and then discarded, leaving operators with only a generic failure.
-That is evidence for a structured execution receipt rather than another
-collection of log strings.
+Design 200 added typed `deletion-pending` and `ref-read-unreadable` reasons,
+named witness-clause diagnostics, and a leftover-worktree section in
+`rbox doctor`. That materially improves the exact incident investigated here.
+It still does not expose one end-to-end record connecting observation,
+decision, effects, and BASE acknowledgement.
 
 An `rbox git explain <repo>` surface should display, for each relevant lane:
 
@@ -483,9 +568,15 @@ no repeated composition that can reinterpret the receipt differently
 Tests should assert the terminal physical Git state and persisted `RepoRecord`
 from the same receipt.
 
-## WorktreeReplica model for tier-2 support
+## Optional WorktreeReplica model for tier-2 product semantics
 
-True seamless worktree behavior needs an explicit replicated entity:
+Design 200 demonstrates that rbox does not need to replicate worktrees merely
+to survive the normal ephemeral-agent lifecycle. Current safety holds,
+per-ref held-skip, authenticated out-of-band deletion, and later reconciliation
+are sufficient for that lifecycle.
+
+If the product goal expands to making the same logical worktree exist, switch,
+or close across machines, then it needs an explicit replicated entity:
 
 ```text
 WorktreeReplica {
@@ -514,19 +605,27 @@ when:
 6. local state is quarantined or pinned first; and
 7. checkout mutation and replicated-state acknowledgement share one receipt.
 
-Without those facts, the current hold is the correct behavior.
+Without those facts, the current hold is the correct behavior. This protocol
+should be considered only if cross-machine worktree identity is an intentional
+product feature; it should not displace the nearer-term per-ref publication
+and semantic-effect-boundary work.
 
 ## Recommended sequence
 
-1. Fix and permanently gate the current squash-prune/BASE persistence failure.
+1. Keep the resolved squash-prune/BASE regression and the design 200 lifecycle
+   rig as permanent gates.
 2. Update `docs/usage.md` to describe the implemented worktree model.
-3. Add structured Git decisions and `rbox git explain`.
-4. Introduce typed effect plans and execution receipts.
-5. Route clean apply, divergent follow, and manual resolution through one
+3. Introduce typed effect plans and execution receipts.
+4. Route clean apply, divergent follow, and manual resolution through one
    canonical ref-transaction authority.
-6. Separate pure planning from effects in `apply.ts` and `follow.ts`.
-7. Design and implement the tier-2 `WorktreeReplica` lifecycle protocol.
-8. Keep daemon scheduling refactors separate from Git semantic refactors.
+5. Separate pure planning from effects in `apply.ts` and `follow.ts`.
+6. Add an end-to-end `rbox git explain` view over observations, holds, plans,
+   execution receipts, and BASE acknowledgement.
+7. Implement design 201 per-ref publishing when the larger wire/state
+   migration is scheduled.
+8. Consider `WorktreeReplica` only if replicating worktree lifecycle becomes
+   a deliberate product promise.
+9. Keep daemon scheduling refactors separate from Git semantic refactors.
 
 ## Final assessment
 
@@ -537,9 +636,10 @@ locked second proofs, and A/P/K artifacts.
 
 The main architectural deficit is not a lack of Git safety mechanisms. It is
 the absence of a single, inspectable semantic effect boundary connecting those
-mechanisms to one durable state receipt. The observed squash-prune failure is a
-concrete example: Git reached the intended terminal state, but replicated state
-did not.
+mechanisms to one durable state receipt. Design 200 resolves the reproduced
+squash-prune/BASE failure and makes the common ephemeral-worktree lifecycle
+self-healing. It also grows the largest policy modules and the number of direct
+Git wrapper calls, strengthening the maintainability case for consolidation.
 
 A semantic-operation-to-effect-plan mapping preserves rbox's endpoint-state
 replication model while making each Git mutation rigorous, testable,
