@@ -1,6 +1,59 @@
 # 200 — Worktree lifecycle resilience: capturing out-of-band branch deletion
 
-Status: DESIGN v9 — 2026-07-25. **v9 replaces the two auxiliaries v8 added; it does not touch v7's
+Status: DESIGN v10 — 2026-07-25. **v10 is the final-mile round: three refinements inside the two
+mechanisms v9 rebuilt, and no structural change anywhere.** Codex round 8
+(`REVIEW-200-R8-CODEX.md`, kept beside this file) left the v7 core untouched for a **third**
+consecutive round, **verified step D on the ordinary active-BASE path**, and **closed the one claim v9
+shipped as UNVERIFIED** (`opts.sourceGlobalSeq` is the signed head sequence in every production caller
+of `applyGitSections` — §13.8's closed bullet). Its three findings all land inside §3.2b's trigger and
+§3.2c's field lifecycle:
+
+1. **One clause is WITHDRAWN, because it latched.** v9 answered round-7 B4 with two rules: reconcile at
+   push entry (correct, kept verbatim) and then *refuse to arm over a survivor, letting the repository
+   take step D's defer*. Round 8 showed step D's trigger does not even fire for the protected pair — the
+   re-created ref is **present**, so it is not an unproven absence — and that adding a survivor gate to
+   force the defer creates an **undisclosed permanent non-current latch**: the carry is the omitting
+   pending section, so the acknowledged section never asserts the ref (condition 3), BASE still holds
+   `priorOid` (condition 1) and the head is past the slot (condition 2). **v10 checked whether that
+   latch is merely bounded before rewriting anything, and it is not**: a pull-lane BASE retirement for a
+   ref that is live locally is *inexpressible* (`branchProofMatches` demands `locked.liveOid === after`
+   for an `after === null` retirement, `base-composer.ts:246-258`; `publisher-ack` preserves BASE for
+   any omitted ref without L's proof, `:356-357`), so condition 1 is unreachable by construction. So
+   v10 takes the first repair round 8 named — **overlapping attempt generations** — and it costs a
+   per-entry annotation rather than a new representation, because the field was already a map keyed by
+   ref: each entry now carries **its own** `attemptedSequence` and `attemptedGitIncomingKey`, and arming
+   **merges** instead of replacing (§3.2c amendment 2). v9's stated reason for refusing generations —
+   "an unreconciled attempt is exactly the state in which this repository should not be publishing
+   another omission" — was the error: the publication that *clears* a survivor is an **assertion**, not
+   an omission.
+2. **The per-entry clear is respecified against the inputs the ACK site actually holds, with a
+   positive-assertion guard.** Round 8 enumerated the site (`push.ts:942-1009`) and neither of v9's
+   claimed inputs is there: no `live.refs` reaches `GitPushPlan` (ordinary capture folds the strict read
+   into the section's own `refs`), and `stateGit` (`:944`) is `gitBaseAfterCommit`'s **requested**
+   candidate, not the composed BASE — `composeRepoBase` runs later and twice
+   (`sync-state.ts:221-229`, `sync-state-store.ts:165-180`). Worse, v9's literal expression is true when
+   **both sides omit the ref**, which clears an entry against an absent ref and re-exposes the round-6
+   destructive race. So condition 3 becomes an **affirmative** assertion bound to the capture observation
+   (`gitPlan.captured` membership + a positive well-formed `refs[ref]` + `refScope === "all"`), and
+   condition 1 **moves to the composition boundary** where the persisted composed BASE exists
+   (§3.2c amendment 3).
+3. **Step D gains an active-BASE gate and a real `deletion-pending` producer.** `repoAbsent` /
+   `removedKey` retain `record.base` as a hidden provenance anchor while suppressing it from the
+   projection (`sync-state-model.ts:455-458`), so a re-add after an identity change can reach step D
+   with `base[rel]` **and** `pending[rel]` absent and no type-correct fallback — the gate makes the
+   `pending[rel] ?? base[rel]` fallback total and names the outcome (the section **stays absent**;
+   §3.2b). And §5.2's `deletion-pending` producer is the *apply* lane, while step D is in the *push*
+   lane: `captureReason` (`plan.ts:224-232`) is a regex classifier with no such arm, so an exact
+   `"deletion-pending"` detail became `other` and anything containing *capture* became `artifact`. Step D
+   now mints a **typed** reason through the deferral channel's existing per-item tagging seam (§3.2b,
+   §5.2's new inventory row).
+
+Plus round 8's minor: every non-normative summary that still called step D's replacement "today's
+`deferOne`" now says **the existing per-repository carry machinery** and names `revertCapture` first
+(header item 1 below, §6's cost row, §13.8's B1 and M1). **v10 introduces no new UNVERIFIED claim**, and
+§13.9 records both places where round 8 offered options and v10 chose one.
+
+*v9's header, kept for the record.* **v9 replaces the two auxiliaries v8 added; it does not touch v7's
 core.** Codex rounds 6 and 7 (`REVIEW-200-R6-CODEX.md`, `REVIEW-200-R7-CODEX.md`, both kept beside
 this file) **validated the re-frame twice**: no stale-ACK or replay path through the ACK's six checks,
 Git 2.46's `verify R <zero-oid>` means exactly what step L needs, a bare omission really is
@@ -14,9 +67,12 @@ primitive, v9 **replaces one and rebuilds the other's lifecycle out of parts tha
    basis-fallback or recompacted section could assert a tip its own `packChain` could not reach
    (round-7 B1). It is not repairable by feeding the tip into capture either: **R4 keeps no pin on the
    deleting device**, so after `git gc` the object may not exist locally at all. Instead, when any
-   witnessed-absent head lacks a passing L proof, **the repository's capture defers wholesale for that
-   cycle** through today's `deferOne` (`plan.ts:533-551`), carrying the last synced section — whose
-   pack links the wire has already carried, and which still asserts `R = X`, so no follower prunes.
+   witnessed-absent head lacks a passing L proof **and the repository's projected BASE is active**
+   (v10's gate, round-8 major 2), **the repository's capture defers wholesale for that cycle** through
+   **the existing per-repository carry machinery** — `revertCapture` (`plan.ts:174-183`) after a
+   committed capture, or `deferOne` (`:533-551`) if W/L are hoisted ahead of it — carrying the last
+   synced section, whose pack links the wire has already carried and which still asserts `R = X`, so no
+   follower prunes.
    **The cost is one sync cycle of Git-plane latency per refusal, stated in §3.2b, priced in §6, and
    pinned by a named test**; §9.4's per-ref-independence AC is amended rather than quietly dropped, and
    a *standing* refusal makes that carry standing — a new named residual, §13.4 item 10.
@@ -28,9 +84,11 @@ primitive, v9 **replaces one and rebuilds the other's lifecycle out of parts tha
 3. **§12 C3 stays TAKEN; its lifecycle is rebuilt on round 7's own prescriptions** (§3.2c). All three
    of v8's transitions failed: the drop test was true in the state it had to protect (B3), a second arm
    overwrote the first (B4), and an unrelated ACK cleared a still-advertising omission (B5). v9 tests
-   drop condition 2 against the **authenticated head sequence**, reconciles at push entry and **refuses
-   to arm over a survivor**, and clears **per entry from post-ACK state** — three orderings copied from
-   `resolutionReceipt`'s own lane. **The wire-authorship alternative was tried and rejected on code**
+   drop condition 2 against the **authenticated head sequence**, reconciles at push entry, and clears
+   **per entry from post-ACK state** — orderings copied from `resolutionReceipt`'s own lane. *(v9 also
+   said "refuses to arm over a survivor"; **v10 withdraws that clause and merges instead** — round-8
+   blocker 1, item 1 of the v10 header. And v9's per-entry clear predicate is **respecified** in v10 —
+   round-8 blocker 2 and major 1.)* **The wire-authorship alternative was tried and rejected on code**
    (§8 item 14): `deviceId` is signed and unforgeable but cannot attribute a *tombstone*, and no durable
    floor exists for "my unacknowledged publication".
 4. **Case (b)'s exit is respecified against the binary, for the third time and this time against HEAD**
@@ -43,14 +101,17 @@ primitive, v9 **replaces one and rebuilds the other's lifecycle out of parts tha
    five tests, four of them missed by v8's five-site table, and one — the API's 17-element cap fixture —
    that round 7 did not name either. **The kill-switch rollback contract is restated for the last time
    and made true**: off restores the pre-200 binary *exactly*, unproven-omission author included, and
-   §9.5's "still carried, never omitted" row is withdrawn (§11).
+   §9.5's "still carried, never omitted" row is withdrawn (§11). *(v10 adds the **fifteenth** site round
+   8 found: step D's own **capture-lane** producer, which needs a typed reason because `captureReason`
+   would classify it `other` or `artifact` — round-8 major 3.)*
 
 Plus round 7's three minors folded in place: invariant 1's strength (held, not published; origins are
 retained, never re-minted, at an unchanged OID), the status-order rationale (`gitDeferralReasonPrecedence`
 selects the displayed lane, it is not only an age tie-break) with a repair line that no longer promises
 self-clearance, and invariant 11's honest verb (C3 enables no *destructive or authority-granting* path;
-it does enable a conservative one). **One claim in v9 is marked UNVERIFIED rather than asserted** and is
-named in §13.8.
+it does enable a conservative one). ~~**One claim in v9 is marked UNVERIFIED rather than asserted**~~ —
+**that claim is CLOSED as VERIFIED by round 8 and the trace is folded into §3.2c amendment 1 and
+§13.8**; **v10 carries no UNVERIFIED claim.**
 
 *v8's header, kept for the record.* v8 was a convergence round on v7's shape that closed round 6's four
 wiring findings: step G's outgoing representation for an unproven absence, §12 C3's TAKEN persisted
@@ -135,15 +196,22 @@ smaller than the machinery it replaces:
    predicate latched **indefinitely** and *authorized* destruction; C3's withholds it (§13.4 item 8).
    **v9 rebuilds that field's lifecycle** on round 7's prescriptions and leaves **one** sub-case
    standing: a re-creation of the **current branch** holds until a checkout move or `keep-mine`
-   (§3.2c termination). The ref is safe; the deletion is what may need repeating.
+   (§3.2c termination). The ref is safe; the deletion is what may need repeating. **v10 keeps that as the
+   *only* standing sub-case, which is what round 8 falsified for v9**: v9's survivor rule added a second,
+   undisclosed, permanent one for **non-current** refs, and amendment 2's merge removes it rather than
+   disclosing it (§3.2c amendment 2, §13.9 blocker 1). The current-branch case remains the single named
+   residual here.
 4. **An absence rbox cannot prove costs that repository's Git plane a cycle — or a standing carry.**
    New in v9. Step D defers the whole repository's capture when any witnessed-absent head lacks a
-   locked proof (§3.2b), because there is no per-ref outgoing representation whose bundle can cover the
-   deleted tip. Transient refusals (lock contention, a HEAD move, a busy repository) cost one cycle;
-   **standing** refusals (no usable origin, a stale owning A, an unborn-branch HEAD, a non-clearing
-   ref-database signal) keep that repository carrying its last synced section until the cause goes.
-   The file plane is untouched, nothing is destroyed anywhere, and it is reported under
-   `deletion-pending` (§13.4 item 10). The honest fix for the class is design 201.
+   locked proof **and that repository's projected BASE is active** (§3.2b; the gate is v10's, round-8
+   major 2 — a *hidden* BASE anchor takes no defer and publishes no section at all), because there is no
+   per-ref outgoing representation whose bundle can cover the deleted tip. Transient refusals (lock
+   contention, a HEAD move, a busy repository) cost one cycle; **standing** refusals (no usable origin, a
+   stale owning A, an unborn-branch HEAD, a non-clearing ref-database signal) keep that repository
+   carrying its last synced section until the cause goes. The file plane is untouched, nothing is
+   destroyed anywhere, and it is reported under `deletion-pending` — through a **typed** capture-lane
+   reason as of v10, because the regex classifier would have shown `other` or `artifact` instead
+   (round-8 major 3; §13.4 item 10). The honest fix for the class is design 201.
 
 **Earlier revisions, compressed — §12 (rulings) and §13 (review record) are authoritative.**
 *v6:* replaced A″'s `advertised` conjunct with a durable omission intent, gave the omission
@@ -731,7 +799,7 @@ be *fresh*, and it is taken in the same push that publishes the omission.
 |---|---|---|
 | **W** — witness | plan, before the candidate is finalized | Evaluate §3.3's nine rules for every `R` where `record.base.refs[R] = X` is positive and `R` is absent from the capture's own **strict** ref read (§3.3a, `capture.ts:259`). O(1) per BASE head against a map the capture already read; **zero new Git subprocesses** in the negative case. |
 | **L** — locked proof | plan, immediately after W, once per witnessed ref | One prepared **verify-only** ref transaction — `verify R 0000…0` plus `reserveNonRacingHead`'s HEAD line (`branch-transition.ts:72-91`) — that writes **no artifact and commits no mutation**. Success under `R.lock` is the locked absence proof (§3.3 rule 6). Any refusal — ref present, lock held by another Git process, HEAD moved, transaction error — drops `R` from the **proven** set, and step D below then defers that whole repository's capture for the cycle. **The lock's lifetime is the transaction, and the transaction ends at `commit`** — well before T, POST and K. That is Git 2.46's contract (`prepare` creates the locks, `commit` releases them) and it is what round 6 verified; §3.6 case (d) states the resulting L-to-K window as an accepted one-cycle window rather than claiming a lock that is not held. |
-| **D** — defer | plan, after L, in the same pass that decides this repository's outgoing section | **New in v9 (round-7 blocker 1), replacing v8's step G.** If **any** `refs/heads/*` ref of this repository has `record.base.refs[R]` positive, is absent from the capture's strict read, has an effective capture `refScope` of `all`, and has **no** passing L proof, the repository's capture is **deferred wholesale for this cycle** and its last synced section is carried — today's per-repository defer primitive (`revertCapture`, `plan.ts:174-183`, or `deferOne`, `:533-551`, if W/L are hoisted ahead of the capture; §3.2b picks the property, not the helper). Per-repository, not per-ref; §9.4's per-ref-independence AC is amended accordingly and the latency is stated in §3.2b. |
+| **D** — defer | plan, after L, in the same pass that decides this repository's outgoing section | **New in v9 (round-7 blocker 1), replacing v8's step G; gated and given a typed reason in v10 (round-8 major 2 and 3).** If **any** `refs/heads/*` ref of this repository has `record.base.refs[R]` positive, is absent from the capture's strict read, has an effective capture `refScope` of `all`, and has **no** passing L proof — **and the repository's projected BASE is active** (`record.repoAbsent !== true && record.removedKey === undefined`, `sync-state-model.ts:455-458`) **and it is not itself being retired this pass** — the repository's capture is **deferred wholesale for this cycle** and its last synced section is carried, through the existing per-repository carry machinery (`revertCapture`, `plan.ts:174-183`, or `deferOne`, `:533-551`, if W/L are hoisted ahead of the capture; §3.2b picks the property, not the helper). When the gate is false the repository's section simply **stays absent** — a hidden provenance anchor is never resurrected. The defer records a **typed** `deletion-pending` capture deferral rather than a regex-classified string (§3.2b, `plan.ts:224-232`). Per-repository, not per-ref; §9.4's per-ref-independence AC is amended accordingly and the latency is stated in §3.2b. |
 | **T** — tombstone | `normalizePublishedGitSection` | For a ref with a passing L proof the candidate omits `R` by construction, because capture reads live refs. The normalizer authors one tombstone at **exactly** `X` (below) from the locked-proof map. The pre-existing advertised-diff loop (`publisher-tombstones.ts:108-122`) remains a **second** author of deletion tombstones, and v9 stops claiming otherwise — §3.2b states the one case it authors and why that case is correct. |
 | **K** — acknowledgement | the push's ACK state CAS (`push.ts:955-1005`) | `composeRepoBase` retires `BASE[R]` under `publisher-ack`, from the proof carried in the same packet — the same CAS, the same authority and the same crash story as every other ref that section advertised. A ref that only step D's carried section asserts is not part of `absentBranchProofs` at all, so its ACK is a no-op for it: BASE keeps `X` and **retains its prior origin verbatim** — `publisher-ack` mints a new origin only when `requested !== before` (`base-composer.ts:363-367`) and the shared tail re-uses `priorOrigin` when `before === after` (`base-composer.ts:457-461`), which is also why a re-assertion cannot launder a `pull-p` origin into a `publisher-ack` one (round-7 minor 1). |
 
@@ -853,10 +921,50 @@ all**, and v9 says so before proposing anything:
 is the whole-repository answer, and it is today's answer for every other repository that cannot be
 captured safely right now:
 
-> For a repository whose effective capture `refScope` is `all`: if **any** `refs/heads/*` ref `R`
-> has `record.base.refs[R]` positive, is absent from this capture's strict ref read (§3.3a), and
-> has **no** passing step-L proof, the repository's capture is **deferred for this cycle** and its
-> last synced section is carried.
+> For a repository whose effective capture `refScope` is `all` **and whose projected BASE is active**:
+> if **any** `refs/heads/*` ref `R` has `record.base.refs[R]` positive, is absent from this capture's
+> strict ref read (§3.3a), and has **no** passing step-L proof, the repository's capture is **deferred
+> for this cycle** and its last synced section is carried.
+
+**The active-BASE gate, and why a positive `record.base.refs[R]` does not imply a carriable section
+(round-8 major 2).** v9 argued that `pending[rel] ?? base[rel]` is total because the trigger requires
+`record.base.refs[R]` positive. The state model deliberately makes that implication false:
+
+- `RepoRecord.repoAbsent` and `removedKey` **retain `record.base` as a non-authoritative provenance
+  anchor while hiding it from the projection** — `stateFromRepoRecords` builds
+  `state.lastSyncedManifest.gitRepos` from `record.repoAbsent !== true && record.removedKey === undefined
+  ? record.base : undefined` (`sync-state-model.ts:455-458`), and `base` in the planner *is* that
+  projection (`plan.ts:141`). So `record.base.refs[R]` can be positive while `base[rel]` is absent.
+- A remote repository removal with a surviving local `.git` produces exactly that shape: apply drops the
+  projected section, preserves BASE under **carry** authority, and records `removedKey`
+  (`apply.ts:691-718` — `delete applied[rel]`, `repoProofs[rel] = carryRepoBaseProof(...)`,
+  `removedMem[rel] = …`). `pending[rel]` is deleted in the same arm (`apply.ts:702`).
+- If that leftover later changes identity, the push planner clears the removal memory and captures it as
+  a **re-add** (`plan.ts:599-604`). At that moment `record.base.refs[R]` may be positive with `base[rel]`
+  **and** `pending[rel]` both absent — so v9's fallback is `undefined`, `revertCapture`'s `fallback:
+  GitSection` parameter is not optional (`plan.ts:174`), treating `undefined` as an outgoing section
+  fails normalization, and resurrecting the hidden anchor would contradict the very suppression that
+  hid it.
+
+**So the gate is part of the trigger, and the hidden-anchor disposition is named rather than left to the
+fallback.** Step D applies only when the repository's BASE is *active* — equivalently
+`state.lastSyncedManifest.gitRepos[rel] !== undefined`, i.e. `record.repoAbsent !== true &&
+record.removedKey === undefined` — **and** the repository is not itself being retired in this same pass
+(`plan.ts:813-817` drops the section and sets `repoAbsent[rel]` when the directory is gone; the
+removal-memory arm at `plan.ts:599-604` returns before any capture when the identity still matches).
+When the gate is false:
+
+> **The repository's section stays absent.** No defer, no carry, no `revertCapture` call. That is
+> already the correct wire outcome and it destroys nothing: a hidden anchor asserts nothing on the wire
+> (the removal has been applied, so the wire has no section for `rel`), the outgoing map has no entry
+> for `rel`, so `normalizeOutgoingGitSections` never iterates it (`publisher-tombstones.ts:180-193`) and
+> **no tombstone is authored for `R` or for anything else**. A deferred re-add publishes on a later
+> cycle exactly as an undeferred re-add would.
+
+This makes the fallback `pending[rel] ?? base[rel]` **total** by the gate rather than by assumption, and
+it is the property §9.1's re-add row asserts. Note that the gate is a strict narrowing: it can only
+*reduce* the set of repositories that defer, and every repository it excludes was already publishing no
+section for `R`, so it cannot re-open round-7 blocker 1.
 
 **Which helper, and why the answer is probably not `deferOne` — stated because getting it wrong is a
 silent bookkeeping bug.** The two per-repository primitives differ in exactly the places that matter
@@ -921,6 +1029,44 @@ if (candidate.refs[ref] === priorOid) continue;                 // publisher-tom
 
 **No deletion tombstone is authored, with zero normalizer change.** That is the part v8 needed a
 new refusal rule for, and step D gets it by construction.
+
+**Step D's own deferral reason needs a producer, because the capture lane classifies by regex
+(round-8 major 3).** §5.2 specifies `deletion-pending` and §13.4 item 10 promises the standing-refusal
+residual is *reported* under it — but §5.2's producer is the **apply**-lane hold (`follow.ts:717-767`,
+`:1030-1037`), and step D lives in the **push** lane. Round 8 traced what v9's free-form reason string
+actually becomes:
+
+- `revertCapture` / `deferOne` record `deferred.push({ relPath, reason })` — a **string**
+  (`plan.ts:159`, `:182`, `:540`, `:550`).
+- `plan()` classifies every non-config item with `captureReason(item.reason)` (`plan.ts:224-232`,
+  applied at `:275-278`), whose arms are ordered regexes ending in `return "other"`.
+- There is no `deletion-pending` arm. An exact `"deletion-pending"` detail falls through to **`other`**;
+  worse, any natural phrasing containing the word *capture* — "deletion capture deferred", which is what
+  a reason line for this condition wants to say — matches `/capture|artifact|blob|decrypt|import|bundle/`
+  and is classified **`artifact`**. Both are the wrong sentence: the user is told rbox had an artifact
+  problem, or an unclassified one, rather than that rbox is finishing a branch they deleted.
+
+**The decision: step D mints its reason as a typed value, through the deferral channel's own existing
+metadata plumbing.** `deferred`'s items are already tagged out-of-band **by object identity** for the
+config lane — `configLaneDefers` and `configLaneItems` are `Set<(typeof deferred)[number]>`
+(`plan.ts:160-161`) consulted before `captureReason` runs (`plan.ts:275-278`). v10 uses the same seam
+rather than a new one:
+
+> The deferral item gains an optional typed reason —
+> `deferred: Array<{ relPath: string; reason: string; typedReason?: GitDeferralReason }>` — and
+> `plan()`'s classification becomes
+> `captureDeferrals[item.relPath] = item.typedReason ?? captureReason(item.reason)`. Step D's call passes
+> `typedReason: "deletion-pending"` explicitly; every existing producer is unchanged and keeps its regex
+> classification. `revertCapture` (`plan.ts:174-183`) and `deferOne` (`:533-551`) each take the optional
+> reason through to the item they push.
+
+An exact non-regex arm at the top of `captureReason` (`if (reason === "deletion-pending") return
+"deletion-pending";`) is an acceptable alternative **only** if it is placed before the `artifact` arm and
+the reason string is exactly that literal — but it makes the human-readable detail line and the machine
+classification the same string, which is why the typed field is the specified form: the log line
+`git-sync deferred <rel>: finishing a branch deletion rbox could not prove (…)` and the enum stay
+independent. §5.2's inventory gains this producer as a row, and §9.1 asserts it on the **capture** lane
+(the apply-lane `FollowProgress.blockers` test does not cover it).
 
 **One consequence about `refScope`, verified, because it removes the largest permanent class.**
 The trigger is gated on `refScope === "all"` and that gate is not decoration: an omission inside a
@@ -1098,28 +1244,43 @@ which is minted in the push's pre-POST state save, survives a lost ACK, and is r
 the head (`push.ts:785-820`, reconciler `pull.ts:174-200`).
 
 ```ts
-/** Local-only, one per repository. Minted in the push's existing pre-POST state save
- *  (`push.ts:785-820`) whenever the candidate omits at least one proven branch; finished
- *  by the same terminal outcomes that finish `resolutionReceipt`, and dropped per entry
- *  from post-ACK state. Its ONLY effect is to make the named (ref, priorOid) pairs
- *  UNTOUCHABLE in both lanes. It authorizes nothing, anywhere. */
+/** Local-only, one per repository. Entries are minted in the push's existing pre-POST
+ *  state save (`push.ts:785-820`) whenever the candidate omits at least one proven
+ *  branch; each entry is finished by the same terminal outcomes that finish
+ *  `resolutionReceipt`, and dropped per entry from post-ACK state. Its ONLY effect is to
+ *  make the named (ref, priorOid) pairs UNTOUCHABLE in both lanes. It authorizes nothing,
+ *  anywhere.
+ *
+ *  v10 (round-8 blocker 1): each entry carries ITS OWN attempt slot. v9 hoisted
+ *  `attemptedSequence` / `attemptedGitIncomingKey` to the record and refused to arm a
+ *  second time over a survivor, which latched the repository permanently — see amendment 2. */
 export interface GitAbsencePublicationAttempt {
-  /** gitIncomingKey of the omitting candidate this push sent. */
-  attemptedGitIncomingKey: string;
-  /** parentSequence + 1 — the sequence the omission occupies if it is accepted. */
+  /** ref → the one outstanding attempt protecting that ref. One entry per ref. */
+  omitted: Readonly<Record<string, GitAbsenceAttemptEntry>>;
+}
+
+export interface GitAbsenceAttemptEntry {
+  /** The exact BASE value step L proved absent — the value the tombstone names. */
+  priorOid: string;
+  /** parentSequence + 1 for the push that armed THIS entry: the sequence the omission
+   *  occupies if it is accepted. Monotone per entry; an arm may raise it, never lower it. */
   attemptedSequence: number;
-  /** The exact locked-proof map that push handed to T, the dry run and the ACK. */
-  omitted: Readonly<Record<string, string>>;   // ref → priorOid
+  /** gitIncomingKey of the omitting candidate that push sent. */
+  attemptedGitIncomingKey: string;
 }
 ```
 
 - **On `RepoRecord`**: `absencePublicationAttempt?: GitAbsencePublicationAttempt`, beside
   `resolutionReceipt` (`sync-state-model.ts:280-283`, `:310`).
-- **State-source lane**: `values.absencePublicationAttempt?: Record<string, GitAbsencePublicationAttempt | null>`,
-  mirroring `resolutionReceipt` exactly — the merge arm at `sync-state.ts:251-253`, the observed-repo
-  key union at `:376` and `:558`, and the dirty test at `:563-570`. This is the lane round-5 M1 said
-  a per-ref transition field needs, obtained by copying the one that already has it rather than
-  inventing recompute-merge semantics.
+- **State-source lane**: `values.absencePublicationAttempt?: Record<string, GitAbsenceAttemptUpdate | null>`,
+  homed exactly where `resolutionReceipt`'s lane is — the per-repository arm at
+  `sync-state.ts:251-253`, the observed-repo key union at `:376` and `:558`, and the dirty test at
+  `:563-570`. This is the lane round-5 M1 said a per-ref transition field needs, obtained by copying
+  the one that already has it. **v10 changes the lane's payload from a replacement value to a merge
+  instruction** — `null` clears the whole field, otherwise `{ arm?: Record<string,
+  GitAbsenceAttemptEntry>; clearAsserted?: string[] }` — because round-8 major 1 showed the caller
+  cannot precompute the result: drop condition 1 needs the *composed* BASE, which does not exist until
+  `composeRepoBase` runs inside the save (amendment 3).
 - **Arm**: inside the existing `beforeCommitSend` callback, in the *same* save that already arms a
   keep-mine receipt, under the same repo-generation CAS, with the same rule that no failure-capable
   work follows the durable arm before the POST (`push.ts:785-820`).
@@ -1134,18 +1295,24 @@ at `N` with `attemptedSequence = N + 1`, and a landed POST whose ACK save is los
   **signed** head sequence — `verifiedHead` binds to `parseCommit(head).seq` and refuses a server
   that pairs a valid commit with a different number (`e2ee-remote.ts:474-478`), and `pull()` already
   destructures it as `sequence` (`pull.ts:89-95`).
-- **Drop condition 2 becomes**: `headSequence < attemptedSequence` — no head has ever occupied the
-  attempt's slot, so the POST provably did not land.
+- **Drop condition 2 becomes**: `headSequence < entry.attemptedSequence` — no head has ever occupied
+  that entry's slot, so its POST provably did not land.
 - **Ordering is part of the condition, not an implementation note.** The reconciliation must run
   before the tombstone transition is planned, so the apply lane reads an already-reconciled entry.
-  The plumb exists: `pull.ts` has `sequence` at `:89-95` and already passes `sourceGlobalSeq` into
-  `applyGitSections` (consumed at `apply.ts:1314`), which is the same value; `applyGitSections`'
-  options bag is `apply.ts:291-317`. **UNVERIFIED:** whether `opts.sourceGlobalSeq` is always the
-  signed head sequence on every entry point into `applyGitSections` (rather than
-  `state.lastSyncedSequence`, its fallback at `apply.ts:1314`) was not traced for all callers; if it
-  is not, the reconciliation takes the signed sequence as its own parameter rather than reusing that
-  one.
-- `headSequence >= attemptedSequence` does **not** prove our commit occupied the slot — a peer may
+- **The plumb is exact, and v10 records the closed trace that v9 flagged UNVERIFIED (§13.8, round-8
+  fresh-eyes item 5).** `applyGitSections`' only non-test caller is `applyPulledManifest`, which always
+  passes `sourceGlobalSeq: sequence` (`pull.ts:363-372`; options bag at `apply.ts:291-317`, consumed at
+  `apply.ts:1314`). Its three production entry paths all supply an **authenticated** sequence:
+  `pull()`'s `api.latest()` head, which returns `verifiedHead()`'s *signed* seq
+  (`e2ee-remote.ts:132-139` → `:449-481`, where `parseCommit(head).seq` must equal the server's number
+  or the pull refuses); `reconcileResolutionReceipt`'s `head.sequence`, which is that same value
+  (`pull.ts:184-193`); and `chain-repair.ts:52-60`'s `manifestAtSeq(seq)`, whose target is verified
+  through `verifyHistorySegment` against the verified head's hash (`e2ee-remote.ts:520-535`). Every call
+  that omits the option is a test. **So `opts.sourceGlobalSeq` IS the signed sequence in production and
+  `state.lastSyncedSequence` is dead as a fallback there** — but the reconciliation still takes the
+  signed sequence as a **required** parameter rather than inheriting the optional one, because a
+  required parameter cannot silently acquire a fourth caller with weaker provenance.
+- `headSequence >= entry.attemptedSequence` does **not** prove our commit occupied the slot — a peer may
   have taken it while our POST lost the CAS. That direction is safe: the entry stands, withholds
   non-destructively, and is dropped by condition 1 or 3. It is also narrowed by amendment 1b.
 
@@ -1158,25 +1325,116 @@ already distinguishes the outcomes and already finishes its receipt on the negat
 (`:828-838`). The attempt takes the identical treatment. What remains armed afterwards is only the
 genuinely uncertain set, which is what makes conditions 1–3 a lifecycle rather than a latch.
 
-**Amendment 2 — one outstanding attempt per repository, reconciled before the next arm
-(round-7 blocker 4).** v8 replaced the field blindly, so `arm(R) → lose ACK → re-create R → arm(S)`
-overwrote the entry that was protecting `R`, and a 409 on the second attempt then pulled the first
-attempt's accepted omission with no protection left (`push.ts:272`, `:790-819`, `:827-838`,
-`:853-899`). Push startup reconciles only `resolutionReceipt` and no C3 reconciliation preceded the
-second arm. The amendment is the ordering `resolutionReceipt` already has:
+**Amendment 2 — one outstanding attempt per *ref*, merged and never overwritten. The survivor defer
+is WITHDRAWN (round-7 blocker 4, respecified in v10 for round-8 blocker 1).** v8 replaced the field
+blindly, so `arm(R) → lose ACK → re-create R → arm(S)` overwrote the entry that was protecting `R`,
+and a 409 on the second attempt then pulled the first attempt's accepted omission with no protection
+left (`push.ts:272`, `:790-819`, `:827-838`, `:853-899`). Push startup reconciles only
+`resolutionReceipt` and no C3 reconciliation preceded the second arm.
+
+**One half of v9's answer survives verbatim and is still required:**
 
 - **Reconcile at push entry**, in the same place the receipt is reconciled
   (`push.ts:272-273` → `pull.ts:174-200`): evaluate conditions 1–3 against the authenticated head
-  and post-ACK state, and remove every entry they drop.
-- **Then refuse to arm over a survivor.** If an attempt still stands for a repository after that
-  reconciliation, the planner does **not** author a new omission for it — that repository's capture
-  takes **step D's defer** for the cycle (the trigger already fires, because the outstanding pairs
-  are withheld from the witnessed set, so those heads have no passing proof). One outstanding
-  attempt per repository, never overwritten, and the same primitive that answers blocker 1 answers
-  the ordering half of blocker 4.
-- Multiple attempt *generations* are deliberately not represented. Round 7 offered both options; the
-  cheaper one is correct here because an unreconciled attempt is exactly the state in which this
-  repository should not be publishing another omission anyway.
+  and post-ACK state, and remove every entry they drop. `reconcileResolutionReceipt` is the exact
+  template, including its `gitIncomingKey(section) === receipt.attemptedGitIncomingKey` head test
+  (`pull.ts:184-189`).
+
+**The other half — "then refuse to arm over a survivor, and let the repository take step D's defer" —
+is withdrawn, because round 8 killed it on two independent counts and both are correct:**
+
+1. **Step D's trigger does not fire for the protected pair, so v9's parenthetical is false.** Step D
+   (§3.2b) requires a `refs/heads/*` ref that BASE holds positive, that is **absent** from the
+   capture's strict read, and that has no passing L proof. In v9's own round-7 B4 fixture `R` is
+   *present* (it was re-created), so `R` is not a step-D candidate at all; `S` is absent but **has** a
+   passing proof. Withholding `R` from the witnessed set does not make `R` absent, so nothing in the
+   repository satisfies D. Without an *additional* survivor gate the second arm overwrites the first,
+   which is round-7 B4 unfixed.
+2. **With that additional survivor gate, the repository latches permanently — and not in the disclosed
+   current-branch shape.** Round 8's trace, reproduced because it is the finding: arm attempt A for
+   `R`, lose the ACK save, re-create non-current `R`, delete a different BASE-positive `S`, push again.
+   Push entry reconciles by fetching and applying the authenticated head exactly as `resolutionReceipt`
+   does (`push.ts:272-273` → `pull.ts:174-200`), which is valid: the entry force-holds `R` while A's
+   accepted omission applies, so BASE keeps `R = priorOid` and the entry survives. Then the survivor
+   gate forces step D, whose carry is `pending[rel]` — the omitting section installed while applying A.
+   From there **every** drop condition is unreachable: the acknowledged section never asserts `R`
+   (condition 3), BASE still holds `priorOid` (condition 1), and the head is at or beyond A's slot
+   (condition 2). `S` stays absent, so every later cycle reaches the same carry. `R` can be
+   **non-current** throughout, so this is not §3.2c's disclosed `checkout -b` residual — it is a new,
+   undisclosed, permanent latch, and round 8 is right that "refuse and carry" is not self-consuming.
+
+**Why no repair inside the one-generation model exists, stated so v11 does not re-propose one.** In the
+state {BASE `R = X`, live `R = X`, wire omits `R` with a tombstone at `X`, `S` deleted and proved} the
+only sections this device may publish are (i) a carry, which asserts both `R` and `S` and therefore
+clears nothing, or (ii) a capture asserting live `R` and omitting `S`, which needs a second attempt
+slot. There is no third option: re-adding `S` at its BASE value is **step G**, withdrawn on bundle
+coverage (§3.2b — `S`'s tip is deleted and may be `git gc`-pruned), and omitting `S` with no attempt
+re-opens round-6 blocker 2 for `S`. The pull lane cannot break the tie either, and this is the specific
+thing v10 checked before choosing: **a pull-lane BASE retirement for a ref that is live locally is
+inexpressible.** `branchProofMatches` requires `locked.liveOid === after`, so an `after === null`
+retirement requires the ref to be genuinely absent (`base-composer.ts:246-258`), and `publisher-ack`
+preserves BASE for any ref the candidate omits unless the ACK carries L's locked proof
+(`base-composer.ts:356-357`). So `composedBase.refs[R]` cannot leave `X` while `R` exists, condition 1
+is unreachable by construction, and the latch is genuinely unbounded rather than "bounded by the next
+pull".
+
+**So v10 takes the first option round 8 named — overlapping attempt generations — and it costs a
+per-entry annotation, not a new representation.** The field is already a *map* keyed by ref
+(`omitted`); v9's mistake was hoisting the attempt's slot and candidate key out of the map onto the
+record, which is what made two live pairs inexpressible. Moving them back in gives every pair its own
+generation:
+
+- **Arming merges, never replaces.** For each `(ref, priorOid)` the push proved, write
+  `omitted[ref] = { priorOid, attemptedSequence, attemptedGitIncomingKey }`. Entries for other refs are
+  untouched. An arm may **raise** an existing entry's `attemptedSequence` (a retry at a later parent)
+  and must never lower it; an arm whose `priorOid` differs from the standing entry's replaces it,
+  because a different value is at stake and condition 1 would have dropped the old entry anyway.
+- **Every drop condition is already per entry** (amendment 3 made condition 3 per `(ref, priorOid)`),
+  so they simply read the entry's own `attemptedSequence` / `attemptedGitIncomingKey` instead of the
+  record's. Condition 2 becomes `headSequence < omitted[ref].attemptedSequence`.
+- **Amendment 1b becomes exact rather than approximate.** A known-negative POST outcome finishes
+  exactly the entries that push armed — the ones whose `attemptedGitIncomingKey` and
+  `attemptedSequence` match that push's candidate and slot — and leaves every older pair standing.
+  Under v9's single record-level attempt this distinction could not be expressed.
+- **No survivor gate exists anywhere in the design.** Step D's trigger is exactly as §3.2b states it,
+  and the planner never consults the attempt field to decide whether to capture. It consults it only to
+  subtract from the witnessed set (a ref that is present again is not witnessed anyway, §3.3 rule 2).
+
+**v9's stated reason for refusing generations is the thing that was wrong.** v9 said "an unreconciled
+attempt is exactly the state in which this repository should not be publishing another omission
+anyway." The publication that *clears* the survivor is an **assertion** of `R`, not another omission —
+and it must be allowed to carry `S`'s newly proved omission in the same section, because `S` would
+otherwise wait forever on a state only `R` can leave. The rule forbade the only self-consuming exit.
+
+**B4's fixture under the merge rule, walked to termination.** Arm A = `{R: {X, N+1, k₁}}`, lose the ACK,
+re-create non-current `R`, delete `S`, push again:
+
+1. Push entry reconciles: head ≥ `N+1` and BASE still holds `R = X`, so A's entry stands and `R` stays
+   force-held. `S` has no entry.
+2. The capture runs — no defer, because no step-D candidate exists (`R` present, `S` proved). It asserts
+   `R` at its live value and omits `S` with a tombstone at `S`'s BASE value.
+3. Pending supersession composes as v9's termination paragraph already derived: `pending[rel]` (A's
+   omitting section) has no `R` entry for the missing-head bail to trip on
+   (`pending-supersession.ts:103-105`), and it *does* assert `S`, which is now absent with a passing
+   proof — P1b row 2 supersedes it.
+4. The arm merges: `omitted = {R: {X, N+1, k₁}, S: {Y, M+1, k₂}}`. Both pairs are protected; neither
+   displaced the other; a 409 recovery pull inside this push still cannot prune `R`.
+5. On the accepted ACK, condition 3 drops `R` (the section affirmatively asserts `R` at the captured
+   live value) and condition 1 drops `S` (the ACK retires `BASE[S]`). The field is gone, the hold is
+   released, and it took **one** cycle.
+
+**The bound, restated for a merged map, because v9's "it is one push's proof map" no longer applies.**
+Two independent bounds, both cheap:
+
+- **Structural.** One entry per ref, and an entry has no effect and is dropped at the next state save
+  once `composedBase.refs[ref] !== priorOid` (condition 1, evaluated at the composition boundary in
+  amendment 3). So the live map is bounded by the `refs/heads/*` members BASE currently holds for that
+  one repository — tens, on the measured fleet shape (~203 heads across 110 repositories, §6).
+- **Explicit and fail-closed.** The map is additionally hard-capped at
+  `MAX_REF_TOMBSTONES_PER_REPO` (`manifest-validate.ts:24`), the same bound the accepted section's own
+  tombstone chains obey. If an arm would exceed it, **do not arm and take step D's defer for that
+  repository this cycle** — fail toward withholding a publication, never toward dropping protection.
+  An unbounded map in a state file is then impossible by construction rather than by argument.
 
 **Amendment 3 — ACK clearing is per entry, from post-ACK state (round-7 blocker 5).** v8 cleared the
 whole field for "every repository whose section this ACK recorded". Round 7's counterexample is real
@@ -1189,26 +1447,96 @@ stated over the state the ACK is about to write, per `(ref, priorOid)`:
 
 > Drop the entry iff **either** the composed post-ACK BASE no longer holds `priorOid` for `ref`
 > (condition 1 — a real retirement or advance landed), **or** the acknowledged section itself asserts
-> `ref` at its live value (condition 3), i.e.
-> `committed.gitRepos[relPath].refs[ref] === live.refs[ref]`.
+> `ref` at its live value (condition 3).
 
-Both inputs are already in the ACK loop's hands: `committed.gitRepos[relPath]` is what the loop reads
-to build the authority (`push.ts:963-980`), and the composed BASE is the composer's own output. In
-round 7's counterexample the acknowledged section is the *pending* section, which **omits** `ref`, so
-`refs[ref]` is `undefined ≠ live` and the entry is correctly **retained**.
+**v10 respecifies both halves, because round 8 verified the ACK call site and v9's rule reads two
+values that are not there, and its literal expression clears on an absence (round-8 blocker 2 and
+major 1).** v9 claimed "both inputs are already in the ACK loop's hands". What the loop at
+`push.ts:942-1009` actually holds is: `committed.gitRepos`; `gitPlan`, including its `captured` /
+`carried` membership and `publisherAckBindings`; the pre-save `ackRecords`
+(`repoRecordsForState(state)`, `push.ts:947`); `pendingAfterAck` (`:942-943`); and `stateGit`
+(`:944`). Neither claimed input is among them:
 
-**The three drop conditions, as amended.** An entry is removed — and the field with its last
-entry — when any of these holds, evaluated at push entry (amendment 2) and in the ACK save
-(amendment 3):
+- **There is no `live.refs`.** Ordinary capture folds the strict ref read (§3.3a) into the `refs` of the
+  `GitSection` it returns (`capture.ts:333-345`); no separate live map is carried on `GitPushPlan`.
+  Resolution capture's own second stability read is a local variable that is discarded before
+  `plan()` returns.
+- **`stateGit` is not the composed BASE.** It is `gitBaseAfterCommit(committed.gitRepos, pendingAfterAck,
+  appliedBase.gitRepos)` (`push.ts:944`) — the *requested* candidate. `composeRepoBase` runs later and
+  **twice**: inside `sourceRecord` on every generation-CAS recomputation (`sync-state.ts:221-229`, retry
+  loop at `:339-356`) and again inside the transactional writer against the then-current previous record
+  (`sync-state-store.ts:165-180`). Precomputing a blanket transition from `stateGit` would decide
+  condition 1 from stale caller state.
 
-1. `composedBase.refs[ref] !== priorOid` — a real retirement landed (a successful ACK, or case (c)'s
-   `pull-ref-transaction` arm) or the ref advanced, so a different value is at stake.
-2. `headSequence < attemptedSequence` — no head has ever occupied the attempt's slot, so the POST
-   provably did not land. This is the **common** failure (offline, quota, 422, a crash before the
-   POST) and it costs nothing. Amendment 1b drops the entry outright for every *known* negative
-   outcome without waiting for this test at all.
-3. The acknowledged section asserts `ref` at its live value. This is the condition that terminates
-   the force-hold, and its termination is re-derived below.
+And v9's executable expression `committed.gitRepos[relPath].refs[ref] === live.refs[ref]` is **also true
+when both sides are absent**, which clears the entry against a ref that is not there. Round 8's trace is
+real: a standing refusal (§3.2b) keeps BASE positive while `R` is absent, step D carries the exact
+omitting pending section, an unrelated file change gets that section acknowledged, `undefined ===
+undefined` clears the entry, and the next local `git branch R X` is exposed to the accepted tombstone
+with live and logical BASE both `X` — the round-6 destructive race C3 exists to close. **JavaScript
+equality over two optional map lookups is not an assertion.** So:
+
+**Condition 3 — affirmative assertion only, and stated over facts the plan already carries.** Drop the
+entry for `ref` at the ACK site iff **all** of:
+
+1. `gitPlan.captured.includes(relPath)` — this ACK recorded a section this device **captured** this
+   cycle, not a carried, pending, BASE or reverted one (`plan.ts:170-172`; the carry arms are
+   `plan.ts:536-543`, `:548-549` and `revertCapture` at `:174-183`, all of which remove `relPath` from
+   `captured`). This is round 8's "bind that assertion to the capture observation" conjunct, and it is
+   what replaces `live.refs`: a captured section's `refs` **are** the strict ref read
+   (`capture.ts:259`, `:333-345`), so a positive entry in it *is* the live value, observed under the
+   same read step W and step L used.
+2. `committed.gitRepos[relPath]` exists and owns a **positive, well-formed** `refs[ref]` —
+   `Object.prototype.hasOwnProperty.call(section.refs, ref)` and the value matches `HEX40`. This is the
+   presence check v9 omitted. `normalizePublishedGitSection` never rewrites `refs`
+   (`publisher-tombstones.ts:165-168` spreads the candidate and replaces only `refTombstones` /
+   `refTombstoneGeneration`), so the acknowledged `refs` are the captured `refs`.
+3. `committed.gitRepos[relPath].refScope === "all"`. A `scoped` section asserts nothing about members
+   outside its scope, and §3.2b's partition means it can never have produced the omission this entry
+   protects.
+4. `gitPlan.absentBranchProofs?.[relPath]?.[ref]` is **absent** — the same push did not also prove
+   `ref` absent. Conjuncts 1 and 2 already exclude this (a proven-absent ref is omitted, not asserted),
+   so this is a redundant guard kept because its failure mode is a destructive clear.
+
+Being stricter than strictly necessary here only **retains** entries longer, which is the safe
+direction (a retained entry withholds; a wrongly dropped one exposes a ref). In round 7's
+counterexample the acknowledged section is the *pending* section reinstated by `revertCapture`
+(`plan.ts:1055`), so `relPath` is not in `captured` and `refs[ref]` is absent — the entry is correctly
+**retained** by conjuncts 1 and 2 independently.
+
+**Condition 1 — evaluated at the composition boundary, never by the caller.** The only place the
+composed BASE that is actually persisted exists is inside the transactional writer, immediately after
+`composeRepoBase` returns and before `records[transition.relPath]` is written
+(`sync-state-store.ts:165-180`). That is where condition 1 belongs:
+
+> After `composed` is computed for `relPath`, drop every entry of that repository's
+> `absencePublicationAttempt` whose `composed.base?.refs[ref] !== entry.priorOid`. If no entry remains,
+> drop the field.
+
+Three consequences that are part of the specification, not notes:
+
+- **It runs on every CAS recomputation for free**, because the writer runs once per accepted packet and
+  `saveStateSource` re-composes the packet on rejection (`sync-state.ts:339-356`). There is no window in
+  which a stale composition decides a drop.
+- **The caller therefore ships an instruction, not a value** — `{ arm, clearAsserted }` — where
+  `clearAsserted` is the set of refs condition 3 decided at the ACK site and `arm` is amendment 2's
+  merge. `sourceRecord` carries it through; the writer applies condition 1 on top. This is the one place
+  the field's lane deviates from `resolutionReceipt`'s value-replacement shape, and the deviation is
+  forced by where the input lives.
+- **The retention arm is the field's protection against a stale source, and it already works.**
+  `sourceRecord` returns the newer record whole when `current.sourceSeq > source.sourceGlobalSeq`
+  (`sync-state.ts:211-216`), so an older source's clear can never erase a newer arm — the same
+  protection `deferrals` gets there. Round 8 asked for exactly this ("preserve the field when a newer
+  record wins the retention arm") and it is inherited rather than added.
+
+**The three drop conditions, as amended.** Every condition is **per entry**; an entry is removed, and
+the field with its last entry, when any of these holds. Each is evaluated where its input exists:
+
+| # | Condition | Where it is evaluated |
+|---|---|---|
+| **1** | `composedBase.refs[ref] !== entry.priorOid` — a real retirement landed (a successful ACK, or case (c)'s `pull-ref-transaction` arm) or the ref advanced, so a different value is at stake | At the composition boundary, `sync-state-store.ts:165-180`, on every accepted packet (amendment 3). Also at push entry, against the record the reconciliation just loaded |
+| **2** | `headSequence < entry.attemptedSequence` — no head has ever occupied **that entry's** slot, so its POST provably did not land. The **common** failure (offline, quota, 422, a crash before the POST), and it costs nothing | At push entry and in the pull's reconciliation, against the pull's signed head sequence (amendment 1). Amendment 1b drops the entries a *known*-negative outcome finished without waiting for this test at all |
+| **3** | The acknowledged section **affirmatively asserts** `ref`, under all four conjuncts of amendment 3. This is the condition that terminates the force-hold, and its termination is re-derived below | At the ACK site, `push.ts:942-1009`, from `gitPlan` + `committed` only (amendment 3) |
 
 **What it does, per lane — and round 6 is why there are two.** Blocker 2's destructive act is *not*
 in the push lane: it is the apply lane consuming **this device's own already-accepted tombstone**
@@ -1220,11 +1548,14 @@ priorOid` still holds:
 |---|---|---|
 | **present** (re-created between L's `commit` and the lost ACK, at `priorOid` or anything else) | **apply** | `ref` is **force-held** through the existing `forcedHeldRefs` seam. The seam is exactly the right shape and already vetoes the destructive path: `FollowOptions.forcedHeldRefs?: GitPartialApply["heldRefs"]` (`follow.ts:171-172`), built in `apply.ts:912-927`, passed at `apply.ts:1347`, consumed at `follow.ts:720-726` **before** the transition loop, and `forcedRefs.has(ref)` is already a disjunct of the tombstone-waiver loop's skip predicate (`follow.ts:778`) — so neither the attestation path nor the owned-tip prune path can touch it. Nothing is destroyed and nothing is created. *(`d2RejectedRefs` → `pendingEvidence` → `tombstone-attestation.ts:113-115` is the same pattern one layer deeper: a locally-derived, per-cycle, non-persisted fact that hard-vetoes tombstone authority for named refs.)* |
 | **present** | push | Nothing to add: §3.3 rule 2 already fails, so W does not witness it. The capture asserts the live value, as it does for any present ref. |
-| **absent**, and the applied head asserts `ref` at or after `attemptedSequence` | **push** | **W does not witness the pair**, so T authors no tombstone and K records no retirement; that head therefore has no passing proof and **step D defers the repository's capture** for the cycle. This is the peer variant of the same race: an assertion exists at or after our slot, and whether it is a newer writer's re-creation or a stale echo of a rejected attempt is the undecidable question §8 item 12 refuses to ask. C1's ruled direction is to fail toward never destroying the other writer's ref. |
+| **absent**, and the applied head asserts `ref` at or after that entry's `attemptedSequence` | **push** | **W does not witness the pair**, so T authors no tombstone and K records no retirement; that head therefore has no passing proof and **step D defers the repository's capture** for the cycle. This is the peer variant of the same race: an assertion exists at or after our slot, and whether it is a newer writer's re-creation or a stale echo of a rejected attempt is the undecidable question §8 item 12 refuses to ask. C1's ruled direction is to fail toward never destroying the other writer's ref. |
 | **absent**, and the POST provably did not land, or a head omits `ref` | — | **Nothing at all.** The entry is dropped (conditions 1–2, or amendment 1b) and v7's behaviour stands unchanged: crash rows 1, 2 and 6 re-publish, and row 3 retires BASE from a head that omits the ref through §3.6 case (c). |
 
-**Termination, re-derived under the amendments (round-7 major 2).** v8 claimed "two cycles, no
-human" for every recreation shape. That is wrong for one of them and the design now separates them:
+**Termination, re-derived under the amendments (round-7 major 2, extended in v10).** v8 claimed "two
+cycles, no human" for every recreation shape. That is wrong for one of them and the design now
+separates them. **The latch test — no entry may be live and unreachable by its three drop conditions
+other than the named current-branch case — is stated at the end of this section and is the property
+round 8 falsified for v9.**
 
 - **Non-current recreation (`git branch R X`) — one cycle.** The pull force-holds `R`. The *same*
   cycle's push captures: `R` is present, so the capture asserts it at its live value; the held ref
@@ -1233,6 +1564,12 @@ human" for every recreation shape. That is wrong for one of them and the design 
   `R` entry to trip on and supersession turns on the other refs alone. The accepted ACK's section
   asserts `R` at its live value ⇒ drop condition 3 ⇒ the entry goes and the hold releases in the
   same state save. Nothing needs a second cycle, and nothing needs a human.
+- **Non-current recreation *plus a second deletion in the same repository* — also one cycle, and this
+  is the case v9 latched (round-8 blocker 1).** With `S` deleted and proved while `R`'s attempt still
+  stands, the capture asserts `R` and omits `S` in one section, amendment 2 **merges** `S`'s pair
+  beside `R`'s instead of displacing it, and the accepted ACK drops `R` by condition 3 and `S` by
+  condition 1 in the same state save. Under v9's survivor rule the same fixture deferred forever
+  because the carried section could never assert `R`; the merge is what makes the exit exist.
 - **Current-branch recreation (`git checkout -b R X`) — it does NOT terminate on its own, and that
   is now stated.** §3.6 case (d) and §12 C3 both name `git checkout -b` as a recreation source, and
   round 7 traced what the forced hold then does: `follow.ts:723-724` sets
@@ -1247,11 +1584,18 @@ human" for every recreation shape. That is wrong for one of them and the design 
   `rbox git resolve <repo> keep-mine`. This is §13.4 item 7's class verbatim: a held ref, a carried
   section, and a named human exit.
 
-**One bound, stated because an unbounded map in a state file is a defect.** `omitted` **is** the
-locked-proof map the same push handed to T, the dry run and the ACK, so it is bounded by the refs one
-push proved, and every entry it can hold is a ref that already has a tombstone entry in the accepted
-section — i.e. bounded by `MAX_REF_TOMBSTONES_PER_REPO` (`manifest-validate.ts:23-24`) by
-construction. No new cap, and no new producer.
+**The latch test, stated as the acceptance criterion it is (round-8 blocker 1).**
+
+> For every reachable state, an entry that is still live is reachable by at least one of drop
+> conditions 1–3 without requiring a publication the design refuses — **except** the disclosed
+> current-branch recreation above.
+
+v9 failed this and v10's amendment 2 is the repair. The proof obligation for any future change to the
+field is exactly this sentence, and it is discharged by showing that the repository can always publish
+a section that **asserts** every live entry-named ref: amendment 2 guarantees that, because the assertion
+is an ordinary capture of a present ref and the merge rule stops a second omission from blocking it.
+The bound is stated in amendment 2 (structural, plus an explicit fail-closed cap at
+`MAX_REF_TOMBSTONES_PER_REPO`, `manifest-validate.ts:24`).
 
 **Why this cannot regrow v6's apparatus, stated as the property rather than as a promise.** v6's
 `owed` predicate, `record.absenceOmission` and its reconciliation table existed to answer *"is the
@@ -2700,7 +3044,8 @@ force anything else in this table.
 | `sync-git/held-skip.ts:37-40` (`heldBlockersAllowSkip`) | not allowlisted ⇒ the sidecar skip is never taken. Over-work, safe; add it |
 | `sync-git/held-skip.ts:57-62` (`causallyMapped`) | pair `deletion-pending` with `missing-branch-proof`, else a spurious composer blocker |
 | `sync-git/apply.ts:749-753` (`heldReasonOf`) | a hand-rolled chain that can never produce the new reason. **Derive it from `progress.blockers`' `ref-plane` entries via `firstReason` over `GIT_DEFERRAL_REASON_RANK`**, falling back to today's chain when that set is empty (all-indeterminate holds carry `provenance: "indeterminate"` instead, `follow.ts:1031`). Behaviour-identical today — the only ref-plane reasons today are `heldReasonOf`'s three and their ranks reproduce its order — and total tomorrow. `FollowProgress` already carries `blockers` as its *"complete classification seam"* (`follow.ts:128-132`) |
-| `sync-git/follow.ts:717-767`, `:1030-1037` | the producer: classify the deletion hold as `deletion-pending` and emit it on the ref-plane blocker while `heldRefs[ref]` persists `local-commits` |
+| `sync-git/follow.ts:717-767`, `:1030-1037` | the **apply-lane** producer: classify the deletion hold as `deletion-pending` and emit it on the ref-plane blocker while `heldRefs[ref]` persists `local-commits` |
+| `sync-git/plan.ts:159`, `:174-183`, `:224-232`, `:275-278`, `:533-551` | **MISSED IN v9 — the capture-lane producer (round-8 major 3).** Step D lives in the push lane, records its defer as a free-form string, and `plan()` classifies it with `captureReason`, whose arms are regexes with no `deletion-pending` member: an exact `"deletion-pending"` detail becomes **`other`** and any detail containing the word *capture* becomes **`artifact`** via `/capture\|artifact\|blob\|decrypt\|import\|bundle/`. So the residual §13.4 item 10 promises to report under `deletion-pending` is displayed as the wrong condition. **Fix:** the deferral item gains `typedReason?: GitDeferralReason`, `plan()` prefers it (`item.typedReason ?? captureReason(item.reason)`), and step D passes `"deletion-pending"` explicitly — the same out-of-band per-item tagging `configLaneDefers` / `configLaneItems` already use by object identity (`plan.ts:160-161`). Needs a **capture-lane** status test; the apply-side `FollowProgress.blockers` test does not cover it |
 | `doctor-cmd.ts:34`, `:107-127` | derived from the tuple, so recognition is automatic; the explicit regex arm above is still required |
 | `daemon/ambient-status.ts:185-198`; `status-view.ts:306-312` | tolerant by design (`isKnownGitDeferralReason`, `UNKNOWN_GIT_DEFERRAL_PRESENTATION`). No change — this is the documented safe-downgrade path |
 | `sync-git/deferral-hygiene.ts:27-44`, `:125-126` | keyed on `GitBusyClassification`, not on `GitDeferralReason`. **Decision: no change** — the lock-doctor hygiene sweep is about lock provenance, and a deletion hold has none |
@@ -2761,7 +3106,7 @@ for one repository. Scale: ~203 branch heads across 110 repositories.
 | P1 step L, the locked absence proof | One prepared verify-only ref transaction per witnessed ref — no artifact, no mutation, no state save. Runs only for a ref that already passed the other eight rules. | Tens of ms, once per deletion, not per cycle. |
 | P1 step K, the ACK retirement | Additional fields on an authority object the ACK already builds (`push.ts:962-975`) and two extra conditions inside `composeRepoBase`, plus one lane cleared in the save that already runs. **No extra state save.** | Zero. |
 | §3.2's witness-backed tombstone | One extra loop over the witnessed refs inside a pure function that already loops over `advertised.refs`. | Zero. |
-| **§3.2b step D, the unproven-absence defer** | One boolean over the same W/L outputs, then today's `deferOne` (`plan.ts:533-551`). No new subprocess, no new state, no new section. | **Zero compute; one sync cycle of Git-plane latency** for that repository whenever a witness or proof refusal occurs, and a standing carry while a *standing* refusal persists (§13.4 item 10). This is the design's one deliberately-bought latency and §3.2b states it rather than amortizing it. |
+| **§3.2b step D, the unproven-absence defer** | One boolean over the same W/L outputs plus the active-BASE gate (two record-field lookups, v10), then **the existing per-repository carry machinery** — `revertCapture` (`plan.ts:174-183`) after a committed capture, or `deferOne` (`:533-551`) if W/L are hoisted ahead of it. No new subprocess, no new state, no new section. | **Zero compute; one sync cycle of Git-plane latency** for that repository whenever a witness or proof refusal occurs, and a standing carry while a *standing* refusal persists (§13.4 item 10). This is the design's one deliberately-bought latency and §3.2b states it rather than amortizing it. |
 | §3.2a's push-side artifact reader | One `scanBaseArtifacts` + `readSettledAbsence` per repository that has a witness candidate *or* an existing pending section — never on the converged path. | Unmeasurable; strictly less than the probe it feeds. |
 | §3.6's apply-side hold | One map entry in a classification pass that already runs. It **removes** work: the throw at `branch-transition.ts:105`, its catch, and the whole-repository defer it caused. | Negative. |
 | §3.3a strict ref read | Same `git show-ref` invocation, different error handling. **Zero additional subprocesses.** | Zero. |
@@ -2780,8 +3125,12 @@ pinned refs), **R5** removed its only recurring transfer cost (P4), and **v7** r
 per-deletion write beyond the ACK itself (v6's armed intent). **v8 buys one of those back,
 deliberately and at a fraction of the size**: §12 C3's attempt record is one field in a state save
 the push already performs, once per deletion, against v6's persisted field *plus* four transitions
-*plus* a reconciliation CAS on the pull path. v1's blanket claim that "net cost is negative" is still
-true for the whole design, which it was not in v3, v4 or v6.
+*plus* a reconciliation CAS on the pull path. **v10 widens that one field's per-ref value by two scalars**
+(each entry carries its own `attemptedSequence` and `attemptedGitIncomingKey` instead of sharing the
+record's, §3.2c amendment 2) — bytes, in a map already bounded by BASE's branch refs and hard-capped at
+`MAX_REF_TOMBSTONES_PER_REPO`; it buys the removal of a permanent latch and costs no additional save, no
+additional subprocess and no additional wire traffic. v1's blanket claim that "net cost is negative" is
+still true for the whole design, which it was not in v3, v4 or v6.
 
 Two things v4 said here are worth keeping as constraints on **design 201**, since they are
 why P4's cost was larger than it looked:
@@ -3178,18 +3527,38 @@ history is needed:
     — assert the entry is **dropped unread** and the omission re-publishes normally. Under v8's
     `record.sourceSeq < attemptedSequence` predicate both rows take branch (ii), so this pair is the
     executable form of the blocker.
-  - **Arm → lose → arm does not overwrite** (round-7 blocker 4). Arm for `R`, lose the ACK, re-create
-    `R`, delete a different `S`, then push again **without** pulling. Assert the second push
-    reconciles first and then **refuses to arm over the survivor** — the repository takes step D's
-    defer rather than replacing the entry — and that a subsequent 409 recovery pull cannot prune `R`.
-    Assert the entry for `R` is still present throughout.
-  - **ACK clearing is per entry, from post-ACK state** (round-7 blocker 5). Arm for `R`; make the
-    final pending-supersession proof fail on an unrelated ref so `revertCapture` reinstates the exact
-    pending section (`plan.ts:1055`); let that section be accepted. Assert the entry for `R` is
-    **retained**, because the acknowledged section omits `R` so `committed.gitRepos[rel].refs[R]` is
-    `undefined ≠ live.refs[R]` and composed BASE still holds `priorOid`. Then the positive twin: an
-    acknowledged section that asserts `R` at its live value drops exactly that entry and leaves any
-    other entry standing.
+  - **Arm → lose → arm MERGES, and the repository does not latch** (round-7 blocker 4, respecified for
+    round-8 blocker 1). Arm for `R`, lose the ACK, re-create **non-current** `R`, delete a different
+    BASE-positive `S`, then push again **without** a separate pull. Assert, in order: push entry
+    reconciles by fetching and applying the authenticated head (`push.ts:272-273` → `pull.ts:174-200`)
+    and `R`'s entry **survives** it (BASE still holds `priorOid`, head ≥ its slot); the repository is
+    **not** deferred (no step-D candidate exists — `R` is present, `S` is proved); the capture asserts
+    `R` at its live value and omits `S` with a tombstone at `S`'s BASE value; `omitted` now holds
+    **both** pairs with their **own** `attemptedSequence` values and neither displaced the other; a
+    409 recovery pull inside that push still cannot prune `R`; and the accepted ACK drops `R` by
+    condition 3 and `S` by condition 1 in **one** state save. **Then the latch regression bar, which is
+    the executable form of round-8 blocker 1:** run the identical fixture against v9's rule (refuse to
+    arm over a survivor ⇒ step D defers) and assert it never clears — the carried section omits `R`
+    forever. Name that row for the finding
+    (`…_survivor_defer_latches_the_repository_round8_blocker1`) so the day someone re-proposes a single
+    record-level attempt the test is what they have to argue with.
+  - **ACK clearing is per entry, positive-assertion-only, from the inputs the ACK site holds**
+    (round-7 blocker 5; respecified for round-8 blocker 2 and major 1). Arm for `R`; make the final
+    pending-supersession proof fail on an unrelated ref so `revertCapture` reinstates the exact pending
+    section (`plan.ts:1055`); let that section be accepted. Assert the entry for `R` is **retained**,
+    and assert it is retained for **each** conjunct independently: `relPath` is not in
+    `gitPlan.captured` (`revertCapture` splices it out, `plan.ts:179-180`), and
+    `committed.gitRepos[rel].refs[R]` has no positive entry. Then the row that pins the guard v9
+    lacked: **`R` absent locally, BASE positive, step D carrying the omitting pending section, and that
+    section acknowledged** — assert the entry is **retained**, because a bare
+    `committed.gitRepos[rel].refs[R] === live.refs[R]` would evaluate `undefined === undefined` and
+    clear it; then `git branch R X` and assert the re-creation is **not** pruned. Then the positive
+    twin: a **captured** section affirmatively asserting `R` at the captured live value drops exactly
+    that entry and leaves every other entry standing. Two placement assertions complete it: condition 1
+    is evaluated inside the transactional writer after `composeRepoBase` (`sync-state-store.ts:165-180`)
+    — assert that a caller-side `stateGit` (`push.ts:944`, `gitBaseAfterCommit`) that disagrees with the
+    composed result does **not** decide the drop — and a stale source (`current.sourceSeq >
+    source.sourceGlobalSeq`, `sync-state.ts:211-216`) **preserves** a newer arm rather than clearing it.
   - **Peer re-creation at the same OID.** Accept the omission, drop the ACK CAS, deliver a peer
     section re-creating `R` at exactly `X` at a **higher** sequence, then pull. Assert no tombstone is
     re-authored (step W does not witness the pair), that **step D defers the repository's capture**,
@@ -3241,6 +3610,28 @@ history is needed:
     nothing new, records a `deletion-pending` deferral with a repair line that does **not** promise
     self-clearance, and that `take-theirs` clears it while `keep-mine` still refuses. Name it for
     §13.4 item 10.
+  - **The reason is `deletion-pending` on the CAPTURE lane, not `other` and not `artifact`** (round-8
+    major 3). Over the real `planGitSections`, assert `plan().captureDeferrals[rel] ===
+    "deletion-pending"` for a step-D defer, and assert it for a defer whose human-readable detail line
+    **contains the word "capture"** — under `captureReason`'s regex order that detail classifies as
+    `artifact` (`plan.ts:229`), so this row is what proves the typed reason is carried rather than
+    re-derived. Then the surface: `status-view` displays *"finishing a branch deletion"* for that
+    repository, and `firstReason` picks `deletion-pending` over a co-occurring `git-busy` and **under**
+    a co-occurring `local-commits` (§5.2's rank argument). The apply-side `FollowProgress.blockers` test
+    does not cover any of this — assert it on the push lane explicitly.
+  - **The hidden provenance anchor — step D does not apply, and nothing is resurrected** (round-8
+    major 2). Build a repository with `record.base.refs[R]` positive and `removedKey` set (drive it
+    through the real remote-removal arm, `apply.ts:691-718`, so BASE is preserved under carry authority
+    and `pending` is deleted), verify `state.lastSyncedManifest.gitRepos[rel]` is **absent**
+    (`sync-state-model.ts:455-458`), then change the leftover's identity so the planner clears the
+    removal memory and captures it as a re-add (`plan.ts:599-604`), and make `R`'s L proof refuse.
+    Assert: **no** step-D defer; **no** `revertCapture` call with an `undefined` fallback (the
+    type-level statement of the finding); the published outgoing map has **no entry** for `rel`; no
+    tombstone is authored anywhere for `R`; `record.base` is unchanged and is **not** projected back
+    into the manifest. Then the positive control: with `removedKey` and `repoAbsent` both clear, the
+    identical fixture **does** take step D and carries `pending[rel] ?? base[rel]`, which is now total.
+    Run the second half of the gate too: a repository whose directory is genuinely gone takes
+    `plan.ts:813-817`'s removal and **not** step D.
   - **No normalizer refusal exists, and the already-applied omission is not refused.** Hand
     `normalizePublishedGitSection` a candidate that omits a `refs/heads/*` ref present in
     `advertised.refs` with no matching locked proof and assert it **authors the ordinary tombstone at
@@ -3843,7 +4234,7 @@ chooses to lose a *deletion* rather than a *ref*.
 |---|---|---|---|
 | **C1** | When another writer's assertion of a ref races this device's unpublished deletion of it, **fail toward never destroying the other writer's ref**: apply the assertion, do not re-publish the omission (§3.6 rows 5–6, case (b)) | Under R4 the durability contract is file history: a lost deletion is one keystroke to repeat and the content survives regardless, while a destroyed ref is unrecoverable on the Git plane. **v7 makes this cheap where v6 made it expensive** — with no durable owed state, "do not re-publish" is the default rather than a decision that needs evidence | Reversing it (re-assert the deletion on doubt) restores round-4's ABA verbatim. There is no third option that is decidable from local state — §3.6, and v6's two rejected alternatives, now recorded in §13.6 |
 | **C2** | ~~One new local-only persisted field, `record.absenceOmission`~~ — **WITHDRAWN in v7** | v6 needed it to answer *"is this device still the reason the wire says `X`?"*, a question only the early-BASE-retirement window can pose. v7 does not open that window (invariant 11), so the question does not arise and the field has no reader | Re-adding it means re-adding the window, which is what §8 item 12 rejects on five rounds of evidence. The narrower, additive form is C3 |
-| **C3** | ~~Do not add a pre-POST arm to close the lost-ACK-CAS re-creation race~~ — **TAKEN 2026-07-25 (v8), reversing v7's reservation; field lifecycle AMENDED in v9 (round-7 blockers 3–5)** | v7 declined it because the window looked *one pull cycle wide and closed from the wire*, and required a peer to prune, re-create at the identical OID and publish inside that cycle. **Round 6 falsified both halves**: no peer is needed — a purely local `git branch <R> <X>` between step L's `commit` and a lost ACK reaches it — and the reason `checkTombstoneAttestation` refuses in the *post*-ACK version is a **retired logical BASE** (`tombstone-attestation.ts:107-109`), which a lost ACK is precisely the state that lacks. So the shape is an ordinary agent-churn race against an ordinary crash, and it deletes a ref | Reversing it back is a deliberate re-opening of round-6 blocker 2. The shape taken is the narrowest one that closes it: **one** local-only per-repository field, `record.absencePublicationAttempt = { attemptedGitIncomingKey, attemptedSequence, omitted }`, written in the push's **existing** pre-POST state save (`push.ts:799-819`), cleared by the ACK's existing lane pattern and by three local drop conditions, and read **only** to withhold — force-holding the ref in the apply lane, or not witnessing the pair in the push lane. It can neither retire a BASE member nor enable any destructive or authority-granting code path (invariant 11, §3.2c — v9 narrows v8's "any code path", which was literally false: `forcedHeldRefs` is a `routeThroughFollow` disjunct at `apply.ts:1011-1013`), which is why it is not v6's `absenceOmission` with a new name: v6's predicate *authorized* a retirement and latched indefinitely. **v9 keeps C3 TAKEN and rebuilds its lifecycle on round 7's own prescriptions**, because round 7 killed all three of v8's transitions: the drop test is now the **authenticated head sequence** rather than `record.sourceSeq` (B3), the attempt is **reconciled at push entry and never overwritten** — a survivor makes the repository take step D's defer instead of arming a second attempt (B4) — and ACK clearing is **per entry from post-ACK BASE/section/live state** rather than per repository (B5), plus the attempt is finished on every known-negative POST outcome exactly as `resolutionReceipt` already is. The wire-authorship alternative was tried and rejected on code (§8 item 14). Full specification in **§3.2c**; §9.1 has the closed test, the negative control, and one row per amended transition |
+| **C3** | ~~Do not add a pre-POST arm to close the lost-ACK-CAS re-creation race~~ — **TAKEN 2026-07-25 (v8), reversing v7's reservation; field lifecycle AMENDED in v9 (round-7 blockers 3–5) and RE-AMENDED in v10 (round-8 blockers 1–2, major 1)** | v7 declined it because the window looked *one pull cycle wide and closed from the wire*, and required a peer to prune, re-create at the identical OID and publish inside that cycle. **Round 6 falsified both halves**: no peer is needed — a purely local `git branch <R> <X>` between step L's `commit` and a lost ACK reaches it — and the reason `checkTombstoneAttestation` refuses in the *post*-ACK version is a **retired logical BASE** (`tombstone-attestation.ts:107-109`), which a lost ACK is precisely the state that lacks. So the shape is an ordinary agent-churn race against an ordinary crash, and it deletes a ref | Reversing it back is a deliberate re-opening of round-6 blocker 2. The shape taken is the narrowest one that closes it: **one** local-only per-repository field, `record.absencePublicationAttempt = { omitted: Record<ref, { priorOid, attemptedSequence, attemptedGitIncomingKey }> }`, written in the push's **existing** pre-POST state save (`push.ts:799-819`), cleared by the ACK's existing lane pattern and by three local drop conditions, and read **only** to withhold — force-holding the ref in the apply lane, or not witnessing the pair in the push lane. It can neither retire a BASE member nor enable any destructive or authority-granting code path (invariant 11, §3.2c — v9 narrows v8's "any code path", which was literally false: `forcedHeldRefs` is a `routeThroughFollow` disjunct at `apply.ts:1011-1013`), which is why it is not v6's `absenceOmission` with a new name: v6's predicate *authorized* a retirement and latched indefinitely. **v9 keeps C3 TAKEN and rebuilds its lifecycle on round 7's own prescriptions**, because round 7 killed all three of v8's transitions: the drop test is now the **authenticated head sequence** rather than `record.sourceSeq` (B3), the attempt is **reconciled at push entry and never overwritten** (B4), and ACK clearing is **per entry from post-ACK state** rather than per repository (B5), plus the attempt is finished on every known-negative POST outcome exactly as `resolutionReceipt` already is. **v10 keeps C3 TAKEN and re-amends two of those three transitions on round 8's evidence**: v9's "never overwritten" was implemented as *refuse to arm over a survivor and let the repository take step D's defer*, which round 8 showed is a **permanent non-current latch** — so arming now **merges** and each entry carries its own attempt slot (round-8 B1, amendment 2); and v9's per-entry clear read two values the ACK site does not hold and cleared on `undefined === undefined`, so condition 3 is now an **affirmative capture-bound assertion** and condition 1 moved to the composition boundary (round-8 B2/M1, amendment 3). The wire-authorship alternative was tried and rejected on code (§8 item 14). Full specification in **§3.2c**; §9.1 has the closed test, the negative control, the latch regression bar, and one row per amended transition |
 
 **0. What does rbox promise about Git history? — RULED 2026-07-24 (R4).**
 *Not one of v1's questions; it is the question underneath Q2 and Q3, and answering it retired
@@ -4204,7 +4595,10 @@ for the absence mechanism itself (§13.6).
     when the ref clears) and the same honest fix (per-ref publishing, design 201). Three things keep it
     from being mode (b) again: **the file plane is untouched** and file history is the durability
     contract (R4, §3.0a); it is **reported**, under `deletion-pending` with a repair line that no longer
-    promises self-clearance (§5.2); and it is **non-destructive** — the carried section keeps asserting
+    promises self-clearance (§5.2) — **and v10 makes that reporting real rather than nominal**, because
+    round-8 major 3 found the capture lane had no producer for the reason and would have displayed
+    `other` or `artifact` instead (§3.2b, §5.2's new inventory row); and it is **non-destructive** — the
+    carried section keeps asserting
     exactly what BASE asserts, so nothing anywhere prunes. A reviewer who finds a shape where this
     *loses* work has found a blocker; a reviewer who finds another standing refusal has found this item.
     A reviewer who thinks the standing half needs a machine exit is asking for §10's `keep-mine`
@@ -4449,12 +4843,12 @@ the replacement is a mechanism that already exists in the codebase.
 
 | # | Round-7 finding | v9 |
 |---|---|---|
-| **B1** | Step G can advertise an OID the section's pack links do not contain — full/forced/basis-fallback/recompacted captures build the bundle from live refs, where `R` is absent, so a fresh receiver importing `packChain + newest` has no path to `X` | **RESOLVED by replacement — §3.2b step D.** Step G is **withdrawn** (§8 item 13). It is not repairable: feeding the tip into capture's inputs cannot work either, because R4 keeps no pin on the deleting device and `git gc` may already have removed `X`. The replacement is today's `deferOne` (`plan.ts:533-551`) — the repository's capture defers wholesale and the last synced section is carried, so **bundle coverage is trivial (the carried section's links are ones the wire already carried)** and the carried section still asserts `R = X` so no follower prunes. The cost is one cycle of Git-plane latency, stated in §3.2b, priced in §6, amended into §9.4's AC, and pinned by a named test in §9.1 |
+| **B1** | Step G can advertise an OID the section's pack links do not contain — full/forced/basis-fallback/recompacted captures build the bundle from live refs, where `R` is absent, so a fresh receiver importing `packChain + newest` has no path to `X` | **RESOLVED by replacement — §3.2b step D.** Step G is **withdrawn** (§8 item 13). It is not repairable: feeding the tip into capture's inputs cannot work either, because R4 keeps no pin on the deleting device and `git gc` may already have removed `X`. The replacement is **the existing per-repository carry machinery** — `revertCapture` (`plan.ts:174-183`) after a committed capture, or `deferOne` (`:533-551`) if W/L are hoisted ahead of it; §3.2b picks the property, not the helper, and **v10 uses that phrasing everywhere so no summary names the helper §3.2b warns implementers off** (round-8 minor 1). The repository's capture defers wholesale and the last synced section is carried, so **bundle coverage is trivial (the carried section's links are ones the wire already carried)** and the carried section still asserts `R = X` so no follower prunes. The cost is one cycle of Git-plane latency, stated in §3.2b, priced in §6, amended into §9.4's AC, and pinned by a named test in §9.1. **v10 adds the active-BASE gate** that makes the carry total (round-8 major 2) and a **typed** `deletion-pending` reason (round-8 major 3) |
 | **B2** | The proposed normalizer refusal rejects a fully authorized remote deletion: after an incoming tombstone retires `BASE[R]`, `advertised` stays positive, the candidate legitimately omits `R`, and no proof exists — so the backstop refuses forever, and only an ACK could advance `advertised` | **RESOLVED by deletion — §3.2b.** v9 adds **no normalizer refusal**. The predicate is not decidable where v8 put it (the normalizer cannot see BASE), and the shape B2 names is *correct behaviour* that must keep working. The gate moves to the layer that can see BASE, the live refs and the proof map at once — the plan — and it is a **structural test over `planGitSections`**, not a runtime throw. §9.1 asserts the legitimate case is authored and does **not** throw, which is the executable form of this finding |
 | **B3** | C3 drop condition 2 (`record.sourceSeq < attemptedSequence`) is true in the exact lost-ACK state it must protect — a landed POST with a lost ACK leaves `sourceSeq = N` | **RESOLVED — §3.2c amendment 1.** The test becomes `headSequence < attemptedSequence` against the pull's **signed** head sequence (`e2ee-remote.ts:474-478`, already in `pull()`'s hands at `pull.ts:89-95`), reconciled **before** the tombstone transition is planned. Amendment 1b additionally finishes the attempt on every *known-negative* POST outcome exactly as `resolutionReceipt` already does (`push.ts:846-851`, `:901-905`, `:853-899`), so what stays armed is only the genuinely uncertain set. §9.1 has the two-row pair with opposite required outcomes that v8's predicate cannot tell apart |
-| **B4** | arm → lose ACK → arm can overwrite the ref the first attempt protected; push startup reconciles only `resolutionReceipt` | **RESOLVED — §3.2c amendment 2.** Reconcile at push entry, in the same place the receipt is reconciled (`push.ts:272-273` → `pull.ts:174-200`), and then **refuse to arm over a survivor**: that repository takes step D's defer for the cycle instead. One outstanding attempt per repository, never overwritten. Multiple generations are deliberately not represented, because an unreconciled attempt is exactly the state in which the repository should not be publishing another omission |
-| **B5** | Clearing C3 on every ACK can clear an ACK that still advertises the omission — `revertCapture` reinstates the exact pending section, and "this ACK recorded a section for the repository" is not enough | **RESOLVED — §3.2c amendment 3.** Clearing is per `(ref, priorOid)` and evaluated against the state the ACK is about to write: drop iff composed post-ACK BASE no longer holds `priorOid`, **or** `committed.gitRepos[rel].refs[ref] === live.refs[ref]`. Both inputs are already in the ACK loop (`push.ts:963-980`). In B5's own counterexample the acknowledged section omits `ref`, so the entry is correctly **retained**; §9.1 pins that row and its positive twin |
-| **M1** | The normalizer has no specified per-repository refusal path — throwing aborts the whole push, returning a finding still publishes | **RESOLVED by B2's deletion.** There is no refusal to plumb. The per-repository failure primitive this design uses is `deferOne`, which already exists, already records a typed deferral through `captureReason` (`plan.ts:224-232`, `:273-279`), and is already the codebase's answer for "this repository cannot be captured safely right now" |
+| **B4** | arm → lose ACK → arm can overwrite the ref the first attempt protected; push startup reconciles only `resolutionReceipt` | **RESOLVED, but v9's answer was half wrong and round 8 caught it — see §13.9 blocker 1.** The half that stands: **reconcile at push entry**, in the same place the receipt is reconciled (`push.ts:272-273` → `pull.ts:174-200`). The half **WITHDRAWN in v10**: "refuse to arm over a survivor and let the repository take step D's defer". Round 8 showed step D's trigger does not even fire for the protected pair (`R` is *present*), and that adding a survivor gate to force it creates a **permanent non-current latch**. v10 keeps one entry per **ref** and **merges** on arming, each entry carrying its own `attemptedSequence` / `attemptedGitIncomingKey` — the "overlapping generations" option round 7 offered and v9 declined for a reason (§3.2c amendment 2) that was wrong: the publication that clears a survivor is an *assertion*, not another omission |
+| **B5** | Clearing C3 on every ACK can clear an ACK that still advertises the omission — `revertCapture` reinstates the exact pending section, and "this ACK recorded a section for the repository" is not enough | **RESOLVED in shape, respecified in v10 — see §13.9 blocker 2 and major 1.** Per `(ref, priorOid)` clearing against post-ACK state is right and stands. v9's *predicate* was not implementable: the ACK site holds neither `live.refs` nor the composed BASE, and `committed.gitRepos[rel].refs[ref] === live.refs[ref]` is **true when both are absent**, which clears an entry against an absent ref. v10 splits it: condition 3 is an **affirmative** assertion (`gitPlan.captured` membership + a positive well-formed `refs[ref]` + `refScope === "all"`) evaluated at the ACK site from plan-carried facts, and condition 1 moves to the composition boundary (`sync-state-store.ts:165-180`). §9.1 pins the retained row, the `undefined === undefined` row, the positive twin and both placement assertions |
+| **M1** | The normalizer has no specified per-repository refusal path — throwing aborts the whole push, returning a finding still publishes | **RESOLVED by B2's deletion.** There is no refusal to plumb. The per-repository failure primitive this design uses is the existing carry machinery (`revertCapture` / `deferOne`), which already records a typed deferral through the `deferred` → `captureReason` channel (`plan.ts:224-232`, `:275-278`). **v10 corrects one thing v9 asserted here** (round-8 major 3): `captureReason` is a regex classifier with **no `deletion-pending` arm**, so step D's reason would have been reported as `other` or `artifact`. The channel is right; the reason needed a typed producer, specified in §3.2b and added to §5.2's inventory |
 | **M2** | C3's current-branch example does not terminate in the promised two cycles: a forced hold on `live.currentRef` produces a whole-checkout defer, and the changed HEAD makes pending supersession carry | **ACCEPTED and re-derived — §3.2c termination, §13.4 item 8.** The non-current `git branch R X` shape terminates in **one** cycle (not two), because the same cycle's capture asserts `R` at its live value and that ACK drops the entry. The current-branch `git checkout -b R X` shape does **not** terminate automatically and v9 says so, names the two exits (switch off it, or `keep-mine`), and adds a §9.1 row that asserts the entry still stands after two further cycles. The ref is safe in both |
 | **M3** | The `GitDeferralReason` consumer inventory is not total | **RESOLVED — §5.2's complete inventory.** Fourteen sites plus five tests, classified as compile-time exhaustive, runtime allowlist, or test. Four were missed by v8's five-site table: `resolve-presentation.ts:113-133` (`Record<GitDeferralReason, string>` — typecheck), `breadcrumb-veto.ts:56-76` (`assertNever`, plus a second deliberate slot in the separate `BreadcrumbVetoGate` union at `:27-45`/`:107-114`), `shell-init.ts:189-190` (aborts the **whole** prompt sidecar for every repository, not one row), and `status-view.test.ts:143` (silently stops being exhaustive). **One site round 7 did not name is the sharpest**: `apps/api/test/telemetry-ingest.test.ts:262` builds a 17-long array to trip the length cap, so a 17th member makes that fixture *valid* and the cap stops being tested — it must become 18. Also `apps/api/test/telemetry-ingest.test.ts:82` asserts tuple **equality** including position, which is what makes "same PR, same slot" mandatory rather than tidy |
 | **M4** | Case (b) specifies the lifecycle design 177 deleted | **RESOLVED — §3.6 case (b), rewritten against HEAD.** `GitResolutionIntent` and `RepoRecord.resolutionIntent` do not exist in `src/`; the only survivors are two by-name strips (`sync-state-model.ts:353-367` with its sole caller `sync-state-store.ts:89`, and `:397-401`). The carrier is the ephemeral `GitResolutionRider` (`resolution-intent.ts:44-51`), built at `resolve-command.ts:755`, pushed synchronously at `:769-770`, inside one `withWorkspaceSyncMutex` scope (`:540`–`:1003`) with a confirm-boundary re-derivation at `:709-750`. A pre-ACK failure persists nothing and **the user re-runs** — there is no automatic retry, because a daemon push carries no rider. v9 also states plainly that steps W/L/T/D **do not exist in the binary** and must be added to that capture, and that a step-D defer there fails the command cleanly rather than silently. **Design 176 was never amended and still says "next ordinary push" (`176:42`)**; that is recorded so the next reader is not misled |
@@ -4490,10 +4884,80 @@ than v8's list:**
   refusal *loses* work, or where the carried section prunes something on a follower, is a blocker.
 - **§3.2c's amended lifecycle has no state in which an entry is both live and unreachable by its three
   drop conditions, other than the named current-branch case.** That is the latch test, and v8 failed it
-  three ways.
-- **UNVERIFIED, and flagged as such rather than asserted:** whether `opts.sourceGlobalSeq` is the
-  *signed* head sequence on **every** entry point into `applyGitSections`, or falls back to
-  `state.lastSyncedSequence` (`apply.ts:1314`) on some. §3.2c amendment 1 needs the signed value; if
-  that plumb is not already exact, the reconciliation must take it as its own parameter. This is the
-  one place v9 knowingly did not finish the trace, and it is a wiring question rather than a
-  correctness one — the fallback is *older*, so it can only over-retain an entry, never drop one early.
+  three ways. **Round 8 found that v9 failed it a fourth way** — see §13.9 blocker 1. The claim was the
+  right one to publish, and it was the one that broke.
+- ~~**UNVERIFIED, and flagged as such rather than asserted:** whether `opts.sourceGlobalSeq` is the
+  *signed* head sequence on **every** entry point into `applyGitSections`.~~ **CLOSED — VERIFIED in
+  round 8, and v10 folds the trace into the design (§3.2c amendment 1, round-8 fresh-eyes item 5).**
+  `applyGitSections`' sole non-test caller is `applyPulledManifest`, which always passes its own
+  `sequence` (`pull.ts:363-372`). All three production entry paths supply an authenticated value:
+  `pull()`'s `api.latest()`, which returns `verifiedHead()`'s signed seq and refuses a server that pairs
+  a valid commit with a different number (`e2ee-remote.ts:132-139`, `:449-481`);
+  `reconcileResolutionReceipt`'s `head.sequence`, the same value (`pull.ts:184-193`); and chain repair's
+  `manifestAtSeq(seq)`, verified through `verifyHistorySegment` against the verified head's hash
+  (`chain-repair.ts:52-60`, `e2ee-remote.ts:520-535`). Direct calls omitting the option are tests only,
+  so `state.lastSyncedSequence` (`apply.ts:1314`) is dead as a production fallback. **v10 nevertheless
+  takes round 8's recommendation** and makes the value a **required** parameter of the new
+  reconciliation rather than inheriting the optional one — a required parameter cannot silently acquire
+  a fourth caller with weaker provenance. **v10 introduces no new UNVERIFIED claim.**
+
+### 13.9 Round 8 — `REVIEW-200-R8-CODEX.md`, and how v10 answers it
+
+**Verdict: NOT-ALIGNED, and the shape of the round is that the core is now settled and the auxiliary
+lifecycle is the only thing still moving.** Round 8 verified step D on the ordinary active-BASE path
+(capture has the ref snapshot before finalization, W/L can run after it, and `revertCapture` replaces
+both `out` and `finalizedOutgoing` while undoing the successful-capture bookkeeping), **closed the one
+claim v9 shipped as UNVERIFIED**, and left the v7 core untouched for a third consecutive round. All
+three of its findings land inside §3.2b's trigger and §3.2c's field lifecycle, and **all three are
+refinements: nothing in the design's shape changed, one clause was withdrawn, and two predicates were
+respecified against verified call-site inputs.**
+
+| # | Round-8 finding | v10 |
+|---|---|---|
+| **B1** | Amendment 2's survivor rule turns round-7 B4's overwrite race into an undisclosed **permanent non-current latch**: step D's trigger does not fire for the protected pair (`R` is present), and a survivor gate that forces the defer carries the omitting pending section, after which conditions 1, 2 and 3 are all unreachable while `S` stays absent | **RESOLVED by withdrawal plus the option round 8 named first — §3.2c amendment 2.** The survivor-defer clause is **withdrawn**; arming now **merges**, and each entry carries its own `attemptedSequence` / `attemptedGitIncomingKey` (the field was already a per-ref map — v9's error was hoisting the slot onto the record, which is exactly what made two live pairs inexpressible). v10 also records **why the disclose-and-bound option was rejected**: the latch is *not* bounded by the next pull, because a pull-lane BASE retirement for a locally-present ref is inexpressible — `branchProofMatches` requires `locked.liveOid === after` for an `after === null` retirement (`base-composer.ts:246-258`) and `publisher-ack` preserves BASE for any ref the candidate omits without L's locked proof (`:356-357`). So condition 1 is unreachable by construction and the latch is unbounded. Amendment 2 walks B4's own fixture to termination in one cycle, and §9.1 adds the **latch regression bar** that fails under v9's rule |
+| **B2** | Condition 3's written equality `committed.gitRepos[rel].refs[ref] === live.refs[ref]` is **true when both sides omit the ref**, so a step-D carry of the omitting pending section that gets acknowledged clears the entry while composed BASE still holds `priorOid` — re-exposing the round-6 destructive race to the next `git branch R X` | **RESOLVED — §3.2c amendment 3, condition 3.** The clear now requires **affirmative** evidence, in four conjuncts: `gitPlan.captured.includes(relPath)` (round 8's "bind that assertion to the capture observation" — and the thing that replaces the missing `live.refs`, because a captured section's `refs` **are** the strict ref read, `capture.ts:259`, `:333-345`); a positive well-formed `refs[ref]` (`hasOwnProperty` + `HEX40`), which is the presence check v9 omitted; `refScope === "all"`; and no `absentBranchProofs` entry for the same ref in the same push. Being stricter only **retains** entries, which is the safe direction. §9.1 pins the `undefined === undefined` row explicitly, followed by a `git branch R X` that must not be pruned |
+| **M1** | The clear is specified at a site that has neither claimed derived input: no `live.refs` reaches `GitPushPlan`, and `stateGit` (`push.ts:944`) is `gitBaseAfterCommit`'s **requested** candidate, not the composed BASE — `composeRepoBase` runs later and twice, inside `sourceRecord` on every CAS recomputation and again inside the transactional writer | **RESOLVED — §3.2c amendment 3, condition 1 and the lane.** Verified against the site: the loop holds `committed.gitRepos`, `gitPlan` (with `captured` / `carried` membership and `publisherAckBindings`), pre-save `ackRecords`, `pendingAfterAck` and `stateGit` — and nothing else. So condition 3 is respecified over plan-carried facts only (B2 above), and **condition 1 moves to the composition boundary**: it is evaluated inside the transactional writer immediately after `composeRepoBase` returns and before the record is written (`sync-state-store.ts:165-180`), which is the only place the persisted composed BASE exists and which runs once per accepted packet on every recompute (`sync-state.ts:339-356`). The state-source lane therefore carries a **merge instruction** (`{ arm, clearAsserted }` \| `null`) rather than `resolutionReceipt`'s replacement value, and the `current.sourceSeq > source.sourceGlobalSeq` retention arm (`sync-state.ts:211-216`) already gives round 8's "preserve the field when a newer record wins" for free |
+| **M2** | Step D is not total for a positive **hidden** BASE anchor: `repoAbsent` / `removedKey` retain `record.base` while hiding it from the projection, so a re-add after an identity change can reach step D with `base[rel]` and `pending[rel]` both absent — and `revertCapture`'s fallback is not optional | **RESOLVED — §3.2b, the active-BASE gate.** The trigger gains *"and whose projected BASE is active"* (`record.repoAbsent !== true && record.removedKey === undefined`, the exact predicate at `sync-state-model.ts:455-458`) **and** *"and which is not itself being retired this pass"* (`plan.ts:813-817`; the removal-memory arm returns before capture at `plan.ts:599-604`). When the gate is false the repository's **section stays absent** — round 8's own "safe natural disposition for a deferred re-add" — and v10 states why that is not a hidden `base[rel]` carry: the wire has no section for `rel`, the outgoing map has no entry, so `normalizeOutgoingGitSections` never iterates it and no tombstone is authored. The gate is a strict narrowing, so it cannot re-open round-7 B1. §9.1 adds the re-add row driven through the real removal arm (`apply.ts:691-718`) plus its positive control |
+| **M3** | Step D's `deletion-pending` capture reason has no producer: the defer goes through `deferred` as a free-form string and `captureReason` has no such arm, so an exact `"deletion-pending"` detail becomes `other` and any detail containing *capture* becomes `artifact` | **RESOLVED — §3.2b's producer paragraph and a new §5.2 inventory row.** The deferral item gains `typedReason?: GitDeferralReason` and `plan()` prefers it (`item.typedReason ?? captureReason(item.reason)`, `plan.ts:275-278`), which is the same out-of-band per-item tagging `configLaneDefers` / `configLaneItems` already do by object identity (`plan.ts:160-161`) — the deferral channel's own existing reason plumbing rather than a new one. Round 8's alternative (an exact non-regex arm ahead of the `artifact` regex) is recorded as acceptable but not chosen, because it fuses the human detail line and the machine enum. §9.1 asserts it on the **capture** lane, including the adversarial detail line containing the word *capture*, since the apply-side `FollowProgress.blockers` test does not cover it |
+| **m1** | Non-normative summaries still call step D's replacement "today's `deferOne`", the helper §3.2b warns implementers not to use after finalization | **RESOLVED — header item 1, §6's cost row, §13.8's B1 and M1.** All four now say **"the existing per-repository carry machinery"** and name `revertCapture` (`plan.ts:174-183`) first, with `deferOne` as the hoisted-W/L alternative. §3.2b's normative table is unchanged; the split that invited the mistake is gone |
+
+**What round 8 verified as closed, recorded because it is what v10 builds on.** Step D's evaluation
+point is viable on the active-BASE path — capture returns the strict ref map in the section before
+normalization, W/L can run after `commitCapture`, and `revertCapture` updates both `out` and
+`finalizedOutgoing`, removes `captured`, clears the authored config hash and repo-absence bookkeeping,
+and records the defer (`plan.ts:169-183`, `:987-1055`). An accepted POST with a lost ACK **is**
+reconcilable at push entry by fetching and applying the authenticated head exactly as
+`resolutionReceipt` does (`push.ts:272-273` → `pull.ts:174-200`) — round 8 confirmed the ordering v9
+specified; only what happened *after* that reconciliation was wrong. The current-branch residual is
+"real but acceptably disclosed … a literal field wedge, but a reported, safe one with named exits", and
+round 8 notes the keep-mine rider becomes a **second** exit once the survivor rule is repaired — which
+amendment 2 does. And `sourceGlobalSeq` is **resolved for every production caller** (§13.8's closed
+bullet). **Round 8 reclassified nothing in §13.6's rounds-2-to-5 sweep, so the landmine arithmetic is
+unchanged at 10 N/A / 12 moot / 12 carried = 34.**
+
+**Nothing in round 8 contradicted v9 in a way that needed adjudication.** Every disagreement resolved
+in round 8's favour on code that v10 re-read at the cited lines, and two of its findings are
+*narrowings* of claims v9 itself flagged as the ones worth attacking (the latch test and step D's
+totality). One clause of round 8's prescription was **not** taken, and the reason is recorded rather
+than elided: its shortest-list item 1 offers three repairs — overlapping generations, a staged
+representation, or design 201's per-ref wire model — and v10 takes the **first**, because the field is
+already a per-ref map and the repair is a per-entry annotation rather than a new representation. Round
+8's own alternative for M3 (an exact string arm in `captureReason`) is likewise recorded as acceptable
+and not chosen.
+
+**What v10 deliberately did not do, so round 9 can aim at it.** It restructures nothing: amendment 2
+moves two scalars into a map that already existed, amendment 3 moves one condition to the composition
+site that already runs it, step D gains a two-field gate, and the reason gains a typed field on a
+channel that already tags items out of band. **Three claims are the ones worth attacking:**
+
+- **Amendment 2's merge makes the latch test hold universally.** The proof obligation is that a
+  repository can always publish a section that *asserts* every live entry-named ref. A reachable state
+  where it cannot — where the assertion is itself blocked by a hold, a defer or a supersession carry
+  that the entry causes — is a blocker, and it is the same class of finding as round-8 B1.
+- **Condition 3's four conjuncts are sufficient as well as necessary.** They are deliberately
+  over-strict, so the risk is not a wrong clear but a *never*-clear: if `gitPlan.captured` can exclude a
+  repository whose acknowledged section genuinely came from this device's capture, the entry survives an
+  event that should have ended it and the latch test fails from the other side.
+- **The active-BASE gate's "section stays absent" outcome is safe for every reachable hidden-anchor
+  shape.** v10 argues it from "the wire has no section for `rel`". A shape where a hidden anchor
+  coexists with a live wire section for the same repository would make that argument false.
