@@ -465,10 +465,19 @@ async function runPsLstart(pid: number): Promise<PsLstartRun> {
   });
 }
 
-/** Exported for adversarial platform tests: the `ps` reading must be able to
- * fail in every ambiguous way without any of them becoming proof of death. */
-export async function darwinProcessStartForTests(pid: number, run: PsRunner): Promise<string> {
-  return await darwinPsProcessStart(pid, run);
+/** Exported for adversarial platform tests: both readings must be able to fail in
+ * every ambiguous way without any of them becoming proof of death. Omit `sysctl`
+ * to drive the `ps` reading alone; supply it to drive the whole darwin chain,
+ * including what escapes when neither source answers. */
+export async function darwinProcessStartForTests(pid: number, run: PsRunner, sysctl?: SysctlProcReader): Promise<string> {
+  return sysctl ? await darwinProcessStart(pid, run, sysctl) : await darwinPsProcessStart(pid, run);
+}
+
+/** Exported for adversarial platform tests: pairs an injected start-time reading
+ * with the real classification, so a reader that cannot answer is proven to
+ * reach the corroborating kill rather than the dead short-circuit. */
+export async function probeProcessForTests(pid: number, read: (pid: number) => Promise<string>): Promise<ProcessProbe> {
+  return await probeProcess(pid, read);
 }
 
 /** Canonicalize one `TZ=UTC LC_ALL=C ps -o lstart=` line into whole epoch
@@ -496,10 +505,13 @@ export function parseDarwinProcessStartListing(line: string): string | undefined
   return String(Math.floor(ms / 1000));
 }
 
-async function darwinProcessStart(pid: number): Promise<string> {
+export type SysctlProcReader = (pid: number) => Promise<Buffer>;
+const readSysctlProcInfo: SysctlProcReader = (pid) => execBytes("/usr/sbin/sysctl", ["-b", `kern.proc.pid.${pid}`]);
+
+async function darwinProcessStart(pid: number, ps: PsRunner = runPsLstart, sysctl: SysctlProcReader = readSysctlProcInfo): Promise<string> {
   let bytes: Buffer;
   try {
-    bytes = await execBytes("/usr/sbin/sysctl", ["-b", `kern.proc.pid.${pid}`]);
+    bytes = await sysctl(pid);
   } catch (error) {
     // sysctl stays PRIMARY so a healthy host keeps producing byte-identical
     // microsecond readings. macOS 26 removed the `kern.proc.pid.<pid>` OID name,
@@ -508,11 +520,19 @@ async function darwinProcessStart(pid: number): Promise<string> {
     // keeps the writer and the prober on one clock. Same-boot mixing of the two
     // sources is handled by `compareProcessStart`, never by string equality.
     try {
-      return await darwinPsProcessStart(pid);
+      return await darwinPsProcessStart(pid, ps);
     } catch (psError) {
       if (errno(psError) === "ESRCH") throw psError;
       if (pid === process.pid) return darwinFallbackOwnStart;
-      throw error;
+      // Both readings failed and neither proved absence. The primary's error must
+      // NOT escape as it stands: `probeProcess` short-circuits ENOENT and ESRCH
+      // straight to "dead" without the corroborating kill(pid, 0), so a sysctl
+      // that merely failed to spawn would sentence a live owner. Re-code the pair
+      // as an unreadable incarnation, which reaches that corroboration instead.
+      // Errno codes only — never the underlying messages, which carry paths.
+      const unreadable = new Error(`process incarnation unreadable (sysctl ${errno(error) ?? "failed"}, ps ${errno(psError) ?? "failed"})`);
+      (unreadable as NodeJS.ErrnoException).code = "EIO";
+      throw unreadable;
     }
   }
   if (bytes.length < 16) {
@@ -569,9 +589,9 @@ async function processStart(pid: number): Promise<string> {
   throw new Error(`unsupported lock identity platform: ${process.platform}`);
 }
 
-async function probeProcess(pid: number): Promise<ProcessProbe> {
+async function probeProcess(pid: number, read: (pid: number) => Promise<string> = processStart): Promise<ProcessProbe> {
   try {
-    return { status: "alive", startTime: await processStart(pid) };
+    return { status: "alive", startTime: await read(pid) };
   } catch (error) {
     if (["ENOENT", "ESRCH"].includes(errno(error) ?? "")) return { status: "dead" };
     if (process.platform === "darwin") {

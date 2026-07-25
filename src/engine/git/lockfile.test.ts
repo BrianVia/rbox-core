@@ -21,6 +21,7 @@ import {
   darwinProcessStartForTests,
   parseDarwinProcessStartListing,
   parseLockMarker,
+  probeProcessForTests,
   publishLockMarker,
   readHostIdentityLedger,
   refreshHostIdentityLedger,
@@ -929,6 +930,51 @@ describe("macOS 26 process-start source", () => {
     // The same empty listing against a live pid must NOT claim death.
     const live = await darwinProcessStartForTests(process.pid, async () => empty).then(() => undefined, (error: unknown) => error);
     expect((live as NodeJS.ErrnoException).code).not.toBe("ESRCH");
+  });
+
+
+  test("neither probe answering never classifies a live process dead, whatever the primary's errno", async () => {
+    const ambiguousPs: PsLstartRun = { stdout: "", failed: true, incomplete: true };
+    // A live pid that is NOT our own: the self-pid uptime fallback would answer
+    // for `process.pid` and hide the classification this test is about.
+    const child = spawn("sleep", ["30"], { stdio: "ignore" });
+    await new Promise<void>((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
+    const livePid = child.pid!;
+    try {
+    // ENOENT and ESRCH are the two codes probeProcess accepts as death WITHOUT
+    // the corroborating kill(pid, 0), so a primary that merely failed to spawn
+    // must not be allowed to escape carrying one of them.
+    for (const code of ["ENOENT", "ESRCH", "EPERM", "EACCES", undefined]) {
+      const sysctl = async (): Promise<Buffer> => {
+        const error = new Error("primary reading failed") as NodeJS.ErrnoException;
+        if (code) error.code = code;
+        throw error;
+      };
+      // End to end first: the real classifier must reach the corroborating path.
+      const probe = await probeProcessForTests(livePid, (pid) => darwinProcessStartForTests(pid, async () => ambiguousPs, sysctl));
+      expect(probe.status, code ?? "no code").not.toBe("dead");
+
+      // Then the mechanism: nothing carrying either short-circuit code escapes.
+      const escaped = await darwinProcessStartForTests(livePid, async () => ambiguousPs, sysctl)
+        .then(() => undefined, (error: unknown) => error as NodeJS.ErrnoException);
+      expect(escaped?.code, code ?? "no code").not.toBe("ENOENT");
+      expect(escaped?.code, code ?? "no code").not.toBe("ESRCH");
+      }
+    } finally {
+      child.kill("SIGKILL");
+    }
+  });
+
+  test("a kernel-confirmed absence still reports death through the whole darwin chain", async () => {
+    const sysctl = async (): Promise<Buffer> => {
+      const error = new Error("primary reading failed") as NodeJS.ErrnoException;
+      error.code = "ENOENT";
+      throw error;
+    };
+    // A completed ps run that named no process, for a pid the kernel confirms gone.
+    const empty: PsLstartRun = { stdout: "", failed: true, incomplete: false };
+    const probe = await probeProcessForTests(2_147_483_646, (pid) => darwinProcessStartForTests(pid, async () => empty, sysctl));
+    expect(probe.status).toBe("dead");
   });
 
   test("start-time readings compare at the coarser of their two resolutions", () => {
