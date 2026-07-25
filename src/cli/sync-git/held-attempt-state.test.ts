@@ -11,6 +11,7 @@ const attempt: GitHeldAttempt = {
   incomingKey: "incoming", localFingerprint: "fingerprint", fingerprintVersion: "version",
   effectiveBaseIndexProjection: null, effectiveIncomingIndexProjection: null,
   incomingIndexArtifactDescriptor: "null",
+  worktreeRegistryDigest: "worktrees",
   reflogs: [{ path: "logs/refs/stash", digest: "digest" }],
   blockers: [{ provenance: "checkout", reason: "local-commits" }],
   repoIdentity: "identity", stateNonce: "nonce", baseOriginsHash: "base", partialDisposition: "partial",
