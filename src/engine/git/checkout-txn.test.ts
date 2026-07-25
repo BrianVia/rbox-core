@@ -14,7 +14,7 @@ import {
   type CheckoutPlan,
 } from "./checkout-txn.js";
 import { recoverJournal, writeCheckoutJournal, type CheckoutJournal, type CheckoutJournalBinding } from "./journal.js";
-import { captureCommonDirIdentity } from "./lockfile.js";
+import { captureCommonDirIdentity, systemLockIdentity } from "./lockfile.js";
 import { repoCtx, type RepoCtx } from "./shared.js";
 import { ShutdownMutationGate } from "../mutation-gate.js";
 
@@ -771,4 +771,69 @@ test("typed capability distinguishes missing/version/probe/unsupported states an
   expect(await checkoutTransactionCapability(repo, async () => false, async () => ({ stdout: "git version 2.43.0" }))).toEqual({
     status: "unsupported", version: "git version 2.43.0",
   });
+});
+
+// The journalled owner must be exact, so both non-alive probes abort — but they
+// are named apart, because a recurring "could not be read" is a platform probe
+// defect (macOS 26 dropped the sysctl OID `darwinProcessStart` reads) while a
+// dead child is an ordinary transaction failure.
+for (const [status, reason] of [
+  ["dead", "prepared Git child died before its intent was recorded"],
+  ["unknown", "prepared Git child incarnation could not be read"],
+] as const) {
+  test(`a ${status} prepared child defers with its own reason and leaves no residue`, async () => {
+    const { journal } = await checkoutJournal();
+    const result = await commitCheckout(ctx, plan(await candidateFor(newOid)), {
+      capabilityProbe: supported,
+      secondProof: proof,
+      journal: { workspaceRoot: root, relPath: "repo", value: journal },
+      identity: { current: systemLockIdentity.current, probe: async () => ({ status }) },
+    });
+
+    expect(result).toMatchObject({ status: "defer", reason });
+    expect(await git(repo, "rev-parse", "refs/heads/main")).toBe(oldOid);
+    expect(await fs.readFile(path.join(ctx.gitDir, "index"))).toEqual(oldIndex);
+    expect((await fs.readdir(ctx.commonDir, { recursive: true })).filter((entry) => entry.toString().endsWith(".lock"))).toEqual([]);
+    expect(journal.expectedNew.preparedTransactions ?? []).toEqual([]);
+  });
+}
+
+test("the post-HEAD transaction probes its own child and surfaces the same unreadable-incarnation reason", async () => {
+  const { binding, journal } = await checkoutJournal("ref: refs/heads/side\n");
+  await git(repo, "branch", "side", oldOid);
+  let probes = 0;
+  // The post-HEAD intent is recorded after the primary transaction has already
+  // committed, so its failure leaves the journal to arbitrate rather than
+  // deferring — but it must still be the probe's own reason that surfaces.
+  await expect(commitCheckout(ctx, plan(await candidateFor(newOid), {
+    refUpdates: [],
+    head: { kind: "symbolic", newTarget: "refs/heads/side", oldTarget: "refs/heads/main" },
+    postHeadRefUpdates: [{ kind: "update", ref: "refs/heads/main", newOid, oldOid }],
+  }), {
+    capabilityProbe: supported,
+    secondProof: proof,
+    journal: { workspaceRoot: root, relPath: "repo", value: journal },
+    // Only the post-HEAD child is unreadable; the primary transaction must
+    // still record an exact owner and commit.
+    identity: {
+      current: systemLockIdentity.current,
+      probe: async (pid) => (probes++ === 0 ? systemLockIdentity.probe(pid) : { status: "unknown" }),
+    },
+  })).rejects.toThrow("prepared Git child incarnation could not be read");
+
+  expect(probes).toBe(2);
+  expect(journal.expectedNew.preparedTransactions?.map((entry) => entry.id)).toEqual(["primary"]);
+  expect(journal.expectedNew.preparedTransactions?.[0]?.completed).toBe(true);
+  expect(await git(repo, "symbolic-ref", "HEAD")).toBe("refs/heads/side");
+  expect(await git(repo, "rev-parse", "refs/heads/main")).toBe(oldOid);
+  expect((await fs.readdir(ctx.commonDir, { recursive: true })).filter((entry) => entry.toString().endsWith(".lock"))).toEqual([]);
+
+  // Leaving HEAD switched is only acceptable because the journal can finish the
+  // job. Prove that end to end rather than inferring it from lock cleanliness.
+  const recovery = await recoverJournal(root, "repo", binding);
+  expect(recovery.status).toBe("rolled-back");
+  expect(await git(repo, "symbolic-ref", "HEAD")).toBe("refs/heads/main");
+  expect(await git(repo, "rev-parse", "refs/heads/main")).toBe(oldOid);
+  expect(await fs.readFile(path.join(ctx.gitDir, "index"))).toEqual(oldIndex);
+  expect(await fs.readdir(path.join(root, ".rbox", "state", "git-journal"))).toEqual([]);
 });

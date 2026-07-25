@@ -18,6 +18,7 @@ import {
 } from "../engine/e2ee/index.js";
 import {
   acquireLock,
+  compareProcessStart,
   systemLockIdentity,
   type LockIdentitySource,
   type ProcessIncarnation,
@@ -669,7 +670,7 @@ async function ownerIsLive(owner: LoginAttemptOwner, identity: LockIdentitySourc
   if (owner.hostId !== current.hostId) return true;
   if (owner.bootId !== current.bootId) return false;
   const probe = await identity.probe(owner.pid);
-  return probe.status === "alive" && probe.startTime === owner.startTime
+  return probe.status === "alive" && compareProcessStart(owner.startTime, probe.startTime) !== "different"
     || probe.status === "unknown";
 }
 

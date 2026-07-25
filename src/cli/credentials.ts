@@ -3,7 +3,7 @@ import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
-import { systemLockIdentity } from "../engine/git/lockfile.js";
+import { compareProcessStart, systemLockIdentity } from "../engine/git/lockfile.js";
 import { homeDir } from "./rbox-paths.js";
 import { GENESIS_ACCOUNT_ID_RE, invalidateGenesisEnrollmentWitness } from "./genesis-durable.js";
 import { isAccountId } from "./account-id.js";
@@ -399,7 +399,8 @@ async function acquireFence(): Promise<{ path: string; observation: MarkerObserv
     const now = Date.now();
     if (held.mtimeMs > now || Date.parse(held.marker.acquiredAt) > now) throw new Error(`future-dated credential fence marker: ${markerPath}`);
     const probe = await systemLockIdentity.probe(held.marker.pid);
-    const exactDead = probe.status === "dead" || (probe.status === "alive" && probe.startTime !== held.marker.processStart);
+    const exactDead = probe.status === "dead"
+      || (probe.status === "alive" && compareProcessStart(held.marker.processStart, probe.startTime) === "different");
     if (exactDead) {
       await unlinkObserved(markerPath, held, true);
       continue;

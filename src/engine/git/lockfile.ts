@@ -177,6 +177,35 @@ function errno(error: unknown): string | undefined {
   return (error as NodeJS.ErrnoException | undefined)?.code;
 }
 
+export type ProcessStartComparison = "same" | "different" | "incomparable";
+
+/** Compare a recorded process-start reading with a freshly probed one.
+ *
+ * String equality alone is wrong the moment one host can read the clock two
+ * ways. macOS reports `seconds.microseconds` through sysctl and whole `seconds`
+ * through ps (macOS 26 dropped the sysctl OID name), and a transient sysctl
+ * failure can switch a single host between them mid-boot. Treating that as a
+ * different incarnation would classify a LIVE owner dead and authorise reaping
+ * its lock, so the two are compared at the coarser of their resolutions.
+ *
+ * The pre-ps binaries had no foreign reading at all and fell back to a
+ * process-uptime estimate in whole MICROSECONDS for their own pid. Such a value
+ * is a bare integer far too large to be epoch seconds, and it cannot be
+ * reconciled with a second clock at all — it is reported incomparable so a
+ * marker written by one of those binaries, in this boot, reads as unknown
+ * liveness rather than as a dead owner. Every caller maps unknown to "leave it
+ * alone", which is the only safe reading. Linux tick-since-boot values stay far
+ * below the threshold and are unaffected. */
+export function compareProcessStart(recorded: string, probed: string): ProcessStartComparison {
+  if (recorded === probed) return "same";
+  const microsecondClock = (value: string): boolean => !value.includes(".") && value.length >= 13;
+  if (microsecondClock(recorded) !== microsecondClock(probed)) return "incomparable";
+  const [recordedSeconds, recordedFraction] = recorded.split(".");
+  const [probedSeconds, probedFraction] = probed.split(".");
+  if (recordedSeconds === probedSeconds && (recordedFraction === undefined || probedFraction === undefined)) return "same";
+  return "different";
+}
+
 /** Shared strict validator for journal-carried process incarnations. */
 export function validProcessIncarnation(value: unknown): value is ProcessIncarnation {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
@@ -205,7 +234,9 @@ export async function classifyProcessIncarnation(
   try {
     const probe = await identity.probe(owner.pid);
     if (probe.status === "unknown") return "unknown";
-    return probe.status === "dead" || probe.startTime !== owner.startTime ? "dead" : "alive";
+    if (probe.status === "dead") return "dead";
+    const start = compareProcessStart(owner.startTime, probe.startTime);
+    return start === "incomparable" ? "unknown" : start === "different" ? "dead" : "alive";
   } catch {
     return "unknown";
   }
@@ -366,13 +397,143 @@ export async function resolveDarwinIdentityComponents(run: IdentityCommand = exe
   return { kernUuid, bootSessionUuid, platformUuid };
 }
 
-async function darwinProcessStart(pid: number): Promise<string> {
+/** `ps -o lstart=` under `LC_ALL=C`, e.g. `Fri Jul 24 23:05:12 2026`. The day is
+ * space-padded to two columns. */
+const PS_LSTART_RE = /^[A-Za-z]{3} ([A-Za-z]{3}) {1,2}(\d{1,2}) (\d{2}):(\d{2}):(\d{2}) (\d{4})$/;
+const PS_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/** Second-resolution start time from `ps`, the only per-process clock macOS 26
+ * still exposes to a command-line caller after it dropped the `kern.proc.pid`
+ * sysctl OID name. `TZ=UTC` makes the reading independent of the caller's zone
+ * and removes the repeated-hour ambiguity a local-time rendering would carry, so
+ * two reads of one process are byte-identical. */
+async function darwinPsProcessStart(pid: number, run: PsRunner = runPsLstart): Promise<string> {
+  const listing = await run(pid);
+  // A run that never completed says nothing at all about the process. Only a
+  // completed run may even SUGGEST absence, and never on its own: `ps` also
+  // exits non-zero when it refuses the request, so the kernel has to corroborate
+  // through kill(pid, 0) before anything here reports a dead process. Getting
+  // this order wrong turns "the probe broke" into proof of death, which would
+  // authorize reaping a live owner's locks, fences, and journals.
+  if (listing.incomplete) throw new Error("process start listing did not complete");
+  const line = listing.stdout.trim();
+  if (!line) {
+    try {
+      process.kill(pid, 0);
+    } catch (killError) {
+      if (errno(killError) === "ESRCH") {
+        const error = new Error("process incarnation unavailable");
+        (error as NodeJS.ErrnoException).code = "ESRCH";
+        throw error;
+      }
+    }
+    // The listing named no process but the kernel will not confirm absence:
+    // indeterminate, which every caller reads as "leave it alone".
+    throw new Error("process start listing named no process");
+  }
+  if (listing.failed) throw new Error("process start listing failed");
+  const start = parseDarwinProcessStartListing(line);
+  if (start === undefined) throw new Error("unparsable process start listing");
+  return start;
+}
+
+/** A completed `ps` run reports `failed` for a non-zero exit; `incomplete` marks
+ * a run that never reached one — a failure to spawn, a timeout, or a signal. */
+export interface PsLstartRun {
+  stdout: string;
+  failed: boolean;
+  incomplete: boolean;
+}
+export type PsRunner = (pid: number) => Promise<PsLstartRun>;
+
+async function runPsLstart(pid: number): Promise<PsLstartRun> {
+  return await new Promise<PsLstartRun>((resolve) => {
+    execFile("/bin/ps", ["-p", String(pid), "-o", "lstart="], {
+      encoding: "utf8",
+      maxBuffer: 4 * 1024,
+      timeout: 2_000,
+      killSignal: "SIGKILL",
+      env: { PATH: "/usr/bin:/bin", LC_ALL: "C", TZ: "UTC" },
+    }, (error, stdout) => {
+      // A non-zero exit carries a numeric `code`; a failure to run the command
+      // at all carries an errno string, and a timeout carries `killed`/`signal`.
+      // Only the first ran to completion.
+      const failure = error as (NodeJS.ErrnoException & { killed?: boolean; signal?: string }) | null;
+      const incomplete = !!failure && (typeof failure.code === "string" || failure.killed === true || failure.signal != null);
+      resolve({ stdout, failed: !!error, incomplete });
+    });
+  });
+}
+
+/** Exported for adversarial platform tests: both readings must be able to fail in
+ * every ambiguous way without any of them becoming proof of death. Omit `sysctl`
+ * to drive the `ps` reading alone; supply it to drive the whole darwin chain,
+ * including what escapes when neither source answers. */
+export async function darwinProcessStartForTests(pid: number, run: PsRunner, sysctl?: SysctlProcReader): Promise<string> {
+  return sysctl ? await darwinProcessStart(pid, run, sysctl) : await darwinPsProcessStart(pid, run);
+}
+
+/** Exported for adversarial platform tests: pairs an injected start-time reading
+ * with the real classification, so a reader that cannot answer is proven to
+ * reach the corroborating kill rather than the dead short-circuit. */
+export async function probeProcessForTests(pid: number, read: (pid: number) => Promise<string>): Promise<ProcessProbe> {
+  return await probeProcess(pid, read);
+}
+
+/** Canonicalize one `TZ=UTC LC_ALL=C ps -o lstart=` line into whole epoch
+ * seconds. Exported for adversarial platform tests: the value is compared for
+ * equality across processes and binaries, so it must be a pure function of the
+ * listing and never carry the reader's locale, zone, or clock. */
+export function parseDarwinProcessStartListing(line: string): string | undefined {
+  const match = PS_LSTART_RE.exec(line.trim());
+  const month = match ? PS_MONTHS.indexOf(match[1]!) : -1;
+  if (!match || month < 0) return undefined;
+  const year = Number(match[6]);
+  const day = Number(match[2]);
+  const hours = Number(match[3]);
+  const minutes = Number(match[4]);
+  const seconds = Number(match[5]);
+  if (day < 1 || hours > 23 || minutes > 59 || seconds > 59) return undefined;
+  const ms = Date.UTC(year, month, day, hours, minutes, seconds);
+  if (!Number.isFinite(ms) || ms < 0) return undefined;
+  // Date.UTC silently rolls an impossible calendar date forward (Feb 31 becomes
+  // March 3), which would canonicalize a nonsense listing into a plausible-looking
+  // and WRONG incarnation. Round-trip the components instead of trusting them.
+  const round = new Date(ms);
+  if (round.getUTCFullYear() !== year || round.getUTCMonth() !== month || round.getUTCDate() !== day
+    || round.getUTCHours() !== hours || round.getUTCMinutes() !== minutes || round.getUTCSeconds() !== seconds) return undefined;
+  return String(Math.floor(ms / 1000));
+}
+
+export type SysctlProcReader = (pid: number) => Promise<Buffer>;
+const readSysctlProcInfo: SysctlProcReader = (pid) => execBytes("/usr/sbin/sysctl", ["-b", `kern.proc.pid.${pid}`]);
+
+async function darwinProcessStart(pid: number, ps: PsRunner = runPsLstart, sysctl: SysctlProcReader = readSysctlProcInfo): Promise<string> {
   let bytes: Buffer;
   try {
-    bytes = await execBytes("/usr/sbin/sysctl", ["-b", `kern.proc.pid.${pid}`]);
+    bytes = await sysctl(pid);
   } catch (error) {
-    if (pid === process.pid) return darwinFallbackOwnStart;
-    throw error;
+    // sysctl stays PRIMARY so a healthy host keeps producing byte-identical
+    // microsecond readings. macOS 26 removed the `kern.proc.pid.<pid>` OID name,
+    // so there the primary answers "unknown oid" with exit 1 for every live
+    // process and every reading — self and foreign alike — comes from ps, which
+    // keeps the writer and the prober on one clock. Same-boot mixing of the two
+    // sources is handled by `compareProcessStart`, never by string equality.
+    try {
+      return await darwinPsProcessStart(pid, ps);
+    } catch (psError) {
+      if (errno(psError) === "ESRCH") throw psError;
+      if (pid === process.pid) return darwinFallbackOwnStart;
+      // Both readings failed and neither proved absence. The primary's error must
+      // NOT escape as it stands: `probeProcess` short-circuits ENOENT and ESRCH
+      // straight to "dead" without the corroborating kill(pid, 0), so a sysctl
+      // that merely failed to spawn would sentence a live owner. Re-code the pair
+      // as an unreadable incarnation, which reaches that corroboration instead.
+      // Errno codes only — never the underlying messages, which carry paths.
+      const unreadable = new Error(`process incarnation unreadable (sysctl ${errno(error) ?? "failed"}, ps ${errno(psError) ?? "failed"})`);
+      (unreadable as NodeJS.ErrnoException).code = "EIO";
+      throw unreadable;
+    }
   }
   if (bytes.length < 16) {
     const error = new Error("process incarnation unavailable");
@@ -428,9 +589,9 @@ async function processStart(pid: number): Promise<string> {
   throw new Error(`unsupported lock identity platform: ${process.platform}`);
 }
 
-async function probeProcess(pid: number): Promise<ProcessProbe> {
+async function probeProcess(pid: number, read: (pid: number) => Promise<string> = processStart): Promise<ProcessProbe> {
   try {
-    return { status: "alive", startTime: await processStart(pid) };
+    return { status: "alive", startTime: await read(pid) };
   } catch (error) {
     if (["ENOENT", "ESRCH"].includes(errno(error) ?? "")) return { status: "dead" };
     if (process.platform === "darwin") {
@@ -894,7 +1055,10 @@ async function classifyProbe(read: MarkerRead, identity: LockIdentitySource, ide
   const marker = read.marker!;
   const probe = await identity.probe(marker.pid);
   if (probe.status === "unknown") return { kind: "foreign", raw: read.raw, reason: "process liveness unavailable", observation: read };
-  if (probe.status === "dead" || probe.startTime !== marker.startTime) return { kind: "dead", marker, raw: read.raw, observation: read };
+  if (probe.status === "dead") return { kind: "dead", marker, raw: read.raw, observation: read };
+  const start = compareProcessStart(marker.startTime, probe.startTime);
+  if (start === "incomparable") return { kind: "foreign", raw: read.raw, reason: "process start clock unavailable", observation: read };
+  if (start === "different") return { kind: "dead", marker, raw: read.raw, observation: read };
   return { kind: "live", marker, raw: read.raw, identityDrift: identityDrift || undefined, observation: read };
 }
 
