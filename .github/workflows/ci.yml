@@ -17,12 +17,57 @@ permissions:
   contents: read
 
 jobs:
+  # Do not use pull_request.paths-ignore here. GitHub leaves required checks
+  # pending when an entire workflow is path-filtered, which would make
+  # docs-only PRs unmergeable. Instead, classify once, keep the required matrix
+  # contexts as cheap no-op jobs, and skip every non-required heavyweight job.
+  changes:
+    name: "changes · CI scope"
+    runs-on: ubuntu-latest
+    outputs:
+      run_ci: ${{ steps.scope.outputs.run_ci }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          filter: blob:none
+      - name: Classify changed paths
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # Main pushes always run CI: release gates require a successful run
+          # for the exact pushed SHA. Only PRs whose every path is under docs/
+          # receive the lightweight treatment.
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            RUN_CI=true
+          else
+            BASE_SHA="$(git merge-base "$PR_BASE_SHA" "$PR_HEAD_SHA")"
+            RUN_CI=false
+            while IFS= read -r -d '' changed_path; do
+              case "$changed_path" in
+                docs/*) ;;
+                *)
+                  RUN_CI=true
+                  break
+                  ;;
+              esac
+            # Disable rename detection so moving code into docs/ still reports
+            # the removed non-doc path and cannot bypass CI.
+            done < <(git diff --no-renames --name-only -z "$BASE_SHA" "$PR_HEAD_SHA")
+          fi
+          echo "run_ci=$RUN_CI" >> "$GITHUB_OUTPUT"
+          echo "full CI required: $RUN_CI"
+
   # GitHub-hosted only (founder decision 2026-07-13): the self-hosted home box
   # double-booked as the dev workstation — CPU-starved runners flaked heavyweight
   # tests every busy run, and ephemeral job workspaces leaked ~13GB/day/container
   # (filled a 916GB disk once). Not worth it.
   test:
     name: ${{ matrix.name }}
+    needs: changes
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -63,15 +108,21 @@ jobs:
             shard_index: 2
             shard_count: 2
     steps:
+      - name: Docs-only PR — required check satisfied without running CI
+        if: needs.changes.outputs.run_ci != 'true'
+        run: echo "Only docs/** changed; skipping tests for this required check."
+
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        if: needs.changes.outputs.run_ci == 'true'
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        if: needs.changes.outputs.run_ci == 'true'
         with:
           bun-version: "1.3.14"
       # `bun run typecheck` shells out to `tsc`, whose node shebang otherwise picks
       # up the self-hosted runner image's ancient system Node (v10, no `??`). Pin a
       # modern Node on PATH so tsc runs the same here as on GitHub-hosted runners.
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
-        if: matrix.kind != 'src'
+        if: needs.changes.outputs.run_ci == 'true' && matrix.kind != 'src'
         with:
           node-version: 24
 
@@ -80,6 +131,7 @@ jobs:
       # bun.lock (sha512-integrity-verified).
       - name: Cache bun install store
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: needs.changes.outputs.run_ci == 'true'
         with:
           path: ~/.bun/install/cache
           key: bun-install-${{ runner.os }}-${{ hashFiles('bun.lock') }}
@@ -87,7 +139,7 @@ jobs:
             bun-install-${{ runner.os }}-
 
       - name: Cache tsc incremental state
-        if: matrix.kind == 'checks'
+        if: needs.changes.outputs.run_ci == 'true' && matrix.kind == 'checks'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .cache/tsbuildinfo
@@ -96,7 +148,7 @@ jobs:
             tsc-${{ runner.os }}-
 
       - name: Cache apps/api vitest artifacts
-        if: matrix.kind == 'workers-api'
+        if: needs.changes.outputs.run_ci == 'true' && matrix.kind == 'workers-api'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .cache/vitest/apps-api
@@ -107,30 +159,33 @@ jobs:
       # Host-platform install (Linux): pulls @parcel/watcher-linux-x64-glibc so the
       # native watcher suite RUNS here (must not silently skip on CI — design §41).
       - name: Install (frozen)
+        if: needs.changes.outputs.run_ci == 'true'
         run: bun install --frozen-lockfile
 
       - name: Guards
-        if: matrix.kind == 'checks'
+        if: needs.changes.outputs.run_ci == 'true' && matrix.kind == 'checks'
         run: bun run guards
 
       - name: Typecheck (root + apps/api)
-        if: matrix.kind == 'checks'
+        if: needs.changes.outputs.run_ci == 'true' && matrix.kind == 'checks'
         run: bun run typecheck
 
       - name: Test — src shard
-        if: matrix.kind == 'src'
+        if: needs.changes.outputs.run_ci == 'true' && matrix.kind == 'src'
         run: bun scripts/ci-shard-tests.ts run --shard-count "${{ matrix.shard_count }}" --shard-index "${{ matrix.shard_index }}"
 
       - name: Test — apps/api (Workers shard ${{ matrix.shard_index }}/${{ matrix.shard_count }})
-        if: matrix.kind == 'workers-api'
+        if: needs.changes.outputs.run_ci == 'true' && matrix.kind == 'workers-api'
         run: cd apps/api && npx vitest run --shard=${{ matrix.shard_index }}/${{ matrix.shard_count }}
 
       - name: Test — storage truth runner
-        if: matrix.kind == 'checks'
+        if: needs.changes.outputs.run_ci == 'true' && matrix.kind == 'checks'
         run: bun run test:storage-truth
 
   bun-refwatch-contract:
     name: "bun · refwatch behavior contract"
+    needs: changes
+    if: needs.changes.outputs.run_ci == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -148,6 +203,8 @@ jobs:
 
   web:
     name: "web · check + build"
+    needs: changes
+    if: needs.changes.outputs.run_ci == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -290,6 +347,8 @@ jobs:
 
   compiled-tui-build:
     name: "compiled TUI · cross-build"
+    needs: changes
+    if: needs.changes.outputs.run_ci == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
