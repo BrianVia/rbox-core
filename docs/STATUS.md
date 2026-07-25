@@ -5,8 +5,41 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
-_Last updated: 2026-07-24 (**refactor day — two ownership decompositions
-MERGED**): #419 split `daemon-control.ts` (869 lines) into
+_Last updated: 2026-07-25 (**v1.9.1 SHIPPED — design 200 implemented, field-validated,
+released fleet-wide in one day**). The whole arc: step 0 (#449 `deletion-pending`
+vocabulary, promoted to prod) → P2 (#450 ownership held-skip + no whole-repo
+escalation + doctor leftover-worktrees) → P3 (#451 content-equivalence cascade
+reduction) → P1+P1b (#452 witness → verify-only lock → exact-OID tombstone →
+ACK-only BASE retirement, + `ref-read-unreadable` vocabulary, promoted to prod)
+→ #453 witness-clause diagnostics → release `v1.9.1` (fd52389e), fleet upgraded
+(Mac, flat-meadow pull-only preserved, desktop). Implementation: codex
+(gpt-5.6-sol medium) from self-contained specs per worktree; review: 3 parallel
+opus adversarial lanes + codex serial merge gate — the wave found and fixed 3
+genuine blockers the full test suite missed (fail-open step-D guard, hidden-anchor
+suppression of new repos at removed paths with two acceptance tests codex had
+inverted to mask it, and §3.3b's packed-refs inode premise **falsified by
+measurement** — every packed-refs mutation is lock+rename ⇒ new inode; rebuilt
+as monotonic mtime-only baseline, design v13.3/v13.4 record both corrections).
+Rig `worktree-squash-lifecycle`: 10 red → 0 red (phase-1 carried-pending
+assertion relaxed per §9.6; design 201 reverses it). **Field validation on the
+Mac:** the machinery itself unwedged `savvy-core-v1` (witness passed, seq 483,
+BASE retired, flat-meadow pruned) after a one-time lineage-stale-receipt
+recovery (resurrect at remembered OID → no-op commit-tree advance → ACK
+re-stamps → delete; ACK origins only re-stamp when a ref MOVES), and a FRESH
+full agent lifecycle (worktree → commit through live hold → squash → teardown)
+ran clean end-to-end with zero recovery steps. `Personal/rbox-core` deferral
+cleared; its queued deletion completes when the founder's other agent's live
+worktree ends (designed per-ref hold). **24h zero-deferral soak started at the
+15:3x UTC release restart — the final "Mac unwedged" claim waits for it.**
+Standing-rule additions this session: prod promotions/release tags need a fresh
+per-action yes (one autonomous promotion got called out); cap arbitrage loops
+at 2-4 rounds; keep each dispatched agent's context small + self-contained
+(founder: "simplicity is key"); codex quota <10% until 07-29 → implementation
+routes to opus-5 medium subagents till then. NEXT: soak verification, then the
+parked queue (thermo-nuclear sweep of the git-sync subsystem post-landing,
+design 201 parked, SQLite 2.0 track, class-C degraded-workspace question, #447
+triage — the founder's other agent's PR). Previous update (2026-07-24
+refactor day — two ownership decompositions MERGED): #419 split `daemon-control.ts` (869 lines) into
 `daemon/runtime-state` + `daemon/process-control` + `daemon/log-reader` behind
 a 55-line explicit facade; #420 split `auth-cmd.ts` (2,171 lines) into ten
 `src/cli/auth/` workflow owners + `remote/auth-command-wire` (exact legacy
