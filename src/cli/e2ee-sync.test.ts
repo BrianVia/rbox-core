@@ -1780,7 +1780,7 @@ function sinkRemoteFor(server: FakeServer, secrets: DeviceSecrets, lines: string
 }
 
 const nonDeltaCauses = (lines: readonly string[]): string[] =>
-  lines.filter((line) => line.includes("mde non_delta cause=")).map((line) => line.split("cause=")[1]!);
+  lines.filter((line) => line.includes("mde non_delta cause=")).map((line) => line.match(/cause=([^ ]+)/)![1]!);
 
 /** Capture what the push seam actually hands the writer — a seam divergence
  *  (e.g. push building a base the writer discards) is invisible on the wire. */
@@ -1808,6 +1808,8 @@ test("204/5 default-on steady state publishes a chained delta a cold peer folds 
   expect(genesis.sequence).toBe(1);
   expect(await wireKind(server, pusher, 0)).toBe("snapshot");
   expect(nonDeltaCauses(lines)).toEqual(["no-base"]);
+  const genesisBody = parseSignedCommit(server.commits[0]!);
+  expect(lines).toContain(`rbox: mde non_delta cause=no-base bytes=${server.store.blobs.get(genesisBody.encManifestSha)!.byteLength}`);
   const afterGenesis = await loadState(root, syncStreamId(cfg));
   expect(validManifestMeta(afterGenesis.manifestMeta)).toEqual(afterGenesis.manifestMeta);
 
@@ -1815,9 +1817,9 @@ test("204/5 default-on steady state publishes a chained delta a cold peer folds 
   await retargetSymlink(root, 7, "steady-state-v2");
   expect((await push(root, cfg, { remote: pusher })).sequence).toBe(2);
   expect(await wireKind(server, pusher, 1)).toBe("delta");
-  expect(nonDeltaCauses(lines)).toEqual([]); // a delta commit logs nothing
-
+  expect(nonDeltaCauses(lines)).toEqual([]);
   const body = parseSignedCommit(server.commits[1]!);
+  expect(lines).toContain(`rbox: mde delta ops=1 bytes=${server.store.blobs.get(body.encManifestSha)!.byteLength}`);
   expect(body.manifestChain).toEqual([afterGenesis.manifestMeta!.encManifestSha]);
   const afterDelta = await loadState(root, syncStreamId(cfg));
   expect(afterDelta.manifestMeta!.chain).toEqual(body.manifestChain);

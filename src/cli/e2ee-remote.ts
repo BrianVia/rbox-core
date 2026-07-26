@@ -832,6 +832,7 @@ export class E2eeRemote implements SyncRemote {
     let resultManifestHash: string | undefined;
     let emittedChain: string[] | undefined;
     let emittedDelta = false;
+    let emittedDeltaOpCount: number | undefined;
     const disposition = deltaDisposition(deltaEnabled, options, epoch, account.currentEpoch);
     let nonDeltaCause: MdeNonDeltaCause | undefined;
     if (!snapshotEnabled) {
@@ -854,6 +855,7 @@ export class E2eeRemote implements SyncRemote {
         resultManifestHash = candidate.resultHash;
         emittedChain = chain;
         emittedDelta = true;
+        emittedDeltaOpCount = candidate.opCount;
       } else {
         nonDeltaCause = "economic";
         built = await encodeSnapshot(); // §3.3.4: candidate discarded, re-emit as snapshot
@@ -862,9 +864,13 @@ export class E2eeRemote implements SyncRemote {
       nonDeltaCause = disposition.cause;
       built = await encodeSnapshot();
     }
-    // §7 burn-in discriminator. Sink-only (the daemon supplies one, one-shot CLI
-    // commands do not) so an every-17th-push compaction never becomes user noise.
-    if (nonDeltaCause) this.ctx.warningSink?.(`rbox: mde non_delta cause=${nonDeltaCause}`);
+    // §7 per-commit discriminator. The selected envelope's encoded byte length
+    // attributes economic fallbacks to the emitted snapshot, not the discarded delta.
+    if (emittedDeltaOpCount !== undefined) {
+      this.ctx.warningSink?.(`rbox: mde delta ops=${emittedDeltaOpCount} bytes=${built.encManifest.byteLength}`);
+    } else if (nonDeltaCause) {
+      this.ctx.warningSink?.(`rbox: mde non_delta cause=${nonDeltaCause} bytes=${built.encManifest.byteLength}`);
+    }
     if (onCommitTimings) encodeMs = Math.max(0, Date.now() - t0 - encryptMs);
     if (onCommitTimings) {
       const t0 = Date.now();

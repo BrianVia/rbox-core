@@ -12,6 +12,11 @@ All notable changes to rbox are recorded here. The format follows
   Dev-build versions with `+` metadata now parse correctly, restoring daemon
   witness reporting and graceful shutdown safety.
 
+### Changed
+- Manifest publications now report whether they emitted a delta or snapshot,
+  including encoded size (and delta operation count), in daemon logs and
+  interactive push, pull, and sync diagnostics.
+
 ## [1.9.1] — 2026-07-25 — "worktrees come and go, sync keeps up"
 
 ### Fixed

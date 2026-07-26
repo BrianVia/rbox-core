@@ -75,7 +75,7 @@ export async function runSyncCommand(root: string, opts: { allowMassDelete?: boo
   const sp = spinner("syncing");
   try {
     await withWorkspaceSyncMutex(root, async (syncMutex) => {
-      const { cfg, deps } = await buildAuthedRemote(root);
+      const { cfg, deps } = await buildAuthedRemote(root, Date.now, (line) => process.stderr.write(`${line}\n`));
       deps.syncMutex = syncMutex;
       deps.onProgress = (done, total, phase, detail, bytes) => sp.update(progressLabel(phase, done, total, detail, bytes));
       attachGitSyncProgress(deps, sp, { verbose: opts.verbose });
