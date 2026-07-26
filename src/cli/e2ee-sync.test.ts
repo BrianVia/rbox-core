@@ -82,6 +82,7 @@ beforeEach(() => {
   delete process.env.RBOX_MDE_DELTA;
   delete process.env.RBOX_MDE_SNAPSHOT;
   delete process.env.RBOX_MDE_FAST_PULL;
+  delete process.env.RBOX_MTIME_NORMALIZE;
 });
 
 test("latest timing formatter appends the non-sensitive fold token", () => {
@@ -1793,6 +1794,34 @@ function recordCommitOptions(remote: E2eeRemote): Array<CommitOptions | undefine
   }) as E2eeRemote["commit"];
   return seen;
 }
+
+test("209/5 mtime-only scan is commit-free and a forced commit with full-tree skew emits exactly one delta op", async () => {
+  const server = new FakeServer();
+  const secrets = await bootstrapOnto(server, ACCT, "devA-209-sink", NOW);
+  const lines: string[] = [];
+  const pusher = sinkRemoteFor(server, secrets, lines);
+  const root = await tmp();
+  const cfg = await cfgFor(root, secrets, pusher);
+  await seedSymlinkWorkspace(root);
+  expect((await push(root, cfg, { remote: pusher })).sequence).toBe(1);
+
+  const skewSymlinkMtimes = async (mtimeMs: number): Promise<void> => {
+    const date = new Date(mtimeMs);
+    await Promise.all(Array.from({ length: 300 }, (_, index) =>
+      fs.lutimes(path.join(root, "partition", index.toString().padStart(4, "0")), date, date)));
+  };
+  await skewSymlinkMtimes(2_000);
+  const noop = await push(root, cfg, { remote: pusher });
+  expect(noop.committed).toBe(false);
+  expect(server.commits).toHaveLength(1);
+
+  lines.length = 0;
+  await retargetSymlink(root, 7, "one-real-change");
+  await skewSymlinkMtimes(3_000);
+  expect((await push(root, cfg, { remote: pusher })).sequence).toBe(2);
+  const body = parseSignedCommit(server.commits[1]!);
+  expect(lines).toContain(`rbox: mde delta ops=1 bytes=${server.store.blobs.get(body.encManifestSha)!.byteLength}`);
+}, 60_000);
 
 test("204/5 default-on steady state publishes a chained delta a cold peer folds exactly", async () => {
   const server = new FakeServer();
