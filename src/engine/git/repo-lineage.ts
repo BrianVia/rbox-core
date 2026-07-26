@@ -118,7 +118,17 @@ export async function readStateLineageV1(
   stateNonce: string,
   repositoryIdentity: RepoIdentityV1,
 ): Promise<StateLineageV1> {
-  const value = { workspaceRootReal: await fs.realpath(workspaceRoot), stream, stateNonce, repositoryIdentity };
+  return stateLineageV1FromRealRoot(await fs.realpath(workspaceRoot), stream, stateNonce, repositoryIdentity);
+}
+
+/** Construct lineage when the caller already resolved the workspace root. */
+export function stateLineageV1FromRealRoot(
+  workspaceRootReal: string,
+  stream: string,
+  stateNonce: string,
+  repositoryIdentity: RepoIdentityV1,
+): StateLineageV1 {
+  const value = { workspaceRootReal, stream, stateNonce, repositoryIdentity };
   encodeStateLineageV1(value);
   return value;
 }

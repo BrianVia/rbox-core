@@ -43,6 +43,7 @@ export {
   readRepoIdentityV1,
   encodeStateLineageV1,
   readStateLineageV1,
+  stateLineageV1FromRealRoot,
   lineageHash,
   artifactBinding,
   bindingForContext,
