@@ -309,3 +309,32 @@ product — a full regression hunt for what a `HEAD: <sha> (behind origin/main
 by N)` line in the report header would have made a 10-second read. Fix: rig
 run header logs the launching checkout's HEAD, dirty state, and
 behind-origin count; loudly warn when behind.
+- **`npm run digest -- --json` is unpipeable** (rbox-admin): npm prints its
+  own `> rbox-admin@…` banner to stdout ahead of the JSON, so `| python3 -m
+  json.tool` chokes. Use `npx tsx scripts/digest.ts` directly for machine
+  consumption, or teach the docs/skill that.
+- **Fleet-versions panel counts 14-day ghosts as hosts** (rbox-admin): a host
+  seen once since the window start stays a "host" on its old version after
+  upgrading, so 1.9.1 adoption read 20% when live devices were ~all current.
+  Dedupe by host on latest-seen version.
+- **`client.telemetry.drops` records only the reason enum, never the kind**
+  (by design, low-cardinality): a sustained `unknown_kind` CRITICAL is
+  unattributable from AE — can't tell which client/build sends the unknown
+  kind without tailing the worker live.
+- **`rbox pair` exits on copy-to-clipboard** (founder, 2026-07-26): hitting the
+  copy key in the pair flow terminates the command instead of staying alive to
+  watch for the peer's `connect` and confirming success. Copy should be
+  non-terminal; the flow should keep waiting and print "paired ✓ <device>"
+  (or time out with the token's expiry). Related backlog: onboarding pairing
+  flow (#5 in the 2026-07-18 UX list).
+- **`rbox init --workspace` only accepts the opaque `ws_…` id** (founder,
+  2026-07-26, during FM re-bind): the founder had to SSH-grep the Mac's
+  workspace.json for the id. It should also accept the server-visible
+  workspace NAME (resolve via the same listing the setup picker uses; error
+  on ambiguity, suggest candidates). Violates the minimize-typing law.
+- **`rbox init --adopt` runs minutes of silent hashing with no progress**
+  (founder, 2026-07-26, FM re-bind: 77k files, ~230% CPU, nothing on the
+  tty): the adoption scan should emit a rolling one-line status —
+  files hashed / total (percent), matched-vs-divergent counts as they
+  accumulate, like the transfer progress lines the daemon already renders
+  (design 45/88 machinery exists; wire it into the adopt scan path).
