@@ -9,14 +9,13 @@ import { createHash } from "node:crypto";
 // top-level pull of an op when the trust predicate P holds, and refreshes it
 // afterwards with an O(applied) patch unless a fallback trigger fires.
 
-import { HashCache, scanManifest, type BlobStore, type FileEntry, type GitSection, type Manifest } from "../../engine/index.js";
+import { HashCache, nativePruneGlobs, scanManifest, type BlobStore, type FileEntry, type GitSection, type IgnoreMatcher, type Manifest } from "../../engine/index.js";
 import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
-import { RboxDaemon } from "./daemon.js";
-import { gitTopologyChanged } from "./manifest-update.js";
-import type { ManifestUpdate } from "./manifest-update.js";
+import { RboxDaemon, type ScanCadenceClock } from "./daemon.js";
+import { gitReposMatcherKey, gitTopologyChanged } from "./manifest-update.js";
+import type { ManifestUpdate, TrustedPullViewResult } from "./manifest-update.js";
 import type { CommitResult, SyncRemote } from "../remote.js";
 import type { SyncState, WorkspaceConfig } from "../config.js";
-import type { TrustedLocalView } from "../sync.js";
 
 const KEK = Buffer.alloc(32, 7);
 const shaHex = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -76,8 +75,12 @@ class MiniRemote implements SyncRemote {
 interface DaemonInternals {
   cache: HashCache;
   manifest: Manifest;
-  matcher: unknown;
+  matcher: IgnoreMatcher;
   matcherGitReposKey: string;
+  matcherGeneration: number;
+  manifestMatcherGeneration: number;
+  watcherNativePruneKey: string;
+  rulesChangedSinceDeepScan: boolean;
   syncBase?: SyncState;
   want: { pull: boolean; push: boolean; fullScan: boolean; deepScan: boolean };
   writeFinishRetryTimers: Set<ReturnType<typeof setTimeout>>;
@@ -96,12 +99,15 @@ interface DaemonInternals {
   gitRefRegistry?: unknown;
   openDriftAudits: Set<{ candidates: unknown[]; timer?: ReturnType<typeof setTimeout> }>;
   activity: { halt?: { op: string; message?: string } };
+  startWatcherFn: (root: string, matcher: IgnoreMatcher, onSettle: unknown, opts: unknown) => Promise<{ backend: "parcel" | "chokidar"; close(): Promise<void> }>;
   pump(): Promise<void>;
   doDeepScan(): Promise<unknown>;
+  doFullScan(): Promise<unknown>;
+  startLiveWatch(): Promise<void>;
   loadSyncBase(): Promise<SyncState>;
   rebuildMatcher(state?: { lastSyncedManifest: Manifest }): void;
   scheduleWriteFinishRetry(paths: Set<string>): void;
-  buildTrustedPullView(base: SyncState): Promise<TrustedLocalView | undefined>;
+  buildTrustedPullView(base: SyncState): Promise<TrustedPullViewResult>;
   replaceManifestFromScan(
     cache: HashCache, previous: Manifest, stats: undefined, kind: undefined, mode: "pruned" | "unpruned",
   ): Promise<{ deferred: Set<string>; coverage: string }>;
@@ -142,10 +148,11 @@ function testConfig(): WorkspaceConfig {
   };
 }
 
-function makeDaemon(remote: MiniRemote): DaemonInternals {
+function makeDaemon(remote: MiniRemote, opts: { scanCadenceClock?: ScanCadenceClock } = {}): DaemonInternals {
   const d = new RboxDaemon(root, testConfig(), { remote, backoff: async () => {} }, {
     bootId: "boot-trust",
     log: (line: string) => lines.push(line),
+    ...opts,
   }) as unknown as DaemonInternals;
   d.cache = new HashCache();
   daemon = d;
@@ -154,22 +161,28 @@ function makeDaemon(remote: MiniRemote): DaemonInternals {
 
 /** Baseline: publish the current tree, then bring the daemon into the state P
  *  describes — live trusted watcher, complete manifest from a full-workspace scan,
- *  matcher current with the base's gitRepos, nothing pending. */
-async function armed(remote: MiniRemote): Promise<DaemonInternals> {
+ *  matcher current with the base's gitRepos, nothing pending.
+ *
+ *  The fixture watcher is PARCEL (design 206 §3b/r4-F3): on chokidar every matcher
+ *  rebuild fuses watcher trust, so the healing claims these tests pin can only be
+ *  stated for the fleet's default backend. The chokidar fuse has its own test. */
+async function armed(remote: MiniRemote, backend: "parcel" | "chokidar" = "parcel"): Promise<DaemonInternals> {
   const d = makeDaemon(remote);
   d.manifest = await scanManifest(root);
   const base = await d.loadSyncBase();
   d.want.push = true;
   await d.pump();
   const after = await d.loadSyncBase();
-  d.watcher = { backend: "chokidar", close: async () => {} };
+  // The rebuild lands BEFORE the fixture watcher exists: §3b's downgrade is about
+  // rebuilds under a LIVE subscription, and arming must not trip it.
+  d.rebuildMatcher(after ?? base);
+  d.watcher = { backend, close: async () => {} };
   d.watcherHealthy = true;
   d.watcherDegraded = false;
   d.trustState = "trusted";
   d.manifestObservationComplete = true;
   d.activeCaseCollisions = [];
   d.resetLifecycle = "ready";
-  d.rebuildMatcher(after ?? base);
   await d.replaceManifestFromScan(d.cache, after.lastSyncedManifest, undefined, undefined, "unpruned");
   lines.length = 0;
   return d;
@@ -177,33 +190,44 @@ async function armed(remote: MiniRemote): Promise<DaemonInternals> {
 
 const pullLine = (): string | undefined => lines.find((l) => l.startsWith("pull local="));
 
-// ── 1. P-matrix ────────────────────────────────────────────────────────────────
-test("design 202 P-matrix: every condition independently false drops the pull back to the scan path", async () => {
+// ── 1. P-matrix + 206 test 5 skip-cause matrix ────────────────────────────────
+test("design 202 P-matrix: every condition independently false drops the pull back to the scan path, naming its clause", async () => {
   const remote = new MiniRemote();
   await fs.writeFile(path.join(root, "a.txt"), "one");
   const d = await armed(remote);
   const base = await d.loadSyncBase();
 
-  expect(await d.buildTrustedPullView(base)).toBeDefined(); // armed baseline is trusted
+  expect((await d.buildTrustedPullView(base)).view).toBeDefined(); // armed baseline is trusted
 
-  const cases: [string, () => void, () => void][] = [
-    ["P1 no watcher", () => { d.watcher = undefined; }, () => { d.watcher = { backend: "chokidar", close: async () => {} }; }],
-    ["P1 unhealthy", () => { d.watcherHealthy = false; }, () => { d.watcherHealthy = true; }],
-    ["P1 untrusted", () => { d.trustState = "suspect"; }, () => { d.trustState = "trusted"; }],
-    ["P1 degraded", () => { d.watcherDegraded = true; }, () => { d.watcherDegraded = false; }],
-    ["P2 incomplete observation", () => { d.manifestObservationComplete = false; }, () => { d.manifestObservationComplete = true; }],
-    ["P2 case collision", () => { d.activeCaseCollisions = [{ paths: ["A.txt", "a.txt"] }]; }, () => { d.activeCaseCollisions = []; }],
-    ["P5 no full-workspace install since seed", () => { d.fullWorkspaceSinceSeed = false; }, () => { d.fullWorkspaceSinceSeed = true; }],
-    ["P6 not ready", () => { d.resetLifecycle = "recovering"; }, () => { d.resetLifecycle = "ready"; }],
-    ["P7 stale matcher provenance", () => { d.matcherGitReposKey = "some/repo"; }, () => { d.matcherGitReposKey = ""; }],
-    ["F5 kill switch", () => { process.env.RBOX_PULL_TRUST_WATCHER = "0"; }, () => { delete process.env.RBOX_PULL_TRUST_WATCHER; }],
+  const cases: [string, string, () => void, () => void][] = [
+    ["P1 no watcher", "p1-watcher", () => { d.watcher = undefined; }, () => { d.watcher = { backend: "parcel", close: async () => {} }; }],
+    ["P1 unhealthy", "p1-watcher", () => { d.watcherHealthy = false; }, () => { d.watcherHealthy = true; }],
+    ["P1 untrusted", "p1-watcher", () => { d.trustState = "suspect"; }, () => { d.trustState = "trusted"; }],
+    ["P1 degraded", "p1-watcher", () => { d.watcherDegraded = true; }, () => { d.watcherDegraded = false; }],
+    ["P2 incomplete observation", "p2-observation", () => { d.manifestObservationComplete = false; }, () => { d.manifestObservationComplete = true; }],
+    ["P2 case collision", "p2-observation", () => { d.activeCaseCollisions = [{ paths: ["A.txt", "a.txt"] }]; }, () => { d.activeCaseCollisions = []; }],
+    ["P5 no full-workspace install since seed", "p5-seed", () => { d.fullWorkspaceSinceSeed = false; }, () => { d.fullWorkspaceSinceSeed = true; }],
+    ["P6 not ready", "p6-reset", () => { d.resetLifecycle = "recovering"; }, () => { d.resetLifecycle = "ready"; }],
+    ["P7 stale matcher provenance", "p7-matcher", () => { d.matcherGitReposKey = "some/repo"; }, () => { d.matcherGitReposKey = ""; }],
+    ["P7 manifest not observed under this matcher", "p7-matcher-observation",
+      () => { d.manifestMatcherGeneration -= 1; }, () => { d.manifestMatcherGeneration += 1; }],
+    ["F5 kill switch", "kill-switch", () => { process.env.RBOX_PULL_TRUST_WATCHER = "0"; }, () => { delete process.env.RBOX_PULL_TRUST_WATCHER; }],
   ];
-  for (const [label, br0k, restore] of cases) {
+  for (const [label, skip, br0k, restore] of cases) {
     br0k();
-    expect(await d.buildTrustedPullView(base), label).toBeUndefined();
+    expect((await d.buildTrustedPullView(base)).skip, label).toBe(skip as never);
     restore();
-    expect(await d.buildTrustedPullView(base), `${label} (restored)`).toBeDefined();
+    expect((await d.buildTrustedPullView(base)).view, `${label} (restored)`).toBeDefined();
   }
+});
+
+// ── 206 test 11: the red herring never gates the predicate ────────────────────
+test("design 206: rulesChangedSinceDeepScan is diagnostics-only and never gates buildTrustedPullView", async () => {
+  const remote = new MiniRemote();
+  await fs.writeFile(path.join(root, "a.txt"), "one");
+  const d = await armed(remote);
+  d.rulesChangedSinceDeepScan = true;
+  expect((await d.buildTrustedPullView(await d.loadSyncBase())).view).toBeDefined();
 });
 
 test("design 202 P3: the pre-pull drain applies pending events into the view; a deferred one is stripped and exempted", async () => {
@@ -213,7 +237,7 @@ test("design 202 P3: the pre-pull drain applies pending events into the view; a 
   await fs.writeFile(path.join(root, "b.txt"), "two");
   d.pendingEvents.push({ relPath: "b.txt", kind: "change" });
 
-  const view = (await d.buildTrustedPullView(await d.loadSyncBase()))!;
+  const view = (await d.buildTrustedPullView(await d.loadSyncBase())).view!;
   expect(d.pendingEvents.length).toBe(0);
   expect(view.manifest.files.some((f) => f.path === "b.txt")).toBe(true); // drained INTO the view
   expect(d.lastManifestUpdate).toEqual({ kind: "partial", source: "watch-events", paths: new Set(["b.txt"]) });
@@ -271,6 +295,26 @@ test("design 202: a mass-delete trip under the trusted view refuses, re-pulls sc
   for (const n of names) expect(await fs.readFile(path.join(root, n), "utf8")).toBe(n);
 });
 
+// ── 206 test 6: the refusal names itself on the pull line ─────────────────────
+test("design 206: a refusal whose scan-backed re-run completes logs `pull local=scan skip=refused`", async () => {
+  const remote = new MiniRemote();
+  const names = Array.from({ length: 100 }, (_, i) => `f${String(i).padStart(3, "0")}.txt`);
+  for (const n of names) await fs.writeFile(path.join(root, n), n);
+  const d = await armed(remote);
+  // Half the tree leaves disk with no watcher event: the trusted view still carries
+  // 100 entries (guard trips at 100), a fresh scan carries 50 (below the floor).
+  for (const n of names.slice(0, 50)) await fs.rm(path.join(root, n));
+  remote.injectCommit([]);
+
+  d.want.pull = true;
+  await d.pump();
+
+  expect(lines).toContain("pull local=trusted refused=mass-delete"); // details stay on their own line
+  expect(pullLine()).toBe("pull local=trusted refused=mass-delete");
+  expect(lines.filter((l) => l.startsWith("pull local=")).at(-1)).toBe("pull local=scan skip=refused");
+  expect(d.activity.halt).toBeUndefined();
+});
+
 // ── 5. write-finish give-up ───────────────────────────────────────────────────
 test("design 202: a write-finish give-up records the path as unsettled until a covering scan re-observes it", async () => {
   const remote = new MiniRemote();
@@ -281,7 +325,7 @@ test("design 202: a write-finish give-up records the path as unsettled until a c
   for (let i = 0; i < 16; i++) d.scheduleWriteFinishRetry(new Set(["m.txt"])); // MAX_RETRIES = 15
   expect(d.unsettledPaths.has("m.txt")).toBe(true);
 
-  const view = (await d.buildTrustedPullView(await d.loadSyncBase()))!;
+  const view = (await d.buildTrustedPullView(await d.loadSyncBase())).view!;
   expect(view.manifest.files.some((f) => f.path === "m.txt")).toBe(false); // stripped
   expect(view.deferred.has("m.txt")).toBe(true); // and exempted
 
@@ -421,7 +465,7 @@ test("design 202 kill switch: RBOX_PULL_TRUST_WATCHER=0 restores the scan path e
   d.want.pull = true;
   await d.pump();
 
-  expect(pullLine()).toBe("pull local=scan");
+  expect(pullLine()).toBe("pull local=scan skip=kill-switch");
   expect(d.lastManifestUpdate?.kind).toBe("full-workspace");
   expect(await fs.readFile(path.join(root, "n.txt"), "utf8")).toBe("new");
 });
@@ -448,4 +492,256 @@ test.skipIf(!lazyGitProbesPresent)("design 202 + 203 both on: a steady-state pul
   expect(await fs.readFile(path.join(root, "n.txt"), "utf8")).toBe("new");
   expect(d.manifest.files.find((f) => f.path === "n.txt")?.sha256).toBe(shaHex("new"));
   expect((await d.loadSyncBase()).lastSyncedSequence).toBe(remote.head);
+});
+
+// ══ design 206 — matcher provenance must follow the base, skips must be named ══
+
+const REPO_SECTION: GitSection = {
+  bundleSha: "1".repeat(64), bundleEncSha: "2".repeat(64), bundleCipherSize: 1,
+  head: "ref: refs/heads/main\n", refs: {}, refScope: "all", generatedAt: "2026-07-26T00:00:00.000Z",
+};
+
+const withRepos = (base: SyncState, gitRepos: Record<string, GitSection>): SyncState => ({
+  ...base,
+  lastSyncedManifest: { ...base.lastSyncedManifest, gitRepos, manifestSchema: 2 },
+});
+
+/** The pre-op base carries a repo key the post-pull base will not — the shape a
+ *  clone/publish/delete sequence produces, with the matcher current for THAT base. */
+async function stagePreOpTopologyChange(d: DaemonInternals): Promise<void> {
+  d.syncBase = withRepos(await d.loadSyncBase(), { repo: REPO_SECTION });
+  d.matcherGitReposKey = "repo"; // P7 is measured against that same pre-op base
+}
+
+// ── 206 test 1 + 10: the #464 regression ──────────────────────────────────────
+test("design 206 (#464): a git-topology pull falls back once, then the NEXT pull is trusted again", async () => {
+  const remote = new MiniRemote();
+  await fs.writeFile(path.join(root, "a.txt"), "one");
+  const d = await armed(remote);
+  await stagePreOpTopologyChange(d);
+  remote.injectCommit([await remote.seedEntry("a.txt", "one"), await remote.seedEntry("n.txt", "new")]);
+
+  d.want.pull = true;
+  await d.pump();
+  expect(pullLine()).toBe("pull local=trusted fallback=git-topology");
+  // Test 10: the healing scan ran under a matcher whose provenance is the POST-pull
+  // base, and its install stamped that observation as current.
+  const base = await d.loadSyncBase();
+  expect(d.matcherGitReposKey).toBe(gitReposMatcherKey(base));
+  expect(d.manifestMatcherGeneration).toBe(d.matcherGeneration);
+
+  lines.length = 0;
+  remote.injectCommit([await remote.seedEntry("a.txt", "one"), await remote.seedEntry("n.txt", "new"), await remote.seedEntry("s.txt", "second")]);
+  d.want.pull = true;
+  await d.pump();
+  expect(pullLine()).toBe("pull local=trusted"); // pre-206 this stayed local=scan until restart
+});
+
+// ── 206 test 2: the push-side latch ───────────────────────────────────────────
+test("design 206: a base key-set change that arrives via the push path is not a permanent latch", async () => {
+  const remote = new MiniRemote();
+  await fs.writeFile(path.join(root, "a.txt"), "one");
+  const d = await armed(remote);
+  await fs.writeFile(path.join(root, "p.txt"), "push me");
+  // State-level simulation of the key change (MiniRemote has no git capture): the
+  // base moved and no rebuild site fired, exactly what push completion left behind.
+  d.matcherGitReposKey = "repo";
+
+  d.want.push = true;
+  await d.pump();
+  expect(d.matcherGitReposKey).toBe(gitReposMatcherKey(await d.loadSyncBase())); // realigned
+
+  lines.length = 0;
+  d.want.pull = true;
+  await d.pump();
+  // The rebuild invalidated the manifest's observation provenance: one scan pull.
+  expect(pullLine()).toBe("pull local=scan skip=p7-matcher-observation");
+
+  lines.length = 0;
+  d.want.pull = true;
+  await d.pump();
+  expect(pullLine()).toBe("pull local=trusted");
+});
+
+// ── 206 test 3: anti-re-trust invariant ───────────────────────────────────────
+test("design 206: a rebuilt matcher with no full-workspace install since is skip=p7-matcher-observation", async () => {
+  const remote = new MiniRemote();
+  await fs.writeFile(path.join(root, "a.txt"), "one");
+  const d = await armed(remote);
+  const base = await d.loadSyncBase();
+
+  d.rebuildMatcher(base);
+  expect((await d.buildTrustedPullView(base)).skip).toBe("p7-matcher-observation");
+
+  d.want.pull = true;
+  await d.pump();
+  expect(pullLine()).toBe("pull local=scan skip=p7-matcher-observation");
+});
+
+// ── 206 test 4: capture at observation START, not at install ──────────────────
+test("design 206: a rebuild landing mid-scan leaves the installed manifest stamped stale", async () => {
+  const remote = new MiniRemote();
+  await fs.writeFile(path.join(root, "a.txt"), "one");
+  const d = await armed(remote);
+  const base = await d.loadSyncBase();
+
+  // Fires strictly after the generation capture and strictly before the install —
+  // the window a stamp-at-install-time implementation would wrongly credit.
+  class RebuildDuringWalk extends HashCache {
+    fired = false;
+    lookup(rel: string, mtimeMs: number, size: number, ctimeMs: number): string | undefined {
+      if (!this.fired) {
+        this.fired = true;
+        d.rebuildMatcher(base);
+      }
+      return super.lookup(rel, mtimeMs, size, ctimeMs);
+    }
+  }
+  const cache = new RebuildDuringWalk();
+  await d.replaceManifestFromScan(cache, base.lastSyncedManifest, undefined, undefined, "unpruned");
+
+  expect(cache.fired).toBe(true);
+  expect(d.manifestMatcherGeneration).not.toBe(d.matcherGeneration);
+  expect((await d.buildTrustedPullView(base)).skip).toBe("p7-matcher-observation");
+});
+
+// ── 206 test 7: the hot-path guard ────────────────────────────────────────────
+test("design 206: loadSyncBase on an unchanged gitRepos key set rebuilds nothing", async () => {
+  const remote = new MiniRemote();
+  await fs.writeFile(path.join(root, "a.txt"), "one");
+  const d = await armed(remote);
+  const matcher = d.matcher;
+  const generation = d.matcherGeneration;
+
+  await d.loadSyncBase();
+  await d.loadSyncBase();
+
+  expect(d.matcher).toBe(matcher);
+  expect(d.matcherGeneration).toBe(generation);
+});
+
+// ── 206 test 8: the watcher follows the CURRENT matcher ───────────────────────
+test("design 206: the watcher receives a facade that tracks rebuilds, not the matcher object", async () => {
+  const clock: ScanCadenceClock = {
+    setTimeout: () => 0, clearTimeout: () => {}, setInterval: () => 0, clearInterval: () => {},
+  };
+  const d = makeDaemon(new MiniRemote(), { scanCadenceClock: clock });
+  let captured: IgnoreMatcher | undefined;
+  d.startWatcherFn = async (_root, matcher) => {
+    captured = matcher;
+    return { backend: "parcel", close: async () => {} };
+  };
+  await d.startLiveWatch();
+
+  expect(captured).toBeDefined();
+  expect(captured).not.toBe(d.matcher);
+  expect(captured!.ignores("x.txt")).toBe(false);
+
+  await fs.writeFile(path.join(root, ".rboxignore"), "x.txt\n");
+  d.rebuildMatcher(await d.loadSyncBase());
+
+  expect(captured!.ignores("x.txt")).toBe(true); // delegated, not captured-by-value
+});
+
+// ── 206 test 8b: backend-input downgrade (parcel) ──────────────────────────────
+const DOWNGRADE_LINE = "watcher downgraded: ignore-rule change alters native watch coverage — pulls scan until restart";
+
+test("design 206 §3b: a rebuild that changes the native prune globs fuses watcher trust for the daemon lifetime", async () => {
+  const remote = new MiniRemote();
+  await fs.writeFile(path.join(root, "a.txt"), "one");
+  const d = await armed(remote);
+  // `!dist/keep.txt` re-includes under a hard-pruned dir, so `dist` LEAVES the native
+  // set — the live subscription's globs no longer match the matcher.
+  await fs.writeFile(path.join(root, ".rboxignore"), "!dist/keep.txt\n");
+  d.rebuildMatcher(await d.loadSyncBase());
+
+  expect(lines).toContain(DOWNGRADE_LINE);
+  expect(d.trustState).toBe("fused");
+
+  lines.length = 0;
+  d.want.pull = true;
+  await d.pump();
+  expect(pullLine()).toBe("pull local=scan skip=p1-watcher");
+
+  await d.doFullScan(); // a clean full-workspace scan must NOT re-trust a fuse
+  expect(d.trustState).toBe("fused");
+  lines.length = 0;
+  d.want.pull = true;
+  await d.pump();
+  expect(pullLine()).toBe("pull local=scan skip=p1-watcher");
+});
+
+test("design 206 §3b: matcher coverage expanding into an ALWAYS_NATIVE_PRUNE dir downgrades even though the globs are unchanged", async () => {
+  const remote = new MiniRemote();
+  await fs.writeFile(path.join(root, "a.txt"), "one");
+  const d = await armed(remote);
+  const globsBefore = d.watcherNativePruneKey;
+  await fs.writeFile(path.join(root, ".rboxignore"), "!node_modules/\n");
+  d.rebuildMatcher(await d.loadSyncBase());
+
+  expect(nativePruneGlobs(root).join("\n")).toBe(globsBefore); // the r4 false negative
+  expect(lines).toContain(DOWNGRADE_LINE);
+  expect(d.trustState).toBe("fused");
+});
+
+test("design 206 §3b: a rebuild that leaves the backend inputs alone does NOT downgrade", async () => {
+  const remote = new MiniRemote();
+  await fs.writeFile(path.join(root, "a.txt"), "one");
+  const d = await armed(remote);
+  await fs.writeFile(path.join(root, ".rboxignore"), "notes.txt\n");
+  d.rebuildMatcher(await d.loadSyncBase());
+
+  expect(lines).not.toContain(DOWNGRADE_LINE);
+  expect(d.trustState).toBe("trusted");
+
+  lines.length = 0;
+  d.want.pull = true;
+  await d.pump(); // re-observes under the new matcher
+  d.want.pull = true;
+  lines.length = 0;
+  await d.pump();
+  expect(pullLine()).toBe("pull local=trusted");
+});
+
+test("design 206 §3b: on chokidar ANY rebuild downgrades — its watch admission bakes in `prunes`", async () => {
+  const remote = new MiniRemote();
+  await fs.writeFile(path.join(root, "a.txt"), "one");
+  const d = await armed(remote, "chokidar");
+  await fs.writeFile(path.join(root, ".rboxignore"), "notes.txt\n");
+  d.rebuildMatcher(await d.loadSyncBase());
+
+  expect(lines).toContain(DOWNGRADE_LINE);
+  expect(d.trustState).toBe("fused");
+});
+
+// ── 206 test 8c: the observation-op boundary guard ────────────────────────────
+test("design 206 §1: a hygiene-installed base with a changed key set is re-baselined by the next deep scan", async () => {
+  const remote = new MiniRemote();
+  await fs.writeFile(path.join(root, "a.txt"), "one");
+  const d = await armed(remote);
+  // Hygiene installs syncBase directly and the pump prefers it over a reload: without
+  // the op-boundary guard a pull-only daemon would deep-scan under the stale matcher.
+  d.syncBase = withRepos(await d.loadSyncBase(), { repo: REPO_SECTION });
+
+  await d.doDeepScan();
+
+  expect(d.matcherGitReposKey).toBe(gitReposMatcherKey(d.syncBase!));
+  expect(d.manifestMatcherGeneration).toBe(d.matcherGeneration);
+  expect((await d.buildTrustedPullView(d.syncBase!)).view).toBeDefined();
+});
+
+// ── 206 test 9: the founder's literal sequence ────────────────────────────────
+test("design 206: clone → publish → delete → publish realigns P7 at every step", async () => {
+  const remote = new MiniRemote();
+  await fs.writeFile(path.join(root, "a.txt"), "one");
+  const d = await armed(remote);
+  const base = await d.loadSyncBase();
+
+  for (const gitRepos of [{ repo: REPO_SECTION }, {}, { repo: REPO_SECTION }, {}]) {
+    d.syncBase = withRepos(base, gitRepos);
+    await d.doFullScan(); // the pump-owned observation boundary of that step
+    expect(d.matcherGitReposKey).toBe(gitReposMatcherKey(d.syncBase!));
+    expect(d.manifestMatcherGeneration).toBe(d.matcherGeneration);
+    expect((await d.buildTrustedPullView(d.syncBase!)).view).toBeDefined();
+  }
 });

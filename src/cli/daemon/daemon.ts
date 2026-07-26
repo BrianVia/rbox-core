@@ -6,8 +6,10 @@ import { constants } from "node:fs";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import {
+  ALWAYS_NATIVE_PRUNE,
   applyWatchEvents,
   buildIgnoreMatcher,
+  nativePruneGlobs,
   discoverGitRepos,
   discoverGitReposUnder,
   diffManifests,
@@ -125,6 +127,8 @@ import {
   patchManifestFromPull,
   pullTrustWatcherEnabled,
   type ManifestUpdate,
+  type SkipCause,
+  type TrustedPullViewResult,
 } from "./manifest-update.js";
 import { cleanPath, LOG_PATHS_MAX, scanStatsLine, summarizeActions } from "./render.js";
 import { RotatingDaemonLogger, type DaemonLogSink } from "./logger.js";
@@ -400,6 +404,15 @@ export class RboxDaemon {
   private fullWorkspaceSinceSeed = false;
   /** P7: the base `gitRepos` key set `this.matcher` was last built from. */
   private matcherGitReposKey = gitReposMatcherKey();
+  /** Design 206 §2: bumped by every `rebuildMatcher`. */
+  private matcherGeneration = 0;
+  /** The generation the CURRENT manifest's full-workspace observation STARTED under.
+   *  Never equal to `matcherGeneration` until such an observation installs, so P7
+   *  refuses a manifest whose inclusion decisions predate the live matcher. */
+  private manifestMatcherGeneration = -1;
+  /** The `nativePruneGlobs` output the live parcel subscription was created with —
+   *  backend state no facade can retro-fix (design 206 §3b). */
+  private watcherNativePruneKey: string;
   private activeCaseCollisions: CaseFoldCollisionGroup[] = [];
   private pathWarningWrite: Promise<void> = Promise.resolve();
   private syncBase?: SyncState;
@@ -630,6 +643,7 @@ export class RboxDaemon {
     this.telemetry = new TelemetryQueue(this.api, this.log);
     this.syncStateReporter = new SyncStateReporter(root, cfg, this.api, this.log);
     this.matcher = buildIgnoreMatcher(root, { respectGitignore: cfg.respectGitignore === true });
+    this.watcherNativePruneKey = nativePruneGlobs(root).join("\n");
     this.bootId = opts.bootId ?? process.env[DAEMON_BOOT_ID_ENV] ?? crypto.randomBytes(16).toString("hex");
     this.pullOnly = opts.pullOnly === true;
     this.chainRepairPolicy = new DaemonChainRepairPolicy(cfg.deviceId);
@@ -790,7 +804,7 @@ export class RboxDaemon {
     try {
       const watcher = await this.startWatcherFn(
         this.root,
-        this.matcher,
+        this.currentMatcherFacade(),
         (events) => {
           if (this.resetLifecycle !== "ready") return;
           this.noteChurn();
@@ -870,6 +884,9 @@ export class RboxDaemon {
         return;
       }
       this.watcher = watcher;
+      // The subscription's native prune set is fixed from here until close; §3b
+      // compares later rebuilds against THIS value, not the current rule files.
+      this.watcherNativePruneKey = nativePruneGlobs(this.root).join("\n");
       const registryEligible = gitRefSideChannelEligible(process.platform, this.watcher.backend);
       if (registryEligible) {
         this.gitRefRegistry = new GitRefWatchRegistry({
@@ -1194,6 +1211,10 @@ export class RboxDaemon {
   private async loadSyncBase(heldMutex?: WorkspaceSyncMutex): Promise<SyncState> {
     const state = await loadState(this.root, syncStreamId(this.cfg), this.log, heldMutex);
     this.syncBase = state;
+    // Design 206 §1: push completion, post-pull reload, failure recovery and boot all
+    // land here, so a base whose `gitRepos` key set moved re-baselines P7 provenance
+    // instead of latching the pull path onto scans until restart (#464).
+    this.ensureMatcherProvenance(state);
     return state;
   }
 
@@ -2142,24 +2163,29 @@ export class RboxDaemon {
    * with a side effect, so a kill-switched or otherwise untrusted daemon behaves
    * exactly as it did before this design.
    */
-  private async buildTrustedPullView(base: SyncState): Promise<TrustedLocalView | undefined> {
-    if (!pullTrustWatcherEnabled()) return undefined;                            // F5
-    if (!this.watcherTrustedForPull()) return undefined;                         // P1
-    if (!this.manifestSettledForPull()) return undefined;                        // P2
-    if (!this.fullWorkspaceSinceSeed) return undefined;                          // P5
-    if (this.resetLifecycle !== "ready") return undefined;                       // P6
-    if (this.matcherGitReposKey !== gitReposMatcherKey(base)) return undefined;  // P7
+  private async buildTrustedPullView(base: SyncState): Promise<TrustedPullViewResult> {
+    if (!pullTrustWatcherEnabled()) return { skip: "kill-switch" };              // F5
+    if (!this.watcherTrustedForPull()) return { skip: "p1-watcher" };            // P1
+    if (!this.manifestSettledForPull()) return { skip: "p2-observation" };       // P2
+    if (!this.fullWorkspaceSinceSeed) return { skip: "p5-seed" };                // P5
+    if (this.resetLifecycle !== "ready") return { skip: "p6-reset" };            // P6
+    if (this.matcherGitReposKey !== gitReposMatcherKey(base)) return { skip: "p7-matcher" };            // P7
+    // Design 206 §2: provenance alone would re-engage trust over a manifest whose
+    // inclusion decisions predate the current matcher.
+    if (this.manifestMatcherGeneration !== this.matcherGeneration) return { skip: "p7-matcher-observation" };
     await this.applyPendingWatchEvents();                                        // P3
-    if (this.pendingEvents.length > 0) return undefined;
+    if (this.pendingEvents.length > 0) return { skip: "p3-pending" };
     // The drain is P's only side-effecting clause and it awaits: re-read the two
     // conditions it can itself invalidate rather than trusting the pre-drain read.
-    if (!this.watcherTrustedForPull() || !this.manifestSettledForPull()) return undefined;
+    // Each re-check reports its own clause — never a token of its own.
+    if (!this.watcherTrustedForPull()) return { skip: "p1-watcher" };
+    if (!this.manifestSettledForPull()) return { skip: "p2-observation" };
     // `deferred` aliases the live set deliberately: it is read-only to `pull()`
     // (ReadonlySet) and every writer of `unsettledPaths` is pump-owned code that
     // cannot run while this op's `pull()` is in flight — watcher callbacks only
     // enqueue events, and the pump is single-flight. The op therefore sees one
     // consistent snapshot without copying it.
-    return { manifest: omitPaths(this.manifest, this.unsettledPaths), deferred: this.unsettledPaths };
+    return { view: { manifest: omitPaths(this.manifest, this.unsettledPaths), deferred: this.unsettledPaths } };
   }
 
   /**
@@ -2194,7 +2220,7 @@ export class RboxDaemon {
     // the post-pull install; the pre-op base is F2's "before" side.
     const opWatcherErrorGeneration = this.watcherErrorGeneration;
     const preBase = this.syncBase ?? await this.loadSyncBase();
-    const trustedView = await this.buildTrustedPullView(preBase);
+    const trustResult = await this.buildTrustedPullView(preBase);
     const metricsReport = beginReport("pull");
     const report = metricsReport ?? (telemetryEnabled() ? PhaseReport.pull() : undefined);
     // onGitLog: per-repo apply/conflict/defer forensics (design 43 §10) land in the daemon log.
@@ -2250,7 +2276,11 @@ export class RboxDaemon {
     // when it consumed one, `undefined` when it scanned (never consumed, or refused
     // and re-ran scan-backed). Everything downstream — the patch, the fallback, the
     // log line — reads this, not a web of parallel flags.
-    let trustedLocal = trustedView;
+    let trustedLocal = trustResult.view;
+    // Design 206 §4: the CAUSE the main line had no trusted view, kept separate from
+    // the view itself so a refusal (which nulls the view after it was built) names
+    // itself instead of reappearing as a bare `local=scan`.
+    let initialSkip: SkipCause | "refused" | undefined = trustResult.skip;
     let actions: Action[];
     try {
       actions = await runPull(trustedLocal);
@@ -2260,6 +2290,7 @@ export class RboxDaemon {
       // op — that run's guard behaves as it always has (a real wave still halts).
       this.log(`pull local=trusted refused=${error.reason}`);
       trustedLocal = undefined;
+      initialSkip = "refused";
       actions = await runPull(undefined);
     }
     this.chainRepairPolicy.clear();
@@ -2293,8 +2324,10 @@ export class RboxDaemon {
     // Every cause is NAMED by the check that decides it — including F1, which the
     // patch itself reports — so none is ever reconstructed by elimination. F2 is a
     // pure pre/post base comparison (nothing new comes out of `pull()`) and is what
-    // keeps repo discovery (ref registry + safety floor) and matcher provenance (P7)
-    // with the scan that does them right.
+    // keeps repo discovery (ref registry + safety floor) with the scan that does it
+    // right. The scan does NOT realign matcher provenance — the guarded rebuild in
+    // `loadSyncBase` above already did that (design 206 §1), so this scan runs under a
+    // current matcher and its install re-stamps the observation generation.
     const fallback = trustedLocal === undefined ? undefined
       : chainRepaired ? "chain-repair"                                          // F4
       : rulesWritten ? "ignore-rules"                                           // F3
@@ -2307,9 +2340,10 @@ export class RboxDaemon {
     if (trustedLocal === undefined || fallback !== undefined) {
       await this.replaceManifestFromScan(this.cache, base.lastSyncedManifest, undefined, undefined, this.watcherScanMode());
     }
-    // Fleet-greppable provenance: which local view the pull's main line read, and why
-    // the O(applied) refresh gave way to a scan when it did.
-    this.log(`pull local=${trustedLocal === undefined ? "scan" : "trusted"}${fallback === undefined ? "" : ` fallback=${fallback}`}`);
+    // Fleet-greppable provenance, three distinct questions: which local view the pull's
+    // main line read, why it had none (`skip=`), and why the post-pull O(applied)
+    // refresh gave way to a scan (`fallback=`).
+    this.log(`pull local=${trustedLocal === undefined ? "scan" : "trusted"}${initialSkip === undefined ? "" : ` skip=${initialSkip}`}${fallback === undefined ? "" : ` fallback=${fallback}`}`);
   }
 
   private bumpConflict(_kind: "commit"): void {
@@ -2339,7 +2373,13 @@ export class RboxDaemon {
   }
 
   /** Runs synchronously after the authoritative state save, before later network
-   * work can hang/fail, so every new durable episode becomes locally visible. */
+   * work can hang/fail, so every new durable episode becomes locally visible.
+   *
+   * Deliberately does NOT re-baseline matcher provenance (design 206 §1): its callers
+   * are `pull()`/`pushManifest()` save callbacks and the un-pumped hygiene timer, where
+   * a synchronous rebuild would stall the event loop mid-network-op. A key change here
+   * leaves P7 refusing (named `skip=p7-matcher`) until the next pump-owned boundary —
+   * at most one extra scan pull, in the safe direction. */
   private observeDurableGitState(state: SyncState, now = Date.now()): void {
     const before = this.syncBase
       ? renderShellDeferrals(this.syncBase, now, ageBucket, projectedRepoRecords(this.syncBase))
@@ -2893,6 +2933,7 @@ export class RboxDaemon {
 
   private async doFullScan(): Promise<ScanCoverage> {
     await this.reloadWorkspaceConfigIfChanged();
+    if (this.syncBase) this.ensureMatcherProvenance(this.syncBase);
     const errorGenAtStart = this.watcherErrorGeneration;
     const stats = createScanStats();
     const started = Date.now();
@@ -2911,6 +2952,11 @@ export class RboxDaemon {
   /** Cache-bypassing re-hash — the ultimate authority against mtime+size-stable drift. */
   private async doDeepScan(): Promise<ScanCoverage> {
     await this.reloadWorkspaceConfigIfChanged();
+    // Design 206 §1 serial gate: hygiene installs `syncBase` directly and the pump
+    // binding prefers it over a reload, so a pull-only daemon could otherwise deep-scan
+    // under a stale matcher indefinitely. Runs BEFORE errorGen capture, audit creation,
+    // and `watcherScanMode()` selection.
+    if (this.syncBase) this.ensureMatcherProvenance(this.syncBase);
     const errorGenAtStart = this.watcherErrorGeneration;
     const scanStartMs = Date.now();
     const priorManifest = this.manifest;
@@ -2978,6 +3024,12 @@ export class RboxDaemon {
     const deferErrnos = makeDeferErrnoReporter(this.log, () => {
       try { this.telemetry.record({ kind: "safety_event", eventType: "scan_fault", count: 1 }); } catch {}
     });
+    // Design 206 §2: the generation this observation STARTS under, captured with the
+    // same synchronous read of `this.matcher` the walk uses. Stamping at install time
+    // instead would credit a rebuild that landed during the (seconds-long) walk to a
+    // manifest observed under the old matcher; capturing here leaves the stamp stale
+    // so P7 keeps trusted off until the next clean observation.
+    const observedUnder = this.matcherGeneration;
     const fresh = await scanManifest(this.root, this.matcher, cache, undefined, (repo) => discoveredGitRepos.push(repo), scanStats, deferred, probe, dircache, mode,
       deferErrnos.onErrno, this.log);
     deferErrnos.flush();
@@ -3023,6 +3075,7 @@ export class RboxDaemon {
       deferred.size > 0 ? deferManifest(fresh, previous, deferred) : fresh,
       { kind: "full-workspace", coverage, deferred },
       { rebuildFrom: deferred },
+      observedUnder,
     );
     if (deferred.size > 0) this.scheduleWriteFinishRetry(deferred);
     if (probe) {
@@ -3173,6 +3226,62 @@ export class RboxDaemon {
       knownGitRepos: Object.keys(state?.lastSyncedManifest.gitRepos ?? {}),
     });
     this.matcherGitReposKey = gitReposMatcherKey(state);
+    this.matcherGeneration++;
+    this.downgradeWatcherIfBackendStale();
+  }
+
+  /**
+   * Design 206 §1: re-baseline P7 provenance at pump-owned boundaries. The
+   * key-equality guard is LOAD-BEARING, not an optimization: under tracked
+   * evaluation `buildIgnoreMatcher` runs `discoverGitReposSync` plus per-repo
+   * `git ls-files`, so an unguarded call would put sync fs + subprocess work on
+   * every base reload. Guarded, it fires only on genuine topology change.
+   */
+  private ensureMatcherProvenance(base: SyncState): void {
+    if (this.matcherGitReposKey !== gitReposMatcherKey(base)) this.rebuildMatcher(base);
+  }
+
+  /**
+   * Design 206 §3b. The §3a facade keeps the JS filtering layer current, but the
+   * BACKEND subscription bakes in matcher-derived state it cannot retro-fix: parcel's
+   * native `ignore` globs are computed once at subscribe time, and chokidar bakes
+   * `matcher.prunes` into recursive watch admission. When a rebuild moves those
+   * inputs the live watch is blind for paths the new matcher observes, so trust drops
+   * to the EXISTING terminal `fused` state — P1 stays false and every pull takes the
+   * (correct, pre-202) scan path until restart. Hot re-arm is a watcher-lifecycle
+   * design of its own, deliberately not smuggled in here.
+   */
+  private downgradeWatcherIfBackendStale(): void {
+    const backend = this.watcher?.backend;
+    if (backend === undefined || this.trustState === "fused") return;
+    const stale = backend === "chokidar"
+      // Chokidar admits recursive watches by the full `prunes` result: any rebuild
+      // can move it, and there is no cheaper subscription input to compare.
+      || nativePruneGlobs(this.root).join("\n") !== this.watcherNativePruneKey
+      // Glob output unchanged but matcher coverage EXPANDED into a natively-excluded
+      // dir (`!node_modules/`): those events never reach the JS layer at all.
+      || [...ALWAYS_NATIVE_PRUNE].some((d) => !(this.matcher.prunes?.(`${d}/`) ?? this.matcher.ignores(`${d}/`)));
+    if (!stale) return;
+    this.log("watcher downgraded: ignore-rule change alters native watch coverage — pulls scan until restart");
+    this.setTrustState("fused", "native watch coverage changed");
+    this.writeAmbientStatus();
+    this.pinSafetyFloor();
+  }
+
+  /**
+   * Design 206 §3a. The watcher is handed THIS, not `this.matcher`: the backends
+   * capture the matcher object once at start, so after any rebuild a captured
+   * reference filters live events through a matcher the daemon has already replaced.
+   * Delegation switches atomically with the assignment in `rebuildMatcher`.
+   */
+  private currentMatcherFacade(): IgnoreMatcher {
+    return {
+      ignores: (p) => this.matcher.ignores(p),
+      prunes: (p) => this.matcher.prunes?.(p) ?? this.matcher.ignores(p),
+      prunesForGitDiscovery: (p) => this.matcher.prunesForGitDiscovery?.(p) ?? this.matcher.ignores(`${p}/`),
+      tracked: (p) => this.matcher.tracked?.(p) ?? false,
+      unevaluatedGitRepoForPath: (p) => this.matcher.unevaluatedGitRepoForPath?.(p),
+    };
   }
 
   /**
@@ -3194,11 +3303,20 @@ export class RboxDaemon {
     next: Manifest,
     update: ManifestUpdate | undefined,
     unsettled?: { rebuildFrom?: ReadonlySet<string>; settle?: Iterable<string>; add?: Iterable<string> },
+    /** Design 206 §2: the matcher generation the full-workspace OBSERVATION started
+     *  under — captured by its caller, never re-read here. Meaningless for a partial
+     *  update (no observation) and for the seed (nothing observed at all). */
+    observedUnderMatcherGeneration?: number,
   ): void {
     this.manifest = next;
     this.lastManifestUpdate = update;
-    if (update === undefined) this.fullWorkspaceSinceSeed = false;
-    else if (update.kind === "full-workspace") this.fullWorkspaceSinceSeed = true;
+    if (update === undefined) {
+      this.fullWorkspaceSinceSeed = false;
+      this.manifestMatcherGeneration = -1;
+    } else if (update.kind === "full-workspace") {
+      this.fullWorkspaceSinceSeed = true;
+      this.manifestMatcherGeneration = observedUnderMatcherGeneration ?? -1;
+    }
     if (unsettled?.rebuildFrom) {
       this.unsettledPaths.clear();
       for (const p of unsettled.rebuildFrom) this.unsettledPaths.add(p);
