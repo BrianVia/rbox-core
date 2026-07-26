@@ -55,3 +55,26 @@ r2 scope: **A (hardened) + B (hardened, + FAST_PULL default-on) + C-reduced
 (narrow C1, scoped read-only memos, realpath hoist, C5 attribution) in
 v1.10.0; C3 (delta discovery) and the cross-repo common-dir memo are OUT,
 deferred with their evidence to a successor design.**
+
+## Round 2 (2026-07-26) — serial gate, codex gpt-5.6-sol (medium)
+
+Verdict: CHANGES-REQUIRED (1 HIGH, 3 MEDIUM, 2 LOW — strictly narrower than
+round 1; converging). Raw report: `CODEX-204-R2-SERIAL.md` (worktree-local).
+
+| # | Finding | Ruling |
+|---|---|---|
+| 1 | HIGH: FAST_PULL default-on opens a persisted-corruption wedge — grown-chain path trusts persisted `manifestHash` without re-hashing; fold failure → `ManifestChainError` → daemon repair's cold probe succeeds → retry reuses the same corrupt evidence (escapes the one-level catch at `src/cli/daemon/daemon.ts:2226`). | **ACCEPT.** r3 rule: any evidence-fold failure is a cold-walk miss WITHIN the same pull (retry without evidence; cold walk self-heals persisted state); only cold-walk failure raises `ManifestChainError`. New test 9b (real pull, repair catch not entered). Chose fallback over pre-hashing to keep steady state at zero extra cost. |
+| 2 | MEDIUM: default-on `recordEvidence` forces meta collection under `RBOX_MDE_SNAPSHOT=0`; raw-v0 decode synthesizes `manifestMeta`; mixed-fleet expectation at `src/cli/e2ee-sync.test.ts:704` inverts. | **ACCEPT (behavior ruled fine, made explicit).** Synthesized meta from a raw head is harmless and keeps evidence live during an emergency raw window. Test 9c names the required update. |
+| 3 | MEDIUM: O16 discriminator still non-exhaustive (economic rejection, kill switches, repair also cause persistent snapshots). | **ACCEPT.** Writer logs `mde snapshot cause=<policy\|no-base\|integrity\|force\|economic\|chain-cap>` on every non-delta commit (small implementation addition); §7 rewritten around the enum. |
+| 4 | MEDIUM: test 3 named a nonexistent wire field — endpoint returns `error:"unsatisfied_blobs"` + `missing`/`missingTotal` (`apps/api/src/commit-envelope.ts:31`); `unsatisfiedBlobs` is the client-side name. Harness: `testEnv` must accept `"enforce"`; over-cap needs 50,001 markers (bulk insert). | **ACCEPT.** §3.1 + test 3 corrected; harness notes folded. Gate confirmed the regression is otherwise writable in the current harness. |
+| 5 | LOW: O15 anchor-qualification was a silent no-op in r2; plus exact errors (economic guard :782 not :781; journal pair :419-420 not :418-419; `e2ee-remote.ts:77-83` is history, not reader-support evidence). | **ACCEPT.** All named anchors fixed; remaining bare anchors qualified; reader-support evidence re-anchored to the decode path (`src/cli/e2ee-remote.ts:160-305`). |
+| 6 | LOW: C2 mis-stated `plan.ts:502` as a stage-2 read — it runs inside `captureWithConfig` post-capture (invoked from `:1000`). | **ACCEPT.** §5.4 rewritten: memo covers `:378,458` only, cleared before the capture pool; `:502`, `:1271`, `:1281` are fresh post-boundary derivations. |
+
+Gate also verified with no findings: all other round-1 rulings materially
+folded; §3.2 fault-model narrowing matches admission reality;
+`canonicalManifestHash` exists (`src/engine/manifest-delta.ts:195`, sync
+helper `canonicalManifestHashStreaming` at `:96`) and closes the A7 hole;
+raw-v0 readable everywhere incl. doctor's `chainDiagnostic`; C1-narrow
+matches `plan.ts` dependencies.
+
+## Round 3 — focused re-check of the round-2 folds: pending
