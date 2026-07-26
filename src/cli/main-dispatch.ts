@@ -294,7 +294,7 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
       const sp = spinner("pushing");
       try {
         await withWorkspaceSyncMutex(root, async (syncMutex) => {
-          const { cfg, deps } = await buildAuthedRemote(root);
+          const { cfg, deps } = await buildAuthedRemote(root, Date.now, (line) => process.stderr.write(`${line}\n`));
           deps.syncMutex = syncMutex;
           deps.onProgress = (done, total, phase, detail, bytes) => sp.update(progressLabel(phase, done, total, detail, bytes));
           // Push-side consent (design 50 §4): op-scoped — NEVER the pull-side
@@ -322,7 +322,7 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
       const sp = spinner("pulling");
       try {
 await withWorkspaceSyncMutex(root, async (syncMutex) => {
-          const { cfg, deps } = await buildAuthedRemote(root);
+          const { cfg, deps } = await buildAuthedRemote(root, Date.now, (line) => process.stderr.write(`${line}\n`));
           deps.syncMutex = syncMutex;
           deps.onProgress = (done, total, phase, detail, bytes) => sp.update(progressLabel(phase, done, total, detail, bytes));
           attachGitSyncProgress(deps, sp, { verbose: flags["verbose"] === "true" });
