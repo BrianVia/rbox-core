@@ -1,19 +1,27 @@
 /** Minimal semver for the forward-only upgrade gate (design 14 U4'). Parses
  *  `MAJOR.MINOR.PATCH` (optional leading `v`, optional `-prerelease` which we treat
- *  as lower than the same release). Rejects malformed input rather than guessing. */
+ *  as lower than the same release, and optional `+build` ignored for precedence).
+ *  Rejects malformed input rather than guessing. */
 export interface SemVer {
   major: number;
   minor: number;
   patch: number;
   prerelease: string | null;
+  build: string | null;
 }
 
-const RE = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/;
+const RE = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.-]+))?$/;
 
 export function parseSemver(s: string): SemVer {
   const m = RE.exec(s.trim());
   if (!m) throw new Error(`not a semver: ${s}`);
-  return { major: Number(m[1]), minor: Number(m[2]), patch: Number(m[3]), prerelease: m[4] ?? null };
+  return {
+    major: Number(m[1]),
+    minor: Number(m[2]),
+    patch: Number(m[3]),
+    prerelease: m[4] ?? null,
+    build: m[5] ?? null,
+  };
 }
 
 /** Compare two prerelease strings by semver §11 precedence: dot-separated
