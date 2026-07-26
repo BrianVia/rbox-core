@@ -1,7 +1,7 @@
-# 207 — Repo-removal residue: sweep what rmdir proves empty, show the rest
+# 208 — Repo-removal residue: sweep what rmdir proves empty, show the rest
 
 Status: ALIGNED r3 (tier-2 retirement and bundle retention DESCOPED on
-review; serial-gate hardening folded — see REVIEW-207.md)
+review; serial-gate hardening folded — see REVIEW-208.md)
 Fixes: #460 (visible ghost skeleton + doctor blindness). Successor work
 seeded in §Descoped.
 

@@ -156,7 +156,7 @@ test("the full design-138 loadState caller inventory remains on the hard-refusal
     "sync/push.ts": 6,
     "status-cmd.ts": 2,
     // Workspace shape, the local-only linked-worktree inventory, and the
-    // design-207 repo-residue section each read through the same
+    // design-208 repo-residue section each read through the same
     // stream-mismatch hard-refusal API.
     "doctor-cmd.ts": 3,
     "ignore-cmd.ts": 1,

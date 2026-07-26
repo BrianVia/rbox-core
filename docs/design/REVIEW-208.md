@@ -1,4 +1,4 @@
-# REVIEW-207 — ledger
+# REVIEW-208 — ledger (repo-removal residue; renumbered from 207 — the Alchemy evaluation claimed 207 concurrently)
 
 Status: ALIGNED r3 (focused re-check verdict: ALIGNED).
 
@@ -40,4 +40,4 @@ sweep + journal key + doctor). Rulings:
 Serial gate confirmed: journal-key clearing on the removal arm is aligned
 with recovery/resurrection expectations.
 
-## Round 3 — focused re-check: see REVIEW-207-r3.md
+## Round 3 — focused re-check: see review-207-r3-focused.md (preserved in .claude/)

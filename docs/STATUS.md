@@ -5,6 +5,46 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_Session addendum (2026-07-26, night): **BURN-IN BUG SWEEP SHIPPED — 4 PRs
+merged (#471 #472 #474 #475), fleet on 1.9.1-dev+b374f1e, all fixes
+field-verified live.** Parallel root-cause wave over #459/#460/#464/#465,
+then design→adversarial-review→implement per lane. (1) **#464 → design 206
+(ALIGNED r5, 5-round ledger REVIEW-206.md, PR #475)**: P7 latch — no
+push/pull that moved the base gitRepos key set ever rebuilt the matcher
+(202's F2 "realigns provenance" claim was FALSE); shipped
+ensureMatcherProvenance at pump boundaries + matcher-generation stamped at
+observation START + watcher facade + fail-safe fused downgrade when a
+rebuild moves backend watch inputs (hot re-arm descoped → #473) + named
+skip= causes on every scan pull. FIELD-CONFIRMED: clone churn healed to
+`pull local=trusted` in ~4 min unattended (was: latched forever, restart
+required). (2) **#460 → design 208 (renumbered from 207 — Alchemy eval
+claimed 207 concurrently; ALIGNED r3, REVIEW-208.md, PR #474)**: reviews
+KILLED r1's whole-dir trash retirement (self-referential identity predicate)
+and bundle retention (recovery-state, → #470); shipped anchored rmdir-only
+skeleton sweep + journal key clearing + doctor `repo residue` section.
+FIELD-CONFIRMED: post-delete residue now just .git+.rbox (was 30M skeleton),
+doctor names it with the manual command. (3) **#465 → PR #471**: real root
+cause was semver rejecting `+build` — dev builds corrupted the ENTIRE
+ambient status record (witness, status version, mode promotion, and rbox
+stop's graceful drain = 60s SIGKILL on every fleet host); plus ps -ww
+truncation hardening; start now prints pid/version/mode and self-polls the
+witness (no more "re-run"). (4) **#459 CLOSED not-a-bug** (the 7.3MB
+"snapshots" were deltas; sink wiring proven live) → spun out #469 (fat
+deltas after boot/rescan — advisory churn in field-exact diffToOps; TOP
+next-cycle candidate, ~7.9MB+1.3s per boot/rescan) and PR #472 (mde
+delta/non_delta attribution on every commit + daemon wiring lock test +
+one-shot stderr sink). #472's line PROVED #469 live on its first benchmark
+commit (`mde delta ops=81120 bytes=7894911` after daemon restart).
+Benchmarks on b374f1e: clone→FM-applied ~50s wall (publish 21.2s, FM apply
+15.7s incl 2.0s git import); rm→published 23s (33.4KB delta, 4290 del ops);
+FM pull lines now self-attribute `skip=p1-watcher` (its inotify watcher is
+still dead — sysctl fix still pending, needs sudo). Issues filed: #469
+(fat delta), #470 (quarantine bundle lifecycle — unbounded growth, needs
+pinning design), #473 (watcher hot re-arm). Worktrees fix-459/460/464/465
+removed (all MERGED); raw review reports preserved in `.claude/`
+(review-206-r1..r4, review-207-r1..r3, spec-465). NO 1.10.0 tag — bake
+continues; fresh explicit founder go required (standing rule)._
+
 _Session addendum (2026-07-26, evening): **DESIGN 204 SHIPPED to main (PR
 #458, squash 514d6899) and burn-in STARTED on both hosts
 (1.9.1-dev+514d689).** Design `docs/design/204-delta-scoped-publish.md`
