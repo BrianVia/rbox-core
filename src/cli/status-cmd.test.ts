@@ -14,6 +14,7 @@ import { writeResetHaltHealth } from "./reset-health.js";
 import { RBOX_VERSION } from "./version.js";
 import { saveActivity } from "./activity.js";
 import { GENESIS_PENDING_MESSAGE, publishPrepublishMarker } from "./genesis-durable.js";
+import { flushAccountProfileWrites, scheduleAccountProfileWrite } from "./account-profile.js";
 
 const OLD_ENV = { ...process.env };
 const NOW = Date.parse("2026-07-08T12:00:00Z");
@@ -313,6 +314,79 @@ test("status loads credentials once and continues locally with credential-degrad
   expect(loads).toBe(1);
   expect(text).toContain("Credential degraded");
   expect(text).toContain("invalid-environment");
+});
+
+function signedInStatusDeps(accountId: string): StatusCmdDeps {
+  const d = cleanScanDeps();
+  d.loadCredentials = async () => ({
+    state: "valid",
+    source: "disk",
+    credentials: {
+      v: 1,
+      token: "tok",
+      deviceId: cfg.deviceId,
+      accountId,
+      remoteUrl: "https://api.test",
+    },
+    legacy: false,
+    extensions: {},
+  });
+  return d;
+}
+
+test("fresh workspace status falls back to the account profile for email and plan", async () => {
+  const accountId = "acct_aaaaaaaaaaaaaaaa";
+  scheduleAccountProfileWrite({
+    accountId,
+    email: "owner@example.com",
+    signInMethod: "github",
+    plan: "pro",
+  });
+  await flushAccountProfileWrites();
+  const d = signedInStatusDeps(accountId);
+  d.readBriefIdentity = async () => undefined;
+
+  expect(await captureStatusWithDeps({}, d)).toContain("Signed in as owner@example.com · pro");
+});
+
+test("status preserves the unavailable identity copy when profile and primary cache are absent", async () => {
+  const d = signedInStatusDeps("acct_bbbbbbbbbbbbbbbb");
+  expect(await captureStatusWithDeps({}, d)).toContain("Signed in · plan unavailable");
+});
+
+test("workspace identity cache retains precedence over the account profile", async () => {
+  const accountId = "acct_cccccccccccccccc";
+  scheduleAccountProfileWrite({
+    accountId,
+    email: "profile@example.com",
+    signInMethod: null,
+    plan: "solo",
+  });
+  await flushAccountProfileWrites();
+  const d = signedInStatusDeps(accountId);
+  d.readBriefIdentity = async () => ({ email: "workspace@example.com", plan: "team" });
+
+  const text = await captureStatusWithDeps({}, d);
+  expect(text).toContain("Signed in as workspace@example.com · team");
+  expect(text).not.toContain("profile@example.com");
+});
+
+test("status applies the account-profile fallback independently per identity field", async () => {
+  const accountId = "acct_dddddddddddddddd";
+  scheduleAccountProfileWrite({
+    accountId,
+    email: "profile@example.com",
+    signInMethod: null,
+    plan: "pro",
+  });
+  await flushAccountProfileWrites();
+  const d = signedInStatusDeps(accountId);
+
+  d.readBriefIdentity = async () => ({ email: "workspace@example.com", plan: null });
+  expect(await captureStatusWithDeps({}, d)).toContain("Signed in as workspace@example.com · pro");
+
+  d.readBriefIdentity = async () => ({ email: null, plan: "team" });
+  expect(await captureStatusWithDeps({}, d)).toContain("Signed in as profile@example.com · team");
 });
 
 test("status exposes a durable starvation warning without holder details", async () => {

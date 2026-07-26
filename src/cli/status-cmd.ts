@@ -160,7 +160,7 @@ function humanGitDeferralEntries<T extends GitDeferralDisplayEntry>(
 
 async function cachedAccountSummary(
   loaded: CredentialLoadResult,
-  identityLookup: (accountId: string) => Promise<BriefIdentitySource | undefined>
+  primaryIdentityLookup?: (accountId: string) => Promise<BriefIdentitySource | undefined>
 ): Promise<BriefAccountSummary> {
   if (loaded.state === "absent") return { state: "signed-out" };
   if (loaded.state !== "valid") {
@@ -169,10 +169,16 @@ async function cachedAccountSummary(
   }
   const creds = loaded.credentials;
   if (!creds.accountId) return { state: "unavailable" };
-  const identity = await identityLookup(creds.accountId);
+  const [primary, profile] = await Promise.all([
+    primaryIdentityLookup?.(creds.accountId),
+    readCachedBriefIdentity(creds.accountId),
+  ]);
   return {
     state: "ok",
-    identity: identity ?? { email: null, plan: null },
+    identity: {
+      email: primary?.email ?? profile?.email ?? null,
+      plan: primary?.plan ?? profile?.plan ?? null,
+    },
   };
 }
 
@@ -401,7 +407,7 @@ export async function statusCmdWithDeps(
         kind: "reset-halt",
         workspaceLabel,
         daemonRunning: bg.running,
-        account: await cachedAccountSummary(loadedCredentials, deps.readBriefIdentity ?? readCachedBriefIdentity),
+        account: await cachedAccountSummary(loadedCredentials, deps.readBriefIdentity),
       });
       for (const line of rendered.lines) console.log(line);
       return { daemonRunning: rendered.daemonRunning };
@@ -700,7 +706,7 @@ export async function statusCmdWithDeps(
   if (!opts.verbose) {
     const account = await cachedAccountSummary(
       loadedCredentials,
-      deps.readBriefIdentity ?? readCachedBriefIdentity
+      deps.readBriefIdentity
     );
     const updateState = await readUpdateCheckState();
     const nextVersion = updateAvailableVersion(updateState);
