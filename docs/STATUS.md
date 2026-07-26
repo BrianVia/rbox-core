@@ -5,7 +5,29 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
-_Last updated: 2026-07-25 (**v1.9.1 SHIPPED — design 200 implemented, field-validated,
+_Last updated: 2026-07-26 (**pull fast path merged — designs 202+203, targets
+v1.10.0 after fleet burn-in**). Origin: AE telemetry showed every pull paying
+O(workspace) fixed cost (fleet pull p50 64.5s; ~20s flat on the Mac's 108k-file
+workspace: scan 8-9.5s + git-apply ~7s + a telemetry-invisible post-pull scan).
+PR #455 (f393ef0e): design 202 (pull consumes the watcher-maintained manifest
+under trust predicate P1-P7, `unsettledPaths`, O(applied) post-pull patch,
+refuse-and-rescan-once mass-delete, `ManifestUpdate` partial/full-workspace
+provenance, kill switch RBOX_PULL_TRUST_WATCHER) + design 203 (lazy git-apply
+probes: zero steady-state git spawns, busy-eager-spawn-free, memoized identity,
+kill switch RBOX_GIT_APPLY_LAZY). Review: 2 codex(medium) + opus parallel wave
+→ synthesis → codex serial gate → focused re-check; /simplify 4-lane pass
+closed a push-path design-108 gap (installManifest seam) and made the patch
+truly O(applied). **Burn-in (in progress): Mac on 1.9.1-dev+f393ef0 — pull
+local=trusted, scan 0.0s, git-apply 0.2s/101 repos (was ~15s combined).**
+Blockers found on flat-meadow (both pre-existing): (1) watcher dead from
+inotify exhaustion (65536 watches < 77k files) → trusted path correctly
+refuses; fix = sysctl 60-rbox-inotify.conf + pull-only restart (needs Brian's
+sudo); (2) FM is the 403-telemetry device from the fleet digest (~60 rejected
+samples/hr; sync-state report failing) — needs device re-auth, restart does
+not clear it. Mac→FM propagation still ~29s until FM's watcher lives. NO tag
+until burn-in green + fresh explicit go.
+
+Prior update (2026-07-25): (**v1.9.1 SHIPPED — design 200 implemented, field-validated,
 released fleet-wide in one day**). The whole arc: step 0 (#449 `deletion-pending`
 vocabulary, promoted to prod) → P2 (#450 ownership held-skip + no whole-repo
 escalation + doctor leftover-worktrees) → P3 (#451 content-equivalence cascade
