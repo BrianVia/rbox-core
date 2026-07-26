@@ -1,8 +1,9 @@
 # Design 204 — Delta-scoped publish wire
 
-**Status:** DRAFT (r1)
+**Status:** DRAFT r2 (round-1 findings folded — see `REVIEW-204.md`)
 **Target:** v1.10.0 (rides the same release as designs 202+203; same burn-in)
-**Kill switches:** `RBOX_PREFLIGHT_DELTA=0`, `RBOX_MDE_DELTA=0` / `RBOX_MDE_SNAPSHOT=0`, `RBOX_GIT_PLAN_LAZY=0`
+**Kill switches:** `RBOX_PREFLIGHT_DELTA=0`, `RBOX_MDE_DELTA=0`,
+`RBOX_MDE_SNAPSHOT=0` (master), `RBOX_MDE_FAST_PULL=0`, `RBOX_GIT_PLAN_LAZY=0`
 
 ## 1. Problem and field evidence
 
@@ -13,7 +14,7 @@ steady-state publish of a **40-byte single-file change**, 2026-07-26:
 |---|---:|---|
 | `missing` | 4.1 s | presence-checks **all 108,537** manifest blobs (7.2 MB of hashes upstream, 3 serial 50k POSTs, ~41 D1 batch subrequests) |
 | `commit` | 4.4 s | uploads a **full 12.5 MB zstd manifest snapshot** (u≈2.0 s) + commit POST |
-| `git-plan` | 2.7 s | walks all 101 repos: unconditional journal/lineage pre-loop (~10–14 serial fs syscalls/repo, ~8 realpath), full fingerprint per repo (refs-tree walk, packed-refs read, ≤1 MiB index hash), whole-tree `discoverGitRepos` readdir walk, and a stage-5 hygiene re-derivation per repo |
+| `git-plan` | 2.7 s | serial fs work × 101 repos + whole-tree discovery walk (breakdown unmeasured — Part C5 instruments it) |
 | total publish | **15.6 s** | for 40 bytes |
 
 Post-202/203, the receive side is ~4.5 s; the publish side is now the
@@ -25,316 +26,379 @@ names, never O(workspace).
 
 ## 2. The decisive recon finding
 
-Parts A and B below are **not new mechanism**. Both deltas are fully built,
-reviewed, and shipped dark behind opt-in env flags:
+Parts A and B are **unfreeze designs**, not new mechanism. Both deltas are
+fully built, reviewed, and shipped dark behind opt-in env flags:
 
 - **A (`missing`):** `RBOX_PREFLIGHT_DELTA=1` (design 103 Part B) presence-
   checks only `toEncrypt − deferred + recoverAddresses`. Measured in the
-  design-103 gate: 2.8–4.0 s → **0.1 s** on a 114k-file workspace
-  (`docs/design/103-steady-sync-quick-wins.md` §gate record, CHANGELOG
-  v1.7.x). Default arm today: `src/cli/sync-recovery.ts:304-305` sends every
-  manifest `encSha`, not even deduped.
+  design-103 gate: 2.8–4.0 s → **0.1 s** on a 114k-file workspace.
+  Default arm today: `src/cli/sync-recovery.ts:304-305` sends every manifest
+  `encSha`, undeduped.
 - **B (`commit`):** `RBOX_MDE_DELTA=1` (design 84 Phase C2) emits a zstd
   delta envelope (`ManifestDeltaOp[]`) chained to the prior snapshot via the
   signed `manifestChain`. Server accepts and GC-roots chains
   (`apps/api/src/workspace-sync.ts:481,648,849,1016`); **every reader since
-  v1.1.0 folds deltas** (Phase B, fleet floor verified 2026-07-17 before the
-  snapshot flip, comment at `src/cli/e2ee-remote.ts:77-83`); the economic
-  guard (`e2ee-remote.ts:782`) and chain cap (`MAX_MANIFEST_DELTA_CHAIN=16`)
-  handle compaction. `state.manifestMeta` base evidence is already
-  maintained on every snapshot commit and every pull.
+  v1.1.0 folds deltas** (Phase B; fleet floor verified 2026-07-17 before the
+  snapshot flip, `src/cli/e2ee-remote.ts:77-83`); economic guard
+  (`src/cli/e2ee-remote.ts:781`) and chain cap
+  (`MAX_MANIFEST_DELTA_CHAIN=16`, `src/engine/manifest-chain.ts:1`) handle
+  compaction. `state.manifestMeta` base evidence is maintained on every
+  snapshot commit and every pull.
 
-So 204's parts A and B are **unfreeze designs**: verify the freeze
-conditions are discharged, flip the defaults per the founder default-on rule
-([[default-on-preference]]), keep the kill switches. Part C (git-plan) is
-the only new mechanism, and it is a transfer of design 203's pattern.
+Both flips follow the founder default-on rule ([[default-on-preference]])
+with kill switches retained. Part C is a **reduced** transfer of design
+203's pattern to the plan; the ambitious discovery-delta lever was reviewed
+out in round 1 and deferred (§5.5).
 
 ## 3. Part A — preflight delta default-on
 
 ### 3.1 Freeze condition and its discharge
 
-REVIEW-103 item 11 (hardened round 2): `RBOX_PREFLIGHT_DELTA` must not ship
-enabled alongside a design-102 narrowed admission **until 102's acceptance
-proves carried-ref fence/prune/loss handling**. Status now:
+REVIEW-103 item 11: `RBOX_PREFLIGHT_DELTA` must not ship enabled alongside a
+design-102 narrowed admission until 102's acceptance proves carried-ref
+fence/prune/loss handling. Status:
 
-- Design 102 delta admission is `enforce` on prod (REVIEW-142:147), live
-  since the v1.8.x line, with per-commit `commit.delta` AE metrics and the
-  fallback counter at zero in steady state.
-- Carried-ref handling is implemented (`apps/api/src/commit-delta.ts` —
-  `carriedCount`, `markedCarried`, `intentCarriedHit`, fence set) and pinned
-  by `apps/api/test/commit-delta.test.ts` + `commit-delta-shadow.test.ts`.
+- **Mechanism half: discharged.** Under `RBOX_COMMIT_DELTA_ADMISSION=enforce`
+  (prod: `apps/api/wrangler.jsonc:112,194`), the fence probe folds
+  prune-marked carried refs into `admitData`
+  (`apps/api/src/commit-delta.ts:75-79`) → they are presence-checked and
+  422 on loss. Over-cap fails closed: `fence_over_cap` and
+  `markedProbeSkipped` both force full-refset admission
+  (`apps/api/src/workspace-sync.ts:84,344`).
+- **Test half: NOT discharged — this design closes it.** Every carried-ref
+  behavioral test today is shadow-mode
+  (`apps/api/test/commit-delta-shadow.test.ts:43-54` accepts only
+  `off|shadow`); `commit-delta.test.ts` covers the pure merge only. **Hard
+  precondition for the flip (test 3, §6):** an enforce-mode endpoint
+  regression proving (a) a prune-marked carried ref returns 422 with that
+  sha in `unsatisfiedBlobs` and no head movement, (b) probe over-cap falls
+  back to full-refset admission. Server-side test only; no server code
+  change expected — if the test FAILS, Part A stays frozen and the failure
+  is a design-102 bug to fix first.
 
-The implementation MUST re-verify (not assume) that a test exists pinning
-"admission checks carried refs against the parent refset" (REVIEW-103 item
-11's companion regression test). If absent, add it in this cycle — it is a
-server-side test only, no server code change.
+### 3.2 Fault model and safety argument (corrected in r1 review)
 
-### 3.2 Mechanism (flag semantics flip only)
+The 422 backstop is real but its authority is 102's **fence probe**, not
+full admission. State of each loss class after the flip:
 
-`src/cli/sync-recovery.ts:295` becomes default-on:
+1. **Prune-marked carried ref** (every sanctioned GC/prune flow marks before
+   deleting): server 422s via the fence probe → `accumulateRecoveryPage`
+   (`src/cli/sync/push.ts:373`) → next preflight checks the union of
+   accumulated pages → re-upload. Covered.
+2. **Unmarked `present=0` carried ref**: produced by NO sanctioned server
+   flow; requires out-of-band catalog correction. After the flip, neither
+   the delta preflight nor enforce admission checks it (today's full
+   preflight does, on the receipts branch). This is the accepted narrowed
+   fault model. The legacy inline-commit branch does not detect this class
+   even today (`workspace-sync.ts:1273-1300` is not `present`-aware).
+   **Operator rule (add to docs/DEPLOYMENTS.md on merge):** any manual
+   catalog repair that clears `present` must either prune-mark the affected
+   refs or be followed by client `--verify` / one push with
+   `RBOX_PREFLIGHT_FULL=1`.
+3. **Physical R2/pack loss with healthy catalog**: invisible to preflight
+   and admission both before and after (all checks are D1-only; bytes are
+   verified on read, `apps/api/src/blob-pack.ts:122-134`). No regression;
+   out of scope.
+
+**Posture change, named:** today's full preflight opportunistically
+re-uploads prune-marked blobs on every push. After the flip that repair is
+driven by the server fence probe at commit time (and by `--verify` /
+`RBOX_PREFLIGHT_FULL=1` for proactive audit — REVIEW-103 r2's ruling that
+"proactive detection stays `--verify`").
+
+### 3.3 Mechanism
+
+One exported helper, consumed by BOTH arms (round 1 found two independent
+env reads — `src/cli/sync-recovery.ts:185` feeds the pipeline arm via
+`args.preflightDelta`, `:295` the serialized arm):
 
 ```ts
-const preflightDelta = process.env.RBOX_PREFLIGHT_DELTA !== "0";
+export const preflightDeltaEnabled = () =>
+  process.env.RBOX_PREFLIGHT_DELTA !== "0";
 ```
 
-Same flip at the pipeline seam (`src/cli/publish-pipeline/pipeline.ts:437`
-consumes `args.preflightDelta`, set from the same read — one flag read site,
-threaded; verify there is exactly one env read and keep it that way).
+Both read sites consume it. Everything else is unchanged and already built:
+candidate set `toEncrypt − deferred + recoverAddresses`
+(`sync-recovery.ts:306-315`); recovery-page union + `forceFullAudit`
+overflow latch (`push.ts:158-171,358-378`). Corrections to prior claims:
+repair forces `forceSnapshot`, not a full audit; genesis is candidate-set
+equivalence (`toEncrypt ≈ all`), not an audit; a recovery retry checks the
+**union** of accumulated pages, not exactly the last residue.
 
-Everything else already exists and is unchanged:
+### 3.4 Telemetry
 
-- **Candidate set:** `toEncrypt` encShas − `deferred` + `options.recoverAddresses`
-  (`sync-recovery.ts:306-315`).
-- **Safety net (the correctness backstop):** if the client under-checks —
-  server lost a blob (GC, prune, pack loss) that the delta didn't name — the
-  commit returns **422 `reupload` with `unsatisfiedBlobs`**, which feeds
-  `accumulateRecoveryPage` (`src/cli/sync/push.ts:373`) → next attempt
-  presence-checks the named residue; escalation to `forceFullAudit` (full
-  sweep) already exists for pathological pages. This loop is why the delta
-  arm is safe: the server's refset admission is the authority, the preflight
-  is only an optimization.
-- **First publish / repair:** `forceFullAudit` continues to force the full
-  sweep; genesis pushes have `toEncrypt ≈ everything` anyway.
+Delta-arm details (`introduced/recover/sent/fullAudit`) already exist.
+`introduced` gets ONE definition across both arms: unique post-defer
+addresses. Field check: `missing` ≲0.2 s; `sent` ≈ changed-blob count.
 
-### 3.3 Telemetry
-
-The delta arm already records `introduced/recover/sent/fullAudit` details
-(`sync-recovery.ts:326-332`). No new telemetry. Field verification: AE
-`missing` wall drops to ≲0.2 s; `sent` ≈ changed-file count.
-
-## 4. Part B — manifest delta commits default-on
+## 4. Part B — manifest delta commits default-on (+ evidence fast-pull)
 
 ### 4.1 Freeze condition and its discharge
 
-Design 108 §7 froze `RBOX_MDE_DELTA` on both A/B arms so the files-first
-gate would not silently depend on it. That gate concluded (design 108
-shipped, v1.3.x); the freeze simply was never revisited. Design 149 §A3
-plans the principled successor (`minReaderVersion` floor, tri-state
-overrides) but 149 is unimplemented and NOT a dependency: the snapshot flip
-(v1.7.1) established the accepted interim pattern — **manual fleet-floor
-verification + env kill switch**. Reader floor for deltas is v1.1.0 (same
-Phase-B reader as snapshots, already verified 2026-07-17); current fleet is
-≈ entirely ≥1.8. The implementation MUST re-verify the live device floor via
-the admin cockpit / D1 `devices.client_version` before merge, and record the
-verification in the doc (same discipline as the `e2ee-remote.ts:77-83`
-comment).
+Design 108 §7 froze `RBOX_MDE_DELTA` so the files-first A/B gate would not
+silently depend on it ("the gate must not silently depend on it" —
+`docs/design/108-files-first-publish.md:561`); the gate closed with design
+108's ship. Design 149 §A3 is the principled successor (reader-version
+floors) but is unimplemented and NOT a dependency: the v1.7.1 snapshot flip
+established the interim pattern — manual fleet-floor verification + kill
+switch. Reader floor for deltas is v1.1.0 (same Phase-B reader, verified
+2026-07-17). **Pre-merge step:** re-verify the live device floor via the
+admin cockpit / D1 `devices.client_version` and record it here.
 
-### 4.2 Mechanism (two seams, one semantic)
+### 4.2 Mechanism — one policy, two seams, lattice inverted
 
-Both existing gates flip from `=== "1"` to `!== "0"`, with the 149 §A3
-precedence rule adopted early because it costs nothing:
+Today's lattice is `delta ⟹ snapshot` with delta opt-in. The new lattice is
+`snapshot ⟹ delta-eligible` with both default-on and `RBOX_MDE_SNAPSHOT=0`
+as the master kill (149 §A3 precedence, adopted early):
 
-1. `mdeWriteCaps()` (`src/cli/e2ee-remote.ts:84-87`):
-   ```ts
-   const snapshot = process.env.RBOX_MDE_SNAPSHOT !== "0";
-   const delta = snapshot && process.env.RBOX_MDE_DELTA !== "0";
-   return { delta, snapshot };
-   ```
-   `RBOX_MDE_SNAPSHOT=0` is the master kill switch: it forces raw-v0 AND
-   disables delta regardless of `RBOX_MDE_DELTA` (149 §A3 precedence). The
-   contradictory pair logs once: `mde_delta_ignored_snapshot_kill_switch`.
-2. Push's deltaBase selection (`src/cli/sync/push.ts:771`): same
-   `!== "0"` read. Keep the two seams reading the SAME env var so a single
-   `RBOX_MDE_DELTA=0` disables both (pin with a test that greps both call
-   sites... no — pin behaviorally: with `RBOX_MDE_DELTA=0`, a steady-state
-   push emits a snapshot envelope even when a valid base exists).
+```ts
+export function mdeWritePolicy(): { delta: boolean; snapshot: boolean } {
+  const snapshot = process.env.RBOX_MDE_SNAPSHOT !== "0";
+  const delta = snapshot && process.env.RBOX_MDE_DELTA !== "0";
+  return { delta, snapshot };
+}
+```
 
-All Phase-C2 preconditions stay as-is and keep the flip safe:
+Consumed at BOTH seams — `mdeWriteCaps()` in `src/cli/e2ee-remote.ts:84-87`
+and push's deltaBase selection (`src/cli/sync/push.ts:773-778`). The push
+seam must NOT re-read raw env vars: under master kill it constructs no
+`deltaBase` (today it would still pay `validManifestMeta` +
+`manifestFromMeta` + O(N) `validateManifest` for a base the writer then
+discards). Contradictory pair (`RBOX_MDE_SNAPSHOT=0` + `RBOX_MDE_DELTA=1`)
+logs `mde_delta_ignored_snapshot_kill_switch` **once** (module-scope latch —
+`mdeWritePolicy` runs per operation).
 
-- No valid base (`manifestMeta` missing/epoch-mismatched, sequence gap,
-  `validateManifest` fail) → snapshot. First publish → snapshot.
-- Economic guard: delta only when `chainBytes + candidateEncBytes <
-  snapshotBytes` (`e2ee-remote.ts:782`) — degenerate huge deltas
-  self-select snapshot.
-- Chain cap 16 → periodic snapshot compaction; amortized cost = full
-  snapshot every ≤16 commits.
-- 422 / chain-error repair paths force snapshots (`push.ts:188,295`).
+**Master kill covers repair (round-1 blocker):** `forceSnapshot` currently
+overrides `snapshotEnabled` (`e2ee-remote.ts:769-795`), so
+`RBOX_MDE_SNAPSHOT=0` would not force raw on repair. Change: with
+`snapshot=false`, repair and every other arm emit **raw-v0** (chain-free);
+`forceSnapshot` means "do not emit a delta", never "override the master
+kill".
 
-### 4.3 Receiver interaction (must not regress 202 / 106)
+**Base-integrity precondition (round-1 blocker):** `validManifestMeta`
+validates shape only — a structurally valid but stale/mismatched meta would
+publish an unreadable delta (readers fail the base-hash check AFTER the head
+commits), and the previously claimed sequence-gap guard is tautological
+(`appliedSequence` is defined as `state.lastSyncedSequence`,
+`push.ts:461-467,773-778`). New rule: delta selection additionally requires
 
-- Readers fold chains since v1.1.0; `fastFoldBase` (design 106) short-
-  circuits on exact chain evidence — verify its evidence comparison treats a
-  grown chain as a miss (it compares the full signed chain, so yes; pin with
-  a test).
-- The WS "committed" doorbell stays content-free (design 120). No wire shape
-  changes: the delta envelope is an opaque encrypted blob like any other.
-- Pull `download`/`decrypt` phases shrink too (receivers download the small
-  delta link instead of 12.5 MB when their base is current) — a free win on
-  the receive side; record expected AE movement.
+```
+canonicalManifestHash(reconstructedBase) === manifestMeta.manifestHash
+```
 
-## 5. Part C — lazy git-plan (design 203 transferred to the push side)
+Any mismatch → snapshot + fresh meta write. The hash pass is O(manifest)
+CPU-only; implementation may memoize per push. Existing preconditions stay:
+epoch equality, chain length + 1 ≤ 16, economic guard
+(`chainBytes + candidateEncBytes < snapshotBytes`).
 
-### 5.1 What the 2.7 s is (and what it is NOT)
+### 4.3 Receiver interaction — fast-pull joins the scope
 
-Steady state is already spawn-free on fingerprint hits (`sp=0` in
-`gitPlanStats`). The cost is serial fs work × 101 repos plus one whole-tree
-walk. **Repo skipping via the file-plane delta is unsound** — git ref
+- **`RBOX_MDE_FAST_PULL` (design 106) flips default-on in this design.**
+  Round 1 established that delta writes WITHOUT the evidence fast path
+  regress default receivers: `decodeManifestAt`'s cold walk fetches the
+  head + every chain link + the terminal snapshot per pull — more bytes
+  than today's single snapshot. With evidence: exact head → zero fetch;
+  grown chain → **delta-suffix hit** (`e2ee-remote.ts:264-305`, design
+  106's primary win — fetch only the new links). Kill switch
+  `RBOX_MDE_FAST_PULL=0`. Read path shipped in v1.7.x; pinned at
+  `src/cli/e2ee-sync.test.ts:774-785`.
+- Corrected claim from r1: a grown chain is an evidence-prefix HIT, not a
+  miss. The miss/fail-closed cases are substituted, reordered, or non-prefix
+  evidence.
+- The WS "committed" doorbell stays content-free (design 120). No wire
+  shape changes anywhere: the delta envelope is an opaque encrypted blob.
+
+### 4.4 Compaction cadence
+
+At most 16 consecutive deltas; the next commit emits a snapshot. Amortized:
+one snapshot-sized commit per ≤17 pushes; steady-state commits carry
+KB-scale deltas.
+
+## 5. Part C — lazy git-plan (reduced scope after round 1)
+
+### 5.1 What survives review
+
+Round 1 removed the two aggressive levers: **cross-repo common-dir
+fingerprint memoization** (unsound — a shared-ref mutation between linked-
+worktree decisions yields a false trusted hit; existing hand-invalidations
+at `src/cli/sync-git/plan.ts:1288,1294-1295` prove invalidation is
+correctness-bearing; ~zero value without linked-worktree density) and
+**delta discovery / walk skipping** (§5.5). What ships in this cycle is
+measurement plus two safe, narrow levers. Kill switch: `RBOX_GIT_PLAN_LAZY`
+(`!== "0"`), one read at plan entry, legacy arm byte-faithful.
+
+**Repo skipping via the file-plane delta remains unsound** — git ref
 movement never appears in the manifest diff; the fingerprint IS the change
-detector. So Part C cuts the per-repo constant and the workspace-level walk,
-never the visited set. (Same invariant 203 pinned: "the visited set does not
-shrink".)
+detector. The visited set does not shrink.
 
-Kill switch: `RBOX_GIT_PLAN_LAZY` (`!== "0"`), one read at plan entry,
-legacy arm preserved byte-faithful like `RBOX_GIT_APPLY_LAZY`.
+### 5.2 C5 — sub-phase attribution (the point of this cycle's Part C)
 
-### 5.2 Levers, in expected-value order
+`gitPlanStats` gains exclusive wall-clock buckets: `discoverMs`,
+`journalPreloopMs`, `fingerprintMs`, `hygieneMs`, and `otherMs =
+totalMs − Σ(exclusive buckets)` (cache load/save, config lane, proofs,
+capture all land in `otherMs` this cycle). Carried into the existing
+`recordDetails("git-plan", …)` summary. Tests assert buckets are finite,
+nonnegative, and individually ≤ total — NOT that they sum to the wall
+(non-exclusive nesting was a round-1 finding). This is what tells the
+successor design which lever is worth building; the per-lever savings
+below are hypotheses, not commitments.
 
-**C1 — gate the journal/lineage pre-loop on the journal probe.**
-`plan.ts:376-445` runs `checkoutJournalBinding` + `recoverAndLandFollowJournal`
-+ the lineage cluster unconditionally per repo (~8 realpath + reads), yet
-`recoverJournal` ENOENTs in steady state. Transfer 203's gate exactly:
-`checkoutJournalPresent(root, rel)` (already exported,
-`src/engine/git/journal.ts`) — one lstat per repo; only on presence (or
-lazy=0) derive the binding and run recovery. The probe fails open
-(non-ENOENT ⇒ present), same as 203. The lineage reads
-(`readRepoIdentityV1`/`readStateLineageV1`) that exist only to validate a
-journal binding move behind the same gate; lineage reads needed for other
-plan decisions (pend/needsRes arms) stay where they are. Recon inventory
-says this deletes ~10–14 syscalls/repo → ~1–1.4k syscalls/push.
+### 5.3 C1-narrow — gate ONLY the journal recovery pair
 
-**C2 — memoize per-plan-run derivations.**
-- `repoCtxFromDisk(repoDir)`: derived up to 4× per repo per run
-  (`plan.ts:378,458,502`, inside `gitFingerprint`, again at `:1271` stage-5
-  hygiene). One memo map `rel → ctx` for the duration of one
-  `planGitSections` call (203's `memo` helper, `apply.ts:408-419`, hoisted
-  to a shared module — do NOT copy-paste it a second time).
-- `realpath(workspaceRoot)`: once per run, not once per repo
-  (`readStateLineageV1` re-does it per repo).
-- Common-dir fingerprint memo: switch the plan's fingerprint run from
-  `"per-decision"` to the existing-but-unused `"cross-repo"` policy
-  (`fingerprint.ts:84-88,303-307`) so linked worktrees sharing a common dir
-  fingerprint it once. CAUTION: verify the racy-clean trust margin
-  (`trustedGitFingerprintHit`) is still per-repo-correct when the common-dir
-  token is shared across repos within one run — the token is a point-in-time
-  read either way; the sharing window is one plan pass. If a reviewer finds
-  a soundness hole here, drop this lever alone (it is separable).
+The pre-loop (`src/cli/sync-git/plan.ts:376-445`) is NOT journal-only work
+(round-1 blocker, all three reviewers): `publisherAckBindings`
+(`plan.ts:404-417`) feeds absence-proof rejection (`:1086-1090`), pending
+supersession (`:1231-1240`), and publisher-ACK authoring
+(`src/cli/sync/push.ts:966-985`); the `!ctx` quarantine arm (`:393-399`)
+sets `recoveryAllowsSupersession`, consumed at `:805`. **All of that stays
+eager.** Only this pair gates on the probe:
 
-**C3 — skip the whole-tree `discoverGitRepos` walk when nothing demands it.**
-The walk (`plan.ts:360` → full ignore-pruned readdir of 108k files) exists
-to find NEW repos (not yet in `base`/`pending`). New-repo appearance is
-exactly what the daemon already observes: `classifyRepoCandidate`
-(`git-ref-watch.ts:73`) emits `RepoCandidateWork{owner,dirty,discover}` into
-`handleGitSignalBatch` (`daemon.ts:901-926`), which today only feeds
-`gitRefRegistry.markCandidates` + a reason-only `requestPush`. Mechanism:
+```ts
+const recover = !gitPlanLazy || await checkoutJournalPresent(root, rel);
+if (recover) { /* checkoutJournalBinding + recoverAndLandFollowJournal (plan.ts:418-419) */ }
+```
 
-- The daemon accumulates a **discovery-pending flag + candidate rel set**
-  from the signal batches since the last completed plan (a set union, not
-  a queue; cleared only when a plan that consumed it completes
-  successfully — single-use handoff, exactly 202's view-consumption
-  pattern).
-- `planGitSections` gains an optional `discovery` input:
-  `{mode:"delta", candidates: Set<string>} | {mode:"walk"}`. Under
-  `mode:"delta"`, the visited key set = `base ∪ pending ∪ candidates`
-  (each candidate still `lstat`-verified before admission, same as the
-  walk's own verification); NO tree walk.
-- Trust predicate (mirrors 202's P): delta mode only when the live watcher
-  is healthy since before the last completed plan, the git-ref registry
-  snapshot is `complete`, and no `overCap/outside/refused/failed` owner
-  exists whose floorDir could hide a new repo. Any failure ⇒ `mode:"walk"`
-  (today's behavior) + one log line `git-plan discovery=walk cause=<c>`.
-- CLI one-shot pushes (no daemon) always pass `mode:"walk"`.
-- Removal is already handled by state (`gitReposRemoved` + base keys), not
-  by the walk — deleting a repo dir surfaces via the file plane; verify and
-  pin this claim in a test (delete a repo dir, delta-mode plan still
-  produces the removal section).
+`checkoutJournalPresent` (single lstat, fails open on non-ENOENT —
+`src/engine/git/journal.ts:152`) is the same primitive design 203 uses at
+`src/cli/sync-git/apply.ts:644`. Containment argument for mutation-time
+recheck (203's rule): the plan's journal consumption is confined to the
+pre-loop; stage-5 conflict-ref pruning consumes no journal state; journal
+producers are serialized by the workspace mutex. The probe-to-mutation race
+test (§6 test 13) pins this.
 
-C3 is the riskiest lever; it is severable (C1+C2 alone likely recover
->1.5 s). If review finds the trust predicate needs more than the registry
-already records (e.g. a per-owner "armed continuously" fact), prefer adding
-that ONE fact to the registry over widening the predicate's inputs.
+Honest saving: ~2–4 syscalls/repo net of the added lstat (NOT the 10–14
+claimed in r1 — the lineage cluster stays). C5 measures the actual value.
 
-**C4 — stage-5 hygiene reuses stage-2 work.** `plan.ts:1268-1290` re-derives
-ctx per repo; consume the C2 memo. `pruneConflictRefs` stays once-per-common-
-dir (dedupe already exists), and its namespace probe joins the common-dir
-memo.
+### 5.4 C2-narrow — scoped memos, read-only stages
 
-**C5 — sub-phase attribution (ships first, in the same PR).** `gitPlanStats`
-gains wall-clock buckets: `discoverMs`, `journalMs`, `fingerprintMs`,
-`hygieneMs` (Date.now brackets, no per-repo overhead beyond 8 adds), carried
-into the existing `recordDetails("git-plan", …)` summary string. This is how
-burn-in proves which lever paid.
+- `repoCtxFromDisk`: 8 call sites in the plan (`plan.ts:378,458,502,1044,
+  1193,1231,1271,1281`). Memo `rel → ctx` covering ONLY the read-only
+  stages (pre-loop + stage-2 decision reads: `:378,458,502`), **invalidated
+  at the capture boundary**; stage-5 hygiene (`:1271,1281`) keeps fresh
+  derivation (the `plan.ts:1294-1295` comment warns about exactly the
+  stale-memo-across-capture hazard). No change to `gitFingerprint`'s
+  internal derivation (no API change this cycle). Reuse design 203's `memo`
+  helper by hoisting it from `src/cli/sync-git/apply.ts:408-419` into a
+  shared module — do not copy-paste it.
+- `realpath(workspaceRoot)`: once per plan run (`readStateLineageV1`
+  currently re-resolves it per repo).
+- Fingerprint policy stays `"per-decision"`. Common-dir work per repo is
+  untouched this cycle.
 
-### 5.3 What does NOT change
+### 5.5 Deferred: delta discovery (C3/C4 of r1)
 
-The plan's output contract (sections, base carry, `captureObserved`/
-`configObserved` totality, protectedPending), slow-path behavior on
-fingerprint miss, 422 `force` recapture, and every `mode:"walk"` semantics
-are byte-identical to today. Lazy=0 restores today's exact sequence
-including the unconditional pre-loop.
+Skipping the whole-tree `discoverGitRepos` walk is deferred to a successor
+design. Round 1 established it needs (evidence in `REVIEW-204.md` +
+`.claude-review-204-r1-codex{A,B}.md`):
+
+- `kindByPath` reconstruction for the visited set (it gates the fingerprint
+  fast path at `plan.ts:866` — an empty map forces every repo to the
+  spawning slow path, inverting the goal);
+- a backend-independent, daemon-owned discovery-continuity state
+  (`GitRefWatchRegistry` is Linux+Parcel only — the predicate could never
+  fire on the Mac, the measured host);
+- verified `@parcel/watcher` rename/descendant-event semantics (read the
+  source, per [[verify-dependency-source-on-load-bearing-assumptions]]);
+- epoch-stamped candidate handoff ACKed on accepted publication (not plan
+  completion), overflow (`discoverAll`) poisoning, restart-forces-walk;
+- preservation of `onGitReposDiscovered` → safety-floor refresh.
+
+### 5.6 What does NOT change
+
+Plan output contract (sections, base carry, `captureObserved`/
+`configObserved` totality, protectedPending, `onGitReposDiscovered`), the
+discovery walk itself, slow-path behavior, 422 `force` recapture. Lazy=0
+restores today's exact sequence.
 
 ## 6. Tests the implementation MUST write
 
 Part A:
-1. Default-on: no env → delta arm taken (`sent` == introduced count), full
-   sweep NOT sent; `RBOX_PREFLIGHT_DELTA=0` → legacy all-blobs arm
-   (byte-shape: undeduped full manifest list, preserving today's behavior).
-2. 422-recovery loop: server reports `unsatisfiedBlobs` → next attempt's
-   check set includes exactly the residue; `forceFullAudit` escalation still
-   reachable.
-3. Server regression pin (verify exists / add): 102 admission rejects a
-   commit whose carried refs are absent from the parent refset.
-4. Ambient-env hygiene: force-delete `RBOX_PREFLIGHT_DELTA` in beforeEach of
-   every touched suite (the 202/203 lesson, three separate recurrences).
+1. Default-on: no env → delta arm in BOTH the serialized and pipeline arms;
+   `RBOX_PREFLIGHT_DELTA=0` → legacy full-sweep arm in both (byte-shape
+   preserved: undeduped full manifest list).
+2. 422-recovery: retry's check set is the union of accumulated recovery
+   pages + introduced; overflow latches `forceFullAudit`.
+3. **Enforce-mode server regression (hard precondition):** under
+   `RBOX_COMMIT_DELTA_ADMISSION=enforce`, (a) a commit whose carried ref is
+   prune-marked returns 422 with that sha in `unsatisfiedBlobs` and no head
+   movement; (b) marked-probe over-cap falls back to full-refset admission.
+4. Ambient-env hygiene: force-delete `RBOX_PREFLIGHT_DELTA` AND
+   `RBOX_PREFLIGHT_FULL` in beforeEach of every touched suite; update
+   `src/cli/sync/sync.test.ts:733-746,750-759` to set `="0"` explicitly
+   (they currently `delete` to select the legacy arm — inverted by the
+   flip).
 
 Part B:
-5. Default-on steady state: valid base ⇒ delta envelope emitted, chain
-   grows, `manifestChain` signed; reader (existing fold path) reproduces the
-   manifest exactly.
-6. Kill switches: `RBOX_MDE_DELTA=0` ⇒ snapshot despite valid base;
-   `RBOX_MDE_SNAPSHOT=0` ⇒ raw-v0 AND no delta even with `RBOX_MDE_DELTA=1`,
-   warn-once log emitted.
-7. Chain cap: 16 deltas ⇒ 17th commit is a snapshot (compaction) — likely
-   already pinned in design-84 suites; verify, don't duplicate.
-8. Economic guard: crafted change where delta ≥ snapshot bytes ⇒ snapshot.
-9. `fastFoldBase` evidence miss on grown chain (design 106 interaction).
-10. Repair/422 arms still force snapshots.
+5. Default-on steady state: valid base ⇒ delta envelope, chain grows,
+   signed `manifestChain`; reader folds exactly.
+6. Kill-switch matrix: `RBOX_MDE_DELTA=0` ⇒ snapshot despite valid base
+   (and NO `deltaBase` constructed at the push seam); `RBOX_MDE_SNAPSHOT=0`
+   ⇒ raw-v0, no delta, no `deltaBase`, warn-once; `RBOX_MDE_SNAPSHOT=0` +
+   repair ⇒ raw-v0 (the `forceSnapshot` override is subordinate to the
+   master kill).
+7. Chain cap end-to-end: 16 real consecutive delta commits; the 17th
+   snapshots (not an injected synthetic chain).
+8. Economic guard end-to-end: a real candidate whose
+   `chainBytes + candidateEncBytes ≥ snapshotBytes` ⇒ snapshot.
+9. Fast-pull evidence (verify vs `e2ee-sync.test.ts:774-785`, don't
+   duplicate): exact head ⇒ zero-fetch; grown chain ⇒ suffix-only fetch
+   (`fold:"evidence"`); substituted/reordered/non-prefix evidence ⇒
+   fail-closed re-walk. Plus `RBOX_MDE_FAST_PULL=0` ⇒ cold-walk behavior
+   preserved.
+10. Base-integrity: structurally valid meta whose `manifestHash` mismatches
+    the reconstructed base ⇒ snapshot emitted + meta rewritten; reader
+    folds clean end-to-end.
+11. Repair/422 arms force snapshots (with master kill off).
 
 Part C:
-11. Spawn/syscall parity: lazy=1 steady state ⇒ zero git spawns (existing
-    pin) AND journal binding NOT derived when no journal file exists (probe
-    lstat only — assert via call-count seam, mirroring 203's tests).
-12. Journal present ⇒ recovery runs identically to lazy=0 (fidelity).
-13. Lazy=0 byte-faithful legacy order (203's pattern).
-14. Delta-discovery: new repo created while daemon runs ⇒ candidate set
-    carries it ⇒ plan admits it without a walk; trust-predicate failure
-    (registry incomplete / owner refused / no daemon) ⇒ walk mode; repo dir
-    deleted ⇒ removal section still emitted in delta mode.
-15. Cross-repo common-dir memo: linked worktrees share one common-dir
-    fingerprint within a run; fingerprint hit/miss decisions unchanged vs
-    per-decision policy on a matrix of (clean, ref-moved, index-touched)
-    states.
-16. `gitPlanStats` sub-phase buckets sum ≈ phase wall (tolerance), present
-    in the details summary.
+12. C1-narrow fidelity: no journal ⇒ binding/recovery pair skipped, AND
+    absence-proof, pending-supersession, and publisher-ACK behavior
+    byte-identical to lazy=0 (the round-1 regression concern); journal
+    present ⇒ recovery identical to lazy=0.
+13. Probe-to-mutation race: journal created after the pre-loop probe ⇒ next
+    plan recovers it; no stage-5 arm consumes journal state.
+14. Ctx memo: invalidated at the capture boundary; stage-5 derivations
+    fresh; a repo whose `.git` shape flips mid-plan (dir↔pointer) gets
+    fresh ctx post-capture.
+15. Lazy=0 byte-faithful legacy order (203's pattern), including the
+    unconditional journal pair.
+16. `gitPlanStats` buckets: exclusive brackets finite, nonnegative, each ≤
+    total wall; `otherMs` present; summary string carries them.
+17. Zero-spawn steady state preserved (existing pin) under lazy=1.
 
 ## 7. Rollout
 
-One release (v1.10.0, with 202/203). All three parts default-on with
-independent kill switches (founder default-on rule; the wire is
-backward-compatible in every direction — old readers fold deltas since
-v1.1.0, the server already roots chains, presence-check is client-local
-policy, git-plan is client-local). Burn-in on the founder fleet as dev
-builds, same protocol as 202/203. Field acceptance:
+One release (v1.10.0, with 202/203). All flips default-on with independent
+kill switches; wire is backward-compatible in every direction (readers fold
+deltas since v1.1.0; server roots chains; preflight and git-plan are
+client-local). Burn-in on the founder fleet as dev builds. Field acceptance:
 
 - `missing` ≲0.2 s; `sent` ≈ changed count.
-- `commit` ≲1 s steady state (small delta upload + POST); periodic
-  compaction commits may still show snapshot-sized walls every ≤16th push —
-  expected, not a regression.
-- `git-plan` ≤0.5 s with `discovery=delta`; sub-phase buckets attribute the
-  remainder.
-- End-to-end Mac→FM single-file propagation target: ≤8 s (from 19.6 s).
+- `commit` ≲1 s steady state. Expected: one snapshot-sized wall per ≤17th
+  push (compaction). **Failure discriminator:** snapshot walls on EVERY
+  push ⇒ a deltaBase precondition is failing (meta invalid, epoch mismatch,
+  base-hash mismatch, or the new integrity check) — check the emitted
+  envelope kind + precondition log, not compaction.
+- Receive side: steady-state pulls fetch only the new chain link
+  (`fold:"evidence"`, suffix-only) — `download`/`decrypt` AE drop is
+  expected and attributable to the FAST_PULL flip.
+- `git-plan`: C5 buckets present in details; C1/C2-narrow deltas measured
+  (hypothesis: a few hundred ms; the honest answer comes from the buckets).
+- End-to-end Mac→FM single-file propagation: ≤12 s expected (from 19.6 s;
+  publish ~15.6→~8 s dominated by the remaining git-plan/address/encrypt
+  residual). The successor discovery design targets the rest.
 
 ## 8. Non-goals
 
-- Implementing design 149's `minReaderVersion` floor mechanism (149 remains
-  the successor for principled capability gating; this design uses the
-  established manual-floor + kill-switch interim, third use of the pattern).
-- Server-side changes of any kind (none are needed; the commit endpoint,
-  chain rooting, GC, and 102 admission are untouched).
-- Blob packing / upload-lane throughput (designs 111/114 territory).
-- Shrinking the git-plan visited set below `base ∪ pending ∪ candidates`.
-- The publish pipeline flag path (`RBOX_PUBLISH_PIPELINE`, default off,
-  failed its design-98 gate) — Part A threads the flag through it for
-  consistency but no pipeline-specific work.
-- Batching/`updateScope` burst coalescing (the founder's ideation note):
-  the existing debouncers already batch; revisit only if burn-in shows
-  per-push fixed costs dominating burst scenarios after A–C land.
+- Implementing design 149's `minReaderVersion` floor (149 stays the
+  principled successor; third use of the manual-floor + kill-switch
+  interim).
+- Server-side code changes (the enforce-mode regression in test 3 is a
+  test; if it fails, that is a design-102 bug fixed under 102, and Part A
+  stays frozen until green).
+- Git-plan delta discovery / walk skipping and cross-repo common-dir
+  fingerprint memoization (deferred with evidence — §5.5).
+- Blob packing / upload-lane throughput (designs 111/114).
+- Shrinking the git-plan visited set.
+- Batching/`updateScope` burst coalescing (existing debouncers batch;
+  revisit only if burn-in shows per-push fixed costs dominating bursts).
