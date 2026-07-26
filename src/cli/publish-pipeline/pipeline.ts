@@ -202,7 +202,12 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
     const batch = checkBuffer.splice(0, ROLLING_CHECK_BATCH);
     checkerInflight++;
     try {
-      const addresses = [...new Set(batch.map((item) => item.address))];
+      // The kill switch is byte-faithful to the serialized legacy sweep: retain
+      // manifest order and duplicate addresses. Delta/full-audit arms are set
+      // semantics and keep the rolling request deduplication.
+      const addresses = !args.preflightDelta && !args.fullAudit
+        ? batch.map((item) => item.address)
+        : [...new Set(batch.map((item) => item.address))];
       const t0 = LANE_TIMING ? performance.now() : 0;
       const statsT0 = firstPublishTiming.enabled ? performance.now() : 0;
       const missing = new Set(await timeMissingBlobs(args.api, addresses));

@@ -136,6 +136,15 @@ There is no local replay, fetch-by-id, reconciliation, or admin endpoint for
 this flow. Use Stripe's existing dashboard resend after the configuration is
 deployed.
 
+## Blob catalog repair safety
+
+Any manual catalog repair that clears a blob's `present` flag must also
+prune-mark every affected account ref before the next commit, or be followed by
+`rbox sync --verify` / one push with `RBOX_PREFLIGHT_FULL=1`. Delta preflight
+intentionally checks newly introduced and server-requested recovery addresses;
+the commit admission fence catches prune-marked carried refs, but an unmarked
+manual `present=0` correction is outside that safety envelope.
+
 ## Secrets (GitHub repo)
 
 - `CLOUDFLARE_DEPLOY_TOKEN` — Workers Scripts:Edit + D1:Edit + Cloudflare

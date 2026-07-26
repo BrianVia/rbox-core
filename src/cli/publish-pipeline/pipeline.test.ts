@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -20,6 +20,22 @@ import { runPublishPipeline } from "./pipeline.js";
 import type { ReceiptPort } from "./receipt-drainer.js";
 
 const hash = (bytes: string | Buffer) => createHash("sha256").update(bytes).digest("hex");
+let savedPreflightDelta: string | undefined;
+let savedPreflightFull: string | undefined;
+
+beforeEach(() => {
+  savedPreflightDelta = process.env.RBOX_PREFLIGHT_DELTA;
+  savedPreflightFull = process.env.RBOX_PREFLIGHT_FULL;
+  delete process.env.RBOX_PREFLIGHT_DELTA;
+  delete process.env.RBOX_PREFLIGHT_FULL;
+});
+
+afterEach(() => {
+  if (savedPreflightDelta === undefined) delete process.env.RBOX_PREFLIGHT_DELTA;
+  else process.env.RBOX_PREFLIGHT_DELTA = savedPreflightDelta;
+  if (savedPreflightFull === undefined) delete process.env.RBOX_PREFLIGHT_FULL;
+  else process.env.RBOX_PREFLIGHT_FULL = savedPreflightFull;
+});
 
 class PipelineRemote {
   readonly blobs = new Map<string, Buffer>();
@@ -327,6 +343,47 @@ test("encryptAndUpload routes flag-off and small pushes to legacy, large pushes 
       else expect(remote.checks.length).toBe(1);
       expect(sawRunTemp).toBe(pipeline);
     } finally { await fs.rm(fx.root, { recursive: true, force: true }); }
+  }
+});
+
+test("pipeline preflight defaults to introduced-only and =0 restores the carried-address sweep", async () => {
+  const carried = "a".repeat(64);
+  for (const [deltaFlag, expectedCarriedChecks] of [[undefined, 0], ["0", 2]] as const) {
+    const fx = await fixture(66);
+    try {
+      const carriedFiles = fx.local.files.slice(-2).map((file) => ({
+        ...file,
+        encSha: carried,
+        cipherSize: file.size,
+      }));
+      const base: Manifest = { generatedAt: new Date(0).toISOString(), files: carriedFiles };
+      const remote = new PipelineRemote();
+      remote.blobs.set(carried, Buffer.from("already-present"));
+
+      await withEnv({
+        RBOX_PUBLISH_PIPELINE: "1",
+        RBOX_CRYPTO_FUSE: "0",
+        RBOX_PREFLIGHT_DELTA: deltaFlag,
+      }, async () => {
+        await encryptAndUpload(
+          remote as unknown as SyncRemote,
+          fx.root,
+          configFor(fx.root, generateKek()),
+          fx.local,
+          base,
+          PhaseReport.disabled(),
+          undefined,
+          async () => {},
+        );
+      });
+
+      expect(remote.checks.flat().filter((address) => address === carried)).toHaveLength(expectedCarriedChecks);
+      if (deltaFlag === "0") {
+        expect(remote.checks.some((addresses) => addresses.length === 2 && addresses.every((address) => address === carried))).toBe(true);
+      }
+    } finally {
+      await fs.rm(fx.root, { recursive: true, force: true });
+    }
   }
 });
 
