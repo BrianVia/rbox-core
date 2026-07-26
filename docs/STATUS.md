@@ -5,6 +5,27 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_Session addendum (2026-07-26, late night): **#469 SHIPPED and field-confirmed
+(PR #476, design 209 ALIGNED r3): first post-boot publish went ops=81120/7.9MB
+→ ops=1/603B on the Mac.** Mechanism pivoted mid-review (strip-from-wire was
+proven WORSE than the bug during fleet skew) to commit-seam mtime
+normalization — adopt the base entry when all ten identity fields ===;
+RBOX_MTIME_NORMALIZE=0 kills. Fleet on 1.9.1-dev+777fd48, both hosts. Full
+rig suite 7/7 PASS at c64a6110 (an earlier 7-failure scare was a STALE
+PRIMARY CHECKOUT running pre-#466 scenario code — papercut filed: rig must
+print tree provenance). NEW FOUNDER RULES (in dev-cycle skill + memory):
+phase-0 level-set + per-PR "did it help / did we make anything worse"
+close-out; rig FAST suite every ~3-4 sync-plane PRs and before any tag;
+git revert is a first-class option for net-unhelpful merges; ≤500-line file
+target + comments only for inexpressible constraints. NEXT CAMPAIGN (founder
+directive): wrap 476 ✓ → CLI surface reorganization — decompose around the
+#447 semantic-transition audit, agent-ergonomics objective; codex roadmap
+sweep dispatched (output → .claude/roadmap-2026-07-26-structural.md);
+docs/design/notes/2026-07-25-cli-surface-review.md committed for founder
+annotation. Design 163 (SQLite state plane) ruled VIABLE by founder — parked,
+sequenced after the reorg. git-plan perf design folds INTO the git-plane
+reorg cycle. NO 1.10.0 tag — fresh explicit go required._
+
 _Session addendum (2026-07-26, night): **BURN-IN BUG SWEEP SHIPPED — 4 PRs
 merged (#471 #472 #474 #475), fleet on 1.9.1-dev+b374f1e, all fixes
 field-verified live.** Parallel root-cause wave over #459/#460/#464/#465,
