@@ -1,4 +1,5 @@
 import {
+  actionPath,
   applyActions,
   isIgnoreRuleFile,
   PhaseReport,
@@ -239,34 +240,33 @@ export async function applyPulledManifest(
   // the local file re-publishes (RESURRECTION, the safe direction: never a
   // deletion). Feeding base-carried entries into reconcile would instead let a
   // remote delete plan a disk delete against an unreadable path (design 108).
-  const scanDeferred = new Set<string>();
+  let scanDeferred: ReadonlySet<string>;
   let local: Manifest;
+  let scanWallMs: number | undefined;
   if (trustedView) {
     // Design 202: the daemon's watcher-maintained manifest already IS this view, so
     // the O(workspace) walk is skipped entirely. `deferred` carries the daemon's
-    // unsettled set — the same role `scanDeferred` plays above: those paths are
-    // omitted from `local` (by the daemon, before handing the view over) and exempted
-    // by the oracle below.
-    for (const p of trustedView.deferred) scanDeferred.add(p);
+    // unsettled set — the same role the scan's deferred set plays above: those paths
+    // are omitted from `local` (by the daemon, before handing the view over) and
+    // exempted by the oracle below.
+    scanDeferred = trustedView.deferred;
     local = await report.phase("scan", async () => trustedView.manifest);
-    if (report.enabled) {
-      report.files = fileCountOf(local);
-      report.record("scan", { count: report.files, plaintextBytes: plaintextBytesOf(local) });
-    }
   } else {
     const scanFault = () => deps.telemetry?.record({ kind: "safety_event", eventType: "scan_fault", count: 1 });
     const deferErrnos = deps.warningSink ? makeDeferErrnoReporter(deps.warningSink, scanFault) : makeDeferErrnoReporter(undefined, scanFault);
+    const deferred = new Set<string>();
+    scanDeferred = deferred;
     const scanT0 = Date.now();
-    local = await report.phase("scan", () => scanManifest(root, matcher, cache, scanTick(deps), undefined, scanStats, scanDeferred, undefined, dircache, deps.forceFullScan ? "unpruned" : "pruned", deferErrnos.onErrno, deps.warningSink));
+    local = await report.phase("scan", () => scanManifest(root, matcher, cache, scanTick(deps), undefined, scanStats, deferred, undefined, dircache, deps.forceFullScan ? "unpruned" : "pruned", deferErrnos.onErrno, deps.warningSink));
     deferErrnos.flush();
-    const scanWallMs = Date.now() - scanT0;
-    if (report.enabled) {
-      report.files = fileCountOf(local);
-      report.record("scan", { count: report.files, plaintextBytes: plaintextBytesOf(local) });
-      if (scanStats) {
-        const details = scanDetailsOf(scanStats, scanWallMs, scanDeferred.size);
-        report.recordDetails("scan", { ...details }, formatScanStats(details));
-      }
+    scanWallMs = Date.now() - scanT0;
+  }
+  if (report.enabled) {
+    report.files = fileCountOf(local);
+    report.record("scan", { count: report.files, plaintextBytes: plaintextBytesOf(local) });
+    if (scanStats && scanWallMs !== undefined) {
+      const details = scanDetailsOf(scanStats, scanWallMs, scanDeferred.size);
+      report.recordDetails("scan", { ...details }, formatScanStats(details));
     }
   }
 
@@ -290,7 +290,6 @@ export async function applyPulledManifest(
   // Filtering everything through the PRE-pull matcher would drop a file a relaxed
   // rule just un-ignored — it would never land locally, and the follow-up push
   // would commit its deletion back to the remote (a data-loss echo).
-  const pathOf = (a: Action) => (a.kind === "write" ? a.entry.path : a.path);
   const all = reconcile(state.lastSyncedManifest, local, remote, cfg.deviceId, new Date().toISOString());
 
   // Mass-delete guard (design 44): refuse to apply a delete wave that wipes ≥half the
@@ -313,7 +312,7 @@ export async function applyPulledManifest(
         `If this deletion is intentional, run \`${deps.massDeleteHint ?? "rbox pull --allow-mass-delete"}\` to apply it once.`
     );
   }
-  const ruleActions = all.filter((a) => isIgnoreRuleFile(pathOf(a)) && !matcher.ignores(pathOf(a)));
+  const ruleActions = all.filter((a) => isIgnoreRuleFile(actionPath(a)) && !matcher.ignores(actionPath(a)));
   // Trash tier (design 50 §2): ONE batch per pull receives every propagated deletion and
   // type-flip dir eviction as an atomic rename instead of `fs.rm`. `days === 0` disables it
   // (classic immediate delete / visible conflict eviction). `finish()` settles the `.active`
@@ -341,7 +340,7 @@ export async function applyPulledManifest(
         if (ruleActions.length > 0) await applyActions(root, ruleActions, api.blobStore(), applyOpts);
         const fresh = ruleActions.length > 0 ? matcherForState(root, cfg, state) : matcher;
         finalMatcher = fresh;
-        const rest = all.filter((a) => !isIgnoreRuleFile(pathOf(a)) && !fresh.ignores(pathOf(a)));
+        const rest = all.filter((a) => !isIgnoreRuleFile(actionPath(a)) && !fresh.ignores(actionPath(a)));
         await applyActions(root, rest, api.blobStore(), applyOpts);
         actions = [...ruleActions, ...rest];
       });

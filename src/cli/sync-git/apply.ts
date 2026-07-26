@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { applyGitState, assertGitTargetWithinRoot, checkoutJournalDir, finalizeGitChainTimings, gitIdentity, gitIdentityKey, gitPreflight, indexIdentityV2, inspectLockedPRepairReceipt, isGitBusy, persistPRepairTerminal, preserveGitConflict, receiverEquivalentCollisionNames, repoCtxFromDisk, poolMap, readBaseAbsentArtifact, readBasePresentArtifact, runLockedPRepairAttempt, resumeLockedAcceptedPRepair, refreshLockedAcceptedPRepair, settleBaseAbsentArtifact, type AppliedManifestOracle, type ApplyBranchTransitionAdapter, type ApplyBranchTransitionInput, type CheckoutCapabilityProbe, type GitIdentity, type GitChainTimings, type GitSection, type IgnoreMatcher, type Manifest, type BlobStore, type RepoCtx, zeroGitChainTimings } from "../../engine/index.js";
+import { applyGitState, assertGitTargetWithinRoot, checkoutJournalPresent, finalizeGitChainTimings, gitIdentity, gitIdentityKey, gitPreflight, indexIdentityV2, inspectLockedPRepairReceipt, isGitBusy, persistPRepairTerminal, preserveGitConflict, receiverEquivalentCollisionNames, repoCtxFromDisk, poolMap, readBaseAbsentArtifact, readBasePresentArtifact, runLockedPRepairAttempt, resumeLockedAcceptedPRepair, refreshLockedAcceptedPRepair, settleBaseAbsentArtifact, type AppliedManifestOracle, type ApplyBranchTransitionAdapter, type ApplyBranchTransitionInput, type CheckoutCapabilityProbe, type GitIdentity, type GitChainTimings, type GitSection, type IgnoreMatcher, type Manifest, type BlobStore, type RepoCtx, zeroGitChainTimings } from "../../engine/index.js";
 import { canonicalizeGitConfig, sanitizeGitSectionForPersistence, validateCanonicalGitConfig, type GitConfig } from "../../engine/git/config-sync.js";
 import { applyConfigTransaction, materializeFreshGitConfig, readConfigSnapshot, readParsedConfigSnapshot, sameConfigStatToken, type ConfigStatToken, type ConfigTransactionResult } from "../../engine/git/config-txn.js";
 import { readAllRefs, readAllRefsStrict } from "../../engine/git/refs.js";
@@ -319,8 +319,6 @@ opts: {
     beforeFinalLive?: (relPath: string) => void | Promise<void>;
     beforeManualAbsentTransition?: (relPath: string, ref: string) => void | Promise<void>;
     beforeWorktreeOwnershipRead?: (relPath: string) => void | Promise<void>;
-    /** Test seam after the advisory journal probe and before the chain lock. */
-    afterJournalExistenceProbe?: (relPath: string) => void | Promise<void>;
     /** Shared logical time for held-attempt tests; omitted production call sites
      * retain the helpers' individual wall-clock reads. */
     heldNow?: () => number;
@@ -406,11 +404,19 @@ opts: {
     return group;
   };
 
-  const journalPathExists = async (rel: string): Promise<boolean> =>
-    fs.lstat(checkoutJournalDir(root, rel)).then(
-      () => true,
-      (error: NodeJS.ErrnoException) => error.code === "ENOENT" ? false : true,
-    );
+  /** One-shot async memo with reset — the per-repo probe thunks (design 203). */
+  const memo = <T,>(fn: () => Promise<T>): (() => Promise<T>) & { reset: () => void } => {
+    let done = false;
+    let value: T;
+    const get = async (): Promise<T> => {
+      if (!done) {
+        value = await fn();
+        done = true;
+      }
+      return value;
+    };
+    return Object.assign(get, { reset: () => { done = false; } });
+  };
 
   const laneRecord = (rel: string): RepoRecordInput => ({
     sourceSeq: records[rel]?.sourceSeq ?? state.lastSyncedSequence,
@@ -552,11 +558,7 @@ opts: {
     if (record.resolutionKey) needsRes[rel] = record.resolutionKey; else delete needsRes[rel];
   };
 
-  const processRepo = async (
-    rel: string,
-    journalObservedBeforeLock: boolean,
-    chainTimings?: GitChainTimings,
-  ): Promise<{ result: GitApplyRepoResult; commonDirGroup?: number }> => {
+  const processRepo = async (rel: string, chainTimings?: GitChainTimings): Promise<{ result: GitApplyRepoResult; commonDirGroup?: number }> => {
     const wireRemoteSec = remote.gitRepos?.[rel];
     const remoteSec = wireRemoteSec === undefined ? undefined : sanitizeGitSectionForPersistence(wireRemoteSec);
     let sanitizedConfigReason: string | undefined;
@@ -580,22 +582,8 @@ opts: {
     let pend = pending[rel];
     const repoDir = repoDirOf(root, rel);
     let dotGit = await fs.lstat(path.join(repoDir, ".git")).catch(() => undefined);
-    let diskCtxKnown = false;
-    let diskCtx: RepoCtx | undefined;
-    const getDiskCtx = async (): Promise<RepoCtx | undefined> => {
-      if (!diskCtxKnown) {
-        diskCtx = dotGit ? await repoCtxFromDisk(repoDir).catch(() => undefined) : undefined;
-        diskCtxKnown = true;
-      }
-      return diskCtx;
-    };
-    const resetDiskCtx = (): void => {
-      diskCtxKnown = false;
-      diskCtx = undefined;
-    };
-    const commonDirGroup = commonDirGroups
-      ? commonDirGroupFor(await getDiskCtx())
-      : undefined;
+    const getDiskCtx = memo(async () => dotGit ? await repoCtxFromDisk(repoDir).catch(() => undefined) : undefined);
+    const commonDirGroup = commonDirGroupFor(await getDiskCtx());
 
     // Sanitizing an invalid incoming config must not make the next push author a
     // corrective echo. Record the unchanged owned local config as the config-lane
@@ -653,11 +641,9 @@ opts: {
     // Design 116 recovery is the first per-repo operation in every arm. The
     // surrounding runRepo chain lock is already keyed by this common dir.
     let recoveryConflict = false;
-    const recoverJournal = !lazyProbes
-      || journalObservedBeforeLock
-      || await journalPathExists(rel);
+    const recoverJournal = !lazyProbes || await checkoutJournalPresent(root, rel);
     const recoveryCtx = recoverJournal ? await getDiskCtx() : undefined;
-    if (recoverJournal && recoveryCtx) {
+    if (recoveryCtx) {
       const binding = await checkoutJournalBinding(state.stream, expectedStateNonce(state), recoveryCtx);
       const landed = await runMutation(repoDir, () => recoverAndLandFollowJournal(root, rel, binding, state, {
         land: !opts.degradedMutex,
@@ -694,7 +680,7 @@ opts: {
       } else if (recovery.status === "fresh-quarantined") {
         glog(`git-sync WARNING ${rel}: partial fresh repository quarantined at ${recovery.quarantinePath}`);
         dotGit = await fs.lstat(path.join(repoDir, ".git")).catch(() => undefined);
-        resetDiskCtx();
+        getDiskCtx.reset();
       }
     } else if (recoverJournal) {
       const recovery = await runMutation(repoDir, () =>
@@ -715,24 +701,13 @@ opts: {
     // check must run BEFORE any identity comparison — a lock makes write-tree fail,
     // flipping gitIdentity onto the raw-index fallback, which would read as FALSE
     // divergence (spurious conflict) or poison a removal memory with a transient key.
-    let busyKnown = false;
-    let busy = false;
-    const getBusy = async (): Promise<boolean> => {
-      if (!busyKnown) {
-        if (!lazyProbes) {
-          busy = dotGit !== undefined && await isGitBusy(repoDir);
-        } else {
-          const knownCtx = await getDiskCtx();
-          busy = dotGit !== undefined && (knownCtx
-            ? await isGitBusy(repoDir, knownCtx)
-            : await isGitBusy(repoDir));
-        }
-        busyKnown = true;
-      }
-      return busy;
-    };
-    if (!lazyProbes || remoteSec) await getBusy();
-    if (busy && remoteSec) {
+    // Legacy mode passes no ctx so isGitBusy spawns exactly as today (the kill
+    // switch's spawn-count fidelity is pinned by test); lazy mode reuses the
+    // memoized fs-derived ctx.
+    const getBusy = memo(async () =>
+      dotGit !== undefined && await isGitBusy(repoDir, lazyProbes ? await getDiskCtx() : undefined));
+    if (!lazyProbes) await getBusy(); // legacy order: busy probed for every repo, as today
+    if (remoteSec && await getBusy()) {
       pending[rel] = remoteSec; // apply needs quiescence — retry next pull; outbound carries newest truth
       setDeferral(rel, "apply", "git-busy", incomingKey, await checkoutOf(repoDir));
       glog(`git-sync deferred ${rel}: receiver git busy`);
@@ -741,16 +716,10 @@ opts: {
     // NOTE: remote ABSENCE is processed even when busy — it never mutates local .git,
     // and skipping it would leave gitPendingRemote/base carrying a section the remote
     // deleted, which the next file-only push would resurrect.
-    let localIdKnown = false;
-    let localId: GitIdentity | undefined;
-    const getLocalId = async (): Promise<GitIdentity | undefined> => {
-      if (!localIdKnown) {
-        await getBusy();
-        localId = dotGit ? await gitIdentity(repoDir) : undefined;
-        localIdKnown = true;
-      }
-      return localId;
-    };
+    const getLocalId = memo(async (): Promise<GitIdentity | undefined> => {
+      await getBusy(); // busy-known-first: identity under a held lock reads as false divergence
+      return dotGit ? await gitIdentity(repoDir) : undefined;
+    });
     if (!lazyProbes) await getLocalId();
 
     if (!remoteSec) {
@@ -781,7 +750,7 @@ opts: {
         // section's identity instead (projected onto the leftover's shape), which is
         // lock-immune and equals the live identity whenever the leftover is untouched.
         removedMem[rel] =
-          busy && baseSec ? projectedKey(baseSec, dotGit.isFile() ? "scoped" : "all") : gitIdentityKey(identity);
+          (await getBusy()) && baseSec ? projectedKey(baseSec, dotGit.isFile() ? "scoped" : "all") : gitIdentityKey(identity);
       }
       // §13.5 conflict precedence: the pending remote section is preserved for manual
       // recovery. Best-effort — preserve never mutates local branches/index/identity,
@@ -972,9 +941,7 @@ opts: {
     // remote change that equals local work) → advance base, clear pending, no mutation.
     // A removal-memory leftover never takes this shortcut: it must go through the §9
     // clean-materialization path (wipe on dir targets) so stale refs can't survive.
-    const shortcutLocalId = remoteChanged || pend || resolutionChanged || checkpointReproof
-      ? await getLocalId()
-      : undefined;
+    const shortcutLocalId = await getLocalId();
     if (shortcutLocalId && !cleanMaterialize) {
       const n = narrowerScope(shortcutLocalId.refScope, remoteSec.refScope);
       if (projectedKey(shortcutLocalId, n) === projectedKey(remoteSec, n)) {
@@ -1837,13 +1804,9 @@ opts: {
         return;
       }
       const lockKey = await gitApplyMutationKey(root, rel);
-      const journalObservedBeforeLock = !lazyProbes
-        ? true
-        : await journalPathExists(rel);
-      if (opts.afterJournalExistenceProbe) await opts.afterJournalExistenceProbe(rel);
       await chainLock(commonDirLocks, lockKey, async () => {
         startedAt = Date.now();
-        const processed = await processRepo(rel, journalObservedBeforeLock, chainTimings);
+        const processed = await processRepo(rel, chainTimings);
         result = processed.result;
         commonDirGroup = processed.commonDirGroup;
       });

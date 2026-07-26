@@ -9,7 +9,7 @@
  * upgrade rule ("only a full-workspace install with an empty deferred set may set
  * `manifestObservationComplete`") stop being bespoke booleans read off call sites.
  */
-import type { Action, FileEntry, Manifest } from "../../engine/index.js";
+import { actionPath, compareManifestPaths, type Action, type FileEntry, type Manifest } from "../../engine/index.js";
 import { gitIncomingKey } from "../sync-git/shared.js";
 import type { SyncState } from "../config.js";
 
@@ -24,7 +24,11 @@ export type ManifestUpdate =
     }
   | {
       kind: "partial";
-      source: "watch-events" | "pull-applied";
+      /** `push-committed` is the committed-subset manifest a successful push returns:
+       *  it differs from the daemon's own manifest only at the paths that push
+       *  deferred (they carry the base entry), so it is a partial update like any
+       *  other patch — never a fresh workspace observation. */
+      source: "watch-events" | "pull-applied" | "push-committed";
       /** Least-information payload: exactly what this update touched, never the
        *  whole workspace. One update per settled drain / per pull, never per file. */
       paths: ReadonlySet<string>;
@@ -34,16 +38,17 @@ export type ManifestUpdate =
 export const pullTrustWatcherEnabled = (): boolean => process.env.RBOX_PULL_TRUST_WATCHER !== "0";
 
 /**
- * The trusted view's manifest: the daemon's manifest MINUS every unsettled path.
- * Pull's scan path deliberately omits scan-deferred paths from `local` (design 108):
- * feeding a base-carried entry into reconcile would let a remote delete plan a disk
- * delete against a path nobody could read. The daemon's manifest has the opposite
- * shape (it CARRIES the prior entry for deferred paths), so the omission has to be
- * restored here before the view crosses the seam.
+ * "This manifest minus the paths nobody can currently observe" — one home for the
+ * predicate. Its caller is the trusted view: pull's scan path deliberately omits
+ * scan-deferred paths from `local` (design 108), because feeding a base-carried
+ * entry into reconcile would let a remote delete plan a disk delete against a path
+ * nobody could read. The daemon's manifest has the opposite shape (it CARRIES the
+ * prior entry for deferred paths), so the omission has to be restored here before
+ * the view crosses the seam.
  */
-export function stripUnsettled(manifest: Manifest, unsettled: ReadonlySet<string>): Manifest {
-  if (unsettled.size === 0) return manifest;
-  const files = manifest.files.filter((f) => !unsettled.has(f.path));
+export function omitPaths(manifest: Manifest, paths: ReadonlySet<string>): Manifest {
+  if (paths.size === 0) return manifest;
+  const files = manifest.files.filter((f) => !paths.has(f.path));
   return files.length === manifest.files.length ? manifest : { ...manifest, files };
 }
 
@@ -62,33 +67,77 @@ export function patchManifestFromPull(
   actions: readonly Action[],
   postBase: Manifest,
 ): { manifest: Manifest; paths: Set<string>; unsettled: Set<string> } {
+  // `paths` is built ONCE and serves both roles: the merge's touch list and the
+  // provenance stamp (no second set assembled just to report). Conflict-copy paths
+  // are touched — they belong in the stamp — but are not entries we can author, so
+  // `unsettled` marks them and the merge below leaves them exactly as they are.
   const paths = new Set<string>();
   const unsettled = new Set<string>();
   for (const a of actions) {
-    if (a.kind === "write") paths.add(a.entry.path);
-    else if (a.kind === "delete") paths.add(a.path);
-    else {
-      paths.add(a.path);
+    paths.add(actionPath(a));
+    if (a.kind === "conflict") {
+      paths.add(a.keepLocalAs);
       unsettled.add(a.keepLocalAs);
     }
   }
-  // `paths` reports everything the pull touched, the conflict copies included; only
-  // the entry-bearing ones drive the lookup below.
-  const reported = new Set([...paths, ...unsettled]);
-  if (paths.size === 0) return { manifest: trusted, paths: reported, unsettled };
-  // One in-memory pass collecting ONLY the touched paths — no disk work, and the
-  // post-pull base is the authority for what now sits at each of them.
-  const wanted = new Map<string, FileEntry>();
-  for (const f of postBase.files) if (paths.has(f.path)) wanted.set(f.path, f);
-  const byPath = new Map(trusted.files.map((f) => [f.path, f] as const));
-  for (const p of paths) {
-    const entry = wanted.get(p);
+  if (paths.size === unsettled.size) return { manifest: trusted, paths, unsettled };
+  // `trusted.files` is in canonical manifest order (P5 guarantees a scan-authored
+  // lineage), so the patch is ONE linear merge over it plus a per-touched-path lookup
+  // in the post-pull base — no Map over the whole manifest and no re-sort.
+  const baseEntryAt = postBaseLookup(postBase, paths);
+  const touched = [...paths].sort(compareManifestPaths);
+  const files: FileEntry[] = [];
+  let i = 0;
+  let j = 0;
+  while (i < trusted.files.length || j < touched.length) {
+    const held = trusted.files[i];
+    const p = touched[j];
+    if (p === undefined) { files.push(held!); i++; continue; }
+    const order = held === undefined ? 1 : compareManifestPaths(held.path, p);
+    if (order < 0) { files.push(held!); i++; continue; } // untouched: copy through
     // Absent from the post-pull base ⇒ the pull removed it (delete, or a write the
     // base does not carry because local rules ignore it — either way not ours to keep).
-    if (entry) byPath.set(p, entry); else byPath.delete(p);
+    // Unsettled (a conflict copy) ⇒ not ours to author at all: keep whatever the
+    // trusted manifest held, and let the watcher event settle it.
+    const replacement = unsettled.has(p) ? (order === 0 ? held : undefined) : baseEntryAt(p);
+    if (replacement) files.push(replacement);
+    if (order === 0) i++;
+    j++;
   }
-  const files = [...byPath.values()].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
-  return { manifest: { ...trusted, files }, paths: reported, unsettled };
+  return { manifest: { ...trusted, files }, paths, unsettled };
+}
+
+/**
+ * Reader for "what does the post-pull base carry at this path?".
+ *
+ * Every manifest this client commits is in canonical order, so the normal answer is
+ * a binary search — O(applied·log n), no allocation. But `postBase` arrives over the
+ * wire, and an unordered one would make a binary search MISS a path that is present,
+ * which the patch would read as "the pull removed it" and the next push would publish
+ * as a deletion. So order is verified first (one comparison per entry, no allocation)
+ * and an unordered base falls back to a single pass collecting only the touched paths.
+ */
+function postBaseLookup(postBase: Manifest, wanted: ReadonlySet<string>): (path: string) => FileEntry | undefined {
+  const files = postBase.files;
+  for (let i = 1; i < files.length; i++) {
+    if (compareManifestPaths(files[i - 1]!.path, files[i]!.path) > 0) {
+      const found = new Map<string, FileEntry>();
+      for (const f of files) if (wanted.has(f.path)) found.set(f.path, f);
+      return (path) => found.get(path);
+    }
+  }
+  return (path) => {
+    let lo = 0;
+    let hi = files.length - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      const order = compareManifestPaths(files[mid]!.path, path);
+      if (order === 0) return files[mid];
+      if (order < 0) lo = mid + 1;
+      else hi = mid - 1;
+    }
+    return undefined;
+  };
 }
 
 /**
@@ -103,8 +152,9 @@ export function patchManifestFromPull(
 export function gitTopologyChanged(before: SyncState, after: SyncState): boolean {
   const a = before.lastSyncedManifest.gitRepos ?? {};
   const b = after.lastSyncedManifest.gitRepos ?? {};
+  // The union's loop subsumes any key-set difference: a key present on one side only
+  // fails its `!sa`/`!sb` test, so no separate size comparison is needed.
   const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
-  if (keys.size !== Object.keys(a).length || keys.size !== Object.keys(b).length) return true;
   for (const k of keys) {
     const sa = a[k];
     const sb = b[k];

@@ -38,6 +38,7 @@ test("deferred repo (no bases entry) retains pull-p origins", () => {
 });
 
 test("203.2: unchanged cross-scope apply advances base and emits explicit sidecar clears", async () => {
+  delete process.env.RBOX_GIT_APPLY_LAZY; // pin the lazy default against ambient kill-switch runs
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-origin-203-"));
   try {
     await fs.mkdir(path.join(root, ".rbox", "state"), { recursive: true });

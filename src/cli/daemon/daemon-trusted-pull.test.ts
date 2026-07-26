@@ -112,6 +112,8 @@ let lines: string[];
 let daemon: DaemonInternals | undefined;
 
 beforeEach(async () => {
+  // Tests pin default-ON behavior; an ambient kill-switch run must not leak in.
+  delete process.env.RBOX_PULL_TRUST_WATCHER;
   root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "rbox-trusted-pull-")));
   lines = [];
 });

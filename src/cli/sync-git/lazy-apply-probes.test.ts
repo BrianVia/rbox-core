@@ -291,7 +291,7 @@ test("203.4-5: unchanged busy receiver defers spawn-free before identity and ret
   expect(pendingRun.value.deferrals?.r?.apply?.reason).toBe("git-busy");
 });
 
-test("203.6: absent journals skip recovery and lock-held recheck catches publication", async () => {
+test("203.6: absent journals skip recovery; present journals recover under the lock", async () => {
   await initRepo("r");
   const section = await capture("r");
   const absentCounter = countingBoundary();
@@ -312,20 +312,6 @@ test("203.6: absent journals skip recovery and lock-held recheck catches publica
   );
   expect(presentCounter.count()).toBeGreaterThan(0);
   expect(present.gitPendingRemote).toBeUndefined();
-  await expect(fs.lstat(presentDir)).rejects.toMatchObject({ code: "ENOENT" });
-
-  const racedCounter = countingBoundary();
-  const raced = await applyGitSections(
-    root, cfg(), stateWith({ r: section }), manifest({ r: section }), store,
-    buildIgnoreMatcher(root), () => {},
-    {
-      disableConfigLane: true,
-      mutationBoundary: racedCounter.boundary,
-      afterJournalExistenceProbe: async (rel) => { await writeValidIntentJournal(rel, section); },
-    },
-  );
-  expect(racedCounter.count()).toBeGreaterThan(0);
-  expect(raced.gitPendingRemote).toBeUndefined();
   await expect(fs.lstat(presentDir)).rejects.toMatchObject({ code: "ENOENT" });
 
   await writeValidIntentJournal("r", section);
@@ -354,7 +340,6 @@ test("203.7: config apply remains serialized with a linked worktree sharing its 
   const remoteMain = { ...baseMain, config: desired };
   const remoteLinked = { ...baseLinked, config: desired };
   const mainEntered = deferred();
-  const linkedAtLockBoundary = deferred();
   const releaseMain = deferred();
   const progress: number[] = [];
 
@@ -372,19 +357,13 @@ test("203.7: config apply remains serialized with a linked worktree sharing its 
         await releaseMain.promise;
         return applyConfigTransaction(...args);
       },
-      afterJournalExistenceProbe: async (rel) => {
-        if (rel === "z-linked") {
-          await mainEntered.promise;
-          linkedAtLockBoundary.resolve();
-        }
-      },
       onProgress: (done) => progress.push(done),
     },
   );
 
   await mainEntered.promise;
-  await linkedAtLockBoundary.promise;
-  await new Promise<void>((resolve) => setImmediate(resolve));
+  // Let z-linked reach and queue on the shared common-dir chain lock.
+  for (let i = 0; i < 20; i++) await new Promise<void>((resolve) => setImmediate(resolve));
   expect(progress).toEqual([]);
   releaseMain.resolve();
   const outcome = await applying;

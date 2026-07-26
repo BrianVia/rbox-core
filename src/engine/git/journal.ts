@@ -147,6 +147,13 @@ export type JournalRecoveryResult<TIntended = unknown> =
 const keyFor = (relPath: string) => hashBytes(Buffer.from(relPath));
 export const checkoutJournalDir = (workspaceRoot: string, relPath: string) => path.join(workspaceRoot, ".rbox", "state", "git-journal", keyFor(relPath));
 const checkoutJournalIdPath = (workspaceRoot: string, relPath: string) => path.join(checkoutJournalDir(workspaceRoot, relPath), "journal.id");
+/** Cheap presence probe for the recovery gate. Fails open: any error other
+ * than ENOENT reports "present" so the full recovery machinery runs. */
+export const checkoutJournalPresent = (workspaceRoot: string, relPath: string): Promise<boolean> =>
+  fs.lstat(checkoutJournalDir(workspaceRoot, relPath)).then(
+    () => true,
+    (error: NodeJS.ErrnoException) => error.code !== "ENOENT",
+  );
 
 function safeRel(rel: string): boolean {
   return rel.length > 0 && !path.isAbsolute(rel) && !rel.split(/[\\/]/).includes("..");

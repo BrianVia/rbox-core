@@ -166,7 +166,7 @@ export {
   type IgnoreMatcher,
   type IgnoreRule,
 } from "./ignore.js";
-export { scanManifest, createScanStats, applyWatchEvents, statsStableAcrossHash, isPresentButUnreadableError, type ScanStats, type DirProbeSample, type DirProbeSink, type WatchEvent, type WatchEventKind } from "./manifest.js";
+export { scanManifest, createScanStats, applyWatchEvents, compareManifestPaths, statsStableAcrossHash, isPresentButUnreadableError, type ScanStats, type DirProbeSample, type DirProbeSink, type WatchEvent, type WatchEventKind } from "./manifest.js";
 export { diffManifests, indexByPath, sameContent, type ManifestDiff } from "./diff.js";
 export { LocalBlobStore, type BlobStore } from "./blobstore.js";
 export { reconcile, conflictName, type Action } from "./reconcile.js";
@@ -183,7 +183,7 @@ export {
   type ReceiverEquivalence,
   type ReceiverEquivalenceProbe,
 } from "./apply-receipt.js";
-export { applyActions,
+export { applyActions, actionPath,
   laneTimingSummary, restoreEntryToPath, uploadManifestBlobs } from "./apply.js";
 export {
   applyStatsDelta, applyStatsEnabled, setApplyStatsEnabled, snapshotApplyStats,
@@ -307,6 +307,7 @@ export {
 } from "./git/keep-pins.js";
 export {
   checkoutJournalDir,
+  checkoutJournalPresent,
   writeCheckoutJournal,
   updateCheckoutJournal,
   markCheckoutJournalPublished,

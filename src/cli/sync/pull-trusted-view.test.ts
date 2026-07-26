@@ -81,6 +81,7 @@ async function viewOfDisk(unsettled: string[] = []): Promise<TrustedLocalView> {
 }
 
 beforeEach(async () => {
+  delete process.env.RBOX_PULL_TRUST_WATCHER; // pin default-on against ambient kill-switch runs
   root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "rbox-pull-trusted-")));
   await fs.mkdir(path.join(root, ".rbox", "state"), { recursive: true });
   cfg = {
