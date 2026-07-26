@@ -32,11 +32,16 @@ warningSink output — never reaches daemon.log; diagnostics-only), Mac `sp7`
 (7 repos re-spawn slow-path EVERY push — fingerprint never re-trusts;
 investigate during soak), two pre-existing main test failures
 (scripts/e2e/dev-backed-scenario.test.ts parsePairToken vs current `rbox
-pair` output — reproduced at 77329d9d). Soak queue: FM greenfield rig
-benchmark (~/code, serial, raw-probe first), local 6-shard test-suite
-parallelization experiment (scripts/ci-shard-tests.ts run locally on the
-32-thread desktop; watch ~/.rbox/daemons litter contention). NO 1.10.0 tag —
-bake first, fresh explicit go required._
+pair` output — reproduced at 77329d9d). Soak sweep DONE same evening: rig
+FAST suite vs dev on the 204 build = 6/7 PASS (onboard 11.3s, two-device
+25.3s, mass-delete-guard 13.7s, type-flip 15.0s, idle-cpu 193.8s, join-ahead
+32.3s); git-entanglement's 7 failures bisected to PRE-EXISTING main drift
+(identical at f0bfb456) — #462 (ownership-hold/deferral-aging assertions,
+same rot class as #dev-backed parsePairToken). Deletion propagation ~4s via
+38.7KB delta BUT left 30M checkout residue on FM invisible to doctor — #460.
+`bun run test:parallel` SHIPPED (#461): local 6-shard suite 126s vs 364s
+serial, zero flakes first runs (keep watching). NO 1.10.0 tag — bake first,
+fresh explicit go required._
 
 _Prior addendum (2026-07-26, later): burn-in DONE on both hosts; #457 merged
 (refwatch crash fix — Linux fs.watch nameless-filename TypeError crash-looped
