@@ -1,7 +1,7 @@
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { buildIgnoreMatcher, checkoutTransactionCapability, cryptoPoolStatus, ManifestChainError, MAX_MANIFEST_DELTA_CHAIN, type IgnoreMatcher } from "../engine/index.js";
+import { buildIgnoreMatcher, checkoutTransactionCapability, cryptoPoolStatus, gitIdentity, gitIdentityKey, ManifestChainError, MAX_MANIFEST_DELTA_CHAIN, type IgnoreMatcher } from "../engine/index.js";
 import { loadActivity, type DaemonActivity } from "./activity.js";
 import { loadConfig, loadRawState, loadState, repoRecordsForState, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { credentialFailureMessage, loadCredentials, type CredentialLoadResult, type Credentials } from "./credentials.js";
@@ -23,6 +23,7 @@ import { ResetCorruptionError } from "./reset-io.js";
 import { GIT_DEFERRAL_REASONS } from "./sync-state-model.js";
 import { fetchWithDeadline, transferTimeoutMs } from "./remote/resilient.js";
 import { listWorktrees } from "../engine/git/shared.js";
+import { formatBinaryBytes } from "./quota-format.js";
 
 const REPORT_CAP_BYTES = 512 * 1024;
 const DAEMON_LOG_TAIL_BYTES = 64 * 1024;
@@ -70,6 +71,7 @@ export interface DiagnosticsBundle {
   activity: ActivitySection;
   workspaceShape: WorkspaceShape;
   leftoverWorktrees: DiagnosticsLeftoverWorktreeSection;
+  repoResidue: DiagnosticsRepoResidueSection;
 }
 
 export interface LocalOnlyLeftoverWorktreeEntry {
@@ -96,6 +98,38 @@ export interface DiagnosticsLeftoverWorktreeSection {
   entries: DiagnosticsLeftoverWorktreeEntry[];
 }
 
+export type RepoResidueIdentityVerdict = "match" | "mismatch" | "unknown";
+
+export interface LocalOnlyRepoResidueEntry {
+  rel: string;
+  path: string;
+  gitPresent: boolean;
+  rboxPresent: boolean;
+  identity: RepoResidueIdentityVerdict;
+}
+
+export interface LocalOnlyQuarantineEntry {
+  label: string;
+  path: string;
+  present: boolean;
+  bytes?: number;
+}
+
+export interface LocalOnlyRepoResidueSection {
+  count: number;
+  entries: LocalOnlyRepoResidueEntry[];
+  quarantine: LocalOnlyQuarantineEntry[];
+  bytesMeasured: boolean;
+}
+
+export interface DiagnosticsRepoResidueSection {
+  count: number;
+  gitPresent: number;
+  rboxPresent: number;
+  identity: Record<RepoResidueIdentityVerdict, number>;
+  quarantinePresent: number;
+}
+
 type Assert<T extends true> = T;
 type _LocalWorktreesExcludedFromBundle = Assert<
   LocalOnlyLeftoverWorktreeSection extends DiagnosticsLeftoverWorktreeSection ? false : true
@@ -111,9 +145,11 @@ export interface DoctorContext {
   daemonStale: boolean;
   localOnly: {
     leftoverWorktrees: LocalOnlyLeftoverWorktreeSection;
+    repoResidue?: LocalOnlyRepoResidueSection;
   };
   diagnostics: {
     leftoverWorktrees: DiagnosticsLeftoverWorktreeSection;
+    repoResidue?: DiagnosticsRepoResidueSection;
   };
 }
 
@@ -121,6 +157,7 @@ interface DoctorCmdOptions {
   report: boolean;
   yes: boolean;
   diagnostics?: boolean;
+  residueBytes?: boolean;
 }
 
 const rboxHome = () => path.join(process.env.RBOX_HOME || os.homedir(), ".rbox");
@@ -489,6 +526,110 @@ export async function collectLeftoverWorktrees(
   };
 }
 
+async function pathPresent(abs: string): Promise<boolean> {
+  return fsp.lstat(abs).then(() => true, () => false);
+}
+
+async function allocatedBytes(abs: string): Promise<number> {
+  let stat: Awaited<ReturnType<typeof fsp.lstat>>;
+  try {
+    stat = await fsp.lstat(abs);
+  } catch {
+    return 0;
+  }
+  const self = typeof stat.blocks === "number" ? stat.blocks * 512 : stat.size;
+  if (!stat.isDirectory() || stat.isSymbolicLink()) return self;
+  let entries: string[];
+  try {
+    entries = await fsp.readdir(abs);
+  } catch {
+    return self;
+  }
+  let total = self;
+  for (const entry of entries) total += await allocatedBytes(path.join(abs, entry));
+  return total;
+}
+
+export async function collectRepoResidue(
+  root: string,
+  cfg: WorkspaceConfig,
+  options: { residueBytes?: boolean } = {},
+): Promise<{
+  localOnly: LocalOnlyRepoResidueSection;
+  diagnostics: DiagnosticsRepoResidueSection;
+}> {
+  const state = await loadState(root, syncStreamId(cfg));
+  const entries: LocalOnlyRepoResidueEntry[] = [];
+  for (const [rel, remembered] of Object.entries(state.gitReposRemoved ?? {}).sort(([a], [b]) => a.localeCompare(b))) {
+    const repoDir = rel === "." ? root : path.join(root, rel);
+    if (!await pathPresent(repoDir)) continue;
+    const gitPresent = await pathPresent(path.join(repoDir, ".git"));
+    const rboxPresent = await pathPresent(path.join(repoDir, ".rbox"));
+    let identity: RepoResidueIdentityVerdict = "unknown";
+    try {
+      const live = await gitIdentity(repoDir);
+      if (live) identity = gitIdentityKey(live) === remembered ? "match" : "mismatch";
+    } catch {
+      // An unreadable or no-longer-valid Git repository is informationally unknown.
+    }
+    entries.push({
+      rel,
+      path: path.resolve(repoDir),
+      gitPresent,
+      rboxPresent,
+      identity,
+    });
+  }
+
+  const quarantineCandidates = new Map<string, { label: string; path: string }>();
+  const addQuarantine = (label: string, abs: string): void => {
+    const resolved = path.resolve(abs);
+    if (!quarantineCandidates.has(resolved)) quarantineCandidates.set(resolved, { label, path: resolved });
+  };
+  addQuarantine("workspace .rbox/git-quarantine", path.join(root, ".rbox", "git-quarantine"));
+  const records = repoRecordsForState(state);
+  const currentBaseRepos = [...new Set([
+    ...Object.keys(state.lastSyncedManifest.gitRepos ?? {}),
+    ...Object.entries(records).filter(([, record]) => record.base !== undefined).map(([rel]) => rel),
+  ])].sort();
+  for (const rel of currentBaseRepos) {
+    const repoDir = rel === "." ? root : path.join(root, rel);
+    addQuarantine(`${rel}/.rbox/git-quarantine`, path.join(repoDir, ".rbox", "git-quarantine"));
+    addQuarantine(`${rel}/.rbox/git-conflicts`, path.join(repoDir, ".rbox", "git-conflicts"));
+  }
+  const quarantine: LocalOnlyQuarantineEntry[] = [];
+  for (const candidate of quarantineCandidates.values()) {
+    const present = await pathPresent(candidate.path);
+    // Keep the workspace line even when absent; per-repo lines are useful only
+    // when an artifact directory actually exists.
+    if (!present && candidate.label !== "workspace .rbox/git-quarantine") continue;
+    quarantine.push({
+      ...candidate,
+      present,
+      ...(present && options.residueBytes ? { bytes: await allocatedBytes(candidate.path) } : {}),
+    });
+  }
+
+  const identity: DiagnosticsRepoResidueSection["identity"] = { match: 0, mismatch: 0, unknown: 0 };
+  for (const entry of entries) identity[entry.identity] += 1;
+  const diagnostics: DiagnosticsRepoResidueSection = {
+    count: entries.length,
+    gitPresent: entries.filter((entry) => entry.gitPresent).length,
+    rboxPresent: entries.filter((entry) => entry.rboxPresent).length,
+    identity,
+    quarantinePresent: quarantine.filter((entry) => entry.present).length,
+  };
+  return {
+    localOnly: {
+      count: entries.length,
+      entries,
+      quarantine,
+      bytesMeasured: options.residueBytes === true,
+    },
+    diagnostics,
+  };
+}
+
 async function addWorkspaceShape(root: string, relDir: string, matcher: IgnoreMatcher, shape: WorkspaceShape): Promise<void> {
   const absDir = relDir ? path.join(root, relDir) : root;
   let entries: Array<import("node:fs").Dirent>;
@@ -538,13 +679,16 @@ async function checkLocking(root: string): Promise<DoctorCheck> {
   };
 }
 
-export async function collectDoctorContext(root: string): Promise<DoctorContext> {
+export async function collectDoctorContext(
+  root: string,
+  options: { residueBytes?: boolean } = {},
+): Promise<DoctorContext> {
   const rawCfg = await loadConfig(root);
   const loaded = await loadCredentials();
   const creds = loaded.state === "valid" ? loaded.credentials : undefined;
   const cfg = { ...rawCfg, remoteUrl: creds?.remoteUrl ?? rawCfg.remoteUrl };
   const daemon = checkDaemon(root, cfg);
-  const [credentials, enrollment, device, remote, version, state, locking, git, shape, chain, leftoverWorktrees] = await Promise.all([
+  const [credentials, enrollment, device, remote, version, state, locking, git, shape, chain, leftoverWorktrees, repoResidue] = await Promise.all([
     loaded.state !== "valid" && loaded.state !== "absent"
       ? Promise.resolve({ ok: false, label: "credentials", message: `credential-degraded: ${credentialFailureMessage(loaded)}`, hint: "repair the credential source, then retry" })
       : checkCredentials(creds),
@@ -563,6 +707,21 @@ export async function collectDoctorContext(root: string): Promise<DoctorContext>
       localOnly: { count: 0, entries: [] },
       diagnostics: { count: 0, entries: [] },
     })),
+    collectRepoResidue(root, cfg, options).catch(() => ({
+      localOnly: {
+        count: 0,
+        entries: [],
+        quarantine: [],
+        bytesMeasured: options.residueBytes === true,
+      },
+      diagnostics: {
+        count: 0,
+        gitPresent: 0,
+        rboxPresent: 0,
+        identity: { match: 0, mismatch: 0, unknown: 0 },
+        quarantinePresent: 0,
+      },
+    })),
   ]);
   return {
     root,
@@ -572,8 +731,14 @@ export async function collectDoctorContext(root: string): Promise<DoctorContext>
     daemonStale: daemon.stale,
     workspaceShape: shape,
     checks: { credentials, enrollment, device, daemon: daemon.check, remote, version, state, crypto: checkCryptoWorkers(), locking, git, chain },
-    localOnly: { leftoverWorktrees: leftoverWorktrees.localOnly },
-    diagnostics: { leftoverWorktrees: leftoverWorktrees.diagnostics },
+    localOnly: {
+      leftoverWorktrees: leftoverWorktrees.localOnly,
+      repoResidue: repoResidue.localOnly,
+    },
+    diagnostics: {
+      leftoverWorktrees: leftoverWorktrees.diagnostics,
+      repoResidue: repoResidue.diagnostics,
+    },
   };
 }
 
@@ -636,6 +801,13 @@ export async function buildDiagnosticsBundle(ctx: DoctorContext): Promise<Diagno
     activity: sidecars.activity,
     workspaceShape: ctx.workspaceShape,
     leftoverWorktrees: ctx.diagnostics.leftoverWorktrees,
+    repoResidue: ctx.diagnostics.repoResidue ?? {
+      count: 0,
+      gitPresent: 0,
+      rboxPresent: 0,
+      identity: { match: 0, mismatch: 0, unknown: 0 },
+      quarantinePresent: 0,
+    },
   });
 }
 
@@ -679,8 +851,34 @@ export function renderDoctor(
         `      branch ${entry.branch ?? "(detached)"} · ${entry.path} · prunable ${entry.prunable ? "yes" : "no"} · holds synced ref ${entry.holdsSyncedRef ? "yes" : "no"}`,
       );
     }
+    const residue = localOnly.repoResidue;
+    if (residue) {
+      lines.push(`  repo residue: ${residue.count}`);
+      for (const entry of residue.entries) {
+        lines.push(
+          `      left behind after '${entry.rel}' was removed on another machine — contains a local Git repository rbox will not delete. review it yourself before removing anything.`,
+        );
+        lines.push(
+          `      ${entry.path} · .git ${entry.gitPresent ? "present" : "absent"} · .rbox ${entry.rboxPresent ? "present" : "absent"} · identity ${entry.identity}`,
+        );
+        lines.push(`      remove manually: rm -rf -- ${shellQuote(entry.path)}`);
+      }
+      lines.push("  quarantine residue:");
+      for (const entry of residue.quarantine) {
+        const detail = !entry.present
+          ? "absent"
+          : entry.bytes !== undefined
+            ? `size on disk ${formatBinaryBytes(entry.bytes)}`
+            : "present · size not measured (run `rbox doctor --residue-bytes`)";
+        lines.push(`      ${entry.label}: ${detail}`);
+      }
+    }
   }
   return lines.join("\n");
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\"'\"'")}'`;
 }
 
 export function diagnosticsUploadEnabled(opts: { diagnostics?: boolean }): boolean {
@@ -749,7 +947,10 @@ export async function doctorCmd(root: string, opts: DoctorCmdOptions): Promise<v
   if (opts.diagnostics === true && !opts.report) {
     throw new Error("--diagnostics uploads the support report — combine it with --report: rbox doctor --report --diagnostics");
   }
-  const ctx = await collectDoctorContext(root);
+  const ctx = await collectDoctorContext(
+    root,
+    opts.residueBytes ? { residueBytes: true } : {},
+  );
   console.log(renderDoctor(ctx.checks, ctx.localOnly));
   if (opts.report) {
     const bundle = await buildDiagnosticsBundle(ctx);

@@ -8,6 +8,7 @@ import {
   checkDeviceIdentity,
   collectDoctorContext,
   collectLeftoverWorktrees,
+  collectRepoResidue,
   doctorCmd,
   presentDiagnosticsPreview,
   redactGitLogLines,
@@ -17,6 +18,7 @@ import {
   type DoctorContext,
 } from "./doctor-cmd.js";
 import { git } from "../engine/git/shared.js";
+import { gitIdentity, gitIdentityKey } from "../engine/index.js";
 import { saveStateUnsafeLegacyOrTest, syncStreamId } from "./config.js";
 import { saveDevice } from "./e2ee-keystore.js";
 import { bootstrapAccount } from "../engine/e2ee/index.js";
@@ -44,8 +46,20 @@ const checks: DoctorChecks = {
   git: { ok: true, label: "git", message: "transactional symref-update supported", status: "supported", current: "git version 2.46.0" },
 };
 const emptyWorktrees = {
-  localOnly: { leftoverWorktrees: { count: 0, entries: [] } },
-  diagnostics: { leftoverWorktrees: { count: 0, entries: [] } },
+  localOnly: {
+    leftoverWorktrees: { count: 0, entries: [] },
+    repoResidue: { count: 0, entries: [], quarantine: [], bytesMeasured: false },
+  },
+  diagnostics: {
+    leftoverWorktrees: { count: 0, entries: [] },
+    repoResidue: {
+      count: 0,
+      gitPresent: 0,
+      rboxPresent: 0,
+      identity: { match: 0, mismatch: 0, unknown: 0 },
+      quarantinePresent: 0,
+    },
+  },
 };
 
 beforeEach(async () => {
@@ -84,6 +98,13 @@ function sampleBundle(): DiagnosticsBundle {
     activity: { at: "2026-07-03T00:00:00.000Z" },
     workspaceShape: { fileCount: 1, totalBytes: 42 },
     leftoverWorktrees: { count: 0, entries: [] },
+    repoResidue: {
+      count: 0,
+      gitPresent: 0,
+      rboxPresent: 0,
+      identity: { match: 0, mismatch: 0, unknown: 0 },
+      quarantinePresent: 0,
+    },
   };
 }
 
@@ -356,6 +377,143 @@ test("design 200 P2: doctor prints absolute leftover paths but the bundle contai
   } finally {
     await fs.rm(root, { recursive: true, force: true });
     await fs.rm(privateParent, { recursive: true, force: true });
+  }
+});
+
+test("207.7: repo residue is local-only, verdicts are neutral, and quarantine sizing is opt-in", async () => {
+  const root = await makeWorkspace();
+  try {
+    const cfg = {
+      schema: "e2ee/v1" as const,
+      remoteWorkspaceId: "ws_diag",
+      projectId: "root",
+      rootPath: root,
+      remoteUrl: "https://api.test",
+      token: "",
+      deviceId: "dev_1",
+      syncGit: true,
+    };
+    const initCommittedRepo = async (rel: string): Promise<string> => {
+      const repo = path.join(root, rel);
+      await fs.mkdir(repo, { recursive: true });
+      await git(repo, ["init", "-qb", "main"]);
+      await git(repo, ["config", "user.email", "doctor@example.invalid"]);
+      await git(repo, ["config", "user.name", "doctor"]);
+      await fs.writeFile(path.join(repo, "tracked"), `${rel}\n`);
+      await git(repo, ["add", "tracked"]);
+      await git(repo, ["commit", "-qm", rel]);
+      return repo;
+    };
+    const matchRepo = await initCommittedRepo("private-match-repo");
+    const mismatchRepo = await initCommittedRepo("private-mismatch-repo");
+    const currentRepo = await initCommittedRepo("current-repo");
+    const unknownRepo = path.join(root, "private-unknown-repo");
+    await fs.mkdir(unknownRepo);
+    await fs.mkdir(path.join(matchRepo, ".rbox", "git-quarantine"), { recursive: true });
+    await fs.writeFile(path.join(matchRepo, ".rbox", "git-quarantine", "kept.bundle"), "kept\n");
+
+    const tip = (await git(currentRepo, ["rev-parse", "HEAD"])).trim();
+    const currentSection = {
+      bundleSha: "1".repeat(64),
+      bundleEncSha: "2".repeat(64),
+      bundleCipherSize: 1,
+      head: "ref: refs/heads/main\n",
+      refs: { "refs/heads/main": tip },
+      refScope: "all" as const,
+    };
+    const matchKey = gitIdentityKey(await gitIdentity(matchRepo));
+    await saveStateUnsafeLegacyOrTest(root, {
+      stream: syncStreamId(cfg),
+      stateNonce: "b".repeat(32),
+      lastSyncedSequence: 2,
+      lastSyncedManifest: {
+        generatedAt: "2026-07-26T00:00:00.000Z",
+        files: [],
+        manifestSchema: 2,
+        gitRepos: { "current-repo": currentSection },
+      },
+      gitReposRemoved: {
+        "private-match-repo": matchKey,
+        "private-mismatch-repo": "not-the-live-identity",
+        "private-unknown-repo": "no-readable-git",
+        "private-absent-repo": "phantom-must-not-render",
+      },
+    });
+    await fs.mkdir(path.join(root, ".rbox", "git-quarantine"), { recursive: true });
+    await fs.writeFile(path.join(root, ".rbox", "git-quarantine", "retired.git"), "retired\n");
+    await fs.mkdir(path.join(currentRepo, ".rbox", "git-quarantine"), { recursive: true });
+    await fs.writeFile(path.join(currentRepo, ".rbox", "git-quarantine", "local.bundle"), "bundle\n");
+    await fs.mkdir(path.join(currentRepo, ".rbox", "git-conflicts"), { recursive: true });
+    await fs.writeFile(path.join(currentRepo, ".rbox", "git-conflicts", "conflict.bundle"), "conflict\n");
+
+    const presence = await collectRepoResidue(root, cfg);
+    expect(presence.localOnly.entries.map(({ rel, identity }) => ({ rel, identity }))).toEqual([
+      { rel: "private-match-repo", identity: "match" },
+      { rel: "private-mismatch-repo", identity: "mismatch" },
+      { rel: "private-unknown-repo", identity: "unknown" },
+    ]);
+    expect(presence.localOnly.entries.find((entry) => entry.rel === "private-match-repo")).toMatchObject({
+      gitPresent: true,
+      rboxPresent: true,
+    });
+    expect(presence.localOnly.quarantine.every((entry) => entry.bytes === undefined)).toBe(true);
+
+    const localOnly = {
+      leftoverWorktrees: { count: 0, entries: [] },
+      repoResidue: presence.localOnly,
+    };
+    const printed = renderDoctor(checks, localOnly);
+    expect(printed).toContain("leftover worktrees: 0");
+    expect(printed).toContain("repo residue: 3");
+    expect(printed).toContain(
+      "left behind after 'private-match-repo' was removed on another machine — contains a local Git repository rbox will not delete. review it yourself before removing anything.",
+    );
+    expect(printed).toContain(`${matchRepo} · .git present · .rbox present · identity match`);
+    expect(printed).toContain(`remove manually: rm -rf -- '${matchRepo}'`);
+    expect(printed).not.toContain("private-absent-repo");
+    expect(printed).toContain("workspace .rbox/git-quarantine: present · size not measured");
+    expect(printed).toContain("current-repo/.rbox/git-conflicts: present · size not measured");
+
+    const sized = await collectRepoResidue(root, cfg, { residueBytes: true });
+    expect(sized.localOnly.bytesMeasured).toBe(true);
+    expect(sized.localOnly.quarantine.filter((entry) => entry.present).every((entry) => (entry.bytes ?? -1) >= 0)).toBe(true);
+    const sizedPrinted = renderDoctor(checks, {
+      leftoverWorktrees: { count: 0, entries: [] },
+      repoResidue: sized.localOnly,
+    });
+    expect(sizedPrinted).toContain("workspace .rbox/git-quarantine: size on disk");
+    expect(sizedPrinted).toContain("current-repo/.rbox/git-quarantine: size on disk");
+    expect(sizedPrinted).toContain("current-repo/.rbox/git-conflicts: size on disk");
+
+    const ctx: DoctorContext = {
+      root,
+      cfg,
+      checks,
+      workspaceShape: { fileCount: 3, totalBytes: 1 },
+      daemonStale: true,
+      localOnly,
+      diagnostics: {
+        leftoverWorktrees: { count: 0, entries: [] },
+        repoResidue: presence.diagnostics,
+      },
+    };
+    const payload = JSON.stringify(await buildDiagnosticsBundle(ctx));
+    expect(payload).toContain("\"repoResidue\"");
+    expect(payload).toContain("\"count\":3");
+    expect(payload).toContain("\"match\":1");
+    for (const secret of [
+      matchRepo,
+      mismatchRepo,
+      unknownRepo,
+      "private-match-repo",
+      "private-mismatch-repo",
+      "private-unknown-repo",
+      "current-repo",
+    ]) {
+      expect(payload).not.toContain(secret);
+    }
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
   }
 });
 

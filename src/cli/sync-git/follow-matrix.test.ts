@@ -18,7 +18,10 @@ import {
 } from "../../engine/index.js";
 import { readOpState } from "../../engine/git/refs.js";
 import { hashFile } from "../../engine/hash.js";
-import { loadState, repoRecordsForState, saveStateUnsafeLegacyOrTest, type SyncState, type WorkspaceConfig } from "../config.js";
+import { loadState, repoRecordsForState, saveStateUnsafeLegacyOrTest, syncStreamId, type SyncState, type WorkspaceConfig } from "../config.js";
+import { collectRepoResidue, renderDoctor, type DoctorChecks } from "../doctor-cmd.js";
+import type { SyncRemote } from "../remote.js";
+import { pull } from "../sync.js";
 import { orderedRepoDeferralUpdates, saveStateSource } from "../sync-state.js";
 import { applyGitSections, withRevalidatedGitPartialApplies } from "./apply.js";
 import { gitIncomingKey } from "./shared.js";
@@ -528,6 +531,87 @@ test("design 116 scan-deferred row defers when the applied-manifest oracle is in
     expect(await fs.readFile(path.join(repo, ".git", "HEAD"), "utf8")).toBe("ref: refs/heads/main\n");
   } finally {
     await fs.rm(root, { recursive: true, force: true });
+  }
+}, 20_000);
+
+test("207.9: cloned repo removal loses its empty skeleton and doctor names the retained repository", async () => {
+  const root = path.join(suiteTmp, `founder-repro-${Math.random().toString(16).slice(2)}`);
+  const repo = path.join(root, REL);
+  const sender = path.join(suiteTmp, `founder-sender-${Math.random().toString(16).slice(2)}`);
+  try {
+    await initRepo(sender);
+    const tracked = new Map([
+      [`${REL}/media/links/metadata/item.txt`, "metadata\n"],
+      [`${REL}/packages/empty/generated/item.txt`, "generated\n"],
+    ]);
+    for (const [rel, bytes] of tracked) {
+      const senderPath = path.join(sender, rel.slice(REL.length + 1));
+      await fs.mkdir(path.dirname(senderPath), { recursive: true });
+      await fs.writeFile(senderPath, bytes);
+    }
+    await git(sender, "add", ".");
+    await git(sender, "commit", "-qm", "nested repository");
+    await fs.mkdir(path.join(root, ".rbox", "state"), { recursive: true });
+    await exec("git", ["clone", "-q", sender, repo], { env: TEST_GIT_ENV });
+    const base = await capture(repo);
+    const cfg = cfgFor(root);
+    const files: FileEntry[] = [];
+    for (const [rel, bytes] of tracked) {
+      const stat = await fs.lstat(path.join(root, rel));
+      files.push({
+        path: rel,
+        type: "file",
+        sha256: hashBytes(Buffer.from(bytes)),
+        size: Buffer.byteLength(bytes),
+        mode: stat.mode & 0o777,
+        mtimeMs: stat.mtimeMs,
+      });
+    }
+    await saveStateUnsafeLegacyOrTest(root, {
+      stream: syncStreamId(cfg),
+      stateNonce: "d".repeat(32),
+      lastSyncedSequence: 1,
+      lastSyncedManifest: {
+        generatedAt: "present",
+        files,
+        manifestSchema: 2,
+        gitRepos: { [REL]: base },
+      },
+      repoRecords: { [REL]: { repoGen: 1, sourceSeq: 1, base } },
+    });
+    const remote: SyncRemote = {
+      latest: async () => ({
+        sequence: 2,
+        manifest: { generatedAt: "removed", files: [], manifestSchema: 2 },
+      }),
+      missingBlobs: async () => [],
+      putBlobFile: async () => {},
+      commit: async () => ({ sequence: 3 }),
+      blobStore: () => store,
+    };
+
+    await pull(root, cfg, { remote, onGitLog: () => {} });
+    await expect(fs.lstat(path.join(repo, "media"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.lstat(path.join(repo, "packages"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await fs.lstat(path.join(repo, ".git"))).isDirectory()).toBe(true);
+
+    const residue = await collectRepoResidue(root, cfg);
+    expect(residue.localOnly.entries).toHaveLength(1);
+    expect(residue.localOnly.entries[0]).toMatchObject({
+      rel: REL,
+      path: repo,
+      gitPresent: true,
+      identity: "match",
+    });
+    const rendered = renderDoctor({} as DoctorChecks, {
+      leftoverWorktrees: { count: 0, entries: [] },
+      repoResidue: residue.localOnly,
+    });
+    expect(rendered).toContain(`left behind after '${REL}' was removed on another machine`);
+    expect(rendered).toContain(`remove manually: rm -rf -- '${repo}'`);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+    await fs.rm(sender, { recursive: true, force: true });
   }
 }, 20_000);
 

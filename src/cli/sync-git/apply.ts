@@ -1,6 +1,7 @@
+import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { applyGitState, assertGitTargetWithinRoot, checkoutJournalPresent, finalizeGitChainTimings, gitIdentity, gitIdentityKey, gitPreflight, indexIdentityV2, inspectLockedPRepairReceipt, isGitBusy, persistPRepairTerminal, preserveGitConflict, receiverEquivalentCollisionNames, repoCtxFromDisk, poolMap, readBaseAbsentArtifact, readBasePresentArtifact, runLockedPRepairAttempt, resumeLockedAcceptedPRepair, refreshLockedAcceptedPRepair, settleBaseAbsentArtifact, type AppliedManifestOracle, type ApplyBranchTransitionAdapter, type ApplyBranchTransitionInput, type CheckoutCapabilityProbe, type GitIdentity, type GitChainTimings, type GitSection, type IgnoreMatcher, type Manifest, type BlobStore, type RepoCtx, zeroGitChainTimings } from "../../engine/index.js";
+import { applyGitState, assertGitTargetWithinRoot, checkoutJournalPresent, clearCheckoutJournal, finalizeGitChainTimings, gitIdentity, gitIdentityKey, gitPreflight, indexIdentityV2, inspectLockedPRepairReceipt, isGitBusy, persistPRepairTerminal, preserveGitConflict, receiverEquivalentCollisionNames, repoCtxFromDisk, poolMap, readBaseAbsentArtifact, readBasePresentArtifact, runLockedPRepairAttempt, resumeLockedAcceptedPRepair, refreshLockedAcceptedPRepair, settleBaseAbsentArtifact, type AppliedManifestOracle, type ApplyBranchTransitionAdapter, type ApplyBranchTransitionInput, type CheckoutCapabilityProbe, type GitIdentity, type GitChainTimings, type GitSection, type IgnoreMatcher, type Manifest, type BlobStore, type RepoCtx, zeroGitChainTimings } from "../../engine/index.js";
 import { canonicalizeGitConfig, sanitizeGitSectionForPersistence, validateCanonicalGitConfig, type GitConfig } from "../../engine/git/config-sync.js";
 import { applyConfigTransaction, materializeFreshGitConfig, readConfigSnapshot, readParsedConfigSnapshot, sameConfigStatToken, type ConfigStatToken, type ConfigTransactionResult } from "../../engine/git/config-txn.js";
 import { readAllRefs, readAllRefsStrict } from "../../engine/git/refs.js";
@@ -28,6 +29,125 @@ import {
 import { acquirePreparedStateCasLocks, markStateCasCommitted, prepareStateCasLocks, releaseStateCasLocks, type HeldStateCasLock, type StateCasLockRequest } from "./state-cas-locks.js";
 import type { LockfileHooks } from "../../engine/git/lockfile.js";
 import { asyncMemo } from "./async-memo.js";
+import { openAdoptDirectory } from "../adopt-fs.js";
+
+const directoryOpenFlags =
+  constants.O_RDONLY | (constants.O_DIRECTORY ?? 0) | (constants.O_NOFOLLOW ?? 0);
+
+function directoryFdPath(fd: number, leaf?: string): string {
+  const root = process.platform === "linux" ? `/proc/self/fd/${fd}` : `/dev/fd/${fd}`;
+  return leaf === undefined ? root : path.join(root, leaf);
+}
+
+async function pinnedDirectoryStillBound(
+  root: string,
+  rel: string,
+  held: fs.FileHandle,
+): Promise<boolean> {
+  const reopened = await openAdoptDirectory(root, rel, false).catch(() => undefined);
+  if (!reopened) return false;
+  try {
+    const [expected, actual] = await Promise.all([
+      held.stat({ bigint: true }),
+      reopened.stat({ bigint: true }),
+    ]);
+    return expected.dev === actual.dev && expected.ino === actual.ino;
+  } finally {
+    await reopened.close().catch(() => {});
+  }
+}
+
+export interface RepoSkeletonSweepOptions {
+  /** Tests only: receives the already-pinned parent handle and a single safe leaf. */
+  rmdir?: (parent: fs.FileHandle, leaf: string) => Promise<void>;
+}
+
+/**
+ * Best-effort, bottom-up removal of directories that rmdir itself proves empty.
+ * Every traversal component is opened no-follow and every rmdir is relative to a
+ * verified pinned parent handle. Files, symlinks, and non-empty directories are
+ * never removed.
+ */
+export async function sweepRemovedRepoSkeleton(
+  root: string,
+  rel: string,
+  options: RepoSkeletonSweepOptions = {},
+): Promise<void> {
+  if (rel === ".") return;
+  const parts = rel.split("/");
+  if (
+    path.isAbsolute(rel)
+    || rel.includes("\\")
+    || rel.includes("\0")
+    || parts.some((part) => !part || part === "." || part === "..")
+  ) return;
+
+  const remove = options.rmdir
+    ?? ((parent: fs.FileHandle, leaf: string) => fs.rmdir(directoryFdPath(parent.fd, leaf)));
+
+  const sweepChild = async (
+    parent: fs.FileHandle,
+    parentRel: string,
+    leaf: string,
+  ): Promise<void> => {
+    const childRel = parentRel ? `${parentRel}/${leaf}` : leaf;
+    try {
+      await assertGitTargetWithinRoot(root, childRel);
+      if (!await pinnedDirectoryStillBound(root, parentRel, parent)) return;
+      const child = await fs.open(directoryFdPath(parent.fd, leaf), directoryOpenFlags);
+      try {
+        const entries = await fs.readdir(directoryFdPath(child.fd), { withFileTypes: true });
+        for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+          if (!entry.isDirectory()) continue;
+          // Retained Git and rbox recovery state are opaque. Their presence
+          // vetoes ancestor rmdir through ENOTEMPTY, and even empty internals
+          // must remain byte-for-byte untouched.
+          if (entry.name === ".git" || entry.name === ".rbox") continue;
+          await sweepChild(child, childRel, entry.name);
+        }
+      } finally {
+        await child.close().catch(() => {});
+      }
+      if (!await pinnedDirectoryStillBound(root, parentRel, parent)) return;
+      await remove(parent, leaf);
+    } catch {
+      // A failed open/identity check/rmdir vetoes only this subtree. In
+      // particular ENOTEMPTY, ENOTDIR, EACCES, and concurrent changes are
+      // ordinary residue, not pull failures.
+    }
+  };
+
+  try {
+    await assertGitTargetWithinRoot(root, rel);
+    const leaf = parts.pop()!;
+    const parentRel = parts.join("/");
+    const parent = await openAdoptDirectory(root, parentRel, false);
+    try {
+      await sweepChild(parent, parentRel, leaf);
+    } finally {
+      await parent.close().catch(() => {});
+    }
+  } catch {
+    // Removal cleanup is deliberately best effort.
+  }
+}
+
+interface KeySnapshot<T> {
+  present: boolean;
+  value: T | undefined;
+}
+
+function snapshotKey<T>(record: Record<string, T>, key: string): KeySnapshot<T> {
+  return {
+    present: Object.prototype.hasOwnProperty.call(record, key),
+    value: record[key],
+  };
+}
+
+function restoreKey<T>(record: Record<string, T>, key: string, snapshot: KeySnapshot<T>): void {
+  if (snapshot.present) record[key] = snapshot.value!;
+  else delete record[key];
+}
 /** Local-vs-base divergence, projected onto the narrower of the two scopes (§7).
  *  No base → ANY local git identity is divergence-from-nothing (an independently
  *  created local repo must never be clobbered). No local identity (no repo, empty
@@ -320,11 +440,15 @@ opts: {
     beforeFinalLive?: (relPath: string) => void | Promise<void>;
     beforeManualAbsentTransition?: (relPath: string, ref: string) => void | Promise<void>;
     beforeWorktreeOwnershipRead?: (relPath: string) => void | Promise<void>;
+    /** Tests only: after removal state transitions, before journal/skeleton cleanup. */
+    beforeRemovalCleanup?: (relPath: string) => void | Promise<void>;
     /** Shared logical time for held-attempt tests; omitted production call sites
      * retain the helpers' individual wall-clock reads. */
     heldNow?: () => number;
     warningSink?: (message: string) => void;
     mutationBoundary?: MutationBoundary;
+    /** Tests only: observes/injects the anchored empty-directory removal call. */
+    sweepRmdir?: RepoSkeletonSweepOptions["rmdir"];
   } = {}
 ): Promise<GitPullOutcome> {
   const sanitizeSections = (sections: Record<string, GitSection> | undefined): Record<string, GitSection> =>
@@ -717,6 +841,17 @@ opts: {
       // preserve. Ordering is crash-safety: if the
       // preserve throws (blob/fs failure), the per-repo catch must not leave a stale
       // pending/base entry for the next push to resurrect.
+      const beforeRemoval = {
+        applied: snapshotKey(applied, rel),
+        removedMem: snapshotKey(removedMem, rel),
+        needsRes: snapshotKey(needsRes, rel),
+        pending: snapshotKey(pending, rel),
+        deferrals: snapshotKey(deferrals, rel),
+        partial: snapshotKey(partial, rel),
+        attempt: snapshotKey(attempt, rel),
+        idxProj: snapshotKey(idxProj, rel),
+        repoProofs: snapshotKey(repoProofs, rel),
+      };
       const identity = await getLocalId();
       const diverged = pend !== undefined && localDivergedFromBase(identity, baseSec);
       delete pending[rel];
@@ -738,6 +873,30 @@ opts: {
         // lock-immune and equals the live identity whenever the leftover is untouched.
         removedMem[rel] =
           (await getBusy()) && baseSec ? projectedKey(baseSec, dotGit.isFile() ? "scoped" : "all") : gitIdentityKey(identity);
+      }
+      await opts.beforeRemovalCleanup?.(rel);
+      let journalClearError: unknown;
+      try {
+        await clearCheckoutJournal(root, rel);
+      } catch (error) {
+        journalClearError = error;
+      }
+      await sweepRemovedRepoSkeleton(
+        root,
+        rel,
+        opts.sweepRmdir ? { rmdir: opts.sweepRmdir } : {},
+      );
+      if (journalClearError) {
+        restoreKey(applied, rel, beforeRemoval.applied);
+        restoreKey(removedMem, rel, beforeRemoval.removedMem);
+        restoreKey(needsRes, rel, beforeRemoval.needsRes);
+        restoreKey(pending, rel, beforeRemoval.pending);
+        restoreKey(deferrals, rel, beforeRemoval.deferrals);
+        restoreKey(partial, rel, beforeRemoval.partial);
+        restoreKey(attempt, rel, beforeRemoval.attempt);
+        restoreKey(idxProj, rel, beforeRemoval.idxProj);
+        restoreKey(repoProofs, rel, beforeRemoval.repoProofs);
+        throw journalClearError;
       }
       // §13.5 conflict precedence: the pending remote section is preserved for manual
       // recovery. Best-effort — preserve never mutates local branches/index/identity,

@@ -11,6 +11,10 @@ All notable changes to rbox are recorded here. The format follows
   including its version and witnessed mode, and calls out version mismatches.
   Dev-build versions with `+` metadata now parse correctly, restoring daemon
   witness reporting and graceful shutdown safety.
+- Removing a repository on another machine now prunes empty directory
+  skeletons without touching local Git or recovery data. `rbox doctor` reports
+  any retained repository residue and known quarantine directories; pass
+  `--residue-bytes` to measure their size on disk.
 
 ### Changed
 - Manifest publications now report whether they emitted a delta or snapshot,
