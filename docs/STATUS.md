@@ -5,6 +5,27 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_Session addendum (2026-07-26, later): burn-in DONE on both hosts; #457 merged
+(refwatch crash fix — Linux fs.watch nameless-filename TypeError crash-looped
+FM's daemon; found because FM had never run a live watcher until its re-bind).
+FM re-bound as a FULL device (fresh credential — the 403-telemetry mystery
+device was FM; now zero 403s; old tree parked at
+~/Development.pre-rebind-2026-07-26; inotify raised via
+/etc/sysctl.d/60-rbox-inotify.conf). Measured after 202+203: Mac steady pull
+~5s (scan 0.0s, git-apply 0.2s/101 repos); FM notify→disk ~4.5s (trusted);
+end-to-end Mac→FM 19.6s (was ~29s). **Remaining bottleneck = Mac PUBLISH
+15.6s for a 40-byte change — the design-204 target**: (a) `missing` 4.1s =
+presence check for ALL 108,537 blobs (7.2MB hashes upstream) instead of
+delta-vs-proven-watermark; (b) `commit` 4.4s = full 12.5MB manifest snapshot
+upload (commit.delta AE family suggests delta machinery partially exists —
+find why snapshot path taken); (c) `git-plan` 2.7s = plan walk not yet
+203-treated. Open FM items: savvy-core git deferral ("artifact on checkout
+unavailable" — likely needs Mac-side ref movement to republish artifacts);
+watch for `git-ref-watch event error (degraded to dirty)` lines (would mean
+nameless events occur in practice). Issue #456: init --adopt displaces 90k
+files BEFORE validating workspace (adopt abort restored perfectly). NO 1.10.0
+tag yet — bake first, fresh explicit go required._
+
 _Last updated: 2026-07-26 (**pull fast path merged — designs 202+203, targets
 v1.10.0 after fleet burn-in**). Origin: AE telemetry showed every pull paying
 O(workspace) fixed cost (fleet pull p50 64.5s; ~20s flat on the Mac's 108k-file
