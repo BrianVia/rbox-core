@@ -7,6 +7,10 @@ All notable changes to rbox are recorded here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- Manifest delta commits now keep advisory file mtimes stable across machines,
+  preventing a daemon restart or full rescan from publishing a workspace-sized
+  delta when only a small number of files actually changed. Set
+  `RBOX_MTIME_NORMALIZE=0` to restore the previous behavior.
 - `rbox start` now recognizes and identifies an already-running background sync,
   including its version and witnessed mode, and calls out version mismatches.
   Dev-build versions with `+` metadata now parse correctly, restoring daemon

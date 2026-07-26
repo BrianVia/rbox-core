@@ -12,8 +12,14 @@ import { loadState, saveStateUnsafeLegacyOrTest, StreamMismatchError, syncStream
 import { BlobRetryLaterError, BlobShaMismatchError, type CommitOptions, type CommitResult, type LatestOptions, type SyncRemote } from "../remote.js";
 import {
   buildIgnoreMatcher,
+  canonicalManifestBytes,
+  canonicalManifestHashStreaming,
+  decodeEnvelope,
+  diffToOps,
   ENCRYPT_ADDRESS_CACHE_REL,
+  encodeDeltaEnvelope,
   encryptFileToTemp,
+  foldDelta,
   PhaseReport,
   scanManifest,
   type BlobStore,
@@ -23,6 +29,7 @@ import {
   type GitSection,
   type Manifest,
 } from "../../engine/index.js";
+import { setClassifyCacheHitObserverForTest } from "../publish-pipeline/shared.js";
 import { encryptFileNameProbe } from "../../engine/e2ee/e2ee-e2e.helpers.js";
 import { listTrash } from "../../engine/trash.js";
 import { projectLocalManifest } from "../local-file-projection.js";
@@ -110,6 +117,176 @@ test("stampManifestSchemaForCommit stamps schema 4 only when file or git compres
   ).toBe(4);
 });
 
+const normalizedEntry = (entryPath: string, mtimeMs: number): FileEntry => ({
+  path: entryPath,
+  type: "file",
+  sha256: "1".repeat(64),
+  size: 11,
+  mode: 0o644,
+  mtimeMs,
+  encSha: "2".repeat(64),
+  comp: "zstd",
+  payloadSha: "3".repeat(64),
+  cipherSize: 27,
+});
+
+test("209/1 full-tree mtime rewrites normalize entry-for-entry and emit zero ops", () => {
+  const base: Manifest = {
+    generatedAt: "base",
+    files: [normalizedEntry("a.txt", 10), normalizedEntry("b.txt", 20), normalizedEntry("c.txt", 30)],
+  };
+  const target: Manifest = {
+    generatedAt: "target",
+    files: base.files.map((entry, index) => ({ ...entry, mtimeMs: 1_000 + index })),
+  };
+
+  const committed = stampManifestSchemaForCommit(target, base);
+
+  expect(committed.files).toEqual(base.files);
+  expect(committed.files.every((entry, index) => entry === base.files[index])).toBe(true);
+  expect(diffToOps(base, committed)).toEqual([]);
+});
+
+test("209/2 every non-path identity field prevents normalization; rename is set plus del", () => {
+  const baseEntry: FileEntry = {
+    ...normalizedEntry("identity.txt", 10),
+    type: "symlink",
+    symlinkTarget: "../target",
+  };
+  const base: Manifest = { generatedAt: "base", files: [baseEntry] };
+  const changes: Array<[string, (entry: FileEntry) => FileEntry]> = [
+    ["sha256", (entry) => ({ ...entry, sha256: "4".repeat(64) })],
+    ["size", (entry) => ({ ...entry, size: entry.size + 1 })],
+    ["mode", (entry) => ({ ...entry, mode: 0o755 })],
+    ["type", (entry) => ({ ...entry, type: "file" })],
+    ["symlinkTarget", (entry) => ({ ...entry, symlinkTarget: "../elsewhere" })],
+    ["encSha", (entry) => ({ ...entry, encSha: "5".repeat(64) })],
+    ["comp", (entry) => {
+      const { comp: _comp, ...withoutComp } = entry;
+      return withoutComp;
+    }],
+    ["payloadSha", (entry) => ({ ...entry, payloadSha: "6".repeat(64) })],
+    ["cipherSize", (entry) => ({ ...entry, cipherSize: entry.cipherSize! + 1 })],
+  ];
+
+  for (const [field, change] of changes) {
+    const outgoing = change({ ...baseEntry, mtimeMs: 99 });
+    const committed = stampManifestSchemaForCommit({ generatedAt: field, files: [outgoing] }, base);
+    expect(committed.files[0]).toBe(outgoing);
+    expect(diffToOps(base, committed), field).toEqual([{ op: "set", entry: outgoing }]);
+  }
+
+  const renamed = { ...baseEntry, path: "renamed.txt", mtimeMs: 99 };
+  const committed = stampManifestSchemaForCommit({ generatedAt: "rename", files: [renamed] }, base);
+  expect(committed.files[0]).toBe(renamed);
+  expect(diffToOps(base, committed)).toEqual([
+    { op: "del", path: "identity.txt" },
+    { op: "set", entry: renamed },
+  ]);
+});
+
+test("209/3 unknown keys on either side disable normalization and fall through verbatim", () => {
+  const plainBase = normalizedEntry("future.txt", 10);
+  const plainTarget = { ...plainBase, mtimeMs: 20 };
+  const futureBase = { ...plainBase, futureIdentity: "base" } as FileEntry;
+  const futureTarget = { ...plainTarget, futureIdentity: "target" } as FileEntry;
+
+  const outgoingAgainstFutureBase = { ...plainTarget };
+  const againstFutureBase = stampManifestSchemaForCommit(
+    { generatedAt: "target", files: [outgoingAgainstFutureBase] },
+    { generatedAt: "base", files: [futureBase] },
+  );
+  expect(againstFutureBase.files[0]).toBe(outgoingAgainstFutureBase);
+  expect(diffToOps({ generatedAt: "base", files: [futureBase] }, againstFutureBase)).toHaveLength(1);
+
+  const futureOutgoing = stampManifestSchemaForCommit(
+    { generatedAt: "target", files: [futureTarget] },
+    { generatedAt: "base", files: [plainBase] },
+  );
+  expect(futureOutgoing.files[0]).toBe(futureTarget);
+  expect(diffToOps({ generatedAt: "base", files: [plainBase] }, futureOutgoing)).toHaveLength(1);
+});
+
+test("209/4 normalized commit encodes, decodes, and folds byte-for-byte coherently", async () => {
+  const base: Manifest = {
+    generatedAt: "base",
+    manifestSchema: 4,
+    files: [normalizedEntry("changed.txt", 20), normalizedEntry("same.txt", 10)],
+  };
+  const target: Manifest = {
+    generatedAt: "target",
+    manifestSchema: 4,
+    files: [
+      { ...base.files[0]!, mtimeMs: 100 },
+      { ...base.files[1]!, sha256: "7".repeat(64), encSha: "8".repeat(64), payloadSha: "9".repeat(64), mtimeMs: 200 },
+    ],
+  };
+  const committed = stampManifestSchemaForCommit(target, base);
+  const encoded = await encodeDeltaEnvelope(base, committed, {
+    baseEncSha: "a".repeat(64),
+    baseManifestHash: canonicalManifestHashStreaming(base),
+    compress: true,
+  });
+  const decoded = await decodeEnvelope(encoded.bytes);
+  if (decoded.kind !== "delta") throw new Error("expected delta");
+
+  expect(encoded.opCount).toBe(1);
+  const folded = foldDelta(base, decoded.ops, decoded.header);
+  expect(canonicalManifestBytes(folded)).toEqual(canonicalManifestBytes(committed));
+});
+
+test("209/8 mixed old/new writers alternate 2-op and 0-op commits without ping-pong on the new side", () => {
+  const initial: Manifest = {
+    generatedAt: "initial",
+    files: [normalizedEntry("a.txt", 10), normalizedEntry("b.txt", 20)],
+  };
+  const oldOne: Manifest = {
+    generatedAt: "old-1",
+    files: initial.files.map((entry) => ({ ...entry, mtimeMs: entry.mtimeMs + 100 })),
+  };
+  const newOneLocal: Manifest = {
+    generatedAt: "new-1",
+    files: oldOne.files.map((entry) => ({ ...entry, mtimeMs: entry.mtimeMs + 100 })),
+  };
+  const newOne = stampManifestSchemaForCommit(newOneLocal, oldOne);
+  const oldTwo: Manifest = {
+    generatedAt: "old-2",
+    files: newOne.files.map((entry) => ({ ...entry, mtimeMs: entry.mtimeMs + 100 })),
+  };
+  const newTwo = stampManifestSchemaForCommit({
+    generatedAt: "new-2",
+    files: oldTwo.files.map((entry) => ({ ...entry, mtimeMs: entry.mtimeMs + 100 })),
+  }, oldTwo);
+
+  expect([
+    diffToOps(initial, oldOne).length,
+    diffToOps(oldOne, newOne).length,
+    diffToOps(newOne, oldTwo).length,
+    diffToOps(oldTwo, newTwo).length,
+  ]).toEqual([2, 0, 2, 0]);
+});
+
+test("209/9 RBOX_MTIME_NORMALIZE=0 restores one mtime op per entry", () => {
+  const previous = process.env.RBOX_MTIME_NORMALIZE;
+  process.env.RBOX_MTIME_NORMALIZE = "0";
+  try {
+    const base: Manifest = {
+      generatedAt: "base",
+      files: [normalizedEntry("a.txt", 10), normalizedEntry("b.txt", 20), normalizedEntry("c.txt", 30)],
+    };
+    const target: Manifest = {
+      generatedAt: "target",
+      files: base.files.map((entry) => ({ ...entry, mtimeMs: entry.mtimeMs + 1_000 })),
+    };
+    const committed = stampManifestSchemaForCommit(target, base);
+    expect(committed.files).toBe(target.files);
+    expect(diffToOps(base, committed)).toHaveLength(base.files.length);
+  } finally {
+    if (previous === undefined) delete process.env.RBOX_MTIME_NORMALIZE;
+    else process.env.RBOX_MTIME_NORMALIZE = previous;
+  }
+});
+
 /**
  * Stateful in-memory server simulator (design 09 §1) — monotonic head, 409 parent
  * conflict, 422 blob-existence. Blobs are content-addressed by `encSha` (ciphertext)
@@ -121,6 +298,7 @@ class FakeRemote implements SyncRemote {
   private readonly log = new Map<number, Manifest>(); // seq → manifest
   private readonly blobs = new Map<string, Buffer>(); // encSha → ciphertext
   commitCalls = 0;
+  successfulCommits: Array<{ manifest: Manifest; options?: CommitOptions }> = [];
   forceUnsatisfiedOnce = false;
   forceUnsatisfiedTotals: number[] = [];
   forceUnsatisfiedPageSize = 1;
@@ -208,6 +386,7 @@ class FakeRemote implements SyncRemote {
       encBytes: 7,
       serverTimings: { totalMs: 13, envelopeMs: 1, accountingMs: 2, sidecarMs: 3, commitMs: 4, mirrorMs: 2, responseMs: 1 },
     });
+    this.successfulCommits.push({ manifest, ...(options ? { options } : {}) });
     this.head += 1;
     this.log.set(this.head, manifest);
     return { sequence: this.head };
@@ -243,6 +422,7 @@ let cfg: WorkspaceConfig;
 let savedPreflightDelta: string | undefined;
 let savedPreflightFull: string | undefined;
 let savedScanPrune: string | undefined;
+let savedMtimeNormalize: string | undefined;
 const noBackoff = async () => {};
 const deps = (remote: SyncRemote): SyncDeps => ({ remote, backoff: noBackoff });
 
@@ -250,9 +430,11 @@ beforeEach(async () => {
   savedPreflightDelta = process.env.RBOX_PREFLIGHT_DELTA;
   savedPreflightFull = process.env.RBOX_PREFLIGHT_FULL;
   savedScanPrune = process.env.RBOX_SCAN_PRUNE;
+  savedMtimeNormalize = process.env.RBOX_MTIME_NORMALIZE;
   delete process.env.RBOX_PREFLIGHT_DELTA;
   delete process.env.RBOX_PREFLIGHT_FULL;
   delete process.env.RBOX_SCAN_PRUNE;
+  delete process.env.RBOX_MTIME_NORMALIZE;
   root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-sync-test-"));
   await fs.mkdir(path.join(root, ".rbox", "state"), { recursive: true });
   // E2EE is the only mode (D6): a workspace always has an encryption key.
@@ -271,12 +453,15 @@ beforeEach(async () => {
   };
 });
 afterEach(async () => {
+  setClassifyCacheHitObserverForTest(undefined);
   if (savedPreflightDelta === undefined) delete process.env.RBOX_PREFLIGHT_DELTA;
   else process.env.RBOX_PREFLIGHT_DELTA = savedPreflightDelta;
   if (savedPreflightFull === undefined) delete process.env.RBOX_PREFLIGHT_FULL;
   else process.env.RBOX_PREFLIGHT_FULL = savedPreflightFull;
   if (savedScanPrune === undefined) delete process.env.RBOX_SCAN_PRUNE;
   else process.env.RBOX_SCAN_PRUNE = savedScanPrune;
+  if (savedMtimeNormalize === undefined) delete process.env.RBOX_MTIME_NORMALIZE;
+  else process.env.RBOX_MTIME_NORMALIZE = savedMtimeNormalize;
   await fs.rm(root, { recursive: true, force: true });
 });
 
@@ -326,6 +511,88 @@ test("no-op: pull-then-push with no local changes makes ZERO commits, sequence s
   expect(remote.commitCalls).toBe(before); // ZERO new commits — no echo
   expect(seq).toBe(1);
   expect(remote.headSeq()).toBe(1);
+});
+
+test("209/5 mtime-only push is a no-op; one real change plus full-tree mtime skew reaches the commit sink as one op", async () => {
+  const remote = new FakeRemote();
+  const base = [
+    await remote.seedEntry("a.txt", "A\n"),
+    await remote.seedEntry("b.txt", "B\n"),
+    await remote.seedEntry("c.txt", "C\n"),
+  ];
+  remote.injectCommit(base);
+  await pull(root, cfg, deps(remote));
+
+  for (const entry of base) {
+    await fs.utimes(path.join(root, entry.path), new Date(2_000), new Date(2_000));
+  }
+  const beforeNoop = remote.commitCalls;
+  const noop = await push(root, cfg, deps(remote));
+  expect(noop.committed).toBe(false);
+  expect(remote.commitCalls).toBe(beforeNoop);
+
+  await write("b.txt", "B changed\n");
+  await fs.utimes(path.join(root, "a.txt"), new Date(3_000), new Date(3_000));
+  await fs.utimes(path.join(root, "c.txt"), new Date(3_000), new Date(3_000));
+  const changed = await push(root, cfg, deps(remote));
+  expect(changed.committed).toBe(true);
+  const committed = remote.successfulCommits.at(-1)!.manifest;
+  expect(diffToOps({ generatedAt: "", files: base }, committed)).toHaveLength(1);
+  expect(diffToOps({ generatedAt: "", files: base }, committed)[0]).toMatchObject({
+    op: "set",
+    entry: { path: "b.txt" },
+  });
+});
+
+test("209/7 normalized paths never reach classifyCacheHit; rename, mode, and missing-descriptor provenance stay distinct", async () => {
+  const remote = new FakeRemote();
+  const mtimeBase = await remote.seedEntry("mtime.txt", "mtime\n");
+  const renameBase = await remote.seedEntry("old-name.txt", "rename\n");
+  const modeBase = await remote.seedEntry("mode.txt", "mode\n");
+  const missingWithDescriptor = await remote.seedEntry("missing.txt", "missing\n");
+  const { encSha: _encSha, ...missingBase } = missingWithDescriptor;
+  const base: Manifest = {
+    generatedAt: "foreign",
+    files: [mtimeBase, modeBase, missingBase, renameBase].sort((a, b) => a.path.localeCompare(b.path)),
+  };
+  remote.injectCommit(base.files);
+  await saveStateUnsafeLegacyOrTest(root, {
+    stream: syncStreamId(cfg),
+    lastSyncedSequence: 1,
+    lastSyncedManifest: base,
+  });
+
+  await write("mtime.txt", "mtime\n");
+  await write("new-name.txt", "rename\n");
+  await write("mode.txt", "mode\n");
+  await write("missing.txt", "missing\n");
+  await fs.chmod(path.join(root, "mtime.txt"), 0o644);
+  await fs.chmod(path.join(root, "new-name.txt"), 0o644);
+  await fs.chmod(path.join(root, "mode.txt"), 0o755);
+  await fs.chmod(path.join(root, "missing.txt"), 0o644);
+  await writeEncryptCache({
+    [missingWithDescriptor.sha256]: {
+      encSha: missingWithDescriptor.encSha!,
+      cipherSize: (await enc("missing\n")).ciphertext.length,
+      paths: ["missing.txt"],
+    },
+  });
+
+  const classified: string[] = [];
+  setClassifyCacheHitObserverForTest((entryPath) => classified.push(entryPath));
+  const result = await push(root, cfg, deps(remote));
+  expect(result.committed).toBe(true);
+  expect(classified).toEqual(["missing.txt"]);
+
+  const committed = remote.successfulCommits.at(-1)!.manifest;
+  const byPath = new Map(committed.files.map((entry) => [entry.path, entry]));
+  expect(byPath.get("mtime.txt")!.mtimeMs).toBe(mtimeBase.mtimeMs);
+  expect(byPath.has("old-name.txt")).toBe(false);
+  expect(byPath.get("new-name.txt")!.mtimeMs).not.toBe(renameBase.mtimeMs);
+  expect(byPath.get("mode.txt")!.mode).toBe(0o755);
+  expect(byPath.get("mode.txt")!.mtimeMs).not.toBe(modeBase.mtimeMs);
+  expect(byPath.get("missing.txt")!.encSha).toBe(missingWithDescriptor.encSha);
+  expect(byPath.get("missing.txt")!.mtimeMs).not.toBe(missingBase.mtimeMs);
 });
 
 // QUARANTINED locally (design 156): red on clean main on dev machines while CI has

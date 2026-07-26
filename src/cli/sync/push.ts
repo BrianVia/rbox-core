@@ -7,6 +7,7 @@ import {
   manifestRequiresSchema4,
   type IgnoreMatcher,
   type GitSection,
+  type FileEntry,
   type Manifest,
   type CaseFoldCollisionGroup,
 } from "../../engine/index.js";
@@ -45,13 +46,45 @@ import { finishResolutionReceipt, pull, reconcileResolutionReceipt, scanManifest
 import { MutationGateClosedError } from "../../engine/mutation-gate.js";
 import { projectLocalManifest } from "../local-file-projection.js";
 
-export function stampManifestSchemaForCommit(manifest: Manifest): Manifest {
-  const schema = Math.max(gitReposManifestSchema(manifest.gitRepos) ?? 0, manifestRequiresSchema4(manifest) ? 4 : 0);
+const COMMIT_FILE_ENTRY_KEYS = ["path", "sha256", "size", "mode", "mtimeMs", "type", "symlinkTarget", "encSha", "comp", "payloadSha", "cipherSize"] as const;
+const COMMIT_FILE_ENTRY_KEY_SET: ReadonlySet<string> = new Set(COMMIT_FILE_ENTRY_KEYS);
+const COMMIT_FILE_IDENTITY_KEYS = COMMIT_FILE_ENTRY_KEYS.filter((key) => key !== "mtimeMs");
+
+function knownCommitFileEntry(entry: FileEntry): boolean {
+  return Object.keys(entry).every((key) => COMMIT_FILE_ENTRY_KEY_SET.has(key));
+}
+
+/**
+ * Stamp the manifest schema and keep advisory mtimes stable at the single
+ * commit seam. Reusing the applied base entry makes the field-exact delta
+ * encoder see no change while preserving every existing wire field.
+ */
+export function stampManifestSchemaForCommit(manifest: Manifest, base?: Manifest): Manifest {
+  let files = manifest.files;
+  if (process.env.RBOX_MTIME_NORMALIZE !== "0" && base && base.files.length > 0) {
+    const baseFiles = new Map(base.files.map((entry) => [entry.path, entry]));
+    for (let index = 0; index < manifest.files.length; index++) {
+      const outgoing = manifest.files[index]!;
+      const prior = baseFiles.get(outgoing.path);
+      if (
+        prior
+        && knownCommitFileEntry(prior)
+        && knownCommitFileEntry(outgoing)
+        && COMMIT_FILE_IDENTITY_KEYS.every((key) => prior[key] === outgoing[key])
+        && prior !== outgoing
+      ) {
+        if (files === manifest.files) files = [...manifest.files];
+        files[index] = prior;
+      }
+    }
+  }
+  const normalized = files === manifest.files ? manifest : { ...manifest, files };
+  const schema = Math.max(gitReposManifestSchema(normalized.gitRepos) ?? 0, manifestRequiresSchema4(normalized) ? 4 : 0);
   if (schema === 0) {
-    const { manifestSchema: _manifestSchema, ...withoutSchema } = manifest;
+    const { manifestSchema: _manifestSchema, ...withoutSchema } = normalized;
     return withoutSchema;
   }
-  return { ...manifest, manifestSchema: schema };
+  return { ...normalized, manifestSchema: schema };
 }
 /**
  * Scan and push. Convenience wrapper for CLI one-shots — the daemon uses
@@ -744,7 +777,10 @@ async function runPushAttempt(
     // deferred file is simply omitted. Invariant: every blob the committed manifest references
     // was uploaded AND hash-matched this run, or is an already-synced base blob — no dangling
     // ref, no phantom deletion.
-    const committed = stampManifestSchemaForCommit(deferred.size === 0 ? local : deferManifest(local, appliedBase, deferred));
+    const committed = stampManifestSchemaForCommit(
+      deferred.size === 0 ? local : deferManifest(local, appliedBase, deferred),
+      state.lastSyncedManifest,
+    );
 
     if (needsUpload && needsUpload.size > 0) {
       return reuploadOutcome(committed, [...needsUpload], needsUpload.size);

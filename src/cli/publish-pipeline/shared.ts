@@ -48,7 +48,15 @@ export function hasErrorCode(error: unknown, code: string): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === code;
 }
 
+let classifyCacheHitObserverForTest: ((path: string) => void) | undefined;
+
+/** Narrow provenance-test seam shared by both publish implementations. */
+export function setClassifyCacheHitObserverForTest(observer: ((path: string) => void) | undefined): void {
+  classifyCacheHitObserverForTest = observer;
+}
+
 export async function classifyCacheHit(root: string, file: FileEntry): Promise<"accept" | "defer"> {
+  classifyCacheHitObserverForTest?.(file.path);
   try {
     const stat = await fs.lstat(path.join(root, file.path));
     if (!stat.isFile()) return "defer";
