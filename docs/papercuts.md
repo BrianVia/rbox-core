@@ -298,3 +298,14 @@ pulls resume (~4-6 min of scan-path pulls). Post-206 this heals unattended
 and is named in the log, but the cadence is the remaining latency; a
 burst-aware fast re-trust (immediate pinned rescan instead of waiting for the
 safety tick) would shrink it.
+
+## Rig runs print no tree provenance — stale-checkout runs read as regressions (2026-07-26)
+
+The rig mounts src/ and scripts/ from whichever checkout launches it, but the
+run header never says WHICH tree that was. Tonight a rig launch from the
+primary checkout (whose local main was 6 commits behind origin) produced 7
+"failures" that were really pre-#466 scenario expectations vs the newer
+product — a full regression hunt for what a `HEAD: <sha> (behind origin/main
+by N)` line in the report header would have made a 10-second read. Fix: rig
+run header logs the launching checkout's HEAD, dirty state, and
+behind-origin count; loudly warn when behind.
