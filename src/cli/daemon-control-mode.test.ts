@@ -5,12 +5,16 @@ import path from "node:path";
 import {
   admitLiveDaemonMode,
   DAEMON_MODE_WITNESS_TIMEOUT_MS,
+  daemonVersionSkewLine,
+  formatDaemonProcessLabel,
   readDaemonModeWitness,
+  startDaemon,
   waitForDaemonModeWitness,
   type DaemonModeWitness,
 } from "./daemon-control.js";
 import { daemonPidPath, daemonRuntimeDir, daemonStatusPath } from "./rbox-paths.js";
 import type { DaemonMode } from "./daemon/ambient-status.js";
+import { RBOX_VERSION } from "./version.js";
 
 let temp: string;
 let root: string;
@@ -64,10 +68,10 @@ test("production mode witness wait is fifteen seconds", () => {
   expect(DAEMON_MODE_WITNESS_TIMEOUT_MS).toBe(15_000);
 });
 
-async function writeStatus(mode: DaemonMode | undefined, bootId: string): Promise<void> {
+async function writeStatus(mode: DaemonMode | undefined, bootId: string, daemonVersion = "1.7.19"): Promise<void> {
   await fs.writeFile(daemonStatusPath(root), JSON.stringify({
     schemaVersion: 1,
-    daemonVersion: "1.7.19",
+    daemonVersion,
     ...(mode === undefined ? {} : { mode }),
     bootId,
     state: "synced",
@@ -90,6 +94,16 @@ test("mode witness is bound to the live v2 pidfile boot id", async () => {
 
   await fs.writeFile(daemonPidPath(root), "123\n");
   expect(readDaemonModeWitness(root)).toEqual({ kind: "unknown" });
+});
+
+test("dev build metadata preserves a boot-bound mode witness", async () => {
+  await fs.writeFile(daemonPidPath(root), "v2 123 boot-live\n");
+  await writeStatus("read-write", "boot-live", "1.9.1-dev+514d689");
+  expect(readDaemonModeWitness(root)).toEqual({
+    kind: "known",
+    mode: "read-write",
+    bootId: "boot-live",
+  });
 });
 
 test("newly spawned boot cannot match stale status and waits for its own witness", async () => {
@@ -121,4 +135,116 @@ test("witness delayed past timeout stays unknown, then a retry admits the same l
   const retryWitness = readDaemonModeWitness(root, "boot-slow");
   expect(retryWitness).toEqual({ kind: "known", mode: "pull-only", bootId: "boot-slow" });
   expect(admitLiveDaemonMode("pull-only", "pending", retryWitness)).toBe("matched");
+});
+
+test("daemon identity copy includes only known parts and reports version skew", () => {
+  expect(formatDaemonProcessLabel(4711, "1.9.1-dev+514d689", "read-write"))
+    .toBe("process 4711, v1.9.1-dev+514d689, read-write");
+  expect(formatDaemonProcessLabel(4711, "1.9.1")).toBe("process 4711, v1.9.1");
+  expect(formatDaemonProcessLabel(4711)).toBe("process 4711");
+  expect(daemonVersionSkewLine("1.9.1-dev+514d689", "1.9.1")).toBe(
+    "this rbox is v1.9.1 but the running background sync is v1.9.1-dev+514d689 — restart it to catch up: rbox stop && rbox start",
+  );
+  expect(daemonVersionSkewLine("1.9.1", "1.9.1")).toBeUndefined();
+});
+
+test("an owned witnessed dev daemon is identified without spawning or asking for a re-run", async () => {
+  await fs.writeFile(daemonPidPath(root), "v2 123 boot-live\n");
+  await writeStatus("read-write", "boot-live", "1.9.1-dev+514d689");
+  const logs: string[] = [];
+  let spawned = 0;
+
+  const result = await startDaemon(root, {
+    daemonOwned: () => true,
+    log: (line) => logs.push(line),
+    onSpawned: () => { spawned++; },
+  });
+
+  expect(result).toBe("already-running");
+  expect(spawned).toBe(0);
+  expect(logs).toEqual([
+    "background sync is already running (process 123, v1.9.1-dev+514d689, read-write)",
+    daemonVersionSkewLine("1.9.1-dev+514d689", RBOX_VERSION),
+  ]);
+  expect(logs.every((line) => !line.includes("re-run"))).toBe(true);
+});
+
+test("an equal-version daemon has no version-skew line", async () => {
+  await fs.writeFile(daemonPidPath(root), "v2 123 boot-live\n");
+  await writeStatus("read-write", "boot-live", RBOX_VERSION);
+  const logs: string[] = [];
+
+  expect(await startDaemon(root, {
+    daemonOwned: () => true,
+    log: (line) => logs.push(line),
+  })).toBe("already-running");
+  expect(logs).toEqual([
+    `background sync is already running (process 123, v${RBOX_VERSION}, read-write)`,
+  ]);
+});
+
+test("pending intent polls its live daemon and admits a witness that appears", async () => {
+  await fs.writeFile(daemonPidPath(root), "v2 123 boot-live\n");
+  await writeStatus(undefined, "boot-live", RBOX_VERSION);
+  const logs: string[] = [];
+  let witnessed = 0;
+  const statusWrite = setTimeout(() => {
+    void writeStatus("read-write", "boot-live", RBOX_VERSION);
+  }, 1);
+
+  try {
+    expect(await startDaemon(root, {
+      modeIntent: "pending",
+      daemonOwned: () => true,
+      modeWitnessTimeoutMs: 100,
+      modeWitnessPollMs: 1,
+      log: (line) => logs.push(line),
+      onModeWitness: () => { witnessed++; },
+    })).toBe("already-running");
+  } finally {
+    clearTimeout(statusWrite);
+  }
+
+  expect(witnessed).toBe(1);
+  expect(logs).toEqual([
+    `background sync is already running (process 123, v${RBOX_VERSION}, read-write)`,
+  ]);
+  expect(logs.some((line) => line.includes("could not confirm"))).toBe(false);
+});
+
+test("pending intent reports a terminal outcome when its live witness never appears", async () => {
+  await fs.writeFile(daemonPidPath(root), "v2 123 boot-live\n");
+  await writeStatus(undefined, "boot-live", RBOX_VERSION);
+  const logs: string[] = [];
+
+  expect(await startDaemon(root, {
+    modeIntent: "pending",
+    daemonOwned: () => true,
+    modeWitnessTimeoutMs: 0,
+    log: (line) => logs.push(line),
+  })).toBe("retry-later");
+  expect(logs).toEqual([
+    `background sync is running (process 123, v${RBOX_VERSION}) but rbox could not confirm its mode within 15s — check it with: rbox status`,
+  ]);
+});
+
+test("explicit intent identifies an unknown live daemon before preserving the restart-required error", async () => {
+  await fs.writeFile(daemonPidPath(root), "v2 123 boot-live\n");
+  await writeStatus(undefined, "boot-live", RBOX_VERSION);
+  const logs: string[] = [];
+
+  await expect(startDaemon(root, {
+    modeIntent: "explicit",
+    pullOnly: true,
+    daemonOwned: () => true,
+    log: (line) => logs.push(line),
+  })).rejects.toThrow("the live daemon's mode is unknown; restart required: rbox stop && rbox start --pull-only");
+  expect(logs).toEqual([
+    `background sync is already running (process 123, v${RBOX_VERSION})`,
+  ]);
+});
+
+test("start copy never asks the operator to re-run rbox start", async () => {
+  const source = await fs.readFile(path.join(import.meta.dir, "daemon/process-control.ts"), "utf8");
+  expect(source).not.toContain("re-run `rbox start`");
 });

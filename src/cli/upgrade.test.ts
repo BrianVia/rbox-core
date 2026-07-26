@@ -19,6 +19,17 @@ describe("semver forward-only gate", () => {
     expect(() => parseSemver("nope")).toThrow();
     expect(() => parseSemver("1.2")).toThrow();
   });
+  test("accepts build metadata without using it for precedence", () => {
+    expect(parseSemver("1.9.1-dev+514d689").build).toBe("514d689");
+    expect(parseSemver("0.9.1-dev+03ff993.dirty")).toMatchObject({
+      prerelease: "dev",
+      build: "03ff993.dirty",
+    });
+    expect(semverGt("1.9.1", "1.9.1-dev+514d689")).toBe(true);
+    expect(semverGt("1.9.1+a", "1.9.1+b")).toBe(false);
+    expect(() => parseSemver("1.6.3\nforged")).toThrow();
+    expect(() => parseSemver("1.2")).toThrow();
+  });
   test("prerelease identifiers compare numerically, not lexically (anti-rollback)", () => {
     // The bug this guards: lexical "2" > "10" would let an OLDER signed rc replay as newer.
     expect(semverGt("1.0.0-rc.10", "1.0.0-rc.2")).toBe(true);

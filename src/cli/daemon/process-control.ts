@@ -4,7 +4,7 @@ import fs from "node:fs";
 import { systemLockIdentity } from "../../engine/git/lockfile.js";
 import { isStandaloneBinary } from "../runtime.js";
 import { daemonCrashLogPath } from "../rbox-paths.js";
-import { AMBIENT_STATUS_STALE_MS, readAmbientDaemonStatusRecord, type DaemonMode } from "./ambient-status.js";
+import { AMBIENT_STATUS_STALE_MS, readAmbientDaemonStatusRecord, validDaemonVersion, type DaemonMode } from "./ambient-status.js";
 import { RBOX_VERSION } from "../version.js";
 import {
   DAEMON_BOOT_ID_ENV,
@@ -59,7 +59,7 @@ function isAlive(pid: number): boolean {
 }
 
 function readDaemonCommand(pid: number): string {
-  return execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8" });
+  return execFileSync("ps", ["-ww", "-p", String(pid), "-o", "command="], { encoding: "utf8" });
 }
 
 /** Confirm the pid is an rbox daemon, optionally for one exact workspace root.
@@ -151,11 +151,38 @@ export interface StartDaemonOptions {
   /** Test seam; production waits for the newly spawned daemon's boot-bound mode witness. */
   modeWitnessTimeoutMs?: number;
   modeWitnessPollMs?: number;
+  /** Output seam; defaults to console.log. Mirrors StopDaemonDeps.log. */
+  log?: (line: string) => void;
+  /** Test seam for process ownership; defaults to the ps-backed isOurDaemon. */
+  daemonOwned?: (pid: number, root: string) => boolean;
 }
 
 export const DAEMON_MODE_WITNESS_TIMEOUT_MS = 15_000;
 
 export type DaemonModeWitness = { kind: "known"; mode: DaemonMode; bootId: string } | { kind: "unknown" };
+
+/** "process 4711, v1.9.1-dev+514d689, read-write" — unknown parts are omitted. */
+export function formatDaemonProcessLabel(pid: number, version?: string, mode?: DaemonMode): string {
+  return [`process ${pid}`, ...(version === undefined ? [] : [`v${version}`]), ...(mode === undefined ? [] : [mode])].join(", ");
+}
+
+/** Undefined when the versions match. */
+export function daemonVersionSkewLine(daemonVersion: string, cliVersion: string): string | undefined {
+  if (daemonVersion === cliVersion) return undefined;
+  return `this rbox is v${cliVersion} but the running background sync is v${daemonVersion} — restart it to catch up: rbox stop && rbox start`;
+}
+
+function liveDaemonIdentity(root: string): { version?: string; mode?: DaemonMode } {
+  const pidfile = readDaemonPidRecord(root);
+  const record = readAmbientDaemonStatusRecord(root);
+  if (record.kind !== "ok") return {};
+  const bootBound = pidfile.version === "v2" && pidfile.bootId !== undefined
+    && record.status.bootId === pidfile.bootId;
+  return {
+    ...(validDaemonVersion(record.status.daemonVersion) ? { version: record.status.daemonVersion } : {}),
+    ...(bootBound && record.status.mode !== undefined ? { mode: record.status.mode } : {}),
+  };
+}
 
 /** Read the daemon-owned mode witness only when it belongs to the same incarnation
  * as the v2 pidfile. A missing field, legacy pidfile, corrupt status, or a status
@@ -239,8 +266,18 @@ export function guardDaemonCrashLog(root: string): void {
 
 export async function startDaemon(root: string, opts: StartDaemonOptions = {}): Promise<StartDaemonResult> {
   const requestedMode: DaemonMode = opts.pullOnly === true ? "pull-only" : "read-write";
+  const log = opts.log ?? console.log;
+  const daemonOwned = opts.daemonOwned ?? isOurDaemon;
+  const logAlreadyRunning = (pid: number): void => {
+    const identity = liveDaemonIdentity(root);
+    log(`background sync is already running (${formatDaemonProcessLabel(pid, identity.version, identity.mode)})`);
+    if (identity.version !== undefined) {
+      const skew = daemonVersionSkewLine(identity.version, RBOX_VERSION);
+      if (skew !== undefined) log(skew);
+    }
+  };
   const existing = readPid(root);
-  if (existing && isOurDaemon(existing, root)) {
+  if (existing && daemonOwned(existing, root)) {
     // A live daemon is only "already running" if it's bound to the CURRENT workspace.
     // Re-initializing the root (a repeat `rbox setup`/`rbox init`) rebinds it to a new
     // workspace id, but the old daemon keeps its startup binding and 404s on every op
@@ -249,11 +286,11 @@ export async function startDaemon(root: string, opts: StartDaemonOptions = {}): 
     const bound = readDaemonBinding(root);
     const current = currentWorkspaceId(root);
     if (bound && current && bound !== current) {
-      console.log(`background sync (process ${existing}) was serving workspace ${bound}, but this folder is now ${current} — restarting`);
+      log(`background sync (process ${existing}) was serving workspace ${bound}, but this folder is now ${current} — restarting`);
       try {
         // Re-verify ownership at the moment of signalling (PID-reuse window), and
         // swallow ESRCH — "already exited" is success here, not an error.
-        if (isOurDaemon(existing, root)) process.kill(existing, "SIGTERM");
+        if (daemonOwned(existing, root)) process.kill(existing, "SIGTERM");
       } catch {
         /* gone between check and signal */
       }
@@ -261,21 +298,37 @@ export async function startDaemon(root: string, opts: StartDaemonOptions = {}): 
         // Never escalate to SIGKILL: a forced kill can land mid git-sync `.git`
         // mutation, whose rollback is JS-level and dies with the process. SIGTERM
         // shutdown is graceful (awaits the pump) — just try again shortly.
-        console.log(`the previous background sync (process ${existing}) hasn't exited yet — re-run \`rbox start\` in a moment`);
+        log(`the previous background sync (process ${existing}) has not exited yet — start again once it does: rbox status`);
         return "retry-later";
       }
       await removeDaemonPidRecord(root);
     } else {
       const pidfile = readDaemonPidRecord(root);
       await opts.onLive?.({ pid: existing, ...(pidfile.bootId === undefined ? {} : { bootId: pidfile.bootId }) });
-      const witness = readDaemonModeWitness(root);
-      const admission = admitLiveDaemonMode(requestedMode, opts.modeIntent ?? "preserve", witness);
+      let witness = readDaemonModeWitness(root);
+      if (witness.kind === "unknown" && (opts.modeIntent ?? "preserve") === "explicit") {
+        logAlreadyRunning(existing);
+      }
+      let admission = admitLiveDaemonMode(requestedMode, opts.modeIntent ?? "preserve", witness);
       if (admission === "pending-unknown") {
-        console.log(`background sync (process ${existing}) is running, but its mode is not witnessed yet — re-run \`rbox start\` in a moment`);
-        return "retry-later";
+        if (pidfile.version === "v2" && pidfile.bootId !== undefined) {
+          witness = await waitForDaemonModeWitness(
+            root,
+            pidfile.bootId,
+            opts.modeWitnessTimeoutMs ?? DAEMON_MODE_WITNESS_TIMEOUT_MS,
+            opts.modeWitnessPollMs ?? 50,
+            { daemonOwned },
+          );
+          admission = admitLiveDaemonMode(requestedMode, opts.modeIntent ?? "preserve", witness);
+        }
+        if (admission === "pending-unknown") {
+          const identity = liveDaemonIdentity(root);
+          log(`background sync is running (${formatDaemonProcessLabel(existing, identity.version)}) but rbox could not confirm its mode within 15s — check it with: rbox status`);
+          return "retry-later";
+        }
       }
       if (admission === "matched" && witness.kind === "known") await opts.onModeWitness?.(witness);
-      console.log(`background sync already running (process ${existing})`);
+      logAlreadyRunning(existing);
       return admission === "matched" ? "already-running" : "already-running-unknown-mode";
     }
   } else if (existing) {
@@ -311,14 +364,14 @@ export async function startDaemon(root: string, opts: StartDaemonOptions = {}): 
 
   if (child.pid) publishDaemonPidRecord(root, child.pid, bootId);
   if (!child.pid) {
-    console.log("background sync did not report a process id — re-run `rbox start` in a moment");
+    log("background sync did not report a process id — nothing started; check for errors with: rbox logs");
     return "retry-later";
   }
   try {
     await opts.onSpawned?.({ pid: child.pid, bootId });
   } catch (error) {
     try {
-      if (isOurDaemon(child.pid, root)) process.kill(child.pid, "SIGTERM");
+      if (daemonOwned(child.pid, root)) process.kill(child.pid, "SIGTERM");
     } catch {
       /* the child already exited or was stopped while desired persistence waited */
     }
@@ -329,14 +382,33 @@ export async function startDaemon(root: string, opts: StartDaemonOptions = {}): 
     bootId,
     opts.modeWitnessTimeoutMs ?? DAEMON_MODE_WITNESS_TIMEOUT_MS,
     opts.modeWitnessPollMs ?? 50,
+    { daemonOwned },
   );
   if (witness.kind === "unknown") {
-    console.log(`background sync (process ${child.pid}) started, but its mode is not witnessed yet — re-run \`rbox start\` in a moment`);
+    const pidfile = readDaemonPidRecord(root);
+    if (
+      pidfile.version === "v2"
+      && pidfile.pid === child.pid
+      && pidfile.bootId === bootId
+      && daemonOwned(child.pid, root)
+    ) {
+      log(`background sync (process ${child.pid}) is still starting up — it keeps going in the background; check it with: rbox status`);
+    } else if (pidfile.pid !== undefined && daemonOwned(pidfile.pid, root)) {
+      const identity = liveDaemonIdentity(root);
+      log(`another background sync already owns this workspace (${formatDaemonProcessLabel(pidfile.pid, identity.version)}) — the one just started stood down`);
+      if (identity.version !== undefined) {
+        const skew = daemonVersionSkewLine(identity.version, RBOX_VERSION);
+        if (skew !== undefined) log(skew);
+      }
+    } else {
+      log("background sync exited right after starting — see what happened with: rbox logs");
+    }
     return "retry-later";
   }
   if (witness.mode !== requestedMode) throw modeRestartRequired(requestedMode, witness.mode);
   await opts.onModeWitness?.(witness);
-  console.log(`background sync started (process ${child.pid}). view logs with: rbox logs`);
+  const identity = liveDaemonIdentity(root);
+  log(`background sync started (${formatDaemonProcessLabel(child.pid, identity.version, witness.mode)}). view logs with: rbox logs`);
   return "started";
 }
 

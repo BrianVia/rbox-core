@@ -6,6 +6,12 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- `rbox start` now recognizes and identifies an already-running background sync,
+  including its version and witnessed mode, and calls out version mismatches.
+  Dev-build versions with `+` metadata now parse correctly, restoring daemon
+  witness reporting and graceful shutdown safety.
+
 ## [1.9.1] — 2026-07-25 — "worktrees come and go, sync keeps up"
 
 ### Fixed
