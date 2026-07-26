@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -8,6 +8,7 @@ import {
   LocalBlobStore,
   buildIgnoreMatcher,
   captureGitState,
+  checkoutJournalDir,
   gitIdentity,
   gitIdentityKey,
   repoCtxFromDisk,
@@ -21,6 +22,7 @@ import type { MutationBoundary } from "../../engine/mutation-gate.js";
 import { applyConfigTransaction } from "../../engine/git/config-txn.js";
 import type { RepoRecord, SyncState, WorkspaceConfig } from "../config.js";
 import { loadState, saveStateUnsafeLegacyOrTest, syncStreamId } from "../config.js";
+import { collectRepoResidue } from "../doctor-cmd.js";
 import type { SyncRemote } from "../remote.js";
 import { pull } from "../sync.js";
 import { applyGitSections } from "./apply.js";
@@ -415,6 +417,177 @@ test("203.9: remote absence is processed while the receiver is busy", async () =
   expect(outcome.gitRepos).toBeUndefined();
   expect(outcome.gitPendingRemote).toBeUndefined();
   expect(outcome.gitReposRemoved?.r).toBe(gitIdentityKey(section));
+});
+
+test("207.1: repo removal prunes empty skeletons while preserving .git and repo quarantine", async () => {
+  const repo = await initRepo("r");
+  const section = await capture("r");
+  await fs.rm(path.join(repo, "tracked.txt"));
+  await fs.mkdir(path.join(repo, "media", "links", "metadata"), { recursive: true });
+  await fs.mkdir(path.join(repo, "empty", "deeper"), { recursive: true });
+  await fs.mkdir(path.join(repo, ".rbox", "git-quarantine"), { recursive: true });
+  await fs.mkdir(path.join(repo, ".git", "protected-empty", "deeper"), { recursive: true });
+  await fs.mkdir(path.join(repo, ".rbox", "protected-empty", "deeper"), { recursive: true });
+  await fs.writeFile(path.join(repo, ".rbox", "git-quarantine", "recovery.bundle"), "recovery\n");
+  const headBefore = await fs.readFile(path.join(repo, ".git", "HEAD"));
+
+  await applyGitSections(
+    root, cfg(), stateWith({ r: section }), manifest({}), store,
+    buildIgnoreMatcher(root), () => {}, { disableConfigLane: true },
+  );
+
+  await expect(fs.lstat(path.join(repo, "media"))).rejects.toMatchObject({ code: "ENOENT" });
+  await expect(fs.lstat(path.join(repo, "empty"))).rejects.toMatchObject({ code: "ENOENT" });
+  expect(await fs.readFile(path.join(repo, ".git", "HEAD"))).toEqual(headBefore);
+  expect(await fs.readFile(path.join(repo, ".rbox", "git-quarantine", "recovery.bundle"), "utf8")).toBe("recovery\n");
+  expect((await fs.lstat(path.join(repo, ".git", "protected-empty", "deeper"))).isDirectory()).toBe(true);
+  expect((await fs.lstat(path.join(repo, ".rbox", "protected-empty", "deeper"))).isDirectory()).toBe(true);
+});
+
+test("207.2: repo removal leaves a nested repository and its ENOTEMPTY ancestor intact", async () => {
+  const repo = await initRepo("r");
+  const section = await capture("r");
+  await fs.rm(path.join(repo, "tracked.txt"));
+  await fs.mkdir(path.join(repo, "vendor", "nested", ".git"), { recursive: true });
+  await fs.writeFile(path.join(repo, "vendor", "nested", ".git", "HEAD"), "ref: refs/heads/main\n");
+  await fs.mkdir(path.join(repo, "vendor", "empty-sibling", "leaf"), { recursive: true });
+
+  await applyGitSections(
+    root, cfg(), stateWith({ r: section }), manifest({}), store,
+    buildIgnoreMatcher(root), () => {}, { disableConfigLane: true },
+  );
+
+  expect(await fs.readFile(path.join(repo, "vendor", "nested", ".git", "HEAD"), "utf8")).toBe("ref: refs/heads/main\n");
+  await expect(fs.lstat(path.join(repo, "vendor", "empty-sibling"))).rejects.toMatchObject({ code: "ENOENT" });
+  expect((await fs.lstat(path.join(repo, "vendor"))).isDirectory()).toBe(true);
+});
+
+test("207.3: repo removal never follows or removes directory-shaped symlinks", async () => {
+  const repo = await initRepo("r");
+  const section = await capture("r");
+  await fs.rm(path.join(repo, "tracked.txt"));
+  const outside = path.join(tmp, "outside");
+  await fs.mkdir(outside);
+  await fs.writeFile(path.join(outside, "sentinel"), "outside\n");
+  await fs.mkdir(path.join(repo, "skeleton"), { recursive: true });
+  await fs.symlink(outside, path.join(repo, "skeleton", "looks-like-a-directory"));
+
+  await applyGitSections(
+    root, cfg(), stateWith({ r: section }), manifest({}), store,
+    buildIgnoreMatcher(root), () => {}, { disableConfigLane: true },
+  );
+
+  expect((await fs.lstat(path.join(repo, "skeleton", "looks-like-a-directory"))).isSymbolicLink()).toBe(true);
+  expect(await fs.readFile(path.join(outside, "sentinel"), "utf8")).toBe("outside\n");
+});
+
+test("207.4: workspace-root repo removal refuses the skeleton sweep", async () => {
+  await git(root, "init", "-q", "-b", "main");
+  await fs.writeFile(path.join(root, "tracked.txt"), "root\n");
+  await git(root, "add", "tracked.txt");
+  await git(root, "commit", "-qm", "root");
+  const section = (await captureGitState(root, store, KEK))!;
+  await fs.rm(path.join(root, "tracked.txt"));
+  await fs.mkdir(path.join(root, "must-remain-empty"));
+
+  await applyGitSections(
+    root, cfg(), stateWith({ ".": section }), manifest({}), store,
+    buildIgnoreMatcher(root), () => {}, { disableConfigLane: true },
+  );
+
+  expect((await fs.lstat(root)).isDirectory()).toBe(true);
+  expect((await fs.lstat(path.join(root, "must-remain-empty"))).isDirectory()).toBe(true);
+});
+
+test("207.5: an rmdir failure leaves only that subtree and never surfaces from apply", async () => {
+  const repo = await initRepo("r");
+  const section = await capture("r");
+  await fs.rm(path.join(repo, "tracked.txt"));
+  await fs.mkdir(path.join(repo, "a-pruned", "leaf"), { recursive: true });
+  await fs.mkdir(path.join(repo, "z-blocked", "leaf"), { recursive: true });
+  const attempted: string[] = [];
+
+  const outcome = await applyGitSections(
+    root, cfg(), stateWith({ r: section }), manifest({}), store,
+    buildIgnoreMatcher(root), () => {}, {
+      disableConfigLane: true,
+      sweepRmdir: async (parent, leaf) => {
+        attempted.push(leaf);
+        if (leaf === "leaf" && attempted.filter((name) => name === "leaf").length === 2) {
+          const error = new Error("busy") as NodeJS.ErrnoException;
+          error.code = "EBUSY";
+          throw error;
+        }
+        const proxy = process.platform === "linux" ? `/proc/self/fd/${parent.fd}` : `/dev/fd/${parent.fd}`;
+        await fs.rmdir(path.join(proxy, leaf));
+      },
+    },
+  );
+
+  await expect(fs.lstat(path.join(repo, "a-pruned"))).rejects.toMatchObject({ code: "ENOENT" });
+  expect((await fs.lstat(path.join(repo, "z-blocked", "leaf"))).isDirectory()).toBe(true);
+  const config = cfg();
+  await saveStateUnsafeLegacyOrTest(root, {
+    stream: syncStreamId(config),
+    stateNonce: "e".repeat(32),
+    lastSyncedSequence: 2,
+    lastSyncedManifest: { generatedAt: "removed", files: [], manifestSchema: 2 },
+    gitReposRemoved: outcome.gitReposRemoved,
+  });
+  expect((await collectRepoResidue(root, config)).localOnly.entries.map((entry) => entry.rel)).toEqual(["r"]);
+});
+
+test("207.6: removal clears only its journal key and leaves workspace quarantine trees untouched", async () => {
+  const repo = await initRepo("r");
+  const section = await capture("r");
+  const quarantine = path.join(root, ".rbox", "git-quarantine");
+  await fs.mkdir(path.join(quarantine, "retired.git", "objects"), { recursive: true });
+  await fs.mkdir(path.join(quarantine, "0123456789abcdef"), { recursive: true });
+  await fs.writeFile(path.join(quarantine, "retired.git", "HEAD"), "retired\n");
+  await fs.writeFile(path.join(quarantine, "0123456789abcdef", "ORIG_HEAD"), "forensic\n");
+  const journal = checkoutJournalDir(root, "r");
+  const siblingJournal = checkoutJournalDir(root, "other");
+
+  await applyGitSections(
+    root, cfg(), stateWith({ r: section }), manifest({}), store,
+    buildIgnoreMatcher(root), () => {}, {
+      disableConfigLane: true,
+      beforeRemovalCleanup: async () => {
+        await fs.mkdir(journal, { recursive: true });
+        await fs.writeFile(path.join(journal, "standing"), "journal\n");
+        await fs.mkdir(siblingJournal, { recursive: true });
+        await fs.writeFile(path.join(siblingJournal, "standing"), "sibling\n");
+      },
+    },
+  );
+
+  await expect(fs.lstat(journal)).rejects.toMatchObject({ code: "ENOENT" });
+  expect(await fs.readFile(path.join(siblingJournal, "standing"), "utf8")).toBe("sibling\n");
+  expect(await fs.readFile(path.join(quarantine, "retired.git", "HEAD"), "utf8")).toBe("retired\n");
+  expect(await fs.readFile(path.join(quarantine, "0123456789abcdef", "ORIG_HEAD"), "utf8")).toBe("forensic\n");
+});
+
+test("207.8: no-op pull performs zero rmdir calls", async () => {
+  await initRepo("r");
+  const section = await capture("r");
+  const config = cfg();
+  const state = stateWith({ r: section });
+  state.stream = syncStreamId(config);
+  await saveStateUnsafeLegacyOrTest(root, state);
+  const remote: SyncRemote = {
+    latest: async () => ({ sequence: 2, manifest: manifest({ r: section }) }),
+    missingBlobs: async () => [],
+    putBlobFile: async () => {},
+    commit: async () => ({ sequence: 3 }),
+    blobStore: () => store,
+  };
+  const rmdir = spyOn(fs, "rmdir");
+  try {
+    await pull(root, config, { remote, onGitLog: () => {} });
+    expect(rmdir).toHaveBeenCalledTimes(0);
+  } finally {
+    rmdir.mockRestore();
+  }
 });
 
 test("203.11: lazy kill switch restores the legacy probe command order", async () => {

@@ -388,6 +388,7 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
     case "doctor": {
       const report = flags.report === "true";
       const diagnostics = flags.diagnostics === "true";
+      const residueBytes = flags["residue-bytes"] === "true";
       if (diagnostics && !report) throw new Error("--diagnostics uploads the support report — combine it with --report: rbox doctor --report --diagnostics");
       const root = await resolvePathFlagRoot(flags.path);
       if (positional[0] === "reset-journal") {
@@ -398,7 +399,7 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
       }
       if (flags.quarantine === "true" || flags.restore !== undefined) throw new Error("--quarantine/--restore require `rbox doctor reset-journal`");
       const { doctorCmd } = await import("./doctor-cmd.js");
-      await doctorCmd(root, { report, yes: flags.yes === "true", diagnostics });
+      await doctorCmd(root, { report, yes: flags.yes === "true", diagnostics, residueBytes });
       break;
     }
     case "start": {
