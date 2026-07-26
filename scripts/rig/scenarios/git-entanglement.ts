@@ -498,9 +498,43 @@ GIT_AUTHOR_DATE='2026-03-08T00:00:00 +0000' GIT_COMMITTER_DATE='2026-03-08T00:00
           // a derived age, rather than relying on the quieted human line.
           rec.assert(`[${blocker}] JSON status exposes stable age`, visible?.reason === expectedReason && typeof visible.deferredSince === "string" && visible.deferredSince === deferred?.deferredSince && typeof visible.reasonSince === "string" && visible.reasonSince === deferred?.reasonSince && typeof visible.ageSeconds === "number" && Number.isInteger(visible.ageSeconds) && visible.ageSeconds >= 0 && visible.bytesChanged === false && visible.checkout?.kind === "branch" && visible.checkout.label === "main", JSON.stringify(visible));
 
+          let expectedDeferredSince = deferred?.deferredSince;
+          if (blocker === "edit") {
+            // Design 200 aged visibility: cross the transient quiet window and retain
+            // design 176's frozen human `git deferred` grammar as a live rig consumer.
+            await ctx.b.daemonStop(GUEST.workDir);
+            const statePath = `${GUEST.workDir}/.rbox/state.json`;
+            const rawState = await ctx.b.readFile(statePath);
+            const applyDeferral = state.repoRecords?.[TOP]?.deferrals?.apply;
+            if (typeof applyDeferral?.deferredSince !== "string" || typeof applyDeferral.reasonSince !== "string") {
+              throw new Error(`missing ${TOP} apply-lane timestamps before aged visibility: ${JSON.stringify(applyDeferral)}`);
+            }
+            const agedAt = new Date(Date.now() - 11 * 60_000).toISOString();
+            const replaceTimestampOnce = (source: string, field: "deferredSince" | "reasonSince", current: string): string => {
+              const token = `${JSON.stringify(field)}: ${JSON.stringify(current)}`;
+              if (source.split(token).length !== 2) {
+                throw new Error(`expected exactly one ${field} token for ${TOP} apply deferral`);
+              }
+              return source.replace(token, `${JSON.stringify(field)}: ${JSON.stringify(agedAt)}`);
+            };
+            const agedState = replaceTimestampOnce(
+              replaceTimestampOnce(rawState, "deferredSince", applyDeferral.deferredSince),
+              "reasonSince",
+              applyDeferral.reasonSince,
+            );
+            await ctx.b.writeFile(statePath, agedState);
+            await ctx.b.daemonStart(GUEST.workDir);
+
+            const agedHuman = await ctx.b.rbox(["status", "--git"], { cwd: GUEST.workDir, allowFail: true, env: { NO_COLOR: "1" } });
+            const agedHumanLine = agedHuman.stdout.trim().split("\n").find((line) => line.includes(TOP) && /git deferred\s+\d+[smhd]:/.test(line));
+            rec.assert("[edit] aged human status uses frozen grammar and rendered reason", agedHumanLine?.includes("local edits") === true, agedHumanLine ?? agedHuman.stdout.trim().slice(-800));
+            await ctx.b.daemonStop(GUEST.workDir);
+            expectedDeferredSince = agedAt;
+          }
+
           await ctx.b.rbox(["pull"], { cwd: GUEST.workDir });
           const retried = await readSyncState(ctx.b);
-          rec.assert(`[${blocker}] retry preserves deferredSince`, retried.repoRecords?.[TOP]?.deferrals?.apply?.deferredSince === deferred?.deferredSince, retried.repoRecords?.[TOP]?.deferrals?.apply?.deferredSince ?? "missing");
+          rec.assert(`[${blocker}] retry preserves deferredSince`, retried.repoRecords?.[TOP]?.deferrals?.apply?.deferredSince === expectedDeferredSince, retried.repoRecords?.[TOP]?.deferrals?.apply?.deferredSince ?? "missing");
 
           const aBytes = await ctx.a.readFile(`${topA}/a.txt`);
           if (blocker === "edit") await ctx.b.writeFile(`${topB}/a.txt`, aBytes);
