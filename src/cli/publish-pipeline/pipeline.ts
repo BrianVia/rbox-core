@@ -79,6 +79,7 @@ export interface PublishPipelineArgs {
 }
 
 export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ needsUpload: Set<string> }> {
+  const mode = args.fullAudit ? "full-audit" : args.preflightDelta ? "delta" : "legacy";
   const disk = new ResourceBudget(clampConc(process.env.RBOX_PIPELINE_QUEUE_BYTES, DEFAULT_QUEUE_BYTES, Number.MAX_SAFE_INTEGER));
   const queue = new ReadyQueue({ maxItems: clampConc(process.env.RBOX_PIPELINE_ITEMS, DEFAULT_QUEUE_ITEMS, 1_000_000) });
   const held = new Set<ReadyBlob>();
@@ -205,7 +206,7 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
       // The kill switch is byte-faithful to the serialized legacy sweep: retain
       // manifest order and duplicate addresses. Delta/full-audit arms are set
       // semantics and keep the rolling request deduplication.
-      const addresses = !args.preflightDelta && !args.fullAudit
+      const addresses = mode === "legacy"
         ? batch.map((item) => item.address)
         : [...new Set(batch.map((item) => item.address))];
       const t0 = LANE_TIMING ? performance.now() : 0;
@@ -439,12 +440,12 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
   try {
     for (const file of args.toEncrypt) enqueueWork(file);
     const pipelineFiles = new Set(args.toEncrypt);
-    if (!args.preflightDelta || args.fullAudit) {
+    if (mode !== "delta") {
       // Design 103 parity: legacy fullAudit also sweeps only manifest file addresses; git refs remain commit-422 authority.
       // recoverAddresses are intentionally ignored under fullAudit, also parity: the retry loop CLEARS its recovery
       // accumulator when the full-audit latch trips ("the chunked full audit needs no recovery set", sync.ts
       // accumulateRecoveryPage), and legacy fullAudit builds encShas from local.files alone.
-      const seen = args.fullAudit ? new Set<string>() : undefined;
+      const seen = mode === "full-audit" ? new Set<string>() : undefined;
       for (const file of args.local.files) {
         if (file.type !== "file" || !file.encSha || pipelineFiles.has(file) || seen?.has(file.encSha)) continue;
         seen?.add(file.encSha);
@@ -481,8 +482,9 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
     args.report.record("encrypt", { count: args.toEncrypt.length, ciphertextBytes: encCtBytes, changedBytes: encCtBytes });
     args.report.recordDetails("address", { cacheHits, cacheMisses }, `hit${cacheHits}m${cacheMisses}`);
     args.report.record("missing", { count: checked });
-    if (args.preflightDelta || args.fullAudit) {
-      args.report.recordDetails("missing", { introduced, recover, sent: checked, fullAudit: args.fullAudit ? 1 : 0 }, `i${introduced}r${recover}s${checked}fa${args.fullAudit ? 1 : 0}`);
+    if (mode !== "legacy") {
+      const fullAudit = mode === "full-audit" ? 1 : 0;
+      args.report.recordDetails("missing", { introduced, recover, sent: checked, fullAudit }, `i${introduced}r${recover}s${checked}fa${fullAudit}`);
     }
     if (args.report.enabled) args.report.blobs = checked;
     args.report.record("upload", { count: up, wireBytes: upWireBytes });

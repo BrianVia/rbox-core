@@ -301,6 +301,7 @@ async function pushManifestInner(
     ...(resolution ? { resolution } : {}),
   };
   let previousUnsatisfiedTotal: number | undefined;
+  const baseIntegrityByMeta = new Map<string, boolean>();
   // Shared "discard the attempt, rebuild from disk truth" reset — used by the
   // pull-first/epoch-stale arm AND the files-first fallback arm below.
   const rescanReset = async (): Promise<void> => {
@@ -322,7 +323,7 @@ async function pushManifestInner(
   };
 
   for (;;) {
-    const outcome = await runPushAttempt(root, cfg, deps, backoff, state);
+    const outcome = await runPushAttempt(root, cfg, deps, backoff, state, baseIntegrityByMeta);
     if (outcome.done) {
       const lane = uploadLaneTimingSummary();
       if (lane) (deps.warningSink ?? ((line) => process.stderr.write(`${line}\n`)))(lane);
@@ -448,7 +449,8 @@ async function runPushAttempt(
   cfg: WorkspaceConfig,
   deps: SyncDeps,
   backoff: (attempt: number) => Promise<void>,
-  attemptState: PushAttemptState
+  attemptState: PushAttemptState,
+  baseIntegrityByMeta: Map<string, boolean>,
 ): Promise<AttemptOutcome> {
   const { purgeIgnored, forceGitRecapture, recoverAddresses, forceFullAudit, forceSnapshot, filesFirstAborted, repair, resolution } = attemptState;
   let local = attemptState.local;
@@ -784,16 +786,28 @@ async function runPushAttempt(
       const reconstructedBase = manifestMeta ? manifestFromMeta(state.lastSyncedManifest, manifestMeta) : undefined;
       if (!manifestMeta || !reconstructedBase || !validateManifest(reconstructedBase).ok || state.lastSyncedSequence !== appliedSequence) {
         deltaBaseRejection = "no-base";
-      } else if (canonicalManifestHashStreaming(reconstructedBase) !== manifestMeta.manifestHash) {
+      } else {
+        const integrityKey = JSON.stringify([
+          appliedSequence,
+          manifestMeta.encManifestSha,
+          manifestMeta.manifestHash,
+        ]);
+        let integrityOk = baseIntegrityByMeta.get(integrityKey);
+        if (integrityOk === undefined) {
+          integrityOk = canonicalManifestHashStreaming(reconstructedBase) === manifestMeta.manifestHash;
+          baseIntegrityByMeta.set(integrityKey, integrityOk);
+        }
+        if (!integrityOk) {
         // §4.2 base-integrity precondition (REVIEW-204 A7): validManifestMeta
         // validates SHAPE only. A structurally valid but stale/mismatched meta
         // publishes a delta whose base no reader can reproduce — and readers only
         // discover that AFTER the head commits. Bind the meta's manifestHash to
         // the base we actually reconstructed; any mismatch snapshots instead,
         // which rewrites the meta and self-heals the next push.
-        deltaBaseRejection = "integrity";
-      } else {
-        deltaBase = { manifest: reconstructedBase, meta: manifestMeta };
+          deltaBaseRejection = "integrity";
+        } else {
+          deltaBase = { manifest: reconstructedBase, meta: manifestMeta };
+        }
       }
     }
     if (deps.blockedFingerprint !== undefined || report.enabled || deltaBase || deltaBaseRejection || repair || forceSnapshot) {

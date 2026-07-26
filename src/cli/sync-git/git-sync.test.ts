@@ -3440,7 +3440,7 @@ test("design 204 C2: pre-capture ctx memo is cleared before a dir-to-pointer fli
   await planGitSections(rootA, cfgA, await st(rootA), remote, new Set(), buildIgnoreMatcher(rootA));
   await markDivergenceCacheTrusted(rootA);
   process.env.RBOX_GIT_PLAN_LAZY = "1";
-  const observed: Array<{ stage: string; kind?: string }> = [];
+  const observed: Array<{ rel: string; kind?: string }> = [];
   const movedGit = path.join(rootA, "lazy-ctx-flip-gitdir");
 
   await planGitSections(rootA, cfgA, await st(rootA), remote, new Set(), buildIgnoreMatcher(rootA), undefined, noBackoff, {
@@ -3448,12 +3448,12 @@ test("design 204 C2: pre-capture ctx memo is cleared before a dir-to-pointer fli
       await fs.rename(path.join(repo, ".git"), movedGit);
       await fs.writeFile(path.join(repo, ".git"), "gitdir: ../lazy-ctx-flip-gitdir\n");
     },
-    onPostCaptureCtx: (_seen, stage, ctx) => {
-      if (_seen === rel) observed.push({ stage, kind: ctx?.kind });
+    onHygieneCtx: (seen, ctx) => {
+      if (seen === rel) observed.push({ rel: seen, kind: ctx?.kind });
     },
   });
 
-  expect(observed.some(({ stage, kind }) => stage === "hygiene" && kind === "pointer")).toBe(true);
+  expect(observed.some(({ rel: seen, kind }) => seen === rel && kind === "pointer")).toBe(true);
 }, 60_000);
 
 test("design 204 C5: timing buckets are finite, bounded, nonnegative, and summarized", async () => {

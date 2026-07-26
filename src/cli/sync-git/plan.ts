@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { GitCaptureDeferredError, artifactBinding, checkoutJournalDir, checkoutJournalPresent, discoverGitRepos, gitIdentity, gitIdentityKey, gitPreflight, inTreeWorktreeParentRel, isGitBusy, isPresentButUnreadableError, gitSectionBlobRefs, oracleFromState, readRepoIdentityV1, readStateLineageV1, receiverEquivalentCollisionNames, repoCtxFromDisk, poolMap, stateLineageV1FromRealRoot, type DiscoveredGitRepo, type GitRepoKind, type GitSection, type IgnoreMatcher, type RepoCtx } from "../../engine/index.js";
+import { GitCaptureDeferredError, artifactBinding, checkoutJournalPresent, discoverGitRepos, gitIdentity, gitIdentityKey, gitPreflight, inTreeWorktreeParentRel, isGitBusy, isPresentButUnreadableError, gitSectionBlobRefs, oracleFromState, readRepoIdentityV1, readStateLineageV1, receiverEquivalentCollisionNames, repoCtxFromDisk, poolMap, stateLineageV1FromRealRoot, type DiscoveredGitRepo, type GitRepoKind, type GitSection, type IgnoreMatcher, type RepoCtx } from "../../engine/index.js";
 import { pinDisplaced } from "../../engine/git/keep-pins.js";
 import { git } from "../../engine/git/shared.js";
 import { type GitConfigRunner } from "../../engine/git/config-txn.js";
@@ -133,8 +133,8 @@ export interface GitPlanOptions {
   afterJournalPreloop?: () => void | Promise<void>;
   /** Tests only: runs after read-only decisions and memo invalidation, before capture. */
   beforeCapturePool?: () => void | Promise<void>;
-  /** Tests only: observes fresh post-boundary repository-context derivations. */
-  onPostCaptureCtx?: (relPath: string, stage: "capture-config" | "absence-proof" | "resolution" | "supersession" | "hygiene", ctx: RepoCtx | undefined) => void;
+  /** Tests only: observes the fresh repository context used by hygiene. */
+  onHygieneCtx?: (relPath: string, ctx: RepoCtx | undefined) => void;
 }
 
 /**
@@ -166,26 +166,18 @@ export async function planGitSections(
   // Design 204 §5.1: one policy read at entry. The legacy arm retains the
   // pre-204 probe order and does not consume the scoped memo.
   const gitPlanLazy = process.env.RBOX_GIT_PLAN_LAZY !== "0";
-  let discoverMs = 0;
-  let journalPreloopMs = 0;
-  let fingerprintMs = 0;
-  let hygieneMs = 0;
-  const measure = async <T>(record: (elapsedMs: number) => void, fn: () => Promise<T>): Promise<T> => {
+  const timings = {
+    discoverMs: 0,
+    journalPreloopMs: 0,
+    fingerprintMs: 0,
+    hygieneMs: 0,
+  };
+  const measure = async <T>(key: keyof typeof timings, fn: () => Promise<T>): Promise<T> => {
     const startedAt = performance.now();
     try {
       return await fn();
     } finally {
-      record(performance.now() - startedAt);
-    }
-  };
-  let fingerprintBracketDepth = 0;
-  const measureFingerprint = async <T>(fn: () => Promise<T>): Promise<T> => {
-    if (fingerprintBracketDepth > 0) return fn();
-    fingerprintBracketDepth++;
-    try {
-      return await measure((elapsed) => { fingerprintMs += elapsed; }, fn);
-    } finally {
-      fingerprintBracketDepth--;
+      timings[key] += performance.now() - startedAt;
     }
   };
   const preCaptureCtx = new Map<string, ReturnType<typeof asyncMemo<RepoCtx | undefined>>>();
@@ -261,7 +253,10 @@ export async function planGitSections(
   const cache = await loadGitDivergenceCache(root);
   const fingerprintRun = gitFingerprintRun("per-decision");
   const fastPathParentRel = new Map<string, string | undefined>();
-  const stats: GitPlanStats = {
+  const stats: Omit<
+    GitPlanStats,
+    keyof typeof timings | "carried" | "captured" | "totalMs" | "otherMs"
+  > = {
     repos: 0,
     fpHits: 0,
     fpMisses: 0,
@@ -269,14 +264,6 @@ export async function planGitSections(
     spawnedRepos: 0,
     pointerPreSkips: 0,
     parentRelCached: 0,
-    carried: 0,
-    captured: 0,
-    totalMs: 0,
-    discoverMs: 0,
-    journalPreloopMs: 0,
-    fingerprintMs: 0,
-    hygieneMs: 0,
-    otherMs: 0,
   };
   const glog = options.onGitLog ?? ((line: string) => console.error(line));
   const logOnce = (seen: Set<string>, rel: string, line: string) => {
@@ -357,8 +344,15 @@ export async function planGitSections(
       else captureDeferrals[item.relPath] = item.typedReason ?? captureReason(item.reason);
     }
     const totalMs = performance.now() - planStartedAt;
-    const otherMs = Math.max(0, totalMs - discoverMs - journalPreloopMs - fingerprintMs - hygieneMs);
-    Object.assign(stats, { totalMs, discoverMs, journalPreloopMs, fingerprintMs, hygieneMs, otherMs });
+    const otherMs = Math.max(0, totalMs - Object.values(timings).reduce((sum, value) => sum + value, 0));
+    const gitPlanStats: GitPlanStats = {
+      ...stats,
+      ...timings,
+      carried: carried.length,
+      captured: captured.length,
+      totalMs,
+      otherMs,
+    };
     return {
       gitRepos: emptyToUndef(outgoing),
       changed,
@@ -384,7 +378,7 @@ export async function planGitSections(
       configObserved: [...configObserved].sort(),
       skipped,
       removed,
-      gitPlanStats: { ...stats, carried: carried.length, captured: captured.length },
+      gitPlanStats,
     };
   };
   // Design 108 §3.2/§3.1: genesis files-first defer — attach nothing this commit. On a
@@ -396,7 +390,7 @@ export async function planGitSections(
   // second push, no "history attached" lie).
   if (options.filesFirstDefer && cfg.syncGit) {
     const discovered = await measure(
-      (elapsed) => { discoverMs += elapsed; },
+      "discoverMs",
       () => discoverGitRepos(root, matcher),
     );
     try { await options.onGitReposDiscovered?.(discovered); } catch { /* daemon observer never changes planning */ }
@@ -421,7 +415,7 @@ export async function planGitSections(
   const kek = cfg.kek;
 
   const discovered = await measure(
-    (elapsed) => { discoverMs += elapsed; },
+    "discoverMs",
     () => discoverGitRepos(root, matcher),
   );
   try { await options.onGitReposDiscovered?.(discovered); } catch { /* daemon observer never changes planning */ }
@@ -439,19 +433,17 @@ export async function planGitSections(
   const keys = [...new Set([...kindByPath.keys(), ...Object.keys(base), ...Object.keys(pending)])].sort();
   const recoveryBlocked = new Map<string, string>();
   const recoveryAllowsSupersession = new Map<string, boolean>();
-  const workspaceRootReal = gitPlanLazy ? await fs.realpath(root) : undefined;
-  await measure((elapsed) => { journalPreloopMs += elapsed; }, async () => {
+  const workspaceRootReal = asyncMemo(() => fs.realpath(root));
+  await measure("journalPreloopMs", async () => {
+    if (gitPlanLazy) {
+      await poolMap(keys, GIT_CAPTURE_CONCURRENCY, async (rel) => {
+        await preCaptureRepoCtx(rel);
+      });
+    }
     for (const rel of keys) {
-      const repoDir = repoDirOf(root, rel);
       const ctx = await preCaptureRepoCtx(rel);
       if (options.resolution?.repo === rel && pending[rel]) {
-        const journalPresent = await fs.lstat(checkoutJournalDir(root, rel)).then(
-          () => true,
-          (error: NodeJS.ErrnoException) => {
-            if (error.code === "ENOENT") return false;
-            throw error;
-          },
-        );
+        const journalPresent = await checkoutJournalPresent(root, rel);
         if (journalPresent) {
           recoveryAllowsSupersession.set(rel, false);
           recoveryBlocked.set(rel, "checkout journal must be recovered before keep-mine can publish");
@@ -473,7 +465,7 @@ export async function planGitSections(
             commonDirReal: ctx.commonDir,
           });
           const lineage = gitPlanLazy
-            ? stateLineageV1FromRealRoot(workspaceRootReal!, state.stream, state.stateNonce!, identity)
+            ? stateLineageV1FromRealRoot(await workspaceRootReal(), state.stream, state.stateNonce!, identity)
             : await readStateLineageV1(root, state.stream, state.stateNonce!, identity);
           const binding = artifactBinding(lineage);
           publisherAckBindings[rel] = {
@@ -575,7 +567,6 @@ export async function planGitSections(
     configObserved.add(rel);
     const repoDir = repoDirOf(root, rel);
     const diskCtx = await repoCtxFromDisk(repoDir).catch(() => undefined);
-    options.onPostCaptureCtx?.(rel, "capture-config", diskCtx);
     if (!diskCtx || diskCtx.kind !== "dir" || section.refScope !== "all") {
       logOnce(
         configOwnershipSkipLogged,
@@ -664,9 +655,9 @@ export async function planGitSections(
   ): Promise<void> => {
     stats.spawnedRepos++;
     const probeBeforeFingerprint = fastLookup?.fingerprint
-      ?? await measureFingerprint(() => gitFingerprint(fingerprintRun, root, rel));
+      ?? await gitFingerprint(fingerprintRun, root, rel);
     const recomputeCacheProbe = async (): Promise<DivergenceCacheProbeSnapshot> => {
-      const beforeFingerprint = await measureFingerprint(() => gitFingerprint(fingerprintRun, root, rel));
+      const beforeFingerprint = await gitFingerprint(fingerprintRun, root, rel);
       if (await isGitBusy(repoDirOf(root, rel))) {
         const { probe } = await buildPlanProbe(root, rel, beforeFingerprint.diskCtx);
         return { beforeFingerprint, probe, kind };
@@ -941,7 +932,8 @@ export async function planGitSections(
     // 6 probe is plannable-clean with a valid preflight kind
     // 7 design-43 §7 carry matrix reaches carry
     if (!force.has(rel) && !pend && needsRes[rel] === undefined && removedMem[rel] === undefined && kindByPath.has(rel) && baseSec) {
-      fastLookup = await measureFingerprint(
+      fastLookup = await measure(
+        "fingerprintMs",
         () => fingerprintHitProbe(fingerprintRun, root, rel, cache, kind, !options.disableConfigLane),
       );
       if (fastLookup.status === "untrusted") {
@@ -974,7 +966,8 @@ export async function planGitSections(
     // skipped after `sectioned` is known, but a trusted cached parentRel lets us
     // defer that decision without paying the identity/preflight spawn floor.
     if (!force.has(rel) && !pend && needsRes[rel] === undefined && removedMem[rel] === undefined && kind === "pointer" && !baseSec) {
-      fastLookup = await measureFingerprint(
+      fastLookup = await measure(
+        "fingerprintMs",
         () => fingerprintHitProbe(fingerprintRun, root, rel, cache, kind, !options.disableConfigLane),
       );
       if (fastLookup.status === "untrusted") {
@@ -1131,7 +1124,6 @@ export async function planGitSections(
       } catch (error) {
         ctxFailure = error;
       }
-      options.onPostCaptureCtx?.(rel, "absence-proof", ctx);
       if (!ctx) {
         if (absenceCaptureEnabled && missing.length > 0) {
           const reason = `repository context became unreadable before branch deletion proof: ${errMsg(ctxFailure)}`;
@@ -1278,7 +1270,6 @@ export async function planGitSections(
     const p = pending[rel];
     const candidate = finalizedOutgoing[rel];
     const ctx = await repoCtxFromDisk(repoDirOf(root, rel)).catch(() => undefined);
-    options.onPostCaptureCtx?.(rel, "resolution", ctx);
     if (!rider || !p || !candidate || !ctx || !captured.includes(rel)) {
       const reason = deferred.find((item) => item.relPath === rel)?.reason
         ?? "keep-mine capture did not produce a final candidate";
@@ -1317,7 +1308,6 @@ export async function planGitSections(
     const p = pending[rel];
     const candidate = finalizedOutgoing[rel];
     const ctx = await repoCtxFromDisk(repoDirOf(root, rel)).catch(() => undefined);
-    options.onPostCaptureCtx?.(rel, "supersession", ctx);
     const binding = publisherAckBindings[rel];
     const proven = captured.includes(rel) && p !== undefined && candidate !== undefined && ctx !== undefined
       && binding !== undefined
@@ -1353,13 +1343,13 @@ export async function planGitSections(
   let conflictDeleteBudget = CONFLICT_REF_PRUNE_LIMIT;
   const cleanedCommonDirs = new Set<string>();
   const postCleanupCacheRefresh = new Set(captured);
-  await measure((elapsed) => { hygieneMs += elapsed; }, async () => {
+  await measure("hygieneMs", async () => {
     for (const rel of [...new Set([...stableCarryHygiene, ...captured])]
       .filter((candidate) => !resolutionCandidates.has(candidate))
       .sort()) {
       if (conflictDeleteBudget === 0) break;
       const ctx = await repoCtxFromDisk(repoDirOf(root, rel)).catch(() => undefined);
-      options.onPostCaptureCtx?.(rel, "hygiene", ctx);
+      options.onHygieneCtx?.(rel, ctx);
       if (!ctx) continue;
       const commonDir = path.resolve(ctx.commonDir);
       if (cleanedCommonDirs.has(commonDir)) continue;
@@ -1392,7 +1382,8 @@ export async function planGitSections(
     cache.dirty = true;
     try {
       const postCaptureFingerprintRun = gitFingerprintRun("per-decision");
-      const beforeFingerprint = await measureFingerprint(
+      const beforeFingerprint = await measure(
+        "fingerprintMs",
         () => gitFingerprint(postCaptureFingerprintRun, root, rel),
       );
       const pf = await gitPreflight(repoDirOf(root, rel));

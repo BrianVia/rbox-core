@@ -75,6 +75,29 @@ const EMPTY_MANIFEST: Manifest = { generatedAt: "", files: [] };
  *  signature, `chain-cap` at ~1/17 cadence is healthy compaction. */
 export type MdeNonDeltaCause = "policy" | "no-base" | "integrity" | "force" | "economic" | "chain-cap";
 
+type DeltaDisposition =
+  | { ok: true; base: NonNullable<CommitOptions["deltaBase"]> }
+  | { ok: false; cause: MdeNonDeltaCause };
+
+function deltaDisposition(
+  deltaEnabled: boolean,
+  options: CommitOptions | undefined,
+  keyEpoch: number,
+  accountEpoch: number,
+): DeltaDisposition {
+  if (!deltaEnabled) return { ok: false, cause: "policy" };
+  if (options?.forceSnapshot) return { ok: false, cause: "force" };
+  const base = options?.deltaBase;
+  if (!base) return { ok: false, cause: options?.deltaBaseRejection ?? "no-base" };
+  if (base.meta.keyEpoch !== keyEpoch || base.meta.accountEpoch !== accountEpoch) {
+    return { ok: false, cause: "integrity" };
+  }
+  if (base.meta.chain.length + 1 > MAX_MANIFEST_DELTA_CHAIN) {
+    return { ok: false, cause: "chain-cap" };
+  }
+  return { ok: true, base };
+}
+
 /** Design 204 §4.2 — the manifest-encoding write LATTICE, inverted.
  *
  *  Design 84 shipped `delta ⟹ snapshot` with delta opt-in. Since design 204
@@ -809,21 +832,16 @@ export class E2eeRemote implements SyncRemote {
     let resultManifestHash: string | undefined;
     let emittedChain: string[] | undefined;
     let emittedDelta = false;
-    // §4.2: `forceSnapshot` (repair/422) means "do not emit a delta" — it never
-    // constructs a base and never overrides the master kill below.
-    const deltaBase = deltaEnabled && !options?.forceSnapshot ? options?.deltaBase : undefined;
+    const disposition = deltaDisposition(deltaEnabled, options, epoch, account.currentEpoch);
     let nonDeltaCause: MdeNonDeltaCause | undefined;
     if (!snapshotEnabled) {
       // MASTER KILL (§4.2): every arm — including repair — emits chain-free
       // raw-v0. This branch must precede forceSnapshot, or the emergency raw
       // window would silently leak envelope-v1 snapshots on the repair path.
-      nonDeltaCause = "policy";
+      nonDeltaCause = disposition.ok ? undefined : disposition.cause;
       built = await buildEncoded(new TextEncoder().encode(JSON.stringify(manifest)));
-    } else if (deltaBase &&
-      deltaBase.meta.keyEpoch === epoch &&
-      deltaBase.meta.accountEpoch === account.currentEpoch &&
-      deltaBase.meta.chain.length + 1 <= MAX_MANIFEST_DELTA_CHAIN
-    ) {
+    } else if (disposition.ok) {
+      const deltaBase = disposition.base;
       const chain = [...deltaBase.meta.chain, deltaBase.meta.encManifestSha];
       const candidate = await encodeDeltaEnvelope(deltaBase.manifest, manifest, {
         baseEncSha: deltaBase.meta.encManifestSha,
@@ -841,17 +859,7 @@ export class E2eeRemote implements SyncRemote {
         built = await encodeSnapshot(); // §3.3.4: candidate discarded, re-emit as snapshot
       }
     } else {
-      // §7 cause enum, most-dominant reason first: a kill switch explains the
-      // whole fleet, a forced snapshot explains this commit, and only then do
-      // the base's own dispositions apply. `no-base` vs `integrity` is decided
-      // at the PUSH seam (it owns the persisted meta), so the writer reads the
-      // disposition it was handed; an epoch mismatch is writer-visible and
-      // classifies as `integrity`.
-      nonDeltaCause = !deltaEnabled ? "policy"
-        : options?.forceSnapshot ? "force"
-          : !deltaBase ? (options?.deltaBaseRejection ?? "no-base")
-            : deltaBase.meta.keyEpoch !== epoch || deltaBase.meta.accountEpoch !== account.currentEpoch ? "integrity"
-              : "chain-cap";
+      nonDeltaCause = disposition.cause;
       built = await encodeSnapshot();
     }
     // §7 burn-in discriminator. Sink-only (the daemon supplies one, one-shot CLI
@@ -909,8 +917,8 @@ export class E2eeRemote implements SyncRemote {
         accountEpoch: account.currentEpoch,
         keyEpoch: epoch,
         chain: emittedChain ?? [],
-        chainBytes: emittedDelta ? deltaBase!.meta.chainBytes + built.encManifest.byteLength : 0,
-        snapshotBytes: emittedDelta ? deltaBase!.meta.snapshotBytes : built.encManifest.byteLength,
+        chainBytes: emittedDelta && disposition.ok ? disposition.base.meta.chainBytes + built.encManifest.byteLength : 0,
+        snapshotBytes: emittedDelta && disposition.ok ? disposition.base.meta.snapshotBytes : built.encManifest.byteLength,
         gitRepos: manifest.gitRepos ?? {},
       } } : {}),
     };

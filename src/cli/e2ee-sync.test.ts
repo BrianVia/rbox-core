@@ -21,7 +21,7 @@ import { canonicalManifestHashStreaming, decodeEnvelope, encodeDeltaEnvelope, EN
 import { encryptManifest, openManifestChainBlob, parseCommit as parseSignedCommit } from "../engine/e2ee/index.js";
 import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
 import { blobRefsForManifest, E2eeRemote, mdeWritePolicy, resetMdeWritePolicyWarnOnceForTests, SIDECAR_THRESHOLD } from "./e2ee-remote.js";
-import { bootstrapOnto, cfgFor as harnessCfg, FakeServer, memPin, remoteFor as harnessRemote } from "./e2ee-fake-server.js";
+import { bootstrapOnto, cfgFor as harnessCfg, FakeServer, remoteFor as harnessRemote } from "./e2ee-fake-server.js";
 import { CommitRejectedError, type CommitOptions } from "./remote.js";
 import { formatLatestTimings, pull, push, pushManifest } from "./sync.js";
 import { repairChain } from "./chain-repair.js";
@@ -1774,11 +1774,9 @@ async function retargetSymlink(root: string, index: number, tag: string): Promis
 /** An E2eeRemote whose warning sink is captured — production wires the daemon
  *  logger here, which is where §7's `mde non_delta cause=` line lands. */
 function sinkRemoteFor(server: FakeServer, secrets: DeviceSecrets, lines: string[]): E2eeRemote {
-  return new E2eeRemote(
-    server,
-    { accountId: ACCT, workspaceId: WS, secrets, now: () => NOW + 5000, warningSink: (line: string) => { lines.push(line); } },
-    memPin(),
-  );
+  return harnessRemote(server, secrets, ACCT, WS, NOW + 5000, {
+    warningSink: (line: string) => { lines.push(line); },
+  });
 }
 
 const nonDeltaCauses = (lines: readonly string[]): string[] =>

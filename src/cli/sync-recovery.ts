@@ -66,6 +66,8 @@ import {
 const compressionEnabled = () => process.env.RBOX_COMPRESS !== "0";
 const pipelineEnabled = () => /^(1|true|yes|on)$/i.test(process.env.RBOX_PUBLISH_PIPELINE?.trim() ?? "");
 export const preflightDeltaEnabled = () => process.env.RBOX_PREFLIGHT_DELTA !== "0";
+export const fullAuditEnabled = (forceFullAudit?: boolean) =>
+  process.env.RBOX_PREFLIGHT_FULL === "1" || (preflightDeltaEnabled() && forceFullAudit === true);
 const PIPELINE_MIN_FILES = 64;
 export { uploadLaneTiming, uploadLaneTimingSummary };
 export const uploadConcurrencyForTests = uploadConcurrency;
@@ -184,7 +186,7 @@ export async function encryptAndUpload(
 
     if (usePipeline) {
       const preflightDelta = preflightDeltaEnabled();
-      const fullAudit = process.env.RBOX_PREFLIGHT_FULL === "1" || (preflightDelta && options.forceFullAudit === true);
+      const fullAudit = fullAuditEnabled(options.forceFullAudit);
       const result = await withCryptoPool(kek, cfg.keyEpoch, toEncrypt.length, (pool) => runPublishPipeline({
         api,
         root,
@@ -294,7 +296,7 @@ export async function encryptAndUpload(
       report.recordDetails("address", { cacheHits, cacheMisses }, `hit${cacheHits}m${cacheMisses}`);
 
     const preflightDelta = preflightDeltaEnabled();
-    const fullAudit = process.env.RBOX_PREFLIGHT_FULL === "1" || (preflightDelta && options.forceFullAudit === true);
+    const fullAudit = fullAuditEnabled(options.forceFullAudit);
 
     let encShas: string[];
     let introduced = 0;

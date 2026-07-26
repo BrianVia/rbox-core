@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { beforeEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -20,21 +20,10 @@ import { runPublishPipeline } from "./pipeline.js";
 import type { ReceiptPort } from "./receipt-drainer.js";
 
 const hash = (bytes: string | Buffer) => createHash("sha256").update(bytes).digest("hex");
-let savedPreflightDelta: string | undefined;
-let savedPreflightFull: string | undefined;
 
 beforeEach(() => {
-  savedPreflightDelta = process.env.RBOX_PREFLIGHT_DELTA;
-  savedPreflightFull = process.env.RBOX_PREFLIGHT_FULL;
   delete process.env.RBOX_PREFLIGHT_DELTA;
   delete process.env.RBOX_PREFLIGHT_FULL;
-});
-
-afterEach(() => {
-  if (savedPreflightDelta === undefined) delete process.env.RBOX_PREFLIGHT_DELTA;
-  else process.env.RBOX_PREFLIGHT_DELTA = savedPreflightDelta;
-  if (savedPreflightFull === undefined) delete process.env.RBOX_PREFLIGHT_FULL;
-  else process.env.RBOX_PREFLIGHT_FULL = savedPreflightFull;
 });
 
 class PipelineRemote {
