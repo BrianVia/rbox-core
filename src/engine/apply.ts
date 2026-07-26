@@ -62,6 +62,13 @@ export interface ApplyOptions {
   mutationBoundary?: MutationBoundary;
 }
 
+/** The workspace-relative path an action targets. A `write` names it inside its
+ *  entry, every other kind carries it directly — one definition so no consumer has
+ *  to re-derive the discrimination. */
+export function actionPath(a: Action): string {
+  return a.kind === "write" ? a.entry.path : a.path;
+}
+
 /**
  * Apply reconcile actions to `destRoot` — precondition-checked and
  * non-destructive. Every write stages a temp first, then re-checks the target
@@ -96,7 +103,7 @@ export async function applyActions(
   const needDirs = new Set<string>();
   let dirComponentWalks = 0;
   for (const a of rest) {
-    const p = a.kind === "write" ? a.entry.path : a.path;
+    const p = actionPath(a);
     const parts = p.split("/");
     if (measured) dirComponentWalks += parts.length - 1;
     let acc = "";

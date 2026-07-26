@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { applyGitState, assertGitTargetWithinRoot, finalizeGitChainTimings, gitIdentity, gitIdentityKey, gitPreflight, indexIdentityV2, inspectLockedPRepairReceipt, isGitBusy, persistPRepairTerminal, preserveGitConflict, receiverEquivalentCollisionNames, repoCtxFromDisk, poolMap, readBaseAbsentArtifact, readBasePresentArtifact, runLockedPRepairAttempt, resumeLockedAcceptedPRepair, refreshLockedAcceptedPRepair, settleBaseAbsentArtifact, type AppliedManifestOracle, type ApplyBranchTransitionAdapter, type ApplyBranchTransitionInput, type CheckoutCapabilityProbe, type GitIdentity, type GitChainTimings, type GitSection, type IgnoreMatcher, type Manifest, type BlobStore, zeroGitChainTimings } from "../../engine/index.js";
+import { applyGitState, assertGitTargetWithinRoot, checkoutJournalPresent, finalizeGitChainTimings, gitIdentity, gitIdentityKey, gitPreflight, indexIdentityV2, inspectLockedPRepairReceipt, isGitBusy, persistPRepairTerminal, preserveGitConflict, receiverEquivalentCollisionNames, repoCtxFromDisk, poolMap, readBaseAbsentArtifact, readBasePresentArtifact, runLockedPRepairAttempt, resumeLockedAcceptedPRepair, refreshLockedAcceptedPRepair, settleBaseAbsentArtifact, type AppliedManifestOracle, type ApplyBranchTransitionAdapter, type ApplyBranchTransitionInput, type CheckoutCapabilityProbe, type GitIdentity, type GitChainTimings, type GitSection, type IgnoreMatcher, type Manifest, type BlobStore, type RepoCtx, zeroGitChainTimings } from "../../engine/index.js";
 import { canonicalizeGitConfig, sanitizeGitSectionForPersistence, validateCanonicalGitConfig, type GitConfig } from "../../engine/git/config-sync.js";
 import { applyConfigTransaction, materializeFreshGitConfig, readConfigSnapshot, readParsedConfigSnapshot, sameConfigStatToken, type ConfigStatToken, type ConfigTransactionResult } from "../../engine/git/config-txn.js";
 import { readAllRefs, readAllRefsStrict } from "../../engine/git/refs.js";
@@ -362,6 +362,7 @@ opts: {
   });
   if (!cfg.syncGit) return pack();
   const keys = [...new Set([...Object.keys(remote.gitRepos ?? {}), ...Object.keys(baseRepos), ...Object.keys(pending)])].sort();
+  const lazyProbes = process.env.RBOX_GIT_APPLY_LAZY !== "0";
   // Logical repo keys must remain one-to-one with receiver targets even if this
   // state later lands on an NFC/case-aliasing filesystem.
   const collidingRepoKeys = receiverEquivalentCollisionNames(keys);
@@ -392,10 +393,8 @@ opts: {
     throw new Error("E2EE required: remote has git state but no key on this device — run `rbox pair`/`rbox key recover`.");
   }
 
-  const commonDirGroupFor = async (repoDir: string, hasDotGit: boolean): Promise<number | undefined> => {
-    if (!commonDirGroups || !hasDotGit) return undefined;
-    const ctx = await repoCtxFromDisk(repoDir).catch(() => undefined);
-    if (!ctx) return undefined;
+  const commonDirGroupFor = (ctx: RepoCtx | undefined): number | undefined => {
+    if (!commonDirGroups || !ctx) return undefined;
     const key = path.resolve(ctx.commonDir);
     let group = commonDirGroups.get(key);
     if (group === undefined) {
@@ -403,6 +402,20 @@ opts: {
       commonDirGroups.set(key, group);
     }
     return group;
+  };
+
+  /** One-shot async memo with reset — the per-repo probe thunks (design 203). */
+  const memo = <T,>(fn: () => Promise<T>): (() => Promise<T>) & { reset: () => void } => {
+    let done = false;
+    let value: T;
+    const get = async (): Promise<T> => {
+      if (!done) {
+        value = await fn();
+        done = true;
+      }
+      return value;
+    };
+    return Object.assign(get, { reset: () => { done = false; } });
   };
 
   const laneRecord = (rel: string): RepoRecordInput => ({
@@ -569,17 +582,18 @@ opts: {
     let pend = pending[rel];
     const repoDir = repoDirOf(root, rel);
     let dotGit = await fs.lstat(path.join(repoDir, ".git")).catch(() => undefined);
-    const commonDirGroup = await commonDirGroupFor(repoDir, dotGit !== undefined);
+    const getDiskCtx = memo(async () => dotGit ? await repoCtxFromDisk(repoDir).catch(() => undefined) : undefined);
+    const commonDirGroup = commonDirGroupFor(await getDiskCtx());
 
     // Sanitizing an invalid incoming config must not make the next push author a
     // corrective echo. Record the unchanged owned local config as the config-lane
     // baseline; only a later genuine local edit is publishable.
     if (sanitizedConfigReason && !opts.disableConfigLane && dotGit) {
-      const diskCtx = await repoCtxFromDisk(repoDir).catch(() => undefined);
-      if (diskCtx?.kind === "dir") {
-        const receiver = await configReceiver(root, diskCtx).catch(() => undefined);
+      const configCtx = await getDiskCtx();
+      if (configCtx?.kind === "dir") {
+        const receiver = await configReceiver(root, configCtx).catch(() => undefined);
         if (receiver?.owned) {
-          const local = await readLocalGitConfig(root, rel, diskCtx, undefined, () => {
+          const local = await readLocalGitConfig(root, rel, configCtx, undefined, () => {
             const logKey = `${root}\0${rel}`;
             if (!configInvalidSkipLogged.has(`${logKey}\0credential`)) {
               configInvalidSkipLogged.add(`${logKey}\0credential`);
@@ -608,15 +622,15 @@ opts: {
       // marker so the established presence rule can heal an old writer that
       // stripped a valid config field. Invalid-present input takes the branch
       // above and deliberately retains the local hash instead.
-      const diskCtx = await repoCtxFromDisk(repoDir).catch(() => undefined);
-      if (diskCtx?.kind === "dir") {
-        const receiver = await configReceiver(root, diskCtx).catch(() => undefined);
-        if (receiver?.owned) {
-          const beforeLane = laneRecord(rel);
-          // Ordinary wire absence only consumes an existing authorship
-          // baseline. It must not materialize cfgShape in an otherwise empty
-          // lane merely because this receiver happens to own config.
-          if (beforeLane.cfgSynced !== undefined) {
+      const beforeLane = laneRecord(rel);
+      // Ordinary wire absence only consumes an existing authorship baseline.
+      // Keep the context/ownership realpath cluster behind that pure marker:
+      // an otherwise empty lane has nothing to clear.
+      if (beforeLane.cfgSynced !== undefined) {
+        const configCtx = await getDiskCtx();
+        if (configCtx?.kind === "dir") {
+          const receiver = await configReceiver(root, configCtx).catch(() => undefined);
+          if (receiver?.owned) {
             const { cfgSynced: _cfgSynced, ...withoutSynced } = beforeLane;
             replaceLane(rel, withoutSynced);
           }
@@ -627,7 +641,8 @@ opts: {
     // Design 116 recovery is the first per-repo operation in every arm. The
     // surrounding runRepo chain lock is already keyed by this common dir.
     let recoveryConflict = false;
-    const recoveryCtx = dotGit ? await repoCtxFromDisk(repoDir).catch(() => undefined) : undefined;
+    const recoverJournal = !lazyProbes || await checkoutJournalPresent(root, rel);
+    const recoveryCtx = recoverJournal ? await getDiskCtx() : undefined;
     if (recoveryCtx) {
       const binding = await checkoutJournalBinding(state.stream, expectedStateNonce(state), recoveryCtx);
       const landed = await runMutation(repoDir, () => recoverAndLandFollowJournal(root, rel, binding, state, {
@@ -665,8 +680,9 @@ opts: {
       } else if (recovery.status === "fresh-quarantined") {
         glog(`git-sync WARNING ${rel}: partial fresh repository quarantined at ${recovery.quarantinePath}`);
         dotGit = await fs.lstat(path.join(repoDir, ".git")).catch(() => undefined);
+        getDiskCtx.reset();
       }
-    } else {
+    } else if (recoverJournal) {
       const recovery = await runMutation(repoDir, () =>
         quarantineUnboundFollowJournal(root, rel, state.stream, expectedStateNonce(state)));
       if (recovery.status === "binding-mismatch") {
@@ -685,8 +701,13 @@ opts: {
     // check must run BEFORE any identity comparison — a lock makes write-tree fail,
     // flipping gitIdentity onto the raw-index fallback, which would read as FALSE
     // divergence (spurious conflict) or poison a removal memory with a transient key.
-    const busy = dotGit !== undefined && (await isGitBusy(repoDir));
-    if (busy && remoteSec) {
+    // Legacy mode passes no ctx so isGitBusy spawns exactly as today (the kill
+    // switch's spawn-count fidelity is pinned by test); lazy mode reuses the
+    // memoized fs-derived ctx.
+    const getBusy = memo(async () =>
+      dotGit !== undefined && await isGitBusy(repoDir, lazyProbes ? await getDiskCtx() : undefined));
+    if (!lazyProbes) await getBusy(); // legacy order: busy probed for every repo, as today
+    if (remoteSec && await getBusy()) {
       pending[rel] = remoteSec; // apply needs quiescence — retry next pull; outbound carries newest truth
       setDeferral(rel, "apply", "git-busy", incomingKey, await checkoutOf(repoDir));
       glog(`git-sync deferred ${rel}: receiver git busy`);
@@ -695,7 +716,11 @@ opts: {
     // NOTE: remote ABSENCE is processed even when busy — it never mutates local .git,
     // and skipping it would leave gitPendingRemote/base carrying a section the remote
     // deleted, which the next file-only push would resurrect.
-    const localId = dotGit ? await gitIdentity(repoDir) : undefined;
+    const getLocalId = memo(async (): Promise<GitIdentity | undefined> => {
+      await getBusy(); // busy-known-first: identity under a held lock reads as false divergence
+      return dotGit ? await gitIdentity(repoDir) : undefined;
+    });
+    if (!lazyProbes) await getLocalId();
 
     if (!remoteSec) {
       // §9 removal + [v6] absence-supersedes-pending. The DIVERGENCE EXAMINATION runs
@@ -705,7 +730,8 @@ opts: {
       // preserve. Ordering is crash-safety: if the
       // preserve throws (blob/fs failure), the per-repo catch must not leave a stale
       // pending/base entry for the next push to resurrect.
-      const diverged = pend !== undefined && localDivergedFromBase(localId, baseSec);
+      const identity = await getLocalId();
+      const diverged = pend !== undefined && localDivergedFromBase(identity, baseSec);
       delete pending[rel];
       delete needsRes[rel];
       deferrals[rel] = null;
@@ -724,7 +750,7 @@ opts: {
         // section's identity instead (projected onto the leftover's shape), which is
         // lock-immune and equals the live identity whenever the leftover is untouched.
         removedMem[rel] =
-          busy && baseSec ? projectedKey(baseSec, dotGit.isFile() ? "scoped" : "all") : gitIdentityKey(localId);
+          (await getBusy()) && baseSec ? projectedKey(baseSec, dotGit.isFile() ? "scoped" : "all") : gitIdentityKey(identity);
       }
       // §13.5 conflict precedence: the pending remote section is preserved for manual
       // recovery. Best-effort — preserve never mutates local branches/index/identity,
@@ -791,15 +817,18 @@ opts: {
     if (removedMem[rel] !== undefined) {
       if (!dotGit) {
         delete removedMem[rel]; // leftover gone → memory pruned; plain fresh target
-      } else if (gitIdentityKey(localId) === removedMem[rel]) {
-        cleanMaterialize = true;
-      } else if (!localId && dotGit.isFile()) {
-        pending[rel] = remoteSec;
-        setDeferral(rel, "apply", "unreadable", incomingKey, await checkoutOf(repoDir));
-        glog(`git-sync deferred ${rel}: leftover pointer repo unreadable — keeping removal memory`);
-        return { result: "deferred", commonDirGroup };
       } else {
-        delete removedMem[rel]; // identity genuinely changed (incl. a re-init'd empty dir repo)
+        const removalLocalId = await getLocalId();
+        if (gitIdentityKey(removalLocalId) === removedMem[rel]) {
+          cleanMaterialize = true;
+        } else if (!removalLocalId && dotGit.isFile()) {
+          pending[rel] = remoteSec;
+          setDeferral(rel, "apply", "unreadable", incomingKey, await checkoutOf(repoDir));
+          glog(`git-sync deferred ${rel}: leftover pointer repo unreadable — keeping removal memory`);
+          return { result: "deferred", commonDirGroup };
+        } else {
+          delete removedMem[rel]; // identity genuinely changed (incl. a re-init'd empty dir repo)
+        }
       }
     }
 
@@ -872,7 +901,7 @@ opts: {
     let resolutionChanged = false;
     let checkpointReproof = false;
     if (needsRes[rel] !== undefined) {
-      if (gitIdentityKey(localId) === needsRes[rel]) {
+      if (gitIdentityKey(await getLocalId()) === needsRes[rel]) {
         const alreadyReproved = records[rel]?.deferrals?.apply?.subjectKey === incomingKey && records[rel]?.deferrals?.apply?.reproof === true;
         if (opts.degradedMutex || !gitFollowEnabled() || !opts.oracle || alreadyReproved) {
           clearAttempt(rel);
@@ -912,9 +941,10 @@ opts: {
     // remote change that equals local work) → advance base, clear pending, no mutation.
     // A removal-memory leftover never takes this shortcut: it must go through the §9
     // clean-materialization path (wipe on dir targets) so stale refs can't survive.
-    if (localId && !cleanMaterialize) {
-      const n = narrowerScope(localId.refScope, remoteSec.refScope);
-      if (projectedKey(localId, n) === projectedKey(remoteSec, n)) {
+    const shortcutLocalId = await getLocalId();
+    if (shortcutLocalId && !cleanMaterialize) {
+      const n = narrowerScope(shortcutLocalId.refScope, remoteSec.refScope);
+      if (projectedKey(shortcutLocalId, n) === projectedKey(remoteSec, n)) {
         const priorRefs = baseSec?.refs ?? {};
         const candidateRefs = remoteSec.refs;
         const refChanged = [...new Set([...Object.keys(priorRefs), ...Object.keys(candidateRefs)])]
@@ -940,13 +970,14 @@ opts: {
     const recordedPartial = records[rel]?.partial;
     let forcedHeldRefs: GitPartialApply["heldRefs"] | undefined;
     const d2RejectedRefs = new Set<string>();
-    let divergenceId = localId;
-    if (recordedPartial && localId && pend && gitIncomingKey(pend) === recordedPartial.incomingKey) {
+    const divergenceLocalId = await getLocalId();
+    let divergenceId = divergenceLocalId;
+    if (recordedPartial && divergenceLocalId && pend && gitIncomingKey(pend) === recordedPartial.incomingKey) {
       if (await partialRefsStillMatch(repoDir, recordedPartial)) {
         divergenceId = withoutRboxAuthoredRefs(
-          localId,
+          divergenceLocalId,
           baseSec,
-          !recordedPartial.checkoutPending && !checkoutMatchesIncoming(localId, pend)
+          !recordedPartial.checkoutPending && !checkoutMatchesIncoming(divergenceLocalId, pend)
             ? { ...recordedPartial, checkoutPending: true }
             : recordedPartial,
         );
@@ -1054,7 +1085,7 @@ opts: {
       partial[rel] = progress
         ? partialFrom({ ...progress, configApplied }, true)
         : null;
-      needsRes[rel] = gitIdentityKey(progress ? await gitIdentity(repoDir) : localId);
+      needsRes[rel] = gitIdentityKey(progress ? await gitIdentity(repoDir) : await getLocalId());
       clearAttempt(rel);
       setDeferral(rel, "apply", reason, incomingKey, await checkoutOf(repoDir));
       glog(`git-sync CONFLICT ${rel} — local kept; remote preserved at ${recoveryBundle ?? "refs/rbox-conflict/*"}. Resolve manually. Your local Git work is safe; inspect the preserved incoming state before resolving.`);

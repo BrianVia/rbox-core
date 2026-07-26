@@ -194,9 +194,17 @@ export async function scanManifest(
   return { generatedAt: new Date().toISOString(), files };
 }
 
+/** The manifest's canonical path order — plain byte-wise ascending, the SINGLE
+ *  definition every producer and consumer of a sorted `files` array shares. Exported
+ *  so a patch that merges into an already-sorted manifest (design 202) can rely on
+ *  the same order the scan established instead of re-sorting to guess it. */
+export function compareManifestPaths(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
 function sortManifestFiles(files: FileEntry[], scanStats?: ScanStats): void {
   const t0 = scanStats ? Date.now() : 0;
-  files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  files.sort((a, b) => compareManifestPaths(a.path, b.path));
   if (scanStats) scanStats.sortMs += Date.now() - t0;
 }
 
@@ -374,7 +382,7 @@ export async function applyWatchEvents(
     }
   }
 
-  const files = [...map.values()].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  const files = [...map.values()].sort((a, b) => compareManifestPaths(a.path, b.path));
   return { generatedAt: new Date().toISOString(), files };
 }
 

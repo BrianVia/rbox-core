@@ -1,4 +1,5 @@
 import {
+  actionPath,
   applyActions,
   isIgnoreRuleFile,
   PhaseReport,
@@ -31,7 +32,7 @@ import { assertSyncMutex, workspaceSyncMutexDegraded } from "../sync-mutex.js";
 import { inputRecord, observedRepoKeys, orderedRepoDeferralUpdates, saveStateSource } from "../sync-state.js";
 import { type SyncDeps, withReportScanStats, withCache, withDircache } from "./deps.js";
 import { formatLatestTimings, formatScanStats, scanDetailsOf, formatApplyStats } from "./format.js";
-import { apiFor, makeDeferErrnoReporter, MASS_DELETE_MIN_FILES, MassDeleteGuardError, matcherForState, plaintextBytesOf, fileCountOf, scanTick } from "./policy.js";
+import { apiFor, makeDeferErrnoReporter, MASS_DELETE_MIN_FILES, MassDeleteGuardError, matcherForState, plaintextBytesOf, fileCountOf, scanTick, TrustedViewRefusalError, type TrustedLocalView } from "./policy.js";
 
 export async function scanManifestForPushResult(root: string, cfg: WorkspaceConfig, deps: SyncDeps, purgeIgnored = false): Promise<{ manifest: Manifest; observationComplete: boolean }> {
   const report = deps.report ?? PhaseReport.disabled("push");
@@ -65,15 +66,21 @@ export async function scanManifestForPush(root: string, cfg: WorkspaceConfig, de
  * the remote we just pulled. The remote manifest is validated before it touches
  * the filesystem (never trust the network). Returns the actions taken.
  */
-export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = {}): Promise<Action[]> {
-  return (await pullWithMetadata(root, cfg, deps)).actions;
+export async function pull(root: string, cfg: WorkspaceConfig, deps: SyncDeps = {}, trustedView?: TrustedLocalView): Promise<Action[]> {
+  return (await pullWithMetadata(root, cfg, deps, trustedView)).actions;
 }
 
-/** Pull boundary metadata used by guided setup without changing pull's public API. */
+/** Pull boundary metadata used by guided setup without changing pull's public API.
+ *
+ *  `trustedView` (design 202) is single-use BY CONSTRUCTION: it reaches exactly the
+ *  one top-level `applyPulledManifest` below. The resolution-receipt inner pull runs
+ *  first and can mutate disk, so it always scans; chain repair and its post-repair
+ *  re-pull are separate `pull()` calls that receive no view. */
 export async function pullWithMetadata(
   root: string,
   cfg: WorkspaceConfig,
-  deps: SyncDeps = {}
+  deps: SyncDeps = {},
+  trustedView?: TrustedLocalView
 ): Promise<{ actions: Action[]; initialRemoteSequence: number }> {
   if (deps.syncMutex) assertSyncMutex(deps.syncMutex, root);
   const report = deps.report ?? PhaseReport.disabled("pull");
@@ -102,7 +109,7 @@ export async function pullWithMetadata(
   surfaceResolutionReceiptReconciliation(reconciled, deps);
   return {
     actions: reconciled.status === "none"
-      ? await applyPulledManifest(root, cfg, deps, api, { sequence, manifest: remote, manifestMeta, state })
+      ? await applyPulledManifest(root, cfg, deps, api, { sequence, manifest: remote, manifestMeta, state }, trustedView)
       : reconciled.actions,
     initialRemoteSequence: sequence,
   };
@@ -206,7 +213,11 @@ export async function applyPulledManifest(
   cfg: WorkspaceConfig,
   deps: SyncDeps,
   api: SyncRemote,
-  input: { sequence: number; manifest: Manifest; manifestMeta?: GlobalManifestMeta; kek?: Uint8Array; keyEpoch?: number; state?: SyncState }
+  input: { sequence: number; manifest: Manifest; manifestMeta?: GlobalManifestMeta; kek?: Uint8Array; keyEpoch?: number; state?: SyncState },
+  /** Design 202, daemon-internal: passed ONLY by `pullWithMetadata`'s main line.
+   *  Every other caller (resolution-receipt reconciliation, chain repair, CLI
+   *  one-shots) omits it and therefore scans. */
+  trustedView?: TrustedLocalView
 ): Promise<Action[]> {
   const report = deps.report ?? PhaseReport.disabled("pull");
   deps = withReportScanStats(deps, report);
@@ -229,17 +240,31 @@ export async function applyPulledManifest(
   // the local file re-publishes (RESURRECTION, the safe direction: never a
   // deletion). Feeding base-carried entries into reconcile would instead let a
   // remote delete plan a disk delete against an unreadable path (design 108).
-  const scanDeferred = new Set<string>();
-  const scanFault = () => deps.telemetry?.record({ kind: "safety_event", eventType: "scan_fault", count: 1 });
-  const deferErrnos = deps.warningSink ? makeDeferErrnoReporter(deps.warningSink, scanFault) : makeDeferErrnoReporter(undefined, scanFault);
-  const scanT0 = Date.now();
-  const local = await report.phase("scan", () => scanManifest(root, matcher, cache, scanTick(deps), undefined, scanStats, scanDeferred, undefined, dircache, deps.forceFullScan ? "unpruned" : "pruned", deferErrnos.onErrno, deps.warningSink));
-  deferErrnos.flush();
-  const scanWallMs = Date.now() - scanT0;
+  let scanDeferred: ReadonlySet<string>;
+  let local: Manifest;
+  let scanWallMs: number | undefined;
+  if (trustedView) {
+    // Design 202: the daemon's watcher-maintained manifest already IS this view, so
+    // the O(workspace) walk is skipped entirely. `deferred` carries the daemon's
+    // unsettled set — the same role the scan's deferred set plays above: those paths
+    // are omitted from `local` (by the daemon, before handing the view over) and
+    // exempted by the oracle below.
+    scanDeferred = trustedView.deferred;
+    local = await report.phase("scan", async () => trustedView.manifest);
+  } else {
+    const scanFault = () => deps.telemetry?.record({ kind: "safety_event", eventType: "scan_fault", count: 1 });
+    const deferErrnos = deps.warningSink ? makeDeferErrnoReporter(deps.warningSink, scanFault) : makeDeferErrnoReporter(undefined, scanFault);
+    const deferred = new Set<string>();
+    scanDeferred = deferred;
+    const scanT0 = Date.now();
+    local = await report.phase("scan", () => scanManifest(root, matcher, cache, scanTick(deps), undefined, scanStats, deferred, undefined, dircache, deps.forceFullScan ? "unpruned" : "pruned", deferErrnos.onErrno, deps.warningSink));
+    deferErrnos.flush();
+    scanWallMs = Date.now() - scanT0;
+  }
   if (report.enabled) {
     report.files = fileCountOf(local);
     report.record("scan", { count: report.files, plaintextBytes: plaintextBytesOf(local) });
-    if (scanStats) {
+    if (scanStats && scanWallMs !== undefined) {
       const details = scanDetailsOf(scanStats, scanWallMs, scanDeferred.size);
       report.recordDetails("scan", { ...details }, formatScanStats(details));
     }
@@ -265,7 +290,6 @@ export async function applyPulledManifest(
   // Filtering everything through the PRE-pull matcher would drop a file a relaxed
   // rule just un-ignored — it would never land locally, and the follow-up push
   // would commit its deletion back to the remote (a data-loss echo).
-  const pathOf = (a: Action) => (a.kind === "write" ? a.entry.path : a.path);
   const all = reconcile(state.lastSyncedManifest, local, remote, cfg.deviceId, new Date().toISOString());
 
   // Mass-delete guard (design 44): refuse to apply a delete wave that wipes ≥half the
@@ -274,13 +298,21 @@ export async function applyPulledManifest(
   const plannedDeletes = all.reduce((n, a) => n + (a.kind === "delete" ? 1 : 0), 0);
   const baseFiles = state.lastSyncedManifest.files.length;
   if (!deps.allowMassDelete && plannedDeletes >= MASS_DELETE_MIN_FILES && plannedDeletes * 2 >= baseFiles) {
+    // Design 202: an INCOMPLETE trusted view inflates planned deletes, and the daemon
+    // never sets `allowMassDelete` — a false positive there would halt background sync
+    // forever. Refuse instead: nothing has touched disk yet (this guard is pre-apply),
+    // so the caller re-runs the pull scan-backed and that run decides for real.
+    if (trustedView) {
+      throw new TrustedViewRefusalError("mass-delete",
+        `pull planned ${plannedDeletes} of ${baseFiles} deletions from a trusted local view — refusing to act on it; rescanning`);
+    }
     deps.telemetry?.record({ kind: "safety_event", eventType: "mass_delete_breaker", count: 1 });
     throw new MassDeleteGuardError("pull",
       `pull would delete ${plannedDeletes} of ${baseFiles} tracked files — refusing (mass-delete guard). ` +
         `If this deletion is intentional, run \`${deps.massDeleteHint ?? "rbox pull --allow-mass-delete"}\` to apply it once.`
     );
   }
-  const ruleActions = all.filter((a) => isIgnoreRuleFile(pathOf(a)) && !matcher.ignores(pathOf(a)));
+  const ruleActions = all.filter((a) => isIgnoreRuleFile(actionPath(a)) && !matcher.ignores(actionPath(a)));
   // Trash tier (design 50 §2): ONE batch per pull receives every propagated deletion and
   // type-flip dir eviction as an atomic rename instead of `fs.rm`. `days === 0` disables it
   // (classic immediate delete / visible conflict eviction). `finish()` settles the `.active`
@@ -308,7 +340,7 @@ export async function applyPulledManifest(
         if (ruleActions.length > 0) await applyActions(root, ruleActions, api.blobStore(), applyOpts);
         const fresh = ruleActions.length > 0 ? matcherForState(root, cfg, state) : matcher;
         finalMatcher = fresh;
-        const rest = all.filter((a) => !isIgnoreRuleFile(pathOf(a)) && !fresh.ignores(pathOf(a)));
+        const rest = all.filter((a) => !isIgnoreRuleFile(actionPath(a)) && !fresh.ignores(actionPath(a)));
         await applyActions(root, rest, api.blobStore(), applyOpts);
         actions = [...ruleActions, ...rest];
       });

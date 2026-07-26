@@ -349,7 +349,7 @@ class ManifestOracle implements AppliedManifestOracle {
     private readonly matcher: IgnoreMatcher,
     private readonly source: () => ReceiptSource,
     private readonly oracleManifest: Manifest,
-    private readonly scanDeferred: Set<string>,
+    private readonly scanDeferred: ReadonlySet<string>,
     private readonly dircache?: DirCache,
     private readonly preScanHashCache?: HashCache,
   ) {}
@@ -714,7 +714,7 @@ export function oracleFromPull(opts: {
    *  identity; action-touched files are always content-hashed. */
   hashcache?: HashCache;
   root: string;
-  scanDeferred: Set<string>;
+  scanDeferred: ReadonlySet<string>;
 }): AppliedManifestOracle {
   const source = (): ReceiptSource => {
     const preApply = indexByPath(opts.preScan);

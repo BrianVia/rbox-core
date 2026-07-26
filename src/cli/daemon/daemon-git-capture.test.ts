@@ -314,7 +314,7 @@ test("every raw want.push assignment is owned by requestPush and terminal record
   expect(source.match(/this\.recordGitCaptureSuccess\(provenance\)/g)).toHaveLength(1);
   const returned = source.indexOf("res = await pushManifest");
   const recorded = source.indexOf("this.recordGitCaptureSuccess(provenance)");
-  const bookkeeping = source.indexOf("this.manifest = res.manifest", recorded);
+  const bookkeeping = source.indexOf("this.installManifest(res.manifest", recorded);
   expect(returned).toBeLessThan(recorded);
   expect(recorded).toBeLessThan(bookkeeping);
 });
