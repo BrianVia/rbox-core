@@ -5,7 +5,40 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
-_Session addendum (2026-07-26, later): burn-in DONE on both hosts; #457 merged
+_Session addendum (2026-07-26, evening): **DESIGN 204 SHIPPED to main (PR
+#458, squash 514d6899) and burn-in STARTED on both hosts
+(1.9.1-dev+514d689).** Design `docs/design/204-delta-scoped-publish.md`
+ALIGNED r3 (2 codex + opus parallel wave → synthesis → codex serial gate →
+focused re-check; ledger `docs/design/REVIEW-204.md`). Parts: (A) preflight
+delta default-on — REVIEW-103 freeze DISCHARGED by a new enforce-mode server
+regression, green vs unmodified server; (B) manifest delta commits +
+RBOX_MDE_FAST_PULL default-on, mdeWritePolicy() both-seam lattice,
+base-integrity hash binding, evidence-fold→cold-walk fallback; (C) reduced
+lazy git-plan (journal-pair gating, scoped memos, C5 sub-phase buckets) —
+delta discovery + cross-repo fingerprint memo DEFERRED with banked evidence
+(REVIEW-204 §5.5 seed for the successor). Kill switches:
+RBOX_PREFLIGHT_DELTA/RBOX_MDE_DELTA/RBOX_MDE_SNAPSHOT(master)/
+RBOX_MDE_FAST_PULL/RBOX_GIT_PLAN_LAZY (=0 each). **Field results (warm):
+missing 4.1s→0.1s (77B up), commit 4.4s/12.5MB→2.7s/614B delta, FM pull
+manifest 0B (fold=evidence), FM pull wall 1.8s, Mac publish 15.6→11.3s,
+end-to-end Mac→FM 19.6→15.3s.** Dedup-shape regression check: fresh
+savvy-core clone (118M+36M git) Mac→FM files-usable 21.4s, git-complete
+25.7s; economic guard field-fired correctly (662KB delta chosen over 7.3MB
+snapshot on the 5k-file update). NEW top levers from C5 buckets: git-plan
+~2.5-3.1s (discover walk ~1-1.4s + other ~0.8s + fingerprint ~0.6s; journal
+preloop now 19ms) and ~4s unaccounted push wall (redeem/flush tails).
+Anomalies filed/open: #459 (mde non_delta cause= line — and seemingly ALL
+warningSink output — never reaches daemon.log; diagnostics-only), Mac `sp7`
+(7 repos re-spawn slow-path EVERY push — fingerprint never re-trusts;
+investigate during soak), two pre-existing main test failures
+(scripts/e2e/dev-backed-scenario.test.ts parsePairToken vs current `rbox
+pair` output — reproduced at 77329d9d). Soak queue: FM greenfield rig
+benchmark (~/code, serial, raw-probe first), local 6-shard test-suite
+parallelization experiment (scripts/ci-shard-tests.ts run locally on the
+32-thread desktop; watch ~/.rbox/daemons litter contention). NO 1.10.0 tag —
+bake first, fresh explicit go required._
+
+_Prior addendum (2026-07-26, later): burn-in DONE on both hosts; #457 merged
 (refwatch crash fix — Linux fs.watch nameless-filename TypeError crash-looped
 FM's daemon; found because FM had never run a live watcher until its re-bind).
 FM re-bound as a FULL device (fresh credential — the 403-telemetry mystery
