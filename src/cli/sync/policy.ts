@@ -43,6 +43,28 @@ export class MassDeleteGuardError extends Error {
   }
 }
 
+/** Design 202: the local view a pull's main line may consume INSTEAD of scanning
+ *  the workspace. `manifest` is the daemon's watcher-maintained truth with every
+ *  unsettled path already stripped (scan-omission semantics, design 108) and
+ *  `deferred` is exactly that unsettled set — it feeds the git oracle's exemption
+ *  list the way a scan's deferrals do. Constructed only by the daemon, and only for
+ *  the single top-level `pull()` of an op. */
+export type TrustedLocalView = {
+  manifest: Manifest;
+  deferred: ReadonlySet<string>;
+};
+
+/** Design 202: the mass-delete guard tripped while the main line was reading a
+ *  TRUSTED (unscanned) local view. Thrown strictly BEFORE any file action executes,
+ *  so the caller may simply re-run the pull scan-backed; it is never a halt. Only
+ *  the scan-backed re-run may halt with {@link MassDeleteGuardError}. */
+export class TrustedViewRefusalError extends Error {
+  constructor(public readonly reason: "mass-delete", message: string) {
+    super(message);
+    this.name = "TrustedViewRefusalError";
+  }
+}
+
 export function makeDeferErrnoReporter(
   sink: (line: string) => void = (l) => console.error(`rbox: ${l}`),
   onFault?: () => void,
