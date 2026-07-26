@@ -48,7 +48,12 @@ import { readLockingHealth, type LockingHealth } from "./sync-mutex.js";
 import { readAmbientDaemonStatusRecord, validDaemonVersion } from "./daemon/ambient-status.js";
 import type { DaemonMode } from "./daemon/ambient-status.js";
 import { serializeGitDeferralLanes } from "./sync-git/git-deferral-json.js";
-import { deferralHygieneDetailKey, reconcileGitDeferrals, type GitBusyDisplayDetail } from "./sync-git/deferral-hygiene.js";
+import { reconcileGitDeferrals } from "./sync-git/deferral-hygiene.js";
+import {
+  refreshStatusDeferralAssertions,
+  statusStaleLockDetail,
+  type StatusDeferralDisplayDetails,
+} from "./status-maintenance.js";
 import { inspectResetJournalSafety } from "./reset-halt-inspection.js";
 import { readResetHaltHealth } from "./reset-health.js";
 import { promotePendingModeIntent } from "./autostart-cmd.js";
@@ -327,10 +332,30 @@ function runningDaemonLabel(version?: string, mode?: DaemonMode): string {
   return details.length === 0 ? "running" : `running (${details.join(", ")})`;
 }
 
-function statusStaleLockDetail(root: string, detail: GitBusyDisplayDetail | undefined): GitBusyDisplayDetail | undefined {
-  if (!detail) return undefined;
-  const relative = path.relative(root, detail.samplePath);
-  return { ...detail, samplePath: relative && !relative.startsWith("..") ? relative : path.basename(detail.samplePath) };
+export interface StatusCacheHint {
+  cache: Pick<HashCache, "prune" | "save">;
+  /** Evaluated only once writeback is authorized, so a skipped save costs nothing. */
+  livePaths: () => Set<string>;
+}
+
+export type StatusCacheWriteReceipt =
+  | { kind: "written" }
+  | { kind: "skipped-not-owner" }
+  | { kind: "write-failed" };
+
+/** Best-effort fallback writeback of the scan's hashcache. It changes no sync
+ * authority, and only a status invocation that still owns the workspace may
+ * write — including at rename, which the daemon may have claimed by then. */
+export async function saveStatusHashCache(
+  root: string,
+  hint: StatusCacheHint,
+  ownsCache: (root: string) => boolean,
+): Promise<StatusCacheWriteReceipt> {
+  if (!ownsCache(root)) return { kind: "skipped-not-owner" };
+  hint.cache.prune(hint.livePaths());
+  let failed = false;
+  await hint.cache.save(root, { beforeRename: () => ownsCache(root) }).catch(() => { failed = true; });
+  return failed ? { kind: "write-failed" } : { kind: "written" };
 }
 
 export async function statusCmd(root: string, opts: StatusCmdOptions = {}): Promise<StatusCmdResult> {
@@ -429,17 +454,18 @@ export async function statusCmdWithDeps(
 
   const accountSummaryP = opts.verbose ? fetchAccountSummary(3500, loadedCredentials) : Promise.resolve(null);
   let state = await loadState(root, syncStreamId(cfg));
-  let hygieneDetails = new Map<string, GitBusyDisplayDetail>();
+  let hygieneDetails: StatusDeferralDisplayDetails = new Map();
   const runDeferralHygiene = async (): Promise<void> => {
-    const result = await (deps.reconcileGitDeferrals ?? reconcileGitDeferrals)(root, cfg, state);
-    state = result.state;
-    hygieneDetails = result.displayDetails;
+    const receipt = await refreshStatusDeferralAssertions(root, {
+      cfg,
+      state,
+      reconcile: deps.reconcileGitDeferrals ?? reconcileGitDeferrals,
+    });
+    if (receipt.kind !== "refreshed") return;
+    state = receipt.state;
+    hygieneDetails = receipt.displayDetails;
   };
-  try {
-    await runDeferralHygiene();
-  } catch {
-    // Fail closed: retain the durable lanes already loaded and keep rendering.
-  }
+  await runDeferralHygiene();
 
   const activityP = daemonStale ? Promise.resolve(undefined) : loadActivity(root);
   const pathWarningsP = (deps.readPathWarnings ?? readPathWarnings)(root);
@@ -464,11 +490,7 @@ export async function statusCmdWithDeps(
   let mustComputeLocal = false;
   if (localBaseSequenceMismatched(activity, state)) {
     state = await loadState(root, syncStreamId(cfg));
-    try {
-      await runDeferralHygiene();
-    } catch {
-      // Fail closed after the reload too; status remains available.
-    }
+    await runDeferralHygiene();
     attributed = attributeActivity(state);
     activity = attributed.activity;
     mustComputeLocal = true;
@@ -571,10 +593,11 @@ export async function statusCmdWithDeps(
     } finally {
       gitRepoFeed.close();
     }
-    if (!deps.readDaemonPidRecord(root).present) {
-      hashCache.prune(new Set(rawLocalManifest.files.map((f) => f.path)));
-      await hashCache.save(root, { beforeRename: () => !deps.readDaemonPidRecord(root).present }).catch(() => {});
-    }
+    await saveStatusHashCache(
+      root,
+      { cache: hashCache, livePaths: () => new Set(rawLocalManifest.files.map((f) => f.path)) },
+      (owned) => !deps.readDaemonPidRecord(owned).present,
+    );
     const projected = projectLocalManifest(rawLocalManifest, state.lastSyncedManifest, matcher);
     const localManifest = projected.manifest;
     // A full status scan owns current read-only disk truth for this invocation.
@@ -792,7 +815,7 @@ export async function statusCmdWithDeps(
           reason: deferral.displayReason,
           canResolve: deferral.canResolve,
           canKeepMine: deferral.canKeepMine,
-          staleLockDetail: statusStaleLockDetail(root, hygieneDetails.get(deferralHygieneDetailKey(deferral.repo, deferral.displayLane))),
+          staleLockDetail: statusStaleLockDetail(root, hygieneDetails, deferral.repo, deferral.displayLane),
         })}`);
       }
     }
@@ -901,7 +924,7 @@ export async function statusCmdWithDeps(
         reason: deferral.displayReason,
         canResolve: deferral.canResolve,
         canKeepMine: deferral.canKeepMine,
-        staleLockDetail: statusStaleLockDetail(root, hygieneDetails.get(deferralHygieneDetailKey(deferral.repo, deferral.displayLane))),
+        staleLockDetail: statusStaleLockDetail(root, hygieneDetails, deferral.repo, deferral.displayLane),
       })}`);
     }
   }
