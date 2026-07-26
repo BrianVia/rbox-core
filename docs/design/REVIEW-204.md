@@ -77,4 +77,24 @@ helper `canonicalManifestHashStreaming` at `:96`) and closes the A7 hole;
 raw-v0 readable everywhere incl. doctor's `chainDiagnostic`; C1-narrow
 matches `plan.ts` dependencies.
 
-## Round 3 — focused re-check of the round-2 folds: pending
+## Round 3 (2026-07-26) — focused re-check, codex gpt-5.6-sol (medium)
+
+Verdict: CHANGES-REQUIRED (2 MEDIUM, 1 LOW) — all refinements of the round-2
+fold text, no new failure class. Raw report: `CODEX-204-R3-FOCUSED.md`.
+
+| # | Finding | Ruling |
+|---|---|---|
+| 1 | Test 9b's "through a real pull" cannot prove daemon-catch non-entry (the catch lives only in `runPull()`). Fallback rule itself confirmed implementable and 106-preserving. | **ACCEPT.** Test 9b split: (a) first `pull()` completes without surfacing `ManifestChainError`; (b) daemon-seam repair-call spy proves repair fires only on a surfaced error. |
+| 2 | Snapshot-cause enum not writer-derivable (`no-base` vs `integrity` decided at the push seam); master-kill commits are raw-v0, so "snapshot cause" is a misnomer. | **ACCEPT.** Log renamed `mde non_delta cause=…`; push seam passes `deltaBaseRejection?: "no-base"\|"integrity"` on `CommitOptions`; epoch mismatch = `integrity`. |
+| 3 | Shorthand anchors remained after the round-2 anchor ruling. | **ACCEPT.** All standalone shorthands qualified; the one remaining `:378,…` list directly follows its fully-qualified file in the same sentence. |
+
+Round-3 residuals were strictly contract-edge/editorial refinements of the
+orchestrator's own fold text (convergence: structural → mechanism →
+contract-edge → editorial across rounds 1→2→3). Fixed and self-certified per
+the dev-cycle convergence rule.
+
+## Status: **ALIGNED (r3, 2026-07-26)**
+
+Implementation may begin. Hard sequencing: §6 test 3 (enforce-mode server
+regression) must be written and GREEN before the Part A default flip lands;
+if it fails, Part A stays frozen and the failure is a design-102 bug.

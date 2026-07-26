@@ -272,10 +272,10 @@ below are hypotheses, not commitments.
 
 The pre-loop (`src/cli/sync-git/plan.ts:376-445`) is NOT journal-only work
 (round-1 blocker, all three reviewers): `publisherAckBindings`
-(`src/cli/sync-git/plan.ts:404-417`) feeds absence-proof rejection (`:1086-1090`), pending
-supersession (`:1231-1240`), and publisher-ACK authoring
-(`src/cli/sync/push.ts:966-985`); the `!ctx` quarantine arm (`:393-399`)
-sets `recoveryAllowsSupersession`, consumed at `:805`. **All of that stays
+(`src/cli/sync-git/plan.ts:404-417`) feeds absence-proof rejection (`src/cli/sync-git/plan.ts:1086-1090`), pending
+supersession (`src/cli/sync-git/plan.ts:1231-1240`), and publisher-ACK authoring
+(`src/cli/sync/push.ts:966-985`); the `!ctx` quarantine arm (`src/cli/sync-git/plan.ts:393-399`)
+sets `recoveryAllowsSupersession`, consumed at `src/cli/sync-git/plan.ts:805`. **All of that stays
 eager.** Only this pair gates on the probe:
 
 ```ts
@@ -299,10 +299,12 @@ claimed in r1 — the lineage cluster stays). C5 measures the actual value.
 - `repoCtxFromDisk`: 8 call sites in `src/cli/sync-git/plan.ts`
   (`:378,458,502,1044,1193,1231,1271,1281`). Memo `rel → ctx` covering ONLY
   the pre-capture read stages (pre-loop + stage-2 decision reads:
-  `:378,458`), **cleared before the capture pool starts**; `:502` runs
+  `src/cli/sync-git/plan.ts:378,458`), **cleared before the capture pool
+  starts**; `src/cli/sync-git/plan.ts:502` runs
   inside `captureWithConfig` AFTER repository capture (invoked from
-  `:1000`) and therefore performs a fresh post-boundary derivation, as do
-  the stage-5 hygiene sites (`:1271,1281`) — the `src/cli/sync-git/plan.ts:1294-1295`
+  `src/cli/sync-git/plan.ts:1000`) and therefore performs a fresh
+  post-boundary derivation, as do the stage-5 hygiene sites
+  (`src/cli/sync-git/plan.ts:1271,1281`) — the `src/cli/sync-git/plan.ts:1294-1295`
   comment warns about exactly the stale-memo-across-capture hazard. No
   change to `gitFingerprint`'s
   internal derivation (no API change this cycle). Reuse design 203's `memo`
@@ -382,9 +384,12 @@ Part B:
 9b. **Evidence-fold fallback (serial-gate HIGH):** corrupted persisted
    manifest + structurally valid meta + advanced delta head ⇒ the pull
    falls back to the cold walk in the SAME operation, succeeds, and
-   self-heals the persisted state; no `ManifestChainError` surfaces and no
-   repair loop triggers. Exercise through a real pull (the daemon repair
-   catch at `src/cli/daemon/daemon.ts:2226` must not be entered).
+   self-heals the persisted state. Two assertions (a direct `pull()` test
+   cannot prove daemon-catch non-entry by success alone): (a) the first
+   `pull()` completes without surfacing `ManifestChainError`; (b) a
+   daemon-seam test with a repair-call spy proves the repair path
+   (`src/cli/daemon/daemon.ts:2226`) is invoked only for a SURFACED
+   chain error, never for an evidence-fold failure that fell back.
 9c. Raw-v0 evidence synthesis: with `RBOX_MDE_SNAPSHOT=0` and
    `recordEvidence:true`, raw-v0 decode synthesizes `manifestMeta`; update
    the inverted mixed-fleet expectation at `src/cli/e2ee-sync.test.ts:704`.
@@ -418,14 +423,18 @@ client-local). Burn-in on the founder fleet as dev builds. Field acceptance:
 
 - `missing` ≲0.2 s; `sent` ≈ changed count.
 - `commit` ≲1 s steady state. Expected: one snapshot-sized wall per ≤17th
-  push (compaction). **Failure discriminator:** the writer logs the
-  snapshot cause on every non-delta commit —
-  `mde snapshot cause=<policy|no-base|integrity|force|economic|chain-cap>`
-  (a small implementation requirement of this design; the enum covers
-  master/delta kill, missing or integrity-rejected deltaBase,
-  repair/forceSnapshot, economic rejection at `src/cli/e2ee-remote.ts:782`,
-  and compaction). Persistent `economic` or `no-base`/`integrity` walls are
-  the bug signatures; `chain-cap` at ~1/17 cadence is healthy.
+  push (compaction). **Failure discriminator:** every non-delta commit
+  logs `mde non_delta cause=<policy|no-base|integrity|force|economic|chain-cap>`
+  ("non_delta" because master-kill commits are raw-v0, not snapshots).
+  Derivability (round-3 finding): `no-base` vs `integrity` is decided at
+  the push seam, which today passes only `options.deltaBase` — the push
+  seam therefore passes an explicit disposition (e.g.
+  `deltaBaseRejection?: "no-base" | "integrity"` on `CommitOptions`) so
+  the writer can log the true cause; epoch mismatch classifies as
+  `integrity`. `economic` (rejection at `src/cli/e2ee-remote.ts:782`) and
+  `chain-cap` are writer-local; `force` = repair/forceSnapshot; `policy` =
+  kill switches. Persistent `economic`/`no-base`/`integrity` walls are the
+  bug signatures; `chain-cap` at ~1/17 cadence is healthy.
 - Receive side: steady-state pulls fetch only the new chain link
   (`fold:"evidence"`, suffix-only) — `download`/`decrypt` AE drop is
   expected and attributable to the FAST_PULL flip.
