@@ -1,4 +1,5 @@
 import {
+  canonicalManifestHashStreaming,
   diffManifests,
   PhaseReport,
   scanManifest,
@@ -9,7 +10,8 @@ import {
   type Manifest,
   type CaseFoldCollisionGroup,
 } from "../../engine/index.js";
-import { applyStateSavePacket, ensureCapableStateLineage, expectedStateNonce, loadState, manifestFromMeta, repoRecordsForState, stateWasStreamMismatch, syncStreamId, validManifestMeta, type GitResolutionPublicationReceipt, type WorkspaceConfig } from "../config.js";
+import { applyStateSavePacket, ensureCapableStateLineage, expectedStateNonce, loadState, manifestFromMeta, repoRecordsForState, stateWasStreamMismatch, syncStreamId, validManifestMeta, type GitResolutionPublicationReceipt, type GlobalManifestMeta, type WorkspaceConfig } from "../config.js";
+import { mdeWritePolicy } from "../e2ee-remote.js";
 import { type CommitOptions, type CommitTimings } from "../remote.js";
 import {
   deferManifest,
@@ -770,18 +772,40 @@ async function runPushAttempt(
 
     let commitTimings: CommitTimings | undefined;
     let commitOptions: CommitOptions | undefined;
-    const manifestMeta = validManifestMeta(state.manifestMeta);
-    const reconstructedBase = manifestMeta ? manifestFromMeta(state.lastSyncedManifest, manifestMeta) : undefined;
-    const deltaBase = process.env.RBOX_MDE_DELTA === "1" && !forceSnapshot && manifestMeta && reconstructedBase &&
-      validateManifest(reconstructedBase).ok && state.lastSyncedSequence === appliedSequence
-      ? { manifest: reconstructedBase, meta: manifestMeta }
-      : undefined;
-    if (deps.blockedFingerprint !== undefined || report.enabled || deltaBase || repair) {
+    // Design 204 §4.2: the writer's policy decides this seam too — no raw env read
+    // here, or the two seams could diverge in a way no wire assertion can see.
+    // Under the master kill (or with deltas killed) NOTHING is reconstructed: the
+    // meta validate + manifestFromMeta + O(N) validateManifest + O(N) canonical
+    // hash below are pure waste for a base the writer would immediately discard.
+    let deltaBase: { manifest: Manifest; meta: GlobalManifestMeta } | undefined;
+    let deltaBaseRejection: "no-base" | "integrity" | undefined;
+    if (mdeWritePolicy().delta && !forceSnapshot) {
+      const manifestMeta = validManifestMeta(state.manifestMeta);
+      const reconstructedBase = manifestMeta ? manifestFromMeta(state.lastSyncedManifest, manifestMeta) : undefined;
+      if (!manifestMeta || !reconstructedBase || !validateManifest(reconstructedBase).ok || state.lastSyncedSequence !== appliedSequence) {
+        deltaBaseRejection = "no-base";
+      } else if (canonicalManifestHashStreaming(reconstructedBase) !== manifestMeta.manifestHash) {
+        // §4.2 base-integrity precondition (REVIEW-204 A7): validManifestMeta
+        // validates SHAPE only. A structurally valid but stale/mismatched meta
+        // publishes a delta whose base no reader can reproduce — and readers only
+        // discover that AFTER the head commits. Bind the meta's manifestHash to
+        // the base we actually reconstructed; any mismatch snapshots instead,
+        // which rewrites the meta and self-heals the next push.
+        deltaBaseRejection = "integrity";
+      } else {
+        deltaBase = { manifest: reconstructedBase, meta: manifestMeta };
+      }
+    }
+    if (deps.blockedFingerprint !== undefined || report.enabled || deltaBase || deltaBaseRejection || repair || forceSnapshot) {
       commitOptions = {
         ...(deps.blockedFingerprint !== undefined ? { blockedFingerprint: deps.blockedFingerprint } : {}),
         ...(report.enabled ? { onCommitTimings: (t: CommitTimings) => (commitTimings = t) } : {}),
         ...(deltaBase ? { deltaBase } : {}),
-        ...(repair ? { forceSnapshot: true } : {}),
+        ...(deltaBaseRejection ? { deltaBaseRejection } : {}),
+        // The 422 chain-link arm (`attemptState.forceSnapshot`) already withheld
+        // deltaBase above; forwarding the flag is behaviour-neutral there and is
+        // what lets the writer log §7's `force` instead of a misleading `no-base`.
+        ...(repair || forceSnapshot ? { forceSnapshot: true } : {}),
       };
     }
     const parentSequence = repair?.parentSequence ?? appliedSequence;
