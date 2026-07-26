@@ -65,6 +65,9 @@ import {
 // coalescer, so the default mirrors the pull-side batch supply margin. Env-tunable.
 const compressionEnabled = () => process.env.RBOX_COMPRESS !== "0";
 const pipelineEnabled = () => /^(1|true|yes|on)$/i.test(process.env.RBOX_PUBLISH_PIPELINE?.trim() ?? "");
+export const preflightDeltaEnabled = () => process.env.RBOX_PREFLIGHT_DELTA !== "0";
+export const fullAuditEnabled = (forceFullAudit?: boolean) =>
+  process.env.RBOX_PREFLIGHT_FULL === "1" || (preflightDeltaEnabled() && forceFullAudit === true);
 const PIPELINE_MIN_FILES = 64;
 export { uploadLaneTiming, uploadLaneTimingSummary };
 export const uploadConcurrencyForTests = uploadConcurrency;
@@ -182,8 +185,8 @@ export async function encryptAndUpload(
       : await fs.mkdtemp(path.join(os.tmpdir(), "rbox-encup-"));
 
     if (usePipeline) {
-      const preflightDelta = process.env.RBOX_PREFLIGHT_DELTA === "1";
-      const fullAudit = process.env.RBOX_PREFLIGHT_FULL === "1" || (preflightDelta && options.forceFullAudit === true);
+      const preflightDelta = preflightDeltaEnabled();
+      const fullAudit = fullAuditEnabled(options.forceFullAudit);
       const result = await withCryptoPool(kek, cfg.keyEpoch, toEncrypt.length, (pool) => runPublishPipeline({
         api,
         root,
@@ -292,8 +295,8 @@ export async function encryptAndUpload(
       // (hits/misses are only known here, after classifyCacheHit ran per file).
       report.recordDetails("address", { cacheHits, cacheMisses }, `hit${cacheHits}m${cacheMisses}`);
 
-    const preflightDelta = process.env.RBOX_PREFLIGHT_DELTA === "1";
-    const fullAudit = process.env.RBOX_PREFLIGHT_FULL === "1" || (preflightDelta && options.forceFullAudit === true);
+    const preflightDelta = preflightDeltaEnabled();
+    const fullAudit = fullAuditEnabled(options.forceFullAudit);
 
     let encShas: string[];
     let introduced = 0;

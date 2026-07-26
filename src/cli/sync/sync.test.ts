@@ -250,6 +250,8 @@ beforeEach(async () => {
   savedPreflightDelta = process.env.RBOX_PREFLIGHT_DELTA;
   savedPreflightFull = process.env.RBOX_PREFLIGHT_FULL;
   savedScanPrune = process.env.RBOX_SCAN_PRUNE;
+  delete process.env.RBOX_PREFLIGHT_DELTA;
+  delete process.env.RBOX_PREFLIGHT_FULL;
   delete process.env.RBOX_SCAN_PRUNE;
   root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-sync-test-"));
   await fs.mkdir(path.join(root, ".rbox", "state"), { recursive: true });
@@ -697,8 +699,7 @@ test("delta preflight recovers a lost carried ref reported by full commit admiss
   expect(remote.hasBlob(carriedAddress)).toBe(true);
 });
 
-test("delta preflight sends only the unique introduced address", async () => {
-  process.env.RBOX_PREFLIGHT_DELTA = "1";
+test("default preflight sends only the unique introduced address", async () => {
   const remote = new FakeRemote();
   await write("carried.txt", "base\n");
   await push(root, cfg, deps(remote));
@@ -732,7 +733,7 @@ test("delta git-identity-only commit sends no blob-preflight request", async () 
 });
 
 test("flag-off preflight preserves manifest order and duplicate addresses", async () => {
-  delete process.env.RBOX_PREFLIGHT_DELTA;
+  process.env.RBOX_PREFLIGHT_DELTA = "0";
   delete process.env.RBOX_PREFLIGHT_FULL;
   const remote = new FakeRemote();
   await write("a.txt", "same\n");
@@ -747,7 +748,7 @@ test("flag-off preflight preserves manifest order and duplicate addresses", asyn
 });
 
 test("full preflight without delta checks the full deduped address set", async () => {
-  delete process.env.RBOX_PREFLIGHT_DELTA;
+  process.env.RBOX_PREFLIGHT_DELTA = "0";
   process.env.RBOX_PREFLIGHT_FULL = "1";
   const remote = new FakeRemote();
   await write("a.txt", "same\n");

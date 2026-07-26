@@ -88,7 +88,11 @@ export async function pullWithMetadata(
   const api = deps.remote ?? apiFor(cfg);
   const state = await report.phase("state-load", () => loadState(root, syncStreamId(cfg), deps.warningSink, deps.syncMutex));
   const validatedMeta = validManifestMeta(state.manifestMeta);
-  const fastPullEnabled = process.env.RBOX_MDE_FAST_PULL === "1";
+  // Design 204 §4.3: DEFAULT-ON. Delta writes without the evidence fast path
+  // regress default receivers — the cold walk fetches the head + every chain link
+  // + the terminal snapshot per pull, i.e. more bytes than one snapshot. Kill
+  // switch RBOX_MDE_FAST_PULL=0 restores the cold walk.
+  const fastPullEnabled = process.env.RBOX_MDE_FAST_PULL !== "0";
   const fastFoldBase = fastPullEnabled && validatedMeta
     ? { manifest: manifestFromMeta(state.lastSyncedManifest, validatedMeta), meta: validatedMeta }
     : undefined;

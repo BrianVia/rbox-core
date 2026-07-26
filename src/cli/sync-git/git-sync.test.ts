@@ -27,6 +27,7 @@ import {
   gitDivergenceFastRepoSource,
   gitFingerprintVersionForBounds,
   gitIncomingKey,
+  formatGitPlanStats,
   formatGitPushLine,
   nextDeferral,
   planGitSections,
@@ -233,6 +234,7 @@ let depsB: SyncDeps;
 const noBackoff = async () => {};
 
 beforeEach(async () => {
+  delete process.env.RBOX_GIT_PLAN_LAZY;
   tmp = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-gitsync-"));
   rootA = path.join(tmp, "A");
   rootB = path.join(tmp, "B");
@@ -261,6 +263,7 @@ beforeEach(async () => {
   depsB = { remote, backoff: noBackoff, onGitLog: (l) => logsB.push(l) };
 });
 afterEach(async () => {
+  delete process.env.RBOX_GIT_PLAN_LAZY;
   delete process.env.RBOX_GIT_REPO_CAP;
   delete process.env.RBOX_GIT_APPLY_CONCURRENCY;
   await fs.rm(tmp, { recursive: true, force: true });
@@ -3348,6 +3351,128 @@ test("gitDivergenceCount heals corrupt divergence cache after correct slow path"
   expect(warm.spawns).toBe(0);
 }, 120_000);
 
+// ── design 204-C: lazy git-plan ─────────────────────────────────────────────────
+
+test("design 204 C1/C15: no-journal lazy plan skips only recovery and is byte-faithful to legacy", async () => {
+  const rel = "lazy-fidelity";
+  const repo = path.join(rootA, rel);
+  await initRepo(repo);
+  await commitFile(repo, "f.txt", "base", "c1");
+  await git(repo, "branch", "topic");
+  await push(rootA, cfgA, depsA);
+  await git(repo, "branch", "-D", "topic");
+  const state = await st(rootA);
+  const matcher = buildIgnoreMatcher(rootA);
+
+  const legacyRecovery: string[] = [];
+  process.env.RBOX_GIT_PLAN_LAZY = "0";
+  const legacy = await planGitSections(rootA, cfgA, state, remote, new Set(), matcher, undefined, noBackoff, {
+    onJournalRecovery: (seen) => legacyRecovery.push(seen),
+  });
+
+  const lazyRecovery: string[] = [];
+  process.env.RBOX_GIT_PLAN_LAZY = "1";
+  const lazy = await planGitSections(rootA, cfgA, state, remote, new Set(), matcher, undefined, noBackoff, {
+    onJournalRecovery: (seen) => lazyRecovery.push(seen),
+  });
+
+  const stableSurface = (value: GitPushPlan) => JSON.parse(JSON.stringify(gitPlanSurface(value)), (key, item) =>
+    key === "generatedAt" || key === "ts" ? "<time>" : item);
+  expect(legacyRecovery).toEqual([rel]);
+  expect(lazyRecovery).toEqual([]);
+  expect(stableSurface(lazy)).toEqual(stableSurface(legacy));
+  expect(JSON.stringify(lazy.publisherAckBindings)).toBe(JSON.stringify(legacy.publisherAckBindings));
+  expect(JSON.stringify(lazy.absentBranchProofs)).toBe(JSON.stringify(legacy.absentBranchProofs));
+}, 60_000);
+
+test("design 204 C1/C13: a journal appearing after the lazy probe is untouched until the next plan", async () => {
+  const rel = "lazy-journal-race";
+  const repo = path.join(rootA, rel);
+  await initRepo(repo);
+  await commitFile(repo, "f.txt", "base", "c1");
+  await push(rootA, cfgA, depsA);
+  const state = await st(rootA);
+  const matcher = buildIgnoreMatcher(rootA);
+  const journalDir = checkoutJournalDir(rootA, rel);
+  const firstRecoveries: string[] = [];
+  process.env.RBOX_GIT_PLAN_LAZY = "1";
+
+  await planGitSections(rootA, cfgA, state, remote, new Set(), matcher, undefined, noBackoff, {
+    onJournalRecovery: (seen) => firstRecoveries.push(seen),
+    afterJournalPreloop: async () => {
+      await fs.mkdir(journalDir, { recursive: true });
+    },
+  });
+  expect(firstRecoveries).toEqual([]);
+  expect(await fs.lstat(journalDir).then(() => true, () => false)).toBe(true);
+
+  const nextRecoveries: string[] = [];
+  await planGitSections(rootA, cfgA, state, remote, new Set(), matcher, undefined, noBackoff, {
+    onJournalRecovery: (seen) => nextRecoveries.push(seen),
+  });
+  expect(nextRecoveries).toEqual([rel]);
+}, 60_000);
+
+test("design 204 C1: pending supersession and publisher ACK binding are identical without a journal", async () => {
+  const rel = "lazy-pending";
+  await prepareSupersedingPending(rel);
+  const state = await st(rootB);
+  const matcher = buildIgnoreMatcher(rootB);
+
+  process.env.RBOX_GIT_PLAN_LAZY = "0";
+  const legacy = await planGitSections(rootB, cfgB, state, remote, new Set(), matcher);
+  process.env.RBOX_GIT_PLAN_LAZY = "1";
+  const lazy = await planGitSections(rootB, cfgB, state, remote, new Set(), matcher);
+
+  expect(lazy.supersededPending).toEqual(legacy.supersededPending);
+  expect(lazy.supersessionIdentityKeys).toEqual(legacy.supersessionIdentityKeys);
+  expect(JSON.stringify(lazy.publisherAckBindings)).toBe(JSON.stringify(legacy.publisherAckBindings));
+  expect({ ...lazy.gitRepos?.[rel], generatedAt: "<time>" })
+    .toEqual({ ...legacy.gitRepos?.[rel], generatedAt: "<time>" });
+}, 90_000);
+
+test("design 204 C2: pre-capture ctx memo is cleared before a dir-to-pointer flip", async () => {
+  const rel = "lazy-ctx-flip";
+  const repo = path.join(rootA, rel);
+  await initRepo(repo);
+  await commitFile(repo, "f.txt", "base", "c1");
+  await push(rootA, cfgA, depsA);
+  await planGitSections(rootA, cfgA, await st(rootA), remote, new Set(), buildIgnoreMatcher(rootA));
+  await markDivergenceCacheTrusted(rootA);
+  process.env.RBOX_GIT_PLAN_LAZY = "1";
+  const observed: Array<{ rel: string; kind?: string }> = [];
+  const movedGit = path.join(rootA, "lazy-ctx-flip-gitdir");
+
+  await planGitSections(rootA, cfgA, await st(rootA), remote, new Set(), buildIgnoreMatcher(rootA), undefined, noBackoff, {
+    beforeCapturePool: async () => {
+      await fs.rename(path.join(repo, ".git"), movedGit);
+      await fs.writeFile(path.join(repo, ".git"), "gitdir: ../lazy-ctx-flip-gitdir\n");
+    },
+    onHygieneCtx: (seen, ctx) => {
+      if (seen === rel) observed.push({ rel: seen, kind: ctx?.kind });
+    },
+  });
+
+  expect(observed.some(({ rel: seen, kind }) => seen === rel && kind === "pointer")).toBe(true);
+}, 60_000);
+
+test("design 204 C5: timing buckets are finite, bounded, nonnegative, and summarized", async () => {
+  const repo = path.join(rootA, "lazy-timings");
+  await initRepo(repo);
+  await commitFile(repo, "f.txt", "base", "c1");
+  process.env.RBOX_GIT_PLAN_LAZY = "1";
+  const plan = await planGitSections(rootA, cfgA, await st(rootA), remote, new Set(), buildIgnoreMatcher(rootA));
+  const stats = plan.gitPlanStats!;
+  for (const key of ["discoverMs", "journalPreloopMs", "fingerprintMs", "hygieneMs", "otherMs"] as const) {
+    expect(Number.isFinite(stats[key])).toBe(true);
+    expect(stats[key]).toBeGreaterThanOrEqual(0);
+    expect(stats[key]).toBeLessThanOrEqual(stats.totalMs);
+  }
+  const summary = formatGitPlanStats(stats);
+  expect(summary).toContain("ms[t");
+  for (const marker of [" d", " j", " f", " h", " o"]) expect(summary).toContain(marker);
+}, 60_000);
+
 // ── design 83: push-side git-plan fingerprint cache ─────────────────────────────
 
 test("steady-state all-hit git plan has no sidecar changes", async () => {
@@ -3511,6 +3636,7 @@ test("design 83: plan cache does not trust a stale carried probe after another r
 }, 40_000);
 
 test("design 83: trusted warm plan is zero-spawn and uses cached parentRel for pointer skips", async () => {
+  process.env.RBOX_GIT_PLAN_LAZY = "1";
   const { W } = await makeInTreeMainWithWorktree();
   const wtSection = (await captureGitState(W, remote.blobStore(), KEK))!;
   const s0 = await st(rootA);

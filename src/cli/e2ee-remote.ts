@@ -70,20 +70,72 @@ export const SIDECAR_THRESHOLD = 4000;
 
 const EMPTY_MANIFEST: Manifest = { generatedAt: "", files: [] };
 
-/** Design 84's rollout flags form a capability LATTICE, not independent axes:
- *  C2 (delta) implies C1 (snapshot envelopes) implies meta collection. Encoded
- *  once here — flag reads stay point-of-use per repo convention, the derived
- *  implication does not.
+/** Why a commit did NOT emit a delta (design 204 §7). The burn-in failure
+ *  discriminator: a persistent `economic`/`no-base`/`integrity` wall is a bug
+ *  signature, `chain-cap` at ~1/17 cadence is healthy compaction. */
+export type MdeNonDeltaCause = "policy" | "no-base" | "integrity" | "force" | "economic" | "chain-cap";
+
+type DeltaDisposition =
+  | { ok: true; base: NonNullable<CommitOptions["deltaBase"]> }
+  | { ok: false; cause: MdeNonDeltaCause };
+
+function deltaDisposition(
+  deltaEnabled: boolean,
+  options: CommitOptions | undefined,
+  keyEpoch: number,
+  accountEpoch: number,
+): DeltaDisposition {
+  if (!deltaEnabled) return { ok: false, cause: "policy" };
+  if (options?.forceSnapshot) return { ok: false, cause: "force" };
+  const base = options?.deltaBase;
+  if (!base) return { ok: false, cause: options?.deltaBaseRejection ?? "no-base" };
+  if (base.meta.keyEpoch !== keyEpoch || base.meta.accountEpoch !== accountEpoch) {
+    return { ok: false, cause: "integrity" };
+  }
+  if (base.meta.chain.length + 1 > MAX_MANIFEST_DELTA_CHAIN) {
+    return { ok: false, cause: "chain-cap" };
+  }
+  return { ok: true, base };
+}
+
+/** Design 204 §4.2 — the manifest-encoding write LATTICE, inverted.
  *
- *  Snapshot writing is DEFAULT-ON since v1.7.1: Phase B readers have shipped
- *  in every release since v1.1.0 and the live device inventory was verified
- *  ≥ that floor before the flip (2026-07-17). RBOX_MDE_SNAPSHOT=0 is the
- *  kill-switch for a fleet that must write raw-v0 for a lagging reader; the
- *  design-149 minReaderVersion gate replaces this manual check before wider
- *  distribution. Delta remains opt-in until its own default flip. */
-function mdeWriteCaps(): { delta: boolean; snapshot: boolean } {
-  const delta = process.env.RBOX_MDE_DELTA === "1";
-  return { delta, snapshot: delta || process.env.RBOX_MDE_SNAPSHOT !== "0" };
+ *  Design 84 shipped `delta ⟹ snapshot` with delta opt-in. Since design 204
+ *  both are default-on and the lattice reads `snapshot ⟹ delta-eligible`:
+ *  `RBOX_MDE_SNAPSHOT=0` is the MASTER kill (adopting design 149 §A3's
+ *  precedence early) and forces chain-free raw-v0 on EVERY arm, including
+ *  repair's `forceSnapshot` — which means "do not emit a delta", never
+ *  "override the master kill". `RBOX_MDE_DELTA=0` kills only deltas.
+ *
+ *  Phase B readers have shipped in every release since v1.1.0 (fold path
+ *  verified against the live device inventory on 2026-07-17); design 149's
+ *  minReaderVersion gate replaces this manual floor check later.
+ *
+ *  ONE policy, consumed at BOTH write seams: here (the writer) and push's
+ *  deltaBase selection. The push seam must never re-read the raw env vars —
+ *  a seam divergence is invisible to any behavioral wire assertion. */
+export function mdeWritePolicy(): { delta: boolean; snapshot: boolean } {
+  const snapshot = process.env.RBOX_MDE_SNAPSHOT !== "0";
+  const delta = snapshot && process.env.RBOX_MDE_DELTA !== "0";
+  if (!snapshot && process.env.RBOX_MDE_DELTA === "1") warnDeltaIgnoredOnce();
+  return { delta, snapshot };
+}
+
+/** The contradictory pair (`RBOX_MDE_SNAPSHOT=0` + `RBOX_MDE_DELTA=1`) is an
+ *  operator misconfiguration, not a per-operation event — but `mdeWritePolicy`
+ *  runs per operation, so the latch must live at module scope (REVIEW-204 O12). */
+let warnedDeltaIgnoredUnderSnapshotKill = false;
+function warnDeltaIgnoredOnce(): void {
+  if (warnedDeltaIgnoredUnderSnapshotKill) return;
+  warnedDeltaIgnoredUnderSnapshotKill = true;
+  process.stderr.write(
+    "rbox: mde_delta_ignored_snapshot_kill_switch — RBOX_MDE_SNAPSHOT=0 forces raw-v0 manifests, so RBOX_MDE_DELTA=1 is ignored\n"
+  );
+}
+
+/** Test-only: clear the module-scope warn-once latch so a suite can assert it. */
+export function resetMdeWritePolicyWarnOnceForTests(): void {
+  warnedDeltaIgnoredUnderSnapshotKill = false;
 }
 
 export function blobRefsForManifest(manifest: Manifest): Array<{ encSha: string; size: number }> | null {
@@ -133,7 +185,7 @@ export class E2eeRemote implements SyncRemote {
     const vh = await this.verifiedHead();
     // Empty heads have no manifest blob decode substeps to time.
     if (!vh) return { sequence: 0, manifest: EMPTY_MANIFEST };
-    const collectMeta = mdeWriteCaps().snapshot || options?.recordEvidence === true || options?.fastFoldBase !== undefined;
+    const collectMeta = mdeWritePolicy().snapshot || options?.recordEvidence === true || options?.fastFoldBase !== undefined;
     const decoded = await this.decodeManifestAt(vh.commit, vh.account, false, options?.onLatestTimings, collectMeta, options?.fastFoldBase);
     return { sequence: vh.sequence, manifest: decoded.manifest, ...(decoded.manifestMeta ? { manifestMeta: decoded.manifestMeta } : {}) };
   }
@@ -271,36 +323,51 @@ export class E2eeRemote implements SyncRemote {
       (signedChain.length > evidenceChainLength + 1 ||
         (headEnvelope.header.baseEncSha === fastFoldBase.meta.encManifestSha &&
           headEnvelope.header.baseManifestHash === fastFoldBase.meta.manifestHash))) {
-      const suffix = signedChain.slice(evidenceChainLength + 1);
-      const suffixWalk = await this.walkAndFoldManifestLinks({
-        links: suffix,
-        kek,
-        keyEpoch: body.keyEpoch,
-        head,
-        initial: {
-          manifest: fastFoldBase.manifest,
-          trustedBaseHash: fastFoldBase.meta.manifestHash,
-          predecessorSha: fastFoldBase.meta.encManifestSha,
-        },
-      });
-      let manifest = suffixWalk.manifest!;
-      if (headEnvelope.header.baseEncSha !== suffixWalk.predecessorSha) {
-        throw new ManifestChainError("head linkage does not match signed chain", { head, failingLink: body.encManifestSha });
-      }
+      // Design 204 §4.3 (serial-gate HIGH): the suffix path trusts the PERSISTED
+      // `manifestHash` as `trustedBaseHash` without re-hashing the persisted
+      // manifest, so locally corrupted persisted state would surface as a
+      // ManifestChainError — and the daemon's one-level repair catch would retry
+      // with the SAME corrupt evidence, wedging an otherwise healthy chain. Any
+      // evidence-fold failure is therefore a cold-walk MISS within this same
+      // operation: fall through and retry without evidence. The cold walk is
+      // authenticated and self-heals the persisted state (exactly what
+      // FAST_PULL-off does today); only ITS failure raises ManifestChainError.
+      // Steady state pays nothing; the corrupt-evidence case pays one slow pull.
       try {
-        manifest = foldDelta(manifest, headEnvelope.ops, headEnvelope.header, suffixWalk.trustedBaseHash);
-      } catch (cause) {
-        throw this.foldChainError(cause, head, body.encManifestSha);
+        const suffix = signedChain.slice(evidenceChainLength + 1);
+        const suffixWalk = await this.walkAndFoldManifestLinks({
+          links: suffix,
+          kek,
+          keyEpoch: body.keyEpoch,
+          head,
+          initial: {
+            manifest: fastFoldBase.manifest,
+            trustedBaseHash: fastFoldBase.meta.manifestHash,
+            predecessorSha: fastFoldBase.meta.encManifestSha,
+          },
+        });
+        let manifest = suffixWalk.manifest!;
+        if (headEnvelope.header.baseEncSha !== suffixWalk.predecessorSha) {
+          throw new ManifestChainError("head linkage does not match signed chain", { head, failingLink: body.encManifestSha });
+        }
+        try {
+          manifest = foldDelta(manifest, headEnvelope.ops, headEnvelope.header, suffixWalk.trustedBaseHash);
+        } catch (cause) {
+          throw this.foldChainError(cause, head, body.encManifestSha);
+        }
+        this.cacheManifest(body.encManifestSha, body.keyEpoch, signedChain, manifest);
+        emitLatestTimings(suffixWalk.downloadMs, suffixWalk.decryptMs, "evidence", suffix.length + 1);
+        return {
+          manifest,
+          kek,
+          // Fast path never refetches the terminal snapshot: propagate its bytes
+          // and accumulate only the fetched suffix + head ciphertexts (§3.4).
+          manifestMeta: makeMeta(headEnvelope.header.resultHash, fastFoldBase.meta.chainBytes + suffixWalk.deltaCipherBytes + encManifest.byteLength, fastFoldBase.meta.snapshotBytes, manifest),
+        };
+      } catch {
+        // Deliberately unclassified: ANY evidence-path failure degrades to the
+        // cold walk below, which re-decides the same question authentically.
       }
-      this.cacheManifest(body.encManifestSha, body.keyEpoch, signedChain, manifest);
-      emitLatestTimings(suffixWalk.downloadMs, suffixWalk.decryptMs, "evidence", suffix.length + 1);
-      return {
-        manifest,
-        kek,
-        // Fast path never refetches the terminal snapshot: propagate its bytes
-        // and accumulate only the fetched suffix + head ciphertexts (§3.4).
-        manifestMeta: makeMeta(headEnvelope.header.resultHash, fastFoldBase.meta.chainBytes + suffixWalk.deltaCipherBytes + encManifest.byteLength, fastFoldBase.meta.snapshotBytes, manifest),
-      };
     }
 
     const chainWalk = await this.walkAndFoldManifestLinks({ links: signedChain, kek, keyEpoch: body.keyEpoch, head });
@@ -729,7 +796,7 @@ export class E2eeRemote implements SyncRemote {
     let encodeMs = 0;
     let encryptMs = 0;
     let uploadMs = 0;
-    const { delta: deltaEnabled, snapshot: snapshotEnabled } = mdeWriteCaps();
+    const { delta: deltaEnabled, snapshot: snapshotEnabled } = mdeWritePolicy();
     const baseBuildArgs = {
       secrets: this.ctx.secrets,
       workspaceId: this.ctx.workspaceId,
@@ -765,13 +832,16 @@ export class E2eeRemote implements SyncRemote {
     let resultManifestHash: string | undefined;
     let emittedChain: string[] | undefined;
     let emittedDelta = false;
-    const deltaBase = deltaEnabled ? options?.deltaBase : undefined;
-    if (!options?.forceSnapshot &&
-      deltaBase &&
-      deltaBase.meta.keyEpoch === epoch &&
-      deltaBase.meta.accountEpoch === account.currentEpoch &&
-      deltaBase.meta.chain.length + 1 <= MAX_MANIFEST_DELTA_CHAIN
-    ) {
+    const disposition = deltaDisposition(deltaEnabled, options, epoch, account.currentEpoch);
+    let nonDeltaCause: MdeNonDeltaCause | undefined;
+    if (!snapshotEnabled) {
+      // MASTER KILL (§4.2): every arm — including repair — emits chain-free
+      // raw-v0. This branch must precede forceSnapshot, or the emergency raw
+      // window would silently leak envelope-v1 snapshots on the repair path.
+      nonDeltaCause = disposition.ok ? undefined : disposition.cause;
+      built = await buildEncoded(new TextEncoder().encode(JSON.stringify(manifest)));
+    } else if (disposition.ok) {
+      const deltaBase = disposition.base;
       const chain = [...deltaBase.meta.chain, deltaBase.meta.encManifestSha];
       const candidate = await encodeDeltaEnvelope(deltaBase.manifest, manifest, {
         baseEncSha: deltaBase.meta.encManifestSha,
@@ -785,14 +855,16 @@ export class E2eeRemote implements SyncRemote {
         emittedChain = chain;
         emittedDelta = true;
       } else {
+        nonDeltaCause = "economic";
         built = await encodeSnapshot(); // §3.3.4: candidate discarded, re-emit as snapshot
       }
-    } else if (snapshotEnabled || options?.forceSnapshot) {
-      // NOTE(84): C2 implies C1; rollout flags are sequential capabilities, not independent axes.
-      built = await encodeSnapshot();
     } else {
-      built = await buildEncoded(new TextEncoder().encode(JSON.stringify(manifest)));
+      nonDeltaCause = disposition.cause;
+      built = await encodeSnapshot();
     }
+    // §7 burn-in discriminator. Sink-only (the daemon supplies one, one-shot CLI
+    // commands do not) so an every-17th-push compaction never becomes user noise.
+    if (nonDeltaCause) this.ctx.warningSink?.(`rbox: mde non_delta cause=${nonDeltaCause}`);
     if (onCommitTimings) encodeMs = Math.max(0, Date.now() - t0 - encryptMs);
     if (onCommitTimings) {
       const t0 = Date.now();
@@ -845,8 +917,8 @@ export class E2eeRemote implements SyncRemote {
         accountEpoch: account.currentEpoch,
         keyEpoch: epoch,
         chain: emittedChain ?? [],
-        chainBytes: emittedDelta ? deltaBase!.meta.chainBytes + built.encManifest.byteLength : 0,
-        snapshotBytes: emittedDelta ? deltaBase!.meta.snapshotBytes : built.encManifest.byteLength,
+        chainBytes: emittedDelta && disposition.ok ? disposition.base.meta.chainBytes + built.encManifest.byteLength : 0,
+        snapshotBytes: emittedDelta && disposition.ok ? disposition.base.meta.snapshotBytes : built.encManifest.byteLength,
         gitRepos: manifest.gitRepos ?? {},
       } } : {}),
     };

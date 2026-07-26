@@ -3,7 +3,7 @@ import path from "node:path";
 import { hashBytes } from "../engine/hash.js";
 import { bootstrapAccount, parseCommit, parseRefset, type DeviceSecrets, type SignedCommit } from "../engine/e2ee/index.js";
 import type { BlobStore } from "../engine/index.js";
-import { E2eeRemote, type AccountKeysDTO, type E2eeApi, type HeadPin, type PinStore, type WsKeyDTO } from "./e2ee-remote.js";
+import { E2eeRemote, type AccountKeysDTO, type E2eeApi, type E2eeContext, type HeadPin, type PinStore, type WsKeyDTO } from "./e2ee-remote.js";
 import { NeedsRebaselineError } from "./remote.js";
 import { BATCH_BLOB_CONTENT_TYPE, BATCH_FRAME_HEADER_BYTES, BATCH_STATUS_BIT, DEFAULT_BATCH_RECORD_BYTES } from "./remote/blob-batch.js";
 import type { WorkspaceConfig } from "./config.js";
@@ -189,8 +189,15 @@ export async function bootstrapOnto(server: FakeServer, accountId: string, devic
 }
 
 /** Construct an `E2eeRemote` bound to a FakeServer for a device's secrets. */
-export function remoteFor(server: FakeServer, secrets: DeviceSecrets, accountId: string, workspaceId: string, now: number): E2eeRemote {
-  return new E2eeRemote(server, { accountId, workspaceId, secrets, now: () => now }, memPin());
+export function remoteFor(
+  server: FakeServer,
+  secrets: DeviceSecrets,
+  accountId: string,
+  workspaceId: string,
+  now: number,
+  ctxOverride: Partial<E2eeContext> = {},
+): E2eeRemote {
+  return new E2eeRemote(server, { accountId, workspaceId, secrets, now: () => now, ...ctxOverride }, memPin());
 }
 
 /** A `WorkspaceConfig` with the blob-encryption KEK loaded from the remote (frozen

@@ -2,6 +2,7 @@ import { applyD1Migrations, env, SELF } from "cloudflare:test";
 import { beforeAll, describe, expect, test } from "vitest";
 import { createHash } from "node:crypto";
 import { WorkspaceSync } from "../src/workspace-sync.js";
+import { FENCE_SET_MAX } from "../src/commit-delta.js";
 import { blobKey } from "../src/util.js";
 import { serializeRefset } from "../../../src/engine/refset.js";
 import type { Env } from "../src/env.js";
@@ -40,13 +41,15 @@ async function fixture(name: string) {
   return { accountId, refSha, manifestSha, sidecarSha, parent, body, request };
 }
 
-function testEnv(mode: "off" | "shadow", points: Array<{ blobs?: string[]; doubles?: number[] }>): Env {
+type DeltaAdmissionMode = "off" | "shadow" | "enforce";
+
+function testEnv(mode: DeltaAdmissionMode, points: Array<{ blobs?: string[]; doubles?: number[] }>): Env {
   return { ...env, RBOX_COMMIT_DELTA_ADMISSION: mode, rbox_metrics: { writeDataPoint: (p: { blobs?: string[]; doubles?: number[] }) => points.push(p) } as AnalyticsEngineDataset };
 }
 
 async function responseBody(
   f: Awaited<ReturnType<typeof fixture>>,
-  mode: "off" | "shadow",
+  mode: DeltaAdmissionMode,
   points: Array<{ blobs?: string[]; doubles?: number[] }> = [],
   overrides: { ctx?: DurableObjectState; request?: Request } = {},
 ) {
@@ -160,6 +163,55 @@ describe("design 102 shadow admission with real D1/R2", () => {
     expect(hasDeltaPoint(points, "parent_unreadable")).toBe(true);
   });
 
+});
+
+describe("design 102 enforce admission with real D1/R2", () => {
+  test("prune-marked carried ref is admitted, reports missing, and does not move head", async () => {
+    const f = await fixture(`delta-enforce-carried-${crypto.randomUUID()}`);
+    await env.rbox_dev_db.prepare("INSERT INTO blob_ref_candidates(account_id,sha256,marked_at) VALUES (?,?,?)")
+      .bind(f.accountId, f.refSha, Date.now()).run();
+    await env.rbox_dev_db.prepare("UPDATE blobs SET present=0 WHERE sha256=?").bind(f.refSha).run();
+    const ctx = fakeCtx(f.parent);
+    const points: Array<{ blobs?: string[]; doubles?: number[] }> = [];
+
+    const result = await responseBody(f, "enforce", points, { ctx });
+
+    expect(result.status).toBe(422);
+    expect(result.body).toMatchObject({
+      error: "unsatisfied_blobs",
+      missing: [f.refSha],
+      missingTotal: 1,
+    });
+    expect(await ctx.storage.kv.get("head")).toEqual({ sequence: 1, commitHash: hash("parent") });
+    expect(points.find((point) => point.blobs?.[0] === "commit.delta" && point.blobs?.[1] === "carried_fenced")?.doubles?.[1])
+      .toBeGreaterThanOrEqual(1);
+    expect(points.some((point) => point.blobs?.[0] === "commit.delta" && point.blobs?.[1] === "fallback")).toBe(false);
+    expect(hasDeltaPoint(points, "childParseMs")).toBe(false);
+  });
+
+  test("marked-probe over cap falls back to full-refset admission", async () => {
+    const f = await fixture(`delta-enforce-over-cap-${crypto.randomUUID()}`);
+    await env.rbox_dev_db.prepare(`
+      WITH digits(n) AS (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9))
+      INSERT INTO blob_ref_candidates(account_id, sha256, marked_at)
+      SELECT ?, printf('%064x', a.n + 10*b.n + 100*c.n + 1000*d.n + 10000*e.n), ?
+      FROM digits a CROSS JOIN digits b CROSS JOIN digits c CROSS JOIN digits d CROSS JOIN digits e
+      WHERE a.n + 10*b.n + 100*c.n + 1000*d.n + 10000*e.n <= ?
+    `).bind(f.accountId, Date.now(), FENCE_SET_MAX).run();
+    await env.rbox_dev_db.prepare("UPDATE blobs SET present=0 WHERE sha256=?").bind(f.refSha).run();
+    const points: Array<{ blobs?: string[]; doubles?: number[] }> = [];
+
+    const result = await responseBody(f, "enforce", points);
+
+    expect(result.status).toBe(422);
+    expect(result.body).toMatchObject({
+      error: "unsatisfied_blobs",
+      missing: [f.refSha],
+      missingTotal: 1,
+    });
+    expect(hasDeltaPoint(points, "marks_over_cap")).toBe(true);
+    expect(hasDeltaPoint(points, "fallback", "marks_over_cap")).toBe(true);
+  });
 });
 
 describe("design 84 server manifestChain admission", () => {

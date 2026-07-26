@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import { createHash, randomBytes } from "node:crypto";
 import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
@@ -20,9 +20,9 @@ import {
 import { canonicalManifestHashStreaming, decodeEnvelope, encodeDeltaEnvelope, ENCRYPT_ADDRESS_CACHE_REL, gitSectionBlobRefs, ManifestChainError, MAX_MANIFEST_DELTA_CHAIN, PhaseReport, restoreEntryToPath, type GitSection, type Manifest } from "../engine/index.js";
 import { encryptManifest, openManifestChainBlob, parseCommit as parseSignedCommit } from "../engine/e2ee/index.js";
 import { encryptFileNameProbe } from "../engine/e2ee/e2ee-e2e.helpers.js";
-import { blobRefsForManifest, E2eeRemote, SIDECAR_THRESHOLD } from "./e2ee-remote.js";
+import { blobRefsForManifest, E2eeRemote, mdeWritePolicy, resetMdeWritePolicyWarnOnceForTests, SIDECAR_THRESHOLD } from "./e2ee-remote.js";
 import { bootstrapOnto, cfgFor as harnessCfg, FakeServer, remoteFor as harnessRemote } from "./e2ee-fake-server.js";
-import { CommitRejectedError } from "./remote.js";
+import { CommitRejectedError, type CommitOptions } from "./remote.js";
 import { formatLatestTimings, pull, push, pushManifest } from "./sync.js";
 import { repairChain } from "./chain-repair.js";
 import { loadState, manifestFromMeta, saveStateUnsafeLegacyOrTest, syncStreamId, validManifestMeta, type WorkspaceConfig } from "./config.js";
@@ -73,6 +73,16 @@ const sidecarShaOf = (manifest: Manifest): string => {
   });
   return shaBytes(serializeRefset(refs));
 };
+
+// Design 204 ambient-env hygiene (the 202/203 lesson — this recurred three times):
+// all three manifest-encoding switches are DEFAULT-ON, so an inherited value from
+// the operator's shell or a leaked assignment in a sibling test silently selects a
+// different arm. Force-delete before every test; each test opts in explicitly.
+beforeEach(() => {
+  delete process.env.RBOX_MDE_DELTA;
+  delete process.env.RBOX_MDE_SNAPSHOT;
+  delete process.env.RBOX_MDE_FAST_PULL;
+});
 
 test("latest timing formatter appends the non-sensitive fold token", () => {
   expect(formatLatestTimings({ downloadMs: 1, decryptMs: 2, parseMs: 3, encBytes: 4, fold: "evidence", foldLinks: 2 })).toEndWith("4B fold=evidence f2");
@@ -701,7 +711,7 @@ test("C2 commit emits a chained delta and a cold peer folds it with propagated m
   });
 });
 
-test("mixed fleet reads snapshot/delta history with the raw kill-switch, restores it, then writes raw-v0 without manifest meta", async () => {
+test("mixed fleet reads snapshot/delta history with the raw kill-switch, restores it, then writes raw-v0 that clears manifest meta", async () => {
   const server = new FakeServer();
   const secrets = await bootstrapOnto(server, ACCT, "devA-mixed-fleet", NOW);
   const writer = await remoteFor(server, secrets);
@@ -743,7 +753,15 @@ test("mixed fleet reads snapshot/delta history with the raw kill-switch, restore
     const root = await tmp();
     const cfg = await cfgFor(root, secrets, peer);
     await pull(root, cfg, { remote: peer });
-    expect((await loadState(root, syncStreamId(cfg))).manifestMeta).toBeUndefined();
+    // Design 204 test 9c (the r2 serial-gate ruling, ACCEPTED): default-on
+    // FAST_PULL sets recordEvidence, so the pull collects and persists fold
+    // evidence EVEN under the RBOX_MDE_SNAPSHOT=0 emergency raw window. That is
+    // desirable — evidence only accelerates future pulls, and keeping it live
+    // means the window costs the receiver nothing. The pre-204 expectation here
+    // was "raw kill-switch ⇒ no persisted meta"; it inverts by design.
+    const metaUnderRawWindow = (await loadState(root, syncStreamId(cfg))).manifestMeta;
+    expect(metaUnderRawWindow).toBeDefined();
+    expect(validManifestMeta(metaUnderRawWindow)).toEqual(metaUnderRawWindow);
     await fs.symlink("../target/raw-v0", path.join(root, "mixed-legacy-write"));
     expect((await push(root, cfg, { remote: peer })).sequence).toBe(3);
 
@@ -949,7 +967,9 @@ test("D history fold LRU avoids refetching the same authenticated manifest blob"
   expect(server.store.getCalls).toHaveLength(1);
 });
 
-test("D pull flag is off by default and enables the persisted-state fast base only at exactly 1", async () => {
+// Design 204 §4.3 test 9: FAST_PULL is DEFAULT-ON (the pre-204 assertion was the
+// exact inverse — "off by default, on only at exactly 1"). Only "0" disables it.
+test("D pull evidence base is default-on and only RBOX_MDE_FAST_PULL=0 restores the cold walk", async () => {
   await withManifestEncodingFlags(undefined, "1", async () => {
     const server = new FakeServer();
     const secrets = await bootstrapOnto(server, ACCT, "devA-fast-pull-flag", NOW);
@@ -965,14 +985,23 @@ test("D pull flag is off by default and enables the persisted-state fast base on
     const middle: Manifest = { ...base, generatedAt: "middle", files: base.files.map((f, i) => i === 10 ? { ...f, mode: 0o755 } : f) };
     const second = await writer.commit(1, secrets.deviceId, middle, { deltaBase: { manifest: base, meta: first.manifestMeta! } });
     server.store.getCalls = [];
-    await withFastPullFlag(undefined, () => pull(root, cfg, { remote: puller }));
+    // Kill switch: cold-walk behaviour preserved (head + every signed link).
+    await withFastPullFlag("0", () => pull(root, cfg, { remote: puller }));
     expect(server.store.getCalls).toEqual([second.manifestMeta!.encManifestSha, ...second.manifestMeta!.chain]);
 
     const target: Manifest = { ...middle, generatedAt: "target", files: middle.files.map((f, i) => i === 11 ? { ...f, mode: 0o700 } : f) };
     const third = await writer.commit(2, secrets.deviceId, target, { deltaBase: { manifest: middle, meta: second.manifestMeta! } });
     server.store.getCalls = [];
-    await withFastPullFlag("1", () => pull(root, cfg, { remote: puller }));
+    // Unset (the fleet default) takes the suffix-only evidence path.
+    await withFastPullFlag(undefined, () => pull(root, cfg, { remote: puller }));
     expect(server.store.getCalls).toEqual([third.manifestMeta!.encManifestSha]);
+
+    const fourthManifest: Manifest = { ...target, generatedAt: "fourth", files: target.files.map((f, i) => i === 12 ? { ...f, mode: 0o711 } : f) };
+    const fourth = await writer.commit(3, secrets.deviceId, fourthManifest, { deltaBase: { manifest: target, meta: third.manifestMeta! } });
+    server.store.getCalls = [];
+    // An explicit "1" is still honoured (no operator's pinned config breaks).
+    await withFastPullFlag("1", () => pull(root, cfg, { remote: puller }));
+    expect(server.store.getCalls).toEqual([fourth.manifestMeta!.encManifestSha]);
   });
 });
 
@@ -1658,7 +1687,7 @@ test("D fast pull rejects an intermediate SIGNED-chain substitution (same snapsh
   });
 }, 60_000);
 
-test("R4 evidence suffix rejects bytes substituted under a signed link address without refetching the prefix", async () => {
+test("R4 evidence suffix demotes bytes substituted under a signed link address to a cold walk that fails closed", async () => {
   await withManifestEncodingFlags("1", "1", async () => {
     const server = new FakeServer();
     const secrets = await bootstrapOnto(server, ACCT, "devA-r4-suffix-address", NOW);
@@ -1675,9 +1704,18 @@ test("R4 evidence suffix rejects bytes substituted under a signed link address w
     server.store.blobs.set(third.manifestMeta!.encManifestSha, new Uint8Array(server.store.blobs.get(first.manifestMeta!.encManifestSha)!));
     server.store.getCalls = [];
     await expect(peer.latest({ fastFoldBase: { manifest: m1, meta: second.manifestMeta! } })).rejects.toBeInstanceOf(ManifestChainError);
-    expect(server.store.getCalls).toEqual([fourth.manifestMeta!.encManifestSha, third.manifestMeta!.encManifestSha]);
-    expect(server.store.getCalls).not.toContain(first.manifestMeta!.encManifestSha);
-    expect(server.store.getCalls).not.toContain(second.manifestMeta!.encManifestSha);
+    // Design 204 §4.3: the suffix walk still refuses the substituted bytes, but an
+    // evidence-fold failure is now a MISS, not a verdict — the same operation
+    // retries cold (head + every signed link). Only the cold walk's own failure
+    // raises, which is why the error still surfaces. The prefix refetch is the
+    // deliberate "one slow pull" price of not wedging on corrupt local evidence.
+    expect(server.store.getCalls).toEqual([
+      fourth.manifestMeta!.encManifestSha,
+      third.manifestMeta!.encManifestSha,
+      first.manifestMeta!.encManifestSha,
+      second.manifestMeta!.encManifestSha,
+      third.manifestMeta!.encManifestSha,
+    ]);
   });
 }, 60_000);
 
@@ -1707,4 +1745,456 @@ test("repairChain converges on a readable head that raced in BEFORE the repair s
     expect(outcome.kind === "converged" && outcome.sequence).toBe(3);
     expect(server.commits).toHaveLength(3); // no repair commit published
   });
+}, 60_000);
+
+// ---------------------------------------------------------------------------
+// Design 204 Part B — manifest delta commits default-on (§4.2/§4.3, §6 tests
+// 5-11 + 9b/9c, §7's non-delta cause log). Every test below runs with the
+// ambient switches DELETED by the file-wide beforeEach, so "no env" here means
+// exactly what a fleet device sees.
+// ---------------------------------------------------------------------------
+
+/** A real on-disk workspace of symlinks. Symlink entries carry no blob (only
+ *  `type:"file"` entries need an `encSha`), so a push is scan + commit with zero
+ *  upload traffic — and 300 of them make a snapshot comfortably larger than the
+ *  16 one-entry deltas the chain cap allows, so the economic guard never
+ *  pre-empts the mechanism under test. */
+async function seedSymlinkWorkspace(root: string, count = 300): Promise<void> {
+  await fs.mkdir(path.join(root, "partition"), { recursive: true });
+  await Promise.all(Array.from({ length: count }, (_, i) =>
+    fs.symlink(`../target/${hex(i + 1)}`, path.join(root, "partition", i.toString().padStart(4, "0")))));
+}
+
+async function retargetSymlink(root: string, index: number, tag: string): Promise<void> {
+  const link = path.join(root, "partition", index.toString().padStart(4, "0"));
+  await fs.unlink(link);
+  await fs.symlink(`../target/${tag}`, link);
+}
+
+/** An E2eeRemote whose warning sink is captured — production wires the daemon
+ *  logger here, which is where §7's `mde non_delta cause=` line lands. */
+function sinkRemoteFor(server: FakeServer, secrets: DeviceSecrets, lines: string[]): E2eeRemote {
+  return harnessRemote(server, secrets, ACCT, WS, NOW + 5000, {
+    warningSink: (line: string) => { lines.push(line); },
+  });
+}
+
+const nonDeltaCauses = (lines: readonly string[]): string[] =>
+  lines.filter((line) => line.includes("mde non_delta cause=")).map((line) => line.split("cause=")[1]!);
+
+/** Capture what the push seam actually hands the writer — a seam divergence
+ *  (e.g. push building a base the writer discards) is invisible on the wire. */
+function recordCommitOptions(remote: E2eeRemote): Array<CommitOptions | undefined> {
+  const seen: Array<CommitOptions | undefined> = [];
+  const original = remote.commit.bind(remote);
+  remote.commit = ((parentSequence: number, deviceId: string, manifest: Manifest, options?: CommitOptions) => {
+    seen.push(options);
+    return original(parentSequence, deviceId, manifest, options);
+  }) as E2eeRemote["commit"];
+  return seen;
+}
+
+test("204/5 default-on steady state publishes a chained delta a cold peer folds exactly", async () => {
+  const server = new FakeServer();
+  const secrets = await bootstrapOnto(server, ACCT, "devA-204-default-on", NOW);
+  const lines: string[] = [];
+  const pusher = sinkRemoteFor(server, secrets, lines);
+  const root = await tmp();
+  const cfg = await cfgFor(root, secrets, pusher);
+  await seedSymlinkWorkspace(root);
+
+  // Genesis has no persisted evidence yet: snapshot, and §7 names the reason.
+  const genesis = await push(root, cfg, { remote: pusher });
+  expect(genesis.sequence).toBe(1);
+  expect(await wireKind(server, pusher, 0)).toBe("snapshot");
+  expect(nonDeltaCauses(lines)).toEqual(["no-base"]);
+  const afterGenesis = await loadState(root, syncStreamId(cfg));
+  expect(validManifestMeta(afterGenesis.manifestMeta)).toEqual(afterGenesis.manifestMeta);
+
+  lines.length = 0;
+  await retargetSymlink(root, 7, "steady-state-v2");
+  expect((await push(root, cfg, { remote: pusher })).sequence).toBe(2);
+  expect(await wireKind(server, pusher, 1)).toBe("delta");
+  expect(nonDeltaCauses(lines)).toEqual([]); // a delta commit logs nothing
+
+  const body = parseSignedCommit(server.commits[1]!);
+  expect(body.manifestChain).toEqual([afterGenesis.manifestMeta!.encManifestSha]);
+  const afterDelta = await loadState(root, syncStreamId(cfg));
+  expect(afterDelta.manifestMeta!.chain).toEqual(body.manifestChain);
+  expect(canonicalManifestHashStreaming(manifestFromMeta(afterDelta.lastSyncedManifest, afterDelta.manifestMeta!)))
+    .toBe(afterDelta.manifestMeta!.manifestHash);
+
+  // A cold peer with no evidence at all folds the chain to exactly what shipped.
+  const peer = await remoteFor(server, secrets);
+  expect((await peer.latest()).manifest).toEqual(afterDelta.lastSyncedManifest);
+}, 60_000);
+
+test("204/6 kill-switch matrix: delta off, master kill, repair under master kill", async () => {
+  // RBOX_MDE_DELTA=0 — snapshot despite a valid base, and the push seam builds
+  // NO deltaBase (the point of consuming one policy at both seams).
+  await withManifestEncodingFlags(undefined, "0", async () => {
+    const server = new FakeServer();
+    const secrets = await bootstrapOnto(server, ACCT, "devA-204-delta-off", NOW);
+    const lines: string[] = [];
+    const pusher = sinkRemoteFor(server, secrets, lines);
+    const seen = recordCommitOptions(pusher);
+    const root = await tmp();
+    const cfg = await cfgFor(root, secrets, pusher);
+    await seedSymlinkWorkspace(root);
+    await push(root, cfg, { remote: pusher });
+    const withMeta = await loadState(root, syncStreamId(cfg));
+    expect(withMeta.manifestMeta).toBeDefined(); // a valid base exists...
+    lines.length = 0;
+    await retargetSymlink(root, 3, "delta-off");
+    await push(root, cfg, { remote: pusher });
+    expect(await wireKind(server, pusher, 1)).toBe("snapshot"); // ...and is still not used
+    expect(seen.at(-1)?.deltaBase).toBeUndefined();
+    expect(seen.at(-1)?.deltaBaseRejection).toBeUndefined();
+    expect(nonDeltaCauses(lines)).toEqual(["policy"]);
+  });
+
+  // RBOX_MDE_SNAPSHOT=0 — the MASTER kill: raw-v0, no chain, no deltaBase.
+  await withManifestEncodingFlags("0", undefined, async () => {
+    const server = new FakeServer();
+    const secrets = await bootstrapOnto(server, ACCT, "devA-204-master-kill", NOW);
+    const lines: string[] = [];
+    const pusher = sinkRemoteFor(server, secrets, lines);
+    const seen = recordCommitOptions(pusher);
+    const root = await tmp();
+    const cfg = await cfgFor(root, secrets, pusher);
+    await seedSymlinkWorkspace(root);
+    await push(root, cfg, { remote: pusher });
+    expect(await wireKind(server, pusher, 0)).toBe("raw");
+    await retargetSymlink(root, 4, "master-kill");
+    lines.length = 0;
+    await push(root, cfg, { remote: pusher });
+    expect(await wireKind(server, pusher, 1)).toBe("raw");
+    expect(parseSignedCommit(server.commits[1]!).manifestChain).toEqual([]);
+    expect(seen.every((options) => options?.deltaBase === undefined)).toBe(true);
+    expect(nonDeltaCauses(lines)).toEqual(["policy"]);
+  });
+
+  // The master kill outranks forceSnapshot: repair emits raw-v0, NOT a snapshot
+  // envelope. `forceSnapshot` means "no delta", never "override the kill".
+  const server = new FakeServer();
+  const secrets = await bootstrapOnto(server, ACCT, "devA-204-repair-under-kill", NOW);
+  const lines: string[] = [];
+  const writer = sinkRemoteFor(server, secrets, lines);
+  const base = deltaSizedManifest("repair-under-kill");
+  const snapshot = await writer.commit(0, secrets.deviceId, base);
+  expect(await wireKind(server, writer, 0)).toBe("snapshot");
+  const target: Manifest = { ...base, generatedAt: "repaired", files: base.files.map((f, i) => i === 5 ? { ...f, mode: 0o755 } : f) };
+  lines.length = 0;
+  const repaired = await withManifestEncodingFlags("0", undefined, () =>
+    writer.commit(1, secrets.deviceId, target, { deltaBase: { manifest: base, meta: snapshot.manifestMeta! }, forceSnapshot: true }));
+  expect(await wireKind(server, writer, 1)).toBe("raw");
+  expect(parseSignedCommit(server.commits[1]!).manifestChain).toEqual([]);
+  expect(repaired.manifestMeta).toBeUndefined();
+  expect(nonDeltaCauses(lines)).toEqual(["policy"]);
+}, 60_000);
+
+test("204/6 the contradictory kill-switch pair warns exactly once per process", async () => {
+  resetMdeWritePolicyWarnOnceForTests();
+  const written: string[] = [];
+  const original = process.stderr.write.bind(process.stderr);
+  process.stderr.write = ((chunk: unknown, ...rest: unknown[]) => {
+    written.push(String(chunk));
+    return (original as (...args: never[]) => boolean)(...([chunk, ...rest] as never[]));
+  }) as typeof process.stderr.write;
+  try {
+    await withManifestEncodingFlags("0", "1", async () => {
+      for (let i = 0; i < 5; i++) expect(mdeWritePolicy()).toEqual({ delta: false, snapshot: false });
+    });
+  } finally {
+    process.stderr.write = original;
+  }
+  expect(written.filter((line) => line.includes("mde_delta_ignored_snapshot_kill_switch"))).toHaveLength(1);
+  // Non-contradictory configurations never warn, before or after the latch.
+  resetMdeWritePolicyWarnOnceForTests();
+  expect(mdeWritePolicy()).toEqual({ delta: true, snapshot: true });
+  await withManifestEncodingFlags("0", undefined, async () => {
+    expect(mdeWritePolicy()).toEqual({ delta: false, snapshot: false });
+  });
+  await withManifestEncodingFlags(undefined, "0", async () => {
+    expect(mdeWritePolicy()).toEqual({ delta: false, snapshot: true });
+  });
+});
+
+test("204/7 sixteen real consecutive delta commits, then the chain cap snapshots", async () => {
+  const server = new FakeServer();
+  const secrets = await bootstrapOnto(server, ACCT, "devA-204-chain-cap", NOW);
+  const lines: string[] = [];
+  const pusher = sinkRemoteFor(server, secrets, lines);
+  const root = await tmp();
+  const cfg = await cfgFor(root, secrets, pusher);
+  await seedSymlinkWorkspace(root);
+  await push(root, cfg, { remote: pusher });
+  expect(await wireKind(server, pusher, 0)).toBe("snapshot");
+
+  // Every link below is a REAL push through sync.ts against the previous real
+  // commit's persisted evidence — no injected chain, no forced byte equality.
+  for (let link = 1; link <= MAX_MANIFEST_DELTA_CHAIN; link++) {
+    lines.length = 0;
+    await retargetSymlink(root, link, `chain-cap-${link}`);
+    expect((await push(root, cfg, { remote: pusher })).sequence).toBe(link + 1);
+    expect(await wireKind(server, pusher, link)).toBe("delta");
+    expect(parseSignedCommit(server.commits[link]!).manifestChain).toHaveLength(link);
+    expect(nonDeltaCauses(lines)).toEqual([]);
+  }
+
+  lines.length = 0;
+  await retargetSymlink(root, 200, "chain-cap-overflow");
+  expect((await push(root, cfg, { remote: pusher })).sequence).toBe(MAX_MANIFEST_DELTA_CHAIN + 2);
+  expect(await wireKind(server, pusher)).toBe("snapshot");
+  expect(parseSignedCommit(server.commits.at(-1)!).manifestChain ?? []).toEqual([]);
+  expect(nonDeltaCauses(lines)).toEqual(["chain-cap"]);
+
+  // Compaction restarts the cadence, and a cold peer reads the post-cap head.
+  const peer = await remoteFor(server, secrets);
+  expect((await peer.latest()).manifest).toEqual((await loadState(root, syncStreamId(cfg))).lastSyncedManifest);
+  await retargetSymlink(root, 201, "post-compaction");
+  await push(root, cfg, { remote: pusher });
+  expect(await wireKind(server, pusher)).toBe("delta");
+  expect(parseSignedCommit(server.commits.at(-1)!).manifestChain).toHaveLength(1);
+}, 180_000);
+
+test("204/8 a real candidate that loses the economic comparison snapshots", async () => {
+  const server = new FakeServer();
+  const secrets = await bootstrapOnto(server, ACCT, "devA-204-economic", NOW);
+  const lines: string[] = [];
+  const pusher = sinkRemoteFor(server, secrets, lines);
+  const root = await tmp();
+  const cfg = await cfgFor(root, secrets, pusher);
+  await seedSymlinkWorkspace(root);
+  await push(root, cfg, { remote: pusher });
+  await retargetSymlink(root, 1, "economic-warmup");
+  await push(root, cfg, { remote: pusher });
+  expect(await wireKind(server, pusher, 1)).toBe("delta");
+  const chained = await loadState(root, syncStreamId(cfg));
+  expect(chained.manifestMeta!.chainBytes).toBeGreaterThan(0);
+
+  // Retarget EVERY entry: the delta's op list carries the whole manifest plus a
+  // linkage header, so chainBytes + candidate can no longer beat one snapshot.
+  // This is a real candidate genuinely losing the comparison — nothing injected.
+  for (let i = 0; i < 300; i++) await retargetSymlink(root, i, `economic-${hex(i + 900_000)}`);
+  lines.length = 0;
+  await push(root, cfg, { remote: pusher });
+  expect(await wireKind(server, pusher)).toBe("snapshot");
+  expect(parseSignedCommit(server.commits.at(-1)!).manifestChain ?? []).toEqual([]);
+  expect(nonDeltaCauses(lines)).toEqual(["economic"]);
+  const healed = await loadState(root, syncStreamId(cfg));
+  expect(healed.manifestMeta!.chain).toEqual([]);
+  expect(healed.manifestMeta!.chainBytes).toBe(0);
+  const peer = await remoteFor(server, secrets);
+  expect((await peer.latest()).manifest).toEqual(healed.lastSyncedManifest);
+}, 120_000);
+
+/** Local state whose persisted manifest no longer matches its (structurally
+ *  valid) meta, under an advanced delta head — the §4.3 corruption wedge. */
+async function corruptEvidenceFixture(deviceId: string) {
+  const server = new FakeServer();
+  const secrets = await bootstrapOnto(server, ACCT, deviceId, NOW);
+  const writer = await remoteFor(server, secrets);
+  const receiver = await remoteFor(server, secrets);
+  const root = await tmp();
+  const cfg = await cfgFor(root, secrets, receiver);
+  const base = deltaSizedManifest(`${deviceId}-base`);
+  const first = await writer.commit(0, secrets.deviceId, base);
+  await pull(root, cfg, { remote: receiver });
+
+  const corrupted = await loadState(root, syncStreamId(cfg));
+  corrupted.lastSyncedManifest = {
+    ...corrupted.lastSyncedManifest,
+    files: corrupted.lastSyncedManifest.files.map((entry, index) =>
+      index === 17 ? { ...entry, symlinkTarget: "../target/locally-corrupted" } : entry),
+  };
+  await saveStateUnsafeLegacyOrTest(root, corrupted);
+  const reloaded = await loadState(root, syncStreamId(cfg));
+  // Structurally valid meta — only the CONTENT binding is broken, which is
+  // exactly what validManifestMeta cannot see.
+  expect(validManifestMeta(reloaded.manifestMeta)).toEqual(reloaded.manifestMeta);
+  expect(canonicalManifestHashStreaming(manifestFromMeta(reloaded.lastSyncedManifest, reloaded.manifestMeta!)))
+    .not.toBe(reloaded.manifestMeta!.manifestHash);
+
+  const target: Manifest = { ...base, generatedAt: `${deviceId}-target`, files: base.files.map((f, i) => i === 2 ? { ...f, mode: 0o755 } : f) };
+  const second = await writer.commit(1, secrets.deviceId, target, { deltaBase: { manifest: base, meta: first.manifestMeta! } });
+  return { server, secrets, receiver, root, cfg, target, second };
+}
+
+test("204/9b corrupt persisted evidence falls back to the cold walk in the same pull and self-heals", async () => {
+  const { server, receiver, root, cfg, target, second } = await corruptEvidenceFixture("devA-204-fold-fallback");
+  server.store.getCalls = [];
+  const report = PhaseReport.pull();
+
+  // (a) No ManifestChainError is SURFACED: the evidence fold failed, and the very
+  // same operation retried without evidence rather than handing the daemon an
+  // error whose repair would replay the identical corrupt evidence.
+  await pull(root, cfg, { remote: receiver, report });
+
+  expect((report.toJSON().phases.latest!.details as { fold?: string }).fold).toBe("coldwalk");
+  expect(server.store.getCalls).toEqual([second.manifestMeta!.encManifestSha, ...second.manifestMeta!.chain]);
+  const healed = await loadState(root, syncStreamId(cfg));
+  expect(healed.lastSyncedManifest).toEqual(target);
+  expect(canonicalManifestHashStreaming(manifestFromMeta(healed.lastSyncedManifest, healed.manifestMeta!)))
+    .toBe(healed.manifestMeta!.manifestHash);
+
+  // The healed state is immediately back on the fast path — one slow pull, once.
+  server.store.getCalls = [];
+  const steady = PhaseReport.pull();
+  await pull(root, cfg, { remote: receiver, report: steady });
+  expect(server.store.getCalls).toEqual([]);
+  expect((steady.toJSON().phases.latest!.details as { fold?: string }).fold).toBe("evidence");
+}, 60_000);
+
+test("204/9b the daemon repair seam fires only for a SURFACED chain error", async () => {
+  // Mirrors src/cli/daemon/daemon.ts's runPull catch exactly: repair is entered
+  // if and only if pull() throws ManifestChainError out to the daemon.
+  const repairSeam = async (root: string, cfg: WorkspaceConfig, remote: E2eeRemote, onRepair: () => void) => {
+    try {
+      return await pull(root, cfg, { remote });
+    } catch (error) {
+      if (!(error instanceof ManifestChainError)) throw error;
+      onRepair();
+      return [];
+    }
+  };
+
+  // Evidence-fold failure that fell back: the seam is never entered.
+  const fallback = await corruptEvidenceFixture("devA-204-repair-spy-fallback");
+  let repairs = 0;
+  await repairSeam(fallback.root, fallback.cfg, fallback.receiver, () => { repairs++; });
+  expect(repairs).toBe(0);
+  expect((await loadState(fallback.root, syncStreamId(fallback.cfg))).lastSyncedManifest).toEqual(fallback.target);
+
+  // A genuinely broken chain (the link blob is gone) still surfaces and repairs.
+  const broken = await corruptEvidenceFixture("devA-204-repair-spy-broken");
+  broken.server.store.blobs.delete(broken.second.manifestMeta!.chain[0]!);
+  let brokenRepairs = 0;
+  await repairSeam(broken.root, broken.cfg, broken.receiver, () => { brokenRepairs++; });
+  expect(brokenRepairs).toBe(1);
+}, 60_000);
+
+test("204/9c a raw-v0 head under the master kill still synthesizes fold evidence on request", async () => {
+  await withManifestEncodingFlags("0", undefined, async () => {
+    const server = new FakeServer();
+    const secrets = await bootstrapOnto(server, ACCT, "devA-204-raw-evidence", NOW);
+    const writer = await remoteFor(server, secrets);
+    const peer = await remoteFor(server, secrets);
+    const manifest = deltaSizedManifest("raw-evidence");
+    const committed = await writer.commit(0, secrets.deviceId, manifest);
+    expect(await wireKind(server, writer, 0)).toBe("raw");
+    expect(committed.manifestMeta).toBeUndefined(); // the WRITER records none
+
+    // Default-on FAST_PULL sets recordEvidence, so the READER synthesizes meta
+    // from the raw head. Ruled harmless and desirable (r2 serial gate): evidence
+    // only accelerates later pulls and stays live through the raw window.
+    const evidence = await peer.latest({ recordEvidence: true });
+    expect(evidence.manifestMeta).toBeDefined();
+    expect(evidence.manifestMeta!.chain).toEqual([]);
+    expect(evidence.manifestMeta!.chainBytes).toBe(0);
+    expect(evidence.manifestMeta!.snapshotBytes).toBeGreaterThan(0);
+    expect(evidence.manifestMeta!.manifestHash).toBe(canonicalManifestHashStreaming(manifest));
+
+    // Without the request, the raw window collects nothing (unchanged surface).
+    expect((await (await remoteFor(server, secrets)).latest()).manifestMeta).toBeUndefined();
+  });
+});
+
+test("204/10 a stale meta that mismatches its reconstructed base snapshots and rewrites the meta", async () => {
+  const server = new FakeServer();
+  const secrets = await bootstrapOnto(server, ACCT, "devA-204-integrity", NOW);
+  const lines: string[] = [];
+  const pusher = sinkRemoteFor(server, secrets, lines);
+  const seen = recordCommitOptions(pusher);
+  const root = await tmp();
+  const cfg = await cfgFor(root, secrets, pusher);
+  await seedSymlinkWorkspace(root);
+  await push(root, cfg, { remote: pusher });
+  await retargetSymlink(root, 2, "integrity-warmup");
+  await push(root, cfg, { remote: pusher });
+  expect(await wireKind(server, pusher, 1)).toBe("delta");
+
+  // Structurally valid meta, content binding broken: pre-204 this published a
+  // delta against a base no reader can reproduce, and readers only found out
+  // after the head committed (REVIEW-204 A7).
+  const stale = await loadState(root, syncStreamId(cfg));
+  stale.lastSyncedManifest = {
+    ...stale.lastSyncedManifest,
+    files: stale.lastSyncedManifest.files.map((entry, index) =>
+      index === 40 ? { ...entry, symlinkTarget: "../target/stale-meta-drift" } : entry),
+  };
+  await saveStateUnsafeLegacyOrTest(root, stale);
+  const drifted = await loadState(root, syncStreamId(cfg));
+  expect(validManifestMeta(drifted.manifestMeta)).toEqual(drifted.manifestMeta);
+  expect(canonicalManifestHashStreaming(manifestFromMeta(drifted.lastSyncedManifest, drifted.manifestMeta!)))
+    .not.toBe(drifted.manifestMeta!.manifestHash);
+
+  lines.length = 0;
+  await retargetSymlink(root, 6, "integrity-push");
+  await push(root, cfg, { remote: pusher });
+  expect(await wireKind(server, pusher)).toBe("snapshot");
+  expect(seen.at(-1)?.deltaBase).toBeUndefined();
+  expect(seen.at(-1)?.deltaBaseRejection).toBe("integrity");
+  expect(nonDeltaCauses(lines)).toEqual(["integrity"]);
+
+  // Meta rewritten and re-bound to the manifest that actually shipped...
+  const healed = await loadState(root, syncStreamId(cfg));
+  expect(healed.manifestMeta!.chain).toEqual([]);
+  expect(canonicalManifestHashStreaming(manifestFromMeta(healed.lastSyncedManifest, healed.manifestMeta!)))
+    .toBe(healed.manifestMeta!.manifestHash);
+  // ...and a cold reader folds the result clean, end to end.
+  const peer = await remoteFor(server, secrets);
+  expect((await peer.latest()).manifest).toEqual(healed.lastSyncedManifest);
+
+  // The next push is delta-eligible again off the rewritten meta.
+  lines.length = 0;
+  await retargetSymlink(root, 8, "integrity-followup");
+  await push(root, cfg, { remote: pusher });
+  expect(await wireKind(server, pusher)).toBe("delta");
+  expect(nonDeltaCauses(lines)).toEqual([]);
+}, 120_000);
+
+test("204/11 repair and 422 chain-link recovery force snapshots with the master kill off", async () => {
+  // Repair arm: a perfectly good base is present and deltas are default-on, yet
+  // forceSnapshot emits a chain-free snapshot (NOT raw — the master kill is off).
+  const server = new FakeServer();
+  const secrets = await bootstrapOnto(server, ACCT, "devA-204-force-arm", NOW);
+  const lines: string[] = [];
+  const writer = sinkRemoteFor(server, secrets, lines);
+  const base = deltaSizedManifest("force-arm-base");
+  const first = await writer.commit(0, secrets.deviceId, base);
+  const target: Manifest = { ...base, generatedAt: "force-arm-target", files: base.files.map((f, i) => i === 9 ? { ...f, mode: 0o755 } : f) };
+  lines.length = 0;
+  const forced = await writer.commit(1, secrets.deviceId, target, {
+    deltaBase: { manifest: base, meta: first.manifestMeta! },
+    forceSnapshot: true,
+  });
+  expect(await wireKind(server, writer, 1)).toBe("snapshot");
+  expect(parseSignedCommit(server.commits[1]!).manifestChain).toEqual([]);
+  expect(forced.manifestMeta!.chain).toEqual([]);
+  expect(forced.manifestMeta!.chainBytes).toBe(0);
+  expect(nonDeltaCauses(lines)).toEqual(["force"]);
+
+  // 422 arm: the missing page names the chain link this attempt tried to build,
+  // so the retry must abandon the chain — and say `force`, not `no-base`.
+  const partServer = new FakeServer();
+  const partSecrets = await bootstrapOnto(partServer, ACCT, "devA-204-force-422", NOW);
+  const partLines: string[] = [];
+  const partRemote = sinkRemoteFor(partServer, partSecrets, partLines);
+  const partRoot = await tmp();
+  const partCfg = await cfgFor(partRoot, partSecrets, partRemote);
+  const partBase = deltaSizedManifest("force-422-base");
+  const partFirst = await partRemote.commit(0, partSecrets.deviceId, partBase);
+  await pull(partRoot, partCfg, { remote: partRemote });
+  const partTarget: Manifest = { ...partBase, generatedAt: "force-422-target", files: partBase.files.map((f, i) => i === 299 ? { ...f, mode: 0o755 } : f) };
+  const baseCommit = partServer.commitSigned;
+  let bounced = false;
+  partServer.commitSigned = async (parent, commit) => {
+    if (!bounced) { bounced = true; return { unsatisfiedBlobs: [partFirst.manifestMeta!.encManifestSha], unsatisfiedTotal: 1 }; }
+    return baseCommit(parent, commit);
+  };
+  partLines.length = 0;
+  await pushManifest(partRoot, partCfg, partTarget, { remote: partRemote });
+  expect(await wireKind(partServer, partRemote)).toBe("snapshot");
+  expect(nonDeltaCauses(partLines)).toEqual(["force"]);
 }, 60_000);

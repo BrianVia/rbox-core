@@ -60,7 +60,13 @@ export interface CommitOptions {
   onCommitTimings?: (timings: CommitTimings) => void;
   /** Applied manifest + its verified wire identity; only sync.ts may select this base. */
   deltaBase?: { manifest: Manifest; meta: GlobalManifestMeta };
-  /** Design 84 repair: encode a chain-free snapshot regardless of rollout flags. */
+  /** Design 204 §7: why the push seam withheld `deltaBase`, so the writer can log
+   *  the TRUE non-delta cause. Only the push seam can tell "there was no usable
+   *  persisted meta" (`no-base`) from "the meta failed the base-hash binding"
+   *  (`integrity`) — both reach the writer as a missing `deltaBase`. */
+  deltaBaseRejection?: "no-base" | "integrity";
+  /** Design 84 repair: do not emit a delta. Subordinate to the RBOX_MDE_SNAPSHOT
+   *  master kill (design 204 §4.2) — under it, repair emits raw-v0, not a snapshot. */
   forceSnapshot?: boolean;
   /** Awaited at the last client-side boundary before the manifest POST. A
    * synchronous keep-mine uses this to durably arm uncertain-ACK recovery. */

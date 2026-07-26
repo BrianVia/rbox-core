@@ -27,6 +27,7 @@ import {
 } from "./base-composer.js";
 import { acquirePreparedStateCasLocks, markStateCasCommitted, prepareStateCasLocks, releaseStateCasLocks, type HeldStateCasLock, type StateCasLockRequest } from "./state-cas-locks.js";
 import type { LockfileHooks } from "../../engine/git/lockfile.js";
+import { asyncMemo } from "./async-memo.js";
 /** Local-vs-base divergence, projected onto the narrower of the two scopes (§7).
  *  No base → ANY local git identity is divergence-from-nothing (an independently
  *  created local repo must never be clobbered). No local identity (no repo, empty
@@ -404,20 +405,6 @@ opts: {
     return group;
   };
 
-  /** One-shot async memo with reset — the per-repo probe thunks (design 203). */
-  const memo = <T,>(fn: () => Promise<T>): (() => Promise<T>) & { reset: () => void } => {
-    let done = false;
-    let value: T;
-    const get = async (): Promise<T> => {
-      if (!done) {
-        value = await fn();
-        done = true;
-      }
-      return value;
-    };
-    return Object.assign(get, { reset: () => { done = false; } });
-  };
-
   const laneRecord = (rel: string): RepoRecordInput => ({
     sourceSeq: records[rel]?.sourceSeq ?? state.lastSyncedSequence,
     ...(configLane[rel] ?? configLaneState(records[rel] ?? { repoGen: 0, sourceSeq: state.lastSyncedSequence })),
@@ -582,7 +569,7 @@ opts: {
     let pend = pending[rel];
     const repoDir = repoDirOf(root, rel);
     let dotGit = await fs.lstat(path.join(repoDir, ".git")).catch(() => undefined);
-    const getDiskCtx = memo(async () => dotGit ? await repoCtxFromDisk(repoDir).catch(() => undefined) : undefined);
+    const getDiskCtx = asyncMemo(async () => dotGit ? await repoCtxFromDisk(repoDir).catch(() => undefined) : undefined);
     const commonDirGroup = commonDirGroupFor(await getDiskCtx());
 
     // Sanitizing an invalid incoming config must not make the next push author a
@@ -704,7 +691,7 @@ opts: {
     // Legacy mode passes no ctx so isGitBusy spawns exactly as today (the kill
     // switch's spawn-count fidelity is pinned by test); lazy mode reuses the
     // memoized fs-derived ctx.
-    const getBusy = memo(async () =>
+    const getBusy = asyncMemo(async () =>
       dotGit !== undefined && await isGitBusy(repoDir, lazyProbes ? await getDiskCtx() : undefined));
     if (!lazyProbes) await getBusy(); // legacy order: busy probed for every repo, as today
     if (remoteSec && await getBusy()) {
@@ -716,7 +703,7 @@ opts: {
     // NOTE: remote ABSENCE is processed even when busy — it never mutates local .git,
     // and skipping it would leave gitPendingRemote/base carrying a section the remote
     // deleted, which the next file-only push would resurrect.
-    const getLocalId = memo(async (): Promise<GitIdentity | undefined> => {
+    const getLocalId = asyncMemo(async (): Promise<GitIdentity | undefined> => {
       await getBusy(); // busy-known-first: identity under a held lock reads as false divergence
       return dotGit ? await gitIdentity(repoDir) : undefined;
     });
