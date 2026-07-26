@@ -12,6 +12,7 @@
 import { actionPath, compareManifestPaths, type Action, type FileEntry, type Manifest } from "../../engine/index.js";
 import { gitIncomingKey } from "../sync-git/shared.js";
 import type { SyncState } from "../config.js";
+import type { TrustedLocalView } from "../sync.js";
 
 export type ManifestUpdate =
   | {
@@ -36,6 +37,24 @@ export type ManifestUpdate =
 
 /** Design 202 kill switch. Default ON; `=0` disables the seam AND the patch. */
 export const pullTrustWatcherEnabled = (): boolean => process.env.RBOX_PULL_TRUST_WATCHER !== "0";
+
+/**
+ * Design 206 §4: why a pull's main line had NO trusted view. One token per clause of
+ * the trust predicate P, so `pull local=scan` is never causeless in the field. The
+ * post-drain P1/P2 re-check reports its underlying clause, not a separate token.
+ */
+export type SkipCause =
+  | "kill-switch"
+  | "p1-watcher"
+  | "p2-observation"
+  | "p3-pending"
+  | "p5-seed"
+  | "p6-reset"
+  | "p7-matcher"
+  | "p7-matcher-observation";
+
+/** Either the single-use local view, or the named clause that withheld it. */
+export type TrustedPullViewResult = { view: TrustedLocalView; skip?: undefined } | { view?: undefined; skip: SkipCause };
 
 /**
  * "This manifest minus the paths nobody can currently observe" — one home for the

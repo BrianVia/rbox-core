@@ -162,7 +162,7 @@ The daemon stores the last update (`lastManifestUpdate`). Consequences:
 | P4 | `watcherErrorGeneration` captured at op start and re-checked immediately before the **synchronous** post-pull install (see below) | `daemon.ts:470`, `806-811`, `1642-1643` |
 | P5 | A `full-workspace` manifest update has occurred since `seedFromState` (which clears `lastManifestUpdate`; reset recovery re-seeds immediately before returning to ready, `daemon.ts:1255-1259`) | `daemon.ts:1177-1182`, `2814-2879` |
 | P6 | `resetLifecycle === "ready"` at pump-op entry (the op boundary, not the WS frame gate) | pump entry, `daemon.ts:1569` region |
-| P7 | Daemon matcher generation current: the matcher must have been rebuilt since the last change to the base `gitRepos` key set (see fallback trigger F2 — a git-topology-changing pull forces the scan path, which realigns provenance) | `daemon.ts:3006-3011`, `src/cli/sync/policy.ts:88-94` |
+| P7 | Daemon matcher provenance current: the matcher must have been rebuilt since the last change to the base `gitRepos` key set, AND the in-memory manifest must come from a full-workspace observation started under that matcher (design 206 §2 added the second clause; the rebuild itself is the guarded `ensureMatcherProvenance` at every pump-owned boundary) | `daemon.ts` `rebuildMatcher`/`ensureMatcherProvenance`, `src/cli/sync/policy.ts:88-94` |
 
 P is evaluated by the daemon; `pull()` stays policy-free.
 
@@ -192,8 +192,12 @@ dedicated test, not by prose.
   non-manifest side effects where they matter — `discoveredGitRepos` →
   `gitRefRegistry.upsert` + `refreshGitSafetyFloor` (`daemon.ts:2843-2856`)
   — so a newly cloned repo is registered immediately, not at the next safety
-  tick; and it realigns matcher provenance (P7), since `knownGitRepos`
-  derives from base `gitRepos` keys.
+  tick. It does NOT by itself realign matcher provenance (P7): the scan runs
+  with the matcher it finds. Provenance is realigned by the guarded
+  `ensureMatcherProvenance` rebuild inside `loadSyncBase` (design 206 §1),
+  which runs on the post-pull reload just above this fallback — so the
+  fallback scan observes under a current matcher and its install re-stamps
+  the observation generation.
 - **F3** The pull wrote an ignore-rule file (`daemon.ts:2142-2145`) — matcher
   changed; patching cannot re-evaluate exclusions.
 - **F4** Chain repair engaged (`repairChain` ran at all).
@@ -257,8 +261,13 @@ bound.
 
 No wire changes. The daemon pull log line gains `local=trusted|scan` (+
 `refused=…` on fallback), making trusted-vs-scan rate and fallback causes
-greppable per device. Extending the AE `sync_phase` schema with a source enum
-is deliberately deferred: the ingest worker drops unknown fields
+greppable per device. Design 206 §4 added `skip=<cause>` to that contract: on
+every `local=scan` line it names the clause of P that withheld the trusted
+view (`kill-switch`, `p1-watcher`, `p2-observation`, `p3-pending`, `p5-seed`,
+`p6-reset`, `p7-matcher`, `p7-matcher-observation`, or `refused` for the
+mass-delete guard), so a scan-path pull is never causeless.
+
+Extending the AE `sync_phase` schema with a source enum is deliberately deferred: the ingest worker drops unknown fields
 (`unknown_field`), so a server-side schema deploy must precede any client
 emission — follow-up, not this design.
 

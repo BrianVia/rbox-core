@@ -20,6 +20,19 @@ All notable changes to rbox are recorded here. The format follows
 - Manifest publications now report whether they emitted a delta or snapshot,
   including encoded size (and delta operation count), in daemon logs and
   interactive push, pull, and sync diagnostics.
+- **Pulls stay fast after you clone or delete a repository inside your
+  workspace.** Cloning, publishing or removing a repo used to permanently drop
+  every later pull back onto a full workspace scan (~5s each on a large
+  workspace) until the daemon was restarted; rbox now re-aligns its ignore
+  matcher when the workspace's repository set moves and returns to instant
+  pulls on the very next sync.
+- Live file watching now follows ignore-rule changes instead of continuing to
+  filter events through the rules it started with. When such a change alters
+  what the operating-system watcher itself can see, rbox says so in the log and
+  falls back to scanning pulls until the next restart, rather than trusting a
+  watcher that has gone partly blind.
+- Every scan-path pull now records WHY it scanned (`pull local=scan skip=…`),
+  so a slow steady state can be attributed from the daemon log alone.
 
 ## [1.9.1] — 2026-07-25 — "worktrees come and go, sync keeps up"
 

@@ -154,6 +154,7 @@ export {
 export { cryptoPoolStatus, shutdownCryptoPool, withCryptoPool, type CryptoPoolStatus, type CryptoPool, type CoalescedBlob } from "./crypto-pool.js";
 export { hashFile, hashBytes } from "./hash.js";
 export {
+  ALWAYS_NATIVE_PRUNE,
   BUILTIN_IGNORE,
   GIT_REF_SIGNAL_TAIL_TABLE,
   HARD_PRUNE_DIRS,

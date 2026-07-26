@@ -147,7 +147,7 @@ export const HARD_PRUNE_DIRS: string[] = [
  *  hand a native watcher's coarse `ignore` even in the presence of negations. `.rbox` is
  *  hard-excluded in code (no rule can re-include it); a `!node_modules/…`/`!.git/…`
  *  re-include is pathological and still heals via the safety scan. */
-const ALWAYS_NATIVE_PRUNE = new Set(["node_modules", ".git", ".rbox"]);
+export const ALWAYS_NATIVE_PRUNE: ReadonlySet<string> = new Set(["node_modules", ".git", ".rbox"]);
 
 /**
  * True when a POSIX workspace-relative path is a ref-surface signal inside an
