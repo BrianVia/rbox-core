@@ -799,3 +799,41 @@ test("namespace admission refuses a symlinked heads root without traversing its 
   expect(logs.some((message) => message.includes("directory budget"))).toBe(false);
   await registry.close();
 });
+
+test("nameless and garbage fs.watch filenames never throw and degrade to dirty (2026-07-26 FM crash)", async () => {
+  const root = tempRoot();
+  const main = path.join(root, "main");
+  const common = path.join(main, ".git");
+  makeGitDir(common);
+  const contexts = new Map([
+    [main, { repoDir: main, kind: "dir" as const, gitDir: common, commonDir: common }],
+  ]);
+  const watches = new TestWatches();
+  const logs: string[] = [];
+  const registry = new GitRefWatchRegistry({
+    root,
+    resolveRepo: async (repoDir) => contexts.get(repoDir),
+    refStorage: async () => undefined,
+    watch: watches.watch,
+    onLog: (line) => logs.push(line),
+  });
+  await registry.upsert([{ relPath: "main", kind: "dir" }]);
+  const shared = watches.latest(common, "shallow");
+
+  // Bun on Linux delivers null AND undefined filenames; the pre-fix guard only
+  // checked `=== null`, so undefined reached safeTail(.length) and the
+  // TypeError killed the daemon. Every shape here must be absorbed.
+  const garbage: unknown[] = [undefined, null, "", Buffer.from("HEAD"), 42, {}, "HEAD"];
+  for (const filename of garbage) {
+    expect(() => shared.listener("rename", filename as never)).not.toThrow();
+    expect(() => shared.listener("change", filename as never)).not.toThrow();
+  }
+  expect(registry.state.closed).toBe(false);
+  expect(registry.state.readerDead).toBe(false);
+});
+
+test("classifyRefEvent tolerates non-string tails", () => {
+  expect(classifyRefEvent("gitDir", undefined as never)).toBe("none");
+  expect(classifyRefEvent("gitDir", null as never)).toBe("none");
+  expect(classifyRefEvent("refsRoot", 7 as never)).toBe("none");
+});

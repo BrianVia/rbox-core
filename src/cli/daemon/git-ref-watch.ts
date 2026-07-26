@@ -45,6 +45,7 @@ function classifySafeRefEvent(role: GitRefWatchRole, tail: string): GitRefEventC
 }
 
 function safeTail(tail: string): boolean {
+  if (typeof tail !== "string") return false; // fs.watch contract violations must classify as noise, never throw
   if (tail.length === 0 || tail.includes("\0") || tail.startsWith("/") || tail.endsWith("/")) return false;
   return tail.split("/").every((part) => part.length > 0 && part !== "." && part !== "..");
 }
@@ -742,23 +743,36 @@ export class GitRefWatchRegistry {
   #attach(desired: DesiredTarget): ActiveTarget {
     let active!: ActiveTarget;
     const handle = this.#watch(desired.canonicalRoot, desired.mode, (eventType, filename) => {
-      if (this.#closed || this.#readerDead) return;
-      const tail = Buffer.isBuffer(filename) ? filename.toString("utf8") : filename;
-      if (tail === null || (eventType === "rename" && tail === "")) {
-        this.#dirtyTarget(desired.key);
-        return;
-      }
-      if (!safeTail(tail)) return;
-      let signal = false;
-      for (const contributor of (active?.contributors ?? desired.contributors).values()) {
-        const eventClass = classifySafeRefEvent(contributor.role, tail);
-        if (eventClass === "structure") {
+      // The ref side-channel is an ACCELERATOR over the git safety floor: any
+      // failure in here degrades to "this target is dirty" — it must never
+      // propagate as an uncaught exception that takes the daemon down
+      // (2026-07-26: Linux fs.watch delivered an undefined filename and the
+      // resulting TypeError crash-looped a fresh device's daemon).
+      try {
+        if (this.#closed || this.#readerDead) return;
+        const tail = Buffer.isBuffer(filename) ? filename.toString("utf8") : filename;
+        // Nameless events (filename null OR undefined — Bun surfaces both on
+        // Linux) mean "something under this root changed": conservatively
+        // dirty the target; never hand a non-string to the classifier.
+        if (tail == null || (eventType === "rename" && tail === "")) {
           this.#dirtyTarget(desired.key);
           return;
         }
-        if (eventClass === "target" || eventClass === "lockPreSignal") signal = true;
+        if (!safeTail(tail)) return;
+        let signal = false;
+        for (const contributor of (active?.contributors ?? desired.contributors).values()) {
+          const eventClass = classifySafeRefEvent(contributor.role, tail);
+          if (eventClass === "structure") {
+            this.#dirtyTarget(desired.key);
+            return;
+          }
+          if (eventClass === "target" || eventClass === "lockPreSignal") signal = true;
+        }
+        if (signal) this.#onSignal?.();
+      } catch (error) {
+        try { this.#dirtyTarget(desired.key); } catch { /* detaching */ }
+        this.#onLog?.(`git-ref-watch event error (degraded to dirty): ${error instanceof Error ? error.message : String(error)}`);
       }
-      if (signal) this.#onSignal?.();
     });
     active = { ...desired, contributors: new Map(desired.contributors), handle };
     handle.on?.("error", (error) => this.readerDied(error));
