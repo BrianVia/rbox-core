@@ -39,9 +39,22 @@ FAST suite vs dev on the 204 build = 6/7 PASS (onboard 11.3s, two-device
 (identical at f0bfb456) — #462 (ownership-hold/deferral-aging assertions,
 same rot class as #dev-backed parsePairToken). Deletion propagation ~4s via
 38.7KB delta BUT left 30M checkout residue on FM invisible to doctor — #460.
-`bun run test:parallel` SHIPPED (#461): local 6-shard suite 126s vs 364s
-serial, zero flakes first runs (keep watching). NO 1.10.0 tag — bake first,
-fresh explicit go required._
+`bun run test:parallel` SHIPPED (#461): local 6-shard suite ~126s vs 364s
+serial (8 shards WORSE at 141s, 16 faster-but-flaky at 100s — 6 is the
+sweet spot; zero flakes across three 6-shard runs so far). Late-evening
+additions: #466 merged (git-entanglement rewritten to the design-200
+deferral contract + aged-visibility step via 11-min state backdate —
+grammar-freeze marker preserved; rig FAST suite now fully green on the 204
+build); #468 merged (status shows email+plan via per-field account-profile
+fallback — field-verified on FM, fixes #467); fleet now runs DEV builds by
+standing founder rule (~/.rbox/bin/rbox → symlink to rbox-dev on all 3
+hosts, release parked as rbox-release; both daemons on 1.9.1-dev+bb419b6);
+FM parked pre-rebind daemon record removed (status noise). New issues from
+burn-in: #463 (RboxBar real transfer progress), #464 (202 trusted-pull
+stuck in scan after ignore-rules churn — top candidate for next cycle with
+the git-plan successor), #465 (rbox start over running daemon says
+'started/not witnessed' instead of 'already running'). NO 1.10.0 tag —
+bake first, fresh explicit go required._
 
 _Prior addendum (2026-07-26, later): burn-in DONE on both hosts; #457 merged
 (refwatch crash fix — Linux fs.watch nameless-filename TypeError crash-looped
