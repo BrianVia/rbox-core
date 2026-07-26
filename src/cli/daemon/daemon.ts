@@ -37,7 +37,7 @@ import { loadActivity, renderShellDeferrals, renderShellLine, saveActivity, save
 import { expectedStateNonce, loadConfig, loadState, repoRecordsForState, syncStreamId, trashConfig, type SyncState, type WorkspaceConfig } from "../config.js";
 import { pruneTrash } from "../../engine/trash.js";
 import { DAEMON_BOOT_ID_ENV, readDaemonPidRecord, recordDaemonBinding } from "./runtime-state.js";
-import { MassDeleteGuardError, PushConflictExhaustedError, makeDeferErrnoReporter, pull, pushManifest, type SyncDeps } from "../sync.js";
+import { MassDeleteGuardError, PushConflictExhaustedError, TrustedViewRefusalError, makeDeferErrnoReporter, pull, pushManifest, type SyncDeps, type TrustedLocalView } from "../sync.js";
 import { deferManifest } from "../sync-recovery.js";
 import type { TransferPhase, TransferProgressBytes } from "../transfer-progress.js";
 import { buildAuthedRemote } from "../e2ee-client.js";
@@ -117,6 +117,14 @@ import {
   WS_PING_MS,
   WS_PONG_DEADLINE_DEFAULT_MS,
 } from "./policy.js";
+import {
+  gitReposMatcherKey,
+  gitTopologyChanged,
+  patchManifestFromPull,
+  pullTrustWatcherEnabled,
+  stripUnsettled,
+  type ManifestUpdate,
+} from "./manifest-update.js";
 import { cleanPath, LOG_PATHS_MAX, scanStatsLine, summarizeActions } from "./render.js";
 import { RotatingDaemonLogger, type DaemonLogSink } from "./logger.js";
 import { TelemetryQueue } from "../telemetry/queue.js";
@@ -377,6 +385,18 @@ export class RboxDaemon {
    * complete observation of the skipped disk paths. Only a fresh scan restores
    * completeness and may authoritatively clear/revise the episode. */
   private manifestObservationComplete = true;
+  /** Design 202: paths whose on-disk truth this daemon has NOT observed — watcher
+   *  deferrals, scan deferrals, write-finish give-ups, and conflict copies a pull
+   *  just created. They are stripped from any trusted local view (restoring pull's
+   *  scan-omission semantics, design 108) and exempt the git oracle. Cleared for a
+   *  path only when it is re-observed cleanly or a full-workspace scan installs. */
+  private readonly unsettledPaths = new Set<string>();
+  /** Provenance of the LAST `this.manifest` install (design 202). */
+  private lastManifestUpdate?: ManifestUpdate;
+  /** P5: has any full-workspace install landed since the last state seed? */
+  private fullWorkspaceSinceSeed = false;
+  /** P7: the base `gitRepos` key set `this.matcher` was last built from. */
+  private matcherGitReposKey = gitReposMatcherKey();
   private activeCaseCollisions: CaseFoldCollisionGroup[] = [];
   private pathWarningWrite: Promise<void> = Promise.resolve();
   private syncBase?: SyncState;
@@ -1179,6 +1199,11 @@ export class RboxDaemon {
     this.manifest = state.lastSyncedManifest;
     this.lastLoggedSeq = state.lastSyncedSequence;
     this.rebuildMatcher(state);
+    // The seed is last-synced BASE, not disk truth: nothing has been observed yet,
+    // so P5 goes false until a full-workspace scan installs (design 202).
+    this.lastManifestUpdate = undefined;
+    this.fullWorkspaceSinceSeed = false;
+    this.unsettledPaths.clear();
   }
 
   private scheduleResetRetry(): void {
@@ -1971,16 +1996,27 @@ export class RboxDaemon {
       } else {
         const deferred = new Set<string>();
         this.manifest = await applyWatchEvents(this.manifest, this.root, this.matcher, events, this.cache, deferred);
+        let rescanned = false;
         if (!this.manifestObservationComplete && caseFoldCollisionGroups(this.manifest.files).length > 0) {
           // The retained safe subset discovered an independent new collision.
           // Re-scan to reunite it with every still-active omitted group before
           // the next push authors warning truth.
           const scanned = await this.replaceManifestFromScan(this.cache, this.manifest, undefined, undefined, this.watcherScanMode());
           for (const path of scanned.deferred) deferred.add(path);
+          rescanned = true;
         }
         await this.resolveDriftFromAppliedEvents(events, deferred);
         // A path that hashed cleanly this round is settled — clear any retry it accrued.
         for (const e of events) if (!deferred.has(e.relPath)) this.writeFinishRetries.delete(e.relPath);
+        // Design 202: ONE partial update per settled drain (never per file). A path
+        // this drain read cleanly is re-observed and leaves the unsettled set; a path
+        // it deferred joins it. A rescan in this arm already installed full-workspace
+        // provenance and its own unsettled set — it must not be overwritten as partial.
+        if (!rescanned) {
+          for (const e of events) if (!deferred.has(e.relPath)) this.unsettledPaths.delete(e.relPath);
+          for (const p of deferred) this.unsettledPaths.add(p);
+          this.noteManifestUpdate({ kind: "partial", source: "watch-events", paths: new Set(events.map((e) => e.relPath)) });
+        }
         if (deferred.size > 0) this.scheduleWriteFinishRetry(deferred);
       }
     }
@@ -2032,6 +2068,10 @@ export class RboxDaemon {
       } else {
         this.writeFinishRetries.delete(p); // give up; the safety scan will heal it
         this.deferredRetryPaths.delete(p);
+        // …but the path is still UNOBSERVED until that scan lands. Record it (design
+        // 202) instead of dropping it silently, or a trusted view would hand pull a
+        // stale entry for it with nothing left tracking the gap.
+        this.unsettledPaths.add(p);
       }
     }
     if (retryable.length === 0 || this.stopped) return;
@@ -2071,12 +2111,66 @@ export class RboxDaemon {
     this.writeFinishRetryTimers.add(timer);
   }
 
+  /** P1: the watcher is live and its stream is trusted, not merely present. */
+  private watcherTrustedForPull(): boolean {
+    return this.watcher !== undefined && this.watcherHealthy && this.trustState === "trusted" && !this.watcherDegraded;
+  }
+
+  /** P2: the manifest is a complete observation with no active case-fold collision. */
+  private manifestSettledForPull(): boolean {
+    return this.manifestObservationComplete && this.activeCaseCollisions.length === 0;
+  }
+
+  /**
+   * Design 202 trust predicate P. Evaluated HERE — `pull()` stays policy-free — and
+   * returns the single-use local view, or `undefined` to leave the pull on today's
+   * byte-for-byte scan path. P3's drain is deliberately last: it is the only clause
+   * with a side effect, so a kill-switched or otherwise untrusted daemon behaves
+   * exactly as it did before this design.
+   */
+  private async buildTrustedPullView(base: SyncState): Promise<TrustedLocalView | undefined> {
+    if (!pullTrustWatcherEnabled()) return undefined;                            // F5
+    if (!this.watcherTrustedForPull()) return undefined;                         // P1
+    if (!this.manifestSettledForPull()) return undefined;                        // P2
+    if (!this.fullWorkspaceSinceSeed) return undefined;                          // P5
+    if (this.resetLifecycle !== "ready") return undefined;                       // P6
+    if (this.matcherGitReposKey !== gitReposMatcherKey(base)) return undefined;  // P7
+    await this.applyPendingWatchEvents();                                        // P3
+    if (this.pendingEvents.length > 0) return undefined;
+    // The drain is P's only side-effecting clause and it awaits: re-read the two
+    // conditions it can itself invalidate rather than trusting the pre-drain read.
+    if (!this.watcherTrustedForPull() || !this.manifestSettledForPull()) return undefined;
+    return { manifest: stripUnsettled(this.manifest, this.unsettledPaths), deferred: new Set(this.unsettledPaths) };
+  }
+
+  /**
+   * Design 202 post-pull refresh: O(applied) instead of O(workspace). Re-checks P4
+   * (F1) and then installs SYNCHRONOUSLY — there is no `await` between the check and
+   * the assignment, so no watcher callback can interleave. Returns false when the
+   * check fails; the caller then falls back to the full scan.
+   */
+  private installPullPatch(view: TrustedLocalView, actions: Action[], base: SyncState, opWatcherErrorGeneration: number): boolean {
+    if (this.watcherErrorGeneration !== opWatcherErrorGeneration) return false;
+    const patched = patchManifestFromPull(view.manifest, actions, base.lastSyncedManifest);
+    this.manifest = patched.manifest;
+    // A conflict copy's content is unknown until something hashes it; the watcher
+    // event that observes it settles it and the next push publishes it.
+    for (const p of patched.unsettled) this.unsettledPaths.add(p);
+    this.noteManifestUpdate({ kind: "partial", source: "pull-applied", paths: patched.paths });
+    return true;
+  }
+
   private async doPull(syncMutex: WorkspaceSyncMutex, notifyLatencyMs?: number, notifyPendingAt?: number, carrier: Carrier = "none"): Promise<void> {
     if (this.e2ee.remote instanceof E2eeRemote) {
       const pin = await this.e2ee.remote.loadVerifiedPin();
       this.chainRepairPolicy.assertHeadAllowed(pin);
     }
     this.typeFlipsSincePull = 0; // per-op tally — a failed prior op's flips must not inflate this one's count
+    // Design 202. P4 is captured HERE, at op start, and re-checked immediately before
+    // the post-pull install; the pre-op base is F2's "before" side.
+    const opWatcherErrorGeneration = this.watcherErrorGeneration;
+    const preBase = this.syncBase ?? await this.loadSyncBase();
+    const trustedView = await this.buildTrustedPullView(preBase);
     const metricsReport = beginReport("pull");
     const report = metricsReport ?? (telemetryEnabled() ? PhaseReport.pull() : undefined);
     // onGitLog: per-repo apply/conflict/defer forensics (design 43 §10) land in the daemon log.
@@ -2101,26 +2195,44 @@ export class RboxDaemon {
       telemetry: this.telemetry,
       mutationBoundary: this.mutationGate,
     };
+    // Chain repair mutates disk across historical sequences and its post-repair
+    // re-pull must see that disk — both always scan (F4 also forces the post-pull
+    // scan below), so only the view passed in here can ever be trusted.
+    let chainRepaired = false;
+    const runPull = async (view?: TrustedLocalView): Promise<Action[]> => {
+      try {
+        return await pull(this.root, this.cfg, pullDeps, view);
+      } catch (error) {
+        if (!(error instanceof ManifestChainError)) throw error;
+        chainRepaired = true;
+        let refusal: SuffixInfo[] | undefined;
+        const outcome = await repairChain(this.root, this.cfg, pullDeps, error, {
+          confirmSupersede: async (suffix) => {
+            const selfOnly = this.chainRepairPolicy.confirmSupersede(suffix);
+            if (!selfOnly) refusal = suffix;
+            return selfOnly;
+          },
+        });
+        if (outcome.kind === "declined") {
+          const suffix = refusal ?? outcome.suffix;
+          throw this.chainRepairPolicy.halt(error, suffix);
+        }
+        return outcome.kind === "converged"
+          ? [...outcome.actions, ...await pull(this.root, this.cfg, pullDeps)]
+          : outcome.actions;
+      }
+    };
+    let localSource: "trusted" | "scan" = trustedView ? "trusted" : "scan";
     let actions: Action[];
     try {
-      actions = await pull(this.root, this.cfg, pullDeps);
+      actions = await runPull(trustedView);
     } catch (error) {
-      if (!(error instanceof ManifestChainError)) throw error;
-      let refusal: SuffixInfo[] | undefined;
-      const outcome = await repairChain(this.root, this.cfg, pullDeps, error, {
-        confirmSupersede: async (suffix) => {
-          const selfOnly = this.chainRepairPolicy.confirmSupersede(suffix);
-          if (!selfOnly) refusal = suffix;
-          return selfOnly;
-        },
-      });
-      if (outcome.kind === "declined") {
-        const suffix = refusal ?? outcome.suffix;
-        throw this.chainRepairPolicy.halt(error, suffix);
-      }
-      actions = outcome.kind === "converged"
-        ? [...outcome.actions, ...await pull(this.root, this.cfg, pullDeps)]
-        : outcome.actions;
+      if (!(error instanceof TrustedViewRefusalError)) throw error;
+      // Pre-action refusal: NOTHING touched disk. Re-run scan-backed exactly once per
+      // op — that run's guard behaves as it always has (a real wave still halts).
+      this.log(`pull local=trusted refused=${error.reason}`);
+      localSource = "scan";
+      actions = await runPull(undefined);
     }
     this.chainRepairPolicy.clear();
     if (notifyPendingAt !== undefined) {
@@ -2139,7 +2251,8 @@ export class RboxDaemon {
     // A pull that WROTE an ignore-rule file must refresh the matcher before the rescan
     // below and the pump's follow-up push — otherwise that push publishes files the
     // freshly pulled rules exclude (same hazard doPush guards on watcher events).
-    if (actions.some((a) => isIgnoreRuleFile(a.kind === "write" ? a.entry.path : a.path))) {
+    const rulesWritten = actions.some((a) => isIgnoreRuleFile(a.kind === "write" ? a.entry.path : a.path));
+    if (rulesWritten) {
       this.rebuildMatcher(await this.loadSyncBase());
       this.rulesChangedSinceDeepScan = true;
     }
@@ -2148,11 +2261,30 @@ export class RboxDaemon {
     const base = await this.loadSyncBase();
     this.emitDurableGitDeferrals(base);
     this.lastLoggedSeq = base.lastSyncedSequence;
+    // Design 202 fallback triggers. F2 is a pure pre/post base comparison — nothing
+    // new comes out of `pull()` — and it is what keeps repo discovery (ref registry +
+    // safety floor) and matcher provenance (P7) with the scan that does them right.
+    const fallback = trustedView === undefined || localSource === "scan"
+      ? undefined
+      : chainRepaired ? "chain-repair"                                          // F4
+      : rulesWritten ? "ignore-rules"                                           // F3
+      : gitTopologyChanged(preBase, base) ? "git-topology"                      // F2
+      : undefined;
     // Refresh in-memory truth from disk (cache-warm: pull invalidated written paths).
     // Deferred paths carry the POST-pull base entry, never the pre-pull manifest —
     // carrying pre-pull truth would let the follow-up push publish a stale entry
     // over the version this pull just applied.
-    await this.replaceManifestFromScan(this.cache, base.lastSyncedManifest, undefined, undefined, this.watcherScanMode());
+    const trusted = trustedView !== undefined && localSource === "trusted";
+    const patched = trusted && fallback === undefined
+      && this.installPullPatch(trustedView, actions, base, opWatcherErrorGeneration);
+    if (!patched) {
+      await this.replaceManifestFromScan(this.cache, base.lastSyncedManifest, undefined, undefined, this.watcherScanMode());
+    }
+    // Fleet-greppable provenance: which local view the pull's main line read, and why
+    // the O(applied) refresh gave way to a scan when it did. A trusted pull that fell
+    // back with no F2/F3/F4 cause failed the P4 re-check — the watcher dropped (F1).
+    const cause = trusted && !patched ? ` fallback=${fallback ?? "watcher-drop"}` : "";
+    this.log(`pull local=${localSource}${cause}`);
   }
 
   private bumpConflict(_kind: "commit"): void {
@@ -2860,6 +2992,13 @@ export class RboxDaemon {
     // unseen case-variant of a path that did hash. Preserve warning authority
     // until a later scan observes the whole file set.
     this.manifestObservationComplete = deferred.size === 0;
+    // Design 202: a scan is a FULL WORKSPACE observation (pruned scans reuse cached
+    // listings, they do not omit paths), so it re-derives the unsettled set outright —
+    // every previously unsettled path it read cleanly is settled again.
+    const coverage = coverageOf(dircache?.lastOutcome ?? "off");
+    this.unsettledPaths.clear();
+    for (const p of deferred) this.unsettledPaths.add(p);
+    this.noteManifestUpdate({ kind: "full-workspace", coverage, deferred: new Set(deferred) });
     if (deferred.size > 0) this.scheduleWriteFinishRetry(deferred);
     if (probe) {
       const summary = probe.summary();
@@ -2872,7 +3011,7 @@ export class RboxDaemon {
     // from the optional metrics struct: a pruned scan can heal but must never
     // testify to watcher re-trust (design 104 R1 F8). No dircache ⇒ unpruned walk ⇒
     // "full-tree". Callers forward this value unchanged.
-    return { freshManifest: fresh, deferred, coverage: coverageOf(dircache?.lastOutcome ?? "off") };
+    return { freshManifest: fresh, deferred, coverage };
   }
 
   /** Serialized sidecar transaction. `fn` returning false means "unchanged" and
@@ -3008,6 +3147,15 @@ export class RboxDaemon {
       respectGitignore: this.cfg.respectGitignore === true,
       knownGitRepos: Object.keys(state?.lastSyncedManifest.gitRepos ?? {}),
     });
+    this.matcherGitReposKey = gitReposMatcherKey(state);
+  }
+
+  /** Every install of `this.manifest` records its provenance here (design 202).
+   *  Only a full-workspace install may clear seed staleness (P5); a partial patch
+   *  has no access to the completeness upgrade at all. */
+  private noteManifestUpdate(update: ManifestUpdate): void {
+    this.lastManifestUpdate = update;
+    if (update.kind === "full-workspace") this.fullWorkspaceSinceSeed = true;
   }
 
   /** Adoption invalidation is a durable cross-process generation, not merely a
