@@ -280,3 +280,21 @@ During a push, the menu-bar popover shows `Status: working / File: – / Progres
 With a (dev-build) daemon already running, `rbox start` spawns a new process that loses the single-instance lock and dies — but the CLI prints "background sync (process N) started, but its mode is not witnessed yet — re-run `rbox start` in a moment". Two fixes: (1) detect the existing daemon and say "already running (pid …, version …)" — including a mismatch note when the running binary differs (rbox vs rbox-dev); (2) the witness confirmation should be the CLI's job — poll briefly and report the witnessed mode instead of asking the user to re-run (founder rule: minimize user typing). Hit 3× today (both hosts' restarts + founder's manual start on FM).
 
 Resolved: dev versions with build metadata now parse correctly, process ownership reads the full command line, and `rbox start` identifies the live daemon by process, version, and witnessed mode. It polls the witness itself and reports a terminal next step for slow, exited, or concurrently superseded starts; no start outcome asks the operator to re-run the command.
+
+## Dev-build fleet sees "update available → 1.9.1" downgrade hint (2026-07-26)
+
+With the fleet on dev builds (1.9.1-dev+<sha>), `rbox status` now prints
+`update available: 1.9.1-dev+b374f1e → 1.9.1` — semver-correct (release >
+prerelease) but backwards for the founder's dev-tracking fleet; following it
+would DOWNGRADE to the release binary and re-break the symlink setup. Wants a
+dev-channel awareness check (suppress the hint when running a `-dev+` build,
+or compare against the dev channel instead).
+
+## Large clone/rm bursts always trip FSEvents overflow → 2-scan re-trust lag (2026-07-26)
+
+Every ~5k-file burst (repo clone, rm -rf) drops the Mac watcher to suspect
+("transient overflow"), costing two clean 60s safety scans before trusted
+pulls resume (~4-6 min of scan-path pulls). Post-206 this heals unattended
+and is named in the log, but the cadence is the remaining latency; a
+burst-aware fast re-trust (immediate pinned rescan instead of waiting for the
+safety tick) would shrink it.
