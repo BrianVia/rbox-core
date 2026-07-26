@@ -302,3 +302,11 @@ removed; the redacted result is retained at
   "review H2" recurred on PR #401 CI. Converted to injected clocks
   (SafetyCadenceClock seam + ManualRecoveryClock) with assertions unchanged;
   looped 10x green.
+
+## src/engine/git-state.test.ts — "detached pointer captures use detached HEAD as basis for scoped chains"
+
+- 2026-07-26: failed once on CI shard 4/6 (PR #478, a status-only diff that
+  cannot reach engine git capture), 252ms fail. Proof: green in isolation
+  locally (24/24 same file), green on CI rerun of the failed shard. Class:
+  real-git subprocess timing under shard parallelism. One observation —
+  watch for recurrence before any quarantine.

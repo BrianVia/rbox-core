@@ -5,6 +5,23 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_Session addendum (2026-07-27, small hours): **FM IS NOW A FULL SYNCER**
+(founder decision): explicit `rbox start --read-write` — live watcher started
+(inotify raised to 1048576 first), FIRST-EVER FM trusted pull 23:33 UTC,
+echo-watched clean (2 publishes, no loop; the 07-21 echo bug class is fixed
+in 1.9.x). Correction: FM never had watcher exhaustion under current code —
+PULL-ONLY daemons never START a watcher (daemon.ts:772-777); #477 filed for
+pull-only deployments generally (no fleet host runs pull-only now). Mode
+intent verified sticky (bare start preserves pull-only — the post-07-21
+protection works). **Reorg campaign cycle 1 MERGED (PR #478)**:
+RefreshStatusDeferralAssertions — status's hidden hygiene write behind
+StatusMaintenancePort+receipt, contract test red-first; honest close-out:
+~24 lines moved, status-cmd.ts 922→945 (shrink comes from the next two
+status cycles), safe-change context 4 files → 71-line seam. One flake
+recorded (git-state detached-pointer, proof complete, docs/flaky-tests.md).
+Wave 1 continues: ProjectWorkspaceStatusDetail → RenderWorkspaceStatusSurface.
+FM sudo password was shared in-session — founder should rotate it._
+
 _Session addendum (2026-07-26, late night): **#469 SHIPPED and field-confirmed
 (PR #476, design 209 ALIGNED r3): first post-boot publish went ops=81120/7.9MB
 → ops=1/603B on the Mac.** Mechanism pivoted mid-review (strip-from-wire was
