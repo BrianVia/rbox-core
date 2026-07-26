@@ -123,7 +123,7 @@ interface RigRepoRecord {
     checkoutPending?: boolean;
     heldRefs?: Record<string, string>;
   };
-  deferrals?: Record<string, { reason?: string; deferredSince?: string }>;
+  deferrals?: Record<string, { lane?: string; reason?: string; deferredSince?: string; reasonSince?: string }>;
 }
 
 interface RigSyncState {
@@ -413,7 +413,9 @@ GIT_AUTHOR_DATE='2026-03-08T00:00:00 +0000' GIT_COMMITTER_DATE='2026-03-08T00:00
           rec.assert("diverged sibling ref is held", bSide.out.trim() === beforeSide && sibling.out.trim() === beforeSide && incomingSide !== beforeSide, `held=${beforeSide.slice(0, 12)} incoming=${incomingSide.slice(0, 12)}`);
           const state = await readSyncState(ctx.b);
           const record = state.repoRecords?.[TOP];
-          rec.assert("diverged sibling records a non-checkout ownership hold", record?.partial?.checkoutPending === false && record.partial.heldRefs?.["refs/heads/side"] === "ownership" && record.deferrals?.apply?.reason === "worktree-ownership", JSON.stringify(record?.partial));
+          // Design 200 P2 / #462: a non-HEAD ownership hold is durable per ref,
+          // but must not escalate into a repository-level apply deferral.
+          rec.assert("diverged sibling records a non-checkout ownership hold", record?.pending !== undefined && record.partial?.checkoutPending === false && record.partial.heldRefs?.["refs/heads/side"] === "ownership" && record.deferrals?.apply === undefined, JSON.stringify(record));
         });
 
         await rec.step("removing sibling lets held side retry without another push", async () => {
@@ -462,7 +464,10 @@ GIT_AUTHOR_DATE='2026-03-08T00:00:00 +0000' GIT_COMMITTER_DATE='2026-03-08T00:00
           await ctx.a.rbox(["push"], { cwd: GUEST.workDir });
           await ctx.b.rbox(["pull"], { cwd: GUEST.workDir });
 
-          const expectedReason = blocker === "edit" ? "local-edits" : blocker === "commit" ? "local-commits" : blocker === "index" ? "local-index" : "local-stash";
+          // Design 200 P2 / #462: the durable record keeps the classifier's
+          // selected reason; stash changes ORIG_HEAD, so local-operation wins
+          // the product's reason precedence over the accompanying stash hold.
+          const expectedReason = blocker === "edit" ? "local-edits" : blocker === "commit" ? "local-commits" : blocker === "index" ? "local-index" : "local-operation";
           const state = await readSyncState(ctx.b);
           const deferred = state.repoRecords?.[TOP]?.deferrals?.apply;
           rec.assert(`[${blocker}] exact durable reason`, deferred?.reason === expectedReason && state.repoRecords?.[TOP]?.pending !== undefined, JSON.stringify(deferred));
@@ -475,23 +480,61 @@ GIT_AUTHOR_DATE='2026-03-08T00:00:00 +0000' GIT_COMMITTER_DATE='2026-03-08T00:00
           else if (blocker === "index") rec.assert("staged-only index preserved", (await gitExec(ctx.b, topB, ["write-tree"])).out.trim() === protectedValue, protectedValue.slice(0, 12));
           else rec.assert("local stash remains reachable", (await gitExec(ctx.b, topB, ["rev-parse", "refs/stash"])).out.trim() === protectedValue && (await gitExec(ctx.b, topB, ["cat-file", "-e", `${protectedValue}^{commit}`])).code === 0, protectedValue.slice(0, 12));
 
-          const human = await ctx.b.rbox(["status"], { cwd: GUEST.workDir, allowFail: true, env: { NO_COLOR: "1" } });
-          const renderedReason = blocker === "edit" ? "local edits" : blocker === "commit" ? "local commits" : blocker === "index" ? "local index changes" : "local stash";
+          const human = await ctx.b.rbox(["status", "--git"], { cwd: GUEST.workDir, allowFail: true, env: { NO_COLOR: "1" } });
           const humanLine = human.stdout.trim().split("\n").find((line) => line.includes("git deferred") && line.includes(TOP));
-          rec.assert(`[${blocker}] human status shows aged reason`, humanLine?.includes(renderedReason) === true && /git deferred\s+\d+[smhd]:/.test(humanLine), humanLine ?? "missing deferral line");
           const jsonStatus = await ctx.b.rbox(["status", "--json"], { cwd: GUEST.workDir, allowFail: true });
-          let visible: { repo?: string; reason?: string; deferredSince?: string; ageSeconds?: number } | undefined;
+          let visible: { repo?: string; lane?: string; reason?: string; deferredSince?: string; reasonSince?: string; ageSeconds?: number | null; bytesChanged?: boolean; checkout?: { kind?: string; label?: string } } | undefined;
           try {
-            const parsed = JSON.parse(jsonStatus.stdout) as { git?: { deferrals?: Array<{ repo?: string; reason?: string; deferredSince?: string; ageSeconds?: number }> } };
-            visible = parsed.git?.deferrals?.find((entry) => entry.repo === TOP && entry.reason === expectedReason);
+            const parsed = JSON.parse(jsonStatus.stdout) as { git?: { deferrals?: Array<{ repo?: string; lane?: string; reason?: string; deferredSince?: string; reasonSince?: string; ageSeconds?: number | null; bytesChanged?: boolean; checkout?: { kind?: string; label?: string } }> } };
+            visible = parsed.git?.deferrals?.find((entry) => entry.repo === TOP && entry.lane === "apply");
           } catch {
             visible = undefined;
           }
-          rec.assert(`[${blocker}] JSON status exposes stable age`, visible?.deferredSince === deferred?.deferredSince && typeof visible?.ageSeconds === "number", JSON.stringify(visible));
+          // Design 200 P2 / #462: transient holds stay out of status --git's
+          // ten-minute quiet window, while JSON is the immediate user-visible
+          // reason surface; no repo-level line is promised at this age.
+          rec.assert(`[${blocker}] current status surfaces expose reason`, humanLine === undefined && visible?.lane === "apply" && visible.reason === expectedReason, JSON.stringify({ humanLine, visible }));
+          // Design 200 P2 / #462: JSON exposes the durable lane timestamps plus
+          // a derived age, rather than relying on the quieted human line.
+          rec.assert(`[${blocker}] JSON status exposes stable age`, visible?.reason === expectedReason && typeof visible.deferredSince === "string" && visible.deferredSince === deferred?.deferredSince && typeof visible.reasonSince === "string" && visible.reasonSince === deferred?.reasonSince && typeof visible.ageSeconds === "number" && Number.isInteger(visible.ageSeconds) && visible.ageSeconds >= 0 && visible.bytesChanged === false && visible.checkout?.kind === "branch" && visible.checkout.label === "main", JSON.stringify(visible));
+
+          let expectedDeferredSince = deferred?.deferredSince;
+          if (blocker === "edit") {
+            // Design 200 aged visibility: cross the transient quiet window and retain
+            // design 176's frozen human `git deferred` grammar as a live rig consumer.
+            await ctx.b.daemonStop(GUEST.workDir);
+            const statePath = `${GUEST.workDir}/.rbox/state.json`;
+            const rawState = await ctx.b.readFile(statePath);
+            const applyDeferral = state.repoRecords?.[TOP]?.deferrals?.apply;
+            if (typeof applyDeferral?.deferredSince !== "string" || typeof applyDeferral.reasonSince !== "string") {
+              throw new Error(`missing ${TOP} apply-lane timestamps before aged visibility: ${JSON.stringify(applyDeferral)}`);
+            }
+            const agedAt = new Date(Date.now() - 11 * 60_000).toISOString();
+            const replaceTimestampOnce = (source: string, field: "deferredSince" | "reasonSince", current: string): string => {
+              const token = `${JSON.stringify(field)}: ${JSON.stringify(current)}`;
+              if (source.split(token).length !== 2) {
+                throw new Error(`expected exactly one ${field} token for ${TOP} apply deferral`);
+              }
+              return source.replace(token, `${JSON.stringify(field)}: ${JSON.stringify(agedAt)}`);
+            };
+            const agedState = replaceTimestampOnce(
+              replaceTimestampOnce(rawState, "deferredSince", applyDeferral.deferredSince),
+              "reasonSince",
+              applyDeferral.reasonSince,
+            );
+            await ctx.b.writeFile(statePath, agedState);
+            await ctx.b.daemonStart(GUEST.workDir);
+
+            const agedHuman = await ctx.b.rbox(["status", "--git"], { cwd: GUEST.workDir, allowFail: true, env: { NO_COLOR: "1" } });
+            const agedHumanLine = agedHuman.stdout.trim().split("\n").find((line) => line.includes(TOP) && /git deferred\s+\d+[smhd]:/.test(line));
+            rec.assert("[edit] aged human status uses frozen grammar and rendered reason", agedHumanLine?.includes("local edits") === true, agedHumanLine ?? agedHuman.stdout.trim().slice(-800));
+            await ctx.b.daemonStop(GUEST.workDir);
+            expectedDeferredSince = agedAt;
+          }
 
           await ctx.b.rbox(["pull"], { cwd: GUEST.workDir });
           const retried = await readSyncState(ctx.b);
-          rec.assert(`[${blocker}] retry preserves deferredSince`, retried.repoRecords?.[TOP]?.deferrals?.apply?.deferredSince === deferred?.deferredSince, retried.repoRecords?.[TOP]?.deferrals?.apply?.deferredSince ?? "missing");
+          rec.assert(`[${blocker}] retry preserves deferredSince`, retried.repoRecords?.[TOP]?.deferrals?.apply?.deferredSince === expectedDeferredSince, retried.repoRecords?.[TOP]?.deferrals?.apply?.deferredSince ?? "missing");
 
           const aBytes = await ctx.a.readFile(`${topA}/a.txt`);
           if (blocker === "edit") await ctx.b.writeFile(`${topB}/a.txt`, aBytes);

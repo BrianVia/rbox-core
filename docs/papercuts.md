@@ -272,3 +272,9 @@ what happened, what it cost, fix hint if obvious.
   The last message overwrote the full review the prompt asked codex to write
   to the same path; findings had to be recovered from the 38MB session
   stream. Keep the two paths distinct.
+
+## RboxBar popover shows no real transfer progress (2026-07-26)
+During a push, the menu-bar popover shows `Status: working / File: – / Progress: working…` — three placeholder rows. Founder ask: show actual push/pull progress — direction, file name(s), quantity (e.g. "pushing 48 files · 12/48 · 205 KB"), and a real progress bar. The daemon already has per-phase counts (upload lane knows files/bytes/inflight); the popover just doesn't consume them.
+
+## `rbox start` over a running daemon reports ambiguous half-success (2026-07-26)
+With a (dev-build) daemon already running, `rbox start` spawns a new process that loses the single-instance lock and dies — but the CLI prints "background sync (process N) started, but its mode is not witnessed yet — re-run `rbox start` in a moment". Two fixes: (1) detect the existing daemon and say "already running (pid …, version …)" — including a mismatch note when the running binary differs (rbox vs rbox-dev); (2) the witness confirmation should be the CLI's job — poll briefly and report the witnessed mode instead of asking the user to re-run (founder rule: minimize user typing). Hit 3× today (both hosts' restarts + founder's manual start on FM).
