@@ -22,7 +22,7 @@ interface HaltInternals {
   start(): Promise<void>;
   stop(): Promise<void>;
   startWatcherFn: (...args: unknown[]) => Promise<{ close(): Promise<void> }>;
-  replaceManifestFromScan(...args: unknown[]): Promise<unknown>;
+  localObserver: { observe(...args: unknown[]): Promise<unknown> };
   handleWsMessageData(data: string): void;
 }
 
@@ -158,7 +158,7 @@ test("poisoned startup arms handles once, skips the direct scan, and heal does n
     deliverWatcher = args[2] as (events: unknown[]) => void;
     return { backend: "parcel", close: async () => {} };
   };
-  d.replaceManifestFromScan = async () => { startupScans++; return undefined; };
+  d.localObserver.observe = async () => { startupScans++; return undefined; };
   await fs.mkdir(path.dirname(resetJournalPath(root)), { recursive: true });
   await fs.writeFile(resetJournalPath(root), "{poisoned-startup");
   try {

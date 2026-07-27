@@ -83,7 +83,7 @@ interface DaemonInternals {
   rulesChangedSinceDeepScan: boolean;
   syncBase?: SyncState;
   want: { pull: boolean; push: boolean; fullScan: boolean; deepScan: boolean };
-  writeFinishRetryTimers: Set<ReturnType<typeof setTimeout>>;
+  retryQueue: { stop(): void; scheduleWriteFinish(paths: Set<string>): void };
   pendingEvents: { relPath: string; kind: string }[];
   unsettledPaths: Set<string>;
   lastManifestUpdate?: ManifestUpdate;
@@ -106,11 +106,10 @@ interface DaemonInternals {
   startLiveWatch(): Promise<void>;
   loadSyncBase(): Promise<SyncState>;
   rebuildMatcher(state?: { lastSyncedManifest: Manifest }): void;
-  scheduleWriteFinishRetry(paths: Set<string>): void;
   buildTrustedPullView(base: SyncState): Promise<TrustedPullViewResult>;
-  replaceManifestFromScan(
-    cache: HashCache, previous: Manifest, stats: undefined, kind: undefined, mode: "pruned" | "unpruned",
-  ): Promise<{ deferred: Set<string>; coverage: string }>;
+  localObserver: {
+    observe(plan: { kind: "scan"; cache: HashCache; previous: Manifest; mode: "pruned" | "unpruned" }): Promise<{ deferredPaths: ReadonlySet<string>; coverage: string }>;
+  };
 }
 
 let root: string;
@@ -124,7 +123,7 @@ beforeEach(async () => {
   lines = [];
 });
 afterEach(async () => {
-  for (const t of daemon?.writeFinishRetryTimers ?? []) clearTimeout(t);
+  daemon?.retryQueue.stop();
   for (const audit of daemon?.openDriftAudits ?? []) if (audit.timer) clearTimeout(audit.timer);
   daemon = undefined;
   delete process.env.RBOX_PULL_TRUST_WATCHER;
@@ -183,7 +182,7 @@ async function armed(remote: MiniRemote, backend: "parcel" | "chokidar" = "parce
   d.manifestObservationComplete = true;
   d.activeCaseCollisions = [];
   d.resetLifecycle = "ready";
-  await d.replaceManifestFromScan(d.cache, after.lastSyncedManifest, undefined, undefined, "unpruned");
+  await d.localObserver.observe({ kind: "scan", cache: d.cache, previous: after.lastSyncedManifest, mode: "unpruned" });
   lines.length = 0;
   return d;
 }
@@ -322,14 +321,14 @@ test("design 202: a write-finish give-up records the path as unsettled until a c
   await fs.writeFile(path.join(root, "m.txt"), "mid-write");
   const d = await armed(remote);
 
-  for (let i = 0; i < 16; i++) d.scheduleWriteFinishRetry(new Set(["m.txt"])); // MAX_RETRIES = 15
+  for (let i = 0; i < 16; i++) d.retryQueue.scheduleWriteFinish(new Set(["m.txt"])); // MAX_RETRIES = 15
   expect(d.unsettledPaths.has("m.txt")).toBe(true);
 
   const view = (await d.buildTrustedPullView(await d.loadSyncBase())).view!;
   expect(view.manifest.files.some((f) => f.path === "m.txt")).toBe(false); // stripped
   expect(view.deferred.has("m.txt")).toBe(true); // and exempted
 
-  await d.replaceManifestFromScan(d.cache, (await d.loadSyncBase()).lastSyncedManifest, undefined, undefined, "unpruned");
+  await d.localObserver.observe({ kind: "scan", cache: d.cache, previous: (await d.loadSyncBase()).lastSyncedManifest, mode: "unpruned" });
   expect(d.unsettledPaths.has("m.txt")).toBe(false); // healed by the covering scan
 });
 
@@ -598,7 +597,7 @@ test("design 206: a rebuild landing mid-scan leaves the installed manifest stamp
     }
   }
   const cache = new RebuildDuringWalk();
-  await d.replaceManifestFromScan(cache, base.lastSyncedManifest, undefined, undefined, "unpruned");
+  await d.localObserver.observe({ kind: "scan", cache, previous: base.lastSyncedManifest, mode: "unpruned" });
 
   expect(cache.fired).toBe(true);
   expect(d.manifestMatcherGeneration).not.toBe(d.matcherGeneration);

@@ -529,7 +529,7 @@ export async function encryptAndUpload(
  *  churning tree). A deferred file that was previously synced carries its base entry
  *  forward (never a phantom deletion on other machines); a never-synced deferred file
  *  is omitted. Preserves the git section from `local`. */
-export function deferManifest(local: Manifest, base: Manifest, deferred: Set<string>): Manifest {
+export function deferManifest(local: Manifest, base: Manifest, deferred: ReadonlySet<string>): Manifest {
   const baseByPath = new Map(base.files.map((f) => [f.path, f]));
   const files = local.files.filter((f) => !deferred.has(f.path));
   for (const p of deferred) {

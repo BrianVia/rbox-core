@@ -88,7 +88,7 @@ interface DaemonInternals {
   cache: InstanceType<typeof HashCache>;
   manifest: Manifest;
   want: { pull: boolean; push: boolean; fullScan: boolean; deepScan: boolean };
-  writeFinishRetryTimers: Set<ReturnType<typeof setTimeout>>;
+  retryQueue: { stop(): void };
   pump(): Promise<void>;
   loadSyncBase(): Promise<unknown>;
 }
@@ -101,7 +101,7 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   mutateWhenContent = undefined;
-  for (const t of daemon?.writeFinishRetryTimers ?? []) clearTimeout(t);
+  daemon?.retryQueue.stop();
   daemon = undefined;
   await fs.rm(root, { recursive: true, force: true });
 });
