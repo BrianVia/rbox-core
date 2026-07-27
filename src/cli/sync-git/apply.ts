@@ -2,16 +2,17 @@ import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { applyGitState, assertGitTargetWithinRoot, checkoutJournalPresent, clearCheckoutJournal, finalizeGitChainTimings, gitIdentity, gitIdentityKey, gitPreflight, indexIdentityV2, inspectLockedPRepairReceipt, isGitBusy, persistPRepairTerminal, preserveGitConflict, receiverEquivalentCollisionNames, repoCtxFromDisk, poolMap, readBaseAbsentArtifact, readBasePresentArtifact, runLockedPRepairAttempt, resumeLockedAcceptedPRepair, refreshLockedAcceptedPRepair, settleBaseAbsentArtifact, type AppliedManifestOracle, type ApplyBranchTransitionAdapter, type ApplyBranchTransitionInput, type CheckoutCapabilityProbe, type GitIdentity, type GitChainTimings, type GitSection, type IgnoreMatcher, type Manifest, type BlobStore, type RepoCtx, zeroGitChainTimings } from "../../engine/index.js";
-import { canonicalizeGitConfig, sanitizeGitSectionForPersistence, validateCanonicalGitConfig, type GitConfig } from "../../engine/git/config-sync.js";
-import { applyConfigTransaction, materializeFreshGitConfig, readConfigSnapshot, readParsedConfigSnapshot, sameConfigStatToken, type ConfigStatToken, type ConfigTransactionResult } from "../../engine/git/config-txn.js";
+import { canonicalizeGitConfig, sanitizeGitSectionForPersistence } from "../../engine/git/config-sync.js";
+import { applyConfigTransaction, materializeFreshGitConfig, readParsedConfigSnapshot } from "../../engine/git/config-txn.js";
 import { readAllRefs, readAllRefsStrict } from "../../engine/git/refs.js";
 import { git, readHead, warnOnce } from "../../engine/git/shared.js";
-import { DEFERRAL_LANES, expectedStateNonce, loadRawState, repoRecordsForState, type ConfigShapeIdentity, type GitDeferral, type GitDeferralReason, type GitHeldAttempt, type GitPartialApply, type RepoRecord, type RepoRecordInput, type SyncState, type TypedBlocker, type WorkspaceConfig } from "../config.js";
-import { completeConfigApply, configLaneState, inputRecord, type ConfigLaneState, type GitDeferralUpdates } from "../sync-state.js";
+import { DEFERRAL_LANES, expectedStateNonce, loadRawState, repoRecordsForState, type GitDeferral, type GitDeferralReason, type GitHeldAttempt, type GitPartialApply, type RepoRecord, type RepoRecordInput, type SyncState, type TypedBlocker, type WorkspaceConfig } from "../config.js";
+import { configLaneState, inputRecord, type ConfigLaneState, type GitDeferralUpdates } from "../sync-state.js";
 import { checkoutJournalBinding, clearFollowJournal, deriveBaseIndexProjection, firstReason, followDivergedRepo, FollowCrashInjectedError, quarantineUnboundFollowJournal, recoverAndLandFollowJournal, type FollowCrashPoint, type FollowIntended, type FollowProgress } from "./follow.js";
-import { checkoutLabel, configInvalidSkipLogged, configOwnershipSkipLogged, repoDirOf, localDivergedFromBase, narrowerScope, projectedKey, emptyToUndef, errMsg, chainLock, gitApplyMutationKey, nestedRepoChains, gitApplyConcurrency, gitFollowEnabled, gitIncomingKey, nextDeferral, repoEquivalenceWarningLogged, sectionOpState } from "./shared.js";
+import { checkoutLabel, repoDirOf, localDivergedFromBase, narrowerScope, projectedKey, emptyToUndef, errMsg, chainLock, gitApplyMutationKey, nestedRepoChains, gitApplyConcurrency, gitFollowEnabled, gitIncomingKey, nextDeferral, repoEquivalenceWarningLogged, sectionOpState } from "./shared.js";
 import { executeRemoteRepositoryDeletion, planRemoteRepositoryDeletion, sweepRemovedRepoSkeleton, type RemoteRepositoryDeletionEffects, type RemoteRepositoryDeletionIdentity, type RepoSkeletonSweepOptions } from "./remote-repository-deletion.js";
-import { gitConfigHash, readLocalGitConfig, sameConfigShape, configReceiver } from "./config-lane.js";
+import { configReceiver } from "./config-lane.js";
+import { ConfigLaneLedger, applyReceivedGitConfig, classifyIncomingConfigSanitation, planReceivedGitConfigApply, planReceivedGitConfigBaseline, planReceivedGitConfigTarget, type GitConfigExecutor, type ReceivedGitConfigIdentity, type ReceivedGitConfigPlan } from "./received-git-config.js";
 import { prepareFollowerBranchProtocol } from "./follower-protocol.js";
 import { createPRepairStatePort } from "./p-repair-state.js";
 import { settleExactPresentArtifact } from "./p-settlement.js";
@@ -417,9 +418,10 @@ opts: {
     return group;
   };
 
-  const laneRecord = (rel: string): RepoRecordInput => ({
-    sourceSeq: records[rel]?.sourceSeq ?? state.lastSyncedSequence,
-    ...(configLane[rel] ?? configLaneState(records[rel] ?? { repoGen: 0, sourceSeq: state.lastSyncedSequence })),
+  const laneLedger = new ConfigLaneLedger({
+    lane: configLane,
+    sourceSeq: (rel) => records[rel]?.sourceSeq ?? state.lastSyncedSequence,
+    storedLane: (rel) => configLaneState(records[rel] ?? { repoGen: 0, sourceSeq: state.lastSyncedSequence }),
   });
   const currentDeferral = (rel: string, lane: GitDeferral["lane"]): GitDeferral | undefined => {
     const transition = deferrals[rel];
@@ -457,34 +459,6 @@ opts: {
     if (!ctx) return undefined;
     return checkoutLabel(await readHead(ctx).catch(() => ""));
   };
-  const replaceLane = (rel: string, record: RepoRecordInput): void => {
-    configLane[rel] = configLaneState(record);
-  };
-  const invalidateLaneShape = (rel: string, shape: ConfigShapeIdentity | undefined): RepoRecordInput => {
-    const current = laneRecord(rel);
-    if (sameConfigShape(current.cfgShape, shape)) return current;
-    const reset: RepoRecordInput = { sourceSeq: current.sourceSeq, ...(shape === undefined ? {} : { cfgShape: shape }) };
-    replaceLane(rel, reset);
-    return reset;
-  };
-  const completeLane = (
-    rel: string,
-    shape: ConfigShapeIdentity,
-    hashes: { pre: string; post: string; incoming: string; basePre?: string; postToken: ConfigStatToken }
-  ): void => {
-    replaceLane(rel, {
-      ...completeConfigApply(laneRecord(rel), {
-        pre: hashes.pre,
-        post: hashes.post,
-        incoming: hashes.incoming,
-        ...(hashes.basePre === undefined ? {} : { basePre: hashes.basePre }),
-        postToken: hashes.postToken,
-      }),
-      cfgShape: shape,
-    });
-  };
-  const configFailure = (result: Exclude<ConfigTransactionResult, { status: "completed" }>): Error =>
-    new Error(`config ${result.status}: ${result.fault.reason}`);
   const runMutation = async <T>(repository: string, fn: () => Promise<T>): Promise<T> => {
     const lease = opts.mutationBoundary?.enter({ phase: "git-commit", repository });
     if (lease && !lease.beginCommit()) {
@@ -498,55 +472,37 @@ opts: {
     }
   };
 
-  /** Run the config mutation only after the caller has selected the correct Git
-   * disposition. Existing repos use the optimistic locked transaction; a truly
-   * fresh repo uses the step-3 private-target helper. */
-  const runConfigApply = async (
-    rel: string,
-    repoDir: string,
-    incoming: GitConfig,
-    baseConfig: GitConfig | undefined,
-    receiver: { fresh: true } | { fresh: false; shape: ConfigShapeIdentity; configPath: string }
-  ): Promise<void> => {
-    if (receiver.fresh) {
-      await runMutation(repoDir, () =>
-        (opts.materializeFreshConfig ?? materializeFreshGitConfig)(repoDir, incoming, path.join(repoDir, ".git")));
-      const ctx = await repoCtxFromDisk(repoDir);
+  /** Bind the config effects to ONE phase. The phase — and, inside a follow
+   * lock, the serialized common dir — is what refuses a foreign plan; the
+   * executor never re-derives either from the plan it is handed. */
+  const configExecutorFor = (
+    identity: ReceivedGitConfigIdentity,
+    phase: GitConfigExecutor["phase"],
+    commonDirToken?: string,
+  ): GitConfigExecutor => ({
+    identity,
+    phase,
+    ...(commonDirToken === undefined ? {} : { commonDirToken }),
+    ledger: laneLedger,
+    materializeFresh: async (incoming) => {
+      await runMutation(identity.repoDir, () => (opts.materializeFreshConfig ?? materializeFreshGitConfig)(
+        identity.repoDir, incoming, path.join(identity.repoDir, ".git")));
+    },
+    inspectFreshInstall: async () => {
+      const ctx = await repoCtxFromDisk(identity.repoDir);
       if (!ctx) throw new Error("fresh config apply lost repository context");
       const owned = await configReceiver(root, ctx);
       if (!owned.owned) throw new Error("fresh config target is not receiver-owned");
-      const installed = await readParsedConfigSnapshot(repoDir, owned.configPath, "locked");
+      const installed = await readParsedConfigSnapshot(identity.repoDir, owned.configPath, "locked");
       if (!installed.ok) throw new Error(`fresh config post-read: ${installed.fault.reason}`);
       const post = canonicalizeGitConfig(installed.snapshot.entries);
       if (!post.ok) throw new Error(`fresh config post-parse: ${post.reason}`);
-      completeLane(rel, owned.shape, {
-        pre: gitConfigHash({}),
-        post: gitConfigHash(post.config),
-        incoming: gitConfigHash(incoming),
-        ...(baseConfig === undefined ? {} : { basePre: gitConfigHash(baseConfig) }),
-        postToken: installed.snapshot.token,
-      });
-      return;
-    }
-
-    const result = await runMutation(repoDir, () =>
-      (opts.applyConfig ?? applyConfigTransaction)(repoDir, receiver.configPath, incoming, { baseConfig }));
-    if (result.status !== "completed") throw configFailure(result);
-    for (const warning of result.warnings) {
-      try {
-        glog(`git-sync WARNING ${rel}: config ${warning}`);
-      } catch {
-        // Observability after the rename commit point is strictly non-fatal.
-      }
-    }
-    completeLane(rel, receiver.shape, {
-      pre: result.preHash,
-      post: result.postHash,
-      incoming: result.incomingHash,
-      ...(result.baseHash === undefined ? {} : { basePre: result.baseHash }),
-      postToken: result.postToken,
-    });
-  };
+      return { shape: owned.shape, config: post.config, token: installed.snapshot.token };
+    },
+    applyExisting: (configPath, incoming, baseConfig) => runMutation(identity.repoDir, () =>
+      (opts.applyConfig ?? applyConfigTransaction)(identity.repoDir, configPath, incoming, { baseConfig })),
+    log: glog,
+  });
 
   const installRecoveredRecord = (rel: string, record: RepoRecord): void => {
     records[rel] = record;
@@ -557,85 +513,30 @@ opts: {
     if (record.resolutionKey) needsRes[rel] = record.resolutionKey; else delete needsRes[rel];
   };
 
-  const processRepo = async (rel: string, chainTimings?: GitChainTimings): Promise<{ result: GitApplyRepoResult; commonDirGroup?: number }> => {
+  const processRepo = async (rel: string, chainTimings: GitChainTimings | undefined, lockKey: string): Promise<{ result: GitApplyRepoResult; commonDirGroup?: number }> => {
     const wireRemoteSec = remote.gitRepos?.[rel];
     const remoteSec = wireRemoteSec === undefined ? undefined : sanitizeGitSectionForPersistence(wireRemoteSec);
-    let sanitizedConfigReason: string | undefined;
-    if (wireRemoteSec?.config !== undefined) {
-      const config = validateCanonicalGitConfig(wireRemoteSec.config);
-      sanitizedConfigReason = !config.ok
-        ? config.reason
-        : wireRemoteSec.refScope === "scoped"
-          ? "scoped git section cannot carry config"
-          : undefined;
-      if (sanitizedConfigReason) {
-        const logKey = `${root}\0${rel}`;
-        if (!configInvalidSkipLogged.has(logKey)) {
-          configInvalidSkipLogged.add(logKey);
-          glog(`git-sync WARNING ${rel}: ignored invalid incoming config (${sanitizedConfigReason}); Git state continues`);
-        }
-      }
-    }
     const incomingKey = remoteSec === undefined ? undefined : gitIncomingKey(remoteSec);
     let baseSec = baseRepos[rel];
     let pend = pending[rel];
     const repoDir = repoDirOf(root, rel);
+    const configIdentity: ReceivedGitConfigIdentity = { root, relPath: rel, repoDir };
+    const sanitizedConfigReason = classifyIncomingConfigSanitation(configIdentity, wireRemoteSec, glog);
     let dotGit = await fs.lstat(path.join(repoDir, ".git")).catch(() => undefined);
     const getDiskCtx = asyncMemo(async () => dotGit ? await repoCtxFromDisk(repoDir).catch(() => undefined) : undefined);
     const commonDirGroup = commonDirGroupFor(await getDiskCtx());
 
-    // Sanitizing an invalid incoming config must not make the next push author a
-    // corrective echo. Record the unchanged owned local config as the config-lane
-    // baseline; only a later genuine local edit is publishable.
-    if (sanitizedConfigReason && !opts.disableConfigLane && dotGit) {
-      const configCtx = await getDiskCtx();
-      if (configCtx?.kind === "dir") {
-        const receiver = await configReceiver(root, configCtx).catch(() => undefined);
-        if (receiver?.owned) {
-          const local = await readLocalGitConfig(root, rel, configCtx, undefined, () => {
-            const logKey = `${root}\0${rel}`;
-            if (!configInvalidSkipLogged.has(`${logKey}\0credential`)) {
-              configInvalidSkipLogged.add(`${logKey}\0credential`);
-              glog(`git-sync WARNING ${rel}: skipped credential-bearing remote URL from config baseline`);
-            }
-          });
-          if (local.status === "ok") {
-            const beforeLane = laneRecord(rel);
-            const lane = invalidateLaneShape(rel, receiver.shape);
-            const priorBaseline = beforeLane.cfgShape === undefined || sameConfigShape(beforeLane.cfgShape, receiver.shape)
-              ? beforeLane.cfgSynced
-              : undefined;
-            replaceLane(rel, {
-              ...lane,
-              // Preserve an existing same-shape baseline: if the user changed
-              // A→B before this pull, B must remain publishable. Seed the current
-              // hash only for the first sanitation observation.
-              cfgSynced: priorBaseline ?? local.cached.hash,
-              cfgShape: receiver.shape,
-            });
-          }
-        }
-      }
-    } else if (wireRemoteSec && wireRemoteSec.config === undefined && !opts.disableConfigLane && dotGit) {
-      // Genuine wire absence is not sanitation. Clear an old authorship/baseline
-      // marker so the established presence rule can heal an old writer that
-      // stripped a valid config field. Invalid-present input takes the branch
-      // above and deliberately retains the local hash instead.
-      const beforeLane = laneRecord(rel);
-      // Ordinary wire absence only consumes an existing authorship baseline.
-      // Keep the context/ownership realpath cluster behind that pure marker:
-      // an otherwise empty lane has nothing to clear.
-      if (beforeLane.cfgSynced !== undefined) {
-        const configCtx = await getDiskCtx();
-        if (configCtx?.kind === "dir") {
-          const receiver = await configReceiver(root, configCtx).catch(() => undefined);
-          if (receiver?.owned) {
-            const { cfgSynced: _cfgSynced, ...withoutSynced } = beforeLane;
-            replaceLane(rel, withoutSynced);
-          }
-        }
-      }
-    }
+    const baselinePlan = await planReceivedGitConfigBaseline({
+      identity: configIdentity,
+      sanitizedReason: sanitizedConfigReason,
+      wireSection: wireRemoteSec,
+      laneDisabled: opts.disableConfigLane === true,
+      leftoverPresent: dotGit !== undefined,
+      repoContext: getDiskCtx,
+      ledger: laneLedger,
+      log: glog,
+    });
+    if (baselinePlan) await applyReceivedGitConfig(baselinePlan, configExecutorFor(configIdentity, baselinePlan.phase));
 
     // Design 116 recovery is the first per-repo operation in every arm. The
     // surrounding runRepo chain lock is already keyed by this common dir.
@@ -851,50 +752,33 @@ opts: {
       glog(`git-sync deferred ${rel}: ${reason}`);
     };
 
-    // Design 93 §6/§9. The config predicate is deliberately decided before
-    // EITHER unchanged shortcut. Receiver ownership is local shape, not sender
-    // shape; cross-shape rows skip config loudly once while Git keeps its existing
-    // disposition. A shape mismatch first clears the old lane markers and records
-    // the new identity in this pull's atomic repo transition.
-    let configDue = false;
-    let configTarget: { fresh: true } | { fresh: false; shape: ConfigShapeIdentity; configPath: string } | undefined;
-    if (!opts.disableConfigLane && remoteSec.config !== undefined) {
-      if (!dotGit) {
-        invalidateLaneShape(rel, undefined);
-        configDue = true;
-        configTarget = { fresh: true };
-      } else {
-        const diskCtx = await repoCtxFromDisk(repoDir).catch(() => undefined);
-        if (!diskCtx) {
-          invalidateLaneShape(rel, undefined);
-          const logKey = `${root}\0${rel}`;
-          if (!configOwnershipSkipLogged.has(logKey)) {
-            configOwnershipSkipLogged.add(logKey);
-            glog(`git-sync config skipped ${rel}: receiver repository shape is unreadable/non-owned. rbox left shared Git settings alone; Git history can still sync.`);
-          }
-        } else {
-          const receiver = await configReceiver(root, diskCtx);
-          const lane = invalidateLaneShape(rel, receiver.shape);
-          if (!receiver.owned) {
-            const logKey = `${root}\0${rel}`;
-            if (!configOwnershipSkipLogged.has(logKey)) {
-              configOwnershipSkipLogged.add(logKey);
-              glog(`git-sync config skipped ${rel}: receiver ${diskCtx.kind} shape does not own the common config. rbox left shared Git settings alone; Git history can still sync.`);
-            }
-          } else {
-            configTarget = { fresh: false, shape: receiver.shape, configPath: receiver.configPath };
-            const current = await readConfigSnapshot(receiver.configPath);
-            const token = current.ok ? current.snapshot.token : undefined;
-            configDue = gitConfigHash(remoteSec.config) !== lane.cfgApplied || !sameConfigStatToken(token, lane.cfgToken);
-          }
-        }
-      }
-    }
+    const configDisposition = await planReceivedGitConfigTarget({
+      identity: configIdentity,
+      laneDisabled: opts.disableConfigLane === true,
+      incoming: remoteSec.config,
+      leftoverPresent: dotGit !== undefined,
+      ledger: laneLedger,
+      log: glog,
+    });
+    const configDue = configDisposition.due;
+    const configTarget = configDisposition.target;
     if (!opts.disableConfigLane && !configDue) clearDeferral(rel, "config");
 
-    const tryConfigApply = async (): Promise<boolean> => {
+    const configApplyPlan = (
+      phase: "config-only" | "after-materialization" | "inside-follow-lock",
+      commonDirToken?: string,
+    ): ReceivedGitConfigPlan | undefined => planReceivedGitConfigApply({
+      identity: configIdentity,
+      phase,
+      disposition: configDisposition,
+      incoming: remoteSec.config,
+      baseConfig: inheritedConfigBase,
+      ...(commonDirToken === undefined ? {} : { commonDirToken }),
+    });
+
+    const tryConfigApply = async (plan: ReceivedGitConfigPlan, executor: GitConfigExecutor): Promise<boolean> => {
       try {
-        await runConfigApply(rel, repoDir, remoteSec.config!, inheritedConfigBase, configTarget!);
+        await applyReceivedGitConfig(plan, executor);
         clearDeferral(rel, "config");
         return true;
       } catch (error) {
@@ -929,8 +813,9 @@ opts: {
 
     let configFailed = false;
     const applyConfigOnly = async (): Promise<boolean> => {
-      if (!configDue || !configTarget || configTarget.fresh) return !configDue;
-      if (await tryConfigApply()) return true;
+      const plan = configApplyPlan("config-only");
+      if (!plan) return !configDue;
+      if (await tryConfigApply(plan, configExecutorFor(configIdentity, "config-only"))) return true;
       configFailed = true;
       partial[rel] = partialFrom({ appliedRefs: {}, heldRefs: {}, configApplied: false }, false);
       return true;
@@ -1126,8 +1011,9 @@ opts: {
       }
 
       const runFollowConfig = async (): Promise<boolean> => {
-        if (!configDue || !configTarget || configTarget.fresh || remoteSec.config === undefined) return !configDue || configTarget === undefined;
-        return tryConfigApply();
+        const plan = configApplyPlan("inside-follow-lock", lockKey);
+        if (!plan) return !configDue || configTarget === undefined;
+        return tryConfigApply(plan, configExecutorFor(configIdentity, "inside-follow-lock", lockKey));
       };
 
       const binding = await checkoutJournalBinding(state.stream, expectedStateNonce(state), ctx);
@@ -1394,7 +1280,7 @@ opts: {
           const next = nextDeferral("apply", effectiveDeferrals.apply, heldReason, new Date().toISOString(), incomingKey, await checkoutOf(repoDir));
           effectiveDeferrals.apply = next;
         } else delete effectiveDeferrals.apply;
-        const lane = laneRecord(rel);
+        const lane = laneLedger.record(rel);
         const part = held || !progress.configApplied ? partialFrom(progress, false) : undefined;
         const previous = records[rel];
         const previousRecord = previous === undefined ? undefined : inputRecord(previous);
@@ -1676,8 +1562,9 @@ opts: {
       }
       const held = Object.entries(res.heldRefs ?? {}).sort(([a], [b]) => a.localeCompare(b));
       let configApplied = !configDue || configTarget === undefined;
-      if (configDue && configTarget && remoteSec.config !== undefined) {
-        configApplied = await tryConfigApply();
+      const materializedConfigPlan = configApplyPlan("after-materialization");
+      if (materializedConfigPlan) {
+        configApplied = await tryConfigApply(materializedConfigPlan, configExecutorFor(configIdentity, "after-materialization"));
       }
       if (held.length > 0) {
         pending[rel] = remoteSec;
@@ -1818,7 +1705,7 @@ opts: {
       const lockKey = await gitApplyMutationKey(root, rel);
       await chainLock(commonDirLocks, lockKey, async () => {
         startedAt = Date.now();
-        const processed = await processRepo(rel, chainTimings);
+        const processed = await processRepo(rel, chainTimings, lockKey);
         result = processed.result;
         commonDirGroup = processed.commonDirGroup;
       });
