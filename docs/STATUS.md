@@ -5,6 +5,31 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_EVENING RIDER 2026-07-27: **the sensible-defaults purge + parallel streams.**
+CLI surface: founder+codex decision memo merged (#510, supersedes the
+51-command inventory); memo steps 1-2 SHIPPED (#511 — default help shows
+real [PATH] signatures, `start` front-door overload removed; setup demoted
+from first screen per founder). #512: RBOX_HOME credential isolation
+(#505 closed) + doctor positional [PATH]; 9 cli-audit defects filed
+(#513-#521; #517 = plaintext recovery phrase on non-macOS, has teeth).
+Blob-pack arc COMPLETE: #509 writer default-on after FM fast-pipe proof
+(48.7→75-82 Mbps, 1.54x, per-connection at line rate). Crypto (#508):
+profiling proved the encrypt lane memory/VFS-bound — cores-derived worker
+default ran BELOW one serial core; cross-fleet sweep (3 architectures,
+12/12) fixed the knee at 4; fused path (d99, dark) proven
+address-identical → #522 ships fused default-on + 4-worker cap +
+**defaults-ledger test** (every perf flag's default pinned in one reviewed
+table — the fix for the shipped-dark class; 4th instance found today).
+115's calibration addendum superseded (falsified). Design 212 (selective
+sync, Max's ask) ALIGNED r3 under the cap: pull-only scoped bindings,
+three-layer publish seal + witness-integrity, r1's 15 findings banked as
+the V2/read-write entry fee; implementation not started. Design 211
+(binding registry + status/doctor --all) agent mid-review, PR pending.
+**Fleet build #10 (1.9.1-dev+6a33b0c): all hosts, bare-started — ZERO
+load-bearing env vars remain on the fleet.** Next-frontier notes: pack
+lane's ~2.3Gbps fused plateau = main-isolate serialization (post-zstd);
+decrypt lane worker count unmeasured._
+
 _DAY SESSION 2026-07-27 (afternoon, "re-evaluating life"): **desktop
 REJOINED the fleet + two features shipped + prod promoted.**
 (1) via-desktop-ubuntu is a fleet member again: the in-place `--adopt` of
