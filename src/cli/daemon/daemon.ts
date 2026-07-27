@@ -15,7 +15,6 @@ import {
   isIgnoreRuleFile,
   HashCache,
   createScanStats,
-  actionPath,
   type IgnoreMatcher,
   type Manifest,
   type WatchEvent,
@@ -33,7 +32,7 @@ import { loadActivity, renderShellDeferrals, renderShellLine, saveActivity, save
 import { expectedStateNonce, loadConfig, loadState, repoRecordsForState, syncStreamId, trashConfig, type SyncState, type WorkspaceConfig } from "../config.js";
 import { pruneTrash } from "../../engine/trash.js";
 import { DAEMON_BOOT_ID_ENV, readDaemonPidRecord, recordDaemonBinding } from "./runtime-state.js";
-import { MassDeleteGuardError, PushConflictExhaustedError, TrustedViewRefusalError, pull, pushManifest, type SyncDeps, type TrustedLocalView } from "../sync.js";
+import { MassDeleteGuardError, PushConflictExhaustedError, pull, pushManifest, type SyncDeps, type TrustedLocalView } from "../sync.js";
 import type { TransferPhase, TransferProgressBytes } from "../transfer-progress.js";
 import { buildAuthedRemote } from "../e2ee-client.js";
 import { E2eeRemote } from "../e2ee-remote.js";
@@ -121,11 +120,16 @@ import {
   gitTopologyChanged,
   patchManifestFromPull,
   pullTrustWatcherEnabled,
-  type SkipCause,
   type TrustedPullViewResult,
 } from "./manifest-update.js";
 import { LocalAuthority } from "./local-observation-transition.js";
 import { classifyPublishOutcome, PublishLocalWorkspaceTransition } from "./daemon-publish-transition.js";
+import {
+  ApplyRemoteWorkspaceTransition,
+  buildTrustedPullView,
+  classifyPullOutcome,
+  type PullTrustFacts,
+} from "./daemon-pull-transition.js";
 import { cleanPath, LOG_PATHS_MAX, scanStatsLine, summarizeActions } from "./render.js";
 import { errCode, RotatingDaemonLogger, type DaemonLogSink } from "./logger.js";
 import { TelemetryQueue } from "../telemetry/queue.js";
@@ -1990,36 +1994,29 @@ export class RboxDaemon {
     return this.local.observationComplete && this.activeCaseCollisions.length === 0;
   }
 
-  /**
-   * Design 202 trust predicate P. Evaluated HERE — `pull()` stays policy-free — and
-   * returns the single-use local view, or `undefined` to leave the pull on today's
-   * byte-for-byte scan path. P3's drain is deliberately last: it is the only clause
-   * with a side effect, so a kill-switched or otherwise untrusted daemon behaves
-   * exactly as it did before this design.
-   */
-  private async buildTrustedPullView(base: SyncState): Promise<TrustedPullViewResult> {
-    if (!pullTrustWatcherEnabled()) return { skip: "kill-switch" };              // F5
-    if (!this.watcherTrustedForPull()) return { skip: "p1-watcher" };            // P1
-    if (!this.manifestSettledForPull()) return { skip: "p2-observation" };       // P2
-    if (!this.local.fullWorkspaceSinceSeed) return { skip: "p5-seed" };          // P5
-    if (this.resetLifecycle !== "ready") return { skip: "p6-reset" };            // P6
-    if (this.matcherGitReposKey !== gitReposMatcherKey(base)) return { skip: "p7-matcher" };            // P7
-    // Design 206 §2: provenance alone would re-engage trust over a manifest whose
-    // inclusion decisions predate the current matcher.
-    if (this.local.observedMatcherGeneration !== this.matcherGeneration) return { skip: "p7-matcher-observation" };
-    await this.applyPendingWatchEvents();                                        // P3
-    if (this.pendingEvents.length > 0) return { skip: "p3-pending" };
-    // The drain is P's only side-effecting clause and it awaits: re-read the two
-    // conditions it can itself invalidate rather than trusting the pre-drain read.
-    // Each re-check reports its own clause — never a token of its own.
-    if (!this.watcherTrustedForPull()) return { skip: "p1-watcher" };
-    if (!this.manifestSettledForPull()) return { skip: "p2-observation" };
-    // `deferred` aliases the live set deliberately: it is read-only to `pull()`
-    // (ReadonlySet) and every writer of the unsettled set is pump-owned code that
-    // cannot run while this op's `pull()` is in flight — watcher callbacks only
-    // enqueue events, and the pump is single-flight. The op therefore sees one
-    // consistent snapshot without copying it.
-    return { view: { manifest: this.local.trustedProjection(), deferred: this.local.unsettledPaths } };
+  /** The daemon-state readings design 202's trust predicate P is evaluated over.
+   *  `deferred` aliases the live unsettled set deliberately: it is read-only to
+   *  `pull()` (ReadonlySet) and every writer of that set is pump-owned code that cannot
+   *  run while this op's `pull()` is in flight — watcher callbacks only enqueue events,
+   *  and the pump is single-flight. The op therefore sees one consistent snapshot
+   *  without copying it. */
+  private pullTrustFacts(base: SyncState): PullTrustFacts {
+    return {
+      killSwitchOff: () => !pullTrustWatcherEnabled(),
+      watcherTrusted: () => this.watcherTrustedForPull(),
+      manifestSettled: () => this.manifestSettledForPull(),
+      fullWorkspaceSinceSeed: () => this.local.fullWorkspaceSinceSeed,
+      resetReady: () => this.resetLifecycle === "ready",
+      matcherMatchesBase: () => this.matcherGitReposKey === gitReposMatcherKey(base),
+      matcherObservationCurrent: () => this.local.observedMatcherGeneration === this.matcherGeneration,
+      drainPendingEvents: () => this.applyPendingWatchEvents(),
+      pendingEmpty: () => this.pendingEvents.length === 0,
+      trustedView: () => ({ manifest: this.local.trustedProjection(), deferred: this.local.unsettledPaths }),
+    };
+  }
+
+  private buildTrustedPullView(base: SyncState): Promise<TrustedPullViewResult> {
+    return buildTrustedPullView(this.pullTrustFacts(base));
   }
 
   /**
@@ -2030,18 +2027,45 @@ export class RboxDaemon {
    */
   private installPullPatch(
     local: Manifest,
-    actions: Action[],
+    actions: readonly Action[],
     postBase: Manifest,
     opWatcherErrorGeneration: number,
-  ): { ok: true; reason?: undefined } | { ok: false; reason: "watcher-drop" } {
-    if (this.watcherErrorGeneration !== opWatcherErrorGeneration) return { ok: false, reason: "watcher-drop" }; // F1
+  ): "watcher-drop" | undefined {
+    if (this.watcherErrorGeneration !== opWatcherErrorGeneration) return "watcher-drop"; // F1
     const patched = patchManifestFromPull(local, actions, postBase);
     // A conflict copy's content is unknown until something hashes it; the watcher
     // event that observes it settles it and the next push publishes it.
     this.local.commitPatch(patched.manifest, { kind: "partial", source: "pull-applied", paths: patched.paths }, {
       add: patched.unsettled,
     });
-    return { ok: true };
+    return undefined;
+  }
+
+  /** Chain repair mutates disk across historical sequences and its post-repair re-pull
+   *  must see that disk — both always scan (F4 also forces the post-pull scan), so only
+   *  the view passed in here can ever be trusted. */
+  private async runPull(deps: SyncDeps, view: TrustedLocalView | undefined, noteChainRepair: () => void): Promise<Action[]> {
+    try {
+      return await pull(this.root, this.cfg, deps, view);
+    } catch (error) {
+      if (!(error instanceof ManifestChainError)) throw error;
+      noteChainRepair();
+      let refusal: SuffixInfo[] | undefined;
+      const outcome = await repairChain(this.root, this.cfg, deps, error, {
+        confirmSupersede: async (suffix) => {
+          const selfOnly = this.chainRepairPolicy.confirmSupersede(suffix);
+          if (!selfOnly) refusal = suffix;
+          return selfOnly;
+        },
+      });
+      if (outcome.kind === "declined") {
+        const suffix = refusal ?? outcome.suffix;
+        throw this.chainRepairPolicy.halt(error, suffix);
+      }
+      return outcome.kind === "converged"
+        ? [...outcome.actions, ...await pull(this.root, this.cfg, deps)]
+        : outcome.actions;
+    }
   }
 
   private async doPull(syncMutex: WorkspaceSyncMutex, notifyLatencyMs?: number, notifyPendingAt?: number, carrier: Carrier = "none"): Promise<void> {
@@ -2050,135 +2074,88 @@ export class RboxDaemon {
       this.chainRepairPolicy.assertHeadAllowed(pin);
     }
     this.typeFlipsSincePull = 0; // per-op tally — a failed prior op's flips must not inflate this one's count
-    // Design 202. P4 is captured HERE, at op start, and re-checked immediately before
-    // the post-pull install; the pre-op base is F2's "before" side.
-    const opWatcherErrorGeneration = this.watcherErrorGeneration;
-    const preBase = this.syncBase ?? await this.loadSyncBase();
-    const trustResult = await this.buildTrustedPullView(preBase);
-    const metricsReport = beginReport("pull");
-    const report = metricsReport ?? (telemetryEnabled() ? PhaseReport.pull() : undefined);
-    // onGitLog: per-repo apply/conflict/defer forensics (design 43 §10) land in the daemon log.
-    // onPullApplied carries BOTH the forensic log line and the status trail — wired
-    // here and in doPush's deps so the pull inside push's 409 recovery is recorded
-    // identically; its actions are discarded by the retry loop.
-    let activeCarrier = carrier;
-    const pullDeps: SyncDeps = {
-      ...this.e2ee,
-      cache: this.cache,
-      syncMutex,
-      report,
-      onGitLog: this.log,
-      onGitDeferralsSaved: (state) => this.observeDurableGitState(state),
-      onProgress: (done, total, phase, detail, bytes) => this.onTransferProgress(done, total, phase, detail, bytes), // design 45 + 88
-      onPullApplied: (a) => {
-        this.creditAppliedCarrier(activeCarrier);
-        activeCarrier = "none";
-        this.recordPullApplied(a);
-      },
-      onTypeFlip: (rel) => this.noteTypeFlip(rel), // design 50 §3: forensic line + conflict count
-      telemetry: this.telemetry,
-      mutationBoundary: this.mutationGate,
-    };
-    // Chain repair mutates disk across historical sequences and its post-repair
-    // re-pull must see that disk — both always scan (F4 also forces the post-pull
-    // scan below), so only the view passed in here can ever be trusted.
     let chainRepaired = false;
-    const runPull = async (view?: TrustedLocalView): Promise<Action[]> => {
-      try {
-        return await pull(this.root, this.cfg, pullDeps, view);
-      } catch (error) {
-        if (!(error instanceof ManifestChainError)) throw error;
-        chainRepaired = true;
-        let refusal: SuffixInfo[] | undefined;
-        const outcome = await repairChain(this.root, this.cfg, pullDeps, error, {
-          confirmSupersede: async (suffix) => {
-            const selfOnly = this.chainRepairPolicy.confirmSupersede(suffix);
-            if (!selfOnly) refusal = suffix;
-            return selfOnly;
+    let activeCarrier = carrier;
+    await this.pullTransition.apply({
+      seal: async () => {
+        // Design 202. P4 is captured HERE, at op start, and re-checked immediately
+        // before the post-pull install; the pre-op base is F2's "before" side.
+        const watcherErrorGeneration = this.watcherErrorGeneration;
+        const preBase = this.syncBase ?? await this.loadSyncBase();
+        return { trust: await this.buildTrustedPullView(preBase), preBase, watcherErrorGeneration, notifyPendingAt };
+      },
+      open: () => {
+        const metricsReport = beginReport("pull");
+        const report = metricsReport ?? (telemetryEnabled() ? PhaseReport.pull() : undefined);
+        // onGitLog: per-repo apply/conflict/defer forensics (design 43 §10) land in the daemon log.
+        // onPullApplied carries BOTH the forensic log line and the status trail — wired
+        // here and in doPush's deps so the pull inside push's 409 recovery is recorded
+        // identically; its actions are discarded by the retry loop.
+        const pullDeps: SyncDeps = {
+          ...this.e2ee,
+          cache: this.cache,
+          syncMutex,
+          report,
+          onGitLog: this.log,
+          onGitDeferralsSaved: (state) => this.observeDurableGitState(state),
+          onProgress: (done, total, phase, detail, bytes) => this.onTransferProgress(done, total, phase, detail, bytes), // design 45 + 88
+          onPullApplied: (a) => {
+            this.creditAppliedCarrier(activeCarrier);
+            activeCarrier = "none";
+            this.recordPullApplied(a);
           },
-        });
-        if (outcome.kind === "declined") {
-          const suffix = refusal ?? outcome.suffix;
-          throw this.chainRepairPolicy.halt(error, suffix);
-        }
-        return outcome.kind === "converged"
-          ? [...outcome.actions, ...await pull(this.root, this.cfg, pullDeps)]
-          : outcome.actions;
-      }
-    };
-    // The ONE value describing which local view the main line actually read: the view
-    // when it consumed one, `undefined` when it scanned (never consumed, or refused
-    // and re-ran scan-backed). Everything downstream — the patch, the fallback, the
-    // log line — reads this, not a web of parallel flags.
-    let trustedLocal = trustResult.view;
-    // Design 206 §4: the CAUSE the main line had no trusted view, kept separate from
-    // the view itself so a refusal (which nulls the view after it was built) names
-    // itself instead of reappearing as a bare `local=scan`.
-    let initialSkip: SkipCause | "refused" | undefined = trustResult.skip;
-    let actions: Action[];
-    try {
-      actions = await runPull(trustedLocal);
-    } catch (error) {
-      if (!(error instanceof TrustedViewRefusalError)) throw error;
-      // Pre-action refusal: NOTHING touched disk. Re-run scan-backed exactly once per
-      // op — that run's guard behaves as it always has (a real wave still halts).
-      this.log(`pull local=trusted refused=${error.reason}`);
-      trustedLocal = undefined;
-      initialSkip = "refused";
-      actions = await runPull(undefined);
-    }
-    this.chainRepairPolicy.clear();
-    if (notifyPendingAt !== undefined) {
-      this.telemetry.record({ kind: "propagation", deliveryToApplyMs: Math.max(0, this.now() - notifyPendingAt) });
-    }
-    if (report) this.syncPhaseSampler.recordCompleted(report, "pull", this.telemetry);
-    metricsReport?.logSummaryTo((line) =>
-      this.log(notifyLatencyMs !== undefined ? `${line} notify_latency_ms=${notifyLatencyMs}` : line),
-    );
-    const fileConflicts = actions.filter((a) => a.kind === "conflict").length;
-    if (fileConflicts > 0) {
-      this.metrics.fileConflicts += fileConflicts;
+          onTypeFlip: (rel) => this.noteTypeFlip(rel), // design 50 §3: forensic line + conflict count
+          telemetry: this.telemetry,
+          mutationBoundary: this.mutationGate,
+        };
+        return {
+          execute: (request) => classifyPullOutcome(
+            request,
+            (view) => this.runPull(pullDeps, view, () => { chainRepaired = true; }),
+            () => chainRepaired,
+          ),
+          settleReport: () => {
+            if (report) this.syncPhaseSampler.recordCompleted(report, "pull", this.telemetry);
+            metricsReport?.logSummaryTo((line) =>
+              this.log(notifyLatencyMs !== undefined ? `${line} notify_latency_ms=${notifyLatencyMs}` : line),
+            );
+          },
+        };
+      },
+    });
+  }
+
+  private readonly pullTransition = new ApplyRemoteWorkspaceTransition({
+    clearChainRepair: () => this.chainRepairPolicy.clear(),
+    recordPropagation: (pendingAt) => {
+      this.telemetry.record({ kind: "propagation", deliveryToApplyMs: Math.max(0, this.now() - pendingAt) });
+    },
+    recordFileConflicts: async (count) => {
+      this.metrics.fileConflicts += count;
       this.metrics.lastConflictAt = new Date().toISOString();
       await saveMetrics(this.root, this.metrics);
-    }
-    // A pull that WROTE an ignore-rule file must refresh the matcher before the rescan
-    // below and the pump's follow-up push — otherwise that push publishes files the
-    // freshly pulled rules exclude (same hazard doPush guards on watcher events).
-    const rulesWritten = actions.some((a) => isIgnoreRuleFile(actionPath(a)));
-    if (rulesWritten) {
+    },
+    refreshMatcher: async () => {
       this.rebuildMatcher(await this.loadSyncBase());
       this.rulesChangedSinceDeepScan = true;
-    }
-    // The pull advanced the local base sequence; remember it so the follow-up no-op
-    // push isn't logged as if THIS daemon published the remotely-produced sequence.
-    const base = await this.loadSyncBase();
-    this.emitDurableGitDeferrals(base);
-    this.lastLoggedSeq = base.lastSyncedSequence;
-    // Design 202: the O(applied) refresh, or the cause that sent it back to the scan.
-    // Every cause is NAMED by the check that decides it — including F1, which the
-    // patch itself reports — so none is ever reconstructed by elimination. F2 is a
-    // pure pre/post base comparison (nothing new comes out of `pull()`) and is what
-    // keeps repo discovery (ref registry + safety floor) with the scan that does it
-    // right. The scan does NOT realign matcher provenance — the guarded rebuild in
-    // `loadSyncBase` above already did that (design 206 §1), so this scan runs under a
-    // current matcher and its install re-stamps the observation generation.
-    const fallback = trustedLocal === undefined ? undefined
-      : chainRepaired ? "chain-repair"                                          // F4
-      : rulesWritten ? "ignore-rules"                                           // F3
-      : gitTopologyChanged(preBase, base) ? "git-topology"                      // F2
-      : this.installPullPatch(trustedLocal.manifest, actions, base.lastSyncedManifest, opWatcherErrorGeneration).reason;
-    // Refresh in-memory truth from disk (cache-warm: pull invalidated written paths).
-    // Deferred paths carry the POST-pull base entry, never the pre-pull manifest —
-    // carrying pre-pull truth would let the follow-up push publish a stale entry
-    // over the version this pull just applied.
-    if (trustedLocal === undefined || fallback !== undefined) {
-      await this.localObserver.observe({ kind: "scan", cache: this.cache, previous: base.lastSyncedManifest, mode: this.watcherScanMode() });
-    }
-    // Fleet-greppable provenance, three distinct questions: which local view the pull's
-    // main line read, why it had none (`skip=`), and why the post-pull O(applied)
-    // refresh gave way to a scan (`fallback=`).
-    this.log(`pull local=${trustedLocal === undefined ? "scan" : "trusted"}${initialSkip === undefined ? "" : ` skip=${initialSkip}`}${fallback === undefined ? "" : ` fallback=${fallback}`}`);
-  }
+    },
+    adoptPostBase: async () => {
+      const base = await this.loadSyncBase();
+      this.emitDurableGitDeferrals(base);
+      this.lastLoggedSeq = base.lastSyncedSequence;
+      return base;
+    },
+    gitTopologyChanged: (before, after) => gitTopologyChanged(before, after),
+    // The scan does NOT realign matcher provenance — the guarded rebuild in
+    // `loadSyncBase` already did that (design 206 §1), so it runs under a current
+    // matcher and its install re-stamps the observation generation.
+    scanLocal: async (previous) => {
+      await this.localObserver.observe({ kind: "scan", cache: this.cache, previous, mode: this.watcherScanMode() });
+    },
+    installPullPatch: (view, actions, postBase, generation) =>
+      this.installPullPatch(view.manifest, actions, postBase, generation),
+    log: (line) => this.log(line),
+  });
 
   private bumpConflict(_kind: "commit"): void {
     this.metrics.commitConflicts409 += 1;
