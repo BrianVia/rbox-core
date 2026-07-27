@@ -66,7 +66,7 @@ const REPOSITORY_PROVEN_HEALTHY = new Set([
   "config",
 ]);
 
-/** A remedy is pasted from wherever the reader is standing — `rbox doctor --path`
+/** A remedy is pasted from wherever the reader is standing — `rbox doctor <path>`
  * runs from anywhere, and the machine view hands out workspaces by path. Every
  * workspace-scoped command therefore carries its own workspace. */
 function scoped(root: string, command: string): string {

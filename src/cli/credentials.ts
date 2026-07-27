@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
 import { compareProcessStart, systemLockIdentity } from "../engine/git/lockfile.js";
-import { homeDir } from "./rbox-paths.js";
+import { rboxDir } from "./rbox-paths.js";
 import { GENESIS_ACCOUNT_ID_RE, invalidateGenesisEnrollmentWitness } from "./genesis-durable.js";
 import { isAccountId } from "./account-id.js";
 
@@ -112,7 +112,10 @@ async function testSeam(seam: CredentialTestSeam, context: Readonly<Record<strin
 export const PROD_REMOTE = "https://api.rbox.to";
 export const PROD_WEB = "https://app.rbox.to";
 
-const dir = () => path.join(homeDir(), ".rbox");
+/** The credential store lives in the SAME RBOX_HOME-aware root as the keystore and
+ *  daemon state (issue #505): a scratch env that sets only RBOX_HOME must never
+ *  fall back to the production credential under the real home. */
+const dir = () => rboxDir();
 const file = () => path.join(dir(), "credentials.json");
 const lockFile = () => path.join(dir(), "credentials.lock");
 const fenceFile = () => path.join(dir(), "credentials.lock.fence");
@@ -225,9 +228,10 @@ function components(abs: string): string[] {
 
 /** Validate the whole no-symlink chain, but apply owner/mode policy only to ~/.rbox. */
 async function secureCredentialDirectory(create: boolean): Promise<PathObservation | undefined> {
-  // Authority extends only to the secret leaf. HOME and all system ancestors
-  // must already exist as plain directories; never create or chmod them.
-  for (const component of components(homeDir())) {
+  // Authority extends only to the secret leaf. The rbox root's parent and all
+  // system ancestors must already exist as plain directories; never create or
+  // chmod them.
+  for (const component of components(path.dirname(dir()))) {
     const stat = await fs.lstat(component);
     if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error(`unsafe credential directory component: ${component}`);
   }

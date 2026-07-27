@@ -63,8 +63,8 @@ if (!fs.existsSync(binary)) fail(`${binary} missing — run without --skip-build
 
 const demoHome = path.join(os.homedir(), ".rbox-dev-demo");
 fs.rmSync(demoHome, { recursive: true, force: true });
-// Seed a realistic-feeling home: the demo overrides HOME for isolation
-// (credentials resolve through $HOME/.rbox), so tilde paths land HERE — give
+// Seed a realistic-feeling home: RBOX_HOME isolates all rbox state, and the demo
+// also overrides HOME so tilde paths land HERE — give
 // the directory picker believable places to navigate — dev-shaped targets\n// only (never model junk drawers like Downloads as sync candidates).
 const project = path.join(demoHome, "demo-project");
 fs.mkdirSync(project, { recursive: true });

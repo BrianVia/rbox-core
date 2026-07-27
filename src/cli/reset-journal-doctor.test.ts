@@ -46,7 +46,7 @@ async function capture(fn: () => Promise<void>): Promise<string> {
 test("doctor reset-journal dispatches before ordinary loadState collection", async () => {
   await fs.mkdir(path.dirname(resetJournalPath(root)), { recursive: true });
   await fs.writeFile(resetJournalPath(root), "{malformed");
-  process.argv = [process.execPath, "rbox", "doctor", "reset-journal", "--path", root];
+  process.argv = [process.execPath, "rbox", "doctor", "reset-journal", root];
   process.chdir(root);
   const output = await capture(() => main());
   expect(output).toContain("malformed reset journal JSON");
