@@ -146,3 +146,28 @@ test("full-reference screen renders every public group and omits hidden commands
   expect(screen).not.toContain("hydrate"); // disabled alongside `deps` (design 51)
   expect(screen).toMatch(/^\s*init\s/m);
 });
+
+test("full-reference screen shows one row per top-level command, without flags", () => {
+  const screen = renderGroupedHelp();
+  // Subcommand families collapse into their parent's row; leaves keep their
+  // registry entries for `rbox <cmd> --help` and completions.
+  for (const family of ["key", "trash", "autostart", "git"]) {
+    expect(screen.match(new RegExp(`^  ${family}[ <]`, "gm")), `${family} must render exactly one row`).toHaveLength(1);
+  }
+  expect(screen).not.toMatch(/^\s*key status/m);
+  expect(screen).not.toMatch(/^\s*trash list/m);
+  // Flags live in per-command help, never in the reference column.
+  expect(screen).not.toContain("[--");
+  // Positional shape survives the flag strip.
+  expect(screen).toMatch(/^\s*doctor \[reset-journal\] \[path\]\s/m);
+  expect(screen).toMatch(/^\s*restore <file>@<seq>\s/m);
+});
+
+test("family parents route their bare --help to the parent plus its leaves", () => {
+  for (const family of ["trash", "autostart", "git"]) {
+    const entries = helpFor(family)!;
+    expect(entries[0]!.name).toBe(family);
+    expect(entries.length).toBeGreaterThan(1);
+    for (const sub of entries.slice(1)) expect(sub.name.startsWith(`${family} `)).toBe(true);
+  }
+});

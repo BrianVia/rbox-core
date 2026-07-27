@@ -31,6 +31,8 @@ export interface CommandHelp {
   flags?: { flag: string; desc: string }[];
   notes?: string[];
   examples?: string[];
+  /** Grouped-screen left column override, for when the derived form is too wide. */
+  brief?: string;
   /** Excluded from the grouped screen (init, deprecated aliases, internal). */
   hidden?: boolean;
   /** If set, this is a deprecated alias forwarding to that command path. */
@@ -146,6 +148,12 @@ export const COMMAND_HELP: CommandHelp[] = [
     usage: "rbox stop [path]",
   },
   {
+    name: "autostart",
+    group: "SYNCING",
+    summary: "start background sync automatically after login",
+    usage: "rbox autostart <enable | disable | status>",
+  },
+  {
     name: "autostart enable",
     group: "SYNCING",
     summary: "resume background sync after login",
@@ -184,6 +192,12 @@ export const COMMAND_HELP: CommandHelp[] = [
       { flag: "--pull-only", desc: "pull remote changes and skip the push phase" },
       { flag: "--verbose", desc: "print each git repo's apply/conflict/defer line instead of a running count" },
     ],
+  },
+  {
+    name: "git",
+    group: "SYNCING",
+    summary: "inspect and resolve deferred Git repos",
+    usage: "rbox git <deferrals | resolve>",
   },
   {
     name: "git deferrals",
@@ -276,6 +290,12 @@ export const COMMAND_HELP: CommandHelp[] = [
       { flag: "--allow-mass-delete", desc: "also consent to the push-side mass-delete guard" },
     ],
     examples: ["rbox ignore 'dist/**'", "rbox ignore --list"],
+  },
+  {
+    name: "trash",
+    group: "SYNCING",
+    summary: "list, restore, or permanently delete locally trashed files",
+    usage: "rbox trash <list | restore | empty>",
   },
   {
     name: "trash list",
@@ -418,6 +438,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     group: "DEVICES & ACCOUNT",
     summary: "encryption and agent sync keys",
     usage: "rbox key <status | save | backup | genesis | recover | create-ci | materialize | list | revoke>",
+    brief: "key <subcommand>",
     flags: [
       { flag: "--json", desc: "with `status`, print JSON" },
       { flag: "--kit", desc: "with `backup`, write the cached recovery phrase to the default recovery kit path" },
@@ -712,18 +733,23 @@ export function renderEssentialHelp(): string {
   return lines.join("\n");
 }
 
-/** Render the full reference screen (every non-hidden entry, in group order). */
+/**
+ * Render the full reference screen: one row per TOP-LEVEL command, flags omitted.
+ * Subcommand leaves ("key status", "trash restore") stay registered for `--help`
+ * and completions but collapse into their parent's row here — the reference screen
+ * answers "what commands exist", and `rbox <command> --help` answers the rest.
+ */
 export function renderGroupedHelp(): string {
   const lines: string[] = [];
   lines.push(`${style.bold("rbox")} — dev-aware sync ${style.dim("(end-to-end encrypted)")}`);
-  const visible = COMMAND_HELP.filter((c) => !c.hidden);
+  const visible = COMMAND_HELP.filter((c) => !c.hidden && !c.name.includes(" "));
   for (const group of GROUP_ORDER) {
     const entries = visible.filter((c) => c.group === group);
     if (!entries.length) continue;
     lines.push("");
     lines.push(style.dim(group));
-    const w = Math.max(...entries.map((e) => usageBody(e).length));
-    for (const e of entries) lines.push(`  ${usageBody(e).padEnd(w)}  ${style.dim(e.summary)}`);
+    const w = Math.max(...entries.map((e) => briefUsage(e).length));
+    for (const e of entries) lines.push(`  ${briefUsage(e).padEnd(w)}  ${style.dim(e.summary)}`);
   }
   lines.push("");
   lines.push(style.dim("Run `rbox <command> --help` for details on any command."));
@@ -731,10 +757,17 @@ export function renderGroupedHelp(): string {
   return lines.join("\n");
 }
 
-/** The grouped-screen left column: the usage minus the leading "rbox ", or just the
- *  command name when the usage isn't a plain `rbox …` form (e.g. `connect`'s pipe). */
-function usageBody(c: CommandHelp): string {
-  return c.usage.startsWith("rbox ") ? c.usage.slice("rbox ".length) : c.name;
+/** The grouped-screen left column: the usage minus the leading "rbox " and minus
+ *  every flag — `[--x]` groups and top-level `| --x …` alternates — so the column
+ *  shows only the command's shape (subverbs + positionals). */
+function briefUsage(c: CommandHelp): string {
+  if (c.brief) return c.brief;
+  const body = c.usage.startsWith("rbox ") ? c.usage.slice("rbox ".length) : c.name;
+  return body
+    .replace(/\s*\[--[^\]]*\]/g, "")
+    .replace(/\s*\|\s*--\S+( <[^>]+>)?/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 /** Build the lookup key for `--help` from the command + its positional args, longest
