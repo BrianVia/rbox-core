@@ -3,10 +3,12 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { collectMachineTriage, renderMachineTriage } from "./doctor-machine.js";
-import { daemonRuntimeDir, daemonStatusPath } from "./daemon-control.js";
+import { daemonPidPath, daemonRuntimeDir, daemonStatusPath } from "./rbox-paths.js";
 import type { AmbientDaemonStatusV1 } from "./daemon/ambient-status.js";
 
 const NOW = Date.parse("2026-07-27T12:00:00.000Z");
+const LIVE_PID = 4242;
+const BOOT = "boot-live";
 
 let home: string;
 let scratch: string;
@@ -28,11 +30,13 @@ afterEach(async () => {
 });
 
 /** Seed the same on-disk records a live workspace daemon maintains: the
- * desired-state row under ~/.rbox/daemons and, optionally, its status record. */
+ * desired-state row under ~/.rbox/daemons, its pidfile, and its status record. */
 async function seedWorkspace(name: string, opts: {
   workspaceId?: string;
   boundWorkspaceId?: string;
-  status?: Partial<AmbientDaemonStatusV1>;
+  status?: Partial<AmbientDaemonStatusV1> & Record<string, unknown>;
+  pidBootId?: string;
+  withPidfile?: boolean;
   missing?: boolean;
 } = {}): Promise<string> {
   const root = path.join(scratch, name);
@@ -52,6 +56,9 @@ async function seedWorkspace(name: string, opts: {
     workspaceId,
     at: new Date(NOW).toISOString(),
   }));
+  if (opts.withPidfile !== false) {
+    await fs.writeFile(daemonPidPath(root), `v2 ${LIVE_PID} ${opts.pidBootId ?? BOOT}\n`);
+  }
   if (opts.status) {
     await fs.writeFile(daemonStatusPath(root), JSON.stringify({
       schemaVersion: 1,
@@ -65,22 +72,46 @@ async function seedWorkspace(name: string, opts: {
   return root;
 }
 
-const collect = () => collectMachineTriage({ now: () => NOW, isDaemonProcess: () => false });
+const collectWith = (alive: boolean) =>
+  collectMachineTriage({ now: () => NOW, isDaemonProcess: () => alive });
 
-test("no synced folders prints the setup pointer instead of an error", async () => {
-  const triage = await collect();
+test("no synced folders prints the setup pointer and admits the list is not exhaustive", async () => {
+  const triage = await collectWith(false);
   expect(triage).toEqual({ schemaVersion: 1, scope: "machine", workspaces: [] });
   const rendered = renderMachineTriage(triage).join("\n");
   expect(rendered).toContain("rbox is not syncing anything here yet.");
   expect(rendered).toContain("rbox setup");
+  // MEDIUM 12: a track-only folder leaves no record here, so say so.
+  expect(rendered).toContain("`rbox track` that has never started background sync is not listed here");
 });
 
-test("each workspace gets a plain-English line and a cd-into-it command", async () => {
+test("a fresh status record from a DEAD daemon is never reported as up to date", async () => {
+  const root = await seedWorkspace("crashed", { status: { state: "synced" } });
+  const triage = await collectWith(false);
+  const workspace = triage.workspaces[0]!;
+  // Producer proof: the record is present and fresh; liveness is what demotes it.
+  expect(JSON.parse(await fs.readFile(daemonStatusPath(root), "utf8")).state).toBe("synced");
+  expect(workspace.state).not.toBe("synced");
+  expect(workspace.state).toBe("stopped");
+  expect(workspace.summary).toBe("background sync is not running here");
+  expect(workspace.command).toBe(`cd ${root} && rbox start`);
+});
+
+test("a future-dated heartbeat from a live daemon is not trusted either", async () => {
+  await seedWorkspace("skewed", {
+    status: { state: "synced", heartbeatAt: new Date(NOW + 3 * 3600_000).toISOString() },
+  });
+  const triage = await collectWith(true);
+  expect(triage.workspaces[0]!.state).toBe("unknown");
+  expect(triage.workspaces[0]!.summary).toContain("may be stuck");
+});
+
+test("a live daemon with a fresh record gets its plain-English line and a cd-into-it command", async () => {
   const healthy = await seedWorkspace("aaa-notes", { status: { state: "synced" } });
   const stuck = await seedWorkspace("bbb-code", {
     status: { state: "attention", attentionReason: "watcher-degraded", deferredRepos: 2 },
   });
-  const triage = await collect();
+  const triage = await collectWith(true);
   expect(triage.workspaces.map((w) => w.name)).toEqual(["aaa-notes", "bbb-code"]);
 
   const [first, second] = triage.workspaces;
@@ -98,31 +129,50 @@ test("each workspace gets a plain-English line and a cd-into-it command", async 
   const rendered = renderMachineTriage(triage).join("\n");
   expect(rendered).toContain("2 synced folders on this machine");
   expect(rendered).toContain("You are not inside a synced folder");
+  expect(rendered).toContain("`rbox track` that has never started background sync is not listed here");
 });
 
-test("a stopped daemon reads as stopped and is told to start, not to diagnose", async () => {
-  const root = await seedWorkspace("idle");
-  const triage = await collect();
+test("a download-only claim needs the record to match the live pidfile incarnation", async () => {
+  await seedWorkspace("bound", { status: { state: "synced", mode: "pull-only", bootId: BOOT }, pidBootId: BOOT });
+  expect((await collectWith(true)).workspaces[0]!.summary).toBe("up to date (download-only)");
+
+  await fs.rm(scratch, { recursive: true, force: true });
+  await fs.rm(path.join(home, ".rbox"), { recursive: true, force: true });
+  await fs.mkdir(scratch, { recursive: true });
+  await seedWorkspace("unbound", { status: { state: "synced", mode: "pull-only", bootId: "boot-other" }, pidBootId: BOOT });
+  expect((await collectWith(true)).workspaces[0]!.summary).toBe("up to date");
+});
+
+test("a daemon with no pidfile reads as stopped and is told to start", async () => {
+  const root = await seedWorkspace("idle", { withPidfile: false });
+  const triage = await collectWith(true);
   expect(triage.workspaces[0]!.state).toBe("stopped");
-  expect(triage.workspaces[0]!.summary).toBe("background sync is not running here");
   expect(triage.workspaces[0]!.command).toBe(`cd ${root} && rbox start`);
 });
 
-test("a stale status record from a live daemon reads as possibly stuck", async () => {
+test("a live daemon with a stale record reads as possibly stuck", async () => {
   await seedWorkspace("stale", { status: { state: "syncing", heartbeatAt: new Date(NOW - 3 * 3600_000).toISOString() } });
-  const triage = await collectMachineTriage({ now: () => NOW, isDaemonProcess: () => true, readDaemonPidRecord: () => ({ present: true, pid: 4242 }) });
+  const triage = await collectWith(true);
   expect(triage.workspaces[0]!.state).toBe("unknown");
   expect(triage.workspaces[0]!.summary).toContain("may be stuck");
 });
 
-test("a folder that is gone, or now bound elsewhere, is reported rather than crashing the view", async () => {
+test("a vanished folder offers NO command, because untrack cannot run against it", async () => {
   await seedWorkspace("vanished", { missing: true });
+  const triage = await collectWith(false);
+  const workspace = triage.workspaces[0]!;
+  expect(workspace.state).toBe("unreachable");
+  expect(workspace.summary).toContain("no longer set up for rbox");
+  expect(workspace.command).toBeUndefined();
+  // The renderer must not print an empty `run:` line for it either.
+  const rendered = renderMachineTriage(triage).join("\n");
+  expect(rendered).not.toContain("rbox untrack");
+  expect(rendered).not.toMatch(/run:\s*$/m);
+});
+
+test("a folder rebound to a different workspace is reported rather than crashing the view", async () => {
   await seedWorkspace("rebound", { workspaceId: "ws_old", boundWorkspaceId: "ws_new" });
-  const triage = await collect();
-  const byName = new Map(triage.workspaces.map((w) => [w.name, w]));
-  expect(byName.get("vanished")!.state).toBe("unreachable");
-  expect(byName.get("vanished")!.summary).toContain("no longer set up for rbox");
-  expect(byName.get("vanished")!.command).toContain("rbox untrack");
-  expect(byName.get("rebound")!.state).toBe("unreachable");
-  expect(byName.get("rebound")!.summary).toContain("different rbox workspace");
+  const workspace = (await collectWith(false)).workspaces[0]!;
+  expect(workspace.state).toBe("unreachable");
+  expect(workspace.summary).toContain("different rbox workspace");
 });

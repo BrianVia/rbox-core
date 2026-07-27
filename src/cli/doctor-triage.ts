@@ -1,24 +1,27 @@
 /**
- * Plain-English triage for `rbox doctor`.
+ * Plain-English triage for `rbox doctor` — what is SAID about a workspace.
  *
  * Every stuck state rbox can already detect internally is translated here into
  * three things a non-expert needs: what is wrong, whether their data is safe,
- * and one copy-pasteable command. Read-only — this module diagnoses and
- * recommends; it never mutates workspace, daemon, or sync state.
+ * and one copy-pasteable command scoped to the workspace being diagnosed.
+ *
+ * What may be believed in the first place lives in `doctor-evidence.ts`; this
+ * module never reaches past it. Two rules follow from that split and are load-
+ * bearing for every sentence below: nothing a check could not prove is stated
+ * as fact, and no remedy is offered that cannot run against the very state that
+ * produced the finding.
  */
 import path from "node:path";
-import { loadActivity, type DaemonActivity } from "./activity.js";
-import { inspectAdoptFence, type AdoptFenceInspection } from "./adopt-journal.js";
-import { loadConfig, loadState, repoRecordsForState, syncStreamId } from "./config.js";
-import { readDaemonPidRecord } from "./daemon-control.js";
-import { isDaemonProcess } from "./daemon/process-control.js";
-import { readAmbientDaemonStatusRecord, type AmbientDaemonStatusRecord } from "./daemon/ambient-status.js";
-import { AMBIENT_STATUS_STALE_MS } from "./populate-marker.js";
+import type { DaemonActivity } from "./activity.js";
+import type { AdoptFenceInspection } from "./adopt-journal.js";
+import { daemonOwnsActivity, liveAmbient, serviceUnverified, type TriageInputs } from "./doctor-evidence.js";
 import { shQuoteIfNeeded } from "./shell-quote.js";
-import { ageBucket, projectGitDeferralRepos, type GitDeferralRepoProjection } from "./status-view.js";
+import { ageBucket, type GitDeferralRepoProjection } from "./status-view.js";
 import { style } from "./style.js";
 import { RBOX_VERSION } from "./version.js";
 import type { DoctorChecks } from "./doctor-cmd.js";
+
+export { readTriageInputs, serviceUnverified, type TriageInputs, type TriageReadDeps } from "./doctor-evidence.js";
 
 export type TriageSeverity = "blocked" | "attention" | "info";
 
@@ -30,7 +33,8 @@ export interface TriageFinding {
   problem: string;
   /** Whether their data is safe. Always answered — never left implied. */
   safety: string;
-  /** One copy-pasteable command. Omitted only when no single command exists. */
+  /** One copy-pasteable command, carrying its own workspace when the command is
+   * workspace-scoped. Omitted only when no command can honestly fix the state. */
   command?: string;
 }
 
@@ -43,62 +47,30 @@ export interface WorkspaceTriage {
   findings: TriageFinding[];
 }
 
-export interface TriageInputs {
-  root: string;
-  checks: DoctorChecks;
-  deferrals: GitDeferralRepoProjection[];
-  activity?: DaemonActivity;
-  ambient: AmbientDaemonStatusRecord;
-  daemonRunning: boolean;
-  adopt: AdoptFenceInspection;
-  now: number;
-  cliVersion?: string;
-}
-
 const SAFE_LOCAL_FILES = "Your files on this machine are untouched.";
 const SAFE_NOTHING_LOST = "Nothing is lost — changes are just waiting instead of syncing.";
 const SEVERITY_RANK: Record<TriageSeverity, number> = { blocked: 0, attention: 1, info: 2 };
 
-/** Read every triage input for `root`. Each read is best-effort: a diagnosis
- * surface must still render when one of the sidecars it reads is unavailable. */
-export async function readTriageInputs(root: string, checks: DoctorChecks, now = Date.now()): Promise<TriageInputs> {
-  const [deferrals, activity, adopt] = await Promise.all([
-    readDeferrals(root, now),
-    loadActivity(root).catch(() => undefined),
-    inspectAdoptFence(root).catch((error: unknown) => ({
-      status: "corrupt" as const,
-      reason: error instanceof Error ? error.message : String(error),
-    })),
-  ]);
-  const pid = readDaemonPidRecord(root);
-  return {
-    root,
-    checks,
-    deferrals,
-    activity,
-    adopt,
-    ambient: readAmbientDaemonStatusRecord(root),
-    daemonRunning: pid.pid !== undefined && isDaemonProcess(pid.pid),
-    now,
-  };
-}
+/** Deferral reasons where rbox has PROVEN the repository itself is fine and only
+ * its own bookkeeping is paused. Anything outside this set failed to read or
+ * reconcile the repository, so the reassurance would be a false promise. */
+const REPOSITORY_PROVEN_HEALTHY = new Set([
+  "local-edits",
+  "local-index",
+  "local-operation",
+  "local-commits",
+  "local-stash",
+  "deletion-pending",
+  "git-busy",
+  "ignored-target",
+  "config",
+]);
 
-async function readDeferrals(root: string, now: number): Promise<GitDeferralRepoProjection[]> {
-  try {
-    const cfg = await loadConfig(root);
-    const records = repoRecordsForState(await loadState(root, syncStreamId(cfg)));
-    return projectGitDeferralRepos(
-      Object.entries(records).flatMap(([repo, record]) =>
-        Object.values(record.deferrals ?? {}).flatMap((deferral) => (deferral ? [{ repo, deferral, record }] : []))),
-      now,
-    );
-  } catch {
-    return [];
-  }
-}
-
-function repoArg(repo: string): string {
-  return repo.startsWith("-") ? `./${repo}` : repo;
+/** A remedy is pasted from wherever the reader is standing — `rbox doctor --path`
+ * runs from anywhere, and the machine view hands out workspaces by path. Every
+ * workspace-scoped command therefore carries its own workspace. */
+function scoped(root: string, command: string): string {
+  return `cd ${shQuoteIfNeeded(path.resolve(root))} && ${command}`;
 }
 
 /** The shared age buckets read as clipped exact times ("1h" for a 20-hour wait).
@@ -119,42 +91,65 @@ function plainAge(bucket: string): string {
   return minutes <= 1 ? "for a minute" : `for ${minutes} minutes`;
 }
 
-function deferralFinding(repo: GitDeferralRepoProjection, now: number): TriageFinding {
+function repoArg(repo: string): string {
+  return repo.startsWith("-") ? `./${repo}` : repo;
+}
+
+function deferralFinding(root: string, repo: GitDeferralRepoProjection, now: number): TriageFinding {
   const age = ageBucket(repo.oldestDeferredSince, now);
   const command = repo.canKeepMine
-    ? `rbox git resolve ${shQuoteIfNeeded(repoArg(repo.repo))} keep-mine`
+    ? scoped(root, `rbox git resolve ${shQuoteIfNeeded(repoArg(repo.repo))} keep-mine`)
     : repo.canResolve
-      ? `rbox git resolve ${shQuoteIfNeeded(repoArg(repo.repo))}`
-      : "rbox git deferrals --brief";
+      ? scoped(root, `rbox git resolve ${shQuoteIfNeeded(repoArg(repo.repo))}`)
+      : scoped(root, "rbox git deferrals --brief");
   const waiting = repo.canResolve
     ? "rbox has paused publishing its history until you say which side wins"
     : `rbox has paused publishing its history (${repo.reasonLabel})`;
+  const safety = REPOSITORY_PROVEN_HEALTHY.has(repo.displayReason)
+    ? `Your repository is healthy; only rbox's bookkeeping is paused. ${SAFE_LOCAL_FILES}`
+    : `rbox could not read or reconcile part of this repository (${repo.reasonLabel}). It has changed nothing there — look at the repository itself before changing anything.`;
   return {
     id: `git-paused:${repo.repo}`,
     severity: age === "unknown" || age.endsWith("m") ? "attention" : "blocked",
     problem: `The code folder "${repo.repo}" has been waiting ${plainAge(age)} to publish: ${waiting}.`.replace("  ", " "),
-    safety: `Your repository is healthy; only rbox's bookkeeping is paused. ${SAFE_LOCAL_FILES}`,
+    safety,
     command,
   };
 }
 
-function haltFinding(halt: NonNullable<DaemonActivity["halt"]>): TriageFinding | undefined {
+function massDeleteCounts(reason: string): { deletes: number; tracked: number } | undefined {
+  const match = /(\d+) of (\d+) tracked files/.exec(reason);
+  return match ? { deletes: Number(match[1]), tracked: Number(match[2]) } : undefined;
+}
+
+/** The remedy is consent to a SPECIFIC deletion, so the copy names what is being
+ * consented to and the scale of it. `rbox sync --allow-mass-delete` is never
+ * offered: that waives the guard in both directions, including an unrelated one. */
+function massDeleteFinding(root: string, halt: NonNullable<DaemonActivity["halt"]>, op: "pull" | "push"): TriageFinding {
+  const counts = massDeleteCounts(halt.reason);
+  const scale = counts ? `${counts.deletes} of your ${counts.tracked} synced files` : "an unusually large number of files";
+  const target = op === "pull" ? `delete ${scale} from this machine` : `delete ${scale} everywhere else you sync`;
+  const consent = op === "pull" ? "that local deletion" : "that deletion for your other machines";
+  return {
+    id: "halt:mass-delete",
+    severity: "blocked",
+    problem: `Syncing stopped because finishing it would ${target}, and rbox will not do that without your say-so.`,
+    safety: `Nothing has been deleted — rbox stopped before touching anything. The command below CONFIRMS ${consent}; check what is missing first.`,
+    command: scoped(root, `rbox ${op} --allow-mass-delete`),
+  };
+}
+
+function haltFinding(root: string, halt: NonNullable<DaemonActivity["halt"]>): TriageFinding | undefined {
   switch (halt.typedReason?.kind) {
     case "mass-delete":
-      return {
-        id: "halt:mass-delete",
-        severity: "blocked",
-        problem: "Syncing stopped because this change would delete an unusually large number of files, and rbox will not do that without you saying so.",
-        safety: "Nothing was deleted. rbox stopped before touching anything.",
-        command: "rbox sync --allow-mass-delete",
-      };
+      return massDeleteFinding(root, halt, halt.typedReason.op);
     case "chain-repair":
       return {
         id: "halt:chain-repair",
         severity: "blocked",
         problem: "Syncing stopped because part of this workspace's sync history could not be read.",
         safety: `${SAFE_LOCAL_FILES} Your uploaded versions are still on the server.`,
-        command: "rbox recover --repair-chain",
+        command: scoped(root, "rbox recover --repair-chain"),
       };
     case "too-many-refs":
     case "body-too-large":
@@ -163,7 +158,7 @@ function haltFinding(halt: NonNullable<DaemonActivity["halt"]>): TriageFinding |
         severity: "blocked",
         problem: "Syncing stopped because one upload was larger than the service accepts.",
         safety: SAFE_LOCAL_FILES,
-        command: "rbox doctor --report",
+        command: scoped(root, "rbox doctor --report"),
       };
     case "push-conflict":
       return undefined;
@@ -174,14 +169,23 @@ function haltFinding(halt: NonNullable<DaemonActivity["halt"]>): TriageFinding |
         severity: "blocked",
         problem: "Syncing stopped and will not retry on its own.",
         safety: SAFE_LOCAL_FILES,
-        command: "rbox logs",
+        command: scoped(root, "rbox logs"),
       };
   }
 }
 
-function credentialFindings(checks: DoctorChecks, root: string): TriageFinding[] {
+function accountFindings(input: TriageInputs): TriageFinding[] {
+  const { checks, root } = input;
   const out: TriageFinding[] = [];
-  if (!checks.credentials.ok) {
+  if (serviceUnverified(checks)) {
+    out.push({
+      id: "service-unreachable",
+      severity: "attention",
+      problem: "rbox couldn't reach the sync service to check — your connection may be down, or the service may be busy.",
+      safety: `${SAFE_NOTHING_LOST} rbox resumes on its own once it can connect. Nothing here was checked against the service, so nothing about your account or your uploaded files is being reported as broken.`,
+      command: scoped(root, "rbox doctor"),
+    });
+  } else if (!checks.credentials.ok) {
     out.push({
       id: "signed-out",
       severity: "blocked",
@@ -205,23 +209,54 @@ function credentialFindings(checks: DoctorChecks, root: string): TriageFinding[]
       severity: "attention",
       problem: "This folder is registered to a different machine than the one you are on, so background sync may refuse to run.",
       safety: SAFE_LOCAL_FILES,
-      command: `rbox track ${shQuoteIfNeeded(root)}`,
+      command: `rbox track ${shQuoteIfNeeded(path.resolve(root))}`,
     });
   }
   return out;
 }
 
-function environmentFindings(checks: DoctorChecks): TriageFinding[] {
-  const out: TriageFinding[] = [];
-  if (!checks.remote.ok) {
-    out.push({
-      id: "offline",
+/** `rbox recover` is deliberately NOT offered here: it runs a normal pull/push,
+ * whose state loader refuses exactly these files, so it would do network work and
+ * then fail without repairing anything. */
+function stateFinding(root: string, check: DoctorChecks["state"]): TriageFinding | undefined {
+  if (check.ok) return undefined;
+  const mismatch = check.status === "stream-mismatch";
+  return {
+    id: mismatch ? "state-belongs-elsewhere" : "state-unreadable",
+    severity: "blocked",
+    problem: mismatch
+      ? "This folder's local sync records belong to a different workspace than the one it is connected to now, so syncing is blocked. rbox cannot repair this by itself."
+      : `This folder's local sync records cannot be read (${check.message}), so syncing is blocked. rbox cannot repair this by itself.`,
+    safety: `${SAFE_LOCAL_FILES} Your uploaded files are still on the server; joining this folder to the workspace again with \`rbox setup\` re-checks every file rather than deleting anything. Send the report below if you would like help first.`,
+    command: scoped(root, "rbox doctor --report"),
+  };
+}
+
+function lockingFinding(root: string, check: DoctorChecks["locking"]): TriageFinding | undefined {
+  if (check.ok) return undefined;
+  if (check.status === "starved") {
+    return {
+      id: "sync-lock-contention",
       severity: "attention",
-      problem: "rbox cannot reach the sync service right now, so nothing is uploading or downloading.",
-      safety: `${SAFE_NOTHING_LOST} rbox resumes on its own once the connection is back.`,
-      command: "rbox doctor",
-    });
+      problem: "Another rbox process is holding this folder's sync lock, so syncing cannot start.",
+      safety: SAFE_NOTHING_LOST,
+      command: scoped(root, "rbox stop && rbox start"),
+    };
   }
+  // degraded-unlocked: syncing CONTINUES without the modern lock because this
+  // machine's identity is unavailable. Restarting the daemon does not fix that.
+  return {
+    id: "locking-degraded",
+    severity: "attention",
+    problem: "rbox could not identify this machine, so it is syncing without its usual safety lock. Your files still sync; shared Git settings are not synced while this lasts.",
+    safety: `${SAFE_LOCAL_FILES} rbox falls back to its older, more cautious way of saving progress.`,
+    command: scoped(root, "rbox doctor --report"),
+  };
+}
+
+function environmentFindings(input: TriageInputs): TriageFinding[] {
+  const { checks, root } = input;
+  const out: TriageFinding[] = [];
   if (!checks.git.ok) {
     out.push({
       id: "git-unusable",
@@ -231,39 +266,28 @@ function environmentFindings(checks: DoctorChecks): TriageFinding[] {
       command: process.platform === "darwin" ? "brew install git" : undefined,
     });
   }
-  if (!checks.state.ok) {
-    out.push({
-      id: "local-bookkeeping",
-      severity: "blocked",
-      problem: `This folder's local sync bookkeeping is unreadable (${checks.state.message}).`,
-      safety: `${SAFE_LOCAL_FILES} Your uploaded versions are still on the server.`,
-      command: "rbox recover",
-    });
-  }
-  // A sign-in or key failure makes every server-side read fail too; reporting
-  // the downstream symptom as its own problem sends the user down a false path.
-  if (checks.chain && !checks.chain.ok && checks.credentials.ok && checks.enrollment.ok) {
+  const state = stateFinding(root, checks.state);
+  if (state) out.push(state);
+  // A sign-in or key failure makes every server-side read fail too, and a
+  // transport failure proves nothing: only a verified chain error may be
+  // reported as unreadable history.
+  if (checks.chain && !checks.chain.ok && checks.chain.inconclusive !== true
+    && checks.credentials.ok && checks.enrollment.ok) {
     out.push({
       id: "history-unreadable",
       severity: "blocked",
       problem: "Part of this workspace's uploaded sync history cannot be read, so new uploads are blocked.",
       safety: SAFE_LOCAL_FILES,
-      command: "rbox recover --repair-chain",
+      command: scoped(root, "rbox recover --repair-chain"),
     });
   }
-  if (!checks.locking.ok) {
-    out.push({
-      id: "sync-lock",
-      severity: "attention",
-      problem: "Another rbox process is holding this folder's sync lock, so syncing cannot start.",
-      safety: SAFE_NOTHING_LOST,
-      command: "rbox stop && rbox start",
-    });
-  }
+  const locking = lockingFinding(root, checks.locking);
+  if (locking) out.push(locking);
   return out;
 }
 
 function daemonFindings(input: TriageInputs): TriageFinding[] {
+  const { root } = input;
   const out: TriageFinding[] = [];
   const daemon = input.checks.daemon;
   if (daemon.status === "stale") {
@@ -272,7 +296,7 @@ function daemonFindings(input: TriageInputs): TriageFinding[] {
       severity: "attention",
       problem: "Background sync is running, but it is still attached to a different workspace than this folder, so this folder is not syncing.",
       safety: SAFE_NOTHING_LOST,
-      command: "rbox start",
+      command: scoped(root, "rbox start"),
     });
   } else if (!daemon.ok) {
     out.push({
@@ -280,54 +304,49 @@ function daemonFindings(input: TriageInputs): TriageFinding[] {
       severity: "attention",
       problem: "Background sync is not running for this folder, so changes are not syncing.",
       safety: SAFE_NOTHING_LOST,
-      command: "rbox start",
+      command: scoped(root, "rbox start"),
     });
   }
 
-  const ambient = input.ambient.kind === "ok" ? input.ambient.status : undefined;
-  // A status record only describes a LIVE daemon. A stopped daemon's leftovers
-  // would otherwise contradict the "background sync is not running" finding.
-  const fresh = ambient !== undefined
-    && input.daemonRunning
-    && input.now - Date.parse(ambient.heartbeatAt) <= AMBIENT_STATUS_STALE_MS;
-  if (fresh && ambient?.attentionReason === "watcher-degraded") {
+  const live = liveAmbient(input);
+  if (live?.status.attentionReason === "watcher-degraded") {
     out.push({
       id: "watcher-degraded",
       severity: "attention",
       problem: "rbox stopped receiving instant notifications when files change here, so edits can take minutes to sync instead of seconds.",
       safety: `${SAFE_NOTHING_LOST} rbox still catches changes with periodic scans.`,
-      command: "rbox stop && rbox start",
+      command: scoped(root, "rbox stop && rbox start"),
     });
   }
-  if (fresh && ambient?.attentionReason === "ownership-lost") {
+  if (live?.status.attentionReason === "ownership-lost") {
     out.push({
       id: "ownership-lost",
       severity: "attention",
       problem: "Another rbox process took over syncing this folder, so this background sync stepped aside.",
       safety: SAFE_NOTHING_LOST,
-      command: "rbox stop && rbox start",
+      command: scoped(root, "rbox stop && rbox start"),
     });
   }
-  if (fresh && ambient?.mode === "pull-only") {
+  if (live?.bootBound && live.status.mode === "pull-only") {
     out.push({
       id: "pull-only",
       severity: "info",
       problem: "Background sync is in download-only mode: changes you make here are not being uploaded.",
-      safety: `${SAFE_LOCAL_FILES} Nothing here has been overwritten by this mode.`,
-      command: "rbox start --read-write",
+      safety: "Your edits here are safe and still on this machine — they are just not leaving it. Changes from your other machines DO keep downloading and applying here.",
+      command: scoped(root, "rbox start --read-write"),
     });
   }
   const cliVersion = input.cliVersion ?? RBOX_VERSION;
-  if (input.daemonRunning && ambient?.daemonVersion !== undefined && ambient.daemonVersion !== cliVersion) {
+  if (live?.status.daemonVersion !== undefined && live.status.daemonVersion !== cliVersion) {
     out.push({
       id: "daemon-version-skew",
       severity: "attention",
-      problem: `Background sync is still running rbox ${ambient.daemonVersion} while this machine has ${cliVersion} installed.`,
+      problem: `Background sync is still running rbox ${live.status.daemonVersion} while this machine has ${cliVersion} installed.`,
       safety: SAFE_NOTHING_LOST,
       command: "rbox upgrade",
     });
   }
-  if (!input.checks.version.ok && input.checks.version.latest) {
+  if (!input.checks.version.ok && input.checks.version.inconclusive !== true && input.checks.version.latest) {
     out.push({
       id: "update-available",
       severity: "info",
@@ -339,39 +358,40 @@ function daemonFindings(input: TriageInputs): TriageFinding[] {
   return out;
 }
 
-function adoptFinding(adopt: AdoptFenceInspection): TriageFinding | undefined {
-  if (adopt.status === "active") {
-    return {
-      id: "adopt-incomplete",
-      severity: "blocked",
-      problem: "Moving this folder into rbox did not finish, so syncing is held until it is completed or undone.",
-      safety: "Your original files are preserved inside the folder while the move-in is unfinished.",
-      command: "rbox adopt status",
-    };
-  }
-  if (adopt.status === "corrupt") {
-    return {
-      id: "adopt-corrupt",
-      severity: "blocked",
-      problem: "The record of moving this folder into rbox is damaged, so syncing is held.",
-      safety: "Your original files are preserved inside the folder.",
-      command: "rbox adopt status",
-    };
-  }
-  return undefined;
+function adoptFinding(root: string, adopt: AdoptFenceInspection): TriageFinding | undefined {
+  if (adopt.status !== "active" && adopt.status !== "corrupt") return undefined;
+  return {
+    id: adopt.status === "active" ? "adopt-incomplete" : "adopt-corrupt",
+    severity: "blocked",
+    problem: adopt.status === "active"
+      ? "Moving this folder into rbox did not finish, so syncing is held until it is completed or undone."
+      : "The record of moving this folder into rbox is damaged, so syncing is held.",
+    safety: "Your original files are preserved inside the folder while the move-in is unfinished.",
+    command: scoped(root, "rbox adopt status"),
+  };
 }
 
 function quotaFinding(activity: DaemonActivity | undefined): TriageFinding | undefined {
-  if (!activity?.outOfStorage) return undefined;
-  const workspaces = activity.outOfStorage.kind === "workspaces";
+  const quota = activity?.outOfStorage;
+  if (!quota) return undefined;
+  if (quota.reason === "no_plan") {
+    return {
+      id: "quota-no-plan",
+      severity: "blocked",
+      problem: "This account is not on a plan yet, so new changes cannot be uploaded.",
+      safety: `${SAFE_LOCAL_FILES} Downloads keep working.`,
+      command: "rbox subscribe solo",
+    };
+  }
+  const workspaces = quota.kind === "workspaces";
   return {
     id: workspaces ? "quota-workspaces" : "quota-storage",
     severity: "blocked",
     problem: workspaces
-      ? "Your plan has no room for another synced folder, so this one cannot upload."
-      : "Your account is out of storage, so new changes cannot be uploaded.",
+      ? "Your plan has no room for another synced folder, so this one cannot upload. If you are already on the largest plan, stop syncing a folder you no longer need instead."
+      : "Your account is out of storage, so new changes cannot be uploaded. If you are already on the largest plan, remove files you no longer need instead — `rbox usage` shows what is using space.",
     safety: `${SAFE_LOCAL_FILES} Downloads keep working.`,
-    command: "rbox subscribe",
+    command: "rbox subscribe pro",
   };
 }
 
@@ -379,15 +399,16 @@ function quotaFinding(activity: DaemonActivity | undefined): TriageFinding | und
  * stop sync entirely, then things that slow it down, then advisories. */
 export function triageWorkspace(input: TriageInputs): WorkspaceTriage {
   const findings: TriageFinding[] = [];
-  const adopt = adoptFinding(input.adopt);
+  const adopt = adoptFinding(input.root, input.adopt);
   if (adopt) findings.push(adopt);
-  findings.push(...credentialFindings(input.checks, input.root));
-  const quota = quotaFinding(input.activity);
+  findings.push(...accountFindings(input));
+  const owned = daemonOwnsActivity(input);
+  const quota = owned ? quotaFinding(input.activity) : undefined;
   if (quota) findings.push(quota);
-  const halt = input.activity?.halt ? haltFinding(input.activity.halt) : undefined;
+  const halt = owned && input.activity?.halt ? haltFinding(input.root, input.activity.halt) : undefined;
   if (halt) findings.push(halt);
-  findings.push(...environmentFindings(input.checks));
-  for (const repo of input.deferrals) findings.push(deferralFinding(repo, input.now));
+  findings.push(...environmentFindings(input));
+  for (const repo of input.deferrals) findings.push(deferralFinding(input.root, repo, input.now));
   findings.push(...daemonFindings(input));
 
   const ordered = findings
