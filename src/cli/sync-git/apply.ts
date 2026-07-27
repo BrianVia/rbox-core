@@ -6,15 +6,16 @@ import { canonicalizeGitConfig, sanitizeGitSectionForPersistence } from "../../e
 import { applyConfigTransaction, materializeFreshGitConfig, readParsedConfigSnapshot } from "../../engine/git/config-txn.js";
 import { readAllRefs, readAllRefsStrict } from "../../engine/git/refs.js";
 import { git, readHead, warnOnce } from "../../engine/git/shared.js";
-import { DEFERRAL_LANES, expectedStateNonce, loadRawState, repoRecordsForState, type GitDeferral, type GitDeferralReason, type GitHeldAttempt, type GitPartialApply, type RepoRecord, type RepoRecordInput, type SyncState, type TypedBlocker, type WorkspaceConfig } from "../config.js";
+import { expectedStateNonce, loadRawState, repoRecordsForState, type GitDeferral, type GitDeferralReason, type GitHeldAttempt, type GitPartialApply, type RepoRecord, type RepoRecordInput, type SyncState, type TypedBlocker, type WorkspaceConfig } from "../config.js";
 import { configLaneState, inputRecord, type ConfigLaneState, type GitDeferralUpdates } from "../sync-state.js";
-import { checkoutJournalBinding, clearFollowJournal, deriveBaseIndexProjection, firstReason, followDivergedRepo, FollowCrashInjectedError, quarantineUnboundFollowJournal, recoverAndLandFollowJournal, type FollowCrashPoint, type FollowIntended, type FollowProgress } from "./follow.js";
+import { checkoutJournalBinding, clearFollowJournal, deriveBaseIndexProjection, followDivergedRepo, FollowCrashInjectedError, quarantineUnboundFollowJournal, recoverAndLandFollowJournal, type FollowCrashPoint, type FollowIntended, type FollowProgress } from "./follow.js";
 import { checkoutLabel, repoDirOf, localDivergedFromBase, narrowerScope, projectedKey, emptyToUndef, errMsg, chainLock, gitApplyMutationKey, nestedRepoChains, gitApplyConcurrency, gitFollowEnabled, gitIncomingKey, nextDeferral, repoEquivalenceWarningLogged, sectionOpState } from "./shared.js";
 import { executeRemoteRepositoryDeletion, planRemoteRepositoryDeletion, sweepRemovedRepoSkeleton, type RemoteRepositoryDeletionEffects, type RemoteRepositoryDeletionIdentity, type RepoSkeletonSweepOptions } from "./remote-repository-deletion.js";
 import { configReceiver } from "./config-lane.js";
 import { ConfigLaneLedger, applyReceivedGitConfig, classifyIncomingConfigSanitation, planReceivedGitConfigApply, planReceivedGitConfigBaseline, planReceivedGitConfigTarget, type GitConfigExecutor, type ReceivedGitConfigIdentity, type ReceivedGitConfigPlan } from "./received-git-config.js";
 import { prepareFollowerBranchProtocol } from "./follower-protocol.js";
 import { settleStandingBranchProof, type StandingProofPort, type StandingRepairAttempt } from "./standing-branch-proof.js";
+import { composeFollowAuthority, composeFollowRepoTransition, followHeldDeferralReason, mergeFollowDeferralLanes, type FollowRepoTransition, type FollowTransitionIdentity, type StandingBranchProofReceipt } from "./follow-repo-transition.js";
 import { executeCleanMaterialization, planCleanMaterialization, type CleanMaterializationEffects } from "./clean-materialization.js";
 import { createPRepairStatePort } from "./p-repair-state.js";
 import { settleExactPresentArtifact } from "./p-settlement.js";
@@ -22,11 +23,8 @@ import { MutationGateClosedError, type MutationBoundary } from "../../engine/mut
 import { blockersAfterComposer, createHeldAttempt, gitHeldSkipEnabled, gitOwnershipNoEscalateEnabled, heldAttemptFloorElapsed, heldAttemptMatches, heldBlockersAllowSkip, incomingIndexArtifactDescriptor, observeHeldInputs, ownershipBlockersArePerRefOnly, readWorktreeRegistryDigest, rebindHeldAttemptsAfterSettlement, sameHeldOutcome, sortedTypedBlockers } from "./held-skip.js";
 import {
   carryRepoBaseProof,
-  composeRepoBase,
   recordOriginLineage,
-  type ComposeRepoBaseResult,
   type RepoBaseProof,
-  type RepoBaseLockedProof,
 } from "./base-composer.js";
 import { acquirePreparedStateCasLocks, markStateCasCommitted, prepareStateCasLocks, releaseStateCasLocks, type HeldStateCasLock, type StateCasLockRequest } from "./state-cas-locks.js";
 import type { LockfileHooks } from "../../engine/git/lockfile.js";
@@ -694,32 +692,6 @@ opts: {
       configApplied: progress.configApplied,
       ...(!progress.configApplied && inheritedConfigBase !== undefined ? { configBase: inheritedConfigBase } : {}),
     });
-    const heldReasonOf = (progress: Pick<FollowProgress, "blockers" | "heldRefs">): GitDeferralReason => {
-      const classified = firstReason(new Set<GitDeferralReason>(
-        progress.blockers
-          .filter((blocker) => blocker.provenance === "ref-plane")
-          .map((blocker) => blocker.reason),
-      ));
-      if (classified) return classified;
-      const persisted = Object.values(progress.heldRefs);
-      return persisted.includes("local-commits") ? "local-commits"
-        : persisted.includes("local-stash") ? "local-stash"
-        : "worktree-ownership";
-    };
-    const ownershipOnlyDisposition = (
-      progress: Pick<FollowProgress, "heldRefs" | "blockers">,
-      composed: ComposeRepoBaseResult,
-      checkoutComplete: boolean,
-    ): boolean => {
-      const heldReasons = Object.values(progress.heldRefs);
-      if (heldReasons.length === 0 || heldReasons.some((reason) => reason !== "ownership")) return false;
-      return ownershipBlockersArePerRefOnly(blockersAfterComposer({
-        classification: progress.blockers,
-        disposition: composed.disposition,
-        holds: composed.holds,
-        checkoutComplete,
-      }));
-    };
 
     // Removal memory: a leftover whose identity still EQUALS the memory is treated as
     // ABSENT (clean materialization target [v3/v4]); a leftover that CHANGED re-enters
@@ -1086,6 +1058,22 @@ opts: {
         return { result: "deferred", commonDirGroup };
       }
       const settledProtocol = settlement.protocol;
+      // Everything downstream composes against this exact pair: the repository
+      // and wire section the follow is bound to, and the lineage the settled
+      // standing-branch proof licensed it to stamp.
+      const followIdentity: FollowTransitionIdentity = {
+        relPath: rel,
+        incomingKey: incomingKey!,
+        repoKind: ctx.kind,
+        effectiveRefScope: remoteSec.refScope,
+      };
+      const followProof: StandingBranchProofReceipt = {
+        relPath: rel,
+        incomingKey: incomingKey!,
+        lineageHash: settledProtocol.lineageHash,
+        repositoryIdentityHash: settledProtocol.repositoryIdentityHash,
+        unmaterializedAbsenceRefs: settledProtocol.unmaterializedAbsenceRefs,
+      };
       await opts.afterHeldSkipPrepass?.(rel);
       const heldNowMs = opts.heldNow?.();
       const effectivePartial = currentPartial(rel);
@@ -1172,77 +1160,64 @@ opts: {
           ? createHeldAttempt(observed, merged)
           : createHeldAttempt(observed, merged, new Date(heldNowMs).toISOString());
       };
-      const proofFor = (progress: FollowProgress, checkoutComplete: boolean): RepoBaseProof => {
-        const branches: RepoBaseLockedProof["branches"] = { ...(progress.branchLockedProofs ?? {}) };
-        const safeRefs: RepoBaseLockedProof["safeRefs"] = Object.fromEntries(Object.entries(progress.safeRefWitnesses ?? {}).map(([ref, witness]) => [ref, {
-          liveOid: witness.afterOid,
-          witness,
-          ...(ref === "refs/stash" && witness.afterOid !== null ? { stashReflogReady: true } : {}),
-        }]));
-        return {
-          authority: {
-            kind: "pull-ref-transaction",
-            lineageHash: settledProtocol.lineageHash,
-            repositoryIdentityHash: settledProtocol.repositoryIdentityHash,
-            incomingKey: incomingKey!,
-            branchWitnesses: progress.branchWitnesses ?? {},
-            safeRefWitnesses: progress.safeRefWitnesses ?? {},
-          },
-          lockedProof: {
-            repoKind: ctx.kind,
-            effectiveRefScope: remoteSec.refScope,
-            checkoutComplete,
-            incomingKey: incomingKey!,
-            branches,
-            safeRefs,
-          },
-        };
-      };
-
       const intendedFor = async (progress: FollowProgress): Promise<FollowIntended> => {
-        const proof = proofFor(progress, true);
-        const composed = composeRepoBase(
-          { base: baseSec, branchBaseOrigins: records[rel]?.branchBaseOrigins },
-          { base: remoteSec },
-          proof.authority,
-          proof.lockedProof,
-        );
-        const held = Object.keys(progress.heldRefs).length > 0 || composed.disposition === "pending";
-        const ownershipOnly = ownershipOnlyDisposition(
-          progress,
-          composed,
-          proof.lockedProof.checkoutComplete,
-        );
-        const effectiveDeferrals = { ...(records[rel]?.deferrals ?? {}) };
-        const transition = deferrals[rel];
-        if (transition === null) {
-          for (const lane of DEFERRAL_LANES) delete effectiveDeferrals[lane];
-        } else if (transition) {
-          for (const lane of DEFERRAL_LANES) {
-            if (transition[lane] === null) delete effectiveDeferrals[lane];
-            else if (transition[lane]) effectiveDeferrals[lane] = transition[lane]!;
-          }
-        }
-        if (held && !(gitOwnershipNoEscalateEnabled() && ownershipOnly)) {
-          const heldReason = heldReasonOf(progress);
+        const authority = composeFollowAuthority({
+          identity: followIdentity,
+          incoming: remoteSec,
+          baseComposition: {
+            prior: { base: baseSec, branchBaseOrigins: records[rel]?.branchBaseOrigins },
+            candidate: { base: remoteSec },
+          },
+        }, followProof, progress, true);
+        const effectiveDeferrals = mergeFollowDeferralLanes(records[rel]?.deferrals, deferrals[rel]);
+        if (authority.held && !(gitOwnershipNoEscalateEnabled() && authority.ownershipOnly)) {
+          const heldReason = followHeldDeferralReason(progress);
           const next = nextDeferral("apply", effectiveDeferrals.apply, heldReason, new Date().toISOString(), incomingKey, await checkoutOf(repoDir));
           effectiveDeferrals.apply = next;
         } else delete effectiveDeferrals.apply;
         const lane = laneLedger.record(rel);
-        const part = held || !progress.configApplied ? partialFrom(progress, false) : undefined;
+        const part = authority.held || !progress.configApplied ? partialFrom(progress, false) : undefined;
         const previous = records[rel];
         const previousRecord = previous === undefined ? undefined : inputRecord(previous);
         const record: RepoRecordInput = {
           sourceSeq: opts.sourceGlobalSeq ?? state.lastSyncedSequence,
-          ...(composed.base ? { base: composed.base } : {}),
-          ...(composed.branchBaseOrigins ? { branchBaseOrigins: composed.branchBaseOrigins } : {}),
-          ...(held ? { pending: remoteSec } : {}),
+          ...(authority.composed.base ? { base: authority.composed.base } : {}),
+          ...(authority.composed.branchBaseOrigins ? { branchBaseOrigins: authority.composed.branchBaseOrigins } : {}),
+          ...(authority.held ? { pending: remoteSec } : {}),
           ...configLaneState(lane),
           ...(Object.keys(effectiveDeferrals).length ? { deferrals: effectiveDeferrals } : {}),
           ...(part ? { partial: part } : {}),
           ...(progress.incomingIndexProjection ? { idxProj: progress.incomingIndexProjection } : {}),
         };
-        return { record, expectedRepoGen: records[rel]?.repoGen ?? 0, relPath: rel, baseProof: proof, ...(previousRecord ? { previousRecord } : {}) };
+        return { record, expectedRepoGen: records[rel]?.repoGen ?? 0, relPath: rel, baseProof: authority.proof, ...(previousRecord ? { previousRecord } : {}) };
+      };
+
+      /** Applies one composed transition to this pull's sidecar lanes in the
+       * order the durable packet composer reads them. */
+      const commitFollowTransition = async (
+        transition: FollowRepoTransition,
+        progress: FollowProgress,
+      ): Promise<void> => {
+        if (transition.resolutionMemory === "clear") delete needsRes[rel];
+        if (transition.removalMemory === "clear") delete removedMem[rel];
+        if (transition.baseAdvance) {
+          repoProofs[rel] = transition.baseAdvance.proof;
+          if (transition.baseAdvance.appliedSection) applied[rel] = transition.baseAdvance.appliedSection;
+          else delete applied[rel];
+          if (transition.baseAdvance.branchOrigins) branchBaseOrigins[rel] = transition.baseAdvance.branchOrigins;
+        }
+        if (transition.indexProjection !== "retain") idxProj[rel] = transition.indexProjection;
+        if (transition.pending === null) delete pending[rel];
+        else pending[rel] = transition.pending;
+        if (transition.heldAttempt === "clear") clearAttempt(rel);
+        partial[rel] = transition.partial.kind === "from-progress"
+          ? partialFrom(progress, transition.partial.checkoutPending)
+          : transition.partial.kind === "config-carry"
+            ? partialFrom({ appliedRefs: {}, heldRefs: {}, configApplied: false }, false)
+            : null;
+        if (transition.deferral.kind === "clear") clearDeferral(rel, "apply");
+        else setDeferral(rel, "apply", transition.deferral.reason, incomingKey, await checkoutOf(repoDir));
+        if (transition.publishJournal) publishedJournals.push(rel);
       };
       const classificationWorktreeRegistryDigest = await readWorktreeRegistryDigest(repoDir);
       const follow = await runMutation(repoDir, () => followDivergedRepo({
@@ -1277,24 +1252,25 @@ opts: {
         afterHeldClassification: async (classification) => {
           await opts.afterHeldClassification?.(rel);
           if (classification.phase === "followed") {
-            const finalProof = proofFor(classification.progress, true);
-            const finalComposed = composeRepoBase(
-              { base: baseSec, branchBaseOrigins: records[rel]?.branchBaseOrigins },
-              { base: remoteSec },
-              finalProof.authority,
-              finalProof.lockedProof,
-            );
+            const final = composeFollowAuthority({
+              identity: followIdentity,
+              incoming: remoteSec,
+              baseComposition: {
+                prior: { base: baseSec, branchBaseOrigins: records[rel]?.branchBaseOrigins },
+                candidate: { base: remoteSec },
+              },
+            }, followProof, classification.progress, true);
             await recordAttempt({
               ...classification,
               expectedWorktreeRegistryDigest: classificationWorktreeRegistryDigest,
-              ...(finalComposed.base ? { boundBase: finalComposed.base } : {}),
-              ...(finalComposed.branchBaseOrigins ? { boundOrigins: finalComposed.branchBaseOrigins } : {}),
+              ...(final.composed.base ? { boundBase: final.composed.base } : {}),
+              ...(final.composed.branchBaseOrigins ? { boundOrigins: final.composed.branchBaseOrigins } : {}),
               observationPartial: partialFrom(classification.progress, false),
               blockers: blockersAfterComposer({
                 classification: classification.blockers,
-                disposition: finalComposed.disposition,
-                holds: finalComposed.holds,
-                checkoutComplete: finalProof.lockedProof.checkoutComplete,
+                disposition: final.composed.disposition,
+                holds: final.composed.holds,
+                checkoutComplete: final.proof.lockedProof.checkoutComplete,
               }),
             });
           } else {
@@ -1321,77 +1297,37 @@ opts: {
           markCheckpointReproof(rel);
           return { result: "unchanged", commonDirGroup };
         }
-        // Deferred checkout has historically kept serialized BASE unchanged even
-        // when earlier ref phases made physical progress. The sole exception is
-        // a crash-reconstructed owning A: it must consume its stale BASE member
-        // once so the §126 veto does not recur forever. Narrow the proof to those
-        // absences; do not accidentally publish unrelated pre-checkout progress.
-        const reconstructed = [...settledProtocol.unmaterializedAbsenceRefs]
-          .filter((ref) => follow.appliedRefs[ref]?.kind === "absent"
-            && follow.branchWitnesses?.[ref]?.kind === "absent"
-            && follow.branchLockedProofs?.[ref] !== undefined);
-        if (reconstructed.length > 0) {
-          const only = new Set(reconstructed);
-          const absenceProgress: FollowProgress = {
-            appliedRefs: Object.fromEntries(Object.entries(follow.appliedRefs).filter(([ref]) => only.has(ref))),
-            heldRefs: follow.heldRefs,
-            blockers: follow.blockers,
-            configApplied: false,
-            branchWitnesses: Object.fromEntries(Object.entries(follow.branchWitnesses ?? {}).filter(([ref]) => only.has(ref))),
-            branchLockedProofs: Object.fromEntries(Object.entries(follow.branchLockedProofs ?? {}).filter(([ref]) => only.has(ref))),
-            safeRefWitnesses: {},
-          };
-          const deferredProof = proofFor(absenceProgress, false);
-          const deferredComposed = composeRepoBase(
-            { base: baseSec, branchBaseOrigins: records[rel]?.branchBaseOrigins },
-            { base: remoteSec },
-            deferredProof.authority,
-            deferredProof.lockedProof,
-          );
-          repoProofs[rel] = deferredProof;
-          if (deferredComposed.base) applied[rel] = deferredComposed.base; else delete applied[rel];
-          if (deferredComposed.branchBaseOrigins) branchBaseOrigins[rel] = deferredComposed.branchBaseOrigins;
-        }
-        pending[rel] = remoteSec;
-        partial[rel] = partialFrom(follow, true);
-        setDeferral(rel, "apply", follow.reason, incomingKey, await checkoutOf(repoDir));
+        await commitFollowTransition(composeFollowRepoTransition({
+          identity: followIdentity,
+          incoming: remoteSec,
+          baseComposition: {
+            prior: { base: baseSec, branchBaseOrigins: records[rel]?.branchBaseOrigins },
+            candidate: { base: remoteSec },
+          },
+        }, {
+          relPath: rel,
+          incomingKey: incomingKey!,
+          outcome: "deferred",
+          deferralReason: follow.reason,
+          progress: follow,
+        }, followProof), follow);
         glog(`git-sync deferred ${rel}: ${follow.detail}`);
         return { result: "deferred", commonDirGroup };
       }
 
-      delete needsRes[rel];
-      delete removedMem[rel];
-      const held = Object.entries(follow.heldRefs);
-      const settledProof = proofFor(follow, true);
-      const composedFollow = composeRepoBase(
-        { base: baseSec, branchBaseOrigins: records[rel]?.branchBaseOrigins },
-        { base: remoteSec },
-        settledProof.authority,
-        settledProof.lockedProof,
-      );
-      repoProofs[rel] = settledProof;
-      if (composedFollow.base) applied[rel] = composedFollow.base; else delete applied[rel];
-      if (composedFollow.branchBaseOrigins) branchBaseOrigins[rel] = composedFollow.branchBaseOrigins;
-      idxProj[rel] = follow.incomingIndexProjection ?? null;
-      if (held.length > 0 || composedFollow.disposition === "pending") {
-        const ownershipOnly = ownershipOnlyDisposition(
-          follow,
-          composedFollow,
-          settledProof.lockedProof.checkoutComplete,
-        );
-        pending[rel] = remoteSec;
-        partial[rel] = partialFrom(follow, false);
-        if (gitOwnershipNoEscalateEnabled() && ownershipOnly) clearDeferral(rel, "apply");
-        else setDeferral(rel, "apply", held.length ? heldReasonOf(follow) : "artifact", incomingKey, await checkoutOf(repoDir));
-      } else {
-        delete pending[rel];
-        clearAttempt(rel);
-        partial[rel] = follow.configApplied
-          ? null
-          : partialFrom({ appliedRefs: {}, heldRefs: {}, configApplied: false }, false);
-        clearDeferral(rel, "apply");
-      }
-      publishedJournals.push(rel);
+      await commitFollowTransition(composeFollowRepoTransition({
+        identity: followIdentity,
+        incoming: remoteSec,
+        baseComposition: {
+          prior: { base: baseSec, branchBaseOrigins: records[rel]?.branchBaseOrigins },
+          candidate: { base: remoteSec },
+        },
+      }, {
+        relPath: rel,
+        incomingKey: incomingKey!,
+        outcome: "followed",
+        progress: follow,
+      }, followProof), follow);
       glog(`git-sync followed ${rel}`);
       return { result: "applied", commonDirGroup };
     }
