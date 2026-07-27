@@ -193,6 +193,13 @@ test("a rebind replaces the entry and carries nothing over from the old workspac
   await rememberBinding(root, { remoteWorkspaceId: "ws_first", name: "First", accountId: "acct_1" });
   const first = (await readPersistedEntries())[0]!;
 
+  // A real rebind rewrites the workspace config first; the registry only ever
+  // records a binding that the root actually carries right now.
+  await fs.writeFile(path.join(root, ".rbox", "workspace.json"), JSON.stringify({
+    remoteWorkspaceId: "ws_second",
+    projectId: "root",
+    remoteUrl: "https://api.test",
+  }));
   await rememberBinding(root, { remoteWorkspaceId: "ws_second" });
   const second = (await readPersistedEntries())[0]!;
   expect(second.workspaceId).toBe("ws_second");
@@ -243,6 +250,57 @@ test("rememberResolvedRoot refreshes a stale lastSeen and a changed binding", as
 test("rememberResolvedRoot ignores a root with no readable binding", async () => {
   await rememberResolvedRoot(path.join(scratch, "not-a-workspace"));
   expect(await readPersistedEntries()).toEqual([]);
+});
+
+test("a record whose binding no longer matches disk is refused, not written", async () => {
+  // The shape of the untrack race: a caller holds an identity from before the
+  // binding was removed. Re-reading under the lock is what refuses it.
+  const root = await bindRoot("raced");
+  await fs.rm(root, { recursive: true, force: true });
+  await rememberBinding(root, { remoteWorkspaceId: "ws_raced" });
+  expect(await readPersistedEntries()).toEqual([]);
+});
+
+test("rememberResolvedRoot cannot resurrect an entry a concurrent untrack removed", async () => {
+  const root = await bindRoot("untracked-midflight", "ws_untracked-midflight");
+  await rememberBinding(root, { remoteWorkspaceId: "ws_untracked-midflight" });
+  // untrack: the binding goes, then the entry goes.
+  await fs.rm(path.join(root, ".rbox"), { recursive: true, force: true });
+  expect(await forgetBinding(root)).toBe(true);
+
+  await rememberResolvedRoot(root);
+  expect(await readPersistedEntries()).toEqual([]);
+});
+
+test("forgetBinding surfaces a failure instead of claiming a removal it did not make", async () => {
+  const root = await bindRoot("unforgettable");
+  await rememberBinding(root, { remoteWorkspaceId: "ws_unforgettable" });
+  // A registry directory that cannot be written at all: the lock cannot be taken.
+  await fs.chmod(path.dirname(bindingRegistryPath()), 0o500);
+  try {
+    await expect(forgetBinding(root)).rejects.toThrow();
+  } finally {
+    await fs.chmod(path.dirname(bindingRegistryPath()), 0o700);
+  }
+  expect(await readPersistedEntries()).toHaveLength(1);
+});
+
+test("a far-future lastSeenAt does not read as permanently fresh", async () => {
+  const root = await bindRoot("skewed", "ws_skewed", "Skewed");
+  const future = new Date(Date.now() + 10 * REFRESH_INTERVAL_MS);
+  await rememberBinding(root, { remoteWorkspaceId: "ws_skewed", name: "Skewed" }, () => future);
+
+  await rememberResolvedRoot(root);
+  const entry = (await readPersistedEntries())[0]!;
+  expect(Date.parse(entry.lastSeenAt)).toBeLessThan(future.getTime());
+});
+
+test("an empty workspace name converges instead of rewriting on every command", async () => {
+  const root = await bindRoot("nameless", "ws_nameless", "");
+  await rememberResolvedRoot(root);
+  const before = await fs.readFile(bindingRegistryPath(), "utf8");
+  await rememberResolvedRoot(root);
+  expect(await fs.readFile(bindingRegistryPath(), "utf8")).toBe(before);
 });
 
 test("registry rows are sorted by root so aggregate views are stable", async () => {

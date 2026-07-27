@@ -137,6 +137,16 @@ test("a live daemon with a fresh record gets its plain-English line and a cd-int
   expect(rendered).not.toContain("has never started background sync is not listed here");
 });
 
+test("a rejected record supplies no pending work either, not just no state", async () => {
+  // The `status --all` PENDING column reads deferredRepos, so a dead daemon's
+  // count must not survive the gate that already demoted its state.
+  await seedWorkspace("dead-with-deferrals", { status: { state: "attention", deferredRepos: 3 } });
+  const workspace = (await collectWith(false)).workspaces[0]!;
+  expect(workspace.state).toBe("stopped");
+  expect(workspace.deferredRepos).toBeUndefined();
+  expect(workspace.summary).not.toContain("waiting on you");
+});
+
 test("a boot-bound record is trusted in full, including download-only mode", async () => {
   await seedWorkspace("bound", { status: { state: "synced", mode: "pull-only", bootId: BOOT }, pidBootId: BOOT });
   const workspace = (await collectWith(true)).workspaces[0]!;

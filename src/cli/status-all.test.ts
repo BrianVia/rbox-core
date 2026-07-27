@@ -169,6 +169,34 @@ test("untrack forgets a registered root whose binding is already gone", async ()
   expect(logs.join("\n")).toContain("forgot");
 });
 
+test("untrack of a stale nested root never walks up and destroys the parent's binding", async () => {
+  // The registry lists a child whose own binding is gone, and its PARENT is a
+  // live workspace. Walking up would untrack the parent the user never named.
+  const parent = await trackOnlyWorkspace("parent", "Parent");
+  const child = path.join(parent, "nested");
+  await fs.mkdir(path.join(child, ".rbox"), { recursive: true });
+  await fs.writeFile(path.join(child, ".rbox", "workspace.json"), JSON.stringify({
+    remoteWorkspaceId: "ws_nested",
+    projectId: "root",
+    remoteUrl: "https://api.test",
+  }));
+  await rememberBinding(child, { remoteWorkspaceId: "ws_nested" });
+  await fs.rm(path.join(child, ".rbox"), { recursive: true, force: true });
+
+  await run("untrack", child, "--force");
+
+  // The parent keeps its binding and its registry entry; only the child is gone.
+  await fs.access(path.join(parent, ".rbox", "workspace.json"));
+  expect((await readPersistedEntries()).map((entry) => entry.root)).toEqual([parent]);
+});
+
+test("--all rejects the single-workspace detail flags rather than ignoring them", async () => {
+  await trackOnlyWorkspace("papers");
+  await expect(run("status", "--all", "--verbose")).rejects.toThrow(/--all is the aggregate view/);
+  await expect(run("status", "--all", "--git")).rejects.toThrow(/--all is the aggregate view/);
+  await expect(run("doctor", "--all", "--residue-bytes")).rejects.toThrow(/workspace-scoped/);
+});
+
 test("untrack of an unknown, unbound path still refuses", async () => {
   await expect(run("untrack", path.join(outside, "nowhere"), "--force")).rejects.toThrow(/Not inside an rbox workspace/);
 });

@@ -21,7 +21,7 @@
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { acquireLock, type OwnedLock } from "../engine/git/lockfile.js";
-import { writeFileAtomic } from "../engine/fsutil.js";
+import { fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
 import { readDesiredDaemonRows } from "./autostart-cmd.js";
 import { currentWorkspaceId } from "./daemon/runtime-state.js";
 import { rboxDir } from "./rbox-paths.js";
@@ -115,7 +115,11 @@ async function writeEntries(entries: BindingRegistryEntry[]): Promise<void> {
   };
   const target = bindingRegistryPath();
   await fsp.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
-  await writeFileAtomic(target, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 });
+  await writeFileAtomic(target, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600, exactMode: true });
+  // Same durability contract as the desired-state record this mirrors: without
+  // the directory fsync, power loss can discard a rename we already reported as
+  // successful and silently restore the previous registry.
+  await fsyncDirectory(path.dirname(target));
 }
 
 async function registryLock(): Promise<OwnedLock> {
@@ -163,8 +167,10 @@ function upsert(
   // A rebind starts a new binding lifetime: nothing from the old workspace —
   // not its name, not its account, not its bind date — carries over.
   const carried = prev?.workspaceId === binding.remoteWorkspaceId ? prev : undefined;
-  const name = binding.name ?? carried?.name;
-  const accountId = binding.accountId ?? carried?.accountId;
+  // An empty name is the same as no name; storing "" would make the freshness
+  // comparison in `rememberResolvedRoot` rewrite the file on every command.
+  const name = (binding.name?.length ? binding.name : undefined) ?? carried?.name;
+  const accountId = (binding.accountId?.length ? binding.accountId : undefined) ?? carried?.accountId;
   return [...others, {
     root,
     workspaceId: binding.remoteWorkspaceId,
@@ -179,11 +185,18 @@ function upsert(
  * Record a binding this command just wrote. BEST EFFORT: a busy lock or an
  * unwritable `~/.rbox` must never fail the `track`/`init`/`adopt` it rides along
  * with, and `rememberResolvedRoot` re-adds the entry on the next command.
+ *
+ * The binding is re-read INSIDE the lock. Without that, a caller holding a
+ * snapshot from before a concurrent `untrack` would resurrect the very entry
+ * that untrack just removed.
  */
 export async function rememberBinding(root: string, binding: RememberedBinding, now = () => new Date()): Promise<void> {
   const abs = path.resolve(root);
-  await mutate((entries) => upsert(entries, abs, binding, now().toISOString()))
-    .catch(() => undefined);
+  await mutate((entries) => (
+    currentWorkspaceId(abs) === binding.remoteWorkspaceId
+      ? upsert(entries, abs, binding, now().toISOString())
+      : undefined
+  )).catch(() => undefined);
 }
 
 /**
@@ -195,26 +208,49 @@ export async function rememberBinding(root: string, binding: RememberedBinding, 
 export async function rememberResolvedRoot(root: string, now = () => new Date()): Promise<void> {
   const abs = path.resolve(root);
   try {
-    const cfg = JSON.parse(await fsp.readFile(workspaceConfigPath(abs), "utf8")) as {
-      remoteWorkspaceId?: unknown;
-      name?: unknown;
-    };
-    if (typeof cfg.remoteWorkspaceId !== "string" || cfg.remoteWorkspaceId.length === 0) return;
-    const name = typeof cfg.name === "string" ? cfg.name : undefined;
+    const observed = await readBindingIdentity(abs);
+    if (observed === undefined) return;
     const at = now();
     const prev = (await readPersistedEntries()).find((entry) => entry.root === abs);
+    // A far-future `lastSeenAt` (clock skew, a hand-edited file) must not read as
+    // permanently fresh, so the age has to be inside the window from BELOW too.
+    const age = prev === undefined ? Number.NaN : at.getTime() - Date.parse(prev.lastSeenAt);
     const fresh = prev !== undefined
-      && prev.workspaceId === cfg.remoteWorkspaceId
-      && prev.name === name
-      && at.getTime() - Date.parse(prev.lastSeenAt) < REFRESH_INTERVAL_MS;
+      && prev.workspaceId === observed.remoteWorkspaceId
+      && prev.name === observed.name
+      && Number.isFinite(age) && age >= 0 && age < REFRESH_INTERVAL_MS;
     if (fresh) return;
-    await mutate((entries) => upsert(entries, abs, { remoteWorkspaceId: cfg.remoteWorkspaceId as string, ...(name ? { name } : {}) }, at.toISOString()));
+    // Re-read the binding under the lock: the snapshot above may predate a
+    // concurrent `untrack`, and writing it back would resurrect that entry.
+    await mutate((entries) => (
+      currentWorkspaceId(abs) === observed.remoteWorkspaceId
+        ? upsert(entries, abs, observed, at.toISOString())
+        : undefined
+    ));
   } catch {
     // Best effort by design (see rememberBinding).
   }
 }
 
-/** Drop a root from the registry. Returns true when an entry was actually removed. */
+/** The registry-relevant identity of a binding on disk, or undefined when the
+ * root carries no usable one. An empty name is normalized away so it compares
+ * equal to the omitted field the entry stores. */
+async function readBindingIdentity(root: string): Promise<RememberedBinding | undefined> {
+  const cfg = JSON.parse(await fsp.readFile(workspaceConfigPath(root), "utf8")) as {
+    remoteWorkspaceId?: unknown;
+    name?: unknown;
+  };
+  if (typeof cfg.remoteWorkspaceId !== "string" || cfg.remoteWorkspaceId.length === 0) return undefined;
+  const name = typeof cfg.name === "string" && cfg.name.length > 0 ? cfg.name : undefined;
+  return { remoteWorkspaceId: cfg.remoteWorkspaceId, ...(name === undefined ? {} : { name }) };
+}
+
+/**
+ * Drop a root from the registry. Returns true when an entry was actually
+ * removed. Unlike the record paths this THROWS on a lock or write failure:
+ * untrack prints "this machine no longer lists it", and that claim must not be
+ * made about an entry that is still on disk.
+ */
 export async function forgetBinding(root: string): Promise<boolean> {
   const abs = path.resolve(root);
   let removed = false;
@@ -223,7 +259,7 @@ export async function forgetBinding(root: string): Promise<boolean> {
     if (next.length === entries.length) return undefined;
     removed = true;
     return next;
-  }).catch(() => undefined);
+  });
   return removed;
 }
 

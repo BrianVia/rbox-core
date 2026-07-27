@@ -164,8 +164,12 @@ export async function collectMachineTriage(deps: MachineTriageDeps = {}): Promis
       && Number.isFinite(age)
       && age <= AMBIENT_STATUS_STALE_MS
       && age >= -DAEMON_HEARTBEAT_FUTURE_SKEW_MS;
-    const suffix = deferralSuffix(status);
-    const deferred = status?.deferredRepos ?? 0;
+    // Deferral counts are evidence like any other field: a record the gates
+    // rejected describes a daemon that no longer exists, and quoting its count
+    // would put invented pending work in the `status --all` table.
+    const trusted = usable ? status : undefined;
+    const suffix = deferralSuffix(trusted);
+    const deferred = trusted?.deferredRepos ?? 0;
     if (usable && status) {
       const { state, summary } = summarize(status);
       const line = `${summary}${suffix}`;
@@ -201,7 +205,6 @@ export async function collectMachineTriage(deps: MachineTriageDeps = {}): Promis
       summary,
       ...(problem === undefined ? {} : { problem }),
       command: running ? command : `cd ${shQuoteIfNeeded(row.root)} && rbox start`,
-      ...(status?.deferredRepos === undefined ? {} : { deferredRepos: status.deferredRepos }),
     });
   }
   workspaces.sort((a, b) => a.root.localeCompare(b.root));

@@ -134,9 +134,18 @@ Same primitives the desired-record store already uses, per the repo's
 
 - **write**: `acquireLock` (`src/engine/git/lockfile.ts`) on
   `~/.rbox/workspaces.json.lock`, bounded poll to a 10 s deadline, then
-  read-modify-write and `writeFileAtomic` (`src/engine/fsutil.ts`, tmp + rename).
-  The lock is released in a `finally`. Because the mutation re-reads inside the
-  lock, two concurrent `track`s of different roots both survive.
+  read-modify-write, `writeFileAtomic` (`src/engine/fsutil.ts`, tmp + rename) and
+  `fsyncDirectory` — the same durability contract as `writeDesiredRecord`, so a
+  rename we reported as successful cannot be discarded by power loss. The lock is
+  released in a `finally`. Because the mutation re-reads inside the lock, two
+  concurrent `track`s of different roots both survive.
+- **revalidation**: both record paths re-read `<root>/.rbox/workspace.json`
+  INSIDE the lock and write nothing unless it still names the binding being
+  recorded. Without that, a process holding a pre-`untrack` snapshot would
+  resurrect the entry untrack just removed.
+- **failure reporting**: recording is best-effort (swallowed), but `forgetBinding`
+  THROWS. `untrack` prints "this machine no longer lists it", and that claim must
+  never be made about an entry still on disk.
 - **read**: no lock. `writeFileAtomic`'s rename means a reader sees either the
   old or the new complete file, never a torn one.
 - **crash**: a crash mid-write leaves the tmp file and the old registry intact;
@@ -162,6 +171,19 @@ asks for, all read from the already-trusted ambient record: `mode`,
   auto-all behavior, now over the registry.
 - `--all` and `PATH` are **mutually exclusive** (`rbox status --all ./x` →
   clear error). Automation uses `--all` for stable aggregate semantics.
+
+Two identity questions are deliberately answered by matching existing behavior
+rather than by this design:
+
+- roots are keyed by `path.resolve`, not `realpath`, because that is exactly how
+  `workspaceKey` already names every daemon runtime directory. Canonicalizing
+  here alone would make registry entries and daemon records disagree about the
+  same workspace. Symlink-alias roots are therefore a repo-wide path-identity
+  question, not a registry one.
+- the daemon lifecycle race where a concurrent `stop` recreates `desired.json`
+  after an `untrack` removed the runtime directory is pre-existing (the #503 view
+  showed the same resurrected row). With the registry the outcome is a `missing`
+  row, which is reported and now clearable — strictly better than before.
 
 ## 8. Non-goals
 

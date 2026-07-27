@@ -244,11 +244,14 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
     }
     case "untrack": {
       const explicit = positional[0] === undefined ? undefined : path.resolve(positional[0]);
-      // A root the registry still lists but whose `.rbox/` binding is already
-      // gone has no workspace to walk up to — yet forgetting it is exactly the
-      // remedy `status --all` / `doctor --all` print for that row (design 211).
-      const resolved = await findRoot(explicit ?? process.cwd())
-        ?? (explicit !== undefined && await (await import("./binding-registry.js")).isRegisteredRoot(explicit) ? explicit : undefined);
+      // An EXACT registry hit wins before any upward search. A root the registry
+      // still lists but whose `.rbox/` binding is gone has no workspace to walk
+      // up to, and walking up would untrack whichever ancestor happens to be a
+      // workspace — destroying a binding the user never named. Forgetting the
+      // named root is the remedy `status --all` prints for that row (design 211).
+      const registered = explicit !== undefined
+        && await (await import("./binding-registry.js")).isRegisteredRoot(explicit);
+      const resolved = registered ? explicit : await findRoot(explicit ?? process.cwd());
       if (resolved === undefined) throw workspaceRequiredError();
       const root = resolved;
       const { untrack } = await import("./untrack-cmd.js");
@@ -427,6 +430,11 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
       }
       assertAllWithoutPath("status", flags.all === "true", positional[0]);
       if (flags.all === "true") {
+        // --verbose and --git are single-workspace detail views; silently
+        // ignoring them would report the wrong thing with a success exit code.
+        if (flags.verbose === "true" || flags.git === "true") {
+          throw new Error("--all is the aggregate view; --verbose and --git report one workspace. Use `rbox status --all [--json]`.");
+        }
         await runMachineTriage(jsonMode, "status");
         break;
       }
@@ -459,8 +467,8 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
       if (flags.all === "true") {
         // Bounded, read-only diagnostics across the registry. The workspace-scoped
         // support-report and reset-journal work has no machine-wide meaning.
-        if (report || diagnostics || resetJournal || flags.quarantine === "true" || flags.restore !== undefined) {
-          throw new Error("--all runs the read-only all-workspaces check; support-report and reset-journal work is workspace-scoped");
+        if (report || diagnostics || residueBytes || resetJournal || flags.quarantine === "true" || flags.restore !== undefined) {
+          throw new Error("--all runs the read-only all-workspaces check; support-report, residue measurement, and reset-journal work are workspace-scoped");
         }
         await runMachineTriage(jsonMode);
         break;
