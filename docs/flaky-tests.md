@@ -314,6 +314,11 @@ removed; the redacted result is retained at
   QUEUED FIX: convert the file's timing-sensitive fixtures to the injected
   seam pattern that resolved the daemon-activity flakes (PR #403), or give
   the file a dedicated anti-affinity shard slot.
+- RESOLVED 2026-07-27: root cause identified as detached git
+  auto-maintenance (`gc.pid` trips `gitBusy` → "receiver git busy"
+  `applied:false`; evidence: PR #491 CI attempt-1 shard 5/6 log). Fixed by
+  suite-wide `GIT_CONFIG` env injection in `scripts/test-preload.ts`;
+  assertions now surface `res.reason`.
 
 ## rig git-join-ahead — fixture setup "linked-worktree source is refused" (RESOLVED — not a flake)
 
@@ -335,3 +340,14 @@ removed; the redacted result is retained at
   before the rerun proof due to an unguarded command chain (merges are now
   verdict-gated); post-merge verification on main substituted for the rerun
   leg.
+- RESOLVED 2026-07-27: converted to injected `now` +
+  `ManualRecoveryClock` per the PR #403 pattern. CI evidence (PR #492
+  attempt-1 shard 1/6) showed the ~5 ms real recovery timer consuming the
+  probe before the error was cleared.
+
+## src/cli/sync-git/follow.test.ts — "design safety linearization: op-state after the boundary remains ordinary post-follow work"
+
+- 2026-07-27: failed on main run 30232946666 shard 1/6 (commit `300c85ad`)
+  with "git-sync deferred repo: planned graph connectivity proof failed".
+  Same Cause-A class: auto-gc repack racing connectivity-proof object reads;
+  covered by the same `scripts/test-preload.ts` fix.

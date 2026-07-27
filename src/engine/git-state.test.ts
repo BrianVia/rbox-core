@@ -470,6 +470,7 @@ test("current incremental link is imported even when recorded commit tips are al
   await commitFile(A, "f.txt", "base\n", "c1");
   const base = (await captureGitState(A, store, KEK))!;
   let res = await applyGitState(B, base, store, KEK);
+  expect(res.reason).toBeUndefined();
   expect(res.applied).toBe(true);
 
   await fs.writeFile(path.join(A, "staged.txt"), "staged\n");
@@ -479,6 +480,7 @@ test("current incremental link is imported even when recorded commit tips are al
   expect(gitSectionTips(chained)).toEqual(gitSectionTips(base));
 
   res = await applyGitState(B, chained, store, KEK);
+  expect(res.reason).toBeUndefined();
   expect(res.applied).toBe(true);
   expect(await git(B, "diff", "--cached", "--name-only")).toBe("staged.txt");
   await expect(git(B, "fsck", "--connectivity-only", "--no-dangling")).resolves.toBeDefined();
@@ -557,6 +559,7 @@ test("detached pointer captures use detached HEAD as basis for scoped chains", a
   expect(chained.head).toBe(await git(W, "rev-parse", "HEAD"));
 
   const res = await applyGitState(B, chained, store, KEK);
+  expect(res.reason).toBeUndefined();
   expect(res.applied).toBe(true);
   expect(await git(B, "rev-parse", "HEAD")).toBe(chained.head);
 });
