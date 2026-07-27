@@ -351,3 +351,15 @@ removed; the redacted result is retained at
   with "git-sync deferred repo: planned graph connectivity proof failed".
   Same Cause-A class: auto-gc repack racing connectivity-proof object reads;
   covered by the same `scripts/test-preload.ts` fix.
+
+## src/cli/sync-git/follow.test.ts — "design 174 C: many-ref follow has exclusive leaf coverage and an explicit residual"
+
+- 2026-07-27: failed on PR #499 CI shard 3/6 (run 30269092909) at its 30s
+  test timeout with "killed 1 dangling process" — a hung git subprocess
+  under shard contention, NOT the auto-gc class #497 fixed (that cause is
+  suppressed suite-wide since 678697ad; this presents as a hang, mechanism
+  unidentified). Diff was daemon-scheduling only (no plausible path into
+  applyIncoming). Proof: 3x green locally in the file, rerun requested.
+  Second follow.test.ts incident today (see the safety-linearization entry)
+  — the file is the flake registry's top subprocess-contention locus now;
+  if a third incident lands, it earns a dedicated investigation cycle.
