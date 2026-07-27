@@ -96,7 +96,7 @@ interface DaemonInternals {
   watcherDegraded: boolean;
   watcherErrorGeneration: number;
   trustState: "trusted" | "suspect" | "fused";
-  gitRefRegistry?: unknown;
+  gitDiscovery: { registry?: unknown };
   openDriftAudits: Set<{ candidates: unknown[]; timer?: ReturnType<typeof setTimeout> }>;
   activity: { halt?: { op: string; message?: string } };
   startWatcherFn: (root: string, matcher: IgnoreMatcher, onSettle: unknown, opts: unknown) => Promise<{ backend: "parcel" | "chokidar"; close(): Promise<void> }>;
@@ -396,7 +396,7 @@ test("design 202 F2: a pull that changes the base gitRepos set falls back to the
   await fs.mkdir(path.join(root, "repo", ".git"), { recursive: true });
   await fs.writeFile(path.join(root, "repo", ".git", "HEAD"), "ref: refs/heads/main\n");
   const upserted: string[] = [];
-  d.gitRefRegistry = {
+  d.gitDiscovery.registry = {
     beginSnapshot: () => 1,
     applySnapshot: async () => {},
     upsert: async (repos: { relPath: string }[]) => { for (const r of repos) upserted.push(r.relPath); },
