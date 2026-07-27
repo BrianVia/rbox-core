@@ -1,7 +1,7 @@
 import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { applyGitState, assertGitTargetWithinRoot, checkoutJournalPresent, clearCheckoutJournal, finalizeGitChainTimings, gitIdentity, gitIdentityKey, gitPreflight, indexIdentityV2, inspectLockedPRepairReceipt, isGitBusy, persistPRepairTerminal, preserveGitConflict, receiverEquivalentCollisionNames, repoCtxFromDisk, poolMap, readBaseAbsentArtifact, readBasePresentArtifact, runLockedPRepairAttempt, resumeLockedAcceptedPRepair, refreshLockedAcceptedPRepair, settleBaseAbsentArtifact, type AppliedManifestOracle, type ApplyBranchTransitionAdapter, type ApplyBranchTransitionInput, type CheckoutCapabilityProbe, type GitIdentity, type GitChainTimings, type GitSection, type IgnoreMatcher, type Manifest, type BlobStore, type RepoCtx, zeroGitChainTimings } from "../../engine/index.js";
+import { applyGitState, assertGitTargetWithinRoot, checkoutJournalPresent, clearCheckoutJournal, finalizeGitChainTimings, gitIdentity, gitIdentityKey, gitPreflight, indexIdentityV2, inspectLockedPRepairReceipt, isGitBusy, persistPRepairTerminal, preserveGitConflict, receiverEquivalentCollisionNames, repoCtxFromDisk, poolMap, readBaseAbsentArtifact, readBasePresentArtifact, runLockedPRepairAttempt, resumeLockedAcceptedPRepair, refreshLockedAcceptedPRepair, settleBaseAbsentArtifact, type AppliedManifestOracle, type CheckoutCapabilityProbe, type GitIdentity, type GitChainTimings, type GitSection, type IgnoreMatcher, type Manifest, type BlobStore, type RepoCtx, zeroGitChainTimings } from "../../engine/index.js";
 import { canonicalizeGitConfig, sanitizeGitSectionForPersistence } from "../../engine/git/config-sync.js";
 import { applyConfigTransaction, materializeFreshGitConfig, readParsedConfigSnapshot } from "../../engine/git/config-txn.js";
 import { readAllRefs, readAllRefsStrict } from "../../engine/git/refs.js";
@@ -14,10 +14,9 @@ import { executeRemoteRepositoryDeletion, planRemoteRepositoryDeletion, sweepRem
 import { configReceiver } from "./config-lane.js";
 import { ConfigLaneLedger, applyReceivedGitConfig, classifyIncomingConfigSanitation, planReceivedGitConfigApply, planReceivedGitConfigBaseline, planReceivedGitConfigTarget, type GitConfigExecutor, type ReceivedGitConfigIdentity, type ReceivedGitConfigPlan } from "./received-git-config.js";
 import { prepareFollowerBranchProtocol } from "./follower-protocol.js";
+import { executeCleanMaterialization, planCleanMaterialization, type CleanMaterializationEffects } from "./clean-materialization.js";
 import { createPRepairStatePort } from "./p-repair-state.js";
 import { settleExactPresentArtifact } from "./p-settlement.js";
-import { commitPlannedBranchTransition, planBranchTransition } from "./branch-transition.js";
-import { runUpdateRefTransaction } from "../../engine/git/keep-pins.js";
 import { MutationGateClosedError, type MutationBoundary } from "../../engine/mutation-gate.js";
 import { blockersAfterComposer, createHeldAttempt, gitHeldSkipEnabled, gitOwnershipNoEscalateEnabled, heldAttemptFloorElapsed, heldAttemptMatches, heldBlockersAllowSkip, incomingIndexArtifactDescriptor, observeHeldInputs, ownershipBlockersArePerRefOnly, readWorktreeRegistryDigest, rebindHeldAttemptsAfterSettlement, sameHeldOutcome, sortedTypedBlockers } from "./held-skip.js";
 import {
@@ -1448,229 +1447,95 @@ opts: {
       return { result: "applied", commonDirGroup };
     }
 
-    // Clean apply. Refusals and containment run BEFORE any mutation [v2, B5].
-    if (rel !== "." && (matcher.ignores(rel) || matcher.ignores(`${rel}/`))) {
-      await defer("target is inside an ignored subtree — refusing to materialize", "ignored-target");
+    // Clean apply — one bound plan, one identity-bound execution, one receipt.
+    // Refusals and containment are decided BEFORE any mutation [v2, B5].
+    // The ignore refusal deliberately short-circuits the containment probe: an
+    // ignored target must not pay for a realpath walk it can never use.
+    const ignoredTarget = rel !== "." && (matcher.ignores(rel) || matcher.ignores(`${rel}/`));
+    // The config phase is `ApplyReceivedGitConfig`'s decision, not this
+    // transition's: a bound after-materialization plan IS the authorization.
+    const materializedConfigPlan = configApplyPlan("after-materialization");
+    const cleanPlan = await planCleanMaterialization({
+      identity: { root, relPath: rel, repoDir, incomingKey: incomingKey! },
+      incoming: remoteSec,
+      ignoredTarget,
+      containmentRefusal: ignoredTarget
+        ? undefined
+        : await assertGitTargetWithinRoot(root, rel).then(() => undefined, (e) => errMsg(e)),
+      cleanMaterialize,
+      dotGit: dotGit && { isDirectory: dotGit.isDirectory() },
+      stateNonce: state.stateNonce,
+      localRefs: () => readAllRefs(repoDir),
+      degradedMutex: opts.degradedMutex === true,
+      chainTimings,
+      warningSink: opts.warningSink,
+      config: materializedConfigPlan
+        ? { phase: "apply-after-materialization" }
+        : { phase: "not-due", applied: !configDue || configTarget === undefined },
+      inheritedConfigBase,
+      // Suppression deliberately removes the repo from the manifest projection,
+      // but §130 retains the protected BASE anchor in RepoRecord for the later
+      // clean materialization transaction. Never plan A/P from the suppressed
+      // projection.
+      baseComposition: {
+        prior: { base: records[rel]?.base ?? baseSec, branchBaseOrigins: records[rel]?.branchBaseOrigins },
+        candidate: { base: remoteSec },
+      },
+    });
+    if (cleanPlan.status === "refused") {
+      await defer(cleanPlan.reason, cleanPlan.deferralReason);
       return { result: "deferred", commonDirGroup };
     }
-    try {
-      await assertGitTargetWithinRoot(root, rel);
-    } catch (e) {
-      await defer(errMsg(e), "containment");
-      return { result: "deferred", commonDirGroup };
-    }
-
-    // Dir leftover clean materialization [v5]: applyGitState performs capture-grade
-    // quarantine after artifact verification, then routes every branch create/update/
-    // delete through §130's typed A/P/K transition adapter. cleanWipeRefs widens only
-    // the physical wipe set (including scoped omissions); it never widens authority.
-    // Pointer leftover: NEVER ref-wipe (shared main-clone store) — the guarded
-    // update-only apply is the whole treatment; the memory clears on success.
-    const wipeLeftover = cleanMaterialize && dotGit !== undefined && dotGit.isDirectory();
-    const capableLineage = /^[0-9a-f]{32}$/.test(state.stateNonce ?? "");
-    if (!capableLineage) {
-      const remoteBranches = Object.keys(remoteSec.refs).some((ref) => ref.startsWith("refs/heads/"));
-      const localBranches = dotGit
-        ? Object.keys(await readAllRefs(repoDir).catch(() => ({}))).some((ref) => ref.startsWith("refs/heads/"))
-        : false;
-      if (remoteBranches || (wipeLeftover && localBranches)) {
-        await defer("branch materialization requires a durable capable state lineage", "artifact");
-        return { result: "deferred", commonDirGroup };
-      }
-    }
-    // Suppression deliberately removes the repo from the manifest projection, but
-    // §130 retains the protected BASE anchor in RepoRecord for the later clean
-    // materialization transaction. Never plan A/P from the suppressed projection.
-    const cleanBaseSec = records[rel]?.base ?? baseSec;
     let cleanProtocol: Awaited<ReturnType<typeof prepareFollowerBranchProtocol>> | undefined;
-    const protocolFor = async (ctx: NonNullable<Awaited<ReturnType<typeof repoCtxFromDisk>>>) => {
-      if (!cleanProtocol) cleanProtocol = await prepareFollowerBranchProtocol({
-        workspaceRoot: root,
-        relPath: rel,
-        state,
-        ctx,
-        record: records[rel],
-        base: cleanBaseSec,
-        incoming: remoteSec,
-        liveRefs: await readAllRefs(repoDir),
-      });
-      if (cleanProtocol.status === "hold") throw new Error(cleanProtocol.reason);
-      return cleanProtocol.protocol;
-    };
-    const cleanBranchTransitions: ApplyBranchTransitionAdapter = {
-      commit: async (input: ApplyBranchTransitionInput) => {
-        const protocol = await protocolFor(input.ctx);
-        const logicalBaseOid = protocol.logicalBaseRefs[input.ref] ?? null;
-        if (input.afterOid === null && logicalBaseOid === null && input.beforeOid !== null) {
-          // A clean wipe may encounter a quarantined local-only branch. Its
-          // logical BASE is already absent, so no A is authored; the typed
-          // physical-only plan still has an exact expected-old inverse.
-          await runUpdateRefTransaction(repoDir, [
-            ...input.extraTransactionLines,
-            `delete ${input.ref} ${input.beforeOid}`,
-          ]);
-          return {
-            ref: input.ref,
-            beforeOid: input.beforeOid,
-            afterOid: null,
-            inverseLines: [`create ${input.ref} ${input.beforeOid}`],
-          };
-        }
-        const plan = await planBranchTransition({
-          repoDir,
-          binding: protocol.binding,
-          ref: input.ref,
-          beforeOid: input.beforeOid,
-          afterOid: input.afterOid,
-          logicalBaseOid,
-          extraTransactionLines: input.extraTransactionLines,
-          ...(input.expectedReflogFingerprint ? { expectedReflogFingerprint: input.expectedReflogFingerprint } : {}),
+    const cleanEffects: CleanMaterializationEffects = {
+      identity: cleanPlan.identity,
+      runMutation: (fn) => runMutation(repoDir, fn),
+      applyState: (options) => applyGitState(repoDir, remoteSec, store, kek, options),
+      branchProtocol: async (ctx) => {
+        if (!cleanProtocol) cleanProtocol = await prepareFollowerBranchProtocol({
+          workspaceRoot: root,
+          relPath: rel,
+          state,
+          ctx,
+          record: records[rel],
+          base: cleanPlan.baseComposition.prior.base,
+          incoming: remoteSec,
+          liveRefs: await readAllRefs(repoDir),
         });
-        const committed = await commitPlannedBranchTransition(plan);
-        return {
-          ref: plan.ref,
-          beforeOid: plan.beforeOid,
-          afterOid: plan.afterOid,
-          inverseLines: plan.inverseLines,
-          witness: committed.witness,
-          lockedProof: committed.lockedProof,
-        };
+        if (cleanProtocol.status === "hold") throw new Error(cleanProtocol.reason);
+        return cleanProtocol.protocol;
       },
-      rollback: async (_ctx, transition) => {
-        await runUpdateRefTransaction(repoDir, transition.inverseLines);
-      },
+      repoContext: async () => (await repoCtxFromDisk(repoDir))!,
+      applyConfig: () => tryConfigApply(
+        materializedConfigPlan!,
+        configExecutorFor(configIdentity, "after-materialization"),
+      ),
+      log: glog,
     };
-    const res = await runMutation(repoDir, () => applyGitState(
-      repoDir,
-      remoteSec,
-      store,
-      kek,
-      {
-        ...(opts.degradedMutex ? { legacyWholeSectionOwnership: true } : {}),
-        ...(capableLineage ? { branchTransitions: cleanBranchTransitions } : {}),
-        ...(wipeLeftover ? { beforeMutateWipesRefs: true, cleanWipeRefs: true } : {}),
-        ...(chainTimings ? { chainTimings } : {}),
-        ...(opts.warningSink ? { warningSink: opts.warningSink } : {}),
-      }
-    ));
-    if (res.applied) {
-      // Belt-and-braces post-init containment re-verify (§7 [v2, B5; v3]).
-      try {
-        await assertGitTargetWithinRoot(root, rel);
-      } catch (e) {
-        glog(`git-sync WARNING ${rel}: post-apply containment check failed: ${errMsg(e)}`);
-      }
-      const held = Object.entries(res.heldRefs ?? {}).sort(([a], [b]) => a.localeCompare(b));
-      let configApplied = !configDue || configTarget === undefined;
-      const materializedConfigPlan = configApplyPlan("after-materialization");
-      if (materializedConfigPlan) {
-        configApplied = await tryConfigApply(materializedConfigPlan, configExecutorFor(configIdentity, "after-materialization"));
-      }
-      if (held.length > 0) {
-        pending[rel] = remoteSec;
-        const filtered = new Set(res.filteredRefs ?? []);
-        const heldSet = new Set(held.map(([ref]) => ref));
-        const transitionPartials: GitPartialApply["appliedRefs"] = {};
-        for (const [ref, transition] of Object.entries(res.branchTransitions ?? {})) {
-          if (!transition.witness) continue;
-          transitionPartials[ref] = transition.witness.kind === "present"
-            ? { kind: "present", oid: transition.witness.nextOid, artifactOid: transition.witness.artifactOid, episode: transition.witness.episode }
-            : { kind: "absent", artifactOid: transition.witness.artifactOid };
-        }
-        Object.assign(transitionPartials, res.safeRefTransitions ?? {});
-        for (const [ref, oid] of Object.entries(remoteSec.refs)) {
-          if (!heldSet.has(ref) && !filtered.has(ref) && transitionPartials[ref] === undefined) {
-            transitionPartials[ref] = { kind: "direct", oid };
-          }
-        }
-        partial[rel] = partialFrom({
-          appliedRefs: transitionPartials,
-          heldRefs: Object.fromEntries(held.map(([ref]) => [ref, "ownership" as const])),
-          configApplied,
-        }, false);
-        setDeferral(rel, "apply", "worktree-ownership", incomingKey, await checkoutOf(repoDir));
-      } else if (res.branchTransitions || res.safeRefTransitions) {
-        const protocol = await protocolFor((await repoCtxFromDisk(repoDir))!);
-        const branchWitnesses = Object.fromEntries(Object.entries(res.branchTransitions ?? {})
-          .flatMap(([ref, transition]) => transition.witness ? [[ref, transition.witness] as const] : []));
-        const safeRefWitnesses = res.safeRefTransitions ?? {};
-        const proof: RepoBaseProof = {
-          authority: {
-            kind: "pull-ref-transaction",
-            lineageHash: protocol.lineageHash,
-            repositoryIdentityHash: protocol.repositoryIdentityHash,
-            incomingKey: incomingKey!,
-            branchWitnesses,
-            safeRefWitnesses,
-          },
-          lockedProof: {
-            repoKind: (await repoCtxFromDisk(repoDir))!.kind,
-            effectiveRefScope: wipeLeftover ? "all" : remoteSec.refScope,
-            checkoutComplete: true,
-            incomingKey: incomingKey!,
-            branches: Object.fromEntries(Object.entries(res.branchTransitions ?? {})
-              .flatMap(([ref, transition]) => transition.witness && transition.lockedProof
-                ? [[ref, transition.lockedProof] as const]
-                : [])),
-            safeRefs: Object.fromEntries(Object.entries(safeRefWitnesses).map(([ref, witness]) => [ref, {
-              liveOid: witness.afterOid,
-              witness,
-              ...(ref === "refs/stash" && witness.afterOid !== null ? { stashReflogReady: true } : {}),
-            }])),
-          },
-        };
-        const composed = composeRepoBase(
-          { base: cleanBaseSec, branchBaseOrigins: records[rel]?.branchBaseOrigins },
-          { base: remoteSec },
-          proof.authority,
-          proof.lockedProof,
-        );
-        repoProofs[rel] = proof;
-        if (composed.base) applied[rel] = composed.base; else delete applied[rel];
-        if (composed.branchBaseOrigins) branchBaseOrigins[rel] = composed.branchBaseOrigins;
-        if (composed.disposition === "pending") pending[rel] = remoteSec; else delete pending[rel];
-        partial[rel] = configApplied
-          ? null
-          : partialFrom({ appliedRefs: {}, heldRefs: {}, configApplied: false }, false);
-        if (composed.disposition === "pending") setDeferral(rel, "apply", "artifact", incomingKey, await checkoutOf(repoDir));
-        else { clearDeferral(rel, "apply"); clearAttempt(rel); }
-      } else {
-        applied[rel] = remoteSec;
-        delete pending[rel];
-        partial[rel] = configApplied
-          ? null
-          : partialFrom({ appliedRefs: {}, heldRefs: {}, configApplied: false }, false);
-        clearDeferral(rel, "apply");
-        clearAttempt(rel);
-      }
-      delete removedMem[rel];
-      // A legacy clean apply may normalize the index. Never retain a semantic
-      // projection cached for the prior base; the next follow derives it once
-      // from the decrypt-verified new base artifact.
-      idxProj[rel] = null;
-      glog(
-        `git-sync applied ${rel}${held.length
-          ? ` (held refs: ${held.map(([ref, worktree]) => `${ref}=${worktree}`).join(" ")})`
-          : res.filteredRefs?.length
-            ? ` (filtered refs: ${res.filteredRefs.join(" ")})`
-            : ""}`
-      );
-      return { result: "applied", commonDirGroup };
-    } else {
-      const reason = res.reason ?? "apply deferred";
-      if (/\bconfig\b/i.test(reason)) {
+    const receipt = await executeCleanMaterialization(cleanPlan, cleanEffects);
+    if (receipt.status === "deferred") {
+      if (receipt.configLaneDeferred) {
         setDeferral(rel, "config", "config", incomingKey, await checkoutOf(repoDir));
       }
-      const typed: GitDeferralReason = /worktree-ownership|ownership-deferred/.test(reason) ? "worktree-ownership"
-        : reason.includes("busy") ? "git-busy"
-        : /\bconfig\b/i.test(reason) ? "config"
-        : /quarantine/i.test(reason) ? "other"
-        : /artifact|bundle|decrypt|import/i.test(reason) ? "artifact"
-        : /unsupported|invalid git section/i.test(reason) ? "unsupported"
-        : "other";
-      await defer(reason, typed);
+      await defer(receipt.reason, receipt.deferralReason);
       return { result: "deferred", commonDirGroup };
     }
+    const materialized = receipt.transition;
+    if (materialized.proof) repoProofs[rel] = materialized.proof;
+    if (materialized.appliedSection !== "retain") {
+      if (materialized.appliedSection) applied[rel] = materialized.appliedSection;
+      else delete applied[rel];
+    }
+    if (materialized.branchOrigins) branchBaseOrigins[rel] = materialized.branchOrigins;
+    if (materialized.pending) pending[rel] = materialized.pending; else delete pending[rel];
+    partial[rel] = materialized.partial;
+    if (materialized.deferral === "clear") clearDeferral(rel, "apply");
+    else setDeferral(rel, "apply", materialized.deferral, incomingKey, await checkoutOf(repoDir));
+    if (materialized.attempt === "clear") clearAttempt(rel);
+    delete removedMem[rel];
+    idxProj[rel] = materialized.indexProjection;
+    glog(receipt.announcement);
+    return { result: "applied", commonDirGroup };
   };
 
   const queuedAt = Date.now();
