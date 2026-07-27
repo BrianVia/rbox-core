@@ -6,6 +6,35 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-07-27
+
+### Added
+- **`rbox doctor` now explains problems in plain English.** Every finding says
+  what is wrong, whether your data is safe, and the exact command to run —
+  ordered by what to fix first. Outside a synced folder, `rbox doctor` and
+  `rbox status` now show a summary of every workspace on the machine instead
+  of an error, and new `rbox status --all` / `rbox doctor --all` flags give the
+  machine-wide view from anywhere, backed by a durable local workspace
+  registry. `rbox doctor <path>` now works positionally (`--path` remains).
+- **Small files upload in packs.** Many small files are now coalesced into
+  bandwidth-sized objects before upload: ~6x fewer requests and up to 1.5x
+  faster on fast connections, with identical content and history.
+  `RBOX_BLOB_PACK=0` restores the previous per-file uploads.
+
+### Changed
+- **Encryption is dramatically faster.** The fused in-memory encrypt path is
+  now the default (no more per-file temp files — up to 5x faster, biggest on
+  macOS), and the worker pool defaults to 4 workers after a cross-machine
+  sweep showed more workers actively slow encryption down. `RBOX_CRYPTO_FUSE=0`
+  restores the previous path.
+- **Adopting a large existing folder no longer takes forever.** The adoption
+  journal now batches its safety writes (same crash guarantees, ~1000x less
+  disk writing) — a 300k-file adoption drops from days to minutes.
+
+### Fixed
+- `RBOX_HOME` now isolates credentials as documented; previously a scratch
+  environment silently used the real account credential.
+
 ### Fixed
 - Manifest delta commits now keep advisory file mtimes stable across machines,
   preventing a daemon restart or full rescan from publishing a workspace-sized
