@@ -364,3 +364,12 @@ behind-origin count; loudly warn when behind.
   that misread before the merged code was checked. Rules: flip the doc's
   Status header in the SHIP commit itself; any "X never shipped" claim
   must be verified against git (`git log -S <flag>`) before acting on it.
+
+- **`rbox logs` surfaces archival crash text without provenance (2026-07-27,
+  cost ~20 min during release validation):** the legacy `daemon.log` index
+  file retains un-timestamped crash dumps from old binaries (here: the
+  7/26 refwatch TypeError that #457 already fixed), and `rbox logs` stitches
+  its tail after current dated-log lines — a fossil crash reads as a live
+  release blocker. Fix hint: label each merged source section
+  ("--- from daemon.log (legacy, last written <date>)") or drop legacy-file
+  tails once dated logs exist.
