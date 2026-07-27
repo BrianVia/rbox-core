@@ -12,8 +12,10 @@ Brian's preferred loop — follow it unless told otherwise:
    the design, revise here, re-dispatch — until BOTH agents (Claude and GPT)
    are in alignment, **capped at 3 review rounds** (founder rule 2026-07-27).
    At least one round must execute code/tests, not just read the doc. If
-   round 3 isn't ALIGNED, the design is wrong-layer or over-scoped — cut
-   scope or ship the residual behind a kill switch; never schedule round 4.
+   round 3 isn't ALIGNED, the design is wrong-layer or over-scoped — never
+   schedule round 4: step out a layer (re-frame one abstraction level up),
+   ask the founder to break the tie with 2-4 concrete options, or cut
+   scope / ship the residual behind a kill switch.
    Keep the rounds in a `REVIEW-N.md` beside the worktree.
 3. Implement via `codex exec` against the agreed design (spec-first dispatch).
 4. Validate the design is actually working: a dev build shipped to the local
