@@ -154,7 +154,6 @@ test("the full design-138 loadState caller inventory remains on the hard-refusal
     // Receipt arming consumes applyStateSavePacket's installed state directly;
     // a reload after the durable arm would reopen a pre-POST failure window.
     "sync/push.ts": 6,
-    "status-cmd.ts": 2,
     // Workspace shape, the local-only linked-worktree inventory, and the
     // design-208 repo-residue section each read through the same
     // stream-mismatch hard-refusal API.
@@ -176,7 +175,14 @@ test("the full design-138 loadState caller inventory remains on the hard-refusal
     expect(direct + injected, relative).toBe(expected);
     total += direct + injected;
   }
-  expect(total).toBe(29);
+  expect(total).toBe(27);
+
+  // Status reads state through its projection port instead of calling the API
+  // directly; the binding and both port reads still ride the hard-refusal path.
+  const portSource = await fs.readFile(path.join(cli, "status-read-port.ts"), "utf8");
+  expect(portSource).toContain("readState: loadState");
+  const projectionSource = await fs.readFile(path.join(cli, "status-projection.ts"), "utf8");
+  expect(projectionSource.match(/\bport\.readState\s*\(/g)?.length ?? 0).toBe(2);
 });
 
 test("nonce advance after witness validation is a zero-reset-write barrier including Git refs", async () => {

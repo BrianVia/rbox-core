@@ -1,18 +1,10 @@
 import path from "node:path";
-import { PassThrough } from "node:stream";
-import { buildIgnoreMatcher, checkoutTransactionCapability, cryptoPoolStatus, diffManifests, HashCache, scanManifest, type CheckoutTransactionCapability, type DiscoveredGitRepo, type IgnoreMatcher } from "../engine/index.js";
-import { trashStats } from "../engine/trash.js";
-import { isSafetyHaltReason, loadActivity, shellStateOf, type DaemonActivity } from "./activity.js";
+import { isSafetyHaltReason } from "./activity.js";
 import { RBOX_VERSION } from "./version.js";
-import { fetchAccountSummary, formatAccountSummary } from "./account-cmd.js";
-import { readAccountProfile } from "./account-profile.js";
-import { DEFERRAL_LANES, loadConfig, loadState, repoRecordsForState, syncStreamId, type GitDeferral, type SyncState, type WorkspaceConfig } from "./config.js";
-import { loadCredentials, type CredentialLoadResult, type Credentials } from "./credentials.js";
-import { daemonBindingStatus, readDaemonPidRecord } from "./daemon-control.js";
+import { formatAccountSummary } from "./account-cmd.js";
+import type { CredentialLoadResult } from "./credentials.js";
 import { emitJson } from "./json.js";
-import { loadMetrics } from "./metrics.js";
 import {
-  attributeDaemonForStatus,
   aggregatePlanQuotaAttention,
   briefBehindRemote,
   briefWorkspaceLabel,
@@ -20,296 +12,27 @@ import {
   healthDetailLines,
   healthLine,
   lastSyncLines,
-  projectGitDeferralRepos,
   renderBriefStatus,
   renderGitDeferralCompanion,
   renderGitDeferralLine,
   trashLine,
   type BriefHaltReason,
-  type BriefAccountSummary,
   type BriefIdentitySource,
   type BriefStatusSnapshot,
-  type GitDeferralDisplayEntry,
-  type StatusRemoteHead,
 } from "./status-view.js";
-import {
-  conflictSnapshotStatus,
-  gitDivergenceCount,
-  gitDivergenceFastRepoSource,
-  gitDivergenceStatus,
-  type GitDivergenceRepoHint,
-  type GitDivergenceStatus,
-} from "./sync-git.js";
 import { style } from "./style.js";
-import { formatUpdateAvailableLine, readUpdateCheckState, updateAvailableVersion } from "./update-check.js";
+import { formatUpdateAvailableLine, updateAvailableVersion } from "./update-check.js";
 import { shortWorkspaceId } from "./workspace-picker.js";
-import { readFreshPopulateStatus } from "./populate-status.js";
-import { readLockingHealth, type LockingHealth } from "./sync-mutex.js";
-import { readAmbientDaemonStatusRecord, validDaemonVersion } from "./daemon/ambient-status.js";
-import type { DaemonMode } from "./daemon/ambient-status.js";
 import { serializeGitDeferralLanes } from "./sync-git/git-deferral-json.js";
-import { reconcileGitDeferrals } from "./sync-git/deferral-hygiene.js";
-import {
-  refreshStatusDeferralAssertions,
-  statusStaleLockDetail,
-  type StatusDeferralDisplayDetails,
-} from "./status-maintenance.js";
-import { inspectResetJournalSafety } from "./reset-halt-inspection.js";
-import { readResetHaltHealth } from "./reset-health.js";
-import { promotePendingModeIntent } from "./autostart-cmd.js";
-import { pendingGenesisState } from "./genesis-enrollment.js";
+import { refreshStatusDeferralAssertions, statusStaleLockDetail } from "./status-maintenance.js";
 import { GENESIS_PENDING_MESSAGE } from "./genesis-durable.js";
-import { buildPathWarnings, readPathWarnings, type PathWarningsV1 } from "./path-warnings.js";
-import { projectLocalManifest } from "./local-file-projection.js";
-import { fetchWithDeadline } from "./remote/resilient.js";
+import { projectWorkspaceStatusDetail } from "./status-projection.js";
+import type { StatusCacheHint, StatusMode, WorkspaceStatusProjection } from "./status-contract.js";
+import { createStatusReadPort, defaultStatusDeps, type StatusCmdDeps } from "./status-read-port.js";
+import { reconcileGitDeferrals } from "./sync-git/deferral-hygiene.js";
 
-interface StatusAccountJson {
-  plan: string | null;
-  usedBytes: number | null;
-  capBytes: number | null;
-}
-
-interface StatusLocalCountsBase {
-  added: number;
-  changed: number;
-  deleted: number;
-  trackedFiles: number;
-  gitChanged: number;
-  gitDeferrals: GitDivergenceStatus["deferrals"];
-  gitConfigChecking?: string[];
-  gitConfigDisabled?: GitDivergenceStatus["configDisabled"];
-  conflictSnapshots: { total: number; prunable: number };
-}
-
-interface LocalGitDeferral extends GitDeferral {
-  repo: string;
-}
-
-function localGitDeferrals(state: SyncState): LocalGitDeferral[] {
-  const out: LocalGitDeferral[] = [];
-  for (const [repo, record] of Object.entries(repoRecordsForState(state))) {
-    for (const lane of DEFERRAL_LANES) {
-      const deferral = record.deferrals?.[lane];
-      if (deferral) out.push({ repo, ...deferral });
-    }
-  }
-  return out.sort((a, b) => Date.parse(a.deferredSince) - Date.parse(b.deferredSince)
-    || a.repo.localeCompare(b.repo)
-    || DEFERRAL_LANES.indexOf(a.lane) - DEFERRAL_LANES.indexOf(b.lane));
-}
-
-type StatusLocalCounts =
-  | (StatusLocalCountsBase & { source: "computed" })
-  | (StatusLocalCountsBase & { source: "daemon"; ageMs: number });
-
-export interface StatusCmdDeps {
-  now: () => number;
-  loadCredentials?: typeof loadCredentials;
-  loadHashCache: (root: string) => Promise<HashCache>;
-  scanManifest: typeof scanManifest;
-  gitDivergenceCount: typeof gitDivergenceCount;
-  /** Optional so existing embedders/test fakes using the numeric API remain valid. */
-  gitDivergenceStatus?: typeof gitDivergenceStatus;
-  gitDivergenceFastRepoSource: (
-    root: string,
-    baseGitRepos: SyncState["lastSyncedManifest"]["gitRepos"],
-    matcher: IgnoreMatcher
-  ) => Promise<GitDivergenceRepoHint[]>;
-  daemonBindingStatus: typeof daemonBindingStatus;
-  readDaemonPidRecord: typeof readDaemonPidRecord;
-  readLockingHealth?: (root: string) => Promise<LockingHealth>;
-  checkoutTransactionCapability?: typeof checkoutTransactionCapability;
-  readAmbientDaemonStatusRecord?: typeof readAmbientDaemonStatusRecord;
-  readBriefIdentity?: (accountId: string) => Promise<BriefIdentitySource | undefined>;
-  promotePendingModeIntent?: typeof promotePendingModeIntent;
-  reconcileGitDeferrals?: typeof reconcileGitDeferrals;
-  readPathWarnings?: typeof readPathWarnings;
-}
-
-const defaultStatusDeps: StatusCmdDeps = {
-  now: () => Date.now(),
-  loadHashCache: (root) => HashCache.load(root),
-  scanManifest,
-  gitDivergenceCount,
-  gitDivergenceStatus,
-  gitDivergenceFastRepoSource,
-  daemonBindingStatus,
-  readDaemonPidRecord,
-  readLockingHealth,
-  checkoutTransactionCapability,
-  readAmbientDaemonStatusRecord,
-  promotePendingModeIntent,
-  reconcileGitDeferrals,
-  readPathWarnings,
-};
-
-const LOCAL_TRUST_MS = 60_000;
-const TRANSIENT_DEFERRAL_QUIET_MS = 10 * 60_000;
-
-function humanGitDeferralEntries<T extends GitDeferralDisplayEntry>(
-  entries: T[],
-  now: number,
-): T[] {
-  return entries.filter((entry) => {
-    const projected = projectGitDeferralRepos([entry], now)[0];
-    if (projected?.remediationClass !== "transient") return true;
-    const deferredAt = Date.parse(entry.deferral.deferredSince);
-    // Peer echoes on an actively committed repo arrive seconds behind local
-    // state and self-supersede on the next push. Showing those brief holds as
-    // attention trains users to ignore the banner or reach for take-theirs.
-    return !Number.isFinite(deferredAt)
-      || deferredAt > now
-      || now - deferredAt >= TRANSIENT_DEFERRAL_QUIET_MS;
-  });
-}
-
-async function cachedAccountSummary(
-  loaded: CredentialLoadResult,
-  primaryIdentityLookup?: (accountId: string) => Promise<BriefIdentitySource | undefined>
-): Promise<BriefAccountSummary> {
-  if (loaded.state === "absent") return { state: "signed-out" };
-  if (loaded.state !== "valid") {
-    const where = loaded.state === "invalid-environment" ? loaded.variable : loaded.path;
-    return { state: "credential-degraded", reason: `${loaded.state}: ${where}` };
-  }
-  const creds = loaded.credentials;
-  if (!creds.accountId) return { state: "unavailable" };
-  const [primary, profile] = await Promise.all([
-    primaryIdentityLookup?.(creds.accountId),
-    readCachedBriefIdentity(creds.accountId),
-  ]);
-  return {
-    state: "ok",
-    identity: {
-      email: primary?.email ?? profile?.email ?? null,
-      plan: primary?.plan ?? profile?.plan ?? null,
-    },
-  };
-}
-
-async function readCachedBriefIdentity(accountId: string): Promise<BriefIdentitySource | undefined> {
-  const profile = await readAccountProfile(accountId);
-  return profile ? { email: profile.email, plan: profile.plan } : undefined;
-}
-
-function trustedLocalSnapshot(
-  input: {
-    activity: DaemonActivity | undefined;
-    state: SyncState;
-    now: number;
-    daemonRunning: boolean;
-    boundWorkspaceId?: string;
-    currentWorkspaceId: string;
-    livePidfileBootId?: string;
-  }
-): { local: NonNullable<DaemonActivity["local"]>; ageMs: number } | undefined {
-  if (!input.daemonRunning) return undefined;
-  if (input.boundWorkspaceId !== input.currentWorkspaceId) return undefined;
-  if (input.livePidfileBootId === undefined) return undefined;
-  const { activity, state, now } = input;
-  if (!activity) return undefined;
-  const local = activity.local;
-  if (!local) return undefined;
-  if (!activity.ws) return undefined;
-  const ageMs = now - Date.parse(local.at);
-  if (!Number.isFinite(ageMs) || ageMs < 0 || ageMs >= LOCAL_TRUST_MS) return undefined;
-  if (local.stream !== state.stream) return undefined;
-  if (local.baseSequence !== state.lastSyncedSequence) return undefined;
-  if (!local.settled) return undefined;
-  return { local, ageMs };
-}
-
-function localBaseSequenceMismatched(activity: DaemonActivity | undefined, state: SyncState): boolean {
-  const local = activity?.local;
-  return local !== undefined && local.stream === state.stream && local.baseSequence !== state.lastSyncedSequence;
-}
-
-async function fetchRemoteSequence(
-  cfg: WorkspaceConfig,
-  creds: { token: string; remoteUrl?: string } | undefined,
-  timeoutMs = 2500
-): Promise<number | undefined> {
-  try {
-    const token = creds?.token || cfg.token;
-    if (!token) return undefined;
-    const base = creds?.remoteUrl ?? cfg.remoteUrl;
-    const res = await fetchWithDeadline(`${base}/v1/ws/${cfg.remoteWorkspaceId}/proj/${cfg.projectId}/latest`, {
-      headers: { authorization: `Bearer ${token}` },
-    }, timeoutMs);
-    if (!res.ok) return undefined;
-    const seq = ((await res.json()) as { sequence?: number }).sequence;
-    return typeof seq === "number" ? seq : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-async function fetchStatusAccountJson(loaded: CredentialLoadResult, timeoutMs = 3500): Promise<StatusAccountJson> {
-  const unavailable = { plan: null, usedBytes: null, capBytes: null };
-  if (loaded.state !== "valid") return unavailable;
-  const creds = loaded.credentials;
-  try {
-    const res = await fetchWithDeadline(`${creds.remoteUrl}/v1/account/usage`, {
-      headers: { authorization: `Bearer ${creds.token}` },
-    }, timeoutMs);
-    if (!res.ok) return unavailable;
-    const body = (await res.json()) as { plan?: unknown; usedBytes?: unknown; storageCap?: unknown };
-    if (typeof body.plan !== "string" || typeof body.usedBytes !== "number") return unavailable;
-    const capBytes = body.storageCap === null || typeof body.storageCap === "number" ? body.storageCap : null;
-    return { plan: body.plan, usedBytes: body.usedBytes, capBytes };
-  } catch {
-    return unavailable;
-  }
-}
-
-function credentialStatusJson(loaded: CredentialLoadResult): Record<string, unknown> {
-  if (loaded.state === "valid" || loaded.state === "absent") return { state: loaded.state };
-  if (loaded.state === "invalid-environment") return { state: "credential-degraded", reason: loaded.state, variable: loaded.variable };
-  return { state: "credential-degraded", reason: loaded.state, path: loaded.path };
-}
-
-function statusHealthJson(input: {
-  activity: DaemonActivity | undefined;
-  populate?: { filesDone: number; filesTotal: number };
-  localChanges: number;
-  gitChanged: number;
-  gitDeferrals: number;
-  gitBytesChangedDeferrals: number;
-  localSequence: number;
-  remote: StatusRemoteHead | undefined;
-  now: number;
-}): "halt" | "outofstorage" | "active" | "pending" | "ok" {
-  if (input.populate) return "active";
-  const behind = input.remote?.sequence !== undefined && input.remote.sequence > input.localSequence;
-  const settled = input.localChanges === 0
-    && input.gitChanged === 0
-    && input.gitDeferrals === 0
-    && input.gitBytesChangedDeferrals === 0
-    && !behind;
-  return shellStateOf(input.activity ?? { at: new Date(input.now).toISOString() }, settled);
-}
-
-function createGitRepoFeed(): {
-  push: (repo: DiscoveredGitRepo) => void;
-  close: () => void;
-  iterable: AsyncIterable<DiscoveredGitRepo>;
-} {
-  const feed = new PassThrough({ objectMode: true });
-  let closed = false;
-
-  return {
-    push(repo) {
-      if (closed) return;
-      feed.write(repo);
-    },
-    close() {
-      if (closed) return;
-      closed = true;
-      feed.end();
-    },
-    iterable: feed.iterator({ destroyOnReturn: false }) as AsyncIterable<DiscoveredGitRepo>,
-  };
-}
+export type { StatusCmdDeps } from "./status-read-port.js";
+export type { StatusCacheHint } from "./status-contract.js";
 
 export interface StatusCmdResult {
   daemonRunning: boolean;
@@ -327,15 +50,15 @@ function assertPresentationFlags(opts: StatusCmdOptions): void {
   if (selected > 1) throw new Error("choose only one status presentation flag: --json, --verbose, or --git");
 }
 
-function runningDaemonLabel(version?: string, mode?: DaemonMode): string {
-  const details = [version === undefined ? undefined : `v${version}`, mode].filter((item): item is string => item !== undefined);
-  return details.length === 0 ? "running" : `running (${details.join(", ")})`;
+function credentialStatusJson(loaded: CredentialLoadResult): Record<string, unknown> {
+  if (loaded.state === "valid" || loaded.state === "absent") return { state: loaded.state };
+  if (loaded.state === "invalid-environment") return { state: "credential-degraded", reason: loaded.state, variable: loaded.variable };
+  return { state: "credential-degraded", reason: loaded.state, path: loaded.path };
 }
 
-export interface StatusCacheHint {
-  cache: Pick<HashCache, "prune" | "save">;
-  /** Evaluated only once writeback is authorized, so a skipped save costs nothing. */
-  livePaths: () => Set<string>;
+function runningDaemonLabel(version?: string, mode?: string): string {
+  const details = [version === undefined ? undefined : `v${version}`, mode].filter((item): item is string => item !== undefined);
+  return details.length === 0 ? "running" : `running (${details.join(", ")})`;
 }
 
 export type StatusCacheWriteReceipt =
@@ -375,530 +98,324 @@ export async function statusCmdWithBriefIdentity(root: string, identity: BriefId
   });
 }
 
+/** Project once, then run the two effects cycle 1 left to this root: the
+ * best-effort desired-mode promotion and the fallback hashcache writeback. */
+async function projectOnce<M extends StatusMode>(
+  root: string,
+  mode: M,
+  deps: StatusCmdDeps,
+): Promise<WorkspaceStatusProjection<M>> {
+  const projection = await projectWorkspaceStatusDetail(root, { mode }, createStatusReadPort(mode, deps), {
+    refresh: (cfg, state) => refreshStatusDeferralAssertions(root, {
+      cfg,
+      state,
+      reconcile: deps.reconcileGitDeferrals ?? reconcileGitDeferrals,
+    }),
+  });
+  // The boot-bound witness remains authoritative; status must still render if
+  // the desired-state side file is temporarily unavailable.
+  if (projection.bookkeeping.promoteDaemonModeIntent) await deps.promotePendingModeIntent?.(root).catch(() => false);
+  if (projection.kind === "detail" && projection.cacheHint) {
+    await saveStatusHashCache(root, projection.cacheHint, (owned) => !deps.readDaemonPidRecord(owned).present);
+  }
+  return projection;
+}
+
 export async function statusCmdWithDeps(
   root: string,
   opts: Omit<StatusCmdOptions, "now"> = {},
   deps: StatusCmdDeps = defaultStatusDeps
 ): Promise<StatusCmdResult> {
   assertPresentationFlags(opts);
-  const loadedCredentials = await (deps.loadCredentials ?? loadCredentials)();
-  const creds = loadedCredentials.state === "valid" ? loadedCredentials.credentials : undefined;
-  const genesisPending=Boolean(creds?.accountId&&await pendingGenesisState(creds.accountId));
-  const rawCfg = await loadConfig(root);
-  const cfg = { ...rawCfg, remoteUrl: creds?.remoteUrl ?? rawCfg.remoteUrl };
-  const daemonBinding = deps.daemonBindingStatus(root, cfg.remoteWorkspaceId);
-  const alive = daemonBinding.alive;
-  const daemonStale = daemonBinding.stale;
-  const bg = { running: alive.running && !daemonStale, pid: alive.pid };
-  let daemonVersion: string | undefined;
-  let daemonMode: DaemonMode | undefined;
-  if (bg.running) {
-    const record = (deps.readAmbientDaemonStatusRecord ?? readAmbientDaemonStatusRecord)(root);
-    if (record.kind === "ok") {
-      if (validDaemonVersion(record.status.daemonVersion)) daemonVersion = record.status.daemonVersion;
-      if (alive.bootId !== undefined && record.status.bootId === alive.bootId) daemonMode = record.status.mode;
-    }
-    // Desired-mode promotion is best-effort bookkeeping. The boot-bound
-    // witness remains authoritative and status must still render if the
-    // desired-state side file is temporarily unavailable.
-    await deps.promotePendingModeIntent?.(root).catch(() => false);
-  }
-  const daemonVersionSkew = daemonVersion !== undefined && daemonVersion !== RBOX_VERSION;
-
-  // Design 138 F2b: this branch precedes every loadState/state-dependent
-  // section. The classifier and health reader are both read-only; a direct
-  // status invocation can therefore explain an unsafe standing transaction
-  // without helping the daemon mutate its side-file.
-  const [resetInspection, resetHealth] = await Promise.all([
-    inspectResetJournalSafety(root, syncStreamId(cfg)),
-    readResetHaltHealth(root),
-  ]);
-  const resetDegraded = resetInspection.status === "halt" || resetHealth !== undefined;
-  if (resetDegraded) {
-    const reason = resetInspection.status === "halt" ? resetInspection.reason : "recovering";
-    if (opts.json) {
-      emitJson({
-        workspace: { id: cfg.remoteWorkspaceId, name: cfg.name ?? null, root },
-        halted: true,
-        reason,
-        daemon: { running: bg.running, pid: bg.pid ?? null },
-        credential: credentialStatusJson(loadedCredentials),
-      });
-      return { daemonRunning: bg.running };
-    }
-    if (!opts.verbose) {
-      const workspaceLabel = briefWorkspaceLabel(cfg.name, path.basename(root));
-      const rendered = renderBriefStatus({
-        kind: "reset-halt",
-        workspaceLabel,
-        daemonRunning: bg.running,
-        account: await cachedAccountSummary(loadedCredentials, deps.readBriefIdentity),
-      });
-      for (const line of rendered.lines) console.log(line);
-      return { daemonRunning: rendered.daemonRunning };
-    }
-    const wsLabel = cfg.name
-      ? `${style.cyan(cfg.name)} ${style.dim("@")} ${root} ${style.dim(`(${shortWorkspaceId(cfg.remoteWorkspaceId)})`)}`
-      : `${style.cyan(cfg.remoteWorkspaceId)} ${style.dim("@")} ${root}`;
-    console.log(`${style.bold("workspace")} ${wsLabel} ${style.dim(`· rbox ${RBOX_VERSION}`)}`);
-    if (loadedCredentials.state !== "valid" && loadedCredentials.state !== "absent") {
-      const diagnostic = credentialStatusJson(loadedCredentials);
-      console.log(`  ${style.yellow(`credential-degraded: ${String(diagnostic.reason)} (${String(diagnostic.variable ?? diagnostic.path)})`)}`);
-    }
-    console.log(`  ${style.yellow(`sync halted: a state-recovery record can't be processed (${reason}). Files on disk are untouched; run \`rbox doctor reset-journal\`.`)}`);
-    console.log(`  ${style.dim("background sync:")} ${daemonStale
-      ? style.yellow(`running but bound to a previous workspace (pid ${alive.pid})`)
-      : bg.running ? style.green(`${runningDaemonLabel(daemonVersion, daemonMode)} (pid ${bg.pid})`) : style.yellow("stopped")}`);
-    return { daemonRunning: bg.running };
-  }
-
-  const accountSummaryP = opts.verbose ? fetchAccountSummary(3500, loadedCredentials) : Promise.resolve(null);
-  let state = await loadState(root, syncStreamId(cfg));
-  let hygieneDetails: StatusDeferralDisplayDetails = new Map();
-  const runDeferralHygiene = async (): Promise<void> => {
-    const receipt = await refreshStatusDeferralAssertions(root, {
-      cfg,
-      state,
-      reconcile: deps.reconcileGitDeferrals ?? reconcileGitDeferrals,
-    });
-    if (receipt.kind !== "refreshed") return;
-    state = receipt.state;
-    hygieneDetails = receipt.displayDetails;
-  };
-  await runDeferralHygiene();
-
-  const activityP = daemonStale ? Promise.resolve(undefined) : loadActivity(root);
-  const pathWarningsP = (deps.readPathWarnings ?? readPathWarnings)(root);
-  const trashP = trashStats(root).catch(() => undefined);
-  const lockingP = (deps.readLockingHealth ?? readLockingHealth)(root);
-  const accountJsonP = opts.json ? fetchStatusAccountJson(loadedCredentials) : Promise.resolve(null);
-  const [rawActivity, durablePathWarnings] = await Promise.all([activityP, pathWarningsP]);
-  let pathWarnings: PathWarningsV1 | undefined = durablePathWarnings;
-  const attributionNow = deps.now();
-  const attributeActivity = (base: SyncState) =>
-    attributeDaemonForStatus({
-      activity: rawActivity,
-      daemonRunning: bg.running,
-      boundWorkspaceId: daemonBinding.bound,
-      currentWorkspaceId: cfg.remoteWorkspaceId,
-      livePidfileBootId: alive.bootId,
-      localSequence: base.lastSyncedSequence,
-      now: attributionNow,
-    });
-  let attributed = attributeActivity(state);
-  let activity = attributed.activity;
-  let mustComputeLocal = false;
-  if (localBaseSequenceMismatched(activity, state)) {
-    state = await loadState(root, syncStreamId(cfg));
-    await runDeferralHygiene();
-    attributed = attributeActivity(state);
-    activity = attributed.activity;
-    mustComputeLocal = true;
-  }
-  const remoteHeadP: Promise<StatusRemoteHead | undefined> = attributed.remote
-    ? Promise.resolve(attributed.remote)
-    : fetchRemoteSequence(cfg, creds).then((probed) => (probed !== undefined ? { sequence: probed, source: "probe" as const } : undefined));
-  const populate = state.lastSyncedSequence === 0 ? await readFreshPopulateStatus(root, cfg, attributionNow).catch(() => undefined) : undefined;
-  const trusted = mustComputeLocal
-    ? undefined
-    : trustedLocalSnapshot({
-      activity,
-      state,
-      now: attributionNow,
-      daemonRunning: bg.running,
-      boundWorkspaceId: daemonBinding.bound,
-      currentWorkspaceId: cfg.remoteWorkspaceId,
-      livePidfileBootId: alive.bootId,
-    });
-
-  const evaluateGit = async (
-    matcher: IgnoreMatcher | undefined,
-    source?: readonly GitDivergenceRepoHint[] | AsyncIterable<GitDivergenceRepoHint>,
-    includeBaseRepos = true
-  ): Promise<GitDivergenceStatus> => {
-    if (!cfg.syncGit) return { count: 0, indeterminate: false, deferrals: localGitDeferrals(state).map(({ repo, ...d }) => ({ relPath: repo, ...d })), configChecking: [], configDisabled: [], conflictSnapshots: { total: 0, prunable: 0 } };
-    try {
-      if (deps.gitDivergenceStatus) {
-        return await deps.gitDivergenceStatus(root, cfg, state, matcher, source, includeBaseRepos);
-      }
-      return {
-        count: await deps.gitDivergenceCount(root, cfg, state, matcher, source, includeBaseRepos),
-        indeterminate: false,
-        deferrals: localGitDeferrals(state).map(({ repo, ...d }) => ({ relPath: repo, ...d })),
-        configChecking: [],
-        configDisabled: [],
-        conflictSnapshots: { total: 0, prunable: 0 },
-      };
-    } catch {
-      // Design 93 §6: an indeterminate config lane is conservatively divergent;
-      // status must never collapse an evaluation failure to zero.
-      return { count: 1, indeterminate: true, deferrals: localGitDeferrals(state).map(({ repo, ...d }) => ({ relPath: repo, ...d })), configChecking: ["*"], configDisabled: [], conflictSnapshots: { total: 0, prunable: 0 } };
-    }
-  };
-
-  let counts: StatusLocalCounts;
-  if (trusted) {
-    const matcher = buildIgnoreMatcher(root, {
-      respectGitignore: false,
-      knownGitRepos: Object.keys(state.lastSyncedManifest.gitRepos ?? {}),
-    });
-    const repoHints = cfg.syncGit ? await deps.gitDivergenceFastRepoSource(root, state.lastSyncedManifest.gitRepos, matcher) : [];
-    const gitStatus = await evaluateGit(undefined, repoHints, false);
-    counts = {
-      added: trusted.local.added,
-      changed: trusted.local.changed,
-      deleted: trusted.local.deleted,
-      trackedFiles: trusted.local.trackedFiles,
-      gitChanged: gitStatus.count,
-      gitDeferrals: gitStatus.deferrals,
-      gitConfigChecking: gitStatus.configChecking,
-      gitConfigDisabled: gitStatus.configDisabled,
-      conflictSnapshots: gitStatus.conflictSnapshots,
-      source: "daemon",
-      ageMs: trusted.ageMs,
-    };
-  } else if (populate) {
-    const conflictSnapshots = await conflictSnapshotStatus(root, [
-      ...Object.keys(state.lastSyncedManifest.gitRepos ?? {}),
-      ...Object.keys(state.gitPendingRemote ?? {}),
-      ...Object.keys(repoRecordsForState(state)),
-    ]);
-    counts = {
-      added: 0,
-      changed: 0,
-      deleted: 0,
-      trackedFiles: populate.operation.filesDone,
-      gitChanged: 0,
-      gitDeferrals: localGitDeferrals(state).map(({ repo, ...d }) => ({
-        relPath: repo,
-        lane: d.lane,
-        reason: d.reason,
-        deferredSince: d.deferredSince,
-        ...(d.bytesChanged === undefined ? {} : { bytesChanged: d.bytesChanged }),
-      })),
-      conflictSnapshots,
-      source: "computed",
-    };
-  } else {
-    const matcher = buildIgnoreMatcher(root, {
-      respectGitignore: cfg.respectGitignore === true,
-      knownGitRepos: Object.keys(state.lastSyncedManifest.gitRepos ?? {}),
-    });
-    const hashCache = await deps.loadHashCache(root);
-    const gitRepoFeed = createGitRepoFeed();
-    const gitChangedP = evaluateGit(matcher, gitRepoFeed.iterable);
-    let rawLocalManifest;
-    try {
-      rawLocalManifest = await deps.scanManifest(root, matcher, hashCache, undefined, (repo) => gitRepoFeed.push(repo));
-    } finally {
-      gitRepoFeed.close();
-    }
-    await saveStatusHashCache(
-      root,
-      { cache: hashCache, livePaths: () => new Set(rawLocalManifest.files.map((f) => f.path)) },
-      (owned) => !deps.readDaemonPidRecord(owned).present,
-    );
-    const projected = projectLocalManifest(rawLocalManifest, state.lastSyncedManifest, matcher);
-    const localManifest = projected.manifest;
-    // A full status scan owns current read-only disk truth for this invocation.
-    // It never mutates the durable sidecar; the passive loop remains its writer.
-    pathWarnings = buildPathWarnings(projected.caseCollisions);
-    const manifestDiff = diffManifests(state.lastSyncedManifest, localManifest);
-    const deleted = manifestDiff.deleted.filter((p) => !matcher.ignores(p)).length;
-    const gitStatus = await gitChangedP;
-    counts = {
-      added: manifestDiff.added.length,
-      changed: manifestDiff.changed.length,
-      deleted,
-      trackedFiles: localManifest.files.length,
-      gitChanged: gitStatus.count,
-      gitDeferrals: gitStatus.deferrals,
-      gitConfigChecking: gitStatus.configChecking,
-      gitConfigDisabled: gitStatus.configDisabled,
-      conflictSnapshots: gitStatus.conflictSnapshots,
-      source: "computed",
-    };
-  }
-
-  const [remote, trash, accountJson, locking] = await Promise.all([remoteHeadP, trashP, accountJsonP, lockingP]);
-  const localChanges = counts.added + counts.changed + counts.deleted;
-  const now = deps.now();
-  const crypto = cryptoPoolStatus();
-  const gitDeferrals = localGitDeferrals(state);
-  const projectedGitDeferrals = counts.gitDeferrals;
-  const statusRecords = repoRecordsForState(state);
-  const projectedGitEntries = projectedGitDeferrals.map((deferral) => ({
-    repo: deferral.relPath,
-    deferral,
-    record: statusRecords[deferral.relPath],
-  }));
-  const localGitEntries = gitDeferrals.map((deferral) => ({
-    repo: deferral.repo,
-    deferral,
-    record: statusRecords[deferral.repo],
-  }));
-  const projectedGitRepos = projectGitDeferralRepos(projectedGitEntries, now);
-  const localGitRepoProjections = projectGitDeferralRepos(localGitEntries, now);
-  const humanProjectedGitRepos = projectGitDeferralRepos(humanGitDeferralEntries(projectedGitEntries, now), now);
-  const humanLocalGitRepoProjections = projectGitDeferralRepos(humanGitDeferralEntries(localGitEntries, now), now);
-  const gitDeferredRepos = projectedGitRepos.length;
-  const gitBytesChangedDeferrals = projectedGitRepos.filter((repo) => repo.bytesChanged).length;
-  const gitCapability: CheckoutTransactionCapability | undefined = projectedGitRepos.some((repo) => repo.displayReason === "unsupported")
-    ? await (deps.checkoutTransactionCapability ?? checkoutTransactionCapability)(root)
-    : undefined;
   if (opts.json) {
-    const statusJson = {
-      workspace: { id: cfg.remoteWorkspaceId, name: cfg.name ?? null, root },
-      health: statusHealthJson({
-        activity,
-        populate: populate?.operation,
-        localChanges,
-        gitChanged: counts.gitChanged,
-        gitDeferrals: gitDeferredRepos,
-        gitBytesChangedDeferrals,
-        localSequence: state.lastSyncedSequence,
-        remote,
-        now,
-      }),
-      daemon: {
-        running: bg.running,
-        pid: bg.pid ?? null,
-        version: daemonVersion ?? null,
-        mode: daemonMode ?? null,
-        cliVersion: RBOX_VERSION,
-        versionSkew: daemonVersionSkew,
-      },
-      locking: {
-        status: locking.status,
-        reason: locking.status === "ok" ? null : locking.reason,
-        path: ".rbox/state/sync.lock",
-      },
-      remote: remote ? { sequence: remote.sequence, source: remote.source } : null,
-      ...(counts.source === "daemon"
-        ? {
-          local: {
-            added: counts.added,
-            changed: counts.changed,
-            deleted: counts.deleted,
-            gitChangedRepos: counts.gitChanged,
-            source: counts.source,
-            ageMs: counts.ageMs,
-          },
-        }
-        : {}),
-      trash: trash && trash.files > 0 ? { bytes: trash.bytes, count: trash.files } : null,
-      account: accountJson,
-      credential: credentialStatusJson(loadedCredentials),
-      ...(genesisPending?{genesisPending:true,resumeInstruction:GENESIS_PENDING_MESSAGE}:{}),
-      crypto,
-      git: {
-        ...(gitCapability ? { capability: gitCapability } : {}),
-        deferrals: serializeGitDeferralLanes(gitDeferrals.map(({ repo, ...deferral }) => ({ repo, deferral })), now),
-        deferredRepos: localGitRepoProjections.map((repo) => ({
-          repo: repo.repo,
-          oldestDeferredSince: repo.oldestDeferredSince,
-          displayReason: repo.displayReason,
-          ageSeconds: Number.isFinite(Date.parse(repo.oldestDeferredSince)) && Date.parse(repo.oldestDeferredSince) <= now
-            ? Math.floor((now - Date.parse(repo.oldestDeferredSince)) / 1000)
-            : null,
-          bytesChanged: repo.bytesChanged,
-          ...(repo.checkout?.kind === "branch"
-            ? { checkout: { kind: "branch" as const, ...(repo.checkout.label === undefined ? {} : { label: repo.checkout.label }) } }
-            : repo.checkout?.kind === "detached"
-              ? { checkout: { kind: "detached" as const } }
-              : {}),
-        })),
-        conflictSnapshots: counts.conflictSnapshots,
-      },
-      ...(counts.gitConfigChecking?.length || counts.gitConfigDisabled?.length
-        ? {
-          gitConfig: {
-            state: counts.gitConfigChecking?.length ? "checking" : "disabled",
-            checking: counts.gitConfigChecking ?? [],
-            disabled: counts.gitConfigDisabled ?? [],
-          },
-        }
-        : {}),
-      ...(activity?.halt?.reason !== undefined ? { haltReason: activity.halt.reason } : {}),
-      pathWarnings: pathWarnings ?? null,
-    };
-    emitJson(statusJson);
-    return { daemonRunning: bg.running };
+    const projection = await projectOnce(root, "json", deps);
+    return projection.kind === "reset-halt" ? renderResetHalt(projection) : renderStatusJson(projection);
   }
+  if (opts.verbose) {
+    const projection = await projectOnce(root, "verbose", deps);
+    return projection.kind === "reset-halt" ? renderResetHalt(projection) : renderStatusVerbose(projection);
+  }
+  const projection = await projectOnce(root, opts.git === true ? "git" : "brief", deps);
+  return projection.kind === "reset-halt" ? renderResetHalt(projection) : renderStatusBrief(projection, opts.git === true);
+}
 
-  if (!opts.verbose) {
-    const account = await cachedAccountSummary(
-      loadedCredentials,
-      deps.readBriefIdentity
-    );
-    const updateState = await readUpdateCheckState();
-    const nextVersion = updateAvailableVersion(updateState);
-    const planQuota = aggregatePlanQuotaAttention(account, activity?.outOfStorage);
-    const typedHalt = activity?.halt?.typedReason;
-    const retryArmed = Boolean(bg.running
-      && activity?.halt?.nextProbeAt
-      && activity.halt.recoveryState !== "suspended"
-      && activity.halt.recoveryState !== "running"
-      && !activity.halt.terminal
-      && !isSafetyHaltReason(typedHalt?.kind));
-    const retrySuspended = activity?.halt?.recoveryState === "suspended"
-      && typedHalt?.kind !== "mass-delete"
-      && typedHalt?.kind !== "chain-repair";
-    const retryRunning = activity?.halt?.recoveryState === "running"
-      && !activity.halt.terminal
-      && typedHalt?.kind !== "mass-delete"
-      && typedHalt?.kind !== "chain-repair";
-    const halt: BriefHaltReason | undefined = activity?.halt && !retryArmed && !retrySuspended && !retryRunning
-      ? typedHalt?.kind === "mass-delete"
-        ? { kind: "mass-delete", op: typedHalt.op }
-        : typedHalt?.kind === "too-many-refs"
-          ? { kind: "too-many-refs" }
-          : typedHalt?.kind === "body-too-large"
-            ? { kind: "body-too-large" }
-            : { kind: "unknown" }
-      : undefined;
-    const active = freshBriefActive(activity, bg.running, now);
-    const workspaceLabel = briefWorkspaceLabel(cfg.name, path.basename(root));
-    const brief: BriefStatusSnapshot = {
-      kind: "full",
-      workspaceLabel,
-      daemonRunning: bg.running,
-      daemonStale,
-      account,
-      pendingChanges: localChanges + counts.gitChanged,
-      ...(active ? { active } : {}),
-      ...(populate ? { populate: { filesDone: populate.operation.filesDone, filesTotal: populate.operation.filesTotal } } : {}),
-      behindRemote: briefBehindRemote(state.lastSyncedSequence, remote),
-      ...(halt ? { halt } : {}),
-      ...(retryArmed && activity?.halt?.nextProbeAt && daemonMode !== "pull-only"
-        ? { recovery: { nextProbeAt: activity.halt.nextProbeAt } }
-        : retryRunning
-          ? { recovery: { running: true as const } }
-        : {}),
-      planQuota,
-      daemonVersion,
-      cliVersion: RBOX_VERSION,
-      daemonVersionSkew,
-      locking,
-      ...(pathWarnings ? { pathWarnings } : {}),
-      ...(humanProjectedGitRepos.length > 0
-        ? {
-          git: {
-            count: humanProjectedGitRepos.length,
-            oldestDeferredSince: humanProjectedGitRepos[0]!.oldestDeferredSince,
-            allLocalEditDeferrals: humanProjectedGitRepos.every((repo) => repo.displayReason === "local-edits"),
-          },
-        }
-        : {}),
-      ...(trash && trash.files > 0 ? { trash: { files: trash.files, bytes: trash.bytes } } : {}),
-      ...(nextVersion ? { update: { current: RBOX_VERSION, next: nextVersion } } : {}),
-      now,
-    };
-    const rendered = renderBriefStatus(brief);
+type HaltProjection = Extract<WorkspaceStatusProjection<StatusMode>, { kind: "reset-halt" }>;
+type DetailProjection<M extends StatusMode> = Extract<WorkspaceStatusProjection<M>, { kind: "detail" }>;
+
+function daemonLine(daemon: DetailProjection<StatusMode>["daemon"], populatePid?: number): string {
+  if (populatePid !== undefined) return style.cyan(`initial sync in progress (pid ${populatePid})`);
+  if (daemon.stale) return style.yellow(`running but bound to a previous workspace (pid ${daemon.pid}) — run \`rbox start\` to rebind`);
+  return daemon.running
+    ? style.green(`${runningDaemonLabel(daemon.version, daemon.mode)} (pid ${daemon.pid})`)
+    : style.yellow("stopped");
+}
+
+function verboseWorkspaceHeading(workspace: DetailProjection<StatusMode>["workspace"]): string {
+  const label = workspace.name
+    ? `${style.cyan(workspace.name)} ${style.dim("@")} ${workspace.root} ${style.dim(`(${shortWorkspaceId(workspace.id)})`)}`
+    : `${style.cyan(workspace.id)} ${style.dim("@")} ${workspace.root}`;
+  return `${style.bold("workspace")} ${label} ${style.dim(`· rbox ${RBOX_VERSION}`)}`;
+}
+
+function renderResetHalt(projection: HaltProjection): StatusCmdResult {
+  const { workspace, daemon, credentials, probes } = projection;
+  if (probes.mode === "json") {
+    emitJson({
+      workspace: { id: workspace.id, name: workspace.name ?? null, root: workspace.root },
+      halted: true,
+      reason: projection.reason,
+      daemon: { running: daemon.running, pid: daemon.pid ?? null },
+      credential: credentialStatusJson(credentials),
+    });
+    return { daemonRunning: daemon.running };
+  }
+  if (probes.mode !== "verbose") {
+    const rendered = renderBriefStatus({
+      kind: "reset-halt",
+      workspaceLabel: briefWorkspaceLabel(workspace.name, path.basename(workspace.root)),
+      daemonRunning: daemon.running,
+      account: probes.account,
+    });
     for (const line of rendered.lines) console.log(line);
-    if(genesisPending)console.log(`  ${style.yellow(GENESIS_PENDING_MESSAGE)}`);
-    if (counts.conflictSnapshots.prunable > 0) {
-      console.log(`  conflict snapshots: ${counts.conflictSnapshots.total} (${counts.conflictSnapshots.prunable} prunable)`);
-    }
-    if (opts.git) {
-      for (const deferral of humanProjectedGitRepos) {
-        console.log(`  ${renderGitDeferralLine({
-          relPath: deferral.repo,
-          reason: deferral.displayReason,
-          deferredSince: deferral.oldestDeferredSince,
-          checkout: deferral.checkout,
-          bytesChanged: deferral.bytesChanged,
-          now,
-          capability: deferral.displayReason === "unsupported" ? gitCapability : undefined,
-        })}`);
-        console.log(`    ${renderGitDeferralCompanion({
-          reason: deferral.displayReason,
-          canResolve: deferral.canResolve,
-          canKeepMine: deferral.canKeepMine,
-          staleLockDetail: statusStaleLockDetail(root, hygieneDetails, deferral.repo, deferral.displayLane),
-        })}`);
-      }
-    }
     return { daemonRunning: rendered.daemonRunning };
   }
+  console.log(verboseWorkspaceHeading(workspace));
+  if (credentials.state !== "valid" && credentials.state !== "absent") {
+    const diagnostic = credentialStatusJson(credentials);
+    console.log(`  ${style.yellow(`credential-degraded: ${String(diagnostic.reason)} (${String(diagnostic.variable ?? diagnostic.path)})`)}`);
+  }
+  console.log(`  ${style.yellow(`sync halted: a state-recovery record can't be processed (${projection.reason}). Files on disk are untouched; run \`rbox doctor reset-journal\`.`)}`);
+  console.log(`  ${style.dim("background sync:")} ${daemon.stale
+    ? style.yellow(`running but bound to a previous workspace (pid ${daemon.pid})`)
+    : daemon.running ? style.green(`${runningDaemonLabel(daemon.version, daemon.mode)} (pid ${daemon.pid})`) : style.yellow("stopped")}`);
+  return { daemonRunning: daemon.running };
+}
 
-  const wsLabel = cfg.name
-    ? `${style.cyan(cfg.name)} ${style.dim("@")} ${root} ${style.dim(`(${shortWorkspaceId(cfg.remoteWorkspaceId)})`)}`
-    : `${style.cyan(cfg.remoteWorkspaceId)} ${style.dim("@")} ${root}`;
-  console.log(`${style.bold("workspace")} ${wsLabel} ${style.dim(`· rbox ${RBOX_VERSION}`)}`);
-  if(genesisPending)console.log(`  ${style.yellow(GENESIS_PENDING_MESSAGE)}`);
+function renderStatusJson(projection: DetailProjection<"json">): StatusCmdResult {
+  const { workspace, daemon, counts, git, locking, activity } = projection;
+  const now = projection.now;
+  emitJson({
+    workspace: { id: workspace.id, name: workspace.name ?? null, root: workspace.root },
+    health: projection.health,
+    daemon: {
+      running: daemon.running,
+      pid: daemon.pid ?? null,
+      version: daemon.version ?? null,
+      mode: daemon.mode ?? null,
+      cliVersion: RBOX_VERSION,
+      versionSkew: daemon.versionSkew,
+    },
+    locking: {
+      status: locking.status,
+      reason: locking.status === "ok" ? null : locking.reason,
+      path: ".rbox/state/sync.lock",
+    },
+    remote: projection.remote ? { sequence: projection.remote.sequence, source: projection.remote.source } : null,
+    ...(counts.source === "daemon"
+      ? {
+        local: {
+          added: counts.added,
+          changed: counts.changed,
+          deleted: counts.deleted,
+          gitChangedRepos: counts.gitChanged,
+          source: counts.source,
+          ageMs: counts.ageMs,
+        },
+      }
+      : {}),
+    trash: projection.trash && projection.trash.files > 0 ? { bytes: projection.trash.bytes, count: projection.trash.files } : null,
+    account: projection.probes.account,
+    credential: credentialStatusJson(projection.credentials),
+    ...(projection.genesisPending ? { genesisPending: true, resumeInstruction: GENESIS_PENDING_MESSAGE } : {}),
+    crypto: projection.crypto,
+    git: {
+      ...(git.capability ? { capability: git.capability } : {}),
+      deferrals: serializeGitDeferralLanes(git.deferrals.map(({ repo, ...deferral }) => ({ repo, deferral })), now),
+      deferredRepos: git.localRepoProjections.map((repo) => ({
+        repo: repo.repo,
+        oldestDeferredSince: repo.oldestDeferredSince,
+        displayReason: repo.displayReason,
+        ageSeconds: Number.isFinite(Date.parse(repo.oldestDeferredSince)) && Date.parse(repo.oldestDeferredSince) <= now
+          ? Math.floor((now - Date.parse(repo.oldestDeferredSince)) / 1000)
+          : null,
+        bytesChanged: repo.bytesChanged,
+        ...(repo.checkout?.kind === "branch"
+          ? { checkout: { kind: "branch" as const, ...(repo.checkout.label === undefined ? {} : { label: repo.checkout.label }) } }
+          : repo.checkout?.kind === "detached"
+            ? { checkout: { kind: "detached" as const } }
+            : {}),
+      })),
+      conflictSnapshots: counts.conflictSnapshots,
+    },
+    ...(counts.gitConfigChecking?.length || counts.gitConfigDisabled?.length
+      ? {
+        gitConfig: {
+          state: counts.gitConfigChecking?.length ? "checking" : "disabled",
+          checking: counts.gitConfigChecking ?? [],
+          disabled: counts.gitConfigDisabled ?? [],
+        },
+      }
+      : {}),
+    ...(activity?.halt?.reason !== undefined ? { haltReason: activity.halt.reason } : {}),
+    pathWarnings: projection.pathWarnings ?? null,
+  });
+  return { daemonRunning: daemon.running };
+}
+
+function renderStatusBrief(projection: DetailProjection<"brief" | "git">, gitDetail: boolean): StatusCmdResult {
+  const { workspace, daemon, counts, git, activity, populate } = projection;
+  const now = projection.now;
+  const account = projection.probes.account;
+  const planQuota = aggregatePlanQuotaAttention(account, activity?.outOfStorage);
+  const typedHalt = activity?.halt?.typedReason;
+  const retryArmed = Boolean(daemon.running
+    && activity?.halt?.nextProbeAt
+    && activity.halt.recoveryState !== "suspended"
+    && activity.halt.recoveryState !== "running"
+    && !activity.halt.terminal
+    && !isSafetyHaltReason(typedHalt?.kind));
+  const retrySuspended = activity?.halt?.recoveryState === "suspended"
+    && typedHalt?.kind !== "mass-delete"
+    && typedHalt?.kind !== "chain-repair";
+  const retryRunning = activity?.halt?.recoveryState === "running"
+    && !activity.halt.terminal
+    && typedHalt?.kind !== "mass-delete"
+    && typedHalt?.kind !== "chain-repair";
+  const halt: BriefHaltReason | undefined = activity?.halt && !retryArmed && !retrySuspended && !retryRunning
+    ? typedHalt?.kind === "mass-delete"
+      ? { kind: "mass-delete", op: typedHalt.op }
+      : typedHalt?.kind === "too-many-refs"
+        ? { kind: "too-many-refs" }
+        : typedHalt?.kind === "body-too-large"
+          ? { kind: "body-too-large" }
+          : { kind: "unknown" }
+    : undefined;
+  const active = freshBriefActive(activity, daemon.running, now);
+  const nextVersion = updateAvailableVersion(projection.probes.update);
+  const brief: BriefStatusSnapshot = {
+    kind: "full",
+    workspaceLabel: briefWorkspaceLabel(workspace.name, path.basename(workspace.root)),
+    daemonRunning: daemon.running,
+    daemonStale: daemon.stale,
+    account,
+    pendingChanges: projection.localChanges + counts.gitChanged,
+    ...(active ? { active } : {}),
+    ...(populate ? { populate: { filesDone: populate.operation.filesDone, filesTotal: populate.operation.filesTotal } } : {}),
+    behindRemote: briefBehindRemote(projection.state.localSequence, projection.remote),
+    ...(halt ? { halt } : {}),
+    ...(retryArmed && activity?.halt?.nextProbeAt && daemon.mode !== "pull-only"
+      ? { recovery: { nextProbeAt: activity.halt.nextProbeAt } }
+      : retryRunning
+        ? { recovery: { running: true as const } }
+        : {}),
+    planQuota,
+    daemonVersion: daemon.version,
+    cliVersion: RBOX_VERSION,
+    daemonVersionSkew: daemon.versionSkew,
+    locking: projection.locking,
+    ...(projection.pathWarnings ? { pathWarnings: projection.pathWarnings } : {}),
+    ...(git.humanProjectedRepos.length > 0
+      ? {
+        git: {
+          count: git.humanProjectedRepos.length,
+          oldestDeferredSince: git.humanProjectedRepos[0]!.oldestDeferredSince,
+          allLocalEditDeferrals: git.humanProjectedRepos.every((repo) => repo.displayReason === "local-edits"),
+        },
+      }
+      : {}),
+    ...(projection.trash && projection.trash.files > 0 ? { trash: { files: projection.trash.files, bytes: projection.trash.bytes } } : {}),
+    ...(nextVersion ? { update: { current: RBOX_VERSION, next: nextVersion } } : {}),
+    now,
+  };
+  const rendered = renderBriefStatus(brief);
+  for (const line of rendered.lines) console.log(line);
+  if (projection.genesisPending) console.log(`  ${style.yellow(GENESIS_PENDING_MESSAGE)}`);
+  if (counts.conflictSnapshots.prunable > 0) {
+    console.log(`  conflict snapshots: ${counts.conflictSnapshots.total} (${counts.conflictSnapshots.prunable} prunable)`);
+  }
+  if (gitDetail) {
+    for (const deferral of git.humanProjectedRepos) {
+      console.log(`  ${renderGitDeferralLine({
+        relPath: deferral.repo,
+        reason: deferral.displayReason,
+        deferredSince: deferral.oldestDeferredSince,
+        checkout: deferral.checkout,
+        bytesChanged: deferral.bytesChanged,
+        now,
+        capability: deferral.displayReason === "unsupported" ? git.capability : undefined,
+      })}`);
+      console.log(`    ${renderGitDeferralCompanion({
+        reason: deferral.displayReason,
+        canResolve: deferral.canResolve,
+        canKeepMine: deferral.canKeepMine,
+        staleLockDetail: statusStaleLockDetail(workspace.root, projection.hygieneDetails, deferral.repo, deferral.displayLane),
+      })}`);
+    }
+  }
+  return { daemonRunning: rendered.daemonRunning };
+}
+
+function renderStatusVerbose(projection: DetailProjection<"verbose">): StatusCmdResult {
+  const { workspace, daemon, counts, git, activity, populate, locking, crypto } = projection;
+  const now = projection.now;
+  console.log(verboseWorkspaceHeading(workspace));
+  if (projection.genesisPending) console.log(`  ${style.yellow(GENESIS_PENDING_MESSAGE)}`);
   const statusSnapshot = {
     added: counts.added,
     changed: counts.changed,
     deleted: counts.deleted,
     gitChanged: counts.gitChanged,
-    gitDeferrals: humanProjectedGitRepos.length,
-    gitBytesChangedDeferrals: humanProjectedGitRepos.filter((repo) => repo.bytesChanged).length,
-    gitOldestDeferral: humanProjectedGitRepos[0]
-      ? { deferredSince: humanProjectedGitRepos[0].oldestDeferredSince, reason: humanProjectedGitRepos[0].displayReason }
+    gitDeferrals: git.humanProjectedRepos.length,
+    gitBytesChangedDeferrals: git.humanProjectedRepos.filter((repo) => repo.bytesChanged).length,
+    gitOldestDeferral: git.humanProjectedRepos[0]
+      ? { deferredSince: git.humanProjectedRepos[0].oldestDeferredSince, reason: git.humanProjectedRepos[0].displayReason }
       : undefined,
     trackedFiles: counts.trackedFiles,
-    daemonRunning: bg.running,
-    localSequence: state.lastSyncedSequence,
-    remote,
+    daemonRunning: daemon.running,
+    localSequence: projection.state.localSequence,
+    remote: projection.remote,
     activity,
-    pathWarnings,
+    pathWarnings: projection.pathWarnings,
     populate: populate
       ? {
-          phase: populate.operation.phase,
-          filesDone: populate.operation.filesDone,
-          filesTotal: populate.operation.filesTotal,
-          ...(populate.operation.bytesDone !== undefined ? { bytesDone: populate.operation.bytesDone } : {}),
-          ...(populate.operation.bytesTotal !== undefined ? { bytesTotal: populate.operation.bytesTotal } : {}),
-        }
+        phase: populate.operation.phase,
+        filesDone: populate.operation.filesDone,
+        filesTotal: populate.operation.filesTotal,
+        ...(populate.operation.bytesDone !== undefined ? { bytesDone: populate.operation.bytesDone } : {}),
+        ...(populate.operation.bytesTotal !== undefined ? { bytesTotal: populate.operation.bytesTotal } : {}),
+      }
       : undefined,
     now,
   };
   console.log(`  ${healthLine(statusSnapshot)}`);
   for (const detail of healthDetailLines(statusSnapshot)) console.log(`  ${detail}`);
-  if (attributed.remoteLine) console.log(`  ${attributed.remoteLine}`);
+  if (projection.remoteLine) console.log(`  ${projection.remoteLine}`);
   if (crypto.state === "disabled") console.log(`  ${style.dim("crypto workers:")} ${style.yellow(`disabled — ${crypto.reason}`)}`);
   for (const trail of lastSyncLines(activity, now)) console.log(`  ${style.dim(trail)}`);
-  console.log(
-    `  ${style.dim("background sync:")} ${
-      populate
-        ? style.cyan(`initial sync in progress (pid ${populate.pid})`)
-        : daemonStale
-        ? style.yellow(`running but bound to a previous workspace (pid ${alive.pid}) — run \`rbox start\` to rebind`)
-        : bg.running
-          ? style.green(`${runningDaemonLabel(daemonVersion, daemonMode)} (pid ${bg.pid})`)
-          : style.yellow("stopped")
-    }`
-  );
-  if (daemonVersionSkew) {
-    console.log(`  ${style.yellow(`daemon is running v${daemonVersion} but this CLI is v${RBOX_VERSION} — restart to finish the upgrade: rbox stop && rbox start`)}`);
+  console.log(`  ${style.dim("background sync:")} ${daemonLine(daemon, populate?.pid)}`);
+  if (daemon.versionSkew) {
+    console.log(`  ${style.yellow(`daemon is running v${daemon.version} but this CLI is v${RBOX_VERSION} — restart to finish the upgrade: rbox stop && rbox start`)}`);
   }
   console.log(`  ${style.dim("locking:")} ${locking.status === "ok"
     ? style.green("ok (.rbox/state/sync.lock)")
     : style.yellow(`${locking.status}: ${locking.reason} (.rbox/state/sync.lock)`)}`);
-  if (cfg.syncGit || projectedGitDeferrals.length > 0) {
-    const synced = Object.keys(state.lastSyncedManifest.gitRepos ?? {}).length;
-    const pending = Object.keys(state.gitPendingRemote ?? {}).length;
-    const conflicts = Object.keys(state.gitNeedsResolution ?? {}).length;
+  if (workspace.syncGit || counts.gitDeferrals.length > 0) {
+    const parts: string[] = [];
     // "0 repos synced" while the first publish is mid-flight reads as "doing
     // nothing" (founder repro). When a fresh cycle is running, say what's
-    // actually happening; the gitcap phase even knows its counts. Richer
-    // persisted per-phase counters are design 69 §3.4.
-    const act = activity?.active;
-    const live = act && Date.now() - Date.parse(act.at) < 60_000 ? act : undefined;
-    const parts: string[] = [];
-    if (synced === 0 && live) {
+    // actually happening; the gitcap phase even knows its counts.
+    if (projection.state.syncedRepos === 0 && git.live) {
       parts.push(
-        live.phase === "gitcap"
-          ? style.cyan(`capturing ${live.done}/${live.total} repos — first publish in progress`)
+        git.live.phase === "gitcap"
+          ? style.cyan(`capturing ${git.live.done}/${git.live.total} repos — first publish in progress`)
           : style.cyan("first publish in progress")
       );
     } else {
-      parts.push(style.green(`${synced} repo${synced === 1 ? "" : "s"} synced`));
+      parts.push(style.green(`${projection.state.syncedRepos} repo${projection.state.syncedRepos === 1 ? "" : "s"} synced`));
     }
-    if (pending) parts.push(style.yellow(`${pending} pending`));
-    if (conflicts) parts.push(style.yellow(`${conflicts} conflict${conflicts === 1 ? "" : "s"}`));
-    if (humanProjectedGitRepos.length) parts.push(style.yellow(`${humanProjectedGitRepos.length} deferred`));
+    if (projection.state.pendingRepos) parts.push(style.yellow(`${projection.state.pendingRepos} pending`));
+    if (projection.state.conflictRepos) parts.push(style.yellow(`${projection.state.conflictRepos} conflict${projection.state.conflictRepos === 1 ? "" : "s"}`));
+    if (git.humanProjectedRepos.length) parts.push(style.yellow(`${git.humanProjectedRepos.length} deferred`));
     if (counts.gitConfigChecking?.length) {
       const names = counts.gitConfigChecking.filter((rel) => rel !== "*");
       parts.push(style.yellow(`config: checking${names.length ? ` (${names.join(", ")})` : ""}`));
@@ -910,7 +427,7 @@ export async function statusCmdWithDeps(
     if (counts.conflictSnapshots.prunable > 0) {
       console.log(`  conflict snapshots: ${counts.conflictSnapshots.total} (${counts.conflictSnapshots.prunable} prunable)`);
     }
-    for (const deferral of humanLocalGitRepoProjections) {
+    for (const deferral of git.humanLocalRepoProjections) {
       console.log(`    ${renderGitDeferralLine({
         relPath: deferral.repo,
         reason: deferral.displayReason,
@@ -918,28 +435,28 @@ export async function statusCmdWithDeps(
         checkout: deferral.checkout,
         bytesChanged: deferral.bytesChanged,
         now,
-        capability: deferral.displayReason === "unsupported" ? gitCapability : undefined,
+        capability: deferral.displayReason === "unsupported" ? git.capability : undefined,
       })}`);
       console.log(`      ${renderGitDeferralCompanion({
         reason: deferral.displayReason,
         canResolve: deferral.canResolve,
         canKeepMine: deferral.canKeepMine,
-        staleLockDetail: statusStaleLockDetail(root, hygieneDetails, deferral.repo, deferral.displayLane),
+        staleLockDetail: statusStaleLockDetail(workspace.root, projection.hygieneDetails, deferral.repo, deferral.displayLane),
       })}`);
     }
   }
-  const m = await loadMetrics(root);
+  const m = projection.probes.metrics;
   if (m.syncs > 0 || m.commitConflicts409 > 0 || m.fileConflicts > 0) {
     const conf = m.commitConflicts409 + m.fileConflicts;
     console.log(
       `  ${style.dim("sync metrics:")} ${m.syncs} syncs, ${conf ? style.yellow(`${m.commitConflicts409} commit-409 / ${m.fileConflicts} file-conflict`) : style.green("0 conflicts")}${m.lastConflictAt ? style.dim(` (last ${m.lastConflictAt})`) : ""}`
     );
   }
-  const trashStatus = trashLine(trash);
+  const trashStatus = trashLine(projection.trash);
   if (trashStatus) console.log(`  ${trashStatus}`);
-  console.log(`  ${style.dim(`device ${cfg.deviceId} · sequence ${state.lastSyncedSequence} · ${counts.trackedFiles.toLocaleString("en-US")} files on disk`)}`);
-  for (const line of formatAccountSummary((await accountSummaryP)!)) console.log(line);
-  const updateLine = formatUpdateAvailableLine(await readUpdateCheckState());
+  console.log(`  ${style.dim(`device ${workspace.deviceId} · sequence ${projection.state.localSequence} · ${counts.trackedFiles.toLocaleString("en-US")} files on disk`)}`);
+  for (const line of formatAccountSummary(projection.probes.accountSummary)) console.log(line);
+  const updateLine = formatUpdateAvailableLine(projection.probes.update);
   if (updateLine) console.log(`  ${updateLine}`);
-  return { daemonRunning: bg.running };
+  return { daemonRunning: daemon.running };
 }
