@@ -8,14 +8,14 @@ import { RboxDaemon } from "./daemon.js";
 const DROP = "Events were dropped by the FSEvents client. File system must be re-scanned.";
 type Mode = "pruned" | "unpruned";
 type Coverage = { coverage: "full-tree" | "pruned"; errorGenAtStart: number };
-type ScanResult = { freshManifest: Manifest; deferred: Set<string>; coverage: Coverage["coverage"] };
+type ScanResult = { freshManifest: Manifest; deferredPaths: ReadonlySet<string>; coverage: Coverage["coverage"] };
 
 interface Internals {
   startWatcherFn: (root: string, matcher: unknown, cb: (events: unknown[]) => void, opts?: { onError?: (err: Error) => void }) => Promise<{ close(): Promise<void> }>;
   startLiveWatch(): Promise<void>;
   doFullScan(): Promise<Coverage>;
   maybeClearWatcherDegradedAfterScan(opWatcherErrorGeneration: number, cov: Coverage): void;
-  replaceManifestFromScan(cache: HashCache, previous: Manifest, stats: unknown, kind: "safety scan", mode: Mode): Promise<ScanResult>;
+  localObserver: { observe(plan: { kind: "scan"; mode: Mode }): Promise<ScanResult> };
   cache: HashCache;
   manifest: Manifest;
   watcher?: { close(): Promise<void> };
@@ -73,12 +73,12 @@ function harness(): {
     onError = opts?.onError;
     return { backend: "parcel", close: async () => {} };
   };
-  daemon.replaceManifestFromScan = async (_cache, _previous, _stats, _kind, mode) => {
+  daemon.localObserver.observe = async ({ mode }) => {
     modes.push(mode);
     const hook = duringScan;
     duringScan = undefined;
     hook?.();
-    return { freshManifest: daemon.manifest, deferred: new Set(), coverage: mode === "pruned" ? "pruned" : "full-tree" };
+    return { freshManifest: daemon.manifest, deferredPaths: new Set<string>(), coverage: mode === "pruned" ? "pruned" : "full-tree" };
   };
   return {
     daemon,

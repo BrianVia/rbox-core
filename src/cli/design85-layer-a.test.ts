@@ -19,9 +19,9 @@ test("daemon safety-mode coverage is pruned when warm; deep mode is full-tree an
   delete process.env.RBOX_SCAN_PRUNE;
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-layer-a-daemon-"));
   const cfg = { remoteWorkspaceId: "w", projectId: "root", deviceId: "d", rootPath: root, remoteUrl: "https://example.invalid", token: "" };
-  type ScanResult = { freshManifest: Manifest; deferred: Set<string>; coverage: "full-tree" | "pruned" };
+  type ScanResult = { freshManifest: Manifest; deferredPaths: ReadonlySet<string>; coverage: "full-tree" | "pruned" };
   type Internals = {
-    replaceManifestFromScan(cache: HashCache, previous: Manifest, stats: ReturnType<typeof createScanStats>, kind: "safety scan" | "deep scan", mode: "pruned" | "unpruned"): Promise<ScanResult>;
+    localObserver: { observe(plan: { kind: "scan"; cache: HashCache; previous: Manifest; scanStats: ReturnType<typeof createScanStats>; scanKind: "safety scan" | "deep scan"; mode: "pruned" | "unpruned" }): Promise<ScanResult> };
     gitDiscovery: {
       readonly hasAuthoritativeSnapshot: boolean;
       readonly absenceProof?: { epoch: number; discoveredRepos: ReadonlySet<string> };
@@ -33,17 +33,17 @@ test("daemon safety-mode coverage is pruned when warm; deep mode is full-tree an
   const empty: Manifest = { generatedAt: "", files: [] };
   try {
     await fs.writeFile(path.join(root, "a.txt"), "a");
-    const cold = await daemon.replaceManifestFromScan(new HashCache(), empty, createScanStats(), "safety scan", "pruned");
+    const cold = await daemon.localObserver.observe({ kind: "scan", cache: new HashCache(), previous: empty, scanStats: createScanStats(), scanKind: "safety scan", mode: "pruned" });
     expect(cold.coverage).toBe("full-tree"); // deadline self-demotion seeds the cache
     await Bun.sleep(RACY_MARGIN_MS + 40);
-    const primed = await daemon.replaceManifestFromScan(new HashCache(), cold.freshManifest, createScanStats(), "safety scan", "pruned");
+    const primed = await daemon.localObserver.observe({ kind: "scan", cache: new HashCache(), previous: cold.freshManifest, scanStats: createScanStats(), scanKind: "safety scan", mode: "pruned" });
     await Bun.sleep(RACY_MARGIN_MS + 40);
     const warmStats = createScanStats();
-    const warm = await daemon.replaceManifestFromScan(new HashCache(), primed.freshManifest, warmStats, "safety scan", "pruned");
+    const warm = await daemon.localObserver.observe({ kind: "scan", cache: new HashCache(), previous: primed.freshManifest, scanStats: warmStats, scanKind: "safety scan", mode: "pruned" });
     expect(warm.coverage).toBe("pruned");
     expect(warmStats.dirsReusedFromCache).toBeGreaterThan(0);
     const deepStats = createScanStats();
-    const deep = await daemon.replaceManifestFromScan(new HashCache(), warm.freshManifest, deepStats, "deep scan", "unpruned");
+    const deep = await daemon.localObserver.observe({ kind: "scan", cache: new HashCache(), previous: warm.freshManifest, scanStats: deepStats, scanKind: "deep scan", mode: "unpruned" });
     expect(deep.coverage).toBe("full-tree");
     expect(deepStats.dircacheOutcome).toBe("unpruned");
     expect(deepStats.dirsReusedFromCache).toBe(0);
@@ -52,7 +52,7 @@ test("daemon safety-mode coverage is pruned when warm; deep mode is full-tree an
     daemon.gitDiscovery.authoritativeSnapshotTaken = true;
     process.env.RBOX_SCAN_PRUNE = "0";
     const disabledStats = createScanStats();
-    const disabled = await daemon.replaceManifestFromScan(new HashCache(), deep.freshManifest, disabledStats, "safety scan", "pruned");
+    const disabled = await daemon.localObserver.observe({ kind: "scan", cache: new HashCache(), previous: deep.freshManifest, scanStats: disabledStats, scanKind: "safety scan", mode: "pruned" });
     expect(disabled.coverage).toBe("full-tree");
     expect(disabledStats.dircacheOutcome).toBe("off");
     expect(daemon.gitDiscovery.hasAuthoritativeSnapshot).toBe(true);

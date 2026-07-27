@@ -108,7 +108,7 @@ interface DaemonInternals {
   doPull(...args: unknown[]): Promise<void>;
   observeNotifyLatency(latencyMs: number): void;
   maybeClearWatcherUnsettledAfterOp(op: string, opWatcherGeneration: number): void;
-  replaceManifestFromScan(cache: HashCache, previous: Manifest, stats: undefined, kind: undefined, mode: "unpruned"): Promise<unknown>;
+  retryQueue: { scheduleWriteFinish(paths: Set<string>): void };
   onTransferProgress(done: number, total: number, phase: TransferPhase, detailOrBytes?: string | TransferProgressBytes, bytes?: TransferProgressBytes): void;
   lastProgressWrite: number;
   pump(): Promise<void>;
@@ -122,7 +122,6 @@ interface DaemonInternals {
   doPush(...args: unknown[]): Promise<void>;
   ambientStatusFrom(activity: DaemonActivity, settled: boolean, now: number): { deferredRepos: number };
   writeHeartbeatSurfaces(): void;
-  scheduleWriteFinishRetry(paths: Set<string>): void;
   writeWsActivity(): void;
   startActivityHeartbeat(intervalMs?: number): void;
   stopActivityHeartbeat(): void;
@@ -1526,7 +1525,7 @@ test("raw watcher event persists local unsettled before the debounced pump runs"
 test("deferred write-finish retry keeps local unsettled while retry is pending", async () => {
   const daemon = await makeDaemon(new MiniRemote());
   try {
-    daemon.scheduleWriteFinishRetry(new Set(["still-writing.txt"]));
+    daemon.retryQueue.scheduleWriteFinish(new Set(["still-writing.txt"]));
     daemon.writeWsActivity();
     await daemon.activityWrite;
     expect((await loadActivity(root))?.local?.settled).toBe(false);

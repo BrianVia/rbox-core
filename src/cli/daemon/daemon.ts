@@ -7,7 +7,6 @@ import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import {
   ALWAYS_NATIVE_PRUNE,
-  applyWatchEvents,
   buildIgnoreMatcher,
   nativePruneGlobs,
   discoverGitRepos,
@@ -15,13 +14,8 @@ import {
   diffManifests,
   isIgnoreRuleFile,
   HashCache,
-  DirCache,
-  coverageOf,
   createScanStats,
-  scanPruneEnabled,
-  scanManifest,
   actionPath,
-  type ScanStats,
   type IgnoreMatcher,
   type Manifest,
   type WatchEvent,
@@ -29,7 +23,6 @@ import {
   ManifestChainError,
   PhaseReport,
   cryptoPoolStatus,
-  caseFoldCollisionGroups,
   manifestPathCaseFold,
   type CaseFoldCollisionGroup,
   writeFileAtomic,
@@ -40,13 +33,12 @@ import { loadActivity, renderShellDeferrals, renderShellLine, saveActivity, save
 import { expectedStateNonce, loadConfig, loadState, repoRecordsForState, syncStreamId, trashConfig, type SyncState, type WorkspaceConfig } from "../config.js";
 import { pruneTrash } from "../../engine/trash.js";
 import { DAEMON_BOOT_ID_ENV, readDaemonPidRecord, recordDaemonBinding } from "./runtime-state.js";
-import { MassDeleteGuardError, PushConflictExhaustedError, TrustedViewRefusalError, makeDeferErrnoReporter, pull, pushManifest, type SyncDeps, type TrustedLocalView } from "../sync.js";
+import { MassDeleteGuardError, PushConflictExhaustedError, TrustedViewRefusalError, pull, pushManifest, type SyncDeps, type TrustedLocalView } from "../sync.js";
 import { deferManifest } from "../sync-recovery.js";
 import type { TransferPhase, TransferProgressBytes } from "../transfer-progress.js";
 import { buildAuthedRemote } from "../e2ee-client.js";
 import { E2eeRemote } from "../e2ee-remote.js";
 import { beginReport, loadMetrics, metricsEnabled, saveMetrics, type SyncMetrics } from "../metrics.js";
-import { createScanProbe, loadScanProbe, saveScanProbe } from "../scan-probe.js";
 import {
   AUDIT_EVENT_CAP,
   AUDIT_SETTLE_MS,
@@ -72,6 +64,11 @@ import { CommitRejectedError } from "../remote.js";
 import { createSignalDebouncer, startWatcher, type GitSignalBatch, type SignalDebouncer, type Watcher } from "./watcher.js";
 import { gitRefSideChannelEligible } from "./git-ref-watch.js";
 import { GitDiscoveryContinuity } from "./git-discovery-continuity.js";
+import {
+  LocalRetryQueue,
+  LocalWorkspaceObserver,
+  type ScanObservationReceipt,
+} from "./local-workspace-observer.js";
 import { runUpdateCheckIfDue } from "../update-check.js";
 import {
   AMBIENT_STATUS_HEARTBEAT_MS,
@@ -98,7 +95,6 @@ import {
   classifyWatcherError,
   DaemonChainRepairPolicy,
   DEEP_SCAN_MS,
-  GC_FENCE_RETRY_MS,
   jitter,
   recoveryProbeDelayMs,
   selectPumpOperation,
@@ -509,14 +505,11 @@ export class RboxDaemon {
   private startupBoundaryRun?: Promise<void>;
   private readonly mutationGate: ShutdownMutationGate;
   private startupLockRecoveryDone = false;
-  /** Per-path retry counter for hot-path write-finish: a mid-write file is re-pushed a
-   *  few times before falling back to the safety scan, so a large save isn't stalled 60s. */
-  private readonly writeFinishRetries = new Map<string, number>();
-  private readonly writeFinishRetryTimers = new Set<ReturnType<typeof setTimeout>>();
-  private readonly deferredRetryPaths = new Set<string>();
-  /** Publication-fenced paths remain base-carried across unrelated safety pushes
-   * until their hours-scale retry timer deliberately releases them. */
-  private readonly gcFenceRetryPaths = new Set<string>();
+  /** Sole owner of local disk observation: the tree walk, the bounded watcher
+   * patch, and the per-path retry queue their deferrals arm. The daemon supplies
+   * effects and sequences receipts; it holds none of that queue itself. */
+  private readonly localObserver: LocalWorkspaceObserver;
+  private readonly retryQueue: LocalRetryQueue;
   private watcherUnsettled = false;
   private watcherUnsettledGeneration = 0;
   private activePumpOp?: PumpOperation;
@@ -633,6 +626,30 @@ export class RboxDaemon {
       });
     }
     this.telemetry = new TelemetryQueue(this.api, this.log);
+    this.retryQueue = new LocalRetryQueue({
+      requeue: (paths) => {
+        for (const p of paths) this.pendingEvents.push({ relPath: p, kind: "change" });
+        this.request("push");
+      },
+      markUnsettled: (p) => this.unsettledPaths.add(p),
+      stopped: () => this.stopped,
+    });
+    this.localObserver = new LocalWorkspaceObserver({
+      root,
+      currentManifest: () => this.manifest,
+      currentMatcher: () => this.matcher,
+      matcherGeneration: () => this.matcherGeneration,
+      scanMode: () => this.watcherScanMode(),
+      beginTopologySnapshot: (scanKind) => this.gitDiscovery.beginScanSnapshot(scanKind),
+      observeTopology: (observation) => this.gitDiscovery.observe(observation),
+      install: (next, update, unsettled, observedUnder) => this.installManifest(next, update, unsettled, observedUnder),
+      setObservationComplete: (complete) => { this.manifestObservationComplete = complete; },
+      observationComplete: () => this.manifestObservationComplete,
+      log: (line) => this.log(line),
+      recordScanFault: () => {
+        try { this.telemetry.record({ kind: "safety_event", eventType: "scan_fault", count: 1 }); } catch {}
+      },
+    }, this.retryQueue);
     this.syncStateReporter = new SyncStateReporter(root, cfg, this.api, this.log);
     this.matcher = buildIgnoreMatcher(root, { respectGitignore: cfg.respectGitignore === true });
     this.watcherNativePruneKey = nativePruneGlobs(root).join("\n");
@@ -735,7 +752,7 @@ export class RboxDaemon {
               if (!boundaryBootstrapped) this.seedFromState(initialState);
               await this.adoptionCacheGenerationBoundary();
               if (this.stopped) return;
-              await this.replaceManifestFromScan(this.cache, initialState.lastSyncedManifest, undefined, undefined, this.watcherScanMode());
+              await this.localObserver.observe({ kind: "scan", cache: this.cache, previous: initialState.lastSyncedManifest, mode: this.watcherScanMode() });
               if (this.stopped) return;
               this.pruneCache();
               await this.cache.save(this.root);
@@ -1040,10 +1057,7 @@ export class RboxDaemon {
     if (this.syncStateHeartbeatTimer) clearInterval(this.syncStateHeartbeatTimer);
     this.stopActivityHeartbeat();
     this.stopAmbientStatusHeartbeat();
-    for (const timer of this.writeFinishRetryTimers) clearTimeout(timer);
-    this.writeFinishRetryTimers.clear();
-    this.deferredRetryPaths.clear();
-    this.gcFenceRetryPaths.clear();
+    this.retryQueue.stop();
     this.clearGitBusyEpisode();
     this.stopWsKeepalive();
     this.clearBackstop();
@@ -1814,8 +1828,8 @@ export class RboxDaemon {
     const report = metricsReport ?? (telemetryEnabled() ? PhaseReport.push() : undefined);
     let res: Awaited<ReturnType<typeof pushManifest>>;
     try {
-      const pushManifestInput = this.gcFenceRetryPaths.size > 0 && this.syncBase
-        ? deferManifest(this.manifest, this.syncBase.lastSyncedManifest, this.gcFenceRetryPaths)
+      const pushManifestInput = this.retryQueue.gcFencedPaths.size > 0 && this.syncBase
+        ? deferManifest(this.manifest, this.syncBase.lastSyncedManifest, this.retryQueue.gcFencedPaths)
         : this.manifest;
       res = await pushManifest(this.root, this.cfg, pushManifestInput, {
         ...this.e2ee,
@@ -1892,8 +1906,8 @@ export class RboxDaemon {
     if (res.deferred && res.deferred.length > 0) {
       const retryLater = new Set(res.retryLater ?? []);
       const writeFinish = new Set(res.deferred.filter((p) => !retryLater.has(p)));
-      if (writeFinish.size > 0) this.scheduleWriteFinishRetry(writeFinish);
-      if (retryLater.size > 0) this.scheduleGcFenceRetry(retryLater);
+      if (writeFinish.size > 0) this.retryQueue.scheduleWriteFinish(writeFinish);
+      if (retryLater.size > 0) this.retryQueue.scheduleGcFence(retryLater);
     }
     const durableState = await this.loadSyncBase();
     this.emitDurableGitDeferrals(durableState);
@@ -1965,32 +1979,15 @@ export class RboxDaemon {
       if (events.some((e) => isIgnoreRuleFile(e.relPath)) || collisionIntersection) {
         this.rebuildMatcher(await this.loadSyncBase());
         if (events.some((e) => isIgnoreRuleFile(e.relPath))) this.rulesChangedSinceDeepScan = true;
-        const { deferred } = await this.replaceManifestFromScan(this.cache, this.manifest, undefined, undefined, this.watcherScanMode());
-        await this.resolveDriftFromAppliedEvents(events, deferred);
+        const receipt = await this.localObserver.observe({ kind: "scan", cache: this.cache, previous: this.manifest, mode: this.watcherScanMode() });
+        await this.resolveDriftFromAppliedEvents(events, receipt.deferredPaths);
       } else {
-        const deferred = new Set<string>();
-        const patched = await applyWatchEvents(this.manifest, this.root, this.matcher, events, this.cache, deferred);
-        // Design 202: ONE partial update per settled drain (never per file). A path
-        // this drain read cleanly is re-observed and leaves the unsettled set; a path
-        // it deferred joins it. Installing HERE — before the collision rescan below —
-        // is what makes the ordering do the bookkeeping: a rescan simply installs
-        // full-workspace provenance and its own unsettled set on top, so no "did we
-        // rescan?" flag is needed to stop a partial stamp from overwriting it.
-        this.installManifest(patched, { kind: "partial", source: "watch-events", paths: new Set(events.map((e) => e.relPath)) }, {
-          settle: events.filter((e) => !deferred.has(e.relPath)).map((e) => e.relPath),
-          add: deferred,
-        });
-        if (!this.manifestObservationComplete && caseFoldCollisionGroups(this.manifest.files).length > 0) {
-          // The retained safe subset discovered an independent new collision.
-          // Re-scan to reunite it with every still-active omitted group before
-          // the next push authors warning truth.
-          const scanned = await this.replaceManifestFromScan(this.cache, this.manifest, undefined, undefined, this.watcherScanMode());
-          for (const path of scanned.deferred) deferred.add(path);
-        }
-        await this.resolveDriftFromAppliedEvents(events, deferred);
-        // A path that hashed cleanly this round is settled — clear any retry it accrued.
-        for (const e of events) if (!deferred.has(e.relPath)) this.writeFinishRetries.delete(e.relPath);
-        if (deferred.size > 0) this.scheduleWriteFinishRetry(deferred);
+        const receipt = await this.localObserver.observe({ kind: "watch-batch", events, cache: this.cache });
+        // Drift resolves against the receipt's unread cursor BEFORE the retry
+        // schedule lands: a covering event delivered in that window must still be
+        // able to retract, and the sidecar transaction is the evidence barrier.
+        await this.resolveDriftFromAppliedEvents(events, receipt.deferredPaths);
+        this.localObserver.settleRetries(receipt);
       }
     }
   }
@@ -2019,69 +2016,6 @@ export class RboxDaemon {
     });
     this.pathWarningWrite = run.catch(() => {});
     await run;
-  }
-
-  /**
-   * Re-enqueue mid-write paths as `change` events after a short quiet, so a large save
-   * that was still being written when we hashed gets picked up promptly rather than
-   * waiting for the 60s safety scan. Bounded per path — after a few tries we give up and
-   * let the safety/deep scan be the floor, so a pathological never-settling file can't
-   * hot-loop the pump forever.
-   */
-  private scheduleWriteFinishRetry(paths: Set<string>): void {
-    const MAX_RETRIES = 15; // ~3s of retrying at RETRY_DELAY_MS before deferring to safety scan
-    const RETRY_DELAY_MS = 200;
-    const retryable: string[] = [];
-    for (const p of paths) {
-      const n = (this.writeFinishRetries.get(p) ?? 0) + 1;
-      if (n <= MAX_RETRIES) {
-        this.writeFinishRetries.set(p, n);
-        this.deferredRetryPaths.add(p);
-        retryable.push(p);
-      } else {
-        this.writeFinishRetries.delete(p); // give up; the safety scan will heal it
-        this.deferredRetryPaths.delete(p);
-        // …but the path is still UNOBSERVED until that scan lands. Record it (design
-        // 202) instead of dropping it silently, or a trusted view would hand pull a
-        // stale entry for it with nothing left tracking the gap.
-        this.unsettledPaths.add(p);
-      }
-    }
-    if (retryable.length === 0 || this.stopped) return;
-    const timer = setTimeout(() => {
-      this.writeFinishRetryTimers.delete(timer);
-      if (this.stopped) return;
-      for (const p of retryable) {
-        this.deferredRetryPaths.delete(p);
-        this.pendingEvents.push({ relPath: p, kind: "change" });
-      }
-      this.request("push");
-    }, RETRY_DELAY_MS);
-    this.writeFinishRetryTimers.add(timer);
-  }
-
-  /** A GC publication fence is deliberately long-lived. Keep these paths in the
-   * existing deferred set (so status remains unsettled), but requeue only on an
-   * hours-scale timer; the ordinary 200ms write-finish loop would re-upload bytes
-   * that the server has already accepted and deterministically receive another 503. */
-  private scheduleGcFenceRetry(paths: Set<string>): void {
-    for (const p of paths) {
-      this.deferredRetryPaths.add(p);
-      this.gcFenceRetryPaths.add(p);
-    }
-    if (paths.size === 0 || this.stopped) return;
-    const timer = setTimeout(() => {
-      this.writeFinishRetryTimers.delete(timer);
-      if (this.stopped) return;
-      for (const p of paths) {
-        this.deferredRetryPaths.delete(p);
-        this.gcFenceRetryPaths.delete(p);
-        this.pendingEvents.push({ relPath: p, kind: "change" });
-      }
-      this.request("push");
-    }, GC_FENCE_RETRY_MS);
-    timer.unref?.();
-    this.writeFinishRetryTimers.add(timer);
   }
 
   /** A watcher OBJECT exists and its stream has not faulted. `watcherHealthy` starts
@@ -2283,7 +2217,7 @@ export class RboxDaemon {
     // carrying pre-pull truth would let the follow-up push publish a stale entry
     // over the version this pull just applied.
     if (trustedLocal === undefined || fallback !== undefined) {
-      await this.replaceManifestFromScan(this.cache, base.lastSyncedManifest, undefined, undefined, this.watcherScanMode());
+      await this.localObserver.observe({ kind: "scan", cache: this.cache, previous: base.lastSyncedManifest, mode: this.watcherScanMode() });
     }
     // Fleet-greppable provenance, three distinct questions: which local view the pull's
     // main line read, why it had none (`skip=`), and why the post-pull O(applied)
@@ -2442,7 +2376,7 @@ export class RboxDaemon {
       !this.want.fullScan &&
       !this.want.deepScan &&
       this.pendingEvents.length === 0 &&
-      this.deferredRetryPaths.size === 0
+      this.retryQueue.deferredPaths.size === 0
     );
   }
 
@@ -2882,8 +2816,8 @@ export class RboxDaemon {
     const errorGenAtStart = this.watcherErrorGeneration;
     const stats = createScanStats();
     const started = Date.now();
-    const { deferred, coverage } = await this.replaceManifestFromScan(this.cache, this.manifest, stats, "safety scan", this.watcherScanMode());
-    if (metricsEnabled()) this.log(scanStatsLine("safety scan", stats, Date.now() - started, deferred.size));
+    const { deferredPaths, coverage } = await this.localObserver.observe({ kind: "scan", cache: this.cache, previous: this.manifest, scanStats: stats, scanKind: "safety scan", mode: this.watcherScanMode() });
+    if (metricsEnabled()) this.log(scanStatsLine("safety scan", stats, Date.now() - started, deferredPaths.size));
     this.lastSafetyCompletedMs = Date.now();
     this.pruneCache();
     return { coverage, errorGenAtStart };
@@ -2918,16 +2852,16 @@ export class RboxDaemon {
     };
     this.openDriftAudits.add(audit);
     const fresh = new HashCache();
-    let scanResult: { freshManifest: Manifest; deferred: Set<string>; coverage: "full-tree" | "pruned" };
+    let scanResult: ScanObservationReceipt;
     try {
-      scanResult = await this.replaceManifestFromScan(fresh, this.manifest, stats, "deep scan", "unpruned");
+      scanResult = await this.localObserver.observe({ kind: "scan", cache: fresh, previous: this.manifest, scanStats: stats, scanKind: "deep scan", mode: "unpruned" });
     } catch (error) {
       this.openDriftAudits.delete(audit);
       throw error;
     }
-    const { freshManifest, deferred, coverage } = scanResult;
+    const freshManifest = scanResult.freshManifest;
     this.rulesChangedSinceDeepScan = false;
-    if (metricsEnabled()) this.log(scanStatsLine("deep scan", stats, Date.now() - scanStartMs, deferred.size));
+    if (metricsEnabled()) this.log(scanStatsLine("deep scan", stats, Date.now() - scanStartMs, scanResult.deferredPaths.size));
     this.cache = fresh; // replace cache with freshly-verified truth (already tight)
     audit.candidates = diffForDrift(priorManifest, freshManifest, {
       firstSeenAtMs: scanStartMs, eventGenAtScan, bootId: this.bootId,
@@ -2951,63 +2885,7 @@ export class RboxDaemon {
         if (r.removedBatches) this.log(`trash pruned: ${r.removedBatches} batch${r.removedBatches === 1 ? "" : "es"}, ${r.freedBytes} bytes freed`);
       })
       .catch(() => {});
-    return { coverage, errorGenAtStart };
-  }
-
-  /** Install a coherent full-scan result. A path that changed under its deferred
-   *  hash carries `previous`'s entry (never a torn tuple, never a deletion) and
-   *  enters the existing write-finish retry loop. */
-  private async replaceManifestFromScan(cache: HashCache, previous: Manifest, scanStats: ScanStats | undefined, scanKind: "safety scan" | "deep scan" | undefined, mode: "pruned" | "unpruned"): Promise<{ freshManifest: Manifest; deferred: Set<string>; coverage: "full-tree" | "pruned" }> {
-    const deferred = new Set<string>();
-    const discoveredGitRepos: DiscoveredGitRepo[] = [];
-    const topologySnapshot = this.gitDiscovery.beginScanSnapshot(scanKind);
-    const probeOn = process.env.RBOX_SCAN_PROBE === "1" && scanKind !== undefined;
-    const scanStartMs = Date.now();
-    const priorProbe = probeOn ? await loadScanProbe(this.root) : undefined;
-    const probe = probeOn ? createScanProbe(priorProbe) : undefined;
-    const dircache = scanPruneEnabled() ? await DirCache.load(this.root) : undefined;
-    const deferErrnos = makeDeferErrnoReporter(this.log, () => {
-      try { this.telemetry.record({ kind: "safety_event", eventType: "scan_fault", count: 1 }); } catch {}
-    });
-    // Design 206 §2: the generation this observation STARTS under, captured with the
-    // same synchronous read of `this.matcher` the walk uses. Stamping at install time
-    // instead would credit a rebuild that landed during the (seconds-long) walk to a
-    // manifest observed under the old matcher; capturing here leaves the stamp stale
-    // so P7 keeps trusted off until the next clean observation.
-    const observedUnder = this.matcherGeneration;
-    const fresh = await scanManifest(this.root, this.matcher, cache, undefined, (repo) => discoveredGitRepos.push(repo), scanStats, deferred, probe, dircache, mode,
-      deferErrnos.onErrno, this.log);
-    deferErrnos.flush();
-    await dircache?.save(this.root);
-    await this.gitDiscovery.observe({ kind: "scan", repos: discoveredGitRepos, mode, snapshot: topologySnapshot });
-    // Any deferred path makes collision evidence incomplete: it might be the
-    // unseen case-variant of a path that did hash. Preserve warning authority
-    // until a later scan observes the whole file set.
-    this.manifestObservationComplete = deferred.size === 0;
-    // Design 202: a scan is a FULL WORKSPACE observation (pruned scans reuse cached
-    // listings, they do not omit paths), so it re-derives the unsettled set outright —
-    // every previously unsettled path it read cleanly is settled again. `deferred` is
-    // stamped by reference: this function is its only writer and it is done writing.
-    const coverage = coverageOf(dircache?.lastOutcome ?? "off");
-    this.installManifest(
-      deferred.size > 0 ? deferManifest(fresh, previous, deferred) : fresh,
-      { kind: "full-workspace", coverage, deferred },
-      { rebuildFrom: deferred },
-      observedUnder,
-    );
-    if (deferred.size > 0) this.scheduleWriteFinishRetry(deferred);
-    if (probe) {
-      const summary = probe.summary();
-      this.log(`scan probe: dirs=${summary.dirs} eligible=${summary.eligible} eligibleReaddirMs=${summary.eligibleReaddirMs} totalReaddirMs=${summary.totalReaddirMs} projectedDircacheBytes=${summary.projectedDircacheBytes} probeOverheadMs=${summary.probeOverheadMs}`);
-      // Measurement only — a probe sidecar write failure must never fail the scan op.
-      await saveScanProbe(this.root, scanStartMs, probe).catch((e) => this.log(`scan probe sidecar write failed: ${errCode(e)}`));
-    }
-    // Coverage originates HERE — the function that invokes the tree walker. It is
-    // read from the DIRCACHE (the component that made the pruning decision), never
-    // from the optional metrics struct: a pruned scan can heal but must never
-    // testify to watcher re-trust (design 104 R1 F8). No dircache ⇒ unpruned walk ⇒
-    // "full-tree". Callers forward this value unchanged.
-    return { freshManifest: fresh, deferred, coverage };
+    return { coverage: scanResult.coverage, errorGenAtStart };
   }
 
   /** Serialized sidecar transaction. `fn` returning false means "unchanged" and
@@ -3034,7 +2912,7 @@ export class RboxDaemon {
     await run;
   }
 
-  private async resolveDriftFromAppliedEvents(events: WatchEvent[], deferred: Set<string>): Promise<void> {
+  private async resolveDriftFromAppliedEvents(events: WatchEvent[], deferred: ReadonlySet<string>): Promise<void> {
     await this.mutateDriftState((state) => {
       if (state.pending.length === 0) return false;
       const result = resolveCoveredAtApply(state.pending, events, deferred, this.manifest);
@@ -3076,7 +2954,7 @@ export class RboxDaemon {
       let quiescent = false;
       await this.mutateDriftState((state) => {
         // ---- synchronous decision section (no awaits past this point) ----
-        const pendingCoverage = [...audit.rawEvents, ...audit.appliedEvents, ...this.pendingEvents, ...[...this.deferredRetryPaths].map((relPath) => ({ relPath, kind: "change" as const }))];
+        const pendingCoverage = [...audit.rawEvents, ...audit.appliedEvents, ...this.pendingEvents, ...[...this.retryQueue.deferredPaths].map((relPath) => ({ relPath, kind: "change" as const }))];
         quiescent = !audit.overflow && audit.rawEvents.length === 0;
         const survivors: DriftCandidate[] = [];
         // Loop-invariant: the audit's trust stamp is monotonically downgraded and
@@ -3252,8 +3130,8 @@ export class RboxDaemon {
     const fresh = new HashCache();
     this.rebuildMatcher(this.syncBase);
     const prior = this.manifest;
-    const scanned = await this.replaceManifestFromScan(fresh, prior, undefined, "deep scan", "unpruned");
-    if (scanned.deferred.size > 0) throw new Error("adoption cache generation full scan deferred; publication remains blocked");
+    const scanned = await this.localObserver.observe({ kind: "scan", cache: fresh, previous: prior, scanKind: "deep scan", mode: "unpruned" });
+    if (scanned.deferredPaths.size > 0) throw new Error("adoption cache generation full scan deferred; publication remains blocked");
     this.cache = fresh;
     this.pruneCache();
     await this.cache.save(this.root);

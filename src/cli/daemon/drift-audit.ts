@@ -87,7 +87,7 @@ export function snapshotAtPath(manifest: Manifest, p: string): EntrySnapshot | n
   return null;
 }
 
-export function resolveCoveredAtApply(pending: DriftCandidate[], events: WatchEvent[], deferred: Set<string>, manifest: Manifest): { pending: DriftCandidate[]; lateCovered: number; coveredAmbiguous: number } {
+export function resolveCoveredAtApply(pending: DriftCandidate[], events: WatchEvent[], deferred: ReadonlySet<string>, manifest: Manifest): { pending: DriftCandidate[]; lateCovered: number; coveredAmbiguous: number } {
   let lateCovered = 0, coveredAmbiguous = 0;
   const kept = pending.filter((candidate) => {
     if (deferred.has(candidate.path) || !eventsCoverPath(events, candidate.path)) return true;
