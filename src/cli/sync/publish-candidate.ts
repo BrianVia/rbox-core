@@ -13,6 +13,7 @@ import type {
 import type { GitPushPlan } from "../sync-git/plan.js";
 import type { GitResolutionRider } from "../sync-git/resolution-intent.js";
 import { MassDeleteGuardError, pushMassDeleteTrips } from "./policy.js";
+import type { PublishedGitTransition } from "./publisher-ack-transition.js";
 
 /**
  * The publish candidate's own lineage: the accepted revision every decision is
@@ -121,11 +122,48 @@ export interface PublicationIdentity {
   readonly observedSequence: number;
 }
 
+/**
+ * The bounded publication projection of the executed capture. The sealed plan
+ * exposes this instead of the whole `GitPushPlan`: a publication consumer needs
+ * the disposition, the files-first flag, and the transition packet the accepted
+ * acknowledgement replays — never the planner's working surface.
+ */
+export interface SealedGitPublication {
+  readonly capturePlanId: string;
+  /** Explicit disposition for the foreground resolver. Never inferred. */
+  readonly resolution?: NonNullable<GitPushPlan["resolution"]>;
+  /** Design 108 §3.1: git capture was deferred AND a repo exists to attach. */
+  readonly filesFirstDeferred: boolean;
+  readonly transition: PublishedGitTransition;
+}
+
+function sealedGitPublication(receipt: GitCaptureExecutionReceipt): SealedGitPublication {
+  const plan = receipt.plan;
+  return {
+    capturePlanId: receipt.planId,
+    ...(plan.resolution ? { resolution: plan.resolution } : {}),
+    filesFirstDeferred: plan.filesFirstDeferred === true,
+    transition: {
+      supersededPending: plan.supersededPending,
+      resolvedPending: plan.resolvedPending ?? [],
+      ...(plan.supersessionIdentityKeys ? { supersessionIdentityKeys: plan.supersessionIdentityKeys } : {}),
+      pending: plan.gitPendingRemote,
+      removed: plan.gitReposRemoved,
+      resolutions: plan.gitNeedsResolution,
+      repoAbsent: plan.repoAbsent,
+      packedRefsIdentity: plan.packedRefsIdentity,
+      ...(plan.publisherAckBindings ? { publisherAckBindings: plan.publisherAckBindings } : {}),
+      ...(plan.absentBranchProofs ? { absentBranchProofs: plan.absentBranchProofs } : {}),
+      authoredCfgHashByRepo: plan.authoredCfgHashByRepo,
+    },
+  };
+}
+
 interface SealedPlanBase {
   readonly identity: PublicationIdentity;
   /** The file plane to publish, with this capture's sections attached. */
   readonly candidate: Manifest;
-  readonly captureReceipt: GitCaptureExecutionReceipt;
+  readonly publication: SealedGitPublication;
   readonly observationReceipt: CaptureObservationReceipt;
 }
 
@@ -296,7 +334,7 @@ export async function preparePublishCandidate(
         },
       });
     }
-    return { admission: "no-op", identity, candidate, captureReceipt, observationReceipt };
+    return { admission: "no-op", identity, candidate, publication: sealedGitPublication(captureReceipt), observationReceipt };
   }
 
   // §10 forensic line — only when git-sync did something beyond a steady carry.
@@ -318,5 +356,5 @@ export async function preparePublishCandidate(
     );
   }
 
-  return { admission: "publish", identity, candidate, captureReceipt, observationReceipt, gitUnchanged };
+  return { admission: "publish", identity, candidate, publication: sealedGitPublication(captureReceipt), observationReceipt, gitUnchanged };
 }

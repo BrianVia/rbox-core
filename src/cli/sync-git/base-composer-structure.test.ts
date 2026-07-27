@@ -150,7 +150,9 @@ test("design 130 persisted BASE and branch-origin writes are a closed allowlist"
 });
 
 test("design 200 publisher ACK derives identity, advertised refs, and effective scope from one accepted section", async () => {
-  const source = await fs.readFile(path.join(srcRoot, "cli", "sync", "push.ts"), "utf8");
+  // The sole constructor moved with its owner (AcknowledgePublishedGitTransitions);
+  // the allowlist follows ownership and is never widened to both files.
+  const source = await fs.readFile(path.join(srcRoot, "cli", "sync", "publisher-ack-transition.ts"), "utf8");
   const constructor = source.match(
     /const section = committed\.gitRepos\?\.\[relPath\];[\s\S]*?kind: "publisher-ack",[\s\S]*?incomingKey: gitIncomingKey\(section\),[\s\S]*?advertisedRefs: section\.refs,[\s\S]*?effectiveRefScope: section\.refScope,/,
   );
