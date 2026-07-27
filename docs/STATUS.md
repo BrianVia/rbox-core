@@ -5,6 +5,64 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_DAY SESSION 2026-07-27 (afternoon, "re-evaluating life"): **desktop
+REJOINED the fleet + two features shipped + prod promoted.**
+(1) via-desktop-ubuntu is a fleet member again: the in-place `--adopt` of
+the stale ~/Development replica was KILLED mid-overlay after proving an
+O(n²) journal defect (120MB journal fully rewritten per file event, 55GB+
+written in 18min, ~6-day projection — **#501**, real fix belongs in the
+163 SQLite store; 20-line batching stopgap optional). Rejoin went
+rename-aside (`~/Development.pre-rejoin`, KEEP until soak confirms) +
+empty-dir join + pull-only materialize; 15 linked worktrees parked at
+`~/Development.pre-rejoin-worktrees/` (git worktree move, all functional).
+Git plane had proven ~identical pre-kill (210/212 branches equal). Daemon
+pull-only; read-write flip pending founder + .rboxignore for agent scratch.
+Fresh-join hazard found: tracked `.env` files deleted by materialize
+(apps/web/.env.* restored from git — needs an issue).
+(2) **rbox doctor triage SHIPPED (#503**, closes #498): plain-English
+ordered findings (what's wrong / is data safe / one paste-safe scoped
+command), all-workspaces machine view outside any workspace, `--json` twin.
+3 review rounds under the NEW HARD CAP (AGENTS.md + dev-cycle skill:
+max 3 rounds, one must execute code; round-3 residue → step out a layer /
+founder tie-break / kill switch — never round 4). Review killed 14+4+1
+real defects incl. offline-misdiagnosed-as-signed-out, blanket
+--allow-mass-delete remedy, and two PRE-EXISTING prod bugs: doctor crashed
+on malformed state.json; daemonProcessMatches matched roots by SUBSTRING
+(prefix-sibling `/w/work-old` owned `/w/work`) — fixed to exact-argument
+match, shared by start/stop/status liveness.
+(3) **Design-204 false alarm corrected**: the morning corpus review called
+the delta flips "shipped dark" — WRONG, 204 shipped 7/26 (PR #458) and the
+fleet runs it; stale DRAFT header + stale README index caused it (papercut
++ rule: verify "never shipped" claims via `git log -S`). Fleet env rollout
+of those flags was a NO-OP and was stopped.
+(4) **Blob-pack (114) validation**: prod acceptance was already live;
+writer canaried on dev — correctness PASS (123 packs, zero fallbacks,
+byte-identical read-back on a paired device), wall-time FAIL (~26% slower;
+**#504**). Blocker 1 (13-row blob_locations chunking → 385 stmts/5k-commit)
+FIXED via json_each single-JSON-param batches (**#506**, 850 API tests,
+independent opus review ALIGNED — also fixed a latent cross-chunk
+pack-fence bug on main, red/green pinned). Dev re-measure: redeem 1.92x →
+**1.07x** parity. Blocker 2 (7.5MiB fill starves encrypt→upload pipelining;
+worsens when producer slows) OPEN — RBOX_PACK_TARGET_BYTES sweep running on
+dev; FM fast-pipe originator test after. Fleet burn-in: RBOX_BLOB_PACK=1
+env on all 3 daemons (default still OFF in code; flip gated on blocker 2 +
+FM numbers). **#505**: RBOX_HOME does NOT isolate credentials (prod
+credential leaks into scratch envs) — real footgun, open.
+(5) **PROD PROMOTED** (explicit founder yes, 767b97c8→5720f852):
+API-worker delta was exactly #458+#506, no migrations, no web; deploy
+workflow green; prod health ok; fleet redeems at parity now.
+(6) **Fleet build #9**: 1.9.1-dev+5720f85 on all 3 hosts (canary-compiled),
+modes preserved, burn-in env preserved. Doctor field-validated on FM's
+day-old savvy-core deferral + desktop outside-workspace view.
+(7) Founder-facing: CLI surface review artifact
+(https://claude.ai/code/artifact/036e2673-884a-4005-9cdd-0759c8abf736 +
+gist 80fbf0fee5745f50b9ebdf2fe6b466ce) — 51 commands, plain-English blurbs,
+nested subcommands, notes exportable; annotation pass pending. Strategy
+session verdict logged: ~60/40 odds on passive-dropbox-for-devs; levers =
+doctor(done)/CLI shrink/selective-repo-sync design(NOT STARTED, Max's ask,
+zero docs exist)/deferral metric/adopt milestone (166+#501). desktop
+.zshrc SSH auto-tmux fix (failed attach no longer closes the connection)._
+
 _REORG CAMPAIGN COMPLETE (2026-07-27 ~09:30 local): **20 reorg merges,
 19/21 roadmap cycles** (#478-#496, #499). Every schedulable cycle is done;
 wave 6 (RecoverStateAuthorityAtDaemonBoundary +
