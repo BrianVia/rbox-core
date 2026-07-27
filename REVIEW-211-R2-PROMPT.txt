@@ -1,0 +1,51 @@
+ROUND 2 of an adversarial review of design 211 in this repository (rbox-core).
+Work from the code. Run commands. Do this review YOURSELF — do not dispatch
+subagents.
+
+Round 1 (yours) reported 11 findings. The last commit `6c93d9a` responds to them.
+Full feature diff: `git diff HEAD~4`. Response diff only: `git show HEAD`.
+
+## Fixed — verify each fix is real and complete, not cosmetic
+
+1. BLOCKER, untrack walk-up (`src/cli/main-dispatch.ts`, the `untrack` case): an
+   exact registry hit now wins BEFORE any upward `findRoot` search. Regression
+   test: `status-all.test.ts` "untrack of a stale nested root never walks up".
+   Check for a remaining path where an ancestor can still be untracked, and for
+   any case where preferring the exact registered root is now WRONG.
+2. HIGH, resurrect race (`binding-registry.ts` `rememberBinding` /
+   `rememberResolvedRoot`): both re-read the binding via `currentWorkspaceId`
+   INSIDE the locked mutation. Confirm the check is genuinely inside the lock and
+   that no remaining ordering resurrects a forgotten entry.
+3. HIGH, swallowed forget failures: `forgetBinding` now throws. Confirm untrack
+   cannot still print a false "no longer lists it".
+4. MEDIUM, rejected records supplying `deferredRepos` (`doctor-machine.ts`):
+   pending evidence is now taken only from a gated record.
+5. MEDIUM, missing directory fsync after the atomic rename.
+6. MEDIUM, `--all` + `--verbose` / `--git` / `--residue-bytes` now rejected.
+7. LOW, empty-name and far-future-`lastSeenAt` convergence.
+
+## Explicitly DECLINED — challenge these only with a concrete in-diff failure
+
+- Root identity uses `path.resolve`, not `realpath`, deliberately: `workspaceKey`
+  in `src/cli/rbox-paths.ts` already names every daemon runtime directory that
+  way, so canonicalizing in the registry alone would make the registry and the
+  daemon records disagree about the same workspace. Repo-wide question.
+- The `stop`-recreates-`desired.json`-after-`untrack` lifecycle race is
+  pre-existing daemon behavior (the #503 view showed the same resurrected row);
+  with the registry it becomes a reported, now-clearable `missing` row.
+- Leftover `.rbox-tmp-*` after SIGKILL and the ignored `OwnedLock.release()`
+  result are shared `writeFileAtomic`/lock conventions used identically by
+  `autostart-cmd.ts`; changing them here alone would diverge from prior art.
+
+## Required work
+
+- `bun run typecheck`
+- `bun test src/cli/binding-registry.test.ts src/cli/status-all.test.ts
+  src/cli/doctor-machine.test.ts src/cli/doctor-outside-workspace.test.ts
+  src/cli/track-untrack.test.ts`
+- Re-run your round-1 multi-process break probes against the fixed code, plus a
+  probe that specifically tries to resurrect a forgotten entry across processes.
+
+Report ONLY new or unresolved findings, with SEVERITY, file:line, the concrete
+failure, and the minimal fix. End with exactly one line: `ALIGNED` if nothing
+above MEDIUM remains, else `CHANGES-REQUIRED`.

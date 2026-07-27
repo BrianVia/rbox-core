@@ -303,6 +303,25 @@ test("an empty workspace name converges instead of rewriting on every command", 
   expect(await fs.readFile(bindingRegistryPath(), "utf8")).toBe(before);
 });
 
+test("a name CLEARED in the workspace config is cleared in the registry and then converges", async () => {
+  const root = await bindRoot("renamed", "ws_renamed", "Old");
+  await rememberResolvedRoot(root);
+  expect((await readPersistedEntries())[0]!.name).toBe("Old");
+
+  await fs.writeFile(path.join(root, ".rbox", "workspace.json"), JSON.stringify({
+    remoteWorkspaceId: "ws_renamed",
+    projectId: "root",
+    remoteUrl: "https://api.test",
+  }));
+  await rememberResolvedRoot(root);
+  expect((await readPersistedEntries())[0]!.name).toBeUndefined();
+
+  // ...and the next resolve must be a no-op, not another rewrite.
+  const settled = await fs.readFile(bindingRegistryPath(), "utf8");
+  await rememberResolvedRoot(root);
+  expect(await fs.readFile(bindingRegistryPath(), "utf8")).toBe(settled);
+});
+
 test("registry rows are sorted by root so aggregate views are stable", async () => {
   const b = await bindRoot("bbb");
   const a = await bindRoot("aaa");

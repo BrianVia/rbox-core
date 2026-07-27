@@ -161,6 +161,11 @@ function upsert(
   root: string,
   binding: RememberedBinding,
   nowIso: string,
+  /** True when `binding` was read from the workspace config and therefore states
+   * the whole truth about the name — including that it was CLEARED. Carrying a
+   * stale cached name forward there would make every later resolve see a
+   * mismatch and rewrite the file again, forever. */
+  authoritativeName = false,
 ): BindingRegistryEntry[] {
   const others = entries.filter((entry) => entry.root !== root);
   const prev = entries.find((entry) => entry.root === root);
@@ -169,7 +174,8 @@ function upsert(
   const carried = prev?.workspaceId === binding.remoteWorkspaceId ? prev : undefined;
   // An empty name is the same as no name; storing "" would make the freshness
   // comparison in `rememberResolvedRoot` rewrite the file on every command.
-  const name = (binding.name?.length ? binding.name : undefined) ?? carried?.name;
+  const observed = binding.name?.length ? binding.name : undefined;
+  const name = authoritativeName ? observed : observed ?? carried?.name;
   const accountId = (binding.accountId?.length ? binding.accountId : undefined) ?? carried?.accountId;
   return [...others, {
     root,
@@ -224,7 +230,7 @@ export async function rememberResolvedRoot(root: string, now = () => new Date())
     // concurrent `untrack`, and writing it back would resurrect that entry.
     await mutate((entries) => (
       currentWorkspaceId(abs) === observed.remoteWorkspaceId
-        ? upsert(entries, abs, observed, at.toISOString())
+        ? upsert(entries, abs, observed, at.toISOString(), true)
         : undefined
     ));
   } catch {

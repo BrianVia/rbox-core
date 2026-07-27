@@ -52,9 +52,11 @@ single atomic rename gives readers a consistent snapshot with no directory walk.
 }
 ```
 
-Unknown fields are preserved on rewrite; an unparseable file degrades to "no
-entries" rather than throwing (the registry must never be the reason a bind
-fails). Entries are sorted by `root` on write so the file diffs cleanly.
+An unparseable file degrades to "no entries" rather than throwing (the registry
+must never be the reason a bind fails). Entries are sorted by `root` on write so
+the file diffs cleanly. A rewrite keeps only the known fields — this is a local,
+fully reconstructible cache, so a field an older binary drops is simply
+re-recorded by the newer binary's next write.
 
 ## 3. Effective set = persisted entries ∪ daemon desired rows
 
@@ -180,6 +182,13 @@ rather than by this design:
   here alone would make registry entries and daemon records disagree about the
   same workspace. Symlink-alias roots are therefore a repo-wide path-identity
   question, not a registry one.
+- `rbox untrack <some>/<sub>/<dir>` resolving to the enclosing workspace is the
+  memo's PATH-as-workspace-locator contract, not a registry bug: `findRoot` has
+  always walked up, and a descendant probe behaves byte-identically before and
+  after this change. Only the EXACT registered root is special-cased, and only
+  because a root whose binding is gone has no workspace to walk up to. Making a
+  stale entry shadow a live ancestor for every descendant path would be the
+  regression.
 - the daemon lifecycle race where a concurrent `stop` recreates `desired.json`
   after an `untrack` removed the runtime directory is pre-existing (the #503 view
   showed the same resurrected row). With the registry the outcome is a `missing`
