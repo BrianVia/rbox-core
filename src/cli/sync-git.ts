@@ -19,9 +19,6 @@ export {
 export { gitDivergenceFastRepoSource, classifyDivergenceCacheEntry, type GitDivergenceRepoHint } from "./sync-git/divergence-cache.js";
 export {
   applyGitSections,
-  revalidateGitPartialApplies,
-  withRevalidatedGitPartialApplies,
-  settleCommittedBranchArtifacts,
   formatGitApplyMetrics,
   type GitPullOutcome,
   type GitApplyRunKind,
@@ -29,6 +26,11 @@ export {
   type GitApplyRepoTiming,
   type GitApplyMetrics,
 } from "./sync-git/apply.js";
+export {
+  revalidateGitPartialApplies,
+  settleCommittedBranchArtifacts,
+  withRevalidatedGitPartialApplies,
+} from "./sync-git/received-git-transition-commit.js";
 export { conflictSnapshotStatus, gitDivergenceStatus, gitDivergenceCount, type GitDivergenceStatus, type GitDivergenceStatusOptions } from "./sync-git/status.js";
 export {
   DEFERRAL_HYGIENE_ACTION,

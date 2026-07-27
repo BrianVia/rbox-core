@@ -384,7 +384,7 @@ test("R2 real-process crash matrix recovers a 140-lock withRevalidated state-CAS
   if (await updater.exited !== 0) throw new Error(await new Response(updater.stderr).text());
 
   const script = `
-    import { withRevalidatedGitPartialApplies } from "./src/cli/sync-git/apply.ts";
+    import { withRevalidatedGitPartialApplies } from "./src/cli/sync-git/received-git-transition-commit.ts";
     const root = process.env.RBOX_T3_CRASH_ROOT;
     const oid = process.env.RBOX_T3_CRASH_OID;
     const point = process.env.RBOX_T3_CRASH_POINT;

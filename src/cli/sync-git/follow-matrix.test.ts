@@ -23,7 +23,8 @@ import { collectRepoResidue, renderDoctor, type DoctorChecks } from "../doctor-c
 import type { SyncRemote } from "../remote.js";
 import { pull } from "../sync.js";
 import { orderedRepoDeferralUpdates, saveStateSource } from "../sync-state.js";
-import { applyGitSections, withRevalidatedGitPartialApplies } from "./apply.js";
+import { applyGitSections } from "./apply.js";
+import { withRevalidatedGitPartialApplies } from "./received-git-transition-commit.js";
 import { gitIncomingKey } from "./shared.js";
 
 const exec = promisify(execFile);

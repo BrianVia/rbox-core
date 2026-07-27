@@ -134,11 +134,14 @@ test("design 130 persisted BASE and branch-origin writes are a closed allowlist"
     // Design 177 retains read-only oracle proof inputs named `base`; BASE writes
     // still route only through the composer/state transitions guarded below.
     "src/cli/git/resolve-command.ts": 9,
-    "src/cli/sync-git/apply.ts": 25,
+    "src/cli/sync-git/apply.ts": 24,
     "src/cli/sync-git/base-composer.ts": 2,
     "src/cli/sync-git/follow.ts": 1,
     "src/cli/sync-git/p-repair-state.ts": 1,
     "src/cli/sync-git/p-settlement.ts": 1,
+    // The unreadable-terminal carry moved with its owner
+    // (CommitReceivedGitTransition); the allowlist follows ownership.
+    "src/cli/sync-git/received-git-transition-commit.ts": 1,
     // Design 178 D.3 read-only publisher-ACK composer dry-run inputs/result.
     "src/cli/sync-git/pending-supersession.ts": 3,
     "src/cli/sync-git/plan.ts": 2,

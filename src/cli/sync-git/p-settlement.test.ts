@@ -15,7 +15,8 @@ import {
 import { gitRaw } from "../../engine/git/shared.js";
 import { MutationGateClosedError, ShutdownMutationGate, type MutationBoundary } from "../../engine/mutation-gate.js";
 import { loadRawState, saveStateUnsafeLegacyOrTest, type SyncState } from "../config.js";
-import { settleCommittedBranchArtifacts, type GitPullOutcome } from "./apply.js";
+import type { GitPullOutcome } from "./apply.js";
+import { settleCommittedBranchArtifacts } from "./received-git-transition-commit.js";
 import { settleExactPresentArtifact } from "./p-settlement.js";
 
 const exec = promisify(execFile);
