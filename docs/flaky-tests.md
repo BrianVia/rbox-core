@@ -324,3 +324,14 @@ removed; the redacted result is retained at
   flake (an earlier version of this entry wrongly claimed a green rerun).
   Fixed same night: rm -rf before mkdir + worktree add -B. Not correlated
   with product changes (#480-482).
+
+## src/cli/daemon/daemon-activity.test.ts — "design 178 B: safety halt clears only when its own recovery predicate stops reproducing"
+
+- 2026-07-27: failed on CI shard 1/6 (PR #492); green in the file locally
+  (67/67) and full suite green on the exact merged tree. Same design-178
+  starved-runner class as the two tests PR #403 converted to injected
+  clocks — this sibling still uses real timing. QUEUED FIX: same
+  SafetyCadenceClock seam conversion. Process note: this PR was merged
+  before the rerun proof due to an unguarded command chain (merges are now
+  verdict-gated); post-merge verification on main substituted for the rerun
+  leg.
