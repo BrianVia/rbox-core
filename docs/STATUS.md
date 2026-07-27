@@ -5,6 +5,39 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_POST-RELEASE ADDENDUM 2026-07-27 (late night): **savvy-core wedge
+ROOT-CAUSED — git pack chain discontinuity (#526).** Every fresh receiver
+(FM ~2 days, desktop since rejoin) loops on "bundle verify failed for git
+pack link 4": chain links are BASIS bundles (capture.ts:304-308), link 4's
+prerequisites aren't satisfied by links 0-3 for a from-scratch receiver
+(scar tissue from the July stash/conflict-ref episodes), and the sequential
+import fail-closes (shared.ts:571). The publisher never notices — it holds
+all objects and receiver verify-failures produce NO wire signal (design-174
+meta-lesson recurring); the only degrade-to-full path fires on basis
+CREATION failure, never on receiver import failure. A content-neutral ref
+nudge (published seq 789) added a new link to the same broken chain —
+useless, as predicted in hindsight. Desktop savvy-core briefly materialized
+a .git skeleton then rolled back (correct cleanup). FIX DIRECTION (#526):
+(1) `rbox git republish <repo>` operator lever — force full-bundle chain
+reset from the publisher; unblocks the fleet same-day; (2) structural:
+receiver import-failure feedback → automatic compaction. NOT built yet —
+awaiting founder go. Also: Mac's only remaining deferral is
+Personal/home-dashboard ("incoming checkout ref could not be published
+safely"), unrelated. Founder's CLI feedback branch
+(codex/cli-surface-help) verified byte-identical to the merged #510 memo —
+already merged, steps 1-2 + registry SHIPPED in v1.10.0; remaining memo
+items (Max validation checkpoint, setup-demotion remainder, keyed
+materialization design) queued per founder hold. Healthy-chain receiver
+materialization benchmark for a savvy-core-class repo: ~30-60s from
+publish. Operator kit completed on the desktop (founder-authorized rsync
+from Mac): dev-keys/prod-keys/release-private-key .local.secret + .env,
+all git-ignored. Papercut filed: `rbox logs` stitches legacy un-timestamped
+crash dumps after current lines (7/26 refwatch fossil read as a live
+release blocker; cost ~20 min). New issues this stretch: #525
+(rbox transfer-test command), #526 (chain republish). Queued founder
+decisions: #526 lever go, 212 V1 implementation go, desktop read-write
+flip (needs agent-scratch .rboxignore), memo remainder timing._
+
 _RELEASE 2026-07-27 (night): **v1.10.0 SHIPPED** (tag 929d2ee3, release
 run 30303334623 green: build + 3-platform smoke + publish; changelog live).
 Headlines: plain-English doctor + machine-wide status/doctor --all on the
