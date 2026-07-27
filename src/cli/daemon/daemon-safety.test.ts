@@ -82,14 +82,20 @@ interface SafetyInternals {
   matcher: { ignores(path: string): boolean };
   cfg: { respectGitignore?: boolean };
   reloadWorkspaceConfigIfChanged(): Promise<void>;
-  gitSafetyFloorRequired: boolean;
-  gitBackendFallbackPending: boolean;
-  authoritativeGitRepos: readonly { relPath: string; kind: "dir" | "pointer" }[];
-  planDiscoveredGitDirOwners: Set<string>;
-  observePlanGitRepos(repos: readonly { relPath: string; kind: "dir" | "pointer" }[]): Promise<void>;
-  gitRefRegistry?: unknown;
+  gitDiscovery: DiscoveryInternals;
   handleGitSignalBatch(batch: GitSignalBatch): Promise<void>;
-  refreshGitSafetyFloor(reason: string): void;
+}
+
+/** The discovery owner's public receipt surface plus the continuity fields these
+ *  floor regressions drive directly, reached the same way daemon internals are. */
+interface DiscoveryInternals {
+  readonly floorRequired: boolean;
+  readonly refBackendAttached: boolean;
+  observe(observation: { kind: "plan"; repos: readonly { relPath: string; kind: "dir" | "pointer" }[] }): Promise<unknown>;
+  refreshFloor(reason: string): void;
+  backendFallbackPending: boolean;
+  authoritative: readonly { relPath: string; kind: "dir" | "pointer" }[];
+  planDiscoveredDirOwners: Set<string>;
 }
 
 test("design 175: ref signal requests push without pending/file-settle state", async () => {
@@ -121,7 +127,7 @@ test("design 175: ref signal requests push without pending/file-settle state", a
 
   try {
     await daemon.startLiveWatch();
-    expect(daemon.gitRefRegistry !== undefined).toBe(process.platform === "linux");
+    expect(daemon.gitDiscovery.refBackendAttached).toBe(process.platform === "linux");
     const realNow = Date.now;
     const signalAt = realNow();
     try {
@@ -157,7 +163,7 @@ test("design 175: a directory-backed repo holds the git safety floor only on Lin
   try {
     await daemon.startLiveWatch();
     daemon.safetyDelay = FLOOR;
-    expect(daemon.gitSafetyFloorRequired).toBe(process.platform === "linux");
+    expect(daemon.gitDiscovery.floorRequired).toBe(process.platform === "linux");
     daemon.advanceSafetyCadenceForTick();
     expect(daemon.safetyDelay).toBe(process.platform === "linux" ? FLOOR : 120_000);
   } finally {
@@ -173,16 +179,16 @@ test.skipIf(process.platform !== "linux")("design 175 fix: plan discovery pins t
   const daemon = makeDaemon(root);
   try {
     daemon.safetyDelay = CAP;
-    daemon.authoritativeGitRepos = [];
-    expect(daemon.gitRefRegistry).toBeUndefined();
-    await daemon.observePlanGitRepos([{ relPath: "late", kind: "dir" }]);
-    expect(daemon.planDiscoveredGitDirOwners).toEqual(new Set(["late"]));
-    expect(daemon.gitSafetyFloorRequired).toBe(true);
+    daemon.gitDiscovery.authoritative = [];
+    expect(daemon.gitDiscovery.refBackendAttached).toBe(false);
+    await daemon.gitDiscovery.observe({ kind: "plan", repos: [{ relPath: "late", kind: "dir" }] });
+    expect(daemon.gitDiscovery.planDiscoveredDirOwners).toEqual(new Set(["late"]));
+    expect(daemon.gitDiscovery.floorRequired).toBe(true);
     expect(daemon.safetyDelay).toBe(FLOOR);
 
-    daemon.planDiscoveredGitDirOwners.clear();
-    daemon.refreshGitSafetyFloor("complete-zero-snapshot");
-    expect(daemon.gitSafetyFloorRequired).toBe(false);
+    daemon.gitDiscovery.planDiscoveredDirOwners.clear();
+    daemon.gitDiscovery.refreshFloor("complete-zero-snapshot");
+    expect(daemon.gitDiscovery.floorRequired).toBe(false);
   } finally {
     if (daemon.safetyTimer) clearTimeout(daemon.safetyTimer);
     fs.rmSync(root, { recursive: true, force: true });
@@ -199,8 +205,8 @@ test.skipIf(process.platform !== "linux")("design 175 fix: registry construction
   daemon.pumping = true;
   try {
     await daemon.startLiveWatch();
-    expect(daemon.gitRefRegistry).toBeUndefined();
-    expect(daemon.gitSafetyFloorRequired).toBe(true);
+    expect(daemon.gitDiscovery.refBackendAttached).toBe(false);
+    expect(daemon.gitDiscovery.floorRequired).toBe(true);
   } finally {
     if (daemon.safetyTimer) clearTimeout(daemon.safetyTimer);
     if (daemon.deepTimer) clearInterval(daemon.deepTimer);
@@ -214,23 +220,23 @@ test.skipIf(process.platform !== "linux")("design 175: fallback and dir snapshot
   const daemon = makeDaemon(root);
   try {
     daemon.safetyDelay = CAP;
-    daemon.gitBackendFallbackPending = true;
-    daemon.refreshGitSafetyFloor("chokidar-pending");
-    expect(daemon.gitSafetyFloorRequired).toBe(true);
+    daemon.gitDiscovery.backendFallbackPending = true;
+    daemon.gitDiscovery.refreshFloor("chokidar-pending");
+    expect(daemon.gitDiscovery.floorRequired).toBe(true);
     expect(daemon.safetyDelay).toBe(FLOOR);
 
-    daemon.gitBackendFallbackPending = false;
-    daemon.authoritativeGitRepos = [{ relPath: "linked", kind: "pointer" }];
-    daemon.refreshGitSafetyFloor("pointer-only-snapshot");
-    expect(daemon.gitSafetyFloorRequired).toBe(false);
+    daemon.gitDiscovery.backendFallbackPending = false;
+    daemon.gitDiscovery.authoritative = [{ relPath: "linked", kind: "pointer" }];
+    daemon.gitDiscovery.refreshFloor("pointer-only-snapshot");
+    expect(daemon.gitDiscovery.floorRequired).toBe(false);
 
-    daemon.authoritativeGitRepos = [{ relPath: "repo", kind: "dir" }];
-    daemon.refreshGitSafetyFloor("dir-snapshot");
-    expect(daemon.gitSafetyFloorRequired).toBe(true);
+    daemon.gitDiscovery.authoritative = [{ relPath: "repo", kind: "dir" }];
+    daemon.gitDiscovery.refreshFloor("dir-snapshot");
+    expect(daemon.gitDiscovery.floorRequired).toBe(true);
 
-    daemon.authoritativeGitRepos = [];
-    daemon.refreshGitSafetyFloor("zero-repo-snapshot");
-    expect(daemon.gitSafetyFloorRequired).toBe(false);
+    daemon.gitDiscovery.authoritative = [];
+    daemon.gitDiscovery.refreshFloor("zero-repo-snapshot");
+    expect(daemon.gitDiscovery.floorRequired).toBe(false);
   } finally {
     if (daemon.safetyTimer) clearTimeout(daemon.safetyTimer);
     fs.rmSync(root, { recursive: true, force: true });

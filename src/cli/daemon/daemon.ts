@@ -70,7 +70,8 @@ import { QuotaExceededError, RboxApi } from "../remote.js";
 import { envInt } from "../remote/resilient.js";
 import { CommitRejectedError } from "../remote.js";
 import { createSignalDebouncer, startWatcher, type GitSignalBatch, type SignalDebouncer, type Watcher } from "./watcher.js";
-import { GitRefWatchRegistry, gitRefSideChannelEligible, ownerOrder } from "./git-ref-watch.js";
+import { gitRefSideChannelEligible } from "./git-ref-watch.js";
+import { GitDiscoveryContinuity } from "./git-discovery-continuity.js";
 import { runUpdateCheckIfDue } from "../update-check.js";
 import {
   AMBIENT_STATUS_HEARTBEAT_MS,
@@ -131,7 +132,7 @@ import {
   type TrustedPullViewResult,
 } from "./manifest-update.js";
 import { cleanPath, LOG_PATHS_MAX, scanStatsLine, summarizeActions } from "./render.js";
-import { RotatingDaemonLogger, type DaemonLogSink } from "./logger.js";
+import { errCode, RotatingDaemonLogger, type DaemonLogSink } from "./logger.js";
 import { TelemetryQueue } from "../telemetry/queue.js";
 import { TELEMETRY_SAMPLE_SCHEMAS, telemetryEnabled, type GitCaptureSample } from "../telemetry/contract.js";
 import { SyncPhaseSampler } from "../telemetry/sync-phase.js";
@@ -338,12 +339,6 @@ export function durableGitDeferralLines(
   return pending.sort((a, b) => a.at - b.at || a.line.localeCompare(b.line)).map((row) => row.line);
 }
 
-/** Sanitized error identifier for measurement-failure log lines. Node fs errors
- *  embed absolute paths in `message` — only the errno code may be emitted (the
- *  founder's no-raw-filenames rule covers failure lines too, D2-R3). */
-const errCode = (e: unknown): string =>
-  e && typeof e === "object" && "code" in e && typeof (e as { code?: unknown }).code === "string" ? (e as { code: string }).code : "unknown";
-
 interface OpenDriftAudit {
   scanStartMs: number;
   candidates: DriftCandidateDraft[];
@@ -423,19 +418,16 @@ export class RboxDaemon {
   private resetHaltReason?: string;
   private readonly resetHaltLogGate = new ResetHaltLogGate();
   private pendingEvents: WatchEvent[] = [];
-  private gitRefRegistry?: GitRefWatchRegistry;
   private gitSignalDebouncer?: SignalDebouncer;
-  /** Backend-independent dir-backed ownership pin for the safety cadence. */
-  private gitSafetyFloorRequired = false;
-  private gitBackendFallbackPending = false;
-  private authoritativeGitRepos: readonly DiscoveredGitRepo[] = [];
-  /** Additive dir discoveries since the latest shrinking safety snapshot. */
-  private planDiscoveredGitDirOwners = new Set<string>();
-  private hasAuthoritativeGitSnapshot = false;
-  /** Each completed unpruned scan re-mints an exact pr8 proof, consumable once
-   * per absent repository. */
-  private deferralDiscoveryEpoch = 0;
-  private deferralDiscoveryAuthority?: { epoch: number; discoveredRepos: ReadonlySet<string> };
+  /** Sole owner of repository topology, absence authority, and the Linux
+   * safety-cadence floor. The daemon supplies discovery effects and consumes
+   * receipts; it holds none of that state itself. */
+  private readonly gitDiscovery = new GitDiscoveryContinuity({
+    discoverAll: () => discoverGitRepos(this.root, this.matcher),
+    discoverUnder: (owner) => discoverGitReposUnder(this.root, owner, this.matcher),
+    pinSafetyFloor: () => this.pinSafetyFloor(),
+    log: (line) => this.log(line),
+  });
   private pendingPushReasons = { signal: false, candidate: false, scan: false, other: false };
   private gitBusyEpisode?: { timers: unknown[]; queuedStages: number[] };
 
@@ -887,28 +879,20 @@ export class RboxDaemon {
       // The subscription's native prune set is fixed from here until close; §3b
       // compares later rebuilds against THIS value, not the current rule files.
       this.watcherNativePruneKey = nativePruneGlobs(this.root).join("\n");
-      const registryEligible = gitRefSideChannelEligible(process.platform, this.watcher.backend);
-      if (registryEligible) {
-        this.gitRefRegistry = new GitRefWatchRegistry({
+      if (gitRefSideChannelEligible(process.platform, this.watcher.backend)) {
+        await this.gitDiscovery.attachRefBackend({
           root: this.root,
+          initial: initialGitRepos,
           onSignal: () => signalDebouncer.push("signal"),
           onArmed: () => signalDebouncer.push("other"),
-          onFloorChange: () => this.refreshGitSafetyFloor("registry"),
           onLog: this.log,
         });
-        await this.gitRefRegistry.upsert(initialGitRepos);
-      } else if (process.platform === "linux") {
-        this.gitBackendFallbackPending = true;
-        this.refreshGitSafetyFloor("backend-fallback");
-      }
+      } else this.gitDiscovery.noteRefBackendUnavailable();
       this.watcherSessionId = crypto.randomBytes(16).toString("hex");
     } catch (e) {
-      await this.gitRefRegistry?.close();
-      this.gitRefRegistry = undefined;
+      await this.gitDiscovery.abandonRefBackend();
       signalDebouncer.dispose();
       this.gitSignalDebouncer = undefined;
-      this.gitBackendFallbackPending = process.platform === "linux";
-      this.refreshGitSafetyFloor("backend-fallback");
       this.log(`live watch unavailable: ${e instanceof Error ? e.message : String(e)} — degrading to periodic scan every ${Math.round(SAFETY_SYNC_MS / 1000)}s`);
       this.watcherDegraded = true;
       this.writeAmbientStatus();
@@ -917,24 +901,7 @@ export class RboxDaemon {
 
   private async handleGitSignalBatch(batch: GitSignalBatch): Promise<void> {
     if (this.resetLifecycle !== "ready" || this.stopped) return;
-    try {
-      if (this.gitRefRegistry) {
-        if (batch.discoverAll) await this.gitRefRegistry.markAllCandidatesDirty();
-        else await this.gitRefRegistry.markCandidates(batch.candidates);
-        let discovered: DiscoveredGitRepo[] = [];
-        if (batch.discoverAll) {
-          discovered = await discoverGitRepos(this.root, this.matcher);
-        } else {
-          const owners = [...new Set(batch.candidates.filter((candidate) => candidate.discover).map((candidate) => candidate.owner))].sort();
-          for (const owner of owners) discovered.push(...await discoverGitReposUnder(this.root, owner, this.matcher));
-        }
-        if (discovered.length > 0) {
-          await this.gitRefRegistry.upsert(discovered);
-        }
-      }
-    } catch (error) {
-      this.log(`git ref candidate discovery failed: ${errCode(error)}`);
-    }
+    await this.gitDiscovery.observe({ kind: "signal", discoverAll: batch.discoverAll, candidates: batch.candidates });
     this.noteChurn();
     if (batch.reasons.signal) this.requestPush("signal");
     if (batch.reasons.candidate) this.requestPush("candidate");
@@ -961,28 +928,6 @@ export class RboxDaemon {
       if (this.safetyTimer !== undefined) this.scanCadenceClock.clearTimeout(this.safetyTimer);
       this.scheduleSafetyScan();
     }
-  }
-
-  private refreshGitSafetyFloor(reason: string): void {
-    const next = process.platform === "linux" && (
-      this.gitBackendFallbackPending
-      || this.authoritativeGitRepos.some((repo) => repo.kind === "dir")
-      || this.planDiscoveredGitDirOwners.size > 0
-      || this.gitRefRegistry?.floorRequired === true
-    );
-    if (next === this.gitSafetyFloorRequired) return;
-    this.gitSafetyFloorRequired = next;
-    if (next) this.pinSafetyFloor();
-    this.log(`git safety floor ${next ? "required" : "released"}: ${reason}`);
-  }
-
-  /** Backend-independent additive plan observation. A registry, when present,
-   * owns arming; this daemon-owned claim independently pins Chokidar/fallback
-   * until the next complete safety snapshot is allowed to shrink it. */
-  private async observePlanGitRepos(repos: readonly DiscoveredGitRepo[]): Promise<void> {
-    for (const repo of repos) if (repo.kind === "dir") this.planDiscoveredGitDirOwners.add(repo.relPath);
-    await this.gitRefRegistry?.upsert(repos);
-    this.refreshGitSafetyFloor("plan-discovery");
   }
 
   /**
@@ -1032,7 +977,7 @@ export class RboxDaemon {
       watcherLive: this.watcherLive(),
       churned: this.churnSinceSafety,
       degradedBackoffEligible,
-      pinToFloor: process.platform === "linux" && this.gitSafetyFloorRequired,
+      pinToFloor: this.gitDiscovery.floorRequired,
     });
   }
 
@@ -1126,7 +1071,7 @@ export class RboxDaemon {
     this.gitSignalDebouncer?.dispose();
     await Promise.allSettled([
       Promise.resolve().then(() => this.watcher?.close()),
-      Promise.resolve().then(() => this.gitRefRegistry?.close()),
+      Promise.resolve().then(() => this.gitDiscovery.close()),
       Promise.resolve().then(() => this.telemetry.flush(AbortSignal.timeout(1500))),
       Promise.resolve().then(() => this.activityWrite),
       Promise.resolve().then(() => this.cache?.save(this.root)),
@@ -1881,7 +1826,7 @@ export class RboxDaemon {
         report,
         onGitLog: this.log, // design 43 §10: capture/carry/defer/remove forensics in the daemon log
         onGitDeferralsSaved: (state) => this.observeDurableGitState(state),
-        onGitReposDiscovered: (repos) => this.observePlanGitRepos(repos),
+        onGitReposDiscovered: async (repos) => { await this.gitDiscovery.observe({ kind: "plan", repos }); },
         onGitBusyDeferred: (repos) => { if (repos.length > 0) this.noteGitBusyDeferred(); },
         onProgress: (done, total, phase, detail, bytes) => this.onTransferProgress(done, total, phase, detail, bytes), // design 45 + 88: progress plus local status path
         onPullApplied: (a) => this.recordPullApplied(a), // design 45: the 409-recovery pull mutates the tree too
@@ -2402,7 +2347,7 @@ export class RboxDaemon {
         timeBudgetMs: this.deferralHygieneBudgetMs,
         cursor: this.deferralHygieneCursor,
         recoverShared: (_root, commonDir) => this.recoverStateCasWithGate(commonDir),
-        getDiscoveryAuthority: () => this.deferralDiscoveryAuthority,
+        getDiscoveryAuthority: () => this.gitDiscovery.absenceProof,
       });
       if (result.state !== base) this.observeDurableGitState(result.state, this.now());
       if (result.recoveredLocks > 0) {
@@ -3015,7 +2960,7 @@ export class RboxDaemon {
   private async replaceManifestFromScan(cache: HashCache, previous: Manifest, scanStats: ScanStats | undefined, scanKind: "safety scan" | "deep scan" | undefined, mode: "pruned" | "unpruned"): Promise<{ freshManifest: Manifest; deferred: Set<string>; coverage: "full-tree" | "pruned" }> {
     const deferred = new Set<string>();
     const discoveredGitRepos: DiscoveredGitRepo[] = [];
-    const registrySnapshotEpoch = scanKind ? this.gitRefRegistry?.beginSnapshot() : undefined;
+    const topologySnapshot = this.gitDiscovery.beginScanSnapshot(scanKind);
     const probeOn = process.env.RBOX_SCAN_PROBE === "1" && scanKind !== undefined;
     const scanStartMs = Date.now();
     const priorProbe = probeOn ? await loadScanProbe(this.root) : undefined;
@@ -3034,34 +2979,7 @@ export class RboxDaemon {
       deferErrnos.onErrno, this.log);
     deferErrnos.flush();
     await dircache?.save(this.root);
-    const repos = [...discoveredGitRepos].sort(ownerOrder);
-    if (mode === "unpruned") {
-      const epoch = ++this.deferralDiscoveryEpoch;
-      this.deferralDiscoveryAuthority = { epoch, discoveredRepos: new Set(repos.map((repo) => repo.relPath)) };
-    } else {
-      // Pruned discovery is additive and cannot testify that a missing repo is gone.
-      this.deferralDiscoveryAuthority = undefined;
-    }
-    if (scanKind && mode === "unpruned") {
-      this.authoritativeGitRepos = repos;
-      this.planDiscoveredGitDirOwners.clear();
-      this.hasAuthoritativeGitSnapshot = true;
-      this.gitBackendFallbackPending = false;
-      if (registrySnapshotEpoch !== undefined) await this.gitRefRegistry?.applySnapshot(repos, registrySnapshotEpoch, true);
-      else await this.gitRefRegistry?.upsert(repos);
-      this.refreshGitSafetyFloor(`${scanKind}-snapshot`);
-    } else if (!scanKind && mode === "unpruned" && !this.hasAuthoritativeGitSnapshot) {
-      this.authoritativeGitRepos = repos;
-      this.hasAuthoritativeGitSnapshot = true;
-      await this.gitRefRegistry?.upsert(repos);
-      this.refreshGitSafetyFloor("initial-snapshot");
-    } else {
-      // Pruned scans are additive evidence only: discovery-pruned subtrees do
-      // not report repositories, so their absence can never authorize pr8
-      // gone-directory cleanup or shrink the ref registry.
-      await this.gitRefRegistry?.upsert(repos);
-      this.refreshGitSafetyFloor(mode === "pruned" ? "pruned-additive-scan" : "additive-scan");
-    }
+    await this.gitDiscovery.observe({ kind: "scan", repos: discoveredGitRepos, mode, snapshot: topologySnapshot });
     // Any deferred path makes collision evidence incomplete: it might be the
     // unseen case-variant of a path that did hash. Preserve warning authority
     // until a later scan observes the whole file set.

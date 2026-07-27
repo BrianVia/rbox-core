@@ -102,8 +102,7 @@ interface DaemonInternals {
   safetyTimer?: unknown;
   scheduleSafetyScan(): void;
   deepTimer?: ReturnType<typeof setInterval>;
-  deferralDiscoveryEpoch: number;
-  deferralDiscoveryAuthority?: { epoch: number; discoveredRepos: ReadonlySet<string> };
+  gitDiscovery: { readonly absenceProof?: { epoch: number; discoveredRepos: ReadonlySet<string> } };
   doFullScan(): Promise<{ coverage: "full-tree" | "pruned"; errorGenAtStart: number }>;
   doDeepScan(): Promise<{ coverage: "full-tree" | "pruned"; errorGenAtStart: number }>;
   doPull(...args: unknown[]): Promise<void>;
@@ -791,18 +790,18 @@ test("pr8: production pull-only timers remint discovery and clear a ghost withou
     await daemon.start();
     expect(clock.safetyArmed).toBe(true);
     expect(clock.deepArmed).toBe(true);
-    const firstEpoch = daemon.deferralDiscoveryAuthority?.epoch;
+    const firstEpoch = daemon.gitDiscovery.absenceProof?.epoch;
     expect(firstEpoch).toBeDefined();
 
     await clock.fireSafety();
-    expect(daemon.deferralDiscoveryAuthority?.epoch).toBe(firstEpoch);
+    expect(daemon.gitDiscovery.absenceProof?.epoch).toBe(firstEpoch);
     expect(daemon.syncBase?.repoRecords?.ghost?.deferrals?.capture).toBeDefined();
 
     now += 30_000;
     await clock.fireDeep();
     await Promise.resolve();
     await daemon.pumpRun;
-    expect(daemon.deferralDiscoveryAuthority?.epoch).toBe(firstEpoch! + 1);
+    expect(daemon.gitDiscovery.absenceProof?.epoch).toBe(firstEpoch! + 1);
     expect(daemon.syncBase?.repoRecords?.ghost?.deferrals).toBeUndefined();
     expect((await loadState(root, seeded.stream)).repoRecords?.ghost?.deferrals).toBeUndefined();
     expect(daemon.want.push).toBe(false);

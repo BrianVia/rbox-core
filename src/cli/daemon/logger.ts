@@ -16,6 +16,12 @@ const MAX_RETENTION_DAYS = 3650;
 const LINK_CHECK_MS = 60_000;
 const LINK_CHECK_RECORDS = 512;
 
+/** Sanitized error identifier for measurement-failure log lines. Node fs errors
+ *  embed absolute paths in `message` — only the errno code may be emitted (the
+ *  founder's no-raw-filenames rule covers failure lines too, D2-R3). */
+export const errCode = (e: unknown): string =>
+  e && typeof e === "object" && "code" in e && typeof (e as { code?: unknown }).code === "string" ? (e as { code: string }).code : "unknown";
+
 function errno(error: unknown): string | undefined {
   return typeof error === "object" && error !== null && "code" in error
     ? String((error as NodeJS.ErrnoException).code)

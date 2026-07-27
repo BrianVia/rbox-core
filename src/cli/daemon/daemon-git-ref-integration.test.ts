@@ -26,7 +26,7 @@ interface IntegrationDaemon {
   pendingPushReasons: { signal: boolean; candidate: boolean; scan: boolean; other: boolean };
   want: { push: boolean };
   takePushProvenance(): { signal: boolean; candidate: boolean; scan: boolean; other: boolean };
-  gitRefRegistry?: GitRefWatchRegistry;
+  gitDiscovery: { registry?: GitRefWatchRegistry; close(): Promise<void> };
   gitSignalDebouncer?: SignalDebouncer;
   watcher?: Watcher;
   safetyTimer?: ReturnType<typeof setTimeout>;
@@ -55,7 +55,7 @@ test.skipIf(process.platform !== "linux")(
       fs.mkdirSync(repo);
       await new Promise((resolve) => setTimeout(resolve, 250));
       await exec("git", ["-C", repo, "init", "--initial-branch=main", "--quiet"], { env: GIT_ENV });
-      await waitFor(() => (daemon.gitRefRegistry?.activeHandles ?? 0) >= 4);
+      await waitFor(() => (daemon.gitDiscovery.registry?.activeHandles ?? 0) >= 4);
       await new Promise((resolve) => setTimeout(resolve, 650)); // drain the arm handshake batch
       expect(daemon.want.push).toBe(true);
 
@@ -77,7 +77,7 @@ test.skipIf(process.platform !== "linux")(
       if (daemon.safetyTimer) clearTimeout(daemon.safetyTimer);
       if (daemon.deepTimer) clearInterval(daemon.deepTimer);
       await daemon.watcher?.close().catch(() => {});
-      await daemon.gitRefRegistry?.close().catch(() => {});
+      await daemon.gitDiscovery.close().catch(() => {});
       daemon.gitSignalDebouncer?.dispose();
       fs.rmSync(root, { recursive: true, force: true });
     }
