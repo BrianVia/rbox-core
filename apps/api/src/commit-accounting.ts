@@ -37,9 +37,13 @@ export const MAX_REFS_PER_TXN = 3_000;
 // Validate IN-list SELECTs (≤90 refs each) grouped per db.batch() — one subrequest per group.
 export const VALIDATE_IN_LIST_CHUNK = 90;
 export const SELECTS_PER_BATCH = Math.ceil(MAX_REFS_PER_TXN / VALIDATE_IN_LIST_CHUNK); // ~34
-// Worst mixed chunk: 5 logical-accounting statements + 3 pack-location
-// subchunks (ceil(33/13)) + 1 canonical-location delete.
-export const ACCOUNTING_STATEMENTS_PER_CHUNK = 9;
+// Worst mixed chunk: 5 logical-accounting statements + 1 canonical-location
+// delete. Packed placements are grouped separately across the whole transaction.
+export const ACCOUNTING_STATEMENTS_PER_CHUNK = 6;
+// 2,000 compact rows (two 64-hex shas, a 32-hex pack id, offset, length) measure
+// ~484 KB — roughly 4x under D1's documented 2,000,000-byte string/bound-value
+// limit. `packed` is itself bounded by MAX_REFS_PER_TXN, so no chunk exceeds this.
+export const PACKED_PLACEMENT_CHUNK = 2_000;
 // §71: hard sanity reject on the ACCOUNTED ref set in one commit. For sidecar commits the
 // signed descriptor's data-ref count is not the full accounting set: encManifestSha and
 // sidecarSha are charged/granted too. Keep the carrier count named so a future carrier changes
@@ -180,6 +184,8 @@ export async function commitAccounting(
   // so a later chunk's NOT-EXISTS still sees earlier chunks' grants (no double-charge).
   for (const superBatch of chunk(newRefs, MAX_REFS_PER_TXN)) {
     const stmts: D1PreparedStatement[] = [];
+    const canonicalDeletes: D1PreparedStatement[] = [];
+    const packed = superBatch.filter((ref): ref is RefWithSize & { pack: PackPlacement } => ref.pack !== undefined);
     for (const c of chunk(superBatch, ACCOUNTING_INSERT_CHUNK)) {
       const shas = c.map((r) => r.sha);
       const inList = shas.map(() => "?").join(",");
@@ -217,29 +223,42 @@ export async function commitAccounting(
       // the ON CONFLICT UPDATE above, but `granted_at` is NOT the barrier — the marker is.
       stmts.push(db.prepare(`DELETE FROM blob_ref_candidates WHERE account_id = ? AND sha256 IN (${inList})`).bind(accountId, ...shas));
 
-      const packed = c.filter((ref): ref is RefWithSize & { pack: PackPlacement } => ref.pack !== undefined);
-      for (const locations of chunk(packed, 13)) {
-        stmts.push(
-          db
-            .prepare(
-              `INSERT INTO blob_locations (sha256, storage, pack_id, offset, length, pack_sha256, installed_at)
-               VALUES ${locations.map(() => "(?,'pack',?,?,?,?,?)").join(",")}
-               ON CONFLICT(sha256) DO UPDATE SET
-                 pack_id=excluded.pack_id, offset=excluded.offset, length=excluded.length,
-                 pack_sha256=excluded.pack_sha256, installed_at=excluded.installed_at`,
-            )
-            .bind(...locations.flatMap((ref) => [ref.sha, ref.pack.packId, ref.pack.offset, ref.pack.length, ref.pack.packSha256, nowMs])),
-        );
-      }
       const canonical = c.filter((ref) => ref.pack === undefined).map((ref) => ref.sha);
       if (canonical.length > 0) {
-        stmts.push(
+        canonicalDeletes.push(
           db
             .prepare(`DELETE FROM blob_locations WHERE sha256 IN (${canonical.map(() => "?").join(",")})`)
             .bind(...canonical),
         );
       }
     }
+    for (const locations of chunk(packed, PACKED_PLACEMENT_CHUNK)) {
+      const rows = locations.map((ref) => ({
+        sha256: ref.sha,
+        pack_id: ref.pack.packId,
+        offset: ref.pack.offset,
+        length: ref.pack.length,
+        pack_sha256: ref.pack.packSha256,
+      }));
+      stmts.push(
+        db
+          .prepare(
+            `INSERT INTO blob_locations (sha256, storage, pack_id, offset, length, pack_sha256, installed_at)
+             SELECT j.value->>'$.sha256', 'pack', j.value->>'$.pack_id',
+                    CAST(j.value->>'$.offset' AS INTEGER), CAST(j.value->>'$.length' AS INTEGER),
+                    j.value->>'$.pack_sha256', ${nowMs}
+             FROM json_each(?) AS j
+             WHERE true
+             ON CONFLICT(sha256) DO UPDATE SET
+               pack_id=excluded.pack_id, offset=excluded.offset, length=excluded.length,
+               pack_sha256=excluded.pack_sha256, installed_at=excluded.installed_at`,
+          )
+          .bind(JSON.stringify(rows)),
+      );
+    }
+    // Preserve placement-before-canonical trigger ordering: a destination pack
+    // must not look transiently empty while another row is moving into it.
+    stmts.push(...canonicalDeletes);
 
     try {
       // `db` is the §25 span-wrapped binding — the Proxy times+counts batch() itself,

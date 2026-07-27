@@ -9,7 +9,7 @@ import {
   encodePackHeader,
   type PackDirEntry,
 } from "../../../src/engine/blob-pack.js";
-import { commitAccounting, isDeleteFenceAbort, validateCommitRefs } from "../src/commit-accounting.js";
+import { ACCOUNTING_INSERT_CHUNK, commitAccounting, isDeleteFenceAbort, validateCommitRefs } from "../src/commit-accounting.js";
 import { blobGet } from "../src/blobs.js";
 import { WorkspaceSync } from "../src/workspace-sync.js";
 
@@ -107,6 +107,49 @@ async function location(sha: string) {
   return db().prepare("SELECT pack_id,offset,length,pack_sha256 FROM blob_locations WHERE sha256=?").bind(sha).first<{
     pack_id: string; offset: number; length: number; pack_sha256: string;
   }>();
+}
+
+interface InventoryMember {
+  sha256: string;
+  offset: number;
+  length: number;
+}
+
+async function seedReadyPack(packId: string, packSha256: string, members: InventoryMember[]): Promise<void> {
+  const nowMs = Date.now();
+  const sizeBytes = members.reduce((max, member) => Math.max(max, member.offset + member.length), 0);
+  await db().batch([
+    db()
+      .prepare("INSERT INTO packs(pack_id,pack_sha256,size_bytes,member_count,state,created_at,touched_at) VALUES(?,?,?,?,'ready',?,?)")
+      .bind(packId, packSha256, sizeBytes, members.length, nowMs, nowMs),
+    db()
+      .prepare(
+        `INSERT INTO pack_members(pack_id,sha256,offset,length)
+         SELECT ?, j.value->>'$.sha256',
+                CAST(j.value->>'$.offset' AS INTEGER), CAST(j.value->>'$.length' AS INTEGER)
+         FROM json_each(?) AS j`,
+      )
+      .bind(packId, JSON.stringify(members)),
+  ]);
+}
+
+function countPlacementStatements(realDb: D1Database): { db: D1Database; count: () => number } {
+  let placementStatements = 0;
+  return {
+    db: new Proxy(realDb, {
+      get(target, prop) {
+        if (prop === "prepare") {
+          return (sql: string) => {
+            if (sql.includes("INSERT INTO blob_locations")) placementStatements++;
+            return target.prepare(sql);
+          };
+        }
+        const value = target[prop as keyof D1Database];
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }),
+    count: () => placementStatements,
+  };
 }
 
 describe("design 114 receipt placement accounting", () => {
@@ -236,5 +279,215 @@ describe("design 114 receipt placement accounting", () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ granted: 2048, alreadyEntitled: 0, rejected: 0 });
     expect(Number((await db().prepare("SELECT COUNT(*) n FROM blob_locations WHERE pack_id=?").bind(pack.id).first())!.n)).toBe(2048);
+  });
+
+  test("accounting installs and updates 2050 packed placements in two JSON batches", async () => {
+    const a = await bootstrap("pack-accounting-json-2050");
+    const refs = Array.from({ length: 2050 }, (_, i) => ({
+      sha: hash(`json-placement-${i}`),
+      size: 17 + (i % 29),
+    }));
+    const firstPacks = [
+      { id: nextId(), sha: hash("json-placement-pack-a") },
+      { id: nextId(), sha: hash("json-placement-pack-b") },
+    ];
+    const secondPacks = [
+      { id: nextId(), sha: hash("json-placement-pack-c") },
+      { id: nextId(), sha: hash("json-placement-pack-d") },
+    ];
+    const placement = (
+      ref: (typeof refs)[number],
+      index: number,
+      packs: typeof firstPacks,
+      generation: number,
+    ) => {
+      const pack = packs[index < 2048 ? 0 : 1]!;
+      return {
+        sha: ref.sha,
+        size: ref.size,
+        pack: {
+          packId: pack.id,
+          offset: generation * 1_000_000 + index * 53 + 64,
+          length: ref.size,
+          packSha256: pack.sha,
+        },
+      };
+    };
+    const firstRefs = refs.map((ref, i) => placement(ref, i, firstPacks, 1));
+    const secondRefs = refs.map((ref, i) => placement(ref, i, secondPacks, 2));
+    for (const [packIndex, pack] of firstPacks.entries()) {
+      const packRefs = firstRefs.slice(packIndex === 0 ? 0 : 2048, packIndex === 0 ? 2048 : undefined);
+      await seedReadyPack(pack.id, pack.sha, packRefs.map((ref) => ({
+        sha256: ref.sha,
+        offset: ref.pack.offset,
+        length: ref.pack.length,
+      })));
+    }
+    for (const [packIndex, pack] of secondPacks.entries()) {
+      const packRefs = secondRefs.slice(packIndex === 0 ? 0 : 2048, packIndex === 0 ? 2048 : undefined);
+      await seedReadyPack(pack.id, pack.sha, packRefs.map((ref) => ({
+        sha256: ref.sha,
+        offset: ref.pack.offset,
+        length: ref.pack.length,
+      })));
+    }
+
+    const firstNow = 1_000_000_000;
+    const firstCounted = countPlacementStatements(db());
+    expect(await commitAccounting(firstCounted.db, a.accountId, firstRefs, firstNow)).toEqual({ ok: true });
+    expect(firstCounted.count()).toBe(2);
+    const targetShas = JSON.stringify(refs.map((ref) => ref.sha));
+    expect(Number((await db()
+      .prepare("SELECT COUNT(*) n FROM blob_locations WHERE sha256 IN (SELECT value FROM json_each(?))")
+      .bind(targetShas)
+      .first())!.n)).toBe(2050);
+
+    const assertPlacements = async (
+      expectedRefs: typeof firstRefs,
+      installedAt: number,
+    ) => {
+      // 1999/2000 straddle the PACKED_PLACEMENT_CHUNK JSON seam; 2048/2049 straddle
+      // the pack boundary this test introduces. Both pairs must agree.
+      for (const index of [0, 1025, 1999, 2000, 2048, 2049]) {
+        const expected = expectedRefs[index]!;
+        expect(await db()
+          .prepare("SELECT storage,pack_id,offset,length,pack_sha256,installed_at FROM blob_locations WHERE sha256=?")
+          .bind(expected.sha)
+          .first()).toEqual({
+          storage: "pack",
+          pack_id: expected.pack.packId,
+          offset: expected.pack.offset,
+          length: expected.pack.length,
+          pack_sha256: expected.pack.packSha256,
+          installed_at: installedAt,
+        });
+      }
+    };
+    await assertPlacements(firstRefs, firstNow);
+
+    const secondNow = firstNow + 1;
+    const secondCounted = countPlacementStatements(db());
+    expect(await commitAccounting(secondCounted.db, a.accountId, secondRefs, secondNow)).toEqual({ ok: true });
+    expect(secondCounted.count()).toBe(2);
+    expect(Number((await db()
+      .prepare("SELECT COUNT(*) n FROM blob_locations WHERE sha256 IN (SELECT value FROM json_each(?))")
+      .bind(targetShas)
+      .first())!.n)).toBe(2050);
+    expect(Number((await db()
+      .prepare("SELECT COUNT(*) n FROM blob_locations WHERE pack_id IN (?,?)")
+      .bind(firstPacks[0]!.id, firstPacks[1]!.id)
+      .first())!.n)).toBe(0);
+    await assertPlacements(secondRefs, secondNow);
+  });
+
+  test("mixed packed and canonical accounting deletes the canonical placement", async () => {
+    const a = await bootstrap("pack-accounting-json-mixed");
+    const packedSha = hash("json-mixed-packed");
+    const canonicalSha = hash("json-mixed-canonical");
+    const destinationPack = { id: nextId(), sha: hash("json-mixed-destination-pack") };
+    const sourcePack = { id: nextId(), sha: hash("json-mixed-source-pack") };
+    const destinationMembers = [
+      { sha256: packedSha, offset: 64, length: 21 },
+      { sha256: canonicalSha, offset: 85, length: 24 },
+    ];
+    const sourceMember = { sha256: packedSha, offset: 512, length: 21 };
+    await seedReadyPack(destinationPack.id, destinationPack.sha, destinationMembers);
+    await seedReadyPack(sourcePack.id, sourcePack.sha, [sourceMember]);
+    expect(await commitAccounting(db(), a.accountId, [
+      {
+        sha: packedSha,
+        size: sourceMember.length,
+        pack: {
+          packId: sourcePack.id,
+          offset: sourceMember.offset,
+          length: sourceMember.length,
+          packSha256: sourcePack.sha,
+        },
+      },
+      {
+        sha: canonicalSha,
+        size: destinationMembers[1]!.length,
+        pack: {
+          packId: destinationPack.id,
+          offset: destinationMembers[1]!.offset,
+          length: destinationMembers[1]!.length,
+          packSha256: destinationPack.sha,
+        },
+      },
+    ], 2_000_000_000)).toEqual({ ok: true });
+
+    expect(await commitAccounting(db(), a.accountId, [
+      {
+        sha: packedSha,
+        size: destinationMembers[0]!.length,
+        pack: {
+          packId: destinationPack.id,
+          offset: destinationMembers[0]!.offset,
+          length: destinationMembers[0]!.length,
+          packSha256: destinationPack.sha,
+        },
+      },
+      { sha: canonicalSha, size: destinationMembers[1]!.length },
+    ], 2_000_000_001)).toEqual({ ok: true });
+
+    expect(await location(packedSha)).toEqual({
+      pack_id: destinationPack.id,
+      offset: destinationMembers[0]!.offset,
+      length: destinationMembers[0]!.length,
+      pack_sha256: destinationPack.sha,
+    });
+    expect(await location(canonicalSha)).toBeNull();
+    expect(await db()
+      .prepare("SELECT 1 FROM pack_gc_candidates WHERE pack_id=?")
+      .bind(destinationPack.id)
+      .first()).toBeNull();
+  });
+
+  // Regression: the canonical DELETE and the packed INSERT for the SAME pack must
+  // not be reordered across ACCOUNTING_INSERT_CHUNK boundaries. Before design 210
+  // the placement inserts were emitted per 33-ref chunk, so a chunk-0 canonical
+  // delete that emptied pack A ran BEFORE the chunk-1 insert that refilled it —
+  // firing blob_locations_delete_pack_candidate and leaving a spurious
+  // pack_gc_candidates row. That row transiently fences every read/PUT of a live
+  // pack (blob-pack.ts fenceRead) until pack GC unmarks it. Grouping all placement
+  // inserts ahead of all canonical deletes removes the window.
+  test("canonical delete and packed insert for one pack in different chunks leave no GC candidate", async () => {
+    const a = await bootstrap("pack-accounting-cross-chunk-order");
+    const pack = { id: nextId(), sha: hash("cross-chunk-order-pack") };
+    const leaving = hash("cross-chunk-leaving");
+    const arriving = hash("cross-chunk-arriving");
+    const members = [
+      { sha256: leaving, offset: 64, length: 10 },
+      { sha256: arriving, offset: 74, length: 12 },
+    ];
+    await seedReadyPack(pack.id, pack.sha, members);
+
+    // `leaving` starts as the pack's only placement, so removing it empties pack A.
+    expect(await commitAccounting(db(), a.accountId, [
+      { sha: leaving, size: 10, pack: { packId: pack.id, offset: 64, length: 10, packSha256: pack.sha } },
+    ], 3_000_000_000)).toEqual({ ok: true });
+    expect((await location(leaving))?.pack_id).toBe(pack.id);
+
+    // ACCOUNTING_INSERT_CHUNK is 33: `leaving` plus 32 fillers fill chunk 0, so the
+    // canonical delete lands a whole chunk before `arriving`'s placement insert.
+    const refs = [
+      { sha: leaving, size: 10 },
+      ...Array.from({ length: ACCOUNTING_INSERT_CHUNK - 1 }, (_, i) => ({ sha: hash(`cross-chunk-filler-${i}`), size: 5 })),
+      { sha: arriving, size: 12, pack: { packId: pack.id, offset: 74, length: 12, packSha256: pack.sha } },
+    ];
+    expect(refs.length).toBe(ACCOUNTING_INSERT_CHUNK + 1);
+    expect(await commitAccounting(db(), a.accountId, refs, 3_000_000_001)).toEqual({ ok: true });
+
+    expect(await location(leaving)).toBeNull();
+    expect(await location(arriving)).toEqual({
+      pack_id: pack.id,
+      offset: 74,
+      length: 12,
+      pack_sha256: pack.sha,
+    });
+    expect(await db()
+      .prepare("SELECT 1 FROM pack_gc_candidates WHERE pack_id=?")
+      .bind(pack.id)
+      .first()).toBeNull();
   });
 });

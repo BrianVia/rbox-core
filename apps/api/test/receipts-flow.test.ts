@@ -10,6 +10,7 @@ import {
   MAX_RECEIPTS_PER_REDEEM,
   MAX_REFS_PER_COMMIT,
   MAX_REFS_PER_TXN,
+  PACKED_PLACEMENT_CHUNK,
   receiptRedeemMax,
   SELECTS_PER_BATCH,
   VALIDATE_IN_LIST_CHUNK,
@@ -350,7 +351,9 @@ describe("§23.4 commit accounting (direct-write: catalog present=1 + charge + g
 
 describe("design 71 receipt redemption and ref-scale guards", () => {
   test("static budget math stays inside the documented margins", () => {
-    const statementsPerAccountingTxn = Math.ceil(MAX_REFS_PER_TXN / ACCOUNTING_INSERT_CHUNK) * ACCOUNTING_STATEMENTS_PER_CHUNK;
+    const statementsPerAccountingTxn =
+      Math.ceil(MAX_REFS_PER_TXN / ACCOUNTING_INSERT_CHUNK) * ACCOUNTING_STATEMENTS_PER_CHUNK
+      + Math.ceil(MAX_REFS_PER_TXN / PACKED_PLACEMENT_CHUNK);
     const maxParams = Math.max(
       ACCOUNTING_INSERT_CHUNK * 3,
       VALIDATE_IN_LIST_CHUNK + 1,
@@ -361,9 +364,9 @@ describe("design 71 receipt redemption and ref-scale guards", () => {
     const accountingSubrequests = Math.ceil(MAX_REFS_PER_COMMIT / MAX_REFS_PER_TXN);
     const commitPathSubrequestsAtMax = preflightSubrequests + validateSubrequests + accountingSubrequests + 1; // D1 mirror
 
-    // Design 114 adds up to four placement statements per 33-ref chunk while
+    // Design 210 groups packed placements across the whole super-batch while
     // preserving the existing whole-super-batch failure unit.
-    expect(statementsPerAccountingTxn).toBe(819);
+    expect(statementsPerAccountingTxn).toBe(548);
     expect(maxParams).toBeLessThanOrEqual(99);
     expect(commitPathSubrequestsAtMax).toBeLessThanOrEqual(300);
     expect(MAX_RECEIPTS_PER_REDEEM).toBeLessThanOrEqual(5_000);
