@@ -303,13 +303,17 @@ removed; the redacted result is retained at
   (SafetyCadenceClock seam + ManualRecoveryClock) with assertions unchanged;
   looped 10x green.
 
-## src/engine/git-state.test.ts — "detached pointer captures use detached HEAD as basis for scoped chains"
+## src/engine/git-state.test.ts — RECURRING under CI sharding (2 distinct tests, 2 nights' PRs)
 
-- 2026-07-26: failed once on CI shard 4/6 (PR #478, a status-only diff that
-  cannot reach engine git capture), 252ms fail. Proof: green in isolation
-  locally (24/24 same file), green on CI rerun of the failed shard. Class:
-  real-git subprocess timing under shard parallelism. One observation —
-  watch for recurrence before any quarantine.
+- 2026-07-26: "detached pointer captures use detached HEAD as basis" failed
+  once on shard 4/6 (PR #478, status-only diff). Green isolation + rerun.
+- 2026-07-27: "current incremental link is imported even when recorded
+  commit tips are already present" failed on shard 5/6 (PR #491, daemon
+  observation diff — no plausible path). Green isolation + rerun.
+- Class: real-git subprocess timing under shard parallelism, file-level.
+  QUEUED FIX: convert the file's timing-sensitive fixtures to the injected
+  seam pattern that resolved the daemon-activity flakes (PR #403), or give
+  the file a dedicated anti-affinity shard slot.
 
 ## rig git-join-ahead — fixture setup "linked-worktree source is refused" (RESOLVED — not a flake)
 
