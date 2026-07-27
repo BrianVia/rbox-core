@@ -16,6 +16,7 @@ import { enrolledDeviceId } from "./e2ee-keystore.js";
 import { resolveWorkspaceDeviceId } from "./init-plan.js";
 import { RebindConsentRequiredError } from "./reset-consent.js";
 import { assertNoPendingGenesis } from "./e2ee-client.js";
+import { rememberBinding } from "./binding-registry.js";
 
 export interface TrackResult {
   cfg: WorkspaceConfig;
@@ -135,6 +136,13 @@ export async function track(
     };
     await saveConfig(root, next);
     return next;
+  });
+  // Design 211: this machine's durable record of the binding, so `rbox status
+  // --all` can find a tracked folder that never started background sync.
+  await rememberBinding(root, {
+    remoteWorkspaceId: cfg.remoteWorkspaceId,
+    ...(cfg.name ? { name: cfg.name } : {}),
+    ...(creds?.accountId ? { accountId: creds.accountId } : {}),
   });
   return { cfg, root };
 }

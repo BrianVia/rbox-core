@@ -41,6 +41,7 @@ import { acknowledgeCacheGeneration } from "./adopt-cache.js";
 import { DirCache, HashCache } from "../engine/index.js";
 import type { AdoptJournal } from "./adopt-journal.js";
 import { genesisClassifierConsultationNeeded } from "./genesis-enrollment.js";
+import { rememberBinding } from "./binding-registry.js";
 import { summarizeCaseCollisions } from "./sync-cmd.js";
 
 export const WORKSPACE_DEFINITION =
@@ -489,6 +490,13 @@ async function executeInitPlan(
       if (adoptionJournal.phase === "paused") throw new Error("adoption paused while retaining source; run `rbox adopt status|resume|abort`");
     }
     await saveConfig(plan.root, cfg);
+    // Design 211: record the binding for `rbox status --all` / `doctor --all`.
+    // `setup` (guided and keyed) binds through here, so this one call covers it.
+    await rememberBinding(plan.root, {
+      remoteWorkspaceId: cfg.remoteWorkspaceId,
+      ...(cfg.name ? { name: cfg.name } : {}),
+      ...(creds.accountId ? { accountId: creds.accountId } : {}),
+    });
 
     // 4. This workspace is end-to-end encrypted: the server stores only ciphertext.
     process.stderr.write(`${stderrStyle.dim("this workspace is end-to-end encrypted — the server never sees your file names or contents.")}\n`);

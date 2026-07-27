@@ -88,8 +88,9 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "status",
     group: "GETTING STARTED",
     summary: "workspace + background-sync state",
-    usage: "rbox status [path] [--json | --verbose | --git]",
+    usage: "rbox status [path] [--all] [--json | --verbose | --git]",
     flags: [
+      { flag: "--all", desc: "show every locally known workspace (cannot be combined with a path)" },
       { flag: "--json", desc: "print JSON" },
       { flag: "--verbose", desc: "print the complete legacy status detail" },
       { flag: "--git", desc: "show per-repository Git deferral detail" },
@@ -531,8 +532,9 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "doctor",
     group: "BILLING & MAINTENANCE",
     summary: "explain what is stuck and how to fix it, in plain English",
-    usage: "rbox doctor [reset-journal] [path] [--json | --report | --residue-bytes | --quarantine | --restore <bundle>]",
+    usage: "rbox doctor [reset-journal] [path] [--all] [--json | --report | --residue-bytes | --quarantine | --restore <bundle>]",
     flags: [
+      { flag: "--all", desc: "check every locally known workspace (cannot be combined with a path)" },
       { flag: "--json", desc: "print the findings as JSON (outside a workspace, the all-workspaces summary)" },
       { flag: "--report", desc: "build and print the support report locally" },
       { flag: "--residue-bytes", desc: "measure known Git quarantine and conflict directories" },

@@ -24,6 +24,7 @@ import { RBOX_DIR } from "./config.js";
 import { forceKill, isDaemonRunning, removeDaemonRuntime, stopDaemon, waitForExit } from "./daemon-control.js";
 import { style } from "./style.js";
 import { loadAdoptJournal } from "./adopt-journal.js";
+import { forgetBinding, isRegisteredRoot } from "./binding-registry.js";
 
 const STOP_TIMEOUT_MS = 5000;
 const KILL_TIMEOUT_MS = 2000;
@@ -83,11 +84,28 @@ export async function untrack(opts: UntrackOptions): Promise<void> {
   // 2. Remove the binding, but only after proving the path is exactly <root>/.rbox
   //    and not a symlink (defeats a swapped/symlinked `.rbox` pointing elsewhere).
   const rboxPath = path.join(root, RBOX_DIR);
+  const bindingGone = !(await fsp.lstat(rboxPath).then(() => true, () => false));
+  if (bindingGone) {
+    // The binding is already gone (the folder was deleted, moved, or cleaned by
+    // hand) but the local registry still lists it. This is the ONLY way to clear
+    // the `missing` rows `rbox status --all` / `doctor --all` report, so untrack
+    // forgets the entry instead of dead-ending on "nothing to untrack".
+    const known = await isRegisteredRoot(root);
+    await forgetBinding(root);
+    await removeDaemonRuntime(root);
+    if (!known) throw new Error(`no rbox binding at ${rboxPath} — nothing to untrack`);
+    console.log(`${style.sym.ok} forgot ${root}`);
+    console.log(style.dim("  its rbox binding was already gone; this machine no longer lists it."));
+    return;
+  }
   await removeRboxDir(root, rboxPath);
 
   // The daemon's pid/log live globally under ~/.rbox — remove them too so untrack
   // leaves nothing orphaned outside the workspace.
   await removeDaemonRuntime(root);
+  // Design 211: drop the durable binding record so the aggregate views stop
+  // listing this root at all (rather than listing it as a stale binding).
+  await forgetBinding(root);
 
   console.log(`${style.sym.ok} untracked ${root}`);
   console.log(style.dim("  local files are untouched."));
