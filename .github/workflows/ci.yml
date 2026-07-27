@@ -117,7 +117,7 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         if: needs.changes.outputs.run_ci == 'true'
         with:
-          bun-version: "1.3.14"
+          bun-version: "canary"
       # `bun run typecheck` shells out to `tsc`, whose node shebang otherwise picks
       # up the self-hosted runner image's ancient system Node (v10, no `??`). Pin a
       # modern Node on PATH so tsc runs the same here as on GitHub-hosted runners.
@@ -191,7 +191,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: "1.3.14"
+          bun-version: "canary"
       - name: Install (frozen, all platforms)
         # --os=*/--cpu=* mirrors the release legs: the probe self-compiles, and
         # bun's bundler must resolve ALL THREE literal @parcel/watcher platform
@@ -310,7 +310,7 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         if: steps.regress-changes.outputs.changed == 'true'
         with:
-          bun-version: "1.3.14"
+          bun-version: "canary"
 
       - name: Cache bun install store
         if: steps.regress-changes.outputs.changed == 'true'
@@ -355,7 +355,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: "1.3.14"
+          bun-version: "canary"
       - name: Install (frozen, all platforms)
         run: bun install --frozen-lockfile --os=* --cpu=*
       - name: Cross-build all release targets
@@ -394,7 +394,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: "1.3.14"
+          bun-version: "canary"
       - name: Download exact candidate binaries
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -437,7 +437,7 @@ jobs:
           path: baseline
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: "1.3.14"
+          bun-version: "canary"
       - name: Download exact candidate binaries
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -465,7 +465,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: "1.3.14"
+          bun-version: "canary"
       - name: Install (frozen)
         run: bun install --frozen-lockfile
       - name: Download exact candidate binaries

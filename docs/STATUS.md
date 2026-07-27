@@ -35,9 +35,16 @@ compiled crypto-pool exit test sane (#270 class clear). ONE real finding →
 errors and exposed a genuine fd leak — secureMoveNoReplace stranded the
 source parent handle whenever the destination O_NOFOLLOW walk refused
 (escape tests / hostile workspace); one fd per failed adoption move on
-stable. remote-repository-deletion.ts audited clean. Posture: fleet keeps
-building with STABLE bun until 1.4.0 ships; consider a periodic canary
-suite run for early warning._
+stable. remote-repository-deletion.ts audited clean. POSTURE (founder call,
+same day, superseding the initial stable-until-release stance): **canary is
+now the MAIN bun on all three hosts** (`bun upgrade --canary`; desktop +
+Mac + FM all 1.4.0-canary) — future dev builds are canary-compiled; revert
+per-host with `bun upgrade --stable` (1.3.14) if a canary regression bites.
+Daemons were NOT rebuilt/restarted for this — they pick up canary-compiled
+binaries at the next normal fleet build. CI/release/deploy-api workflows
+repinned `bun-version: "1.3.14"` → `"canary"` (all 11 sites) — NOTE this
+makes CI and any future tagged release build on a MOVING nightly; if a
+canary regression lands upstream, repin the workflows first._
 
 _Day-session riders (2026-07-27 morning): **#497 killed the three registered
 CI flakes** — root causes proven from CI attempt-1 logs (pull failed

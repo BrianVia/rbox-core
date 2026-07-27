@@ -1,0 +1,25 @@
+Verdict: **CHANGES-REQUIRED**
+
+1. **HIGH — The sweep is not race-safe or containment-safe as specified.**  
+   `lstat` followed by path-based traversal does not pin the inspected directory. An attacker/concurrent process can replace an already-inspected ancestor with a symlink before `readdir` or `rmdir`; subsequent operations resolve through that symlink and can remove empty directories outside `repoDir`. `assertWithinRoot` is another check-then-use operation and does not close this race ([fsutil.ts](/home/via/Development/Personal/rbox-core/.claude/worktrees/pull-fast-path/src/engine/fsutil.ts:150)). The cited adoption precedent is materially stronger: it opens the parent, checks inode/birthtime identity, and performs `rmdir` relative to that pinned handle ([adopt-fs.ts](/home/via/Development/Personal/rbox-core/.claude/worktrees/pull-fast-path/src/cli/adopt-fs.ts:179)). Concurrent replacement with a newly created empty directory can also delete that new directory, disproving “worst race outcome: a directory survives.” Require an anchored dirfd/open-handle traversal with no-follow opens and identity validation, or weaken the loss-proof claim and reject the mechanism.
+
+2. **HIGH — `match` cannot support “identical to what was synced; safe to delete.”**  
+   Normally, `removedMem[rel]` is stamped from the live repository at removal time ([apply.ts](/home/via/Development/Personal/rbox-core/.claude/worktrees/pull-fast-path/src/cli/sync-git/apply.ts:720)). A local commit made before removal is therefore incorporated into both the memory and a later `match`. Moreover, `gitIdentityKey` only covers HEAD, index tree, selected refs, and operation state; it excludes config, hooks, reflog-only/unreachable objects, and other `.git` contents ([identity.ts](/home/via/Development/Personal/rbox-core/.claude/worktrees/pull-fast-path/src/engine/git/identity.ts:90)). Thus `match` means, at most, “the sync identity currently equals the removal-time fingerprint,” not “equal to synced state” or “safe to delete.” The proposed `rm -rf` recommendation recreates r1’s unsafe authorization inference. Keep the verdict informational and neutral, or store an independent pre-removal synced comparison—but even that must not authorize deletion given the identity blind spots.
+
+3. **MEDIUM — `gitReposRemoved` is not a complete index of repo residue.**  
+   Removal memory is created only when `.git` exists ([apply.ts](/home/via/Development/Personal/rbox-core/.claude/worktrees/pull-fast-path/src/cli/sync-git/apply.ts:734)). It is later pruned whenever `.git` disappears, regardless of a surviving `<repo>/.rbox` or empty skeleton ([plan.ts](/home/via/Development/Personal/rbox-core/.claude/worktrees/pull-fast-path/src/cli/sync-git/plan.ts:424)). Therefore doctor will miss:
+
+   - residue where `.git` was already absent at removal;
+   - `.rbox` residue after the user removes only `.git` and another push prunes the memory;
+   - any skeleton surviving without removal memory.
+
+   A separate durable residue tombstone/candidate index is needed if doctor claims to “show the rest.” Also, sizing only `<workspace>/.rbox/git-quarantine` exposes class 4, not repo-local class-3 quarantine growth.
+
+4. **LOW — Several factual statements need correction, though the descoping decisions remain sound.**
+
+   - “Stamped from the same live identity” and “equality always passes” omit the busy-repository exception, which stamps a projected base identity instead ([apply.ts](/home/via/Development/Personal/rbox-core/.claude/worktrees/pull-fast-path/src/cli/sync-git/apply.ts:735)).
+   - Journal keys are not “never auto-deleted”; normal published recovery and successful checkout completion clear them ([follow.ts](/home/via/Development/Personal/rbox-core/.claude/worktrees/pull-fast-path/src/cli/sync-git/follow.ts:337), [journal.ts](/home/via/Development/Personal/rbox-core/.claude/worktrees/pull-fast-path/src/engine/git/journal.ts:213)).
+   - Journal-retired `.git` trees are timestamp/full-hash entries directly under `git-quarantine`, while ORIG_HEAD bytes use a `<sha16>/` directory; they share an ancestor, not the same `<sha16>` layout ([journal.ts](/home/via/Development/Personal/rbox-core/.claude/worktrees/pull-fast-path/src/engine/git/journal.ts:450), [orig-head.ts](/home/via/Development/Personal/rbox-core/.claude/worktrees/pull-fast-path/src/cli/sync-git/orig-head.ts:55)).
+   - The 2-GiB trash cap is the default, not the fixed maximum; configuration permits up to 1 TiB ([workspace-config.ts](/home/via/Development/Personal/rbox-core/.claude/worktrees/pull-fast-path/src/cli/workspace-config.ts:66)).
+
+Journal-key clearing itself is aligned: journal recovery precedes every removal arm; unresolved/corrupt recovery defers, recoverable state is landed or quarantined, and resurrection creates a fresh journal rather than depending on the removed key.

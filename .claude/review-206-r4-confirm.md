@@ -1,0 +1,10 @@
+1. **(a) Permanent P1-down is expressible cleanly.** The existing terminal `fused` state suffices: `watcherTrustedForPull()` requires `trustState === "trusted"`, while clean-scan re-trust only transitions from `suspect`. Setting `fused` for coverage downgrade therefore cannot be undone, while ordinary transient errors can continue using `suspect → trusted`. Emit the named downgrade through the transition path to avoid duplicate logging; separately guard the log if already fused.
+
+2. **(b) Parcel comparison has a material false negative.** `nativePruneGlobs()` always retains the native `node_modules` prune through `ALWAYS_NATIVE_PRUNE`, even when `.rboxignore` contains `!node_modules/`. Yet `buildIgnoreMatcher()` then reports both `ignores("node_modules/x.txt") === false` and `prunes("node_modules/") === false`. Thus matcher-visible coverage expands while the native-glob output remains unchanged, leaving the Parcel watcher blind without triggering downgrade. This needs either:
+
+   - removing overridable `node_modules` from `ALWAYS_NATIVE_PRUNE`, making the output comparison complete; or
+   - comparing a richer subscription-soundness fingerprint and adding this case to test 8b.
+
+3. **(c) §1/§2 and tests 1–2 contradict the Chokidar rule.** Those sections promise topology rebuilds heal back to trusted, but §3b says *any* Chokidar rebuild permanently downgrades P1. More concretely, `armed()` in [daemon-trusted-pull.test.ts](/home/via/Development/Personal/rbox-core/.claude/worktrees/pull-fast-path/src/cli/daemon/daemon-trusted-pull.test.ts:165) installs a Chokidar watcher. Therefore the topology rebuilds exercised by tests 1 and 2 would fuse it, making their expected return to `local=trusted` impossible. Qualify the healing claims as Parcel-with-unchanged-native-coverage and change those regression fixtures explicitly to Parcel; retain a separate Chokidar permanent-downgrade test.
+
+**Verdict: CHANGES-REQUIRED.**

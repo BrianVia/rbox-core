@@ -1,0 +1,20 @@
+1. **HIGH — Pull-only healing is not bounded by the 30-minute deep tick.**
+
+   The guarded `loadSyncBase` repair is sound once invoked: no sequence leaves the matcher stale past a successful pump-owned load. Pull completion loads at [daemon.ts:2289](/home/via/Development/Personal/rbox-core/.claude/worktrees/pull-fast-path/src/cli/daemon/daemon.ts:2289), push completion at [daemon.ts:1932](/home/via/Development/Personal/rbox-core/.claude/worktrees/pull-fast-path/src/cli/daemon/daemon.ts:1932), and failure recovery at [daemon.ts:1755](/home/via/Development/Personal/rbox-core/.claude/worktrees/pull-fast-path/src/cli/daemon/daemon.ts:1755).
+
+   The gap is that a next load is not guaranteed. Hygiene directly replaces `syncBase` via [daemon.ts:2343](/home/via/Development/Personal/rbox-core/.claude/worktrees/pull-fast-path/src/cli/daemon/daemon.ts:2343), while the pump binding uses `this.syncBase ?? loadSyncBase()` at [daemon.ts:1661](/home/via/Development/Personal/rbox-core/.claude/worktrees/pull-fast-path/src/cli/daemon/daemon.ts:1661). A deep scan calls `replaceManifestFromScan` without loading the base, so repeated 30-minute ticks can scan with the stale matcher indefinitely. A backstop pull normally heals this sooner, but the backstop is explicitly configurable to zero.
+
+   This can occur when hygiene’s CAS save/reload returns a concurrent winner with a changed manifest `gitRepos` set. Section 2’s stated pull-only bound is therefore false. The design needs to guarantee a later pump-owned refresh—for example, queue a pull/base-refresh on an observed key mismatch, or explicitly load/rebuild before the pull-only deep scan.
+
+2. **HIGH — The watcher facade does not update backend subscription exclusions.**
+
+   The facade fixes calls through the captured matcher object, but §3 incorrectly concludes that no watcher restart or trust downgrade is needed.
+
+   - Parcel’s native exclusions are computed once at subscription creation at [watcher.ts:382](/home/via/Development/Personal/rbox-core/.claude/worktrees/pull-fast-path/src/cli/daemon/watcher.ts:382). `nativePruneGlobs` reads the current ignore-rule negations at [ignore.ts:227](/home/via/Development/Personal/rbox-core/.claude/worktrees/pull-fast-path/src/engine/ignore.ts:227), so it is rule-text-dependent, despite being independent of the matcher object. If `.rboxignore` later adds `!dist/keep.txt`, a facade cannot recover events Parcel’s original native `**/dist/**` exclusion never delivers.
+   - Chokidar applies `matcher.prunes` during recursive watch admission at [watcher.ts:423](/home/via/Development/Personal/rbox-core/.claude/worktrees/pull-fast-path/src/cli/daemon/watcher.ts:423). Delegating the callback to a new matcher does not install watches inside an existing subtree excluded during startup. This matters for topology-driven trackedness changes because tracked membership can change pruning at [ignore.ts:473](/home/via/Development/Personal/rbox-core/.claude/worktrees/pull-fast-path/src/engine/ignore.ts:473).
+
+   After the proposed full scan stamps the new generation, all trust predicates can pass while the backend remains blind to later edits. Unlatching P7 makes that a reachable trusted-view failure. Section 3 needs a backend-aware re-arm/restart protocol with trust downgraded across the gap, or subscription exclusions that are invariant across matcher changes. Test 8’s fake watcher is insufficient; tests must exercise native-glob changes and Chokidar subtree admission.
+
+No additional issue was found with capture-at-observation-start: all full-workspace installs funnel through `replaceManifestFromScan` → `installManifest` at [daemon.ts:3022](/home/via/Development/Personal/rbox-core/.claude/worktrees/pull-fast-path/src/cli/daemon/daemon.ts:3022), while seed and incremental call sites remain non-authoritative. Capturing immediately before `scanManifest` and threading that captured value correctly rejects both mid-scan and post-scan/pre-install rebuilds. The `skip=refused` and other skip-token restructuring is also coherent.
+
+**Verdict: CHANGES-REQUIRED.**
