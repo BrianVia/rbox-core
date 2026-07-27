@@ -25,6 +25,20 @@ after wave 6 lands on the 163 track). Next-biggest agent-confusion
 surfaces (encore candidates for the next thermo-nuclear sweep, founder
 undecided): follow.ts 1784, plan.ts 1474._
 
+_Bun 1.4.0-canary validation (2026-07-27, founder-requested): canary
+1.4.0-canary.1 (the Rust-era major bump) installed SIDE-BY-SIDE in the
+session scratchpad (system bun stays 1.3.14 — `bun upgrade --canary`
+in-place would flip every session on the host). Full 6-shard suite GREEN
+under canary at wall parity (176s vs 172s stable); canary-compiled binary +
+compiled crypto-pool exit test sane (#270 class clear). ONE real finding →
+**#500 MERGED** (ebc6b7b6): canary treats GC-collected FileHandles as run
+errors and exposed a genuine fd leak — secureMoveNoReplace stranded the
+source parent handle whenever the destination O_NOFOLLOW walk refused
+(escape tests / hostile workspace); one fd per failed adoption move on
+stable. remote-repository-deletion.ts audited clean. Posture: fleet keeps
+building with STABLE bun until 1.4.0 ships; consider a periodic canary
+suite run for early warning._
+
 _Day-session riders (2026-07-27 morning): **#497 killed the three registered
 CI flakes** — root causes proven from CI attempt-1 logs (pull failed
 attempts via `gh api .../runs/<id>/attempts/1/jobs` BEFORE reruns overwrite
