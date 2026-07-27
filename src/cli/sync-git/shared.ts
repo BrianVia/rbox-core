@@ -103,6 +103,17 @@ export const carryMatrixMatches = (baseSec: GitSection, pfKind: GitRepoKind, ide
     : baseSec.refScope === "scoped"
       ? identityKey === gitIdentityKey(baseSec)
       : identityKey === projectedKey(baseSec, "scoped");
+/** Local-vs-base divergence, projected onto the narrower of the two scopes (§7).
+ *  No base → ANY local git identity is divergence-from-nothing (an independently
+ *  created local repo must never be clobbered). No local identity (no repo, empty
+ *  repo, deleted/unusable `.git`) → never diverged: there is no committed local work
+ *  to preserve, so a clean (re)materialization loses nothing. */
+export function localDivergedFromBase(localId: GitIdentity | undefined, base: GitSection | undefined): boolean {
+  if (!localId) return false;
+  if (!base) return true;
+  const n = narrowerScope(localId.refScope, base.refScope);
+  return projectedKey(localId, n) !== projectedKey(base, n);
+}
 export const gitReposManifestSchema = (gitRepos: Record<string, GitSection> | undefined): 2 | 3 | undefined =>
   gitRepos ? (Object.values(gitRepos).some((s) => (s.packChain?.length ?? 0) > 0) ? 3 : 2) : undefined;
 export const emptyToUndef = <T,>(o: Record<string, T>): Record<string, T> | undefined => (Object.keys(o).length ? o : undefined);
