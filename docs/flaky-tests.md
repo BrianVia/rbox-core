@@ -311,11 +311,12 @@ removed; the redacted result is retained at
   real-git subprocess timing under shard parallelism. One observation —
   watch for recurrence before any quarantine.
 
-## rig git-join-ahead — fixture setup "linked-worktree source is refused"
+## rig git-join-ahead — fixture setup "linked-worktree source is refused" (RESOLVED — not a flake)
 
-- 2026-07-27: failed once in a full-suite run (setup `git worktree add` exit
-  128 inside rig-dev-b, BEFORE any product assertion; suspect volume/branch
-  residue across scenarios in the shared /work). Green on immediate isolated
-  rerun. Not correlated with product changes (#480-482 touched status render
-  + push planning). Rig-infra class; pair with the tree-provenance papercut
-  if fixture hygiene recurs.
+- 2026-07-27: failed twice consecutively at setup (`git worktree add` exit
+  128, then `git clone` "destination already exists") — the scenario's
+  sibling fixture dirs (/work/ws-{ordinary,linked}-source) live OUTSIDE the
+  reset workspace and survive warm volumes: a non-idempotent fixture, not a
+  flake (an earlier version of this entry wrongly claimed a green rerun).
+  Fixed same night: rm -rf before mkdir + worktree add -B. Not correlated
+  with product changes (#480-482).

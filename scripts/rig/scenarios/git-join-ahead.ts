@@ -206,9 +206,10 @@ printf 'behind local addition\n' > '${repoPath(BEHIND)}/b-local.txt'`]);
         const ordinaryRoot = `${GUEST.workDir}-ordinary-source`;
         const linkedRoot = `${GUEST.workDir}-linked-source`;
         await ctx.b.exec(["sh", "-c", `set -eu
+rm -rf '${ordinaryRoot}' '${linkedRoot}'
 mkdir -p '${ordinaryRoot}' '${linkedRoot}'
 git clone -q '${repoPath(REPO)}' '${ordinaryRoot}/${REPO}'
-git -C '${ordinaryRoot}/${REPO}' worktree add -q -b linked-source '${linkedRoot}/${REPO}'`]);
+git -C '${ordinaryRoot}/${REPO}' worktree add -q -B linked-source '${linkedRoot}/${REPO}'`]);
         const linkedHead = (await ctx.b.exec(["git", "-C", `${linkedRoot}/${REPO}`, "rev-parse", "HEAD"])).stdout.trim();
         const refused = await ctx.b.rbox(["init", "--workspace", workspaceId, "--no-interactive", "--adopt", "--remote", ctx.apiUrl], { cwd: linkedRoot, allowFail: true });
         rec.assert("linked source invocation refused", refused.exitCode !== 0);
