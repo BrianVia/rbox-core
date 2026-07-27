@@ -69,6 +69,35 @@ afterEach(async () => {
   await fs.rm(home, { recursive: true, force: true });
 });
 
+test("RBOX_HOME isolates the credential store while HOME stays untouched (#505)", async () => {
+  await saveCredentials({ ...credential, token: "tok_production" });
+  expect(await fs.readFile(credentialPath(), "utf8")).toContain("tok_production");
+
+  const scratch = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-credentials-scratch-"));
+  process.env.RBOX_HOME = scratch;
+  try {
+    // HOME still points at the "production" home holding a valid credential.
+    expect(process.env.HOME).toBe(home);
+    expect((await loadCredentials()).state).toBe("absent");
+
+    await saveCredentials({ ...credential, token: "tok_scratch" });
+    const scratchFile = path.join(scratch, ".rbox", "credentials.json");
+    expect(await fs.readFile(scratchFile, "utf8")).toContain("tok_scratch");
+
+    const loaded = await loadCredentials();
+    expect(loaded.state).toBe("valid");
+    if (loaded.state === "valid") expect(loaded.credentials.token).toBe("tok_scratch");
+  } finally {
+    delete process.env.RBOX_HOME;
+    await fs.rm(scratch, { recursive: true, force: true });
+  }
+
+  // The production credential under HOME is untouched and readable again.
+  const back = await loadCredentials();
+  expect(back.state).toBe("valid");
+  if (back.state === "valid") expect(back.credentials.token).toBe("tok_production");
+});
+
 test("parser accepts v1 and both legacy shapes while preserving only unknown extensions", () => {
   for (const [legacy, value] of [
     [false, { v: 1, ...credential, extra: { retained: true } }],
