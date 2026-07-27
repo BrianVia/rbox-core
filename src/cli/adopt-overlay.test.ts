@@ -5,10 +5,12 @@ import path from "node:path";
 import { secureMoveNoReplace } from "./adopt-fs.js";
 import { inventoryAdoptionSource } from "./adopt-inventory.js";
 import {
+  ADOPT_PERSIST_BATCH,
   ADOPT_VERSION,
   adoptDisplacedDir,
   adoptStashDir,
   adoptUnplacedDir,
+  createBatchedPersist,
   identitiesEqual,
   readAdoptIdentity,
   type AdoptJournal,
@@ -204,5 +206,100 @@ describe("design 166 file overlay", () => {
     await runFileOverlay(journal, persist);
     expect(journal.overlayMoves[0]?.state).toBe("complete");
     expect(await fs.readFile(path.join(root, "crash.txt"), "utf8")).toBe("B");
+  });
+});
+
+describe("issue 501 journal persist batching", () => {
+  test("K+1 events cost exactly one batch write plus a trailing flush", async () => {
+    let writes = 0;
+    let clock = 0;
+    const batched = createBatchedPersist(async () => { writes += 1; }, { batch: 3, maxDelayMs: 10_000, now: () => clock });
+    for (let event = 0; event < 4; event += 1) await batched.persist();
+    expect(writes).toBe(1);
+    await batched.flush();
+    expect(writes).toBe(2);
+    await batched.flush();
+    expect(writes).toBe(2);
+  });
+
+  test("a slow trickle still persists on the max-delay bound", async () => {
+    let writes = 0;
+    let clock = 0;
+    const batched = createBatchedPersist(async () => { writes += 1; }, { batch: 1000, maxDelayMs: 2000, now: () => clock });
+    await batched.persist();
+    expect(writes).toBe(0);
+    clock = 2000;
+    await batched.persist();
+    expect(writes).toBe(1);
+  });
+
+  test("overlay write amplification scales with events/K, not events", async () => {
+    const { root, stash, journal } = await fixture();
+    const count = ADOPT_PERSIST_BATCH + 1;
+    await Promise.all(Array.from({ length: count }, (_unused, index) => fs.writeFile(path.join(stash, `f${index}`), `B${index}`)));
+    let writes = 0;
+    await runFileOverlay(journal, async () => { writes += 1; });
+    expect(journal.overlayMoves).toHaveLength(count);
+    expect(journal.overlayMoves.every((move) => move.state === "complete")).toBe(true);
+    expect(await fs.readFile(path.join(root, `f${count - 1}`), "utf8")).toBe(`B${count - 1}`);
+    // Eager persistence wrote >= 2 * count times; batching stays within a small
+    // multiple of count / ADOPT_PERSIST_BATCH.
+    expect(writes).toBeLessThanOrEqual(12);
+  });
+
+  test("a crash mid-batch replays journaled intents without loss or duplication", async () => {
+    const { root, stash, journal, persist } = await fixture();
+    await fs.writeFile(path.join(stash, "landed"), "B landed");
+    await fs.writeFile(path.join(stash, "displaced"), "B displaced");
+    await fs.writeFile(path.join(root, "displaced"), "A displaced");
+    await fs.writeFile(path.join(stash, "untouched"), "B untouched");
+    const [landedBefore, displacedBefore, untouchedBefore, baselineBefore] = await Promise.all([
+      readAdoptIdentity(path.join(stash, "landed"), true),
+      readAdoptIdentity(path.join(stash, "displaced"), true),
+      readAdoptIdentity(path.join(stash, "untouched"), true),
+      readAdoptIdentity(path.join(root, "displaced"), true),
+    ]);
+    // The batch's intents reached disk; the process died with one move fully
+    // executed, one half-executed, and one not started — all unpersisted.
+    journal.overlayMoves.push(
+      { path: "landed", source: "landed", destination: "landed", disposition: "landed", sourceBefore: landedBefore, state: "intent" },
+      { path: "displaced", source: "displaced", destination: "displaced", disposition: "displaced", displaced: "displaced", sourceBefore: displacedBefore, baselineBefore, state: "intent" },
+      { path: "untouched", source: "untouched", destination: "untouched", disposition: "landed", sourceBefore: untouchedBefore, state: "intent" },
+    );
+    await secureMoveNoReplace({ sourceRoot: stash, sourceRel: "landed", destinationRoot: root, destinationRel: "landed", expectedSource: landedBefore });
+    await secureMoveNoReplace({ sourceRoot: root, sourceRel: "displaced", destinationRoot: adoptDisplacedDir(root), destinationRel: "displaced", expectedSource: baselineBefore });
+
+    await runFileOverlay(journal, persist);
+    expect(journal.phase).toBe("overlay");
+    expect(journal.overlayMoves).toHaveLength(3);
+    expect(journal.overlayMoves.every((move) => move.state === "complete")).toBe(true);
+    expect(await fs.readFile(path.join(root, "landed"), "utf8")).toBe("B landed");
+    expect(await fs.readFile(path.join(root, "displaced"), "utf8")).toBe("B displaced");
+    expect(await fs.readFile(path.join(root, "untouched"), "utf8")).toBe("B untouched");
+    expect(await fs.readFile(path.join(adoptDisplacedDir(root), "displaced"), "utf8")).toBe("A displaced");
+    expect(await fs.readdir(stash)).toEqual([]);
+  });
+
+  test("abort replays a reversal that crashed before its journal write", async () => {
+    const { root, stash, journal, persist } = await fixture();
+    await fs.writeFile(path.join(stash, "landed"), "B landed");
+    await fs.writeFile(path.join(stash, "same"), "B same");
+    await fs.writeFile(path.join(root, "same"), "A same");
+    await runFileOverlay(journal, persist);
+
+    const landed = journal.overlayMoves.find((move) => move.path === "landed")!;
+    const same = journal.overlayMoves.find((move) => move.path === "same")!;
+    // Reverse both of "landed"'s and one of "same"'s renames by hand, leaving every
+    // move still journaled as complete — the state a batched abort crash leaves.
+    await secureMoveNoReplace({ sourceRoot: root, sourceRel: "landed", destinationRoot: stash, destinationRel: "landed", expectedSource: landed.sourceAfter! });
+    await secureMoveNoReplace({ sourceRoot: root, sourceRel: "same", destinationRoot: stash, destinationRel: "same", expectedSource: same.sourceAfter! });
+
+    await abortFileOverlay(journal, persist);
+    expect(journal.phase).toBe("overlay");
+    expect(journal.overlayMoves.every((move) => move.state === "aborted")).toBe(true);
+    expect(await fs.readFile(path.join(stash, "landed"), "utf8")).toBe("B landed");
+    expect(await fs.readFile(path.join(stash, "same"), "utf8")).toBe("B same");
+    expect(await fs.readFile(path.join(root, "same"), "utf8")).toBe("A same");
+    expect(await fs.lstat(path.join(root, "landed")).then(() => true, () => false)).toBe(false);
   });
 });
