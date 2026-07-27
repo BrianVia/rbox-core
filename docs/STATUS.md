@@ -5,6 +5,20 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_OVERNIGHT CHARTER (2026-07-27, founder-authorized ~00:00): run the 21-cycle
+reorg roadmap on all fronts; MERGE TO MAIN WHEN CONFIDENT (campaign-scoped
+grant); every ~3 merged PRs push a dev build to the fleet (Mac + FM, both
+read-write now) and watch logs for issues; rig run all every ~3-4 merges;
+target nearly-all cycles done by ~09:00 local. Protocol per cycle: agent
+implements from the roadmap contract (opus for fail-closed git seams, codex
+ok for read-only lanes), contract test red-first, MY gates re-run
+(typecheck+test:parallel), PR, merge on green. Parallel lanes allowed when
+file-disjoint (status lane ∥ push spine). Don't get bogged down: a cycle
+whose review finds deep problems parks as an unmerged PR; move on. Reorg
+PRs skip CHANGELOG (internal refactors — kills the merge-train conflicts).
+Cycles merged so far: w1c1 #478, w1c2 #479 (status-cmd 922→462). NO 1.10.0
+tag regardless._
+
 _Session addendum (2026-07-27, small hours): **FM IS NOW A FULL SYNCER**
 (founder decision): explicit `rbox start --read-write` — live watcher started
 (inotify raised to 1048576 first), FIRST-EVER FM trusted pull 23:33 UTC,
