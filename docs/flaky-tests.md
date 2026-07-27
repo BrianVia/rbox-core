@@ -310,3 +310,12 @@ removed; the redacted result is retained at
   locally (24/24 same file), green on CI rerun of the failed shard. Class:
   real-git subprocess timing under shard parallelism. One observation —
   watch for recurrence before any quarantine.
+
+## rig git-join-ahead — fixture setup "linked-worktree source is refused"
+
+- 2026-07-27: failed once in a full-suite run (setup `git worktree add` exit
+  128 inside rig-dev-b, BEFORE any product assertion; suspect volume/branch
+  residue across scenarios in the shared /work). Green on immediate isolated
+  rerun. Not correlated with product changes (#480-482 touched status render
+  + push planning). Rig-infra class; pair with the tree-provenance papercut
+  if fixture hygiene recurs.
