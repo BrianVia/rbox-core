@@ -348,5 +348,9 @@ behind-origin count; loudly warn when behind.
 - **`rbox status` outside a workspace is a dead end** (founder, 2026-07-27):
   it errors "Not inside an rbox workspace" instead of showing a cumulative
   all-workspaces summary from the machine's daemon records. Filed as #498.
+  FIXED 2026-07-27 (`doctor-triage`): both `rbox doctor` and `rbox status`
+  now fall back to the all-workspaces view (`src/cli/doctor-machine.ts`),
+  and `rbox doctor` leads with a plain-English triage report
+  (`src/cli/doctor-triage.ts`, `--json` for the non-interactive twin).
   Process note attached to the same ask: founder wants GitHub issues to
   become the public todo list for feature asks like this.

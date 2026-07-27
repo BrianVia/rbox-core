@@ -80,6 +80,19 @@ async function resolvePathFlagRoot(arg: string | undefined): Promise<string> {
   return root;
 }
 
+/** #498: outside a workspace, `rbox doctor`/`rbox status` summarize every synced
+ * folder on this machine instead of dead-ending on "Not inside an rbox workspace". */
+async function runMachineTriage(jsonMode: boolean): Promise<void> {
+  const { collectMachineTriage, renderMachineTriage } = await import("./doctor-machine.js");
+  const triage = await collectMachineTriage();
+  if (jsonMode) {
+    const { emitJson } = await import("./json.js");
+    emitJson(triage);
+    return;
+  }
+  for (const line of renderMachineTriage(triage)) console.log(line);
+}
+
 export type FrontDoorImport = () => Promise<Pick<typeof import("./front-door.js"), "resolveBareRboxTarget" | "runFrontDoor" | "runUntrackedMenu">>;
 export type UpgradeCommandImport = () => Promise<Pick<typeof import("./upgrade-cmd.js"), "upgradeCmd">>;
 
@@ -375,7 +388,12 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
         fail("choose only one status presentation flag: --json, --verbose, or --git");
         break;
       }
-      const root = await resolveRoot(positional[0]);
+      const statusRoot = await findRoot(positional[0] ? path.resolve(positional[0]) : process.cwd());
+      if (!statusRoot) {
+        await runMachineTriage(jsonMode);
+        break;
+      }
+      const root = statusRoot;
       const { statusCmd } = await import("./status-cmd.js");
       await statusCmd(root, {
         json: jsonMode,
@@ -390,7 +408,17 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
       const diagnostics = flags.diagnostics === "true";
       const residueBytes = flags["residue-bytes"] === "true";
       if (diagnostics && !report) throw new Error("--diagnostics uploads the support report — combine it with --report: rbox doctor --report --diagnostics");
-      const root = await resolvePathFlagRoot(flags.path);
+      const doctorRoot = await findRoot(flags.path ? path.resolve(flags.path) : process.cwd());
+      if (!doctorRoot) {
+        // Support-report and reset-journal work is workspace-scoped; only the
+        // plain triage read has a meaningful machine-wide answer.
+        if (report || diagnostics || positional[0] !== undefined || flags.quarantine === "true" || flags.restore !== undefined) {
+          throw new Error("Not inside an rbox workspace. Run from the workspace, or pass --path <dir>.");
+        }
+        await runMachineTriage(jsonMode);
+        break;
+      }
+      const root = doctorRoot;
       if (positional[0] === "reset-journal") {
         if (report || diagnostics) throw new Error("reset-journal rescue cannot be combined with support-report flags");
         const { resetJournalDoctorCmd } = await import("./reset-journal-doctor.js");
@@ -399,7 +427,7 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
       }
       if (flags.quarantine === "true" || flags.restore !== undefined) throw new Error("--quarantine/--restore require `rbox doctor reset-journal`");
       const { doctorCmd } = await import("./doctor-cmd.js");
-      await doctorCmd(root, { report, yes: flags.yes === "true", diagnostics, residueBytes });
+      await doctorCmd(root, { report, yes: flags.yes === "true", diagnostics, residueBytes, json: jsonMode, now: deps.now?.().getTime() });
       break;
     }
     case "start": {

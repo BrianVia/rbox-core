@@ -24,6 +24,7 @@ import { GIT_DEFERRAL_REASONS } from "./sync-state-model.js";
 import { fetchWithDeadline, transferTimeoutMs } from "./remote/resilient.js";
 import { listWorktrees } from "../engine/git/shared.js";
 import { formatBinaryBytes } from "./quota-format.js";
+import { emitJson } from "./json.js";
 
 const REPORT_CAP_BYTES = 512 * 1024;
 const DAEMON_LOG_TAIL_BYTES = 64 * 1024;
@@ -158,6 +159,8 @@ interface DoctorCmdOptions {
   yes: boolean;
   diagnostics?: boolean;
   residueBytes?: boolean;
+  json?: boolean;
+  now?: number;
 }
 
 const rboxHome = () => path.join(process.env.RBOX_HOME || os.homedir(), ".rbox");
@@ -947,10 +950,22 @@ export async function doctorCmd(root: string, opts: DoctorCmdOptions): Promise<v
   if (opts.diagnostics === true && !opts.report) {
     throw new Error("--diagnostics uploads the support report — combine it with --report: rbox doctor --report --diagnostics");
   }
+  if (opts.json === true && opts.report) {
+    throw new Error("--json prints the findings only — drop --report, or drop --json to build the support report");
+  }
   const ctx = await collectDoctorContext(
     root,
     opts.residueBytes ? { residueBytes: true } : {},
   );
+  const { readTriageInputs, renderWorkspaceTriage, triageWorkspace } = await import("./doctor-triage.js");
+  const triage = triageWorkspace(await readTriageInputs(root, ctx.checks, opts.now));
+  if (opts.json === true) {
+    emitJson(triage);
+    if (Object.values(ctx.checks).some((c) => !c.ok)) process.exitCode = 1;
+    return;
+  }
+  for (const line of renderWorkspaceTriage(triage)) console.log(line);
+  console.log("");
   console.log(renderDoctor(ctx.checks, ctx.localOnly));
   if (opts.report) {
     const bundle = await buildDiagnosticsBundle(ctx);
