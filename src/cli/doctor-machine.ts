@@ -74,7 +74,9 @@ function deferralSuffix(status: AmbientDaemonStatusV1 | undefined): string {
   return count === 1 ? " · 1 code folder is waiting on you" : ` · ${count} code folders are waiting on you`;
 }
 
-function summarize(status: AmbientDaemonStatusV1, bootBound: boolean): { state: MachineWorkspaceState; summary: string } {
+/** Only ever called with a record already proven to belong to the live daemon
+ * incarnation, so every field — including `mode` (design 178) — is authoritative. */
+function summarize(status: AmbientDaemonStatusV1): { state: MachineWorkspaceState; summary: string } {
   switch (status.state) {
     case "attention":
       return {
@@ -86,8 +88,7 @@ function summarize(status: AmbientDaemonStatusV1, bootBound: boolean): { state: 
     case "paused":
       return { state: "paused", summary: "background sync is paused" };
     case "synced":
-      // Mode is authoritative only for the live incarnation (design 178).
-      return { state: "synced", summary: bootBound && status.mode === "pull-only" ? "up to date (download-only)" : "up to date" };
+      return { state: "synced", summary: status.mode === "pull-only" ? "up to date (download-only)" : "up to date" };
   }
 }
 
@@ -136,15 +137,19 @@ export async function collectMachineTriage(deps: MachineTriageDeps = {}): Promis
     // behind, and reporting that as "up to date" is the worst possible lie.
     const running = pid.pid !== undefined && alive(pid.pid);
     const age = status ? now - Date.parse(status.heartbeatAt) : Number.NaN;
+    // The record must belong to the incarnation that is running RIGHT NOW —
+    // same gate the in-workspace report applies (doctor-evidence.liveAmbient).
+    // A record from a previous boot describes a daemon that no longer exists.
+    const bootBound = status?.bootId !== undefined && pid.bootId !== undefined && status.bootId === pid.bootId;
     const usable = running
       && status !== undefined
+      && bootBound
       && Number.isFinite(age)
       && age <= AMBIENT_STATUS_STALE_MS
       && age >= -DAEMON_HEARTBEAT_FUTURE_SKEW_MS;
     const suffix = deferralSuffix(status);
     if (usable && status) {
-      const bootBound = status.bootId !== undefined && pid.bootId !== undefined && status.bootId === pid.bootId;
-      const { state, summary } = summarize(status, bootBound);
+      const { state, summary } = summarize(status);
       workspaces.push({
         root,
         name,

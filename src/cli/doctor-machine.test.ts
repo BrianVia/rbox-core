@@ -37,6 +37,8 @@ async function seedWorkspace(name: string, opts: {
   status?: Partial<AmbientDaemonStatusV1> & Record<string, unknown>;
   pidBootId?: string;
   withPidfile?: boolean;
+  /** Omit the record's boot id entirely, as a pre-design-178 daemon would. */
+  noStatusBootId?: boolean;
   missing?: boolean;
 } = {}): Promise<string> {
   const root = path.join(scratch, name);
@@ -66,6 +68,9 @@ async function seedWorkspace(name: string, opts: {
       heartbeatAt: new Date(NOW - 1_000).toISOString(),
       sequence: 1,
       lastSyncedAt: null,
+      // A real daemon stamps the incarnation that wrote the record; default to
+      // the matching one so each test exercises the axis it names.
+      ...(opts.noStatusBootId ? {} : { bootId: opts.pidBootId ?? BOOT }),
       ...opts.status,
     }));
   }
@@ -132,15 +137,30 @@ test("a live daemon with a fresh record gets its plain-English line and a cd-int
   expect(rendered).toContain("`rbox track` that has never started background sync is not listed here");
 });
 
-test("a download-only claim needs the record to match the live pidfile incarnation", async () => {
+test("a boot-bound record is trusted in full, including download-only mode", async () => {
   await seedWorkspace("bound", { status: { state: "synced", mode: "pull-only", bootId: BOOT }, pidBootId: BOOT });
-  expect((await collectWith(true)).workspaces[0]!.summary).toBe("up to date (download-only)");
+  const workspace = (await collectWith(true)).workspaces[0]!;
+  expect(workspace.state).toBe("synced");
+  expect(workspace.summary).toBe("up to date (download-only)");
+});
 
-  await fs.rm(scratch, { recursive: true, force: true });
-  await fs.rm(path.join(home, ".rbox"), { recursive: true, force: true });
-  await fs.mkdir(scratch, { recursive: true });
-  await seedWorkspace("unbound", { status: { state: "synced", mode: "pull-only", bootId: "boot-other" }, pidBootId: BOOT });
-  expect((await collectWith(true)).workspaces[0]!.summary).toBe("up to date");
+test("a record from a PREVIOUS boot is not trusted for STATE either, not just mode", async () => {
+  // Round-2 finding: the machine view gated only `mode` on the boot id, so an
+  // old-boot record still drove the headline state.
+  const root = await seedWorkspace("stale-boot", {
+    status: { state: "synced", mode: "pull-only", bootId: "boot-previous" },
+    pidBootId: BOOT,
+  });
+  const workspace = (await collectWith(true)).workspaces[0]!;
+  expect(JSON.parse(await fs.readFile(daemonStatusPath(root), "utf8")).state).toBe("synced");
+  expect(workspace.state).not.toBe("synced");
+  expect(workspace.state).toBe("unknown");
+  expect(workspace.summary).toContain("may be stuck");
+});
+
+test("a legacy record with no boot id is not trusted for state", async () => {
+  await seedWorkspace("legacy", { status: { state: "synced" }, pidBootId: BOOT, noStatusBootId: true });
+  expect((await collectWith(true)).workspaces[0]!.state).toBe("unknown");
 });
 
 test("a daemon with no pidfile reads as stopped and is told to start", async () => {

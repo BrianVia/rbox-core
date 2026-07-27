@@ -14,14 +14,14 @@
 import path from "node:path";
 import type { DaemonActivity } from "./activity.js";
 import type { AdoptFenceInspection } from "./adopt-journal.js";
-import { daemonOwnsActivity, liveAmbient, serviceUnverified, type TriageInputs } from "./doctor-evidence.js";
+import { daemonOwnsActivity, liveAmbient, provenFailure, unverifiedChecks, type TriageInputs } from "./doctor-evidence.js";
 import { shQuoteIfNeeded } from "./shell-quote.js";
 import { ageBucket, type GitDeferralRepoProjection } from "./status-view.js";
 import { style } from "./style.js";
 import { RBOX_VERSION } from "./version.js";
 import type { DoctorChecks } from "./doctor-cmd.js";
 
-export { readTriageInputs, serviceUnverified, type TriageInputs, type TriageReadDeps } from "./doctor-evidence.js";
+export { observeDaemon, readTriageInputs, unverifiedChecks, type DaemonObservation, type TriageInputs, type TriageReadDeps } from "./doctor-evidence.js";
 
 export type TriageSeverity = "blocked" | "attention" | "info";
 
@@ -174,18 +174,28 @@ function haltFinding(root: string, halt: NonNullable<DaemonActivity["halt"]>): T
   }
 }
 
+function plainList(items: string[]): string {
+  if (items.length < 2) return items[0] ?? "";
+  return `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}`;
+}
+
+/** The "couldn't check" finding and the definitive ones are INDEPENDENT. A
+ * lookup that never got an answer withholds only its own claim; it never
+ * cancels a rejection or a corruption another check actually proved. */
 function accountFindings(input: TriageInputs): TriageFinding[] {
   const { checks, root } = input;
   const out: TriageFinding[] = [];
-  if (serviceUnverified(checks)) {
+  const unverified = unverifiedChecks(checks);
+  if (unverified.length > 0) {
     out.push({
       id: "service-unreachable",
       severity: "attention",
-      problem: "rbox couldn't reach the sync service to check — your connection may be down, or the service may be busy.",
-      safety: `${SAFE_NOTHING_LOST} rbox resumes on its own once it can connect. Nothing here was checked against the service, so nothing about your account or your uploaded files is being reported as broken.`,
+      problem: `rbox couldn't reach the sync service to check ${plainList(unverified)} — your connection may be down, or the service may be busy.`,
+      safety: `${SAFE_NOTHING_LOST} rbox resumes on its own once it can connect. Anything it could not check is simply left unreported here — it is not being called broken.`,
       command: scoped(root, "rbox doctor"),
     });
-  } else if (!checks.credentials.ok) {
+  }
+  if (provenFailure(checks.credentials)) {
     out.push({
       id: "signed-out",
       severity: "blocked",
@@ -227,7 +237,10 @@ function stateFinding(root: string, check: DoctorChecks["state"]): TriageFinding
     problem: mismatch
       ? "This folder's local sync records belong to a different workspace than the one it is connected to now, so syncing is blocked. rbox cannot repair this by itself."
       : `This folder's local sync records cannot be read (${check.message}), so syncing is blocked. rbox cannot repair this by itself.`,
-    safety: `${SAFE_LOCAL_FILES} Your uploaded files are still on the server; joining this folder to the workspace again with \`rbox setup\` re-checks every file rather than deleting anything. Send the report below if you would like help first.`,
+    // The prose remedy is scoped exactly like the structured ones: `doctor
+    // --path` is read from anywhere, so a bare `rbox setup` would target
+    // whatever directory the reader happens to be standing in.
+    safety: `${SAFE_LOCAL_FILES} Your uploaded files are still on the server; joining this folder to the workspace again with \`${scoped(root, "rbox setup")}\` re-checks every file rather than deleting anything. Send the report below if you would like help first.`,
     command: scoped(root, "rbox doctor --report"),
   };
 }
@@ -268,11 +281,11 @@ function environmentFindings(input: TriageInputs): TriageFinding[] {
   }
   const state = stateFinding(root, checks.state);
   if (state) out.push(state);
-  // A sign-in or key failure makes every server-side read fail too, and a
-  // transport failure proves nothing: only a verified chain error may be
-  // reported as unreadable history.
-  if (checks.chain && !checks.chain.ok && checks.chain.inconclusive !== true
-    && checks.credentials.ok && checks.enrollment.ok) {
+  // Only a VERIFIED chain error may be reported as unreadable history, and only
+  // when nothing upstream explains it: a PROVEN sign-in or key failure makes
+  // every server-side read fail, so the chain error would be its symptom. An
+  // inconclusive sign-in lookup explains nothing and must not suppress it.
+  if (provenFailure(checks.chain) && !provenFailure(checks.credentials) && !provenFailure(checks.enrollment)) {
     out.push({
       id: "history-unreadable",
       severity: "blocked",
@@ -286,11 +299,14 @@ function environmentFindings(input: TriageInputs): TriageFinding[] {
   return out;
 }
 
+/** Every daemon claim below reads from the ONE observation in `input.daemon`,
+ * never from `checks.daemon` — that verdict was captured earlier in collection,
+ * and mixing the two lets a daemon that rebound mid-collection keep its old
+ * answer while its current sidecars are read. */
 function daemonFindings(input: TriageInputs): TriageFinding[] {
-  const { root } = input;
+  const { root, daemon } = input;
   const out: TriageFinding[] = [];
-  const daemon = input.checks.daemon;
-  if (daemon.status === "stale") {
+  if (daemon.stale) {
     out.push({
       id: "daemon-stale-binding",
       severity: "attention",
@@ -298,7 +314,7 @@ function daemonFindings(input: TriageInputs): TriageFinding[] {
       safety: SAFE_NOTHING_LOST,
       command: scoped(root, "rbox start"),
     });
-  } else if (!daemon.ok) {
+  } else if (!daemon.running) {
     out.push({
       id: "daemon-stopped",
       severity: "attention",
@@ -308,8 +324,10 @@ function daemonFindings(input: TriageInputs): TriageFinding[] {
     });
   }
 
+  // `liveAmbient` already required live + bound-to-this-root + fresh + boot-
+  // bound, so every claim below is about the incarnation running right now.
   const live = liveAmbient(input);
-  if (live?.status.attentionReason === "watcher-degraded") {
+  if (live?.attentionReason === "watcher-degraded") {
     out.push({
       id: "watcher-degraded",
       severity: "attention",
@@ -318,7 +336,7 @@ function daemonFindings(input: TriageInputs): TriageFinding[] {
       command: scoped(root, "rbox stop && rbox start"),
     });
   }
-  if (live?.status.attentionReason === "ownership-lost") {
+  if (live?.attentionReason === "ownership-lost") {
     out.push({
       id: "ownership-lost",
       severity: "attention",
@@ -327,7 +345,7 @@ function daemonFindings(input: TriageInputs): TriageFinding[] {
       command: scoped(root, "rbox stop && rbox start"),
     });
   }
-  if (live?.bootBound && live.status.mode === "pull-only") {
+  if (live?.mode === "pull-only") {
     out.push({
       id: "pull-only",
       severity: "info",
@@ -337,16 +355,16 @@ function daemonFindings(input: TriageInputs): TriageFinding[] {
     });
   }
   const cliVersion = input.cliVersion ?? RBOX_VERSION;
-  if (live?.status.daemonVersion !== undefined && live.status.daemonVersion !== cliVersion) {
+  if (live?.daemonVersion !== undefined && live.daemonVersion !== cliVersion) {
     out.push({
       id: "daemon-version-skew",
       severity: "attention",
-      problem: `Background sync is still running rbox ${live.status.daemonVersion} while this machine has ${cliVersion} installed.`,
+      problem: `Background sync is still running rbox ${live.daemonVersion} while this machine has ${cliVersion} installed.`,
       safety: SAFE_NOTHING_LOST,
       command: "rbox upgrade",
     });
   }
-  if (!input.checks.version.ok && input.checks.version.inconclusive !== true && input.checks.version.latest) {
+  if (provenFailure(input.checks.version) && input.checks.version.latest) {
     out.push({
       id: "update-available",
       severity: "info",

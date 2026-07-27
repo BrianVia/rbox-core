@@ -3,9 +3,16 @@
  *
  * This module owns the reads and the trust gates; `doctor-triage.ts` owns what
  * is said about them. Keeping the two apart is what stops a plausible-looking
- * record from becoming a confident sentence: a status record is evidence only
- * while its daemon is live and the record belongs to that incarnation, and a
- * failed remote check is evidence of nothing at all when it never got an answer.
+ * record from becoming a confident sentence. Three rules are load-bearing:
+ *
+ * - Inconclusive evidence suppresses only ITS OWN check. A lookup that never
+ *   got an answer can neither prove a fault nor excuse one that another check
+ *   did prove, so verdicts stay per-check and never become one shared veto.
+ * - A daemon status record is evidence only for the incarnation that wrote it:
+ *   live, bound to THIS root, fresh, and matching the live pidfile's boot id.
+ * - Ownership comes from ONE observation taken at triage time. Combining a
+ *   liveness verdict captured earlier with a pid read taken later can both
+ *   suppress a live halt and resurrect dead residue.
  *
  * Every read here is non-mutating — `loadRawState` rather than `loadState`,
  * whose reset-journal recovery takes the workspace mutex and rewrites state.
@@ -13,12 +20,28 @@
 import { loadActivity, type DaemonActivity } from "./activity.js";
 import { inspectAdoptFence, type AdoptFenceInspection } from "./adopt-journal.js";
 import { loadConfig, loadRawState, repoRecordsForState, syncStreamId } from "./config.js";
-import { readDaemonPidRecord, type DaemonPidRecord } from "./daemon-control.js";
-import { DAEMON_HEARTBEAT_FUTURE_SKEW_MS, isDaemonProcess } from "./daemon/process-control.js";
+import { currentWorkspaceId } from "./daemon-control.js";
+import { DAEMON_HEARTBEAT_FUTURE_SKEW_MS, daemonBindingStatus } from "./daemon/process-control.js";
 import { readAmbientDaemonStatusRecord, type AmbientDaemonStatusRecord, type AmbientDaemonStatusV1 } from "./daemon/ambient-status.js";
 import { AMBIENT_STATUS_STALE_MS } from "./populate-marker.js";
 import { projectGitDeferralRepos, type GitDeferralRepoProjection } from "./status-view.js";
-import type { DoctorChecks } from "./doctor-cmd.js";
+import type { DoctorCheck, DoctorChecks } from "./doctor-cmd.js";
+
+/** One point-in-time answer to "is a daemon running for THIS workspace root?".
+ * Liveness is root-scoped — the daemon's own command line must name this root —
+ * so a recycled pid, or another workspace's daemon that inherited it, is never
+ * mistaken for ours. */
+export interface DaemonObservation {
+  /** A live rbox daemon whose own command line names this root. */
+  running: boolean;
+  pid?: number;
+  bootId?: string;
+  /** Live, but its startup binding names a different workspace than this root. */
+  stale: boolean;
+  /** Live AND bound to this root: the only state in which the daemon's sidecars
+   * describe this workspace right now. */
+  ownsRoot: boolean;
+}
 
 export interface TriageInputs {
   root: string;
@@ -26,16 +49,33 @@ export interface TriageInputs {
   deferrals: GitDeferralRepoProjection[];
   activity?: DaemonActivity;
   ambient: AmbientDaemonStatusRecord;
-  pid: DaemonPidRecord;
-  daemonRunning: boolean;
+  daemon: DaemonObservation;
   adopt: AdoptFenceInspection;
   now: number;
   cliVersion?: string;
 }
 
 export interface TriageReadDeps {
-  /** Liveness seam: the only input a test cannot produce by writing files. */
-  isDaemonProcess?: typeof isDaemonProcess;
+  /** The single liveness/binding seam. Tests either drive it or drive the real
+   * one by writing a pidfile — either way there is exactly one observation. */
+  daemonBindingStatus?: typeof daemonBindingStatus;
+  currentWorkspaceId?: typeof currentWorkspaceId;
+}
+
+/** Take the ONE ownership observation triage is allowed to use. */
+export function observeDaemon(root: string, deps: TriageReadDeps = {}): DaemonObservation {
+  const workspaceId = (deps.currentWorkspaceId ?? currentWorkspaceId)(root);
+  // An unreadable workspace binding cannot prove ownership of anything; the
+  // empty id makes any bound daemon read as stale, which is the safe answer.
+  const status = (deps.daemonBindingStatus ?? daemonBindingStatus)(root, workspaceId ?? "");
+  const running = status.alive.running;
+  return {
+    running,
+    ...(status.alive.pid === undefined ? {} : { pid: status.alive.pid }),
+    ...(status.alive.bootId === undefined ? {} : { bootId: status.alive.bootId }),
+    stale: status.stale,
+    ownsRoot: running && !status.stale && workspaceId !== undefined,
+  };
 }
 
 /** Read every triage input for `root`. Each read is best-effort: a diagnosis
@@ -54,8 +94,6 @@ export async function readTriageInputs(
       reason: error instanceof Error ? error.message : String(error),
     })),
   ]);
-  const pid = readDaemonPidRecord(root);
-  const alive = deps.isDaemonProcess ?? isDaemonProcess;
   return {
     root,
     checks,
@@ -63,8 +101,7 @@ export async function readTriageInputs(
     activity,
     adopt,
     ambient: readAmbientDaemonStatusRecord(root),
-    pid,
-    daemonRunning: pid.pid !== undefined && alive(pid.pid),
+    daemon: observeDaemon(root, deps),
     now,
   };
 }
@@ -90,40 +127,50 @@ async function readDeferrals(root: string, now: number): Promise<GitDeferralRepo
   }
 }
 
-/** True when a remote-dependent check failed WITHOUT proving anything about the
- * account, the keys, or the uploaded history — an outage, a timeout, or a 5xx.
- * Nothing downstream of the service may be called broken on this evidence. */
-export function serviceUnverified(checks: DoctorChecks): boolean {
-  return !checks.remote.ok
-    || checks.credentials.inconclusive === true
-    || checks.chain?.inconclusive === true
-    || checks.version.inconclusive === true;
+/** This check failed, and the failure is evidence of a real fault. */
+export function provenFailure(check: DoctorCheck | undefined): boolean {
+  return check !== undefined && !check.ok && check.inconclusive !== true;
+}
+
+/** This check never got an answer. It proves nothing — in either direction. */
+export function inconclusive(check: DoctorCheck | undefined): boolean {
+  return check !== undefined && !check.ok && check.inconclusive === true;
+}
+
+const UNVERIFIED_LABELS: ReadonlyArray<readonly [keyof DoctorChecks, string]> = [
+  ["credentials", "your sign-in"],
+  ["chain", "your uploaded history"],
+  ["version", "whether an update is available"],
+];
+
+/** Plain-English names of the checks that could not reach a verdict, so the
+ * report can say what it did NOT learn. Deliberately a LIST, not a boolean
+ * veto: each entry withholds only its own check's claim, and never suppresses
+ * a different check that did prove something. */
+export function unverifiedChecks(checks: DoctorChecks): string[] {
+  const names = UNVERIFIED_LABELS.flatMap(([key, label]) => (inconclusive(checks[key]) ? [label] : []));
+  // An unreachable service is WHY the rest could not answer; name it first and
+  // only once, so the finding never reads as several separate outages.
+  return provenFailure(checks.remote) ? ["the sync service", ...names] : names;
 }
 
 /** The daemon's activity sidecar is residue once its daemon is gone or has
  * rebound elsewhere: a restart re-evaluates every halt and quota refusal, so
  * status drops it (status-view.ts) and diagnosis must drop it too. */
 export function daemonOwnsActivity(input: TriageInputs): boolean {
-  return input.daemonRunning && input.checks.daemon.status !== "stale";
+  return input.daemon.ownsRoot;
 }
 
-export interface LiveAmbient {
-  status: AmbientDaemonStatusV1;
-  /** The record provably came from the live v2 pidfile's incarnation, which
-   * design 178 requires before `mode` is authoritative. */
-  bootBound: boolean;
-}
-
-/** The status record describes ONE daemon incarnation. It is evidence only
- * while that incarnation is the live one: the process is alive and bound to
- * this workspace, and the heartbeat is neither stale nor future-dated. */
-export function liveAmbient(input: TriageInputs): LiveAmbient | undefined {
+/** The status record describes ONE daemon incarnation, and is evidence only
+ * while that incarnation is the live one: a live daemon bound to this root, a
+ * heartbeat neither stale nor future-dated, and a boot id matching the live v2
+ * pidfile (design 178). A record failing any of those is not downgraded to a
+ * weaker claim — it is not used at all. */
+export function liveAmbient(input: TriageInputs): AmbientDaemonStatusV1 | undefined {
   if (input.ambient.kind !== "ok" || !daemonOwnsActivity(input)) return undefined;
   const status = input.ambient.status;
   const age = input.now - Date.parse(status.heartbeatAt);
   if (!Number.isFinite(age) || age > AMBIENT_STATUS_STALE_MS || age < -DAEMON_HEARTBEAT_FUTURE_SKEW_MS) return undefined;
-  return {
-    status,
-    bootBound: status.bootId !== undefined && input.pid.bootId !== undefined && status.bootId === input.pid.bootId,
-  };
+  if (status.bootId === undefined || input.daemon.bootId === undefined || status.bootId !== input.daemon.bootId) return undefined;
+  return status;
 }

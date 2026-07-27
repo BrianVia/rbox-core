@@ -10,6 +10,7 @@ import {
   type TriageInputs,
 } from "./doctor-triage.js";
 import { checkManifestChain, collectDoctorContext, doctorCmd, type DoctorChecks } from "./doctor-cmd.js";
+import type { DaemonObservation } from "./doctor-evidence.js";
 import { saveStateUnsafeLegacyOrTest, syncStreamId } from "./config.js";
 import { daemonPidPath, daemonRuntimeDir, daemonStatusPath } from "./rbox-paths.js";
 import { lockingHealthPath } from "./sync-mutex.js";
@@ -40,13 +41,14 @@ const healthyChecks = (): DoctorChecks => ({
   chain: { ok: true, label: "manifest chain", message: "head 3" },
 });
 
+const STOPPED: DaemonObservation = { running: false, stale: false, ownsRoot: false };
+
 const inputs = (over: Partial<TriageInputs> = {}): TriageInputs => ({
   root,
   checks: healthyChecks(),
   deferrals: [],
   ambient: { kind: "absent" },
-  pid: { present: false },
-  daemonRunning: true,
+  daemon: { running: true, stale: false, ownsRoot: true, pid: LIVE_PID, bootId: BOOT },
   adopt: { status: "none" },
   now: NOW,
   cliVersion: "1.9.0",
@@ -62,6 +64,20 @@ const workspaceConfig = () => ({
   token: "",
   deviceId: "dev_1",
 });
+
+/** Drive the single liveness/binding seam. A `boundTo` differing from this
+ * root's workspace id reproduces a daemon that rebound elsewhere. */
+function liveness(opts: { running: boolean; pid?: number; bootId?: string; boundTo?: string }) {
+  return {
+    daemonBindingStatus: (_root: string, workspaceId: string) => {
+      const alive = opts.running
+        ? { running: true, pid: opts.pid ?? LIVE_PID, bootId: opts.bootId ?? BOOT }
+        : { running: false };
+      const bound = opts.running ? opts.boundTo ?? workspaceId : undefined;
+      return { alive, bound, stale: opts.running && bound !== undefined && bound !== workspaceId };
+    },
+  };
+}
 
 const findingById = (findings: TriageFinding[], id: string): TriageFinding | undefined =>
   findings.find((finding) => finding.id === id);
@@ -193,6 +209,63 @@ test("a 5xx on the account check is inconclusive, not a rejected token", async (
   expect(findingById(triage.findings, "service-unreachable")).toBeDefined();
 });
 
+// ---- R2 HIGH 1: an inconclusive check suppresses ONLY its own claim ----
+
+test("a REJECTED token still reports signed-out even when the version lookup was inconclusive", async () => {
+  await saveCredentials({ token: "tok_stale", deviceId: "dev_1", remoteUrl: "https://api.rbox.to", accountId: "acct_1111111111111111" });
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = String(typeof input === "object" && "url" in input ? input.url : input);
+    if (url.includes("/v1/account/status")) return new Response("no", { status: 401 });
+    // The release manifest is what fails to answer here.
+    if (url.endsWith("/version") || url.endsWith("/version.sig")) throw new Error("connection reset");
+    return new Response("ok", { status: 200 });
+  }) as typeof fetch;
+
+  const ctx = await collectDoctorContext(root);
+  // Producer proof of the exact reported combination.
+  expect(ctx.checks.credentials.ok).toBe(false);
+  expect(ctx.checks.credentials.inconclusive).toBeUndefined();
+  expect(ctx.checks.version.inconclusive).toBe(true);
+
+  const findings = triageWorkspace(await readTriageInputs(root, ctx.checks, NOW)).findings;
+  expect(findingById(findings, "signed-out")?.command).toBe("rbox login");
+  // The unverified check is still disclosed — it just cannot veto the rejection.
+  const offline = findingById(findings, "service-unreachable");
+  expect(offline?.problem).toContain("whether an update is available");
+  expect(offline?.problem).not.toContain("your sign-in");
+});
+
+test("a VERIFIED chain error still reports unreadable history when the sign-in lookup was inconclusive", async () => {
+  const chain = await checkManifestChain({
+    chainDiagnostic: async () => {
+      throw new ManifestChainError("link decrypt failed");
+    },
+  });
+  const checks = healthyChecks();
+  checks.chain = chain;
+  checks.credentials = { ok: false, inconclusive: true, label: "credentials", message: "could not verify token" };
+  expect(chain.inconclusive).toBeUndefined();
+
+  const findings = triageWorkspace(inputs({ checks })).findings;
+  expect(findingById(findings, "history-unreadable")?.command).toBe(`cd ${root} && rbox recover --repair-chain`);
+  expect(findingById(findings, "signed-out")).toBeUndefined();
+  expect(findingById(findings, "service-unreachable")?.problem).toContain("your sign-in");
+});
+
+test("a PROVEN sign-in failure does still suppress the chain error it would explain", async () => {
+  const chain = await checkManifestChain({
+    chainDiagnostic: async () => {
+      throw new ManifestChainError("link decrypt failed");
+    },
+  });
+  const checks = healthyChecks();
+  checks.chain = chain;
+  checks.credentials = { ok: false, label: "credentials", message: "token rejected (401)" };
+  const findings = triageWorkspace(inputs({ checks })).findings;
+  expect(findingById(findings, "signed-out")).toBeDefined();
+  expect(findingById(findings, "history-unreadable")).toBeUndefined();
+});
+
 // ------------------------- HIGH 2: a transport error is not proven corruption
 
 test("a transport failure on the chain diagnostic is inconclusive and claims no corruption", async () => {
@@ -232,11 +305,11 @@ test("a stopped daemon's halt and quota residue is read but never reported", asy
     },
     outOfStorage: { at: new Date(NOW).toISOString(), kind: "storage" },
   });
-  const collected = await readTriageInputs(root, healthyChecks(), NOW, { isDaemonProcess: () => false });
+  const collected = await readTriageInputs(root, healthyChecks(), NOW, liveness({ running: false }));
   // Producer proof: the residue IS on disk and WAS read — the gate is what drops it.
   expect(collected.activity?.halt?.typedReason?.kind).toBe("mass-delete");
   expect(collected.activity?.outOfStorage).toBeDefined();
-  expect(collected.daemonRunning).toBe(false);
+  expect(collected.daemon.ownsRoot).toBe(false);
 
   const triage = triageWorkspace(collected);
   expect(findingById(triage.findings, "halt:mass-delete")).toBeUndefined();
@@ -255,32 +328,144 @@ test("a daemon bound to another workspace also drops halt residue", async () => 
     },
   });
   await writeDaemonRecords({ statusBootId: BOOT, pidBootId: BOOT });
-  const collected = await readTriageInputs(root, healthyChecks(), NOW, { isDaemonProcess: () => true });
+  const collected = await readTriageInputs(root, healthyChecks(), NOW, liveness({ running: true, boundTo: "ws_elsewhere" }));
+  // Producer proof: the halt IS on disk and the daemon IS alive — the binding
+  // mismatch alone is what makes the residue unowned.
   expect(collected.activity?.halt).toBeDefined();
-  expect(collected.daemonRunning).toBe(true);
-  const stale: TriageInputs = {
-    ...collected,
-    daemonRunning: true,
-    checks: { ...healthyChecks(), daemon: { ok: false, label: "background sync", message: "stale", status: "stale" } },
-  };
-  expect(findingById(triageWorkspace(stale).findings, "halt:mass-delete")).toBeUndefined();
+  expect(collected.daemon.running).toBe(true);
+  expect(collected.daemon.stale).toBe(true);
+  expect(collected.daemon.ownsRoot).toBe(false);
+  const findings = triageWorkspace(collected).findings;
+  expect(findingById(findings, "halt:mass-delete")).toBeUndefined();
+  expect(findingById(findings, "daemon-stale-binding")).toBeDefined();
+});
+
+// ---- R2 HIGH 3: ownership is ONE fresh, root-aware observation ----
+
+test("a pid that is alive but is not this root's daemon leaves residue unowned", async () => {
+  // PID reuse, reproduced against the REAL observation: the pidfile names a live
+  // process that is not an rbox daemon for this root at all.
+  await writeActivity({
+    at: new Date(NOW).toISOString(),
+    halt: {
+      at: new Date(NOW).toISOString(),
+      reason: "pull would delete 900 of 1000 tracked files",
+      count: 1,
+      op: "pull",
+      typedReason: { kind: "mass-delete", op: "pull" },
+    },
+    outOfStorage: { at: new Date(NOW).toISOString(), kind: "storage" },
+  });
+  await fs.mkdir(daemonRuntimeDir(root), { recursive: true });
+  await fs.writeFile(daemonPidPath(root), `v2 ${process.pid} ${BOOT}\n`);
+
+  const collected = await readTriageInputs(root, healthyChecks(), NOW);
+  expect(collected.activity?.halt).toBeDefined();
+  expect(collected.daemon.running).toBe(false);
+  expect(collected.daemon.ownsRoot).toBe(false);
+
+  const findings = triageWorkspace(collected).findings;
+  expect(findingById(findings, "halt:mass-delete")).toBeUndefined();
+  expect(findingById(findings, "quota-storage")).toBeUndefined();
+  expect(findingById(findings, "daemon-stopped")).toBeDefined();
+});
+
+test("a live rbox daemon for ANOTHER root does not claim this one", async () => {
+  // Same pid, real `ps` inspection: the command line names a different root, so
+  // the root-scoped observation refuses it (bare isDaemonProcess would not).
+  const other = path.join(path.dirname(root), "some-other-workspace");
+  const squatter = Bun.spawn(["sh", "-c", "sleep 30", "__daemon-run", other], { stdout: "ignore", stderr: "ignore" });
+  try {
+    await fs.mkdir(daemonRuntimeDir(root), { recursive: true });
+    await fs.writeFile(daemonPidPath(root), `v2 ${squatter.pid} ${BOOT}\n`);
+    await writeActivity({
+      at: new Date(NOW).toISOString(),
+      halt: {
+        at: new Date(NOW).toISOString(),
+        reason: "pull would delete 900 of 1000 tracked files",
+        count: 1,
+        op: "pull",
+        typedReason: { kind: "mass-delete", op: "pull" },
+      },
+    });
+    const collected = await readTriageInputs(root, healthyChecks(), NOW);
+    expect(collected.daemon.ownsRoot).toBe(false);
+    expect(findingById(triageWorkspace(collected).findings, "halt:mass-delete")).toBeUndefined();
+  } finally {
+    squatter.kill();
+    await squatter.exited;
+  }
+});
+
+test("ownership comes from the triage-time observation, not the earlier check verdict", async () => {
+  await writeActivity({
+    at: new Date(NOW).toISOString(),
+    halt: {
+      at: new Date(NOW).toISOString(),
+      reason: "pull would delete 5 of 50 tracked files",
+      count: 1,
+      op: "pull",
+      typedReason: { kind: "mass-delete", op: "pull" },
+    },
+  });
+  // A daemon that rebound to THIS root after collection captured "stale": the
+  // stale check verdict must not suppress the halt its live daemon is reporting.
+  const staleChecks = healthyChecks();
+  staleChecks.daemon = { ok: false, label: "background sync", message: "stale", status: "stale" };
+  const collected = await readTriageInputs(root, staleChecks, NOW, liveness({ running: true }));
+  expect(collected.daemon.ownsRoot).toBe(true);
+  const findings = triageWorkspace(collected).findings;
+  expect(findingById(findings, "halt:mass-delete")).toBeDefined();
+  expect(findingById(findings, "daemon-stale-binding")).toBeUndefined();
 });
 
 // ------------------- HIGH 4/5: ambient state bound to the live daemon incarnation
 
 test("a pull-only claim requires the status record to match the live pidfile incarnation", async () => {
   await writeDaemonRecords({ statusBootId: "boot-other", pidBootId: BOOT, status: { mode: "pull-only", daemonVersion: "1.9.0" } });
-  const mismatched = await readTriageInputs(root, healthyChecks(), NOW, { isDaemonProcess: () => true });
-  expect(mismatched.pid.bootId).toBe(BOOT);
+  const mismatched = await readTriageInputs(root, healthyChecks(), NOW, liveness({ running: true }));
+  expect(mismatched.daemon.bootId).toBe(BOOT);
   expect(mismatched.ambient.kind).toBe("ok");
   expect(findingById(triageWorkspace(mismatched).findings, "pull-only")).toBeUndefined();
 
   await writeDaemonRecords({ statusBootId: BOOT, pidBootId: BOOT, status: { mode: "pull-only", daemonVersion: "1.9.0" } });
-  const bound = await readTriageInputs(root, healthyChecks(), NOW, { isDaemonProcess: () => true });
+  const bound = await readTriageInputs(root, healthyChecks(), NOW, liveness({ running: true }));
   const pullOnly = findingById(triageWorkspace(bound).findings, "pull-only");
   expect(pullOnly?.command).toBe(`cd ${root} && rbox start --read-write`);
   // MEDIUM 14: pull-only still APPLIES remote changes locally.
   expect(pullOnly?.safety).toContain("DO keep downloading and applying here");
+});
+
+test("a record from a PREVIOUS boot yields no watcher and no version-skew finding either", async () => {
+  // The exact reproduction from review round 2: an old-boot record that used to
+  // produce watcher-degraded + daemon-version-skew because only `mode` was gated.
+  await writeDaemonRecords({
+    statusBootId: "boot-previous",
+    pidBootId: BOOT,
+    status: { state: "attention", attentionReason: "watcher-degraded", mode: "pull-only", daemonVersion: "1.0.0" },
+  });
+  const old = await readTriageInputs(root, healthyChecks(), NOW, liveness({ running: true }));
+  // Producer proof: the record parsed, the daemon is live and owns this root —
+  // the boot-id mismatch is the only thing standing between them.
+  expect(old.ambient.kind).toBe("ok");
+  expect(old.daemon.ownsRoot).toBe(true);
+  expect(old.daemon.bootId).toBe(BOOT);
+
+  const findings = triageWorkspace(old).findings;
+  expect(findingById(findings, "watcher-degraded")).toBeUndefined();
+  expect(findingById(findings, "daemon-version-skew")).toBeUndefined();
+  expect(findingById(findings, "ownership-lost")).toBeUndefined();
+  expect(findingById(findings, "pull-only")).toBeUndefined();
+});
+
+test("a legacy record with no boot id at all is not trusted", async () => {
+  await writeDaemonRecords({
+    pidBootId: BOOT,
+    status: { state: "attention", attentionReason: "watcher-degraded", daemonVersion: "1.0.0" },
+  });
+  const legacy = await readTriageInputs(root, healthyChecks(), NOW, liveness({ running: true }));
+  expect(legacy.ambient.kind).toBe("ok");
+  expect(findingById(triageWorkspace(legacy).findings, "watcher-degraded")).toBeUndefined();
 });
 
 test("a dead daemon's fresh record produces no watcher or version finding", async () => {
@@ -289,7 +474,7 @@ test("a dead daemon's fresh record produces no watcher or version finding", asyn
     pidBootId: BOOT,
     status: { state: "attention", attentionReason: "watcher-degraded", daemonVersion: "1.0.0" },
   });
-  const dead = await readTriageInputs(root, healthyChecks(), NOW, { isDaemonProcess: () => false });
+  const dead = await readTriageInputs(root, healthyChecks(), NOW, liveness({ running: false }));
   expect(dead.ambient.kind).toBe("ok");
   const findings = triageWorkspace(dead).findings;
   expect(findingById(findings, "watcher-degraded")).toBeUndefined();
@@ -302,7 +487,7 @@ test("a future-dated heartbeat is not trusted as live state", async () => {
     pidBootId: BOOT,
     status: { state: "attention", attentionReason: "watcher-degraded", heartbeatAt: new Date(NOW + 3 * 3600_000).toISOString() },
   });
-  const skewed = await readTriageInputs(root, healthyChecks(), NOW, { isDaemonProcess: () => true });
+  const skewed = await readTriageInputs(root, healthyChecks(), NOW, liveness({ running: true }));
   expect(skewed.ambient.kind).toBe("ok");
   expect(findingById(triageWorkspace(skewed).findings, "watcher-degraded")).toBeUndefined();
 });
@@ -313,7 +498,7 @@ test("a live, boot-bound, fresh record does surface the degraded watcher and ver
     pidBootId: BOOT,
     status: { state: "attention", attentionReason: "watcher-degraded", daemonVersion: "1.0.0" },
   });
-  const live = await readTriageInputs(root, healthyChecks(), NOW, { isDaemonProcess: () => true });
+  const live = await readTriageInputs(root, healthyChecks(), NOW, liveness({ running: true }));
   const findings = triageWorkspace(live).findings;
   expect(findingById(findings, "watcher-degraded")?.command).toBe(`cd ${root} && rbox stop && rbox start`);
   expect(findingById(findings, "daemon-version-skew")?.command).toBe("rbox upgrade");
@@ -323,11 +508,11 @@ test("a live, boot-bound, fresh record does surface the degraded watcher and ver
 
 test("every workspace-scoped remedy carries its own workspace", () => {
   const checks = healthyChecks();
-  checks.daemon = { ok: false, label: "background sync", message: "stopped", status: "stopped" };
   checks.state = { ok: false, label: "state", message: "not valid JSON", status: "malformed" };
   checks.locking = { ok: false, label: "locking", message: "starved", status: "starved" };
   const triage = triageWorkspace(inputs({
     checks,
+    daemon: STOPPED,
     adopt: { status: "active", phase: "scanning", journalId: "j1" },
     deferrals: [deferral()],
   }));
@@ -353,8 +538,8 @@ test("a pull-side mass-delete halt consents to that pull only, and names the cou
     },
   });
   await writeDaemonRecords({ statusBootId: BOOT, pidBootId: BOOT });
-  const live = await readTriageInputs(root, healthyChecks(), NOW, { isDaemonProcess: () => true });
-  expect(live.daemonRunning).toBe(true);
+  const live = await readTriageInputs(root, healthyChecks(), NOW, liveness({ running: true }));
+  expect(live.daemon.ownsRoot).toBe(true);
   const finding = findingById(triageWorkspace(live).findings, "halt:mass-delete");
   expect(finding?.command).toBe(`cd ${root} && rbox pull --allow-mass-delete`);
   expect(finding?.command).not.toContain("rbox sync");
@@ -375,7 +560,7 @@ test("a push-side mass-delete halt consents to that push only", async () => {
     },
   });
   await writeDaemonRecords({ statusBootId: BOOT, pidBootId: BOOT });
-  const live = await readTriageInputs(root, healthyChecks(), NOW, { isDaemonProcess: () => true });
+  const live = await readTriageInputs(root, healthyChecks(), NOW, liveness({ running: true }));
   const finding = findingById(triageWorkspace(live).findings, "halt:mass-delete");
   expect(finding?.command).toBe(`cd ${root} && rbox push --allow-mass-delete`);
   expect(finding?.problem).toContain("everywhere else you sync");
@@ -393,6 +578,9 @@ test("malformed local state is honest that rbox cannot repair it, and never offe
   expect(finding?.problem).toContain("rbox cannot repair this by itself");
   expect(finding?.command).toBe(`cd ${root} && rbox doctor --report`);
   expect(finding?.command).not.toContain("rbox recover");
+  // R2 MEDIUM 4: the PROSE remedy is scoped like the structured ones.
+  expect(finding?.safety).toContain(`cd ${root} && rbox setup`);
+  expect(finding?.safety).not.toMatch(/[^&] `rbox setup`/);
 });
 
 test("a state file from another workspace gets its own finding, also without rbox recover", () => {
@@ -517,9 +705,8 @@ test("only proven-healthy deferral classes claim the repository is healthy", () 
 test("blocked findings sort ahead of attention, and advisories sort last", () => {
   const checks = healthyChecks();
   checks.enrollment = { ok: false, label: "encryption", message: "device key is missing" };
-  checks.daemon = { ok: false, label: "background sync", message: "stopped", status: "stopped" };
   checks.version = { ok: false, label: "version", message: "update available", latest: "9.9.9" };
-  const triage = triageWorkspace(inputs({ checks }));
+  const triage = triageWorkspace(inputs({ checks, daemon: STOPPED }));
   expect(triage.findings.map((f) => f.id)).toEqual(["encryption-key", "daemon-stopped", "update-available"]);
   expect(triage.healthy).toBe(false);
   expect(renderWorkspaceTriage(triage).join("\n")).toContain("2 things need your attention.");
@@ -560,9 +747,11 @@ test("doctor --json emits the same findings machine-readably, and refuses --repo
   expect(payload.schemaVersion).toBe(1);
   expect(payload.scope).toBe("workspace");
   expect(payload.root).toBe(path.resolve(root));
-  // Offline: the machine-readable twin must make the same "couldn't check" call.
+  // Offline: the machine-readable twin makes the same "couldn't check" call...
   expect(payload.findings.some((f) => f.id === "service-unreachable")).toBe(true);
-  expect(payload.findings.some((f) => f.id === "signed-out")).toBe(false);
+  // ...without suppressing a definitive local fact (no credentials on disk at
+  // all is proven, not inconclusive), and without inventing corruption.
+  expect(payload.findings.some((f) => f.id === "signed-out")).toBe(true);
   expect(payload.findings.some((f) => f.id === "history-unreadable")).toBe(false);
   for (const finding of payload.findings) {
     expect(finding.problem.length).toBeGreaterThan(0);
