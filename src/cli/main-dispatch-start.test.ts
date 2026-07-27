@@ -39,9 +39,9 @@ afterEach(async () => {
   await fs.rm(temp, { recursive: true, force: true });
 });
 
-test("start outside a workspace stays a clear error for non-TTY stdin", async () => {
+test("start outside a workspace is a clear error for non-TTY stdin", async () => {
   Object.defineProperty(process.stdin, "isTTY", { value: false, configurable: true });
-  await expect(main({ frontDoorImport })).rejects.toThrow("Not inside an rbox workspace");
+  await expect(main({ frontDoorImport })).rejects.toThrow("Not inside a synced folder. Run `rbox` to get started, or pass the folder: rbox start <path>");
   expect(frontDoorCalls).toBe(0);
 });
 
@@ -52,10 +52,17 @@ test("non-interactive bare rbox never runs the interactive front door", async ()
   expect(frontDoorCalls).toBe(0);
 });
 
-test("start outside a workspace invokes the guided front door for TTY stdin", async () => {
+test("start outside a workspace on a TTY errors instead of opening the front door", async () => {
   Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
-  await main({ frontDoorImport });
-  expect(frontDoorCalls).toBe(1);
+  await expect(main({ frontDoorImport })).rejects.toThrow("Not inside a synced folder. Run `rbox` to get started, or pass the folder: rbox start <path>");
+  expect(frontDoorCalls).toBe(0);
+});
+
+test("start with a path outside any workspace errors instead of opening the front door", async () => {
+  Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+  process.argv = [process.execPath, "rbox", "start", temp];
+  await expect(main({ frontDoorImport })).rejects.toThrow("Not inside a synced folder");
+  expect(frontDoorCalls).toBe(0);
 });
 
 test("start rejects mutually exclusive explicit mode flags", async () => {

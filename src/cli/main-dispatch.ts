@@ -68,6 +68,13 @@ function workspaceRequiredError(): Error {
   return new Error("Not inside an rbox workspace. Run `rbox setup` to get started, or `rbox track <path>` to bind a directory.");
 }
 
+/** `start` used to open the guided front door when it could not resolve a workspace
+ *  on a TTY, which made one command mean two different things. It now only starts a
+ *  workspace's background sync, and routes setup to the bare-`rbox` front door. */
+function startWorkspaceRequiredError(): Error {
+  return new Error("Not inside a synced folder. Run `rbox` to get started, or pass the folder: rbox start <path>");
+}
+
 async function resolveRoot(arg: string | undefined): Promise<string> {
   const root = await findRoot(arg ? path.resolve(arg) : process.cwd());
   if (!root) throw workspaceRequiredError();
@@ -439,18 +446,9 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
         : flags["read-write"] === "true"
           ? "read-write" as const
           : undefined;
-      if (positional[0]) {
-        await startDaemonAndRecordDesired(await resolveRoot(positional[0]), { mode });
-        break;
-      }
-      const root = await findRoot(process.cwd());
-      if (root) {
-        await startDaemonAndRecordDesired(root, { mode });
-      } else if (process.stdin.isTTY) {
-        await runGuidedFrontDoor(deps.frontDoorImport);
-      } else {
-        throw workspaceRequiredError();
-      }
+      const root = await findRoot(positional[0] ? path.resolve(positional[0]) : process.cwd());
+      if (!root) throw startWorkspaceRequiredError();
+      await startDaemonAndRecordDesired(root, { mode });
       break;
     }
     case "stop": {
