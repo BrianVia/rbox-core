@@ -136,7 +136,7 @@ export const COMMAND_HELP: CommandHelp[] = [
       { flag: "--pull-only", desc: "watch remote changes without pushing local changes" },
       { flag: "--read-write", desc: "pull and push changes" },
     ],
-    notes: ["Run outside a workspace with no path, on a terminal, and rbox opens the guided setup to create or join one."],
+    notes: ["[path] defaults to the current directory; run `rbox` to set one up."],
   },
   {
     name: "stop",
@@ -648,59 +648,64 @@ export function renderCommand(c: CommandHelp): string {
   return lines.join("\n");
 }
 
-/** Render the founder-approved top-level help screen with only essential flows. */
+/**
+ * Render the founder-approved top-level help screen: the common loop only, with
+ * the real signatures. The `[PATH]` argument is the point — it already exists in
+ * every one of these commands, and hiding it here is what made `start` read like
+ * a machine-wide daemon switch instead of a workspace verb.
+ *
+ * Column widths are computed across ALL rows so one description column runs the
+ * length of the screen.
+ */
+const ESSENTIAL_HELP_GROUPS: { heading: string; entries: [string, string][] }[] = [
+  {
+    heading: "GET STARTED",
+    entries: [
+      ["rbox", "set up rbox, or pick what to do in this folder"],
+      ["rbox status [PATH]", "show one workspace, or all when outside one"],
+    ],
+  },
+  {
+    heading: "SYNC",
+    entries: [
+      ["rbox sync [PATH]", "sync once"],
+      ["rbox start [PATH]", "start background sync"],
+      ["rbox stop [PATH]", "stop background sync"],
+      ["rbox logs [PATH]", "show background-sync logs"],
+    ],
+  },
+  {
+    heading: "ADD A MACHINE",
+    entries: [
+      ["rbox pair", "create a token on a machine that's already set up"],
+      ["rbox connect TOKEN", "authorize + encrypt this machine with that token"],
+    ],
+  },
+  {
+    heading: "FIX",
+    entries: [["rbox doctor [PATH]", "explain what's wrong and what to run next"]],
+  },
+  {
+    heading: "MORE",
+    entries: [
+      ["rbox <command> --help", "flags and details for one command"],
+      ["rbox help --all", "the full command reference"],
+    ],
+  },
+];
+
 export function renderEssentialHelp(): string {
   const lines: string[] = [];
   lines.push(`${style.bold("rbox")} — end-to-end encrypted sync for your dev folders`);
 
-  const groups: { heading: string; entries: [string, string][] }[] = [
-    {
-      heading: "START",
-      entries: [
-        ["setup", "guided onboarding: account → workspace → syncing"],
-        ["status", "what's synced, what's running"],
-      ],
-    },
-    {
-      heading: "SYNC",
-      entries: [
-        ["start", "begin background sync for this workspace"],
-        ["stop", "stop background sync"],
-        ["sync", "sync once, right now"],
-        ["logs", "follow the background-sync log"],
-      ],
-    },
-    {
-      heading: "ADD A MACHINE",
-      entries: [
-        ["pair", "create a token on a signed-in machine"],
-        ["connect", "authorize + encrypt this machine with a pairing token"],
-      ],
-    },
-    {
-      heading: "IF SOMETHING'S WRONG",
-      entries: [
-        ["doctor", "check workspace health"],
-        ["trash", "list/restore files rbox moved aside"],
-        ["key", "encryption: status, backup, recover"],
-      ],
-    },
-    {
-      heading: "MORE",
-      entries: [
-        ["rbox help --all", "the full command reference"],
-        ["rbox <command> --help", "flags and details for one command"],
-      ],
-    },
-  ];
-
-  for (const { heading, entries } of groups) {
+  const w = Math.max(...ESSENTIAL_HELP_GROUPS.flatMap(({ entries }) => entries.map(([command]) => command.length)));
+  for (const { heading, entries } of ESSENTIAL_HELP_GROUPS) {
     lines.push("");
     lines.push(style.dim(heading));
-    const w = Math.max(...entries.map(([command]) => command.length));
     for (const [command, summary] of entries) lines.push(`  ${command.padEnd(w)}  ${style.dim(summary)}`);
   }
   lines.push("");
+  lines.push(style.dim("PATH names any folder inside a workspace; it selects that whole workspace."));
   lines.push(style.dim("Exit codes: 0 ok, 1 error, 130 user cancel (Ctrl-C)."));
   return lines.join("\n");
 }

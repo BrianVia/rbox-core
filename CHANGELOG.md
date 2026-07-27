@@ -21,6 +21,19 @@ All notable changes to rbox are recorded here. The format follows
   `--residue-bytes` to measure their size on disk.
 
 ### Changed
+- **`rbox --help` now shows the real command signatures.** The default screen
+  listed bare words (`start`, `stop`, `sync`), hiding the `[PATH]` argument that
+  every one of those commands already accepts and making `start` read like a
+  machine-wide switch. It now shows `rbox sync [PATH]`, `rbox start [PATH]`,
+  `rbox stop [PATH]`, `rbox logs [PATH]`, `rbox status [PATH]`, and
+  `rbox doctor [PATH]`, and is pared to the common loop. `rbox help --all`
+  still prints the full reference.
+- **`rbox start` no longer opens guided setup.** Run outside a synced folder on
+  a terminal, it used to launch the interactive front door — one command with
+  two meanings. It now starts background sync for the workspace at `[PATH]` or
+  the current directory, and otherwise fails with "Not inside a synced folder.
+  Run `rbox` to get started, or pass the folder: rbox start <path>". Bare
+  `rbox` remains the setup front door.
 - Manifest publications now report whether they emitted a delta or snapshot,
   including encoded size (and delta operation count), in daemon logs and
   interactive push, pull, and sync diagnostics.

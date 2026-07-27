@@ -99,30 +99,39 @@ test("the registry's alias targets agree with the deprecations resolver (no drif
 test("essential screen matches the founder-approved top-level help", () => {
   expect(renderEssentialHelp()).toBe(`rbox — end-to-end encrypted sync for your dev folders
 
-START
-  setup   guided onboarding: account → workspace → syncing
-  status  what's synced, what's running
+GET STARTED
+  rbox                   set up rbox, or pick what to do in this folder
+  rbox status [PATH]     show one workspace, or all when outside one
 
 SYNC
-  start  begin background sync for this workspace
-  stop   stop background sync
-  sync   sync once, right now
-  logs   follow the background-sync log
+  rbox sync [PATH]       sync once
+  rbox start [PATH]      start background sync
+  rbox stop [PATH]       stop background sync
+  rbox logs [PATH]       show background-sync logs
 
 ADD A MACHINE
-  pair     create a token on a signed-in machine
-  connect  authorize + encrypt this machine with a pairing token
+  rbox pair              create a token on a machine that's already set up
+  rbox connect TOKEN     authorize + encrypt this machine with that token
 
-IF SOMETHING'S WRONG
-  doctor  check workspace health
-  trash   list/restore files rbox moved aside
-  key     encryption: status, backup, recover
+FIX
+  rbox doctor [PATH]     explain what's wrong and what to run next
 
 MORE
-  rbox help --all        the full command reference
   rbox <command> --help  flags and details for one command
+  rbox help --all        the full command reference
 
+PATH names any folder inside a workspace; it selects that whole workspace.
 Exit codes: 0 ok, 1 error, 130 user cancel (Ctrl-C).`);
+});
+
+test("every workspace verb on the essential screen advertises its real [PATH] signature", () => {
+  const screen = renderEssentialHelp();
+  for (const command of ["status", "sync", "start", "stop", "logs", "doctor"]) {
+    expect(screen, `${command} must show its argument`).toContain(`rbox ${command} [PATH]`);
+  }
+  // Later memo steps add these; never advertise a flag the CLI does not accept.
+  expect(screen).not.toContain("status --all");
+  expect(screen).not.toContain("doctor --all");
 });
 
 test("full-reference screen renders every public group and omits hidden commands", () => {
