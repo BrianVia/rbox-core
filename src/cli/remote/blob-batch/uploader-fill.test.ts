@@ -61,11 +61,15 @@ class FakeClock {
   }
 }
 
+// Fill-policy tests exercise the BATCH lane; packs are default-on since #504
+// closed, so beforeEach selects the legacy arm explicitly.
 beforeEach(async () => {
   for (const key of ENV_KEYS) {
+
     if (!savedEnv.has(key)) savedEnv.set(key, process.env[key]);
     delete process.env[key];
   }
+  process.env.RBOX_BLOB_PACK = "0";
   resetBatchBlobStateForTests();
   resetUploadDispatchStatsForTests();
   batchSizes = [];

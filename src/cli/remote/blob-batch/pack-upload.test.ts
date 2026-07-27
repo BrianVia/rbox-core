@@ -669,6 +669,15 @@ describe("pack builder and knobs", () => {
     await expect(buildPack([{ sha: changed.sha, size: 11, srcPath: changed.path, uploadsDir: tmpDir }])).rejects.toThrow("member size changed");
   });
 
+  test("pack writer is DEFAULT-ON; RBOX_BLOB_PACK=0 is the kill switch", () => {
+    delete process.env.RBOX_BLOB_PACK;
+    expect(packUploadConfig().enabled).toBe(true);
+    process.env.RBOX_BLOB_PACK = "0";
+    expect(packUploadConfig().enabled).toBe(false);
+    process.env.RBOX_BLOB_PACK = "1";
+    expect(packUploadConfig().enabled).toBe(true);
+  });
+
   test("founder knobs clamp to compiled hard limits", () => {
     process.env.RBOX_BLOB_PACK = "1";
     process.env.RBOX_PACK_STREAMS = "999";

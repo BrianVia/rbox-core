@@ -63,7 +63,11 @@ export function fillVersion(): "v1" | "v2" {
 }
 
 export function packUploadEnabled(): boolean {
-  return process.env.RBOX_BLOB_PACK === "1";
+  // Default-ON since 2026-07-27 (founder decision, issue #504 closed): correctness
+  // + wall-time + connection-efficiency all field-validated on dev and the fleet;
+  // reader floor v1.5.0 verified against live prod devices. RBOX_BLOB_PACK=0 is
+  // the kill switch.
+  return process.env.RBOX_BLOB_PACK !== "0";
 }
 
 export function packUploadConfig(): PackConfig {
