@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
+  observeDaemon,
   readTriageInputs,
   renderWorkspaceTriage,
   triageWorkspace,
@@ -368,6 +369,42 @@ test("a pid that is alive but is not this root's daemon leaves residue unowned",
   expect(findingById(findings, "halt:mass-delete")).toBeUndefined();
   expect(findingById(findings, "quota-storage")).toBeUndefined();
   expect(findingById(findings, "daemon-stopped")).toBeDefined();
+});
+
+test("a live daemon for a PREFIX SIBLING root does not claim this one", async () => {
+  // Round-3 defect, reproduced end to end through the real `ps` read: ownership
+  // used a substring test, so a daemon for `<root>-old` owned `<root>` — and a
+  // reused pid then attributed that workspace's halt to this one.
+  const sibling = `${root}-old`;
+  const squatter = Bun.spawn(["sh", "-c", "sleep 30", "__daemon-run", sibling], { stdout: "ignore", stderr: "ignore" });
+  try {
+    // The SAME live pid is recorded for both roots — the pid reuse this defect
+    // needed. Only the command line can tell the two workspaces apart.
+    for (const owner of [root, sibling]) {
+      await fs.mkdir(daemonRuntimeDir(owner), { recursive: true });
+      await fs.writeFile(daemonPidPath(owner), `v2 ${squatter.pid} ${BOOT}\n`);
+    }
+    await writeActivity({
+      at: new Date(NOW).toISOString(),
+      halt: {
+        at: new Date(NOW).toISOString(),
+        reason: "pull would delete 900 of 1000 tracked files",
+        count: 1,
+        op: "pull",
+        typedReason: { kind: "mass-delete", op: "pull" },
+      },
+    });
+    expect(observeDaemon(root).ownsRoot).toBe(false);
+    // ...and the same process IS still recognized as the sibling's own daemon.
+    expect(observeDaemon(sibling).running).toBe(true);
+
+    const collected = await readTriageInputs(root, healthyChecks(), NOW);
+    expect(collected.activity?.halt).toBeDefined();
+    expect(findingById(triageWorkspace(collected).findings, "halt:mass-delete")).toBeUndefined();
+  } finally {
+    squatter.kill();
+    await squatter.exited;
+  }
 });
 
 test("a live rbox daemon for ANOTHER root does not claim this one", async () => {
