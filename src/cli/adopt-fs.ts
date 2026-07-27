@@ -143,7 +143,15 @@ export async function secureMoveNoReplace(input: {
   beforeRename?: () => void | Promise<void>;
 }): Promise<SecureMoveResult> {
   const source = await openedParent(input.sourceRoot, input.sourceRel, false);
-  const destination = await openedParent(input.destinationRoot, input.destinationRel, input.createDestinationParents === true);
+  let destination: Awaited<ReturnType<typeof openedParent>>;
+  try {
+    destination = await openedParent(input.destinationRoot, input.destinationRel, input.createDestinationParents === true);
+  } catch (error) {
+    // A refused destination walk (e.g. a symlinked parent under O_NOFOLLOW)
+    // must not strand the already-open source parent handle.
+    await source.handle.close().catch(() => {});
+    throw error;
+  }
   try {
     const sourceBefore = await identityAt(source.handle, source.leaf, input.expectedSource.kind === "file");
     if (!identitiesEqual(input.expectedSource, sourceBefore)) throw new Error(`adoption source identity changed: ${input.sourceRel}`);
