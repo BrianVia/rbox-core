@@ -50,6 +50,7 @@ interface Harness {
   stopped: boolean;
   manifest: Manifest;
   complete: boolean;
+  revision: number;
 }
 
 function harness(options: {
@@ -78,6 +79,7 @@ function harness(options: {
     stopped: false,
     manifest: options.manifest ?? manifestOf(),
     complete: true,
+    revision: 0,
   };
   const retries = new LocalRetryQueue({
     requeue: (paths) => h.requeued.push([...paths]),
@@ -98,12 +100,23 @@ function harness(options: {
       h.topology.push(observation);
       return { kind: observation.kind, absenceAuthority: "authoritative", topology: "shrinking-snapshot", registryActions: [], floorRequired: false };
     },
-    install: (next, update, unsettled, observedUnder) => {
-      h.installs.push({ next, update, unsettled, observedUnder });
-      h.manifest = next;
+    // The LOCAL-authority seam is a sealed commit intent (`CommitLocalObservation`);
+    // this harness records the SAME facts the previous install/completeness effects
+    // carried, so every assertion below still reads the observer's own output.
+    authority: {
+      snapshot: () => ({ lineageToken: "harness", localRevision: h.revision }),
+      commitObservation: (intent) => {
+        h.installs.push({ next: intent.next, update: intent.update, unsettled: intent.unsettled, observedUnder: intent.observedUnderMatcherGeneration });
+        if (intent.completeness !== undefined) {
+          h.completeness.push(intent.completeness === "complete");
+          h.complete = intent.completeness === "complete";
+        }
+        h.manifest = intent.next;
+        h.revision += 1;
+        return { observationId: intent.identity.observationId, outcome: "advanced", localRevision: h.revision, observationComplete: h.complete };
+      },
+      get observationComplete() { return h.complete; },
     },
-    setObservationComplete: (complete) => { h.completeness.push(complete); h.complete = complete; },
-    observationComplete: () => h.complete,
     log: (line) => h.logs.push(line),
     recordScanFault: () => {},
     scanTree: (async (_root, _matcher, _cache, _onProgress, _onGitRepo, _stats, deferred) => {

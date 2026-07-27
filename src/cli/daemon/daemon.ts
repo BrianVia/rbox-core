@@ -120,13 +120,12 @@ import {
 import {
   gitReposMatcherKey,
   gitTopologyChanged,
-  omitPaths,
   patchManifestFromPull,
   pullTrustWatcherEnabled,
-  type ManifestUpdate,
   type SkipCause,
   type TrustedPullViewResult,
 } from "./manifest-update.js";
+import { LocalAuthority } from "./local-observation-transition.js";
 import { cleanPath, LOG_PATHS_MAX, scanStatsLine, summarizeActions } from "./render.js";
 import { errCode, RotatingDaemonLogger, type DaemonLogSink } from "./logger.js";
 import { TelemetryQueue } from "../telemetry/queue.js";
@@ -167,8 +166,6 @@ const TELEMETRY_FLUSH_MS = 120_000;
 const CAPABILITY_INITIAL_DELAY_MS = 5 * 60_000;
 const CAPABILITY_INTERVAL_MS = 6 * 60 * 60_000;
 const SYNC_STATE_HEARTBEAT_MS = 60 * 60_000;
-/** "This install observed nothing" — the seed's unsettled rebuild source (design 202). */
-const EMPTY_PATHS: ReadonlySet<string> = new Set<string>();
 export const GIT_BUSY_RETRY_DELAYS_MS = [2_000, 8_000] as const;
 
 export interface GitBusyRetryClock {
@@ -378,29 +375,13 @@ export class RboxDaemon {
   private readonly syncStateReporter: SyncStateReporter;
   private matcher: IgnoreMatcher; // rebuilt when .gitignore/.rboxignore changes
   private cache!: HashCache;
-  private manifest: Manifest = { generatedAt: "", files: [] };
-  /** After a collision push `manifest` is the safe publication subset, not a
-   * complete observation of the skipped disk paths. Only a fresh scan restores
-   * completeness and may authoritatively clear/revise the episode. */
-  private manifestObservationComplete = true;
-  /** Design 202: paths whose on-disk truth this daemon has NOT observed — watcher
-   *  deferrals, scan deferrals, write-finish give-ups, and conflict copies a pull
-   *  just created. They are stripped from any trusted local view (restoring pull's
-   *  scan-omission semantics, design 108) and exempt the git oracle. Cleared for a
-   *  path only when it is re-observed cleanly or a full-workspace scan installs. */
-  private readonly unsettledPaths = new Set<string>();
-  /** Provenance of the LAST `this.manifest` install (design 202). */
-  private lastManifestUpdate?: ManifestUpdate;
-  /** P5: has any full-workspace install landed since the last state seed? */
-  private fullWorkspaceSinceSeed = false;
+  /** LOCAL authority — head, unread cursor, completeness, and the P5/P7 provenance
+   *  trusted-pull reads (`CommitLocalObservation`). The daemon never assigns them. */
+  private readonly local = new LocalAuthority();
   /** P7: the base `gitRepos` key set `this.matcher` was last built from. */
   private matcherGitReposKey = gitReposMatcherKey();
   /** Design 206 §2: bumped by every `rebuildMatcher`. */
   private matcherGeneration = 0;
-  /** The generation the CURRENT manifest's full-workspace observation STARTED under.
-   *  Never equal to `matcherGeneration` until such an observation installs, so P7
-   *  refuses a manifest whose inclusion decisions predate the live matcher. */
-  private manifestMatcherGeneration = -1;
   /** The `nativePruneGlobs` output the live parcel subscription was created with —
    *  backend state no facade can retro-fix (design 206 §3b). */
   private watcherNativePruneKey: string;
@@ -631,20 +612,18 @@ export class RboxDaemon {
         for (const p of paths) this.pendingEvents.push({ relPath: p, kind: "change" });
         this.request("push");
       },
-      markUnsettled: (p) => this.unsettledPaths.add(p),
+      markUnsettled: (p) => this.local.markUnsettled(p),
       stopped: () => this.stopped,
     });
     this.localObserver = new LocalWorkspaceObserver({
       root,
-      currentManifest: () => this.manifest,
+      currentManifest: () => this.local.manifest,
       currentMatcher: () => this.matcher,
       matcherGeneration: () => this.matcherGeneration,
       scanMode: () => this.watcherScanMode(),
       beginTopologySnapshot: (scanKind) => this.gitDiscovery.beginScanSnapshot(scanKind),
       observeTopology: (observation) => this.gitDiscovery.observe(observation),
-      install: (next, update, unsettled, observedUnder) => this.installManifest(next, update, unsettled, observedUnder),
-      setObservationComplete: (complete) => { this.manifestObservationComplete = complete; },
-      observationComplete: () => this.manifestObservationComplete,
+      authority: this.local,
       log: (line) => this.log(line),
       recordScanFault: () => {
         try { this.telemetry.record({ kind: "safety_event", eventType: "scan_fault", count: 1 }); } catch {}
@@ -1184,7 +1163,7 @@ export class RboxDaemon {
     // The seed is last-synced BASE, not disk truth: nothing has been observed yet,
     // so provenance is cleared and P5 goes false until a full-workspace scan
     // installs (design 202).
-    this.installManifest(state.lastSyncedManifest, undefined, { rebuildFrom: EMPTY_PATHS });
+    this.local.seed(state.lastSyncedManifest);
   }
 
   private scheduleResetRetry(): void {
@@ -1522,7 +1501,7 @@ export class RboxDaemon {
   private async hasPublishableLocalDivergence(): Promise<"none" | "some" | "indeterminate"> {
     const base = this.syncBase;
     if (!base) return "some";
-    const diff = diffManifests(base.lastSyncedManifest, this.manifest);
+    const diff = diffManifests(base.lastSyncedManifest, this.local.manifest);
     if (diff.added.length || diff.changed.length || diff.deleted.some((item) => !this.matcher.ignores(item))) return "some";
     const git = await gitDivergenceStatus(this.root, this.cfg, base, this.matcher);
     return git.count > 0 ? "some" : git.indeterminate ? "indeterminate" : "none";
@@ -1829,8 +1808,8 @@ export class RboxDaemon {
     let res: Awaited<ReturnType<typeof pushManifest>>;
     try {
       const pushManifestInput = this.retryQueue.gcFencedPaths.size > 0 && this.syncBase
-        ? deferManifest(this.manifest, this.syncBase.lastSyncedManifest, this.retryQueue.gcFencedPaths)
-        : this.manifest;
+        ? deferManifest(this.local.manifest, this.syncBase.lastSyncedManifest, this.retryQueue.gcFencedPaths)
+        : this.local.manifest;
       res = await pushManifest(this.root, this.cfg, pushManifestInput, {
         ...this.e2ee,
         cache: this.cache,
@@ -1849,7 +1828,7 @@ export class RboxDaemon {
         mutationBoundary: this.mutationGate,
         onCaseCollisionObservation: (observation) => this.observeCaseCollisions(observation),
       }, {
-        localFileObservation: this.manifestObservationComplete
+        localFileObservation: this.local.observationComplete
           ? { authority: "authoritative" }
           : { authority: "preserve", caseCollisions: this.activeCaseCollisions },
       });
@@ -1873,12 +1852,12 @@ export class RboxDaemon {
     // entry, not observed disk truth, so they are unsettled exactly like a scan's or
     // a watcher's deferrals (design 108's gap: this install used to bypass the
     // bookkeeping entirely). Push behavior itself is unchanged.
-    this.installManifest(res.manifest, { kind: "partial", source: "push-committed", paths: new Set(res.deferred ?? []) }, {
+    this.local.commitPatch(res.manifest, { kind: "partial", source: "push-committed", paths: new Set(res.deferred ?? []) }, {
       add: res.deferred ?? [],
     });
     this.activeCaseCollisions = res.caseCollisions.map((group) => ({ paths: [...group.paths] }));
-    this.manifestObservationComplete = res.localFileObservationAuthority === "authoritative"
-      && this.activeCaseCollisions.length === 0;
+    this.local.setObservationComplete(res.localFileObservationAuthority === "authoritative"
+      && this.activeCaseCollisions.length === 0);
     // Forensic record: every ADVANCE of the remote sequence this daemon caused, with the
     // resulting tree size and anything it had to defer. Gated on `committed` (design 44):
     // a push whose internal 409-recovery PULLED a remote sequence and then no-opped must
@@ -1979,7 +1958,7 @@ export class RboxDaemon {
       if (events.some((e) => isIgnoreRuleFile(e.relPath)) || collisionIntersection) {
         this.rebuildMatcher(await this.loadSyncBase());
         if (events.some((e) => isIgnoreRuleFile(e.relPath))) this.rulesChangedSinceDeepScan = true;
-        const receipt = await this.localObserver.observe({ kind: "scan", cache: this.cache, previous: this.manifest, mode: this.watcherScanMode() });
+        const receipt = await this.localObserver.observe({ kind: "scan", cache: this.cache, previous: this.local.manifest, mode: this.watcherScanMode() });
         await this.resolveDriftFromAppliedEvents(events, receipt.deferredPaths);
       } else {
         const receipt = await this.localObserver.observe({ kind: "watch-batch", events, cache: this.cache });
@@ -2000,7 +1979,7 @@ export class RboxDaemon {
     // upgrade completeness again.
     this.activeCaseCollisions = groups;
     if (observation.authority === "preserve" || groups.length > 0) {
-      this.manifestObservationComplete = false;
+      this.local.setObservationComplete(false);
     }
     if (observation.authority !== "authoritative") return;
     const run = this.pathWarningWrite.then(async () => {
@@ -2032,7 +2011,7 @@ export class RboxDaemon {
 
   /** P2: the manifest is a complete observation with no active case-fold collision. */
   private manifestSettledForPull(): boolean {
-    return this.manifestObservationComplete && this.activeCaseCollisions.length === 0;
+    return this.local.observationComplete && this.activeCaseCollisions.length === 0;
   }
 
   /**
@@ -2046,12 +2025,12 @@ export class RboxDaemon {
     if (!pullTrustWatcherEnabled()) return { skip: "kill-switch" };              // F5
     if (!this.watcherTrustedForPull()) return { skip: "p1-watcher" };            // P1
     if (!this.manifestSettledForPull()) return { skip: "p2-observation" };       // P2
-    if (!this.fullWorkspaceSinceSeed) return { skip: "p5-seed" };                // P5
+    if (!this.local.fullWorkspaceSinceSeed) return { skip: "p5-seed" };          // P5
     if (this.resetLifecycle !== "ready") return { skip: "p6-reset" };            // P6
     if (this.matcherGitReposKey !== gitReposMatcherKey(base)) return { skip: "p7-matcher" };            // P7
     // Design 206 §2: provenance alone would re-engage trust over a manifest whose
     // inclusion decisions predate the current matcher.
-    if (this.manifestMatcherGeneration !== this.matcherGeneration) return { skip: "p7-matcher-observation" };
+    if (this.local.observedMatcherGeneration !== this.matcherGeneration) return { skip: "p7-matcher-observation" };
     await this.applyPendingWatchEvents();                                        // P3
     if (this.pendingEvents.length > 0) return { skip: "p3-pending" };
     // The drain is P's only side-effecting clause and it awaits: re-read the two
@@ -2060,11 +2039,11 @@ export class RboxDaemon {
     if (!this.watcherTrustedForPull()) return { skip: "p1-watcher" };
     if (!this.manifestSettledForPull()) return { skip: "p2-observation" };
     // `deferred` aliases the live set deliberately: it is read-only to `pull()`
-    // (ReadonlySet) and every writer of `unsettledPaths` is pump-owned code that
+    // (ReadonlySet) and every writer of the unsettled set is pump-owned code that
     // cannot run while this op's `pull()` is in flight — watcher callbacks only
     // enqueue events, and the pump is single-flight. The op therefore sees one
     // consistent snapshot without copying it.
-    return { view: { manifest: omitPaths(this.manifest, this.unsettledPaths), deferred: this.unsettledPaths } };
+    return { view: { manifest: this.local.trustedProjection(), deferred: this.local.unsettledPaths } };
   }
 
   /**
@@ -2083,7 +2062,7 @@ export class RboxDaemon {
     const patched = patchManifestFromPull(local, actions, postBase);
     // A conflict copy's content is unknown until something hashes it; the watcher
     // event that observes it settles it and the next push publishes it.
-    this.installManifest(patched.manifest, { kind: "partial", source: "pull-applied", paths: patched.paths }, {
+    this.local.commitPatch(patched.manifest, { kind: "partial", source: "pull-applied", paths: patched.paths }, {
       add: patched.unsettled,
     });
     return { ok: true };
@@ -2433,12 +2412,12 @@ export class RboxDaemon {
   private localSnapshot(settled: boolean, now: number): DaemonActivity["local"] | undefined {
     const base = this.syncBase;
     if (!base) return undefined;
-    const manifestDiff = diffManifests(base.lastSyncedManifest, this.manifest);
+    const manifestDiff = diffManifests(base.lastSyncedManifest, this.local.manifest);
     return {
       at: new Date(now).toISOString(),
       stream: base.stream,
       baseSequence: base.lastSyncedSequence,
-      trackedFiles: this.manifest.files.length,
+      trackedFiles: this.local.manifest.files.length,
       added: manifestDiff.added.length,
       changed: manifestDiff.changed.length,
       deleted: manifestDiff.deleted.filter((p) => !this.matcher.ignores(p)).length,
@@ -2466,8 +2445,8 @@ export class RboxDaemon {
         currentPath: this.activeProgressPath,
         repoRecords: this.syncBase ? projectedRepoRecords(this.syncBase) : undefined,
       }),
-      fileCount: this.manifest.files.length,
-      totalBytes: this.manifest.files.reduce((n, f) => n + f.size, 0),
+      fileCount: this.local.manifest.files.length,
+      totalBytes: this.local.manifest.files.reduce((n, f) => n + f.size, 0),
       daemonVersion: RBOX_VERSION,
       mode: this.pullOnly ? "pull-only" : "read-write",
       bootId: this.bootId,
@@ -2816,7 +2795,7 @@ export class RboxDaemon {
     const errorGenAtStart = this.watcherErrorGeneration;
     const stats = createScanStats();
     const started = Date.now();
-    const { deferredPaths, coverage } = await this.localObserver.observe({ kind: "scan", cache: this.cache, previous: this.manifest, scanStats: stats, scanKind: "safety scan", mode: this.watcherScanMode() });
+    const { deferredPaths, coverage } = await this.localObserver.observe({ kind: "scan", cache: this.cache, previous: this.local.manifest, scanStats: stats, scanKind: "safety scan", mode: this.watcherScanMode() });
     if (metricsEnabled()) this.log(scanStatsLine("safety scan", stats, Date.now() - started, deferredPaths.size));
     this.lastSafetyCompletedMs = Date.now();
     this.pruneCache();
@@ -2838,7 +2817,7 @@ export class RboxDaemon {
     if (this.syncBase) this.ensureMatcherProvenance(this.syncBase);
     const errorGenAtStart = this.watcherErrorGeneration;
     const scanStartMs = Date.now();
-    const priorManifest = this.manifest;
+    const priorManifest = this.local.manifest;
     const eventGenAtScan = this.watcherUnsettledGeneration;
     const rulesChanged = this.rulesChangedSinceDeepScan;
     const stats = createScanStats();
@@ -2854,7 +2833,7 @@ export class RboxDaemon {
     const fresh = new HashCache();
     let scanResult: ScanObservationReceipt;
     try {
-      scanResult = await this.localObserver.observe({ kind: "scan", cache: fresh, previous: this.manifest, scanStats: stats, scanKind: "deep scan", mode: "unpruned" });
+      scanResult = await this.localObserver.observe({ kind: "scan", cache: fresh, previous: this.local.manifest, scanStats: stats, scanKind: "deep scan", mode: "unpruned" });
     } catch (error) {
       this.openDriftAudits.delete(audit);
       throw error;
@@ -2915,7 +2894,7 @@ export class RboxDaemon {
   private async resolveDriftFromAppliedEvents(events: WatchEvent[], deferred: ReadonlySet<string>): Promise<void> {
     await this.mutateDriftState((state) => {
       if (state.pending.length === 0) return false;
-      const result = resolveCoveredAtApply(state.pending, events, deferred, this.manifest);
+      const result = resolveCoveredAtApply(state.pending, events, deferred, this.local.manifest);
       if (result.pending.length === state.pending.length) return false;
       state.pending = result.pending;
       state.resolvedSinceLastAudit.lateCovered += result.lateCovered;
@@ -3013,7 +2992,7 @@ export class RboxDaemon {
    * a workspace's lifetime — real disk bloat on fast-churning monorepos.
    */
   private pruneCache(): void {
-    this.cache.prune(new Set(this.manifest.files.map((f) => f.path)));
+    this.cache.prune(new Set(this.local.manifest.files.map((f) => f.path)));
   }
 
   private rebuildMatcher(state?: { lastSyncedManifest: Manifest }): void {
@@ -3080,47 +3059,6 @@ export class RboxDaemon {
     };
   }
 
-  /**
-   * The ONE way `this.manifest` is replaced (design 202). It owns the assignment,
-   * the provenance stamp — only a full-workspace install clears seed staleness (P5);
-   * a partial patch has no access to that upgrade at all — and the reconciliation of
-   * `unsettledPaths` that belongs with it, so no install site can quietly land new
-   * in-memory truth while leaving one of the three behind.
-   *
-   * `update === undefined` is the state SEED: nothing has been observed yet, so the
-   * provenance is cleared rather than stamped.
-   *
-   * `unsettled` is applied in the order a caller means it: `rebuildFrom` first (a
-   * full-workspace observation re-derives the whole set), then `settle` (paths this
-   * update read cleanly), then `add` (paths it could not read) — so a path that is
-   * both re-observed and re-deferred ends up unsettled.
-   */
-  private installManifest(
-    next: Manifest,
-    update: ManifestUpdate | undefined,
-    unsettled?: { rebuildFrom?: ReadonlySet<string>; settle?: Iterable<string>; add?: Iterable<string> },
-    /** Design 206 §2: the matcher generation the full-workspace OBSERVATION started
-     *  under — captured by its caller, never re-read here. Meaningless for a partial
-     *  update (no observation) and for the seed (nothing observed at all). */
-    observedUnderMatcherGeneration?: number,
-  ): void {
-    this.manifest = next;
-    this.lastManifestUpdate = update;
-    if (update === undefined) {
-      this.fullWorkspaceSinceSeed = false;
-      this.manifestMatcherGeneration = -1;
-    } else if (update.kind === "full-workspace") {
-      this.fullWorkspaceSinceSeed = true;
-      this.manifestMatcherGeneration = observedUnderMatcherGeneration ?? -1;
-    }
-    if (unsettled?.rebuildFrom) {
-      this.unsettledPaths.clear();
-      for (const p of unsettled.rebuildFrom) this.unsettledPaths.add(p);
-    }
-    if (unsettled?.settle) for (const p of unsettled.settle) this.unsettledPaths.delete(p);
-    if (unsettled?.add) for (const p of unsettled.add) this.unsettledPaths.add(p);
-  }
-
   /** Adoption invalidation is a durable cross-process generation, not merely a
    * disk-cache deletion. Observe it only under the workspace mutex, drop every
    * resident scan hint, and acknowledge only after an uncached unpruned scan. */
@@ -3129,7 +3067,7 @@ export class RboxDaemon {
     if (!record || record.generation <= this.observedAdoptCacheGeneration) return;
     const fresh = new HashCache();
     this.rebuildMatcher(this.syncBase);
-    const prior = this.manifest;
+    const prior = this.local.manifest;
     const scanned = await this.localObserver.observe({ kind: "scan", cache: fresh, previous: prior, scanKind: "deep scan", mode: "unpruned" });
     if (scanned.deferredPaths.size > 0) throw new Error("adoption cache generation full scan deferred; publication remains blocked");
     this.cache = fresh;

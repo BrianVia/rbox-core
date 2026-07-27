@@ -231,7 +231,7 @@ test("drop-spanning survivor is unattributable via a subsequent re-trusted audit
     fs.writeFileSync(path.join(root, "drift.txt"), "old");
     const cfg = { remoteWorkspaceId: "ws", projectId: "root", deviceId: "dev", rootPath: root, remoteUrl: "mem://", token: "" };
     const d = new RboxDaemon(root, cfg as never, {} as never, { bootId: "boot" }) as never as {
-      cache: HashCache; manifest: unknown; matcher: unknown; watcher?: unknown; watcherSessionId?: string;
+      cache: HashCache; local: { head: unknown }; matcher: unknown; watcher?: unknown; watcherSessionId?: string;
       trustState: string; watcherHealthy: boolean; watcherErrorGeneration: number; lastTransientDropMs: number; recoveryHoldMs: number;
       startWatcherFn: (r: string, m: unknown, cb: unknown, o?: { onError?: (e: Error) => void }) => Promise<{ backend: "parcel"; close(): Promise<void> }>;
       startLiveWatch(): Promise<void>; doDeepScan(): Promise<unknown>; runDriftAuditNow(): Promise<void>;
@@ -241,7 +241,7 @@ test("drop-spanning survivor is unattributable via a subsequent re-trusted audit
     let onError: ((e: Error) => void) | undefined;
     d.startWatcherFn = (_r, _m, _cb, o) => { onError = o?.onError; return Promise.resolve({ backend: "parcel", close: async () => {} }); };
     d.cache = await HashCache.load(root);
-    d.manifest = await scanManifest(root, d.matcher as never, d.cache);
+    d.local.head = await scanManifest(root, d.matcher as never, d.cache);
     await d.startLiveWatch();
     d.watcherSessionId = "session";
 

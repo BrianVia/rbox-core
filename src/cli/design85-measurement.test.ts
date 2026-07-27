@@ -61,7 +61,7 @@ test("daemon deep audit records, confirms, and races without sleeping", async ()
     const cfg = { schema: "e2ee/v1", remoteWorkspaceId: "ws", projectId: "root", deviceId: "dev", rootPath: root, remoteUrl: "mem://", token: "", encrypted: true, kek: "00".repeat(32), accountId: "a", accountEpoch: 0, keyEpoch: 0 };
     const daemon = new RboxDaemon(root, cfg as never, { remote: {} as never, backoff: async () => {} }, { bootId: "boot" }) as any;
     daemon.cache = await HashCache.load(root);
-    daemon.manifest = await scanManifest(root, daemon.matcher, daemon.cache);
+    daemon.local.head = await scanManifest(root, daemon.matcher, daemon.cache);
     daemon.watcher = { close: async () => {} };
     daemon.watcherSessionId = "session";
     await fs.writeFile(path.join(root, "DISTINCTIVE_PRIVATE_DRIFT_NAME"), "changed");
@@ -119,7 +119,7 @@ test("a candidate born in a NON-quiescent scan never counts as a quiescent-gated
     const cfg = { schema: "e2ee/v1", remoteWorkspaceId: "ws", projectId: "root", deviceId: "dev", rootPath: root, remoteUrl: "mem://", token: "", encrypted: true, kek: "00".repeat(32), accountId: "a", accountEpoch: 0, keyEpoch: 0 };
     const daemon = new RboxDaemon(root, cfg as never, { remote: {} as never, backoff: async () => {} }, { bootId: "boot" }) as any;
     daemon.cache = await HashCache.load(root);
-    daemon.manifest = await scanManifest(root, daemon.matcher, daemon.cache);
+    daemon.local.head = await scanManifest(root, daemon.matcher, daemon.cache);
     daemon.watcher = { close: async () => {} };
     daemon.watcherSessionId = "session";
 
@@ -153,7 +153,7 @@ test("drift sidecar write failure is measurement-only — the apply path never t
     const cfg = { schema: "e2ee/v1", remoteWorkspaceId: "ws", projectId: "root", deviceId: "dev", rootPath: root, remoteUrl: "mem://", token: "", encrypted: true, kek: "00".repeat(32), accountId: "a", accountEpoch: 0, keyEpoch: 0 };
     const daemon = new RboxDaemon(root, cfg as never, { remote: {} as never, backoff: async () => {} }, { bootId: "boot" }) as any;
     daemon.cache = await HashCache.load(root);
-    daemon.manifest = await scanManifest(root, daemon.matcher, daemon.cache);
+    daemon.local.head = await scanManifest(root, daemon.matcher, daemon.cache);
     daemon.watcher = { close: async () => {} };
     daemon.watcherSessionId = "session";
 
@@ -191,7 +191,7 @@ test("a batch applied between scan and settle covers the candidate — never a f
     const cfg = { schema: "e2ee/v1", remoteWorkspaceId: "ws", projectId: "root", deviceId: "dev", rootPath: root, remoteUrl: "mem://", token: "", encrypted: true, kek: "00".repeat(32), accountId: "a", accountEpoch: 0, keyEpoch: 0 };
     const daemon = new RboxDaemon(root, cfg as never, { remote: {} as never, backoff: async () => {} }, { bootId: "boot" }) as any;
     daemon.cache = await HashCache.load(root);
-    daemon.manifest = await scanManifest(root, daemon.matcher, daemon.cache);
+    daemon.local.head = await scanManifest(root, daemon.matcher, daemon.cache);
     daemon.watcher = { close: async () => {} };
     daemon.watcherSessionId = "session";
 
