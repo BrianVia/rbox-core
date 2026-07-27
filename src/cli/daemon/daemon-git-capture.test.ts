@@ -312,9 +312,14 @@ test("every raw want.push assignment is owned by requestPush and terminal record
   const requestPush = source.slice(source.indexOf("private requestPush"), source.indexOf("private takePushProvenance"));
   expect(requestPush).toContain("this.want.push = true");
   expect(source.match(/this\.recordGitCaptureSuccess\(provenance\)/g)).toHaveLength(1);
-  const returned = source.indexOf("res = await pushManifest");
-  const recorded = source.indexOf("this.recordGitCaptureSuccess(provenance)");
-  const bookkeeping = source.indexOf("this.local.commitPatch(res.manifest", recorded);
-  expect(returned).toBeLessThan(recorded);
+  // The ordering this gate froze now lives in the publish reducer that owns it: a
+  // terminal refusal returns before any capture credit, and credit precedes the
+  // committed-subset bookkeeping.
+  const reducer = fs.readFileSync(fileURLToPath(new URL("./daemon-publish-transition.ts", import.meta.url)), "utf8");
+  const terminal = reducer.indexOf('if (outcome.kind === "terminal-block")');
+  const recorded = reducer.indexOf('"record-git-capture-success"', terminal);
+  const bookkeeping = reducer.indexOf('"commit-published-subset"', recorded);
+  expect(terminal).toBeGreaterThan(0);
+  expect(terminal).toBeLessThan(recorded);
   expect(recorded).toBeLessThan(bookkeeping);
 });
