@@ -9,7 +9,7 @@ import {
   encodePackHeader,
   type PackDirEntry,
 } from "../../../src/engine/blob-pack.js";
-import { commitAccounting, isDeleteFenceAbort, validateCommitRefs } from "../src/commit-accounting.js";
+import { ACCOUNTING_INSERT_CHUNK, commitAccounting, isDeleteFenceAbort, validateCommitRefs } from "../src/commit-accounting.js";
 import { blobGet } from "../src/blobs.js";
 import { WorkspaceSync } from "../src/workspace-sync.js";
 
@@ -346,7 +346,9 @@ describe("design 114 receipt placement accounting", () => {
       expectedRefs: typeof firstRefs,
       installedAt: number,
     ) => {
-      for (const index of [0, 1025, 2048, 2049]) {
+      // 1999/2000 straddle the PACKED_PLACEMENT_CHUNK JSON seam; 2048/2049 straddle
+      // the pack boundary this test introduces. Both pairs must agree.
+      for (const index of [0, 1025, 1999, 2000, 2048, 2049]) {
         const expected = expectedRefs[index]!;
         expect(await db()
           .prepare("SELECT storage,pack_id,offset,length,pack_sha256,installed_at FROM blob_locations WHERE sha256=?")
@@ -438,6 +440,54 @@ describe("design 114 receipt placement accounting", () => {
     expect(await db()
       .prepare("SELECT 1 FROM pack_gc_candidates WHERE pack_id=?")
       .bind(destinationPack.id)
+      .first()).toBeNull();
+  });
+
+  // Regression: the canonical DELETE and the packed INSERT for the SAME pack must
+  // not be reordered across ACCOUNTING_INSERT_CHUNK boundaries. Before design 210
+  // the placement inserts were emitted per 33-ref chunk, so a chunk-0 canonical
+  // delete that emptied pack A ran BEFORE the chunk-1 insert that refilled it —
+  // firing blob_locations_delete_pack_candidate and leaving a spurious
+  // pack_gc_candidates row. That row transiently fences every read/PUT of a live
+  // pack (blob-pack.ts fenceRead) until pack GC unmarks it. Grouping all placement
+  // inserts ahead of all canonical deletes removes the window.
+  test("canonical delete and packed insert for one pack in different chunks leave no GC candidate", async () => {
+    const a = await bootstrap("pack-accounting-cross-chunk-order");
+    const pack = { id: nextId(), sha: hash("cross-chunk-order-pack") };
+    const leaving = hash("cross-chunk-leaving");
+    const arriving = hash("cross-chunk-arriving");
+    const members = [
+      { sha256: leaving, offset: 64, length: 10 },
+      { sha256: arriving, offset: 74, length: 12 },
+    ];
+    await seedReadyPack(pack.id, pack.sha, members);
+
+    // `leaving` starts as the pack's only placement, so removing it empties pack A.
+    expect(await commitAccounting(db(), a.accountId, [
+      { sha: leaving, size: 10, pack: { packId: pack.id, offset: 64, length: 10, packSha256: pack.sha } },
+    ], 3_000_000_000)).toEqual({ ok: true });
+    expect((await location(leaving))?.pack_id).toBe(pack.id);
+
+    // ACCOUNTING_INSERT_CHUNK is 33: `leaving` plus 32 fillers fill chunk 0, so the
+    // canonical delete lands a whole chunk before `arriving`'s placement insert.
+    const refs = [
+      { sha: leaving, size: 10 },
+      ...Array.from({ length: ACCOUNTING_INSERT_CHUNK - 1 }, (_, i) => ({ sha: hash(`cross-chunk-filler-${i}`), size: 5 })),
+      { sha: arriving, size: 12, pack: { packId: pack.id, offset: 74, length: 12, packSha256: pack.sha } },
+    ];
+    expect(refs.length).toBe(ACCOUNTING_INSERT_CHUNK + 1);
+    expect(await commitAccounting(db(), a.accountId, refs, 3_000_000_001)).toEqual({ ok: true });
+
+    expect(await location(leaving)).toBeNull();
+    expect(await location(arriving)).toEqual({
+      pack_id: pack.id,
+      offset: 74,
+      length: 12,
+      pack_sha256: pack.sha,
+    });
+    expect(await db()
+      .prepare("SELECT 1 FROM pack_gc_candidates WHERE pack_id=?")
+      .bind(pack.id)
       .first()).toBeNull();
   });
 });

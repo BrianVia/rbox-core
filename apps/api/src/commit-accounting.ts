@@ -40,7 +40,9 @@ export const SELECTS_PER_BATCH = Math.ceil(MAX_REFS_PER_TXN / VALIDATE_IN_LIST_C
 // Worst mixed chunk: 5 logical-accounting statements + 1 canonical-location
 // delete. Packed placements are grouped separately across the whole transaction.
 export const ACCOUNTING_STATEMENTS_PER_CHUNK = 6;
-// One compact JSON value stays comfortably below D1's ~1 MiB bound-value limit.
+// 2,000 compact rows (two 64-hex shas, a 32-hex pack id, offset, length) measure
+// ~484 KB — roughly 4x under D1's documented 2,000,000-byte string/bound-value
+// limit. `packed` is itself bounded by MAX_REFS_PER_TXN, so no chunk exceeds this.
 export const PACKED_PLACEMENT_CHUNK = 2_000;
 // §71: hard sanity reject on the ACCOUNTED ref set in one commit. For sidecar commits the
 // signed descriptor's data-ref count is not the full accounting set: encManifestSha and

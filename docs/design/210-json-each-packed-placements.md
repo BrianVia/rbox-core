@@ -23,9 +23,17 @@ Only packed-placement statement construction changes.
 - Placement installation remains in the same `db.batch()` transaction and
   therefore keeps the existing cap/delete-fence failure unit.
 - Packed placement statements run before the unchanged canonical deletes. This
-  preserves the prior same-chunk trigger ordering and prevents a destination
-  pack from being transiently empty (and falsely marked as a GC candidate)
-  while a packed row is moving into it.
+  preserves the prior *same-chunk* trigger ordering and **fixes** the prior
+  *cross-chunk* ordering. Previously the placement inserts were emitted inside
+  the per-33-ref loop, so a canonical `DELETE` in chunk 0 that emptied pack A
+  ran BEFORE a chunk-1 placement insert that refilled it. That fired
+  `blob_locations_delete_pack_candidate` and left a spurious
+  `pack_gc_candidates` row for a pack that is still live. The row is not a
+  data-loss risk — `pack-gc.ts` unmarks candidates that regained locations and
+  re-checks emptiness before setting `deleting_at` — but until it is unmarked,
+  `fenceRead` in `blob-pack.ts` rejects every read/PUT of that pack, because it
+  treats any `pack_gc_candidates` row as a fence. Grouping all placement
+  inserts ahead of all canonical deletes closes that window.
 - The `blob_locations` column order and conflict behavior stay:
   `sha256`, `storage='pack'`, `pack_id`, `offset`, `length`, `pack_sha256`,
   `installed_at=nowMs`; conflict updates every existing mutable placement
@@ -67,7 +75,11 @@ construction without repeating it in every JSON object. Explicit casts
 preserve integer `offset` and `length`; `nowMs` is already an integer.
 `WHERE true` avoids SQLite's documented parsing ambiguity between a `SELECT`
 join clause and the UPSERT `ON CONFLICT`. Each JSON value remains far below
-D1's approximate 1 MiB bound-value limit.
+D1's bound-value limit: 2,000 rows of two 64-hex SHAs, a 32-hex pack id, a
+10-digit offset and an 8-digit length measure **484,001 bytes**, roughly 4x
+under D1's documented 2,000,000-byte string limit (and ~2x under 1 MiB). The
+chunk cannot grow past 2,000 rows: `packed` is bounded by `MAX_REFS_PER_TXN`
+and then re-chunked at `PACKED_PLACEMENT_CHUNK` regardless of commit size.
 
 At 5,000 packed refs, the two existing super-batches contain 3,000 and 2,000
 refs, producing two plus one placement statements: 385 → 3.
@@ -88,6 +100,11 @@ Extend `apps/api/test/blob-pack-redeem.test.ts`:
 3. In a mixed packed/canonical commit, preinstall locations for both SHAs,
    commit one packed and one canonical ref, and assert the packed location is
    updated while the canonical SHA's row is deleted.
+4. Cross-chunk ordering regression: place a pack's only member, then commit that
+   SHA as canonical alongside 32 canonical fillers (filling chunk 0) plus a
+   second placement into the SAME pack (chunk 1). Assert no `pack_gc_candidates`
+   row survives. This test is RED against the pre-210 implementation — test 3
+   alone is not, because both its refs share one 33-ref chunk.
 
 Run the focused test file during review, then `bun run test:api` and
 `bun run typecheck`.
