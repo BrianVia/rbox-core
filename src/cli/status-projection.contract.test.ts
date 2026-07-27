@@ -162,8 +162,12 @@ test("one invocation performs one projection: every admitted read happens exactl
   expect(calls.length).toBe(new Set(calls).size);
 });
 
-test("the renderer performs zero I/O: status-cmd.ts holds no reader of its own", async () => {
-  const source = await fs.readFile(path.join(path.dirname(fileURLToPath(import.meta.url)), "status-cmd.ts"), "utf8");
+test("the renderer performs zero I/O: the composition root and its renderers hold no reader of their own", async () => {
+  const dir = path.dirname(fileURLToPath(import.meta.url));
+  // Both halves of the emission surface: cycle 3 moved rendering out of
+  // status-cmd.ts, so the lock must follow the behavior, not the filename.
+  const locked = ["status-cmd.ts", "status-render.ts"];
+  const source = (await Promise.all(locked.map((file) => fs.readFile(path.join(dir, file), "utf8")))).join("\n");
   // Composition-root effects cycle 1 kept: the hashcache writeback's ownership
   // probe and the best-effort desired-mode promotion. Everything else a status
   // surface shows must arrive through the projection.
