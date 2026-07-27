@@ -34,7 +34,6 @@ import { expectedStateNonce, loadConfig, loadState, repoRecordsForState, syncStr
 import { pruneTrash } from "../../engine/trash.js";
 import { DAEMON_BOOT_ID_ENV, readDaemonPidRecord, recordDaemonBinding } from "./runtime-state.js";
 import { MassDeleteGuardError, PushConflictExhaustedError, TrustedViewRefusalError, pull, pushManifest, type SyncDeps, type TrustedLocalView } from "../sync.js";
-import { deferManifest } from "../sync-recovery.js";
 import type { TransferPhase, TransferProgressBytes } from "../transfer-progress.js";
 import { buildAuthedRemote } from "../e2ee-client.js";
 import { E2eeRemote } from "../e2ee-remote.js";
@@ -126,6 +125,7 @@ import {
   type TrustedPullViewResult,
 } from "./manifest-update.js";
 import { LocalAuthority } from "./local-observation-transition.js";
+import { classifyPublishOutcome, PublishLocalWorkspaceTransition } from "./daemon-publish-transition.js";
 import { cleanPath, LOG_PATHS_MAX, scanStatsLine, summarizeActions } from "./render.js";
 import { errCode, RotatingDaemonLogger, type DaemonLogSink } from "./logger.js";
 import { TelemetryQueue } from "../telemetry/queue.js";
@@ -1799,22 +1799,20 @@ export class RboxDaemon {
     }
   }
 
+  /** The publish composition root: prologue, the report lifecycle the push deps bag
+   *  owns, and one sealed transition. Everything the outcome is allowed to change
+   *  lives in {@link PublishLocalWorkspaceTransition}. */
   private async doPush(syncMutex: WorkspaceSyncMutex, provenance: PushProvenance): Promise<void> {
     this.typeFlipsSincePull = 0; // per-op tally — a failed prior op's flips must not inflate this one's count
     await this.applyPendingWatchEvents();
-    const blockedFingerprint = this.terminalPushBlock();
     const metricsReport = beginReport("push");
     const report = metricsReport ?? (telemetryEnabled() ? PhaseReport.push() : undefined);
-    let res: Awaited<ReturnType<typeof pushManifest>>;
-    try {
-      const pushManifestInput = this.retryQueue.gcFencedPaths.size > 0 && this.syncBase
-        ? deferManifest(this.local.manifest, this.syncBase.lastSyncedManifest, this.retryQueue.gcFencedPaths)
-        : this.local.manifest;
-      res = await pushManifest(this.root, this.cfg, pushManifestInput, {
+    await this.publishTransition.publish(provenance, {
+      execute: (request) => classifyPublishOutcome(request, () => pushManifest(this.root, this.cfg, request.manifest, {
         ...this.e2ee,
         cache: this.cache,
         syncMutex,
-        blockedFingerprint,
+        blockedFingerprint: request.blockedFingerprint,
         onCommitConflict: () => this.bumpConflict("commit"),
         report,
         onGitLog: this.log, // design 43 §10: capture/carry/defer/remove forensics in the daemon log
@@ -1827,76 +1825,54 @@ export class RboxDaemon {
         telemetry: this.telemetry,
         mutationBoundary: this.mutationGate,
         onCaseCollisionObservation: (observation) => this.observeCaseCollisions(observation),
-      }, {
-        localFileObservation: this.local.observationComplete
-          ? { authority: "authoritative" }
-          : { authority: "preserve", caseCollisions: this.activeCaseCollisions },
-      });
-    } catch (e) {
-      if (e instanceof CommitRejectedError && e.stillBlocked) {
-        this.pushTerminalBlocked = true;
-        this.logTerminalPushBlocked(e.fingerprint);
-        // The attempt may have established the capable state lineage before the
-        // remote repeated its terminal refusal. Adopt that durable nonce just as
-        // the normal completion path does, or the next pump mistakes our own
-        // initialization for an idle rebind and stops the daemon.
-        const durableState = await this.loadSyncBase();
-        this.emitDurableGitDeferrals(durableState);
-        return;
-      }
-      throw e;
-    }
-    this.recordGitCaptureSuccess(provenance);
-    // The committed subset (stays fresh even across a conflict re-scan). It differs
-    // from what we handed push only at the paths push DEFERRED — those carry the base
-    // entry, not observed disk truth, so they are unsettled exactly like a scan's or
-    // a watcher's deferrals (design 108's gap: this install used to bypass the
-    // bookkeeping entirely). Push behavior itself is unchanged.
-    this.local.commitPatch(res.manifest, { kind: "partial", source: "push-committed", paths: new Set(res.deferred ?? []) }, {
-      add: res.deferred ?? [],
+      }, { localFileObservation: request.localFileObservation })),
+      settleReport: () => {
+        if (report) this.syncPhaseSampler.recordCompleted(report, "push", this.telemetry);
+        metricsReport?.logSummaryTo(this.log); // Explicit metrics opt-out is silent. By default even a
+        // no-op tick logs its state-load/git-plan cost — intentional since design 82 §4 (the
+        // invisible steady-state cost is exactly what that design instruments).
+      },
     });
-    this.activeCaseCollisions = res.caseCollisions.map((group) => ({ paths: [...group.paths] }));
-    this.local.setObservationComplete(res.localFileObservationAuthority === "authoritative"
-      && this.activeCaseCollisions.length === 0);
-    // Forensic record: every ADVANCE of the remote sequence this daemon caused, with the
-    // resulting tree size and anything it had to defer. Gated on `committed` (design 44):
-    // a push whose internal 409-recovery PULLED a remote sequence and then no-opped must
-    // not be logged as if THIS daemon published it — and the steady-state no-op stays
-    // silent so it doesn't fill the log.
-    if (res.committed && res.sequence !== this.lastLoggedSeq) {
-      const deferredNote =
-        res.deferred && res.deferred.length > 0
-          ? `; deferred ${res.deferred.length}: ${res.deferred.slice(0, LOG_PATHS_MAX).map(cleanPath).join(" ")}`
-          : "";
-      this.log(`push: published sequence ${res.sequence} (${res.manifest.files.length} files${deferredNote})`);
-    }
-    this.lastLoggedSeq = res.sequence;
-    if (res.committed) {
+  }
+
+  private readonly publishTransition = new PublishLocalWorkspaceTransition({
+    sealAttemptInputs: () => ({
+      manifest: this.local.manifest,
+      appliedBase: this.syncBase?.lastSyncedManifest,
+      gcFencedPaths: this.retryQueue.gcFencedPaths,
+      observationComplete: this.local.observationComplete,
+      caseCollisions: this.activeCaseCollisions,
+      blockedFingerprint: this.terminalPushBlock(),
+    }),
+    lastPublishedSequence: () => this.lastLoggedSeq,
+    noteTerminalBlock: (fingerprint) => {
+      this.pushTerminalBlocked = true;
+      this.logTerminalPushBlocked(fingerprint);
+    },
+    recordGitCaptureSuccess: (provenance) => this.recordGitCaptureSuccess(provenance),
+    commitPublishedSubset: (next, deferred) => {
+      this.local.commitPatch(next, { kind: "partial", source: "push-committed", paths: new Set(deferred) }, { add: deferred });
+    },
+    adoptCollisionObservation: (groups, observationComplete) => {
+      this.activeCaseCollisions = groups.map((group) => ({ paths: [...group.paths] }));
+      this.local.setObservationComplete(observationComplete);
+    },
+    log: (line) => this.log(line),
+    notePublishedSequence: (sequence) => { this.lastLoggedSeq = sequence; },
+    recordPublishActivity: (files, sequence) => {
       // The status trail: "last push: 2m ago — N files → sequence S" (design 45).
       // Its own slot — it must never mask what a recovery pull applied.
-      this.activity.lastPush = { at: new Date().toISOString(), files: res.manifest.files.length, sequence: res.sequence };
+      this.activity.lastPush = { at: new Date().toISOString(), files, sequence };
       this.activityDirty = true;
-    }
-    // Files deferred because they were still changing under the push: re-enqueue them
-    // promptly (bounded) rather than waiting for the 60s safety scan. Reuses the same
-    // per-path retry budget as mid-write files — a pathologically-churning file gives up
-    // to the safety/deep scan instead of hot-looping. res.manifest already carries their
-    // base (or omits them), so a genuine settle is re-detected by the change event's re-hash.
-    if (res.deferred && res.deferred.length > 0) {
-      const retryLater = new Set(res.retryLater ?? []);
-      const writeFinish = new Set(res.deferred.filter((p) => !retryLater.has(p)));
-      if (writeFinish.size > 0) this.retryQueue.scheduleWriteFinish(writeFinish);
-      if (retryLater.size > 0) this.retryQueue.scheduleGcFence(retryLater);
-    }
-    const durableState = await this.loadSyncBase();
-    this.emitDurableGitDeferrals(durableState);
-    this.metrics.syncs += 1;
-    await saveMetrics(this.root, this.metrics);
-    if (report) this.syncPhaseSampler.recordCompleted(report, "push", this.telemetry);
-    metricsReport?.logSummaryTo(this.log); // Explicit metrics opt-out is silent. By default even a
-    // no-op tick logs its state-load/git-plan cost — intentional since design 82 §4 (the
-    // invisible steady-state cost is exactly what that design instruments).
-  }
+    },
+    scheduleWriteFinish: (paths) => this.retryQueue.scheduleWriteFinish(new Set(paths)),
+    scheduleGcFence: (paths) => this.retryQueue.scheduleGcFence(new Set(paths)),
+    refreshDurableState: async () => { this.emitDurableGitDeferrals(await this.loadSyncBase()); },
+    recordSyncMetric: async () => {
+      this.metrics.syncs += 1;
+      await saveMetrics(this.root, this.metrics);
+    },
+  });
 
   private terminalPushBlock(): string | undefined {
     const halt = this.activity.halt;
