@@ -356,6 +356,48 @@ export async function saveAdoptJournal(root: string, journal: AdoptJournal): Pro
   await fsyncDirectory(parent);
 }
 
+/**
+ * Persisting rewrites the whole journal, so one write per O(1) event costs
+ * O(workspace) — a 372k-file adopt rewrote 120MB every few seconds. Batching
+ * bounds the high-frequency phases to O(events / ADOPT_PERSIST_BATCH) writes.
+ */
+export const ADOPT_PERSIST_BATCH = 1000;
+export const ADOPT_PERSIST_MAX_DELAY_MS = 2000;
+
+export interface BatchedPersist {
+  /** Journals a mutation, writing only at the batch-size or max-delay bound. */
+  persist(): Promise<void>;
+  /** Records that the in-memory journal changed without considering a write. */
+  mark(): void;
+  /** Writes now if anything is unpersisted. */
+  flush(): Promise<void>;
+}
+
+export function createBatchedPersist(
+  persist: () => Promise<void>,
+  options: { batch?: number; maxDelayMs?: number; now?: () => number } = {},
+): BatchedPersist {
+  const batch = options.batch ?? ADOPT_PERSIST_BATCH;
+  const maxDelayMs = options.maxDelayMs ?? ADOPT_PERSIST_MAX_DELAY_MS;
+  const now = options.now ?? (() => Date.now());
+  let unpersisted = 0;
+  let lastWrite = now();
+  const flush = async (): Promise<void> => {
+    if (unpersisted === 0) return;
+    unpersisted = 0;
+    lastWrite = now();
+    await persist();
+  };
+  return {
+    mark: () => { unpersisted += 1; },
+    flush,
+    persist: async () => {
+      unpersisted += 1;
+      if (unpersisted >= batch || now() - lastWrite >= maxDelayMs) await flush();
+    },
+  };
+}
+
 export async function loadAdoptJournal(root: string): Promise<AdoptJournal | undefined> {
   const resolvedRoot = path.resolve(root);
   for (const component of [path.join(resolvedRoot, ".rbox"), adoptDir(resolvedRoot)]) {

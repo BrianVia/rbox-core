@@ -6,14 +6,17 @@ import {
   secureMoveNoReplace,
 } from "./adopt-fs.js";
 import {
+  ADOPT_PERSIST_BATCH,
   adoptDisplacedDir,
   adoptStashDir,
   adoptUnplacedDir,
+  createBatchedPersist,
   identitiesEqual,
   readAdoptIdentity,
   type AdoptIdentity,
   type AdoptJournal,
   type AdoptOverlayMove,
+  type BatchedPersist,
 } from "./adopt-journal.js";
 
 function relAbs(root: string, rel: string): string {
@@ -106,27 +109,52 @@ async function classifyOrRunMove(
   }
 }
 
-async function addAndRun(
-  journal: AdoptJournal,
-  move: AdoptOverlayMove,
-  persist: () => Promise<void>,
-): Promise<void> {
-  journal.overlayMoves.push(move);
-  await persist();
-  await classifyOrRunMove(journal, move, persist);
-}
-
 /** Ignore-independent, leafwise B-over-A overlay with retained collisions. */
 export async function runFileOverlay(journal: AdoptJournal, persist: () => Promise<void>): Promise<void> {
   const root = journal.workspace.root;
   const stash = adoptStashDir(root);
   const repoPaths = journal.sourceRepos.map((repo) => repo.path);
+  const batched = createBatchedPersist(persist);
+  try {
+    await overlayWalk(journal, root, stash, repoPaths, batched);
+  } finally {
+    await batched.flush();
+  }
+}
 
+async function overlayWalk(
+  journal: AdoptJournal,
+  root: string,
+  stash: string,
+  repoPaths: readonly string[],
+  batched: BatchedPersist,
+): Promise<void> {
   for (const move of journal.overlayMoves) {
-    if (move.state !== "complete" && move.state !== "aborted") await classifyOrRunMove(journal, move, persist);
+    if (move.state !== "complete" && move.state !== "aborted") await classifyOrRunMove(journal, move, batched.persist);
     if (journal.phase === "paused") return;
   }
   const known = new Set(journal.overlayMoves.map((move) => move.path));
+  const pending: AdoptOverlayMove[] = [];
+
+  // The whole batch of intents is journaled in ONE write before any of its moves
+  // execute, so a crash still finds every started move on disk; the replay window
+  // widens from one in-flight move to ADOPT_PERSIST_BATCH, all of which
+  // classifyOrRunMove already reclassifies from live identities on resume.
+  const runPending = async (): Promise<void> => {
+    if (pending.length === 0) return;
+    const batch = pending.splice(0);
+    journal.overlayMoves.push(...batch);
+    batched.mark();
+    await batched.flush();
+    for (const move of batch) {
+      await classifyOrRunMove(journal, move, batched.persist);
+      if (journal.phase === "paused") return;
+    }
+  };
+  const enqueue = async (move: AdoptOverlayMove): Promise<void> => {
+    pending.push(move);
+    if (pending.length >= ADOPT_PERSIST_BATCH) await runPending();
+  };
 
   const walk = async (relativeDirectory: string): Promise<void> => {
     const sourceDir = relAbs(stash, relativeDirectory || ".");
@@ -144,7 +172,7 @@ export async function runFileOverlay(journal: AdoptJournal, persist: () => Promi
         if (!destination) {
           const identity = await createAdoptDirectory(root, rel);
           journal.createdDirectories.push({ path: rel, identity });
-          await persist();
+          await batched.persist();
           await walk(rel);
           continue;
         }
@@ -152,67 +180,85 @@ export async function runFileOverlay(journal: AdoptJournal, persist: () => Promi
           await walk(rel);
           continue;
         }
-        await addAndRun(journal, {
+        await enqueue({
           path: rel, source: rel, destination: rel, disposition: "unplaced", unplaced: rel,
           sourceBefore: source, baselineBefore: destination, state: "intent", reason: "type collision",
-        }, persist);
+        });
         if (journal.phase === "paused") return;
         continue;
       }
 
       if (["fifo", "socket", "device", "other"].includes(source.kind)) {
-        await addAndRun(journal, {
+        await enqueue({
           path: rel, source: rel, destination: rel, disposition: "special", unplaced: rel,
           sourceBefore: source, baselineBefore: destination, state: "intent", reason: `special ${source.kind} retained`,
-        }, persist);
+        });
       } else if (!destination) {
-        await addAndRun(journal, {
+        await enqueue({
           path: rel, source: rel, destination: rel, disposition: "landed", sourceBefore: source, state: "intent",
-        }, persist);
+        });
       } else if (source.kind === destination.kind) {
-        await addAndRun(journal, {
+        await enqueue({
           path: rel, source: rel, destination: rel, disposition: "displaced", displaced: rel,
           sourceBefore: source, baselineBefore: destination, state: "intent",
-        }, persist);
+        });
       } else {
-        await addAndRun(journal, {
+        await enqueue({
           path: rel, source: rel, destination: rel, disposition: "unplaced", unplaced: rel,
           sourceBefore: source, baselineBefore: destination, state: "intent", reason: "type collision",
-        }, persist);
+        });
       }
       if (journal.phase === "paused") return;
     }
   };
   await walk("");
+  if (journal.phase !== "paused") await runPending();
 }
 
 export async function abortFileOverlay(journal: AdoptJournal, persist: () => Promise<void>): Promise<void> {
   const root = journal.workspace.root;
   const stash = adoptStashDir(root);
   const displaced = adoptDisplacedDir(root);
-  for (const move of [...journal.overlayMoves].reverse()) {
-    if (move.state !== "complete") continue;
-    try {
-      if (move.disposition === "landed" || move.disposition === "displaced") {
-        const live = await readAdoptIdentity(relAbs(root, move.destination), move.sourceBefore.kind === "file");
-        if (!identitiesEqual(move.sourceAfter ?? move.sourceBefore, live)) throw new Error("live adopted value changed");
-        await secureMoveNoReplace({ sourceRoot: root, sourceRel: move.destination, destinationRoot: stash, destinationRel: move.source, expectedSource: live, createDestinationParents: true });
+  const batched = createBatchedPersist(persist);
+  try {
+    for (const move of [...journal.overlayMoves].reverse()) {
+      if (move.state !== "complete") continue;
+      try {
+        // Each reversal step is skipped when its result is already on disk, so a
+        // batched abort that crashes between a rename and its journal write
+        // converges on resume instead of refusing the changed live value.
+        if (move.disposition === "landed" || move.disposition === "displaced") {
+          const withContent = move.sourceBefore.kind === "file";
+          const retainedB = await maybeIdentity(relAbs(stash, move.source), withContent);
+          if (!identitiesEqual(move.sourceBefore, retainedB)) {
+            const live = await readAdoptIdentity(relAbs(root, move.destination), withContent);
+            if (!identitiesEqual(move.sourceAfter ?? move.sourceBefore, live)) throw new Error("live adopted value changed");
+            await secureMoveNoReplace({ sourceRoot: root, sourceRel: move.destination, destinationRoot: stash, destinationRel: move.source, expectedSource: live, createDestinationParents: true });
+          }
+        }
+        if (move.disposition === "displaced") {
+          const withContent = move.baselineBefore?.kind === "file";
+          const restoredA = await maybeIdentity(relAbs(root, move.destination), withContent);
+          if (!identitiesEqual(move.baselineBefore, restoredA)) {
+            const retainedA = await readAdoptIdentity(relAbs(displaced, move.displaced!), withContent);
+            if (!identitiesEqual(move.baselineAfter ?? move.baselineBefore, retainedA)) throw new Error("displaced baseline changed");
+            await secureMoveNoReplace({ sourceRoot: displaced, sourceRel: move.displaced!, destinationRoot: root, destinationRel: move.destination, expectedSource: retainedA, createDestinationParents: true });
+          }
+        }
+        move.state = "aborted";
+        await batched.persist();
+      } catch (error) {
+        move.state = "paused"; move.reason = error instanceof Error ? error.message : String(error);
+        journal.phase = "paused"; journal.resumePhase = "aborting"; journal.pauseReasons.push(`${move.path}: ${move.reason}`);
+        batched.mark(); return;
       }
-      if (move.disposition === "displaced") {
-        const retainedA = await readAdoptIdentity(relAbs(displaced, move.displaced!), move.baselineBefore?.kind === "file");
-        if (!identitiesEqual(move.baselineAfter ?? move.baselineBefore, retainedA)) throw new Error("displaced baseline changed");
-        await secureMoveNoReplace({ sourceRoot: displaced, sourceRel: move.displaced!, destinationRoot: root, destinationRel: move.destination, expectedSource: retainedA, createDestinationParents: true });
-      }
-      move.state = "aborted";
-      await persist();
-    } catch (error) {
-      move.state = "paused"; move.reason = error instanceof Error ? error.message : String(error);
-      journal.phase = "paused"; journal.resumePhase = "aborting"; journal.pauseReasons.push(`${move.path}: ${move.reason}`); await persist(); return;
     }
-  }
-  for (const created of [...journal.createdDirectories].reverse()) {
-    await removeEmptyAdoptDirectory(root, created.path, created.identity).catch((error: NodeJS.ErrnoException) => {
-      if (error.code !== "ENOENT" && error.code !== "ENOTEMPTY") throw error;
-    });
+    for (const created of [...journal.createdDirectories].reverse()) {
+      await removeEmptyAdoptDirectory(root, created.path, created.identity).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== "ENOENT" && error.code !== "ENOTEMPTY") throw error;
+      });
+    }
+  } finally {
+    await batched.flush();
   }
 }
