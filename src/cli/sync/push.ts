@@ -5,7 +5,6 @@ import {
   scanManifest,
   validateManifest,
   manifestRequiresSchema4,
-  type IgnoreMatcher,
   type GitSection,
   type FileEntry,
   type Manifest,
@@ -41,10 +40,10 @@ import { withPushLaneAccumulator } from "../telemetry/lane-accumulator.js";
 import { withPushTailTiming } from "../push-tail-timing.js";
 import { savePathWarnings } from "../path-warnings.js";
 import { formatCommitTimings, formatScanStats, scanDetailsOf } from "./format.js";
-import { apiFor, MAX_ATTEMPTS, MassDeleteGuardError, NO_GIT_FORCE, pushMassDeleteTrips, makeDeferErrnoReporter, defaultBackoff, filesFirstFlagEnabled, matcherForState, plaintextBytesOf, fileCountOf, scanTick } from "./policy.js";
+import { apiFor, MAX_ATTEMPTS, NO_GIT_FORCE, makeDeferErrnoReporter, defaultBackoff, filesFirstFlagEnabled, matcherForState, plaintextBytesOf, fileCountOf, scanTick } from "./policy.js";
 import { finishResolutionReceipt, pull, reconcileResolutionReceipt, scanManifestForPushResult, surfaceResolutionReceiptReconciliation } from "./pull.js";
 import { MutationGateClosedError } from "../../engine/mutation-gate.js";
-import { projectLocalManifest } from "../local-file-projection.js";
+import { cloneCollisionGroups, preparePublishCandidate, type GitCapturePort } from "./publish-candidate.js";
 
 const COMMIT_FILE_ENTRY_KEYS = ["path", "sha256", "size", "mode", "mtimeMs", "type", "symlinkTarget", "encSha", "comp", "payloadSha", "cipherSize"] as const;
 const COMMIT_FILE_ENTRY_KEY_SET: ReadonlySet<string> = new Set(COMMIT_FILE_ENTRY_KEYS);
@@ -450,26 +449,6 @@ function filePathsForCache(manifest: Manifest): Set<string> {
   return new Set(manifest.files.filter((entry) => entry.type === "file").map((entry) => entry.path));
 }
 
-function cloneCollisionGroups(groups: readonly CaseFoldCollisionGroup[]): CaseFoldCollisionGroup[] {
-  return groups.map((group) => ({ paths: [...group.paths] }));
-}
-
-function mergeCollisionGroups(
-  previous: readonly CaseFoldCollisionGroup[],
-  discovered: readonly CaseFoldCollisionGroup[],
-): CaseFoldCollisionGroup[] {
-  const groups = new Map<string, CaseFoldCollisionGroup>();
-  for (const group of [...previous, ...discovered]) {
-    const paths = [...new Set(group.paths)].sort();
-    groups.set(paths.join("\0"), { paths });
-  }
-  return [...groups.values()].sort((a, b) => {
-    const ak = a.paths.join("\0");
-    const bk = b.paths.join("\0");
-    return ak < bk ? -1 : ak > bk ? 1 : 0;
-  });
-}
-
 function resultCollisionMetadata(state: PushAttemptState): Pick<PushResult, "caseCollisions" | "localFileObservationAuthority"> {
   return {
     caseCollisions: cloneCollisionGroups(state.caseCollisions),
@@ -505,216 +484,160 @@ async function runPushAttempt(
   const matcher = matcherForState(root, cfg, state, { purgeSafety: purgeIgnored }); // shared: forward-only ignore carry + git discovery
   const scannedFilePaths = attemptState.rawScannedFilePaths;
 
-  // A 422 retries the already-projected candidate verbatim. A fresh input or a
-  // 409/epoch rescan is projected exactly once against the newly loaded applied
-  // base, after forward-ignore carry and before every publication decision.
-  if (!attemptState.candidateProjected) {
-    const projected = projectLocalManifest(local, appliedBase, matcher, purgeIgnored);
-    attemptState.caseCollisions = attemptState.observationAuthority === "authoritative"
-      ? cloneCollisionGroups(projected.caseCollisions)
-      : mergeCollisionGroups(attemptState.caseCollisions, projected.caseCollisions);
-    attemptState.local = projected.manifest;
-    attemptState.candidateProjected = true;
-    local = projected.manifest;
-    try {
-      await deps.onCaseCollisionObservation?.({
-        authority: attemptState.observationAuthority,
-        caseCollisions: cloneCollisionGroups(attemptState.caseCollisions),
-      });
-    } catch (error) {
+  // Every Git-plane effect the candidate transition may order. `execute` is the
+  // sole mutating member: it owns scratch/conflict-ref mutations, so the whole
+  // planner is registered conservatively under one commit lease and a stop drains
+  // any read phase that can later reach one.
+  const capture: GitCapturePort = {
+    execute: (plan) => report.phase("git-plan", async () => {
+      const lease = deps.mutationBoundary?.enter({ phase: "git-commit" });
       try {
-        deps.warningSink?.(`rbox: could not record path-collision warning: ${error instanceof Error ? error.message : String(error)}`);
-      } catch {
-        // The warning observer and its diagnostic are advisory by contract.
+        if (lease && !lease.beginCommit()) throw new MutationGateClosedError();
+        return {
+          planId: plan.planId,
+          // `forceGitRecapture` is the per-relPath 422 recapture set [v2, M5]: a git
+          // artifact missing server-side can't be satisfied by a file re-upload — ONLY
+          // the repos whose sections reference the missing encShas recapture; the force
+          // lives at this single site or the recovery is dead.
+          plan: await planGitSections(root, cfg, state, api, plan.forceGitRecapture, matcher, deps.onProgress, backoff, {
+            onGitLog: deps.onGitLog,
+            disableConfigLane: workspaceSyncMutexDegraded(deps.syncMutex),
+            degradedMutex: workspaceSyncMutexDegraded(deps.syncMutex),
+            filesFirstDefer: plan.filesFirstDefer,
+            onGitReposDiscovered: deps.onGitReposDiscovered,
+            resolution: plan.resolution,
+            resolutionCaptureTestHooks: deps.resolutionCaptureTestHooks,
+            beforeAbsenceWitness: deps.beforeAbsenceWitness,
+          }),
+        };
+      } finally {
+        lease?.finish();
       }
-    }
-  }
-
-  if (purgeIgnored) {
-    const deleted = diffManifests(appliedBase, local).deleted;
-    assertNoUnevaluatedPurgeDeletes(matcher, deleted);
-  }
-
-  // Design 108 §3.2: the file-plane diff drives BOTH the files-must-diff guard and (later)
-  // the no-op / mass-delete checks. Computed once here — planGitSections does not touch the
-  // file plane — so the files-first decision precedes git capture.
-  const filesDiff = diffManifests(appliedBase, local);
-  const fileDiffNonEmpty = filesDiff.added.length > 0 || filesDiff.changed.length > 0 || filesDiff.deleted.length > 0;
-  // Files-first defers git capture ONLY on a genuine genesis first-init with a real file
-  // diff (§3.1/§3.4): flag on, no 409/epoch/starvation latch yet, parentSequence 0, NOT a
-  // rebind/stream-mismatch, and files actually differ. Any false leg ⇒ ordinary git-inclusive
-  // planning (byte-identical to today when the flag is off).
-  const filesFirstDefer =
-    filesFirstFlagEnabled() &&
-    repair === undefined &&                // NEVER defer under chain-repair: a repair supersede
-                                           // posts repair.parentSequence (≠ appliedSequence) and
-                                           // must republish git verbatim, never drop it (BLOCKER).
-    cfg.syncGit === true &&                // no git to attach ⇒ nothing to defer (no wasted commit 2)
-    !filesFirstAborted &&
-    appliedSequence === 0 &&
-    !stateWasStreamMismatch(state) &&
-    fileDiffNonEmpty;
-
-  // Attach the git sections (design 43 §6): per-repo carry/capture/defer/remove map
-  // orchestration. `forceGitRecapture` is the per-relPath 422 recapture set [v2, M5]:
-  // a git artifact missing server-side can't be satisfied by a file re-upload — ONLY
-  // the repos whose sections reference the missing encShas recapture; the force lives
-  // at this single site (each retry recomputes the map) or the recovery is dead.
-  const gitPlan = await report.phase("git-plan", async () => {
-    // Capture owns scratch/conflict-ref mutations. Register the whole planner
-    // conservatively so a stop drains any read phase that can later reach one.
-    const lease = deps.mutationBoundary?.enter({ phase: "git-commit" });
-    try {
-      if (lease && !lease.beginCommit()) throw new MutationGateClosedError();
-      return await planGitSections(root, cfg, state, api, forceGitRecapture, matcher, deps.onProgress, backoff, {
-        onGitLog: deps.onGitLog,
-        disableConfigLane: workspaceSyncMutexDegraded(deps.syncMutex),
-        degradedMutex: workspaceSyncMutexDegraded(deps.syncMutex),
-        filesFirstDefer,
-        onGitReposDiscovered: deps.onGitReposDiscovered,
-        resolution,
-        resolutionCaptureTestHooks: deps.resolutionCaptureTestHooks,
-        beforeAbsenceWitness: deps.beforeAbsenceWitness,
-      });
-    } finally {
-      lease?.finish();
-    }
-  });
-  const busyRepos = Object.entries(gitPlan.captureDeferrals)
-    .filter(([, reason]) => reason === "git-busy")
-    .map(([relPath]) => relPath)
-    .sort();
-  try { deps.onGitBusyDeferred?.(busyRepos); } catch { /* daemon observer is non-throwing */ }
-  const carryProofsFor = (snapshot: typeof state, relPaths: readonly string[]): Record<string, RepoBaseProof> => {
-    const records = repoRecordsForState(snapshot);
-    return Object.fromEntries(relPaths.map((relPath) => {
-      const lineageHash = recordOriginLineage(records[relPath]?.branchBaseOrigins)
-        ?? gitPlan.publisherAckBindings?.[relPath]?.lineageHash
-        ?? "legacy-untrusted";
-      return [relPath, carryRepoBaseProof(lineageHash)];
-    }));
+    }),
+    notifyBusyDeferred: (relPaths) => {
+      try { deps.onGitBusyDeferred?.(relPaths); } catch { /* daemon observer is non-throwing */ }
+    },
+    observe: (observation) => {
+      const observationRecords = repoRecordsForState(state);
+      return recordGitCaptureObservation(
+        {
+          records: observationRecords,
+          carried: {
+            bases: state.lastSyncedManifest.gitRepos,
+            pending: state.gitPendingRemote,
+            removed: state.gitReposRemoved,
+            resolutions: state.gitNeedsResolution,
+          },
+          changedRepos: (values) => changedSidecarRepoKeys(state, values),
+          save: async (write) => {
+            state = await report.phase("state-save", () => saveStateSource(root, state, {
+              expectedStream: syncStreamId(cfg),
+              sourceGlobalSeq: write.acceptedSequence,
+              observedRepos: write.observedRepos,
+              values: write.values,
+              repoProofs: write.repoProofs,
+            }, {
+              allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),
+              forceLegacy: workspaceSyncMutexDegraded(deps.syncMutex),
+            }));
+            try {
+              deps.onGitDeferralsSaved?.(state);
+            } catch {
+              // A local visibility hook cannot fail a save that is already durable.
+            }
+          },
+        },
+        {
+          acceptedSequence: state.lastSyncedSequence,
+          originLineageOf: (relPath) => recordOriginLineage(observationRecords[relPath]?.branchBaseOrigins),
+        },
+        observation,
+      );
+    },
+    reportCapturePlan: ({ plan }) => {
+      if (!report.enabled) return;
+      report.record("git-plan", { count: Object.keys(plan.gitRepos ?? {}).length }); // guarded: skip the key-array materialization on no-op ticks
+      if (plan.gitPlanStats) report.recordDetails("git-plan", { gitPlan: plan.gitPlanStats }, formatGitPlanStats(plan.gitPlanStats));
+    },
+    carryBaseOnNoOp: async ({ receipt, acceptedSequence: carrySequence, values }) => {
+      const changedRepos = changedSidecarRepoKeys(state, values);
+      if (changedRepos.length === 0) return;
+      const records = repoRecordsForState(state);
+      const repoProofs: Record<string, RepoBaseProof> = Object.fromEntries(changedRepos.map((relPath) => [
+        relPath,
+        carryRepoBaseProof(recordOriginLineage(records[relPath]?.branchBaseOrigins)
+          ?? receipt.plan.publisherAckBindings?.[relPath]?.lineageHash
+          ?? "legacy-untrusted"),
+      ]));
+      await report.phase("state-save", () => saveStateSource(root, state, {
+        expectedStream: syncStreamId(cfg),
+        sourceGlobalSeq: carrySequence,
+        observedRepos: changedRepos,
+        values,
+        repoProofs,
+      }, {
+        allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),
+        forceLegacy: workspaceSyncMutexDegraded(deps.syncMutex),
+      }));
+    },
+    logPublicationLine: ({ plan }) => {
+      (deps.onGitLog ?? ((l: string) => console.error(l)))(formatGitPushLine(plan), plan);
+    },
   };
-  const observationRecords = repoRecordsForState(state);
-  await recordGitCaptureObservation(
+
+  const sealed = await preparePublishCandidate(
+    { acceptedSequence: appliedSequence, appliedBase },
     {
-      records: observationRecords,
-      carried: {
-        bases: state.lastSyncedManifest.gitRepos,
-        pending: state.gitPendingRemote,
-        removed: state.gitReposRemoved,
-        resolutions: state.gitNeedsResolution,
-      },
-      changedRepos: (values) => changedSidecarRepoKeys(state, values),
-      save: async (write) => {
-        state = await report.phase("state-save", () => saveStateSource(root, state, {
-          expectedStream: syncStreamId(cfg),
-          sourceGlobalSeq: write.acceptedSequence,
-          observedRepos: write.observedRepos,
-          values: write.values,
-          repoProofs: write.repoProofs,
-        }, {
-          allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),
-          forceLegacy: workspaceSyncMutexDegraded(deps.syncMutex),
-        }));
+      manifest: local,
+      matcher,
+      projected: attemptState.candidateProjected,
+      caseCollisions: attemptState.caseCollisions,
+      authority: attemptState.observationAuthority,
+      recordProjection: async ({ manifest, caseCollisions }) => {
+        attemptState.caseCollisions = caseCollisions;
+        attemptState.local = manifest;
+        attemptState.candidateProjected = true;
         try {
-          deps.onGitDeferralsSaved?.(state);
-        } catch {
-          // A local visibility hook cannot fail a save that is already durable.
+          await deps.onCaseCollisionObservation?.({
+            authority: attemptState.observationAuthority,
+            caseCollisions: cloneCollisionGroups(caseCollisions),
+          });
+        } catch (error) {
+          try {
+            deps.warningSink?.(`rbox: could not record path-collision warning: ${error instanceof Error ? error.message : String(error)}`);
+          } catch {
+            // The warning observer and its diagnostic are advisory by contract.
+          }
         }
       },
     },
+    capture,
     {
-      acceptedSequence: state.lastSyncedSequence,
-      originLineageOf: (relPath) => recordOriginLineage(observationRecords[relPath]?.branchBaseOrigins),
-    },
-    {
-      observedAt: new Date().toISOString(),
-      captureObserved: gitPlan.captureObserved,
-      captureDeferrals: gitPlan.captureDeferrals,
-      configObserved: gitPlan.configObserved,
-      configDeferrals: gitPlan.configDeferrals,
-      protectedPending: gitPlan.protectedPending,
-      packedRefsIdentity: gitPlan.packedRefsIdentity,
-      ackLineageOf: (relPath) => gitPlan.publisherAckBindings?.[relPath]?.lineageHash,
-      changedFilePaths: () => [
-        ...filesDiff.added.map((entry) => entry.path),
-        ...filesDiff.changed.map((entry) => entry.path),
-        ...filesDiff.deleted,
-      ],
+      purgeIgnored,
+      // NEVER defer git under chain-repair: a repair supersede posts
+      // repair.parentSequence (≠ appliedSequence) and must republish git verbatim.
+      repairing: repair !== undefined,
+      syncGit: cfg.syncGit === true,
+      filesFirstEnabled: filesFirstFlagEnabled(),
+      filesFirstAborted,
+      streamMismatch: stateWasStreamMismatch(state),
+      forceGitRecapture,
+      ...(resolution ? { resolution } : {}),
+      // Op-scoped consent only (allowMassDeletePush / RBOX_ALLOW_MASS_DELETE handled
+      // at the CLI boundary) — the daemon never consents, so a runaway wipe halts
+      // background push instead of publishing.
+      allowMassDelete: deps.allowMassDeletePush === true,
+      ...(deps.massDeleteHint !== undefined ? { massDeleteHint: deps.massDeleteHint } : {}),
+      onMassDeleteRefused: () => deps.telemetry?.record({ kind: "safety_event", eventType: "mass_delete_breaker", count: 1 }),
     },
   );
-  if (report.enabled) {
-    report.record("git-plan", { count: Object.keys(gitPlan.gitRepos ?? {}).length }); // guarded: skip the key-array materialization on no-op ticks
-    if (gitPlan.gitPlanStats) report.recordDetails("git-plan", { gitPlan: gitPlan.gitPlanStats }, formatGitPlanStats(gitPlan.gitPlanStats));
-  }
-  // Schema is stamped once, at commit (stampManifestSchemaForCommit) — deriving it
-  // here too would be a second copy of the rule.
-  local = { ...local, gitRepos: gitPlan.gitRepos };
-
-  // The file plane is unchanged by git-plan, so the hoisted filesDiff above is
-  // authoritative — filesUnchanged is exactly its negation (single source, can't drift).
-  const filesUnchanged = !fileDiffNonEmpty;
-  const gitUnchanged = !gitPlan.changed;
-  if (!repair && filesUnchanged && gitUnchanged) {
-    // No-op (files AND git identity match base). Safe even under a forced git RE-CAPTURE
-    // (the 422 recovery): reaching here needs local == base, but to have hit the 422 at all
-    // attempt-0 must have passed its own no-op — i.e. a real file or git-identity change. The
-    // base sequence is unadvanced across a 422, so that change still shows here (filesUnchanged
-    // or gitUnchanged is false) → this no-op is unreachable whenever there is anything to
-    // commit; when it IS reachable, local == base and committing would just echo. So the git
-    // recapture's re-uploaded artifacts are never silently dropped by this branch.
-    //
-    // LOCAL-ONLY git bookkeeping may still have moved even though nothing needs
-    // committing — deleting a leftover .git is usually EXACTLY a no-op push (a .git
-    // removal changes no synced files), yet §9 requires its removal memory to be
-    // pruned then, or the stale memory suppresses a later legitimate re-add at that
-    // path. Persist the bookkeeping commit-free.
-    if (cfg.syncGit) {
-      const values = {
-        bases: appliedBase.gitRepos,
-        packedRefsIdentity: gitPlan.packedRefsIdentity,
-        repoAbsent: gitPlan.repoAbsent ?? {},
-        pending: gitPlan.gitPendingRemote,
-        removed: gitPlan.gitReposRemoved,
-        resolutions: gitPlan.gitNeedsResolution,
-      };
-      const changedRepos = changedSidecarRepoKeys(state, values);
-      if (changedRepos.length > 0) {
-        await report.phase("state-save", () => saveStateSource(root, state, {
-          expectedStream: syncStreamId(cfg),
-          sourceGlobalSeq: appliedSequence,
-          observedRepos: changedRepos,
-          values,
-          repoProofs: carryProofsFor(state, changedRepos),
-        }, {
-          allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),
-          forceLegacy: workspaceSyncMutexDegraded(deps.syncMutex),
-        }));
-      }
-    }
+  const gitPlan = sealed.captureReceipt.plan;
+  local = sealed.candidate;
+  if (sealed.admission === "no-op") {
     if (cfg.encrypted) await pruneEncryptAddressCache(root, cfg, scannedFilePaths);
     return { done: true, result: { sequence: appliedSequence, manifest: local, committed: false, ...resultCollisionMetadata(attemptState), ...(gitPlan.resolution ? { resolution: gitPlan.resolution } : {}) } };
   }
-  // §10 forensic line — only when git-sync did something beyond a steady carry.
-  if (cfg.syncGit && (gitPlan.captured.length || gitPlan.deferred.length || gitPlan.removed.length)) {
-    (deps.onGitLog ?? ((l: string) => console.error(l)))(formatGitPushLine(gitPlan), gitPlan);
-  }
-
-  // Push-side mass-delete breaker (design 108): compute the intended deletions on the
-  // PRE-UPLOAD manifest and refuse before any encrypt/upload/commit work. Deferral only
-  // carries base entries forward, so pre-upload `local` and post-defer `committed` have an
-  // identical DELETE count (a churning file is a change, not a delete). Op-scoped consent
-  // only (allowMassDeletePush / RBOX_ALLOW_MASS_DELETE handled at the CLI boundary) — the
-  // daemon never consents, so a runaway wipe halts background push instead of publishing.
-  const pushDeletes = filesDiff.deleted.length;
-  if (!deps.allowMassDeletePush && pushMassDeleteTrips(pushDeletes, appliedBase.files.length)) {
-    deps.telemetry?.record({ kind: "safety_event", eventType: "mass_delete_breaker", count: 1 });
-    throw new MassDeleteGuardError("push",
-      `push would delete ${pushDeletes} of ${appliedBase.files.length} tracked files — refusing (mass-delete guard). ` +
-        `If this deletion is intentional, run \`${deps.massDeleteHint ?? "rbox push --allow-mass-delete"}\` ` +
-        `(or set RBOX_ALLOW_MASS_DELETE=1) to publish it once.`
-    );
-  }
+  const gitUnchanged = sealed.gitUnchanged;
 
   // Upload missing blobs — ALWAYS convergently encrypted (by encSha, ciphertext).
   // E2EE is the only mode (design 12 D6): a non-encrypted config reaching the sync
@@ -1097,17 +1020,5 @@ async function runPushAttempt(
     } } : {}) } };
   } finally {
     if (firstPublishTiming.enabled) beginFirstPublishTiming(false);
-  }
-}
-
-function assertNoUnevaluatedPurgeDeletes(matcher: IgnoreMatcher, deleted: string[]): void {
-  for (const path of deleted) {
-    const repo = matcher.unevaluatedGitRepoForPath?.(path);
-    if (repo !== undefined) {
-      throw new Error(
-        `refusing purge: cannot evaluate tracked files for git repo ${repo} (first affected path ${path}). ` +
-          `Fix that repo's .git/index and retry.`
-      );
-    }
   }
 }
