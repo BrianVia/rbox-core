@@ -27,7 +27,8 @@ import { OP_STATE_CLASSIFICATION, OP_STATE_DIRS, OP_STATE_FILES } from "../../en
 import { loadState, repoRecordsForState, saveStateUnsafeLegacyOrTest, type SyncState, type WorkspaceConfig } from "../config.js";
 import type { SyncRemote } from "../remote.js";
 import { orderedRepoDeferralUpdates, saveStateSource } from "../sync-state.js";
-import { applyGitSections, settleCommittedBranchArtifacts, withRevalidatedGitPartialApplies } from "./apply.js";
+import { applyGitSections } from "./apply.js";
+import { settleCommittedBranchArtifacts, withRevalidatedGitPartialApplies } from "./received-git-transition-commit.js";
 import { checkoutJournalBinding, FollowCrashInjectedError, followDivergedRepo, recoverFollowJournal, selectCheckoutSelfRootWitness, type FollowCrashPoint } from "./follow.js";
 import { boundedOrigHeadPreservationError, origHeadPreservationFailureLine, origHeadWorktreeDiscriminator } from "./orig-head.js";
 import { planGitSections } from "./plan.js";
