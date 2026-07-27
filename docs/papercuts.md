@@ -338,3 +338,10 @@ behind-origin count; loudly warn when behind.
   files hashed / total (percent), matched-vs-divergent counts as they
   accumulate, like the transfer progress lines the daemon already renders
   (design 45/88 machinery exists; wire it into the adopt scan path).
+- **Ref watcher logs "config authority unavailable" once per minute per
+  stuck repo** (FM, 2026-07-27): savvy-core's materialization-incomplete
+  skeleton (empty .git, no config) makes the probe fail every cadence tick —
+  793 identical lines in one day. A standing condition should log once per
+  episode/day with a counter, like the watcher-error dedupe does. The repo
+  itself is the known 20h "needs attention" deferral, surfaced correctly by
+  `rbox status --git`.
