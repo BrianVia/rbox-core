@@ -2,9 +2,7 @@ import os from "node:os";
 import crypto from "node:crypto";
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
-import { constants } from "node:fs";
 import path from "node:path";
-import { setTimeout as delay } from "node:timers/promises";
 import {
   ALWAYS_NATIVE_PRUNE,
   buildIgnoreMatcher,
@@ -24,7 +22,6 @@ import {
   cryptoPoolStatus,
   manifestPathCaseFold,
   type CaseFoldCollisionGroup,
-  writeFileAtomic,
 } from "../../engine/index.js";
 import type { Action } from "../../engine/reconcile.js";
 import { MutationGateClosedError, ShutdownMutationGate } from "../../engine/mutation-gate.js";
@@ -95,7 +92,6 @@ import {
   DEEP_SCAN_MS,
   jitter,
   recoveryProbeDelayMs,
-  selectPumpOperation,
   nextSafetyDelay,
   POLL_BACKSTOP_DEFAULT_MS,
   reconnectDelayMs,
@@ -122,6 +118,12 @@ import {
   pullTrustWatcherEnabled,
   type TrustedPullViewResult,
 } from "./manifest-update.js";
+import {
+  DaemonOperationScheduler,
+  readLockStarvationEpisode,
+  type DaemonOperationExecutor,
+  type DaemonSchedulerPorts,
+} from "./daemon-operation-scheduler.js";
 import { LocalAuthority } from "./local-observation-transition.js";
 import { classifyPublishOutcome, PublishLocalWorkspaceTransition } from "./daemon-publish-transition.js";
 import {
@@ -162,10 +164,6 @@ type RboxBarAmbientStatus = AmbientDaemonStatusV1 & {
   workspaceRoot: string;
 };
 
-const LOCK_STARVATION_MS = 15 * 60_000;
-const LOCK_STARVATION_MAX_BYTES = 4 * 1024;
-const MUTEX_BACKOFF_TIERS = [250, 500, 1_000, 2_000, 4_000, 8_000, 16_000, 30_000] as const;
-const MUTEX_EARLY_REPROBE_MS = 2_000;
 const TELEMETRY_FLUSH_MS = 120_000;
 const CAPABILITY_INITIAL_DELAY_MS = 5 * 60_000;
 const CAPABILITY_INTERVAL_MS = 6 * 60 * 60_000;
@@ -213,57 +211,6 @@ export function gitCaptureSampleForProvenance(provenance: PushProvenance): GitCa
   if (provenance.candidate) return { kind: "git_capture", signalPushes: 0, candidatePushes: 1, scanPushes: 0 };
   if (provenance.scan) return { kind: "git_capture", signalPushes: 0, candidatePushes: 0, scanPushes: 1 };
   return undefined;
-}
-
-export interface LockStarvationEpisode {
-  holderKey: string;
-  firstSeenAt: number;
-  warnedAt?: number;
-  countedAt?: number;
-}
-
-export const lockStarvationPath = (root: string): string => path.join(root, ".rbox", "state", "lock-starvation.json");
-
-const episodeTime = (value: unknown): value is number =>
-  typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
-
-export async function readLockStarvationEpisode(root: string): Promise<LockStarvationEpisode | undefined> {
-  let handle: fs.FileHandle | undefined;
-  try {
-    handle = await fs.open(lockStarvationPath(root), constants.O_RDONLY | constants.O_NOFOLLOW);
-    const stat = await handle.stat();
-    if (!stat.isFile() || stat.size > LOCK_STARVATION_MAX_BYTES) return undefined;
-    const raw = await handle.readFile("utf8");
-    if (Buffer.byteLength(raw) > LOCK_STARVATION_MAX_BYTES) return undefined;
-    const parsed = JSON.parse(raw) as Record<string, unknown>;
-    const keys = Object.keys(parsed);
-    if (keys.some((key) => !["holderKey", "firstSeenAt", "warnedAt", "countedAt"].includes(key))) return undefined;
-    if (typeof parsed.holderKey !== "string" || !/^[0-9a-f]{64}$/.test(parsed.holderKey)) return undefined;
-    if (!episodeTime(parsed.firstSeenAt)) return undefined;
-    if (parsed.warnedAt !== undefined && !episodeTime(parsed.warnedAt)) return undefined;
-    if (parsed.countedAt !== undefined && !episodeTime(parsed.countedAt)) return undefined;
-    return {
-      holderKey: parsed.holderKey,
-      firstSeenAt: parsed.firstSeenAt,
-      ...(parsed.warnedAt === undefined ? {} : { warnedAt: parsed.warnedAt }),
-      ...(parsed.countedAt === undefined ? {} : { countedAt: parsed.countedAt }),
-    };
-  } catch {
-    return undefined;
-  } finally {
-    await handle?.close().catch(() => {});
-  }
-}
-
-async function saveLockStarvationEpisode(root: string, episode: LockStarvationEpisode): Promise<void> {
-  await fs.mkdir(path.dirname(lockStarvationPath(root)), { recursive: true });
-  await writeFileAtomic(lockStarvationPath(root), JSON.stringify(episode));
-}
-
-export function lockStarvationAgeBucket(ageMs: number): "15m" | "1h" | "1d" {
-  if (ageMs >= 24 * 60 * 60_000) return "1d";
-  if (ageMs >= 60 * 60_000) return "1h";
-  return "15m";
 }
 
 interface ScanCoverage { coverage: "full-tree" | "pruned"; errorGenAtStart: number }
@@ -497,7 +444,6 @@ export class RboxDaemon {
   private readonly retryQueue: LocalRetryQueue;
   private watcherUnsettled = false;
   private watcherUnsettledGeneration = 0;
-  private activePumpOp?: PumpOperation;
   private appliedPendingEventsInOp = false;
   /** Pump-error dedup (see the pump catch) + last logged commit sequence (doPush). */
   private lastErrMsg = "";
@@ -517,8 +463,9 @@ export class RboxDaemon {
   private workspaceConfigStat?: { mtimeMs: number; size: number };
   private observedAdoptCacheGeneration = 0;
 
-  private readonly want: Wants = { pull: false, push: false, fullScan: false, deepScan: false };
-  private pumping = false;
+  /** Sole owner of the wakeup queue, the recovery episode, mutex backoff/starvation,
+   *  the active operation, and the single-flight/drain state. */
+  private readonly scheduler: DaemonOperationScheduler;
   private metrics: SyncMetrics = { syncs: 0, commitConflicts409: 0, fileConflicts: 0, lockStarved: 0 };
   /** In-memory activity record mirrored to `.rbox/state/activity.json` (design 45) —
    *  what `rbox status` reads for the health verdict, last-sync trail, live transfer
@@ -540,16 +487,7 @@ export class RboxDaemon {
   private readonly deferralHygieneCursor: DeferralHygieneCursor = {};
   private deferralHygieneRunning = false;
   private readonly deferralHygieneBudgetMs: number;
-  private recoveryTimer?: unknown;
-  private recoveryDue = false;
-  private recoveryDequeuesSinceDue = 0;
   private readonly gitBusyRetryClock: GitBusyRetryClock;
-  private lockStarvationEpisode?: LockStarvationEpisode;
-  private mutexHolderKey?: string;
-  private mutexBackoffTier = 0;
-  private mutexLoggedTier = -1;
-  private mutexBackoffController?: AbortController;
-  private lastMutexEarlyReprobeAt = Number.NEGATIVE_INFINITY;
   private readonly wsDisabled: boolean;
   private readonly wsReliabilityDisabled: boolean;
   private readonly pongDeadlineMs: number;
@@ -681,7 +619,56 @@ export class RboxDaemon {
     this.backstopMs = this.wsReliabilityDisabled
       ? 0
       : envInt("RBOX_DAEMON_POLL_BACKSTOP_MS", POLL_BACKSTOP_DEFAULT_MS, 0, Number.MAX_SAFE_INTEGER);
+    const ports: DaemonSchedulerPorts = {
+      root: this.root,
+      now: () => this.now(),
+      log: (line) => this.log(line),
+      recoveryClock: this.recoveryClock,
+      acquireMutex: (workspaceRoot) => this.acquireSyncMutexFn(workspaceRoot),
+      releaseMutex: (handle) => releaseWorkspaceSyncMutex(handle),
+      isStopped: () => this.stopped,
+      readyForReentry: () => !this.stopped && this.resetLifecycle === "ready",
+      standingHalt: () => {
+        const halt = this.activity.halt;
+        return halt ? { op: halt.op, witness: halt.nextProbeAt ?? halt.at } : undefined;
+      },
+      countLockStarvation: async () => {
+        this.metrics.lockStarved += 1;
+        await saveMetrics(this.root, this.metrics);
+      },
+      wake: () => void this.pump(),
+    };
+    this.scheduler = new DaemonOperationScheduler(ports);
   }
+
+  // ---- scheduler-owned state, as the daemon's test-visible surface -----------
+  // The scheduler is the sole owner; these forward reads and writes to it so the
+  // daemon (and the suites that poke its internals) keep one vocabulary.
+
+  private get want(): Wants { return this.scheduler.wants; }
+  private get pumping(): boolean { return this.scheduler.pumping; }
+  private set pumping(value: boolean) { this.scheduler.pumping = value; }
+  private get pumpRun(): Promise<void> { return this.scheduler.pumpRun; }
+  private get activePumpOp(): PumpOperation | undefined { return this.scheduler.activePumpOp; }
+  private get recoveryDue(): boolean { return this.scheduler.recoveryDue; }
+  private set recoveryDue(value: boolean) { this.scheduler.recoveryDue = value; }
+  private get recoveryDequeuesSinceDue(): number { return this.scheduler.recoveryDequeuesSinceDue; }
+  private set recoveryDequeuesSinceDue(value: number) { this.scheduler.recoveryDequeuesSinceDue = value; }
+  private get recoveryTimer(): unknown { return this.scheduler.recoveryTimer; }
+
+  /** The halt record the dequeued probe was armed against, handed from the operation's
+   *  own prologue to its body (the record itself is never the scheduler's). */
+  private probeHalt?: NonNullable<DaemonActivity["halt"]>;
+
+  /** The daemon's side of the scheduler: what an operation boundary admits, what each
+   *  dequeued operation DOES, and the exit-time persistence. Which operation runs, and
+   *  whether it may run at all, is the scheduler's. */
+  private readonly operationExecutor: DaemonOperationExecutor = {
+    openOperationBoundary: (syncMutex) => this.openOperationBoundary(syncMutex),
+    beginOperation: (op) => this.beginPumpOperation(op),
+    runOperation: (op, syncMutex) => this.runPumpOperation(op, syncMutex),
+    settleAfterDrain: () => this.settleAfterDrain(),
+  };
 
   async start(): Promise<void> {
     // Be a background citizen: lose the CPU race to the developer's own tools.
@@ -704,7 +691,7 @@ export class RboxDaemon {
       this.activity.local = persistedActivity.local;
       this.activity.outOfStorage = persistedActivity.outOfStorage;
     }
-    this.lockStarvationEpisode = await readLockStarvationEpisode(this.root);
+    this.scheduler.lockStarvationEpisode = await readLockStarvationEpisode(this.root);
     this.log(`rbox daemon starting: ${this.root} → workspace ${this.cfg.remoteWorkspaceId} (device ${this.cfg.deviceId})${this.pullOnly ? " [pull-only]" : ""}`);
     // Record the binding so `rbox start` can tell a live daemon from a STALE one
     // (bound to a workspace this root was since re-initialized away from).
@@ -739,7 +726,7 @@ export class RboxDaemon {
               if (this.stopped) return;
               this.pruneCache();
               await this.cache.save(this.root);
-              this.want.pull = true;
+              this.scheduler.queue("pull");
               if (!this.pullOnly) this.requestPush("other");
             }
           }
@@ -756,8 +743,8 @@ export class RboxDaemon {
     } else {
       // Startup contention is not a recovery halt. Queue the startup scan; its
       // eventual pump iteration will pass through the same boundary.
-      this.want.pull = true;
-      this.want.fullScan = true;
+      this.scheduler.queue("pull");
+      this.scheduler.queue("fullScan");
     }
 
     if (this.stopped) return;
@@ -988,7 +975,7 @@ export class RboxDaemon {
     const recovery = await this.recoverStateCasWithGate();
     if (recovery.recovered > 0) {
       this.log(`recovered ${recovery.recovered} crash-owned Git lock${recovery.recovered === 1 ? "" : "s"}`);
-      this.want.pull = true;
+      this.scheduler.queue("pull");
       if (!this.pullOnly) this.requestPush("other");
     }
     if (recovery.indeterminate > 0) this.log(`Git lock recovery retained ${recovery.indeterminate} indeterminate journal episode${recovery.indeterminate === 1 ? "" : "s"}`);
@@ -1019,7 +1006,7 @@ export class RboxDaemon {
     this.stopped = true;
     this.mutationGate.close();
     this.invalidateCursorSchedule();
-    this.abortMutexBackoff();
+    this.scheduler.abortMutexBackoff();
     this.writeAmbientStatus();
     this.shutdownPromise = this.finishStop(firstStop);
     return this.shutdownPromise;
@@ -1028,7 +1015,6 @@ export class RboxDaemon {
   private async finishStop(firstStop: boolean): Promise<void> {
     const keyDeliveryDrain = this.keyDeliveryFlight?.stop();
     if (this.safetyTimer !== undefined) this.scanCadenceClock.clearTimeout(this.safetyTimer);
-    if (this.recoveryTimer) this.recoveryClock.clearTimeout(this.recoveryTimer);
     if (this.deepTimer) this.scanCadenceClock.clearInterval(this.deepTimer);
     if (this.resetRetryTimer) clearTimeout(this.resetRetryTimer);
     for (const audit of this.openDriftAudits) if (audit.timer) clearTimeout(audit.timer);
@@ -1057,7 +1043,9 @@ export class RboxDaemon {
     try {
       await Promise.allSettled([
         this.startupBoundaryRun,
-        this.pumpRun,
+        // Disarms the recovery probe and any parked mutex backoff, then drains the
+        // in-flight loop: the committed operation completes, queued work is skipped.
+        this.scheduler.stop(),
         this.mutationGate.drain(),
         keyDeliveryDrain,
       ]);
@@ -1085,8 +1073,7 @@ export class RboxDaemon {
   private requestPush(reason: "signal" | "candidate" | "scan" | "other" = "other"): void {
     if (!this.pullOnly) {
       this.pendingPushReasons[reason] = true;
-      this.want.push = true;
-      this.signalMutexEarlyReprobe();
+      this.scheduler.request("push");
     }
   }
 
@@ -1142,8 +1129,7 @@ export class RboxDaemon {
     if (kind === "push") this.requestPush("other");
     else {
       if (this.pullOnly && kind !== "pull" && kind !== "deepScan") return;
-      this.want[kind] = true;
-      this.signalMutexEarlyReprobe();
+      this.scheduler.request(kind);
     }
     this.writeAmbientStatus();
     if (this.resetLifecycle !== "ready" && this.now() < this.nextResetRetryAt) return;
@@ -1177,7 +1163,7 @@ export class RboxDaemon {
       this.resetRetryTimer = undefined;
       if (this.stopped) return;
       this.nextResetRetryAt = this.now();
-      this.want.fullScan = true;
+      this.scheduler.queue("fullScan");
       void this.pump();
     }, delay);
     this.resetRetryTimer.unref?.();
@@ -1262,106 +1248,12 @@ export class RboxDaemon {
     this.updateCheckTimer = setInterval(() => void runUpdateCheckIfDue(this.cfg.remoteUrl), UPDATE_CHECK_TICK_MS);
   }
 
-  /** The in-flight pump loop, if any — awaited by stop() so shutdown drains it. */
-  private pumpRun: Promise<void> = Promise.resolve();
-
-  private signalMutexEarlyReprobe(): void {
-    if (!this.mutexBackoffController) return;
-    const now = this.now();
-    if (now - this.lastMutexEarlyReprobeAt < MUTEX_EARLY_REPROBE_MS) return;
-    this.lastMutexEarlyReprobeAt = now;
-    this.mutexBackoffController?.abort();
-  }
-
-  private abortMutexBackoff(): void {
-    this.mutexBackoffController?.abort();
-  }
-
-  private mutexDelay(holderKey: string): { delayMs: number; shouldLog: boolean } {
-    if (this.mutexHolderKey !== holderKey) {
-      this.mutexHolderKey = holderKey;
-      this.mutexBackoffTier = 0;
-      this.mutexLoggedTier = -1;
-    } else {
-      this.mutexBackoffTier = Math.min(this.mutexBackoffTier + 1, MUTEX_BACKOFF_TIERS.length - 1);
-    }
-    const shouldLog = this.mutexLoggedTier !== this.mutexBackoffTier;
-    if (shouldLog) this.mutexLoggedTier = this.mutexBackoffTier;
-    return { delayMs: MUTEX_BACKOFF_TIERS[this.mutexBackoffTier]!, shouldLog };
-  }
-
-  private resetMutexBackoff(): void {
-    this.mutexHolderKey = undefined;
-    this.mutexBackoffTier = 0;
-    this.mutexLoggedTier = -1;
-    this.lastMutexEarlyReprobeAt = Number.NEGATIVE_INFINITY;
-  }
-
-  private async waitForMutexBackoff(delayMs: number): Promise<void> {
-    if (this.stopped) return;
-    const controller = new AbortController();
-    this.mutexBackoffController = controller;
-    try {
-      await delay(delayMs, undefined, { signal: controller.signal });
-    } catch (error) {
-      if (!(error instanceof Error) || error.name !== "AbortError") throw error;
-    } finally {
-      if (this.mutexBackoffController === controller) this.mutexBackoffController = undefined;
-    }
-  }
-
-  private async clearLockStarvationEpisode(): Promise<void> {
-    if (!this.lockStarvationEpisode) return;
-    this.lockStarvationEpisode = undefined;
-    await fs.rm(lockStarvationPath(this.root), { force: true });
-  }
-
-  private async observeLockContention(contention: Extract<DaemonMutexResult, { status: "contended" }>): Promise<void> {
-    const reason = contention.warningReason;
-    if (!reason) {
-      await this.clearLockStarvationEpisode();
-      return;
-    }
-    const now = this.now();
-    let episode = this.lockStarvationEpisode;
-    if (!episode || episode.holderKey !== contention.holderKey) {
-      episode = { holderKey: contention.holderKey, firstSeenAt: now };
-      this.lockStarvationEpisode = episode;
-      await saveLockStarvationEpisode(this.root, episode);
-      return;
-    }
-    const age = Math.max(0, now - episode.firstSeenAt);
-    if (age < LOCK_STARVATION_MS) return;
-    if (episode.warnedAt === undefined) {
-      this.log(`lock starved: reason=${reason} age=${lockStarvationAgeBucket(age)}`);
-      episode = { ...episode, warnedAt: now };
-      this.lockStarvationEpisode = episode;
-      await saveLockStarvationEpisode(this.root, episode);
-    }
-    if (episode.countedAt === undefined) {
-      episode = { ...episode, countedAt: now };
-      this.lockStarvationEpisode = episode;
-      // Persist the episode fence before the metric: a crash may lose one count,
-      // but can never count the same starvation episode twice.
-      await saveLockStarvationEpisode(this.root, episode);
-      this.metrics.lockStarved += 1;
-      await saveMetrics(this.root, this.metrics);
-    }
-  }
-
   private async pump(): Promise<void> {
-    if (this.pumping || this.stopped) return;
-    this.pumping = true;
-    const run = this.pumpLoop();
-    this.pumpRun = run;
-    return run;
+    return this.scheduler.service(this.operationExecutor);
   }
 
   private nextPumpOperation(): PumpOperation | undefined {
-    const eligible = { ...this.want };
-    const halt = this.activity.halt;
-    if (halt) eligible[halt.op] = false;
-    return selectPumpOperation(eligible, this.recoveryDue, this.recoveryDequeuesSinceDue);
+    return this.scheduler.nextOperation();
   }
 
   private armStandingRecovery(): void {
@@ -1372,28 +1264,17 @@ export class RboxDaemon {
     }
     const halt = this.activity.halt;
     if (!halt) return;
-    if (this.recoveryTimer) this.recoveryClock.clearTimeout(this.recoveryTimer);
     if (this.pullOnly && halt.op === "push") {
+      this.scheduler.clearRecoveryEpisode();
       this.activity.suspendedPushHalt ??= { ...halt, recoveryState: "suspended" };
       this.activity.halt = undefined;
-      this.recoveryTimer = undefined;
-      this.recoveryDue = false;
-      this.recoveryDequeuesSinceDue = 0;
       this.writeActivity();
       return;
     }
     halt.recoveryState = "armed";
     const dueAt = Date.parse(halt.nextProbeAt ?? halt.lastFailureAt ?? halt.at);
     const delayMs = Number.isFinite(dueAt) ? Math.max(0, dueAt - this.now()) : 0;
-    const witness = halt.nextProbeAt ?? halt.at;
-    this.recoveryTimer = this.recoveryClock.setTimeout(() => {
-      this.recoveryTimer = undefined;
-      if (this.activity.halt && (this.activity.halt.nextProbeAt ?? this.activity.halt.at) === witness) {
-        this.recoveryDue = true;
-        this.recoveryDequeuesSinceDue = 0;
-        void this.pump();
-      }
-    }, delayMs);
+    this.scheduler.armRecoveryProbe(delayMs, halt.nextProbeAt ?? halt.at);
   }
 
   private recordRecoveryFailure(
@@ -1426,8 +1307,8 @@ export class RboxDaemon {
       ...(typedReason ? { typedReason } : {}),
       ...(terminal ? { terminal } : {}),
     };
-    if (!(this.pullOnly && op === "push")) this.want[op] = true;
-    this.recoveryDue = false;
+    if (!(this.pullOnly && op === "push")) this.scheduler.queue(op);
+    this.scheduler.disarmRecoveryDue();
     this.armStandingRecovery();
     this.writeActivity();
   }
@@ -1492,10 +1373,7 @@ export class RboxDaemon {
   }
 
   private clearRecoveryHalt(): void {
-    if (this.recoveryTimer) this.recoveryClock.clearTimeout(this.recoveryTimer);
-    this.recoveryTimer = undefined;
-    this.recoveryDue = false;
-    this.recoveryDequeuesSinceDue = 0;
+    this.scheduler.clearRecoveryEpisode();
     this.activity.halt = undefined;
     this.lastErrMsg = "";
     this.errRepeat = 0;
@@ -1592,215 +1470,190 @@ export class RboxDaemon {
     this.clearRecoveryHalt();
   }
 
-  private async pumpLoop(): Promise<void> {
-    try {
-      while (!this.stopped) {
-        // Resolve WHICH op this iteration runs up front — the halt bookkeeping below
-        // is keyed on it (a halt is only healed by a success of the SAME kind).
-        const op = this.nextPumpOperation();
-        if (!op) break;
-        const acquired = await this.acquireSyncMutexFn(this.root);
-        if (acquired.status === "contended") {
-          // Do not clear want[op]: contention must requeue, never consume, this tick.
-          await this.observeLockContention(acquired).catch(() => {
-            this.log("lock starvation state unavailable");
-          });
-          const backoff = this.mutexDelay(acquired.holderKey);
-          if (backoff.shouldLog) this.log(`pump op ${op}: sync busy; re-queued (backoff ${backoff.delayMs}ms)`);
-          await this.waitForMutexBackoff(backoff.delayMs);
-          continue;
-        }
-        this.resetMutexBackoff();
-        await this.clearLockStarvationEpisode().catch(() => {
-          this.log("lock starvation state unavailable");
-        });
-        const syncMutex = acquired.handle;
-        try {
-          if (!await this.resetOperationBoundary(syncMutex)) break;
-          if (this.stopped) break;
-          await this.recoverOwnedLocksAtBoundary();
-          if (this.stopped) break;
-          await this.adoptionCacheGenerationBoundary();
-          const binding = this.syncBase ?? await this.loadSyncBase();
-          const bindingMatches = await daemonBindingMatches(this.root, syncStreamId(this.cfg), expectedStateNonce(binding));
-          if (!bindingMatches) {
-            this.log("daemon binding changed while idle (stream/state nonce mismatch) — stopping before mutation");
-            this.stopped = true;
-            break;
-          }
-          const opWatcherGeneration = this.watcherUnsettledGeneration;
-          const opWatcherErrorGeneration = this.watcherErrorGeneration;
-          try {
-            let pushedToRemote = false;
-            this.pushTerminalBlocked = false;
-            const recoveryHalt = op === "recoveryProbe" ? this.activity.halt : undefined;
-            if (op === "recoveryProbe") {
-              if (!recoveryHalt) continue;
-              this.recoveryDue = false;
-              this.recoveryDequeuesSinceDue = 0;
-              this.want[recoveryHalt.op] = false;
-              this.activity.halt = {
-                ...recoveryHalt,
-                lastProbeAt: new Date(this.now()).toISOString(),
-                recoveryState: "running",
-              };
-              this.writeActivity();
-            } else {
-              this.want[op] = false;
-              if (this.recoveryDue) this.recoveryDequeuesSinceDue++;
-            }
-            const pushProvenance = op === "push" ? this.takePushProvenance() : undefined;
-            const gitBusyRetryStage = op === "push" ? this.takeGitBusyRetryStage() : 0;
-            const activeCarrier = op === "pull" ? this.takeQueuedCarrier() : "none";
-            this.activePumpOp = op;
-            this.writeAmbientStatus();
-            this.appliedPendingEventsInOp = false;
-            try {
-              if (op === "recoveryProbe") {
-                await this.runRecoveryProbe(syncMutex, recoveryHalt!, opWatcherErrorGeneration);
-              } else if (op === "push") {
-                const quotaProbe = this.activity.outOfStorage !== undefined && this.outOfStorageProbeArmed;
-                this.outOfStorageProbeArmed = false;
-                if (this.activity.outOfStorage && !quotaProbe) {
-                  await this.applyPendingWatchEvents();
-                } else {
-                  await this.doPush(syncMutex, pushProvenance!);
-                  pushedToRemote = true;
-                }
-              } else {
-                await this.executeOp(op, syncMutex, { recovery: false, opWatcherErrorGeneration, carrier: activeCarrier });
-              }
-              // D4 (design note 2026-07-24): the exclusion is deliberate — a recovery op runs
-              // outside the watcher-unsettled generation bracketing this guard's generation
-              // argument assumes, so it must never clear the unsettled surface here.
-              if (op !== "recoveryProbe") this.maybeClearWatcherUnsettledAfterOp(op, opWatcherGeneration);
-              if (this.syncBase) this.syncStateReporter.afterSyncTick(this.syncBase);
-            } finally {
-              if (op === "push") this.finishGitBusyRetry(gitBusyRetryStage);
-              this.activePumpOp = undefined;
-              this.activeProgressPath = undefined;
-              this.writeAmbientStatus();
-            }
-            // Op completed: any live progress is over. A standing halt is healed ONLY by
-            // a success of the op kind that recorded it — a mass-delete-guard halt from a
-            // pull must survive the queued push's no-op success and every safety scan.
-            // Anything less flaps the warning off within seconds.
-            // Persist when something visible changed (or as a throttled heartbeat, so
-            // `rbox status` can say "last checked: Ns ago" without idle disk churn).
-            const terminalBlocked = op === "push" && this.pushTerminalBlocked;
-            const clearsOutOfStorage = pushedToRemote && this.activity.outOfStorage !== undefined;
-            const cleared = this.activity.active !== undefined || clearsOutOfStorage || terminalBlocked;
-            this.activity.active = undefined;
-            this.activeProgressPath = undefined;
-            if (clearsOutOfStorage) {
-              this.activity.outOfStorage = undefined;
-            }
-            if (clearsOutOfStorage) {
-              // The healed failure's dedup streak ends with it: a LATER failure with the
-              // same message is a new episode that must log and persist a fresh visible
-              // state, not silently count as repeat 2..9 and leave activity.json healed.
-              this.lastErrMsg = "";
-              this.errRepeat = 0;
-            }
-            if (cleared || this.activityDirty || Date.now() - this.lastActivityWrite > 30_000) this.writeActivity();
-          } catch (e) {
-            if (e instanceof MutationGateClosedError && this.stopped) {
-              // Cooperative shutdown cancellation is not an operation failure:
-              // no durable halt, retry counter, or misleading error surface.
-              continue;
-            }
-            // A capture/config lane transition is saved before later upload/commit
-            // work. If that later work fails, refresh the durable truth here rather
-            // than waiting for a successful operation that may never arrive.
-            try {
-              const now = Date.now();
-              const before = this.syncBase ? renderShellDeferrals(this.syncBase, now, ageBucket) : undefined;
-              const durableState = await this.loadSyncBase();
-              this.emitDurableGitDeferrals(durableState, now);
-              if (before !== renderShellDeferrals(durableState, now, ageBucket)) this.writeActivity();
-            } catch {
-              // Preserve the original pump failure if the visibility refresh fails.
-            }
-            // Dedup a persistent error (e.g. a dead workspace 404s on EVERY op): log the
-            // first hit and every 10th after, with the running count — so the log stays
-            // readable while still showing exactly how long the failure has persisted.
-            const msg = e instanceof Error ? e.message : String(e);
-            this.errRepeat = msg === this.lastErrMsg ? this.errRepeat + 1 : 1;
-            this.lastErrMsg = msg;
-            const shouldLogRepeat = this.errRepeat === 1 || this.errRepeat % 10 === 0;
-            if (op === "recoveryProbe") {
-              const standing = this.activity.halt;
-              if (standing) {
-                const failure = this.classifyOperationFailure(e);
-                if ((standing.typedReason?.kind === "push-conflict"
-                  || (standing.op === "push" && !standing.typedReason && !standing.terminal))
-                  && e instanceof RecoveryProbePreflightError
-                  && failure.kind === "halt"
-                  && !failure.typedReason
-                  && !failure.terminal) {
-                  const nextProbeAt = new Date(this.now() + recoveryProbeDelayMs(
-                    standing.consecutiveFailures ?? standing.count,
-                    this.recoveryRandom,
-                  )).toISOString();
-                  this.activity.halt = { ...standing, nextProbeAt, recoveryState: "armed" };
-                  this.want[standing.op] = true;
-                  this.recoveryDue = false;
-                  this.armStandingRecovery();
-                  this.writeActivity();
-                } else {
-                  const recorded = this.recordClassifiedFailure(standing.op, failure);
-                  if (recorded.kind === "quota" && standing.op === "push") {
-                    // A recovery probe discovered a new quota condition. Retire the
-                    // conflict episode so it cannot remain permanently "running".
-                    this.clearRecoveryHalt();
-                  }
-                }
-              }
-              if (shouldLogRepeat) this.log(`recovery probe failed: ${msg}${this.errRepeat > 1 ? ` (x${this.errRepeat})` : ""}`);
-              continue;
-            }
-            const failure = this.classifyOperationFailure(e);
-            const recorded = this.recordClassifiedFailure(op, failure);
-            if (recorded.kind === "quota") {
-              if (shouldLogRepeat) this.log(`pump op quota: ${msg}${this.errRepeat > 1 ? ` (x${this.errRepeat})` : ""}`);
-              if (recorded.visibleChanged || shouldLogRepeat) this.writeActivity();
-              await sleep(jitter(1000));
-              continue;
-            }
-            if (recorded.blocked) {
-              if (shouldLogRepeat) {
-                this.log(`pump op blocked: ${msg}${this.errRepeat > 1 ? ` (x${this.errRepeat})` : ""}`);
-                this.writeActivity();
-              }
-              continue;
-            }
-            // The halt record is the failure's user-visible surface (design 45): without
-            // it a mass-delete-guard refusal (design 44) stalls background sync with no
-            // indicator anywhere but this log. Persisted on the log-line schedule.
-            if (shouldLogRepeat) {
-              this.log(`pump op error: ${msg}${this.errRepeat > 1 ? ` (x${this.errRepeat})` : ""}`);
-              this.writeActivity();
-            }
-          }
-        } finally {
-          await releaseWorkspaceSyncMutex(syncMutex);
-        }
-      }
-      await this.cache.save(this.root);
-      this.writeAmbientStatus();
-      // Settle the sidecar: all wants are drained here, so re-render if
-      // the state CHANGED from the last write — the mid-pump write said `pending`
-      // (push still queued) and the no-op push wrote nothing; an idle workspace must
-      // read `ok`. State-compared, so a truly unchanged pump writes nothing extra.
-      const settledNow = this.localSettled();
-      if (shellLineStateOf(this.activity, settledNow, Date.now()) !== this.lastShellState) this.writeActivity();
-    } finally {
-      this.pumping = false;
-      // A timer/watcher can queue work after the loop observes no operation but
-      // before exit-time persistence completes. Re-enter after dropping the
-      // single-flight guard so that wakeup cannot be lost.
-      if (!this.stopped && this.resetLifecycle === "ready" && this.nextPumpOperation()) await this.pump();
+  /** Reset authority, crash-lock recovery, and binding revalidation — the prologue
+   *  every operation passes through with the workspace mutex held. `false` ends the
+   *  loop WITHOUT consuming the selected operation. */
+  private async openOperationBoundary(syncMutex: WorkspaceSyncMutex): Promise<boolean> {
+    if (!await this.resetOperationBoundary(syncMutex)) return false;
+    if (this.stopped) return false;
+    await this.recoverOwnedLocksAtBoundary();
+    if (this.stopped) return false;
+    await this.adoptionCacheGenerationBoundary();
+    const binding = this.syncBase ?? await this.loadSyncBase();
+    const bindingMatches = await daemonBindingMatches(this.root, syncStreamId(this.cfg), expectedStateNonce(binding));
+    if (!bindingMatches) {
+      this.log("daemon binding changed while idle (stream/state nonce mismatch) — stopping before mutation");
+      this.stopped = true;
+      return false;
     }
+    this.pushTerminalBlocked = false;
+    return true;
+  }
+
+  /** The dequeued operation's own bookkeeping, run before the scheduler publishes the
+   *  active operation — the probe's halt record must render against an idle surface. */
+  private beginPumpOperation(op: PumpOperation): void {
+    if (op !== "recoveryProbe") return;
+    const recoveryHalt = this.activity.halt!;
+    this.probeHalt = recoveryHalt;
+    this.activity.halt = {
+      ...recoveryHalt,
+      lastProbeAt: new Date(this.now()).toISOString(),
+      recoveryState: "running",
+    };
+    this.writeActivity();
+  }
+
+  private async runPumpOperation(op: PumpOperation, syncMutex: WorkspaceSyncMutex): Promise<void> {
+    const opWatcherGeneration = this.watcherUnsettledGeneration;
+    const opWatcherErrorGeneration = this.watcherErrorGeneration;
+    const recoveryHalt = this.probeHalt;
+    this.probeHalt = undefined;
+    try {
+      let pushedToRemote = false;
+      const pushProvenance = op === "push" ? this.takePushProvenance() : undefined;
+      const gitBusyRetryStage = op === "push" ? this.takeGitBusyRetryStage() : 0;
+      const activeCarrier = op === "pull" ? this.takeQueuedCarrier() : "none";
+      this.writeAmbientStatus();
+      this.appliedPendingEventsInOp = false;
+      try {
+        if (op === "recoveryProbe") {
+          await this.runRecoveryProbe(syncMutex, recoveryHalt!, opWatcherErrorGeneration);
+        } else if (op === "push") {
+          const quotaProbe = this.activity.outOfStorage !== undefined && this.outOfStorageProbeArmed;
+          this.outOfStorageProbeArmed = false;
+          if (this.activity.outOfStorage && !quotaProbe) {
+            await this.applyPendingWatchEvents();
+          } else {
+            await this.doPush(syncMutex, pushProvenance!);
+            pushedToRemote = true;
+          }
+        } else {
+          await this.executeOp(op, syncMutex, { recovery: false, opWatcherErrorGeneration, carrier: activeCarrier });
+        }
+        // D4 (design note 2026-07-24): the exclusion is deliberate — a recovery op runs
+        // outside the watcher-unsettled generation bracketing this guard's generation
+        // argument assumes, so it must never clear the unsettled surface here.
+        if (op !== "recoveryProbe") this.maybeClearWatcherUnsettledAfterOp(op, opWatcherGeneration);
+        if (this.syncBase) this.syncStateReporter.afterSyncTick(this.syncBase);
+      } finally {
+        if (op === "push") this.finishGitBusyRetry(gitBusyRetryStage);
+        this.scheduler.markOperationIdle();
+        this.activeProgressPath = undefined;
+        this.writeAmbientStatus();
+      }
+      // Op completed: any live progress is over. A standing halt is healed ONLY by
+      // a success of the op kind that recorded it — a mass-delete-guard halt from a
+      // pull must survive the queued push's no-op success and every safety scan.
+      // Anything less flaps the warning off within seconds.
+      // Persist when something visible changed (or as a throttled heartbeat, so
+      // `rbox status` can say "last checked: Ns ago" without idle disk churn).
+      const terminalBlocked = op === "push" && this.pushTerminalBlocked;
+      const clearsOutOfStorage = pushedToRemote && this.activity.outOfStorage !== undefined;
+      const cleared = this.activity.active !== undefined || clearsOutOfStorage || terminalBlocked;
+      this.activity.active = undefined;
+      this.activeProgressPath = undefined;
+      if (clearsOutOfStorage) {
+        this.activity.outOfStorage = undefined;
+      }
+      if (clearsOutOfStorage) {
+        // The healed failure's dedup streak ends with it: a LATER failure with the
+        // same message is a new episode that must log and persist a fresh visible
+        // state, not silently count as repeat 2..9 and leave activity.json healed.
+        this.lastErrMsg = "";
+        this.errRepeat = 0;
+      }
+      if (cleared || this.activityDirty || Date.now() - this.lastActivityWrite > 30_000) this.writeActivity();
+    } catch (e) {
+      if (e instanceof MutationGateClosedError && this.stopped) {
+        // Cooperative shutdown cancellation is not an operation failure:
+        // no durable halt, retry counter, or misleading error surface.
+        return;
+      }
+      // A capture/config lane transition is saved before later upload/commit
+      // work. If that later work fails, refresh the durable truth here rather
+      // than waiting for a successful operation that may never arrive.
+      try {
+        const now = Date.now();
+        const before = this.syncBase ? renderShellDeferrals(this.syncBase, now, ageBucket) : undefined;
+        const durableState = await this.loadSyncBase();
+        this.emitDurableGitDeferrals(durableState, now);
+        if (before !== renderShellDeferrals(durableState, now, ageBucket)) this.writeActivity();
+      } catch {
+        // Preserve the original pump failure if the visibility refresh fails.
+      }
+      // Dedup a persistent error (e.g. a dead workspace 404s on EVERY op): log the
+      // first hit and every 10th after, with the running count — so the log stays
+      // readable while still showing exactly how long the failure has persisted.
+      const msg = e instanceof Error ? e.message : String(e);
+      this.errRepeat = msg === this.lastErrMsg ? this.errRepeat + 1 : 1;
+      this.lastErrMsg = msg;
+      const shouldLogRepeat = this.errRepeat === 1 || this.errRepeat % 10 === 0;
+      if (op === "recoveryProbe") {
+        const standing = this.activity.halt;
+        if (standing) {
+          const failure = this.classifyOperationFailure(e);
+          if ((standing.typedReason?.kind === "push-conflict"
+            || (standing.op === "push" && !standing.typedReason && !standing.terminal))
+            && e instanceof RecoveryProbePreflightError
+            && failure.kind === "halt"
+            && !failure.typedReason
+            && !failure.terminal) {
+            const nextProbeAt = new Date(this.now() + recoveryProbeDelayMs(
+              standing.consecutiveFailures ?? standing.count,
+              this.recoveryRandom,
+            )).toISOString();
+            this.activity.halt = { ...standing, nextProbeAt, recoveryState: "armed" };
+            this.scheduler.queue(standing.op);
+            this.scheduler.disarmRecoveryDue();
+            this.armStandingRecovery();
+            this.writeActivity();
+          } else {
+            const recorded = this.recordClassifiedFailure(standing.op, failure);
+            if (recorded.kind === "quota" && standing.op === "push") {
+              // A recovery probe discovered a new quota condition. Retire the
+              // conflict episode so it cannot remain permanently "running".
+              this.clearRecoveryHalt();
+            }
+          }
+        }
+        if (shouldLogRepeat) this.log(`recovery probe failed: ${msg}${this.errRepeat > 1 ? ` (x${this.errRepeat})` : ""}`);
+        return;
+      }
+      const failure = this.classifyOperationFailure(e);
+      const recorded = this.recordClassifiedFailure(op, failure);
+      if (recorded.kind === "quota") {
+        if (shouldLogRepeat) this.log(`pump op quota: ${msg}${this.errRepeat > 1 ? ` (x${this.errRepeat})` : ""}`);
+        if (recorded.visibleChanged || shouldLogRepeat) this.writeActivity();
+        await sleep(jitter(1000));
+        return;
+      }
+      if (recorded.blocked) {
+        if (shouldLogRepeat) {
+          this.log(`pump op blocked: ${msg}${this.errRepeat > 1 ? ` (x${this.errRepeat})` : ""}`);
+          this.writeActivity();
+        }
+        return;
+      }
+      // The halt record is the failure's user-visible surface (design 45): without
+      // it a mass-delete-guard refusal (design 44) stalls background sync with no
+      // indicator anywhere but this log. Persisted on the log-line schedule.
+      if (shouldLogRepeat) {
+        this.log(`pump op error: ${msg}${this.errRepeat > 1 ? ` (x${this.errRepeat})` : ""}`);
+        this.writeActivity();
+      }
+    }
+  }
+
+  private async settleAfterDrain(): Promise<void> {
+    await this.cache.save(this.root);
+    this.writeAmbientStatus();
+    // Settle the sidecar: all wants are drained here, so re-render if
+    // the state CHANGED from the last write — the mid-pump write said `pending`
+    // (push still queued) and the no-op push wrote nothing; an idle workspace must
+    // read `ok`. State-compared, so a truly unchanged pump writes nothing extra.
+    const settledNow = this.localSettled();
+    if (shellLineStateOf(this.activity, settledNow, Date.now()) !== this.lastShellState) this.writeActivity();
   }
 
   /** The publish composition root: prologue, the report lifecycle the push deps bag
@@ -2217,7 +2070,7 @@ export class RboxDaemon {
       });
       if (result.state !== base) this.observeDurableGitState(result.state, this.now());
       if (result.recoveredLocks > 0) {
-        this.want.pull = true;
+        this.scheduler.queue("pull");
         if (!this.pullOnly) this.requestPush("other");
         this.log(`Git lock recovery requeued the repository family (${result.recoveredLocks} lock${result.recoveredLocks === 1 ? "" : "s"})`);
       }

@@ -308,9 +308,11 @@ test("push provenance snapshots at dequeue and preserves later reasons for the n
 
 test("every raw want.push assignment is owned by requestPush and terminal recording is at the normal return boundary", () => {
   const source = fs.readFileSync(fileURLToPath(new URL("./daemon.ts", import.meta.url)), "utf8");
-  expect(source.match(/this\.want\.push\s*=\s*true/g)).toHaveLength(1);
+  // The queue moved into DaemonOperationScheduler; the ownership rule did not —
+  // exactly one literal push request exists and requestPush is where it lives.
+  expect(source.match(/this\.scheduler\.request\("push"\)/g)).toHaveLength(1);
   const requestPush = source.slice(source.indexOf("private requestPush"), source.indexOf("private takePushProvenance"));
-  expect(requestPush).toContain("this.want.push = true");
+  expect(requestPush).toContain('this.scheduler.request("push")');
   expect(source.match(/this\.recordGitCaptureSuccess\(provenance\)/g)).toHaveLength(1);
   // The ordering this gate froze now lives in the publish reducer that owns it: a
   // terminal refusal returns before any capture credit, and credit precedes the
