@@ -5,17 +5,42 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
-_Overnight checkpoint (2026-07-27, updated ~afternoon): **19 reorg merges**
-(#478-#496). Waves COMPLETE: 1 (status), 2 (push spine), 3 (discovery), 4
-(receive), 5 (follow/receive commit — w5c3 CommitReceivedGitTransition #494),
-7 (LOCAL authority — w7c3 PublishLocalWorkspaceTransition #495), 8c1 (pull
-orchestration — ApplyRemoteWorkspaceTransition #496, merged 05:47). Remaining:
-**w8c2 ServiceNextDaemonOperation only** — IN FLIGHT (worktree
-`.claude/worktrees/reorg-w8c2`, uncommitted draft: daemon-operation-scheduler
-.ts 388L + contract test 337L; needs rebase onto #496 before continuing);
-wave 6 PARKED on the 163 store port (by roadmap design). Hotspots (pre-#496):
-status-cmd 922→103, push.ts 1144→946, apply.ts 2291→1794, daemon.ts
-3790→3524. Extracted owners: status-maintenance/
+_REORG CAMPAIGN COMPLETE (2026-07-27 ~09:30 local): **20 reorg merges,
+19/21 roadmap cycles** (#478-#496, #499). Every schedulable cycle is done;
+wave 6 (RecoverStateAuthorityAtDaemonBoundary +
+PublishDaemonRuntimeObservation, ~380-490 daemon.ts lines) stays PARKED on
+the design-163 store port BY ROADMAP DESIGN — it opens with the 163 track,
+not before. Final cycle w8c2 #499 (squash ce2d5320):
+DaemonOperationScheduler solely owns queue/wants, recovery episode, mutex
+backoff + durable starvation, active op, single-flight/drain; daemon keeps
+boundary admission + op bodies + halt records behind a typed executor;
+16-test contract file. Review caught TWO defects in the archived draft
+(never executed): refused-boundary exit re-entry hot-looped forever (now
+parks until next wakeup — provably equivalent to old daemon exit), and a
+tick-sensitive single-flight assertion. Field-validated same hour: fleet
+build 1.9.1-dev+ce2d532 on Mac+FM, Mac→FM smoke round-trip clean, trusted
+pulls + push normal, zero pump errors. Hotspots final: status-cmd 922→103,
+push.ts 1144→946, apply.ts 2291→1502, daemon.ts 3790→3330 (→~2,300-2,450
+after wave 6 lands on the 163 track). Next-biggest agent-confusion
+surfaces (encore candidates for the next thermo-nuclear sweep, founder
+undecided): follow.ts 1784, plan.ts 1474._
+
+_Day-session riders (2026-07-27 morning): **#497 killed the three registered
+CI flakes** — root causes proven from CI attempt-1 logs (pull failed
+attempts via `gh api .../runs/<id>/attempts/1/jobs` BEFORE reruns overwrite
+them): git-state x2 + follow safety-linearization were detached git
+auto-maintenance (gc.pid tripping gitBusy / repack racing connectivity
+proofs) → suite-wide GIT_CONFIG env injection in scripts/test-preload.ts
+(repo config can't cover product-inited repos; cleanGitEnv spreads
+process.env); daemon-activity 178-B ran real ~5ms recovery timers →
+injected advancing now + ManualRecoveryClock. NEW follow.test.ts flake
+(174-C hung-subprocess timeout, #499 CI) recorded with proof — SECOND
+follow incident today; a third earns an investigation cycle. Rig FAST
+7/7 at the #494-497 checkpoint. Founder asks filed: #498 (`rbox status`
+anywhere → cumulative all-workspaces summary) + wants GitHub issues to
+become the public todo list. Ops note: worktree removal leaves the shell
+cwd dangling — one papercuts commit landed on the w8c2 branch and
+conflicted; use `git -C` absolute paths after removing a worktree._ Extracted owners: status-maintenance/
 projection/render/contract/read-port; git-capture-observation,
 publish-candidate, manifest-commit-executor, publisher-ack-transition;
 git-discovery-continuity, local-workspace-observer,
