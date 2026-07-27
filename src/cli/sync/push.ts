@@ -12,7 +12,6 @@ import {
 } from "../../engine/index.js";
 import { applyStateSavePacket, ensureCapableStateLineage, expectedStateNonce, loadState, manifestFromMeta, repoRecordsForState, stateWasStreamMismatch, syncStreamId, validManifestMeta, type GitResolutionPublicationReceipt, type GlobalManifestMeta, type WorkspaceConfig } from "../config.js";
 import { mdeWritePolicy } from "../e2ee-remote.js";
-import { type CommitOptions, type CommitTimings } from "../remote.js";
 import {
   deferManifest,
   encryptAndUpload,
@@ -44,6 +43,7 @@ import { apiFor, MAX_ATTEMPTS, NO_GIT_FORCE, makeDeferErrnoReporter, defaultBack
 import { finishResolutionReceipt, pull, reconcileResolutionReceipt, scanManifestForPushResult, surfaceResolutionReceiptReconciliation } from "./pull.js";
 import { MutationGateClosedError } from "../../engine/mutation-gate.js";
 import { cloneCollisionGroups, preparePublishCandidate, type GitCapturePort } from "./publish-candidate.js";
+import { executeManifestCommit, type ManifestCommitPort } from "./manifest-commit-executor.js";
 
 const COMMIT_FILE_ENTRY_KEYS = ["path", "sha256", "size", "mode", "mtimeMs", "type", "symlinkTarget", "encSha", "comp", "payloadSha", "cipherSize"] as const;
 const COMMIT_FILE_ENTRY_KEY_SET: ReadonlySet<string> = new Set(COMMIT_FILE_ENTRY_KEYS);
@@ -700,8 +700,6 @@ async function runPushAttempt(
       }
     }
 
-    let commitTimings: CommitTimings | undefined;
-    let commitOptions: CommitOptions | undefined;
     // Design 204 §4.2: the writer's policy decides this seam too — no raw env read
     // here, or the two seams could diverge in a way no wire assertion can see.
     // Under the master kill (or with deltas killed) NOTHING is reconstructed: the
@@ -738,147 +736,137 @@ async function runPushAttempt(
         }
       }
     }
-    if (deps.blockedFingerprint !== undefined || report.enabled || deltaBase || deltaBaseRejection || repair || forceSnapshot) {
-      commitOptions = {
-        ...(deps.blockedFingerprint !== undefined ? { blockedFingerprint: deps.blockedFingerprint } : {}),
-        ...(report.enabled ? { onCommitTimings: (t: CommitTimings) => (commitTimings = t) } : {}),
-        ...(deltaBase ? { deltaBase } : {}),
-        ...(deltaBaseRejection ? { deltaBaseRejection } : {}),
-        // The 422 chain-link arm (`attemptState.forceSnapshot`) already withheld
-        // deltaBase above; forwarding the flag is behaviour-neutral there and is
-        // what lets the writer log §7's `force` instead of a misleading `no-base`.
-        ...(repair || forceSnapshot ? { forceSnapshot: true } : {}),
-      };
-    }
     const parentSequence = repair?.parentSequence ?? appliedSequence;
-    let armedReceipt: GitResolutionPublicationReceipt | undefined;
+    let keepMineArm: GitResolutionPublicationReceipt | undefined;
     if (resolution && gitPlan.resolution?.outcome === "published") {
       const candidate = committed.gitRepos?.[resolution.repo];
       if (!candidate || !gitPlan.resolution.confirmedReportHash) {
         throw new Error("keep-mine planner admitted no exact publication candidate");
       }
-      const receipt: GitResolutionPublicationReceipt = {
+      keepMineArm = {
         repo: resolution.repo,
         attemptedGitIncomingKey: gitIncomingKey(candidate),
         attemptedSequence: parentSequence + 1,
         confirmedReportHash: gitPlan.resolution.confirmedReportHash,
       };
-      commitOptions = {
-        ...(commitOptions ?? {}),
-        beforeCommitSend: async () => {
-          const boundary = await loadState(root, syncStreamId(cfg), deps.warningSink, deps.syncMutex);
-          const record = repoRecordsForState(boundary)[resolution.repo];
-          if (!record) throw new Error("keep-mine receipt repository disappeared before commit send");
-          const installed = await applyStateSavePacket(root, {
-            expectedStream: boundary.stream,
-            expectedNonce: expectedStateNonce(boundary),
-            sourceGlobalSeq: boundary.lastSyncedSequence,
-            repos: [{
-              relPath: resolution.repo,
-              expectedRepoGen: record.repoGen,
-              newRecord: { ...inputRecord(record), resolutionReceipt: receipt },
-              baseProof: carryRepoBaseProof(recordOriginLineage(record.branchBaseOrigins) ?? "legacy-untrusted"),
-            }],
-          });
-          if (installed.status !== "accepted") throw new Error("keep-mine publication receipt could not be armed");
-          // No failure-capable work may follow the durable arm before POST.
-          // The accepted transaction already returns the exact installed state.
-          state = installed.state;
-          armedReceipt = receipt;
-        },
-      };
     }
-    const commitStatsToken = firstPublishMeasurementToken();
-    const commitStatsT0 = commitStatsToken ? performance.now() : 0;
-    const redeemBefore = firstPublishTiming.stats.receiptRedemptionWallMs;
-    let res: Awaited<ReturnType<typeof api.commit>>;
-    try {
-      res = await report.phase("commit", () => api.commit(parentSequence, cfg.deviceId, committed, commitOptions));
-    } catch (error) {
-      if (armedReceipt) {
+    const commitPort: ManifestCommitPort = {
+      armKeepMine: async (receipt) => {
+        const boundary = await loadState(root, syncStreamId(cfg), deps.warningSink, deps.syncMutex);
+        const record = repoRecordsForState(boundary)[receipt.repo];
+        if (!record) throw new Error("keep-mine receipt repository disappeared before commit send");
+        const installed = await applyStateSavePacket(root, {
+          expectedStream: boundary.stream,
+          expectedNonce: expectedStateNonce(boundary),
+          sourceGlobalSeq: boundary.lastSyncedSequence,
+          repos: [{
+            relPath: receipt.repo,
+            expectedRepoGen: record.repoGen,
+            newRecord: { ...inputRecord(record), resolutionReceipt: receipt },
+            baseProof: carryRepoBaseProof(recordOriginLineage(record.branchBaseOrigins) ?? "legacy-untrusted"),
+          }],
+        });
+        if (installed.status !== "accepted") throw new Error("keep-mine publication receipt could not be armed");
+        // No failure-capable work may follow the durable arm before POST.
+        // The accepted transaction already returns the exact installed state.
+        state = installed.state;
+      },
+      commit: async ({ parentSequence: parent, manifest, options }) => {
+        const commitStatsToken = firstPublishMeasurementToken();
+        const commitStatsT0 = commitStatsToken ? performance.now() : 0;
+        const redeemBefore = firstPublishTiming.stats.receiptRedemptionWallMs;
+        const response = await report.phase("commit", () => api.commit(parent, cfg.deviceId, manifest, options));
+        if (firstPublishMeasurementLive(commitStatsToken)) {
+          const redeemDuring = firstPublishTiming.stats.receiptRedemptionWallMs - redeemBefore;
+          firstPublishTiming.stats.commitWallMs += Math.max(0, Math.round(performance.now() - commitStatsT0) - redeemDuring);
+        }
+        return response;
+      },
+      reportCommitTimings: (timings) => report.recordDetails("commit", { ...timings }, formatCommitTimings(timings)),
+      disarmKeepMine: async (receipt) => {
+        await finishResolutionReceipt(root, state, receipt.repo, receipt, false);
+        state = await loadState(root, syncStreamId(cfg), deps.warningSink, deps.syncMutex);
+      },
+      notifyConflict: () => { deps.onCommitConflict?.(); }, // tally 409 retry pressure (design 09 §3)
+      reconcileKeepMine: async () => {
+        const reconciled = await reconcileResolutionReceipt(root, cfg, deps, api);
+        return reconciled.status === "none"
+          ? { status: "none" }
+          : { status: reconciled.status, sequence: reconciled.sequence, manifest: reconciled.manifest };
+      },
+      pullAndLoadAccepted: async () => {
+        await pull(root, cfg, deps);
+        const postPull = await loadState(root, syncStreamId(cfg), deps.warningSink, deps.syncMutex);
+        return { sequence: postPull.lastSyncedSequence, manifest: postPull.lastSyncedManifest };
+      },
+    };
+    const commitReceipt = await executeManifestCommit(
+      {
+        identity: sealed.identity,
+        manifest: committed,
+        parentSequence,
+        ...(deltaBase ? { deltaBase } : {}),
+        ...(deltaBaseRejection ? { deltaBaseRejection } : {}),
+        // The 422 chain-link arm (`attemptState.forceSnapshot`) already withheld
+        // deltaBase above; forwarding the flag is behaviour-neutral there and is
+        // what lets the writer log §7's `force` instead of a misleading `no-base`.
+        forceSnapshot: repair !== undefined || forceSnapshot,
+        ...(deps.blockedFingerprint !== undefined ? { blockedFingerprint: deps.blockedFingerprint } : {}),
+        reportTimings: report.enabled,
+        ...(keepMineArm ? { keepMineArm } : {}),
+        resolutionRider: resolution !== undefined,
+      },
+      commitPort,
+    );
+
+    if (commitReceipt.kind === "ack-uncertain") {
+      return { done: true, result: {
+        sequence: appliedSequence,
+        manifest: committed,
+        committed: false,
+        ...resultCollisionMetadata(attemptState),
+        resolution: { outcome: "ack-uncertain", reason: commitReceipt.reason },
+      } };
+    }
+    if (commitReceipt.kind === "epoch-stale") {
+      return { done: false, action: { kind: "epoch-stale" }, exhaustedError: "push: account epoch kept rotating under us" };
+    }
+    if (commitReceipt.kind === "resolution-transition") {
+      const transition = commitReceipt.transition;
+      if (transition.kind === "authentication-failed") {
         return { done: true, result: {
           sequence: appliedSequence,
           manifest: committed,
           committed: false,
           ...resultCollisionMetadata(attemptState),
-          resolution: { outcome: "ack-uncertain", reason: "the publish acknowledgement was lost; run rbox push or rbox pull to reconcile" },
+          resolution: { outcome: "ack-uncertain", reason: transition.reason },
         } };
       }
-      throw error;
+      return { done: true, result: {
+        sequence: transition.sequence,
+        manifest: transition.manifest,
+        committed: false,
+        ...resultCollisionMetadata(attemptState),
+        resolution: transition.kind === "published"
+          ? { outcome: "published", sequence: transition.sequence }
+          : { outcome: "aborted-remote-moved", reason: transition.reason },
+      } };
     }
-    if (firstPublishMeasurementLive(commitStatsToken)) {
-      const redeemDuring = firstPublishTiming.stats.receiptRedemptionWallMs - redeemBefore;
-      firstPublishTiming.stats.commitWallMs += Math.max(0, Math.round(performance.now() - commitStatsT0) - redeemDuring);
-    }
-    if (commitTimings) report.recordDetails("commit", { ...commitTimings }, formatCommitTimings(commitTimings));
-
-    if (res.epochStale !== undefined) {
-      if (armedReceipt) {
-        await finishResolutionReceipt(root, state, armedReceipt.repo, armedReceipt, false);
-        state = await loadState(root, syncStreamId(cfg), deps.warningSink, deps.syncMutex);
-      }
-      return { done: false, action: { kind: "epoch-stale" }, exhaustedError: "push: account epoch kept rotating under us" };
-    }
-    if (res.conflict) {
-      deps.onCommitConflict?.(); // tally 409 retry pressure (design 09 §3)
-      if (resolution) {
-        try {
-          if (armedReceipt) {
-            const reconciled = await reconcileResolutionReceipt(root, cfg, deps, api);
-            if (reconciled.status === "exact") {
-              return { done: true, result: {
-                sequence: reconciled.sequence,
-                manifest: reconciled.manifest,
-                committed: false,
-                ...resultCollisionMetadata(attemptState),
-                resolution: { outcome: "published", sequence: reconciled.sequence },
-              } };
-            }
-            if (reconciled.status === "mismatch") {
-              return { done: true, result: {
-                sequence: reconciled.sequence,
-                manifest: reconciled.manifest,
-                committed: false,
-                ...resultCollisionMetadata(attemptState),
-                resolution: { outcome: "aborted-remote-moved", reason: "another machine published while confirming" },
-              } };
-            }
-          }
-          await pull(root, cfg, deps);
-          const postPull = await loadState(root, syncStreamId(cfg), deps.warningSink, deps.syncMutex);
-          return { done: true, result: {
-            sequence: postPull.lastSyncedSequence,
-            manifest: postPull.lastSyncedManifest,
-            committed: false,
-            ...resultCollisionMetadata(attemptState),
-            resolution: { outcome: "aborted-remote-moved", reason: "another machine published while confirming" },
-          } };
-        } catch {
-          return { done: true, result: {
-            sequence: appliedSequence,
-            manifest: committed,
-            committed: false,
-            ...resultCollisionMetadata(attemptState),
-            resolution: { outcome: "ack-uncertain", reason: "remote truth could not be authenticated; run rbox push or rbox pull to reconcile" },
-          } };
-        }
-      }
+    if (commitReceipt.kind === "conflict") {
       return repair
         ? { done: false, action: { kind: "repair-conflict" }, exhaustedError: "repair: verified head advanced during publication" }
         : { done: false, action: { kind: "pull-first" }, exhaustedError: "push: too many conflicts, remote is moving faster than we can reconcile" };
     }
-    if (res.unsatisfiedBlobs) {
-      if (armedReceipt) {
-        await finishResolutionReceipt(root, state, armedReceipt.repo, armedReceipt, false);
-        state = await loadState(root, syncStreamId(cfg), deps.warningSink, deps.syncMutex);
-      }
+    if (commitReceipt.kind === "unsatisfied") {
       // A missing GIT artifact can't be satisfied by a file re-upload, and an identity-carry
       // would re-reference the absent bundle (§28) — so force a RE-CAPTURE for
       // exactly the repos whose sections reference the missing encShas (see gitForceForMissingBlobs).
       // The reupload retry re-checks missingBlobs + re-uploads the missing FILE ciphertext with
       // the same per-file defer; the SAME manifest is retried (no pull, no re-scan).
-      return reuploadOutcome(committed, res.unsatisfiedBlobs, res.unsatisfiedTotal, res.attemptedManifestChain);
+      return reuploadOutcome(committed, commitReceipt.unsatisfiedBlobs, commitReceipt.unsatisfiedTotal, commitReceipt.attemptedManifestChain);
     }
+    const armedReceipt = commitReceipt.armed;
+    const acceptedSequence = commitReceipt.sequence;
 
     // ACCEPTED. Capture the files-synced ACK timestamp NOW (design 108 §3.6): the END is
     // this accepted commit response; the START is init's command milestone (before scan).
@@ -936,7 +924,7 @@ async function runPushAttempt(
           lineageHash: binding.lineageHash,
           repositoryIdentityHash: binding.repositoryIdentityHash,
           incomingKey: gitIncomingKey(section),
-          sourceSeq: res.sequence!,
+          sourceSeq: acceptedSequence,
           advertisedRefs: section.refs,
           ...(gitPlan.absentBranchProofs?.[relPath]
             ? { absentBranchProofs: gitPlan.absentBranchProofs[relPath] }
@@ -973,9 +961,9 @@ async function runPushAttempt(
     try {
       await report.phase("state-save", () => saveStateSource(root, state, {
         expectedStream: syncStreamId(cfg),
-        sourceGlobalSeq: res.sequence!,
+        sourceGlobalSeq: acceptedSequence,
         globalManifest: committed,
-        ...(res.manifestMeta ? { manifestMeta: res.manifestMeta } : {}),
+        ...(commitReceipt.manifestMeta ? { manifestMeta: commitReceipt.manifestMeta } : {}),
         observedRepos: observedRepoKeys(state, committed.gitRepos, ackValues),
         values: ackValues,
         repoProofs,
@@ -987,7 +975,7 @@ async function runPushAttempt(
     } catch (error) {
       if (armedReceipt) {
         return { done: true, result: {
-          sequence: res.sequence!,
+          sequence: acceptedSequence,
           manifest: committed,
           committed: true,
           ...resultCollisionMetadata(attemptState),
@@ -1013,10 +1001,10 @@ async function runPushAttempt(
     }
 
     if (deferred.size > 0) reportDeferred(deferred, deps.warningSink);
-    return { done: true, result: { sequence: res.sequence!, manifest: committed, deferred: [...deferred], retryLater: [...retryLater], committed: true, ...resultCollisionMetadata(attemptState), ...(gitPlan.filesFirstDeferred ? { gitDeferred: true } : {}), ...(gitPlan.resolution ? { resolution: {
+    return { done: true, result: { sequence: acceptedSequence, manifest: committed, deferred: [...deferred], retryLater: [...retryLater], committed: true, ...resultCollisionMetadata(attemptState), ...(gitPlan.filesFirstDeferred ? { gitDeferred: true } : {}), ...(gitPlan.resolution ? { resolution: {
       outcome: gitPlan.resolution.outcome,
       ...(gitPlan.resolution.reason ? { reason: gitPlan.resolution.reason } : {}),
-      sequence: res.sequence!,
+      sequence: acceptedSequence,
     } } : {}) } };
   } finally {
     if (firstPublishTiming.enabled) beginFirstPublishTiming(false);

@@ -153,7 +153,9 @@ test("the full design-138 loadState caller inventory remains on the hard-refusal
     "sync/pull.ts": 5,
     // Receipt arming consumes applyStateSavePacket's installed state directly;
     // a reload after the durable arm would reopen a pre-POST failure window.
-    "sync/push.ts": 6,
+    // The epoch-stale and 422 post-disarm reloads are one ManifestCommitPort
+    // member, so both classification arms share a single call site.
+    "sync/push.ts": 5,
     // Workspace shape, the local-only linked-worktree inventory, and the
     // design-208 repo-residue section each read through the same
     // stream-mismatch hard-refusal API.
@@ -175,7 +177,7 @@ test("the full design-138 loadState caller inventory remains on the hard-refusal
     expect(direct + injected, relative).toBe(expected);
     total += direct + injected;
   }
-  expect(total).toBe(27);
+  expect(total).toBe(26);
 
   // Status reads state through its projection port instead of calling the API
   // directly; the binding and both port reads still ride the hard-refusal path.
