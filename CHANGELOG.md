@@ -6,6 +6,16 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.10.1] - 2026-07-27
+
+### Changed
+- **A calmer help screen.** `rbox --help` now shows just the six commands of
+  the everyday loop — `status`, `sync`, `start`, `stop`, `doctor`, and bare
+  `rbox` — with everything else one step away in `rbox help --all`. The full
+  reference itself is easier to scan: one row per command (subcommands like
+  `key …` and `trash …` fold into their parent), and flags now live only in
+  each command's own `--help`. No command was removed or renamed.
+
 ## [1.10.0] - 2026-07-27
 
 ### Added
