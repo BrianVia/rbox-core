@@ -50,7 +50,13 @@ export function configuredWorkers(warningSink: (line: string) => void = console.
     return configuredWorkersCache;
   }
   const parallelism = typeof os.availableParallelism === "function" ? os.availableParallelism() : os.cpus().length;
-  const base = override ?? Math.min(Math.max(parallelism - 2, 2), MAX_WORKERS);
+  // 4 workers, cross-architecture constant (2026-07-27 fleet sweep, issue #508):
+  // the encrypt lane is memory-bandwidth/VFS-bound, not compute-bound — the
+  // knee was 4 on 12/12 sweeps across Zen3 16C, Zen3 8C, and M2 Max, and the
+  // old cores-derived default (parallelism-2 → 10-30 workers) ran 1.7-7x
+  // SLOWER than 4, below one serial core at the top end. Core count does not
+  // predict the knee; do not restore a formula without new sweep evidence.
+  const base = override ?? Math.min(4, Math.max(parallelism, 1));
   let count = Math.max(1, Math.min(base, MAX_WORKERS));
 
   const memoryCap = Math.max(1, Math.floor(os.totalmem() / WORKER_MEMORY_BYTES));

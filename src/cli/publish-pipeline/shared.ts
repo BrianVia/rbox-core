@@ -89,7 +89,10 @@ export const MAX_SHAS_PER_CHECK = 50_000;
 export const PER_FILE_UPLOAD_ATTEMPTS = 3;
 export const FUSED_ENCRYPT_CONCURRENCY_CAP = 2048;
 
-export const fuseEnabled = (): boolean => /^(1|true|yes|on)$/i.test(process.env.RBOX_CRYPTO_FUSE?.trim() ?? "");
+// Default ON (2026-07-27, issue #508): fused encrypt skips the per-blob
+// temp-file lifecycles (5x wall on the fleet, 4.6x on APFS) and was proven
+// address-identical over 1,000 blobs. RBOX_CRYPTO_FUSE=0 is the kill switch.
+export const fuseEnabled = (): boolean => !/^(0|false|no|off)$/i.test(process.env.RBOX_CRYPTO_FUSE?.trim() ?? "");
 
 // Default ON (founder call 2026-07-13, single-user fleet): upload-time receipt
 // draining ships live; RBOX_REDEEM_DRAIN=off is the kill switch for both the

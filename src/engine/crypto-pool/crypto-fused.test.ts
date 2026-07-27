@@ -231,8 +231,8 @@ describe("fused crypto", () => {
         return originalEncryptCoalesced.apply(this, args);
       };
       setDefaultEncryptObserverForTest(() => { oracleCalls++; });
-      if (fused) process.env.RBOX_CRYPTO_FUSE = "1";
-      else delete process.env.RBOX_CRYPTO_FUSE;
+      // Fuse is default-on; the file-backed arm needs the explicit kill switch.
+      process.env.RBOX_CRYPTO_FUSE = fused ? "1" : "0";
       try {
         await encryptAndUpload(remote, root, cfg, local, base, PhaseReport.disabled(), undefined, async () => {});
         return { coalescedCalls, oracleCalls };
