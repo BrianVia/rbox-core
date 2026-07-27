@@ -1,6 +1,7 @@
 import path from "node:path";
 import { progressLabel } from "./status-view.js";
-import { findRoot } from "./config.js";
+import { findRoot as findWorkspaceRoot } from "./config.js";
+import { rememberResolvedRoot } from "./binding-registry.js";
 import { pull, push } from "./sync.js";
 import { attachGitSyncProgress, postSyncNudge, runSyncCommand, summarize, summarizeCaseCollisions } from "./sync-cmd.js";
 import { beginReport, logDebugSummary } from "./metrics.js";
@@ -81,6 +82,19 @@ async function resolveRoot(arg: string | undefined): Promise<string> {
   return root;
 }
 
+/**
+ * Design 211's convergence net. Every workspace-local command resolves its root
+ * through here, so operating on a workspace also records (or refreshes) its
+ * entry in the local binding registry. That is what folds in bindings made by an
+ * older binary, and what covers any future bind path that forgets to register
+ * itself. Read-mostly and best-effort: it writes only when something changed.
+ */
+async function findRoot(start: string): Promise<string | undefined> {
+  const root = await findWorkspaceRoot(start);
+  if (root !== undefined) await rememberResolvedRoot(root);
+  return root;
+}
+
 async function resolvePathFlagRoot(arg: string | undefined): Promise<string> {
   const root = await findRoot(arg ? path.resolve(arg) : process.cwd());
   if (!root) throw new Error("Not inside an rbox workspace. Run from the workspace, or pass --path <dir>.");
@@ -89,15 +103,24 @@ async function resolvePathFlagRoot(arg: string | undefined): Promise<string> {
 
 /** #498: outside a workspace, `rbox doctor`/`rbox status` summarize every synced
  * folder on this machine instead of dead-ending on "Not inside an rbox workspace". */
-async function runMachineTriage(jsonMode: boolean): Promise<void> {
-  const { collectMachineTriage, renderMachineTriage } = await import("./doctor-machine.js");
+async function runMachineTriage(jsonMode: boolean, surface: "doctor" | "status" = "doctor"): Promise<void> {
+  const { collectMachineTriage, renderMachineStatusTable, renderMachineTriage } = await import("./doctor-machine.js");
   const triage = await collectMachineTriage();
   if (jsonMode) {
     const { emitJson } = await import("./json.js");
     emitJson(triage);
     return;
   }
-  for (const line of renderMachineTriage(triage)) console.log(line);
+  const render = surface === "status" ? renderMachineStatusTable : renderMachineTriage;
+  for (const line of render(triage)) console.log(line);
+}
+
+/** `--all` is an aggregate over every locally known workspace, so a PATH — which
+ * selects exactly one — cannot mean anything alongside it (CLI-surface memo §3). */
+function assertAllWithoutPath(cmd: string, all: boolean, pathArg: string | undefined): void {
+  if (all && pathArg !== undefined) {
+    throw new Error(`--all covers every locally known workspace, so it cannot be combined with a path. Use \`rbox ${cmd} --all\` or \`rbox ${cmd} ${pathArg}\`.`);
+  }
 }
 
 export type FrontDoorImport = () => Promise<Pick<typeof import("./front-door.js"), "resolveBareRboxTarget" | "runFrontDoor" | "runUntrackedMenu">>;
@@ -220,7 +243,14 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
       break;
     }
     case "untrack": {
-      const root = await resolveRoot(positional[0]);
+      const explicit = positional[0] === undefined ? undefined : path.resolve(positional[0]);
+      // A root the registry still lists but whose `.rbox/` binding is already
+      // gone has no workspace to walk up to — yet forgetting it is exactly the
+      // remedy `status --all` / `doctor --all` print for that row (design 211).
+      const resolved = await findRoot(explicit ?? process.cwd())
+        ?? (explicit !== undefined && await (await import("./binding-registry.js")).isRegisteredRoot(explicit) ? explicit : undefined);
+      if (resolved === undefined) throw workspaceRequiredError();
+      const root = resolved;
       const { untrack } = await import("./untrack-cmd.js");
       await untrack({
         root,
@@ -387,7 +417,7 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
     }
     case "status": {
       if (positional.length > 1) {
-        fail("usage: rbox status [path] [--json | --verbose | --git]");
+        fail("usage: rbox status [path] [--all] [--json | --verbose | --git]");
         break;
       }
       const presentations = [flags.json, flags.verbose, flags.git].filter((value) => value === "true").length;
@@ -395,9 +425,14 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
         fail("choose only one status presentation flag: --json, --verbose, or --git");
         break;
       }
+      assertAllWithoutPath("status", flags.all === "true", positional[0]);
+      if (flags.all === "true") {
+        await runMachineTriage(jsonMode, "status");
+        break;
+      }
       const statusRoot = await findRoot(positional[0] ? path.resolve(positional[0]) : process.cwd());
       if (!statusRoot) {
-        await runMachineTriage(jsonMode);
+        await runMachineTriage(jsonMode, "status");
         break;
       }
       const root = statusRoot;
@@ -420,6 +455,16 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
       // alias. `reset-journal` is a sub-verb, so the path follows it when present.
       const resetJournal = positional[0] === "reset-journal";
       const doctorPath = (resetJournal ? positional[1] : positional[0]) ?? flags.path;
+      assertAllWithoutPath("doctor", flags.all === "true", doctorPath);
+      if (flags.all === "true") {
+        // Bounded, read-only diagnostics across the registry. The workspace-scoped
+        // support-report and reset-journal work has no machine-wide meaning.
+        if (report || diagnostics || resetJournal || flags.quarantine === "true" || flags.restore !== undefined) {
+          throw new Error("--all runs the read-only all-workspaces check; support-report and reset-journal work is workspace-scoped");
+        }
+        await runMachineTriage(jsonMode);
+        break;
+      }
       const doctorRoot = await findRoot(doctorPath ? path.resolve(doctorPath) : process.cwd());
       if (!doctorRoot) {
         // Support-report and reset-journal work is workspace-scoped; only the

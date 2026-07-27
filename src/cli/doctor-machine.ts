@@ -1,23 +1,24 @@
 /**
- * The all-workspaces view (#498): what `rbox doctor` / `rbox status` show when
- * you are NOT standing inside a workspace. The machine's synced folders are
- * enumerated from the per-workspace daemon records under `~/.rbox/daemons`
- * (the same desired-state rows `rbox upgrade` and boot-resume already read),
- * so running from anywhere gives one line per folder plus the command that
- * takes you into its full report. Read-only.
+ * The all-workspaces view (#498, extended by design 211): what `rbox status
+ * --all` / `rbox doctor --all` show, and what plain `rbox status` / `rbox
+ * doctor` fall back to when you are NOT standing inside a workspace.
  *
- * The desired-state row is the ONLY record carrying a workspace's absolute
- * path — the runtime directory is named by a hash of that path, so a folder
- * bound with `rbox track` that has never started background sync leaves
- * nothing here to find. The footer says so rather than implying the list is
- * exhaustive.
+ * Enumeration comes from the DURABLE LOCAL BINDING REGISTRY
+ * (`binding-registry.ts`), which unions the persisted per-bind records with the
+ * daemon desired-state rows. That is what retired the old "a folder bound with
+ * `rbox track` that never started background sync is not listed here" footer:
+ * the registry covers those bindings, so the list is no longer knowingly
+ * incomplete.
+ *
+ * Per-workspace facts still come from the daemon's own ambient status record,
+ * behind the SAME liveness + boot-binding trust gates the in-workspace report
+ * applies. Read-only: no network, no scans, no mutation.
  */
-import fsp from "node:fs/promises";
 import path from "node:path";
-import { readDesiredDaemonRows } from "./autostart-cmd.js";
-import { currentWorkspaceId, readDaemonPidRecord } from "./daemon-control.js";
+import { readBindingRegistry, type BindingHealth, type BindingRegistryRow } from "./binding-registry.js";
+import { readDaemonPidRecord } from "./daemon-control.js";
 import { DAEMON_HEARTBEAT_FUTURE_SKEW_MS, isDaemonProcess } from "./daemon/process-control.js";
-import { readAmbientDaemonStatusRecord, type AmbientDaemonStatusV1 } from "./daemon/ambient-status.js";
+import { readAmbientDaemonStatusRecord, type AmbientDaemonStatusV1, type DaemonMode } from "./daemon/ambient-status.js";
 import { AMBIENT_STATUS_STALE_MS } from "./populate-marker.js";
 import { shQuoteIfNeeded } from "./shell-quote.js";
 import { style } from "./style.js";
@@ -34,9 +35,19 @@ export type MachineWorkspaceState =
 export interface MachineWorkspaceSummary {
   root: string;
   name: string;
+  /** Registry health of the local binding: bound / missing / rebound. */
+  binding: BindingHealth;
   state: MachineWorkspaceState;
+  /** Is a background-sync process for this root alive right now? */
+  daemonRunning: boolean;
+  /** Authoritative only when the record passed the liveness/boot gates. */
+  mode?: DaemonMode;
+  /** ISO timestamp of the last completed sync, when the daemon reported one. */
+  lastSyncedAt?: string;
   /** One plain-English line: what this folder is doing right now. */
   summary: string;
+  /** The single highest-priority problem, or absent when nothing is wrong. */
+  problem?: string;
   /** Copy-pasteable next step. Absent when no command can honestly act on this
    * folder from here (a folder that is gone cannot be `cd`-ed into). */
   command?: string;
@@ -50,16 +61,12 @@ export interface MachineTriage {
 }
 
 export interface MachineTriageDeps {
-  readDesiredDaemonRows?: typeof readDesiredDaemonRows;
+  readBindingRegistry?: typeof readBindingRegistry;
   readAmbientDaemonStatusRecord?: typeof readAmbientDaemonStatusRecord;
   readDaemonPidRecord?: typeof readDaemonPidRecord;
-  currentWorkspaceId?: typeof currentWorkspaceId;
   isDaemonProcess?: typeof isDaemonProcess;
-  exists?: (target: string) => Promise<boolean>;
   now?: () => number;
 }
-
-const pathExists = (target: string): Promise<boolean> => fsp.stat(target).then(() => true, () => false);
 
 const ATTENTION_SUMMARY: Record<string, string> = {
   halt: "syncing stopped and needs your decision",
@@ -67,6 +74,11 @@ const ATTENTION_SUMMARY: Record<string, string> = {
   "watcher-degraded": "not noticing file changes instantly; syncing is slow",
   "ownership-lost": "another rbox process took over syncing this folder",
 };
+
+const MISSING_SUMMARY =
+  "this folder is gone or is no longer set up for rbox, so rbox is not syncing it. If you moved it back, run `rbox start` inside it.";
+const REBOUND_SUMMARY =
+  "this folder is now connected to a different rbox workspace than the one that was set up here";
 
 function deferralSuffix(status: AmbientDaemonStatusV1 | undefined): string {
   const count = status?.deferredRepos ?? 0;
@@ -92,47 +104,52 @@ function summarize(status: AmbientDaemonStatusV1): { state: MachineWorkspaceStat
   }
 }
 
+/** The one problem to lead with. Ordered worst-first; `undefined` means healthy. */
+function highestPriorityProblem(state: MachineWorkspaceState, summary: string, deferred: number): string | undefined {
+  if (state === "unreachable" || state === "attention") return summary;
+  if (state === "unknown") return "background sync is running but has not reported in";
+  if (state === "stopped") return "background sync is not running";
+  if (deferred > 0) return deferred === 1 ? "1 code folder is waiting on you" : `${deferred} code folders are waiting on you`;
+  return undefined;
+}
+
+function unreachable(row: BindingRegistryRow, summary: string, command?: string): MachineWorkspaceSummary {
+  return {
+    root: row.root,
+    name: row.name ?? path.basename(row.root),
+    binding: row.health,
+    state: "unreachable",
+    daemonRunning: false,
+    summary,
+    problem: summary,
+    ...(command === undefined ? {} : { command }),
+  };
+}
+
 export async function collectMachineTriage(deps: MachineTriageDeps = {}): Promise<MachineTriage> {
-  const rows = await (deps.readDesiredDaemonRows ?? readDesiredDaemonRows)().catch(() => []);
+  const rows = await (deps.readBindingRegistry ?? readBindingRegistry)().catch(() => []);
   const readAmbient = deps.readAmbientDaemonStatusRecord ?? readAmbientDaemonStatusRecord;
   const readPid = deps.readDaemonPidRecord ?? readDaemonPidRecord;
   const alive = deps.isDaemonProcess ?? isDaemonProcess;
-  const workspaceId = deps.currentWorkspaceId ?? currentWorkspaceId;
-  const exists = deps.exists ?? pathExists;
   const now = (deps.now ?? Date.now)();
 
-  const seen = new Set<string>();
   const workspaces: MachineWorkspaceSummary[] = [];
   for (const row of rows) {
-    const root = path.resolve(row.desired.rootPath);
-    if (seen.has(root)) continue;
-    seen.add(root);
-    const name = path.basename(root);
-    const command = `cd ${shQuoteIfNeeded(root)} && rbox doctor`;
-    if (!await exists(path.join(root, ".rbox", "workspace.json"))) {
-      // No command: `rbox untrack <root>` resolves the workspace binding first
-      // and so cannot run against exactly the state that produced this row.
-      workspaces.push({
-        root,
-        name,
-        state: "unreachable",
-        summary: "this folder is gone or is no longer set up for rbox, so rbox is not syncing it. If you moved it back, run `rbox start` inside it.",
-      });
+    const name = row.name ?? path.basename(row.root);
+    const command = `cd ${shQuoteIfNeeded(row.root)} && rbox doctor`;
+    if (row.health === "missing") {
+      // No `cd` command: `rbox untrack <root>` is the honest remedy, and it now
+      // clears a registry entry whose binding is already gone.
+      workspaces.push(unreachable(row, MISSING_SUMMARY, `rbox untrack ${shQuoteIfNeeded(row.root)}`));
       continue;
     }
-    if (row.desired.workspaceId !== workspaceId(root)) {
-      workspaces.push({
-        root,
-        name,
-        state: "unreachable",
-        summary: "this folder is now connected to a different rbox workspace than the one that was set up here",
-        command,
-      });
+    if (row.health === "rebound") {
+      workspaces.push(unreachable(row, REBOUND_SUMMARY, command));
       continue;
     }
-    const record = readAmbient(root);
+    const record = readAmbient(row.root);
     const status = record.kind === "ok" ? record.status : undefined;
-    const pid = readPid(root);
+    const pid = readPid(row.root);
     // Liveness FIRST: a daemon that just died leaves a fresh-looking record
     // behind, and reporting that as "up to date" is the worst possible lie.
     const running = pid.pid !== undefined && alive(pid.pid);
@@ -148,26 +165,42 @@ export async function collectMachineTriage(deps: MachineTriageDeps = {}): Promis
       && age <= AMBIENT_STATUS_STALE_MS
       && age >= -DAEMON_HEARTBEAT_FUTURE_SKEW_MS;
     const suffix = deferralSuffix(status);
+    const deferred = status?.deferredRepos ?? 0;
     if (usable && status) {
       const { state, summary } = summarize(status);
+      const line = `${summary}${suffix}`;
+      const problem = highestPriorityProblem(state, line, deferred);
       workspaces.push({
-        root,
+        root: row.root,
         name,
+        binding: row.health,
         state,
-        summary: `${summary}${suffix}`,
+        daemonRunning: true,
+        // Mode and lastSyncedAt are quoted ONLY from a record that cleared the
+        // gates above; a stale record's mode is not evidence of anything.
+        ...(status.mode === undefined ? {} : { mode: status.mode }),
+        ...(status.lastSyncedAt === null || status.lastSyncedAt === undefined ? {} : { lastSyncedAt: status.lastSyncedAt }),
+        summary: line,
+        ...(problem === undefined ? {} : { problem }),
         command,
         ...(status.deferredRepos === undefined ? {} : { deferredRepos: status.deferredRepos }),
       });
       continue;
     }
+    const state: MachineWorkspaceState = running ? "unknown" : "stopped";
+    const summary = running
+      ? `background sync is running but has not reported in — it may be stuck${suffix}`
+      : `background sync is not running here${suffix}`;
+    const problem = highestPriorityProblem(state, summary, deferred);
     workspaces.push({
-      root,
+      root: row.root,
       name,
-      state: running ? "unknown" : "stopped",
-      summary: running
-        ? `background sync is running but has not reported in — it may be stuck${suffix}`
-        : `background sync is not running here${suffix}`,
-      command: running ? command : `cd ${shQuoteIfNeeded(root)} && rbox start`,
+      binding: row.health,
+      state,
+      daemonRunning: running,
+      summary,
+      ...(problem === undefined ? {} : { problem }),
+      command: running ? command : `cd ${shQuoteIfNeeded(row.root)} && rbox start`,
       ...(status?.deferredRepos === undefined ? {} : { deferredRepos: status.deferredRepos }),
     });
   }
@@ -185,27 +218,25 @@ const MARK: Record<MachineWorkspaceState, string> = {
   unknown: style.sym.warn,
 };
 
-/** Discovery is bounded by what the daemon records can name; say so instead of
- * letting the list imply it is exhaustive. */
-const TRACK_ONLY_FOOTER =
-  "A folder bound with `rbox track` that has never started background sync is not listed here — run `rbox doctor` inside it.";
+/** A problem worth interrupting the user for. A folder whose background sync is
+ * simply stopped is reported in its own row, but is not an alarm — plenty of
+ * workspaces are deliberately synced by hand. */
+const needsAttention = (workspace: MachineWorkspaceSummary): boolean =>
+  workspace.state === "attention" || workspace.state === "unreachable" || workspace.state === "unknown"
+  || (workspace.deferredRepos ?? 0) > 0;
 
 export function renderMachineTriage(triage: MachineTriage): string[] {
   if (triage.workspaces.length === 0) {
     return [
-      `${style.bold("rbox doctor")} — no synced folders on this machine`,
+      `${style.bold("rbox doctor")} — no workspaces on this machine`,
       "",
       "rbox is not syncing anything here yet.",
       `${style.dim("run:")} rbox setup`,
-      "",
-      style.dim(TRACK_ONLY_FOOTER),
     ];
   }
   const count = triage.workspaces.length;
   const lines = [
-    `${style.bold("rbox doctor")} — ${count} synced folder${count === 1 ? "" : "s"} on this machine`,
-    "",
-    style.dim("You are not inside a synced folder, so this is the summary for all of them."),
+    `${style.bold("rbox doctor")} — ${count} workspace${count === 1 ? "" : "s"} on this machine`,
     "",
   ];
   for (const workspace of triage.workspaces) {
@@ -214,7 +245,91 @@ export function renderMachineTriage(triage: MachineTriage): string[] {
     if (workspace.command) lines.push(`    ${style.dim("run:")} ${workspace.command}`);
   }
   lines.push("");
-  lines.push(style.dim(TRACK_ONLY_FOOTER));
-  lines.push(style.dim("machine-readable: rbox doctor --json"));
+  lines.push(style.dim("machine-readable: rbox doctor --all --json"));
   return lines;
+}
+
+const BINDING_LABEL: Record<BindingHealth, string> = {
+  bound: "ok",
+  missing: "root gone",
+  rebound: "rebound",
+};
+
+const DAEMON_LABEL: Record<MachineWorkspaceState, string> = {
+  syncing: "running",
+  synced: "running",
+  attention: "running",
+  paused: "running",
+  stopped: "stopped",
+  unreachable: "—",
+  unknown: "no report",
+};
+
+/** `dd mmm HH:MM`, or `—` when the daemon has never reported a completed sync. */
+function relativeSync(iso: string | undefined, now: number): string {
+  if (!iso) return "—";
+  const at = Date.parse(iso);
+  if (!Number.isFinite(at)) return "—";
+  const seconds = Math.max(0, Math.round((now - at) / 1000));
+  if (seconds < 60) return "just now";
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return `${hours}h ago`;
+  return `${Math.round(hours / 24)}d ago`;
+}
+
+function pendingCell(workspace: MachineWorkspaceSummary): string {
+  if (workspace.state === "unreachable") return "—";
+  const deferred = workspace.deferredRepos ?? 0;
+  if (deferred > 0) return `${deferred} git`;
+  if (workspace.state === "syncing") return "syncing";
+  if (workspace.daemonRunning) return "none";
+  return "unknown";
+}
+
+function padCells(rows: string[][]): string[] {
+  const widths = rows[0]?.map((_, column) => Math.max(...rows.map((row) => (row[column] ?? "").length))) ?? [];
+  return rows.map((row) => row.map((cell, column) => (column === row.length - 1 ? cell : cell.padEnd(widths[column] ?? 0))).join("  ").trimEnd());
+}
+
+/**
+ * `rbox status --all` — the concise aggregate table the CLI-surface memo asks
+ * for: name, root, binding health, daemon state + mode, last successful sync,
+ * pending work, and the highest-priority problem. Same projection as
+ * `doctor --all`; only the presentation differs.
+ */
+export function renderMachineStatusTable(triage: MachineTriage, now = Date.now()): string[] {
+  if (triage.workspaces.length === 0) {
+    return [
+      `${style.bold("rbox status")} — no workspaces on this machine`,
+      "",
+      "rbox is not syncing anything here yet.",
+      `${style.dim("run:")} rbox`,
+    ];
+  }
+  const count = triage.workspaces.length;
+  const header = ["WORKSPACE", "ROOT", "BINDING", "SYNC", "LAST SYNC", "PENDING", "PROBLEM"];
+  const body = triage.workspaces.map((workspace) => [
+    workspace.name,
+    workspace.root,
+    BINDING_LABEL[workspace.binding],
+    workspace.mode === "pull-only" ? `${DAEMON_LABEL[workspace.state]} (pull-only)` : DAEMON_LABEL[workspace.state],
+    relativeSync(workspace.lastSyncedAt, now),
+    pendingCell(workspace),
+    workspace.problem ?? "—",
+  ]);
+  const [head, ...rest] = padCells([header, ...body]);
+  const problems = triage.workspaces.filter(needsAttention).length;
+  return [
+    `${style.bold("rbox status --all")} — ${count} workspace${count === 1 ? "" : "s"} on this machine`,
+    "",
+    // Every mark is exactly one visible character, so two spaces keep the
+    // header aligned with the marked body rows in both colored and plain output.
+    style.dim(`  ${head ?? ""}`),
+    ...rest.map((line, index) => `${MARK[triage.workspaces[index]!.state]} ${line}`),
+    "",
+    style.dim(problems === 0 ? "nothing needs your attention." : `${problems} need${problems === 1 ? "s" : ""} attention — run: rbox doctor --all`),
+    style.dim("machine-readable: rbox status --all --json"),
+  ];
 }

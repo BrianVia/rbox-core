@@ -80,14 +80,15 @@ async function seedWorkspace(name: string, opts: {
 const collectWith = (alive: boolean) =>
   collectMachineTriage({ now: () => NOW, isDaemonProcess: () => alive });
 
-test("no synced folders prints the setup pointer and admits the list is not exhaustive", async () => {
+test("no synced folders prints the setup pointer", async () => {
   const triage = await collectWith(false);
   expect(triage).toEqual({ schemaVersion: 1, scope: "machine", workspaces: [] });
   const rendered = renderMachineTriage(triage).join("\n");
   expect(rendered).toContain("rbox is not syncing anything here yet.");
   expect(rendered).toContain("rbox setup");
-  // MEDIUM 12: a track-only folder leaves no record here, so say so.
-  expect(rendered).toContain("`rbox track` that has never started background sync is not listed here");
+  // Design 211 retired the track-only disclaimer: the binding registry covers
+  // folders bound with `rbox track` that never started background sync.
+  expect(rendered).not.toContain("has never started background sync is not listed here");
 });
 
 test("a fresh status record from a DEAD daemon is never reported as up to date", async () => {
@@ -132,9 +133,8 @@ test("a live daemon with a fresh record gets its plain-English line and a cd-int
   expect(second!.command).toBe(`cd ${stuck} && rbox doctor`);
 
   const rendered = renderMachineTriage(triage).join("\n");
-  expect(rendered).toContain("2 synced folders on this machine");
-  expect(rendered).toContain("You are not inside a synced folder");
-  expect(rendered).toContain("`rbox track` that has never started background sync is not listed here");
+  expect(rendered).toContain("2 workspaces on this machine");
+  expect(rendered).not.toContain("has never started background sync is not listed here");
 });
 
 test("a boot-bound record is trusted in full, including download-only mode", async () => {
@@ -177,16 +177,17 @@ test("a live daemon with a stale record reads as possibly stuck", async () => {
   expect(triage.workspaces[0]!.summary).toContain("may be stuck");
 });
 
-test("a vanished folder offers NO command, because untrack cannot run against it", async () => {
-  await seedWorkspace("vanished", { missing: true });
+test("a vanished folder is offered the untrack that now clears its registry entry", async () => {
+  const root = await seedWorkspace("vanished", { missing: true });
   const triage = await collectWith(false);
   const workspace = triage.workspaces[0]!;
   expect(workspace.state).toBe("unreachable");
+  expect(workspace.binding).toBe("missing");
   expect(workspace.summary).toContain("no longer set up for rbox");
-  expect(workspace.command).toBeUndefined();
-  // The renderer must not print an empty `run:` line for it either.
+  // Design 211 made this remedy real: untrack against a root whose binding is
+  // already gone forgets the registry entry instead of erroring.
+  expect(workspace.command).toBe(`rbox untrack ${root}`);
   const rendered = renderMachineTriage(triage).join("\n");
-  expect(rendered).not.toContain("rbox untrack");
   expect(rendered).not.toMatch(/run:\s*$/m);
 });
 
