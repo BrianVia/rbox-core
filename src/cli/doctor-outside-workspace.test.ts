@@ -99,6 +99,39 @@ test("doctor --json outside a workspace emits the machine-scoped payload", async
   expect(payload.workspaces[0]!.command).toContain("rbox");
 });
 
+test("the workspace root is an optional positional and --path is an equivalent alias", async () => {
+  const root = await seedWorkspaceRecord("papers");
+  const capture = async (argv: string[]): Promise<string> => {
+    const written: string[] = [];
+    const origWrite = process.stdout.write.bind(process.stdout);
+    process.stdout.write = ((chunk: string | Uint8Array) => {
+      written.push(String(chunk));
+      return true;
+    }) as typeof process.stdout.write;
+    logs = [];
+    try {
+      process.argv = [process.execPath, "rbox", ...argv];
+      await main();
+    } finally {
+      process.stdout.write = origWrite;
+    }
+    return written.join("") || logs.join("\n");
+  };
+
+  const positional = await capture(["doctor", root, "--json"]);
+  const flag = await capture(["doctor", "--path", root, "--json"]);
+  expect(positional).toBe(flag);
+
+  // Workspace-scoped, not the machine-wide summary the bare invocation prints.
+  const parsed = JSON.parse(positional) as { scope?: string };
+  expect(parsed.scope).not.toBe("machine");
+
+  // A positional that is not a workspace fails loudly instead of silently
+  // falling back to the machine summary.
+  process.argv = [process.execPath, "rbox", "doctor", outside];
+  await expect(main()).rejects.toThrow("Not inside an rbox workspace");
+});
+
 test("a support report still requires a workspace", async () => {
   process.argv = [process.execPath, "rbox", "doctor", "--report"];
   await expect(main()).rejects.toThrow("Not inside an rbox workspace");

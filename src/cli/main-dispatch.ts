@@ -415,18 +415,23 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
       const diagnostics = flags.diagnostics === "true";
       const residueBytes = flags["residue-bytes"] === "true";
       if (diagnostics && !report) throw new Error("--diagnostics uploads the support report — combine it with --report: rbox doctor --report --diagnostics");
-      const doctorRoot = await findRoot(flags.path ? path.resolve(flags.path) : process.cwd());
+      // The workspace root is an optional positional (`rbox doctor <path>`), like
+      // every other workspace-local verb; `--path <dir>` stays as a compatibility
+      // alias. `reset-journal` is a sub-verb, so the path follows it when present.
+      const resetJournal = positional[0] === "reset-journal";
+      const doctorPath = (resetJournal ? positional[1] : positional[0]) ?? flags.path;
+      const doctorRoot = await findRoot(doctorPath ? path.resolve(doctorPath) : process.cwd());
       if (!doctorRoot) {
         // Support-report and reset-journal work is workspace-scoped; only the
         // plain triage read has a meaningful machine-wide answer.
-        if (report || diagnostics || positional[0] !== undefined || flags.quarantine === "true" || flags.restore !== undefined) {
-          throw new Error("Not inside an rbox workspace. Run from the workspace, or pass --path <dir>.");
+        if (report || diagnostics || resetJournal || doctorPath !== undefined || flags.quarantine === "true" || flags.restore !== undefined) {
+          throw new Error("Not inside an rbox workspace. Run from the workspace, or pass the workspace path: rbox doctor <path>.");
         }
         await runMachineTriage(jsonMode);
         break;
       }
       const root = doctorRoot;
-      if (positional[0] === "reset-journal") {
+      if (resetJournal) {
         if (report || diagnostics) throw new Error("reset-journal rescue cannot be combined with support-report flags");
         const { resetJournalDoctorCmd } = await import("./reset-journal-doctor.js");
         await resetJournalDoctorCmd(root, { quarantine: flags.quarantine === "true", restore: flags.restore });
