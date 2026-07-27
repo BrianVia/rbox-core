@@ -5,28 +5,46 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
-_Overnight checkpoint (2026-07-27 ~05:00): **16 reorg merges** (#478-#493
-span). Waves COMPLETE: 1 (status), 2 (push spine), 3 (discovery), 4
-(receive); wave 5: 2/3 (w5c3 CommitReceivedGitTransition implementing);
-wave 7: 2/4 (w7c3 PublishLocalWorkspaceTransition implementing; w7c4
-ApplyRemoteWorkspaceTransition + wave-8 ServiceNextDaemonOperation queued);
-wave 6 PARKED on the 163 store port (by roadmap design). Hotspots:
-status-cmd 922→103, push.ts 1144→946, apply.ts 2291→1794, daemon.ts
-3790→3524. Extracted owners so far: status-maintenance/projection/render/
-contract/read-port; git-capture-observation, publish-candidate,
-manifest-commit-executor, publisher-ack-transition; git-discovery-
-continuity, local-workspace-observer, local-observation-transition
-(LocalAuthority); remote-repository-deletion, received-git-config,
-clean-materialization, standing-branch-proof, follow-repo-transition.
-Fleet: build #5 (110917d) both hosts, 5 blog smoke round-trips green
-(commit ~13-60s, branch switch 17s, branch delete 21s Mac→FM). Rig 7/7
-twice. Flake registry: git-state.test.ts upgraded RECURRING (2 tests, 2
-PRs, injected-seam fix queued); daemon-activity design-178 sibling recorded
-(same queued fix). Process fixes tonight: pull-before-rig unconditional;
-merges verdict-gated in a separate step (one PR merged pre-rerun-proof —
-post-merge verification was green; my gh identity BYPASSES branch
-protection, so watcher discipline is the real gate). Rig join-ahead fixture
-made idempotent (#483)._
+_Overnight checkpoint (2026-07-27, updated ~afternoon): **18 reorg merges**
+(#478-#495). Waves COMPLETE: 1 (status), 2 (push spine), 3 (discovery), 4
+(receive), 5 (follow/receive commit — w5c3 CommitReceivedGitTransition #494),
+7 (LOCAL authority — w7c3 PublishLocalWorkspaceTransition #495). Remaining:
+wave 8 only — w8c2 ServiceNextDaemonOperation IN FLIGHT (worktree
+`.claude/worktrees/reorg-w8c2`, uncommitted draft: daemon-operation-scheduler
+.ts 388L + contract test 337L), then w8c1 ApplyRemoteWorkspaceTransition
+(apply.ts pull side, unstarted); wave 6 PARKED on the 163 store port (by
+roadmap design). Hotspots: status-cmd 922→103, push.ts 1144→946, apply.ts
+2291→1794, daemon.ts 3790→3524. Extracted owners: status-maintenance/
+projection/render/contract/read-port; git-capture-observation,
+publish-candidate, manifest-commit-executor, publisher-ack-transition;
+git-discovery-continuity, local-workspace-observer,
+local-observation-transition (LocalAuthority); remote-repository-deletion,
+received-git-config, clean-materialization, standing-branch-proof,
+follow-repo-transition, received-git-transition (w5c3), publish-local
+transition reducer (w7c3). Fleet: build #5 (110917d) both hosts, 5 blog
+smoke round-trips green (commit ~13-60s, branch switch 17s, branch delete
+21s Mac→FM); 2 merges since — next dev build due with the next merge. Rig
+7/7 twice. **Flakes ROOT-CAUSED (2026-07-27 day session), fix PR in flight
+(worktree flake-fixes):** (1) git-state.test.ts + a NEW third site
+(follow.test.ts:2086 "planned graph connectivity proof failed", main run
+30232946666 shard 1/6) share one cause — product-spawned git detaches
+auto-gc/maintenance whose gc.pid/repack races gitBusy + connectivity proofs
+under shard contention (evidence: PR #491 attempt-1 shard-5 log shows
+applied:false at git-state:482; gitBusy checks gc.pid); fix = suite-wide
+GIT_CONFIG_COUNT env injection (maintenance.auto=false, gc.auto=0) in
+scripts/test-preload.ts — reaches product-spawned git via cleanGitEnv's
+process.env spread (repo-level config can't cover product-inited repos).
+(2) daemon-activity 178-B sibling: test daemon ran REAL ~5ms recovery
+timers (PR #492 attempt-1 log: internal timer-pump consumed the probe
+before the test cleared the error; halt re-armed with original
+at/firstFailureAt) — converted to injected advancing now +
+ManualRecoveryClock per #403. NOTE: failed CI attempts get OVERWRITTEN by
+in-place reruns — pull flake evidence via
+`gh api .../runs/<id>/attempts/1/jobs` before it ages out. Process fixes
+last night: pull-before-rig unconditional; merges verdict-gated in a
+separate step (my gh identity BYPASSES branch protection, so watcher
+discipline is the real gate). Rig join-ahead fixture made idempotent
+(#483)._
 
 _OVERNIGHT CHARTER (2026-07-27, founder-authorized ~00:00): run the 21-cycle
 reorg roadmap on all fronts; MERGE TO MAIN WHEN CONFIDENT (campaign-scoped
