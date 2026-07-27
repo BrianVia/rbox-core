@@ -5,6 +5,22 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_RELEASE 2026-07-27 (v1.10.1): **"a calmer help screen" SHIPPED** (tag at
+bacb5785, release run 30308973148 green, api.rbox.to/version = 1.10.1).
+Content: #527 only — root `rbox --help` shrunk to the six core-loop
+commands (no sections; pair/connect/logs demoted to `help --all`), full
+reference collapsed to one row per top-level command with flags stripped
+(key/trash/autostart/git families fold into parent rows; trash/git/
+autostart gained parent entries so their bare --help now renders the
+family overview). Completes the #510 memo's "ruthless primary surface"
+for BOTH screens; presentation-only, no command removed. Founder
+directions on record: "help --all can be larger. But root help should
+be smaller"; tag authorized via explicit go. Also: FLAKE-006 registered
+(credentials.test.ts "separate save processes serialize" — two-process
+lock race, CONFIRMED with all three witnesses on PR #527, fix direction
+in the entry, not yet fixed). Fleet still on dev build #11 (pre-#527);
+next dev build or release train picks it up._
+
 _POST-RELEASE ADDENDUM 2026-07-27 (late night): **savvy-core wedge
 ROOT-CAUSED — git pack chain discontinuity (#526).** Every fresh receiver
 (FM ~2 days, desktop since rejoin) loops on "bundle verify failed for git
