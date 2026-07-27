@@ -24,6 +24,7 @@ import { GIT_DEFERRAL_REASONS } from "./sync-state-model.js";
 import { fetchWithDeadline, transferTimeoutMs } from "./remote/resilient.js";
 import { listWorktrees } from "../engine/git/shared.js";
 import { formatBinaryBytes } from "./quota-format.js";
+import { emitJson } from "./json.js";
 
 const REPORT_CAP_BYTES = 512 * 1024;
 const DAEMON_LOG_TAIL_BYTES = 64 * 1024;
@@ -39,6 +40,9 @@ type CheckName = "credentials" | "enrollment" | "device" | "daemon" | "remote" |
 
 export interface DoctorCheck {
   ok: boolean;
+  /** The check could not reach a verdict (network/transport), as opposed to
+   * proving a fault. Diagnosis must never report inconclusive as proven. */
+  inconclusive?: true;
   label: string;
   message: string;
   hint?: string;
@@ -158,6 +162,8 @@ interface DoctorCmdOptions {
   yes: boolean;
   diagnostics?: boolean;
   residueBytes?: boolean;
+  json?: boolean;
+  now?: number;
 }
 
 const rboxHome = () => path.join(process.env.RBOX_HOME || os.homedir(), ".rbox");
@@ -304,10 +310,15 @@ async function checkCredentials(creds: Credentials | undefined): Promise<DoctorC
     const { res, latencyMs } = await fetchWithTimeout(`${creds.remoteUrl}/v1/account/status`, {
       headers: { authorization: `Bearer ${creds.token}` },
     });
+    // A 5xx is the server failing, not this token being refused. Only the
+    // rejection statuses prove the credential itself is bad.
+    if (res.status >= 500) {
+      return { ok: false, inconclusive: true, label: "credentials", message: `could not verify token (server returned ${res.status})`, latencyMs };
+    }
     if (!res.ok) return { ok: false, label: "credentials", message: `token rejected (${res.status})`, hint: "run `rbox login` again", latencyMs };
     return { ok: true, label: "credentials", message: `authenticated (${latencyMs}ms)`, latencyMs };
   } catch {
-    return { ok: false, label: "credentials", message: "could not verify token", hint: "check your network or run `rbox login` again" };
+    return { ok: false, inconclusive: true, label: "credentials", message: "could not verify token", hint: "check your network or run `rbox login` again" };
   }
 }
 
@@ -382,7 +393,7 @@ async function checkVersion(creds: Credentials | undefined, cfg: WorkspaceConfig
     }
     return { ok: true, label: "version", message: `up to date (${RBOX_VERSION})`, current: RBOX_VERSION, latest };
   } catch {
-    return { ok: false, label: "version", message: "could not verify latest release", current: RBOX_VERSION };
+    return { ok: false, inconclusive: true, label: "version", message: "could not verify latest release", current: RBOX_VERSION };
   }
 }
 
@@ -393,7 +404,7 @@ async function checkState(root: string, cfg: WorkspaceConfig): Promise<DoctorChe
     if (!parsed) return { ok: true, label: "state", message: "no sync state yet" };
     const expected = syncStreamId(cfg);
     if (parsed.stream !== undefined && parsed.stream !== expected) {
-      return { ok: false, label: "state", message: ".rbox/state.json belongs to a different stream", hint: "run `rbox status` for the local re-baseline warning" };
+      return { ok: false, status: "stream-mismatch", label: "state", message: ".rbox/state.json belongs to a different stream", hint: "run `rbox status` for the local re-baseline warning" };
     }
     return { ok: true, label: "state", message: "state file parses and matches this stream" };
   } catch (e) {
@@ -401,9 +412,9 @@ async function checkState(root: string, cfg: WorkspaceConfig): Promise<DoctorChe
     if (e instanceof ResetCorruptionError
       && message.includes(file)
       && (message.includes("malformed JSON") || message.includes("JSON nesting exceeded"))) {
-      return { ok: false, label: "state", message: ".rbox/state.json is not valid JSON", hint: "inspect the file or delete it to intentionally re-baseline" };
+      return { ok: false, status: "malformed", label: "state", message: ".rbox/state.json is not valid JSON", hint: "inspect the file or delete it to intentionally re-baseline" };
     }
-    return { ok: false, label: "state", message: "could not read .rbox/state.json" };
+    return { ok: false, status: "unreadable", label: "state", message: "could not read .rbox/state.json" };
   }
 }
 
@@ -424,7 +435,9 @@ export async function checkManifestChain(remote: Pick<E2eeRemote, "chainDiagnost
         hint: "run `rbox recover` to inspect and repair the unreadable suffix",
       };
     }
-    return { ok: false, label: "manifest chain", message: error instanceof Error ? error.message : String(error) };
+    // Only ManifestChainError establishes an unreadable chain. A timeout or any
+    // other transport failure proves nothing about the uploaded history.
+    return { ok: false, inconclusive: true, label: "manifest chain", message: error instanceof Error ? error.message : String(error) };
   }
 }
 
@@ -699,7 +712,10 @@ export async function collectDoctorContext(
     checkState(root, cfg),
     checkLocking(root),
     checkGitCapability(root),
-    workspaceShape(root, cfg),
+    // An unreadable or foreign-stream state.json is exactly what `checkState`
+    // exists to REPORT; letting its shape read abort the whole collection made
+    // doctor unusable on the one workspace that needs it most.
+    workspaceShape(root, cfg).catch(() => ({ fileCount: 0, totalBytes: 0 })),
     buildAuthedRemote(root, Date.now, undefined, loaded).then((built) => checkManifestChain(built.remote)).catch((error: unknown) => ({
       ok: false, label: "manifest chain", message: error instanceof Error ? error.message : String(error),
     })),
@@ -947,10 +963,22 @@ export async function doctorCmd(root: string, opts: DoctorCmdOptions): Promise<v
   if (opts.diagnostics === true && !opts.report) {
     throw new Error("--diagnostics uploads the support report — combine it with --report: rbox doctor --report --diagnostics");
   }
+  if (opts.json === true && opts.report) {
+    throw new Error("--json prints the findings only — drop --report, or drop --json to build the support report");
+  }
   const ctx = await collectDoctorContext(
     root,
     opts.residueBytes ? { residueBytes: true } : {},
   );
+  const { readTriageInputs, renderWorkspaceTriage, triageWorkspace } = await import("./doctor-triage.js");
+  const triage = triageWorkspace(await readTriageInputs(root, ctx.checks, opts.now));
+  if (opts.json === true) {
+    emitJson(triage);
+    if (Object.values(ctx.checks).some((c) => !c.ok)) process.exitCode = 1;
+    return;
+  }
+  for (const line of renderWorkspaceTriage(triage)) console.log(line);
+  console.log("");
   console.log(renderDoctor(ctx.checks, ctx.localOnly));
   if (opts.report) {
     const bundle = await buildDiagnosticsBundle(ctx);

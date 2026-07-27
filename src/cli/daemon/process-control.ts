@@ -1,6 +1,7 @@
 import { execFileSync, spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import path from "node:path";
 import { systemLockIdentity } from "../../engine/git/lockfile.js";
 import { isStandaloneBinary } from "../runtime.js";
 import { daemonCrashLogPath } from "../rbox-paths.js";
@@ -62,6 +63,34 @@ function readDaemonCommand(pid: number): string {
   return execFileSync("ps", ["-ww", "-p", String(pid), "-o", "command="], { encoding: "utf8" });
 }
 
+const normalizedRoot = (value: string): string => path.resolve(value.trim());
+
+/**
+ * Does this command line name `root` as the daemon's OWN workspace?
+ *
+ * `daemonSpawnArgs` puts the root last, so everything after the `__daemon-run`
+ * marker IS the root — including any spaces in it, which the space-joined `ps`
+ * output (macOS and Linux alike) gives no safe way to split on. Comparing that
+ * whole tail as a normalized path is what makes this an exact argument match
+ * rather than a substring test: a live daemon for `/w/work-old` must never be
+ * read as owning the prefix sibling `/w/work`, or a reused pid would resurrect
+ * another workspace's halt residue. Every whole-token occurrence of the marker
+ * is tried, so neither an entry path nor a root containing the marker text can
+ * mis-anchor the tail.
+ */
+function commandNamesRoot(cmd: string, root: string): boolean {
+  const target = normalizedRoot(root);
+  const line = cmd.replace(/\s+$/u, "");
+  for (let at = line.indexOf(DAEMON_MARKER); at !== -1; at = line.indexOf(DAEMON_MARKER, at + 1)) {
+    const startsToken = at === 0 || /\s/u.test(line[at - 1]!);
+    const after = line[at + DAEMON_MARKER.length];
+    if (!startsToken || after === undefined || !/\s/u.test(after)) continue;
+    const tail = line.slice(at + DAEMON_MARKER.length).trimStart();
+    if (tail.length > 0 && normalizedRoot(tail) === target) return true;
+  }
+  return false;
+}
+
 /** Confirm the pid is an rbox daemon, optionally for one exact workspace root.
  * The command line is read once so the ownership hot path does not spawn two ps
  * subprocesses. The reader seam keeps the single-read contract testable. */
@@ -69,7 +98,8 @@ export function daemonProcessMatches(pid: number, root?: string, readCommand: (p
   if (!isAlive(pid)) return false;
   try {
     const cmd = readCommand(pid);
-    return cmd.includes(DAEMON_MARKER) && (root === undefined || cmd.includes(root));
+    if (!cmd.includes(DAEMON_MARKER)) return false;
+    return root === undefined || commandNamesRoot(cmd, root);
   } catch {
     return false; // ps failed / process gone
   }

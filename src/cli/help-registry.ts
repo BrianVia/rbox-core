@@ -530,9 +530,10 @@ export const COMMAND_HELP: CommandHelp[] = [
   {
     name: "doctor",
     group: "BILLING & MAINTENANCE",
-    summary: "check workspace health; optionally upload a support report",
-    usage: "rbox doctor [reset-journal] [--report | --residue-bytes | --quarantine | --restore <bundle>] [--path <dir>]",
+    summary: "explain what is stuck and how to fix it, in plain English",
+    usage: "rbox doctor [reset-journal] [--json | --report | --residue-bytes | --quarantine | --restore <bundle>] [--path <dir>]",
     flags: [
+      { flag: "--json", desc: "print the findings as JSON (outside a workspace, the all-workspaces summary)" },
       { flag: "--report", desc: "build and print the support report locally" },
       { flag: "--residue-bytes", desc: "measure known Git quarantine and conflict directories" },
       { flag: "--diagnostics", desc: "with --report, upload the report to rbox support (stored unencrypted for 30 days)" },

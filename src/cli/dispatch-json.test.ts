@@ -112,7 +112,7 @@ async function makeWorkspace(): Promise<string> {
 }
 
 test("--json on a command without JSON support keeps human error output", () => {
-  const res = run(["doctor", "--json"]);
+  const res = run(["push", "--json"]);
   expect(res.status).toBe(1);
   expect(res.stdout).toBe("");
   expect(res.stderr).toContain("rbox: Not inside an rbox workspace");
