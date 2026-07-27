@@ -5,16 +5,17 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
-_Overnight checkpoint (2026-07-27, updated ~afternoon): **18 reorg merges**
-(#478-#495). Waves COMPLETE: 1 (status), 2 (push spine), 3 (discovery), 4
+_Overnight checkpoint (2026-07-27, updated ~afternoon): **19 reorg merges**
+(#478-#496). Waves COMPLETE: 1 (status), 2 (push spine), 3 (discovery), 4
 (receive), 5 (follow/receive commit — w5c3 CommitReceivedGitTransition #494),
-7 (LOCAL authority — w7c3 PublishLocalWorkspaceTransition #495). Remaining:
-wave 8 only — w8c2 ServiceNextDaemonOperation IN FLIGHT (worktree
+7 (LOCAL authority — w7c3 PublishLocalWorkspaceTransition #495), 8c1 (pull
+orchestration — ApplyRemoteWorkspaceTransition #496, merged 05:47). Remaining:
+**w8c2 ServiceNextDaemonOperation only** — IN FLIGHT (worktree
 `.claude/worktrees/reorg-w8c2`, uncommitted draft: daemon-operation-scheduler
-.ts 388L + contract test 337L), then w8c1 ApplyRemoteWorkspaceTransition
-(apply.ts pull side, unstarted); wave 6 PARKED on the 163 store port (by
-roadmap design). Hotspots: status-cmd 922→103, push.ts 1144→946, apply.ts
-2291→1794, daemon.ts 3790→3524. Extracted owners: status-maintenance/
+.ts 388L + contract test 337L; needs rebase onto #496 before continuing);
+wave 6 PARKED on the 163 store port (by roadmap design). Hotspots (pre-#496):
+status-cmd 922→103, push.ts 1144→946, apply.ts 2291→1794, daemon.ts
+3790→3524. Extracted owners: status-maintenance/
 projection/render/contract/read-port; git-capture-observation,
 publish-candidate, manifest-commit-executor, publisher-ack-transition;
 git-discovery-continuity, local-workspace-observer,
