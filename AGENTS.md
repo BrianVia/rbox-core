@@ -9,9 +9,12 @@ Brian's preferred loop — follow it unless told otherwise:
 1. Put a design document in `docs/design/N-title.md` (next free N; check after
    rebasing — same collision rule as migrations).
 2. Iterate with subagents + `/arbitrage`: have codex (GPT) adversarially review
-   the design, revise here, re-dispatch — repeat until BOTH agents (Claude and
-   GPT) are in alignment. Keep the review rounds in a `REVIEW-N.md` beside the
-   worktree (see design 93's 11 rounds for the pattern).
+   the design, revise here, re-dispatch — until BOTH agents (Claude and GPT)
+   are in alignment, **capped at 3 review rounds** (founder rule 2026-07-27).
+   At least one round must execute code/tests, not just read the doc. If
+   round 3 isn't ALIGNED, the design is wrong-layer or over-scoped — cut
+   scope or ship the residual behind a kill switch; never schedule round 4.
+   Keep the rounds in a `REVIEW-N.md` beside the worktree.
 3. Implement via `codex exec` against the agreed design (spec-first dispatch).
 4. Validate the design is actually working: a dev build shipped to the local
    fleet, or the test rig (`bun run rig`) — not just unit tests.
