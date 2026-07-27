@@ -5,6 +5,29 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_Overnight checkpoint (2026-07-27 ~05:00): **16 reorg merges** (#478-#493
+span). Waves COMPLETE: 1 (status), 2 (push spine), 3 (discovery), 4
+(receive); wave 5: 2/3 (w5c3 CommitReceivedGitTransition implementing);
+wave 7: 2/4 (w7c3 PublishLocalWorkspaceTransition implementing; w7c4
+ApplyRemoteWorkspaceTransition + wave-8 ServiceNextDaemonOperation queued);
+wave 6 PARKED on the 163 store port (by roadmap design). Hotspots:
+status-cmd 922→103, push.ts 1144→946, apply.ts 2291→1794, daemon.ts
+3790→3524. Extracted owners so far: status-maintenance/projection/render/
+contract/read-port; git-capture-observation, publish-candidate,
+manifest-commit-executor, publisher-ack-transition; git-discovery-
+continuity, local-workspace-observer, local-observation-transition
+(LocalAuthority); remote-repository-deletion, received-git-config,
+clean-materialization, standing-branch-proof, follow-repo-transition.
+Fleet: build #5 (110917d) both hosts, 5 blog smoke round-trips green
+(commit ~13-60s, branch switch 17s, branch delete 21s Mac→FM). Rig 7/7
+twice. Flake registry: git-state.test.ts upgraded RECURRING (2 tests, 2
+PRs, injected-seam fix queued); daemon-activity design-178 sibling recorded
+(same queued fix). Process fixes tonight: pull-before-rig unconditional;
+merges verdict-gated in a separate step (one PR merged pre-rerun-proof —
+post-merge verification was green; my gh identity BYPASSES branch
+protection, so watcher discipline is the real gate). Rig join-ahead fixture
+made idempotent (#483)._
+
 _OVERNIGHT CHARTER (2026-07-27, founder-authorized ~00:00): run the 21-cycle
 reorg roadmap on all fronts; MERGE TO MAIN WHEN CONFIDENT (campaign-scoped
 grant); every ~3 merged PRs push a dev build to the fleet (Mac + FM, both
