@@ -5,6 +5,23 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_RELEASE 2026-07-27 (night): **v1.10.0 SHIPPED** (tag 929d2ee3, release
+run 30303334623 green: build + 3-platform smoke + publish; changelog live).
+Headlines: plain-English doctor + machine-wide status/doctor --all on the
+new binding registry, real [PATH] help surface, packs + fused crypto +
+delta publish default-on (defaults-ledger test guards the class), adopt
+journal batching (#501 stopgap; SQLite half stays 2.0), RBOX_HOME
+isolation. Pre-tag validation: Mac→FM singles 16.1/14.6s vs 15.3s baseline
+(on-par — single-file latency is cadence-bound, a future workstream),
+150-file burst 21.3s clean, regress 0 FAIL (dev-keys secret now on the
+desktop too), release-commit CI green. Fleet on dev build #11 (eeefdfc,
+zero load-bearing env vars). Founder authorizations on record: prod
+promotion (#506 et al) and the v1.10.0 tag ("1.10 is fine if all that
+passed" → CI success → tag). Open after release: 212 V1 implementation
+(ALIGNED, awaiting go), read-write flip for the desktop (needs
+agent-scratch .rboxignore), #517 plaintext-phrase fix, cli-audit batch
+#513-#521, transfer-test command (#525), logs provenance papercut._
+
 _EVENING RIDER 2026-07-27: **the sensible-defaults purge + parallel streams.**
 CLI surface: founder+codex decision memo merged (#510, supersedes the
 51-command inventory); memo steps 1-2 SHIPPED (#511 — default help shows
