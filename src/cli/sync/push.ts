@@ -29,12 +29,12 @@ import {
   gitIncomingKey,
   gitReposManifestSchema,
   planGitSections,
-  nextDeferral,
 } from "../sync-git.js";
 import { carryRepoBaseProof, recordOriginLineage, type RepoBaseProof } from "../sync-git/base-composer.js";
+import { recordGitCaptureObservation } from "../sync-git/git-capture-observation.js";
 import type { GitResolutionRider } from "../sync-git/resolution-intent.js";
 import { assertSyncMutex, workspaceSyncMutexDegraded } from "../sync-mutex.js";
-import { changedSidecarRepoKeys, inputRecord, observedRepoKeys, orderedDeferralUpdates, saveStateSource, type GitDeferralUpdates, type OrderedGitDeferralUpdates } from "../sync-state.js";
+import { changedSidecarRepoKeys, inputRecord, observedRepoKeys, orderedDeferralUpdates, saveStateSource, type OrderedGitDeferralUpdates } from "../sync-state.js";
 import { beginFirstPublishTiming, finishFirstPublishStats, firstPublishMeasurementLive, firstPublishMeasurementToken, firstPublishTiming, formatFirstPublishStats } from "../upload-lane-timing.js";
 import { type SyncDeps, withReportScanStats, withCache, withDircache, refreshWriteContext } from "./deps.js";
 import { withPushLaneAccumulator } from "../telemetry/lane-accumulator.js";
@@ -585,11 +585,6 @@ async function runPushAttempt(
     .map(([relPath]) => relPath)
     .sort();
   try { deps.onGitBusyDeferred?.(busyRepos); } catch { /* daemon observer is non-throwing */ }
-  // Visibility is durable as soon as planning settles. This sidecar-only packet carries
-  // the accepted sequence and therefore cannot claim a candidate commit that later fails.
-  const deferralUpdates: Record<string, OrderedGitDeferralUpdates> = {};
-  const repoRecords = repoRecordsForState(state);
-  const protectedPending = new Set(gitPlan.protectedPending);
   const carryProofsFor = (snapshot: typeof state, relPaths: readonly string[]): Record<string, RepoBaseProof> => {
     const records = repoRecordsForState(snapshot);
     return Object.fromEntries(relPaths.map((relPath) => {
@@ -599,81 +594,55 @@ async function runPushAttempt(
       return [relPath, carryRepoBaseProof(lineageHash)];
     }));
   };
-  const now = new Date().toISOString();
-  for (const rel of gitPlan.captureObserved) {
-    if (protectedPending.has(rel)) continue;
-    const current = repoRecords[rel]?.deferrals;
-    const lanes: GitDeferralUpdates = {};
-    const captureReason = gitPlan.captureDeferrals[rel];
-    if (captureReason) {
-      lanes.capture = nextDeferral("capture", current?.capture, captureReason, now);
-    } else if (current?.capture) lanes.capture = null;
-    if (gitPlan.configObserved.includes(rel)) {
-      const configReason = gitPlan.configDeferrals[rel];
-      if (configReason) {
-        lanes.config = nextDeferral("config", current?.config, configReason, now);
-      } else if (current?.config) lanes.config = null;
-    }
-    const ordered = orderedDeferralUpdates(current, lanes);
-    if (ordered !== undefined) deferralUpdates[rel] = ordered;
-  }
-  // A standing apply episode is also a warning that the checkout metadata may
-  // describe older working bytes. Once this push observes a file-plane change
-  // anywhere in that repo subtree, retain the marker monotonically until the
-  // apply episode itself clears. This is sender-local state only; it never enters
-  // the manifest or changes the apply lane's retry timestamp.
-  const writeBytesChanged = (): void => {
-    const candidates = Object.entries(repoRecords).filter(([relPath, record]) => {
-      if (protectedPending.has(relPath)) return false;
-      const apply = record.deferrals?.apply;
-      return apply !== undefined && apply.bytesChanged !== true;
-    });
-    if (candidates.length === 0) return;
-    const changedPaths = [
-      ...filesDiff.added.map((entry) => entry.path),
-      ...filesDiff.changed.map((entry) => entry.path),
-      ...filesDiff.deleted,
-    ];
-    for (const [rel, record] of candidates) {
-      const apply = record.deferrals!.apply!;
-      const intersects = changedPaths.some((filePath) =>
-        rel === "." || filePath === rel || filePath.startsWith(`${rel}/`));
-      if (!intersects) continue;
-      const ordered = orderedDeferralUpdates(record.deferrals, {
-        apply: { ...apply, bytesChanged: true },
-      });
-      if (ordered?.apply) {
-        deferralUpdates[rel] = { ...(deferralUpdates[rel] ?? {}), apply: ordered.apply };
-      }
-    }
-  };
-  writeBytesChanged();
-  const deferralValues = {
-    bases: state.lastSyncedManifest.gitRepos,
-    packedRefsIdentity: gitPlan.packedRefsIdentity,
-    pending: state.gitPendingRemote,
-    removed: state.gitReposRemoved,
-    resolutions: state.gitNeedsResolution,
-    deferrals: deferralUpdates,
-  };
-  const deferralRepos = changedSidecarRepoKeys(state, deferralValues);
-  if (deferralRepos.length > 0) {
-    state = await report.phase("state-save", () => saveStateSource(root, state, {
-      expectedStream: syncStreamId(cfg),
-      sourceGlobalSeq: state.lastSyncedSequence,
-      observedRepos: deferralRepos,
-      values: deferralValues,
-      repoProofs: carryProofsFor(state, deferralRepos),
-    }, {
-      allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),
-      forceLegacy: workspaceSyncMutexDegraded(deps.syncMutex),
-    }));
-    try {
-      deps.onGitDeferralsSaved?.(state);
-    } catch {
-      // A local visibility hook cannot fail a save that is already durable.
-    }
-  }
+  const observationRecords = repoRecordsForState(state);
+  await recordGitCaptureObservation(
+    {
+      records: observationRecords,
+      carried: {
+        bases: state.lastSyncedManifest.gitRepos,
+        pending: state.gitPendingRemote,
+        removed: state.gitReposRemoved,
+        resolutions: state.gitNeedsResolution,
+      },
+      changedRepos: (values) => changedSidecarRepoKeys(state, values),
+      save: async (write) => {
+        state = await report.phase("state-save", () => saveStateSource(root, state, {
+          expectedStream: syncStreamId(cfg),
+          sourceGlobalSeq: write.acceptedSequence,
+          observedRepos: write.observedRepos,
+          values: write.values,
+          repoProofs: write.repoProofs,
+        }, {
+          allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),
+          forceLegacy: workspaceSyncMutexDegraded(deps.syncMutex),
+        }));
+        try {
+          deps.onGitDeferralsSaved?.(state);
+        } catch {
+          // A local visibility hook cannot fail a save that is already durable.
+        }
+      },
+    },
+    {
+      acceptedSequence: state.lastSyncedSequence,
+      originLineageOf: (relPath) => recordOriginLineage(observationRecords[relPath]?.branchBaseOrigins),
+    },
+    {
+      observedAt: new Date().toISOString(),
+      captureObserved: gitPlan.captureObserved,
+      captureDeferrals: gitPlan.captureDeferrals,
+      configObserved: gitPlan.configObserved,
+      configDeferrals: gitPlan.configDeferrals,
+      protectedPending: gitPlan.protectedPending,
+      packedRefsIdentity: gitPlan.packedRefsIdentity,
+      ackLineageOf: (relPath) => gitPlan.publisherAckBindings?.[relPath]?.lineageHash,
+      changedFilePaths: () => [
+        ...filesDiff.added.map((entry) => entry.path),
+        ...filesDiff.changed.map((entry) => entry.path),
+        ...filesDiff.deleted,
+      ],
+    },
+  );
   if (report.enabled) {
     report.record("git-plan", { count: Object.keys(gitPlan.gitRepos ?? {}).length }); // guarded: skip the key-array materialization on no-op ticks
     if (gitPlan.gitPlanStats) report.recordDetails("git-plan", { gitPlan: gitPlan.gitPlanStats }, formatGitPlanStats(gitPlan.gitPlanStats));
