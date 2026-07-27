@@ -37,6 +37,7 @@ test("design 176 log-language pass is exactly twelve ignored-suffix additions", 
   const source = [
     "src/cli/sync-git/apply.ts",
     "src/cli/sync-git/plan.ts",
+    "src/cli/sync-git/remote-repository-deletion.ts",
     "src/cli/sync/push.ts",
   ].map((relative) => fs.readFileSync(path.join(ROOT, relative), "utf8")).join("\n");
   const occurrences = (clause: string): number => source.split(clause).length - 1;
