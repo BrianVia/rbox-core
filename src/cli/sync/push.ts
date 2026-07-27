@@ -5,7 +5,6 @@ import {
   scanManifest,
   validateManifest,
   manifestRequiresSchema4,
-  type GitSection,
   type FileEntry,
   type Manifest,
   type CaseFoldCollisionGroup,
@@ -22,17 +21,16 @@ import {
 import {
   formatGitPlanStats,
   formatGitPushLine,
-  gitBaseAfterCommit,
   gitForceForMissingBlobs,
   gitIncomingKey,
   gitReposManifestSchema,
   planGitSections,
 } from "../sync-git.js";
-import { carryRepoBaseProof, recordOriginLineage, type RepoBaseProof } from "../sync-git/base-composer.js";
+import { carriedLineageProof, recordOriginLineage, type RepoBaseProof } from "../sync-git/base-composer.js";
 import { recordGitCaptureObservation } from "../sync-git/git-capture-observation.js";
 import type { GitResolutionRider } from "../sync-git/resolution-intent.js";
 import { assertSyncMutex, workspaceSyncMutexDegraded } from "../sync-mutex.js";
-import { changedSidecarRepoKeys, inputRecord, observedRepoKeys, orderedDeferralUpdates, saveStateSource, type OrderedGitDeferralUpdates } from "../sync-state.js";
+import { changedSidecarRepoKeys, inputRecord, observedRepoKeys, saveStateSource } from "../sync-state.js";
 import { beginFirstPublishTiming, finishFirstPublishStats, firstPublishMeasurementLive, firstPublishMeasurementToken, firstPublishTiming, formatFirstPublishStats } from "../upload-lane-timing.js";
 import { type SyncDeps, withReportScanStats, withCache, withDircache, refreshWriteContext } from "./deps.js";
 import { withPushLaneAccumulator } from "../telemetry/lane-accumulator.js";
@@ -44,6 +42,7 @@ import { finishResolutionReceipt, pull, reconcileResolutionReceipt, scanManifest
 import { MutationGateClosedError } from "../../engine/mutation-gate.js";
 import { cloneCollisionGroups, preparePublishCandidate, type GitCapturePort } from "./publish-candidate.js";
 import { executeManifestCommit, type ManifestCommitPort } from "./manifest-commit-executor.js";
+import { acknowledgePublishedGitTransitions, type RepoTransitionPort } from "./publisher-ack-transition.js";
 
 const COMMIT_FILE_ENTRY_KEYS = ["path", "sha256", "size", "mode", "mtimeMs", "type", "symlinkTarget", "encSha", "comp", "payloadSha", "cipherSize"] as const;
 const COMMIT_FILE_ENTRY_KEY_SET: ReadonlySet<string> = new Set(COMMIT_FILE_ENTRY_KEYS);
@@ -565,9 +564,10 @@ async function runPushAttempt(
       const records = repoRecordsForState(state);
       const repoProofs: Record<string, RepoBaseProof> = Object.fromEntries(changedRepos.map((relPath) => [
         relPath,
-        carryRepoBaseProof(recordOriginLineage(records[relPath]?.branchBaseOrigins)
-          ?? receipt.plan.publisherAckBindings?.[relPath]?.lineageHash
-          ?? "legacy-untrusted"),
+        carriedLineageProof(
+          recordOriginLineage(records[relPath]?.branchBaseOrigins),
+          receipt.plan.publisherAckBindings?.[relPath]?.lineageHash,
+        ),
       ]));
       await report.phase("state-save", () => saveStateSource(root, state, {
         expectedStream: syncStreamId(cfg),
@@ -631,11 +631,11 @@ async function runPushAttempt(
       onMassDeleteRefused: () => deps.telemetry?.record({ kind: "safety_event", eventType: "mass_delete_breaker", count: 1 }),
     },
   );
-  const gitPlan = sealed.captureReceipt.plan;
+  const publication = sealed.publication;
   local = sealed.candidate;
   if (sealed.admission === "no-op") {
     if (cfg.encrypted) await pruneEncryptAddressCache(root, cfg, scannedFilePaths);
-    return { done: true, result: { sequence: appliedSequence, manifest: local, committed: false, ...resultCollisionMetadata(attemptState), ...(gitPlan.resolution ? { resolution: gitPlan.resolution } : {}) } };
+    return { done: true, result: { sequence: appliedSequence, manifest: local, committed: false, ...resultCollisionMetadata(attemptState), ...(publication.resolution ? { resolution: publication.resolution } : {}) } };
   }
   const gitUnchanged = sealed.gitUnchanged;
 
@@ -686,7 +686,7 @@ async function runPushAttempt(
     if (!repair && deferred.size > 0 && forceGitRecapture.size === 0) {
       const dd = diffManifests(appliedBase, committed);
       if (dd.added.length === 0 && dd.changed.length === 0 && dd.deleted.length === 0 && gitUnchanged) {
-        if (gitPlan.filesFirstDeferred) {
+        if (publication.filesFirstDeferred) {
           // Design 108 §3.2 anti-starvation: files-first committed nothing (every file
           // deferred) yet real repos were deferred. A terminal committed:false here would
           // leave the sequence at 0 and re-fire genesis every push, STARVING git. Return the
@@ -696,7 +696,7 @@ async function runPushAttempt(
           return { done: false, action: { kind: "files-first-fallback" }, exhaustedError: "push: files-first fallback exceeded its independent cap" };
         }
         reportDeferred(deferred, deps.warningSink);
-        return { done: true, result: { sequence: appliedSequence, manifest: committed, deferred: [...deferred], retryLater: [...retryLater], committed: false, ...resultCollisionMetadata(attemptState), ...(gitPlan.resolution ? { resolution: gitPlan.resolution } : {}) } };
+        return { done: true, result: { sequence: appliedSequence, manifest: committed, deferred: [...deferred], retryLater: [...retryLater], committed: false, ...resultCollisionMetadata(attemptState), ...(publication.resolution ? { resolution: publication.resolution } : {}) } };
       }
     }
 
@@ -738,16 +738,16 @@ async function runPushAttempt(
     }
     const parentSequence = repair?.parentSequence ?? appliedSequence;
     let keepMineArm: GitResolutionPublicationReceipt | undefined;
-    if (resolution && gitPlan.resolution?.outcome === "published") {
+    if (resolution && publication.resolution?.outcome === "published") {
       const candidate = committed.gitRepos?.[resolution.repo];
-      if (!candidate || !gitPlan.resolution.confirmedReportHash) {
+      if (!candidate || !publication.resolution.confirmedReportHash) {
         throw new Error("keep-mine planner admitted no exact publication candidate");
       }
       keepMineArm = {
         repo: resolution.repo,
         attemptedGitIncomingKey: gitIncomingKey(candidate),
         attemptedSequence: parentSequence + 1,
-        confirmedReportHash: gitPlan.resolution.confirmedReportHash,
+        confirmedReportHash: publication.resolution.confirmedReportHash,
       };
     }
     const commitPort: ManifestCommitPort = {
@@ -763,7 +763,7 @@ async function runPushAttempt(
             relPath: receipt.repo,
             expectedRepoGen: record.repoGen,
             newRecord: { ...inputRecord(record), resolutionReceipt: receipt },
-            baseProof: carryRepoBaseProof(recordOriginLineage(record.branchBaseOrigins) ?? "legacy-untrusted"),
+            baseProof: carriedLineageProof(recordOriginLineage(record.branchBaseOrigins)),
           }],
         });
         if (installed.status !== "accepted") throw new Error("keep-mine publication receipt could not be armed");
@@ -865,7 +865,6 @@ async function runPushAttempt(
       // the same per-file defer; the SAME manifest is retried (no pull, no re-scan).
       return reuploadOutcome(committed, commitReceipt.unsatisfiedBlobs, commitReceipt.unsatisfiedTotal, commitReceipt.attemptedManifestChain);
     }
-    const armedReceipt = commitReceipt.armed;
     const acceptedSequence = commitReceipt.sequence;
 
     // ACCEPTED. Capture the files-synced ACK timestamp NOW (design 108 §3.6): the END is
@@ -877,112 +876,47 @@ async function runPushAttempt(
       firstPublishTiming.stats.timeToFilesSyncedMs = Math.max(0, Math.round(performance.now() - deps.filesFirstStartedAt));
     }
 
-    // Per-repo base advance (design 43 §7 [v5]): a PENDING repo's committed section is the
-    // remote's own unapplied truth — the saved git BASE keeps the OLD entry (or none) so the
-    // next pull still sees remote != base and retries the apply (see gitBaseAfterCommit).
-    const supersededPending = new Set(gitPlan.supersededPending);
-    const resolvedPending = new Set(gitPlan.resolvedPending ?? []);
-    const settledPending = new Set([...supersededPending, ...resolvedPending]);
-    // Design 174 §4.2: the one bounded supersession line — emitted ONLY here, after
-    // the accepted commit, so it never claims a supersession a pre-ACK failure undid.
-    for (const relPath of [...supersededPending].sort()) {
-      const keys = gitPlan.supersessionIdentityKeys?.[relPath];
-      (deps.onGitLog ?? ((l: string) => console.error(l)))(
-        `git-sync superseded pending ${relPath}${keys ? ` [P=${keys.pending} candidate=${keys.candidate} composed=${keys.composed}]` : ""}: local history subsumes the unapplied remote section. rbox will publish the local history instead.`,
-      );
-    }
-    for (const relPath of [...resolvedPending].sort()) {
-      (deps.onGitLog ?? ((l: string) => console.error(l)))(
-        `git-sync published keep-mine ${relPath}: local Git state is now the acknowledged remote truth`,
-      );
-    }
-    const pendingAfterAck = { ...(gitPlan.gitPendingRemote ?? {}) };
-    for (const relPath of settledPending) delete pendingAfterAck[relPath];
-    const stateGit = gitBaseAfterCommit(committed.gitRepos, pendingAfterAck, appliedBase.gitRepos);
-    const advertised: Record<string, GitSection | null> = {};
-    const repoProofs: Record<string, RepoBaseProof> = {};
-    const ackRecords = repoRecordsForState(state);
-    const ackPartial = Object.fromEntries([...settledPending].map((relPath) => [relPath, null]));
-    const ackAttempt = Object.fromEntries([...settledPending].map((relPath) => [relPath, null]));
-    const ackDeferrals: Record<string, OrderedGitDeferralUpdates> = {};
-    for (const relPath of settledPending) {
-      const ordered = orderedDeferralUpdates(ackRecords[relPath]?.deferrals, { apply: null });
-      if (ordered) ackDeferrals[relPath] = ordered;
-    }
-    const resolutionsAfterAck = { ...(gitPlan.gitNeedsResolution ?? {}) };
-    for (const relPath of resolvedPending) delete resolutionsAfterAck[relPath];
-    for (const relPath of new Set([
-      ...Object.keys(ackRecords),
-      ...Object.keys(committed.gitRepos ?? {}),
-    ])) {
-      const section = committed.gitRepos?.[relPath];
-      advertised[relPath] = section ?? null;
-      const binding = gitPlan.publisherAckBindings?.[relPath];
-      if (section && binding) repoProofs[relPath] = {
-        authority: {
-          kind: "publisher-ack",
-          lineageHash: binding.lineageHash,
-          repositoryIdentityHash: binding.repositoryIdentityHash,
-          incomingKey: gitIncomingKey(section),
-          sourceSeq: acceptedSequence,
-          advertisedRefs: section.refs,
-          ...(gitPlan.absentBranchProofs?.[relPath]
-            ? { absentBranchProofs: gitPlan.absentBranchProofs[relPath] }
-            : {}),
-        },
-        lockedProof: {
-          repoKind: binding.repoKind,
-          effectiveRefScope: section.refScope,
-          checkoutComplete: true,
-          branches: {},
-          safeRefs: {},
-        },
-      };
-      else {
-        const retainedLineage = recordOriginLineage(ackRecords[relPath]?.branchBaseOrigins)
-          ?? binding?.lineageHash
-          ?? "legacy-untrusted";
-        repoProofs[relPath] = carryRepoBaseProof(retainedLineage);
-      }
-    }
-    const ackValues = {
-      bases: stateGit,
-      packedRefsIdentity: gitPlan.packedRefsIdentity,
-      advertised,
-      repoAbsent: gitPlan.repoAbsent ?? {},
-      pending: pendingAfterAck,
-      removed: gitPlan.gitReposRemoved,
-      resolutions: resolutionsAfterAck,
-      partial: ackPartial,
-      attempt: ackAttempt,
-      resolutionReceipt: Object.fromEntries([...resolvedPending].map((relPath) => [relPath, null])),
-      deferrals: ackDeferrals,
+    const transitionPort: RepoTransitionPort = {
+      records: repoRecordsForState(state),
+      observedRepos: (values) => observedRepoKeys(state, committed.gitRepos, values),
+      announce: (line) => { (deps.onGitLog ?? ((l: string) => console.error(l)))(line); },
+      save: async (write) => {
+        await report.phase("state-save", () => saveStateSource(root, state, {
+          expectedStream: syncStreamId(cfg),
+          sourceGlobalSeq: write.acceptedSequence,
+          globalManifest: write.globalManifest,
+          ...(write.manifestMeta ? { manifestMeta: write.manifestMeta } : {}),
+          observedRepos: write.observedRepos,
+          values: write.values,
+          repoProofs: write.repoProofs,
+          authoredCfgHashByRepo: write.authoredCfgHashByRepo,
+        }, {
+          allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),
+          forceLegacy: workspaceSyncMutexDegraded(deps.syncMutex),
+        }));
+      },
     };
-    try {
-      await report.phase("state-save", () => saveStateSource(root, state, {
-        expectedStream: syncStreamId(cfg),
-        sourceGlobalSeq: acceptedSequence,
-        globalManifest: committed,
-        ...(commitReceipt.manifestMeta ? { manifestMeta: commitReceipt.manifestMeta } : {}),
-        observedRepos: observedRepoKeys(state, committed.gitRepos, ackValues),
-        values: ackValues,
-        repoProofs,
-        authoredCfgHashByRepo: gitPlan.authoredCfgHashByRepo,
-      }, {
-        allowLegacyStreamReplacement: deps.syncMutex === undefined && stateWasStreamMismatch(state),
-        forceLegacy: workspaceSyncMutexDegraded(deps.syncMutex),
-      }));
-    } catch (error) {
-      if (armedReceipt) {
-        return { done: true, result: {
-          sequence: acceptedSequence,
-          manifest: committed,
-          committed: true,
-          ...resultCollisionMetadata(attemptState),
-          resolution: { outcome: "ack-uncertain", reason: "the publish landed but local acknowledgement could not be saved; run rbox push or rbox pull" },
-        } };
-      }
-      throw error;
+    const acknowledgement = await acknowledgePublishedGitTransitions(
+      {
+        identity: sealed.identity,
+        manifest: committed,
+        appliedBaseGit: appliedBase.gitRepos,
+        transition: publication.transition,
+      },
+      commitReceipt,
+      transitionPort,
+    );
+    if (acknowledgement.kind === "accepted-state-pending") {
+      // An unarmed publication keeps the pre-seam contract: the state-save error
+      // is the caller's, not a soft "landed but unrecorded" result.
+      if (!acknowledgement.reason.armed) throw acknowledgement.reason.cause;
+      return { done: true, result: {
+        sequence: acceptedSequence,
+        manifest: committed,
+        committed: true,
+        ...resultCollisionMetadata(attemptState),
+        resolution: { outcome: "ack-uncertain", reason: "the publish landed but local acknowledgement could not be saved; run rbox push or rbox pull" },
+      } };
     }
 
     // Finalize AFTER the fully-persisted commit — a failed attempt never appends a
@@ -1001,9 +935,9 @@ async function runPushAttempt(
     }
 
     if (deferred.size > 0) reportDeferred(deferred, deps.warningSink);
-    return { done: true, result: { sequence: acceptedSequence, manifest: committed, deferred: [...deferred], retryLater: [...retryLater], committed: true, ...resultCollisionMetadata(attemptState), ...(gitPlan.filesFirstDeferred ? { gitDeferred: true } : {}), ...(gitPlan.resolution ? { resolution: {
-      outcome: gitPlan.resolution.outcome,
-      ...(gitPlan.resolution.reason ? { reason: gitPlan.resolution.reason } : {}),
+    return { done: true, result: { sequence: acceptedSequence, manifest: committed, deferred: [...deferred], retryLater: [...retryLater], committed: true, ...resultCollisionMetadata(attemptState), ...(publication.filesFirstDeferred ? { gitDeferred: true } : {}), ...(publication.resolution ? { resolution: {
+      outcome: publication.resolution.outcome,
+      ...(publication.resolution.reason ? { reason: publication.resolution.reason } : {}),
       sequence: acceptedSequence,
     } } : {}) } };
   } finally {

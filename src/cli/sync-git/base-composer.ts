@@ -576,3 +576,13 @@ export function carryRepoBaseProof(lineageHash = "legacy-untrusted"): RepoBasePr
     lockedProof: { repoKind: "dir", effectiveRefScope: "all", checkoutComplete: true, branches: {}, safeRefs: {} },
   };
 }
+
+/**
+ * The one lineage-resolution rule every carry-only proof obeys: a durable
+ * branch origin outranks the publication's plan-time ACK lineage, which
+ * outranks the legacy sentinel. A carry never mints authority, so a repository
+ * with neither is recorded as untrusted rather than refused.
+ */
+export function carriedLineageProof(originLineage: string | undefined, ackLineage?: string): RepoBaseProof {
+  return carryRepoBaseProof(originLineage ?? ackLineage ?? "legacy-untrusted");
+}

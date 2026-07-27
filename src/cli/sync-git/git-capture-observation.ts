@@ -1,6 +1,6 @@
 import type { GitDeferralReason, GitDeferrals } from "../config.js";
 import { orderedDeferralUpdates, type GitDeferralUpdates, type OrderedGitDeferralUpdates, type RepoStateValues } from "../sync-state.js";
-import { carryRepoBaseProof, type RepoBaseProof } from "./base-composer.js";
+import { carriedLineageProof, type RepoBaseProof } from "./base-composer.js";
 import { nextDeferral } from "./shared.js";
 
 /** The durable BASE lineage this observation carries forward. It is carry-only
@@ -149,7 +149,7 @@ export async function recordGitCaptureObservation(
   }
   const repoProofs = Object.fromEntries(observedRepos.map((relPath) => [
     relPath,
-    carryRepoBaseProof(lineage.originLineageOf(relPath) ?? observation.ackLineageOf(relPath) ?? "legacy-untrusted"),
+    carriedLineageProof(lineage.originLineageOf(relPath), observation.ackLineageOf(relPath)),
   ]));
   await port.save({ acceptedSequence: lineage.acceptedSequence, observedRepos, values, repoProofs });
   return { kind: "written", acceptedSequence: lineage.acceptedSequence, observedRepos, deferralUpdates: deferrals };

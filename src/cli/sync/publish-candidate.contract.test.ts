@@ -189,7 +189,13 @@ describe("preparePublishCandidate seals a capture receipt", () => {
     expect(sealed.admission).toBe("publish");
     expect(sealed.identity.acceptedSequence).toBe(3);
     expect(sealed.identity.capturePlanId).toBe(rig.executed[0]!.planId);
-    expect(sealed.captureReceipt.plan).toBe(rig.plan);
+    expect(sealed.publication.capturePlanId).toBe(rig.executed[0]!.planId);
+    // The sealed plan projects the capture; it never republishes the planner's
+    // whole working surface to its consumers.
+    expect(sealed.publication).not.toHaveProperty("plan");
+    expect(sealed.publication.transition.pending).toBe(rig.plan.gitPendingRemote);
+    expect(sealed.publication.transition.authoredCfgHashByRepo).toBe(rig.plan.authoredCfgHashByRepo);
+    expect(sealed.publication.transition.supersededPending).toBe(rig.plan.supersededPending);
     expect(sealed.candidate.gitRepos).toBe(rig.plan.gitRepos);
   });
 });
