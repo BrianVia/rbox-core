@@ -23,6 +23,11 @@ process.env.RBOX_AUTH_GRANT = "0";
 // test runner's ledger writable and process-local without changing HOME (many
 // fixtures exercise HOME/RBOX_HOME precedence explicitly).
 process.env.RBOX_TEST_HOST_IDENTITY_DIR = `/tmp/rbox-test-host-identity-${process.pid}`;
+// Same reasoning for design 211's binding registry (~/.rbox/workspaces.json): it
+// is host-global, and suites that never set RBOX_HOME would otherwise record
+// their throwaway tmp roots in the developer's real registry. Honored ONLY when
+// RBOX_HOME is unset, so fixtures that redirect ~/.rbox still control it.
+process.env.RBOX_TEST_BINDING_REGISTRY_DIR = `/tmp/rbox-test-binding-registry-${process.pid}`;
 // Flake registry: product-created repos appear mid-test, so repo config cannot
 // cover them; cleanGitEnv's process.env spread carries this to every git spawn.
 process.env.GIT_CONFIG_COUNT = "2";
