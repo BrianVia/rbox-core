@@ -86,7 +86,7 @@ interface DaemonInternals {
   watcherErrorGeneration: number;
   ownershipWindDownStarted: boolean;
   cache: HashCache;
-  manifest: Manifest;
+  local: { head: Manifest };
   pendingEvents: WatchEvent[];
   activity: DaemonActivity;
   syncBase?: SyncState;
@@ -182,7 +182,7 @@ async function makeDaemon(
   const daemon = new RboxDaemon(root, cfg, { remote, backoff: async () => {} }, { bootId, keyDeliveryFlight: null, ...opts }) as unknown as DaemonInternals;
   daemons.push(daemon);
   daemon.cache = await HashCache.load(root);
-  daemon.manifest = await scanManifest(root);
+  daemon.local.head = await scanManifest(root);
   await daemon.loadSyncBase();
   return daemon;
 }
@@ -652,7 +652,7 @@ test("design 178 B: idle-host conflict recovery clears after pull without anothe
   // A healed/no-op transaction ends the episode: the next independent
   // exhaustion starts at tier one instead of inheriting the old backoff count.
   await fs.writeFile(path.join(root, "new-local.txt"), "new\n");
-  daemon.manifest = await scanManifest(root);
+  daemon.local.head = await scanManifest(root);
   daemon.want.push = true;
   await daemon.pump();
   expect(daemon.activity.halt?.consecutiveFailures).toBe(1);
@@ -663,7 +663,7 @@ test("review M2: locked divergent repo is indeterminate and conflict recovery st
   const remote = new MiniRemote();
   const daemon = await makeDaemon(remote, "locked-recovery", {}, { syncGit: true });
   await fs.writeFile(path.join(repo, ".git", "index.lock"), "");
-  daemon.manifest = daemon.syncBase!.lastSyncedManifest;
+  daemon.local.head = daemon.syncBase!.lastSyncedManifest;
   expect(await daemon.hasPublishableLocalDivergence()).toBe("indeterminate");
   daemon.hasPublishableLocalDivergence = async () => "indeterminate";
   daemon.activity.halt = {
@@ -685,7 +685,7 @@ test("review M2: post-pull indeterminate divergence does not suppress the push",
   const repo = await makeCommittedRepo();
   const daemon = await makeDaemon(new MiniRemote(), "locked-post-pull", {}, { syncGit: true });
   await fs.writeFile(path.join(repo, ".git", "index.lock"), "");
-  daemon.manifest = daemon.syncBase!.lastSyncedManifest;
+  daemon.local.head = daemon.syncBase!.lastSyncedManifest;
   expect(await daemon.hasPublishableLocalDivergence()).toBe("indeterminate");
   daemon.hasPublishableLocalDivergence = async () => "indeterminate";
   let pushAttempts = 0;
@@ -877,7 +877,7 @@ test("a committed push records the last-sync trail; a no-op push does not", asyn
   const remote = new MiniRemote();
   const daemon = await makeDaemon(remote);
   await fs.writeFile(path.join(root, "a.txt"), "hello");
-  daemon.manifest = await scanManifest(root);
+  daemon.local.head = await scanManifest(root);
 
   daemon.want.push = true;
   await daemon.pump();
@@ -896,7 +896,7 @@ test("the 409-recovery pull inside a push is recorded in the trail (codex R2)", 
   const remote = new MiniRemote();
   const daemon = await makeDaemon(remote);
   await fs.writeFile(path.join(root, "a.txt"), "mine");
-  daemon.manifest = await scanManifest(root);
+  daemon.local.head = await scanManifest(root);
   daemon.want.push = true;
   await daemon.pump(); // baseline: sequence 1
   await daemon.activityWrite;
@@ -906,7 +906,7 @@ test("the 409-recovery pull inside a push is recorded in the trail (codex R2)", 
   remote.injectCommit([...current, await remote.seedEntry("b.txt", "theirs")]);
 
   await fs.writeFile(path.join(root, "c.txt"), "more local work");
-  daemon.manifest = await scanManifest(root);
+  daemon.local.head = await scanManifest(root);
   daemon.want.push = true;
   await daemon.pump(); // 409 → internal pull writes b.txt → re-scan → commit seq 3
   await daemon.activityWrite;
@@ -977,7 +977,7 @@ test("a committed push writes shell.line: v1, state ok, committed sequence (desi
   const remote = new MiniRemote();
   const daemon = await makeDaemon(remote);
   await fs.writeFile(path.join(root, "a.txt"), "hello");
-  daemon.manifest = await scanManifest(root);
+  daemon.local.head = await scanManifest(root);
 
   daemon.want.push = true;
   await daemon.pump();
@@ -1138,7 +1138,7 @@ test("quota errors record outOfStorage, suppress watcher uploads, probe on safet
   const remote = new QuotaCommitRemote();
   const daemon = await makeDaemon(remote);
   await fs.writeFile(path.join(root, "a.txt"), "hello");
-  daemon.manifest = await scanManifest(root);
+  daemon.local.head = await scanManifest(root);
 
   daemon.want.push = true;
   await daemon.pump();
@@ -1183,7 +1183,7 @@ test("review M1: quota thrown by a conflict recovery probe is reclassified", asy
   const remote = new QuotaCommitRemote();
   const daemon = await makeDaemon(remote);
   await fs.writeFile(path.join(root, "local.txt"), "publish me");
-  daemon.manifest = await scanManifest(root);
+  daemon.local.head = await scanManifest(root);
   daemon.activity.halt = {
     at: iso(30), reason: "push conflict", count: 2, op: "push",
     firstFailureAt: iso(30), lastFailureAt: iso(10), consecutiveFailures: 2,
@@ -1204,7 +1204,7 @@ test("review M1: unrelated generic probe error starts a message-only episode", a
   const remote = new RejectedCommitRemote(new Error("unrelated upload failure"));
   const daemon = await makeDaemon(remote);
   await fs.writeFile(path.join(root, "local.txt"), "publish me");
-  daemon.manifest = await scanManifest(root);
+  daemon.local.head = await scanManifest(root);
   const originalFirstFailureAt = iso(30);
   daemon.activity.halt = {
     at: originalFirstFailureAt, reason: "push conflict", count: 3, op: "push",
@@ -1229,7 +1229,7 @@ test("review M1: commit rejection during a conflict probe captures the new finge
   const remote = new RejectedCommitRemote(rejected);
   const daemon = await makeDaemon(remote);
   await fs.writeFile(path.join(root, "local.txt"), "publish me");
-  daemon.manifest = await scanManifest(root);
+  daemon.local.head = await scanManifest(root);
   daemon.activity.halt = {
     at: iso(30), reason: "push conflict", count: 2, op: "push",
     firstFailureAt: iso(30), lastFailureAt: iso(10), consecutiveFailures: 2,
@@ -1254,7 +1254,7 @@ test.each([
   const remote = new RejectedCommitRemote(err);
   const daemon = await makeDaemon(remote);
   await fs.writeFile(path.join(root, "a.txt"), "hello");
-  daemon.manifest = await scanManifest(root);
+  daemon.local.head = await scanManifest(root);
 
   daemon.want.push = true;
   await daemon.pump();
@@ -1278,7 +1278,7 @@ test("push mass-delete refusal persists the producer-authored push classificatio
   const remote = new RejectedCommitRemote(err);
   const daemon = await makeDaemon(remote);
   await fs.writeFile(path.join(root, "a.txt"), "hello");
-  daemon.manifest = await scanManifest(root);
+  daemon.local.head = await scanManifest(root);
 
   daemon.want.push = true;
   daemon.recoveryDue = true;
@@ -1296,7 +1296,7 @@ test("terminal push halt passes blocked fingerprint into the push and preserves 
   const remote = new StillBlockedRemote();
   const daemon = await makeDaemon(remote);
   await fs.writeFile(path.join(root, "a.txt"), "hello");
-  daemon.manifest = await scanManifest(root);
+  daemon.local.head = await scanManifest(root);
   daemon.activity.halt = {
     at: "2026-07-02T12:00:00.000Z",
     reason: "workspace needs 250,001 blob refs per commit; the server cap is 250,000.",
@@ -1325,7 +1325,7 @@ test("terminal push halt passes blocked fingerprint into the push and preserves 
 
   remote.stillBlocked = false;
   await fs.writeFile(path.join(root, "a.txt"), "changed");
-  daemon.manifest = await scanManifest(root);
+  daemon.local.head = await scanManifest(root);
   daemon.want.push = true;
   daemon.recoveryDue = true;
   await daemon.pump();
@@ -1340,7 +1340,7 @@ test("a quota probe refreshes outOfStorage without clearing a real pull halt", a
   const remote = new QuotaCommitRemote();
   const daemon = await makeDaemon(remote);
   await fs.writeFile(path.join(root, "a.txt"), "hello");
-  daemon.manifest = await scanManifest(root);
+  daemon.local.head = await scanManifest(root);
 
   daemon.want.push = true;
   await daemon.pump();
@@ -1432,7 +1432,7 @@ test("local snapshot stays unsettled while a pump op is in flight", async () => 
   const remote = new HookedCommitRemote();
   const daemon = await makeDaemon(remote);
   await fs.writeFile(path.join(root, "during.txt"), "local work");
-  daemon.manifest = await scanManifest(root, undefined, daemon.cache);
+  daemon.local.head = await scanManifest(root, undefined, daemon.cache);
   daemon.want.push = true;
 
   const pump = daemon.pump();
@@ -1453,7 +1453,7 @@ test("timer heartbeat advances while a pump op is in flight", async () => {
   const remote = new HookedCommitRemote();
   const daemon = await makeDaemon(remote);
   await fs.writeFile(path.join(root, "during.txt"), "local work");
-  daemon.manifest = await scanManifest(root, undefined, daemon.cache);
+  daemon.local.head = await scanManifest(root, undefined, daemon.cache);
   daemon.want.push = true;
 
   const pump = daemon.pump();
@@ -1667,7 +1667,7 @@ test("conflicting v2 pidfile observed mid-pump drains the current op before wind
     };
 
     await fs.writeFile(path.join(root, "a.txt"), "hello");
-    daemon.manifest = await scanManifest(root);
+    daemon.local.head = await scanManifest(root);
     daemon.want.push = true;
     const pumpDone = daemon.pump();
     await remote.commitEntered.promise;
@@ -1697,7 +1697,7 @@ test("removing the pidfile during shutdown does not steal ownership from the run
     };
 
     await fs.writeFile(path.join(root, "a.txt"), "hello");
-    daemon.manifest = await scanManifest(root);
+    daemon.local.head = await scanManifest(root);
     daemon.want.push = true;
     const pumpDone = daemon.pump();
     await remote.commitEntered.promise;
@@ -1878,7 +1878,7 @@ test("graceful stop exposes a closed gate, drains a slow pump, and settles watch
         throw new Error("injected watcher close rejection");
       },
     } as Watcher;
-    daemon.manifest = await scanManifest(root);
+    daemon.local.head = await scanManifest(root);
     daemon.want.push = true;
     const pump = daemon.pump();
     await remote.commitEntered.promise;

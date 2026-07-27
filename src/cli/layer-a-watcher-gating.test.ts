@@ -17,7 +17,7 @@ interface Internals {
   maybeClearWatcherDegradedAfterScan(opWatcherErrorGeneration: number, cov: Coverage): void;
   localObserver: { observe(plan: { kind: "scan"; mode: Mode }): Promise<ScanResult> };
   cache: HashCache;
-  manifest: Manifest;
+  local: { head: Manifest };
   watcher?: { close(): Promise<void> };
   watcherHealthy: boolean;
   trustState: "trusted" | "suspect" | "fused";
@@ -78,7 +78,7 @@ function harness(): {
     const hook = duringScan;
     duringScan = undefined;
     hook?.();
-    return { freshManifest: daemon.manifest, deferredPaths: new Set<string>(), coverage: mode === "pruned" ? "pruned" : "full-tree" };
+    return { freshManifest: daemon.local.head, deferredPaths: new Set<string>(), coverage: mode === "pruned" ? "pruned" : "full-tree" };
   };
   return {
     daemon,

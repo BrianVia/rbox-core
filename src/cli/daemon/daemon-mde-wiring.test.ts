@@ -13,7 +13,7 @@ const WORKSPACE_ID = "ws_daemon_mde";
 
 interface DaemonInternals {
   cache: HashCache;
-  manifest: Manifest;
+  local: { head: Manifest };
   want: { push: boolean };
   activityWrite: Promise<void>;
   loadSyncBase(): Promise<unknown>;
@@ -53,7 +53,7 @@ test("daemon wires manifest attribution and publication through its log sink", a
   ) as unknown as DaemonInternals;
   await fs.writeFile(path.join(root, "attribution.txt"), "manifest attribution\n");
   daemon.cache = await HashCache.load(root);
-  daemon.manifest = await scanManifest(root);
+  daemon.local.head = await scanManifest(root);
   await daemon.loadSyncBase();
 
   daemon.want.push = true;
@@ -94,7 +94,7 @@ test("209/6 first daemon commit after a full boot scan emits one op for one real
     { log: sink, keyDeliveryFlight: null },
   ) as unknown as DaemonInternals;
   daemon.cache = await HashCache.load(root);
-  daemon.manifest = await scanManifest(root);
+  daemon.local.head = await scanManifest(root);
   await daemon.loadSyncBase();
 
   daemon.want.push = true;

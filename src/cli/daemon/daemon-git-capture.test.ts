@@ -113,7 +113,7 @@ class RoutingWatches {
 
 interface EpisodeDaemon {
   cache: HashCache;
-  manifest: Manifest;
+  local: { head: Manifest };
   pendingEvents: unknown[];
   pendingPushReasons: { signal: boolean; candidate: boolean; scan: boolean; other: boolean };
   want: { pull: boolean; push: boolean; fullScan: boolean; deepScan: boolean };
@@ -195,7 +195,7 @@ test("lock pre-signal alone captures branch and packed refs through one absolute
 
     try {
       daemon.cache = await HashCache.load(root);
-      daemon.manifest = await scanManifest(root);
+      daemon.local.head = await scanManifest(root);
       await daemon.loadSyncBase();
       daemon.want.push = true;
       await daemon.pump();
@@ -314,7 +314,7 @@ test("every raw want.push assignment is owned by requestPush and terminal record
   expect(source.match(/this\.recordGitCaptureSuccess\(provenance\)/g)).toHaveLength(1);
   const returned = source.indexOf("res = await pushManifest");
   const recorded = source.indexOf("this.recordGitCaptureSuccess(provenance)");
-  const bookkeeping = source.indexOf("this.installManifest(res.manifest", recorded);
+  const bookkeeping = source.indexOf("this.local.commitPatch(res.manifest", recorded);
   expect(returned).toBeLessThan(recorded);
   expect(recorded).toBeLessThan(bookkeeping);
 });

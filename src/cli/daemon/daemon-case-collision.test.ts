@@ -53,21 +53,21 @@ test("failed-attempt observations conservatively retain incomplete authority", a
     remoteUrl: "https://example.invalid", token: "", encrypted: true,
   };
   const daemon = new RboxDaemon(root, cfg as never, {}, { log: () => {} }) as unknown as {
-    manifestObservationComplete: boolean;
+    local: { complete: boolean };
     activeCaseCollisions: Array<{ paths: string[] }>;
     observeCaseCollisions(observation: { authority: "authoritative" | "preserve"; caseCollisions: Array<{ paths: string[] }> }): Promise<void>;
   };
   try {
     await savePathWarnings(root, groups);
-    expect(daemon.manifestObservationComplete).toBe(true);
+    expect(daemon.local.complete).toBe(true);
 
     await daemon.observeCaseCollisions({ authority: "preserve", caseCollisions: groups });
-    expect(daemon.manifestObservationComplete).toBe(false);
+    expect(daemon.local.complete).toBe(false);
     expect(daemon.activeCaseCollisions).toEqual(groups);
     expect((await readPathWarnings(root))?.collisions).toEqual(groups);
 
     await daemon.observeCaseCollisions({ authority: "authoritative", caseCollisions: [] });
-    expect(daemon.manifestObservationComplete).toBe(false);
+    expect(daemon.local.complete).toBe(false);
     expect(daemon.activeCaseCollisions).toEqual([]);
   } finally {
     await fs.rm(root, { recursive: true, force: true });

@@ -18,6 +18,8 @@ import { createScanProbe, loadScanProbe, saveScanProbe } from "../scan-probe.js"
 import { GC_FENCE_RETRY_MS } from "./policy.js";
 import { errCode } from "./logger.js";
 import type { ManifestUpdate } from "./manifest-update.js";
+import type { LineageSnapshot, LocalAuthorityPort, LocalObservationCommitIntent } from "./local-observation-transition.js";
+import { sealLocalObservationIdentity } from "./local-observation-transition.js";
 import type {
   CurrentGitTopologyObservation,
   CurrentGitTopologyReceipt,
@@ -34,9 +36,9 @@ import type {
  * under, the dircache coverage hint, and the topology observation
  * `GitDiscoveryContinuity` derived from the same walk.
  *
- * The observer does NOT advance LOCAL authority: manifest installation and the
- * unsettled-set reconciliation reach it only through {@link LocalObservationEffects},
- * so a future commit owner can take that seam without moving observation again.
+ * The observer does NOT advance LOCAL authority: it seals a commit intent against the
+ * lineage the observation STARTED under and hands it to `CommitLocalObservation`
+ * ({@link LocalAuthorityPort}), which alone owns head, revision, and completeness.
  */
 
 /** The bounded per-path retry queue the observation executor alone arms. Deferred
@@ -214,14 +216,7 @@ export interface LocalObservationEffects {
   beginTopologySnapshot(scanKind: GitScanKind | undefined): ScanTopologySnapshot;
   observeTopology(observation: CurrentGitTopologyObservation): Promise<CurrentGitTopologyReceipt>;
   /** The LOCAL-authority seam: the observer never assigns the manifest itself. */
-  install(
-    next: Manifest,
-    update: ManifestUpdate,
-    unsettled: { rebuildFrom?: ReadonlySet<string>; settle?: Iterable<string>; add?: Iterable<string> },
-    observedUnderMatcherGeneration?: number,
-  ): void;
-  setObservationComplete(complete: boolean): void;
-  observationComplete(): boolean;
+  readonly authority: LocalAuthorityPort;
   log: (line: string) => void;
   recordScanFault(): void;
   /** Injected so the observation contract holds without a real tree walk. */
@@ -255,6 +250,23 @@ export class LocalWorkspaceObserver {
     if (receipt.deferredPaths.size > 0) this.retries.scheduleWriteFinish(new Set(receipt.deferredPaths));
   }
 
+  /** Seal this execution's payload against the lineage it started under and hand it to
+   *  `CommitLocalObservation`. A refusal is fail-closed by construction — LOCAL simply
+   *  does not advance — so it is named in the log rather than left as a silent no-op. */
+  private commit(
+    payload: Omit<LocalObservationCommitIntent, "identity">,
+    observationId: string,
+    lineage: LineageSnapshot,
+  ): void {
+    const receipt = this.effects.authority.commitObservation({
+      ...payload,
+      identity: sealLocalObservationIdentity(observationId, lineage, payload),
+    });
+    if (receipt.outcome !== "advanced") {
+      this.effects.log(`local observation ${observationId} not committed: ${receipt.outcome}`);
+    }
+  }
+
   /** Install a coherent full-scan result. A path that changed under its deferred
    *  hash carries `previous`'s entry (never a torn tuple, never a deletion) and
    *  enters the existing write-finish retry loop. */
@@ -275,27 +287,32 @@ export class LocalWorkspaceObserver {
     // manifest observed under the old matcher; capturing here leaves the stamp stale
     // so P7 keeps trusted off until the next clean observation.
     const observedUnder = this.effects.matcherGeneration();
+    // …and the lineage it starts under, sealed in the same synchronous read, so the
+    // commit can refuse a receipt whose LOCAL moved underneath the walk.
+    const lineage = this.effects.authority.snapshot();
+    const observationId = `obs-${++observationSeq}`;
     const walk = this.effects.scanTree ?? scanManifest;
     const fresh = await walk(root, this.effects.currentMatcher(), plan.cache, undefined, (repo) => discoveredGitRepos.push(repo), plan.scanStats, deferred, probe, dircache, plan.mode,
       deferErrnos.onErrno, this.effects.log);
     deferErrnos.flush();
     await dircache?.save(root);
     const topology = await this.effects.observeTopology({ kind: "scan", repos: discoveredGitRepos, mode: plan.mode, snapshot: topologySnapshot });
-    // Any deferred path makes collision evidence incomplete: it might be the
-    // unseen case-variant of a path that did hash. Preserve warning authority
-    // until a later scan observes the whole file set.
-    this.effects.setObservationComplete(deferred.size === 0);
     // Design 202: a scan is a FULL WORKSPACE observation (pruned scans reuse cached
     // listings, they do not omit paths), so it re-derives the unsettled set outright —
     // every previously unsettled path it read cleanly is settled again. `deferred` is
     // stamped by reference: this function is its only writer and it is done writing.
+    // Any deferred path also makes collision evidence incomplete (it might be the
+    // unseen case-variant of a path that did hash), so the completeness claim and the
+    // head it describes are ONE transition — no window carries one without the other.
     const coverage = coverageOf(dircache?.lastOutcome ?? "off");
-    this.effects.install(
-      deferred.size > 0 ? deferManifest(fresh, plan.previous, deferred) : fresh,
-      { kind: "full-workspace", coverage, deferred },
-      { rebuildFrom: deferred },
-      observedUnder,
-    );
+    const payload = {
+      next: deferred.size > 0 ? deferManifest(fresh, plan.previous, deferred) : fresh,
+      update: { kind: "full-workspace", coverage, deferred } as const,
+      unsettled: { rebuildFrom: deferred },
+      observedUnderMatcherGeneration: observedUnder,
+      completeness: (deferred.size === 0 ? "complete" : "deferred") as "complete" | "deferred",
+    };
+    this.commit(payload, observationId, lineage);
     if (deferred.size > 0) this.retries.scheduleWriteFinish(deferred);
     if (probe) {
       const summary = probe.summary();
@@ -310,7 +327,7 @@ export class LocalWorkspaceObserver {
     // "full-tree". Callers forward this value unchanged.
     return {
       kind: "scan",
-      observationId: `obs-${++observationSeq}`,
+      observationId,
       scope: "full-workspace",
       completeness: deferred.size === 0 ? "complete" : "deferred",
       deferredPaths: deferred,
@@ -328,6 +345,8 @@ export class LocalWorkspaceObserver {
     const deferred = new Set<string>();
     const patch = this.effects.patchEvents ?? applyWatchEvents;
     const observedUnder = this.effects.matcherGeneration();
+    const lineage = this.effects.authority.snapshot();
+    const observationId = `obs-${++observationSeq}`;
     const patched = await patch(this.effects.currentManifest(), this.effects.root, this.effects.currentMatcher(), events, plan.cache, deferred);
     // Design 202: ONE partial update per settled drain (never per file). A path
     // this drain read cleanly is re-observed and leaves the unsettled set; a path
@@ -335,12 +354,17 @@ export class LocalWorkspaceObserver {
     // is what makes the ordering do the bookkeeping: a rescan simply installs
     // full-workspace provenance and its own unsettled set on top, so no "did we
     // rescan?" flag is needed to stop a partial stamp from overwriting it.
-    this.effects.install(patched, { kind: "partial", source: "watch-events", paths: new Set(events.map((e) => e.relPath)) }, {
-      settle: events.filter((e) => !deferred.has(e.relPath)).map((e) => e.relPath),
-      add: deferred,
-    });
+    const payload = {
+      next: patched,
+      update: { kind: "partial", source: "watch-events", paths: new Set(events.map((e) => e.relPath)) } as const,
+      unsettled: {
+        settle: events.filter((e) => !deferred.has(e.relPath)).map((e) => e.relPath),
+        add: deferred,
+      },
+    };
+    this.commit(payload, observationId, lineage);
     let nested: ScanObservationReceipt | undefined;
-    if (!this.effects.observationComplete() && caseFoldCollisionGroups(this.effects.currentManifest().files).length > 0) {
+    if (!this.effects.authority.observationComplete && caseFoldCollisionGroups(this.effects.currentManifest().files).length > 0) {
       // The retained safe subset discovered an independent new collision.
       // Re-scan to reunite it with every still-active omitted group before
       // the next push authors warning truth.
@@ -349,7 +373,7 @@ export class LocalWorkspaceObserver {
     }
     return {
       kind: "watch-batch",
-      observationId: `obs-${++observationSeq}`,
+      observationId,
       scope: "named-paths",
       completeness: deferred.size === 0 ? "complete" : "deferred",
       deferredPaths: deferred,

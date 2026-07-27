@@ -86,7 +86,7 @@ class MiniRemote implements SyncRemote {
 
 interface DaemonInternals {
   cache: InstanceType<typeof HashCache>;
-  manifest: Manifest;
+  local: { head: Manifest };
   want: { pull: boolean; push: boolean; fullScan: boolean; deepScan: boolean };
   retryQueue: { stop(): void };
   pump(): Promise<void>;
@@ -128,7 +128,7 @@ test("a freshly pulled path deferred during the post-pull rescan carries the pul
   await fs.writeFile(path.join(root, "f.txt"), "one");
   daemon = new RboxDaemon(root, testConfig(), { remote, backoff: async () => {} }, { bootId: "boot-defer" }) as unknown as DaemonInternals;
   daemon.cache = new HashCache();
-  daemon.manifest = await scanManifest(root); // pre-pull in-memory truth: f.txt only, no g.txt
+  daemon.local.head = await scanManifest(root); // pre-pull in-memory truth: f.txt only, no g.txt
   await daemon.loadSyncBase();
 
   daemon.want.push = true;

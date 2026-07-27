@@ -74,21 +74,24 @@ class MiniRemote implements SyncRemote {
  *  daemon-scan-defer.test.ts / daemon-safety.test.ts). */
 interface DaemonInternals {
   cache: HashCache;
-  manifest: Manifest;
   matcher: IgnoreMatcher;
   matcherGitReposKey: string;
   matcherGeneration: number;
-  manifestMatcherGeneration: number;
   watcherNativePruneKey: string;
   rulesChangedSinceDeepScan: boolean;
   syncBase?: SyncState;
   want: { pull: boolean; push: boolean; fullScan: boolean; deepScan: boolean };
   retryQueue: { stop(): void; scheduleWriteFinish(paths: Set<string>): void };
   pendingEvents: { relPath: string; kind: string }[];
-  unsettledPaths: Set<string>;
-  lastManifestUpdate?: ManifestUpdate;
-  fullWorkspaceSinceSeed: boolean;
-  manifestObservationComplete: boolean;
+  /** LOCAL authority (`CommitLocalObservation`), driven directly for fixture setup. */
+  local: {
+    head: Manifest;
+    complete: boolean;
+    unsettled: Set<string>;
+    update?: ManifestUpdate;
+    fullWorkspace: boolean;
+    observedGeneration: number;
+  };
   activeCaseCollisions: { paths: string[] }[];
   resetLifecycle: "ready" | "halted" | "recovering" | "bootstrapping";
   watcher?: { backend: "parcel" | "chokidar"; close(): Promise<void> };
@@ -167,7 +170,7 @@ function makeDaemon(remote: MiniRemote, opts: { scanCadenceClock?: ScanCadenceCl
  *  stated for the fleet's default backend. The chokidar fuse has its own test. */
 async function armed(remote: MiniRemote, backend: "parcel" | "chokidar" = "parcel"): Promise<DaemonInternals> {
   const d = makeDaemon(remote);
-  d.manifest = await scanManifest(root);
+  d.local.head = await scanManifest(root);
   const base = await d.loadSyncBase();
   d.want.push = true;
   await d.pump();
@@ -179,7 +182,7 @@ async function armed(remote: MiniRemote, backend: "parcel" | "chokidar" = "parce
   d.watcherHealthy = true;
   d.watcherDegraded = false;
   d.trustState = "trusted";
-  d.manifestObservationComplete = true;
+  d.local.complete = true;
   d.activeCaseCollisions = [];
   d.resetLifecycle = "ready";
   await d.localObserver.observe({ kind: "scan", cache: d.cache, previous: after.lastSyncedManifest, mode: "unpruned" });
@@ -203,13 +206,13 @@ test("design 202 P-matrix: every condition independently false drops the pull ba
     ["P1 unhealthy", "p1-watcher", () => { d.watcherHealthy = false; }, () => { d.watcherHealthy = true; }],
     ["P1 untrusted", "p1-watcher", () => { d.trustState = "suspect"; }, () => { d.trustState = "trusted"; }],
     ["P1 degraded", "p1-watcher", () => { d.watcherDegraded = true; }, () => { d.watcherDegraded = false; }],
-    ["P2 incomplete observation", "p2-observation", () => { d.manifestObservationComplete = false; }, () => { d.manifestObservationComplete = true; }],
+    ["P2 incomplete observation", "p2-observation", () => { d.local.complete = false; }, () => { d.local.complete = true; }],
     ["P2 case collision", "p2-observation", () => { d.activeCaseCollisions = [{ paths: ["A.txt", "a.txt"] }]; }, () => { d.activeCaseCollisions = []; }],
-    ["P5 no full-workspace install since seed", "p5-seed", () => { d.fullWorkspaceSinceSeed = false; }, () => { d.fullWorkspaceSinceSeed = true; }],
+    ["P5 no full-workspace install since seed", "p5-seed", () => { d.local.fullWorkspace = false; }, () => { d.local.fullWorkspace = true; }],
     ["P6 not ready", "p6-reset", () => { d.resetLifecycle = "recovering"; }, () => { d.resetLifecycle = "ready"; }],
     ["P7 stale matcher provenance", "p7-matcher", () => { d.matcherGitReposKey = "some/repo"; }, () => { d.matcherGitReposKey = ""; }],
     ["P7 manifest not observed under this matcher", "p7-matcher-observation",
-      () => { d.manifestMatcherGeneration -= 1; }, () => { d.manifestMatcherGeneration += 1; }],
+      () => { d.local.observedGeneration -= 1; }, () => { d.local.observedGeneration += 1; }],
     ["F5 kill switch", "kill-switch", () => { process.env.RBOX_PULL_TRUST_WATCHER = "0"; }, () => { delete process.env.RBOX_PULL_TRUST_WATCHER; }],
   ];
   for (const [label, skip, br0k, restore] of cases) {
@@ -239,7 +242,7 @@ test("design 202 P3: the pre-pull drain applies pending events into the view; a 
   const view = (await d.buildTrustedPullView(await d.loadSyncBase())).view!;
   expect(d.pendingEvents.length).toBe(0);
   expect(view.manifest.files.some((f) => f.path === "b.txt")).toBe(true); // drained INTO the view
-  expect(d.lastManifestUpdate).toEqual({ kind: "partial", source: "watch-events", paths: new Set(["b.txt"]) });
+  expect(d.local.update).toEqual({ kind: "partial", source: "watch-events", paths: new Set(["b.txt"]) });
 });
 
 // ── 12. trusted-pull log line ─────────────────────────────────────────────────
@@ -253,8 +256,8 @@ test("design 202: an armed daemon logs `pull local=trusted` and refreshes with t
   await d.pump();
 
   expect(pullLine()).toBe("pull local=trusted");
-  expect(d.lastManifestUpdate?.kind).toBe("partial");
-  expect((d.lastManifestUpdate as { source: string }).source).toBe("pull-applied");
+  expect(d.local.update?.kind).toBe("partial");
+  expect((d.local.update as { source: string }).source).toBe("pull-applied");
   expect(await fs.readFile(path.join(root, "n.txt"), "utf8")).toBe("new");
 });
 
@@ -322,14 +325,14 @@ test("design 202: a write-finish give-up records the path as unsettled until a c
   const d = await armed(remote);
 
   for (let i = 0; i < 16; i++) d.retryQueue.scheduleWriteFinish(new Set(["m.txt"])); // MAX_RETRIES = 15
-  expect(d.unsettledPaths.has("m.txt")).toBe(true);
+  expect(d.local.unsettled.has("m.txt")).toBe(true);
 
   const view = (await d.buildTrustedPullView(await d.loadSyncBase())).view!;
   expect(view.manifest.files.some((f) => f.path === "m.txt")).toBe(false); // stripped
   expect(view.deferred.has("m.txt")).toBe(true); // and exempted
 
   await d.localObserver.observe({ kind: "scan", cache: d.cache, previous: (await d.loadSyncBase()).lastSyncedManifest, mode: "unpruned" });
-  expect(d.unsettledPaths.has("m.txt")).toBe(false); // healed by the covering scan
+  expect(d.local.unsettled.has("m.txt")).toBe(false); // healed by the covering scan
 });
 
 // ── 7. post-pull patch correctness ────────────────────────────────────────────
@@ -353,12 +356,12 @@ test("design 202: the O(applied) patch reflects write/delete/conflict, and a con
   await d.pump();
   expect(pullLine()).toBe("pull local=trusted");
 
-  const byPath = new Map(d.manifest.files.map((f) => [f.path, f]));
+  const byPath = new Map(d.local.head.files.map((f) => [f.path, f]));
   expect(byPath.get("n.txt")?.sha256).toBe(shaHex("new"));       // write installed
   expect(byPath.has("d.txt")).toBe(false);                        // delete removed
   expect(byPath.get("c.txt")?.sha256).toBe(shaHex("remote-edit")); // conflict → remote entry
   const copy = (await fs.readdir(root)).find((n) => n.startsWith("c.") && n !== "c.txt")!;
-  expect(d.unsettledPaths.has(copy)).toBe(true);                  // copy is unsettled, not authored
+  expect(d.local.unsettled.has(copy)).toBe(true);                  // copy is unsettled, not authored
   expect(byPath.has(copy)).toBe(false);
 
   // The chained push publishes nothing spurious: no resurrection of d.txt, no stale
@@ -415,7 +418,7 @@ test("design 202 F2: a pull that changes the base gitRepos set falls back to the
   await d.pump();
 
   expect(pullLine()).toBe("pull local=trusted fallback=git-topology");
-  expect(d.lastManifestUpdate?.kind).toBe("full-workspace");
+  expect(d.local.update?.kind).toBe("full-workspace");
   expect(upserted).toContain("repo");
 });
 
@@ -431,8 +434,8 @@ test("design 202 F1: a watcher drop during the pull fails the P4 re-check and fo
   await d.pump();
 
   expect(pullLine()).toBe("pull local=trusted fallback=watcher-drop");
-  expect(d.lastManifestUpdate?.kind).toBe("full-workspace");
-  expect(d.manifest.files.some((f) => f.path === "n.txt")).toBe(true); // the scan healed it
+  expect(d.local.update?.kind).toBe("full-workspace");
+  expect(d.local.head.files.some((f) => f.path === "n.txt")).toBe(true); // the scan healed it
 });
 
 // ── 10. drift-audit accounting ────────────────────────────────────────────────
@@ -465,7 +468,7 @@ test("design 202 kill switch: RBOX_PULL_TRUST_WATCHER=0 restores the scan path e
   await d.pump();
 
   expect(pullLine()).toBe("pull local=scan skip=kill-switch");
-  expect(d.lastManifestUpdate?.kind).toBe("full-workspace");
+  expect(d.local.update?.kind).toBe("full-workspace");
   expect(await fs.readFile(path.join(root, "n.txt"), "utf8")).toBe("new");
 });
 
@@ -489,7 +492,7 @@ test.skipIf(!lazyGitProbesPresent)("design 202 + 203 both on: a steady-state pul
 
   expect(pullLine()).toBe("pull local=trusted");
   expect(await fs.readFile(path.join(root, "n.txt"), "utf8")).toBe("new");
-  expect(d.manifest.files.find((f) => f.path === "n.txt")?.sha256).toBe(shaHex("new"));
+  expect(d.local.head.files.find((f) => f.path === "n.txt")?.sha256).toBe(shaHex("new"));
   expect((await d.loadSyncBase()).lastSyncedSequence).toBe(remote.head);
 });
 
@@ -527,7 +530,7 @@ test("design 206 (#464): a git-topology pull falls back once, then the NEXT pull
   // base, and its install stamped that observation as current.
   const base = await d.loadSyncBase();
   expect(d.matcherGitReposKey).toBe(gitReposMatcherKey(base));
-  expect(d.manifestMatcherGeneration).toBe(d.matcherGeneration);
+  expect(d.local.observedGeneration).toBe(d.matcherGeneration);
 
   lines.length = 0;
   remote.injectCommit([await remote.seedEntry("a.txt", "one"), await remote.seedEntry("n.txt", "new"), await remote.seedEntry("s.txt", "second")]);
@@ -600,7 +603,7 @@ test("design 206: a rebuild landing mid-scan leaves the installed manifest stamp
   await d.localObserver.observe({ kind: "scan", cache, previous: base.lastSyncedManifest, mode: "unpruned" });
 
   expect(cache.fired).toBe(true);
-  expect(d.manifestMatcherGeneration).not.toBe(d.matcherGeneration);
+  expect(d.local.observedGeneration).not.toBe(d.matcherGeneration);
   expect((await d.buildTrustedPullView(base)).skip).toBe("p7-matcher-observation");
 });
 
@@ -725,7 +728,7 @@ test("design 206 §1: a hygiene-installed base with a changed key set is re-base
   await d.doDeepScan();
 
   expect(d.matcherGitReposKey).toBe(gitReposMatcherKey(d.syncBase!));
-  expect(d.manifestMatcherGeneration).toBe(d.matcherGeneration);
+  expect(d.local.observedGeneration).toBe(d.matcherGeneration);
   expect((await d.buildTrustedPullView(d.syncBase!)).view).toBeDefined();
 });
 
@@ -740,7 +743,7 @@ test("design 206: clone → publish → delete → publish realigns P7 at every 
     d.syncBase = withRepos(base, gitRepos);
     await d.doFullScan(); // the pump-owned observation boundary of that step
     expect(d.matcherGitReposKey).toBe(gitReposMatcherKey(d.syncBase!));
-    expect(d.manifestMatcherGeneration).toBe(d.matcherGeneration);
+    expect(d.local.observedGeneration).toBe(d.matcherGeneration);
     expect((await d.buildTrustedPullView(d.syncBase!)).view).toBeDefined();
   }
 });

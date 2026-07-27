@@ -49,7 +49,7 @@ interface DaemonInternals {
   want: { pull: boolean; push: boolean; fullScan: boolean; deepScan: boolean };
   pumpRun: Promise<void>;
   cache: HashCache;
-  manifest: Manifest;
+  local: { head: Manifest };
   activity: { ws?: { connected: boolean; caughtUp: boolean } };
   telemetry: TelemetryRecorder & { flush(signal?: AbortSignal): Promise<void> };
   armPongDeadline(ws: WebSocket): void;
@@ -163,7 +163,7 @@ async function makeDaemon(remote: MiniRemote = new MiniRemote(), opts: {
     ...opts,
   }) as unknown as DaemonInternals;
   daemon.cache = await HashCache.load(root);
-  daemon.manifest = await scanManifest(root);
+  daemon.local.head = await scanManifest(root);
   await daemon.loadSyncBase();
   daemons.push(daemon);
   return daemon;
@@ -662,7 +662,7 @@ test("a push-internal recovery pull is attributed to neither carrier", async () 
   remote.injectCommit([await remote.seedEntry("remote.txt", "remote")]);
   const daemon = await makeDaemon(remote);
   await fs.writeFile(path.join(root, "local.txt"), "local");
-  daemon.manifest = await scanManifest(root, undefined, daemon.cache);
+  daemon.local.head = await scanManifest(root, undefined, daemon.cache);
   daemon.want.push = true;
   await daemon.pump();
   expect(await fs.readFile(path.join(root, "remote.txt"), "utf8")).toBe("remote");
