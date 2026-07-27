@@ -194,18 +194,28 @@ describe("design 93 §6 complete caller disposition drift gate", () => {
   });
 
   test("daemon acquires before consuming want and revalidates stream+nonce", async () => {
-    const source = await fs.readFile(path.join(sourceRoot, "cli", "daemon", "daemon.ts"), "utf8");
-    const pumpLoop = source.indexOf("private async pumpLoop");
-    const acquire = source.indexOf("await this.acquireSyncMutexFn(this.root)", pumpLoop);
-    const resetBoundary = source.indexOf("await this.resetOperationBoundary(syncMutex)", acquire);
-    const revalidate = source.indexOf("await daemonBindingMatches", acquire);
-    const consume = source.indexOf("this.want[op] = false", acquire);
+    // The ordering spans the two owners since the scheduler took the loop: the
+    // scheduler acquires before it opens the boundary and only consumes the want
+    // afterwards; the daemon's boundary revalidates stream+nonce before returning.
+    const scheduler = await fs.readFile(path.join(sourceRoot, "cli", "daemon", "daemon-operation-scheduler.ts"), "utf8");
+    const serviceLoop = scheduler.indexOf("private async serviceLoop");
+    const acquire = scheduler.indexOf("await this.ports.acquireMutex(this.ports.root)", serviceLoop);
+    const boundary = scheduler.indexOf("await executor.openOperationBoundary(syncMutex)", acquire);
+    const consume = scheduler.indexOf("this.dequeue(op)", boundary);
     expect(acquire).toBeGreaterThan(0);
-    expect(resetBoundary).toBeGreaterThan(acquire);
-    expect(revalidate).toBeGreaterThan(acquire);
+    expect(boundary).toBeGreaterThan(acquire);
+    expect(consume).toBeGreaterThan(boundary);
+    expect(scheduler.indexOf("continue;", acquire)).toBeLessThan(boundary);
+
+    const source = await fs.readFile(path.join(sourceRoot, "cli", "daemon", "daemon.ts"), "utf8");
+    const openBoundary = source.indexOf("private async openOperationBoundary");
+    const resetBoundary = source.indexOf("await this.resetOperationBoundary(syncMutex)", openBoundary);
+    const revalidate = source.indexOf("await daemonBindingMatches", openBoundary);
+    const admits = source.indexOf("return true;", openBoundary);
+    expect(openBoundary).toBeGreaterThan(0);
+    expect(resetBoundary).toBeGreaterThan(openBoundary);
     expect(revalidate).toBeGreaterThan(resetBoundary);
-    expect(consume).toBeGreaterThan(revalidate);
-    expect(source.indexOf("continue;", acquire)).toBeLessThan(resetBoundary);
+    expect(admits).toBeGreaterThan(revalidate);
   });
 
   test("purge recomputes after confirmation under the mutex", async () => {

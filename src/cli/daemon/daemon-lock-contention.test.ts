@@ -4,7 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import { loadMetrics } from "../metrics.js";
 import type { DaemonMutexResult } from "../sync-mutex.js";
-import { lockStarvationPath, readLockStarvationEpisode, RboxDaemon } from "./daemon.js";
+import { lockStarvationPath, readLockStarvationEpisode } from "./daemon-operation-scheduler.js";
+import { RboxDaemon } from "./daemon.js";
 
 const KEY_A = "a".repeat(64);
 const KEY_B = "b".repeat(64);
@@ -53,41 +54,41 @@ afterEach(async () => {
 
 test("starvation episode warns eventually once and counts at most once", async () => {
   const d = daemon();
-  await d.observeLockContention(contention(KEY_A));
+  await d.scheduler.observeLockContention(contention(KEY_A));
   expect(await readLockStarvationEpisode(root)).toEqual({ holderKey: KEY_A, firstSeenAt: 0 });
 
   now = 15 * 60_000 - 1;
-  await d.observeLockContention(contention(KEY_A));
+  await d.scheduler.observeLockContention(contention(KEY_A));
   expect(lines).toHaveLength(0);
   expect((await loadMetrics(root)).lockStarved).toBe(0);
 
   now++;
-  await d.observeLockContention(contention(KEY_A));
+  await d.scheduler.observeLockContention(contention(KEY_A));
   expect(lines).toHaveLength(1);
   expect(lines[0]).toEndWith("lock starved: reason=foreign age=15m");
   expect((await loadMetrics(root)).lockStarved).toBe(1);
   expect(await readLockStarvationEpisode(root)).toMatchObject({ holderKey: KEY_A, warnedAt: now, countedAt: now });
 
   now += 24 * 60 * 60_000;
-  await d.observeLockContention(contention(KEY_A));
+  await d.scheduler.observeLockContention(contention(KEY_A));
   expect(lines).toHaveLength(1);
   expect((await loadMetrics(root)).lockStarved).toBe(1);
 });
 
 test("restart fences an already-counted episode and holder replacement starts a new one", async () => {
   const first = daemon();
-  await first.observeLockContention(contention(KEY_A, "identity-drift"));
+  await first.scheduler.observeLockContention(contention(KEY_A, "identity-drift"));
   now = 15 * 60_000;
-  await first.observeLockContention(contention(KEY_A, "identity-drift"));
+  await first.scheduler.observeLockContention(contention(KEY_A, "identity-drift"));
 
   const restarted = daemon();
   restarted.metrics = await loadMetrics(root);
-  restarted.lockStarvationEpisode = await readLockStarvationEpisode(root);
-  await restarted.observeLockContention(contention(KEY_A, "identity-drift"));
+  restarted.scheduler.lockStarvationEpisode = await readLockStarvationEpisode(root);
+  await restarted.scheduler.observeLockContention(contention(KEY_A, "identity-drift"));
   expect(restarted.metrics.lockStarved).toBe(1);
 
   now += 1;
-  await restarted.observeLockContention(contention(KEY_B, "fence"));
+  await restarted.scheduler.observeLockContention(contention(KEY_B, "fence"));
   expect(await readLockStarvationEpisode(root)).toEqual({ holderKey: KEY_B, firstSeenAt: now });
   expect(restarted.metrics.lockStarved).toBe(1);
 });
@@ -99,40 +100,40 @@ test("a persisted countedAt fence accepts a lost metric but never duplicates it"
   now = 16 * 60_000;
   const restarted = daemon();
   restarted.metrics = await loadMetrics(root);
-  restarted.lockStarvationEpisode = await readLockStarvationEpisode(root);
-  await restarted.observeLockContention(contention(KEY_A));
+  restarted.scheduler.lockStarvationEpisode = await readLockStarvationEpisode(root);
+  await restarted.scheduler.observeLockContention(contention(KEY_A));
   expect(restarted.metrics.lockStarved).toBe(0);
   expect((await loadMetrics(root)).lockStarved).toBe(0);
 });
 
 test("ordinary live contention and acquisition clear the private episode", async () => {
   const d = daemon();
-  await d.observeLockContention(contention(KEY_A));
+  await d.scheduler.observeLockContention(contention(KEY_A));
   expect(await fs.stat(lockStarvationPath(root)).then(() => true)).toBe(true);
-  await d.observeLockContention({ status: "contended", holderKey: KEY_A, blockerKind: "live" });
+  await d.scheduler.observeLockContention({ status: "contended", holderKey: KEY_A, blockerKind: "live" });
   expect(await fs.stat(lockStarvationPath(root)).then(() => true, () => false)).toBe(false);
 
-  await d.observeLockContention(contention(KEY_B));
-  await d.clearLockStarvationEpisode();
+  await d.scheduler.observeLockContention(contention(KEY_B));
+  await d.scheduler.clearLockStarvationEpisode();
   expect(await readLockStarvationEpisode(root)).toBeUndefined();
 });
 
 test("holder-aware tiers cap at 30s and reset on replacement", () => {
   const d = daemon();
-  const delays = Array.from({ length: 10 }, () => d.mutexDelay(KEY_A).delayMs);
+  const delays = Array.from({ length: 10 }, () => d.scheduler.mutexDelay(KEY_A).delayMs);
   expect(delays).toEqual([250, 500, 1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000]);
-  expect(d.mutexDelay(KEY_B)).toEqual({ delayMs: 250, shouldLog: true });
-  d.resetMutexBackoff();
-  expect(d.mutexDelay(KEY_A)).toEqual({ delayMs: 250, shouldLog: true });
+  expect(d.scheduler.mutexDelay(KEY_B)).toEqual({ delayMs: 250, shouldLog: true });
+  d.scheduler.resetMutexBackoff();
+  expect(d.scheduler.mutexDelay(KEY_A)).toEqual({ delayMs: 250, shouldLog: true });
 });
 
 test("capped wait is abortable and queued wakeups are rate limited", async () => {
   const d = daemon();
-  const parked = d.waitForMutexBackoff(30_000);
+  const parked = d.scheduler.waitForMutexBackoff(30_000);
   d.requestPush();
   await parked;
 
-  const rateLimited = d.waitForMutexBackoff(30_000);
+  const rateLimited = d.scheduler.waitForMutexBackoff(30_000);
   d.requestPush();
   let resolved = false;
   void rateLimited.then(() => { resolved = true; });
@@ -144,23 +145,23 @@ test("capped wait is abortable and queued wakeups are rate limited", async () =>
   await rateLimited;
   expect(resolved).toBe(true);
 
-  const shutdown = d.waitForMutexBackoff(30_000);
-  d.abortMutexBackoff();
+  const shutdown = d.scheduler.waitForMutexBackoff(30_000);
+  d.scheduler.abortMutexBackoff();
   await shutdown;
 });
 
 test("an older waiter cannot clear a newer backoff controller", async () => {
   const d = daemon();
-  const older = d.waitForMutexBackoff(30_000);
-  const olderController = d.mutexBackoffController as AbortController;
-  const newer = d.waitForMutexBackoff(30_000);
-  const newerController = d.mutexBackoffController as AbortController;
+  const older = d.scheduler.waitForMutexBackoff(30_000);
+  const olderController = d.scheduler.mutexBackoffController as AbortController;
+  const newer = d.scheduler.waitForMutexBackoff(30_000);
+  const newerController = d.scheduler.mutexBackoffController as AbortController;
 
   olderController.abort();
   await older;
-  expect(d.mutexBackoffController).toBe(newerController);
+  expect(d.scheduler.mutexBackoffController).toBe(newerController);
 
-  d.abortMutexBackoff();
+  d.scheduler.abortMutexBackoff();
   await newer;
-  expect(d.mutexBackoffController).toBeUndefined();
+  expect(d.scheduler.mutexBackoffController).toBeUndefined();
 });
