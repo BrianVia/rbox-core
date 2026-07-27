@@ -23,3 +23,10 @@ process.env.RBOX_AUTH_GRANT = "0";
 // test runner's ledger writable and process-local without changing HOME (many
 // fixtures exercise HOME/RBOX_HOME precedence explicitly).
 process.env.RBOX_TEST_HOST_IDENTITY_DIR = `/tmp/rbox-test-host-identity-${process.pid}`;
+// Flake registry: product-created repos appear mid-test, so repo config cannot
+// cover them; cleanGitEnv's process.env spread carries this to every git spawn.
+process.env.GIT_CONFIG_COUNT = "2";
+process.env.GIT_CONFIG_KEY_0 = "maintenance.auto";
+process.env.GIT_CONFIG_VALUE_0 = "false";
+process.env.GIT_CONFIG_KEY_1 = "gc.auto";
+process.env.GIT_CONFIG_VALUE_1 = "0";

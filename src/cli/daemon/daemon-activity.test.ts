@@ -811,7 +811,9 @@ test("pr8: production pull-only timers remint discovery and clear a ghost withou
 test("design 178 B: safety halt clears only when its own recovery predicate stops reproducing", async () => {
   const remote = new MiniRemote();
   remote.latestError = new MassDeleteGuardError("pull", "pull would delete 8603 of 8603 tracked files — refusing (mass-delete guard).");
-  const daemon = await makeDaemon(remote);
+  let now = TEST_NOW;
+  const clock = new ManualRecoveryClock();
+  const daemon = await makeDaemon(remote, "boot-test", { now: () => now, recoveryClock: clock });
 
   daemon.want.pull = true;
   await daemon.pump();
@@ -833,6 +835,7 @@ test("design 178 B: safety halt clears only when its own recovery predicate stop
   await daemon.activityWrite;
   expect((await loadActivity(root))?.halt?.reason).toContain("mass-delete guard");
 
+  now += 60_000;
   remote.latestError = undefined;
   daemon.recoveryDue = true;
   await daemon.pump();
@@ -844,6 +847,7 @@ test("design 178 B: safety halt clears only when its own recovery predicate stop
   // Regression guard: a NEW failure with the SAME message after a heal is a new
   // episode — it must persist a fresh halt (not silently count as dedup repeat 2..9
   // and leave activity.json healed).
+  now += 60_000;
   remote.latestError = new MassDeleteGuardError("pull", "pull would delete 8603 of 8603 tracked files — refusing (mass-delete guard).");
   daemon.want.pull = true;
   await daemon.pump();
