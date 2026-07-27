@@ -122,7 +122,9 @@ test("multi-workspace summary triggers zero maintenance: hygiene has one status 
   // An all-workspaces summary must not reach the writer by reusing the detail
   // path; a second status caller of either name fails this lock.
   expect(invokes.sort()).toEqual(["status-cmd.ts"]);
-  expect(wiresHygiene.sort()).toEqual(["daemon/daemon.ts", "status-cmd.ts", "sync-git.ts"]);
+  // status-read-port.ts only declares/defaults the injectable hygiene dep;
+  // status-cmd.ts remains the sole status invoker asserted above.
+  expect(wiresHygiene.sort()).toEqual(["daemon/daemon.ts", "status-cmd.ts", "status-read-port.ts", "sync-git.ts"]);
 });
 
 test("composition-root cache effect: cache-ownership loss skips writeback", async () => {
