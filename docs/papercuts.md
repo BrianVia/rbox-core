@@ -345,3 +345,8 @@ behind-origin count; loudly warn when behind.
   episode/day with a counter, like the watcher-error dedupe does. The repo
   itself is the known 20h "needs attention" deferral, surfaced correctly by
   `rbox status --git`.
+- **`rbox status` outside a workspace is a dead end** (founder, 2026-07-27):
+  it errors "Not inside an rbox workspace" instead of showing a cumulative
+  all-workspaces summary from the machine's daemon records. Filed as #498.
+  Process note attached to the same ask: founder wants GitHub issues to
+  become the public todo list for feature asks like this.
