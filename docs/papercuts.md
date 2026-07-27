@@ -350,3 +350,13 @@ behind-origin count; loudly warn when behind.
   all-workspaces summary from the machine's daemon records. Filed as #498.
   Process note attached to the same ask: founder wants GitHub issues to
   become the public todo list for feature asks like this.
+
+- **A shipped design still headed "DRAFT" produced a false strategic finding
+  (2026-07-27):** design 204 shipped 7/26 evening (PR #458, field-validated,
+  STATUS addendum written) but its doc header still said DRAFT r3 — a
+  corpus-wide review the next morning reported the 40x publish win as
+  "built but dark, nobody flipped it," and two redundant work streams
+  (a re-implementation dispatch + a fleet env-flag rollout) launched off
+  that misread before the merged code was checked. Rules: flip the doc's
+  Status header in the SHIP commit itself; any "X never shipped" claim
+  must be verified against git (`git log -S <flag>`) before acting on it.

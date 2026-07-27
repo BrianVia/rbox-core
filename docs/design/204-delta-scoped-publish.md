@@ -1,6 +1,6 @@
 # Design 204 — Delta-scoped publish wire
 
-**Status:** DRAFT r3 (round-1 wave + serial gate folded — see `REVIEW-204.md`)
+**Status:** SHIPPED — ALIGNED r3, merged as PR #458 (squash 514d6899, 2026-07-26); field results in `docs/STATUS.md` (missing 4.1s→0.1s, commit 4.4s/12.5MB→2.7s/614B, Mac publish 15.6→11.3s)
 **Target:** v1.10.0 (rides the same release as designs 202+203; same burn-in)
 **Kill switches:** `RBOX_PREFLIGHT_DELTA=0`, `RBOX_MDE_DELTA=0`,
 `RBOX_MDE_SNAPSHOT=0` (master), `RBOX_MDE_FAST_PULL=0`, `RBOX_GIT_PLAN_LAZY=0`
