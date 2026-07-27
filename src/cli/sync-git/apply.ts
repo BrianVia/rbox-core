@@ -14,6 +14,7 @@ import { executeRemoteRepositoryDeletion, planRemoteRepositoryDeletion, sweepRem
 import { configReceiver } from "./config-lane.js";
 import { ConfigLaneLedger, applyReceivedGitConfig, classifyIncomingConfigSanitation, planReceivedGitConfigApply, planReceivedGitConfigBaseline, planReceivedGitConfigTarget, type GitConfigExecutor, type ReceivedGitConfigIdentity, type ReceivedGitConfigPlan } from "./received-git-config.js";
 import { prepareFollowerBranchProtocol } from "./follower-protocol.js";
+import { settleStandingBranchProof, type StandingProofPort, type StandingRepairAttempt } from "./standing-branch-proof.js";
 import { executeCleanMaterialization, planCleanMaterialization, type CleanMaterializationEffects } from "./clean-materialization.js";
 import { createPRepairStatePort } from "./p-repair-state.js";
 import { settleExactPresentArtifact } from "./p-settlement.js";
@@ -1016,127 +1017,75 @@ opts: {
       };
 
       const binding = await checkoutJournalBinding(state.stream, expectedStateNonce(state), ctx);
-      let protocolResult = await prepareFollowerBranchProtocol({
+      const preparedProtocol = await prepareFollowerBranchProtocol({
         workspaceRoot: root, relPath: rel, state, ctx, record: records[rel], base: baseSec,
         incoming: remoteSec, liveRefs: await readAllRefs(repoDir),
         ...(d2RejectedRefs.size ? { d2RejectedRefs } : {}),
       });
-      if (protocolResult.status === "hold") {
-        await defer(protocolResult.reason, "artifact");
+      if (preparedProtocol.status === "hold") {
+        await defer(preparedProtocol.reason, "artifact");
         clearAttempt(rel);
         return { result: "deferred", commonDirGroup };
       }
       const standingPInvalidatedAttempt = Object.keys(records[rel]?.partial?.pRepaired ?? {}).length > 0
-        || protocolResult.protocol.presentArtifacts.length > 0;
+        || preparedProtocol.protocol.presentArtifacts.length > 0;
       if (standingPInvalidatedAttempt) clearAttempt(rel);
-      for (const [ref, receipt] of Object.entries(records[rel]?.partial?.pRepaired ?? {})) {
-        const inspected = await inspectLockedPRepairReceipt(repoDir, receipt);
-        if (inspected.action === "compact-and-restart") {
+      const repairStatePort = (attempt: StandingRepairAttempt) => createPRepairStatePort({
+        root, stream: attempt.stream, relPath: rel, repoKind: ctx.kind,
+        effectiveRefScope: attempt.effectiveRefScope, p: attempt.p,
+      });
+      const standingProofEffects: StandingProofPort = {
+        now: () => new Date().toISOString(),
+        inspectTerminalReceipt: (receipt) => inspectLockedPRepairReceipt(repoDir, receipt),
+        compactTerminalReceipt: async ({ receipt, stream, effectiveRefScope }) => {
           const payload = receipt.q.value.p.payload;
           const port = createPRepairStatePort({
-            root, stream: state.stream, relPath: rel, repoKind: ctx.kind,
-            effectiveRefScope: baseSec?.refScope ?? remoteSec.refScope,
+            root, stream, relPath: rel, repoKind: ctx.kind, effectiveRefScope,
             p: { ref: receipt.p.ref, targetOid: receipt.p.targetOid, payload: {
               v: 2, lineageHash: receipt.lineageHash, repositoryIdentityHash: receipt.repositoryIdentityHash,
               ref: receipt.ref, episode: receipt.episode, priorOid: payload.priorOid, nextOid: payload.nextOid,
             }, payloadBytes: Buffer.alloc(0) },
           });
           const snapshot = await port.read();
-          if (await persistPRepairTerminal(port, "compact", snapshot, receipt) !== "accepted") {
-            await defer(`P-repair terminal receipt CAS rejected for ${ref}`, "artifact");
-            return { result: "deferred", commonDirGroup };
-          }
-          const refreshed = await loadRawState(root);
-          if (!refreshed) {
-            await defer("P-repair terminal state reload failed", "artifact");
-            return { result: "deferred", commonDirGroup };
-          }
-          state = refreshed;
-          const refreshedRecord = repoRecordsForState(state)[rel];
-          if (refreshedRecord) installRecoveredRecord(rel, refreshedRecord);
-          baseSec = baseRepos[rel];
-        } else if (inspected.action === "corruption-hold" || inspected.action === "artifact-contradiction-hold") {
-          await defer(`P-repair terminal inspection refused ${ref}: ${inspected.action}`, "artifact");
-          return { result: "deferred", commonDirGroup };
-        }
-      }
-      // A standing P makes serialized positive BASE unavailable until exact
-      // settlement or bounded repair completes. Every successful row mandates a
-      // full re-plan with fresh state, artifacts, attestations, and snapshots.
-      for (let pass = 0; protocolResult.protocol.presentArtifacts.length > 0 && pass < 8; pass++) {
-        const p = protocolResult.protocol.presentArtifacts[0]!;
-        const exact = await settleExactPresentArtifact({
-          root, stream: state.stream, state, relPath: rel, ctx,
-          binding: protocolResult.protocol.binding, p, mutationBoundary: opts.mutationBoundary,
-        });
-        if (exact.status === "hold") {
-          await defer(exact.reason, "artifact");
-          return { result: "deferred", commonDirGroup };
-        }
-        if (exact.status === "moved") {
-          const port = createPRepairStatePort({
-            root, stream: state.stream, relPath: rel, repoKind: ctx.kind,
-            effectiveRefScope: baseSec?.refScope ?? remoteSec.refScope, p,
-          });
-          const disposition = protocolResult.protocol.artifacts[p.payload.ref];
-          const validateArtifacts = async (): Promise<boolean> => {
-            const fresh = await readBasePresentArtifact(repoDir, protocolResult.status === "ready"
-              ? protocolResult.protocol.binding : p.payload, p.payload.ref);
-            return fresh.status === "valid" && fresh.artifact.targetOid === p.targetOid
-              && disposition?.present === "valid-owning" && disposition.keeps === "exact"
-              && disposition.absence === "absent" && disposition.settledAbsence === "absent";
-          };
-          const accepted = records[rel]?.partial?.pRepaired?.[p.payload.ref];
-          let repaired;
-          if (accepted) {
-            const resumed = await resumeLockedAcceptedPRepair({ repoDir, receipt: accepted, validateArtifacts });
-            repaired = resumed.status === "refresh-receipt"
-              ? await refreshLockedAcceptedPRepair({
-                  repoDir, p, state: port, repairAt: new Date().toISOString(), acceptedReceipt: accepted,
-                  mismatches: { live: exact.reason === "live", reflog: exact.reason === "reflog", baseShape: exact.reason === "base-shape" },
-                  validateArtifacts,
-                })
-              : resumed.status === "restart"
-                ? { status: "restart" as const }
-                : { status: "hold" as const, reason: resumed.reason };
-          } else {
-            repaired = await runLockedPRepairAttempt({
-              repoDir, p, state: port, repairAt: new Date().toISOString(),
-              mismatches: { live: exact.reason === "live", reflog: exact.reason === "reflog", baseShape: exact.reason === "base-shape" },
-              validateArtifacts,
-            });
-          }
-          if (repaired.status === "hold") {
-            await defer(repaired.reason, "artifact");
-            return { result: "deferred", commonDirGroup };
-          }
-          if (repaired.status === "retry") continue;
-          const refreshed = await loadRawState(root);
-          if (!refreshed) {
-            await defer("P-repair state reload failed", "artifact");
-            return { result: "deferred", commonDirGroup };
-          }
-          state = refreshed;
-        } else if (exact.status === "settled") {
-          state = exact.state;
-        } else break;
-        const refreshedRecord = repoRecordsForState(state)[rel];
-        if (refreshedRecord) installRecoveredRecord(rel, refreshedRecord);
-        baseSec = baseRepos[rel];
-        protocolResult = await prepareFollowerBranchProtocol({
-          workspaceRoot: root, relPath: rel, state, ctx, record: records[rel], base: baseSec,
+          return persistPRepairTerminal(port, "compact", snapshot, receipt);
+        },
+        settleExactArtifact: (settle) => settleExactPresentArtifact({
+          root, stream: settle.state.stream, state: settle.state, relPath: rel, ctx,
+          binding: settle.binding, p: settle.p, mutationBoundary: opts.mutationBoundary,
+        }),
+        resumeAcceptedRepair: ({ receipt, validateArtifacts }) =>
+          resumeLockedAcceptedPRepair({ repoDir, receipt, validateArtifacts }),
+        refreshAcceptedRepair: (attempt) => refreshLockedAcceptedPRepair({
+          repoDir, p: attempt.p, state: repairStatePort(attempt), repairAt: attempt.repairAt,
+          acceptedReceipt: attempt.acceptedReceipt, mismatches: attempt.mismatches,
+          validateArtifacts: attempt.validateArtifacts,
+        }),
+        runRepairAttempt: (attempt) => runLockedPRepairAttempt({
+          repoDir, p: attempt.p, state: repairStatePort(attempt), repairAt: attempt.repairAt,
+          mismatches: attempt.mismatches, validateArtifacts: attempt.validateArtifacts,
+        }),
+        readStandingArtifact: (artifact, ref) => readBasePresentArtifact(repoDir, artifact, ref),
+        reloadState: () => loadRawState(root),
+        refreshProtocol: async (source) => prepareFollowerBranchProtocol({
+          workspaceRoot: root, relPath: rel, state: source.state, ctx, record: source.record, base: source.base,
           incoming: remoteSec, liveRefs: await readAllRefs(repoDir),
           ...(d2RejectedRefs.size ? { d2RejectedRefs } : {}),
-        });
-        if (protocolResult.status === "hold") {
-          await defer(protocolResult.reason, "artifact");
-          return { result: "deferred", commonDirGroup };
-        }
-      }
-      if (protocolResult.protocol.presentArtifacts.length > 0) {
-        await defer("P settlement did not stabilize", "artifact");
+        }),
+      };
+      const settlement = await settleStandingBranchProof({
+        identity: { relPath: rel, incomingKey: incomingKey! },
+        state, record: records[rel], serializedBase: baseSec, incomingRefScope: remoteSec.refScope,
+        protocol: preparedProtocol.protocol, retryBudget: 8,
+      }, standingProofEffects);
+      state = settlement.carry.state;
+      if (settlement.carry.recoveredRecord) installRecoveredRecord(rel, settlement.carry.recoveredRecord);
+      baseSec = baseRepos[rel];
+      if (settlement.kind !== "settled") {
+        const refusal = settlement.kind === "held" ? settlement.hold : settlement.lastProof;
+        await defer(refusal.reason, refusal.deferralReason);
         return { result: "deferred", commonDirGroup };
       }
+      const settledProtocol = settlement.protocol;
       await opts.afterHeldSkipPrepass?.(rel);
       const heldNowMs = opts.heldNow?.();
       const effectivePartial = currentPartial(rel);
@@ -1233,8 +1182,8 @@ opts: {
         return {
           authority: {
             kind: "pull-ref-transaction",
-            lineageHash: protocolResult.protocol.lineageHash,
-            repositoryIdentityHash: protocolResult.protocol.repositoryIdentityHash,
+            lineageHash: settledProtocol.lineageHash,
+            repositoryIdentityHash: settledProtocol.repositoryIdentityHash,
             incomingKey: incomingKey!,
             branchWitnesses: progress.branchWitnesses ?? {},
             safeRefWitnesses: progress.safeRefWitnesses ?? {},
@@ -1310,7 +1259,7 @@ opts: {
           ? { ...records[rel], idxProj: idxProj[rel]! }
           : records[rel],
         binding,
-        branchProtocol: protocolResult.protocol,
+        branchProtocol: settledProtocol,
         followEnabled: gitFollowEnabled(),
         runConfig: runFollowConfig,
         makeIntended: intendedFor,
@@ -1377,7 +1326,7 @@ opts: {
         // a crash-reconstructed owning A: it must consume its stale BASE member
         // once so the §126 veto does not recur forever. Narrow the proof to those
         // absences; do not accidentally publish unrelated pre-checkout progress.
-        const reconstructed = [...protocolResult.protocol.unmaterializedAbsenceRefs]
+        const reconstructed = [...settledProtocol.unmaterializedAbsenceRefs]
           .filter((ref) => follow.appliedRefs[ref]?.kind === "absent"
             && follow.branchWitnesses?.[ref]?.kind === "absent"
             && follow.branchLockedProofs?.[ref] !== undefined);
