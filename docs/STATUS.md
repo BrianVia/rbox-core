@@ -41,10 +41,14 @@ now the MAIN bun on all three hosts** (`bun upgrade --canary`; desktop +
 Mac + FM all 1.4.0-canary) — future dev builds are canary-compiled; revert
 per-host with `bun upgrade --stable` (1.3.14) if a canary regression bites.
 Daemons were NOT rebuilt/restarted for this — they pick up canary-compiled
-binaries at the next normal fleet build. CI/release/deploy-api workflows
-repinned `bun-version: "1.3.14"` → `"canary"` (all 11 sites) — NOTE this
-makes CI and any future tagged release build on a MOVING nightly; if a
-canary regression lands upstream, repin the workflows first._
+binaries at the next normal fleet build. CI/deploy-api workflows run
+`bun-version: "canary"` EXCEPT the cross-compile legs: the first canary main
+run proved **canary publishes NO cross-target compile blobs** ("Target
+platform 'bun-darwin-aarch64-v1.4.0' is not available for download"), so
+ci.yml's cross-build job + all three release.yml pins stay `"1.3.14"`
+(inline-commented). A separate transient workerd tarball-extract failure on
+attempt 1 was NOT reproducible locally or on rerun. Native per-target
+compiled-TUI matrix jobs are fine on canary._
 
 _Day-session riders (2026-07-27 morning): **#497 killed the three registered
 CI flakes** — root causes proven from CI attempt-1 logs (pull failed
