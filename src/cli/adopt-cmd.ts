@@ -16,6 +16,7 @@ import {
   loadAdoptJournal,
   type AdoptJournal,
 } from "./adopt-journal.js";
+import { rememberBinding } from "./binding-registry.js";
 import { emitJson } from "./json.js";
 import { confirmDestructive } from "./prompt.js";
 import { acquireWorkspaceSyncMutexForAdopt, releaseWorkspaceSyncMutex } from "./sync-mutex.js";
@@ -109,6 +110,11 @@ async function ensureJournalConfig(journal: AdoptJournal): Promise<void> {
     ...(journal.workspace.name ? { name: journal.workspace.name } : {}),
   };
   await saveConfig(journal.workspace.root, cfg);
+  // Design 211: a restored binding is a binding — record it like track/init do.
+  await rememberBinding(journal.workspace.root, {
+    remoteWorkspaceId: cfg.remoteWorkspaceId,
+    ...(cfg.name ? { name: cfg.name } : {}),
+  });
 }
 
 async function resume(root: string, journal: AdoptJournal): Promise<AdoptJournal> {
