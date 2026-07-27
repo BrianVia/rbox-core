@@ -46,7 +46,12 @@ binaries at the next normal fleet build. CI/deploy-api workflows run
 run proved **canary publishes NO cross-target compile blobs** ("Target
 platform 'bun-darwin-aarch64-v1.4.0' is not available for download"), so
 ci.yml's cross-build job + all three release.yml pins stay `"1.3.14"`
-(inline-commented). A separate transient workerd tarball-extract failure on
+(inline-commented). The startup/size budget job is ALSO pinned stable —
+budgets measure the SHIPPED binary and releases build on stable. WATCH-ITEM
+for 1.4-goes-stable: canary-compiled `status-json` RSS is 48.6MB vs the
+42.55MB budget (+14% runtime baseline) — when repinning to a stable 1.4,
+either bun has slimmed down or the budgets need a founder-approved
+re-baseline. A separate transient workerd tarball-extract failure on
 attempt 1 was NOT reproducible locally or on rerun. Native per-target
 compiled-TUI matrix jobs are fine on canary._
 
