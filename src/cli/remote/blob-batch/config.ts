@@ -69,7 +69,12 @@ export function packUploadEnabled(): boolean {
 export function packUploadConfig(): PackConfig {
   return {
     enabled: packUploadEnabled(),
-    streams: envInt("RBOX_PACK_STREAMS", 4, 1, 64),
+    // 16 streams, field-measured knee (2026-07-27 dev sweep, issue #504): the pack
+    // lane is request-latency-bound (~0.7s per PUT settle), so 4 streams serialized
+    // packs and lost to the 24-slot batch lane; at 16 the same corpus lands 0.88x
+    // of batch wall with the full request-count win. Link-dependent tuning stays
+    // available via RBOX_PACK_STREAMS.
+    streams: envInt("RBOX_PACK_STREAMS", 16, 1, 64),
     cutoffBytes: envInt("RBOX_PACK_CUTOFF_BYTES", PACK_MAX_MEMBER_BYTES, 1, PACK_MAX_MEMBER_BYTES),
     targetPayloadBytes: envInt("RBOX_PACK_TARGET_BYTES", PACK_TARGET_PAYLOAD_BYTES, 64 * 1024, PACK_TARGET_PAYLOAD_BYTES),
     minActivationCount: envInt("RBOX_PACK_MIN_BLOBS", PACK_MIN_ACTIVATION_COUNT, 1, PACK_MAX_MEMBERS),
