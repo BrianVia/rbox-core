@@ -1,10 +1,12 @@
 /**
  * The barrier-era publication seam for `.rbox/state.json` (design 163, unit B0).
  *
- * Every whole-document publication goes through here so the two obligations the
- * barrier adds — check the format immediately before the rename, record the
- * last-writer witness immediately after it — cannot be satisfied in one writer
- * and forgotten in the next. The pinning inventory test enumerates the callers.
+ * This is where the two obligations the barrier adds — check the format
+ * immediately before the rename, record the last-writer witness immediately
+ * after it — are written once instead of per writer. The two transactional CAS
+ * writers still publish inline, because a lost lease is a typed *result* for
+ * them rather than a throw; the pinning inventory test is what holds every
+ * writer, inline or not, to both obligations.
  */
 import path from "node:path";
 import { fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
