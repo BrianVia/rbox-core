@@ -66,10 +66,15 @@ export function validateScopePrefixes(raw: readonly string[]): ScopeValidation {
  */
 export function scopeSplitsRepo(prefixes: readonly string[], repoKeys: Iterable<string>): { prefix: string; repo: string } | undefined {
   for (const repo of repoKeys) {
-    const key = repo === "." ? "" : repo;
-    if (key === "") continue;
+    // A repository AT the workspace root contains every possible prefix, so any
+    // scope at all would cut it in half.
+    if (repo === "." || repo === "") {
+      const prefix = prefixes[0];
+      if (prefix !== undefined) return { prefix, repo: "the whole workspace" };
+      continue;
+    }
     for (const prefix of prefixes) {
-      if (containsPrefix(key, prefix)) return { prefix, repo: key };
+      if (containsPrefix(repo, prefix)) return { prefix, repo };
     }
   }
   return undefined;

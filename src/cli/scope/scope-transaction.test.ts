@@ -6,7 +6,8 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { loadConfig, saveConfig, type WorkspaceConfig } from "../workspace-config.js";
+import { loadConfig, saveConfig, syncStreamId, type WorkspaceConfig } from "../workspace-config.js";
+import { loadState, saveState } from "../sync-state-store.js";
 import { planScopeIntent, resumeScopeIntent, runScopeTransition, type ScopeTransactionDeps } from "./scope-transaction.js";
 
 let home: string;
@@ -38,6 +39,19 @@ const base = (scope?: string[]): WorkspaceConfig => ({
   token: "",
   ...(scope ? { scope, scopeGeneration: 1 } : {}),
 });
+
+/** A durable base manifest naming `paths`, as a completed pull would leave. */
+async function seedBase(paths: string[]): Promise<void> {
+  const cfg = await loadConfig(root);
+  await saveState(root, {
+    stream: syncStreamId(cfg),
+    lastSyncedSequence: 1,
+    lastSyncedManifest: {
+      generatedAt: "2026-07-28T00:00:00Z",
+      files: paths.map((path) => ({ path, type: "file", size: 1, mtimeMs: 0, sha256: "a" })),
+    },
+  } as never);
+}
 
 function spies(): { deps: ScopeTransactionDeps; order: string[]; witness: Array<string[] | undefined> } {
   const order: string[] = [];
@@ -117,6 +131,27 @@ test("a crash before the witness write leaves the record scoped, and the witness
   expect((await loadConfig(root)).scope).toEqual(["Work/repo-B"]);
   await runScopeTransition(root, ["Work/repo-B"], deps);
   expect(witness).toEqual([["Work/repo-B"]]);
+});
+
+test("adding a folder forgets what this machine last saw of it, so it materializes", async () => {
+  // The hazard: a narrowed pull repopulates the full remote base as bookkeeping
+  // carry. Re-adding a folder whose base already equals remote, with nothing on
+  // disk, reconciles to "deleted here" and would leave it permanently empty.
+  await saveConfig(root, base(["Personal/repo-A"]));
+  await seedBase(["Personal/repo-A/a.txt", "Work/repo-B/b.txt"]);
+  const { deps } = spies();
+  await runScopeTransition(root, ["Personal/repo-A", "Work/repo-B"], deps);
+  const after = await loadState(root, syncStreamId(await loadConfig(root)));
+  expect(after.lastSyncedManifest.files.map((f) => f.path)).toEqual(["Personal/repo-A/a.txt"]);
+});
+
+test("removing a folder also forgets it, so nothing reads as a local deletion", async () => {
+  await saveConfig(root, base(["Personal/repo-A", "Work/repo-B"]));
+  await seedBase(["Personal/repo-A/a.txt", "Work/repo-B/b.txt"]);
+  const { deps } = spies();
+  await runScopeTransition(root, ["Personal/repo-A"], deps);
+  const after = await loadState(root, syncStreamId(await loadConfig(root)));
+  expect(after.lastSyncedManifest.files.map((f) => f.path)).toEqual(["Personal/repo-A/a.txt"]);
 });
 
 test("a daemon that was not running is not started by a scope edit", async () => {

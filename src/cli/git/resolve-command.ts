@@ -65,6 +65,7 @@ import { createPRepairStatePort, createPRepairStatePortFromReceipt } from "../sy
 import { hasGitResolutionIncoming, sanitizeTerminalText } from "../status-view.js";
 import { preliminaryResolutionReport, resolutionBindingIdentity, type ResolutionDiscardReport } from "../sync-git/resolution-intent.js";
 import { printShow, printDiscardReport, keepMineConfirmCommand, safeResolveOutput, refusalMessage, type GitResolveShow } from "./resolve-presentation.js";
+import { assertCommandAllowedOnScopedBinding, ScopedBindingRefusal, type ScopeHaltCondition } from "../scope/binding-scope.js";
 
 type GitResolveVerb = "show-me" | "take-theirs" | "keep-mine";
 
@@ -122,6 +123,9 @@ interface ResolveSnapshot {
 
 export type ResolveRefusalCode =
   | "sync-busy" | "proof-indeterminate" | "journal-recovery" | "no-incoming" | "mutex-degraded" | "operation-failed"
+  /** Design 212: this binding syncs part of the workspace, or its scope witnesses
+   *  disagree. Either way keep-mine cannot publish from here. */
+  | ScopeHaltCondition
   | GitDeferralReason;
 
 type ResolveOutput =
@@ -535,6 +539,18 @@ export async function gitResolveCmd(
   }
   const now = deps.now ?? (() => new Date());
   const confirmedKeepMine = verb === "keep-mine" && options.confirm !== undefined;
+  if (verb === "keep-mine") {
+    // Design 212 §3.1b layer 2: keep-mine publishes. Refuse before the remote,
+    // state, repository, config, journal, and scan work below, and keep the named
+    // condition rather than letting it collapse into a generic failure at the end.
+    try {
+      await assertCommandAllowedOnScopedBinding(root, "resolve");
+    } catch (error) {
+      if (!(error instanceof ScopedBindingRefusal)) throw error;
+      emit({ status: "refused", verb, repo: rel, code: error.condition, message: error.message }, json, deps, root);
+      return 1;
+    }
+  }
   const mutexOptions: SyncMutexOptions | undefined = confirmedKeepMine
     ? {
         ...deps.mutexOptions,

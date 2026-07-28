@@ -109,10 +109,23 @@ test("witnesses that name DIFFERENT folders disagree", async () => {
   expect(await resolveBindingScope(root)).toMatchObject({ kind: "halted", condition: "scope-witness-disagreement" });
 });
 
-test("a witness row from a PREVIOUS binding incarnation cannot halt a rebound root", async () => {
+test("scope evidence from ANY row halts an unscoped record — a rebind clears it authoritatively", async () => {
+  // A genuine rebind rewrites the row through `recordBindingScope`, which drops the
+  // scope with it. A surviving scope-bearing row therefore means the binding record
+  // changed outside rbox, whichever workspace the row names.
   await writeRecord({});
   await writeWitness(["Personal/repo-A"], "ws_previous");
-  expect(await resolveBindingScope(root)).toEqual({ kind: "unscoped" });
+  expect(await resolveBindingScope(root)).toMatchObject({ kind: "halted", condition: "scope-witness-disagreement" });
+});
+
+test("a witness whose scope field is present but unreadable is damage, not absence", async () => {
+  await writeRecord({});
+  await fs.mkdir(path.join(home, ".rbox"), { recursive: true });
+  await fs.writeFile(path.join(home, ".rbox", "workspaces.json"), JSON.stringify({
+    schemaVersion: 1,
+    entries: [{ root, workspaceId: WORKSPACE_ID, boundAt: "x", lastSeenAt: "x", scope: "Personal/repo-A" }],
+  }));
+  expect(await resolveBindingScope(root)).toMatchObject({ kind: "halted", condition: "scope-witness-disagreement" });
 });
 
 test("a halted binding refuses reads too, not just publication", async () => {

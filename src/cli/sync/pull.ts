@@ -28,9 +28,8 @@ import {
 } from "../sync-git.js";
 import { carryRepoBaseProof, recordOriginLineage } from "../sync-git/base-composer.js";
 import { gitIncomingKey } from "../sync-git/shared.js";
-import { assertBindingUsable, resolveBindingScope } from "../scope/binding-scope.js";
-import { composeScopedBase, ScopeProjection } from "../scope/projection.js";
-import { applyRuleFileAuthority, saveScopeFindings } from "../scope/rule-authority.js";
+import { applyScopedRuleAuthority, prepareScopedPull } from "../scope/pull-scope.js";
+import { saveScopeFindings } from "../scope/rule-authority.js";
 import { assertSyncMutex, workspaceSyncMutexDegraded } from "../sync-mutex.js";
 import { inputRecord, observedRepoKeys, orderedRepoDeferralUpdates, saveStateSource } from "../sync-state.js";
 import { type SyncDeps, withReportScanStats, withCache, withDircache } from "./deps.js";
@@ -297,41 +296,17 @@ export async function applyPulledManifest(
   // Filtering everything through the PRE-pull matcher would drop a file a relaxed
   // rule just un-ignored — it would never land locally, and the follow-up push
   // would commit its deletion back to the remote (a data-loss echo).
-  // Design 212 §3.2: remote git topology is classified IN / STRADDLE / OOS BEFORE
-  // file reconcile, blob fetch, or apply. Discovering a boundary-crossing repo
-  // during git apply would be too late — its working files would already have moved
-  // while its git state did not.
-  const seal = await resolveBindingScope(root, cfg);
-  assertBindingUsable(seal);
-  const projection = seal.kind === "scoped"
-    ? new ScopeProjection(seal.prefixes, [
-        ...Object.keys(remote.gitRepos ?? {}),
-        ...Object.keys(state.lastSyncedManifest.gitRepos ?? {}),
-        ...Object.keys(state.gitPendingRemote ?? {}),
-      ])
-    : undefined;
-  const scopedBase = projection ? projection.projectFiles(state.lastSyncedManifest) : state.lastSyncedManifest;
-  const scopedLocal = projection ? projection.projectFiles(local) : local;
-  const scopedRemote = projection ? projection.projectFiles(remote) : remote;
-
-  let all = reconcile(scopedBase, scopedLocal, scopedRemote, cfg.deviceId, new Date().toISOString());
-  let ruleFileDivergence: string[] = [];
-  if (projection) {
-    // Remote is authoritative for the ignore-rule files a scoped binding carries as
-    // metadata: with no publish to reconcile it, a local edit there would silently
-    // suppress scoped updates forever while status kept reporting CLEAN.
-    const authority = applyRuleFileAuthority(all, projection, scopedBase, scopedLocal, scopedRemote);
-    all = authority.actions;
-    ruleFileDivergence = authority.diverged;
-  }
-  // A repo that crosses the scope boundary keeps its PRIOR file BASE: advancing it
-  // to a tree we deliberately did not write would make the retained local copy read
-  // as "local ahead" forever, and no later pull would ever converge it. The delta
-  // fold base is derived from the stored manifest, so a quarantined base must not
-  // also claim to describe the remote commit — omit the meta and take the cold walk
-  // until the boundary is resolved.
-  const scopedGlobal = projection ? composeScopedBase(state.lastSyncedManifest, remote, projection) : remote;
-  const scopedObserved = (keys: string[]): string[] => projection ? projection.probeKeys(keys) : keys;
+  // Design 212 §3.2: the remote git topology is classified IN / STRADDLE / OOS and
+  // every manifest is projected onto this binding's folders BEFORE reconcile, blob
+  // fetch, or apply. On an unscoped binding this returns the same manifests.
+  const scoped = await prepareScopedPull(root, state, local, remote);
+  const authority = applyScopedRuleAuthority(
+    reconcile(scoped.reconcileBase, scoped.local, scoped.remote, cfg.deviceId, new Date().toISOString()),
+    scoped,
+  );
+  const all = authority.actions;
+  const ruleFileDivergence = authority.diverged;
+  const projection = scoped.projection;
 
   // Mass-delete guard (design 44): refuse to apply a delete wave that wipes ≥half the
   // baseline. Checked BEFORE any action touches disk — the whole pull fails closed,
@@ -340,7 +315,7 @@ export async function applyPulledManifest(
   // Scope-sized denominator (design 212 §3.2): the guard must compare against what
   // THIS binding holds, in both the scan-backed and the trusted-view arm, or a
   // scoped binding's ordinary cleanup never trips it and a real wipe hides.
-  const baseFiles = scopedBase.files.length;
+  const baseFiles = scoped.reconcileBase.files.length;
   if (!deps.allowMassDelete && plannedDeletes >= MASS_DELETE_MIN_FILES && plannedDeletes * 2 >= baseFiles) {
     // Design 202: an INCOMPLETE trusted view inflates planned deletes, and the daemon
     // never sets `allowMassDelete` — a false positive there would halt background sync
@@ -455,9 +430,9 @@ export async function applyPulledManifest(
   let savedState = await withRevalidatedGitPartialApplies(root, state, gitOutcome, () => report.phase("state-save", () => saveStateSource(root, state, {
     expectedStream: syncStreamId(cfg),
     sourceGlobalSeq: sequence,
-    globalManifest: scopedGlobal,
-    ...(scopedGlobal === remote && manifestMeta ? { manifestMeta } : {}),
-    observedRepos: scopedObserved(observedRepoKeys(state, remote.gitRepos, {
+    globalManifest: scoped.storedBase,
+    ...(scoped.storedBaseIsRemote && manifestMeta ? { manifestMeta } : {}),
+    observedRepos: scoped.probeKeys(observedRepoKeys(state, remote.gitRepos, {
       bases: gitOutcome.gitRepos,
       branchBaseOrigins: gitOutcome.branchBaseOrigins,
       pending: gitOutcome.gitPendingRemote,

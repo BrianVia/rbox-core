@@ -70,8 +70,10 @@ export function applyRuleFileAuthority(
     const here = localByPath.get(entry.path);
     if (!entryDiffers(here, entry)) continue;
     // A local copy that still matches the last-synced base is not an edit — it is
-    // simply behind, and the ordinary write already covers it.
-    const wasEdited = here !== undefined && entryDiffers(here, baseByPath.get(entry.path) ?? here);
+    // simply behind, and the ordinary write already covers it. A copy with NO base
+    // at all was authored here, so it is an edit by definition.
+    const base = baseByPath.get(entry.path);
+    const wasEdited = here !== undefined && (base === undefined || entryDiffers(here, base));
     if (wasEdited) diverged.push(entry.path);
     forced.set(entry.path, { kind: "write", entry, ...(here ? { expectedLocal: here } : {}) });
   }

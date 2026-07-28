@@ -1510,7 +1510,7 @@ export class RboxDaemon {
    * partial tree back on the publishing path.
    */
   private async refreshScopeAuthority(): Promise<boolean> {
-    const seal = await resolveBindingScope(this.root, this.cfg).catch((error): BindingScope =>
+    const seal = await resolveBindingScope(this.root).catch((error): BindingScope =>
       ({ kind: "halted", condition: "binding-record-unreadable", message: error instanceof Error ? error.message : String(error) }));
     this.scopeSeal = seal;
     if (seal.kind === "halted") {

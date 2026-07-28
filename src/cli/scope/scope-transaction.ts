@@ -101,16 +101,22 @@ export async function runScopeTransition(
     const current = await loadConfig(abs);
     // 3. Prune first, under the mutex. Removed folders go to the trash, never
     //    straight to rm — a mistyped prefix must be undoable.
-    if (intent.prune.length > 0) await pruneScopedSubtrees(abs, current, intent.prune);
+    if (intent.prune.length > 0) await pruneScopedSubtrees(abs, current, intent.prune, "trash");
+    // Folders being TAKEN ON must forget what this machine last saw of them. A base
+    // that still describes them, with nothing on disk, reconciles to "deleted here"
+    // and would leave the newly added folder permanently empty.
+    if (intent.materialize.length > 0) await pruneScopedSubtrees(abs, current, intent.materialize, "forget");
     // 4. Commit the accepted scope and the generation in ONE write, then clear the
     //    intent. The generation fences every observation cached under the old scope.
     const committed: WorkspaceConfig = { ...current, scopeGeneration: intent.generation, scope: [...intent.target] };
-    delete committed.scopeIntent;
-    await saveConfig(abs, committed);
-    // 5. The redundant witness last: if this fails the record still says scoped, and
-    //    a witness that lags is repaired on the next resolve — the reverse would let
-    //    a lost record read as unscoped.
+    await saveConfig(abs, { ...committed, scopeIntent: intent });
+    // 5. The redundant witness, and only then the intent clear. Clearing first would
+    //    strand a witness-write failure as a permanent disagreement with nothing left
+    //    on disk saying how to finish.
     await wired.recordWitness(abs, current.remoteWorkspaceId, intent.target);
+    const settled: WorkspaceConfig = { ...committed };
+    delete settled.scopeIntent;
+    await saveConfig(abs, settled);
   });
 
   if (wasRunning) await wired.startDaemon(abs);
@@ -129,14 +135,21 @@ export async function runScopeTransition(
  * a base that still claims the files would read the empty disk as a local deletion
  * and quietly leave the re-added folder empty.
  */
-async function pruneScopedSubtrees(root: string, cfg: WorkspaceConfig, prefixes: readonly string[]): Promise<void> {
+async function pruneScopedSubtrees(
+  root: string,
+  cfg: WorkspaceConfig,
+  prefixes: readonly string[],
+  disk: "trash" | "forget",
+): Promise<void> {
   const state = await loadState(root, syncStreamId(cfg));
   const inside = (rel: string) => prefixes.some((prefix) => withinPrefix(prefix, rel));
-  const batch = openTrashBatch(root);
-  try {
-    for (const prefix of prefixes) await batch.put(prefix);
-  } finally {
-    await batch.finish();
+  if (disk === "trash") {
+    const batch = openTrashBatch(root);
+    try {
+      for (const prefix of prefixes) await batch.put(prefix);
+    } finally {
+      await batch.finish();
+    }
   }
   const retained = state.lastSyncedManifest.files.filter((entry) => !inside(entry.path));
   if (retained.length === state.lastSyncedManifest.files.length) return;

@@ -39,8 +39,9 @@ test("a prefix may not cut a git repository in half", () => {
   // The repo itself, and a repo INSIDE the prefix, are both fine.
   expect(scopeSplitsRepo(["Personal/repo-A"], ["Personal/repo-A"])).toBeUndefined();
   expect(scopeSplitsRepo(["Personal"], ["Personal/repo-A"])).toBeUndefined();
-  // The workspace-root repo key never counts as a splitter of everything.
-  expect(scopeSplitsRepo(["Personal"], ["."])).toBeUndefined();
+  // A repository AT the workspace root contains every possible folder, so any scope
+  // at all would cut it in half.
+  expect(scopeSplitsRepo(["Personal"], ["."])).toEqual({ prefix: "Personal", repo: "the whole workspace" });
 });
 
 test("--scope parses comma-separated lists", () => {

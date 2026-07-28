@@ -302,7 +302,7 @@ async function pushManifestInner(
   // stay the FIRST statement — ahead of resolution-receipt reconciliation, the scan,
   // git planning, upload and repair — because a scoped binding holds only part of the
   // tree, and every one of those steps reads that partial tree as the whole truth.
-  await assertMayPublish(root, cfg);
+  await assertMayPublish(root);
   if (deps.syncMutex) assertSyncMutex(deps.syncMutex, root);
   const report = deps.report ?? PhaseReport.disabled("push");
   deps = withReportScanStats(deps, report);

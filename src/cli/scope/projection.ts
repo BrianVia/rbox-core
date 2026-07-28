@@ -53,9 +53,12 @@ export class ScopeProjection {
     return "oos";
   }
 
-  /** Is `rel` under a repo that crosses the scope boundary? Such paths are frozen. */
+  /** Is `rel` under a repo that crosses the scope boundary? Such paths are frozen.
+   *  A repository at the workspace root crosses EVERY boundary, so it freezes the
+   *  whole file plane — writing part of a repository's worktree while its history
+   *  stays behind is the split this design refuses. */
   quarantined(rel: string): boolean {
-    return this.straddling.some((repo) => repo !== "." && withinPrefix(repo, rel));
+    return this.straddling.some((repo) => (repo === "." ? true : withinPrefix(repo, rel)));
   }
 
   /** Does this binding materialize `rel`? Metadata rule files are always in. */

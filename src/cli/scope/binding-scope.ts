@@ -21,7 +21,9 @@ import { validateScopePrefixes } from "./scope-record.js";
  * pulls in the autostart/daemon-control graph — which in turn needs this seal. A
  * derived row could not attest to scope anyway: only a persisted entry can.
  */
-async function readScopeWitness(root: string): Promise<{ workspaceId: string; scope?: string[] } | undefined> {
+type ScopeWitness = { workspaceId: string; scope?: string[]; corrupt?: true };
+
+async function readScopeWitness(root: string): Promise<ScopeWitness | undefined> {
   let parsed: { entries?: Array<{ root?: unknown; workspaceId?: unknown; scope?: unknown }> };
   try {
     parsed = JSON.parse(await fsp.readFile(bindingRegistryPath(), "utf8")) as typeof parsed;
@@ -32,10 +34,13 @@ async function readScopeWitness(root: string): Promise<{ workspaceId: string; sc
   for (const entry of parsed.entries) {
     if (typeof entry?.root !== "string" || path.resolve(entry.root) !== root) continue;
     if (typeof entry.workspaceId !== "string" || entry.workspaceId.length === 0) continue;
-    const scope = Array.isArray(entry.scope) && entry.scope.length > 0 && entry.scope.every((v) => typeof v === "string")
-      ? (entry.scope as string[])
-      : undefined;
-    return { workspaceId: entry.workspaceId, ...(scope === undefined ? {} : { scope }) };
+    if (entry.scope === undefined) return { workspaceId: entry.workspaceId };
+    // A scope field that is PRESENT but unreadable is damage, never absence: reading
+    // it as "no scope" is precisely the demotion this witness exists to prevent.
+    const usable = Array.isArray(entry.scope) && entry.scope.length > 0 && entry.scope.every((v) => typeof v === "string");
+    return usable
+      ? { workspaceId: entry.workspaceId, scope: entry.scope as string[] }
+      : { workspaceId: entry.workspaceId, corrupt: true };
   }
   return undefined;
 }
@@ -75,7 +80,7 @@ const sameSet = (a: readonly string[], b: readonly string[]): boolean =>
 
 /** Normalize what a binding record claims. An unparseable scope field is treated
  *  as PRESENT-but-broken, never as absent. */
-function declaredScope(cfg: Pick<WorkspaceConfig, "scope">): { present: boolean; prefixes?: string[] } {
+function declaredScope(cfg: WorkspaceConfig): { present: boolean; prefixes?: string[] } {
   if (cfg.scope === undefined) return { present: false };
   if (!Array.isArray(cfg.scope) || cfg.scope.length === 0) return { present: true };
   const validated = validateScopePrefixes(cfg.scope);
@@ -83,18 +88,23 @@ function declaredScope(cfg: Pick<WorkspaceConfig, "scope">): { present: boolean;
 }
 
 /**
- * Resolve the seal for `root`. `cfg` is accepted so hot paths that already hold the
- * binding record do not re-read it; the registry witness is always re-read (it is
- * the cheap half and the whole point is to catch the record having changed).
+ * Resolve the seal for `root`. BOTH witnesses are re-read every time, deliberately:
+ * a caller's config snapshot was taken before the operation began, and the whole
+ * point of this check is to notice the binding record being deleted, replaced, or
+ * corrupted in the meantime. Two small file reads are cheap next to what a wrong
+ * answer costs.
  */
-export async function resolveBindingScope(root: string, cfg?: Pick<WorkspaceConfig, "scope" | "scopeGeneration" | "remoteWorkspaceId">): Promise<BindingScope> {
+export async function resolveBindingScope(root: string): Promise<BindingScope> {
   const abs = path.resolve(root);
-  const record = cfg ?? await loadConfigIfPresent(abs);
+  const record = await loadConfigIfPresent(abs).catch(() => undefined);
   const witness = await readScopeWitness(abs).catch(() => undefined);
   const witnessScope = witness?.scope;
+  if (witness?.corrupt) {
+    return { kind: "halted", condition: "scope-witness-disagreement", message: HALT_MESSAGE["scope-witness-disagreement"] };
+  }
 
   if (record === undefined) {
-    // No binding record at all. Only scope evidence makes this a halt: a plain
+    // No readable binding record. Only scope evidence makes this a halt: a plain
     // untracked directory must keep failing the way it always has.
     if (witnessScope?.length) {
       return { kind: "halted", condition: "binding-record-unreadable", message: HALT_MESSAGE["binding-record-unreadable"] };
@@ -112,9 +122,11 @@ export async function resolveBindingScope(root: string, cfg?: Pick<WorkspaceConf
     }
     return { kind: "scoped", prefixes: declared.prefixes, generation: record.scopeGeneration ?? 0 };
   }
-  // The record positively says "no scope". Only a witness bound to the SAME binding
-  // incarnation can contradict it — after a rebind the old row means nothing.
-  if (witnessScope?.length && witness?.workspaceId === record.remoteWorkspaceId) {
+  // The record positively says "no scope", and a scope-bearing row contradicts it.
+  // A genuine rebind rewrites that row through the authoritative writer and drops
+  // the scope with it, so a surviving one means the record changed outside rbox —
+  // regardless of which workspace id the row names.
+  if (witnessScope?.length) {
     return { kind: "halted", condition: "scope-witness-disagreement", message: HALT_MESSAGE["scope-witness-disagreement"] };
   }
   return { kind: "unscoped" };
@@ -161,8 +173,8 @@ export async function assertCommandAllowedOnScopedBinding(
  * planning, upload, or repair — every indirect publication entrance (ignore purge,
  * git keep-mine, recover's repair-publish, chain repair) passes through here.
  */
-export async function assertMayPublish(root: string, cfg?: Parameters<typeof resolveBindingScope>[1]): Promise<void> {
-  const seal = await resolveBindingScope(root, cfg);
+export async function assertMayPublish(root: string): Promise<void> {
+  const seal = await resolveBindingScope(root);
   assertBindingUsable(seal);
   if (seal.kind === "scoped") throw scopedPublicationRefusal(seal.prefixes);
 }
