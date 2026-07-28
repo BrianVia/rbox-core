@@ -8,6 +8,7 @@ import { fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
 import { currentWorkspaceId, daemonRuntimeDir, readDaemonModeWitness, readDaemonPidRecord, startDaemon, stopDaemon, type DaemonLiveObservation, type DaemonModeIntent } from "./daemon-control.js";
 import { credentialFailureMessage, credentialsForStrictFlow, loadCredentials } from "./credentials.js";
 import { homeDir } from "./rbox-paths.js";
+import { assertBindingUsable, resolveBindingScope } from "./scope/binding-scope.js";
 import { fail, style } from "./style.js";
 import type { DaemonMode } from "./daemon/ambient-status.js";
 
@@ -302,7 +303,14 @@ async function startDaemonAndRecordDesiredImpl(root: string, deps: StartStopDeps
   const read = await readDesiredForStart(abs, deps.resumeExpected);
   if (read === false) return false;
   const previous = read;
-  const requested = resolveStartMode(previous, deps);
+  // Design 212 §3.1b layer 3: scope is the authority for the mode. A halted binding
+  // never starts at all; a scoped one starts pull-only no matter what the desired
+  // record says, what flags were passed, or how the record was corrupted.
+  const seal = await resolveBindingScope(abs);
+  assertBindingUsable(seal);
+  const requested = seal.kind === "scoped"
+    ? { mode: "pull-only" as const, intent: "explicit" as const, explicit: true }
+    : resolveStartMode(previous, deps);
   const identity = deps.trustedDesiredIdentity === undefined
     ? await desiredContext(abs, "running", deps)
     : {

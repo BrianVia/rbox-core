@@ -28,6 +28,8 @@ import {
 } from "../sync-git.js";
 import { carryRepoBaseProof, recordOriginLineage } from "../sync-git/base-composer.js";
 import { gitIncomingKey } from "../sync-git/shared.js";
+import { applyScopedRuleAuthority, prepareScopedPull } from "../scope/pull-scope.js";
+import { saveScopeFindings } from "../scope/rule-authority.js";
 import { assertSyncMutex, workspaceSyncMutexDegraded } from "../sync-mutex.js";
 import { inputRecord, observedRepoKeys, orderedRepoDeferralUpdates, saveStateSource } from "../sync-state.js";
 import { type SyncDeps, withReportScanStats, withCache, withDircache } from "./deps.js";
@@ -294,13 +296,26 @@ export async function applyPulledManifest(
   // Filtering everything through the PRE-pull matcher would drop a file a relaxed
   // rule just un-ignored — it would never land locally, and the follow-up push
   // would commit its deletion back to the remote (a data-loss echo).
-  const all = reconcile(state.lastSyncedManifest, local, remote, cfg.deviceId, new Date().toISOString());
+  // Design 212 §3.2: the remote git topology is classified IN / STRADDLE / OOS and
+  // every manifest is projected onto this binding's folders BEFORE reconcile, blob
+  // fetch, or apply. On an unscoped binding this returns the same manifests.
+  const scoped = await prepareScopedPull(root, state, local, remote);
+  const authority = applyScopedRuleAuthority(
+    reconcile(scoped.reconcileBase, scoped.local, scoped.remote, cfg.deviceId, new Date().toISOString()),
+    scoped,
+  );
+  const all = authority.actions;
+  const ruleFileDivergence = authority.diverged;
+  const projection = scoped.projection;
 
   // Mass-delete guard (design 44): refuse to apply a delete wave that wipes ≥half the
   // baseline. Checked BEFORE any action touches disk — the whole pull fails closed,
   // nothing partial. Legitimate big cleanups ack once with `--allow-mass-delete`.
   const plannedDeletes = all.reduce((n, a) => n + (a.kind === "delete" ? 1 : 0), 0);
-  const baseFiles = state.lastSyncedManifest.files.length;
+  // Scope-sized denominator (design 212 §3.2): the guard must compare against what
+  // THIS binding holds, in both the scan-backed and the trusted-view arm, or a
+  // scoped binding's ordinary cleanup never trips it and a real wipe hides.
+  const baseFiles = scoped.reconcileBase.files.length;
   if (!deps.allowMassDelete && plannedDeletes >= MASS_DELETE_MIN_FILES && plannedDeletes * 2 >= baseFiles) {
     // Design 202: an INCOMPLETE trusted view inflates planned deletes, and the daemon
     // never sets `allowMassDelete` — a false positive there would halt background sync
@@ -405,6 +420,7 @@ export async function applyPulledManifest(
       warningSink: deps.warningSink,
       mutationBoundary: deps.mutationBoundary,
       sourceGlobalSeq: sequence,
+      ...(projection ? { scope: projection } : {}),
     })
   );
   report.record("git-apply", { count: gitOutcome.gitApplyMetrics?.repos ?? 0 });
@@ -414,9 +430,9 @@ export async function applyPulledManifest(
   let savedState = await withRevalidatedGitPartialApplies(root, state, gitOutcome, () => report.phase("state-save", () => saveStateSource(root, state, {
     expectedStream: syncStreamId(cfg),
     sourceGlobalSeq: sequence,
-    globalManifest: remote,
-    ...(manifestMeta ? { manifestMeta } : {}),
-    observedRepos: observedRepoKeys(state, remote.gitRepos, {
+    globalManifest: scoped.storedBase,
+    ...(scoped.storedBaseIsRemote && manifestMeta ? { manifestMeta } : {}),
+    observedRepos: scoped.probeKeys(observedRepoKeys(state, remote.gitRepos, {
       bases: gitOutcome.gitRepos,
       branchBaseOrigins: gitOutcome.branchBaseOrigins,
       pending: gitOutcome.gitPendingRemote,
@@ -427,7 +443,7 @@ export async function applyPulledManifest(
       partial: gitOutcome.partial,
       attempt: gitOutcome.attempt,
       idxProj: gitOutcome.idxProj,
-    }),
+    })),
     values: {
       bases: gitOutcome.gitRepos,
       branchBaseOrigins: gitOutcome.branchBaseOrigins,
@@ -450,6 +466,15 @@ export async function applyPulledManifest(
     deps.onGitDeferralsSaved?.(savedState);
   } catch {
     // A local visibility hook cannot fail a save that is already durable.
+  }
+  if (projection) {
+    // Named, scope-sized findings for status/doctor. Best effort: a visibility
+    // record must never fail a pull that is already durable.
+    await saveScopeFindings(root, {
+      ruleFileDivergence,
+      straddlingRepos: [...projection.straddling],
+      at: new Date().toISOString(),
+    }).catch(() => undefined);
   }
   if (actions.length > 0) {
     try {

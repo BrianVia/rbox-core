@@ -53,6 +53,26 @@ export interface WorkspaceConfig {
   accountEpoch?: number;
   /** Current workspace key epoch for the runtime KEK wrap context — runtime only. */
   keyEpoch?: number;
+  /** Design 212: the workspace-relative prefixes this BINDING syncs. Absent = the
+   *  whole workspace (every existing binding). Present = a scoped, structurally
+   *  PULL-ONLY binding: `pushManifest` refuses, `recover` refuses, and the daemon
+   *  derives pull-only from this field rather than from any mode record. Never sent
+   *  to the server (paths are ciphertext there) and never shared with other
+   *  machines — scope is a property of this binding alone. */
+  scope?: string[];
+  /** Monotonic scope-edit generation. Fences every cached/trusted observation made
+   *  under an older scope (design 212 §3.3). */
+  scopeGeneration?: number;
+  /** Durable in-flight scope edit. Present ⇒ a `rbox scope add|remove` was
+   *  interrupted; the next command resumes it before doing anything else. */
+  scopeIntent?: {
+    generation: number;
+    accepted: string[];
+    target: string[];
+    materialize: string[];
+    prune: string[];
+    at: string;
+  };
   /** Local trash-tier retention (design 50 §2). Both fields optional; normalized
    *  by {@link trashConfig} on read (never trusted raw). `days: 0` = classic
    *  immediate delete (no trash, for the space-constrained). */

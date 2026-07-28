@@ -1,6 +1,7 @@
 import path from "node:path";
 import fs from "node:fs/promises";
 import { isDeepStrictEqual } from "node:util";
+import { scopeProjectionFor } from "../scope/projection.js";
 import {
   inspectGitBusy,
   inspectGitBusyShared,
@@ -209,8 +210,14 @@ export async function reconcileGitDeferrals(
   const now = deps.now();
   const nowIso = new Date(now).toISOString();
   const records = repoRecordsForState(state);
+  // Design 212 §3.2: hygiene resolves repo paths and can retire a deferral once its
+  // stable-gone proof holds. On a scoped binding an out-of-scope repo is ABSENT by
+  // design, so probing it would age out durable conflict and recovery posture that
+  // is still true. Filter before candidate construction, never after the probe.
+  const scope = await scopeProjectionFor(root, Object.keys(records));
   const candidates = new Map<string, GitDeferral[]>();
   for (const [repo, record] of Object.entries(records)) {
+    if (scope && scope.classifyRepo(repo) !== "in") continue;
     for (const deferral of Object.values(record.deferrals ?? {})) {
       if (deferral && selectedReason((deferral as { reason?: unknown }).reason)) {
         const list = candidates.get(repo) ?? [];

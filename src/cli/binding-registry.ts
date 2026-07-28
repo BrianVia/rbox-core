@@ -24,10 +24,11 @@ import { acquireLock, type OwnedLock } from "../engine/git/lockfile.js";
 import { fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
 import { readDesiredDaemonRows } from "./autostart-cmd.js";
 import { currentWorkspaceId } from "./daemon/runtime-state.js";
-import { rboxDir } from "./rbox-paths.js";
+import { bindingRegistryDir, bindingRegistryPath } from "./rbox-paths.js";
 import { RBOX_DIR } from "./workspace-config.js";
 
-const REGISTRY_FILE = "workspaces.json";
+export { bindingRegistryDir, bindingRegistryPath };
+
 const LOCK_WAIT_MS = 10_000;
 const LOCK_POLL_MS = 25;
 /** How long a recorded entry stays "fresh enough" that a mere resolve rewrites nothing. */
@@ -41,6 +42,10 @@ export interface BindingRegistryEntry {
   accountId?: string;
   boundAt: string;
   lastSeenAt: string;
+  /** Design 212 §3.1b layer 4: the REDUNDANT scope witness. The binding record
+   *  (`<root>/.rbox/workspace.json`) is canonical; this row exists so a lost or
+   *  omitted scope there can be DETECTED rather than read as legacy-unscoped. */
+  scope?: string[];
 }
 
 interface BindingRegistryFileV1 {
@@ -58,22 +63,6 @@ export interface BindingRegistryRow extends BindingRegistryEntry {
   derived: boolean;
 }
 
-/**
- * `rboxDir()` already honors `RBOX_HOME`, so every suite that redirects `~/.rbox`
- * is isolated for free. `RBOX_TEST_BINDING_REGISTRY_DIR` covers the suites that
- * do NOT set `RBOX_HOME` (main-dispatch, front-door) so a unit test can never
- * write a junk entry into the developer's real registry — the same escape hatch
- * the lock-identity ledger uses. An explicit `RBOX_HOME` always wins.
- */
-export function bindingRegistryDir(): string {
-  if (!process.env.RBOX_HOME && process.env.RBOX_TEST_BINDING_REGISTRY_DIR) {
-    return process.env.RBOX_TEST_BINDING_REGISTRY_DIR;
-  }
-  return rboxDir();
-}
-
-export const bindingRegistryPath = (): string => path.join(bindingRegistryDir(), REGISTRY_FILE);
-
 const workspaceConfigPath = (root: string): string => path.join(root, RBOX_DIR, "workspace.json");
 
 function validEntry(value: unknown): value is BindingRegistryEntry {
@@ -83,7 +72,8 @@ function validEntry(value: unknown): value is BindingRegistryEntry {
     && typeof e.workspaceId === "string" && e.workspaceId.length > 0
     && typeof e.boundAt === "string" && typeof e.lastSeenAt === "string"
     && (e.name === undefined || typeof e.name === "string")
-    && (e.accountId === undefined || typeof e.accountId === "string");
+    && (e.accountId === undefined || typeof e.accountId === "string")
+    && (e.scope === undefined || (Array.isArray(e.scope) && e.scope.every((p) => typeof p === "string")));
 }
 
 /** The persisted half only. A corrupt or absent file reads as empty: the registry
@@ -154,6 +144,7 @@ export interface RememberedBinding {
   remoteWorkspaceId: string;
   name?: string;
   accountId?: string;
+  scope?: string[];
 }
 
 function upsert(
@@ -166,6 +157,11 @@ function upsert(
    * stale cached name forward there would make every later resolve see a
    * mismatch and rewrite the file again, forever. */
   authoritativeName = false,
+  /** Only the design-212 scope transaction states the whole truth about scope,
+   * including its REMOVAL. Every other writer may add or refresh the witness but
+   * must never drop it: a binding record that silently lost its scope field is
+   * exactly what this row exists to catch. */
+  authoritativeScope = false,
 ): BindingRegistryEntry[] {
   const others = entries.filter((entry) => entry.root !== root);
   const prev = entries.find((entry) => entry.root === root);
@@ -177,6 +173,8 @@ function upsert(
   const observed = binding.name?.length ? binding.name : undefined;
   const name = authoritativeName ? observed : observed ?? carried?.name;
   const accountId = (binding.accountId?.length ? binding.accountId : undefined) ?? carried?.accountId;
+  const observedScope = binding.scope?.length ? [...binding.scope] : undefined;
+  const scope = authoritativeScope ? observedScope : observedScope ?? carried?.scope;
   return [...others, {
     root,
     workspaceId: binding.remoteWorkspaceId,
@@ -184,6 +182,7 @@ function upsert(
     lastSeenAt: nowIso,
     ...(name === undefined ? {} : { name }),
     ...(accountId === undefined ? {} : { accountId }),
+    ...(scope === undefined ? {} : { scope }),
   }];
 }
 
@@ -224,6 +223,7 @@ export async function rememberResolvedRoot(root: string, now = () => new Date())
     const fresh = prev !== undefined
       && prev.workspaceId === observed.remoteWorkspaceId
       && prev.name === observed.name
+      && (observed.scope === undefined || prev.scope?.join("\n") === observed.scope.join("\n"))
       && Number.isFinite(age) && age >= 0 && age < REFRESH_INTERVAL_MS;
     if (fresh) return;
     // Re-read the binding under the lock: the snapshot above may predate a
@@ -245,11 +245,36 @@ async function readBindingIdentity(root: string): Promise<RememberedBinding | un
   const cfg = JSON.parse(await fsp.readFile(workspaceConfigPath(root), "utf8")) as {
     remoteWorkspaceId?: unknown;
     name?: unknown;
+    scope?: unknown;
   };
   if (typeof cfg.remoteWorkspaceId !== "string" || cfg.remoteWorkspaceId.length === 0) return undefined;
   const name = typeof cfg.name === "string" && cfg.name.length > 0 ? cfg.name : undefined;
-  return { remoteWorkspaceId: cfg.remoteWorkspaceId, ...(name === undefined ? {} : { name }) };
+  const scope = Array.isArray(cfg.scope) && cfg.scope.length > 0 && cfg.scope.every((p) => typeof p === "string")
+    ? (cfg.scope as string[])
+    : undefined;
+  return {
+    remoteWorkspaceId: cfg.remoteWorkspaceId,
+    ...(name === undefined ? {} : { name }),
+    ...(scope === undefined ? {} : { scope }),
+  };
 }
+
+/**
+ * Write the design-212 scope witness authoritatively — the ONLY path allowed to
+ * REMOVE it. Called inside the scope transaction's commit, after the binding
+ * record has accepted the same set (design 212 §3.3).
+ */
+export async function recordBindingScope(root: string, workspaceId: string, scope: readonly string[] | undefined, now = () => new Date()): Promise<void> {
+  const abs = path.resolve(root);
+  await mutate((entries) => {
+    if (currentWorkspaceId(abs) !== workspaceId) return undefined;
+    return upsert(entries, abs, {
+      remoteWorkspaceId: workspaceId,
+      ...(scope && scope.length > 0 ? { scope: [...scope] } : {}),
+    }, now().toISOString(), false, true);
+  });
+}
+
 
 /**
  * Drop a root from the registry. Returns true when an entry was actually

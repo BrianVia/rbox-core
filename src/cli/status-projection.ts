@@ -14,6 +14,7 @@ import {
 import type { StatusDeferralDisplayDetails } from "./status-maintenance.js";
 import type { GitDivergenceRepoHint, GitDivergenceStatus } from "./sync-git.js";
 import { RBOX_VERSION } from "./version.js";
+import { scopeProjectionFor } from "./scope/projection.js";
 import type {
   LocalGitDeferral,
   StatusCacheHint,
@@ -280,6 +281,17 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
     }
   };
 
+  // Design 212 §3.2: status consumes the same projection as everything else. Its
+  // diff base must be scope-sized, or a binding that is working perfectly reports
+  // every folder it deliberately does not hold as a local deletion.
+  const statusScope = await scopeProjectionFor(root, [
+    ...Object.keys(state.lastSyncedManifest.gitRepos ?? {}),
+    ...Object.keys(state.gitPendingRemote ?? {}),
+    ...Object.keys(repoRecordsForState(state)),
+  ]);
+  const scopedBaseManifest = statusScope
+    ? statusScope.projectFiles(state.lastSyncedManifest)
+    : state.lastSyncedManifest;
   let counts: StatusLocalCounts;
   let cacheHint: StatusCacheHint | undefined;
   if (trusted) {
@@ -292,7 +304,10 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
     counts = {
       added: trusted.local.added,
       changed: trusted.local.changed,
-      deleted: trusted.local.deleted,
+      // The daemon's deletion count is measured against the whole workspace. On a
+      // scoped binding the folders it does not hold are absent on purpose, and the
+      // daemon does not know which those are.
+      deleted: statusScope ? 0 : trusted.local.deleted,
       trackedFiles: trusted.local.trackedFiles,
       gitChanged: gitStatus.count,
       gitDeferrals: gitStatus.deferrals,
@@ -303,18 +318,24 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
       ageMs: trusted.ageMs,
     };
   } else if (populate) {
-    const conflictSnapshots = await port.readConflictSnapshotStatus(root, [
+    const populateKeys = [
       ...Object.keys(state.lastSyncedManifest.gitRepos ?? {}),
       ...Object.keys(state.gitPendingRemote ?? {}),
       ...Object.keys(repoRecordsForState(state)),
-    ]);
+    ];
+    const populateScope = await scopeProjectionFor(root, populateKeys);
+    const conflictSnapshots = await port.readConflictSnapshotStatus(
+      root,
+      populateScope ? populateScope.probeKeys(populateKeys) : populateKeys,
+    );
     counts = {
       added: 0,
       changed: 0,
       deleted: 0,
       trackedFiles: populate.operation.filesDone,
       gitChanged: 0,
-      gitDeferrals: localGitDeferrals(state).map(({ repo, ...d }) => ({
+      gitDeferrals: localGitDeferrals(state).filter(({ repo }) =>
+        populateScope === undefined || populateScope.classifyRepo(repo) === "in").map(({ repo, ...d }) => ({
         relPath: repo,
         lane: d.lane,
         reason: d.reason,
@@ -339,12 +360,12 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
       gitRepoFeed.close();
     }
     cacheHint = { cache: hashCache, livePaths: () => new Set(rawLocalManifest.files.map((f) => f.path)) };
-    const projected = projectLocalManifest(rawLocalManifest, state.lastSyncedManifest, matcher);
+    const projected = projectLocalManifest(rawLocalManifest, scopedBaseManifest, matcher);
     const localManifest = projected.manifest;
     // A full status scan owns current read-only disk truth for this invocation.
     // It never mutates the durable sidecar; the passive loop remains its writer.
     pathWarnings = buildPathWarnings(projected.caseCollisions);
-    const manifestDiff = diffManifests(state.lastSyncedManifest, localManifest);
+    const manifestDiff = diffManifests(scopedBaseManifest, localManifest);
     const gitStatus = await gitChangedP;
     counts = {
       added: manifestDiff.added.length,

@@ -41,7 +41,7 @@ import { acknowledgeCacheGeneration } from "./adopt-cache.js";
 import { DirCache, HashCache } from "../engine/index.js";
 import type { AdoptJournal } from "./adopt-journal.js";
 import { genesisClassifierConsultationNeeded } from "./genesis-enrollment.js";
-import { rememberBinding } from "./binding-registry.js";
+import { recordBindingScope, rememberBinding } from "./binding-registry.js";
 import { summarizeCaseCollisions } from "./sync-cmd.js";
 
 export const WORKSPACE_DEFINITION =
@@ -467,6 +467,8 @@ async function executeInitPlan(
       // Cache the workspace name LOCALLY so `rbox status` shows it with no round-trip.
       // Present on CREATE (the name just typed) and on TRACK-EXISTING (the picked name).
       ...(plan.workspace.name ? { name: plan.workspace.name } : {}),
+      // Design 212: scope is a property of THIS binding, never of the workspace.
+      ...(plan.scope ? { scope: plan.scope, scopeGeneration: 1 } : {}),
     };
     if (opts.adoption) {
       if (plan.workspace.kind !== "join" || plan.firstSync !== "sync") throw new Error("invalid adoption execution route");
@@ -496,7 +498,15 @@ async function executeInitPlan(
       remoteWorkspaceId: cfg.remoteWorkspaceId,
       ...(cfg.name ? { name: cfg.name } : {}),
       ...(creds.accountId ? { accountId: creds.accountId } : {}),
+      ...(cfg.scope ? { scope: cfg.scope } : {}),
     });
+    // Design 212 §3.1b layer 4: state the whole truth about scope, including its
+    // ABSENCE. `rememberBinding` is best effort and never removes evidence, so a
+    // rebind that dropped a previous scope would otherwise leave a witness the seal
+    // reads as a disagreement forever. This write is NOT best effort: a scoped
+    // binding whose witness never landed must fail loudly at bind time, not silently
+    // become publish-capable later.
+    await recordBindingScope(plan.root, cfg.remoteWorkspaceId, cfg.scope);
 
     // 4. This workspace is end-to-end encrypted: the server stores only ciphertext.
     process.stderr.write(`${stderrStyle.dim("this workspace is end-to-end encrypted — the server never sees your file names or contents.")}\n`);

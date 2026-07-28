@@ -1,5 +1,6 @@
 import { ManifestChainError, type Action } from "../engine/index.js";
 import { findRoot, loadConfig } from "./config.js";
+import { assertCommandAllowedOnScopedBinding } from "./scope/binding-scope.js";
 import { credentialsForStrictFlow, loadCredentials } from "./credentials.js";
 import { keystorePinStore } from "./e2ee-keystore.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
@@ -41,6 +42,11 @@ function count(actions: Action[], kind: Action["kind"]): number {
 export async function recoverWorkspaceCmd(pathArg: string | undefined, opts: RecoverOptions = {}, deps: RecoverDeps = {}): Promise<void> {
   const root = await (deps.findRoot ?? findRoot)(pathArg ?? process.cwd());
   if (!root) throw new Error("Not inside an rbox workspace. Run `rbox setup` to get started, or `rbox track <path>` to bind a directory.");
+  // Design 212 §3.1b layer 2 (r3 finding 2): refuse BEFORE any manifest read. The
+  // late `pushManifest` chokepoint would stop the publication but only after chain
+  // repair had already applied a historical manifest to disk, stranding this copy on
+  // a deliberately older tree with no way for a scoped binding to finish the repair.
+  await assertCommandAllowedOnScopedBinding(root, "recover");
   const confirmation = {
     message: `Recover ${root}? This re-verifies the server head against the retained local pin, reconciles files, then pushes remaining local diffs.`,
     default: false,

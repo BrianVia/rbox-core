@@ -38,6 +38,22 @@ export function workspaceKey(root: string): string {
 
 export const rboxDir = (): string => path.join(process.env.RBOX_HOME || homeDir(), RBOX_DIR);
 
+/**
+ * `rboxDir()` already honors `RBOX_HOME`, so every suite that redirects `~/.rbox`
+ * is isolated for free. `RBOX_TEST_BINDING_REGISTRY_DIR` covers the suites that
+ * do NOT set `RBOX_HOME` (main-dispatch, front-door) so a unit test can never
+ * write a junk entry into the developer's real registry — the same escape hatch
+ * the lock-identity ledger uses. An explicit `RBOX_HOME` always wins.
+ */
+export function bindingRegistryDir(): string {
+  if (!process.env.RBOX_HOME && process.env.RBOX_TEST_BINDING_REGISTRY_DIR) {
+    return process.env.RBOX_TEST_BINDING_REGISTRY_DIR;
+  }
+  return rboxDir();
+}
+
+export const bindingRegistryPath = (): string => path.join(bindingRegistryDir(), "workspaces.json");
+
 const daemonHome = () => rboxDir();
 
 export const daemonRuntimeDir = (root: string): string => path.join(daemonHome(), "daemons", workspaceKey(root));

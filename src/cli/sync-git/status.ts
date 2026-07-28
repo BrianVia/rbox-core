@@ -8,6 +8,7 @@ import { readLocalGitConfig, shouldPublishGitConfig } from "./config-lane.js";
 import { gitFingerprintRun } from "./fingerprint.js";
 import { GIT_DIVERGENCE_CONCURRENCY, loadGitDivergenceCache, saveGitDivergenceCache, cachedDivergenceProbe, type CachedDivergenceProbe, type GitDivergenceRepoHint, type GitDivergenceRepoSource } from "./divergence-cache.js";
 import { inspectConflictRefs } from "./conflict-retention.js";
+import { scopeProjectionFor } from "../scope/projection.js";
 /**
  * READ-ONLY advisory count of repos whose LOCAL git state a push would publish —
  * the `rbox status` verdict's git dimension (design 45). Mirrors
@@ -72,7 +73,18 @@ export async function gitDivergenceStatus(
   options: GitDivergenceStatusOptions = {}
 ): Promise<GitDivergenceStatus> {
   const deferrals: GitDivergenceStatus["deferrals"] = [];
+  // Design 212 §3.2: filter before key/candidate construction, so a scoped binding
+  // issues zero out-of-scope filesystem, git, config, or journal probes — and reads
+  // steady rather than dirty (an absent out-of-scope BASE repo would otherwise count
+  // as a pending removal).
+  const scope = await scopeProjectionFor(root, [
+    ...Object.keys(state.lastSyncedManifest.gitRepos ?? {}),
+    ...Object.keys(state.gitPendingRemote ?? {}),
+    ...Object.keys(repoRecordsForState(state)),
+  ]);
+  const inScope = (relPath: string): boolean => scope === undefined || scope.classifyRepo(relPath) === "in";
   for (const [relPath, record] of Object.entries(repoRecordsForState(state))) {
+    if (!inScope(relPath)) continue;
     for (const lane of DEFERRAL_LANES) {
       const deferral = record.deferrals?.[lane];
       if (!deferral) continue;
@@ -86,16 +98,18 @@ export async function gitDivergenceStatus(
     }
   }
   deferrals.sort((a, b) => (a.relPath < b.relPath ? -1 : a.relPath > b.relPath ? 1 : 0) || (a.lane < b.lane ? -1 : a.lane > b.lane ? 1 : 0));
-  const base = state.lastSyncedManifest.gitRepos ?? {};
-  const pending = state.gitPendingRemote ?? {};
+  const pick = <T>(map: Record<string, T>): Record<string, T> =>
+    scope === undefined ? map : Object.fromEntries(Object.entries(map).filter(([key]) => inScope(key)));
+  const base = pick(state.lastSyncedManifest.gitRepos ?? {});
+  const pending = pick(state.gitPendingRemote ?? {});
   if (!cfg.syncGit) {
-    const known = new Set([...Object.keys(base), ...Object.keys(pending), ...Object.keys(repoRecordsForState(state))]);
-    if (discoveredRepos) for await (const repo of discoveredRepos) known.add(repo.relPath);
-    else if (matcher) for (const repo of await discoverGitRepos(root, matcher)) known.add(repo.relPath);
+    const known = new Set([...Object.keys(base), ...Object.keys(pending), ...Object.keys(repoRecordsForState(state)).filter(inScope)]);
+    if (discoveredRepos) for await (const repo of discoveredRepos) { if (inScope(repo.relPath)) known.add(repo.relPath); }
+    else if (matcher) for (const repo of await discoverGitRepos(root, matcher)) { if (inScope(repo.relPath)) known.add(repo.relPath); }
     return { count: 0, indeterminate: false, deferrals, configChecking: [], configDisabled: [], conflictSnapshots: await conflictSnapshotStatus(root, [...known]) };
   }
-  const needsRes = state.gitNeedsResolution ?? {};
-  const removedMem = state.gitReposRemoved ?? {};
+  const needsRes = pick(state.gitNeedsResolution ?? {});
+  const removedMem = pick(state.gitReposRemoved ?? {});
   const cache = await loadGitDivergenceCache(root);
   const probes = new Map<string, CachedDivergenceProbe>();
   const run = gitFingerprintRun("cross-repo");
@@ -113,6 +127,7 @@ export async function gitDivergenceStatus(
   }
 
   const scheduleProbe = async (repo: GitDivergenceRepoHint): Promise<void> => {
+    if (!inScope(repo.relPath)) return;
     sourcePaths.add(repo.relPath);
     if (repo.kind) kindByPath.set(repo.relPath, repo.kind);
     if (pending[repo.relPath]) {

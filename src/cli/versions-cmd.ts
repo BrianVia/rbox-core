@@ -4,6 +4,8 @@ import { openTrashBatch } from "../engine/trash.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
 import { NeedsRebaselineError } from "./remote.js";
 import { emitJson } from "./json.js";
+import { assertBindingUsable, resolveBindingScope } from "./scope/binding-scope.js";
+import { ScopeProjection } from "./scope/projection.js";
 import { style } from "./style.js";
 
 /**
@@ -83,6 +85,14 @@ export async function restoreCmd(root: string, spec: string): Promise<void> {
   const at = spec.lastIndexOf("@");
   if (at < 1) throw new Error("usage: rbox restore <path>@<seq>  (e.g. rbox restore src/app.ts@3)");
   const rel = toRelPath(spec.slice(0, at));
+  // Design 212 §3.2: refuse an out-of-scope restore BEFORE the blob is fetched —
+  // otherwise `restore` quietly defeats the binding's disk and bandwidth boundary.
+  const seal = await resolveBindingScope(root);
+  assertBindingUsable(seal);
+  const scoped = seal.kind === "scoped" ? new ScopeProjection(seal.prefixes) : undefined;
+  if (scoped && !scoped.includes(rel)) {
+    throw new Error(`'${rel}' is outside the folders this machine syncs (${scoped.describe()}) — restore it on a machine that syncs the whole workspace.`);
+  }
   const seq = Number(spec.slice(at + 1));
   if (!Number.isInteger(seq) || seq < 1) throw new Error(`bad version sequence in '${spec}' — expected a positive integer after '@'`);
 
@@ -116,5 +126,7 @@ export async function restoreCmd(root: string, spec: string): Promise<void> {
   if (previousCopyTrashed) {
     console.log(style.dim(`previous copy of ${rel} moved to the local trash — undo with: rbox trash restore ${rel}`));
   }
-  console.log(style.dim("(written to disk as a local change — run `rbox push`/`rbox sync` to publish it as a new version)"));
+  console.log(scoped
+    ? style.dim("(written to disk here only — this folder receives changes and never sends them)")
+    : style.dim("(written to disk as a local change — run `rbox push`/`rbox sync` to publish it as a new version)"));
 }

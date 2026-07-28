@@ -84,6 +84,7 @@ import {
   type WorkspaceSyncMutex,
 } from "../sync-mutex.js";
 import { repairChain, type SuffixInfo } from "../chain-repair.js";
+import { resolveBindingScope, ScopedBindingRefusal, type BindingScope } from "../scope/binding-scope.js";
 import {
   ACTIVITY_HEARTBEAT_MS,
   ChainRepairHaltError,
@@ -479,7 +480,15 @@ export class RboxDaemon {
   private ambientStatusSawPidfile = false;
   private activeProgressPath?: string;
   private readonly bootId: string;
-  private readonly pullOnly: boolean;
+  /** Design 212 §3.1b layer 3: NOT readonly — scope, not the startup environment
+   *  bit or the desired-mode record, is the authority for this. It is re-derived at
+   *  every operation boundary under the mutex, and can only ever narrow to
+   *  pull-only. */
+  private pullOnly: boolean;
+  private scopeSeal: BindingScope = { kind: "unscoped" };
+  /** The scope generation this process's cached and watcher-fed observations were
+   *  built under. A change fences them all by ending the process. */
+  private scopeGeneration: number | undefined;
   private readonly acquireSyncMutexFn: (root: string) => Promise<DaemonMutexResult>;
   private readonly now: () => number;
   private readonly recoveryRandom: () => number;
@@ -692,6 +701,9 @@ export class RboxDaemon {
       this.activity.outOfStorage = persistedActivity.outOfStorage;
     }
     this.scheduler.lockStarvationEpisode = await readLockStarvationEpisode(this.root);
+    // Scope is truth: a forged RBOX_DAEMON_PULL_ONLY=0, a missing desired record, or
+    // a corrupt one can never start a scoped binding read-write.
+    if (!await this.refreshScopeAuthority()) return;
     this.log(`rbox daemon starting: ${this.root} → workspace ${this.cfg.remoteWorkspaceId} (device ${this.cfg.deviceId})${this.pullOnly ? " [pull-only]" : ""}`);
     // Record the binding so `rbox start` can tell a live daemon from a STALE one
     // (bound to a workspace this root was since re-initialized away from).
@@ -1474,6 +1486,7 @@ export class RboxDaemon {
    *  every operation passes through with the workspace mutex held. `false` ends the
    *  loop WITHOUT consuming the selected operation. */
   private async openOperationBoundary(syncMutex: WorkspaceSyncMutex): Promise<boolean> {
+    if (!await this.refreshScopeAuthority()) return false;
     if (!await this.resetOperationBoundary(syncMutex)) return false;
     if (this.stopped) return false;
     await this.recoverOwnedLocksAtBoundary();
@@ -1488,6 +1501,44 @@ export class RboxDaemon {
     }
     this.pushTerminalBlocked = false;
     return true;
+  }
+
+  /**
+   * Re-derive the binding's scope authority. Returns false (and stops the daemon)
+   * when the binding is halted — a scope witness that has gone missing or
+   * disagrees must never be read as "legacy unscoped", because that would put a
+   * partial tree back on the publishing path.
+   */
+  private async refreshScopeAuthority(): Promise<boolean> {
+    const seal = await resolveBindingScope(this.root).catch((error): BindingScope =>
+      ({ kind: "halted", condition: "binding-record-unreadable", message: error instanceof Error ? error.message : String(error) }));
+    this.scopeSeal = seal;
+    if (seal.kind === "halted") {
+      this.log(`rbox daemon halting (${seal.condition}): ${seal.message}`);
+      this.stopped = true;
+      return false;
+    }
+    if (seal.kind === "scoped" && !this.pullOnly) {
+      this.pullOnly = true;
+      this.log(`rbox daemon is receive-only: this folder syncs only ${seal.prefixes.join(", ")}`);
+    }
+    const generation = seal.kind === "scoped" ? seal.generation : 0;
+    if (this.scopeGeneration === undefined) {
+      this.scopeGeneration = generation;
+    } else if (this.scopeGeneration !== generation) {
+      // The folders this machine syncs changed under us. Every watcher-fed
+      // observation and cached view this process holds was built for the old set,
+      // so the only safe move is to stop: the scope edit restarts us with fresh
+      // authority and a full rescan.
+      this.log("the folders this machine syncs changed - restarting background sync");
+      this.stopped = true;
+      return false;
+    }
+    return true;
+  }
+
+  private get scoped(): boolean {
+    return this.scopeSeal.kind === "scoped";
   }
 
   /** The dequeued operation's own bookkeeping, run before the scheduler publishes the
@@ -1902,6 +1953,16 @@ export class RboxDaemon {
       return await pull(this.root, this.cfg, deps, view);
     } catch (error) {
       if (!(error instanceof ManifestChainError)) throw error;
+      // Chain repair applies a historical manifest to disk and then PUBLISHES the
+      // supersession. A scoped binding can do neither safely, so it halts here
+      // rather than at the late publication chokepoint (design 212 §3.1b).
+      if (this.scoped) {
+        throw new ScopedBindingRefusal(
+          "scoped-binding-cannot-publish",
+          "the workspace history needs repairing, and this folder only syncs part of it. "
+            + "Run `rbox recover` on a machine that syncs the whole workspace; this copy resumes on its own afterwards.",
+        );
+      }
       noteChainRepair();
       let refusal: SuffixInfo[] | undefined;
       const outcome = await repairChain(this.root, this.cfg, deps, error, {
@@ -3311,6 +3372,8 @@ export async function runDaemon(root: string): Promise<void> {
     const { cfg, deps } = await buildAuthedRemote(root, Date.now, logger.log); // E2EE transport + injected KEK
     daemon = new RboxDaemon(root, cfg, { ...deps, onGitLog: logger.log, warningSink: logger.log }, {
       bootId,
+      // Transport only — `refreshScopeAuthority` is what actually decides, and can
+      // only narrow. A scoped binding starts pull-only whatever this says.
       pullOnly: process.env.RBOX_DAEMON_PULL_ONLY === "1",
       log: logger.log,
       onStopped: finish,

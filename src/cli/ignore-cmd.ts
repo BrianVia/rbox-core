@@ -10,6 +10,7 @@ import { withWorkspaceSyncMutex } from "./sync-mutex.js";
 import { style } from "./style.js";
 import { savePathWarnings } from "./path-warnings.js";
 import { summarizeCaseCollisions } from "./sync-cmd.js";
+import { assertCommandAllowedOnScopedBinding } from "./scope/binding-scope.js";
 
 const RBOXIGNORE = ".rboxignore";
 
@@ -70,6 +71,7 @@ export async function setRespectGitignore(root: string, raw: string | undefined)
 }
 
 export async function purgeIgnored(root: string, opts: { yes?: boolean; allowMassDelete?: boolean } = {}): Promise<void> {
+  await assertCommandAllowedOnScopedBinding(root, "purge");
   const { cfg, deps } = await buildAuthedRemote(root);
   const preview = await computePurgeCandidate(root, cfg);
   if (preview.purged.length === 0) {

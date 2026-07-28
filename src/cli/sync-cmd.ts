@@ -72,6 +72,13 @@ function safeWarningPath(value: string): string {
 }
 
 export async function runSyncCommand(root: string, opts: { allowMassDelete?: boolean; pullOnly?: boolean; verbose?: boolean } = {}): Promise<void> {
+  // Design 212 §3.1b layer 2: on a scoped binding `sync` MEANS a scoped pull. It
+  // must never run a half-sync whose push half would publish a partial tree, and it
+  // must not fail either — receiving changes is exactly what this binding is for.
+  const { resolveBindingScope, assertBindingUsable } = await import("./scope/binding-scope.js");
+  const seal = await resolveBindingScope(root);
+  assertBindingUsable(seal);
+  const pullOnly = opts.pullOnly === true || seal.kind === "scoped";
   const sp = spinner("syncing");
   try {
     await withWorkspaceSyncMutex(root, async (syncMutex) => {
@@ -82,9 +89,9 @@ export async function runSyncCommand(root: string, opts: { allowMassDelete?: boo
       deps.allowMassDelete = opts.allowMassDelete === true;
       deps.allowMassDeletePush = opts.allowMassDelete === true || process.env.RBOX_ALLOW_MASS_DELETE === "1";
       deps.massDeleteHint = "rbox sync --allow-mass-delete";
-      const report = beginReport(opts.pullOnly ? "pull" : "sync");
+      const report = beginReport(pullOnly ? "pull" : "sync");
       deps.report = report;
-      if (opts.pullOnly) {
+      if (pullOnly) {
         const pulled = await pull(root, cfg, deps);
         sp.stop();
         summarize("pulled", pulled, root);
