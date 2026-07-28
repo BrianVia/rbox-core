@@ -25,6 +25,9 @@ const LOCK_STARVATION_MS = 15 * 60_000;
 const LOCK_STARVATION_MAX_BYTES = 4 * 1024;
 const MUTEX_BACKOFF_TIERS = [250, 500, 1_000, 2_000, 4_000, 8_000, 16_000, 30_000] as const;
 const MUTEX_EARLY_REPROBE_MS = 2_000;
+/** Breaker for a selection the loop can neither run nor park on: selecting without
+ *  consuming is an unbounded allocating spin, not a slow loop. */
+const NO_PROGRESS_ITERATION_BOUND = 3;
 
 /** The kinds of work a caller may ask the daemon to do. The recovery probe is not
  *  one: it is the scheduler's own response to a standing halt. */
@@ -331,9 +334,9 @@ export class DaemonOperationScheduler {
   private dequeue(op: PumpOperation): PumpOperation | undefined {
     if (op === "recoveryProbe") {
       const halt = this.ports.standingHalt();
-      if (!halt) return undefined;
       this.recoveryDue = false;
       this.recoveryDequeuesSinceDue = 0;
+      if (!halt) return undefined;
       this.wants[halt.op] = false;
       return op;
     }
@@ -343,10 +346,11 @@ export class DaemonOperationScheduler {
   }
 
   private async serviceLoop(executor: DaemonOperationExecutor): Promise<void> {
-    // A refused boundary parks the queue: only the NEXT external wakeup may
-    // retry it. Exit-time re-entry after a refusal would hot-loop against the
-    // same refusal with the wants unconsumed.
-    let boundaryRefused = false;
+    // A refused boundary — or a selection this loop cannot consume — parks the
+    // queue: only the NEXT external wakeup may retry it. Exit-time re-entry
+    // would hot-loop against the same refusal with the wants unconsumed.
+    let parked = false;
+    let noProgress = 0;
     try {
       while (!this.ports.isStopped()) {
         // Resolve WHICH op this iteration runs up front — the executor's halt
@@ -363,6 +367,7 @@ export class DaemonOperationScheduler {
           const backoff = this.mutexDelay(acquired.holderKey);
           if (backoff.shouldLog) this.ports.log(`pump op ${op}: sync busy; re-queued (backoff ${backoff.delayMs}ms)`);
           await this.waitForMutexBackoff(backoff.delayMs);
+          noProgress = 0;
           continue;
         }
         this.resetMutexBackoff();
@@ -371,9 +376,15 @@ export class DaemonOperationScheduler {
         });
         const syncMutex = acquired.handle;
         try {
-          if (!await executor.openOperationBoundary(syncMutex)) { boundaryRefused = true; break; }
+          if (!await executor.openOperationBoundary(syncMutex)) { parked = true; break; }
           const dequeued = this.dequeue(op);
-          if (!dequeued) continue;
+          if (!dequeued) {
+            if (++noProgress < NO_PROGRESS_ITERATION_BOUND) continue;
+            this.ports.log(`pump op ${op}: selected but not serviceable ${noProgress}x; parking the queue`);
+            parked = true;
+            break;
+          }
+          noProgress = 0;
           executor.beginOperation?.(dequeued);
           this.activePumpOp = dequeued;
           try {
@@ -391,7 +402,7 @@ export class DaemonOperationScheduler {
       // A timer/watcher can queue work after the loop observes no operation but
       // before exit-time persistence completes. Re-enter after dropping the
       // single-flight guard so that wakeup cannot be lost.
-      if (!boundaryRefused && this.ports.readyForReentry() && this.nextOperation()) await this.service(executor);
+      if (!parked && this.ports.readyForReentry() && this.nextOperation()) await this.service(executor);
     }
   }
 }
