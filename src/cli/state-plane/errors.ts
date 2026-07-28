@@ -159,3 +159,29 @@ export class GitSectionOversizeError extends Error {
     super(`Git section ${relPath} exceeds the 4 MiB cursor row ceiling (${bytes} bytes)`);
   }
 }
+
+/**
+ * A persisted authority row could not be decoded into the value its schema
+ * promises: the durable bytes are corrupt. Distinct from a caller passing a bad
+ * value (`TypeError`) and from a sealed stage being mutated after sealing
+ * (`StageChangedError`) — this is data-at-rest corruption discovered on read.
+ * The originating decode failure is retained as `cause`.
+ */
+export class StateDataCorruptionError extends Error {
+  readonly name = "StateDataCorruptionError";
+  constructor(readonly entity: string, readonly key: string, override readonly cause?: unknown) {
+    super(`corrupt ${entity} authority row ${JSON.stringify(key)}`, { cause });
+  }
+}
+
+/** Decode one persisted authority row, converting any decode failure into a
+ * `StateDataCorruptionError`. A row that will not decode is data-at-rest
+ * corruption, not a caller error — the single taxonomy every column codec shares,
+ * at every site that reconstructs a value from durable bytes. */
+export function decodeAuthorityRow<T>(entity: string, key: string, decode: () => T): T {
+  try {
+    return decode();
+  } catch (cause) {
+    throw new StateDataCorruptionError(entity, key, cause);
+  }
+}

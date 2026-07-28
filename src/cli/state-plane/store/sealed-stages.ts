@@ -7,6 +7,7 @@
  * the header that later commits to authority. */
 import type { FileEntry, GitSection } from "../../../engine/index.js";
 import { decodeFileEntry, encodeFileEntry, type EncodedFileEntry } from "../codecs/file-entry.js";
+import { decodeGitSection } from "../codecs/git-section.js";
 import { canonicalJson, parseCanonicalJson, utf16beOrderKey } from "../digest/codecs.js";
 import { StageDigestBuilder, type StageCounts, type StageLogicalDigest } from "../digest/stage-semantic-v1.js";
 import { CursorWindowError, GitSectionOversizeError, StageChangedError } from "../errors.js";
@@ -198,7 +199,7 @@ class SqliteSealedStage implements SealedStageReader {
         if (bytes > PAGE_BYTES) throw new GitSectionOversizeError(row.rel_path, bytes);
         return bytes;
       },
-      (row) => ({ relPath: row.rel_path, section: parseCanonicalJson(row.section_cjson) as unknown as GitSection }),
+      (row) => ({ relPath: row.rel_path, section: this.#decodeSealedSection(row.rel_path, row.section_cjson) }),
       (row) => row.rel_path,
     );
   }
@@ -206,7 +207,18 @@ class SqliteSealedStage implements SealedStageReader {
   gitRepo(role: GitSectionRole, relPath: string): GitSection | undefined {
     const row = this.accessor.db.query("SELECT section_cjson FROM stage_git_sections WHERE stage_id=? AND role=? AND rel_path=?")
       .get(this.ref.stageId, role, relPath) as { section_cjson: string } | null;
-    return row ? parseCanonicalJson(row.section_cjson) as unknown as GitSection : undefined;
+    return row ? this.#decodeSealedSection(relPath, row.section_cjson) : undefined;
+  }
+
+  /** A sealed row that no longer decodes to an admissible section is a mutated or
+   * corrupt sealed stage — the same class as every other verification failure
+   * here, so it fails as a `StageChangedError`, never a bare parse throw. */
+  #decodeSealedSection(relPath: string, sectionCjson: string): GitSection {
+    try {
+      return decodeGitSection(relPath, sectionCjson);
+    } catch (cause) {
+      throw new StageChangedError(this.ref.stageId, `git section ${relPath} is not a canonical admissible section: ${String(cause)}`);
+    }
   }
 
   streamFiles(visit: (encoded: EncodedFileEntry) => void): number {
