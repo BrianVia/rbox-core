@@ -1,0 +1,114 @@
+/** LOCAL-plane transactions.
+ *
+ * LOCAL is rebuildable, so it needs no CAS packet: a scan promotes a sealed stage
+ * by set-difference and a watcher invalidates completeness before disk mutation.
+ * Both bump the LOCAL head, which is what every push/trusted-status predicate
+ * reads through the lineage snapshot token. */
+import type { Database } from "bun:sqlite";
+import { canonicalJson } from "../digest/codecs.js";
+import { StageChangedError } from "../errors.js";
+import type { LineageSnapshot, ManifestHeader } from "../ports.js";
+import {
+  copyStageFilesIntoTemp, createStageFileTemp, dropStageFileTemp, internStagedEntryValues,
+  openSealedStage, promoteFilesIntoPlane, type SealedStageRef,
+} from "./generations.js";
+import { stateStoreDatabase, type StateStoreHandle } from "./open.js";
+import { currentSnapshot } from "./read-snapshot.js";
+import { StageLock } from "./stage-artifacts.js";
+
+export interface LocalScanResult {
+  localRevision: number;
+  token: LineageSnapshot;
+}
+
+/**
+ * Finalize a full LOCAL scan. Only a full scan may set `complete=1`, and it does so
+ * in the same transaction that installs the trust epoch the completeness claim is
+ * about — a later reader can never see one without the other.
+ */
+export function applyLocalScan(
+  store: StateStoreHandle,
+  stageDirectory: string,
+  stage: SealedStageRef,
+  header: ManifestHeader & { trustEpoch: string },
+  expected: { lineageId: string; localRevision: number },
+): LocalScanResult {
+  if (store.readonly) throw new Error("state store is open read-only");
+  if (stage.plane !== "local") throw new StageChangedError(stage.stageId, "a LOCAL scan requires a LOCAL stage");
+  if (stage.counts.gitSections !== 0) throw new StageChangedError(stage.stageId, "a LOCAL stage carries no Git sections");
+  const db = stateStoreDatabase(store);
+  createStageFileTemp(db);
+  try {
+    const lock = StageLock.acquire(stageDirectory, stage.stageId);
+    try {
+      const reader = openSealedStage(stageDirectory, stage, lock);
+      try {
+        const copied = copyStageFilesIntoTemp(db, reader);
+        if (copied !== stage.counts.files) {
+          throw new StageChangedError(stage.stageId, "sealed stage file count changed while streaming");
+        }
+      } finally {
+        reader.close();
+      }
+    } finally {
+      lock.release();
+    }
+    return promote(db, stage, header, expected);
+  } finally {
+    dropStageFileTemp(db);
+  }
+}
+
+function promote(
+  db: Database,
+  stage: SealedStageRef,
+  header: ManifestHeader & { trustEpoch: string },
+  expected: { lineageId: string; localRevision: number },
+): LocalScanResult {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const current = db.query("SELECT generation FROM plane_heads WHERE lineage_id=? AND plane='local'")
+      .get(expected.lineageId) as { generation: number } | null;
+    if (!current) throw new Error("state store LOCAL head disappeared");
+    if (current.generation !== expected.localRevision) {
+      throw new StageChangedError(stage.stageId, `LOCAL head moved to ${current.generation}, expected ${expected.localRevision}`);
+    }
+    const generation = expected.localRevision + 1;
+    internStagedEntryValues(db);
+    promoteFilesIntoPlane(db, expected.lineageId, "local", generation);
+    const { generatedAt, manifestSchema, sourceSequence, trustEpoch, complete: _complete, ...extras } = header;
+    db.query(`UPDATE plane_heads SET generation=?,generated_at=?,manifest_schema=?,source_sequence=?,
+      trust_epoch=?,complete=1,extras_cjson=? WHERE lineage_id=? AND plane='local'`).run(
+      generation, generatedAt, manifestSchema ?? null, sourceSequence ?? null, trustEpoch,
+      Object.keys(extras).length === 0 ? null : canonicalJson(extras), expected.lineageId,
+    );
+    db.exec("COMMIT");
+  } catch (error) {
+    if (db.inTransaction) db.exec("ROLLBACK");
+    throw error;
+  }
+  return { localRevision: expected.localRevision + 1, token: currentSnapshot(db) };
+}
+
+/**
+ * Watcher invalidation. Clearing `complete` bumps the LOCAL head too: a predicate
+ * that already read the previous token must be forced to re-read rather than keep
+ * treating a now-untrusted plane as a full scan.
+ */
+export function invalidateLocalPlane(store: StateStoreHandle, lineageId: string): LocalScanResult {
+  if (store.readonly) throw new Error("state store is open read-only");
+  const db = stateStoreDatabase(store);
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const current = db.query("SELECT generation,complete FROM plane_heads WHERE lineage_id=? AND plane='local'")
+      .get(lineageId) as { generation: number; complete: number } | null;
+    if (!current) throw new Error("state store LOCAL head disappeared");
+    db.query("UPDATE plane_heads SET generation=?,complete=0,trust_epoch=NULL WHERE lineage_id=? AND plane='local'")
+      .run(current.generation + 1, lineageId);
+    db.exec("COMMIT");
+    return { localRevision: current.generation + 1, token: currentSnapshot(db) };
+  } catch (error) {
+    if (db.inTransaction) db.exec("ROLLBACK");
+    throw error;
+  }
+}

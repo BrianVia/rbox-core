@@ -155,12 +155,17 @@ src/cli/state-plane/adapters/legacy-json-publication.ts — barrier-era whole-JS
 src/cli/state-plane/migration/last-writer-witness.ts — closed-schema durable proof of the exact barrier-capable writer and state bytes last published. Never: sync authority, state reads for normal operation, or migration admission policy.
 src/cli/state-plane/migration/reserve.ts — provenance-bound 1 MiB migration runway creation, adoption, and diagnostic classification. Never: claiming/deleting the reserve, migration execution, or state publication.
 src/cli/state-plane/sqlite-contract/ — tests and test-only helpers observing the bun:sqlite behaviors required by design 163. Never: production imports or database policy.
-src/cli/state-plane/ports.ts — opaque SQLite-store read-snapshot, projection, and digest contracts shared inside the CLI vertical. Never: database handles, mutation-stage contracts, engine DTO copies, or migration policy.
+src/cli/state-plane/ports.ts — opaque SQLite-store read-snapshot, projection, digest, and CAS result/retry-view contracts shared inside the CLI vertical. Never: database handles, sealed-artifact refs, engine DTO copies, or migration policy.
 src/cli/state-plane/codecs/ — exhaustive bounded FileEntry and RepoRecord column/canonical-extension mappings. Never: SQL queries, authority choice, or publication.
 src/cli/state-plane/schema/ — frozen schema-v1 DDL, application identity, genesis application, and bounded cheap-open validation. Never: runtime mutation policy or migration orchestration.
 src/cli/state-plane/store/open.ts — sole main-authority connection factory, pragma pin/readback, and clean checkpoint/close ownership. Never: state composition or authority election.
 src/cli/state-plane/store/read-snapshot.ts — short-transaction lineage/file/repository/Git cursors and final token assertion. Never: whole-state materialization or writes.
-src/cli/state-plane/digest/ — canonical framing plus authority-state and manifest logical digests. Never: stage schemas, physical publication, reset witnesses, or authority choice.
+src/cli/state-plane/store/stage-artifacts.ts — id-scoped stage locks, no-follow identity-bracketed physical proof, no-clobber sealed publication, single-accessor sealed handles, and always-finalized row streaming. Never: stage schemas, digest grammars, or authority mutation.
+src/cli/state-plane/store/generations.ts — file/Git generation staging, sealed-stage verification and cursors, entry-value interning, plane set-difference promotion, and unreferenced-value GC. Never: CAS predicates, repository transitions, or authority election.
+src/cli/state-plane/store/transition-stages.ts — sealed multi-repository CAS inputs, base-proof and evidence admission, transition row ceilings, and the frozen bounded CAS retry view. Never: authority mutation, BASE composition, or global file promotion.
+src/cli/state-plane/store/write-packet.ts — the one atomic global + multi-repository CAS: input verification, predicate checks, BASE recomposition, transition application, manifest projection rebuild, and the telemetry-binding singleton. Never: stage construction, engine merge recomputation, or lock ownership policy.
+src/cli/state-plane/store/local-plane.ts — LOCAL full-scan promotion with its trust epoch and watcher completeness invalidation. Never: BASE authority, CAS packets, or scan policy.
+src/cli/state-plane/digest/ — canonical framing plus authority-state, manifest, sealed-stage, and repository-transition logical digests. Never: physical publication, reset witnesses, or authority choice.
 src/cli/state-plane/backup/ — staged VACUUM INTO, verification, fsync, atomic no-clobber backup publication, and id-scoped cleanup. Never: reset/quarantine witnesses or authority choice.
 src/cli/state-plane/adapters/read-only.ts — unwired loadState/loadRawState-shaped and Manifest read projections over bounded store cursors. Never: whole-state writes or JSON/SQLite authority selection.
 ```

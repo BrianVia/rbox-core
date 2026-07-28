@@ -66,7 +66,7 @@ export class StateStoreOpenError extends Error {
 
 export class CursorWindowError extends Error {
   readonly name = "CursorWindowError";
-  constructor(readonly kind: "file" | "repo" | "git" | "chain", readonly requested: number, readonly maximum: number) {
+  constructor(readonly kind: "file" | "repo" | "git" | "chain" | "transition", readonly requested: number, readonly maximum: number) {
     super(`${kind} cursor window ${requested} exceeds maximum ${maximum}`);
   }
 }
@@ -89,6 +89,45 @@ export class RepoRecordOversizeError extends Error {
   readonly name = "RepoRecordOversizeError";
   constructor(readonly relPath: string, readonly canonicalBytes: number, readonly retainedEstimate: number) {
     super(`repository record ${relPath} exceeds state-store limits (${canonicalBytes} canonical, ${retainedEstimate} retained bytes)`);
+  }
+}
+
+/** A sealed stage artifact was replaced, mutated, or could not be proven to be
+ * the exact file its ref names. Never retried against the same path in place:
+ * a retry that needs different bytes needs a new stage id. */
+export class StageChangedError extends Error {
+  readonly name = "StageChangedError";
+  constructor(readonly stageId: string, detail: string) {
+    super(`sealed stage ${stageId} failed verification: ${detail}`);
+  }
+}
+
+/** The exclusive id-scoped stage lock could not be acquired or is no longer held. */
+export class StageLockError extends Error {
+  readonly name = "StageLockError";
+  constructor(readonly stageId: string, readonly detail: string) {
+    super(`stage ${stageId} lock unavailable: ${detail}`);
+  }
+}
+
+/** One transition row exceeded the 8 MiB canonical / 24 MiB retained ceiling.
+ * Raised by the pre-materialization scanner, before sealing or any authority write. */
+export class TransitionRowOversizeError extends Error {
+  readonly name = "TransitionRowOversizeError";
+  constructor(readonly relPath: string, readonly canonicalBytes: number, readonly retainedEstimate: number) {
+    super(`transition row ${relPath} exceeds transition-stage limits (${canonicalBytes} canonical, ${retainedEstimate} retained bytes)`);
+  }
+}
+
+/**
+ * A transition tried to introduce or change BASE without an explicit, purpose-bound
+ * `RepoBaseProof`. The removed first implementation of this seam admitted exactly
+ * this, which is why it is a named typed refusal rather than a generic TypeError.
+ */
+export class ProoflessBaseError extends Error {
+  readonly name = "ProoflessBaseError";
+  constructor(readonly relPath: string, readonly detail: string) {
+    super(`repository ${relPath} may not change BASE without a validated proof: ${detail}`);
   }
 }
 

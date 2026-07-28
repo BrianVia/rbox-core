@@ -57,6 +57,37 @@ export interface ReadSnapshot {
   finishProjection(): void;
 }
 
+/** The external publication lock the CAS runs under. Checked before any write
+ * and rechecked immediately before commit; loss rolls the whole packet back. */
+export interface CasOwnerToken {
+  isOwner(): boolean;
+}
+
+export type CasRejectionReason =
+  | "lineage" | "stream" | "nonce" | "state-revision" | "base-generation"
+  | "local-revision" | "repo-generation" | "global-sequence" | "owner-lost";
+
+export interface CasRetryRepo {
+  relPath: string;
+  expectedRepoGen: number;
+  /** Absent means the authority currently has no record at this path. */
+  record?: RepoRecord;
+}
+
+/** Token-coherent, sealed retry projection over ONLY the packet's touched paths.
+ * A rejection never rematerializes global files or whole maps. */
+export interface CasRetryView {
+  readonly token: LineageSnapshot;
+  touchedRepos(afterRelPath: string | undefined, batchSize: number): CursorPage<CasRetryRepo>;
+  close(): void;
+}
+
+export type CasResult =
+  | { status: "accepted"; token: LineageSnapshot }
+  | { status: "rejected"; reason: CasRejectionReason; retry: CasRetryView }
+  | { status: "busy"; detail: string }
+  | { status: "unsupported"; error: unknown };
+
 export interface MaterializeManifestRequest {
   plane: Plane;
   purpose: ManifestMaterializationPurpose;
