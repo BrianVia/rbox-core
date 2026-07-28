@@ -212,7 +212,7 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "git",
     group: "SYNCING",
     summary: "inspect and resolve deferred Git repos",
-    usage: "rbox git <deferrals | resolve>",
+    usage: "rbox git <deferrals | resolve | republish>",
   },
   {
     name: "git deferrals",
@@ -238,6 +238,18 @@ export const COMMAND_HELP: CommandHelp[] = [
     notes: [
       "The default verb is show-me.",
       "take-theirs quarantines and pins local Git work before following incoming metadata; working files are not rewritten.",
+    ],
+  },
+  {
+    name: "git republish",
+    group: "SYNCING",
+    summary: "restart one repository's Git pack chain on the next publish",
+    usage: "rbox git republish <repo> [--json]",
+    flags: [{ flag: "--json", desc: "print the recorded request as JSON" }],
+    notes: [
+      "Run on the machine that publishes this repository.",
+      "Use it when other machines keep deferring the repo with a Git pack link verify failure: the next publish sends one self-contained bundle they can import from scratch.",
+      "Records an intent only — nothing is captured, uploaded, or changed in your repository until the next publish.",
     ],
   },
   {

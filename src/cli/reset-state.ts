@@ -485,6 +485,7 @@ export async function resetSyncState(
       path.join(root, RBOX_DIR, "state", "shell.line"),
       path.join(root, RBOX_DIR, "state", "shell.deferrals"),
       path.join(root, RBOX_DIR, "state", "path-warnings.json"),
+      path.join(root, RBOX_DIR, "state", "git-republish.json"),
     ]) {
       try {
         await fs.rm(p, { recursive: true });

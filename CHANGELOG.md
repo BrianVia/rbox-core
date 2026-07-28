@@ -17,6 +17,13 @@ All notable changes to rbox are recorded here. The format follows
   so a future upgrade cannot fail partway through for want of disk, and it
   refuses to touch that reserved space if anything it did not create is
   occupying it.
+- **`rbox git republish <repo>`** — an operator lever for a Git pack chain that
+  new machines cannot replay. When every fresh machine defers a repository with
+  a "bundle verify failed for git pack link N" error, run this on the machine
+  that publishes it: the next publish sends one self-contained bundle instead of
+  another increment on the broken chain, and stranded machines recover on their
+  next pull. Records an intent only — nothing is captured or uploaded until that
+  publish — and is fully non-interactive (`--json`, exit 0/1).
 
 ## [1.10.2] - 2026-07-27
 
