@@ -21,14 +21,24 @@ import { deleteAccount, readCredentials, resolveBootstrapSecret, resolvePlatform
 import { RunCapture } from "./lib/capture.js";
 import { assignMainExit, reportExit } from "./lib/exit-code.js";
 import { renderReportMd } from "./lib/report.js";
-import { deleteImageHashRecord, imageHashRecordPath, readImageHashRecord, writeImageHashRecord } from "./lib/image-hash-records.js";
-import { formatBytes, trimRunDirectories, trimWorkloadCache } from "./lib/gc.js";
-import { assessDiskHeadroom, assessDockerInfo, assessRootlessPolicy, mayRunDockerDoctorProbes } from "./lib/doctor.js";
+import { imageHashRecordPath, readImageHashRecord, writeImageHashRecord } from "./lib/image-hash-records.js";
+import { formatBytes, trimRunDirectories } from "./lib/gc.js";
+import { doctor } from "./lib/doctor-command.js";
+import { down, gc, watch } from "./lib/runtime-commands.js";
+import { binaryGuardReport, binaryVersionGuardError } from "./lib/binary-run.js";
 import { waitForConvergence, waitForPath } from "./lib/waiters.js";
 import { ensureWorkloadDir, resolveWorkloadTar } from "./lib/workload.js";
 import { FAST_SUITE, getScenario, scenarioNames } from "./scenarios/index.js";
 import { finalizeReport, renderReportTable, skipReport, type RigCtx, type Scenario, type ScenarioReport } from "./scenarios/types.js";
-import { resolveRigBinaryOverride, rigGuestMounts, stageRigBinaryOverride } from "./lib/binary.js";
+import {
+  assertDualBinaryAllowed,
+  makeRigBinaryIdentity,
+  prepareRigBinarySelection,
+  resolveRigBinaryPaths,
+  rigGuestMounts,
+  type RigBinaryIdentity,
+  type RigBinarySelection,
+} from "./lib/binary.js";
 
 const REPO_ROOT = path.resolve(fileURLToPath(import.meta.url), "../../.."); // scripts/rig/rig.ts → repo root
 const RIG_DIR = path.join(REPO_ROOT, "scripts", "rig");
@@ -62,8 +72,8 @@ const USAGE = `rig — design-56 test bench
 
 usage:
   rig doctor [--runner container|docker]  host/runtime preflight
-  rig up [--api-url <url>] [--binary </absolute/rbox>]  build image + start rig-dev-a/b
-  rig run <scenario> [--keep-account] [--binary </absolute/rbox>] run one scenario
+  rig up [--api-url <url>] [--binary <path>] [--binary-a <path>] [--binary-b <path>]
+  rig run <scenario> [--keep-account] [--binary <path>] [--binary-a <path>] [--binary-b <path>]
   rig run all                         run the FAST suite (fresh account each; exit 1 if any FAIL)
   rig run conductor-initial-sync [--workload-tar <path>]   real-workload scale (explicit-only)
   rig watch [--api-url <url>]          live interleaved tail: [A]/[B] guests + [srv] wrangler
@@ -73,8 +83,6 @@ usage:
 scenarios: ${scenarioNames().join(", ")}
 suite:     ${FAST_SUITE.join(", ")}
 api url:   --api-url > RBOX_API > ${DEFAULT_DEV_API} (prod is always refused)`;
-
-// ── image build / staleness ─────────────────────────────────────────────────────
 
 function currentImageHash(): string {
   return imageHash({
@@ -103,11 +111,9 @@ async function ensureImage(): Promise<string> {
   return want;
 }
 
-// ── up ──────────────────────────────────────────────────────────────────────────
-
 /** Idempotent: build if stale, create the network + both containers if absent,
  *  (re)start them. Re-running with everything present just reports state. */
-async function ensureUp(apiUrl: string, binaryOverride?: string): Promise<void> {
+async function ensureUp(apiUrl: string, binaries: RigBinarySelection): Promise<void> {
   await C.ensureRuntimeReady();
   const trimmed = trimRunDirectories(RUNS_DIR);
   if (trimmed.entries) console.log(`trimmed ${trimmed.entries} old rig runs (${formatBytes(trimmed.bytes)})`);
@@ -119,8 +125,8 @@ async function ensureUp(apiUrl: string, binaryOverride?: string): Promise<void> 
     await C.networkCreate(NAMES.network);
   }
 
-  const mounts = rigGuestMounts(REPO_ROOT, binaryOverride ? stageRigBinaryOverride(binaryOverride) : undefined);
-  for (const name of [NAMES.a, NAMES.b]) {
+  for (const [name, binary] of [[NAMES.a, binaries.a], [NAMES.b, binaries.b]] as const) {
+    const mounts = rigGuestMounts(REPO_ROOT, binary.stagedDirectory);
     const spec: C.CreateSpec = { name, image: NAMES.image, imageHash: currentHash, network: NAMES.network, cpus: DEV_CPUS, memory: DEV_MEMORY, mounts, env: { RBOX_API: apiUrl } };
     let exists = await C.containerExists(name);
     if (exists && !(await C.containerHasMounts(name, mounts))) {
@@ -148,8 +154,6 @@ async function ensureUp(apiUrl: string, binaryOverride?: string): Promise<void> 
     console.log(`removed dangling rig image ${dangling.id} (${dangling.size})`);
   }
 }
-
-// ── run ───────────────────────────────────────────────────────────────────────
 
 function timestamp(d = new Date()): string {
   const p = (n: number) => String(n).padStart(2, "0");
@@ -204,7 +208,10 @@ async function executeScenario(
   apiUrl: string,
   flags: Record<string, string>,
   bootstrapSecret: string,
-  platformSecret: string
+  platformSecret: string,
+  binaries: [RigBinaryIdentity, RigBinaryIdentity],
+  selection: RigBinarySelection,
+  binaryGuardError?: string,
 ): Promise<ScenarioReport> {
   const runDir = path.join(RUNS_DIR, `${timestamp()}-${scenario.name}`);
   fs.mkdirSync(runDir, { recursive: true });
@@ -237,13 +244,16 @@ async function executeScenario(
     waitForConvergence: (da, db, dir, timeoutMs) => waitForConvergence(da, db, dir, timeoutMs),
   };
 
-  // Clean slate before every scenario (containers are reused across the suite).
-  await resetGuests({ a, b }, log);
+  if (binaryGuardError) log(`✗ ${binaryGuardError}`);
 
   // conductor-initial-sync needs the workload volume mounted into A (rig-managed,
   // scenario-specific). Absent tarball → the scenario SKIPs; a stage failure aborts.
-  if (scenario.name === "conductor-initial-sync") {
-    await prepareConductorWorkload(apiUrl, flags, log);
+  if (!binaryGuardError) {
+    // Clean slate before every scenario (containers are reused across the suite).
+    await resetGuests({ a, b }, log);
+    if (scenario.name === "conductor-initial-sync") {
+      await prepareConductorWorkload(apiUrl, flags, selection, log);
+    }
   }
 
   // Capture is created BEFORE the scenario and finalized in `finally` so artifacts
@@ -263,7 +273,9 @@ async function executeScenario(
 
   let report: ScenarioReport | undefined;
   try {
-    if (C.runtimeMarkers().includes("rootless-unvalidated") && scenario.name === "daemon-idle-cpu") {
+    if (binaryGuardError) {
+      report = binaryGuardReport(scenario.name, binaries, binaryGuardError);
+    } else if (C.runtimeMarkers().includes("rootless-unvalidated") && scenario.name === "daemon-idle-cpu") {
       report = skipReport(scenario.name, "resource-budget scenario skipped: rootless-unvalidated");
     } else try {
       report = await scenario.run(ctx);
@@ -275,11 +287,12 @@ async function executeScenario(
       report = finalizeReport({ scenario: scenario.name, startedAt: now, finishedAt: now, steps: [{ name: "run", ok: false, ms: 0, detail: String(e) }], assertions: [] });
     }
   } finally {
-    await cleanupScenarioAccount(ctx, report);
+    if (!binaryGuardError) await cleanupScenarioAccount(ctx, report);
   }
 
   if (!report) throw new Error(`scenario ${scenario.name} produced no report`);
 
+  report = { ...report, binaries };
   const persistedReport = { ...report, runner: C.runnerName(), ...(C.runtimeMarkers().length ? { markers: [...C.runtimeMarkers()] } : {}) };
   fs.writeFileSync(path.join(runDir, "report.json"), JSON.stringify(persistedReport, null, 2));
 
@@ -304,17 +317,38 @@ async function executeScenario(
   return report;
 }
 
+async function probeBinaryIdentities(
+  apiUrl: string,
+  selection: RigBinarySelection,
+): Promise<[RigBinaryIdentity, RigBinaryIdentity]> {
+  const a = new Device(NAMES.a, apiUrl);
+  const b = new Device(NAMES.b, apiUrl);
+  const [versionA, versionB] = await Promise.all([
+    a.rbox(["--version"], { allowFail: true }),
+    b.rbox(["--version"], { allowFail: true }),
+  ]);
+  const version = (result: C.RunResult): string => (result.stdout.trim() || result.stderr.trim() || "(no version output)");
+  return [
+    makeRigBinaryIdentity("A", selection.a, version(versionA), versionA.exitCode),
+    makeRigBinaryIdentity("B", selection.b, version(versionB), versionB.exitCode),
+  ];
+}
+
 async function runScenario(name: string, apiUrl: string, flags: Record<string, string>): Promise<number> {
   const scenario = getScenario(name);
   if (!scenario) {
     console.error(`rig: unknown scenario ${JSON.stringify(name)} (have: ${scenarioNames().join(", ")})`);
     return 2;
   }
-  // Resolve the secret up front (never printed) so a misconfig fails before any work.
-  const bootstrapSecret = resolveBootstrapSecret(REPO_ROOT);
-  const platformSecret = resolvePlatformSecret(REPO_ROOT);
-  await ensureUp(apiUrl, resolveRigBinaryOverride(flags));
-  const report = await executeScenario(scenario, apiUrl, flags, bootstrapSecret, platformSecret);
+  const selection = prepareRigBinarySelection(resolveRigBinaryPaths(flags), REPO_ROOT);
+  assertDualBinaryAllowed(selection, scenario.name, scenario.supportsDualBinary === true);
+  await ensureUp(apiUrl, selection);
+  const binaries = await probeBinaryIdentities(apiUrl, selection);
+  const guardError = binaryVersionGuardError(selection, binaries);
+  // A binary-identity refusal needs neither account secrets nor guest cleanup.
+  const bootstrapSecret = guardError ? "" : resolveBootstrapSecret(REPO_ROOT);
+  const platformSecret = guardError ? "" : resolvePlatformSecret(REPO_ROOT);
+  const report = await executeScenario(scenario, apiUrl, flags, bootstrapSecret, platformSecret, binaries, selection, guardError);
   return reportExit(report);
 }
 
@@ -324,15 +358,22 @@ async function runScenario(name: string, apiUrl: string, flags: Record<string, s
  * FAILs; SKIP never fails the suite. conductor-initial-sync stays explicit-only.
  */
 async function runSuite(apiUrl: string, flags: Record<string, string>): Promise<number> {
-  const bootstrapSecret = resolveBootstrapSecret(REPO_ROOT);
-  const platformSecret = resolvePlatformSecret(REPO_ROOT);
-  await ensureUp(apiUrl, resolveRigBinaryOverride(flags));
+  const selection = prepareRigBinarySelection(resolveRigBinaryPaths(flags), REPO_ROOT);
+  for (const name of FAST_SUITE) {
+    const scenario = getScenario(name)!;
+    assertDualBinaryAllowed(selection, scenario.name, scenario.supportsDualBinary === true);
+  }
+  await ensureUp(apiUrl, selection);
+  const binaries = await probeBinaryIdentities(apiUrl, selection);
+  const guardError = binaryVersionGuardError(selection, binaries);
+  const bootstrapSecret = guardError ? "" : resolveBootstrapSecret(REPO_ROOT);
+  const platformSecret = guardError ? "" : resolvePlatformSecret(REPO_ROOT);
 
   const results: ScenarioReport[] = [];
   for (const name of FAST_SUITE) {
     const scenario = getScenario(name)!;
     console.log(`\n═══ suite: ${name} (${results.length + 1}/${FAST_SUITE.length}) ═══`);
-    results.push(await executeScenario(scenario, apiUrl, flags, bootstrapSecret, platformSecret));
+    results.push(await executeScenario(scenario, apiUrl, flags, bootstrapSecret, platformSecret, binaries, selection, guardError));
   }
 
   const pad = Math.max(...results.map((r) => r.scenario.length));
@@ -354,7 +395,12 @@ async function runSuite(apiUrl: string, flags: Record<string, string>): Promise<
  * scenarios have no container access by design. Host-side staging is deliberate —
  * see the workload.ts header for the container-1.0.0 wedge this replaced.
  */
-async function prepareConductorWorkload(apiUrl: string, flags: Record<string, string>, log: (l: string) => void): Promise<void> {
+async function prepareConductorWorkload(
+  apiUrl: string,
+  flags: Record<string, string>,
+  binaries: RigBinarySelection,
+  log: (l: string) => void,
+): Promise<void> {
   const tarPath = resolveWorkloadTar(flags);
   if (!fs.existsSync(tarPath)) {
     log(`conductor workload tarball absent (${tarPath}) — scenario will SKIP`);
@@ -376,233 +422,12 @@ async function prepareConductorWorkload(apiUrl: string, flags: Record<string, st
     network: NAMES.network,
     cpus: DEV_CPUS,
     memory: DEV_MEMORY,
-    mounts: rigGuestMounts(REPO_ROOT, (() => {
-      const binary = resolveRigBinaryOverride(flags);
-      return binary ? stageRigBinaryOverride(binary) : undefined;
-    })(), [
+    mounts: rigGuestMounts(REPO_ROOT, binaries.a.stagedDirectory, [
       { source: staged.dir, target: GUEST.workloadMount, readonly: true },
     ]),
     env: { RBOX_API: apiUrl },
   });
   await C.startContainer(NAMES.a);
-}
-
-// ── down ──────────────────────────────────────────────────────────────────────
-
-async function down(all: boolean): Promise<void> {
-  const removed: string[] = [];
-  for (const name of [NAMES.a, NAMES.b]) {
-    await C.stopContainer(name);
-    if (await C.deleteContainer(name)) removed.push(`container ${name}`);
-  }
-  if (await C.networkDelete(NAMES.network)) removed.push(`network ${NAMES.network}`);
-  if (all) {
-    if (await C.imageDelete(NAMES.image)) removed.push(`image ${NAMES.image}`);
-    for (const volume of await C.listRigVolumes()) {
-      if (await C.volumeDelete(volume.name)) removed.push(`volume ${volume.name}`);
-    }
-    for (const image of await C.rigDanglingImages()) if (await C.imageDelete(image.id)) removed.push(`dangling image ${image.id} (${image.size})`);
-    try {
-      deleteImageHashRecord(HASH_FILE, C.runnerName());
-    } catch {
-      /* best-effort */
-    }
-  }
-  console.log(removed.length ? `removed:\n  ${removed.join("\n  ")}` : "nothing to remove (already clean)");
-}
-
-async function gc(): Promise<void> {
-  await C.ensureRuntimeReady();
-  const images = await C.rigDanglingImages();
-  let removedImages = 0;
-  const reclaimedImageSizes: string[] = [];
-  for (const image of images) if (await C.imageDelete(image.id)) { removedImages++; reclaimedImageSizes.push(image.size); }
-  const volumes = await C.listRigVolumes();
-  let removedVolumes = 0;
-  const reclaimedVolumeSizes: string[] = [];
-  for (const volume of volumes) if (await C.volumeDelete(volume.name)) { removedVolumes++; reclaimedVolumeSizes.push(volume.size); }
-  const runs = trimRunDirectories(RUNS_DIR);
-  const cache = trimWorkloadCache(path.join(os.homedir(), ".cache", "rbox-rig", "workloads"));
-  console.log(`rig gc: ${removedImages} dangling images (${reclaimedImageSizes.join(", ") || "0 B"})`);
-  console.log(`rig gc: ${removedVolumes} rig volumes (${reclaimedVolumeSizes.join(", ") || "0 B"})`);
-  console.log(`rig gc: ${runs.entries} old runs (${formatBytes(runs.bytes)})`);
-  console.log(`rig gc: ${cache.entries} workload-cache entries (${formatBytes(cache.bytes)})`);
-}
-
-// ── watch ─────────────────────────────────────────────────────────────────────
-
-/** Interleaved live tail of both guests + the dev worker until Ctrl-C. The [srv]
- *  stream uses `--format pretty` — wrangler v4's `--format json` is multi-line
- *  pretty-printed (useless to compact line-by-line); pretty is already human-readable. */
-async function watch(apiUrl: string): Promise<number> {
-  console.log(`rig watch — [A]/[B] container logs + [srv] wrangler tail (${apiUrl}). Ctrl-C to stop.`);
-  const handles: C.StreamHandle[] = [];
-  const emit = (prefix: string) => (line: string) => console.log(`${prefix} ${line}`);
-
-  handles.push(C.streamContainerLogs(NAMES.a, { onStdout: emit("[A]"), onStderr: emit("[A]") }));
-  handles.push(C.streamContainerLogs(NAMES.b, { onStdout: emit("[B]"), onStderr: emit("[B]") }));
-  handles.push(
-    C.spawnStream(["bunx", "wrangler", "tail", "rbox-dev-api", "--format", "pretty"], {
-      cwd: path.join(REPO_ROOT, "apps", "api"),
-      onStdout: emit("[srv]"),
-      onStderr: emit("[srv]"),
-    })
-  );
-
-  await new Promise<void>((resolve) => {
-    const stop = () => {
-      for (const h of handles) {
-        try {
-          h.kill("SIGTERM");
-        } catch {
-          /* best-effort */
-        }
-      }
-      resolve();
-    };
-    process.on("SIGINT", stop);
-    process.on("SIGTERM", stop);
-  });
-  return 0;
-}
-
-// ── doctor ──────────────────────────────────────────────────────────────────────
-
-interface Check {
-  label: string;
-  ok: boolean;
-  detail: string;
-  fix?: string;
-  /** Advisory checks are informational only — they never affect the exit code. */
-  advisory?: boolean;
-}
-
-async function doctor(apiUrl: string): Promise<number> {
-  const checks: Check[] = [];
-  const add = (label: string, ok: boolean, detail: string, fix?: string) => checks.push({ label, ok, detail, fix });
-  const advise = (label: string, ok: boolean, detail: string) => checks.push({ label, ok, detail, advisory: true });
-
-  if (C.runnerName() === "apple-container") {
-    try {
-      const ver = (await C.spawnHost(["sw_vers", "-productVersion"], { allowFail: true })).stdout.trim();
-      const major = Number(ver.split(".")[0]);
-      add("macOS >= 26", Number.isFinite(major) && major >= 26, ver || "unknown", "upgrade macOS (container needs macOS 26+ for container-to-container networking)");
-    } catch { add("macOS >= 26", false, "sw_vers failed"); }
-    const arch = (await C.spawnHost(["uname", "-m"], { allowFail: true })).stdout.trim();
-    add("arch arm64", arch === "arm64", arch || "unknown", "the rig targets arm64 (Apple silicon) guests");
-    const ver = await C.version();
-    add("container CLI present", ver.length > 0, ver || "not found", "brew install container   # Apple container runtime");
-    const sys = await C.systemStatus();
-    add("container system running", sys.healthy, sys.healthy ? "healthy" : sys.raw || "not running", "container system start");
-    const cacheDir = path.join(os.homedir(), ".cache", "rbox-rig", "workloads");
-    fs.mkdirSync(RUNS_DIR, { recursive: true }); fs.mkdirSync(cacheDir, { recursive: true });
-    const disk = await C.spawnHost(["df", "-Pk", RUNS_DIR, cacheDir], { allowFail: true });
-    const diskAssessment = assessDiskHeadroom(disk.exitCode === 0 ? disk.stdout : (disk.stderr || disk.stdout), disk.exitCode);
-    add("runs/cache disk headroom", diskAssessment.ok, diskAssessment.detail, "run `bun run rig gc`");
-  } else {
-    let dockerLocal = false;
-    try {
-      const endpoint = await C.dockerEndpoint();
-      dockerLocal = mayRunDockerDoctorProbes(endpoint);
-      add("Docker context is local", dockerLocal, endpoint || "unknown", "select a local unix-socket Docker context; remote daemons cannot resolve checkout bind paths");
-    } catch (e) { add("Docker context is local", false, e instanceof Error ? e.message : String(e)); }
-    let info: C.DockerInfo | undefined;
-    let dockerInfoError: string | undefined;
-    let dockerDiskOk = false;
-    try {
-      info = await C.dockerInfo();
-      const capability = assessDockerInfo(info);
-      add("Docker server capabilities", capability.ok, capability.detail, "enable Docker memory and CPU quota support");
-    } catch (e) {
-      dockerInfoError = e instanceof Error ? e.message : String(e);
-      add("Docker server capabilities", false, dockerInfoError, "start Docker and check local socket permissions");
-    }
-    if (dockerLocal && info && typeof info.DockerRootDir === "string" && info.DockerRootDir !== "") {
-      const cacheDir = path.join(os.homedir(), ".cache", "rbox-rig", "workloads");
-      fs.mkdirSync(RUNS_DIR, { recursive: true }); fs.mkdirSync(cacheDir, { recursive: true });
-      const disk = await C.spawnHost(["df", "-Pk", info.DockerRootDir, RUNS_DIR, cacheDir], { allowFail: true });
-      const diskAssessment = assessDiskHeadroom(disk.exitCode === 0 ? disk.stdout : (disk.stderr || disk.stdout), disk.exitCode);
-      dockerDiskOk = diskAssessment.ok;
-      add("Docker/runs/cache disk headroom", diskAssessment.ok, diskAssessment.detail,
-        "run `bun run rig gc`; if Docker build cache dominates, inspect it and choose `docker builder prune` manually");
-      advise("Docker builder cache size", true, await C.dockerBuilderDiskUsage());
-    } else {
-      add("Docker/runs/cache disk space", false,
-        dockerLocal ? dockerInfoError ?? "DockerRootDir unavailable" : "refused for remote Docker context");
-    }
-    let dockerProbeOk = false;
-    try {
-      if (!dockerLocal) throw new Error("refused for remote Docker context");
-      if (!(await C.imageExists(NAMES.image))) {
-        if (!dockerDiskOk) throw new Error("probe image absent and disk-headroom gate failed; refusing to build");
-        const hash = currentImageHash();
-        console.log(`doctor: building scoped probe image ${NAMES.image} (${hash})…`);
-        const built = await C.ensureImagePresent({ tag: NAMES.image, dockerfile: path.join(RIG_DIR, "Dockerfile"), contextDir: REPO_ROOT, labels: { "rig.hash": hash } });
-        if (built) writeImageHashRecord(HASH_FILE, C.runnerName(), hash);
-      }
-      const probe = await C.runDockerDoctorProbe(REPO_ROOT);
-      dockerProbeOk = probe.exitCode === 0;
-      add("Docker bind/network probe", probe.exitCode === 0, probe.exitCode === 0 ? "read-only checkout bind + outbound DNS passed" : (probe.stderr || probe.stdout).trim(), "check bind policy and daemon networking, then re-run doctor");
-    } catch (e) { add("Docker bind/network probe", false, e instanceof Error ? e.message : String(e)); }
-    if (dockerLocal && info && C.dockerIsRootless(info)) {
-      let limitsProbeOk = false;
-      try {
-        await C.assessRuntimeResourcePolicy(NAMES.image);
-        limitsProbeOk = !C.runtimeMarkers().includes("rootless-unvalidated");
-      } catch { /* assessment below remains rootless-unvalidated */ }
-      const policy = assessRootlessPolicy(info, limitsProbeOk);
-      advise("rootless resource-limit policy", policy.ok, policy.detail);
-    } else if (dockerLocal && info) {
-      const policy = assessRootlessPolicy(info, dockerProbeOk);
-      advise("rootless resource-limit policy", policy.ok, policy.detail);
-    } else advise("rootless resource-limit policy", false, dockerLocal ? "docker info unavailable" : "refused for remote Docker context");
-  }
-
-  // bun on host
-  const bun = (await C.spawnHost(["bun", "--version"], { allowFail: true })).stdout.trim();
-  add("bun present", bun.length > 0, bun || "not found", "curl -fsSL https://bun.sh/install | bash");
-
-  // bootstrap secret resolvable (never printed)
-  try {
-    resolveBootstrapSecret(REPO_ROOT);
-    add("bootstrap secret resolvable", true, "found (redacted)");
-  } catch (e) {
-    add("bootstrap secret resolvable", false, e instanceof Error ? e.message : String(e), "set RBOX_DEV_BOOTSTRAP or add RBOX_DEV_BOOTSTRAP_SECRET= to dev-keys.local.secret");
-  }
-
-  // platform secret resolvable (never printed)
-  try {
-    resolvePlatformSecret(REPO_ROOT);
-    add("platform secret resolvable", true, "found (redacted)");
-  } catch (e) {
-    add("platform secret resolvable", false, e instanceof Error ? e.message : String(e), "set RBOX_DEV_PLATFORM_SECRET or add RBOX_DEV_PLATFORM_SECRET= to dev-keys.local.secret");
-  }
-
-  // dev API reachable (GET /health, 5s budget)
-  try {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 5000);
-    const res = await fetch(`${apiUrl}/health`, { signal: ctrl.signal }).finally(() => clearTimeout(timer));
-    add("dev API reachable", res.ok, `${apiUrl}/health → ${res.status}`, "check the dev worker is deployed / your network");
-  } catch (e) {
-    add("dev API reachable", false, `${apiUrl}/health → ${e instanceof Error ? e.message : String(e)}`);
-  }
-
-  // Advisory: the AE query pair (optional — absence only skips the server-metrics
-  // capture channel, never fails the run or doctor).
-  advise("CLOUDFLARE_ACCOUNT_ID (optional, AE query)", Boolean(process.env.CLOUDFLARE_ACCOUNT_ID), process.env.CLOUDFLARE_ACCOUNT_ID ? "present" : "absent");
-  advise("CLOUDFLARE_API_TOKEN (optional, AE query)", Boolean(process.env.CLOUDFLARE_API_TOKEN), process.env.CLOUDFLARE_API_TOKEN ? "present" : "absent");
-
-  let anyFail = false;
-  for (const c of checks) {
-    const mark = c.advisory ? (c.ok ? "○" : "·") : c.ok ? "✓" : "✗";
-    console.log(`${mark} ${c.label}: ${c.detail}`);
-    if (!c.ok && !c.advisory) {
-      anyFail = true;
-      if (c.fix) console.log(`    fix: ${c.fix}`);
-    }
-  }
-  return anyFail ? 1 : 0;
 }
 
 // ── main ─────────────────────────────────────────────────────────────────────
@@ -620,11 +445,18 @@ async function main(): Promise<number> {
   // Prod-URL refusal happens inside resolveConfig, before any container is created.
   switch (cmd) {
     case "doctor":
-      return doctor(resolveConfig(process.env, flags, REPO_ROOT).apiUrl);
+      return doctor({
+        apiUrl: resolveConfig(process.env, flags, REPO_ROOT).apiUrl,
+        repoRoot: REPO_ROOT,
+        rigDir: RIG_DIR,
+        runsDir: RUNS_DIR,
+        hashFile: HASH_FILE,
+        currentImageHash,
+      });
     case "up":
       await ensureUp(
         resolveConfig(process.env, flags, REPO_ROOT).apiUrl,
-        resolveRigBinaryOverride(flags),
+        prepareRigBinarySelection(resolveRigBinaryPaths(flags), REPO_ROOT),
       );
       console.log("up complete.");
       return 0;
@@ -638,12 +470,12 @@ async function main(): Promise<number> {
       return scenario === "all" ? runSuite(apiUrl, flags) : runScenario(scenario, apiUrl, flags);
     }
     case "watch":
-      return watch(resolveConfig(process.env, flags, REPO_ROOT).apiUrl);
+      return watch(resolveConfig(process.env, flags, REPO_ROOT).apiUrl, REPO_ROOT);
     case "down":
-      await down(flags.all === "true");
+      await down(flags.all === "true", HASH_FILE);
       return 0;
     case "gc":
-      await gc();
+      await gc(RUNS_DIR);
       return 0;
     default:
       console.error(`rig: unknown command ${JSON.stringify(cmd)}\n`);

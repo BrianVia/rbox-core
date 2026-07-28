@@ -7,6 +7,7 @@
 import type { Device } from "../lib/device.js";
 import type { Divergence } from "../lib/convergence.js";
 import type { PollOutcome } from "../lib/waiters.js";
+import type { RigBinaryIdentity } from "../lib/binary.js";
 
 export interface RigCtx {
   a: Device;
@@ -47,6 +48,8 @@ export interface RigCtx {
 
 export interface Scenario {
   name: string;
+  /** Closed by default: the scenario's assertions are valid across version skew. */
+  supportsDualBinary?: true;
   run(ctx: RigCtx): Promise<ScenarioReport>;
 }
 
@@ -73,6 +76,8 @@ export interface ScenarioReport {
   durationMs: number;
   steps: StepResult[];
   assertions: AssertionResult[];
+  /** Host artifact provenance plus the version observed inside each guest. */
+  binaries?: [RigBinaryIdentity, RigBinaryIdentity];
   /** Present only when `verdict === "SKIP"` — the human reason (e.g. absent tarball). */
   skipReason?: string;
 }

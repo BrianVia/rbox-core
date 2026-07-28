@@ -34,7 +34,13 @@ const skippedCapture: CaptureSummary = {
 };
 
 test("renderReportMd renders a full run with verdict, steps, resources, and AE", () => {
-  const md = renderReportMd(report, fullCapture);
+  const md = renderReportMd({
+    ...report,
+    binaries: [
+      { device: "A", mode: "compiled", version: "rbox 1.11.0", versionExitCode: 0, hostPath: "/artifacts/rbox-1.11.0", sha256: "a".repeat(64) },
+      { device: "B", mode: "compiled", version: "rbox 2.0.0", versionExitCode: 0, hostPath: "/artifacts/rbox-2.0.0", sha256: "b".repeat(64) },
+    ],
+  }, fullCapture);
   expect(md).toContain("# onboard-smoke — ✅ PASS");
   expect(md).toContain("runner: docker");
   expect(md).toContain("[A] login --bootstrap");
@@ -43,6 +49,8 @@ test("renderReportMd renders a full run with verdict, steps, resources, and AE",
   expect(md).toContain("peak mem 210.5 MB");
   expect(md).toContain("wrangler tail");
   expect(md).toContain("Analytics Engine");
+  expect(md).toContain("rbox 1.11.0");
+  expect(md).toContain("/artifacts/rbox-2.0.0");
   expect(md).toContain("`stats-a.jsonl`");
 });
 
