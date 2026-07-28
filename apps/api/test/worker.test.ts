@@ -2249,6 +2249,9 @@ describe("release distribution (design 14)", () => {
     await env.rbox_releases.put("releases/version.json", '{"version":"0.0.2"}');
     await env.rbox_releases.put("releases/version.json.sig", "sig-bytes");
     await env.rbox_releases.put("releases/install.sh", "#!/bin/sh\n");
+    await env.rbox_releases.put("releases/next/manifest.json", '{"version":"2.0.0-beta.1"}');
+    await env.rbox_releases.put("releases/next/manifest.json.sig", "next-sig-bytes");
+    await env.rbox_releases.put("releases/next/install.sh", "#!/bin/sh\n# next\n");
     await env.rbox_releases.put("releases/changelog.md", "# Changelog\n\n## [0.0.2]\n");
     await env.rbox_releases.put("releases/rbox-linux-x64", "LATEST-BIN");
     await env.rbox_releases.put("releases/rbox-darwin-arm64", "LATEST-DARWIN");
@@ -2290,6 +2293,16 @@ describe("release distribution (design 14)", () => {
     expect(v.headers.get("cache-control")).toBe("no-cache");
     expect(((await v.json()) as { version: string }).version).toBe("0.0.2");
     expect((await SELF.fetch(`${BASE}/version.sig`)).status).toBe(200);
+  });
+
+  test("/next release objects are isolated from stable keys", async () => {
+    const v = await SELF.fetch(`${BASE}/next/version`);
+    expect(v.status).toBe(200);
+    expect(v.headers.get("cache-control")).toBe("no-cache");
+    expect(((await v.json()) as { version: string }).version).toBe("2.0.0-beta.1");
+    expect(await (await SELF.fetch(`${BASE}/next/version.sig`)).text()).toBe("next-sig-bytes");
+    expect(await (await SELF.fetch(`${BASE}/next/install.sh`)).text()).toBe("#!/bin/sh\n# next\n");
+    expect(((await (await SELF.fetch(`${BASE}/version`)).json()) as { version: string }).version).toBe("0.0.2");
   });
 
   // End-to-end through the REAL worker fetch → gateway → ctx.exports.CachedReleases

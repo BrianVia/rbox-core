@@ -17,9 +17,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { releaseSigningInput, verifyReleaseArtifacts } from "../src/cli/release-verify.js";
 import { RELEASE_KEYS } from "../src/cli/release-key.js";
-import { semverGt } from "../src/cli/semver.js";
+import { parseSemver, releaseChannelForVersion, semverGt, type ReleaseChannel } from "../src/cli/semver.js";
 import { buildCryptoWorkerBundle } from "./build-crypto-worker.js";
-import { publishReleaseObjects, wranglerReleaseStore } from "./release-publish.js";
+import { publishReleaseObjects, wranglerReleaseStore, type ReleaseObjectStore } from "./release-publish.js";
 
 const ROOT = path.resolve(import.meta.dir, "..");
 // Intel Macs (darwin-x64) are intentionally unsupported — Apple Silicon + Linux only.
@@ -47,7 +47,124 @@ export function checkedInRboxVersion(source: string): string {
 
 export function deriveDevVersion(checkedInVersion: string, shortSha: string): string {
   if (!/^[0-9a-f]{7,64}$/i.test(shortSha)) throw new Error(`invalid short git sha ${JSON.stringify(shortSha)}`);
-  return `${checkedInVersion}-dev+${shortSha}`;
+  if (parseSemver(checkedInVersion).build !== null) {
+    throw new Error(`checked-in version must not contain build metadata: ${checkedInVersion}`);
+  }
+  return `${checkedInVersion}+dev.${shortSha}`;
+}
+
+export function releaseChannelForInput(version: string): ReleaseChannel {
+  const parsed = parseSemver(version);
+  if (parsed.build !== null) throw new Error(`release version must not contain build metadata: ${version}`);
+  return releaseChannelForVersion(version);
+}
+
+/** Mirrors release.yml's `!contains(github.ref_name, '-')` changelog guard. */
+export function workflowPublishesChangelog(version: string): boolean {
+  return !version.includes("-");
+}
+
+function replaceOnce(source: string, before: string, after: string): string {
+  const first = source.indexOf(before);
+  if (first === -1 || source.indexOf(before, first + before.length) !== -1) {
+    throw new Error(`next installer template expected exactly one ${JSON.stringify(before)}`);
+  }
+  return `${source.slice(0, first)}${after}${source.slice(first + before.length)}`;
+}
+
+/** Derive the opt-in installer without changing the stable install.sh bytes. */
+export function nextInstallerSource(stableSource: string): string {
+  let source = replaceOnce(
+    stableSource,
+    'BASE="${RBOX_DOWNLOAD_BASE:-https://api.rbox.to}"',
+    'BASE="${RBOX_DOWNLOAD_BASE:-https://api.rbox.to}"\nMANIFEST_BASE="$BASE/next"',
+  );
+  source = replaceOnce(source, 'URL="$BASE/bin/$BIN"', 'URL="" # assigned from the signed next manifest below');
+  source = source.replaceAll("$BASE/version", "$MANIFEST_BASE/version");
+  source = replaceOnce(
+    source,
+    'rm -f "$DEST/rbox.channel.json"',
+    `printf '%s\\n' '{"schema":1,"channel":"next"}' > "$CHANNEL_TMP"
+chmod 644 "$CHANNEL_TMP"
+mv -f "$CHANNEL_TMP" "$DEST/rbox.channel.json"`,
+  );
+  source = replaceOnce(
+    source,
+    "EXPECTED_SHA=$(printf '%s\\n' \"$SHA_MATCHES\" | sed -n '1p')",
+    `EXPECTED_SHA=$(printf '%s\\n' "$SHA_MATCHES" | sed -n '1p')
+ARTIFACT_PATHS=$(
+  grep -Eo "\\"$BIN\\":\\{[^}]*\\"path\\":\\"v[0-9A-Za-z.+-]+/$BIN\\"" "$MANIFEST" 2>/dev/null |
+    sed -E -n 's/.*"path":"([^"]+)".*/\\1/p'
+)
+ARTIFACT_PATH_COUNT=$(printf '%s\\n' "$ARTIFACT_PATHS" | sed '/^$/d' | wc -l | tr -d ' ')
+if [ "$ARTIFACT_PATH_COUNT" != "1" ]; then
+  echo "rbox: next release manifest did not contain exactly one immutable path for $BIN" >&2
+  exit 1
+fi
+ARTIFACT_PATH=$(printf '%s\\n' "$ARTIFACT_PATHS" | sed -n '1p')
+URL="$BASE/bin/$ARTIFACT_PATH"`,
+  );
+  return source;
+}
+
+export type LiveChannelVersion = { status: "found"; version: string } | { status: "missing" };
+
+export function isWranglerMissingDiagnostic(stderr: string): boolean {
+  const plain = stderr.replace(/\x1b\[[0-9;]*m/g, "");
+  return /(?:^|\n)\s*(?:✘\s*)?(?:\[ERROR\]\s*)?The specified key does not exist\.\s*(?:\n|$)/.test(plain);
+}
+
+function nextChannelStore(store: ReleaseObjectStore, nextInstaller: string): ReleaseObjectStore {
+  return {
+    sha256: (key) => store.sha256(key),
+    put: (key, file, contentType) => {
+      if (/^releases\/v[^/]+\/rbox-/.test(key)) return store.put(key, file, contentType);
+      if (/^releases\/rbox-/.test(key)) return Promise.resolve();
+      if (key === "releases/install.sh") return store.put("releases/next/install.sh", nextInstaller, contentType);
+      if (key === "releases/version.json") return store.put("releases/next/manifest.json", file, contentType);
+      if (key === "releases/version.json.sig") return store.put("releases/next/manifest.json.sig", file, contentType);
+      return Promise.reject(new Error(`unexpected mutable next-channel key ${key}`));
+    },
+  };
+}
+
+export async function publishReleaseChannel(opts: {
+  channel: ReleaseChannel;
+  manifest: ReturnType<typeof verifyReleaseArtifacts>;
+  dist: string;
+  store: ReleaseObjectStore;
+  readLive: (key: string) => LiveChannelVersion | Promise<LiveChannelVersion>;
+  stableInstaller: string;
+  changelog: string;
+}): Promise<void> {
+  const manifestKey = opts.channel === "latest" ? "releases/version.json" : "releases/next/manifest.json";
+  const before = await opts.readLive(manifestKey);
+  if (before.status === "missing" && opts.channel === "latest") {
+    throw new Error("could not read the live release manifest — refusing mutable publication");
+  }
+  if (before.status === "found" && semverGt(before.version, opts.manifest.version)) {
+    throw new Error(`live ${opts.channel} release ${before.version} is newer than candidate ${opts.manifest.version} — refusing rollback`);
+  }
+
+  if (opts.channel === "latest") {
+    await publishReleaseObjects({ manifest: opts.manifest, dist: opts.dist, store: opts.store });
+  } else {
+    const nextInstaller = path.join(opts.dist, "install-next.sh");
+    fs.writeFileSync(nextInstaller, nextInstallerSource(fs.readFileSync(opts.stableInstaller, "utf8")));
+    await publishReleaseObjects({
+      manifest: opts.manifest,
+      dist: opts.dist,
+      store: nextChannelStore(opts.store, nextInstaller),
+    });
+  }
+
+  const after = await opts.readLive(manifestKey);
+  if (after.status !== "found" || after.version !== opts.manifest.version) {
+    throw new Error(`live ${opts.channel} release did not activate ${opts.manifest.version}`);
+  }
+  if (opts.channel === "latest") {
+    await opts.store.put("releases/changelog.md", opts.changelog, "text/markdown; charset=utf-8");
+  }
 }
 
 /** Rewrite version.ts only for the duration of a build, restoring its exact bytes on every throw/return. */
@@ -71,9 +188,20 @@ const argv = process.argv.slice(2);
 const dev = argv.includes("--dev");
 const positional = argv.filter((value) => !value.startsWith("--"));
 const uploadOnly = argv.includes("--upload-only");
-if ((dev && (positional.length !== 0 || uploadOnly)) || (!dev && (positional.length !== 1 || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(positional[0]!)))) {
+let channel: ReleaseChannel | undefined;
+let channelError: unknown;
+try {
+  if (!dev && positional.length === 1) channel = releaseChannelForInput(positional[0]!);
+} catch (error) {
+  channelError = error;
+}
+if ((dev && (positional.length !== 0 || uploadOnly)) || (!dev && (positional.length !== 1 || channel === undefined))) {
+  if (channelError instanceof Error) console.error(channelError.message);
   console.error("usage: bun scripts/release.ts <version> [--targets=...] [--no-upload | --upload-only]\n       bun scripts/release.ts --dev [--targets=...]");
   process.exit(2);
+}
+if (!dev && workflowPublishesChangelog(positional[0]!) !== (channel === "latest")) {
+  throw new Error(`release channel and workflow changelog gate disagree for ${positional[0]}`);
 }
 const versionFile = path.join(ROOT, "src/cli/version.ts");
 const checkedInSource = fs.readFileSync(versionFile, "utf8");
@@ -88,7 +216,7 @@ const keyId = process.env.RBOX_RELEASE_KEY_ID ?? RELEASE_KEYS[0]!.keyId;
 const tag = `v${version}`;
 const dist = path.join(ROOT, "dist");
 
-if (!dev) {
+if (!dev && channel === "latest") {
   const changelog = fs.readFileSync(path.join(ROOT, "CHANGELOG.md"), "utf8");
   const firstReleased = changelog.match(/^## \[(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\]/m)?.[1];
   if (firstReleased !== version) {
@@ -115,22 +243,32 @@ async function uploadRelease(): Promise<void> {
   // Pin wrangler to an exact version so the publish step can't pull a surprise "latest".
   const WRANGLER = "wrangler@4.107.0"; // keep in lockstep with the root devDependency pin
   const store = wranglerReleaseStore({ cwd: ROOT, wrangler: WRANGLER });
-  const liveManifest = () => {
-    const got = Bun.spawnSync(["bunx", WRANGLER, "r2", "object", "get", "rbox-releases/releases/version.json", "--pipe", "--remote"], { cwd: ROOT });
-    if (got.exitCode !== 0) throw new Error("could not read the live release manifest — refusing mutable publication");
+  const liveManifest = (key: string): LiveChannelVersion => {
+    const got = Bun.spawnSync(["bunx", WRANGLER, "r2", "object", "get", `rbox-releases/${key}`, "--pipe", "--remote"], {
+      cwd: ROOT,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    if (got.exitCode !== 0) {
+      const stderr = got.stderr.toString().trim();
+      if (channel === "next" && isWranglerMissingDiagnostic(stderr)) return { status: "missing" };
+      throw new Error(`could not read the live ${channel} release manifest — refusing mutable publication${stderr ? `: ${stderr}` : ""}`);
+    }
     const parsed = JSON.parse(got.stdout.toString()) as { version?: unknown };
-    if (typeof parsed.version !== "string") throw new Error("live release manifest has no valid version");
-    return parsed.version;
+    if (typeof parsed.version !== "string") throw new Error(`live ${channel} release manifest has no valid version`);
+    parseSemver(parsed.version);
+    return { status: "found", version: parsed.version };
   };
-  const before = liveManifest();
-  if (semverGt(before, version)) {
-    throw new Error(`live release ${before} is newer than candidate ${version} — refusing rollback`);
-  }
-  await publishReleaseObjects({ manifest: m, dist, store });
-  const after = liveManifest();
-  if (after !== version) throw new Error(`live release changed to ${after}; refusing to publish changelog for ${version}`);
-  await store.put("releases/changelog.md", path.join(dist, "../CHANGELOG.md"), "text/markdown; charset=utf-8");
-  console.log("[release] channel activation and changelog publication OK");
+  await publishReleaseChannel({
+    channel: channel!,
+    manifest: m,
+    dist,
+    store,
+    readLive: liveManifest,
+    stableInstaller: path.join(ROOT, "scripts/install.sh"),
+    changelog: path.join(ROOT, "CHANGELOG.md"),
+  });
+  console.log(`[release] ${channel} channel activation${channel === "latest" ? " and changelog publication" : ""} OK`);
   console.log(`[release] published ${tag}`);
 }
 

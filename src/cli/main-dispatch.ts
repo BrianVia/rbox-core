@@ -294,6 +294,7 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
       const { upgradeCmd } = await (deps.upgradeCommandImport ?? (() => import("./upgrade-cmd.js")))();
       await upgradeCmd(flags.remote ?? DEFAULT_REMOTE, {
         check: flags.check === "true",
+        channel: flags.channel,
         commandDeps: { isElevated: () => elevated },
       });
       break;

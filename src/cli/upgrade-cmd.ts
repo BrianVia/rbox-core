@@ -11,9 +11,10 @@ import { readAmbientDaemonStatusRecord } from "./daemon/ambient-status.js";
 import { readDesiredDaemonRows, resumeDesiredDaemon, type DesiredStateRow } from "./autostart-cmd.js";
 import { workspaceKey } from "./rbox-paths.js";
 import { fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
-import { acquireLock, type OwnedLock } from "../engine/git/lockfile.js";
 import { verifyAndParseManifest } from "./release-verify.js";
 import { DOWNLOAD_IDLE_MS, blobDownloadTimeoutMs, fetchWithDeadline } from "./remote/resilient.js";
+import { parseUpgradeChannel, readUpgradeChannel, upgradeManifestBase, writeUpgradeChannel } from "./upgrade-channel.js";
+import { withUpgradeLock } from "./upgrade-lock.js";
 
 /**
  * `rbox upgrade` (design 14) — self-update the installed binary, SAFELY:
@@ -62,17 +63,6 @@ interface EffectiveFloor {
 }
 
 const processIsElevated = (): boolean => typeof process.geteuid === "function" && process.geteuid() === 0;
-
-function causeHasCode(error: unknown, codes: readonly string[]): boolean {
-  const seen = new Set<unknown>();
-  let current = error;
-  while (current !== null && typeof current === "object" && !seen.has(current)) {
-    seen.add(current);
-    if ("code" in current && codes.includes(String(current.code))) return true;
-    current = "cause" in current ? current.cause : undefined;
-  }
-  return false;
-}
 
 function floorMessage(floor: EffectiveFloor): string {
   return floor.state?.phase === "pending"
@@ -290,22 +280,6 @@ async function writeReleaseState(ctx: UpgradeContext, version: string, phase: Re
   await fsyncDirectory(ctx.dir);
 }
 
-async function acquireUpgradeLock(ctx: UpgradeContext): Promise<OwnedLock> {
-  const result = await acquireLock(ctx.lockPath, { skipIdentityRefresh: true, markerMode: 0o644 });
-  if (result.status === "acquired") return result.lock;
-  if (result.status === "held") {
-    const pid = "marker" in result.inspection ? result.inspection.marker.pid : undefined;
-    throw new Error(`another rbox upgrade is already running${pid ? ` (pid ${pid})` : ""} — refusing to run concurrently`);
-  }
-  if (!ctx.elevated && causeHasCode(result.error, ["EACCES", "EPERM"])) {
-    throw new Error(
-      `cannot acquire the rbox upgrade lock at ${ctx.lockPath} — if this rbox install is root-owned, retry with \`sudo rbox upgrade\``,
-      { cause: result.error },
-    );
-  }
-  throw new Error("cannot acquire the rbox upgrade lock", { cause: result.error });
-}
-
 async function fetchBytes(url: string): Promise<Uint8Array> {
   const res = await fetchWithDeadline(url, { redirect: "follow" });
   if (!res.ok) throw new Error(`fetch ${url} → ${res.status}`);
@@ -362,7 +336,7 @@ async function downloadToTemp(url: string, dir: string): Promise<{ tmp: string; 
   }
 }
 
-export async function upgradeCmd(remoteUrl: string, opts: { check?: boolean; daemonDeps?: UpgradeDaemonDeps; commandDeps?: UpgradeCommandDeps } = {}): Promise<void> {
+export async function upgradeCmd(remoteUrl: string, opts: { check?: boolean; channel?: string; daemonDeps?: UpgradeDaemonDeps; commandDeps?: UpgradeCommandDeps } = {}): Promise<void> {
   if (!(opts.commandDeps?.isStandaloneBinary ?? isStandaloneBinary)()) {
     throw new Error("`rbox upgrade` only works on an installed binary — you're running from source. Use git, or install via the one-liner.");
   }
@@ -378,9 +352,14 @@ export async function upgradeCmd(remoteUrl: string, opts: { check?: boolean; dae
     lockPath: `${exe}.upgrade.lock`,
   });
   const name = artifactName();
-
-  // 1. Fetch manifest + detached signature (RAW bytes) and verify BEFORE trusting.
-  const [manifestBytes, sigBytes] = await Promise.all([fetchBytes(`${remoteUrl}/version`), fetchBytes(`${remoteUrl}/version.sig`)]);
+  const requestedChannel = parseUpgradeChannel(opts.channel);
+  // An explicit selection is authoritative and repairs an unreadable persisted
+  // setting. Silent reads retain the fail-closed behavior.
+  const priorChannel = requestedChannel === undefined ? await readUpgradeChannel(exe) : undefined;
+  const channel = requestedChannel ?? priorChannel!;
+  const manifestBase = upgradeManifestBase(remoteUrl, channel);
+  console.log(`checking the ${channel} channel…`);
+  const [manifestBytes, sigBytes] = await Promise.all([fetchBytes(`${manifestBase}/version`), fetchBytes(`${manifestBase}/version.sig`)]);
   const manifest = (opts.commandDeps?.verifyAndParseManifest ?? verifyAndParseManifest)(manifestBytes, sigBytes);
 
   const noUpgrade = async (floor: EffectiveFloor): Promise<void> => {
@@ -396,12 +375,37 @@ export async function upgradeCmd(remoteUrl: string, opts: { check?: boolean; dae
     floor.state?.phase === "pending"
     && floor.state.version === manifest.version
     && semverGt(floor.state.version, RBOX_VERSION);
+  const artifact = () => {
+    const art = manifest.artifacts[name];
+    if (!art || !/^[0-9a-f]{64}$/.test(art.sha256) || typeof art.path !== "string") {
+      throw new Error(`release has no valid artifact for ${name}`);
+    }
+    if (art.path !== `v${manifest.version}/${name}`) {
+      throw new Error(`release artifact path ${art.path} doesn't match v${manifest.version}/${name} — refusing`);
+    }
+    return art;
+  };
+  const applyChannelSelection = async (lockedFloor: EffectiveFloor): Promise<void> => {
+    if (requestedChannel === undefined) {
+      const currentChannel = await readUpgradeChannel(exe);
+      if (currentChannel !== priorChannel) throw new Error("upgrade channel changed while this upgrade was running — retry");
+      return;
+    }
+    if (requestedChannel === "latest" && semverGt(lockedFloor.version, manifest.version)) {
+      throw new Error(`cannot switch to the latest channel: installed rbox ${lockedFloor.version} is newer than latest ${manifest.version}; install a newer latest release before switching back`);
+    }
+    await writeUpgradeChannel(exe, requestedChannel);
+  };
 
   // 2. Forward-only: never install below the executable-scoped durable floor.
   // An exact pending target may be retried by an older still-running process.
   const floor = await effectiveFloor(ctx);
+  if (requestedChannel !== undefined) artifact();
   const pendingRetry = isPendingRetry(floor);
   if (!semverGt(manifest.version, floor.version) && !pendingRetry) {
+    if (requestedChannel !== undefined) {
+      await withUpgradeLock(ctx, async () => applyChannelSelection(await effectiveFloor(ctx)));
+    }
     if (opts.check) {
       if (semverGt(floor.version, RBOX_VERSION)) {
         console.log(floorMessage(floor));
@@ -413,18 +417,15 @@ export async function upgradeCmd(remoteUrl: string, opts: { check?: boolean; dae
     }
     return;
   }
-  const art = manifest.artifacts[name];
-  if (!art || !/^[0-9a-f]{64}$/.test(art.sha256) || typeof art.path !== "string") {
-    throw new Error(`release has no valid artifact for ${name}`);
-  }
+  const art = artifact();
   // Bind the artifact path to the manifest's own version + this platform: the
   // whole manifest is signed, so a correct release always names `v<ver>/<name>`.
   // Rejecting anything else stops a mis-signed/buggy manifest from claiming a new
   // version while serving another version's (or platform's) bytes (defense-in-depth).
-  if (art.path !== `v${manifest.version}/${name}`) {
-    throw new Error(`release artifact path ${art.path} doesn't match v${manifest.version}/${name} — refusing`);
-  }
   if (opts.check) {
+    if (requestedChannel !== undefined) {
+      await withUpgradeLock(ctx, async () => applyChannelSelection(await effectiveFloor(ctx)));
+    }
     console.log(`${pendingRetry ? "update repair pending" : "update available"}: ${manifest.version} (you have ${RBOX_VERSION}) — run \`rbox upgrade\``);
     return;
   }
@@ -440,10 +441,9 @@ export async function upgradeCmd(remoteUrl: string, opts: { check?: boolean; dae
   // Serialize the mutating section: take the exclusive upgrade lock, then RE-READ
   // the floor under it (a concurrent upgrade may have finished and bumped it) so
   // two racing runs can't rename in reverse order and leave an older binary.
-  const releaseLock = await acquireUpgradeLock(ctx);
-  let primaryError: unknown;
-  try {
+  await withUpgradeLock(ctx, async () => {
     const lockedFloor = await effectiveFloor(ctx);
+    await applyChannelSelection(lockedFloor);
     if (!semverGt(manifest.version, lockedFloor.version) && !isPendingRetry(lockedFloor)) {
       await noUpgrade(lockedFloor);
       return;
@@ -479,16 +479,5 @@ export async function upgradeCmd(remoteUrl: string, opts: { check?: boolean; dae
     } else {
       await restartDaemonsAfterUpgrade(opts.daemonDeps);
     }
-  } catch (error) {
-    primaryError = error;
-    throw error;
-  } finally {
-    const released = await releaseLock.release();
-    if (!released.released || !released.durable) {
-      const releaseError = new Error("upgrade finished without durably releasing its lock; retry after checking the install directory", { cause: released.error });
-      if (primaryError instanceof Error && primaryError.cause === undefined) primaryError.cause = releaseError;
-      else if (primaryError === undefined) throw releaseError;
-      else console.error(releaseError.message);
-    }
-  }
+  });
 }
