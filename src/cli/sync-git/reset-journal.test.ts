@@ -66,6 +66,94 @@ async function begin(z: ResetZEntry[] = [], crashAt?: (point: string) => void): 
   }, { randomBytes: random, now, crashAt });
 }
 
+async function legacyProtocolTree(z: ResetZEntry[] = []): Promise<Record<string, string>> {
+  const snapshot: Record<string, string> = {};
+  const collect = async (directory: string): Promise<void> => {
+    const relativeDirectory = path.relative(root, directory) || ".";
+    const entries = await fs.readdir(directory, { withFileTypes: true }).catch(() => []);
+    snapshot[`${relativeDirectory}/`] = entries.map((entry) => `${entry.name}:${entry.isDirectory() ? "d" : entry.isFile() ? "f" : entry.isSymbolicLink() ? "l" : "o"}`).sort().join(",");
+    for (const entry of entries) {
+      const absolute = path.join(directory, entry.name);
+      if (entry.isDirectory()) await collect(absolute);
+      else if (entry.isFile()) {
+        const relative = path.relative(root, absolute);
+        const bytes = await fs.readFile(absolute);
+        if (relative === path.join(".rbox", "state", "last-writer.json")) {
+          const witness = JSON.parse(bytes.toString("utf8")) as Record<string, unknown>;
+          for (const key of ["writtenAtMs", "stateMtimeMs", "stateDev", "stateIno"]) {
+            if (key in witness) witness[key] = `<volatile:${key}>`;
+          }
+          snapshot[relative] = Buffer.from(JSON.stringify(witness)).toString("base64");
+        } else if (relative === path.join(".rbox", "state", "reset-v1.json")) {
+          const journal = JSON.parse(bytes.toString("utf8")) as {
+            old?: { z?: Array<{ repositoryIdentityHash?: string; repositoryIdentity?: Record<string, unknown> }> };
+          };
+          for (const entry of journal.old?.z ?? []) {
+            entry.repositoryIdentityHash = "<fixture-derived>";
+            const identity = entry.repositoryIdentity;
+            if (!identity) continue;
+            for (const key of ["birthtime", "dev", "ino", "commonDirReal", "gitDirReal", "worktreeId"]) {
+              if (key in identity) identity[key] = `<fixture:${key}>`;
+            }
+          }
+          snapshot[relative] = Buffer.from(JSON.stringify(journal)).toString("base64");
+        } else {
+          snapshot[relative] = bytes.toString("base64");
+        }
+      }
+      else if (entry.isSymbolicLink()) snapshot[path.relative(root, absolute)] = `symlink:${await fs.readlink(absolute)}`;
+    }
+  };
+  // Full protocol namespace: this catches unknown temps, unexpected leaves,
+  // and directory-only residue rather than enumerating expected artifacts.
+  await collect(path.join(root, ".rbox"));
+  const commonDirectories = new Set(z.map((entry) => entry.repositoryIdentity.commonDirReal));
+  for (const commonDirectory of commonDirectories) {
+    for (const namespace of ["refs/rbox-local", "refs/rbox-recovery"]) {
+      const namespaceRoot = path.join(commonDirectory, namespace);
+      const prefix = `git-protocol:${path.relative(root, commonDirectory)}:${namespace}`;
+      const collectRefs = async (directory: string): Promise<void> => {
+        const entries = await fs.readdir(directory, { withFileTypes: true }).catch(() => undefined);
+        if (!entries) {
+          snapshot[`${prefix}${path.relative(namespaceRoot, directory) ? `/${path.relative(namespaceRoot, directory)}` : ""}/`] = "<absent>";
+          return;
+        }
+        const relative = path.relative(namespaceRoot, directory);
+        snapshot[`${prefix}${relative ? `/${relative}` : ""}/`] = entries
+          .map((entry) => `${entry.name}:${entry.isDirectory() ? "d" : entry.isFile() ? "f" : entry.isSymbolicLink() ? "l" : "o"}`)
+          .sort()
+          .join(",");
+        for (const child of entries) {
+          const absolute = path.join(directory, child.name);
+          if (child.isDirectory()) await collectRefs(absolute);
+          else if (child.isFile()) {
+            snapshot[`${prefix}/${path.relative(namespaceRoot, absolute)}`] =
+              (await fs.readFile(absolute)).toString("base64");
+          } else if (child.isSymbolicLink()) {
+            snapshot[`${prefix}/${path.relative(namespaceRoot, absolute)}`] =
+              `symlink:${await fs.readlink(absolute)}`;
+          }
+        }
+      };
+      await collectRefs(namespaceRoot);
+    }
+  }
+  for (const entry of z) {
+    for (const ref of [entry.activeRef, entry.recoveryRef]) {
+      const file = path.join(entry.repositoryIdentity.commonDirReal, ref);
+      const bytes = await fs.readFile(file).catch(() => undefined);
+      snapshot[`git-ref:${path.relative(root, file)}`] = bytes?.toString("base64") ?? "<absent>";
+    }
+  }
+  return Object.fromEntries(Object.entries(snapshot).sort(([left], [right]) => left.localeCompare(right)));
+}
+
+async function freshLegacyFixture(label: string): Promise<void> {
+  await fs.rm(root, { recursive: true, force: true });
+  root = await fs.mkdtemp(path.join(os.tmpdir(), `rbox-reset-differential-${label}-`));
+  await writeOld();
+}
+
 beforeEach(async () => {
   root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-reset-v1-"));
   await writeOld();
@@ -150,6 +238,117 @@ describe("design 130 reset crash/recovery matrix", () => {
         stream: "new-stream", stateNonce: "2".repeat(32), stateRevision: 8,
       });
       await expect(fs.access(resetJournalPath(root))).rejects.toThrow();
+    });
+  }
+
+  for (const point of [
+    "after-prepared",
+    "after-candidate-create",
+    "after-archive-create",
+    "after-ready",
+    "after-destination-parent-fsync",
+    "after-source-parent-fsync",
+    "after-state-replace",
+    "after-installed",
+    "after-marker-write",
+    "after-z-retired",
+  ]) {
+    test(`legacy JSON byte-tree differential at ${point} covers old/next config`, async () => {
+      const run = async (callerStream: "old-stream" | "new-stream") => {
+        await freshLegacyFixture(`${point}-${callerStream}`);
+        if (point === "after-prepared") {
+          await expect(begin([], (seen) => {
+            if (seen === point) throw new Error(point);
+          })).rejects.toThrow(point);
+        } else {
+          await begin();
+          await expect(recoverResetJournal(root, callerStream, { crashAt: (seen) => {
+            if (seen === point) throw new Error(point);
+          } })).rejects.toThrow(point);
+        }
+        const beforeRecovery = await legacyProtocolTree();
+        expect(await recoverResetJournal(root, callerStream)).toBe("complete");
+        return { beforeRecovery, afterRecovery: await legacyProtocolTree() };
+      };
+
+      const oldConfig = await run("old-stream");
+      const nextConfig = await run("new-stream");
+      // Config disposition selects roll-forward versus retirement policy, but
+      // every admitted legacy JSON row has the same exact physical transition.
+      expect(nextConfig.beforeRecovery).toEqual(oldConfig.beforeRecovery);
+      expect(nextConfig.afterRecovery).toEqual(oldConfig.afterRecovery);
+      expect(oldConfig).toMatchSnapshot();
+    });
+  }
+
+  for (const point of [
+    "after-recovery-ref-1",
+    "after-recovery-ref-2",
+    "after-active-group-1",
+    "after-active-group-2",
+  ]) {
+    test(`legacy JSON byte-tree differential at ${point} covers old/next config`, async () => {
+      const fixtureParent = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-reset-z-differential-"));
+      const fixedRoot = path.join(fixtureParent, "workspace");
+      try {
+        root = fixedRoot;
+        await writeOld();
+        const z = [
+          await zFixture(path.join(root, "repo-a"), "repo-a", "a"),
+          await zFixture(path.join(root, "repo-b"), "repo-b", "b"),
+        ];
+        await begin(z);
+        const preparedJournal = await fs.readFile(resetJournalPath(root));
+        const restorePreparedTree = async (): Promise<void> => {
+          await fs.rm(path.join(root, ".rbox", "state"), { recursive: true, force: true });
+          await fs.mkdir(path.dirname(resetJournalPath(root)), { recursive: true });
+          await fs.writeFile(stateFile(), oldBytes());
+          await fs.writeFile(resetJournalPath(root), preparedJournal);
+          for (const entry of z) {
+            const repo = entry.repositoryIdentity.worktreeId;
+            await git(repo, "update-ref", entry.activeRef, entry.targetOid);
+            await git(repo, "update-ref", "-d", entry.recoveryRef);
+          }
+        };
+        const run = async (callerStream: "old-stream" | "new-stream") => {
+          await restorePreparedTree();
+          await expect(recoverResetJournal(root, callerStream, { crashAt: (seen) => {
+            if (seen === point) throw new Error(point);
+          } })).rejects.toThrow(point);
+          const beforeRecovery = await legacyProtocolTree(z);
+          expect(await recoverResetJournal(root, callerStream)).toBe("complete");
+          return { beforeRecovery, afterRecovery: await legacyProtocolTree(z) };
+        };
+
+        const oldConfig = await run("old-stream");
+        const nextConfig = await run("new-stream");
+        expect(nextConfig.beforeRecovery).toEqual(oldConfig.beforeRecovery);
+        expect(nextConfig.afterRecovery).toEqual(oldConfig.afterRecovery);
+        expect(oldConfig).toMatchSnapshot();
+      } finally {
+        await fs.rm(fixtureParent, { recursive: true, force: true });
+      }
+    });
+  }
+
+  for (const [point, count] of [["before-recovery-ref-normalize-1", 0], ["before-recovery-ref-normalize-2", 1]] as const) {
+    test(`legacy initiation normalization golden at ${point}`, async () => {
+      const z = [
+        await zFixture(path.join(root, "normalize-a"), "normalize-a", "a"),
+        await zFixture(path.join(root, "normalize-b"), "normalize-b", "b"),
+      ];
+      for (const entry of z) await git(entry.repositoryIdentity.worktreeId, "update-ref", entry.recoveryRef, entry.targetOid);
+      await expect(beginResetJournal(root, "new-stream", oldBytes(), oldState(), z, {
+        version: 2, authorizedNextStream: "new-stream", consentKind: "setup-rebind", mintedAtRevision: 7,
+      }, {
+        randomBytes: random,
+        now,
+        crashAt(seen) { if (seen === point) throw new Error(point); },
+      })).rejects.toThrow(point);
+      const beforeResume = await legacyProtocolTree(z);
+      expect(z.slice(0, count).every((entry) => beforeResume[`git-ref:${path.relative(root, path.join(entry.repositoryIdentity.commonDirReal, entry.recoveryRef))}`] === "<absent>")).toBe(true);
+      await begin(z);
+      expect({ beforeResume, afterResume: await legacyProtocolTree(z) }).toMatchSnapshot();
     });
   }
 

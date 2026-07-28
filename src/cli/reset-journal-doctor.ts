@@ -4,7 +4,13 @@ import { acquireLock } from "../engine/git/lockfile.js";
 import { withRepositoryRecoveryFence, type RepositoryProtocolFenceRequest } from "../engine/git/protocol-locks.js";
 import { loadConfig, stateLockPath, statePath, syncStreamId } from "./config.js";
 import { assertStateReadable } from "./state-plane/authority-marker.js";
-import { boundedHash, boundedRead } from "./reset-io.js";
+import { classifyStateFormat } from "./state-plane/authority-marker.js";
+import { boundedHash, RESET_STREAM_BYTE_LIMIT } from "./reset-io.js";
+import {
+  decodeResetJournal,
+  inspectResetJournalEnvelopeStreams,
+  resetJournalFileSource,
+} from "./reset-journal-codec.js";
 import { inspectResetJournalSafety } from "./reset-halt-inspection.js";
 import { resetJournalPath } from "./reset-journal.js";
 import {
@@ -17,8 +23,6 @@ import {
 } from "./reset-quarantine.js";
 import { withWorkspaceSyncMutex } from "./sync-mutex.js";
 
-const MAX_JOURNAL_BYTES = 512 * 1024;
-
 export interface ResetJournalDoctorOptions {
   quarantine?: boolean;
   restore?: string;
@@ -29,13 +33,24 @@ async function withJournalOnlyFence<T>(root: string, fn: () => Promise<T>): Prom
 }
 
 export async function withResetJournalDoctorFence<T>(root: string, requests: readonly RepositoryProtocolFenceRequest[], fn: () => Promise<T>): Promise<T> {
-  return withWorkspaceSyncMutex(root, async () => withRepositoryRecoveryFence(requests, stateLockPath(root), async () => {
-    const acquired = await acquireLock(stateLockPath(root));
+  const sqliteState = path.join(root, ".rbox", "state", "state.db");
+  const preFormat = await classifyStateFormat(statePath(root));
+  const isSqlite = preFormat === "authority-marker";
+  const fencePath = isSqlite ? sqliteState : stateLockPath(root);
+  const lockPath = isSqlite ? `${sqliteState}.lock` : stateLockPath(root);
+  return withWorkspaceSyncMutex(root, async () => withRepositoryRecoveryFence(requests, fencePath, async () => {
+    const acquired = await acquireLock(lockPath);
     if (acquired.status !== "acquired") throw new Error("reset-journal doctor could not acquire the state recovery fence");
-    // Everything inside this fence hashes, quarantines, or republishes the live
-    // state. A newer state plane is refused here rather than at each read.
-    await assertStateReadable(statePath(root));
-    try { return await fn(); }
+    try {
+      const heldFormat = await classifyStateFormat(statePath(root));
+      if (heldFormat !== preFormat) {
+        throw new Error("reset-journal doctor state format changed while acquiring the recovery fence");
+      }
+      // Everything inside this fence hashes, quarantines, or republishes the
+      // live state. A newer state plane is refused here rather than at each read.
+      if (!isSqlite) await assertStateReadable(statePath(root));
+      return await fn();
+    }
     finally {
       const released = await acquired.lock.release();
       if (!released.released) throw new Error("reset-journal doctor lost the state recovery fence");
@@ -70,12 +85,17 @@ async function journalFromBundle(root: string, bundle: string): Promise<{ old: {
   const manifest = await readResetQuarantineBundle(root, bundle);
   const journal = manifest?.artifacts.find((artifact) => artifact.kind === "journal");
   if (!manifest || !journal) return undefined;
-  const bytes = await boundedRead(resetQuarantineArtifactPath(bundle, journal), MAX_JOURNAL_BYTES);
-  if (!bytes) return undefined;
   try {
-    const value = JSON.parse(bytes.toString("utf8")) as { old?: { stream?: unknown }; next?: { stream?: unknown } };
-    return typeof value.old?.stream === "string" && typeof value.next?.stream === "string"
-      ? value as { old: { stream: string; z?: unknown[] }; next: { stream: string }; [key: string]: unknown } : undefined;
+    const decoded = await decodeResetJournal(await resetJournalFileSource(resetQuarantineArtifactPath(bundle, journal)));
+    if (!decoded.ok) {
+      const envelope = await inspectResetJournalEnvelopeStreams(
+        await resetJournalFileSource(resetQuarantineArtifactPath(bundle, journal)),
+      );
+      return envelope
+        ? { old: { stream: envelope.oldStream }, next: { stream: envelope.nextStream } }
+        : undefined;
+    }
+    return decoded.journal as unknown as { old: { stream: string; z?: unknown[] }; next: { stream: string }; [key: string]: unknown };
   } catch {
     return undefined;
   }
@@ -128,32 +148,25 @@ async function quarantineStandingJournal(root: string): Promise<void> {
     const inspection = await inspectResetJournalSafety(root, syncStreamId(await loadConfig(root)));
     if (inspection.status === "none") throw new Error("reset journal disappeared before quarantine");
     if (before.journalIdentityHash && inspection.journalIdentityHash !== before.journalIdentityHash) throw new Error("reset journal changed before quarantine; retry the command");
-    const envelope = await boundedRead(resetJournalPath(root), MAX_JOURNAL_BYTES);
-    if (!envelope) throw new Error("reset journal disappeared before quarantine");
-    let version: unknown;
-    try { version = (JSON.parse(envelope.toString("utf8")) as { v?: unknown }).v; } catch { version = undefined; }
-    const typed = inspection as typeof inspection & {
-      journal?: { v?: number; phase?: string; id?: string; old?: { stateNonce?: string; stateSha256?: string; z?: unknown[] }; next?: { stateSha256?: string } };
-      observation?: {
-        active?: string; marker?: string; recoveryRefs?: unknown; activeRefGroups?: unknown;
-        activeHash?: string; artifactPaths?: { candidate?: string; archive?: string };
-      };
-    };
-    if (version === 2 && typed.journal?.v === 2) {
-      if (!typed.journal || !typed.observation || !["prepared", "ready"].includes(typed.journal.phase ?? "") || typed.observation.active !== "old") {
+    if (!await boundedHash(resetJournalPath(root), RESET_STREAM_BYTE_LIMIT)) throw new Error("reset journal disappeared before quarantine");
+    const journal = inspection.journal;
+    const observation = inspection.observation;
+    const version = journal?.v;
+    if (journal?.v === 2) {
+      if (!observation || !["prepared", "ready"].includes(journal.phase) || observation.active !== "old") {
         throw new Error("reset journal has progressed past quarantine eligibility; complete forward recovery instead");
       }
       const artifacts: Array<{ kind: "journal" | "candidate" | "archive"; absolutePath: string; cleanup: "remove-exact" | "preserve" }> = [
         { kind: "journal", absolutePath: resetJournalPath(root), cleanup: "remove-exact" },
       ];
-      if (typed.observation.artifactPaths?.candidate && await boundedHash(typed.observation.artifactPaths.candidate)) {
-        artifacts.push({ kind: "candidate", absolutePath: typed.observation.artifactPaths.candidate, cleanup: "remove-exact" });
+      if (await boundedHash(observation.artifactPaths.candidate)) {
+        artifacts.push({ kind: "candidate", absolutePath: observation.artifactPaths.candidate, cleanup: "remove-exact" });
       }
-      if (typed.observation.artifactPaths?.archive && await boundedHash(typed.observation.artifactPaths.archive)) {
-        artifacts.push({ kind: "archive", absolutePath: typed.observation.artifactPaths.archive, cleanup: "preserve" });
+      if (await boundedHash(observation.artifactPaths.archive)) {
+        artifacts.push({ kind: "archive", absolutePath: observation.artifactPaths.archive, cleanup: "preserve" });
       }
-      const recoveryRefs = typed.observation.recoveryRefs;
-      const activeRefGroups = typed.observation.activeRefGroups;
+      const recoveryRefs = observation.recoveryRefs;
+      const activeRefGroups = observation.activeRefGroups;
       const isRestorablePrefix = (value: unknown): value is { kind: "prefix"; count: number; total: number } => {
         if (!value || typeof value !== "object") return false;
         const disposition = value as { kind?: unknown; count?: unknown; total?: unknown };
@@ -165,9 +178,9 @@ async function quarantineStandingJournal(root: string): Promise<void> {
         throw new Error("reset ref preconditions could not be safely observed; retry the command");
       }
       const bundle = await quarantineResetUnderFence(root, {
-        scope: "transaction", phase: typed.journal.phase!, activeStateSha256: typed.observation.activeHash,
-        recoveredStateSha256: typed.journal.next?.stateSha256,
-        markerPrecondition: String(typed.observation.marker),
+        scope: "transaction", phase: journal.phase, activeStateSha256: observation.activeHash,
+        recoveredStateSha256: journal.next.stateSha256,
+        markerPrecondition: String(observation.marker),
         refPreconditions: JSON.stringify({ recovery: recoveryRefs, active: activeRefGroups }),
         artifacts,
       });

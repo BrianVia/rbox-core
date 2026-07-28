@@ -35,6 +35,7 @@ import {
   type ResetJournalAuthorization,
   type ResetZEntry,
 } from "./reset-journal.js";
+import { compareResetZEntries } from "./reset-z.js";
 import {
   RESET_MATERIALIZED_BYTE_LIMIT,
   assertResetParseAdmission,
@@ -303,7 +304,7 @@ async function prepareResetArtifactsUnderFence<T>(
     if (finalState.stream !== state.stream || finalState.stateNonce !== state.stateNonce) {
       throw new Error("reset refused: state lineage changed during artifact preflight");
     }
-    return finish(finalState, stateBytes, entries.sort((a, b) => a.activeRef < b.activeRef ? -1 : a.activeRef > b.activeRef ? 1 : a.targetOid < b.targetOid ? -1 : 1));
+    return finish(finalState, stateBytes, entries.sort(compareResetZEntries));
   }
 }
 

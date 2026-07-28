@@ -42,7 +42,24 @@ function backupFileHash(file: string): { sha256: BackupFileHash; bytes: number }
   return { sha256: hash.digest("hex") as BackupFileHash, bytes };
 }
 
-export function publishStateBackup(options: StateBackupOptions): StateBackupResult {
+export interface StateBackupPublicationSeam {
+  boundary(point: string): void;
+}
+
+const PRODUCTION_BACKUP_PUBLICATION: StateBackupPublicationSeam = {
+  boundary() {},
+};
+
+export function createStateBackupPublisher(
+  publication: StateBackupPublicationSeam,
+): (options: StateBackupOptions) => StateBackupResult {
+  return (options) => publishStateBackupWithPublication(options, publication);
+}
+
+function publishStateBackupWithPublication(
+  options: StateBackupOptions,
+  publication: StateBackupPublicationSeam,
+): StateBackupResult {
   if (!/^[0-9a-f]{32}$/.test(options.backupId)) throw new TypeError("backupId must be lowercase hex32");
   if (fs.existsSync(options.destination)) throw new Error(`backup destination already exists: ${options.destination}`);
   const stagingDirectory = `${options.destination}.backup-${options.backupId}`;
@@ -71,17 +88,23 @@ export function publishStateBackup(options: StateBackupOptions): StateBackupResu
     }
     const fd = fs.openSync(staging, "r");
     try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    publication.boundary("after-backup-staging-fsync");
     const physical = backupFileHash(staging);
     // Same-filesystem link+unlink gives atomic no-clobber publication; rename(2)
     // would silently replace an operator-owned destination.
     fs.linkSync(staging, options.destination);
+    publication.boundary("after-backup-link");
     fs.unlinkSync(staging);
+    publication.boundary("after-backup-source-unlink");
     fs.rmdirSync(stagingDirectory);
     stagingOwned = false;
     fsyncDirectory(path.dirname(options.destination));
+    publication.boundary("after-backup-publication");
     return { physicalSha256: physical.sha256, bytes: physical.bytes };
   } catch (error) {
     if (stagingOwned) fs.rmSync(stagingDirectory, { recursive: true, force: true });
     throw error;
   }
 }
+
+export const publishStateBackup = createStateBackupPublisher(PRODUCTION_BACKUP_PUBLICATION);

@@ -242,25 +242,57 @@ export async function boundedFilesEqual(left: string, right: string, cap = RESET
   return crypto.timingSafeEqual(Buffer.from(leftHash, "hex"), Buffer.from(rightHash, "hex"));
 }
 
+export interface BoundedCopyOptions {
+  onStep?: (
+    step:
+      | "temp-opened"
+      | "temp-written"
+      | "temp-synced"
+      | "temp-closed"
+      | "before-rename"
+      | "after-rename"
+      | "parent-synced"
+      | "created-ancestors-synced",
+  ) => void | Promise<void>;
+}
+
 /** Stream-copy a stable source to an atomically published destination. */
-export async function boundedCopy(source: string, destination: string, cap = RESET_STREAM_BYTE_LIMIT): Promise<boolean> {
+export async function boundedCopy(
+  source: string,
+  destination: string,
+  cap = RESET_STREAM_BYTE_LIMIT,
+  options: BoundedCopyOptions = {},
+): Promise<boolean> {
   const parent = path.dirname(destination);
   const created = await ensureDirectoryChain(parent, "bounded-copy destination");
   const tmp = path.join(parent, `${RBOX_TMP_PREFIX}${process.pid}-${crypto.randomBytes(8).toString("hex")}-${path.basename(destination)}`);
   let output: fs.FileHandle | undefined;
   try {
     output = await fs.open(tmp, "wx", 0o600);
-    const result = await boundedStream(source, cap, async (chunk) => { await output!.write(chunk); });
+    await options.onStep?.("temp-opened");
+    const result = await boundedStream(source, cap, async (chunk) => {
+      await output!.write(chunk);
+      await options.onStep?.("temp-written");
+    });
     if (!result) return false;
     await output.sync();
+    await options.onStep?.("temp-synced");
     await output.close();
     output = undefined;
+    await options.onStep?.("temp-closed");
+    await options.onStep?.("before-rename");
     await fs.rename(tmp, destination);
+    await options.onStep?.("after-rename");
     await fsyncDirectory(parent);
+    await options.onStep?.("parent-synced");
     await fsyncCreatedDirectoryAncestors(parent, created);
+    await options.onStep?.("created-ancestors-synced");
     return true;
   } finally {
-    await output?.close().catch(() => {});
+    if (output) {
+      await output.close().catch(() => {});
+      await options.onStep?.("temp-closed");
+    }
     await fs.rm(tmp, { force: true }).catch(() => {});
   }
 }

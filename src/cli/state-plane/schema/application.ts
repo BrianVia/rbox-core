@@ -4,6 +4,8 @@ import { SCHEMA_V1_DDL } from "./v1.js";
 
 export const STATE_STORE_APPLICATION_ID = "rbox-state-plane";
 export const STATE_STORE_SCHEMA_VERSION = 1;
+export const STATE_STORE_SQLITE_APPLICATION_ID = 0x52424f58;
+export const STATE_STORE_SQLITE_USER_VERSION = 1;
 export const STATE_STORE_DDL_FINGERPRINT = "4d2a960d759fad3a1ce3367b45b24f4b0c91a85c7f0a75025979a0db38e9e4d3";
 
 export interface GenesisLineage {

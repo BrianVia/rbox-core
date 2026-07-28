@@ -72,6 +72,11 @@ export class StreamMismatchError extends Error {
   }
 }
 
+/**
+ * Read-path provenance is deliberately tolerant of unrelated legacy-directory
+ * entries. Reset operations use the strict namespace inventory; ordinary
+ * loadState has always ignored names it does not understand.
+ */
 async function hasResetLineageArchive(root: string): Promise<boolean> {
   const archiveRoot = path.join(root, RBOX_DIR, "state", "lineages");
   const lineages = await fs.readdir(archiveRoot, { withFileTypes: true }).catch((error) => {
@@ -84,7 +89,9 @@ async function hasResetLineageArchive(root: string): Promise<boolean> {
       if (isENOENT(error)) return [];
       throw error;
     });
-    if (archives.some((entry) => entry.isFile() && /^[0-9a-f]{64}\.json$/.test(entry.name))) return true;
+    if (archives.some((entry) =>
+      entry.isFile() && /^[0-9a-f]{64}\.(?:json|db)$/.test(entry.name)
+    )) return true;
   }
   return false;
 }

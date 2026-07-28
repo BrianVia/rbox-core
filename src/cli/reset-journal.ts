@@ -5,8 +5,6 @@ import { canonicalize } from "../engine/e2ee/jcs.js";
 import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
 import { acquireLock, type OwnedLock } from "../engine/git/lockfile.js";
 import { withRepositoryRecoveryFence } from "../engine/git/protocol-locks.js";
-import { readRepoIdentityV1, repositoryIdentityHash, validateRepoIdentityV1, type RepoIdentityV1 } from "../engine/git/repo-lineage.js";
-import { gitRaw } from "../engine/git/shared.js";
 import {
   assertStateReadable,
   recordLastWriterWitness,
@@ -19,9 +17,6 @@ import {
   type MarkerDisposition,
   type NextArtifactDisposition,
   type OldArtifactDisposition,
-  type PrefixDisposition,
-  type ResetPhysicalObservation,
-  type ResetPhysicalRow,
   type StateDisposition,
 } from "./reset-journal-classifier.js";
 import {
@@ -31,104 +26,72 @@ import {
   boundedEqualsBytes,
   boundedHash,
   boundedRead,
-  assertResetParseAdmission,
-  parseResetJsonBytes,
 } from "./reset-io.js";
+import {
+  decodeResetJournalBytes,
+  encodeResetJournal,
+  resetJournalFileSource,
+  decodeResetJournal,
+  type SQLiteResetJournalV2,
+} from "./reset-journal-codec.js";
+import {
+  ResetRecoveryHaltError,
+  type ResetArtifactObservation,
+  type ResetJournalHooks,
+  type ResetJournalInspection,
+} from "./reset-journal-inspection.js";
+export {
+  ResetRecoveryHaltError,
+  type ResetArtifactObservation,
+  type ResetJournalHooks,
+  type ResetJournalInspection,
+} from "./reset-journal-inspection.js";
+import { compareResetZEntries, type ResetZEntry } from "./reset-z.js";
+import { classifyStateFormat } from "./state-plane/authority-marker.js";
+import {
+  createResetRecoveryRefs,
+  deleteExactResetRecoveryRef,
+  exactResetRecoveryRefs,
+  observeResetRefs,
+  retireResetActiveGroups,
+} from "./reset-z-runtime.js";
+import {
+  validateResetJournalV1,
+  validateResetJournalV2,
+  type ResetConsentKind,
+  type ResetJournal,
+  type ResetJournalAuthorization,
+  type ResetJournalV1,
+  type ResetJournalV2,
+  type ResetNextState,
+  type ResetPhase,
+} from "./reset-journal-legacy-schema.js";
+export {
+  validateResetJournalV1,
+  validateResetJournalV2,
+  type ResetConsentKind,
+  type ResetJournal,
+  type ResetJournalAuthorization,
+  type ResetJournalV1,
+  type ResetJournalV2,
+  type ResetNextState,
+  type ResetPhase,
+} from "./reset-journal-legacy-schema.js";
 
 const HEX32 = /^[0-9a-f]{32}$/;
-const HEX40 = /^[0-9a-f]{40}$/;
-const HEX64 = /^[0-9a-f]{64}$/;
 const MAX_JOURNAL_BYTES = 512 * 1024;
-const MAX_Z = 256;
 const MAX_TEXT = 4096;
 
-export type ResetPhase = "prepared" | "ready" | "installed" | "z-retired";
-export type ResetConsentKind = "setup-rebind" | "setup-create";
+export type { ResetZEntry } from "./reset-z.js";
 
-export interface ResetJournalAuthorization {
-  version: 2;
-  authorizedNextStream: string;
-  consentKind: ResetConsentKind;
-  mintedAtRevision: number;
-}
-
-export interface ResetZEntry {
-  lineageHash: string;
-  repositoryIdentityHash: string;
-  repositoryIdentity: RepoIdentityV1;
-  activeRef: string;
-  targetOid: string;
-  recoveryRef: string;
-}
-
-export interface ResetNextState {
-  stream: string;
-  stateNonce: string;
-  stateRevision: number;
-  lastSyncedSequence: 0;
-  lastSyncedManifest: { generatedAt: ""; files: [] };
-  repoRecords: Record<string, never>;
-  telemetryBindingId?: string;
-}
-
-interface ResetJournalBody {
-  id: string;
-  phase: ResetPhase;
-  createdAt: string;
-  old: { stream: string; stateNonce: string; stateRevision: number; stateSha256: string; archiveBaseline: "absent" | "exact"; z: ResetZEntry[] };
-  next: { stream: string; stateNonce: string; stateRevision: number; stateSha256: string; state: ResetNextState };
-}
-
-export interface ResetJournalV1 extends ResetJournalBody { v: 1 }
-export interface ResetJournalV2 extends ResetJournalBody { v: 2; authorization: ResetJournalAuthorization }
-export type ResetJournal = ResetJournalV1 | ResetJournalV2;
-
-export interface ResetJournalHooks {
-  now?: () => Date;
-  randomBytes?: (size: number) => Buffer;
-  crashAt?: (point: string) => void | Promise<void>;
-}
-
-export interface ResetArtifactObservation extends ResetPhysicalObservation {
-  activeHash?: string;
-  candidateHash?: string;
-  archiveHash?: string;
-  artifactPaths: { active: string; candidate: string; archive: string; marker: string; journal: string };
-}
-
-export type ResetJournalInspection =
-  | { status: "none" }
-  | { status: "halt"; reason: string; journalIdentityHash?: string; journal?: ResetJournal; observation?: ResetArtifactObservation }
-  | {
-    status: "recoverable";
-    journalIdentityHash: string;
-    journal: ResetJournalV2;
-    configDisposition: "old" | "next";
-    row: ResetPhysicalRow;
-    observation: ResetArtifactObservation;
-  };
-
-export class ResetRecoveryHaltError extends Error {
-  readonly code = "RESET_RECOVERY_HALT";
-  constructor(readonly inspection: Extract<ResetJournalInspection, { status: "halt" }>) {
-    super(`reset recovery halted: ${inspection.reason}`);
-    this.name = "ResetRecoveryHaltError";
-  }
-}
-
+const record = (value: unknown): Record<string, unknown> | undefined => value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 const exact = (value: Record<string, unknown>, keys: readonly string[]): boolean => {
   const actual = Object.keys(value).sort();
   const expected = [...keys].sort();
   return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
 };
-const record = (value: unknown): Record<string, unknown> | undefined => value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 const counter = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 const bounded = (value: unknown): value is string => typeof value === "string" && Buffer.byteLength(value) <= MAX_TEXT && !value.includes("\0");
-const canonicalTime = (value: unknown): value is string => {
-  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) return false;
-  const parsed = Date.parse(value);
-  return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
-};
 const sha256 = (bytes: Uint8Array): string => crypto.createHash("sha256").update(bytes).digest("hex");
 const canonicalLine = (value: unknown): Buffer => Buffer.concat([Buffer.from(canonicalize(value)), Buffer.from("\n")]);
 const corruption = (message: string): ResetCorruptionError => new ResetCorruptionError(message);
@@ -139,94 +102,36 @@ export const resetArchivePath = (root: string, nonce: string, hash: string): str
 export const resetIncarnationPath = (root: string): string => path.join(root, ".rbox", "state", "state-incarnation.json");
 const activeStatePath = (root: string): string => path.join(root, ".rbox", "state.json");
 
-function validateIdentity(value: unknown): RepoIdentityV1 {
-  const identity = record(value);
-  if (!identity || !exact(identity, ["relPath", "kind", "worktreeId", "gitDirReal", "commonDirReal", "dev", "ino", "birthtime"])) throw corruption("bad repository identity schema");
-  for (const key of ["relPath", "worktreeId", "gitDirReal", "commonDirReal", "dev", "ino", "birthtime"] as const) {
-    if (!bounded(identity[key])) throw corruption(`bad repository identity ${key}`);
+async function parseJournal(bytes: Uint8Array): Promise<ResetJournal> {
+  const decoded = await decodeResetJournalBytes(bytes);
+  if (!decoded.ok) throw corruption(decoded.error.code === "JSON_SYNTAX"
+    ? "malformed reset journal JSON"
+    : `reset journal decoder rejected: ${decoded.error.code}`);
+  if ("stateFormat" in decoded.journal) throw corruption("SQLite reset journal requires DB-artifact dispatch");
+  if (decoded.journal.v === 1) {
+    return {
+      ...decoded.journal,
+      old: { ...decoded.journal.old, archiveBaseline: "absent" },
+    } as ResetJournalV1;
   }
-  const typed = identity as unknown as RepoIdentityV1;
-  validateRepoIdentityV1(typed);
-  return typed;
-}
-
-function validateBody(journal: Record<string, unknown>, requireArchiveBaseline: boolean): ResetJournalBody {
-  if (typeof journal.id !== "string" || !HEX32.test(journal.id) || !["prepared", "ready", "installed", "z-retired"].includes(journal.phase as string) || !canonicalTime(journal.createdAt)) throw corruption("bad reset journal envelope");
-  const old = record(journal.old);
-  const next = record(journal.next);
-  const oldKeys = ["stream", "stateNonce", "stateRevision", "stateSha256", ...(requireArchiveBaseline ? ["archiveBaseline"] : []), "z"];
-  if (!old || !exact(old, oldKeys) || !bounded(old.stream)
-    || typeof old.stateNonce !== "string" || !HEX32.test(old.stateNonce) || !counter(old.stateRevision) || typeof old.stateSha256 !== "string" || !HEX64.test(old.stateSha256) || !Array.isArray(old.z) || old.z.length > MAX_Z) throw corruption("bad old reset state");
-  if (requireArchiveBaseline && old.archiveBaseline !== "absent" && old.archiveBaseline !== "exact") throw corruption("bad old reset archive baseline");
-  const z: ResetZEntry[] = [];
-  const seenActive = new Set<string>();
-  const seenRecovery = new Set<string>();
-  for (const rawEntry of old.z) {
-    const entry = record(rawEntry);
-    if (!entry || !exact(entry, ["lineageHash", "repositoryIdentityHash", "repositoryIdentity", "activeRef", "targetOid", "recoveryRef"]) || typeof entry.lineageHash !== "string" || !HEX64.test(entry.lineageHash)
-      || typeof entry.repositoryIdentityHash !== "string" || !HEX64.test(entry.repositoryIdentityHash) || typeof entry.targetOid !== "string" || !HEX40.test(entry.targetOid)) throw corruption("bad Z entry");
-    const repositoryIdentity = validateIdentity(entry.repositoryIdentity);
-    if (repositoryIdentityHash(repositoryIdentity) !== entry.repositoryIdentityHash) throw corruption("repository identity hash mismatch");
-    const activeRef = `refs/rbox-local/base-absent-settled/v1/${entry.lineageHash}`;
-    const recoveryRef = `refs/rbox-recovery/base-absent/v1/${entry.lineageHash}/${entry.targetOid}`;
-    if (entry.activeRef !== activeRef || entry.recoveryRef !== recoveryRef || seenActive.has(activeRef) || seenRecovery.has(recoveryRef)) throw corruption("unsafe or duplicate Z ref");
-    seenActive.add(activeRef); seenRecovery.add(recoveryRef);
-    z.push({ ...entry as unknown as ResetZEntry, repositoryIdentity });
-  }
-  const sorted = [...z].sort((a, b) => a.activeRef.localeCompare(b.activeRef) || a.targetOid.localeCompare(b.targetOid));
-  if (z.some((entry, index) => entry.activeRef !== sorted[index]?.activeRef || entry.targetOid !== sorted[index]?.targetOid)) throw corruption("unsorted Z entries");
-  if (!next || !exact(next, ["stream", "stateNonce", "stateRevision", "stateSha256", "state"]) || !bounded(next.stream)
-    || typeof next.stateNonce !== "string" || !HEX32.test(next.stateNonce) || !counter(next.stateRevision) || typeof next.stateSha256 !== "string" || !HEX64.test(next.stateSha256)) throw corruption("bad next reset state");
-  const state = record(next.state);
-  const allowed = ["stream", "stateNonce", "stateRevision", "lastSyncedSequence", "lastSyncedManifest", "repoRecords", ...(state?.telemetryBindingId === undefined ? [] : ["telemetryBindingId"])] as const;
-  const manifest = record(state?.lastSyncedManifest);
-  if (!state || !exact(state, allowed) || state.stream !== next.stream || state.stateNonce !== next.stateNonce || state.stateRevision !== next.stateRevision || state.lastSyncedSequence !== 0
-    || !manifest || !exact(manifest, ["generatedAt", "files"]) || manifest.generatedAt !== "" || !Array.isArray(manifest.files) || manifest.files.length !== 0
-    || !record(state.repoRecords) || Object.keys(state.repoRecords as object).length !== 0 || (state.telemetryBindingId !== undefined && (typeof state.telemetryBindingId !== "string" || !/^[0-9a-f]{16}$/.test(state.telemetryBindingId)))) throw corruption("bad bounded next state");
-  if (sha256(canonicalLine(state)) !== next.stateSha256) throw corruption("next state hash mismatch");
-  return {
-    id: journal.id, phase: journal.phase as ResetPhase, createdAt: journal.createdAt as string,
-    old: { ...old as unknown as ResetJournalBody["old"], archiveBaseline: requireArchiveBaseline ? old.archiveBaseline as "absent" | "exact" : "absent", z },
-    next: { ...next as unknown as ResetJournalBody["next"], state: state as unknown as ResetNextState },
-  };
-}
-
-export function validateResetJournalV1(value: unknown): ResetJournalV1 {
-  const journal = record(value);
-  if (!journal || !exact(journal, ["v", "id", "phase", "createdAt", "old", "next"]) || journal.v !== 1) throw corruption("bad reset journal v1 envelope");
-  return { v: 1, ...validateBody(journal, false) };
-}
-
-export function validateResetJournalV2(value: unknown): ResetJournalV2 {
-  const journal = record(value);
-  if (!journal || !exact(journal, ["v", "id", "phase", "createdAt", "authorization", "old", "next"]) || journal.v !== 2) throw corruption("bad reset journal v2 envelope");
-  const authorization = record(journal.authorization);
-  if (!authorization || !exact(authorization, ["version", "authorizedNextStream", "consentKind", "mintedAtRevision"])
-    || authorization.version !== 2 || !bounded(authorization.authorizedNextStream)
-    || !["setup-rebind", "setup-create"].includes(authorization.consentKind as string) || !counter(authorization.mintedAtRevision)) throw corruption("bad reset authorization witness");
-  const body = validateBody(journal, true);
-  const typed = authorization as unknown as ResetJournalAuthorization;
-  if (typed.authorizedNextStream !== body.next.stream) throw corruption("reset authorization witness does not bind the journal destination");
-  return { v: 2, authorization: typed, ...body };
-}
-
-function parseJournal(bytes: Buffer): ResetJournal {
-  assertResetParseAdmission(bytes.byteLength);
-  let value: unknown;
-  try {
-    value = parseResetJsonBytes<unknown>(bytes, "reset journal");
-  } catch (error) {
-    if (error instanceof ResetCorruptionError) {
-      throw corruption(`malformed reset journal JSON${error.message.includes("nesting") ? " (nesting limit)" : ""}`);
-    }
-    throw error;
-  }
-  return record(value)?.v === 2 ? validateResetJournalV2(value) : validateResetJournalV1(value);
+  return decoded.journal as ResetJournalV2;
 }
 
 export async function readResetJournal(root: string): Promise<ResetJournal | undefined> {
-  const bytes = await boundedRead(resetJournalPath(root), MAX_JOURNAL_BYTES);
-  return bytes ? parseJournal(bytes) : undefined;
+  const file = resetJournalPath(root);
+  try {
+    const decoded = await decodeResetJournal(await resetJournalFileSource(file));
+    if (!decoded.ok) throw corruption(decoded.error.code === "JSON_SYNTAX"
+      ? "malformed reset journal JSON"
+      : `reset journal decoder rejected: ${decoded.error.code}`);
+    if ("stateFormat" in decoded.journal) throw corruption("SQLite reset journal requires DB-artifact dispatch");
+    return decoded.journal.v === 1
+      ? { ...decoded.journal, old: { ...decoded.journal.old, archiveBaseline: "absent" } } as ResetJournalV1
+      : decoded.journal as ResetJournalV2;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
 }
 
 async function durableWrite(file: string, bytes: Uint8Array): Promise<void> {
@@ -244,61 +149,6 @@ async function expectedAbsentOrExact(file: string, bytes: Uint8Array): Promise<v
   if (equal === true) return;
   if (equal === false) throw corruption(`wrong existing bytes at ${file}`);
   await durableWrite(file, bytes);
-}
-
-async function readRef(entry: ResetZEntry, ref: string): Promise<string | undefined> {
-  try {
-    return (await gitRaw(entry.repositoryIdentity.commonDirReal, ["rev-parse", "--verify", "--quiet", ref])).trim();
-  } catch (error) {
-    if ((error as { code?: unknown }).code === 1) return undefined;
-    throw error;
-  }
-}
-
-async function verifyIdentity(entry: ResetZEntry): Promise<void> {
-  const current = await readRepoIdentityV1(entry.repositoryIdentity.relPath, entry.repositoryIdentity.kind, entry.repositoryIdentity);
-  if (repositoryIdentityHash(current) !== entry.repositoryIdentityHash) throw corruption("repository incarnation changed");
-}
-
-function prefixDisposition(values: readonly boolean[]): PrefixDisposition {
-  let count = 0;
-  while (count < values.length && values[count]) count++;
-  return { kind: values.slice(count).some(Boolean) ? "other" : "prefix", count, total: values.length };
-}
-
-async function observeRefs(entries: readonly ResetZEntry[]): Promise<{ recovery: PrefixDisposition; activeGroups: PrefixDisposition }> {
-  const recoveryPresent: boolean[] = [];
-  for (const entry of entries) {
-    await verifyIdentity(entry);
-    const value = await readRef(entry, entry.recoveryRef);
-    if (value !== undefined && value !== entry.targetOid) return { recovery: { kind: "other", count: 0, total: entries.length }, activeGroups: { kind: "other", count: 0, total: 0 } };
-    recoveryPresent.push(value === entry.targetOid);
-  }
-  const groups = new Map<string, ResetZEntry[]>();
-  for (const entry of entries) groups.set(entry.repositoryIdentity.commonDirReal, [...(groups.get(entry.repositoryIdentity.commonDirReal) ?? []), entry]);
-  const retired: boolean[] = [];
-  for (const commonDir of [...groups.keys()].sort()) {
-    const dispositions: boolean[] = [];
-    for (const entry of groups.get(commonDir)!) {
-      const value = await readRef(entry, entry.activeRef);
-      if (value !== undefined && value !== entry.targetOid) return { recovery: prefixDisposition(recoveryPresent), activeGroups: { kind: "other", count: 0, total: groups.size } };
-      dispositions.push(value === undefined);
-    }
-    if (new Set(dispositions).size > 1) return { recovery: prefixDisposition(recoveryPresent), activeGroups: { kind: "other", count: 0, total: groups.size } };
-    retired.push(dispositions[0] ?? false);
-  }
-  return { recovery: prefixDisposition(recoveryPresent), activeGroups: prefixDisposition(retired) };
-}
-
-async function exactRecoveryRefs(entries: readonly ResetZEntry[]): Promise<ResetZEntry[]> {
-  const existing: ResetZEntry[] = [];
-  for (const entry of entries) {
-    await verifyIdentity(entry);
-    const value = await readRef(entry, entry.recoveryRef);
-    if (value !== undefined && value !== entry.targetOid) throw corruption(`wrong recovery Z target ${entry.recoveryRef}`);
-    if (value === entry.targetOid) existing.push(entry);
-  }
-  return existing;
 }
 
 function stateDisposition(hash: string | undefined, journal: ResetJournalV2): StateDisposition {
@@ -337,7 +187,7 @@ async function observePhysical(root: string, journal: ResetJournalV2): Promise<R
   // recognized here, not consumed as an ordinary signature mismatch.
   await assertStateReadable(paths.active);
   const [activeHash, candidateHash, archiveHash, marker, refs] = await Promise.all([
-    boundedHash(paths.active), boundedHash(paths.candidate), boundedHash(paths.archive), markerDisposition(paths.marker, journal), observeRefs(journal.old.z),
+    boundedHash(paths.active), boundedHash(paths.candidate), boundedHash(paths.archive), markerDisposition(paths.marker, journal), observeResetRefs(journal.old.z),
   ]);
   return {
     phase: journal.phase,
@@ -354,23 +204,59 @@ export async function observeResetJournalBytes(
   root: string,
   bytes: Buffer,
 ): Promise<{ journal: ResetJournalV2; observation: ResetArtifactObservation }> {
-  const parsed = parseJournal(bytes);
+  const parsed = await parseJournal(bytes);
   if (parsed.v !== 2) throw corruption("legacy reset journal has no restorable physical preconditions");
   return { journal: parsed, observation: await observePhysical(root, parsed) };
 }
 
 export async function inspectResetJournal(root: string, callerStream?: string): Promise<ResetJournalInspection> {
-  let bytes: Buffer | undefined;
-  try { bytes = await boundedRead(resetJournalPath(root), MAX_JOURNAL_BYTES); }
+  if (await classifyStateFormat(activeStatePath(root)) === "authority-marker") {
+    const { sqliteResetFacade } = await import("./state-plane/reset/index.js");
+    const sqlite = await sqliteResetFacade.inspect(root, callerStream);
+    if (sqlite.status === "steady" || sqlite.status === "none") return { status: "none" };
+    if (sqlite.status === "w1") {
+      return { status: "halt", reason: "SQLite authority has an ordinary WAL crash requiring writer takeover" };
+    }
+    if (sqlite.status === "halt") {
+      return {
+        status: "halt",
+        reason: `${sqlite.row}: ${sqlite.reason}`,
+        ...(sqlite.decodeError === undefined ? {} : { decodeError: sqlite.decodeError }),
+      };
+    }
+    return {
+      status: "recoverable",
+      journalIdentityHash: sqlite.journalIdentityHash,
+      journal: sqlite.journal,
+      configDisposition: sqlite.configDisposition,
+      row: sqlite.row,
+      observation: { ...sqlite.row.observation, artifactPaths: sqlite.paths },
+    };
+  }
+  const file = resetJournalPath(root);
+  let decoded: Awaited<ReturnType<typeof decodeResetJournal>>;
+  try { decoded = await decodeResetJournal(await resetJournalFileSource(file)); }
   catch (error) {
-    const journalIdentityHash = await boundedHash(resetJournalPath(root), RESET_STREAM_BYTE_LIMIT).catch(() => undefined);
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { status: "none" };
+    const journalIdentityHash = await boundedHash(file, RESET_STREAM_BYTE_LIMIT).catch(() => undefined);
     return { status: "halt", reason: error instanceof Error ? error.message : "unreadable reset journal", journalIdentityHash };
   }
-  if (!bytes) return { status: "none" };
-  const journalIdentityHash = sha256(bytes);
-  let journal: ResetJournal;
-  try { journal = parseJournal(bytes); }
-  catch (error) { return { status: "halt", reason: error instanceof Error ? error.message : "malformed reset journal", journalIdentityHash }; }
+  if (!decoded.ok) {
+    const journalIdentityHash = await boundedHash(file, RESET_STREAM_BYTE_LIMIT).catch(() => undefined);
+    const reason = decoded.error.code === "JSON_SYNTAX"
+      ? "reset-corruption: malformed reset journal JSON"
+      : decoded.error.code === "DEPTH_LIMIT"
+        ? "reset-corruption: malformed reset journal JSON (nesting limit)"
+        : `reset-corruption: reset journal decoder rejected: ${decoded.error.code}`;
+    return { status: "halt", reason, journalIdentityHash };
+  }
+  const journalIdentityHash = decoded.rawSha256;
+  if ("stateFormat" in decoded.journal) {
+    return { status: "halt", reason: "SQLite reset journal requires DB-artifact dispatch", journalIdentityHash };
+  }
+  const journal = decoded.journal.v === 1
+    ? { ...decoded.journal, old: { ...decoded.journal.old, archiveBaseline: "absent" } } as ResetJournalV1
+    : decoded.journal as ResetJournalV2;
   if (journal.v === 1) return { status: "halt", reason: "legacy reset journal v1 has no authorization witness", journalIdentityHash, journal };
   if (callerStream !== journal.old.stream && callerStream !== journal.next.stream) {
     return { status: "halt", reason: callerStream === undefined ? "caller stream is unavailable" : "durable config names neither authorized reset stream", journalIdentityHash, journal };
@@ -390,7 +276,7 @@ export async function inspectResetJournal(root: string, callerStream?: string): 
 
 async function writeJournal(root: string, journal: ResetJournalV2): Promise<void> {
   validateResetJournalV2(journal);
-  await durableWrite(resetJournalPath(root), canonicalLine(journal));
+  await durableWrite(resetJournalPath(root), await encodeResetJournal(journal as import("./reset-journal-codec.js").ResetJournalV2));
 }
 
 async function setPhase(root: string, journal: ResetJournalV2, nextPhase: ResetPhase, hooks: ResetJournalHooks): Promise<ResetJournalV2> {
@@ -398,41 +284,6 @@ async function setPhase(root: string, journal: ResetJournalV2, nextPhase: ResetP
   await writeJournal(root, next);
   await hooks.crashAt?.(`after-${nextPhase}`);
   return next;
-}
-
-async function createRecoveryRefs(entries: readonly ResetZEntry[], start: number, hooks: ResetJournalHooks): Promise<void> {
-  for (let index = start; index < entries.length; index++) {
-    const entry = entries[index]!;
-    await verifyIdentity(entry);
-    if (await readRef(entry, entry.activeRef) !== entry.targetOid) throw corruption(`active Z changed ${entry.activeRef}`);
-    const recovery = await readRef(entry, entry.recoveryRef);
-    if (recovery !== undefined && recovery !== entry.targetOid) throw corruption(`wrong recovery Z target ${entry.recoveryRef}`);
-    if (recovery === undefined) await gitRaw(entry.repositoryIdentity.commonDirReal, ["update-ref", entry.recoveryRef, entry.targetOid, ""]);
-    await hooks.crashAt?.(`after-recovery-ref-${index + 1}`);
-  }
-}
-
-async function retireActiveGroups(entries: readonly ResetZEntry[], start: number, hooks: ResetJournalHooks): Promise<void> {
-  const groups = new Map<string, ResetZEntry[]>();
-  for (const entry of entries) groups.set(entry.repositoryIdentity.commonDirReal, [...(groups.get(entry.repositoryIdentity.commonDirReal) ?? []), entry]);
-  const ordered = [...groups.keys()].sort();
-  for (let index = start; index < ordered.length; index++) {
-    const commonDir = ordered[index]!;
-    const group = groups.get(commonDir)!.sort((a, b) => a.activeRef.localeCompare(b.activeRef));
-    for (const entry of group) {
-      await verifyIdentity(entry);
-      if (await readRef(entry, entry.recoveryRef) !== entry.targetOid) throw corruption(`wrong recovery Z target ${entry.recoveryRef}`);
-      const active = await readRef(entry, entry.activeRef);
-      if (active !== undefined && active !== entry.targetOid) throw corruption(`wrong active Z target ${entry.activeRef}`);
-    }
-    const present = await Promise.all(group.map(async (entry) => (await readRef(entry, entry.activeRef)) === entry.targetOid));
-    if (present.some(Boolean) && !present.every(Boolean)) throw corruption(`physically impossible mixed Z retirement in ${commonDir}`);
-    if (present.every(Boolean)) {
-      const stdin = group.map((entry) => `delete ${entry.activeRef} ${entry.targetOid}`).join("\n") + "\n";
-      await gitRaw(commonDir, ["update-ref", "--stdin"], { stdin });
-    }
-    await hooks.crashAt?.(`after-active-group-${index + 1}`);
-  }
 }
 
 export async function recoverResetJournalUnderHeldFence(
@@ -446,6 +297,9 @@ export async function recoverResetJournalUnderHeldFence(
   let inspection = await inspectResetJournal(root, callerStream);
   if (inspection.status === "none") return "none";
   if (inspection.status === "halt") throw new ResetRecoveryHaltError(inspection);
+  if ("stateFormat" in inspection.journal) {
+    throw corruption("state format changed before legacy reset recovery");
+  }
   let journal = inspection.journal;
   const candidatePath = resetCandidatePath(root, journal.id);
   const archivePath = resetArchivePath(root, journal.old.stateNonce, journal.old.stateSha256);
@@ -466,7 +320,7 @@ export async function recoverResetJournalUnderHeldFence(
     }
     inspection = await inspectResetJournal(root, callerStream);
     if (inspection.status !== "recoverable") throw inspection.status === "halt" ? new ResetRecoveryHaltError(inspection) : corruption("reset journal disappeared during recovery");
-    await createRecoveryRefs(journal.old.z, inspection.observation.recoveryRefs.count, hooks);
+    await createResetRecoveryRefs(journal.old.z, inspection.observation.recoveryRefs.count, hooks.crashAt);
     const readyBoundary = await inspectResetJournal(root, callerStream);
     if (readyBoundary.status !== "recoverable"
       || readyBoundary.observation.recoveryRefs.count !== readyBoundary.observation.recoveryRefs.total
@@ -513,7 +367,7 @@ export async function recoverResetJournalUnderHeldFence(
     }
     inspection = await inspectResetJournal(root, callerStream);
     if (inspection.status !== "recoverable") throw inspection.status === "halt" ? new ResetRecoveryHaltError(inspection) : corruption("reset journal disappeared during retirement");
-    await retireActiveGroups(journal.old.z, inspection.observation.activeRefGroups.count, hooks);
+    await retireResetActiveGroups(journal.old.z, inspection.observation.activeRefGroups.count, hooks.crashAt);
     const retiredBoundary = await inspectResetJournal(root, callerStream);
     if (retiredBoundary.status !== "recoverable"
       || retiredBoundary.observation.activeRefGroups.count !== retiredBoundary.observation.activeRefGroups.total
@@ -537,6 +391,13 @@ export async function recoverResetJournalUnderHeldFence(
 }
 
 export async function recoverResetJournal(root: string, callerStream: string, hooks: ResetJournalHooks = {}): Promise<"none" | "complete"> {
+  const preFormat = await classifyStateFormat(activeStatePath(root));
+  if (preFormat === "authority-marker") {
+    // Keep bun:sqlite outside the executable's static graph until U3 flips
+    // authority. The dynamically loaded module exposes only the bound facade.
+    const { sqliteResetFacade } = await import("./state-plane/reset/index.js");
+    return sqliteResetFacade.recover(root, callerStream, hooks);
+  }
   const initial = await readResetJournal(root);
   if (!initial) return "none";
   const preflight = await inspectResetJournal(root, callerStream);
@@ -549,7 +410,12 @@ export async function recoverResetJournal(root: string, callerStream: string, ho
   return withRepositoryRecoveryFence(requests, path.resolve(activeStatePath(root)), async () => {
     const acquired = await acquireLock(`${activeStatePath(root)}.lock`);
     if (acquired.status !== "acquired") throw new Error("reset refused: sync state lock unavailable during recovery");
-    try { return await recoverResetJournalUnderHeldFence(root, callerStream, hooks, acquired.lock); }
+    try {
+      if (await classifyStateFormat(activeStatePath(root)) !== preFormat) {
+        throw new Error("reset state format changed while acquiring the recovery fence");
+      }
+      return await recoverResetJournalUnderHeldFence(root, callerStream, hooks, acquired.lock);
+    }
     finally { await acquired.lock.release(); }
   });
 }
@@ -579,13 +445,13 @@ export async function beginResetJournal(
     v: 2, id, phase: "prepared", createdAt: now, authorization,
     old: {
       stream: oldState.stream, stateNonce: oldState.stateNonce!, stateRevision: oldState.stateRevision!, stateSha256: sha256(oldBytes), archiveBaseline: "absent",
-      z: [...z].sort((a, b) => a.activeRef.localeCompare(b.activeRef) || a.targetOid.localeCompare(b.targetOid)),
+      z: [...z].sort(compareResetZEntries),
     },
     next: { stream: nextStream, stateNonce: nonce, stateRevision: nextState.stateRevision, stateSha256: sha256(canonicalLine(nextState)), state: nextState },
   };
   const [activeHash, candidateHash, archiveHash, marker, refs, existingRecoveryRefs] = await Promise.all([
     boundedHash(activeStatePath(root)), boundedHash(resetCandidatePath(root, id)), boundedHash(resetArchivePath(root, journal.old.stateNonce, journal.old.stateSha256)),
-    markerDisposition(resetIncarnationPath(root), journal), observeRefs(journal.old.z), exactRecoveryRefs(journal.old.z),
+    markerDisposition(resetIncarnationPath(root), journal), observeResetRefs(journal.old.z), exactResetRecoveryRefs(journal.old.z),
   ]);
   if (activeHash !== journal.old.stateSha256 || candidateHash !== undefined
     || (archiveHash !== undefined && archiveHash !== journal.old.stateSha256) || !["old", "absent"].includes(marker)
@@ -600,10 +466,9 @@ export async function beginResetJournal(
   for (let index = 0; index < existingRecoveryRefs.length; index++) {
     const entry = existingRecoveryRefs[index]!;
     await hooks.crashAt?.(`before-recovery-ref-normalize-${index + 1}`);
-    await verifyIdentity(entry);
-    await gitRaw(entry.repositoryIdentity.commonDirReal, ["update-ref", "-d", entry.recoveryRef, entry.targetOid]);
+    await deleteExactResetRecoveryRef(entry);
   }
-  const normalizedRefs = await observeRefs(journal.old.z);
+  const normalizedRefs = await observeResetRefs(journal.old.z);
   if (normalizedRefs.recovery.kind !== "prefix" || normalizedRefs.recovery.count !== 0
     || normalizedRefs.activeGroups.kind !== "prefix" || normalizedRefs.activeGroups.count !== 0) {
     throw new Error("reset refused: recovery refs did not normalize to the P0 initiation invariant");
