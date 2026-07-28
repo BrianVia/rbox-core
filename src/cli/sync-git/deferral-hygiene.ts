@@ -22,7 +22,7 @@ import {
   type SyncState,
   type WorkspaceConfig,
 } from "../config.js";
-import { rethrowIfStateBarrier } from "../state-barrier.js";
+import { rethrowIfStateBarrier } from "../state-plane/authority-marker.js";
 import { inputRecord } from "../sync-state.js";
 import { recoverStateCasLocks, type StateCasRecoveryResult } from "./state-cas-locks.js";
 

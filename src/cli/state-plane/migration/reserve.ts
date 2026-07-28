@@ -12,10 +12,10 @@ import crypto from "node:crypto";
 import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { fsyncDirectory, moveNoClobber, RBOX_TMP_PREFIX } from "../engine/fsutil.js";
-import { parseSemver } from "./semver.js";
-import { RBOX_VERSION } from "./version.js";
-import { RBOX_DIR } from "./workspace-config.js";
+import { fsyncDirectory, moveNoClobber, RBOX_TMP_PREFIX } from "../../../engine/fsutil.js";
+import { parseSemver } from "../../semver.js";
+import { RBOX_VERSION } from "../../version.js";
+import { RBOX_DIR } from "../../workspace-config.js";
 
 export const RESERVE_MAGIC = "RBOX-STATE-RESERVE-v1";
 export const RESERVE_HEADER_BYTES = 128;

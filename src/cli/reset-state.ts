@@ -42,7 +42,7 @@ import {
   boundedRead,
   parseResetJsonBytes,
 } from "./reset-io.js";
-import { assertStateReadable } from "./state-barrier.js";
+import { assertStateReadable } from "./state-plane/authority-marker.js";
 import { createPRepairStatePort } from "./sync-git/p-repair-state.js";
 import { settleExactPresentArtifact } from "./sync-git/p-settlement.js";
 import {
