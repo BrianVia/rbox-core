@@ -528,10 +528,12 @@ authority outlives the journal:
 Migration settles a standing journal. It does **not** settle a pending
 quarantine bundle. Normative v6 resolution:
 
-1. **M0 refuses to start while any resumable quarantine bundle exists.** The M0
-   quiescence predicate below enumerates `.rbox/state/quarantine/` with the
-   same bounded, no-follow discipline. A bundle in any state other than
-   "absent" blocks migration with a typed `quarantine-pending` refusal (not a
+1. **M0 refuses to start while any resumable quarantine bundle exists.** This
+   is one condition of the M0 quiescence predicate below, which is the **single
+   normative admission predicate** — v7 moved the quarantine clause into that
+   list rather than leaving a second, differently-worded copy here. A bundle in
+   any state other than "absent" blocks migration with a typed
+   `quarantine-pending` refusal (not a
    halt — it is an ordinary "finish this first" condition, and the doctor's
    existing resume path is the remedy). Malformed, partial, and
    unreadable-`COMMITTED` bundles are exactly the cases
@@ -1980,23 +1982,115 @@ clobber each other's `state.json` today.
    `forceLegacy` caller — must re-check for `Q` immediately before its rename
    and throw `StateFormatTooNewError` instead of publishing. A write-side
    barrier is the only thing that stops an already-running pre-Q operation.
+
+   **1a. The barrier must be race-free, and a bare check-then-rename is not
+   (v7).** V6 specified the check without specifying what makes it atomic with
+   the publication, which is a real defect: a `Q` written between the check and
+   the rename is still destroyed. The closure is argued from the actual
+   publication primitive rather than from an invented syscall.
+
+   *The primitive.* Every state write publishes through
+   `writeFileAtomic` (`src/engine/fsutil.ts:35-89`): it writes and fsyncs a
+   sibling temp, then calls the optional `beforeRename` hook, and **on a `false`
+   return it removes the temp and returns without renaming** (`:70-80`);
+   otherwise it publishes with a single `fs.rename(tmp, absPath)` (`:83`).
+   `beforeRename` is therefore the only publication-abort seam that exists, and
+   `sync-state-store.ts` already uses it for exactly this shape of assertion
+   (`:216`, `:411`: `beforeRename: async () => (owner = await lock.isOwner())`).
+   B0's barrier check is added to that same hook. `rename(2)` replaces its
+   target unconditionally, so no property of the hook alone can make the check
+   atomic with the rename.
+
+   *Race-freedom therefore comes from mutual exclusion, not from the check.*
+   Normative: **every production write of `.rbox/state.json` must hold
+   `stateLockPath(root)` continuously from before the barrier read until after
+   the rename returns.** Two of the three writers already do
+   (`applyStateSavePacket` acquires or asserts the held lock at
+   `sync-state-store.ts:120-135`; `ensureTelemetryBindingId` at `:395`), and
+   both re-assert ownership inside `beforeRename`, so a stolen or expired lock
+   aborts the publication instead of racing it. The one writer that holds
+   nothing is `writeWholeStateUnsafe` (`:369`) — the degraded/`forceLegacy`
+   terminal write, and precisely the writer this whole closure is about. B0
+   changes it to acquire the same lock, read the barrier, publish, and release.
+   M6's authority rename runs under the complete lock set, which includes that
+   state lock (§ "Durable phase publication and sole actor"), so a `Q`
+   publication and a legacy publication cannot interleave: each actor's own
+   check-then-rename window lies inside a lock the other must acquire. This adds
+   no new primitive and no new file — it extends an existing lock discipline to
+   the one path that skipped it.
+
+   *The unlocked residue is refused, not raced.* `degraded-unlocked` exists
+   exactly when `acquireLock` returns `unsupported` (`src/cli/sync-mutex.ts:85-88`),
+   i.e. the filesystem offers no safe identity/link primitive — so on that
+   filesystem **no** check-then-rename sequence can be made atomic, and the
+   design does not pretend otherwise. B0 makes the degraded path fail closed
+   instead: under `degraded-unlocked`, `writeWholeStateUnsafe` performs the
+   barrier read in `beforeRename` and refuses to publish over `Q` or over any
+   non-JSON legacy path. The remaining theoretical window (a `Q` appearing
+   between that read and the rename) is closed from the other side rather than
+   left open: M0 refuses to migrate a `degraded-unlocked` workspace at all
+   (bullet 3 below) and re-checks that predicate immediately before the M6
+   rename, and degradation is a filesystem-capability property, so a workspace
+   that is degraded for one process is degraded for all of them. Locked
+   workspaces are serialized by the lock; unlocked workspaces never have a `Q`
+   published under them. There is no third case.
+
+   **1b. The durable last-writer witness.** `SyncState` has no version field
+   and B0 must not add one — a new state member would be silently dropped by
+   pre-B0 binaries and by the degraded composer, which already nulls
+   `stateNonce`, `stateRevision`, and `repoRecords`, so it could not prove
+   anything about the writer that wrote last. The witness therefore lives
+   **outside** the state document, in a sidecar at
+   `.rbox/state/last-writer.json`, whose closed schema is
+   `{version:1, writerVersion:"<semver>", writtenAtMs:<integer>,
+   stateDev:<integer>, stateIno:<integer>}`.
+   Update protocol: the actor that just published `state.json` writes it
+   **after** the publication rename and its `fsyncDirectory`, still holding the
+   same state lock, via `writeFileAtomic` plus `fsyncDirectory`, recording the
+   `dev`/`ino` it observes on the just-published `state.json`. It is never
+   authority and never read by the sync engine; a failed witness write does not
+   fail the state write (the state is already published) and merely leaves the
+   witness stale. Its sole consumer is migration admission: M0 admits a
+   workspace only when the witness exists, parses exactly, its
+   `stateDev`/`stateIno` equal the live `.rbox/state.json` identity — proving
+   the recorded writer wrote *the state that is there now*, not some earlier
+   one — and `writerVersion >= 1.11.0`, the ratified downgrade floor. Anything
+   else (absent, stale, foreign, identity-mismatched, lower version) is a typed
+   `barrier-witness-missing` refusal, not a halt; the remedy is one ordinary
+   sync with a barrier-capable binary, which is exactly the condition the gate
+   is trying to establish. B0's pinning inventory test (contents item 2) is
+   extended to require both obligations of every enumerated write entry point:
+   it checks the barrier, and it updates the witness.
 2. That barrier release is a scheduled **pre-U0 deliverable** with an adoption
    gate (see the rollout plan's `B0` unit), not a footnote inside a U-slice.
    No 2.0 binary may migrate a workspace until the barrier version is adopted
    by all 4 external users and all 3 fleet hosts.
-3. **M0 quiescence and capability predicate.** Before publishing its first
-   control, M0 additionally requires, under the complete lock set:
+3. **M0 quiescence and capability predicate — the single normative predicate
+   (consolidated in v7).** Before publishing its first control, M0 requires,
+   under the complete lock set, **exactly these four conditions and no others**;
+   every other section that mentions an M0 admission condition refers here
+   rather than restating a partial list (v6 had two divergent versions of this
+   predicate — one including quarantine enumeration, one omitting it — which is
+   how a fail-closed gate quietly becomes two gates):
    - workspace locking health is **not** `degraded-unlocked` (a degraded
      workspace is refused with a typed `degraded-fence` refusal, matching what
      reset already does);
    - no other live rbox process holds or recently held a workspace operation —
      established by the existing daemon/lock ownership evidence plus a bounded
      wait, not by a heuristic;
-   - the barrier-capability witness is present: the workspace's recorded
-     last-writer version is >= the pinned downgrade floor. A workspace whose
-     most recent writer predates the barrier is refused until it has been
+   - **no resumable quarantine bundle exists.** `.rbox/state/quarantine/` is
+     enumerated with the same bounded, no-follow discipline; a bundle in any
+     state other than absent refuses migration with a typed
+     `quarantine-pending` refusal, whose remedy is the doctor's existing resume
+     path (§ "Committed quarantine retains deletion authority", which owns the
+     reasoning and delegates the predicate to this list);
+   - the barrier-capability witness is present and current: the
+     `.rbox/state/last-writer.json` sidecar specified in 1b parses exactly, its
+     recorded `stateDev`/`stateIno` match the live `state.json`, and its
+     `writerVersion` is >= the ratified `1.11.0` downgrade floor. A workspace
+     whose most recent writer predates the barrier is refused until it has been
      written once by a barrier-capable binary.
-   All three are re-checked immediately before the M6 rename, not only at M0.
+   All four are re-checked immediately before the M6 rename, not only at M0.
 4. **Fixtures (required before U3 may be enabled).** A rig scenario starts a
    degraded-unlocked legacy writer, suspends it after its state read, runs a
    full M0–M7 migration to completion, then resumes the writer: with the
@@ -2086,14 +2180,16 @@ M2's witness semantics are unchanged.
   restoring a backup, and the backup preamble above makes an unadvised attempt
   fail loudly.
 
-**4. Exact downgrade floor.** The supported downgrade floor is the first
-stable release that ships the write-side `Q` barrier (§ the degraded-writer
-closure above), provisionally **`1.11.0`** — the exact version is pinned in
-this document before U3 begins and is repeated in the 2.0 release notes.
-Below the floor, a binary's behavior against `Q` is whatever its guarded JSON
-parser happened to do and is explicitly unsupported. `main` is at `1.10.2`
-today, so the floor is a release that does not yet exist; that is the point of
-the pre-U0 `B0` unit.
+**4. Exact downgrade floor — RATIFIED `1.11.0` (founder, 2026-07-28).** The
+supported downgrade floor is **`1.11.0`**, the first stable release that ships
+the write-side `Q` barrier (§ the degraded-writer closure above). This is no
+longer provisional: the founder ratified the number on 2026-07-28, so `B0`
+ships *as* `1.11.0` rather than "whatever `B0` turns out to be", and both the
+M0 barrier-capability witness (1b) and the 2.0 release notes cite that exact
+version. Below the floor, a binary's behavior against `Q` is whatever its
+guarded JSON parser happened to do and is explicitly unsupported. `main` is at
+`1.10.2` today, so the floor is a release that does not yet exist; that is the
+point of the pre-U0 `B0` unit.
 
 The M0 authority matrix is exhaustive after standing reset recovery. `L`
 means an identity-stable admitted legacy JSON regular file; `C` means an active
@@ -2158,8 +2254,10 @@ JSON/`Q` authority row is corruption, not suppression.
 - Emergency halt candidate/reserve: prebuilt, fsynced, migration-id-bound
   siblings used to record ENOSPC without requiring new data blocks.
 - Backup history: immutable regular files
-  `.rbox/state/legacy-json/<sha256>.json`; the JSON body after the v6
-  `RBOX-LEGACY-STATE-BACKUP-v1` preamble must hash to the filename.
+  `.rbox/state/legacy-json/<sha256>.json`, always preamble-prefixed streaming
+  copies and never hard links (v7); the JSON body after the v6
+  `RBOX-LEGACY-STATE-BACKUP-v1` preamble must hash to the filename, while the
+  whole-file physical hash carries artifact identity.
   The fixed `pre-163-latest.json.bak` is replaceable only after its bytes exist
   in history.
 - DB completion row, inserted last in the same transaction as all imported
@@ -2187,7 +2285,7 @@ phase about to start. Its phase-specific `witness` closed union is:
 |---|---|
 | `M0` | exact source path/stat identity/hash/bytes, migration and authority ids, exact staging path |
 | `M1` | M0 plus successful 52×/512 MiB/RSS admission; an unhalted record has both exact fsynced `haltResources` identities `available` (a later halt may change only that top-level disposition) |
-| `M2` | exact immutable-history path/hash and exact fixed-backup path/hash, both parent-fsynced, plus `stagingMain` equal to `"absent"` or `{dev,ino}` (the same-phase revision after M3's durable exclusive create) |
+| `M2` | exact immutable-history path plus its body and physical hashes, exact fixed-backup path plus its body and physical hashes (both preamble-prefixed copies, never hard links — v7), both parent-fsynced, plus `stagingMain` equal to `"absent"` or `{dev,ino}` (the same-phase revision after M3's durable exclusive create) |
 | `M3` | exact committed `migration_completion` tuple/digest and the recorded durable staging-main identity |
 | `M4` | staging physical SHA-256/bytes, `S0`, semantic digest/counts, DDL/application/schema/FK/integrity proof version |
 | `M5` | the same physical witness at active `state.db`, active `S0`, `stagingMain:"absent"`, post-convergence state-parent fsync, and the prebound Q-sibling path/bytes plus its `absent|building|exact` same-phase disposition |
@@ -2301,9 +2399,10 @@ the process performs no further write.
 ### Correlated M6 cleanup to M7 (r3 C2b; r3b-4)
 
 M6 carries `cleanup:{order,durablePrefix,currentIntent}`. `order` is the closed
-role order for exact M6-present private/migration-id artifacts first, the
-generic reserve next, and the emergency resource last; it records each exact
-path/identity and parent.
+role order: the generic reserve first and the emergency resource last (v7 —
+the inventory below shows that no other role can contribute an M6 cleanup item,
+so the "private/migration-id artifacts first" clause described a set that is
+always empty at M6); it records each exact path/identity and parent.
 Q sibling is already absent and active DB/control/source backups are never
 cleanup items. M6 publication starts at prefix zero with no intent.
 
@@ -2313,29 +2412,74 @@ never enumerated it, and the C1 vector repeated the same undefined
 in this order; a role with no M6-present artifact contributes no item, and no
 other path may ever enter the vector.
 
-| # | Role | Canonical path | Admitted starting disposition at M6 | Terminal disposition |
-|---|---|---|---|---|
-| 1 | staging rollback journal | `.rbox/state/state.db.migrate.<migrationId>-journal` | absent, or exact regular file owned by this migration id | absent + parent fsync |
-| 2 | staging WAL | `.rbox/state/state.db.migrate.<migrationId>-wal` | absent, or exact owned regular file | absent + parent fsync |
-| 3 | staging SHM | `.rbox/state/state.db.migrate.<migrationId>-shm` | absent, or exact owned regular file | absent + parent fsync |
-| 4 | staging main (redundant name after the M5 rename) | `.rbox/state/state.db.migrate.<migrationId>` | absent (normal), or exact regular file whose physical hash equals the M4 witness | absent + parent fsync |
-| 5 | control publisher temp | `.rbox/state/migration-v1.json.<controlRevision>.tmp` for any revision of this migration id | absent, or exact inert regular temp | absent + parent fsync |
-| 6 | prepared halted-M6 sibling | `exactRevisionScopedPath(b+5)` | exact (direct branch) or absent (promoted branch) | the `exact-or-absent-terminal` descriptor already specified; retired by M7 |
-| 7 | generic reserve | the M1-recorded 1 MiB reserve path | `available`, `cleanup-intent`, or `cleanup-absent` | `retired` |
-| 8 | emergency halt candidate | the M1-recorded id-bound emergency path | `available`, `cleanup-intent`, or `cleanup-absent` | `retired` |
+**Reconciled with M0–M7 in v7.** V6's first version of this table contradicted
+the machine in three places, each of which is corrected below rather than left
+for an implementer to arbitrate: it admitted live staging artifacts at M6
+though M5 cannot complete without them being gone; it placed the prepared
+halted-M6 sibling *before* the resources whose cleanup creates it; and it
+auto-removed an inert control-publisher temp, which the doctor-only inert-temp
+rule forbids. The table now distinguishes **asserted absences** (roles that can
+never contribute a cleanup item, and whose presence at M6 is corruption) from
+the **two actual cleanup items**.
 
-Item 8 is the final item and therefore owns the allocation-free runway below.
-Sidecars precede their main (1–3 before 4) for the same reason the C1 vector
-orders them that way. Explicitly **not** cleanup items, in any branch: the
+| # | Role | Canonical path | Admitted starting disposition at M6 | Cleanup item? | Terminal disposition |
+|---|---|---|---|---|---|
+| 1 | staging rollback journal | `.rbox/state/state.db.migrate.<migrationId>-journal` | absent only | no — asserted | absent (already) |
+| 2 | staging WAL | `.rbox/state/state.db.migrate.<migrationId>-wal` | absent only | no — asserted | absent (already) |
+| 3 | staging SHM | `.rbox/state/state.db.migrate.<migrationId>-shm` | absent only | no — asserted | absent (already) |
+| 4 | staging main (redundant name after the M5 rename) | `.rbox/state/state.db.migrate.<migrationId>` | absent only | no — asserted | absent (already) |
+| 5 | control publisher temp | `.rbox/state/migration-v1.json.<controlRevision>.tmp` for any revision of this migration id | absent, or exact inert regular temp | no — doctor-only | unchanged by M6/M7; doctor's inert-temp quarantine owns it |
+| 6 | prepared halted-M6 sibling | `exactRevisionScopedPath(b+5)` | not yet created at the M6 cleanup start; created by the final-item runway below | no — M7-terminal | the `exact-or-absent-terminal` descriptor already specified; retired by M7 |
+| 7 | generic reserve | the M1-recorded 1 MiB reserve path | `available`, `cleanup-intent`, or `cleanup-absent` | **yes — first** | `retired` |
+| 8 | emergency halt candidate | the M1-recorded id-bound emergency path | `available`, `cleanup-intent`, or `cleanup-absent` | **yes — final** | `retired` |
+
+Item 8 is the final item and therefore owns the allocation-free runway below;
+item 7 is the only nonfinal cleanup item, so the ordered cursor
+(`durablePrefix`, `currentIntent`) ranges over exactly two positions. Why each
+non-item is a non-item:
+
+- **Roles 1–4 are absent by the time M6 exists, as a consequence of the machine
+  rather than of cleanup.** M4 requires `S0` — all three sidecars absent —
+  twice, before and after verification, and M5 renames the staging main over
+  `state.db` and then "require[s] staging absent" before publishing, with the M5
+  witness recording `stagingMain:"absent"`. A present staging artifact at M6 is
+  therefore not debris to be swept but a contradiction of the witness that
+  admitted M6: it is a `reserved-path` corruption halt with zero writes, on the
+  same footing as every other artifact-behind observation. They are listed
+  because the inventory is closed and must name what it asserts, not because
+  anything deletes them. Their pre-M5 forms remain live in the C1 retirement
+  vector, which is where a staging artifact can legitimately still exist.
+- **Role 5 is an inert temp, and inert-temp removal is doctor-only.** The
+  crash-table `absent` row already states the rule ("explicit doctor may
+  quarantine inert temps later"), and enumerating "any revision of this
+  migration id" would require directory discovery, which the cleanup vector
+  explicitly forbids ("no other path may ever enter the vector"). V6's row did
+  both. A stranded control temp is inert by construction — it never coordinates
+  or suppresses anything — so leaving it is safe, and the doctor's existing
+  inert-temp path is the one remover.
+- **Role 6 does not exist yet when M6 cleanup starts.** It is rendered at
+  revision `b+5` by the final item's own runway, i.e. strictly after item 7 has
+  been retired and while item 8's intent is durable, and it is retired by M7's
+  terminal descriptor. Placing it at position 6 described an artifact being
+  cleaned before the step that creates it.
+
+Explicitly **not** cleanup items, in any branch: the
 active DB, the control record itself (retired last, separately), `Q`, the Q
 sibling (already absent at M6), the fixed and immutable legacy-JSON backups,
 `cache-v1-retired/` parked caches (owned by U4's cache retirement, not by
-migration), and every legacy reset artifact in the retained-JSON branch.
+migration), every legacy reset artifact in the retained-JSON branch, and roles
+1–6 above for the reasons just given.
 
 The C1 source-change retirement vector uses the same eight roles plus the
 recorded Q sibling and any exact prepared active DB, exactly as its own table
-already prints; "private/migration-id artifacts" in that table means roles 1–6
-here and nothing else.
+already prints — but it runs *before* M5, so roles 1–4 are live members there
+rather than asserted absences (which is precisely why they are roles at all).
+"Private/migration-id artifacts" in that table means role 5 here and nothing
+else, and only those revision-scoped siblings whose exact path and identity the
+retiring control record itself names: C1 arms an enumerated vector, so it never
+discovers a temp, and it therefore does not reach the discovered inert temps
+that remain doctor-only. Role 6 cannot exist before M6 and is never in the C1
+vector.
 
 Before removing item `k+1`, the controller CAS-publishes the same M6 phase with
 `currentIntent:k+1`; a resource changes from `available` to `cleanup-intent` in
@@ -2592,10 +2736,25 @@ workspace mutex, complete repository fence as needed, and state lock:
    create it, and create/fsync the id-bound emergency halt candidate. Publish
    M1 only after both identities and parents are durable.
 3. **M2 — preserve source.** Ensure the current source exists at its immutable
-   hash-addressed history path by verified hard link or bounded streaming copy.
+   hash-addressed history path as a **bounded streaming copy carrying the
+   mandatory `RBOX-LEGACY-STATE-BACKUP-v1 <source-sha256>` preamble.
+   Hard-linking is forbidden (v7)** — v6 folded the preamble and left this
+   sentence's "verified hard link" alternative standing, and the two cannot both
+   be true: a hard link is the source's own bytes, so it cannot carry a
+   preamble, it would make the "immutable" history mutate whenever a 1.x writer
+   wrote through the same inode, and the restoration refusal the preamble exists
+   to guarantee would not apply to it. Every backup file, fixed and historical,
+   is a preamble-prefixed copy. Two distinct hashes follow, and the design uses
+   them consistently: the **body hash** is SHA-256 of the JSON document after
+   the preamble line, equals the source file's own hash, and is what names the
+   history file and appears in the preamble; the **physical hash** is SHA-256 of
+   the whole backup file including its preamble, and is what identity-brackets
+   the artifact and is recorded in the M2 witness. Wherever a digest references
+   a backup, it is the body hash for provenance and the physical hash for
+   artifact identity; they are never interchanged.
    If fixed `.bak` is absent/exact, publish/reuse it. If different but valid,
-   first preserve it under its own verified hash, fsync path+directory, then
-   atomically replace fixed backup and fsync `.rbox`. No unique bytes are
+   first preserve it under its own verified body hash, fsync path+directory,
+   then atomically replace fixed backup and fsync `.rbox`. No unique bytes are
    overwritten/deleted. Publish M2 only after both exact backup witnesses and
    their parents are durable.
 4. **M3 — durably create and build.** Before SQLite opens staging, no-follow
@@ -2802,7 +2961,9 @@ intent/unlink/parent-fsync/prefix, final halted-M6/M7 sibling preparation and
 old/new publication boundary, halt publish/recreate/clear, and
 every one-phase artifact-ahead restart (r3 C1+C2); it
 injects OS ENOSPC and `SQLITE_FULL` at every M0–M7 write
-class (including reserve/halt publication and cleanup), hard-link fallback,
+class (including reserve/halt publication and cleanup) and the M2
+preamble-prefixed backup streaming-copy path (v7: there is no hard-link
+fallback to inject any more),
 and instantiates retirement at M2 absent/incomplete/committed staging, M3 with
 each owned sidecar subset, every M4 staging-only/active-ahead/both form, and M5
 with absent/building/exact Q sibling. It also covers
@@ -3013,12 +3174,15 @@ digest and covers no local RepoRecord sidecar.
 repo_records(
   lineage_id, rel_path, path_order, repo_gen, source_seq,
   base_cjson NULL, advertised_cjson NULL,
-  branch_base_origins_cjson NULL, pending_cjson NULL,
+  branch_base_origins_cjson NULL,
+  packed_refs_identity NULL, pending_cjson NULL,
   repo_absent NULL CHECK(repo_absent=1),
   removed_key NULL, resolution_key NULL,
   cfg_synced NULL, cfg_applied NULL,
   cfg_token_cjson NULL, cfg_shape_cjson NULL,
-  deferrals_cjson NULL, partial_cjson NULL, idx_proj NULL, extras_cjson,
+  deferrals_cjson NULL, partial_cjson NULL,
+  attempt_cjson NULL, resolution_receipt_cjson NULL,
+  idx_proj NULL, extras_cjson,
   canonical_bytes, retained_estimate,
   PRIMARY KEY(lineage_id,rel_path)
 )
@@ -3051,11 +3215,18 @@ including values ignored by current per-path RepoRecord precedence. Therefore
 absent versus empty `{}` is reconstructible even when there are zero child
 rows. The raw migration digest orders and covers both the flags and values.
 
-Every `RepoRecord` field maps one-for-one: required `repoGen`/`sourceSeq` and
-optional `base`, `advertised`, `branchBaseOrigins`, `pending`, `repoAbsent`
+Every `RepoRecord` field maps one-for-one. **The list below is rebased on the
+current interface (`src/cli/sync-state-model.ts:288`), member by member, in
+declaration order** — v5 and v6 both carried a list that predated three live
+members, and v6's review log claimed a closure its normative text never made:
+required `repoGen`/`sourceSeq`, then optional `base`, `advertised`,
+`branchBaseOrigins`, `packedRefsIdentity`, `pending`, `repoAbsent`
 (true-or-absent), `removedKey`, `resolutionKey`, `cfgSynced`, `cfgApplied`,
-`cfgToken`, `cfgShape`, `deferrals`, `partial`, and `idxProj`. A missing record
-has logical `{repoGen:0,sourceSeq:0}`. NULL is field absence; an empty canonical
+`cfgToken`, `cfgShape`, `deferrals`, `partial`, `attempt`, `resolutionReceipt`,
+and `idxProj` — nineteen members, matching the nineteen field-carrying
+`repo_records` columns above one-for-one (the remaining columns are the
+lineage/path key, `extras_cjson`, and the two recomputed size columns).
+A missing record has logical `{repoGen:0,sourceSeq:0}`. NULL is field absence; an empty canonical
 object is not NULL. Canonical blobs are authoritative rather than
 `json_extract`-mutated because each admitted record is independently bounded
 and its proofs must remain atomic (durable row count is not capped at 256).
@@ -3099,6 +3270,56 @@ The codecs preserve these nested fields completely:
 Compile-time `satisfies Record<keyof T,true>` maps cover `SyncState`, `Manifest`,
 `FileEntry`, `GlobalManifestMeta`, `RepoRecord`, `GitSection`, and the nested
 recovery types; fixtures exercise every union member and optional-presence bit.
+
+#### Newly named members and strip-on-read semantics (v7, R4-CODE B3 + R4-CODEX 1)
+
+The three members v5/v6 omitted are live today and are normative columns above,
+not extras:
+
+- **`packedRefsIdentity?: {mtimeMs:number}`** -> `packed_refs_identity`. A
+  refuse-only restore detector for the common store's `packed-refs`. Stored as
+  the canonical one-key object (not a bare number), so a future second member
+  cannot be mistaken for a schema change; NULL is absence, and absence is
+  semantically distinct from a recorded identity because absence means "no
+  refusal evidence", never "unchanged".
+- **`attempt?: GitHeldAttempt`** -> `attempt_cjson`. The design-174/200
+  local-only held-follow observation: `incomingKey`, both
+  `effective*IndexProjection` nullable projections,
+  `incomingIndexArtifactDescriptor`, `localFingerprint`, `fingerprintVersion`,
+  optional `worktreeRegistryDigest` (whose absence is itself load-bearing — a
+  missing digest is never eligible for held-skip, so absent-versus-empty must
+  survive the round trip), ordered `reflogs` entries, and the complete ordered
+  `blockers` union. Never wire-visible; the wire composer excludes it exactly
+  as it excludes `idxProj`.
+- **`resolutionReceipt?: GitResolutionPublicationReceipt`** ->
+  `resolution_receipt_cjson`: `repo`, `attemptedGitIncomingKey`,
+  `attemptedSequence`, `confirmedReportHash`, all four required. It is durable
+  proof that a synchronous keep-mine publication may have reached the server, so
+  dropping it is a correctness loss, not a cosmetic one; the migration
+  round-trip fixture asserts it explicitly.
+
+**`resolutionIntent` is stripped before the digest, and is never `extras_cjson`.**
+It is a `<=1.7.18` obsolete member that `stripObsoleteResolutionIntents`
+(`src/cli/sync-state-model.ts:363`, with the defensive projection at `:404`)
+removes on every disk read, because every read funnels through `loadRawState`.
+Its normative disposition here: the named `state-semantic-v1` v1 normalization
+applies that same strip to the **source** JSON *before* the source semantic
+digest is computed, and the importer discards it rather than routing it into
+`extras_cjson`. Consequences, all deliberate: source digest and SQL round-trip
+digest agree without a special case; `source_shape_flags_cjson` records no
+presence bit for it, so a source that carried it is not reported as a shape
+difference; and it can never be resurrected by an `extras_cjson` spread. It is
+the one known member that is intentionally *not* preserved, and this is the
+only place that exception is granted.
+
+**Schema-rebase gate (so this cannot drift a fourth time).** The compile-time
+coverage maps above prove that every `keyof RepoRecord` is *handled*; they do
+not prove that this document lists it. U1 therefore ships a test that reads the
+`repo_records` column list from the frozen DDL and asserts a total bijection
+with `keyof RepoRecord` minus the single named strip-list member
+(`resolutionIntent`), failing with the missing names. Adding a `RepoRecord`
+field without adding its column — the exact failure that produced this
+paragraph — becomes a red test rather than a stale sentence.
 
 ### Complete SyncState mapping and legacy semantics
 
@@ -3386,7 +3607,8 @@ control revisions and one named f6 exception, for one item.
 allocation resource under ENOSPC. PARTIALLY ADOPTED.** Deleting the emergency
 resource as the final cleanup item is what forces the allocation-free runway to
 exist. Permanently retaining it (1 MiB per workspace, forever) would let M7
-publish normally and would delete roles 6–8 from the cleanup inventory. This is
+publish normally and would delete roles 7–8 — under v7's reconciled inventory,
+*both* remaining cleanup items — from the inventory. This is
 attractive and v6 does not take it, for one reason: a permanently retained
 migration-era resource becomes an artifact of unknown provenance to every
 future reader, and the reserve is claimed by M1 from `B0`, which means it is
@@ -3586,8 +3808,9 @@ must pass the differential rig before the next begins.**
 
 ### B0 — pre-U0 stable-line barrier release (blocking dependency)
 
-Owner: named before U0 starts. Ships on `main` as an ordinary 1.x release
-(provisionally `1.11.0`, the pinned downgrade floor).
+Owner: named before U0 starts. Ships on `main` as an ordinary 1.x release,
+**`1.11.0` — the ratified downgrade floor (founder, 2026-07-28)**, not a
+placeholder to be pinned later.
 
 Contents:
 1. Recognize exact `Q` before **every** state read **and every state write**,
@@ -3597,8 +3820,38 @@ Contents:
 2. A pinning inventory test that enumerates every production state
    reader/writer/reset entry point and fails when a new one appears without a
    barrier check.
-3. The fsynced 1 MiB generic reserve that M1 later claims.
+3. The fsynced 1 MiB generic reserve that M1 later claims — fully specified
+   here in v7, because "the reserve" was named in five places and defined in
+   none:
+   - **Exact path:** `.rbox/state/reserve-1mib.bin`. Fixed, not id-scoped: it
+     is generic runway, claimed by whichever migration runs, and `B0` creates
+     it long before any migration id exists.
+   - **Creation:** no-follow `O_CREAT|O_EXCL` at mode 0600, write exactly
+     1,048,576 zero bytes, `fsync` the file, `fsync` `.rbox/state`, then lstat
+     and record `{dev,ino,size}`. Creation is attempted once per `B0` startup
+     path and its failure is never fatal to the 1.x binary — a workspace
+     without the reserve is simply a workspace M1 must create it in.
+   - **Collision:** an existing exact regular non-symlink file of exactly
+     1,048,576 bytes is **adopted** (identity recorded, contents irrelevant —
+     it is allocation, not data). Anything else at that path — directory,
+     symlink, device, wrong size, unreadable — is **never deleted and never
+     truncated**: `B0` leaves it and reports it, and M1 refuses with a typed
+     `reserve-foreign` condition. The one thing a fixed-path allocation artifact
+     must not do is delete something it did not create.
+   - **Pre-M0 inventory disposition:** the reserve exists on every barrier-era
+     1.x workspace, including ones that never migrate. It is a named, known
+     member of `.rbox/state/` — enumerated by the journal-independent reset
+     namespace inventory as an **inert non-reset artifact**: never an O/N
+     witness, never a classification input, never correlated by a P/R/I/Z row,
+     and never deleted by reset. Being a named member is what keeps it from
+     tripping the "unknown name in a reserved directory" halt. M1 claims it by
+     CAS-recording its identity into the control; M6 role 7 retires it; on a
+     workspace that never migrates it stays resident forever at 1 MiB, which is
+     the price `B0` pays for M1's guaranteed runway.
 4. Doctor copy that never advises deleting `Q`.
+5. The `.rbox/state/last-writer.json` witness sidecar and its update protocol
+   (§ the degraded-writer closure, 1b), plus the extension of the item-2
+   inventory test to cover it.
 
 Exit criteria (all required before U3 may be enabled, not merely before it may
 be written):
@@ -3701,9 +3954,16 @@ Additional v6 exits:
   materialization and adds a SQLite page cache, so this is a real risk, not a
   formality.
 - **Differential control.** The same-corpus manifest diff and the two-host rig
-  (below) run at the flip, where they must be clean *by construction* — the
-  engine did not change. A failure here means the store is not semantically
-  faithful, which is exactly what the gate exists to catch.
+  (below) run at the flip. V6 said they "must be clean *by construction* — the
+  engine did not change"; **v7 weakens that to the differential gate's own
+  framing**, because the claim overstated what the flip leaves untouched. The
+  scan/reconcile/apply engine is byte-identical, but the backend, the codecs,
+  the CAS admission path, and the whole reset/quarantine conversion all change
+  underneath it, and each can move a wire-visible verdict without any engine
+  edit. So the flip is not exempt from the gate; it is the run where a
+  difference is *least expected* and therefore most informative. The rule is
+  the same as every other slice's: any difference is either fixed or explicitly
+  ratified as intended, and an unexplained one blocks the flip.
 - **Adapter inventory.** The whole-state adapter is the single permitted
   production use of `loadState(): SyncState`. CI counts its call sites from
   this release forward; the count may only decrease and must reach zero by
