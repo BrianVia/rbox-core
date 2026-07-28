@@ -5,6 +5,53 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_SESSION 2026-07-27 (night) → 07-28 (early): **memory incident closed, desktop
+READ-WRITE, v1.10.2 shipped, 163/2.0 kickoff.** (1) **OOM root-caused end to
+end** (report: `/home/via/memory-incident-report-2026-07-27.md` on the desktop,
+§9 addendum): the 21.3GiB `bun` the kernel killed at 01:54 was a wave-8 reorg
+subagent's `timeout 120 bun test daemon-operation-scheduler.contract.test.ts`
+run 2s after editing the draft scheduler — retired-halt recoveryProbe spin,
+~21GiB in ≤48s. Forensic method that cracked it: Claude session transcripts
+(`~/.claude/projects/…` + subagents/) survive reboots/tmpfs and reconstruct
+exact commands AND exact code versions from Write/Edit payloads. No released
+build ever had the bug. Mitigations live: host swap 2→32GiB +
+user-slice MemoryMax=32GiB (founder), PreToolUse hook wrapping every agent
+`bun test` in a systemd 12G-capped scope (desktop, `~/.claude/hooks/`), and
+the structural fix #530. (2) **v1.10.2 RELEASED** (tag 551604cc, run
+30321597242 green, api.rbox.to/version=1.10.2): #530 scheduler spin guard
+only — dequeue retires recoveryDue with its halt + serviceLoop no-progress
+breaker (parks queue after 3), red-then-green verified. (3) **Desktop daemon
+READ-WRITE since ~21:14 EDT** (founder-ordered; the old "no flip before
+.rboxignore" precondition was struck — #531's memo proved ignores freeze,
+never delete): trusted pulls live (`scan 0.0s`), first publish calm (seq 817,
+3.2MB wire), manifest 83.7k→120.3k files, no #501 journal blowup yet — watch
+it. Worktrees now sync FROM desktop; Mac/FM exclude them via
+respectGitignore=on + repo .gitignore lines (rbox-core:40) — founder semantic
+confirmed correct ("sync unless gitignored AND respect on"); recommended
+re-include if wanted: `!.claude/worktrees/` in .rboxignore (verified; `/**`
+variant silently fails). NEW PAPERCUT: sync conflict artifacts
+(`*.conflict.md`) landing inside active agent worktrees get swept by
+`git add -A` (docs/papercuts.md; agents must stage by name). (4) **Docs
+merged**: #531 flip/ephemera memo (headline: NO new default-ignore set
+needed; open questions incl. respectGitignore per-device inconsistency),
+#532 design 213 pull-only live watch (DRAFT/NOT ALIGNED, 2nd codex round
+owed; urgency dropped now the whole fleet is read-write). (5) **163/2.0
+kickoff — v5 failed ratification** (2 opus lanes + codex: NOT-READY;
+correctness core praised, C4 inventory/schema drift/rollout failed). Fold
+rounds on `design/163-v6` (v6 + backend-first restructure): codex final
+serial = NOT-ALIGNED; **rounds one and two both falsely logged the
+RepoRecord schema closure (said-not-done) — verify fold claims by grep,
+never by the review log**. FOUNDER RATIFIED tonight: backend-first hybrid
+(B0→U0→U1→U2 reset→U3 flip/2.0→U4a–f on main→U5), B0 barrier gate incl.
+external-user adoption, downgrade floor 1.11.0, kill numbers p50≤200ms/
+p95≤400ms/RSS≤1.5GB. OPEN founder question: external users take the one-way
+migration before the payoff lands. v7 targeted fold (witness-table
+discipline) in flight on `design/163-v7` at session end; after it verifies →
+codex serial → ratify → B0 barrier becomes the next dev item (ships as
+1.11.0). ALSO QUEUED (founder yes tonight): #526 `rbox git republish` lever,
+design 212 V1 implementation. gh CLI token was re-authed via device flow
+(expired token blocked PRs mid-session)._
+
 _RELEASE 2026-07-27 (v1.10.1): **"a calmer help screen" SHIPPED** (tag at
 bacb5785, release run 30308973148 green, api.rbox.to/version = 1.10.1).
 Content: #527 only — root `rbox --help` shrunk to the six core-loop
