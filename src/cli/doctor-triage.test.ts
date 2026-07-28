@@ -620,6 +620,30 @@ test("malformed local state is honest that rbox cannot repair it, and never offe
   expect(finding?.safety).not.toMatch(/[^&] `rbox setup`/);
 });
 
+test("a state plane from a newer rbox is reported end to end and never advises deleting it", async () => {
+  await fs.writeFile(path.join(root, ".rbox", "state.json"), `RBOX-SQLITE-AUTHORITY-v1\n${"a".repeat(32)}\n`);
+  const ctx = await collectDoctorContext(root);
+  expect(ctx.checks.state.ok).toBe(false);
+  expect(ctx.checks.state.status).toBe("format-too-new");
+  expect(ctx.checks.state.hint).not.toContain("delete it");
+
+  const finding = findingById(triageWorkspace(await readTriageInputs(root, ctx.checks, NOW)).findings, "state-format-too-new");
+  expect(finding?.severity).toBe("blocked");
+  expect(finding?.problem).toContain("newer version of rbox");
+  expect(finding?.command).toBe("rbox upgrade");
+  // The only mention of deletion anywhere in the finding is the instruction NOT to.
+  expect(`${finding?.problem} ${finding?.safety} ${finding?.command}`.match(/delet/gi)?.length).toBe(1);
+  expect(finding?.safety).toContain("Do not delete");
+});
+
+test("a foreign occupant of the upgrade reserve is reported without threatening it", () => {
+  const checks = healthyChecks();
+  checks.reserve = { ok: false, label: "upgrade reserve", message: "not rbox's own reserved space (foreign-workspace)", status: "reserve-foreign" };
+  const finding = findingById(triageWorkspace(inputs({ checks })).findings, "state-reserve-foreign");
+  expect(finding?.severity).toBe("attention");
+  expect(finding?.safety).toContain("will not open, shrink, or delete");
+});
+
 test("a state file from another workspace gets its own finding, also without rbox recover", () => {
   const checks = healthyChecks();
   checks.state = { ok: false, label: "state", message: "different stream", status: "stream-mismatch" };

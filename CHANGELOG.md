@@ -6,6 +6,18 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **rbox now protects your folder's sync records from a future upgrade.** A
+  later version of rbox will store those records differently. From this release
+  on, rbox recognizes the newer format and stops rather than writing the older
+  format over it — so an older copy of rbox running somewhere on your machine
+  can no longer quietly undo an upgrade. If that ever happens, `rbox doctor`
+  says so in plain English and points at `rbox upgrade`; it never tells you to
+  delete anything. rbox also reserves a small amount of space inside the folder
+  so a future upgrade cannot fail partway through for want of disk, and it
+  refuses to touch that reserved space if anything it did not create is
+  occupying it.
+
 ## [1.10.2] - 2026-07-27
 
 ### Fixed

@@ -7,6 +7,8 @@ import { acquireLock, type OwnedLock } from "../engine/git/lockfile.js";
 import { withRepositoryRecoveryFence } from "../engine/git/protocol-locks.js";
 import { readRepoIdentityV1, repositoryIdentityHash, validateRepoIdentityV1, type RepoIdentityV1 } from "../engine/git/repo-lineage.js";
 import { gitRaw } from "../engine/git/shared.js";
+import { assertStateReadable, StateFormatTooNewError, StateWriteRefusedError } from "./state-barrier.js";
+import { recordLastWriterWitness } from "./state-witness.js";
 import type { SyncState } from "./sync-state-model.js";
 import {
   classifyResetPhysicalSignature,
@@ -327,6 +329,9 @@ async function observePhysical(root: string, journal: ResetJournalV2): Promise<R
     archive: resetArchivePath(root, journal.old.stateNonce, journal.old.stateSha256),
     marker: resetIncarnationPath(root), journal: resetJournalPath(root),
   };
+  // Hashing the live state is a read of the state plane: a newer format must be
+  // recognized here, not consumed as an ordinary signature mismatch.
+  await assertStateReadable(paths.active);
   const [activeHash, candidateHash, archiveHash, marker, refs] = await Promise.all([
     boundedHash(paths.active), boundedHash(paths.candidate), boundedHash(paths.archive), markerDisposition(paths.marker, journal), observeRefs(journal.old.z),
   ]);
@@ -368,7 +373,12 @@ export async function inspectResetJournal(root: string, callerStream?: string): 
   }
   let observation: ResetArtifactObservation;
   try { observation = await observePhysical(root, journal); }
-  catch (error) { return { status: "halt", reason: error instanceof Error ? error.message : "physical reset inspection failed", journalIdentityHash, journal }; }
+  catch (error) {
+    // The barrier is fail-closed and typed; demoting it to a generic reset halt
+    // would tell the user to repair a reset that is not the problem.
+    if (error instanceof StateFormatTooNewError) throw error;
+    return { status: "halt", reason: error instanceof Error ? error.message : "physical reset inspection failed", journalIdentityHash, journal };
+  }
   const row = classifyResetPhysicalSignature(observation);
   if (!row) return { status: "halt", reason: "physical reset state matches no authorized recovery row", journalIdentityHash, journal, observation };
   return { status: "recoverable", journalIdentityHash, journal, configDisposition: callerStream === journal.old.stream ? "old" : "next", row, observation };
@@ -428,6 +438,7 @@ export async function recoverResetJournalUnderHeldFence(
   stateLock: OwnedLock,
 ): Promise<"none" | "complete"> {
   if (!(await stateLock.isOwner())) throw corruption("sync state lock ownership was lost");
+  await assertStateReadable(activeStatePath(root));
   let inspection = await inspectResetJournal(root, callerStream);
   if (inspection.status === "none") return "none";
   if (inspection.status === "halt") throw new ResetRecoveryHaltError(inspection);
@@ -443,6 +454,7 @@ export async function recoverResetJournalUnderHeldFence(
       await hooks.crashAt?.("after-candidate-create");
     }
     if (rowId === "P0" || rowId === "P1") {
+      await assertStateReadable(activeStatePath(root));
       if (await boundedHash(activeStatePath(root)) !== journal.old.stateSha256) throw corruption("old state changed before archive creation");
       if (!(await boundedCopy(activeStatePath(root), archivePath))) throw corruption("old state disappeared before archive creation");
       if (await boundedHash(archivePath) !== journal.old.stateSha256) throw corruption("old state archive copy mismatch");
@@ -465,8 +477,17 @@ export async function recoverResetJournalUnderHeldFence(
   if (journal.phase === "ready") {
     const activeParent = path.dirname(activeStatePath(root));
     const candidateParent = path.dirname(candidatePath);
-    if (inspection.row.ids[0] === "R0") await fs.rename(candidatePath, activeStatePath(root));
+    if (inspection.row.ids[0] === "R0") {
+      // The entry-time ownership check is arbitrarily old by now: preparing the
+      // archive and the recovery refs is unbounded work. Re-assert the lease and
+      // then read the barrier with nothing between it and the rename but the
+      // rename, so a lease lost during that work refuses instead of publishing.
+      if (!(await stateLock.isOwner())) throw new StateWriteRefusedError("state-lock-lease-lost", activeStatePath(root));
+      await assertStateReadable(activeStatePath(root));
+      await fs.rename(candidatePath, activeStatePath(root));
+    }
     await fsyncDirectory(activeParent);
+    await recordLastWriterWitness(root, activeStatePath(root), nextBytes);
     await hooks.crashAt?.("after-destination-parent-fsync");
     await fs.rm(candidatePath, { force: true });
     await fsyncDirectory(candidateParent);

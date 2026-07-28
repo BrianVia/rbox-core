@@ -20,6 +20,8 @@ import { GENESIS_PENDING_MESSAGE } from "./genesis-durable.js";
 import type { E2eeRemote } from "./e2ee-remote.js";
 import { readLockingHealth } from "./sync-mutex.js";
 import { ResetCorruptionError } from "./reset-io.js";
+import { StateFormatTooNewError } from "./state-barrier.js";
+import { inspectStateReserve } from "./state-reserve.js";
 import { GIT_DEFERRAL_REASONS } from "./sync-state-model.js";
 import { fetchWithDeadline, transferTimeoutMs } from "./remote/resilient.js";
 import { listWorktrees } from "../engine/git/shared.js";
@@ -53,7 +55,7 @@ export interface DoctorCheck {
   pid?: number;
 }
 
-export type DoctorChecks = Record<CheckName, DoctorCheck> & { chain?: DoctorCheck };
+export type DoctorChecks = Record<CheckName, DoctorCheck> & { chain?: DoctorCheck; reserve?: DoctorCheck };
 
 export interface WorkspaceShape {
   fileCount: number;
@@ -409,12 +411,41 @@ async function checkState(root: string, cfg: WorkspaceConfig): Promise<DoctorChe
     return { ok: true, label: "state", message: "state file parses and matches this stream" };
   } catch (e) {
     const message = e instanceof Error ? e.message : "";
+    if (e instanceof StateFormatTooNewError) {
+      return {
+        ok: false, status: "format-too-new", label: "state",
+        message: ".rbox/state.json was written by a newer version of rbox",
+        hint: "run `rbox upgrade`; do not delete this file",
+      };
+    }
     if (e instanceof ResetCorruptionError
       && message.includes(file)
       && (message.includes("malformed JSON") || message.includes("JSON nesting exceeded"))) {
       return { ok: false, status: "malformed", label: "state", message: ".rbox/state.json is not valid JSON", hint: "inspect the file or delete it to intentionally re-baseline" };
     }
     return { ok: false, status: "unreadable", label: "state", message: "could not read .rbox/state.json" };
+  }
+}
+
+/** The reserved 1 MiB of upgrade runway. Absent is normal (it is created by the
+ * first state save); only a foreign occupant of the path is a finding, because
+ * rbox will never adopt, shrink, or remove something it did not write. */
+async function checkStateReserve(root: string, cfg: WorkspaceConfig): Promise<DoctorCheck> {
+  try {
+    const outcome = await inspectStateReserve(root, syncStreamId(cfg));
+    if (outcome.status === "reserve-foreign") {
+      return {
+        ok: false, status: "reserve-foreign", label: "upgrade reserve",
+        message: `.rbox/state/reserve-1mib.bin is not rbox's own reserved space (${outcome.detail})`,
+        hint: "move that file aside yourself, then run `rbox doctor` again",
+      };
+    }
+    if (outcome.status === "unavailable") {
+      return { ok: true, label: "upgrade reserve", message: outcome.detail === "absent" ? "not reserved yet" : `not reserved yet (${outcome.detail})` };
+    }
+    return { ok: true, label: "upgrade reserve", message: "1 MiB reserved for future upgrades" };
+  } catch {
+    return { ok: true, inconclusive: true, label: "upgrade reserve", message: "could not check the reserved space" };
   }
 }
 
@@ -701,7 +732,7 @@ export async function collectDoctorContext(
   const creds = loaded.state === "valid" ? loaded.credentials : undefined;
   const cfg = { ...rawCfg, remoteUrl: creds?.remoteUrl ?? rawCfg.remoteUrl };
   const daemon = checkDaemon(root, cfg);
-  const [credentials, enrollment, device, remote, version, state, locking, git, shape, chain, leftoverWorktrees, repoResidue] = await Promise.all([
+  const [credentials, enrollment, device, remote, version, state, reserve, locking, git, shape, chain, leftoverWorktrees, repoResidue] = await Promise.all([
     loaded.state !== "valid" && loaded.state !== "absent"
       ? Promise.resolve({ ok: false, label: "credentials", message: `credential-degraded: ${credentialFailureMessage(loaded)}`, hint: "repair the credential source, then retry" })
       : checkCredentials(creds),
@@ -710,6 +741,7 @@ export async function collectDoctorContext(
     checkRemote(creds, cfg),
     checkVersion(creds, cfg),
     checkState(root, cfg),
+    checkStateReserve(root, cfg),
     checkLocking(root),
     checkGitCapability(root),
     // An unreadable or foreign-stream state.json is exactly what `checkState`
@@ -746,7 +778,7 @@ export async function collectDoctorContext(
     credentialResult: loaded,
     daemonStale: daemon.stale,
     workspaceShape: shape,
-    checks: { credentials, enrollment, device, daemon: daemon.check, remote, version, state, crypto: checkCryptoWorkers(), locking, git, chain },
+    checks: { credentials, enrollment, device, daemon: daemon.check, remote, version, state, crypto: checkCryptoWorkers(), locking, git, reserve, chain },
     localOnly: {
       leftoverWorktrees: leftoverWorktrees.localOnly,
       repoResidue: repoResidue.localOnly,
@@ -853,7 +885,7 @@ export function renderDoctor(
   localOnly?: DoctorContext["localOnly"],
 ): string {
   const lines = [`${style.bold("doctor")} — workspace health`];
-  for (const key of ["credentials", "enrollment", "device", "daemon", "remote", "version", "state", "crypto", "locking", "git", "chain"] as const) {
+  for (const key of ["credentials", "enrollment", "device", "daemon", "remote", "version", "state", "crypto", "locking", "git", "reserve", "chain"] as const) {
     const c = checks[key];
     if (!c) continue;
     lines.push(`  ${c.ok ? style.sym.ok : style.sym.err} ${c.label}: ${c.message}`);

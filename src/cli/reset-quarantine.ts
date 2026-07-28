@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { assertStateReadable } from "./state-barrier.js";
 import { canonicalize } from "../engine/e2ee/jcs.js";
 import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
 import { boundedCopy, boundedHash, boundedJsonRead, boundedRead, RESET_STREAM_BYTE_LIMIT } from "./reset-io.js";
@@ -314,6 +315,9 @@ export async function restoreResetQuarantineUnderFence(root: string, bundle: str
   const manifest = await loadCommittedBundle(bundle);
   if (!manifest) throw new Error("reset quarantine bundle is uncommitted or corrupt");
   if (manifest.activeStateSha256) {
+    // The restore decision is taken from the live state's hash; a newer state
+    // plane must be recognized rather than hashed as if it were JSON.
+    await assertStateReadable(path.join(root, ".rbox", "state.json"));
     const active = await boundedHash(path.join(root, ".rbox", "state.json"), RESET_STREAM_BYTE_LIMIT);
     if (manifest.recoveredStateSha256 !== undefined && active === manifest.recoveredStateSha256) {
       const journal = manifest.artifacts.find((a) => a.kind === "journal")!;

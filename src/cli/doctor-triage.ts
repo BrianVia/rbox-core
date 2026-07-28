@@ -230,6 +230,15 @@ function accountFindings(input: TriageInputs): TriageFinding[] {
  * then fail without repairing anything. */
 function stateFinding(root: string, check: DoctorChecks["state"]): TriageFinding | undefined {
   if (check.ok) return undefined;
+  if (check.status === "format-too-new") {
+    return {
+      id: "state-format-too-new",
+      severity: "blocked",
+      problem: "This folder's sync records were written by a newer version of rbox than the one installed here, so this version will not touch them.",
+      safety: `${SAFE_LOCAL_FILES} Do not delete the sync records — the newer rbox needs them.`,
+      command: "rbox upgrade",
+    };
+  }
   const mismatch = check.status === "stream-mismatch";
   return {
     id: mismatch ? "state-belongs-elsewhere" : "state-unreadable",
@@ -296,6 +305,15 @@ function environmentFindings(input: TriageInputs): TriageFinding[] {
   }
   const locking = lockingFinding(root, checks.locking);
   if (locking) out.push(locking);
+  if (checks.reserve && !checks.reserve.ok && checks.reserve.inconclusive !== true) {
+    out.push({
+      id: "state-reserve-foreign",
+      severity: "attention",
+      problem: "Something that rbox did not create is sitting in the space rbox reserves inside this folder for future upgrades.",
+      safety: `${SAFE_LOCAL_FILES} rbox will not open, shrink, or delete that file — it has simply stopped reserving the space.`,
+      command: scoped(root, "rbox doctor --report"),
+    });
+  }
   return out;
 }
 
