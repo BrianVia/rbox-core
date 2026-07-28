@@ -4,6 +4,7 @@ import path from "node:path";
 import { StateStoreOpenError } from "../errors.js";
 import {
   applySchemaV1,
+  installGenesisLineage,
   STATE_STORE_SQLITE_APPLICATION_ID,
   STATE_STORE_SQLITE_USER_VERSION,
   type GenesisLineage,
@@ -205,7 +206,11 @@ export function stateStoreDatabase(store: StateStoreHandle): Database {
   return connection;
 }
 
-export function createStateStore(file: string, genesis: GenesisLineage): StateStoreHandle {
+/** @internal state-plane vertical only; future installers own their transaction. */
+export function initializeStateStore(
+  file: string,
+  install: (db: Database) => void,
+): StateStoreHandle {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   let db: Database | undefined;
   let claimed = false;
@@ -222,7 +227,8 @@ export function createStateStore(file: string, genesis: GenesisLineage): StateSt
     db = new Database(file, { create: false, readwrite: true });
     db.exec(`PRAGMA page_size=4096; PRAGMA application_id=${STATE_STORE_SQLITE_APPLICATION_ID}; PRAGMA user_version=${STATE_STORE_SQLITE_USER_VERSION}`);
     configureWriter(db);
-    applySchemaV1(db, genesis);
+    applySchemaV1(db);
+    install(db);
     const header = validateOpen(db, file);
     const pragmas = readPragmas(db);
     assertPragmas(pragmas, false, file);
@@ -234,6 +240,10 @@ export function createStateStore(file: string, genesis: GenesisLineage): StateSt
     }
     throw error;
   }
+}
+
+export function createStateStore(file: string, genesis: GenesisLineage): StateStoreHandle {
+  return initializeStateStore(file, (db) => installGenesisLineage(db, genesis));
 }
 
 export function openStateStore(file: string, options: { readonly?: boolean } = {}): StateStoreHandle {
