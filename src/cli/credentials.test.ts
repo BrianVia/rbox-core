@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, setSystemTime, test } from "bun:test";
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -457,23 +458,34 @@ test("a peer that cycles the fence exhausts the budget and names the churn", asy
   const fence = `${lockPath()}.fence`;
   await fs.mkdir(path.dirname(fence), { mode: 0o700 });
   const identity = await (await import("../engine/git/lockfile.js")).systemLockIdentity.current();
-  const republish = async (nonce: string) => {
-    await fs.rm(fence, { force: true });
-    await fs.writeFile(fence, JSON.stringify({
+  // Allocate the successor while the current marker is still linked, then
+  // rename it over: the two inodes coexist, so the replacement can never
+  // inherit the old inode number. Unlink-then-create would let the allocator
+  // hand back the same inode — every marker here is the same size and mode, so
+  // the inode is the ONLY thing that makes the swap observable.
+  const republish = (nonce: string) => {
+    const swap = `${fence}.swap`;
+    fsSync.writeFileSync(swap, JSON.stringify({
       v: 1, pid: process.pid, processStart: identity.startTime, acquiredAt: new Date().toISOString(), nonce: nonce.repeat(32),
     }), { mode: 0o600 });
+    fsSync.renameSync(swap, fence);
   };
-  await republish("a");
+  republish("a");
   let cycles = 0;
-  restoreHook = installCredentialTestHook(async (seam, context) => {
-    // A peer that keeps taking and releasing the fence: every inspection finds
-    // a different inode at the same path, so no attempt can ever settle.
+  restoreHook = installCredentialTestHook((seam, context) => {
+    // A peer that keeps taking and releasing the fence. The swap is synchronous
+    // inside the inspection window the seam names, so every attempt observes a
+    // turnover no matter how the runner schedules this process.
     if (seam !== "marker-observe-before-open" || context.markerPath !== fence) return;
     cycles++;
-    await republish(String(cycles % 10));
+    republish(String(cycles % 10));
   });
-  await expect(saveCredentials(credential)).rejects.toThrow(/saw the marker change during inspection/);
+  const failure = await saveCredentials(credential).then(() => undefined, (error: unknown) => error as Error);
+  // Boundedness comes from the hook's own attempt count, not from elapsed time:
+  // the budget exhausted after a finite number of inspections, and the message
+  // reports every one of them as churn rather than a stuck holder.
   expect(cycles).toBeGreaterThan(1);
+  expect(failure?.message).toContain(`${cycles} of ${cycles} attempts saw the marker change during inspection`);
 });
 
 test("five-minute stale main marker is taken over independent of its live PID", async () => {
