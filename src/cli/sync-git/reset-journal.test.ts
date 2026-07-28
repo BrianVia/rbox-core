@@ -80,7 +80,11 @@ async function legacyProtocolTree(z: ResetZEntry[] = []): Promise<Record<string,
         const bytes = await fs.readFile(absolute);
         if (relative === path.join(".rbox", "state", "last-writer.json")) {
           const witness = JSON.parse(bytes.toString("utf8")) as Record<string, unknown>;
-          for (const key of ["writtenAtMs", "stateMtimeMs", "stateDev", "stateIno"]) {
+          // writerVersion is the running rbox version — it changes every
+          // release and is not behavior, so redact it alongside the other
+          // environment-dependent fields (else every version bump breaks this
+          // legacy-invariance differential).
+          for (const key of ["writtenAtMs", "stateMtimeMs", "stateDev", "stateIno", "writerVersion"]) {
             if (key in witness) witness[key] = `<volatile:${key}>`;
           }
           snapshot[relative] = Buffer.from(JSON.stringify(witness)).toString("base64");
