@@ -5,7 +5,8 @@ import path from "node:path";
 import { resolveRigBinaryPaths } from "./rig/lib/binary.js";
 import { shellQuote } from "./ux/lib.js";
 
-const binary = resolveRigBinaryPaths({ binary: process.argv[2] }).a;
+const binaryArg = process.argv[2];
+const binary = resolveRigBinaryPaths(binaryArg === undefined ? {} : { binary: binaryArg }).a;
 const scenario = process.argv[3] ?? "--full";
 const scenarios = new Set(["--full", "--cancel", "--secret-retry", "--secret-abort", "--secret-render-error", "--secret-cancel"]);
 if (!binary || process.argv.length > 4 || !scenarios.has(scenario)) {

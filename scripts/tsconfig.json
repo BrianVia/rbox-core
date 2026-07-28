@@ -1,0 +1,16 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": [
+    "rig/**/*.ts",
+    "tui-compiled-smoke.ts",
+    "tui-performance-budget.ts"
+  ],
+  "exclude": [
+    "rig/**/*.test.ts",
+    "rig/runs/**",
+    "rig/cache/**"
+  ]
+}

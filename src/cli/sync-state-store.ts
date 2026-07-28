@@ -25,6 +25,7 @@ import {
   assertStatePublishable,
   assertStateReadable,
   publishWholeState,
+  StreamMismatchError,
   StateWriteRefusedError,
 } from "./state-plane/index.js";
 import { RBOX_DIR } from "./workspace-config.js";
@@ -54,23 +55,7 @@ const stateIncarnationPath = (root: string) => path.join(root, RBOX_DIR, "state"
 const freshState = (stream: string): SyncState => ({ stream, lastSyncedSequence: 0, lastSyncedManifest: EMPTY_MANIFEST });
 const streamMismatchFreshStates = new WeakSet<SyncState>();
 export const stateWasStreamMismatch = (state: SyncState): boolean => streamMismatchFreshStates.has(state);
-
-/** A caller selected a different manifest stream than the durable baseline. */
-export class StreamMismatchError extends Error {
-  readonly name = "StreamMismatchError";
-
-  constructor(
-    readonly root: string,
-    readonly expectedStream: string,
-    readonly observedStream: string,
-    readonly source: "state" | "incarnation-marker",
-  ) {
-    super(
-      `sync state at ${source === "state" ? statePath(root) : stateIncarnationPath(root)} belongs to stream ${observedStream}, ` +
-      `not ${expectedStream}; refusing to reset local sync history without setup confirmation`,
-    );
-  }
-}
+export { StreamMismatchError };
 
 /**
  * Read-path provenance is deliberately tolerant of unrelated legacy-directory

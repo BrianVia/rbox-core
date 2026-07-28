@@ -1,3 +1,25 @@
+import path from "node:path";
+
+/** A caller selected a different manifest stream than the durable baseline. */
+export class StreamMismatchError extends Error {
+  readonly name = "StreamMismatchError";
+
+  constructor(
+    readonly root: string,
+    readonly expectedStream: string,
+    readonly observedStream: string,
+    readonly source: "state" | "incarnation-marker",
+  ) {
+    const file = source === "state"
+      ? path.join(root, ".rbox", "state.json")
+      : path.join(root, ".rbox", "state", "state-incarnation.json");
+    super(
+      `sync state at ${file} belongs to stream ${observedStream}, ` +
+      `not ${expectedStream}; refusing to reset local sync history without setup confirmation`,
+    );
+  }
+}
+
 /** The state plane belongs to a newer rbox than this one. Never repairable by
  * deleting the marker: it is the only pointer to the authoritative database. */
 export class StateFormatTooNewError extends Error {

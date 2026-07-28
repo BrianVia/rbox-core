@@ -19,9 +19,7 @@ export { openReadSnapshot } from "./store/read-snapshot.js";
 export { stateSemanticDigest } from "./digest/state-semantic-v1.js";
 export {
   loadRawStateFromStore,
-  loadStateFromStore,
   materializeManifestFromStore,
-  readOnlyAdapters,
 } from "./adapters/read-only.js";
 export { publishStateBackup, type StateBackupOptions, type StateBackupResult } from "./backup/publish.js";
 export { beginGeneration, collectUnreferencedEntryValues, type GenerationBuilder } from "./store/generations.js";

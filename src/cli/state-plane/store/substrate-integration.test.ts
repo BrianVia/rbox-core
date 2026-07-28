@@ -2,9 +2,9 @@ import { afterEach, expect, spyOn, test } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import * as storeFacade from "../store-facade.js";
 import {
   loadRawStateFromStore,
-  loadStateFromStore,
   materializeManifestFromStore,
 } from "../adapters/read-only.js";
 import { publishStateBackup } from "../backup/publish.js";
@@ -44,11 +44,6 @@ test("genesis read projections, state digest, and backup publication agree", () 
     lastSyncedManifest: { generatedAt: "", files: [] },
     repoRecords: {},
   });
-  expect(loadStateFromStore(handle, "other")).toEqual({
-    stream: "other",
-    lastSyncedSequence: 0,
-    lastSyncedManifest: { generatedAt: "", files: [] },
-  });
   expect(stateSemanticDigest(stateStoreDatabase(handle)))
     .toBe("cf4c1f7481d725a468cf3679d4eb99eb14040df7dc2438a37887b424ef6b8700");
 
@@ -67,6 +62,11 @@ test("genesis read projections, state digest, and backup publication agree", () 
     backupId: "d".repeat(32),
   })).toThrow("already exists");
   handle.close();
+});
+
+test("the SQLite facade exposes no expected-stream policy that can fabricate genesis", () => {
+  expect(Object.keys(storeFacade)).not.toContain("loadStateFromStore");
+  expect(Object.keys(storeFacade)).not.toContain("readOnlyAdapters");
 });
 
 test("backup publication removes owned staging when a foreign destination races the link", () => {

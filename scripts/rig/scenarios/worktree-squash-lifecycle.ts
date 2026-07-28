@@ -232,9 +232,8 @@ export const worktreeSquashLifecycle: Scenario = {
       // capture lane's per-repo forensics reach the DAEMON LOG only. That asymmetry is why
       // the soak's daemon-log check below is load-bearing, not decorative.
       const argv = verb === "push" ? ["push"] : ["pull", "--verbose"];
-      const env = verb === "push"
-        ? { RBOX_UPLOAD_CONCURRENCY: CONCURRENCY, RBOX_DEBUG: "1" }
-        : { RBOX_DOWNLOAD_CONCURRENCY: CONCURRENCY, RBOX_DEBUG: "1" };
+      const env: Record<string, string> = { RBOX_DEBUG: "1" };
+      env[verb === "push" ? "RBOX_UPLOAD_CONCURRENCY" : "RBOX_DOWNLOAD_CONCURRENCY"] = CONCURRENCY;
       const res = await dev.rbox(argv, { cwd: GUEST.workDir, env, allowFail: true });
       const text = `${res.stdout}\n${res.stderr}`;
       sink.push(`── ${label} rbox ${verb} (exit ${res.exitCode}) ──\n${text}`);

@@ -150,12 +150,12 @@ src/cli/telemetry/sync-phase.ts — per-daemon independent pull/push cadence and
 ```
 src/cli/state-plane/index.ts — facade: the stable public state-plane surface. Never: logic, state, or non-re-export declarations.
 src/cli/state-plane/authority-marker.ts — bounded recognition of the legacy JSON/SQLite-authority marker formats plus read/write publication guards and fail-closed rethrowing. Never: persistence, migration artifacts, or error message ownership.
-src/cli/state-plane/errors.ts — typed state-format and state-publication refusal errors and their stable reason/message taxonomy. Never: filesystem access, classification, or retry policy.
+src/cli/state-plane/errors.ts — typed state-format, stream-mismatch, and state-publication refusal errors and their stable reason/message taxonomy. Never: filesystem access, classification, or retry policy.
 src/cli/state-plane/adapters/legacy-json-publication.ts — barrier-era whole-JSON publication adapter and ordered post-publication witness/reserve obligations. Never: state composition, locking policy, SQLite storage, or reset recovery.
 src/cli/state-plane/migration/last-writer-witness.ts — closed-schema durable proof of the exact barrier-capable writer and state bytes last published. Never: sync authority, state reads for normal operation, or migration admission policy.
 src/cli/state-plane/migration/reserve.ts — provenance-bound 1 MiB migration runway creation, adoption, and diagnostic classification. Never: claiming/deleting the reserve, migration execution, or state publication.
 src/cli/state-plane/sqlite-contract/ — tests and test-only helpers observing the bun:sqlite behaviors required by design 163. Never: production imports or database policy.
-src/cli/state-plane/ports.ts — opaque SQLite-store read-snapshot, projection, digest, and CAS result/retry-view contracts shared inside the CLI vertical. Never: database handles, sealed-artifact refs, engine DTO copies, or migration policy.
+src/cli/state-plane/ports.ts — opaque SQLite-store raw read-snapshot, projection, digest, and CAS result/retry-view contracts shared inside the CLI vertical. Never: expected-stream/authority policy, database handles, sealed-artifact refs, engine DTO copies, or migration policy.
 src/cli/state-plane/codecs/ — exhaustive bounded FileEntry and RepoRecord column/canonical-extension mappings. Never: SQL queries, authority choice, or publication.
 src/cli/state-plane/schema/ — frozen schema-v1 DDL, application identity, genesis application, and bounded cheap-open validation. Never: runtime mutation policy or migration orchestration.
 src/cli/state-plane/store/open.ts — sole main-authority connection factory, pragma pin/readback, and clean checkpoint/close ownership. Never: state composition or authority election.
@@ -173,7 +173,7 @@ src/cli/state-plane/store/write-packet.ts — the CAS driver: pairing and sealed
 src/cli/state-plane/store/local-plane.ts — LOCAL full-scan promotion under its sealed trust epoch and watcher completeness invalidation. Never: BASE authority, CAS packets, or scan policy.
 src/cli/state-plane/digest/ — canonical framing plus authority-state, manifest, sealed-stage, and repository-transition logical digests. Never: physical publication, reset witnesses, or authority choice.
 src/cli/state-plane/backup/ — staged VACUUM INTO, verification, fsync, atomic no-clobber backup publication, and id-scoped cleanup. Never: reset/quarantine witnesses or authority choice.
-src/cli/state-plane/adapters/read-only.ts — unwired loadState/loadRawState-shaped and Manifest read projections over bounded store cursors. Never: whole-state writes or JSON/SQLite authority selection.
+src/cli/state-plane/adapters/read-only.ts — policy-free raw-state and Manifest read projections over bounded store cursors. Never: expected-stream checking, whole-state writes, or JSON/SQLite authority selection.
 src/cli/state-plane/reset/artifacts.ts — canonical SQLite reset artifact paths, no-open S0/SW/other observation, stable physical hashes, bounded seed reads, and DB/parent fsync. Never: journal decoding, row policy, or SQLite opens.
 src/cli/state-plane/reset/classifier.ts — inventory-first J0/W1/W2/W3 predecode admission and typed orphan/corruption outcomes. Never: mutation, journal-derived namespace discovery, or DB opening.
 src/cli/state-plane/reset/lifecycle.ts — strict reset-only writer checkpoint/close/S0/fsync, W1 takeover, authority/lineage checks, and private empty-lineage seed preparation through the SQLite store facade. Never: correlated row actions or production authority election.

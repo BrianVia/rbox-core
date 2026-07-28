@@ -79,7 +79,7 @@ const ENTRY_POINTS: readonly EntryPoint[] = [
  * needs a reason, because "it only names the path" is a claim the next reader of
  * this list has to be able to check. */
 const EXEMPT: ReadonlyMap<string, { sites: number; reason: string }> = new Map([
-  ["src/cli/sync-state-store.ts::<module>", { sites: 1, reason: "the statePath constructor itself" }],
+  ["src/cli/state-plane/errors.ts::<module>", { sites: 1, reason: "StreamMismatchError renders the stable legacy authority path but never reads or writes it" }],
   ["src/cli/reset-journal.ts::activeStatePath", { sites: 1, reason: "the local state-path constructor itself" }],
   ["src/cli/state-plane/reset/artifacts.ts::<module>", { sites: 1, reason: "the SQLite reset path table names the legacy authority-marker path but never reads or writes it" }],
   ["src/cli/reset-journal.ts::beginResetJournal", { sites: 2, reason: "hashes the caller-supplied prepared bytes and names the candidate path; the live document is read by its guarded caller under the same lock" }],
