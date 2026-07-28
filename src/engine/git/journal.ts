@@ -5,7 +5,7 @@ import { hashBytes, hashFile } from "../hash.js";
 import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory, writeFileAtomic } from "../fsutil.js";
 import type { GitSection } from "../types.js";
 import { exists, git, readRegularFileNoFollow } from "./shared.js";
-import { pruneEmptyOpStateDirs, readAllRefs } from "./refs.js";
+import { pruneEmptyOpStateDirs, readAllRefs, readAllRefsStrict } from "./refs.js";
 import { runUpdateRefTransaction } from "./keep-pins.js";
 import {
   acquireLock,
@@ -836,8 +836,16 @@ export async function recoverJournal<T = unknown>(
     // its observed-landing authority installs only a ref the repository was
     // actually seen to hold. A journal claiming a ref that is not on disk can
     // never install it; it is held, not fabricated.
-    const observedRefs = await readAllRefs(repoDir);
-    return { status: "keep", intended: journal.intended, incomingKey: journal.incomingKey, observedRefs, journalPath: dir };
+    //
+    // This MUST use the strict read: the observed refs become proven-null
+    // deletions for every key they omit, so an unreadable/corrupt ref database
+    // read as {} would authorize wiping BASE. A read failure is not a verified
+    // empty repository, so it defers the journal untouched instead.
+    const observed = await readAllRefsStrict(repoDir);
+    if (observed.status === "unreadable") {
+      return { status: "defer", reason: `published checkout ref database unreadable (${observed.marker})`, journalPath: dir };
+    }
+    return { status: "keep", intended: journal.intended, incomingKey: journal.incomingKey, observedRefs: observed.refs, journalPath: dir };
   }
 
   if (journal.createdFresh) {

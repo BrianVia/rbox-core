@@ -594,6 +594,31 @@ test("checkout recovery refuses a repository replaced at the same common-dir pat
   expect(await fs.readFile(path.join(gitDir, "sentinel"), "utf8")).toBe("replacement\n");
 });
 
+test("an unreadable ref database defers the published landing instead of composing an empty witness", async () => {
+  // Fail-open guard: readAllRefs turns a failed show-ref into {}, which the
+  // observed-landing composer would read as every ref proven-deleted — a BASE
+  // wipe authorized by a read error. The strict read distinguishes a corrupt
+  // ref DB from a genuinely empty one, and a corrupt one defers untouched.
+  const { oldOid } = await history();
+  const oldHead = await fs.readFile(path.join(gitDir, "HEAD"), "utf8");
+  const index = await fs.readFile(path.join(gitDir, "index"));
+  const journal = makeJournal({ oldOid, oldHead, expectedHead: oldHead, expectedRefs: { "refs/heads/main": oldOid }, expectedIndex: index, intended: { record: "x" } });
+  const journalPath = await writeCheckoutJournal(root, "repo", journal, { indexPath: path.join(gitDir, "index"), gitDir });
+  await markCheckoutJournalPublished(root, "repo");
+  await fs.mkdir(path.join(gitDir, "refs", "heads"), { recursive: true });
+  await fs.writeFile(path.join(gitDir, "refs", "heads", "broken"), "not-an-oid\n");
+
+  const result = await recoverJournal(root, "repo", binding);
+  expect(result.status).toBe("defer");
+  if (result.status === "defer") expect(result.reason).toMatch(/ref database unreadable/);
+
+  // A genuinely readable repository — even after removing the corruption — keeps.
+  await fs.rm(path.join(gitDir, "refs", "heads", "broken"));
+  expect(await recoverJournal(root, "repo", binding)).toMatchObject({
+    status: "keep", observedRefs: { "refs/heads/main": oldOid },
+  });
+});
+
 test("published journal keeps checkout and returns opaque intended data for a fresh CAS save", async () => {
   const { oldOid } = await history();
   const oldHead = await fs.readFile(path.join(gitDir, "HEAD"), "utf8");
