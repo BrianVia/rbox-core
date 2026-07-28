@@ -1,6 +1,30 @@
 # 163 — The state plane moves to SQLite
 
-Status: v6 — pending final ratification. v6 folds the R4 ratification round
+Status: **v7 — pending final ratification.** V7 is a *round-three targeted
+fold*: it closes the enumerated residual list from the codex final serial
+review of the v6 tip (2026-07-28), records the founder decisions ratified that
+day, and leaves exactly one question open (below).
+
+Provenance, stated honestly, because this is the third attempt at some of it:
+**rounds one and two both recorded a schema closure in the review log that they
+never performed.** The v6 log row for CODE B3 + CODEX 1 claims "three columns
+added" and a `resolutionIntent` disposition; in fact `packedRefsIdentity`,
+`attempt`, and `resolutionReceipt` appeared **only in that log row** — the
+`repo_records` DDL and the one-for-one field list were never touched, and the
+section the row cites ("Newly named members and strip-on-read semantics") did
+not exist. V7 makes those edits in the normative sections and adds a
+schema-rebase gate so a fourth drift is a red test rather than a sentence. The
+standing rule this cost us is now explicit: **the review log records a closure;
+it never constitutes one.** V7 additionally makes the `B0` write barrier
+race-free (v6 specified a check-then-rename that a concurrent `Q` still beats),
+reconciles three fold-introduced contradictions between the M6 cleanup
+inventory, the M2 backup preamble, and the M0–M7 machine, consolidates two
+divergent M0 admission predicates into one, and finishes the rollout residuals
+(reserve path, dual-binary rig, corpus fixture, kill-criterion protocol). The
+M0–M7 machine, the `Q` barrier, and every migration fence are unchanged or
+strictly tightened; nothing in this fold weakens them.
+
+Previous status (v6), retained for provenance: v6 folds the R4 ratification round
 (two opus lenses — code-claims and rollout — plus one gpt-5.6-sol review; all
 three are in `docs/design/notes/163/REVIEW-163-R4-*.md`). Provenance, stated
 honestly: **v5's claim to be "strictly additive" with "every v4 closure
@@ -18,42 +42,54 @@ terminal-control-last, 2.0-only confinement) is unchanged.
 It is not implementation authority until the
 orchestrator ratifies it.
 
-## QUESTIONS FOR THE ORCHESTRATOR (v6 — answer before ratifying)
+## OPEN QUESTION FOR THE FOUNDER (v7 — exactly one remains)
 
-1. **Sequencing — RESOLVED IN v6, and the plan below is restructured.**
-   The founder's leaning ("backend-first if the fold agrees") was put to a
-   verified analysis rather than accepted on authority. The analysis agrees:
-   backend-first is superior, and for a reason neither review stated — it makes
-   the one irreversible step (the `Q` authority flip) coincide with the
-   **smallest** possible diff instead of the largest. The U-slices are
-   reordered accordingly (`B0 → U0 → U1 → U2 reset → U3 flip → U4a–U4f engine
-   → U5`). The M0–M7 authority machine, the `Q` barrier, and all migration
-   fencing are **unchanged** — only their position in the schedule moved. Full
-   argument and the conditions attached: "Rejected and deferred alternatives",
-   item 5.
-   **Residual decision for the orchestrator:** backend-first ships 2.0 — and
-   therefore the one-way migration — to the four external users *before* the
-   latency and memory wins land (those arrive across U4a–U4f). The flip's own
-   payoff is real but narrower: O(dirty-row) authority writes and structurally
-   impossible reset admission errors. V6 gates that with a no-regression
-   criterion (the flip may not ship if trusted status or daemon RSS is worse
-   than the 1.x baseline), but "users take the migration first, benefit later"
-   is a judgment call about four real people, not a technical one. Confirm it.
-2. **Is the pre-U0 barrier release acceptable as a hard gate?** R4-CODEX 2
-   shows a running degraded-unlocked legacy writer can overwrite `Q` after M6.
-   The fix is a Q-before-every-write barrier that must ship **and bake** in the
-   stable 1.x line, adopted by all 4 external users and all 3 fleet hosts,
-   before any 2.0 binary migrates a workspace. That makes an external-user
-   upgrade a blocking dependency of design 163. Confirm the gate, or accept the
-   split-brain risk explicitly.
-3. **Downgrade floor version.** V6 requires an exact version number as the
-   supported downgrade floor (the first stable release carrying the barrier).
-   It is provisionally written as `1.11.0` and must be pinned to the actual
-   release before U3.
-4. **Ship/no-ship threshold.** V6 proposes a named U5 kill criterion
-   (trusted status p50 <= 200 ms and p95 <= 400 ms, daemon steady-state RSS
-   <= 1.5 GB, on the 112k corpus). Those numbers are proposals, not measured
-   commitments; the orchestrator owns them. Field-claim corrections from r1 are folded below;
+**Do the four external users take the one-way migration before the latency and
+memory payoff lands?** Backend-first ships 2.0 — and therefore the irreversible
+`Q` flip — to all four external users at `U3`, while the wins they would
+actually notice (trusted-status latency, daemon RSS) arrive across `U4a–U4f`
+afterwards. The flip's own payoff is real but narrower: O(dirty-row) authority
+writes and structurally impossible reset admission errors. It is gated by the
+U3 no-regression criterion (the flip may not ship if trusted status or daemon
+RSS is worse than the 1.x baseline) and recoverable only by re-adoption, so the
+downside is bounded but not zero. This is a judgment about four real people —
+two of them non-technical, one of them paying — not a technical question, and
+the fold cannot answer it. **Everything else in this document is either closed
+or ratified; this is the only input still owed.**
+
+## Founder decisions ratified 2026-07-28
+
+Recorded here as ratified, not provisional. Each is normative where it lives.
+
+1. **Sequencing: backend-first hybrid — ADOPTED.** Order is
+   `B0 → U0 → U1 → U2 reset → U3 flip/2.0 → U4a–U4f on main → U5`, with the
+   fold's four normative conditions attached (no-regression gate at the flip;
+   time-boxed and CI-inventoried whole-state adapter; per-slice differential;
+   `B0` unchanged). The founder's leaning was explicitly conditioned on a
+   verified analysis rather than issued as a decree, and the analysis — redone
+   against `src/` — agreed for a reason neither review stated: it makes the one
+   irreversible step coincide with the **smallest** possible diff instead of
+   the largest. The M0–M7 authority machine, the `Q` barrier, and all migration
+   fencing are unchanged; only their position in the schedule moved. Full
+   argument: "Rejected and deferred alternatives", item 5.
+2. **`B0` as a hard pre-U0 gate — ACCEPTED, including external-user adoption.**
+   A running degraded-unlocked legacy writer can overwrite `Q` after M6, so the
+   write-side barrier must ship **and bake** on the stable 1.x line and be
+   adopted by all 4 external users and all 3 fleet hosts before any 2.0 binary
+   migrates a workspace. An external-user upgrade is therefore a blocking
+   dependency of design 163, accepted as such rather than traded against the
+   split-brain risk.
+3. **Downgrade floor: `1.11.0` — RATIFIED.** `B0` ships as `1.11.0`, and that
+   exact version is the supported downgrade floor, the M0 barrier-capability
+   threshold, and the pinned 1.x side of the differential rig.
+4. **Kill-criterion numbers — RATIFIED.** On the 112k corpus: trusted
+   `rbox status` p50 <= 200 ms and p95 <= 400 ms; daemon steady-state
+   RSS <= 1.5 GB. V7 adds the measurement protocol these numbers need
+   (warmup/sampling, "ordinary use", "unexplained halt", a four-week bake, one
+   remediation cycle) in the U5 section. **One input is still owed there and is
+   flagged as blocking before U5 begins: the frozen machine profile.**
+
+Field-claim corrections from r1 are folded below;
 the steady-state write churn was root-caused and fixed separately by #349
 (undefined-vs-{} guard bug; Git-plan bookkeeping was not the culprit). Origin:
 founder step-back question
@@ -167,20 +203,28 @@ criteria, ship/no-ship criterion, and branch-merge process are normative in
 the only unreviewed part of the design and two of its assumptions were false
 (v6 R4-ROLLOUT).
 
-All design-163 **implementation** lands on a long-lived `2.0` branch created
-from `main` when implementation starts. `main` remains the stable 1.x line
-(1.10.2 at the time of this fold; v5 still called it "1.7.x");
+**Branch model, corrected in v7 to match the restructured plan.** The
+long-lived `2.0` branch spans **`U0` through `U3` only** — entry interning,
+store/schema, reset conversion, and the migration/`Q` flip. It is created from
+`main` when U0 starts and it ends when 2.0 ships at U3. `U4a–U4f` are **not**
+on it: each engine slice lands on `main` as an ordinary 2.x release, which is
+most of the reason backend-first was adopted. `B0` is likewise not on it — it
+is a 1.x release on `main`.
+`main` remains the stable 1.x line through `B0`
+(1.10.2 at the time of this fold; v5 still called it "1.7.x"), then the 2.x
+line from U3 onward;
 design documents and reviews continue to merge to `main`, and periodic merges
-**from `main` into `2.0`** keep the implementation branch current. The shared,
+**from `main` into `2.0`** keep the implementation branch current while it
+exists. The shared,
 long-lived `2.0` branch is never rebased; a developer-local topic branch may be
 rebased before it is merged (r3 C9; r3c-3+r3c-6).
-The state-plane rewrite ships only as the 2.0 major version. No U0–U5 slice,
+The authority flip ships only as the 2.0 major version. No `U0`–`U3` slice,
 migration artifact, or half-migrated state plane rides an ordinary
 1.x release. The one deliberate exception is `B0`: the **write-side `Q`
 barrier is a 1.x deliverable and must be**, because its entire purpose is to
 make binaries that predate 2.0 fail closed. `B0` contains no design-163
-implementation — no store, no schema, no migration — only the barrier check and
-its pinning inventory test.
+implementation — no store, no schema, no migration — only the barrier check,
+its pinning inventory test, the generic reserve, and the last-writer witness.
 
 ## Acceptance targets (measured, not promised)
 
@@ -3653,12 +3697,12 @@ The argument for it is strong and v6 does not pretend otherwise:
   backend swap behind it feasible.
 - It would produce fleet-observable signal months earlier than the current
   plan, whose first checkpoint is a genesis-path throwaway workspace after
-  U2c.
+  v5's U2c (the slice now numbered U4c).
 - It would let the 1,019-commits-per-60-days `main` keep flowing through one
   codebase instead of a long-lived branch with a port-forward ledger.
 - The measured wins (BASE/LOCAL row-local writes, indexed status projections)
-  do not actually require the memory rewrite; U2's cursor discipline is a
-  second, separable win.
+  do not actually require the memory rewrite; the cursor discipline of the
+  engine slices (v5's U2, now U4a–U4f) is a second, separable win.
 
 **The decisive argument, which neither review made:** backend-first makes the
 irreversible step coincide with the *smallest* diff. `Q` is the only one-way,
@@ -3776,7 +3820,8 @@ judgment about real users, and it is the residual question at the top of this
 document.
 
 What this buys, beyond the risk argument: the `2.0` branch shrinks from "the
-whole project" to `B0 → U3`, the port-forward ledger becomes nearly empty, the
+whole project" to `U0 → U3` (`B0` ships from `main`), the port-forward ledger
+becomes nearly empty, the
 U4 slices land on `main` as ordinary 2.x releases, and the first fleet-visible
 signal arrives months earlier.
 
@@ -4025,6 +4070,43 @@ for the whole rewrite, against the flip's clean control:
    change, a tracked-repo change, and a mass-delete-shaped change. Neither host
    may observe a spurious delete, a lost deferral, or a divergent manifest.
 
+**Two named rig deliverables this gate does not yet have (v7).** The
+differential above is written as if the rig could already run two different
+binaries. It cannot, and neither can it build the corpus it is measured on;
+both are prerequisites of the U3 flip gate, not conveniences:
+
+- **Dual-binary rig plumbing.** Verified: `--binary` is a *single global*
+  override. `scripts/rig/rig.ts` resolves one path
+  (`resolveRigBinaryOverride`), stages it once (`stageRigBinaryOverride`), and
+  mounts the result into `rigGuestMounts` for the whole rig, so `rig-dev-a` and
+  `rig-dev-b` necessarily run the same executable — exactly what a
+  candidate-versus-1.x differential must not do. Deliverable: per-device
+  overrides (`--binary-a` / `--binary-b`, or a per-device mount map) with the
+  same exact-absolute-path, regular-non-symlink, canonical, executable
+  validation `scripts/rig/lib/binary.ts` already enforces, plus a scenario
+  assertion that the two devices report different `rbox --version` strings so a
+  silent single-binary run cannot masquerade as a differential.
+- **Pinned 1.x artifact provenance.** The 1.x side of the rig must run the
+  **published, signed release artifact** for the ratified floor `1.11.0` —
+  fetched from `rbox-releases` and verified against its recorded digest and
+  detached signature — never a locally built binary from the working tree. A
+  differential whose control is a local build proves nothing about what the
+  four external users are running. The digest is recorded in the rig scenario
+  so a re-run years later is reproducible.
+
+**Reproducible 112k corpus fixture (v7).** Every gate in this document — the
+migration duration budget, the no-regression gate, the U5 kill criterion, the
+disk budget — is stated "on the 112k corpus", and no such corpus is
+reproducible today. Verified: `scripts/bench/corpus.ts` generates seeded shapes
+topping out at `repo: {files: 5000}`, twenty-two times too small. Deliverable
+(U1, because U1 is the first slice whose exits are measured): a
+`corpus-112k` shape in that same generator — deterministic from its seed,
+including the empty-file and duplicate-content shapes it already seeds
+deliberately, plus the Git-repository and nested-ignore-rule shapes 163's gates
+actually exercise — with its generated manifest hash pinned in the repository
+so two hosts can prove they measured the same corpus. Numbers measured on an
+unpinned corpus are not comparable and do not satisfy any gate here.
+
 A slice that fails its differential is reverted, not patched forward; that
 option exists only because authority is already settled.
 
@@ -4046,18 +4128,58 @@ work itself is out of design 163's scope (it is its own small design), but
 symlink covers the three founder hosts and does not cover `B0`, which must
 reach external users through the normal channel.
 
-**Named ship/no-ship criterion (R4-ROLLOUT H4).** `<200 ms` is explicitly a
+**Named ship/no-ship criterion (R4-ROLLOUT H4) — numbers RATIFIED by the
+founder 2026-07-28.** `<200 ms` is explicitly a
 target whose miss is "not permission to broaden the claim", which as written
 lets 2.0 ship delivering no user-visible improvement while carrying migration
 risk, permanently higher disk use, and ~15 new halt classes. The U5 gate is
-therefore stated now, before the measurements exist (the numbers themselves
-are the orchestrator's to set — see the questions at the top):
+therefore stated now, before the measurements exist. The thresholds below are
+no longer proposals:
 
-- **Ship** requires, on the 112k corpus: trusted `rbox status` p50 <= 200 ms
-  and p95 <= 400 ms (baseline today: 0.84 s); daemon steady-state RSS
-  <= 1.5 GB across 24 h of ordinary use (field baseline: 2.95 → 6.41 GB over
-  23 cycles); zero unexplained halts during the bake; and the U2 differential
-  clean.
+- **Ship** requires, on the pinned 112k corpus fixture: trusted `rbox status`
+  **p50 <= 200 ms and p95 <= 400 ms** (baseline today: 0.84 s); daemon
+  steady-state **RSS <= 1.5 GB** across 24 h of ordinary use (field baseline:
+  2.95 → 6.41 GB over 23 cycles); zero unexplained halts during the bake; and
+  the per-slice differential clean.
+
+**Measurement protocol for those numbers (v7).** A ratified threshold with an
+unspecified method is still unfalsifiable, so the protocol is normative here.
+One input is genuinely still owed and is named as such rather than invented.
+
+- **Frozen machine profile — OWED, and blocking before U5 begins.** All ship
+  numbers are measured on one named, frozen host profile (exact machine, CPU,
+  RAM, filesystem, and whether it is a fleet host or the rig), chosen by the
+  founder and recorded in this section before the first U5 measurement. Nothing
+  else in this list is meaningful without it: the same code will pass on one
+  fleet host and fail on another. This is the one open input of the kill
+  criterion.
+- **Warmup and sampling.** Each latency figure is 100 consecutive trusted
+  `rbox status` invocations against a settled daemon, after 10 discarded warmup
+  invocations, on an unmodified workspace with the LOCAL plane complete;
+  p50/p95 are computed over the 100 recorded samples, and the raw samples are
+  retained with the verdict. A run in which any sample is untrusted is void,
+  not clamped — the target has only ever applied to trusted status.
+- **"Ordinary use"** means the bake workspace under its normal daily
+  edit/sync/Git activity with no synthetic load and no deliberate idling:
+  at least one push, one pull, and one Git-bearing sync per day, and the daemon
+  never restarted except by an upgrade. RSS is the daemon's steady-state
+  resident size sampled at 5-minute intervals across the window; the criterion
+  is the **maximum** sample, not the mean, because the failure mode being
+  gated is unbounded growth.
+- **"Unexplained halt"** means any halt (of the ~15 new fail-closed classes or
+  any pre-existing one) whose root cause is not identified and attributed to a
+  specific defect or a deliberate refusal by the end of the bake. A halt that
+  is understood, reproduced, and either fixed or ratified as correct behavior
+  is explained; "it did not recur" is not an explanation.
+- **Bake duration.** U5 bakes for **four weeks** across all three fleet hosts
+  and any external user who has opted in — twice `B0`'s two-week barrier bake,
+  because U5 is gating the whole engine port rather than one refusal check. The
+  24 h RSS window is measured inside that bake, not instead of it.
+- **Remediation cycle.** Exactly **one**. A missed threshold gets one
+  remediation cycle — diagnosis, fix, and a full re-measurement under this same
+  protocol — and if the second measurement misses, the no-ship alternatives
+  below are taken. There is no third attempt, because the point of a named
+  criterion is that it can be lost.
 - **No-ship** is not "try harder". If the criterion is missed after one
   remediation cycle, the named alternatives are **stop after the last passing
   slice** (the flip and the slices that met their gates stay; the remainder is
@@ -4087,24 +4209,29 @@ source. Deleting them is safe precisely because they were never authority.
 ### 2.0 branch merge process (R4-ROLLOUT H3)
 
 **The backend-first restructure mostly dissolves this problem, which is one of
-its larger benefits.** The `2.0` branch now spans `B0 → U3` (store, schema,
-reset conversion, migration) instead of the whole project, and the U4 engine
+its larger benefits.** The `2.0` branch now spans `U0 → U3` (entry interning,
+store, schema, reset conversion, migration) instead of the whole project —
+`B0` is a 1.x release on `main` and is not on the branch at all — and the U4
+engine
 slices land on `main` as ordinary 2.x releases. The branch's lifetime falls
 from the full project to roughly its first third, and the port-forward ledger
 — the expensive part — becomes nearly empty, because the files U4 rewrites are
 still being maintained on `main` while U4 rewrites them there.
 
 The process below therefore applies to a shorter branch, but it is not
-optional: even `B0 → U3` spans months of a fast-moving `main`. Measured on
+optional: even `U0 → U3` spans months of a fast-moving `main`. Measured on
 `main`: **1,019 commits in the last 60 days.**
 
 One reviewer figure is corrected here: `src/cli/daemon.ts` and `src/cli/sync.ts`
 show ~2,400 and ~2,600 lines of churn in that window, but they are now **10-
 and 16-line re-export barrels** — that churn is the decomposition itself, not
-ongoing change. The genuinely hot file U2 rewrites is
+ongoing change. The genuinely hot file the engine slices rewrite is
 `src/cli/sync-git/apply.ts`: 25 commits, net +1,502 lines, and 1,502 lines
 today (above the 500-line target). Live churn otherwise moved into
-`src/cli/daemon/**` and `src/cli/sync/**`, which U2 also rewrites.
+`src/cli/daemon/**` and `src/cli/sync/**`, which U4a–U4f also rewrite. (V7
+terminology sweep: these three sentences carried v5's numbering, in which the
+engine rewrite was U2; under the restructured plan the engine slices are
+U4a–U4f and `U2` is the reset conversion.)
 
 Required process:
 - a **named owner** for the 2.0 branch, accountable for its currency;
@@ -4162,7 +4289,7 @@ refuted or corrected rather than folded as stated.
 | CODE B1 — `hasResetLineageArchive` `.json` regex; provenance predicate is an authorization input 163 silently breaks | **Folded.** Verified exactly, including the silent-false failure mode. | "Lineage-archive provenance predicate"; `reset-namespace-inventory.ts` owns it; the enabled legacy write is a U2 exit item |
 | CODE B1 (citation) — `push.ts:623` listed as an `allowLegacyStreamReplacement` site | **Corrected.** `:623` is a different consumer (`streamMismatch` → `filesFirstDefer` capture policy). The authorization sites are `pull.ts:445` and `push.ts:539,:579,:894` — the reviewer missed `:894`. | Same section, cited correctly |
 | CODE B2 — Z order is `localeCompare`, not "lexical" | **Folded**, with the exact function named per axis. Independent survey found a latent cross-module mismatch (`reset-state.ts:304` builds the same axis with code-unit `<`/`>` while `reset-journal.ts:170` validates with `localeCompare`) — recorded and assigned to U4. | Reset notation section; the journal grammar; `path_order` paragraph unchanged (already correct) |
-| CODE B3 + CODEX 1 — RepoRecord mapping omits `packedRefsIdentity`, `attempt`, `resolutionReceipt`; `resolutionIntent` collides with `extras_cjson` and the M4 digest | **Folded.** Verified against the current interface; all three exist and are live. Mapping rebased, three columns added, `resolutionIntent` given an explicit strip-before-digest disposition, and a schema rebase gate added so this cannot drift a third time. | `repo_records` DDL; "Newly named members and strip-on-read semantics" |
+| CODE B3 + CODEX 1 — RepoRecord mapping omits `packedRefsIdentity`, `attempt`, `resolutionReceipt`; `resolutionIntent` collides with `extras_cjson` and the M4 digest | **Folded.** Verified against the current interface; all three exist and are live. **This row was false when written, twice.** Rounds one and two recorded it as folded while the normative sections were never edited: until v7, `packedRefsIdentity`/`attempt`/`resolutionReceipt` appeared nowhere but in this cell. Actually closed in v7 — columns added to the DDL, mapping rebased on the current interface in declaration order, `resolutionIntent` given a strip-before-digest disposition, and a schema-rebase gate added. | `repo_records` DDL; "Newly named members and strip-on-read semantics" (created in v7); v7 residual row 1 |
 | CODE B3 (wording) — "every state reader deliberately strips" | **Corrected.** There is exactly one production call site (`loadRawState`); it works because every disk read funnels through it. The second strip is explicitly defensive. | Same section |
 | CODE B4 — tombstone caps are 16/512, not 8 | **Folded.** Constants verified exact. | Growth model section |
 | CODE B4 (sub-claim) — "expiry 90d checks out" in `manifest-validate.ts` | **Refuted as located.** That file has no retention constant; the wire validator bounds count only. Three separate 90-day client-side constants carry age. | Same paragraph, all three named |
@@ -4187,9 +4314,9 @@ refuted or corrected rather than folded as stated.
 | Seam feasibility (v6 verification, no reviewer claim) | **Verified before restructuring, not assumed.** `sync-state-store.ts` is the sole engine disk funnel and is CI-enforced by an existing allowlist test with exact per-module counts; `loadState` has 26 production call sites across 9 modules and `applyStateSavePacket` 7 across 6, all resolving through one pinned barrel, so a behind-the-seam swap changes none of them; the N-sized `.files` array is touched in only four modules. `StateSavePacket`/`StateSaveResult` are already packet- and CAS-shaped, so O(dirty-row) writes land at the flip. The one genuine blocker — reset-v1's ~1,500 lines of byte-level transaction over the state file — is exactly what the resequencing puts first. | "Rejected and deferred alternatives" item 5, feasibility bullets |
 | ROLLOUT B1 — no prerelease channel in `scripts/release.ts` | **Folded** as a normative pre-U5 dependency. Verified in full, plus one addition: after an rc publish the anti-rollback guard would *refuse* a subsequent stable hotfix. Pipeline work stays out of 163's scope. | U5 section |
 | ROLLOUT B2 — barrier release is a hard prerequisite, not a slice | **Folded** as `B0` with an adoption gate; merged with CODEX 2. | `B0` |
-| ROLLOUT B4 — no wire-visible semantics differential | **Folded** as U2's exit criterion: same-corpus manifest diff plus a two-host (2.0 + 1.x, one workspace) rig. | U2 exit |
-| ROLLOUT H1 — U2 is ~70% of the project | **Folded**: U2a–U2f with per-unit exits. | U2 table |
-| ROLLOUT H2 — first falsifiable fleet checkpoint unnamed | **Folded**: genesis-path throwaway workspace after U2c, an explicit U2 deliverable. | U2 section |
+| ROLLOUT B4 — no wire-visible semantics differential | **Folded** as the per-slice engine exit criterion: same-corpus manifest diff plus a two-host (2.0 + 1.x, one workspace) rig. (Row renumbered in v7: it said "U2's exit criterion" in v5's numbering.) | U4a–U4f per-slice differential; run first as the U3 flip's control |
+| ROLLOUT H1 — the engine rewrite is ~70% of the project | **Folded**: decomposed into six units with per-unit exits. (Renumbered in v7: v5 called them U2a–U2f.) | U4a–U4f table |
+| ROLLOUT H2 — first falsifiable fleet checkpoint unnamed | **Folded**: genesis-path throwaway workspace, reachable as soon as U1's store and U2's reset support exist and therefore an explicit U3 deliverable — earlier than v5's "after U2c". | U3 section, "First fleet checkpoint" |
 | ROLLOUT H3 — merge process has no owner/cadence/conflict policy | **Folded**: named owner, at-worst-weekly CI merge with a conflict report, port-forward ledger. | Branch merge process |
 | ROLLOUT H3 (evidence) — `daemon.ts` churned 6,222 lines, `sync.ts` 5,178 | **Refuted as framed.** Re-measured: 1,019 commits in 60 days is right, but `daemon.ts` and `sync.ts` are now 10- and 16-line re-export barrels and their churn is the decomposition itself. The genuinely hot rewritten file is `sync-git/apply.ts` (25 commits, +1,502 net, 1,502 lines today). The conclusion survives on corrected evidence. | Branch merge process |
 | ROLLOUT H4 — no named kill criterion | **Folded** with proposed thresholds and re-scope/revert as named alternatives; the numbers are Question 4 for the orchestrator. | U5 section |
@@ -4200,9 +4327,32 @@ refuted or corrected rather than folded as stated.
 | ROLLOUT M5 — new halt surface has no user-facing copy | **Folded**: every new halt reason ships a plain-English doctor entry plus a non-interactive twin, as a merge gate. | U3 section |
 | ROLLOUT "verified clear" — `.rbox/` WAL churn is a non-issue | **Confirmed independently** and stated once in the design, as the reviewer suggested. | U1 section |
 
-V6 remains pending final ratification and is not implementation authority. The
-questions at the top of this document are open. Question 1 was resolved during
-the fold — the founder's leaning plus a verified analysis agreed on
-backend-first, so v6 restructured the plan rather than only flagging it — but
-its residual (external users take the one-way migration before the latency and
-memory wins) is a judgment about real people and is still owed an answer.
+V6 remained pending final ratification and was not implementation authority.
+
+## R4-final residual fold (v7)
+
+One review: the codex final serial review of the v6 tip (commits `9599d59a` +
+`5ddf75c7`), verdict NOT-ALIGNED, 2026-07-28. Its residual list is closed
+below. **Two of these residuals are re-openings of closures the v6 log already
+claimed** — that is why the first row of this table is about the log itself.
+
+| Residual | Disposition in v7 |
+|---|---|
+| **The v6 log claimed closures the normative sections never received** (schema columns; `resolutionIntent`) | **Cause admitted, not just the symptom.** The log row is evidence of intent, never of an edit; both rounds wrote the row and skipped the section. Standing rule recorded in the status line: the review log records a closure, it never constitutes one. The concrete drift is closed below, with a test so the next drift is red rather than silent. |
+| 1 — schema DDL omits `packedRefsIdentity`, `attempt`, `resolutionReceipt`; `resolutionIntent` has no normative disposition | **Closed in the normative sections.** `repo_records` gains `packed_refs_identity`, `attempt_cjson`, `resolution_receipt_cjson`; the one-for-one field list is rebased on `sync-state-model.ts:288` in declaration order (nineteen members, nineteen field-carrying columns); a new "Newly named members and strip-on-read semantics" subsection specifies all three shapes and gives `resolutionIntent` its strip-before-digest disposition (stripped in the v1 normalization *before* the source digest, never routed to `extras_cjson`, no shape-presence bit); a U1 schema-rebase gate asserts DDL-column vs `keyof RepoRecord` bijection minus the one named strip member. |
+| 2 — B0 write barrier is a check-then-rename race, and the last-writer witness has nowhere to live | **Closed, argued from the real primitive.** `writeFileAtomic` (`fsutil.ts:35-89`) publishes with one `fs.rename` and exposes exactly one abort seam, `beforeRename`, which `sync-state-store.ts:216,:411` already uses for lock-ownership assertions — so the check cannot be made atomic with the rename by any property of the hook. Race-freedom comes from mutual exclusion instead: every state write must hold `stateLockPath` across check-then-rename (two of three writers already do; `writeWholeStateUnsafe` is changed to), and M6's rename holds the same lock. The one filesystem where that is impossible is exactly `degraded-unlocked` (`acquireLock` returned `unsupported`), and there M0 refuses to migrate at all, so no `Q` can appear under an unlocked writer. Witness: a `.rbox/state/last-writer.json` sidecar (not a `SyncState` member, which pre-B0 binaries and the degraded composer would drop), written under the same lock after the publication fsync, bound to the published `state.json` `dev`/`ino`, read only by M0 admission. |
+| 3 — M2 says "hard link or copy" while every backup must carry a preamble | **Contradiction resolved toward the preamble.** Backups are always preamble-prefixed streaming copies; hard-linking is forbidden and the reason is stated (a link cannot carry a preamble, would let 1.x writers mutate "immutable" history through the same inode, and would escape the restoration refusal). Body hash versus physical hash defined and used consistently in the M2 phase text, the M2 witness row, the artifact list, and fault injection. |
+| 4 — M6 literal cleanup inventory contradicts M0–M7 in three places | **Table reconciled, machine unchanged.** Roles 1–4 (staging main + sidecars) become asserted absences — M4 requires `S0` twice and M5 requires staging absent with `stagingMain:"absent"`, so presence at M6 is a `reserved-path` corruption halt, not debris; role 5 (control publisher temp) is removed from auto-cleanup as an inert temp under the existing doctor-only rule, which also removes the directory discovery the vector forbids; role 6 (prepared halted-M6 sibling) is removed from the cleanup order because the final-item runway creates it and M7 retires it. Two real cleanup items remain: reserve then emergency, the latter still owning the allocation-free runway. |
+| 5 — two divergent M0 admission predicates | **Consolidated into one.** The quiescence/capability predicate is now the single normative list of exactly four conditions (non-degraded fence, no live operation, no resumable quarantine bundle, barrier-capability witness), re-checked before the M6 rename; the quarantine section keeps the reasoning and delegates the predicate. |
+| 6 — downgrade floor written provisional | **RATIFIED `1.11.0`** (founder, 2026-07-28) in the abort section, the `B0` unit, the M0 witness threshold, and the rig's pinned control. |
+| 7 — reserve lacks path, creation/collision protocol, pre-M0 disposition | **Specified in `B0` contents item 3:** `.rbox/state/reserve-1mib.bin`, `O_EXCL` 0600 create of exactly 1,048,576 zero bytes with file+parent fsync, adopt-an-exact-match / never-delete-a-foreign-path collision rule with a typed `reserve-foreign` M1 refusal, and a named inert non-reset member of the `.rbox/state/` inventory that survives on workspaces that never migrate. |
+| 8 — mixed-version differential rig has no dual-binary plumbing | **Named as a deliverable, with the limitation verified:** `rig.ts` resolves and stages one global `--binary` into `rigGuestMounts`, so both devices necessarily run the same executable. Per-device overrides plus a version-difference assertion are required, and the 1.x side must be the published, signed, digest-verified `1.11.0` artifact rather than a local build. |
+| 9 — the 112k corpus is not a reproducible fixture | **Named as a U1 deliverable.** Verified: `scripts/bench/corpus.ts` tops out at `repo: {files: 5000}`. A seeded `corpus-112k` shape with a pinned manifest hash is required before any gate stated "on the 112k corpus" can be evaluated. |
+| 10 — kill thresholds unratified and unprotocolled | **Numbers RATIFIED** (p50 <= 200 ms, p95 <= 400 ms, RSS <= 1.5 GB). Protocol added: 100 samples after 10 warmups with void-on-untrusted, "ordinary use" and "unexplained halt" defined, 5-minute RSS sampling judged on the maximum, four-week bake, exactly one remediation cycle. **Still owed and flagged blocking: the frozen machine profile.** |
+| 11 — "clean by construction" overstates the flip | **Weakened to the document's own differential-gate framing.** The engine is byte-identical but the backend, codecs, CAS admission, and reset conversion all change underneath it; the flip is the run where a difference is least expected, not one that is exempt. |
+| 12 — superseded U2 numbering, U5 ship criterion, branch language | **Swept.** Review-log rows renumbered with their v5 origin noted, the U5 criterion now says per-slice differential, the `apply.ts` churn paragraph attributes the rewrite to U4a–U4f, and the branch model is corrected to `2.0 = U0 → U3` with `B0` on `main` and `U4a–U4f` landing on `main` as 2.x. |
+
+V7 remains pending final ratification and is not implementation authority. The
+single open question at the top of this document — whether the four external
+users take the one-way migration before the latency and memory wins land — is
+the only input still owed.
