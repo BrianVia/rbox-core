@@ -8,37 +8,52 @@ import type { TransitionEvidenceBindings, TransitionInput } from "./transition-s
 
 declare const migrationImporterCapabilityBrand: unique symbol;
 /**
- * The right to CREATE a migration-tagged transition stage.
- *
- * The brand is a non-exported `unique symbol`, so no module can write one down;
- * the sole cast that produces one is lexical to
- * `state-plane/migration/base-proof.ts`, which keeps it module-private and hands
- * it only to the entry point it binds (the `state-plane/reset/owner.ts` idiom).
+ * The right to CREATE a migration-tagged transition stage — the tag that makes
+ * blanket `migration` BASE authority admissible on re-admission, and therefore
+ * the thing that has to be unforgeable on the SQLite plane (a persisted proof
+ * loses its brand to the canonical-JSON round trip; the tag survives sealing).
  */
 export interface MigrationImporterCapability {
-  readonly kind: "state-plane-migration-importer/v1";
   readonly [migrationImporterCapabilityBrand]: true;
 }
 
-const MIGRATION_IMPORTERS = new WeakSet<object>();
+/**
+ * The capability IS this object — not its shape, not its type, not membership in
+ * a registry. It is module-private, never exported, never returned by anything,
+ * and never handed to a registrar, so there is no value to forge and no mint to
+ * call. Validation below is `===`, so a look-alike is simply a different object.
+ *
+ * The previous shape kept a `WeakSet` behind an exported `register` function.
+ * That was a runtime mint: a TypeScript brand constrains ordinary structural
+ * assignability but says nothing to a `as never` caller, so registering a forged
+ * literal admitted it. Identity has no such surface.
+ */
+const MIGRATION_IMPORTER = Object.freeze({}) as unknown as MigrationImporterCapability;
 
 /**
- * Teach this seam the identity of migration territory's token. This is NOT an
- * authorization decision — its argument is unforgeable without the brand, so
- * only the one lexical mint can call it. It exists because the store must not
- * import migration territory (that would close a cycle), and a WeakSet needs
- * the object, not just its type.
+ * Run `work` as the state-plane migration importer.
+ *
+ * The capability exists only as this callback's argument. This is a scope you
+ * enter, not a token you are issued: nothing here returns it, and nothing
+ * accepts it for safekeeping. Entering the scope is deliberately open — the
+ * bound facade in `state-plane/reset/owner.ts` is equally callable — because
+ * what has to be impossible is MANUFACTURING the capability, so that the only
+ * code able to tag a stage is code that came through this function.
  */
-export function registerMigrationImporterCapability(capability: MigrationImporterCapability): void {
-  MIGRATION_IMPORTERS.add(capability);
+export function withMigrationImporter<T>(run: (capability: MigrationImporterCapability) => T): T {
+  return run(MIGRATION_IMPORTER);
 }
 
-export function assertMigrationImporterCapability(value: unknown): asserts value is MigrationImporterCapability {
-  if (value === null || value === undefined || typeof value !== "object") {
-    throw new MigrationImporterCapabilityError("no capability was presented");
-  }
-  if (!MIGRATION_IMPORTERS.has(value)) {
-    throw new MigrationImporterCapabilityError("the value presented is not the minted capability");
+/**
+ * The stage gate's check. It compares and nothing else: it cannot produce the
+ * capability, cannot store one, and cannot be talked into widening what counts
+ * as one. Exported only because the const stays private to this module.
+ */
+export function assertMigrationImporter(value: unknown): asserts value is MigrationImporterCapability {
+  if (value !== MIGRATION_IMPORTER) {
+    throw new MigrationImporterCapabilityError(
+      value === undefined ? "no capability was presented" : "the value presented is not the migration importer",
+    );
   }
 }
 

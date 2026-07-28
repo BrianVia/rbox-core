@@ -153,10 +153,11 @@ test("the migration importer tag cannot be claimed without the capability", () =
   const token = openReadSnapshot(handle).token;
 
   // The tag is what makes blanket authority admissible on re-admission, and
-  // canonical JSON erases every in-memory distinction — so a forger who could
+  // canonical JSON erases every in-memory distinction — so a caller who could
   // simply ASK for the tag would inherit the whole reserved lane. Refused at
-  // stage creation, before any bytes exist.
-  for (const forged of [undefined, {}, { kind: "state-plane-migration-importer/v1" }]) {
+  // stage creation, before any bytes exist. The check is `===` against a
+  // module-private object, so a look-alike is just a different object.
+  for (const forged of [undefined, {}, { kind: "state-plane-migration-importer/v1" }, Object.freeze({})]) {
     expect(() => beginRepoTransitionStage(stages, token, [], {
       importer: "migration",
       ...(forged === undefined ? {} : { capability: forged as never }),
@@ -167,6 +168,28 @@ test("the migration importer tag cannot be claimed without the capability", () =
   const engine = beginRepoTransitionStage(stages, token, []);
   engine.discard();
   handle.close();
+});
+
+test("the admission seam offers no way to obtain or register the capability", async () => {
+  const admission = await import("./transition-admission.js");
+
+  // Regression pin for the exploited round-2 shape: an exported registrar took
+  // any object into a trusted WeakSet, so a forged literal was admitted. There
+  // must be no registrar, and no export may hand a capability back.
+  expect(Object.keys(admission).sort()).toEqual([
+    "assertBaseProof", "assertDeclaredBindings", "assertEvidence", "assertMigrationImporter",
+    "canonicalEvidenceOf", "withMigrationImporter",
+  ].sort());
+  for (const name of Object.keys(admission)) expect(name).not.toMatch(/register|mint|create/i);
+
+  // The one entry point yields the capability only INSIDE its callback, and the
+  // gate accepts nothing else — including a value smuggled out of that callback's
+  // sibling scope, since there is only ever one object and it is not exported.
+  const inside = admission.withMigrationImporter((capability) => {
+    expect(() => admission.assertMigrationImporter(capability)).not.toThrow();
+    return capability;
+  });
+  expect(() => admission.assertMigrationImporter({ ...(inside as object) })).toThrow(MigrationImporterCapabilityError);
 });
 
 test("the CAS refuses a proofless row that would move an existing BASE", () => {

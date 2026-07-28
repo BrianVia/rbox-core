@@ -8,28 +8,19 @@
  * once at creation and then bound by the seal. So the tag is the thing that has
  * to be unforgeable, and this module is where that is decided.
  *
- * `MigrationImporterCapability` is branded with a non-exported `unique symbol`
- * (`store/transition-admission.ts`), so no module can write one down. The single
- * token is minted here, registered for identity, and captured by the one entry
- * point below — never exported, never returned. That is the
- * `state-plane/reset/owner.ts` idiom: deep importers may use the bound entry
- * point but cannot mint another.
+ * The capability is a module-private object in `store/transition-admission.ts`,
+ * reachable only as the argument of `withMigrationImporter` and validated by
+ * `===`. Nothing mints one, nothing registers one, and nothing returns one — so
+ * this module holds no token at all. It enters the scope, tags the stage inside
+ * it, and leaves.
  *
  * Kept apart from `./base-proof.ts` so the leaf that `sync-state-model.ts`
  * depends on for legacy adoption never reaches into the store's import graph.
  */
 import type { SourceStageBinding } from "../digest/repo-transition-v1.js";
 import type { LineageSnapshot } from "../ports.js";
-import {
-  registerMigrationImporterCapability,
-  type MigrationImporterCapability,
-} from "../store/transition-admission.js";
+import { withMigrationImporter } from "../store/transition-admission.js";
 import { beginRepoTransitionStage, type RepoTransitionStageBuilder } from "../store/transition-stages.js";
-
-const MIGRATION_IMPORTER = Object.freeze({
-  kind: "state-plane-migration-importer/v1" as const,
-}) as unknown as MigrationImporterCapability;
-registerMigrationImporterCapability(MIGRATION_IMPORTER);
 
 /**
  * The only way to create a migration-tagged transition stage — the tag that lets
@@ -43,7 +34,8 @@ export function beginMigrationImportStage(
   sourceStageBindings: readonly SourceStageBinding[],
   options: { stageId?: string; globalBinding?: SourceStageBinding } = {},
 ): RepoTransitionStageBuilder {
-  return beginRepoTransitionStage(directory, snapshotToken, sourceStageBindings, {
-    ...options, importer: "migration", capability: MIGRATION_IMPORTER,
-  });
+  return withMigrationImporter((capability) =>
+    beginRepoTransitionStage(directory, snapshotToken, sourceStageBindings, {
+      ...options, importer: "migration", capability,
+    }));
 }

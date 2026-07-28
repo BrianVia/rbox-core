@@ -15,7 +15,9 @@
  * is gated on `MigrationImporterCapability`, branded the same way.
  */
 import type { ComposeRepoBaseAuthority, MigrationBaseAuthority } from "./base-composer.js";
-import type { MigrationImporterCapability } from "../state-plane/store/transition-admission.js";
+import type * as admission from "../state-plane/store/transition-admission.js";
+
+type MigrationImporterCapability = Parameters<Parameters<typeof admission.withMigrationImporter>[0]>[0];
 
 type Assert<T extends true> = T;
 
@@ -48,7 +50,29 @@ type _EmptyObjectIsNotTheCapability = Assert<
   Record<string, never> extends MigrationImporterCapability ? false : true
 >;
 
+type Returns<T> = T extends (...args: never[]) => infer R ? R : never;
+
+/**
+ * `withMigrationImporter` is the ONE position the capability may appear in — as
+ * the argument it supplies to a callback. Every other export of the seam is
+ * pinned here to never hand one back, so a getter, an unwrapper, or a registrar
+ * that echoes its argument cannot be added without failing typecheck. The exact
+ * export list is separately locked at runtime in proofless-base.test.ts, which
+ * is what catches a registrar that returns `void`.
+ */
+type OtherAdmissionExports = Omit<typeof admission, "withMigrationImporter">;
+
+type CapabilityYieldingExports = {
+  [K in keyof OtherAdmissionExports as
+    MigrationImporterCapability extends Returns<OtherAdmissionExports[K]> ? K : never]: true;
+};
+
+type _NoOtherExportYieldsTheCapability = Assert<
+  keyof CapabilityYieldingExports extends never ? true : false
+>;
+
 export type MigrationAuthoritySurfacePins = [
+  _NoOtherExportYieldsTheCapability,
   _BlanketAuthorityIsUnforgeable,
   _MintedAuthorityIsStillAnAuthority,
   _ImporterCapabilityIsUnforgeable,
