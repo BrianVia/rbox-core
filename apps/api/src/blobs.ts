@@ -558,7 +558,7 @@ export async function multipartComplete(env: Env, sha: string, uploadId: string,
     // A `retry_later` 503 keeps everything — that response IS an instruction to retry.
     if (!resumable) {
       // A failed staging delete leaks a `staging/` object whose only D1 handle is being
-      // dropped on the next line — report it (versions.ts' staging sweep is its reclaimer)
+      // dropped on the next line — report it (`staging-gc.ts` owns its reclaimer)
       // but never fail the request because cleanup failed.
       await op.span.r2(() => env.rbox_dev_blobs.delete(up.staging_key).catch((e) => logErr("multipart_staging_delete_failed", e)));
       await cleanupUpload(op.env, accountId, uploadId);

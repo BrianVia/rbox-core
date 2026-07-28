@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Env } from "../src/env.js";
-import { MAX_SNAPSHOT_RETRIES, reachableFromWorkspaces } from "../src/versions.js";
+import { MAX_SNAPSHOT_RETRIES, reachableFromWorkspaces } from "../src/gc-roots.js";
 
 const page = (overrides: Record<string, unknown> = {}) => ({
   head: 4,

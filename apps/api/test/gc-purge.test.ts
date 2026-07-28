@@ -5,23 +5,24 @@ import { grantEntitlementWithQuota } from "../src/billing.js";
 import {
   GC_BUDGET_SAFE,
   GC_FIXED_COST,
-  GC_INSERT_ROWS,
-  GC_MAX_WORKSPACE_ROWS,
   GC_P1_COST,
   GC_PER_EXECUTE,
   PER_WORKSPACE_ROOTS_COST,
   INTENT_QUIESCENCE_MS,
-  PURGE_LEASE_TTL_MS,
-  STALE_INTENT_MS,
-  TAKEOVER_QUIESCENCE_MS,
-  gcAudit,
   gcExecuteLimit,
-  gcHealthData,
-  gcMark,
-  gcPurge,
+} from "../src/gc-policy.js";
+import { GC_INSERT_ROWS, gcMark } from "../src/gc-mark.js";
+import { GC_MAX_WORKSPACE_ROWS, gcHealthData } from "../src/gc-health.js";
+import { gcAudit } from "../src/gc-audit.js";
+import { STALE_INTENT_MS, gcPurge } from "../src/gc-purge.js";
+import {
   writeGcObservation,
   type GcObservationV1,
-} from "../src/versions.js";
+} from "../src/gc-observability.js";
+import {
+  PURGE_LEASE_TTL_MS,
+  TAKEOVER_QUIESCENCE_MS,
+} from "../src/gc-state.js";
 import { blobKey } from "../src/util.js";
 import worker, { GC_MARK_UTC_HOUR, GC_PURGE_UTC_HOUR } from "../src/worker.js";
 import { RECEIPT_TTL_MS } from "../src/receipts.js";

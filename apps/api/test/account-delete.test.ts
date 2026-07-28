@@ -5,7 +5,7 @@ import { AccountGoneError, createWebSession, mintDevice, mintDeviceWithNotificat
 import { deleteAccount, driveAccountDeletion, purgeUploadR2, purgeWorkspaceDO, sweepAccountDeletions, DELETION_GRACE_MS, type PurgeDeps } from "../src/account-delete.js";
 import type { Principal } from "../src/authz.js";
 import type { Env } from "../src/env.js";
-import { gcPurge } from "../src/versions.js";
+import { gcPurge } from "../src/gc-purge.js";
 import { retentionPrune } from "../src/retention.js";
 import { blobKey } from "../src/util.js";
 

@@ -228,7 +228,7 @@ export async function driveAccountDeletion(env: Env, accountId: string, nowMs: n
 
   // 2. Canonical blobs (§4f, race-safe). Drop this account's entitlements (`blob_refs`), then
   //    CONDEMN — never inline-delete — any sha now referenced by NO account, by inserting a
-  //    `gc_candidates` row. The EXISTING reachability-GC (`versions.ts::gcPurge`) reclaims the
+  //    `gc_candidates` row. The EXISTING reachability-GC (`gc-purge.ts`) reclaims the
   //    R2 object + `blobs` row on its quiescent sweep, re-checking reachability so a concurrent
   //    re-reference UN-CONDEMNS it (a receipt-PUT writes the canonical object before any D1 ref;
   //    blobPut/commit `DELETE gc_candidates`, resurrecting it). A bespoke inline R2 delete here

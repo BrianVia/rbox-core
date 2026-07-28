@@ -3,7 +3,7 @@ import type { Env } from "../env.js";
 import { json } from "../util.js";
 import { dbFor } from "../db.js";
 import { authorizeWorkspace, type Principal } from "../authz.js";
-import { versionsList } from "../versions.js";
+import { versionsList } from "../version-history.js";
 import { mintGrant } from "../grants.js";
 import { tombstoneFenceResponse } from "../genesis-repair.js";
 
