@@ -10,18 +10,30 @@ export interface SemVer {
   build: string | null;
 }
 
-const RE = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.-]+))?$/;
+export type ReleaseChannel = "latest" | "next";
+
+const RE = /^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/;
 
 export function parseSemver(s: string): SemVer {
   const m = RE.exec(s.trim());
   if (!m) throw new Error(`not a semver: ${s}`);
+  const core = [m[1]!, m[2]!, m[3]!].map(Number);
+  if (core.some((value) => !Number.isSafeInteger(value))) throw new Error(`not a semver: ${s}`);
+  const prerelease = m[4] ?? null;
+  if (prerelease?.split(".").some((identifier) => /^\d+$/.test(identifier) && identifier.length > 1 && identifier.startsWith("0"))) {
+    throw new Error(`not a semver: ${s}`);
+  }
   return {
-    major: Number(m[1]),
-    minor: Number(m[2]),
-    patch: Number(m[3]),
-    prerelease: m[4] ?? null,
+    major: core[0]!,
+    minor: core[1]!,
+    patch: core[2]!,
+    prerelease,
     build: m[5] ?? null,
   };
+}
+
+export function releaseChannelForVersion(version: string): ReleaseChannel {
+  return parseSemver(version).prerelease === null ? "latest" : "next";
 }
 
 /** Compare two prerelease strings by semver §11 precedence: dot-separated
@@ -39,7 +51,8 @@ function comparePrerelease(a: string, b: string): number {
     const xn = /^\d+$/.test(x);
     const yn = /^\d+$/.test(y);
     if (xn && yn) {
-      if (x !== y) return Number(x) - Number(y);
+      if (x.length !== y.length) return x.length - y.length;
+      if (x !== y) return x < y ? -1 : 1;
     } else if (xn !== yn) {
       return xn ? -1 : 1; // numeric identifiers are lower than alphanumeric
     } else if (x !== y) {

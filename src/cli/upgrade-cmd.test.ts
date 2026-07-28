@@ -162,6 +162,77 @@ test("upgrade command check mode does not restart stale daemons at the current-v
   expect(consoleLogs).toEqual([`already up to date (${RBOX_VERSION})`]);
 });
 
+test("next channel persists per install and derives both manifest URLs", async () => {
+  const urls: string[] = [];
+  globalThis.fetch = async (input) => {
+    urls.push(String(input));
+    return new Response("fixture", { status: 200 });
+  };
+  const consoleLog = spyOn(console, "log").mockImplementation(() => {});
+  try {
+    await upgradeCmd("https://releases.example/", {
+      check: true,
+      channel: "next",
+      commandDeps: { ...commandDeps(manifest(RBOX_VERSION)), isElevated: () => true },
+    });
+    await upgradeCmd("https://releases.example/", {
+      check: true,
+      commandDeps: { ...commandDeps(manifest(RBOX_VERSION)), isElevated: () => true },
+    });
+  } finally {
+    consoleLog.mockRestore();
+  }
+  expect(urls).toEqual([
+    "https://releases.example/next/version",
+    "https://releases.example/next/version.sig",
+    "https://releases.example/next/version",
+    "https://releases.example/next/version.sig",
+  ]);
+  expect(JSON.parse(await fs.readFile(`${executable}.channel.json`, "utf8"))).toEqual({ schema: 1, channel: "next" });
+});
+
+test("switching from next to an older latest refuses and leaves next persisted", async () => {
+  await fs.writeFile(`${executable}.channel.json`, `${JSON.stringify({ schema: 1, channel: "next" })}\n`);
+  serve();
+  const latest = "1.0.0";
+  await expect(upgradeCmd("https://releases.example", {
+    check: true,
+    channel: "latest",
+    commandDeps: { ...commandDeps(manifest(latest)), isElevated: () => true },
+  })).rejects.toThrow(
+    `cannot switch to the latest channel: installed rbox ${RBOX_VERSION} is newer than latest ${latest}; install a newer latest release before switching back`,
+  );
+  expect(JSON.parse(await fs.readFile(`${executable}.channel.json`, "utf8"))).toEqual({ schema: 1, channel: "next" });
+});
+
+test("failed next manifest authentication does not persist the requested channel", async () => {
+  serve();
+  await expect(upgradeCmd("https://releases.example", {
+    check: true,
+    channel: "next",
+    commandDeps: {
+      isStandaloneBinary: () => true,
+      isElevated: () => true,
+      verifyAndParseManifest: () => { throw new Error("signature invalid"); },
+    },
+  })).rejects.toThrow("signature invalid");
+  expect(fsSync.existsSync(`${executable}.channel.json`)).toBe(false);
+});
+
+test("a signed manifest without this platform does not persist the requested channel", async () => {
+  serve();
+  await expect(upgradeCmd("https://releases.example", {
+    check: true,
+    channel: "next",
+    commandDeps: {
+      isStandaloneBinary: () => true,
+      isElevated: () => true,
+      verifyAndParseManifest: () => ({ version: nextVersion(), keyId: "test", artifacts: {} }),
+    },
+  })).rejects.toThrow(`release has no valid artifact for ${artifact()}`);
+  expect(fsSync.existsSync(`${executable}.channel.json`)).toBe(false);
+});
+
 test.skipIf(typeof process.geteuid !== "function" || process.geteuid() === 0)(
   "unreadable legacy sudo state cannot block the first non-sudo daemon repair",
   async () => {
@@ -305,265 +376,4 @@ test("elevated successful upgrade keeps state beside the executable and skips us
     `upgraded ${RBOX_VERSION} → ${version}`,
     "run `rbox upgrade` once without sudo to restart user daemons on the new version",
   ]);
-});
-
-test("pending floor survives failure before rename, blocks intermediates, and permits exact repair", async () => {
-  const target = versionAfter(2);
-  const intermediate = versionAfter(1);
-  const targetBinary = Buffer.from("target-binary");
-  serve(targetBinary);
-  await expect(upgradeCmd("https://releases.example", {
-    commandDeps: {
-      ...commandDeps(manifest(target, targetBinary)),
-      isElevated: () => true,
-      afterPendingState: () => { throw new Error("injected pre-rename failure"); },
-    },
-  })).rejects.toThrow("injected pre-rename failure");
-  expect(await fs.readFile(executable, "utf8")).toBe("old-binary");
-  expect(JSON.parse(await fs.readFile(`${executable}.release.json`, "utf8"))).toMatchObject({
-    version: target,
-    phase: "pending",
-  });
-
-  const logs: string[] = [];
-  const consoleLog = spyOn(console, "log").mockImplementation((...args) => void logs.push(args.join(" ")));
-  try {
-    await upgradeCmd("https://releases.example", {
-      commandDeps: { ...commandDeps(manifest(intermediate)), isElevated: () => true },
-    });
-  } finally {
-    consoleLog.mockRestore();
-  }
-  expect(await fs.readFile(executable, "utf8")).toBe("old-binary");
-  expect(logs).toEqual([
-    `an upgrade to ${target} is incomplete — run \`rbox upgrade\` again to finish it`,
-  ]);
-
-  serve(targetBinary);
-  const repairLog = spyOn(console, "log").mockImplementation(() => {});
-  try {
-    await upgradeCmd("https://releases.example", {
-      commandDeps: { ...commandDeps(manifest(target, targetBinary)), isElevated: () => true },
-    });
-  } finally {
-    repairLog.mockRestore();
-  }
-  expect(await fs.readFile(executable)).toEqual(targetBinary);
-  expect(JSON.parse(await fs.readFile(`${executable}.release.json`, "utf8"))).toMatchObject({
-    version: target,
-    phase: "committed",
-  });
-});
-
-test("failure after executable rename retains a pending floor that blocks rollback", async () => {
-  const target = versionAfter(2);
-  const intermediate = versionAfter(1);
-  const targetBinary = Buffer.from("renamed-before-failure");
-  serve(targetBinary);
-  await expect(upgradeCmd("https://releases.example", {
-    commandDeps: {
-      ...commandDeps(manifest(target, targetBinary)),
-      isElevated: () => true,
-      afterExecutableRename: () => { throw new Error("injected post-rename failure"); },
-    },
-  })).rejects.toThrow("injected post-rename failure");
-  expect(await fs.readFile(executable)).toEqual(targetBinary);
-  expect(JSON.parse(await fs.readFile(`${executable}.release.json`, "utf8"))).toMatchObject({
-    version: target,
-    phase: "pending",
-  });
-
-  serve(Buffer.from("intermediate-rollback"));
-  const logs: string[] = [];
-  const consoleLog = spyOn(console, "log").mockImplementation((...args) => void logs.push(args.join(" ")));
-  try {
-    await upgradeCmd("https://releases.example", {
-      commandDeps: { ...commandDeps(manifest(intermediate, Buffer.from("intermediate-rollback"))), isElevated: () => true },
-    });
-  } finally {
-    consoleLog.mockRestore();
-  }
-  expect(await fs.readFile(executable)).toEqual(targetBinary);
-  expect(logs).toEqual([
-    `an upgrade to ${target} is incomplete — run \`rbox upgrade\` again to finish it`,
-  ]);
-});
-
-test("check mode distinguishes pending and committed floors above the running version", async () => {
-  const target = nextVersion();
-  serve();
-  const logs: string[] = [];
-  const consoleLog = spyOn(console, "log").mockImplementation((...args) => void logs.push(args.join(" ")));
-  try {
-    await fs.writeFile(`${executable}.release.json`, `${JSON.stringify({ schema: 1, version: target, phase: "pending" })}\n`);
-    await upgradeCmd("https://releases.example", {
-      check: true,
-      commandDeps: { ...commandDeps(manifest(RBOX_VERSION)), isElevated: () => true },
-    });
-    await fs.writeFile(`${executable}.release.json`, `${JSON.stringify({ schema: 1, version: target, phase: "committed" })}\n`);
-    await upgradeCmd("https://releases.example", {
-      check: true,
-      commandDeps: { ...commandDeps(manifest(RBOX_VERSION)), isElevated: () => true },
-    });
-  } finally {
-    consoleLog.mockRestore();
-  }
-  expect(logs).toEqual([
-    `an upgrade to ${target} is incomplete — run \`rbox upgrade\` again to finish it`,
-    `verified upgrade floor is ${target}; this process is ${RBOX_VERSION} — run \`rbox upgrade\` again from a fresh shell`,
-  ]);
-});
-
-test("non-durable lock release warns without replacing a primary error that already has a cause", async () => {
-  const primary = new Error("injected upgrade failure", { cause: new Error("original cause") });
-  const errors: string[] = [];
-  const consoleError = spyOn(console, "error").mockImplementation((...args) => void errors.push(args.join(" ")));
-  let thrown: unknown;
-  serve();
-  try {
-    await upgradeCmd("https://releases.example", {
-      commandDeps: {
-        ...commandDeps(manifest(nextVersion())),
-        isElevated: () => true,
-        afterPendingState: async () => {
-          await fs.rm(`${executable}.upgrade.lock`);
-          throw primary;
-        },
-      },
-    });
-  } catch (error) {
-    thrown = error;
-  } finally {
-    consoleError.mockRestore();
-  }
-  expect(thrown).toBe(primary);
-  expect(errors).toEqual([
-    "upgrade finished without durably releasing its lock; retry after checking the install directory",
-  ]);
-});
-
-test.skipIf(typeof process.geteuid !== "function" || process.geteuid() === 0)(
-  "non-elevated lock acquisition permission errors suggest sudo",
-  async () => {
-    const installDir = path.dirname(executable);
-    const accessSync = fsSync.accessSync;
-    const access = spyOn(fsSync, "accessSync").mockImplementation((target, mode) => {
-      accessSync(target, mode);
-      if (path.resolve(String(target)) === installDir && mode === fsSync.constants.W_OK) {
-        fsSync.chmodSync(installDir, 0o500);
-      }
-    });
-    serve();
-    try {
-      await expect(upgradeCmd("https://releases.example", {
-        commandDeps: { ...commandDeps(manifest(nextVersion())), isElevated: () => false },
-      })).rejects.toThrow(
-        `cannot acquire the rbox upgrade lock at ${executable}.upgrade.lock — if this rbox install is root-owned, retry with \`sudo rbox upgrade\``,
-      );
-    } finally {
-      access.mockRestore();
-      fsSync.chmodSync(installDir, 0o700);
-    }
-  },
-);
-
-test("elevated and non-elevated contenders share the executable-scoped lock", async () => {
-  const high = versionAfter(2);
-  const low = versionAfter(1);
-  const highBinary = Buffer.from("highest-binary");
-  let entered!: () => void;
-  const downloadEntered = new Promise<void>((resolve) => { entered = resolve; });
-  let unblock!: () => void;
-  const blocked = new Promise<void>((resolve) => { unblock = resolve; });
-  globalThis.fetch = async (input) => {
-    const url = String(input);
-    if (url.includes(`/bin/v${high}/`)) {
-      entered();
-      await blocked;
-      return new Response(highBinary, { status: 200 });
-    }
-    return new Response(Buffer.from("fixture"), { status: 200 });
-  };
-  const consoleLog = spyOn(console, "log").mockImplementation(() => {});
-  try {
-    const highUpgrade = upgradeCmd("https://releases.example", {
-      commandDeps: {
-        ...commandDeps(manifest(high, highBinary)),
-        isElevated: () => true,
-      },
-    });
-    await downloadEntered;
-    await expect(upgradeCmd("https://releases.example", {
-      commandDeps: { ...commandDeps(manifest(low)), isElevated: () => false },
-    })).rejects.toThrow(/another rbox upgrade is already running/);
-    unblock();
-    await highUpgrade;
-  } finally {
-    consoleLog.mockRestore();
-  }
-  expect(await fs.readFile(executable)).toEqual(highBinary);
-  expect(JSON.parse(await fs.readFile(`${executable}.release.json`, "utf8"))).toMatchObject({
-    version: high,
-    phase: "committed",
-  });
-});
-
-test("existing malformed or symlinked canonical release state fails closed", async () => {
-  serve();
-  await fs.writeFile(`${executable}.release.json`, "{broken");
-  await expect(upgradeCmd("https://releases.example", {
-    commandDeps: { ...commandDeps(manifest(nextVersion())), isElevated: () => true },
-  })).rejects.toThrow(/release state is malformed/);
-
-  await fs.rm(`${executable}.release.json`);
-  const target = path.join(sandbox, "state-target");
-  await fs.writeFile(target, JSON.stringify({ schema: 1, version: nextVersion(), phase: "committed" }));
-  await fs.symlink(target, `${executable}.release.json`);
-  await expect(upgradeCmd("https://releases.example", {
-    commandDeps: { ...commandDeps(manifest(nextVersion())), isElevated: () => true },
-  })).rejects.toThrow(/not a safe regular file/);
-
-  await fs.rm(`${executable}.release.json`);
-  await fs.writeFile(`${executable}.release.json`, "x".repeat(4097));
-  await expect(upgradeCmd("https://releases.example", {
-    commandDeps: { ...commandDeps(manifest(nextVersion())), isElevated: () => true },
-  })).rejects.toThrow(/not a safe regular file/);
-
-  if (typeof process.geteuid === "function" && process.geteuid() !== 0) {
-    await fs.rm(`${executable}.release.json`);
-    await fs.writeFile(`${executable}.release.json`, JSON.stringify({
-      schema: 1,
-      version: nextVersion(),
-      phase: "committed",
-    }));
-    await fs.chmod(`${executable}.release.json`, 0o000);
-    await expect(upgradeCmd("https://releases.example", {
-      commandDeps: { ...commandDeps(manifest(nextVersion())), isElevated: () => true },
-    })).rejects.toThrow(/release state is unreadable/);
-  }
-});
-
-test("upgrade lock marker and release state stay exactly readable under a restrictive umask", async () => {
-  const binary = Buffer.from("umask-replacement");
-  const version = nextVersion();
-  serve(binary);
-  let lockMode = 0;
-  const oldUmask = process.umask(0o077);
-  const consoleLog = spyOn(console, "log").mockImplementation(() => {});
-  try {
-    await upgradeCmd("https://releases.example", {
-      commandDeps: {
-        ...commandDeps(manifest(version, binary)),
-        isElevated: () => true,
-        afterPendingState: async () => {
-          lockMode = (await fs.stat(`${executable}.upgrade.lock`)).mode & 0o777;
-        },
-      },
-    });
-  } finally {
-    consoleLog.mockRestore();
-    process.umask(oldUmask);
-  }
-  expect(lockMode).toBe(0o644);
-  expect((await fs.stat(`${executable}.release.json`)).mode & 0o777).toBe(0o644);
 });

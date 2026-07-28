@@ -9,7 +9,7 @@ afterEach(() => {
 
 function harness(elevated: boolean, command = "upgrade") {
   let refreshes = 0;
-  const calls: Array<{ remote: string; check: boolean; elevated: boolean }> = [];
+  const calls: Array<{ remote: string; check: boolean; channel?: string; elevated: boolean }> = [];
   const deps: MainDispatchDeps = {
     isElevated: () => elevated,
     refreshSystemLockIdentityLedger: async () => {
@@ -26,12 +26,13 @@ function harness(elevated: boolean, command = "upgrade") {
         calls.push({
           remote,
           check: opts?.check === true,
+          channel: opts?.channel,
           elevated: opts?.commandDeps?.isElevated?.() === true,
         });
       },
     }),
   };
-  process.argv = [process.execPath, "rbox", command, "--check", "--remote", "https://releases.test"];
+  process.argv = [process.execPath, "rbox", command, "--check", "--channel", "next", "--remote", "https://releases.test"];
   return { deps, state: () => ({ refreshes, calls }) };
 }
 
@@ -40,7 +41,7 @@ test("elevated upgrade skips the optional home-scoped identity refresh", async (
   await main(h.deps);
   expect(h.state()).toEqual({
     refreshes: 0,
-    calls: [{ remote: "https://releases.test", check: true, elevated: true }],
+    calls: [{ remote: "https://releases.test", check: true, channel: "next", elevated: true }],
   });
 });
 
@@ -49,7 +50,7 @@ test("non-elevated upgrade retains the identity refresh", async () => {
   await main(h.deps);
   expect(h.state()).toEqual({
     refreshes: 1,
-    calls: [{ remote: "https://releases.test", check: true, elevated: false }],
+    calls: [{ remote: "https://releases.test", check: true, channel: "next", elevated: false }],
   });
 });
 

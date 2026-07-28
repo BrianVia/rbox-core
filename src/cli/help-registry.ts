@@ -598,9 +598,10 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "upgrade",
     group: "BILLING & MAINTENANCE",
     summary: "update the rbox binary",
-    usage: "rbox upgrade [--check]",
+    usage: "rbox upgrade [--check] [--channel <latest|next>]",
     flags: [
       { flag: "--check", desc: "report whether an update is available, without installing" },
+      { flag: "--channel <latest|next>", desc: "switch and persist the release channel (default: latest)" },
       { flag: "--remote <url>", desc: "rbox API server (default: production; the RBOX_API env var also overrides)" },
     ],
   },

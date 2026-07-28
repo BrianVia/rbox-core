@@ -184,6 +184,7 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: bun scripts/release.ts "${GITHUB_REF_NAME#v}" --upload-only
       - name: Rebuild the public changelog page
+        if: ${{ !contains(github.ref_name, '-') }}
         env:
           RBOX_HOME_DEPLOY_HOOK: ${{ secrets.RBOX_HOME_DEPLOY_HOOK }}
         run: |

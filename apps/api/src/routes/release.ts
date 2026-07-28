@@ -6,6 +6,12 @@ import { ipKey, rateLimited } from "../ratelimit.js";
 // edge — design 14 U7).
 const releaseNotFound = () => new Response(JSON.stringify({ error: "not_found" }), { status: 404, headers: { "content-type": "application/json", "cache-control": "no-store" } });
 const SHELL_HEADERS = { "content-type": "text/x-shellscript; charset=utf-8", "cache-control": "public, max-age=300, stale-while-revalidate=3600" };
+const MANIFEST_KEYS: Readonly<Record<string, string>> = {
+  "/version": "releases/version.json",
+  "/version.sig": "releases/version.json.sig",
+  "/next/version": "releases/next/manifest.json",
+  "/next/version.sig": "releases/next/manifest.json.sig",
+};
 const AGENT_SH = `#!/bin/sh
 set -eu
 
@@ -36,7 +42,7 @@ export async function releaseRoutes({ req, env, exports, url, seg }: RouteCtx): 
     if (limited) return limited;
     return new Response(AGENT_SH, { headers: SHELL_HEADERS });
   }
-  if (url.pathname === "/install.sh" && req.method === "GET") {
+  if ((url.pathname === "/install.sh" || url.pathname === "/next/install.sh") && req.method === "GET") {
     const limited = await releaseLimited();
     if (limited) return limited;
     return exports.CachedReleases.fetch(req);
@@ -50,13 +56,13 @@ export async function releaseRoutes({ req, env, exports, url, seg }: RouteCtx): 
   // verifies the signature against an embedded key before trusting it). Keep the
   // manifest JSON shape aligned with scripts/release.ts; install.sh greps the
   // artifact sha256 from that compact field layout before installing.
-  if ((url.pathname === "/version" || url.pathname === "/version.sig") && req.method === "GET") {
+  const manifestKey = MANIFEST_KEYS[url.pathname];
+  if (manifestKey && req.method === "GET") {
     const limited = await releaseLimited();
     if (limited) return limited;
-    const key = url.pathname === "/version" ? "releases/version.json" : "releases/version.json.sig";
-    const obj = await env.rbox_releases.get(key);
+    const obj = await env.rbox_releases.get(manifestKey);
     if (!obj) return releaseNotFound();
-    const type = url.pathname === "/version" ? "application/json" : "text/plain; charset=utf-8";
+    const type = url.pathname.endsWith("version") ? "application/json" : "text/plain; charset=utf-8";
     return new Response(obj.body, { headers: { "content-type": type, "cache-control": "no-cache" } });
   }
   // Binaries: `/bin/rbox-<os>-<arch>` (mutable "latest" alias, short cache — for
@@ -74,8 +80,9 @@ export async function releaseRoutes({ req, env, exports, url, seg }: RouteCtx): 
 
 /** CachedReleases half: pure R2 response contract for design 70's cached entrypoint. */
 export async function cachedReleaseResponse(url: URL, env: Env): Promise<Response> {
-  if (url.pathname === "/install.sh") {
-    const obj = await env.rbox_releases.get("releases/install.sh");
+  if (url.pathname === "/install.sh" || url.pathname === "/next/install.sh") {
+    const key = url.pathname === "/install.sh" ? "releases/install.sh" : "releases/next/install.sh";
+    const obj = await env.rbox_releases.get(key);
     if (!obj) return releaseNotFound();
     return new Response(obj.body, { headers: SHELL_HEADERS });
   }
