@@ -45,15 +45,15 @@ async function readScopeWitness(root: string): Promise<ScopeWitness | undefined>
   return undefined;
 }
 
-export type ScopeHaltCondition =
-  | "scoped-binding-cannot-publish"
-  | "binding-record-unreadable"
-  | "scope-witness-disagreement";
+/** The two ways the seal itself cannot be read. Both stop the binding entirely. */
+export type ScopeSealFailure = "binding-record-unreadable" | "scope-witness-disagreement";
+
+export type ScopeHaltCondition = "scoped-binding-cannot-publish" | ScopeSealFailure;
 
 export type BindingScope =
   | { kind: "unscoped" }
   | { kind: "scoped"; prefixes: readonly string[]; generation: number }
-  | { kind: "halted"; condition: ScopeHaltCondition; message: string };
+  | { kind: "halted"; condition: ScopeSealFailure; message: string };
 
 /** A refusal named by its condition, so callers and tests never have to infer the
  *  class from prose. */
@@ -72,8 +72,10 @@ const HALT_MESSAGE = {
   "scope-witness-disagreement":
     "this folder's rbox binding record no longer lists the folders it was set up to sync, but this machine still remembers them. "
     + "Syncing is paused until the two agree — re-run `rbox scope add <folder>` to restate them, or `rbox untrack` and set the folder up again.",
-  "scoped-binding-cannot-publish": "",
-} as const satisfies Record<ScopeHaltCondition, string>;
+} as const satisfies Record<ScopeSealFailure, string>;
+
+const halt = (condition: ScopeSealFailure): BindingScope =>
+  ({ kind: "halted", condition, message: HALT_MESSAGE[condition] });
 
 const sameSet = (a: readonly string[], b: readonly string[]): boolean =>
   a.length === b.length && a.every((value, index) => value === b[index]);
@@ -99,36 +101,26 @@ export async function resolveBindingScope(root: string): Promise<BindingScope> {
   const record = await loadConfigIfPresent(abs).catch(() => undefined);
   const witness = await readScopeWitness(abs).catch(() => undefined);
   const witnessScope = witness?.scope;
-  if (witness?.corrupt) {
-    return { kind: "halted", condition: "scope-witness-disagreement", message: HALT_MESSAGE["scope-witness-disagreement"] };
-  }
+  if (witness?.corrupt) return halt("scope-witness-disagreement");
 
   if (record === undefined) {
     // No readable binding record. Only scope evidence makes this a halt: a plain
     // untracked directory must keep failing the way it always has.
-    if (witnessScope?.length) {
-      return { kind: "halted", condition: "binding-record-unreadable", message: HALT_MESSAGE["binding-record-unreadable"] };
-    }
+    if (witnessScope?.length) return halt("binding-record-unreadable");
     return { kind: "unscoped" };
   }
 
   const declared = declaredScope(record);
-  if (declared.present && declared.prefixes === undefined) {
-    return { kind: "halted", condition: "binding-record-unreadable", message: HALT_MESSAGE["binding-record-unreadable"] };
-  }
+  if (declared.present && declared.prefixes === undefined) return halt("binding-record-unreadable");
   if (declared.prefixes) {
-    if (witnessScope && !sameSet(witnessScope, declared.prefixes)) {
-      return { kind: "halted", condition: "scope-witness-disagreement", message: HALT_MESSAGE["scope-witness-disagreement"] };
-    }
+    if (witnessScope && !sameSet(witnessScope, declared.prefixes)) return halt("scope-witness-disagreement");
     return { kind: "scoped", prefixes: declared.prefixes, generation: record.scopeGeneration ?? 0 };
   }
   // The record positively says "no scope", and a scope-bearing row contradicts it.
   // A genuine rebind rewrites that row through the authoritative writer and drops
   // the scope with it, so a surviving one means the record changed outside rbox —
   // regardless of which workspace id the row names.
-  if (witnessScope?.length) {
-    return { kind: "halted", condition: "scope-witness-disagreement", message: HALT_MESSAGE["scope-witness-disagreement"] };
-  }
+  if (witnessScope?.length) return halt("scope-witness-disagreement");
   return { kind: "unscoped" };
 }
 

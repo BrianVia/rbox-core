@@ -3,6 +3,7 @@ import path from "node:path";
 import { discoverGitRepos, poolMap, repoCtxFromDisk, type GitRepoKind, type GitSection, type IgnoreMatcher } from "../../engine/index.js";
 import { type GitConfigRunner } from "../../engine/git/config-txn.js";
 import { DEFERRAL_LANES, repoRecordsForState, type GitDeferral, type SyncState, type WorkspaceConfig } from "../config.js";
+import { knownRepoKeys } from "../sync-state-model.js";
 import { repoDirOf, carryMatrixMatches } from "./shared.js";
 import { readLocalGitConfig, shouldPublishGitConfig } from "./config-lane.js";
 import { gitFingerprintRun } from "./fingerprint.js";
@@ -77,11 +78,7 @@ export async function gitDivergenceStatus(
   // issues zero out-of-scope filesystem, git, config, or journal probes — and reads
   // steady rather than dirty (an absent out-of-scope BASE repo would otherwise count
   // as a pending removal).
-  const scope = await scopeProjectionFor(root, [
-    ...Object.keys(state.lastSyncedManifest.gitRepos ?? {}),
-    ...Object.keys(state.gitPendingRemote ?? {}),
-    ...Object.keys(repoRecordsForState(state)),
-  ]);
+  const scope = await scopeProjectionFor(root, knownRepoKeys(state));
   const inScope = (relPath: string): boolean => scope === undefined || scope.classifyRepo(relPath) === "in";
   for (const [relPath, record] of Object.entries(repoRecordsForState(state))) {
     if (!inScope(relPath)) continue;

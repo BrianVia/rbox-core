@@ -485,7 +485,9 @@ export class RboxDaemon {
    *  every operation boundary under the mutex, and can only ever narrow to
    *  pull-only. */
   private pullOnly: boolean;
-  private scopeSeal: BindingScope = { kind: "unscoped" };
+  /** Whether this binding syncs only part of the workspace, as of the last
+   *  operation boundary. */
+  private scoped = false;
   /** The scope generation this process's cached and watcher-fed observations were
    *  built under. A change fences them all by ending the process. */
   private scopeGeneration: number | undefined;
@@ -1512,7 +1514,7 @@ export class RboxDaemon {
   private async refreshScopeAuthority(): Promise<boolean> {
     const seal = await resolveBindingScope(this.root).catch((error): BindingScope =>
       ({ kind: "halted", condition: "binding-record-unreadable", message: error instanceof Error ? error.message : String(error) }));
-    this.scopeSeal = seal;
+    this.scoped = seal.kind === "scoped";
     if (seal.kind === "halted") {
       this.log(`rbox daemon halting (${seal.condition}): ${seal.message}`);
       this.stopped = true;
@@ -1535,10 +1537,6 @@ export class RboxDaemon {
       return false;
     }
     return true;
-  }
-
-  private get scoped(): boolean {
-    return this.scopeSeal.kind === "scoped";
   }
 
   /** The dequeued operation's own bookkeeping, run before the scheduler publishes the

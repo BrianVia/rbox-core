@@ -375,6 +375,17 @@ export function normalizeStateCounter(value: unknown): number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }
 
+/** Every git repo key this state knows of: the last-synced manifest, whatever the
+ * remote has queued, and every durable per-repo record. This is the set status,
+ * doctor and the design-212 scope projection classify. */
+export function knownRepoKeys(state: SyncState): string[] {
+  return [
+    ...Object.keys(state.lastSyncedManifest.gitRepos ?? {}),
+    ...Object.keys(state.gitPendingRemote ?? {}),
+    ...Object.keys(repoRecordsForState(state)),
+  ];
+}
+
 /** Fold the legacy parallel maps into complete records. Every later state write
  * reconstructs gitRepos and sidecars solely from this returned record set. */
 export function repoRecordsForState(state: SyncState): Record<string, RepoRecord> {
