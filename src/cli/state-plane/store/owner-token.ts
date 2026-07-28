@@ -9,10 +9,10 @@
  * `CasOwnerToken` the store consumes. `CasPacket.ownerToken` requires the
  * BRANDED `OwnedLockCasToken`, so a bare `{ isOwner }` literal no longer
  * type-checks at the CAS admission boundary — the token always carries the
- * provenance of an exact held lock. This is the only PRODUCTION mint site; the
- * single test-only seam is `owner-token-testkit.ts`. The CLI owns the factory so
- * the engine never imports a CLI type: the engine exposes `isOwnerSync`, and
- * state-plane brands the token.
+ * provenance of an exact held lock. This is the only PRODUCTION mint site; tests
+ * mint through a single sibling test-kit module instead. The CLI owns the
+ * factory so the engine never imports a CLI type: the engine exposes
+ * `isOwnerSync`, and state-plane brands the token.
  */
 import type { OwnedLock } from "../../../engine/git/lockfile.js";
 import type { CasOwnerToken } from "../ports.js";

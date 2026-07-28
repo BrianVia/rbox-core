@@ -165,7 +165,7 @@ test("every rejection reason in the operation table is reachable and lands nothi
   expectRejected(applyCasPacket(handle, stages, packet(stages, handle, {
     rows: [{ relPath: "repo", expectedRepoGen: 4, newRecord: { sourceSeq: 5 } }],
   })), "repo-generation");
-  expectRejected(applyCasPacket(handle, stages, packet(stages, handle, { owner: { isOwner: () => false } })), "owner-lost");
+  expectRejected(applyCasPacket(handle, stages, packet(stages, handle, { owner: casOwnerTokenForTest(() => false) })), "owner-lost");
 
   expect(applyCasPacket(handle, stages, packet(stages, handle, { sourceGlobalSeq: 5 })).status).toBe("accepted");
   // sourceGlobalSeq equal to lastSyncedSequence is explicitly allowed; strictly

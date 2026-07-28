@@ -40,17 +40,34 @@ test("the CAS owner token sees a stolen marker as ownership lost, synchronously"
 });
 
 test("the test-only mint seam is unreachable from production code", async () => {
-  // owner-token-testkit.ts exists so tests can construct a branded CAS token
-  // without a real lock; no production module may import it, or the brand's
-  // provenance guarantee would leak.
-  const srcRoot = path.resolve(import.meta.dir, "..", "..", "..");
-  const files = (await Array.fromAsync(fs.glob("**/*.ts", { cwd: srcRoot })))
-    .filter((file) => !file.endsWith(".test.ts") && !file.endsWith(".typecheck.ts")
-      && !file.endsWith("owner-token-testkit.ts"));
+  // The test-kit exists so tests can construct a branded CAS token without a
+  // real lock; no production module may reach it — by direct import, re-export,
+  // or dynamic import() — or the brand's provenance guarantee would leak. The
+  // scan covers every production root and every reach shape: it flags either the
+  // seam identifier or its module specifier appearing in a non-test file.
+  const repoRoot = path.resolve(import.meta.dir, "..", "..", "..", "..");
+  const patterns = [
+    "src/**/*.ts", "src/**/*.tsx",
+    "apps/**/*.ts", "apps/**/*.tsx",
+    "scripts/**/*.ts", "scripts/**/*.tsx",
+    "rig/**/*.ts", "rig/**/*.tsx",
+  ];
+  const skipDir = (p: string): boolean =>
+    p.includes("node_modules") || /(?:^|\/)(?:build|dist|\.svelte-kit)(?:\/|$)/.test(p);
+  const seen = new Set<string>();
+  for (const pattern of patterns) {
+    for await (const file of fs.glob(pattern, { cwd: repoRoot, exclude: skipDir })) seen.add(file);
+  }
+  const files = [...seen].filter((file) =>
+    !file.endsWith(".test.ts") && !file.endsWith(".test.tsx")
+    && !file.endsWith(".typecheck.ts")
+    && !file.endsWith("owner-token-testkit.ts"));
   const offenders: string[] = [];
   for (const file of files) {
-    const source = await fs.readFile(path.join(srcRoot, file), "utf8");
-    if (/(?:from|import)\s*["'][^"']*owner-token-testkit/.test(source)) offenders.push(file);
+    const source = await fs.readFile(path.join(repoRoot, file), "utf8");
+    if (source.includes("casOwnerTokenForTest") || source.includes("owner-token-testkit")) {
+      offenders.push(file);
+    }
   }
-  expect(offenders, "production code must not import the test-only CAS token seam").toEqual([]);
+  expect(offenders, "production code must not name, import, or re-export the test-only CAS token seam").toEqual([]);
 });
