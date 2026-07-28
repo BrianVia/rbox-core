@@ -416,6 +416,10 @@ export class GenerationOwnerScope {
 
   /** Only the workspace writer holding the workspace mutex may call this. */
   createOwner(seed: CandidateSeed = {}): { owner: GenerationOwnerLease; token: GenerationMutationToken } {
+    // Refused BEFORE any allocation: a candidate created here could never be
+    // torn down, because every terminal path is prohibited for the rest of the
+    // release callback. Nothing is allocated, so nothing can leak.
+    requireNoReleaseCycle("createOwner");
     if (this.closed) throw new Error("generation owner scope is closed");
     const entries = seed.entries ?? (seed.seedFrom ? resolvePublished(seed.seedFrom).entries : []);
     const ownerId = nextOwnerId++;
@@ -478,6 +482,10 @@ export async function withGenerationOwnerScope<T>(
   arena: EntryArena,
   body: (scope: GenerationOwnerScope) => Promise<T> | T,
 ): Promise<T> {
+  // Same reason as `createOwner`: this scope's mandatory `finally abortAll()`
+  // would run while the release callback is still in scope and be refused, so
+  // the scope is denied at entry rather than created and then stranded.
+  requireNoReleaseCycle("withGenerationOwnerScope");
   const scope = new GenerationOwnerScope(arena, SCOPE_KEY);
   try {
     return await body(scope);

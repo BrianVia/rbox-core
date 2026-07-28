@@ -275,3 +275,48 @@ test("out-of-order worker results with a stale expected version conflict inside 
   });
   expect(arena.stats().liveSlots).toBe(0);
 });
+
+test("REGRESSION (r4): a nested scope inside a release callback is refused before it allocates", async () => {
+  const arena = new EntryArena();
+  await withGenerationOwnerScope(arena, async (scope) => {
+    const { owner } = scope.createOwner({ entries: SEED });
+    const registration = await registerWorker(owner);
+    await registration.markRunning();
+    let nestedReached = false;
+    await expect(
+      registration.fail(async () => {
+        await Promise.resolve();
+        await withGenerationOwnerScope(arena, (nested) => {
+          nestedReached = true;
+          nested.createOwner({ entries: [entry("nested.txt")] });
+        });
+      }),
+    ).rejects.toThrow(OwnerReentrancyError);
+    // Nothing was allocated, so there is nothing that teardown could not reclaim.
+    expect(nestedReached).toBe(false);
+    expect(arena.stats()).toMatchObject({ liveSlots: 2, retains: 2 });
+    expect(registration.state).toBe("done");
+    expect(inspectOwner(owner).pendingResults).toBe(0);
+  });
+  expect(arena.stats()).toMatchObject({ liveSlots: 0, retains: 0 });
+});
+
+test("REGRESSION (r4): createOwner on the outer scope is refused inside a release callback", async () => {
+  const arena = new EntryArena();
+  await withGenerationOwnerScope(arena, async (scope) => {
+    const { owner } = scope.createOwner({ entries: SEED });
+    const registration = await registerWorker(owner);
+    await registration.markRunning();
+    const ownersBefore = scope.liveOwnerIds.length;
+    await expect(
+      registration.fail(async () => {
+        await Promise.resolve();
+        scope.createOwner({ entries: [entry("nested.txt")] });
+      }),
+    ).rejects.toThrow(OwnerReentrancyError);
+    expect(scope.liveOwnerIds).toHaveLength(ownersBefore);
+    expect(arena.stats()).toMatchObject({ liveSlots: 2, retains: 2 });
+    expect(inspectOwner(owner).pendingResults).toBe(0);
+  });
+  expect(arena.stats()).toMatchObject({ liveSlots: 0, retains: 0 });
+});
