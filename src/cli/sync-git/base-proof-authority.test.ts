@@ -169,7 +169,12 @@ test("the JSON CAS refuses a prooflessly changed BASE instead of defaulting to m
   }
 });
 
-test("published-intent recovery holds a proofless BASE move rather than minting migration authority", async () => {
+test("published-intent recovery adopts a proofless (legacy) journal's completed checkout", async () => {
+  // A published-checkout journal with no proof is a v1.7.24 legacy journal
+  // whose branch switch already committed to disk. The recovery is not an
+  // ordinary write — it lands what already happened — so it installs the
+  // intended base under the confined legacy-adoption capability rather than
+  // holding it. A journal that DOES carry a proof uses that proof instead.
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-base-proof-intent-"));
   try {
     await fs.mkdir(path.join(root, ".rbox", "state"), { recursive: true });
@@ -178,8 +183,34 @@ test("published-intent recovery holds a proofless BASE move rather than minting 
       record: { sourceSeq: 2, base: section(U) }, expectedRepoGen: 3, relPath: "r",
     });
     const record = recovered.state.repoRecords?.r;
-    expect(record?.base?.refs["refs/heads/main"]).toBe(T);
-    expect(record?.pending).toEqual(section(U));
+    expect(recovered.disposition).toBe("landed");
+    expect(record?.base?.refs["refs/heads/main"]).toBe(U);
+    expect(record?.pending).toBeUndefined();
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("only the confined recovery may install blanket authority through the JSON store", async () => {
+  // The capability is what separates the legacy recovery from an ordinary
+  // packet: applyStateSavePacket refuses a migration proof it is handed
+  // directly, because no ordinary caller can present the adoption capability.
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-base-proof-blanket-store-"));
+  try {
+    await fs.mkdir(path.join(root, ".rbox", "state"), { recursive: true });
+    await fs.writeFile(path.join(root, ".rbox", "state.json"), JSON.stringify(state()));
+    const packet = {
+      expectedStream: "s", expectedNonce: "0".repeat(32), sourceGlobalSeq: 2,
+      repos: [{ relPath: "r", expectedRepoGen: 3, newRecord: { sourceSeq: 2, base: section(U) },
+        baseProof: migrationRepoBaseProof() }],
+    } as const;
+    // No option, and a forged look-alike capability, are both refused — only the
+    // module-private object that isLegacyBaseAdoption compares by identity opens it.
+    await expect(applyStateSavePacket(root, packet)).rejects.toThrow(ProoflessBaseError);
+    await expect(applyStateSavePacket(root, packet, { legacyBaseAdoption: {} as never }))
+      .rejects.toThrow(ProoflessBaseError);
+    await expect(applyStateSavePacket(root, packet, { legacyBaseAdoption: Object.freeze({}) as never }))
+      .rejects.toThrow(ProoflessBaseError);
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
@@ -206,6 +237,10 @@ test("the mints' importers are a closed list", async () => {
   expect(importers.sort(), "migration BASE authority escaped its territory").toEqual([
     // The legacy JSON manifest adoption the blanket authority exists for.
     "cli/sync-state-model.ts",
+    // The confined legacy published-checkout recovery: mints the adoption proof.
+    "cli/sync-state.ts",
+    // The JSON store: validates the adoption capability before permitting it.
+    "cli/sync-state-store.ts",
     // Composer unit test: the one place migration composition semantics are asserted.
     "cli/sync-git/base-composer.test.ts",
     // This file, proving carry composes byte-identically to the old default.

@@ -53,3 +53,33 @@ export function adoptLegacyManifestRepoBase(candidate: GitSection | undefined): 
   };
 }
 
+
+/**
+ * The right to adopt blanket `migration` BASE authority through the JSON state
+ * store. A recovered v1.7.24 published-checkout journal carries no proof — it
+ * predates the proof system — yet its checkout already completed on disk, so the
+ * landing must INSTALL the intended base to match reality. That is legacy
+ * adoption, exactly what blanket authority is for; the store refuses the kind
+ * outright otherwise, so this capability is how the one legitimate JSON-store
+ * adoption path says so.
+ *
+ * Same shape as the importer capability: a module-private object reachable only
+ * inside `withLegacyBaseAdoption`'s callback and validated by `===`. Nothing
+ * mints, returns, or registers it, so there is no forgeable surface — an
+ * ordinary packet write cannot present it and stays refused.
+ */
+declare const legacyBaseAdoptionBrand: unique symbol;
+export interface LegacyBaseAdoptionCapability {
+  readonly [legacyBaseAdoptionBrand]: true;
+}
+
+const LEGACY_BASE_ADOPTION = Object.freeze({}) as unknown as LegacyBaseAdoptionCapability;
+
+export function withLegacyBaseAdoption<T>(run: (capability: LegacyBaseAdoptionCapability) => T): T {
+  return run(LEGACY_BASE_ADOPTION);
+}
+
+/** True only for the one module-private object, compared by identity. */
+export function isLegacyBaseAdoption(value: unknown): value is LegacyBaseAdoptionCapability {
+  return value === LEGACY_BASE_ADOPTION;
+}

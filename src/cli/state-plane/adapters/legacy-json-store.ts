@@ -8,6 +8,7 @@ import { assertProtocolLockHeld } from "../../../engine/git/protocol-locks.js";
 import { sanitizeGitSectionForPersistence } from "../../../engine/git/config-sync.js";
 import { composeRepoBase } from "../../sync-git/base-composer.js";
 import { requireRepoBaseProof } from "../../sync-git/base-proof-selection.js";
+import { isLegacyBaseAdoption } from "../migration/base-proof.js";
 import {
   acquireWorkspaceSyncMutex,
   assertSyncMutex,
@@ -145,6 +146,9 @@ export async function applyStateSavePacket(root: string, packet: StateSavePacket
     }
 
     const records = repoRecordsForState(current);
+    // Only the confined legacy published-checkout recovery may install blanket
+    // authority; everything else is refused by requireRepoBaseProof below.
+    const permitBlanket = isLegacyBaseAdoption(options.legacyBaseAdoption);
     for (const transition of packet.repos) {
       if ((records[transition.relPath]?.repoGen ?? 0) !== transition.expectedRepoGen) {
         return { status: "rejected", reason: "repo-generation", state: current };
@@ -158,7 +162,7 @@ export async function applyStateSavePacket(root: string, packet: StateSavePacket
         : sanitizeGitSectionForPersistence(transition.newRecord.base);
       const previousValue = { base: sanitizedPreviousBase, branchBaseOrigins: previous.branchBaseOrigins };
       const candidateValue = { base: sanitizedCandidateBase, branchBaseOrigins: transition.newRecord.branchBaseOrigins };
-      const proof = requireRepoBaseProof(transition.relPath, transition.baseProof, previousValue, candidateValue);
+      const proof = requireRepoBaseProof(transition.relPath, transition.baseProof, previousValue, candidateValue, permitBlanket);
       const composed = composeRepoBase(
         previousValue,
         candidateValue,
