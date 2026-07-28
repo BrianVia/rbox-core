@@ -10,6 +10,7 @@
  */
 import crypto from "node:crypto";
 import path from "node:path";
+import { parseScopeFlag, validateScopePrefixes } from "./scope/scope-record.js";
 
 /** The per-machine credential shape we care about (subset of credentials.ts). */
 export interface CredsView {
@@ -85,6 +86,9 @@ export interface InitPlan {
   syncGit: boolean;
   /** Design 72 opt-in. Defaults false so new scripted workspaces keep current behavior. */
   respectGitignore: boolean;
+  /** Design 212: sync only these workspace folders on this machine. Present ⇒ the
+   *  binding is structurally receive-only. Absent = the whole workspace. */
+  scope?: string[];
 }
 
 export interface InitError {
@@ -175,6 +179,25 @@ export function resolveInitPlan(input: InitInput): InitPlan | InitError {
   const firstSync: InitPlan["firstSync"] =
     flags["no-sync"] === TRUE ? "none" : workspace.kind === "new" ? "push" : flags["pull-only"] === TRUE ? "pull" : "sync";
 
+  // Design 212 §2: a scoped binding must be pull-only. Publishing from a partial
+  // tree would ask the differ to read every folder this machine does not have as
+  // deleted, so the two flags are one decision, refused at bind time.
+  let scope: string[] | undefined;
+  if (flags.scope !== undefined) {
+    if (firstSync !== "pull") {
+      return {
+        code: "scope_requires_pull_only",
+        message: "syncing only some folders is one-way for now: add --pull-only.",
+        headlessHint: `rbox init --workspace <id> --scope ${flags.scope} --pull-only`,
+      };
+    }
+    const validated = validateScopePrefixes(parseScopeFlag(flags.scope));
+    if (!validated.ok) {
+      return { code: "invalid_scope", message: validated.error, headlessHint: "rbox init --workspace <id> --scope Personal/repo-A --pull-only" };
+    }
+    scope = validated.prefixes;
+  }
+
   return {
     auth,
     workspace,
@@ -183,5 +206,6 @@ export function resolveInitPlan(input: InitInput): InitPlan | InitError {
     firstSync,
     syncGit: flags.git !== "false",
     respectGitignore: flags["respect-gitignore"] === "true",
+    ...(scope === undefined ? {} : { scope }),
   };
 }

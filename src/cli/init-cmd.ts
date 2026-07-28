@@ -467,6 +467,8 @@ async function executeInitPlan(
       // Cache the workspace name LOCALLY so `rbox status` shows it with no round-trip.
       // Present on CREATE (the name just typed) and on TRACK-EXISTING (the picked name).
       ...(plan.workspace.name ? { name: plan.workspace.name } : {}),
+      // Design 212: scope is a property of THIS binding, never of the workspace.
+      ...(plan.scope ? { scope: plan.scope, scopeGeneration: 1 } : {}),
     };
     if (opts.adoption) {
       if (plan.workspace.kind !== "join" || plan.firstSync !== "sync") throw new Error("invalid adoption execution route");
@@ -496,6 +498,7 @@ async function executeInitPlan(
       remoteWorkspaceId: cfg.remoteWorkspaceId,
       ...(cfg.name ? { name: cfg.name } : {}),
       ...(creds.accountId ? { accountId: creds.accountId } : {}),
+      ...(cfg.scope ? { scope: cfg.scope } : {}),
     });
 
     // 4. This workspace is end-to-end encrypted: the server stores only ciphertext.

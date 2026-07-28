@@ -344,6 +344,8 @@ export async function main(deps: MainDispatchDeps = {}): Promise<void> {
     }
     case "push": {
       const root = await resolveRoot(positional[0]);
+      // Design 212 §3.1b layer 2: refuse before the scan, not after it.
+      await (await import("./scope/binding-scope.js")).assertCommandAllowedOnScopedBinding(root, "push");
       const sp = spinner("pushing");
       try {
         await withWorkspaceSyncMutex(root, async (syncMutex) => {
@@ -401,6 +403,12 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
         pullOnly: flags["pull-only"] === "true",
         verbose: flags["verbose"] === "true",
       });
+      break;
+    }
+    case "scope": {
+      const root = await resolveRoot(undefined);
+      const { scopeCmd } = await import("./scope/scope-cmd.js");
+      await scopeCmd(root, positional[0], positional.slice(1), { json: jsonMode });
       break;
     }
     case "export": {

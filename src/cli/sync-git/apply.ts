@@ -11,6 +11,7 @@ import { configLaneState, inputRecord, type ConfigLaneState, type GitDeferralUpd
 import { checkoutJournalBinding, deriveBaseIndexProjection, followDivergedRepo, FollowCrashInjectedError, quarantineUnboundFollowJournal, recoverAndLandFollowJournal, type FollowCrashPoint, type FollowIntended, type FollowProgress } from "./follow.js";
 import { checkoutLabel, repoDirOf, localDivergedFromBase, narrowerScope, projectedKey, emptyToUndef, errMsg, chainLock, gitApplyMutationKey, nestedRepoChains, gitApplyConcurrency, gitFollowEnabled, gitIncomingKey, nextDeferral, repoEquivalenceWarningLogged, sectionOpState } from "./shared.js";
 import { executeRemoteRepositoryDeletion, planRemoteRepositoryDeletion, sweepRemovedRepoSkeleton, type RemoteRepositoryDeletionEffects, type RemoteRepositoryDeletionIdentity, type RepoSkeletonSweepOptions } from "./remote-repository-deletion.js";
+import type { ScopeProjection } from "../scope/projection.js";
 import { configReceiver } from "./config-lane.js";
 import { ConfigLaneLedger, applyReceivedGitConfig, classifyIncomingConfigSanitation, planReceivedGitConfigApply, planReceivedGitConfigBaseline, planReceivedGitConfigTarget, type GitConfigExecutor, type ReceivedGitConfigIdentity, type ReceivedGitConfigPlan } from "./received-git-config.js";
 import { prepareFollowerBranchProtocol } from "./follower-protocol.js";
@@ -318,6 +319,11 @@ opts: {
     mutationBoundary?: MutationBoundary;
     /** Tests only: observes/injects the anchored empty-directory removal call. */
     sweepRmdir?: RepoSkeletonSweepOptions["rmdir"];
+    /** Design 212: the shared pre-probe scope projection. Present ⇒ only `IN` repos
+     * are visited at all. Out-of-scope and boundary-crossing keys never reach key
+     * construction, collision analysis, disk probing, journal recovery, or config —
+     * their BASE and every durable sidecar lane stay exactly as they were. */
+    scope?: ScopeProjection;
   } = {}
 ): Promise<GitPullOutcome> {
   const sanitizeSections = (sections: Record<string, GitSection> | undefined): Record<string, GitSection> =>
@@ -355,7 +361,14 @@ opts: {
     gitApplyMetrics: finishGitApplyMetrics(metrics, commonDirGroups),
   });
   if (!cfg.syncGit) return pack();
-  const keys = [...new Set([...Object.keys(remote.gitRepos ?? {}), ...Object.keys(baseRepos), ...Object.keys(pending)])].sort();
+  const allKeys = [...new Set([...Object.keys(remote.gitRepos ?? {}), ...Object.keys(baseRepos), ...Object.keys(pending)])].sort();
+  const keys = opts.scope ? opts.scope.probeKeys(allKeys) : allKeys;
+  if (opts.scope) {
+    for (const carried of opts.scope.carriedKeys(allKeys)) {
+      if (opts.scope.classifyRepo(carried) !== "straddle") continue;
+      glog(`git-sync WARNING: ${carried} crosses the folders this machine syncs — leaving it untouched until the scope covers the whole repository`);
+    }
+  }
   const lazyProbes = process.env.RBOX_GIT_APPLY_LAZY !== "0";
   // Logical repo keys must remain one-to-one with receiver targets even if this
   // state later lands on an NFC/case-aliasing filesystem.
@@ -779,7 +792,12 @@ opts: {
     // worktree→standalone→worktree round-trips converge without apply ping-pong.
     const cmpScope = narrowerScope(remoteSec.refScope, baseSec?.refScope);
     const remoteChanged = projectedKey(remoteSec, cmpScope) !== (baseSec ? projectedKey(baseSec, cmpScope) : "none");
-    if (!remoteChanged && !pend && !resolutionChanged && !checkpointReproof && !(configDue && configTarget?.fresh)) {
+    // On a scoped binding an absent repo may have an already-equal BASE — carried
+    // from before the folder left the scope. Taking the unchanged shortcut there
+    // would advance nothing and materialize nothing, so `scope add` would report
+    // CLEAN forever without ever putting the repository on disk (design 212 §3.2).
+    const materializationOwed = opts.scope !== undefined && dotGit === undefined;
+    if (!materializationOwed && !remoteChanged && !pend && !resolutionChanged && !checkpointReproof && !(configDue && configTarget?.fresh)) {
       if (!(await applyConfigOnly())) return { result: "deferred", commonDirGroup };
       applied[rel] = remoteSec; // unchanged → base advances (possibly across scopes)
       clearAttempt(rel);

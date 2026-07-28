@@ -26,6 +26,7 @@ import { readAmbientDaemonStatusRecord, type AmbientDaemonStatusRecord, type Amb
 import { AMBIENT_STATUS_STALE_MS } from "./populate-marker.js";
 import { projectGitDeferralRepos, type GitDeferralRepoProjection } from "./status-view.js";
 import type { DoctorCheck, DoctorChecks } from "./doctor-cmd.js";
+import { scopeProjectionFor } from "./scope/projection.js";
 
 /** One point-in-time answer to "is a daemon running for THIS workspace root?".
  * Liveness is root-scoped — the daemon's own command line must name this root —
@@ -117,8 +118,11 @@ async function readDeferrals(root: string, now: number): Promise<GitDeferralRepo
     if (!state) return [];
     if (state.stream !== undefined && state.stream !== syncStreamId(cfg)) return [];
     const records = repoRecordsForState(state);
+    // Design 212 §3.2: doctor consumes the same projection. An out-of-scope repo's
+    // deferral is not this machine's problem to report.
+    const scope = await scopeProjectionFor(root, Object.keys(records));
     return projectGitDeferralRepos(
-      Object.entries(records).flatMap(([repo, record]) =>
+      Object.entries(records).filter(([repo]) => scope === undefined || scope.classifyRepo(repo) === "in").flatMap(([repo, record]) =>
         Object.values(record.deferrals ?? {}).flatMap((deferral) => (deferral ? [{ repo, deferral, record }] : []))),
       now,
     );

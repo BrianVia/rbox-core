@@ -14,6 +14,7 @@ import {
 import type { StatusDeferralDisplayDetails } from "./status-maintenance.js";
 import type { GitDivergenceRepoHint, GitDivergenceStatus } from "./sync-git.js";
 import { RBOX_VERSION } from "./version.js";
+import { scopeProjectionFor } from "./scope/projection.js";
 import type {
   LocalGitDeferral,
   StatusCacheHint,
@@ -303,11 +304,16 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
       ageMs: trusted.ageMs,
     };
   } else if (populate) {
-    const conflictSnapshots = await port.readConflictSnapshotStatus(root, [
+    const populateKeys = [
       ...Object.keys(state.lastSyncedManifest.gitRepos ?? {}),
       ...Object.keys(state.gitPendingRemote ?? {}),
       ...Object.keys(repoRecordsForState(state)),
-    ]);
+    ];
+    const populateScope = await scopeProjectionFor(root, populateKeys);
+    const conflictSnapshots = await port.readConflictSnapshotStatus(
+      root,
+      populateScope ? populateScope.probeKeys(populateKeys) : populateKeys,
+    );
     counts = {
       added: 0,
       changed: 0,

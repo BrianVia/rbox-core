@@ -29,6 +29,7 @@ import {
 import { carriedLineageProof, recordOriginLineage, type RepoBaseProof } from "../sync-git/base-composer.js";
 import { recordGitCaptureObservation } from "../sync-git/git-capture-observation.js";
 import type { GitResolutionRider } from "../sync-git/resolution-intent.js";
+import { assertMayPublish } from "../scope/binding-scope.js";
 import { assertSyncMutex, workspaceSyncMutexDegraded } from "../sync-mutex.js";
 import { changedSidecarRepoKeys, inputRecord, observedRepoKeys, saveStateSource } from "../sync-state.js";
 import { beginFirstPublishTiming, finishFirstPublishStats, firstPublishMeasurementLive, firstPublishMeasurementToken, firstPublishTiming, formatFirstPublishStats } from "../upload-lane-timing.js";
@@ -296,6 +297,12 @@ async function pushManifestInner(
   options: PushManifestOptions = {}
 ): Promise<PushResult> {
   const { purgeIgnored = false, repair, resolution } = options;
+  // Design 212 §3.1b layer 1. This is the shared publication boundary: ignore purge,
+  // git keep-mine, recover's repair-publish and chain repair all arrive here. It must
+  // stay the FIRST statement — ahead of resolution-receipt reconciliation, the scan,
+  // git planning, upload and repair — because a scoped binding holds only part of the
+  // tree, and every one of those steps reads that partial tree as the whole truth.
+  await assertMayPublish(root, cfg);
   if (deps.syncMutex) assertSyncMutex(deps.syncMutex, root);
   const report = deps.report ?? PhaseReport.disabled("push");
   deps = withReportScanStats(deps, report);
