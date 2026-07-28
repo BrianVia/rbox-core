@@ -1,13 +1,19 @@
 # 163 — The state plane moves to SQLite
 
-Status: **v10 — RATIFIED 2026-07-28 as implementation authority for B0 → U5.**
-Codex ALIGNED at tip `1a42a4f0` after the R4 round (two opus lanes + codex
-serial ×5); founder decisions of 2026-07-28 recorded in their own section
-(backend-first hybrid, B0 gate, `1.11.0` floor, kill-criterion numbers). Two
-founder inputs remain owed (enumerated below) — the first, the frozen machine
-profile, blocks U5, not B0/U0/U1. Implementation may begin with `B0`.
+Status: **v11 — amendment to the ratified v10 (founder requirement reductions
+2026-07-28), changed sections pending codex re-confirmation.**
+V11 **deletes** requirements and adds none, so v10 remains implementation
+authority for B0 → U5 everywhere v11 does not touch. Only the changed sections
+are re-opened: § "Founder requirement reductions ratified 2026-07-28 (v11)",
+§ 1a closure part two and the residue passage, the M0 admission predicate
+(bullet 5), the `F1`–`F6` framing, `B0`/`U3` exit criteria, and the open-inputs
+list. **Exactly one founder input remains owed: the frozen machine profile**,
+which blocks U5, not B0/U0/U1. `B0` is merged (#539) and its shipped code
+requirements are unchanged by this amendment.
 
-Prior status for the record: V10 is a *round-six single-item
+Prior status for the record: v10 was **RATIFIED 2026-07-28 as implementation
+authority for B0 → U5**; codex ALIGNED at tip `1a42a4f0` after the R4 round
+(two opus lanes + codex serial ×5). V10 is a *round-six single-item
 fold*: the R4-v9 serial review verified both v9 closures and the reserve byte
 math, then falsified v9's blast-radius bound on the named residue by executing
 the merge consumer — `reconcile` classifies `local == stale base` as an
@@ -88,25 +94,23 @@ terminal-control-last, 2.0-only confinement) is unchanged.
 It is not implementation authority until the
 orchestrator ratifies it.
 
-## OPEN INPUTS OWED BY THE FOUNDER (v8 — there are exactly two)
+## OPEN INPUTS OWED BY THE FOUNDER (v11 — there is exactly one)
 
-V7 said "exactly one remains" and that was false: the kill-threshold protocol
-already carried a second one, marked **OWED** and **blocking** in its own
-section (§ "Measurement protocol for those numbers"), while this list did not
-name it. Both are enumerated here, and this list is the authority on how many
-there are.
+V8 said "exactly two" and that was true at v8. **V11 resolves the first of
+them**, so this list is now one item long; this list remains the authority on
+how many there are.
 
-**1. Do the four external users take the one-way migration before the latency and
-memory payoff lands?** Backend-first ships 2.0 — and therefore the irreversible
-`Q` flip — to all four external users at `U3`, while the wins they would
-actually notice (trusted-status latency, daemon RSS) arrive across `U4a–U4f`
-afterwards. The flip's own payoff is real but narrower: O(dirty-row) authority
-writes and structurally impossible reset admission errors. It is gated by the
-U3 no-regression criterion (the flip may not ship if trusted status or daemon
-RSS is worse than the 1.x baseline) and recoverable only by re-adoption, so the
-downside is bounded but not zero. This is a judgment about four real people —
-two of them non-technical, one of them paying — not a technical question, and
-the fold cannot answer it.
+**1. RESOLVED by founder decision 5 (2026-07-28) — do the four external users
+take the one-way migration before the payoff lands?** The question asked
+whether it was acceptable to *push* an irreversible flip at users on the
+project's schedule while the wins they would notice arrive later. Decision 5
+removes the push: migration is explicit-and-exclusive, so a user takes it
+**inside an upgrade they chose to run** (`rbox upgrade`) or by typing
+`rbox migrate`. **No part of the question survives as an open input.** What
+survives is not a question but two already-ratified obligations that decision 5
+does not touch: the U3 no-regression gate (the flip may not ship if trusted
+status or daemon RSS is worse than the 1.x baseline) and the plain-English halt
+copy for two non-technical users. The founder does not owe an answer here.
 
 **2. Which host is the frozen machine profile for every U5 ship number?**
 All ratified kill-criterion thresholds (trusted status p50/p95, daemon RSS) are
@@ -118,8 +122,8 @@ statement of what must be recorded lives in § "Measurement protocol for those
 numbers". Naming it here is not a duplicate requirement, it is the correction
 of v7's count.
 
-**Everything else in this document is either closed or ratified; these two are
-the only inputs still owed.**
+**Everything else in this document is either closed or ratified; the frozen
+machine profile is the only input still owed.**
 
 ## Founder decisions ratified 2026-07-28
 
@@ -152,6 +156,83 @@ Recorded here as ratified, not provisional. Each is normative where it lives.
    (warmup/sampling, "ordinary use", "unexplained halt", a four-week bake, one
    remediation cycle) in the U5 section. **One input is still owed there and is
    flagged as blocking before U5 begins: the frozen machine profile.**
+
+## Founder requirement reductions ratified 2026-07-28 (v11)
+
+Two decisions taken after v10 was ratified. Both **delete** requirements; the
+amendment adds no new mechanism, no new artifact, and no new file. Where a
+mechanism below is retained, it is retained *unchanged* — v11 changes what the
+document claims the mechanism is load-bearing for, not what it does.
+
+5. **Migration is explicit-and-exclusive — the "parked car" rule. ADOPTED.**
+   The founder's framing: you do not rebuild the engine while the car is being
+   driven; you migrate a parked car. Normative, and this rule supersedes every
+   earlier sentence that let a migration begin opportunistically:
+   **`MIGRATION-EXCLUSIVITY-v11` — a migration may begin only inside an
+   exclusivity window in which no other rbox actor runs against the workspace,
+   and there are exactly two admitted ways to be inside one:**
+   - **(a) riding `rbox upgrade`.** The managed upgrade already stops daemons
+     and waits for them: `restartDaemonsAfterUpgrade` calls `await stop(root)`
+     (`src/cli/upgrade-cmd.ts:154`) and `stopDaemon`
+     (`src/cli/daemon/process-control.ts:445`) sends `SIGTERM` and blocks on
+     `waitForExit` until the named process is actually gone, removing the
+     pidfile only then. **Exact semantics, not rounded off:** the loop is *per
+     workspace* and restarts each one (`resumeDesiredDaemon`,
+     `src/cli/upgrade-cmd.ts:160`) before advancing to the next entry, so the
+     window is "this workspace has no daemon", not "the machine is quiet", and
+     it is the interval between that workspace's `stop` returning and its
+     `resumeDesiredDaemon`. A migration runs inside that interval or not at all.
+   - **(b) an explicit foreground `rbox migrate`.** A command the user types,
+     in a workspace whose daemon is not running, that does the whole M0–M7
+     transaction in the foreground with progress on stdout and a
+     non-interactive twin. Nothing else invokes it.
+
+   **Deleted by this rule:** ambient migration. No daemon boot path, no
+   `rbox status`, no incidental sync, and no first-2.0-launch hook may start a
+   migration. "The first 2.0 boot migrates the workspace" is no longer a thing
+   this design does.
+
+   **What enforces the window, and what happens when it cannot be
+   guaranteed.** Enforcement is a refusal, not a lock upgrade: M0 admits only
+   when its caller is one of the two admitted entry points *and* M0
+   independently confirms, under the complete lock set it already takes, that
+   no daemon is live for this workspace (the existing daemon pid-record and
+   ownership evidence — `isDaemonRunning`/`parseDaemonPid` — plus the bounded
+   wait already in the M0 predicate). If either half is unproven, migration
+   **refuses** with a typed `migration-not-exclusive` refusal: no control is
+   published, no artifact is created, JSON stays authoritative, and the remedy
+   printed is the one action `rbox migrate` in a quiet workspace. Fail-closed
+   is the whole enforcement story; there is no degraded "migrate anyway" mode.
+
+   **Consequence — the concurrent-legacy-writer threat model collapses.** The
+   entire § 1a analysis was about a legacy writer racing a *live* migration;
+   exclusivity excludes that scenario at the front door instead of fencing it
+   at the back. **Deleted as a U3 requirement: the M0 paired-interval
+   live-writer sampling.** Outcomes (i)/(ii)/ABA and the `check → rename`
+   microwindow analysis become **defense-in-depth against an excluded
+   scenario** rather than the load-bearing ratifiability argument.
+
+   **What REMAINS, unweakened:** `Q` recognition and the `B0` write-side
+   barrier (exclusivity binds what runs *during* a migration and says nothing
+   about a binary started **later**, which must still refuse); the
+   `last-writer.json` witness sidecar (cheap, shipped, and a statement about
+   history rather than concurrency); the 1 MiB reserve (it is about ENOSPC, not
+   writers); `F1`–`F6` as regression nets, reframed from "named residual" to
+   "excluded by exclusivity, tested anyway"; and every M0–M7
+   crash/resume/halt property — a parked car can still stall, and nothing in the
+   durability machine depended on the writer race. **B0's shipped code (#539) is
+   NOT retroactively deleted**; its witness and refusal machinery is now
+   defense-in-depth, which is a fine thing for it to be.
+6. **The U3 drain gate reads existing `rbox-admin` version telemetry — no new
+   infrastructure. RATIFIED.** Founder: "I already have version telemetry in my
+   rbox-admin repo." The `telemetry-verified drain` bar is **unchanged**; only
+   its implementation cost changes, from "build a fleet version view" to zero.
+   Issue #540 (build drain telemetry) was closed as **invalid** on that basis.
+   Fleet picture recorded 2026-07-28, so the gate is read against a known
+   population rather than an abstract one: **1 external user on 1.6** (a
+   personal contact, to be nudged directly), **2 external users on 1.9.x who
+   upgrade frequently**, and the **founder fleet on dev builds**. The drain is
+   a handful of named humans, not a statistical exercise.
 
 Field-claim corrections from r1 are folded below;
 the steady-state write churn was root-caused and fixed separately by #349
@@ -241,7 +322,10 @@ schema sketch.
 
 ### Migration
 
-Migration is a one-way, fenced authority transaction, not a DB-presence test.
+Migration is a one-way, fenced authority transaction, not a DB-presence test,
+and since v11 it is **explicit and exclusive**: it runs only inside an
+`rbox upgrade` stop window or an explicit foreground `rbox migrate`, never
+ambiently and never on boot (`MIGRATION-EXCLUSIVITY-v11`).
 It builds a sibling DB, writes the completion witness in the same transaction
 as the imported rows, verifies a full semantic round trip, publishes the DB,
 then atomically replaces the legacy state path with a durable old-reader
@@ -2140,17 +2224,12 @@ clobber each other's `state.json` today.
    rename.
 
    **V7 concluded from that pairing that "there is no third case". That was
-   false**, and the error is worth stating precisely because it is the shape of
-   error this whole section exists to prevent. V7's argument rested on
-   "degradation is a filesystem-capability property, so a workspace degraded for
-   one process is degraded for all of them." The premise does not hold as
-   written: `writeWholeStateUnsafe` is reached by **two** disjunctive
-   conditions, `unsupported` locking *and* `forceLegacy`, and nothing made the
-   second one a property of the filesystem. A writer can therefore be inside an
-   unlocked check-then-rename window **on a perfectly lockable filesystem** —
-   which is exactly the workspace M0 admits. Its window can have opened before
-   `Q` existed and before M0 ran, and it remains unlocked across its own
-   check→rename. That is the third case.
+   false.** V7 rested on "degradation is a filesystem-capability property", but
+   `writeWholeStateUnsafe` is reached by **two** disjunctive conditions,
+   `unsupported` locking *and* `forceLegacy`, and nothing made the second a
+   property of the filesystem. A writer can therefore be inside an unlocked
+   check-then-rename window **on a perfectly lockable filesystem** — exactly the
+   workspace M0 admits. That is the third case.
 
    *Closure, part one — collapse every closable instance of it into case 1.*
    Normative for `B0`: the unlocked publication path may be entered **only**
@@ -2164,140 +2243,62 @@ clobber each other's `state.json` today.
    barrier read through the rename, and M6's rename holds the same lock. The
    third case has no B0-era instance.
 
-   *Closure, part two — M0 must additionally require no live legacy writer at
-   all.* Mutual exclusion only binds writers that take the lock, so M0's
-   quiescence predicate (bullet 3 below) is extended with a **writer-liveness
-   observation** rather than assumed away: under the complete lock set, M0
-   samples the live `.rbox/state.json` content witness (§ 1b: body hash, size,
-   mtime, `dev`/`ino`) and the `last-writer.json` sidecar together, waits a
-   bounded interval, and re-samples. Any change to the state file that the
-   sidecar does not account for proves a writer that publishes without
-   maintaining the witness — i.e. a non-B0 writer — is live, and M0 refuses with
-   a typed `legacy-writer-live` refusal. The same paired sample is re-taken
-   immediately before the M6 rename, so a writer that surfaces mid-migration is
-   caught at the last fence rather than after the flip.
+   *Closure, part two — SUPERSEDED BY EXCLUSIVITY (v11). The paired-interval
+   live-writer sampling is DELETED as a U3 requirement.* V8 extended M0's
+   quiescence predicate with a **writer-liveness observation**: sample the live
+   `state.json` five-field content witness and the `last-writer.json` sidecar
+   together, wait a bounded interval, re-sample, and refuse with
+   `legacy-writer-live` on any state change the sidecar does not account for.
+   That mechanism existed to detect a legacy writer running *concurrently with
+   a live migration*. Founder decision 5 (`MIGRATION-EXCLUSIVITY-v11`) excludes
+   that scenario at the front door: a migration begins only inside an
+   `rbox upgrade` stop window or an explicit foreground `rbox migrate`, and M0
+   refuses with `migration-not-exclusive` when the window is unproven. **The U3
+   implementation need not implement the paired-interval sampling.** Exclusivity
+   replaces it; a timing probe is not a substitute for the workspace being
+   parked, and running both would have been two gates where one is decisive.
 
-   *Closure, part three (v9) — the paired sample is not atomic with the rename,
-   so bind the last instant to content instead.* V8 asserted that re-taking the
-   paired sample "immediately before the M6 rename" closed everything except a
-   writer that publishes after `Q`. It does not. Sampling and renaming are two
-   separate syscall sequences, and an unlocked pre-B0 writer whose
-   `fs.rename` (`fsutil.ts:83`) lands **between** them publishes a fresh legacy
-   JSON that M6 then immediately renames `Q` over. The migrated database and the
-   M2 backups both descend from the *older* source; the fresh document is gone.
-   That is a **silent lost write**, and it is a distinct outcome from the
-   post-`Q` destruction v8 named — v8 had no name for it at all.
+   *Closure, part three — RETAINED AS DEFENSE-IN-DEPTH, no longer load-bearing
+   (v11).* V9 made the body-hash re-verification of `.rbox/state.json` against
+   the M3-imported source digest the **immediately preceding operation** to
+   M6's `fs.rename`, under the `stateLockPath` M6 already holds; a mismatch is
+   a typed `legacy-write-detected` disposition that does **not** rename, enters
+   C1 source-change retirement, and leaves JSON authoritative. That check costs
+   one hash of a file M6 has already read and it stays exactly as specified —
+   but it now guards a scenario exclusivity has excluded, so it is a
+   belt-and-braces assertion rather than the thing that makes the flip safe.
+   V9's supporting argument (that sampling and renaming are two syscall
+   sequences and no property of `writeFileAtomic`'s single `beforeRename` seam
+   can fuse them) remains true and is not restated at length here; the
+   `check → rename` microwindow it bounds is no longer a live threat.
 
-   Normative for M6: the M6 exact-sibling step already rehashes and
-   identity-revalidates the live JSON before it renames (§ "M6 — flip
-   authority"), but v8 placed that rehash at the *start* of the step, with the
-   sibling fsync, hashing, and identity-bracketing work between it and the
-   rename. **The body-hash re-verification of `.rbox/state.json` against the
-   M3-imported source digest is now the last operation M6 performs before
-   `fs.rename`** — same lock, same held `stateLockPath`, nothing between the
-   comparison and the rename but the rename itself. A mismatch is a typed
-   `legacy-write-detected` disposition: M6 does **not** rename, enters C1 source-
-   change retirement, and leaves JSON authoritative — which is exactly the
-   fencing promise, not a new one. This does not make check and rename atomic
-   (`writeFileAtomic` exposes one abort seam, `beforeRename`, and no property of
-   it can fuse a `stat`+`read`+`hash` of a *different* file into the rename
-   syscall — the same argument v7 used to reject the check-then-rename fix).
-   What it does is shrink the exposure from the whole bounded sampling interval
-   to the two instants `check → rename`.
+   *The residual outcomes — EXCLUDED BY EXCLUSIVITY, documented and tested
+   anyway (v11).* V8/v9/v10 named two outcomes of an unlocked pre-`1.11.0`
+   writer whose `fs.rename` lands near M6's — **(i)** post-`Q` destruction,
+   detectable as `legacy-overwrite-after-Q` (`F3`); **(ii)** the pre-`Q` lost
+   write in the `check → rename` microwindow, unrecoverable and silent (`F5`) —
+   plus v10's **ABA** consequence of (ii), where `reconcile`
+   (`src/engine/reconcile.ts:60`) classifies `local == stale base` as an
+   ordinary remote write and `apply` (`src/engine/apply.ts:287`) silently
+   overwrites a user's intentional revert (`F6`). Each is stated in full at its
+   fixture below and is **not** restated here. All three are **reclassified
+   from "named residual accepted at ratification" to "excluded scenario,
+   asserted by fixture"**. All three require, together, a **pre-`1.11.0`
+   binary**, the `forceLegacy`-or-`unsupported` unlocked publication path
+   (`writeWholeStateUnsafe`, `sync-state-store.ts:338-370`, which takes no lock;
+   the ordinary CAS path holds the state lock even pre-B0 at `:120-135`), and a
+   rename landing in one of the two windows. Under
+   `MIGRATION-EXCLUSIVITY-v11` no such binary is running against the workspace,
+   because nothing is: the workspace is parked.
 
-   *The irreducible residue, both outcomes, with the preconditions that are
-   actually required.* V8's precondition list was wrong in two ways and is
-   restated here without the falsified claims. V8 asserted the writer must
-   "complete its state read before M0 begins" and that its read→rename window
-   must "span the entire M0–M6 migration". Neither is required. `saveStateSource`
-   reaches the unsafe writer at `sync-state.ts:348-350`, and its production
-   callers separate their state *read* from that *write* by the entire body of a
-   sync: push loads state at `push.ts:476` and does not save until
-   `push.ts:532-540`, with the whole remote negotiation in between; pull loads at
-   `pull.ts:233` and saves at `pull.ts:414-446`, with git apply in between. A
-   pre-B0 writer that begins *after* M0 and publishes *during* the migration is
-   therefore entirely ordinary, and the read→rename window needs to span nothing
-   but its own sync. What is actually required is only:
-   - **a pre-`1.11.0` binary.** A B0-or-later binary holds `stateLockPath`
-     continuously across its check→rename (closure part one), and M6 holds that
-     same lock, so no B0-era writer can rename into either window. Pre-B0,
-     `writeWholeStateUnsafe` (`sync-state-store.ts:338-370`) acquires no lock at
-     all — it is `writeFileAtomic` plus `fsyncDirectory`, nothing else.
-   - **the `forceLegacy`-or-`unsupported` path specifically.** Pre-B0 that means
-     `workspaceSyncMutexDegraded` at `pull.ts:446` / `push.ts:540`, `:580`,
-     `:895`, or the fresh-init `saveState`. The ordinary CAS path holds the state
-     lock even pre-B0 (`sync-state-store.ts:120-135`), so the common writer is
-     excluded with no B0 change. Note this path is reachable **on a lockable
-     filesystem** — restricting it to `unsupported` locking is a B0 change and by
-     construction the residual binary does not have it.
-   - **its rename landing inside one of two specific windows.** Everything else
-     is caught: a publication before M0's paired sample fails the witness floor,
-     and a publication anywhere inside the bounded interval fails
-     `legacy-writer-live`.
-
-   The two windows give the two outcomes, and both are now named:
-   - **(i) post-`Q` destruction.** The rename lands strictly *after* M6's rename.
-     `Q` is destroyed and a legacy JSON is re-elected. This is **detectable after
-     the fact**: the resulting `.rbox/state.json` has a body hash matching no
-     M2-recorded source digest and a stale `last-writer.json`, which the doctor
-     reports as `legacy-overwrite-after-Q` with the immutable hash-addressed
-     backup as recovery evidence. Fixture `F3` asserts it as a known outcome.
-   - **(ii) pre-`Q` lost write.** The rename lands in the `check → rename`
-     microwindow above. M6's rename installs `Q`; the fresh legacy document is
-     displaced and its contents are lost. Fixture `F5` asserts it as a known
-     outcome.
-
-   *What is recoverable in outcome (ii), argued from the primitive rather than
-   asserted.* The honest answer is **nothing on disk, and M6 cannot be made to
-   preserve it.** `writeFileAtomic` publishes with a single `fs.rename`
-   (`fsutil.ts:83`); M6's own rename then replaces that inode, its link count
-   reaches zero, and no process holds an open descriptor on it, so the kernel
-   releases the bytes. M6 never opened that inode — the whole point of the
-   microwindow is that the file changed *after* M6 last read it — so "M6
-   preserves the pre-rename inode content it displaced" is not implementable:
-   M6 can only preserve what it read, and what it read is the older source,
-   which M2 already backed up twice. This design does **not** claim otherwise.
-   - **Detectability: none in the state plane.** Nothing records that the write
-     happened. A pre-B0 writer maintains no witness, `state.json` is `Q` after the
-     flip, and the M2 backups and the migrated DB agree with each other on the
-     older source — there is no divergent `.bak` to compare against, because the
-     backups were taken from the source M6 verified, not from the document that
-     replaced it. There is no `legacy-overwrite-after-Q` analogue for (ii).
-     Outcome (ii) is **silent**, and calling it "detectable" would be a lie.
-   - **The worst downstream outcome, stated without the bound v9 falsely
-     claimed (v10).** v9 asserted that a lost save "produces redundant conflict
-     detection, never a silent content overwrite." The R4-v9 serial review
-     falsified that by executing the merge consumer: `reconcile`
-     (`src/engine/reconcile.ts:60`) classifies `local == base` as an ordinary
-     remote write, and `apply` (`src/engine/apply.ts:287`) replaces a file that
-     still equals `expectedLocal` without a conflict copy. So the ABA case is
-     real: the pre-`B0` writer applies remote `B1` and its save of BASE `B1` is
-     the lost write; the user later intentionally reverts the file to its `B0`
-     contents; the next pull sees stale BASE `B0`, local `B0`, remote `B1` — and
-     **silently overwrites the user's intentional revert**. No user bytes live
-     only in `state.json`, but it is correctness-authoritative for
-     reconciliation posture, and "derived cache" does not make losing an update
-     universally fail-closed. This design accepts outcome (ii) with that
-     stronger consequence named: the reachable worst case is a silent overwrite
-     of a user edit that recreates a superseded state, in the specific lineage
-     where the lost save was the BASE advancement for that same path. The
-     narrower stale-BASE cases (local differs from base) still take the
-     conflict/deferral path; the bound v9 drew around *all* cases is withdrawn.
-
-   *Ratification.* This residue is **accepted and named**, not closed. It is a
-   scheduling assumption (`B0` adoption) enforced by a gate rather than by a
-   lock. What makes it ratifiable is not the outcome — outcome (ii) is genuinely
-   silent — but its precondition: it requires an out-of-date binary *actively
-   racing a migration on the same workspace*, and `B0`'s adoption gate exists
-   precisely to drain that population before any 2.0 binary may migrate anything
-   (all 4 external users and all 3 fleet hosts on `>= 1.11.0`, verified by
-   aggregate version telemetry, two-week bake). The M0 witness floor
-   independently refuses any workspace whose *last* writer was pre-B0, so
-   reaching either window needs a workspace written recently by a B0 binary while
-   a pre-B0 binary is simultaneously mid-sync on it. If that population is not
-   demonstrably drained at the U3 gate, this residue is not ratifiable and U3
-   must not be enabled; the gate, not this paragraph, is what carries the
-   argument.
+   *Ratification, restated (v11).* V10 ratified this residue as "accepted and
+   named", carried by the `B0` adoption gate and the hard U3 drain gate. That
+   argument is unchanged and still stands on its own; v11 puts a simpler one in
+   front of it — the scenario does not occur because the migration does not run
+   while anything else does. Both gates remain, and B0's barrier plus the
+   witness floor remain the layers that cover a binary started *later* or a
+   workspace whose last writer predates the barrier. The U3 drain criterion is
+   not relaxed here; only its data source is named (founder decision 6).
 
    **1b. The durable last-writer witness.** `SyncState` has no version field
    and B0 must not add one — a new state member would be silently dropped by
@@ -2352,8 +2353,9 @@ clobber each other's `state.json` today.
    identity-drifted, lower version) is a typed `barrier-witness-missing`
    refusal, not a halt; the remedy is one ordinary sync with a barrier-capable
    binary, which is exactly the condition the gate is trying to establish. The
-   same five-field sample is what the writer-liveness observation above
-   re-samples across its bounded interval. B0's pinning inventory test (contents
+   witness is **retained in v11** — it is cheap, it is already shipped in B0
+   (#539), and it proves a fact about the workspace's history that exclusivity
+   does not address. B0's pinning inventory test (contents
    item 2) is extended to require both obligations of every enumerated write
    entry point: it checks the barrier, and it updates the witness.
 2. That barrier release is a scheduled **pre-U0 deliverable** with an adoption
@@ -2387,25 +2389,22 @@ clobber each other's `state.json` today.
      `1.11.0` downgrade floor. A workspace whose most recent writer predates the
      barrier is refused until it has been written once by a barrier-capable
      binary;
-   - **no live legacy writer at all (v8).** Mutual exclusion binds only writers
-     that take the lock, so this condition is established by observation, not by
-     inference from the first bullet: M0 takes the paired sample of the live
-     `state.json` five-field content witness and the `last-writer.json` sidecar,
-     waits a bounded interval, and re-samples. Any state-file change the sidecar
-     does not account for proves a writer that publishes without maintaining the
-     witness is live, and M0 refuses with a typed `legacy-writer-live` refusal.
-     This is the condition that covers the third case named in 1a; the residue
-     it cannot cover — a pre-`1.11.0` unlocked writer whose `fs.rename` lands in
-     M6's `check → rename` microwindow or strictly after M6's rename — is named
-     and accepted there with both of its outcomes.
+   - **the exclusivity window is proven (v11 — replaces v8's live-writer
+     sampling).** `MIGRATION-EXCLUSIVITY-v11`: M0 admits only when its caller is
+     one of the two admitted entry points (inside `rbox upgrade`'s per-workspace
+     stop window, or an explicit foreground `rbox migrate`) **and** M0
+     independently confirms no daemon is live for this workspace from the
+     existing pid-record/ownership evidence. Otherwise it refuses with a typed
+     `migration-not-exclusive` refusal, publishing no control and creating no
+     artifact. **The bounded-interval paired sampling and its
+     `legacy-writer-live` refusal are deleted** — see § 1a closure part two.
    All five are re-checked immediately before the M6 rename, not only at M0.
-   **The re-check is not the last thing M6 does (v9).** Because the paired
-   sample is not atomic with the rename, M6 additionally re-verifies
-   `.rbox/state.json`'s `stateBodySha256` against the M3-imported source digest
-   as the **immediately preceding operation** to `fs.rename`, under the
-   `stateLockPath` it already holds; a mismatch is a typed
-   `legacy-write-detected` disposition that does not rename and enters C1
-   retirement with JSON still authoritative (§ 1a, closure part three).
+   M6 additionally re-verifies `.rbox/state.json`'s `stateBodySha256` against
+   the M3-imported source digest as the **immediately preceding operation** to
+   `fs.rename`, under the `stateLockPath` it already holds; a mismatch is a
+   typed `legacy-write-detected` disposition that does not rename and enters C1
+   retirement with JSON still authoritative. Retained as defense-in-depth
+   against a scenario exclusivity excludes (§ 1a, closure part three).
 4. **Fixtures (required before U3 may be enabled) — corrected in v8.** V7
    specified one fixture that **cannot be constructed**: it started a
    *degraded-unlocked* legacy writer and then required "a full M0–M7 migration
@@ -2413,7 +2412,15 @@ clobber each other's `state.json` today.
    degraded-unlocked workspace at all. The fixture asserted an outcome the
    design forbids reaching, so it could only ever have been deleted or
    quietly weakened by whoever tried to write it. The matrix is now six
-   fixtures (v9 adds `F5`; v10 adds `F6`), each testing what the machine actually does:
+   fixtures (v9 adds `F5`; v10 adds `F6`), each testing what the machine
+   actually does. **Framing changed in v11, contents not.** `F1`–`F6` are
+   retained in full as regression nets, but they now test **excluded
+   scenarios**: under `MIGRATION-EXCLUSIVITY-v11` nothing else runs while a
+   migration runs, so `F2`–`F6` construct a concurrency the design no longer
+   admits. They stay because they are cheap, because they pin B0's shipped
+   refusal machinery (#539), and because a fixture is the only thing that stops
+   a documented outcome from silently drifting. Read every "named residue"
+   below as "excluded by exclusivity, tested anyway":
    - **F1 — the degraded fence does what M0 says.** A degraded-unlocked
      workspace with a live legacy writer: M0 must refuse with a typed
      `degraded-fence` refusal, publishing no control and creating no migration
@@ -3104,7 +3111,8 @@ descriptor; they do not select or mutate different M7 bytes.
 
 ### Ordered phases
 
-Migration runs only after standing-reset recovery, under the non-degraded
+Migration runs only inside a proven `MIGRATION-EXCLUSIVITY-v11` window (v11),
+after standing-reset recovery, under the non-degraded
 workspace mutex, complete repository fence as needed, and state lock:
 
 1. **M0 — classify and record intent.** Bounded-read the legacy path first;
@@ -4319,16 +4327,22 @@ Contents:
 Exit criteria (all required before U3 may be enabled, not merely before it may
 be written):
 - released on the stable channel;
-- adopted by **all 4 external users and all 3 fleet hosts**, verified by the
-  aggregate version telemetry the fleet already reports;
+- adopted by **all 4 external users and all 3 fleet hosts**, read from the
+  **existing `rbox-admin` version view** (founder decision 6, v11) — no new
+  telemetry infrastructure is built for this gate, and issue #540 was closed as
+  invalid on that basis;
 - baked for at least two weeks of ordinary fleet use with zero
   barrier-related incidents;
 - the degraded/legacy-writer fixture matrix `F1`–`F6` from the closure above
   passes, including both negative controls and `F5`'s companion assertion;
-- the pre-`1.11.0` population is **demonstrably drained** by the aggregate
-  version telemetry above. This is the only thing carrying § 1a's outcome (ii),
-  which is silent and unrecoverable; if the telemetry cannot show the drain, U3
-  does not open.
+- the pre-`1.11.0` population is **demonstrably drained** in that same
+  `rbox-admin` version view. The bar is unchanged by v11; what changed is that
+  it is no longer the *only* thing carrying § 1a's outcome (ii) —
+  `MIGRATION-EXCLUSIVITY-v11` excludes that scenario outright and the drain gate
+  is now the second layer. It still gates U3: if the version view cannot show
+  the drain, U3 does not open. Known population as of 2026-07-28: 1 external
+  user on 1.6 (nudge directly), 2 on 1.9.x upgrading frequently, founder fleet
+  on dev builds.
 
 ### U0 — entry interning (no gate)
 
@@ -4435,15 +4449,21 @@ Additional v6 exits:
   production use of `loadState(): SyncState`. CI counts its call sites from
   this release forward; the count may only decrease and must reach zero by
   U4f.
+- **Explicit-and-exclusive entry (v11, founder decision 5).** U3 ships the two
+  admitted entry points and nothing else: the `rbox upgrade` per-workspace stop
+  window and a foreground `rbox migrate`. U3 does **not** implement ambient or
+  on-boot migration, and it does **not** implement the paired-interval
+  live-writer sampling v8 specified — `migration-not-exclusive` refusal
+  replaces both.
 - **Migration duration budget and progress UX (R4-ROLLOUT M1).** M3 imports
   112k files in one transaction; M4 runs full `integrity_check` plus a second
   semantic digest; all under the workspace mutex with `synchronous=FULL`. The
-  first 2.0 boot on the 59 MB Mac state must not look like a hang. Budget:
+  migration the user just asked for must not look like a hang. Budget:
   **complete M0–M7 in <= 60 s on the 112k corpus**, and if any phase exceeds
-  5 s the daemon publishes a `migrating` health state naming the phase and its
-  progress, which `rbox status` renders in plain English and the non-interactive
-  twin reports as structured output. A migration that exceeds the budget is a
-  reportable finding, not a silent success.
+  5 s the foreground command prints the phase and its progress, which
+  `rbox status` also renders in plain English from a `migrating` health state
+  and the non-interactive twin reports as structured output. A migration that
+  exceeds the budget is a reportable finding, not a silent success.
 - **Halt copy (R4-ROLLOUT M5).** Design 163 introduces roughly fifteen new
   fail-closed halt classes, each of which stops sync, and two of the four
   external users are non-technical. Every new halt reason ships with a
@@ -4830,5 +4850,31 @@ One review: the codex serial review of the v9 tip. Both v9 closures and the
 |---|---|
 | The F5 blast-radius bound is false: "a lost save leaves a stale BASE … redundant conflict detection, never a silent content overwrite" does not survive the merge consumer. Executed counterexample: lost save was the BASE advancement to `B1`; user intentionally reverts the file to `B0` contents; next pull sees stale BASE `B0`, local `B0`, remote `B1`; `reconcile` (`src/engine/reconcile.ts:60`) classifies `local == base` as an ordinary remote write and `apply` (`src/engine/apply.ts:287`) replaces the file with no conflict copy — the intentional revert is silently overwritten | **Bound withdrawn, stronger consequence named, fixture added.** The residue paragraph now states the reachable worst case plainly — a silent overwrite of a user edit that recreates a superseded state, in the lineage where the lost save was that path's BASE advancement — and confines the surviving fail-closed claim to the cases where local differs from base. New fixture `F6` extends `F5` through the post-flip pull and asserts the silent `write` outcome (and the absence of any anomaly), so a future BASE-generation mechanism that converts this case into a conflict turns `F6` red and upgrades the documentation. The ratification argument is unchanged **because it never rested on the withdrawn bound**: it rests on the preconditions (pre-`1.11.0` binary actively racing a migration in a two-instant microwindow) and the hard U3 exit criterion — telemetry-verified drain of the pre-`1.11.0` population, or U3 does not open. |
 
-V10 remains pending final ratification and is not implementation authority. The
-same two founder inputs are owed, both enumerated at the top of this document.
+*(Written before ratification; v10 was ratified later the same day. Its
+statement that two founder inputs are owed is superseded by v11 — see the
+R4-v11 section below and the open-inputs list at the top.)*
+
+## R4-v11 founder requirement reduction (v11)
+
+Not a review round. **An amendment to a ratified document, taken from two
+founder decisions of 2026-07-28**, both of which *remove* requirements. No
+codex round produced these; the changed sections are therefore marked pending
+codex re-confirmation while the rest of v10 stands as ratified.
+
+| Founder decision | What v11 deletes | What v11 keeps |
+|---|---|---|
+| **5 — migration is explicit-and-exclusive ("parked car")** | Ambient/on-boot migration, in every form. M0's **paired-interval live-writer sampling** and its `legacy-writer-live` refusal (§ 1a closure part two) — the U3 implementation must not build them. The framing of outcomes (i)/(ii)/ABA and the `check → rename` microwindow as *load-bearing named residuals* | The two admitted entry points, the `migration-not-exclusive` refusal, and the full "What REMAINS" list in § "Founder requirement reductions" — `Q`/barrier, witness, reserve, M6's last-instant re-verify, `F1`–`F6`, every crash/resume/halt property |
+| **6 — the drain gate reads existing `rbox-admin` version telemetry** | The implied obligation to build fleet drain telemetry. Issue #540 closed as **invalid** | The `telemetry-verified drain` bar itself, at full strength, in both the `B0` exit criteria and the U3 gate — sourced from the `rbox-admin` version view at zero implementation cost |
+
+**Founder question status after v11.** Open input 1 (do the four external users
+take the one-way migration before the payoff lands?) is **RESOLVED, with no
+surviving fragment**: decision 5 converts the migration from something pushed
+at a user into something a user runs — `rbox upgrade` or `rbox migrate`. The
+obligations that outlive it (U3 no-regression gate, plain-English halt copy)
+were already ratified and are not questions. **Exactly one input remains owed:
+the frozen machine profile, blocking U5.**
+
+**Not deleted retroactively.** B0 shipped in #539 with the witness sidecar, the
+write-side barrier, the reserve, and the pinning inventory test. None of that is
+withdrawn. It is now defense-in-depth against a scenario exclusivity excludes,
+which is a fine thing for shipped code to be.
