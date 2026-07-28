@@ -37,6 +37,25 @@ function root(prefix: string): string {
   return value;
 }
 
+/** Keys out of order — canonical parse refuses it, standing in for any corrupt
+ * durable blob (non-canonical bytes or a canonical non-object). */
+const NON_CANONICAL = '{"b":1,"a":2}';
+
+function freshStore(prefix: string) {
+  const handle = createStateStore(path.join(root(prefix), "state.db"), {
+    authorityId: "a".repeat(32), lineageId: LINEAGE, stream: "stream", createdBy: "test",
+  });
+  return { handle, db: stateStoreDatabase(handle) };
+}
+
+function expectCorruption(fn: () => unknown, entity: string, key?: string): void {
+  let thrown: unknown;
+  try { fn(); } catch (error) { thrown = error; }
+  expect(thrown).toBeInstanceOf(StateDataCorruptionError);
+  expect((thrown as StateDataCorruptionError).entity).toBe(entity);
+  if (key !== undefined) expect((thrown as StateDataCorruptionError).key).toBe(key);
+}
+
 /** A well-formed section. `bad` drops a mandatory field to make it inadmissible. */
 function section(seed: number): GitSection {
   return {
@@ -237,5 +256,42 @@ test("a corrupt FileEntry authority row surfaces as StateDataCorruptionError", (
   expect(thrown).toBeInstanceOf(StateDataCorruptionError);
   expect((thrown as StateDataCorruptionError).entity).toBe("fileEntry");
   expect((thrown as StateDataCorruptionError).key).toBe(p);
+  handle.close();
+});
+
+/* --------------------------------------- token tables read by currentSnapshot */
+// Every durable blob the snapshot token decodes is in the taxonomy: a corrupt row
+// of ANY authority table is StateDataCorruptionError with that table's entity, not
+// a bare Error/TypeError leaking through spreadExtras/parseCanonicalJson.
+
+test("a corrupt state_lineage extras row is StateDataCorruptionError(stateLineage)", () => {
+  const { handle, db } = freshStore("rbox-gitsec-lineage-");
+  db.query("UPDATE state_lineage SET extras_cjson=? WHERE lineage_id=?").run(NON_CANONICAL, LINEAGE);
+  expectCorruption(() => openReadSnapshot(handle), "stateLineage", LINEAGE);
+  handle.close();
+});
+
+test("a corrupt plane_heads extras row is StateDataCorruptionError(planeHead)", () => {
+  const { handle, db } = freshStore("rbox-gitsec-planehead-");
+  db.query("UPDATE plane_heads SET extras_cjson=? WHERE lineage_id=? AND plane='base'").run(NON_CANONICAL, LINEAGE);
+  expectCorruption(() => openReadSnapshot(handle), "planeHead", "base");
+  handle.close();
+});
+
+test("a corrupt migration_completion source-shape row is StateDataCorruptionError(migrationCompletion)", () => {
+  const { handle, db } = freshStore("rbox-gitsec-migcomp-");
+  db.query("UPDATE migration_completion SET source_shape_flags_cjson=? WHERE singleton=1").run(NON_CANONICAL);
+  expectCorruption(() => openReadSnapshot(handle), "migrationCompletion", LINEAGE);
+  handle.close();
+});
+
+test("a corrupt global_manifest_meta extras row is StateDataCorruptionError(globalManifestMeta)", () => {
+  const { handle, db } = freshStore("rbox-gitsec-meta-");
+  // Genesis carries no meta row; install one at the active base generation (0) so
+  // the snapshot materializes it, with a corrupt extras blob.
+  db.query(`INSERT OR REPLACE INTO global_manifest_meta(lineage_id,base_generation,enc_manifest_sha,
+    manifest_hash,account_epoch,key_epoch,chain_bytes,snapshot_bytes,extras_cjson)
+    VALUES (?,0,?,?,0,0,0,1,?)`).run(LINEAGE, Buffer.alloc(32), Buffer.alloc(32), NON_CANONICAL);
+  expectCorruption(() => openReadSnapshot(handle), "globalManifestMeta", "0");
   handle.close();
 });

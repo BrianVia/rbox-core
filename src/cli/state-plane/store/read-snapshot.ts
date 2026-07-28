@@ -58,16 +58,20 @@ export function currentSnapshot(db: Database): LineageSnapshot {
     enc_manifest_sha: Uint8Array; manifest_hash: Uint8Array; account_epoch: number; key_epoch: number;
     chain_bytes: number; snapshot_bytes: number; extras_cjson: string | null;
   } | null;
-  const manifestMeta = meta ? {
-    ...spreadExtras(meta.extras_cjson),
-    encManifestSha: Buffer.from(meta.enc_manifest_sha).toString("hex"),
-    manifestHash: Buffer.from(meta.manifest_hash).toString("hex"),
-    accountEpoch: meta.account_epoch,
-    keyEpoch: meta.key_epoch,
-    chainBytes: meta.chain_bytes,
-    snapshotBytes: meta.snapshot_bytes,
-  } as Omit<GlobalManifestMeta, "chain" | "gitRepos"> : undefined;
-  const sourceShape = parseCanonicalJson(core.source_shape_flags_cjson) as Record<string, unknown>;
+  const generationKey = String(core.active_base_generation);
+  const manifestMeta = meta
+    ? decodeAuthorityRow("globalManifestMeta", generationKey, () => ({
+      ...spreadExtras(meta.extras_cjson),
+      encManifestSha: Buffer.from(meta.enc_manifest_sha).toString("hex"),
+      manifestHash: Buffer.from(meta.manifest_hash).toString("hex"),
+      accountEpoch: meta.account_epoch,
+      keyEpoch: meta.key_epoch,
+      chainBytes: meta.chain_bytes,
+      snapshotBytes: meta.snapshot_bytes,
+    } as Omit<GlobalManifestMeta, "chain" | "gitRepos">))
+    : undefined;
+  const sourceShape = decodeAuthorityRow("migrationCompletion", core.lineage_id,
+    () => parseCanonicalJson(core.source_shape_flags_cjson) as Record<string, unknown>);
   const manifestShape = sourceShape.lastSyncedManifest;
   const manifestGitReposPresent = typeof manifestShape === "object" && manifestShape !== null
     && !Array.isArray(manifestShape)
@@ -82,10 +86,10 @@ export function currentSnapshot(db: Database): LineageSnapshot {
     baseGeneration: core.active_base_generation,
     localRevision: core.local_revision,
     ...(core.telemetry_binding_id === null ? {} : { telemetryBindingId: core.telemetry_binding_id }),
-    lineageExtras: spreadExtras(core.extras_cjson),
+    lineageExtras: decodeAuthorityRow("stateLineage", core.lineage_id, () => spreadExtras(core.extras_cjson)),
     manifestGitReposPresent,
-    baseHeader: header(base),
-    localHeader: header(local),
+    baseHeader: decodeAuthorityRow("planeHead", "base", () => header(base)),
+    localHeader: decodeAuthorityRow("planeHead", "local", () => header(local)),
     ...(manifestMeta ? { manifestMeta } : {}),
   };
 }
