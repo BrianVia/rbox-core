@@ -49,21 +49,21 @@ interface EntryPoint {
 
 const ENTRY_POINTS: readonly EntryPoint[] = [
   // Reads — refuse a state plane written by a newer rbox instead of guessing.
-  { file: "src/cli/sync-state-store.ts", symbol: "loadRawState", kind: "read", sites: 2, guards: ["assertStateReadable"] },
-  { file: "src/cli/sync-state-store.ts", symbol: "loadState", kind: "read", sites: 1, guards: ["loadRawState"] },
+  { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "loadRawState", kind: "read", sites: 2, guards: ["assertStateReadable"] },
+  { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "loadState", kind: "read", sites: 1, guards: ["loadRawState"] },
   { file: "src/cli/doctor-state-plane.ts", symbol: "checkState", kind: "read", sites: 1, guards: ["loadRawState"] },
 
   // Writes — check the barrier immediately before the publishing rename, and
   // record the last-writer witness immediately after it.
   { file: "src/cli/state-plane/adapters/legacy-json-publication.ts", symbol: "publishWholeState", kind: "write", sites: 0, guards: ["assertStatePublishable"] },
   { file: "src/cli/state-plane/adapters/legacy-json-publication.ts", symbol: "afterStatePublication", kind: "write", sites: 0, guards: ["recordLastWriterWitness", "ensureStateReserve"] },
-  { file: "src/cli/sync-state-store.ts", symbol: "applyStateSavePacket", kind: "write", sites: 7, guards: ["assertStatePublishable", "afterStatePublication"] },
-  { file: "src/cli/sync-state-store.ts", symbol: "writeWholeStateUnsafe", kind: "write", sites: 2, guards: ["acquireLock", "publishWholeState", "afterStatePublication"] },
-  { file: "src/cli/sync-state-store.ts", symbol: "ensureTelemetryBindingId", kind: "write", sites: 5, guards: ["assertStatePublishable", "afterStatePublication"] },
+  { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "applyStateSavePacket", kind: "write", sites: 7, guards: ["assertStatePublishable", "afterStatePublication"] },
+  { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "writeWholeStateUnsafe", kind: "write", sites: 2, guards: ["acquireLock", "publishWholeState", "afterStatePublication"] },
+  { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "ensureTelemetryBindingId", kind: "write", sites: 5, guards: ["assertStatePublishable", "afterStatePublication"] },
 
   // Reset entry points — the same obligations, plus the ones that republish the
   // state document by renaming a prepared candidate over it.
-  { file: "src/cli/sync-state-store.ts", symbol: "installGenesisResetStateUnderHeldLock", kind: "reset", sites: 4, guards: ["publishWholeState", "afterStatePublication"] },
+  { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "installGenesisResetStateUnderHeldLock", kind: "reset", sites: 4, guards: ["publishWholeState", "afterStatePublication"] },
   { file: "src/cli/reset-journal.ts", symbol: "observePhysical", kind: "reset", sites: 0, guards: ["assertStateReadable"] },
   { file: "src/cli/reset-journal.ts", symbol: "recoverResetJournalUnderHeldFence", kind: "reset", sites: 8, guards: ["assertStateReadable", "isOwner", "recordLastWriterWitness"] },
   { file: "src/cli/reset-journal.ts", symbol: "inspectResetJournal", kind: "reset", sites: 1, guards: ["classifyStateFormat"] },
@@ -81,7 +81,7 @@ const ENTRY_POINTS: readonly EntryPoint[] = [
 const EXEMPT: ReadonlyMap<string, { sites: number; reason: string }> = new Map([
   ["src/cli/state-plane/errors.ts::<module>", { sites: 1, reason: "StreamMismatchError renders the stable legacy authority path but never reads or writes it" }],
   ["src/cli/reset-journal.ts::activeStatePath", { sites: 1, reason: "the local state-path constructor itself" }],
-  ["src/cli/state-plane/reset/artifacts.ts::<module>", { sites: 1, reason: "the SQLite reset path table names the legacy authority-marker path but never reads or writes it" }],
+  ["src/cli/state-plane/paths.ts::<module>", { sites: 1, reason: "the SQLite reset path table names the legacy authority-marker path but never reads or writes it" }],
   ["src/cli/reset-journal.ts::beginResetJournal", { sites: 2, reason: "hashes the caller-supplied prepared bytes and names the candidate path; the live document is read by its guarded caller under the same lock" }],
   ["src/cli/sync-git/p-settlement.ts::settleExactPresentArtifact", { sites: 4, reason: "uses statePath only to name the protocol lock class; the save itself is applyStateSavePacket" }],
   ["src/cli/scan-probe.ts::loadScanProbe", { sites: 2, reason: "a local statePath naming .rbox/state/scan-probe.json, not the state plane" }],
@@ -177,7 +177,7 @@ describe("state barrier pinning inventory", () => {
 
   test("ordinary publication traverses the typed adapter in publication order", () => {
     for (const symbol of ["writeWholeStateUnsafe", "installGenesisResetStateUnderHeldLock"]) {
-      expectOrderedCalls("src/cli/sync-state-store.ts", symbol, ["publishWholeState", "afterStatePublication"]);
+      expectOrderedCalls("src/cli/state-plane/adapters/legacy-json-store.ts", symbol, ["publishWholeState", "afterStatePublication"]);
     }
 
     const file = "src/cli/state-plane/adapters/legacy-json-publication.ts";
@@ -194,14 +194,14 @@ describe("state barrier pinning inventory", () => {
 
   test("inline CAS publication proves its callback and post-publication order", () => {
     for (const symbol of ["applyStateSavePacket", "ensureTelemetryBindingId"]) {
-      const publish = requiredCall("src/cli/sync-state-store.ts", symbol, "writeFileAtomic");
+      const publish = requiredCall("src/cli/state-plane/adapters/legacy-json-store.ts", symbol, "writeFileAtomic");
       const options = publish.arguments?.[2] ?? "";
       expect(options).toContain("beforeRename");
       expect(options).toContain("assertStatePublishable");
       expect(options).toContain("isOwner");
-      const stateParentSync = requiredCallAfter("src/cli/sync-state-store.ts", symbol, "fsyncDirectory", publish);
+      const stateParentSync = requiredCallAfter("src/cli/state-plane/adapters/legacy-json-store.ts", symbol, "fsyncDirectory", publish);
       expect(stateParentSync.arguments?.[0]).toBe("path.dirname(statePath(root))");
-      expectOrderedCalls("src/cli/sync-state-store.ts", symbol, [
+      expectOrderedCalls("src/cli/state-plane/adapters/legacy-json-store.ts", symbol, [
         "assertStatePublishable",
         "fsyncDirectory",
         "afterStatePublication",

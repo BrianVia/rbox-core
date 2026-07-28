@@ -27,12 +27,13 @@ import { openReadSnapshot } from "./read-snapshot.js";
 import { sealedStagePath } from "./stage-artifacts.js";
 import { beginRepoTransitionStage, type SealedRepoTransitionRef } from "./transition-stages.js";
 import { applyCasPacket } from "./write-packet.js";
+import { casOwnerTokenForTest } from "./owner-token-testkit.js";
 
 const roots: string[] = [];
 const LINEAGE = "b".repeat(32);
 const NONCE = "c".repeat(32);
 const HEADER: ManifestHeader = { generatedAt: "", complete: true };
-const OWNER = { isOwner: () => true };
+const OWNER = casOwnerTokenForTest(() => true);
 
 afterEach(() => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });

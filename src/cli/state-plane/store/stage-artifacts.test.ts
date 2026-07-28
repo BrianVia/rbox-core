@@ -16,12 +16,13 @@ import { openReadSnapshot } from "./read-snapshot.js";
 import { StageLock, privateDirectoryPath, sealedStagePath, stageLockPath } from "./stage-artifacts.js";
 import { beginRepoTransitionStage, openSealedRepoTransitionStage } from "./transition-stages.js";
 import { applyCasPacket, type CasPacket } from "./write-packet.js";
+import { casOwnerTokenForTest } from "./owner-token-testkit.js";
 
 const roots: string[] = [];
 const LINEAGE = "b".repeat(32);
 const NONCE = "c".repeat(32);
 const HEADER: ManifestHeader = { generatedAt: "2026-07-28T10:00:00.000Z", complete: true };
-const OWNER = { isOwner: () => true };
+const OWNER = casOwnerTokenForTest(() => true);
 
 afterEach(() => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });

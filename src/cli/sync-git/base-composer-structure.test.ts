@@ -144,24 +144,28 @@ test("design 130 whole-state persistence is a closed allowlist", async () => {
   ));
   expect(counts(sites)).toEqual({
     "src/cli/scan-probe.ts": 1,
-    "src/cli/sync-state-store.ts": 4,
+    "src/cli/state-plane/adapters/legacy-json-store.ts": 4,
     "src/cli/sync-state.ts": 4,
   });
 });
 
 test("design 130 raw whole-state APIs cannot be aliased into new production sites", async () => {
-  // The compatibility facade is separately pinned by config-surface.test.ts.
-  // This closed set counts the owner definition and production consumers, so
-  // decomposition cannot inflate the pre/post operation-category total.
-  const outsideFacade = (file: string): boolean => file !== path.join(srcRoot, "cli", "config.ts");
+  // The compatibility facades are separately pinned by config-surface.test.ts:
+  // `config.ts` and the `sync-state-store.ts` re-export facade both name these
+  // APIs only to forward them. This closed set counts the owner definition and
+  // production consumers, so decomposition cannot inflate the pre/post
+  // operation-category total.
+  const outsideFacade = (file: string): boolean =>
+    file !== path.join(srcRoot, "cli", "config.ts")
+    && file !== path.join(srcRoot, "cli", "sync-state-store.ts");
   const unsafe = await sweep(/\bsaveStateUnsafeLegacyOrTest\b/g, outsideFacade);
   expect(counts(unsafe)).toEqual({
-    "src/cli/sync-state-store.ts": 1,
+    "src/cli/state-plane/adapters/legacy-json-store.ts": 1,
     "src/cli/sync-state.ts": 5,
   });
   const guarded = await sweep(/\bsaveState\b/g, outsideFacade);
   expect(counts(guarded)).toEqual({
-    "src/cli/sync-state-store.ts": 2,
+    "src/cli/state-plane/adapters/legacy-json-store.ts": 2,
   });
 });
 
@@ -215,7 +219,7 @@ test("design 130 persisted BASE and branch-origin writes are a closed allowlist"
     "src/cli/sync-git/pending-supersession.ts": 3,
     "src/cli/sync-git/plan.ts": 2,
     "src/cli/sync-state-model.ts": 11,
-    "src/cli/sync-state-store.ts": 8,
+    "src/cli/state-plane/adapters/legacy-json-store.ts": 8,
     "src/cli/sync-state.ts": 14,
     "src/cli/sync/pull.ts": 2,
   });

@@ -22,12 +22,14 @@ import { createStateStore, openStateStore, stateStoreDatabase, type StateStoreHa
 import { openReadSnapshot } from "./read-snapshot.js";
 import { beginRepoTransitionStage, type SealedRepoTransitionRef } from "./transition-stages.js";
 import { applyCasPacket, ensureTelemetryBindingId, type CasExpectation, type CasPacket } from "./write-packet.js";
+import type { OwnedLockCasToken } from "./owner-token.js";
+import { casOwnerTokenForTest } from "./owner-token-testkit.js";
 
 const roots: string[] = [];
 const LINEAGE = "b".repeat(32);
 const NONCE = "c".repeat(32);
 const STREAM = "workspace/163";
-const OWNER = { isOwner: () => true };
+const OWNER = casOwnerTokenForTest(() => true);
 const HEADER: ManifestHeader = { generatedAt: "2026-07-28T10:00:00.000Z", manifestSchema: 2, complete: true };
 
 afterEach(() => {
@@ -113,7 +115,7 @@ function packet(
     manifestMeta?: GlobalManifestMeta;
     rows?: Array<{ relPath: string; expectedRepoGen: number; newRecord: RepoRecordInput; proof?: boolean }>;
     global?: boolean;
-    owner?: { isOwner: () => boolean };
+    owner?: OwnedLockCasToken;
   } = {},
 ): CasPacket {
   const live = openReadSnapshot(handle).token;
@@ -163,7 +165,7 @@ test("every rejection reason in the operation table is reachable and lands nothi
   expectRejected(applyCasPacket(handle, stages, packet(stages, handle, {
     rows: [{ relPath: "repo", expectedRepoGen: 4, newRecord: { sourceSeq: 5 } }],
   })), "repo-generation");
-  expectRejected(applyCasPacket(handle, stages, packet(stages, handle, { owner: { isOwner: () => false } })), "owner-lost");
+  expectRejected(applyCasPacket(handle, stages, packet(stages, handle, { owner: casOwnerTokenForTest(() => false) })), "owner-lost");
 
   expect(applyCasPacket(handle, stages, packet(stages, handle, { sourceGlobalSeq: 5 })).status).toBe("accepted");
   // sourceGlobalSeq equal to lastSyncedSequence is explicitly allowed; strictly
@@ -566,20 +568,18 @@ test("a hostile owner callback cannot rewrite what commits", () => {
   const { stages, handle } = workspace("rbox-cas-frozen-");
   const built = packet(stages, handle, {});
   let calls = 0;
-  const hostile = {
-    isOwner: () => {
-      calls++;
-      // Between the predicate checks and the commit, rewrite everything the
-      // caller still has a reference to.
-      (built.global!.stage as { header: ManifestHeader }).header = {
-        generatedAt: "2099-01-01T00:00:00.000Z", complete: true,
-      };
-      built.global!.fileHeader = { generatedAt: "2099-01-01T00:00:00.000Z", complete: true };
-      built.expected.stateRevision = 999;
-      built.sourceGlobalSeq = 999;
-      return true;
-    },
-  };
+  const hostile = casOwnerTokenForTest(() => {
+    calls++;
+    // Between the predicate checks and the commit, rewrite everything the
+    // caller still has a reference to.
+    (built.global!.stage as { header: ManifestHeader }).header = {
+      generatedAt: "2099-01-01T00:00:00.000Z", complete: true,
+    };
+    built.global!.fileHeader = { generatedAt: "2099-01-01T00:00:00.000Z", complete: true };
+    built.expected.stateRevision = 999;
+    built.sourceGlobalSeq = 999;
+    return true;
+  });
   expect(applyCasPacket(handle, stages, { ...built, ownerToken: hostile }).status).toBe("accepted");
   expect(calls).toBeGreaterThanOrEqual(2);
   const state = loadRawStateFromStore(handle);

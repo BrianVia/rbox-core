@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
-import { constants } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readSync, type BigIntStats } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory, writeFileAtomic } from "../fsutil.js";
@@ -941,6 +941,49 @@ async function readMarkerNoFollow(lockPath: string): Promise<MarkerRead | undefi
   }
 }
 
+/** Synchronous mirror of {@link readMarkerNoFollow}. Byte-for-byte the same
+ * no-follow classification, in one blocking pass, so a caller inside a
+ * synchronous critical section (the SQLite CAS, which checks lease ownership
+ * mid-transaction) can observe the exact marker without awaiting. */
+function readMarkerNoFollowSync(lockPath: string): MarkerRead | undefined {
+  let before: BigIntStats;
+  try {
+    before = lstatSync(lockPath, { bigint: true });
+  } catch (error) {
+    if (errno(error) === "ENOENT") return undefined;
+    throw error;
+  }
+  const token = statToken(before);
+  if (before.isSymbolicLink()) return { ...token, raw: "", reason: "symlink lock" };
+  if (!before.isFile()) return { ...token, raw: "", reason: "non-regular lock" };
+  let fd: number | undefined;
+  try {
+    fd = openSync(lockPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const opened = fstatSync(fd, { bigint: true });
+    if (!opened.isFile() || !sameStat(before, opened)) return { ...token, raw: "", reason: "lock changed during inspection" };
+    if (opened.size > BigInt(MARKER_MAX_BYTES)) {
+      const bounded = Buffer.alloc(MARKER_MAX_BYTES);
+      const bytesRead = readSync(fd, bounded, 0, bounded.length, 0);
+      const after = fstatSync(fd, { bigint: true });
+      if (!sameStat(opened, after)) return { ...token, raw: "", reason: "lock changed during inspection" };
+      return { ...statToken(opened), raw: bounded.subarray(0, bytesRead).toString("latin1"), reason: "oversized lock marker" };
+    }
+    const bytes = Buffer.alloc(MARKER_MAX_BYTES + 1);
+    const bytesRead = readSync(fd, bytes, 0, bytes.length, 0);
+    const after = fstatSync(fd, { bigint: true });
+    if (!sameStat(opened, after) || BigInt(bytesRead) !== opened.size) return { ...token, raw: "", reason: "lock changed during inspection" };
+    if (bytesRead > MARKER_MAX_BYTES) return { ...token, raw: "", reason: "oversized lock marker" };
+    const raw = bytes.subarray(0, bytesRead).toString("latin1");
+    const marker = parseLockMarker(raw);
+    return { ...statToken(opened), raw, marker, reason: marker ? undefined : "malformed or foreign lock marker" };
+  } catch (error) {
+    if (["ENOENT", "ELOOP"].includes(errno(error) ?? "")) return { ...token, raw: "", reason: "lock changed during inspection" };
+    throw error;
+  } finally {
+    if (fd !== undefined) try { closeSync(fd); } catch { /* descriptor already gone */ }
+  }
+}
+
 /** No-follow observation seam for journal-backed Git reservations. Unlike
  * acquireLock(), this primitive never decides that an existing marker is stale
  * and never reaps it: recovery authority belongs to the caller's durable
@@ -1341,6 +1384,18 @@ export class OwnedLock {
   async isOwner(): Promise<boolean> {
     try {
       const current = await readMarkerNoFollow(this.path);
+      return current !== undefined && sameMarkerObservation(current, this.observation);
+    } catch {
+      return false;
+    }
+  }
+
+  /** Synchronous, no-follow ownership observation. Identical semantics to
+   * {@link isOwner}, but usable from a synchronous critical section such as the
+   * SQLite CAS's pre-write and pre-commit lease checks. */
+  isOwnerSync(): boolean {
+    try {
+      const current = readMarkerNoFollowSync(this.path);
       return current !== undefined && sameMarkerObservation(current, this.observation);
     } catch {
       return false;

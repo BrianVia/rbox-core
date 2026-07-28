@@ -3,6 +3,8 @@ import path from "node:path";
 import { constants } from "node:fs";
 import { boundedHash, boundedRead } from "../../reset-io.js";
 
+export { sqliteResetPaths } from "../paths.js";
+
 export const RESET_NEXT_DB_SEED_LIMIT = 256 * 1024;
 export const RESET_SCHEMA_V1_EMPTY_SEED_BYTES = 126_976;
 export const SQLITE_RESET_SIDECARS = ["-wal", "-shm", "-journal"] as const;
@@ -22,18 +24,6 @@ export interface DbArtifactObservation {
   presentSidecars: readonly SqliteResetSidecar[];
   identity?: FileIdentity;
 }
-
-export const sqliteResetPaths = {
-  stateRoot: (root: string): string => path.join(root, ".rbox", "state"),
-  authorityMarker: (root: string): string => path.join(root, ".rbox", "state.json"),
-  active: (root: string): string => path.join(root, ".rbox", "state", "state.db"),
-  journal: (root: string): string => path.join(root, ".rbox", "state", "reset-v1.json"),
-  marker: (root: string): string => path.join(root, ".rbox", "state", "state-incarnation.json"),
-  candidate: (root: string, id: string): string =>
-    path.join(root, ".rbox", "state", "reset-candidates", `${id}.db`),
-  archive: (root: string, nonce: string, hash: string): string =>
-    path.join(root, ".rbox", "state", "lineages", nonce, `${hash}.db`),
-};
 
 const sameIdentity = (a: FileIdentity, b: FileIdentity): boolean =>
   a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeNs === b.mtimeNs;
