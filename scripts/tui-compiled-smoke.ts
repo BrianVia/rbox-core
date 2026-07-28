@@ -2,10 +2,10 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { resolveRigBinaryOverride } from "./rig/lib/binary.js";
+import { resolveRigBinaryPaths } from "./rig/lib/binary.js";
 import { shellQuote } from "./ux/lib.js";
 
-const binary = resolveRigBinaryOverride({ binary: process.argv[2] });
+const binary = resolveRigBinaryPaths({ binary: process.argv[2] }).a;
 const scenario = process.argv[3] ?? "--full";
 const scenarios = new Set(["--full", "--cancel", "--secret-retry", "--secret-abort", "--secret-render-error", "--secret-cancel"]);
 if (!binary || process.argv.length > 4 || !scenarios.has(scenario)) {

@@ -148,9 +148,13 @@ test("a corrupt store reads as no requests with a warning, and refuses to be ove
 });
 
 test("a new request at capacity is refused rather than evicting a live one", async () => {
-  for (let i = 0; i < REPUBLISH_REQUESTS_MAX; i++) {
-    await record(`repo-${i}`, "2026-07-28T00:00:00.000Z");
-  }
+  // Fill under one held mutex: 256 separate acquisitions blow the per-test
+  // budget on a loaded CI shard without changing what the test proves.
+  await withWorkspaceSyncMutex(root, async (mutex) => {
+    for (let i = 0; i < REPUBLISH_REQUESTS_MAX; i++) {
+      await recordHeld(mutex, `repo-${i}`, "2026-07-28T00:00:00.000Z");
+    }
+  });
   await expect(record("one-too-many", "2026-07-28T00:00:00.000Z"))
     .rejects.toThrow(/already pending/);
   expect((await republishPlanInput(root, STREAM)).repos.size).toBe(REPUBLISH_REQUESTS_MAX);
