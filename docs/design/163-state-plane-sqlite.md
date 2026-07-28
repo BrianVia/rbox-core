@@ -1,6 +1,13 @@
 # 163 — The state plane moves to SQLite
 
-Status: **v10 — pending final ratification.** V10 is a *round-six single-item
+Status: **v10 — RATIFIED 2026-07-28 as implementation authority for B0 → U5.**
+Codex ALIGNED at tip `1a42a4f0` after the R4 round (two opus lanes + codex
+serial ×5); founder decisions of 2026-07-28 recorded in their own section
+(backend-first hybrid, B0 gate, `1.11.0` floor, kill-criterion numbers). Two
+founder inputs remain owed (enumerated below) — the first, the frozen machine
+profile, blocks U5, not B0/U0/U1. Implementation may begin with `B0`.
+
+Prior status for the record: V10 is a *round-six single-item
 fold*: the R4-v9 serial review verified both v9 closures and the reserve byte
 math, then falsified v9's blast-radius bound on the named residue by executing
 the merge consumer — `reconcile` classifies `local == stale base` as an
