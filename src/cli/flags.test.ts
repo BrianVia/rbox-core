@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { ALIAS_COMMANDS } from "./command-catalog.js";
-import { parseFlags, unknownFlagError } from "./flags.js";
+import { flagValues, parseFlags, unknownFlagError } from "./flags.js";
 import { COMMAND_HELP, helpFor } from "./help-registry.js";
 
 test("--json is a boolean long flag before or after a status path", () => {
@@ -22,6 +22,13 @@ test("boolean long flags do not consume following positionals", () => {
 
 test("known value long flags still consume values", () => {
   expect(parseFlags(["--limit", "25", "--path", "."])).toEqual({ positional: [], flags: { limit: "25", path: "." } });
+});
+
+test("track --include is repeatable without changing single-value flag behavior", () => {
+  const parsed = parseFlags(["--include", "Personal/repo-A", "--include=Work/repo-B"], "track");
+  expect(parsed.positional).toEqual([]);
+  expect(flagValues(parsed.flags, "include")).toEqual(["Personal/repo-A", "Work/repo-B"]);
+  expect(parseFlags(["--limit", "10", "--limit", "20"], "versions").flags.limit).toBe("20");
 });
 
 test("ignore respect-gitignore consumes on/off value", () => {

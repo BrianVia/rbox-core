@@ -1,5 +1,5 @@
 /**
- * `rbox scope` — show, widen, or narrow the folders THIS machine syncs
+ * `rbox include` — show, widen, or narrow the folders THIS machine syncs
  * (design 212 §3.1). Every verb has a non-interactive twin: `--json` renders the
  * same facts, and nothing here prompts.
  */
@@ -13,7 +13,7 @@ import { readScopeFindings } from "./rule-authority.js";
 import { parseScopeFlag, scopeSplitsRepo, validateScopePrefixes, withinPrefix } from "./scope-record.js";
 import { resumeScopeIntent, runScopeTransition, type ScopeTransactionDeps } from "./scope-transaction.js";
 
-export const SCOPE_USAGE = "usage: rbox scope [add <folder>… | remove <folder>…] [--json]";
+export const SCOPE_USAGE = "usage: rbox include [add <folder>… | remove <folder>…] [--json]";
 
 interface ScopeShowRow {
   prefix: string;
@@ -25,7 +25,7 @@ export async function scopeCmd(
   root: string,
   sub: string | undefined,
   args: readonly string[],
-  opts: { json?: boolean } = {},
+  opts: { json?: boolean; quiet?: boolean } = {},
   deps: ScopeTransactionDeps = {},
 ): Promise<void> {
   // Any invocation finishes an interrupted edit first — a half-applied scope must
@@ -38,7 +38,7 @@ export async function scopeCmd(
   return editScope(root, sub, requested, opts, deps);
 }
 
-async function showScope(root: string, opts: { json?: boolean }): Promise<void> {
+async function showScope(root: string, opts: { json?: boolean; quiet?: boolean }): Promise<void> {
   const seal = await resolveBindingScope(root);
   assertBindingUsable(seal);
   if (seal.kind !== "scoped") {
@@ -47,7 +47,7 @@ async function showScope(root: string, opts: { json?: boolean }): Promise<void> 
       return;
     }
     console.log("this machine syncs the whole workspace.");
-    console.log(style.dim("sync only part of it:  rbox scope add <folder>"));
+    console.log(style.dim("sync only part of it:  rbox include add <folder>"));
     return;
   }
   const cfg = await loadConfig(root);
@@ -81,14 +81,14 @@ async function showScope(root: string, opts: { json?: boolean }): Promise<void> 
   for (const rule of findings?.ruleFileDivergence ?? []) {
     console.log(`  ${style.sym.warn} ${style.yellow(rule)} was edited here and has been restored from the workspace — change ignore rules on a machine that syncs everything`);
   }
-  console.log(style.dim("add a folder:  rbox scope add <folder>   remove one:  rbox scope remove <folder>"));
+  console.log(style.dim("add a folder:  rbox include add <folder>   remove one:  rbox include remove <folder>"));
 }
 
 async function editScope(
   root: string,
   sub: "add" | "remove",
   requested: string[],
-  opts: { json?: boolean },
+  opts: { json?: boolean; quiet?: boolean },
   deps: ScopeTransactionDeps,
 ): Promise<void> {
   const seal = await resolveBindingScope(root);
@@ -103,7 +103,7 @@ async function editScope(
 
   if (sub === "remove") {
     const unknown = validatedRequest.prefixes.filter((prefix) => !accepted.includes(prefix));
-    if (unknown.length > 0) throw new Error(`this machine does not sync ${unknown.join(", ")} — run \`rbox scope\` to see what it does sync`);
+    if (unknown.length > 0) throw new Error(`this machine does not sync ${unknown.join(", ")} — run \`rbox include\` to see what it does sync`);
     if (target.length === 0) {
       throw new Error("that would leave nothing to sync — run `rbox untrack` if you want to stop syncing this folder entirely");
     }
@@ -119,7 +119,7 @@ async function editScope(
   }
   if (validated.prefixes.join("\n") === accepted.join("\n")) {
     if (opts.json) emitJson({ changed: false, prefixes: validated.prefixes });
-    else console.log("nothing to change — this machine already syncs exactly those folders.");
+    else if (!opts.quiet) console.log("nothing to change — this machine already syncs exactly those folders.");
     return;
   }
 
@@ -128,6 +128,7 @@ async function editScope(
     emitJson({ changed: true, ...result });
     return;
   }
+  if (opts.quiet) return;
   console.log(`${style.bold("now syncing")}: ${validated.prefixes.map((p) => style.cyan(p)).join(", ")}`);
   if (result.pruned.length > 0) {
     console.log(`${result.pruned.join(", ")} moved to the local trash — undo with ${style.cyan("rbox trash restore <path>")}`);

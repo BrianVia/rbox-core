@@ -16,7 +16,12 @@ import { enrolledDeviceId } from "./e2ee-keystore.js";
 import { resolveWorkspaceDeviceId } from "./init-plan.js";
 import { RebindConsentRequiredError } from "./reset-consent.js";
 import { assertNoPendingGenesis } from "./e2ee-client.js";
-import { rememberBinding } from "./binding-registry.js";
+import { recordBindingScope, rememberBinding } from "./binding-registry.js";
+import { flagValues } from "./flags.js";
+import { saveStateSource } from "./sync-state.js";
+import { loadState } from "./sync-state-store.js";
+import { resolveBindingScope, type BindingScope } from "./scope/binding-scope.js";
+import type { ScopeTransactionDeps } from "./scope/scope-transaction.js";
 
 export interface TrackResult {
   cfg: WorkspaceConfig;
@@ -29,6 +34,39 @@ export interface TrackDeps {
   promptSelect?: (typeof import("./prompt.js"))["promptSelect"];
   promptWorkspacePick?: (typeof import("./workspace-picker.js"))["promptWorkspacePick"];
   createRemoteWorkspace?: (typeof import("./remote.js"))["createRemoteWorkspace"];
+  scopeDeps?: ScopeTransactionDeps;
+}
+
+function sameScope(seal: BindingScope, scope: readonly string[] | undefined): boolean {
+  if (!scope?.length) return seal.kind === "unscoped";
+  return seal.kind === "scoped" && seal.prefixes.join("\n") === scope.join("\n");
+}
+
+async function restoreTrackScope(
+  root: string,
+  baseline: WorkspaceConfig,
+  baselineState: Awaited<ReturnType<typeof loadRawState>>,
+): Promise<void> {
+  await withWorkspaceSyncMutex(root, async () => {
+    if (baselineState) {
+      const current = await loadState(root, syncStreamId(baseline));
+      await saveStateSource(root, current, {
+        expectedStream: syncStreamId(baseline),
+        sourceGlobalSeq: baselineState.lastSyncedSequence,
+        globalManifest: baselineState.lastSyncedManifest,
+        observedRepos: [],
+        values: {},
+      });
+    }
+    // A temporary disagreement halts safely. Publishing an unscoped config before
+    // clearing its witness would instead create a window that looks read-write.
+    await recordBindingScope(root, baseline.remoteWorkspaceId, baseline.scope);
+    await saveConfig(root, baseline);
+  });
+  const restored = await resolveBindingScope(root);
+  if (!sameScope(restored, baseline.scope)) {
+    throw new Error("scope rollback did not restore the binding's previous include state");
+  }
 }
 
 /**
@@ -44,6 +82,10 @@ export async function track(
   deps: TrackDeps = {}
 ): Promise<TrackResult> {
   const root = path.resolve(pathArg ?? process.cwd());
+  const includes = flagValues(flags, "include");
+  if (includes.length > 0 && flags.workspace === undefined) {
+    throw new Error("--include chooses folders of an existing workspace — use it with --workspace <id>");
+  }
   const remoteUrl = flags.remote ?? defaultRemote;
   const projectId = flags.project ?? "root";
   const { credentialsForStrictFlow, loadCredentials } = await import("./credentials.js");
@@ -130,6 +172,11 @@ export async function track(
       // non-git root; pass --git false to opt out.
       syncGit: flags.git !== "false",
       respectGitignore: flags["respect-gitignore"] === "true",
+      ...(prev?.scope ? {
+        scope: [...prev.scope],
+        ...(prev.scopeGeneration === undefined ? {} : { scopeGeneration: prev.scopeGeneration }),
+        ...(prev.scopeIntent === undefined ? {} : { scopeIntent: prev.scopeIntent }),
+      } : {}),
       // Cache a picker-supplied workspace name LOCALLY so `rbox status` shows it with
       // no round-trip (manual-id / --workspace entry has none → status falls back to id).
       ...(pickedName ? { name: pickedName } : {}),
@@ -143,8 +190,44 @@ export async function track(
     remoteWorkspaceId: cfg.remoteWorkspaceId,
     ...(cfg.name ? { name: cfg.name } : {}),
     ...(creds?.accountId ? { accountId: creds.accountId } : {}),
+    ...(cfg.scope ? { scope: cfg.scope } : {}),
   });
-  return { cfg, root };
+  if (includes.length === 0) return { cfg, root };
+  const autostart = await import("./autostart-cmd.js");
+  const control = await import("./daemon-control.js");
+  const daemonRunning = deps.scopeDeps?.daemonRunning
+    ?? ((workspaceRoot: string) => control.readDaemonPidRecord(workspaceRoot).pid !== undefined);
+  const stopDaemon = deps.scopeDeps?.stopDaemon ?? autostart.stopDaemonAndRecordDesired;
+  const startDaemon = deps.scopeDeps?.startDaemon ?? autostart.startDaemonAndRecordDesired;
+  let daemonStopAttempted = false;
+  try {
+    const { scopeCmd } = await import("./scope/scope-cmd.js");
+    await scopeCmd(root, "add", includes, { quiet: true }, {
+      ...deps.scopeDeps,
+      daemonRunning,
+      stopDaemon: async (workspaceRoot) => {
+        daemonStopAttempted = true;
+        await stopDaemon(workspaceRoot);
+      },
+      startDaemon,
+    });
+  } catch (error) {
+    try {
+      await restoreTrackScope(root, cfg, initialState);
+      if (daemonStopAttempted && !daemonRunning(root)) await startDaemon(root);
+    } catch (rollbackError) {
+      throw new Error(
+        `workspace binding succeeded, but its include setup failed and rollback could not be verified: ${String(rollbackError)}`,
+        { cause: error },
+      );
+    }
+    const previous = cfg.scope?.length
+      ? "the workspace remains bound with its previous included folders"
+      : "the workspace was bound unscoped";
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`${detail}\n${previous} — run \`rbox include add <folder>\` to finish choosing folders`, { cause: error });
+  }
+  return { cfg: await loadConfig(root), root };
 }
 
 /** Print the human-facing summary for a successful `track`. */
