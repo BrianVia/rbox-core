@@ -200,8 +200,8 @@ test("an in-place overwrite of an UNREAD page cannot reach a contained consumer"
       fs.fsyncSync(shared);
     } finally {
       fs.closeSync(shared);
+      reader.close();
     }
-    reader.close();
   } finally {
     lock.release();
   }

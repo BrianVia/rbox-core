@@ -7,7 +7,7 @@ import type { RepoBaseProof } from "../../sync-git/base-composer.js";
 import { encodeRepoRecord } from "../codecs/repo-record.js";
 import { canonicalJson, parseCanonicalJson, retainedEstimate, utf16beOrderKey } from "../digest/codecs.js";
 import {
-  RepoTransitionDigestBuilder, canonicalStageBinding, sameStageBinding,
+  RepoTransitionDigestBuilder, sameStageBinding,
   type RepoTransitionDigest, type SourceStageBinding,
 } from "../digest/repo-transition-v1.js";
 import { ProoflessBaseError, StageChangedError, TransitionRowOversizeError } from "../errors.js";
