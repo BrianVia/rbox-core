@@ -5,6 +5,50 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_SESSION 2026-07-28 (all-nighter, back half): **163 RATIFIED at v10 then
+REDUCED at v11, B0 shipped, #526 saga CLOSED with field proof, 212 V1 landed,
+v1.10.2 released.** (1) **Design 163**: R4 ratification round (2 opus lanes +
+codex serial ×6, all artifacts in docs/design/notes/163/) drove v5→v10;
+RATIFIED, then founder requirement reductions produced **v11 (RATIFIED
+AMENDMENT, #544)**: migration is LOCK-EXCLUSIVE ("parked car" — runs only
+holding the workspace mutation locks, entered via `rbox upgrade`'s stop window
+or foreground `rbox migrate`; paired-interval live-writer sampling DELETED as
+a U3 requirement; residual race reclassified excluded-scenario/defense-in-depth,
+F1–F6 kept as regression nets); the U3 drain gate reads the EXISTING
+rbox-admin version view (founder confirmed it exists — #540 closed invalid;
+users: 1 on 1.6 nudgeable friend, 2 on 1.9.x, fleet on dev). Plan:
+B0 ships as 1.11.0 → U1/U2 on main → 2.0 branch only for U3 → U4a–f as 2.x →
+U5. ONE founder input owed: frozen machine profile (blocks U5 only). Fold
+integrity lesson baked into the doc's own provenance: two rounds falsely
+logged the schema closure — **verify folds by grep on committed bytes, never
+by review logs**. (2) **B0 IMPLEMENTED and merged (#539)**: Q-recognition with
+per-site AST-pinned inventory, typed unlocked-writer refusals, content-bound
+last-writer witness, 128-byte-headered reserve; 9 codex findings folded incl.
+a CRITICAL reset R0 rename race. 1.11.0 release train awaits founder tag.
+Follow-up: #542 (barrier read lacks O_NOFOLLOW). (3) **#526 CLOSED**:
+`rbox git republish <repo>` (#536, +884, spec + 12 codex findings in
+docs/design/notes/2026-07-28-526-republish-lever.md) field-validated same
+night — Mac published the restarted chain (`git-sync republish restarted`),
+desktop imported 24s after its last link-4 failure, FM recovered after moving
+its orphaned-stub `.git` to ~/rbox-recovery/savvy-core.git-stub-20260728
+(founder-approved; delete when confident). **Fleet git-sync is clean on all
+three hosts** — first time since early July. Mac runs 1.10.2-dev+2a9e860;
+desktop+FM still on dev #12 (receivers needed no change). (4) **212 V1 merged
+(#538**, ~1,920 lines, 53 tests; 12 codex findings — 2 real bugs fixed:
+scoped-CLEAN status, remove→pull→add rematerialization). Fleet validation
+still owed (needs fleet dev refresh). (5) **/simplify sweep** (founder-ordered,
+retro): #536 −24 lines pre-merge, #541 B0 honesty pass, #543 212 cleanup
+(scope-findings.json dead fields removed pre-release-window). Verdict across
+all three: implementations carry zero flourish beyond their designs.
+(6) **Second same-night writer incident**: codex with `--sandbox
+workspace-write` reverted an implementer's unstaged tree twice → STANDING
+RULE: review codex runs are `--sandbox read-only`; ONE writer per worktree;
+verify committed bytes with `git show HEAD:`. (#535 echo-clobber remains open;
+desktop carve-out for .claude/worktrees still in place — worktrees at
+~/agent-work/526-republish and /home/via/rbox-worktrees/212-v1 are strays to
+sweep after their branches are confirmed dead.) Founder queue: 1.11.0 tag ·
+machine profile · 212 fleet validation · #535 root-cause · #542._
+
 _SESSION 2026-07-27 (night) → 07-28 (early): **memory incident closed, desktop
 READ-WRITE, v1.10.2 shipped, 163/2.0 kickoff.** (1) **OOM root-caused end to
 end** (report: `/home/via/memory-incident-report-2026-07-27.md` on the desktop,
