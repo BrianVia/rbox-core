@@ -18,7 +18,11 @@ export interface GenesisLineage {
   telemetryBindingId?: string;
 }
 
-export function applySchemaV1(db: Database, genesis: GenesisLineage): void {
+export function applySchemaV1(db: Database): void {
+  db.exec(SCHEMA_V1_DDL);
+}
+
+export function installGenesisLineage(db: Database, genesis: GenesisLineage): void {
   if (!/^[0-9a-f]{32}$/.test(genesis.authorityId)) throw new TypeError("authorityId must be lowercase hex32");
   if (!/^[0-9a-f]{32}$/.test(genesis.lineageId)) throw new TypeError("lineageId must be lowercase hex32");
   if (!genesis.stream || Buffer.byteLength(genesis.stream) > 4096) throw new TypeError("stream must be nonempty bounded text");
@@ -31,7 +35,6 @@ export function applySchemaV1(db: Database, genesis: GenesisLineage): void {
     throw new TypeError("telemetryBindingId must be lowercase hex16");
   }
   const initialize = db.transaction(() => {
-    db.exec(SCHEMA_V1_DDL);
     db.query(`INSERT INTO state_lineage(
       lineage_id,stream,state_nonce,state_revision,last_synced_sequence,
       active_base_generation,local_revision,telemetry_binding_id,
