@@ -6,6 +6,8 @@ import { saveState, type SyncState } from "../config.js";
 
 const root = path.resolve(import.meta.dir, "../../..");
 const srcRoot = path.join(root, "src");
+// 11,768 bytes when introduced; leave room for legitimate allowlist growth.
+const AST_SWEEP_MAX_BYTES = 20 * 1024;
 
 interface Site {
   file: string;
@@ -28,9 +30,16 @@ function parsedAstSites(): AstSite[] {
     "node",
     path.join(import.meta.dir, "base-composer-ast-sweep.mjs"),
     root,
+    "base-composer-structure",
   ]);
   if (!result.success) throw new Error(result.stderr.toString() || `AST sweep exited ${result.exitCode}`);
-  astSites = JSON.parse(result.stdout.toString()) as AstSite[];
+  expect(result.stdout.byteLength, "AST sweep returned empty stdout").toBeGreaterThan(0);
+  expect(result.stdout.byteLength, "AST sweep output exceeded its transport budget")
+    .toBeLessThanOrEqual(AST_SWEEP_MAX_BYTES);
+  const parsed: unknown = JSON.parse(result.stdout.toString());
+  expect(Array.isArray(parsed), "AST sweep output was not an array").toBeTrue();
+  expect(parsed.length, "AST sweep returned no records").toBeGreaterThan(0);
+  astSites = parsed as AstSite[];
   return astSites;
 }
 
