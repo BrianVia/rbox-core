@@ -79,8 +79,11 @@ async function sweep(pattern: RegExp, include: (file: string, line: string) => b
 }
 
 test("design 130 whole-state persistence is a closed allowlist", async () => {
+  // `publishWholeState` is design 163 B0's single barrier-checked publication
+  // seam; it counts as a whole-state persistence site so routing through it can
+  // never be used to slip past this gate.
   const sites = await astSweep((site) => site.category === "call" && (
-    ["saveState", "saveStateUnsafeLegacyOrTest"].includes(site.callee ?? "")
+    ["saveState", "saveStateUnsafeLegacyOrTest", "publishWholeState"].includes(site.callee ?? "")
       || (["writeFileAtomic", "fs.writeFile"].includes(site.callee ?? "")
         && site.arguments?.[0]?.startsWith("statePath(") === true)
   ));

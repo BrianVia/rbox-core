@@ -114,12 +114,15 @@ test("an accepted state CAS publishes state.json's parent before retiring the in
         rm.mockRestore();
       }
 
-      expect(steps).toEqual([
+      expect(steps.slice(0, 4)).toEqual([
         "rename state.json",
         `fsync ${stateParent}`,
         "unlink marker",
         `fsync ${markerParent}`,
       ]);
+      // Design 163 B0's witness and reserve are written after that window and
+      // may only add directory flushes to it — never another publication.
+      expect(steps.slice(4).filter((step) => !step.startsWith("fsync "))).toEqual([]);
     } finally {
       await acquired.lock.release();
     }

@@ -21,6 +21,7 @@ import {
   type SyncState,
   type WorkspaceConfig,
 } from "../config.js";
+import { rethrowIfStateBarrier } from "../state-barrier.js";
 import { inputRecord } from "../sync-state.js";
 import { recoverStateCasLocks, type StateCasRecoveryResult } from "./state-cas-locks.js";
 
@@ -437,8 +438,12 @@ export async function reconcileGitDeferrals(
         sourceGlobalSeq: base.lastSyncedSequence,
         repos: transitions,
       });
-    } catch {
-      const winner = await deps.reload(root, base.stream || syncStreamId(cfg)).catch(() => base);
+    } catch (error) {
+      rethrowIfStateBarrier(error);
+      const winner = await deps.reload(root, base.stream || syncStreamId(cfg)).catch((reloadError: unknown) => {
+        rethrowIfStateBarrier(reloadError);
+        return base;
+      });
       return { state: winner, changed: false, accepted: false, displayDetails, commonDirsInspected: sharedInspections.size, recoveredLocks };
     }
     if (saved.status === "accepted") {
@@ -491,21 +496,29 @@ export async function reconcileGitDeferrals(
             sourceGlobalSeq: repairBase.lastSyncedSequence,
             repos: repairs,
           });
-        } catch {
-          repairBase = await deps.reload(root, repairBase.stream || syncStreamId(cfg)).catch(() => repairBase);
+        } catch (error) {
+          rethrowIfStateBarrier(error);
+          repairBase = await deps.reload(root, repairBase.stream || syncStreamId(cfg)).catch((reloadError: unknown) => {
+            rethrowIfStateBarrier(reloadError);
+            return repairBase;
+          });
           await deps.compensationBackoff(repairAttempt);
           continue;
         }
         if (repaired.status === "accepted") {
           return { state: repaired.state, changed: true, accepted: true, displayDetails, commonDirsInspected: sharedInspections.size, recoveredLocks };
         }
-        repairBase = await deps.reload(root, repairBase.stream || syncStreamId(cfg)).catch(() =>
-          repaired.status === "rejected" ? repaired.state : repairBase);
+        repairBase = await deps.reload(root, repairBase.stream || syncStreamId(cfg)).catch((reloadError: unknown) => {
+          rethrowIfStateBarrier(reloadError);
+          return repaired.status === "rejected" ? repaired.state : repairBase;
+        });
         await deps.compensationBackoff(repairAttempt);
       }
     }
-    const winner = await deps.reload(root, base.stream || syncStreamId(cfg)).catch(() =>
-      saved.status === "rejected" ? saved.state : base);
+    const winner = await deps.reload(root, base.stream || syncStreamId(cfg)).catch((reloadError: unknown) => {
+      rethrowIfStateBarrier(reloadError);
+      return saved.status === "rejected" ? saved.state : base;
+    });
     if (saved.status !== "rejected" || saved.reason !== "repo-generation") {
       return { state: winner, changed: false, accepted: false, displayDetails, commonDirsInspected: sharedInspections.size, recoveredLocks };
     }

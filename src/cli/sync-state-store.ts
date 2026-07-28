@@ -20,6 +20,8 @@ import {
 import { BINDING_ID_RE } from "./telemetry/contract.js";
 import { readResetJournal, recoverResetJournal } from "./reset-journal.js";
 import { boundedJsonRead } from "./reset-io.js";
+import { assertStatePublishable, assertStateReadable, StateWriteRefusedError } from "./state-barrier.js";
+import { afterStatePublication, publishWholeState } from "./state-publish.js";
 import { RBOX_DIR } from "./workspace-config.js";
 import {
   expectedStateNonce,
@@ -85,6 +87,7 @@ async function hasResetLineageArchive(root: string): Promise<boolean> {
 /** Raw state load for the transactional writer. Unlike loadState, this never
  * hides a stream mismatch by manufacturing a fresh baseline. */
 export async function loadRawState(root: string): Promise<SyncState | undefined> {
+  await assertStateReadable(statePath(root));
   const state = await boundedJsonRead<SyncState>(statePath(root));
   if (state) return stripObsoleteResolutionIntents(state);
   const marker = await boundedJsonRead<{
@@ -212,8 +215,12 @@ export async function applyStateSavePacket(root: string, packet: StateSavePacket
       stateRevision: normalizeStateCounter(current.stateRevision) + 1,
     }, records);
     let owner = true;
-    await writeFileAtomic(statePath(root), JSON.stringify(next, null, 2), {
-      beforeRename: async () => (owner = await lock.isOwner()),
+    const body = JSON.stringify(next, null, 2);
+    await writeFileAtomic(statePath(root), body, {
+      beforeRename: async () => {
+        await assertStatePublishable(statePath(root), { locked: true });
+        return (owner = await lock.isOwner());
+      },
     });
     if (!owner) return { status: "rejected", reason: "owner-lost", state: current };
     // writeFileAtomic syncs the temp's BYTES, but the rename that publishes them
@@ -230,6 +237,9 @@ export async function applyStateSavePacket(root: string, packet: StateSavePacket
     await fs.rm(stateIncarnationPath(root), { force: true });
     // …and this publishes that unlink in the marker's own parent.
     if (markerExisted) await fsyncDirectory(path.dirname(stateIncarnationPath(root)));
+    // Last, so nothing about the witness sits inside the marker-retirement crash
+    // window: the witness is diagnostic evidence, never durability ordering.
+    await afterStatePublication(root, statePath(root), next, body);
     return { status: "accepted", state: next };
   } finally {
     if (releaseLock) await lock.release();
@@ -366,8 +376,26 @@ async function writeWholeStateUnsafe(root: string, state: SyncState): Promise<vo
           ...(state.gitPendingRemote === undefined ? {} : { gitPendingRemote: sanitizeSectionMap(state.gitPendingRemote) }),
         };
       })();
-  await writeFileAtomic(statePath(root), JSON.stringify(sanitized, null, 2));
-  await fsyncDirectory(path.dirname(statePath(root)));
+  const body = JSON.stringify(sanitized, null, 2);
+  // The whole-state writer historically published with no lock at all, which is
+  // what let a legacy save land on top of a newer format. It now takes the same
+  // state lock every other writer holds; only a filesystem that offers no lock
+  // primitive (`unsupported`) authorizes publishing without one. Contention, an
+  // I/O failure, and a lost lease are refusals, not permission to write anyway.
+  const acquired = await acquireLock(stateLockPath(root));
+  if (acquired.status === "held") {
+    throw new StateWriteRefusedError("state-lock-unavailable", statePath(root), stateLockBusyDetail(acquired));
+  }
+  if (acquired.status === "error") {
+    throw new StateWriteRefusedError("state-lock-error", statePath(root), String(acquired.error));
+  }
+  const lock = acquired.status === "acquired" ? acquired.lock : undefined;
+  try {
+    await publishWholeState(statePath(root), body, lock);
+    await afterStatePublication(root, statePath(root), state, body);
+  } finally {
+    await lock?.release();
+  }
 }
 
 /** Fresh, non-Git initialization only. Git BASE and every repository sidecar are
@@ -407,11 +435,16 @@ export async function ensureTelemetryBindingId(
     const bindingId = randomBytes(8).toString("hex");
     const next: SyncState = { ...current, telemetryBindingId: bindingId };
     let owner = true;
-    await writeFileAtomic(statePath(root), JSON.stringify(next, null, 2), {
-      beforeRename: async () => (owner = await acquired.lock.isOwner()),
+    const body = JSON.stringify(next, null, 2);
+    await writeFileAtomic(statePath(root), body, {
+      beforeRename: async () => {
+        await assertStatePublishable(statePath(root), { locked: true });
+        return (owner = await acquired.lock.isOwner());
+      },
     });
     if (!owner) throw new Error("sync state telemetry lock ownership was lost");
     await fsyncDirectory(path.dirname(statePath(root)));
+    await afterStatePublication(root, statePath(root), next, body);
     return { state: next, bindingId };
   } finally {
     await acquired.lock.release();
@@ -448,8 +481,9 @@ export async function installGenesisResetStateUnderHeldLock(
     lastSyncedManifest: EMPTY_MANIFEST,
     repoRecords: {},
   };
-  await writeFileAtomic(statePath(root), JSON.stringify(genesis, null, 2));
-  await fsyncDirectory(path.dirname(statePath(root)));
+  const body = JSON.stringify(genesis, null, 2);
+  await publishWholeState(statePath(root), body, heldLock);
+  await afterStatePublication(root, statePath(root), genesis, body);
   await writeFileAtomic(stateIncarnationPath(root), JSON.stringify({
     stream: genesis.stream,
     stateNonce: genesis.stateNonce,

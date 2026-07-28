@@ -42,6 +42,7 @@ import {
   boundedRead,
   parseResetJsonBytes,
 } from "./reset-io.js";
+import { assertStateReadable } from "./state-barrier.js";
 import { createPRepairStatePort } from "./sync-git/p-repair-state.js";
 import { settleExactPresentArtifact } from "./sync-git/p-settlement.js";
 import {
@@ -294,6 +295,7 @@ async function prepareResetArtifactsUnderFence<T>(
     const journalRoot = path.join(root, RBOX_DIR, "state", "git-journal");
     const remaining = await fs.readdir(journalRoot).catch((error) => isENOENT(error) ? [] : Promise.reject(error));
     if (remaining.length > 0) throw new Error(`reset refused: unbound or unreadable checkout journal entries remain at ${journalRoot}`);
+    await assertStateReadable(statePath(root));
     const stateBytes = await boundedRead(statePath(root), RESET_MATERIALIZED_BYTE_LIMIT);
     if (!stateBytes) throw new Error("reset refused: active state disappeared during artifact preflight");
     assertResetParseAdmission(stateBytes.byteLength);
@@ -460,6 +462,7 @@ export async function resetSyncState(
         }
         recoveryCallerStream = prior.stream;
         await prepareResetArtifactsUnderFence(root, prior, descriptors, acquired.lock, async (preparedState, preparedBytes, z) => {
+          await assertStateReadable(statePath(root));
           const revalidated = await boundedRead(statePath(root), RESET_MATERIALIZED_BYTE_LIMIT);
           if (!revalidated) throw new Error("sync state disappeared before reset journal preparation");
           if (!revalidated.equals(preparedBytes)) throw new Error("sync state changed before reset journal preparation");

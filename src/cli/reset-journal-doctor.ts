@@ -2,7 +2,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { acquireLock } from "../engine/git/lockfile.js";
 import { withRepositoryRecoveryFence, type RepositoryProtocolFenceRequest } from "../engine/git/protocol-locks.js";
-import { loadConfig, stateLockPath, syncStreamId } from "./config.js";
+import { loadConfig, stateLockPath, statePath, syncStreamId } from "./config.js";
+import { assertStateReadable } from "./state-barrier.js";
 import { boundedHash, boundedRead } from "./reset-io.js";
 import { inspectResetJournalSafety } from "./reset-halt-inspection.js";
 import { resetJournalPath } from "./reset-journal.js";
@@ -31,6 +32,9 @@ export async function withResetJournalDoctorFence<T>(root: string, requests: rea
   return withWorkspaceSyncMutex(root, async () => withRepositoryRecoveryFence(requests, stateLockPath(root), async () => {
     const acquired = await acquireLock(stateLockPath(root));
     if (acquired.status !== "acquired") throw new Error("reset-journal doctor could not acquire the state recovery fence");
+    // Everything inside this fence hashes, quarantines, or republishes the live
+    // state. A newer state plane is refused here rather than at each read.
+    await assertStateReadable(statePath(root));
     try { return await fn(); }
     finally {
       const released = await acquired.lock.release();
