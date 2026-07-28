@@ -13,6 +13,8 @@ import {
   resumeDesiredDaemon,
   startDaemonAndRecordDesired,
   stopDaemonAndRecordDesired,
+  parkDaemonForMaintenance,
+  resumeDaemonAfterMaintenance,
 } from "./autostart-cmd.js";
 import { daemonPidPath, daemonStatusPath } from "./rbox-paths.js";
 
@@ -942,4 +944,84 @@ test("credential degradation is actionable in status and starts zero boot-resume
     console.log = oldLog;
   }
   expect(lines.join("\n")).toContain("credential-degraded");
+});
+
+test("parking records the resume obligation before the daemon is stopped", async () => {
+  const root = await workspace("ws_park");
+  await recordDesired(root, "running", "acct_park");
+  const stopped: string[] = [];
+  await parkDaemonForMaintenance(root, "mt_1", {
+    loadCredentials: creds("acct_park"),
+    stopDaemon: async (r) => {
+      // The obligation is already on disk while the process is still being stopped.
+      const midPark = JSON.parse(await fs.readFile(desiredStatePath(r), "utf8"));
+      expect(midPark.maintenance).toMatchObject({ id: "mt_1", resume: "running" });
+      stopped.push(r);
+    },
+    now: () => new Date("2026-07-28T00:00:00.000Z"),
+  });
+  expect(stopped).toEqual([root]);
+  const parked = JSON.parse(await fs.readFile(desiredStatePath(root), "utf8"));
+  expect(parked).toMatchObject({ state: "stopped", maintenance: { id: "mt_1", resume: "running" } });
+});
+
+test("only the matching token resumes, and it resumes exactly once", async () => {
+  const root = await workspace("ws_resume");
+  await recordDesired(root, "running", "acct_resume");
+  await parkDaemonForMaintenance(root, "mt_1", { loadCredentials: creds("acct_resume"), stopDaemon: async () => {} });
+
+  const started: string[] = [];
+  const start = async (r: string) => {
+    started.push(r);
+    return "started" as const;
+  };
+  expect(await resumeDaemonAfterMaintenance(root, "mt_other", { loadCredentials: creds("acct_resume"), startDaemon: start })).toBe(false);
+  expect(started).toEqual([]);
+
+  expect(await resumeDaemonAfterMaintenance(root, "mt_1", { loadCredentials: creds("acct_resume"), startDaemon: start })).toBe(true);
+  expect(started).toEqual([root]);
+  const resumed = JSON.parse(await fs.readFile(desiredStatePath(root), "utf8"));
+  expect(resumed.state).toBe("running");
+  expect(resumed.maintenance).toBeUndefined();
+
+  // Replaying the same token is a no-op: the obligation was consumed.
+  expect(await resumeDaemonAfterMaintenance(root, "mt_1", { loadCredentials: creds("acct_resume"), startDaemon: start })).toBe(false);
+  expect(started).toEqual([root]);
+});
+
+test("an explicit stop cancels the maintenance obligation", async () => {
+  const root = await workspace("ws_userstop");
+  await recordDesired(root, "running", "acct_userstop");
+  await parkDaemonForMaintenance(root, "mt_1", { loadCredentials: creds("acct_userstop"), stopDaemon: async () => {} });
+  await stopDaemonAndRecordDesired(root, { loadCredentials: creds("acct_userstop"), stopDaemon: async () => {} });
+
+  expect(JSON.parse(await fs.readFile(desiredStatePath(root), "utf8")).maintenance).toBeUndefined();
+  const started: string[] = [];
+  expect(await resumeDaemonAfterMaintenance(root, "mt_1", {
+    loadCredentials: creds("acct_userstop"),
+    startDaemon: async (r) => {
+      started.push(r);
+      return "started" as const;
+    },
+  })).toBe(false);
+  expect(started).toEqual([]);
+  expect(JSON.parse(await fs.readFile(desiredStatePath(root), "utf8")).state).toBe("stopped");
+});
+
+test("parking a daemon the user had already stopped does not start it later", async () => {
+  const root = await workspace("ws_parkstopped");
+  await recordDesired(root, "stopped", "acct_parkstopped");
+  await parkDaemonForMaintenance(root, "mt_1", { loadCredentials: creds("acct_parkstopped"), stopDaemon: async () => {} });
+  expect(JSON.parse(await fs.readFile(desiredStatePath(root), "utf8")).maintenance).toMatchObject({ resume: "stopped" });
+
+  const started: string[] = [];
+  expect(await resumeDaemonAfterMaintenance(root, "mt_1", {
+    loadCredentials: creds("acct_parkstopped"),
+    startDaemon: async (r) => {
+      started.push(r);
+      return "started" as const;
+    },
+  })).toBe(false);
+  expect(started).toEqual([]);
+  expect(JSON.parse(await fs.readFile(desiredStatePath(root), "utf8")).maintenance).toBeUndefined();
 });

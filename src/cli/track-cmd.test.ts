@@ -145,8 +145,9 @@ test("a failed include transition restarts background sync after restoring the p
     daemonRunning: () => false,
   });
   let running = true;
-  let stops = 0;
-  let starts = 0;
+  let parks = 0;
+  let resumes = 0;
+  let token: string | undefined;
 
   await expect(track(
     root,
@@ -155,20 +156,24 @@ test("a failed include transition restarts background sync after restoring the p
     {
       scopeDeps: {
         daemonRunning: () => running,
-        stopDaemon: async () => {
-          stops++;
+        parkDaemon: async (_root, id) => {
+          parks++;
+          token = id;
           running = false;
         },
-        startDaemon: async () => {
-          starts++;
+        resumeDaemon: async (_root, id) => {
+          resumes++;
+          if (id !== token) return false;
+          token = undefined;
           running = true;
+          return true;
         },
         recordWitness: async () => { throw new Error("injected witness failure"); },
       },
     },
   )).rejects.toThrow("the workspace remains bound with its previous included folders");
 
-  expect({ running, stops, starts }).toEqual({ running: true, stops: 1, starts: 1 });
+  expect({ running, parks, resumes }).toEqual({ running: true, parks: 1, resumes: 1 });
   expect(await resolveBindingScope(root)).toMatchObject({
     kind: "scoped",
     prefixes: ["Personal/repo-A"],

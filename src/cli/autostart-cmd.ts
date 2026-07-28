@@ -21,6 +21,14 @@ const RBOX_BIN_REL = `${RBOX_DIR}/bin/rbox`;
 
 export type DesiredDaemonStateValue = "running" | "stopped";
 
+/** "stopped for maintenance, resume to `resume`" — the durable form of a stop that
+ *  owes a restart. Only the holder of `id` may close the window. */
+export interface DaemonMaintenance {
+  id: string;
+  resume: DesiredDaemonStateValue;
+  at: string;
+}
+
 export interface DesiredDaemonState {
   rootPath: string;
   state: DesiredDaemonStateValue;
@@ -29,6 +37,7 @@ export interface DesiredDaemonState {
   at: string;
   pullOnly?: boolean;
   pendingModeIntent?: DaemonMode;
+  maintenance?: DaemonMaintenance;
 }
 
 export interface DesiredStateRow {
@@ -148,6 +157,14 @@ async function exists(p: string): Promise<boolean> {
   }
 }
 
+function parseMaintenance(v: unknown): DaemonMaintenance | undefined {
+  if (typeof v !== "object" || v === null) return undefined;
+  const m = v as Partial<DaemonMaintenance>;
+  if (typeof m.id !== "string" || !m.id) return undefined;
+  if (m.resume !== "running" && m.resume !== "stopped") return undefined;
+  return { id: m.id, resume: m.resume, at: typeof m.at === "string" ? m.at : "" };
+}
+
 function parseDesired(raw: string): DesiredDaemonState | undefined {
   try {
     const v = JSON.parse(raw) as Partial<DesiredDaemonState>;
@@ -158,6 +175,7 @@ function parseDesired(raw: string): DesiredDaemonState | undefined {
     if (typeof v.at !== "string" || !v.at) return undefined;
     if (v.pullOnly !== undefined && typeof v.pullOnly !== "boolean") return undefined;
     if (v.pendingModeIntent !== undefined && v.pendingModeIntent !== "pull-only" && v.pendingModeIntent !== "read-write") return undefined;
+    const maintenance = parseMaintenance(v.maintenance);
     return {
       rootPath: v.rootPath,
       state: v.state,
@@ -166,6 +184,7 @@ function parseDesired(raw: string): DesiredDaemonState | undefined {
       at: v.at,
       ...(v.pullOnly === true ? { pullOnly: true } : {}),
       ...(v.pendingModeIntent === undefined ? {} : { pendingModeIntent: v.pendingModeIntent }),
+      ...(maintenance === undefined ? {} : { maintenance }),
     };
   } catch {
     return undefined;
@@ -468,8 +487,7 @@ export async function resumeDesiredDaemon(
   });
 }
 
-export async function stopDaemonAndRecordDesired(root: string, deps: StartStopDeps = {}): Promise<void> {
-  const abs = path.resolve(root);
+async function recordStoppedDesired(abs: string, deps: StartStopDeps, maintenance?: DaemonMaintenance): Promise<void> {
   const identity = await desiredContext(abs, "stopped", deps);
   await mutateDesiredRecord(abs, async (current) => {
     let accepted = desiredMode(current);
@@ -482,11 +500,64 @@ export async function stopDaemonAndRecordDesired(root: string, deps: StartStopDe
       }
     }
     await (deps.stopDaemon ?? stopDaemon)(abs);
-    return desiredWithModes({
+    const stopped = desiredWithModes({
       ...identity,
       state: "stopped",
       at: (deps.now ?? (() => new Date()))().toISOString(),
     }, accepted, pending);
+    return maintenance === undefined ? stopped : { ...stopped, maintenance };
+  });
+}
+
+/** A user stop is the last word: rebuilding the record from a fresh identity drops
+ *  any maintenance token, so an in-flight scope edit will not resurrect the daemon
+ *  the user just asked to switch off. */
+export async function stopDaemonAndRecordDesired(root: string, deps: StartStopDeps = {}): Promise<void> {
+  await recordStoppedDesired(path.resolve(root), deps);
+}
+
+/**
+ * Stop the daemon under a durable obligation to bring it back: the record reads
+ * "stopped for maintenance, resume to X", never a bare "stopped". The token is
+ * claimed BEFORE the process is touched, so no crash inside the window can leave a
+ * stop that nothing owes a restart for.
+ */
+export async function parkDaemonForMaintenance(root: string, id: string, deps: StartStopDeps = {}): Promise<void> {
+  const abs = path.resolve(root);
+  const identity = await desiredContext(abs, "running", deps);
+  const at = (deps.now ?? (() => new Date()))().toISOString();
+  const claimed = await mutateDesiredRecord(abs, (current) => {
+    const held = current?.maintenance;
+    const resume = held?.id === id ? held.resume : (current?.state ?? "running");
+    return { ...(current ?? identity), maintenance: { id, resume, at } };
+  });
+  await recordStoppedDesired(abs, deps, claimed?.maintenance ?? { id, resume: "running", at });
+}
+
+/**
+ * Close the maintenance window opened by exactly `id`. Any other token — a user
+ * stop, a user start, an already-consumed window — means the obligation is gone and
+ * this is a no-op. Resolves to whether the daemon was brought back. Throwing leaves
+ * the token in place so a later attempt can still honour it.
+ */
+export async function resumeDaemonAfterMaintenance(root: string, id: string, deps: StartStopDeps = {}): Promise<boolean> {
+  const abs = path.resolve(root);
+  const held = (await readDesiredRecord(desiredStatePath(abs)))?.maintenance;
+  if (held?.id !== id) return false;
+  if (held.resume !== "running") {
+    await clearMaintenance(abs, id);
+    return false;
+  }
+  const started = await startDaemonAndRecordDesiredImpl(abs, deps);
+  await clearMaintenance(abs, id);
+  return started;
+}
+
+async function clearMaintenance(abs: string, id: string): Promise<void> {
+  await mutateDesiredRecord(abs, (current) => {
+    if (current?.maintenance?.id !== id) return undefined;
+    const { maintenance: _consumed, ...rest } = current;
+    return rest;
   });
 }
 

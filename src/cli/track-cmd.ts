@@ -197,24 +197,26 @@ export async function track(
   const control = await import("./daemon-control.js");
   const daemonRunning = deps.scopeDeps?.daemonRunning
     ?? ((workspaceRoot: string) => control.readDaemonPidRecord(workspaceRoot).pid !== undefined);
-  const stopDaemon = deps.scopeDeps?.stopDaemon ?? autostart.stopDaemonAndRecordDesired;
-  const startDaemon = deps.scopeDeps?.startDaemon ?? autostart.startDaemonAndRecordDesired;
-  let daemonStopAttempted = false;
+  const parkDaemon = deps.scopeDeps?.parkDaemon ?? autostart.parkDaemonForMaintenance;
+  const resumeDaemon = deps.scopeDeps?.resumeDaemon ?? autostart.resumeDaemonAfterMaintenance;
+  // Rollback discards the intent that owed the parked daemon its return, so it has
+  // to carry the token itself.
+  let parkedToken: string | undefined;
   try {
     const { scopeCmd } = await import("./scope/scope-cmd.js");
     await scopeCmd(root, "add", includes, { quiet: true }, {
       ...deps.scopeDeps,
       daemonRunning,
-      stopDaemon: async (workspaceRoot) => {
-        daemonStopAttempted = true;
-        await stopDaemon(workspaceRoot);
+      parkDaemon: async (workspaceRoot, id) => {
+        parkedToken = id;
+        await parkDaemon(workspaceRoot, id);
       },
-      startDaemon,
+      resumeDaemon,
     });
   } catch (error) {
     try {
       await restoreTrackScope(root, cfg, initialState);
-      if (daemonStopAttempted && !daemonRunning(root)) await startDaemon(root);
+      if (parkedToken !== undefined && !daemonRunning(root)) await resumeDaemon(root, parkedToken);
     } catch (rollbackError) {
       throw new Error(
         `workspace binding succeeded, but its include setup failed and rollback could not be verified: ${String(rollbackError)}`,
