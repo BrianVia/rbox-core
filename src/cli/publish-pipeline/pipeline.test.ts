@@ -17,6 +17,7 @@ import type { SyncRemote } from "../remote.js";
 import { encryptAndUpload } from "../sync-recovery.js";
 import { beginFirstPublishTiming, firstPublishTiming } from "../upload-lane-timing.js";
 import { runPublishPipeline } from "./pipeline.js";
+import { CipherDescriptorWriter } from "./shared.js";
 import type { ReceiptPort } from "./receipt-drainer.js";
 
 const hash = (bytes: string | Buffer) => createHash("sha256").update(bytes).digest("hex");
@@ -75,6 +76,19 @@ async function fixture(count: number, duplicate = false) {
   return { root, tmpDir, local: { generatedAt: new Date(0).toISOString(), files } satisfies Manifest };
 }
 
+/** Entries are readonly: seed a carried ciphertext address by replacing the entry. */
+function seedEncSha(files: FileEntry[], index: number, encSha: string): void {
+  files[index] = { ...files[index]!, encSha };
+}
+
+/** The pipeline replaces entries in place of mutating them; it needs the containers. */
+function trackEntries(files: FileEntry[], toEncrypt: FileEntry[]): CipherDescriptorWriter {
+  const entries = new CipherDescriptorWriter();
+  entries.track(files);
+  if (toEncrypt !== files) entries.track(toEncrypt);
+  return entries;
+}
+
 async function run(fx: Awaited<ReturnType<typeof fixture>>, remote: PipelineRemote, options: {
   cache?: EncryptAddressCache;
   writer?: EncryptAddressCacheWriter;
@@ -85,13 +99,15 @@ async function run(fx: Awaited<ReturnType<typeof fixture>>, remote: PipelineRemo
   recoverAddresses?: ReadonlySet<string>;
 } = {}) {
   const cache = options.cache ?? new EncryptAddressCache({ accountId: "a", workspaceId: "w", accountEpoch: 1, keyEpoch: 1 });
+  const toEncrypt = options.toEncrypt ?? fx.local.files;
   return runPublishPipeline({
     api: remote as unknown as SyncRemote,
     root: fx.root,
     kek: generateKek(),
     tmpDir: fx.tmpDir,
-    toEncrypt: options.toEncrypt ?? fx.local.files,
+    toEncrypt,
     local: fx.local,
+    entries: trackEntries(fx.local.files, toEncrypt),
     encryptCache: cache,
     cacheWriter: options.writer ?? new EncryptAddressCacheWriter(fx.root, cache, 60_000),
     encryptOpts: { compress: false },
@@ -152,7 +168,7 @@ test("publish pipeline releases duplicate and server-satisfied ciphertext temps"
     const encrypted = await encryptFileToTemp(path.join(satisfiedFx.root, satisfiedFx.local.files[0]!.path), generateKek(), satisfiedFx.tmpDir);
     // This seed uses a different KEK, so copy the descriptor and then run with a cache-like
     // carried reference to exercise the no-ready satisfied path deterministically.
-    satisfiedFx.local.files[0]!.encSha = encrypted.encSha;
+    seedEncSha(satisfiedFx.local.files, 0, encrypted.encSha);
     remote.blobs.set(encrypted.encSha, await fs.readFile(encrypted.ciphertextPath));
     await fs.rm(encrypted.ciphertextPath, { force: true });
     const original = satisfiedFx.local.files[0]!;
@@ -160,7 +176,7 @@ test("publish pipeline releases duplicate and server-satisfied ciphertext temps"
     const cache = new EncryptAddressCache({ accountId: "a", workspaceId: "w", accountEpoch: 1, keyEpoch: 1 });
     await runPublishPipeline({
       api: remote as unknown as SyncRemote, root: satisfiedFx.root, kek: generateKek(), tmpDir: satisfiedFx.tmpDir,
-      toEncrypt, local: satisfiedFx.local, encryptCache: cache,
+      toEncrypt, local: satisfiedFx.local, entries: trackEntries(satisfiedFx.local.files, toEncrypt), encryptCache: cache,
       cacheWriter: new EncryptAddressCacheWriter(satisfiedFx.root, cache), encryptOpts: { compress: false },
       encryptFileToTemp, report: PhaseReport.disabled(), backoff: async () => {}, pool: undefined,
       preflightDelta: false, fullAudit: false, deferred: new Set(), retryLater: new Set(), uploadsDir: path.join(satisfiedFx.root, "uploads"),
@@ -249,7 +265,7 @@ test("delta recovery checks mapped and address-only entries without uploading th
   try {
     const mapped = "a".repeat(64);
     const unmapped = "b".repeat(64);
-    fx.local.files[0]!.encSha = mapped;
+    seedEncSha(fx.local.files, 0, mapped);
     let encrypts = 0;
     const remote = new PipelineRemote();
     await run(fx, remote, {
@@ -289,7 +305,7 @@ test("unsatisfied cache hit re-encrypts and PUTs exactly once", async () => {
     const remote = new PipelineRemote();
     await run(fx, remote, { cache, encrypt: async (...args) => { encrypts++; return encryptFileToTemp(...args); } });
     expect(encrypts).toBe(1);
-    expect(remote.puts).toEqual([file.encSha!]);
+    expect(remote.puts).toEqual([fx.local.files[0]!.encSha!]);
   } finally { await fs.rm(fx.root, { recursive: true, force: true }); }
 });
 
@@ -308,8 +324,8 @@ test("mutation after ready uploads the scanned snapshot", async () => {
       await fs.writeFile(path.join(fx.root, file.path), "mutated-after-ready");
       return blob;
     } });
-    expect(file.sha256).toBe(scannedSha);
-    expect(file.encSha).toBe(snapshotSha);
+    expect(fx.local.files[0]!.sha256).toBe(scannedSha);
+    expect(fx.local.files[0]!.encSha).toBe(snapshotSha);
     expect(remote.blobs.get(snapshotSha)).toEqual(snapshotBytes);
   } finally { await fs.rm(fx.root, { recursive: true, force: true }); }
 });

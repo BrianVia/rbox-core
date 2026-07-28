@@ -333,7 +333,7 @@ function refHasCompressionFields(ref: unknown): boolean {
  *  stamper (sync.ts) and the schema-4 gates in this file — stamping and
  *  validation MUST agree on the field set or a client could stamp a manifest
  *  its own validator then rejects. */
-export function manifestRequiresSchema4(m: { files: Array<{ comp?: string }>; gitRepos?: Record<string, unknown> }): boolean {
+export function manifestRequiresSchema4(m: { files: ReadonlyArray<{ comp?: string }>; gitRepos?: Record<string, unknown> }): boolean {
   return m.files.some((f) => f.comp !== undefined) || Object.values(m.gitRepos ?? {}).some(gitSectionRequiresSchema4);
 }
 

@@ -36,7 +36,6 @@ import { DEFAULT_REDEEM_THRESHOLD, ReceiptDrainer } from "./receipt-drainer.js";
 import {
   MAX_SHAS_PER_CHECK,
   PER_FILE_UPLOAD_ATTEMPTS,
-  applyCipherDescriptor,
   classifyCacheHit,
   clampConc,
   descriptorFromEncryptedBlob,
@@ -46,6 +45,7 @@ import {
   materializeLease,
   redeemDrainUpload,
   uploadConcurrency,
+  type CipherDescriptorWriter,
 } from "./shared.js";
 
 const ROLLING_CHECK_BATCH = Math.min(5_000, MAX_SHAS_PER_CHECK);
@@ -61,6 +61,8 @@ export interface PublishPipelineArgs {
   tmpDir: string;
   toEncrypt: FileEntry[];
   local: Manifest;
+  /** Owns the entry containers; attaching a descriptor replaces the entry in all of them. */
+  entries: CipherDescriptorWriter;
   encryptCache: EncryptAddressCache;
   cacheWriter: EncryptAddressCacheWriter;
   encryptOpts: { compress: boolean };
@@ -254,11 +256,12 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
   let cacheHits = 0;
   let cacheMisses = 0;
   const reservationFor = (size: number): number => size + size + 4096;
-  const recordEncrypted = (file: FileEntry, encrypted: EncryptedBlob): void => {
+  const recordEncrypted = (file: FileEntry, encrypted: EncryptedBlob): FileEntry => {
     const descriptor = descriptorFromEncryptedBlob(encrypted);
-    applyCipherDescriptor(file, descriptor);
+    const attached = args.entries.attach(file, descriptor);
     args.encryptCache.record(encrypted.plaintextSha, { ...descriptor, cipherSize: encrypted.cipherSize, path: file.path });
     args.cacheWriter.schedule();
+    return attached;
   };
   const encryptOne = async (file: FileEntry, forceEncrypt: boolean): Promise<void> => {
     const t0 = LANE_TIMING ? performance.now() : 0;
@@ -270,12 +273,12 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
         return;
       }
       cacheHits++;
-      applyCipherDescriptor(file, cached);
+      const attached = args.entries.attach(file, cached);
       args.encryptCache.record(file.sha256, { ...cached, path: file.path });
       args.cacheWriter.schedule();
       if (LANE_TIMING) uploadLaneTiming.encryptMs += performance.now() - t0;
-      emitEncrypt(file);
-      submitAddressCheck(file);
+      emitEncrypt(attached);
+      submitAddressCheck(attached);
       return;
     }
     cacheMisses++;
@@ -304,12 +307,12 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
     disk.reconcile(reservation, encrypted.cipherSize);
     firstPublishReady(encrypted.cipherSize, encrypted.encSha);
     if (forceEncrypt && firstPublishTiming.enabled) firstPublishTiming.stats.reEncryptedOnResume++;
-    recordEncrypted(file, encrypted);
+    const attached = recordEncrypted(file, encrypted);
     encCtBytes += encrypted.cipherSize;
     if (LANE_TIMING) uploadLaneTiming.encryptMs += performance.now() - t0;
-    emitEncrypt(file);
-    const ready = makeReady(file, encrypted);
-    submitCheck(file, ready);
+    emitEncrypt(attached);
+    const ready = makeReady(attached, encrypted);
+    submitCheck(attached, ready);
     try {
       if (scope.signal.aborted) throw abortCause;
       await queue.push(ready);
@@ -411,8 +414,7 @@ export async function runPublishPipeline(args: PublishPipelineArgs): Promise<{ n
           abandoned.release("abandoned");
           throw abortCause;
         }
-        recordEncrypted(file, encrypted);
-        current = makeReady(file, encrypted);
+        current = makeReady(recordEncrypted(file, encrypted), encrypted);
         byteTracker.migrate(file.path, current.encSha, current.cipherSize);
         if (scope.signal.aborted) { current.release("abandoned"); throw abortCause; }
         const missing = await timeMissingBlobs(args.api, [current.encSha]);

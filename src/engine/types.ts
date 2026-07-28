@@ -9,30 +9,30 @@ export type FileType = "file" | "symlink";
  */
 export interface FileEntry {
   /** POSIX-relative path from the sync root. Never absolute, never contains `..`. */
-  path: string;
+  readonly path: string;
   /** Lowercase hex SHA-256 of the file bytes (of the link target string, for symlinks). */
-  sha256: string;
+  readonly sha256: string;
   /** Byte length of the content. */
-  size: number;
+  readonly size: number;
   /** Unix permission bits (`& 0o777`). Carried so the executable bit survives a sync. */
-  mode: number;
+  readonly mode: number;
   /** Local mtime in ms. Fast-path hint only — NOT part of content identity. */
-  mtimeMs: number;
-  type: FileType;
+  readonly mtimeMs: number;
+  readonly type: FileType;
   /** For `type: "symlink"`, the raw link target. */
-  symlinkTarget?: string;
+  readonly symlinkTarget?: string;
   /** Ciphertext content-address (M5, encrypted workspaces): where the encrypted
    *  body is stored. `sha256` stays the PLAINTEXT identity (dedup/reconcile key);
    *  this is the address of the AES-GCM ciphertext in R2. Absent = plaintext blob. */
-  encSha?: string;
+  readonly encSha?: string;
   /** Payload compression applied before encryption (design 79). Absent = raw. */
-  comp?: "zstd";
+  readonly comp?: "zstd";
   /** sha256 of the compressed payload (the exact encrypted bytes) — the key/nonce
    *  derivation input for compressed blobs. Present iff `comp` is. */
-  payloadSha?: string;
+  readonly payloadSha?: string;
   /** Ciphertext byte length (payload + GCM tag). Present iff `comp` is — used as
    *  the download size hint since `size` no longer predicts it. */
-  cipherSize?: number;
+  readonly cipherSize?: number;
 }
 
 /**
@@ -120,7 +120,7 @@ export interface GitSection {
 /** A point-in-time snapshot of a tree's syncable files, sorted by `path`. */
 export interface Manifest {
   generatedAt: string;
-  files: FileEntry[];
+  files: readonly FileEntry[];
   /** Manifest schema version. Absent (v1) = pre-§43. `gitRepos` requires >= 2.
    *  Clients refuse schemas newer than KNOWN_MANIFEST_SCHEMA ("upgrade rbox") so
    *  every future schema break fails loudly (design 43 §2). */

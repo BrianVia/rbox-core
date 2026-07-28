@@ -1008,9 +1008,9 @@ test("flag-off preflight preserves manifest order and duplicate addresses", asyn
   await write("c.txt", "different\n");
   const local = await scanManifest(root);
 
-  await pushManifest(root, cfg, local, deps(remote));
+  const pushed = await pushManifest(root, cfg, local, deps(remote));
 
-  expect(remote.missingBlobCalls[0]).toEqual(local.files.filter((f) => f.type === "file").map((f) => f.encSha!));
+  expect(remote.missingBlobCalls[0]).toEqual(pushed.manifest.files.filter((f) => f.type === "file").map((f) => f.encSha!));
   expect(remote.missingBlobCalls[0]).toEqual([(await enc("same\n")).encSha, (await enc("same\n")).encSha, (await enc("different\n")).encSha]);
 });
 
