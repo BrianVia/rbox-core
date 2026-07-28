@@ -267,6 +267,7 @@ src/engine/darwin-bulk-walk.ts      — macOS-only bulk directory enumeration (b
 src/engine/encoding.ts              — base64url encode/decode. Pure leaf. Never: dependencies.
 src/engine/pat-token.ts             — personal-access-token generate/validate (+CRC32). Self-contained. Never: transport.
 src/engine/refset.ts                — dependency-free binary codec for the rbox-refset-v1 sidecar (locked format; bundles into client + Worker). Never: hashing (caller hashes).
+src/engine/sqlite-contract/         — tests and test-only helpers observing the bun:sqlite behaviors required by design 163. Never: production imports or database policy.
 ```
 
 ## `src/engine/crypto-pool/` — worker-based crypto pool
