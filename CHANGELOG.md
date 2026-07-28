@@ -6,6 +6,16 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.10.2] - 2026-07-27
+
+### Fixed
+- **The sync scheduler can no longer spin.** If the daemon's recovery probe
+  ever outlives the condition it was armed for, the scheduler now retires it
+  and parks the queue instead of re-selecting it in a tight loop. No released
+  build exhibited the bug — it was found while investigating a runaway in
+  unreleased development code — but the guard makes the daemon structurally
+  immune to that whole class of hot loop.
+
 ## [1.10.1] - 2026-07-27
 
 ### Changed
