@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { saveState, type SyncState } from "../config.js";
+import { runAstSweep, type AstSweepDeps } from "./ast-sweep-runner.js";
 
 const root = path.resolve(import.meta.dir, "../../..");
 const srcRoot = path.join(root, "src");
@@ -26,22 +27,67 @@ interface AstSite extends Site {
 let astSites: AstSite[] | undefined;
 function parsedAstSites(): AstSite[] {
   if (astSites) return astSites;
-  const result = Bun.spawnSync([
-    "node",
+  const result = runAstSweep(
     path.join(import.meta.dir, "base-composer-ast-sweep.mjs"),
     root,
     "base-composer-structure",
-  ]);
-  if (!result.success) throw new Error(result.stderr.toString() || `AST sweep exited ${result.exitCode}`);
-  expect(result.stdout.byteLength, "AST sweep returned empty stdout").toBeGreaterThan(0);
-  expect(result.stdout.byteLength, "AST sweep output exceeded its transport budget")
+  );
+  expect(result.stdoutLength, "AST sweep returned empty stdout").toBeGreaterThan(0);
+  expect(result.stdoutLength, "AST sweep output exceeded its transport budget")
     .toBeLessThanOrEqual(AST_SWEEP_MAX_BYTES);
-  const parsed: unknown = JSON.parse(result.stdout.toString());
+  const parsed = result.parsed;
   expect(Array.isArray(parsed), "AST sweep output was not an array").toBeTrue();
   expect(parsed.length, "AST sweep returned no records").toBeGreaterThan(0);
   astSites = parsed as AstSite[];
   return astSites;
 }
+
+const bytes = (text: string): Uint8Array => new TextEncoder().encode(text);
+
+test("AST sweep retries unusable stdout through explicit piped stdio", () => {
+  const attempts = [
+    { success: true, exitCode: 0, stdout: bytes(""), stderr: bytes("") },
+    { success: true, exitCode: 0, stdout: bytes("{]"), stderr: bytes("parse noise") },
+    { success: true, exitCode: 0, stdout: bytes('[{"file":"ok","line":1}]'), stderr: bytes("") },
+  ];
+  const options: unknown[] = [];
+  const backoffs: number[] = [];
+  const deps: AstSweepDeps = {
+    spawn: (_command, stdio) => {
+      options.push(stdio);
+      return attempts.shift()!;
+    },
+    sleep: (milliseconds) => backoffs.push(milliseconds),
+  };
+
+  const result = runAstSweep("/sweep.mjs", "/repo", "base-composer-structure", deps);
+
+  expect(result.parsed).toEqual([{ file: "ok", line: 1 }]);
+  expect(options).toEqual([
+    { stdin: "ignore", stdout: "pipe", stderr: "pipe" },
+    { stdin: "ignore", stdout: "pipe", stderr: "pipe" },
+    { stdin: "ignore", stdout: "pipe", stderr: "pipe" },
+  ]);
+  expect(backoffs).toEqual([10, 20]);
+});
+
+test("AST sweep reports the final child diagnostic after exhausting retries", () => {
+  const backoffs: number[] = [];
+  const deps: AstSweepDeps = {
+    spawn: () => ({
+      success: false,
+      exitCode: 23,
+      stdout: bytes("bad"),
+      stderr: bytes("distinctive child failure"),
+    }),
+    sleep: (milliseconds) => backoffs.push(milliseconds),
+  };
+
+  expect(() => runAstSweep("/sweep.mjs", "/repo", "state-plane-inventory", deps)).toThrow(
+    /failed after 3 attempts.*child exit code 23.*stderr: distinctive child failure.*stdout length 3 bytes/,
+  );
+  expect(backoffs).toEqual([10, 20]);
+});
 
 async function astSweep(match: (site: AstSite) => boolean): Promise<Site[]> {
   return parsedAstSites().filter(match);
