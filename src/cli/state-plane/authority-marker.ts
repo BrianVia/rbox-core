@@ -11,6 +11,7 @@
  * The write side is the load-bearing half: a read-time check only protects an
  * operation that read *after* the flip.
  */
+import { constants, type Stats } from "node:fs";
 import fs from "node:fs/promises";
 import { StateFormatTooNewError, StateWriteRefusedError } from "./errors.js";
 
@@ -41,28 +42,66 @@ function looksLikeJson(bytes: Buffer): boolean {
 
 /**
  * Classify the bytes at `file` without materializing the document. Reads at most
- * {@link DETECT_BYTES}, follows no symlink, and never throws for content — only
- * an unexpected filesystem error propagates.
+ * {@link DETECT_BYTES} and never throws for content — only an unexpected
+ * filesystem error propagates.
+ *
+ * Every property is decided from a single no-follow descriptor, as the sidecar
+ * modules do: a pathname lookup followed by a second one could be answered by a
+ * symlink swapped in after the first, which would let the attacker's file be
+ * read as the state document under the original file's type and size.
  */
 export async function classifyStateFormat(file: string): Promise<StateFormat> {
-  let stat: Awaited<ReturnType<typeof fs.lstat>>;
+  let handle: Awaited<ReturnType<typeof fs.open>>;
   try {
-    stat = await fs.lstat(file);
+    handle = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT" || (error as NodeJS.ErrnoException).code === "ENOTDIR") return "absent";
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return "absent";
+    // ELOOP is either O_NOFOLLOW refusing a symlink at the final component —
+    // the case the old path stat classified as foreign — or a symlink loop met
+    // while resolving an ancestor, which was and remains an unexpected error.
+    // This lstat classifies only; nothing is ever read by pathname afterwards,
+    // so it cannot reintroduce the window the descriptor closes.
+    if (code === "ELOOP" && await isSymbolicLinkAtPath(file)) return "foreign";
     throw error;
   }
-  if (!stat.isFile() || stat.isSymbolicLink()) return "foreign";
-  if (stat.size === 0) return "foreign";
-  const handle = await fs.open(file, "r");
-  let head: Buffer;
+  let closed = false;
   try {
-    const buffer = Buffer.alloc(Math.min(DETECT_BYTES, stat.size));
-    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
-    head = buffer.subarray(0, bytesRead);
-  } finally {
+    const stat = await handle.stat();
+    let head = Buffer.alloc(0);
+    if (stat.isFile() && stat.size > 0) {
+      const buffer = Buffer.alloc(Math.min(DETECT_BYTES, stat.size));
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+      head = buffer.subarray(0, bytesRead);
+    }
+    const format = formatOf(stat, head);
+    // Unlike the sidecars, which suppress a close failure because their only
+    // verdict is "no sample", this returns a verdict a fail-closed barrier acts
+    // on: a close that fails may mean the read never completed. Suppression
+    // stays on the error paths, where it would mask the primary failure.
+    closed = true;
     await handle.close();
+    return format;
+  } catch (error) {
+    if (!closed) await handle.close().catch(() => undefined);
+    throw error;
   }
+}
+
+/** The whole body of the only pathname lookup this module still performs: it
+ * decides one bit about a path that has already been refused, and nothing is
+ * ever read through it. Kept a separate function so the pinning inventory can
+ * see that containment, which the AST sweep cannot express as "inside a catch". */
+async function isSymbolicLinkAtPath(file: string): Promise<boolean> {
+  try {
+    return (await fs.lstat(file)).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+function formatOf(stat: Stats, head: Buffer): StateFormat {
+  if (!stat.isFile() || stat.size === 0) return "foreign";
   if (stat.size === AUTHORITY_MARKER_BYTES && AUTHORITY_MARKER_RE.test(head.toString("latin1"))) return "authority-marker";
   return looksLikeJson(head) ? "json" : "foreign";
 }
