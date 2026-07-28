@@ -134,7 +134,8 @@ function sealTransitions(
   global: SealedStageRef | undefined,
 ): SealedRepoTransitionRef {
   const bindings = global ? [{ stageId: global.stageId, logicalDigest: global.logicalDigest, physicalSha256: global.physicalSha256 }] : [];
-  const builder = beginRepoTransitionStage(directory, openReadSnapshot(handle).token, bindings);
+  const builder = beginRepoTransitionStage(directory, openReadSnapshot(handle).token, bindings,
+    global ? { globalBinding: bindings[0]! } : {});
   for (const transition of delta.transitions) {
     const input: TransitionInput = {
       relPath: transition.relPath,

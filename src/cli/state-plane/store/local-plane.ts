@@ -56,9 +56,15 @@ export function applyLocalScan(
       } finally {
         reader.close();
       }
-      const result = promote(db, stage, expected);
-      // Adoption completed; the design's id-scoped delete follows it under the
-      // same lock that owned the whole consumption interval.
+      // Adoption AND refusal both end the stage's life, so the id-scoped delete
+      // runs either way under the lock that owned the whole consumption interval.
+      let result: LocalScanResult;
+      try {
+        result = promote(db, stage, expected);
+      } catch (error) {
+        deleteSealedArtifact(stageDirectory, stage, lock);
+        throw error;
+      }
       deleteSealedArtifact(stageDirectory, stage, lock);
       return result;
     } finally {

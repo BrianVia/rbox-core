@@ -13,17 +13,16 @@ import { StageChangedError } from "../errors.js";
 import type { CasOwnerToken, CasRejectionReason, CasResult, ManifestHeader } from "../ports.js";
 import { buildCasRetryView } from "./cas-retry-view.js";
 import {
-  Rejected, applyGlobal, applyTransitions, checkPredicates, rebuildManifestProjection, reject,
+  Rejected, applyGlobal, applyTransitions, checkPredicates, copyTransitionRowsIntoTemp,
+  createTransitionTemp, dropTransitionTemp, freezeValue, rebuildManifestProjection, reject,
+  type FrozenCasInputs,
 } from "./cas-steps.js";
 import { copyStageFilesIntoTemp, createStageFileTemp, dropStageFileTemp } from "./generations.js";
 import { stateStoreDatabase, type StateStoreHandle } from "./open.js";
 import { currentSnapshot } from "./read-snapshot.js";
 import { openSealedStage, verifySourceStageBinding, type SealedStageRef } from "./sealed-stages.js";
 import { StageLock, deleteSealedArtifact, type SealedArtifactRef } from "./stage-artifacts.js";
-import {
-  copyTransitionRowsIntoTemp, createTransitionTemp, dropTransitionTemp,
-  openSealedRepoTransitionStage, type SealedRepoTransitionRef,
-} from "./transition-stages.js";
+import { openSealedRepoTransitionStage, type SealedRepoTransitionRef } from "./transition-stages.js";
 
 export interface CasExpectation {
   lineageId: string;
@@ -59,13 +58,19 @@ export interface CasInternalHooks {
 function assertPairing(packet: CasPacket): void {
   const bindings = packet.repoTransitions.sourceStageBindings;
   if (!packet.global) {
-    if (bindings.length !== 0) {
+    if (bindings.length !== 0 || packet.repoTransitions.globalBinding !== undefined) {
       throw new StageChangedError(packet.repoTransitions.stageId, "a repo-only packet must declare an empty source-stage list");
     }
     return;
   }
   if (!bindings.some((binding) => sameStageBinding(binding, packet.global!.stage))) {
     throw new StageChangedError(packet.repoTransitions.stageId, "the global stage is not one of the transition stage's source bindings");
+  }
+  // The transition stage must have been SEALED knowing which binding is global;
+  // otherwise its rows were admitted without the global-present-per-row rule.
+  const sealedGlobal = packet.repoTransitions.globalBinding;
+  if (!sealedGlobal || !sameStageBinding(sealedGlobal, packet.global.stage)) {
+    throw new StageChangedError(packet.repoTransitions.stageId, "the transition stage was not sealed against this global stage");
   }
   if (packet.global.stage.plane !== "base") {
     throw new StageChangedError(packet.global.stage.stageId, "a CAS global stage must be a BASE stage");
@@ -115,20 +120,40 @@ export function applyCasPacket(
     const verified = new Set<string>();
     for (const binding of packet.repoTransitions.sourceStageBindings) {
       // A stage consumed below is fully verified by that consumption; a stage
-      // named only as Git evidence gets the same full proof here.
-      const derived = binding.stageId === packet.global?.stage.stageId
-        ? packet.global.stage
-        : verifySourceStageBinding(stageDirectory, binding);
+      // named only as Git evidence gets the same full proof here — and joins the
+      // consumed set, so it is cleaned up on adoption or refusal like any other.
+      if (binding.stageId === packet.global?.stage.stageId) {
+        verified.add(canonicalBinding(binding));
+        continue;
+      }
+      const derived = verifySourceStageBinding(stageDirectory, binding);
       if (derived.logicalDigest !== binding.logicalDigest || derived.physicalSha256 !== binding.physicalSha256) {
         throw new StageChangedError(binding.stageId, "verified source stage does not match its binding");
       }
       verified.add(canonicalBinding(binding));
+      consumed.push(binding);
     }
+    let sealedHeader: ManifestHeader | undefined;
     if (packet.global) {
-      consumeGlobalStage(db, stageDirectory, packet.global.stage);
+      sealedHeader = consumeGlobalStage(db, stageDirectory, packet.global.stage);
       consumed.push(packet.global.stage);
     }
-    const result = runTransaction(db, stageDirectory, packet, verified, hooks);
+    // Everything the transaction reads is copied here, out of the verified
+    // artifact and the packet scalars, once and for all.
+    const frozen: FrozenCasInputs = {
+      expected: freezeValue(packet.expected),
+      sourceGlobalSeq: packet.sourceGlobalSeq,
+      hasGlobal: packet.global !== undefined,
+      ...(sealedHeader === undefined ? {} : { globalHeader: freezeValue(sealedHeader) }),
+      ...(packet.global?.manifestMeta === undefined
+        ? {}
+        : { globalManifestMeta: freezeValue(packet.global.manifestMeta) }),
+      ...(packet.repoTransitions.globalBinding === undefined
+        ? {}
+        : { globalBinding: freezeValue(packet.repoTransitions.globalBinding) }),
+      ownerToken: packet.ownerToken,
+    };
+    const result = runTransaction(db, stageDirectory, frozen, verified, hooks);
     // The design's id-scoped cleanup after adoption or refusal. `busy` adopted and
     // refused nothing, so its inputs stay available to the caller's retry.
     if (result.status === "accepted" || result.status === "rejected") {
@@ -170,7 +195,9 @@ function consumeTransitionStage(db: Database, directory: string, ref: SealedRepo
   }
 }
 
-function consumeGlobalStage(db: Database, directory: string, ref: SealedStageRef): void {
+/** Returns the header the artifact itself carries — the only header allowed to
+ * commit. The caller's `fileHeader` was already compared to it during admission. */
+function consumeGlobalStage(db: Database, directory: string, ref: SealedStageRef): ManifestHeader {
   const lock = StageLock.acquire(directory, ref.stageId);
   try {
     const reader = openSealedStage(directory, ref, lock);
@@ -181,6 +208,7 @@ function consumeGlobalStage(db: Database, directory: string, ref: SealedStageRef
       reader.close();
     }
     if (copied !== ref.counts.files) throw new StageChangedError(ref.stageId, "sealed stage file count changed while streaming");
+    return reader.sealedHeader;
   } finally {
     lock.release();
   }
@@ -194,7 +222,7 @@ function isBusy(error: unknown): boolean {
 function runTransaction(
   db: Database,
   stageDirectory: string,
-  packet: CasPacket,
+  frozen: FrozenCasInputs,
   verified: ReadonlySet<string>,
   hooks: CasInternalHooks,
 ): CasResult {
@@ -208,16 +236,16 @@ function runTransaction(
   }
   let rejection: CasRejectionReason | undefined;
   try {
-    checkPredicates(db, packet, verified);
-    const lineageId = packet.expected.lineageId;
-    if (packet.global) applyGlobal(db, packet, lineageId);
+    checkPredicates(db, frozen, verified);
+    const lineageId = frozen.expected.lineageId;
+    if (frozen.hasGlobal) applyGlobal(db, frozen, lineageId);
     applyTransitions(db, lineageId);
-    const generation = packet.expected.baseGeneration + (packet.global ? 1 : 0);
+    const generation = frozen.expected.baseGeneration + (frozen.hasGlobal ? 1 : 0);
     rebuildManifestProjection(db, lineageId, generation);
     db.query("UPDATE state_lineage SET state_nonce=COALESCE(state_nonce,?),state_revision=? WHERE lineage_id=?")
-      .run(crypto.randomBytes(16).toString("hex"), packet.expected.stateRevision + 1, lineageId);
+      .run(crypto.randomBytes(16).toString("hex"), frozen.expected.stateRevision + 1, lineageId);
     // Step 5: the last thing before commit is the ownership recheck.
-    if (!packet.ownerToken.isOwner()) reject("owner-lost");
+    if (!frozen.ownerToken.isOwner()) reject("owner-lost");
     db.exec("COMMIT");
   } catch (error) {
     if (db.inTransaction) db.exec("ROLLBACK");

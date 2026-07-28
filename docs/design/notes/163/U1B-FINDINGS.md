@@ -73,6 +73,34 @@ U1b's mutation/import seam must enforce both `(chainBytes===0) ===
 reads already-admitted substrate rows, so these admission invariants belong
 with U1b's cursor-first writer rather than being silently implied by readers.
 
+### Ratified containment mechanism and trust boundary (round 3)
+
+Verify-then-reopen is unrepresentable in the shipped seam. Consumption makes ONE
+bounded streaming pass that simultaneously computes the physical hash and writes a
+private `O_EXCL` copy inside the lock-owned private directory, so the verified
+bytes and the consumed bytes are the same reads rather than two observations of a
+mutable path. The copy is opened, primed with one read so SQLite materializes its
+WAL index, and then unlinked together with its sidecars: from that point the
+connection reads anonymous inodes that no pathname reaches, and cleanup is
+automatic. There is no closing re-proof, because there is nothing left to re-prove.
+Hard-linking was rejected — it shares the writable inode, so it binds a name but
+not the bytes. `Database.deserialize` was rejected — a stage has no row cap, so
+materializing the largest legal artifact violates the design's memory budget.
+
+Publication is the mirror: the builder holds its own descriptor on the private
+inode across fsync, hash, `link(2)`, and a post-link `fstat` dev/ino comparison
+against that descriptor. A destination that is not the proven inode, or a parent
+fsync that fails after a successful link, is unlinked — a destination never
+survives a failed seal. Deletion pins the inode with a private hard link, proves it
+through a descriptor on the private name, and unlinks the shared name only after a
+fresh no-follow open of it confirms the same inode.
+
+**Ratified trust boundary.** A same-UID actor mutating an anonymous inode behind an
+open descriptor requires `/proc`-level fd introspection, which is ptrace-equivalent
+and outside this design's threat model. The same boundary covers the residual
+window between the identity confirmation and the unlink in the id-scoped delete,
+which the id-scoped lock serializes against every legitimate writer.
+
 ## Additional round-3 constraints
 
 - A sealed artifact must have an explicit lifecycle and exactly one active

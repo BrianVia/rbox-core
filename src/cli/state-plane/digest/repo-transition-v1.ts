@@ -34,12 +34,21 @@ export class RepoTransitionDigestBuilder {
   #rows = 0;
   #sealed = false;
 
-  constructor(snapshotToken: LineageSnapshot, sourceStageBindings: readonly SourceStageBinding[]) {
+  constructor(
+    snapshotToken: LineageSnapshot,
+    sourceStageBindings: readonly SourceStageBinding[],
+    globalBinding?: SourceStageBinding,
+  ) {
     this.#hash.token("snapshot");
     this.#hash.token(canonicalJson(snapshotToken));
     this.#hash.token("source-stages");
     this.#hash.token(String(sourceStageBindings.length));
     for (const binding of sourceStageBindings) this.#hash.token(canonicalStageBinding(binding));
+    // Which declared stage is THE global one is a load-bearing distinction: every
+    // derived row must name it, so it is framed rather than inferred.
+    this.#hash.token("global-stage");
+    this.#hash.token(globalBinding === undefined ? "0" : "1");
+    if (globalBinding !== undefined) this.#hash.token(canonicalStageBinding(globalBinding));
   }
 
   row(input: {

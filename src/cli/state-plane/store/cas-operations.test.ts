@@ -89,7 +89,8 @@ function sealTransitions(
   const bindings = global
     ? [{ stageId: global.stageId, logicalDigest: global.logicalDigest, physicalSha256: global.physicalSha256 }]
     : [];
-  const builder = beginRepoTransitionStage(stages, token, bindings);
+  const builder = beginRepoTransitionStage(stages, token, bindings,
+    global ? { globalBinding: bindings[0]! } : {});
   for (const row of rows) {
     builder.putTransition({
       relPath: row.relPath,
@@ -392,7 +393,7 @@ test("a global packet admits additional Git-proof stages and verifies every one"
     stageId: stage.stageId, logicalDigest: stage.logicalDigest, physicalSha256: stage.physicalSha256,
   }));
   const build = () => {
-    const builder = beginRepoTransitionStage(stages, token, bindings);
+    const builder = beginRepoTransitionStage(stages, token, bindings, { globalBinding: bindings[0]! });
     builder.putTransition({
       relPath: "repo-a", expectedRepoGen: 0, newRecord: { sourceSeq: 5, base: section(20) },
       baseProof: carryRepoBaseProof("lineage"),
@@ -430,7 +431,7 @@ test("source evidence must be present, exact, and carried into the transaction",
   const token = openReadSnapshot(handle).token;
   const global = sealGlobal(stages, [entry("one.txt", 1)]);
   const binding = { stageId: global.stageId, logicalDigest: global.logicalDigest, physicalSha256: global.physicalSha256 };
-  const builder = beginRepoTransitionStage(stages, token, [binding]);
+  const builder = beginRepoTransitionStage(stages, token, [binding], { globalBinding: binding });
   // A derived record with no evidence is exactly the silent synthesis the seam
   // must refuse: the stage declares a source, so every row must attribute itself.
   expect(() => builder.putTransition({
@@ -462,6 +463,80 @@ test("source evidence must be present, exact, and carried into the transaction",
     repoTransitions: forged, ownerToken: OWNER,
   })).toThrow(StageChangedError);
   expect(loadRawStateFromStore(handle).stateRevision).toBe(0);
+  handle.close();
+});
+
+test("a derived row may not attribute itself to a Git-proof stage alone", () => {
+  const { stages, handle } = workspace("rbox-cas-global-evidence-");
+  const token = openReadSnapshot(handle).token;
+  const global = sealGlobal(stages, [entry("one.txt", 1)]);
+  const proofOnly = beginGeneration(stages, "base", HEADER);
+  proofOnly.putGitSection("meta-wire", "repo-a", section(30));
+  const gitStage = proofOnly.finishGeneration({ files: 0, gitSections: 1 });
+  const bindingOf = (stage: SealedStageRef) => ({
+    stageId: stage.stageId, logicalDigest: stage.logicalDigest, physicalSha256: stage.physicalSha256,
+  });
+  const globalBinding = bindingOf(global);
+  const gitBinding = bindingOf(gitStage);
+
+  const builder = beginRepoTransitionStage(stages, token, [globalBinding, gitBinding], { globalBinding });
+  // Subset-of-declared is not enough: a global packet derives every record from
+  // the global stage, so naming only the Git-proof stage is a refusal.
+  expect(() => builder.putTransition({
+    relPath: "repo-a", expectedRepoGen: 0, newRecord: { sourceSeq: 5 },
+    evidenceBindings: { sourceStages: [gitBinding] },
+  })).toThrow(/does not name the global source stage/);
+  builder.putTransition({
+    relPath: "repo-a", expectedRepoGen: 0, newRecord: { sourceSeq: 5 },
+    evidenceBindings: { sourceStages: [globalBinding, gitBinding] },
+  });
+  expect(applyCasPacket(handle, stages, {
+    expected: expectation(token),
+    sourceGlobalSeq: 5,
+    global: { stage: global, fileHeader: global.header },
+    repoTransitions: builder.finishRepoTransitionStage(),
+    ownerToken: OWNER,
+  }).status).toBe("accepted");
+  // Every consumed artifact — including the Git-proof-only stage — is gone.
+  expect(fs.readdirSync(stages)).toEqual([]);
+  handle.close();
+});
+
+test("a hostile owner callback cannot rewrite what commits", () => {
+  const { stages, handle } = workspace("rbox-cas-frozen-");
+  const built = packet(stages, handle, {});
+  let calls = 0;
+  const hostile = {
+    isOwner: () => {
+      calls++;
+      // Between the predicate checks and the commit, rewrite everything the
+      // caller still has a reference to.
+      (built.global!.stage as { header: ManifestHeader }).header = {
+        generatedAt: "2099-01-01T00:00:00.000Z", complete: true,
+      };
+      built.global!.fileHeader = { generatedAt: "2099-01-01T00:00:00.000Z", complete: true };
+      built.expected.stateRevision = 999;
+      built.sourceGlobalSeq = 999;
+      return true;
+    },
+  };
+  expect(applyCasPacket(handle, stages, { ...built, ownerToken: hostile }).status).toBe("accepted");
+  expect(calls).toBeGreaterThanOrEqual(2);
+  const state = loadRawStateFromStore(handle);
+  expect(state.lastSyncedManifest.generatedAt).toBe(HEADER.generatedAt);
+  expect(state.lastSyncedSequence).toBe(5);
+  expect(state.stateRevision).toBe(1);
+  handle.close();
+});
+
+test("a LOCAL scan refused by a moved head still deletes its stage", () => {
+  const { stages, handle } = workspace("rbox-cas-local-refusal-");
+  const stage = sealGlobal(stages, [entry("scan.txt", 1)], "local", { ...HEADER, trustEpoch: "epoch-1" });
+  expect(() => applyLocalScan(handle, stages, stage, { lineageId: LINEAGE, localRevision: 9 }))
+    .toThrow(StageChangedError);
+  // Refusal ends the stage's life exactly as adoption does.
+  expect(fs.readdirSync(stages)).toEqual([]);
+  expect(openReadSnapshot(handle).token.localRevision).toBe(0);
   handle.close();
 });
 

@@ -18,7 +18,7 @@ import {
   PrivateStageDirectory, StageLock, abandonBuilder, configureStageBuilder, deleteSealedArtifact,
   openSealedArtifact, sealAndPublish, sealedStagePath, streamRows,
 } from "./stage-artifacts.js";
-import { CAS_TRANSITION_TEMP } from "./transition-stages.js";
+import { CAS_TRANSITION_TEMP } from "./cas-steps.js";
 
 const MAX_RETRY_BATCH = 16;
 const MAX_RETRY_ROW_RETAINED = 16 * 1024 * 1024;

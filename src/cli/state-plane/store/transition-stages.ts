@@ -26,6 +26,7 @@ CREATE TABLE transition_meta(
   stage_id TEXT PRIMARY KEY, state TEXT NOT NULL CHECK(state IN ('building','sealed')),
   snapshot_cjson TEXT NOT NULL, source_bindings_cjson TEXT NOT NULL,
   importer TEXT NOT NULL CHECK(importer IN ('engine','migration')),
+  global_binding_cjson TEXT,
   digest TEXT, row_count INTEGER,
   CHECK(state='building' OR (digest IS NOT NULL AND row_count IS NOT NULL))
 );
@@ -58,6 +59,9 @@ export interface TransitionInput {
 
 export interface SealedRepoTransitionRef {
   stageId: string;
+  /** The declared source stage that is THE global stage, when the packet has one.
+   * Every derived row's evidence must name it exactly. */
+  globalBinding?: SourceStageBinding;
   logicalDigest: RepoTransitionDigest;
   physicalSha256: string;
   bytes: number;
@@ -79,9 +83,13 @@ export function beginRepoTransitionStage(
   directory: string,
   snapshotToken: LineageSnapshot,
   sourceStageBindings: readonly SourceStageBinding[],
-  options: { importer?: "engine" | "migration"; stageId?: string } = {},
+  options: { importer?: "engine" | "migration"; stageId?: string; globalBinding?: SourceStageBinding } = {},
 ): RepoTransitionStageBuilder {
   const importer = options.importer ?? "engine";
+  const globalBinding = options.globalBinding;
+  if (globalBinding && !sourceStageBindings.some((binding) => sameStageBinding(binding, globalBinding))) {
+    throw new TypeError("the global binding must also be declared as a source stage");
+  }
   const stageId = options.stageId ?? crypto.randomBytes(16).toString("hex");
   const bindings = [...sourceStageBindings].sort((a, b) => (a.stageId < b.stageId ? -1 : a.stageId > b.stageId ? 1 : 0));
   const lock = StageLock.acquire(directory, stageId);
@@ -92,13 +100,16 @@ export function beginRepoTransitionStage(
     db = new Database(privateDirectory.file(), { create: true, readwrite: true });
     configureStageBuilder(db);
     db.exec(TRANSITION_DDL);
-    db.query(`INSERT INTO transition_meta(stage_id,state,snapshot_cjson,source_bindings_cjson,importer)
-      VALUES (?,'building',?,?,?)`).run(stageId, canonicalJson(snapshotToken), canonicalJson(bindings), importer);
+    db.query(`INSERT INTO transition_meta(stage_id,state,snapshot_cjson,source_bindings_cjson,importer,global_binding_cjson)
+      VALUES (?,'building',?,?,?,?)`).run(
+      stageId, canonicalJson(snapshotToken), canonicalJson(bindings), importer,
+      globalBinding === undefined ? null : canonicalJson(globalBinding),
+    );
   } catch (error) {
     abandonBuilder(db, lock, privateDirectory);
     throw error;
   }
-  return new SqliteTransitionBuilder(directory, stageId, snapshotToken, bindings, importer, db, lock, privateDirectory);
+  return new SqliteTransitionBuilder(directory, stageId, snapshotToken, bindings, globalBinding, importer, db, lock, privateDirectory);
 }
 
 /**
@@ -141,6 +152,7 @@ export function assertEvidence(
   relPath: string,
   evidence: TransitionEvidenceBindings | undefined,
   declared: readonly SourceStageBinding[],
+  globalBinding?: SourceStageBinding,
 ): void {
   const named = evidence?.sourceStages;
   if (!Array.isArray(named)) throw new TypeError(`transition ${relPath} has no evidenceBindings.sourceStages`);
@@ -156,9 +168,15 @@ export function assertEvidence(
       throw new TypeError(`transition ${relPath} names source stage ${binding.stageId}, which this stage is not bound to`);
     }
   }
+  // Subset-of-declared is not enough. When a global stage exists every derived
+  // record is derived from IT, so its exact identity must appear in each row —
+  // otherwise a row could attribute itself to a Git-proof stage alone.
+  if (globalBinding && !named.some((binding) => sameStageBinding(binding, globalBinding))) {
+    throw new TypeError(`transition ${relPath} does not name the global source stage ${globalBinding.stageId}`);
+  }
 }
 
-const canonicalEvidenceOf = (evidence: TransitionEvidenceBindings): string =>
+export const canonicalEvidenceOf = (evidence: TransitionEvidenceBindings): string =>
   canonicalJson({
     sourceStages: evidence.sourceStages.map((binding) => ({
       stageId: binding.stageId, logicalDigest: binding.logicalDigest, physicalSha256: binding.physicalSha256,
@@ -174,6 +192,7 @@ class SqliteTransitionBuilder implements RepoTransitionStageBuilder {
     readonly stageId: string,
     private readonly snapshotToken: LineageSnapshot,
     private readonly bindings: SourceStageBinding[],
+    private readonly globalBinding: SourceStageBinding | undefined,
     private readonly importer: "engine" | "migration",
     private readonly db: Database,
     private readonly lock: StageLock,
@@ -189,7 +208,7 @@ class SqliteTransitionBuilder implements RepoTransitionStageBuilder {
       throw new TypeError(`transition ${input.relPath} has an invalid expected generation`);
     }
     assertBaseProof(input, this.importer);
-    assertEvidence(input.relPath, input.evidenceBindings, this.bindings);
+    assertEvidence(input.relPath, input.evidenceBindings, this.bindings, this.globalBinding);
     // Pre-materialization scan: the complete row — record plus proof plus evidence
     // — is measured and refused BEFORE anything is encoded or written, so an
     // oversize row never reaches sealing or an authority write.
@@ -233,9 +252,9 @@ class SqliteTransitionBuilder implements RepoTransitionStageBuilder {
     if (!this.#open) throw new Error("transition stage builder is closed");
     this.lock.assertHeld();
     try {
-      const digest = new RepoTransitionDigestBuilder(this.snapshotToken, this.bindings);
+      const digest = new RepoTransitionDigestBuilder(this.snapshotToken, this.bindings, this.globalBinding);
       streamRows<TransitionRowShape>(this.db, TRANSITION_ROW_SELECT, [this.stageId], (row) => {
-        revalidate(row, this.bindings, this.importer);
+        revalidate(row, this.bindings, this.importer, this.globalBinding);
         digest.row(digestRow(row));
       });
       const rowCount = digest.rows;
@@ -251,7 +270,9 @@ class SqliteTransitionBuilder implements RepoTransitionStageBuilder {
       this.privateDirectory.destroy();
       this.lock.release();
       return {
-        stageId: this.stageId, logicalDigest, physicalSha256: physical.sha256, bytes: physical.bytes,
+        stageId: this.stageId,
+        ...(this.globalBinding === undefined ? {} : { globalBinding: this.globalBinding }),
+        logicalDigest, physicalSha256: physical.sha256, bytes: physical.bytes,
         rowCount, snapshotToken: this.snapshotToken, sourceStageBindings: this.bindings,
       };
     } catch (error) {
@@ -300,10 +321,15 @@ function decodeRow(row: TransitionRowShape): TransitionRow {
 }
 
 /** The row's OWN evidence is re-admitted; nothing is substituted from the stage. */
-function revalidate(row: TransitionRowShape, declared: SourceStageBinding[], importer: "engine" | "migration"): TransitionRow {
+function revalidate(
+  row: TransitionRowShape,
+  declared: SourceStageBinding[],
+  importer: "engine" | "migration",
+  globalBinding?: SourceStageBinding,
+): TransitionRow {
   const decoded = decodeRow(row);
   assertBaseProof(decoded, importer);
-  assertEvidence(decoded.relPath, decoded.evidenceBindings, declared);
+  assertEvidence(decoded.relPath, decoded.evidenceBindings, declared, globalBinding);
   return decoded;
 }
 
@@ -319,21 +345,26 @@ export function openSealedRepoTransitionStage(
 ): SealedTransitionReader {
   const accessor = openSealedArtifact(directory, ref, lock);
   try {
-    const meta = accessor.db.query(`SELECT stage_id,state,snapshot_cjson,source_bindings_cjson,importer,digest,row_count
-      FROM transition_meta`).get() as {
+    const meta = accessor.db.query(`SELECT stage_id,state,snapshot_cjson,source_bindings_cjson,importer,
+      global_binding_cjson,digest,row_count FROM transition_meta`).get() as {
       stage_id: string; state: string; snapshot_cjson: string; source_bindings_cjson: string;
-      importer: "engine" | "migration"; digest: string; row_count: number;
+      importer: "engine" | "migration"; global_binding_cjson: string | null;
+      digest: string; row_count: number;
     } | null;
     if (!meta || meta.stage_id !== ref.stageId || meta.state !== "sealed") {
       throw new StageChangedError(ref.stageId, "sealed transition identity does not match its ref");
     }
+    const sealedGlobal = meta.global_binding_cjson === null
+      ? undefined
+      : parseCanonicalJson(meta.global_binding_cjson) as unknown as SourceStageBinding;
     if (meta.snapshot_cjson !== canonicalJson(ref.snapshotToken)
-      || meta.source_bindings_cjson !== canonicalJson(ref.sourceStageBindings)) {
-      throw new StageChangedError(ref.stageId, "sealed transition snapshot or source bindings do not match its ref");
+      || meta.source_bindings_cjson !== canonicalJson(ref.sourceStageBindings)
+      || canonicalJson(sealedGlobal ?? null) !== canonicalJson(ref.globalBinding ?? null)) {
+      throw new StageChangedError(ref.stageId, "sealed transition snapshot, source bindings, or global binding do not match its ref");
     }
-    const digest = new RepoTransitionDigestBuilder(ref.snapshotToken, ref.sourceStageBindings);
+    const digest = new RepoTransitionDigestBuilder(ref.snapshotToken, ref.sourceStageBindings, sealedGlobal);
     streamRows<TransitionRowShape>(accessor.db, TRANSITION_ROW_SELECT, [ref.stageId], (row) => {
-      revalidate(row, ref.sourceStageBindings, meta.importer);
+      revalidate(row, ref.sourceStageBindings, meta.importer, sealedGlobal);
       digest.row(digestRow(row));
     });
     if (digest.rows !== ref.rowCount || digest.seal() !== ref.logicalDigest || meta.digest !== ref.logicalDigest) {
@@ -356,34 +387,4 @@ export function openSealedRepoTransitionStage(
       accessor.close();
     },
   };
-}
-
-/* ------------------------------------------------------------ the CAS input */
-
-export const CAS_TRANSITION_TEMP = "cas_transitions";
-
-export function createTransitionTemp(db: Database): void {
-  db.exec(`DROP TABLE IF EXISTS temp.${CAS_TRANSITION_TEMP};
-    CREATE TEMP TABLE ${CAS_TRANSITION_TEMP}(
-      rel_path TEXT PRIMARY KEY, path_order BLOB NOT NULL, expected_repo_gen INTEGER NOT NULL,
-      record_cjson TEXT NOT NULL, base_proof_cjson TEXT, evidence_cjson TEXT NOT NULL);`);
-}
-
-export function dropTransitionTemp(db: Database): void {
-  db.exec(`DROP TABLE IF EXISTS temp.${CAS_TRANSITION_TEMP}`);
-}
-
-/** Per-row evidence travels into the TEMP schema, because step 1 of the CAS checks
- * it against the packet's verified source stages. Dropping it here would make the
- * check unfalsifiable. */
-export function copyTransitionRowsIntoTemp(db: Database, reader: SealedTransitionReader): number {
-  const insert = db.query(`INSERT INTO ${CAS_TRANSITION_TEMP}(rel_path,path_order,expected_repo_gen,record_cjson,base_proof_cjson,evidence_cjson)
-    VALUES (?,?,?,?,?,?)`);
-  return reader.streamRows((row) => {
-    insert.run(
-      row.relPath, utf16beOrderKey(row.relPath), row.expectedRepoGen,
-      canonicalJson(row.newRecord), row.baseProof === undefined ? null : canonicalJson(row.baseProof),
-      canonicalEvidenceOf(row.evidenceBindings),
-    );
-  });
 }

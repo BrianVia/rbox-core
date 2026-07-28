@@ -15,11 +15,40 @@ import {
 import { encodeRepoRecord } from "../codecs/repo-record.js";
 import { canonicalJson, parseCanonicalJson, utf16beOrderKey } from "../digest/codecs.js";
 import { ProoflessBaseError, StageChangedError } from "../errors.js";
-import type { CasRejectionReason } from "../ports.js";
+import type { CasRejectionReason, ManifestHeader } from "../ports.js";
 import { internStagedEntryValues, promoteFilesIntoPlane } from "./generations.js";
 import { streamRows } from "./stage-artifacts.js";
-import { CAS_TRANSITION_TEMP, type TransitionEvidenceBindings } from "./transition-stages.js";
-import type { CasPacket } from "./write-packet.js";
+import {
+  canonicalEvidenceOf, type SealedTransitionReader, type TransitionEvidenceBindings,
+} from "./transition-stages.js";
+import type { SourceStageBinding } from "../digest/repo-transition-v1.js";
+import type { CasOwnerToken } from "../ports.js";
+import type { CasExpectation } from "./write-packet.js";
+
+
+/**
+ * The transaction's inputs, deep-copied out of the VERIFIED artifacts and the
+ * packet scalars once verification is complete. Everything inside `BEGIN
+ * IMMEDIATE` reads only this. The caller still owns `ownerToken.isOwner()`, which
+ * runs twice inside the transaction — freezing is what stops that callback from
+ * rewriting the header, the sequence, or an expectation between the predicate
+ * checks and the commit.
+ */
+export interface FrozenCasInputs {
+  expected: CasExpectation;
+  sourceGlobalSeq: number;
+  hasGlobal: boolean;
+  /** The header the stage was SEALED with, read back from the artifact. */
+  globalHeader?: ManifestHeader;
+  globalManifestMeta?: GlobalManifestMeta;
+  globalBinding?: SourceStageBinding;
+  ownerToken: CasOwnerToken;
+}
+
+/** Structural deep copy through the canonical codec: the result shares no object
+ * identity with the caller's packet, so later mutation cannot reach it. */
+export const freezeValue = <T>(value: T): T =>
+  value === undefined ? value : parseCanonicalJson(canonicalJson(value)) as unknown as T;
 
 export class Rejected extends Error {
   constructor(readonly reason: CasRejectionReason) {
@@ -38,30 +67,38 @@ interface LineageRow {
 
 /** Step 1: every predicate, including each row's source evidence against the
  * stages this CAS actually verified. */
-export function checkPredicates(db: Database, packet: CasPacket, verified: ReadonlySet<string>): void {
+export function checkPredicates(db: Database, frozen: FrozenCasInputs, verified: ReadonlySet<string>): void {
   const row = db.query(`SELECT l.lineage_id,l.stream,l.state_nonce,l.state_revision,
     l.last_synced_sequence,l.active_base_generation,l.local_revision
     FROM store_meta m JOIN state_lineage l ON l.lineage_id=m.active_lineage_id
     WHERE m.singleton=1`).get() as LineageRow | null;
   if (!row) throw new Error("state store singleton disappeared");
-  const expected = packet.expected;
+  const expected = frozen.expected;
   if (row.lineage_id !== expected.lineageId) reject("lineage");
   if (row.stream !== expected.stream) reject("stream");
   if ((row.state_nonce ?? "legacy") !== expected.nonce) reject("nonce");
   if ((row.state_revision ?? 0) !== expected.stateRevision) reject("state-revision");
   if (row.active_base_generation !== expected.baseGeneration) reject("base-generation");
   if (row.local_revision !== expected.localRevision) reject("local-revision");
-  if (packet.global && packet.sourceGlobalSeq < row.last_synced_sequence) reject("global-sequence");
+  if (frozen.hasGlobal && frozen.sourceGlobalSeq < row.last_synced_sequence) reject("global-sequence");
   const drift = db.query(`SELECT t.rel_path FROM ${CAS_TRANSITION_TEMP} t
     WHERE t.expected_repo_gen <> COALESCE(
       (SELECT r.repo_gen FROM repo_records r WHERE r.lineage_id=? AND r.rel_path=t.rel_path), 0)
     LIMIT 1`).get(expected.lineageId) as { rel_path: string } | null;
   if (drift) reject("repo-generation");
-  assertEvidenceAgainstVerified(db, verified);
-  if (!packet.ownerToken.isOwner()) reject("owner-lost");
+  assertEvidenceAgainstVerified(db, verified, frozen.globalBinding);
+  if (!frozen.ownerToken.isOwner()) reject("owner-lost");
 }
 
-function assertEvidenceAgainstVerified(db: Database, verified: ReadonlySet<string>): void {
+const canonicalBinding = (binding: SourceStageBinding): string => canonicalJson({
+  stageId: binding.stageId, logicalDigest: binding.logicalDigest, physicalSha256: binding.physicalSha256,
+});
+
+function assertEvidenceAgainstVerified(
+  db: Database,
+  verified: ReadonlySet<string>,
+  globalBinding: SourceStageBinding | undefined,
+): void {
   streamRows<{ rel_path: string; evidence_cjson: string }>(
     db, `SELECT rel_path,evidence_cjson FROM ${CAS_TRANSITION_TEMP} ORDER BY path_order`, [], (row) => {
       const evidence = parseCanonicalJson(row.evidence_cjson) as unknown as TransitionEvidenceBindings;
@@ -73,36 +110,38 @@ function assertEvidenceAgainstVerified(db: Database, verified: ReadonlySet<strin
         throw new StageChangedError(row.rel_path, "transition row names a source stage this packet did not verify");
       }
       for (const binding of named) {
-        if (!verified.has(canonicalJson({
-          stageId: binding.stageId, logicalDigest: binding.logicalDigest, physicalSha256: binding.physicalSha256,
-        }))) {
+        if (!verified.has(canonicalBinding(binding))) {
           throw new StageChangedError(row.rel_path, `transition row names unverified source stage ${binding.stageId}`);
         }
+      }
+      // Subset-of-verified is not enough: a global packet derives EVERY record
+      // from the global stage, so its exact identity must appear in each row.
+      if (globalBinding && !named.some((binding) => canonicalBinding(binding) === canonicalBinding(globalBinding))) {
+        throw new StageChangedError(row.rel_path, "transition row does not name the packet's global source stage");
       }
     });
 }
 
 /** Step 3. The staged file set replaces BASE by set-difference; the sealed header,
  * manifest meta, and sequence are replaced together or not at all. */
-export function applyGlobal(db: Database, packet: CasPacket, lineageId: string): void {
-  const global = packet.global!;
-  const generation = packet.expected.baseGeneration + 1;
+export function applyGlobal(db: Database, frozen: FrozenCasInputs, lineageId: string): void {
+  const generation = frozen.expected.baseGeneration + 1;
   internStagedEntryValues(db);
   promoteFilesIntoPlane(db, lineageId, "base", generation);
-  const { generatedAt, manifestSchema, sourceSequence, trustEpoch, complete: _complete, ...extras } = global.stage.header;
+  const { generatedAt, manifestSchema, sourceSequence, trustEpoch, complete: _complete, ...extras } = frozen.globalHeader!;
   db.query(`UPDATE plane_heads SET generation=?,generated_at=?,manifest_schema=?,source_sequence=?,
     trust_epoch=?,complete=1,extras_cjson=? WHERE lineage_id=? AND plane='base'`).run(
     generation, generatedAt, manifestSchema ?? null, sourceSequence ?? null, trustEpoch ?? null,
     Object.keys(extras).length === 0 ? null : canonicalJson(extras), lineageId,
   );
-  db.query("UPDATE state_lineage SET last_synced_sequence=? WHERE lineage_id=?").run(packet.sourceGlobalSeq, lineageId);
+  db.query("UPDATE state_lineage SET last_synced_sequence=? WHERE lineage_id=?").run(frozen.sourceGlobalSeq, lineageId);
   db.query("DELETE FROM manifest_chain WHERE lineage_id=?").run(lineageId);
   db.query("DELETE FROM global_manifest_meta WHERE lineage_id=?").run(lineageId);
   db.query("DELETE FROM manifest_git_sections WHERE lineage_id=? AND role='meta-wire'").run(lineageId);
-  if (global.manifestMeta === undefined) return;
+  if (frozen.globalManifestMeta === undefined) return;
   // The admission invariants U1a could only read are enforced here, by the one
   // definition the wire codec and the JSON authority already share.
-  const meta = validManifestMeta(global.manifestMeta);
+  const meta = validManifestMeta(frozen.globalManifestMeta);
   if (!meta) throw new TypeError("CAS manifestMeta is not a valid GlobalManifestMeta");
   const { encManifestSha, manifestHash, accountEpoch, keyEpoch, chainBytes, snapshotBytes,
     chain, gitRepos, ...metaExtras } = meta as GlobalManifestMeta & Record<string, unknown>;
@@ -222,3 +261,32 @@ export function rebuildManifestProjection(db: Database, lineageId: string, gener
     .run(lineageId, generation, lineageId);
 }
 
+/* ------------------------------------------------------- the CAS input copy */
+
+export const CAS_TRANSITION_TEMP = "cas_transitions";
+
+export function createTransitionTemp(db: Database): void {
+  db.exec(`DROP TABLE IF EXISTS temp.${CAS_TRANSITION_TEMP};
+    CREATE TEMP TABLE ${CAS_TRANSITION_TEMP}(
+      rel_path TEXT PRIMARY KEY, path_order BLOB NOT NULL, expected_repo_gen INTEGER NOT NULL,
+      record_cjson TEXT NOT NULL, base_proof_cjson TEXT, evidence_cjson TEXT NOT NULL);`);
+}
+
+export function dropTransitionTemp(db: Database): void {
+  db.exec(`DROP TABLE IF EXISTS temp.${CAS_TRANSITION_TEMP}`);
+}
+
+/** Per-row evidence travels into the TEMP schema, because step 1 of the CAS checks
+ * it against the packet's verified source stages. Dropping it here would make the
+ * check unfalsifiable. */
+export function copyTransitionRowsIntoTemp(db: Database, reader: SealedTransitionReader): number {
+  const insert = db.query(`INSERT INTO ${CAS_TRANSITION_TEMP}(rel_path,path_order,expected_repo_gen,record_cjson,base_proof_cjson,evidence_cjson)
+    VALUES (?,?,?,?,?,?)`);
+  return reader.streamRows((row) => {
+    insert.run(
+      row.relPath, utf16beOrderKey(row.relPath), row.expectedRepoGen,
+      canonicalJson(row.newRecord), row.baseProof === undefined ? null : canonicalJson(row.baseProof),
+      canonicalEvidenceOf(row.evidenceBindings),
+    );
+  });
+}

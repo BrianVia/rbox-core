@@ -8,7 +8,7 @@
  * orphaned artifact — on success, on refusal, and on adoption.
  */
 import { Database } from "bun:sqlite";
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -21,7 +21,8 @@ import { createStateStore, stateStoreDatabase, type StateStoreHandle } from "./o
 import { openReadSnapshot } from "./read-snapshot.js";
 import { openSealedStage, type SealedStageRef } from "./sealed-stages.js";
 import {
-  StageLock, openSealedArtifact, privateDirectoryPath, sealedStagePath, stageLockPath,
+  StageLock, deleteSealedArtifact, openSealedArtifact, privateDirectoryPath, sealedStagePath,
+  stageLockPath,
 } from "./stage-artifacts.js";
 import { beginRepoTransitionStage } from "./transition-stages.js";
 import { applyCasPacket, type CasPacket } from "./write-packet.js";
@@ -68,7 +69,7 @@ function casPacket(
   const live: LineageSnapshot = openReadSnapshot(handle).token;
   const token: LineageSnapshot = staleRevision === undefined ? live : { ...live, stateRevision: staleRevision };
   const binding = { stageId: stage.stageId, logicalDigest: stage.logicalDigest, physicalSha256: stage.physicalSha256 };
-  const builder = beginRepoTransitionStage(stages, token, [binding]);
+  const builder = beginRepoTransitionStage(stages, token, [binding], { globalBinding: binding });
   builder.putTransition({
     relPath: "repo", expectedRepoGen: 0, newRecord: { sourceSeq: 1, removedKey: "gone" },
     evidenceBindings: { sourceStages: [binding] },
@@ -115,15 +116,17 @@ test("swapping the shared pathname cannot change what a contained consumer reads
 
   const proof = StageLock.acquire(stages, original.stageId);
   try {
-    // The decisive property: the SQLite connection a consumer reads through is
-    // bound to the private, lock-derived name — never to the shared pathname that
-    // was verified. Nothing outside this lock can rename or replace it, which is
-    // what closes the verify-then-reopen-by-name window.
+    // The consumer's connection is bound to an ANONYMOUS inode: the private copy
+    // and its WAL sidecars are unlinked once the priming read has materialized the
+    // WAL index, so after this point no pathname at all reaches the bytes SQLite
+    // reads — not the shared name, and not the private one either.
     const accessor = openSealedArtifact(stages, original, proof);
     try {
       const attached = accessor.db.query("PRAGMA database_list").get() as { file: string };
       expect(attached.file.startsWith(privateDirectoryPath(stages, original.stageId))).toBe(true);
       expect(attached.file).not.toBe(originalPath);
+      expect(fs.existsSync(attached.file)).toBe(false);
+      expect(fs.readdirSync(privateDirectoryPath(stages, original.stageId))).toEqual([]);
     } finally {
       accessor.close();
     }
@@ -134,16 +137,27 @@ test("swapping the shared pathname cannot change what a contained consumer reads
   const lock = StageLock.acquire(stages, original.stageId);
   const reader = openSealedStage(stages, original, lock);
   try {
-    // The classic TOCTOU: replace the verified name with a different valid stage
-    // while the consumer is mid-read, then restore it. Containment means the
-    // consumer never looks at that name again.
+    // The attack the previous regression missed: mutate the SHARED INODE IN PLACE
+    // while the consumer is mid-read, then restore it. A hard-link scheme shares
+    // that inode, so SQLite would have read the impostor's pages. Copy-while-
+    // hashing means the consumed bytes were captured in the same pass that hashed
+    // them, so an in-place edit is not observable at all.
     const impostorBytes = fs.readFileSync(impostorPath);
     const originalBytes = fs.readFileSync(originalPath);
-    fs.rmSync(originalPath);
-    fs.writeFileSync(originalPath, impostorBytes);
     expect(reader.files(undefined, 512).rows.map((file) => file.path)).toEqual(["original.txt"]);
-    fs.rmSync(originalPath);
-    fs.writeFileSync(originalPath, originalBytes);
+    const shared = fs.openSync(originalPath, "r+");
+    try {
+      fs.writeSync(shared, impostorBytes, 0, Math.min(impostorBytes.length, originalBytes.length), 0);
+      fs.fsyncSync(shared);
+      // Same inode, different bytes, mid-consumption.
+      expect(fs.readFileSync(originalPath).equals(originalBytes)).toBe(false);
+      expect(reader.files(undefined, 512).rows.map((file) => file.path)).toEqual(["original.txt"]);
+      expect(reader.streamFiles(() => {})).toBe(1);
+      fs.writeSync(shared, originalBytes, 0, originalBytes.length, 0);
+      fs.fsyncSync(shared);
+    } finally {
+      fs.closeSync(shared);
+    }
     reader.close();
   } finally {
     lock.release();
@@ -152,6 +166,33 @@ test("swapping the shared pathname cannot change what a contained consumer reads
   expect(fs.existsSync(privateDirectoryPath(stages, original.stageId))).toBe(false);
   for (const suffix of ["-wal", "-shm", "-journal"]) expect(fs.existsSync(`${originalPath}${suffix}`)).toBe(false);
   handle.close();
+});
+
+test("the id-scoped delete refuses a shared name that is no longer the proven inode", () => {
+  const { stages } = workspace("rbox-lifecycle-delete-race-");
+  const stage = seal(stages, [entry("one.txt", 1)]);
+  const sealed = sealedStagePath(stages, stage.stageId, stage.logicalDigest);
+  const originalLink = fs.linkSync;
+  // Swap the shared name for a BYTE-IDENTICAL copy the instant after the inode is
+  // pinned. The content proof still passes; only the dev/ino confirmation catches
+  // it — which is why the delete confirms identity rather than trusting the hash.
+  const link = spyOn(fs, "linkSync").mockImplementation((source, target) => {
+    originalLink(source as string, target as string);
+    const bytes = fs.readFileSync(sealed);
+    fs.rmSync(sealed);
+    fs.writeFileSync(sealed, bytes);
+  });
+  const lock = StageLock.acquire(stages, stage.stageId);
+  try {
+    expect(() => deleteSealedArtifact(stages, stage, lock))
+      .toThrow("the shared name is no longer the inode this ref proves");
+  } finally {
+    link.mockRestore();
+    lock.release();
+  }
+  // Refused, so the impostor is still there rather than silently removed.
+  expect(fs.existsSync(sealed)).toBe(true);
+  expect(fs.existsSync(privateDirectoryPath(stages, stage.stageId))).toBe(false);
 });
 
 test("artifact cleanup never unlinks the lock that authorizes it", () => {
@@ -195,6 +236,55 @@ test("a sealing failure leaves no lock, no private directory, and no partial art
   } finally {
     lock.release();
   }
+});
+
+test("a destination never survives a failed seal, even after a successful link", () => {
+  const { stages } = workspace("rbox-lifecycle-fsync-");
+  const originalFsync = fs.fsyncSync;
+  const originalLink = fs.linkSync;
+  let linked: string | undefined;
+  const link = spyOn(fs, "linkSync").mockImplementation((source, target) => {
+    originalLink(source as string, target as string);
+    linked = target as string;
+  });
+  // Fail only the parent-directory flush that follows a SUCCESSFUL publication.
+  const fsync = spyOn(fs, "fsyncSync").mockImplementation((fd: number) => {
+    if (linked !== undefined) throw new Error("simulated directory fsync failure");
+    originalFsync(fd);
+  });
+  try {
+    const builder = beginGeneration(stages, "base", HEADER);
+    builder.putEntries([entry("one.txt", 1)]);
+    expect(() => builder.finishGeneration({ files: 1, gitSections: 0 })).toThrow("simulated directory fsync failure");
+  } finally {
+    fsync.mockRestore();
+    link.mockRestore();
+  }
+  expect(linked).toBeDefined();
+  expect(fs.existsSync(linked!)).toBe(false);
+  expect(fs.readdirSync(stages)).toEqual([]);
+});
+
+test("a destination that is not the proven inode is removed and sealing fails", () => {
+  const { stages } = workspace("rbox-lifecycle-wrong-inode-");
+  let published: string | undefined;
+  // A "link" that produces a different inode is exactly what the post-link fstat
+  // comparison exists to catch.
+  const link = spyOn(fs, "linkSync").mockImplementation((source, target) => {
+    fs.copyFileSync(source as string, target as string);
+    published = target as string;
+  });
+  try {
+    const builder = beginGeneration(stages, "base", HEADER);
+    builder.putEntries([entry("one.txt", 1)]);
+    expect(() => builder.finishGeneration({ files: 1, gitSections: 0 }))
+      .toThrow("the published name is not the inode this builder proved");
+  } finally {
+    link.mockRestore();
+  }
+  expect(published).toBeDefined();
+  expect(fs.existsSync(published!)).toBe(false);
+  expect(fs.readdirSync(stages)).toEqual([]);
 });
 
 test("a discarded transition builder leaves no lock and no private directory", () => {

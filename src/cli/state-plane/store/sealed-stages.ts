@@ -32,6 +32,8 @@ export interface SealedStageRef {
 }
 
 export interface SealedStageReader {
+  /** The header the artifact itself carries, read back during verification. */
+  readonly sealedHeader: ManifestHeader;
   files(afterPath: string | undefined, batchSize: number): CursorPage<FileEntry>;
   gitRepoCursor(role: GitSectionRole, afterRelPath: string | undefined, batchSize: number): CursorPage<{ relPath: string; section: GitSection }>;
   gitRepo(role: GitSectionRole, relPath: string): GitSection | undefined;
@@ -44,8 +46,9 @@ export interface SealedStageReader {
  * the lock for the whole consumption interval and releases it after `close()`. */
 export function openSealedStage(directory: string, ref: SealedStageRef, lock: StageLock): SealedStageReader {
   const accessor = openSealedArtifact(directory, ref, lock);
+  let derived: SealedStageRef;
   try {
-    const derived = deriveStageRef(accessor, ref.stageId, ref.physicalSha256, ref.bytes);
+    derived = deriveStageRef(accessor, ref.stageId, ref.physicalSha256, ref.bytes);
     if (canonicalJson(derived) !== canonicalJson(ref)) {
       throw new StageChangedError(ref.stageId, "sealed stage identity does not match its ref");
     }
@@ -53,7 +56,7 @@ export function openSealedStage(directory: string, ref: SealedStageRef, lock: St
     try { accessor.close(); } catch { /* the original refusal is the report */ }
     throw error;
   }
-  return new SqliteSealedStage(accessor, ref);
+  return new SqliteSealedStage(accessor, ref, derived.header);
 }
 
 function deriveStageRef(
@@ -158,7 +161,11 @@ function assertWindow(kind: "file" | "git", batchSize: number, maximum: number):
 }
 
 class SqliteSealedStage implements SealedStageReader {
-  constructor(private readonly accessor: SealedArtifactAccessor, private readonly ref: SealedStageRef) {}
+  constructor(
+    private readonly accessor: SealedArtifactAccessor,
+    private readonly ref: SealedStageRef,
+    readonly sealedHeader: ManifestHeader,
+  ) {}
 
   files(afterPath: string | undefined, batchSize: number): CursorPage<FileEntry> {
     assertWindow("file", batchSize, MAX_FILE_BATCH);
