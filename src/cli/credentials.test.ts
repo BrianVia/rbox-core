@@ -452,6 +452,30 @@ test("a fence released inside the inspection window is a retry, not a lost write
   await expect(fs.lstat(fence)).rejects.toThrow();
 });
 
+test("a peer that cycles the fence exhausts the budget and names the churn", async () => {
+  setSystemTime();
+  const fence = `${lockPath()}.fence`;
+  await fs.mkdir(path.dirname(fence), { mode: 0o700 });
+  const identity = await (await import("../engine/git/lockfile.js")).systemLockIdentity.current();
+  const republish = async (nonce: string) => {
+    await fs.rm(fence, { force: true });
+    await fs.writeFile(fence, JSON.stringify({
+      v: 1, pid: process.pid, processStart: identity.startTime, acquiredAt: new Date().toISOString(), nonce: nonce.repeat(32),
+    }), { mode: 0o600 });
+  };
+  await republish("a");
+  let cycles = 0;
+  restoreHook = installCredentialTestHook(async (seam, context) => {
+    // A peer that keeps taking and releasing the fence: every inspection finds
+    // a different inode at the same path, so no attempt can ever settle.
+    if (seam !== "marker-observe-before-open" || context.markerPath !== fence) return;
+    cycles++;
+    await republish(String(cycles % 10));
+  });
+  await expect(saveCredentials(credential)).rejects.toThrow(/saw the marker change during inspection/);
+  expect(cycles).toBeGreaterThan(1);
+});
+
 test("five-minute stale main marker is taken over independent of its live PID", async () => {
   await fs.mkdir(path.dirname(lockPath()), { mode: 0o700 });
   const stale = { v: 1, pid: process.pid, processStart: "1", acquiredAt: fixedNow.toISOString(), nonce: "a".repeat(32) };

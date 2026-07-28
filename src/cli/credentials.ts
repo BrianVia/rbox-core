@@ -303,7 +303,9 @@ async function readMarker(markerPath: string): Promise<MarkerObservation | undef
   }
   const beforeObs = observation(before);
   if (!regular(beforeObs.mode)) throw new Error(`unsafe credential lock marker: ${markerPath}`);
-  await testSeam("marker-observe-before-open", { markerPath });
+  // Guarded, not merely no-op: an awaited async seam would yield a microtask
+  // in production exactly inside the lstat/open window this fix is about.
+  if (credentialTestHook) await testSeam("marker-observe-before-open", { markerPath });
   let handle: fs.FileHandle;
   try {
     handle = await fs.open(markerPath, constants.O_RDONLY | NOFOLLOW);
@@ -405,8 +407,9 @@ async function unlinkObserved(target: string, expected: PathObservation, durable
 /** Inspect a fence this process failed to publish. The holder can release at
  *  any instant — nothing fences the fence — so a marker that is absent, turns
  *  over mid-inspection, or belongs to a proven-dead incarnation only means
- *  "look again", never a failed acquisition. */
-async function inspectHeldFence(markerPath: string): Promise<"retry" | "held"> {
+ *  "look again", never a failed acquisition. Turnover is reported separately
+ *  from the other retries so exhaustion can name marker churn as its cause. */
+async function inspectHeldFence(markerPath: string): Promise<"retry" | "turnover" | "held"> {
   try {
     const held = await readMarker(markerPath);
     if (!held) return "retry";
@@ -419,13 +422,14 @@ async function inspectHeldFence(markerPath: string): Promise<"retry" | "held"> {
     await unlinkObserved(markerPath, held, true);
     return "retry";
   } catch (error) {
-    if (error instanceof MarkerTurnoverError) return "retry";
+    if (error instanceof MarkerTurnoverError) return "turnover";
     throw error;
   }
 }
 
 async function acquireFence(): Promise<{ path: string; observation: MarkerObservation }> {
   const markerPath = fenceFile();
+  let turnovers = 0;
   for (let attempt = 0; attempt < LOCK_RETRIES; attempt++) {
     const created = await markerForCurrentProcess();
     const result = await publishMarker(markerPath, created.raw);
@@ -434,11 +438,16 @@ async function acquireFence(): Promise<{ path: string; observation: MarkerObserv
       if (!observed || observed.marker.nonce !== created.marker.nonce) throw new Error("credential fence ownership could not be proved");
       return { path: markerPath, observation: observed };
     }
-    if (await inspectHeldFence(markerPath) === "retry") continue;
+    const inspected = await inspectHeldFence(markerPath);
+    if (inspected === "turnover") turnovers++;
+    if (inspected !== "held") continue;
     if (credentialTestHook) await testSeam("lock-contended", { lockPath: markerPath, attempt: String(attempt) });
     if (attempt + 1 < LOCK_RETRIES) await sleep(LOCK_RETRY_MS);
   }
-  throw new Error(`credential fence is held or its owner cannot be proved dead: ${markerPath}`);
+  // Benign turnovers stay silent; only exhaustion needs to name marker churn,
+  // which points at a cycling peer rather than one stuck holder.
+  const churn = turnovers > 0 ? `; ${turnovers} of ${LOCK_RETRIES} attempts saw the marker change during inspection` : "";
+  throw new Error(`credential fence is held or its owner cannot be proved dead: ${markerPath}${churn}`);
 }
 
 async function releaseFence(fence: { path: string; observation: MarkerObservation }): Promise<void> {
