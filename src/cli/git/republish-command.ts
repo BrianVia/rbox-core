@@ -2,6 +2,7 @@ import path from "node:path";
 import type { GitSection } from "../../engine/types.js";
 import { loadConfig, loadState, repoRecordsForState, syncStreamId, type SyncState } from "../config.js";
 import { recordRepublishRequest } from "../sync-git/republish-requests.js";
+import type { WorkspaceSyncMutex } from "../sync-mutex.js";
 
 export interface GitRepublishCmdDeps {
   now?: () => Date;
@@ -51,6 +52,7 @@ function admit(state: SyncState, rel: string): { base: GitSection } | { refusal:
 export async function gitRepublishCmd(
   root: string,
   repoArg: string,
+  syncMutex: WorkspaceSyncMutex,
   options: GitRepublishCmdOptions = {},
   deps: GitRepublishCmdDeps = {},
 ): Promise<number> {
@@ -65,7 +67,14 @@ export async function gitRepublishCmd(
     const admission = admit(state, rel);
     if ("refusal" in admission) throw new Error(admission.refusal);
     const { base } = admission;
-    const result = await recordRepublishRequest(root, stream, rel, { bundleSha: base.bundleSha, generatedAt: base.generatedAt }, (deps.now ?? (() => new Date()))());
+    const result = await recordRepublishRequest(
+      root,
+      stream,
+      rel,
+      { bundleSha: base.bundleSha, generatedAt: base.generatedAt },
+      (deps.now ?? (() => new Date()))(),
+      syncMutex,
+    );
     if (options.json) {
       write(JSON.stringify({ schemaVersion: 1, repo: rel, status: result.status, requestedAt: result.requestedAt, pending: result.pending }));
       return 0;
