@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { buildIgnoreMatcher, checkoutTransactionCapability, cryptoPoolStatus, gitIdentity, gitIdentityKey, ManifestChainError, MAX_MANIFEST_DELTA_CHAIN, type IgnoreMatcher } from "../engine/index.js";
 import { loadActivity, type DaemonActivity } from "./activity.js";
-import { loadConfig, loadRawState, loadState, repoRecordsForState, syncStreamId, type WorkspaceConfig } from "./config.js";
+import { loadConfig, loadState, repoRecordsForState, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { credentialFailureMessage, loadCredentials, type CredentialLoadResult, type Credentials } from "./credentials.js";
 import { currentWorkspaceId, daemonBindingStatus, readDaemonBindingRecord, readMergedDaemonLogTail } from "./daemon-control.js";
 import { enrolledDeviceId, loadDevice } from "./e2ee-keystore.js";
@@ -19,8 +19,8 @@ import { pendingGenesisState } from "./genesis-enrollment.js";
 import { GENESIS_PENDING_MESSAGE } from "./genesis-durable.js";
 import type { E2eeRemote } from "./e2ee-remote.js";
 import { readLockingHealth } from "./sync-mutex.js";
-import { ResetCorruptionError } from "./reset-io.js";
-import { inspectStateReserve, StateFormatTooNewError } from "./state-plane/index.js";
+import { checkState, checkStateReserve } from "./doctor-state-plane.js";
+import { describeCheck, type DoctorCheckDescriptor, type DoctorCheckRunInput } from "./doctor-check.js";
 import { GIT_DEFERRAL_REASONS } from "./sync-state-model.js";
 import { fetchWithDeadline, transferTimeoutMs } from "./remote/resilient.js";
 import { listWorktrees } from "../engine/git/shared.js";
@@ -398,56 +398,6 @@ async function checkVersion(creds: Credentials | undefined, cfg: WorkspaceConfig
   }
 }
 
-async function checkState(root: string, cfg: WorkspaceConfig): Promise<DoctorCheck> {
-  const file = path.join(root, ".rbox", "state.json");
-  try {
-    const parsed = await loadRawState(root);
-    if (!parsed) return { ok: true, label: "state", message: "no sync state yet" };
-    const expected = syncStreamId(cfg);
-    if (parsed.stream !== undefined && parsed.stream !== expected) {
-      return { ok: false, status: "stream-mismatch", label: "state", message: ".rbox/state.json belongs to a different stream", hint: "run `rbox status` for the local re-baseline warning" };
-    }
-    return { ok: true, label: "state", message: "state file parses and matches this stream" };
-  } catch (e) {
-    const message = e instanceof Error ? e.message : "";
-    if (e instanceof StateFormatTooNewError) {
-      return {
-        ok: false, status: "format-too-new", label: "state",
-        message: ".rbox/state.json was written by a newer version of rbox",
-        hint: "run `rbox upgrade`; do not delete this file",
-      };
-    }
-    if (e instanceof ResetCorruptionError
-      && message.includes(file)
-      && (message.includes("malformed JSON") || message.includes("JSON nesting exceeded"))) {
-      return { ok: false, status: "malformed", label: "state", message: ".rbox/state.json is not valid JSON", hint: "inspect the file or delete it to intentionally re-baseline" };
-    }
-    return { ok: false, status: "unreadable", label: "state", message: "could not read .rbox/state.json" };
-  }
-}
-
-/** The reserved 1 MiB of upgrade runway. Absent is normal (it is created by the
- * first state save); only a foreign occupant of the path is a finding, because
- * rbox will never adopt, shrink, or remove something it did not write. */
-async function checkStateReserve(root: string, cfg: WorkspaceConfig): Promise<DoctorCheck> {
-  try {
-    const outcome = await inspectStateReserve(root, syncStreamId(cfg));
-    if (outcome.status === "reserve-foreign") {
-      return {
-        ok: false, status: "reserve-foreign", label: "upgrade reserve",
-        message: `.rbox/state/reserve-1mib.bin is not rbox's own reserved space (${outcome.detail})`,
-        hint: "move that file aside yourself, then run `rbox doctor` again",
-      };
-    }
-    if (outcome.status === "unavailable") {
-      return { ok: true, label: "upgrade reserve", message: outcome.detail === "absent" ? "not reserved yet" : `not reserved yet (${outcome.detail})` };
-    }
-    return { ok: true, label: "upgrade reserve", message: "1 MiB reserved for future upgrades" };
-  } catch {
-    return { ok: true, inconclusive: true, label: "upgrade reserve", message: "could not check the reserved space" };
-  }
-}
-
 export async function checkManifestChain(remote: Pick<E2eeRemote, "chainDiagnostic">): Promise<DoctorCheck> {
   try {
     const d = await remote.chainDiagnostic();
@@ -722,6 +672,26 @@ async function checkLocking(root: string): Promise<DoctorCheck> {
   };
 }
 
+/** Ordered doctor checks: the human render order AND the serialized bundle key order. */
+const DOCTOR_CHECKS: readonly DoctorCheckDescriptor[] = [
+  describeCheck("credentials", ({ creds, loaded }) => loaded.state !== "valid" && loaded.state !== "absent"
+    ? { ok: false, label: "credentials", message: `credential-degraded: ${credentialFailureMessage(loaded)}`, hint: "repair the credential source, then retry" }
+    : checkCredentials(creds)),
+  describeCheck("enrollment", ({ creds }) => checkEnrollment(creds)),
+  describeCheck("device", ({ creds, cfg }) => checkDeviceIdentity(creds, cfg)),
+  describeCheck("daemon", ({ root, cfg }) => checkDaemon(root, cfg).check),
+  describeCheck("remote", ({ creds, cfg }) => checkRemote(creds, cfg)),
+  describeCheck("version", ({ creds, cfg }) => checkVersion(creds, cfg)),
+  describeCheck("state", ({ root, cfg }) => checkState(root, cfg)),
+  describeCheck("crypto", () => checkCryptoWorkers()),
+  describeCheck("locking", ({ root }) => checkLocking(root)),
+  describeCheck("git", ({ root }) => checkGitCapability(root)),
+  describeCheck("reserve", ({ root, cfg }) => checkStateReserve(root, cfg)),
+  describeCheck("chain", ({ root, loaded }) => buildAuthedRemote(root, Date.now, undefined, loaded)
+    .then((built) => checkManifestChain(built.remote))
+    .catch((error: unknown) => ({ ok: false, label: "manifest chain", message: error instanceof Error ? error.message : String(error) }))),
+];
+
 export async function collectDoctorContext(
   root: string,
   options: { residueBytes?: boolean } = {},
@@ -730,26 +700,13 @@ export async function collectDoctorContext(
   const loaded = await loadCredentials();
   const creds = loaded.state === "valid" ? loaded.credentials : undefined;
   const cfg = { ...rawCfg, remoteUrl: creds?.remoteUrl ?? rawCfg.remoteUrl };
-  const daemon = checkDaemon(root, cfg);
-  const [credentials, enrollment, device, remote, version, state, reserve, locking, git, shape, chain, leftoverWorktrees, repoResidue] = await Promise.all([
-    loaded.state !== "valid" && loaded.state !== "absent"
-      ? Promise.resolve({ ok: false, label: "credentials", message: `credential-degraded: ${credentialFailureMessage(loaded)}`, hint: "repair the credential source, then retry" })
-      : checkCredentials(creds),
-    checkEnrollment(creds),
-    checkDeviceIdentity(creds, cfg),
-    checkRemote(creds, cfg),
-    checkVersion(creds, cfg),
-    checkState(root, cfg),
-    checkStateReserve(root, cfg),
-    checkLocking(root),
-    checkGitCapability(root),
-    // An unreadable or foreign-stream state.json is exactly what `checkState`
-    // exists to REPORT; letting its shape read abort the whole collection made
-    // doctor unusable on the one workspace that needs it most.
+  const input: DoctorCheckRunInput = { root, cfg, creds, loaded };
+  const [checkEntries, shape, leftoverWorktrees, repoResidue] = await Promise.all([
+    // Each descriptor carries its own key: a keyed record, not index-aligned.
+    Promise.all(DOCTOR_CHECKS.map(async (descriptor) => [descriptor.id, await descriptor.run(input)] as const)),
+    // An unreadable or foreign-stream state.json is what `checkState` REPORTS;
+    // letting its shape read abort collection made doctor unusable where needed.
     workspaceShape(root, cfg).catch(() => ({ fileCount: 0, totalBytes: 0 })),
-    buildAuthedRemote(root, Date.now, undefined, loaded).then((built) => checkManifestChain(built.remote)).catch((error: unknown) => ({
-      ok: false, label: "manifest chain", message: error instanceof Error ? error.message : String(error),
-    })),
     collectLeftoverWorktrees(root, cfg).catch(() => ({
       localOnly: { count: 0, entries: [] },
       diagnostics: { count: 0, entries: [] },
@@ -770,14 +727,16 @@ export async function collectDoctorContext(
       },
     })),
   ]);
+  const checks = Object.fromEntries(checkEntries) as DoctorChecks;
   return {
     root,
     cfg,
     creds,
     credentialResult: loaded,
-    daemonStale: daemon.stale,
+    // The daemon check's `stale` status is what `daemon.stale` carried before.
+    daemonStale: checks.daemon.status === "stale",
     workspaceShape: shape,
-    checks: { credentials, enrollment, device, daemon: daemon.check, remote, version, state, crypto: checkCryptoWorkers(), locking, git, reserve, chain },
+    checks,
     localOnly: {
       leftoverWorktrees: leftoverWorktrees.localOnly,
       repoResidue: repoResidue.localOnly,
@@ -830,6 +789,16 @@ function pickActivity(a: DaemonActivity | undefined): ActivitySection {
   return out;
 }
 
+/** The bundle's `checks` map through each descriptor's machine renderer, in descriptor key order. */
+function machineChecks(checks: DoctorChecks): DoctorChecks {
+  return Object.fromEntries(
+    DOCTOR_CHECKS.flatMap((descriptor) => {
+      const check = checks[descriptor.id];
+      return check ? [[descriptor.id, descriptor.renderMachine(check)] as const] : [];
+    }),
+  ) as DoctorChecks;
+}
+
 export async function buildDiagnosticsBundle(ctx: DoctorContext): Promise<DiagnosticsBundle> {
   const sidecars = daemonOwnedSectionsExcluded(ctx)
     ? { daemonLogTail: STALE_EXCLUDED, metrics: STALE_EXCLUDED, activity: STALE_EXCLUDED }
@@ -842,7 +811,7 @@ export async function buildDiagnosticsBundle(ctx: DoctorContext): Promise<Diagno
     version: RBOX_VERSION,
     platform: { os: process.platform, arch: process.arch },
     bunVersion: bunVersion(),
-    checks: ctx.checks,
+    checks: machineChecks(ctx.checks),
     daemonLogTail: sidecars.daemonLogTail,
     metrics: sidecars.metrics,
     activity: sidecars.activity,
@@ -884,11 +853,10 @@ export function renderDoctor(
   localOnly?: DoctorContext["localOnly"],
 ): string {
   const lines = [`${style.bold("doctor")} — workspace health`];
-  for (const key of ["credentials", "enrollment", "device", "daemon", "remote", "version", "state", "crypto", "locking", "git", "reserve", "chain"] as const) {
-    const c = checks[key];
+  for (const descriptor of DOCTOR_CHECKS) {
+    const c = checks[descriptor.id];
     if (!c) continue;
-    lines.push(`  ${c.ok ? style.sym.ok : style.sym.err} ${c.label}: ${c.message}`);
-    if (!c.ok && c.hint) lines.push(`      ${style.dim("fix:")} ${c.hint}`);
+    lines.push(...descriptor.renderHuman(c));
   }
   if (localOnly) {
     const worktrees = localOnly.leftoverWorktrees;

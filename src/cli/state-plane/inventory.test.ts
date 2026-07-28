@@ -51,7 +51,7 @@ const ENTRY_POINTS: readonly EntryPoint[] = [
   // Reads — refuse a state plane written by a newer rbox instead of guessing.
   { file: "src/cli/sync-state-store.ts", symbol: "loadRawState", kind: "read", sites: 2, guards: ["assertStateReadable"] },
   { file: "src/cli/sync-state-store.ts", symbol: "loadState", kind: "read", sites: 1, guards: ["loadRawState"] },
-  { file: "src/cli/doctor-cmd.ts", symbol: "checkState", kind: "read", sites: 1, guards: ["loadRawState"] },
+  { file: "src/cli/doctor-state-plane.ts", symbol: "checkState", kind: "read", sites: 1, guards: ["loadRawState"] },
 
   // Writes — check the barrier immediately before the publishing rename, and
   // record the last-writer witness immediately after it.

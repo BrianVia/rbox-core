@@ -36,7 +36,7 @@ const BASE_CALL_CALLEES = new Set([
   "spawn",
 ]);
 const STATE_ORDER_OWNERS = new Map([
-  ["src/cli/doctor-cmd.ts", new Set(["checkState"])],
+  ["src/cli/doctor-state-plane.ts", new Set(["checkState"])],
   ["src/cli/reset-journal-doctor.ts", new Set(["quarantineStandingJournal", "withResetJournalDoctorFence"])],
   ["src/cli/reset-journal.ts", new Set([
     "observePhysical",
