@@ -50,6 +50,32 @@ test("WAL and FULL synchronous mode survive set-and-readback", () => {
   }
 });
 
+test("NUMERIC and REAL readback preserve the state-store number contract", () => {
+  const db = new Database(":memory:");
+  try {
+    db.exec("CREATE TABLE values_under_test(size NUMERIC NOT NULL, mtime_ms REAL NOT NULL)");
+    const exactUnsafeInteger = 2 ** 53 + 2;
+    const realAtInt64Boundary = 2 ** 63;
+    const insert = db.query("INSERT INTO values_under_test VALUES (?,?)");
+    insert.run(exactUnsafeInteger, 1.25);
+    insert.run(realAtInt64Boundary, 1.25);
+
+    const read = db.query("SELECT size,mtime_ms,typeof(size) AS storage FROM values_under_test ORDER BY rowid");
+    expect(read.safeIntegers()).toBe(false);
+    expect(read.all()).toEqual([
+      { size: exactUnsafeInteger, mtime_ms: 1.25, storage: "integer" },
+      { size: realAtInt64Boundary, mtime_ms: 1.25, storage: "real" },
+    ]);
+    expect(read.safeIntegers(true)).toBe(read);
+    expect(read.all()).toEqual([
+      { size: BigInt(exactUnsafeInteger), mtime_ms: 1.25, storage: "integer" },
+      { size: realAtInt64Boundary, mtime_ms: 1.25, storage: "real" },
+    ]);
+  } finally {
+    db.close();
+  }
+});
+
 test("a competing writer waits for busy_timeout before surfacing SQLITE_BUSY", () => {
   const file = databasePath();
   const holder = new Database(file);
