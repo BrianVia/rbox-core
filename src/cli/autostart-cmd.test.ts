@@ -12,11 +12,13 @@ import {
   readDesiredDaemonRows,
   resumeDesiredDaemon,
   startDaemonAndRecordDesired,
+  startDaemonForUser,
   stopDaemonAndRecordDesired,
   parkDaemonForMaintenance,
   resumeDaemonAfterMaintenance,
 } from "./autostart-cmd.js";
 import { daemonPidPath, daemonStatusPath } from "./rbox-paths.js";
+import { withScopeTransitionLock } from "./scope/scope-lock.js";
 
 let home: string;
 let roots: string[];
@@ -1142,4 +1144,49 @@ test("a crash between the restart and the token clear resolves to a plain clear"
   const final = JSON.parse(await fs.readFile(desiredStatePath(root), "utf8"));
   expect(final.state).toBe("running");
   expect(final.maintenance).toBeUndefined();
+});
+
+test("a user start waits for a live scope edit and then reports it", async () => {
+  const root = await workspace("ws_startblocked");
+  await recordDesired(root, "running", "acct_startblocked");
+  const started: string[] = [];
+
+  await withScopeTransitionLock(root, async () => {
+    // A scope edit holds the lock: the daemon must not boot into a half-applied scope.
+    await expect(startDaemonForUser(root, {
+      loadCredentials: creds("acct_startblocked"),
+      lockWaitMs: 1,
+      startDaemon: async (r) => {
+        started.push(r);
+        return "started" as const;
+      },
+    })).rejects.toThrow("in progress");
+  });
+  expect(started).toEqual([]);
+});
+
+test("a user start after a crashed scope edit cancels the window and boots", async () => {
+  const root = await workspace("ws_startorphan");
+  await recordDesired(root, "running", "acct_startorphan");
+  await parkDaemonForMaintenance(root, "mt_1", { loadCredentials: creds("acct_startorphan"), stopDaemon: async () => {} });
+  // The edit died here: the window is open and nothing holds the lock.
+
+  const started: string[] = [];
+  await startDaemonForUser(root, {
+    loadCredentials: creds("acct_startorphan"),
+    startDaemon: async (r) => {
+      started.push(r);
+      return "started" as const;
+    },
+  });
+  expect(started).toEqual([root]);
+  const final = JSON.parse(await fs.readFile(desiredStatePath(root), "utf8"));
+  expect(final.state).toBe("running");
+  expect(final.maintenance).toBeUndefined();
+
+  // And the cancelled window cannot be resumed behind the user's back.
+  expect(await resumeDaemonAfterMaintenance(root, "mt_1", {
+    loadCredentials: creds("acct_startorphan"),
+    startDaemon: async () => "started" as const,
+  })).toBe(false);
 });

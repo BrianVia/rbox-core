@@ -4,10 +4,11 @@ import os from "node:os";
 import path from "node:path";
 
 import { readPersistedEntries } from "./binding-registry.js";
-import { loadConfig, loadState, saveStateUnsafeLegacyOrTest, syncStreamId } from "./config.js";
+import { loadConfig, loadState, saveConfig, saveStateUnsafeLegacyOrTest, syncStreamId } from "./config.js";
 import { flagValues, parseFlags } from "./flags.js";
 import { resolveBindingScope } from "./scope/binding-scope.js";
 import { scopeCmd } from "./scope/scope-cmd.js";
+import { withScopeTransitionLock } from "./scope/scope-lock.js";
 import { resumeScopeIntent } from "./scope/scope-transaction.js";
 import { track } from "./track-cmd.js";
 
@@ -225,4 +226,23 @@ test("a crash between the include rollback and the restart still owes the daemon
 
   await resumeScopeIntent(root, daemon);
   expect(running).toBe(true);
+});
+
+test("a bind racing a live scope edit cannot overwrite its cursor", async () => {
+  await track(root, { workspace: "ws_bindrace" }, "https://api.test");
+  await scopeCmd(root, "add", ["Personal/repo-A"], { quiet: true }, { daemonRunning: () => false });
+  // A scope edit is mid-transition, holding the lock with its cursor journaled.
+  const cursor = { generation: 3, accepted: ["Personal/repo-A"], target: ["Work/repo-B"], materialize: ["Work/repo-B"], prune: ["Personal/repo-A"], at: "live", phase: "planned" as const };
+  await saveConfig(root, { ...(await loadConfig(root)), scopeIntent: cursor });
+
+  await withScopeTransitionLock(root, async () => {
+    await expect(track(
+      root,
+      { workspace: "ws_bindrace", include: "Work/repo-C" },
+      "https://api.test",
+      { scopeDeps: { daemonRunning: () => false, lockWaitMs: 1 } },
+    )).rejects.toThrow("in progress");
+  });
+
+  expect((await loadConfig(root)).scopeIntent).toMatchObject({ at: "live", target: ["Work/repo-B"] });
 });

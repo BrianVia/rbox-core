@@ -9,6 +9,7 @@ import { currentWorkspaceId, daemonRuntimeDir, readDaemonModeWitness, readDaemon
 import { credentialFailureMessage, credentialsForStrictFlow, loadCredentials } from "./credentials.js";
 import { homeDir } from "./rbox-paths.js";
 import { assertBindingUsable, resolveBindingScope } from "./scope/binding-scope.js";
+import { withScopeTransitionLock } from "./scope/scope-lock.js";
 import { fail, style } from "./style.js";
 import type { DaemonMode } from "./daemon/ambient-status.js";
 
@@ -65,6 +66,8 @@ interface DesiredDeps extends CommonDeps {
   mode?: DaemonMode;
   /** Compatibility for setup/older callers; true is an explicit pull-only intent. */
   pullOnly?: boolean;
+  /** Bounded wait for the scope-transition lock before reporting an edit in progress. */
+  lockWaitMs?: number;
 }
 
 interface StartStopDeps extends DesiredDeps {
@@ -493,8 +496,27 @@ async function startDaemonAndRecordDesiredImpl(root: string, deps: StartStopDeps
   return promoted !== undefined;
 }
 
+/** Start and record, composable: callers that already hold the scope-transition
+ *  lock (the resume path) or that cannot be racing an edit use this. */
 export async function startDaemonAndRecordDesired(root: string, deps: StartStopDeps = {}): Promise<void> {
   await startDaemonAndRecordDesiredImpl(root, deps);
+}
+
+/**
+ * `rbox start` and every other command-level start. It takes the scope-transition
+ * lock because a scope edit parks the daemon precisely so nothing runs while
+ * folders are being trashed and committed: a start landing mid-edit would boot the
+ * daemon into a half-applied scope AND drop the maintenance token on its way past,
+ * and the resume fence can only decline to restart afterwards — it cannot put the
+ * daemon back to sleep. Waiting for the edit, then reporting it, is the only safe
+ * answer.
+ *
+ * With no edit in flight the user still wins outright: the record is rebuilt from a
+ * fresh identity, so an orphaned window left by a crashed edit is cancelled by the
+ * very act of starting.
+ */
+export async function startDaemonForUser(root: string, deps: StartStopDeps = {}): Promise<void> {
+  await withScopeTransitionLock(path.resolve(root), () => startDaemonAndRecordDesiredImpl(root, deps), deps.lockWaitMs);
 }
 
 export async function resumeDesiredDaemon(
