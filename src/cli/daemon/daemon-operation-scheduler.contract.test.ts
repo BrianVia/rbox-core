@@ -163,6 +163,18 @@ test("contract: a standing halt is ineligible ambiently and heals only through i
   expect(r.scheduler.recoveryDequeuesSinceDue).toBe(0);
 });
 
+test("contract: a due probe whose halt is already retired terminates the loop", async () => {
+  const r = rig();
+  r.halt = undefined; // the halt healed, but the due probe outlived it
+  r.scheduler.recoveryDue = true;
+  expect(r.scheduler.nextOperation()).toBe("recoveryProbe");
+  const timeout = new Promise<"timeout">((resolve) => void setTimeout(() => resolve("timeout"), 2_000));
+  expect(await Promise.race([r.service().then(() => "done" as const), timeout])).toBe("done");
+  expect(r.serviced).toEqual([]);
+  expect(r.scheduler.recoveryDue).toBe(false);
+  expect(r.scheduler.nextOperation()).toBeUndefined();
+});
+
 test("contract: a refused boundary ends the loop without servicing or draining the queue", async () => {
   const r = rig();
   r.scheduler.queue("pull");
