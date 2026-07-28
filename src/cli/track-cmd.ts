@@ -21,6 +21,7 @@ import { flagValues } from "./flags.js";
 import { saveStateSource } from "./sync-state.js";
 import { loadState } from "./sync-state-store.js";
 import { resolveBindingScope, type BindingScope } from "./scope/binding-scope.js";
+import { withScopeTransitionLock } from "./scope/scope-lock.js";
 import type { ScopeTransactionDeps } from "./scope/scope-transaction.js";
 
 export interface TrackResult {
@@ -46,8 +47,11 @@ async function restoreTrackScope(
   root: string,
   baseline: WorkspaceConfig,
   baselineState: Awaited<ReturnType<typeof loadRawState>>,
+  lockWaitMs?: number,
 ): Promise<void> {
-  await withWorkspaceSyncMutex(root, async () => {
+  // Restoring the baseline deletes whatever intent is journaled. Only the scope
+  // transition lock's holder is allowed to do that.
+  await withScopeTransitionLock(root, () => withWorkspaceSyncMutex(root, async () => {
     if (baselineState) {
       const current = await loadState(root, syncStreamId(baseline));
       await saveStateSource(root, current, {
@@ -62,7 +66,7 @@ async function restoreTrackScope(
     // clearing its witness would instead create a window that looks read-write.
     await recordBindingScope(root, baseline.remoteWorkspaceId, baseline.scope);
     await saveConfig(root, baseline);
-  });
+  }), lockWaitMs);
   const restored = await resolveBindingScope(root);
   if (!sameScope(restored, baseline.scope)) {
     throw new Error("scope rollback did not restore the binding's previous include state");
@@ -147,7 +151,9 @@ export async function track(
   // track must reset explicitly). A re-track of the SAME workspace keeps both the
   // baseline and the existing device id (re-tracking must not mint a new device).
   const nextStream = syncStreamId({ remoteUrl, remoteWorkspaceId: workspaceId, projectId });
-  const cfg = await withWorkspaceSyncMutex(root, async (syncMutex): Promise<WorkspaceConfig> => {
+  // This write carries the scope cursor forward — including the journaled intent it
+  // deliberately preserves — so it is a scope-cursor writer like any other.
+  const cfg = await withScopeTransitionLock(root, () => withWorkspaceSyncMutex(root, async (syncMutex): Promise<WorkspaceConfig> => {
     const prev = await loadConfig(root).catch(() => undefined);
     const currentState = await loadRawState(root);
     const currentStream = currentState?.stream ?? (prev ? syncStreamId(prev) : undefined);
@@ -183,7 +189,7 @@ export async function track(
     };
     await saveConfig(root, next);
     return next;
-  });
+  }), deps.scopeDeps?.lockWaitMs);
   // Design 211: this machine's durable record of the binding, so `rbox status
   // --all` can find a tracked folder that never started background sync.
   await rememberBinding(root, {
@@ -193,28 +199,21 @@ export async function track(
     ...(cfg.scope ? { scope: cfg.scope } : {}),
   });
   if (includes.length === 0) return { cfg, root };
-  const autostart = await import("./autostart-cmd.js");
   const control = await import("./daemon-control.js");
   const daemonRunning = deps.scopeDeps?.daemonRunning
     ?? ((workspaceRoot: string) => control.readDaemonPidRecord(workspaceRoot).pid !== undefined);
-  const stopDaemon = deps.scopeDeps?.stopDaemon ?? autostart.stopDaemonAndRecordDesired;
-  const startDaemon = deps.scopeDeps?.startDaemon ?? autostart.startDaemonAndRecordDesired;
-  let daemonStopAttempted = false;
+  const scopeDeps = { ...deps.scopeDeps, daemonRunning };
   try {
     const { scopeCmd } = await import("./scope/scope-cmd.js");
-    await scopeCmd(root, "add", includes, { quiet: true }, {
-      ...deps.scopeDeps,
-      daemonRunning,
-      stopDaemon: async (workspaceRoot) => {
-        daemonStopAttempted = true;
-        await stopDaemon(workspaceRoot);
-      },
-      startDaemon,
-    });
+    await scopeCmd(root, "add", includes, { quiet: true }, scopeDeps);
   } catch (error) {
     try {
-      await restoreTrackScope(root, cfg, initialState);
-      if (daemonStopAttempted && !daemonRunning(root)) await startDaemon(root);
+      await restoreTrackScope(root, cfg, initialState, deps.scopeDeps?.lockWaitMs);
+      // The restore deletes the intent, so the daemon's own maintenance window is
+      // the surviving cursor — and it survives a crash here too, because the next
+      // `rbox include` closes any window it finds with no intent behind it.
+      const { resumeScopeIntent } = await import("./scope/scope-transaction.js");
+      await resumeScopeIntent(root, scopeDeps);
     } catch (rollbackError) {
       throw new Error(
         `workspace binding succeeded, but its include setup failed and rollback could not be verified: ${String(rollbackError)}`,

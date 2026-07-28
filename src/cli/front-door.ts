@@ -1,6 +1,6 @@
 import os from "node:os";
 import { rboxBanner } from "./wordmark.js";
-import { startDaemonAndRecordDesired, stopDaemonAndRecordDesired } from "./autostart-cmd.js";
+import { startDaemonForUser, stopDaemonAndRecordDesired } from "./autostart-cmd.js";
 import { fetchAccountSummary } from "./account-cmd.js";
 import { getIdentity, identityText, readAccountProfile } from "./account-profile.js";
 import { DEFAULT_REMOTE } from "./api-base.js";
@@ -133,7 +133,7 @@ export async function runFrontDoor(root: string, deps: FrontDoorDeps = {}): Prom
   if (action === "sync") return (deps.syncNow ?? runSyncCommand)(root);
   if (action === "logs") return (deps.viewLogs ?? ((r) => logsDaemon(r, { follow: false, lines: DEFAULT_LOG_LINES })))(root);
   if (action === "stop") return (deps.pauseSyncing ?? stopDaemonAndRecordDesired)(root);
-  if (action === "start") return (deps.startSyncing ?? startDaemonAndRecordDesired)(root);
+  if (action === "start") return (deps.startSyncing ?? startDaemonForUser)(root);
   if (action === "setup") return (deps.setUpWorkspace ?? (async (cwd) => {
     const { runSetup } = await import("./setup-cmd.js");
     await runSetup({ cwd, defaultRemote: DEFAULT_REMOTE, flags: {}, preselectedWorkspaceKind: "new" });

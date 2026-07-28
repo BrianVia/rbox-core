@@ -4,10 +4,12 @@ import os from "node:os";
 import path from "node:path";
 
 import { readPersistedEntries } from "./binding-registry.js";
-import { loadConfig, loadState, saveStateUnsafeLegacyOrTest, syncStreamId } from "./config.js";
+import { loadConfig, loadState, saveConfig, saveStateUnsafeLegacyOrTest, syncStreamId } from "./config.js";
 import { flagValues, parseFlags } from "./flags.js";
 import { resolveBindingScope } from "./scope/binding-scope.js";
 import { scopeCmd } from "./scope/scope-cmd.js";
+import { withScopeTransitionLock } from "./scope/scope-lock.js";
+import { resumeScopeIntent } from "./scope/scope-transaction.js";
 import { track } from "./track-cmd.js";
 
 let root: string;
@@ -145,8 +147,9 @@ test("a failed include transition restarts background sync after restoring the p
     daemonRunning: () => false,
   });
   let running = true;
-  let stops = 0;
-  let starts = 0;
+  let parks = 0;
+  let resumes = 0;
+  let token: string | undefined;
 
   await expect(track(
     root,
@@ -155,22 +158,91 @@ test("a failed include transition restarts background sync after restoring the p
     {
       scopeDeps: {
         daemonRunning: () => running,
-        stopDaemon: async () => {
-          stops++;
+        parkedMaintenanceId: async () => token,
+        parkDaemon: async (_root, id) => {
+          parks++;
+          token = id;
           running = false;
         },
-        startDaemon: async () => {
-          starts++;
+        resumeDaemon: async (_root, id) => {
+          resumes++;
+          if (id !== token) return false;
           running = true;
+          // Consumed only after the restart, as the durable record does.
+          token = undefined;
+          return true;
         },
         recordWitness: async () => { throw new Error("injected witness failure"); },
       },
     },
   )).rejects.toThrow("the workspace remains bound with its previous included folders");
 
-  expect({ running, stops, starts }).toEqual({ running: true, stops: 1, starts: 1 });
+  expect({ running, parks, resumes }).toEqual({ running: true, parks: 1, resumes: 1 });
   expect(await resolveBindingScope(root)).toMatchObject({
     kind: "scoped",
     prefixes: ["Personal/repo-A"],
   });
+});
+
+test("a crash between the include rollback and the restart still owes the daemon a return", async () => {
+  await track(root, { workspace: "ws_crashroll" }, "https://api.test");
+  await scopeCmd(root, "add", ["Personal/repo-A"], { quiet: true }, { daemonRunning: () => false });
+
+  let running = true;
+  let token: string | undefined;
+  const daemon = {
+    daemonRunning: () => running,
+    parkedMaintenanceId: async () => token,
+    parkDaemon: async (_root: string, id: string) => {
+      token = id;
+      running = false;
+    },
+    resumeDaemon: async (_root: string, id: string) => {
+      if (id !== token) return false;
+      running = true;
+      token = undefined;
+      return true;
+    },
+  };
+
+  await expect(track(
+    root,
+    { workspace: "ws_crashroll", include: "Work/repo-B" },
+    "https://api.test",
+    {
+      scopeDeps: {
+        ...daemon,
+        recordWitness: async () => { throw new Error("injected witness failure"); },
+        resumeDaemon: async () => { throw new Error("power loss"); },
+      },
+    },
+  )).rejects.toThrow("rollback could not be verified");
+
+  // The rollback restored the scope but died before the restart. The daemon's own
+  // maintenance window is the surviving cursor.
+  expect(running).toBe(false);
+  expect(token).toBeDefined();
+  expect(await resolveBindingScope(root)).toMatchObject({ kind: "scoped", prefixes: ["Personal/repo-A"] });
+
+  await resumeScopeIntent(root, daemon);
+  expect(running).toBe(true);
+});
+
+test("a bind racing a live scope edit cannot overwrite its cursor", async () => {
+  await track(root, { workspace: "ws_bindrace" }, "https://api.test");
+  await scopeCmd(root, "add", ["Personal/repo-A"], { quiet: true }, { daemonRunning: () => false });
+  // A scope edit is mid-transition, holding the lock with its cursor journaled.
+  const cursor = { generation: 3, accepted: ["Personal/repo-A"], target: ["Work/repo-B"], materialize: ["Work/repo-B"], prune: ["Personal/repo-A"], at: "live", phase: "planned" as const };
+  await saveConfig(root, { ...(await loadConfig(root)), scopeIntent: cursor });
+
+  await withScopeTransitionLock(root, async () => {
+    await expect(track(
+      root,
+      { workspace: "ws_bindrace", include: "Work/repo-C" },
+      "https://api.test",
+      { scopeDeps: { daemonRunning: () => false, lockWaitMs: 1 } },
+    )).rejects.toThrow("in progress");
+  });
+
+  expect((await loadConfig(root)).scopeIntent).toMatchObject({ at: "live", target: ["Work/repo-B"] });
 });

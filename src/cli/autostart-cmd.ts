@@ -9,6 +9,7 @@ import { currentWorkspaceId, daemonRuntimeDir, readDaemonModeWitness, readDaemon
 import { credentialFailureMessage, credentialsForStrictFlow, loadCredentials } from "./credentials.js";
 import { homeDir } from "./rbox-paths.js";
 import { assertBindingUsable, resolveBindingScope } from "./scope/binding-scope.js";
+import { withScopeTransitionLock } from "./scope/scope-lock.js";
 import { fail, style } from "./style.js";
 import type { DaemonMode } from "./daemon/ambient-status.js";
 
@@ -21,6 +22,14 @@ const RBOX_BIN_REL = `${RBOX_DIR}/bin/rbox`;
 
 export type DesiredDaemonStateValue = "running" | "stopped";
 
+/** "stopped for maintenance, resume to `resume`" — the durable form of a stop that
+ *  owes a restart. Only the holder of `id` may close the window. */
+export interface DaemonMaintenance {
+  id: string;
+  resume: DesiredDaemonStateValue;
+  at: string;
+}
+
 export interface DesiredDaemonState {
   rootPath: string;
   state: DesiredDaemonStateValue;
@@ -29,6 +38,7 @@ export interface DesiredDaemonState {
   at: string;
   pullOnly?: boolean;
   pendingModeIntent?: DaemonMode;
+  maintenance?: DaemonMaintenance;
 }
 
 export interface DesiredStateRow {
@@ -56,6 +66,8 @@ interface DesiredDeps extends CommonDeps {
   mode?: DaemonMode;
   /** Compatibility for setup/older callers; true is an explicit pull-only intent. */
   pullOnly?: boolean;
+  /** Bounded wait for the scope-transition lock before reporting an edit in progress. */
+  lockWaitMs?: number;
 }
 
 interface StartStopDeps extends DesiredDeps {
@@ -148,6 +160,14 @@ async function exists(p: string): Promise<boolean> {
   }
 }
 
+function parseMaintenance(v: unknown): DaemonMaintenance | undefined {
+  if (typeof v !== "object" || v === null) return undefined;
+  const m = v as Partial<DaemonMaintenance>;
+  if (typeof m.id !== "string" || !m.id) return undefined;
+  if (m.resume !== "running" && m.resume !== "stopped") return undefined;
+  return { id: m.id, resume: m.resume, at: typeof m.at === "string" ? m.at : "" };
+}
+
 function parseDesired(raw: string): DesiredDaemonState | undefined {
   try {
     const v = JSON.parse(raw) as Partial<DesiredDaemonState>;
@@ -158,6 +178,7 @@ function parseDesired(raw: string): DesiredDaemonState | undefined {
     if (typeof v.at !== "string" || !v.at) return undefined;
     if (v.pullOnly !== undefined && typeof v.pullOnly !== "boolean") return undefined;
     if (v.pendingModeIntent !== undefined && v.pendingModeIntent !== "pull-only" && v.pendingModeIntent !== "read-write") return undefined;
+    const maintenance = parseMaintenance(v.maintenance);
     return {
       rootPath: v.rootPath,
       state: v.state,
@@ -166,6 +187,7 @@ function parseDesired(raw: string): DesiredDaemonState | undefined {
       at: v.at,
       ...(v.pullOnly === true ? { pullOnly: true } : {}),
       ...(v.pendingModeIntent === undefined ? {} : { pendingModeIntent: v.pendingModeIntent }),
+      ...(maintenance === undefined ? {} : { maintenance }),
     };
   } catch {
     return undefined;
@@ -260,19 +282,35 @@ async function desiredRecordLock(root: string): Promise<OwnedLock> {
   }
 }
 
+interface DesiredRecordIo {
+  read: () => Promise<DesiredDaemonState | undefined>;
+  write: (record: DesiredDaemonState) => Promise<void>;
+}
+
+/** One critical section over the desired record. Park needs two writes with the
+ *  daemon stopped between them and NO window in which another process can act, so
+ *  the lock is scoped to the caller's whole sequence rather than to one write. */
+async function withDesiredRecordLock<T>(root: string, body: (io: DesiredRecordIo) => Promise<T>): Promise<T> {
+  const lock = await desiredRecordLock(root);
+  try {
+    return await body({
+      read: () => readDesiredRecord(desiredStatePath(root)),
+      write: writeDesiredRecord,
+    });
+  } finally {
+    await lock.release();
+  }
+}
+
 async function mutateDesiredRecord(
   root: string,
   mutation: (current: DesiredDaemonState | undefined) => Promise<DesiredDaemonState | undefined> | DesiredDaemonState | undefined,
 ): Promise<DesiredDaemonState | undefined> {
-  const lock = await desiredRecordLock(root);
-  try {
-    const current = await readDesiredRecord(desiredStatePath(root));
-    const next = await mutation(current);
-    if (next !== undefined) await writeDesiredRecord(next);
+  return withDesiredRecordLock(root, async (io) => {
+    const next = await mutation(await io.read());
+    if (next !== undefined) await io.write(next);
     return next;
-  } finally {
-    await lock.release();
-  }
+  });
 }
 
 function sameDesiredGeneration(current: DesiredDaemonState | undefined, expected: DesiredDaemonState): boolean {
@@ -323,6 +361,11 @@ async function startDaemonAndRecordDesiredImpl(root: string, deps: StartStopDeps
         ...(deps.trustedDesiredIdentity.pendingModeIntent === undefined
           ? {}
           : { pendingModeIntent: deps.trustedDesiredIdentity.pendingModeIntent }),
+        // Carried, not dropped: the obligation outlives the start attempt and is
+        // consumed only once the daemon is confirmed up.
+        ...(deps.trustedDesiredIdentity.maintenance === undefined
+          ? {}
+          : { maintenance: deps.trustedDesiredIdentity.maintenance }),
       };
   const fresh = (state: DesiredDaemonStateValue): DesiredDaemonState => ({
     ...identity,
@@ -453,8 +496,27 @@ async function startDaemonAndRecordDesiredImpl(root: string, deps: StartStopDeps
   return promoted !== undefined;
 }
 
+/** Start and record, composable: callers that already hold the scope-transition
+ *  lock (the resume path) or that cannot be racing an edit use this. */
 export async function startDaemonAndRecordDesired(root: string, deps: StartStopDeps = {}): Promise<void> {
   await startDaemonAndRecordDesiredImpl(root, deps);
+}
+
+/**
+ * `rbox start` and every other command-level start. It takes the scope-transition
+ * lock because a scope edit parks the daemon precisely so nothing runs while
+ * folders are being trashed and committed: a start landing mid-edit would boot the
+ * daemon into a half-applied scope AND drop the maintenance token on its way past,
+ * and the resume fence can only decline to restart afterwards — it cannot put the
+ * daemon back to sleep. Waiting for the edit, then reporting it, is the only safe
+ * answer.
+ *
+ * With no edit in flight the user still wins outright: the record is rebuilt from a
+ * fresh identity, so an orphaned window left by a crashed edit is cancelled by the
+ * very act of starting.
+ */
+export async function startDaemonForUser(root: string, deps: StartStopDeps = {}): Promise<void> {
+  await withScopeTransitionLock(path.resolve(root), () => startDaemonAndRecordDesiredImpl(root, deps), deps.lockWaitMs);
 }
 
 export async function resumeDesiredDaemon(
@@ -468,25 +530,115 @@ export async function resumeDesiredDaemon(
   });
 }
 
+/** Stop the daemon and return the record that records it. Caller supplies the
+ *  critical section; this never takes the lock itself. */
+async function stopUnderDesiredLock(
+  abs: string,
+  deps: StartStopDeps,
+  identity: DesiredDaemonState,
+  current: DesiredDaemonState | undefined,
+  maintenance?: DaemonMaintenance,
+): Promise<DesiredDaemonState> {
+  let accepted = desiredMode(current);
+  let pending = current?.pendingModeIntent;
+  if (pending !== undefined) {
+    const witness = readDaemonModeWitness(abs);
+    if (witness.kind === "known" && witness.mode === pending) {
+      accepted = pending;
+      pending = undefined;
+    }
+  }
+  await (deps.stopDaemon ?? stopDaemon)(abs);
+  const stopped = desiredWithModes({
+    ...identity,
+    state: "stopped",
+    at: (deps.now ?? (() => new Date()))().toISOString(),
+  }, accepted, pending);
+  return maintenance === undefined ? stopped : { ...stopped, maintenance };
+}
+
+/** A user stop is the last word: rebuilding the record from a fresh identity drops
+ *  any maintenance token, so an in-flight scope edit will not resurrect the daemon
+ *  the user just asked to switch off. */
 export async function stopDaemonAndRecordDesired(root: string, deps: StartStopDeps = {}): Promise<void> {
   const abs = path.resolve(root);
   const identity = await desiredContext(abs, "stopped", deps);
-  await mutateDesiredRecord(abs, async (current) => {
-    let accepted = desiredMode(current);
-    let pending = current?.pendingModeIntent;
-    if (pending !== undefined) {
-      const witness = readDaemonModeWitness(abs);
-      if (witness.kind === "known" && witness.mode === pending) {
-        accepted = pending;
-        pending = undefined;
-      }
+  await mutateDesiredRecord(abs, (current) => stopUnderDesiredLock(abs, deps, identity, current));
+}
+
+export class DaemonMaintenanceConflictError extends Error {
+  constructor() {
+    super("another rbox command is already holding background sync for maintenance — re-run this in a moment");
+    this.name = "DaemonMaintenanceConflictError";
+  }
+}
+
+/** The open maintenance window on this workspace, if any. */
+export async function readDaemonMaintenance(root: string): Promise<DaemonMaintenance | undefined> {
+  return (await readDesiredRecord(desiredStatePath(path.resolve(root))))?.maintenance;
+}
+
+/**
+ * Stop the daemon under a durable obligation to bring it back: the record reads
+ * "stopped for maintenance, resume to X", never a bare "stopped". Claim and stop
+ * share ONE critical section — the token is on disk before the process is touched,
+ * and no `rbox stop` can slip between the two writes and have its cancellation
+ * overwritten by the second one.
+ */
+export async function parkDaemonForMaintenance(root: string, id: string, deps: StartStopDeps = {}): Promise<void> {
+  const abs = path.resolve(root);
+  const identity = await desiredContext(abs, "running", deps);
+  const at = (deps.now ?? (() => new Date()))().toISOString();
+  await withDesiredRecordLock(abs, async (io) => {
+    const current = await io.read();
+    const held = current?.maintenance;
+    // Someone else's live window. Scope transitions are serialized by their own
+    // lock, so this can only mean that lock did not hold — never take it over.
+    if (held !== undefined && held.id !== id) throw new DaemonMaintenanceConflictError();
+    const maintenance: DaemonMaintenance = { id, resume: held?.resume ?? current?.state ?? "running", at };
+    await io.write({ ...(current ?? identity), maintenance });
+    await io.write(await stopUnderDesiredLock(abs, deps, identity, current, maintenance));
+  });
+}
+
+/**
+ * Close the maintenance window opened by exactly `id`. Any other token means the
+ * obligation is not ours: a no-op.
+ *
+ * The obligation is consumed LAST. The commitment to resume is written first, with
+ * the token retained, so a start that fails or a crash before it completes still
+ * leaves a window for the next attempt to find — and because the start is fenced on
+ * the exact record that commitment wrote, a concurrent `rbox stop` either lands
+ * before it (the window is already gone) or after it (its record wins and the start
+ * stands down), never in between. Re-entering with the daemon already up simply
+ * consumes the window.
+ */
+export async function resumeDaemonAfterMaintenance(root: string, id: string, deps: StartStopDeps = {}): Promise<boolean> {
+  const abs = path.resolve(root);
+  const committed = await mutateDesiredRecord(abs, (current) => {
+    if (current?.maintenance?.id !== id) return undefined;
+    if (current.maintenance.resume !== "running") {
+      const { maintenance: _closed, ...rest } = current;
+      return rest;
     }
-    await (deps.stopDaemon ?? stopDaemon)(abs);
-    return desiredWithModes({
-      ...identity,
-      state: "stopped",
-      at: (deps.now ?? (() => new Date()))().toISOString(),
-    }, accepted, pending);
+    return { ...current, state: "running" as const, at: (deps.now ?? (() => new Date()))().toISOString() };
+  });
+  if (committed?.state !== "running" || committed.maintenance?.id !== id) return false;
+  const started = await startDaemonAndRecordDesiredImpl(abs, {
+    ...deps,
+    resumeExpected: committed,
+    trustedDesiredIdentity: committed,
+  });
+  if (!started) return false;
+  await clearMaintenance(abs, id);
+  return true;
+}
+
+async function clearMaintenance(abs: string, id: string): Promise<void> {
+  await mutateDesiredRecord(abs, (current) => {
+    if (current?.maintenance?.id !== id) return undefined;
+    const { maintenance: _consumed, ...rest } = current;
+    return rest;
   });
 }
 

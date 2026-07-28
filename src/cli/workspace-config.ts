@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { writeFileAtomic } from "../engine/fsutil.js";
+import type { ScopeIntent } from "./scope/scope-intent.js";
 
 function isENOENT(e: unknown): boolean {
   return (e as NodeJS.ErrnoException)?.code === "ENOENT";
@@ -65,14 +66,7 @@ export interface WorkspaceConfig {
   scopeGeneration?: number;
   /** Durable in-flight scope edit. Present ⇒ a `rbox include add|remove` was
    *  interrupted; the next command resumes it before doing anything else. */
-  scopeIntent?: {
-    generation: number;
-    accepted: string[];
-    target: string[];
-    materialize: string[];
-    prune: string[];
-    at: string;
-  };
+  scopeIntent?: ScopeIntent;
   /** Local trash-tier retention (design 50 §2). Both fields optional; normalized
    *  by {@link trashConfig} on read (never trusted raw). `days: 0` = classic
    *  immediate delete (no trash, for the space-constrained). */

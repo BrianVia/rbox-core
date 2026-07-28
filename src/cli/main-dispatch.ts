@@ -6,7 +6,7 @@ import { pull, push } from "./sync.js";
 import { attachGitSyncProgress, postSyncNudge, runSyncCommand, summarize, summarizeCaseCollisions } from "./sync-cmd.js";
 import { beginReport, logDebugSummary } from "./metrics.js";
 import { DEFAULT_LOG_LINES, logsDaemon } from "./daemon-control.js";
-import { autostartCmd, bootResume, BOOT_RESUME_MARKER, startDaemonAndRecordDesired, stopDaemonAndRecordDesired } from "./autostart-cmd.js";
+import { autostartCmd, bootResume, BOOT_RESUME_MARKER, startDaemonForUser, stopDaemonAndRecordDesired } from "./autostart-cmd.js";
 import { addIgnorePattern, listIgnoreRules, purgeIgnored, setRespectGitignore } from "./ignore-cmd.js";
 import { approveDevice, keyBackup, keyGenesis, keySave, keyStatus, listDevices, login, logout, recoverCmd, revokeDevice } from "./auth-cmd.js";
 import { buildAuthedRemote } from "./e2ee-client.js";
@@ -514,7 +514,7 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
           : undefined;
       const root = await findRoot(positional[0] ? path.resolve(positional[0]) : process.cwd());
       if (!root) throw startWorkspaceRequiredError();
-      await startDaemonAndRecordDesired(root, { mode });
+      await startDaemonForUser(root, { mode });
       break;
     }
     case "stop": {

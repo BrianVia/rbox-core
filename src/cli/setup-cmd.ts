@@ -32,7 +32,7 @@ import { EXISTING_ACCOUNT_ENROLLMENT_MESSAGE, login, offerRecoveryKitAfterRecove
 import { enrollViaPrevalidatedRecovery, PairingTokenShapeError, parsePairingToken } from "./e2ee-client.js";
 import { genesisClassifierConsultationNeeded, pendingGenesisState } from "./genesis-enrollment.js";
 import { phraseToRk, rkToPhrase } from "../engine/e2ee/index.js";
-import { enableAutostart, startDaemonAndRecordDesired } from "./autostart-cmd.js";
+import { enableAutostart, startDaemonForUser } from "./autostart-cmd.js";
 import { credentialsForStrictFlow, loadCredentials, type CredentialLoadResult } from "./credentials.js";
 import { loadConfigIfPresent, loadRawState, syncStreamId } from "./config.js";
 import { hasDevice } from "./e2ee-keystore.js";
@@ -262,7 +262,7 @@ export async function runSetup(opts: {
   });
   const actions = startSyncActions(startChoice);
   if (actions.startDaemon) {
-    await startDaemonAndRecordDesired(outcome.root, { mode: "read-write" });
+    await startDaemonForUser(outcome.root, { mode: "read-write" });
     process.stderr.write(`${e.green("✓")} Background sync started. Stop anytime with \`rbox stop\`.\n`);
     if (actions.enableAutostart) {
       await enableAutostart();
