@@ -462,8 +462,9 @@ async function settleRepublish(
   deps: SyncDeps,
   gitRepos: Manifest["gitRepos"],
 ): Promise<void> {
+  if (!deps.syncMutex) return;
   try {
-    const settled = await settleRepublishRequests(root, syncStreamId(cfg), gitRepos);
+    const settled = await settleRepublishRequests(root, syncStreamId(cfg), gitRepos, deps.syncMutex);
     for (const relPath of settled) {
       (deps.onGitLog ?? ((line: string) => console.error(line)))(`git-sync republish restarted ${relPath}`);
     }

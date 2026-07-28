@@ -3,6 +3,7 @@ import path from "node:path";
 import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory, writeFileAtomic } from "../../engine/fsutil.js";
 import type { GitSection } from "../../engine/types.js";
 import { boundedJsonRead } from "../reset-io.js";
+import { assertHealthyOwnedSyncMutex, assertSyncMutex, type WorkspaceSyncMutex } from "../sync-mutex.js";
 
 /** #526: a republish request asks the next publish of ONE repo to emit a
  *  chain-free full bundle, abandoning a pack chain fresh receivers cannot
@@ -37,6 +38,20 @@ export type RepublishStoreRead =
   | { status: "absent" }
   | { status: "corrupt" }
   | { status: "valid"; record: RepublishRequestsV1 };
+
+export class RepublishMutexOwnershipError extends Error {
+  constructor(message = "republish mutation requires a held workspace sync mutex") {
+    super(message);
+    this.name = "RepublishMutexOwnershipError";
+  }
+}
+
+export class RepublishStoreChangedError extends Error {
+  constructor() {
+    super("the republish request file changed while the workspace sync mutex was held");
+    this.name = "RepublishStoreChangedError";
+  }
+}
 
 export const REPUBLISH_REQUESTS_MAX = 256;
 export const REPUBLISH_REQUESTS_MAX_BYTES = 64 * 1024;
@@ -88,7 +103,7 @@ function validate(value: unknown): RepublishRequestsV1 | undefined {
  *  under another `stream` reads as `absent`: it belongs to a workspace this
  *  state no longer is, so it carries no authority to force or settle anything
  *  here and is replaced rather than merged. */
-export async function readRepublishStore(root: string, stream: string): Promise<RepublishStoreRead> {
+async function readStoreFile(root: string): Promise<RepublishStoreRead> {
   let raw: unknown;
   try {
     raw = await boundedJsonRead(republishRequestsPath(root), REPUBLISH_REQUESTS_MAX_BYTES);
@@ -98,6 +113,13 @@ export async function readRepublishStore(root: string, stream: string): Promise<
   if (raw === undefined) return { status: "absent" };
   const record = validate(raw);
   if (!record) return { status: "corrupt" };
+  return { status: "valid", record };
+}
+
+export async function readRepublishStore(root: string, stream: string): Promise<RepublishStoreRead> {
+  const read = await readStoreFile(root);
+  if (read.status !== "valid") return read;
+  const { record } = read;
   if (record.stream !== stream) return { status: "absent" };
   return { status: "valid", record };
 }
@@ -114,7 +136,37 @@ export async function republishPlanInput(root: string, stream: string): Promise<
   return { repos: new Set(read.record.requests.map((request) => request.relPath)) };
 }
 
-async function writeStore(root: string, stream: string, requests: readonly RepublishRequest[]): Promise<void> {
+const sameRequest = (left: RepublishRequest, right: RepublishRequest): boolean =>
+  left.relPath === right.relPath
+  && left.requestedAt === right.requestedAt
+  && left.baseBundleSha === right.baseBundleSha
+  && left.baseGeneratedAt === right.baseGeneratedAt;
+
+function sameRead(left: RepublishStoreRead, right: RepublishStoreRead): boolean {
+  if (left.status !== right.status) return false;
+  if (left.status !== "valid" || right.status !== "valid") return true;
+  return left.record.stream === right.record.stream
+    && left.record.requests.length === right.record.requests.length
+    && left.record.requests.every((request, index) => sameRequest(request, right.record.requests[index]!));
+}
+
+async function assertRepublishMutex(mutex: WorkspaceSyncMutex | undefined, root: string): Promise<void> {
+  if (!mutex) throw new RepublishMutexOwnershipError();
+  try {
+    assertSyncMutex(mutex, root);
+    await assertHealthyOwnedSyncMutex(mutex, root);
+  } catch (error) {
+    throw new RepublishMutexOwnershipError(error instanceof Error ? error.message : String(error));
+  }
+}
+
+async function writeStore(
+  root: string,
+  stream: string,
+  requests: readonly RepublishRequest[],
+  expected: RepublishStoreRead,
+): Promise<void> {
+  if (!sameRead(await readStoreFile(root), expected)) throw new RepublishStoreChangedError();
   const file = republishRequestsPath(root);
   const parent = path.dirname(file);
   if (requests.length === 0) {
@@ -139,6 +191,10 @@ export interface RecordRepublishResult {
   pending: number;
 }
 
+export interface RepublishMutationTestHooks {
+  afterRead?: () => Promise<void>;
+}
+
 /** Install (or observe) a pending request for one repository. Re-requesting a
  *  repository whose request has not settled keeps the ORIGINAL request: the
  *  intent is already recorded, and settlement is proven by a NEW bundle rather
@@ -149,16 +205,20 @@ export async function recordRepublishRequest(
   relPath: string,
   base: RepublishBase,
   now: Date,
+  mutex: WorkspaceSyncMutex,
+  hooks: RepublishMutationTestHooks = {},
 ): Promise<RecordRepublishResult> {
+  await assertRepublishMutex(mutex, root);
   if (!validRelPath(relPath)) throw new Error("invalid repository path");
   if (!HEX64.test(base.bundleSha) || !validTimestamp(base.generatedAt)) {
     throw new Error("this repository has no published Git bundle to supersede");
   }
-  const read = await readRepublishStore(root, stream);
+  const read = await readStoreFile(root);
+  await hooks.afterRead?.();
   if (read.status === "corrupt") {
     throw new Error(`the republish request file is unreadable — inspect and remove ${republishRequestsPath(root)}, then run this again`);
   }
-  const current = read.status === "valid" ? read.record.requests : [];
+  const current = read.status === "valid" && read.record.stream === stream ? read.record.requests : [];
   const existing = current.find((request) => request.relPath === relPath);
   if (existing) return { status: "already-pending", requestedAt: existing.requestedAt, pending: current.length };
   if (current.length >= REPUBLISH_REQUESTS_MAX) {
@@ -166,14 +226,7 @@ export async function recordRepublishRequest(
   }
   const requestedAt = now.toISOString();
   const next = [...current, { relPath, requestedAt, baseBundleSha: base.bundleSha, baseGeneratedAt: base.generatedAt }];
-  await writeStore(root, stream, next);
-  // The store is advisory and unlocked: a concurrent settle can land between
-  // the read and the rename. Confirm the request survived rather than reporting
-  // a success the next push will not act on.
-  const confirmed = await readRepublishStore(root, stream);
-  if (confirmed.status !== "valid" || !confirmed.record.requests.some((request) => request.relPath === relPath)) {
-    throw new Error("a concurrent sync replaced the request file — run this command again");
-  }
+  await writeStore(root, stream, next, read);
   return { status: "recorded", requestedAt, pending: next.length };
 }
 
@@ -193,20 +246,23 @@ export async function settleRepublishRequests(
   root: string,
   stream: string,
   gitRepos: Record<string, GitSection> | undefined,
+  mutex: WorkspaceSyncMutex,
+  hooks: RepublishMutationTestHooks = {},
 ): Promise<string[]> {
-  const read = await readRepublishStore(root, stream);
-  if (read.status !== "valid") return [];
-  const settled = new Map<string, string>();
+  await assertRepublishMutex(mutex, root);
+  const read = await readStoreFile(root);
+  await hooks.afterRead?.();
+  if (read.status !== "valid" || read.record.stream !== stream) return [];
+  const settled = new Map<string, RepublishRequest>();
   for (const request of read.record.requests) {
-    if (republishSatisfiedBy(gitRepos?.[request.relPath], request)) settled.set(request.relPath, request.requestedAt);
+    if (republishSatisfiedBy(gitRepos?.[request.relPath], request)) settled.set(request.relPath, request);
   }
   if (settled.size === 0) return [];
-  // Re-read before writing and drop ONLY the exact (relPath, requestedAt) pairs
-  // proven satisfied, so a request installed for another repository while this
-  // push was committing is not written away.
-  const fresh = await readRepublishStore(root, stream);
-  const remaining = (fresh.status === "valid" ? fresh.record.requests : [])
-    .filter((request) => settled.get(request.relPath) !== request.requestedAt);
-  await writeStore(root, stream, remaining);
+  const remaining = read.record.requests
+    .filter((request) => {
+      const satisfied = settled.get(request.relPath);
+      return !satisfied || !sameRequest(request, satisfied);
+    });
+  await writeStore(root, stream, remaining, read);
   return [...settled.keys()].sort();
 }

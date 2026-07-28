@@ -636,7 +636,8 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
         }
         const root = await resolveRoot(target);
         const { gitRepublishCmd } = await import("./git-cmd.js");
-        const code = await gitRepublishCmd(root, target, { json: jsonMode }, { now: deps.now });
+        const code = await withWorkspaceSyncMutex(root, (syncMutex) =>
+          gitRepublishCmd(root, target, syncMutex, { json: jsonMode }, { now: deps.now }));
         if (code !== 0) process.exitCode = code;
         break;
       }
