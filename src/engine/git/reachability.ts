@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { GitSection } from "../types.js";
-import { enumerateRefReflogOids, HEX40, git, gitRaw, headBranchOf, repoCtx } from "./shared.js";
+import { enumerateRefReflogOids, HEX40, git, gitRaw, headBranchOf, repoCtx, type RepoCtx } from "./shared.js";
 
 export interface ImportedScratchNamespace {
   /** Imported scratch names are deliberately not ownership roots. */
@@ -36,9 +36,15 @@ export interface NoDropProofOptions {
   /** Injectable only so the 5,000-commit production bound has a cheap test. */
   contentEquivalenceCommitCap?: number;
   contentEquivalenceCache?: ContentEquivalenceCache;
+  ownershipContext?: OwnershipProofContext;
 }
 
 export const CONTENT_EQUIVALENCE_COMMIT_CAP = 5_000;
+
+export interface OwnershipProofContext {
+  /** Three-valued so an unreadable shallow marker remains fail-closed. */
+  shallow: boolean | undefined;
+}
 
 // r1 F5: graph classification must never turn a promisor fetch into an
 // apparently complete local proof.
@@ -81,6 +87,11 @@ function hasShallowFile(commonDir: string): Promise<boolean | undefined> {
   return fs.access(path.join(commonDir, "shallow")).then(() => true, (error: NodeJS.ErrnoException) => error.code === "ENOENT" ? false : undefined);
 }
 
+/** Reuse a caller's evidence-grade repository context without spawning Git. */
+export async function ownershipProofContext(ctx: Pick<RepoCtx, "commonDir">): Promise<OwnershipProofContext> {
+  return { shallow: await hasShallowFile(ctx.commonDir) };
+}
+
 async function shallow(repoDir: string): Promise<boolean | undefined> {
   const ctx = await repoCtx(repoDir);
   if (!ctx) return undefined;
@@ -116,7 +127,7 @@ async function peelAndVerify(repoDir: string, roots: readonly string[]): Promise
   }
 }
 
-async function tipOwnedByIncomingDetailed(repoDir: string, tip: string, roots: readonly string[]): Promise<PartitionedOwnership> {
+async function tipOwnedByIncomingLegacyDetailed(repoDir: string, tip: string, roots: readonly string[]): Promise<PartitionedOwnership> {
   const isShallow = await shallow(repoDir);
   if (isShallow !== false) return { tip, proof: { status: "indeterminate", marker: isShallow ? "shallow-store" : "walk-error" } };
   const graph = await peelAndVerify(repoDir, [tip, ...roots]);
@@ -134,19 +145,44 @@ async function tipOwnedByIncomingDetailed(repoDir: string, tip: string, roots: r
   return { tip, commit: tipCommit, proof: { status: "unowned" } };
 }
 
-export async function tipOwnedByIncoming(repoDir: string, tip: string, roots: readonly string[]): Promise<OwnershipProof> {
-  return (await tipOwnedByIncomingDetailed(repoDir, tip, roots)).proof;
+export async function tipOwnedByIncoming(
+  repoDir: string,
+  tip: string,
+  roots: readonly string[],
+  context?: OwnershipProofContext,
+): Promise<OwnershipProof> {
+  return (await tipOwnedByIncomingDetailed(repoDir, tip, roots, context)).proof;
 }
 
-async function legacyPartition(repoDir: string, tips: readonly string[], roots: readonly string[]): Promise<PartitionedOwnership[]> {
+async function tipOwnedByIncomingDetailed(
+  repoDir: string,
+  tip: string,
+  roots: readonly string[],
+  context?: OwnershipProofContext,
+): Promise<PartitionedOwnership> {
+  const [result] = await partitionOwnedByIncoming(repoDir, [tip], roots, context);
+  return result!;
+}
+
+/** Test-only semantic oracle. Production uses it solely for exact batch fallbacks. */
+export async function legacyPartitionOwnedByIncomingForTest(
+  repoDir: string,
+  tips: readonly string[],
+  roots: readonly string[],
+): Promise<PartitionedOwnership[]> {
   const result: PartitionedOwnership[] = [];
-  for (const tip of tips) result.push(await tipOwnedByIncomingDetailed(repoDir, tip, roots));
+  for (const tip of tips) result.push(await tipOwnedByIncomingLegacyDetailed(repoDir, tip, roots));
   return result;
 }
 
-/** Every per-tip status and marker MUST equal tipOwnedByIncoming's answer: legacyPartition is the semantic oracle, and every fallback preserves it. */
-export async function partitionOwnedByIncoming(repoDir: string, tips: readonly string[], roots: readonly string[]): Promise<PartitionedOwnership[]> {
-  const isShallow = await batchedShallow(repoDir);
+/** Every full entry MUST equal the legacy oracle: tip, optional commit, status, and marker. */
+export async function partitionOwnedByIncoming(
+  repoDir: string,
+  tips: readonly string[],
+  roots: readonly string[],
+  context?: OwnershipProofContext,
+): Promise<PartitionedOwnership[]> {
+  const isShallow = context ? context.shallow : await batchedShallow(repoDir);
   if (isShallow !== false) {
     const marker = isShallow ? "shallow-store" : "walk-error";
     return tips.map((tip) => ({ tip, proof: { status: "indeterminate", marker } }));
@@ -161,22 +197,21 @@ export async function partitionOwnedByIncoming(repoDir: string, tips: readonly s
     });
     const lines = raw.split("\n");
     if (lines.at(-1) === "") lines.pop();
-    if (lines.length !== inputs.length) return legacyPartition(repoDir, tips, roots);
+    if (lines.length !== inputs.length) return legacyPartitionOwnedByIncomingForTest(repoDir, tips, roots);
     // Duplicate raw OIDs and distinct tags peeling to one commit make any OID-keyed map wrong; position is the only correct key.
     records = lines.map((line) => {
       const match = /^([0-9a-f]{40}) commit$/.exec(line);
       return match ? { commit: match[1]! } : {};
     });
   } catch {
-    return legacyPartition(repoDir, tips, roots);
+    return legacyPartitionOwnedByIncomingForTest(repoDir, tips, roots);
   }
 
   const tipRecords = records.slice(0, tips.length);
   const rootRecords = records.slice(tips.length);
   if (rootRecords.some((record) => !record?.commit)) {
-    return tips.map((tip, index) => ({
+    return tips.map((tip) => ({
       tip,
-      ...(tipRecords[index]?.commit ? { commit: tipRecords[index]!.commit } : {}),
       proof: { status: "indeterminate", marker: "missing-object" },
     }));
   }
@@ -189,7 +224,7 @@ export async function partitionOwnedByIncoming(repoDir: string, tips: readonly s
     });
   } catch {
     // Recover exact per-tip markers and preserve independence after any corrupt walk.
-    return legacyPartition(repoDir, tips, roots);
+    return legacyPartitionOwnedByIncomingForTest(repoDir, tips, roots);
   }
 
   const candidateCommits = new Set(tipRecords.flatMap((record) => record?.commit ? [record.commit] : []));
@@ -208,7 +243,7 @@ export async function partitionOwnedByIncoming(repoDir: string, tips: readonly s
     });
     if (pending && candidateCommits.has(pending)) ownedCommits.add(pending);
   } catch {
-    return legacyPartition(repoDir, tips, roots);
+    return legacyPartitionOwnedByIncomingForTest(repoDir, tips, roots);
   }
 
   return tips.map((tip, index) => {
@@ -226,7 +261,7 @@ export async function noDropProof(
   protectedTips: readonly string[],
   options: NoDropProofOptions = {},
 ): Promise<NoDropProof> {
-  const isShallow = await shallow(repoDir);
+  const isShallow = options.ownershipContext ? options.ownershipContext.shallow : await shallow(repoDir);
   if (isShallow !== false) return { status: "indeterminate", marker: isShallow ? "shallow-store" : "walk-error" };
   const values = (v: Readonly<Record<string, string>> | readonly string[]) => Array.isArray(v) ? [...v] : Object.values(v);
   const durableRoots = [...values(plannedRefs), ...values(heldRefs), ...values(recoveryPins)];

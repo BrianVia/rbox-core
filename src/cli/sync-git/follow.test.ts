@@ -14,8 +14,10 @@ import {
   hashBytes,
   indexIdentityV2,
   oracleFromState,
+  ownershipProofContext,
   probeReceiverEquivalence,
   resetCheckoutCapabilityProbeCacheForTests,
+  setGitSpawnObserver,
   setReceiverEquivalenceProbeForTests,
   type AppliedManifestOracle,
   type GitSection,
@@ -29,7 +31,7 @@ import type { SyncRemote } from "../remote.js";
 import { orderedRepoDeferralUpdates, saveStateSource } from "../sync-state.js";
 import { applyGitSections } from "./apply.js";
 import { settleCommittedBranchArtifacts, withRevalidatedGitPartialApplies } from "./received-git-transition-commit.js";
-import { checkoutJournalBinding, FollowCrashInjectedError, followDivergedRepo, recoverFollowJournal, selectCheckoutSelfRootWitness, type FollowCrashPoint } from "./follow.js";
+import { checkoutJournalBinding, classifyCheckoutOwnership, FollowCrashInjectedError, followDivergedRepo, recoverFollowJournal, selectCheckoutSelfRootWitness, type FollowCrashPoint } from "./follow.js";
 import { boundedOrigHeadPreservationError, origHeadPreservationFailureLine, origHeadWorktreeDiscriminator } from "./orig-head.js";
 import { planGitSections } from "./plan.js";
 import { GIT_FINGERPRINT_RACY_CLEAN_MARGIN_MS, gitFingerprint, gitFingerprintRun } from "./fingerprint.js";
@@ -102,6 +104,7 @@ afterEach(async () => {
   else process.env.RBOX_GIT_FOLLOW = priorGitFollow;
   resetCheckoutCapabilityProbeCacheForTests();
   setReceiverEquivalenceProbeForTests(undefined);
+  setGitSpawnObserver(undefined);
   configOwnershipSkipLogged.clear();
   configInvalidSkipLogged.clear();
   configCredentialSkipLogged.clear();
@@ -265,6 +268,71 @@ test("RBOX_GIT_FOLLOW parses only exact zero as disabled", () => {
   expect(gitFollowEnabled({ RBOX_GIT_FOLLOW: "0" })).toBe(false);
   expect(gitFollowEnabled({ RBOX_GIT_FOLLOW: "00" })).toBe(true);
   expect(gitFollowEnabled({ RBOX_GIT_FOLLOW: "invalid" })).toBe(true);
+});
+
+test("issue 569: follow-shaped current plus N stash proofs stay constant-spawn and preserve mapping", async () => {
+  const base = await commit("base\n", "spawn base");
+  const rootOne = await commit("root one\n", "spawn root one");
+  const rootTwo = await commit("root two\n", "spawn root two");
+  await git(sender, "checkout", "-qb", "receiver-local", base);
+  const localTips: string[] = [];
+  for (let i = 0; i < 40; i++) {
+    await git(sender, "commit", "--allow-empty", "-qm", `local stash-like ${i}`);
+    localTips.push(await git(sender, "rev-parse", "HEAD"));
+  }
+  const ctx = await repoCtx(sender);
+  if (!ctx) throw new Error("sender context missing");
+  const proofContext = await ownershipProofContext(ctx);
+  const roots = [rootOne, rootTwo];
+
+  const unreadableReflog = await classifyCheckoutOwnership(
+    sender,
+    localTips.at(-1),
+    roots,
+    proofContext,
+    async () => { throw new Error("forced reflog read failure"); },
+  );
+  expect(unreadableReflog.reasons).toEqual(["local-commits", "unreadable"]);
+  expect(unreadableReflog.details).toEqual([
+    "current tip has receiver-only commits",
+    "stash reflog could not be read",
+  ]);
+
+  const missing = "f".repeat(40);
+  const mixedStash = await classifyCheckoutOwnership(
+    sender,
+    base,
+    roots,
+    proofContext,
+    async () => [localTips[0]!, missing],
+  );
+  expect(mixedStash.reasons).toEqual(["local-stash", "unreadable"]);
+  expect(mixedStash.details).toEqual([
+    "stash reflog contains receiver-only work",
+    "stash reachability missing-object",
+  ]);
+
+  const observe = async (tips: readonly string[]) => {
+    const commands: string[][] = [];
+    setGitSpawnObserver((_root, args) => commands.push([...args]));
+    const classification = await classifyCheckoutOwnership(
+      sender,
+      base,
+      roots,
+      proofContext,
+      async () => tips,
+    );
+    setGitSpawnObserver(undefined);
+    return { classification, commands };
+  };
+  const small = await observe(localTips.slice(0, 2));
+  const large = await observe(localTips);
+  expect(small.classification.reasons).toEqual(["local-stash", "local-stash"]);
+  expect(large.classification.reasons).toEqual(Array.from({ length: localTips.length }, () => "local-stash"));
+  expect(large.commands).toHaveLength(small.commands.length);
+  expect(large.commands.length).toBeLessThanOrEqual(10);
+  expect(large.commands.map((args) => args[0])).toEqual(["cat-file", "rev-list", "rev-list"]);
+  expect(large.commands.some((args) => args[0] === "merge-base")).toBe(false);
 });
 
 test("contained attached tip follows HEAD, tip, and semantic index with BASE equality", async () => {
@@ -2307,6 +2375,18 @@ test("checkout-boundary excluded ref read is lossy and over-holds instead of thr
     },
   });
   expect(result.outcome.deferrals?.repo?.apply?.reason).not.toBe("other");
+});
+
+test("issue 569: checkout boundary revalidates shallow state instead of reusing admission evidence", async () => {
+  const { c1, state, incoming } = await baseAndIncoming();
+  const old = await git(receiver, "rev-parse", "HEAD");
+  const shallowPath = path.join(receiver, ".git", "shallow");
+  const result = await applyIncoming(state, incoming, matchingOracle, {
+    beforeCheckoutSecondProof: () => fs.writeFile(shallowPath, `${c1}\n`),
+  });
+  expect(result.outcome.deferrals?.repo?.apply?.reason).toBe("unsupported");
+  expect(await git(receiver, "rev-parse", "HEAD")).toBe(old);
+  await fs.rm(shallowPath, { force: true });
 });
 
 test("post-commit finalLive bookkeeping ref failure cannot convert a committed cycle to other", async () => {

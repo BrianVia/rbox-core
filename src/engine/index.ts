@@ -266,12 +266,14 @@ export {
 } from "./git/p-repair-transaction.js";
 export {
   incomingOwnershipRoots,
+  ownershipProofContext,
   partitionOwnedByIncoming,
   tipOwnedByIncoming,
   noDropProof,
   enumerateStashReflogOids,
   type ImportedScratchNamespace,
   type OwnershipProof,
+  type OwnershipProofContext,
   type PartitionedOwnership,
   type NoDropProof,
 } from "./git/reachability.js";
