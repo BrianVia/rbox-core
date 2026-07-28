@@ -1094,3 +1094,52 @@ test("re-parking under the same token keeps the state it promised to return to",
   await parkDaemonForMaintenance(root, "mt_1", { loadCredentials: creds("acct_reparks"), stopDaemon: async () => {} });
   expect(JSON.parse(await fs.readFile(desiredStatePath(root), "utf8")).maintenance).toMatchObject({ id: "mt_1", resume: "running" });
 });
+
+test("a start that fails leaves the obligation open for the next attempt", async () => {
+  const root = await workspace("ws_startfail");
+  await recordDesired(root, "running", "acct_startfail");
+  await parkDaemonForMaintenance(root, "mt_1", { loadCredentials: creds("acct_startfail"), stopDaemon: async () => {} });
+
+  await expect(resumeDaemonAfterMaintenance(root, "mt_1", {
+    loadCredentials: creds("acct_startfail"),
+    startDaemon: async () => { throw new Error("power loss"); },
+  })).rejects.toThrow("power loss");
+
+  // The commitment is durable and the obligation is NOT consumed.
+  const stranded = JSON.parse(await fs.readFile(desiredStatePath(root), "utf8"));
+  expect(stranded).toMatchObject({ state: "running", maintenance: { id: "mt_1", resume: "running" } });
+
+  const started: string[] = [];
+  expect(await resumeDaemonAfterMaintenance(root, "mt_1", {
+    loadCredentials: creds("acct_startfail"),
+    startDaemon: async (r) => {
+      started.push(r);
+      return "started" as const;
+    },
+  })).toBe(true);
+  expect(started).toEqual([root]);
+  expect(JSON.parse(await fs.readFile(desiredStatePath(root), "utf8")).maintenance).toBeUndefined();
+});
+
+test("a crash between the restart and the token clear resolves to a plain clear", async () => {
+  const root = await workspace("ws_clearcrash");
+  await recordDesired(root, "running", "acct_clearcrash");
+  await parkDaemonForMaintenance(root, "mt_1", { loadCredentials: creds("acct_clearcrash"), stopDaemon: async () => {} });
+  // The daemon came up but the process died before consuming the window.
+  await expect(resumeDaemonAfterMaintenance(root, "mt_1", {
+    loadCredentials: creds("acct_clearcrash"),
+    startDaemon: async () => { throw new Error("power loss"); },
+  })).rejects.toThrow("power loss");
+
+  const starts: string[] = [];
+  expect(await resumeDaemonAfterMaintenance(root, "mt_1", {
+    loadCredentials: creds("acct_clearcrash"),
+    startDaemon: async (r) => {
+      starts.push(r);
+      return "already-running" as const;
+    },
+  })).toBe(true);
+  const final = JSON.parse(await fs.readFile(desiredStatePath(root), "utf8"));
+  expect(final.state).toBe("running");
+  expect(final.maintenance).toBeUndefined();
+});

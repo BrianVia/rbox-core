@@ -20,16 +20,10 @@ import { syncStreamId } from "../workspace-config.js";
 import { withWorkspaceSyncMutex } from "../sync-mutex.js";
 import { loadConfig, saveConfig, type WorkspaceConfig } from "../workspace-config.js";
 import { intentPhase, newMaintenanceId, planScopeIntent, sameIntent, type ScopeIntent } from "./scope-intent.js";
+import { ScopeEditInProgressError, withScopeTransitionLock } from "./scope-lock.js";
 import { withinPrefix } from "./scope-record.js";
 
 export { planScopeIntent, type ScopeIntent } from "./scope-intent.js";
-
-export class ScopeEditInFlightError extends Error {
-  constructor() {
-    super("another change to the folders this machine syncs is still finishing — re-run this in a moment");
-    this.name = "ScopeEditInFlightError";
-  }
-}
 
 export interface ScopeTransitionResult {
   accepted: string[];
@@ -50,11 +44,13 @@ export interface ScopeTransactionDeps {
   parkedMaintenanceId?: (root: string) => Promise<string | undefined>;
   recordWitness?: (root: string, workspaceId: string, scope: readonly string[] | undefined) => Promise<void>;
   newMaintenanceId?: () => string;
+  /** Bounded wait for the transition lock before reporting an edit in progress. */
+  lockWaitMs?: number;
   now?: () => Date;
   log?: (line: string) => void;
 }
 
-async function defaultDeps(deps: ScopeTransactionDeps): Promise<Required<Omit<ScopeTransactionDeps, "log">> & { log: (line: string) => void }> {
+async function defaultDeps(deps: ScopeTransactionDeps): Promise<Required<Omit<ScopeTransactionDeps, "log" | "lockWaitMs">> & { log: (line: string) => void }> {
   const autostart = await import("../autostart-cmd.js");
   const control = await import("../daemon-control.js");
   const registry = await import("../binding-registry.js");
@@ -79,21 +75,31 @@ async function journal(abs: string, intent: ScopeIntent): Promise<void> {
 /**
  * Run (or resume) one scope transition to completion. `target` is the fully
  * validated, normalized, accepted-set-to-be; passing the intent's own target is how
- * a resume re-enters.
+ * a resume re-enters. Serialized against every other scope edit and recovery on
+ * this workspace, so nothing below has to defend against a second writer.
  */
 export async function runScopeTransition(
   root: string,
   target: readonly string[],
   deps: ScopeTransactionDeps = {},
 ): Promise<ScopeTransitionResult> {
+  return withScopeTransitionLock(path.resolve(root), () => transition(root, target, deps), deps.lockWaitMs);
+}
+
+async function transition(
+  root: string,
+  target: readonly string[],
+  deps: ScopeTransactionDeps,
+): Promise<ScopeTransitionResult> {
   const wired = await defaultDeps(deps);
   const abs = path.resolve(root);
   const cfg = await loadConfig(abs);
   const accepted = cfg.scope ?? [];
   const journaled = cfg.scopeIntent?.target.join("\n") === target.join("\n") ? cfg.scopeIntent : undefined;
-  // Someone else's unfinished edit. Planning over it would delete the only record
-  // that says how to finish it.
-  if (journaled === undefined && cfg.scopeIntent !== undefined) throw new ScopeEditInFlightError();
+  // An unfinished edit for a DIFFERENT target — one this lock holder did not
+  // interrupt, since it holds the only writer slot. Planning over it would delete
+  // the only record that says how to finish it.
+  if (journaled === undefined && cfg.scopeIntent !== undefined) throw new ScopeEditInProgressError();
   let intent = journaled ?? planScopeIntent(accepted, target, (cfg.scopeGeneration ?? 0) + 1, wired.now().toISOString());
   const phase = intentPhase(intent, cfg.scope, cfg.scopeGeneration);
   // A recovered pre-`phase` intent carries no maintenance token, so nothing on disk
@@ -152,8 +158,10 @@ export async function runScopeTransition(
   }
   await withWorkspaceSyncMutex(abs, async () => {
     const settled: WorkspaceConfig = { ...(await loadConfig(abs)) };
-    // Only ever retire OUR cursor: a concurrent edit may have journaled its own.
-    if (!sameIntent(settled.scopeIntent, intent)) return;
+    // The transition lock makes this writer the only one that can have touched the
+    // cursor. A mismatch is therefore not a race to tolerate — it means the lock
+    // did not hold, and clearing anyway would delete a cursor that is not ours.
+    if (!sameIntent(settled.scopeIntent, intent)) throw new Error("scope intent changed under the transition lock");
     delete settled.scopeIntent;
     await saveConfig(abs, settled);
   });
@@ -209,11 +217,15 @@ async function pruneScopedSubtrees(
  */
 export async function resumeScopeIntent(root: string, deps: ScopeTransactionDeps = {}): Promise<ScopeTransitionResult | undefined> {
   const abs = path.resolve(root);
-  const cfg = await loadConfig(abs).catch(() => undefined);
-  if (cfg?.scopeIntent) return runScopeTransition(root, cfg.scopeIntent.target, deps);
-  if (cfg === undefined) return undefined;
-  const wired = await defaultDeps(deps);
-  const parked = await wired.parkedMaintenanceId(abs);
-  if (parked !== undefined) await wired.resumeDaemon(abs, parked);
-  return undefined;
+  return withScopeTransitionLock(abs, async () => {
+    const cfg = await loadConfig(abs).catch(() => undefined);
+    if (cfg?.scopeIntent) return transition(root, cfg.scopeIntent.target, deps);
+    if (cfg === undefined) return undefined;
+    // Both reads happen under the lock, so no transition can journal and park
+    // between them and have its live window mistaken for an orphan.
+    const wired = await defaultDeps(deps);
+    const parked = await wired.parkedMaintenanceId(abs);
+    if (parked !== undefined) await wired.resumeDaemon(abs, parked);
+    return undefined;
+  }, deps.lockWaitMs);
 }

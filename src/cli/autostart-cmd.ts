@@ -358,6 +358,11 @@ async function startDaemonAndRecordDesiredImpl(root: string, deps: StartStopDeps
         ...(deps.trustedDesiredIdentity.pendingModeIntent === undefined
           ? {}
           : { pendingModeIntent: deps.trustedDesiredIdentity.pendingModeIntent }),
+        // Carried, not dropped: the obligation outlives the start attempt and is
+        // consumed only once the daemon is confirmed up.
+        ...(deps.trustedDesiredIdentity.maintenance === undefined
+          ? {}
+          : { maintenance: deps.trustedDesiredIdentity.maintenance }),
       };
   const fresh = (state: DesiredDaemonStateValue): DesiredDaemonState => ({
     ...identity,
@@ -565,8 +570,8 @@ export async function parkDaemonForMaintenance(root: string, id: string, deps: S
   await withDesiredRecordLock(abs, async (io) => {
     const current = await io.read();
     const held = current?.maintenance;
-    // Someone else's live window. Taking it over would leave that transaction's
-    // intent pointing at a token this one will consume.
+    // Someone else's live window. Scope transitions are serialized by their own
+    // lock, so this can only mean that lock did not hold — never take it over.
     if (held !== undefined && held.id !== id) throw new DaemonMaintenanceConflictError();
     const maintenance: DaemonMaintenance = { id, resume: held?.resume ?? current?.state ?? "running", at };
     await io.write({ ...(current ?? identity), maintenance });
@@ -575,23 +580,44 @@ export async function parkDaemonForMaintenance(root: string, id: string, deps: S
 }
 
 /**
- * Close the maintenance window opened by exactly `id`. The check, the token clear
- * and the decision to run again are one atomic step, and the start that follows is
- * fenced on the exact record this wrote: a concurrent `rbox stop` therefore either
- * lands first (the window is already gone — no-op) or last (its record wins and the
- * start stands down), never in between. Any other token means the obligation is not
- * ours: a no-op. Throwing leaves the window open for a later attempt.
+ * Close the maintenance window opened by exactly `id`. Any other token means the
+ * obligation is not ours: a no-op.
+ *
+ * The obligation is consumed LAST. The commitment to resume is written first, with
+ * the token retained, so a start that fails or a crash before it completes still
+ * leaves a window for the next attempt to find — and because the start is fenced on
+ * the exact record that commitment wrote, a concurrent `rbox stop` either lands
+ * before it (the window is already gone) or after it (its record wins and the start
+ * stands down), never in between. Re-entering with the daemon already up simply
+ * consumes the window.
  */
 export async function resumeDaemonAfterMaintenance(root: string, id: string, deps: StartStopDeps = {}): Promise<boolean> {
   const abs = path.resolve(root);
   const committed = await mutateDesiredRecord(abs, (current) => {
     if (current?.maintenance?.id !== id) return undefined;
-    const { maintenance, ...rest } = current;
-    if (maintenance.resume !== "running") return rest;
-    return { ...rest, state: "running" as const, at: (deps.now ?? (() => new Date()))().toISOString() };
+    if (current.maintenance.resume !== "running") {
+      const { maintenance: _closed, ...rest } = current;
+      return rest;
+    }
+    return { ...current, state: "running" as const, at: (deps.now ?? (() => new Date()))().toISOString() };
   });
-  if (committed?.state !== "running") return false;
-  return startDaemonAndRecordDesiredImpl(abs, { ...deps, resumeExpected: committed, trustedDesiredIdentity: committed });
+  if (committed?.state !== "running" || committed.maintenance?.id !== id) return false;
+  const started = await startDaemonAndRecordDesiredImpl(abs, {
+    ...deps,
+    resumeExpected: committed,
+    trustedDesiredIdentity: committed,
+  });
+  if (!started) return false;
+  await clearMaintenance(abs, id);
+  return true;
+}
+
+async function clearMaintenance(abs: string, id: string): Promise<void> {
+  await mutateDesiredRecord(abs, (current) => {
+    if (current?.maintenance?.id !== id) return undefined;
+    const { maintenance: _consumed, ...rest } = current;
+    return rest;
+  });
 }
 
 /** Opportunistically accept durable user intent when the current pidfile and

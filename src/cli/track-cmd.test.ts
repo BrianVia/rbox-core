@@ -166,8 +166,9 @@ test("a failed include transition restarts background sync after restoring the p
         resumeDaemon: async (_root, id) => {
           resumes++;
           if (id !== token) return false;
-          token = undefined;
           running = true;
+          // Consumed only after the restart, as the durable record does.
+          token = undefined;
           return true;
         },
         recordWitness: async () => { throw new Error("injected witness failure"); },
@@ -197,8 +198,8 @@ test("a crash between the include rollback and the restart still owes the daemon
     },
     resumeDaemon: async (_root: string, id: string) => {
       if (id !== token) return false;
-      token = undefined;
       running = true;
+      token = undefined;
       return true;
     },
   };

@@ -97,10 +97,14 @@ function daemonFake(startLive = true): DaemonFake {
       },
       resumeDaemon: async (_root, id) => {
         if (token?.id !== id) return false;
-        const resume = token.resume;
-        token = undefined;
-        if (resume !== "running") return false;
+        if (token.resume !== "running") {
+          token = undefined;
+          return false;
+        }
         live = true;
+        // Consumed only once the daemon is confirmed up, exactly as the durable
+        // record does — so a fault before this point leaves the window open.
+        token = undefined;
         order.push("resume");
         return true;
       },
@@ -344,35 +348,53 @@ test("a second edit refuses to plan over an unfinished one", async () => {
   })).rejects.toThrow("power loss");
 
   const second = daemonFake();
-  await expect(runScopeTransition(root, ["Work/repo-C"], second.deps)).rejects.toThrow("still finishing");
+  await expect(runScopeTransition(root, ["Work/repo-C"], second.deps)).rejects.toThrow("in progress");
   expect((await loadConfig(root)).scopeIntent).toMatchObject({ target: ADD });
 });
 
-test("two interleaved edits: neither settles away the other's recovery cursor", async () => {
+test("two edits cannot interleave: the second waits, then runs on the first's result", async () => {
   await saveConfig(root, base(["Personal/repo-A"]));
   const first = daemonFake();
-  const theirs = planScopeIntent(ADD, ["Work/repo-C"], 9, "theirs");
+  const second = daemonFake(false);
+  let queued: Promise<unknown> | undefined;
+  let secondFinished = false;
 
-  // Both processes read an empty slot at once — the window no refusal can close.
-  // The second journals its intent while the first is between its resume and its
-  // settle, so the first settles against a cursor that is no longer its own.
   await runScopeTransition(root, ADD, {
     ...first.deps,
-    resumeDaemon: async (root_, id) => {
-      const restarted = await first.deps.resumeDaemon?.(root_, id);
-      await saveConfig(root, { ...(await loadConfig(root)), scopeIntent: theirs });
-      return restarted ?? false;
+    recordWitness: async (...args) => {
+      // A second edit is launched while the first is mid-transition.
+      queued = runScopeTransition(root, [...ADD, "Work/repo-C"], { ...second.deps, lockWaitMs: 5_000 })
+        .then(() => { secondFinished = true; });
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      expect(secondFinished).toBe(false);
+      await first.deps.recordWitness?.(...args);
     },
   });
-  expect(first.live()).toBe(true);
-  expect((await loadConfig(root)).scopeIntent).toMatchObject({ target: ["Work/repo-C"], at: "theirs" });
+  await queued;
 
-  // And the surviving cursor still runs to completion.
-  const second = daemonFake(false);
-  await resumeScopeIntent(root, second.deps);
+  // The second planned against the FIRST's committed scope and generation.
   const cfg = await loadConfig(root);
-  expect(cfg.scope).toEqual(["Work/repo-C"]);
+  expect(cfg.scope).toEqual([...ADD, "Work/repo-C"]);
   expect(cfg.scopeIntent).toBeUndefined();
+  expect(cfg.scopeGeneration).toBe(3);
+});
+
+test("an edit that cannot get the lock in time says so rather than interleaving", async () => {
+  await saveConfig(root, base(["Personal/repo-A"]));
+  const first = daemonFake();
+  let blocked: Promise<unknown> | undefined;
+
+  await runScopeTransition(root, ADD, {
+    ...first.deps,
+    recordWitness: async (...args) => {
+      blocked = expect(runScopeTransition(root, ["Work/repo-C"], { ...daemonFake().deps, lockWaitMs: 1 }))
+        .rejects.toThrow("in progress");
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      await first.deps.recordWitness?.(...args);
+    },
+  });
+  await blocked;
+  expect((await loadConfig(root)).scope).toEqual(ADD);
 });
 
 test("a legacy intent already applied to the record is not replayed onto disk", async () => {
