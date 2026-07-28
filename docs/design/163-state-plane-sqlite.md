@@ -1,6 +1,18 @@
 # 163 — The state plane moves to SQLite
 
-Status: **v9 — pending final ratification.** V9 is a *round-five targeted fold*:
+Status: **v10 — pending final ratification.** V10 is a *round-six single-item
+fold*: the R4-v9 serial review verified both v9 closures and the reserve byte
+math, then falsified v9's blast-radius bound on the named residue by executing
+the merge consumer — `reconcile` classifies `local == stale base` as an
+ordinary remote write, so the ABA case (a user's intentional revert silently
+overwritten in the lost-save lineage) is reachable. V10 withdraws that bound,
+names the stronger consequence, and adds fixture `F6` asserting it. The
+ratification argument was already carried by the precondition and the hard U3
+drain gate, not by the withdrawn bound; that structure is unchanged.
+
+V9 provenance below is retained as the record of round five.
+
+V9 was a *round-five targeted fold*:
 it closes the two residuals from the codex serial review of the v8 tip.
 
 Provenance, stated honestly: **v8 named one outcome of the pre-B0 writer race
@@ -2245,15 +2257,25 @@ clobber each other's `state.json` today.
      backups were taken from the source M6 verified, not from the document that
      replaced it. There is no `legacy-overwrite-after-Q` analogue for (ii).
      Outcome (ii) is **silent**, and calling it "detectable" would be a lie.
-   - **What limits the damage is convergence, not detection.** `.rbox/state.json`
-     is a cache of the last-synced manifest plus locally derived git records, not
-     a data plane: no user bytes live only there. A lost save therefore leaves a
-     **stale BASE**, and stale BASE is the input rbox's merge is already
-     fail-closed about — the next sync re-fetches the remote manifest and
-     re-scans the repositories, and a BASE that is behind produces redundant
-     conflict detection (a deferral), never a silent content overwrite. This
-     design does not claim the re-derivation is bit-identical, only that the
-     failure mode is a stale cache with a fail-closed consumer.
+   - **The worst downstream outcome, stated without the bound v9 falsely
+     claimed (v10).** v9 asserted that a lost save "produces redundant conflict
+     detection, never a silent content overwrite." The R4-v9 serial review
+     falsified that by executing the merge consumer: `reconcile`
+     (`src/engine/reconcile.ts:60`) classifies `local == base` as an ordinary
+     remote write, and `apply` (`src/engine/apply.ts:287`) replaces a file that
+     still equals `expectedLocal` without a conflict copy. So the ABA case is
+     real: the pre-`B0` writer applies remote `B1` and its save of BASE `B1` is
+     the lost write; the user later intentionally reverts the file to its `B0`
+     contents; the next pull sees stale BASE `B0`, local `B0`, remote `B1` — and
+     **silently overwrites the user's intentional revert**. No user bytes live
+     only in `state.json`, but it is correctness-authoritative for
+     reconciliation posture, and "derived cache" does not make losing an update
+     universally fail-closed. This design accepts outcome (ii) with that
+     stronger consequence named: the reachable worst case is a silent overwrite
+     of a user edit that recreates a superseded state, in the specific lineage
+     where the lost save was the BASE advancement for that same path. The
+     narrower stale-BASE cases (local differs from base) still take the
+     conflict/deferral path; the bound v9 drew around *all* cases is withdrawn.
 
    *Ratification.* This residue is **accepted and named**, not closed. It is a
    scheduling assumption (`B0` adoption) enforced by a gate rather than by a
@@ -2383,8 +2405,8 @@ clobber each other's `state.json` today.
    to completion", while bullet 3's first condition refuses to migrate a
    degraded-unlocked workspace at all. The fixture asserted an outcome the
    design forbids reaching, so it could only ever have been deleted or
-   quietly weakened by whoever tried to write it. The matrix is now five
-   fixtures (v9 adds `F5`), each testing what the machine actually does:
+   quietly weakened by whoever tried to write it. The matrix is now six
+   fixtures (v9 adds `F5`; v10 adds `F6`), each testing what the machine actually does:
    - **F1 — the degraded fence does what M0 says.** A degraded-unlocked
      workspace with a live legacy writer: M0 must refuse with a typed
      `degraded-fence` refusal, publishing no control and creating no migration
@@ -2424,6 +2446,16 @@ clobber each other's `state.json` today.
      instead of after it, M6 must refuse with `legacy-write-detected`, not
      rename, and leave JSON authoritative — proving the part-three check is what
      bounds the microwindow rather than something else.
+   - **F6 — the ABA consequence of outcome (ii) (v10).** Extends F5 past the
+     migration: with the lost save being the BASE advancement for a path (the
+     legacy writer had applied remote `B1`), the fixture then reverts the file
+     on disk to its `B0` contents and runs the post-flip pull against remote
+     `B1`. The asserted *documented* outcome is the silent overwrite: `reconcile`
+     returns an ordinary `write` (`local == stale base`), `apply` replaces the
+     file with no conflict copy, and no anomaly is emitted. Like F5, the fixture
+     asserts the silence — a future mechanism that turns this case into a
+     conflict (e.g., BASE-generation stamping) turns F6 red and upgrades the
+     residue's documentation rather than letting it drift.
 
 The source bytes are retained exactly at the fixed convenience path
 `.rbox/state/legacy-json/pre-163-latest.json.bak` (v6 moved it off
@@ -4284,7 +4316,7 @@ be written):
   aggregate version telemetry the fleet already reports;
 - baked for at least two weeks of ordinary fleet use with zero
   barrier-related incidents;
-- the degraded/legacy-writer fixture matrix `F1`–`F5` from the closure above
+- the degraded/legacy-writer fixture matrix `F1`–`F6` from the closure above
   passes, including both negative controls and `F5`'s companion assertion;
 - the pre-`1.11.0` population is **demonstrably drained** by the aggregate
   version telemetry above. This is the only thing carrying § 1a's outcome (ii),
@@ -4780,4 +4812,16 @@ in the normative sections and in this table.
 | 2 — the specified `RBOX-STATE-RESERVE-v1 <semver> <stream>\n` header cannot fit 64 bytes; real streams are 71 bytes on their own | **Re-encoded to a 128-byte header, with the arithmetic shown.** Fixed overhead is `21` (magic) `+ 1 + 1` (separators) `+ 1` (`\n`) `= 24` plus the two variable fields. A verbatim stream needs `24 + 6 + 71 = 101` bytes and a full SHA-256 hex digest needs `24 + 6 + 64 = 94` — both over 64 — and truncating hex to fit 64 makes the digest width a function of the semver (34 hex for `1.11.0`, 18 for `1.11.0-rc.3+2026072701`), which is neither fixed-width nor collision-resistant. All three 64-byte forms are rejected in the doc. The header is now **128 bytes**: magic, space, semver (`<= 40` bytes; a longer semver refuses to create rather than truncating), space, the lowercase SHA-256 hex of the workspace `stream`'s UTF-8 bytes (64 chars), `\n`, NUL-padded — fixed overhead `21 + 1 + 1 + 64 + 1 = 88`, leaving exactly 40. Zero fill becomes **1,048,448** bytes and `128 + 1,048,448 = 1,048,576`, so total reserve size and the allocation guarantee are unchanged. M1 adoption and M6 role-7 deletion are stated as one rule — **byte-for-byte equality of all 128 bytes** with the CAS-recorded header — and `reserve-foreign` now covers a malformed 128-byte frame (bad magic, oversized/ill-formed semver, non-hex or wrong-length digest, missing `\n`, non-NUL padding) or a digest naming a different workspace. |
 
 V9 remains pending final ratification and is not implementation authority. The
+same two founder inputs are owed, both enumerated at the top of this document.
+
+## R4-v10 residual fold (v10)
+
+One review: the codex serial review of the v9 tip. Both v9 closures and the
+128-byte reserve arithmetic were **verified as real**; one blocker.
+
+| Residual | Disposition in v10 |
+|---|---|
+| The F5 blast-radius bound is false: "a lost save leaves a stale BASE … redundant conflict detection, never a silent content overwrite" does not survive the merge consumer. Executed counterexample: lost save was the BASE advancement to `B1`; user intentionally reverts the file to `B0` contents; next pull sees stale BASE `B0`, local `B0`, remote `B1`; `reconcile` (`src/engine/reconcile.ts:60`) classifies `local == base` as an ordinary remote write and `apply` (`src/engine/apply.ts:287`) replaces the file with no conflict copy — the intentional revert is silently overwritten | **Bound withdrawn, stronger consequence named, fixture added.** The residue paragraph now states the reachable worst case plainly — a silent overwrite of a user edit that recreates a superseded state, in the lineage where the lost save was that path's BASE advancement — and confines the surviving fail-closed claim to the cases where local differs from base. New fixture `F6` extends `F5` through the post-flip pull and asserts the silent `write` outcome (and the absence of any anomaly), so a future BASE-generation mechanism that converts this case into a conflict turns `F6` red and upgrades the documentation. The ratification argument is unchanged **because it never rested on the withdrawn bound**: it rests on the preconditions (pre-`1.11.0` binary actively racing a migration in a two-instant microwindow) and the hard U3 exit criterion — telemetry-verified drain of the pre-`1.11.0` population, or U3 does not open. |
+
+V10 remains pending final ratification and is not implementation authority. The
 same two founder inputs are owed, both enumerated at the top of this document.
