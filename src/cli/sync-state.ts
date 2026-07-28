@@ -237,7 +237,7 @@ function sourceRecord(source: StateSource, relPath: string, current: RepoRecord)
     else retained.deferrals = mergedDeferrals;
     // A retention moves nothing, so it carries the record's own lineage rather
     // than the discarded source's proof.
-    return { newRecord: sanitizeRepoRecordInput(retained), baseProof: provisionalRepoBaseProof(undefined, previousValue) };
+    return { newRecord: sanitizeRepoRecordInput(retained), baseProof: provisionalRepoBaseProof(relPath, undefined, previousValue) };
   }
   const lane = source.values.configLane?.[relPath] ?? current;
   const hasAdvertisedValue = Object.prototype.hasOwnProperty.call(source.values.advertised ?? {}, relPath);
@@ -246,7 +246,7 @@ function sourceRecord(source: StateSource, relPath: string, current: RepoRecord)
     base: source.values.bases?.[relPath],
     branchBaseOrigins: source.values.branchBaseOrigins?.[relPath],
   };
-  const proof = provisionalRepoBaseProof(source.repoProofs?.[relPath], previousValue);
+  const proof = provisionalRepoBaseProof(relPath, source.repoProofs?.[relPath], previousValue);
   const composed = composeRepoBase(
     previousValue,
     candidateValue,
@@ -522,7 +522,7 @@ export async function savePublishedRepoIntent(
     if (Object.keys(deferrals).length) merged.deferrals = deferrals; else delete merged.deferrals;
     merged.sourceSeq = Math.max(currentInput.sourceSeq, intended.record.sourceSeq);
     const previousValue = { base: currentInput.base, branchBaseOrigins: currentInput.branchBaseOrigins };
-    const baseProof = provisionalRepoBaseProof(intended.baseProof, previousValue);
+    const baseProof = provisionalRepoBaseProof(relPath, intended.baseProof, previousValue);
     const composed = composeRepoBase(
       previousValue,
       { base: merged.base, branchBaseOrigins: merged.branchBaseOrigins },

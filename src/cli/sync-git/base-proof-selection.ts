@@ -9,11 +9,11 @@
  * the seam is looking at the real predecessor:
  *
  *   - `provisionalRepoBaseProof` composes a CANDIDATE packet against a snapshot
- *     that may already be stale. It never refuses, because a stale-looking
- *     change is indistinguishable from a real one until the generation CAS
- *     settles it. Absent a supplied proof it falls back to carry authority,
- *     which HOLDS every unwitnessed ref move instead of installing it, so the
- *     worst case is a held candidate that the CAS then rejects on generation.
+ *     that may already be stale, so it never refuses on the SHAPE of a delta: a
+ *     stale-looking change is indistinguishable from a real one until the
+ *     generation CAS settles it. Absent a supplied proof it falls back to carry
+ *     authority, which HOLDS every unwitnessed ref move instead of installing
+ *     it, so the worst case is a held candidate the CAS rejects on generation.
  *
  *   - `requireRepoBaseProof` admits a transition at the seam that holds the
  *     state lock and the true predecessor. There a proofless BASE move is a
@@ -55,10 +55,36 @@ export function baseSemanticallyUnchanged(previous: RepoBaseValue, candidate: Re
 const carriedFrom = (previous: RepoBaseValue): RepoBaseProof =>
   carryRepoBaseProof(recordOriginLineage(previous.branchBaseOrigins) ?? "legacy-untrusted");
 
-export const provisionalRepoBaseProof = (
+/**
+ * No ordinary state write carries blanket authority — not a forged structural
+ * `{ kind: "migration" }`, and not even a genuinely minted one. Legacy adoption
+ * happens in `state-plane/migration/base-proof.ts` and never reaches a packet,
+ * so refusing the kind outright is both simpler and stricter than checking a
+ * token: it needs no identity that a canonical-JSON round trip would destroy,
+ * and it holds against a caller that reconstructed the shape by hand.
+ *
+ * Unlike a proofless BASE move, this is never a staleness artifact — the
+ * authority a caller names does not depend on how old its snapshot is — so both
+ * seams refuse it.
+ */
+function refuseBlanketAuthority(relPath: string, supplied: RepoBaseProof): void {
+  if (supplied.authority?.kind === "migration") {
+    throw new ProoflessBaseError(
+      relPath,
+      "blanket migration authority is reserved for legacy import and may not authorize a state write",
+    );
+  }
+}
+
+export function provisionalRepoBaseProof(
+  relPath: string,
   supplied: RepoBaseProof | undefined,
   previous: RepoBaseValue,
-): RepoBaseProof => supplied ?? carriedFrom(previous);
+): RepoBaseProof {
+  if (supplied === undefined) return carriedFrom(previous);
+  refuseBlanketAuthority(relPath, supplied);
+  return supplied;
+}
 
 export function requireRepoBaseProof(
   relPath: string,
@@ -66,7 +92,10 @@ export function requireRepoBaseProof(
   previous: RepoBaseValue,
   candidate: RepoBaseValue,
 ): RepoBaseProof {
-  if (supplied !== undefined) return supplied;
+  if (supplied !== undefined) {
+    refuseBlanketAuthority(relPath, supplied);
+    return supplied;
+  }
   if (!baseSemanticallyUnchanged(previous, candidate)) {
     throw new ProoflessBaseError(relPath, governedRefsUnchanged(previous, candidate)
       ? "the write moves branch base origins but supplied no repoProofs entry"

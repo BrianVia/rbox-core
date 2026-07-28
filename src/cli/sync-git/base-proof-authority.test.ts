@@ -7,6 +7,11 @@
  * changing nothing at all. Before this contract existed, a missing
  * `repoProofs` entry silently defaulted to `migrationRepoBaseProof()` in three
  * places on the live JSON write path.
+ *
+ * Two layers hold it. The compiler owns construction — `MigrationBaseAuthority`
+ * is branded, pinned by `migration-authority-surface.typecheck.ts`. This file
+ * owns behavior: what the seams do with a proof they are handed, and proof that
+ * carry authority composes byte-identically to the default it replaced.
  */
 import { expect, test } from "bun:test";
 import fs from "node:fs/promises";
@@ -16,7 +21,8 @@ import type { GitSection } from "../../engine/index.js";
 import { ProoflessBaseError } from "../state-plane/errors.js";
 import { applyStateSavePacket } from "../config.js";
 import { composeStateSavePacket, savePublishedRepoIntent, type StateSource } from "../sync-state.js";
-import { carryRepoBaseProof, type BranchBaseOrigin } from "./base-composer.js";
+import { carryRepoBaseProof, composeRepoBase, type BranchBaseOrigin, type RepoBaseProof } from "./base-composer.js";
+import { migrationRepoBaseProof } from "../state-plane/migration/base-proof.js";
 
 const T = "1".repeat(40);
 const U = "2".repeat(40);
@@ -52,10 +58,67 @@ test("a proofless candidate BASE move is held by carry authority, never laundere
   expect(packet.repos[0]?.newRecord.pending).toEqual(section(U));
 });
 
-test("a byte-unchanged advance derives carry authority from the retained lineage", () => {
+test("an identical section derives carry authority from the retained lineage", () => {
   const packet = composeStateSavePacket(state(), source({ bases: { r: section(T) } }));
   expect(packet.repos[0]?.baseProof).toEqual(carryRepoBaseProof(LIN));
+  expect(packet.repos[0]?.newRecord.base).toEqual(section(T));
   expect(packet.repos[0]?.newRecord.branchBaseOrigins?.["refs/heads/main"]).toMatchObject({ kind: "pull-p" });
+});
+
+/**
+ * The distinct, and much more common, legitimate case: apply.ts's unchanged
+ * shortcut advances a section across scopes and re-bundles it while every
+ * governed ref stays put ("unchanged → base advances (possibly across scopes)").
+ * This is what `authorityGovernedRefs` exists to permit, and the case where a
+ * whole-section equality rule would have wrongly refused live pull traffic.
+ */
+test("a governed-identical metadata advance composes byte-identically to the pre-HEAD migration default", () => {
+  const advanced: GitSection = {
+    ...section(T),
+    bundleSha: "9".repeat(64), bundleEncSha: "8".repeat(64), bundleCipherSize: 4096,
+    refScope: "scoped", generatedAt: "advanced",
+  };
+  const packet = composeStateSavePacket(state(), source({ bases: { r: advanced } }));
+  expect(packet.repos[0]?.baseProof?.authority.kind).toBe("pull-carry");
+
+  // The pre-HEAD path fed these exact inputs to composeRepoBase under the
+  // implicit blanket-migration default. Same inputs, that authority, asserted
+  // byte-for-byte — so compatibility is proven against the old semantics rather
+  // than against a second current implementation.
+  const legacy = migrationRepoBaseProof();
+  const preHead = composeRepoBase(
+    { base: section(T), branchBaseOrigins: { "refs/heads/main": origin } },
+    { base: advanced },
+    legacy.authority,
+    legacy.lockedProof,
+  );
+  expect(packet.repos[0]?.newRecord.base).toEqual(preHead.base);
+  expect(packet.repos[0]?.newRecord.branchBaseOrigins).toEqual(preHead.branchBaseOrigins);
+
+  // ...and the advance is real: the non-governed fields moved, no hold was taken.
+  expect(preHead.disposition).toBe("terminal");
+  expect(packet.repos[0]?.newRecord.base).toMatchObject({
+    bundleSha: "9".repeat(64), refScope: "scoped", generatedAt: "advanced",
+    refs: { "refs/heads/main": T },
+  });
+  expect(packet.repos[0]?.newRecord.pending).toBeUndefined();
+});
+
+test("the JSON CAS accepts and persists a governed-identical metadata advance", async () => {
+  const advanced: GitSection = { ...section(T), bundleSha: "9".repeat(64), refScope: "scoped", generatedAt: "advanced" };
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-base-proof-advance-"));
+  try {
+    await fs.mkdir(path.join(root, ".rbox", "state"), { recursive: true });
+    await fs.writeFile(path.join(root, ".rbox", "state.json"), JSON.stringify(state()));
+    const result = await applyStateSavePacket(root, composeStateSavePacket(state(), source({ bases: { r: advanced } })));
+    expect(result.status).toBe("accepted");
+    const record = result.status === "accepted" ? result.state.repoRecords?.r : undefined;
+    expect(record?.base).toMatchObject({ bundleSha: "9".repeat(64), refScope: "scoped", generatedAt: "advanced" });
+    expect(record?.base?.refs).toEqual({ "refs/heads/main": T });
+    expect(record?.branchBaseOrigins?.["refs/heads/main"]).toMatchObject({ kind: "pull-p" });
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });
 
 test("an unobserved repo (no candidate BASE) derives carry authority and retains its record", () => {
@@ -122,18 +185,53 @@ test("published-intent recovery holds a proofless BASE move rather than minting 
   }
 });
 
-test("migration authority is constructible only from state-plane migration territory", async () => {
+/**
+ * Defense in depth only — the contract is the compiler. `MigrationBaseAuthority`
+ * carries a non-exported brand (see migration-authority-surface.typecheck.ts),
+ * so no import specifier of any shape lets a module construct one. This still
+ * pins WHO reaches for the mint: it matches `.js`, `.ts`, and extensionless
+ * specifiers in both `import ... from` and `export ... from` position, so a deep
+ * import cannot slip past — and a re-export chain cannot either, because its
+ * FIRST hop must name this path and would appear in the list below.
+ */
+test("the mint's importers are a closed list", async () => {
   const src = path.resolve(import.meta.dir, "../..");
+  const specifier = /\bfrom\s*\(?\s*["'][^"']*migration\/base-proof(\.[jt]s)?["']/;
   const importers: string[] = [];
   for (const entry of await fs.readdir(src, { recursive: true, withFileTypes: true })) {
     if (!entry.isFile() || !entry.name.endsWith(".ts")) continue;
     const abs = path.join(entry.parentPath, entry.name);
-    if (/migration\/base-proof\.js/.test(await fs.readFile(abs, "utf8"))) {
-      importers.push(path.relative(src, abs));
-    }
+    if (specifier.test(await fs.readFile(abs, "utf8"))) importers.push(path.relative(src, abs));
   }
   expect(importers.sort(), "migration BASE authority escaped its territory").toEqual([
-    "cli/state-plane/store/proofless-base.test.ts",
+    // The legacy JSON manifest adoption the blanket authority exists for.
     "cli/sync-state-model.ts",
-  ]);
+    // Composer unit test: the one place migration composition semantics are asserted.
+    "cli/sync-git/base-composer.test.ts",
+    // This file, proving carry composes byte-identically to the old default.
+    "cli/sync-git/base-proof-authority.test.ts",
+    // U1b store admission test for the tagged-importer reservation.
+    "cli/state-plane/store/proofless-base.test.ts",
+  ].sort());
+});
+
+test("no ordinary state write may name blanket authority, minted or forged", async () => {
+  const minted = migrationRepoBaseProof();
+  const forged = { authority: { kind: "migration", lineageHash: LIN }, lockedProof: minted.lockedProof } as RepoBaseProof;
+  for (const proof of [minted, forged]) {
+    expect(() => composeStateSavePacket(state(), source({ bases: { r: section(T) } }, { r: proof })))
+      .toThrow(ProoflessBaseError);
+  }
+
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-base-proof-blanket-"));
+  try {
+    await fs.mkdir(path.join(root, ".rbox", "state"), { recursive: true });
+    await fs.writeFile(path.join(root, ".rbox", "state.json"), JSON.stringify(state()));
+    await expect(applyStateSavePacket(root, {
+      expectedStream: "s", expectedNonce: "0".repeat(32), sourceGlobalSeq: 2,
+      repos: [{ relPath: "r", expectedRepoGen: 3, newRecord: { sourceSeq: 2, base: section(T) }, baseProof: forged }],
+    })).rejects.toThrow(ProoflessBaseError);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });

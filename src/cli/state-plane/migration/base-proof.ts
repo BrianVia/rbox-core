@@ -11,11 +11,22 @@
  * `src/cli/sync-git/base-proof-authority.test.ts`.
  */
 import type { GitSection } from "../../../engine/index.js";
-import { composeRepoBase, type RepoBaseProof, type RepoBaseValue } from "../../sync-git/base-composer.js";
+import {
+  composeRepoBase,
+  type MigrationBaseAuthority,
+  type RepoBaseProof,
+  type RepoBaseValue,
+} from "../../sync-git/base-composer.js";
 
+/**
+ * The single mint. `MigrationBaseAuthority` carries a non-exported brand, so
+ * this cast is the only way a value of that type comes into existence — an
+ * inline `{ kind: "migration", … }` elsewhere no longer type-checks as one.
+ */
 export function migrationRepoBaseProof(lineageHash = "legacy-untrusted"): RepoBaseProof {
+  const authority = Object.freeze({ kind: "migration", lineageHash }) as unknown as MigrationBaseAuthority;
   return {
-    authority: { kind: "migration", lineageHash },
+    authority,
     lockedProof: { repoKind: "dir", effectiveRefScope: "all", checkoutComplete: true, branches: {}, safeRefs: {} },
   };
 }

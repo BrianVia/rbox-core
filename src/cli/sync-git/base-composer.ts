@@ -151,7 +151,24 @@ export type ComposeRepoBaseAuthority =
         disposition: "advance-prior-to-next" | "already-next" | "preserve-absent" | "preserve-third";
       }>>;
     }
-  | { kind: "migration"; lineageHash: string };
+  | MigrationBaseAuthority;
+
+declare const migrationBaseAuthorityBrand: unique symbol;
+/**
+ * Blanket authority: it installs any candidate refs without a per-branch
+ * witness. The brand is a NON-EXPORTED `unique symbol`, so `{ kind: "migration",
+ * lineageHash }` written anywhere else no longer satisfies this type — minting
+ * one takes a deliberate cast, and the only module that performs it is
+ * `state-plane/migration/base-proof.ts` (the `state-plane/reset/owner.ts`
+ * lexical-capability idiom). The brand is erased at runtime, so it never reaches
+ * a canonical-JSON digest; the live CAS refuses this kind outright instead
+ * (base-proof-selection.ts), which catches a forged structural variant too.
+ */
+export interface MigrationBaseAuthority {
+  readonly kind: "migration";
+  readonly lineageHash: string;
+  readonly [migrationBaseAuthorityBrand]: true;
+}
 
 export interface RepoBaseValue {
   base?: GitSection;

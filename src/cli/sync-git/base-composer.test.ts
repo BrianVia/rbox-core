@@ -7,6 +7,7 @@ import {
   type RepoBaseLockedProof,
   type SafeRefWitness,
 } from "./base-composer.js";
+import { migrationRepoBaseProof } from "../state-plane/migration/base-proof.js";
 
 const L = "1".repeat(40);
 const N = "2".repeat(40);
@@ -330,7 +331,8 @@ describe("design 130 mandatory BASE composer", () => {
     }, locked());
     expect(ack.base?.refs).toMatchObject({ [main]: N, [side]: U });
     expect(ack.branchBaseOrigins?.[main]).toMatchObject({ kind: "publisher-ack", sourceSeq: 9, incomingKey: "ack" });
-    const migrated = composeRepoBase(previous, candidate, { kind: "migration", lineageHash: LIN }, locked());
+    // Blanket authority is branded; a structural literal is no longer one.
+    const migrated = composeRepoBase(previous, candidate, migrationRepoBaseProof(LIN).authority, locked());
     expect(migrated.base?.refs).toMatchObject({ [main]: N, [side]: U });
     expect(migrated.branchBaseOrigins).toBeUndefined();
   });
