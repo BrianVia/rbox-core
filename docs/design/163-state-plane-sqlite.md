@@ -20,15 +20,25 @@ orchestrator ratifies it.
 
 ## QUESTIONS FOR THE ORCHESTRATOR (v6 — answer before ratifying)
 
-1. **Sequencing: backend-first behind the state seam, or the current
-   big-bang 2.0?** The R4 codex review argues 163 couples authority migration,
-   engine rewrite, reset conversion, and rollout into one long-lived branch
-   without adequately rejecting a cheaper ordering. The v6 alternatives
-   section below argues the question in full and reaches a qualified
-   conclusion: **the backend-first sequencing is superior for U1–U2 and is not
-   available for U3–U4**, which suggests a hybrid the current U-slices do not
-   describe. This is a restructuring decision, so v6 raises it rather than
-   taking it. See "Rejected and deferred alternatives".
+1. **Sequencing — RESOLVED IN v6, and the plan below is restructured.**
+   The founder's leaning ("backend-first if the fold agrees") was put to a
+   verified analysis rather than accepted on authority. The analysis agrees:
+   backend-first is superior, and for a reason neither review stated — it makes
+   the one irreversible step (the `Q` authority flip) coincide with the
+   **smallest** possible diff instead of the largest. The U-slices are
+   reordered accordingly (`B0 → U0 → U1 → U2 reset → U3 flip → U4a–U4f engine
+   → U5`). The M0–M7 authority machine, the `Q` barrier, and all migration
+   fencing are **unchanged** — only their position in the schedule moved. Full
+   argument and the conditions attached: "Rejected and deferred alternatives",
+   item 5.
+   **Residual decision for the orchestrator:** backend-first ships 2.0 — and
+   therefore the one-way migration — to the four external users *before* the
+   latency and memory wins land (those arrive across U4a–U4f). The flip's own
+   payoff is real but narrower: O(dirty-row) authority writes and structurally
+   impossible reset admission errors. V6 gates that with a no-regression
+   criterion (the flip may not ship if trusted status or daemon RSS is worse
+   than the 1.x baseline), but "users take the migration first, benefit later"
+   is a judgment call about four real people, not a technical one. Confirm it.
 2. **Is the pre-U0 barrier release acceptable as a hard gate?** R4-CODEX 2
    shows a running degraded-unlocked legacy writer can overwrite `Q` after M6.
    The fix is a Q-before-every-write barrier that must ship **and bake** in the
@@ -69,7 +79,7 @@ that contract:
    divergence). SQLite removes the baseline-parse/materialization component;
    it does not remove the filesystem scan or Git work. Steady-state trusted
    path measures 0.84 s (162 r1 evidence). That 0.84 s is the current baseline;
-   the `<200 ms` value below is a prospective measured U2 target, not claimed
+   the `<200 ms` value below is a prospective measured U4 target, not claimed
    parity or an inference that all 0.84 s is JSON work (r3 C9; r3c-5).
 3. **Daemon memory** — the field log recorded RSS 2.95 → 6.41 GB over 23
    cycles. Code independently proves repeated full-state parsing plus multiple
@@ -142,12 +152,16 @@ state machine and the stable guard/ENOSPC halts are normative below.
 `B0` pre-U0 stable-line barrier release (below); U0 entry
 interning/immutable structural sharing (independently implementable
 and testable within 2.0, not independently shippable);
-U1 store/schema/digest/backup modules and read-only adapters; U2a–U2f ordered
-scan/reconcile/apply/push ports plus generation-CAS writes; U3 migration and
-the old-reader barrier; U4 138 DB-artifact reset/quarantine flows; U5 fleet
-bake with component telemetry. Default-on is allowed only after U4 review and
-the barrier-compatible bake release; rig scenarios run migration from real
-pre-163 states and every injected boundary below. The gated plan, per-unit exit
+U1 store/schema/digest/backup modules and read-only adapters; **U2 138
+DB-artifact reset/quarantine flows; U3 migration, the old-reader barrier, and
+the `Q` authority flip behind a whole-state compatibility adapter (2.0 ships
+here); U4a–U4f the ordered scan/reconcile/apply/push ports plus cursor-backed
+caches, landing as ordinary 2.x releases**; U5 fleet bake with component
+telemetry. V6 reordered these around the backend-first sequencing (v5 had the
+engine rewrite at U2 and reset at U4, with the flip in the middle); the
+authority machinery itself is unchanged. Default-on is allowed only after U2
+review and the barrier-compatible bake release; rig scenarios run migration
+from real pre-163 states and every injected boundary below. The gated plan, per-unit exit
 criteria, ship/no-ship criterion, and branch-merge process are normative in
 "Rollout, gates, and delivery plan" below — v5's version of this paragraph was
 the only unreviewed part of the design and two of its assumptions were false
@@ -169,10 +183,18 @@ implementation — no store, no schema, no migration — only the barrier check 
 its pinning inventory test.
 
 ## Acceptance targets (measured, not promised)
+
+**When each target is owed (v6).** Under the backend-first sequencing the
+targets below are **U4's**, not the 2.0 flip release's. The flip (U3) owes only
+the O(dirty-row) authority write, structurally impossible reset admission
+errors, and the no-regression gate — it must not make status or RSS worse, and
+it does not yet claim to make them better. Claiming a U4 target for the flip
+release would be exactly the kind of broadened claim the last bullet forbids.
+
 - Trusted `rbox status` with live daemon: < 200 ms on the 112k corpus. The
   unsettled fallback is reported separately as baseline-load, scan, diff, and
-  Git-divergence components; it has no <200 ms promise. U2 reports the current
-  0.84 s and post-U2 state-load/projection, daemon/RPC, scan/diff, and Git
+  Git-divergence components; it has no <200 ms promise. U4 reports the current
+  0.84 s and post-U4 state-load/projection, daemon/RPC, scan/diff, and Git
   components separately. Failure to reach `<200 ms` is a target miss, not
   permission to broaden the claim about what SQLite removes (r3 C9; r3c-5).
 - Record peak live `FileEntry` objects, SQLite cache, wire buffers, every
@@ -188,8 +210,8 @@ its pinning inventory test.
 ## Non-goals
 - Wire protocol / server anything (84 unchanged).
 - Hash-cache/dircache **authority consolidation into `state.db`**. Their
-  workspace-sized JS maps are nevertheless incompatible with U2's memory
-  contract, so U2 gives HashCache, DirCache, and EncryptAddressCache one
+  workspace-sized JS maps are nevertheless incompatible with U4's memory
+  contract, so U4 gives HashCache, DirCache, and EncryptAddressCache one
   separate cursor-backed `.rbox/state/cache-v2.db`; it is rebuildable,
   non-authoritative, independently deletable, and is never consulted to elect
   BASE/LOCAL authority. This is a representation change inside design 163,
@@ -422,7 +444,7 @@ Normative dispositions:
   `publishCommitRecord` `finally` block closes its handle but does **not**
   remove its temp, so a thrown (not merely killed) publication leaks a
   permanent `.rbox-tmp-<pid>-<16hex>-COMMITTED` inside the bundle directory.
-  U4 fixes that producer; the inventory rule above already tolerates the
+  U2 fixes that producer; the inventory rule above already tolerates the
   existing debris either way.
 
 After a successful inventory the precedence is closed:
@@ -594,10 +616,10 @@ Normative v6 definition and owner:
   each produce the same predicate value as today's `.json` archive.
 - The **write** that this authorization enables (`legacyState` plus
   `saveStateUnsafeLegacyOrTest`, `sync-state.ts:364-367`) is a whole-JSON
-  state replacement and has no post-Q meaning. U2 replaces it with an explicit
+  state replacement and has no post-Q meaning. U4 replaces it with an explicit
   store operation that performs the same lineage replacement as a bounded CAS
   transaction under the same authorization predicate. Until that operation
-  exists, migration must not be enabled — it is listed as a U2 exit item below.
+  exists, migration must not be enabled — it is listed as a U4 exit item below.
 
 #### Complete `.rbox/state/**` consumer sweep (v6 R4-CODE recommendation)
 
@@ -616,7 +638,7 @@ is a **file** and `.rbox/state/` is a **directory**. `state.db` lands at
 | `sync-state-store.ts` | `state.json`, `state-incarnation.json`, `lineages/<hex32>/<hex64>.json` | **yes** — the hex64 `.json` archive regex | Owned by the lineage-provenance predicate above; `STATE_FILE`/marker paths are unchanged (`Q` occupies `state.json`). |
 | `reset-journal.ts`, `reset-state.ts`, `reset-journal-doctor.ts` | `reset-v1.json`, `reset-candidates/<id>.json`, `lineages/**`, `state-incarnation.json` | **yes** — by design | The SQLite branch plus the retained legacy-JSON branch above. |
 | `reset-quarantine.ts` | `quarantine/**`, and `safeRelative` requires archived originals to be under `.rbox/state/` | prefix, not extension | Fourth durable tree; fenced by the M0 quiescence predicate. |
-| **`adopt-cache.ts`** | `cache-generation.json`; `invalidateAdoptionCaches` deletes a **hardcoded list**: `hashcache.json`, `dircache.json`, `scan-probe.json`, `git-divergence.json`, and `git-tracked/` | **yes — highest-risk item found in R4** | U2 replaces those caches with `cache-v2.db` and parks the v1 files under `cache-v1-retired/`. `fs.rm(..., {force:true})` on a now-absent path is a silent no-op, so adoption would advance its generation while leaving live stale caches. **U2 must update this list in the same change that introduces `cache-v2.db`**, adding the v2 tables' invalidation (a bounded transaction, not a file delete) and the parked-copy path. A U2 test asserts that adoption invalidates every cache the scan path can consult. |
+| **`adopt-cache.ts`** | `cache-generation.json`; `invalidateAdoptionCaches` deletes a **hardcoded list**: `hashcache.json`, `dircache.json`, `scan-probe.json`, `git-divergence.json`, and `git-tracked/` | **yes — highest-risk item found in R4** | U4a replaces those caches with `cache-v2.db` and parks the v1 files under `cache-v1-retired/`. `fs.rm(..., {force:true})` on a now-absent path is a silent no-op, so adoption would advance its generation while leaving live stale caches. **U4a must update this list in the same change that introduces `cache-v2.db`**, adding the v2 tables' invalidation (a bounded transaction, not a file delete) and the parked-copy path. A U4a test asserts that adoption invalidates every cache the scan path can consult. |
 | `path-warnings.ts` | `path-warnings.json`; `requirePlainWarningsParent` lstat-walks `.rbox` then `state` and **throws if either is not a plain directory** | no extension dependency, but a hard shape assertion | Unaffected: `.rbox/state` remains a plain directory in every 163 layout. Recorded because any future "state as a file" variant would hard-fail here. |
 | `reset-health.ts` | `health-halt.json` | no | Unaffected. Self-validating, advisory. |
 | `daemon/drift-audit.ts` (note: not `src/cli/drift-audit.ts`, which does not exist) | `drift-audit.json` | no | Unaffected. Self-versioned (`version:1`), fails soft to an empty state. Its in-memory diff is separately re-homed on `DriftAuditPort`. |
@@ -677,7 +699,7 @@ then delegate to `observeResetJournalBytes`), so that call site changes.
 The complete list of modules that touch raw journal bytes today, verified for
 v6 (R4-CODE item 6; v5 named two of five):
 
-| Module | What it does today | After U4 |
+| Module | What it does today | After U2 |
 |---|---|---|
 | `reset-journal.ts` | the only module that **parses** (`readResetJournal`, `observeResetJournalBytes`, `inspectResetJournal`) | imports the shared codec; owns no parser |
 | `reset-journal-doctor.ts` | raw `JSON.parse` of both bundled and live journal bytes to read `.v` | imports the shared codec; the bare `JSON.parse` is deleted |
@@ -1093,7 +1115,7 @@ thread mode is not treated as permission to share Bun objects.
 ## Engine ordered-merge and cursor architecture (r1 f3)
 
 The store port is not `loadState(): SyncState`. That compatibility adapter is
-migration/test-only and must not become U2's implementation. The operational
+migration/test-only and must not become U4's implementation. The operational
 model is three ordered planes plus sealed action plans:
 
 - **BASE** — the transactionally versioned authoritative plane last
@@ -1282,8 +1304,8 @@ and balanced arena retains (r3 C7; r3b-5).
 
 U0 is deliberately transitional: its fingerprint index is O(unique live
 entries), and it is implemented before SQLite within 2.0 to remove duplicate object graphs and
-make aliasing safe; U0 is measured but is not credited with U2's <64 MiB
-non-wire budget. Once U2 removes N-sized manifest arrays, `EntryArena` becomes
+make aliasing safe; U0 is measured but is not credited with U4's <64 MiB
+non-wire budget. Once U4 removes N-sized manifest arrays, `EntryArena` becomes
 an operation-local decode cache capped at the lesser of 8,192 entries or 8
 MiB estimated retained metadata, with LRU eviction restricted to zero-lease
 slots. SQLite `entry_id` is the durable structural-sharing identity across
@@ -1298,16 +1320,16 @@ U0 tests require `Object.is` for unchanged cross-generation entries, inequality
 for changed/encrypted entries, mutation failure under freeze, release of
 unreachable arena members, optional-presence distinction, collision fallback,
 and byte/semantic immutability of source manifests after encrypt/defer/fold.
-U2 tests additionally force the 8,192/8 MiB cap through success, thrown sink,
+U4 tests additionally force the 8,192/8 MiB cap through success, thrown sink,
 CAS retry, and cancelled cursor paths and require every lease count to return
 to zero.
 
-### Rebuildable cache and plan memory (part of U2, not a hidden exception)
+### Rebuildable cache and plan memory (part of U4, not a hidden exception)
 
 The current `HashCache`, `DirCache`, `EncryptAddressCache`, and tracked-path
 cache each load a workspace-sized JSON object/array/`Map`; DirCache also
 retains child arrays and EncryptAddressCache retains a reverse `pathOwner` map.
-They do not survive U2 in that form. Their replacement is one independent
+They do not survive U4 in that form. Their replacement is one independent
 `.rbox/state/cache-v2.db`, opened through a non-authoritative cache port with
 `journal_mode=TRUNCATE`, `synchronous=NORMAL`, an 8 MiB page cache, one writer,
 and no connection to the state authority transaction. Corruption/context
@@ -1396,9 +1418,9 @@ binds its digest. Missing/unreadable/oversize/malformed rule evidence returns
 do not prune, and refuse purge. No caller falls back to the current
 workspace-sized `gitLayers`, rule-source arrays, or permissive matching.
 
-The old three cache JSON files and every legacy tracked-path cache JSON are not parsed or migrated on U2 startup—that
+The old three cache JSON files and every legacy tracked-path cache JSON are not parsed or migrated on U4 startup—that
 would recreate the peak this design removes. They are rebuildable evidence, so
-U2 atomically parks them under an id-scoped `.rbox/state/cache-v1-retired/`
+U4 atomically parks them under an id-scoped `.rbox/state/cache-v1-retired/`
 name after creating the empty v2 cache, cold-populates rows through the normal
 scan/encryption paths, then deletes the parked copies only after a successful
 bounded scan. Failure leaves either old cache files or the parked copies for
@@ -1568,7 +1590,7 @@ lines, so the "JSON-backed entry points (`:715-763`)" citation ran past EOF and
 is withdrawn; and the canonical receipt is `canonicalReceipt` at `:152`, while
 `:157-161` is `normalizeRel`. The other four cited ranges re-verified exact.
 Line numbers in this document are review evidence, not implementation
-addresses — U2 re-derives every peak by symbol name.
+addresses — U4 re-derives every peak by symbol name.
 
 ### Push: ordered candidate, bounded work, explicit wire wall
 
@@ -1729,7 +1751,7 @@ entries, all non-wire manifest metadata together must add <64 MiB JS heap, not
 windows and arena/cache charges; it backpressures producers before that total,
 and CI records peak live entry/action objects for every row.
 
-U2 removes the daemon's retained manifest. Post-decomposition that field is
+U4 removes the daemon's retained manifest. Post-decomposition that field is
 `this.local.manifest` (`src/cli/daemon/daemon.ts`, 16 read sites), owned by
 `LocalAuthority` (`src/cli/daemon/local-observation-transition.ts`), not a
 `this.manifest` on the daemon class — the port replacement therefore lands on
@@ -1761,11 +1783,11 @@ ports and are budgeted, not merely measured:
 - `DeltaCommitAdapter` retains BASE+target manifests, two N-sized file maps,
   repo maps, D operations and their sorted array, validation collections,
   blob refs/refset, and encoding/compression/encryption buffers. If delta loses
-  its size comparison, U2 releases all delta-only graphs/buffers before it may
+  its size comparison, U4 releases all delta-only graphs/buffers before it may
   admit the fallback snapshot encoder;
 - `BlobRefCommitAdapter` owns upload/refset construction and commit retry's N-sized
   `blobRefs`, `uploaded`, `needsUpload`, audit-`seen`, and address-dedup
-  collections. Before U2 leaves the wire adapter they move to the candidate
+  collections. Before U4 leaves the wire adapter they move to the candidate
   stage tables; only the final signed-protocol `blobRefs` array/refset bytes
   remain an unavoidable full wire allocation.
 
@@ -1825,14 +1847,14 @@ variable (v6 R4-CODE item 8). 161's is `RBOX_RESET_PARSE_BUDGET_BYTES`
 That variable governs the reset/migration parse admission and is unchanged by
 163. The wire ledger's `H` is a separate process-wide budget for wire
 materialization; the two are never conflated, aliased, or defaulted from each
-other, and U2 ships `RBOX_PROCESS_BUDGET_BYTES` as a genuinely new knob with
+other, and U4 ships `RBOX_PROCESS_BUDGET_BYTES` as a genuinely new knob with
 its own doctor line.
 
 `F_runtime` is
 `align4096(max(8 MiB,ceil(1.25 * M)))`, where `M` is the maximum unattributed
 live-byte increase measured across the isolated supported-Bun boundary fixture
 suite after subtracting every other term. It is generated and frozen per
-supported Bun/V8 build before U2 can enable; a runtime with no calibrated value
+supported Bun/V8 build before U4 can enable; a runtime with no calibrated value
 is refused. This replaces the unexplained flat 32 MiB workspace number.
 
 A reservation for a dropped JS reference remains live until the adapter ends
@@ -1873,7 +1895,7 @@ The existing envelope plaintext ceiling is 512 MiB. The declared 64 MiB
 definition in `src/engine/manifest-validate.ts` plus a re-export in
 `src/engine/index.ts`, with no comparison, no throw, and no test referencing it
 (v6 R4-CODE item 12; v5's "not an effective admission at every call site"
-understated this — the constant is dead). U2 makes it an explicit outgoing pre-materialization cursor
+understated this — the constant is dead). U4 makes it an explicit outgoing pre-materialization cursor
 count and a post-serialization assertion. Inbound, immediately after
 authentication/decompression and **before** `JSON.parse` or ordinary object
 materialization, the body-length/token scan enforces the same 64 MiB logical
@@ -2307,7 +2329,7 @@ Sidecars precede their main (1–3 before 4) for the same reason the C1 vector
 orders them that way. Explicitly **not** cleanup items, in any branch: the
 active DB, the control record itself (retired last, separately), `Q`, the Q
 sibling (already absent at M6), the fixed and immutable legacy-JSON backups,
-`cache-v1-retired/` parked caches (owned by U2's cache retirement, not by
+`cache-v1-retired/` parked caches (owned by U4's cache retirement, not by
 migration), and every legacy reset artifact in the retained-JSON branch.
 
 The C1 source-change retirement vector uses the same eight roles plus the
@@ -3382,7 +3404,7 @@ single highest-value change in v6.
 **4. Make all U3 migration entry unreachable until U4 reset/quarantine support
 is complete, rather than merely default-off. ADOPTED.** Default-off is a flag;
 unreachable is a property. U3's migration entry point is compiled behind the
-U4 capability predicate: a build without complete DB-artifact reset/quarantine
+U2 capability predicate: a build without complete DB-artifact reset/quarantine
 support does not merely decline to migrate, it has no code path that can. This
 also removes a whole class of "the flag was flipped on the wrong host"
 incident.
@@ -3391,8 +3413,16 @@ incident.
 centralized state/CAS seam, temporarily retaining a production whole-state
 adapter, then replace materialization with cursor ports — rather than coupling
 authority migration, engine rewrite, reset conversion, and rollout into one
-big-bang 2.0 branch. QUALIFIED YES for U1–U2; NOT AVAILABLE for U3–U4.
-RAISED AS QUESTION 1 FOR THE ORCHESTRATOR.**
+big-bang 2.0 branch. ADOPTED, with conditions. The U-slice plan below is
+restructured around it.**
+
+Provenance, stated plainly: the founder's leaning was "backend-first if the
+fold agrees", explicitly conditioned on verified analysis rather than issued as
+a decree. V6's first draft had reached a *qualified* yes ("superior for U1–U2,
+unavailable for U3–U4") and flagged it as an open question. Re-examining it
+against `src/` — rather than against the reviews' description of `src/` —
+changed the answer to an unqualified yes and exposed an error in that draft's
+own reasoning. Both are recorded below.
 
 The argument for it is strong and v6 does not pretend otherwise:
 
@@ -3408,44 +3438,151 @@ The argument for it is strong and v6 does not pretend otherwise:
   do not actually require the memory rewrite; U2's cursor discipline is a
   second, separable win.
 
-The argument against, and why it is not a clean win:
+**The decisive argument, which neither review made:** backend-first makes the
+irreversible step coincide with the *smallest* diff. `Q` is the only one-way,
+whole-workspace, cross-binary act in this design. Under v5's ordering it lands
+in the same release as a complete engine rewrite, so the release that can never
+be undone in place is also the release with the largest possible semantic
+differential — precisely the risk R4-ROLLOUT B4 identified and could only
+propose to test, not to reduce. Under backend-first the flip lands with the
+engine **byte-identical**: same scan, same reconcile, same apply, same push,
+same wire output, with only the bytes under the seam changed. The wire-visible
+differential at the flip is trivially clean *by construction* rather than by
+testing, and the engine's semantic changes then arrive in six small,
+independently shippable, independently revertible slices — each of which can be
+reverted, because none of them touches authority.
 
-- **It contradicts the memory contract, not merely the schedule.** "Temporarily
-  retain a production whole-state adapter" is exactly the
-  `loadState(): SyncState` compatibility adapter this design forbids outside
-  migration/tests. Keeping it in production means keeping the 59 MB
-  materialization, the 52× admission, and the daemon's retained manifest —
-  i.e. shipping SQLite while keeping every symptom that motivated SQLite. The
-  design would be carrying two state planes and none of the benefits for the
-  duration.
-- **The authority flip cannot be phased.** `Q` is a one-way, whole-workspace,
-  cross-binary authority change. There is no "partly migrated" state that both
-  a 1.x and a 2.0 binary can read, which is the entire reason for the barrier.
-  So U3–U4 must land as a unit regardless of how U1–U2 are sequenced.
-- **Reset conversion is coupled to the artifact format, not to the schedule.**
-  The moment `state.db` is authority, the 138 file-swap protocol is operating
-  on `.db` artifacts; U4 cannot lag U3 in the field.
+That inverts the natural objection ("you take the irreversible risk before the
+payoff"). The irreversible risk is *smaller* when taken early, because it is
+taken alone.
 
-Honest conclusion: **the backend-first sequencing is superior for U1 and U2 and
-unavailable for U3 and U4.** That suggests a hybrid neither v5 nor the codex
-review states — land U1's store and U2's cursor ports incrementally on `main`
-behind the existing seam, with JSON still authoritative and no whole-state
-adapter retained in production, and open the `2.0` branch only for U3–U5. That
-would shorten the branch's life from the whole project to its last third and
-make the port-forward ledger nearly empty.
+Three objections from v6's first draft, re-examined against `src/`:
 
-V6 does **not** unilaterally restructure the plan to that shape: it changes
-what ships on the stable line, it is a founder-level call about risk on a
-line with four external users, and it interacts with the `B0` gate. It is
-Question 1 at the top of this document.
+- **"It contradicts the memory contract."** Half true, and the half that is
+  true is bounded. Verified: `StateSavePacket` is already
+  `{expectedStream, expectedNonce, sourceGlobalSeq, global?, repos[]}` and
+  `StateSaveResult` is already `accepted | rejected(reason) | busy |
+  unsupported` (`src/cli/sync-state-model.ts:332-344`) — that is
+  structurally the design's `applyCasPacket` and its result union, already in
+  production. The **write** path is therefore already a delta, so a SQLite
+  store implements it natively as a set-difference into rows: the
+  **O(dirty-rows) authority write lands at the flip, not at the end**. Only the
+  *read* keeps whole-state materialization, and only until the U4 slices
+  replace it. So the adapter phase carries the memory symptom, not the I/O
+  symptom, and it carries it for a bounded, gated interval.
+- **"The authority flip cannot be phased."** Correct, and irrelevant to the
+  ordering. Nobody proposed phasing the flip; backend-first moves it, intact.
+- **"Reset conversion is coupled to the artifact format, so U4 cannot lag
+  U3."** Correct, and this is the draft's actual error: the right conclusion is
+  not "therefore they must ship together at the end" but **"therefore reset
+  conversion moves in front of the flip."** Reset/quarantine on `.db` artifacts
+  depends only on the store existing — not on any engine port. Sequenced
+  first, it also structurally satisfies codex alternative 4: migration entry
+  cannot exist before reset support, because reset support ships first.
+
+Feasibility, verified rather than assumed:
+
+- `src/cli/sync-state-store.ts` (460 lines) is the sole disk funnel for the
+  engine. `loadRawState` is the single structured reader; exactly four
+  functions physically write the state file (`applyStateSavePacket`,
+  `writeWholeStateUnsafe` behind `saveState`/`saveStateUnsafeLegacyOrTest`,
+  `ensureTelemetryBindingId`, `installGenesisResetStateUnderHeldLock`).
+- That funnel is **CI-enforced, not incidental**:
+  `src/cli/sync-git/base-composer-structure.test.ts:78,95` pins whole-state
+  persistence to a closed per-module allowlist with exact counts, so a new
+  write site fails the build today. The swap inherits an existing structural
+  guarantee rather than needing a new one.
+- `loadState` has 26 production call sites across 9 modules (plus two sites
+  that pass it as a value); `applyStateSavePacket` has 7 across 6 modules
+  (plus three injected defaults); every one of them resolves through the
+  `src/cli/config.ts` barrel, whose surface is itself pinned by
+  `config-surface.typecheck.ts`. **None need to change**, because a backend
+  swap preserves their signatures. That is the definition of a behind-the-seam
+  swap.
+- Whole-state coupling is broad by module count but shallow by depth:
+  `state.lastSyncedManifest` appears in 22 production modules, but the N-sized
+  `.files` array is touched in only four (`ignore-cmd.ts`, `sync/pull.ts`,
+  `sync-state-model.ts`, `sync-state-store.ts`). Leaf modules receive an
+  already-materialized state as a parameter; they do not load it. U4's cursor
+  slices therefore have a small true surface.
+- **The one genuine blocker is reset-v1, and it is exactly what U2 exists to
+  remove.** `reset-journal.ts`, `reset-state.ts`, `reset-quarantine.ts`, and
+  `reset-journal-doctor.ts` (~1,500 lines) do not go through the seam at all:
+  they treat `.rbox/state.json` as an opaque byte object with
+  sha256-of-file-bytes preconditions, `boundedCopy` archives named by content
+  hash, and `fs.rename` as the commit primitive, plus raw `boundedRead`s that
+  bypass `loadRawState` (`reset-state.ts:297,463`) and a protocol-lock identity
+  derived from the state path. This is precisely the keystone's subject matter
+  and precisely why v6 sequences reset conversion **before** the flip: without
+  U2, a SQLite backend behind the seam would leave reset operating on a file
+  that is no longer authority. Independent verification reached this
+  conclusion from the opposite direction, which is why v6 treats the ordering
+  as structural rather than preferential.
+- The only production code that reads `.rbox/state.json` outside the store and
+  outside reset is `doctor-cmd.ts:401`, a diagnostic that parses it directly
+  for a health check and substring-matches its own error strings. It is
+  already assigned a row in the C4 consumer sweep and must move behind the
+  store or become authority-aware.
+
+Conditions attached to the adoption — the plan below is not backend-first
+without them:
+
+1. **No-regression gate at the flip.** The adapter keeps whole-state
+   materialization *and* adds a SQLite page cache, so the flip could plausibly
+   be a memory regression. It may not ship unless trusted `rbox status`
+   latency and daemon steady-state RSS on the 112k corpus are **no worse than
+   the 1.x baseline**. "No worse" is the bar at the flip; the improvements are
+   U4's to earn.
+2. **The whole-state adapter is time-boxed and inventoried.** It is the single
+   permitted production use of `loadState(): SyncState`. A CI inventory counts
+   its call sites, that count may only decrease, and it must reach zero by
+   U4f. The compile-time ban on whole-state access elsewhere applies from U1.
+3. **The differential rig runs per slice, not once.** The flip's differential
+   is clean by construction and is still run as the control; every U4 slice
+   then re-runs the same-corpus manifest diff and the two-host rig. This is
+   strictly more testing than v5's single differential, spread across smaller
+   diffs.
+4. **`B0` is unchanged and still blocks everything.** Moving the flip earlier
+   moves it *closer* to the barrier dependency, so the barrier's adoption gate
+   becomes more load-bearing, not less.
+
+What this costs, stated honestly: the four external users take the one-way
+migration in the 2.0 release and receive the latency/memory wins across
+subsequent 2.x releases. V6 judges that acceptable because the flip release is
+small, gated on no-regression, and recoverable by re-adoption — but it is a
+judgment about real users, and it is the residual question at the top of this
+document.
+
+What this buys, beyond the risk argument: the `2.0` branch shrinks from "the
+whole project" to `B0 → U3`, the port-forward ledger becomes nearly empty, the
+U4 slices land on `main` as ordinary 2.x releases, and the first fleet-visible
+signal arrives months earlier.
 
 ## Rollout, gates, and delivery plan (v6 R4-ROLLOUT)
 
 The correctness core survived five rounds; the rollout was 20 lines and had
-been reviewed by nobody. This section replaces it. Its gate structure is:
-**U0 and U1 may start immediately** (internal, unshippable, zero fleet
-exposure). **`B0` must complete and be adopted before U3 may be enabled.**
-**U2 may not close, and U3 may not begin, until the exits below are met.**
+been reviewed by nobody. This section replaces it, and v6 reorders it around
+the backend-first sequencing adopted above.
+
+**Order: `B0` → `U0` → `U1` → `U2` (reset on DB artifacts) → `U3` (migration +
+`Q` flip + whole-state adapter; this is where 2.0 ships) → `U4a–U4f` (engine
+slices, ordinary 2.x releases) → `U5` (bake + kill criterion).**
+
+What moved, and what did not. The authority machinery is untouched: M0–M7,
+the `Q` predicate and barrier, the migration fencing, the crash/resume table,
+the retirement and cleanup subprotocols, and every halt are exactly as
+specified above. Only the *schedule* changed — reset conversion moved in front
+of the flip (it depends on the store, not the engine), and the engine rewrite
+moved behind it (it depends on the flip, not the reverse). V5's numbering
+`U2 = engine`, `U3 = migration`, `U4 = reset` is superseded; the mapping is
+`v5 U4 → v6 U2`, `v5 U3 → v6 U3`, `v5 U2a–U2f → v6 U4a–U4f`.
+
+Gate structure: **`U0` and `U1` may start immediately** (internal, unshippable,
+zero fleet exposure). **`B0` must complete and be adopted before `U3` may be
+enabled.** **`U2` must complete before `U3` may begin** — migration entry is
+compiled behind the reset-capability predicate, so a build without complete
+DB-artifact reset support has no code path that can migrate. **Each `U4` slice
+must pass the differential rig before the next begins.**
 
 ### B0 — pre-U0 stable-line barrier release (blocking dependency)
 
@@ -3511,46 +3648,66 @@ Additional v6 exits:
   makes user negations unable to drop `.rbox` from the prune set. WAL/SHM
   sidecars generate zero watcher events.
 
-### U2a–U2f — the engine port (decomposed; R4-ROLLOUT H1)
+### U2 — reset/quarantine on DB artifacts (moved ahead of the flip)
 
-U2 as written was not a slice; it was most of the project with no falsifiable
-checkpoint inside it. It decomposes into six units, each with an exit:
+This is v5's U4, resequenced. It must precede the authority flip, because the
+moment `state.db` is authority the 138 file-swap protocol is operating on
+`.db` artifacts — and because reset-v1 is the one subsystem that does **not**
+go through the state seam. Verified: `reset-journal.ts`, `reset-state.ts`,
+`reset-quarantine.ts`, and `reset-journal-doctor.ts` treat the state file as an
+opaque byte object (sha256-of-bytes preconditions, content-hash-named archive
+copies, `fs.rename` as the commit primitive, raw `boundedRead`s that bypass
+`loadRawState`). A backend swap that left this untouched would leave reset
+transacting over a file that is no longer authority.
 
-| Unit | Scope | Exit criterion |
-|---|---|---|
-| **U2a** | `cache-v2.db`: hash, directory, encrypt-address ports + the `cache-v1-retired/` parking protocol + the `adopt-cache.ts` invalidation-list update | cold-rebuild parity on the 112k corpus; adoption invalidates every cache the scan path can consult (the C4 sweep's highest-risk row) |
-| **U2b** | `TrackedPathIndexPort` + `IgnoreRuleIndexPort`, including the `TrackedIndexUnavailable` / `IgnoreRulesUnavailable` fail-closed verdicts | differential: identical tracked/ignored verdicts vs 1.x on the corpus, plus injected-unavailability tests proving no permissive fallback |
-| **U2c** | LOCAL plane: `ScanGenerationSink`, watcher `LocalPatchPort`, generation-CAS local head | full scan produces a byte-identical ordered LOCAL membership vs 1.x; incomplete scan invisible |
-| **U2d** | BASE/REMOTE: reconcile cursors, sealed plan, `ApplyPlanPort` + `ApplyReceiptOraclePort` | `canonicalReceipt` digest reproduced byte-for-byte from cursors; pull apply parity on the corpus |
-| **U2e** | Push: WIRE-CANDIDATE stage, `GitStateCursorPort`, both outcome ports, `applyCasPacket` | wire-visible differential (below) |
-| **U2f** | Materialization budget: `WireAllocationLedger`, `ConstructionPeakV1`, `F_runtime` calibration, the CI peak ledger | every budget row in the table above measured and inside its cap on the 112k corpus |
+Scope: the entire normative reset re-derivation above — the shared bounded
+decoder, the journal-independent namespace inventory with both branches, the
+J0/W1/W2/W3 rows, the correlated P/R/I/Z table on `.db` artifacts, and the
+quarantine protocol.
 
-**U2 exit criterion — wire-visible semantics differential (R4-ROLLOUT B4).**
-The `Q` barrier is per-host and local; two hosts sharing a workspace never see
-each other's state file. The real skew risk is that U2 rewrites ignore-rule
-evaluation, tracked-path membership, deferral/carry, and mass-delete
-decisioning — all of which are wire-visible through the manifest they produce.
-"84 unchanged" covers the protocol, not the semantics fed into it. U2 does not
-close until:
-1. **Same-corpus manifest diff**: the same workspace corpus, pushed by a 1.x
-   binary and by a 2.0 binary, produces identical manifests (files, ordering,
-   Git sections, deferral/carry decisions) modulo timestamps; any difference is
-   either fixed or explicitly ratified as an intended change.
-2. **Two-host differential rig**: one workspace, one 2.0 host and one 1.x host,
-   both syncing — pull/push interleaved, including an ignore-rule change, a
-   tracked-repo change, and a mass-delete-shaped change. Neither host may
-   observe a spurious delete, a lost deferral, or a divergent manifest.
+Exits: the full crash rig (process kill and power-cut snapshots at every
+labeled boundary); the frozen temp-grammar handling; the
+`compareResetZEntries` unification; the quarantine `publishCommitRecord` temp
+leak fix; the `COMMITTED + journal absent + candidate present` fixtures; and
+the legacy-JSON-branch fixtures. Migration entry is compiled behind this
+unit's capability predicate, so U3 is not merely gated on U2 by policy — it is
+unreachable without it.
 
-**U2 first fleet checkpoint (R4-ROLLOUT H2).** U0/U1 produce nothing
-fleet-observable, so the first falsifiable signal is not after U0. It is a 2.0
-dev build running a **throwaway workspace through the genesis path**
-(M0 absent/absent/absent) after U2c — before migration exists at all.
-Genesis-path validation is an explicit U2 deliverable, and that checkpoint is
-the first go/no-go the founder can personally observe.
+### U3 — migration, the `Q` flip, and the whole-state adapter (2.0 ships here)
 
-### U3 — migration and the barrier
+Blocked on `B0` exits and on U2. This is the release that carries the one-way
+authority change, and under the backend-first sequencing it carries **nothing
+else**: the engine is byte-identical across the flip, reading and writing
+through a whole-state compatibility adapter over the store.
 
-Blocked on `B0` exits. Additional v6 exits:
+The adapter's shape is not arbitrary. Verified: `StateSavePacket` is already
+`{expectedStream, expectedNonce, sourceGlobalSeq, global?, repos[]}` with the
+result union `accepted | rejected(reason) | busy | unsupported`, i.e. the
+write path is already a delta and already CAS-shaped. So the adapter is
+asymmetric, and deliberately so:
+
+- **Writes go native.** `applyStateSavePacket` maps onto the store's packet
+  semantics and set-diffs into rows, so authority writes become O(dirty rows)
+  **at the flip**. The per-cycle full-serialize disappears here, not in U4.
+- **Reads stay whole.** `loadState`/`loadRawState` materialize a complete
+  `SyncState` from rows. This preserves every caller signature and therefore
+  every caller, at the cost of keeping the materialization peak until U4
+  replaces it cursor by cursor.
+
+Additional v6 exits:
+- **No-regression gate (backend-first condition 1).** The flip may not ship
+  unless trusted `rbox status` latency and daemon steady-state RSS on the 112k
+  corpus are no worse than the 1.x baseline. The adapter keeps whole-state
+  materialization and adds a SQLite page cache, so this is a real risk, not a
+  formality.
+- **Differential control.** The same-corpus manifest diff and the two-host rig
+  (below) run at the flip, where they must be clean *by construction* — the
+  engine did not change. A failure here means the store is not semantically
+  faithful, which is exactly what the gate exists to catch.
+- **Adapter inventory.** The whole-state adapter is the single permitted
+  production use of `loadState(): SyncState`. CI counts its call sites from
+  this release forward; the count may only decrease and must reach zero by
+  U4f.
 - **Migration duration budget and progress UX (R4-ROLLOUT M1).** M3 imports
   112k files in one transaction; M4 runs full `integrity_check` plus a second
   semantic digest; all under the workspace mutex with `synchronous=FULL`. The
@@ -3564,15 +3721,52 @@ Blocked on `B0` exits. Additional v6 exits:
   fail-closed halt classes, each of which stops sync, and two of the four
   external users are non-technical. Every new halt reason ships with a
   plain-English doctor entry naming what happened, what is safe, and the one
-  next action — plus its non-interactive twin. This is a U3/U4 deliverable and
+  next action — plus its non-interactive twin. This is a U2/U3 deliverable and
   a merge gate, not documentation debt.
 
-### U4 — reset/quarantine on DB artifacts
+**First fleet checkpoint (R4-ROLLOUT H2).** U0/U1 produce nothing
+fleet-observable. Under this sequencing the first falsifiable signal arrives
+earlier than it would have: a 2.0 dev build running a **throwaway workspace
+through the genesis path** (M0 absent/absent/absent), which is reachable as
+soon as U1's store and U2's reset support exist — before migration is enabled
+on any real workspace. Genesis-path validation is an explicit U3 deliverable
+and is the first go/no-go the founder can personally observe.
 
-Additional v6 exits: the frozen temp-grammar handling, the
-`compareResetZEntries` unification, the quarantine `publishCommitRecord` temp
-leak fix, and the `COMMITTED + journal absent + candidate present` fixtures,
-all specified above.
+### U4a–U4f — the engine port (decomposed; R4-ROLLOUT H1)
+
+V5's U2. It was not a slice; it was most of the project with no falsifiable
+checkpoint inside it. Under backend-first each unit is an ordinary 2.x
+release on `main`: independently shippable, independently measurable, and
+independently **revertible**, because none of them touches authority.
+
+| Unit | Scope | Exit criterion |
+|---|---|---|
+| **U4a** | `cache-v2.db`: hash, directory, encrypt-address ports + the `cache-v1-retired/` parking protocol + the `adopt-cache.ts` invalidation-list update | cold-rebuild parity on the 112k corpus; adoption invalidates every cache the scan path can consult (the C4 sweep's highest-risk row) |
+| **U4b** | `TrackedPathIndexPort` + `IgnoreRuleIndexPort`, including the `TrackedIndexUnavailable` / `IgnoreRulesUnavailable` fail-closed verdicts | differential: identical tracked/ignored verdicts vs 1.x on the corpus, plus injected-unavailability tests proving no permissive fallback |
+| **U4c** | LOCAL plane: `ScanGenerationSink`, watcher `LocalPatchPort`, generation-CAS local head | full scan produces a byte-identical ordered LOCAL membership vs the adapter path; incomplete scan invisible |
+| **U4d** | BASE/REMOTE: reconcile cursors, sealed plan, `ApplyPlanPort` + `ApplyReceiptOraclePort` | `canonicalReceipt` digest reproduced byte-for-byte from cursors; pull apply parity on the corpus |
+| **U4e** | Push: WIRE-CANDIDATE stage, `GitStateCursorPort`, both outcome ports | wire-visible differential (below) |
+| **U4f** | Materialization budget: `WireAllocationLedger`, `ConstructionPeakV1`, `F_runtime` calibration, the CI peak ledger; **the whole-state adapter is deleted** | every budget row in the table above measured and inside its cap; adapter call-site count is zero |
+
+**Per-slice exit criterion — wire-visible semantics differential
+(R4-ROLLOUT B4).** The `Q` barrier is per-host and local; two hosts sharing a
+workspace never see each other's state file. The real skew risk is that these
+slices rewrite ignore-rule evaluation, tracked-path membership, deferral/carry,
+and mass-delete decisioning — all wire-visible through the manifest they
+produce. "84 unchanged" covers the protocol, not the semantics fed into it.
+Under backend-first this differential runs **once per slice** rather than once
+for the whole rewrite, against the flip's clean control:
+1. **Same-corpus manifest diff**: the same workspace corpus, pushed by the
+   previous release and by the candidate, produces identical manifests (files,
+   ordering, Git sections, deferral/carry decisions) modulo timestamps; any
+   difference is either fixed or explicitly ratified as an intended change.
+2. **Two-host differential rig**: one workspace, one candidate host and one
+   1.x host, both syncing — pull/push interleaved, including an ignore-rule
+   change, a tracked-repo change, and a mass-delete-shaped change. Neither host
+   may observe a spurious delete, a lost deferral, or a divergent manifest.
+
+A slice that fails its differential is reverted, not patched forward; that
+option exists only because authority is already settled.
 
 ### U5 — fleet bake, and the named kill criterion
 
@@ -3605,10 +3799,19 @@ are the orchestrator's to set — see the questions at the top):
   23 cycles); zero unexplained halts during the bake; and the U2 differential
   clean.
 - **No-ship** is not "try harder". If the criterion is missed after one
-  remediation cycle, the named alternatives are **re-scope** (ship U0–U2's
-  measured wins on the 1.x line where they are independently valid, and defer
-  the authority migration) or **revert** the 2.0 branch. Both are first-class
-  outcomes, consistent with the standing revert-is-an-option rule.
+  remediation cycle, the named alternatives are **stop after the last passing
+  slice** (the flip and the slices that met their gates stay; the remainder is
+  abandoned, leaving a working system rather than a half-finished one) or
+  **revert the failing slice**. Both are first-class outcomes, consistent with
+  the standing revert-is-an-option rule.
+- Backend-first changes the shape of this gate for the better. Under v5's
+  ordering, "no-ship" meant reverting a branch containing the authority
+  migration *and* the entire engine rewrite — in practice unrevertible once
+  any workspace had flipped. Under this ordering the kill criterion is
+  evaluated per slice against settled authority, so a miss costs one slice
+  rather than the project. The one thing that still cannot be reverted in
+  place is the flip itself, which is why it carries its own no-regression gate
+  at U3 and why recovery is re-adoption.
 
 **Steady-state disk budget (R4-ROLLOUT M2).** New permanent residents:
 `state.db`, its WAL (backpressure only at 256 MiB), `cache-v2.db`, the fixed
@@ -3623,8 +3826,17 @@ source. Deleting them is safe precisely because they were never authority.
 
 ### 2.0 branch merge process (R4-ROLLOUT H3)
 
-A long-lived branch across a fast-moving `main` needs a process, not an
-intention. Measured on `main`: **1,019 commits in the last 60 days.**
+**The backend-first restructure mostly dissolves this problem, which is one of
+its larger benefits.** The `2.0` branch now spans `B0 → U3` (store, schema,
+reset conversion, migration) instead of the whole project, and the U4 engine
+slices land on `main` as ordinary 2.x releases. The branch's lifetime falls
+from the full project to roughly its first third, and the port-forward ledger
+— the expensive part — becomes nearly empty, because the files U4 rewrites are
+still being maintained on `main` while U4 rewrites them there.
+
+The process below therefore applies to a shorter branch, but it is not
+optional: even `B0 → U3` spans months of a fast-moving `main`. Measured on
+`main`: **1,019 commits in the last 60 days.**
 
 One reviewer figure is corrected here: `src/cli/daemon.ts` and `src/cli/sync.ts`
 show ~2,400 and ~2,600 lines of churn in that window, but they are now **10-
@@ -3710,7 +3922,9 @@ refuted or corrected rather than folded as stated.
 | CODEX 5 — M6 cleanup set called closed but never enumerated | **Folded** as an eight-row literal inventory with roles, paths, starting and terminal dispositions, plus an explicit not-a-cleanup-item list. | "Literal cleanup inventory" |
 | CODEX 6 + ROLLOUT B3 — no abort story; `.pre-163.bak` footgun | **Folded.** Verified: no version field, unchecked cast, and the sequence guard gets *more* permissive as the sequence goes backwards. Backup path moved out of the `state.json` neighbourhood, given a non-JSON preamble so restoration fails closed, pre-Q and post-Q abort procedures specified, downgrade floor named. | "Supported abort procedure and the `.pre-163.bak` footgun" |
 | CODEX 8 — migration can refuse the states that motivated it | **Folded.** Supported envelope defined with real numbers; refusal UX specified; streaming import recorded as future work with its reason. | "Supported migratable envelope" |
-| CODEX simpler alternatives (5 items) | **Argued explicitly, not silently taken or dropped.** Two adopted, one partially adopted and pre-authorized as a U3 simplification, one rejected with its cost priced, one raised to the orchestrator. | "Rejected and deferred alternatives" |
+| CODEX simpler alternatives (items 1–4) | **Argued explicitly, not silently taken or dropped.** One adopted in full (`B0`), one adopted (unreachable-not-default-off, now structurally satisfied by the resequencing), one partially adopted and pre-authorized as a U3 simplification (permanent reserve), one rejected with its cost priced (terminal-authority-at-M6). | "Rejected and deferred alternatives" |
+| CODEX alternative 5 — backend-first sequencing vs big-bang 2.0 | **ADOPTED; the U-slice plan is restructured.** V6's first draft reached a qualified yes and flagged it as a question. The orchestrator relayed a founder leaning — "backend-first if the fold agrees", explicitly conditioned on verified analysis, not issued as a decree — and the analysis was redone against `src/` rather than against the reviews' description of it. That changed the answer to an unqualified yes, produced an argument neither review made (the flip coincides with the *smallest* diff, so the irreversible step is safer taken early and alone), and **falsified the first draft's own third objection**: "reset conversion is coupled to the artifact format, so it cannot lag the flip" does not imply "they ship together at the end", it implies **reset moves in front of the flip**. Order is now `B0 → U0 → U1 → U2 reset → U3 flip → U4a–U4f engine → U5`. The M0–M7 machine, `Q` predicate and barrier, and all migration fencing are unchanged — only the schedule moved. Four conditions attached (no-regression gate at the flip; time-boxed and CI-inventoried whole-state adapter; per-slice differential; `B0` unchanged). | Question 1; "Rejected and deferred alternatives" item 5; the whole rollout section; Mechanism summary; acceptance-targets preamble |
+| Seam feasibility (v6 verification, no reviewer claim) | **Verified before restructuring, not assumed.** `sync-state-store.ts` is the sole engine disk funnel and is CI-enforced by an existing allowlist test with exact per-module counts; `loadState` has 26 production call sites across 9 modules and `applyStateSavePacket` 7 across 6, all resolving through one pinned barrel, so a behind-the-seam swap changes none of them; the N-sized `.files` array is touched in only four modules. `StateSavePacket`/`StateSaveResult` are already packet- and CAS-shaped, so O(dirty-row) writes land at the flip. The one genuine blocker — reset-v1's ~1,500 lines of byte-level transaction over the state file — is exactly what the resequencing puts first. | "Rejected and deferred alternatives" item 5, feasibility bullets |
 | ROLLOUT B1 — no prerelease channel in `scripts/release.ts` | **Folded** as a normative pre-U5 dependency. Verified in full, plus one addition: after an rc publish the anti-rollback guard would *refuse* a subsequent stable hotfix. Pipeline work stays out of 163's scope. | U5 section |
 | ROLLOUT B2 — barrier release is a hard prerequisite, not a slice | **Folded** as `B0` with an adoption gate; merged with CODEX 2. | `B0` |
 | ROLLOUT B4 — no wire-visible semantics differential | **Folded** as U2's exit criterion: same-corpus manifest diff plus a two-host (2.0 + 1.x, one workspace) rig. | U2 exit |
@@ -3726,6 +3940,9 @@ refuted or corrected rather than folded as stated.
 | ROLLOUT M5 — new halt surface has no user-facing copy | **Folded**: every new halt reason ships a plain-English doctor entry plus a non-interactive twin, as a merge gate. | U3 section |
 | ROLLOUT "verified clear" — `.rbox/` WAL churn is a non-issue | **Confirmed independently** and stated once in the design, as the reviewer suggested. | U1 section |
 
-V6 remains pending final ratification and is not implementation authority. Four
-questions at the top of this document are open, and Question 1 (backend-first
-sequencing) is a restructuring decision v6 deliberately did not take alone.
+V6 remains pending final ratification and is not implementation authority. The
+questions at the top of this document are open. Question 1 was resolved during
+the fold — the founder's leaning plus a verified analysis agreed on
+backend-first, so v6 restructured the plan rather than only flagging it — but
+its residual (external users take the one-way migration before the latency and
+memory wins) is a judgment about real people and is still owed an answer.

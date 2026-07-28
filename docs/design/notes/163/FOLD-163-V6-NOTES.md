@@ -38,8 +38,55 @@ Both are recorded in the design and assigned to U4.
 | Schema | `RepoRecord` mapping rebased on the current interface (`packedRefsIdentity`, `attempt`, `resolutionReceipt` added as typed columns); `resolutionIntent` given a strip-before-digest disposition that satisfies M4 without resurrecting it; a schema rebase gate added so it cannot drift again |
 | Migration | write-side `Q` barrier made a hard pre-U0 gate with an M0 quiescence/capability predicate and a degraded-writer fixture; supported abort procedure specified; the fixed backup moved and made structurally non-restorable; downgrade floor named; supported migratable envelope defined; M6 cleanup set enumerated literally |
 | v4 amendments in place | the "rebuilds a revision-correct pair" paragraph, the `exact halted M0–M7` crash-table cell, the halt-clearing paragraph, and the "intent durable at revision `r`" phrase |
-| Rollout | replaced: `B0` barrier unit, U2a–U2f with per-unit exits, wire-visible differential as U2's exit, genesis-path checkpoint, prerelease-channel dependency, named ship/no-ship criterion, disk and duration budgets, `bun:sqlite` contract suite and Bun 1.3.14 floor, halt copy requirement, branch merge process with a port-forward ledger |
-| New sections | "Rejected and deferred alternatives" (five codex alternatives argued, two adopted, one pre-authorized, one rejected with its cost priced, one escalated); "R4 ratification round review log" |
+| Rollout | replaced and **resequenced**: `B0` barrier unit, U2 reset ahead of the flip, U3 flip with the whole-state adapter, U4a–U4f engine slices with per-unit exits, per-slice wire-visible differential, genesis-path checkpoint, prerelease-channel dependency, named ship/no-ship criterion, disk and duration budgets, `bun:sqlite` contract suite and Bun 1.3.14 floor, halt copy requirement, branch merge process with a port-forward ledger |
+| New sections | "Rejected and deferred alternatives" (five codex alternatives argued); "R4 ratification round review log" |
+
+## The sequencing restructure (mid-fold, founder-conditioned)
+
+The fold's first draft reached a *qualified* yes on codex alternative 5
+(backend-first) and flagged it as a question rather than restructuring. The
+orchestrator then relayed a founder leaning — "backend-first if the fold
+agrees", explicitly conditioned on verified analysis rather than issued as a
+decree, with authority to restructure if the analysis concurred and to keep
+the plan and record the disagreement if it did not.
+
+The analysis was redone against `src/` rather than against the reviews'
+description of `src/`, and it concurred — unqualified. Two things came out of
+that pass that the first draft did not have:
+
+1. **The decisive argument neither review made.** Backend-first makes the one
+   irreversible act (the `Q` flip) coincide with the *smallest* diff rather
+   than the largest. Under v5's ordering the unrevertible release is also the
+   release with a complete engine rewrite in it; under backend-first the engine
+   is byte-identical across the flip, so the wire-visible differential is clean
+   by construction and the engine's semantic risk arrives in six small,
+   individually revertible slices.
+2. **The first draft's own reasoning was falsified.** It objected that "reset
+   conversion is coupled to the artifact format, so U4 cannot lag U3 — they
+   must ship together at the end." The correct conclusion is the opposite:
+   reset conversion depends on the store, not the engine, so it moves *in
+   front* of the flip. That also structurally satisfies codex alternative 4
+   (migration entry unreachable, not merely default-off).
+
+Feasibility was verified before restructuring, not assumed: the engine's disk
+seam is one 460-line module whose write sites are already pinned by a CI
+allowlist test; `loadState` has 26 production call sites and
+`applyStateSavePacket` 7, all through one pinned barrel, none of which a
+behind-the-seam swap touches; `StateSavePacket`/`StateSaveResult` are already
+packet- and CAS-shaped, so O(dirty-row) writes land at the flip rather than at
+the end. The one real blocker — reset-v1's ~1,500 lines of byte-level
+transaction over the state file — is precisely what the new ordering puts
+first.
+
+New order: `B0 → U0 → U1 → U2 (reset) → U3 (flip, 2.0 ships) → U4a–U4f
+(engine, 2.x) → U5`. Four conditions are attached and are normative: a
+no-regression gate at the flip, a time-boxed and CI-inventoried whole-state
+adapter, a per-slice differential, and `B0` unchanged. The M0–M7 machine, the
+`Q` predicate and barrier, and all migration fencing are untouched.
+
+The residual — external users take the one-way migration before the latency
+and memory wins — is left as an explicit open question, because it is a
+judgment about four real people rather than a technical finding.
 
 ## Keystone
 
