@@ -426,10 +426,11 @@ export async function restoreResetQuarantineUnderFence(root: string, bundle: str
     const bundledJournal = absoluteBundled(bundle, journalArtifact.bundled);
     const decoded = await decodeResetJournal(await resetJournalFileSource(bundledJournal));
     if (!decoded.ok) throw new Error(`reset quarantine transaction journal is invalid: ${decoded.error.code}`);
-    const observation = "stateFormat" in decoded.journal
+    const decodedJournal = decoded.journal;
+    const observation = "stateFormat" in decodedJournal
       ? await (async () => {
         const { sqliteResetFacade } = await import("./state-plane/reset/index.js");
-        return sqliteResetFacade.observeControlPlane(root, decoded.journal);
+        return sqliteResetFacade.observeControlPlane(root, decodedJournal);
       })()
       : (await observeResetJournalBytes(
         root,
