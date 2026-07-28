@@ -6,10 +6,13 @@
  * (`OwnedLock.isOwner`), but the SQLite CAS checks ownership synchronously both
  * before its writes and immediately before commit. This factory adapts the held
  * lock's synchronous, no-follow observation into the synchronous
- * `CasOwnerToken` the store consumes — and it is the ONLY mint site, so a token
- * always carries the provenance of an exact held lock rather than a bare
- * `{ isOwner }` literal. The CLI owns the factory so the engine never imports a
- * CLI type: the engine exposes `isOwnerSync`, and state-plane brands the token.
+ * `CasOwnerToken` the store consumes. `CasPacket.ownerToken` requires the
+ * BRANDED `OwnedLockCasToken`, so a bare `{ isOwner }` literal no longer
+ * type-checks at the CAS admission boundary — the token always carries the
+ * provenance of an exact held lock. This is the only PRODUCTION mint site; the
+ * single test-only seam is `owner-token-testkit.ts`. The CLI owns the factory so
+ * the engine never imports a CLI type: the engine exposes `isOwnerSync`, and
+ * state-plane brands the token.
  */
 import type { OwnedLock } from "../../../engine/git/lockfile.js";
 import type { CasOwnerToken } from "../ports.js";

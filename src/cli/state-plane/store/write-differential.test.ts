@@ -29,12 +29,13 @@ import { createStateStore, type StateStoreHandle } from "./open.js";
 import { openReadSnapshot } from "./read-snapshot.js";
 import { beginRepoTransitionStage, type SealedRepoTransitionRef, type TransitionInput } from "./transition-stages.js";
 import { applyCasPacket, type CasPacket } from "./write-packet.js";
+import { casOwnerTokenForTest } from "./owner-token-testkit.js";
 
 const roots: string[] = [];
 const LINEAGE = "b".repeat(32);
 const NONCE = "c".repeat(32);
 const STREAM = "https://api.test::ws_163::root";
-const OWNER = { isOwner: () => true };
+const OWNER = casOwnerTokenForTest(() => true);
 
 const identity: LockIdentitySource = {
   current: async () => ({ hostId: "84", bootId: "84", pid: 84, startTime: "1" }),

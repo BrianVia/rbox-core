@@ -10,7 +10,8 @@ import type { GlobalManifestMeta } from "../../sync-state-model.js";
 import { canonicalJson } from "../digest/codecs.js";
 import { sameStageBinding, type SourceStageBinding } from "../digest/repo-transition-v1.js";
 import { StageChangedError } from "../errors.js";
-import type { CasOwnerToken, CasRejectionReason, CasResult, ManifestHeader } from "../ports.js";
+import type { CasRejectionReason, CasResult, ManifestHeader } from "../ports.js";
+import type { OwnedLockCasToken } from "./owner-token.js";
 import { buildCasRetryView } from "./cas-retry-view.js";
 import {
   Rejected, applyGlobal, applyTransitions, checkPredicates, copyTransitionRowsIntoTemp,
@@ -39,7 +40,9 @@ export interface CasPacket {
   sourceGlobalSeq: number;
   global?: { stage: SealedStageRef; fileHeader: ManifestHeader; manifestMeta?: GlobalManifestMeta };
   repoTransitions: SealedRepoTransitionRef;
-  ownerToken: CasOwnerToken;
+  /** Only a branded token minted from a held `OwnedLock` (or the test-only seam)
+   * can authorize a commit; a bare `{ isOwner }` is rejected at this boundary. */
+  ownerToken: OwnedLockCasToken;
 }
 
 /** @internal Observation seam for the token-race branches of the retry protocol.
