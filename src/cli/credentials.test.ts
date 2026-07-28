@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, setSystemTime, test } from "bun:test";
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -426,6 +427,65 @@ test("separate save processes serialize and leave one complete v1 document", asy
   expect(saved.v).toBe(1);
   expect(["one", "two"]).toContain(saved.token);
   await expect(fs.lstat(lockPath())).rejects.toThrow();
+});
+
+test("a fence released inside the inspection window is a retry, not a lost writer", async () => {
+  setSystemTime();
+  const fence = `${lockPath()}.fence`;
+  await fs.mkdir(path.dirname(fence), { mode: 0o700 });
+  const identity = await (await import("../engine/git/lockfile.js")).systemLockIdentity.current();
+  // A live peer holds the fence, so this writer's publication collides and it
+  // must inspect the holder's marker.
+  await fs.writeFile(fence, JSON.stringify({
+    v: 1, pid: process.pid, processStart: identity.startTime, acquiredAt: new Date().toISOString(), nonce: "e".repeat(32),
+  }), { mode: 0o600 });
+  let released = false;
+  restoreHook = installCredentialTestHook(async (seam, context) => {
+    // The peer finishes and releases in the one unfenced window that exists:
+    // between this writer's lstat of the fence and its open of the same path.
+    if (seam !== "marker-observe-before-open" || context.markerPath !== fence || released) return;
+    released = true;
+    await fs.unlink(fence);
+  });
+  await saveCredentials(credential);
+  expect(released).toBe(true);
+  expect(JSON.parse(await fs.readFile(credentialPath(), "utf8"))).toEqual({ v: 1, ...credential });
+  await expect(fs.lstat(fence)).rejects.toThrow();
+});
+
+test("a peer that cycles the fence exhausts the budget and names the churn", async () => {
+  setSystemTime();
+  const fence = `${lockPath()}.fence`;
+  await fs.mkdir(path.dirname(fence), { mode: 0o700 });
+  const identity = await (await import("../engine/git/lockfile.js")).systemLockIdentity.current();
+  // Allocate the successor while the current marker is still linked, then
+  // rename it over: the two inodes coexist, so the replacement can never
+  // inherit the old inode number. Unlink-then-create would let the allocator
+  // hand back the same inode — every marker here is the same size and mode, so
+  // the inode is the ONLY thing that makes the swap observable.
+  const republish = (nonce: string) => {
+    const swap = `${fence}.swap`;
+    fsSync.writeFileSync(swap, JSON.stringify({
+      v: 1, pid: process.pid, processStart: identity.startTime, acquiredAt: new Date().toISOString(), nonce: nonce.repeat(32),
+    }), { mode: 0o600 });
+    fsSync.renameSync(swap, fence);
+  };
+  republish("a");
+  let cycles = 0;
+  restoreHook = installCredentialTestHook((seam, context) => {
+    // A peer that keeps taking and releasing the fence. The swap is synchronous
+    // inside the inspection window the seam names, so every attempt observes a
+    // turnover no matter how the runner schedules this process.
+    if (seam !== "marker-observe-before-open" || context.markerPath !== fence) return;
+    cycles++;
+    republish(String(cycles % 10));
+  });
+  const failure = await saveCredentials(credential).then(() => undefined, (error: unknown) => error as Error);
+  // Boundedness comes from the hook's own attempt count, not from elapsed time:
+  // the budget exhausted after a finite number of inspections, and the message
+  // reports every one of them as churn rather than a stuck holder.
+  expect(cycles).toBeGreaterThan(1);
+  expect(failure?.message).toContain(`${cycles} of ${cycles} attempts saw the marker change during inspection`);
 });
 
 test("five-minute stale main marker is taken over independent of its live PID", async () => {
