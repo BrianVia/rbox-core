@@ -50,7 +50,7 @@ const STATE_ORDER_OWNERS = new Map([
     "afterStatePublication",
     "publishWholeState",
   ])],
-  ["src/cli/sync-state-store.ts", new Set([
+  ["src/cli/state-plane/adapters/legacy-json-store.ts", new Set([
     "applyStateSavePacket",
     "ensureTelemetryBindingId",
     "installGenesisResetStateUnderHeldLock",

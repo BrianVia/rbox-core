@@ -58,7 +58,7 @@ Since: 106
 
 A delayed save from an old workspace stream or reset incarnation can never overwrite current state.
 
-Enforced: `src/cli/sync-state-store.ts:118-149`; `src/cli/sync-state.ts:295`
+Enforced: `src/cli/state-plane/adapters/legacy-json-store.ts:115-146`; `src/cli/sync-state.ts:295`
 Proven: `src/cli/sync-state.test.ts:489-521`  
 Since: 116
 
@@ -66,7 +66,7 @@ Since: 116
 
 A state update is rejected as a whole if its global sequence or any repository generation is stale, keeping file and Git truth together.
 
-Enforced: `src/cli/sync-state-store.ts:143-157`
+Enforced: `src/cli/state-plane/adapters/legacy-json-store.ts:140-154`
 Proven: `src/cli/sync-state.test.ts:441-460`  
 Since: 116
 
@@ -74,7 +74,7 @@ Since: 116
 
 Even when repository state changes away and later looks equal again, an old save cannot mistake it for the original state.
 
-Enforced: `src/cli/sync-state-store.ts:152-184`; `src/cli/sync-state.ts:492`
+Enforced: `src/cli/state-plane/adapters/legacy-json-store.ts:149-181`; `src/cli/sync-state.ts:492`
 Proven: `src/cli/sync-state.test.ts:426`  
 Since: 116
 
