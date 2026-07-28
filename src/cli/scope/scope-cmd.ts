@@ -10,7 +10,7 @@ import { loadConfig, syncStreamId } from "../workspace-config.js";
 import { resolveBindingScope, assertBindingUsable } from "./binding-scope.js";
 import { ScopeProjection } from "./projection.js";
 import { readScopeFindings } from "./rule-authority.js";
-import { parseScopeFlag, scopeSplitsRepo, validateScopePrefixes } from "./scope-record.js";
+import { parseScopeFlag, scopeSplitsRepo, validateScopePrefixes, withinPrefix } from "./scope-record.js";
 import { resumeScopeIntent, runScopeTransition, type ScopeTransactionDeps } from "./scope-transaction.js";
 
 export const SCOPE_USAGE = "usage: rbox scope [add <folder>… | remove <folder>…] [--json]";
@@ -52,11 +52,12 @@ async function showScope(root: string, opts: { json?: boolean }): Promise<void> 
   }
   const cfg = await loadConfig(root);
   const state = await loadState(root, syncStreamId(cfg));
-  const projection = new ScopeProjection(seal.prefixes, Object.keys(state.lastSyncedManifest.gitRepos ?? {}));
+  const repoKeys = Object.keys(state.lastSyncedManifest.gitRepos ?? {});
+  const projection = new ScopeProjection(seal.prefixes, repoKeys);
   const rows: ScopeShowRow[] = seal.prefixes.map((prefix) => ({
     prefix,
-    files: state.lastSyncedManifest.files.filter((entry) => entry.path === prefix || entry.path.startsWith(`${prefix}/`)).length,
-    repos: Object.keys(state.lastSyncedManifest.gitRepos ?? {}).filter((key) => key === prefix || key.startsWith(`${prefix}/`)).length,
+    files: state.lastSyncedManifest.files.filter((entry) => withinPrefix(prefix, entry.path)).length,
+    repos: repoKeys.filter((key) => withinPrefix(prefix, key)).length,
   }));
   const findings = await readScopeFindings(root);
   if (opts.json) {

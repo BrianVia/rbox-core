@@ -275,7 +275,6 @@ export async function recordBindingScope(root: string, workspaceId: string, scop
   });
 }
 
-
 /**
  * Drop a root from the registry. Returns true when an entry was actually
  * removed. Unlike the record paths this THROWS on a lock or write failure:

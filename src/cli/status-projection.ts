@@ -2,6 +2,7 @@ import { PassThrough } from "node:stream";
 import { diffManifests, type DiscoveredGitRepo, type IgnoreMatcher } from "../engine/index.js";
 import { shellStateOf, type DaemonActivity } from "./activity.js";
 import { DEFERRAL_LANES, repoRecordsForState, syncStreamId, type SyncState } from "./config.js";
+import { knownRepoKeys } from "./sync-state-model.js";
 import { validDaemonVersion, type DaemonMode } from "./daemon/ambient-status.js";
 import { buildPathWarnings, type PathWarningsV1 } from "./path-warnings.js";
 import { projectLocalManifest } from "./local-file-projection.js";
@@ -284,11 +285,8 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
   // Design 212 §3.2: status consumes the same projection as everything else. Its
   // diff base must be scope-sized, or a binding that is working perfectly reports
   // every folder it deliberately does not hold as a local deletion.
-  const statusScope = await scopeProjectionFor(root, [
-    ...Object.keys(state.lastSyncedManifest.gitRepos ?? {}),
-    ...Object.keys(state.gitPendingRemote ?? {}),
-    ...Object.keys(repoRecordsForState(state)),
-  ]);
+  const statusRepoKeys = knownRepoKeys(state);
+  const statusScope = await scopeProjectionFor(root, statusRepoKeys);
   const scopedBaseManifest = statusScope
     ? statusScope.projectFiles(state.lastSyncedManifest)
     : state.lastSyncedManifest;
@@ -318,15 +316,9 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
       ageMs: trusted.ageMs,
     };
   } else if (populate) {
-    const populateKeys = [
-      ...Object.keys(state.lastSyncedManifest.gitRepos ?? {}),
-      ...Object.keys(state.gitPendingRemote ?? {}),
-      ...Object.keys(repoRecordsForState(state)),
-    ];
-    const populateScope = await scopeProjectionFor(root, populateKeys);
     const conflictSnapshots = await port.readConflictSnapshotStatus(
       root,
-      populateScope ? populateScope.probeKeys(populateKeys) : populateKeys,
+      statusScope ? statusScope.probeKeys(statusRepoKeys) : statusRepoKeys,
     );
     counts = {
       added: 0,
@@ -335,7 +327,7 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
       trackedFiles: populate.operation.filesDone,
       gitChanged: 0,
       gitDeferrals: localGitDeferrals(state).filter(({ repo }) =>
-        populateScope === undefined || populateScope.classifyRepo(repo) === "in").map(({ repo, ...d }) => ({
+        statusScope === undefined || statusScope.classifyRepo(repo) === "in").map(({ repo, ...d }) => ({
         relPath: repo,
         lane: d.lane,
         reason: d.reason,

@@ -19,22 +19,17 @@ const FINDINGS_FILE = "scope-findings.json";
 const findingsPath = (root: string) => path.join(root, RBOX_DIR, FINDINGS_FILE);
 
 export interface ScopeFindings {
-  /** Rule files whose local bytes were overwritten by remote truth, newest run wins. */
+  /** Rule files whose local bytes were overwritten by remote truth, newest run wins.
+   *  The straddling repos of the same pull are NOT recorded here: `rbox scope`
+   *  classifies the live topology itself, so a stored copy could only go stale. */
   ruleFileDivergence: string[];
-  /** Repos crossing a scope boundary, quarantined on the last pull. */
-  straddlingRepos: string[];
-  at: string;
 }
 
 export async function readScopeFindings(root: string): Promise<ScopeFindings | undefined> {
   try {
     const parsed = JSON.parse(await fsp.readFile(findingsPath(root), "utf8")) as Partial<ScopeFindings>;
-    if (!Array.isArray(parsed.ruleFileDivergence) || !Array.isArray(parsed.straddlingRepos)) return undefined;
-    return {
-      ruleFileDivergence: parsed.ruleFileDivergence.filter((v): v is string => typeof v === "string"),
-      straddlingRepos: parsed.straddlingRepos.filter((v): v is string => typeof v === "string"),
-      at: typeof parsed.at === "string" ? parsed.at : "",
-    };
+    if (!Array.isArray(parsed.ruleFileDivergence)) return undefined;
+    return { ruleFileDivergence: parsed.ruleFileDivergence.filter((v): v is string => typeof v === "string") };
   } catch {
     return undefined;
   }

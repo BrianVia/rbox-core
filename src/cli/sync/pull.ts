@@ -470,11 +470,7 @@ export async function applyPulledManifest(
   if (projection) {
     // Named, scope-sized findings for status/doctor. Best effort: a visibility
     // record must never fail a pull that is already durable.
-    await saveScopeFindings(root, {
-      ruleFileDivergence,
-      straddlingRepos: [...projection.straddling],
-      at: new Date().toISOString(),
-    }).catch(() => undefined);
+    await saveScopeFindings(root, { ruleFileDivergence }).catch(() => undefined);
   }
   if (actions.length > 0) {
     try {
