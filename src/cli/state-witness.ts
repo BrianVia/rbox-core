@@ -89,7 +89,7 @@ export function parseLastWriterWitness(text: string): LastWriterWitness | undefi
   return record as unknown as LastWriterWitness;
 }
 
-export async function readLastWriterWitness(root: string): Promise<LastWriterWitness | undefined> {
+async function readLastWriterWitness(root: string): Promise<LastWriterWitness | undefined> {
   const file = lastWriterWitnessPath(root);
   let stat: Awaited<ReturnType<typeof fs.lstat>>;
   try {
@@ -98,7 +98,7 @@ export async function readLastWriterWitness(root: string): Promise<LastWriterWit
     return undefined;
   }
   if (!stat.isFile() || stat.isSymbolicLink() || stat.size > WITNESS_MAX_BYTES) return undefined;
-  return parseLastWriterWitness(await fs.readFile(file, "utf8").catch(() => "")) ?? undefined;
+  return parseLastWriterWitness(await fs.readFile(file, "utf8").catch(() => ""));
 }
 
 /**

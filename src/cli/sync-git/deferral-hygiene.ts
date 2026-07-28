@@ -401,6 +401,16 @@ export async function reconcileGitDeferrals(
     return { state, changed: false, accepted: false, displayDetails, commonDirsInspected: sharedInspections.size, recoveredLocks };
   }
 
+  /** Reload the durable winner of a lost CAS race, falling back to what the
+   * caller already holds. A barrier refusal is terminal and must never be
+   * folded into that fallback: the retry it would authorize is the write the
+   * barrier just refused. */
+  const reloadWinner = async (from: SyncState, fallback: SyncState = from): Promise<SyncState> =>
+    await deps.reload(root, from.stream || syncStreamId(cfg)).catch((error: unknown) => {
+      rethrowIfStateBarrier(error);
+      return fallback;
+    });
+
   let base = state;
   for (let attempt = 0; attempt < 3; attempt++) {
     const currentRecords = repoRecordsForState(base);
@@ -447,10 +457,7 @@ export async function reconcileGitDeferrals(
       });
     } catch (error) {
       rethrowIfStateBarrier(error);
-      const winner = await deps.reload(root, base.stream || syncStreamId(cfg)).catch((reloadError: unknown) => {
-        rethrowIfStateBarrier(reloadError);
-        return base;
-      });
+      const winner = await reloadWinner(base);
       return { state: winner, changed: false, accepted: false, displayDetails, commonDirsInspected: sharedInspections.size, recoveredLocks };
     }
     if (saved.status === "accepted") {
@@ -505,27 +512,18 @@ export async function reconcileGitDeferrals(
           });
         } catch (error) {
           rethrowIfStateBarrier(error);
-          repairBase = await deps.reload(root, repairBase.stream || syncStreamId(cfg)).catch((reloadError: unknown) => {
-            rethrowIfStateBarrier(reloadError);
-            return repairBase;
-          });
+          repairBase = await reloadWinner(repairBase);
           await deps.compensationBackoff(repairAttempt);
           continue;
         }
         if (repaired.status === "accepted") {
           return { state: repaired.state, changed: true, accepted: true, displayDetails, commonDirsInspected: sharedInspections.size, recoveredLocks };
         }
-        repairBase = await deps.reload(root, repairBase.stream || syncStreamId(cfg)).catch((reloadError: unknown) => {
-          rethrowIfStateBarrier(reloadError);
-          return repaired.status === "rejected" ? repaired.state : repairBase;
-        });
+        repairBase = await reloadWinner(repairBase, repaired.status === "rejected" ? repaired.state : repairBase);
         await deps.compensationBackoff(repairAttempt);
       }
     }
-    const winner = await deps.reload(root, base.stream || syncStreamId(cfg)).catch((reloadError: unknown) => {
-      rethrowIfStateBarrier(reloadError);
-      return saved.status === "rejected" ? saved.state : base;
-    });
+    const winner = await reloadWinner(base, saved.status === "rejected" ? saved.state : base);
     if (saved.status !== "rejected" || saved.reason !== "repo-generation") {
       return { state: winner, changed: false, accepted: false, displayDetails, commonDirsInspected: sharedInspections.size, recoveredLocks };
     }

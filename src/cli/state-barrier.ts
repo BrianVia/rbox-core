@@ -108,8 +108,8 @@ export async function classifyStateFormat(file: string): Promise<StateFormat> {
   return looksLikeJson(head) ? "json" : "foreign";
 }
 
-/** True only for the exact 58-byte marker. Exposed for fixtures and the
- * inventory test; production code goes through {@link classifyStateFormat}. */
+/** True only for the exact 58-byte marker. Exposed for fixtures and tests;
+ * production code goes through {@link classifyStateFormat}. */
 export function isAuthorityMarkerBytes(bytes: Uint8Array): boolean {
   return bytes.byteLength === AUTHORITY_MARKER_BYTES
     && AUTHORITY_MARKER_RE.test(Buffer.from(bytes).toString("latin1"));
@@ -130,6 +130,12 @@ export async function assertStateReadable(file: string): Promise<void> {
  * the check has no mutual exclusion behind it, so it additionally refuses any
  * target it cannot positively recognize as legacy JSON.
  */
+export async function assertStatePublishable(file: string, opts: { locked: boolean }): Promise<void> {
+  const format = await classifyStateFormat(file);
+  if (format === "authority-marker") throw new StateFormatTooNewError(file);
+  if (!opts.locked && format === "foreign") throw new StateWriteRefusedError("state-unlocked-foreign-target", file);
+}
+
 /**
  * Re-raise the barrier's fail-closed refusals out of a broad `catch`. Callers
  * that fold every exception into "the save did not land" would otherwise reload
@@ -138,10 +144,4 @@ export async function assertStateReadable(file: string): Promise<void> {
  */
 export function rethrowIfStateBarrier(error: unknown): void {
   if (error instanceof StateFormatTooNewError || error instanceof StateWriteRefusedError) throw error;
-}
-
-export async function assertStatePublishable(file: string, opts: { locked: boolean }): Promise<void> {
-  const format = await classifyStateFormat(file);
-  if (format === "authority-marker") throw new StateFormatTooNewError(file);
-  if (!opts.locked && format === "foreign") throw new StateWriteRefusedError("state-unlocked-foreign-target", file);
 }
