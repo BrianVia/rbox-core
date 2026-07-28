@@ -12,12 +12,12 @@ import type { PRepairReceipt } from "../engine/git/p-repair.js";
 import {
   carryRepoBaseProof,
   composeRepoBase,
-  migrationRepoBaseProof,
   recordOriginLineage,
   type BranchBaseOrigin,
   type RepoBaseProof,
   type SafeRefWitness,
 } from "./sync-git/base-composer.js";
+import { adoptLegacyManifestRepoBase } from "./state-plane/migration/base-proof.js";
 
 /** Last point this device and the server agreed on — the reconcile base.
  *  The three `git*` maps are LOCAL-ONLY (design 43 §11): they never ride a manifest
@@ -419,15 +419,7 @@ export function repoRecordsForState(state: SyncState): Record<string, RepoRecord
     records[relPath] = {
       repoGen: 0,
       sourceSeq: normalizeStateCounter(state.lastSyncedSequence),
-      ...(() => {
-        const candidate = state.lastSyncedManifest.gitRepos?.[relPath];
-        const composed = composeRepoBase({}, { ...(candidate === undefined ? {} : { base: candidate }) },
-          migrationRepoBaseProof().authority, migrationRepoBaseProof().lockedProof);
-        return {
-          ...(composed.base === undefined ? {} : { base: composed.base }),
-          ...(composed.branchBaseOrigins === undefined ? {} : { branchBaseOrigins: composed.branchBaseOrigins }),
-        };
-      })(),
+      ...adoptLegacyManifestRepoBase(state.lastSyncedManifest.gitRepos?.[relPath]),
       ...(state.gitPendingRemote?.[relPath] === undefined ? {} : { pending: state.gitPendingRemote[relPath] }),
       ...(state.gitReposRemoved?.[relPath] === undefined ? {} : { removedKey: state.gitReposRemoved[relPath] }),
       ...(state.gitNeedsResolution?.[relPath] === undefined ? {} : { resolutionKey: state.gitNeedsResolution[relPath] }),

@@ -4,10 +4,10 @@ import type { ConfigStatToken } from "../engine/git/config-txn.js";
 import { sanitizeGitSectionForPersistence } from "../engine/git/config-sync.js";
 import {
   composeRepoBase,
-  migrationRepoBaseProof,
   type BranchBaseOrigin,
   type RepoBaseProof,
 } from "./sync-git/base-composer.js";
+import { provisionalRepoBaseProof } from "./sync-git/base-proof-selection.js";
 import {
   applyStateSavePacket,
   DEFERRAL_LANES,
@@ -218,7 +218,15 @@ function selectPackedRefsIdentity(
   return next === null ? {} : { packedRefsIdentity: next };
 }
 
-function sourceRecord(source: StateSource, relPath: string, current: RepoRecord): RepoRecordInput {
+/** The transition one source contributes for one repository: its record and the
+ * BASE authority that both this composition and the store's re-composition use. */
+interface SourceRepoTransition {
+  newRecord: RepoRecordInput;
+  baseProof: RepoBaseProof;
+}
+
+function sourceRecord(source: StateSource, relPath: string, current: RepoRecord): SourceRepoTransition {
+  const previousValue = { base: current.base, branchBaseOrigins: current.branchBaseOrigins };
   // A recompute from an older source retains the entire newer record. This is the
   // ordering half of the generation CAS: older pending/absence cannot regress a
   // newer success, while the transition still records that this path was observed.
@@ -227,18 +235,21 @@ function sourceRecord(source: StateSource, relPath: string, current: RepoRecord)
     const retained = inputRecord(current);
     if (mergedDeferrals === undefined) delete retained.deferrals;
     else retained.deferrals = mergedDeferrals;
-    return sanitizeRepoRecordInput(retained);
+    // A retention moves nothing, so it carries the record's own lineage rather
+    // than the discarded source's proof.
+    return { newRecord: sanitizeRepoRecordInput(retained), baseProof: provisionalRepoBaseProof(undefined, previousValue) };
   }
   const lane = source.values.configLane?.[relPath] ?? current;
   const hasAdvertisedValue = Object.prototype.hasOwnProperty.call(source.values.advertised ?? {}, relPath);
   const advertisedValue = source.values.advertised?.[relPath];
-  const proof = source.repoProofs?.[relPath] ?? migrationRepoBaseProof();
+  const candidateValue = {
+    base: source.values.bases?.[relPath],
+    branchBaseOrigins: source.values.branchBaseOrigins?.[relPath],
+  };
+  const proof = provisionalRepoBaseProof(source.repoProofs?.[relPath], previousValue);
   const composed = composeRepoBase(
-    { base: current.base, branchBaseOrigins: current.branchBaseOrigins },
-    {
-      base: source.values.bases?.[relPath],
-      branchBaseOrigins: source.values.branchBaseOrigins?.[relPath],
-    },
+    previousValue,
+    candidateValue,
     proof.authority,
     proof.lockedProof,
   );
@@ -274,7 +285,7 @@ function sourceRecord(source: StateSource, relPath: string, current: RepoRecord)
   if (composed.disposition === "pending" && source.values.bases?.[relPath] && next.pending === undefined) {
     next.pending = source.values.bases[relPath];
   }
-  return sanitizeRepoRecordInput(next);
+  return { newRecord: sanitizeRepoRecordInput(next), baseProof: proof };
 }
 
 export function composeStateSavePacket(snapshot: SyncState, source: StateSource): StateSavePacket {
@@ -282,12 +293,7 @@ export function composeStateSavePacket(snapshot: SyncState, source: StateSource)
   const observedRepos = [...new Set(source.observedRepos)].sort();
   const repos = observedRepos.map((relPath) => {
     const current = records[relPath] ?? { repoGen: 0, sourceSeq: 0 };
-    return {
-      relPath,
-      expectedRepoGen: current.repoGen,
-      newRecord: sourceRecord(source, relPath, current),
-      baseProof: source.repoProofs?.[relPath] ?? migrationRepoBaseProof(),
-    };
+    return { relPath, expectedRepoGen: current.repoGen, ...sourceRecord(source, relPath, current) };
   });
   return {
     expectedStream: source.expectedStream,
@@ -515,9 +521,10 @@ export async function savePublishedRepoIntent(
     }
     if (Object.keys(deferrals).length) merged.deferrals = deferrals; else delete merged.deferrals;
     merged.sourceSeq = Math.max(currentInput.sourceSeq, intended.record.sourceSeq);
-    const baseProof = intended.baseProof ?? migrationRepoBaseProof();
+    const previousValue = { base: currentInput.base, branchBaseOrigins: currentInput.branchBaseOrigins };
+    const baseProof = provisionalRepoBaseProof(intended.baseProof, previousValue);
     const composed = composeRepoBase(
-      { base: currentInput.base, branchBaseOrigins: currentInput.branchBaseOrigins },
+      previousValue,
       { base: merged.base, branchBaseOrigins: merged.branchBaseOrigins },
       baseProof.authority,
       baseProof.lockedProof,

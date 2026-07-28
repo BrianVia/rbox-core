@@ -1,0 +1,139 @@
+/**
+ * Ordinary state writes may not borrow migration authority.
+ *
+ * `migration` is a blanket BASE authority: it accepts any candidate refs without
+ * a witness. The store seam reserves it for the tagged importer, so every
+ * ordinary producer must either supply its own purpose-bound proof or be
+ * changing nothing at all. Before this contract existed, a missing
+ * `repoProofs` entry silently defaulted to `migrationRepoBaseProof()` in three
+ * places on the live JSON write path.
+ */
+import { expect, test } from "bun:test";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import type { GitSection } from "../../engine/index.js";
+import { ProoflessBaseError } from "../state-plane/errors.js";
+import { applyStateSavePacket } from "../config.js";
+import { composeStateSavePacket, savePublishedRepoIntent, type StateSource } from "../sync-state.js";
+import { carryRepoBaseProof, type BranchBaseOrigin } from "./base-composer.js";
+
+const T = "1".repeat(40);
+const U = "2".repeat(40);
+const LIN = "a".repeat(64);
+const EPISODE = "e".repeat(32);
+
+const section = (head: string): GitSection => ({
+  bundleSha: "0".repeat(64), bundleEncSha: "1".repeat(64), bundleCipherSize: 1,
+  head: "ref: refs/heads/main", refs: { "refs/heads/main": head }, refScope: "all", generatedAt: "g",
+});
+
+const origin: BranchBaseOrigin = { v: 1, oid: T, lineageHash: LIN, kind: "pull-p", episode: EPISODE };
+
+const state = () => ({
+  stream: "s", stateNonce: "0".repeat(32), stateRevision: 1, lastSyncedSequence: 1,
+  lastSyncedManifest: { generatedAt: "old", files: [] },
+  repoRecords: { r: { repoGen: 3, sourceSeq: 1, base: section(T), branchBaseOrigins: { "refs/heads/main": origin } } },
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+}) as any;
+
+const source = (values: StateSource["values"], repoProofs?: StateSource["repoProofs"]): StateSource => ({
+  expectedStream: "s", sourceGlobalSeq: 2, observedRepos: ["r"], values,
+  ...(repoProofs ? { repoProofs } : {}),
+});
+
+test("a proofless candidate BASE move is held by carry authority, never laundered as a migration", () => {
+  // The packet composer works from a snapshot that may already be stale, so it
+  // degrades to the weakest authority rather than refusing a possible race.
+  // Carry holds the move: the changed head never reaches the candidate record.
+  const packet = composeStateSavePacket(state(), source({ bases: { r: section(U) } }));
+  expect(packet.repos[0]?.baseProof?.authority.kind).toBe("pull-carry");
+  expect(packet.repos[0]?.newRecord.base?.refs["refs/heads/main"]).toBe(T);
+  expect(packet.repos[0]?.newRecord.pending).toEqual(section(U));
+});
+
+test("a byte-unchanged advance derives carry authority from the retained lineage", () => {
+  const packet = composeStateSavePacket(state(), source({ bases: { r: section(T) } }));
+  expect(packet.repos[0]?.baseProof).toEqual(carryRepoBaseProof(LIN));
+  expect(packet.repos[0]?.newRecord.branchBaseOrigins?.["refs/heads/main"]).toMatchObject({ kind: "pull-p" });
+});
+
+test("an unobserved repo (no candidate BASE) derives carry authority and retains its record", () => {
+  const packet = composeStateSavePacket(state(), source({}));
+  expect(packet.repos[0]?.baseProof).toEqual(carryRepoBaseProof(LIN));
+  expect(packet.repos[0]?.newRecord.base).toEqual(section(T));
+});
+
+test("a supplied purpose-bound proof is used exactly as given", () => {
+  const supplied = carryRepoBaseProof(LIN);
+  const packet = composeStateSavePacket(state(), source({ bases: { r: section(T) } }, { r: supplied }));
+  expect(packet.repos[0]?.baseProof).toBe(supplied);
+});
+
+test("inventory: no ordinary StateSavePacket transition carries migration authority", () => {
+  const sources: StateSource[] = [
+    source({}),
+    source({ bases: { r: section(T) } }),
+    source({ bases: { r: section(T) } }, { r: carryRepoBaseProof(LIN) }),
+    source({ bases: { r: section(U) } }, { r: carryRepoBaseProof(LIN) }),
+    source({ pending: { r: section(U) } }),
+    source({ removed: { r: "gone" } }),
+    source({ resolutions: { r: "conflict" } }),
+    source({ idxProj: { r: "proj" } }),
+    { ...source({}), sourceGlobalSeq: 0 }, // stale-source retention path
+  ];
+  for (const candidate of sources) {
+    for (const transition of composeStateSavePacket(state(), candidate).repos) {
+      expect(transition.baseProof?.authority.kind, `source ${JSON.stringify(candidate.values)}`)
+        .not.toBe("migration");
+    }
+  }
+});
+
+test("the JSON CAS refuses a prooflessly changed BASE instead of defaulting to migration authority", async () => {
+  // Under the state lock the predecessor is a fact, not a race, so a proofless
+  // BASE move is refused outright rather than held.
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-base-proof-"));
+  try {
+    await fs.mkdir(path.join(root, ".rbox", "state"), { recursive: true });
+    await fs.writeFile(path.join(root, ".rbox", "state.json"), JSON.stringify(state()));
+    await expect(applyStateSavePacket(root, {
+      expectedStream: "s", expectedNonce: "0".repeat(32), sourceGlobalSeq: 2,
+      repos: [{ relPath: "r", expectedRepoGen: 3, newRecord: { sourceSeq: 2, base: section(U) } }],
+    })).rejects.toThrow(ProoflessBaseError);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("published-intent recovery holds a proofless BASE move rather than minting migration authority", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-base-proof-intent-"));
+  try {
+    await fs.mkdir(path.join(root, ".rbox", "state"), { recursive: true });
+    await fs.writeFile(path.join(root, ".rbox", "state.json"), JSON.stringify(state()));
+    const recovered = await savePublishedRepoIntent(root, state(), "r", {
+      record: { sourceSeq: 2, base: section(U) }, expectedRepoGen: 3, relPath: "r",
+    });
+    const record = recovered.state.repoRecords?.r;
+    expect(record?.base?.refs["refs/heads/main"]).toBe(T);
+    expect(record?.pending).toEqual(section(U));
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("migration authority is constructible only from state-plane migration territory", async () => {
+  const src = path.resolve(import.meta.dir, "../..");
+  const importers: string[] = [];
+  for (const entry of await fs.readdir(src, { recursive: true, withFileTypes: true })) {
+    if (!entry.isFile() || !entry.name.endsWith(".ts")) continue;
+    const abs = path.join(entry.parentPath, entry.name);
+    if (/migration\/base-proof\.js/.test(await fs.readFile(abs, "utf8"))) {
+      importers.push(path.relative(src, abs));
+    }
+  }
+  expect(importers.sort(), "migration BASE authority escaped its territory").toEqual([
+    "cli/state-plane/store/proofless-base.test.ts",
+    "cli/sync-state-model.ts",
+  ]);
+});

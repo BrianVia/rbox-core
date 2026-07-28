@@ -183,6 +183,20 @@ export interface RepoBaseProof {
   lockedProof: RepoBaseLockedProof;
 }
 
+/**
+ * The ref classes composeRepoBase decides under an authority: branches and safe
+ * refs. Every other ref is copied wholesale from whichever family wins, so two
+ * candidates agreeing here compose identically under any authority kind — the
+ * fact the prooflessness rule in base-proof-selection.ts rests on.
+ */
+export function authorityGovernedRefs(base: GitSection | undefined): Record<string, string> {
+  const governed: Record<string, string> = {};
+  for (const [ref, oid] of Object.entries(base?.refs ?? {})) {
+    if (isBranch(ref) || isSafeRef(ref)) governed[ref] = oid;
+  }
+  return governed;
+}
+
 const isBranch = (ref: string): boolean => ref.startsWith("refs/heads/");
 const isSafeRef = (ref: string): boolean => ref.startsWith("refs/tags/") || ref === "refs/stash";
 const oid = (value: string | null): boolean => value === null || HEX40.test(value);
@@ -563,13 +577,9 @@ export function composeRepoBase(
   };
 }
 
-export function migrationRepoBaseProof(lineageHash = "legacy-untrusted"): RepoBaseProof {
-  return {
-    authority: { kind: "migration", lineageHash },
-    lockedProof: { repoKind: "dir", effectiveRefScope: "all", checkoutComplete: true, branches: {}, safeRefs: {} },
-  };
-}
-
+/** Blanket `migration` authority is deliberately not constructible here; it
+ * lives in `state-plane/migration/base-proof.ts` so no ordinary write path can
+ * default to it. Prooflessly changed BASE is refused by requireRepoBaseProof(). */
 export function carryRepoBaseProof(lineageHash = "legacy-untrusted"): RepoBaseProof {
   return {
     authority: { kind: "pull-carry", lineageHash },
