@@ -6,6 +6,16 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.11.1] - 2026-07-28
+
+### Fixed
+- **Syncing a workspace with many Git repositories is dramatically faster,
+  especially on macOS.** rbox was launching one small `git` helper for every
+  branch and tag while proving a repository's history was safe to accept —
+  thousands of launches per sync on a busy repository, which macOS makes
+  slow. It now asks the same questions in three launches. Syncs that took
+  90+ seconds on a Mac now complete in a few seconds.
+
 ### Added
 - **Opt in to preview CLI releases without moving the stable fleet.**
   Install the preview channel with
