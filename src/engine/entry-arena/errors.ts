@@ -35,14 +35,24 @@ export class WorkerLifecycleError extends Error {
   }
 }
 
-/** The `FileEntry` extension vocabulary is entirely primitive (every declared
- *  field in `src/engine/types.ts` is a string or a number), so exact interning
- *  compares with `Object.is` and freezes shallowly. A composite value would
- *  silently break both, so it is refused at intern time rather than deep-frozen. */
+/** Extension members are arbitrary decoded JSON, which interning fully
+ *  supports. This is raised only for values JSON cannot produce (functions,
+ *  symbols, bigints) or nesting past `MAX_EXTENSION_DEPTH`. */
 export class EntryShapeError extends Error {
   constructor(key: string, detail: string) {
     super(`entry field ${key} is not internable: ${detail}`);
     this.name = "EntryShapeError";
+  }
+}
+
+/** A terminal operation was started on an owner from inside that same owner's
+ *  resource-release callback — a cycle: the operation waits for the settlement
+ *  that is waiting for the callback. Detected across awaits, not just
+ *  synchronously, so abort can never deadlock. */
+export class OwnerReentrancyError extends Error {
+  constructor(operation: string) {
+    super(`${operation} cannot be called from a resource-release callback of the same owner`);
+    this.name = "OwnerReentrancyError";
   }
 }
 

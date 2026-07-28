@@ -393,6 +393,7 @@ export {
   EntryArena,
   EntryShapeError,
   GenerationOwnerCapabilityError,
+  OwnerReentrancyError,
   GenerationReplacementConflict,
   PublishedGeneration,
   WorkerLifecycleError,
@@ -406,4 +407,5 @@ export {
   type PublishedGenerationToken,
   type WorkerEntryRequest,
   type WorkerRegistration,
+  type WorkerReplacementResult,
 } from "./entry-arena/index.js";

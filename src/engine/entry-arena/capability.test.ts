@@ -1,21 +1,22 @@
 import { expect, test } from "bun:test";
 import * as barrel from "./index.js";
 import { EntryArena } from "./arena.js";
-import { authenticateOwner, createOwnerControl, discardUnseeded, seedCandidate } from "./owner.js";
+import { PublishedGeneration, resolvePublishedGeneration, takePublicationCapability } from "./generation.js";
+import { takeOwnerCapability } from "./owner.js";
 import { GenerationOwnerScope, withGenerationOwnerScope } from "./scope.js";
+import type { FileEntry } from "../types.js";
 
-test("REGRESSION (finding 6): the barrel exports no capability-minting surface", () => {
+function entry(path: string): FileEntry {
+  return { path, sha256: `sha-${path}`, size: 3, mode: 0o644, mtimeMs: 1000, type: "file" };
+}
+
+test("REGRESSION (r2 finding 4): the barrel exports no capability-minting surface", () => {
   const names = Object.keys(barrel);
   for (const forbidden of [
-    "createOwnerControl",
-    "authenticateOwner",
-    "seedCandidate",
-    "discardUnseeded",
-    "abortControl",
-    "controlOfOwner",
-    "replaceOnOwnerQueue",
-    "requireOwnerLive",
-    "settleOwnerDrain",
+    "takeOwnerCapability",
+    "takePublicationCapability",
+    "resolvePublishedGeneration",
+    "createRegistration",
     "CandidateGeneration",
     "OWNER_CONSTRUCTION_KEY",
     "SCOPE_CONSTRUCTION_KEY",
@@ -25,20 +26,37 @@ test("REGRESSION (finding 6): the barrel exports no capability-minting surface",
   expect(names).toContain("withGenerationOwnerScope");
 });
 
-test("REGRESSION (finding 6): a deep import cannot mint an owner outside a scope", () => {
-  const arena = new EntryArena();
-  const forgedKey = Symbol("forged") as never;
-  expect(() => createOwnerControl(forgedKey, arena, () => {})).toThrow(/module-private/);
-  expect(() => authenticateOwner(forgedKey, { ownerId: 1 })).toThrow(/module-private/);
-  expect(() => seedCandidate(forgedKey, {} as never, [])).toThrow(/module-private/);
-  expect(() => discardUnseeded(forgedKey, {} as never)).toThrow(/module-private/);
-  expect(arena.stats()).toMatchObject({ liveSlots: 0, retains: 0 });
+test("REGRESSION (r2 finding 4): a deep import cannot claim the owner capability", () => {
+  // The scope module claimed it when it initialized; there is no second one.
+  expect(() => takeOwnerCapability()).toThrow(/already claimed/);
+  expect(() => takeOwnerCapability()).toThrow(/already claimed/);
 });
 
-test("REGRESSION (finding 6): a scope cannot be constructed without withGenerationOwnerScope", async () => {
+test("REGRESSION (r2 finding 4): a scope cannot be constructed without withGenerationOwnerScope", async () => {
   const arena = new EntryArena();
-  expect(() => new GenerationOwnerScope(arena, Symbol("forged") as never)).toThrow(/module-private/);
+  expect(() => new GenerationOwnerScope(arena, Symbol("forged"))).toThrow(/only by withGenerationOwnerScope/);
   await withGenerationOwnerScope(arena, (scope) => {
     expect(scope).toBeInstanceOf(GenerationOwnerScope);
   });
+});
+
+test("REGRESSION (r2 finding 6): a hand-constructed PublishedGeneration mints no seedable token", async () => {
+  const arena = new EntryArena();
+  // The publication capability was claimed by the owner module at init.
+  expect(() => takePublicationCapability()).toThrow(/already claimed/);
+
+  const slot = arena.internExact(entry("a.txt"));
+  expect(
+    () => new PublishedGeneration(Symbol("forged"), arena, 1, [{ path: "a.txt", state: { slot, pathEpoch: 0 } }]),
+  ).toThrow(/only by publishGeneration/);
+
+  // Even a shape-compatible impostor token resolves to nothing.
+  const impostor = Object.freeze({ kind: "published" as const, generationId: 1 });
+  expect(() => resolvePublishedGeneration(impostor)).toThrow(/not live/);
+  await withGenerationOwnerScope(arena, (scope) => {
+    expect(() => scope.createOwner({ seedFrom: impostor })).toThrow(/not live/);
+  });
+
+  arena.release(slot);
+  expect(arena.stats()).toMatchObject({ liveSlots: 0, retains: 0 });
 });

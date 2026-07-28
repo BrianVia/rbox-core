@@ -291,6 +291,50 @@ test("the worker DTO carries path, expected version and entry — never a token"
   });
 });
 
+test("REGRESSION (r2 finding 5): seeding never re-reads the caller's entry after interning", async () => {
+  const arena = new EntryArena();
+  await withGenerationOwnerScope(arena, async (scope) => {
+    // The arena consumes the source exactly while producing its own frozen copy;
+    // any read after that would throw and strand the provisional retain.
+    let reads = 0;
+    const hostile = {
+      sha256: "sha-a.txt",
+      size: 3,
+      mode: 0o644,
+      mtimeMs: 1000,
+      type: "file" as const,
+      get path(): string {
+        if (++reads > 2) throw new Error("path accessor exploded");
+        return "a.txt";
+      },
+    };
+    const { owner, token } = scope.createOwner({ entries: [hostile as FileEntry] });
+    expect(candidateRef(owner, "a.txt")!.entry.path).toBe("a.txt");
+    expect(arena.stats()).toMatchObject({ liveSlots: 1, retains: 1 });
+    await discardGeneration(owner, token);
+    expect(arena.stats()).toMatchObject({ liveSlots: 0, retains: 0 });
+  });
+});
+
+test("REGRESSION (r2 finding 5): a mid-iteration intern failure leaves no provisional retain", async () => {
+  const arena = new EntryArena();
+  await withGenerationOwnerScope(arena, (scope) => {
+    const hostile = {
+      sha256: "sha-b.txt",
+      size: 3,
+      mode: 0o644,
+      mtimeMs: 1000,
+      type: "file" as const,
+      get path(): string {
+        throw new Error("path accessor exploded");
+      },
+    };
+    expect(() => scope.createOwner({ entries: [entry("a.txt"), hostile as FileEntry] })).toThrow("path accessor exploded");
+    expect(scope.liveOwnerIds).toEqual([]);
+    expect(arena.stats()).toMatchObject({ liveSlots: 0, retains: 0 });
+  });
+});
+
 test("REGRESSION (finding 8): a seed iterator that throws leaks no retains", async () => {
   const arena = new EntryArena();
   await withGenerationOwnerScope(arena, (scope) => {

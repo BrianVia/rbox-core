@@ -50,6 +50,13 @@ export interface EntryLease {
 
 export type ReplacementDisposition = "unchanged" | "replaced";
 
+/** What a worker's apply callback sees. Deliberately WITHOUT a token: workers
+ *  never hold mutation authority, not even transitively through a result. */
+export interface WorkerReplacementResult {
+  readonly entry: OwnedEntryRef;
+  readonly disposition: ReplacementDisposition;
+}
+
 export type WorkerLifecycleState =
   | "registered"
   | "running"

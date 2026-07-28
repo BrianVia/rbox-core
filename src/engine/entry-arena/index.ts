@@ -1,12 +1,21 @@
 /**
  * Public surface of the U0 entry-interning unit. Deliberately absent:
- * `createOwnerControl`, `authenticateOwner`, `seedCandidate`, `discardUnseeded`,
- * `abortControl`, `controlOfOwner`, `replaceOnOwnerQueue`, `OwnerControl`, and
- * `CandidateGeneration`, plus the construction keys — the mutable builder, the
- * raw control block, and the capability minting stay module-private, and
+ * `takeOwnerCapability`, `takePublicationCapability`, `OwnerControl`,
+ * `OwnerHandle`, and `CandidateGeneration`. The minting capabilities are
+ * claim-once handoffs consumed at module initialization by their single
+ * legitimate consumer, the raw control block is unreachable, and
  * `withGenerationOwnerScope` is the only owner construction path.
  */
-export { EntryArena, defaultFingerprint, sameEntryExact, type ArenaSlot, type ArenaStats, type EntryArenaOptions } from "./arena.js";
+export {
+  EntryArena,
+  MAX_EXTENSION_DEPTH,
+  canonicalEntryKey,
+  defaultFingerprint,
+  sameEntryExact,
+  type ArenaSlot,
+  type ArenaStats,
+  type EntryArenaOptions,
+} from "./arena.js";
 export { withCipherDescriptor, type CipherDescriptor } from "./cipher-descriptor.js";
 export { PublishedGeneration } from "./generation.js";
 export {
@@ -14,6 +23,7 @@ export {
   EntryShapeError,
   GenerationOwnerCapabilityError,
   GenerationReplacementConflict,
+  OwnerReentrancyError,
   WorkerLifecycleError,
   type ReplacementConflictReason,
 } from "./errors.js";
@@ -23,6 +33,7 @@ export {
   discardGeneration,
   inspectOwner,
   publishGeneration,
+  registerWorker,
   replaceInternedEntry,
   workerRequest,
   type AbortOutcome,
@@ -31,7 +42,7 @@ export {
   type ReplaceInternedEntryArgs,
   type ReplaceInternedEntryResult,
 } from "./owner.js";
-export { registerWorker, type WorkerApplyContext, type WorkerRegistration } from "./workers.js";
+export type { WorkerApplyContext, WorkerRegistration } from "./workers.js";
 export { withGenerationOwnerScope, type CandidateSeed, type GenerationOwnerScope } from "./scope.js";
 export type {
   EntryLease,
@@ -46,5 +57,6 @@ export type {
   WorkerEntryRequest,
   WorkerIntakeState,
   WorkerLifecycleState,
+  WorkerReplacementResult,
   WorkerResultId,
 } from "./tokens.js";

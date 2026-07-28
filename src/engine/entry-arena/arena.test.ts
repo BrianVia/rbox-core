@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import type { FileEntry } from "../types.js";
-import { EntryArena, defaultFingerprint, sameEntryExact } from "./arena.js";
+import { EntryArena, MAX_EXTENSION_DEPTH, canonicalEntryKey, defaultFingerprint, sameEntryExact } from "./arena.js";
 import { withCipherDescriptor } from "./cipher-descriptor.js";
 import { EntryShapeError } from "./errors.js";
 
@@ -85,11 +85,56 @@ test("extension members participate in exact interning", () => {
   arena.release(extended);
 });
 
-test("composite extension values are refused at intern time", () => {
+test("REGRESSION (r2 finding 7): structurally equal extras intern together regardless of key order", () => {
   const arena = new EntryArena();
-  for (const value of [{ nested: 1 }, [1, 2], () => 1, Symbol("x"), null]) {
-    expect(() => arena.internExact({ ...entry(), extension: value } as unknown as FileEntry)).toThrow(EntryShapeError);
+  const first = arena.internExact({ ...entry(), extras: { b: [1, { z: 1, y: 2 }], a: "x" } } as unknown as FileEntry);
+  const second = arena.internExact({ ...entry(), extras: { a: "x", b: [1, { y: 2, z: 1 }] } } as unknown as FileEntry);
+  expect(second).toBe(first);
+  expect(Object.is(second.entry, first.entry)).toBe(true);
+  arena.release(first);
+  arena.release(second);
+  expect(arena.stats()).toMatchObject({ liveSlots: 0, retains: 0 });
+});
+
+test("REGRESSION (r2 finding 7): absent, null, {} and [] extras are four distinct values", () => {
+  const arena = new EntryArena();
+  const slots = [
+    arena.internExact(entry()),
+    arena.internExact({ ...entry(), extras: null } as unknown as FileEntry),
+    arena.internExact({ ...entry(), extras: undefined } as unknown as FileEntry),
+    arena.internExact({ ...entry(), extras: {} } as unknown as FileEntry),
+    arena.internExact({ ...entry(), extras: [] } as unknown as FileEntry),
+  ];
+  expect(new Set(slots.map((slot) => slot.id)).size).toBe(5);
+  expect(arena.stats().liveSlots).toBe(5);
+  for (const slot of slots) arena.release(slot);
+  expect(arena.stats()).toMatchObject({ liveSlots: 0, retains: 0 });
+});
+
+test("REGRESSION (r2 finding 7): the arena deep-copies and deep-freezes extras", () => {
+  const arena = new EntryArena();
+  const extras = { nested: { list: [1, 2] } };
+  const slot = arena.internExact({ ...entry(), extras } as unknown as FileEntry);
+  const interned = (slot.entry as Record<string, unknown>).extras as { nested: { list: number[] } };
+  expect(interned).not.toBe(extras);
+  extras.nested.list.push(3);
+  extras.nested = { list: [9] };
+  expect(interned.nested.list).toEqual([1, 2]);
+  expect(Object.isFrozen(interned)).toBe(true);
+  expect(Object.isFrozen(interned.nested)).toBe(true);
+  expect(Object.isFrozen(interned.nested.list)).toBe(true);
+  expect(() => interned.nested.list.push(4)).toThrow();
+  arena.release(slot);
+});
+
+test("values JSON cannot produce, and unbounded nesting, are refused", () => {
+  const arena = new EntryArena();
+  for (const value of [() => 1, Symbol("x"), 1n]) {
+    expect(() => arena.internExact({ ...entry(), extras: value } as unknown as FileEntry)).toThrow(EntryShapeError);
   }
+  let deep: unknown = 1;
+  for (let i = 0; i <= MAX_EXTENSION_DEPTH + 1; i++) deep = { deep };
+  expect(() => arena.internExact({ ...entry(), extras: deep } as unknown as FileEntry)).toThrow(EntryShapeError);
   expect(arena.stats()).toMatchObject({ liveSlots: 0, retains: 0 });
 });
 
@@ -131,10 +176,12 @@ test("slot ids are monotonic and never reused", () => {
   arena.release(recycled);
 });
 
-test("defaultFingerprint is stable across key order", () => {
+test("the canonical key and its fingerprint are stable across key order", () => {
   const a: Record<string, unknown> = { path: "a", sha256: "x", size: 1, mode: 0, mtimeMs: 0, type: "file" };
   const b: Record<string, unknown> = { type: "file", mtimeMs: 0, mode: 0, size: 1, sha256: "x", path: "a" };
-  expect(defaultFingerprint(a as unknown as FileEntry)).toBe(defaultFingerprint(b as unknown as FileEntry));
+  const keyA = canonicalEntryKey(a as unknown as FileEntry);
+  expect(keyA).toBe(canonicalEntryKey(b as unknown as FileEntry));
+  expect(defaultFingerprint(keyA)).toBe(defaultFingerprint(canonicalEntryKey(b as unknown as FileEntry)));
 });
 
 test("withCipherDescriptor is pure and preserves extension members", () => {

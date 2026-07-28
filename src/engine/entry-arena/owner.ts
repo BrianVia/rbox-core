@@ -8,15 +8,18 @@
  * WeakMap authenticates only — it owns no lifetime and is never enumerated;
  * lifetime belongs to `GenerationOwnerScope`'s strong, enumerable registry.
  *
- * `createOwnerControl`/`authenticateOwner` demand a module-private construction
- * key, so a deep import cannot mint an owner outside a scope.
+ * NOTHING exported from this module yields an `OwnerControl` or mints an owner.
+ * The minting capability is handed to the scope module exactly once, at module
+ * initialization, through `takeOwnerCapability()`; a later importer gets a
+ * throw. Worker code receives a narrow port, never a control.
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { FileEntry } from "../types.js";
 import type { EntryArena } from "./arena.js";
-import { CandidateGeneration, PublishedGeneration } from "./generation.js";
-import { GenerationOwnerCapabilityError, GenerationReplacementConflict, WorkerLifecycleError } from "./errors.js";
-import { OWNER_CONSTRUCTION_KEY, requireConstructionKey, type OwnerConstructionKey } from "./internal.js";
+import { CandidateGeneration, PublishedGeneration, takePublicationCapability } from "./generation.js";
+import { GenerationOwnerCapabilityError, GenerationReplacementConflict, OwnerReentrancyError } from "./errors.js";
 import { SerializedQueue } from "./queue.js";
+import { createRegistration, type WorkerOwnerPort, type WorkerRecord, type WorkerRegistration } from "./workers.js";
 import {
   makeVersionToken,
   sameVersion,
@@ -27,7 +30,6 @@ import {
   type ReplacementDisposition,
   type WorkerEntryRequest,
   type WorkerIntakeState,
-  type WorkerLifecycleState,
   type WorkerResultId,
 } from "./tokens.js";
 
@@ -36,6 +38,8 @@ export interface GenerationOwnerLease {
 }
 
 export type AbortOutcome = "aborted" | "already-terminal";
+
+const publish = takePublicationCapability();
 
 interface Deferred<T> {
   promise: Promise<T>;
@@ -48,14 +52,14 @@ function deferred<T>(): Deferred<T> {
   return { promise, resolve };
 }
 
-export interface WorkerRecord {
-  readonly id: WorkerResultId;
-  state: WorkerLifecycleState;
-  discardOnReturn: boolean;
-  readonly cancel?: () => void;
+/** One publication/discard in flight. The expectation follows ONLY an unbroken
+ *  chain of this drain's own worker callbacks; anything else poisons it. */
+interface DrainState {
+  expectation: GenerationMutationToken;
+  poisoned: boolean;
 }
 
-export interface OwnerControl {
+interface OwnerControl {
   readonly ownerId: number;
   readonly arena: EntryArena;
   readonly candidate: CandidateGeneration;
@@ -66,87 +70,35 @@ export interface OwnerControl {
    *  hook can neither skip a later hook nor strand the abort promise. */
   readonly abortHookErrors: unknown[];
   currentToken: GenerationMutationToken | null;
-  /** The token a publication/discard in progress expects to still see. Only
-   *  advances made by that drain's own worker-return callbacks update it. */
-  drainExpectation: GenerationMutationToken | null;
+  drain: DrainState | null;
   terminalState: OwnerTerminalState;
   workerIntake: WorkerIntakeState;
   pendingResults: number;
   nextTokenSequence: number;
   nextWorkerId: number;
   drainWaiters: Array<() => void>;
-  releaseCallbackDepth: number;
+  port?: WorkerOwnerPort;
   abort?: Deferred<AbortOutcome>;
 }
 
 /** Isolate-private capability registry. Never enumerated, never a lifetime. */
 const OWNER_CONTROLS = new WeakMap<GenerationOwnerLease, OwnerControl>();
 
+/** Owners whose resource-release callback is currently executing, propagated
+ *  across awaits. A terminal call on one of these from inside its own release
+ *  callback is a cycle, so it fails loudly instead of hanging. */
+const RELEASE_CONTEXT = new AsyncLocalStorage<ReadonlySet<OwnerControl>>();
+
 let nextOwnerId = 1;
 
-export function controlOfOwner(owner: GenerationOwnerLease): OwnerControl {
+function controlOf(owner: GenerationOwnerLease): OwnerControl {
   const control = OWNER_CONTROLS.get(owner);
   if (!control) throw new GenerationOwnerCapabilityError();
   return control;
 }
 
-export function authenticateOwner(key: OwnerConstructionKey, owner: GenerationOwnerLease): OwnerControl {
-  requireConstructionKey(key, OWNER_CONSTRUCTION_KEY, "authenticateOwner");
-  return controlOfOwner(owner);
-}
-
-/** Creates an UNSEEDED owner. The caller registers the control in its scope
- *  BEFORE seeding, so a throwing seed iterator can never leak retains that the
- *  strong registry cannot find (see `seedCandidate`/`discardUnseeded`). */
-export function createOwnerControl(
-  key: OwnerConstructionKey,
-  arena: EntryArena,
-  onTerminal: (ownerId: number) => void,
-): { owner: GenerationOwnerLease; token: GenerationMutationToken; control: OwnerControl } {
-  requireConstructionKey(key, OWNER_CONSTRUCTION_KEY, "createOwnerControl");
-  const ownerId = nextOwnerId++;
-  const control: OwnerControl = {
-    ownerId,
-    arena,
-    candidate: new CandidateGeneration(arena, arena.allocateGenerationId()),
-    queue: new SerializedQueue(),
-    workerResults: new Map(),
-    onTerminal,
-    abortHookErrors: [],
-    currentToken: null,
-    drainExpectation: null,
-    terminalState: "live",
-    workerIntake: "open",
-    pendingResults: 0,
-    nextTokenSequence: 1,
-    nextWorkerId: 1,
-    drainWaiters: [],
-    releaseCallbackDepth: 0,
-  };
-  const token = advanceToken(control);
-  const owner: GenerationOwnerLease = Object.freeze({ ownerId });
-  OWNER_CONTROLS.set(owner, control);
-  return { owner, token, control };
-}
-
-export function seedCandidate(
-  key: OwnerConstructionKey,
-  control: OwnerControl,
-  entries: Iterable<Readonly<FileEntry>>,
-): void {
-  requireConstructionKey(key, OWNER_CONSTRUCTION_KEY, "seedCandidate");
-  control.candidate.seed(entries);
-}
-
-/** Unwind for a seed that threw: the control is already registered, so its
- *  partial retains are released and the control leaves the registry terminal. */
-export function discardUnseeded(key: OwnerConstructionKey, control: OwnerControl): void {
-  requireConstructionKey(key, OWNER_CONSTRUCTION_KEY, "discardUnseeded");
-  control.candidate.releaseAll();
-  control.terminalState = "discarded";
-  control.currentToken = null;
-  control.workerResults.clear();
-  control.onTerminal(control.ownerId);
+function requireNoReleaseCycle(control: OwnerControl, operation: string): void {
+  if (RELEASE_CONTEXT.getStore()?.has(control)) throw new OwnerReentrancyError(operation);
 }
 
 function advanceToken(control: OwnerControl): GenerationMutationToken {
@@ -159,7 +111,7 @@ function advanceToken(control: OwnerControl): GenerationMutationToken {
   return token;
 }
 
-export function requireOwnerLive(control: OwnerControl): void {
+function requireLive(control: OwnerControl): void {
   if (control.terminalState !== "live") throw new GenerationReplacementConflict("not-live", control.terminalState);
 }
 
@@ -183,13 +135,13 @@ export interface ReplaceInternedEntryResult {
 
 /** Runs already on the owner queue. Every retain change and the `currentToken`
  *  update happen inside this one synchronous step. */
-export function replaceOnOwnerQueue(
+function replaceOnQueue(
   control: OwnerControl,
   args: Omit<ReplaceInternedEntryArgs, "owner">,
   viaWorkerCallback: boolean,
 ): ReplaceInternedEntryResult {
   const { token, path, expected, next } = args;
-  requireOwnerLive(control);
+  requireLive(control);
   requireCurrentToken(control, token);
   if (next.path !== path) throw new GenerationReplacementConflict("path-mismatch", `${next.path} !== ${path}`);
   const state = control.candidate.state(path);
@@ -205,23 +157,32 @@ export function replaceOnOwnerQueue(
     }
     const entry = control.candidate.replace(path, provisional);
     handedOff = true;
-    const advanced = advanceToken(control);
-    // The coordinator knows which advances are its own drain's; only those keep
-    // a publication's expectation current (design 163 §1446-1453, §1472-1474).
-    if (viaWorkerCallback && control.drainExpectation) control.drainExpectation = advanced;
-    return { token: advanced, entry, disposition: "replaced" };
+    // A drain's expectation may only follow an UNBROKEN chain of that drain's
+    // own callbacks. An outside advance — or a worker replaying a laundered
+    // outside token — poisons it and fails the terminal step.
+    const drain = control.drain;
+    if (drain) {
+      if (viaWorkerCallback && token === drain.expectation) drain.expectation = advanceToken(control);
+      else {
+        drain.poisoned = true;
+        advanceToken(control);
+      }
+    } else {
+      advanceToken(control);
+    }
+    return { token: control.currentToken!, entry, disposition: "replaced" };
   } finally {
     if (!handedOff) control.arena.release(provisional);
   }
 }
 
 export function replaceInternedEntry(args: ReplaceInternedEntryArgs): Promise<ReplaceInternedEntryResult> {
-  const control = controlOfOwner(args.owner);
-  return control.queue.run(() => replaceOnOwnerQueue(control, args, false));
+  const control = controlOf(args.owner);
+  return control.queue.run(() => replaceOnQueue(control, args, false));
 }
 
 export function candidateRef(owner: GenerationOwnerLease, path: string): OwnedEntryRef | undefined {
-  return controlOfOwner(owner).candidate.ref(path);
+  return controlOf(owner).candidate.ref(path);
 }
 
 /** The immutable DTO a crypto worker receives — never the owner, never a token. */
@@ -242,7 +203,7 @@ export interface OwnerSnapshot {
 }
 
 export function inspectOwner(owner: GenerationOwnerLease): OwnerSnapshot {
-  const control = controlOfOwner(owner);
+  const control = controlOf(owner);
   return {
     ownerId: control.ownerId,
     generationId: control.candidate.generationId,
@@ -259,7 +220,7 @@ function drained(control: OwnerControl): Promise<void> {
   return new Promise<void>((resolve) => control.drainWaiters.push(resolve));
 }
 
-export function settleOwnerDrain(control: OwnerControl): void {
+function settleDrain(control: OwnerControl): void {
   if (control.pendingResults !== 0) return;
   const waiters = control.drainWaiters;
   control.drainWaiters = [];
@@ -277,57 +238,45 @@ function finalizeAbort(control: OwnerControl): void {
 }
 
 /** Close intake, wait off-queue for every registered worker to reach `done`,
- *  then re-enter the queue to finalize. A returned-but-queued result therefore
- *  blocks the terminal step until its replacement/discard and release complete.
- *
- * The caller proves the exact current token at initiation; from there the
- * expectation follows this drain's own worker callbacks. Any advance made from
- * outside the drain leaves `currentToken !== drainExpectation` and fails the
- * terminal step. */
+ *  then re-enter the queue to finalize. A returned-but-queued result blocks the
+ *  terminal step until its replacement/discard and release complete. */
 async function closeAndDrain(control: OwnerControl, token: GenerationMutationToken): Promise<void> {
   await control.queue.run(() => {
-    requireOwnerLive(control);
+    requireLive(control);
+    if (control.drain) throw new GenerationReplacementConflict("pending-results", "another terminal operation is draining");
     requireCurrentToken(control, token);
     control.workerIntake = "closed";
-    control.drainExpectation = control.currentToken;
+    control.drain = { expectation: control.currentToken!, poisoned: false };
   });
-  await drained(control);
-}
-
-/** A resource-release callback must not SYNCHRONOUSLY start a terminal operation
- *  on its own owner: its registration is still pending, so that operation could
- *  only finish after the settlement that is waiting for the callback. Release
- *  runs off-queue, so this is a cycle detector, not a queue-occupancy fix. */
-function requireNotInReleaseCallback(control: OwnerControl, operation: string): void {
-  if (control.releaseCallbackDepth > 0) {
-    throw new WorkerLifecycleError(`${operation} cannot be called from a resource-release callback of the same owner`);
+  try {
+    await drained(control);
+  } catch (error) {
+    control.drain = null;
+    throw error;
   }
 }
 
-function requireDrainExpectation(control: OwnerControl): void {
-  const expected = control.drainExpectation;
-  control.drainExpectation = null;
-  if (control.currentToken !== expected) {
+function takeDrain(control: OwnerControl): DrainState {
+  const drain = control.drain;
+  control.drain = null;
+  if (!drain || drain.poisoned || control.currentToken !== drain.expectation) {
     throw new GenerationReplacementConflict("stale-token", "the candidate advanced outside this drain");
   }
+  return drain;
 }
 
 export async function publishGeneration(
   owner: GenerationOwnerLease,
   token: GenerationMutationToken,
 ): Promise<PublishedGeneration> {
-  const control = controlOfOwner(owner);
-  requireNotInReleaseCallback(control, "publishGeneration");
+  const control = controlOf(owner);
+  requireNoReleaseCycle(control, "publishGeneration");
   await closeAndDrain(control, token);
   return control.queue.run(() => {
-    requireOwnerLive(control);
+    requireLive(control);
     if (control.pendingResults !== 0) throw new GenerationReplacementConflict("pending-results");
-    requireDrainExpectation(control);
-    const published = new PublishedGeneration(
-      control.arena,
-      control.candidate.generationId,
-      control.candidate.transfer(),
-    );
+    takeDrain(control);
+    const published = publish(control.arena, control.candidate.generationId, control.candidate.transfer());
     control.terminalState = "published";
     control.currentToken = null;
     control.workerResults.clear();
@@ -340,13 +289,13 @@ export async function discardGeneration(
   owner: GenerationOwnerLease,
   token: GenerationMutationToken,
 ): Promise<void> {
-  const control = controlOfOwner(owner);
-  requireNotInReleaseCallback(control, "discardGeneration");
+  const control = controlOf(owner);
+  requireNoReleaseCycle(control, "discardGeneration");
   await closeAndDrain(control, token);
   await control.queue.run(() => {
-    requireOwnerLive(control);
+    requireLive(control);
     if (control.pendingResults !== 0) throw new GenerationReplacementConflict("pending-results");
-    requireDrainExpectation(control);
+    takeDrain(control);
     control.candidate.releaseAll();
     control.terminalState = "discarded";
     control.currentToken = null;
@@ -357,12 +306,11 @@ export async function discardGeneration(
 
 /** Unconditional terminal API: authenticates the owner, accepts no token. */
 export function abortGeneration(owner: GenerationOwnerLease): Promise<AbortOutcome> {
-  const control = controlOfOwner(owner);
-  requireNotInReleaseCallback(control, "abortGeneration");
-  return abortControl(control);
+  return abortControl(controlOf(owner), "abortGeneration");
 }
 
-export function abortControl(control: OwnerControl): Promise<AbortOutcome> {
+function abortControl(control: OwnerControl, operation: string): Promise<AbortOutcome> {
+  requireNoReleaseCycle(control, operation);
   if (control.abort) return control.abort.promise.then(() => "already-terminal" as const);
   if (control.terminalState !== "live") return Promise.resolve("already-terminal" as const);
   const pending = deferred<AbortOutcome>();
@@ -377,7 +325,7 @@ export function abortControl(control: OwnerControl): Promise<AbortOutcome> {
     control.workerIntake = "closed";
     control.terminalState = "aborting";
     control.currentToken = null;
-    control.drainExpectation = null;
+    control.drain = null;
     for (const record of control.workerResults.values()) {
       if (record.state === "done") continue;
       record.discardOnReturn = true;
@@ -391,4 +339,107 @@ export function abortControl(control: OwnerControl): Promise<AbortOutcome> {
     if (control.pendingResults === 0) finalizeAbort(control);
   });
   return pending.promise;
+}
+
+function portFor(control: OwnerControl): WorkerOwnerPort {
+  control.port ??= {
+    runOnQueue: (task) => control.queue.run(task),
+    isLive: () => control.terminalState === "live",
+    replace: (path, expected, next) => {
+      if (!control.currentToken) throw new GenerationReplacementConflict("stale-token");
+      const result = replaceOnQueue(control, { token: control.currentToken, path, expected, next }, true);
+      return { entry: result.entry, disposition: result.disposition };
+    },
+    finishWorker: (record) => {
+      control.workerResults.delete(record.id);
+      control.pendingResults--;
+      settleDrain(control);
+    },
+    runRelease: (run) => {
+      const store = new Set(RELEASE_CONTEXT.getStore() ?? []);
+      store.add(control);
+      return RELEASE_CONTEXT.run(store, run);
+    },
+  };
+  return control.port;
+}
+
+export function registerWorker(
+  owner: GenerationOwnerLease,
+  options: { cancel?: () => void } = {},
+): Promise<WorkerRegistration> {
+  const control = controlOf(owner);
+  return control.queue.run(() => {
+    requireLive(control);
+    if (control.workerIntake !== "open") throw new GenerationReplacementConflict("intake-closed");
+    const record: WorkerRecord = {
+      id: control.nextWorkerId++,
+      state: "registered",
+      discardOnReturn: false,
+      cancel: options.cancel,
+    };
+    control.workerResults.set(record.id, record);
+    control.pendingResults++;
+    return createRegistration(portFor(control), record);
+  });
+}
+
+/** The registry entry the scope owns: a strong, enumerable handle with exactly
+ *  the operations teardown needs and no way back to the control block. */
+export interface OwnerHandle {
+  readonly owner: GenerationOwnerLease;
+  readonly token: GenerationMutationToken;
+  readonly ownerId: number;
+  seed(entries: Iterable<Readonly<FileEntry>>): void;
+  discardUnseeded(): void;
+  abort(operation: string): Promise<AbortOutcome>;
+}
+
+export type OwnerCapability = (arena: EntryArena, onTerminal: (ownerId: number) => void) => OwnerHandle;
+
+let unclaimedOwnerCapability: OwnerCapability | null = (arena, onTerminal) => {
+  const ownerId = nextOwnerId++;
+  const control: OwnerControl = {
+    ownerId,
+    arena,
+    candidate: new CandidateGeneration(arena, arena.allocateGenerationId()),
+    queue: new SerializedQueue(),
+    workerResults: new Map(),
+    onTerminal,
+    abortHookErrors: [],
+    currentToken: null,
+    drain: null,
+    terminalState: "live",
+    workerIntake: "open",
+    pendingResults: 0,
+    nextTokenSequence: 1,
+    nextWorkerId: 1,
+    drainWaiters: [],
+  };
+  const token = advanceToken(control);
+  const owner: GenerationOwnerLease = Object.freeze({ ownerId });
+  OWNER_CONTROLS.set(owner, control);
+  return {
+    owner,
+    token,
+    ownerId,
+    seed: (entries) => control.candidate.seed(entries),
+    discardUnseeded: () => {
+      control.candidate.releaseAll();
+      control.terminalState = "discarded";
+      control.currentToken = null;
+      control.workerResults.clear();
+      control.onTerminal(ownerId);
+    },
+    abort: (operation) => abortControl(control, operation),
+  };
+};
+
+/** Claim-once handoff to the scope module, taken when it initializes. A later
+ *  deep import gets a throw, so minting an owner is not importable. */
+export function takeOwnerCapability(): OwnerCapability {
+  if (!unclaimedOwnerCapability) throw new GenerationOwnerCapabilityError("the owner capability was already claimed");
+  const claimed = unclaimedOwnerCapability;
+  unclaimedOwnerCapability = null;
+  return claimed;
 }

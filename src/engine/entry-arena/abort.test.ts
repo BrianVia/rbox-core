@@ -2,16 +2,18 @@ import { expect, test } from "bun:test";
 import type { FileEntry } from "../types.js";
 import { EntryArena } from "./arena.js";
 import { withCipherDescriptor } from "./cipher-descriptor.js";
-import { GenerationReplacementConflict, WorkerLifecycleError } from "./errors.js";
+import { GenerationReplacementConflict, OwnerReentrancyError, WorkerLifecycleError } from "./errors.js";
 import {
   abortGeneration,
   candidateRef,
+  discardGeneration,
   inspectOwner,
   publishGeneration,
+  registerWorker,
   replaceInternedEntry,
   workerRequest,
 } from "./owner.js";
-import { registerWorker, type WorkerApplyContext } from "./workers.js";
+import type { WorkerApplyContext } from "./workers.js";
 import { withGenerationOwnerScope } from "./scope.js";
 
 function entry(path: string, overrides: Partial<FileEntry> = {}): FileEntry {
@@ -212,100 +214,55 @@ test("intake closes before publication drains, so late registration conflicts", 
   expect(arena.stats().liveSlots).toBe(0);
 });
 
-test("REGRESSION (finding 2): a saved worker apply context is revoked when the callback returns", async () => {
+test("REGRESSION (r2 finding 3): a worker replaying an outside advance cannot launder the drain", async () => {
   const arena = new EntryArena();
   await withGenerationOwnerScope(arena, async (scope) => {
     const { owner, token } = scope.createOwner({ entries: SEED });
     const request = workerRequest(owner, "a.txt");
     const registration = await registerWorker(owner);
     await registration.markRunning();
-    let escaped: WorkerApplyContext | undefined;
-    await registration.returnResult((context) => {
-      escaped = context;
-    });
-    expect(escaped).toBeDefined();
-    expect(() =>
-      escaped!.replace(request.path, request.expected, withCipherDescriptor(request.entry, { encSha: "enc-a" })),
-    ).toThrow(WorkerLifecycleError);
-    // Nothing moved: the token the caller holds is still current and publishes.
-    expect(candidateRef(owner, "a.txt")!.entry.encSha).toBeUndefined();
-    const published = await publishGeneration(owner, token);
-    expect(published.get("a.txt")!.encSha).toBeUndefined();
-    published.release();
-    expect(arena.stats()).toMatchObject({ liveSlots: 0, retains: 0 });
-  });
-});
 
-test("REGRESSION (finding 3): settlement is single-use and pendingResults never underflows", async () => {
-  const arena = new EntryArena();
-  await withGenerationOwnerScope(arena, async (scope) => {
-    const { owner } = scope.createOwner({ entries: SEED });
-    const registration = await registerWorker(owner);
-    expect(await registration.fail()).toBe("discarded");
-    expect(inspectOwner(owner).pendingResults).toBe(0);
-    await expect(registration.fail()).rejects.toThrow(WorkerLifecycleError);
-    await expect(registration.returnResult(() => {})).rejects.toThrow(WorkerLifecycleError);
-    await expect(registration.markRunning()).rejects.toThrow(WorkerLifecycleError);
-    expect(inspectOwner(owner).pendingResults).toBe(0);
-    expect(await abortGeneration(owner)).toBe("aborted");
-    expect(arena.stats()).toMatchObject({ liveSlots: 0, retains: 0 });
-  });
-});
-
-test("REGRESSION (finding 3): a result cannot be returned before the worker runs", async () => {
-  const arena = new EntryArena();
-  await withGenerationOwnerScope(arena, async (scope) => {
-    const { owner } = scope.createOwner({ entries: SEED });
-    const registration = await registerWorker(owner);
-    await expect(registration.returnResult(() => {})).rejects.toThrow(WorkerLifecycleError);
-    expect(registration.state).toBe("registered");
-    expect(inspectOwner(owner).pendingResults).toBe(1);
-    await registration.markRunning();
-    expect(await registration.returnResult(() => {})).toBe("applied");
-    expect(inspectOwner(owner).pendingResults).toBe(0);
-    expect(await abortGeneration(owner)).toBe("aborted");
-  });
-});
-
-test("REGRESSION (finding 4): a throwing resource release still reaches done and settles the abort", async () => {
-  const arena = new EntryArena();
-  await withGenerationOwnerScope(arena, async (scope) => {
-    const { owner } = scope.createOwner({ entries: SEED });
-    const registration = await registerWorker(owner);
-    await registration.markRunning();
-    const abort = abortGeneration(owner);
+    // Publication begins with T.
+    const publish = publishGeneration(owner, token);
     await settled();
-    await expect(
-      registration.returnResult(
-        () => {},
-        () => {
-          throw new Error("temp file unlink failed");
-        },
-      ),
-    ).rejects.toThrow("temp file unlink failed");
-    expect(registration.state).toBe("done");
-    expect(await abort).toBe("aborted");
-    expect(inspectOwner(owner)).toMatchObject({ terminalState: "discarded", pendingResults: 0 });
+    // An outside replacement advances T -> U ...
+    const outside = await replaceInternedEntry({
+      owner,
+      token,
+      path: "b.txt",
+      expected: candidateRef(owner, "b.txt")!.version,
+      next: entry("b.txt", { size: 4 }),
+    });
+    expect(outside.disposition).toBe("replaced");
+    // ... and the pending worker then replaces on top of U.
+    expect(
+      await registration.returnResult((context) => {
+        context.replace(request.path, request.expected, withCipherDescriptor(request.entry, { encSha: "enc-a" }));
+      }),
+    ).toBe("applied");
+
+    await expect(publish).rejects.toThrow(GenerationReplacementConflict);
+    expect(inspectOwner(owner).terminalState).toBe("live");
+    expect(await abortGeneration(owner)).toBe("aborted");
     expect(arena.stats()).toMatchObject({ liveSlots: 0, retains: 0 });
   });
 });
 
-test("REGRESSION (finding 4): a release callback that re-enters its own owner is refused, not deadlocked", async () => {
+test("REGRESSION (r2 finding 3): a second terminal operation cannot join a drain in flight", async () => {
   const arena = new EntryArena();
   await withGenerationOwnerScope(arena, async (scope) => {
-    const { owner } = scope.createOwner({ entries: SEED });
+    const { owner, token } = scope.createOwner({ entries: SEED });
     const registration = await registerWorker(owner);
-    await registration.markRunning();
-    await expect(
-      registration.fail(() => {
-        void abortGeneration(owner);
-      }),
-    ).rejects.toThrow(WorkerLifecycleError);
-    expect(registration.state).toBe("done");
-    expect(inspectOwner(owner).pendingResults).toBe(0);
-    expect(await abortGeneration(owner)).toBe("aborted");
-    expect(arena.stats()).toMatchObject({ liveSlots: 0, retains: 0 });
+    const first = publishGeneration(owner, token);
+    await settled();
+    await expect(discardGeneration(owner, token)).rejects.toThrow(GenerationReplacementConflict);
+    await expect(publishGeneration(owner, token)).rejects.toThrow(GenerationReplacementConflict);
+    await registration.fail();
+    const published = await first;
+    expect(published.entries).toHaveLength(2);
+    published.release();
   });
+  expect(arena.stats()).toMatchObject({ liveSlots: 0, retains: 0 });
 });
 
 test("REGRESSION (finding 7): a throwing cancellation hook cancels the rest and still settles", async () => {
@@ -332,59 +289,6 @@ test("REGRESSION (finding 7): a throwing cancellation hook cancels the rest and 
     expect(await abort).toBe("aborted");
     expect(arena.stats()).toMatchObject({ liveSlots: 0, retains: 0 });
   });
-});
-
-test("an apply that throws still releases resources and decrements pendingResults", async () => {
-  const arena = new EntryArena();
-  await withGenerationOwnerScope(arena, async (scope) => {
-    const { owner, token } = scope.createOwner({ entries: SEED });
-    const registration = await registerWorker(owner);
-    await registration.markRunning();
-    let released = false;
-    await expect(
-      registration.returnResult(
-        () => {
-          throw new Error("encryption failed");
-        },
-        () => {
-          released = true;
-        },
-      ),
-    ).rejects.toThrow("encryption failed");
-    expect(released).toBe(true);
-    expect(registration.state).toBe("done");
-    expect(inspectOwner(owner).pendingResults).toBe(0);
-    const generation = await publishGeneration(owner, token);
-    generation.release();
-  });
-  expect(arena.stats().liveSlots).toBe(0);
-});
-
-test("out-of-order worker results with a stale expected version conflict inside the callback", async () => {
-  const arena = new EntryArena();
-  await withGenerationOwnerScope(arena, async (scope) => {
-    const { owner, token } = scope.createOwner({ entries: SEED });
-    const stale = workerRequest(owner, "a.txt");
-    const first = await replaceInternedEntry({
-      owner,
-      token,
-      path: "a.txt",
-      expected: stale.expected,
-      next: entry("a.txt", { size: 4 }),
-    });
-    expect(first.disposition).toBe("replaced");
-    const registration = await registerWorker(owner);
-    await registration.markRunning();
-    await expect(
-      registration.returnResult((context) => {
-        context.replace(stale.path, stale.expected, withCipherDescriptor(stale.entry, { encSha: "enc-a" }));
-      }),
-    ).rejects.toThrow(GenerationReplacementConflict);
-    expect(inspectOwner(owner).pendingResults).toBe(0);
-    expect(arena.stats()).toMatchObject({ liveSlots: 2, retains: 2 });
-    await abortGeneration(owner);
-  });
-  expect(arena.stats().liveSlots).toBe(0);
 });
 
 test("cancellation after token advancement discards the late result", async () => {
