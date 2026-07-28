@@ -428,6 +428,30 @@ test("separate save processes serialize and leave one complete v1 document", asy
   await expect(fs.lstat(lockPath())).rejects.toThrow();
 });
 
+test("a fence released inside the inspection window is a retry, not a lost writer", async () => {
+  setSystemTime();
+  const fence = `${lockPath()}.fence`;
+  await fs.mkdir(path.dirname(fence), { mode: 0o700 });
+  const identity = await (await import("../engine/git/lockfile.js")).systemLockIdentity.current();
+  // A live peer holds the fence, so this writer's publication collides and it
+  // must inspect the holder's marker.
+  await fs.writeFile(fence, JSON.stringify({
+    v: 1, pid: process.pid, processStart: identity.startTime, acquiredAt: new Date().toISOString(), nonce: "e".repeat(32),
+  }), { mode: 0o600 });
+  let released = false;
+  restoreHook = installCredentialTestHook(async (seam, context) => {
+    // The peer finishes and releases in the one unfenced window that exists:
+    // between this writer's lstat of the fence and its open of the same path.
+    if (seam !== "marker-observe-before-open" || context.markerPath !== fence || released) return;
+    released = true;
+    await fs.unlink(fence);
+  });
+  await saveCredentials(credential);
+  expect(released).toBe(true);
+  expect(JSON.parse(await fs.readFile(credentialPath(), "utf8"))).toEqual({ v: 1, ...credential });
+  await expect(fs.lstat(fence)).rejects.toThrow();
+});
+
 test("five-minute stale main marker is taken over independent of its live PID", async () => {
   await fs.mkdir(path.dirname(lockPath()), { mode: 0o700 });
   const stale = { v: 1, pid: process.pid, processStart: "1", acquiredAt: fixedNow.toISOString(), nonce: "a".repeat(32) };

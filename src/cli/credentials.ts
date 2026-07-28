@@ -79,6 +79,7 @@ const NOFOLLOW = constants.O_NOFOLLOW ?? 0;
 
 type CredentialTestSeam =
   | "lock-before-acquire" | "lock-contended" | "load-before-mutation-lock"
+  | "marker-observe-before-open"
   | "marker-temp-opened" | "marker-temp-written" | "marker-temp-synced" | "marker-temp-closed"
   | "marker-before-link" | "marker-after-link" | "marker-before-temp-cleanup" | "marker-after-temp-cleanup"
   | "source-after-lstat" | "source-after-open" | "source-after-fstat" | "source-after-read"
@@ -286,6 +287,12 @@ function parseMarker(raw: string): MarkerV1 | undefined {
   }
 }
 
+/** A marker vanished or was replaced between its lstat and its open. For an
+ *  observer of someone else's marker that is a lock turnover, not a fault —
+ *  the same disposition `readMarkerNoFollow` gives "lock changed during
+ *  inspection". Owners of the marker still treat it as fatal by not catching it. */
+class MarkerTurnoverError extends Error {}
+
 async function readMarker(markerPath: string): Promise<MarkerObservation | undefined> {
   let before;
   try {
@@ -296,10 +303,17 @@ async function readMarker(markerPath: string): Promise<MarkerObservation | undef
   }
   const beforeObs = observation(before);
   if (!regular(beforeObs.mode)) throw new Error(`unsafe credential lock marker: ${markerPath}`);
-  const handle = await fs.open(markerPath, constants.O_RDONLY | NOFOLLOW);
+  await testSeam("marker-observe-before-open", { markerPath });
+  let handle: fs.FileHandle;
+  try {
+    handle = await fs.open(markerPath, constants.O_RDONLY | NOFOLLOW);
+  } catch (error) {
+    if (["ENOENT", "ELOOP"].includes(errno(error) ?? "")) throw new MarkerTurnoverError(`credential lock marker changed during inspection: ${markerPath}`);
+    throw error;
+  }
   try {
     const opened = observation(await handle.stat({ bigint: true }));
-    if (!sameIdentity(beforeObs, opened)) throw new Error(`credential lock marker changed during inspection: ${markerPath}`);
+    if (!sameIdentity(beforeObs, opened)) throw new MarkerTurnoverError(`credential lock marker changed during inspection: ${markerPath}`);
     if (opened.size > BigInt(MARKER_MAX_BYTES)) throw new Error(`credential lock marker exceeds ${MARKER_MAX_BYTES} bytes: ${markerPath}`);
     const bytes = Buffer.alloc(Number(opened.size));
     let offset = 0;
@@ -388,6 +402,28 @@ async function unlinkObserved(target: string, expected: PathObservation, durable
   return true;
 }
 
+/** Inspect a fence this process failed to publish. The holder can release at
+ *  any instant — nothing fences the fence — so a marker that is absent, turns
+ *  over mid-inspection, or belongs to a proven-dead incarnation only means
+ *  "look again", never a failed acquisition. */
+async function inspectHeldFence(markerPath: string): Promise<"retry" | "held"> {
+  try {
+    const held = await readMarker(markerPath);
+    if (!held) return "retry";
+    const now = Date.now();
+    if (held.mtimeMs > now || Date.parse(held.marker.acquiredAt) > now) throw new Error(`future-dated credential fence marker: ${markerPath}`);
+    const probe = await systemLockIdentity.probe(held.marker.pid);
+    const exactDead = probe.status === "dead"
+      || (probe.status === "alive" && compareProcessStart(held.marker.processStart, probe.startTime) === "different");
+    if (!exactDead) return "held";
+    await unlinkObserved(markerPath, held, true);
+    return "retry";
+  } catch (error) {
+    if (error instanceof MarkerTurnoverError) return "retry";
+    throw error;
+  }
+}
+
 async function acquireFence(): Promise<{ path: string; observation: MarkerObservation }> {
   const markerPath = fenceFile();
   for (let attempt = 0; attempt < LOCK_RETRIES; attempt++) {
@@ -398,17 +434,7 @@ async function acquireFence(): Promise<{ path: string; observation: MarkerObserv
       if (!observed || observed.marker.nonce !== created.marker.nonce) throw new Error("credential fence ownership could not be proved");
       return { path: markerPath, observation: observed };
     }
-    const held = await readMarker(markerPath);
-    if (!held) continue;
-    const now = Date.now();
-    if (held.mtimeMs > now || Date.parse(held.marker.acquiredAt) > now) throw new Error(`future-dated credential fence marker: ${markerPath}`);
-    const probe = await systemLockIdentity.probe(held.marker.pid);
-    const exactDead = probe.status === "dead"
-      || (probe.status === "alive" && compareProcessStart(held.marker.processStart, probe.startTime) === "different");
-    if (exactDead) {
-      await unlinkObserved(markerPath, held, true);
-      continue;
-    }
+    if (await inspectHeldFence(markerPath) === "retry") continue;
     if (credentialTestHook) await testSeam("lock-contended", { lockPath: markerPath, attempt: String(attempt) });
     if (attempt + 1 < LOCK_RETRIES) await sleep(LOCK_RETRY_MS);
   }
