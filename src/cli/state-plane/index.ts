@@ -5,6 +5,11 @@ export * from "./migration/last-writer-witness.js";
 export * from "./migration/reserve.js";
 export type {
   BackupFileHash,
+  CasOwnerToken,
+  CasRejectionReason,
+  CasResult,
+  CasRetryRepo,
+  CasRetryView,
   CursorPage,
   LineageSnapshot,
   ManifestMaterializationPurpose,
