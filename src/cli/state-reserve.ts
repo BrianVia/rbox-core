@@ -12,7 +12,7 @@ import crypto from "node:crypto";
 import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { fsyncDirectory } from "../engine/fsutil.js";
+import { fsyncDirectory, moveNoClobber, RBOX_TMP_PREFIX } from "../engine/fsutil.js";
 import { parseSemver } from "./semver.js";
 import { RBOX_VERSION } from "./version.js";
 import { RBOX_DIR } from "./workspace-config.js";
@@ -58,6 +58,17 @@ export type ReserveForeignDetail =
   | "unreadable"
   | "header-malformed"
   | "foreign-workspace";
+
+export type StateReserveCreationStep =
+  | "header-written"
+  | "fill-written"
+  | "temp-synced"
+  | "before-final-claim";
+
+export interface StateReserveCreationHooks {
+  /** Internal fault-observation seam for persistence tests. */
+  onStep?: (step: StateReserveCreationStep) => void | Promise<void>;
+}
 
 export const streamDigest = (stream: string): string =>
   crypto.createHash("sha256").update(Buffer.from(stream, "utf8")).digest("hex");
@@ -160,8 +171,10 @@ export async function ensureStateReserve(
   root: string,
   stream: string,
   creatingVersion: string = RBOX_VERSION,
+  hooks: StateReserveCreationHooks = {},
 ): Promise<ReserveOutcome> {
   const file = stateReservePath(root);
+  const dir = path.dirname(file);
   const expectedDigest = streamDigest(stream);
   const existing = await classifyExisting(file, expectedDigest);
   if (existing) return existing;
@@ -172,32 +185,45 @@ export async function ensureStateReserve(
   } catch (error) {
     return { status: "unavailable", detail: error instanceof Error ? error.message : String(error) };
   }
+  const temp = path.join(
+    dir,
+    `${RBOX_TMP_PREFIX}${process.pid}-${crypto.randomBytes(8).toString("hex")}-${path.basename(file)}`,
+  );
+  let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
+  let ownsTemp = false;
   try {
-    await fs.mkdir(path.dirname(file), { recursive: true });
-    // "wx" is O_CREAT|O_EXCL|O_WRONLY: it claims the name atomically and refuses
-    // to follow a symlink sitting at it.
-    const handle = await fs.open(file, "wx", 0o600);
+    await fs.mkdir(dir, { recursive: true });
+    handle = await fs.open(
+      temp,
+      constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW,
+      0o600,
+    );
+    ownsTemp = true;
     try {
       await handle.writeFile(headerBytes);
+      await hooks.onStep?.("header-written");
       await handle.writeFile(Buffer.alloc(RESERVE_FILL_BYTES));
+      await hooks.onStep?.("fill-written");
       await handle.sync();
+      await hooks.onStep?.("temp-synced");
     } finally {
       await handle.close();
+      handle = undefined;
     }
-    await fsyncDirectory(path.dirname(file));
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+    const tempStat = await fs.lstat(temp);
+    await hooks.onStep?.("before-final-claim");
+    if (!await moveNoClobber(temp, file, tempStat)) {
       return await classifyExisting(file, expectedDigest) ?? { status: "unavailable", detail: "raced" };
     }
+    await fsyncDirectory(dir);
+    const published = await classifyExisting(file, expectedDigest);
+    if (!published) return { status: "unavailable", detail: "vanished" };
+    if (published.status !== "adopted") return published;
+    return { status: "created", identity: published.identity };
+  } catch (error) {
     return { status: "unavailable", detail: String((error as NodeJS.ErrnoException).code ?? error) };
+  } finally {
+    await handle?.close().catch(() => undefined);
+    if (ownsTemp) await fs.unlink(temp).catch(() => undefined);
   }
-  const stat = await fs.lstat(file).catch(() => undefined);
-  if (!stat) return { status: "unavailable", detail: "vanished" };
-  return {
-    status: "created",
-    identity: {
-      creatingVersion, streamSha256: expectedDigest,
-      dev: Number(stat.dev), ino: Number(stat.ino), size: stat.size, headerBytes,
-    },
-  };
 }
