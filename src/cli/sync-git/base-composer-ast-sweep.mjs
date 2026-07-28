@@ -45,6 +45,7 @@ const STATE_ORDER_OWNERS = new Map([
   ])],
   ["src/cli/reset-quarantine.ts", new Set(["restoreResetQuarantineUnderFence"])],
   ["src/cli/reset-state.ts", new Set(["prepareResetArtifactsUnderFence", "resetSyncState"])],
+  ["src/cli/state-plane/authority-marker.ts", new Set(["classifyStateFormat", "isSymbolicLinkAtPath"])],
   ["src/cli/state-plane/adapters/legacy-json-publication.ts", new Set([
     "afterStatePublication",
     "publishWholeState",
@@ -64,9 +65,14 @@ const STATE_ORDER_CALLEES = new Set([
   "assertStatePublishable",
   "assertStateReadable",
   "ensureStateReserve",
+  "fs.lstat",
+  "fs.open",
   "fs.rename",
   "fsyncDirectory",
+  "handle.read",
+  "handle.stat",
   "isOwner",
+  "isSymbolicLink",
   "loadRawState",
   "publishWholeState",
   "recordLastWriterWitness",
@@ -124,6 +130,7 @@ function statePlaneCall(node, source, file) {
     projected = projected.map((argument, index) =>
       argument || arguments_[index]?.match(MARKER_ARGUMENT)?.[0] || "");
   }
+  if (tracksOrder && callee === "fs.open" && arguments_[1] !== undefined) projected[1] = arguments_[1];
   if (tracksOrder && calleeLeaf === "writeFileAtomic" && arguments_[2] !== undefined) projected[2] = arguments_[2];
   if (tracksOrder && calleeLeaf === "fsyncDirectory" && arguments_[0] !== undefined) projected[0] = arguments_[0];
   return {
