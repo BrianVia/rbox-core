@@ -1,7 +1,9 @@
 # 163 — The state plane moves to SQLite
 
-Status: **v11 — amendment to the ratified v10 (founder requirement reductions
-2026-07-28), changed sections pending codex re-confirmation.**
+Status: **v11 — RATIFIED AMENDMENT to v10 (founder requirement reductions
+2026-07-28); codex ALIGNED at v11-r2 (`537b4a07`).** Exclusivity is defined as
+workspace mutation-lock ownership; one founder input remains owed (the frozen
+machine profile, blocking U5 only).
 V11 **deletes** requirements and adds none, so v10 remains implementation
 authority for B0 → U5 everywhere v11 does not touch. Only the changed sections
 are re-opened: § "Founder requirement reductions ratified 2026-07-28 (v11)",
