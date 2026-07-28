@@ -45,6 +45,13 @@ export function renderReportMd(report: ScenarioReport, capture: CaptureSummary):
   out.push(`- started: ${report.startedAt}`);
   out.push(`- finished: ${report.finishedAt}`);
   out.push(`- duration: ${n1(report.durationMs)} ms`, "");
+  if (report.binaries) {
+    out.push("## Binaries", "", "| device | mode | version | sha256 | host path |", "| --- | --- | --- | --- | --- |");
+    for (const binary of report.binaries) {
+      out.push(`| ${binary.device} | ${binary.mode} | ${binary.version} | ${binary.sha256 ?? "—"} | ${binary.hostPath ?? "checkout source"} |`);
+    }
+    out.push("");
+  }
 
   out.push("## Steps", "", "| step | result | ms |", "| --- | --- | ---: |");
   for (const s of report.steps) {

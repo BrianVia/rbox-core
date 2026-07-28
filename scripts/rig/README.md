@@ -210,12 +210,27 @@ the `RBOX_DEV_BOOTSTRAP` repo secret (and optionally `CLOUDFLARE_ACCOUNT_ID` /
 bun run rig run onboard-smoke --binary /absolute/path/rbox-linux-arm64
 ```
 
-The rig validates that the host path is a regular, non-symlink executable before
-creating a container, copies those exact bytes into a content-addressed,
-single-file staging directory, then bind-mounts that directory read-only at
-`/opt/rbox/bin` in both guests. Every foreground, shell-mediated, and
-detached scenario invocation uses that fixed executable. Omitting `--binary`
-preserves the source-mode image shim.
+`--binary` remains the both-device shorthand. `--binary-a` and `--binary-b`
+override it for one device:
+
+```sh
+bun run rig up --binary-a /absolute/rbox-1.11.0 --binary-b /absolute/rbox-2.0
+```
+
+The rig validates every supplied path as a regular, non-symlink executable before
+creating a container, copies each exact artifact into its own content-addressed
+single-file staging directory, and bind-mounts the selected directory read-only at
+`/opt/rbox/bin` in that guest. Every foreground, shell-mediated, and detached
+scenario invocation uses that fixed executable. Omitting an override preserves
+the source-mode image shim.
+
+Runs persist A and B mode, SHA-256, observed `rbox --version`, and compiled host
+path in `report.json` and `report.md`. Different effective binary contents are
+refused unless the scenario explicitly declares dual-binary support; a declared
+differential also fails before scenario assertions if both guests report the same
+version. No current scenario declares support: `git-entanglement` reads the legacy
+state-file layout, while `two-device-live` does not explicitly migrate the 2.0
+side and therefore cannot yet prove design 163's mixed-authority contract.
 
 ## What's next
 
