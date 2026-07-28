@@ -8,6 +8,7 @@ import { Database } from "bun:sqlite";
 import crypto from "node:crypto";
 import type { FileEntry, GitSection } from "../../../engine/index.js";
 import { encodeFileEntry } from "../codecs/file-entry.js";
+import { encodeGitSection } from "../codecs/git-section.js";
 import { canonicalJson, parseCanonicalJson, utf16beOrderKey } from "../digest/codecs.js";
 import { StageDigestBuilder, type StageCounts } from "../digest/stage-semantic-v1.js";
 import { CursorWindowError, GitSectionOversizeError, StageChangedError } from "../errors.js";
@@ -18,7 +19,7 @@ import {
   sealedStagePath, streamRows,
 } from "./stage-artifacts.js";
 
-const STAGE_DDL = `
+export const STAGE_DDL = `
 CREATE TABLE stage_meta(
   stage_id TEXT PRIMARY KEY, plane TEXT NOT NULL CHECK(plane IN ('base','local')),
   state TEXT NOT NULL CHECK(state IN ('building','sealed')),
@@ -106,14 +107,17 @@ class SqliteGenerationBuilder implements GenerationBuilder {
 
   putGitSection(role: GitSectionRole, relPath: string, section: GitSection): void {
     this.#assertOpen();
-    const canonical = canonicalJson(section);
-    const bytes = Buffer.byteLength(canonical) + Buffer.byteLength(relPath);
-    if (bytes > PAGE_BYTES) throw new GitSectionOversizeError(relPath, bytes);
-    this.#flushBefore(bytes);
+    // Malformed path/section from a caller is a TypeError here, before any row
+    // is written — the same admission the RepoRecord codec applies to its base/
+    // advertised/pending sections. The stored bytes are then the exact canonical
+    // spelling the digest covers.
+    const encoded = encodeGitSection(relPath, section);
+    if (encoded.bytes > PAGE_BYTES) throw new GitSectionOversizeError(relPath, encoded.bytes);
+    this.#flushBefore(encoded.bytes);
     this.declareGitRole(role);
     this.db.query("INSERT INTO stage_git_sections(stage_id,role,rel_path,path_order,section_cjson) VALUES (?,?,?,?,?)")
-      .run(this.stageId, role, relPath, utf16beOrderKey(relPath), canonical);
-    this.#pendingBytes += bytes;
+      .run(this.stageId, role, relPath, utf16beOrderKey(relPath), encoded.canonical);
+    this.#pendingBytes += encoded.bytes;
   }
 
   finishGeneration(expectedCounts: StageCounts): SealedStageRef {

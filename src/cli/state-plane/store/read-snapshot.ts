@@ -1,10 +1,11 @@
 import type { Database } from "bun:sqlite";
-import type { FileEntry, GitSection } from "../../../engine/index.js";
+import type { FileEntry } from "../../../engine/index.js";
 import type { GlobalManifestMeta, RepoRecord } from "../../sync-state-model.js";
 import { decodeFileEntry, type FileEntryRow } from "../codecs/file-entry.js";
+import { decodeGitSection } from "../codecs/git-section.js";
 import { decodeRepoRecord, type RepoRecordRow } from "../codecs/repo-record.js";
 import { canonicalJson, parseCanonicalJson, spreadExtras, utf16beOrderKey } from "../digest/codecs.js";
-import { CursorWindowError, GitSectionOversizeError, SnapshotChangedError } from "../errors.js";
+import { CursorWindowError, GitSectionOversizeError, SnapshotChangedError, StateDataCorruptionError } from "../errors.js";
 import type {
   CursorPage, GitSectionRole, LineageSnapshot, ManifestHeader, Plane,
   ReadSnapshot, RepositorySnapshot,
@@ -89,6 +90,17 @@ export function currentSnapshot(db: Database): LineageSnapshot {
   };
 }
 
+/** Decode one persisted authority row, converting any decode failure into a
+ * `StateDataCorruptionError`. A row that will not decode is data-at-rest
+ * corruption, not a caller error — the same taxonomy for every column codec. */
+function decodeAuthorityRow<T>(entity: string, key: string, decode: () => T): T {
+  try {
+    return decode();
+  } catch (cause) {
+    throw new StateDataCorruptionError(entity, key, cause);
+  }
+}
+
 function sameToken(a: LineageSnapshot, b: LineageSnapshot): boolean {
   return canonicalJson(a) === canonicalJson(b);
 }
@@ -153,7 +165,7 @@ class SqliteReadSnapshot implements ReadSnapshot {
         this.token.lineageId, plane, afterPath === undefined ? Buffer.alloc(0) : utf16beOrderKey(afterPath), batchSize,
       ) as FileEntryRow[];
       const page = boundedPage(rows, batchSize, (row) => row.retained_estimate, (row) => row.path);
-      return { ...page, rows: page.rows.map(decodeFileEntry) };
+      return { ...page, rows: page.rows.map((row) => decodeAuthorityRow("fileEntry", row.path, () => decodeFileEntry(row))) };
     });
   }
 
@@ -169,7 +181,7 @@ class SqliteReadSnapshot implements ReadSnapshot {
         ...page,
         rows: page.rows.map((row) => ({
           relPath: row.rel_path,
-          record: decodeRepoRecord(row),
+          record: decodeAuthorityRow("repoRecord", row.rel_path, () => decodeRepoRecord(row)),
           token: { ...this.token, repoGen: row.repo_gen },
         })),
       };
@@ -180,7 +192,9 @@ class SqliteReadSnapshot implements ReadSnapshot {
     return shortQuery(this.db, this.token, () => {
       const row = this.db.query("SELECT * FROM repo_records WHERE lineage_id=? AND rel_path=?")
         .get(this.token.lineageId, relPath) as RepoRecordRow | null;
-      return row ? { record: decodeRepoRecord(row), token: { ...this.token, repoGen: row.repo_gen } } : undefined;
+      return row
+        ? { record: decodeAuthorityRow("repoRecord", relPath, () => decodeRepoRecord(row)), token: { ...this.token, repoGen: row.repo_gen } }
+        : undefined;
     });
   }
 
@@ -218,7 +232,10 @@ class SqliteReadSnapshot implements ReadSnapshot {
       const page = boundedPage(rows, batchSize, rowBytes, (row) => row.rel_path);
       return {
         ...page,
-        rows: page.rows.map((row) => ({ relPath: row.rel_path, section: JSON.parse(row.section_cjson) as GitSection })),
+        rows: page.rows.map((row) => ({
+          relPath: row.rel_path,
+          section: decodeAuthorityRow("gitSection", row.rel_path, () => decodeGitSection(row.rel_path, row.section_cjson)),
+        })),
       };
     });
   }
