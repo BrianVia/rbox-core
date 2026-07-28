@@ -20,7 +20,7 @@ const findingsPath = (root: string) => path.join(root, RBOX_DIR, FINDINGS_FILE);
 
 export interface ScopeFindings {
   /** Rule files whose local bytes were overwritten by remote truth, newest run wins.
-   *  The straddling repos of the same pull are NOT recorded here: `rbox scope`
+   *  The straddling repos of the same pull are NOT recorded here: `rbox include`
    *  classifies the live topology itself, so a stored copy could only go stale. */
   ruleFileDivergence: string[];
 }

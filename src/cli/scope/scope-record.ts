@@ -80,7 +80,6 @@ export function scopeSplitsRepo(prefixes: readonly string[], repoKeys: Iterable<
   return undefined;
 }
 
-/** Parse the `--scope` flag: comma-separated, repeatable by comma only (the flag
- *  parser keeps one value per name). */
+/** Parse one comma-separated scope token (used by init and the include editor). */
 export const parseScopeFlag = (value: string): string[] =>
   value.split(",").map((part) => part.trim()).filter((part) => part.length > 0);

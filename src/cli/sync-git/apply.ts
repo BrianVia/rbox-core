@@ -794,7 +794,7 @@ opts: {
     const remoteChanged = projectedKey(remoteSec, cmpScope) !== (baseSec ? projectedKey(baseSec, cmpScope) : "none");
     // On a scoped binding an absent repo may have an already-equal BASE — carried
     // from before the folder left the scope. Taking the unchanged shortcut there
-    // would advance nothing and materialize nothing, so `scope add` would report
+    // would advance nothing and materialize nothing, so `include add` would report
     // CLEAN forever without ever putting the repository on disk (design 212 §3.2).
     const materializationOwed = opts.scope !== undefined && dotGit === undefined;
     if (!materializationOwed && !remoteChanged && !pend && !resolutionChanged && !checkpointReproof && !(configDue && configTarget?.fresh)) {
@@ -1517,4 +1517,3 @@ opts: {
   if (gateClosure) throw gateClosure;
   return pack();
 }
-

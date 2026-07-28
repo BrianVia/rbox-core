@@ -63,7 +63,7 @@ export interface WorkspaceConfig {
   /** Monotonic scope-edit generation. Fences every cached/trusted observation made
    *  under an older scope (design 212 §3.3). */
   scopeGeneration?: number;
-  /** Durable in-flight scope edit. Present ⇒ a `rbox scope add|remove` was
+  /** Durable in-flight scope edit. Present ⇒ a `rbox include add|remove` was
    *  interrupted; the next command resumes it before doing anything else. */
   scopeIntent?: {
     generation: number;

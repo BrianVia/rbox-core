@@ -121,17 +121,17 @@ export const COMMAND_HELP: CommandHelp[] = [
     ],
   },
   {
-    name: "scope",
+    name: "include",
     group: "SYNCING",
-    summary: "sync only some folders of the workspace on this machine",
-    usage: "rbox scope [add <folder>… | remove <folder>…] [--json]",
+    summary: "sync only the folders you include on this machine",
+    usage: "rbox include [add <folder>… | remove <folder>…] [--json]",
     flags: [{ flag: "--json", desc: "machine-readable output" }],
     notes: [
       "A machine that syncs only some folders receives changes but never sends them — push code out of it with git.",
       "Folders are workspace-relative, and a folder cannot cut a git repository in half.",
       "Removing a folder moves its files to the local trash; `rbox trash restore` undoes that.",
     ],
-    examples: ["rbox scope", "rbox scope add Personal/repo-A", "rbox scope remove Personal/repo-A"],
+    examples: ["rbox include", "rbox include add Personal/repo-A", "rbox include remove Personal/repo-A"],
   },
   {
     name: "adopt",
@@ -285,9 +285,10 @@ export const COMMAND_HELP: CommandHelp[] = [
     name: "track",
     group: "SYNCING",
     summary: "bind a directory to a workspace (create/join; no first sync)",
-    usage: "rbox track [path] [--workspace <id>] [--respect-gitignore] [--new-device]",
+    usage: "rbox track [path] [--workspace <id>] [--include <folder>] [--respect-gitignore] [--new-device]",
     flags: [
       { flag: "--workspace <id>", desc: "join an existing workspace instead of creating one (alias: -w)" },
+      { flag: "--include <folder>", desc: "sync only this folder (repeat for more); implies this machine never sends changes" },
       { flag: "--respect-gitignore", desc: "skip gitignored untracked files in this workspace" },
       { flag: "--new-device", desc: "mint a new device identity instead of reusing this machine's enrolled device (advanced)" },
       { flag: "--remote <url>", desc: "rbox API server (default: production; the RBOX_API env var also overrides)" },

@@ -13,6 +13,27 @@ test("per-command help: leaf lookup returns exactly that command", () => {
   expect(track![0]!.usage).toContain("rbox track");
 });
 
+test("include help uses the founder-approved surface and track documents repeatable --include", () => {
+  const include = byName.get("include")!;
+  expect(renderCommand(include)).toContain("include — sync only the folders you include on this machine");
+  expect(include.usage).toBe("rbox include [add <folder>… | remove <folder>…] [--json]");
+  expect(include.notes).toEqual([
+    "A machine that syncs only some folders receives changes but never sends them — push code out of it with git.",
+    "Folders are workspace-relative, and a folder cannot cut a git repository in half.",
+    "Removing a folder moves its files to the local trash; `rbox trash restore` undoes that.",
+  ]);
+  expect(include.examples).toEqual([
+    "rbox include",
+    "rbox include add Personal/repo-A",
+    "rbox include remove Personal/repo-A",
+  ]);
+  expect(byName.has("scope")).toBe(false);
+  expect(byName.get("track")?.flags).toContainEqual({
+    flag: "--include <folder>",
+    desc: "sync only this folder (repeat for more); implies this machine never sends changes",
+  });
+});
+
 test("git deferrals help registers both exclusive output modes", () => {
   const entry = helpFor("git deferrals");
   expect(entry).toHaveLength(1);

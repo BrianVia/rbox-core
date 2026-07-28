@@ -126,6 +126,43 @@ test("JSON-supported group usage errors emit JSON to stderr", () => {
   expect(JSON.parse(res.stderr)).toEqual({ error: "usage: rbox device <approve <user-code>|list|revoke <device-id>>" });
 });
 
+test("include is the only command token and preserves JSON usage errors", async () => {
+  const root = await makeWorkspace();
+  try {
+    const shown = run(["include"], root);
+    expect(shown.status).toBe(0);
+    expect(shown.stdout).toContain("this machine syncs the whole workspace");
+
+    const old = run(["scope"], root);
+    expect(old.status).toBe(1);
+
+    const invalid = run(["include", "bogus", "--json"], root);
+    expect(invalid.status).toBe(1);
+    expect(JSON.parse(invalid.stderr)).toEqual({
+      error: "usage: rbox include [add <folder>… | remove <folder>…] [--json]",
+    });
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("dispatcher preserves every repeated track --include value", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-dispatch-track-"));
+  try {
+    const result = run([
+      "track", root,
+      "--workspace", "ws_dispatch_include",
+      "--include", "Personal/repo-A",
+      "--include", "Work/repo-B",
+    ]);
+    expect(result.status).toBe(0);
+    const cfg = JSON.parse(await fs.readFile(path.join(root, ".rbox", "workspace.json"), "utf8"));
+    expect(cfg.scope).toEqual(["Personal/repo-A", "Work/repo-B"]);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test("versions usage errors emit JSON to stderr when --json is active", () => {
   const res = run(["versions", "--json", "--limit", "nope"]);
   expect(res.status).toBe(1);

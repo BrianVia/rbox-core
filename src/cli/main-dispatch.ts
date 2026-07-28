@@ -405,7 +405,7 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
       });
       break;
     }
-    case "scope": {
+    case "include": {
       const root = await resolveRoot(undefined);
       const { scopeCmd } = await import("./scope/scope-cmd.js");
       await scopeCmd(root, positional[0], positional.slice(1), { json: jsonMode });

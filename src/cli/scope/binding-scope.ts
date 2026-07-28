@@ -71,7 +71,7 @@ const HALT_MESSAGE = {
     + "Restore .rbox/workspace.json, or run `rbox untrack` here and set the folder up again.",
   "scope-witness-disagreement":
     "this folder's rbox binding record no longer lists the folders it was set up to sync, but this machine still remembers them. "
-    + "Syncing is paused until the two agree — re-run `rbox scope add <folder>` to restate them, or `rbox untrack` and set the folder up again.",
+    + "Syncing is paused until the two agree — re-run `rbox include add <folder>` to restate them, or `rbox untrack` and set the folder up again.",
 } as const satisfies Record<ScopeSealFailure, string>;
 
 const halt = (condition: ScopeSealFailure): BindingScope =>

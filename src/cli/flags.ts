@@ -7,6 +7,24 @@ const SHORT_FLAGS: Record<string, { key: string; takesValue?: true }> = {
   "-w": { key: "workspace", takesValue: true },
 };
 
+const REPEATABLE_VALUE_FLAGS = new Set(["include"]);
+const REPEATABLE_VALUE_SEPARATOR = "\0";
+
+/** Return every value of an allowlisted repeatable flag without widening the
+ * command layer's long-standing `Record<string, string>` flag contract. NUL cannot
+ * occur in an OS argv entry, so it is an unambiguous internal separator. */
+export function flagValues(flags: Record<string, string>, key: string): string[] {
+  const value = flags[key];
+  return value === undefined ? [] : value.split(REPEATABLE_VALUE_SEPARATOR);
+}
+
+function setLongFlag(flags: Record<string, string>, key: string, value: string): void {
+  const previous = flags[key];
+  flags[key] = REPEATABLE_VALUE_FLAGS.has(key) && previous !== undefined
+    ? `${previous}${REPEATABLE_VALUE_SEPARATOR}${value}`
+    : value;
+}
+
 /** A help entry's `--flag`/`--flag <value>` spec → its name and whether it takes a value. */
 function declaredArity(flag: string): { name: string; takesValue: boolean } | undefined {
   const token = flag.match(/^(--[a-z0-9][a-z0-9-]*)\b/i)?.[1];
@@ -76,11 +94,12 @@ export function parseFlags(args: string[], cmd?: string): { positional: string[]
       const value = eq === -1 ? undefined : a.slice(eq + 1);
       const takesValue = longFlagArity.get(key);
       if (value !== undefined) {
-        flags[key] = value;
+        setLongFlag(flags, key, value);
       } else if (takesValue === false) {
         flags[key] = "true";
       } else {
-        flags[key] = args[i + 1] && !args[i + 1]!.startsWith("--") ? args[++i]! : "true";
+        const next = args[i + 1] && !args[i + 1]!.startsWith("--") ? args[++i]! : undefined;
+        setLongFlag(flags, key, next ?? (REPEATABLE_VALUE_FLAGS.has(key) ? "" : "true"));
       }
     } else if (SHORT_FLAGS[a]) {
       const spec = SHORT_FLAGS[a]!;
