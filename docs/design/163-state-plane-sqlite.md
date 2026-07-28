@@ -1,10 +1,29 @@
 # 163 — The state plane moves to SQLite
 
-Status: **v8 — pending final ratification.** V8 is a *round-four targeted
-fold*: it closes the seven residuals from the codex serial review of the v7 tip
-and corrects the open-input count, which v7 understated.
+Status: **v9 — pending final ratification.** V9 is a *round-five targeted fold*:
+it closes the two residuals from the codex serial review of the v8 tip.
 
-Provenance, stated honestly: **v7's "no third case" argument for the `B0` write
+Provenance, stated honestly: **v8 named one outcome of the pre-B0 writer race
+and missed the other, and two of the bounds v8 offered for it are contradicted
+by the source it cites.** V8's paired witness sample is not atomic with M6's
+rename, so an unlocked pre-`1.11.0` writer can publish *between* them and have
+its document silently overwritten by `Q` — a lost write, distinct from the
+post-`Q` destruction `F3` already asserted, and unnamed in v8. V9 shrinks that
+window to the `check → rename` instants with an M6 body-hash re-verification,
+names **both** outcomes with fixtures (`F3` and the new `F5`), withdraws v8's
+false necessity claims ("state read completes before M0", "window spans the
+entire M0–M6 migration" — push and pull separate read from write by a whole
+sync), and states plainly that the surviving pre-`Q` outcome is **unrecoverable
+and silent**, ratifiable only on the `B0` adoption gate, which becomes a hard U3
+exit criterion. V9 also re-encodes the reserve provenance header, which v8
+specified at a width it cannot fit. The `M0–M7` machine, the `Q` barrier, and
+every migration fence are unchanged or strictly tightened; nothing in this fold
+weakens them.
+
+Previous status (v8), retained for provenance: V8 is a *round-four targeted
+fold*: it closes the seven residuals from the codex serial review of the v7 tip
+and corrects the open-input count, which v7 understated. V8's own provenance
+note: **v7's "no third case" argument for the `B0` write
 barrier was wrong, and v7's claim that exactly one founder input remained was
 wrong.** V8 names the third case with its exact preconditions instead of
 arguing it away, binds the last-writer witness to content rather than to a
@@ -2139,38 +2158,117 @@ clobber each other's `state.json` today.
    immediately before the M6 rename, so a writer that surfaces mid-migration is
    caught at the last fence rather than after the flip.
 
-   *The residual that survives both, with its exact preconditions.* One window
-   cannot be closed by anything `B0` or 2.0 does, because it belongs to a binary
-   that predates both. A **pre-`1.11.0`** binary that (i) enters
-   `writeWholeStateUnsafe` — degraded or `forceLegacy` — (ii) completes its
-   state read before M0 begins, (iii) publishes nothing until strictly after
-   M6's `Q` rename, and (iv) runs on a lockable filesystem, so M0's
-   `degraded-fence` does not fire, holds no lock, checks no barrier, maintains
-   no witness, and its rename destroys `Q`. All four conditions are required
-   simultaneously. What bounds it:
-   - It requires a pre-B0 binary co-resident with a 2.0 binary on one workspace.
-     That is precisely what `B0`'s adoption gate exists to exclude (all 4
-     external users and all 3 fleet hosts on `>= 1.11.0`, two-week bake), and
-     the M0 witness floor independently refuses any workspace whose *last*
-     writer was pre-B0 — so reaching this state needs a workspace written
-     recently by a B0 binary while a pre-B0 binary is simultaneously mid-write.
-   - It requires `writeWholeStateUnsafe` specifically. The ordinary CAS path
-     already holds the state lock even pre-B0 (`sync-state-store.ts:120-135`),
-     so the common writer is excluded without any B0 change.
-   - It requires the writer's read→rename window to span the entire M0–M6
-     migration — budgeted at `<= 60 s` on the 112k corpus — against an observed
-     window of milliseconds. A publication anywhere *inside* the window is
-     caught by the paired witness sample above.
-   - It is detectable after the fact, not silent: the result is a legacy JSON at
-     `.rbox/state.json` whose body hash matches no M2-recorded source digest and
-     whose `last-writer.json` is stale, which the doctor reports as
-     `legacy-overwrite-after-Q` with the immutable hash-addressed backup as
-     recovery evidence.
+   *Closure, part three (v9) — the paired sample is not atomic with the rename,
+   so bind the last instant to content instead.* V8 asserted that re-taking the
+   paired sample "immediately before the M6 rename" closed everything except a
+   writer that publishes after `Q`. It does not. Sampling and renaming are two
+   separate syscall sequences, and an unlocked pre-B0 writer whose
+   `fs.rename` (`fsutil.ts:83`) lands **between** them publishes a fresh legacy
+   JSON that M6 then immediately renames `Q` over. The migrated database and the
+   M2 backups both descend from the *older* source; the fresh document is gone.
+   That is a **silent lost write**, and it is a distinct outcome from the
+   post-`Q` destruction v8 named — v8 had no name for it at all.
 
-   This residual is **accepted and named**, not closed. It is a scheduling
-   assumption (`B0` adoption) enforced by a gate rather than by a lock, and the
-   fixture matrix below tests it as a known outcome so it can never be
-   discovered as a surprise.
+   Normative for M6: the M6 exact-sibling step already rehashes and
+   identity-revalidates the live JSON before it renames (§ "M6 — flip
+   authority"), but v8 placed that rehash at the *start* of the step, with the
+   sibling fsync, hashing, and identity-bracketing work between it and the
+   rename. **The body-hash re-verification of `.rbox/state.json` against the
+   M3-imported source digest is now the last operation M6 performs before
+   `fs.rename`** — same lock, same held `stateLockPath`, nothing between the
+   comparison and the rename but the rename itself. A mismatch is a typed
+   `legacy-write-detected` disposition: M6 does **not** rename, enters C1 source-
+   change retirement, and leaves JSON authoritative — which is exactly the
+   fencing promise, not a new one. This does not make check and rename atomic
+   (`writeFileAtomic` exposes one abort seam, `beforeRename`, and no property of
+   it can fuse a `stat`+`read`+`hash` of a *different* file into the rename
+   syscall — the same argument v7 used to reject the check-then-rename fix).
+   What it does is shrink the exposure from the whole bounded sampling interval
+   to the two instants `check → rename`.
+
+   *The irreducible residue, both outcomes, with the preconditions that are
+   actually required.* V8's precondition list was wrong in two ways and is
+   restated here without the falsified claims. V8 asserted the writer must
+   "complete its state read before M0 begins" and that its read→rename window
+   must "span the entire M0–M6 migration". Neither is required. `saveStateSource`
+   reaches the unsafe writer at `sync-state.ts:348-350`, and its production
+   callers separate their state *read* from that *write* by the entire body of a
+   sync: push loads state at `push.ts:476` and does not save until
+   `push.ts:532-540`, with the whole remote negotiation in between; pull loads at
+   `pull.ts:233` and saves at `pull.ts:414-446`, with git apply in between. A
+   pre-B0 writer that begins *after* M0 and publishes *during* the migration is
+   therefore entirely ordinary, and the read→rename window needs to span nothing
+   but its own sync. What is actually required is only:
+   - **a pre-`1.11.0` binary.** A B0-or-later binary holds `stateLockPath`
+     continuously across its check→rename (closure part one), and M6 holds that
+     same lock, so no B0-era writer can rename into either window. Pre-B0,
+     `writeWholeStateUnsafe` (`sync-state-store.ts:338-370`) acquires no lock at
+     all — it is `writeFileAtomic` plus `fsyncDirectory`, nothing else.
+   - **the `forceLegacy`-or-`unsupported` path specifically.** Pre-B0 that means
+     `workspaceSyncMutexDegraded` at `pull.ts:446` / `push.ts:540`, `:580`,
+     `:895`, or the fresh-init `saveState`. The ordinary CAS path holds the state
+     lock even pre-B0 (`sync-state-store.ts:120-135`), so the common writer is
+     excluded with no B0 change. Note this path is reachable **on a lockable
+     filesystem** — restricting it to `unsupported` locking is a B0 change and by
+     construction the residual binary does not have it.
+   - **its rename landing inside one of two specific windows.** Everything else
+     is caught: a publication before M0's paired sample fails the witness floor,
+     and a publication anywhere inside the bounded interval fails
+     `legacy-writer-live`.
+
+   The two windows give the two outcomes, and both are now named:
+   - **(i) post-`Q` destruction.** The rename lands strictly *after* M6's rename.
+     `Q` is destroyed and a legacy JSON is re-elected. This is **detectable after
+     the fact**: the resulting `.rbox/state.json` has a body hash matching no
+     M2-recorded source digest and a stale `last-writer.json`, which the doctor
+     reports as `legacy-overwrite-after-Q` with the immutable hash-addressed
+     backup as recovery evidence. Fixture `F3` asserts it as a known outcome.
+   - **(ii) pre-`Q` lost write.** The rename lands in the `check → rename`
+     microwindow above. M6's rename installs `Q`; the fresh legacy document is
+     displaced and its contents are lost. Fixture `F5` asserts it as a known
+     outcome.
+
+   *What is recoverable in outcome (ii), argued from the primitive rather than
+   asserted.* The honest answer is **nothing on disk, and M6 cannot be made to
+   preserve it.** `writeFileAtomic` publishes with a single `fs.rename`
+   (`fsutil.ts:83`); M6's own rename then replaces that inode, its link count
+   reaches zero, and no process holds an open descriptor on it, so the kernel
+   releases the bytes. M6 never opened that inode — the whole point of the
+   microwindow is that the file changed *after* M6 last read it — so "M6
+   preserves the pre-rename inode content it displaced" is not implementable:
+   M6 can only preserve what it read, and what it read is the older source,
+   which M2 already backed up twice. This design does **not** claim otherwise.
+   - **Detectability: none in the state plane.** Nothing records that the write
+     happened. A pre-B0 writer maintains no witness, `state.json` is `Q` after the
+     flip, and the M2 backups and the migrated DB agree with each other on the
+     older source — there is no divergent `.bak` to compare against, because the
+     backups were taken from the source M6 verified, not from the document that
+     replaced it. There is no `legacy-overwrite-after-Q` analogue for (ii).
+     Outcome (ii) is **silent**, and calling it "detectable" would be a lie.
+   - **What limits the damage is convergence, not detection.** `.rbox/state.json`
+     is a cache of the last-synced manifest plus locally derived git records, not
+     a data plane: no user bytes live only there. A lost save therefore leaves a
+     **stale BASE**, and stale BASE is the input rbox's merge is already
+     fail-closed about — the next sync re-fetches the remote manifest and
+     re-scans the repositories, and a BASE that is behind produces redundant
+     conflict detection (a deferral), never a silent content overwrite. This
+     design does not claim the re-derivation is bit-identical, only that the
+     failure mode is a stale cache with a fail-closed consumer.
+
+   *Ratification.* This residue is **accepted and named**, not closed. It is a
+   scheduling assumption (`B0` adoption) enforced by a gate rather than by a
+   lock. What makes it ratifiable is not the outcome — outcome (ii) is genuinely
+   silent — but its precondition: it requires an out-of-date binary *actively
+   racing a migration on the same workspace*, and `B0`'s adoption gate exists
+   precisely to drain that population before any 2.0 binary may migrate anything
+   (all 4 external users and all 3 fleet hosts on `>= 1.11.0`, verified by
+   aggregate version telemetry, two-week bake). The M0 witness floor
+   independently refuses any workspace whose *last* writer was pre-B0, so
+   reaching either window needs a workspace written recently by a B0 binary while
+   a pre-B0 binary is simultaneously mid-sync on it. If that population is not
+   demonstrably drained at the U3 gate, this residue is not ratifiable and U3
+   must not be enabled; the gate, not this paragraph, is what carries the
+   argument.
 
    **1b. The durable last-writer witness.** `SyncState` has no version field
    and B0 must not add one — a new state member would be silently dropped by
@@ -2267,18 +2365,26 @@ clobber each other's `state.json` today.
      waits a bounded interval, and re-samples. Any state-file change the sidecar
      does not account for proves a writer that publishes without maintaining the
      witness is live, and M0 refuses with a typed `legacy-writer-live` refusal.
-     This is the condition that covers the third case named in 1a; the residual
-     it cannot cover — a pre-`1.11.0` writer whose entire window straddles
-     M0 through M6 without publishing — is named and accepted there.
+     This is the condition that covers the third case named in 1a; the residue
+     it cannot cover — a pre-`1.11.0` unlocked writer whose `fs.rename` lands in
+     M6's `check → rename` microwindow or strictly after M6's rename — is named
+     and accepted there with both of its outcomes.
    All five are re-checked immediately before the M6 rename, not only at M0.
+   **The re-check is not the last thing M6 does (v9).** Because the paired
+   sample is not atomic with the rename, M6 additionally re-verifies
+   `.rbox/state.json`'s `stateBodySha256` against the M3-imported source digest
+   as the **immediately preceding operation** to `fs.rename`, under the
+   `stateLockPath` it already holds; a mismatch is a typed
+   `legacy-write-detected` disposition that does not rename and enters C1
+   retirement with JSON still authoritative (§ 1a, closure part three).
 4. **Fixtures (required before U3 may be enabled) — corrected in v8.** V7
    specified one fixture that **cannot be constructed**: it started a
    *degraded-unlocked* legacy writer and then required "a full M0–M7 migration
    to completion", while bullet 3's first condition refuses to migrate a
    degraded-unlocked workspace at all. The fixture asserted an outcome the
    design forbids reaching, so it could only ever have been deleted or
-   quietly weakened by whoever tried to write it. The matrix is now four
-   fixtures, each testing what the machine actually does:
+   quietly weakened by whoever tried to write it. The matrix is now five
+   fixtures (v9 adds `F5`), each testing what the machine actually does:
    - **F1 — the degraded fence does what M0 says.** A degraded-unlocked
      workspace with a live legacy writer: M0 must refuse with a typed
      `degraded-fence` refusal, publishing no control and creating no migration
@@ -2293,14 +2399,31 @@ clobber each other's `state.json` today.
      and its post-lock barrier re-read sees `Q`. Negative control: with the
      barrier and the lock-entry restriction removed, the same fixture must
      demonstrably destroy `Q`.
-   - **F3 — the named residual, asserted as a known outcome.** F2's shape, but
+   - **F3 — named residue, outcome (i): post-`Q` destruction.** F2's shape, but
      the legacy writer is the published, signed `1.10.x` artifact rather than a
-     `B0` build. The assertion is the *documented* result, not a pass: `Q` is
-     destroyed, and the doctor reports `legacy-overwrite-after-Q` naming the
-     immutable hash-addressed backup. A residual that has a red-to-green fixture
-     cannot silently change into a different residual.
+     `B0` build, and it is released strictly *after* M6's rename. The assertion
+     is the *documented* result, not a pass: `Q` is destroyed, and the doctor
+     reports `legacy-overwrite-after-Q` naming the immutable hash-addressed
+     backup. A residue that has a red-to-green fixture cannot silently change
+     into a different residue.
    - **F4 — concurrency, unchanged from v7.** Two concurrent degraded writers:
      assert the refusal, not merely last-writer-wins.
+   - **F5 — named residue, outcome (ii): the pre-`Q` lost write (v9).** F3's
+     binary (the signed `1.10.x` artifact, `forceLegacy`, lockable filesystem),
+     but released so its `fs.rename` lands inside M6's `check → rename`
+     microwindow — driven deterministically by the `onStep` seam
+     (`fsutil.ts:46`, `"before-rename"`) on the migration side rather than by
+     sleeping, so the fixture is not itself a race. The assertions are the
+     documented outcome: after M7, `.rbox/state.json` is `Q`; the migrated DB
+     and both M2 backups carry the *older* source digest; the legacy writer's
+     document is **absent from every artifact on disk**; and the doctor emits
+     **no** anomaly — `F5` asserts the silence explicitly, so a future change
+     that starts detecting this turns the fixture red and forces the doc to be
+     updated rather than letting the claim drift. Companion assertion, one
+     window earlier: with the writer released *before* M6's body-hash re-verify
+     instead of after it, M6 must refuse with `legacy-write-detected`, not
+     rename, and leave JSON authoritative — proving the part-three check is what
+     bounds the microwindow rather than something else.
 
 The source bytes are retained exactly at the fixed convenience path
 `.rbox/state/legacy-json/pre-163-latest.json.bak` (v6 moved it off
@@ -3015,7 +3138,16 @@ workspace mutex, complete repository fence as needed, and state lock:
 
    With exact sibling, rehash and identity-revalidate live JSON and `.bak` and
    the M5 active completion/hash. A source mismatch enters C1 retirement and
-   includes the recorded building/exact sibling; it never renames. Otherwise
+   includes the recorded building/exact sibling; it never renames. **Then, as
+   the last operation before the rename and with no other work between them
+   (v9), re-verify the live `.rbox/state.json` `stateBodySha256` against the
+   M3-imported source digest under the held `stateLockPath`.** A mismatch here is
+   a typed `legacy-write-detected` disposition on the same C1-retirement footing:
+   zero writes, no rename, JSON stays authoritative. This does not make the pair
+   atomic — `writeFileAtomic` exposes only `beforeRename` and cannot fuse a read
+   of a different file into the rename syscall — it reduces the exposure to the
+   `check → rename` instants, and the residue that survives is named in § 1a
+   closure part three as outcome (ii). Otherwise
    atomically rename the exact sibling over `.rbox/state.json`, fsync `.rbox`,
    then publish M6 with sibling absent and the initial cleanup cursor. A process
    kill after rename observes Q+sibling-absent. A power cut before the parent
@@ -4053,27 +4185,63 @@ Contents:
    - **Exact path:** `.rbox/state/reserve-1mib.bin`. Fixed, not id-scoped: it
      is generic runway, claimed by whichever migration runs, and `B0` creates
      it long before any migration id exists.
-   - **Provenance header (v8) — the reserve says who made it.** The first 64
-     bytes are a fixed-width ASCII provenance header and the remaining 1,048,512
-     bytes are zero fill, so the file is still exactly 1,048,576 bytes and the
-     allocation guarantee is unchanged. The header is the magic string
-     `RBOX-STATE-RESERVE-v1`, one space, the creating binary's semver, one
-     space, the workspace `stream` identity, a newline, NUL-padded to 64 bytes.
-     Without it the protocol was unsound: `B0` adopted *any* same-size regular
+   - **Provenance header (v8; encoding corrected in v9) — the reserve says who
+     made it.** V8 specified a 64-byte header carrying the workspace `stream`
+     identity verbatim. **That does not fit, so v8's header was unimplementable.**
+     The arithmetic, in the same form the rest of this document uses:
+
+     | field | bytes |
+     |---|---:|
+     | magic `RBOX-STATE-RESERVE-v1` | 21 |
+     | separator space | 1 |
+     | creating binary's semver, variable | *v* |
+     | separator space | 1 |
+     | stream field | *s* |
+     | terminating `\n` | 1 |
+     | **fixed overhead (all but *v* and *s*)** | **24** |
+
+     With a verbatim stream (*s* = 71 for a real workspace) and the shortest
+     realistic semver (*v* = 6, `1.11.0`), the header needs `24 + 6 + 71 = 101`
+     bytes — 37 over the 64-byte frame. Substituting a full SHA-256 hex digest
+     (*s* = 64) still needs `24 + 6 + 64 = 94`, 30 over. Truncating the hex to
+     fit 64 leaves `64 − 24 − v` hex characters: 34 (136 bits) for `1.11.0`, but
+     only 18 (72 bits) for a release-candidate string such as
+     `1.11.0-rc.3+2026072701` (*v* = 22) — a digest whose width depends on the
+     version string is not a fixed-width header, and 72 bits is not a
+     collision-resistant workspace binding. All three 64-byte forms are rejected.
+
+     **The header is therefore 128 bytes, not 64.** The first 128 bytes are the
+     fixed-width ASCII provenance header and the remaining **1,048,448** bytes
+     are zero fill; `128 + 1,048,448 = 1,048,576`, so the file is still exactly
+     1,048,576 bytes and the allocation guarantee is unchanged. The header is
+     the magic string `RBOX-STATE-RESERVE-v1`, one space, the creating binary's
+     semver, one space, the **lowercase SHA-256 hex digest (64 characters) of
+     the UTF-8 bytes of the workspace `stream` identity**, a newline, NUL-padded
+     to 128 bytes. Fixed overhead is `21 + 1 + 1 + 64 + 1 = 88`, so the semver
+     field may be **at most `128 − 88 = 40` bytes**; a creating binary whose
+     semver exceeds 40 bytes must not create a reserve (it is a
+     `reserve-foreign`-adjacent refusal to create, never a truncated header).
+     The digest, not the identity, is what the header carries — the reserve
+     needs to prove *which workspace*, and a fixed-width binding does that
+     without an unbounded field.
+     Without provenance the protocol was unsound: `B0` adopted *any* same-size regular
      file, M1 claimed it, and M6 role 7 deleted it — while the same section
      promises never to delete a path `B0` did not create. A same-size file
      written by an unrelated tool satisfied every check, so the promise was
      enforced by nothing.
-   - **Creation:** no-follow `O_CREAT|O_EXCL` at mode 0600, write the 64-byte
-     provenance header followed by exactly 1,048,512 zero bytes, `fsync` the
+   - **Creation:** no-follow `O_CREAT|O_EXCL` at mode 0600, write the 128-byte
+     provenance header followed by exactly 1,048,448 zero bytes, `fsync` the
      file, `fsync` `.rbox/state`, then lstat and record
-     `{dev,ino,size,creatingVersion,stream}`. Creation is attempted once per
+     `{dev,ino,size,creatingVersion,streamSha256}`. Creation is attempted once per
      `B0` startup path and its failure is never fatal to the 1.x binary — a
      workspace without the reserve is simply a workspace M1 must create it in.
    - **Collision:** a path is **adoptable** only if it is a regular non-symlink
-     file of exactly 1,048,576 bytes **and** its first 64 bytes parse as the
-     provenance header with a well-formed creating version and a `stream` equal
-     to this workspace's. Such a file is adopted (identity and header fields
+     file of exactly 1,048,576 bytes **and** its first 128 bytes parse as the
+     provenance header — magic exact, semver field well-formed and `<= 40`
+     bytes, digest field exactly 64 lowercase hex characters, `\n` present, and
+     every byte after the `\n` through offset 127 a NUL — **and** its digest
+     field equals the SHA-256 of this workspace's `stream`. Such a file is
+     adopted (identity and header fields
      recorded; the zero fill is allocation, not data). **Anything else at that
      path is `reserve-foreign`** — directory, symlink, device, wrong size,
      unreadable, header absent, header malformed, or header naming a different
@@ -4085,9 +4253,12 @@ Contents:
      typed condition. The one thing a fixed-path allocation artifact must not do
      is delete something it did not create, and after v8 that is a property of
      the bytes rather than a sentence in this document.
-   - **Deletion is header-gated.** M6 role 7 re-reads the 64-byte header
-     immediately before unlinking and requires it to match the header fields M1
-     CAS-recorded into the control. A mismatch is a `reserve-foreign` corruption
+   - **Deletion is header-gated.** M6 role 7 re-reads the 128-byte header
+     immediately before unlinking and requires **byte-for-byte equality of all
+     128 bytes** with the header M1 CAS-recorded into the control — the same
+     equality rule M1 applied on adoption, stated once so the two cannot drift
+     into "matching fields" versus "matching bytes". A mismatch is a
+     `reserve-foreign` corruption
      halt with zero writes, on the same footing as every other artifact-behind
      observation — so the one deleting step in the reserve's life cannot delete
      a file that replaced the one M1 claimed.
@@ -4113,8 +4284,12 @@ be written):
   aggregate version telemetry the fleet already reports;
 - baked for at least two weeks of ordinary fleet use with zero
   barrier-related incidents;
-- the degraded/legacy-writer fixture matrix `F1`–`F4` from the closure above
-  passes, including both negative controls.
+- the degraded/legacy-writer fixture matrix `F1`–`F5` from the closure above
+  passes, including both negative controls and `F5`'s companion assertion;
+- the pre-`1.11.0` population is **demonstrably drained** by the aggregate
+  version telemetry above. This is the only thing carrying § 1a's outcome (ii),
+  which is silent and unrecoverable; if the telemetry cannot show the drain, U3
+  does not open.
 
 ### U0 — entry interning (no gate)
 
@@ -4587,3 +4762,22 @@ sections rather than the claims.
 
 V8 remains pending final ratification and is not implementation authority. Two
 founder inputs are owed, both enumerated at the top of this document.
+
+## R4-v9 residual fold (v9)
+
+One review: the codex serial review of the v8 tip, 2026-07-29. **Two** residuals,
+closed below. Row 1 also carries a correction to the v8 log row above it: the
+"bound-by-bound discussion" that row 1 of the v8 table credits contained two
+claims that do not survive contact with the source, and v9 removes them rather
+than leaving a log row asserting a bound the code contradicts. Consistent with
+the standing rule — *the review log records a closure, it never constitutes
+one* — the v8 rows are left as the record of what v8 did; the corrections live
+in the normative sections and in this table.
+
+| Residual | Disposition in v9 |
+|---|---|
+| 1 — the paired witness sample is not atomic with M6's rename, so a pre-`1.11.0` unsafe writer can publish *after* the final sample and *before* the rename; M6 then overwrites that fresh JSON with `Q` while the migrated DB and M2 backups descend from the older source. A silent lost write, distinct from the post-`Q` destruction `F3` asserts, and unnamed in v8 | **Window shrunk, residue split into two named outcomes, and the falsified bounds withdrawn.** (a) M6 re-verifies `.rbox/state.json`'s `stateBodySha256` against the M3-imported source digest as the **immediately preceding operation** to `fs.rename`, under the `stateLockPath` it already holds — a mismatch is a typed `legacy-write-detected` disposition that does not rename and enters C1 retirement with JSON authoritative. V8 already rehashed the live JSON but did so at the *start* of the M6 exact-sibling step, with fsync/hash/identity-bracket work between check and rename; v9 makes it the last instant. It is explicitly **not** atomic (`writeFileAtomic` exposes only `beforeRename`, `fsutil.ts:40`), it only reduces exposure to the `check → rename` instants. (b) The residue is restated as **two** outcomes: **(i)** post-`Q` destruction, detectable as `legacy-overwrite-after-Q` (`F3`); **(ii)** the pre-`Q` lost write in the microwindow (`F5`). (c) Recovery and detection for (ii) are stated without overclaim: **unrecoverable and silent.** `fs.rename` (`fsutil.ts:83`) releases the displaced inode, M6 never opened it — so "preserve the displaced content" is not implementable, and M6 can only preserve what it read, which is the already-backed-up older source. No `.bak` diverges, no witness records it, and there is no `legacy-overwrite-after-Q` analogue; `F5` asserts the *absence* of a doctor anomaly so the silence cannot drift. What limits damage is convergence, not detection: `state.json` is a manifest cache plus derived git records, so the failure mode is a **stale BASE** whose consumer is already fail-closed (redundant deferral, never silent overwrite). (d) **Falsified-necessity correction.** V8's row 1 claimed the residual "requires the writer's read→rename window to span the entire M0–M6 migration" and that the writer must "complete its state read before M0 begins". Both are false: `saveStateSource` reaches the unsafe writer at `sync-state.ts:348-350`, and its callers separate read from write by a whole sync — push loads at `push.ts:476` and saves at `push.ts:532-540`; pull loads at `pull.ts:233` and saves at `pull.ts:414-446`. The preconditions are now stated as exactly what is required: a pre-`1.11.0` binary, the `forceLegacy`-or-`unsupported` path (`pull.ts:446`, `push.ts:540`/`:580`/`:895`, or fresh-init `saveState`; `writeWholeStateUnsafe` at `sync-state-store.ts:338-370` takes no lock), and a rename landing in one of the two windows. Ratifiability is pinned to the `B0` adoption gate and made a hard U3 exit criterion — if telemetry cannot show the pre-`1.11.0` population drained, U3 does not open. |
+| 2 — the specified `RBOX-STATE-RESERVE-v1 <semver> <stream>\n` header cannot fit 64 bytes; real streams are 71 bytes on their own | **Re-encoded to a 128-byte header, with the arithmetic shown.** Fixed overhead is `21` (magic) `+ 1 + 1` (separators) `+ 1` (`\n`) `= 24` plus the two variable fields. A verbatim stream needs `24 + 6 + 71 = 101` bytes and a full SHA-256 hex digest needs `24 + 6 + 64 = 94` — both over 64 — and truncating hex to fit 64 makes the digest width a function of the semver (34 hex for `1.11.0`, 18 for `1.11.0-rc.3+2026072701`), which is neither fixed-width nor collision-resistant. All three 64-byte forms are rejected in the doc. The header is now **128 bytes**: magic, space, semver (`<= 40` bytes; a longer semver refuses to create rather than truncating), space, the lowercase SHA-256 hex of the workspace `stream`'s UTF-8 bytes (64 chars), `\n`, NUL-padded — fixed overhead `21 + 1 + 1 + 64 + 1 = 88`, leaving exactly 40. Zero fill becomes **1,048,448** bytes and `128 + 1,048,448 = 1,048,576`, so total reserve size and the allocation guarantee are unchanged. M1 adoption and M6 role-7 deletion are stated as one rule — **byte-for-byte equality of all 128 bytes** with the CAS-recorded header — and `reserve-foreign` now covers a malformed 128-byte frame (bad magic, oversized/ill-formed semver, non-hex or wrong-length digest, missing `\n`, non-NUL padding) or a digest naming a different workspace. |
+
+V9 remains pending final ratification and is not implementation authority. The
+same two founder inputs are owed, both enumerated at the top of this document.
