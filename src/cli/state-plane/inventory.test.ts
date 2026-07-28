@@ -17,8 +17,8 @@ import { describe, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import path from "node:path";
 
-const REPO = path.resolve(import.meta.dir, "../..");
-const SWEEP = path.join(import.meta.dir, "sync-git", "base-composer-ast-sweep.mjs");
+const REPO = path.resolve(import.meta.dir, "../../..");
+const SWEEP = path.join(import.meta.dir, "..", "sync-git", "base-composer-ast-sweep.mjs");
 
 /** Text that constructs or names `.rbox/state.json`. */
 const STATE_PATH_ARGUMENT = /\bstatePath\(|\bactiveStatePath\(|["']state\.json["']/;
@@ -52,8 +52,8 @@ const ENTRY_POINTS: readonly EntryPoint[] = [
 
   // Writes — check the barrier immediately before the publishing rename, and
   // record the last-writer witness immediately after it.
-  { file: "src/cli/state-publish.ts", symbol: "publishWholeState", kind: "write", sites: 0, guards: ["assertStatePublishable"] },
-  { file: "src/cli/state-publish.ts", symbol: "afterStatePublication", kind: "write", sites: 0, guards: ["recordLastWriterWitness", "ensureStateReserve"] },
+  { file: "src/cli/state-plane/adapters/legacy-json-publication.ts", symbol: "publishWholeState", kind: "write", sites: 0, guards: ["assertStatePublishable"] },
+  { file: "src/cli/state-plane/adapters/legacy-json-publication.ts", symbol: "afterStatePublication", kind: "write", sites: 0, guards: ["recordLastWriterWitness", "ensureStateReserve"] },
   { file: "src/cli/sync-state-store.ts", symbol: "applyStateSavePacket", kind: "write", sites: 7, guards: ["assertStatePublishable", "afterStatePublication"] },
   { file: "src/cli/sync-state-store.ts", symbol: "writeWholeStateUnsafe", kind: "write", sites: 2, guards: ["acquireLock", "publishWholeState", "afterStatePublication"] },
   { file: "src/cli/sync-state-store.ts", symbol: "ensureTelemetryBindingId", kind: "write", sites: 5, guards: ["assertStatePublishable", "afterStatePublication"] },
@@ -62,7 +62,7 @@ const ENTRY_POINTS: readonly EntryPoint[] = [
   // state document by renaming a prepared candidate over it.
   { file: "src/cli/sync-state-store.ts", symbol: "installGenesisResetStateUnderHeldLock", kind: "reset", sites: 4, guards: ["publishWholeState", "afterStatePublication"] },
   { file: "src/cli/reset-journal.ts", symbol: "observePhysical", kind: "reset", sites: 0, guards: ["assertStateReadable"] },
-  { file: "src/cli/reset-journal.ts", symbol: "recoverResetJournalUnderHeldFence", kind: "reset", sites: 8, guards: ["assertStateReadable", "recordLastWriterWitness", "isOwner"] },
+  { file: "src/cli/reset-journal.ts", symbol: "recoverResetJournalUnderHeldFence", kind: "reset", sites: 8, guards: ["assertStateReadable", "isOwner", "recordLastWriterWitness"] },
   { file: "src/cli/reset-journal.ts", symbol: "recoverResetJournal", kind: "reset", sites: 3, guards: ["recoverResetJournalUnderHeldFence"] },
   { file: "src/cli/reset-state.ts", symbol: "prepareResetArtifactsUnderFence", kind: "reset", sites: 3, guards: ["assertStateReadable"] },
   { file: "src/cli/reset-state.ts", symbol: "resetSyncState", kind: "reset", sites: 5, guards: ["loadRawState", "assertStateReadable"] },
@@ -106,19 +106,41 @@ function accessTable(): Map<string, number> {
   return table;
 }
 
-/** The callees actually invoked inside one enclosing function. */
-function calleesIn(file: string, owner: string): Set<string> {
-  const out = new Set<string>();
-  for (const site of astSites()) {
-    if (site.category !== "call" || site.file !== file || site.owner !== owner) continue;
-    const callee = site.callee ?? "";
-    out.add(callee);
-    // `lock.isOwner()` and `handle.stat()` are property calls; index the member
-    // name too so a guard can be named without pinning the receiver.
-    const member = callee.split(".").pop();
-    if (member) out.add(member);
+/** Calls in lexical source order inside one enclosing function. */
+function callsIn(file: string, owner: string): AstSite[] {
+  return astSites()
+    .filter((site) => site.category === "call" && site.file === file && site.owner === owner)
+    .sort((left, right) => left.line - right.line);
+}
+
+function calleeMatches(site: AstSite, expected: string): boolean {
+  const callee = site.callee ?? "";
+  return callee === expected || callee.split(".").pop() === expected;
+}
+
+function requiredCall(file: string, owner: string, callee: string): AstSite {
+  const site = callsIn(file, owner).find((candidate) => calleeMatches(candidate, callee));
+  expect(site, `${file}:${owner} does not call ${callee}`).toBeDefined();
+  return site!;
+}
+
+function requiredCallAfter(file: string, owner: string, callee: string, after: AstSite): AstSite {
+  const site = callsIn(file, owner)
+    .find((candidate) => candidate.line > after.line && calleeMatches(candidate, callee));
+  expect(site, `${file}:${owner} does not call ${callee} after line ${after.line}`).toBeDefined();
+  return site!;
+}
+
+function expectOrderedCalls(file: string, owner: string, callees: readonly string[]): void {
+  const calls = callsIn(file, owner);
+  let cursor = -1;
+  for (const callee of callees) {
+    const index = calls.findIndex((site, candidateIndex) =>
+      candidateIndex > cursor && calleeMatches(site, callee));
+    expect(index, `${file}:${owner} does not call ${callee} after ${callees[Math.max(0, callees.indexOf(callee) - 1)]}`)
+      .toBeGreaterThan(cursor);
+    cursor = index;
   }
-  return out;
 }
 
 describe("state barrier pinning inventory", () => {
@@ -135,28 +157,73 @@ describe("state barrier pinning inventory", () => {
     ).toEqual(Object.fromEntries([...expected].sort()));
   });
 
-  test("every enumerated entry point calls its barrier and witness obligations", () => {
+  test("every enumerated entry point calls its barrier and witness obligations in order", () => {
     for (const entry of ENTRY_POINTS) {
-      const callees = calleesIn(entry.file, entry.symbol);
-      expect(callees.size, `${entry.file}:${entry.symbol} was not found — the inventory is stale`).toBeGreaterThan(0);
-      for (const guard of entry.guards) {
-        expect(
-          callees.has(guard),
-          `${entry.file}:${entry.symbol} (${entry.kind}) does not call its barrier obligation \`${guard}\``,
-        ).toBe(true);
-      }
+      const calls = callsIn(entry.file, entry.symbol);
+      expect(calls.length, `${entry.file}:${entry.symbol} was not found — the inventory is stale`).toBeGreaterThan(0);
+      expectOrderedCalls(entry.file, entry.symbol, entry.guards);
     }
+  });
+
+  test("ordinary publication traverses the typed adapter in publication order", () => {
+    for (const symbol of ["writeWholeStateUnsafe", "installGenesisResetStateUnderHeldLock"]) {
+      expectOrderedCalls("src/cli/sync-state-store.ts", symbol, ["publishWholeState", "afterStatePublication"]);
+    }
+
+    const file = "src/cli/state-plane/adapters/legacy-json-publication.ts";
+    const publish = requiredCall(file, "publishWholeState", "writeFileAtomic");
+    const options = publish.arguments?.[2] ?? "";
+    expect(options).toContain("beforeRename");
+    expect(options).toContain("assertStatePublishable");
+    expect(options).toContain("lock.isOwner");
+    const stateParentSync = requiredCallAfter(file, "publishWholeState", "fsyncDirectory", publish);
+    expect(stateParentSync.arguments?.[0]).toBe("path.dirname(file)");
+    expectOrderedCalls(file, "publishWholeState", ["writeFileAtomic", "fsyncDirectory"]);
+    expectOrderedCalls(file, "afterStatePublication", ["recordLastWriterWitness", "ensureStateReserve"]);
+  });
+
+  test("inline CAS publication proves its callback and post-publication order", () => {
+    for (const symbol of ["applyStateSavePacket", "ensureTelemetryBindingId"]) {
+      const publish = requiredCall("src/cli/sync-state-store.ts", symbol, "writeFileAtomic");
+      const options = publish.arguments?.[2] ?? "";
+      expect(options).toContain("beforeRename");
+      expect(options).toContain("assertStatePublishable");
+      expect(options).toContain("isOwner");
+      const stateParentSync = requiredCallAfter("src/cli/sync-state-store.ts", symbol, "fsyncDirectory", publish);
+      expect(stateParentSync.arguments?.[0]).toBe("path.dirname(statePath(root))");
+      expectOrderedCalls("src/cli/sync-state-store.ts", symbol, [
+        "assertStatePublishable",
+        "fsyncDirectory",
+        "afterStatePublication",
+      ]);
+    }
+  });
+
+  test("reset byte-swap publication remains a separately ordered contract", () => {
+    const file = "src/cli/reset-journal.ts";
+    const owner = "recoverResetJournalUnderHeldFence";
+    const calls = callsIn(file, owner);
+    const renameIndex = calls.findIndex((site) => calleeMatches(site, "fs.rename"));
+    const ownerIndex = calls.findLastIndex((site, index) => index < renameIndex && calleeMatches(site, "isOwner"));
+    const readableIndex = calls.findLastIndex((site, index) => index < renameIndex && calleeMatches(site, "assertStateReadable"));
+    const stateParentSyncIndex = calls.findIndex((site, index) => index > renameIndex && calleeMatches(site, "fsyncDirectory"));
+    expect(ownerIndex).toBeGreaterThan(-1);
+    expect(readableIndex).toBeGreaterThan(ownerIndex);
+    expect(renameIndex).toBeGreaterThan(readableIndex);
+    expect(stateParentSyncIndex).toBeGreaterThan(renameIndex);
+    expect(calls[stateParentSyncIndex]?.arguments?.[0]).toBe("activeParent");
+    expectOrderedCalls(file, owner, ["fs.rename", "fsyncDirectory", "recordLastWriterWitness"]);
   });
 
   test("the barrier module is the only thing that recognizes the marker bytes", async () => {
     const offenders: string[] = [];
     for (const site of astSites()) {
-      if (site.file.endsWith("state-barrier.ts")) continue;
+      if (site.file.endsWith("state-plane/authority-marker.ts")) continue;
       if ((site.arguments ?? []).some((argument) => argument.includes("RBOX-SQLITE-AUTHORITY"))) offenders.push(site.file);
     }
-    const barrier = await fs.readFile(path.join(REPO, "src/cli/state-barrier.ts"), "utf8");
+    const barrier = await fs.readFile(path.join(REPO, "src/cli/state-plane/authority-marker.ts"), "utf8");
     expect(barrier).toContain("RBOX-SQLITE-AUTHORITY-v1");
-    expect(offenders, "the marker literal must live only in state-barrier.ts").toEqual([]);
+    expect(offenders, "the marker literal must live only in state-plane/authority-marker.ts").toEqual([]);
   });
 
   test("every exemption states a reason", () => {

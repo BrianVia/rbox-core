@@ -9,12 +9,12 @@
  * writer, inline or not, to both obligations.
  */
 import path from "node:path";
-import { fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
-import type { OwnedLock } from "../engine/git/lockfile.js";
-import { assertStatePublishable, StateWriteRefusedError } from "./state-barrier.js";
-import { ensureStateReserve } from "./state-reserve.js";
-import { recordLastWriterWitness } from "./state-witness.js";
-import type { SyncState } from "./sync-state-model.js";
+import { fsyncDirectory, writeFileAtomic } from "../../../engine/fsutil.js";
+import type { OwnedLock } from "../../../engine/git/lockfile.js";
+import { assertStatePublishable } from "../authority-marker.js";
+import { StateWriteRefusedError } from "../errors.js";
+import { ensureStateReserve } from "../migration/reserve.js";
+import { recordLastWriterWitness } from "../migration/last-writer-witness.js";
 
 /**
  * Publish `body` as the whole state document at `file`. `lock` is the state lock
@@ -45,9 +45,9 @@ export async function publishWholeState(file: string, body: string, lock: OwnedL
  * for the bytes just published, and make sure the migration reserve exists.
  * Neither may fail a state write that is already durable.
  */
-export async function afterStatePublication(root: string, file: string, state: SyncState, body: string): Promise<void> {
+export async function afterStatePublication(root: string, file: string, stream: string, body: string): Promise<void> {
   await recordLastWriterWitness(root, file, body);
-  if (typeof state.stream === "string" && state.stream.length > 0) {
-    await ensureStateReserve(root, state.stream).catch(() => undefined);
+  if (typeof stream === "string" && stream.length > 0) {
+    await ensureStateReserve(root, stream).catch(() => undefined);
   }
 }

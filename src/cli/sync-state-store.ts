@@ -20,8 +20,13 @@ import {
 import { BINDING_ID_RE } from "./telemetry/contract.js";
 import { readResetJournal, recoverResetJournal } from "./reset-journal.js";
 import { boundedJsonRead } from "./reset-io.js";
-import { assertStatePublishable, assertStateReadable, StateWriteRefusedError } from "./state-barrier.js";
-import { afterStatePublication, publishWholeState } from "./state-publish.js";
+import {
+  afterStatePublication,
+  assertStatePublishable,
+  assertStateReadable,
+  publishWholeState,
+  StateWriteRefusedError,
+} from "./state-plane/index.js";
 import { RBOX_DIR } from "./workspace-config.js";
 import {
   expectedStateNonce,
@@ -239,7 +244,7 @@ export async function applyStateSavePacket(root: string, packet: StateSavePacket
     if (markerExisted) await fsyncDirectory(path.dirname(stateIncarnationPath(root)));
     // Last, so nothing about the witness sits inside the marker-retirement crash
     // window: the witness is diagnostic evidence, never durability ordering.
-    await afterStatePublication(root, statePath(root), next, body);
+    await afterStatePublication(root, statePath(root), next.stream, body);
     return { status: "accepted", state: next };
   } finally {
     if (releaseLock) await lock.release();
@@ -392,7 +397,7 @@ async function writeWholeStateUnsafe(root: string, state: SyncState): Promise<vo
   const lock = acquired.status === "acquired" ? acquired.lock : undefined;
   try {
     await publishWholeState(statePath(root), body, lock);
-    await afterStatePublication(root, statePath(root), state, body);
+    await afterStatePublication(root, statePath(root), state.stream, body);
   } finally {
     await lock?.release();
   }
@@ -444,7 +449,7 @@ export async function ensureTelemetryBindingId(
     });
     if (!owner) throw new Error("sync state telemetry lock ownership was lost");
     await fsyncDirectory(path.dirname(statePath(root)));
-    await afterStatePublication(root, statePath(root), next, body);
+    await afterStatePublication(root, statePath(root), next.stream, body);
     return { state: next, bindingId };
   } finally {
     await acquired.lock.release();
@@ -483,7 +488,7 @@ export async function installGenesisResetStateUnderHeldLock(
   };
   const body = JSON.stringify(genesis, null, 2);
   await publishWholeState(statePath(root), body, heldLock);
-  await afterStatePublication(root, statePath(root), genesis, body);
+  await afterStatePublication(root, statePath(root), genesis.stream, body);
   await writeFileAtomic(stateIncarnationPath(root), JSON.stringify({
     stream: genesis.stream,
     stateNonce: genesis.stateNonce,

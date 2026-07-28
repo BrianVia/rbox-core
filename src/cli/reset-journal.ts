@@ -7,8 +7,12 @@ import { acquireLock, type OwnedLock } from "../engine/git/lockfile.js";
 import { withRepositoryRecoveryFence } from "../engine/git/protocol-locks.js";
 import { readRepoIdentityV1, repositoryIdentityHash, validateRepoIdentityV1, type RepoIdentityV1 } from "../engine/git/repo-lineage.js";
 import { gitRaw } from "../engine/git/shared.js";
-import { assertStateReadable, StateFormatTooNewError, StateWriteRefusedError } from "./state-barrier.js";
-import { recordLastWriterWitness } from "./state-witness.js";
+import {
+  assertStateReadable,
+  recordLastWriterWitness,
+  StateFormatTooNewError,
+  StateWriteRefusedError,
+} from "./state-plane/index.js";
 import type { SyncState } from "./sync-state-model.js";
 import {
   classifyResetPhysicalSignature,

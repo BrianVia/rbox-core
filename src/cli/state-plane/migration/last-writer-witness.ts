@@ -15,10 +15,10 @@ import crypto from "node:crypto";
 import { constants, type Stats } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
-import { semverGt } from "./semver.js";
-import { RBOX_VERSION } from "./version.js";
-import { RBOX_DIR } from "./workspace-config.js";
+import { fsyncDirectory, writeFileAtomic } from "../../../engine/fsutil.js";
+import { semverGt } from "../../semver.js";
+import { RBOX_VERSION } from "../../version.js";
+import { RBOX_DIR } from "../../workspace-config.js";
 
 /** The ratified downgrade floor: the first release whose writers maintain this
  * witness. A workspace whose most recent writer predates it is not migratable. */

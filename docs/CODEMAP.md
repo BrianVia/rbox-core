@@ -9,7 +9,7 @@ trees, or changes what a module owns, updates its line here in the same PR.
 
 Scope: the API Worker and sync engine — `apps/api/src/`, `src/cli/sync*`, `src/cli/daemon*`,
 `src/cli/e2ee-remote*`, `src/cli/remote/`, `src/cli/publish-pipeline/`,
-`src/cli/telemetry/`, `src/engine/`. Command files (`src/cli/*-cmd.ts`), dispatch, and UI helpers
+`src/cli/telemetry/`, `src/cli/state-plane/`, `src/engine/`. Command files (`src/cli/*-cmd.ts`), dispatch, and UI helpers
 are deliberately not mapped.
 
 Barrels (`sync.ts`, `sync-git.ts`, `daemon.ts`, `crypto-pool.ts`,
@@ -145,6 +145,18 @@ src/cli/telemetry/lane-accumulator.ts — AsyncLocalStorage-scoped per-push uplo
 src/cli/telemetry/sync-phase.ts — per-daemon independent pull/push cadence and tail sampling plus privacy-bounded PhaseReport projection. Never: sync execution, queue transport, or repo identifiers.
 ```
 
+## `src/cli/state-plane/` — local sync-state authority and persistence boundary
+
+```
+src/cli/state-plane/index.ts — facade: the stable public state-plane surface. Never: logic, state, or non-re-export declarations.
+src/cli/state-plane/authority-marker.ts — bounded recognition of the legacy JSON/SQLite-authority marker formats plus read/write publication guards and fail-closed rethrowing. Never: persistence, migration artifacts, or error message ownership.
+src/cli/state-plane/errors.ts — typed state-format and state-publication refusal errors and their stable reason/message taxonomy. Never: filesystem access, classification, or retry policy.
+src/cli/state-plane/adapters/legacy-json-publication.ts — barrier-era whole-JSON publication adapter and ordered post-publication witness/reserve obligations. Never: state composition, locking policy, SQLite storage, or reset recovery.
+src/cli/state-plane/migration/last-writer-witness.ts — closed-schema durable proof of the exact barrier-capable writer and state bytes last published. Never: sync authority, state reads for normal operation, or migration admission policy.
+src/cli/state-plane/migration/reserve.ts — provenance-bound 1 MiB migration runway creation, adoption, and diagnostic classification. Never: claiming/deleting the reserve, migration execution, or state publication.
+src/cli/state-plane/sqlite-contract/ — tests and test-only helpers observing the bun:sqlite behaviors required by design 163. Never: production imports or database policy.
+```
+
 ## `src/cli/` — sync-adjacent singles
 
 ```
@@ -277,7 +289,6 @@ src/engine/darwin-bulk-walk.ts      — macOS-only bulk directory enumeration (b
 src/engine/encoding.ts              — base64url encode/decode. Pure leaf. Never: dependencies.
 src/engine/pat-token.ts             — personal-access-token generate/validate (+CRC32). Self-contained. Never: transport.
 src/engine/refset.ts                — dependency-free binary codec for the rbox-refset-v1 sidecar (locked format; bundles into client + Worker). Never: hashing (caller hashes).
-src/engine/sqlite-contract/         — tests and test-only helpers observing the bun:sqlite behaviors required by design 163. Never: production imports or database policy.
 ```
 
 ## `src/engine/crypto-pool/` — worker-based crypto pool

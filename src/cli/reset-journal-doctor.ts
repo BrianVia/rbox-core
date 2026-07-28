@@ -3,7 +3,7 @@ import path from "node:path";
 import { acquireLock } from "../engine/git/lockfile.js";
 import { withRepositoryRecoveryFence, type RepositoryProtocolFenceRequest } from "../engine/git/protocol-locks.js";
 import { loadConfig, stateLockPath, statePath, syncStreamId } from "./config.js";
-import { assertStateReadable } from "./state-barrier.js";
+import { assertStateReadable } from "./state-plane/authority-marker.js";
 import { boundedHash, boundedRead } from "./reset-io.js";
 import { inspectResetJournalSafety } from "./reset-halt-inspection.js";
 import { resetJournalPath } from "./reset-journal.js";
