@@ -19,10 +19,17 @@ import { loadState } from "../sync-state-store.js";
 import { syncStreamId } from "../workspace-config.js";
 import { withWorkspaceSyncMutex } from "../sync-mutex.js";
 import { loadConfig, saveConfig, type WorkspaceConfig } from "../workspace-config.js";
-import { newMaintenanceId, planScopeIntent, type ScopeIntent } from "./scope-intent.js";
+import { intentPhase, newMaintenanceId, planScopeIntent, sameIntent, type ScopeIntent } from "./scope-intent.js";
 import { withinPrefix } from "./scope-record.js";
 
 export { planScopeIntent, type ScopeIntent } from "./scope-intent.js";
+
+export class ScopeEditInFlightError extends Error {
+  constructor() {
+    super("another change to the folders this machine syncs is still finishing — re-run this in a moment");
+    this.name = "ScopeEditInFlightError";
+  }
+}
 
 export interface ScopeTransitionResult {
   accepted: string[];
@@ -39,6 +46,8 @@ export interface ScopeTransactionDeps {
   /** Close the window opened by exactly `id`; resolves to whether it restarted. */
   resumeDaemon?: (root: string, id: string) => Promise<boolean>;
   daemonRunning?: (root: string) => boolean;
+  /** The id of an open maintenance window, for a daemon whose intent is gone. */
+  parkedMaintenanceId?: (root: string) => Promise<string | undefined>;
   recordWitness?: (root: string, workspaceId: string, scope: readonly string[] | undefined) => Promise<void>;
   newMaintenanceId?: () => string;
   now?: () => Date;
@@ -53,6 +62,7 @@ async function defaultDeps(deps: ScopeTransactionDeps): Promise<Required<Omit<Sc
     parkDaemon: deps.parkDaemon ?? ((root, id) => autostart.parkDaemonForMaintenance(root, id)),
     resumeDaemon: deps.resumeDaemon ?? ((root, id) => autostart.resumeDaemonAfterMaintenance(root, id)),
     daemonRunning: deps.daemonRunning ?? ((root) => control.readDaemonPidRecord(root).pid !== undefined),
+    parkedMaintenanceId: deps.parkedMaintenanceId ?? (async (root) => (await autostart.readDaemonMaintenance(root))?.id),
     recordWitness: deps.recordWitness ?? registry.recordBindingScope,
     newMaintenanceId: deps.newMaintenanceId ?? newMaintenanceId,
     now: deps.now ?? (() => new Date()),
@@ -81,7 +91,15 @@ export async function runScopeTransition(
   const cfg = await loadConfig(abs);
   const accepted = cfg.scope ?? [];
   const journaled = cfg.scopeIntent?.target.join("\n") === target.join("\n") ? cfg.scopeIntent : undefined;
+  // Someone else's unfinished edit. Planning over it would delete the only record
+  // that says how to finish it.
+  if (journaled === undefined && cfg.scopeIntent !== undefined) throw new ScopeEditInFlightError();
   let intent = journaled ?? planScopeIntent(accepted, target, (cfg.scopeGeneration ?? 0) + 1, wired.now().toISOString());
+  const phase = intentPhase(intent, cfg.scope, cfg.scopeGeneration);
+  // A recovered pre-`phase` intent carries no maintenance token, so nothing on disk
+  // distinguishes "the interrupted edit parked the daemon" from "the user stopped
+  // it". Guessing either way is wrong; §6 tells the user instead.
+  const legacy = journaled !== undefined && journaled.phase === undefined && journaled.maintenanceId === undefined;
 
   // 1. Durable intent, before anything moves.
   if (journaled === undefined) await saveConfig(abs, { ...cfg, scopeIntent: intent });
@@ -91,7 +109,7 @@ export async function runScopeTransition(
   //    journaled BEFORE the daemon is touched and the park itself is durable, so a
   //    crash inside this window cannot leave background sync silently switched off:
   //    the liveness sample is never the only thing that remembers the restart.
-  if (intent.phase !== "committed" && wired.daemonRunning(abs)) {
+  if (phase !== "committed" && wired.daemonRunning(abs)) {
     const id = intent.maintenanceId ?? wired.newMaintenanceId();
     if (intent.maintenanceId === undefined) {
       intent = { ...intent, maintenanceId: id };
@@ -102,7 +120,7 @@ export async function runScopeTransition(
 
   await withWorkspaceSyncMutex(abs, async () => {
     const current = await loadConfig(abs);
-    if (intent.phase !== "committed") {
+    if (phase !== "committed") {
       // 3. Prune first, under the mutex. Removed folders go to the trash, never
       //    straight to rm — a mistyped prefix must be undoable.
       if (intent.prune.length > 0) await pruneScopedSubtrees(abs, current, intent.prune, "trash");
@@ -129,8 +147,13 @@ export async function runScopeTransition(
   const daemonRestarted = intent.maintenanceId === undefined
     ? false
     : await wired.resumeDaemon(abs, intent.maintenanceId);
+  if (legacy && !daemonRestarted && !wired.daemonRunning(abs)) {
+    wired.log("background sync is off here — an interrupted change to your synced folders could not tell whether you turned it off on purpose. Turn it back on with: rbox start");
+  }
   await withWorkspaceSyncMutex(abs, async () => {
     const settled: WorkspaceConfig = { ...(await loadConfig(abs)) };
+    // Only ever retire OUR cursor: a concurrent edit may have journaled its own.
+    if (!sameIntent(settled.scopeIntent, intent)) return;
     delete settled.scopeIntent;
     await saveConfig(abs, settled);
   });
@@ -177,9 +200,20 @@ async function pruneScopedSubtrees(
   });
 }
 
-/** Resume an interrupted transition, if one is journaled. */
+/**
+ * Finish whatever an interrupted scope edit left behind: the journaled intent if
+ * there is one, otherwise a daemon still parked under a window whose intent was
+ * discarded — a `track --include` rollback, or a crash inside one. An open window
+ * with no intent can only mean a stranded daemon: the intent is always durable
+ * before the park, and settling always attempts the resume.
+ */
 export async function resumeScopeIntent(root: string, deps: ScopeTransactionDeps = {}): Promise<ScopeTransitionResult | undefined> {
-  const cfg = await loadConfig(path.resolve(root)).catch(() => undefined);
-  if (!cfg?.scopeIntent) return undefined;
-  return runScopeTransition(root, cfg.scopeIntent.target, deps);
+  const abs = path.resolve(root);
+  const cfg = await loadConfig(abs).catch(() => undefined);
+  if (cfg?.scopeIntent) return runScopeTransition(root, cfg.scopeIntent.target, deps);
+  if (cfg === undefined) return undefined;
+  const wired = await defaultDeps(deps);
+  const parked = await wired.parkedMaintenanceId(abs);
+  if (parked !== undefined) await wired.resumeDaemon(abs, parked);
+  return undefined;
 }

@@ -87,7 +87,9 @@ function daemonFake(startLive = true): DaemonFake {
     deps: {
       daemonRunning: () => live,
       newMaintenanceId: () => `mt_${++ids}`,
+      parkedMaintenanceId: async () => token?.id,
       parkDaemon: async (_root, id) => {
+        if (token !== undefined && token.id !== id) throw new Error("another rbox command is already holding background sync for maintenance");
         token = { id, resume: live ? "running" : "stopped" };
         live = false;
         parks += 1;
@@ -310,4 +312,111 @@ test("an explicit stop during the window wins: the resume does not resurrect the
   expect(cfg.scope).toEqual(ADD);
   expect(cfg.scopeIntent).toBeUndefined();
   expect(fake.live()).toBe(false);
+});
+
+/**
+ * Round 2 — the review found three more ways the obligation could be dropped:
+ * a rollback that discards the cursor, two edits erasing each other's cursor, and
+ * intents written before the phase field existed.
+ */
+
+test("a rollback that discards the intent still leaves the parked daemon a way back", async () => {
+  await saveConfig(root, base(["Personal/repo-A"]));
+  const fake = daemonFake();
+  await expect(runScopeTransition(root, ADD, {
+    ...fake.deps,
+    recordWitness: async () => { throw new Error("power loss"); },
+  })).rejects.toThrow("power loss");
+  // What `track --include` rollback does: restore the old config, intent and all.
+  await saveConfig(root, base(["Personal/repo-A"]));
+  expect(fake.live()).toBe(false);
+
+  await resumeScopeIntent(root, fake.deps);
+  expect(fake.live()).toBe(true);
+});
+
+test("a second edit refuses to plan over an unfinished one", async () => {
+  await saveConfig(root, base(["Personal/repo-A"]));
+  const first = daemonFake();
+  await expect(runScopeTransition(root, ADD, {
+    ...first.deps,
+    recordWitness: async () => { throw new Error("power loss"); },
+  })).rejects.toThrow("power loss");
+
+  const second = daemonFake();
+  await expect(runScopeTransition(root, ["Work/repo-C"], second.deps)).rejects.toThrow("still finishing");
+  expect((await loadConfig(root)).scopeIntent).toMatchObject({ target: ADD });
+});
+
+test("two interleaved edits: neither settles away the other's recovery cursor", async () => {
+  await saveConfig(root, base(["Personal/repo-A"]));
+  const first = daemonFake();
+  const theirs = planScopeIntent(ADD, ["Work/repo-C"], 9, "theirs");
+
+  // Both processes read an empty slot at once — the window no refusal can close.
+  // The second journals its intent while the first is between its resume and its
+  // settle, so the first settles against a cursor that is no longer its own.
+  await runScopeTransition(root, ADD, {
+    ...first.deps,
+    resumeDaemon: async (root_, id) => {
+      const restarted = await first.deps.resumeDaemon?.(root_, id);
+      await saveConfig(root, { ...(await loadConfig(root)), scopeIntent: theirs });
+      return restarted ?? false;
+    },
+  });
+  expect(first.live()).toBe(true);
+  expect((await loadConfig(root)).scopeIntent).toMatchObject({ target: ["Work/repo-C"], at: "theirs" });
+
+  // And the surviving cursor still runs to completion.
+  const second = daemonFake(false);
+  await resumeScopeIntent(root, second.deps);
+  const cfg = await loadConfig(root);
+  expect(cfg.scope).toEqual(["Work/repo-C"]);
+  expect(cfg.scopeIntent).toBeUndefined();
+});
+
+test("a legacy intent already applied to the record is not replayed onto disk", async () => {
+  // Yesterday's shape: scope and generation already committed, intent re-persisted,
+  // no phase and no maintenance token.
+  await saveConfig(root, {
+    ...base(["Personal/repo-A"]),
+    scopeGeneration: 2,
+    scopeIntent: { generation: 2, accepted: ["Personal/repo-A", "Work/repo-B"], target: ["Personal/repo-A"], materialize: [], prune: ["Work/repo-B"], at: "t" },
+  });
+  await fs.mkdir(path.join(root, "Work/repo-B"), { recursive: true });
+  await fs.writeFile(path.join(root, "Work/repo-B/notes.txt"), "recreated since the crash");
+  const fake = daemonFake(false);
+
+  await resumeScopeIntent(root, fake.deps);
+  expect(await fs.readFile(path.join(root, "Work/repo-B/notes.txt"), "utf8")).toBe("recreated since the crash");
+  expect((await loadConfig(root)).scopeIntent).toBeUndefined();
+});
+
+test("a legacy intent not yet applied still does its disk work", async () => {
+  await saveConfig(root, {
+    ...base(["Personal/repo-A", "Work/repo-B"]),
+    scopeIntent: { generation: 2, accepted: ["Personal/repo-A", "Work/repo-B"], target: ["Personal/repo-A"], materialize: [], prune: ["Work/repo-B"], at: "t" },
+  });
+  await fs.mkdir(path.join(root, "Work/repo-B"), { recursive: true });
+  await fs.writeFile(path.join(root, "Work/repo-B/notes.txt"), "goes to the trash");
+  const fake = daemonFake(false);
+
+  await resumeScopeIntent(root, fake.deps);
+  await expect(fs.access(path.join(root, "Work/repo-B"))).rejects.toThrow();
+  expect((await loadConfig(root)).scope).toEqual(["Personal/repo-A"]);
+});
+
+test("a legacy intent whose daemon is already down says so rather than guessing", async () => {
+  await saveConfig(root, {
+    ...base(["Personal/repo-A"]),
+    scopeGeneration: 2,
+    scopeIntent: { generation: 2, accepted: ["Personal/repo-A"], target: ["Personal/repo-A"], materialize: [], prune: [], at: "t" },
+  });
+  const fake = daemonFake(false);
+  const lines: string[] = [];
+
+  await resumeScopeIntent(root, { ...fake.deps, log: (line) => lines.push(line) });
+  expect(fake.live()).toBe(false);
+  expect(lines.join("\n")).toContain("rbox start");
+  expect((await loadConfig(root)).scopeIntent).toBeUndefined();
 });

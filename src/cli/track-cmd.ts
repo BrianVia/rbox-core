@@ -193,30 +193,21 @@ export async function track(
     ...(cfg.scope ? { scope: cfg.scope } : {}),
   });
   if (includes.length === 0) return { cfg, root };
-  const autostart = await import("./autostart-cmd.js");
   const control = await import("./daemon-control.js");
   const daemonRunning = deps.scopeDeps?.daemonRunning
     ?? ((workspaceRoot: string) => control.readDaemonPidRecord(workspaceRoot).pid !== undefined);
-  const parkDaemon = deps.scopeDeps?.parkDaemon ?? autostart.parkDaemonForMaintenance;
-  const resumeDaemon = deps.scopeDeps?.resumeDaemon ?? autostart.resumeDaemonAfterMaintenance;
-  // Rollback discards the intent that owed the parked daemon its return, so it has
-  // to carry the token itself.
-  let parkedToken: string | undefined;
+  const scopeDeps = { ...deps.scopeDeps, daemonRunning };
   try {
     const { scopeCmd } = await import("./scope/scope-cmd.js");
-    await scopeCmd(root, "add", includes, { quiet: true }, {
-      ...deps.scopeDeps,
-      daemonRunning,
-      parkDaemon: async (workspaceRoot, id) => {
-        parkedToken = id;
-        await parkDaemon(workspaceRoot, id);
-      },
-      resumeDaemon,
-    });
+    await scopeCmd(root, "add", includes, { quiet: true }, scopeDeps);
   } catch (error) {
     try {
       await restoreTrackScope(root, cfg, initialState);
-      if (parkedToken !== undefined && !daemonRunning(root)) await resumeDaemon(root, parkedToken);
+      // The restore deletes the intent, so the daemon's own maintenance window is
+      // the surviving cursor — and it survives a crash here too, because the next
+      // `rbox include` closes any window it finds with no intent behind it.
+      const { resumeScopeIntent } = await import("./scope/scope-transaction.js");
+      await resumeScopeIntent(root, scopeDeps);
     } catch (rollbackError) {
       throw new Error(
         `workspace binding succeeded, but its include setup failed and rollback could not be verified: ${String(rollbackError)}`,

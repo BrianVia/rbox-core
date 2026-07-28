@@ -1025,3 +1025,72 @@ test("parking a daemon the user had already stopped does not start it later", as
   expect(started).toEqual([]);
   expect(JSON.parse(await fs.readFile(desiredStatePath(root), "utf8")).maintenance).toBeUndefined();
 });
+
+test("a user stop landing inside the park is never overwritten by it", async () => {
+  const root = await workspace("ws_parkrace");
+  await recordDesired(root, "running", "acct_parkrace");
+  // Fires at EVERY credential lookup the park makes, so the stop lands in every
+  // gap the park leaves between claiming the token and recording the stop.
+  let races = 0;
+  const raceThenLoad = async () => {
+    races += 1;
+    await stopDaemonAndRecordDesired(root, { loadCredentials: creds("acct_parkrace"), stopDaemon: async () => {} });
+    return creds("acct_parkrace")();
+  };
+
+  await parkDaemonForMaintenance(root, "mt_1", { loadCredentials: raceThenLoad, stopDaemon: async () => {} });
+  expect(races).toBeGreaterThan(0);
+
+  const started: string[] = [];
+  const restarted = await resumeDaemonAfterMaintenance(root, "mt_1", {
+    loadCredentials: creds("acct_parkrace"),
+    startDaemon: async (r) => {
+      started.push(r);
+      return "started" as const;
+    },
+  });
+  expect({ restarted, started }).toEqual({ restarted: false, started: [] });
+  expect(JSON.parse(await fs.readFile(desiredStatePath(root), "utf8")).state).toBe("stopped");
+});
+
+test("a user stop landing inside the resume wins over the restart", async () => {
+  const root = await workspace("ws_resumerace");
+  await recordDesired(root, "running", "acct_resumerace");
+  await parkDaemonForMaintenance(root, "mt_1", { loadCredentials: creds("acct_resumerace"), stopDaemon: async () => {} });
+
+  const started: string[] = [];
+  const restarted = await resumeDaemonAfterMaintenance(root, "mt_1", {
+    loadCredentials: creds("acct_resumerace"),
+    startDaemon: async (r) => {
+      // The user changes their mind while the daemon is coming up.
+      await stopDaemonAndRecordDesired(root, { loadCredentials: creds("acct_resumerace"), stopDaemon: async () => {} });
+      started.push(r);
+      return "started" as const;
+    },
+  });
+  expect(started).toEqual([root]);
+  expect(restarted).toBe(false);
+  const final = JSON.parse(await fs.readFile(desiredStatePath(root), "utf8"));
+  expect(final.state).toBe("stopped");
+  expect(final.maintenance).toBeUndefined();
+});
+
+test("a park refuses to take over someone else's open window", async () => {
+  const root = await workspace("ws_twoparks");
+  await recordDesired(root, "running", "acct_twoparks");
+  await parkDaemonForMaintenance(root, "mt_1", { loadCredentials: creds("acct_twoparks"), stopDaemon: async () => {} });
+
+  await expect(parkDaemonForMaintenance(root, "mt_2", {
+    loadCredentials: creds("acct_twoparks"),
+    stopDaemon: async () => {},
+  })).rejects.toThrow("already holding background sync");
+  expect(JSON.parse(await fs.readFile(desiredStatePath(root), "utf8")).maintenance).toMatchObject({ id: "mt_1" });
+});
+
+test("re-parking under the same token keeps the state it promised to return to", async () => {
+  const root = await workspace("ws_reparks");
+  await recordDesired(root, "running", "acct_reparks");
+  await parkDaemonForMaintenance(root, "mt_1", { loadCredentials: creds("acct_reparks"), stopDaemon: async () => {} });
+  await parkDaemonForMaintenance(root, "mt_1", { loadCredentials: creds("acct_reparks"), stopDaemon: async () => {} });
+  expect(JSON.parse(await fs.readFile(desiredStatePath(root), "utf8")).maintenance).toMatchObject({ id: "mt_1", resume: "running" });
+});

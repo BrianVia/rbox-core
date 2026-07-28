@@ -8,6 +8,7 @@ import { loadConfig, loadState, saveStateUnsafeLegacyOrTest, syncStreamId } from
 import { flagValues, parseFlags } from "./flags.js";
 import { resolveBindingScope } from "./scope/binding-scope.js";
 import { scopeCmd } from "./scope/scope-cmd.js";
+import { resumeScopeIntent } from "./scope/scope-transaction.js";
 import { track } from "./track-cmd.js";
 
 let root: string;
@@ -156,6 +157,7 @@ test("a failed include transition restarts background sync after restoring the p
     {
       scopeDeps: {
         daemonRunning: () => running,
+        parkedMaintenanceId: async () => token,
         parkDaemon: async (_root, id) => {
           parks++;
           token = id;
@@ -178,4 +180,48 @@ test("a failed include transition restarts background sync after restoring the p
     kind: "scoped",
     prefixes: ["Personal/repo-A"],
   });
+});
+
+test("a crash between the include rollback and the restart still owes the daemon a return", async () => {
+  await track(root, { workspace: "ws_crashroll" }, "https://api.test");
+  await scopeCmd(root, "add", ["Personal/repo-A"], { quiet: true }, { daemonRunning: () => false });
+
+  let running = true;
+  let token: string | undefined;
+  const daemon = {
+    daemonRunning: () => running,
+    parkedMaintenanceId: async () => token,
+    parkDaemon: async (_root: string, id: string) => {
+      token = id;
+      running = false;
+    },
+    resumeDaemon: async (_root: string, id: string) => {
+      if (id !== token) return false;
+      token = undefined;
+      running = true;
+      return true;
+    },
+  };
+
+  await expect(track(
+    root,
+    { workspace: "ws_crashroll", include: "Work/repo-B" },
+    "https://api.test",
+    {
+      scopeDeps: {
+        ...daemon,
+        recordWitness: async () => { throw new Error("injected witness failure"); },
+        resumeDaemon: async () => { throw new Error("power loss"); },
+      },
+    },
+  )).rejects.toThrow("rollback could not be verified");
+
+  // The rollback restored the scope but died before the restart. The daemon's own
+  // maintenance window is the surviving cursor.
+  expect(running).toBe(false);
+  expect(token).toBeDefined();
+  expect(await resolveBindingScope(root)).toMatchObject({ kind: "scoped", prefixes: ["Personal/repo-A"] });
+
+  await resumeScopeIntent(root, daemon);
+  expect(running).toBe(true);
 });
