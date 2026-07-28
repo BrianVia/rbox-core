@@ -15,7 +15,7 @@ import type { RepoRecordInput } from "../../sync-state-model.js";
 import { encodeFileEntry } from "../codecs/file-entry.js";
 import { REPO_RECORD_KEYS } from "../codecs/repo-record.js";
 import type { LineageSnapshot, ManifestHeader } from "../ports.js";
-import { canonicalJson } from "./codecs.js";
+import { canonicalJson, domainHash } from "./codecs.js";
 import { RepoTransitionDigestBuilder, type SourceStageBinding } from "./repo-transition-v1.js";
 import { StageDigestBuilder, STAGE_GIT_ROLES, type StageCounts } from "./stage-semantic-v1.js";
 
@@ -281,6 +281,97 @@ test("repo-transition-v1 moves for every RepoRecord member it frames", () => {
   }
   expect(variants.size).toBe(REPO_RECORD_KEYS.length - 1);
   assertAllDistinct(base, variants);
+});
+
+/**
+ * The count tokens both grammars emit at seal time cannot be varied through the
+ * builders — `seal()` refuses a count that disagrees with the rows. So these
+ * reconstruct the exact framed token sequence by hand, prove the reconstruction is
+ * faithful (it must equal the builder's digest), and then re-emit it with the count
+ * token dropped or altered. If a builder ever stopped framing its counts, the
+ * faithful reconstruction and the count-free one would agree and this fails.
+ */
+test("stage-semantic-v1 frames its explicit count tokens", () => {
+  const emit = (tokens: (hash: ReturnType<typeof domainHash>) => void): string => {
+    const hash = domainHash("stage-semantic-v1");
+    tokens(hash);
+    return hash.digest();
+  };
+  const body = (hash: ReturnType<typeof domainHash>): void => {
+    hash.token("stage-id");
+    hash.token(STAGE_BASE.stageId);
+    hash.token("plane");
+    hash.token(STAGE_BASE.plane);
+    hash.token("header");
+    hash.token(canonicalJson(STAGE_BASE.header));
+    for (const entry of STAGE_BASE.entries) {
+      hash.token("file");
+      hash.token(encodeFileEntry(entry).canonical);
+    }
+    for (const row of STAGE_BASE.sections) {
+      hash.token("git-section");
+      hash.token(row.role);
+      hash.token(row.relPath);
+      hash.token(canonicalJson(row.section));
+    }
+    for (const role of STAGE_GIT_ROLES) {
+      hash.token("role-present");
+      hash.token(role);
+      hash.token(STAGE_BASE.roles.includes(role) ? "1" : "0");
+    }
+  };
+  const counts: StageCounts = { files: STAGE_BASE.entries.length, gitSections: STAGE_BASE.sections.length };
+  const faithful = emit((hash) => {
+    body(hash);
+    hash.token("counts");
+    hash.token(canonicalJson(counts));
+  });
+  expect(faithful, "reconstruction must match the builder exactly").toBe(stageDigest(STAGE_BASE));
+  expect(emit(body), "counts token dropped").not.toBe(faithful);
+  expect(emit((hash) => {
+    body(hash);
+    hash.token("counts");
+    hash.token(canonicalJson({ files: counts.files + 1, gitSections: counts.gitSections }));
+  }), "counts token altered").not.toBe(faithful);
+});
+
+test("repo-transition-v1 frames its explicit row-count token", () => {
+  const emit = (tokens: (hash: ReturnType<typeof domainHash>) => void): string => {
+    const hash = domainHash("repo-transition-v1");
+    tokens(hash);
+    return hash.digest();
+  };
+  const body = (hash: ReturnType<typeof domainHash>): void => {
+    hash.token("snapshot");
+    hash.token(canonicalJson(TRANSITION_BASE.token));
+    hash.token("source-stages");
+    hash.token(String(TRANSITION_BASE.bindings.length));
+    for (const binding of TRANSITION_BASE.bindings) hash.token(canonicalJson(binding));
+    hash.token("global-stage");
+    hash.token(TRANSITION_BASE.globalBinding === undefined ? "0" : "1");
+    if (TRANSITION_BASE.globalBinding !== undefined) hash.token(canonicalJson(TRANSITION_BASE.globalBinding));
+    for (const row of TRANSITION_BASE.rows) {
+      hash.token("transition");
+      hash.token(row.relPath);
+      hash.token(String(row.expectedRepoGen));
+      hash.token(canonicalJson(row.record));
+      hash.token(row.proof === undefined ? "0" : "1");
+      if (row.proof !== undefined) hash.token(row.proof);
+      hash.token(canonicalJson({ sourceStages: row.evidence }));
+    }
+  };
+  const faithful = emit((hash) => {
+    body(hash);
+    hash.token("rows");
+    hash.token(String(TRANSITION_BASE.rows.length));
+  });
+  expect(faithful, "reconstruction must match the builder exactly").toBe(transitionDigest(TRANSITION_BASE));
+  expect(emit(body), "rows token dropped").not.toBe(faithful);
+  expect(emit((hash) => {
+    body(hash);
+    hash.token("rows");
+    hash.token(String(TRANSITION_BASE.rows.length + 1));
+  }), "rows token altered").not.toBe(faithful);
 });
 
 test("repo-transition-v1 moves for every binding, evidence, row, and snapshot dimension", () => {

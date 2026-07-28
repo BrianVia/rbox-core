@@ -182,7 +182,10 @@ export function sealAndPublish(
       }
       fsyncDirectory(path.dirname(destination));
     } catch (error) {
+      // The no-survivor guarantee has to be durable too: a crash after the unlink
+      // must not resurrect a destination this seal already disowned.
       fs.rmSync(destination, { force: true });
+      try { fsyncDirectory(path.dirname(destination)); } catch { /* best effort */ }
       throw error;
     }
     return { sha256: proof.sha256, bytes: proof.bytes };
@@ -247,10 +250,17 @@ export function openSealedArtifact(
       throw new StageChangedError(expected.stageId, "sealed artifact physical hash does not match its ref");
     }
     db = new Database(contained, { create: false, readonly: true });
-    db.exec("PRAGMA query_only=ON; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=250; PRAGMA temp_store=FILE");
-    // The priming read materializes the WAL index; only then can the names go.
-    db.query("SELECT count(*) AS n FROM sqlite_schema").get();
-    for (const suffix of ["", ...SQLITE_SIDECARS]) fs.rmSync(`${contained}${suffix}`, { force: true });
+    try {
+      db.exec("PRAGMA query_only=ON; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=250; PRAGMA temp_store=FILE");
+      // The priming read materializes the WAL index; only then can the names go.
+      db.query("SELECT count(*) AS n FROM sqlite_schema").get();
+      for (const suffix of ["", ...SQLITE_SIDECARS]) fs.rmSync(`${contained}${suffix}`, { force: true });
+    } catch (error) {
+      // The handle must never outlive the names: an unclosed anonymous inode is
+      // a leak nothing can reach to clean up.
+      db.close();
+      throw error;
+    }
   } catch (error) {
     privateDirectory.destroy();
     if (error instanceof StageChangedError || error instanceof StageLockError) throw error;

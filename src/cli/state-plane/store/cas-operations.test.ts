@@ -502,6 +502,66 @@ test("a derived row may not attribute itself to a Git-proof stage alone", () => 
   handle.close();
 });
 
+test("a binding that only reuses the global stage's id is refused, never waved through", () => {
+  const { stages, handle } = workspace("rbox-cas-forged-id-");
+  const token = openReadSnapshot(handle).token;
+  const global = sealGlobal(stages, [entry("one.txt", 1)]);
+  const globalBinding = {
+    stageId: global.stageId, logicalDigest: global.logicalDigest, physicalSha256: global.physicalSha256,
+  };
+  // Same stage id, wrong digest and hash. Three independent guards compare the
+  // WHOLE identity — pairing, the sealed-ref comparison, and the verified-set skip
+  // — so this shape is refused; the skip's own tightening is defence in depth.
+  const forged = { ...globalBinding, logicalDigest: hex(64, 7), physicalSha256: hex(64, 8) };
+  const builder = beginRepoTransitionStage(stages, token, [globalBinding], { globalBinding });
+  builder.putTransition({
+    relPath: "repo", expectedRepoGen: 0, newRecord: { sourceSeq: 5 },
+    evidenceBindings: { sourceStages: [globalBinding] },
+  });
+  const ref = builder.finishRepoTransitionStage();
+  expect(() => applyCasPacket(handle, stages, {
+    expected: expectation(token),
+    sourceGlobalSeq: 5,
+    global: { stage: global, fileHeader: global.header },
+    // The packet claims the forged binding is the transition stage's source.
+    repoTransitions: { ...ref, sourceStageBindings: [forged], globalBinding: forged },
+    ownerToken: OWNER,
+  })).toThrow(StageChangedError);
+  expect(loadRawStateFromStore(handle).stateRevision).toBe(0);
+  handle.close();
+});
+
+test("a duplicate source binding is refused, and shared artifacts are deleted once", () => {
+  const { stages, handle } = workspace("rbox-cas-duplicate-");
+  const token = openReadSnapshot(handle).token;
+  const global = sealGlobal(stages, [entry("one.txt", 1)]);
+  const globalBinding = {
+    stageId: global.stageId, logicalDigest: global.logicalDigest, physicalSha256: global.physicalSha256,
+  };
+  // A duplicate would be verified twice and consumed twice, so post-commit cleanup
+  // would delete an artifact it had already removed.
+  expect(() => beginRepoTransitionStage(stages, token, [globalBinding, { ...globalBinding }], { globalBinding }))
+    .toThrow(/declared more than once/);
+  expect(() => beginRepoTransitionStage(stages, token, [globalBinding, { ...globalBinding, logicalDigest: hex(64, 9) }], { globalBinding }))
+    .toThrow(/share a stage id/);
+
+  // The legitimate shape still cleans up exactly once, leaving nothing behind.
+  const builder = beginRepoTransitionStage(stages, token, [globalBinding], { globalBinding });
+  builder.putTransition({
+    relPath: "repo", expectedRepoGen: 0, newRecord: { sourceSeq: 5 },
+    evidenceBindings: { sourceStages: [globalBinding] },
+  });
+  expect(applyCasPacket(handle, stages, {
+    expected: expectation(token),
+    sourceGlobalSeq: 5,
+    global: { stage: global, fileHeader: global.header },
+    repoTransitions: builder.finishRepoTransitionStage(),
+    ownerToken: OWNER,
+  }).status).toBe("accepted");
+  expect(fs.readdirSync(stages)).toEqual([]);
+  handle.close();
+});
+
 test("a hostile owner callback cannot rewrite what commits", () => {
   const { stages, handle } = workspace("rbox-cas-frozen-");
   const built = packet(stages, handle, {});

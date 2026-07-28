@@ -134,25 +134,68 @@ test("swapping the shared pathname cannot change what a contained consumer reads
     proof.release();
   }
 
+  // Consumption leaves no private directory and no sidecar beside the artifact.
+  expect(fs.existsSync(privateDirectoryPath(stages, original.stageId))).toBe(false);
+  for (const suffix of ["-wal", "-shm", "-journal"]) expect(fs.existsSync(`${originalPath}${suffix}`)).toBe(false);
+  expect(fs.existsSync(impostorPath)).toBe(true);
+  handle.close();
+});
+
+/** Two stages built to the same shape so their artifacts are the same length: the
+ * impostor differs only in the leading character of each path, so an in-place
+ * overwrite is byte-for-byte substitutable and cannot be detected by size alone. */
+function pagedStage(stages: string, marker: string, rows: number): SealedStageRef {
+  const builder = beginGeneration(stages, "base", HEADER);
+  for (let offset = 0; offset < rows; offset += 128) {
+    builder.putEntries(Array.from({ length: Math.min(128, rows - offset) }, (_, index) => ({
+      path: `${marker}/${String(offset + index).padStart(5, "0")}.txt`,
+      sha256: hex(64, 1), size: 1, mode: 0o644, mtimeMs: 1, type: "file",
+      padding: marker.repeat(512),
+    } as unknown as FileEntry)));
+  }
+  return builder.finishGeneration({ files: rows, gitSections: 0 });
+}
+
+test("an in-place overwrite of an UNREAD page cannot reach a contained consumer", () => {
+  const { stages, handle } = workspace("rbox-contain-unread-page-");
+  const rows = 600;
+  const original = pagedStage(stages, "aaaa", rows);
+  const impostor = pagedStage(stages, "bbbb", rows);
+  const originalPath = sealedStagePath(stages, original.stageId, original.logicalDigest);
+  const impostorPath = sealedStagePath(stages, impostor.stageId, impostor.logicalDigest);
+  const originalBytes = fs.readFileSync(originalPath);
+  const impostorBytes = fs.readFileSync(impostorPath);
+  // Many pages, and the two artifacts are interchangeable in length.
+  expect(originalBytes.length).toBe(impostorBytes.length);
+  expect(originalBytes.length).toBeGreaterThan(64 * 4096);
+
   const lock = StageLock.acquire(stages, original.stageId);
   const reader = openSealedStage(stages, original, lock);
+  const seen: string[] = [];
   try {
-    // The attack the previous regression missed: mutate the SHARED INODE IN PLACE
-    // while the consumer is mid-read, then restore it. A hard-link scheme shares
-    // that inode, so SQLite would have read the impostor's pages. Copy-while-
-    // hashing means the consumed bytes were captured in the same pass that hashed
-    // them, so an in-place edit is not observable at all.
-    const impostorBytes = fs.readFileSync(impostorPath);
-    const originalBytes = fs.readFileSync(originalPath);
-    expect(reader.files(undefined, 512).rows.map((file) => file.path)).toEqual(["original.txt"]);
+    // Read ONE small window, so the overwhelming majority of leaf pages have not
+    // been touched — nothing can be served from a page cache that never saw them.
+    const first = reader.files(undefined, 16);
+    seen.push(...first.rows.map((file) => file.path));
+    expect(first.done).toBe(false);
+
+    // Now overwrite the shared inode in place, between cursor windows. This is the
+    // same inode a hard-link containment scheme would have handed to SQLite.
     const shared = fs.openSync(originalPath, "r+");
     try {
-      fs.writeSync(shared, impostorBytes, 0, Math.min(impostorBytes.length, originalBytes.length), 0);
+      fs.writeSync(shared, impostorBytes, 0, impostorBytes.length, 0);
       fs.fsyncSync(shared);
-      // Same inode, different bytes, mid-consumption.
-      expect(fs.readFileSync(originalPath).equals(originalBytes)).toBe(false);
-      expect(reader.files(undefined, 512).rows.map((file) => file.path)).toEqual(["original.txt"]);
-      expect(reader.streamFiles(() => {})).toBe(1);
+      expect(fs.readFileSync(originalPath).equals(impostorBytes)).toBe(true);
+
+      // Page the REST of the stage while the shared bytes are the impostor's.
+      let after = first.after;
+      for (;;) {
+        const page = reader.files(after, 16);
+        seen.push(...page.rows.map((file) => file.path));
+        if (page.done) break;
+        after = page.after;
+      }
+      // Restore, exactly as an attacker would before any closing hash.
       fs.writeSync(shared, originalBytes, 0, originalBytes.length, 0);
       fs.fsyncSync(shared);
     } finally {
@@ -162,9 +205,9 @@ test("swapping the shared pathname cannot change what a contained consumer reads
   } finally {
     lock.release();
   }
-  // Consumption leaves no private directory and no sidecar beside the artifact.
-  expect(fs.existsSync(privateDirectoryPath(stages, original.stageId))).toBe(false);
-  for (const suffix of ["-wal", "-shm", "-journal"]) expect(fs.existsSync(`${originalPath}${suffix}`)).toBe(false);
+  expect(seen).toHaveLength(rows);
+  expect(seen.every((path) => path.startsWith("aaaa/"))).toBe(true);
+  expect(seen.some((path) => path.startsWith("bbbb/"))).toBe(false);
   handle.close();
 });
 
@@ -242,14 +285,28 @@ test("a destination never survives a failed seal, even after a successful link",
   const { stages } = workspace("rbox-lifecycle-fsync-");
   const originalFsync = fs.fsyncSync;
   const originalLink = fs.linkSync;
+  const originalRm = fs.rmSync;
+  // A trace seam, so the ORDER of the recovery steps is observable.
+  const trace: string[] = [];
   let linked: string | undefined;
+  let failed = false;
   const link = spyOn(fs, "linkSync").mockImplementation((source, target) => {
     originalLink(source as string, target as string);
     linked = target as string;
+    trace.push("link");
   });
-  // Fail only the parent-directory flush that follows a SUCCESSFUL publication.
+  const rm = spyOn(fs, "rmSync").mockImplementation((target, options) => {
+    if (target === linked) trace.push("unlink");
+    originalRm(target, options);
+  });
+  // Fail only the FIRST parent-directory flush after a successful publication;
+  // the flush that follows the recovery unlink must still be attempted.
   const fsync = spyOn(fs, "fsyncSync").mockImplementation((fd: number) => {
-    if (linked !== undefined) throw new Error("simulated directory fsync failure");
+    if (linked !== undefined && !failed) {
+      failed = true;
+      throw new Error("simulated directory fsync failure");
+    }
+    if (linked !== undefined) trace.push("fsync-dir");
     originalFsync(fd);
   });
   try {
@@ -258,11 +315,49 @@ test("a destination never survives a failed seal, even after a successful link",
     expect(() => builder.finishGeneration({ files: 1, gitSections: 0 })).toThrow("simulated directory fsync failure");
   } finally {
     fsync.mockRestore();
+    rm.mockRestore();
     link.mockRestore();
   }
   expect(linked).toBeDefined();
   expect(fs.existsSync(linked!)).toBe(false);
   expect(fs.readdirSync(stages)).toEqual([]);
+  // The removal is made durable: a crash after the unlink must not resurrect a
+  // destination this seal already disowned.
+  expect(trace.indexOf("unlink")).toBeGreaterThan(trace.indexOf("link"));
+  expect(trace.slice(trace.indexOf("unlink"))).toContain("fsync-dir");
+});
+
+test("containment initialization never leaks a SQLite handle", () => {
+  const { stages } = workspace("rbox-contain-leak-");
+  const stage = seal(stages, [entry("one.txt", 1)]);
+  const openDescriptors = (): number => fs.readdirSync("/proc/self/fd").length;
+  const before = openDescriptors();
+  const originalRm = fs.rmSync;
+  // Fail the unlink that follows the priming read: the handle is already open, so
+  // this is exactly the window in which it could be stranded on an inode nothing
+  // can reach.
+  const rm = spyOn(fs, "rmSync").mockImplementation((target, options) => {
+    if (String(target).endsWith("/artifact")) throw new Error("simulated unlink failure");
+    originalRm(target, options);
+  });
+  const lock = StageLock.acquire(stages, stage.stageId);
+  try {
+    expect(() => openSealedArtifact(stages, stage, lock)).toThrow("simulated unlink failure");
+  } finally {
+    rm.mockRestore();
+    lock.release();
+  }
+  // A leaked handle would keep both the database and its WAL sidecars open.
+  expect(openDescriptors()).toBeLessThanOrEqual(before);
+  // …and the accessor registry is clean, so the artifact is consumable again.
+  const retry = StageLock.acquire(stages, stage.stageId);
+  try {
+    const reader = openSealedStage(stages, stage, retry);
+    expect(reader.files(undefined, 512).rows).toHaveLength(1);
+    reader.close();
+  } finally {
+    retry.release();
+  }
 });
 
 test("a destination that is not the proven inode is removed and sealing fails", () => {

@@ -111,18 +111,23 @@ export function applyCasPacket(
   assertTransitionSnapshot(packet);
   createStageFileTemp(db);
   createTransitionTemp(db);
-  const consumed: SealedArtifactRef[] = [];
+  // Keyed by exact identity: a packet may legitimately name the same artifact more
+  // than once, and cleanup must still delete it exactly once.
+  const consumed = new Map<string, SealedArtifactRef>();
   try {
     // One stage at a time, each under its own id-scoped lock: bounded descriptors
     // and bounded memory regardless of how many source stages a packet names.
     consumeTransitionStage(db, stageDirectory, packet.repoTransitions);
-    consumed.push(packet.repoTransitions);
+    consumed.set(canonicalBinding(packet.repoTransitions), packet.repoTransitions);
     const verified = new Set<string>();
     for (const binding of packet.repoTransitions.sourceStageBindings) {
       // A stage consumed below is fully verified by that consumption; a stage
       // named only as Git evidence gets the same full proof here — and joins the
       // consumed set, so it is cleaned up on adoption or refusal like any other.
-      if (binding.stageId === packet.global?.stage.stageId) {
+      // The skip compares the WHOLE identity. Pairing and the sealed-ref comparison
+      // already refuse a binding that merely reuses the global stage's id, so this
+      // is defence in depth: no single comparison in the chain decides on id alone.
+      if (packet.global && sameStageBinding(binding, packet.global.stage)) {
         verified.add(canonicalBinding(binding));
         continue;
       }
@@ -131,12 +136,12 @@ export function applyCasPacket(
         throw new StageChangedError(binding.stageId, "verified source stage does not match its binding");
       }
       verified.add(canonicalBinding(binding));
-      consumed.push(binding);
+      consumed.set(canonicalBinding(binding), binding);
     }
     let sealedHeader: ManifestHeader | undefined;
     if (packet.global) {
       sealedHeader = consumeGlobalStage(db, stageDirectory, packet.global.stage);
-      consumed.push(packet.global.stage);
+      consumed.set(canonicalBinding(packet.global.stage), packet.global.stage);
     }
     // Everything the transaction reads is copied here, out of the verified
     // artifact and the packet scalars, once and for all.
@@ -157,7 +162,7 @@ export function applyCasPacket(
     // The design's id-scoped cleanup after adoption or refusal. `busy` adopted and
     // refused nothing, so its inputs stay available to the caller's retry.
     if (result.status === "accepted" || result.status === "rejected") {
-      for (const ref of consumed) deleteConsumedStage(stageDirectory, ref);
+      for (const ref of consumed.values()) deleteConsumedStage(stageDirectory, ref);
     }
     return result;
   } finally {

@@ -7,10 +7,15 @@ import type { RepoBaseProof } from "../../sync-git/base-composer.js";
 import { encodeRepoRecord } from "../codecs/repo-record.js";
 import { canonicalJson, parseCanonicalJson, retainedEstimate, utf16beOrderKey } from "../digest/codecs.js";
 import {
-  RepoTransitionDigestBuilder, sameStageBinding,
+  RepoTransitionDigestBuilder, canonicalStageBinding, sameStageBinding,
   type RepoTransitionDigest, type SourceStageBinding,
 } from "../digest/repo-transition-v1.js";
 import { ProoflessBaseError, StageChangedError, TransitionRowOversizeError } from "../errors.js";
+import {
+  assertBaseProof, assertDeclaredBindings, assertEvidence, canonicalEvidenceOf,
+} from "./transition-admission.js";
+
+export { assertBaseProof, assertEvidence, canonicalEvidenceOf } from "./transition-admission.js";
 import type { LineageSnapshot } from "../ports.js";
 import { PAGE_BYTES } from "./sealed-stages.js";
 import {
@@ -91,6 +96,7 @@ export function beginRepoTransitionStage(
     throw new TypeError("the global binding must also be declared as a source stage");
   }
   const stageId = options.stageId ?? crypto.randomBytes(16).toString("hex");
+  assertDeclaredBindings(sourceStageBindings);
   const bindings = [...sourceStageBindings].sort((a, b) => (a.stageId < b.stageId ? -1 : a.stageId > b.stageId ? 1 : 0));
   const lock = StageLock.acquire(directory, stageId);
   let privateDirectory: PrivateStageDirectory | undefined;
@@ -111,77 +117,6 @@ export function beginRepoTransitionStage(
   }
   return new SqliteTransitionBuilder(directory, stageId, snapshotToken, bindings, globalBinding, importer, db, lock, privateDirectory);
 }
-
-/**
- * The proof rule the withdrawn first implementation of this seam failed.
- *
- * A record that carries `base` or `branchBaseOrigins` is asserting new BASE
- * authority. That assertion is admitted only with an explicit `RepoBaseProof` whose
- * authority kind is a real one — the `migration` kind is a blanket authority
- * reserved for the tagged migration importer, which is why an implicit
- * `migrationRepoBaseProof()` default is not offered anywhere in this seam. Whatever
- * proof is supplied is then bound by the transition digest to this repository, its
- * expected generation, the source evidence, and the coherent snapshot token.
- */
-export function assertBaseProof(
-  input: Pick<TransitionInput, "relPath" | "newRecord" | "baseProof">,
-  importer: "engine" | "migration",
-): void {
-  if (input.baseProof === undefined) {
-    if (input.newRecord.base !== undefined) {
-      throw new ProoflessBaseError(input.relPath, "the record introduces or changes BASE but carries no baseProof");
-    }
-    if (input.newRecord.branchBaseOrigins !== undefined) {
-      throw new ProoflessBaseError(input.relPath, "the record carries branch base origins but no baseProof");
-    }
-    return;
-  }
-  const authority = input.baseProof.authority;
-  if (!authority || typeof authority.kind !== "string") {
-    throw new ProoflessBaseError(input.relPath, "baseProof has no authority kind");
-  }
-  if (authority.kind === "migration" && importer !== "migration") {
-    throw new ProoflessBaseError(input.relPath, "implicit migration authority is reserved for the tagged migration importer");
-  }
-  if (!input.baseProof.lockedProof) throw new ProoflessBaseError(input.relPath, "baseProof has no lockedProof");
-}
-
-/** Admission for one row's evidence. An empty list is refused whenever the stage
- * declared any source, so a derived record can never reach the CAS unattributed. */
-export function assertEvidence(
-  relPath: string,
-  evidence: TransitionEvidenceBindings | undefined,
-  declared: readonly SourceStageBinding[],
-  globalBinding?: SourceStageBinding,
-): void {
-  const named = evidence?.sourceStages;
-  if (!Array.isArray(named)) throw new TypeError(`transition ${relPath} has no evidenceBindings.sourceStages`);
-  if (declared.length === 0) {
-    if (named.length > 0) throw new TypeError(`transition ${relPath} names source stages, but the stage declared none`);
-    return;
-  }
-  if (named.length === 0) {
-    throw new TypeError(`transition ${relPath} names no source stage, but this stage derives from ${declared.length}`);
-  }
-  for (const binding of named) {
-    if (!declared.some((row) => sameStageBinding(row, binding))) {
-      throw new TypeError(`transition ${relPath} names source stage ${binding.stageId}, which this stage is not bound to`);
-    }
-  }
-  // Subset-of-declared is not enough. When a global stage exists every derived
-  // record is derived from IT, so its exact identity must appear in each row —
-  // otherwise a row could attribute itself to a Git-proof stage alone.
-  if (globalBinding && !named.some((binding) => sameStageBinding(binding, globalBinding))) {
-    throw new TypeError(`transition ${relPath} does not name the global source stage ${globalBinding.stageId}`);
-  }
-}
-
-export const canonicalEvidenceOf = (evidence: TransitionEvidenceBindings): string =>
-  canonicalJson({
-    sourceStages: evidence.sourceStages.map((binding) => ({
-      stageId: binding.stageId, logicalDigest: binding.logicalDigest, physicalSha256: binding.physicalSha256,
-    })),
-  });
 
 class SqliteTransitionBuilder implements RepoTransitionStageBuilder {
   #open = true;
