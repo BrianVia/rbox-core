@@ -3,8 +3,44 @@
  * the sealed reader's re-admission — without the SQLite plumbing around them. */
 import { canonicalStageBinding, sameStageBinding, type SourceStageBinding } from "../digest/repo-transition-v1.js";
 import { canonicalJson } from "../digest/codecs.js";
-import { ProoflessBaseError } from "../errors.js";
+import { MigrationImporterCapabilityError, ProoflessBaseError } from "../errors.js";
 import type { TransitionEvidenceBindings, TransitionInput } from "./transition-stages.js";
+
+declare const migrationImporterCapabilityBrand: unique symbol;
+/**
+ * The right to CREATE a migration-tagged transition stage.
+ *
+ * The brand is a non-exported `unique symbol`, so no module can write one down;
+ * the sole cast that produces one is lexical to
+ * `state-plane/migration/base-proof.ts`, which keeps it module-private and hands
+ * it only to the entry point it binds (the `state-plane/reset/owner.ts` idiom).
+ */
+export interface MigrationImporterCapability {
+  readonly kind: "state-plane-migration-importer/v1";
+  readonly [migrationImporterCapabilityBrand]: true;
+}
+
+const MIGRATION_IMPORTERS = new WeakSet<object>();
+
+/**
+ * Teach this seam the identity of migration territory's token. This is NOT an
+ * authorization decision — its argument is unforgeable without the brand, so
+ * only the one lexical mint can call it. It exists because the store must not
+ * import migration territory (that would close a cycle), and a WeakSet needs
+ * the object, not just its type.
+ */
+export function registerMigrationImporterCapability(capability: MigrationImporterCapability): void {
+  MIGRATION_IMPORTERS.add(capability);
+}
+
+export function assertMigrationImporterCapability(value: unknown): asserts value is MigrationImporterCapability {
+  if (value === null || value === undefined || typeof value !== "object") {
+    throw new MigrationImporterCapabilityError("no capability was presented");
+  }
+  if (!MIGRATION_IMPORTERS.has(value)) {
+    throw new MigrationImporterCapabilityError("the value presented is not the minted capability");
+  }
+}
 
 /** Exact-identity dedup. A duplicate would be verified twice and, worse, consumed
  * twice — leaving post-commit cleanup to delete an artifact it already removed. */

@@ -18,10 +18,11 @@ import path from "node:path";
 import type { GitSection } from "../../../engine/index.js";
 import { carryRepoBaseProof } from "../../sync-git/base-composer.js";
 import { migrationRepoBaseProof } from "../migration/base-proof.js";
+import { beginMigrationImportStage } from "../migration/import-stage.js";
 import type { RepoRecordInput } from "../../sync-state-model.js";
 import { canonicalJson, utf16beOrderKey } from "../digest/codecs.js";
 import { loadRawStateFromStore } from "../adapters/read-only.js";
-import { ProoflessBaseError, StageChangedError } from "../errors.js";
+import { MigrationImporterCapabilityError, ProoflessBaseError, StageChangedError } from "../errors.js";
 import type { LineageSnapshot, ManifestHeader } from "../ports.js";
 import { createStateStore, stateStoreDatabase, type StateStoreHandle } from "./open.js";
 import { openReadSnapshot } from "./read-snapshot.js";
@@ -74,7 +75,11 @@ function sealOne(
   row: { relPath: string; expectedRepoGen: number; newRecord: RepoRecordInput; baseProof?: ReturnType<typeof carryRepoBaseProof> },
   options: { importer?: "engine" | "migration" } = {},
 ): SealedRepoTransitionRef {
-  const builder = beginRepoTransitionStage(stages, token, [], options);
+  // A migration-tagged stage is only creatable through migration territory's
+  // bound entry point; `beginRepoTransitionStage` cannot be talked into the tag.
+  const builder = options.importer === "migration"
+    ? beginMigrationImportStage(stages, token, [])
+    : beginRepoTransitionStage(stages, token, []);
   builder.putTransition({
     relPath: row.relPath,
     expectedRepoGen: row.expectedRepoGen,
@@ -131,7 +136,8 @@ test("blanket migration authority is reserved for the tagged migration importer"
   })).toThrow(ProoflessBaseError);
 
   // The same proof IS admissible from the tagged importer, so the refusal above is
-  // about provenance rather than about the proof being malformed.
+  // about provenance rather than about the proof being malformed. The tag is
+  // minted through the capability, never asked for by name.
   const tagged = sealOne(stages, token, {
     relPath: "repo", expectedRepoGen: 0,
     newRecord: { sourceSeq: 1, base: section(10) },
@@ -139,6 +145,27 @@ test("blanket migration authority is reserved for the tagged migration importer"
   }, { importer: "migration" });
   expect(applyOne(stages, handle, tagged).status).toBe("accepted");
   expect(loadRawStateFromStore(handle).repoRecords!["repo"]!.base).toBeDefined();
+  handle.close();
+});
+
+test("the migration importer tag cannot be claimed without the capability", () => {
+  const { stages, handle } = workspace("rbox-proofless-capability-");
+  const token = openReadSnapshot(handle).token;
+
+  // The tag is what makes blanket authority admissible on re-admission, and
+  // canonical JSON erases every in-memory distinction — so a forger who could
+  // simply ASK for the tag would inherit the whole reserved lane. Refused at
+  // stage creation, before any bytes exist.
+  for (const forged of [undefined, {}, { kind: "state-plane-migration-importer/v1" }]) {
+    expect(() => beginRepoTransitionStage(stages, token, [], {
+      importer: "migration",
+      ...(forged === undefined ? {} : { capability: forged as never }),
+    })).toThrow(MigrationImporterCapabilityError);
+  }
+
+  // The refusal is about the tag alone: the same call with no tag is fine.
+  const engine = beginRepoTransitionStage(stages, token, []);
+  engine.discard();
   handle.close();
 });
 

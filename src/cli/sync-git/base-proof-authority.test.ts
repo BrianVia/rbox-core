@@ -194,9 +194,9 @@ test("published-intent recovery holds a proofless BASE move rather than minting 
  * import cannot slip past — and a re-export chain cannot either, because its
  * FIRST hop must name this path and would appear in the list below.
  */
-test("the mint's importers are a closed list", async () => {
+test("the mints' importers are a closed list", async () => {
   const src = path.resolve(import.meta.dir, "../..");
-  const specifier = /\bfrom\s*\(?\s*["'][^"']*migration\/base-proof(\.[jt]s)?["']/;
+  const specifier = /\bfrom\s*\(?\s*["'][^"']*migration\/(base-proof|import-stage)(\.[jt]s)?["']/;
   const importers: string[] = [];
   for (const entry of await fs.readdir(src, { recursive: true, withFileTypes: true })) {
     if (!entry.isFile() || !entry.name.endsWith(".ts")) continue;

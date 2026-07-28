@@ -12,7 +12,8 @@ import {
 } from "../digest/repo-transition-v1.js";
 import { ProoflessBaseError, StageChangedError, TransitionRowOversizeError } from "../errors.js";
 import {
-  assertBaseProof, assertDeclaredBindings, assertEvidence, canonicalEvidenceOf,
+  assertBaseProof, assertDeclaredBindings, assertEvidence, assertMigrationImporterCapability,
+  canonicalEvidenceOf, type MigrationImporterCapability,
 } from "./transition-admission.js";
 
 export { assertBaseProof, assertEvidence, canonicalEvidenceOf } from "./transition-admission.js";
@@ -88,9 +89,19 @@ export function beginRepoTransitionStage(
   directory: string,
   snapshotToken: LineageSnapshot,
   sourceStageBindings: readonly SourceStageBinding[],
-  options: { importer?: "engine" | "migration"; stageId?: string; globalBinding?: SourceStageBinding } = {},
+  options: {
+    importer?: "engine" | "migration";
+    /** Required for `importer: "migration"`; unforgeable outside migration territory. */
+    capability?: MigrationImporterCapability;
+    stageId?: string;
+    globalBinding?: SourceStageBinding;
+  } = {},
 ): RepoTransitionStageBuilder {
   const importer = options.importer ?? "engine";
+  // The importer tag survives sealing and is what re-admission trusts, so it is
+  // proven HERE — before any bytes exist — rather than at re-admission, where the
+  // canonical-JSON round trip has already erased every in-memory distinction.
+  if (importer === "migration") assertMigrationImporterCapability(options.capability);
   const globalBinding = options.globalBinding;
   if (globalBinding && !sourceStageBindings.some((binding) => sameStageBinding(binding, globalBinding))) {
     throw new TypeError("the global binding must also be declared as a source stage");

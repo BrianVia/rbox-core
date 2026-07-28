@@ -142,6 +142,20 @@ export class TransitionRowOversizeError extends Error {
 }
 
 /**
+ * A stage tried to tag itself as the migration importer without presenting the
+ * state-plane migration capability. That tag is what makes blanket `migration`
+ * BASE authority admissible on re-admission — after canonical-JSON round trip a
+ * minted authority and a forged one are indistinguishable, so the tag, not the
+ * proof shape, is the thing that has to be unforgeable.
+ */
+export class MigrationImporterCapabilityError extends Error {
+  readonly name = "MigrationImporterCapabilityError";
+  constructor(readonly detail: string) {
+    super(`a migration-tagged transition stage requires the state-plane migration capability: ${detail}`);
+  }
+}
+
+/**
  * A transition tried to introduce or change BASE without an explicit, purpose-bound
  * `RepoBaseProof`. The removed first implementation of this seam admitted exactly
  * this, which is why it is a named typed refusal rather than a generic TypeError.

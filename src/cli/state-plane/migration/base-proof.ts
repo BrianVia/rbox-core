@@ -2,13 +2,20 @@
  * Blanket BASE authority, confined to legacy-import territory.
  *
  * `migration` is the one authority kind that composes any candidate refs without
- * a per-branch witness, which is why the store seam admits it only from the
- * tagged migration importer. It lives here, not beside the composer, so no
- * ordinary write path can reach for it as a default when its own purpose-bound
- * proof is missing — the failure mode this module exists to make unavailable.
+ * a per-branch witness. It lives here, not beside the composer, so no ordinary
+ * write path can reach for it as a default when its own purpose-bound proof is
+ * missing — the failure mode this module exists to make unavailable.
  *
- * The importer set is pinned by the contract test in
- * `src/cli/sync-git/base-proof-authority.test.ts`.
+ * In memory that brand is the whole contract, and the JSON seams refuse the kind
+ * outright. Persisting one is a separate problem with a separate token: a proof
+ * loses its brand to the canonical-JSON round trip, so the SQLite plane keys off
+ * the stage's importer TAG instead — see `./import-stage.ts`. This module stays
+ * a leaf so the legacy adoption below can be reached from `sync-state-model.ts`
+ * without dragging the store's import graph into a cycle.
+ *
+ * The set of modules that reach for either mint is pinned by
+ * `src/cli/sync-git/base-proof-authority.test.ts`, and both brands by
+ * `src/cli/sync-git/migration-authority-surface.typecheck.ts`.
  */
 import type { GitSection } from "../../../engine/index.js";
 import {
@@ -45,3 +52,4 @@ export function adoptLegacyManifestRepoBase(candidate: GitSection | undefined): 
     ...(composed.branchBaseOrigins === undefined ? {} : { branchBaseOrigins: composed.branchBaseOrigins }),
   };
 }
+
