@@ -9,10 +9,11 @@ import path from "node:path";
 import type { FileEntry } from "../../../engine/index.js";
 import { StageChangedError, StageLockError } from "../errors.js";
 import type { LineageSnapshot, ManifestHeader } from "../ports.js";
-import { beginGeneration, openSealedStage, verifySourceStageBinding, type SealedStageRef } from "./generations.js";
+import { beginGeneration } from "./generations.js";
+import { openSealedStage, verifySourceStageBinding, type SealedStageRef } from "./sealed-stages.js";
 import { createStateStore, stateStoreDatabase, type StateStoreHandle } from "./open.js";
 import { openReadSnapshot } from "./read-snapshot.js";
-import { StageLock, buildingStagePath, sealedStagePath, stageLockPath } from "./stage-artifacts.js";
+import { StageLock, privateDirectoryPath, sealedStagePath, stageLockPath } from "./stage-artifacts.js";
 import { beginRepoTransitionStage, openSealedRepoTransitionStage } from "./transition-stages.js";
 import { applyCasPacket, type CasPacket } from "./write-packet.js";
 
@@ -59,7 +60,7 @@ function casPacket(stages: string, handle: StateStoreHandle, stage: SealedStageR
       localRevision: token.localRevision,
     },
     sourceGlobalSeq: 1,
-    global: { stage, fileHeader: HEADER },
+    global: { stage, fileHeader: stage.header },
     repoTransitions: builder.finishRepoTransitionStage(),
     ownerToken: OWNER,
   };
@@ -77,9 +78,9 @@ test("a discarded generation leaves neither an artifact nor a lock behind", () =
   const stageId = "1".repeat(32);
   const builder = beginGeneration(stages, "base", HEADER, stageId);
   builder.putEntries([entry("one.txt", 1)]);
-  expect(fs.existsSync(buildingStagePath(stages, stageId))).toBe(true);
+  expect(fs.existsSync(privateDirectoryPath(stages, stageId))).toBe(true);
   builder.discardGeneration();
-  expect(fs.existsSync(buildingStagePath(stages, stageId))).toBe(false);
+  expect(fs.existsSync(privateDirectoryPath(stages, stageId))).toBe(false);
   expect(fs.existsSync(stageLockPath(stages, stageId))).toBe(false);
   expect(fs.readdirSync(stages)).toEqual([]);
 });
@@ -247,7 +248,7 @@ test("a global stage and its transition stage must come from the same input", ()
   };
   expect(() => applyCasPacket(handle, stages, {
     expected, sourceGlobalSeq: 1,
-    global: { stage, fileHeader: HEADER },
+    global: { stage, fileHeader: stage.header },
     repoTransitions: foreign.finishRepoTransitionStage(),
     ownerToken: OWNER,
   })).toThrow(StageChangedError);

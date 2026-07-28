@@ -198,9 +198,10 @@ test("design 130 persisted BASE and branch-origin writes are a closed allowlist"
     "src/cli/state-plane/codecs/repo-record.ts": 2,
     // U1b's unwired CAS recomposes BASE exactly like the JSON authority: one
     // composeRepoBase call per transition, driven by that transition's own
-    // explicit RepoBaseProof. There is no second BASE-writing path in the store,
-    // and a proofless row never reaches an authority write (ProoflessBaseError).
-    "src/cli/state-plane/store/write-packet.ts": 8,
+    // explicit RepoBaseProof. Step 2 lives in exactly one module, so there is no
+    // second BASE-writing path in the store, and a proofless row never reaches an
+    // authority write (ProoflessBaseError) — including branch-origin-only removal.
+    "src/cli/state-plane/store/cas-steps.ts": 8,
     "src/cli/sync-git/apply.ts": 24,
     "src/cli/sync-git/base-composer.ts": 2,
     "src/cli/sync-git/follow.ts": 1,

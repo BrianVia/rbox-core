@@ -2,19 +2,21 @@
  *
  * LOCAL is rebuildable, so it needs no CAS packet: a scan promotes a sealed stage
  * by set-difference and a watcher invalidates completeness before disk mutation.
- * Both bump the LOCAL head, which is what every push/trusted-status predicate
- * reads through the lineage snapshot token. */
+ * Both bump the LOCAL head, which is what every push/trusted-status predicate reads
+ * through the lineage snapshot token. As on the global side, the header that
+ * commits is the one the stage was sealed with. */
 import type { Database } from "bun:sqlite";
 import { canonicalJson } from "../digest/codecs.js";
 import { StageChangedError } from "../errors.js";
 import type { LineageSnapshot, ManifestHeader } from "../ports.js";
 import {
   copyStageFilesIntoTemp, createStageFileTemp, dropStageFileTemp, internStagedEntryValues,
-  openSealedStage, promoteFilesIntoPlane, type SealedStageRef,
+  promoteFilesIntoPlane,
 } from "./generations.js";
 import { stateStoreDatabase, type StateStoreHandle } from "./open.js";
 import { currentSnapshot } from "./read-snapshot.js";
-import { StageLock } from "./stage-artifacts.js";
+import { openSealedStage, type SealedStageRef } from "./sealed-stages.js";
+import { StageLock, deleteSealedArtifact } from "./stage-artifacts.js";
 
 export interface LocalScanResult {
   localRevision: number;
@@ -24,18 +26,22 @@ export interface LocalScanResult {
 /**
  * Finalize a full LOCAL scan. Only a full scan may set `complete=1`, and it does so
  * in the same transaction that installs the trust epoch the completeness claim is
- * about — a later reader can never see one without the other.
+ * about — a later reader can never see one without the other. The trust epoch is
+ * read from the sealed header, so a stage sealed under epoch A can never commit
+ * epoch B.
  */
 export function applyLocalScan(
   store: StateStoreHandle,
   stageDirectory: string,
   stage: SealedStageRef,
-  header: ManifestHeader & { trustEpoch: string },
   expected: { lineageId: string; localRevision: number },
 ): LocalScanResult {
   if (store.readonly) throw new Error("state store is open read-only");
   if (stage.plane !== "local") throw new StageChangedError(stage.stageId, "a LOCAL scan requires a LOCAL stage");
   if (stage.counts.gitSections !== 0) throw new StageChangedError(stage.stageId, "a LOCAL stage carries no Git sections");
+  if (typeof stage.header.trustEpoch !== "string" || stage.header.trustEpoch.length === 0) {
+    throw new StageChangedError(stage.stageId, "a completed LOCAL scan must be sealed with its trust epoch");
+  }
   const db = stateStoreDatabase(store);
   createStageFileTemp(db);
   try {
@@ -50,10 +56,14 @@ export function applyLocalScan(
       } finally {
         reader.close();
       }
+      const result = promote(db, stage, expected);
+      // Adoption completed; the design's id-scoped delete follows it under the
+      // same lock that owned the whole consumption interval.
+      deleteSealedArtifact(stageDirectory, stage, lock);
+      return result;
     } finally {
       lock.release();
     }
-    return promote(db, stage, header, expected);
   } finally {
     dropStageFileTemp(db);
   }
@@ -62,7 +72,6 @@ export function applyLocalScan(
 function promote(
   db: Database,
   stage: SealedStageRef,
-  header: ManifestHeader & { trustEpoch: string },
   expected: { lineageId: string; localRevision: number },
 ): LocalScanResult {
   db.exec("BEGIN IMMEDIATE");
@@ -76,10 +85,11 @@ function promote(
     const generation = expected.localRevision + 1;
     internStagedEntryValues(db);
     promoteFilesIntoPlane(db, expected.lineageId, "local", generation);
+    const header: ManifestHeader = stage.header;
     const { generatedAt, manifestSchema, sourceSequence, trustEpoch, complete: _complete, ...extras } = header;
     db.query(`UPDATE plane_heads SET generation=?,generated_at=?,manifest_schema=?,source_sequence=?,
       trust_epoch=?,complete=1,extras_cjson=? WHERE lineage_id=? AND plane='local'`).run(
-      generation, generatedAt, manifestSchema ?? null, sourceSequence ?? null, trustEpoch,
+      generation, generatedAt, manifestSchema ?? null, sourceSequence ?? null, trustEpoch as string,
       Object.keys(extras).length === 0 ? null : canonicalJson(extras), expected.lineageId,
     );
     db.exec("COMMIT");

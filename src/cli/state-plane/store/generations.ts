@@ -1,28 +1,22 @@
 /** Staging, promotion, and GC for file/Git generations.
  *
- * A generation is built into an external, connection-owned stage database, sealed
- * physically and semantically, and only then promoted into a plane by SQL
- * set-difference. No stage is ever attached as writable authority. */
+ * A generation is built inside its own private directory, sealed by the normative
+ * commit → checkpoint TRUNCATE → close → S0 → fsync → prove → link sequence, and
+ * only then promoted into a plane by SQL set-difference. No stage is ever attached
+ * as writable authority, and no stage pathname is reopened after verification. */
 import { Database } from "bun:sqlite";
 import crypto from "node:crypto";
-import fs from "node:fs";
 import type { FileEntry, GitSection } from "../../../engine/index.js";
-import { decodeFileEntry, encodeFileEntry, type EncodedFileEntry } from "../codecs/file-entry.js";
+import { encodeFileEntry } from "../codecs/file-entry.js";
 import { canonicalJson, parseCanonicalJson, utf16beOrderKey } from "../digest/codecs.js";
-import {
-  StageDigestBuilder, type StageCounts, type StageLogicalDigest,
-} from "../digest/stage-semantic-v1.js";
+import { StageDigestBuilder, type StageCounts } from "../digest/stage-semantic-v1.js";
 import { CursorWindowError, GitSectionOversizeError, StageChangedError } from "../errors.js";
-import type { CursorPage, GitSectionRole, ManifestHeader, Plane } from "../ports.js";
+import type { GitSectionRole, ManifestHeader, Plane } from "../ports.js";
+import { MAX_FILE_BATCH, PAGE_BYTES, type SealedStageReader, type SealedStageRef } from "./sealed-stages.js";
 import {
-  StageLock, assertSealedZeroSidecars, buildingStagePath, configureStageBuilder,
-  fsyncFile, openSealedArtifact, physicalProof, publishSealed, sealedStagePath, streamRows,
-  type SealedArtifactAccessor,
+  PrivateStageDirectory, StageLock, abandonBuilder, configureStageBuilder, sealAndPublish,
+  sealedStagePath, streamRows,
 } from "./stage-artifacts.js";
-
-const BATCH_BYTES = 4 * 1024 * 1024;
-const MAX_FILE_BATCH = 512;
-const MAX_GIT_BATCH = 16;
 
 const STAGE_DDL = `
 CREATE TABLE stage_meta(
@@ -45,15 +39,6 @@ CREATE TABLE stage_git_sections(
 CREATE INDEX stage_git_sections_order ON stage_git_sections(stage_id,role,path_order);
 `;
 
-export interface SealedStageRef {
-  stageId: string;
-  plane: Plane;
-  logicalDigest: StageLogicalDigest;
-  physicalSha256: string;
-  bytes: number;
-  counts: StageCounts;
-}
-
 export interface GenerationBuilder {
   readonly stageId: string;
   putEntries(entries: readonly FileEntry[]): void;
@@ -70,21 +55,20 @@ export function beginGeneration(
   stageId: string = crypto.randomBytes(16).toString("hex"),
 ): GenerationBuilder {
   const lock = StageLock.acquire(directory, stageId);
-  const file = buildingStagePath(directory, stageId);
-  let db: Database;
+  let privateDirectory: PrivateStageDirectory | undefined;
+  let db: Database | undefined;
   try {
-    fs.rmSync(file, { force: true });
-    db = new Database(file, { create: true, readwrite: true });
+    privateDirectory = PrivateStageDirectory.claim(lock);
+    db = new Database(privateDirectory.file(), { create: true, readwrite: true });
     configureStageBuilder(db);
     db.exec(STAGE_DDL);
     db.query("INSERT INTO stage_meta(stage_id,plane,state,header_cjson) VALUES (?,?,'building',?)")
       .run(stageId, plane, canonicalJson(header));
   } catch (error) {
-    lock.cleanupOwnedArtifacts();
-    lock.release();
+    abandonBuilder(db, lock, privateDirectory);
     throw error;
   }
-  return new SqliteGenerationBuilder(directory, stageId, plane, header, db, lock, file);
+  return new SqliteGenerationBuilder(directory, stageId, plane, header, db, lock, privateDirectory);
 }
 
 class SqliteGenerationBuilder implements GenerationBuilder {
@@ -98,7 +82,7 @@ class SqliteGenerationBuilder implements GenerationBuilder {
     private readonly header: ManifestHeader,
     private readonly db: Database,
     private readonly lock: StageLock,
-    private readonly file: string,
+    private readonly privateDirectory: PrivateStageDirectory,
   ) {
     this.db.exec("BEGIN");
   }
@@ -124,7 +108,7 @@ class SqliteGenerationBuilder implements GenerationBuilder {
     this.#assertOpen();
     const canonical = canonicalJson(section);
     const bytes = Buffer.byteLength(canonical) + Buffer.byteLength(relPath);
-    if (bytes > BATCH_BYTES) throw new GitSectionOversizeError(relPath, bytes);
+    if (bytes > PAGE_BYTES) throw new GitSectionOversizeError(relPath, bytes);
     this.#flushBefore(bytes);
     this.declareGitRole(role);
     this.db.query("INSERT INTO stage_git_sections(stage_id,role,rel_path,path_order,section_cjson) VALUES (?,?,?,?,?)")
@@ -134,58 +118,61 @@ class SqliteGenerationBuilder implements GenerationBuilder {
 
   finishGeneration(expectedCounts: StageCounts): SealedStageRef {
     this.#assertOpen();
-    this.lock.assertHeld();
-    const digest = new StageDigestBuilder(this.stageId, this.plane, this.header);
-    streamRows<{ path: string; entry_cjson: string }>(
-      this.db, "SELECT path,entry_cjson FROM stage_entries WHERE stage_id=? ORDER BY path_order",
-      [this.stageId], (row) => {
-        // Re-encode rather than trust the stored bytes: the digest must cover a
-        // value this store would itself admit, in this store's canonical spelling.
-        const encoded = encodeFileEntry(parseCanonicalJson(row.entry_cjson) as unknown as FileEntry);
-        if (encoded.canonical !== row.entry_cjson || encoded.path !== row.path) {
-          throw new StageChangedError(this.stageId, `stage row ${row.path} is not canonical`);
-        }
-        digest.file(encoded.canonical);
-      });
-    streamRows<{ role: GitSectionRole }>(
-      this.db, "SELECT role FROM stage_git_roles WHERE stage_id=? ORDER BY role",
-      [this.stageId], (row) => digest.declareRole(row.role));
-    streamRows<{ role: GitSectionRole; rel_path: string; section_cjson: string }>(
-      this.db, `SELECT role,rel_path,section_cjson FROM stage_git_sections
-        WHERE stage_id=? ORDER BY role,path_order`,
-      [this.stageId], (row) => digest.gitSection(row.role, row.rel_path, row.section_cjson));
-    const counts = digest.counts;
-    const logicalDigest = digest.seal(expectedCounts);
-    this.db.query("UPDATE stage_meta SET state='sealed',digest=?,counts_cjson=? WHERE stage_id=?")
-      .run(logicalDigest, canonicalJson(counts), this.stageId);
-    this.db.exec("COMMIT");
-    this.#open = false;
-    this.db.close();
-    assertSealedZeroSidecars(this.file, this.stageId);
-    fsyncFile(this.file);
-    const physical = physicalProof(this.file, this.stageId);
-    const destination = sealedStagePath(this.directory, this.stageId, logicalDigest);
-    publishSealed(this.file, destination, this.stageId);
-    this.lock.release();
-    return {
-      stageId: this.stageId, plane: this.plane, logicalDigest,
-      physicalSha256: physical.sha256, bytes: physical.bytes, counts,
-    };
+    try {
+      const digest = new StageDigestBuilder(this.stageId, this.plane, this.header as unknown as Record<string, unknown>);
+      streamRows<{ path: string; entry_cjson: string }>(
+        this.db, "SELECT path,entry_cjson FROM stage_entries WHERE stage_id=? ORDER BY path_order",
+        [this.stageId], (row) => {
+          // Re-encode rather than trust the stored bytes: the digest must cover a
+          // value this store would itself admit, in this store's canonical spelling.
+          const encoded = encodeFileEntry(parseCanonicalJson(row.entry_cjson) as unknown as FileEntry);
+          if (encoded.canonical !== row.entry_cjson || encoded.path !== row.path) {
+            throw new StageChangedError(this.stageId, `stage row ${row.path} is not canonical`);
+          }
+          digest.file(encoded.canonical);
+        });
+      streamRows<{ role: GitSectionRole }>(
+        this.db, "SELECT role FROM stage_git_roles WHERE stage_id=? ORDER BY role",
+        [this.stageId], (row) => digest.declareRole(row.role));
+      streamRows<{ role: GitSectionRole; rel_path: string; section_cjson: string }>(
+        this.db, `SELECT role,rel_path,section_cjson FROM stage_git_sections
+          WHERE stage_id=? ORDER BY role,path_order`,
+        [this.stageId], (row) => digest.gitSection(row.role, row.rel_path, row.section_cjson));
+      const counts = digest.counts;
+      const logicalDigest = digest.seal(expectedCounts);
+      this.db.query("UPDATE stage_meta SET state='sealed',digest=?,counts_cjson=? WHERE stage_id=?")
+        .run(logicalDigest, canonicalJson(counts), this.stageId);
+      this.db.exec("COMMIT");
+      this.#open = false;
+      const physical = sealAndPublish(
+        this.db, this.privateDirectory.file(),
+        sealedStagePath(this.directory, this.stageId, logicalDigest), this.stageId,
+      );
+      this.privateDirectory.destroy();
+      this.lock.release();
+      return {
+        stageId: this.stageId, plane: this.plane, header: this.header, logicalDigest,
+        physicalSha256: physical.sha256, bytes: physical.bytes, counts,
+      };
+    } catch (error) {
+      // A sealing failure — no-clobber refusal, S0, or hash — must leave neither a
+      // lock nor a partial artifact behind.
+      this.#open = false;
+      abandonBuilder(this.db, this.lock, this.privateDirectory);
+      throw error;
+    }
   }
 
   discardGeneration(): void {
     if (!this.#open) return;
     this.#open = false;
-    try { if (this.db.inTransaction) this.db.exec("ROLLBACK"); } catch { /* closing anyway */ }
-    this.db.close();
-    this.lock.cleanupOwnedArtifacts();
-    this.lock.release();
+    abandonBuilder(this.db, this.lock, this.privateDirectory);
   }
 
   #flushBefore(rowBytes: number): void {
     // An oversize-but-valid row is processed alone; otherwise the open batch is
     // committed before it would cross the byte ceiling.
-    if (this.#pendingBytes > 0 && this.#pendingBytes + rowBytes > BATCH_BYTES) {
+    if (this.#pendingBytes > 0 && this.#pendingBytes + rowBytes > PAGE_BYTES) {
       this.db.exec("COMMIT");
       this.db.exec("BEGIN");
       this.#pendingBytes = 0;
@@ -196,180 +183,6 @@ class SqliteGenerationBuilder implements GenerationBuilder {
     if (!this.#open) throw new Error("generation builder is closed");
     this.lock.assertHeld();
   }
-}
-
-export interface SealedStageReader {
-  files(afterPath: string | undefined, batchSize: number): CursorPage<FileEntry>;
-  gitRepoCursor(role: GitSectionRole, afterRelPath: string | undefined, batchSize: number): CursorPage<{ relPath: string; section: GitSection }>;
-  gitRepo(role: GitSectionRole, relPath: string): GitSection | undefined;
-  /** Row-at-a-time canonical stream. The only interface the CAS copy uses. */
-  streamFiles(visit: (encoded: EncodedFileEntry) => void): number;
-  close(): void;
-}
-
-/** Verify and open one sealed stage under its own id-scoped lock. The caller owns
- * the lock for the whole consumption interval and releases it after `close()`. */
-export function openSealedStage(
-  directory: string,
-  ref: SealedStageRef,
-  lock: StageLock,
-): SealedStageReader {
-  const file = sealedStagePath(directory, ref.stageId, ref.logicalDigest);
-  const accessor = openSealedArtifact(file, ref, lock);
-  try {
-    const derived = deriveStageRef(accessor, ref.stageId, ref.physicalSha256, ref.bytes);
-    if (canonicalJson(derived) !== canonicalJson(ref)) {
-      throw new StageChangedError(ref.stageId, "sealed stage identity does not match its ref");
-    }
-  } catch (error) {
-    try { accessor.close(); } catch { /* the original refusal is the report */ }
-    throw error;
-  }
-  return new SqliteSealedStage(accessor, ref);
-}
-
-/**
- * Recompute the whole ref from the artifact's own rows. A crash-resumed stage is
- * never trusted from its `sealed` bit or its stored digest column: both are
- * compared against a fresh `stage-semantic-v1` recomputation.
- */
-function deriveStageRef(
-  accessor: SealedArtifactAccessor,
-  stageId: string,
-  physicalSha256: string,
-  bytes: number,
-): SealedStageRef {
-  const meta = accessor.db.query("SELECT stage_id,plane,state,header_cjson,digest,counts_cjson FROM stage_meta").get() as {
-    stage_id: string; plane: Plane; state: string; header_cjson: string; digest: string; counts_cjson: string;
-  } | null;
-  if (!meta) throw new StageChangedError(stageId, "sealed stage has no stage_meta row");
-  if (meta.stage_id !== stageId || meta.state !== "sealed") {
-    throw new StageChangedError(stageId, "sealed stage identity does not match its ref");
-  }
-  const digest = new StageDigestBuilder(meta.stage_id, meta.plane, parseCanonicalJson(meta.header_cjson) as Record<string, unknown>);
-  streamRows<{ entry_cjson: string }>(
-    accessor.db, "SELECT entry_cjson FROM stage_entries WHERE stage_id=? ORDER BY path_order",
-    [stageId], (row) => digest.file(row.entry_cjson));
-  streamRows<{ role: GitSectionRole }>(
-    accessor.db, "SELECT role FROM stage_git_roles WHERE stage_id=? ORDER BY role",
-    [stageId], (row) => digest.declareRole(row.role));
-  streamRows<{ role: GitSectionRole; rel_path: string; section_cjson: string }>(
-    accessor.db, `SELECT role,rel_path,section_cjson FROM stage_git_sections
-      WHERE stage_id=? ORDER BY role,path_order`,
-    [stageId], (row) => digest.gitSection(row.role, row.rel_path, row.section_cjson));
-  const counts = digest.counts;
-  const stored = parseCanonicalJson(meta.counts_cjson) as unknown as StageCounts;
-  const logicalDigest = digest.seal(stored);
-  if (meta.digest !== logicalDigest) throw new StageChangedError(stageId, "sealed stage digest column is stale");
-  return { stageId, plane: meta.plane, logicalDigest, physicalSha256, bytes, counts };
-}
-
-/**
- * Reverify one source-stage binding end to end. A stage named only as Git proof
- * still gets the full physical + logical proof even though its rows are not
- * recopied, and the derived ref is returned so a caller can compare it to the ref
- * it believes it is consuming.
- */
-export function verifySourceStageBinding(
-  directory: string,
-  binding: { stageId: string; logicalDigest: string; physicalSha256: string },
-): SealedStageRef {
-  const lock = StageLock.acquire(directory, binding.stageId);
-  try {
-    const file = sealedStagePath(directory, binding.stageId, binding.logicalDigest);
-    const accessor = openSealedArtifact(file, binding, lock);
-    let derived: SealedStageRef;
-    try {
-      derived = deriveStageRef(accessor, binding.stageId, binding.physicalSha256, accessor.bytes);
-      if (derived.logicalDigest !== binding.logicalDigest) {
-        throw new StageChangedError(binding.stageId, "source stage logical digest does not match its binding");
-      }
-    } finally {
-      accessor.close();
-    }
-    return derived;
-  } finally {
-    lock.release();
-  }
-}
-
-class SqliteSealedStage implements SealedStageReader {
-  constructor(private readonly accessor: SealedArtifactAccessor, private readonly ref: SealedStageRef) {}
-
-  files(afterPath: string | undefined, batchSize: number): CursorPage<FileEntry> {
-    if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > MAX_FILE_BATCH) {
-      throw new CursorWindowError("file", batchSize, MAX_FILE_BATCH);
-    }
-    const rows = this.accessor.db.query(`SELECT path,entry_cjson FROM stage_entries
-      WHERE stage_id=? AND path_order>? ORDER BY path_order LIMIT ?`).all(
-      this.ref.stageId, afterPath === undefined ? Buffer.alloc(0) : utf16beOrderKey(afterPath), batchSize,
-    ) as Array<{ path: string; entry_cjson: string }>;
-    const admitted: FileEntry[] = [];
-    let used = 0;
-    for (const row of rows) {
-      const encoded = encodeFileEntry(parseCanonicalJson(row.entry_cjson) as unknown as FileEntry);
-      if (admitted.length > 0 && used + encoded.retainedEstimate > BATCH_BYTES) break;
-      admitted.push(decodeStageEntry(encoded));
-      used += encoded.retainedEstimate;
-    }
-    const last = rows[admitted.length - 1];
-    return {
-      rows: admitted,
-      done: admitted.length === rows.length && rows.length < batchSize,
-      ...(last ? { after: last.path } : {}),
-    };
-  }
-
-  gitRepoCursor(role: GitSectionRole, afterRelPath: string | undefined, batchSize: number) {
-    if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > MAX_GIT_BATCH) {
-      throw new CursorWindowError("git", batchSize, MAX_GIT_BATCH);
-    }
-    const rows = this.accessor.db.query(`SELECT rel_path,section_cjson FROM stage_git_sections
-      WHERE stage_id=? AND role=? AND path_order>? ORDER BY path_order LIMIT ?`).all(
-      this.ref.stageId, role, afterRelPath === undefined ? Buffer.alloc(0) : utf16beOrderKey(afterRelPath), batchSize,
-    ) as Array<{ rel_path: string; section_cjson: string }>;
-    const admitted: Array<{ relPath: string; section: GitSection }> = [];
-    let used = 0;
-    for (const row of rows) {
-      const bytes = Buffer.byteLength(row.section_cjson) + Buffer.byteLength(row.rel_path);
-      if (bytes > BATCH_BYTES) throw new GitSectionOversizeError(row.rel_path, bytes);
-      if (admitted.length > 0 && used + bytes > BATCH_BYTES) break;
-      admitted.push({ relPath: row.rel_path, section: parseCanonicalJson(row.section_cjson) as unknown as GitSection });
-      used += bytes;
-    }
-    const last = rows[admitted.length - 1];
-    return {
-      rows: admitted,
-      done: admitted.length === rows.length && rows.length < batchSize,
-      ...(last ? { after: last.rel_path } : {}),
-    };
-  }
-
-  gitRepo(role: GitSectionRole, relPath: string): GitSection | undefined {
-    const row = this.accessor.db.query("SELECT section_cjson FROM stage_git_sections WHERE stage_id=? AND role=? AND rel_path=?")
-      .get(this.ref.stageId, role, relPath) as { section_cjson: string } | null;
-    return row ? parseCanonicalJson(row.section_cjson) as unknown as GitSection : undefined;
-  }
-
-  streamFiles(visit: (encoded: EncodedFileEntry) => void): number {
-    return streamRows<{ entry_cjson: string }>(
-      this.accessor.db, "SELECT entry_cjson FROM stage_entries WHERE stage_id=? ORDER BY path_order",
-      [this.ref.stageId], (row) => visit(encodeFileEntry(parseCanonicalJson(row.entry_cjson) as unknown as FileEntry)));
-  }
-
-  close(): void {
-    this.accessor.close();
-  }
-}
-
-function decodeStageEntry(encoded: EncodedFileEntry): FileEntry {
-  return decodeFileEntry({
-    path: encoded.path, sha256: encoded.sha256, size: encoded.size, mode: encoded.mode,
-    mtime_ms: encoded.mtimeMs, kind: encoded.kind, symlink_target: encoded.symlinkTarget,
-    enc_sha: encoded.encSha, comp: encoded.comp, payload_sha: encoded.payloadSha,
-    cipher_size: encoded.cipherSize, extras_cjson: encoded.extrasCjson,
-    canonical_bytes: encoded.canonicalBytes, retained_estimate: encoded.retainedEstimate,
-  });
 }
 
 /* ---------------------------------------------------------------- promotion */
@@ -418,8 +231,8 @@ export function copyStageFilesIntoTemp(db: Database, stage: SealedStageReader): 
   });
 }
 
-/** Intern every staged value, then resolve each staged row to the authority's
- * entry id. Both halves are indexed SQL set operations over the whole stage. */
+/** Intern every staged value, then resolve each staged row to the authority's entry
+ * id. Both halves are indexed SQL set operations over the whole stage. */
 export function internStagedEntryValues(db: Database): void {
   db.query(`INSERT INTO entry_values(${ENTRY_COLUMNS})
     SELECT ${ENTRY_COLUMNS.split(",").map((column) => `t.${column.trim()}`).join(",")}

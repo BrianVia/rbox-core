@@ -18,6 +18,7 @@ import path from "node:path";
 import type { GitSection } from "../../../engine/index.js";
 import { carryRepoBaseProof, migrationRepoBaseProof } from "../../sync-git/base-composer.js";
 import type { RepoRecordInput } from "../../sync-state-model.js";
+import { canonicalJson, utf16beOrderKey } from "../digest/codecs.js";
 import { loadRawStateFromStore } from "../adapters/read-only.js";
 import { ProoflessBaseError, StageChangedError } from "../errors.js";
 import type { LineageSnapshot, ManifestHeader } from "../ports.js";
@@ -156,6 +157,26 @@ test("the CAS refuses a proofless row that would move an existing BASE", () => {
   });
   expect(() => applyOne(stages, handle, proofless)).toThrow(ProoflessBaseError);
   expect(loadRawStateFromStore(handle)).toStrictEqual(withBase);
+  handle.close();
+});
+
+test("branch-origin-only provenance is BASE authority and is protected without a proof", () => {
+  const { stages, handle } = workspace("rbox-proofless-origins-");
+  const db = stateStoreDatabase(handle);
+  // Branch origins can outlive their section (a migration import, a composer hold),
+  // so the guard must hold for the authority row shape, not just for `base`.
+  db.query(`INSERT INTO repo_records(lineage_id,rel_path,path_order,repo_gen,source_seq,
+    branch_base_origins_cjson,extras_cjson,canonical_bytes,retained_estimate)
+    VALUES (?,?,?,1,1,?,NULL,64,4096)`).run(
+    LINEAGE, "repo", utf16beOrderKey("repo"),
+    canonicalJson({ "refs/heads/main": { v: 1, oid: "a".repeat(40), lineageHash: "e".repeat(64), kind: "manual", episode: "1".repeat(32) } }),
+  );
+  const proofless = sealOne(stages, openReadSnapshot(handle).token, {
+    relPath: "repo", expectedRepoGen: 1, newRecord: { sourceSeq: 2, removedKey: "gone" },
+  });
+  expect(() => applyOne(stages, handle, proofless)).toThrow(ProoflessBaseError);
+  expect(db.query("SELECT branch_base_origins_cjson FROM repo_records WHERE rel_path='repo'").get())
+    .not.toEqual({ branch_base_origins_cjson: null });
   handle.close();
 });
 

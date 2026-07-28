@@ -2,6 +2,7 @@
  * bounded-window rules, and the LOCAL-plane transactions. */
 import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -9,9 +10,13 @@ import type { FileEntry, GitSection } from "../../../engine/index.js";
 import { carryRepoBaseProof } from "../../sync-git/base-composer.js";
 import type { GlobalManifestMeta, RepoRecordInput } from "../../sync-state-model.js";
 import { loadRawStateFromStore } from "../adapters/read-only.js";
-import { CursorWindowError, RepoRecordOversizeError, TransitionRowOversizeError } from "../errors.js";
+import {
+  CursorWindowError, RepoRecordOversizeError, StageChangedError, TransitionRowOversizeError,
+} from "../errors.js";
 import type { CasRejectionReason, CasResult, LineageSnapshot, ManifestHeader } from "../ports.js";
-import { beginGeneration, type SealedStageRef } from "./generations.js";
+import { beginGeneration } from "./generations.js";
+import { openSealedStage, type SealedStageRef } from "./sealed-stages.js";
+import { StageLock, sealedStagePath } from "./stage-artifacts.js";
 import { applyLocalScan, invalidateLocalPlane } from "./local-plane.js";
 import { createStateStore, openStateStore, stateStoreDatabase, type StateStoreHandle } from "./open.js";
 import { openReadSnapshot } from "./read-snapshot.js";
@@ -64,8 +69,13 @@ function expectation(token: LineageSnapshot): CasExpectation {
   };
 }
 
-function sealGlobal(stages: string, files: FileEntry[], plane: "base" | "local" = "base"): SealedStageRef {
-  const builder = beginGeneration(stages, plane, HEADER);
+function sealGlobal(
+  stages: string,
+  files: FileEntry[],
+  plane: "base" | "local" = "base",
+  header: ManifestHeader = HEADER,
+): SealedStageRef {
+  const builder = beginGeneration(stages, plane, header);
   builder.putEntries(files);
   return builder.finishGeneration({ files: files.length, gitSections: 0 });
 }
@@ -125,7 +135,7 @@ function packet(
     expected,
     sourceGlobalSeq: options.sourceGlobalSeq ?? 5,
     ...(global
-      ? { global: { stage: global, fileHeader: HEADER, ...(options.manifestMeta ? { manifestMeta: options.manifestMeta } : {}) } }
+      ? { global: { stage: global, fileHeader: global.header, ...(options.manifestMeta ? { manifestMeta: options.manifestMeta } : {}) } }
       : {}),
     repoTransitions: sealTransitions(stages, token, global, options.rows ?? []),
     ownerToken: options.owner ?? OWNER,
@@ -355,9 +365,8 @@ test("promotion of a large stage does not scale heap with authority size", () =>
 test("LOCAL scans and watcher invalidation move the LOCAL head without touching BASE", () => {
   const { stages, handle } = workspace("rbox-cas-local-");
   expect(openReadSnapshot(handle).token.localHeader.complete).toBe(false);
-  const stage = sealGlobal(stages, [entry("scan.txt", 1)], "local");
-  const scanned = applyLocalScan(handle, stages, stage,
-    { ...HEADER, trustEpoch: "epoch-1" }, { lineageId: LINEAGE, localRevision: 0 });
+  const stage = sealGlobal(stages, [entry("scan.txt", 1)], "local", { ...HEADER, trustEpoch: "epoch-1" });
+  const scanned = applyLocalScan(handle, stages, stage, { lineageId: LINEAGE, localRevision: 0 });
   expect(scanned.localRevision).toBe(1);
   expect(scanned.token.localHeader.complete).toBe(true);
   expect(scanned.token.localHeader.trustEpoch).toBe("epoch-1");
@@ -369,6 +378,164 @@ test("LOCAL scans and watcher invalidation move the LOCAL head without touching 
   expect(invalidated.token.localHeader.complete).toBe(false);
   expect(invalidated.token.localHeader.trustEpoch).toBeUndefined();
   expect(openReadSnapshot(handle).files("base", undefined, 512).rows).toEqual([]);
+  handle.close();
+});
+
+test("a global packet admits additional Git-proof stages and verifies every one", () => {
+  const { stages, handle } = workspace("rbox-cas-git-proof-");
+  const token = openReadSnapshot(handle).token;
+  const global = sealGlobal(stages, [entry("one.txt", 1)]);
+  const proofOnly = beginGeneration(stages, "base", HEADER);
+  proofOnly.putGitSection("meta-wire", "repo-a", section(30));
+  const gitStage = proofOnly.finishGeneration({ files: 0, gitSections: 1 });
+  const bindings = [global, gitStage].map((stage) => ({
+    stageId: stage.stageId, logicalDigest: stage.logicalDigest, physicalSha256: stage.physicalSha256,
+  }));
+  const build = () => {
+    const builder = beginRepoTransitionStage(stages, token, bindings);
+    builder.putTransition({
+      relPath: "repo-a", expectedRepoGen: 0, newRecord: { sourceSeq: 5, base: section(20) },
+      baseProof: carryRepoBaseProof("lineage"),
+      // Evidence may name the Git-proof stage the section was folded from; the CAS
+      // still reverifies BOTH declared stages before the transaction.
+      evidenceBindings: { sourceStages: bindings },
+    });
+    return builder.finishRepoTransitionStage();
+  };
+  const packetOf = (repoTransitions: ReturnType<typeof build>): CasPacket => ({
+    expected: expectation(token),
+    sourceGlobalSeq: 5,
+    global: { stage: global, fileHeader: global.header },
+    repoTransitions,
+    ownerToken: OWNER,
+  });
+
+  // A Git-proof stage whose bytes changed is refused even though its rows are
+  // never copied — the previously unreachable verification loop now runs.
+  const first = build();
+  const gitPath = sealedStagePath(stages, gitStage.stageId, gitStage.logicalDigest);
+  const pristine = fs.readFileSync(gitPath);
+  fs.appendFileSync(gitPath, "tamper");
+  expect(() => applyCasPacket(handle, stages, packetOf(first))).toThrow(StageChangedError);
+  expect(loadRawStateFromStore(handle).stateRevision).toBe(0);
+
+  fs.writeFileSync(gitPath, pristine);
+  expect(applyCasPacket(handle, stages, packetOf(build())).status).toBe("accepted");
+  expect(loadRawStateFromStore(handle).repoRecords!["repo-a"]!.base).toBeDefined();
+  handle.close();
+});
+
+test("source evidence must be present, exact, and carried into the transaction", () => {
+  const { stages, handle } = workspace("rbox-cas-evidence-");
+  const token = openReadSnapshot(handle).token;
+  const global = sealGlobal(stages, [entry("one.txt", 1)]);
+  const binding = { stageId: global.stageId, logicalDigest: global.logicalDigest, physicalSha256: global.physicalSha256 };
+  const builder = beginRepoTransitionStage(stages, token, [binding]);
+  // A derived record with no evidence is exactly the silent synthesis the seam
+  // must refuse: the stage declares a source, so every row must attribute itself.
+  expect(() => builder.putTransition({
+    relPath: "repo", expectedRepoGen: 0, newRecord: { sourceSeq: 5 },
+    evidenceBindings: { sourceStages: [] },
+  })).toThrow(/names no source stage/);
+  expect(() => builder.putTransition({
+    relPath: "repo", expectedRepoGen: 0, newRecord: { sourceSeq: 5 },
+    evidenceBindings: { sourceStages: [{ ...binding, physicalSha256: hex(64, 7) }] },
+  })).toThrow(/this stage is not bound to/);
+  builder.putTransition({
+    relPath: "repo", expectedRepoGen: 0, newRecord: { sourceSeq: 5 },
+    evidenceBindings: { sourceStages: [binding] },
+  });
+  const ref = builder.finishRepoTransitionStage();
+
+  // Forging the sealed row's evidence back to empty is refused before the
+  // transaction, because the reader re-admits each row's OWN evidence.
+  const file = sealedStagePath(stages, ref.stageId, ref.logicalDigest);
+  const db = new Database(file, { create: false, readwrite: true });
+  db.query("UPDATE transition_rows SET evidence_cjson='{\"sourceStages\":[]}'").run();
+  db.close();
+  fs.rmSync(`${file}-wal`, { force: true });
+  fs.rmSync(`${file}-shm`, { force: true });
+  const forged = { ...ref, physicalSha256: createHash("sha256").update(fs.readFileSync(file)).digest("hex") };
+  expect(() => applyCasPacket(handle, stages, {
+    expected: expectation(token), sourceGlobalSeq: 5,
+    global: { stage: global, fileHeader: global.header },
+    repoTransitions: forged, ownerToken: OWNER,
+  })).toThrow(StageChangedError);
+  expect(loadRawStateFromStore(handle).stateRevision).toBe(0);
+  handle.close();
+});
+
+test("the header that commits is the sealed one, never a caller's parallel claim", () => {
+  const { stages, handle } = workspace("rbox-cas-header-");
+  const built = packet(stages, handle, {});
+  expect(() => applyCasPacket(handle, stages, {
+    ...built,
+    global: { ...built.global!, fileHeader: { ...HEADER, generatedAt: "2099-01-01T00:00:00.000Z" } },
+  })).toThrow(StageChangedError);
+  expect(loadRawStateFromStore(handle).stateRevision).toBe(0);
+
+  expect(applyCasPacket(handle, stages, packet(stages, handle, {})).status).toBe("accepted");
+  expect(loadRawStateFromStore(handle).lastSyncedManifest.generatedAt).toBe(HEADER.generatedAt);
+  handle.close();
+});
+
+test("stage and retry cursors stop before the byte ceiling instead of after it", () => {
+  const { stages, handle } = workspace("rbox-cas-byte-window-");
+  const fat = (name: string, seed: number): FileEntry =>
+    ({ ...entry(name, seed), padding: "x".repeat(900_000) } as FileEntry);
+  const builder = beginGeneration(stages, "base", HEADER);
+  for (let index = 0; index < 6; index++) builder.putEntries([fat(`fat-${index}.txt`, index + 1)]);
+  const stage = builder.finishGeneration({ files: 6, gitSections: 0 });
+
+  const lock = StageLock.acquire(stages, stage.stageId);
+  try {
+    const reader = openSealedStage(stages, stage, lock);
+    const page = reader.files(undefined, 512);
+    // Six ~1.8 MiB rows cannot fit in one 4 MiB page even though the row window is
+    // 512; paging stops on bytes and reports itself unfinished.
+    expect(page.rows.length).toBeGreaterThan(0);
+    expect(page.rows.length).toBeLessThan(6);
+    expect(page.done).toBe(false);
+    expect(page.after).toBe(page.rows.at(-1)!.path);
+    const rest = reader.files(page.after, 512);
+    expect(rest.rows.length).toBeGreaterThan(0);
+    reader.close();
+  } finally {
+    lock.release();
+  }
+  handle.close();
+});
+
+test("cursor sources never materialize a page before bounding it", async () => {
+  // A structural guard: the byte ceiling is only meaningful if the rows are
+  // streamed. `.all()` on a windowed cursor would reintroduce the exact
+  // materialization the withdrawn attempt was faulted for.
+  const cursorSources = ["sealed-stages.ts", "cas-retry-view.ts"];
+  for (const name of cursorSources) {
+    const source = await Bun.file(path.join(import.meta.dir, name)).text();
+    expect(source, name).not.toContain(".all(");
+  }
+});
+
+test("a snapshot that moves while the retry view is built is reported busy", () => {
+  const { root, stages, handle } = workspace("rbox-cas-retry-busy-");
+  const competitor = new Database(path.join(root, "state.db"), { create: false, readwrite: true });
+  const bump = () => competitor.query("UPDATE state_lineage SET last_synced_sequence=last_synced_sequence+1").run();
+  try {
+    // Before the view's transaction opens…
+    const early = applyCasPacket(handle, stages, packet(stages, handle, { expected: { stateRevision: 7 } }),
+      { beforeRetryView: bump });
+    expect(early).toEqual({ status: "busy", detail: "snapshot changed while building the retry view" });
+    // …and after it commits but before the view is handed back.
+    const late = applyCasPacket(handle, stages, packet(stages, handle, { expected: { stateRevision: 7 } }),
+      { afterRetryView: bump });
+    expect(late).toEqual({ status: "busy", detail: "snapshot changed while building the retry view" });
+  } finally {
+    competitor.close();
+  }
+  // A busy outcome adopted and refused nothing, so it left no artifact behind.
+  expect(fs.readdirSync(stages).filter((name) => name.endsWith(".lock"))).toEqual([]);
+  expect(loadRawStateFromStore(handle).stateRevision).toBe(0);
   handle.close();
 });
 
