@@ -628,6 +628,18 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
         if (code !== 0) process.exitCode = code;
         break;
       }
+      if (sub === "republish") {
+        const target = positional[1];
+        if (!target || positional.length !== 2) {
+          fail("usage: rbox git republish <repo> [--json]");
+          break;
+        }
+        const root = await resolveRoot(target);
+        const { gitRepublishCmd } = await import("./git-cmd.js");
+        const code = await gitRepublishCmd(root, target, { json: jsonMode }, { now: deps.now });
+        if (code !== 0) process.exitCode = code;
+        break;
+      }
       const repo = positional[1];
       const verb = positional[2] ?? "show-me";
       if (sub !== "resolve" || !repo || positional.length > 3 || !["show-me", "take-theirs", "keep-mine"].includes(verb)) {

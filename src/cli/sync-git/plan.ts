@@ -6,7 +6,7 @@ import { pinDisplaced } from "../../engine/git/keep-pins.js";
 import { git } from "../../engine/git/shared.js";
 import { type GitConfigRunner } from "../../engine/git/config-txn.js";
 import { sanitizeGitSectionForPersistence } from "../../engine/git/config-sync.js";
-import { expectedStateNonce, repoRecordsForState, type GitDeferralReason, type SyncState, type WorkspaceConfig } from "../config.js";
+import { expectedStateNonce, repoRecordsForState, syncStreamId, type GitDeferralReason, type SyncState, type WorkspaceConfig } from "../config.js";
 import type { SyncRemote } from "../remote.js";
 import type { TransferProgress } from "../transfer-progress.js";
 import { GIT_CAPTURE_CONCURRENCY, configCredentialSkipLogged, configOwnershipSkipLogged, pendingCarryLogged, gitRepoCap, repoDirOf, carryMatrixMatches, emptyToUndef, errMsg, gitIncomingKey, capturePlannedGitSection, observePackedRefsIdentity, packedRefsMtimeRegressed, type ResolutionCaptureTestHooks } from "./shared.js";
@@ -24,6 +24,7 @@ import { branchBaseOriginMatches } from "./base-composer.js";
 import { prepareFollowerBranchProtocol } from "./follower-protocol.js";
 import { commitAbsentBranchVerification, planAbsentBranchVerification } from "./branch-transition.js";
 import { asyncMemo } from "./async-memo.js";
+import { republishPlanInput } from "./republish-requests.js";
 /** The outcome of push-side git orchestration: the outbound `gitRepos` map, whether it
  *  differs from what the last commit carried, the local-only state after this cycle
  *  (persisted only on a successful commit — recomputed idempotently otherwise), and
@@ -146,6 +147,9 @@ export interface GitPlanOptions {
  * `force` is the per-relPath 422 recapture set [v2, M5]: forced repos skip the carry
  * fast-path; a forced non-P repo that cannot recapture is DROPPED from this commit (the
  * non-looping failure path [v3]) rather than re-referencing blobs the server lost.
+ * The #526 republish set also skips the carry fast-path and captures with no basis, but
+ * never inherits that drop: its base is still valid server-side, so a failed chain
+ * restart defers with base carry and stays pending for the next push.
  */
 export async function planGitSections(
   root: string,
@@ -163,6 +167,15 @@ export async function planGitSections(
   options: GitPlanOptions = {}
 ): Promise<GitPushPlan> {
   const planStartedAt = performance.now();
+  // #526: pending operator chain restarts. Read once at entry alongside the 422
+  // force set. A republished repo must skip every carry fast-path and capture with
+  // no basis, but — unlike a 422 force, whose BASE references blobs the server has
+  // LOST — its base is still valid server-side, so a failed republish capture takes
+  // the ordinary defer-with-base-carry path and stays pending.
+  const { repos: republish, warning: republishWarning } = await republishPlanInput(root, syncStreamId(cfg));
+  if (republishWarning) options.onGitLog?.(republishWarning);
+  if (republish.size > 0) options.onGitLog?.(`git-sync republish pending ${[...republish].sort().join(", ")}`);
+  const mustCapture = (rel: string): boolean => force.has(rel) || republish.has(rel);
   // Design 204 §5.1: one policy read at entry. The legacy arm retains the
   // pre-204 probe order and does not consume the scoped memo.
   const gitPlanLazy = process.env.RBOX_GIT_PLAN_LAZY !== "0";
@@ -801,7 +814,7 @@ export async function planGitSections(
     //   pointer/scoped    → carry on scoped-identity match
     //   pointer/all-base  → the explicit wider-carry exception: carry when the base's
     //                       SCOPED PROJECTION matches (terminates the convergence loop)
-    if (baseSec && !force.has(rel) && !opts.forceCapture) {
+    if (baseSec && !mustCapture(rel) && !opts.forceCapture) {
       if (!isGitRepoKind(liveKind)) {
         deferOne(rel, "preflight did not report a usable git repo kind");
         return;
@@ -924,14 +937,14 @@ export async function planGitSections(
     }
 
     // §3.3 fast-path guards:
-    // 1 !force.has(rel)
+    // 1 !mustCapture(rel) (422 force or #526 republish)
     // 2 no pending, needs-resolution, or removed-memory suppression
     // 3 repo was discovered this run
     // 4 base section exists
     // 5 trusted fingerprint hit with a probe
     // 6 probe is plannable-clean with a valid preflight kind
     // 7 design-43 §7 carry matrix reaches carry
-    if (!force.has(rel) && !pend && needsRes[rel] === undefined && removedMem[rel] === undefined && kindByPath.has(rel) && baseSec) {
+    if (!mustCapture(rel) && !pend && needsRes[rel] === undefined && removedMem[rel] === undefined && kindByPath.has(rel) && baseSec) {
       fastLookup = await measure(
         "fingerprintMs",
         () => fingerprintHitProbe(fingerprintRun, root, rel, cache, kind, !options.disableConfigLane),
@@ -965,7 +978,7 @@ export async function planGitSections(
     // §3.8 post-gate extension: a baseless in-tree worktree pointer can only be
     // skipped after `sectioned` is known, but a trusted cached parentRel lets us
     // defer that decision without paying the identity/preflight spawn floor.
-    if (!force.has(rel) && !pend && needsRes[rel] === undefined && removedMem[rel] === undefined && kind === "pointer" && !baseSec) {
+    if (!mustCapture(rel) && !pend && needsRes[rel] === undefined && removedMem[rel] === undefined && kind === "pointer" && !baseSec) {
       fastLookup = await measure(
         "fingerprintMs",
         () => fingerprintHitProbe(fingerprintRun, root, rel, cache, kind, !options.disableConfigLane),
@@ -1027,7 +1040,7 @@ export async function planGitSections(
     }
   }
   for (const rel of [...toCapture, ...carried]) {
-    if (force.has(rel)) continue; // 422 recapture must capture, not base-carry via policy skip
+    if (mustCapture(rel)) continue; // 422 recapture / #526 republish must capture, not base-carry via policy skip
     if (kindByPath.get(rel) !== "pointer" || pending[rel] || needsRes[rel] !== undefined) continue;
     let parentRel: string | undefined;
     if (fastPathParentRel.has(rel)) {
@@ -1071,7 +1084,7 @@ export async function planGitSections(
   await poolMap(toCapture, GIT_CAPTURE_CONCURRENCY, async (rel) => {
     try {
       const { section: sec, reason } = await capturePlannedGitSection(
-        root, rel, cfg, base[rel], api, kek, uploadsDir, force.has(rel), backoff,
+        root, rel, cfg, base[rel], api, kek, uploadsDir, mustCapture(rel), backoff,
         (abs) => noteRepoBytes(rel, abs), resolutionCandidates.has(rel),
         resolutionCandidates.has(rel) ? options.resolutionCaptureTestHooks : undefined,
       );

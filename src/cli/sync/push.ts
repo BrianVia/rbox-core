@@ -28,6 +28,7 @@ import {
 } from "../sync-git.js";
 import { carriedLineageProof, recordOriginLineage, type RepoBaseProof } from "../sync-git/base-composer.js";
 import { recordGitCaptureObservation } from "../sync-git/git-capture-observation.js";
+import { settleRepublishRequests } from "../sync-git/republish-requests.js";
 import type { GitResolutionRider } from "../sync-git/resolution-intent.js";
 import { assertMayPublish } from "../scope/binding-scope.js";
 import { assertSyncMutex, workspaceSyncMutexDegraded } from "../sync-mutex.js";
@@ -451,6 +452,26 @@ interface PushAttemptState {
   resolution?: GitResolutionRider;
 }
 
+/** #526: clear chain-restart requests the landed manifest proves satisfied.
+ *  Called on every receipt that proves a manifest landed. A settle failure can
+ *  never fail an already-durable commit — the worst case is one more full
+ *  bundle on the next push. */
+async function settleRepublish(
+  root: string,
+  cfg: WorkspaceConfig,
+  deps: SyncDeps,
+  gitRepos: Manifest["gitRepos"],
+): Promise<void> {
+  try {
+    const settled = await settleRepublishRequests(root, syncStreamId(cfg), gitRepos);
+    for (const relPath of settled) {
+      (deps.onGitLog ?? ((line: string) => console.error(line)))(`git-sync republish restarted ${relPath}`);
+    }
+  } catch (error) {
+    deps.warningSink?.(`rbox: could not clear the Git republish request: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 function filePathsForCache(manifest: Manifest): Set<string> {
   return new Set(manifest.files.filter((entry) => entry.type === "file").map((entry) => entry.path));
 }
@@ -849,6 +870,7 @@ async function runPushAttempt(
           resolution: { outcome: "ack-uncertain", reason: transition.reason },
         } };
       }
+      if (transition.kind === "published") await settleRepublish(root, cfg, deps, transition.manifest.gitRepos);
       return { done: true, result: {
         sequence: transition.sequence,
         manifest: transition.manifest,
@@ -873,6 +895,7 @@ async function runPushAttempt(
       return reuploadOutcome(committed, commitReceipt.unsatisfiedBlobs, commitReceipt.unsatisfiedTotal, commitReceipt.attemptedManifestChain);
     }
     const acceptedSequence = commitReceipt.sequence;
+    await settleRepublish(root, cfg, deps, committed.gitRepos);
 
     // ACCEPTED. Capture the files-synced ACK timestamp NOW (design 108 §3.6): the END is
     // this accepted commit response; the START is init's command milestone (before scan).

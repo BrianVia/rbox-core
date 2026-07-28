@@ -88,6 +88,18 @@ Statuses used below:
 | Status / fix | **FIXED-BY-DESIGN** in PR #389 / `cbcab7b9` (local `4a2fb24c`): premise-only starvation retries with bounded escalation and then reports `INCONCLUSIVE` with exit 0; an established-pressure contract violation and callback deadline still hard-fail. |
 | Proof | v1.7.19 premise-versus-contract split; `docs/STATUS.md` and fix history record the incident and corrected semantics. |
 
+### FLAKE-006 — contended credential save loses a serialized writer
+
+| Field | Record |
+|---|---|
+| Test | `separate save processes serialize and leave one complete v1 document` |
+| File | `src/cli/credentials.test.ts` (line 424) |
+| First / last seen | 2026-07-28 / 2026-07-28 |
+| Failure | `expect(await Promise.all([first.exited, second.exited])).toEqual([0, 0])` received `[0, 1]` after `[80.19ms]` on PR #536, shard 3/6 |
+| Root cause | Not yet root-caused. Two spawned save processes contend for the credential lock; the loser exits 1 instead of serializing behind the winner. Same file and same contention class as FLAKE-002, whose fix hardened the *logout* handshake but not this two-writer path — a starved runner appears to push one writer past its lock-acquisition budget. |
+| Status / fix | **CONFIRMED flake, UNFIXED.** The three proof witnesses exist, so this is not a regression from PR #536 (whose diff touches no credential path). No deterministic patch yet: the contended-writer wait needs the same handshake treatment FLAKE-002 got. |
+| Proof | [2026-07-28 failure](https://github.com/BrianVia/rbox-core/actions/runs/30324649446/job/90167390189) and [green same-SHA rerun](https://github.com/BrianVia/rbox-core/actions/runs/30324649446/job/90193788407), exact SHA `7ce9e01adf04c9b673e7ad148755dea1da213140`; 5× local isolation of the full file green (47 tests, 4.53–4.57 s). |
+
 ## Same-class audit candidates
 
 These are the actionable occurrences found by the `src/**/*.test.ts` and

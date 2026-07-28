@@ -3,6 +3,8 @@ import * as gitCmd from "./git-cmd.js";
 import type {
   GitDeferralsCmdDeps,
   GitDeferralsCmdOptions,
+  GitRepublishCmdDeps,
+  GitRepublishCmdOptions,
   GitResolveShow,
   ResolveRefusalCode,
 } from "./git-cmd.js";
@@ -10,6 +12,8 @@ import type {
 export type GitCmdFacadeTypes = [
   GitDeferralsCmdDeps,
   GitDeferralsCmdOptions,
+  GitRepublishCmdDeps,
+  GitRepublishCmdOptions,
   GitResolveShow,
   ResolveRefusalCode,
 ];
@@ -17,6 +21,7 @@ export type GitCmdFacadeTypes = [
 test("git-cmd preserves its exact runtime compatibility surface", () => {
   expect(Object.keys(gitCmd).sort()).toEqual([
     "gitDeferralsCmd",
+    "gitRepublishCmd",
     "gitResolveCmd",
     "safeResolveText",
   ]);
