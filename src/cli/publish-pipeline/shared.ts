@@ -10,17 +10,14 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import {
   isSourceChangedError,
+  withCipherDescriptor,
+  type CipherDescriptor,
   type CoalescedBlob,
   type EncryptedBlob,
   type FileEntry,
 } from "../../engine/index.js";
 
-export type CipherDescriptor = {
-  encSha: string;
-  cipherSize?: number;
-  comp?: "zstd";
-  payloadSha?: string;
-};
+export { withCipherDescriptor, type CipherDescriptor };
 
 export function descriptorFromEntry(file: FileEntry): CipherDescriptor | undefined {
   if (!file.encSha) return undefined;
@@ -31,16 +28,30 @@ export function descriptorFromEncryptedBlob(blob: EncryptedBlob): CipherDescript
   return blob.comp ? { encSha: blob.encSha, comp: blob.comp, payloadSha: blob.payloadSha, cipherSize: blob.cipherSize } : { encSha: blob.encSha };
 }
 
-export function applyCipherDescriptor(file: FileEntry, descriptor: CipherDescriptor): void {
-  file.encSha = descriptor.encSha;
-  if (descriptor.comp) {
-    file.comp = descriptor.comp;
-    file.payloadSha = descriptor.payloadSha;
-    file.cipherSize = descriptor.cipherSize;
-  } else {
-    delete file.comp;
-    delete file.payloadSha;
-    delete file.cipherSize;
+/**
+ * Attaching a cipher descriptor REPLACES the entry now that `FileEntry` is
+ * readonly (design 163 § "Early U0"). The publish path keeps the same entry in
+ * several containers at once — the manifest's file array, the encrypt work
+ * list, the upload work list — so a replacement is only visible if it lands in
+ * every container holding that path. Registering a container here is what makes
+ * `attach` equivalent to the old in-place mutation.
+ */
+export class CipherDescriptorWriter {
+  private readonly slots = new Map<string, Array<{ list: FileEntry[]; index: number }>>();
+
+  track(list: FileEntry[]): void {
+    for (let index = 0; index < list.length; index++) {
+      const entry = list[index]!;
+      const existing = this.slots.get(entry.path);
+      if (existing) existing.push({ list, index });
+      else this.slots.set(entry.path, [{ list, index }]);
+    }
+  }
+
+  attach(file: FileEntry, descriptor: CipherDescriptor): FileEntry {
+    const next = withCipherDescriptor(file, descriptor);
+    for (const slot of this.slots.get(file.path) ?? []) slot.list[slot.index] = next;
+    return next;
   }
 }
 

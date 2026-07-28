@@ -30,7 +30,7 @@ import {
   FUSED_ENCRYPT_CONCURRENCY_CAP,
   MAX_SHAS_PER_CHECK,
   PER_FILE_UPLOAD_ATTEMPTS,
-  applyCipherDescriptor,
+  CipherDescriptorWriter,
   classifyCacheHit,
   clampConc,
   descriptorFromEncryptedBlob,
@@ -125,8 +125,9 @@ export async function pruneEncryptAddressCache(root: string, cfg: WorkspaceConfi
 
 /** Encrypted upload (M5): attach `encSha` to each file entry (reuse the base's
  *  encSha for unchanged files; else convergent-encrypt), then upload the missing
- *  ciphertext blobs by `encSha`. Mutates only `local`'s cipher descriptors; the
- *  scan-time plaintext SHA and size remain authoritative.
+ *  ciphertext blobs by `encSha`. Entries are immutable, so this REPLACES them in
+ *  a file array it takes private ownership of; only `local.files` observes the
+ *  attached descriptors, and the scan-time plaintext SHA and size stay authoritative.
  *
  *  Snapshot mismatches and missing sources defer immediately. Ciphertext upload
  *  mismatches retry within a fixed per-file budget. Deferred paths are omitted or
@@ -161,22 +162,31 @@ export async function encryptAndUpload(
   const deferred = new Set<string>();
   const retryLater = new Set<string>();
   let needsUpload: Set<string> | undefined;
+  // Entries are readonly, so descriptors are attached by replacement. Take
+  // ownership of a private file array first: `local` may share its entries with
+  // the applied base (the daemon carries base entries forward), and replacement
+  // must never reach through to the base manifest.
+  const entries = new CipherDescriptorWriter();
+  const files = [...local.files];
+  local.files = files;
+  entries.track(files);
   try {
     // Carry forward unchanged ciphertext addresses; collect the rest to (re)encrypt.
     const toEncrypt: FileEntry[] = [];
     let carried = 0;
     await report.phase("address", async () => {
-      for (const f of local.files) {
+      for (const f of files) {
         if (f.type !== "file") continue;
         const reuse = baseEnc.get(f.sha256);
         if (reuse) {
-          applyCipherDescriptor(f, reuse); // unchanged → reuse ciphertext descriptor (no re-encrypt)
+          entries.attach(f, reuse); // unchanged → reuse ciphertext descriptor (no re-encrypt)
           if (encryptCache.migratePath(f.sha256, f.path)) cacheWriter.schedule();
           carried++;
         } else {
           toEncrypt.push(f);
         }
       }
+      entries.track(toEncrypt);
     });
     report.record("address", { count: carried });
     const usePipeline = pipelineEnabled() && options.encryptFileToTemp === undefined && toEncrypt.length >= PIPELINE_MIN_FILES;
@@ -194,6 +204,7 @@ export async function encryptAndUpload(
         tmpDir,
         toEncrypt,
         local,
+        entries,
         encryptCache,
         cacheWriter,
         encryptOpts,
@@ -244,7 +255,7 @@ export async function encryptAndUpload(
           }
           if (status === "accept") {
             cacheHits++;
-            applyCipherDescriptor(f, cached);
+            entries.attach(f, cached);
             ctSizeByEnc.set(cached.encSha, cached.cipherSize);
             encryptCache.record(f.sha256, { ...cached, path: f.path });
             cacheWriter.schedule();
@@ -273,7 +284,7 @@ export async function encryptAndUpload(
           }
           throw err;
         }
-        applyCipherDescriptor(f, descriptorFromEncryptedBlob(e));
+        entries.attach(f, descriptorFromEncryptedBlob(e));
         firstPublishReady(e.cipherSize, e.encSha);
         ctByEnc.set(e.encSha, e.ciphertextPath);
         ctSizeByEnc.set(e.encSha, e.cipherSize);
@@ -369,10 +380,11 @@ export async function encryptAndUpload(
      * Upload ONE file's blob with bounded per-file retry. Each retry re-encrypts a fresh
      * snapshot of THIS file and requires it to match `f`'s scanned SHA and size. A changed
      * source defers immediately; repeated ciphertext upload mismatches remain bounded.
-     * Mutates only `f`'s cipher descriptor. Returns the
+     * Replaces only this entry's cipher descriptor, in the manifest array too. Returns the
      * wire bytes actually sent (0 if a convergent peer already uploaded the address).
      */
-    const uploadFileWithRetry = async (f: FileEntry): Promise<number | null> => {
+    const uploadFileWithRetry = async (scanned: FileEntry): Promise<number | null> => {
+      let f = scanned;
       for (let attempt = 0; attempt < PER_FILE_UPLOAD_ATTEMPTS; attempt++) {
         if (uploaded.has(f.encSha!)) return 0; // a convergent peer already landed this exact blob
         let ct = ctByEnc.get(f.encSha!);
@@ -399,7 +411,7 @@ export async function encryptAndUpload(
             }
             throw err;
           }
-          applyCipherDescriptor(f, descriptorFromEncryptedBlob(re));
+          f = entries.attach(f, descriptorFromEncryptedBlob(re));
           const freshEncSha = re.encSha;
           ct = re.ciphertextPath;
           ctByEnc.set(freshEncSha, ct);

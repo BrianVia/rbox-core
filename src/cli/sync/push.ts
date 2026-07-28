@@ -60,7 +60,7 @@ function knownCommitFileEntry(entry: FileEntry): boolean {
  * encoder see no change while preserving every existing wire field.
  */
 export function stampManifestSchemaForCommit(manifest: Manifest, base?: Manifest): Manifest {
-  let files = manifest.files;
+  let files: FileEntry[] | undefined;
   if (process.env.RBOX_MTIME_NORMALIZE !== "0" && base && base.files.length > 0) {
     const baseFiles = new Map(base.files.map((entry) => [entry.path, entry]));
     for (let index = 0; index < manifest.files.length; index++) {
@@ -73,12 +73,12 @@ export function stampManifestSchemaForCommit(manifest: Manifest, base?: Manifest
         && COMMIT_FILE_IDENTITY_KEYS.every((key) => prior[key] === outgoing[key])
         && prior !== outgoing
       ) {
-        if (files === manifest.files) files = [...manifest.files];
+        files ??= [...manifest.files];
         files[index] = prior;
       }
     }
   }
-  const normalized = files === manifest.files ? manifest : { ...manifest, files };
+  const normalized = files === undefined ? manifest : { ...manifest, files };
   const schema = Math.max(gitReposManifestSchema(normalized.gitRepos) ?? 0, manifestRequiresSchema4(normalized) ? 4 : 0);
   if (schema === 0) {
     const { manifestSchema: _manifestSchema, ...withoutSchema } = normalized;
