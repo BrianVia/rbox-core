@@ -26,6 +26,26 @@ export class GenerationOwnerCapabilityError extends Error {
   }
 }
 
+/** An illegal worker lifecycle transition, a reused settlement, or a revoked
+ *  apply context. Never decrements `pendingResults`. */
+export class WorkerLifecycleError extends Error {
+  constructor(detail: string) {
+    super(detail);
+    this.name = "WorkerLifecycleError";
+  }
+}
+
+/** The `FileEntry` extension vocabulary is entirely primitive (every declared
+ *  field in `src/engine/types.ts` is a string or a number), so exact interning
+ *  compares with `Object.is` and freezes shallowly. A composite value would
+ *  silently break both, so it is refused at intern time rather than deep-frozen. */
+export class EntryShapeError extends Error {
+  constructor(key: string, detail: string) {
+    super(`entry field ${key} is not internable: ${detail}`);
+    this.name = "EntryShapeError";
+  }
+}
+
 export class EntryLeaseError extends Error {
   constructor(detail: string) {
     super(detail);

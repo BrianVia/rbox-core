@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import type { FileEntry } from "../types.js";
 import { EntryArena, defaultFingerprint, sameEntryExact } from "./arena.js";
 import { withCipherDescriptor } from "./cipher-descriptor.js";
+import { EntryShapeError } from "./errors.js";
 
 function entry(overrides: Partial<FileEntry> = {}): FileEntry {
   return { path: "a.txt", sha256: "aa", size: 3, mode: 0o644, mtimeMs: 1000, type: "file", ...overrides };
@@ -82,6 +83,14 @@ test("extension members participate in exact interning", () => {
   expect((extended.entry as Record<string, unknown>).futureField).toBe(1);
   arena.release(plain);
   arena.release(extended);
+});
+
+test("composite extension values are refused at intern time", () => {
+  const arena = new EntryArena();
+  for (const value of [{ nested: 1 }, [1, 2], () => 1, Symbol("x"), null]) {
+    expect(() => arena.internExact({ ...entry(), extension: value } as unknown as FileEntry)).toThrow(EntryShapeError);
+  }
+  expect(arena.stats()).toMatchObject({ liveSlots: 0, retains: 0 });
 });
 
 test("fingerprint collisions fall back to a full field comparison", () => {

@@ -107,11 +107,23 @@ export class CandidateGeneration {
   }
 }
 
+/** Resolves the published token to its generation. Private to this module: the
+ *  TOKEN is the capability, so a released — or forged — token resolves to
+ *  nothing and can never seed a candidate. */
+const LIVE_PUBLISHED = new WeakMap<PublishedGenerationToken, PublishedGeneration>();
+
+export function resolvePublishedGeneration(token: PublishedGenerationToken): PublishedGeneration {
+  const generation = LIVE_PUBLISHED.get(token);
+  if (!generation) throw new EntryLeaseError("published generation token is not live");
+  return generation;
+}
+
 export class PublishedGeneration {
   readonly token: PublishedGenerationToken;
   readonly generationId: GenerationId;
-  /** Frozen: published arrays are never sorted, spliced, or pushed in place. */
-  readonly entries: readonly Readonly<FileEntry>[];
+  /** Frozen: published arrays are never sorted, spliced, or pushed in place.
+   *  Null once released — a released generation exposes nothing. */
+  private frozenEntries: readonly Readonly<FileEntry>[] | null;
   private readonly byPath = new Map<string, PathState>();
   private released = false;
 
@@ -123,14 +135,25 @@ export class PublishedGeneration {
     this.generationId = generationId;
     this.token = Object.freeze({ kind: "published" as const, generationId });
     for (const { path, state } of transferred) this.byPath.set(path, state);
-    this.entries = Object.freeze(transferred.map(({ state }) => state.slot.entry));
+    this.frozenEntries = Object.freeze(transferred.map(({ state }) => state.slot.entry));
+    LIVE_PUBLISHED.set(this.token, this);
+  }
+
+  get entries(): readonly Readonly<FileEntry>[] {
+    return this.requireLive();
+  }
+
+  get isReleased(): boolean {
+    return this.released;
   }
 
   get(path: string): Readonly<FileEntry> | undefined {
+    this.requireLive();
     return this.byPath.get(path)?.slot.entry;
   }
 
   versionOf(path: string): EntryVersionToken | undefined {
+    this.requireLive();
     const state = this.byPath.get(path);
     if (!state) return undefined;
     return makeVersionToken(this.generationId, path, state.pathEpoch, state.slot.id);
@@ -139,7 +162,7 @@ export class PublishedGeneration {
   /** An explicit extra retain that outlives replacements and awaits. Release it
    *  in `finally`. */
   lease(path: string): EntryLease {
-    if (this.released) throw new EntryLeaseError(`generation ${this.generationId} is released`);
+    this.requireLive();
     const state = this.byPath.get(path);
     if (!state) throw new EntryLeaseError(`generation ${this.generationId} has no path ${path}`);
     this.arena.retain(state.slot);
@@ -161,7 +184,14 @@ export class PublishedGeneration {
   release(): void {
     if (this.released) return;
     this.released = true;
+    this.frozenEntries = null;
+    LIVE_PUBLISHED.delete(this.token);
     for (const state of this.byPath.values()) this.arena.release(state.slot);
     this.byPath.clear();
+  }
+
+  private requireLive(): readonly Readonly<FileEntry>[] {
+    if (!this.frozenEntries) throw new EntryLeaseError(`published generation ${this.generationId} is released`);
+    return this.frozenEntries;
   }
 }
