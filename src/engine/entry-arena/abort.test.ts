@@ -14,7 +14,7 @@ import {
   workerRequest,
 } from "./owner.js";
 import type { WorkerApplyContext } from "./workers.js";
-import { withGenerationOwnerScope } from "./scope.js";
+import { withGenerationOwnerScope } from "./owner.js";
 
 function entry(path: string, overrides: Partial<FileEntry> = {}): FileEntry {
   return { path, sha256: `sha-${path}`, size: 3, mode: 0o644, mtimeMs: 1000, type: "file", ...overrides };

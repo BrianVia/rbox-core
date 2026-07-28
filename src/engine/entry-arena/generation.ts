@@ -116,42 +116,6 @@ export class CandidateGeneration {
   }
 }
 
-/** Resolves the published token to its generation. Private to this module: the
- *  TOKEN is the capability, so a released — or forged, or hand-constructed —
- *  token resolves to nothing and can never seed a candidate. Registration
- *  happens ONLY inside the publication capability below. */
-const LIVE_PUBLISHED = new WeakMap<PublishedGenerationToken, PublishedGeneration>();
-
-const PUBLICATION_KEY = Symbol("rbox.entry-arena.publication");
-
-export function resolvePublishedGeneration(token: PublishedGenerationToken): PublishedGeneration {
-  const generation = LIVE_PUBLISHED.get(token);
-  if (!generation) throw new EntryLeaseError("published generation token is not live");
-  return generation;
-}
-
-export type PublicationCapability = (
-  arena: EntryArena,
-  generationId: GenerationId,
-  transferred: Array<{ path: string; state: PathState }>,
-) => PublishedGeneration;
-
-let unclaimedPublication: PublicationCapability | null = (arena, generationId, transferred) => {
-  const generation = new PublishedGeneration(PUBLICATION_KEY, arena, generationId, transferred);
-  LIVE_PUBLISHED.set(generation.token, generation);
-  return generation;
-};
-
-/** Claim-once handoff: the single legitimate publisher (`publishGeneration`)
- *  takes this when its module initializes. A later deep import gets a throw, so
- *  constructing a generation and minting a seedable token is not importable. */
-export function takePublicationCapability(): PublicationCapability {
-  if (!unclaimedPublication) throw new EntryLeaseError("the publication capability was already claimed");
-  const claimed = unclaimedPublication;
-  unclaimedPublication = null;
-  return claimed;
-}
-
 export class PublishedGeneration {
   readonly token: PublishedGenerationToken;
   readonly generationId: GenerationId;
@@ -161,15 +125,13 @@ export class PublishedGeneration {
   private readonly byPath = new Map<string, PathState>();
   private released = false;
 
+  /** Inert on its own: a generation becomes seedable only when the publisher
+   *  registers its token, which happens nowhere but `publishGeneration`. */
   constructor(
-    key: symbol,
     private readonly arena: EntryArena,
     generationId: GenerationId,
     transferred: Array<{ path: string; state: PathState }>,
   ) {
-    if (key !== PUBLICATION_KEY) {
-      throw new EntryLeaseError("a published generation is created only by publishGeneration");
-    }
     this.generationId = generationId;
     this.token = Object.freeze({ kind: "published" as const, generationId });
     for (const { path, state } of transferred) this.byPath.set(path, state);
@@ -222,7 +184,6 @@ export class PublishedGeneration {
     if (this.released) return;
     this.released = true;
     this.frozenEntries = null;
-    LIVE_PUBLISHED.delete(this.token);
     for (const state of this.byPath.values()) this.arena.release(state.slot);
     this.byPath.clear();
   }

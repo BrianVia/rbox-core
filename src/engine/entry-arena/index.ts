@@ -1,10 +1,10 @@
 /**
  * Public surface of the U0 entry-interning unit. Deliberately absent:
- * `takeOwnerCapability`, `takePublicationCapability`, `OwnerControl`,
- * `OwnerHandle`, and `CandidateGeneration`. The minting capabilities are
- * claim-once handoffs consumed at module initialization by their single
- * legitimate consumer, the raw control block is unreachable, and
- * `withGenerationOwnerScope` is the only owner construction path.
+ * `OwnerControl`, `OwnerHandle`, and `CandidateGeneration`. All construction
+ * authority is co-located inside `owner.ts` — its scope key and registries are
+ * module-scope consts that never cross a module boundary — so there is nothing
+ * to hand off, nothing to claim, and `withGenerationOwnerScope` is the only
+ * owner construction path in every import order.
  */
 export {
   EntryArena,
@@ -35,23 +35,25 @@ export {
   publishGeneration,
   registerWorker,
   replaceInternedEntry,
+  withGenerationOwnerScope,
   workerRequest,
-  type AbortOutcome,
-  type GenerationOwnerLease,
+  type CandidateSeed,
+  type GenerationOwnerScope,
   type OwnerSnapshot,
-  type ReplaceInternedEntryArgs,
-  type ReplaceInternedEntryResult,
 } from "./owner.js";
 export type { WorkerApplyContext, WorkerRegistration } from "./workers.js";
-export { withGenerationOwnerScope, type CandidateSeed, type GenerationOwnerScope } from "./scope.js";
 export type {
+  AbortOutcome,
   EntryLease,
   EntryVersionToken,
   GenerationId,
   GenerationMutationToken,
   OwnedEntryRef,
+  GenerationOwnerLease,
   OwnerTerminalState,
   PublishedGenerationToken,
+  ReplaceInternedEntryArgs,
+  ReplaceInternedEntryResult,
   ReplacementDisposition,
   SlotId,
   WorkerEntryRequest,

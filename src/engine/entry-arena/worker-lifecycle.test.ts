@@ -13,7 +13,7 @@ import {
   workerRequest,
 } from "./owner.js";
 import type { WorkerApplyContext } from "./workers.js";
-import { withGenerationOwnerScope } from "./scope.js";
+import { withGenerationOwnerScope } from "./owner.js";
 
 function entry(path: string, overrides: Partial<FileEntry> = {}): FileEntry {
   return { path, sha256: "sha-" + path, size: 3, mode: 0o644, mtimeMs: 1000, type: "file", ...overrides };
@@ -150,23 +150,55 @@ test("REGRESSION (r2 finding 2): scope.abortOwner and scope.abortAll are guarded
   expect(arena.stats()).toMatchObject({ liveSlots: 0, retains: 0 });
 });
 
-test("REGRESSION (r2 finding 2): an UNRELATED owner can still be aborted from a release callback", async () => {
+test("REGRESSION (r3 finding 2): NO owner may be driven terminal from a release callback", async () => {
   const arena = new EntryArena();
   await withGenerationOwnerScope(arena, async (scope) => {
     const first = scope.createOwner({ entries: SEED });
     const second = scope.createOwner({ entries: [entry("c.txt")] });
     const registration = await registerWorker(first.owner);
     await registration.markRunning();
-    let otherOutcome: string | undefined;
-    expect(
-      await registration.fail(async () => {
+    await expect(
+      registration.fail(async () => {
         await Promise.resolve();
-        otherOutcome = await abortGeneration(second.owner);
+        await abortGeneration(second.owner);
       }),
-    ).toBe("discarded");
-    expect(otherOutcome).toBe("aborted");
-    expect(inspectOwner(second.owner).terminalState).toBe("discarded");
-    expect(await abortGeneration(first.owner)).toBe("aborted");
+    ).rejects.toThrow(OwnerReentrancyError);
+    expect(inspectOwner(second.owner).terminalState).toBe("live");
+    expect(registration.state).toBe("done");
+    expect(inspectOwner(first.owner).pendingResults).toBe(0);
+  });
+  expect(arena.stats()).toMatchObject({ liveSlots: 0, retains: 0 });
+});
+
+test("REGRESSION (r3 finding 2): concurrent mutual cross-owner aborts throw instead of deadlocking", async () => {
+  const arena = new EntryArena();
+  await withGenerationOwnerScope(arena, async (scope) => {
+    const a = scope.createOwner({ entries: SEED });
+    const b = scope.createOwner({ entries: [entry("c.txt")] });
+    const workerA = await registerWorker(a.owner);
+    const workerB = await registerWorker(b.owner);
+    await workerA.markRunning();
+    await workerB.markRunning();
+
+    // Codex's repro: A's release aborts B while B's release aborts A.
+    const settleA = workerA
+      .fail(async () => {
+        await Promise.resolve();
+        await abortGeneration(b.owner);
+      })
+      .catch((error: unknown) => error);
+    const settleB = workerB
+      .fail(async () => {
+        await Promise.resolve();
+        await abortGeneration(a.owner);
+      })
+      .catch((error: unknown) => error);
+    expect(await settleA).toBeInstanceOf(OwnerReentrancyError);
+    expect(await settleB).toBeInstanceOf(OwnerReentrancyError);
+    expect(inspectOwner(a.owner).pendingResults).toBe(0);
+    expect(inspectOwner(b.owner).pendingResults).toBe(0);
+    expect(await abortGeneration(a.owner)).toBe("aborted");
+    expect(await abortGeneration(b.owner)).toBe("aborted");
   });
   expect(arena.stats()).toMatchObject({ liveSlots: 0, retains: 0 });
 });

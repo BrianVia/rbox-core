@@ -7,9 +7,14 @@
  * Interning equality is EXACT — every field, every optional-field presence, and
  * every preserved extension member, compared by CANONICAL VALUE. Extension
  * members are authoritative arbitrary JSON (design 163 § extras_cjson), so
- * absent / `null` / `{}` / `[]` are four distinct values, key order is not
- * significant, and the arena stores a deep, deeply frozen copy so a caller can
- * never mutate an interned entry through a shared sub-object.
+ * absent / `null` / `{}` / `[]` are four distinct values and key order is not
+ * significant.
+ *
+ * The caller's entry is SNAPSHOT EXACTLY ONCE into null-prototype, frozen,
+ * data-property objects. Canonicalization, the depth bound, equality, and the
+ * stored entry all read that one snapshot, so an accessor cannot make a slot's
+ * key disagree with the entry stored under it, and an own `__proto__` member
+ * survives the copy like any other key.
  *
  * `sameContent` (diff.ts) remains a different comparison and still ignores
  * `mtimeMs`.
@@ -51,11 +56,35 @@ export interface EntryArenaOptions {
 
 /** Nesting bound for extension members. Manifest extras are decoded JSON, which
  *  is acyclic and shallow in practice; the bound turns a pathological or cyclic
- *  input into a loud failure instead of a hang. */
+ *  input into a loud `EntryShapeError` instead of a stack overflow. */
 export const MAX_EXTENSION_DEPTH = 32;
 
-function canonicalValue(value: unknown, path: string, depth: number): string {
+function defineOwn(target: Record<string, unknown>, key: string, value: unknown): void {
+  // Assignment would route an own `__proto__` key through the prototype setter
+  // and silently drop a valid decoded-JSON member.
+  Object.defineProperty(target, key, { value, enumerable: true, writable: false, configurable: false });
+}
+
+/** Reads each source value EXACTLY once and returns a frozen, null-prototype
+ *  deep copy. Every later step reads this result, never the caller's object. */
+function snapshotValue(value: unknown, path: string, depth: number): unknown {
   if (depth > MAX_EXTENSION_DEPTH) throw new EntryShapeError(path, `nested deeper than ${MAX_EXTENSION_DEPTH}`);
+  if (value === null) return null;
+  const kind = typeof value;
+  if (kind !== "object") {
+    if (kind === "string" || kind === "number" || kind === "boolean" || kind === "undefined") return value;
+    throw new EntryShapeError(path, `${kind} is not representable in a manifest`);
+  }
+  if (Array.isArray(value)) {
+    return Object.freeze(value.map((item, index) => snapshotValue(item, `${path}[${index}]`, depth + 1)));
+  }
+  const source = value as Record<string, unknown>;
+  const copy = Object.create(null) as Record<string, unknown>;
+  for (const key of Object.keys(source)) defineOwn(copy, key, snapshotValue(source[key], `${path}.${key}`, depth + 1));
+  return Object.freeze(copy);
+}
+
+function canonicalOf(value: unknown): string {
   if (value === undefined) return "u";
   if (value === null) return "z";
   switch (typeof value) {
@@ -65,47 +94,35 @@ function canonicalValue(value: unknown, path: string, depth: number): string {
       return `n${Object.is(value, -0) ? "-0" : String(value)}`;
     case "boolean":
       return value ? "b1" : "b0";
-    case "object":
-      break;
     default:
-      throw new EntryShapeError(path, `${typeof value} is not representable in a manifest`);
+      break;
   }
-  if (Array.isArray(value)) {
-    return `a[${value.map((item, index) => canonicalValue(item, `${path}[${index}]`, depth + 1)).join(",")}]`;
-  }
+  if (Array.isArray(value)) return `a[${value.map(canonicalOf).join(",")}]`;
   const record = value as Record<string, unknown>;
-  const keys = Object.keys(record).sort();
-  return `o{${keys.map((key) => `${JSON.stringify(key)}:${canonicalValue(record[key], `${path}.${key}`, depth + 1)}`).join(",")}}`;
+  return `o{${Object.keys(record)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalOf(record[key])}`)
+    .join(",")}}`;
 }
 
-/** Total order-independent serialization of an entry. Two entries intern to the
- *  same slot exactly when their canonical forms are identical strings. */
+export interface InternedSnapshot {
+  /** The arena's own immutable entry — this exact object is what gets stored. */
+  entry: Readonly<FileEntry>;
+  /** Order-independent total serialization of that same object. */
+  canonical: string;
+}
+
+export function snapshotEntry(entry: Readonly<FileEntry>): InternedSnapshot {
+  const snapshot = snapshotValue(entry, "", 0) as Readonly<FileEntry>;
+  return { entry: snapshot, canonical: canonicalOf(snapshot) };
+}
+
 export function canonicalEntryKey(entry: Readonly<FileEntry>): string {
-  const keys = Object.keys(entry).sort();
-  return keys
-    .map((key) => `${JSON.stringify(key)}=${canonicalValue((entry as Record<string, unknown>)[key], key, 0)}`)
-    .join(";");
+  return snapshotEntry(entry).canonical;
 }
 
 export function sameEntryExact(a: Readonly<FileEntry>, b: Readonly<FileEntry>): boolean {
   return canonicalEntryKey(a) === canonicalEntryKey(b);
-}
-
-function deepCopyFrozen(value: unknown): unknown {
-  if (value === null || typeof value !== "object") return value;
-  if (Array.isArray(value)) return Object.freeze(value.map(deepCopyFrozen));
-  const source = value as Record<string, unknown>;
-  const copy: Record<string, unknown> = {};
-  for (const key of Object.keys(source)) copy[key] = deepCopyFrozen(source[key]);
-  return Object.freeze(copy);
-}
-
-/** The arena's own immutable copy: no sub-object is shared with the caller, and
- *  every level is frozen. Depth is already bounded by `canonicalEntryKey`. */
-function internedCopy(entry: Readonly<FileEntry>): Readonly<FileEntry> {
-  const copy: Record<string, unknown> = {};
-  for (const key of Object.keys(entry)) copy[key] = deepCopyFrozen((entry as Record<string, unknown>)[key]);
-  return Object.freeze(copy) as Readonly<FileEntry>;
 }
 
 export function defaultFingerprint(canonical: string): string {
@@ -140,7 +157,7 @@ export class EntryArena {
    * zero-retain slot.
    */
   internExact(entry: Readonly<FileEntry>): ArenaSlot {
-    const canonical = canonicalEntryKey(entry);
+    const { entry: snapshot, canonical } = snapshotEntry(entry);
     const fingerprint = this.fingerprintOf(canonical);
     const bucket = this.buckets.get(fingerprint);
     if (bucket) {
@@ -151,13 +168,7 @@ export class EntryArena {
         }
       }
     }
-    const record: SlotRecord = {
-      id: this.nextSlotId++,
-      entry: internedCopy(entry),
-      fingerprint,
-      canonical,
-      retains: 1,
-    };
+    const record: SlotRecord = { id: this.nextSlotId++, entry: snapshot, fingerprint, canonical, retains: 1 };
     this.slots.set(record.id, record);
     if (bucket) bucket.push(record);
     else this.buckets.set(fingerprint, [record]);

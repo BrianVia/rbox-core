@@ -12,7 +12,7 @@ import {
   workerRequest,
   type GenerationOwnerLease,
 } from "./owner.js";
-import { withGenerationOwnerScope } from "./scope.js";
+import { withGenerationOwnerScope } from "./owner.js";
 import { makeVersionToken, type GenerationMutationToken, type PublishedGenerationToken } from "./tokens.js";
 
 function entry(path: string, overrides: Partial<FileEntry> = {}): FileEntry {

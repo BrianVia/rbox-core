@@ -45,13 +45,13 @@ export class EntryShapeError extends Error {
   }
 }
 
-/** A terminal operation was started on an owner from inside that same owner's
- *  resource-release callback — a cycle: the operation waits for the settlement
- *  that is waiting for the callback. Detected across awaits, not just
- *  synchronously, so abort can never deadlock. */
+/** A terminal operation was started from inside a resource-release callback.
+ *  Same-owner is a direct cycle and cross-owner pairs are a mutual one, so NO
+ *  owner may be driven terminal from a release callback. Detected across
+ *  awaits, not just synchronously, so abort can never deadlock. */
 export class OwnerReentrancyError extends Error {
   constructor(operation: string) {
-    super(`${operation} cannot be called from a resource-release callback of the same owner`);
+    super(`${operation} cannot be called from a resource-release callback`);
     this.name = "OwnerReentrancyError";
   }
 }

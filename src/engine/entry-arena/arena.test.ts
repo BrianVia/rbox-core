@@ -201,3 +201,61 @@ test("withCipherDescriptor drops comp, payloadSha and cipherSize together", () =
   expect("payloadSha" in plain).toBe(false);
   expect("cipherSize" in plain).toBe(false);
 });
+
+test("REGRESSION (r3 finding 3): an own '__proto__' member survives interning", () => {
+  const arena = new EntryArena();
+  const source: Record<string, unknown> = { ...entry() };
+  Object.defineProperty(source, "__proto__", { value: { a: 1 }, enumerable: true, writable: true, configurable: true });
+  const slot = arena.internExact(source as unknown as FileEntry);
+  expect(Object.keys(slot.entry)).toContain("__proto__");
+  expect(Object.getPrototypeOf(slot.entry)).toBeNull();
+  expect(sameEntryExact(slot.entry, source as unknown as FileEntry)).toBe(true);
+  // It is a real member, so it distinguishes just like any other extension.
+  const without = arena.internExact(entry());
+  expect(without).not.toBe(slot);
+  arena.release(slot);
+  arena.release(without);
+  expect(arena.stats()).toMatchObject({ liveSlots: 0, retains: 0 });
+});
+
+test("REGRESSION (r3 finding 3): a changing accessor cannot diverge the key from the stored entry", () => {
+  const arena = new EntryArena();
+  let reads = 0;
+  const shifty: Record<string, unknown> = {
+    ...entry(),
+    get size(): number {
+      return ++reads === 1 ? 1 : 999;
+    },
+  };
+  const slot = arena.internExact(shifty as unknown as FileEntry);
+  expect(slot.entry.size).toBe(1);
+  // The slot really is keyed under what it stores: an equal plain entry shares it.
+  const plain = arena.internExact(entry({ size: 1 }));
+  expect(plain).toBe(slot);
+  expect(canonicalEntryKey(slot.entry)).toBe(canonicalEntryKey(entry({ size: 1 })));
+  arena.release(slot);
+  arena.release(plain);
+  expect(arena.stats()).toMatchObject({ liveSlots: 0, retains: 0 });
+});
+
+test("REGRESSION (r3 finding 3): cyclic extras hit the depth bound, never a stack overflow", () => {
+  const arena = new EntryArena();
+  const cyclic: Record<string, unknown> = {};
+  cyclic.self = cyclic;
+  expect(() => arena.internExact({ ...entry(), extras: cyclic } as unknown as FileEntry)).toThrow(EntryShapeError);
+
+  // Shallow-then-cyclic accessor: the single read wins, so the arena stores the
+  // shallow value and the later cyclic one is never reachable.
+  let reads = 0;
+  const shallowThenCyclic: Record<string, unknown> = {
+    ...entry(),
+    get extras(): unknown {
+      return reads++ === 0 ? { ok: 1 } : cyclic;
+    },
+  };
+  const slot = arena.internExact(shallowThenCyclic as unknown as FileEntry);
+  expect((slot.entry as unknown as Record<string, unknown>).extras).toEqual({ ok: 1 });
+  expect(canonicalEntryKey(slot.entry)).toBe(canonicalEntryKey({ ...entry(), extras: { ok: 1 } } as unknown as FileEntry));
+  arena.release(slot);
+  expect(arena.stats()).toMatchObject({ liveSlots: 0, retains: 0 });
+});

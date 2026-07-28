@@ -83,6 +83,28 @@ export function sameVersion(a: EntryVersionToken, b: EntryVersionToken): boolean
   return a.generationId === b.generationId && a.path === b.path && a.pathEpoch === b.pathEpoch && a.slotId === b.slotId;
 }
 
+/** The owner capability's public face. A brand alone is not authority: the
+ *  coordinator authenticates this object against an isolate-private registry. */
+export interface GenerationOwnerLease {
+  readonly ownerId: number;
+}
+
+export type AbortOutcome = "aborted" | "already-terminal";
+
+export interface ReplaceInternedEntryArgs {
+  owner: GenerationOwnerLease;
+  token: GenerationMutationToken;
+  path: string;
+  expected: EntryVersionToken;
+  next: Readonly<FileEntry>;
+}
+
+export interface ReplaceInternedEntryResult {
+  token: GenerationMutationToken;
+  entry: OwnedEntryRef;
+  disposition: ReplacementDisposition;
+}
+
 /** The immutable DTO handed to a crypto worker — never the owner, never a token. */
 export interface WorkerEntryRequest {
   readonly path: string;
