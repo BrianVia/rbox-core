@@ -1,11 +1,19 @@
 # 163 — The state plane moves to SQLite
 
-Status: **v7 — pending final ratification.** V7 is a *round-three targeted
-fold*: it closes the enumerated residual list from the codex final serial
-review of the v6 tip (2026-07-28), records the founder decisions ratified that
-day, and leaves exactly one question open (below).
+Status: **v8 — pending final ratification.** V8 is a *round-four targeted
+fold*: it closes the seven residuals from the codex serial review of the v7 tip
+and corrects the open-input count, which v7 understated.
 
-Provenance, stated honestly, because this is the third attempt at some of it:
+Provenance, stated honestly: **v7's "no third case" argument for the `B0` write
+barrier was wrong, and v7's claim that exactly one founder input remained was
+wrong.** V8 names the third case with its exact preconditions instead of
+arguing it away, binds the last-writer witness to content rather than to a
+reusable inode, gives the inert control temp and the generic reserve
+dispositions that their own consumers can actually honour, and lists both open
+inputs. The `M0–M7` machine, the `Q` barrier, and every migration fence are
+unchanged or strictly tightened; nothing in this fold weakens them.
+
+Previous status (v7), retained for provenance:
 **rounds one and two both recorded a schema closure in the review log that they
 never performed.** The v6 log row for CODE B3 + CODEX 1 claims "three columns
 added" and a `resolutionIntent` disposition; in fact `packedRefsIdentity`,
@@ -42,9 +50,15 @@ terminal-control-last, 2.0-only confinement) is unchanged.
 It is not implementation authority until the
 orchestrator ratifies it.
 
-## OPEN QUESTION FOR THE FOUNDER (v7 — exactly one remains)
+## OPEN INPUTS OWED BY THE FOUNDER (v8 — there are exactly two)
 
-**Do the four external users take the one-way migration before the latency and
+V7 said "exactly one remains" and that was false: the kill-threshold protocol
+already carried a second one, marked **OWED** and **blocking** in its own
+section (§ "Measurement protocol for those numbers"), while this list did not
+name it. Both are enumerated here, and this list is the authority on how many
+there are.
+
+**1. Do the four external users take the one-way migration before the latency and
 memory payoff lands?** Backend-first ships 2.0 — and therefore the irreversible
 `Q` flip — to all four external users at `U3`, while the wins they would
 actually notice (trusted-status latency, daemon RSS) arrive across `U4a–U4f`
@@ -54,8 +68,20 @@ U3 no-regression criterion (the flip may not ship if trusted status or daemon
 RSS is worse than the 1.x baseline) and recoverable only by re-adoption, so the
 downside is bounded but not zero. This is a judgment about four real people —
 two of them non-technical, one of them paying — not a technical question, and
-the fold cannot answer it. **Everything else in this document is either closed
-or ratified; this is the only input still owed.**
+the fold cannot answer it.
+
+**2. Which host is the frozen machine profile for every U5 ship number?**
+All ratified kill-criterion thresholds (trusted status p50/p95, daemon RSS) are
+measured on one named, frozen host profile — exact machine, CPU, RAM,
+filesystem, and whether it is a fleet host or the rig — and the same code will
+pass on one fleet host and fail on another, so no threshold is falsifiable
+until this is chosen. It is **OWED and blocking before U5 begins**; the full
+statement of what must be recorded lives in § "Measurement protocol for those
+numbers". Naming it here is not a duplicate requirement, it is the correction
+of v7's count.
+
+**Everything else in this document is either closed or ratified; these two are
+the only inputs still owed.**
 
 ## Founder decisions ratified 2026-07-28
 
@@ -2063,21 +2089,88 @@ clobber each other's `state.json` today.
    no new primitive and no new file — it extends an existing lock discipline to
    the one path that skipped it.
 
-   *The unlocked residue is refused, not raced.* `degraded-unlocked` exists
-   exactly when `acquireLock` returns `unsupported` (`src/cli/sync-mutex.ts:85-88`),
-   i.e. the filesystem offers no safe identity/link primitive — so on that
-   filesystem **no** check-then-rename sequence can be made atomic, and the
-   design does not pretend otherwise. B0 makes the degraded path fail closed
-   instead: under `degraded-unlocked`, `writeWholeStateUnsafe` performs the
-   barrier read in `beforeRename` and refuses to publish over `Q` or over any
-   non-JSON legacy path. The remaining theoretical window (a `Q` appearing
-   between that read and the rename) is closed from the other side rather than
-   left open: M0 refuses to migrate a `degraded-unlocked` workspace at all
+   *The unlocked residue is refused, not raced — except in one case, which v8
+   names rather than argues away.* `degraded-unlocked` exists exactly when
+   `acquireLock` returns `unsupported` (`src/cli/sync-mutex.ts:85-88`), i.e. the
+   filesystem offers no safe identity/link primitive — so on that filesystem
+   **no** check-then-rename sequence can be made atomic, and the design does not
+   pretend otherwise. B0 makes the degraded path fail closed instead: under
+   `degraded-unlocked`, `writeWholeStateUnsafe` performs the barrier read in
+   `beforeRename` and refuses to publish over `Q` or over any non-JSON legacy
+   path. M0 then refuses to migrate a `degraded-unlocked` workspace at all
    (bullet 3 below) and re-checks that predicate immediately before the M6
-   rename, and degradation is a filesystem-capability property, so a workspace
-   that is degraded for one process is degraded for all of them. Locked
-   workspaces are serialized by the lock; unlocked workspaces never have a `Q`
-   published under them. There is no third case.
+   rename.
+
+   **V7 concluded from that pairing that "there is no third case". That was
+   false**, and the error is worth stating precisely because it is the shape of
+   error this whole section exists to prevent. V7's argument rested on
+   "degradation is a filesystem-capability property, so a workspace degraded for
+   one process is degraded for all of them." The premise does not hold as
+   written: `writeWholeStateUnsafe` is reached by **two** disjunctive
+   conditions, `unsupported` locking *and* `forceLegacy`, and nothing made the
+   second one a property of the filesystem. A writer can therefore be inside an
+   unlocked check-then-rename window **on a perfectly lockable filesystem** —
+   which is exactly the workspace M0 admits. Its window can have opened before
+   `Q` existed and before M0 ran, and it remains unlocked across its own
+   check→rename. That is the third case.
+
+   *Closure, part one — collapse every closable instance of it into case 1.*
+   Normative for `B0`: the unlocked publication path may be entered **only**
+   when `acquireLock` returns `unsupported` for this workspace on this
+   filesystem. `forceLegacy` alone does not authorize it, a transient
+   acquisition failure does not authorize it, and an expired or stolen lease
+   does not authorize it — each of those becomes a typed refusal to publish,
+   not a permission to publish unlocked. With that, `degraded-unlocked` finally
+   *is* the filesystem-capability property v7 asserted it was, every B0-era
+   writer on a lockable filesystem holds `stateLockPath` continuously from the
+   barrier read through the rename, and M6's rename holds the same lock. The
+   third case has no B0-era instance.
+
+   *Closure, part two — M0 must additionally require no live legacy writer at
+   all.* Mutual exclusion only binds writers that take the lock, so M0's
+   quiescence predicate (bullet 3 below) is extended with a **writer-liveness
+   observation** rather than assumed away: under the complete lock set, M0
+   samples the live `.rbox/state.json` content witness (§ 1b: body hash, size,
+   mtime, `dev`/`ino`) and the `last-writer.json` sidecar together, waits a
+   bounded interval, and re-samples. Any change to the state file that the
+   sidecar does not account for proves a writer that publishes without
+   maintaining the witness — i.e. a non-B0 writer — is live, and M0 refuses with
+   a typed `legacy-writer-live` refusal. The same paired sample is re-taken
+   immediately before the M6 rename, so a writer that surfaces mid-migration is
+   caught at the last fence rather than after the flip.
+
+   *The residual that survives both, with its exact preconditions.* One window
+   cannot be closed by anything `B0` or 2.0 does, because it belongs to a binary
+   that predates both. A **pre-`1.11.0`** binary that (i) enters
+   `writeWholeStateUnsafe` — degraded or `forceLegacy` — (ii) completes its
+   state read before M0 begins, (iii) publishes nothing until strictly after
+   M6's `Q` rename, and (iv) runs on a lockable filesystem, so M0's
+   `degraded-fence` does not fire, holds no lock, checks no barrier, maintains
+   no witness, and its rename destroys `Q`. All four conditions are required
+   simultaneously. What bounds it:
+   - It requires a pre-B0 binary co-resident with a 2.0 binary on one workspace.
+     That is precisely what `B0`'s adoption gate exists to exclude (all 4
+     external users and all 3 fleet hosts on `>= 1.11.0`, two-week bake), and
+     the M0 witness floor independently refuses any workspace whose *last*
+     writer was pre-B0 — so reaching this state needs a workspace written
+     recently by a B0 binary while a pre-B0 binary is simultaneously mid-write.
+   - It requires `writeWholeStateUnsafe` specifically. The ordinary CAS path
+     already holds the state lock even pre-B0 (`sync-state-store.ts:120-135`),
+     so the common writer is excluded without any B0 change.
+   - It requires the writer's read→rename window to span the entire M0–M6
+     migration — budgeted at `<= 60 s` on the 112k corpus — against an observed
+     window of milliseconds. A publication anywhere *inside* the window is
+     caught by the paired witness sample above.
+   - It is detectable after the fact, not silent: the result is a legacy JSON at
+     `.rbox/state.json` whose body hash matches no M2-recorded source digest and
+     whose `last-writer.json` is stale, which the doctor reports as
+     `legacy-overwrite-after-Q` with the immutable hash-addressed backup as
+     recovery evidence.
+
+   This residual is **accepted and named**, not closed. It is a scheduling
+   assumption (`B0` adoption) enforced by a gate rather than by a lock, and the
+   fixture matrix below tests it as a known outcome so it can never be
+   discovered as a surprise.
 
    **1b. The durable last-writer witness.** `SyncState` has no version field
    and B0 must not add one — a new state member would be silently dropped by
@@ -2087,31 +2180,62 @@ clobber each other's `state.json` today.
    **outside** the state document, in a sidecar at
    `.rbox/state/last-writer.json`, whose closed schema is
    `{version:1, writerVersion:"<semver>", writtenAtMs:<integer>,
-   stateDev:<integer>, stateIno:<integer>}`.
+   stateBodySha256:"<hex64>", stateSizeBytes:<integer>,
+   stateMtimeMs:<integer>, stateDev:<integer>, stateIno:<integer>}`.
+
+   **The witness is bound to content, not to an inode (v8).** V7 recorded only
+   `dev`/`ino`, which is defeated by the very publication protocol this design
+   mandates everywhere: `writeFileAtomic` renames a *new* file over the target,
+   the old inode is released, and an inode number is free to be reused by the
+   next file the filesystem allocates — including the next `state.json`. A
+   dev/ino-only witness can therefore match a document the recorded writer never
+   wrote. The witness records the published body's `stateBodySha256` and
+   `stateSizeBytes` alongside the identity triple. `.rbox/state.json` carries no
+   preamble, so its body hash and its physical hash coincide (the body-vs-
+   physical distinction of § M2 applies to preamble-prefixed backups, not to the
+   live state), and the hash is taken over the exact bytes just published.
+
+   *Authority on verify, stated so an implementer cannot pick differently.*
+   **`stateBodySha256` and `stateSizeBytes` are the authoritative fields**: they
+   carry the whole property the witness exists to prove, and a mismatch in
+   either is decisive. `stateDev`, `stateIno`, and `stateMtimeMs` are
+   **corroborating** — cheap change detection that catches a replacement before
+   the hash is computed, and diagnostic detail in the refusal. Verification
+   requires **all five to match** and fails closed on any mismatch; the
+   distinction is which field is trusted when they disagree, and the answer is
+   the content hash: a dev/ino match with a body mismatch is always a refusal,
+   and a body match with a dev/ino mismatch is *also* a refusal, reported as
+   `barrier-witness-identity-drift` because it means something republished
+   identical bytes without maintaining the witness. Nothing anywhere admits a
+   witness on identity alone.
+
    Update protocol: the actor that just published `state.json` writes it
    **after** the publication rename and its `fsyncDirectory`, still holding the
    same state lock, via `writeFileAtomic` plus `fsyncDirectory`, recording the
-   `dev`/`ino` it observes on the just-published `state.json`. It is never
-   authority and never read by the sync engine; a failed witness write does not
-   fail the state write (the state is already published) and merely leaves the
-   witness stale. Its sole consumer is migration admission: M0 admits a
-   workspace only when the witness exists, parses exactly, its
-   `stateDev`/`stateIno` equal the live `.rbox/state.json` identity — proving
-   the recorded writer wrote *the state that is there now*, not some earlier
-   one — and `writerVersion >= 1.11.0`, the ratified downgrade floor. Anything
-   else (absent, stale, foreign, identity-mismatched, lower version) is a typed
-   `barrier-witness-missing` refusal, not a halt; the remedy is one ordinary
-   sync with a barrier-capable binary, which is exactly the condition the gate
-   is trying to establish. B0's pinning inventory test (contents item 2) is
-   extended to require both obligations of every enumerated write entry point:
-   it checks the barrier, and it updates the witness.
+   body hash and size of the bytes it published and the `dev`/`ino`/`mtime` it
+   observes on the just-published `state.json`. It is never authority and never
+   read by the sync engine; a failed witness write does not fail the state write
+   (the state is already published) and merely leaves the witness stale. Its
+   sole consumer is migration admission: M0 admits a workspace only when the
+   witness exists, parses exactly, all five state fields match the live
+   `.rbox/state.json` — proving the recorded writer wrote *the state that is
+   there now*, byte for byte, not some earlier one and not a coincidentally
+   identical inode — and `writerVersion >= 1.11.0`, the ratified downgrade
+   floor. Anything else (absent, stale, foreign, content-mismatched,
+   identity-drifted, lower version) is a typed `barrier-witness-missing`
+   refusal, not a halt; the remedy is one ordinary sync with a barrier-capable
+   binary, which is exactly the condition the gate is trying to establish. The
+   same five-field sample is what the writer-liveness observation above
+   re-samples across its bounded interval. B0's pinning inventory test (contents
+   item 2) is extended to require both obligations of every enumerated write
+   entry point: it checks the barrier, and it updates the witness.
 2. That barrier release is a scheduled **pre-U0 deliverable** with an adoption
    gate (see the rollout plan's `B0` unit), not a footnote inside a U-slice.
    No 2.0 binary may migrate a workspace until the barrier version is adopted
    by all 4 external users and all 3 fleet hosts.
 3. **M0 quiescence and capability predicate — the single normative predicate
    (consolidated in v7).** Before publishing its first control, M0 requires,
-   under the complete lock set, **exactly these four conditions and no others**;
+   under the complete lock set, **exactly these five conditions and no others**;
    every other section that mentions an M0 admission condition refers here
    rather than restating a partial list (v6 had two divergent versions of this
    predicate — one including quarantine enumeration, one omitting it — which is
@@ -2129,20 +2253,54 @@ clobber each other's `state.json` today.
      path (§ "Committed quarantine retains deletion authority", which owns the
      reasoning and delegates the predicate to this list);
    - the barrier-capability witness is present and current: the
-     `.rbox/state/last-writer.json` sidecar specified in 1b parses exactly, its
-     recorded `stateDev`/`stateIno` match the live `state.json`, and its
-     `writerVersion` is >= the ratified `1.11.0` downgrade floor. A workspace
-     whose most recent writer predates the barrier is refused until it has been
-     written once by a barrier-capable binary.
-   All four are re-checked immediately before the M6 rename, not only at M0.
-4. **Fixtures (required before U3 may be enabled).** A rig scenario starts a
-   degraded-unlocked legacy writer, suspends it after its state read, runs a
-   full M0–M7 migration to completion, then resumes the writer: with the
-   barrier the writer must fail closed with `StateFormatTooNewError` and leave
-   `Q` byte-identical; without the barrier the same fixture must demonstrably
-   destroy `Q` (the negative control proves the fixture tests something).
-   A second fixture covers two concurrent degraded writers and asserts the
-   refusal, not merely last-writer-wins.
+     `.rbox/state/last-writer.json` sidecar specified in 1b parses exactly, all
+     five of its recorded state fields (`stateBodySha256`, `stateSizeBytes`,
+     `stateMtimeMs`, `stateDev`, `stateIno`) match the live `state.json` under
+     the authority rule stated there, and its `writerVersion` is >= the ratified
+     `1.11.0` downgrade floor. A workspace whose most recent writer predates the
+     barrier is refused until it has been written once by a barrier-capable
+     binary;
+   - **no live legacy writer at all (v8).** Mutual exclusion binds only writers
+     that take the lock, so this condition is established by observation, not by
+     inference from the first bullet: M0 takes the paired sample of the live
+     `state.json` five-field content witness and the `last-writer.json` sidecar,
+     waits a bounded interval, and re-samples. Any state-file change the sidecar
+     does not account for proves a writer that publishes without maintaining the
+     witness is live, and M0 refuses with a typed `legacy-writer-live` refusal.
+     This is the condition that covers the third case named in 1a; the residual
+     it cannot cover — a pre-`1.11.0` writer whose entire window straddles
+     M0 through M6 without publishing — is named and accepted there.
+   All five are re-checked immediately before the M6 rename, not only at M0.
+4. **Fixtures (required before U3 may be enabled) — corrected in v8.** V7
+   specified one fixture that **cannot be constructed**: it started a
+   *degraded-unlocked* legacy writer and then required "a full M0–M7 migration
+   to completion", while bullet 3's first condition refuses to migrate a
+   degraded-unlocked workspace at all. The fixture asserted an outcome the
+   design forbids reaching, so it could only ever have been deleted or
+   quietly weakened by whoever tried to write it. The matrix is now four
+   fixtures, each testing what the machine actually does:
+   - **F1 — the degraded fence does what M0 says.** A degraded-unlocked
+     workspace with a live legacy writer: M0 must refuse with a typed
+     `degraded-fence` refusal, publishing no control and creating no migration
+     artifact. Negative control: with the fence predicate removed, M0 proceeds —
+     proving F1 exercises the fence rather than some unrelated refusal.
+   - **F2 — the real third case, on a lockable filesystem.** A `forceLegacy`
+     writer on a lockable filesystem, suspended after its state read, then a
+     full M0–M7 migration to completion, then the writer resumes. With `B0` the
+     writer must fail closed with `StateFormatTooNewError` and leave `Q`
+     byte-identical — because part one of the closure forces it to hold the
+     state lock, so it cannot even reach its rename while M6 holds that lock,
+     and its post-lock barrier re-read sees `Q`. Negative control: with the
+     barrier and the lock-entry restriction removed, the same fixture must
+     demonstrably destroy `Q`.
+   - **F3 — the named residual, asserted as a known outcome.** F2's shape, but
+     the legacy writer is the published, signed `1.10.x` artifact rather than a
+     `B0` build. The assertion is the *documented* result, not a pass: `Q` is
+     destroyed, and the doctor reports `legacy-overwrite-after-Q` naming the
+     immutable hash-addressed backup. A residual that has a red-to-green fixture
+     cannot silently change into a different residual.
+   - **F4 — concurrency, unchanged from v7.** Two concurrent degraded writers:
+     assert the refusal, not merely last-writer-wins.
 
 The source bytes are retained exactly at the fixed convenience path
 `.rbox/state/legacy-json/pre-163-latest.json.bak` (v6 moved it off
@@ -2334,7 +2492,7 @@ phase about to start. Its phase-specific `witness` closed union is:
 | `M4` | staging physical SHA-256/bytes, `S0`, semantic digest/counts, DDL/application/schema/FK/integrity proof version |
 | `M5` | the same physical witness at active `state.db`, active `S0`, `stagingMain:"absent"`, post-convergence state-parent fsync, and the prebound Q-sibling path/bytes plus its `absent|building|exact` same-phase disposition |
 | `M6` | exact `Q` authority id, Q sibling absent, matching active completion/physical witness, `.rbox` parent fsync, and the closed same-phase cleanup cursor below |
-| `M7` | all migration-id cleanup items `retired`, all non-control artifacts absent/exact-terminal, and every affected parent fsynced |
+| `M7` | all migration-id cleanup items `retired`, all non-control artifacts absent/exact-terminal (with the role-5 inert control temp exact-terminal by definition — see below), and every affected parent fsynced |
 
 All control writes call one helper,
 `publishMigrationControl(expectedMigrationId|"absent",
@@ -2472,7 +2630,7 @@ the **two actual cleanup items**.
 | 2 | staging WAL | `.rbox/state/state.db.migrate.<migrationId>-wal` | absent only | no — asserted | absent (already) |
 | 3 | staging SHM | `.rbox/state/state.db.migrate.<migrationId>-shm` | absent only | no — asserted | absent (already) |
 | 4 | staging main (redundant name after the M5 rename) | `.rbox/state/state.db.migrate.<migrationId>` | absent only | no — asserted | absent (already) |
-| 5 | control publisher temp | `.rbox/state/migration-v1.json.<controlRevision>.tmp` for any revision of this migration id | absent, or exact inert regular temp | no — doctor-only | unchanged by M6/M7; doctor's inert-temp quarantine owns it |
+| 5 | control publisher temp | `.rbox/state/migration-v1.json.<controlRevision>.tmp` for any revision of this migration id | absent, or exact inert regular temp | no — doctor-only | **exact-terminal by definition** (v8): unchanged by M6/M7, and M7's "absent or exact-terminal" predicate is satisfied by that unchanged inert temp; doctor's inert-temp quarantine still owns removal |
 | 6 | prepared halted-M6 sibling | `exactRevisionScopedPath(b+5)` | not yet created at the M6 cleanup start; created by the final-item runway below | no — M7-terminal | the `exact-or-absent-terminal` descriptor already specified; retired by M7 |
 | 7 | generic reserve | the M1-recorded 1 MiB reserve path | `available`, `cleanup-intent`, or `cleanup-absent` | **yes — first** | `retired` |
 | 8 | emergency halt candidate | the M1-recorded id-bound emergency path | `available`, `cleanup-intent`, or `cleanup-absent` | **yes — final** | `retired` |
@@ -2501,6 +2659,24 @@ non-item is a non-item:
   both. A stranded control temp is inert by construction — it never coordinates
   or suppresses anything — so leaving it is safe, and the doctor's existing
   inert-temp path is the one remover.
+
+  **Role 5's terminal disposition, reconciled with M7 (v8).** V7 left role 5
+  doctor-only and stopped there, which contradicted M7's witness requirement
+  that all non-control artifacts be "absent or exact-terminal": an inert
+  publisher temp can survive M6 and M7 unchanged, so a migration could satisfy
+  every phase and still fail its own M7 witness. The resolution is definitional,
+  and it deliberately **widens no classifier**: for a role-5 path, *exact
+  inert temp* **is** the exact-terminal disposition. M7 asserts it by `lstat` of
+  a closed, named set of paths — one per revision in this migration's own
+  published revision range, which the control already records as a bounded
+  monotone integer interval — and requires each to be absent or a regular
+  non-symlink file. No directory discovery is introduced (the cleanup vector's
+  prohibition is untouched), no new artifact role is admitted, and the reset
+  namespace inventory, the C1 retirement vector, and the crash-table `absent`
+  row are all unchanged. The doctor's later inert-temp quarantine remains the
+  only remover, and running it after M7 changes an already-terminal disposition
+  to `absent`, which is the other admitted value — so doctor cleanup can never
+  invalidate a completed M7 witness.
 - **Role 6 does not exist yet when M6 cleanup starts.** It is rendered at
   revision `b+5` by the final item's own runway, i.e. strictly after item 7 has
   been retired and while item 8's intent is durable, and it is retired by M7's
@@ -3667,8 +3843,10 @@ blocking pre-U0 deliverable with an adoption gate rather than a footnote. The
 codex review and the rollout review independently reached this; it is the
 single highest-value change in v6.
 
-**4. Make all U3 migration entry unreachable until U4 reset/quarantine support
-is complete, rather than merely default-off. ADOPTED.** Default-off is a flag;
+**4. Make all U3 migration entry unreachable until U2 reset/quarantine support
+is complete, rather than merely default-off. ADOPTED.** (Heading corrected in
+v8: it said `U4`, while the body below and the gate structure both say `U2` —
+reset is `U2` under the v6 resequencing, and `U4a–U4f` is the engine port.) Default-off is a flag;
 unreachable is a property. U3's migration entry point is compiled behind the
 U2 capability predicate: a build without complete DB-artifact reset/quarantine
 support does not merely decline to migrate, it has no code path that can. This
@@ -3713,8 +3891,11 @@ differential — precisely the risk R4-ROLLOUT B4 identified and could only
 propose to test, not to reduce. Under backend-first the flip lands with the
 engine **byte-identical**: same scan, same reconcile, same apply, same push,
 same wire output, with only the bytes under the seam changed. The wire-visible
-differential at the flip is trivially clean *by construction* rather than by
-testing, and the engine's semantic changes then arrive in six small,
+differential at the flip is therefore the run where a difference is *least
+expected* — which is what makes it the most informative run of the gate, not an
+exemption from it; it is held to the same differential gate as every other
+slice (§ U3, "Differential control"), and the engine's semantic changes then
+arrive in six small,
 independently shippable, independently revertible slices — each of which can be
 reverted, because none of them touches authority.
 
@@ -3804,7 +3985,8 @@ without them:
    its call sites, that count may only decrease, and it must reach zero by
    U4f. The compile-time ban on whole-state access elsewhere applies from U1.
 3. **The differential rig runs per slice, not once.** The flip's differential
-   is clean by construction and is still run as the control; every U4 slice
+   is the run where a difference is least expected, and it is run as the
+   control under the same gate rather than assumed clean; every U4 slice
    then re-runs the same-corpus manifest diff and the two-host rig. This is
    strictly more testing than v5's single differential, spread across smaller
    diffs.
@@ -3871,18 +4053,44 @@ Contents:
    - **Exact path:** `.rbox/state/reserve-1mib.bin`. Fixed, not id-scoped: it
      is generic runway, claimed by whichever migration runs, and `B0` creates
      it long before any migration id exists.
-   - **Creation:** no-follow `O_CREAT|O_EXCL` at mode 0600, write exactly
-     1,048,576 zero bytes, `fsync` the file, `fsync` `.rbox/state`, then lstat
-     and record `{dev,ino,size}`. Creation is attempted once per `B0` startup
-     path and its failure is never fatal to the 1.x binary — a workspace
-     without the reserve is simply a workspace M1 must create it in.
-   - **Collision:** an existing exact regular non-symlink file of exactly
-     1,048,576 bytes is **adopted** (identity recorded, contents irrelevant —
-     it is allocation, not data). Anything else at that path — directory,
-     symlink, device, wrong size, unreadable — is **never deleted and never
-     truncated**: `B0` leaves it and reports it, and M1 refuses with a typed
-     `reserve-foreign` condition. The one thing a fixed-path allocation artifact
-     must not do is delete something it did not create.
+   - **Provenance header (v8) — the reserve says who made it.** The first 64
+     bytes are a fixed-width ASCII provenance header and the remaining 1,048,512
+     bytes are zero fill, so the file is still exactly 1,048,576 bytes and the
+     allocation guarantee is unchanged. The header is the magic string
+     `RBOX-STATE-RESERVE-v1`, one space, the creating binary's semver, one
+     space, the workspace `stream` identity, a newline, NUL-padded to 64 bytes.
+     Without it the protocol was unsound: `B0` adopted *any* same-size regular
+     file, M1 claimed it, and M6 role 7 deleted it — while the same section
+     promises never to delete a path `B0` did not create. A same-size file
+     written by an unrelated tool satisfied every check, so the promise was
+     enforced by nothing.
+   - **Creation:** no-follow `O_CREAT|O_EXCL` at mode 0600, write the 64-byte
+     provenance header followed by exactly 1,048,512 zero bytes, `fsync` the
+     file, `fsync` `.rbox/state`, then lstat and record
+     `{dev,ino,size,creatingVersion,stream}`. Creation is attempted once per
+     `B0` startup path and its failure is never fatal to the 1.x binary — a
+     workspace without the reserve is simply a workspace M1 must create it in.
+   - **Collision:** a path is **adoptable** only if it is a regular non-symlink
+     file of exactly 1,048,576 bytes **and** its first 64 bytes parse as the
+     provenance header with a well-formed creating version and a `stream` equal
+     to this workspace's. Such a file is adopted (identity and header fields
+     recorded; the zero fill is allocation, not data). **Anything else at that
+     path is `reserve-foreign`** — directory, symlink, device, wrong size,
+     unreadable, header absent, header malformed, or header naming a different
+     workspace. A `reserve-foreign` path is **never adopted, never claimed,
+     never truncated, and never deleted, by `B0`, by M1, or by M6.** `B0` halts
+     its reserve creation/adoption with the distinct typed `reserve-foreign`
+     condition and reports it (halting the reserve protocol only — as above,
+     never fatal to the 1.x binary), and M1 refuses migration with the same
+     typed condition. The one thing a fixed-path allocation artifact must not do
+     is delete something it did not create, and after v8 that is a property of
+     the bytes rather than a sentence in this document.
+   - **Deletion is header-gated.** M6 role 7 re-reads the 64-byte header
+     immediately before unlinking and requires it to match the header fields M1
+     CAS-recorded into the control. A mismatch is a `reserve-foreign` corruption
+     halt with zero writes, on the same footing as every other artifact-behind
+     observation — so the one deleting step in the reserve's life cannot delete
+     a file that replaced the one M1 claimed.
    - **Pre-M0 inventory disposition:** the reserve exists on every barrier-era
      1.x workspace, including ones that never migrate. It is a named, known
      member of `.rbox/state/` — enumerated by the journal-independent reset
@@ -3905,8 +4113,8 @@ be written):
   aggregate version telemetry the fleet already reports;
 - baked for at least two weeks of ordinary fleet use with zero
   barrier-related incidents;
-- the degraded-writer fixture pair from the closure above passes, including
-  its negative control.
+- the degraded/legacy-writer fixture matrix `F1`–`F4` from the closure above
+  passes, including both negative controls.
 
 ### U0 — entry interning (no gate)
 
@@ -4152,7 +4360,9 @@ One input is genuinely still owed and is named as such rather than invented.
   founder and recorded in this section before the first U5 measurement. Nothing
   else in this list is meaningful without it: the same code will pass on one
   fleet host and fail on another. This is the one open input of the kill
-  criterion.
+  criterion, and it is **open input 2 of 2** in the document's list at the top
+  (§ "OPEN INPUTS OWED BY THE FOUNDER") — v7 omitted it there while marking it
+  owed and blocking here, which made the top-of-document count wrong.
 - **Warmup and sampling.** Each latency figure is 100 consecutive trusted
   `rbox status` invocations against a settled daemon, after 10 discarded warmup
   invocations, on an unmodified workspace with the LOCAL plane complete;
@@ -4352,7 +4562,28 @@ claimed** — that is why the first row of this table is about the log itself.
 | 11 — "clean by construction" overstates the flip | **Weakened to the document's own differential-gate framing.** The engine is byte-identical but the backend, codecs, CAS admission, and reset conversion all change underneath it; the flip is the run where a difference is least expected, not one that is exempt. |
 | 12 — superseded U2 numbering, U5 ship criterion, branch language | **Swept.** Review-log rows renumbered with their v5 origin noted, the U5 criterion now says per-slice differential, the `apply.ts` churn paragraph attributes the rewrite to U4a–U4f, and the branch model is corrected to `2.0 = U0 → U3` with `B0` on `main` and `U4a–U4f` landing on `main` as 2.x. |
 
-V7 remains pending final ratification and is not implementation authority. The
-single open question at the top of this document — whether the four external
-users take the one-way migration before the latency and memory wins land — is
-the only input still owed.
+V7 remained pending final ratification and was not implementation authority. Its
+closing claim that the migration-timing question was "the only input still owed"
+is corrected by v8 row 7 below: the frozen machine profile was a second owed
+input the whole time.
+
+## R4-v8 residual fold (v8)
+
+One review: the codex serial review of the v7 tip, 2026-07-28. Seven residuals,
+closed below. Two of them (rows 1 and 7) are places where v7 *asserted* a
+closure — "there is no third case", "exactly one input remains" — that its own
+normative text does not support; consistent with the standing rule, v8 fixes the
+sections rather than the claims.
+
+| Residual | Disposition in v8 |
+|---|---|
+| 1 — the `B0` third case is real: a writer whose unlocked window opened before degradation was recorded or before `Q` landed stays unlocked across its own check→rename on a lockable filesystem; and the required degraded-writer fixture is unreachable | **Named, not argued away, and closed as far as it can be.** V7's premise ("degradation is a filesystem-capability property") was false: `writeWholeStateUnsafe` is reached by `unsupported` locking **or** `forceLegacy`, and only the first is a filesystem property. Part one makes it true — `B0` may enter the unlocked path **only** on `acquireLock` returning `unsupported`; `forceLegacy`, transient acquisition failure, and expired/stolen leases each become a typed refusal to publish — which collapses every B0-era instance into the serialized case. Part two extends M0's predicate to a fifth condition, **no live legacy writer at all**, established by a paired bounded-interval sample of the five-field state content witness and the sidecar, refusing `legacy-writer-live`, re-taken before the M6 rename. The irreducible residual (a pre-`1.11.0` writer meeting four simultaneous preconditions) is **accepted and named** with its bound-by-bound discussion and an after-the-fact `legacy-overwrite-after-Q` detection. Fixtures rebuilt as `F1`–`F4`: v7's fixture required a full M0–M7 on a degraded-unlocked workspace that M0 refuses, so `F1` now tests the refusal, `F2` tests the real third case on a lockable filesystem with a negative control, `F3` asserts the named residual as a known outcome, `F4` is v7's concurrency fixture. |
+| 2 — the last-writer witness binds to `dev`/`ino`, which atomic replacement plus inode reuse defeats | **Bound to content.** The sidecar schema gains `stateBodySha256`, `stateSizeBytes`, and `stateMtimeMs`. Authority is stated so it cannot be chosen differently: the body hash and size are **authoritative**; `dev`/`ino`/`mtime` are corroborating and diagnostic. All five must match, failing closed either way — a body match with an identity mismatch is `barrier-witness-identity-drift`, and no path anywhere admits a witness on identity alone. `.rbox/state.json` carries no preamble, so its body and physical hashes coincide; the M2 body-vs-physical distinction stays scoped to preamble-prefixed backups. |
+| 3 — M7's "all non-control artifacts absent or exact-terminal" contradicts role 5, whose inert temp can survive M6/M7 unchanged | **Resolved definitionally, widening no classifier.** For a role-5 path, *exact inert temp* **is** the exact-terminal disposition. M7 asserts it by `lstat` over a closed named set — one path per revision in this migration's own recorded revision interval — so no directory discovery enters (the cleanup vector's prohibition is untouched) and no new role is admitted. Doctor inert-temp quarantine remains the only remover, and it moves the path to `absent`, the other admitted value, so post-M7 cleanup can never invalidate a completed witness. |
+| 4 — the reserve has no provenance: `B0` adopts any same-size file, M1 claims it, M6 deletes it, against a promise never to delete what `B0` did not create | **Provenance added to the bytes.** The first 64 bytes are a fixed-width ASCII header (`RBOX-STATE-RESERVE-v1 <creatingVersion> <stream>`, NUL-padded) with 1,048,512 zero bytes after it — same total size, same allocation guarantee. Adoption requires the header to parse and its `stream` to equal this workspace's; header absent, malformed, or foreign-workspace is `reserve-foreign`, which is **never adopted, claimed, truncated, or deleted** by `B0`, M1, or M6. `B0` halts its reserve protocol with that distinct typed condition; M6 role 7 re-reads and re-matches the header immediately before unlinking, and a mismatch is a corruption halt with zero writes. |
+| 5 — the flip is still called "trivially clean by construction" | **Swept to the differential-gate framing.** Both surviving sites — the backend-first decisive-argument paragraph and rollout condition 3 — now say the flip is the run where a difference is *least expected*, held to the same gate as every other slice, rather than exempt from it. The remaining "by construction" occurrences are unrelated (an inert temp, a behavior-not-implementation test). |
+| 6 — a heading gates U3 on "U4 reset/quarantine support" while its body says U2 | **Heading corrected to `U2`,** with the correction noted inline: reset is `U2` under the v6 resequencing and `U4a–U4f` is the engine port. |
+| 7 — the doc claims exactly one open founder input; the frozen machine profile is a second | **Count corrected at the top.** The section is now "OPEN INPUTS OWED BY THE FOUNDER (v8 — there are exactly two)", naming the migration-timing question and the frozen machine profile, and declaring itself the authority on the count. The kill-criterion protocol's own paragraph now cross-references it as open input 2 of 2, so the frozen/owed status reads the same from both directions. |
+
+V8 remains pending final ratification and is not implementation authority. Two
+founder inputs are owed, both enumerated at the top of this document.
