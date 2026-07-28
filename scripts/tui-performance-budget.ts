@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
-import { resolveRigBinaryOverride } from "./rig/lib/binary.js";
+import { resolveRigBinaryPaths } from "./rig/lib/binary.js";
 
 interface Sample {
   wallMs: number;
@@ -61,8 +61,8 @@ function measure(binary: string, cwd: string, args: readonly string[], expectedE
   return { wallMs, rssBytes: Number(match[1]) * (isDarwin ? 1 : 1024) };
 }
 
-const baseline = resolveRigBinaryOverride({ binary: process.argv[2] });
-const candidate = resolveRigBinaryOverride({ binary: process.argv[3] });
+const baseline = resolveRigBinaryPaths({ binary: process.argv[2] }).a;
+const candidate = resolveRigBinaryPaths({ binary: process.argv[3] }).a;
 if (!baseline || !candidate || process.argv.length !== 4) {
   throw new Error("usage: bun scripts/tui-performance-budget.ts /absolute/baseline/rbox /absolute/candidate/rbox");
 }
