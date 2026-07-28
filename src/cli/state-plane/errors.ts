@@ -39,3 +39,62 @@ const REFUSAL_MESSAGES: Record<StateWriteRefusalReason, string> = {
   "state-lock-lease-lost": "this folder's sync-record lock was lost mid-save; refusing to publish",
   "state-unlocked-foreign-target": "this folder's sync records are not in a format this rbox wrote; refusing to replace them",
 };
+
+export type StateStoreOpenReason =
+  | "not-a-database"
+  | "corrupt"
+  | "foreign-by-absence"
+  | "wrong-application"
+  | "wrong-schema-version"
+  | "ddl-fingerprint"
+  | "structural-invariant";
+
+/** Stable refusal for a database that cannot safely be treated as this
+ * version's state authority. The original SQLite error remains available. */
+export class StateStoreOpenError extends Error {
+  readonly name = "StateStoreOpenError";
+
+  constructor(
+    readonly reason: StateStoreOpenReason,
+    readonly file: string,
+    detail: string,
+    readonly cause?: unknown,
+  ) {
+    super(`cannot open state store ${file}: ${detail}`, { cause });
+  }
+}
+
+export class CursorWindowError extends Error {
+  readonly name = "CursorWindowError";
+  constructor(readonly kind: "file" | "repo" | "git" | "chain", readonly requested: number, readonly maximum: number) {
+    super(`${kind} cursor window ${requested} exceeds maximum ${maximum}`);
+  }
+}
+
+export class SnapshotChangedError extends Error {
+  readonly name = "SnapshotChangedError";
+  constructor() {
+    super("state snapshot changed during projection; discard every emitted page and retry");
+  }
+}
+
+export class FileEntryOversizeError extends Error {
+  readonly name = "FileEntryOversizeError";
+  constructor(readonly path: string, readonly canonicalBytes: number, readonly retainedEstimate: number) {
+    super(`file entry ${path} exceeds state-store limits (${canonicalBytes} canonical, ${retainedEstimate} retained bytes)`);
+  }
+}
+
+export class RepoRecordOversizeError extends Error {
+  readonly name = "RepoRecordOversizeError";
+  constructor(readonly relPath: string, readonly canonicalBytes: number, readonly retainedEstimate: number) {
+    super(`repository record ${relPath} exceeds state-store limits (${canonicalBytes} canonical, ${retainedEstimate} retained bytes)`);
+  }
+}
+
+export class GitSectionOversizeError extends Error {
+  readonly name = "GitSectionOversizeError";
+  constructor(readonly relPath: string, readonly bytes: number) {
+    super(`Git section ${relPath} exceeds the 4 MiB cursor row ceiling (${bytes} bytes)`);
+  }
+}

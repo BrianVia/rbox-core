@@ -1,0 +1,81 @@
+import type { Database } from "bun:sqlite";
+import { canonicalJson } from "../digest/codecs.js";
+import { SCHEMA_V1_DDL } from "./v1.js";
+
+export const STATE_STORE_APPLICATION_ID = "rbox-state-plane";
+export const STATE_STORE_SCHEMA_VERSION = 1;
+export const STATE_STORE_DDL_FINGERPRINT = "4d2a960d759fad3a1ce3367b45b24f4b0c91a85c7f0a75025979a0db38e9e4d3";
+
+export interface GenesisLineage {
+  stream: string;
+  authorityId: string;
+  lineageId: string;
+  createdBy: string;
+  stateNonce?: string;
+  stateRevision?: number;
+  telemetryBindingId?: string;
+}
+
+export function applySchemaV1(db: Database, genesis: GenesisLineage): void {
+  if (!/^[0-9a-f]{32}$/.test(genesis.authorityId)) throw new TypeError("authorityId must be lowercase hex32");
+  if (!/^[0-9a-f]{32}$/.test(genesis.lineageId)) throw new TypeError("lineageId must be lowercase hex32");
+  if (!genesis.stream || Buffer.byteLength(genesis.stream) > 4096) throw new TypeError("stream must be nonempty bounded text");
+  if (!genesis.createdBy || Buffer.byteLength(genesis.createdBy) > 256) throw new TypeError("createdBy must be nonempty bounded text");
+  if (genesis.stateNonce !== undefined && !/^[0-9a-f]{32}$/.test(genesis.stateNonce)) throw new TypeError("stateNonce must be lowercase hex32");
+  if (genesis.stateRevision !== undefined && (!Number.isSafeInteger(genesis.stateRevision) || genesis.stateRevision < 0)) {
+    throw new TypeError("stateRevision must be a nonnegative safe integer");
+  }
+  if (genesis.telemetryBindingId !== undefined && !/^[0-9a-f]{16}$/.test(genesis.telemetryBindingId)) {
+    throw new TypeError("telemetryBindingId must be lowercase hex16");
+  }
+  const initialize = db.transaction(() => {
+    db.exec(SCHEMA_V1_DDL);
+    db.query(`INSERT INTO state_lineage(
+      lineage_id,stream,state_nonce,state_revision,last_synced_sequence,
+      active_base_generation,local_revision,telemetry_binding_id,
+      repo_records_authoritative,extras_cjson
+    ) VALUES (?,?,?,?,0,0,0,?,1,NULL)`).run(
+      genesis.lineageId,
+      genesis.stream,
+      genesis.stateNonce ?? null,
+      genesis.stateRevision ?? null,
+      genesis.telemetryBindingId ?? null,
+    );
+    db.query(`INSERT INTO store_meta(
+      singleton,application_id,schema_version,ddl_fingerprint,authority_id,active_lineage_id,created_by
+    ) VALUES (1,?,?,?,?,?,?)`).run(
+      STATE_STORE_APPLICATION_ID,
+      STATE_STORE_SCHEMA_VERSION,
+      STATE_STORE_DDL_FINGERPRINT,
+      genesis.authorityId,
+      genesis.lineageId,
+      genesis.createdBy,
+    );
+    const head = db.prepare(`INSERT INTO plane_heads(
+      lineage_id,plane,generation,generated_at,manifest_schema,source_sequence,trust_epoch,complete,extras_cjson
+    ) VALUES (?,?,0,'',NULL,?,NULL,?,NULL)`);
+    head.run(genesis.lineageId, "base", 0, 1);
+    // LOCAL starts incomplete: no full filesystem scan has established a
+    // trust epoch for this new lineage.
+    head.run(genesis.lineageId, "local", null, 0);
+    head.finalize();
+    db.query(`INSERT INTO migration_completion(
+      singleton,origin_kind,migration_id,importer_version,authority_id,
+      source_json_sha256,source_semantic_digest,source_bytes,source_shape_flags_cjson,
+      source_repo_records_present,entry_count,repo_count,per_table_counts_cjson,completed_at
+    ) VALUES (1,'genesis',?,?,?,NULL,NULL,NULL,?,0,0,0,?,?)`).run(
+      `genesis:${genesis.lineageId}`,
+      genesis.createdBy,
+      genesis.authorityId,
+      canonicalJson({
+        stream: true,
+        stateNonce: genesis.stateNonce !== undefined,
+        stateRevision: genesis.stateRevision !== undefined,
+        lastSyncedManifest: { manifestSchema: false, gitRepos: false },
+      }),
+      canonicalJson({ entry_values: 0, plane_entries: 0, repo_records: 0 }),
+      new Date().toISOString(),
+    );
+  });
+  initialize();
+}

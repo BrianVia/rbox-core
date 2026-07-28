@@ -137,6 +137,10 @@ test("design 130 persisted BASE and branch-origin writes are a closed allowlist"
     // Design 177 retains read-only oracle proof inputs named `base`; BASE writes
     // still route only through the composer/state transitions guarded below.
     "src/cli/git/resolve-command.ts": 9,
+    // U1a's unwired SQLite codec exhaustively maps the existing RepoRecord
+    // shape; it has no authority-write call site.
+    "src/cli/state-plane/codecs/coverage.ts": 2,
+    "src/cli/state-plane/codecs/repo-record.ts": 2,
     "src/cli/sync-git/apply.ts": 24,
     "src/cli/sync-git/base-composer.ts": 2,
     "src/cli/sync-git/follow.ts": 1,
