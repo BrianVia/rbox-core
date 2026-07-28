@@ -121,6 +121,15 @@ export type ManualBranchDecision =
 export type ComposeRepoBaseAuthority =
   | ({ kind: "pull-ref-transaction" } & ProofAuthorityBase)
   | ({ kind: "pull-carry"; lineageHash: string; incomingKey?: string })
+  /**
+   * A published checkout whose landing was verified against the live repository
+   * before this proof was built (see recoverAndLandFollowJournal). The witness
+   * is not a stored claim but the refs actually on disk, carried here as
+   * `observedRefs`; composition installs exactly a candidate ref that matches
+   * its observation and holds anything else. Nothing about this is blanket — it
+   * can only install what a real repository was seen to hold.
+   */
+  | ({ kind: "observed-landing"; lineageHash: string; observedRefs: Readonly<Record<string, string>> })
   | ({ kind: "journal-recovery"; journalId: string } & ProofAuthorityBase)
   | {
       kind: "publisher-ack";
@@ -333,7 +342,7 @@ function incomingBoundaryMatches(authority: ComposeRepoBaseAuthority, lockedProo
 }
 
 function proofIdentity(authority: ComposeRepoBaseAuthority): { lineageHash: string; repositoryIdentityHash?: string } {
-  return authority.kind === "pull-carry" || authority.kind === "migration"
+  return authority.kind === "pull-carry" || authority.kind === "migration" || authority.kind === "observed-landing"
     ? { lineageHash: authority.lineageHash }
     : { lineageHash: authority.lineageHash, repositoryIdentityHash: authority.repositoryIdentityHash };
 }
@@ -346,6 +355,7 @@ function authorityExhaustive(authority: ComposeRepoBaseAuthority): void {
     case "publisher-ack":
     case "manual":
     case "p-repair":
+    case "observed-landing":
     case "migration": return;
     default: {
       const neverAuthority: never = authority;
@@ -380,6 +390,13 @@ export function composeRepoBase(
     if (authority.kind === "pull-carry") {
       after = before;
       if (requested !== before) holds.push({ ref, code: "missing-branch-proof" });
+    } else if (authority.kind === "observed-landing") {
+      // Install exactly what the verified observation saw at this ref; a
+      // candidate that claims anything the observation did not is held.
+      if (requested !== (authority.observedRefs[ref] ?? null)) {
+        after = before;
+        holds.push({ ref, code: "missing-branch-proof" });
+      }
     } else if (authority.kind === "migration") {
       if (before !== null && requested === null) {
         after = before;
@@ -535,6 +552,14 @@ export function composeRepoBase(
       holds.push({ ref, code: "missing-safe-ref-proof" });
       continue;
     }
+    if (authority.kind === "observed-landing") {
+      // Same rule as branches: a safe ref installs only at its observed value.
+      if ((authority.observedRefs[ref] ?? null) !== after) {
+        safeRefsValid = false;
+        holds.push({ ref, code: after === null ? "missing-safe-ref-proof" : "mismatched-safe-ref-proof" });
+      }
+      continue;
+    }
     if (lockedProof.repoKind !== "dir" || lockedProof.effectiveRefScope !== "all") {
       safeRefsValid = false;
       holds.push({ ref, code: "scope-refused" });
@@ -600,6 +625,22 @@ export function composeRepoBase(
 export function carryRepoBaseProof(lineageHash = "legacy-untrusted"): RepoBaseProof {
   return {
     authority: { kind: "pull-carry", lineageHash },
+    lockedProof: { repoKind: "dir", effectiveRefScope: "all", checkoutComplete: true, branches: {}, safeRefs: {} },
+  };
+}
+
+/**
+ * A proof for a checkout landing that was verified against the live repository.
+ * `observedRefs` is the exact ref set read off disk after the checkout; the
+ * composer installs a candidate ref only where it matches that observation, so
+ * the proof can never install anything the repository was not seen to hold.
+ */
+export function observedLandingRepoBaseProof(
+  observedRefs: Readonly<Record<string, string>>,
+  lineageHash = "legacy-untrusted",
+): RepoBaseProof {
+  return {
+    authority: { kind: "observed-landing", lineageHash, observedRefs },
     lockedProof: { repoKind: "dir", effectiveRefScope: "all", checkoutComplete: true, branches: {}, safeRefs: {} },
   };
 }

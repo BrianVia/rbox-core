@@ -4,12 +4,10 @@ import type { ConfigStatToken } from "../engine/git/config-txn.js";
 import { sanitizeGitSectionForPersistence } from "../engine/git/config-sync.js";
 import {
   composeRepoBase,
-  recordOriginLineage,
   type BranchBaseOrigin,
   type RepoBaseProof,
 } from "./sync-git/base-composer.js";
 import { provisionalRepoBaseProof } from "./sync-git/base-proof-selection.js";
-import { migrationRepoBaseProof, withLegacyBaseAdoption } from "./state-plane/migration/base-proof.js";
 import {
   applyStateSavePacket,
   DEFERRAL_LANES,
@@ -524,15 +522,13 @@ export async function savePublishedRepoIntent(
     if (Object.keys(deferrals).length) merged.deferrals = deferrals; else delete merged.deferrals;
     merged.sourceSeq = Math.max(currentInput.sourceSeq, intended.record.sourceSeq);
     const previousValue = { base: currentInput.base, branchBaseOrigins: currentInput.branchBaseOrigins };
-    // A published-checkout journal that carries a proof supplies real witnessed
-    // authority. One that carries none is a legacy v1.7.24 journal — written
-    // before the proof system — whose branch switch already completed on disk;
-    // adopting that materialized checkout is legacy adoption, not an ordinary
-    // write, so it installs under blanket authority behind the capability below.
-    const legacyAdoption = intended.baseProof === undefined;
-    const baseProof = legacyAdoption
-      ? migrationRepoBaseProof(recordOriginLineage(currentInput.branchBaseOrigins) ?? "legacy-untrusted")
-      : provisionalRepoBaseProof(relPath, intended.baseProof, previousValue);
+    // Authority comes only from the proof the caller supplies. A published
+    // checkout that verified its landing against disk supplies an observed-
+    // landing proof (see recoverAndLandFollowJournal) that installs the refs it
+    // observed; a caller with no proof — including a legacy journal whose
+    // landing could not be confirmed — falls to carry, which holds. Missing
+    // proof is never on its own a signal to install anything.
+    const baseProof = provisionalRepoBaseProof(relPath, intended.baseProof, previousValue);
     const composed = composeRepoBase(
       previousValue,
       { base: merged.base, branchBaseOrigins: merged.branchBaseOrigins },
@@ -557,18 +553,12 @@ export async function savePublishedRepoIntent(
       await saveStateUnsafeLegacyOrTest(root, next);
       return { state: next, disposition: superseded ? "superseded" : "landed" };
     }
-    const packet = {
+    const result = await applyStateSavePacket(root, {
       expectedStream: currentSnapshot.stream,
       expectedNonce: expectedStateNonce(currentSnapshot),
       sourceGlobalSeq: merged.sourceSeq,
       repos: [{ relPath, expectedRepoGen: current.repoGen, newRecord: merged, baseProof }],
-    };
-    // The store refuses blanket authority except from this one confined caller,
-    // which enters the adoption scope only for a proofless (legacy) journal.
-    const result = legacyAdoption
-      ? await withLegacyBaseAdoption((legacyBaseAdoption) =>
-          applyStateSavePacket(root, packet, { legacyBaseAdoption }))
-      : await applyStateSavePacket(root, packet);
+    });
     if (result.status === "accepted") {
       return { state: result.state, disposition: superseded ? "superseded" : "landed" };
     }

@@ -17,7 +17,7 @@ import {
   type RepoBaseProof,
   type SafeRefWitness,
 } from "./sync-git/base-composer.js";
-import { adoptLegacyManifestRepoBase, type LegacyBaseAdoptionCapability } from "./state-plane/migration/base-proof.js";
+import { adoptLegacyManifestRepoBase } from "./state-plane/migration/base-proof.js";
 
 /** Last point this device and the server agreed on — the reconcile base.
  *  The three `git*` maps are LOCAL-ONLY (design 43 §11): they never ride a manifest
@@ -348,10 +348,6 @@ export interface StateSaveOptions {
   /** Complete-reset fence already owns both the protocol state class and the
    * physical state lock. The writer must assert and reuse it, never re-enter. */
   heldLock?: OwnedLock;
-  /** Present only on the confined legacy published-checkout recovery, which is
-   * permitted to install blanket `migration` BASE authority. Obtainable solely
-   * inside `withLegacyBaseAdoption`; an ordinary packet write cannot supply it. */
-  legacyBaseAdoption?: LegacyBaseAdoptionCapability;
 }
 
 export const MAX_LEGACY_GIT_SIDECAR_REPOS = MAX_GIT_REPOS;

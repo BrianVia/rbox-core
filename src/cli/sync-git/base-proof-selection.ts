@@ -65,12 +65,12 @@ const carriedFrom = (previous: RepoBaseValue): RepoBaseProof =>
  *
  * Unlike a proofless BASE move, this is never a staleness artifact — the
  * authority a caller names does not depend on how old its snapshot is — so both
- * seams refuse it, except the one confined legacy-adoption caller that presents
- * `permitBlanket` (a v1.7.24 published-checkout recovery installing a completed
- * on-disk checkout).
+ * seams refuse it. Blanket authority never reaches these seams: it is confined
+ * to the SQLite migration importer, and the legacy published-checkout recovery
+ * installs from an observed-landing proof, not from blanket authority.
  */
-function refuseBlanketAuthority(relPath: string, supplied: RepoBaseProof, permitBlanket: boolean): void {
-  if (supplied.authority?.kind === "migration" && !permitBlanket) {
+function refuseBlanketAuthority(relPath: string, supplied: RepoBaseProof): void {
+  if (supplied.authority?.kind === "migration") {
     throw new ProoflessBaseError(
       relPath,
       "blanket migration authority is reserved for legacy import and may not authorize a state write",
@@ -84,7 +84,7 @@ export function provisionalRepoBaseProof(
   previous: RepoBaseValue,
 ): RepoBaseProof {
   if (supplied === undefined) return carriedFrom(previous);
-  refuseBlanketAuthority(relPath, supplied, false);
+  refuseBlanketAuthority(relPath, supplied);
   return supplied;
 }
 
@@ -93,12 +93,9 @@ export function requireRepoBaseProof(
   supplied: RepoBaseProof | undefined,
   previous: RepoBaseValue,
   candidate: RepoBaseValue,
-  /** The confined legacy-adoption path (see withLegacyBaseAdoption) is the one
-   * caller allowed to install blanket authority through this store. */
-  permitBlanket = false,
 ): RepoBaseProof {
   if (supplied !== undefined) {
-    refuseBlanketAuthority(relPath, supplied, permitBlanket);
+    refuseBlanketAuthority(relPath, supplied);
     return supplied;
   }
   if (!baseSemanticallyUnchanged(previous, candidate)) {

@@ -350,6 +350,36 @@ test("v1.7.24 published branch switch lands through pull and never enters recove
   expect(logs.some((line) => line.includes("deferred"))).toBe(false);
 });
 
+test("a published journal whose intended record claims a ref never on disk cannot install it", async () => {
+  // Findings 2/3 regression: a forged or stale published journal must not
+  // install unmaterialized BASE. The fixture only ever checks out main+incoming;
+  // the intended record additionally claims refs/heads/evil, which no repository
+  // was ever seen to hold. Recovery composes BASE from the refs actually on disk,
+  // so the fabricated ref is held, never recorded.
+  const { oldOid, newOid } = await history();
+  const cfg = upgradeConfig();
+  const previous = oldSection(oldOid);
+  await installUpgradeState(previous, cfg);
+  const evilOid = "d".repeat(40);
+  const fixture = await writeV1724BranchSwitchFixture({
+    workspaceRoot: root, relPath: "repo", repoDir: repo, binding,
+    oldOid, newOid, point: "published", intended: intendedRecord(
+      incoming("ref: refs/heads/incoming", {
+        "refs/heads/main": oldOid, "refs/heads/incoming": newOid, "refs/heads/evil": evilOid,
+      }),
+      previous,
+    ),
+  });
+
+  expect(JSON.parse(fixture.raw).phase).toBe("published");
+  await pull(root, cfg, { remote: staticRemote(fixture.incoming) });
+
+  const saved = await loadState(root, syncStreamId(cfg));
+  // The fabricated ref never reaches BASE — the observed-landing witness held it.
+  expect(repoRecordsForState(saved).repo?.base?.refs?.["refs/heads/evil"]).toBeUndefined();
+  expect(await runGit(repo, "rev-parse", "--verify", "--quiet", "refs/heads/evil").catch(() => "")).toBe("");
+});
+
 test("intent recovery restores exact index, nested op-state, attached ref/HEAD, and wiped refs", async () => {
   const { oldOid, newOid } = await history();
   await runGit(repo, "tag", "pre-wipe", oldOid);
@@ -577,6 +607,7 @@ test("published journal keeps checkout and returns opaque intended data for a fr
     status: "keep",
     intended,
     incomingKey: "incoming-key-1",
+    observedRefs: { "refs/heads/main": oldOid },
     journalPath: checkoutJournalDir(root, "repo"),
   });
   expect(await fs.readFile(path.join(checkoutJournalDir(root, "repo"), "journal.json"), "utf8")).toContain('"phase": "published"');
@@ -657,7 +688,7 @@ test("design 126 write crash after journal.id but before journal.json is not a p
 
 test("design 126 clear crash after journal.id unlink keeps published JSON authoritative", async () => {
   const intended = { crashWindow: "json-only" };
-  const { journal, journalPath } = await writtenJournal(intended);
+  const { oldOid, journal, journalPath } = await writtenJournal(intended);
   await markCheckoutJournalPublished(root, "repo");
   await fs.rm(path.join(journalPath, "journal.id"));
   await fs.writeFile(path.join(gitDir, "ORIG_HEAD.lock"), journal.journalId);
@@ -666,6 +697,7 @@ test("design 126 clear crash after journal.id unlink keeps published JSON author
     status: "keep",
     intended,
     incomingKey: "incoming-key-1",
+    observedRefs: { "refs/heads/main": oldOid },
     journalPath,
   });
   await expect(fs.access(path.join(gitDir, "ORIG_HEAD.lock"))).rejects.toThrow();
