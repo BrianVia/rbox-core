@@ -9,6 +9,7 @@ import type { GitSection } from "../types.js";
 import {
   enumerateStashReflogOids,
   incomingOwnershipRoots,
+  legacyPartitionOwnedByIncomingForTest,
   noDropProof,
   partitionOwnedByIncoming,
   tipOwnedByIncoming,
@@ -114,8 +115,8 @@ describe("fail-closed reachability proofs", () => {
     await git("checkout", "-qb", "local", base);
     const local = await commit("local.txt", "local\n");
     const tips = [base, local, tagTip];
-    const expected = await Promise.all(tips.map((tip) => tipOwnedByIncoming(repo, tip, [incoming])));
-    expect(await partitionProofs(repo, tips, [incoming])).toEqual(expected);
+    const expected = await legacyPartitionOwnedByIncomingForTest(repo, tips, [incoming]);
+    expect(await partitionOwnedByIncoming(repo, tips, [incoming])).toEqual(expected);
   });
 
   test("duplicate raw tips and distinct tags peeling to one commit retain positional proofs", async () => {
@@ -138,11 +139,11 @@ describe("fail-closed reachability proofs", () => {
     const local = await commit("local.txt", "local\n");
     const missing = "f".repeat(40);
     const tips = [base, local, missing];
-    expect(await partitionProofs(repo, tips, [incoming])).toEqual(
-      await Promise.all(tips.map((tip) => tipOwnedByIncoming(repo, tip, [incoming]))),
+    expect(await partitionOwnedByIncoming(repo, tips, [incoming])).toEqual(
+      await legacyPartitionOwnedByIncomingForTest(repo, tips, [incoming]),
     );
-    expect(await partitionProofs(repo, [base, local], [missing])).toEqual(
-      await Promise.all([base, local].map((tip) => tipOwnedByIncoming(repo, tip, [missing]))),
+    expect(await partitionOwnedByIncoming(repo, [base, local], [missing])).toEqual(
+      await legacyPartitionOwnedByIncomingForTest(repo, [base, local], [missing]),
     );
   });
 
@@ -179,16 +180,17 @@ describe("fail-closed reachability proofs", () => {
     const incoming = await commit("incoming.txt", "incoming\n");
     await git("checkout", "-qb", "local", base);
     const local = await commit("local.txt", "local\n");
-    let failed = false;
+    const oracle = await legacyPartitionOwnedByIncomingForTest(repo, [local], [incoming]);
+    let batchWalkFailures = 0;
     setGitSpawnObserver((_root, args) => {
-      if (!failed && args[0] === "rev-list" && args.includes("--stdin") && !args.includes("--quiet")) {
-        failed = true;
+      if (batchWalkFailures === 0 && args[0] === "rev-list" && args.includes("--stdin") && !args.includes("--quiet")) {
+        batchWalkFailures++;
         throw new Error("forced ownership walk failure");
       }
     });
-    expect(await partitionOwnedByIncoming(repo, [local], [incoming])).toEqual([
-      { tip: local, commit: local, proof: { status: "unowned" } },
-    ]);
+    expect(await partitionOwnedByIncoming(repo, [local], [incoming])).toEqual(oracle);
+    expect(oracle).toEqual([{ tip: local, commit: local, proof: { status: "unowned" } }]);
+    expect(batchWalkFailures).toBe(1);
   });
 
   test("a shallow store gives every batched tip the legacy marker", async () => {
@@ -198,9 +200,53 @@ describe("fail-closed reachability proofs", () => {
     await exec("git", ["clone", "-q", "--depth", "1", `file://${repo}`, shallowRepo], { env: TEST_GIT_ENV });
     const shallowTip = await gitAt(shallowRepo, "rev-parse", "HEAD");
     expect(shallowTip).toBe(sourceTip);
-    expect(await partitionProofs(shallowRepo, [shallowTip], [shallowTip])).toEqual([
-      await tipOwnedByIncoming(shallowRepo, shallowTip, [shallowTip]),
-    ]);
+    expect(await partitionOwnedByIncoming(shallowRepo, [shallowTip], [shallowTip])).toEqual(
+      await legacyPartitionOwnedByIncomingForTest(shallowRepo, [shallowTip], [shallowTip]),
+    );
+  });
+
+  test("batched ownership is a full-entry differential of the legacy oracle across varied topologies", async () => {
+    const base = await commit("base.txt", "base\n");
+    const incoming = await commit("incoming.txt", "incoming\n");
+    await git("tag", "-a", "incoming-tag", incoming, "-m", "incoming tag");
+    const incomingTag = await git("rev-parse", "refs/tags/incoming-tag");
+    await git("tag", "-a", "base-tag", base, "-m", "base tag");
+    const baseTag = await git("rev-parse", "refs/tags/base-tag");
+    await git("checkout", "-qb", "local", base);
+    const local = await commit("local.txt", "local\n");
+    await fs.writeFile(path.join(repo, "local.txt"), "stash work\n");
+    await git("stash", "push", "-qm", "differential stash");
+    const stash = await git("rev-parse", "refs/stash");
+    const missing = "f".repeat(40);
+    const cases: Array<{ tips: string[]; roots: string[] }> = [
+      { tips: [base, local, base, baseTag], roots: [incoming] },
+      { tips: [base, local], roots: [incomingTag] },
+      { tips: [base, local, stash], roots: [stash] },
+      { tips: [base, local], roots: [] },
+      { tips: [base, missing, local], roots: [incoming] },
+      { tips: [base, local], roots: [missing] },
+    ];
+    for (const entry of cases) {
+      expect(await partitionOwnedByIncoming(repo, entry.tips, entry.roots)).toEqual(
+        await legacyPartitionOwnedByIncomingForTest(repo, entry.tips, entry.roots),
+      );
+    }
+
+    const shallowRepo = path.join(tmp, "differential-shallow");
+    await exec("git", ["clone", "-q", "--depth", "1", `file://${repo}`, shallowRepo], { env: TEST_GIT_ENV });
+    const shallowTip = await gitAt(shallowRepo, "rev-parse", "HEAD");
+    expect(await partitionOwnedByIncoming(shallowRepo, [shallowTip, missing], [shallowTip])).toEqual(
+      await legacyPartitionOwnedByIncomingForTest(shallowRepo, [shallowTip, missing], [shallowTip]),
+    );
+
+    const corruptRepo = await initRepo(path.join(tmp, "differential-corrupt"));
+    repo = corruptRepo;
+    const parent = await commit("parent.txt", "parent\n");
+    const child = await commit("child.txt", "child\n");
+    await fs.rm(path.join(corruptRepo, ".git", "objects", parent.slice(0, 2), parent.slice(2)));
+    expect(await partitionOwnedByIncoming(corruptRepo, [child], [child])).toEqual(
+      await legacyPartitionOwnedByIncomingForTest(corruptRepo, [child], [child]),
+    );
   });
 
   test("ownership subprocess count is constant for 500 candidates", async () => {

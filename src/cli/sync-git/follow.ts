@@ -10,7 +10,9 @@ import {
   indexIdentityV2,
   markCheckoutJournalPublished,
   noDropProof,
+  ownershipProofContext,
   ORIG_HEAD_CHANGED_AT_CHECKOUT_BOUNDARY,
+  partitionOwnedByIncoming,
   probeReceiverEquivalence,
   receiverEquivalentCollisionNames,
   receiverEquivalentPath,
@@ -27,6 +29,7 @@ import {
   type CheckoutRefUpdate,
   type GitChainTimings,
   type GitSection,
+  type OwnershipProofContext,
   basePresentKeepRef,
 } from "../../engine/index.js";
 import { captureCommonDirIdentity } from "../../engine/git/lockfile.js";
@@ -485,6 +488,68 @@ export function firstReason(reasons: ReadonlySet<GitDeferralReason>): GitDeferra
   return selected;
 }
 
+export interface CheckoutOwnershipClassification {
+  reasons: GitDeferralReason[];
+  details: string[];
+}
+
+/**
+ * Focused follow ownership seam: one current tip plus all stash-reflog tips
+ * enter one partition while reflog-read failures remain independently mapped.
+ */
+export async function classifyCheckoutOwnership(
+  repoDir: string,
+  currentTip: string | undefined,
+  roots: readonly string[],
+  context: OwnershipProofContext,
+  loadStashOids?: () => Promise<readonly string[]>,
+  prove: (tips: readonly string[]) => ReturnType<typeof partitionOwnedByIncoming> =
+    (tips) => partitionOwnedByIncoming(repoDir, tips, roots, context),
+): Promise<CheckoutOwnershipClassification> {
+  let stashOids: readonly string[] = [];
+  let stashUnreadable = false;
+  if (loadStashOids) {
+    try {
+      stashOids = await loadStashOids();
+    } catch {
+      stashUnreadable = true;
+    }
+  }
+
+  const tips = [...(currentTip ? [currentTip] : []), ...stashOids];
+  const partition = tips.length > 0 ? await prove(tips) : [];
+  const current = currentTip ? partition[0]?.proof : undefined;
+  const stash = partition.slice(currentTip ? 1 : 0);
+  const reasons: GitDeferralReason[] = [];
+  const details: string[] = [];
+
+  if (!currentTip) {
+    reasons.push("unreadable");
+    details.push("current checkout tip is unreadable");
+  } else if (current?.status === "unowned") {
+    reasons.push("local-commits");
+    details.push("current tip has receiver-only commits");
+  } else if (current?.status === "indeterminate") {
+    reasons.push(current.marker === "shallow-store" ? "unsupported" : "unreadable");
+    details.push(`current-tip reachability ${current.marker}`);
+  }
+
+  for (const entry of stash) {
+    if (entry.proof.status === "unowned") {
+      reasons.push("local-stash");
+      details.push("stash reflog contains receiver-only work");
+    } else if (entry.proof.status === "indeterminate") {
+      reasons.push("unreadable");
+      details.push(`stash reachability ${entry.proof.marker}`);
+    }
+  }
+  if (stashUnreadable) {
+    reasons.push("unreadable");
+    details.push("stash reflog could not be read");
+  }
+  return { reasons, details };
+}
+
 async function classifyCheckout(args: {
   opts: FollowOptions;
   live: LiveMetadata | undefined;
@@ -497,6 +562,7 @@ async function classifyCheckout(args: {
   checkoutRefReason?: GitDeferralReason;
   checkoutRefDetail?: string;
   heldRefs: GitPartialApply["heldRefs"];
+  ownershipContext: OwnershipProofContext;
 }): Promise<CheckoutClassification> {
   const reasons = new Set<GitDeferralReason>();
   const details: string[] = [];
@@ -543,34 +609,19 @@ async function classifyCheckout(args: {
       }
     }
 
-    if (!live.currentTip) {
-      reasons.add("unreadable");
-      details.push("current checkout tip is unreadable");
-    } else {
-      const proof = await addTimedMs(args.opts.chainTimings, "ownershipMs", () =>
-        tipOwnedByIncoming(args.opts.ctx.repoDir, live.currentTip!, args.roots));
-      if (proof.status === "unowned") { reasons.add("local-commits"); details.push("current tip has receiver-only commits"); }
-      else if (proof.status === "indeterminate") {
-        reasons.add(proof.marker === "shallow-store" ? "unsupported" : "unreadable");
-        details.push(`current-tip reachability ${proof.marker}`);
-      }
-    }
-
-    if (args.opts.ctx.kind === "dir") {
-      try {
-        const stashOids = await addTimedMs(args.opts.chainTimings, "reflogMs", () =>
-          enumerateStashReflogOids(args.opts.ctx.repoDir));
-        for (const oid of stashOids) {
-          const proof = await addTimedMs(args.opts.chainTimings, "ownershipMs", () =>
-            tipOwnedByIncoming(args.opts.ctx.repoDir, oid, args.roots));
-          if (proof.status === "unowned") { reasons.add("local-stash"); details.push("stash reflog contains receiver-only work"); }
-          else if (proof.status === "indeterminate") { reasons.add("unreadable"); details.push(`stash reachability ${proof.marker}`); }
-        }
-      } catch {
-        reasons.add("unreadable");
-        details.push("stash reflog could not be read");
-      }
-    }
+    const ownership = await classifyCheckoutOwnership(
+      args.opts.ctx.repoDir,
+      live.currentTip,
+      args.roots,
+      args.ownershipContext,
+      args.opts.ctx.kind === "dir"
+        ? () => addTimedMs(args.opts.chainTimings, "reflogMs", () => enumerateStashReflogOids(args.opts.ctx.repoDir))
+        : undefined,
+      (tips) => addTimedMs(args.opts.chainTimings, "ownershipMs", () =>
+        partitionOwnedByIncoming(args.opts.ctx.repoDir, tips, args.roots, args.ownershipContext)),
+    );
+    for (const reason of ownership.reasons) reasons.add(reason);
+    details.push(...ownership.details);
   }
   if (args.checkoutRefReason) {
     reasons.add(args.checkoutRefReason);
@@ -680,6 +731,7 @@ async function publishRefPlane(
   opts: FollowOptions,
   live: LiveMetadata,
   roots: readonly string[],
+  ownershipContext: OwnershipProofContext,
   classifyOnly = false,
 ): Promise<FollowProgress & {
   checkoutRefReason?: GitDeferralReason;
@@ -808,7 +860,8 @@ async function publishRefPlane(
         : [oldOid];
       protectedByRef.set(ref, protectedOids);
       if (!hold) for (const oid of protectedOids) {
-        const proof = await addTimedMs(opts.chainTimings, "ownershipMs", () => tipOwnedByIncoming(opts.ctx.repoDir, oid, roots));
+        const proof = await addTimedMs(opts.chainTimings, "ownershipMs", () =>
+          tipOwnedByIncoming(opts.ctx.repoDir, oid, roots, ownershipContext));
         if (proof.status === "unowned") {
           if (opts.manualResolution && manualProtected.has(oid)) continue;
           hold = ref === "refs/stash" ? "local-stash" : "local-commits";
@@ -880,14 +933,17 @@ async function publishRefPlane(
       if (tombstoneAuthorized.has(ref)) continue;
       if (opts.manualResolution && protectedOids.every((oid) => manualProtected.has(oid))) continue;
       const proof = await addTimedMs(opts.chainTimings, "ownershipMs", () =>
-        noDropProof(opts.ctx.repoDir, plannedRefs, heldDurable, {}, protectedOids, { contentEquivalenceCache }));
+        noDropProof(opts.ctx.repoDir, plannedRefs, heldDurable, {}, protectedOids, {
+          contentEquivalenceCache,
+          ownershipContext,
+        }));
       if (proof.status === "proven") {
         if (proof.marker !== "content-equivalent") continue;
         const oldOid = live.refs[ref];
         const newOid = effective.refs[ref];
         const nonDestructive = oldOid !== undefined && newOid !== undefined
           && (await addTimedMs(opts.chainTimings, "ownershipMs", () =>
-            tipOwnedByIncoming(opts.ctx.repoDir, oldOid, [newOid]))).status === "owned";
+            tipOwnedByIncoming(opts.ctx.repoDir, oldOid, [newOid], ownershipContext))).status === "owned";
         if (nonDestructive) {
           opts.onContentEquivalentWaiver?.(ref);
           continue;
@@ -1029,7 +1085,7 @@ async function publishRefPlane(
       let tombstoneFingerprint: string | undefined;
       let branchEpisode: string | undefined;
       if (oldOid && (!newOid || (await addTimedMs(opts.chainTimings, "ownershipMs", () =>
-        tipOwnedByIncoming(opts.ctx.repoDir, oldOid, [newOid]))).status !== "owned")) {
+        tipOwnedByIncoming(opts.ctx.repoDir, oldOid, [newOid], ownershipContext))).status !== "owned")) {
         consultedReflogPaths.add(`logs/${ref}`);
         const durableNow = { ...liveNow };
         delete durableNow[ref];
@@ -1229,6 +1285,8 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
     if (!liveBefore) return deferResult(emptyProgress, "unreadable", "git metadata could not be read");
     const baseProjection = opts.record?.idxProj ?? await addTimedMs(opts.chainTimings, "indexOpStateMs", () =>
       deriveBaseIndexProjection(opts, staged.tmpDir).catch(() => undefined));
+    const initialOwnershipContext = await addTimedMs(opts.chainTimings, "ownershipMs", () =>
+      ownershipProofContext(opts.ctx));
     const effectiveBaseIndexProjection = indexArtifact(opts.base) ? baseProjection : null;
     const effective = effectiveRefs(opts.ctx, opts.incoming);
     const ownershipSection = { ...opts.incoming, refs: effective.refs };
@@ -1240,7 +1298,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
     // journal absent a new normative design change.
     let refProgress: Awaited<ReturnType<typeof publishRefPlane>>;
     try {
-      refProgress = await publishRefPlane(opts, liveBefore, roots);
+      refProgress = await publishRefPlane(opts, liveBefore, roots, initialOwnershipContext);
     } catch (error) {
       if (!(error instanceof WorktreeOwnershipUnreadableError)) throw error;
       return deferResult(
@@ -1312,6 +1370,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
       checkoutRefReason: refProgress.checkoutRefReason,
       checkoutRefDetail: refProgress.checkoutRefDetail,
       heldRefs: progress.heldRefs,
+      ownershipContext: initialOwnershipContext,
     }));
     if (!first.safe) {
       const blockers = [...progress.blockers, ...first.blockers];
@@ -1363,7 +1422,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
       const newOid = effective.refs[currentRef];
       let pinLines: string[] = [];
       if (oldOid && (!newOid || (await addTimedMs(opts.chainTimings, "ownershipMs", () =>
-        tipOwnedByIncoming(opts.ctx.repoDir, oldOid, [newOid]))).status !== "owned")) {
+        tipOwnedByIncoming(opts.ctx.repoDir, oldOid, [newOid], initialOwnershipContext))).status !== "owned")) {
         progress.consultedReflogPaths = [...new Set([
           ...(progress.consultedReflogPaths ?? []),
           `logs/${currentRef}`,
@@ -1547,6 +1606,9 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
           && freshBinding.worktreeId === opts.binding.worktreeId
           && freshCtx.kind === opts.ctx.kind;
         const live = sameIncarnation ? await readLive(freshCtx, opts.chainTimings) : undefined;
+        const boundaryOwnershipContext = freshCtx
+          ? await addTimedMs(opts.chainTimings, "ownershipMs", () => ownershipProofContext(freshCtx))
+          : { shallow: undefined };
         if (opts.manualResolution) {
           try {
             if (!(await opts.manualResolution.secondProof(refProgress.authoredRefChanges))) {
@@ -1570,6 +1632,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
           checkoutRefReason: refProgress.checkoutRefReason,
           checkoutRefDetail: refProgress.checkoutRefDetail,
           heldRefs: progress.heldRefs,
+          ownershipContext: boundaryOwnershipContext,
         }));
         if (!proof.safe) boundaryFailure = proof;
         if (!opts.manualResolution && proof.breadcrumbMismatches.length > 0 && !origHeadPreservation) {
@@ -1740,9 +1803,11 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
           deriveBaseIndexProjection(opts, staged.tmpDir).catch(() => undefined))
         : null;
       await opts.beforeFinalLive?.();
+      const finalOwnershipContext = await addTimedMs(opts.chainTimings, "ownershipMs", () =>
+        ownershipProofContext(opts.ctx));
       const finalLive = await readLive(opts.ctx, opts.chainTimings);
       if (finalLive) {
-        const finalRef = await publishRefPlane(opts, finalLive, roots, true);
+        const finalRef = await publishRefPlane(opts, finalLive, roots, finalOwnershipContext, true);
         const finalCheckout = await addTimedMs(opts.chainTimings, "classifyMs", () => classifyCheckout({
           opts,
           live: finalLive,
@@ -1754,6 +1819,7 @@ export async function followDivergedRepo(opts: FollowOptions): Promise<FollowRes
           checkoutRefReason: finalRef.checkoutRefReason,
           checkoutRefDetail: finalRef.checkoutRefDetail,
           heldRefs: finalRef.heldRefs,
+          ownershipContext: finalOwnershipContext,
         }));
         const blockers = [...finalRef.blockers, ...finalCheckout.blockers];
         const finalReflogPaths = [...new Set([
