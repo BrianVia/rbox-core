@@ -14,6 +14,7 @@ import { canonicalJson, utf16beOrderKey } from "../digest/codecs.js";
 import { StageDigestBuilder, type StageCounts } from "../digest/stage-semantic-v1.js";
 import { StageChangedError, StateDataCorruptionError } from "../errors.js";
 import type { ManifestHeader } from "../ports.js";
+import { CAS_TRANSITION_TEMP, applyTransitions, createTransitionTemp } from "./cas-steps.js";
 import { STAGE_DDL, beginGeneration } from "./generations.js";
 import { createStateStore, stateStoreDatabase } from "./open.js";
 import { openReadSnapshot } from "./read-snapshot.js";
@@ -173,6 +174,39 @@ test("a corrupt Git authority row surfaces as StateDataCorruptionError with enti
   expect(thrown).toBeInstanceOf(StateDataCorruptionError);
   expect((thrown as StateDataCorruptionError).entity).toBe("gitSection");
   expect((thrown as StateDataCorruptionError).key).toBe("repo-a");
+  expect((thrown as StateDataCorruptionError).cause).toBeInstanceOf(TypeError);
+  handle.close();
+});
+
+test("a corrupt persisted base section read through the CAS path is StateDataCorruptionError", () => {
+  const handle = createStateStore(path.join(root("rbox-gitsec-cas-base-"), "state.db"), {
+    authorityId: "a".repeat(32), lineageId: LINEAGE, stream: "stream", createdBy: "test",
+  });
+  const db = stateStoreDatabase(handle);
+  const relPath = "repo-a";
+  const order = utf16beOrderKey(relPath);
+  // A persisted repo record whose base column is canonical yet inadmissible
+  // (no refScope) — corruption the write path would never have admitted.
+  db.query(`INSERT INTO repo_records(lineage_id,rel_path,path_order,repo_gen,source_seq,base_cjson,
+    canonical_bytes,retained_estimate) VALUES (?,?,?,?,?,?,?,?)`)
+    .run(LINEAGE, relPath, order, 1, 1, canonicalJson(withoutRefScope(9)), 4096, 4096);
+
+  // A transition over that same repo reaches recomposeBase, which reads the
+  // persisted base. base_proof absent, so the decode is what fails first.
+  createTransitionTemp(db);
+  db.query(`INSERT INTO ${CAS_TRANSITION_TEMP}(rel_path,path_order,expected_repo_gen,record_cjson,base_proof_cjson,evidence_cjson)
+    VALUES (?,?,?,?,NULL,?)`)
+    .run(relPath, order, 1, canonicalJson({ sourceSeq: 2 }), canonicalJson({ sourceStages: [] }));
+
+  let thrown: unknown;
+  try {
+    applyTransitions(db, LINEAGE);
+  } catch (error) {
+    thrown = error;
+  }
+  expect(thrown).toBeInstanceOf(StateDataCorruptionError);
+  expect((thrown as StateDataCorruptionError).entity).toBe("gitSection");
+  expect((thrown as StateDataCorruptionError).key).toBe(relPath);
   expect((thrown as StateDataCorruptionError).cause).toBeInstanceOf(TypeError);
   handle.close();
 });

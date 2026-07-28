@@ -5,7 +5,7 @@ import { decodeFileEntry, type FileEntryRow } from "../codecs/file-entry.js";
 import { decodeGitSection } from "../codecs/git-section.js";
 import { decodeRepoRecord, type RepoRecordRow } from "../codecs/repo-record.js";
 import { canonicalJson, parseCanonicalJson, spreadExtras, utf16beOrderKey } from "../digest/codecs.js";
-import { CursorWindowError, GitSectionOversizeError, SnapshotChangedError, StateDataCorruptionError } from "../errors.js";
+import { CursorWindowError, GitSectionOversizeError, SnapshotChangedError, decodeAuthorityRow } from "../errors.js";
 import type {
   CursorPage, GitSectionRole, LineageSnapshot, ManifestHeader, Plane,
   ReadSnapshot, RepositorySnapshot,
@@ -88,17 +88,6 @@ export function currentSnapshot(db: Database): LineageSnapshot {
     localHeader: header(local),
     ...(manifestMeta ? { manifestMeta } : {}),
   };
-}
-
-/** Decode one persisted authority row, converting any decode failure into a
- * `StateDataCorruptionError`. A row that will not decode is data-at-rest
- * corruption, not a caller error — the same taxonomy for every column codec. */
-function decodeAuthorityRow<T>(entity: string, key: string, decode: () => T): T {
-  try {
-    return decode();
-  } catch (cause) {
-    throw new StateDataCorruptionError(entity, key, cause);
-  }
 }
 
 function sameToken(a: LineageSnapshot, b: LineageSnapshot): boolean {

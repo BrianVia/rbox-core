@@ -173,3 +173,15 @@ export class StateDataCorruptionError extends Error {
     super(`corrupt ${entity} authority row ${JSON.stringify(key)}`, { cause });
   }
 }
+
+/** Decode one persisted authority row, converting any decode failure into a
+ * `StateDataCorruptionError`. A row that will not decode is data-at-rest
+ * corruption, not a caller error — the single taxonomy every column codec shares,
+ * at every site that reconstructs a value from durable bytes. */
+export function decodeAuthorityRow<T>(entity: string, key: string, decode: () => T): T {
+  try {
+    return decode();
+  } catch (cause) {
+    throw new StateDataCorruptionError(entity, key, cause);
+  }
+}

@@ -5,16 +5,16 @@
  * artifact. Steps 2 and 4 are fused per row so the packet is never collected in JS.
  */
 import type { Database } from "bun:sqlite";
-import type { GitSection } from "../../../engine/index.js";
 import {
   composeRepoBase, type BranchBaseOrigin, type RepoBaseProof, type RepoBaseValue,
 } from "../../sync-git/base-composer.js";
 import {
   validManifestMeta, type GlobalManifestMeta, type RepoRecord, type RepoRecordInput,
 } from "../../sync-state-model.js";
+import { decodeGitSection } from "../codecs/git-section.js";
 import { encodeRepoRecord } from "../codecs/repo-record.js";
 import { canonicalJson, parseCanonicalJson, utf16beOrderKey } from "../digest/codecs.js";
-import { ProoflessBaseError, StageChangedError } from "../errors.js";
+import { ProoflessBaseError, StageChangedError, decodeAuthorityRow } from "../errors.js";
 import type { CasRejectionReason, ManifestHeader } from "../ports.js";
 import { internStagedEntryValues, promoteFilesIntoPlane } from "./generations.js";
 import { streamRows } from "./stage-artifacts.js";
@@ -212,11 +212,22 @@ function recomposeBase(
   baseProofCjson: string | null,
   before: { base_cjson: string | null; branch_base_origins_cjson: string | null } | null,
 ): RepoRecordInput {
+  // `before` is a persisted authority repo_records row. A row that no longer
+  // decodes is data-at-rest corruption (StateDataCorruptionError), never a bare
+  // parse Error or a caller-layer TypeError from the recompose below — the same
+  // taxonomy every other authority read observes. The base column routes through
+  // the shared Git-section codec so canonical-but-inadmissible bytes are caught
+  // here rather than escaping validation.
   const previous: RepoBaseValue = {
-    ...(before?.base_cjson == null ? {} : { base: parseCanonicalJson(before.base_cjson) as unknown as GitSection }),
+    ...(before?.base_cjson == null
+      ? {}
+      : { base: decodeAuthorityRow("gitSection", relPath, () => decodeGitSection(relPath, before.base_cjson!)) }),
     ...(before?.branch_base_origins_cjson == null
       ? {}
-      : { branchBaseOrigins: parseCanonicalJson(before.branch_base_origins_cjson) as unknown as Record<string, BranchBaseOrigin> }),
+      : {
+        branchBaseOrigins: decodeAuthorityRow("repoRecord", relPath,
+          () => parseCanonicalJson(before.branch_base_origins_cjson!) as unknown as Record<string, BranchBaseOrigin>),
+      }),
   };
   if (baseProofCjson === null) {
     // Without a proof this transition may not move BASE authority in ANY
