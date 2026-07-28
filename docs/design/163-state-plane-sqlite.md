@@ -2251,12 +2251,22 @@ clobber each other's `state.json` today.
    `legacy-writer-live` on any state change the sidecar does not account for.
    That mechanism existed to detect a legacy writer running *concurrently with
    a live migration*. Founder decision 5 (`MIGRATION-EXCLUSIVITY-v11`) excludes
-   that scenario at the front door: a migration begins only inside an
-   `rbox upgrade` stop window or an explicit foreground `rbox migrate`, and M0
-   refuses with `migration-not-exclusive` when the window is unproven. **The U3
-   implementation need not implement the paired-interval sampling.** Exclusivity
-   replaces it; a timing probe is not a substitute for the workspace being
-   parked, and running both would have been two gates where one is decisive.
+   that scenario at the front door — with "exclusivity" defined operationally,
+   not as machine quiescence (v11-r2): **the window is exclusive ownership of
+   this workspace's mutation locks** (the workspace sync mutex and
+   `stateLockPath`), which every `>= 1.11.0` actor acquires before any state
+   write. A migration begins only from an admitted entry point — an
+   `rbox upgrade` stop window or an explicit foreground `rbox migrate` — and M0
+   verifies lock ownership plus the existing pid/ownership evidence, refusing
+   with `migration-not-exclusive` otherwise. A daemon or foreground command
+   that *starts after* M0's check does not defeat the window: being B0-era, it
+   blocks on the locks the migration holds until M7 releases them. What pid
+   evidence cannot exclude — a lock-ignoring pre-`1.11.0` actor — is exactly
+   the drained population of the `B0` gate, with the retained defense-in-depth
+   mechanisms (closure part three, `F2`–`F6`) as the backstop. **The U3
+   implementation need not implement the paired-interval sampling.** Lock
+   ownership replaces it; a timing probe is not a substitute for holding the
+   locks, and running both would have been two gates where one is decisive.
 
    *Closure, part three — RETAINED AS DEFENSE-IN-DEPTH, no longer load-bearing
    (v11).* V9 made the body-hash re-verification of `.rbox/state.json` against
@@ -2415,9 +2425,10 @@ clobber each other's `state.json` today.
    fixtures (v9 adds `F5`; v10 adds `F6`), each testing what the machine
    actually does. **Framing changed in v11, contents not.** `F1`–`F6` are
    retained in full as regression nets, but they now test **excluded
-   scenarios**: under `MIGRATION-EXCLUSIVITY-v11` nothing else runs while a
-   migration runs, so `F2`–`F6` construct a concurrency the design no longer
-   admits. They stay because they are cheap, because they pin B0's shipped
+   scenarios**: under `MIGRATION-EXCLUSIVITY-v11` no lock-respecting actor can
+   mutate this workspace's state while the migration holds its locks, so
+   `F2`–`F6` construct a concurrency only a lock-ignoring pre-`1.11.0` actor
+   (the drained population) could produce. They stay because they are cheap, because they pin B0's shipped
    refusal machinery (#539), and because a fixture is the only thing that stops
    a documented outcome from silently drifting. Read every "named residue"
    below as "excluded by exclusivity, tested anyway":
@@ -3193,8 +3204,10 @@ workspace mutex, complete repository fence as needed, and state lock:
    zero writes, no rename, JSON stays authoritative. This does not make the pair
    atomic — `writeFileAtomic` exposes only `beforeRename` and cannot fuse a read
    of a different file into the rename syscall — it reduces the exposure to the
-   `check → rename` instants, and the residue that survives is named in § 1a
-   closure part three as outcome (ii). Otherwise
+   `check → rename` instants. Under `MIGRATION-EXCLUSIVITY-v11` that residue is
+   an excluded scenario (only a lock-ignoring pre-`1.11.0` actor reaches it);
+   it remains documented as defense-in-depth in § 1a's retained closure
+   passages and asserted by fixture `F5`. Otherwise
    atomically rename the exact sibling over `.rbox/state.json`, fsync `.rbox`,
    then publish M6 with sibling absent and the initial cleanup cursor. A process
    kill after rename observes Q+sibling-absent. A power cut before the parent
