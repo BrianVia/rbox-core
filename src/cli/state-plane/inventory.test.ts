@@ -226,6 +226,21 @@ describe("state barrier pinning inventory", () => {
     expect(offenders, "the marker literal must live only in state-plane/authority-marker.ts").toEqual([]);
   });
 
+  test("the barrier read classifies from one no-follow descriptor", () => {
+    const file = "src/cli/state-plane/authority-marker.ts";
+    const open = requiredCall(file, "classifyStateFormat", "fs.open");
+    expect(
+      open.arguments?.[1] ?? "",
+      "classifyStateFormat must open the state path with O_NOFOLLOW, or a symlink swapped in at the path is read as the document",
+    ).toContain("O_NOFOLLOW");
+    const pathLookups = callsIn(file, "classifyStateFormat")
+      .filter((site) => ["fs.lstat", "fs.stat", "fs.readFile"].some((callee) => calleeMatches(site, callee)));
+    expect(
+      pathLookups.map((site) => `${site.callee}:${site.line}`),
+      "the classification must be decided from the descriptor, not from a second pathname lookup",
+    ).toEqual([]);
+  });
+
   test("every exemption states a reason", () => {
     for (const [id, { reason }] of EXEMPT) expect(reason.length, id).toBeGreaterThan(20);
   });

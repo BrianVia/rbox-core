@@ -1,4 +1,5 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
+import { rmSync, symlinkSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -58,6 +59,38 @@ test("state formats are classified without parsing", async () => {
   await fs.rm(statePath(root));
   await fs.symlink(path.join(root, "elsewhere"), statePath(root));
   expect(await classifyStateFormat(statePath(root))).toBe("foreign");
+});
+
+test("a symlink at the state path is refused without its target ever being read", async () => {
+  const root = await workspace("rbox-barrier-symlink-");
+  const target = path.join(root, "elsewhere.json");
+  await fs.writeFile(target, JSON.stringify(legacyState()));
+  await fs.symlink(target, statePath(root));
+  // Were the target followed, these bytes would classify as a readable legacy
+  // document and the barrier would hand a foreign file to the state parser.
+  expect(await classifyStateFormat(statePath(root))).toBe("foreign");
+});
+
+test("a symlink swapped in at the path is refused rather than read as the document", async () => {
+  const root = await workspace("rbox-barrier-swap-");
+  const target = path.join(root, "elsewhere.json");
+  await fs.writeFile(target, JSON.stringify(legacyState("attacker")));
+  await fs.writeFile(statePath(root), "not json at all");
+  const realOpen = fs.open;
+  // Stand in for the window between a pathname stat and a separate open: the
+  // path is a regular file when the classification starts and a symlink by the
+  // time the descriptor is taken.
+  const open = spyOn(fs, "open").mockImplementation(((...args: Parameters<typeof fs.open>) => {
+    rmSync(statePath(root));
+    symlinkSync(target, statePath(root));
+    return realOpen(...args);
+  }) as typeof fs.open);
+  try {
+    expect(await classifyStateFormat(statePath(root))).toBe("foreign");
+  } finally {
+    open.mockRestore();
+  }
+  expect((await fs.lstat(statePath(root))).isSymbolicLink(), "the swap fixture never armed").toBe(true);
 });
 
 test("every state read refuses the authority marker with a typed error", async () => {

@@ -11,6 +11,7 @@
  * The write side is the load-bearing half: a read-time check only protects an
  * operation that read *after* the flip.
  */
+import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import { StateFormatTooNewError, StateWriteRefusedError } from "./errors.js";
 
@@ -41,30 +42,37 @@ function looksLikeJson(bytes: Buffer): boolean {
 
 /**
  * Classify the bytes at `file` without materializing the document. Reads at most
- * {@link DETECT_BYTES}, follows no symlink, and never throws for content — only
- * an unexpected filesystem error propagates.
+ * {@link DETECT_BYTES} and never throws for content — only an unexpected
+ * filesystem error propagates.
+ *
+ * Every property is decided from a single no-follow descriptor, as the sidecar
+ * modules do: a pathname lookup followed by a second one could be answered by a
+ * symlink swapped in after the first, which would let the attacker's file be
+ * read as the state document under the original file's type and size.
  */
 export async function classifyStateFormat(file: string): Promise<StateFormat> {
-  let stat: Awaited<ReturnType<typeof fs.lstat>>;
+  let handle: Awaited<ReturnType<typeof fs.open>>;
   try {
-    stat = await fs.lstat(file);
+    handle = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT" || (error as NodeJS.ErrnoException).code === "ENOTDIR") return "absent";
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return "absent";
+    // ELOOP is O_NOFOLLOW refusing a symlink at the path: not a document this
+    // binary may read or replace, and the same refusal a symlink got before.
+    if (code === "ELOOP") return "foreign";
     throw error;
   }
-  if (!stat.isFile() || stat.isSymbolicLink()) return "foreign";
-  if (stat.size === 0) return "foreign";
-  const handle = await fs.open(file, "r");
-  let head: Buffer;
   try {
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.size === 0) return "foreign";
     const buffer = Buffer.alloc(Math.min(DETECT_BYTES, stat.size));
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
-    head = buffer.subarray(0, bytesRead);
+    const head = buffer.subarray(0, bytesRead);
+    if (stat.size === AUTHORITY_MARKER_BYTES && AUTHORITY_MARKER_RE.test(head.toString("latin1"))) return "authority-marker";
+    return looksLikeJson(head) ? "json" : "foreign";
   } finally {
-    await handle.close();
+    await handle.close().catch(() => undefined);
   }
-  if (stat.size === AUTHORITY_MARKER_BYTES && AUTHORITY_MARKER_RE.test(head.toString("latin1"))) return "authority-marker";
-  return looksLikeJson(head) ? "json" : "foreign";
 }
 
 /** True only for the exact 58-byte marker. Exposed for fixtures and tests;
