@@ -47,7 +47,15 @@ test("the SQLite-free engine never imports bun:sqlite", () => {
 
 test("the production state-plane facade bundles without bun:sqlite", async () => {
   const entrypoint = path.resolve(import.meta.dir, "../index.ts");
-  const result = await Bun.build({ entrypoints: [entrypoint], target: "bun", write: false });
+  // Build-generated embedded assets (e.g. crypto-worker.bundle.txt) exist only
+  // after a full build; a fresh CI checkout lacks them and they carry no import
+  // edges, so the bun:sqlite scan is unaffected by leaving them external.
+  const result = await Bun.build({
+    entrypoints: [entrypoint],
+    target: "bun",
+    write: false,
+    external: ["*.bundle.txt"],
+  });
   expect(result.success, result.logs.map(String).join("\n")).toBe(true);
   const output = (await Promise.all(result.outputs.map((item) => item.text()))).join("\n");
   expect(output).not.toContain("bun:sqlite");
