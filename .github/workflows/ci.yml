@@ -178,7 +178,7 @@ jobs:
         if: needs.changes.outputs.run_ci == 'true' && matrix.kind == 'checks'
         run: bun run guards
 
-      - name: Typecheck (root + apps/api)
+      - name: Typecheck (root + apps/api + scripts)
         if: needs.changes.outputs.run_ci == 'true' && matrix.kind == 'checks'
         run: bun run typecheck
 

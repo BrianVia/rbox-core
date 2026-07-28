@@ -9,7 +9,7 @@ import {
 import { canonicalJson } from "../digest/codecs.js";
 import { SnapshotChangedError } from "../errors.js";
 import type {
-  LineageSnapshot, MaterializeManifestRequest, Plane, ReadSnapshot, StateStoreReadAdapters,
+  LineageSnapshot, MaterializeManifestRequest, Plane, ReadSnapshot,
 } from "../ports.js";
 import { openReadSnapshot } from "../store/read-snapshot.js";
 import type { StateStoreHandle } from "../store/open.js";
@@ -120,18 +120,4 @@ export function materializeManifestFromStore(
   const manifest = materializeManifest(snapshot, request.plane);
   snapshot.finishProjection();
   return manifest;
-}
-
-export function loadStateFromStore(store: StateStoreHandle, expectedStream?: string): SyncState {
-  const state = loadRawStateFromStore(store);
-  if (expectedStream === undefined || expectedStream === state.stream) return state;
-  return { stream: expectedStream, lastSyncedSequence: 0, lastSyncedManifest: { generatedAt: "", files: [] } };
-}
-
-export function readOnlyAdapters(store: StateStoreHandle): StateStoreReadAdapters {
-  return {
-    loadRawState: () => loadRawStateFromStore(store),
-    loadState: (expectedStream) => loadStateFromStore(store, expectedStream),
-    materializeManifest: (request) => materializeManifestFromStore(store, request),
-  };
 }

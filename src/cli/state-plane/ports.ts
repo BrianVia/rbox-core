@@ -93,9 +93,3 @@ export interface MaterializeManifestRequest {
   purpose: ManifestMaterializationPurpose;
   projectionToken: LineageSnapshot;
 }
-
-export interface StateStoreReadAdapters {
-  loadRawState(): SyncState;
-  loadState(expectedStream?: string): SyncState;
-  materializeManifest(request: MaterializeManifestRequest): Manifest;
-}

@@ -10,18 +10,9 @@ interface Sample {
   rssBytes: number;
 }
 
-// This probe runs OUTSIDE a workspace, where #498 changed the verdict: the
-// baseline binary still errors ("Not inside an rbox workspace", exit 1) while a
-// candidate carrying the fix prints the all-workspaces view and exits 0. Both
-// binaries are measured with the same expectation, so during the transition
-// this probe alone accepts either. Tighten back to `0` once a release makes the
-// baseline exit 0 too. /usr/bin/time emits its RSS line either way, so the
-// measurement below is unaffected.
-const OUTSIDE_WORKSPACE_STATUS_EXIT = [0, 1] as const;
-
 const workloads = [
-  { name: "status", args: ["status"], expectedExit: OUTSIDE_WORKSPACE_STATUS_EXIT },
-  { name: "status-json", args: ["status", "--json"], expectedExit: OUTSIDE_WORKSPACE_STATUS_EXIT },
+  { name: "status", args: ["status"], expectedExit: 0 },
+  { name: "status-json", args: ["status", "--json"], expectedExit: 0 },
   { name: "prompt-status", args: ["prompt-status"], expectedExit: 0 },
   { name: "daemon-startup-selftest", args: ["__watcher-selftest"], expectedExit: 0 },
 ] as const;
@@ -31,10 +22,7 @@ function percentile(values: number[], fraction: number): number {
   return sorted[Math.max(0, Math.ceil(sorted.length * fraction) - 1)]!;
 }
 
-/** A bare number stays strict; only a probe that spells out a set may accept
- * more than one exit code. */
-function measure(binary: string, cwd: string, args: readonly string[], expectedExit: number | readonly number[]): Sample {
-  const accepted = typeof expectedExit === "number" ? [expectedExit] : expectedExit;
+function measure(binary: string, cwd: string, args: readonly string[], expectedExit: number): Sample {
   const isDarwin = process.platform === "darwin";
   const timeArgs = isDarwin ? ["-l"] : ["-v"];
   const started = performance.now();
@@ -50,8 +38,8 @@ function measure(binary: string, cwd: string, args: readonly string[], expectedE
     stderr: "pipe",
   });
   const wallMs = performance.now() - started;
-  if (!accepted.includes(result.exitCode) || result.stderr.toString().includes("Ink runtime loaded during a non-interactive command")) {
-    throw new Error(`${path.basename(binary)} ${args.join(" ")} exited ${result.exitCode}, expected ${accepted.join(" or ")}\n${result.stderr.toString()}`);
+  if (result.exitCode !== expectedExit || result.stderr.toString().includes("Ink runtime loaded during a non-interactive command")) {
+    throw new Error(`${path.basename(binary)} ${args.join(" ")} exited ${result.exitCode}, expected ${expectedExit}\n${result.stderr.toString()}`);
   }
   const timing = result.stderr.toString();
   const match = isDarwin
@@ -61,8 +49,10 @@ function measure(binary: string, cwd: string, args: readonly string[], expectedE
   return { wallMs, rssBytes: Number(match[1]) * (isDarwin ? 1 : 1024) };
 }
 
-const baseline = resolveRigBinaryPaths({ binary: process.argv[2] }).a;
-const candidate = resolveRigBinaryPaths({ binary: process.argv[3] }).a;
+const baselineArg = process.argv[2];
+const candidateArg = process.argv[3];
+const baseline = resolveRigBinaryPaths(baselineArg === undefined ? {} : { binary: baselineArg }).a;
+const candidate = resolveRigBinaryPaths(candidateArg === undefined ? {} : { binary: candidateArg }).a;
 if (!baseline || !candidate || process.argv.length !== 4) {
   throw new Error("usage: bun scripts/tui-performance-budget.ts /absolute/baseline/rbox /absolute/candidate/rbox");
 }

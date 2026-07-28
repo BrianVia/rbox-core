@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { FileEntry, GitSection } from "../../../engine/index.js";
-import { loadRawState, statePath } from "../../sync-state-store.js";
+import { loadRawState, loadState, statePath, StreamMismatchError } from "../../sync-state-store.js";
 import {
   stateFromRepoRecords,
   type RepoRecord,
@@ -355,6 +355,27 @@ function insertState(handle: StateStoreHandle, state: SyncState): void {
   })();
 }
 
+function enforceExpectedStreamAtCompatibilityBoundary(
+  testRoot: string,
+  expectedStream: string,
+  observed: SyncState,
+): SyncState {
+  if (observed.stream !== expectedStream) {
+    throw new StreamMismatchError(testRoot, expectedStream, observed.stream, "state");
+  }
+  return observed;
+}
+
+async function captureStreamMismatch(run: () => SyncState | Promise<SyncState>): Promise<StreamMismatchError> {
+  try {
+    await run();
+  } catch (error) {
+    expect(error).toBeInstanceOf(StreamMismatchError);
+    return error as StreamMismatchError;
+  }
+  throw new Error("expected StreamMismatchError");
+}
+
 test("direct SQL read path is strictly differential with realistic JSON state across cursor windows", async () => {
   const fixture = JSON.parse(JSON.stringify(realisticState())) as SyncState;
   const jsonRoot = root("rbox-store-json-differential-");
@@ -417,6 +438,57 @@ test("direct SQL read path is strictly differential with realistic JSON state ac
     purpose: "wire-snapshot",
     projectionToken: stale.token,
   })).toThrow(SnapshotChangedError);
+  handle.close();
+});
+
+test("wrong-stream compatibility preserves authority and has JSON/SQLite typed refusal parity", async () => {
+  const fixture = JSON.parse(JSON.stringify(realisticState())) as SyncState;
+  const sharedRoot = root("rbox-store-stream-mismatch-");
+  fs.mkdirSync(path.dirname(statePath(sharedRoot)), { recursive: true });
+  fs.writeFileSync(statePath(sharedRoot), JSON.stringify(fixture));
+  const handle = createStateStore(path.join(sharedRoot, "state.db"), {
+    authorityId: "a".repeat(32),
+    lineageId: LINEAGE,
+    stream: fixture.stream,
+    createdBy: "test",
+    stateNonce: fixture.stateNonce,
+    stateRevision: fixture.stateRevision,
+    telemetryBindingId: fixture.telemetryBindingId,
+  });
+  insertState(handle, fixture);
+
+  const expectedStream = "workspace/other";
+  const jsonError = await captureStreamMismatch(() => loadState(sharedRoot, expectedStream));
+  const sqliteRaw = loadRawStateFromStore(handle);
+  expect(sqliteRaw.stream).toBe(fixture.stream);
+  expect(sqliteRaw.lastSyncedSequence).toBe(41);
+  expect(sqliteRaw.lastSyncedManifest.files.length).toBeGreaterThan(0);
+  expect(Object.keys(sqliteRaw.repoRecords ?? {}).length).toBeGreaterThan(0);
+  expect(sqliteRaw).not.toEqual({
+    stream: expectedStream,
+    lastSyncedSequence: 0,
+    lastSyncedManifest: { generatedAt: "", files: [] },
+  });
+
+  // SQLite intentionally has no production expected-stream read yet. This
+  // test-only translation records the contract the future compatibility
+  // boundary must implement without letting the raw substrate fabricate state.
+  const sqliteError = await captureStreamMismatch(() =>
+    enforceExpectedStreamAtCompatibilityBoundary(sharedRoot, expectedStream, sqliteRaw)
+  );
+  expect({
+    name: sqliteError.name,
+    expectedStream: sqliteError.expectedStream,
+    observedStream: sqliteError.observedStream,
+    source: sqliteError.source,
+    message: sqliteError.message,
+  }).toEqual({
+    name: jsonError.name,
+    expectedStream: jsonError.expectedStream,
+    observedStream: jsonError.observedStream,
+    source: jsonError.source,
+    message: jsonError.message,
+  });
   handle.close();
 });
 

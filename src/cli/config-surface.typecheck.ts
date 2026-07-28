@@ -26,6 +26,9 @@ import type {
   TypedBlocker,
   WorkspaceConfig,
 } from "./config.js";
+// @ts-expect-error The SQLite substrate must not regain an expected-stream policy wrapper.
+import type { StateStoreReadAdapters } from "./state-plane/ports.js";
+import * as stateStoreFacade from "./state-plane/store-facade.js";
 
 type Equal<A, B> =
   (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1 : 2)
@@ -34,6 +37,11 @@ type Equal<A, B> =
       : false
     : false;
 type Assert<T extends true> = T;
+type AssertNever<T extends never> = T;
+type _RemovedSqlitePolicyValuesStayAbsent = AssertNever<Extract<
+  keyof typeof stateStoreFacade,
+  "loadStateFromStore" | "readOnlyAdapters"
+>>;
 
 type OwnerValues =
   & Pick<typeof workspace,
