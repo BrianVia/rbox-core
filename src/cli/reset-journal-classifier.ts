@@ -1,4 +1,4 @@
-import type { ResetPhase } from "./reset-journal.js";
+import type { ResetPhase } from "./reset-journal-codec.js";
 
 export type StateDisposition = "old" | "next" | "absent" | "other";
 export type NextArtifactDisposition = "next" | "absent" | "other";

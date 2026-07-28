@@ -4,6 +4,8 @@ import {
   STATE_STORE_APPLICATION_ID,
   STATE_STORE_DDL_FINGERPRINT,
   STATE_STORE_SCHEMA_VERSION,
+  STATE_STORE_SQLITE_APPLICATION_ID,
+  STATE_STORE_SQLITE_USER_VERSION,
 } from "./application.js";
 
 const REQUIRED_SCHEMA_OBJECTS = [
@@ -67,7 +69,7 @@ export function validateOpen(db: Database, file: string): StoreHeader {
   }
   const applicationId = (db.query("PRAGMA application_id").get() as { application_id: number }).application_id;
   const userVersion = (db.query("PRAGMA user_version").get() as { user_version: number }).user_version;
-  if (applicationId !== 0x52424f58 || userVersion !== STATE_STORE_SCHEMA_VERSION) {
+  if (applicationId !== STATE_STORE_SQLITE_APPLICATION_ID || userVersion !== STATE_STORE_SQLITE_USER_VERSION) {
     throw new StateStoreOpenError("wrong-application", file, `SQLite identity is application=${applicationId}, user_version=${userVersion}`);
   }
   const objects = db.query(`SELECT name FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY name`).all() as Array<{ name: string }>;

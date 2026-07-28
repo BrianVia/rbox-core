@@ -6,11 +6,18 @@ import { canonicalize } from "../engine/e2ee/jcs.js";
 import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory, writeFileAtomic } from "../engine/fsutil.js";
 import { boundedCopy, boundedHash, boundedJsonRead, boundedRead, RESET_STREAM_BYTE_LIMIT } from "./reset-io.js";
 import { observeResetJournalBytes } from "./reset-journal.js";
+import {
+  decodeResetJournal,
+  resetJournalFileSource,
+  type DecodeResetJournalResult,
+} from "./reset-journal-codec.js";
+import { RESET_JOURNAL_BYTE_LIMIT } from "./reset-journal-codec.js";
 
 const HEX64 = /^[0-9a-f]{64}$/;
 const BUNDLE_ID = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.\d{3}Z-[0-9a-f]{16}$/;
 const MANIFEST_CAP = 256 * 1024;
 const COMMIT_CAP = 16 * 1024;
+const SQLITE_SIDECARS = ["-wal", "-shm", "-journal"] as const;
 
 export type ResetQuarantineArtifactKind = "journal" | "candidate" | "archive";
 
@@ -40,7 +47,7 @@ interface QuarantineArtifact {
   bytes: number;
 }
 
-export interface ResetQuarantineManifestV1 {
+interface ResetQuarantineManifestBaseV1 {
   v: 1;
   id: string;
   createdAt: string;
@@ -52,6 +59,19 @@ export interface ResetQuarantineManifestV1 {
   refPreconditions: string;
   artifacts: QuarantineArtifact[];
 }
+export interface LegacyResetQuarantineManifestV1 extends ResetQuarantineManifestBaseV1 {
+  stateFormat?: never;
+  decodedCandidateSha256?: never;
+  decodedCandidateBytes?: never;
+}
+export interface SQLiteResetQuarantineManifestV1 extends ResetQuarantineManifestBaseV1 {
+  stateFormat: "sqlite/v1";
+  decodedCandidateSha256: string;
+  decodedCandidateBytes: number;
+}
+export type ResetQuarantineManifestV1 =
+  | LegacyResetQuarantineManifestV1
+  | SQLiteResetQuarantineManifestV1;
 
 interface ResetQuarantineCommitV1 {
   v: 1;
@@ -66,6 +86,9 @@ export interface ResetQuarantineHooks {
 }
 
 export const resetQuarantineRoot = (root: string): string => path.join(root, ".rbox", "state", "quarantine");
+export async function inspectResetJournalForQuarantine(file: string): Promise<DecodeResetJournalResult> {
+  return decodeResetJournal(await resetJournalFileSource(file));
+}
 const manifestPath = (bundle: string): string => path.join(bundle, "manifest.json");
 const committedPath = (bundle: string): string => path.join(bundle, "COMMITTED");
 const canonicalBytes = (value: unknown): Buffer => Buffer.concat([Buffer.from(canonicalize(value)), Buffer.from("\n")]);
@@ -96,6 +119,7 @@ async function publishCommitRecord(file: string, bytes: Uint8Array, hooks: Reset
   const parent = path.dirname(file);
   const tmp = path.join(parent, `.rbox-tmp-${process.pid}-${crypto.randomBytes(8).toString("hex")}-COMMITTED`);
   let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
+  let renamed = false;
   try {
     handle = await fs.open(tmp, "wx", 0o600);
     await handle.writeFile(bytes);
@@ -104,10 +128,15 @@ async function publishCommitRecord(file: string, bytes: Uint8Array, hooks: Reset
     handle = undefined;
     await hooks.crashAt?.("after-commit-temp-fsync");
     await fs.rename(tmp, file);
+    renamed = true;
     await hooks.crashAt?.("after-commit-rename");
     await fsyncDirectory(parent);
   } finally {
     await handle?.close().catch(() => {});
+    // A caught publication failure owns exactly this positively identified
+    // temp. Once rename succeeds the COMMITTED path is durable protocol state
+    // and must never be removed by error cleanup.
+    if (!renamed) await fs.rm(tmp, { force: true }).catch(() => {});
   }
 }
 
@@ -128,6 +157,12 @@ function validateManifest(value: unknown, expectedId?: string): ResetQuarantineM
     || (m.activeStateSha256 !== undefined && !HEX64.test(m.activeStateSha256))
     || (m.recoveredStateSha256 !== undefined && !HEX64.test(m.recoveredStateSha256))
     || !Array.isArray(m.artifacts) || m.artifacts.length < 1 || m.artifacts.length > 4) return undefined;
+  const sqliteWitness = m.stateFormat === "sqlite/v1"
+    && typeof m.decodedCandidateSha256 === "string" && HEX64.test(m.decodedCandidateSha256)
+    && Number.isSafeInteger(m.decodedCandidateBytes) && Number(m.decodedCandidateBytes) >= 1
+    && Number(m.decodedCandidateBytes) <= 256 * 1024;
+  if (m.stateFormat !== undefined && !sqliteWitness) return undefined;
+  if (m.stateFormat === undefined && (m.decodedCandidateSha256 !== undefined || m.decodedCandidateBytes !== undefined)) return undefined;
   let journals = 0;
   const originals = new Set<string>();
   const bundled = new Set<string>();
@@ -157,6 +192,19 @@ const inventoryHash = (manifest: ResetQuarantineManifestV1): string => sha256(ca
   kind: a.kind, original: a.original, bundled: a.bundled, cleanup: a.cleanup, sha256: a.sha256, bytes: a.bytes,
 }))));
 
+async function requireQuarantineDbS0(file: string): Promise<void> {
+  if (!file.endsWith(".db")) return;
+  for (const suffix of SQLITE_SIDECARS) {
+    const sidecar = await fs.lstat(`${file}${suffix}`).catch((error: unknown) => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw error;
+    });
+    if (sidecar !== undefined) {
+      throw new Error(`reset quarantine requires an S0 DB artifact; sidecar is standing: ${file}${suffix}`);
+    }
+  }
+}
+
 async function verifyBundle(bundle: string, manifest: ResetQuarantineManifestV1): Promise<boolean> {
   for (const artifact of manifest.artifacts) {
     const file = absoluteBundled(bundle, artifact.bundled);
@@ -182,6 +230,32 @@ async function loadCommittedBundle(bundle: string): Promise<ResetQuarantineManif
 export async function readResetQuarantineBundle(root: string, bundle: string): Promise<ResetQuarantineManifestV1 | undefined> {
   if (path.dirname(bundle) !== resetQuarantineRoot(root) || !BUNDLE_ID.test(path.basename(bundle))) return undefined;
   return loadCommittedBundle(bundle);
+}
+
+export type ResetQuarantineResidue =
+  | { kind: "absent" }
+  | { kind: "quarantine-pending"; bundles: readonly string[] }
+  | { kind: "post-q-quarantine-residue"; bundles: readonly string[] };
+
+/**
+ * Read-only M0/doctor quarantine admission inspection. Every entry in the
+ * durable quarantine tree counts: malformed and partial bundles need the same
+ * explicit doctor remedy as a committed bundle and are never silently resumed.
+ */
+export async function inspectResetQuarantineResidue(
+  root: string,
+  authority: "legacy-json" | "sqlite",
+): Promise<ResetQuarantineResidue> {
+  const parent = resetQuarantineRoot(root);
+  const entries = await fs.readdir(parent, { withFileTypes: true }).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  });
+  const bundles = entries.map((entry) => entry.name).sort();
+  if (bundles.length === 0) return { kind: "absent" };
+  return authority === "sqlite"
+    ? { kind: "post-q-quarantine-residue", bundles }
+    : { kind: "quarantine-pending", bundles };
 }
 
 export function resetQuarantineArtifactPath(bundle: string, artifact: { bundled: string }): string {
@@ -267,18 +341,31 @@ export async function quarantineResetUnderFence(root: string, plan: ResetQuarant
   for (let index = 0; index < plan.artifacts.length; index++) {
     const input = plan.artifacts[index]!;
     if (input.kind === "archive" && input.cleanup !== "preserve") throw new Error("reset lineage archives must be copied, never moved");
+    if (input.kind === "candidate" || input.kind === "archive") {
+      await requireQuarantineDbS0(input.absolutePath);
+    }
     const original = safeRelative(root, input.absolutePath);
     const hash = await boundedHash(input.absolutePath, RESET_STREAM_BYTE_LIMIT);
     const stat = await fs.lstat(input.absolutePath).catch(() => undefined);
     if (!hash || !stat?.isFile() || stat.isSymbolicLink()) throw new Error(`reset quarantine artifact is absent or unsafe: ${input.absolutePath}`);
     artifacts.push({ kind: input.kind, original, bundled: `artifacts/${index}-${input.kind}`, cleanup: input.cleanup, sha256: hash, bytes: stat.size });
   }
-  const manifest: ResetQuarantineManifestV1 = {
+  const journalInput = plan.artifacts.find((artifact) => artifact.kind === "journal")!;
+  const decoded = await inspectResetJournalForQuarantine(journalInput.absolutePath);
+  const manifestBase: ResetQuarantineManifestBaseV1 = {
     v: 1, id, createdAt: now.toISOString(), scope: plan.scope, phase: plan.phase,
     ...(plan.activeStateSha256 === undefined ? {} : { activeStateSha256: plan.activeStateSha256 }),
     ...(plan.recoveredStateSha256 === undefined ? {} : { recoveredStateSha256: plan.recoveredStateSha256 }),
     markerPrecondition: plan.markerPrecondition, refPreconditions: plan.refPreconditions, artifacts,
   };
+  const manifest: ResetQuarantineManifestV1 = decoded.ok && "stateFormat" in decoded.journal
+    ? {
+      ...manifestBase,
+      stateFormat: "sqlite/v1",
+      decodedCandidateSha256: decoded.journal.next.stateSha256,
+      decodedCandidateBytes: decoded.journal.next.dbBytes.byteLength,
+    }
+    : manifestBase;
   const manifestBytes = canonicalBytes(manifest);
   await durableAtomic(manifestPath(bundle), manifestBytes);
   await hooks.crashAt?.("after-manifest-publish");
@@ -317,8 +404,11 @@ export async function restoreResetQuarantineUnderFence(root: string, bundle: str
   if (manifest.activeStateSha256) {
     // The restore decision is taken from the live state's hash; a newer state
     // plane must be recognized rather than hashed as if it were JSON.
-    await assertStateReadable(path.join(root, ".rbox", "state.json"));
-    const active = await boundedHash(path.join(root, ".rbox", "state.json"), RESET_STREAM_BYTE_LIMIT);
+    const activePath = manifest.stateFormat === "sqlite/v1"
+      ? path.join(root, ".rbox", "state", "state.db")
+      : path.join(root, ".rbox", "state.json");
+    if (manifest.stateFormat !== "sqlite/v1") await assertStateReadable(activePath);
+    const active = await boundedHash(activePath, RESET_STREAM_BYTE_LIMIT);
     if (manifest.recoveredStateSha256 !== undefined && active === manifest.recoveredStateSha256) {
       const journal = manifest.artifacts.find((a) => a.kind === "journal")!;
       if (await boundedHash(absoluteOriginal(root, journal.original), RESET_STREAM_BYTE_LIMIT) !== undefined) {
@@ -333,9 +423,19 @@ export async function restoreResetQuarantineUnderFence(root: string, bundle: str
   if (manifest.scope === "transaction") {
     const journalArtifact = manifest.artifacts.find((artifact) => artifact.kind === "journal");
     if (!journalArtifact) throw new Error("reset quarantine transaction has no journal");
-    const journalBytes = await boundedRead(absoluteBundled(bundle, journalArtifact.bundled), RESET_STREAM_BYTE_LIMIT);
-    if (!journalBytes) throw new Error("reset quarantine transaction journal is absent");
-    const { observation } = await observeResetJournalBytes(root, journalBytes);
+    const bundledJournal = absoluteBundled(bundle, journalArtifact.bundled);
+    const decoded = await decodeResetJournal(await resetJournalFileSource(bundledJournal));
+    if (!decoded.ok) throw new Error(`reset quarantine transaction journal is invalid: ${decoded.error.code}`);
+    const decodedJournal = decoded.journal;
+    const observation = "stateFormat" in decodedJournal
+      ? await (async () => {
+        const { sqliteResetFacade } = await import("./state-plane/reset/index.js");
+        return sqliteResetFacade.observeControlPlane(root, decodedJournal);
+      })()
+      : (await observeResetJournalBytes(
+        root,
+        (await boundedRead(bundledJournal, RESET_JOURNAL_BYTE_LIMIT))!,
+      )).observation;
     const currentRefs = JSON.stringify({ recovery: observation.recoveryRefs, active: observation.activeRefGroups });
     if (String(observation.marker) !== manifest.markerPrecondition || currentRefs !== manifest.refPreconditions) {
       throw new Error("reset quarantine restore refused: marker or recovery refs changed since quarantine");

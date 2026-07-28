@@ -7,9 +7,54 @@ import { withRepositoryRecoveryFence } from "../engine/git/protocol-locks.js";
 import {
   applyStateSavePacket,
   installGenesisResetStateUnderHeldLock,
+  loadState,
   stateLockPath,
   statePath,
+  stateWasStreamMismatch,
 } from "./sync-state-store.js";
+
+for (const archiveSuffix of ["json", "db"] as const) {
+  test(`seq-0 load preserves reset-lineage authorization from a .${archiveSuffix} archive`, async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), `rbox-lineage-${archiveSuffix}-`));
+    await fs.mkdir(path.dirname(statePath(root)), { recursive: true });
+    await fs.writeFile(statePath(root), JSON.stringify({
+      stream: "stream",
+      lastSyncedSequence: 0,
+      lastSyncedManifest: { generatedAt: "", files: [] },
+    }));
+    const lineage = path.join(root, ".rbox", "state", "lineages", "1".repeat(32));
+    await fs.mkdir(lineage, { recursive: true });
+    await fs.writeFile(path.join(lineage, `${"2".repeat(64)}.${archiveSuffix}`), "opaque");
+
+    const loaded = await loadState(root, "stream");
+    expect(stateWasStreamMismatch(loaded)).toBe(true);
+    await fs.rm(root, { recursive: true, force: true });
+  });
+}
+
+test("seq-0 load silently skips stray legacy reset namespace entries", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-lineage-strays-"));
+  try {
+    await fs.mkdir(path.dirname(statePath(root)), { recursive: true });
+    await fs.writeFile(statePath(root), JSON.stringify({
+      stream: "stream",
+      lastSyncedSequence: 0,
+      lastSyncedManifest: { generatedAt: "", files: [] },
+    }));
+    const stateRoot = path.join(root, ".rbox", "state");
+    const lineage = path.join(stateRoot, "lineages", "1".repeat(32));
+    await fs.mkdir(lineage, { recursive: true });
+    await fs.mkdir(path.join(stateRoot, "reset-candidates"));
+    await fs.writeFile(path.join(stateRoot, "lineages", ".DS_Store"), "Finder metadata");
+    await fs.writeFile(path.join(stateRoot, "reset-candidates", "README"), "operator note");
+    await fs.writeFile(path.join(lineage, `${"2".repeat(64)}.json`), "opaque");
+
+    const loaded = await loadState(root, "stream");
+    expect(stateWasStreamMismatch(loaded)).toBe(true);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
 
 test("ordinary state CAS preserves the canonical state.json bytes", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-state-store-"));

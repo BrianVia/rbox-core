@@ -5,7 +5,12 @@
  */
 export {
   createStateStore,
+  checkpointStateStoreForReset,
+  closeOwnedStateStoreReadersForReset,
   openStateStore,
+  openStateStoreForWalTakeover,
+  ownedStateStoreWriterForReset,
+  type ResetCheckpointResult,
   StateStoreHandle,
   stateStoreDatabase,
   type StorePragmas,

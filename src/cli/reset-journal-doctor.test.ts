@@ -8,6 +8,8 @@ import { resetJournalDoctorCmd, withResetJournalDoctorFence } from "./reset-jour
 import { resetJournalPath } from "./reset-journal.js";
 import { resetQuarantineRoot } from "./reset-quarantine.js";
 import { setProtocolLockTraceForTests, type ProtocolLockTraceEvent } from "../engine/git/protocol-locks.js";
+import { inspectResetJournalSafety } from "./reset-halt-inspection.js";
+import crypto from "node:crypto";
 
 let root = "";
 let cfg: WorkspaceConfig;
@@ -51,6 +53,24 @@ test("doctor reset-journal dispatches before ordinary loadState collection", asy
   const output = await capture(() => main());
   expect(output).toContain("malformed reset journal JSON");
   expect(output).toContain("Files on disk are untouched");
+});
+
+test("oversized and nesting-limit halts preserve the legacy diagnostic contract", async () => {
+  await fs.mkdir(path.dirname(resetJournalPath(root)), { recursive: true });
+  const oversized = Buffer.alloc(512 * 1024 + 1, 0x20);
+  await fs.writeFile(resetJournalPath(root), oversized);
+  const oversizedInspection = await inspectResetJournalSafety(root);
+  expect(oversizedInspection).toMatchObject({
+    status: "halt",
+    journalIdentityHash: crypto.createHash("sha256").update(oversized).digest("hex"),
+  });
+
+  const nested = `${"[".repeat(80)}0${"]".repeat(80)}`;
+  await fs.writeFile(resetJournalPath(root), nested);
+  expect(await inspectResetJournalSafety(root)).toMatchObject({
+    status: "halt",
+    reason: "reset-corruption: malformed reset journal JSON (nesting limit)",
+  });
 });
 
 test("malformed journal quarantine is bounded to the journal", async () => {

@@ -7,6 +7,7 @@ import { canonicalize } from "../engine/e2ee/jcs.js";
 import { pruneTrash } from "../engine/trash.js";
 import { boundedHash } from "./reset-io.js";
 import {
+  inspectResetQuarantineResidue,
   quarantineResetUnderFence,
   resetQuarantineRoot,
   restoreResetQuarantineUnderFence,
@@ -111,6 +112,44 @@ describe("reset quarantine transaction", () => {
       }
     });
   }
+
+  test("an ordinary COMMITTED publication failure removes only its exact temp", async () => {
+    const f = await fixture();
+    await expect(quarantineResetUnderFence(f.root, f.plan, {
+      ...fixedHooks,
+      crashAt: (point) => {
+        if (point === "after-commit-temp-fsync") throw new Error("publication failed");
+      },
+    })).rejects.toThrow("publication failed");
+    const [id] = await fs.readdir(resetQuarantineRoot(f.root));
+    const names = await fs.readdir(path.join(resetQuarantineRoot(f.root), id!));
+    expect(names.some((name) => name.endsWith("-COMMITTED"))).toBe(false);
+    expect(names).toContain("manifest.json");
+    expect(names).toContain("artifacts");
+  });
+
+  test("COMMITTED residue is classified without resuming candidate cleanup across Q", async () => {
+    const f = await fixture();
+    await expect(quarantineResetUnderFence(f.root, f.plan, {
+      ...fixedHooks,
+      crashAt: (point) => {
+        if (point === "after-journal-remove") throw new Error("leave residue");
+      },
+    })).rejects.toThrow("leave residue");
+    expect(await fs.lstat(f.journal).catch(() => undefined)).toBeUndefined();
+    const candidateBefore = await fs.readFile(f.candidate);
+    const archiveBefore = await fs.readFile(f.archive);
+
+    const preQ = await inspectResetQuarantineResidue(f.root, "legacy-json");
+    expect(preQ.kind).toBe("quarantine-pending");
+    expect(await fs.readFile(f.candidate)).toEqual(candidateBefore);
+    expect(await fs.readFile(f.archive)).toEqual(archiveBefore);
+
+    const postQ = await inspectResetQuarantineResidue(f.root, "sqlite");
+    expect(postQ.kind).toBe("post-q-quarantine-residue");
+    expect(await fs.readFile(f.candidate)).toEqual(candidateBefore);
+    expect(await fs.readFile(f.archive)).toEqual(archiveBefore);
+  });
 
   test("copies the durable archive and never removes its canonical provenance", async () => {
     const f = await fixture();
@@ -221,7 +260,22 @@ describe("reset quarantine restore", () => {
     }));
     await expect(restoreResetQuarantineUnderFence(f.root, bundle, { configEligible: true }))
       .rejects.toThrow("marker or recovery refs changed");
+    expect(await fs.lstat(f.candidate).catch(() => undefined)).toBeUndefined();
   });
+
+  for (const secondFailure of ["different journal", "changed candidate"] as const) {
+    test(`marker/ref refusal retains precedence over ${secondFailure}`, async () => {
+      const f = await fixture();
+      const bundle = await quarantineResetUnderFence(f.root, f.plan, fixedHooks);
+      await fs.writeFile(path.join(f.root, ".rbox", "state", "state-incarnation.json"), JSON.stringify({
+        stream: "next-stream", stateNonce: "b".repeat(32), stateRevision: 0,
+      }));
+      if (secondFailure === "different journal") await fs.writeFile(f.journal, "replacement journal\n");
+      else await fs.writeFile(f.candidate, "replacement candidate\n");
+      await expect(restoreResetQuarantineUnderFence(f.root, bundle, { configEligible: true }))
+        .rejects.toThrow("marker or recovery refs changed");
+    });
+  }
 
   test("already-recovered exact next state is idempotent success", async () => {
     const f = await fixture();

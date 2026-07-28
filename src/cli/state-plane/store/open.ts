@@ -2,11 +2,13 @@ import { Database } from "bun:sqlite";
 import fs from "node:fs";
 import path from "node:path";
 import { StateStoreOpenError } from "../errors.js";
-import { applySchemaV1, type GenesisLineage } from "../schema/application.js";
+import {
+  applySchemaV1,
+  STATE_STORE_SQLITE_APPLICATION_ID,
+  STATE_STORE_SQLITE_USER_VERSION,
+  type GenesisLineage,
+} from "../schema/application.js";
 import { validateOpen, type StoreHeader } from "../schema/validate-open.js";
-
-const SQLITE_APPLICATION_ID = 0x52424f58;
-const SQLITE_USER_VERSION = 1;
 
 export interface StorePragmas {
   pageSize: number;
@@ -56,8 +58,8 @@ function readPragmas(db: Database): StorePragmas {
 function assertPragmas(values: StorePragmas, readonly: boolean, file: string): void {
   const expected: Partial<StorePragmas> = {
     pageSize: 4096,
-    applicationId: SQLITE_APPLICATION_ID,
-    userVersion: SQLITE_USER_VERSION,
+    applicationId: STATE_STORE_SQLITE_APPLICATION_ID,
+    userVersion: STATE_STORE_SQLITE_USER_VERSION,
     journalMode: "wal",
     synchronous: 2,
     foreignKeys: 1,
@@ -115,6 +117,10 @@ export class StateStoreHandle {
     connection: Database,
   ) {
     connections.set(this, connection);
+    const reference = new WeakRef(this);
+    liveStoreReferences.set(this, reference);
+    liveStores.add(reference);
+    liveStoreFinalizer.register(this, reference, this);
   }
 
   close(): void {
@@ -126,10 +132,71 @@ export class StateStoreHandle {
     }
     connection.close();
     connections.delete(this);
+    const reference = liveStoreReferences.get(this);
+    if (reference) liveStores.delete(reference);
+    liveStoreReferences.delete(this);
+    liveStoreFinalizer.unregister(this);
   }
 }
 
 const connections = new WeakMap<StateStoreHandle, Database>();
+const liveStoreReferences = new WeakMap<StateStoreHandle, WeakRef<StateStoreHandle>>();
+const liveStores = new Set<WeakRef<StateStoreHandle>>();
+const liveStoreFinalizer = new FinalizationRegistry<WeakRef<StateStoreHandle>>((reference) => {
+  liveStores.delete(reference);
+});
+
+function liveStateStores(): StateStoreHandle[] {
+  const stores: StateStoreHandle[] = [];
+  for (const reference of liveStores) {
+    const store = reference.deref();
+    if (store) stores.push(store);
+    else liveStores.delete(reference);
+  }
+  return stores;
+}
+
+export interface ResetCheckpointResult {
+  busy: number;
+  log: number;
+  checkpointed: number;
+}
+
+/**
+ * Reset-only strict checkpoint boundary. Unlike ordinary close(), failure and
+ * a busy reader are observable and therefore cannot be mistaken for an
+ * at-rest file-swap witness.
+ */
+export function checkpointStateStoreForReset(store: StateStoreHandle): ResetCheckpointResult {
+  if (store.readonly) throw new Error("reset checkpoint requires the owning writer");
+  const db = stateStoreDatabase(store);
+  const row = db.query("PRAGMA wal_checkpoint(TRUNCATE)").get() as
+    | { busy?: unknown; log?: unknown; checkpointed?: unknown }
+    | null;
+  const values = row ? Object.values(row) : [];
+  const result = {
+    busy: Number(row?.busy ?? values[0]),
+    log: Number(row?.log ?? values[1]),
+    checkpointed: Number(row?.checkpointed ?? values[2]),
+  };
+  if (![result.busy, result.log, result.checkpointed].every(Number.isSafeInteger)) {
+    throw new Error("reset checkpoint returned an invalid result");
+  }
+  if (result.busy !== 0) throw new Error(`reset checkpoint remained busy (${result.busy})`);
+  return result;
+}
+
+export function closeOwnedStateStoreReadersForReset(file: string): void {
+  // WeakRef discovery is best-effort; any missed live reader makes the strict
+  // checkpoint fail loudly as busy, yielding a transient error rather than corruption.
+  for (const store of liveStateStores()) {
+    if (store.file === file && store.readonly) store.close();
+  }
+}
+
+export function ownedStateStoreWriterForReset(file: string): StateStoreHandle | undefined {
+  return liveStateStores().find((store) => store.file === file && !store.readonly);
+}
 
 /** @internal state-plane vertical only; deliberately omitted from the facade. */
 export function stateStoreDatabase(store: StateStoreHandle): Database {
@@ -153,7 +220,7 @@ export function createStateStore(file: string, genesis: GenesisLineage): StateSt
       throw error;
     }
     db = new Database(file, { create: false, readwrite: true });
-    db.exec(`PRAGMA page_size=4096; PRAGMA application_id=${SQLITE_APPLICATION_ID}; PRAGMA user_version=${SQLITE_USER_VERSION}`);
+    db.exec(`PRAGMA page_size=4096; PRAGMA application_id=${STATE_STORE_SQLITE_APPLICATION_ID}; PRAGMA user_version=${STATE_STORE_SQLITE_USER_VERSION}`);
     configureWriter(db);
     applySchemaV1(db, genesis);
     const header = validateOpen(db, file);
@@ -191,6 +258,25 @@ export function openStateStore(file: string, options: { readonly?: boolean } = {
   } catch (error) {
     try { preflight.close(); } catch {}
     try { opened?.close(); } catch {}
+    throw error;
+  }
+}
+
+/**
+ * W1-only owning-writer open. A read-only preflight is forbidden here because
+ * opening a WAL-mode database may itself participate in recovery.
+ */
+export function openStateStoreForWalTakeover(file: string): StateStoreHandle {
+  let db: Database | undefined;
+  try {
+    db = new Database(file, { create: false, readwrite: true });
+    configureWriter(db);
+    const header = validateOpen(db, file);
+    const pragmas = readPragmas(db);
+    assertPragmas(pragmas, false, file);
+    return new StateStoreHandle(file, false, header, pragmas, db);
+  } catch (error) {
+    try { db?.close(); } catch {}
     throw error;
   }
 }
