@@ -71,6 +71,16 @@ test("a symlink at the state path is refused without its target ever being read"
   expect(await classifyStateFormat(statePath(root))).toBe("foreign");
 });
 
+test("a symlink loop above the state path stays an unexpected error, not a classification", async () => {
+  const root = await workspace("rbox-barrier-loop-");
+  const loop = path.join(root, "loop");
+  await fs.symlink(loop, loop);
+  // ELOOP from resolving an ancestor is not the final-component symlink the
+  // barrier classifies; the old path stat propagated it and so must this.
+  const failure = await classifyStateFormat(path.join(loop, "state.json")).catch((error: unknown) => error);
+  expect((failure as NodeJS.ErrnoException).code).toBe("ELOOP");
+});
+
 test("a symlink swapped in at the path is refused rather than read as the document", async () => {
   const root = await workspace("rbox-barrier-swap-");
   const target = path.join(root, "elsewhere.json");

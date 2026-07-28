@@ -11,7 +11,7 @@
  * The write side is the load-bearing half: a read-time check only protects an
  * operation that read *after* the flip.
  */
-import { constants } from "node:fs";
+import { constants, type Stats } from "node:fs";
 import fs from "node:fs/promises";
 import { StateFormatTooNewError, StateWriteRefusedError } from "./errors.js";
 
@@ -57,22 +57,53 @@ export async function classifyStateFormat(file: string): Promise<StateFormat> {
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ENOENT" || code === "ENOTDIR") return "absent";
-    // ELOOP is O_NOFOLLOW refusing a symlink at the path: not a document this
-    // binary may read or replace, and the same refusal a symlink got before.
-    if (code === "ELOOP") return "foreign";
+    // ELOOP is either O_NOFOLLOW refusing a symlink at the final component —
+    // the case the old path stat classified as foreign — or a symlink loop met
+    // while resolving an ancestor, which was and remains an unexpected error.
+    // This lstat classifies only; nothing is ever read by pathname afterwards,
+    // so it cannot reintroduce the window the descriptor closes.
+    if (code === "ELOOP" && await isSymbolicLinkAtPath(file)) return "foreign";
     throw error;
   }
+  let closed = false;
   try {
     const stat = await handle.stat();
-    if (!stat.isFile() || stat.size === 0) return "foreign";
-    const buffer = Buffer.alloc(Math.min(DETECT_BYTES, stat.size));
-    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
-    const head = buffer.subarray(0, bytesRead);
-    if (stat.size === AUTHORITY_MARKER_BYTES && AUTHORITY_MARKER_RE.test(head.toString("latin1"))) return "authority-marker";
-    return looksLikeJson(head) ? "json" : "foreign";
-  } finally {
-    await handle.close().catch(() => undefined);
+    let head = Buffer.alloc(0);
+    if (stat.isFile() && stat.size > 0) {
+      const buffer = Buffer.alloc(Math.min(DETECT_BYTES, stat.size));
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+      head = buffer.subarray(0, bytesRead);
+    }
+    const format = formatOf(stat, head);
+    // Unlike the sidecars, which suppress a close failure because their only
+    // verdict is "no sample", this returns a verdict a fail-closed barrier acts
+    // on: a close that fails may mean the read never completed. Suppression
+    // stays on the error paths, where it would mask the primary failure.
+    closed = true;
+    await handle.close();
+    return format;
+  } catch (error) {
+    if (!closed) await handle.close().catch(() => undefined);
+    throw error;
   }
+}
+
+/** The whole body of the only pathname lookup this module still performs: it
+ * decides one bit about a path that has already been refused, and nothing is
+ * ever read through it. Kept a separate function so the pinning inventory can
+ * see that containment, which the AST sweep cannot express as "inside a catch". */
+async function isSymbolicLinkAtPath(file: string): Promise<boolean> {
+  try {
+    return (await fs.lstat(file)).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+function formatOf(stat: Stats, head: Buffer): StateFormat {
+  if (!stat.isFile() || stat.size === 0) return "foreign";
+  if (stat.size === AUTHORITY_MARKER_BYTES && AUTHORITY_MARKER_RE.test(head.toString("latin1"))) return "authority-marker";
+  return looksLikeJson(head) ? "json" : "foreign";
 }
 
 /** True only for the exact 58-byte marker. Exposed for fixtures and tests;

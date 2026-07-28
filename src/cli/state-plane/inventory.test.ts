@@ -228,17 +228,35 @@ describe("state barrier pinning inventory", () => {
 
   test("the barrier read classifies from one no-follow descriptor", () => {
     const file = "src/cli/state-plane/authority-marker.ts";
-    const open = requiredCall(file, "classifyStateFormat", "fs.open");
-    expect(
-      open.arguments?.[1] ?? "",
-      "classifyStateFormat must open the state path with O_NOFOLLOW, or a symlink swapped in at the path is read as the document",
-    ).toContain("O_NOFOLLOW");
-    const pathLookups = callsIn(file, "classifyStateFormat")
-      .filter((site) => ["fs.lstat", "fs.stat", "fs.readFile"].some((callee) => calleeMatches(site, callee)));
+    const calls = callsIn(file, "classifyStateFormat");
+
+    const opens = calls.filter((site) => calleeMatches(site, "fs.open"));
+    expect(opens.length, "classifyStateFormat must take exactly one descriptor").toBe(1);
+    for (const open of opens) {
+      expect(
+        open.arguments?.[1] ?? "",
+        "classifyStateFormat must open the state path with O_NOFOLLOW, or a symlink swapped in at the path is read as the document",
+      ).toContain("O_NOFOLLOW");
+    }
+
+    // Type, size, and bytes must all come from that descriptor.
+    for (const callee of ["handle.stat", "handle.read"]) requiredCall(file, "classifyStateFormat", callee);
+
+    // The AST sweep records calls per enclosing function, not per enclosing
+    // `catch`, so the one permitted pathname lookup — classifying an ELOOP that
+    // O_NOFOLLOW raised — is pinned by living alone in `isSymbolicLinkAtPath`,
+    // whose whole body is checked below. Nothing else here may name the path.
+    const pathnameApis = ["fs.lstat", "fs.stat", "fs.readFile", "fs.readlink", "fs.opendir", "fs.access", "fs.realpath"];
+    const pathLookups = calls.filter((site) => pathnameApis.some((callee) => calleeMatches(site, callee)));
     expect(
       pathLookups.map((site) => `${site.callee}:${site.line}`),
       "the classification must be decided from the descriptor, not from a second pathname lookup",
     ).toEqual([]);
+
+    expect(
+      callsIn(file, "isSymbolicLinkAtPath").map((site) => site.callee),
+      "the permitted lstat must only classify — a read through it would reopen the swap window",
+    ).toEqual(["(await fs.lstat(file)).isSymbolicLink", "fs.lstat"]);
   });
 
   test("every exemption states a reason", () => {
