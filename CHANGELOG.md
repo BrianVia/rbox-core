@@ -6,7 +6,19 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-07-28
+
 ### Added
+- **`rbox include` — sync only the folders you include on this machine.**
+  A laptop that only needs one project no longer has to hold the whole
+  workspace: `rbox include add Personal/repo-A` keeps just that folder synced,
+  and `rbox track --workspace <id> --include Personal/repo-A` joins a
+  workspace already scoped that way (repeat `--include` for more folders). A
+  machine that syncs only some folders receives changes but never sends them,
+  so a partial view can never overwrite the rest of the fleet — push code out
+  of it with git. Folders are workspace-relative, and a folder cannot cut a
+  git repository in half. `rbox include remove` moves that folder's files to
+  the local trash, and `rbox trash restore` undoes it.
 - **rbox now protects your folder's sync records from a future upgrade.** A
   later version of rbox will store those records differently. From this release
   on, rbox recognizes the newer format and stops rather than writing the older
