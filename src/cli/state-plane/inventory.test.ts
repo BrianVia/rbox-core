@@ -19,6 +19,8 @@ import path from "node:path";
 
 const REPO = path.resolve(import.meta.dir, "../../..");
 const SWEEP = path.join(import.meta.dir, "..", "sync-git", "base-composer-ast-sweep.mjs");
+// 16,683 bytes when introduced; leave room for new guarded entry points.
+const AST_SWEEP_MAX_BYTES = 24 * 1024;
 
 /** Text that constructs or names `.rbox/state.json`. */
 const STATE_PATH_ARGUMENT = /\bstatePath\(|\bactiveStatePath\(|["']state\.json["']/;
@@ -86,9 +88,15 @@ const EXEMPT: ReadonlyMap<string, { sites: number; reason: string }> = new Map([
 let cached: AstSite[] | undefined;
 function astSites(): AstSite[] {
   if (cached) return cached;
-  const result = Bun.spawnSync(["node", SWEEP, REPO]);
+  const result = Bun.spawnSync(["node", SWEEP, REPO, "state-plane-inventory"]);
   if (!result.success) throw new Error(result.stderr.toString() || `AST sweep exited ${result.exitCode}`);
-  cached = JSON.parse(result.stdout.toString()) as AstSite[];
+  expect(result.stdout.byteLength, "AST sweep returned empty stdout").toBeGreaterThan(0);
+  expect(result.stdout.byteLength, "AST sweep output exceeded its transport budget")
+    .toBeLessThanOrEqual(AST_SWEEP_MAX_BYTES);
+  const parsed: unknown = JSON.parse(result.stdout.toString());
+  expect(Array.isArray(parsed), "AST sweep output was not an array").toBeTrue();
+  expect(parsed.length, "AST sweep returned no records").toBeGreaterThan(0);
+  cached = parsed as AstSite[];
   return cached;
 }
 
