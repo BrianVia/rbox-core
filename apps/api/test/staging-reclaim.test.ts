@@ -1,6 +1,6 @@
 import { applyD1Migrations, env } from "cloudflare:test";
 import { beforeAll, describe, expect, test } from "vitest";
-import { gcStagingSweep, STAGING_ORPHAN_MIN_AGE_MS } from "../src/versions.js";
+import { gcStagingSweep, STAGING_ORPHAN_MIN_AGE_MS } from "../src/staging-gc.js";
 
 // Regression: `staging/` R2 objects had NO reclaimer. R2's 7-day multipart TTL only covers
 // INCOMPLETE uploads; after `mpu.complete()` the staging key is an ordinary TTL-free object

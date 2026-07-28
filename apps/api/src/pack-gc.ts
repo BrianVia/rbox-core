@@ -13,7 +13,7 @@ import {
   renewLease,
   writeState,
   type PurgeLease,
-} from "./versions.js";
+} from "./gc-state.js";
 
 export const PACK_INTENT_QUIESCENCE_MS = 24 * 3600_000;
 export const PACK_GC_CLOCK_STALENESS_MS = 3600_000;

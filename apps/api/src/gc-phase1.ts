@@ -1,7 +1,7 @@
 import type { Env } from "./env.js";
 import { errClass, json, sha256Hex } from "./util.js";
 import { isOverCapAbort } from "./auth.js";
-import { MAX_UNIQUE_ROOTS, reachableFromWorkspaces } from "./versions.js";
+import { MAX_UNIQUE_ROOTS, reachableFromWorkspaces } from "./gc-roots.js";
 import { dbFor } from "./db.js";
 
 // Max rows per multi-row INSERT so bound params stay within D1's ≤100/statement limit
@@ -26,7 +26,7 @@ async function writeCursor(db: D1Database, key: string, value: string): Promise<
 // phase). PURE D1: it reclaims a `blob_refs` row + its `used_bytes` charge for refs
 // that are no longer reachable from the account's authoritative DO roots. It touches
 // NO R2 — it only CONDEMNS a now-globally-unreferenced blob into `gc_candidates` for
-// the existing manual/quiescent Phase 2 (canonical R2) sweep (worker.ts, versions.ts).
+// the existing manual/quiescent Phase 2 (canonical R2) sweep (`gc-purge.ts`, scheduled by worker.ts).
 //
 // This closes the design 30 §3 / design 07b §d entitlement leak (over-cap partial
 // charges + head-409 orphans that stranded `blob_refs` + `used_bytes` forever).

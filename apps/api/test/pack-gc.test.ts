@@ -18,7 +18,9 @@ import {
   runPackGc,
 } from "../src/pack-gc.js";
 import { CLOCK_SKEW_MS, RECEIPT_TTL_MS } from "../src/receipts.js";
-import { gcPurge, INTENT_QUIESCENCE_MS, PURGE_LEASE_TTL_MS } from "../src/versions.js";
+import { INTENT_QUIESCENCE_MS } from "../src/gc-policy.js";
+import { gcPurge } from "../src/gc-purge.js";
+import { PURGE_LEASE_TTL_MS } from "../src/gc-state.js";
 import { WorkspaceSync } from "../src/workspace-sync.js";
 import { blobGet, blobPut, blobsCheck } from "../src/blobs.js";
 import { phase1Purge } from "../src/gc-phase1.js";
