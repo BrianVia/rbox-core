@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { RBOX_TMP_PREFIX } from "../engine/fsutil.js";
 import { acquireLock } from "../engine/git/lockfile.js";
 import {
   AUTHORITY_MARKER_BYTES,
@@ -48,6 +49,24 @@ async function workspace(prefix: string): Promise<string> {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
   await fs.mkdir(path.join(root, ".rbox", "state"), { recursive: true });
   return root;
+}
+
+async function expectReserveCreationFaultToSelfHeal(
+  step: "header-written" | "fill-written" | "temp-synced",
+): Promise<void> {
+  const root = await workspace(`rbox-reserve-fault-${step}-`);
+  const failed = await ensureStateReserve(root, "stream", "1.11.0", {
+    onStep: (observed) => {
+      if (observed === step) throw new Error(`injected-${step}`);
+    },
+  });
+  expect(failed.status).toBe("unavailable");
+  await expect(fs.lstat(stateReservePath(root))).rejects.toThrow();
+  expect((await fs.readdir(path.dirname(stateReservePath(root))))
+    .filter((name) => name.startsWith(RBOX_TMP_PREFIX))).toEqual([]);
+
+  expect((await ensureStateReserve(root, "stream", "1.11.0")).status).toBe("created");
+  expect((await inspectStateReserve(root, "stream")).status).toBe("adopted");
 }
 
 const legacyState = (stream = "stream") => ({
@@ -198,6 +217,36 @@ test("the reserve is created once at exactly 1 MiB and then adopted", async () =
   expect(parseReserveHeader(bytes.subarray(0, RESERVE_HEADER_BYTES))?.streamSha256).toBe(streamDigest("stream"));
   expect(bytes.subarray(RESERVE_HEADER_BYTES).every((byte) => byte === 0)).toBe(true);
   expect((await ensureStateReserve(root, "stream")).status).toBe("adopted");
+});
+
+test("a reserve fault after the header write self-heals on the next attempt", async () => {
+  await expectReserveCreationFaultToSelfHeal("header-written");
+});
+
+test("a reserve fault after the fill write self-heals on the next attempt", async () => {
+  await expectReserveCreationFaultToSelfHeal("fill-written");
+});
+
+test("a reserve fault after the temp fsync self-heals on the next attempt", async () => {
+  await expectReserveCreationFaultToSelfHeal("temp-synced");
+});
+
+test("a reserve final-name collision classifies the winner and leaves no temp", async () => {
+  const root = await workspace("rbox-reserve-claim-collision-");
+  const digest = streamDigest("stream");
+  const winner = Buffer.concat([buildReserveHeader("1.11.0", digest), Buffer.alloc(RESERVE_FILL_BYTES)]);
+
+  const raced = await ensureStateReserve(root, "stream", "1.11.0", {
+    onStep: async (step) => {
+      if (step === "before-final-claim") await fs.writeFile(stateReservePath(root), winner);
+    },
+  });
+
+  expect(raced.status).toBe("adopted");
+  expect(await fs.readFile(stateReservePath(root))).toEqual(winner);
+  expect((await fs.readdir(path.dirname(stateReservePath(root))))
+    .filter((name) => name.startsWith(RBOX_TMP_PREFIX))).toEqual([]);
+  expect((await ensureStateReserve(root, "stream", "1.11.0")).status).toBe("adopted");
 });
 
 test("a foreign reserve is never adopted, truncated, or deleted", async () => {
