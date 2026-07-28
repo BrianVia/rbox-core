@@ -35,7 +35,6 @@ export interface RepublishRequestsV1 {
 
 export type RepublishStoreRead =
   | { status: "absent" }
-  | { status: "foreign" }
   | { status: "corrupt" }
   | { status: "valid"; record: RepublishRequestsV1 };
 
@@ -85,7 +84,10 @@ function validate(value: unknown): RepublishRequestsV1 | undefined {
 
 /** Classify the store. `corrupt` is distinct from `absent` so a writer refuses
  *  to overwrite bytes an operator may still recover intent from, while a
- *  read-only planner can safely carry on with no requests. */
+ *  read-only planner can safely carry on with no requests. A store written
+ *  under another `stream` reads as `absent`: it belongs to a workspace this
+ *  state no longer is, so it carries no authority to force or settle anything
+ *  here and is replaced rather than merged. */
 export async function readRepublishStore(root: string, stream: string): Promise<RepublishStoreRead> {
   let raw: unknown;
   try {
@@ -96,7 +98,7 @@ export async function readRepublishStore(root: string, stream: string): Promise<
   if (raw === undefined) return { status: "absent" };
   const record = validate(raw);
   if (!record) return { status: "corrupt" };
-  if (record.stream !== stream) return { status: "foreign" };
+  if (record.stream !== stream) return { status: "absent" };
   return { status: "valid", record };
 }
 
@@ -131,15 +133,11 @@ async function writeStore(root: string, stream: string, requests: readonly Repub
   await fsyncCreatedDirectoryAncestors(parent, created);
 }
 
-export type RecordRepublishStatus = "recorded" | "already-pending";
-
 export interface RecordRepublishResult {
-  status: RecordRepublishStatus;
+  status: "recorded" | "already-pending";
   requestedAt: string;
   pending: number;
 }
-
-export class RepublishStoreError extends Error {}
 
 /** Install (or observe) a pending request for one repository. Re-requesting a
  *  repository whose request has not settled keeps the ORIGINAL request: the
@@ -152,21 +150,19 @@ export async function recordRepublishRequest(
   base: RepublishBase,
   now: Date,
 ): Promise<RecordRepublishResult> {
-  if (!validRelPath(relPath)) throw new RepublishStoreError("invalid repository path");
+  if (!validRelPath(relPath)) throw new Error("invalid repository path");
   if (!HEX64.test(base.bundleSha) || !validTimestamp(base.generatedAt)) {
-    throw new RepublishStoreError("this repository has no published Git bundle to supersede");
+    throw new Error("this repository has no published Git bundle to supersede");
   }
   const read = await readRepublishStore(root, stream);
   if (read.status === "corrupt") {
-    throw new RepublishStoreError(`the republish request file is unreadable — inspect and remove ${republishRequestsPath(root)}, then run this again`);
+    throw new Error(`the republish request file is unreadable — inspect and remove ${republishRequestsPath(root)}, then run this again`);
   }
-  // A store bound to a previous workspace binding carries no authority here and
-  // is replaced rather than merged.
   const current = read.status === "valid" ? read.record.requests : [];
   const existing = current.find((request) => request.relPath === relPath);
   if (existing) return { status: "already-pending", requestedAt: existing.requestedAt, pending: current.length };
   if (current.length >= REPUBLISH_REQUESTS_MAX) {
-    throw new RepublishStoreError(`${REPUBLISH_REQUESTS_MAX} chain restarts are already pending — let them publish before requesting another`);
+    throw new Error(`${REPUBLISH_REQUESTS_MAX} chain restarts are already pending — let them publish before requesting another`);
   }
   const requestedAt = now.toISOString();
   const next = [...current, { relPath, requestedAt, baseBundleSha: base.bundleSha, baseGeneratedAt: base.generatedAt }];
@@ -176,7 +172,7 @@ export async function recordRepublishRequest(
   // a success the next push will not act on.
   const confirmed = await readRepublishStore(root, stream);
   if (confirmed.status !== "valid" || !confirmed.record.requests.some((request) => request.relPath === relPath)) {
-    throw new RepublishStoreError("a concurrent sync replaced the request file — run this command again");
+    throw new Error("a concurrent sync replaced the request file — run this command again");
   }
   return { status: "recorded", requestedAt, pending: next.length };
 }

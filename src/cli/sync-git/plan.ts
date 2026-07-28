@@ -116,9 +116,6 @@ export interface GitPlanOptions {
   filesFirstDefer?: boolean;
   /** Deterministic design-130 tombstone timestamp seam. */
   now?: () => Date;
-  /** #526 test seam: the pending chain-restart set. Production reads it from
-   *  `.rbox/state/git-republish.json`; tests inject it directly. */
-  republish?: ReadonlySet<string>;
   /** Awaited daemon registry observer; errors are observability-only. */
   onGitReposDiscovered?: (repos: readonly DiscoveredGitRepo[]) => Promise<void>;
   /** Deterministic test seam for a ref race after B's provisional pre-probe. */
@@ -175,11 +172,8 @@ export async function planGitSections(
   // no basis, but — unlike a 422 force, whose BASE references blobs the server has
   // LOST — its base is still valid server-side, so a failed republish capture takes
   // the ordinary defer-with-base-carry path and stays pending.
-  const republishInput = options.republish
-    ? { repos: options.republish }
-    : await republishPlanInput(root, syncStreamId(cfg));
-  const republish = republishInput.repos;
-  if (republishInput.warning) options.onGitLog?.(republishInput.warning);
+  const { repos: republish, warning: republishWarning } = await republishPlanInput(root, syncStreamId(cfg));
+  if (republishWarning) options.onGitLog?.(republishWarning);
   if (republish.size > 0) options.onGitLog?.(`git-sync republish pending ${[...republish].sort().join(", ")}`);
   const mustCapture = (rel: string): boolean => force.has(rel) || republish.has(rel);
   // Design 204 §5.1: one policy read at entry. The legacy arm retains the

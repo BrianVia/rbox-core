@@ -90,7 +90,7 @@ test("settling one repository leaves a request installed for another repository"
 
 test("a store written under another workspace binding never forces or settles here", async () => {
   await recordRepublishRequest(root, STREAM, "repo", BASE, at("2026-07-28T00:00:00.000Z"));
-  expect(await readRepublishStore(root, "stream-b")).toEqual({ status: "foreign" });
+  expect(await readRepublishStore(root, "stream-b")).toEqual({ status: "absent" });
   expect((await republishPlanInput(root, "stream-b")).repos.size).toBe(0);
   expect(await settleRepublishRequests(root, "stream-b", { repo: section() })).toEqual([]);
   expect((await republishPlanInput(root, STREAM)).repos).toEqual(new Set(["repo"]));

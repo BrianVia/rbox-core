@@ -58,7 +58,7 @@ mode 0600):
 
 Local-only bookkeeping — never synced, never on the wire, and removed by
 `reset-state.ts`'s sidecar cleanup. It is stamped with the workspace `stream`,
-so a store left behind by a previous binding reads as `foreign` and can neither
+so a store left behind by a previous binding reads as `absent` and can neither
 force nor settle anything. Entries are sorted by `relPath`; a request beyond
 `REPUBLISH_REQUESTS_MAX` (256) is **refused**, never evicted — a command that
 returned success must not have its intent silently revoked.
@@ -226,9 +226,9 @@ agent can assert the outcome without parsing prose.
 | 6 | Successful keep-mine publications bypass settlement | **Folded.** Settlement is a shared helper called on both the ACCEPTED commit and the `published` resolution transition — never on aborted, authentication-failed, or uncertain outcomes. |
 | 7 | "Base section or repo record" admits unconsumable requests | **Folded.** Admission requires `syncGit`, a BASE, and no suppressing disposition. |
 | 8 | Base-carry on failure is not universal (structural preflight / missing dir drop instead) | **Folded (wording + admission).** The spec no longer claims universal carry; those states are refused up front. |
-| 9 | Corrupt store silently overwritten, promised diagnostic never emitted | **Folded.** `absent` / `foreign` / `corrupt` / `valid` are distinct; planner fails open *with* the log line, writer refuses. |
+| 9 | Corrupt store silently overwritten, promised diagnostic never emitted | **Folded.** `corrupt` is distinct from `absent`; planner fails open *with* the log line, writer refuses. |
 | 10 | Cap evicts a live request | **Folded.** Refuse at capacity instead. |
-| 11 | Requests not bound to workspace lineage; reset cleanup omits the file | **Folded.** Store stamped with `stream`; mismatch reads as `foreign`; added to `reset-state.ts` cleanup. |
+| 11 | Requests not bound to workspace lineage; reset cleanup omits the file | **Folded.** Store stamped with `stream`; a mismatch reads as `absent`, so it can neither force nor settle and is replaced rather than merged; added to `reset-state.ts` cleanup. |
 | 12 | Mid-chain acceptance proof was wrong (apply compares projected key, not incoming key) | **Folded.** Proof rewritten to cover stranded/pending vs already-converged receivers, plus a test that the next incremental still imports after a skipped restart. |
 
 ## Out of scope

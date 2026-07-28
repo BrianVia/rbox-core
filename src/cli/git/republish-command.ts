@@ -1,4 +1,5 @@
 import path from "node:path";
+import type { GitSection } from "../../engine/types.js";
 import { loadConfig, loadState, repoRecordsForState, syncStreamId, type SyncState } from "../config.js";
 import { recordRepublishRequest } from "../sync-git/republish-requests.js";
 
@@ -30,15 +31,15 @@ function normalizedRepo(root: string, arg: string): string {
  * publisher-absence dispositions, so those are refused here with the reason
  * rather than parked as an intent that never settles.
  */
-function admissionRefusal(state: SyncState, rel: string): string | undefined {
+function admit(state: SyncState, rel: string): { base: GitSection } | { refusal: string } {
   const record = repoRecordsForState(state)[rel];
   const base = record?.base ?? state.lastSyncedManifest.gitRepos?.[rel];
-  if (!base) return `no published Git state for ${rel} yet — there is no pack chain to restart`;
-  if (record?.repoAbsent === true) return `${rel} is currently omitted from publication — see \`rbox git deferrals\` first`;
-  if (record?.removedKey !== undefined) return `${rel} is recorded as removed — re-add it before requesting a chain restart`;
-  if (record?.resolutionKey !== undefined) return `${rel} is waiting on \`rbox git resolve\` — settle that first`;
-  if (record?.pending !== undefined) return `${rel} has protected incoming Git state waiting to apply — let it settle, or resolve it, first`;
-  return undefined;
+  if (!base) return { refusal: `no published Git state for ${rel} yet — there is no pack chain to restart` };
+  if (record?.repoAbsent === true) return { refusal: `${rel} is currently omitted from publication — see \`rbox git deferrals\` first` };
+  if (record?.removedKey !== undefined) return { refusal: `${rel} is recorded as removed — re-add it before requesting a chain restart` };
+  if (record?.resolutionKey !== undefined) return { refusal: `${rel} is waiting on \`rbox git resolve\` — settle that first` };
+  if (record?.pending !== undefined) return { refusal: `${rel} has protected incoming Git state waiting to apply — let it settle, or resolve it, first` };
+  return { base };
 }
 
 /**
@@ -61,10 +62,9 @@ export async function gitRepublishCmd(
     if (cfg.syncGit !== true) throw new Error("Git syncing is off for this workspace, so there is no pack chain to restart");
     const stream = syncStreamId(cfg);
     const state = await (deps.loadState ?? loadState)(root, stream);
-    const refusal = admissionRefusal(state, rel);
-    if (refusal) throw new Error(refusal);
-    const base = repoRecordsForState(state)[rel]?.base ?? state.lastSyncedManifest.gitRepos![rel]!;
-
+    const admission = admit(state, rel);
+    if ("refusal" in admission) throw new Error(admission.refusal);
+    const { base } = admission;
     const result = await recordRepublishRequest(root, stream, rel, { bundleSha: base.bundleSha, generatedAt: base.generatedAt }, (deps.now ?? (() => new Date()))());
     if (options.json) {
       write(JSON.stringify({ schemaVersion: 1, repo: rel, status: result.status, requestedAt: result.requestedAt, pending: result.pending }));
