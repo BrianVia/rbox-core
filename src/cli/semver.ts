@@ -13,6 +13,7 @@ export interface SemVer {
 export type ReleaseChannel = "latest" | "next";
 
 const RE = /^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/;
+const DEV_BUILD_RE = /^dev\.[0-9a-f]{7,64}$/i;
 
 export function parseSemver(s: string): SemVer {
   const m = RE.exec(s.trim());
@@ -63,14 +64,21 @@ function comparePrerelease(a: string, b: string): number {
 }
 
 /** True iff `a` is strictly newer than `b`. A release (no prerelease) outranks the
- *  same x.y.z prerelease; prereleases use semver §11 identifier precedence. */
+ *  same x.y.z prerelease; prereleases use semver §11 identifier precedence.
+ *
+ * Build metadata normally has equal semver precedence. rbox adds one operational
+ * tie-break: an unadorned version outranks the same version carrying `dev.*`
+ * metadata. That lets an official release replace a local build of itself without
+ * making one local build newer than another. */
 export function semverGt(a: string, b: string): boolean {
   const x = parseSemver(a);
   const y = parseSemver(b);
   for (const k of ["major", "minor", "patch"] as const) {
     if (x[k] !== y[k]) return x[k] > y[k];
   }
-  if (x.prerelease === y.prerelease) return false;
+  if (x.prerelease === y.prerelease) {
+    return x.build === null && y.build !== null && DEV_BUILD_RE.test(y.build);
+  }
   if (x.prerelease === null) return true; // release > prerelease of same x.y.z
   if (y.prerelease === null) return false;
   return comparePrerelease(x.prerelease, y.prerelease) > 0;

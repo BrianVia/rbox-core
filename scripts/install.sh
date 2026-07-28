@@ -39,7 +39,8 @@ mkdir -p "$DEST"
 # the embedded release keyring; POSIX sh does not ship a second public-key verifier.
 TMP="$DEST/.rbox.install.$$"
 MANIFEST="$DEST/.rbox.install.$$.version"
-trap 'rm -f "$TMP" "$MANIFEST"' EXIT INT TERM
+CHANNEL_TMP="$DEST/.rbox.install.$$.channel"
+trap 'rm -f "$TMP" "$MANIFEST" "$CHANNEL_TMP"' EXIT INT TERM
 
 if ! curl -fSL --proto '=https' --proto-redir '=https' "$BASE/version" -o "$MANIFEST"; then
   echo "rbox: release manifest download failed from $BASE/version" >&2
@@ -81,6 +82,9 @@ fi
 
 chmod +x "$TMP"
 mv -f "$TMP" "$DEST/rbox"
+# The stable installer is also the explicit way back from the opt-in next
+# channel. Keep the install-scoped upgrade setting symmetric with the binary.
+rm -f "$DEST/rbox.channel.json"
 rm -f "$MANIFEST"
 trap - EXIT INT TERM
 

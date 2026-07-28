@@ -93,7 +93,10 @@ test("pending floor survives failure before rename, blocks intermediates, and pe
     consoleLog.mockRestore();
   }
   expect(await fs.readFile(executable, "utf8")).toBe("old-binary");
-  expect(logs).toEqual([`an upgrade to ${target} is incomplete — run \`rbox upgrade\` again to finish it`]);
+  expect(logs).toEqual([
+    "checking the latest channel…",
+    `an upgrade to ${target} is incomplete — run \`rbox upgrade\` again to finish it`,
+  ]);
 
   serve(targetBinary);
   const repairLog = spyOn(console, "log").mockImplementation(() => {});
@@ -134,7 +137,10 @@ test("failure after executable rename retains a pending floor that blocks rollba
     consoleLog.mockRestore();
   }
   expect(await fs.readFile(executable)).toEqual(targetBinary);
-  expect(logs).toEqual([`an upgrade to ${target} is incomplete — run \`rbox upgrade\` again to finish it`]);
+  expect(logs).toEqual([
+    "checking the latest channel…",
+    `an upgrade to ${target} is incomplete — run \`rbox upgrade\` again to finish it`,
+  ]);
 });
 
 test("check mode distinguishes pending and committed floors above the running version", async () => {
@@ -157,7 +163,9 @@ test("check mode distinguishes pending and committed floors above the running ve
     consoleLog.mockRestore();
   }
   expect(logs).toEqual([
+    "checking the latest channel…",
     `an upgrade to ${target} is incomplete — run \`rbox upgrade\` again to finish it`,
+    "checking the latest channel…",
     `verified upgrade floor is ${target}; this process is ${RBOX_VERSION} — run \`rbox upgrade\` again from a fresh shell`,
   ]);
 });

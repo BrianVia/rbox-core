@@ -44,8 +44,10 @@ test("channel parser refuses every non-channel value", () => {
   expect(() => parseUpgradeChannel("beta")).toThrow("expected latest or next");
 });
 
-test("malformed persisted settings fail closed", async () => {
+test("malformed persisted settings fail closed until an explicit selection repairs them", async () => {
   const exe = await executable();
   await fs.writeFile(upgradeChannelPath(exe), '{"schema":1,"channel":"beta"}\n');
   await expect(readUpgradeChannel(exe)).rejects.toThrow("expected latest or next");
+  await writeUpgradeChannel(exe, "next");
+  expect(await readUpgradeChannel(exe)).toBe("next");
 });

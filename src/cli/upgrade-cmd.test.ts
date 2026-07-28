@@ -159,16 +159,20 @@ test("upgrade command check mode does not restart stale daemons at the current-v
   }
   expect(actions).toEqual([]);
   expect(logs).toEqual([]);
-  expect(consoleLogs).toEqual([`already up to date (${RBOX_VERSION})`]);
+  expect(consoleLogs).toEqual([
+    "checking the latest channel…",
+    `already up to date (${RBOX_VERSION})`,
+  ]);
 });
 
 test("next channel persists per install and derives both manifest URLs", async () => {
   const urls: string[] = [];
+  const consoleLogs: string[] = [];
   globalThis.fetch = async (input) => {
     urls.push(String(input));
     return new Response("fixture", { status: 200 });
   };
-  const consoleLog = spyOn(console, "log").mockImplementation(() => {});
+  const consoleLog = spyOn(console, "log").mockImplementation((...args) => void consoleLogs.push(args.join(" ")));
   try {
     await upgradeCmd("https://releases.example/", {
       check: true,
@@ -188,7 +192,32 @@ test("next channel persists per install and derives both manifest URLs", async (
     "https://releases.example/next/version",
     "https://releases.example/next/version.sig",
   ]);
+  expect(consoleLogs.filter((line) => line === "checking the next channel…")).toHaveLength(2);
   expect(JSON.parse(await fs.readFile(`${executable}.channel.json`, "utf8"))).toEqual({ schema: 1, channel: "next" });
+});
+
+test("explicit channel repairs a corrupt persisted setting while an unflagged upgrade fails closed", async () => {
+  const channelFile = `${executable}.channel.json`;
+  await fs.writeFile(channelFile, '{"schema":1,"channel":"beta"}\n');
+  serve();
+  await expect(upgradeCmd("https://releases.example", {
+    check: true,
+    commandDeps: { ...commandDeps(manifest(RBOX_VERSION)), isElevated: () => true },
+  })).rejects.toThrow("expected latest or next");
+
+  const consoleLogs: string[] = [];
+  const consoleLog = spyOn(console, "log").mockImplementation((...args) => void consoleLogs.push(args.join(" ")));
+  try {
+    await upgradeCmd("https://releases.example", {
+      check: true,
+      channel: "next",
+      commandDeps: { ...commandDeps(manifest(RBOX_VERSION)), isElevated: () => true },
+    });
+  } finally {
+    consoleLog.mockRestore();
+  }
+  expect(consoleLogs[0]).toBe("checking the next channel…");
+  expect(JSON.parse(await fs.readFile(channelFile, "utf8"))).toEqual({ schema: 1, channel: "next" });
 });
 
 test("switching from next to an older latest refuses and leaves next persisted", async () => {
@@ -280,6 +309,7 @@ test("post-lock loser with a newer floor leaves daemons to a fresh process", asy
   expect(actions).toEqual([]);
   expect(logs).toEqual([]);
   expect(consoleLogs).toEqual([
+    "checking the latest channel…",
     `verified upgrade floor is ${version}; this process is ${RBOX_VERSION} — run \`rbox upgrade\` again from a fresh shell`,
   ]);
   expect(await fs.readFile(executable, "utf8")).toBe("old-binary");
@@ -321,7 +351,10 @@ test("elevated equal-version upgrade never enters home-scoped daemon or release 
   }
   expect(actions).toEqual([]);
   expect(logs).toEqual([]);
-  expect(consoleLogs).toEqual([`already up to date (${RBOX_VERSION})`]);
+  expect(consoleLogs).toEqual([
+    "checking the latest channel…",
+    `already up to date (${RBOX_VERSION})`,
+  ]);
   expect(fsSync.existsSync(home)).toBe(false);
 });
 
@@ -373,6 +406,7 @@ test("elevated successful upgrade keeps state beside the executable and skips us
   expect(actions).toEqual([]);
   expect(logs).toEqual([]);
   expect(consoleLogs).toEqual([
+    "checking the latest channel…",
     `upgraded ${RBOX_VERSION} → ${version}`,
     "run `rbox upgrade` once without sudo to restart user daemons on the new version",
   ]);

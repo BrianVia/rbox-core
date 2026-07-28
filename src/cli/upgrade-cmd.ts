@@ -352,9 +352,13 @@ export async function upgradeCmd(remoteUrl: string, opts: { check?: boolean; cha
     lockPath: `${exe}.upgrade.lock`,
   });
   const name = artifactName();
-  const [priorChannel, requestedChannel] = [await readUpgradeChannel(exe), parseUpgradeChannel(opts.channel)];
-  const channel = requestedChannel ?? priorChannel;
+  const requestedChannel = parseUpgradeChannel(opts.channel);
+  // An explicit selection is authoritative and repairs an unreadable persisted
+  // setting. Silent reads retain the fail-closed behavior.
+  const priorChannel = requestedChannel === undefined ? await readUpgradeChannel(exe) : undefined;
+  const channel = requestedChannel ?? priorChannel!;
   const manifestBase = upgradeManifestBase(remoteUrl, channel);
+  console.log(`checking the ${channel} channel…`);
   const [manifestBytes, sigBytes] = await Promise.all([fetchBytes(`${manifestBase}/version`), fetchBytes(`${manifestBase}/version.sig`)]);
   const manifest = (opts.commandDeps?.verifyAndParseManifest ?? verifyAndParseManifest)(manifestBytes, sigBytes);
 
@@ -382,15 +386,15 @@ export async function upgradeCmd(remoteUrl: string, opts: { check?: boolean; cha
     return art;
   };
   const applyChannelSelection = async (lockedFloor: EffectiveFloor): Promise<void> => {
-    const currentChannel = await readUpgradeChannel(exe);
     if (requestedChannel === undefined) {
+      const currentChannel = await readUpgradeChannel(exe);
       if (currentChannel !== priorChannel) throw new Error("upgrade channel changed while this upgrade was running — retry");
       return;
     }
-    if (requestedChannel === "latest" && currentChannel === "next" && semverGt(lockedFloor.version, manifest.version)) {
+    if (requestedChannel === "latest" && semverGt(lockedFloor.version, manifest.version)) {
       throw new Error(`cannot switch to the latest channel: installed rbox ${lockedFloor.version} is newer than latest ${manifest.version}; install a newer latest release before switching back`);
     }
-    if (requestedChannel !== currentChannel) await writeUpgradeChannel(exe, requestedChannel);
+    await writeUpgradeChannel(exe, requestedChannel);
   };
 
   // 2. Forward-only: never install below the executable-scoped durable floor.

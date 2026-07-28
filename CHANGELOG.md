@@ -6,6 +6,15 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **Opt in to preview CLI releases without moving the stable fleet.**
+  Install the preview channel with
+  `curl -fsSL https://rbox.to/next/install.sh | sh`, or switch an existing
+  installation with `rbox upgrade --channel next`. The choice persists beside
+  that installed binary; `rbox upgrade --channel latest` switches back once
+  stable has caught up, and the normal stable installer clears the preview
+  choice.
+
 ## [1.11.0] - 2026-07-28
 
 ### Added

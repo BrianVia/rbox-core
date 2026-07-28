@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import type { Manifest } from "../src/cli/release-verify.js";
@@ -10,8 +11,10 @@ import {
   nextInstallerSource,
   publishReleaseChannel,
   releaseChannelForInput,
+  workflowPublishesChangelog,
   withTemporaryVersionFile,
 } from "./release.js";
+import { semverGt } from "../src/cli/semver.js";
 import type { ReleaseObjectStore } from "./release-publish.js";
 
 const dirs: string[] = [];
@@ -22,8 +25,37 @@ afterEach(() => {
 test("derives an honest dev version from the checked-in version and short git sha", () => {
   const source = 'const CHECKED_IN_RBOX_VERSION = "1.7.3";\nexport const RBOX_VERSION = CHECKED_IN_RBOX_VERSION;\n';
   expect(checkedInRboxVersion(source)).toBe("1.7.3");
-  expect(deriveDevVersion("1.7.3", "84c6037")).toBe("1.7.3-dev+84c6037");
-  expect(deriveDevVersion("1.7.3", "84c6037a")).toBe("1.7.3-dev+84c6037a");
+  expect(deriveDevVersion("1.7.3", "84c6037")).toBe("1.7.3+dev.84c6037");
+  expect(deriveDevVersion("1.7.3", "84c6037a")).toBe("1.7.3+dev.84c6037a");
+  expect(() => deriveDevVersion("1.7.3+local", "84c6037")).toThrow("must not contain build metadata");
+});
+
+test.each(["1.7.3", "2.0.0-beta.1"])(
+  "the official %s release outranks its metadata-only dev build",
+  (release) => {
+    const dev = deriveDevVersion(release, "84c6037");
+    expect(semverGt(release, dev)).toBe(true);
+    expect(semverGt(dev, release)).toBe(false);
+    expect(semverGt(dev, deriveDevVersion(release, "84c6038"))).toBe(false);
+  },
+);
+
+test("workflow changelog guard agrees with release channel derivation", () => {
+  const workflow = fs.readFileSync(new URL("../.github/workflows/release.yml", import.meta.url), "utf8");
+  expect(workflow).toContain("if: ${{ !contains(github.ref_name, '-') }}");
+  for (const version of ["1.12.0", "2.0.0-beta.1", "1.12.0-rc.0"]) {
+    expect(workflowPublishesChangelog(version)).toBe(releaseChannelForInput(version) === "latest");
+  }
+});
+
+test("invalid release input surfaces the parser reason alongside usage", () => {
+  const result = Bun.spawnSync(["bun", new URL("./release.ts", import.meta.url).pathname, "1.12.0+build.1"], {
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  expect(result.exitCode).toBe(2);
+  expect(result.stderr.toString()).toContain("release version must not contain build metadata: 1.12.0+build.1");
+  expect(result.stderr.toString()).toContain("usage: bun scripts/release.ts");
 });
 
 test("restores version.ts byte-for-byte when post-rewrite work throws", async () => {
@@ -33,8 +65,8 @@ test("restores version.ts byte-for-byte when post-rewrite work throws", async ()
   const original = Buffer.from('/** checked in */\r\nconst CHECKED_IN_RBOX_VERSION = "1.7.3";\r\n');
   fs.writeFileSync(file, original);
 
-  await expect(withTemporaryVersionFile(file, "1.7.3-dev+84c6037", async () => {
-    expect(fs.readFileSync(file, "utf8")).toBe('export const RBOX_VERSION = "1.7.3-dev+84c6037";\n');
+  await expect(withTemporaryVersionFile(file, "1.7.3+dev.84c6037", async () => {
+    expect(fs.readFileSync(file, "utf8")).toBe('export const RBOX_VERSION = "1.7.3+dev.84c6037";\n');
     throw new Error("simulated post-rewrite failure");
   })).rejects.toThrow("simulated post-rewrite failure");
 
@@ -68,9 +100,78 @@ test("next installer uses the next manifest and its signed immutable artifact pa
   expect(next).toContain('"$MANIFEST_BASE/version"');
   expect(next).toContain('URL="$BASE/bin/$ARTIFACT_PATH"');
   expect(next).toContain('"path":"([^"]+)"');
+  expect(next).toContain(`printf '%s\\n' '{"schema":1,"channel":"next"}' > "$CHANNEL_TMP"`);
+  expect(next).toContain('mv -f "$CHANNEL_TMP" "$DEST/rbox.channel.json"');
+  expect(next).not.toContain('rm -f "$DEST/rbox.channel.json"');
+  expect(stable).toContain('rm -f "$DEST/rbox.channel.json"');
   expect(next).not.toBe(stable);
   expect(Bun.spawnSync(["sh", "-n"], { stdin: Buffer.from(next) }).exitCode).toBe(0);
   expect(fs.readFileSync(new URL("./install.sh", import.meta.url), "utf8")).toBe(stable);
+});
+
+test("stable and next installers persist their effective channel beside the installed binary", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rbox-channel-install-"));
+  dirs.push(dir);
+  const dest = path.join(dir, "install");
+  const fixtures = path.join(dir, "fixtures");
+  const commands = path.join(dir, "commands");
+  fs.mkdirSync(dest);
+  fs.mkdirSync(fixtures);
+  fs.mkdirSync(commands);
+
+  const binary = Buffer.from("fixture rbox binary");
+  const binaryFile = path.join(fixtures, "rbox-linux-x64");
+  const manifestFile = path.join(fixtures, "version.json");
+  fs.writeFileSync(binaryFile, binary);
+  fs.writeFileSync(manifestFile, JSON.stringify({
+    version: "2.0.0-beta.1",
+    artifacts: {
+      "rbox-linux-x64": {
+        sha256: createHash("sha256").update(binary).digest("hex"),
+        path: "v2.0.0-beta.1/rbox-linux-x64",
+      },
+    },
+  }));
+  fs.writeFileSync(path.join(commands, "uname"), `#!/bin/sh
+[ "$1" = "-s" ] && printf '%s\\n' Linux || printf '%s\\n' x86_64
+`);
+  fs.writeFileSync(path.join(commands, "curl"), `#!/bin/sh
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) shift; OUT="$1" ;;
+    https://*) URL="$1" ;;
+  esac
+  shift
+done
+case "$URL" in
+  */version) cp "$FIXTURE_MANIFEST" "$OUT" ;;
+  */bin/*) cp "$FIXTURE_BINARY" "$OUT" ;;
+  *) exit 9 ;;
+esac
+`);
+  fs.chmodSync(path.join(commands, "uname"), 0o755);
+  fs.chmodSync(path.join(commands, "curl"), 0o755);
+
+  const stableFile = new URL("./install.sh", import.meta.url).pathname;
+  const nextFile = path.join(dir, "install-next.sh");
+  fs.writeFileSync(nextFile, nextInstallerSource(fs.readFileSync(stableFile, "utf8")), { mode: 0o755 });
+  const env = {
+    ...process.env,
+    HOME: dir,
+    PATH: `${commands}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+    RBOX_INSTALL_DIR: dest,
+    RBOX_DOWNLOAD_BASE: "https://releases.test",
+    FIXTURE_MANIFEST: manifestFile,
+    FIXTURE_BINARY: binaryFile,
+  };
+
+  fs.writeFileSync(path.join(dest, "rbox.channel.json"), '{"schema":1,"channel":"next"}\n');
+  expect(Bun.spawnSync(["sh", stableFile, "--no-modify-path"], { env, stdout: "pipe", stderr: "pipe" }).exitCode).toBe(0);
+  expect(fs.existsSync(path.join(dest, "rbox.channel.json"))).toBe(false);
+
+  expect(Bun.spawnSync(["sh", nextFile, "--no-modify-path"], { env, stdout: "pipe", stderr: "pipe" }).exitCode).toBe(0);
+  expect(fs.readFileSync(path.join(dest, "rbox.channel.json"), "utf8")).toBe('{"schema":1,"channel":"next"}\n');
+  expect(fs.statSync(path.join(dest, "rbox.channel.json")).mode & 0o777).toBe(0o644);
 });
 
 const prereleaseManifest: Manifest = {

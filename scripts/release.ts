@@ -47,13 +47,21 @@ export function checkedInRboxVersion(source: string): string {
 
 export function deriveDevVersion(checkedInVersion: string, shortSha: string): string {
   if (!/^[0-9a-f]{7,64}$/i.test(shortSha)) throw new Error(`invalid short git sha ${JSON.stringify(shortSha)}`);
-  return `${checkedInVersion}-dev+${shortSha}`;
+  if (parseSemver(checkedInVersion).build !== null) {
+    throw new Error(`checked-in version must not contain build metadata: ${checkedInVersion}`);
+  }
+  return `${checkedInVersion}+dev.${shortSha}`;
 }
 
 export function releaseChannelForInput(version: string): ReleaseChannel {
   const parsed = parseSemver(version);
   if (parsed.build !== null) throw new Error(`release version must not contain build metadata: ${version}`);
   return releaseChannelForVersion(version);
+}
+
+/** Mirrors release.yml's `!contains(github.ref_name, '-')` changelog guard. */
+export function workflowPublishesChangelog(version: string): boolean {
+  return !version.includes("-");
 }
 
 function replaceOnce(source: string, before: string, after: string): string {
@@ -73,6 +81,13 @@ export function nextInstallerSource(stableSource: string): string {
   );
   source = replaceOnce(source, 'URL="$BASE/bin/$BIN"', 'URL="" # assigned from the signed next manifest below');
   source = source.replaceAll("$BASE/version", "$MANIFEST_BASE/version");
+  source = replaceOnce(
+    source,
+    'rm -f "$DEST/rbox.channel.json"',
+    `printf '%s\\n' '{"schema":1,"channel":"next"}' > "$CHANNEL_TMP"
+chmod 644 "$CHANNEL_TMP"
+mv -f "$CHANNEL_TMP" "$DEST/rbox.channel.json"`,
+  );
   source = replaceOnce(
     source,
     "EXPECTED_SHA=$(printf '%s\\n' \"$SHA_MATCHES\" | sed -n '1p')",
@@ -174,14 +189,19 @@ const dev = argv.includes("--dev");
 const positional = argv.filter((value) => !value.startsWith("--"));
 const uploadOnly = argv.includes("--upload-only");
 let channel: ReleaseChannel | undefined;
+let channelError: unknown;
 try {
   if (!dev && positional.length === 1) channel = releaseChannelForInput(positional[0]!);
-} catch {
-  // The common usage error below deliberately does not expose parser internals.
+} catch (error) {
+  channelError = error;
 }
 if ((dev && (positional.length !== 0 || uploadOnly)) || (!dev && (positional.length !== 1 || channel === undefined))) {
+  if (channelError instanceof Error) console.error(channelError.message);
   console.error("usage: bun scripts/release.ts <version> [--targets=...] [--no-upload | --upload-only]\n       bun scripts/release.ts --dev [--targets=...]");
   process.exit(2);
+}
+if (!dev && workflowPublishesChangelog(positional[0]!) !== (channel === "latest")) {
+  throw new Error(`release channel and workflow changelog gate disagree for ${positional[0]}`);
 }
 const versionFile = path.join(ROOT, "src/cli/version.ts");
 const checkedInSource = fs.readFileSync(versionFile, "utf8");

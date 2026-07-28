@@ -79,12 +79,21 @@ drifts).
 
 ## CLI binaries — GitHub Actions on `v*` tags
 
-`.github/workflows/release.yml`: build/sign/publish the `rbox` binaries to R2,
-then upload the tagged checkout's `CHANGELOG.md` to
-`rbox-releases/releases/changelog.md` and trigger the `rbox-home` Pages deploy
-hook. The API exposes the source at `https://api.rbox.to/changelog.md`; Astro
-renders it at `https://rbox.to/changelog/` during that rebuild. CLI releases
-remain tag-driven and are unaffected by the branch promotion model.
+`.github/workflows/release.yml` derives one of two channels from the tag's
+semver. A bare version such as `v1.12.0` publishes `latest`; a prerelease such
+as `v2.0.0-beta.1` publishes the opt-in `next` channel. Both share immutable
+version-addressed binaries under `releases/v<version>/`. Stable publication
+then updates the existing `releases/rbox-*` aliases, `releases/install.sh`,
+`releases/version.json`, and `releases/version.json.sig`; it also uploads the
+tagged checkout's `CHANGELOG.md` to `releases/changelog.md` and triggers the
+`rbox-home` Pages deploy hook. Prerelease publication updates only
+`releases/next/install.sh`, `releases/next/manifest.json`, and
+`releases/next/manifest.json.sig` after the shared immutable upload. It never
+reads or mutates the stable channel, changelog, or deploy hook.
+
+The API exposes the changelog at `https://api.rbox.to/changelog.md`; Astro
+renders it at `https://rbox.to/changelog/` during the stable rebuild. CLI
+releases remain tag-driven and are unaffected by the branch promotion model.
 
 Release flow: bump `package.json` version + `CHECKED_IN_RBOX_VERSION`
 (`src/cli/version.ts`, first quoted string is read by the workflow's
@@ -97,6 +106,13 @@ step-scoped signing key. PR merge-preview results never qualify.
 Fleet upgrade after the run goes green:
 `curl -fsSL https://rbox.to/install.sh | sh` then `rbox stop && rbox start`
 (run from inside the workspace; binary at `~/.rbox/bin/rbox`).
+For founder-fleet prerelease dogfood, use
+`curl -fsSL https://rbox.to/next/install.sh | sh` or
+`rbox upgrade --channel next`. The selection persists in
+`<installed-rbox>.channel.json`, so later unflagged upgrades continue checking
+`next`. Use `rbox upgrade --channel latest` to switch back after stable catches
+up. Running the stable installer also clears a persisted `next` selection;
+running the next installer writes it.
 The installer is intentionally a binary swap only, so fleet/install-script
 deployments retain that explicit stop/start step. The managed `rbox upgrade`
 command instead snapshots every live daemon under `~/.rbox/daemons`, waits for
@@ -105,10 +121,12 @@ existing pull-only setting. It reports all workspace outcomes and exits
 non-zero if any live runtime cannot be restarted safely.
 Update `CHANGELOG.md` per release.
 
-The tag version must be the first released heading after `[Unreleased]` or the
-release fails. Publish workflows are serialized and refuse to replace a newer
-live manifest. If publication fails while the one-day `rbox-dist` artifact is
-available, rerun the publish job. Later, publish from the exact protected tag.
+For a stable tag, the tag version must be the first released heading after
+`[Unreleased]` or the release fails. Prerelease tags skip the changelog heading
+gate and changelog publication. Publish workflows are serialized, and each
+channel refuses to replace its own newer live manifest. If publication fails
+while the one-day `rbox-dist` artifact is available, rerun the publish job.
+Later, publish from the exact protected tag.
 For changelog-only recovery:
 
 ```sh
@@ -118,9 +136,9 @@ curl --fail --silent --show-error --request POST "$RBOX_HOME_DEPLOY_HOOK" >/dev/
 ```
 
 The release publisher uploads and fetch-verifies immutable versioned binaries
-concurrently, then updates latest aliases, `install.sh`, manifest, and detached
-signature sequentially. Any immutable transfer or hash failure prevents all
-mutable channel changes.
+concurrently, then updates the selected channel's installer, manifest, and
+detached signature sequentially (plus the binary aliases on `latest`). Any
+immutable transfer or hash failure prevents all mutable channel changes.
 
 ## Oversized Stripe webhook recovery
 
