@@ -1,7 +1,17 @@
 # 163 — The state plane moves to SQLite
 
-Status: **v12 — RATIFIED AMENDMENT to v11 (founder, 2026-07-28): the genesis
-intent.** The M0 authority matrix gains exactly two rows, both keyed on a new
+Status: **v13 — AMENDMENT to v12 (2026-07-28): the ownership rule.** A premise
+v12 relied on is **empirically falsified** — a read-only SQLite open is not a
+zero-write operation. V13 replaces "read-only" with **observation-only** where
+the document used the former as a synonym for "zero writes", rewrites M4 (whose
+"reopen read-only … require `S0` a second time" is unimplementable), scopes the
+read-only-connection passages to the workspace's own DB, and inserts one
+normative rule in § "Decoder/WAL rows": **never open a file you do not own.**
+V13 touches only the lines listed in § "R4-v13 the ownership rule (v13)"; every
+other v12/v11/v10 line, and both ratified v12 matrix rows, are byte-unchanged.
+
+Prior status for the record: v12 was **RATIFIED AMENDMENT to v11 (founder,
+2026-07-28): the genesis intent.** The M0 authority matrix gains exactly two rows, both keyed on a new
 durable artifact owned solely by `state-plane/genesis.ts`, so a crash-safe
 genesis run is expressible. V12 touches **only** § "Migration authority state
 machine" (the two inserted matrix rows) and § "R4-v12 genesis intent (v12)";
@@ -483,7 +493,10 @@ protocol terms, and changes only the payload format:
   `checkpoint(TRUNCATE)` on the owning writer, close that writer, then verify
   sidecar absence. A `state.db` accompanied by `-wal`/`-shm` at
   classification time is NOT at rest: it is a crash-window signature of its
-  own. Two new normative rows (W1: wal-present + journal
+  own. **It is also the signature an inspector manufactures** (v13): a
+  read-only open of a WAL-mode DB in a writable parent creates `-wal`/`-shm` on
+  its first read, so an observer that opens is indistinguishable from a crash.
+  Two new normative rows (W1: wal-present + journal
   absent → normal daemon takeover, replay by SQLite on open; W2: wal-present
   + journal present → halt, zero writes, the journal governs) are specified in
   the complete table below.
@@ -504,7 +517,8 @@ pre-P0 artifact/boundary is introduced. Any future alternative must be marked
 This section replaces design 138's physical-state table only when the durable
 state authority is SQLite. Its consent and durable-authorization gates,
 correlated-classification rule, recovery-ref order, active-ref group order,
-and recovery outcomes remain normative. Classification is read-only. An
+and recovery outcomes remain normative. Classification is **observation-only**:
+no SQLite open of any kind, not even read-only (v13). An
 observation matching no *complete* row below is ambiguous and **must halt with
 zero writes**.
 
@@ -851,7 +865,7 @@ is a **file** and `.rbox/state/` is a **directory**. `state.db` lands at
 | `engine/ignore.ts`, `engine/git/journal.ts` | `git-tracked/<key>.json`, `git-journal/<key>/journal.json` | `git-tracked/` **yes** (deleted by `adopt-cache.ts`, replaced by `TrackedPathIndexPort`) | Covered by the `adopt-cache.ts` row; `git-journal/` is unchanged and `reset-state.ts` still requires it empty. |
 | `engine/hashcache.ts`, `engine/dircache.ts`, `engine/encrypt-address-cache.ts` | `hashcache.json`, `dircache.json`, `encrypt-cache.json` | **yes** — replaced by `cache-v2.db` | Already owned by the rebuildable-cache section; the parking/retirement protocol there is the only permitted transition. |
 | `shell-init.ts` | writes literal `$1/.rbox/state/shell.line` and `.../shell.deferrals` **into users' shell rc files** | no | Out of scope, and must stay that way: those paths live out-of-process on machines we do not redeploy. 163 renames neither. |
-| `doctor-cmd.ts` | user-facing copy naming `.rbox/state.json` literally | copy only | U3 updates the copy so that a post-Q workspace is not told to inspect a file that now holds the barrier sentinel; doctor must never advise deleting `Q`. |
+| `doctor-cmd.ts` | user-facing copy naming `.rbox/state.json` literally | copy only | U3 updates the copy so that a post-Q workspace is not told to inspect a file that now holds the barrier sentinel; doctor must never advise deleting `Q`. **Doctor's inspection is observation-only on files it does not own (v13)** — no read-only open of a candidate/archive/orphan. |
 
 Every later use of “every DB in the journal-independent inventory” continues
 to quantify only active and `.db` mains for `S0`/sidecar purposes; every use of
@@ -1098,7 +1112,8 @@ The recovery implementation preserves design 138's two-pass fence order:
    journal+sidecar can halt W2 without opening a DB or trusting a journal field.
    With every inventoried DB at `S0`, parse the journal,
    require state format/authorization/config eligibility, verify the Z identity
-   descriptors, and perform a complete read-only physical classification.
+   descriptors, and perform a complete observation-only physical
+   classification — no SQLite open of any kind (v13).
 2. Derive the canonical repository recovery requests from that validated Z set;
    acquire the workspace mutex and repository fences in canonical order with
    the state/store lock last. For W1 (no journal), acquire only the ordinary
@@ -1114,9 +1129,10 @@ The recovery implementation preserves design 138's two-pass fence order:
    legacy-v1, wrong state format, unauthorized witness, third stream, missing
    `Q`, or any unlisted correlation halts.
 
-Both classifications are read-only. Directory and sidecar lstat identities are bracketed
+Both classifications are observation-only. Directory and sidecar lstat identities are bracketed
 before and after every main-file hash; appearance/disappearance/change restarts
-classification (or W2 under a standing journal). No bounded query, `PRAGMA`,
+classification (or W2 under a standing journal). **No SQLite open of any kind —
+read-only, `immutable=1`, or read-write —** and no bounded query, `PRAGMA`,
 logical digest, integrity check, checkpoint, or cleanup is allowed during
 observation.
 
@@ -1135,6 +1151,30 @@ at `S0` are inert and remain untouched. With no journal, invalid/missing
 `Q`, active absent/nonregular/foreign, rollback journal, a sidecar beside an
 absent main, or any other unrecognized signature is a typed authority/corruption
 halt—not genesis and not permission to remove a sidecar.
+
+**Never open a file you do not own (v13).** A read-only SQLite open is not a
+zero-write operation: on a WAL-mode database in a writable parent the first
+read — a bare `PRAGMA user_version` included — creates `-wal` and `-shm`, and a
+read-only close cannot remove them. Read-only does not avoid the write; it
+changes which file is written and abandons the debris — and the outcome is
+**environment-dependent, not merely dirty**: with a `0555` parent the same open
+succeeds and the first read throws `attempt to write a readonly database`, so
+making the parent read-only converts debris into a hard failure and is not a
+fix. The effect is **WAL-only** — a `journal_mode=delete` database is inert
+under read-only inspection, which is why `backup/publish.ts`'s read-only
+verifier is safe today (its `VACUUM INTO` output has write-version 1, no WAL).
+The **rule** stays ownership-scoped regardless of journal mode, because journal
+mode is a property of the candidate file, and on a refusal path that file is
+exactly what we do not get to inspect first. Ownership means *this
+code created the inode or is its sole durable authority*, never *this code
+currently holds the workspace locked*. A file this code does **not** own — a
+candidate, an archive, an orphan, anything reached on a refusal path — is never
+opened at all, and every refusal decides from file-level facts. A file it
+**does** own — the active store after the authority flip, a staging file this
+lane created, W1 takeover — may be opened, and is then obliged to
+`wal_checkpoint(TRUNCATE)` and close so the at-rest signature is restored. The
+rule bounds *whose* files may be opened; it never forbids rbox from reading and
+checkpointing its own database.
 SHM-only is deliberately included in W1/W2; SHM has no durable transaction
 content, but its presence proves the file set is not the promised at-rest
 signature and only SQLite may normalize it when no journal governs.
@@ -1182,7 +1222,10 @@ not printed as one complete row. Namespace overflow/busy, invalid depth/name,
 special/unreadable inventory entries, and no-journal orphan sidecars take their
 exact C4 typed zero-write halt rather than falling through this list. A
 classifier test injects a deviation on every
-axis of every phase and compares a byte-for-byte zero-write snapshot.
+axis of every phase and compares a byte-for-byte zero-write snapshot. **That
+snapshot includes sidecars and extends to every genesis refusal, every
+migration halt, and every doctor inspection (v13)**, with a negative control in
+which a read-only open of the inspected DB must fail the snapshot.
 
 ### Required publication order and backup boundary
 
@@ -1265,7 +1308,10 @@ is required for O(N) scan/action staging. Read-only CLI connections use
 `query_only=ON`, `cache_size=-8192` (8 MiB), `busy_timeout=250`, and verify
 rather than attempt to change persistent settings. `cache_size` and
 `busy_timeout` are intentionally per-connection; the different reader values
-are not a pinning failure.
+are not a pinning failure. **Scope (v13): this describes readers of the
+workspace's own live authority DB only. It is not licence to point a read-only
+connection at a candidate, archive, staging, or any other file this process
+does not own — such an open creates `-wal`/`-shm` it cannot remove.**
 
 The daemon owns exactly one 32 MiB writer connection and at most one 8 MiB
 maintenance reader; a stage DB has one connection and is closed before the
@@ -1314,7 +1360,8 @@ Every `Database`, prepared statement, transaction callback, iterator, cursor,
 and borrowed row is created, used, finalized, and closed in one Bun isolate.
 No database object/handle crosses a `Worker` message or is shared with crypto
 workers. Workers receive immutable DTOs; a helper isolate that needs state
-opens its own read-only connection and returns a plain value. SQLite's compiled
+opens its own read-only connection **to the workspace's own live authority DB
+and to nothing else (v13)** and returns a plain value. SQLite's compiled
 thread mode is not treated as permission to share Bun objects.
 
 ## Engine ordered-merge and cursor architecture (r1 f3)
@@ -3184,13 +3231,18 @@ workspace mutex, complete repository fence as needed, and state lock:
    record. Publish M3 only after the committed completion tuple is reread and
    exact; WAL sidecars are allowed until M4. A sidecar without the durable main
    is impossible under this order and halts.
-5. **M4 — close and prove.** As the sole migration owner, recover the exact
-   M3 staging WAL if needed, run `wal_checkpoint(TRUNCATE)` non-busy, close,
-   require `S0`, reopen read-only, recompute SQL semantic stream/counts,
-   validate application/user/DDL ids, `foreign_key_check`, and full
-   `integrity_check`; close, require `S0` a second time so the verifier left no
-   sidecar, fsync DB+state directory, physical-hash with identity bracketing,
-   then publish M4 with the complete proof.
+5. **M4 — close and prove.** **Rewritten in v13; the v12 text was
+   unimplementable.** As the sole migration owner, recover the exact M3 staging
+   WAL if needed, then — still on that **owning read-write** connection —
+   recompute SQL semantic stream/counts, validate application/user/DDL ids,
+   `foreign_key_check`, and full `integrity_check`. Verification comes **first**;
+   only after it passes run `wal_checkpoint(TRUNCATE)` non-busy, close, and
+   require `S0` **once**. Then fsync DB+state directory, physical-hash with
+   identity bracketing, and publish M4 with the complete proof. The withdrawn
+   "reopen read-only … require `S0` a second time so the verifier left no
+   sidecar" cannot succeed: staging is WAL-mode, the read-only verifier's first
+   read recreates `-wal`/`-shm`, and its close cannot remove them, so the second
+   `S0` could only ever fail. Owned by U3 lane 3A.
 6. **M5 — publish prepared DB.** Revalidate source/control and exact M4 hash,
    atomically rename staging to `state.db`, durably remove only a redundant
    exact staging name if a crash correlation produced both, require staging
@@ -3256,19 +3308,19 @@ C1+C2).
 
 | Control high-water | Complete admitted restart observation and action | State authority | Sole owner of next protocol mutation |
 |---|---|---|---|
-| absent | Exact `L`, no reserved active DB. An interrupted first control publication may leave an exact regular revision-scoped M0 temp; it is inert, never adopted as control, and fresh M0 chooses a new id without touching it. A special/unreadable/nonconforming temp halts; explicit doctor may quarantine inert temps later. Rerun read-only M0 and publish M0 only after fresh identity/hash. | JSON | 2.0 controller may begin; 1.7.x may perform only ordinary JSON data operations. Doctor is otherwise read-only. |
+| absent | Exact `L`, no reserved active DB. An interrupted first control publication may leave an exact regular revision-scoped M0 temp; it is inert, never adopted as control, and fresh M0 chooses a new id without touching it. A special/unreadable/nonconforming temp halts; explicit doctor may quarantine inert temps later. Rerun read-only M0 and publish M0 only after fresh identity/hash. | JSON | 2.0 controller may begin; 1.7.x may perform only ordinary JSON data operations. Doctor is otherwise **observation-only (v13)** — it opens no DB it does not own. |
 | `M0` | Exact source. Reserve/emergency may be absent or an exact id-scoped partial/complete M1 artifact; validate/create them, rerun admission, then publish M1. Ordinary crash does **not** imply disk-full. | JSON | 2.0 controller only; doctor only if an exact halt is later published. |
 | `M1` | Source exact; history/fixed backup may be absent, exact temp, exact current, or valid prior fixed backup. Resume M2 idempotently, preserving prior bytes, then publish M2. Foreign/special backup halts. | JSON | 2.0 controller only. |
 | `M2` | Source/backups exact. `stagingMain` witness is either `absent` or an exact recorded regular identity. With `absent`, no file or the sole create-ahead shape (exact path, no-follow regular zero-byte mode-0600 file, no sidecars) may begin/finish the M3 identity publication. With a recorded identity, an incomplete id-owned main and only its own sidecars may be recovered/removed and rebuilt; sidecar without main halts. An exact committed completion is the sole M3-artifact-ahead form: reread it and publish M3. | JSON | 2.0 controller only; it is the only actor allowed to open this non-authoritative DB. |
-| `M3` | Exact source/backups plus exact committed id-bound staging; its own WAL/SHM may exist. Open only as migration owner, recover, and rerun all M4 checkpoint/semantic/FK/integrity work. Publish M4 only after close/`S0`/hash/fsync. | JSON | 2.0 controller only. |
-| `M4` | Exact physical M4 witness is either staging-only, or the M5 rename ran ahead and active-only/both-exact is observed. Revalidate identical hashes/completion, fsync/converge without ever moving active backward, durably remove only a redundant exact staging name, then publish M5. Missing both, nonexact active, or any sidecar halts. | JSON | 2.0 controller only. |
+| `M3` | Exact source/backups plus exact committed id-bound staging; its own WAL/SHM may exist. Open only as migration owner, recover, and rerun all M4 semantic/FK/integrity work **on that owning read-write connection, before the checkpoint (v13)**. Publish M4 only after checkpoint/close/`S0`/hash/fsync. | JSON | 2.0 controller only. |
+| `M4` | Exact physical M4 witness is either staging-only, or the M5 rename ran ahead and active-only/both-exact is observed. Revalidate identical hashes/completion, fsync/converge without ever moving active backward, durably remove only a redundant exact staging name, then publish M5. Missing both, nonexact active, or any sidecar halts. **"Any sidecar halts" depends on M4's v13 rewrite:** under the withdrawn reopen-read-only text M4's own verifier left a sidecar it could not remove, and this row would then halt a healthy migration on resume. | JSON | 2.0 controller only. |
 | `M5` + exact `L` | Exact active prepared DB at the M5 hash; staging absent; source/backup still match. Q sibling is exactly one of: absent (plus the sole zero-byte create-ahead); recorded building inode with zero/partial/exact bytes; or recorded exact inode/bytes. Resume only the matching create/write/fsync/same-phase-CAS step, then rename exact sibling. Foreign/changed identity halts. If JSON changed, arm C1 retirement before any cleanup. | JSON | 2.0 controller only; 1.7.x can alter only JSON and thereby invalidate this migration. |
 | `M5` + exact `Q` | Sole M6-artifact-ahead form: matching complete active DB and Q sibling absent. SQLite is already elected; never rename JSON back. Complete/retry `.rbox` fsync, publish M6 with its initial cleanup cursor, and keep writes blocked as `durability-indeterminate` until that fsync succeeds. | SQLite | 2.0 controller only; 1.7.x refuses Q. |
 | ordinary M0–M5 + changed exact `L` | Every non-source artifact must still match the ordinary old phase row exactly; the sole mismatch is a freshly identity-bracketed, legacy-guard-admitted current `L` at the same authoritative path. Publish the initial C1 retirement revision before any artifact mutation. A malformed/special/unreadable replacement or any second mismatch halts. | JSON | 2.0 controller may only arm retirement. |
 | `source-change-retirement` from M0–M5 | Exact L plus precisely the retirement prefix/intent correlation printed above. Only the current intent target may be owned-present or absent; every other target matches its armed disposition/vector position. Resume that target or, at complete prefix, retire control. | JSON | 2.0 controller only; doctor only through exact halted retry. |
 | `M6` | Exact Q + matching complete/physical active DB and exact cleanup prefix/intent. Only the current cleanup-intent item may be exact or absent; earlier items are cleanup-absent and later items exact. Resume that item; publish M7 only from a complete nonfinal prefix plus the final absent intent and prebuilt runway. | SQLite | 2.0 controller only. |
 | `M7` | Exact Q + matching DB, all resource cleanup complete, and the recorded unused r+1 halt sibling either exact-terminal or delete-ahead absent. Durably remove that sibling if needed, then unlink control and fsync state parent; no earlier phase may rerun. | SQLite | 2.0 controller only. |
-| terminal absent control + exact Q | Matching complete active DB and no standing migration control. Ordinary SQLite startup/W1 applies; migration has no next mutation. | SQLite | Ordinary 2.0 state owner; doctor read-only unless separately authorized. |
+| terminal absent control + exact Q | Matching complete active DB and no standing migration control. Ordinary SQLite startup/W1 applies; migration has no next mutation. | SQLite | Ordinary 2.0 state owner; doctor is **observation-only on files it does not own (v13)** — a read-only open of a candidate or archive fabricates W3's `ResetOrphanArtifactHalt` on a healthy workspace, and nobody may then clean it up. It may read the workspace's own active store. |
 | exact halted M0–M7 | The same phase/artifact correlation must match; halt never excuses mismatch. Automatic migration/cleanup is suppressed until explicit retry. | JSON before Q; SQLite after Q | Doctor alone may CAS-clear the halt under full locks, then authority transfers to the same 2.0 controller. **One refinement overrides this cell (v5, flagged v6 R4-CODE B5 / R4-CODEX 7):** for an exact final-intent `promotedHalt` on the allocation-free runway, there is no separate durable clear — doctor CAS-validates H and mints a single-use in-process delegation, and the expected-`r+1` rename of the exact M7 sibling **is** the durable clear and phase advance. No other halted row gains that permission. |
 | foreign/malformed/inconsistent control or artifacts | No phase inference, cleanup, DB open, sentinel write, or backup restoration. | Existing exact L/Q predicate only, otherwise contradictory | None; zero-write corruption halt. |
 
@@ -3498,8 +3550,9 @@ No API opens a sealed path writable or changes it back to building; retry that
 needs mutation creates a new stage id.
 
 Every consumer acquires the id-scoped stage lock, no-follow lstats an exact
-regular `S0` file, verifies physical hash/identity, opens it read-only immutable,
-and streams rows through a fresh `stage-semantic-v1` recomputation. For final
+regular `S0` file, verifies physical hash/identity, opens it with **real SQLite
+`immutable=1`**, and streams rows through a fresh `stage-semantic-v1`
+recomputation. For final
 CAS it copies those rows into connection-owned file-backed TEMP tables while
 streaming, closes the stage, then repeats physical hash/stat/sidecar checks.
 Only exact logical digest/count and before/after physical identity/hash matches
@@ -3507,6 +3560,19 @@ may reach `BEGIN IMMEDIATE`; later changes to the external path cannot affect
 the TEMP input. Mismatch rolls back/discards the TEMP input and is a typed
 `StageChangedError`. Reconcile/apply/wire consumption performs the same proof,
 so a crash-resumed stage is never trusted from its `sealed` bit alone.
+
+**`immutable=1` here, and nowhere else (v13).** `{readonly: true}` is not
+immutable: a read-only open of a WAL-mode DB creates `-wal`/`-shm` on its first
+read and cannot remove them. The immutable form is
+`new Database("file:" + path + "?immutable=1", 0x01 | 0x40)` — the **numeric
+positional flags** overload; the object-options form does not reach it, and
+building this as `{readonly: true}` is a defect. *(Established behaviorally, not
+by reading bun's source.)* It creates no sidecars, but it **silently ignores
+uncheckpointed WAL content** and so returns a confidently wrong answer on any
+live database. It is sound here **only** because the paragraph above guarantees
+an exact regular `S0` file, checkpoint-truncated and never written again — there
+is no WAL to skip. Do not generalize it to candidates, archives, staging, or any
+other evaluation; those are governed by the ownership rule.
 
 `path_order` is a BLOB of big-endian UTF-16 code units. Current manifest order
 uses JavaScript string `<`, which is UTF-16 code-unit order; SQLite UTF-8
@@ -4959,3 +5025,66 @@ data could otherwise satisfy an identity-only test at the active path.
 `initializeStateStore` opens `"wx"` and rejects an existing path
 (`store/open.ts:218`). It is a U3 Wave 1B deliverable that migration's M3 also
 requires. Ratifying v12 authorizes the design, not an immediate landing.
+
+## R4-v13 the ownership rule (v13)
+
+Not a review round. **An amendment to a ratified document forced by an
+empirically falsified premise.** 222 § 2.5.1 prescribed a read-only SQLite open
+as the zero-write way to evaluate a candidate database; three independent lanes
+(bun 1.4.0, Linux, ext4) falsified it.
+
+**The evidence.**
+
+- A read-only open creates nothing, but the **first read — including a bare
+  `PRAGMA user_version` — creates `-wal` and `-shm`**. A read-only `close()`
+  cannot remove them; a read-**write** open+close does. Read-only does not avoid
+  writing, it changes which file is written and abandons the debris.
+- **WAL-only.** A `journal_mode=delete` database is inert under read-only
+  inspection.
+- **Parent-directory mode flips the failure mode.** With a `0555` parent the
+  open succeeds and the first read throws `attempt to write a readonly
+  database`. Same code, opposite outcomes.
+- `immutable=1` **is** reachable — `new Database("file:…?immutable=1",
+  0x01 | 0x40)`, the numeric positional flags overload (established
+  behaviorally, not from bun's source) — and creates no sidecars, but it
+  **silently ignores uncheckpointed WAL content** and returns a confidently
+  wrong verdict on a healthy database. It is not the general fix; it is sound
+  only at § "Field-complete schema and store API"'s sealed-stage consumer, where
+  an exact `S0` file is guaranteed never to be written again.
+
+**The rule is ownership, not open mode.** Ownership means *this code created the
+inode or is its sole durable authority*, not *this code holds the workspace
+locked*. Files this code does not own are never opened; files it owns may be
+opened and must then be checkpointed and closed. The normative sentence lives in
+§ "Decoder/WAL rows J0, W1, W2, and W3", beside the halt it protects.
+
+| Line group | Verdict | v13 |
+|---|---|---|
+| Keystone "sidecars ⇒ not at rest" | survives, sharper than written | notes that a read-only inspection *manufactures* the same signature |
+| "Classification is read-only … zero writes"; "complete read-only physical classification" | weakened — used "read-only" as a synonym for "zero writes" | both become **observation-only; no SQLite open of any kind** |
+| "No bounded query, `PRAGMA`, … during observation" | **survives; the strongest text in the corpus** — this clause, not the word "read-only", is what made the two above safe | generalized to name every open mode. No new primitive |
+| "Do not open …" in J0/W2/W3 | survive | unchanged |
+| Sidecar ⇒ halt, not permission to remove | survives, and is the victim | the ownership rule is inserted here |
+| Byte-for-byte zero-write snapshot incl. sidecars | **survives — the gate that would have caught this** | extended to genesis refusals, migration halts, doctor inspections, with a read-only-open negative control |
+| Read-only CLI connections; helper-isolate read-only open | weakened | scoped to the workspace's own live authority DB; not licence to point read-only at a candidate/archive |
+| **M4 "reopen read-only … require `S0` a second time"** | **FALSE — unimplementable.** Staging is WAL-mode; the verifier's first read creates sidecars its close cannot remove, so the second `S0` can only fail | verify on the **owning read-write** connection *before* `wal_checkpoint(TRUNCATE)`, then close and require `S0` once. Owned by U3 lane 3A |
+| Resume rows `M3` / `M4` | false by inheritance / booby-trapped ("any sidecar halts" would trip on M4's own debris) | both follow M4's rewrite; the M4 row states the dependency |
+| Sealed-stage consumer "opens it read-only immutable" | false as written, salvageable | names the **numeric-flags** `immutable=1` form, the unverified-overload caveat, the WAL-blindness, and that this is the sole sound site |
+| "Doctor is otherwise read-only" (×2, plus the `doctor-cmd.ts` row) | weakened to false in effect — a read-only inspection fabricates W3's `ResetOrphanArtifactHalt` on a healthy workspace | becomes **observation-only on files it does not own** |
+| "byte-identical" (engine results, marker bytes) | survive — out of scope | untouched |
+
+**Lanes that inherit this.** Their briefs carry the fix rather than rediscover
+it.
+
+| Lane | Inheritance |
+|---|---|
+| **3A** | **Blocker.** M4 verification as specified is impossible; verify through the owning read-write connection and checkpoint after |
+| **5B** | Doctor must be observation-only |
+| **2D** | `assertAuthorityWritable` runs on the **hot path, every SQLite save**. File-level only, no SQLite open ever, so nobody optimizes it into one |
+| **2C** | Selection via `classifyStateFormat` is pure-`fs` and safe; `reset/lifecycle.ts:65` `readLineage` is a live read-only open — do not adopt or resurrect it |
+| **4A** | "Any sidecar halts" is a precondition of M4→M5→M6 resume; an open-based check both leaves debris and trips its own halt |
+| **5A** | Per-mutator revalidation runs many times per migration; open-based revalidation multiplies debris linearly |
+| **5C** | Extend the sidecar-inclusive snapshot to every genesis refusal, migration halt, and doctor inspection; add a negative control where a read-only open **must** fail the snapshot |
+| **3C** | Inertness must be a file-level judgement |
+| **3B** | No DB open in spec; note only |
+| **1B** | Not a victim — the **model**. Sidecar removal on adopter failure is legal precisely because the adopter owns the inode |
