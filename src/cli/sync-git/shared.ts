@@ -1,8 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { captureGitState, gitIdentityKey, gitSectionNewestLink, gitSectionTips, hashBytes, projectIdentity, repoCtxFromDisk, MAX_PACK_CHAIN, MAX_GIT_REPOS, type GitIdentity, type GitPackLink, type GitRepoKind, type GitRefScope, type GitSection } from "../../engine/index.js";
-import type { GitCaptureOptions } from "../../engine/git/capture.js";
-import { headBranchOf } from "../../engine/git/shared.js";
+import type { GitCaptureOptions, GitCaptureUploadCollector } from "../../engine/git/capture.js";
+import { headBranchOf, type PendingGitUpload } from "../../engine/git/shared.js";
 import { type GitDeferral, type GitDeferralReason, type WorkspaceConfig } from "../config.js";
 import type { SyncRemote } from "../remote.js";
 import { PER_FILE_UPLOAD_ATTEMPTS } from "../sync-recovery.js";
@@ -240,6 +240,10 @@ export async function gitApplyMutationKey(root: string, rel: string): Promise<st
   return dotGit ? path.resolve(repoDir, ".git") : path.resolve(repoDir);
 }
 
+/** Design 226: the ONE `captureGitState` call site that defers its uploads. `retainDir`
+ *  (when supplied) turns capture into encrypt-only and the returned `pendingUploads`
+ *  carry the artifacts of the SURVIVING section — a pack-chain recompaction's second
+ *  capture REPLACES the first's list, so the discarded first bundle is never flushed. */
 export async function capturePlannedGitSection(
   root: string,
   rel: string,
@@ -253,10 +257,12 @@ export async function capturePlannedGitSection(
   onBytes?: (absoluteBytes: number) => void,
   resolution = false,
   testHooks?: ResolutionCaptureTestHooks,
-): Promise<{ section?: GitSection; reason?: string }> {
+  retainDir?: string,
+): Promise<{ section?: GitSection; reason?: string; pendingUploads?: PendingGitUpload[] }> {
   const repoDir = repoDirOf(root, rel);
-  const capture = (opts: { basis?: { tips: string[] }; onBasisFallback?: (reason: string) => void } = {}) =>
-    captureGitState(repoDir, api.blobStore(), kek, {
+  const capture = async (opts: { basis?: { tips: string[] }; onBasisFallback?: (reason: string) => void } = {}) => {
+    const uploads: GitCaptureUploadCollector | undefined = retainDir === undefined ? undefined : { retainDir, pending: [] };
+    const section = await captureGitState(repoDir, api.blobStore(), kek, {
       workspaceRoot: root,
       uploadsDir,
       uploadAttempts: PER_FILE_UPLOAD_ATTEMPTS,
@@ -264,12 +270,15 @@ export async function capturePlannedGitSection(
       onBytes,
       resolution,
       testHooks,
+      ...(uploads ? { uploads } : {}),
       ...opts,
     });
+    return { section, pendingUploads: uploads?.pending };
+  };
 
   const incremental = incrementalCapturePlan(cfg, baseSec, forced);
   let basisFellBack = false;
-  const section = await capture(
+  const first = await capture(
     incremental
       ? {
           basis: { tips: incremental.basisTips },
@@ -279,11 +288,14 @@ export async function capturePlannedGitSection(
         }
       : {}
   );
-  if (!section || !incremental || basisFellBack) return { section };
+  const { section } = first;
+  if (!section || !incremental || basisFellBack) return { section, pendingUploads: first.pendingUploads };
   if (!exceedsPackChainByteBound(incremental.chain, section.bundleCipherSize)) {
-    return { section: { ...section, packChain: incremental.chain } };
+    return { section: { ...section, packChain: incremental.chain }, pendingUploads: first.pendingUploads };
   }
 
   const full = await capture();
-  return full ? { section: full } : { reason: "capture returned nothing during git pack recompaction" };
+  return full.section
+    ? { section: full.section, pendingUploads: full.pendingUploads }
+    : { reason: "capture returned nothing during git pack recompaction" };
 }

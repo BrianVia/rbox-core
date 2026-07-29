@@ -8,6 +8,7 @@ import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
 import type { BlobStore, ByteProgressCallback } from "../blobstore.js";
 import { encryptFileToTemp, decryptFileToPath } from "../crypto.js";
+import { hashFile } from "../hash.js";
 import type { GitArtifactRef, GitPackLink, GitSection } from "../types.js";
 
 /** Repo shape: "dir" = ordinary repo (`.git` directory); "pointer" = worktree/submodule
@@ -746,12 +747,82 @@ export interface PutGitArtifactOptions {
 
 const isBlobShaMismatchError = (e: unknown): boolean => e instanceof Error && e.name === "BlobShaMismatchError";
 
-/** §28: ENCRYPT a staged plaintext artifact under the workspace KEK, upload the CIPHERTEXT by
- *  its encSha (convergent — same primitive + receipt-capturing store path as file blobs), and
- *  return the (plaintext sha, encSha, cipherSize) ref. Skips the upload if the account already
- *  has the ciphertext blob (entitled+present). On a typed sha-mismatch, drop the stale
- *  ciphertext temp, re-encrypt from the staged plaintext artifact, back off, and retry
- *  within the caller's bound. The temp ciphertext is always cleaned up. */
+/** Design 226: an encrypted-but-not-yet-uploaded git artifact. The ciphertext lives at
+ *  `ciphertextPath` — a path unique per ENCRYPT CALL, never keyed by content, because
+ *  encryption is convergent and two captures of the same staged file collapse to one
+ *  encSha (keying by encSha deletes a still-referenced capture's bytes). */
+export interface PendingGitUpload {
+  encSha: string;
+  ciphertextPath: string;
+  cipherSize: number;
+  attempts: number;
+  uploadsDir?: string;
+  onBytes?: ByteProgressCallback;
+  backoff?: (attempt: number) => Promise<void>;
+}
+
+/** §28 + design 226 step 1: ENCRYPT a staged plaintext artifact under the workspace KEK into
+ *  `retainDir` and return the (plaintext sha, encSha, cipherSize) ref plus the handle naming
+ *  the retained ciphertext. No store is touched: the ref is built entirely from the local
+ *  encryption result, which is what lets a caller decide the section's fate before spending
+ *  bytes on the wire. The ciphertext outlives this call — `retainDir` must not be the
+ *  caller's per-capture temp dir unless the caller flushes and cleans up itself. */
+export async function encryptGitArtifact(
+  kek: Buffer,
+  srcPath: string,
+  retainDir: string,
+  opts: PutGitArtifactOptions = {}
+): Promise<{ ref: GitArtifactRef; pending: PendingGitUpload }> {
+  const enc = await encryptFileToTemp(srcPath, kek, retainDir);
+  return {
+    ref: enc.comp
+      ? { sha: enc.plaintextSha, encSha: enc.encSha, cipherSize: enc.cipherSize, comp: enc.comp, payloadSha: enc.payloadSha }
+      : { sha: enc.plaintextSha, encSha: enc.encSha, cipherSize: enc.cipherSize },
+    pending: {
+      encSha: enc.encSha,
+      ciphertextPath: enc.ciphertextPath,
+      cipherSize: enc.cipherSize,
+      attempts: Math.max(1, opts.attempts ?? 1),
+      uploadsDir: opts.uploadsDir,
+      onBytes: opts.onBytes,
+      backoff: opts.backoff,
+    },
+  };
+}
+
+/** §28 + design 226 step 2: upload a retained CIPHERTEXT by its encSha, skipping the PUT if
+ *  the account already has the blob (entitled+present). On a typed sha-mismatch the SAME
+ *  retained bytes are re-sent after a local `hashFile` re-verification — the staged plaintext
+ *  is long gone by the flush, so re-encrypting is impossible; a ciphertext that no longer
+ *  hashes to its encSha FAILS CLOSED rather than shipping bytes under a claimed address.
+ *  Performs NO cleanup of `ciphertextPath`: retained artifacts collapse across repos by
+ *  encSha, so per-file reclamation can delete bytes another repo still reads. */
+export async function flushGitArtifact(store: BlobStore, pending: PendingGitUpload): Promise<void> {
+  for (let attempt = 0; attempt < pending.attempts; attempt++) {
+    try {
+      if (!(await store.has(pending.encSha))) {
+        if (store.putFile) await store.putFile(pending.encSha, pending.ciphertextPath, pending.cipherSize, pending.uploadsDir, pending.onBytes);
+        else {
+          await store.put(pending.encSha, await fs.readFile(pending.ciphertextPath));
+          pending.onBytes?.(pending.cipherSize);
+        }
+      }
+      return;
+    } catch (e) {
+      if (!isBlobShaMismatchError(e) || attempt + 1 >= pending.attempts) throw e;
+      const actual = await hashFile(pending.ciphertextPath, pending.cipherSize).catch(() => undefined);
+      if (actual !== pending.encSha) {
+        throw new Error(`retained git artifact ciphertext no longer matches ${pending.encSha} at ${pending.ciphertextPath}`);
+      }
+      await pending.backoff?.(attempt);
+    }
+  }
+  throw new Error("unreachable git artifact upload retry state");
+}
+
+/** §28: encrypt + upload in one step, cleaning up the ciphertext temp. The composition of
+ *  `encryptGitArtifact` and `flushGitArtifact`, kept at its original signature for direct
+ *  engine callers and for every `captureGitState` caller that supplies no upload collector. */
 export async function putGitArtifact(
   store: BlobStore,
   kek: Buffer,
@@ -759,29 +830,23 @@ export async function putGitArtifact(
   tmpDir: string,
   opts: PutGitArtifactOptions = {}
 ): Promise<GitArtifactRef> {
-  const attempts = Math.max(1, opts.attempts ?? 1);
-  for (let attempt = 0; attempt < attempts; attempt++) {
-    const enc = await encryptFileToTemp(srcPath, kek, tmpDir);
-    try {
-      if (!(await store.has(enc.encSha))) {
-        if (store.putFile) await store.putFile(enc.encSha, enc.ciphertextPath, enc.cipherSize, opts.uploadsDir, opts.onBytes);
-        else {
-          await store.put(enc.encSha, await fs.readFile(enc.ciphertextPath));
-          opts.onBytes?.(enc.cipherSize);
-        }
-      }
-      return enc.comp ? { sha: enc.plaintextSha, encSha: enc.encSha, cipherSize: enc.cipherSize, comp: enc.comp, payloadSha: enc.payloadSha } : { sha: enc.plaintextSha, encSha: enc.encSha, cipherSize: enc.cipherSize };
-    } catch (e) {
-      if (!isBlobShaMismatchError(e) || attempt + 1 >= attempts) throw e;
-      await opts.backoff?.(attempt);
-    } finally {
-      await fs.rm(enc.ciphertextPath, { force: true });
-    }
+  const { ref, pending } = await encryptGitArtifact(kek, srcPath, tmpDir, opts);
+  try {
+    await flushGitArtifact(store, pending);
+    return ref;
+  } finally {
+    await fs.rm(pending.ciphertextPath, { force: true });
   }
-  throw new Error("unreachable git artifact upload retry state");
 }
 
-async function getBlobToFile(store: BlobStore, sha: string, destPath: string): Promise<void> {
+/** The store surface a git-artifact FETCH needs, and nothing more. Narrow on purpose:
+ *  design 226's plan-local read-through store serves fresh, not-yet-uploaded candidate
+ *  bytes, and a `has` answered from that local retention would report an artifact the
+ *  server has never seen as satisfied. Every consumer of `getGitArtifact` declares this
+ *  type; a full `BlobStore` stays assignable, so no caller is affected. */
+export type GitArtifactReadStore = Pick<BlobStore, "get" | "getToFile">;
+
+async function getBlobToFile(store: GitArtifactReadStore, sha: string, destPath: string): Promise<void> {
   await fs.mkdir(path.dirname(destPath), { recursive: true });
   if (store.getToFile) await store.getToFile(sha, destPath);
   else await fs.writeFile(destPath, await store.get(sha));
@@ -790,7 +855,7 @@ async function getBlobToFile(store: BlobStore, sha: string, destPath: string): P
 /** §28: fetch a git artifact's CIPHERTEXT by encSha, then decrypt+verify (GCM tag + plaintext-sha)
  *  to `destPath`. Throws on any fetch/decrypt/verify failure — callers run this into temp files
  *  BEFORE mutating the gitdir, so a bad/ swapped/ corrupt blob never half-applies. */
-export async function getGitArtifact(store: BlobStore, kek: Buffer, ref: GitArtifactRef, destPath: string, tmpDir: string): Promise<void> {
+export async function getGitArtifact(store: GitArtifactReadStore, kek: Buffer, ref: GitArtifactRef, destPath: string, tmpDir: string): Promise<void> {
   const ct = path.join(tmpDir, `ct-${ref.encSha}`);
   await getBlobToFile(store, ref.encSha, ct);
   await fs.mkdir(path.dirname(destPath), { recursive: true });

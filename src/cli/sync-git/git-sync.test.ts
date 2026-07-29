@@ -111,6 +111,9 @@ class FakeRemote implements SyncRemote {
    *  churning/vanishing mid-capture so that repo defers. Self-clears. */
   failNextGitPut = false;
   gitShaMismatchFailures = 0;
+  /** Design 226: corrupt the ciphertext on disk while rejecting it, so the retry's local
+   *  re-verification of the RETAINED bytes must fail closed instead of re-sending. */
+  corruptSourceOnShaMismatch = false;
   gitPutCalls = 0;
   gitPutUploads: Array<{ sha: string; src: string; size: number; uploadsDir?: string }> = [];
   conflictNext = false;
@@ -208,6 +211,7 @@ class FakeRemote implements SyncRemote {
         self.gitPutUploads.push({ sha: s, src, size, uploadsDir });
         if (self.gitShaMismatchFailures > 0) {
           self.gitShaMismatchFailures -= 1;
+          if (self.corruptSourceOnShaMismatch) await fs.appendFile(src, "corrupt");
           throw new BlobShaMismatchError(s);
         }
         if (self.failNextGitPut) {
@@ -301,6 +305,50 @@ async function makeInTreeMainWithWorktree(): Promise<{ M: string; W: string }> {
   await commitFile(W, "w.txt", "ww", "wt c1");
   return { M, W };
 }
+/** Design 226: every ciphertext still retained under the workspace's gitcap scratch root.
+ *  Empty after any `planGitSections` exit — the single `finally` sweep is the only
+ *  reclamation, so a non-empty result is a leak, not a timing artifact. */
+async function retainedGitCiphertext(root: string): Promise<string[]> {
+  const found: string[] = [];
+  const walk = async (dir: string): Promise<void> => {
+    for (const entry of await fs.readdir(dir, { withFileTypes: true }).catch(() => [])) {
+      const abs = path.join(dir, entry.name);
+      if (entry.isDirectory()) await walk(abs);
+      else if (entry.name.endsWith(".ct")) found.push(abs);
+    }
+  };
+  await walk(path.join(root, ".rbox", "gitcap"));
+  return found.sort();
+}
+
+/** Design 226 §0: count every WRITE the plan makes to the workspace BlobStore, so a
+ *  capture that is decided AGAINST can be asserted to cost exactly zero bytes. */
+function countingGitRemote(base: SyncRemote): { api: SyncRemote; writes: () => number } {
+  const inner = base.blobStore();
+  let writes = 0;
+  const store: BlobStore = {
+    has: (sha) => inner.has(sha),
+    get: (sha) => inner.get(sha),
+    getToFile: (sha, dest, size) => inner.getToFile!(sha, dest, size),
+    async put(sha, bytes) {
+      writes += 1;
+      await inner.put(sha, bytes);
+    },
+    async putFile(sha, src, size, uploadsDir, onBytes) {
+      writes += 1;
+      await inner.putFile!(sha, src, size, uploadsDir, onBytes);
+    },
+  };
+  const api = new Proxy(base, {
+    get(target, prop) {
+      if (prop === "blobStore") return () => store;
+      const value = Reflect.get(target, prop, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  return { api, writes: () => writes };
+}
+
 const st = (root: string) => loadState(root, "http://x::ws_g43::root");
 const syncCycle = async () => {
   await sync(rootA, cfgA, depsA);
@@ -480,7 +528,18 @@ test("D2 pre-save partial revalidation invalidates a human-moved non-current ref
   expect(await fs.readdir(stateCasJournalDir(rootA)).catch((error: NodeJS.ErrnoException) => error.code === "ENOENT" ? [] : Promise.reject(error))).toEqual([]);
 });
 
-test("D2 capture deferral survives failures and remains exact while pending is outstanding", async () => {
+/** DESIGN 226 — RE-EXPRESSED, and an INTENTIONAL INVERSION of the first leg. This test's
+ *  upload fault used to be a CAPTURE fault: the repo deferred with reason "artifact", the
+ *  lane was saved durably, and the push then failed at an injected `commit`. Under the
+ *  design-226 flush barrier the same fault rejects `planGitSections` itself, so no
+ *  capture deferral exists to observe or age and no observation write happens at all —
+ *  "one repo's upload fault fails the whole push" (§0, §2.2). If this is failing, do NOT
+ *  make it green by reinstating a per-repo `catch { revertCapture }` around the flush;
+ *  §2.2 rules that unsound for any repo past `commitAbsentBranchVerification` /
+ *  `pinDisplaced`. The test's real subject — D2 sidecar exactness while a pending is
+ *  outstanding — survives below, driven from the RECOVERED state, and the rejection being
+ *  recoverable is exactly what the middle leg proves. */
+test("a barrier-rejected push records nothing and recovers; D2 stays exact while pending is outstanding", async () => {
   const repo = path.join(rootA, "capture-restart");
   await initRepo(repo);
   await commitFile(repo, "f.txt", "v1", "v1");
@@ -488,39 +547,47 @@ test("D2 capture deferral survives failures and remains exact while pending is o
   await pull(rootB, cfgB, depsB);
   await commitFile(repo, "f.txt", "v2", "v2");
   await fs.writeFile(path.join(rootA, "force-commit.txt"), "x");
-  remote.failNextGitPut = true;
-  const realCommit = remote.commit.bind(remote);
-  let durableObserved = false;
-  depsA.onGitDeferralsSaved = (saved) => {
-    durableObserved = repoRecordsForState(saved)["capture-restart"]?.deferrals?.capture?.reason === "artifact";
-  };
-  remote.commit = async () => {
-    expect(durableObserved).toBe(true); // visibility hook ran immediately after the lane save
-    throw new Error("post-plan network failure");
-  };
-  await expect(push(rootA, cfgA, depsA)).rejects.toThrow(/post-plan network failure/);
-  let record = repoRecordsForState(await st(rootA))["capture-restart"]!;
-  expect(record.deferrals?.capture?.reason).toBe("artifact");
-  const since = record.deferrals?.capture?.deferredSince;
 
-  remote.commit = realCommit;
+  // Barrier leg: the artifact upload fault fails the WHOLE push and writes nothing.
+  let deferralSaves = 0;
+  depsA.onGitDeferralsSaved = () => { deferralSaves += 1; };
+  remote.failNextGitPut = true;
+  const seqBefore = remote.headSeq();
+  await expect(push(rootA, cfgA, depsA)).rejects.toThrow(/simulated mid-capture churn/);
+  expect(remote.headSeq()).toBe(seqBefore); // nothing published
+  expect((await remote.latest()).manifest.files.some((f) => f.path === "force-commit.txt")).toBe(false);
+  expect(deferralSaves).toBe(0); // the plan rejected before any deferral observation could be written
+  expect(repoRecordsForState(await st(rootA))["capture-restart"]?.deferrals?.capture).toBeUndefined();
+  expect(await retainedGitCiphertext(rootA)).toEqual([]); // the finally sweep still ran
   delete depsA.onGitDeferralsSaved;
+
+  // Recoverable: `failNextGitPut` self-cleared, so the next push publishes both planes.
+  await push(rootA, cfgA, depsA);
+  expect(remote.headSeq()).toBeGreaterThan(seqBefore);
+  const healed = (await remote.latest()).manifest;
+  expect(healed.files.some((f) => f.path === "force-commit.txt")).toBe(true);
+  expect(healed.gitRepos!["capture-restart"]!.refs["refs/heads/main"]).toBe(await git(repo, "rev-parse", "refs/heads/main"));
+
+  // D2 exactness while a pending is outstanding: B advances the repo, A is mid-operation
+  // so the apply lane defers, and every P-bound sidecar stays byte-exact across a push.
+  await pull(rootB, cfgB, depsB);
   const repoB = path.join(rootB, "capture-restart");
   await commitFile(repoB, "remote.txt", "newer", "newer remote truth");
   await push(rootB, cfgB, depsB);
   const busyLock = path.join(repo, ".git", "index.lock");
   await fs.writeFile(busyLock, "");
   await pull(rootA, cfgA, depsA);
-  record = repoRecordsForState(await st(rootA))["capture-restart"]!;
-  expect(record.deferrals?.capture?.deferredSince).toBe(since);
+  let record = repoRecordsForState(await st(rootA))["capture-restart"]!;
   expect(record.deferrals?.apply?.reason).toBe("git-busy");
+  const since = record.deferrals?.apply?.deferredSince;
+  expect(since).toBeDefined();
   const heldSidecars = sidecarSnapshot(record);
 
   await fs.rm(busyLock);
   await push(rootA, cfgA, depsA);
   record = repoRecordsForState(await st(rootA))["capture-restart"]!;
   expect(sidecarSnapshot(record)).toBe(heldSidecars);
-  expect(since).toBeDefined();
+  expect(record.deferrals?.apply?.deferredSince).toBe(since);
 });
 
 async function captureSections(rels: readonly string[]): Promise<Record<string, GitSection>> {
@@ -1122,9 +1189,19 @@ test("design 68 §3.3 + 422: a forced skip-eligible pointer recaptures instead o
   await expect(remote.blobStore().get(m.gitRepos!["wt"]!.bundleEncSha)).resolves.toBeDefined();
 }, 20_000);
 
-// ── (b) churn: per-repo capture failure defers with base carry, push proceeds ────
+// ── (b) churn: one repo's artifact upload fault fails the whole push (226 barrier) ────
 
-test("a repo whose capture fails mid-push is DEFERRED with base carry; the push commits everything else", async () => {
+/** DESIGN 226 — INTENTIONAL INVERSION. This test used to assert the PRE-226 outcome: the
+ *  per-repo `catch` at the capture site deferred r2 with base carry while the push still
+ *  committed the stable file subset and r1's carry. Under the design-226 flush barrier one
+ *  repo's upload fault rejects `planGitSections`, so the whole push fails and NOTHING is
+ *  published — that is §0's accepted blast-radius regression, taken because the
+ *  alternative is publishing a section whose bytes are missing. If this is failing, do NOT
+ *  make it green by reinstating a per-repo `catch { revertCapture }` around the flush;
+ *  §2.2 rules that unsound for any repo past `commitAbsentBranchVerification` /
+ *  `pinDisplaced`, and that set is not statically known at the flush point. The rejection
+ *  is RECOVERABLE, which is the leg that matters and is asserted last. */
+test("one repo's artifact upload fault fails the WHOLE push (226 barrier), and the next push recovers", async () => {
   const r1 = path.join(rootA, "r1");
   const r2 = path.join(rootA, "r2");
   await initRepo(r1);
@@ -1132,26 +1209,31 @@ test("a repo whose capture fails mid-push is DEFERRED with base carry; the push 
   await initRepo(r2);
   await commitFile(r2, "b.txt", "b1", "c1");
   await push(rootA, cfgA, depsA);
+  const base1 = (await st(rootA)).lastSyncedManifest.gitRepos!["r1"]!;
   const base2 = (await st(rootA)).lastSyncedManifest.gitRepos!["r2"]!;
 
-  // ONLY r2 changes (so the failing PUT deterministically hits r2's capture) plus an
-  // unrelated file change so the push has something stable to commit.
+  // ONLY r2 changes (so the failing PUT deterministically hits r2's artifacts) plus an
+  // unrelated file change the push would otherwise have committed.
   await commitFile(r2, "b.txt", "b2", "c2");
   await fs.writeFile(path.join(rootA, "note.txt"), "stable");
   remote.failNextGitPut = true;
 
   const seqBefore = remote.headSeq();
-  await push(rootA, cfgA, depsA);
-  expect(remote.headSeq()).toBe(seqBefore + 1); // push proceeded (r2's failure did not abort)
-  const m = (await remote.latest()).manifest;
-  expect(m.files.some((f) => f.path === "note.txt")).toBe(true); // stable subset committed
-  expect(m.gitRepos!["r2"]!.bundleEncSha).toBe(base2.bundleEncSha); // base carried, not regressed
-  expect(m.gitRepos!["r1"]!.bundleEncSha).toBe((await st(rootA)).lastSyncedManifest.gitRepos!["r1"]!.bundleEncSha); // r1 untouched carry
-  expect(logsA.some((l) => l.includes("deferred 1") && l.includes("r2"))).toBe(true);
+  await expect(push(rootA, cfgA, depsA)).rejects.toThrow(/simulated mid-capture churn/);
+  expect(remote.headSeq()).toBe(seqBefore); // nothing published at all
+  const held = (await remote.latest()).manifest;
+  expect(held.files.some((f) => f.path === "note.txt")).toBe(false); // the stable subset did NOT ride along
+  expect(held.gitRepos!["r2"]!.bundleEncSha).toBe(base2.bundleEncSha); // no section regressed either
+  expect(held.gitRepos!["r1"]!.bundleEncSha).toBe(base1.bundleEncSha);
+  expect(await retainedGitCiphertext(rootA)).toEqual([]); // the finally sweep still ran
 
-  // next push (nothing failing): r2 self-heals with a fresh capture
+  // Recoverable: the next push (nothing failing) publishes r2's fresh capture AND the file.
   await push(rootA, cfgA, depsA);
-  expect((await remote.latest()).manifest.gitRepos!["r2"]!.bundleEncSha).not.toBe(base2.bundleEncSha);
+  expect(remote.headSeq()).toBeGreaterThan(seqBefore);
+  const healed = (await remote.latest()).manifest;
+  expect(healed.files.some((f) => f.path === "note.txt")).toBe(true);
+  expect(healed.gitRepos!["r2"]!.bundleEncSha).not.toBe(base2.bundleEncSha);
+  expect(healed.gitRepos!["r1"]!.bundleEncSha).toBe(base1.bundleEncSha);
 }, 20_000);
 
 
@@ -1203,20 +1285,32 @@ test("git artifact sha_mismatch re-encrypts and retries with resumable uploadsDi
   expect(m.gitRepos?.["r"]).toBeDefined();
   expect(backoffAttempts).toEqual([0]);
   expect(remote.gitPutCalls).toBeGreaterThanOrEqual(2);
-  expect(remote.gitPutUploads[0]!.sha).toBe(remote.gitPutUploads[1]!.sha); // same plaintext bundle re-encrypted to the same encSha
-  expect(remote.gitPutUploads[0]!.src).not.toBe(remote.gitPutUploads[1]!.src); // stale ciphertext temp was dropped and recreated
+  expect(remote.gitPutUploads[0]!.sha).toBe(remote.gitPutUploads[1]!.sha); // same encSha
+  // DESIGN 226 — DELIBERATE INVERSION of `not.toBe`. The staged plaintext is gone by the
+  // flush, so the retry cannot re-encrypt; it re-sends the SAME retained ciphertext after
+  // verifying locally that it still hashes to its encSha (and fails closed otherwise).
+  expect(remote.gitPutUploads[0]!.src).toBe(remote.gitPutUploads[1]!.src);
   const scratch = `${path.join(rootA, ".rbox", "gitcap")}${path.sep}`;
   expect(remote.gitPutUploads[0]!.src.startsWith(scratch)).toBe(true);
   expect(remote.gitPutUploads[1]!.src.startsWith(scratch)).toBe(true);
   expect(new Set(remote.gitPutUploads.map((u) => u.uploadsDir))).toEqual(new Set([path.join(rootA, ".rbox", "state", "uploads")]));
 }, 90_000);
 
-test("git artifact sha_mismatch retries are bounded; final failure defers with base carry", async () => {
+/** DESIGN 226 — INTENTIONAL INVERSION. This test used to assert the PRE-226 outcome: an
+ *  exhausted sha-mismatch budget deferred THAT repo with base carry while the push still
+ *  committed the stable file subset. Under the design-226 flush barrier an exhausted PUT
+ *  rejects `planGitSections` and the whole push fails, because by the flush point repos
+ *  past `commitAbsentBranchVerification`/`pinDisplaced` have done irreversible work that
+ *  `revertCapture` cannot undo. If this test is failing, do NOT make it green by
+ *  reinstating a per-repo `catch { revertCapture }` around the flush — design 226 §2.2
+ *  rules that unsound. The retry BUDGET is unchanged and still asserted here; recovery is
+ *  covered by "the barrier's rejection is recoverable" below. */
+test("git artifact sha_mismatch retries are bounded; final failure fails the push (226 barrier)", async () => {
   const r = path.join(rootA, "r");
   await initRepo(r);
   await commitFile(r, "f.txt", "v1", "c1");
   await push(rootA, cfgA, depsA);
-  const base = (await st(rootA)).lastSyncedManifest.gitRepos!["r"]!;
+  const seqBefore = remote.headSeq();
   remote.gitPutCalls = 0;
   remote.gitPutUploads = [];
 
@@ -1225,14 +1319,35 @@ test("git artifact sha_mismatch retries are bounded; final failure defers with b
   const backoffAttempts: number[] = [];
   remote.gitShaMismatchFailures = 99;
 
-  await push(rootA, cfgA, { ...depsA, backoff: async (attempt) => backoffAttempts.push(attempt) });
+  await expect(push(rootA, cfgA, { ...depsA, backoff: async (attempt) => backoffAttempts.push(attempt) }))
+    .rejects.toThrow(/blob PUT rejected/);
 
-  expect(remote.gitPutCalls).toBe(3); // PER_FILE_UPLOAD_ATTEMPTS parity
-  expect(backoffAttempts).toEqual([0, 1]);
-  const m = (await remote.latest()).manifest;
-  expect(m.files.some((f) => f.path === "note.txt")).toBe(true);
-  expect(m.gitRepos!["r"]!.bundleEncSha).toBe(base.bundleEncSha);
-  expect(logsA.some((l) => l.includes("deferred 1") && l.includes("r: capture failed: blob PUT rejected"))).toBe(true);
+  expect(remote.gitPutCalls).toBe(3); // PER_FILE_UPLOAD_ATTEMPTS parity, unchanged
+  expect(backoffAttempts).toEqual([0, 1]); // retry budget unchanged
+  expect(remote.headSeq()).toBe(seqBefore); // nothing published at all
+  expect((await remote.latest()).manifest.files.some((f) => f.path === "note.txt")).toBe(false);
+  expect(await retainedGitCiphertext(rootA)).toEqual([]); // the finally sweep still ran
+
+  // Recoverable: the next push (nothing failing) publishes the repo and the stable file.
+  remote.gitShaMismatchFailures = 0;
+  await push(rootA, cfgA, depsA);
+  expect(remote.headSeq()).toBeGreaterThan(seqBefore);
+  const healed = (await remote.latest()).manifest;
+  expect(healed.files.some((f) => f.path === "note.txt")).toBe(true);
+  expect(healed.gitRepos!["r"]!.refs["refs/heads/main"]).toBe(await git(r, "rev-parse", "refs/heads/main"));
+}, 20_000);
+
+test("design 226: a retained ciphertext corrupted on disk fails CLOSED instead of re-sending", async () => {
+  const r = path.join(rootA, "r");
+  await initRepo(r);
+  await commitFile(r, "f.txt", "v1", "c1");
+  remote.gitShaMismatchFailures = 1;
+  remote.corruptSourceOnShaMismatch = true;
+
+  await expect(push(rootA, cfgA, { ...depsA, backoff: noBackoff }))
+    .rejects.toThrow(/retained git artifact ciphertext no longer matches/);
+  expect(remote.gitPutCalls).toBe(1); // no second send of bytes we cannot vouch for
+  expect(await retainedGitCiphertext(rootA)).toEqual([]);
 }, 20_000);
 
 test("push: a locked (busy) repo defers with base carry — no raw-identity capture while mid-operation", async () => {
@@ -1511,11 +1626,22 @@ test("design 174 B: upload, commit-error, and multi-writer 409 preserve every P-
     expect(sidecarSnapshot(record)).toBe(sidecars);
   };
 
-  // Candidate capture's artifact upload fails. An unrelated file may still ACK,
-  // but it is not the candidate-bound ACK and cannot consume P or its sidecars.
+  // DESIGN 226 — INTENTIONAL INVERSION of this leg only. Pre-226 the candidate capture's
+  // upload fault deferred that repo and the push still committed the unrelated file. Under
+  // the design-226 flush barrier the fault rejects `planGitSections` and the whole push
+  // fails; the sidecar-exactness subject is unchanged and asserted on BOTH sides of the
+  // rejection. Do NOT make this green by reinstating a per-repo `catch { revertCapture }`
+  // around the flush — §2.2 rules that unsound. The commit-error and multi-writer-409 legs
+  // below are untouched by 226, and the recovery leg is asserted after them: a push that
+  // SUCCEEDS here supersedes P and clears its sidecars, which is the very thing the two
+  // remaining legs need outstanding. So recovery is proved on the 409 leg's own push.
   remote.failNextGitPut = true;
   await fs.writeFile(path.join(rootB, "capture-failure.txt"), "one");
-  await push(rootB, cfgB, depsB);
+  const seqBefore = remote.headSeq();
+  await expect(push(rootB, cfgB, depsB)).rejects.toThrow(/simulated mid-capture churn/);
+  expect(remote.headSeq()).toBe(seqBefore); // nothing published
+  expect((await remote.latest()).manifest.files.some((f) => f.path === "capture-failure.txt")).toBe(false);
+  expect(await retainedGitCiphertext(rootB)).toEqual([]); // the finally sweep still ran
   await assertExact();
 
   const realCommit = remote.commit.bind(remote);
@@ -1533,6 +1659,14 @@ test("design 174 B: upload, commit-error, and multi-writer 409 preserve every P-
   };
   await push(rootB, cfgB, depsB);
   expect(atConflict).toBe(sidecars);
+
+  // DESIGN 226 — the barrier's rejection is RECOVERABLE, not a wedge. This push is the
+  // first one allowed to succeed, and it lands BOTH files the two failed pushes blocked.
+  expect(remote.headSeq()).toBeGreaterThan(seqBefore);
+  const healed = (await remote.latest()).manifest;
+  expect(healed.files.some((f) => f.path === "capture-failure.txt")).toBe(true);
+  expect(healed.files.some((f) => f.path === "commit-failure.txt")).toBe(true);
+  expect(await retainedGitCiphertext(rootB)).toEqual([]);
 }, 90_000);
 
 test("design 174 B: real pending is superseded by an ahead main with exact off-branch stash and ACK clears four sidecars", async () => {
@@ -3908,8 +4042,9 @@ test("design 174 B: a ref reset between maybe-probe and capture fails final cand
   await git(repo, "switch", "-q", "main");
   await git(repo, "branch", "-D", "race-unrelated");
 
+  const counted = countingGitRemote(remote);
   const plan = await planGitSections(
-    rootA, cfgA, { ...state, gitPendingRemote: { [rel]: pending } }, remote,
+    rootA, cfgA, { ...state, gitPendingRemote: { [rel]: pending } }, counted.api,
     new Set(), buildIgnoreMatcher(rootA), undefined, undefined,
     { afterPendingPreProbe: async (candidateRel) => {
       expect(candidateRel).toBe(rel);
@@ -3920,6 +4055,10 @@ test("design 174 B: a ref reset between maybe-probe and capture fails final cand
   expect(plan.gitRepos?.[rel]).toBe(pending);
   expect(plan.carried).toContain(rel);
   expect(plan.deferred.some((entry) => entry.relPath === rel && entry.reason.includes("did not supersede"))).toBe(true);
+  // Design 226 §0, the headline regression: this tick FORCE-CAPTURED the candidate and
+  // then discarded it. Zero store writes — not "few" — and no retained ciphertext left.
+  expect(counted.writes()).toBe(0);
+  expect(await retainedGitCiphertext(rootA)).toEqual([]);
 }, 20_000);
 
 test("design 83: plan cache invalidates paused rebase op-state instead of fast-carrying", async () => {
@@ -4024,3 +4163,137 @@ test("push emits gitcap progress per CAPTURED repo — monotonic settle count, r
   await push(rootA, cfgA, second.deps);
   expect(second.events.length).toBe(0);
 });
+
+// ── design 226: git capture uploads AFTER the decision ───────────────────────────
+
+test("design 226: a superseding candidate's artifacts are all flushed before the plan returns", async () => {
+  const rel = "flush-supersede";
+  await prepareSupersedingPending(rel);
+  const store = remote.blobStore();
+  const counted = countingGitRemote(remote);
+
+  const plan = await planGitSections(
+    rootB, cfgB, await st(rootB), counted.api, new Set(), buildIgnoreMatcher(rootB),
+    undefined, noBackoff, { onGitLog: (l) => logsB.push(l) },
+  );
+
+  expect(plan.supersededPending).toEqual([rel]);
+  const refs = gitSectionBlobRefs(plan.gitRepos![rel]!);
+  expect(refs.length).toBeGreaterThan(0);
+  // Satisfied at RETURN, i.e. inside the git-plan phase — long before api.commit sends
+  // the refset. A flush wired after the commit would leave these absent here.
+  for (const ref of refs) expect(await store.has(ref.encSha)).toBe(true);
+  expect(counted.writes()).toBeGreaterThan(0);
+  expect(await retainedGitCiphertext(rootB)).toEqual([]);
+}, 90_000);
+
+test("design 226: one artifact PUT failure rejects the whole plan, publishes nothing, and is recoverable", async () => {
+  const one = path.join(rootA, "barrier-one");
+  const two = path.join(rootA, "barrier-two");
+  await initRepo(one);
+  await commitFile(one, "f.txt", "v1", "c1");
+  await initRepo(two);
+  await commitFile(two, "g.txt", "v1", "c1");
+  const seqBefore = remote.headSeq();
+  remote.failNextGitPut = true;
+
+  await expect(planGitSections(
+    rootA, cfgA, await st(rootA), remote, new Set(), buildIgnoreMatcher(rootA),
+    undefined, noBackoff, { onGitLog: () => {} },
+  )).rejects.toThrow(/upload failed/);
+
+  expect(remote.headSeq()).toBe(seqBefore); // no manifest, so no repo's section published
+  expect(await retainedGitCiphertext(rootA)).toEqual([]); // finally sweep ran on the throw
+
+  // Recoverable: the rejection left no half-applied state the next push cannot redo.
+  await push(rootA, cfgA, depsA);
+  const healed = (await remote.latest()).manifest;
+  expect(healed.gitRepos!["barrier-one"]).toBeDefined();
+  expect(healed.gitRepos!["barrier-two"]).toBeDefined();
+}, 90_000);
+
+test("design 226: a throw after capture still sweeps every retained ciphertext", async () => {
+  const one = path.join(rootA, "sweep-one");
+  const two = path.join(rootA, "sweep-two");
+  await initRepo(one);
+  await commitFile(one, "f.txt", "v1", "c1");
+  await initRepo(two);
+  await commitFile(two, "g.txt", "v1", "c1");
+
+  // A `has` fault throws at the FIRST flush point, with the second repo's ciphertext
+  // still retained and nothing yet uploaded — the exception path the sweep must cover.
+  const failing = new Proxy(remote, {
+    get(target, prop) {
+      if (prop === "blobStore") {
+        const inner = target.blobStore();
+        return () => ({ ...inner, has: async () => { throw new Error("catalog probe failed"); } });
+      }
+      const value = Reflect.get(target, prop, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  }) as SyncRemote;
+
+  await expect(planGitSections(
+    rootA, cfgA, await st(rootA), failing, new Set(), buildIgnoreMatcher(rootA),
+    undefined, noBackoff, { onGitLog: () => {} },
+  )).rejects.toThrow(/catalog probe failed/);
+  expect(await retainedGitCiphertext(rootA)).toEqual([]);
+}, 90_000);
+
+test("design 226: pack recompaction retains per call and flushes ONLY the second capture", async () => {
+  cfgA = { ...cfgA, git: { incremental: true } };
+  const rel = "recompact";
+  const repo = path.join(rootA, rel);
+  await initRepo(repo);
+  await commitFile(repo, "f.txt", "v1", "c1");
+  await push(rootA, cfgA, depsA);
+
+  // A one-byte base makes ANY increment trip exceedsPackChainByteBound, so
+  // capturePlannedGitSection takes the second (full) capture path.
+  const sA = await st(rootA);
+  const base = sA.lastSyncedManifest.gitRepos![rel]!;
+  await saveStateUnsafeLegacyOrTest(rootA, {
+    ...sA,
+    lastSyncedManifest: { ...sA.lastSyncedManifest, gitRepos: { [rel]: { ...base, bundleCipherSize: 1 } } },
+  });
+  await commitFile(repo, "f.txt", "v2", "c2");
+
+  const counted = countingGitRemote(remote);
+  const plan = await planGitSections(
+    rootA, cfgA, await st(rootA), counted.api, new Set(), buildIgnoreMatcher(rootA),
+    undefined, noBackoff, { onGitLog: () => {} },
+  );
+
+  const recompacted = plan.gitRepos![rel]!;
+  expect(recompacted.packChain).toBeUndefined(); // the full recapture, not the increment
+  // Exactly the surviving section's artifacts — the discarded first capture's bundle is
+  // retained but NEVER sent (its per-call path kept it from colliding with the second's).
+  expect(counted.writes()).toBe(gitSectionBlobRefs(recompacted).length);
+  expect(await retainedGitCiphertext(rootA)).toEqual([]);
+}, 120_000);
+
+test("design 226: gitForceForMissingBlobs still re-flushes an artifact the server lost", async () => {
+  const rel = "force-recover";
+  const repo = path.join(rootA, rel);
+  await initRepo(repo);
+  await commitFile(repo, "f.txt", "v1", "c1");
+  await push(rootA, cfgA, depsA);
+  const committed = (await st(rootA)).lastSyncedManifest.gitRepos![rel]!;
+  const store = remote.blobStore();
+  remote.deleteBlob(committed.bundleEncSha);
+  expect(await store.has(committed.bundleEncSha)).toBe(false);
+
+  const counted = countingGitRemote(remote);
+  const plan = await planGitSections(
+    rootA, cfgA, await st(rootA), counted.api, new Set([rel]), buildIgnoreMatcher(rootA),
+    undefined, noBackoff, { onGitLog: () => {} },
+  );
+
+  expect(plan.captured).toContain(rel);
+  // The per-plan dedupe set starts empty every plan, so recovery is never short-circuited.
+  expect(counted.writes()).toBeGreaterThan(0);
+  for (const ref of gitSectionBlobRefs(plan.gitRepos![rel]!)) {
+    expect(await store.has(ref.encSha)).toBe(true);
+  }
+  expect(await retainedGitCiphertext(rootA)).toEqual([]);
+}, 90_000);

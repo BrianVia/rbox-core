@@ -3,7 +3,9 @@ import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { GitCaptureDeferredError, artifactBinding, checkoutJournalPresent, discoverGitRepos, gitIdentity, gitIdentityKey, gitPreflight, inTreeWorktreeParentRel, isGitBusy, isPresentButUnreadableError, gitSectionBlobRefs, oracleFromState, readRepoIdentityV1, readStateLineageV1, receiverEquivalentCollisionNames, repoCtxFromDisk, poolMap, stateLineageV1FromRealRoot, type DiscoveredGitRepo, type GitRepoKind, type GitSection, type IgnoreMatcher, type RepoCtx } from "../../engine/index.js";
 import { pinDisplaced } from "../../engine/git/keep-pins.js";
-import { git } from "../../engine/git/shared.js";
+import { git, type GitArtifactReadStore, type PendingGitUpload } from "../../engine/git/shared.js";
+import { makeGitCaptureDir } from "../../engine/git/capture.js";
+import { flushGitArtifacts, planReadThroughStore } from "./plan-artifacts.js";
 import { type GitConfigRunner } from "../../engine/git/config-txn.js";
 import { sanitizeGitSectionForPersistence } from "../../engine/git/config-sync.js";
 import { expectedStateNonce, repoRecordsForState, syncStreamId, type GitDeferralReason, type SyncState, type WorkspaceConfig } from "../config.js";
@@ -161,7 +163,33 @@ export async function planGitSections(
   /** Per-repo capture progress (the `gitcap` phase): the longest silent phase on a
    *  repo-heavy first push — one `git bundle` per repo, minutes each. Emits after each
    *  capture settles so `done` is a truthful completed-count under bounded concurrency;
-   *  `detail` is the repo just captured. Display-only. */
+   *  `detail` is the repo just captured. Display-only. Design 226: `bytesDone` follows
+   *  the WIRE, so it arrives in bursts at the two flush points rather than during
+   *  capture — the completed count is what keeps the long silent phase alive. */
+  onProgress?: TransferProgress,
+  backoff?: (attempt: number) => Promise<void>,
+  options: GitPlanOptions = {}
+): Promise<GitPushPlan> {
+  // Design 226: capture ENCRYPTS into this dir and the flush uploads from it after the
+  // plan has decided. One sweep on every exit — including a throw — is the ONLY
+  // reclamation: retained artifacts collapse across repos by encSha, so per-file cleanup
+  // could delete bytes a still-undecided repo's read-through GET needs.
+  const retention: { dir?: string } = {};
+  try {
+    return await planGitSectionsWithRetention(retention, root, cfg, state, api, force, matcher, onProgress, backoff, options);
+  } finally {
+    if (retention.dir) await fs.rm(retention.dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+async function planGitSectionsWithRetention(
+  retention: { dir?: string },
+  root: string,
+  cfg: WorkspaceConfig,
+  state: SyncState,
+  api: SyncRemote,
+  force: ReadonlySet<string>,
+  matcher: IgnoreMatcher,
   onProgress?: TransferProgress,
   backoff?: (attempt: number) => Promise<void>,
   options: GitPlanOptions = {}
@@ -1081,14 +1109,30 @@ export async function planGitSections(
     onProgress?.(captureDone, repoCount, "gitcap", rel === "." ? path.basename(root) : rel, { bytesDone: gitBytesDone });
   };
   const uploadsDir = path.join(root, ".rbox", "state", "uploads");
+  // Design 226: retained ciphertext lives under the gitcap scratch root, whose crash
+  // reaper already sweeps `rbox-gitcap-*` dirs with a dead or absent `owner.pid`. NOT
+  // `.rbox/state/uploads` — that is the persistent resumable-multipart token dir.
+  if (toCapture.length > 0) retention.dir = await makeGitCaptureDir(root);
+  const retainDir = retention.dir;
+  const retained = new Map<string, string>();
+  const pendingUploadsByRepo = new Map<string, PendingGitUpload[]>();
+  const flushedEncShas = new Set<string>();
+  // Fresh-candidate index projections (`finalResolutionReport`, `provePendingSupersession`)
+  // resolve retained bytes locally; pending/pack-chain artifacts still come from the server.
+  // Built on first use: a plan that captures nothing never touches the store at all.
+  let readThrough: GitArtifactReadStore | undefined;
+  const artifactStore = (): GitArtifactReadStore => (readThrough ??= planReadThroughStore(api.blobStore(), retained, glog));
   await poolMap(toCapture, GIT_CAPTURE_CONCURRENCY, async (rel) => {
     try {
-      const { section: sec, reason } = await capturePlannedGitSection(
+      const { section: sec, reason, pendingUploads } = await capturePlannedGitSection(
         root, rel, cfg, base[rel], api, kek, uploadsDir, mustCapture(rel), backoff,
         (abs) => noteRepoBytes(rel, abs), resolutionCandidates.has(rel),
         resolutionCandidates.has(rel) ? options.resolutionCaptureTestHooks : undefined,
+        retainDir,
       );
       if (sec) {
+        pendingUploadsByRepo.set(rel, pendingUploads ?? []);
+        for (const artifact of pendingUploads ?? []) retained.set(artifact.encSha, artifact.ciphertextPath);
         commitCapture(rel, await captureWithConfig(rel, sec));
       } else {
         deferOne(rel, reason ?? "capture returned nothing (repo vanished mid-capture or failed self-validation)");
@@ -1278,6 +1322,17 @@ export async function planGitSections(
       "deletion-pending",
     );
   }
+  // Design 226 flush point 1. Every revert that can reach a repo in NEITHER candidate
+  // set — unreadable, absence-witness, tombstone-exactness — has now run, so these
+  // sections are final and their bytes are owed. Bounds retained disk without narrowing
+  // the retained SET, which those three reverts would have leaked past.
+  const decidedLate = new Set([...pendingSupersessionCandidates, ...resolutionCandidates]);
+  const flushPending = async (rels: readonly string[]): Promise<void> => {
+    const owed = rels.flatMap((rel) => pendingUploadsByRepo.get(rel) ?? []);
+    if (owed.length > 0) await flushGitArtifacts(api.blobStore(), owed, flushedEncShas);
+  };
+  await flushPending(captured.filter((rel) => !decidedLate.has(rel)));
+
   for (const rel of [...resolutionCandidates].sort()) {
     const rider = options.resolution?.repo === rel ? options.resolution : undefined;
     const p = pending[rel];
@@ -1290,7 +1345,7 @@ export async function planGitSections(
       resolutionDisposition = { outcome: "refused", reason };
       continue;
     }
-    const report = await finalResolutionReport({ ctx, pending: p, candidate, store: api.blobStore(), kek });
+    const report = await finalResolutionReport({ ctx, pending: p, candidate, store: artifactStore(), kek });
     if (!reportAuthorized(rider.authorizedLanes, report)) {
       const reason = report.lanes.some((lane) => lane.disposition === "indeterminate")
         ? "keep-mine final discard report was indeterminate"
@@ -1325,7 +1380,7 @@ export async function planGitSections(
     const proven = captured.includes(rel) && p !== undefined && candidate !== undefined && ctx !== undefined
       && binding !== undefined
       && await provePendingSupersession({
-        ctx, pending: p, candidate, store: api.blobStore(), kek,
+        ctx, pending: p, candidate, store: artifactStore(), kek,
         base: base[rel], absentBranchProofs: absentBranchProofs[rel],
       })
       && pendingSupersessionAckConverges({
@@ -1349,6 +1404,14 @@ export async function planGitSections(
     }
     if (p) revertCapture(rel, p, "final candidate did not supersede pending section — carrying pending verbatim");
   }
+
+  // Design 226 flush point 2, and the invariant this whole design exists to hold:
+  // planGitSections returns only after every fresh artifact referenced by its final
+  // captured sections is either already remotely satisfied or successfully flushed.
+  // All-or-nothing — a failure here rejects the push rather than publishing a section
+  // whose bytes are missing (the repos past commitAbsentBranchVerification/pinDisplaced
+  // cannot be reverted, and the set is not statically known at this point).
+  await flushPending(captured);
 
   // Design 174 D: independently bounded scratch-ref hygiene. Only an exact
   // stable carry or a successful final capture qualifies; an unconditional P,
