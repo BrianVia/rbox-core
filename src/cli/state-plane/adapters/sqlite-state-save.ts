@@ -5,7 +5,7 @@ import type { CasResult, ManifestHeader } from "../ports.js";
 import { beginGeneration, type GenerationBuilder } from "../store/generations.js";
 import type { OwnedLockCasToken } from "../store/owner-token.js";
 import { openReadSnapshot } from "../store/read-snapshot.js";
-import { MAX_MAX_FILE_BATCH, type SealedStageRef } from "../store/sealed-stages.js";
+import { MAX_FILE_BATCH, type SealedStageRef } from "../store/sealed-stages.js";
 import {
   StageLock,
   deleteSealedArtifact,
