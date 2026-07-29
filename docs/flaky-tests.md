@@ -375,3 +375,32 @@ removed; the redacted result is retained at
   Second follow.test.ts incident today (see the safety-linearization entry)
   — the file is the flake registry's top subprocess-contention locus now;
   if a third incident lands, it earns a dedicated investigation cycle.
+
+## src/cli/daemon/daemon-activity.test.ts — "design 178 B: repeated timer rearming coalesces to one composite probe" (FIXED)
+
+- 2026-07-29: failed on CI shard 1/6 (run 30416449068, job 90463926447,
+  attempt 1) on a PR whose diff touched only `src/cli/state-plane/store/`
+  and docs. Shard wall time 236.87s; the test itself burned 291.68ms.
+- Attempt-1 evidence — the assertion at `daemon-activity.test.ts:441`
+  (`expect(daemon.activity.halt).toBeUndefined()`) received a halt still in
+  flight: `recoveryState: "running"`, `lastProbeAt` 4ms before the probe's
+  own `nextProbeAt` stamp. The probe had started and had not finished.
+- Root cause: the test observed an asynchronous probe by polling wall clock
+  — `for (let i = 0; i < 100 && daemon.activity.halt !== undefined; i++)
+  await sleep(2)`. That is a ~200ms budget on a runner that was oversubscribed
+  enough to stretch a 5s file to 236s. Nothing about coalescing was wrong.
+- Fix: await the signal the production code already publishes. The recovery
+  timer's callback calls `wake()` → `pump()` → `scheduler.service()`, which
+  assigns `pumpRun` synchronously, so `await daemon.pumpRun` after
+  `clock.fireAll()` covers the whole run including the loop's exit-time
+  re-entry. No clock injection was needed or added; no assertion changed.
+  The sibling "recovery wakeup arriving during pump exit persistence is not
+  lost" lost its identical poll loop too — `serviceLoop`'s re-entry is
+  awaited inside the same promise, so `await daemon.pump()` already covered it.
+- Red→green proof (both halves of the test bite):
+  - removed `clearRecoveryTimer()` from `armRecoveryProbe` → RED at line 435,
+    `expect(clock.callbacks.size)` received 3;
+  - removed the timer callback's `wake()` → RED at line 442,
+    `expect(remote.pullCalls)` received 0;
+  - production restored → 20/20 green runs of the file (5.14s–6.10s),
+    `src/cli/` 3514 pass / 0 fail, clean typecheck after `rm -rf .cache/tsbuildinfo`.
