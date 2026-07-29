@@ -21,7 +21,8 @@ import {
   encodeMigrationControl,
   type CompletionTuple, type MigrationControl, type MigrationWitness, type SourceWitness,
 } from "./control-codec.js";
-import { claimStagingMain, importOwnedStaging, preserveSource, proveStaging } from "./import-json.js";
+import { claimStagingMain, importOwnedStaging, preserveSource } from "./import-json.js";
+import { proveStaging } from "./prove-staging.js";
 import { publishBackup } from "./legacy-backup.js";
 
 const locks = {} as unknown as HeldStatePlaneLocks;

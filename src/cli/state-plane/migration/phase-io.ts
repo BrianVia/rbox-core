@@ -11,6 +11,7 @@ import path from "node:path";
 import { MigrationPhaseHaltError } from "../errors.js";
 import { fsyncDirectory } from "../store/artifact-proof.js";
 import { observePath } from "./artifact-observation.js";
+import type { PhaseReceipt } from "./classifier.js";
 import type { MigrationControl, SourceWitness } from "./control-codec.js";
 import type { MigrationHaltCode } from "./health.js";
 
@@ -29,6 +30,17 @@ export const halt = (
     wrote, detail,
   );
 };
+
+/** A phase body may only run on a receipt for the phase it follows. Shared so
+ * the two modules that hold phase bodies cannot drift on what "exact" means. */
+export function requirePhase(
+  receipt: PhaseReceipt, expected: MigrationControl["witness"]["phase"],
+): MigrationControl {
+  if (receipt.phase !== expected) {
+    throw new TypeError(`this phase body requires an exact ${expected} receipt, not ${receipt.phase}`);
+  }
+  return receipt.control;
+}
 
 export const fsyncFileAndParent = (file: string): void => {
   const fd = fs.openSync(file, O.O_RDONLY | O.O_NOFOLLOW);
