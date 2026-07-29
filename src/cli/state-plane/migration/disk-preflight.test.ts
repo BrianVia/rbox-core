@@ -8,8 +8,10 @@ import { normalizeLegacyStateV1 } from "../digest/legacy-state-plan.js";
 import { legacyStateSemanticDigest } from "../digest/state-semantic-v1.js";
 import { adoptClaimedStateStore } from "../store/open.js";
 import {
-  admitMigrationDisk, migrationDiskBudget, STAGING_BYTES_PER_SOURCE_BYTE,
+  admitMigrationDisk, DISK_PREFLIGHT_MARGIN_BYTES, migrationDiskBudget,
+  STAGING_BYTES_PER_SOURCE_BYTE, WAL_BYTES_PER_STAGING_BYTE,
 } from "./disk-preflight.js";
+import { RESERVE_TOTAL_BYTES } from "./reserve.js";
 import { installLegacyState } from "./import-install.js";
 
 const roots: string[] = [];
@@ -32,6 +34,24 @@ test("the budget is itemized and monotone in the source size", () => {
   expect(() => migrationDiskBudget(-1)).toThrow(RangeError);
   // An empty source still needs the schema seed, the reserve, and the margin.
   expect(migrationDiskBudget(0).requiredBytes).toBeGreaterThan(17 * 1024 * 1024);
+});
+
+test("every itemized term is actually summed into the requirement", () => {
+  // Reporting a term and then not charging for it is the failure that makes an
+  // itemized budget worse than no budget: the halt names numbers nobody used.
+  // Each term is pinned by the difference it makes, so dropping any one of the
+  // four addends changes a value asserted here.
+  const budget = migrationDiskBudget(4_096);
+  expect(budget.requiredBytes).toBe(
+    budget.backupBytes + budget.stagingBytes + budget.walBytes
+    + RESERVE_TOTAL_BYTES + DISK_PREFLIGHT_MARGIN_BYTES,
+  );
+  // ...and the WAL term specifically, which is the one a wrong constant would
+  // silently zero out while every other assertion still passed.
+  expect(budget.walBytes).toBe(budget.stagingBytes * WAL_BYTES_PER_STAGING_BYTE);
+  expect(WAL_BYTES_PER_STAGING_BYTE).toBeGreaterThanOrEqual(1);
+  expect(budget.requiredBytes - migrationDiskBudget(0).requiredBytes)
+    .toBe(2 * 4_096 + 4_096 * STAGING_BYTES_PER_SOURCE_BYTE * (1 + WAL_BYTES_PER_STAGING_BYTE));
 });
 
 test("a budget larger than the filesystem is a disk-preflight halt naming both numbers", async () => {

@@ -48,7 +48,6 @@ import { publishBackup, readBackup } from "./legacy-backup.js";
 import { fsyncDirectory } from "../store/artifact-proof.js";
 import { bracketSource, fsyncFileAndParent, halt } from "./phase-io.js";
 
-const SIDECARS = ["-wal", "-shm", "-journal"] as const;
 export const STAGING_PROOF_VERSION = 1;
 
 function requirePhase(receipt: PhaseReceipt, expected: MigrationControl["witness"]["phase"]): MigrationControl {
@@ -155,6 +154,20 @@ function committedCompletion(file: string, control: MigrationControl): Completio
  * second one — whose render→rename window has no resumable image, because the
  * recorded identity and the observed file would then disagree forever.
  * Truncating keeps `{dev, ino}`, so the identity is published exactly once.
+ *
+ * It removes no sidecars, deliberately. Every path that reaches here has just
+ * gone through `committedCompletion`, which either opened the file and closed
+ * it or failed to open it — and SQLite clears its own `-wal`/`-shm` on both
+ * (measured: a failed takeover of a non-database leaves none). A loop here
+ * could only ever be a no-op, and the real guarantee is downstream anyway:
+ * `adoptClaimedStateStore` refuses a claimed file that has any sidecar, so a
+ * surviving one fails closed rather than being silently swept.
+ *
+ * The identity re-check IS kept, and is the one assertion in this module that
+ * no test can reach: `observeStagingMain` already proved this inode a moment
+ * ago, so only a violation of the state lock could make it fire. It guards an
+ * `ftruncate`, which is the one irreversible thing this module does to a file
+ * it did not just create, and that is worth an unreachable assertion.
  */
 function resetRecordedInode(file: string, recorded: ClaimedInode): ClaimedInode {
   const fd = fs.openSync(file, O.O_WRONLY | O.O_NOFOLLOW);
@@ -168,7 +181,6 @@ function resetRecordedInode(file: string, recorded: ClaimedInode): ClaimedInode 
   } finally {
     fs.closeSync(fd);
   }
-  for (const suffix of SIDECARS) fs.rmSync(`${file}${suffix}`, { force: true });
   fsyncDirectory(path.dirname(file));
   return recorded;
 }
@@ -209,9 +221,17 @@ const importLineageId = (control: MigrationControl): string =>
     .update(`rbox-state-lineage-v1\n${control.migrationId}\n${control.authorityId}`)
     .digest("hex").slice(0, 32);
 
-/** The one guarded parse, immediately after the 52×/RSS admission it is guarded
- * by. The bytes are read under the recorded identity and re-hashed, so the
- * document parsed is provably the document the control admitted. */
+/**
+ * The one guarded parse — and the import path's ONLY read of the source.
+ *
+ * It does the whole job on ONE descriptor: admission, complete identity, read,
+ * hash, parse. `bracketSource` is deliberately not called before it here, the
+ * way M2 and M4 call it, because two reads would be two different sets of bytes
+ * with a window between them — and the only bytes whose identity matters are
+ * the ones actually parsed. Folding them removes the window rather than
+ * defending it, and makes each of these checks the sole guard of its own fact,
+ * so none of them can be deleted without a test noticing.
+ */
 function parseAdmittedSource(source: SourceWitness): SyncState {
   if (source.bytes > RESET_MATERIALIZED_BYTE_LIMIT) {
     halt("source-oversize", false, "the legacy document is over the 512 MiB limit",
@@ -227,10 +247,15 @@ function parseAdmittedSource(source: SourceWitness): SyncState {
   const fd = fs.openSync(source.path, O.O_RDONLY | O.O_NOFOLLOW);
   let bytes: Buffer;
   try {
-    const stat = fs.fstatSync(fd);
-    if (!stat.isFile() || Number(stat.dev) !== source.dev || Number(stat.ino) !== source.ino
-      || Number(stat.size) !== source.bytes) {
-      halt("verification", false, "the legacy document changed identity before the parse");
+    const stat = fs.fstatSync(fd, { bigint: true });
+    if (!stat.isFile() || Number(stat.dev) !== source.dev || Number(stat.ino) !== source.ino) {
+      halt("verification", false, "the legacy document is not the inode this migration recorded");
+    }
+    if (Number(stat.size) !== source.bytes) {
+      halt("verification", false, "the legacy document is not the length this migration recorded");
+    }
+    if (stat.mtimeNs.toString() !== source.mtimeNs) {
+      halt("verification", false, "the legacy document was written since this migration recorded it");
     }
     bytes = Buffer.alloc(source.bytes);
     if (fs.readSync(fd, bytes, 0, source.bytes, 0) !== source.bytes) {
@@ -239,6 +264,9 @@ function parseAdmittedSource(source: SourceWitness): SyncState {
   } finally {
     fs.closeSync(fd);
   }
+  // The hash covers the bytes about to be parsed, not a separate read of the
+  // path. This is the check that makes "the admitted document" a fact rather
+  // than an inference from a stat.
   if (crypto.createHash("sha256").update(bytes).digest("hex") !== source.sha256) {
     halt("verification", false, "the legacy document does not hash to its recorded digest");
   }
@@ -259,7 +287,9 @@ export async function importOwnedStaging(
 ): Promise<M3Witness> {
   void locks;
   const control = requirePhase(published.receipt, "M2");
-  const source = bracketSource(control);
+  // No separate `bracketSource` here: `parseAdmittedSource` is the bracket, on
+  // the same descriptor it reads from.
+  const source = control.source;
   const state = parseAdmittedSource(source);
   let plan;
   try {
@@ -300,7 +330,16 @@ function checkRows(db: ReturnType<typeof stateStoreDatabase>, pragma: string): A
 }
 
 function verifyOwnedStaging(file: string, completion: CompletionTuple): void {
-  const store = openStateStoreForWalTakeover(file);
+  let store;
+  try {
+    store = openStateStoreForWalTakeover(file);
+  } catch (error) {
+    // Schema, application id, DDL fingerprint, and the singleton/head coherence
+    // `validateOpen` enforces are all verification facts about a database this
+    // migration built. They arrive as a typed store error; M4 owes the driver a
+    // halt, not someone else's exception class.
+    return halt("verification", true, `the staging database did not open as a valid store (${String(error)})`);
+  }
   try {
     const db = stateStoreDatabase(store);
     if (store.header.authority_id !== completion.authorityId) {
@@ -313,18 +352,39 @@ function verifyOwnedStaging(file: string, completion: CompletionTuple): void {
     if (stateSemanticDigest(db) !== completion.sourceSemanticDigest) {
       halt("verification", false, "the imported database does not reproduce the source semantic digest");
     }
-    // Prepared and finalized, never `db.query`: a cached statement outlives the
-    // call and stops SQLite removing `-wal`/`-shm` at close, which is the one
+    // Prepared and finalized, never `db.query` — see the digest module: past
+    // five cached statements a connection stops closing, and closing is the one
     // thing M4 exists to achieve.
+    //
+    // `foreign_key_check` is NOT covered by `integrity_check`: the latter
+    // validates page and index structure, and reports foreign key violations
+    // only under `PRAGMA foreign_keys` for the rows it happens to touch. An
+    // orphaned `plane_entries` row is structurally perfect and semantically
+    // dangling, which is exactly the shape a partial import produces.
     const violations = checkRows(db, "PRAGMA foreign_key_check");
     if (violations.length > 0) halt("verification", false, `the imported database has ${violations.length} foreign key violations`);
     const integrity = checkRows(db, "PRAGMA integrity_check");
     const verdict = integrity.length === 1 ? Object.values(integrity[0]!)[0] : undefined;
     if (verdict !== "ok") halt("verification", false, "the imported database failed integrity_check");
-    // Only after every check passes: the checkpoint is the step that makes the
-    // at-rest signature meaningful, and a failed verification must never leave
-    // a file that looks finished.
-    checkpointStateStoreForReset(store);
+    // Only after every check passes, and never before (163 v13).
+    //
+    // Honest note on what this does and does not buy, because it reads like
+    // more than it is. By the time M4 runs, this connection has only READ, so
+    // the log is already empty and `TRUNCATE` has nothing to move — measured,
+    // and the reason an assertion on its returned frame counts is a tautology
+    // rather than a check. `close()` would reach `S0` without it.
+    //
+    // It is kept for two reasons that are not "it makes the file at rest": 163
+    // v13 requires a non-busy checkpoint at exactly this point, and it is the
+    // one place a still-open reader is reported as a durability question rather
+    // than inferred later from a sidecar. Deleting it is an equivalent mutant
+    // and is knowingly retained.
+    try {
+      checkpointStateStoreForReset(store);
+    } catch (error) {
+      return halt("durability-indeterminate", true,
+        `the staging database could not be checkpointed to rest (${String(error)})`);
+    }
   } finally {
     store.close();
   }

@@ -42,7 +42,12 @@ export const migrationPaths = {
   reserve: (root: string): string => path.join(stateRootPath(root), "reserve-1mib.bin"),
   emergency: (root: string, migrationId: string): string =>
     path.join(stateRootPath(root), `migration-emergency.${migrationId}.bin`),
-  fixedBackup: (root: string): string => path.join(stateRootPath(root), "pre-163-latest.json.bak"),
+  /** 163's v6 relocation, verbatim: `.rbox/state/legacy-json/`, deliberately
+   * out of the `.rbox/state.json` naming neighbourhood and beside the immutable
+   * history it belongs with, so the path a person restores by reflex is not one
+   * that silently re-elects a stale JSON baseline. */
+  fixedBackup: (root: string): string =>
+    path.join(stateRootPath(root), "legacy-json", "pre-163-latest.json.bak"),
   backupHistory: (root: string, bodySha256: string): string =>
     path.join(stateRootPath(root), "legacy-json", `${bodySha256}.json`),
   /** M2's own render temp, id-scoped so it is never a foreign path to anyone
