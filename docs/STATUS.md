@@ -5,7 +5,67 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
-_SESSION 2026-07-28 (day + all-nighter): **v1.11.0 AND v1.11.1 SHIPPED; the
+_SESSION 2026-07-28→29 (overnight): **U3 waves 1A/1B/1C + 2B are merged on
+`2.0`; 222's read-only-preflight premise is FALSIFIED and the ownership rule
+(#589, 163 v13) AWAITS FOUNDER RATIFICATION — it blocks lanes 3A/5B/5C; two CI
+flakes fixed on main; no release.** The prior-session block below is still the
+state of the program that led here._
+
+_**THE 2.0 BRANCH: U3 WAVE 1 COMPLETE, 2B IN.** `origin/2.0` was cut from main
+at **5535cc1e** and now sits at **132781dd**. Merge order: **#581** 1B (store
+adoption seam + SQLite save adapter) → **#583** 1A (migration control record +
+sole publisher) → **#588** 1C (genesis: the intent, the seven steps, the
+finishing conjunction) → **#590** never open a database rbox does not own →
+**#591** the duplicate-symbol CI gate → **#587** 2B (migration admission, the
+five M0 conditions as an ordered table, `withStatePlaneLocks`). Combined tree
+verified at **f80c35b3** (pre-#587): typecheck clean, `bun test src/cli/`
+**3572 pass / 0 fail**. **#586 Wave 2A** (classifier + PhaseReceipt) is OPEN,
+20/20 checks green, its review folded, awaiting a confirmation review.
+Six-wave plan lives in 222; routing stays bulk → codex, fail-closed seams →
+opus._
+
+_**THE READ-ONLY-PREFLIGHT PREMISE IS EMPIRICALLY FALSE — #589 (163 v13 + 222
+r6) NEEDS FOUNDER RATIFICATION, MARKED NOT-FOR-MERGE.** Proven by four
+independent lanes (bun 1.4.0 / Linux / ext4): a read-only SQLite open creates
+nothing, but the **first read** — a bare `PRAGMA` suffices — creates `-wal` and
+`-shm`, and a read-only `close()` cannot remove them while a read-write close
+can. It is **WAL-only** (a `journal_mode=delete` DB is inert) and
+environment-dependent: in a `0555` parent the first read throws instead.
+`immutable=1` is not an escape — it silently ignores uncheckpointed WAL
+content, returning a confidently wrong verdict on a healthy database. This
+matters because 163 declares a stray sidecar an unremovable corruption
+signature, so a read-only refusal path **manufactures one on data rbox does not
+own**. Proposed normative rule: **never open a file you do not own** —
+ownership = *this code created the inode or is its sole durable authority*,
+never *this code holds the workspace locked*. Unowned files are decided from
+file-level facts; owned files may be opened and must `wal_checkpoint(TRUNCATE)`
+and close. The code half already shipped as **#590** (header-only identity gate
+read with `readSync`, no preflight open; that PR's first-revision
+`PRAGMA query_only` enforcement claim was false and is withdrawn — a pragma the
+caller can turn off was never enforcement). Consequences the unbuilt lanes must
+carry: **3A** — 163:3187-3193's M4 verification is unimplementable as written
+and must verify through the owning connection (blocker); **5B** — doctor
+becomes observation-only on files it does not own; **§M-3** splits
+frozen-window (physical `{bytes,sha256}` + a `bun:sqlite` import ban) from
+live-window (`store_meta.authority_id` + the `migration_completion` singleton,
+read through the owned connection). Branch:
+`docs/readonly-open-ownership-rule`._
+
+_**MAIN SINCE THE LAST RIDER — two flake fixes, no release.** **#584**: the
+design-178 B timer-coalescing test polled wall clock for ~200ms on a shard that
+stretched 5s of work to 236s; fixed by awaiting `scheduler.pumpRun`, a signal
+production already publishes — the poll loop is deleted, production untouched,
+red→green proven both ways. **#585**: the Workers-API fair-use scan test failed
+on cross-test leakage — the suite runs single-worker with no isolation, so
+every file in a shard shares one D1, and a leftover `acct-*` id (`-` < `_`) won
+`ORDER BY next_run_at,account_id` and stole the invocation; fixed by
+tombstoning leftover accounts in the file's own `beforeEach`. Both are in
+`docs/flaky-tests.md`. The generalizable half, worth knowing before writing any
+Workers test: **the API suite shares one D1 across every file in a shard
+(`maxWorkers: 1, isolate: false`), so a test whose subject reads a table
+globally must neutralize rows it did not create, not merely clean up its own**._
+
+_PRIOR SESSION 2026-07-28 (day + all-nighter): **v1.11.0 AND v1.11.1 SHIPPED; the
 163 backend track is DONE through U2 (B0, U0, U1a/U1b, U2 all merged); design
 163 is RATIFIED AT v12 and the U3 implementation design (222) reached GO; the
 2.0 branch is OPEN and U3 is under construction.** Everything below is the
@@ -74,20 +134,6 @@ holding real user data be finished as genesis leftovers, i.e. permanent
 corruption — closed by a conjunction over values already written by the merged
 `installGenesisLineage` from intent-published inputs._
 
-_**THE 2.0 BRANCH IS OPEN; U3 IS UNDER CONSTRUCTION.** `origin/2.0` was cut
-from main at **5535cc1e** and currently sits exactly there — **the wave work is
-NOT pushed yet; it lives on local branches on the desktop only** (`u3/u3-1a-control`,
-`u3/u3-1b-store` under `.claude/worktrees/`). Push before relying on it from
-another host. Six-wave plan lives in 222. **Wave 1A** (control record:
-control-codec, control-publication, paths, errors, halt taxonomy) is built and
-in a fix round — review found 2 proven defects (a stranded revision temp wedges
-that revision permanently; `promotePreparedControl` granted the r→r+2 gap
-unconditionally) plus missing invariant gates. **Wave 1B** (`adoptClaimedStateStore`
-+ sqlite-state-save) is built and committed (**500e8a0d**), under review.
-**Wave 1C (genesis) is HELD until 1B's review clears** — genesis's safety rests
-on 1B's inode gate. Routing rule for the waves: bulk → codex, fail-closed seams
-→ opus._
-
 _**OTHER FIXES MERGED THIS SESSION:** #558 (closes #542 — barrier read
 classifies from one O_NOFOLLOW descriptor); **#559 FLAKE-006** — the real root
 cause was **filesystem inode reuse, not timing** (tmpfs never reuses: 200/200
@@ -104,8 +150,9 @@ sawtooth rather than monotonic, no leaked git children. This is exactly the
 whole-state materialization cost that **163/U4 exists to retire** (U5 kill
 criterion: RSS ≤1.5GB). Record it as the calibration data point, not a bug._
 
-_**OPEN / OWED.** Founder-owed: the **frozen machine profile** (blocks U5's bake
-only); the **v2.0.0-beta.1 tag** when U3 lands; the **adoption drain** (1 user
+_**OPEN / OWED.** Founder-owed, top of the list: **ratify #589 (163 v13) — U3
+lanes 3A/5B/5C are blocked on it**. Then the **frozen machine profile** (blocks
+U5's bake only); the **v2.0.0-beta.1 tag** when U3 lands; the **adoption drain** (1 user
 on 1.6, two on 1.9.x — watch rbox-admin's version view). Issues: **#573** macOS
 git-apply residual (low urgency, see above); **#556** a writer-less FIFO at the
 state path blocks the O_NOFOLLOW single-descriptor state reads in all three
@@ -145,7 +192,34 @@ hosts; `install.sh` reverses it). Rig FAST suite every ~3-4 merged sync-plane
 PRs and before any tag. Every PR closes with "did it help / did we make anything
 worse".
 (7) **Every perf flag's default is pinned in the defaults-ledger test** — that
-is the fix for the shipped-dark class._
+is the fix for the shipped-dark class.
+(8) **Duplicate declarations across parallel lanes merge cleanly — gate them.**
+Six found on `2.0` in one night; `git merge-tree` reported no conflict on any of
+them, and an `interface` duplicated across modules is invisible to `tsc`
+entirely (compatible shapes merge silently, and the owning lane's brand then
+does not apply to the private copy). #591's line-anchored gate
+(`src/cli/state-plane/duplicate-declarations.test.ts`, ~190ms, no AST) catches
+it and pins the exact allowlisted site *count*, not just the name. Its sweep
+found five further pre-existing duplicates, allowlisted "REAL DUPLICATE,
+pending removal": `HeadPin`, `DeferralDiscoveryAuthority`, `ResetConsentKind`,
+`PhysicalProof` (declared twice **in one file**), and `doctorCmd`
+(`hydrate-cmd.ts` exports an unrelated hydrate routine under the doctor
+command's name). Separately: the SQLite sidecar suffix list is duplicated
+**seven** times under three names plus four inline literals — that wants one
+shared exported constant, not a gate.
+(9) **Parallel agents collide on a shared scratchpad.** Agents told to run
+tests via a scratchpad script all chose the same path; one lane's runner
+overwrote another's and silently reported a different worktree's numbers.
+Runners must assert worktree path **and** branch before executing. The tell is
+a test count *larger* than the lane's own scope.
+(10) **"Green that measured the wrong thing" is a class, not a coincidence.**
+Three this session: a stale `.cache/tsbuildinfo`; a `git grep` gate that
+self-matched and whose local green depended on `git grep` skipping untracked
+files; and (9)'s scratchpad collision. One mitigation for all three — pin what
+you are measuring before believing it.
+(11) **No gate covers test-file types.** `tsconfig.json` excludes
+`**/*.test.ts`, so nothing typechecks tests at all; typechecking them against a
+temporary config found real errors a review would not have. Owner unassigned._
 
 _**BUN 1.4.0-canary POSTURE (2026-07-27, founder call — still current).**
 Canary is the MAIN bun on all three hosts (`bun upgrade --canary`); dev builds
@@ -224,39 +298,12 @@ relocated to docs/design/notes/ (#416); worktrees + merged branches pruned. NEXT
 gate); fix the first-device web button LABEL (still reads "send keys"); delete
 the throwaway dev test account._
 
-_Superseded — 189 core-aligned, pre-implementation (2026-07-23): **DESIGN 189 core-ALIGNED; PR #412
-shipped to prod; day = 3 releases + 5 PRs**): Design 189 (web-approved
-pairing — web approval -> an enrolled daemon auto-delivers keys so a new
-machine enrolls without pasting a token/phrase) driven from rough draft to
-v7 core-ALIGNED through 2 parallel codex rounds + 3 serial gates (all in
-worktree .claude/worktrees/189-web-pairing, branch
-design/189-web-approved-pairing, NOT merged). Mechanism (verified): the
-fulfilling daemon is a live admin — buildAdminRoster (roster.ts:124) signs
-a roster admitting the new device's exact pubkeys, wraps MK to the device
-enc pubkey ONCE under the persisted device context, commits that wrap's
-hash, and PUBLISHES the roster server-side atomically; the new CLI fetches
-+ verifies the full chain (signer authority) and stores the wrap as-is.
-Founder RULINGS: (Q1) epoch rotation NOT a prerequisite — accepted that a
-revoked device keeps already-synced plaintext + a ~5-min download-grant
-window (grants bypass bearer auth, grants.ts:22 / worker.test.ts:172);
-honest revoke copy required; rotation filed as design 191 (stub). Zero
-typed codes (fragment auto-binding; manual = device-auth only). 190
-(passkey escrow) DECOUPLED — browser-unwraps-RK violates the key-material
-law; needs its own redesign. **JUDGMENT CALL (mine, surfaced): stopped the
-design loop at core-aligned — the last 2 gates converged on ONE theme
-(handoff crash-recovery idempotency), now specified via the existing
-crash-safe-reuse discipline + an implementation crash-injection acceptance
-gate (189 §14), per the anti-treadmill rule. NOT a gate green-light.**
-NEXT: implement 189 (big multi-surface: apps/api device_auth+pubkeys +
-key_delivery table + migration 0033 + nudge + escrow; daemon fulfillment
-flight; CLI login FSM + staging journal; web approval step-up + fragment
-compare + route CSP; #412's fragment-preservation gap in cli-login/+page.ts
-still open). Decide: merge the 189 doc to main + start implementation, or
-one more confirmation gate on v7's §14 framing. **PR #412 (Clerk
-redirect_url fix) MERGED + PROMOTED TO PRODUCTION** (a36dbe2c; web-only,
-no apps/api/D1 change; app.rbox.to 200) — CLI-login deep links now survive
-the sign-in bounce. Founder memory: minimize-user-typing law recorded.
-Session totals below._
+_189 rulings still live (2026-07-23): epoch rotation is NOT a prerequisite —
+a revoked device keeps already-synced plaintext plus a ~5-min download-grant
+window (grants bypass bearer auth, `grants.ts:22`); honest revoke copy is
+required and rotation is filed as design **191** (stub). Design **190**
+(passkey escrow) stays DECOUPLED — browser-unwraps-RK violates the
+key-material law._
 
 _Telemetry read (minor, 2026-07-23): first 3 days of `client.sync_phase`
 AE data (since 07-21 midday) — **server plane is not the sync bottleneck;
