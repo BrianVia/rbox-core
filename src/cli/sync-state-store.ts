@@ -7,17 +7,21 @@
  * re-export surface; nothing here adds logic.
  */
 export { statePath, stateLockPath } from "./state-plane/paths.js";
+/** Whole-state access selects its backend from the state document's bytes
+ * (design 222 §1.2 A-2); everything below it is JSON-only by construction. */
+export {
+  applyStateSavePacket,
+  loadRawState,
+  loadState,
+} from "./state-plane/adapters/whole-state-compat.js";
 export {
   StreamMismatchError,
-  applyStateSavePacket,
   assertResetIncarnationMarkerNormalized,
   ensureCapableStateLineage,
   ensureTelemetryBindingId,
   installGenesisResetStateUnderHeldLock,
-  loadRawState,
-  loadState,
   saveState,
   saveStateUnsafeLegacyOrTest,
   stateLockBusyDetail,
-  stateWasStreamMismatch,
 } from "./state-plane/adapters/legacy-json-store.js";
+export { stateWasStreamMismatch } from "./state-plane/reset-lineage.js";

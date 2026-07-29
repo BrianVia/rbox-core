@@ -23,7 +23,7 @@ import {
   type WorkspaceSyncMutex,
 } from "../sync-mutex.js";
 import { loadConfigIfPresent, syncStreamId } from "../workspace-config.js";
-import { loadRawState } from "./adapters/legacy-json-store.js";
+import { loadRawLegacyJsonState } from "./adapters/legacy-json-store.js";
 import { classifyStateFormat } from "./authority-marker.js";
 import { StateFormatTooNewError } from "./errors.js";
 import { stateLockPath, statePath } from "./paths.js";
@@ -112,7 +112,7 @@ async function inspectInventory(root: string): Promise<Inventory> {
   }
   const config = await loadConfigIfPresent(root).catch(() => undefined);
   const stream = config ? syncStreamId(config) : undefined;
-  const state = await loadRawState(root);
+  const state = await loadRawLegacyJsonState(root);
   const requests = new Map<string, RepositoryRequest>();
   for (const [relPath, record] of Object.entries(state ? repoRecordsForState(state) : {}).sort(([a], [b]) => a < b ? -1 : 1)) {
     const repoDir = relPath === "." ? root : path.join(root, ...relPath.split("/"));

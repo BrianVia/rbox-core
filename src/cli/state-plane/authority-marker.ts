@@ -121,6 +121,36 @@ function formatOf(stat: Stats, head: Buffer): StateFormat {
   return looksLikeJson(head) ? "json" : "foreign";
 }
 
+/**
+ * The authority id `Q` names, or `undefined` when the bytes at `file` are not
+ * the exact marker. Same single no-follow, non-blocking descriptor as
+ * {@link classifyStateFormat}, for the same reason.
+ *
+ * Selection needs the id, not just the format: a marker whose id the database
+ * does not carry is contradictory durable state, and deciding that from the
+ * marker's own bytes keeps the refusal file-level (design 222 §1.2, §6.4).
+ */
+export async function readAuthorityMarkerId(file: string): Promise<string | undefined> {
+  let handle: Awaited<ReturnType<typeof fs.open>>;
+  try {
+    handle = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR" || code === "ELOOP") return undefined;
+    throw error;
+  }
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.size !== AUTHORITY_MARKER_BYTES) return undefined;
+    const bytes = Buffer.alloc(AUTHORITY_MARKER_BYTES);
+    const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
+    if (bytesRead !== AUTHORITY_MARKER_BYTES || !isAuthorityMarkerBytes(bytes)) return undefined;
+    return bytes.toString("latin1").slice(AUTHORITY_MARKER_MAGIC.length + 1, -1);
+  } finally {
+    await handle.close();
+  }
+}
+
 /** True only for the exact 58-byte marker. Exposed for fixtures and tests;
  * production code goes through {@link classifyStateFormat}. */
 export function isAuthorityMarkerBytes(bytes: Uint8Array): boolean {

@@ -49,9 +49,16 @@ interface EntryPoint {
 
 const ENTRY_POINTS: readonly EntryPoint[] = [
   // Reads — refuse a state plane written by a newer rbox instead of guessing.
-  { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "loadRawState", kind: "read", sites: 2, guards: ["assertStateReadable"] },
-  { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "loadState", kind: "read", sites: 1, guards: ["loadRawState"] },
-  { file: "src/cli/doctor-state-plane.ts", symbol: "checkState", kind: "read", sites: 1, guards: ["loadRawState"] },
+  { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "loadRawLegacyJsonState", kind: "read", sites: 2, guards: ["assertStateReadable"] },
+  { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "loadLegacyJsonState", kind: "read", sites: 1, guards: ["loadRawLegacyJsonState"] },
+  { file: "src/cli/doctor-state-plane.ts", symbol: "checkState", kind: "read", sites: 1, guards: ["loadRawLegacyJsonState"] },
+
+  // The whole-state compatibility adapter (design 222 §1.2 A-2): one selection
+  // from the document's bytes, and every backend-specific read or write behind
+  // it. The refusals are file-level, so nothing here opens a database first.
+  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "selectSqliteAuthority", kind: "read", sites: 2, guards: ["classifyStateFormat", "readAuthorityMarkerId"] },
+  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "loadRawState", kind: "read", sites: 0, guards: ["selectSqliteAuthority", "openAuthorityStore"] },
+  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "loadState", kind: "read", sites: 0, guards: ["selectSqliteAuthority", "recoverStandingResetJournal", "openAuthorityStore", "markResetLineageProvenance"] },
   { file: "src/cli/state-plane/locks.ts", symbol: "inspectInventory", kind: "read", sites: 1, guards: ["classifyStateFormat"] },
   { file: "src/cli/state-plane/migration/admission.ts", symbol: "barrierWitness", kind: "read", sites: 1, guards: ["verifyLastWriterWitness"] },
   // The migration classifier's sole reader of the document. It must handle the
@@ -63,7 +70,11 @@ const ENTRY_POINTS: readonly EntryPoint[] = [
   // record the last-writer witness immediately after it.
   { file: "src/cli/state-plane/adapters/legacy-json-publication.ts", symbol: "publishWholeState", kind: "write", sites: 0, guards: ["assertStatePublishable"] },
   { file: "src/cli/state-plane/adapters/legacy-json-publication.ts", symbol: "afterStatePublication", kind: "write", sites: 0, guards: ["recordLastWriterWitness", "ensureStateReserve"] },
-  { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "applyStateSavePacket", kind: "write", sites: 7, guards: ["assertStatePublishable", "afterStatePublication"] },
+  { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "applyLegacyJsonSavePacket", kind: "write", sites: 7, guards: ["assertStatePublishable", "afterStatePublication"] },
+  // The SQLite save boundary: the lock, then the ONE write fence, then the
+  // selection re-read under that lock, and only then a database open.
+  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "applyStateSavePacket", kind: "write", sites: 0, guards: ["selectSqliteAuthority"] },
+  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "saveThroughStore", kind: "write", sites: 2, guards: ["acquireLock", "assertAuthorityWritable", "selectSqliteAuthority", "openAuthorityStore"] },
   { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "writeWholeStateUnsafe", kind: "write", sites: 2, guards: ["acquireLock", "publishWholeState", "afterStatePublication"] },
   { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "ensureTelemetryBindingId", kind: "write", sites: 5, guards: ["assertStatePublishable", "afterStatePublication"] },
 
@@ -207,7 +218,7 @@ describe("state barrier pinning inventory", () => {
   });
 
   test("inline CAS publication proves its callback and post-publication order", () => {
-    for (const symbol of ["applyStateSavePacket", "ensureTelemetryBindingId"]) {
+    for (const symbol of ["applyLegacyJsonSavePacket", "ensureTelemetryBindingId"]) {
       const publish = requiredCall("src/cli/state-plane/adapters/legacy-json-store.ts", symbol, "writeFileAtomic");
       const options = publish.arguments?.[2] ?? "";
       expect(options).toContain("beforeRename");
