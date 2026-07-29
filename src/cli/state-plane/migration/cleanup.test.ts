@@ -33,6 +33,7 @@ import {
   publishMigrationControl, readCanonicalControl, releaseHaltResource, renderPreparedControl,
   retireCanonicalControl,
 } from "./control-publication.js";
+import { inodeOf, replaceUnderNewInode } from "./inode-fixtures.js";
 import { buildReserveHeader, RESERVE_HEADER_BYTES } from "./reserve.js";
 
 const HASH = "a".repeat(64);
@@ -40,10 +41,6 @@ const ID = "m1";
 const locks = {} as unknown as HeldStatePlaneLocks;
 const digest = (bytes: Uint8Array): string => crypto.createHash("sha256").update(bytes).digest("hex");
 const enospc = (): NodeJS.ErrnoException => Object.assign(new Error("no space"), { code: "ENOSPC" });
-const inodeOf = (file: string): string => {
-  const stat = fs.lstatSync(file);
-  return `${Number(stat.dev)}:${Number(stat.ino)}`;
-};
 
 const source = { path: "/w/.rbox/state.json", dev: 1, ino: 2, bytes: 10, sha256: HASH, mtimeNs: "123" };
 const witnessArtifact = { path: "/w/x", dev: 1, ino: 3, bytes: 4, sha256: HASH };
@@ -238,9 +235,7 @@ describe("the M6 cleanup cursor", () => {
     if (intent.kind !== "intent") throw new Error("unreachable");
 
     const recorded = inodeOf(fx.reserve);
-    fs.unlinkSync(fx.reserve);
-    fs.writeFileSync(fx.reserve, Buffer.alloc(640));
-    const swapped = inodeOf(fx.reserve);
+    const swapped = replaceUnderNewInode(fx.reserve, Buffer.alloc(640));
     expect(swapped, "the fixture must actually produce a different inode").not.toBe(recorded);
 
     await expect(stepCleanup(fx.root, receipt(intent.control), locks)).rejects.toThrow(MigrationControlError);
@@ -316,8 +311,7 @@ describe("the M6 cleanup cursor", () => {
     const ready = await toReady(fx, await toFinalIntent(fx));
 
     const recorded = inodeOf(fx.emergency);
-    fs.unlinkSync(fx.emergency);
-    fs.writeFileSync(fx.emergency, Buffer.alloc(64));
+    replaceUnderNewInode(fx.emergency, Buffer.alloc(64));
     expect(inodeOf(fx.emergency), "the swap must actually produce a different inode").not.toBe(recorded);
 
     // The emergency candidate has no 128-byte header, so `dev`/`ino` is the
@@ -485,8 +479,7 @@ describe("the allocation-free runway", () => {
     const recorded = inodeOf(ledger.halt.path);
 
     // Exactly what "just rebuild the pair" would do.
-    fs.unlinkSync(ledger.halt.path);
-    fs.writeFileSync(ledger.halt.path, Buffer.alloc(0), { mode: 0o600 });
+    replaceUnderNewInode(ledger.halt.path, Buffer.alloc(0), { mode: 0o600 });
     expect(inodeOf(ledger.halt.path), "the replacement must actually be a new inode").not.toBe(recorded);
 
     await expect(stepFutureControlPreparation(fx.root, receipt(current), locks))
@@ -578,8 +571,7 @@ describe("the allocation-free runway", () => {
     const step = stepFutureControlPreparation(fx.root, receipt(current), locks, {
       onStep: (which) => {
         if (which !== "write-halt") return;
-        fs.unlinkSync(ledger.halt.path);
-        fs.writeFileSync(ledger.halt.path, "not this ledger's slot", { mode: 0o600 });
+        replaceUnderNewInode(ledger.halt.path, "not this ledger's slot", { mode: 0o600 });
       },
     });
     await expect(step).rejects.toThrow(/changed identity before its halted-m6 bytes were written/);
@@ -867,8 +859,7 @@ describe("M7 terminalization", () => {
    * because a test that changes both proves neither. */
   test.each([
     ["a different inode at the recorded length", (file: string, size: number) => {
-      fs.unlinkSync(file);
-      fs.writeFileSync(file, Buffer.alloc(size, 0x2e));
+      replaceUnderNewInode(file, Buffer.alloc(size, 0x2e));
     }],
     ["the recorded inode at a different length", (file: string) => {
       fs.appendFileSync(file, "grown");

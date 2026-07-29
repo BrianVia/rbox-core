@@ -12,6 +12,7 @@ import type {
   SourceWitness,
 } from "./control-codec.js";
 import { publishMigrationControl, readCanonicalControl } from "./control-publication.js";
+import { replaceUnderNewInode } from "./inode-fixtures.js";
 import { armRetirement, stepRetirement, type RetirementStep } from "./retirement.js";
 
 const locks = {} as unknown as HeldStatePlaneLocks;
@@ -41,20 +42,13 @@ function inodeOf(file: string): { dev: number; ino: number } {
   return { dev: Number(stat.dev), ino: Number(stat.ino) };
 }
 
-/**
- * Replace a file's CONTENT under a NEW inode, and prove the inode is new. Both
- * files exist at once, so the kernel cannot hand back the old number — a plain
- * unlink-then-create can, and does on the CI filesystem, which would leave every
- * identity assertion below vacuously true.
- */
+/** Replace a file's CONTENT under a provably NEW inode. See `inode-fixtures.ts`
+ * for why this is never an unlink followed by a create. */
 function swapInode(file: string, contents: string): { dev: number; ino: number } {
   const before = inodeOf(file);
-  const decoy = `${file}.decoy`;
-  write(decoy, contents);
-  const after = inodeOf(decoy);
-  expect(after.ino, "the decoy reused the inode under test").not.toBe(before.ino);
-  fs.renameSync(decoy, file);
-  expect(inodeOf(file)).toEqual(after);
+  replaceUnderNewInode(file, contents);
+  const after = inodeOf(file);
+  expect(after.ino, "the replacement reused the inode under test").not.toBe(before.ino);
   return after;
 }
 
