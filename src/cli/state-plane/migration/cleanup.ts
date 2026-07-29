@@ -82,9 +82,30 @@ export function statOrAbsent(file: string): fs.Stats | undefined {
   }
 }
 
-export function m6(receipt: PhaseReceipt): { control: MigrationControl; witness: M6Witness } {
+/**
+ * The door every M6 mutator comes through, and the place the vector's paths are
+ * re-derived. A control read back from disk is a record, not a construction:
+ * `ArtifactItem.path` is a bare string, and this code's next act is an unlink,
+ * so an item naming anything but the path its role derives to — including a
+ * path outside `.rbox/state` — is refused rather than removed. The recorded
+ * parent must also BE the item's parent, or the post-unlink fsync is aimed
+ * somewhere else entirely.
+ *
+ * `retirement.ts` fences the C1 vector the same way. Each derives its own
+ * roles, because the two vectors admit different ones; 222 §M-8 records the
+ * shared derivation as a 5A consolidation rather than a cross-import now.
+ */
+export function m6(root: string, receipt: PhaseReceipt): { control: MigrationControl; witness: M6Witness } {
   const { control } = receipt;
   if (control.witness.phase !== "M6") return corruptCleanup(`cleanup requires an M6 receipt, not ${control.witness.phase}`);
+  for (const item of control.witness.cleanup.items) {
+    const derived = resourceKey(item.role) === "reserve"
+      ? migrationPaths.reserve(root)
+      : migrationPaths.emergency(root, control.migrationId);
+    if (item.path !== derived || item.parent !== path.dirname(item.path)) {
+      corruptCleanup(`${item.path} is not the path this migration's ${item.role} derives to`);
+    }
+  }
   return { control, witness: control.witness };
 }
 
@@ -158,13 +179,16 @@ export function releaseItem(item: ArtifactItem): void {
 }
 
 /**
- * The guard is unreachable defense-in-depth, and deliberately kept: both
- * callers already prove the intent — `retryPromotedHalt` through
- * `isFinalIntentPromotedHalt`, and `completeFinalItem` because the prepared
- * records are pure functions of the whole control, so a moved cursor makes the
- * derived bytes disagree with the ledger's exact descriptors before this runs.
- * It stays because it is what makes the last-item index read safe locally, in
- * code whose next act is an unlink.
+ * DO NOT DELETE THE GUARD BELOW. It is unreachable today, and that is a
+ * property of the two current callers rather than of this function: both prove
+ * the intent first — `retryPromotedHalt` through `isFinalIntentPromotedHalt`,
+ * and `completeFinalItem` because the prepared records are pure functions of
+ * the whole control, so a moved cursor makes the derived bytes disagree with
+ * the ledger's exact descriptors before this runs. A mutation sweep will report
+ * it as an equivalent mutant and a `/simplify` pass will read it as dead code.
+ * It stays: it is what makes the last-item index read safe locally, in a
+ * function whose caller's next act is an unlink, and a third caller would
+ * inherit the unlink without inheriting either proof.
  */
 export const finalItem = (witness: M6Witness): ArtifactItem => {
   const { items, currentIntent } = witness.cleanup;
@@ -205,7 +229,7 @@ function defer(root: string, control: MigrationControl, error: unknown, locks: H
 export async function stepCleanup(
   root: string, receipt: PhaseReceipt, locks: HeldStatePlaneLocks,
 ): Promise<CleanupStep> {
-  const { control, witness } = m6(receipt);
+  const { control, witness } = m6(root, receipt);
   const cursor = witness.cleanup;
   try {
     if (cursor.currentIntent === null) {

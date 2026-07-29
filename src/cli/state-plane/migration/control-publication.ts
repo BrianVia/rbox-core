@@ -130,19 +130,6 @@ export function readCanonicalControl(root: string): MigrationControl | undefined
   return readCanonicalControlExact(root)?.control;
 }
 
-/**
- * M7's terminal retirement, under the same CAS every other transition takes.
- * Nothing is published afterwards — the migration's last durable act is the
- * disappearance of this file (163:3131).
- */
-export function retireCanonicalControl(root: string, expect: PublishExpectation, locks: HeldStatePlaneLocks): void {
-  void locks;
-  assertExpectation(readCanonicalControl(root), expect);
-  const file = migrationPaths.control(root);
-  fs.unlinkSync(file);
-  fsyncDirectorySync(path.dirname(file));
-}
-
 function assertExpectation(current: MigrationControl | undefined, expect: PublishExpectation): void {
   const absent = expect.migrationId === "absent";
   if (absent !== (expect.revision === "absent")) fail("cas", "expectation mixes an absent control with an exact revision");

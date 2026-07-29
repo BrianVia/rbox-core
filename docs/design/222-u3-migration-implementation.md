@@ -572,12 +572,20 @@ catches either.**
   drift it means. (`releaseHaltResource` verifies
   `haltResources.reserve.sha256` as a whole-file digest, which is the shape
   every other `{bytes, sha256}` witness in the codec carries.)
-- `ArtifactItem.path` is schema-typed as a bare `"string"` with no confinement,
-  and cleanup unlinks whatever a well-formed row names. A row reading
-  `/tmp/outside/precious.txt` with a matching inode would be removed. Nothing
-  reaches this without already writing inside `.rbox/state`, so it is not a
-  live escalation — but 4A's builder must derive every `path` from
-  `migrationPaths`, never copy a string from elsewhere in the record.
+- `ArtifactItem.path` is schema-typed as a bare `"string"` with no confinement.
+  **Now fenced rather than documented.** 3B landed `notDerived` over the C1
+  vector while this lane was in review, so M-8 adopted the same rule at the door
+  of every M6 mutator: each item's `path` must equal the path its role derives
+  to from `migrationPaths`, and its `parent` must be that path's own directory
+  or the post-unlink fsync is aimed elsewhere. A row reading
+  `/tmp/outside/precious.txt` is refused, not removed. 4A's builder should still
+  derive every `path` from `migrationPaths` — the fence now makes anything else
+  fail closed instead of silently working.
+
+  The two vectors derive their own roles separately because they admit
+  different ones (C1 carries the staging artifacts and the Q sibling; M6 carries
+  two). **5A consolidation candidate:** one role→path derivation consumed by
+  both, rather than the two that exist now.
 
 ---
 

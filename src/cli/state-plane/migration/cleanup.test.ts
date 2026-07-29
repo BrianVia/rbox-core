@@ -248,19 +248,45 @@ describe("the M6 cleanup cursor", () => {
   });
 
   test("refuses a non-regular occupant even at the recorded inode", async () => {
-    // A directory whose inode the vector recorded. Without the `isFile` check
-    // the unlink is still refused — by `EISDIR`, from the kernel, as an
-    // uncaught errno rather than a protocol refusal.
+    // A directory at the DERIVED reserve path, whose inode the vector recorded.
+    // Without the `isFile` check the unlink is still refused — by `EISDIR`, from
+    // the kernel, as an uncaught errno rather than a protocol refusal.
     const fx = fixture((defaults, root) => {
-      const dir = path.join(root, ".rbox", "state", "not-a-reserve");
-      fs.mkdirSync(dir);
-      const stat = fs.lstatSync(dir);
-      return [{ ...defaults[0]!, path: dir, dev: Number(stat.dev), ino: Number(stat.ino) }, defaults[1]!];
+      const file = migrationPaths.reserve(root);
+      fs.unlinkSync(file);
+      fs.mkdirSync(file);
+      const stat = fs.lstatSync(file);
+      return [{ ...defaults[0]!, dev: Number(stat.dev), ino: Number(stat.ino) }, defaults[1]!];
     });
     const intent = await stepCleanup(fx.root, receipt(fx.control), locks);
     if (intent.kind !== "intent") throw new Error("unreachable");
     await expect(stepCleanup(fx.root, receipt(intent.control), locks))
       .rejects.toThrow(/is not the reserve this cleanup vector recorded/);
+  });
+
+  /** A control is a record, not a construction. `ArtifactItem.path` is a bare
+   * string in the schema, so the vector's paths are re-derived at the door of
+   * every M6 mutator — the same fence `retirement.ts` applies to the C1 vector. */
+  test.each([
+    ["a path outside the state directory", (item: ArtifactItem, root: string) =>
+      ({ ...item, path: path.join(root, "precious.txt"), parent: root })],
+    ["a plausible path inside it", (item: ArtifactItem, root: string) =>
+      ({ ...item, path: path.join(root, ".rbox", "state", "reserve-1mib.bin.old") })],
+    ["a parent that is not the item's own directory", (item: ArtifactItem, root: string) =>
+      ({ ...item, parent: root })],
+  ])("refuses a cleanup item naming %s", async (_label, tamper) => {
+    const decoy: string[] = [];
+    const fx = fixture((defaults, root) => {
+      const moved = tamper(defaults[0]!, root);
+      if (moved.path !== defaults[0]!.path) {
+        fs.renameSync(defaults[0]!.path, moved.path);
+        decoy.push(moved.path);
+      }
+      return [moved, defaults[1]!];
+    });
+    await expect(stepCleanup(fx.root, receipt(fx.control), locks))
+      .rejects.toThrow(/is not the path this migration's reserve derives to/);
+    for (const file of decoy) expect(fs.existsSync(file), "and the named file is untouched").toBe(true);
   });
 
   test("refuses a reserve item recorded without its header digest", async () => {

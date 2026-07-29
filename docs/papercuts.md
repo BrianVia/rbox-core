@@ -388,12 +388,20 @@ behind-origin count; loudly warn when behind.
   on canonical bytes. Nobody noticed across five design rounds because the
   circularity lives in JSON *lengths*, not in named dependencies. Fixed by
   pinning the shape without the length (163:3092 already required the retry to
-  recompute the M7 record, so it was a duplicate too). Two rules: an omission
-  list is not a schema — when a document says which fields a record leaves out,
-  the implementer is inventing the ones it leaves in, and that invention belongs
-  back in the document; and when a record stores a length or hash of another
-  record that stores a length or hash of it, check for the cycle before
-  implementing, preferring derivation over storage.
+  recompute the M7 record, so it was a duplicate too).
+
+  **Rule 1 — an omission list is not a schema.** When a design says which fields
+  a record leaves out, it has not said which fields it leaves in, and the
+  implementer who fills that gap is authoring schema under the impression they
+  are transcribing it. Treat an omission sentence as an open decision: write the
+  shape into the document and get it reviewed before building on it. This is not
+  an anecdote about one field — it is the root cause of the cycle above, and any
+  lane reading a "carries X but not Y" sentence is in the same position.
+
+  **Rule 2 — never store a length or hash of a record that stores yours.** Check
+  for the cycle before implementing, and prefer deriving over storing, which
+  removes the question entirely. A stored copy of a derivable value can only
+  ever disagree with the derivation.
 
 - **The state-plane file-size law has no CI gate (2026-07-29):** 163:3994 states
   "400 lines / 25 KiB is the hard CI failure" for production files, and nothing

@@ -214,7 +214,7 @@ function readSlotExact(slot: SlotRef, recorded: Inode, bytes: Buffer, revision: 
 export async function stepFutureControlPreparation(
   root: string, receipt: PhaseReceipt, locks: HeldStatePlaneLocks, hooks: RunwayHooks = {},
 ): Promise<PreparationStep> {
-  const { control, witness } = m6(receipt);
+  const { control, witness } = m6(root, receipt);
   const ledger = witness.futureControls;
   if (ledger?.stage !== "preparing") return corruptCleanup("the M6 control carries no preparation ledger");
   if (witness.cleanup.currentIntent?.index !== witness.cleanup.items.length) {
@@ -316,7 +316,7 @@ function readyPair(
 export async function completeFinalItem(
   root: string, receipt: PhaseReceipt, locks: HeldStatePlaneLocks,
 ): Promise<FinalItemOutcome> {
-  const { control, witness } = m6(receipt);
+  const { control, witness } = m6(root, receipt);
   const ledger = witness.futureControls;
   if (ledger?.stage !== "preparing" || control.controlRevision !== ledger.readyRevision) {
     return corruptCleanup("the final item may be completed only at the runway-ready revision");
@@ -367,7 +367,7 @@ function promoteSuccess(
 export async function retryPromotedHalt(
   root: string, receipt: PhaseReceipt, locks: HeldStatePlaneLocks,
 ): Promise<FinalItemOutcome> {
-  const { control, witness } = m6(receipt);
+  const { control, witness } = m6(root, receipt);
   const ledger = witness.futureControls;
   if (!isFinalIntentPromotedHalt(control) || ledger?.stage !== "promoted-halt") {
     return corruptCleanup("only an exact final-intent promoted halt may be retried");
