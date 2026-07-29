@@ -554,10 +554,20 @@ test("M4 halts when the committed completion row is not the one M3 published", a
 
 test("M4 refuses a staging path that is no longer the recorded inode", async () => {
   const imported = await importState("m4-foreign", fixtureState());
+  // Build the replacement at a DIFFERENT path first, so the swap cannot be
+  // handed back the inode it just freed. tmpfs never recycles and ext4 always
+  // does, so a fixture that unlinks before it creates passes here and asserts
+  // nothing in CI — hence the construction, and the assertion that it worked.
   const copy = `${imported.stagingPath}.other`;
   fs.copyFileSync(imported.stagingPath, copy);
   fs.rmSync(imported.stagingPath);
   fs.renameSync(copy, imported.stagingPath);
+  const swapped = observePath(imported.stagingPath);
+  expect(swapped.state).toBe("regular");
+  expect(
+    `${(swapped as ClaimedInode).dev}:${(swapped as ClaimedInode).ino}`,
+    "the fixture must actually produce a different inode",
+  ).not.toBe(`${imported.identity.dev}:${imported.identity.ino}`);
   const failure = await proveStaging(imported.root, receiptFor(m3Control(imported)), locks)
     .then(() => undefined, (error: unknown) => error);
   expect(failure).toBeInstanceOf(MigrationPhaseHaltError);
