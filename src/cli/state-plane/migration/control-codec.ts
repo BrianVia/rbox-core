@@ -6,12 +6,15 @@
  * owns the closed exact schema, its canonical bytes, and the predicates that
  * read a control without observing anything else.
  *
- * Two members 163 prints are deliberately absent, because each would store the
+ * Three members 163 prints are deliberately absent, because each would store the
  * same value twice and could therefore only ever disagree: the top-level `phase`
- * (the witness union's discriminant is the phase) and the halt's own `phase` (a
- * halt is phase-preserving by construction).
+ * (the witness union's discriminant is the phase), the halt's own `phase` (a halt
+ * is phase-preserving by construction), and M6's `qAuthorityId` (the control
+ * already carries `authorityId`). Everything else 163 prints is stored, including
+ * every artifact path — see design 222 §1.1's record of what wave 1A pinned.
  */
 import { canonicalize, canonicalString } from "../../../engine/e2ee/jcs.js";
+import { checkRecord, tagged, type Fields, type Refuse, type Spec } from "../closed-record.js";
 import { MigrationControlError } from "../errors.js";
 import type { MigrationHalt, MigrationHaltCode } from "./health.js";
 
@@ -32,10 +35,16 @@ export const ARTIFACT_ROLES = [
 ] as const;
 export type ArtifactRole = typeof ARTIFACT_ROLES[number];
 
-const HALT_CODES: readonly MigrationHaltCode[] = [
-  "source-oversize", "memory-admission", "record-oversize", "disk-preflight", "filesystem-full",
-  "source-changed", "verification", "reserved-path", "durability-indeterminate", "cleanup-deferred",
-];
+/** Exhaustive by construction: a `Record<MigrationHaltCode, true>` cannot omit a
+ * code, so a wave that adds one cannot leave the codec rejecting durable halt
+ * records the rest of the build already accepts. */
+const HALT_CODE_TABLE: Record<MigrationHaltCode, true> = {
+  "source-oversize": true, "memory-admission": true, "record-oversize": true,
+  "disk-preflight": true, "filesystem-full": true, "source-changed": true,
+  "verification": true, "reserved-path": true, "durability-indeterminate": true,
+  "cleanup-deferred": true,
+};
+const HALT_CODES = Object.keys(HALT_CODE_TABLE);
 
 export interface Inode { readonly dev: number; readonly ino: number }
 export interface SourceWitness extends Inode {
@@ -89,25 +98,36 @@ export interface Cursor {
   readonly currentIntent: null | { readonly index: number };
 }
 
-/** A prepared future-control sibling on the M6 allocation-free runway
- * (163:2988). Neither descriptor may ever be reset to `absent`. */
+/** A prepared future-control sibling's disposition on the M6 allocation-free
+ * runway (163:2988). It may never be reset from `building`/`exact` to `absent`. */
 export type PreparedDescriptor =
   | { readonly state: "absent" }
   | ({ readonly state: "building"; readonly expected: null | { readonly bytes: number; readonly sha256: string } } & Inode)
   | ({ readonly state: "exact"; readonly bytes: number; readonly sha256: string } & Inode);
 
+/** One prebound member of the ledger: its fixed kind, its exact path, and how
+ * far it has been rendered (163:2986). Every artifact this record names stores
+ * its own path — the same policy as the retirement vector, the cleanup vector,
+ * and the terminal sibling. */
+export interface PreparedControlSlot {
+  readonly kind: "halted-m6" | "m7";
+  readonly path: string;
+  readonly disposition: PreparedDescriptor;
+}
+
 export type FutureControls =
   | null
   | {
-    readonly kind: "preparing"; readonly baseRevision: number; readonly readyRevision: number;
+    readonly stage: "preparing"; readonly version: 1;
+    readonly baseRevision: number; readonly readyRevision: number;
     readonly haltRevision: number; readonly successRevision: number;
-    readonly halt: PreparedDescriptor; readonly success: PreparedDescriptor;
+    readonly halt: PreparedControlSlot; readonly success: PreparedControlSlot;
   }
   /** The ledger as the promoted halted-M6 record consumes it: where it came
    * from, and the M7 sibling it still owns. Neither member carries its own
    * SHA-256 — that would be a self/cross-digest cycle (163:3028). */
   | {
-    readonly kind: "promoted-halt";
+    readonly stage: "promoted-halt";
     readonly origin: { readonly path: string; readonly revision: number } & Inode;
     readonly preparedSuccess: { readonly path: string; readonly revision: number; readonly bytes: number } & Inode;
   };
@@ -165,62 +185,12 @@ export interface MigrationControl {
 }
 
 // ---------------------------------------------------------------------------
-// The closed schema, and the one reader that enforces it.
+// The closed schema. `closed-record.ts` owns the reader that enforces it.
 
-type Fields = Record<string, Spec>;
-type Spec =
-  | "string" | "int" | "hex" | "digits"
-  | { readonly oneOf: readonly string[] }
-  | { readonly const: unknown }
-  | { readonly opt: Spec }
-  | { readonly list: Spec }
-  | { readonly each: Spec }
-  | { readonly fields: Fields }
-  | { readonly union: { readonly on: string; readonly cases: Record<string, Fields> } };
-
-const bad = (at: string, why: string): never => {
+const bad: Refuse = (at, why) => {
   throw new MigrationControlError("schema", `${at} ${why}`);
 };
-const plainObject = (v: unknown, at: string): Record<string, unknown> =>
-  typeof v === "object" && v !== null && !Array.isArray(v)
-    ? v as Record<string, unknown>
-    : bad(at, "is not an object");
 
-function check(v: unknown, spec: Spec, at: string): void {
-  if (spec === "string") { if (typeof v !== "string" || v.length === 0) bad(at, "is not a nonempty string"); return; }
-  if (spec === "int") { if (typeof v !== "number" || !Number.isSafeInteger(v) || v < 0) bad(at, "is not a nonnegative safe integer"); return; }
-  if (spec === "hex") { if (typeof v !== "string" || !/^[0-9a-f]{64}$/.test(v)) bad(at, "is not 64 lowercase hex characters"); return; }
-  if (spec === "digits") { if (typeof v !== "string" || !/^[0-9]+$/.test(v)) bad(at, "is not decimal digits"); return; }
-  if ("oneOf" in spec) { if (!spec.oneOf.includes(v as string)) bad(at, `is not one of ${spec.oneOf.join("|")}`); return; }
-  if ("const" in spec) { if (v !== spec.const) bad(at, `is not ${JSON.stringify(spec.const)}`); return; }
-  if ("opt" in spec) { if (v !== null) check(v, spec.opt, at); return; }
-  if ("list" in spec) {
-    if (!Array.isArray(v)) { bad(at, "is not an array"); return; }
-    v.forEach((item, i) => check(item, spec.list, `${at}[${i}]`));
-    return;
-  }
-  if ("each" in spec) {
-    for (const [key, item] of Object.entries(plainObject(v, at))) check(item, spec.each, `${at}.${key}`);
-    return;
-  }
-  if ("union" in spec) {
-    const tag = plainObject(v, at)[spec.union.on];
-    const fields = typeof tag === "string" ? spec.union.cases[tag] : undefined;
-    if (!fields) bad(`${at}.${spec.union.on}`, `is not one of ${Object.keys(spec.union.cases).join("|")}`);
-    return check(v, { fields: fields! }, at);
-  }
-  const o = plainObject(v, at);
-  const keys = Object.keys(spec.fields);
-  for (const key of Object.keys(o)) if (!keys.includes(key)) bad(at, `has unknown member ${JSON.stringify(key)}`);
-  for (const key of keys) {
-    if (!(key in o)) bad(at, `is missing ${JSON.stringify(key)}`);
-    check(o[key], spec.fields[key]!, `${at}.${key}`);
-  }
-}
-
-const tagged = (on: string, cases: Record<string, Fields>): Spec => ({
-  union: { on, cases: Object.fromEntries(Object.entries(cases).map(([tag, f]) => [tag, { [on]: { const: tag }, ...f }])) },
-});
 const INODE: Fields = { dev: "int", ino: "int" };
 const SOURCE: Spec = { fields: { path: "string", ...INODE, bytes: "int", sha256: "hex", mtimeNs: "digits" } };
 const ARTIFACT: Fields = { path: "string", ...INODE, bytes: "int", sha256: "hex" };
@@ -234,10 +204,16 @@ const CURSOR: Spec = {
 const RESOURCE: Spec = tagged("disposition", Object.fromEntries(HALT_RESOURCE_DISPOSITIONS.map(
   (d) => [d, d === "available" ? { ...INODE, bytes: "int", sha256: "hex" } : {}] as const,
 )));
-const PREPARED: Spec = tagged("state", {
-  absent: {},
-  building: { ...INODE, expected: { opt: { fields: { bytes: "int", sha256: "hex" } } } },
-  exact: { ...INODE, bytes: "int", sha256: "hex" },
+const slot = (kind: "halted-m6" | "m7"): Spec => ({
+  fields: {
+    kind: { const: kind },
+    path: "string",
+    disposition: tagged("state", {
+      absent: {},
+      building: { ...INODE, expected: { opt: { fields: { bytes: "int", sha256: "hex" } } } },
+      exact: { ...INODE, bytes: "int", sha256: "hex" },
+    }),
+  },
 });
 const PROOF: Fields = {
   sha256: "hex", bytes: "int", semanticDigest: "hex", entryCount: "int", repoCount: "int", proofVersion: "int",
@@ -271,10 +247,11 @@ const WITNESS_LAYERS: readonly Fields[] = [
   {
     cleanup: CURSOR,
     futureControls: {
-      opt: tagged("kind", {
+      opt: tagged("stage", {
         preparing: {
+          version: { const: 1 },
           baseRevision: "int", readyRevision: "int", haltRevision: "int", successRevision: "int",
-          halt: PREPARED, success: PREPARED,
+          halt: slot("halted-m6"), success: slot("m7"),
         },
         "promoted-halt": {
           origin: { fields: { path: "string", revision: "int", ...INODE } },
@@ -311,10 +288,20 @@ const CONTROL: Spec = {
   },
 };
 
-/** The two correlations the shape schema cannot state. */
+/** The correlations the shape schema cannot state. */
 function checkInvariants(control: MigrationControl): void {
   const { witness } = control;
   const m6 = witness.phase === "M6" || witness.phase === "M7" ? witness : undefined;
+  // Disposition legality (163:2636): `not-created` only at M0, `retired` only at
+  // M7, and each intent/absent variant only inside its own subprotocol.
+  for (const [role, resource] of Object.entries(control.haltResources)) {
+    const at = `control.haltResources.${role}`;
+    const d = resource.disposition;
+    if (d === "not-created" && witness.phase !== "M0") bad(at, "is not-created outside M0");
+    if (d === "retired" && witness.phase !== "M7") bad(at, "is retired outside M7");
+    if (d.startsWith("retirement-") && control.retirement === null) bad(at, "names a retirement with none armed");
+    if (d.startsWith("cleanup-") && !m6) bad(at, "names an M6 cleanup before M6");
+  }
   for (const cursor of [control.retirement?.cursor, m6?.cleanup]) {
     if (!cursor) continue;
     if (cursor.durablePrefix > cursor.items.length) bad("control cursor", "prefix exceeds its vector");
@@ -324,7 +311,7 @@ function checkInvariants(control: MigrationControl): void {
     if (cursor.currentIntent && cursor.currentIntent.index > cursor.items.length) bad("control cursor", "current intent is past its vector");
   }
   const ledger = m6?.futureControls;
-  if (ledger?.kind === "preparing") {
+  if (ledger?.stage === "preparing") {
     const { baseRevision: b, readyRevision, haltRevision, successRevision } = ledger;
     if (readyRevision !== b + 4 || haltRevision !== b + 5 || successRevision !== b + 6) {
       bad("control futureControls", "revisions are not exactly spaced b+4/b+5/b+6");
@@ -354,7 +341,7 @@ export function decodeMigrationControl(bytes: Uint8Array): MigrationControl {
   } catch (cause) {
     throw new MigrationControlError("schema", `record is not JSON: ${String(cause)}`);
   }
-  check(parsed, CONTROL, "control");
+  checkRecord(parsed, CONTROL, "control", bad);
   const control = parsed as MigrationControl;
   checkInvariants(control);
   if (canonicalString(control) !== text) throw new MigrationControlError("schema", "record bytes are not canonical");
@@ -386,6 +373,6 @@ export function isFinalIntentPromotedHalt(control: MigrationControl): boolean {
   const { witness } = control;
   return witness.phase === "M6"
     && control.halt?.code === "cleanup-deferred"
-    && witness.futureControls?.kind === "promoted-halt"
+    && witness.futureControls?.stage === "promoted-halt"
     && witness.cleanup.currentIntent?.index === witness.cleanup.items.length;
 }

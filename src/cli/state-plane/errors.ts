@@ -88,6 +88,9 @@ export class StateAuthorityCorruptError extends Error {
 export type MigrationControlErrorReason =
   /** Unknown, extra, missing, mistyped, or noncanonical member bytes. */
   | "schema"
+  /** A control path holds something rbox did not write: a symlink, a directory,
+   * an unreadable or over-cap file, or a sibling that is not this exact record. */
+  | "foreign"
   /** The canonical control was not the exact record the publisher expected. */
   | "cas"
   /** A prepared sibling is not the exact inode/length/hash/bytes it recorded. */

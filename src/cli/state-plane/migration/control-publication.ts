@@ -65,6 +65,12 @@ function fsyncDirectorySync(dir: string): void {
   try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
 }
 
+function fsyncFileAndParent(file: string): void {
+  const fd = fs.openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  fsyncDirectorySync(path.dirname(file));
+}
+
 /** One no-follow descriptor decides type, identity, and bytes: a second pathname
  * lookup could be answered by a symlink swapped in after the first. */
 function readExactFile(file: string): { bytes: Buffer; dev: number; ino: number } | undefined {
@@ -74,14 +80,14 @@ function readExactFile(file: string): { bytes: Buffer; dev: number; ino: number 
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ENOENT" || code === "ENOTDIR") return undefined;
-    return fail("schema", `${file} could not be opened as a regular file (${code})`);
+    return fail("foreign", `${file} could not be opened as a regular file (${code})`);
   }
   try {
     const stat = fs.fstatSync(fd);
-    if (!stat.isFile()) return fail("schema", `${file} is not a regular file`);
-    if (stat.size > CONTROL_MAX_BYTES) return fail("schema", `${file} is ${stat.size} bytes, over the ${CONTROL_MAX_BYTES} cap`);
+    if (!stat.isFile()) return fail("foreign", `${file} is not a regular file`);
+    if (stat.size > CONTROL_MAX_BYTES) return fail("foreign", `${file} is ${stat.size} bytes, over the ${CONTROL_MAX_BYTES} cap`);
     const bytes = Buffer.alloc(stat.size);
-    if (fs.readSync(fd, bytes, 0, bytes.byteLength, 0) !== bytes.byteLength) return fail("schema", `${file} was truncated while reading`);
+    if (fs.readSync(fd, bytes, 0, bytes.byteLength, 0) !== bytes.byteLength) return fail("foreign", `${file} was truncated while reading`);
     return { bytes, dev: Number(stat.dev), ino: Number(stat.ino) };
   } finally {
     fs.closeSync(fd);
@@ -91,12 +97,12 @@ function readExactFile(file: string): { bytes: Buffer; dev: number; ino: number 
 /** Remove a sibling this process created, and only if the path still holds the
  * exact inode it recorded. Cleanup on a caught failure only: a crash leaves the
  * inert revision temp 163's `absent` crash row already admits. */
-function removeOwnSibling(prepared: PreparedControlIdentity): void {
+function removeOwnSibling(sibling: { path: string } & Inode): void {
   try {
-    const observed = fs.lstatSync(prepared.path);
-    if (!observed.isFile() || Number(observed.dev) !== prepared.dev || Number(observed.ino) !== prepared.ino) return;
-    fs.unlinkSync(prepared.path);
-    fsyncDirectorySync(path.dirname(prepared.path));
+    const observed = fs.lstatSync(sibling.path);
+    if (!observed.isFile() || Number(observed.dev) !== sibling.dev || Number(observed.ino) !== sibling.ino) return;
+    fs.unlinkSync(sibling.path);
+    fsyncDirectorySync(path.dirname(sibling.path));
   } catch {
     // Best effort: the sibling is inert either way.
   }
@@ -120,8 +126,9 @@ function assertExpectation(current: MigrationControl | undefined, expect: Publis
   }
 }
 
-/** Revisions are safe integers, exactly spaced. `r -> r+2` is the single
- * permitted gap and only a prepared promotion may take it (163:3008, :2919). */
+/** Revisions are exactly spaced. `r -> r+2` is the single permitted gap and is
+ * the direct-M7 success transition alone (163:2919) — a halt promotion is
+ * `r -> r+1` and doctor's retry promotion is `r+1 -> r+2`, both ordinary steps. */
 function assertRevisionStep(expect: PublishExpectation, next: number, allowGapTwo: boolean): void {
   if (expect.revision === "absent") {
     if (next !== FIRST_CONTROL_REVISION) fail("cas", `a first control must be revision ${FIRST_CONTROL_REVISION}, not ${next}`);
@@ -137,7 +144,8 @@ function assertRevisionStep(expect: PublishExpectation, next: number, allowGapTw
  * entry point implements its own rename.
  */
 function replaceCanonicalControl(
-  root: string, expect: PublishExpectation, source: PreparedControlIdentity, locks: HeldStatePlaneLocks,
+  root: string, expect: PublishExpectation, source: PreparedControlIdentity,
+  promotion: boolean, locks: HeldStatePlaneLocks,
 ): MigrationControl {
   void locks;
   assertExpectation(readCanonicalControl(root), expect);
@@ -151,6 +159,7 @@ function replaceCanonicalControl(
   if (next.controlRevision !== source.revision) {
     fail("prepared-foreign", `${source.path} carries revision ${next.controlRevision}, not ${source.revision}`);
   }
+  assertRevisionStep(expect, next.controlRevision, promotion && next.witness.phase === "M7");
   const file = migrationPaths.control(root);
   fs.renameSync(source.path, file);
   fsyncDirectorySync(path.dirname(file));
@@ -164,6 +173,12 @@ function replaceCanonicalControl(
  * fsync `.rbox/state`, then reread it exactly. Used both for an ordinary
  * publication's own temp and for the M6 runway's prepared future controls —
  * they are the same namespace.
+ *
+ * A crash between rendering and renaming leaves the exact inert temp for this
+ * record at this revision, and every phase after M0 pins both the migration id
+ * and the revision, so refusing to resume it would wedge the migration forever.
+ * The occupied path is therefore adopted — but only when every byte is this
+ * exact record, and never for anything else.
  */
 export function renderPreparedControl(
   root: string, revision: number, next: MigrationControl, locks: HeldStatePlaneLocks,
@@ -172,7 +187,25 @@ export function renderPreparedControl(
   if (next.controlRevision !== revision) fail("schema", `record revision ${next.controlRevision} may not be rendered at ${revision}`);
   const bytes = encodeMigrationControl(next);
   const file = migrationPaths.controlRevision(root, next.migrationId, revision);
-  const fd = fs.openSync(file, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+  const identity = (found: { dev: number; ino: number }): PreparedControlIdentity =>
+    ({ path: file, revision, dev: found.dev, ino: found.ino, bytes: bytes.byteLength, sha256: digest(bytes) });
+
+  let fd: number;
+  try {
+    fd = fs.openSync(file, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "EEXIST") return fail("foreign", `${file} could not be created exclusively (${code})`);
+    const existing = readExactFile(file);
+    if (!existing || !existing.bytes.equals(bytes)) {
+      return fail("foreign", `${file} is occupied by something other than this exact record`);
+    }
+    fsyncFileAndParent(file);
+    return identity(existing);
+  }
+
+  const created = fs.fstatSync(fd);
+  const own = { path: file, dev: Number(created.dev), ino: Number(created.ino) };
   try {
     try {
       fs.writeSync(fd, bytes, 0, bytes.byteLength, 0);
@@ -183,9 +216,9 @@ export function renderPreparedControl(
     fsyncDirectorySync(path.dirname(file));
     const exact = readExactFile(file);
     if (!exact || !exact.bytes.equals(bytes)) return fail("reread", `${file} is not the record just rendered`);
-    return { path: file, revision, dev: exact.dev, ino: exact.ino, bytes: bytes.byteLength, sha256: digest(bytes) };
+    return identity(exact);
   } catch (error) {
-    fs.rmSync(file, { force: true });
+    removeOwnSibling(own);
     throw error;
   }
 }
@@ -193,10 +226,9 @@ export function renderPreparedControl(
 export function publishMigrationControl(
   root: string, expect: PublishExpectation, next: MigrationControl, locks: HeldStatePlaneLocks,
 ): MigrationControl {
-  assertRevisionStep(expect, next.controlRevision, false);
   const prepared = renderPreparedControl(root, next.controlRevision, next, locks);
   try {
-    return replaceCanonicalControl(root, expect, prepared, locks);
+    return replaceCanonicalControl(root, expect, prepared, false, locks);
   } catch (error) {
     removeOwnSibling(prepared);
     throw error;
@@ -207,13 +239,13 @@ export function publishMigrationControl(
  * Promote an ALREADY-EXACT prepared sibling. No temp, no write, no truncate:
  * the shared primitive's pre-rename revalidation of the recorded inode, byte
  * length, SHA-256, and canonical bytes for this fixed revision is the whole
- * admission test, and anything else is foreign and is not renamed.
+ * admission test, and anything else is foreign and is not renamed. Only the
+ * direct-M7 success transition may take the `r -> r+2` gap.
  */
 export function promotePreparedControl(
   root: string, expect: PublishExpectation, prepared: PreparedControlIdentity, locks: HeldStatePlaneLocks,
 ): MigrationControl {
-  assertRevisionStep(expect, prepared.revision, true);
-  return replaceCanonicalControl(root, expect, prepared, locks);
+  return replaceCanonicalControl(root, expect, prepared, true, locks);
 }
 
 /** ENOSPC and EDQUOT are the two conditions the prebuilt runway exists for. */
@@ -228,7 +260,7 @@ const isOutOfSpace = (error: unknown): boolean => {
  * retirement or M6 cleanup cursor is running — those resources are vector items,
  * and a halt consumes no vector item as runway (163:3343).
  */
-function haltRunway(control: MigrationControl): readonly HaltResourceRole[] {
+export function haltRunway(control: MigrationControl): readonly HaltResourceRole[] {
   const cursorActive = control.retirement !== null
     || control.witness.phase === "M6" || control.witness.phase === "M7";
   if (cursorActive) return [];

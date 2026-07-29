@@ -22,7 +22,7 @@ import { ResetCorruptionError } from "./reset-io.js";
 import { inspectStateReserve, StateFormatTooNewError } from "./state-plane/index.js";
 import type { DoctorCheck } from "./doctor-cmd.js";
 import type { TriageSeverity } from "./doctor-triage.js";
-import type { MigrationHaltCode } from "./state-plane/migration/health.js";
+import type { MigrationHalt, MigrationHaltCode } from "./state-plane/migration/health.js";
 
 export async function checkState(root: string, cfg: WorkspaceConfig): Promise<DoctorCheck> {
   const file = path.join(root, ".rbox", "state.json");
@@ -87,6 +87,16 @@ export interface MigrationHaltCopy {
     readonly problem: string;
     readonly safety: string;
     readonly command?: string;
+    /**
+     * The exact numbers 163:3300 requires this halt to print, rendered from the
+     * durable halt record and appended after `problem`. Only the two numeric
+     * facts the record carries are available here; the halts that must name a
+     * PATH (`verification`'s backup, `reserved-path`'s occupant) and
+     * `memory-admission`'s `RBOX_RESET_PARSE_BUDGET_BYTES` value read them from
+     * the control witness and the environment, which is wave 5B's renderer.
+     * Deferral recorded in design 222 §6.3.
+     */
+    readonly measured?: (halt: MigrationHalt) => string | undefined;
   };
   /** The non-interactive twin: a stable id and severity mirroring the doctor
    * triage findings (see `TriageFinding` in `doctor-triage.ts`). */
@@ -96,12 +106,23 @@ export interface MigrationHaltCopy {
   };
 }
 
+/** 163:3300 requires the refusals to print what was measured, not just that a
+ * limit was hit. Rendered from the durable record's own two numeric facts. */
+const bytesMeasured = (halt: MigrationHalt): string | undefined =>
+  halt.required === null && halt.available === null
+    ? undefined
+    : `measured ${halt.available ?? "unknown"} bytes available against ${halt.required ?? "unknown"} required`;
+
 /**
  * Exhaustive halt-code → copy map (design 222 §6.3). The
  * `satisfies Record<MigrationHaltCode, …>` is the gate: a code added to
  * `MigrationHaltCode` without human + machine copy here stops this file
- * compiling. Never advise deleting `Q` and never advise restoring a backup —
- * every command below is real and non-interactively twinned.
+ * compiling. Never advise deleting `Q` and never advise restoring a backup.
+ *
+ * The commands are the ones design 222 §3.2 and §5B introduce (`rbox migrate`,
+ * `rbox doctor --retry-state-migration`); neither exists yet, and no halt is
+ * reachable until they do. Wave 5B owns the final copy pass and the `--json`
+ * twin, and is the gate for "every command is real".
  */
 export const MIGRATION_HALT_COPY = {
   "source-oversize": {
@@ -109,6 +130,7 @@ export const MIGRATION_HALT_COPY = {
       problem: "This workspace's state file is larger than rbox can convert.",
       safety: "Nothing changed; the workspace keeps working on the old format.",
       command: "run the conversion once on a machine with more memory, or re-adopt this workspace",
+      measured: bytesMeasured,
     },
     machine: { id: "state-migration/source-oversize", severity: "blocked" },
   },
@@ -117,6 +139,7 @@ export const MIGRATION_HALT_COPY = {
       problem: "Converting this workspace needs more memory than this machine can spare.",
       safety: "Nothing changed.",
       command: "run the conversion once on a machine with more memory, or re-adopt this workspace",
+      measured: bytesMeasured,
     },
     machine: { id: "state-migration/memory-admission", severity: "blocked" },
   },
@@ -133,6 +156,7 @@ export const MIGRATION_HALT_COPY = {
       problem: "There isn't enough free disk space to convert safely.",
       safety: "Nothing changed.",
       command: "free up space, then run `rbox migrate`",
+      measured: bytesMeasured,
     },
     machine: { id: "state-migration/disk-preflight", severity: "blocked" },
   },
@@ -141,6 +165,7 @@ export const MIGRATION_HALT_COPY = {
       problem: "The disk filled up partway through. rbox stopped instead of leaving a half-converted workspace.",
       safety: "Your old state is still the one in use and is intact.",
       command: "free up space, then run `rbox doctor --retry-state-migration`",
+      measured: bytesMeasured,
     },
     machine: { id: "state-migration/filesystem-full", severity: "blocked" },
   },
