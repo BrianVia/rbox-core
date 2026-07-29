@@ -157,6 +157,15 @@ export function releaseItem(item: ArtifactItem): void {
   fsyncDir(item.parent);
 }
 
+/**
+ * The guard is unreachable defense-in-depth, and deliberately kept: both
+ * callers already prove the intent — `retryPromotedHalt` through
+ * `isFinalIntentPromotedHalt`, and `completeFinalItem` because the prepared
+ * records are pure functions of the whole control, so a moved cursor makes the
+ * derived bytes disagree with the ledger's exact descriptors before this runs.
+ * It stays because it is what makes the last-item index read safe locally, in
+ * code whose next act is an unlink.
+ */
 export const finalItem = (witness: M6Witness): ArtifactItem => {
   const { items, currentIntent } = witness.cleanup;
   if (currentIntent?.index !== items.length) corruptCleanup("the final item is not the current cleanup intent");

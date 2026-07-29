@@ -496,6 +496,23 @@ describe("the allocation-free runway", () => {
     expect(fs.lstatSync(ledger.halt.path).size, "and nothing was written").toBe(0);
   });
 
+  /** The prepared records are pure functions of the WHOLE control, cursor
+   * included, so moving the cursor moves the bytes the ledger's exact
+   * descriptors must match. That is why `finalItem`'s own intent guard is
+   * unreachable from here: the derivation refuses first, and more specifically. */
+  test("refuses a moved cursor because the prepared records no longer derive", async () => {
+    const fx = fixture();
+    const ready = await toReady(fx, await toFinalIntent(fx));
+    const witness = ready.witness as Extract<MigrationWitness, { phase: "M6" }>;
+    const misaimed: MigrationControl = {
+      ...ready,
+      witness: { ...witness, cleanup: { ...witness.cleanup, durablePrefix: 0, currentIntent: { index: 1 } } },
+    };
+    await expect(completeFinalItem(fx.root, receipt(misaimed), locks))
+      .rejects.toThrow(/is not the exact halted-m6 record this ledger prepared/);
+    expect(fs.existsSync(fx.emergency), "and no item is removed on a cursor that does not derive").toBe(true);
+  });
+
   test("refuses to complete the final item while a descriptor is still building", async () => {
     const fx = fixture();
     const ready = await toReady(fx, await toFinalIntent(fx));
