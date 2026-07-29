@@ -5,7 +5,7 @@ import type { CasResult, ManifestHeader } from "../ports.js";
 import { beginGeneration, type GenerationBuilder } from "../store/generations.js";
 import type { OwnedLockCasToken } from "../store/owner-token.js";
 import { openReadSnapshot } from "../store/read-snapshot.js";
-import type { SealedStageRef } from "../store/sealed-stages.js";
+import { MAX_MAX_FILE_BATCH, type SealedStageRef } from "../store/sealed-stages.js";
 import {
   StageLock,
   deleteSealedArtifact,
@@ -20,7 +20,6 @@ import {
 import { applyCasPacket } from "../store/write-packet.js";
 import type { StateStoreHandle } from "../store/open.js";
 
-const FILE_BATCH = 512;
 
 function deleteStage(directory: string, ref: SealedArtifactRef): void {
   if (!fs.existsSync(sealedStagePath(directory, ref.stageId, ref.logicalDigest))) return;
@@ -57,6 +56,11 @@ export async function applySavePacketToStore(
 ): Promise<CasResult> {
   const directory = path.dirname(store.file);
   const token = openReadSnapshot(store).token;
+  // The caller's claimed stream/nonce override the live ones on purpose: passing
+  // the true token makes a mismatch throw StageChangedError out of
+  // assertTransitionSnapshot instead of returning `rejected`, which is the
+  // JSON-compat semantic 2C translates. A fabricated token only reaches a kept
+  // artifact on the accepted path, where the claims provably matched.
   const { nonce: _nonce, ...tokenWithoutNonce } = token;
   const expectedToken = {
     ...tokenWithoutNonce,
@@ -73,8 +77,8 @@ export async function applySavePacketToStore(
     if (packet.global) {
       const header = manifestHeader(packet);
       globalBuilder = beginGeneration(directory, "base", header);
-      for (let offset = 0; offset < packet.global.manifest.files.length; offset += FILE_BATCH) {
-        globalBuilder.putEntries(packet.global.manifest.files.slice(offset, offset + FILE_BATCH));
+      for (let offset = 0; offset < packet.global.manifest.files.length; offset += MAX_FILE_BATCH) {
+        globalBuilder.putEntries(packet.global.manifest.files.slice(offset, offset + MAX_FILE_BATCH));
       }
       global = globalBuilder.finishGeneration({
         files: packet.global.manifest.files.length,
