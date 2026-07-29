@@ -52,6 +52,8 @@ const ENTRY_POINTS: readonly EntryPoint[] = [
   { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "loadRawState", kind: "read", sites: 2, guards: ["assertStateReadable"] },
   { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "loadState", kind: "read", sites: 1, guards: ["loadRawState"] },
   { file: "src/cli/doctor-state-plane.ts", symbol: "checkState", kind: "read", sites: 1, guards: ["loadRawState"] },
+  { file: "src/cli/state-plane/locks.ts", symbol: "inspectInventory", kind: "read", sites: 1, guards: ["classifyStateFormat"] },
+  { file: "src/cli/state-plane/migration/admission.ts", symbol: "barrierWitness", kind: "read", sites: 1, guards: ["verifyLastWriterWitness"] },
 
   // Writes — check the barrier immediately before the publishing rename, and
   // record the last-writer witness immediately after it.
@@ -91,6 +93,7 @@ const EXEMPT: ReadonlyMap<string, { sites: number; reason: string }> = new Map([
   ["src/cli/reset-journal.ts::activeStatePath", { sites: 1, reason: "the local state-path constructor itself" }],
   ["src/cli/reset-journal.ts::beginResetJournal", { sites: 2, reason: "hashes the caller-supplied prepared bytes and names the candidate path; the live document is read by its guarded caller under the same lock" }],
   ["src/cli/sync-git/p-settlement.ts::settleExactPresentArtifact", { sites: 4, reason: "uses statePath only to name the protocol lock class; the save itself is applyStateSavePacket" }],
+  ["src/cli/state-plane/locks.ts::withStatePlaneLocks", { sites: 2, reason: "uses statePath only as the repository fence's state identity; the document is read by the guarded inspectInventory" }],
   ["src/cli/scan-probe.ts::loadScanProbe", { sites: 2, reason: "a local statePath naming .rbox/state/scan-probe.json, not the state plane" }],
   ["src/cli/scan-probe.ts::saveScanProbe", { sites: 3, reason: "a local statePath naming .rbox/state/scan-probe.json, not the state plane" }],
 ]);
