@@ -404,3 +404,44 @@ removed; the redacted result is retained at
     `expect(remote.pullCalls)` received 0;
   - production restored → 20/20 green runs of the file (5.14s–6.10s),
     `src/cli/` 3514 pass / 0 fail, clean typecheck after `rm -rf .cache/tsbuildinfo`.
+
+## apps/api/test/fairuse-scan.test.ts — "stops after eight phase ticks in one invocation" + "missing blob catalog evidence fails closed without advancing totals" (FIXED)
+
+- 2026-07-29: both failed together on CI "workers API · shard 2/2" (run
+  30416449068, job 90463926431, attempt 1) — the same run and the same PR as
+  the daemon-activity entry above, whose diff touched only
+  `src/cli/state-plane/store/` and docs, with zero files under `apps/api/`.
+- Attempt-1 evidence — `fairuse-scan.test.ts:176`
+  (`expect((await scan(accountId))?.status).toBe("materialize_roots")`)
+  received `'capture_pins'`, and `:231`
+  (`await expect(runFairUseObservation(env, NOW)).rejects.toThrow(...)`)
+  resolved `undefined` instead of rejecting. Two failures, one cause: neither
+  invocation ran on the account its own test had just created.
+- Root cause: `runFairUseObservation` is a **global** scheduler.
+  `discoverOneAccount` walks the whole `accounts` table (`fairuse.ts:1032`),
+  enqueues at `next_run_at = nowMs`, and the invocation then spends itself on
+  one row via `ORDER BY next_run_at,account_id LIMIT ?` (`fairuse.ts:1053`).
+  `apps/api/vitest.config.ts` runs the Workers suite `maxWorkers: 1,
+  isolate: false`, so **every file in a shard shares one D1**. This file's
+  `beforeEach` cleared the global `fairuse_*` tables but not `accounts`, so a
+  leftover foreign account was discovered, enqueued at the same `nowMs`, and
+  won the tie whenever its id sorted below `acct_000_fairuse_*` — which every
+  literal `acct-*` id in the suite does, since `'-'` (0x2D) < `'_'` (0x5F).
+  Intermittent because vitest orders files by cached durations, so which files
+  precede this one varies with the CI vitest cache. Reproduced
+  deterministically on `main` by inserting one `acct-probe-foreign` account
+  ahead of the file: same two failures, same messages.
+- Fix: one statement in the existing `beforeEach` — `UPDATE accounts SET
+  deleted_at=? WHERE deleted_at IS NULL`. Discovery skips tombstones, so the
+  file's own accounts become the scheduler's whole world. No retry, sleep,
+  widened timeout, skip, production change, or migration.
+- Red→green proof (the fix does not mask the logic it covers): with it in,
+  `FAIRUSE_PHASE_TICKS_PER_INVOCATION` 8→1 plus a neutered
+  `fairuse_catalog_missing` throw → 3 failed / 7 passed, including both
+  formerly-flaky tests; `apps/api/src/fairuse.ts` restored → 10 passed.
+  Loops: file alone 20/20; `--shard=2/2` in CI order 20/20 — the shard loop is
+  the meaningful one, since the file in isolation has no foreign accounts to
+  trip over.
+- **Generalizes to the whole Workers suite**: one D1 is shared across every
+  file in a shard, so any test whose subject reads a table **globally** must
+  neutralize rows it did not create, not merely clean up its own.

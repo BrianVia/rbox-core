@@ -59,8 +59,11 @@ red→green proven both ways. **#585**: the Workers-API fair-use scan test faile
 on cross-test leakage — the suite runs single-worker with no isolation, so
 every file in a shard shares one D1, and a leftover `acct-*` id (`-` < `_`) won
 `ORDER BY next_run_at,account_id` and stole the invocation; fixed by
-tombstoning leftover accounts in the file's own `beforeEach`. #584 has a
-`docs/flaky-tests.md` entry; **#585 does not — owed**._
+tombstoning leftover accounts in the file's own `beforeEach`. Both are in
+`docs/flaky-tests.md`. The generalizable half, worth knowing before writing any
+Workers test: **the API suite shares one D1 across every file in a shard
+(`maxWorkers: 1, isolate: false`), so a test whose subject reads a table
+globally must neutralize rows it did not create, not merely clean up its own**._
 
 _PRIOR SESSION 2026-07-28 (day + all-nighter): **v1.11.0 AND v1.11.1 SHIPPED; the
 163 backend track is DONE through U2 (B0, U0, U1a/U1b, U2 all merged); design
