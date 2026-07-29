@@ -175,6 +175,28 @@ function flipped(root: string, phase: "M5" | "M6" | "M7", over: Partial<Migratio
   writeFile(statePath(root), MARKER);
 }
 
+/**
+ * An identity belonging to a decoy file that stays alive for the whole fixture,
+ * so it provably cannot be `live`'s inode.
+ *
+ * Never build a "different inode" by unlinking and recreating: a filesystem that
+ * recycles inode numbers hands the same one back, the identity check correctly
+ * reports a match, and the fixture silently asserts nothing (FLAKE-006 —
+ * measured here at tmpfs 0/200 reused, ext4 200/200). The precondition below is
+ * what makes that failure loud instead of a confusing wrong-row assertion.
+ */
+function foreignIdentity(root: string, live: string, decoyName: string): { dev: number; ino: number } {
+  const decoy = path.join(root, ".rbox", "state", decoyName);
+  writeFile(decoy, "a decoy that is never unlinked");
+  const other = observePath(decoy);
+  const target = observePath(live);
+  if (other.state !== "regular" || target.state !== "regular") throw new Error("fixture files are not regular");
+  if (other.dev === target.dev && other.ino === target.ino) {
+    throw new Error("fixture precondition failed: two coexisting files share an inode");
+  }
+  return { dev: other.dev, ino: other.ino };
+}
+
 /** A Q sibling of exactly these bytes, recorded at the given disposition. */
 function sibling(root: string, bytes: Buffer, state: "building" | "exact"): Fixture["qDisposition"] {
   const file = migrationPaths.qSibling(root, ID);
@@ -549,11 +571,13 @@ const ROWS: readonly Row[] = [
     name: "a Q sibling at an inode other than the recorded one is foreign",
     build: (root) => {
       const source = writeLegacy(root);
-      const qDisposition = sibling(root, MARKER, "exact");
       const file = migrationPaths.qSibling(root, ID);
-      fs.unlinkSync(file);
-      writeFile(file, MARKER); // identical bytes, new inode
-      writeControl(root, "M5", { source, active: writeOpaqueActive(root, "db-bytes"), qDisposition });
+      writeFile(file, MARKER); // the exact marker bytes: only the inode is wrong
+      const foreign = foreignIdentity(root, file, "q-sibling-decoy");
+      writeControl(root, "M5", {
+        source, active: writeOpaqueActive(root, "db-bytes"),
+        qDisposition: { state: "exact", ...foreign },
+      });
       return "corruption";
     },
   },
@@ -572,11 +596,8 @@ const ROWS: readonly Row[] = [
       const source = writeLegacy(root);
       const staging = migrationPaths.staging(root, ID);
       writeFile(staging, "partial");
-      const observed = observePath(staging);
-      if (observed.state !== "regular") throw new Error("fixture");
-      fs.unlinkSync(staging);
-      writeFile(staging, "partial"); // identical bytes, new inode
-      writeControl(root, "M2", { source, stagingMain: { state: "present", dev: observed.dev, ino: observed.ino } });
+      const foreign = foreignIdentity(root, staging, "staging-decoy");
+      writeControl(root, "M2", { source, stagingMain: { state: "present", ...foreign } });
       return "corruption";
     },
   },
