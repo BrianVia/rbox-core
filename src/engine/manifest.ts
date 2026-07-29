@@ -263,6 +263,18 @@ function makeWalkCtx(o: WalkCtxOptions): WalkCtx {
 }
 
 /**
+ * Design 224 §2.2 / founder ruling F1: a symlink is ignored iff a directory of the
+ * same name would be. Every `BUILTIN_IGNORE` dir pattern carries a trailing slash,
+ * which gitignore semantics match against directories only — so a symlink named
+ * `node_modules` slipped through. Answered at the two local producers that already
+ * know the entry type; `IgnoreMatcher` keeps its signature, and a regular FILE
+ * named `dist`/`build`/`target` still syncs.
+ */
+function symlinkIgnored(matcher: IgnoreMatcher, rel: string): boolean {
+  return matcher.ignores(rel) || matcher.ignores(`${rel}/`);
+}
+
+/**
  * Patch a manifest in place from a settled batch of watcher events — the hot
  * path, O(changed) not O(repo). File add/change re-hash that one path; unlink
  * drops it; a directory unlink removes the whole `dir/**` prefix; a directory
@@ -280,6 +292,11 @@ export async function applyWatchEvents(
   deferred?: Set<string>
 ): Promise<Manifest> {
   const map = indexByPath(base);
+  // A watcher event carries no file-vs-symlink fact, so the pre-stat `ignores(rel)`
+  // above cannot answer the directory-form question. `statHashEntry` is the second
+  // local producer: drop its result once the type is known (design 224 §2.2).
+  const dropAsIgnoredSymlink = (rel: string, res: StatHashResult): boolean =>
+    res.kind === "entry" && res.entry.type === "symlink" && matcher.ignores(`${rel}/`);
 
   for (const ev of events) {
     const rel = ev.relPath;
@@ -296,7 +313,7 @@ export async function applyWatchEvents(
         continue;
       }
       const res = await statHashEntry(root, rel, cache);
-      if (res.kind === "entry") map.set(rel, res.entry);
+      if (res.kind === "entry" && !dropAsIgnoredSymlink(rel, res)) map.set(rel, res.entry);
       else if (res.kind === "midwrite") deferred?.add(rel); // present but churning — not a delete
       else {
         map.delete(rel);
@@ -351,7 +368,7 @@ export async function applyWatchEvents(
         }
         if (st && !matcher.ignores(rel)) {
           const res = await statHashEntry(root, rel, cache);
-          if (res.kind === "entry") map.set(rel, res.entry);
+          if (res.kind === "entry" && !dropAsIgnoredSymlink(rel, res)) map.set(rel, res.entry);
           else if (res.kind === "midwrite") deferred?.add(rel);
           else {
             map.delete(rel);
@@ -376,7 +393,10 @@ export async function applyWatchEvents(
         continue;
       }
       const res = await statHashEntry(root, rel, cache);
-      if (res.kind === "entry") map.set(rel, res.entry);
+      if (dropAsIgnoredSymlink(rel, res)) {
+        map.delete(rel);
+        cache?.invalidate(rel);
+      } else if (res.kind === "entry") map.set(rel, res.entry);
       else if (res.kind === "midwrite") deferred?.add(rel);
       // "gone" ⇒ vanished after the event; leave it for the next unlink/settle.
     }
@@ -593,7 +613,8 @@ async function walk(
         throw error;
       }
     } else if (child.type === "symlink") {
-      if (ctx.scanStats ? timedMatcher(ctx.scanStats, () => ctx.matcher.ignores(childRel)) : ctx.matcher.ignores(childRel)) continue;
+      const linkIgnored = () => symlinkIgnored(ctx.matcher, childRel);
+      if (ctx.scanStats ? timedMatcher(ctx.scanStats, linkIgnored) : linkIgnored()) continue;
       let target: string;
       try { target = await fs.readlink(abs); }
       catch (error) {

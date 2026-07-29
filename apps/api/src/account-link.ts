@@ -286,6 +286,8 @@ export async function confirmLink(req: Request, env: Env, nowMs: number): Promis
       dbFor(env, shell).prepare(`DELETE FROM fairuse_materialize_refs WHERE account_id = ? AND ${orphan}`).bind(shell, shell),
       dbFor(env, shell).prepare(`DELETE FROM fairuse_root_membership WHERE account_id = ? AND ${orphan}`).bind(shell, shell),
       dbFor(env, shell).prepare(`DELETE FROM fairuse_sha_last WHERE account_id = ? AND ${orphan}`).bind(shell, shell),
+      dbFor(env, shell).prepare(`DELETE FROM fairuse_group_progress WHERE account_id = ? AND ${orphan}`).bind(shell, shell),
+      dbFor(env, shell).prepare(`DELETE FROM fairuse_workspace_group_totals WHERE account_id = ? AND ${orphan}`).bind(shell, shell),
       dbFor(env, shell).prepare(`DELETE FROM fairuse_workspace_streams WHERE account_id = ? AND ${orphan}`).bind(shell, shell),
       dbFor(env, shell).prepare(`DELETE FROM fairuse_scans WHERE account_id = ? AND ${orphan}`).bind(shell, shell),
       dbFor(env, shell).prepare(`DELETE FROM fairuse_leases WHERE account_id = ? AND ${orphan}`).bind(shell, shell),

@@ -157,6 +157,10 @@ export class WorkspaceSync {
     // unavailable, never initialized/migrated, and no index alarm may be armed.
     if (url.pathname === "/roots-inspect") {
       if (req.method !== "GET") return json({ error: "not_found" }, 404);
+      // Design 225 §2.6: head-envelope mode. Same fixed slash-safe path, same
+      // pre-bootstrap read-only contract, but it answers "what does HEAD
+      // reference" in one atomic response instead of paging retained history.
+      if (url.searchParams.get("head") === "1") return this.rootsInspectHead(url);
       return this.rootsInspect(url);
     }
 
@@ -1043,6 +1047,73 @@ export class WorkspaceSync {
    * commit is one signed/validated storage value; limiting it to one sequence keeps
    * the response bounded without inventing a cursor inside an immutable envelope.
    */
+  /**
+   * Design 225 §2.6 — the head envelope, in ONE response, for the fair-use
+   * active-bytes scan. Deliberately narrower than `rootsInspect`:
+   *  - KV reads only. It must NOT call `this.sql()`: those tables are created by
+   *    ensureBootstrap, and this endpoint runs BEFORE bootstrap by design.
+   *  - Not gated on `index_state === "ready"`. The paged reader gates there
+   *    because its three streams depend on the index; the head envelope does
+   *    not, and gating would make every lagging DO permanently unbillable.
+   *  - A legacy NUMERIC head is healthy, not damaged: `readHead` coerces it and
+   *    `commitHash` comes from the seq envelope this method reads anyway.
+   *  - Empty/pristine is an ordinary 200 `{ head: 0, empty: true }` (a computed
+   *    zero), discriminated from damaged by the same evidence ensureBootstrap
+   *    uses (headWatermark / pruneFloor>0 / retained `seq:`).
+   */
+  private async rootsInspectHead(url: URL): Promise<Response> {
+    if (url.searchParams.has("rebuild")) return json({ error: "read_only" }, 400);
+    const floorRaw = this.ctx.storage.kv.get("pruneFloor");
+    const generationRaw = this.ctx.storage.kv.get("index_generation");
+    const floor = floorRaw === undefined ? 0 : Number(floorRaw);
+    const generation = generationRaw === undefined ? 0 : Number(generationRaw);
+    if (!Number.isInteger(floor) || floor < 0 || !Number.isInteger(generation) || generation < 0) {
+      return json({ error: "index_unavailable", reason: "uninitialized" }, 503);
+    }
+    const empty = (head: number, commitHash: string): Response => json({
+      head, commitHash, empty: true, encManifestSha: null, refMode: null, chainRefs: [],
+      pruneFloor: floor, indexGeneration: generation,
+    });
+
+    const rawHead = this.ctx.storage.kv.get("head");
+    if (!isStoredHead(rawHead) && !(typeof rawHead === "number" && Number.isInteger(rawHead) && rawHead >= 0)) {
+      const watermark = this.ctx.storage.kv.get("headWatermark");
+      if (watermark !== undefined || floor > 0 || (await this.hasRetainedSeqEvidence())) {
+        return json({ error: "index_unavailable", reason: "repair_required" }, 503);
+      }
+      if (rawHead !== undefined) return json({ error: "index_unavailable", reason: "uninitialized" }, 503);
+      return empty(0, GENESIS_HASH);
+    }
+    const head = readHead(rawHead);
+    if (head.sequence === 0) return empty(0, head.commitHash || GENESIS_HASH);
+
+    const raw = this.ctx.storage.kv.get(`seq:${head.sequence}`) as string | undefined;
+    if (!raw) return json({ error: "roots_incomplete", message: `retained gap at seq ${head.sequence}` }, 409);
+    const incomplete = json({ error: "roots_incomplete", message: `unreadable refs at seq ${head.sequence}` }, 409);
+    try {
+      const sc = JSON.parse(raw) as SignedCommit;
+      const cb = JSON.parse(sc.body) as CommitBodyView;
+      const mode = readRefMode(cb);
+      if (!mode || typeof cb.encManifestSha !== "string") return incomplete;
+      const chainRefs = readManifestChain(cb.manifestChain, cb.encManifestSha);
+      if (chainRefs === null) return incomplete;
+      return json({
+        head: head.sequence,
+        commitHash: isStoredHead(rawHead) ? rawHead.commitHash : sc.commitHash,
+        empty: false,
+        encManifestSha: cb.encManifestSha,
+        refMode: mode.kind === "inline"
+          ? { kind: "inline", refShas: mode.refShas }
+          : { kind: "sidecar", sidecarSha: mode.sidecarSha, count: mode.count },
+        chainRefs,
+        pruneFloor: floor,
+        indexGeneration: generation,
+      });
+    } catch {
+      return incomplete;
+    }
+  }
+
   private rootsInspect(url: URL): Response {
     if (url.searchParams.has("rebuild")) return json({ error: "read_only" }, 400);
 

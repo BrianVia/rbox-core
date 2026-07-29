@@ -167,6 +167,9 @@ test("status --json emits JSON and uses shellStateOf health values", async () =>
     locking: { status: "ok", reason: null, path: ".rbox/state/sync.lock" },
     pathWarnings: null,
     remote: null,
+    // Design 224 §2.3: the stranded-ignored detector ships default-ON, top-level,
+    // outside the daemon-only `local` block.
+    strandedIgnored: 0,
     trash: null,
     account: { plan: null, usedBytes: null, capBytes: null },
     credential: { state: "absent" },

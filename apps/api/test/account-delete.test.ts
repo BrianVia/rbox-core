@@ -212,6 +212,9 @@ describe("hard purge — enumeration + dedup safety + isolation", () => {
     await db().batch([
       db().prepare(`INSERT INTO fairuse_scans(account_id,epoch,status,plan_snapshot,roots_format_generation,workspace_set_snapshot,started_at,updated_at)
         VALUES(?,1,'materialize_roots','{}',1,'[]',?,?)`).bind(A.accountId, now, now),
+      db().prepare("INSERT INTO fairuse_workspace_group_totals(account_id,epoch,workspace_id,active_bytes,updated_at) VALUES(?,1,'ws_x',5,?)").bind(A.accountId, now),
+      db().prepare(`INSERT INTO fairuse_group_progress(account_id,epoch,workspace_id,cursor_sha,partial_bytes,found_refs,updated_at)
+        VALUES(?,1,'ws_x','',0,0,?)`).bind(A.accountId, now),
       db().prepare(`INSERT INTO fairuse_workspace_streams(account_id,epoch,workspace_id,project_id,pin_head,pin_floor,pin_generation,
         pin_roots_format_generation,updated_at) VALUES(?,1,'ws_a','root',1,0,1,1,?)`).bind(A.accountId, now),
       db().prepare(`INSERT INTO fairuse_root_membership(account_id,epoch,workspace_id,project_id,sha256,head,sequence)
@@ -244,6 +247,7 @@ describe("hard purge — enumeration + dedup safety + isolation", () => {
       "account_notify_prefs WHERE account_id", "audit_log WHERE account_id", "blob_ref_candidates WHERE account_id",
       "fairuse_materialize_refs WHERE account_id", "fairuse_root_membership WHERE account_id",
       "fairuse_sha_last WHERE account_id", "fairuse_workspace_streams WHERE account_id",
+      "fairuse_workspace_group_totals WHERE account_id", "fairuse_group_progress WHERE account_id",
       "fairuse_scans WHERE account_id", "fairuse_leases WHERE account_id", "fairuse_account_queue WHERE account_id",
       "diagnostics_reports WHERE account_id",
     ];

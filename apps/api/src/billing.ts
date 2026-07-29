@@ -131,7 +131,7 @@ export async function usage(env: Env, p: Principal): Promise<Response> {
   const [workspaces, fairUseEpoch] = await Promise.all([
     countWorkspaces(env, p.accountId),
     dbFor(env, p.accountId).prepare(
-      `SELECT active_bytes,history_bytes,bound_bytes,completed_at,pruning_active
+      `SELECT active_bytes,history_bytes,bound_bytes,completed_at,pruning_active,history_computed
        FROM fairuse_scans WHERE account_id=? AND completed_at IS NOT NULL
        ORDER BY completed_at DESC,epoch DESC LIMIT 1`,
     ).bind(p.accountId).first<{
@@ -140,8 +140,13 @@ export async function usage(env: Env, p: Principal): Promise<Response> {
       bound_bytes: number;
       completed_at: number;
       pruning_active: number;
+      history_computed: number;
     }>(),
   ]);
+  // Design 225: the active-only scan does not compute history, so historyBytes and the
+  // bound derived from it report null rather than a fabricated 0. Rows written before
+  // that migration default history_computed=1 and keep reporting what they measured.
+  const withHistory = fairUseEpoch && Number(fairUseEpoch.history_computed) === 1 ? fairUseEpoch : null;
   return json({
     plan: a.plan,
     // Billing cadence (validation note #21): 'monthly' | 'annual' | null (unknown/no
@@ -160,8 +165,8 @@ export async function usage(env: Env, p: Principal): Promise<Response> {
     readOnly: cap !== Infinity && a.used >= cap,
     fairUse: {
       activeBytes: fairUseEpoch ? Number(fairUseEpoch.active_bytes) : null,
-      historyBytes: fairUseEpoch ? Number(fairUseEpoch.history_bytes) : null,
-      bound: fairUseEpoch ? Number(fairUseEpoch.bound_bytes) : null,
+      historyBytes: withHistory ? Number(withHistory.history_bytes) : null,
+      bound: withHistory ? Number(withHistory.bound_bytes) : null,
       lastCompletedEpochAt: fairUseEpoch ? Number(fairUseEpoch.completed_at) : null,
       // Rollout step 1 is observe-only even if a future-schema row was seeded.
       pruningActive: false,

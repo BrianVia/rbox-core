@@ -326,6 +326,9 @@ export class RboxDaemon {
   private readonly syncPhaseSampler = new SyncPhaseSampler();
   private readonly syncStateReporter: SyncStateReporter;
   private matcher: IgnoreMatcher; // rebuilt when .gitignore/.rboxignore changes
+  /** Design 224 §2.3: last observed stranded-ignored count from a push projection.
+   *  Undefined until this daemon has projected once. */
+  private strandedIgnored: number | undefined;
   private cache!: HashCache;
   /** LOCAL authority — head, unread cursor, completeness, and the P5/P7 provenance
    *  trusted-pull reads (`CommitLocalObservation`). The daemon never assigns them. */
@@ -1731,6 +1734,7 @@ export class RboxDaemon {
         telemetry: this.telemetry,
         mutationBoundary: this.mutationGate,
         onCaseCollisionObservation: (observation) => this.observeCaseCollisions(observation),
+        onStrandedIgnoredObserved: (count) => { this.strandedIgnored = count; },
       }, { localFileObservation: request.localFileObservation })),
       settleReport: () => {
         if (report) this.syncPhaseSampler.recordCompleted(report, "push", this.telemetry);
@@ -2287,6 +2291,7 @@ export class RboxDaemon {
       changed: manifestDiff.changed.length,
       deleted: manifestDiff.deleted.filter((p) => !this.matcher.ignores(p)).length,
       settled,
+      ...(this.strandedIgnored === undefined ? {} : { strandedIgnored: this.strandedIgnored }),
       sourceVersion: 1,
     };
   }
