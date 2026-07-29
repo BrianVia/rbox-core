@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -48,14 +49,15 @@ test("fresh create, writer reopen, and read-only reopen pin their own pragmas", 
   writer.close();
   expect(fs.existsSync(`${target}-wal`)).toBe(false);
   const reader = openStateStore(target, { readonly: true });
-  expect(reader.pragmas).toMatchObject({ cacheSize: -8192, busyTimeout: 250, queryOnly: 1 });
+  expect(reader.pragmas).toMatchObject({ cacheSize: -8192, busyTimeout: 250 });
+  expect(reader.readonly).toBe(true);
   if (process.platform === "darwin") {
     expect(reader.pragmas).toMatchObject({ fullfsync: 1, checkpointFullfsync: 1, walAutocheckpoint: 1000 });
   }
   reader.close();
 });
 
-test("foreign SQLite preflight refuses without changing journal mode", () => {
+test("foreign SQLite refusal decides from header bytes and never converts the journal", () => {
   const target = file();
   const foreign = new Database(target);
   foreign.exec("PRAGMA journal_mode=DELETE; CREATE TABLE foreign_table(value TEXT)");
@@ -63,10 +65,136 @@ test("foreign SQLite preflight refuses without changing journal mode", () => {
   let error: unknown;
   try { openStateStore(target); } catch (caught) { error = caught; }
   expect(error).toBeInstanceOf(StateStoreOpenError);
-  expect((error as StateStoreOpenError).reason).toBe("foreign-by-absence");
+  expect((error as StateStoreOpenError).reason).toBe("wrong-application");
   const check = new Database(target, { readonly: true });
   expect((check.query("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode).toBe("delete");
   check.close();
+});
+
+function directorySnapshot(directory: string): string[] {
+  return fs.readdirSync(directory).sort().map((name) => {
+    const entry = path.join(directory, name);
+    const stat = fs.lstatSync(entry);
+    const digest = crypto.createHash("sha256").update(fs.readFileSync(entry)).digest("hex");
+    return `${name} mode=${(stat.mode & 0o7777).toString(8)} size=${stat.size} ino=${stat.dev}:${stat.ino} sha256=${digest}`;
+  });
+}
+
+function refusal(open: () => unknown): StateStoreOpenError {
+  try {
+    open();
+  } catch (caught) {
+    if (caught instanceof StateStoreOpenError) return caught;
+    throw caught;
+  }
+  throw new Error("expected a StateStoreOpenError");
+}
+
+function patchHeader(target: string, edit: (bytes: Buffer) => void): void {
+  const bytes = fs.readFileSync(target);
+  edit(bytes);
+  fs.writeFileSync(target, bytes);
+}
+
+function foreignWalDatabase(): string {
+  const target = file();
+  const foreign = new Database(target);
+  foreign.exec("PRAGMA journal_mode=WAL; CREATE TABLE foreign_table(value TEXT); INSERT INTO foreign_table VALUES ('x')");
+  foreign.query("PRAGMA wal_checkpoint(TRUNCATE)").get();
+  foreign.close();
+  return target;
+}
+
+test("a refused foreign WAL database is left byte-for-byte untouched", () => {
+  const target = foreignWalDatabase();
+  const directory = path.dirname(target);
+  const before = directorySnapshot(directory);
+  expect(before).toHaveLength(1);
+
+  let error: unknown;
+  try { openStateStore(target); } catch (caught) { error = caught; }
+  expect(error).toBeInstanceOf(StateStoreOpenError);
+  expect(directorySnapshot(directory)).toEqual(before);
+
+  try { openStateStore(target, { readonly: true }); } catch (caught) { error = caught; }
+  expect(error).toBeInstanceOf(StateStoreOpenError);
+  expect(directorySnapshot(directory)).toEqual(before);
+});
+
+test("negative control: a read-only open plus one read is visible in the snapshot", () => {
+  const target = foreignWalDatabase();
+  const directory = path.dirname(target);
+  const before = directorySnapshot(directory);
+
+  const probe = new Database(target, { create: false, readonly: true });
+  probe.query("PRAGMA user_version").get();
+  probe.close();
+
+  const after = directorySnapshot(directory);
+  expect(after).not.toEqual(before);
+  expect(after.map((entry) => entry.split(" ")[0])).toEqual([
+    "state.db", "state.db-shm", "state.db-wal",
+  ]);
+});
+
+test("every open of an owned store leaves it at rest with no sidecar", () => {
+  const target = file();
+  const directory = path.dirname(target);
+  createStateStore(target, genesis).close();
+  expect(directorySnapshot(directory)).toHaveLength(1);
+
+  openStateStore(target).close();
+  expect(fs.readdirSync(directory)).toEqual(["state.db"]);
+
+  const atRest = directorySnapshot(directory);
+  openStateStore(target, { readonly: true }).close();
+  expect(directorySnapshot(directory)).toEqual(atRest);
+});
+
+test("the header gate refuses a symlink, a foreign page size, and a non-WAL journal", () => {
+  const owned = file();
+  createStateStore(owned, genesis).close();
+
+  const link = path.join(path.dirname(owned), "link.db");
+  fs.symlinkSync(owned, link);
+  expect(() => openStateStore(link)).toThrow(StateStoreOpenError);
+  expect((refusal(() => openStateStore(link))).reason).toBe("not-a-database");
+
+  const resized = file();
+  createStateStore(resized, genesis).close();
+  patchHeader(resized, (bytes) => bytes.writeUInt16BE(8192, 16));
+  expect(refusal(() => openStateStore(resized)).reason).toBe("structural-invariant");
+
+  const journalled = file();
+  createStateStore(journalled, genesis).close();
+  const flip = new Database(journalled);
+  flip.exec("PRAGMA journal_mode=DELETE");
+  flip.close();
+  const before = directorySnapshot(path.dirname(journalled));
+  expect(refusal(() => openStateStore(journalled)).reason).toBe("structural-invariant");
+  expect(refusal(() => openStateStore(journalled, { readonly: true })).reason).toBe("structural-invariant");
+  expect(directorySnapshot(path.dirname(journalled))).toEqual(before);
+});
+
+test("a corrupt body and a directory at the state path stay typed refusals", () => {
+  // Each shape has an intact header, so the gate admits it and the refusal has
+  // to come from `validateOpen` — which only types it if nothing touched the
+  // database first.
+  const shapes = {
+    "page 1 body": (target: string) => patchHeader(target, (bytes) => bytes.fill(0x58, 100, 4096)),
+    "truncated mid-page": (target: string) => fs.truncateSync(target, 6000),
+    "page count lie": (target: string) => patchHeader(target, (bytes) => bytes.writeUInt32BE(9999, 28)),
+  };
+  for (const damage of Object.values(shapes)) {
+    const corrupt = file();
+    createStateStore(corrupt, genesis).close();
+    damage(corrupt);
+    expect(refusal(() => openStateStore(corrupt)).reason).toBe("corrupt");
+  }
+
+  const directory = file();
+  fs.mkdirSync(directory);
+  expect(refusal(() => openStateStore(directory)).reason).toBe("not-a-database");
 });
 
 test("wrong SQLite version, missing frozen object, and corrupt header are typed", () => {

@@ -61,41 +61,12 @@ export async function readSqliteAuthorityId(root: string): Promise<string> {
   return match[1]!;
 }
 
-function readLineage(file: string): SqliteResetLineage & { authorityId: string } {
-  const store = openStateStore(file, { readonly: true });
-  try {
-    const row = stateStoreDatabase(store).query(`SELECT
-      m.authority_id AS authorityId,l.stream,l.state_nonce AS stateNonce,
-      l.state_revision AS stateRevision,l.telemetry_binding_id AS telemetryBindingId
-      FROM store_meta m JOIN state_lineage l ON l.lineage_id=m.active_lineage_id
-      WHERE m.singleton=1`).get() as {
-        authorityId: string;
-        stream: string;
-        stateNonce: string | null;
-        stateRevision: number | null;
-        telemetryBindingId: string | null;
-      } | null;
-    if (!row || !row.stateNonce || row.stateRevision === null) {
-      throw new Error("SQLite reset requires a complete active lineage");
-    }
-    return {
-      authorityId: row.authorityId,
-      stream: row.stream,
-      stateNonce: row.stateNonce,
-      stateRevision: row.stateRevision,
-      ...(row.telemetryBindingId === null ? {} : { telemetryBindingId: row.telemetryBindingId }),
-    };
-  } finally {
-    store.close();
-  }
-}
-
 export async function quiesceActiveDbForReset(root: string): Promise<SqliteResetLineage> {
   const authorityId = await readSqliteAuthorityId(root);
   const file = sqliteResetPaths.active(root);
   closeOwnedStateStoreReadersForReset(file);
   const store = ownedStateStoreWriterForReset(file) ?? openStateStore(file);
-  let lineage: ReturnType<typeof readLineage> | undefined;
+  let lineage: (SqliteResetLineage & { authorityId: string }) | undefined;
   try {
     const db = stateStoreDatabase(store);
     const row = db.query(`SELECT
