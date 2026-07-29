@@ -12,7 +12,7 @@
 
 export type Fields = Record<string, Spec>;
 export type Spec =
-  | "string" | "int" | "hex" | "digits"
+  | "string" | "int" | "hex" | "hex32" | "digits"
   | { readonly oneOf: readonly string[] }
   | { readonly const: unknown }
   | { readonly opt: Spec }
@@ -41,6 +41,7 @@ export function checkRecord(value: unknown, spec: Spec, at: string, bad: Refuse)
   if (spec === "string") { if (typeof v !== "string" || v.length === 0) bad(at, "is not a nonempty string"); return; }
   if (spec === "int") { if (typeof v !== "number" || !Number.isSafeInteger(v) || v < 0) bad(at, "is not a nonnegative safe integer"); return; }
   if (spec === "hex") { if (typeof v !== "string" || !/^[0-9a-f]{64}$/.test(v)) bad(at, "is not 64 lowercase hex characters"); return; }
+  if (spec === "hex32") { if (typeof v !== "string" || !/^[0-9a-f]{32}$/.test(v)) bad(at, "is not 32 lowercase hex characters"); return; }
   if (spec === "digits") { if (typeof v !== "string" || !/^[0-9]+$/.test(v)) bad(at, "is not decimal digits"); return; }
   if ("oneOf" in spec) { if (!spec.oneOf.includes(v as string)) bad(at, `is not one of ${spec.oneOf.join("|")}`); return; }
   if ("const" in spec) { if (v !== spec.const) bad(at, `is not ${JSON.stringify(spec.const)}`); return; }

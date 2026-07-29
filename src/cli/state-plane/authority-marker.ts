@@ -19,6 +19,16 @@ export const AUTHORITY_MARKER_MAGIC = "RBOX-SQLITE-AUTHORITY-v1";
 /** magic + LF + 32 lowercase hex + LF. */
 export const AUTHORITY_MARKER_BYTES = 58;
 const AUTHORITY_MARKER_RE = new RegExp(`^${AUTHORITY_MARKER_MAGIC}\\n[0-9a-f]{32}\\n$`);
+
+/** The exact bytes `Q` holds for this authority id. This module recognizes the
+ * marker, so it is also the only thing that composes it. */
+export function authorityMarkerBytes(authorityId: string): Buffer {
+  const bytes = Buffer.from(`${AUTHORITY_MARKER_MAGIC}\n${authorityId}\n`, "latin1");
+  if (bytes.byteLength !== AUTHORITY_MARKER_BYTES || !AUTHORITY_MARKER_RE.test(bytes.toString("latin1"))) {
+    throw new Error(`not a valid authority id: ${authorityId}`);
+  }
+  return bytes;
+}
 const DETECT_BYTES = 128;
 
 /** What the bytes at `.rbox/state.json` are, decided without parsing them. */

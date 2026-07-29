@@ -131,7 +131,8 @@ migration modules, not twelve.
 M-3, M-5, M-8 sit in the 301–399 band; the review note is that each is one
 correlated machine 163 specifies as a unit.
 
-**Migration production budget: 2,620.** Genesis 240 (§2), coordinator 90 (§1.3),
+**Migration production budget: 2,620.** Genesis **393** (§2 — revised from the
+estimated 240 when wave 1C shipped; see §2.1), coordinator 90 (§1.3),
 adapters 600 (§1.2).
 
 ---
@@ -642,7 +643,28 @@ purpose is safely retiring a source. Threading a no-source case through it
 produced, in r2, a `null` witness, an empty cleanup vector that does not fit the
 control schema, and phase rows with nothing to observe.
 
-Genesis is `src/cli/state-plane/genesis.ts`, ~240 lines, outside `migration/`.
+Genesis is `src/cli/state-plane/genesis.ts`, **393 non-blank lines / 20,008
+bytes** as shipped in wave 1C, outside `migration/`.
+
+**§7.9 review note (the 301–399 band requires one).** The pre-implementation
+estimate was ~240. The delivered file is 65% larger, and the difference is not
+drift — it is four things this section had not yet costed, each of which was
+argued for and kept:
+
+- the eight-row §2.5.1 conjunction with its read-only sidecar undo (§2.5.1),
+  which the estimate predated;
+- seven distinct crash images, each with its own legal action, rather than the
+  single resume path the estimate assumed;
+- the strict closed-record decode, now delegated to `closed-record.ts` — this
+  one made the file *smaller*;
+- the fenced-evidence construction and comparison (§2.3.2).
+
+It stays one file: 163 v12 and §2.3 name `genesis.ts` sole owner of the intent
+and of every path derived from `authorityId`, and the seven crash images are one
+decision table that splitting would scatter. It is inside §7.9's 400-line /
+25 KiB ceiling with 7 lines of headroom, so **the next change to this file
+should remove something or split deliberately** — it must not be absorbed
+silently.
 
 ### 2.2 What r3 got wrong, and the repair
 
@@ -778,12 +800,15 @@ export type GenesisRefusal = "legacy-present" | "artifact-present" | "evidence-m
 /** Does this workspace belong to genesis? Read-only. */
 export async function inspect(root: string, locks: HeldStatePlaneLocks): Promise<GenesisInspection>;
 
+/** The two ids the intent publishes before the database exists. */
+export interface GenesisIds { authorityId: string; lineageId: string }
+
 /** Establish SQLite authority on a workspace that has none.
  *
- * FRESH START ONLY. `mintLineage` is called at most once, and only when there
+ * FRESH START ONLY. `mintIds` is called at most once, and only when there
  * is no intent to resume (§2.4 step 3, and §2.5.2 case 4's rebuild). */
 export async function establish(
-  root: string, mintLineage: () => GenesisLineage, locks: HeldStatePlaneLocks,
+  root: string, mintIds: () => GenesisIds, locks: HeldStatePlaneLocks,
 ): Promise<GenesisOutcome>;
 
 /** Resume an existing attempt. The intent is the SOLE source of `authorityId`
@@ -832,10 +857,22 @@ housekeeping: §2.5.1 checks the database's `store_meta` against the *intent's*
 ids, so any resume path that rebuilds from step 4 with caller-supplied ids
 installs values that can never satisfy the conjunction — and a **healthy**
 workspace live-locks into a permanent halt on every retry. `establish` therefore
-takes a `mintLineage` thunk it calls at most once, `resume` takes the intent and
-no lineage at all, and step 4's `install` closes over `lineageFrom(intent)`.
+takes a `mintIds` thunk it calls at most once, `resume` takes the intent and
+no ids at all, and step 4's `install` reads its stream and both ids straight off
+the intent.
+
+**Signature amendment (implementation, wave 1C).** The thunk is
+`mintIds: () => GenesisIds`, not `mintLineage: () => GenesisLineage`.
+`GenesisLineage` is `schema/application.ts`'s install argument and additionally
+carries `stream` and `createdBy` — values genesis derives itself, from the
+fenced evidence and a module constant. Letting a caller supply them would widen
+exactly the surface this paragraph closes, so the thunk returns only the two ids
+the intent publishes. This is stronger than the signature first drafted here;
+the code is normative and this text now matches it.
+
 An inventory test asserts `installGenesisLineage`'s only genesis caller derives
-its argument from an intent.
+its argument from an intent (`inventory.test.ts`), that the thunk is called from
+exactly one place, and that `resume` never reaches it.
 
 Step 6 before step 7 is deliberate: r3 checked absence and *then* did four
 filesystem operations before renaming, leaving exactly the window the check
@@ -872,6 +909,79 @@ converted to WAL or otherwise mutated merely because rbox refuses it"
 through a read-write open would let WAL replay mutate the candidate — a
 "zero-write halt" rule that performs a write, which is the defect this whole
 section exists to prevent.
+
+**The premise above is false, and two independent waves measured it.** A
+read-only connection to a WAL database creates `-wal` and `-shm` at its **first
+read**, and — unlike a read-write connection, which checkpoints and unlinks them
+on close — it **cannot remove them again**. The read-only preflight closes the
+WAL-replay hazard but **not** the sidecar hazard. So a halt against a real user
+database left two sidecars beside it, and 163:1136-1138 then classifies that
+file set as a corruption signature rbox is forbidden to clean up. Choosing
+read-only does not deliver the guarantee this section claims; it only changes
+which file gets written. **Wave 2A reached the identical conclusion from M-3 and
+wave 1C from §2.5.2 — treat "evaluate through the read-only preflight" as
+*insufficient on its own* wherever this design says it, not just here.**
+`immutable=1` is not the escape: beyond suppressing WAL replay, `bun:sqlite`
+does not enable URI filenames, so the open fails outright (measured).
+
+**The remedy is to not open, wherever an independent fact decides.** 2A
+eliminated its opens entirely — the classifier matches a candidate against the
+control's own `witness.active` physical `{bytes, sha256}`, which is *stronger*
+than reading `store_meta.authority_id` because it does not trust the candidate's
+self-description, and defers the no-control case to A-2 at selection.
+
+**Genesis cannot borrow that discriminator, and this is structural, not an
+oversight.** Genesis runs precisely when there is no control record, so there is
+no independent witness to match against; and §2.3.3 deliberately excluded a
+staging-content hash from the intent ("the DB is not final when the intent is
+published, so the hash would be of nothing"). The intent's physical facts are
+`staging{dev,ino}` and the fenced evidence — nothing that describes *contents*.
+
+So the conjunction is ordered cheapest-first — evidence, then the recorded
+`{dev, ino}` — and the halt images were measured one by one:
+
+| Image | Opens? | Why |
+|---|---|---|
+| 7, bound evidence differs | **no open** | `resume` halts before the predicate |
+| 6, foreign inode at either path | **no open** | the identity row decides |
+| 6, **recycled** inode at the active path (C2) | **opens** | only `store_meta` discriminates |
+| 5, foreign active DB under an `L` | **opens** | same image, reached from the refusal path |
+| 1, 2, 3 | opens, and **accepts** | success paths; `sealAtRest`/case 3's truncate already leave S0 |
+
+Every zero-write halt is therefore decided with **no open at all except the
+recycled-inode image C2 exists for** — and for that one image no file-level fact
+can discriminate, because `store_meta.authority_id` lives inside the b-tree. For
+it alone the open happens and then **undoes exactly the sidecars it created**,
+never a pre-existing one, which would discard unreplayed frames. Measured: such
+a `-wal` is 0 bytes and the main database is byte-identical afterwards.
+
+**The undo stays in `genesis.ts` and is not a property of `openStateStore` —
+but state the reason accurately.** An earlier draft of this section claimed that
+removing a `-shm` under a live sibling reader splits the wal-index across two
+inodes. **That does not reproduce** (Linux, bun 1.4 / SQLite): with a sibling
+reader live, removing `-shm`, or `-wal`+`-shm`, with an empty or a frame-holding
+WAL, left the sibling reading correctly in every combination tried, and a
+subsequent commit was still visible to both readers. A proposed
+`SQLITE_IOERR_SHORT_READ` failure mode did not reproduce either.
+
+So the placement is a **precaution resting on an invariant, not on a
+demonstrated corruption**: `openStateStore` supports several concurrent
+read-only handles per file — `closeOwnedStateStoreReadersForReset` exists
+precisely to close them all — so an unlink there would act on shared state whose
+other users that layer does not account for. Genesis runs under §3.1's
+exclusivity window, where there is exactly one opener, so it needs no such
+reasoning. Do not promote this undo to the shared layer on the strength of the
+genesis case; that would require its own analysis of concurrent readers.
+
+**Accepted residual: the guarantee covers a completed halt, not a crash inside
+one.** The undo runs in a `finally`. A SIGKILL or power cut between the
+read-only open and that `finally` leaves exactly the `-wal`/`-shm` signature
+163:1136-1138 forbids, beside a real user database. Nothing in this design
+closes that window — the sidecars are created by SQLite before any rbox code
+regains control. It is narrow (one open, no user-visible work between) and it
+degrades to the same state the unfixed code produced on *every* halt rather than
+on a crash inside one, but it is not zero. A reader of this section must not
+infer an absolute guarantee.
 
 | Check | Value |
 |---|---|
@@ -1540,8 +1650,9 @@ final serial review** → merge to `2.0` → dual-binary differential against si
    forward for `status` only, or **do not ship the flip** — the third stays on
    the table per the revert rule.
 7. **F5/F6 assertion maintenance.** Not a leading implementation risk.
-8. **~3,550 production lines** (2,620 migration + 240 genesis + 90 coordinator +
-   600 adapters) of one-way, unrevertible-after-`Q` fail-closed surface.
+8. **~3,700 production lines** (2,620 migration + 393 genesis as shipped +
+   90 coordinator + 600 adapters) of one-way, unrevertible-after-`Q`
+   fail-closed surface.
 
 ---
 

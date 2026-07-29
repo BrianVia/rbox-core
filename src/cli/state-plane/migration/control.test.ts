@@ -328,14 +328,35 @@ describe("sole-writer gate (design 222 §7.9)", () => {
       "cli/state-plane/paths.ts",
       "cli/state-plane/migration/control-publication.ts",
     ]);
+    // Genesis must observe the control's ABSENCE at 222 §2.4 step 1, and §7.9
+    // forbids it importing anything from `migration/` — so it is the one module
+    // outside the publisher that names the path. It may only stat it.
+    const observer = "cli/state-plane/genesis.ts";
     const offenders: string[] = [];
+    let observerText = "";
     for (const entry of fs.readdirSync(src, { recursive: true, encoding: "utf8" })) {
       if (!entry.endsWith(".ts") || entry.endsWith(".test.ts")) continue;
       const relative = entry.split(path.sep).join("/");
       if (allowed.has(relative)) continue;
       const text = fs.readFileSync(path.join(src, entry), "utf8");
-      if (text.includes("migrationPaths.control(") || text.includes("migration-v1.json")) offenders.push(relative);
+      if (relative === observer) { observerText = text; continue; }
+      if (/migrationPaths\.control(Revision)?\(/.test(text) || text.includes("migration-v1.json")) offenders.push(relative);
     }
     expect(offenders).toEqual([]);
+
+    expect(observerText, `${observer} was not found — this exemption is stale`).not.toBe("");
+    expect(observerText, "genesis must reach the control through paths.ts, never the literal").not.toContain("migration-v1.json");
+    expect(observerText.split("migrationPaths.control(").length - 1, "genesis may name the control exactly once").toBe(1);
+
+    // Pinned as an exact statement, not a prefix: a loop with a body could grow
+    // a write inside it and still satisfy a `toContain` check. `.some(inodeOf)`
+    // has no body, so the only way to write through this name is to edit this
+    // line — which fails here.
+    const naming = observerText.split("\n").find((line) => line.includes("migrationPaths.control("))!;
+    expect(
+      naming.trim(),
+      "genesis may only STAT the control. Changing this statement means genesis can now write it — "
+      + "do not update this expectation without moving the observation to the §1.3 coordinator instead.",
+    ).toBe("if ([sqliteResetPaths.active(root), migrationPaths.control(root)].some(inodeOf)) {");
   });
 });
