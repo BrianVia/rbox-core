@@ -48,8 +48,12 @@ export const migrationPaths = {
    * that silently re-elects a stale JSON baseline. */
   fixedBackup: (root: string): string =>
     path.join(stateRootPath(root), "legacy-json", "pre-163-latest.json.bak"),
-  backupHistory: (root: string, bodySha256: string): string =>
-    path.join(stateRootPath(root), "legacy-json", `${bodySha256}.json`),
+  /** Content-addressed by the SOURCE document's whole-file digest. `.rbox/state.json`
+   * carries no preamble, so its body and physical hashes coincide and every
+   * producer and consumer passes the whole-file value; the old `bodySha256` name
+   * implied the preamble-stripped digest the backup files themselves declare. */
+  backupHistory: (root: string, sourceSha256: string): string =>
+    path.join(stateRootPath(root), "legacy-json", `${sourceSha256}.json`),
   /** M2's own render temp, id-scoped so it is never a foreign path to anyone
    * else and never collides with the content-addressed history beside it. */
   backupTemp: (root: string, migrationId: string): string =>

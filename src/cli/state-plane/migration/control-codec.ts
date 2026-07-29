@@ -158,10 +158,19 @@ export interface M2Witness {
 }
 export interface M3Witness { readonly completion: CompletionTuple }
 export interface M4Witness { readonly staging: StagingProof }
+/** M5's own layer, which re-states `stagingMain` because M5 is what empties that
+ * name (163:2748). **From M5 on, `staging` names a path it no longer occupies and
+ * the flip deletes the document `source`/`completion.sourceJsonSha256` describe;
+ * both are contained only by "no consumer reaches them from that row", never by an
+ * assertion. 222 §M-6 has the table — 5A must not break it.** `active` is not on
+ * it: the write fence spans the rename. */
+export interface M5Witness {
+  readonly stagingMain: StagingMain; readonly active: StagingProof; readonly qSibling: QSiblingWitness;
+}
 type W2 = M2Witness;
 type W3 = M3Witness;
 type W4 = M4Witness;
-interface W5 { readonly active: StagingProof; readonly qSibling: QSiblingWitness }
+type W5 = M5Witness;
 interface W6 { readonly cleanup: Cursor; readonly futureControls: FutureControls }
 interface W7 { readonly terminalSibling: TerminalSibling }
 

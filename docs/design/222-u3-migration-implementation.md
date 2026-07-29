@@ -495,6 +495,82 @@ No nullable witness, no genesis caller. Both invariants stay under attack: no
 fsync, hash, or logging between the check and the rename; all five M0 conditions
 re-checked here.
 
+**Shipped as two files (4A), and the signatures amended.** The budget above was
+280 and the honest single file measured 475 nonblank against 163:3994's hard 400,
+so M-6 is `finalize.ts` (M5's rename onto `state.db`, the Q sibling's
+`absent → building → exact` ladder, and the primitives both halves share — 331
+nonblank) plus `authority-flip.ts` (the one rename that elects SQLite, its
+pre-rename evidence, the initial M6 cleanup vector, and everything after the
+rename — 339 nonblank). Both sit in 163's 301–399 band, and the review note is
+the one M-3/M-5/M-8 already carry: each is one correlated machine, and most of
+the growth is the reasoning that review demanded be written where the code lives
+(which side of 163:2988 each refusal falls on, why a length conjunct is or is not
+compared, what contains each stale witness member). Same disposition M-8 took for the same reason, and the
+dependency runs strictly one way: the flip imports the receipt guard, the marker
+bytes, and the sibling fence from `finalize.ts`, never the reverse. The seam is
+the rename — everything in `finalize.ts` runs under legacy-JSON authority. The
+module count is therefore eleven, not ten.
+
+Two signature amendments, both ratified in review:
+
+- `flipAuthority(root, receipt, locks)` — the `source: SourceIdentity` parameter
+  is dropped. `SourceIdentity` does not exist in the tree, and 3A already made
+  this amendment for `preserveSource`/`importOwnedStaging`: the source comes from
+  `control.source`, because a second parameter could only ever disagree with the
+  record the CAS is keyed on.
+- It returns `{ kind: "flipped"; control }`, not a witness. 163:2988 forbids
+  publishing a lower revision once the rename begins, and the only code that can
+  honour that is code owning both the rename and the publication — a witness
+  return implies the driver publishes M6 afterwards, which is exactly the gap a
+  driver could interpose in. The flip therefore also owns the `.rbox` parent
+  fsync and the `M5 + exact Q` resume branch.
+
+**The M5 witness records `stagingMain: "absent"`** (163:2748), published by M5
+itself through the layered witness. Keeping M3's `{state: "present"}` is not
+merely stale: `retirement.ts` reads that member, finds the staging name empty at a
+phase that is not M4, and refuses — which makes C1 retirement from M5 impossible.
+
+**The rename's own failure is typed.** 163:2988's rule is stated for the
+aftermath of a rename, not for the syscall, so 4A decides it explicitly:
+`durability-indeterminate` with `wrote: true`. `rename(2)` is atomic, so the
+failure left one of the two admitted images and the caller cannot know which —
+`wrote` is genuinely unknowable at that instant and a zero-write row is an
+assertion that must not be guessed. The code cannot over-fence, because
+`blocksSqliteWrites` is already TRUE for every phase below M6. This does not
+contradict `promoteSuccess`'s refusal to mislabel a CAS error, where the fence
+would otherwise be lifted.
+
+**An empty M6 cleanup vector is refused, not published**, because `stepCleanup`
+has no complete-prefix transition into M7 and the runway has no final item, so an
+empty cursor wedges the migration one phase past the point of no return. A
+shorter-but-nonempty vector is admitted. **Constraint on whichever wave introduces
+halt clearing:** `haltRunway` returns `[]` only at M6/M7, so at M5 a halt may
+still consume both resources, and clearing that halt without recreating them
+would reach the flip with an empty vector — a post-rename `reserved-path` refusal
+that no row can clear. That wave must either exclude `emergency` from
+`haltRunway` below M6, or let a complete-prefix empty cursor reach M7. Not
+reachable today only because nothing clears a halt yet.
+
+**Which M5 witness members go stale, and what contains each** — carried here
+because the containment is a property of who reads what on which row, no row
+dispatcher exists yet, and nothing asserts it. **5A must not break these.**
+
+| Member | Stale from | Contained by |
+|---|---|---|
+| `staging` (the M4 proof) | M5's rename | Every consumer at phase ≥ M5 reads `active` instead: `retirement.ts` selects on the phase to do exactly that, and `classifier.ts` compares `witness.active` on both M5 rows |
+| `completion.sourceJsonSha256`, `source` | the flip | Their only comparisons — `bracketSource` and the flip's pre-rename body re-read — run under legacy-JSON authority and are unreachable from any row where `Q` is live. The flip's resume branch is the boundary and deliberately skips both |
+| `active` | **never** | `blocksSqliteWrites` is TRUE for every phase below M6, so the frozen window spans the rename and ends only when M6 publishes. This is why the flip may still compare it after `Q` is live |
+
+**Known asymmetry, for a 163 answer.** The flip's resume branch does not
+revalidate the two legacy-JSON backups, while the pre-rename path treats a
+missing one as a hard refusal. 163's `M5 + exact Q` row admits exactly one
+action — complete/retry the `.rbox` fsync and publish M6 — and lists no backup
+precondition; refusing would wedge a fenced M5 forever, because the document the
+backups copy no longer exists to re-derive them from. The cost is that a backup
+deleted inside the rename → publish window is never noticed, and it cannot be
+recorded either: the control schema is closed and strict, so a "backups
+unchecked" note needs a codec member 4A does not own.
+
 ---
 
 #### M-7 `retirement.ts`
