@@ -15,6 +15,8 @@ import { randomBytes } from "node:crypto";
 import { StateAuthorityCorruptError, StateWriteRefusedError } from "./errors.js";
 import * as genesis from "./genesis.js";
 import type { GenesisIds, GenesisInspection, GenesisOutcome } from "./genesis.js";
+// Not from `genesis.js`: the fence's reachable graph must contain no SQLite.
+import { readGenesisIntent } from "./genesis-intent.js";
 import type { EntryProof } from "./locks.js";
 import { blocksSqliteWrites } from "./migration/control-codec.js";
 import { readCanonicalControl } from "./migration/control-publication.js";
@@ -22,9 +24,12 @@ import { statePath } from "./paths.js";
 
 /** M-9's `runMigration`, with its progress sink already bound by the entry site.
  * Injected rather than imported: 222 §8 lands `migration/authority.ts` in wave
- * 5A, and the coordinator's dispatch and fence are wave 2C's dependency now. */
+ * 5A, and the coordinator's dispatch and fence are wave 2C's dependency now.
+ *
+ * 5A: drop the generic. Import `runMigration` and pin `M = MigrationOutcome`. */
 export type MigrationDriver<M> = (root: string, entry: EntryProof) => Promise<M>;
 
+/** 5A: drop the generic (see `MigrationDriver`). */
 export type AuthorityOutcome<M> =
   | { readonly domain: "genesis"; readonly outcome: GenesisOutcome }
   | { readonly domain: "migration"; readonly outcome: M };
@@ -67,16 +72,20 @@ export async function establishStateAuthority<M>(
  * FILE-LEVEL ONLY, NEVER A SQLITE OPEN (163 v13, lane 2D). This runs on every
  * SQLite save. A read-only open creates `-wal`/`-shm` on its first read and
  * cannot remove them, so an open here would deposit debris on the hot path and
- * manufacture the very at-rest violation 163 halts over. Both reads below are
- * plain file reads, and `authority-bootstrap.test.ts` asserts empirically that
- * the fence leaves a real database's directory byte-for-byte unchanged.
+ * manufacture the very at-rest violation 163 halts over.
+ *
+ * Both readers are deliberately imported from modules whose import graphs
+ * contain no `bun:sqlite`, which is what makes an open here unreachable rather
+ * than merely absent — a snapshot cannot see an open that checkpoints and
+ * removes its own sidecars before returning. `authority-bootstrap.test.ts`
+ * walks that graph and carries 163 v13's read-only-open negative control.
  */
 export function assertAuthorityWritable(root: string): void {
   const control = readCanonicalControl(root);
   if (control && blocksSqliteWrites(control)) {
     refuse(root, `migration ${control.migrationId} is at ${control.witness.phase}`);
   }
-  const intent = genesis.readGenesisIntent(root);
+  const intent = readGenesisIntent(root);
   if (intent) refuse(root, `genesis attempt ${intent.authorityId} has not been retired`);
 }
 

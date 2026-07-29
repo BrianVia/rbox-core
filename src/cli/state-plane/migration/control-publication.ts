@@ -76,7 +76,10 @@ function fsyncFileAndParent(file: string): void {
 function readExactFile(file: string): { bytes: Buffer; dev: number; ino: number } | undefined {
   let fd: number;
   try {
-    fd = fs.openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+    // O_NONBLOCK: `readCanonicalControl` is on the write fence's hot path, under
+    // the held state lock, and opening a FIFO without it blocks forever waiting
+    // for a writer. The `isFile` check below is what then refuses it.
+    fd = fs.openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     // Only ENOENT is absence. ENOTDIR means a path component is not a directory
