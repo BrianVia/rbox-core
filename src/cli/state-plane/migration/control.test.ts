@@ -29,7 +29,7 @@ const item = (role: ArtifactItem["role"], ino: number): ArtifactItem =>
 const PROMOTED: FutureControls = {
   stage: "promoted-halt",
   origin: { path: "/w/o", revision: 9, dev: 1, ino: 10 },
-  preparedSuccess: { path: "/w/s", revision: 10, dev: 1, ino: 11, bytes: 500 },
+  preparedSuccess: { path: "/w/s", revision: 10, dev: 1, ino: 11 },
 };
 const PREPARING: FutureControls = {
   stage: "preparing", version: 1,
@@ -347,18 +347,33 @@ describe("control publication", () => {
 describe("sole-writer gate (design 222 §7.9)", () => {
   /** A module cannot write a file it cannot name, so naming the canonical
    * control is the property to pin. `paths.ts` defines it; every reader reaches
-   * it through `readCanonicalControl`. */
+   * it through `readCanonicalControl`.
+   *
+   * The REVISION-SIBLING namespace is pinned separately below. It was folded
+   * into this check while the publisher was its only renderer, but wave 3C's M6
+   * runway renders two prepared siblings of its own — and every one of them is
+   * still admitted by `replaceCanonicalControl`'s pre-rename byte revalidation,
+   * so the property that matters ("one module renames onto the canonical
+   * control") is untouched by letting a second module name a sibling. */
   test("only control-publication.ts names the canonical control path", () => {
     const src = path.resolve(import.meta.dir, "../../..");
     const allowed = new Set([
       "cli/state-plane/paths.ts",
       "cli/state-plane/migration/control-publication.ts",
     ]);
+    /** M-8's two halves render the M6 runway's prepared siblings, so they name
+     * `controlRevision`. They may never name the canonical control — every
+     * transition of it still goes through the publisher. */
+    const siblingOnly = [
+      "cli/state-plane/migration/cleanup.ts",
+      "cli/state-plane/migration/cleanup-runway.ts",
+    ];
     // Genesis must observe the control's ABSENCE at 222 §2.4 step 1, and §7.9
     // forbids it importing anything from `migration/` — so it is the one module
     // outside the publisher that names the path. It may only stat it.
     const observer = "cli/state-plane/genesis.ts";
     const offenders: string[] = [];
+    const siblingSeen: string[] = [];
     let observerText = "";
     for (const entry of fs.readdirSync(src, { recursive: true, encoding: "utf8" })) {
       if (!entry.endsWith(".ts") || entry.endsWith(".test.ts")) continue;
@@ -366,9 +381,15 @@ describe("sole-writer gate (design 222 §7.9)", () => {
       if (allowed.has(relative)) continue;
       const text = fs.readFileSync(path.join(src, entry), "utf8");
       if (relative === observer) { observerText = text; continue; }
+      if (siblingOnly.includes(relative)) {
+        siblingSeen.push(relative);
+        if (/migrationPaths\.control\(/.test(text) || text.includes("migration-v1.json")) offenders.push(relative);
+        continue;
+      }
       if (/migrationPaths\.control(Revision)?\(/.test(text) || text.includes("migration-v1.json")) offenders.push(relative);
     }
     expect(offenders).toEqual([]);
+    expect(siblingSeen.sort(), "a sibling-only exemption names a module that no longer exists").toEqual([...siblingOnly].sort());
 
     expect(observerText, `${observer} was not found — this exemption is stale`).not.toBe("");
     expect(observerText, "genesis must reach the control through paths.ts, never the literal").not.toContain("migration-v1.json");

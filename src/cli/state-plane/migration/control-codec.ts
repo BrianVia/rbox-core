@@ -125,11 +125,21 @@ export type FutureControls =
   }
   /** The ledger as the promoted halted-M6 record consumes it: where it came
    * from, and the M7 sibling it still owns. Neither member carries its own
-   * SHA-256 — that would be a self/cross-digest cycle (163:3028). */
+   * SHA-256 — that would be a self/cross-digest cycle (163:3028).
+   *
+   * `preparedSuccess` carries no byte length either, for the same reason one
+   * level down (wave 3C). 163:3028 has the halted record name the M7 length
+   * while the M7 record names the halt record's length and hash, so each
+   * record's canonical size depends on the decimal width of the other's — a
+   * genuine fixpoint, not a spec detail. It is also a stored duplicate of the
+   * kind 1A already refused three times: the M7 bytes are a pure function of
+   * this record's canonical bytes plus the recorded M7 inode (163:3092, "it can
+   * then recompute and byte-check the one M7 it owns"), so a stored length
+   * could only ever disagree with the recomputation that has to happen anyway. */
   | {
     readonly stage: "promoted-halt";
     readonly origin: { readonly path: string; readonly revision: number } & Inode;
-    readonly preparedSuccess: { readonly path: string; readonly revision: number; readonly bytes: number } & Inode;
+    readonly preparedSuccess: { readonly path: string; readonly revision: number } & Inode;
   };
 
 /** M7's descriptor for the prepared halt sibling: exact on the direct branch,
@@ -255,7 +265,7 @@ const WITNESS_LAYERS: readonly Fields[] = [
         },
         "promoted-halt": {
           origin: { fields: { path: "string", revision: "int", ...INODE } },
-          preparedSuccess: { fields: { path: "string", revision: "int", ...INODE, bytes: "int" } },
+          preparedSuccess: { fields: { path: "string", revision: "int", ...INODE } },
         },
       }),
     },

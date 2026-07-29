@@ -373,3 +373,26 @@ behind-origin count; loudly warn when behind.
   release blocker. Fix hint: label each merged source section
   ("--- from daemon.log (legacy, last written <date>)") or drop legacy-file
   tails once dated logs exist.
+
+- **A ratified design specified a self-referential record schema (2026-07-29,
+  U3 wave 3C, cost ~40 min):** 163:3086's M6 preparation ledger has the
+  halted-M6 record store the prepared M7 record's byte length, while the M7
+  record stores the halt record's byte length and hash. Each record's canonical
+  size therefore depends on the decimal width of the other's, so the ledger row
+  the design says to publish at `b+1` cannot be computed without already knowing
+  `b+2`'s answer — only a fixpoint iteration closes it. Nobody noticed across
+  five design rounds because the circularity lives in JSON *lengths*, not in
+  named dependencies. Wave 1A then carried the shape into the codec verbatim.
+  Fixed by deleting the stored length (163:3092 already required the retry to
+  recompute the M7 record, so it was a duplicate too). Rule: when a record
+  stores a length or hash of another record that stores a length or hash of it,
+  check for the cycle before implementing — and prefer deriving over storing,
+  which removes the question entirely.
+
+- **The state-plane file-size law has no CI gate (2026-07-29):** 163:3994 states
+  "400 lines / 25 KiB is the hard CI failure" for production files, and nothing
+  in `src/`, `scripts/`, or `.github/` enforces it — the number is honoured only
+  by whoever remembers to run `wc`. Wave 3C's first draft landed at 636 lines
+  and would have merged clean. Fix hint: one test beside
+  `duplicate-declarations.test.ts` over `src/cli/state-plane/**`, with the
+  301-399 review-note band as a warning list rather than a failure.

@@ -53,7 +53,7 @@ export type HaltPublication =
   | { readonly durable: true; readonly control: MigrationControl }
   | { readonly durable: false; readonly reason: unknown };
 
-type HaltResourceRole = "reserve" | "emergency";
+export type HaltResourceRole = "reserve" | "emergency";
 
 const digest = (bytes: Uint8Array): string => crypto.createHash("sha256").update(bytes).digest("hex");
 const fail: (reason: MigrationControlErrorReason, detail: string) => never = (reason, detail) => {
@@ -114,9 +114,33 @@ function removeOwnSibling(sibling: { path: string } & Inode): void {
   }
 }
 
-export function readCanonicalControl(root: string): MigrationControl | undefined {
+/** The canonical control plus the inode it currently occupies. The M6 runway's
+ * promoted-halt retry needs the identity, because its whole admission test is
+ * that this file IS the halt sibling that was renamed here (163:3089). */
+export interface CanonicalControl extends Inode {
+  readonly control: MigrationControl;
+}
+
+export function readCanonicalControlExact(root: string): CanonicalControl | undefined {
   const exact = readExactFile(migrationPaths.control(root));
-  return exact && decodeMigrationControl(exact.bytes);
+  return exact && { control: decodeMigrationControl(exact.bytes), dev: exact.dev, ino: exact.ino };
+}
+
+export function readCanonicalControl(root: string): MigrationControl | undefined {
+  return readCanonicalControlExact(root)?.control;
+}
+
+/**
+ * M7's terminal retirement, under the same CAS every other transition takes.
+ * Nothing is published afterwards — the migration's last durable act is the
+ * disappearance of this file (163:3131).
+ */
+export function retireCanonicalControl(root: string, expect: PublishExpectation, locks: HeldStatePlaneLocks): void {
+  void locks;
+  assertExpectation(readCanonicalControl(root), expect);
+  const file = migrationPaths.control(root);
+  fs.unlinkSync(file);
+  fsyncDirectorySync(path.dirname(file));
 }
 
 function assertExpectation(current: MigrationControl | undefined, expect: PublishExpectation): void {
@@ -293,7 +317,18 @@ export function haltRunway(control: MigrationControl): readonly HaltResourceRole
   return (["reserve", "emergency"] as const).filter((role) => control.haltResources[role].disposition === "available");
 }
 
-function releaseHaltResource(root: string, control: MigrationControl, role: HaltResourceRole): void {
+/**
+ * Release one recorded halt resource so a halt publication has somewhere to
+ * land. The identity bracket is the whole safety property: `available` is the
+ * only disposition that names a file, and it names it by inode and length, so
+ * this can never unlink a path that stopped being the resource it recorded.
+ *
+ * Exported for its refusal path alone. `publishMigrationHalt` is the only
+ * production caller, and it reaches this function only after an allocation
+ * failure — a state a unit test cannot manufacture — so wave 1A's review left
+ * the refusal untested. It is tested directly instead.
+ */
+export function releaseHaltResource(root: string, control: MigrationControl, role: HaltResourceRole): void {
   const recorded = control.haltResources[role];
   if (recorded.disposition !== "available") fail("cas", `${role} is ${recorded.disposition}, not available`);
   const file = role === "reserve" ? migrationPaths.reserve(root) : migrationPaths.emergency(root, control.migrationId);

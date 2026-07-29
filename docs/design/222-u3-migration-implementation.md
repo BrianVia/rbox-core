@@ -131,13 +131,13 @@ migration modules, not twelve.
 | # | Module | The one protocol outcome it owns | Budget |
 |---|---|---|---:|
 | M-1 | `control-codec.ts` | The control record as a value: closed union, canonical bytes, pure predicates, the C1 trigger type | 300 |
-| M-2 | `control-publication.ts` | Every durable transition of the canonical control file | 280 |
+| M-2 | `control-publication.ts` | Every durable transition of the canonical control file | 280 (352 shipped) |
 | M-3 | `classifier.ts` | One admitted migration observation row, mutating nothing | 300 |
 | M-4 | `admission.ts` | May a migration begin or continue right now | 260 |
 | M-5 | `import-json.ts` | A **proven staging DB** derived from an admitted source | 340 |
 | M-6 | `finalize.ts` | The prepared DB becomes authority — the one flip | 280 |
 | M-7 | `retirement.ts` | C1: a superseded migration's artifacts are gone | 260 |
-| M-8 | `cleanup.ts` | Terminalization: cursor, runway, M7 | 360 |
+| M-8 | `cleanup.ts` + `cleanup-runway.ts` | Terminalization: cursor, runway, M7 (two files — see §M-8) | 360 (293 + 394 shipped) |
 | M-9 | `authority.ts` | Migration sequencing over typed receipts. No filesystem primitives, **no genesis** | 240 |
 
 M-3, M-5, M-8 sit in the 301–399 band; the review note is that each is one
@@ -227,6 +227,13 @@ export function readCanonicalControl(root: string): MigrationControl | undefined
 Owns revision **arithmetic and validation** (safe integers, exact spacing, the
 monotone `r → r+2` gap as the only permitted one). Paths live in `paths.ts`.
 
+3C adds three members here rather than anywhere else, because this module is the
+sole writer of the canonical control: `readCanonicalControlExact` (the record
+plus the inode it occupies, which the promoted-halt retry's whole admission test
+needs), `retireCanonicalControl` (M7's terminal unlink, under the same CAS as
+every other transition), and an `export` on `releaseHaltResource` so its refusal
+path has the direct test 1A's review flagged as missing.
+
 ##### What wave 1A pinned (record, so later waves do not re-decide it)
 
 - **`FIRST_CONTROL_REVISION = 1`.** Neither document named the first published
@@ -254,6 +261,16 @@ monotone `r → r+2` gap as the only permitted one). Paths live in `paths.ts`.
   unlink. The M6 ledger therefore keeps `version`, both slots' `kind`, and both
   slots' `path`; its outer discriminant is named `stage` so it does not collide
   with the slots' own `kind`.
+
+  **Amended by 3C: `promoted-halt`'s `preparedSuccess` stores no `bytes`.** 1A
+  carried 163:3086's shape through verbatim, including the M7 byte length. That
+  member makes the two prepared records mutually self-sizing — the halt record's
+  canonical length depends on the decimal width of the M7 length it stores, and
+  vice versa — so the ledger could only be filled in by a fixpoint iteration.
+  It is also exactly the class of stored duplicate this list already refuses
+  three times: 163:3092 requires the retry to recompute and byte-check the M7
+  record, so a stored length has no reachable use except to disagree with the
+  recomputation. Full statement in 163 § "V5 future-control preparation".
 - **M6's `cleanup.order` is named `items`**, so the M6 cleanup cursor and the
   C1 retirement cursor are one `Cursor` type over one vector shape. They are
   the same one-target machine (163:2761, :2899) over different vectors.
@@ -516,6 +533,26 @@ The `b..b+4` runway never creates a second pair and always resumes the same
 ledger stage and inode; a caught ENOSPC there publishes no alternate control
 (the named scoped f6 exception). No genesis branch — genesis has no cleanup
 vector because it claims no reserve and no emergency candidate.
+
+**Shipped as two files (3C).** The budget above was 360 and the honest
+implementation is 636 lines, so M-8 is `cleanup.ts` (the cursor, the
+identity-bracketed removal of a vector item, M7, and the primitives both halves
+share — 293 lines) plus `cleanup-runway.ts` (the `b..b+4` preparation ledger,
+the two prepared records, slot I/O, the final item, and `retryPromotedHalt` —
+394 lines). 163:3994's 400-line ceiling is not a budget to be renegotiated, and
+the correlation the one-file review note was protecting is preserved by the
+dependency running strictly one way: the runway imports from the cursor, never
+the reverse. The module count is therefore ten, not nine.
+
+**`completeFinalItem` and the 128 reserve header bytes.** §M-8's earlier
+sentence attached the role-7 header re-match to `completeFinalItem`, but role 7
+is the *nonfinal* item in every vector where the emergency candidate exists, so
+the rule belongs to the shared item bracket rather than to one step. 3C puts it
+there: any vector item of role `reserve` is unlinked only after its first 128
+bytes are re-read through the same descriptor that proves the inode and hashed
+against the digest the vector recorded. **That digest is the contract M-6 (wave
+4A) must honour when it builds the vector**: an item of role `reserve` whose
+`sha256` is `null` is refused, so the requirement cannot be silently skipped.
 
 ---
 
