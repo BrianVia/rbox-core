@@ -79,7 +79,10 @@ function readExactFile(file: string): { bytes: Buffer; dev: number; ino: number 
     fd = fs.openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ENOENT" || code === "ENOTDIR") return undefined;
+    // Only ENOENT is absence. ENOTDIR means a path component is not a directory
+    // — `.rbox/state` replaced by a regular file — which is manual damage, and
+    // reading it as "no control" would restart a migration over a live one.
+    if (code === "ENOENT") return undefined;
     return fail("foreign", `${file} could not be opened as a regular file (${code})`);
   }
   try {

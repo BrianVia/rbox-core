@@ -35,13 +35,19 @@ export type PathObservation =
     readonly sha256: string | null;
   };
 
+/**
+ * `O_NONBLOCK` is load-bearing, not hygiene: without it a FIFO at any observed
+ * path blocks `open(2)` forever and, being synchronous, blocks the event loop, so
+ * no timeout above can rescue it (issue #556). The `isFile` check one line later
+ * rejects the FIFO. Only `ENOENT` is absence — `ENOTDIR` means a path component
+ * is not a directory, which is damage, not an empty workspace.
+ */
 export function observePath(file: string, digest = false): PathObservation {
   let fd: number;
   try {
-    fd = fs.openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+    fd = fs.openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    return { state: code === "ENOENT" || code === "ENOTDIR" ? "absent" : "foreign" };
+    return { state: (error as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "foreign" };
   }
   try {
     const stat = fs.fstatSync(fd, { bigint: true });
@@ -110,7 +116,7 @@ export async function observeLegacyAuthority(root: string): Promise<LegacyAuthor
 function readMarkerAuthorityId(file: string): string | undefined {
   let fd: number;
   try {
-    fd = fs.openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+    fd = fs.openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   } catch {
     return undefined;
   }
@@ -169,7 +175,10 @@ export function observeQSibling(witness: QSiblingWitness): QSiblingObservation |
   const observed = observePath(file, true);
   if (disposition.state === "absent") {
     if (observed.state === "absent") return { state: "absent" };
-    if (observed.state === "regular" && observed.bytes === 0) return { state: "building", bytes: 0 };
+    // The same shape the staging create-ahead admits: zero-byte AND 0600.
+    if (observed.state === "regular" && observed.bytes === 0 && observed.mode === 0o600) {
+      return { state: "building", bytes: 0 };
+    }
     return { foreign: `${file} is neither absent nor the sole zero-byte create-ahead` };
   }
   if (observed.state !== "regular" || observed.dev !== disposition.dev || observed.ino !== disposition.ino) {

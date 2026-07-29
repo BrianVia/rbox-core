@@ -59,11 +59,16 @@ function looksLikeJson(bytes: Buffer): boolean {
  * modules do: a pathname lookup followed by a second one could be answered by a
  * symlink swapped in after the first, which would let the attacker's file be
  * read as the state document under the original file's type and size.
+ *
+ * `O_NONBLOCK` is part of that descriptor's contract, not hygiene: without it a
+ * FIFO at this path makes the open wait for a writer that never comes, so every
+ * caller of this barrier hangs indefinitely (issue #556). `formatOf`'s `isFile`
+ * check classifies the FIFO as `foreign` one step later.
  */
 export async function classifyStateFormat(file: string): Promise<StateFormat> {
   let handle: Awaited<ReturnType<typeof fs.open>>;
   try {
-    handle = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+    handle = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ENOENT" || code === "ENOTDIR") return "absent";
