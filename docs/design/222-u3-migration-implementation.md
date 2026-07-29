@@ -244,12 +244,31 @@ monotone `r → r+2` gap as the only permitted one). Paths live in `paths.ts`.
 - **M6's `cleanup.order` is named `items`**, so the M6 cleanup cursor and the
   C1 retirement cursor are one `Cursor` type over one vector shape. They are
   the same one-target machine (163:2761, :2899) over different vectors.
-- **A crash between rendering a revision sibling and renaming it is
-  resumable.** Every phase after M0 pins both the migration id and the
-  revision, so refusing the occupied path would wedge the migration
-  permanently. The publisher adopts the sibling only when every byte is that
-  exact record at that exact revision, re-fsyncs it and its parent, and treats
-  anything else as foreign.
+- **The halt record's reason member is named `code`**, not 163:3339's `reason`.
+  A rename only, matching `MigrationHaltCode`; no halt record is durable yet,
+  so nothing on disk changes.
+- **A crash between rendering a revision sibling and renaming it is resumable
+  ONLY when the record recurs byte-for-byte — the non-deterministic case is an
+  open decision, not a solved one.** Every phase after M0 pins both the
+  migration id and the revision, so blanket-refusing the occupied path would
+  wedge the migration permanently. The publisher therefore adopts the sibling
+  when every byte is that exact record at that exact revision, re-fsyncs it and
+  its parent, and treats anything else as foreign.
+
+  That covers only records whose content is a pure function of the phase.
+  **It does not cover M2, M3, or any halt**, whose bytes carry freshly created
+  inodes, a wall-clock `completedAt`, or live failure detail — a crash in their
+  render→rename window strands a sibling whose bytes will never recur, and that
+  revision is then permanently unpublishable. The state is fail-closed and
+  data-safe (JSON stays authority, the halt stays in memory) and unreachable in
+  1A, where nothing is wired. Later waves must not "fix" this by letting the
+  publisher overwrite any unpublished temp in its own namespace: **the M6
+  runway legitimately owns prepared siblings at `b+5`/`b+6` while control sits
+  at `b+4`**, so a blanket replace would destroy a live ledger-owned artifact.
+  The intended remover is doctor's inert-temp quarantine (163's designated sole
+  remover), which is a later wave; **the wave that wires the first post-M0
+  publication owns closing this**, either by making those records deterministic
+  or by landing quarantine alongside.
 
 ---
 
