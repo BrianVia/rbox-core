@@ -4,6 +4,15 @@
 > and the independent adversarial validation of §2.6
 > (RATIFY-WITH-CORRECTIONS, 9 items). §10 records both dispositions.
 >
+> **Final review verdict: GO.** The safety argument is sound, the `dev`/`ino`
+> conjunction closes the hazard, and the v12 fold is accurate and correctly
+> scoped. Four doc-level corrections are folded in this revision (§10) — none
+> touches 163 v12's ratified row text: the intent is the sole source of ids on
+> resume; §2.5.1 evaluates through the read-only preflight, case 7 precedes case
+> 5, and cases 6–7 raise `StateAuthorityCorruptError` rather than a new halt
+> code; the write fence collapses to one coordinator-owned call; and two 163
+> editorial qualifications around (not inside) the ratified rows.
+>
 > **§2.6 is RATIFIED** (founder, 2026-07-28) and is now normative in 163 as
 > **v12** — two inserted M0 authority-matrix rows plus a § "R4-v12 genesis
 > intent (v12)" decision record. §2.6 here is a pointer and rationale; 163 v12
@@ -475,27 +484,33 @@ manufactured genesis baseline; shared reset recovery and reset-lineage
 provenance; exhaustive raw `CasResult` translation against the retry view's exact
 token, **without widening `StateSaveResult`**.
 
-**The write fence — two bounded reads, one predicate each**, at the SQLite save
-boundary only, under the already-held state lock:
+**The write fence — ONE call**, at the SQLite save boundary only, under the
+already-held state lock:
 
 ```ts
-// `errors.ts` gains one member to `StateWriteRefusalReason`:
-//   /** A durable migration control or an unretired genesis intent blocks
-//    * writes until recovery finishes. */
-//   | "authority-recovery-pending"
-const control = readCanonicalControl(root);                 // migration/control-publication
-if (control && blocksSqliteWrites(control)) {
-  throw new StateWriteRefusedError("authority-recovery-pending", sqliteResetPaths.active(root));
-}
-if (readGenesisIntent(root)) {                              // genesis.ts — §2.3 case 1
-  throw new StateWriteRefusedError("authority-recovery-pending", sqliteResetPaths.active(root));
-}
+import { assertAuthorityWritable } from "../authority-bootstrap.js";
+assertAuthorityWritable(root);   // throws StateWriteRefusedError("authority-recovery-pending", …)
 ```
 
+An earlier draft inlined two reads here — the migration control and the genesis
+intent — with a duplicated refusal branch. That was worse three ways, and
+collapsing it fixes all three at once:
+
+- it **duplicated a branch** that is one policy, not two;
+- it **doubled the hot-path reads** on every SQLite save;
+- it **broke §7.9's boundary gate.** `whole-state-compat.ts` would have imported
+  from *both* `migration/` and `genesis.ts`, making "exactly one module imports
+  both" false — and lanes 2C and 2D would have collided over who owns the
+  predicate.
+
+The coordinator already imports both domains and is the only module allowed to,
+so the fence lives there (§1.3). A-2 imports one function from one module and
+holds no opinion about either domain.
+
 A surviving genesis intent after `Q` means the authority rename's parent fsync
-may not have completed (§2.3 case 1) — the exact analogue of migration's `M5+Q`
-block, and codex's step 8. Once the intent is retired, writes flow.
-`cleanup-deferred` is writable.
+may not have completed (§2.5.2 case 1) — the exact analogue of migration's
+`M5+Q` block. Once the intent is retired, writes flow. `cleanup-deferred` is
+writable.
 
 Contradictory authority throws `StateAuthorityCorruptError` from selection, zero
 repair writes, not a halt, never retryable.
@@ -524,6 +539,16 @@ export async function establishStateAuthority(
 export type AuthorityOutcome =
   | { domain: "genesis";   outcome: GenesisOutcome }
   | { domain: "migration"; outcome: MigrationOutcome };
+
+/** The state-plane write fence, as ONE exported predicate. Refuses while a
+ * durable migration control blocks writes (`blocksSqliteWrites`) OR an
+ * unretired genesis intent survives. Both are the same policy — "authority
+ * recovery has not finished" — so they are one branch and one refusal reason
+ * (`authority-recovery-pending`, the single member added to
+ * `StateWriteRefusalReason`). This lives here because the coordinator is the
+ * only module permitted to import both domains (§7.9); A-2 calls it and
+ * imports nothing else from either. */
+export function assertAuthorityWritable(root: string): void;
 ```
 
 It runs, in order: `withStatePlaneLocks` (§3.1) → standing reset recovery →
@@ -697,10 +722,17 @@ export type GenesisRefusal = "legacy-present" | "artifact-present" | "evidence-m
 /** Does this workspace belong to genesis? Read-only. */
 export async function inspect(root: string, locks: HeldStatePlaneLocks): Promise<GenesisInspection>;
 
-/** Establish SQLite authority on a workspace that has none. */
+/** Establish SQLite authority on a workspace that has none.
+ *
+ * FRESH START ONLY. `mintLineage` is called at most once, and only when there
+ * is no intent to resume (§2.4 step 3, and §2.5.2 case 4's rebuild). */
 export async function establish(
-  root: string, lineage: GenesisLineage, locks: HeldStatePlaneLocks,
+  root: string, mintLineage: () => GenesisLineage, locks: HeldStatePlaneLocks,
 ): Promise<GenesisOutcome>;
+
+/** Resume an existing attempt. The intent is the SOLE source of `authorityId`
+ * and `lineageId`; no caller-supplied lineage reaches this path. */
+async function resume(root: string, intent: GenesisIntent, locks: HeldStatePlaneLocks): Promise<GenesisOutcome>;
 
 /** Read-only; consumed by A-2's write fence. */
 export function readGenesisIntent(root: string): GenesisIntent | undefined;
@@ -721,7 +753,7 @@ Seven steps. No phases, no witnesses, no reserve, no retirement, no cursor.
    fenced evidence. Only now may SQLite open anything.
 4. **Build**, via `adoptClaimedStateStore(file, expected, install)` (§1.1 M-5,
    Wave 1B — **not on `main` today**) with
-   `install = db => installGenesisLineage(db, lineage)`, which already writes the
+   `install = db => installGenesisLineage(db, lineageFrom(intent))`, which already writes the
    `migration_completion` singleton last in its own transaction. Then
    recover/checkpoint, validate, close, **require `S0`**, fsync the file and
    `.rbox/state`.
@@ -735,6 +767,17 @@ Seven steps. No phases, no witnesses, no reserve, no retirement, no cursor.
    `.rbox/state.json` is still absent under the held `stateLockPath`. Rename the
    sibling over `.rbox/state.json`, fsync `.rbox`, **then retire the intent last**
    (unlink, fsync `.rbox/state`).
+
+**The intent is the sole source of `authorityId` and `lineageId` on every
+resume. Only §2.5.2 case 4 mints fresh ids.** This is load-bearing, not
+housekeeping: §2.5.1 checks the database's `store_meta` against the *intent's*
+ids, so any resume path that rebuilds from step 4 with caller-supplied ids
+installs values that can never satisfy the conjunction — and a **healthy**
+workspace live-locks into a permanent halt on every retry. `establish` therefore
+takes a `mintLineage` thunk it calls at most once, `resume` takes the intent and
+no lineage at all, and step 4's `install` closes over `lineageFrom(intent)`.
+An inventory test asserts `installGenesisLineage`'s only genesis caller derives
+its argument from an intent.
 
 Step 6 before step 7 is deliberate: r3 checked absence and *then* did four
 filesystem operations before renaming, leaving exactly the window the check
@@ -763,10 +806,19 @@ turning a healthy migrated workspace into a permanent
 So the predicate is a **conjunction**. A database is this intent's genesis
 database only if **all** of the following hold:
 
+**Evaluated through the read-only preflight, never a read-write open.** The
+merged `openStateStore(file, { readonly: true })` opens a preflight handle
+`readonly: true` first, precisely "so a foreign SQLite file must not be
+converted to WAL or otherwise mutated merely because rbox refuses it"
+(`store/open.ts:249-262`). §2.5.1 uses that path. Evaluating the conjunction
+through a read-write open would let WAL replay mutate the candidate — a
+"zero-write halt" rule that performs a write, which is the defect this whole
+section exists to prevent.
+
 | Check | Value |
 |---|---|
 | identity | the file's no-follow `{dev, ino}` equals `intent.staging` |
-| opens cleanly | `validateOpen` succeeds |
+| opens cleanly | `validateOpen` succeeds **through the read-only preflight** |
 | authority | `store_meta.authority_id === intent.authorityId` |
 | lineage | `store_meta.active_lineage_id === intent.lineageId` |
 | origin | a `migration_completion` singleton with `origin_kind = 'genesis'` |
@@ -774,8 +826,18 @@ database only if **all** of the following hold:
 | emptiness | that row's `entry_count = 0` and `repo_count = 0` |
 | evidence | `intent.evidence` equals the live fenced evidence |
 
-Any failure is a **zero-write halt**: nothing is adopted, nothing is deleted, no
-`Q` is published.
+Any failure raises **`StateAuthorityCorruptError`**: nothing is adopted, nothing
+is deleted, no `Q` is published, and nothing is retryable.
+
+**Two members are deliberately not load-bearing, named here so nobody later
+mistakes them for safety.** `entry_count = repo_count = 0` is *tautological* —
+`installGenesisLineage` writes zeros and genesis imports nothing, so no
+reachable genesis database has other values. `lineageId` is *defense in depth* —
+with `authorityId` already checked, a lineage mismatch is reachable only at
+~2⁻¹²⁸. Both are in the **ratified** 163 v12 row text; cutting either would cost
+a re-ratification for zero safety, so both stay. Do not "simplify" them away,
+and do not cite them as the reason the conjunction is sound — `authorityId`,
+the identity, and the evidence are.
 
 **This is not the withdrawn proposal.** Every one of `authority_id`,
 `active_lineage_id`, `migration_id`, `origin_kind`, `entry_count`, and
@@ -788,6 +850,22 @@ difference between r3's withdrawn rule and this one.
 
 #### 2.5.2 Crash images — exhaustive, one legal action each
 
+**Evaluation order matters in exactly one place: case 7 is evaluated before case
+5.** Case 5 keys on `state.json` being `L` and does not reference §2.5.1, so it
+does not inherit the evidence check; without the explicit ordering, a copied
+`.rbox` carrying a foreign intent into a workspace that has an `L` would take
+case 5's cleanup path and delete another workspace's artifacts. Evidence is
+checked first, and a mismatch halts before any case-5 removal.
+
+**Cases 6 and 7 raise `StateAuthorityCorruptError`, not a new halt code.** That
+is deliberate and it is a deletion: **U3 adds no genesis halt taxonomy** — no
+member of `MigrationHaltCode`, no new entry in `MIGRATION_HALT_COPY`, and no new
+copy to write, because `StateAuthorityCorruptError` already has its copy in
+§6.4. It also removes the contradiction an unnamed "halt" created with §5.3 and
+163:2612, which reserve halts for the migration control's own taxonomy. The
+three genesis **refusals** (§6.1) are unaffected: they fire at step 1, before
+anything is mutated, and are not halts.
+
 | # | Observation | Only legal action |
 |---|---|---|
 | 1 | `Q` matching `authorityId` + active path satisfies §2.5.1 | **Terminal.** Retry the (idempotent) `.rbox` fsync, remove the sibling if present, retire the intent. **Writes stay blocked until the intent is retired** (A-2 fence) |
@@ -795,8 +873,8 @@ difference between r3's withdrawn rule and this one.
 | 3 | `state.json` absent + active absent + staged path holds the recorded inode | Open it. If it satisfies §2.5.1: checkpoint/validate/close/`S0`/fsync, then step 5 onward. If it **does not open cleanly through `validateOpen` as a genesis store bound to this intent** (C9 — `installGenesisLineage` runs in one transaction, so "committed but not genesis-shaped" is not a reachable state; the reachable failure is a partial or unopenable file): **`ftruncate` the recorded inode to zero in place** (C3 — this preserves the inode, so the next crash still reads case 3 rather than case 6), remove only its `-wal`/`-shm`/`-journal` sidecars, and rebuild from step 4 through the same adopter, whose precondition is exactly a zero-byte claimed file |
 | 4 | `state.json` absent + the recorded inode is at neither path, both absent | Nothing durable happened after the intent. Rebuild from step 2 under a **fresh** `authorityId`; the new intent is published before the old one is unlinked |
 | 5 | `state.json` is `L` | **Refuse `legacy-present`.** JSON is authority. Remove only our own confirmed artifacts, retire the intent — and the coordinator then re-inspects once and dispatches to migration in the same pass (§1.3, C8) |
-| 6 | A foreign inode at either path, an unrecorded file at the active path, `Q` with a non-matching authority id, a malformed intent, or any §2.5.1 check failing | **Zero-write halt.** Never adopt, never delete |
-| 7 | A well-formed intent whose bound `evidence` differs from the live fenced evidence | **Zero-write halt** (C5). This is a copied, moved, or re-adopted workspace. Delete nothing — the artifacts may belong to the workspace this `.rbox` came from |
+| 6 | A foreign inode at either path, an unrecorded file at the active path, `Q` with a non-matching authority id, a malformed intent, or any §2.5.1 check failing | **`StateAuthorityCorruptError`**, zero writes. Never adopt, never delete |
+| 7 | A well-formed intent whose bound `evidence` differs from the live fenced evidence | **`StateAuthorityCorruptError`**, zero writes. A copied, moved, or re-adopted workspace. Delete nothing — the artifacts may belong to the workspace this `.rbox` came from |
 
 **No intent present** is the ordinary world: `absent/absent/absent` → genesis may
 begin; anything else → 163's existing rows, unchanged, including the
@@ -1285,6 +1363,8 @@ dated and re-checked before the 2.0 tag.
 - `classifier.ts` performs no writes, and **contains no genesis row**.
 - **`genesis.ts` imports nothing from `migration/`; `migration/**` imports
   nothing from `genesis.ts`; exactly one module imports both** — the coordinator.
+  `whole-state-compat.ts` imports `assertAuthorityWritable` from the coordinator
+  and nothing else from either domain.
 - Exactly two entry call sites of `establishStateAuthority`, plus one doctor
   authorization site.
 - The canonical control file is written only by `control-publication.ts`,
@@ -1314,7 +1394,7 @@ tests; other lanes propose their one-line entries in the PR body.
 
 | Lane | Deliverable | Routing |
 |---|---|---|
-| **1A** | M-1 + M-2 (one lane — M-2 depends on M-1's exact canonical schema). Codec, `C1Trigger`, `blocksSqliteWrites`, the shared `replaceCanonicalControl`, `promotePreparedControl` with pre-rename revalidation, `publishMigrationHalt`'s discriminated result, `readCanonicalControl`, **all migration + genesis path constructors into `paths.ts`**, **`StateAuthorityCorruptError` + the `authority-recovery-pending` refusal reason into `errors.ts`**, and the initial `MigrationHaltCode` union + `MIGRATION_HALT_COPY` | **opus** |
+| **1A** | M-1 + M-2 (one lane — M-2 depends on M-1's exact canonical schema). Codec, `C1Trigger`, `blocksSqliteWrites`, the shared `replaceCanonicalControl`, `promotePreparedControl` with pre-rename revalidation, `publishMigrationHalt`'s discriminated result, `readCanonicalControl`, **all migration + genesis path constructors into `paths.ts`**, **`StateAuthorityCorruptError` + the `authority-recovery-pending` refusal reason into `errors.ts`**, the initial `MigrationHaltCode` union + `MIGRATION_HALT_COPY`, and **collapsing `paths.ts`'s duplicate incarnation path** (`stateIncarnationPath` and `sqliteResetPaths.marker` are the same path written twice) | **opus** |
 | **1B** | `store/open.ts::adoptClaimedStateStore(file, expected, install)` + A-1 `adapters/sqlite-state-save.ts` + write-path differential tests. **Lands before 1C and 3A, which both consume the adopter** | codex |
 | **1C** | **Genesis** — `genesis.ts`, the five-field intent, the seven steps, the §2.5.1 finishing conjunction, §2.5.2's seven images, G1–G6, and the §2.6 rows applied to the classifier's *documentation* (not its code — the classifier has no genesis row). Depends on 1B for `adoptClaimedStateStore` | **opus** |
 
@@ -1324,8 +1404,8 @@ tests; other lanes propose their one-line entries in the PR body.
 |---|---|---|---|
 | **2A** | M-3 `classifier.ts` + `PhaseReceipt` + table-driven row tests + zero-write snapshots | 1A | **opus** |
 | **2B** | M-4 `admission.ts` + the five conditions + `withStatePlaneLocks` + standing-reset-recovery ordering + F1 + F4 | 1A | **opus** |
-| **2C** | A-2 `whole-state-compat.ts` + `CasResult` translation + the two-condition write fence + call-site counter | 1A, 1B, 1C | **opus** |
-| **2D** | `authority-bootstrap.ts` + the boundary structural gates | 1C, 2A | codex |
+| **2C** | A-2 `whole-state-compat.ts` + `CasResult` translation + the **one-call** write fence (`assertAuthorityWritable`, owned by 2D) + call-site counter | 1A, 1B, 2D | **opus** |
+| **2D** | `authority-bootstrap.ts`: dispatch, the single-re-inspect rule, **`assertAuthorityWritable`**, and the boundary structural gates. **Lands before 2C**, which consumes the fence | 1A, 1C, 2A | codex |
 
 ### Wave 3 — the phase bodies (3 lanes; all consume `PhaseReceipt`)
 
@@ -1429,6 +1509,19 @@ correction bought only attacker-resistance, the smaller record won.
 | **C9** | Case 3's test was unreachable — `installGenesisLineage` writes everything in one transaction | **Folded.** Reworded to "does not open cleanly through `validateOpen` as a genesis store bound to this intent", with the reachable failure named (partial or unopenable file) |
 | — | Disclose that step 4 needs `adoptClaimedStateStore`, not on `main` | **Folded into §2.6 itself**, in the new "what this does add" list: the merged `initializeStateStore` opens `"wx"` and rejects an existing path (`store/open.ts:218`), so **the amendment is not implementable against today's `main`** — ratifying it authorizes the design, not an immediate landing. It is a Wave 1B deliverable that migration's M3 also needs |
 | — | The trim question | **Answered in the doc** (§2.3.3), field by field, with the drop rationale. Six fields become five: `attemptId` and `staging.path` are gone; `version`, `authorityId`, `lineageId`, `evidence`, `staging{dev,ino}` survive. `lineageId` is flagged honestly as the one belt-and-braces field a reviewer could cut without weakening the accident story |
+
+### Disposition of the final review (verdict GO — four doc-level corrections)
+
+None touches 163 v12's ratified row text; both v12 rows remain byte-identical.
+
+| # | Correction | Disposition |
+|---|---|---|
+| **1** (lane 1C, highest value) | The intent must be the sole source of `authorityId`/`lineageId` on every resume. As written, `establish(root, lineage, locks)` took a caller lineage while cases 2/3 rebuild "from step 4", whose `install` closes over it — so a coordinator minting a fresh lineage per invocation (the natural reading of that signature) installs ids that can never satisfy §2.5.1, and a **healthy** workspace live-locks into a permanent halt | **Folded, and carried by the signature, not just prose.** `establish(root, mintLineage: () => GenesisLineage, locks)` calls the thunk at most once and only with no intent to resume; a private `resume(root, intent, locks)` takes the intent and no lineage; step 4 installs `lineageFrom(intent)`. §2.4 states the rule in bold with the live-lock consequence spelled out, and an inventory test asserts `installGenesisLineage`'s only genesis caller derives its argument from an intent |
+| **2** (lane 1C) | §2.5.1 must evaluate through the read-only preflight; case 7 must precede case 5; cases 6–7 must raise `StateAuthorityCorruptError` | **Folded, all three.** §2.5.1 evaluates through `openStateStore`'s `readonly: true` preflight (`store/open.ts:249-262`, which exists precisely so a foreign SQLite file is not converted to WAL merely by being inspected) — otherwise a "zero-write halt" rule performs a write via WAL replay. §2.5.2 states the ordering and why (case 5 keys on `L` and does not reference §2.5.1, so it does not inherit the evidence check; without the ordering a copied `.rbox` would take case 5's cleanup path and delete another workspace's artifacts). Cases 6 and 7 now raise `StateAuthorityCorruptError`, which **deletes the genesis halt taxonomy before it is born**: no `MigrationHaltCode` member, no `MIGRATION_HALT_COPY` entry, no new copy — §6.4 already covers it — and it resolves the contradiction an unnamed "halt" created with §5.3 and 163:2612. The three genesis **refusals** are unaffected; they fire at step 1, before any mutation |
+| **3** (lanes 2C + 2D) | Collapse A-2's two-read fence into one exported `assertAuthorityWritable(root)` in the coordinator | **Folded.** One call replaces a duplicated branch, halves the hot-path reads, and fixes a **real §7.9 boundary violation**: as written, `whole-state-compat.ts` imported from both `migration/` and `genesis.ts`, so "exactly one module imports both" was false and lanes 2C/2D would have collided over ownership. 2D now owns the predicate and **lands before 2C** |
+| **4** (163 editorial) | Qualify 163:2613 and widen `C` at 163:2589 | **Folded.** `absent \| absent \| absent` becomes `absent \| absent \| absent, and no genesis intent`, so it cannot overlap the v12 in-progress row under first-match reading; `C`'s definition now reads "evidence for the record that owns it — the migration control ordinarily, or the genesis intent on the two v12 intent-keyed rows". Both are surrounding definitions, **not** the amendment; the two v12 row texts are untouched |
+| — | `entry_count = repo_count = 0` and `lineageId` are tautological / defense-in-depth | **Recorded, not changed** (§2.5.1). Both are in the ratified row text; cutting either costs a re-ratification for zero safety. They are now explicitly named non-load-bearing so nobody later mistakes them for the reason the conjunction is sound — `authorityId`, the identity, and the evidence are |
+| — | `paths.ts` declares the incarnation path twice | **Folded into lane 1A's PR** — `stateIncarnationPath` and `sqliteResetPaths.marker` are the same path written twice |
 
 ### Deletions r3 asked for, all taken
 

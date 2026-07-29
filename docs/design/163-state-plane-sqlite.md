@@ -2586,8 +2586,10 @@ point of the pre-U0 `B0` unit.
 
 The M0 authority matrix is exhaustive after standing reset recovery. `L`
 means an identity-stable admitted legacy JSON regular file; `C` means an active
-DB with exact application/schema/authority/completion evidence for the control
-record; `P/F` means incomplete/unreadable/foreign DB. `exact` below means an
+DB with exact application/schema/authority/completion evidence for the record
+that owns it — the migration control ordinarily, or the genesis intent on the
+two v12 intent-keyed rows, where the evidence is the design 222 § 2.5.1
+conjunction; `P/F` means incomplete/unreadable/foreign DB. `exact` below means an
 unhalted exact high-water record from the correlated table; `halted` means the
 same exact record with its phase-preserving durable halt. Neither a completion
 row nor a backup elects authority by itself.
@@ -2610,7 +2612,7 @@ row nor a backup elects authority by itself.
 | exact `Q` | matching `C` | halted M5–M7 | SQLite authority; never restore JSON. Honor the phase-specific durability/write block or cleanup deferral until explicit doctor retry delegates to the controller. |
 | exact `Q` | matching `C` whose `authority_id` equals both the intent's authority id and the `Q` bytes | migration control absent plus the same exact genesis intent | Genesis finish-ahead past the authority rename (v12). SQLite authority; writes stay blocked until the `.rbox` parent fsync completes and the intent is retired. |
 | exact `Q` | absent/`P/F`/wrong authority id | any | contradictory authority; hard `StateAuthorityCorruptError`, zero repair writes. |
-| absent | absent | absent | No authority. Genesis is allowed only with fenced config/incarnation/reset evidence and uses staged DB + `Q`; otherwise halt. |
+| absent | absent | absent, and no genesis intent | No authority. Genesis is allowed only with fenced config/incarnation/reset evidence and uses staged DB + `Q`; otherwise halt. |
 | absent | absent, or exactly the database satisfying the genesis intent's full identity conjunction — recorded `{dev,ino}`, `store_meta.authority_id`, `store_meta.active_lineage_id`, and a genesis `migration_completion` singleton whose `migration_id` is `genesis:<lineageId>` with `entry_count = repo_count = 0` | migration control absent plus an exact genesis intent whose bound fenced evidence equals this workspace's current fenced evidence and which records that exact `{dev,ino}` identity | No authority until `Q`. Genesis in progress (v12); only the genesis recorded-identity correlation (design 222 §2.5.2) may act. No migration phase is inferred and no migration artifact is created. |
 | absent | any DB | any | Ambiguous/manual damage; halt. DB presence never elects authority. |
 | malformed JSON, non-exact sentinel, special/unreadable legacy path | any | any | Halt before DB open or cleanup. |
