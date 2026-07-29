@@ -54,6 +54,10 @@ const ENTRY_POINTS: readonly EntryPoint[] = [
   { file: "src/cli/doctor-state-plane.ts", symbol: "checkState", kind: "read", sites: 1, guards: ["loadRawState"] },
   { file: "src/cli/state-plane/locks.ts", symbol: "inspectInventory", kind: "read", sites: 1, guards: ["classifyStateFormat"] },
   { file: "src/cli/state-plane/migration/admission.ts", symbol: "barrierWitness", kind: "read", sites: 1, guards: ["verifyLastWriterWitness"] },
+  // The migration classifier's sole reader of the document. It must handle the
+  // marker rather than refuse it, so its guard is the classifier that decides
+  // the format, not the barrier that throws on it.
+  { file: "src/cli/state-plane/migration/artifact-observation.ts", symbol: "observeLegacyAuthority", kind: "read", sites: 3, guards: ["classifyStateFormat"] },
 
   // Writes — check the barrier immediately before the publishing rename, and
   // record the last-writer witness immediately after it.
