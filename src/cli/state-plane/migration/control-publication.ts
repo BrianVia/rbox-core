@@ -319,9 +319,18 @@ export function haltRunway(control: MigrationControl): readonly HaltResourceRole
 
 /**
  * Release one recorded halt resource so a halt publication has somewhere to
- * land. The identity bracket is the whole safety property: `available` is the
- * only disposition that names a file, and it names it by inode and length, so
- * this can never unlink a path that stopped being the resource it recorded.
+ * land. `available` is the only disposition that names a file, and it names it
+ * by inode, length, AND content digest — all three are checked, through one
+ * descriptor, so this can never unlink a path that stopped being the resource
+ * it recorded. The digest is not decoration: an in-place rewrite keeps the
+ * inode and the length, and inode plus length alone would release it.
+ *
+ * `sha256` here is the WHOLE file, the shape every other `{bytes, sha256}`
+ * witness in the codec carries. It is deliberately not the same evidence as
+ * `cleanup.ts`'s role-7 removal, which compares the 128 reserve header bytes
+ * because 163 states that rule for the cleanup vector specifically. Both are
+ * strict; they differ because the two records store different things about the
+ * same file, and 222 §M-8 warns 4A not to conflate them.
  *
  * Exported for its refusal path alone. `publishMigrationHalt` is the only
  * production caller, and it reaches this function only after an allocation
@@ -332,10 +341,18 @@ export function releaseHaltResource(root: string, control: MigrationControl, rol
   const recorded = control.haltResources[role];
   if (recorded.disposition !== "available") fail("cas", `${role} is ${recorded.disposition}, not available`);
   const file = role === "reserve" ? migrationPaths.reserve(root) : migrationPaths.emergency(root, control.migrationId);
-  const observed = fs.lstatSync(file);
-  if (!observed.isFile() || Number(observed.dev) !== recorded.dev
-    || Number(observed.ino) !== recorded.ino || observed.size !== recorded.bytes) {
-    fail("prepared-foreign", `${file} is not the recorded ${role}`);
+  const fd = fs.openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const observed = fs.fstatSync(fd);
+    const content = Buffer.alloc(observed.isFile() ? Number(observed.size) : 0);
+    if (!observed.isFile() || Number(observed.dev) !== recorded.dev
+      || Number(observed.ino) !== recorded.ino || Number(observed.size) !== recorded.bytes
+      || fs.readSync(fd, content, 0, content.byteLength, 0) !== content.byteLength
+      || digest(content) !== recorded.sha256) {
+      fail("prepared-foreign", `${file} is not the recorded ${role}`);
+    }
+  } finally {
+    fs.closeSync(fd);
   }
   fs.unlinkSync(file);
   fsyncDirectorySync(path.dirname(file));

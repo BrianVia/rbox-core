@@ -31,6 +31,7 @@ import {
 } from "./control-codec.js";
 import {
   publishMigrationControl, readCanonicalControl, releaseHaltResource, renderPreparedControl,
+  retireCanonicalControl,
 } from "./control-publication.js";
 import { buildReserveHeader, RESERVE_HEADER_BYTES } from "./reserve.js";
 
@@ -262,12 +263,12 @@ describe("the M6 cleanup cursor", () => {
     expect(readCanonicalControl(fx.root)!.controlRevision).toBe(ready.controlRevision);
   });
 
-  test("an out-of-space transition defers against the exact same cursor and consumes no vector item", async () => {
+  test.each(["ENOSPC", "EDQUOT"])("a %s transition defers against the exact same cursor and consumes no vector item", async (code) => {
     const fx = fixture();
     let failed = false;
     const rename = fs.renameSync;
     inject("renameSync", ((from: string, to: string) => {
-      if (!failed) { failed = true; throw enospc(); }
+      if (!failed) { failed = true; throw Object.assign(new Error("out of room"), { code }); }
       return rename(from, to);
     }) as typeof fs.renameSync);
 
@@ -465,6 +466,88 @@ describe("the allocation-free runway", () => {
     expect(fs.existsSync(fx.emergency)).toBe(true);
   });
 
+  test("refuses a slot swapped between the bracket and the write, before any bytes land", async () => {
+    const fx = fixture();
+    const base = await toFinalIntent(fx);
+    let current = base;
+    for (const _ of [0, 1]) {
+      const step = await stepFutureControlPreparation(fx.root, receipt(current), locks);
+      if (step.kind !== "advanced") throw new Error("unreachable");
+      current = step.control;
+    }
+    const ledger = ledgerOf(current);
+    const recorded = inodeOf(ledger.halt.path);
+
+    // The swap lands in the window between `bracketSlot` and the write. Only the
+    // write descriptor's own identity check can see it; a check after the write
+    // would notice a slot it had already put a control record into.
+    const step = stepFutureControlPreparation(fx.root, receipt(current), locks, {
+      onStep: (which) => {
+        if (which !== "write-halt") return;
+        fs.unlinkSync(ledger.halt.path);
+        fs.writeFileSync(ledger.halt.path, "not this ledger's slot", { mode: 0o600 });
+      },
+    });
+    await expect(step).rejects.toThrow(/changed identity before its halted-m6 bytes were written/);
+    expect(inodeOf(ledger.halt.path), "the swap must actually be a new inode").not.toBe(recorded);
+    expect(fs.readFileSync(ledger.halt.path, "utf8"), "and it never received the record").toBe("not this ledger's slot");
+  });
+
+  test("refuses a building slot that grew past the image it is allowed to hold", async () => {
+    const fx = fixture();
+    const base = await toFinalIntent(fx);
+    let current = base;
+    for (const _ of [0, 1]) {
+      const step = await stepFutureControlPreparation(fx.root, receipt(current), locks);
+      if (step.kind !== "advanced") throw new Error("unreachable");
+      current = step.control;
+    }
+    const ledger = ledgerOf(current);
+    const expected = ledger.halt.disposition;
+    if (expected.state !== "building" || expected.expected === null) throw new Error("unreachable");
+
+    // Same inode, but longer than the expected image: `building` admits
+    // `0..expected.bytes` and nothing else.
+    const recorded = inodeOf(ledger.halt.path);
+    fs.truncateSync(ledger.halt.path, expected.expected.bytes + 1);
+    expect(inodeOf(ledger.halt.path)).toBe(recorded);
+
+    await expect(stepFutureControlPreparation(fx.root, receipt(current), locks))
+      .rejects.toThrow(/past its expected/);
+  });
+
+  test("refuses to write the M7 slot against an expectation the derivation does not meet", async () => {
+    const fx = fixture();
+    const base = await toFinalIntent(fx);
+    let current = base;
+    for (const _ of [0, 1, 2]) {
+      const step = await stepFutureControlPreparation(fx.root, receipt(current), locks);
+      if (step.kind !== "advanced") throw new Error("unreachable");
+      current = step.control;
+    }
+    const ledger = ledgerOf(current);
+    const success = ledger.success.disposition;
+    if (success.state !== "building" || success.expected === null) throw new Error("unreachable");
+    const before = fs.lstatSync(ledger.success.path).size;
+
+    const tampered: MigrationControl = {
+      ...current,
+      witness: {
+        ...current.witness as Extract<MigrationWitness, { phase: "M6" }>,
+        futureControls: {
+          ...ledger,
+          success: {
+            ...ledger.success,
+            disposition: { ...success, expected: { ...success.expected, sha256: "c".repeat(64) } },
+          },
+        },
+      },
+    };
+    await expect(stepFutureControlPreparation(fx.root, receipt(tampered), locks))
+      .rejects.toThrow(/the M7 record is not the one this ledger expected/);
+    expect(fs.lstatSync(ledger.success.path).size, "and nothing was written").toBe(before);
+  });
+
   test("the ledger owns b+5 and b+6 while control sits at b+4, so no temp may be blanket-overwritten", async () => {
     const fx = fixture();
     const ready = await toReady(fx, await toFinalIntent(fx));
@@ -552,6 +635,29 @@ describe("the final item", () => {
 
     await finishMigration(fx.root, receipt(retried.control), locks);
     expect(readCanonicalControl(fx.root)).toBeUndefined();
+  });
+
+  test("a pre-rename refusal throws; only a real rename failure is durability-indeterminate", async () => {
+    const fx = fixture();
+    const ready = await toReady(fx, await toFinalIntent(fx));
+
+    // Someone published past us. The CAS refuses BEFORE the rename, so the state
+    // is fully determinate — reporting `durability-indeterminate` would both
+    // misdescribe it and block SQLite writes over nothing.
+    fs.writeFileSync(migrationPaths.control(fx.root),
+      encodeMigrationControl({ ...ready, controlRevision: ready.controlRevision + 1 }));
+    await expect(completeFinalItem(fx.root, receipt(ready), locks)).rejects.toThrow(MigrationControlError);
+    expect(fs.existsSync(fx.emergency), "the final item was still removed first").toBe(false);
+
+    // A genuine rename failure is the indeterminate case.
+    const other = fixture();
+    const otherReady = await toReady(other, await toFinalIntent(other));
+    inject("renameSync", (() => { throw Object.assign(new Error("io"), { code: "EIO" }); }) as typeof fs.renameSync);
+    const outcome = await completeFinalItem(other.root, receipt(otherReady), locks);
+    expect(outcome).toMatchObject({ kind: "halted", durableHalt: false });
+    if (outcome.kind !== "halted") throw new Error("unreachable");
+    expect(outcome.halt.code).toBe("durability-indeterminate");
+    expect(outcome.halt.underlyingCode).toBe("EIO");
   });
 
   test("a retry whose final item is already absent never recreates it", async () => {
@@ -678,15 +784,36 @@ describe("M7 terminalization", () => {
   });
 });
 
+describe("the terminal control retirement", () => {
+  test("unlinks the control only under its exact CAS", async () => {
+    const fx = fixture();
+    const ready = await toReady(fx, await toFinalIntent(fx));
+    const outcome = await completeFinalItem(fx.root, receipt(ready), locks);
+    if (outcome.kind !== "finished") throw new Error("unreachable");
+    const expect1 = { migrationId: ID, revision: outcome.control.controlRevision };
+
+    expect(() => retireCanonicalControl(fx.root, { ...expect1, revision: expect1.revision - 1 }, locks)).toThrow(/cas/);
+    expect(() => retireCanonicalControl(fx.root, { ...expect1, migrationId: "other" }, locks)).toThrow(/cas/);
+    expect(readCanonicalControl(fx.root), "a refused retirement leaves the control").toBeDefined();
+
+    retireCanonicalControl(fx.root, expect1, locks);
+    expect(readCanonicalControl(fx.root)).toBeUndefined();
+    // The migration's last durable act does not run twice.
+    expect(() => retireCanonicalControl(fx.root, expect1, locks)).toThrow(/cas/);
+  });
+});
+
 describe("releaseHaltResource (closing wave 1A's untested refusal)", () => {
   test("releases only the exact recorded resource, and refuses every other observation", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "rbox-release-"));
     fs.mkdirSync(path.join(root, ".rbox", "state"), { recursive: true });
     const file = migrationPaths.reserve(root);
-    fs.writeFileSync(file, Buffer.alloc(64));
+    const content = Buffer.alloc(64, 0x7a);
+    fs.writeFileSync(file, content);
     const stat = fs.lstatSync(file);
     const recorded = {
-      disposition: "available", dev: Number(stat.dev), ino: Number(stat.ino), bytes: 64, sha256: HASH,
+      disposition: "available", dev: Number(stat.dev), ino: Number(stat.ino), bytes: 64,
+      sha256: digest(content),
     } as const;
     const control = (over: Partial<MigrationControl["haltResources"]["reserve"]> = {}): MigrationControl =>
       ({
@@ -706,6 +833,17 @@ describe("releaseHaltResource (closing wave 1A's untested refusal)", () => {
     expect(() => releaseHaltResource(root, control({ ino: recorded.ino + 1 }), "reserve")).toThrow(/is not the recorded reserve/);
     expect(() => releaseHaltResource(root, control({ bytes: 65 }), "reserve")).toThrow(/is not the recorded reserve/);
     expect(fs.existsSync(file)).toBe(true);
+
+    // An in-place rewrite keeps the inode AND the length, so only the content
+    // digest can refuse it. This is the case the bracket used to release.
+    const rewrite = fs.openSync(file, "r+");
+    fs.writeSync(rewrite, Buffer.alloc(64, 0x41), 0, 64, 0);
+    fs.closeSync(rewrite);
+    expect(inodeOf(file), "the rewrite must keep the recorded inode").toBe(`${recorded.dev}:${recorded.ino}`);
+    expect(fs.lstatSync(file).size).toBe(recorded.bytes);
+    expect(() => releaseHaltResource(root, control(), "reserve")).toThrow(/is not the recorded reserve/);
+    expect(fs.existsSync(file)).toBe(true);
+    fs.writeFileSync(file, content);
 
     // A directory at the path is not a regular file.
     const other = fs.mkdtempSync(path.join(os.tmpdir(), "rbox-release-"));

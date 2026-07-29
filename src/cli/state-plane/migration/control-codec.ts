@@ -125,7 +125,8 @@ export type FutureControls =
   }
   /** The ledger as the promoted halted-M6 record consumes it: where it came
    * from, and the M7 sibling it still owns. Neither member carries its own
-   * SHA-256 — that would be a self/cross-digest cycle (163:3028).
+   * SHA-256 — that would be a self/cross-digest cycle (163 § "V5 future-control
+   * preparation", the "deliberately omits its own SHA-256" paragraph).
    *
    * `preparedSuccess` carries no byte length either, for the same reason one
    * level down (wave 3C). 163:3028 has the halted record name the M7 length

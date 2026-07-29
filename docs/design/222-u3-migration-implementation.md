@@ -262,15 +262,19 @@ path has the direct test 1A's review flagged as missing.
   slots' `path`; its outer discriminant is named `stage` so it does not collide
   with the slots' own `kind`.
 
-  **Amended by 3C: `promoted-halt`'s `preparedSuccess` stores no `bytes`.** 1A
-  carried 163:3086's shape through verbatim, including the M7 byte length. That
-  member makes the two prepared records mutually self-sizing — the halt record's
+  **Corrected by 3C: `promoted-halt`'s `preparedSuccess` stores no `bytes`.**
+  163 prints no schema for the consumed `promoted-halt` form — only for the
+  one-way `preparing` ledger — and says of it only that `preparedSuccess`
+  "omits the M7 SHA-256". 1A read that as *carries `dev`/`ino`/`bytes`*, which
+  makes the two prepared records mutually self-sizing: the halt record's
   canonical length depends on the decimal width of the M7 length it stores, and
-  vice versa — so the ledger could only be filled in by a fixpoint iteration.
-  It is also exactly the class of stored duplicate this list already refuses
-  three times: 163:3092 requires the retry to recompute and byte-check the M7
-  record, so a stored length has no reachable use except to disagree with the
-  recomputation. Full statement in 163 § "V5 future-control preparation".
+  vice versa. 163's own five-row ordering then breaks before any fixpoint does
+  — the halt bytes must be final before M7 is derived from them — and the
+  fixpoint has no specified convergence. The member is also exactly the class of
+  stored duplicate this list already refuses three times: 163:3092 requires the
+  retry to recompute and byte-check the M7 record, so a stored length has no
+  reachable use except to disagree with the recomputation. Full statement in
+  163 § "V5 future-control preparation".
 - **M6's `cleanup.order` is named `items`**, so the M6 cleanup cursor and the
   C1 retirement cursor are one `Cursor` type over one vector shape. They are
   the same one-target machine (163:2761, :2899) over different vectors.
@@ -553,6 +557,25 @@ bytes are re-read through the same descriptor that proves the inode and hashed
 against the digest the vector recorded. **That digest is the contract M-6 (wave
 4A) must honour when it builds the vector**: an item of role `reserve` whose
 `sha256` is `null` is refused, so the requirement cannot be silently skipped.
+
+**Two hazards for 4A's vector builder, stated because nothing in the schema
+catches either.**
+
+- For role `reserve`, `ArtifactItem.sha256` is the SHA-256 of exactly the first
+  `RESERVE_HEADER_BYTES` (128) bytes — the same value M1 recorded on adoption.
+  It is not a whole-file digest and it is not `haltResources.reserve.sha256`.
+  Both names describe the same file, nothing cross-checks them, and 4A builds
+  the vector from the resource record, so a wire-up error would satisfy the
+  codec and every 3C test. 163:4429 states these must not drift; this is the
+  drift it means. (`releaseHaltResource` verifies
+  `haltResources.reserve.sha256` as a whole-file digest, which is the shape
+  every other `{bytes, sha256}` witness in the codec carries.)
+- `ArtifactItem.path` is schema-typed as a bare `"string"` with no confinement,
+  and cleanup unlinks whatever a well-formed row names. A row reading
+  `/tmp/outside/precious.txt` with a matching inode would be removed. Nothing
+  reaches this without already writing inside `.rbox/state`, so it is not a
+  live escalation — but 4A's builder must derive every `path` from
+  `migrationPaths`, never copy a string from elsewhere in the record.
 
 ---
 

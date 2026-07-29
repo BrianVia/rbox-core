@@ -374,20 +374,26 @@ behind-origin count; loudly warn when behind.
   ("--- from daemon.log (legacy, last written <date>)") or drop legacy-file
   tails once dated logs exist.
 
-- **A ratified design specified a self-referential record schema (2026-07-29,
-  U3 wave 3C, cost ~40 min):** 163:3086's M6 preparation ledger has the
-  halted-M6 record store the prepared M7 record's byte length, while the M7
-  record stores the halt record's byte length and hash. Each record's canonical
-  size therefore depends on the decimal width of the other's, so the ledger row
-  the design says to publish at `b+1` cannot be computed without already knowing
-  `b+2`'s answer — only a fixpoint iteration closes it. Nobody noticed across
-  five design rounds because the circularity lives in JSON *lengths*, not in
-  named dependencies. Wave 1A then carried the shape into the codec verbatim.
-  Fixed by deleting the stored length (163:3092 already required the retry to
-  recompute the M7 record, so it was a duplicate too). Rule: when a record
-  stores a length or hash of another record that stores a length or hash of it,
-  check for the cycle before implementing — and prefer deriving over storing,
-  which removes the question entirely.
+- **A shape the design never printed got read into existence, and it was
+  circular (2026-07-29, U3 wave 3C, cost ~40 min):** 163:3086 says the M6
+  ledger's consumed `promoted-halt` form "omits the M7 SHA-256" and prints no
+  schema for it — only the one-way `preparing` ledger is printed. Wave 1A
+  reasonably read the omission as *carries dev/ino/**bytes***, and that reading
+  is unimplementable: the halted-M6 record would name the M7 record's byte
+  length while the M7 record names the halt record's, so each record's canonical
+  size depends on the decimal width of the other's. 163's own five-row ordering
+  breaks before the fixpoint does — the halt bytes must be final before M7 can
+  be derived from them, yet under that shape they cannot be — and the fixpoint
+  has no specified convergence, so two conforming implementations could disagree
+  on canonical bytes. Nobody noticed across five design rounds because the
+  circularity lives in JSON *lengths*, not in named dependencies. Fixed by
+  pinning the shape without the length (163:3092 already required the retry to
+  recompute the M7 record, so it was a duplicate too). Two rules: an omission
+  list is not a schema — when a document says which fields a record leaves out,
+  the implementer is inventing the ones it leaves in, and that invention belongs
+  back in the document; and when a record stores a length or hash of another
+  record that stores a length or hash of it, check for the cycle before
+  implementing, preferring derivation over storage.
 
 - **The state-plane file-size law has no CI gate (2026-07-29):** 163:3994 states
   "400 lines / 25 KiB is the hard CI failure" for production files, and nothing

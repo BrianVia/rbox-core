@@ -12,13 +12,13 @@
  * Everything here is a pure function of the durable ledger plus two inodes.
  * Nothing chooses a revision, deletes a partial, or creates a second pair: a
  * crash at any point leaves one of the five rows and preparation resumes it.
- *
  * `cleanup.ts` owns the cursor, the identity bracket, and M7; this file imports
  * from it and never the reverse.
  */
 import { constants } from "node:fs";
 import fs from "node:fs";
 import path from "node:path";
+import { MigrationControlError } from "../errors.js";
 import type { HeldStatePlaneLocks } from "../locks.js";
 import type { PhaseReceipt } from "./classifier.js";
 import {
@@ -44,7 +44,7 @@ export type FinalItemOutcome =
   | { readonly kind: "halted"; readonly halt: MigrationHalt; readonly durableHalt: false };
 
 /** Fault-observation seam for the runway's persistence tests, mirroring
- * `reserve.ts`'s creation hooks. Production passes nothing. */
+ * `reserve.ts`'s hooks. Production passes nothing. */
 export type RunwayStep = "claim-halt" | "claim-success" | "write-halt" | "write-success";
 export interface RunwayHooks { readonly onStep?: (step: RunwayStep) => void }
 
@@ -77,12 +77,10 @@ function haltedRecord(control: MigrationControl, ledger: Preparing, halt: Inode,
   };
 }
 
-/**
- * The prepared M7 record — identical on both branches, because it is a pure
+/** The prepared M7 record — identical on both branches, because it is a pure
  * function of the halted-M6 record's canonical bytes plus the M7 inode that
  * record already names. That is what lets the promoted-halt retry recompute the
- * exact bytes the ledger deliberately never stored (163:3092).
- */
+ * exact bytes the ledger deliberately never stored (163:3092). */
 function successRecord(halted: MigrationControl, haltedBytes: Buffer): MigrationControl {
   const witness = halted.witness as M6Witness;
   const ledger = witness.futureControls;
@@ -113,8 +111,8 @@ function successRecord(halted: MigrationControl, haltedBytes: Buffer): Migration
 // Slot I/O. Never a second inode, never a replacement pair.
 
 /** The sole artifact-ahead allowance in an `absent` descriptor: the prebound
- * path may already hold one no-follow regular 0600 zero-byte inode, which is
- * adopted rather than replaced (163:3068). */
+ * path may already hold one no-follow regular 0600 zero-byte inode, adopted
+ * rather than replaced (163:3068). */
 function claimSlot(slot: SlotRef): Inode {
   let fd: number;
   let created = true;
@@ -138,9 +136,9 @@ function claimSlot(slot: SlotRef): Inode {
   }
 }
 
-/** The recorded inode, still here, still regular, still no longer than the
- * image it is allowed to hold. A `building` slot may carry any power-loss byte
- * image of length `0..expected.bytes`; nothing ever interprets a partial one. */
+/** The recorded inode, still regular, still no longer than the image it may
+ * hold: a `building` slot carries any power-loss image of length
+ * `0..expected.bytes`, and nothing ever interprets a partial one. */
 function bracketSlot(slot: SlotRef, recorded: Inode, maxBytes: number): void {
   const observed = statOrAbsent(slot.path);
   if (!observed || !observed.isFile()
@@ -151,8 +149,14 @@ function bracketSlot(slot: SlotRef, recorded: Inode, maxBytes: number): void {
   }
 }
 
-/** Rewrite the recorded inode from offset zero and truncate. No new inode, no
- * temp, no rename: a descriptor may never be reset to `absent`. */
+/**
+ * Rewrite the recorded inode from offset zero and truncate. No new inode, no
+ * temp, no rename: a descriptor may never be reset to `absent`. The identity is
+ * re-proven on the write descriptor itself, not just by the caller's
+ * `bracketSlot` — between those two calls the path can be replaced, and a check
+ * that ran only afterwards would notice a swap it had already written a control
+ * record into.
+ */
 function writeSlot(slot: SlotRef, recorded: Inode, bytes: Buffer, revision: number): PreparedControlIdentity {
   const fd = fs.openSync(slot.path, constants.O_WRONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
@@ -160,11 +164,10 @@ function writeSlot(slot: SlotRef, recorded: Inode, bytes: Buffer, revision: numb
     if (Number(stat.dev) !== recorded.dev || Number(stat.ino) !== recorded.ino) {
       corruptCleanup(`${slot.path} changed identity before its ${slot.kind} bytes were written`);
     }
-    // A short write means the device would not take the rest, which is ENOSPC by
-    // any other name. Classifying it as one matters: the result is a bounded
-    // partial image of the recorded inode, which is precisely the `building`
-    // state this row is allowed to be in, so the runway must leave the ledger
-    // where it is and resume — not call it corruption and wedge.
+    // The `ENOSPC` label is the DISPOSITION, not the diagnosis: a short write
+    // could also be EINTR. Either way the result is a bounded partial image of
+    // the recorded inode — precisely the `building` state this row is allowed
+    // to be in — so the runway resumes rather than wedging on "corruption".
     const written = fs.writeSync(fd, bytes, 0, bytes.byteLength, 0);
     if (written !== bytes.byteLength) {
       throw Object.assign(
@@ -203,16 +206,11 @@ function readSlotExact(slot: SlotRef, recorded: Inode, bytes: Buffer, revision: 
 // ---------------------------------------------------------------------------
 // b..b+4.
 
-/**
- * One durable preparation row (163's five-row table at :3103). Preparation
+/** One durable preparation row (163's five-row table at :3103). Preparation
  * always resumes the same stage and the same inode; it never deletes a partial,
- * chooses a new revision, or creates a second pair.
- *
- * A caught allocation failure here publishes NO alternate control — 163's named
- * scoped exception to f6, because publishing a durable halt would need exactly
- * the allocation this runway exists to avoid. The operator sees
- * `durableHalt: false` and the durable row stays resumable.
- */
+ * chooses a new revision, or creates a second pair. A caught allocation failure
+ * publishes NO alternate control — 163's named scoped exception to f6, because
+ * a durable halt would need the very allocation this runway exists to avoid. */
 export async function stepFutureControlPreparation(
   root: string, receipt: PhaseReceipt, locks: HeldStatePlaneLocks, hooks: RunwayHooks = {},
 ): Promise<PreparationStep> {
@@ -236,17 +234,22 @@ function advanceRunway(
 ): PreparationStep {
   const halt = ledger.halt.disposition;
   const success = ledger.success.disposition;
-  const advance = (next: Preparing): PreparationStep =>
-    ({ kind: "advanced", control: publishNext(root, control, witness, { futureControls: next }, locks) });
-  const withHalt = (disposition: Preparing["halt"]["disposition"]): Preparing["halt"] =>
-    ({ ...ledger.halt, disposition });
-  const withSuccess = (disposition: Preparing["success"]["disposition"]): Preparing["success"] =>
-    ({ ...ledger.success, disposition });
+  const advance = (next: Partial<Preparing>): PreparationStep => ({
+    kind: "advanced",
+    control: publishNext(root, control, witness, { futureControls: { ...ledger, ...next } }, locks),
+  });
+  const withHalt = (disposition: Preparing["halt"]["disposition"]): Partial<Preparing> =>
+    ({ halt: { ...ledger.halt, disposition } });
+  const withSuccess = (disposition: Preparing["success"]["disposition"]): Partial<Preparing> =>
+    ({ success: { ...ledger.success, disposition } });
+  const expect = (bytes: Buffer): { bytes: number; sha256: string } =>
+    ({ bytes: bytes.byteLength, sha256: digestHex(bytes) });
+  const exact = (inode: Inode, bytes: Buffer) =>
+    ({ state: "exact" as const, dev: inode.dev, ino: inode.ino, ...expect(bytes) });
 
   if (halt.state === "absent" && success.state === "absent") {
     hooks.onStep?.("claim-halt");
-    const inode = claimSlot(ledger.halt);
-    return advance({ ...ledger, halt: withHalt({ state: "building", ...inode, expected: null }) });
+    return advance(withHalt({ state: "building", ...claimSlot(ledger.halt), expected: null }));
   }
   if (halt.state === "building" && halt.expected === null && success.state === "absent") {
     bracketSlot(ledger.halt, halt, 0);
@@ -254,9 +257,8 @@ function advanceRunway(
     const inode = claimSlot(ledger.success);
     const bytes = encodeMigrationControl(haltedRecord(control, ledger, halt, inode));
     return advance({
-      ...ledger,
-      halt: withHalt({ ...halt, expected: { bytes: bytes.byteLength, sha256: digestHex(bytes) } }),
-      success: withSuccess({ state: "building", ...inode, expected: null }),
+      ...withHalt({ ...halt, expected: expect(bytes) }),
+      ...withSuccess({ state: "building", ...inode, expected: null }),
     });
   }
   if (halt.state === "building" && halt.expected !== null && success.state === "building" && success.expected === null) {
@@ -269,14 +271,8 @@ function advanceRunway(
     }
     hooks.onStep?.("write-halt");
     writeSlot(ledger.halt, halt, bytes, ledger.haltRevision);
-    const successBytes = encodeMigrationControl(successRecord(halted, bytes));
-    return advance({
-      ...ledger,
-      halt: withHalt({ state: "exact", dev: halt.dev, ino: halt.ino, bytes: bytes.byteLength, sha256: digestHex(bytes) }),
-      success: withSuccess({
-        ...success, expected: { bytes: successBytes.byteLength, sha256: digestHex(successBytes) },
-      }),
-    });
+    const m7 = encodeMigrationControl(successRecord(halted, bytes));
+    return advance({ ...withHalt(exact(halt, bytes)), ...withSuccess({ ...success, expected: expect(m7) }) });
   }
   if (halt.state === "exact" && success.state === "building" && success.expected !== null) {
     const halted = haltedRecord(control, ledger, halt, success);
@@ -289,20 +285,15 @@ function advanceRunway(
     }
     hooks.onStep?.("write-success");
     writeSlot(ledger.success, success, bytes, ledger.successRevision);
-    return advance({
-      ...ledger,
-      success: withSuccess({
-        state: "exact", dev: success.dev, ino: success.ino, bytes: bytes.byteLength, sha256: digestHex(bytes),
-      }),
-    });
+    return advance(withSuccess(exact(success, bytes)));
   }
   if (halt.state === "exact" && success.state === "exact") return { kind: "ready", control };
   return corruptCleanup("the future-control ledger is in no admitted preparation row");
 }
 
-/** Both prepared siblings, re-derived and re-proven byte-for-byte. Deriving
- * rather than trusting the recorded lengths is what makes a swapped sibling
- * unusable even if it somehow kept the recorded inode. */
+/** Both prepared siblings, re-derived and re-proven byte-for-byte: deriving
+ * rather than trusting recorded lengths is what makes a swapped sibling
+ * unusable even if it kept the recorded inode. */
 function readyPair(
   control: MigrationControl, ledger: Preparing,
 ): { halt: PreparedControlIdentity; success: PreparedControlIdentity } {
@@ -318,15 +309,10 @@ function readyPair(
   };
 }
 
-/**
- * The one deletion the whole runway was built for, at `r = b+4`.
- *
- * A caught allocation failure in the unlink or its parent fsync — and only
- * there — may promote the already-durable halted sibling instead. Once the M7
- * promotion is entered no lower revision is published: its failure is an
- * in-process `durability-indeterminate` block, and restart observes either the
- * old M6 or the new M7.
- */
+/** The one deletion the whole runway was built for, at `r = b+4`. A caught
+ * allocation failure in the unlink or its parent fsync — and only there — may
+ * promote the already-durable halted sibling instead. Once the M7 promotion is
+ * entered no lower revision is published. */
 export async function completeFinalItem(
   root: string, receipt: PhaseReceipt, locks: HeldStatePlaneLocks,
 ): Promise<FinalItemOutcome> {
@@ -350,12 +336,19 @@ export async function completeFinalItem(
   return promoteSuccess(root, expectOf(control), pair.success, locks);
 }
 
+/** 163:2988's block is scoped to "once the rename begins", and only a syscall
+ * failure can be on that side of it. Every check the publisher makes BEFORE
+ * renaming — the CAS, the prepared-sibling revalidation, the revision step —
+ * throws `MigrationControlError` and leaves a fully determinate state, so
+ * reporting those as `durability-indeterminate` would misdescribe them and
+ * block SQLite writes (`blocksSqliteWrites`) over nothing. They are rethrown. */
 function promoteSuccess(
   root: string, expect: PublishExpectation, success: PreparedControlIdentity, locks: HeldStatePlaneLocks,
 ): FinalItemOutcome {
   try {
     return { kind: "finished", control: promotePreparedControl(root, expect, success, locks) };
   } catch (error) {
+    if (error instanceof MigrationControlError) throw error;
     return {
       kind: "halted", durableHalt: false,
       halt: { code: "durability-indeterminate", underlyingCode: errnoOf(error), required: null, available: null },
@@ -366,11 +359,10 @@ function promoteSuccess(
 /**
  * Doctor's single-use delegation for the one halted row whose clear is a rename
  * (163:3141). There is no separate durable clear: the expected-`r+1` rename of
- * the exact M7 sibling IS the halt clear and the phase advance.
- *
- * The admission test is that this canonical control IS the halt sibling that was
- * renamed here — its inode must equal the recorded origin, and the origin path
- * must now be absent. A path match alone is never enough.
+ * the exact M7 sibling IS the halt clear and the phase advance. The admission
+ * test is that this canonical control IS the halt sibling renamed here — its
+ * inode must equal the recorded origin, and the origin path must now be absent.
+ * A path match alone is never enough.
  */
 export async function retryPromotedHalt(
   root: string, receipt: PhaseReceipt, locks: HeldStatePlaneLocks,
