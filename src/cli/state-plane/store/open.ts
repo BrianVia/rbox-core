@@ -28,6 +28,11 @@ export interface StorePragmas {
   checkpointFullfsync?: number;
 }
 
+export interface ClaimedInode {
+  readonly dev: number;
+  readonly ino: number;
+}
+
 function scalar(db: Database, pragma: string): number | string {
   const row = db.query(`PRAGMA ${pragma}`).get() as Record<string, number | string> | null;
   if (!row) throw new Error(`PRAGMA ${pragma} returned no row`);
@@ -206,25 +211,35 @@ export function stateStoreDatabase(store: StateStoreHandle): Database {
   return connection;
 }
 
-/** @internal state-plane vertical only; future installers own their transaction. */
-export function initializeStateStore(
+type ClaimStateStore = () => ClaimedInode;
+
+function namedInode(file: string): ClaimedInode | undefined {
+  try {
+    const stat = fs.lstatSync(file);
+    return { dev: stat.dev, ino: stat.ino };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+function sameClaim(left: ClaimedInode | undefined, right: ClaimedInode): boolean {
+  return left?.dev === right.dev && left.ino === right.ino;
+}
+
+function initializeClaimedStateStore(
   file: string,
+  claim: ClaimStateStore,
   install: (db: Database) => void,
 ): StateStoreHandle {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
   let db: Database | undefined;
-  let claimed = false;
+  let claimed: ClaimedInode | undefined;
   try {
-    const claim = fs.openSync(file, "wx", 0o600);
-    claimed = true;
-    try {
-      fs.closeSync(claim);
-    } catch (error) {
-      fs.rmSync(file, { force: true });
-      claimed = false;
-      throw error;
-    }
+    claimed = claim();
     db = new Database(file, { create: false, readwrite: true });
+    if (!sameClaim(namedInode(file), claimed)) {
+      throw new Error("claimed state store path changed while it was opened");
+    }
     db.exec(`PRAGMA page_size=4096; PRAGMA application_id=${STATE_STORE_SQLITE_APPLICATION_ID}; PRAGMA user_version=${STATE_STORE_SQLITE_USER_VERSION}`);
     configureWriter(db);
     applySchemaV1(db);
@@ -235,11 +250,59 @@ export function initializeStateStore(
     return new StateStoreHandle(file, false, header, pragmas, db);
   } catch (error) {
     try { db?.close(); } catch {}
-    if (claimed) {
+    if (claimed && sameClaim(namedInode(file), claimed)) {
       for (const suffix of ["", "-wal", "-shm", "-journal"]) fs.rmSync(`${file}${suffix}`, { force: true });
     }
     throw error;
   }
+}
+
+/** @internal state-plane vertical only; future installers own their transaction. */
+export function initializeStateStore(
+  file: string,
+  install: (db: Database) => void,
+): StateStoreHandle {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  return initializeClaimedStateStore(file, () => {
+    const fd = fs.openSync(file, "wx", 0o600);
+    try {
+      const stat = fs.fstatSync(fd);
+      fs.closeSync(fd);
+      return { dev: stat.dev, ino: stat.ino };
+    } catch (error) {
+      try { fs.closeSync(fd); } catch {}
+      fs.rmSync(file, { force: true });
+      throw error;
+    }
+  }, install);
+}
+
+export function adoptClaimedStateStore(
+  file: string,
+  expected: ClaimedInode,
+  install: (db: Database) => void,
+): StateStoreHandle {
+  return initializeClaimedStateStore(file, () => {
+    const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    try {
+      const opened = fs.fstatSync(fd);
+      const named = fs.lstatSync(file);
+      const exact = opened.isFile()
+        && opened.size === 0
+        && (opened.mode & 0o7777) === 0o600
+        && opened.dev === expected.dev
+        && opened.ino === expected.ino
+        && named.dev === opened.dev
+        && named.ino === opened.ino;
+      if (!exact) throw new Error("claimed state store does not match its expected inode");
+      for (const suffix of ["-wal", "-shm", "-journal"]) {
+        if (namedInode(`${file}${suffix}`)) throw new Error("claimed state store has a SQLite sidecar");
+      }
+    } finally {
+      fs.closeSync(fd);
+    }
+    return expected;
+  }, install);
 }
 
 export function createStateStore(file: string, genesis: GenesisLineage): StateStoreHandle {

@@ -4,7 +4,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { StateStoreOpenError } from "../errors.js";
-import { createStateStore, openStateStore } from "../store/open.js";
+import { installGenesisLineage } from "./application.js";
+import {
+  adoptClaimedStateStore,
+  createStateStore,
+  openStateStore,
+} from "../store/open.js";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -103,4 +108,64 @@ test("failed create removes only its own claim and every SQLite sidecar", () => 
   const before = fs.readFileSync(existing);
   expect(() => createStateStore(existing, genesis)).toThrow();
   expect(fs.readFileSync(existing)).toEqual(before);
+});
+
+test("an exact zero-byte 0600 claim is adopted through the ordinary initializer", () => {
+  const target = file();
+  fs.closeSync(fs.openSync(target, "wx", 0o600));
+  const stat = fs.lstatSync(target);
+  const adopted = adoptClaimedStateStore(target, { dev: stat.dev, ino: stat.ino }, (db) => {
+    installGenesisLineage(db, genesis);
+  });
+  expect(adopted.header).toMatchObject({
+    authority_id: genesis.authorityId,
+    active_lineage_id: genesis.lineageId,
+  });
+  adopted.close();
+  openStateStore(target, { readonly: true }).close();
+});
+
+test("adoption refusals do not delete an unowned claim", () => {
+  for (const shape of ["identity", "bytes", "mode", "sidecar"] as const) {
+    const target = file();
+    fs.closeSync(fs.openSync(target, "wx", 0o600));
+    const stat = fs.lstatSync(target);
+    if (shape === "bytes") fs.writeFileSync(target, "foreign");
+    if (shape === "mode") fs.chmodSync(target, 0o640);
+    if (shape === "sidecar") fs.writeFileSync(`${target}-wal`, "foreign");
+    const expected = shape === "identity"
+      ? { dev: stat.dev, ino: stat.ino + 1 }
+      : { dev: stat.dev, ino: stat.ino };
+    expect(() => adoptClaimedStateStore(target, expected, (db) => {
+      installGenesisLineage(db, genesis);
+    })).toThrow();
+    expect(fs.existsSync(target)).toBe(true);
+    if (shape === "sidecar") expect(fs.readFileSync(`${target}-wal`, "utf8")).toBe("foreign");
+  }
+});
+
+test("a caught adopter installer failure removes its owned main and sidecars", () => {
+  const target = file();
+  fs.closeSync(fs.openSync(target, "wx", 0o600));
+  const stat = fs.lstatSync(target);
+  expect(() => adoptClaimedStateStore(target, { dev: stat.dev, ino: stat.ino }, () => {
+    throw new Error("installer failed");
+  })).toThrow("installer failed");
+  for (const suffix of ["", "-wal", "-shm", "-journal"]) {
+    expect(fs.existsSync(`${target}${suffix}`)).toBe(false);
+  }
+});
+
+test("adopter cleanup never removes a replacement inode", () => {
+  const target = file();
+  const displaced = `${target}.owned`;
+  fs.closeSync(fs.openSync(target, "wx", 0o600));
+  const stat = fs.lstatSync(target);
+  expect(() => adoptClaimedStateStore(target, { dev: stat.dev, ino: stat.ino }, () => {
+    fs.renameSync(target, displaced);
+    fs.writeFileSync(target, "replacement", { mode: 0o600 });
+    throw new Error("after replacement");
+  })).toThrow("after replacement");
+  expect(fs.readFileSync(target, "utf8")).toBe("replacement");
+  expect(fs.existsSync(displaced)).toBe(true);
 });
