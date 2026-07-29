@@ -1,7 +1,16 @@
 # 222 — U3 implementation design: the migration unit, the `Q` flip, and the whole-state adapter
 
-> Status: **r4**, revised against the codex review of r3 (NOT-ALIGNED, 3 CRITICAL
-> + 2 HIGH + folds). §10 records the per-finding disposition.
+> Status: **r5**. Folds the codex review of r3 (NOT-ALIGNED, 3 CRITICAL + 2 HIGH)
+> and the independent adversarial validation of §2.6
+> (RATIFY-WITH-CORRECTIONS, 9 items). §10 records both dispositions.
+>
+> **Founder steer governing r5:** the copy-from-another-workspace attack
+> scenarios are low-odds, and the validation agrees — copy is blocked, stale
+> replay self-heals, races are locked out, and a same-user attacker is no worse
+> than 163's conceded baseline. So the genesis mechanism is made
+> **accident-proof, not attacker-proof**. Where a correction bought only
+> attacker-resistance, the smaller record won; §2.3.3 answers the trim question
+> explicitly and the intent lost two of its six fields.
 >
 > **What changed in r4.** r3's structural ruling — genesis is not a migration —
 > was validated and stands. Its *protocol* was unsound and is replaced: genesis
@@ -81,7 +90,7 @@ are not now.
 | `initializeStateStore` can adopt a claimed file | It opens `"wx"` and rejects an existing path | §1.1 M-5 |
 | `RepositoryFence` is a holdable handle | Callback-scoped | §3.1 |
 | `migration-write-blocked` is a `StateWriteRefusalReason` | It is not, and the error requires a file path | §1.2 A-2 |
-| `origin_kind='genesis'` is provenance | It is a `CHECK`-constrained string the candidate asserts about itself (`v1.ts:27`) | §2.6 — **withdrawn and replaced** |
+| `origin_kind='genesis'` is provenance | It is a `CHECK`-constrained string the candidate asserts about itself (`v1.ts:29`) | §2.6 — **withdrawn and replaced** |
 
 ---
 
@@ -518,6 +527,17 @@ migration control, or an exact genesis intent exists — it calls
 `genesis.establish`; otherwise `migration.runMigration`. It contains no protocol
 logic of its own.
 
+**One re-inspect, for the one outcome that changes the answer (C8).** §2.5 case 5
+is a genesis attempt that finds an `L` has appeared: it refuses `legacy-present`,
+removes its own artifacts, and retires its intent — after which the workspace is
+an ordinary migration candidate. Without a second pass, `rbox migrate` would
+return `legacy-present` and do nothing while §6.1 tells the user to run
+`rbox migrate`. So: **on `legacy-present` only**, the coordinator re-inspects
+once and dispatches to migration in the same pass, under the same held locks.
+Exactly one re-inspect; every other outcome returns directly. Any second
+`legacy-present` is impossible (the intent is gone, so genesis no longer claims
+the workspace) and would be a corruption halt rather than a third pass.
+
 **Structural gates:** `genesis.ts` imports nothing from `migration/`;
 `migration/**` imports nothing from `genesis.ts`; exactly one module imports
 both, and it is this one.
@@ -548,7 +568,7 @@ is worth stating precisely because it is the whole argument for §2.6:
 > user data, safe to sweep and retry — or **(b)** a migrated workspace whose `Q`
 > was lost — **real data, where sweeping is catastrophic**. Nothing *inside* the
 > candidate distinguishes (a) from (b): `origin_kind` is a `CHECK`-constrained
-> string the candidate asserts about itself (`v1.ts:27`), and `validateOpen`
+> string the candidate asserts about itself (`v1.ts:29`), and `validateOpen`
 > establishes structure and coherence but never that this process created the
 > DB, that its lineage matches this workspace's fenced evidence, or that
 > checkpoint/`S0`/fsync completed. A genesis DB copied from another workspace
@@ -565,7 +585,7 @@ Building at a staged path also honors 163's own wording — genesis "uses staged
 DB + `Q`" (163:2603, 163:3772) — so r3's direct-construction reading is
 withdrawn and no longer needs ratification.
 
-### 2.3 The genesis intent
+### 2.3 The genesis intent — and the trim question, answered
 
 `.rbox/state/genesis-v1.json`, owned entirely by `genesis.ts`. A closed exact
 record, **written once and never updated mid-flight**:
@@ -573,28 +593,91 @@ record, **written once and never updated mid-flight**:
 ```ts
 export interface GenesisIntent {
   version: 1;
-  attemptId: string;        // fresh hex32; scopes every path this attempt may own
-  authorityId: string;      // hex32; determines the exact 58 Q bytes
-  lineageId: string;        // hex32
-  evidence: FencedEvidence; // the workspace's fenced config/incarnation/reset evidence, bound
-  staging: { path: string; dev: number; ino: number };   // claimed BEFORE SQLite opens it
+  authorityId: string;      // hex32 — determines the 58 Q bytes, scopes every
+                            //         path this attempt may own, and is checked
+                            //         against store_meta.authority_id
+  lineageId: string;        // hex32 — checked against store_meta.active_lineage_id
+                            //         and migration_completion.migration_id
+  evidence: FencedEvidence; // §2.3.2
+  staging: { dev: number; ino: number };   // claimed BEFORE SQLite opens the file
+}
+
+/** Minimal by design (C5). Enough to notice a `.rbox` that was copied or moved
+ * between workspaces, or a workspace re-adopted since the intent was written.
+ * Nothing more — see the founder steer in §2.3.3. */
+export interface FencedEvidence {
+  root: string;             // absolute workspace root
+  stream: string;           // syncStreamId for this workspace
+  incarnation:              // `.rbox/state/state-incarnation.json`
+    | { dev: number; ino: number; sha256: string }
+    | "absent";
 }
 ```
 
-**There is no stage field, and that is the point.** The recorded inode plus four
+**There is no stage field, and no stored path.** The recorded inode plus four
 observable paths determine the case totally, because `rename(2)` preserves the
 inode — so "where is my recorded inode?" answers "how far did I get?" without a
-cursor. The intent is published once, read many times, and unlinked last.
+cursor.
 
-`attemptId` is the ownership proof for every path this attempt may create. A path
-scoped to a *different* attempt id is not ours and is never deleted — the same
-distinction the reserve protocol makes, and the reason r3's "unlink any prior
-leftover first" is deleted.
+#### 2.3.1 Paths are derived, never read from the record (C4)
 
-Publication: `O_EXCL` temp → canonical bytes → fsync → rename to
-`genesis-v1.json` → fsync `.rbox/state` → exact reread. There is never a prior
-intent to CAS against; if one exists, genesis **resumes** it and never replaces
-it.
+Both paths this attempt may own are **derived from `authorityId`**:
+
+```
+staged DB   .rbox/state/state.db.genesis.<authorityId>
+Q sibling   .rbox/state.json.genesis.<authorityId>.q
+```
+
+The record stores **no path string**, and `genesis.ts` never unlinks a path it
+read out of the record — it unlinks only paths it derived from `authorityId` and
+whose identity it independently confirmed. That removes a field *and* removes a
+delete-authorized input, which is the trade this design wants: a corrupted or
+tampered record can no longer name a victim.
+
+A path scoped to a different `authorityId` is not ours and is never touched —
+the same distinction the reserve protocol makes.
+
+#### 2.3.2 What `FencedEvidence` is for
+
+163 requires "fenced config/incarnation/reset evidence" for genesis but never
+enumerates it, and r3 left it undefined while leaning on it. It is three values,
+all cheap, all observable before the database exists: the absolute workspace
+root, the sync stream id, and the identity of the incarnation marker (or the
+literal `"absent"`, which is itself a fact worth binding).
+
+Its job is to notice **accidents**: a `.rbox` directory copied or rsynced from
+another machine, a workspace moved on disk, or a re-adopt that happened after an
+intent was written. A well-formed intent whose bound evidence differs from the
+live evidence is §2.5 case 7 — a zero-write halt that deletes nothing.
+
+#### 2.3.3 The trim question: the smallest record that still works
+
+**Question.** What is the smallest record that separates *genesis leftovers*
+(no user data, safe to sweep) from *a real workspace whose `Q` was lost* (real
+data, sweeping is catastrophic)?
+
+Applied field by field, with the founder steer — **accident-proof, not
+attacker-proof; where a field only buys attacker-resistance, drop it**:
+
+| Field | Verdict | Why |
+|---|---|---|
+| `version` | **Survives** | Strict decode of a closed record. A future version must halt, not be read leniently. One integer |
+| ~~`attemptId`~~ | **DROPPED (r5)** | Redundant. Its only jobs were scoping the two paths and distinguishing attempts. `authorityId` is already a fresh hex32 per attempt (a rebuild mints a new one, and nothing external depends on it before `Q`), so it scopes the paths itself — and scoping the Q sibling by the same id whose bytes it will contain is *stronger*, not weaker. One field and one indirection removed |
+| ~~`staging.path`~~ | **DROPPED (C4)** | Derived from `authorityId`. Removes a stored string and a delete-authorized input |
+| `authorityId` | **Survives** | Load-bearing three ways: the 58 `Q` bytes, the path scope, and the `store_meta.authority_id` equality check that makes C2's inode-reuse fix work |
+| `lineageId` | **Survives, belt-and-braces** | It is the second value the intent published *before* the database existed, and it binds both `store_meta.active_lineage_id` and `migration_completion.migration_id = 'genesis:<lineageId>'`. Honest accounting: with `authorityId` already checked, a *lineage* mismatch is reachable only at ~2⁻¹²⁸, so this is closer to attacker-resistance than accident-safety. It stays because the completion-row check (C2) names it and it costs 32 bytes — but it is the one field a reviewer could cut without weakening the accident story |
+| `evidence` | **Survives, minimally** | The only thing that catches a copied or moved `.rbox`, which is an accident a real user can produce with `cp -r`. Three values, no more |
+| `staging{dev,ino}` | **Survives** | The core ownership proof, and the thing C2's correction hardens |
+
+**Result: six fields become five**, and the record no longer contains any string
+that authorizes a deletion.
+
+**What was deliberately *not* added,** per the steer: no HMAC or signature over
+the record (buys only attacker-resistance; a same-user attacker with write access
+to `.rbox` is already conceded by 163's threat model); no monotonic counter or
+generation (races are locked out by the exclusivity window, §3); no
+staging-content hash (the DB is not final when the intent is published, so the
+hash would be of nothing).
 
 ### 2.4 The operation
 
@@ -622,60 +705,99 @@ Seven steps. No phases, no witnesses, no reserve, no retirement, no cursor.
 
 1. **Confirm no authority and no competing artifact.** `.rbox/state.json` absent
    (not `L`, not `Q`), `.rbox/state/state.db` absent, `migration-v1.json` absent,
-   and the fenced config/incarnation/reset evidence present. Otherwise refuse
-   `legacy-present` / `artifact-present` / `evidence-missing`, mutating nothing.
+   and the fenced evidence of §2.3.2 present. Otherwise refuse `legacy-present` /
+   `artifact-present` / `evidence-missing`, mutating nothing.
 2. **Claim the staged path.** `O_EXCL` no-follow create a zero-byte mode-0600
-   file at `.rbox/state/state.db.genesis.<attemptId>`; fsync it and
-   `.rbox/state`; `lstat` it. A crash here leaves a zero-byte file no intent
-   names — unowned, inert, provably not a database, and doctor-sweepable.
-3. **Publish the intent** (§2.3), recording that exact identity. Only now may
-   SQLite open anything.
-4. **Build**, via the same `adoptClaimedStateStore(file, expected, install)`
-   seam M3 uses, with `install = db => installGenesisLineage(db, lineage)` —
-   which already writes the `migration_completion` singleton last in its own
-   transaction. Then recover/checkpoint, validate, close, **require `S0`**, fsync
-   the file and `.rbox/state`.
+   file at `.rbox/state/state.db.genesis.<authorityId>`; fsync it and
+   `.rbox/state`; `lstat` it. A crash here leaves a zero-byte file no record
+   names. It is inert and provably not a database, and **nothing in U3 deletes
+   it** — it is reported, not swept (C7).
+3. **Publish the intent** (§2.3), recording that exact identity and the live
+   fenced evidence. Only now may SQLite open anything.
+4. **Build**, via `adoptClaimedStateStore(file, expected, install)` (§1.1 M-5,
+   Wave 1B — **not on `main` today**) with
+   `install = db => installGenesisLineage(db, lineage)`, which already writes the
+   `migration_completion` singleton last in its own transaction. Then
+   recover/checkpoint, validate, close, **require `S0`**, fsync the file and
+   `.rbox/state`.
 5. **Place it.** Rename the exact recorded inode from the staged path to
    `.rbox/state/state.db`; fsync `.rbox/state`.
-6. **Prepare `Q`.** Create the exact sibling at
-   `.rbox/state.json.genesis.<attemptId>.q`, write the 58 bytes derived from
+6. **Prepare `Q`.** Create the sibling at
+   `.rbox/state.json.genesis.<authorityId>.q`, write the 58 bytes derived from
    `authorityId`, fsync it and `.rbox`.
 7. **Publish `Q`.** Revalidate the fenced evidence; then, as the **literal final
    operation before `fs.rename`, with nothing between them**, re-verify that
    `.rbox/state.json` is still absent under the held `stateLockPath`. Rename the
-   sibling over `.rbox/state.json`, fsync `.rbox`, **then retire the intent
-   last** (unlink, fsync `.rbox/state`).
+   sibling over `.rbox/state.json`, fsync `.rbox`, **then retire the intent last**
+   (unlink, fsync `.rbox/state`).
 
-Step 6 before step 7 is the r3-4 fix: r3 checked absence and *then* did four
+Step 6 before step 7 is deliberate: r3 checked absence and *then* did four
 filesystem operations before renaming, leaving exactly the window the check
 exists to close.
 
-Step 7 deliberately does not use M6's `absent → building → exact` ladder. That
-ladder exists so a partially written sibling is resumable *across a durable
-control record's recorded disposition*. Genesis records no disposition: on
-restart the sibling is at an `attemptId`-scoped path this intent owns, so it is
-simply rewritten from offset zero and truncated to 58 bytes. Owned, not
-discovered.
+Step 7 does not use M6's `absent → building → exact` ladder. That ladder makes a
+partially written sibling resumable across a control record's recorded
+disposition. Genesis records no disposition: the sibling sits at a path derived
+from `authorityId`, which this intent owns, so it is rewritten from offset zero
+and truncated to 58 bytes. Owned, not discovered.
 
-### 2.5 Crash images — exhaustive, and each with one legal action
+### 2.5 The finishing predicate, and the crash images
 
-With an intent present, observe `state.json`, the staged path, the active path,
-and the sibling path. Every image is one of:
+#### 2.5.1 The finishing predicate (C2 — the real hazard)
+
+**Before any finishing action, an inode match is not sufficient.** `dev`/`ino`
+pairs are recycled by the filesystem, and this design creates the exact
+conditions for it: §2.5 case 3 truncates the recorded inode, and *migration*
+stages its own database in the **same directory** and renames it onto
+`.rbox/state/state.db`. A recycled inode could therefore land at the active path
+holding **real user data**, satisfy an inode-only test, and cause `Q` to be
+published from `intent.authorityId` — whose id would not match the database,
+turning a healthy migrated workspace into a permanent
+`StateAuthorityCorruptError`.
+
+So the predicate is a **conjunction**. A database is this intent's genesis
+database only if **all** of the following hold:
+
+| Check | Value |
+|---|---|
+| identity | the file's no-follow `{dev, ino}` equals `intent.staging` |
+| opens cleanly | `validateOpen` succeeds |
+| authority | `store_meta.authority_id === intent.authorityId` |
+| lineage | `store_meta.active_lineage_id === intent.lineageId` |
+| origin | a `migration_completion` singleton with `origin_kind = 'genesis'` |
+| binding | that row's `migration_id === 'genesis:' + intent.lineageId` |
+| emptiness | that row's `entry_count = 0` and `repo_count = 0` |
+| evidence | `intent.evidence` equals the live fenced evidence |
+
+Any failure is a **zero-write halt**: nothing is adopted, nothing is deleted, no
+`Q` is published.
+
+**This is not the withdrawn proposal.** Every one of `authority_id`,
+`active_lineage_id`, `migration_id`, `origin_kind`, `entry_count`, and
+`repo_count` is written by the **already-merged** `installGenesisLineage`
+(`schema/application.ts:25-86`, completion row at `:67`, `migration_id` composed
+as `` `genesis:${lineageId}` `` at `:72`) **from values this intent published to
+disk before the database existed**. The database is not asserting something about
+itself; it is being checked against a record that predates it. That is the whole
+difference between r3's withdrawn rule and this one.
+
+#### 2.5.2 Crash images — exhaustive, one legal action each
 
 | # | Observation | Only legal action |
 |---|---|---|
-| 1 | `Q` matching `authorityId` + active path holds the recorded inode + complete DB | **Terminal.** Retry the (idempotent) `.rbox` fsync, remove the sibling if present, retire the intent. **Writes stay blocked until the intent is retired** (A-2 fence) — this is the image r3 collapsed into "terminal" and codex finding 3 caught |
-| 2 | `state.json` absent + active path holds the recorded inode | Recover/checkpoint, fully validate, close, require `S0`, fsync DB and parent — **all of it, not just steps 6–7** (codex finding 2) — then steps 6 and 7 |
-| 3 | `state.json` absent + staged path holds the recorded inode + active absent | Open as owner via the recorded identity. If complete: checkpoint/validate/close/`S0`/fsync, then step 5 onward. If **incomplete** (no `migration_completion` singleton): it is provably ours by recorded inode, so remove it and its own sidecars and rebuild from step 4 |
-| 4 | `state.json` absent + the recorded inode is at neither path, both absent | Nothing durable happened after the intent. Rebuild from step 2 under a **fresh** `attemptId` (new intent published after the new claim; the old intent is unlinked only after the new one is durable) |
-| 5 | `state.json` is `L` | **Refuse `legacy-present`.** JSON is authority. Remove only our own recorded artifacts, then retire the intent |
-| 6 | Anything else — a foreign inode at either path, an unrecorded file at the active path, `Q` with a non-matching authority id, a malformed intent | **Zero-write halt.** Never adopt, never delete |
+| 1 | `Q` matching `authorityId` + active path satisfies §2.5.1 | **Terminal.** Retry the (idempotent) `.rbox` fsync, remove the sibling if present, retire the intent. **Writes stay blocked until the intent is retired** (A-2 fence) |
+| 2 | `state.json` absent + active path satisfies §2.5.1 | Recover/checkpoint, fully validate, close, require `S0`, fsync DB and parent — **all of it**, then steps 6 and 7 |
+| 3 | `state.json` absent + active absent + staged path holds the recorded inode | Open it. If it satisfies §2.5.1: checkpoint/validate/close/`S0`/fsync, then step 5 onward. If it **does not open cleanly through `validateOpen` as a genesis store bound to this intent** (C9 — `installGenesisLineage` runs in one transaction, so "committed but not genesis-shaped" is not a reachable state; the reachable failure is a partial or unopenable file): **`ftruncate` the recorded inode to zero in place** (C3 — this preserves the inode, so the next crash still reads case 3 rather than case 6), remove only its `-wal`/`-shm`/`-journal` sidecars, and rebuild from step 4 through the same adopter, whose precondition is exactly a zero-byte claimed file |
+| 4 | `state.json` absent + the recorded inode is at neither path, both absent | Nothing durable happened after the intent. Rebuild from step 2 under a **fresh** `authorityId`; the new intent is published before the old one is unlinked |
+| 5 | `state.json` is `L` | **Refuse `legacy-present`.** JSON is authority. Remove only our own confirmed artifacts, retire the intent — and the coordinator then re-inspects once and dispatches to migration in the same pass (§1.3, C8) |
+| 6 | A foreign inode at either path, an unrecorded file at the active path, `Q` with a non-matching authority id, a malformed intent, or any §2.5.1 check failing | **Zero-write halt.** Never adopt, never delete |
+| 7 | A well-formed intent whose bound `evidence` differs from the live fenced evidence | **Zero-write halt** (C5). This is a copied, moved, or re-adopted workspace. Delete nothing — the artifacts may belong to the workspace this `.rbox` came from |
 
 **No intent present** is the ordinary world: `absent/absent/absent` → genesis may
 begin; anything else → 163's existing rows, unchanged, including the
-ambiguous-halt row that protects case (b) above.
+ambiguous-halt row that protects a migrated workspace whose `Q` was lost.
 
-### 2.6 §2.6 — THE AMENDMENT TO 163, FOR RATIFICATION
+### 2.6 THE AMENDMENT TO 163, FOR RATIFICATION
 
 *(This is the text going to the founder. r3's `origin_kind`-keyed proposal is
 withdrawn in full.)*
@@ -694,57 +816,72 @@ individually correct and jointly unimplementable:
 ```
 
 The first authorizes genesis. The second halts on the only intermediate state
-genesis can produce, because an active DB and `Q` cannot be published atomically.
-Genesis therefore cannot complete a crash-safe run under the matrix as written.
+genesis can produce, because an active database and `Q` cannot be published
+atomically. Genesis therefore cannot complete a crash-safe run under the matrix
+as written.
 
-**Why a witness is required rather than a cleverer read of the DB.** An active DB
-with no `Q` is either **(a)** genesis leftovers — no user data, safe to sweep and
-retry — or **(b)** a migrated workspace whose `Q` was lost — real data, where
-sweeping is catastrophic. Nothing inside the candidate distinguishes them:
-`origin_kind` is a `CHECK`-constrained string the candidate asserts about itself
-(`schema/v1.ts:27`), and `validateOpen` (`schema/validate-open.ts`) establishes
-application id, schema version, DDL fingerprint, required objects, and
-singleton/head coherence — but never that this process created the DB, never that
-its lineage matches this workspace's fenced evidence, and never that
-checkpoint/`S0`/fsync completed. A valid genesis DB **copied from another
-workspace** would satisfy any `origin_kind`-keyed rule and cause `Q` to be
-published from the copy's authority id. That is a real capability expansion and
-the ambiguous row is what currently prevents it.
+**Why a witness is required rather than a cleverer read of the database.** An
+active database with no `Q` is either **(a)** genesis leftovers — no user data,
+safe to sweep and retry — or **(b)** a migrated workspace whose `Q` was lost —
+real data, where sweeping is catastrophic. Nothing inside the candidate
+distinguishes them: `origin_kind` is a `CHECK`-constrained string the candidate
+asserts about itself (`schema/v1.ts:29`), and `validateOpen`
+(`schema/validate-open.ts`) establishes application id, schema version, DDL
+fingerprint, required objects, and singleton/head coherence — but never that this
+process created the database, never that it belongs to this workspace, and never
+that checkpoint/`S0`/fsync completed. An earlier draft of this amendment keyed
+the new rows on `origin_kind` alone; that was withdrawn because a valid genesis
+database **copied from another workspace** would satisfy it and cause `Q` to be
+published from the copy's authority id.
 
 **Amendment.** Introduce one durable artifact, the **genesis intent**
 (`.rbox/state/genesis-v1.json`, design 222 §2.3): a closed exact record binding
-this workspace's fenced evidence, an attempt id, the authority id, the lineage
-id, and the `{path, dev, ino}` identity of the staged database file — published
-**before** SQLite opens that file and unlinked **last**, after `Q`. It is owned
-solely by `state-plane/genesis.ts`. It is not a migration control, carries no
-phase, and no migration module reads or writes it.
+this workspace's fenced evidence, the authority id, the lineage id, and the
+`{dev, ino}` identity of the staged database file — published **before** SQLite
+opens that file and unlinked **last**, after `Q`. It stores no path (both paths
+are derived from the authority id) and therefore names no deletion target. It is
+owned solely by `state-plane/genesis.ts`. It is not a migration control, carries
+no phase, and no migration module reads or writes it.
 
 163's M0 authority matrix gains **two rows**, both keyed on the intent:
 
 ```
-| Legacy path | Active DB                        | Control                     | Authority and M0 action |
+| Legacy path | Active DB                          | Control                   | Authority and M0 action |
 |---|---|---|---|
-| absent | absent, or exactly the database whose | migration control absent    | Genesis in progress. Only the genesis
-|        | `{dev,ino}` identity the exact        | AND an exact genesis intent | recorded-identity correlation of design
-|        | genesis intent records                | present                     | 222 §2.5 may act. No migration phase is
-|        |                                       |                             | inferred and no migration artifact is
-|        |                                       |                             | created. No authority until `Q`.        |
-| exact  | matching `C`                          | migration control absent    | Genesis finish-ahead past the authority
-| `Q`    |                                       | AND an exact genesis intent | rename. SQLite authority; **writes are
-|        |                                       | present                     | blocked** until the parent fsync
-|        |                                       |                             | completes and the intent is retired.    |
+| absent | absent, or exactly the database that    | migration control absent  | Genesis in progress. Only the genesis
+|        | satisfies design 222 §2.5.1 against     | AND an exact genesis      | recorded-identity correlation of design
+|        | this intent — the recorded {dev,ino},   | intent whose bound fenced | 222 §2.5.2 may act. No migration phase
+|        | `store_meta.authority_id`, `store_meta. | evidence equals this      | is inferred and no migration artifact is
+|        | active_lineage_id`, and a genesis       | workspace's current       | created. No authority until `Q`.
+|        | `migration_completion` singleton whose  | fenced evidence, and      |
+|        | `migration_id` is `genesis:<lineageId>` | which records that exact  |
+|        | with `entry_count = repo_count = 0`     | {dev,ino} identity        |                                        |
+| exact  | matching `C`, whose `authority_id`      | same as above, and the    | Genesis finish-ahead past the authority
+| `Q`    | equals the intent's authority id and    | intent's authority id     | rename. SQLite authority; **writes are
+|        | the `Q` bytes                           | equals the `Q` authority  | blocked** until the parent fsync
+|        |                                         | id                        | completes and the intent is retired.    |
 ```
+
+**Every value in those checks was written by already-merged code from values the
+intent published before the database existed.** `installGenesisLineage`
+(`schema/application.ts:25-86`) writes `store_meta.authority_id`,
+`store_meta.active_lineage_id`, and the `migration_completion` singleton —
+including `migration_id = 'genesis:' + lineageId` (`:72`) and the zero counts —
+last in its own transaction, from the caller's values. The database is never
+asserting something about itself; it is checked against a record that predates
+it. That distinction is the reason this amendment is safe where the withdrawn
+one was not.
 
 **What is explicitly NOT changing:**
 
 - The **ambiguous/manual-damage row is unchanged** and still fires for any
-  database at the active path when there is **no** exact genesis intent naming
-  that exact inode. Case (b) — a migrated workspace whose `Q` was lost — still
+  database at the active path when there is no exact genesis intent satisfying
+  the full conjunction above. A migrated workspace whose `Q` was lost still
   halts, exactly as today.
 - **"DB presence never elects authority" is preserved verbatim.** Presence still
-  elects nothing. The intent — a separate, durable, provenance-bound artifact
-  published before the database existed — is what authorizes the finishing
-  action, and the database must match the identity the intent recorded.
+  elects nothing. The intent — a separate, durable artifact published before the
+  database existed — is what authorizes the finishing action, and the database
+  must satisfy every check the intent implies.
 - The genesis row at 163:2603 keeps its wording, including "**uses staged DB +
   Q**", which design 222 §2.4 now honors literally. No second interpretation of
   that phrase is requested.
@@ -752,10 +889,33 @@ phase, and no migration module reads or writes it.
   a migration control and never becomes one.
 - The `Q` predicate, the barrier, the last-writer witness, the reserve, and
   F1–F6 are untouched.
+- **Doctor gains no new deletion authority.** Genesis artifacts are reported, not
+  swept. Nothing in U3 deletes an unowned zero-byte staged file, a stranded `Q`
+  sibling, or a database at a path scoped to a different authority id.
 
-**Blast radius.** One new artifact, two new matrix rows, one new refusal family,
-and one added condition in the state-plane write fence. No migration code path
-observes any of it.
+**What this does add, stated so it is not discovered later:**
+
+- one durable artifact (`.rbox/state/genesis-v1.json`) and one new named member
+  of the `.rbox/state/` namespace inventory, plus the two derived paths
+  `state.db.genesis.<authorityId>` and `state.json.genesis.<authorityId>.q`;
+- **one new condition in the state-plane write fence**: an unretired genesis
+  intent blocks SQLite writes, alongside the existing migration-control
+  condition. Both surface as the single refusal reason
+  `authority-recovery-pending`;
+- **three new refusal codes** — `legacy-present`, `artifact-present`,
+  `evidence-missing` — each with plain-English doctor copy and a
+  non-interactive twin (design 222 §6.1);
+- **one prerequisite that does not exist on `main` today**: step 4 needs
+  `adoptClaimedStateStore(file, expected, install)`, because the merged
+  `initializeStateStore` opens `"wx"` and rejects an existing path
+  (`store/open.ts:218`). It is a Wave 1B deliverable and is also required by
+  migration's M3. **This amendment is therefore not implementable against
+  today's `main`** — ratifying it authorizes the design, not an immediate
+  landing.
+
+**Blast radius.** One new artifact, two new matrix rows, three refusal codes,
+one added write-fence condition, and one new store-open variant. No migration
+code path observes any of it.
 
 ---
 
@@ -908,7 +1068,7 @@ pre-published.
 | terminal absent control + exact `Q` | Ordinary SQLite startup. `rbox migrate` here is `already-migrated`, exit 0, zero mutation | SQLite |
 | foreign/malformed/inconsistent control or artifacts | Zero-write corruption halt | Existing `L`/`Q` predicate only |
 | exact `Q` + absent/incomplete/foreign/wrong-id DB | Hard `StateAuthorityCorruptError`, zero repair. Not a halt, not retryable | Contradictory |
-| **the two genesis-intent rows** | §2.6. Owned by `genesis.ts`; no migration module reads them | None until `Q` |
+| **the two genesis-intent rows** | §2.6. Owned by `genesis.ts`; keyed on the full §2.5.1 conjunction, not on a field inside the candidate; no migration module reads them | None until `Q` |
 
 ### 5.4 Global rules
 
@@ -997,11 +1157,11 @@ English past 5 s per phase, with a structured `--json` twin.
 | **F5** | Signed 1.10.x, `forceLegacy`, rename inside M6's `check → rename` microwindow — driven by the `onStep` `"before-rename"` seam (`fsutil.ts:46`), **not by sleeping** | After M7: `state.json` is `Q`; DB and both backups carry the older digest; the writer's document absent from every artifact; doctor emits **no anomaly** | Companion: released one window earlier → M6 refuses `legacy-write-detected`, no rename, JSON authoritative |
 | **F6** | F5 extended through the post-flip pull against remote `B1` after reverting to `B0` | Documented silent overwrite: ordinary `write`, no conflict copy, no anomaly | — |
 | **G1** | Full genesis on a throwaway workspace | `Q` + matching DB + intent retired + **no migration artifact of any kind** (namespace-inventory assertion) | — |
-| **G2** | SIGKILL at each of §2.5's cases 2, 3-complete, 3-incomplete, and 4 | Each resumes to a `Q` byte-identical to the uninterrupted run; case 3-incomplete rebuilds; case 4 re-attempts under a fresh id | — |
+| **G2** | SIGKILL at each of §2.5.2's cases 2, 3-clean, 3-unopenable, and 4 | Each resumes to a `Q` byte-identical to the uninterrupted run. **Case 3-unopenable additionally asserts the staged path still holds the RECORDED inode after recovery** (C3 — `ftruncate` in place, not unlink), so a second kill reads case 3 again and never case 6; case 4 re-attempts under a fresh authority id | Replace the in-place truncate with an unlink → the second kill must demonstrably halt a workspace with nothing wrong |
 | **G3** | An `L` published in the window **between step 6's sibling fsync and step 7's rename** — driven by the same deterministic seam, not by sleeping | Refuse `legacy-present`; **rename nothing**; `L` byte-identical; intent retired; own artifacts removed | With the check moved back before step 6 (r3's ordering), the same fixture must demonstrably overwrite `L` |
 | **G4** | Kill after step 7's rename, before the `.rbox` fsync | §2.5 case 1: an intent survives with `Q` present. **A restarted daemon's write is refused** with `authority-recovery-pending`; recovery fsyncs, retires the intent, and writes then flow | Fence condition removed → the write lands |
 | **G5** | A **complete genesis DB copied from another workspace** placed at the active path, no intent | 163's ambiguous row: **halt, zero writes, no `Q` published** | With r3's `origin_kind`-keyed rule, the same fixture publishes `Q` from the copy's authority id — the capability expansion this fixture exists to prevent |
-| **G6** | A leftover zero-byte staged file, or a `Q` sibling, at a **different** attempt id's path | Never deleted, never adopted; reported by doctor as an inert artifact | — |
+| **G6** | A leftover zero-byte staged file, or a `Q` sibling, at a path scoped to a **different authority id**; and a well-formed intent whose bound evidence differs from the live evidence (case 7) | Never deleted, never adopted, no `Q` published; reported by doctor as an inert artifact. **U3 grants no deletion authority over any of them** | — |
 
 F5/F6 assert **silence**; G5 asserts a **refusal**. One comment line each says so.
 
@@ -1104,7 +1264,9 @@ dated and re-checked before the 2.0 tag.
 - The canonical control file is written only by `control-publication.ts`,
   including both prepared-sibling promotions, which share one private primitive.
 - The genesis intent is written only by `genesis.ts`; `readGenesisIntent` is its
-  only exported reader and A-2 its only production consumer.
+  only exported reader and A-2 its only production consumer. It stores no path,
+  and `genesis.ts` never unlinks a path read from it — only paths derived from
+  `authorityId` whose identity it independently confirmed.
 - No production `StateSavePacket` carries `authority.kind === "migration"`.
 - `legacy-writer-live` and paired-interval sampling appear nowhere in `src/`.
 - Every file ≤400 lines / 25 KiB; 301–399 carries a review note.
@@ -1128,7 +1290,7 @@ tests; other lanes propose their one-line entries in the PR body.
 |---|---|---|
 | **1A** | M-1 + M-2 (one lane — M-2 depends on M-1's exact canonical schema). Codec, `C1Trigger`, `blocksSqliteWrites`, the shared `replaceCanonicalControl`, `promotePreparedControl` with pre-rename revalidation, `publishMigrationHalt`'s discriminated result, `readCanonicalControl`, **all migration + genesis path constructors into `paths.ts`**, **`StateAuthorityCorruptError` + the `authority-recovery-pending` refusal reason into `errors.ts`**, and the initial `MigrationHaltCode` union + `MIGRATION_HALT_COPY` | **opus** |
 | **1B** | `store/open.ts::adoptClaimedStateStore(file, expected, install)` + A-1 `adapters/sqlite-state-save.ts` + write-path differential tests. **Lands before 1C and 3A, which both consume the adopter** | codex |
-| **1C** | **Genesis** — `genesis.ts`, the intent, the seven steps, §2.5's six images, G1–G6, and the §2.6 rows applied to the classifier's *documentation* (not its code — the classifier has no genesis row). Depends on 1B | **opus** |
+| **1C** | **Genesis** — `genesis.ts`, the five-field intent, the seven steps, the §2.5.1 finishing conjunction, §2.5.2's seven images, G1–G6, and the §2.6 rows applied to the classifier's *documentation* (not its code — the classifier has no genesis row). Depends on 1B for `adoptClaimedStateStore` | **opus** |
 
 ### Wave 2 — observation, admission, compat, coordinator (4 lanes)
 
@@ -1176,31 +1338,40 @@ final serial review** → merge to `2.0` → dual-binary differential against si
    promoted-halt retry whose clear is a rename.
 2. **Per-mutator revalidation.** Easy to state, easy to lose in one refactor.
    Enforced by the branded `PhaseReceipt`, not by discipline.
-3. **The genesis intent is new durable state on the authority path.** It is
+3. **Inode reuse around the genesis staged path.** The sharpest hazard the
+   independent validation found, and the reason §2.5.1 is a conjunction rather
+   than an inode test: `dev`/`ino` pairs are recycled, genesis truncates a
+   recorded inode in case 3, and *migration* stages its database in the same
+   directory and renames it onto the active path. Without the authority/lineage/
+   completion checks a recycled inode carrying real user data could satisfy an
+   inode-only match and turn a healthy workspace into a permanent
+   `StateAuthorityCorruptError`. Mitigated by the conjunction and by C3's
+   in-place truncate; G2's negative control keeps both honest.
+4. **The genesis intent is new durable state on the authority path.** It is
    small, single-writer, and never updated mid-flight — but it is one more thing
    that can be foreign, malformed, or stranded. G5 and G6 exist to keep its
    fail-closed behavior honest, and the §2.6 ratification is what makes it
    legitimate rather than invented.
-4. **`adoptClaimedStateStore` changes a merged, load-bearing initializer** and is
+5. **`adoptClaimedStateStore` changes a merged, load-bearing initializer** and is
    now consumed by two callers (M3 and genesis). Mitigated by one private shared
    body and crash coverage on both callers.
-5. **`whole-state-compat.ts` — top performance/compatibility risk, not top safety
+6. **`whole-state-compat.ts` — top performance/compatibility risk, not top safety
    risk.** If §7.5 fails: tune the page cache, pull U4's cursor conversion
    forward for `status` only, or **do not ship the flip** — the third stays on
    the table per the revert rule.
-6. **F5/F6 assertion maintenance.** Not a leading implementation risk.
-7. **~3,550 production lines** (2,620 migration + 240 genesis + 90 coordinator +
+7. **F5/F6 assertion maintenance.** Not a leading implementation risk.
+8. **~3,550 production lines** (2,620 migration + 240 genesis + 90 coordinator +
    600 adapters) of one-way, unrevertible-after-`Q` fail-closed surface.
 
 ---
 
-## 10. Disposition of the r3 review
+## 10. Disposition of the r3 review and the §2.6 validation
 
 | # | Finding | Disposition |
 |---|---|---|
-| 1 | CRITICAL — an incomplete active DB is reachable with no durable owner | **Folded by construction.** Genesis now builds at an `attemptId`-scoped **staged** path and renames to active only after the DB is proven complete and durable (§2.4 steps 2–5). An incomplete DB at the active path is unreachable, so no rule needs to authorize deleting one. The staged file is owned by the intent's recorded `{dev,ino}`; before the intent is durable it is a zero-byte file no record names — inert, provably not a database, doctor-swept, never adopted |
-| 2 | CRITICAL — logical completion is not physical durability | **Folded.** §2.5 case 2 and case 3-complete require the full recover/checkpoint/validate/close/require-`S0`/fsync sequence before approaching `Q`. r3's "derive and publish `Q`, no other action" is deleted |
-| 3 | CRITICAL — the post-rename/pre-fsync image is indistinguishable from terminal | **Folded.** §2.5 case 1 is now a distinct image with its own action, and the surviving intent is what makes it observable. A-2's write fence blocks writes while an unretired intent exists with `Q` present — the analogue of migration's `M5+Q` block. G4 tests it with a negative control |
+| 1 | CRITICAL — an incomplete active DB is reachable with no durable owner | **Folded by construction.** Genesis builds at an authority-id-scoped **staged** path and renames to active only after the DB is proven complete and durable (§2.4 steps 2–5). An incomplete DB at the active path is unreachable, so no rule needs to authorize deleting one. The staged file is owned by the intent's recorded `{dev,ino}`; before the intent is durable it is a zero-byte file no record names — inert, provably not a database, **reported and never deleted** (C7) |
+| 2 | CRITICAL — logical completion is not physical durability | **Folded.** §2.5.2 cases 2 and 3-clean require the full recover/checkpoint/validate/close/require-`S0`/fsync sequence before approaching `Q`. r3's "derive and publish `Q`, no other action" is deleted |
+| 3 | CRITICAL — the post-rename/pre-fsync image is indistinguishable from terminal | **Folded.** §2.5.2 case 1 is a distinct image with its own action, and the surviving intent is what makes it observable. A-2's write fence blocks writes while an unretired intent exists with `Q` present — the analogue of migration's `M5+Q` block. G4 tests it with a negative control |
 | 4 | HIGH — the absence check is not immediately before the rename | **Folded.** The sibling is prepared and fsynced in step 6; the legacy-absence re-check is the **literal final operation** before step 7's rename. G3 now injects `L` in that exact window and carries a negative control that reproduces r3's overwrite. "Unlink any prior leftover first" is **deleted** — an attempt-scoped path is owned, a foreign one is never touched, matching the reserve protocol's distinction |
 | 5 | HIGH — the module boundary is declared but not enforced | **Folded.** `genesis-candidate` and `genesis-finish-ahead` are removed from `migration/classifier.ts`; the genesis outcome and dispatch are removed from `migration/authority.ts`; a 90-line coordinator outside both domains (§1.3) classifies and routes. Structural gates in §7.9 assert neither domain imports the other and exactly one module imports both. **The "Wave 1B ships first" claim is deleted** — the checkpoint moves to Wave 5C (§2.7, §7.7) because it needs the coordinator, an entry point, and A-2 |
 | §2.5 amendment | Not sufficient or safe | **Withdrawn in full and replaced.** §2.6 keys the new rows on the durable, provenance-bound genesis intent instead of on `origin_kind`. G5 is the fixture that pins the difference: a genesis DB copied from another workspace must **halt**, and under r3's rule it would have published `Q` |
@@ -1210,6 +1381,28 @@ final serial review** → merge to `2.0` → dual-binary differential against si
 | `GenesisOutcome` codes vs copy table | Only `legacy-present` had copy | **Folded.** `artifact-present` and `evidence-missing` now have full human + machine entries (§6.1) |
 | Stale prerequisite section | `origin/main` is `e1cd0b26`; #574 merged | **Folded.** Rebased. §0.2's blocker and Gate 0's T0.1 condition are **deleted**; §0.1 records the merge and what it provides. Verified: `gh pr view 574` → `MERGED`, and `migration/base-proof.ts`, `migration/import-stage.ts`, `withMigrationImporter` are all present |
 | "§2.5 is the only normative divergence" | Overclaimed | **Deleted.** §2.6 now enumerates precisely what changes and what does not, and the staged-DB reading removes the second divergence rather than asserting it away |
+
+### Disposition of the independent §2.6 validation (RATIFY-WITH-CORRECTIONS, 9 items)
+
+Founder steer applied throughout: the copy-from-another-workspace scenarios are
+low-odds and the validation agrees copy is blocked, stale replay self-heals,
+races are locked out, and a same-user attacker is no worse than 163's conceded
+baseline. **The mechanism is made accident-proof, not attacker-proof.** Where a
+correction bought only attacker-resistance, the smaller record won.
+
+| # | Correction | Disposition |
+|---|---|---|
+| **C1** | Both new rows underspecify "an exact genesis intent" | **Folded.** Both rows now read "whose bound fenced evidence equals this workspace's current fenced evidence, and which records that exact `{dev,ino}` identity"; row 2 adds the authority-id equality against both the database and the `Q` bytes |
+| **C2** | **The real hazard — `dev`/`ino` reuse.** Case 3 truncates the recorded inode while the intent still names it, and migration stages in the same directory and renames onto the active path, so a recycled inode can land at `state.db` holding real user data → case 2 fires → `Q` published from `intent.authorityId` → permanent `StateAuthorityCorruptError` | **Folded completely** (§2.5.1). The finishing predicate is a conjunction: recorded `{dev,ino}`, `validateOpen`, `store_meta.authority_id === intent.authorityId`, `store_meta.active_lineage_id === intent.lineageId`, a `migration_completion` singleton with `origin_kind='genesis'`, `migration_id === 'genesis:' + lineageId`, and `entry_count = repo_count = 0`. §2.5.1 and §2.6 both state explicitly that **every one of those values is written by the already-merged `installGenesisLineage` from values the intent published to disk before the database existed** — so no reviewer mistakes it for the withdrawn self-assertion proposal |
+| **C3** | Case 3's own remedy broke the no-stage-field claim: unlinking the recorded inode makes the next crash read case 6 and halt a healthy workspace | **Folded, preferred fix taken.** `ftruncate` the recorded inode to **zero in place** (preserving the inode), remove only its `-wal`/`-shm`/`-journal` sidecars, rebuild from step 4 through the same adopter — whose precondition is exactly a zero-byte claimed file. G2 now asserts the staged path still holds the recorded inode after recovery, with a negative control that reproduces the false halt |
+| **C4** | Derive the staged path; do not store a path string | **Folded as a simplification** (§2.3.1). Both paths derive from `authorityId`; the record stores no path; `genesis.ts` never unlinks a path read from the record. Removes a field *and* a delete-authorized input |
+| **C5** | `FencedEvidence` was undefined while carrying the copy-detection argument | **Folded minimally** per the steer (§2.3.2): absolute workspace root, stream id, incarnation-marker identity or `"absent"`. Nothing more. Case 7 added: well-formed intent, evidence ≠ live evidence → zero-write halt, delete nothing |
+| **C6** | Citation `v1.ts:27` → `:29` | **Folded** in §2.2 and §2.6. Verified: `origin_kind … CHECK(origin_kind IN ('migration','genesis'))` is line 29 |
+| **C7** | "doctor-sweepable" grants deletion authority the design does not want | **Folded.** Deleted from §2.4 step 2 (now "reported, not swept"). The NOT-changing list gains "**doctor gains no new deletion authority**", and a new "what this does add" list discloses the write fence's new condition and the three refusal codes |
+| **C8** | **Real UX bug** — after case-5 retirement, `rbox migrate` returns `legacy-present` and does nothing while §6.1 tells the user to run `rbox migrate` | **Folded** (§1.3). On `legacy-present` **only**, the coordinator re-inspects once and dispatches to migration in the same pass under the same held locks. Exactly one re-inspect; a second `legacy-present` is unreachable and would be a corruption halt |
+| **C9** | Case 3's test was unreachable — `installGenesisLineage` writes everything in one transaction | **Folded.** Reworded to "does not open cleanly through `validateOpen` as a genesis store bound to this intent", with the reachable failure named (partial or unopenable file) |
+| — | Disclose that step 4 needs `adoptClaimedStateStore`, not on `main` | **Folded into §2.6 itself**, in the new "what this does add" list: the merged `initializeStateStore` opens `"wx"` and rejects an existing path (`store/open.ts:218`), so **the amendment is not implementable against today's `main`** — ratifying it authorizes the design, not an immediate landing. It is a Wave 1B deliverable that migration's M3 also needs |
+| — | The trim question | **Answered in the doc** (§2.3.3), field by field, with the drop rationale. Six fields become five: `attemptId` and `staging.path` are gone; `version`, `authorityId`, `lineageId`, `evidence`, `staging{dev,ino}` survive. `lineageId` is flagged honestly as the one belt-and-braces field a reviewer could cut without weakening the accident story |
 
 ### Deletions r3 asked for, all taken
 
@@ -1223,6 +1416,6 @@ exclusivity assertion about §2.5.
 
 Every r3 finding was verified against the checkout before folding.
 `initializeStateStore`'s `"wx"` and catch-only cleanup, `validateOpen`'s scope,
-`v1.ts:27`'s `CHECK`, `installGenesisLineage`'s completion insert,
+`v1.ts:29`'s `CHECK`, `installGenesisLineage`'s completion insert,
 `withRepositoryRecoveryFence`'s callback shape, `upgrade-cmd.ts`'s single `try`,
 and #574's merge all check out as codex describes them.
