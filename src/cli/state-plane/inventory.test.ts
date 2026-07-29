@@ -73,6 +73,14 @@ const ENTRY_POINTS: readonly EntryPoint[] = [
   { file: "src/cli/reset-quarantine.ts", symbol: "restoreResetQuarantineUnderFence", kind: "reset", sites: 1, guards: ["assertStateReadable"] },
   { file: "src/cli/reset-journal-doctor.ts", symbol: "withResetJournalDoctorFence", kind: "reset", sites: 5, guards: ["classifyStateFormat", "assertStateReadable"] },
   { file: "src/cli/reset-journal-doctor.ts", symbol: "quarantineStandingJournal", kind: "reset", sites: 4, guards: ["withResetJournalDoctorFence"] },
+
+  // Genesis (design 222 §2) — the only writer that publishes `Q` rather than a
+  // legacy document. It never replaces an existing document: every path here
+  // classifies first, and `finishWithQ` renames only over a re-confirmed absence.
+  { file: "src/cli/state-plane/genesis.ts", symbol: "inspect", kind: "read", sites: 1, guards: ["classifyStateFormat"] },
+  { file: "src/cli/state-plane/genesis.ts", symbol: "eligibility", kind: "read", sites: 1, guards: ["classifyStateFormat"] },
+  { file: "src/cli/state-plane/genesis.ts", symbol: "resume", kind: "read", sites: 2, guards: ["classifyStateFormat", "holdsMarkerFor"] },
+  { file: "src/cli/state-plane/genesis.ts", symbol: "finishWithQ", kind: "write", sites: 2, guards: ["classifyStateFormat", "fsp.rename"] },
 ];
 
 /** Access sites that neither read nor replace the document's contents. Each
@@ -222,6 +230,26 @@ describe("state barrier pinning inventory", () => {
     expect(stateParentSyncIndex).toBeGreaterThan(renameIndex);
     expect(calls[stateParentSyncIndex]?.arguments?.[0]).toBe("activeParent");
     expectOrderedCalls(file, owner, ["fs.rename", "fsyncDirectory", "recordLastWriterWitness"]);
+  });
+
+  // 222 §2.4: a resume that rebuilt from step 4 with caller-supplied ids would
+  // install values §2.5.1 can never satisfy, live-locking a HEALTHY workspace
+  // into a permanent halt on every retry. The intent is the sole source.
+  test("installGenesisLineage's only genesis caller derives its ids from the intent", async () => {
+    const genesis = await fs.readFile(path.join(REPO, "src/cli/state-plane/genesis.ts"), "utf8");
+
+    expect(genesis.split("installGenesisLineage(").length - 1, "genesis.ts must install a lineage exactly once").toBe(1);
+    const call = genesis.slice(genesis.indexOf("installGenesisLineage("));
+    const argument = call.slice(0, call.indexOf("})") + 1);
+    for (const binding of ["stream: intent.evidence.stream", "authorityId: intent.authorityId", "lineageId: intent.lineageId"]) {
+      expect(argument, `the installed lineage must come from the intent, not a caller: ${binding}`).toContain(binding);
+    }
+
+    expect(genesis.split("mintIds()").length - 1, "the id thunk must be called from exactly one place").toBe(1);
+    expect(
+      genesis.slice(genesis.indexOf("async function resume(")).split("\n}")[0],
+      "resume must never mint ids — only §2.5.2 case 4 does, by returning to establish",
+    ).not.toContain("mintIds");
   });
 
   test("the barrier module is the only thing that recognizes the marker bytes", async () => {
