@@ -1,4 +1,5 @@
 import path from "node:path";
+import type { MigrationHalt } from "./migration/health.js";
 
 /** A caller selected a different manifest stream than the durable baseline. */
 export class StreamMismatchError extends Error {
@@ -105,6 +106,27 @@ export class MigrationControlError extends Error {
   readonly name = "MigrationControlError";
   constructor(readonly reason: MigrationControlErrorReason, detail: string) {
     super(`migration control ${reason}: ${detail}`);
+  }
+}
+
+/**
+ * A phase body refuses, carrying the exact halt the driver must publish.
+ *
+ * The halt taxonomy is closed and the durable record is the driver's to write
+ * (163's "a failed halt publication is the final mutation of the trace"), so a
+ * phase body names its halt and raises — it never publishes one itself, and it
+ * never returns a value that a caller could mistake for progress. `wrote` is
+ * the one fact the driver cannot recompute: whether this refusal happened
+ * before any artifact mutation, which is what the zero-write rows assert.
+ */
+export class MigrationPhaseHaltError extends Error {
+  readonly name = "MigrationPhaseHaltError";
+  constructor(
+    readonly halt: MigrationHalt,
+    readonly wrote: boolean,
+    detail: string,
+  ) {
+    super(`migration halt ${halt.code}: ${detail}`);
   }
 }
 

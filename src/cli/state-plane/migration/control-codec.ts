@@ -149,10 +149,18 @@ export interface TerminalSibling extends ArtifactWitness {
   readonly disposition: "exact-or-absent-terminal";
 }
 
+/** One phase's own layer of the witness. Exported under the phase it belongs to
+ * so a phase body returns exactly what its publication adds, rather than a
+ * second spelling of the same three members. */
 interface W1 { readonly admission: AdmissionProof }
-interface W2 { readonly history: ArtifactWitness; readonly fixedBackup: ArtifactWitness; readonly stagingMain: StagingMain }
-interface W3 { readonly completion: CompletionTuple }
-interface W4 { readonly staging: StagingProof }
+export interface M2Witness {
+  readonly history: ArtifactWitness; readonly fixedBackup: ArtifactWitness; readonly stagingMain: StagingMain;
+}
+export interface M3Witness { readonly completion: CompletionTuple }
+export interface M4Witness { readonly staging: StagingProof }
+type W2 = M2Witness;
+type W3 = M3Witness;
+type W4 = M4Witness;
 interface W5 { readonly active: StagingProof; readonly qSibling: QSiblingWitness }
 interface W6 { readonly cleanup: Cursor; readonly futureControls: FutureControls }
 interface W7 { readonly terminalSibling: TerminalSibling }
