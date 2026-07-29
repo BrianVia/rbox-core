@@ -137,7 +137,7 @@ migration modules, not twelve.
 | M-5 | `import-json.ts` | A **proven staging DB** derived from an admitted source | 340 |
 | M-6 | `finalize.ts` | The prepared DB becomes authority — the one flip | 280 |
 | M-7 | `retirement.ts` | C1: a superseded migration's artifacts are gone | 260 |
-| M-8 | `cleanup.ts` + `cleanup-runway.ts` | Terminalization: cursor, runway, M7 (two files — see §M-8) | 360 (293 + 394 shipped) |
+| M-8 | `cleanup.ts` + `cleanup-runway.ts` | Terminalization: cursor, runway, M7 (two files — see §M-8) | 360 (302 + 396 shipped) |
 | M-9 | `authority.ts` | Migration sequencing over typed receipts. No filesystem primitives, **no genesis** | 240 |
 
 M-3, M-5, M-8 sit in the 301–399 band; the review note is that each is one
@@ -541,9 +541,11 @@ vector because it claims no reserve and no emergency candidate.
 **Shipped as two files (3C).** The budget above was 360 and the honest
 implementation is 636 lines, so M-8 is `cleanup.ts` (the cursor, the
 identity-bracketed removal of a vector item, M7, and the primitives both halves
-share — 293 lines) plus `cleanup-runway.ts` (the `b..b+4` preparation ledger,
+share — 302 lines) plus `cleanup-runway.ts` (the `b..b+4` preparation ledger,
 the two prepared records, slot I/O, the final item, and `retryPromotedHalt` —
-394 lines). 163:3994's 400-line ceiling is not a budget to be renegotiated, and
+396 total, 376 nonblank). 163's ceiling is stated once as nonblank and once
+without, so both readings are satisfied rather than argued. It is not a budget
+to be renegotiated, and
 the correlation the one-file review note was protecting is preserved by the
 dependency running strictly one way: the runway imports from the cursor, never
 the reverse. The module count is therefore ten, not nine.
