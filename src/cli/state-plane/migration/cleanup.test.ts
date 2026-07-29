@@ -82,7 +82,7 @@ interface Fixture {
 
 /** A workspace whose M6 cleanup cursor is at prefix zero with no intent, over a
  * real reserve carrying a real 128-byte header and a real emergency candidate. */
-function fixture(): Fixture {
+function fixture(rewriteItems?: (defaults: ArtifactItem[], root: string) => ArtifactItem[]): Fixture {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "rbox-cleanup-"));
   const stateDir = path.join(root, ".rbox", "state");
   fs.mkdirSync(stateDir, { recursive: true });
@@ -93,7 +93,8 @@ function fixture(): Fixture {
   const emergency = migrationPaths.emergency(root, ID);
   fs.writeFileSync(emergency, Buffer.alloc(64));
 
-  const items = [itemFor("reserve", reserve, digest(header)), itemFor("emergency", emergency, null)];
+  const defaults = [itemFor("reserve", reserve, digest(header)), itemFor("emergency", emergency, null)];
+  const items = rewriteItems ? rewriteItems(defaults, root) : defaults;
   const control = publishMigrationControl(root, { migrationId: "absent", revision: "absent" }, {
     version: 1, controlRevision: 1, migrationId: ID, authorityId: "a1",
     source, stagingPath: path.join(stateDir, `state.db.migrate.${ID}`),
@@ -246,6 +247,44 @@ describe("the M6 cleanup cursor", () => {
     expect(fs.existsSync(fx.reserve), "a foreign occupant is never removed").toBe(true);
   });
 
+  test("refuses a non-regular occupant even at the recorded inode", async () => {
+    // A directory whose inode the vector recorded. Without the `isFile` check
+    // the unlink is still refused — by `EISDIR`, from the kernel, as an
+    // uncaught errno rather than a protocol refusal.
+    const fx = fixture((defaults, root) => {
+      const dir = path.join(root, ".rbox", "state", "not-a-reserve");
+      fs.mkdirSync(dir);
+      const stat = fs.lstatSync(dir);
+      return [{ ...defaults[0]!, path: dir, dev: Number(stat.dev), ino: Number(stat.ino) }, defaults[1]!];
+    });
+    const intent = await stepCleanup(fx.root, receipt(fx.control), locks);
+    if (intent.kind !== "intent") throw new Error("unreachable");
+    await expect(stepCleanup(fx.root, receipt(intent.control), locks))
+      .rejects.toThrow(/is not the reserve this cleanup vector recorded/);
+  });
+
+  test("refuses a reserve item recorded without its header digest", async () => {
+    const fx = fixture((defaults) => [{ ...defaults[0]!, sha256: null }, defaults[1]!]);
+    const intent = await stepCleanup(fx.root, receipt(fx.control), locks);
+    if (intent.kind !== "intent") throw new Error("unreachable");
+    // The contract 4A must honour, pinned by its own message rather than by
+    // whatever the digest comparison happens to do with a null.
+    await expect(stepCleanup(fx.root, receipt(intent.control), locks))
+      .rejects.toThrow(/was recorded without its reserve header digest/);
+    expect(fs.existsSync(fx.reserve)).toBe(true);
+  });
+
+  test("refuses a cursor that is already complete but never reached M7", async () => {
+    const fx = fixture();
+    const witness = fx.control.witness as Extract<MigrationWitness, { phase: "M6" }>;
+    const complete: MigrationControl = {
+      ...fx.control,
+      witness: { ...witness, cleanup: { ...witness.cleanup, durablePrefix: witness.cleanup.items.length } },
+    };
+    await expect(stepCleanup(fx.root, receipt(complete), locks))
+      .rejects.toThrow(/cursor is complete but M7 was never published/);
+  });
+
   test("the identity bracket alone refuses a swapped item that carries no header rule", async () => {
     const fx = fixture();
     const ready = await toReady(fx, await toFinalIntent(fx));
@@ -309,7 +348,7 @@ describe("the allocation-free runway", () => {
     expect(siblings.sort()).toEqual([path.basename(ledger.halt.path), path.basename(ledger.success.path)].sort());
   });
 
-  test("adopts the sole zero-byte create-ahead at a prebound slot, and refuses anything else", async () => {
+  test("adopts the sole zero-byte create-ahead at a prebound slot", async () => {
     const fx = fixture();
     const base = await toFinalIntent(fx);
     const ledger = ledgerOf(base);
@@ -323,11 +362,23 @@ describe("the allocation-free runway", () => {
     expect(claimed.state).toBe("building");
     expect(`${(claimed as { dev: number }).dev}:${(claimed as { ino: number }).ino}`,
       "the create-ahead inode is adopted, never replaced").toBe(ahead);
+  });
 
-    const other = fixture();
-    const otherBase = await toFinalIntent(other);
-    fs.writeFileSync(ledgerOf(otherBase).halt.path, "not a create-ahead");
-    await expect(stepFutureControlPreparation(other.root, receipt(otherBase), locks))
+  /** `zero-create-ahead` is a conjunction — zero bytes AND mode 0600 — and each
+   * conjunct is pinned separately, because either alone admits a file this
+   * runway would then treat as its own empty slot. */
+  test.each([
+    ["carrying bytes at the right mode", (file: string) => fs.writeFileSync(file, "content", { mode: 0o600 })],
+    ["empty at the wrong mode", (file: string) => fs.writeFileSync(file, Buffer.alloc(0), { mode: 0o644 })],
+  ])("refuses a create-ahead %s", async (_label, occupy) => {
+    const fx = fixture();
+    const base = await toFinalIntent(fx);
+    const ledger = ledgerOf(base);
+    occupy(ledger.halt.path);
+    // `writeFileSync`'s mode applies only on create, and umask can clear bits.
+    fs.chmodSync(ledger.halt.path, fs.lstatSync(ledger.halt.path).size === 0 ? 0o644 : 0o600);
+
+    await expect(stepFutureControlPreparation(fx.root, receipt(base), locks))
       .rejects.toThrow(/neither absent nor the sole zero-byte create-ahead/);
   });
 
@@ -548,6 +599,23 @@ describe("the allocation-free runway", () => {
     expect(fs.lstatSync(ledger.success.path).size, "and nothing was written").toBe(before);
   });
 
+  test("refuses a slot that kept the record as its prefix but grew past it", async () => {
+    const fx = fixture();
+    const ready = await toReady(fx, await toFinalIntent(fx));
+    const ledger = ledgerOf(ready);
+    const recorded = inodeOf(ledger.halt.path);
+
+    // Appending leaves every recorded byte in place, so a comparison that only
+    // reads `bytes.byteLength` bytes and compares them still matches. The
+    // recorded LENGTH is the only thing that refuses this.
+    fs.appendFileSync(ledger.halt.path, "trailing");
+    expect(inodeOf(ledger.halt.path), "the append must keep the recorded inode").toBe(recorded);
+
+    await expect(completeFinalItem(fx.root, receipt(ready), locks))
+      .rejects.toThrow(/is not the exact halted-m6 record this ledger prepared/);
+    expect(fs.existsSync(fx.emergency)).toBe(true);
+  });
+
   test("the ledger owns b+5 and b+6 while control sits at b+4, so no temp may be blanket-overwritten", async () => {
     const fx = fixture();
     const ready = await toReady(fx, await toFinalIntent(fx));
@@ -752,21 +820,32 @@ describe("M7 terminalization", () => {
     expect(before[path.join("state", path.basename(migrationPaths.control(fx.root)))]).toBeDefined();
   });
 
-  test("refuses a terminal sibling that is not the one M7 recorded", async () => {
+  /** M7's unlink brackets on inode AND length; each conjunct is pinned alone,
+   * because a test that changes both proves neither. */
+  test.each([
+    ["a different inode at the recorded length", (file: string, size: number) => {
+      fs.unlinkSync(file);
+      fs.writeFileSync(file, Buffer.alloc(size, 0x2e));
+    }],
+    ["the recorded inode at a different length", (file: string) => {
+      fs.appendFileSync(file, "grown");
+    }],
+  ])("refuses a terminal sibling with %s", async (_label, tamper) => {
     const fx = fixture();
     const ready = await toReady(fx, await toFinalIntent(fx));
     const ledger = ledgerOf(ready);
     const outcome = await completeFinalItem(fx.root, receipt(ready), locks);
     if (outcome.kind !== "finished") throw new Error("unreachable");
 
-    const recorded = inodeOf(ledger.halt.path);
-    fs.unlinkSync(ledger.halt.path);
-    fs.writeFileSync(ledger.halt.path, "a squatter");
-    expect(inodeOf(ledger.halt.path)).not.toBe(recorded);
+    const before = { inode: inodeOf(ledger.halt.path), size: fs.lstatSync(ledger.halt.path).size };
+    tamper(ledger.halt.path, before.size);
+    const after = { inode: inodeOf(ledger.halt.path), size: fs.lstatSync(ledger.halt.path).size };
+    // Exactly one conjunct moved, so exactly one check can be doing the work.
+    expect([after.inode !== before.inode, after.size !== before.size].filter(Boolean)).toHaveLength(1);
 
     await expect(finishMigration(fx.root, receipt(outcome.control), locks))
       .rejects.toThrow(/is not the prepared sibling M7 recorded/);
-    expect(fs.readFileSync(ledger.halt.path, "utf8")).toBe("a squatter");
+    expect(fs.existsSync(ledger.halt.path), "a foreign sibling is never unlinked").toBe(true);
     expect(readCanonicalControl(fx.root)).toBeDefined();
   });
 
