@@ -4,6 +4,11 @@
 > and the independent adversarial validation of §2.6
 > (RATIFY-WITH-CORRECTIONS, 9 items). §10 records both dispositions.
 >
+> **§2.6 is RATIFIED** (founder, 2026-07-28) and is now normative in 163 as
+> **v12** — two inserted M0 authority-matrix rows plus a § "R4-v12 genesis
+> intent (v12)" decision record. §2.6 here is a pointer and rationale; 163 v12
+> owns the rows.
+>
 > **Founder steer governing r5:** the copy-from-another-workspace attack
 > scenarios are low-odds, and the validation agrees — copy is blocked, stale
 > replay self-heals, races are locked out, and a same-user attacker is no worse
@@ -797,10 +802,24 @@ difference between r3's withdrawn rule and this one.
 begin; anything else → 163's existing rows, unchanged, including the
 ambiguous-halt row that protects a migrated workspace whose `Q` was lost.
 
-### 2.6 THE AMENDMENT TO 163, FOR RATIFICATION
+### 2.6 The 163 amendment — RATIFIED, and now normative in 163 v12
 
-*(This is the text going to the founder. r3's `origin_kind`-keyed proposal is
-withdrawn in full.)*
+**Status: RATIFIED by the founder, 2026-07-28.** The amendment this section
+proposed across r3–r5 is folded into
+`docs/design/163-state-plane-sqlite.md` as **v12**: the two matrix rows are
+inserted in § "Migration authority state machine" (M0 authority matrix), and the
+decision record is § "R4-v12 genesis intent (v12)". 163 v12 is normative; this
+section is a pointer and a rationale, not a competing copy.
+
+**What 163 v12 owns:** the two authority-matrix rows, and the statement of what
+does and does not change. **What 222 owns:** the protocol behind them — the
+intent's field list and the trim rationale (§2.3), the seven-step operation
+(§2.4), the finishing conjunction and the seven crash images (§2.5), the copy
+(§6.1), and the fixtures G1–G6 (§7.1). If the two ever disagree, **163 v12
+wins on the rows and 222 wins on the protocol**, and one of them is a bug.
+
+Recorded here for context, since the reasoning is what the rest of §2 is built
+on:
 
 ---
 
@@ -834,7 +853,7 @@ the new rows on `origin_kind` alone; that was withdrawn because a valid genesis
 database **copied from another workspace** would satisfy it and cause `Q` to be
 published from the copy's authority id.
 
-**Amendment.** Introduce one durable artifact, the **genesis intent**
+**Amendment (as ratified).** Introduce one durable artifact, the **genesis intent**
 (`.rbox/state/genesis-v1.json`, design 222 §2.3): a closed exact record binding
 this workspace's fenced evidence, the authority id, the lineage id, and the
 `{dev, ino}` identity of the staged database file — published **before** SQLite
@@ -843,7 +862,9 @@ are derived from the authority id) and therefore names no deletion target. It is
 owned solely by `state-plane/genesis.ts`. It is not a migration control, carries
 no phase, and no migration module reads or writes it.
 
-163's M0 authority matrix gains **two rows**, both keyed on the intent:
+163's M0 authority matrix gains **two rows**, both keyed on the intent. They
+are now inserted in 163 v12; the shape below is the ratified intent, and 163's
+inserted rows are the normative wording:
 
 ```
 | Legacy path | Active DB                          | Control                   | Authority and M0 action |
@@ -918,6 +939,11 @@ one added write-fence condition, and one new store-open variant. No migration
 code path observes any of it.
 
 ---
+
+**Ratification record.** Founder ratified 2026-07-28 as written, with
+`lineageId` retained (§2.3.3 had flagged it as the one cuttable field). Folded
+into 163 as v12 in the same change that carries this revision. The independent
+validation's nine corrections (§10) were folded before ratification.
 
 ### 2.7 Genesis is still the first fleet checkpoint — but not in Wave 1
 
@@ -1350,8 +1376,8 @@ final serial review** → merge to `2.0` → dual-binary differential against si
 4. **The genesis intent is new durable state on the authority path.** It is
    small, single-writer, and never updated mid-flight — but it is one more thing
    that can be foreign, malformed, or stranded. G5 and G6 exist to keep its
-   fail-closed behavior honest, and the §2.6 ratification is what makes it
-   legitimate rather than invented.
+   fail-closed behavior honest. It is now normative (163 v12), so the risk is
+   implementation fidelity to the ratified rows, not legitimacy.
 5. **`adoptClaimedStateStore` changes a merged, load-bearing initializer** and is
    now consumed by two callers (M3 and genesis). Mitigated by one private shared
    body and crash coverage on both callers.

@@ -1,9 +1,18 @@
 # 163 — The state plane moves to SQLite
 
-Status: **v11 — RATIFIED AMENDMENT to v10 (founder requirement reductions
-2026-07-28); codex ALIGNED at v11-r2 (`537b4a07`).** Exclusivity is defined as
-workspace mutation-lock ownership; one founder input remains owed (the frozen
+Status: **v12 — RATIFIED AMENDMENT to v11 (founder, 2026-07-28): the genesis
+intent.** The M0 authority matrix gains exactly two rows, both keyed on a new
+durable artifact owned solely by `state-plane/genesis.ts`, so a crash-safe
+genesis run is expressible. V12 touches **only** § "Migration authority state
+machine" (the two inserted matrix rows) and § "R4-v12 genesis intent (v12)";
+v11/v10 remain implementation authority everywhere else, and the
+ambiguous/manual-damage row is byte-unchanged. The protocol lives in design
+222 § 2; 163 owns the matrix rows. One founder input remains owed (the frozen
 machine profile, blocking U5 only).
+
+Prior status for the record: v11 was **RATIFIED AMENDMENT to v10 (founder
+requirement reductions 2026-07-28); codex ALIGNED at v11-r2 (`537b4a07`).**
+Exclusivity is defined as workspace mutation-lock ownership.
 V11 **deletes** requirements and adds none, so v10 remains implementation
 authority for B0 → U5 everywhere v11 does not touch. Only the changed sections
 are re-opened: § "Founder requirement reductions ratified 2026-07-28 (v11)",
@@ -2599,8 +2608,10 @@ row nor a backup elects authority by itself.
 | exact `Q` | matching `C` | exact M6 cleanup cursor | SQLite authority; run only the cursor's exact current target and publish M7 only from the complete prefix. |
 | exact `Q` | matching `C` | exact M7 | SQLite authority; retire/fsync the control only. |
 | exact `Q` | matching `C` | halted M5–M7 | SQLite authority; never restore JSON. Honor the phase-specific durability/write block or cleanup deferral until explicit doctor retry delegates to the controller. |
+| exact `Q` | matching `C` whose `authority_id` equals both the intent's authority id and the `Q` bytes | migration control absent plus the same exact genesis intent | Genesis finish-ahead past the authority rename (v12). SQLite authority; writes stay blocked until the `.rbox` parent fsync completes and the intent is retired. |
 | exact `Q` | absent/`P/F`/wrong authority id | any | contradictory authority; hard `StateAuthorityCorruptError`, zero repair writes. |
 | absent | absent | absent | No authority. Genesis is allowed only with fenced config/incarnation/reset evidence and uses staged DB + `Q`; otherwise halt. |
+| absent | absent, or exactly the database satisfying the genesis intent's full identity conjunction — recorded `{dev,ino}`, `store_meta.authority_id`, `store_meta.active_lineage_id`, and a genesis `migration_completion` singleton whose `migration_id` is `genesis:<lineageId>` with `entry_count = repo_count = 0` | migration control absent plus an exact genesis intent whose bound fenced evidence equals this workspace's current fenced evidence and which records that exact `{dev,ino}` identity | No authority until `Q`. Genesis in progress (v12); only the genesis recorded-identity correlation (design 222 §2.5.2) may act. No migration phase is inferred and no migration artifact is created. |
 | absent | any DB | any | Ambiguous/manual damage; halt. DB presence never elects authority. |
 | malformed JSON, non-exact sentinel, special/unreadable legacy path | any | any | Halt before DB open or cleanup. |
 
@@ -4893,3 +4904,56 @@ the frozen machine profile, blocking U5.**
 write-side barrier, the reserve, and the pinning inventory test. None of that is
 withdrawn. It is now defense-in-depth against a scenario exclusivity excludes,
 which is a fine thing for shipped code to be.
+
+## R4-v12 genesis intent (v12)
+
+Not a review round. **An amendment to a ratified document, ratified by the
+founder 2026-07-28**, closing a contradiction the U3 implementation design
+(222) surfaced. Produced by four adversarial rounds on 222 plus an independent
+validation of the amendment text (RATIFY-WITH-CORRECTIONS, nine items, all
+folded).
+
+**The contradiction.** Two ratified rows of the M0 authority matrix are
+individually correct and jointly unimplementable: `absent | absent | absent`
+authorizes genesis "with fenced config/incarnation/reset evidence and uses
+staged DB + `Q`", while `absent | any DB | any` halts on the only intermediate
+state genesis can produce — an active database and `Q` cannot be published
+atomically. Genesis therefore could not complete a crash-safe run.
+
+**Why a witness, and not a cleverer read of the database.** An active database
+with no `Q` is either genesis leftovers (no user data, safe to sweep) or a
+migrated workspace whose `Q` was lost (real data, sweeping is catastrophic).
+Nothing inside the candidate distinguishes them: `origin_kind` is a
+`CHECK`-constrained string the candidate asserts about itself
+(`schema/v1.ts:29`), and `validateOpen` establishes structure and coherence but
+never that this process created the database, that it belongs to this
+workspace, or that checkpoint/`S0`/fsync completed. An earlier draft keyed the
+new rows on `origin_kind` alone and was **withdrawn**: a valid genesis database
+copied from another workspace would have satisfied it and published `Q` from
+the copy's authority id.
+
+| What v12 adds | What v12 explicitly leaves unchanged |
+|---|---|
+| The **genesis intent**, `.rbox/state/genesis-v1.json`: a closed exact record binding the workspace's fenced evidence, authority id, lineage id, and the `{dev,ino}` identity of the staged database — published **before** SQLite opens that file and unlinked **last**, after `Q`. It stores no path (both are derived from the authority id) and so names no deletion target. Owned solely by `state-plane/genesis.ts`; not a migration control, no phase, and no migration module reads or writes it | The **ambiguous/manual-damage row, byte-for-byte**. It still fires for any database at the active path with no exact genesis intent satisfying the full conjunction, so a migrated workspace whose `Q` was lost still halts exactly as today |
+| **Two matrix rows**, both keyed on that intent: genesis-in-progress, and genesis finish-ahead past the authority rename (writes blocked until the parent fsync completes and the intent is retired) | **"DB presence never elects authority", verbatim.** Presence still elects nothing; the intent — published before the database existed — is what authorizes the finishing action, and the database must satisfy every check the intent implies |
+| One new **write-fence condition** (an unretired genesis intent blocks SQLite writes, alongside the migration-control condition) and **three refusal codes** — `legacy-present`, `artifact-present`, `evidence-missing` — each with plain-English doctor copy and a non-interactive twin | The genesis row at `absent \| absent \| absent`, including "**uses staged DB + `Q`**", which design 222 § 2.4 now honors literally. No second interpretation is requested |
+| — | Every migration row, phase, witness, halt, and artifact. The `Q` predicate, the barrier, the last-writer witness, the reserve, and `F1`–`F6` |
+| — | **Doctor gains no new deletion authority.** Genesis artifacts are reported, never swept: nothing deletes an unowned zero-byte staged file, a stranded `Q` sibling, or a database scoped to a different authority id |
+
+**Why the new rows are safe where the withdrawn draft was not.** Every value the
+conjunction checks — `store_meta.authority_id`, `store_meta.active_lineage_id`,
+and the `migration_completion` singleton including
+`migration_id = 'genesis:' + lineageId` and `entry_count = repo_count = 0` — is
+written by the already-merged `installGenesisLineage`
+(`schema/application.ts:25-86`, completion row at `:67`, `migration_id` at
+`:72`) from values the intent published to disk **before the database existed**.
+The database never asserts anything about itself; it is checked against a record
+that predates it. The conjunction also closes the real hazard the independent
+validation found: `dev`/`ino` reuse, where a recycled inode carrying real user
+data could otherwise satisfy an identity-only test at the active path.
+
+**Not implementable against today's `main`.** Genesis needs
+`adoptClaimedStateStore(file, expected, install)`, because the merged
+`initializeStateStore` opens `"wx"` and rejects an existing path
+(`store/open.ts:218`). It is a U3 Wave 1B deliverable that migration's M3 also
+requires. Ratifying v12 authorizes the design, not an immediate landing.
