@@ -228,7 +228,7 @@ const WITNESS_LAYERS: readonly Fields[] = [
   {
     completion: {
       fields: {
-        migrationId: "string", importerVersion: "string", authorityId: "string",
+        migrationId: "id", importerVersion: "string", authorityId: "id",
         sourceJsonSha256: "hex", sourceSemanticDigest: "hex", sourceBytes: "int",
         entryCount: "int", repoCount: "int", perTableCounts: { each: "int" }, completedAt: "int",
       },
@@ -267,8 +267,12 @@ const CONTROL: Spec = {
   fields: {
     version: { const: 1 },
     controlRevision: "int",
-    migrationId: "string",
-    authorityId: "string",
+    // `id`, not `string`: both are interpolated straight into `migrationPaths`
+    // templates, and a bare nonempty string may contain `/` and `..`, which
+    // `path.join` normalizes — an id alone could then aim a template at the live
+    // source document. The charset is what makes every path constructor safe.
+    migrationId: "id",
+    authorityId: "id",
     source: SOURCE,
     stagingPath: "string",
     witness: tagged("phase", Object.fromEntries(MIGRATION_PHASES.map(
@@ -348,12 +352,26 @@ export function decodeMigrationControl(bytes: Uint8Array): MigrationControl {
   return control;
 }
 
-/** The C1 trigger. Both dispositions total-map to 163's single durable reason
+/**
+ * The C1 trigger. Both dispositions total-map to 163's single durable reason
  * (163:2727), so a second durable reason cannot be introduced. It lives here so
- * retirement (wave 3) does not depend on the flip (wave 4). */
+ * retirement (wave 3) does not depend on the flip (wave 4).
+ *
+ * Both carry the `replacement` witness because the durable retirement record
+ * requires one for its diagnostic `triggeringSource`, and the barrier inventory
+ * pins exactly one reader of the legacy document: a disposition that carried
+ * only a digest would force retirement to become a second reader of the very
+ * document it must never interpret. `observedBodySha256` is the JSON body hash
+ * the M6 pre-rename re-verify compares, which is not the witness's whole-file
+ * physical hash.
+ */
 export type C1Trigger =
   | { readonly disposition: "source-changed"; readonly replacement: SourceWitness }
-  | { readonly disposition: "legacy-write-detected"; readonly observedBodySha256: string };
+  | {
+    readonly disposition: "legacy-write-detected";
+    readonly replacement: SourceWitness;
+    readonly observedBodySha256: string;
+  };
 export const durableRetirementReason = (_: C1Trigger): "source-changed" => "source-changed";
 
 /**

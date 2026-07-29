@@ -14,7 +14,7 @@ import {
 } from "./control-codec.js";
 import {
   haltRunway, promotePreparedControl, publishMigrationControl, publishMigrationHalt,
-  readCanonicalControl, renderPreparedControl,
+  readCanonicalControl, renderPreparedControl, retireCanonicalControl,
 } from "./control-publication.js";
 
 const HASH = "a".repeat(64);
@@ -142,6 +142,18 @@ describe("control codec", () => {
     for (const build of cases) expect(() => decodeMigrationControl(build())).toThrow(MigrationControlError);
   });
 
+  /** Review B1 R6: both ids are interpolated straight into path templates, and
+   * `path.join` normalizes, so an id containing `/` or `..` can aim a template
+   * at `.rbox/state.json` itself. The charset is the fence. */
+  test("rejects an id that could normalize a path template out of its directory", () => {
+    for (const id of ["x/../../state.json", "..", "a/b", "a.b", "", " ", "-lead", "x".repeat(65)]) {
+      expect(() => encodeMigrationControl(control({ migrationId: id })), id).toThrow(/path-safe identifier/);
+      expect(() => encodeMigrationControl(control({ authorityId: id })), id).toThrow(/path-safe identifier/);
+    }
+    // The shapes production actually mints: hex32 from `randomBytes(16)`.
+    expect(() => encodeMigrationControl(control({ migrationId: "0".repeat(32), authorityId: "a-B_9" }))).not.toThrow();
+  });
+
   test("rejects every phase-illegal resource disposition (163:2636)", () => {
     const illegal: [MigrationPhase, HaltResource["disposition"], RegExp][] = [
       ["M3", "not-created", /not-created outside M0/],
@@ -195,7 +207,9 @@ describe("control codec", () => {
 
   test("both C1 dispositions map to the one durable reason", () => {
     expect(durableRetirementReason({ disposition: "source-changed", replacement: source })).toBe("source-changed");
-    expect(durableRetirementReason({ disposition: "legacy-write-detected", observedBodySha256: HASH })).toBe("source-changed");
+    expect(durableRetirementReason({
+      disposition: "legacy-write-detected", replacement: source, observedBodySha256: HASH,
+    })).toBe("source-changed");
   });
 });
 
@@ -296,6 +310,18 @@ describe("control publication", () => {
     expect(outcome).toEqual({ durable: false, reason: expect.any(MigrationControlError) });
     // A CAS refusal is not an allocation failure: nothing may be released for it.
     expect(fs.existsSync(reserve)).toBe(true);
+  });
+
+  test("the terminal unlink CASes the exact record, and refuses a stale expectation", () => {
+    const root = workspace();
+    const published = publishMigrationControl(root, { migrationId: "absent", revision: "absent" }, control(), locks);
+    expect(() => retireCanonicalControl(root, { migrationId: "m1", revision: 2 }, locks)).toThrow(/cas/);
+    expect(() => retireCanonicalControl(root, { migrationId: "other", revision: 1 }, locks)).toThrow(/cas/);
+    expect(readCanonicalControl(root)).toEqual(published);
+
+    retireCanonicalControl(root, { migrationId: "m1", revision: 1 }, locks);
+    expect(readCanonicalControl(root)).toBeUndefined();
+    expect(() => retireCanonicalControl(root, { migrationId: "m1", revision: 1 }, locks)).toThrow(/cas/);
   });
 
   test("haltRunway offers only available resources, and none while a cursor runs (163:3343)", () => {
