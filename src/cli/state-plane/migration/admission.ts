@@ -6,8 +6,10 @@
  * structural test can read and a fault fixture can demonstrably subtract one
  * condition from without editing the production path.
  *
- * Every condition fails closed: an indeterminate observation refuses. Refusals
- * publish nothing, create nothing, and are freely retried.
+ * No observation yields `admitted`: an indeterminate one refuses. Refusals
+ * publish nothing, create nothing, and are freely retried. One inherited
+ * exception to *terminating*, not to admitting — a FIFO at `state.json` blocks
+ * the read rather than refusing it (issue #556, B0's no-follow open path).
  */
 import fs from "node:fs/promises";
 import { isDaemonProcess } from "../../daemon/process-control.js";
@@ -20,7 +22,7 @@ import {
   resetParseBudgetBytes,
 } from "../../reset-io.js";
 import { assertHealthyOwnedSyncMutex, workspaceSyncMutexDegraded } from "../../sync-mutex.js";
-import type { EntryProof } from "../locks.js";
+import type { DegradedFenceRefusal, EntryProof } from "../locks.js";
 import { migrationPaths, stateLockPath, statePath } from "../paths.js";
 import type { AdmissionProof } from "./control-codec.js";
 import type { MigrationHalt } from "./health.js";
@@ -31,7 +33,7 @@ import {
 import { verifyLastWriterWitness, type WitnessVerdict } from "./last-writer-witness.js";
 
 export type AdmissionRefusal =
-  | { readonly code: "degraded-fence"; readonly detail: string }
+  | DegradedFenceRefusal
   | { readonly code: "quarantine-pending"; readonly detail: string }
   | { readonly code: "barrier-witness-missing"; readonly verdict: WitnessVerdict }
   | { readonly code: "migration-not-exclusive"; readonly detail: string }
@@ -75,6 +77,11 @@ export interface AdmissionCondition {
  * successful acquisition deletes that record (`sync-mutex.ts:195`), so by the
  * time the bundle is held the durable copy says nothing. The handle is the only
  * determinate answer.
+ *
+ * `withStatePlaneLocks` refuses a degraded workspace before minting a bundle at
+ * all, so this is unreachable through the two admitted entry points. It stays
+ * because 163 requires all five under the complete lock set, and it is the only
+ * thing standing between a bundle minted some other way and a migration.
  */
 async function lockingHealth(context: AdmissionContext): Promise<AdmissionRefusal | undefined> {
   const { mutex } = context.entry.locks;

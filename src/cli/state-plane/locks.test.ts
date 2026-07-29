@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { acquireLock } from "../../engine/git/lockfile.js";
 import { resetJournalPath } from "../reset-journal.js";
+import { workspaceSyncMutexDegraded } from "../sync-mutex.js";
 import { saveStateUnsafeLegacyOrTest } from "../sync-state-store.js";
 import { AUTHORITY_MARKER_MAGIC, classifyStateFormat } from "./authority-marker.js";
 import { withStatePlaneLocks, type StatePlaneLockStage } from "./locks.js";
@@ -21,14 +22,16 @@ async function workspace(prefix: string): Promise<string> {
 test("the bundle is acquired in design 222 §3.1's order", async () => {
   const root = await workspace("rbox-locks-order-");
   const stages: StatePlaneLockStage[] = [];
-  const held = await withStatePlaneLocks(root, async (locks) => {
+  const outcome = await withStatePlaneLocks(root, async (locks) => {
     expect(locks.underRepositoryFence).toBeTrue();
     expect(locks.stateLock.path).toBe(stateLockPath(root));
     expect(await locks.stateLock.isOwner()).toBeTrue();
+    // The bundle's declared invariant (design 222 §3.1): healthy, live-owned.
+    expect(workspaceSyncMutexDegraded(locks.mutex)).toBeFalse();
     return true;
   }, { onStage: (stage) => void stages.push(stage) });
 
-  expect(held).toBeTrue();
+  expect(outcome).toEqual({ held: true, value: true });
   expect(stages).toEqual(["mutex", "inventory", "fence", "state-lock", "fenced-recheck", "reset-recovery", "body"]);
 });
 
@@ -39,7 +42,7 @@ test("both locks are released after the body returns", async () => {
   expect(reacquired.status).toBe("acquired");
   if (reacquired.status === "acquired") await reacquired.lock.release();
   // A second full acquisition proves the mutex was released too.
-  expect(await withStatePlaneLocks(root, async () => "again")).toBe("again");
+  expect(await withStatePlaneLocks(root, async () => "again")).toEqual({ held: true, value: "again" });
 });
 
 /** Rewrite the workspace binding, which is one of the inventory's inputs. */

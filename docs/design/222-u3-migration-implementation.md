@@ -1551,6 +1551,12 @@ dated and re-checked before the 2.0 tag.
   and nothing else from either domain.
 - Exactly two entry call sites of `establishStateAuthority`, plus one doctor
   authorization site.
+- **`as`-casts to `HeldStatePlaneLocks` occur only in `locks.ts`** (production
+  `src/**`; test files are the enumerated exception, since adversarial
+  construction is what they are for). The bundle is the proof object every
+  mutator trusts without re-verifying — `control-publication.ts` takes it and
+  does `void locks` — so its unforgeability currently rests on the brand alone.
+  A cast anywhere else reaches an admitted migration with no lock held.
 - The canonical control file is written only by `control-publication.ts`,
   including both prepared-sibling promotions, which share one private primitive.
 - The genesis intent is written only by `genesis.ts`; `readGenesisIntent` is its
@@ -1595,7 +1601,7 @@ tests; other lanes propose their one-line entries in the PR body.
 
 | Lane | Deliverable | Depends on | Routing |
 |---|---|---|---|
-| **3A** | M-5 (M2 / four-observation M3 / M4) + `normalizeLegacyStateV1` + `legacyStateSemanticDigest` + the shared shape-flag builder + fidelity gate | 1A, 1B, 2A | codex |
+| **3A** | M-5 (M2 / four-observation M3 / M4) + `normalizeLegacyStateV1` + `legacyStateSemanticDigest` + the shared shape-flag builder + fidelity gate. **Also owns the `disk-preflight` halt**: 2B deliberately left it undecided because 163:3319 budgets it from staging/backup/WAL size estimates only this lane has, and a guessed multiplier would land a fabricated number in a durable halt record | 1A, 1B, 2A | codex |
 | **3B** | M-7 `retirement.ts` + cursor tests (consumes `C1Trigger` from 1A, not Wave 4) | 1A, 2A | **opus** |
 | **3C** | M-8 `cleanup.ts` (cursor + ledger + `retryPromotedHalt` + M7 in normative order) + runway fault injection | 1A, 2A | **opus** |
 

@@ -17,7 +17,9 @@ import { readResetJournal, recoverResetJournalUnderHeldFence } from "../reset-jo
 import { repoRecordsForState } from "../sync-state-model.js";
 import {
   acquireWorkspaceSyncMutex,
+  assertHealthyOwnedSyncMutex,
   releaseWorkspaceSyncMutex,
+  workspaceSyncMutexDegraded,
   type SyncMutexOptions,
   type WorkspaceSyncMutex,
 } from "../sync-mutex.js";
@@ -43,6 +45,21 @@ export interface EntryProof {
   readonly entry: EntryPoint;
   readonly locks: HeldStatePlaneLocks;
 }
+
+/** 163:2393's first M0 condition. Defined here because the mutex is what
+ * answers it, and admission's refusal union imports this exact member so one
+ * code exists rather than two that could drift. */
+export interface DegradedFenceRefusal {
+  readonly code: "degraded-fence";
+  readonly detail: string;
+}
+
+/** The bundle was held, or it was refused before anything was locked or
+ * written. A degraded workspace is a refusal with user-facing copy, not an
+ * exception — and not a body that runs anyway. */
+export type StatePlaneLockOutcome<T> =
+  | { readonly held: true; readonly value: T }
+  | { readonly held: false; readonly refusal: DegradedFenceRefusal };
 
 export interface StatePlaneLockOptions {
   /** Bounded restarts when the fenced recheck sees a changed inventory. */
@@ -74,7 +91,8 @@ interface Inventory {
 }
 
 const inventoryFingerprint = (inventory: Inventory): string => JSON.stringify([
-  inventory.requests.map((request) => [request.relPath, request.identityHash, [...request.reflogRefs ?? []], request.origins === true]),
+  inventory.requests.map((request) =>
+    [request.relPath, request.commonDir, request.identityHash, [...request.reflogRefs ?? []], request.origins === true]),
   inventory.stream ?? null,
   inventory.standingResetJournal,
 ]);
@@ -143,22 +161,31 @@ async function completeStandingReset(root: string, inventory: Inventory, stateLo
 
 /**
  * Acquire the complete state-plane lock set in design 222 §3.1's order and run
- * `fn` inside it: workspace mutex, read-only inventory, repository recovery
- * fence, state lock, fenced recheck, standing reset recovery, body.
+ * `fn` inside it: healthy workspace mutex, read-only inventory, repository
+ * recovery fence, state lock, fenced recheck, standing reset recovery, body.
  *
- * A degraded mutex is carried into the body rather than thrown from here: it is
- * admission's first condition, and its user-facing answer is the typed
- * `degraded-fence` refusal (163:2446), not an exception.
+ * A degraded workspace never reaches any of that. `completeStandingReset` below
+ * copies, creates, and renames, so the health assertion has to precede it — a
+ * workspace whose locking is known unreliable is exactly the population
+ * `degraded-fence` exists to keep away from state mutation. It is reported as a
+ * refusal so the caller can print 163:2446's copy instead of a stack trace.
  */
 export async function withStatePlaneLocks<T>(
   root: string,
   fn: (locks: HeldStatePlaneLocks) => Promise<T>,
   options: StatePlaneLockOptions = {},
-): Promise<T> {
+): Promise<StatePlaneLockOutcome<T>> {
   const attempts = options.attempts ?? 3;
   for (let attempt = 1; ; attempt++) {
     const mutex = await acquireWorkspaceSyncMutex(root, "cli", options.mutex);
     try {
+      if (workspaceSyncMutexDegraded(mutex)) {
+        return {
+          held: false,
+          refusal: { code: "degraded-fence", detail: mutex.degraded?.reason ?? "identity-unavailable" },
+        };
+      }
+      await assertHealthyOwnedSyncMutex(mutex, root);
       await options.onStage?.("mutex");
       const inventory = await inspectInventory(root);
       await options.onStage?.("inventory");
@@ -187,7 +214,7 @@ export async function withStatePlaneLocks<T>(
           await stateLock.release();
         }
       });
-      if (!restart.restart) return restart.value;
+      if (!restart.restart) return { held: true, value: restart.value };
     } finally {
       await releaseWorkspaceSyncMutex(mutex);
     }
