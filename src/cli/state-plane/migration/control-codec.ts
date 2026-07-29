@@ -228,7 +228,7 @@ const WITNESS_LAYERS: readonly Fields[] = [
   {
     completion: {
       fields: {
-        migrationId: "string", importerVersion: "string", authorityId: "string",
+        migrationId: "id", importerVersion: "string", authorityId: "id",
         sourceJsonSha256: "hex", sourceSemanticDigest: "hex", sourceBytes: "int",
         entryCount: "int", repoCount: "int", perTableCounts: { each: "int" }, completedAt: "int",
       },
@@ -267,8 +267,12 @@ const CONTROL: Spec = {
   fields: {
     version: { const: 1 },
     controlRevision: "int",
-    migrationId: "string",
-    authorityId: "string",
+    // `id`, not `string`: both are interpolated straight into `migrationPaths`
+    // templates, and a bare nonempty string may contain `/` and `..`, which
+    // `path.join` normalizes — an id alone could then aim a template at the live
+    // source document. The charset is what makes every path constructor safe.
+    migrationId: "id",
+    authorityId: "id",
     source: SOURCE,
     stagingPath: "string",
     witness: tagged("phase", Object.fromEntries(MIGRATION_PHASES.map(

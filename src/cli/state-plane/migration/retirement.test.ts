@@ -271,7 +271,8 @@ describe("arming a source-change retirement", () => {
       witness: { ...f.control.witness, stagingMain: { state: "present", dev: staged.dev, ino: staged.ino } },
     } as MigrationControl;
     const outcome = armRetirement(f.root, receipt(escaped), TRIGGER, locks);
-    expect(outcome.kind === "corrupt" && outcome.halt.underlyingCode).toContain("not inside the directories this migration owns");
+    expect(outcome.kind === "corrupt" && outcome.halt.underlyingCode)
+      .toContain("staging path is not the one its migration id derives to");
     expect(fs.existsSync(victim)).toBe(true);
   });
 
@@ -288,6 +289,91 @@ describe("arming a source-change retirement", () => {
       const outcome = armRetirement(f.root, receipt(past), TRIGGER, locks);
       expect(outcome.kind === "corrupt" && outcome.halt.underlyingCode, phase).toContain("past the authority flip");
     }
+  });
+});
+
+/**
+ * Review B1. Every case asserts the VICTIM survived, never the mechanism that
+ * spared it: each one arms and, if arming succeeds, drives the cursor to its
+ * end, so a fence that merely moves the refusal later still fails here.
+ */
+describe("a control may not name a file this migration does not own", () => {
+  function attemptRetirement(root: string, control: MigrationControl): void {
+    try {
+      const outcome = armRetirement(root, receipt(control), TRIGGER, locks);
+      if (outcome.kind === "armed") drive(root, outcome.control);
+    } catch {
+      // A refusal is one of the outcomes under test.
+    }
+    // Refusing at the unlink is not good enough: a retirement that ARMS over a
+    // victim path has already published a record doctor must clear, so the
+    // refusal has to land before anything durable names the victim.
+    expect(readCanonicalControl(root)?.retirement ?? null, "a retirement was armed over a foreign path").toBeNull();
+  }
+
+  /** R1/R2: `stagingPath` is carried verbatim, and both victims are direct
+   * children of the directories a migration owns. */
+  for (const [name, victimOf] of [
+    ["the live legacy source", (root: string) => statePath(root)],
+    ["the fixed backup", (root: string) => migrationPaths.fixedBackup(root)],
+  ] as const) {
+    test(`a staging path aimed at ${name} retires nothing`, () => {
+      const f = fixture("M3");
+      const victim = victimOf(f.root);
+      const before = fs.readFileSync(victim);
+      const staged = inodeOf(victim);
+      attemptRetirement(f.root, {
+        ...f.control, stagingPath: victim,
+        witness: { ...f.control.witness, stagingMain: { state: "present", ...staged } },
+      } as MigrationControl);
+      expect(fs.existsSync(victim), victim).toBe(true);
+      expect(fs.readFileSync(victim)).toEqual(before);
+    });
+  }
+
+  /** R3: the Q-sibling path is the SECOND verbatim path a control carries, and
+   * its `building` branch pins no content hash. */
+  test("a Q-sibling path aimed at the reset journal retires nothing", () => {
+    const f = fixture("M5");
+    const victim = sqliteResetPaths.journal(f.root);
+    write(victim, '{"reset":"journal"}');
+    const staged = inodeOf(victim);
+    const witness = {
+      ...f.control.witness,
+      qSibling: {
+        ...(f.control.witness as { qSibling: { sha256: string } }).qSibling,
+        path: victim, disposition: { state: "building", ...staged },
+      },
+    };
+    attemptRetirement(f.root, { ...f.control, witness } as MigrationControl);
+    expect(fs.existsSync(victim)).toBe(true);
+  });
+
+  /** R6, the root cause: nothing is tampered but the id, and every path in the
+   * vector is then honestly derived by the path policy. */
+  test("a migration id that escapes its path templates retires nothing", () => {
+    const f = fixture("M3");
+    const poisoned = "x/../../state.json";
+    expect(migrationPaths.staging(f.root, poisoned), "the template no longer escapes; rewrite this repro")
+      .toBe(statePath(f.root));
+    const before = fs.readFileSync(statePath(f.root));
+    const staged = inodeOf(statePath(f.root));
+    // Nothing is tampered but the id: the staging path is what the path policy
+    // itself derives, and the resources are spent so only that one item remains.
+    const control = {
+      ...f.control, controlRevision: 2, migrationId: poisoned,
+      stagingPath: migrationPaths.staging(f.root, poisoned),
+      witness: { ...f.control.witness, stagingMain: { state: "present", ...staged } },
+      haltResources: { reserve: { disposition: "consumed-for-halt" }, emergency: { disposition: "consumed-for-halt" } },
+    } as MigrationControl;
+    try {
+      publishMigrationControl(f.root, { migrationId: ID, revision: 1 }, control, locks);
+    } catch {
+      // Refusing the record outright is one of the outcomes under test.
+    }
+    attemptRetirement(f.root, control);
+    expect(fs.existsSync(statePath(f.root))).toBe(true);
+    expect(fs.readFileSync(statePath(f.root))).toEqual(before);
   });
 });
 
@@ -422,7 +508,7 @@ describe("the retirement cursor", () => {
     publishMigrationControl(f.root, { migrationId: ID, revision: armed.controlRevision }, tampered, locks);
 
     const outcome = stepRetirement(f.root, receipt(tampered), locks);
-    expect(outcome.kind === "corrupt" && outcome.halt.underlyingCode).toContain("not inside the directories this migration owns");
+    expect(outcome.kind === "corrupt" && outcome.halt.underlyingCode).toContain("is not the path this migration");
     expect(fs.existsSync(victim)).toBe(true);
     expect(readCanonicalControl(f.root)?.controlRevision).toBe(tampered.controlRevision);
   });
@@ -442,7 +528,7 @@ describe("the retirement cursor", () => {
     publishMigrationControl(f.root, { migrationId: ID, revision: armed.controlRevision }, tampered, locks);
 
     const outcome = stepRetirement(f.root, receipt(tampered), locks);
-    expect(outcome.kind === "corrupt" && outcome.halt.underlyingCode).toContain("not inside the directories this migration owns");
+    expect(outcome.kind === "corrupt" && outcome.halt.underlyingCode).toContain("is not the path this migration");
     expect(fs.existsSync(items[0]!.path)).toBe(true);
   });
 

@@ -13,12 +13,23 @@
  *    preceded by an identity bracket against the exact recorded inode. Nothing
  *    a record names is trusted without that independent confirmation, at arming
  *    and again at every cursor step.
- *  - No path is discovered. The vector comes from the old exact control's own
- *    witness plus the fixed path policy, so no record can name a victim. Two
- *    consequences: the control-publisher temps (163's cleanup role 5) contribute
- *    nothing, because no control below M6 records a sibling path and enumerating
- *    them would need directory discovery; and the current source, the immutable
- *    history, and the fixed backup can never enter the vector.
+ *  - No path is discovered, and no path is believed. A control carries two paths
+ *    verbatim — `stagingPath` and the M5 Q sibling's — and every vector item is
+ *    held to the ONE path its role derives to from `(root, migrationId)`. A
+ *    directory test is not enough: the live source, the fixed backup, and the
+ *    reset journal all live directly inside the two directories a migration owns.
+ *    The control-publisher temps (163's cleanup role 5) contribute nothing,
+ *    because no control below M6 records a sibling path and enumerating them
+ *    would need directory discovery.
+ *
+ * A caught I/O fault throws rather than publishing a halt: the four retry buckets
+ * are M-9's, and `haltRunway` already returns `[]` for any control with a
+ * retirement armed, so no vector item can be consumed as halt runway (163:3343).
+ *
+ * A crash between `renderPreparedControl` and its rename strands an inert
+ * revision-scoped `.tmp` no vector cleans. Not a leak to fix here: it
+ * coordinates nothing, a fresh M0 picks a new id, and the publisher's `O_EXCL`
+ * plus exact-byte adoption means an occupied path cannot wedge a resume.
  *
  * It opens no database. The driver closes any staging handle and takes the
  * complete lock set before this module is reached.
@@ -26,7 +37,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { HeldStatePlaneLocks } from "../locks.js";
-import { migrationPaths, sqliteResetPaths, stateRootPath } from "../paths.js";
+import { migrationPaths, sqliteResetPaths } from "../paths.js";
 import { fsyncDirectory } from "../store/artifact-proof.js";
 import { isForeign, observePath, observeQSibling } from "./artifact-observation.js";
 import type { PhaseReceipt } from "./classifier.js";
@@ -64,33 +75,48 @@ const corrupt = (detail: string): RetirementCorruption =>
 const expectationFor = (control: MigrationControl): PublishExpectation =>
   ({ migrationId: control.migrationId, revision: control.controlRevision });
 
+/** Sidecars precede their main, and each carries its own fixed role (163:2800). */
+const STAGING_SIDECAR_ROLES = ["staging-journal", "staging-wal", "staging-shm"] as const;
+
 /**
- * The two directories a migration artifact may live in: `.rbox/state` for
- * everything but the Q sibling, which sits beside `L` in `.rbox`.
+ * The ONE path each role may hold, derived from `(root, migrationId)` alone.
+ * `control-sibling` has none — no control below M6 records a sibling — so it can
+ * never be a retirement item.
  *
- * Every vector item is checked against them at arming AND at every step, because
- * the one path a control carries verbatim is its `stagingPath`, and a record
- * with a tampered one would otherwise make the sidecar and staging-main roles
- * name a victim anywhere on the disk. The comparison is exact rather than
- * normalizing: a path that needs `..` or `.` resolved to look owned is not one
- * this module wrote. The recorded parent must also BE the item's parent, or the
- * fsync after an unlink would be aimed somewhere else.
+ * This is the containment fence, and it is derivation equality rather than a
+ * directory test because the files a directory test would admit are exactly the
+ * ones that must never be touched: the live source, the fixed backup, and the
+ * reset journal are all direct children of the two directories a migration owns.
  */
-function outsideOwnedDirectories(root: string, items: readonly ArtifactItem[]): string | undefined {
-  const stateRoot = stateRootPath(root);
-  const owned = new Set([stateRoot, path.dirname(stateRoot)]);
+function derivedPath(root: string, migrationId: string, role: ArtifactItem["role"]): string | undefined {
+  const staging = migrationPaths.staging(root, migrationId);
+  switch (role) {
+    case "q-sibling": return migrationPaths.qSibling(root, migrationId);
+    case "staging-journal": return `${staging}-journal`;
+    case "staging-wal": return `${staging}-wal`;
+    case "staging-shm": return `${staging}-shm`;
+    case "staging-main": return staging;
+    case "prepared-active-db": return sqliteResetPaths.active(root);
+    case "emergency": return migrationPaths.emergency(root, migrationId);
+    case "reserve": return migrationPaths.reserve(root);
+    case "control-sibling": return undefined;
+  }
+}
+
+/**
+ * Every step re-derives the durable cursor's paths: a control read back from
+ * disk is a record, not a construction. Arming needs no such pass — the builder
+ * below emits `derivedPath` results and nothing else. The recorded parent must
+ * also BE the item's parent, or the post-unlink fsync is aimed elsewhere.
+ */
+function notDerived(root: string, migrationId: string, items: readonly ArtifactItem[]): string | undefined {
   for (const item of items) {
-    if (!owned.has(item.parent) || item.parent !== path.dirname(item.path)) {
-      return `${item.path} is not inside the directories this migration owns`;
+    if (item.path !== derivedPath(root, migrationId, item.role) || item.parent !== path.dirname(item.path)) {
+      return `${item.path} is not the path this migration's ${item.role} derives to`;
     }
   }
   return undefined;
 }
-
-/** Sidecars precede their main, and each carries its own fixed role (163:2800). */
-const STAGING_SIDECARS = [
-  ["staging-journal", "-journal"], ["staging-wal", "-wal"], ["staging-shm", "-shm"],
-] as const;
 
 // ---------------------------------------------------------------------------
 // Arming.
@@ -112,6 +138,15 @@ export function armRetirement(
   if (fromPhase === "M6" || fromPhase === "M7") {
     return corrupt(`${fromPhase} is past the authority flip, where C1 cannot arm`);
   }
+  // The two paths a control carries verbatim. Both must be what this migration's
+  // id derives to before either is observed, let alone unlinked.
+  if (control.stagingPath !== migrationPaths.staging(root, control.migrationId)) {
+    return corrupt("the control's staging path is not the one its migration id derives to");
+  }
+  if (control.witness.phase === "M5"
+    && control.witness.qSibling.path !== migrationPaths.qSibling(root, control.migrationId)) {
+    return corrupt("the control's Q-sibling path is not the one its migration id derives to");
+  }
 
   const items = retirementVector(root, control);
   if (typeof items === "string") return corrupt(items);
@@ -132,7 +167,13 @@ export function armRetirement(
  * still holds exactly what the control recorded; a mismatch is not a smaller
  * vector but a refusal, because entry publication requires every listed item to
  * match its control-owned starting disposition. Returns the refusal detail as a
- * string.
+ * string. Every path it emits comes from `derivedPath`.
+ *
+ * `sha256` is recorded only where a small artifact's exact bytes are already
+ * known. Deleting a file needs OBJECT identity, which `dev`/`ino` settles; the
+ * staging main and its sidecars are mid-import and have no content to pin, and
+ * hashing them would make the per-step re-sweep digest a multi-gigabyte database
+ * once per item — O(N²) work to learn what the inode already said.
  */
 function retirementVector(root: string, control: MigrationControl): ArtifactItem[] | string {
   const items: ArtifactItem[] = [];
@@ -149,13 +190,13 @@ function retirementVector(root: string, control: MigrationControl): ArtifactItem
     if (recorded.state !== "absent") {
       const observed = observeQSibling(witness.qSibling);
       if (isForeign(observed)) return observed.foreign;
-      push("q-sibling", witness.qSibling.path, recorded.dev, recorded.ino,
+      push("q-sibling", derivedPath(root, control.migrationId, "q-sibling")!, recorded.dev, recorded.ino,
         observed.state === "exact" ? witness.qSibling.sha256 : null);
     }
   }
 
-  for (const [role, suffix] of STAGING_SIDECARS) {
-    const file = `${control.stagingPath}${suffix}`;
+  for (const role of STAGING_SIDECAR_ROLES) {
+    const file = derivedPath(root, control.migrationId, role)!;
     const observed = observePath(file);
     if (observed.state === "foreign") return `${file} is not a regular file`;
     if (observed.state === "regular") push(role, file, observed.dev, observed.ino, null);
@@ -165,14 +206,15 @@ function retirementVector(root: string, control: MigrationControl): ArtifactItem
   // moved the recorded inode to the active path one phase ahead.
   const staging = "stagingMain" in witness ? witness.stagingMain : { state: "absent" } as const;
   if (staging.state === "present") {
-    const observed = observePath(control.stagingPath);
+    const file = derivedPath(root, control.migrationId, "staging-main")!;
+    const observed = observePath(file);
     if (observed.state === "regular") {
       if (observed.dev !== staging.dev || observed.ino !== staging.ino) {
-        return `${control.stagingPath} is not the recorded staging inode`;
+        return `${file} is not the recorded staging inode`;
       }
-      push("staging-main", control.stagingPath, observed.dev, observed.ino, null);
+      push("staging-main", file, observed.dev, observed.ino, null);
     } else if (!(observed.state === "absent" && witness.phase === "M4")) {
-      return `${control.stagingPath} does not hold the recorded staging main`;
+      return `${file} does not hold the recorded staging main`;
     }
   }
 
@@ -188,10 +230,8 @@ function retirementVector(root: string, control: MigrationControl): ArtifactItem
     }
   }
 
-  for (const [role, file] of [
-    ["emergency", migrationPaths.emergency(root, control.migrationId)],
-    ["reserve", migrationPaths.reserve(root)],
-  ] as const) {
+  for (const role of ["emergency", "reserve"] as const) {
+    const file = derivedPath(root, control.migrationId, role)!;
     const recorded = control.haltResources[role];
     if (recorded.disposition !== "available") continue;
     const observed = observePath(file, true);
@@ -201,7 +241,7 @@ function retirementVector(root: string, control: MigrationControl): ArtifactItem
     }
     push(role, file, observed.dev, observed.ino, recorded.sha256);
   }
-  return outsideOwnedDirectories(root, items) ?? items;
+  return items;
 }
 
 // ---------------------------------------------------------------------------
@@ -222,7 +262,7 @@ export function stepRetirement(
   if (control.halt) return corrupt("a halted retirement resumes only through doctor");
   const { items, durablePrefix, currentIntent } = retirement.cursor;
 
-  const detail = outsideOwnedDirectories(root, items)
+  const detail = notDerived(root, control.migrationId, items)
     ?? vectorMismatch(items, durablePrefix, currentIntent !== null);
   if (detail) return corrupt(detail);
 
