@@ -1210,13 +1210,30 @@ The repository fence is **callback-scoped**, so the bundle is a witness of what
 is held, not a set of handles:
 
 ```ts
+declare const heldStatePlaneLocks: unique symbol;   // not exported: the brand
+
 export interface HeldStatePlaneLocks {
-  readonly mutex: WorkspaceSyncMutex;      // healthy, live-owned
+  readonly mutex: WorkspaceSyncMutex;      // non-degraded, acquired for this root
   readonly stateLock: OwnedLock;           // held for this exact root
   readonly underRepositoryFence: true;
+  readonly [heldStatePlaneLocks]: true;    // mintable only in `locks.ts` (§7.9)
 }
-export async function withStatePlaneLocks<T>(root: string, fn: (l: HeldStatePlaneLocks) => Promise<T>): Promise<T>;
+
+/** Degradation is a typed outcome, not an exception: 163's `degraded-fence` is
+ * a refusal with plain-English copy, and it must be decided BEFORE the standing
+ * reset recovery below, which copies, creates, and renames. */
+export type StatePlaneLockOutcome<T> =
+  | { readonly held: true;  readonly value: T }
+  | { readonly held: false; readonly refusal: { code: "degraded-fence"; detail: string } };
+
+export async function withStatePlaneLocks<T>(
+  root: string, fn: (l: HeldStatePlaneLocks) => Promise<T>,
+): Promise<StatePlaneLockOutcome<T>>;
 ```
+
+Live mutex ownership is verified where the answer is consumed — admission's
+exclusivity-window condition, re-called immediately before the M6 rename —
+rather than at the moment the handle is made, where it is a tautology.
 
 Order inside it, adopted verbatim from the N1 ruling:
 
@@ -1551,6 +1568,14 @@ dated and re-checked before the 2.0 tag.
   and nothing else from either domain.
 - Exactly two entry call sites of `establishStateAuthority`, plus one doctor
   authorization site.
+- **`as`-casts to `HeldStatePlaneLocks` occur only in `locks.ts`** (production
+  `src/**`; test files are the enumerated exception, since adversarial
+  construction is what they are for). The bundle is the proof object every
+  mutator trusts without re-verifying — `control-publication.ts` takes it and
+  does `void locks` — so its unforgeability rests on the brand alone. A cast
+  anywhere else reaches an admitted migration with no lock held. **Executable**
+  in `locks.test.ts`, not prose: an unenforced structural claim is how the
+  brand quietly stops being load-bearing.
 - The canonical control file is written only by `control-publication.ts`,
   including both prepared-sibling promotions, which share one private primitive.
 - The genesis intent is written only by `genesis.ts`; `readGenesisIntent` is its
@@ -1595,7 +1620,7 @@ tests; other lanes propose their one-line entries in the PR body.
 
 | Lane | Deliverable | Depends on | Routing |
 |---|---|---|---|
-| **3A** | M-5 (M2 / four-observation M3 / M4) + `normalizeLegacyStateV1` + `legacyStateSemanticDigest` + the shared shape-flag builder + fidelity gate | 1A, 1B, 2A | codex |
+| **3A** | M-5 (M2 / four-observation M3 / M4) + `normalizeLegacyStateV1` + `legacyStateSemanticDigest` + the shared shape-flag builder + fidelity gate. **Also owns the `disk-preflight` halt**: 2B deliberately left it undecided because 163:3319 budgets it from staging/backup/WAL size estimates only this lane has, and a guessed multiplier would land a fabricated number in a durable halt record | 1A, 1B, 2A | codex |
 | **3B** | M-7 `retirement.ts` + cursor tests (consumes `C1Trigger` from 1A, not Wave 4) | 1A, 2A | **opus** |
 | **3C** | M-8 `cleanup.ts` (cursor + ledger + `retryPromotedHalt` + M7 in normative order) + runway fault injection | 1A, 2A | **opus** |
 

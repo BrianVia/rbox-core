@@ -2392,7 +2392,15 @@ clobber each other's `state.json` today.
    how a fail-closed gate quietly becomes two gates):
    - workspace locking health is **not** `degraded-unlocked` (a degraded
      workspace is refused with a typed `degraded-fence` refusal, matching what
-     reset already does);
+     reset already does). **Read this from the live mutex handle, never from
+     `.rbox/state/locking-health.json`** (clarification, v12.1): a successful
+     acquisition deletes that record (`sync-mutex.ts:195`), and this predicate
+     is evaluated under the complete lock set, so the durable copy is always
+     already gone by the time it is consulted. The handle is the only
+     determinate answer. The refusal must also be raised **before** the lock
+     bundle performs any mutation — standing reset recovery copies, creates,
+     and renames — so it is checked at mutex acquisition and again in the M0
+     predicate;
    - no other live rbox process holds or recently held a workspace operation —
      established by the existing daemon/lock ownership evidence plus a bounded
      wait, not by a heuristic;
@@ -2446,8 +2454,13 @@ clobber each other's `state.json` today.
    - **F1 — the degraded fence does what M0 says.** A degraded-unlocked
      workspace with a live legacy writer: M0 must refuse with a typed
      `degraded-fence` refusal, publishing no control and creating no migration
-     artifact. Negative control: with the fence predicate removed, M0 proceeds —
-     proving F1 exercises the fence rather than some unrelated refusal.
+     artifact. Negative control (**corrected, v12.1**): with the fence predicate
+     **and the exclusivity-window predicate** removed, M0 proceeds — proving F1
+     exercises the fence rather than some unrelated refusal. The window
+     predicate must be named too: it verifies a healthy live-owned mutex
+     (`assertHealthyOwnedSyncMutex`), so it independently rejects a degraded
+     workspace and the original one-predicate control was unreachable — removing
+     the fence alone yields `migration-not-exclusive`, never a proceed.
    - **F2 — the real third case, on a lockable filesystem.** A `forceLegacy`
      writer on a lockable filesystem, suspended after its state read, then a
      full M0–M7 migration to completion, then the writer resumes. With `B0` the
