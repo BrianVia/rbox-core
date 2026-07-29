@@ -1,6 +1,17 @@
 # 222 — U3 implementation design: the migration unit, the `Q` flip, and the whole-state adapter
 
-> Status: **r5**. Folds the codex review of r3 (NOT-ALIGNED, 3 CRITICAL + 2 HIGH)
+> Status: **r6**. Folds one falsified premise. **A read-only SQLite open is not
+> a zero-write operation** — on a WAL-mode database in a writable parent the
+> first read, a bare `PRAGMA` included, creates `-wal`/`-shm` that a read-only
+> close cannot remove. r5's §2.5.1 named that defect and then prescribed it.
+> r6 replaces it with the **ownership rule** (163 v13): files this code does not
+> own are never opened at all; files it owns may be opened and must then be
+> checkpointed and closed. §M-3's zero-write requirement is **re-scoped, not
+> deleted**, by whether the database is frozen — and §2.5.1's amendment plus
+> §M-3's re-scoping are **one unit; neither is correct alone**. §10 records the
+> superseding disposition.
+>
+> Prior status for the record: **r5**. Folds the codex review of r3 (NOT-ALIGNED, 3 CRITICAL + 2 HIGH)
 > and the independent adversarial validation of §2.6
 > (RATIFY-WITH-CORRECTIONS, 9 items). §10 records both dispositions.
 >
@@ -8,7 +19,8 @@
 > conjunction closes the hazard, and the v12 fold is accurate and correctly
 > scoped. Four doc-level corrections are folded in this revision (§10) — none
 > touches 163 v12's ratified row text: the intent is the sole source of ids on
-> resume; §2.5.1 evaluates through the read-only preflight, case 7 precedes case
+> resume; §2.5.1 evaluates through the read-only preflight **(false — superseded
+> in r6)**, case 7 precedes case
 > 5, and cases 6–7 raise `StateAuthorityCorruptError` rather than a new halt
 > code; the write fence collapses to one coordinator-owned call; and two 163
 > editorial qualifications around (not inside) the ratified rows.
@@ -309,8 +321,31 @@ foreign, or wrong-`authority_id` DB — is a hard `StateAuthorityCorruptError`
 `MigrationHaltCode`, never retryable. `Q` + a *matching complete* DB with M5
 control is not corruption; it is `m5-artifact-ahead-q`.
 
-Zero writes, enforced by import graph. One table-driven test per row, plus a
-byte-for-byte `.rbox` snapshot before/after every corruption row.
+Zero writes, enforced by import graph — an **import-graph ban on `bun:sqlite`
+in every refusal-path module** is the right mechanism and generalizes beyond
+this file (r6). One table-driven test per row, plus a byte-for-byte `.rbox`
+snapshot, **sidecars included**, before/after every corruption row.
+
+**The ban is re-scoped by frozen-versus-live, not deleted (r6).** §2.5.1's
+amendment and this re-scoping are **one unit; neither is correct alone.**
+
+- **Frozen window** — M4 rename-ahead, `m5-resume`, `m5-artifact-ahead-q`.
+  Writes are blocked by `blocksSqliteWrites`, so the physical
+  `{bytes, sha256}` match is exact and genuinely stronger than anything the
+  database says about itself. The ban stands as written: pure `fs`, no
+  `bun:sqlite`.
+- **Live window** — `m6-cleanup`, `m7`, `cleanup-deferred`, `terminal-sqlite`.
+  The store is **explicitly writable and in normal use**, so a physical
+  `{bytes, sha256}` predicate goes stale on the user's next sync and then throws
+  an unretryable `StateAuthorityCorruptError` on a healthy workspace. The
+  durable predicate 163 actually names — `store_meta.authority_id` plus the
+  `migration_completion` singleton — requires an open. That open is **legal**:
+  past the authority flip the active database is rbox's own store, rbox owns
+  the inode, and the ownership rule never forbade rbox reading its own DB.
+
+The ban therefore reads: no `bun:sqlite` on any refusal path or in the frozen
+window; in the live window, read the workspace's own store through the owning
+connection and nothing else.
 
 ---
 
@@ -382,7 +417,10 @@ export interface PublishedStagingClaim { readonly identity: ClaimedInode; readon
  * asserts, no-follow, that it is exactly the recorded `{dev, ino}` zero-byte
  * 0600 regular inode — the expected identity is a PARAMETER, not an assumption.
  * Both delegate to one private body; both remove the file and its sidecars on
- * any caught failure. `createStateStore` keeps the creating variant.
+ * any caught failure — legal precisely because the adopter OWNS the inode it
+ * was handed (r6). This is the model the ownership rule generalizes: only the
+ * owner may open, and only the owner may clean up after itself.
+ * `createStateStore` keeps the creating variant.
  * `genesis.ts` uses the same adopter (§2.2 step 3).
  *
  * Then: re-run 52×/RSS admission immediately before the sole guarded parse,
@@ -901,14 +939,40 @@ turning a healthy migrated workspace into a permanent
 So the predicate is a **conjunction**. A database is this intent's genesis
 database only if **all** of the following hold:
 
-**Evaluated through the read-only preflight, never a read-write open.** The
-merged `openStateStore(file, { readonly: true })` opens a preflight handle
-`readonly: true` first, precisely "so a foreign SQLite file must not be
-converted to WAL or otherwise mutated merely because rbox refuses it"
-(`store/open.ts:249-262`). §2.5.1 uses that path. Evaluating the conjunction
-through a read-write open would let WAL replay mutate the candidate — a
-"zero-write halt" rule that performs a write, which is the defect this whole
-section exists to prevent.
+**Evaluated only on a database this code owns; never opened otherwise (r6).**
+r5 required this conjunction to be evaluated "through the read-only preflight,
+never a read-write open", reasoning that a read-write open would let WAL replay
+mutate the candidate. **That premise is falsified.** A read-only open of a
+WAL-mode database in a writable parent creates `-wal`/`-shm` on its first read —
+a bare `PRAGMA user_version` is enough — and a read-only close cannot remove
+them, while a read-write close can. Read-only does not avoid the write; it
+abandons the debris — and with a `0555` parent the same open instead throws
+`attempt to write a readonly database` on its first read, so the outcome is
+environment-dependent and a read-only parent is not a fix. The effect is
+**WAL-only** (a `journal_mode=delete` database is inert), but the rule stays
+ownership-scoped, because journal mode is a property of the candidate — the
+thing a refusal path does not get to inspect first.
+`openStateStore(file, { readonly: true })`'s stated purpose
+(`store/open.ts:249-262`) does not survive contact with WAL mode, and
+`immutable=1` is not the fix either: it creates no sidecars but silently ignores
+uncheckpointed WAL content, so on a healthy candidate whose `store_meta` and
+`migration_completion` rows are still in an uncheckpointed WAL it returns a
+confidently wrong verdict.
+
+The governing rule is **163 v13's ownership rule**, and it maps onto this
+section's own refusal/work boundary:
+
+- **Refusal path — the candidate is not ours.** Cases 6 and 7 refuse from
+  file-level facts alone (`{dev,ino}` identity, `state.json` shape, live fenced
+  evidence). No SQLite open of any kind occurs on any path that ends in a
+  refusal.
+- **Work path — the database *is* ours.** Cases 2 and 3 reach the conjunction
+  only after the intent's recorded `{dev,ino}` has already matched, which is
+  what makes the file this intent's own staged inode. Only then is it opened,
+  **read-write, as its owner**, and the case's own sequence
+  (recover/checkpoint/validate/close/require `S0`/fsync) is what restores the
+  at-rest signature. Opening without checkpointing and closing is the defect,
+  not opening writable.
 
 **The premise above is false, and two independent waves measured it.** A
 read-only connection to a WAL database creates `-wal` and `-shm` at its **first
@@ -986,7 +1050,7 @@ infer an absolute guarantee.
 | Check | Value |
 |---|---|
 | identity | the file's no-follow `{dev, ino}` equals `intent.staging` |
-| opens cleanly | `validateOpen` succeeds **through the read-only preflight** |
+| opens cleanly | `validateOpen` succeeds **on the owning read-write connection**, reached only after the identity row above matched (r6) |
 | authority | `store_meta.authority_id === intent.authorityId` |
 | lineage | `store_meta.active_lineage_id === intent.lineageId` |
 | origin | a `migration_completion` singleton with `origin_kind = 'genesis'` |
@@ -995,7 +1059,11 @@ infer an absolute guarantee.
 | evidence | `intent.evidence` equals the live fenced evidence |
 
 Any failure raises **`StateAuthorityCorruptError`**: nothing is adopted, nothing
-is deleted, no `Q` is published, and nothing is retryable.
+is deleted, no `Q` is published, and nothing is retryable. Cases 6 and 7 are
+**zero writes only because the cheapest-first ordering above holds** (r6): the
+identity and evidence checks are pure `fs`, so every refusal is decided before
+any open. If a later lane reorders the conjunction so an open precedes them, the
+zero-write claim becomes false.
 
 **Two members are deliberately not load-bearing, named here so nobody later
 mistakes them for safety.** `entry_count = repo_count = 0` is *tautological* —
@@ -1038,7 +1106,7 @@ anything is mutated, and are not halts.
 |---|---|---|
 | 1 | `Q` matching `authorityId` + active path satisfies §2.5.1 | **Terminal.** Retry the (idempotent) `.rbox` fsync, remove the sibling if present, retire the intent. **Writes stay blocked until the intent is retired** (A-2 fence) |
 | 2 | `state.json` absent + active path satisfies §2.5.1 | Recover/checkpoint, fully validate, close, require `S0`, fsync DB and parent — **all of it**, then steps 6 and 7 |
-| 3 | `state.json` absent + active absent + staged path holds the recorded inode | Open it. If it satisfies §2.5.1: checkpoint/validate/close/`S0`/fsync, then step 5 onward. If it **does not open cleanly through `validateOpen` as a genesis store bound to this intent** (C9 — `installGenesisLineage` runs in one transaction, so "committed but not genesis-shaped" is not a reachable state; the reachable failure is a partial or unopenable file): **`ftruncate` the recorded inode to zero in place** (C3 — this preserves the inode, so the next crash still reads case 3 rather than case 6), remove only its `-wal`/`-shm`/`-journal` sidecars, and rebuild from step 4 through the same adopter, whose precondition is exactly a zero-byte claimed file |
+| 3 | `state.json` absent + active absent + staged path holds the recorded inode | Open it — legally, because the recorded inode matched, so this is **our** staged file and this is 1C's sole remaining open (r6). If it satisfies §2.5.1: checkpoint/validate/close/`S0`/fsync, then step 5 onward. If it **does not open cleanly through `validateOpen` as a genesis store bound to this intent** (C9 — `installGenesisLineage` runs in one transaction, so "committed but not genesis-shaped" is not a reachable state; the reachable failure is a partial or unopenable file): **`ftruncate` the recorded inode to zero in place** (C3 — this preserves the inode, so the next crash still reads case 3 rather than case 6), remove only its `-wal`/`-shm`/`-journal` sidecars, and rebuild from step 4 through the same adopter, whose precondition is exactly a zero-byte claimed file |
 | 4 | `state.json` absent + the recorded inode is at neither path, both absent | Nothing durable happened after the intent. Rebuild from step 2 under a **fresh** `authorityId`; the new intent is published before the old one is unlinked |
 | 5 | `state.json` is `L` | **Refuse `legacy-present`.** JSON is authority. Remove only our own confirmed artifacts, retire the intent — and the coordinator then re-inspects once and dispatches to migration in the same pass (§1.3, C8) |
 | 6 | A foreign inode at either path, an unrecorded file at the active path, `Q` with a non-matching authority id, a malformed intent, or any §2.5.1 check failing | **`StateAuthorityCorruptError`**, zero writes. Never adopt, never delete |
@@ -1328,7 +1396,7 @@ pre-published.
 
 | Kind | Publishes | Suspends | Cleared by | Members |
 |---|---|---|---|---|
-| **Refusal** | Nothing; `.rbox` byte-identical | No | Nothing | `degraded-fence`, `quarantine-pending`, `barrier-witness-missing`, `migration-not-exclusive`, `reserve-foreign`; genesis `legacy-present`, `artifact-present`, `evidence-missing` |
+| **Refusal** | Nothing; `.rbox` byte-identical — **the strongest promise in this document, and false for any refusal that opened a DB. 5C must actually test it, sidecars included (r6)** | No | Nothing | `degraded-fence`, `quarantine-pending`, `barrier-witness-missing`, `migration-not-exclusive`, `reserve-foreign`; genesis `legacy-present`, `artifact-present`, `evidence-missing` |
 | **Disposition** | Arms C1 (durable reason always the literal `"source-changed"`) | No | Terminal retirement prefix | `source-changed`, `legacy-write-detected` |
 | **Halt** | Same-phase revision with exact `halt` + `haltResources` | Yes | `--retry-state-migration`, four buckets | `filesystem-full`, `verification`, `reserved-path`, `durability-indeterminate`, `cleanup-deferred`, `source-oversize`, `memory-admission`, `record-oversize`, `disk-preflight`, `source-changed` **only as a retirement-cursor halt** |
 
@@ -1341,7 +1409,7 @@ pre-published.
 | **M1** | Exact M0; **source + control revalidated** | 52×, 512 MiB cap, RSS/cgroup, advisory `statfs`; claim/create the reserve; create + fsync the emergency candidate | Only after **both** identities and parents are durable | Row `M1`: backup absent, exact temp, exact current, or valid prior. Resume M2 idempotently | `source-oversize`, `memory-admission`, `disk-preflight`, `filesystem-full` |
 | **M2** | Exact M1; **revalidated** | Preamble-prefixed streaming copy to `legacy-json/<body-sha>.json`; publish/reuse the fixed `.bak`, preserving a differing prior under its own body hash first | Only after both exact backup witnesses and parents are durable | Row `M2`, **both branches**: `stagingMain: "absent"` (no file, or the sole create-ahead shape); or a recorded exact identity, where an incomplete id-owned main and only its own sidecars may be recovered/removed and rebuilt. Sidecar-without-main halts | `filesystem-full`, `reserved-path` |
 | **M3** | Exact M2; **revalidated before each of the three seams** | `claimStagingMain` (four observations) → **M-9 CAS-publishes the same-phase M2 revision recording that identity** → `importOwnedStaging` via `adoptClaimedStateStore(file, expected, install)`, one transaction, `migration_completion` last. A `completed` claim skips the import | Only after the committed completion tuple is reread and exact. WAL sidecars allowed until M4 | Row `M3`: exact committed id-bound staging; its own WAL/SHM may exist. Open only as migration owner, recover, rerun all M4 work | `record-oversize`, `memory-admission`, `filesystem-full`, `verification` |
-| **M4** | Exact M3; **revalidated** | Recover WAL, `wal_checkpoint(TRUNCATE)`, close, `S0`; reopen read-only, recompute the SQL digest/counts, validate ids, `foreign_key_check`, `integrity_check`; close, `S0` again; fsync; physical-hash bracketed | Publish M4 with the complete proof | Row `M4`: staging-only, or the M5 rename ran ahead. Revalidate identical hashes/completion, never move active backward, remove only a redundant exact staging name | `verification`, `filesystem-full`, `durability-indeterminate` |
+| **M4** | Exact M3; **revalidated** | **Rewritten in r6 / 163 v13.** On the **owning read-write** connection: recover WAL, recompute the SQL digest/counts, validate ids, `foreign_key_check`, `integrity_check` — *then* `wal_checkpoint(TRUNCATE)`, close, `S0` **once**; fsync; physical-hash bracketed. The withdrawn "reopen read-only … `S0` again" cannot succeed: staging is WAL-mode, the read-only verifier's first read recreates the sidecars and its close cannot remove them. Owned by lane 3A | Publish M4 with the complete proof | Row `M4`: staging-only, or the M5 rename ran ahead. Revalidate identical hashes/completion, never move active backward, remove only a redundant exact staging name | `verification`, `filesystem-full`, `durability-indeterminate` |
 | **M5** | Exact M4 hash; **revalidated** | Rename staging → `state.db`; remove only a redundant exact staging name; require staging absent and active `S0`; fsync `.rbox/state` | Publish M5 with the Q-sibling path + 58-byte hash **prebound**, disposition `absent`. **JSON remains authority** | Row `M5 + exact L`: sibling absent (+ the sole zero-byte create-ahead), recorded `building` at zero/partial/exact bytes, or recorded exact | `filesystem-full`, `reserved-path`, `durability-indeterminate` |
 | **M6** | Exact M5; exact sibling; **revalidated** | Ladder via same-phase CAS; revalidate live JSON + `.bak` + M5 completion/hash; **then, as the last operation before the rename with nothing between, re-verify the live body sha against the M3 source digest under the held `stateLockPath`**; rename; fsync `.rbox` | Publish M6 with sibling absent + the initial cleanup cursor. **Observing `Q` elects SQLite even if publication was interrupted** | Row `M5 + exact Q`: SQLite elected; never rename back. Complete/retry the `.rbox` fsync, publish M6. **`blocksSqliteWrites` is TRUE for this row** | `filesystem-full`, `reserved-path`, `durability-indeterminate` |
 | **M7** | Exact M6; complete nonfinal prefix; final item absent; prepared runway | **Publish M7 first**, converting resources to `retired`; **then** unlink the unused `r+1` sibling if exact-terminal and fsync; **then** unlink the control and fsync | M7 is the durable record of the final cleanup-absent prefix | Row `M7`: recorded `r+1` sibling exact-terminal or delete-ahead absent. **Retry bucket 3** covers a halt here | `cleanup-deferred`, `durability-indeterminate` |
@@ -1469,6 +1537,14 @@ English past 5 s per phase, with a structured `--json` twin.
 | **G6** | A leftover zero-byte staged file, or a `Q` sibling, at a path scoped to a **different authority id**; and a well-formed intent whose bound evidence differs from the live evidence (case 7) | Never deleted, never adopted, no `Q` published; reported by doctor as an inert artifact. **U3 grants no deletion authority over any of them** | — |
 
 F5/F6 assert **silence**; G5 asserts a **refusal**. One comment line each says so.
+
+**Widen the comparisons (r6).** `Q` byte-identical (F2) and `L` byte-identical
+(G3) survive literally but are too narrow: a stray `-wal`/`-shm` beside an
+untouched `Q` passes both. Every such fixture compares the **whole `.rbox`
+tree, sidecars included**. 5C additionally extends that snapshot to every
+genesis refusal, every migration halt, and every doctor inspection, and carries
+a **negative control in which a read-only open of the inspected database must
+fail the snapshot** — that control is what would have caught this defect.
 
 ### 7.2 Crash/disk-full/resume coverage
 
@@ -1638,6 +1714,24 @@ Depends on 1A, 2A, 2B, 3A, 3B, 3C. **opus, alone.**
 | **5B** | Doctor: the four buckets wired, `--abort-state-migration`, the standing-halt projection modeled on `reset-health.ts`, final copy pass | **opus** |
 | **5C** | **The genesis fleet checkpoint** (§7.7 — first reachable here), then F2/F3/F5/F6, the abort differential, the no-regression harness, duration budget, rig scenario. Harness *preparation* may run in parallel from Wave 3 | codex (harness) + **opus** (fixtures) |
 
+### The ownership rule, per lane (r6)
+
+Carried here so unbuilt lanes inherit the fix instead of rediscovering it. Full
+statement and evidence: 163 § "R4-v13 the ownership rule (v13)".
+
+| Lane | Inheritance |
+|---|---|
+| **3A** | **Blocker.** M4 verification as r5 specified it is impossible. Verify on the owning read-write connection, checkpoint after |
+| **5B** | Doctor must be **observation-only** on files it does not own |
+| **2D** | `assertAuthorityWritable` runs on the **hot path, every SQLite save**. File-level only, never a SQLite open, so nobody optimizes it into one |
+| **2C** | Selection via `classifyStateFormat` is pure-`fs` and safe; `reset/lifecycle.ts:65` `readLineage` is a live read-only open — do not adopt or resurrect it |
+| **4A** | "Any sidecar halts" is a precondition of M4→M5→M6 resume; an open-based check both leaves debris and trips its own halt |
+| **5A** | Per-mutator revalidation runs many times per migration; open-based revalidation multiplies debris linearly |
+| **5C** | Extend the sidecar-inclusive snapshot to every genesis refusal, migration halt, and doctor inspection; add the read-only-open negative control |
+| **3C** | Inertness must be a file-level judgement |
+| **3B** | No DB open in spec; note only |
+| **1B** | Not a victim — the **model**. The adopter removes the file *and* its sidecars on failure legally, because it owns the inode |
+
 ### Wave 6 — validation, serial
 
 Full crash-rig sweep → `/simplify` diff-scoped → parallel review fan-out → **one
@@ -1727,7 +1821,7 @@ None touches 163 v12's ratified row text; both v12 rows remain byte-identical.
 | # | Correction | Disposition |
 |---|---|---|
 | **1** (lane 1C, highest value) | The intent must be the sole source of `authorityId`/`lineageId` on every resume. As written, `establish(root, lineage, locks)` took a caller lineage while cases 2/3 rebuild "from step 4", whose `install` closes over it — so a coordinator minting a fresh lineage per invocation (the natural reading of that signature) installs ids that can never satisfy §2.5.1, and a **healthy** workspace live-locks into a permanent halt | **Folded, and carried by the signature, not just prose.** `establish(root, mintLineage: () => GenesisLineage, locks)` calls the thunk at most once and only with no intent to resume; a private `resume(root, intent, locks)` takes the intent and no lineage; step 4 installs `lineageFrom(intent)`. §2.4 states the rule in bold with the live-lock consequence spelled out, and an inventory test asserts `installGenesisLineage`'s only genesis caller derives its argument from an intent |
-| **2** (lane 1C) | §2.5.1 must evaluate through the read-only preflight; case 7 must precede case 5; cases 6–7 must raise `StateAuthorityCorruptError` | **Folded, all three.** §2.5.1 evaluates through `openStateStore`'s `readonly: true` preflight (`store/open.ts:249-262`, which exists precisely so a foreign SQLite file is not converted to WAL merely by being inspected) — otherwise a "zero-write halt" rule performs a write via WAL replay. §2.5.2 states the ordering and why (case 5 keys on `L` and does not reference §2.5.1, so it does not inherit the evidence check; without the ordering a copied `.rbox` would take case 5's cleanup path and delete another workspace's artifacts). Cases 6 and 7 now raise `StateAuthorityCorruptError`, which **deletes the genesis halt taxonomy before it is born**: no `MigrationHaltCode` member, no `MIGRATION_HALT_COPY` entry, no new copy — §6.4 already covers it — and it resolves the contradiction an unnamed "halt" created with §5.3 and 163:2612. The three genesis **refusals** are unaffected; they fire at step 1, before any mutation |
+| **2** (lane 1C) | §2.5.1 must evaluate through the read-only preflight; case 7 must precede case 5; cases 6–7 must raise `StateAuthorityCorruptError` | **SUPERSEDED IN PART (r6) — do not re-derive this.** The first of the three is **false**: a read-only open is not zero-write (163 v13's evidence), so the preflight prescription is withdrawn and replaced by the ownership rule; the other two stand. Original r5 disposition, for the record: **Folded, all three.** §2.5.1 evaluates through `openStateStore`'s `readonly: true` preflight (`store/open.ts:249-262`, which exists precisely so a foreign SQLite file is not converted to WAL merely by being inspected) — otherwise a "zero-write halt" rule performs a write via WAL replay. §2.5.2 states the ordering and why (case 5 keys on `L` and does not reference §2.5.1, so it does not inherit the evidence check; without the ordering a copied `.rbox` would take case 5's cleanup path and delete another workspace's artifacts). Cases 6 and 7 now raise `StateAuthorityCorruptError`, which **deletes the genesis halt taxonomy before it is born**: no `MigrationHaltCode` member, no `MIGRATION_HALT_COPY` entry, no new copy — §6.4 already covers it — and it resolves the contradiction an unnamed "halt" created with §5.3 and 163:2612. The three genesis **refusals** are unaffected; they fire at step 1, before any mutation |
 | **3** (lanes 2C + 2D) | Collapse A-2's two-read fence into one exported `assertAuthorityWritable(root)` in the coordinator | **Folded.** One call replaces a duplicated branch, halves the hot-path reads, and fixes a **real §7.9 boundary violation**: as written, `whole-state-compat.ts` imported from both `migration/` and `genesis.ts`, so "exactly one module imports both" was false and lanes 2C/2D would have collided over ownership. 2D now owns the predicate and **lands before 2C** |
 | **4** (163 editorial) | Qualify 163:2613 and widen `C` at 163:2589 | **Folded.** `absent \| absent \| absent` becomes `absent \| absent \| absent, and no genesis intent`, so it cannot overlap the v12 in-progress row under first-match reading; `C`'s definition now reads "evidence for the record that owns it — the migration control ordinarily, or the genesis intent on the two v12 intent-keyed rows". Both are surrounding definitions, **not** the amendment; the two v12 row texts are untouched |
 | — | `entry_count = repo_count = 0` and `lineageId` are tautological / defense-in-depth | **Recorded, not changed** (§2.5.1). Both are in the ratified row text; cutting either costs a re-ratification for zero safety. They are now explicitly named non-load-bearing so nobody later mistakes them for the reason the conjunction is sound — `authorityId`, the identity, and the evidence are |
