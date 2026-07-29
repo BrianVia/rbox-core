@@ -81,7 +81,6 @@ const ENTRY_POINTS: readonly EntryPoint[] = [
 const EXEMPT: ReadonlyMap<string, { sites: number; reason: string }> = new Map([
   ["src/cli/state-plane/errors.ts::<module>", { sites: 1, reason: "StreamMismatchError renders the stable legacy authority path but never reads or writes it" }],
   ["src/cli/reset-journal.ts::activeStatePath", { sites: 1, reason: "the local state-path constructor itself" }],
-  ["src/cli/state-plane/paths.ts::<module>", { sites: 1, reason: "the SQLite reset path table names the legacy authority-marker path but never reads or writes it" }],
   ["src/cli/reset-journal.ts::beginResetJournal", { sites: 2, reason: "hashes the caller-supplied prepared bytes and names the candidate path; the live document is read by its guarded caller under the same lock" }],
   ["src/cli/sync-git/p-settlement.ts::settleExactPresentArtifact", { sites: 4, reason: "uses statePath only to name the protocol lock class; the save itself is applyStateSavePacket" }],
   ["src/cli/scan-probe.ts::loadScanProbe", { sites: 2, reason: "a local statePath naming .rbox/state/scan-probe.json, not the state plane" }],

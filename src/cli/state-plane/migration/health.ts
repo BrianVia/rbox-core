@@ -1,29 +1,41 @@
 /**
- * Migration halt taxonomy (design 163 §U3, R4-ROLLOUT M5).
+ * Migration halt taxonomy (design 163 § "512 MiB and typed non-looping halts",
+ * :3326).
  *
- * U3 introduces roughly fifteen fail-closed halt classes, each of which stops
- * sync and each of which must ship with plain-English AND machine-readable
- * doctor copy. This module is the CLOSED contract those halts are drawn from:
- * `MigrationHaltCode` is the exhaustive union, and `MigrationHealth` is the
- * result a state-plane migration probe reports.
- *
- * It is deliberately a TYPE SKELETON. U3 replaces the empty union with the
- * concrete codes; this file gains no runtime logic and no filesystem or SQLite
- * access. The exhaustive `satisfies Record<MigrationHaltCode, …>` copy mapping
- * in `doctor-state-plane.ts` is the merge gate: the day a code is added here
- * without its human + machine copy, the build stops compiling.
+ * This module is the CLOSED contract every fail-closed migration halt is drawn
+ * from. It holds types only: no runtime logic, no filesystem, no SQLite. The
+ * exhaustive `satisfies Record<MigrationHaltCode, …>` copy mapping in
+ * `doctor-state-plane.ts` is the merge gate — a code added here without its
+ * human + machine copy stops the build.
  */
 
-// U3 replaces `never` with the closed union of the ~15 migration halt codes
-// (design 163:4482). Every member added here must gain an entry in
-// MIGRATION_HALT_COPY (doctor-state-plane.ts) or the build fails.
-export type MigrationHaltCode = never;
+/** The ten stable halt reasons (163:3326). `source-changed` is expressible only
+ * as a retirement-cursor halt; `durability-indeterminate` and `cleanup-deferred`
+ * are the only two expressible after `Q`. */
+export type MigrationHaltCode =
+  | "source-oversize"
+  | "memory-admission"
+  | "record-oversize"
+  | "disk-preflight"
+  | "filesystem-full"
+  | "source-changed"
+  | "verification"
+  | "reserved-path"
+  | "durability-indeterminate"
+  | "cleanup-deferred";
 
-/** A single fail-closed migration halt: which class stopped the migration. U3
- * adds any per-code detail fields; today the closed `code` alone is the
- * contract every producer and every copy entry is keyed by. */
+/**
+ * One fail-closed migration halt, exactly as the durable control records it
+ * (163:3339). It carries no phase: a halt is phase-preserving by construction
+ * and the control it is published into already names the phase, so a second copy
+ * could only ever disagree.
+ */
 export interface MigrationHalt<Code extends MigrationHaltCode = MigrationHaltCode> {
   readonly code: Code;
+  /** The originating syscall or SQLite code, retained verbatim. */
+  readonly underlyingCode: string | null;
+  readonly required: number | null;
+  readonly available: number | null;
 }
 
 /** What a state-plane migration health probe reports. `healthy` is the ordinary

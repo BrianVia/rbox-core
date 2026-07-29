@@ -97,10 +97,91 @@ export interface MigrationHaltCopy {
 }
 
 /**
- * Exhaustive halt-code → copy map. The `satisfies Record<MigrationHaltCode, …>`
- * is the gate the sweep asked for: the day U3 adds a code to `MigrationHaltCode`
- * without human + machine copy here, this file stops compiling. Empty today
- * because `MigrationHaltCode` is empty today; U3 fills one entry per code.
+ * Exhaustive halt-code → copy map (design 222 §6.3). The
+ * `satisfies Record<MigrationHaltCode, …>` is the gate: a code added to
+ * `MigrationHaltCode` without human + machine copy here stops this file
+ * compiling. Never advise deleting `Q` and never advise restoring a backup —
+ * every command below is real and non-interactively twinned.
  */
 export const MIGRATION_HALT_COPY = {
+  "source-oversize": {
+    human: {
+      problem: "This workspace's state file is larger than rbox can convert.",
+      safety: "Nothing changed; the workspace keeps working on the old format.",
+      command: "run the conversion once on a machine with more memory, or re-adopt this workspace",
+    },
+    machine: { id: "state-migration/source-oversize", severity: "blocked" },
+  },
+  "memory-admission": {
+    human: {
+      problem: "Converting this workspace needs more memory than this machine can spare.",
+      safety: "Nothing changed.",
+      command: "run the conversion once on a machine with more memory, or re-adopt this workspace",
+    },
+    machine: { id: "state-migration/memory-admission", severity: "blocked" },
+  },
+  "record-oversize": {
+    human: {
+      problem: "One entry in this workspace's state is too large to convert.",
+      safety: "Nothing changed.",
+      command: "rbox doctor",
+    },
+    machine: { id: "state-migration/record-oversize", severity: "blocked" },
+  },
+  "disk-preflight": {
+    human: {
+      problem: "There isn't enough free disk space to convert safely.",
+      safety: "Nothing changed.",
+      command: "free up space, then run `rbox migrate`",
+    },
+    machine: { id: "state-migration/disk-preflight", severity: "blocked" },
+  },
+  "filesystem-full": {
+    human: {
+      problem: "The disk filled up partway through. rbox stopped instead of leaving a half-converted workspace.",
+      safety: "Your old state is still the one in use and is intact.",
+      command: "free up space, then run `rbox doctor --retry-state-migration`",
+    },
+    machine: { id: "state-migration/filesystem-full", severity: "blocked" },
+  },
+  "source-changed": {
+    human: {
+      problem: "Cleaning up after an interrupted conversion didn't finish.",
+      safety: "Your current state is untouched and still in use.",
+      command: "rbox doctor --retry-state-migration",
+    },
+    machine: { id: "state-migration/retirement-source-changed", severity: "attention" },
+  },
+  verification: {
+    human: {
+      problem: "The converted state didn't match the original exactly, so rbox refused to switch to it.",
+      safety: "Your original state is untouched and still in use. A copy of it is saved.",
+      command: "rbox doctor",
+    },
+    machine: { id: "state-migration/verification", severity: "blocked" },
+  },
+  "reserved-path": {
+    human: {
+      problem: "rbox found an unexpected file where it keeps its state and won't touch it.",
+      safety: "Nothing was deleted. Your state is unaffected.",
+      command: "rbox doctor",
+    },
+    machine: { id: "state-migration/reserved-path", severity: "blocked" },
+  },
+  "durability-indeterminate": {
+    human: {
+      problem: "rbox can't confirm the last write reached the disk, so it has paused writing to this workspace.",
+      safety: "No data was lost; rbox is being cautious.",
+      command: "rbox doctor --retry-state-migration",
+    },
+    machine: { id: "state-migration/durability-indeterminate", severity: "blocked" },
+  },
+  "cleanup-deferred": {
+    human: {
+      problem: "The conversion finished; tidying up one leftover file didn't.",
+      safety: "Your workspace is fully working on the new format and syncing normally.",
+      command: "rbox doctor --retry-state-migration",
+    },
+    machine: { id: "state-migration/cleanup-deferred", severity: "attention" },
+  },
 } satisfies Record<MigrationHaltCode, MigrationHaltCopy>;
