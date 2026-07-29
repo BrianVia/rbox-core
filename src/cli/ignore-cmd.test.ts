@@ -2,7 +2,11 @@ import { afterEach, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+import type { FileEntry, IgnoreMatcher, Manifest } from "../engine/index.js";
 import { listIgnoreRules } from "./ignore-cmd.js";
+import { assertNoUnevaluatedPurgeDeletes, MassDeleteGuardError } from "./sync/policy.js";
+import { preparePublishCandidate, type GitCapturePort, type PublishPolicy } from "./sync/publish-candidate.js";
 
 const originalLog = console.log;
 afterEach(() => { console.log = originalLog; });
@@ -32,4 +36,131 @@ test("bare ignore collapses builtins while --list prints every rule", async () =
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Design 224 §2.4 — purge corrections. `rbox ignore --purge` was the outlier on
+// all three: it named the wrong recovery command, ignored the env-var consent its
+// own error text advertises, and carried a second copy of the unevaluated-repo
+// refusal that could drift from the enforcing one.
+// ---------------------------------------------------------------------------
+
+const PURGE_HINT = "rbox ignore --purge --allow-mass-delete";
+
+const entry = (p: string): FileEntry => ({ path: p, sha256: "a".repeat(64), size: 1, mode: 0o644, mtimeMs: 0, type: "file" });
+const manifest = (files: FileEntry[]): Manifest => ({ generatedAt: "2026-07-29T00:00:00.000Z", files });
+
+function stubCapture(): GitCapturePort {
+  return {
+    async execute(plan: { planId: string }) {
+      return {
+        planId: plan.planId,
+        plan: {
+          changed: false, authoredCfgHashByRepo: {}, captured: [], carried: [], supersededPending: [],
+          protectedPending: [], deferred: [], captureDeferrals: {}, configDeferrals: {}, captureObserved: [],
+          configObserved: [], skipped: [], removed: [],
+        },
+      };
+    },
+    notifyBusyDeferred() {},
+    async observe() {
+      return { kind: "no-change" as const, acceptedSequence: 0, observedRepos: [], deferralUpdates: {} };
+    },
+    reportCapturePlan() {},
+    async carryBaseOnNoOp() {},
+    logPublicationLine() {},
+  } as unknown as GitCapturePort;
+}
+
+const PASSTHROUGH: IgnoreMatcher = { ignores: () => false };
+
+function purgeCandidate(
+  appliedBase: Manifest,
+  local: Manifest,
+  matcher: IgnoreMatcher,
+  policy: Partial<PublishPolicy> = {},
+): Promise<unknown> {
+  return preparePublishCandidate(
+    { acceptedSequence: 0, appliedBase },
+    {
+      manifest: local,
+      matcher,
+      projected: true,
+      caseCollisions: [],
+      authority: "authoritative",
+      async recordProjection() {},
+    },
+    stubCapture(),
+    {
+      purgeIgnored: true, repairing: false, syncGit: false, filesFirstEnabled: false,
+      filesFirstAborted: false, streamMismatch: false, forceGitRecapture: new Set<string>(),
+      allowMassDelete: false, now: () => new Date("2026-07-29T00:00:00.000Z"),
+      ...policy,
+    },
+  );
+}
+
+/** 1999 of 2000 deleted: over both legs of the push-side mass-delete breaker. */
+const massDeletePurge = (policy: Partial<PublishPolicy> = {}): Promise<unknown> => purgeCandidate(
+  manifest(Array.from({ length: 2000 }, (_unused, i) => entry(`f${i}.txt`))),
+  manifest([entry("f0.txt")]),
+  PASSTHROUGH,
+  policy,
+);
+
+const caught = async (p: Promise<unknown>): Promise<Error | undefined> =>
+  p.then(() => undefined, (e: unknown) => e as Error);
+
+test("the purge-path mass-delete guard names the purge command, not `rbox push`", async () => {
+  const err = await caught(massDeletePurge({ massDeleteHint: PURGE_HINT }));
+  expect(err).toBeInstanceOf(MassDeleteGuardError);
+  expect(err!.message).toContain(PURGE_HINT);
+  expect(err!.message).not.toContain("rbox push");
+  // The env var the message advertises must actually be honored by the purge path.
+  expect(err!.message).toContain("RBOX_ALLOW_MASS_DELETE=1");
+});
+
+test("without a hint the guard still falls back to the push wording (unchanged for other flows)", async () => {
+  const err = await caught(massDeletePurge());
+  expect(err).toBeInstanceOf(MassDeleteGuardError);
+  expect(err!.message).toContain("rbox push --allow-mass-delete");
+});
+
+test("purge honors RBOX_ALLOW_MASS_DELETE, exactly like every other consent site", async () => {
+  const dir = path.dirname(fileURLToPath(import.meta.url));
+  const consent = /allowMassDeletePush = [^;]*process\.env\.RBOX_ALLOW_MASS_DELETE === "1"/;
+  for (const file of ["ignore-cmd.ts", "sync-cmd.ts", "main-dispatch.ts", "recover-cmd.ts"]) {
+    const source = await fs.readFile(path.join(dir, file), "utf8");
+    expect([file, consent.test(source)]).toEqual([file, true]);
+  }
+  // …and the purge invocation is exactly the hint the guard prints.
+  const ignoreCmd = await fs.readFile(path.join(dir, "ignore-cmd.ts"), "utf8");
+  expect(ignoreCmd).toContain(`deps.massDeleteHint = "${PURGE_HINT}"`);
+});
+
+test("consent lets the same purge through, so the guard is the only thing refusing", async () => {
+  expect(await caught(massDeletePurge({ allowMassDelete: true, massDeleteHint: PURGE_HINT }))).toBeUndefined();
+});
+
+test("the unevaluated-repo purge refusal has ONE source of truth: preview and publish emit the identical message", async () => {
+  const blocked: IgnoreMatcher = {
+    ignores: () => true,
+    unevaluatedGitRepoForPath: (p) => (p.startsWith("hidden/") ? "hidden" : undefined),
+  };
+  let previewError: Error | undefined;
+  try {
+    assertNoUnevaluatedPurgeDeletes(blocked, ["keep.txt", "hidden/drop.txt"]);
+  } catch (e) {
+    previewError = e as Error;
+  }
+  expect(previewError?.message).toMatch(/^refusing purge: cannot evaluate tracked files for git repo hidden/);
+
+  const publishError = await caught(purgeCandidate(
+    manifest([entry("keep.txt"), entry("hidden/drop.txt")]),
+    manifest([entry("keep.txt")]),
+    blocked,
+    { allowMassDelete: true },
+  ));
+
+  expect(publishError?.message).toBe(previewError?.message);
 });

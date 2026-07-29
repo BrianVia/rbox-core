@@ -1,4 +1,4 @@
-import { buildIgnoreMatcher, type Manifest } from "../../engine/index.js";
+import { buildIgnoreMatcher, type IgnoreMatcher, type Manifest } from "../../engine/index.js";
 import type { WorkspaceConfig } from "../config.js";
 import { RboxApi, type SyncRemote } from "../remote.js";
 import { envInt } from "../remote/resilient.js";
@@ -114,3 +114,24 @@ export const matcherForState = (root: string, cfg: WorkspaceConfig, state?: { la
     protectTrackedPaths: opts.purgeSafety === true,
     knownGitRepos: Object.keys(state?.lastSyncedManifest.gitRepos ?? {}),
   });
+
+/**
+ * Purge safety: a repo whose tracked set could not be evaluated may hold committed
+ * files among these deletions, and purge is the one flow that turns a local ignore
+ * verdict into a fleet-wide delete. Refuse rather than guess.
+ *
+ * ONE copy, deliberately: the preview (`rbox ignore --purge`) and the enforcing
+ * publish transition must refuse on the identical condition with the identical
+ * message, or the dry-run stops predicting what the real run does.
+ */
+export function assertNoUnevaluatedPurgeDeletes(matcher: IgnoreMatcher, deleted: readonly string[]): void {
+  for (const path of deleted) {
+    const repo = matcher.unevaluatedGitRepoForPath?.(path);
+    if (repo !== undefined) {
+      throw new Error(
+        `refusing purge: cannot evaluate tracked files for git repo ${repo} (first affected path ${path}). ` +
+          `Fix that repo's .git/index and retry.`
+      );
+    }
+  }
+}
