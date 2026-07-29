@@ -348,12 +348,26 @@ export function decodeMigrationControl(bytes: Uint8Array): MigrationControl {
   return control;
 }
 
-/** The C1 trigger. Both dispositions total-map to 163's single durable reason
+/**
+ * The C1 trigger. Both dispositions total-map to 163's single durable reason
  * (163:2727), so a second durable reason cannot be introduced. It lives here so
- * retirement (wave 3) does not depend on the flip (wave 4). */
+ * retirement (wave 3) does not depend on the flip (wave 4).
+ *
+ * Both carry the `replacement` witness because the durable retirement record
+ * requires one for its diagnostic `triggeringSource`, and the barrier inventory
+ * pins exactly one reader of the legacy document: a disposition that carried
+ * only a digest would force retirement to become a second reader of the very
+ * document it must never interpret. `observedBodySha256` is the JSON body hash
+ * the M6 pre-rename re-verify compares, which is not the witness's whole-file
+ * physical hash.
+ */
 export type C1Trigger =
   | { readonly disposition: "source-changed"; readonly replacement: SourceWitness }
-  | { readonly disposition: "legacy-write-detected"; readonly observedBodySha256: string };
+  | {
+    readonly disposition: "legacy-write-detected";
+    readonly replacement: SourceWitness;
+    readonly observedBodySha256: string;
+  };
 export const durableRetirementReason = (_: C1Trigger): "source-changed" => "source-changed";
 
 /**

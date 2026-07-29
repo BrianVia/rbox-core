@@ -254,6 +254,26 @@ export function promotePreparedControl(
   return replaceCanonicalControl(root, expect, prepared, true, locks);
 }
 
+/**
+ * The terminal transition: the migration's coordination record ceases to exist.
+ * Reached at a complete retirement prefix (163:2818) and at M7's finish
+ * (163:3125), and it lives here because this module is the control's sole
+ * writer — a deletion is a durable transition like any other.
+ *
+ * The CAS is the identity bracket. A control is a whole canonical record rather
+ * than an inode, so matching the exact migration id and revision under the held
+ * lock set proves more than a `dev`/`ino` pair would.
+ */
+export function retireCanonicalControl(
+  root: string, expect: PublishExpectation, locks: HeldStatePlaneLocks,
+): void {
+  void locks;
+  assertExpectation(readCanonicalControl(root), expect);
+  const file = migrationPaths.control(root);
+  fs.unlinkSync(file);
+  fsyncDirectorySync(path.dirname(file));
+}
+
 /** ENOSPC and EDQUOT are the two conditions the prebuilt runway exists for. */
 const isOutOfSpace = (error: unknown): boolean => {
   const code = (error as NodeJS.ErrnoException | undefined)?.code;
