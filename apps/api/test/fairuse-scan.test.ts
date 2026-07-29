@@ -31,6 +31,12 @@ beforeEach(async () => {
     db().prepare("DELETE FROM fairuse_leases"),
     db().prepare("DELETE FROM fairuse_account_queue"),
     db().prepare("DELETE FROM fairuse_scheduler"),
+    // Every file in a Workers shard shares one D1, and the fair-use scheduler
+    // discovers accounts globally: a foreign account row sorting below these
+    // ids wins `ORDER BY next_run_at,account_id` and consumes the invocation
+    // these tests expect to spend on their own account. Tombstoning leftovers
+    // makes this file the scheduler's whole world.
+    db().prepare("UPDATE accounts SET deleted_at=? WHERE deleted_at IS NULL").bind(NOW),
     db().prepare("DELETE FROM workspaces WHERE account_id LIKE 'acct_000_fairuse_%'"),
     db().prepare("DELETE FROM blob_refs WHERE account_id LIKE 'acct_000_fairuse_%'"),
     db().prepare("DELETE FROM accounts WHERE id LIKE 'acct_000_fairuse_%'"),
