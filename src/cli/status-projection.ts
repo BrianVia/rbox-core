@@ -292,6 +292,7 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
     : state.lastSyncedManifest;
   let counts: StatusLocalCounts;
   let cacheHint: StatusCacheHint | undefined;
+  let strandedIgnored: number | undefined;
   if (trusted) {
     const matcher = port.buildMatcher(root, {
       respectGitignore: false,
@@ -299,6 +300,7 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
     });
     const repoHints = cfg.syncGit ? await port.gitDivergenceFastRepoSource(root, state.lastSyncedManifest.gitRepos, matcher) : [];
     const gitStatus = await evaluateGit(undefined, repoHints, false);
+    strandedIgnored = trusted.local.strandedIgnored;
     counts = {
       added: trusted.local.added,
       changed: trusted.local.changed,
@@ -354,6 +356,7 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
     cacheHint = { cache: hashCache, livePaths: () => new Set(rawLocalManifest.files.map((f) => f.path)) };
     const projected = projectLocalManifest(rawLocalManifest, scopedBaseManifest, matcher);
     const localManifest = projected.manifest;
+    strandedIgnored = projected.strandedIgnored;
     // A full status scan owns current read-only disk truth for this invocation.
     // It never mutates the durable sidecar; the passive loop remains its writer.
     pathWarnings = buildPathWarnings(projected.caseCollisions);
@@ -420,6 +423,7 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
     remote,
     remoteLine: attributed.remoteLine,
     counts,
+    ...(strandedIgnored === undefined ? {} : { strandedIgnored }),
     localChanges,
     health: projectHealth({
       activity,

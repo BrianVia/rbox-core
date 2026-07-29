@@ -203,4 +203,31 @@ describe("adminPurgeWorkspace", () => {
     expect(Number((await db().prepare("SELECT COUNT(*) AS n FROM accounts WHERE id IN (?, ?)").bind(a.accountId, b.accountId).first<{ n: number }>())!.n)).toBe(2);
     expect(Number((await db().prepare("SELECT COUNT(*) AS n FROM devices WHERE account_id = ?").bind(a.accountId).first<{ n: number }>())!.n)).toBeGreaterThan(0);
   });
+
+  test("drops the workspace's fair-use group aggregate and paging checkpoint", async () => {
+    const account = await bootstrap("ws-purge-fairuse");
+    const ws = "ws_purge_fairuse";
+    const other = "ws_purge_fairuse_other";
+    await seed(account.accountId, ws, "root", [sha("ws-purge-fairuse")]);
+    const now = Date.now();
+    await db().batch([
+      db().prepare("INSERT INTO fairuse_workspace_group_totals(account_id,epoch,workspace_id,active_bytes,updated_at) VALUES(?,1,?,?,?)")
+        .bind(account.accountId, ws, 4_096, now),
+      db().prepare("INSERT INTO fairuse_workspace_group_totals(account_id,epoch,workspace_id,active_bytes,updated_at) VALUES(?,1,?,?,?)")
+        .bind(account.accountId, other, 7, now),
+      db().prepare(`INSERT INTO fairuse_group_progress(account_id,epoch,workspace_id,cursor_sha,partial_bytes,found_refs,updated_at)
+        VALUES(?,1,?,'',0,0,?)`).bind(account.accountId, ws, now),
+    ]);
+
+    const res = await adminPurgeWorkspace(env as Env, ws, { purgeWorkspace: async () => true });
+    expect((await body<{ done: boolean }>(res)).done).toBe(true);
+    // Keyed by workspace_id, so without this cleanup a purged workspace's bytes
+    // would keep summing into the account's active total.
+    const remaining = async (table: string, workspaceId: string) => Number(
+      (await db().prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE workspace_id = ?`).bind(workspaceId).first<{ n: number }>())!.n,
+    );
+    expect(await remaining("fairuse_workspace_group_totals", ws)).toBe(0);
+    expect(await remaining("fairuse_group_progress", ws)).toBe(0);
+    expect(await remaining("fairuse_workspace_group_totals", other)).toBe(1);
+  });
 });

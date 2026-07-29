@@ -12,7 +12,7 @@ import type {
 } from "../sync-git/git-capture-observation.js";
 import type { GitPushPlan } from "../sync-git/plan.js";
 import type { GitResolutionRider } from "../sync-git/resolution-intent.js";
-import { MassDeleteGuardError, pushMassDeleteTrips } from "./policy.js";
+import { assertNoUnevaluatedPurgeDeletes, MassDeleteGuardError, pushMassDeleteTrips } from "./policy.js";
 import type { PublishedGitTransition } from "./publisher-ack-transition.js";
 
 /**
@@ -45,6 +45,9 @@ export interface LocalObservation {
   recordProjection(projection: {
     manifest: Manifest;
     caseCollisions: CaseFoldCollisionGroup[];
+    /** Design 224 §2.3: base entries the matcher ignores — already-synced bytes
+     * stranded behind the ignore plane. Observability only. */
+    strandedIgnored: number;
   }): Promise<void>;
 }
 
@@ -200,18 +203,6 @@ function mergeCollisionGroups(
   });
 }
 
-function assertNoUnevaluatedPurgeDeletes(matcher: IgnoreMatcher, deleted: string[]): void {
-  for (const path of deleted) {
-    const repo = matcher.unevaluatedGitRepoForPath?.(path);
-    if (repo !== undefined) {
-      throw new Error(
-        `refusing purge: cannot evaluate tracked files for git repo ${repo} (first affected path ${path}). ` +
-          `Fix that repo's .git/index and retry.`
-      );
-    }
-  }
-}
-
 /**
  * Seal one publication candidate: project the local file plane, admit or refuse
  * it, execute exactly one Git capture effect, durably observe that capture, and
@@ -236,7 +227,7 @@ export async function preparePublishCandidate(
       ? cloneCollisionGroups(projected.caseCollisions)
       : mergeCollisionGroups(local.caseCollisions, projected.caseCollisions);
     candidate = projected.manifest;
-    await local.recordProjection({ manifest: candidate, caseCollisions });
+    await local.recordProjection({ manifest: candidate, caseCollisions, strandedIgnored: projected.strandedIgnored });
   }
 
   if (policy.purgeIgnored) {

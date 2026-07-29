@@ -434,8 +434,10 @@ test("design 178 B: repeated timer rearming coalesces to one composite probe", a
   daemon.armStandingRecovery();
   expect(clock.callbacks.size).toBe(1);
 
+  // The timer callback wakes the pump synchronously, so the run it starts is the
+  // signal to await — polling wall clock only races a loaded runner.
   clock.fireAll();
-  for (let i = 0; i < 100 && daemon.activity.halt !== undefined; i++) await sleep(2);
+  await daemon.pumpRun;
 
   expect(remote.pullCalls).toBe(1);
   expect(daemon.activity.halt).toBeUndefined();
@@ -484,8 +486,9 @@ test("design 178 B: a recovery wakeup arriving during pump exit persistence is n
     await originalSave(workspaceRoot);
   };
 
+  // Exit-time re-entry is awaited inside the same run, so the pump promise already
+  // covers the injected wakeup.
   await daemon.pump();
-  for (let i = 0; i < 100 && daemon.activity.halt !== undefined; i++) await sleep(2);
 
   expect(remote.pullCalls).toBe(1);
   expect(daemon.activity.halt).toBeUndefined();

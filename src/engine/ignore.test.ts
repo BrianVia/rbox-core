@@ -4,8 +4,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { buildIgnoreMatcher, isGitRefSignal, isHardExcluded, nativePruneGlobs } from "./ignore.js";
-import { scanManifest } from "./manifest.js";
+import { BUILTIN_IGNORE, buildIgnoreMatcher, HARD_PRUNE_DIRS, isGitRefSignal, isHardExcluded, nativePruneGlobs } from "./ignore.js";
+import { applyWatchEvents, scanManifest } from "./manifest.js";
 
 const exec = promisify(execFile);
 const git = (dir: string, ...args: string[]) => exec("git", ["-C", dir, ...args]).then((r) => r.stdout.toString().trim());
@@ -229,7 +229,10 @@ describe("builtin ignores — regenerable build/cache dirs (multi-ecosystem)", (
       "Pods/Local/podspec.json", // sometimes committed on purpose
       "vendor/patched-lib/x.go",
       ".vscode/settings.json", // editor config: untracked-but-precious
+      ".idea/workspace.xml", // editor config: untracked-but-precious
       "wandb/run-1/summary.json", // experiment data
+      "mlruns/0/meta.yaml", // experiment data
+      ".yarn/cache/pkg.zip", // Yarn PnP is committed on purpose by some projects
       "terraform.tfstate", // state FILES sync (E2EE backup is a feature)
     ]) {
       expect(m.ignores(p)).toBe(false);
@@ -373,7 +376,12 @@ describe("design 72 nested gitignore semantics", () => {
     }
   });
 
-  test("missing git index fails closed for a known repo", async () => {
+  // Design 224 §3.1 test 4: this fixture (git init, nothing ever added) is exactly
+  // the `indexAbsent` case, and its contract INVERTS. An index-less repo with no
+  // commits tracks ZERO files, so it no longer un-ignores its own subtree. The
+  // fail-closed guarantee that mattered — purge must not delete tracked paths —
+  // lives on `protectTrackedPaths`, asserted below alongside the new contract.
+  test("indexAbsent: an index-less repo with no commits has an EMPTY tracked set, not an unknown one", async () => {
     const d = await mkroot();
     try {
       const repo = path.join(d, "repo");
@@ -382,9 +390,117 @@ describe("design 72 nested gitignore semantics", () => {
       await fs.writeFile(path.join(d, ".gitignore"), "repo/\n");
 
       const m = buildIgnoreMatcher(d, { respectGitignore: true, knownGitRepos: ["repo"] });
-      expect(m.unevaluatedGitRepoForPath?.("repo/file.txt")).toBe("repo");
+      expect(m.unevaluatedGitRepoForPath?.("repo/file.txt")).toBeUndefined();
+      expect(m.prunes?.("repo/")).toBe(true);
+      expect(m.ignores("repo/file.txt")).toBe(true);
+      expect(m.tracked?.("repo/file.txt")).toBe(false);
+
+      // Purge protection reads the same empty set: nothing is tracked, so nothing
+      // is protected, and no repo blocks the purge refusal.
+      const purge = buildIgnoreMatcher(d, { respectGitignore: true, knownGitRepos: ["repo"], forceTrackedEvaluation: true, protectTrackedPaths: true });
+      expect(purge.unevaluatedGitRepoForPath?.("repo/file.txt")).toBeUndefined();
+      expect(purge.ignores("repo/file.txt")).toBe(true);
+    } finally {
+      await cleanup(d);
+    }
+  });
+
+  test("indexUnreadable: an index deleted from a repo that HAS commits still fails open (purge-safety)", async () => {
+    const d = await mkroot();
+    try {
+      const repo = path.join(d, "repo");
+      await fs.mkdir(repo, { recursive: true });
+      await git(repo, "init", "-qb", "main");
+      await git(repo, "config", "user.email", "test@example.com");
+      await git(repo, "config", "user.name", "Test User");
+      await fs.writeFile(path.join(repo, "committed.txt"), "committed");
+      await git(repo, "add", "committed.txt");
+      await git(repo, "commit", "-qm", "base");
+      await fs.rm(path.join(repo, ".git", "index"));
+      await fs.writeFile(path.join(d, ".gitignore"), "repo/\n");
+
+      // HEAD resolves, so the empty `git ls-files` output is NOT evidence of an
+      // empty tracked set. Without this signal, purge would delete committed files.
+      const m = buildIgnoreMatcher(d, { respectGitignore: true, knownGitRepos: ["repo"] });
+      expect(m.unevaluatedGitRepoForPath?.("repo/committed.txt")).toBe("repo");
       expect(m.prunes?.("repo/")).toBe(false);
-      expect(m.ignores("repo/file.txt")).toBe(false);
+      expect(m.ignores("repo/committed.txt")).toBe(false);
+    } finally {
+      await cleanup(d);
+    }
+  });
+
+  test("indexUnreadable: a stat failure that is not ENOENT still fails open", async () => {
+    const d = await mkroot();
+    try {
+      const repo = path.join(d, "repo");
+      await fs.mkdir(repo, { recursive: true });
+      await git(repo, "init", "-qb", "main");
+      await fs.writeFile(path.join(repo, "keep.txt"), "x");
+      await git(repo, "add", "-f", "keep.txt");
+      await fs.writeFile(path.join(d, ".gitignore"), "repo/\n");
+      // Make the index unstattable without removing it: `stat()` on a path whose
+      // PARENT directory is unsearchable fails EACCES, not ENOENT.
+      await fs.chmod(path.join(repo, ".git"), 0o000);
+      try {
+        const m = buildIgnoreMatcher(d, { respectGitignore: true, knownGitRepos: ["repo"] });
+        expect(m.unevaluatedGitRepoForPath?.("repo/keep.txt")).toBe("repo");
+        expect(m.ignores("repo/keep.txt")).toBe(false);
+      } finally {
+        await fs.chmod(path.join(repo, ".git"), 0o700);
+      }
+    } finally {
+      await cleanup(d);
+    }
+  });
+
+  test("index-less repo no longer defeats the builtin ignore list (design 224 §3.1)", async () => {
+    const d = await mkroot();
+    try {
+      const repo = path.join(d, "proj");
+      await fs.mkdir(path.join(repo, "node_modules"), { recursive: true });
+      await fs.mkdir(path.join(repo, "venv"), { recursive: true });
+      await git(repo, "init", "-qb", "main");
+      await fs.writeFile(path.join(repo, ".gitignore"), "node_modules/\n");
+      await fs.writeFile(path.join(repo, "node_modules", "x.js"), "mod");
+      await fs.writeFile(path.join(repo, "venv", "y"), "venv");
+      await fs.writeFile(path.join(repo, ".env"), "SECRET=1");
+      await fs.writeFile(path.join(repo, "keep.txt"), "real");
+
+      const m = buildIgnoreMatcher(d, { respectGitignore: true });
+      expect(m.ignores("proj/node_modules/x.js")).toBe(true);
+      expect(m.ignores("proj/venv/y")).toBe(true);
+      expect(m.ignores("proj/.env")).toBe(true);
+      expect(m.prunes?.("proj/node_modules/")).toBe(true);
+      expect(m.prunes?.("proj/venv/")).toBe(true);
+
+      const manifest = await scanManifest(d, m);
+      expect(manifest.files.map((f) => f.path).sort()).toEqual(["proj/.gitignore", "proj/keep.txt"]);
+    } finally {
+      await cleanup(d);
+    }
+  });
+
+  test("a healthy repo that genuinely tracks a file under node_modules still syncs exactly that file", async () => {
+    const d = await mkroot();
+    try {
+      const repo = path.join(d, "proj");
+      await fs.mkdir(path.join(repo, "node_modules"), { recursive: true });
+      await git(repo, "init", "-qb", "main");
+      await git(repo, "config", "user.email", "test@example.com");
+      await git(repo, "config", "user.name", "Test User");
+      await fs.writeFile(path.join(repo, ".gitignore"), "node_modules/\n");
+      await fs.writeFile(path.join(repo, "node_modules", "keep.js"), "kept");
+      await fs.writeFile(path.join(repo, "node_modules", "drop.js"), "dropped");
+      await git(repo, "add", "-f", "node_modules/keep.js");
+      await git(repo, "commit", "-qm", "keep");
+
+      const m = buildIgnoreMatcher(d, { respectGitignore: true });
+      expect(m.ignores("proj/node_modules/keep.js")).toBe(false);
+      expect(m.ignores("proj/node_modules/drop.js")).toBe(true);
+      const manifest = await scanManifest(d, m);
+      expect(manifest.files.map((f) => f.path)).toContain("proj/node_modules/keep.js");
+      expect(manifest.files.map((f) => f.path)).not.toContain("proj/node_modules/drop.js");
     } finally {
       await cleanup(d);
     }
@@ -474,5 +590,153 @@ describe("design 72 nested gitignore semantics", () => {
     } finally {
       await cleanup(d);
     }
+  });
+});
+
+describe("design 224 §2.2 — a symlink is ignored iff the same-named directory is", () => {
+  const mkroot = async (): Promise<string> => fs.mkdtemp(path.join(os.tmpdir(), "rbox-ign224-"));
+  const cleanup = (d: string) => fs.rm(d, { recursive: true, force: true });
+  const paths = async (d: string, m = buildIgnoreMatcher(d)): Promise<string[]> =>
+    (await scanManifest(d, m)).files.map((f) => f.path).sort();
+
+  test("a symlink named like a builtin ignore dir is not emitted, at any depth", async () => {
+    const d = await mkroot();
+    try {
+      await fs.mkdir(path.join(d, "pkg"), { recursive: true });
+      await fs.mkdir(path.join(d, "outer"), { recursive: true });
+      await fs.writeFile(path.join(d, "real.txt"), "real");
+      await fs.writeFile(path.join(d, "target.txt"), "t");
+      for (const [dir, name] of [["", "node_modules"], ["", "dist"], ["", ".venv"], ["pkg", "node_modules"], ["pkg", "dist"]] as const) {
+        await fs.symlink("../target.txt", path.join(d, dir, name));
+      }
+      // Nested inside another ignored tree (the parent prune already hides it; this
+      // pins that the verdict does not depend on which guard fires first).
+      await fs.mkdir(path.join(d, "outer", "coverage"), { recursive: true });
+      await fs.symlink("../../target.txt", path.join(d, "outer", "coverage", "node_modules"));
+
+      expect(await paths(d)).toEqual(["real.txt", "target.txt"]);
+    } finally {
+      await cleanup(d);
+    }
+  });
+
+  test("a regular FILE named dist/build/target/coverage still syncs (R1 negative twin)", async () => {
+    const d = await mkroot();
+    try {
+      await fs.mkdir(path.join(d, "pkg"), { recursive: true });
+      for (const name of ["dist", "build", "target", "coverage"]) {
+        await fs.writeFile(path.join(d, name), "content");
+        await fs.writeFile(path.join(d, "pkg", name), "content");
+      }
+      expect(await paths(d)).toEqual([
+        "build", "coverage", "dist",
+        "pkg/build", "pkg/coverage", "pkg/dist", "pkg/target",
+        "target",
+      ]);
+    } finally {
+      await cleanup(d);
+    }
+  });
+
+  test("`!dist` and `!dist/` each re-include a dist SYMLINK exactly as they re-include a dist directory", async () => {
+    for (const negation of ["!dist\n", "!dist/\n"]) {
+      const d = await mkroot();
+      try {
+        await fs.writeFile(path.join(d, ".rboxignore"), negation);
+        await fs.writeFile(path.join(d, "target.txt"), "t");
+        await fs.symlink("target.txt", path.join(d, "dist"));
+        const m = buildIgnoreMatcher(d);
+        expect([negation, m.ignores("dist/")]).toEqual([negation, false]);
+        expect([negation, await paths(d, m)]).toEqual([negation, [".rboxignore", "dist", "target.txt"]]);
+      } finally {
+        await cleanup(d);
+      }
+    }
+  });
+
+  test("a real directory with the same name is still PRUNED, not merely ignored", async () => {
+    const d = await mkroot();
+    try {
+      await fs.mkdir(path.join(d, "node_modules", "deep"), { recursive: true });
+      await fs.writeFile(path.join(d, "node_modules", "deep", "x.js"), "x");
+      const m = buildIgnoreMatcher(d);
+      expect(m.prunes?.("node_modules/")).toBe(true);
+      expect(await paths(d, m)).toEqual([]);
+    } finally {
+      await cleanup(d);
+    }
+  });
+
+  test("the incremental watcher arm agrees with the full scan for a new symlink", async () => {
+    const d = await mkroot();
+    try {
+      await fs.writeFile(path.join(d, "target.txt"), "t");
+      await fs.writeFile(path.join(d, "keep.txt"), "k");
+      await fs.symlink("target.txt", path.join(d, "node_modules"));
+      await fs.symlink("target.txt", path.join(d, "link.txt"));
+      const m = buildIgnoreMatcher(d);
+      const incremental = await applyWatchEvents({ generatedAt: "", files: [] }, d, m, [
+        { relPath: "target.txt", kind: "add" },
+        { relPath: "keep.txt", kind: "add" },
+        { relPath: "node_modules", kind: "add" },
+        { relPath: "link.txt", kind: "add" },
+      ]);
+      expect(incremental.files.map((f) => f.path).sort()).toEqual(["keep.txt", "link.txt", "target.txt"]);
+      expect(await paths(d, m)).toEqual(incremental.files.map((f) => f.path).sort());
+    } finally {
+      await cleanup(d);
+    }
+  });
+
+  test("a base entry for a now-ignored symlink is dropped by the incremental arm, not carried", async () => {
+    const d = await mkroot();
+    try {
+      await fs.writeFile(path.join(d, "target.txt"), "t");
+      await fs.symlink("target.txt", path.join(d, "node_modules"));
+      const m = buildIgnoreMatcher(d);
+      const base = {
+        generatedAt: "",
+        files: [{ path: "node_modules", type: "symlink" as const, symlinkTarget: "target.txt", sha256: "0".repeat(64), size: 10, mode: 0o777, mtimeMs: 0 }],
+      };
+      const next = await applyWatchEvents(base, d, m, [{ relPath: "node_modules", kind: "change" }]);
+      expect(next.files.map((f) => f.path)).toEqual([]);
+    } finally {
+      await cleanup(d);
+    }
+  });
+
+  test("a nested `.rbox` is hard-excluded as a directory AND as a symlink", async () => {
+    const d = await mkroot();
+    try {
+      await fs.mkdir(path.join(d, "a", "b", ".rbox"), { recursive: true });
+      await fs.writeFile(path.join(d, "a", "b", ".rbox", "state.json"), "{}");
+      await fs.mkdir(path.join(d, "c"), { recursive: true });
+      await fs.writeFile(path.join(d, "target.txt"), "t");
+      await fs.symlink("../target.txt", path.join(d, "c", ".rbox"));
+      await fs.writeFile(path.join(d, ".rboxignore"), "!.rbox\n!a/b/.rbox\n!c/.rbox\n");
+
+      const m = buildIgnoreMatcher(d);
+      expect(isHardExcluded("a/b/.rbox")).toBe(true);
+      expect(isHardExcluded("a/b/.rbox/state.json")).toBe(true);
+      expect(m.ignores("a/b/.rbox/state.json")).toBe(true);
+      expect(m.prunes?.("a/b/.rbox/")).toBe(true);
+      expect(m.ignores("c/.rbox")).toBe(true);
+      expect(await paths(d, m)).toEqual([".rboxignore", "target.txt"]);
+    } finally {
+      await cleanup(d);
+    }
+  });
+
+  test("HARD_PRUNE_DIRS stays a bare-name subset of BUILTIN_IGNORE, and vendor/bundle survives", () => {
+    const bareDirNames = new Set(
+      BUILTIN_IGNORE.filter((p) => p.endsWith("/") && !p.startsWith("!") && !p.slice(0, -1).includes("/") && !/[*?[\]]/.test(p))
+        .map((p) => p.slice(0, -1))
+    );
+    bareDirNames.add(".git"); // the one slashless hard exclude that is also a prune dir
+    for (const dir of HARD_PRUNE_DIRS) {
+      expect([dir, dir.includes("/"), bareDirNames.has(dir)]).toEqual([dir, false, true]);
+    }
+    expect(BUILTIN_IGNORE).toContain("vendor/bundle/");
+    expect(buildIgnoreMatcher(root).ignores("vendor/bundle/gems/x.rb")).toBe(true);
   });
 });

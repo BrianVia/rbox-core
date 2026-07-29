@@ -622,10 +622,15 @@ async function runPushAttempt(
       projected: attemptState.candidateProjected,
       caseCollisions: attemptState.caseCollisions,
       authority: attemptState.observationAuthority,
-      recordProjection: async ({ manifest, caseCollisions }) => {
+      recordProjection: async ({ manifest, caseCollisions, strandedIgnored }) => {
         attemptState.caseCollisions = caseCollisions;
         attemptState.local = manifest;
         attemptState.candidateProjected = true;
+        try {
+          deps.onStrandedIgnoredObserved?.(strandedIgnored);
+        } catch {
+          // Design 224 §2.3: a detector count can never change publication correctness.
+        }
         try {
           await deps.onCaseCollisionObservation?.({
             authority: attemptState.observationAuthority,

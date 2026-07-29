@@ -44,6 +44,9 @@ export interface StatusSnapshot {
   /** Local-only advisory: ambiguous case-fold path groups are skipped while the
    * rest of the file plane continues syncing. Never promotes to a halt. */
   pathWarnings?: { groupCount: number; pathCount: number };
+  /** Design 224 §2.3: already-synced entries that match the ignore rules and are
+   *  carried forward rather than deleted. Advisory; `rbox ignore --purge` clears it. */
+  strandedIgnored?: number;
   populate?: {
     phase: TransferPhase;
     filesDone: number;
@@ -893,6 +896,8 @@ export function healthDetailLines(s: StatusSnapshot): string[] {
   if (halt && halt.typedReason?.kind !== "push-conflict" && !halt.terminal && active && !out) {
     lines.push(`${style.yellow("⚠ last attempt failed")} ${style.dim(`(${relTime(halt.at, s.now)})`)} ${halt.reason} ${style.yellow("— will be retried")}`);
   }
+  const stranded = strandedIgnoredLine(s.strandedIgnored);
+  if (stranded) lines.push(stranded);
   if ((s.gitDeferrals ?? 0) > 0 && s.gitOldestDeferral) {
     lines.push(`${style.yellow("git deferral:")} oldest ${ageBucket(s.gitOldestDeferral.deferredSince, s.now)} · ${gitDeferralReasonText(s.gitOldestDeferral.reason)}`);
   }
@@ -904,6 +909,18 @@ export function healthDetailLines(s: StatusSnapshot): string[] {
  *  share one formatting rule. */
 export function humanBytes(bytes: number): string {
   return formatDecimalBytes(bytes);
+}
+
+/** Design 224 §2.3: the advisory line for already-synced files that now match the
+ *  ignore rules and are carried forward instead of deleted. `undefined` at zero —
+ *  the detector is only worth a line when there is something to act on. Count only:
+ *  the stored size is neither the billed nor the reclaimable number. */
+export function strandedIgnoredLine(count: number | undefined): string | undefined {
+  if (!count || count <= 0) return undefined;
+  const body = count === 1
+    ? "1 file matches your ignore rules but is still synced"
+    : `${n(count)} files match your ignore rules but are still synced`;
+  return `${style.yellow(`⚠ ${body}`)} · ${style.dim("rbox ignore --purge")}`;
 }
 
 /** The `rbox status` trash line (design 50 §2), or undefined when trash is empty — the

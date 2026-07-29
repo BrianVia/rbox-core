@@ -5,790 +5,390 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
-_SESSION 2026-07-28 (all-nighter, back half): **163 RATIFIED at v10 then
-REDUCED at v11, B0 shipped, #526 saga CLOSED with field proof, 212 V1 landed,
-v1.10.2 released.** (1) **Design 163**: R4 ratification round (2 opus lanes +
-codex serial ×6, all artifacts in docs/design/notes/163/) drove v5→v10;
-RATIFIED, then founder requirement reductions produced **v11 (RATIFIED
-AMENDMENT, #544)**: migration is LOCK-EXCLUSIVE ("parked car" — runs only
-holding the workspace mutation locks, entered via `rbox upgrade`'s stop window
-or foreground `rbox migrate`; paired-interval live-writer sampling DELETED as
-a U3 requirement; residual race reclassified excluded-scenario/defense-in-depth,
-F1–F6 kept as regression nets); the U3 drain gate reads the EXISTING
-rbox-admin version view (founder confirmed it exists — #540 closed invalid;
-users: 1 on 1.6 nudgeable friend, 2 on 1.9.x, fleet on dev). Plan:
-B0 ships as 1.11.0 → U1/U2 on main → 2.0 branch only for U3 → U4a–f as 2.x →
-U5. ONE founder input owed: frozen machine profile (blocks U5 only). Fold
-integrity lesson baked into the doc's own provenance: two rounds falsely
-logged the schema closure — **verify folds by grep on committed bytes, never
-by review logs**. (2) **B0 IMPLEMENTED and merged (#539)**: Q-recognition with
-per-site AST-pinned inventory, typed unlocked-writer refusals, content-bound
-last-writer witness, 128-byte-headered reserve; 9 codex findings folded incl.
-a CRITICAL reset R0 rename race. 1.11.0 release train awaits founder tag.
-Follow-up: #542 (barrier read lacks O_NOFOLLOW). (3) **#526 CLOSED**:
-`rbox git republish <repo>` (#536, +884, spec + 12 codex findings in
-docs/design/notes/2026-07-28-526-republish-lever.md) field-validated same
-night — Mac published the restarted chain (`git-sync republish restarted`),
-desktop imported 24s after its last link-4 failure, FM recovered after moving
-its orphaned-stub `.git` to ~/rbox-recovery/savvy-core.git-stub-20260728
-(founder-approved; delete when confident). **Fleet git-sync is clean on all
-three hosts** — first time since early July. Mac runs 1.10.2-dev+2a9e860;
-desktop+FM still on dev #12 (receivers needed no change). (4) **212 V1 merged
-(#538**, ~1,920 lines, 53 tests; 12 codex findings — 2 real bugs fixed:
-scoped-CLEAN status, remove→pull→add rematerialization). Fleet validation
-still owed (needs fleet dev refresh). (5) **/simplify sweep** (founder-ordered,
-retro): #536 −24 lines pre-merge, #541 B0 honesty pass, #543 212 cleanup
-(scope-findings.json dead fields removed pre-release-window). Verdict across
-all three: implementations carry zero flourish beyond their designs.
-(6) **Second same-night writer incident**: codex with `--sandbox
-workspace-write` reverted an implementer's unstaged tree twice → STANDING
-RULE: review codex runs are `--sandbox read-only`; ONE writer per worktree;
-verify committed bytes with `git show HEAD:`. (#535 echo-clobber remains open;
-desktop carve-out for .claude/worktrees still in place — worktrees at
-~/agent-work/526-republish and /home/via/rbox-worktrees/212-v1 are strays to
-sweep after their branches are confirmed dead.) Founder queue: 1.11.0 tag ·
-machine profile · 212 fleet validation · #535 root-cause · #542._
+_SESSION 2026-07-29 (day): **the quota investigation — two PRs merged (#602,
+#603), a live upload leak root-caused, and Phase 2 GC found dead since
+~07-20.** Triggered by the founder's dashboard showing 87.9 GB billed against a
+5.1 GB workspace. Accounting itself is CORRECT (`used_bytes` == `SUM` over
+`blob_refs ⋈ blobs`, exactly, every account) — every charged byte is a real
+entitled blob. What was wrong was WHICH blobs got entitled._
 
-_SESSION 2026-07-27 (night) → 07-28 (early): **memory incident closed, desktop
-READ-WRITE, v1.10.2 shipped, 163/2.0 kickoff.** (1) **OOM root-caused end to
-end** (report: `/home/via/memory-incident-report-2026-07-27.md` on the desktop,
-§9 addendum): the 21.3GiB `bun` the kernel killed at 01:54 was a wave-8 reorg
-subagent's `timeout 120 bun test daemon-operation-scheduler.contract.test.ts`
-run 2s after editing the draft scheduler — retired-halt recoveryProbe spin,
-~21GiB in ≤48s. Forensic method that cracked it: Claude session transcripts
-(`~/.claude/projects/…` + subagents/) survive reboots/tmpfs and reconstruct
-exact commands AND exact code versions from Write/Edit payloads. No released
-build ever had the bug. Mitigations live: host swap 2→32GiB +
-user-slice MemoryMax=32GiB (founder), PreToolUse hook wrapping every agent
-`bun test` in a systemd 12G-capped scope (desktop, `~/.claude/hooks/`), and
-the structural fix #530. (2) **v1.10.2 RELEASED** (tag 551604cc, run
-30321597242 green, api.rbox.to/version=1.10.2): #530 scheduler spin guard
-only — dequeue retires recoveryDue with its halt + serviceLoop no-progress
-breaker (parks queue after 3), red-then-green verified. (3) **Desktop daemon
-READ-WRITE since ~21:14 EDT** (founder-ordered; the old "no flip before
-.rboxignore" precondition was struck — #531's memo proved ignores freeze,
-never delete): trusted pulls live (`scan 0.0s`), first publish calm (seq 817,
-3.2MB wire), manifest 83.7k→120.3k files, no #501 journal blowup yet — watch
-it. Worktrees now sync FROM desktop; Mac/FM exclude them via
-respectGitignore=on + repo .gitignore lines (rbox-core:40) — founder semantic
-confirmed correct ("sync unless gitignored AND respect on"); recommended
-re-include if wanted: `!.claude/worktrees/` in .rboxignore (verified; `/**`
-variant silently fails). NEW PAPERCUT: sync conflict artifacts
-(`*.conflict.md`) landing inside active agent worktrees get swept by
-`git add -A` (docs/papercuts.md; agents must stage by name). (4) **Docs
-merged**: #531 flip/ephemera memo (headline: NO new default-ignore set
-needed; open questions incl. respectGitignore per-device inconsistency),
-#532 design 213 pull-only live watch (DRAFT/NOT ALIGNED, 2nd codex round
-owed; urgency dropped now the whole fleet is read-write). (5) **163/2.0
-kickoff — v5 failed ratification** (2 opus lanes + codex: NOT-READY;
-correctness core praised, C4 inventory/schema drift/rollout failed). Fold
-rounds on `design/163-v6` (v6 + backend-first restructure): codex final
-serial = NOT-ALIGNED; **rounds one and two both falsely logged the
-RepoRecord schema closure (said-not-done) — verify fold claims by grep,
-never by the review log**. FOUNDER RATIFIED tonight: backend-first hybrid
-(B0→U0→U1→U2 reset→U3 flip/2.0→U4a–f on main→U5), B0 barrier gate incl.
-external-user adoption, downgrade floor 1.11.0, kill numbers p50≤200ms/
-p95≤400ms/RSS≤1.5GB. OPEN founder question: external users take the one-way
-migration before the payoff lands. v7 targeted fold (witness-table
-discipline) in flight on `design/163-v7` at session end; after it verifies →
-codex serial → ratify → B0 barrier becomes the next dev item (ships as
-1.11.0). ALSO QUEUED (founder yes tonight): #526 `rbox git republish` lever,
-design 212 V1 implementation. gh CLI token was re-authed via device flow
-(expired token blocked PRs mid-session)._
+_**FOUNDER RULING: bill on ACTIVE bytes only; history is never charged.**
+Storing history is acceptable (cost math penciled). That retires the
+`bound_bytes` 5× fair-use bound and the prune as requirements — see
+`bill-active-bytes-never-history` in session memory. Prod shape for the founder
+account: **120.96 GB charged vs 3.91 GB of live head content**; of 80,904 refs,
+51,262 are head, ~2,700 are real version history (3%), and **24,389 (30%) were
+charged but never appeared in any manifest** — upload orphans, not history.
+Version history was never the problem._
 
-_RELEASE 2026-07-27 (v1.10.1): **"a calmer help screen" SHIPPED** (tag at
-bacb5785, release run 30308973148 green, api.rbox.to/version = 1.10.1).
-Content: #527 only — root `rbox --help` shrunk to the six core-loop
-commands (no sections; pair/connect/logs demoted to `help --all`), full
-reference collapsed to one row per top-level command with flags stripped
-(key/trash/autostart/git families fold into parent rows; trash/git/
-autostart gained parent entries so their bare --help now renders the
-family overview). Completes the #510 memo's "ruthless primary surface"
-for BOTH screens; presentation-only, no command removed. Founder
-directions on record: "help --all can be larger. But root help should
-be smaller"; tag authorized via explicit go. Also: FLAKE-006 registered
-(credentials.test.ts "separate save processes serialize" — two-process
-lock race, CONFIRMED with all three witnesses on PR #527, fix direction
-in the entry, not yet fixed). Fleet still on dev build #11 (pre-#527);
-next dev build or release train picks it up._
+_**MERGED: #603 (design 225) — active bytes at head, no root walk.** The
+fair-use scan had NEVER completed for the founder account (12 aborted, 0
+complete): it aborted on any head advance AND, independently, walked every
+retained sequence at one root per page (~1,400 h for one of four workspaces,
+growing faster than it could be walked). Now computed from each workspace's
+head at parity with `refSetAt` — `refs(head) ∪ chainRefs ∪ {encManifestSha} ∪
+{sidecarSha}` ∩ `blob_refs` — via a new read-only `/roots-inspect?head=1` DO
+mode. `fairuse.ts` 1152 → 836. Migration **0035**. `history_computed` defaults
+to **1** so pre-migration completions keep reporting real history. **The
+billing flip is NOT in it** and has an unsolved piece: `active_bytes` is
+epoch-lagged up to an hour, so it cannot be a synchronous admission gate
+alone. Inline mode was the trap — below `SIDECAR_THRESHOLD` there is no
+sidecar, and a sidecar-only reading returns ZERO for every small workspace._
 
-_POST-RELEASE ADDENDUM 2026-07-27 (late night): **savvy-core wedge
-ROOT-CAUSED — git pack chain discontinuity (#526).** Every fresh receiver
-(FM ~2 days, desktop since rejoin) loops on "bundle verify failed for git
-pack link 4": chain links are BASIS bundles (capture.ts:304-308), link 4's
-prerequisites aren't satisfied by links 0-3 for a from-scratch receiver
-(scar tissue from the July stash/conflict-ref episodes), and the sequential
-import fail-closes (shared.ts:571). The publisher never notices — it holds
-all objects and receiver verify-failures produce NO wire signal (design-174
-meta-lesson recurring); the only degrade-to-full path fires on basis
-CREATION failure, never on receiver import failure. A content-neutral ref
-nudge (published seq 789) added a new link to the same broken chain —
-useless, as predicted in hindsight. Desktop savvy-core briefly materialized
-a .git skeleton then rolled back (correct cleanup). FIX DIRECTION (#526):
-(1) `rbox git republish <repo>` operator lever — force full-bundle chain
-reset from the publisher; unblocks the fleet same-day; (2) structural:
-receiver import-failure feedback → automatic compaction. NOT built yet —
-awaiting founder go. Also: Mac's only remaining deferral is
-Personal/home-dashboard ("incoming checkout ref could not be published
-safely"), unrelated. Founder's CLI feedback branch
-(codex/cli-surface-help) verified byte-identical to the merged #510 memo —
-already merged, steps 1-2 + registry SHIPPED in v1.10.0; remaining memo
-items (Max validation checkpoint, setup-demotion remainder, keyed
-materialization design) queued per founder hold. Healthy-chain receiver
-materialization benchmark for a savvy-core-class repo: ~30-60s from
-publish. Operator kit completed on the desktop (founder-authorized rsync
-from Mac): dev-keys/prod-keys/release-private-key .local.secret + .env,
-all git-ignored. Papercut filed: `rbox logs` stitches legacy un-timestamped
-crash dumps after current lines (7/26 refwatch fossil read as a live
-release blocker; cost ~20 min). New issues this stretch: #525
-(rbox transfer-test command), #526 (chain republish). Queued founder
-decisions: #526 lever go, 212 V1 implementation go, desktop read-write
-flip (needs agent-scratch .rboxignore), memo remainder timing._
+_**MERGED: #602 (design 224) — an index-less git repo defeated every ignore
+rule.** A repo with `.git/` but no `.git/index` (`git init`, nothing committed)
+made `loadTrackedRepoSet` report `available: false`, which made every path
+"possibly tracked", which UN-IGNORED the whole subtree. Field: 6 of 328
+subtrees on the Mac had that exact shape and held **31,828 stranded entries**;
+the other 319 held zero. `node_modules`, `venv`, `__pycache__` and 2 real
+`.env` files went up — the secrets patterns `BUILTIN_IGNORE` exists to enforce.
+Fix = taxonomy split: `indexAbsent` (rev-parse ok + stat ENOENT + **unborn
+HEAD**) → `available: true, paths: ∅`; everything else keeps fail-open. The
+third signal is load-bearing — a repo WITH commits that lost its index also
+yields an empty tracked set, and misclassifying it would let `ignore --purge`
+delete committed files fleet-wide. Also: a symlink is now ignored iff a
+same-named directory is (the trailing-slash builtins are directory-only in
+gitignore semantics), and `rbox status` surfaces the stranded count. **Recovers
+zero bytes** — stops accumulation, makes the strand visible and purgeable._
 
-_RELEASE 2026-07-27 (night): **v1.10.0 SHIPPED** (tag 929d2ee3, release
-run 30303334623 green: build + 3-platform smoke + publish; changelog live).
-Headlines: plain-English doctor + machine-wide status/doctor --all on the
-new binding registry, real [PATH] help surface, packs + fused crypto +
-delta publish default-on (defaults-ledger test guards the class), adopt
-journal batching (#501 stopgap; SQLite half stays 2.0), RBOX_HOME
-isolation. Pre-tag validation: Mac→FM singles 16.1/14.6s vs 15.3s baseline
-(on-par — single-file latency is cadence-bound, a future workstream),
-150-file burst 21.3s clean, regress 0 FAIL (dev-keys secret now on the
-desktop too), release-commit CI green. Fleet on dev build #11 (eeefdfc,
-zero load-bearing env vars). Founder authorizations on record: prod
-promotion (#506 et al) and the v1.10.0 tag ("1.10 is fine if all that
-passed" → CI success → tag). Open after release: 212 V1 implementation
-(ALIGNED, awaiting go), read-write flip for the desktop (needs
-agent-scratch .rboxignore), #517 plaintext-phrase fix, cli-audit batch
-#513-#521, transfer-test command (#525), logs provenance papercut._
+_**OPEN — design 226: a deferred git repo uploads ~3 blobs per push tick and
+discards them.** Measured on the desktop: **9,982 push ticks → 9,983 receipts**
+in 13.5 h, one-to-one, none ever referenced. Chain: a stuck pending section
+forces `processRepoSlowPath(..., {forceCapture:true})` every tick
+(`plan.ts:891-903`) → capture UPLOADS before any decision
+(`engine/git/shared.ts:755-782`) → `provePendingSupersession` fails →
+`revertCapture` discards the section and the log prints `captured 0`, HIDING
+the upload → `push.ts:665-668` short-circuits on `no-op` so the receipt is
+never redeemed OR discarded → receipts accrete for the daemon's lifetime
+(`remote/context.ts:35`) → the next real commit drains and charges the lot.
+`store.has()` can NEVER hit for these (a receipts PUT writes the canonical key
+with no D1 row, `present=0`), so even byte-identical recapture re-uploads. Fix
+= move the upload AFTER the decision (encrypt/flush split; encryption is
+convergent so the ref is computable offline). Two review rounds done, both
+CHANGES-REQUIRED, round 3 pending. Reclamation is `gcMark` on the canonical
+prefix, NOT staging GC (which only lists `staging/`). Receipts expire server-
+side at 12 h (`receipts.ts:10`)._
 
-_EVENING RIDER 2026-07-27: **the sensible-defaults purge + parallel streams.**
-CLI surface: founder+codex decision memo merged (#510, supersedes the
-51-command inventory); memo steps 1-2 SHIPPED (#511 — default help shows
-real [PATH] signatures, `start` front-door overload removed; setup demoted
-from first screen per founder). #512: RBOX_HOME credential isolation
-(#505 closed) + doctor positional [PATH]; 9 cli-audit defects filed
-(#513-#521; #517 = plaintext recovery phrase on non-macOS, has teeth).
-Blob-pack arc COMPLETE: #509 writer default-on after FM fast-pipe proof
-(48.7→75-82 Mbps, 1.54x, per-connection at line rate). Crypto (#508):
-profiling proved the encrypt lane memory/VFS-bound — cores-derived worker
-default ran BELOW one serial core; cross-fleet sweep (3 architectures,
-12/12) fixed the knee at 4; fused path (d99, dark) proven
-address-identical → #522 ships fused default-on + 4-worker cap +
-**defaults-ledger test** (every perf flag's default pinned in one reviewed
-table — the fix for the shipped-dark class; 4th instance found today).
-115's calibration addendum superseded (falsified). Design 212 (selective
-sync, Max's ask) ALIGNED r3 under the cap: pull-only scoped bindings,
-three-layer publish seal + witness-integrity, r1's 15 findings banked as
-the V2/read-write entry fee; implementation not started. Design 211
-(binding registry + status/doctor --all) agent mid-review, PR pending.
-**Fleet build #10 (1.9.1-dev+6a33b0c): all hosts, bare-started — ZERO
-load-bearing env vars remain on the fleet.** Next-frontier notes: pack
-lane's ~2.3Gbps fused plateau = main-isolate serialization (post-zstd);
-decrypt lane worker count unmeasured._
+_**PHASE 2 GC HAS BEEN DEAD SINCE ~2026-07-20 — `roots_budget_exceeded`, and
+it is a SCALING WALL, not a tuning knob.** `maxW = floor((800-10-5-3-1)/90) =
+8` (`gc-policy.ts`, used `gc-purge.ts:223`) and prod has **12 workspaces**, so
+`workspaceSnapshot` returns null and `gcPurge` exits before the lease. Result:
+**1,337,881 condemned blobs / 375.8 GB of R2 unreclaimable and growing
+hourly**, 835 delete-intents frozen since 07-08. Raising the budget cannot
+work: 12 × 90 = 1,080 subrequests against Cloudflare's hard 1,000 ceiling. It
+also cannot shard workspaces across ticks, because Phase 2 needs the COMPLETE
+reachable set to delete safely — which is why design 151 chose to fail closed.
+**PARKED at founder instruction** (do not touch without a fresh ask). One probe
+worth running first: deletion is already gated on zero-refs, and 0 of 1.34M
+condemned blobs are referenced — so the global reachability re-check may be a
+redundant second belt that happens to cost the platform limit. Phase 1 is
+healthy and DOES reclaim `used_bytes`; only R2 deletion is blocked._
 
-_DAY SESSION 2026-07-27 (afternoon, "re-evaluating life"): **desktop
-REJOINED the fleet + two features shipped + prod promoted.**
-(1) via-desktop-ubuntu is a fleet member again: the in-place `--adopt` of
-the stale ~/Development replica was KILLED mid-overlay after proving an
-O(n²) journal defect (120MB journal fully rewritten per file event, 55GB+
-written in 18min, ~6-day projection — **#501**, real fix belongs in the
-163 SQLite store; 20-line batching stopgap optional). Rejoin went
-rename-aside (`~/Development.pre-rejoin`, KEEP until soak confirms) +
-empty-dir join + pull-only materialize; 15 linked worktrees parked at
-`~/Development.pre-rejoin-worktrees/` (git worktree move, all functional).
-Git plane had proven ~identical pre-kill (210/212 branches equal). Daemon
-pull-only; read-write flip pending founder + .rboxignore for agent scratch.
-Fresh-join hazard found: tracked `.env` files deleted by materialize
-(apps/web/.env.* restored from git — needs an issue).
-(2) **rbox doctor triage SHIPPED (#503**, closes #498): plain-English
-ordered findings (what's wrong / is data safe / one paste-safe scoped
-command), all-workspaces machine view outside any workspace, `--json` twin.
-3 review rounds under the NEW HARD CAP (AGENTS.md + dev-cycle skill:
-max 3 rounds, one must execute code; round-3 residue → step out a layer /
-founder tie-break / kill switch — never round 4). Review killed 14+4+1
-real defects incl. offline-misdiagnosed-as-signed-out, blanket
---allow-mass-delete remedy, and two PRE-EXISTING prod bugs: doctor crashed
-on malformed state.json; daemonProcessMatches matched roots by SUBSTRING
-(prefix-sibling `/w/work-old` owned `/w/work`) — fixed to exact-argument
-match, shared by start/stop/status liveness.
-(3) **Design-204 false alarm corrected**: the morning corpus review called
-the delta flips "shipped dark" — WRONG, 204 shipped 7/26 (PR #458) and the
-fleet runs it; stale DRAFT header + stale README index caused it (papercut
-+ rule: verify "never shipped" claims via `git log -S`). Fleet env rollout
-of those flags was a NO-OP and was stopped.
-(4) **Blob-pack (114) validation**: prod acceptance was already live;
-writer canaried on dev — correctness PASS (123 packs, zero fallbacks,
-byte-identical read-back on a paired device), wall-time FAIL (~26% slower;
-**#504**). Blocker 1 (13-row blob_locations chunking → 385 stmts/5k-commit)
-FIXED via json_each single-JSON-param batches (**#506**, 850 API tests,
-independent opus review ALIGNED — also fixed a latent cross-chunk
-pack-fence bug on main, red/green pinned). Dev re-measure: redeem 1.92x →
-**1.07x** parity. Blocker 2 (7.5MiB fill starves encrypt→upload pipelining;
-worsens when producer slows) OPEN — RBOX_PACK_TARGET_BYTES sweep running on
-dev; FM fast-pipe originator test after. Fleet burn-in: RBOX_BLOB_PACK=1
-env on all 3 daemons (default still OFF in code; flip gated on blocker 2 +
-FM numbers). **#505**: RBOX_HOME does NOT isolate credentials (prod
-credential leaks into scratch envs) — real footgun, open.
-(5) **PROD PROMOTED** (explicit founder yes, 767b97c8→5720f852):
-API-worker delta was exactly #458+#506, no migrations, no web; deploy
-workflow green; prod health ok; fleet redeems at parity now.
-(6) **Fleet build #9**: 1.9.1-dev+5720f85 on all 3 hosts (canary-compiled),
-modes preserved, burn-in env preserved. Doctor field-validated on FM's
-day-old savvy-core deferral + desktop outside-workspace view.
-(7) Founder-facing: CLI surface review artifact
-(https://claude.ai/code/artifact/036e2673-884a-4005-9cdd-0759c8abf736 +
-gist 80fbf0fee5745f50b9ebdf2fe6b466ce) — 51 commands, plain-English blurbs,
-nested subcommands, notes exportable; annotation pass pending. Strategy
-session verdict logged: ~60/40 odds on passive-dropbox-for-devs; levers =
-doctor(done)/CLI shrink/selective-repo-sync design(NOT STARTED, Max's ask,
-zero docs exist)/deferral metric/adopt milestone (166+#501). desktop
-.zshrc SSH auto-tmux fix (failed attach no longer closes the connection)._
+_**NO DATA LOSS — the purge/re-grant hypothesis was KILLED with evidence.**
+Reconstructed the exact reachable set read-only (roots-inspect + head sidecar +
+refset codec): 0 of 51,262 head refs missing from `blob_refs`, 0 of 1,645
+marked candidates reachable, 0 of 1.34M `gc_candidates` referenced anywhere.
+Founder account sat bit-for-bit flat across 20 minutes of 2-min sampling.
+Reachability fails closed on every path — no truncating branch exists._
 
-_REORG CAMPAIGN COMPLETE (2026-07-27 ~09:30 local): **20 reorg merges,
-19/21 roadmap cycles** (#478-#496, #499). Every schedulable cycle is done;
-wave 6 (RecoverStateAuthorityAtDaemonBoundary +
-PublishDaemonRuntimeObservation, ~380-490 daemon.ts lines) stays PARKED on
-the design-163 store port BY ROADMAP DESIGN — it opens with the 163 track,
-not before. Final cycle w8c2 #499 (squash ce2d5320):
-DaemonOperationScheduler solely owns queue/wants, recovery episode, mutex
-backoff + durable starvation, active op, single-flight/drain; daemon keeps
-boundary admission + op bodies + halt records behind a typed executor;
-16-test contract file. Review caught TWO defects in the archived draft
-(never executed): refused-boundary exit re-entry hot-looped forever (now
-parks until next wakeup — provably equivalent to old daemon exit), and a
-tick-sensitive single-flight assertion. Field-validated same hour: fleet
-build 1.9.1-dev+ce2d532 on Mac+FM, Mac→FM smoke round-trip clean, trusted
-pulls + push normal, zero pump errors. Hotspots final: status-cmd 922→103,
-push.ts 1144→946, apply.ts 2291→1502, daemon.ts 3790→3330 (→~2,300-2,450
-after wave 6 lands on the 163 track). Next-biggest agent-confusion
-surfaces (encore candidates for the next thermo-nuclear sweep, founder
-undecided): follow.ts 1784, plan.ts 1474._
+_**Commit-time `active_bytes` was probed and KILLED (UNSOUND) — do not
+re-propose.** Three independent kills: prod runs delta admission
+(`RBOX_COMMIT_DELTA_ADMISSION: "enforce"`, `wrangler.jsonc:194`) so the commit
+path never sees the full ref set and `commitAccounting` only ever sees
+`newRefs`; head advances and accounting are not 1:1 in either direction
+(`repair` moves head with zero ref inspection); and cross-project dedup is
+unobtainable at commit time because a commit is scoped to one `(ws, proj)`.
+A scan self-heals from current state; an accumulator drifts silently forever._
 
-_Bun 1.4.0-canary validation (2026-07-27, founder-requested): canary
-1.4.0-canary.1 (the Rust-era major bump) installed SIDE-BY-SIDE in the
-session scratchpad (system bun stays 1.3.14 — `bun upgrade --canary`
-in-place would flip every session on the host). Full 6-shard suite GREEN
-under canary at wall parity (176s vs 172s stable); canary-compiled binary +
-compiled crypto-pool exit test sane (#270 class clear). ONE real finding →
-**#500 MERGED** (ebc6b7b6): canary treats GC-collected FileHandles as run
-errors and exposed a genuine fd leak — secureMoveNoReplace stranded the
-source parent handle whenever the destination O_NOFOLLOW walk refused
-(escape tests / hostile workspace); one fd per failed adoption move on
-stable. remote-repository-deletion.ts audited clean. POSTURE (founder call,
-same day, superseding the initial stable-until-release stance): **canary is
-now the MAIN bun on all three hosts** (`bun upgrade --canary`; desktop +
-Mac + FM all 1.4.0-canary) — future dev builds are canary-compiled; revert
-per-host with `bun upgrade --stable` (1.3.14) if a canary regression bites.
-Daemons were NOT rebuilt/restarted for this — they pick up canary-compiled
-binaries at the next normal fleet build. CI/deploy-api workflows run
-`bun-version: "canary"` EXCEPT the cross-compile legs: the first canary main
-run proved **canary publishes NO cross-target compile blobs** ("Target
-platform 'bun-darwin-aarch64-v1.4.0' is not available for download"), so
-ci.yml's cross-build job + all three release.yml pins stay `"1.3.14"`
-(inline-commented). The startup/size budget job is ALSO pinned stable —
-budgets measure the SHIPPED binary and releases build on stable. WATCH-ITEM
-for 1.4-goes-stable: canary-compiled `status-json` RSS is 48.6MB vs the
-42.55MB budget (+14% runtime baseline) — when repinning to a stable 1.4,
-either bun has slimmed down or the budgets need a founder-approved
-re-baseline. A separate transient workerd tarball-extract failure on
-attempt 1 was NOT reproducible locally or on rerun. Native per-target
-compiled-TUI matrix jobs are fine on canary._
+_**Fleet actions taken.** Deleted 6 empty `.git` skeletons on the Mac
+(`transaction-analyzer`, `dev-server-menubar-monitor`, `faceswap-video-api`,
+`LLM-brain`, `twitter-list-adder`, `proof-of-concepts`) — all had `index:
+MISSING` + no HEAD + `node_modules` on disk; projects untouched. Desktop and
+flat-meadow swept clean (`respectGitignore: false`, zero index-less repos).
+Desktop `main` fast-forwarded to origin._
 
-_Day-session riders (2026-07-27 morning): **#497 killed the three registered
-CI flakes** — root causes proven from CI attempt-1 logs (pull failed
-attempts via `gh api .../runs/<id>/attempts/1/jobs` BEFORE reruns overwrite
-them): git-state x2 + follow safety-linearization were detached git
-auto-maintenance (gc.pid tripping gitBusy / repack racing connectivity
-proofs) → suite-wide GIT_CONFIG env injection in scripts/test-preload.ts
-(repo config can't cover product-inited repos; cleanGitEnv spreads
-process.env); daemon-activity 178-B ran real ~5ms recovery timers →
-injected advancing now + ManualRecoveryClock. NEW follow.test.ts flake
-(174-C hung-subprocess timeout, #499 CI) recorded with proof — SECOND
-follow incident today; a third earns an investigation cycle. Rig FAST
-7/7 at the #494-497 checkpoint. Founder asks filed: #498 (`rbox status`
-anywhere → cumulative all-workspaces summary) + wants GitHub issues to
-become the public todo list. Ops note: worktree removal leaves the shell
-cwd dangling — one papercuts commit landed on the w8c2 branch and
-conflicted; use `git -C` absolute paths after removing a worktree._ Extracted owners: status-maintenance/
-projection/render/contract/read-port; git-capture-observation,
-publish-candidate, manifest-commit-executor, publisher-ack-transition;
-git-discovery-continuity, local-workspace-observer,
-local-observation-transition (LocalAuthority); remote-repository-deletion,
-received-git-config, clean-materialization, standing-branch-proof,
-follow-repo-transition, received-git-transition (w5c3), publish-local
-transition reducer (w7c3). Fleet: build #5 (110917d) both hosts, 5 blog
-smoke round-trips green (commit ~13-60s, branch switch 17s, branch delete
-21s Mac→FM); 2 merges since — next dev build due with the next merge. Rig
-7/7 twice. **Flakes ROOT-CAUSED (2026-07-27 day session), fix PR in flight
-(worktree flake-fixes):** (1) git-state.test.ts + a NEW third site
-(follow.test.ts:2086 "planned graph connectivity proof failed", main run
-30232946666 shard 1/6) share one cause — product-spawned git detaches
-auto-gc/maintenance whose gc.pid/repack races gitBusy + connectivity proofs
-under shard contention (evidence: PR #491 attempt-1 shard-5 log shows
-applied:false at git-state:482; gitBusy checks gc.pid); fix = suite-wide
-GIT_CONFIG_COUNT env injection (maintenance.auto=false, gc.auto=0) in
-scripts/test-preload.ts — reaches product-spawned git via cleanGitEnv's
-process.env spread (repo-level config can't cover product-inited repos).
-(2) daemon-activity 178-B sibling: test daemon ran REAL ~5ms recovery
-timers (PR #492 attempt-1 log: internal timer-pump consumed the probe
-before the test cleared the error; halt re-armed with original
-at/firstFailureAt) — converted to injected advancing now +
-ManualRecoveryClock per #403. NOTE: failed CI attempts get OVERWRITTEN by
-in-place reruns — pull flake evidence via
-`gh api .../runs/<id>/attempts/1/jobs` before it ages out. Process fixes
-last night: pull-before-rig unconditional; merges verdict-gated in a
-separate step (my gh identity BYPASSES branch protection, so watcher
-discipline is the real gate). Rig join-ahead fixture made idempotent
-(#483)._
+_**THIRD CYCLE NEEDED: `rbox git resolve` cannot resolve its own deferral
+states, and one message actively misleads.** Desktop `Personal/rbox-core`
+(`local-index`, since 07-27 19:08 — the rejoin) — `keep-mine` refuses BY DESIGN
+because the staging-area and operation-state lanes stay strict (1.7.18), and
+`take-theirs` points at the wrong host. Mac `Personal/home-dashboard`
+(`local-commits`, detached, since 07-27 15:19) has **ZERO local-only commits**
+and `take-theirs` STILL refuses with "local commits changed while the checkout
+was being confirmed" — which is `refusalMessage("local-commits")`
+(`git/resolve-presentation.ts:118`), a reason-keyed refusal, NOT a detected
+change. The token was identical across attempts. Both remain deferred; the
+1.9.1 worktree fixes (per-branch holds, squash-merge recognition, branch-
+deletion sync) are shipped and are NOT what these are hitting._
 
-_OVERNIGHT CHARTER (2026-07-27, founder-authorized ~00:00): run the 21-cycle
-reorg roadmap on all fronts; MERGE TO MAIN WHEN CONFIDENT (campaign-scoped
-grant); every ~3 merged PRs push a dev build to the fleet (Mac + FM, both
-read-write now) and watch logs for issues; rig run all every ~3-4 merges;
-target nearly-all cycles done by ~09:00 local. Protocol per cycle: agent
-implements from the roadmap contract (opus for fail-closed git seams, codex
-ok for read-only lanes), contract test red-first, MY gates re-run
-(typecheck+test:parallel), PR, merge on green. Parallel lanes allowed when
-file-disjoint (status lane ∥ push spine). Don't get bogged down: a cycle
-whose review finds deep problems parks as an unmerged PR; move on. Reorg
-PRs skip CHANGELOG (internal refactors — kills the merge-train conflicts).
-Cycles merged so far: w1c1 #478, w1c2 #479 (status-cmd 922→462). NO 1.10.0
-tag regardless._
+_**HOST: linuxbrew `node` is BROKEN on the desktop.** `which node` →
+linuxbrew 26.5.0, which cannot load its own gcc libs (`GCC_13.0.0`,
+`GLIBCXX_3.4.31/32` missing). `/home/via/n/bin/node` v24.18.0 works. Blocks
+`bun run typecheck` and will bite wrangler and `apps/web`'s `npm ci`._
 
-_Session addendum (2026-07-27, small hours): **FM IS NOW A FULL SYNCER**
-(founder decision): explicit `rbox start --read-write` — live watcher started
-(inotify raised to 1048576 first), FIRST-EVER FM trusted pull 23:33 UTC,
-echo-watched clean (2 publishes, no loop; the 07-21 echo bug class is fixed
-in 1.9.x). Correction: FM never had watcher exhaustion under current code —
-PULL-ONLY daemons never START a watcher (daemon.ts:772-777); #477 filed for
-pull-only deployments generally (no fleet host runs pull-only now). Mode
-intent verified sticky (bare start preserves pull-only — the post-07-21
-protection works). **Reorg campaign cycle 1 MERGED (PR #478)**:
-RefreshStatusDeferralAssertions — status's hidden hygiene write behind
-StatusMaintenancePort+receipt, contract test red-first; honest close-out:
-~24 lines moved, status-cmd.ts 922→945 (shrink comes from the next two
-status cycles), safe-change context 4 files → 71-line seam. One flake
-recorded (git-state detached-pointer, proof complete, docs/flaky-tests.md).
-Wave 1 continues: ProjectWorkspaceStatusDetail → RenderWorkspaceStatusSurface.
-FM sudo password was shared in-session — founder should rotate it._
+_SESSION 2026-07-28→29 (overnight): **U3 waves 1A/1B/1C + 2B are merged on
+`2.0`; 222's read-only-preflight premise is FALSIFIED and the ownership rule
+(#589, 163 v13) AWAITS FOUNDER RATIFICATION — it blocks lanes 3A/5B/5C; two CI
+flakes fixed on main; no release.** The prior-session block below is still the
+state of the program that led here._
 
-_Session addendum (2026-07-26, late night): **#469 SHIPPED and field-confirmed
-(PR #476, design 209 ALIGNED r3): first post-boot publish went ops=81120/7.9MB
-→ ops=1/603B on the Mac.** Mechanism pivoted mid-review (strip-from-wire was
-proven WORSE than the bug during fleet skew) to commit-seam mtime
-normalization — adopt the base entry when all ten identity fields ===;
-RBOX_MTIME_NORMALIZE=0 kills. Fleet on 1.9.1-dev+777fd48, both hosts. Full
-rig suite 7/7 PASS at c64a6110 (an earlier 7-failure scare was a STALE
-PRIMARY CHECKOUT running pre-#466 scenario code — papercut filed: rig must
-print tree provenance). NEW FOUNDER RULES (in dev-cycle skill + memory):
-phase-0 level-set + per-PR "did it help / did we make anything worse"
-close-out; rig FAST suite every ~3-4 sync-plane PRs and before any tag;
-git revert is a first-class option for net-unhelpful merges; ≤500-line file
-target + comments only for inexpressible constraints. NEXT CAMPAIGN (founder
-directive): wrap 476 ✓ → CLI surface reorganization — decompose around the
-#447 semantic-transition audit, agent-ergonomics objective; codex roadmap
-sweep dispatched (output → .claude/roadmap-2026-07-26-structural.md);
-docs/design/notes/2026-07-25-cli-surface-review.md committed for founder
-annotation. Design 163 (SQLite state plane) ruled VIABLE by founder — parked,
-sequenced after the reorg. git-plan perf design folds INTO the git-plane
-reorg cycle. NO 1.10.0 tag — fresh explicit go required._
+_**THE 2.0 BRANCH: U3 WAVE 1 COMPLETE, 2B IN.** `origin/2.0` was cut from main
+at **5535cc1e** and now sits at **132781dd**. Merge order: **#581** 1B (store
+adoption seam + SQLite save adapter) → **#583** 1A (migration control record +
+sole publisher) → **#588** 1C (genesis: the intent, the seven steps, the
+finishing conjunction) → **#590** never open a database rbox does not own →
+**#591** the duplicate-symbol CI gate → **#587** 2B (migration admission, the
+five M0 conditions as an ordered table, `withStatePlaneLocks`). Combined tree
+verified at **f80c35b3** (pre-#587): typecheck clean, `bun test src/cli/`
+**3572 pass / 0 fail**. **#586 Wave 2A** (classifier + PhaseReceipt) is OPEN,
+20/20 checks green, its review folded, awaiting a confirmation review.
+Six-wave plan lives in 222; routing stays bulk → codex, fail-closed seams →
+opus._
 
-_Session addendum (2026-07-26, night): **BURN-IN BUG SWEEP SHIPPED — 4 PRs
-merged (#471 #472 #474 #475), fleet on 1.9.1-dev+b374f1e, all fixes
-field-verified live.** Parallel root-cause wave over #459/#460/#464/#465,
-then design→adversarial-review→implement per lane. (1) **#464 → design 206
-(ALIGNED r5, 5-round ledger REVIEW-206.md, PR #475)**: P7 latch — no
-push/pull that moved the base gitRepos key set ever rebuilt the matcher
-(202's F2 "realigns provenance" claim was FALSE); shipped
-ensureMatcherProvenance at pump boundaries + matcher-generation stamped at
-observation START + watcher facade + fail-safe fused downgrade when a
-rebuild moves backend watch inputs (hot re-arm descoped → #473) + named
-skip= causes on every scan pull. FIELD-CONFIRMED: clone churn healed to
-`pull local=trusted` in ~4 min unattended (was: latched forever, restart
-required). (2) **#460 → design 208 (renumbered from 207 — Alchemy eval
-claimed 207 concurrently; ALIGNED r3, REVIEW-208.md, PR #474)**: reviews
-KILLED r1's whole-dir trash retirement (self-referential identity predicate)
-and bundle retention (recovery-state, → #470); shipped anchored rmdir-only
-skeleton sweep + journal key clearing + doctor `repo residue` section.
-FIELD-CONFIRMED: post-delete residue now just .git+.rbox (was 30M skeleton),
-doctor names it with the manual command. (3) **#465 → PR #471**: real root
-cause was semver rejecting `+build` — dev builds corrupted the ENTIRE
-ambient status record (witness, status version, mode promotion, and rbox
-stop's graceful drain = 60s SIGKILL on every fleet host); plus ps -ww
-truncation hardening; start now prints pid/version/mode and self-polls the
-witness (no more "re-run"). (4) **#459 CLOSED not-a-bug** (the 7.3MB
-"snapshots" were deltas; sink wiring proven live) → spun out #469 (fat
-deltas after boot/rescan — advisory churn in field-exact diffToOps; TOP
-next-cycle candidate, ~7.9MB+1.3s per boot/rescan) and PR #472 (mde
-delta/non_delta attribution on every commit + daemon wiring lock test +
-one-shot stderr sink). #472's line PROVED #469 live on its first benchmark
-commit (`mde delta ops=81120 bytes=7894911` after daemon restart).
-Benchmarks on b374f1e: clone→FM-applied ~50s wall (publish 21.2s, FM apply
-15.7s incl 2.0s git import); rm→published 23s (33.4KB delta, 4290 del ops);
-FM pull lines now self-attribute `skip=p1-watcher` (its inotify watcher is
-still dead — sysctl fix still pending, needs sudo). Issues filed: #469
-(fat delta), #470 (quarantine bundle lifecycle — unbounded growth, needs
-pinning design), #473 (watcher hot re-arm). Worktrees fix-459/460/464/465
-removed (all MERGED); raw review reports preserved in `.claude/`
-(review-206-r1..r4, review-207-r1..r3, spec-465). NO 1.10.0 tag — bake
-continues; fresh explicit founder go required (standing rule)._
+_**THE READ-ONLY-PREFLIGHT PREMISE IS EMPIRICALLY FALSE — #589 (163 v13 + 222
+r6) NEEDS FOUNDER RATIFICATION, MARKED NOT-FOR-MERGE.** Proven by four
+independent lanes (bun 1.4.0 / Linux / ext4): a read-only SQLite open creates
+nothing, but the **first read** — a bare `PRAGMA` suffices — creates `-wal` and
+`-shm`, and a read-only `close()` cannot remove them while a read-write close
+can. It is **WAL-only** (a `journal_mode=delete` DB is inert) and
+environment-dependent: in a `0555` parent the first read throws instead.
+`immutable=1` is not an escape — it silently ignores uncheckpointed WAL
+content, returning a confidently wrong verdict on a healthy database. This
+matters because 163 declares a stray sidecar an unremovable corruption
+signature, so a read-only refusal path **manufactures one on data rbox does not
+own**. Proposed normative rule: **never open a file you do not own** —
+ownership = *this code created the inode or is its sole durable authority*,
+never *this code holds the workspace locked*. Unowned files are decided from
+file-level facts; owned files may be opened and must `wal_checkpoint(TRUNCATE)`
+and close. The code half already shipped as **#590** (header-only identity gate
+read with `readSync`, no preflight open; that PR's first-revision
+`PRAGMA query_only` enforcement claim was false and is withdrawn — a pragma the
+caller can turn off was never enforcement). Consequences the unbuilt lanes must
+carry: **3A** — 163:3187-3193's M4 verification is unimplementable as written
+and must verify through the owning connection (blocker); **5B** — doctor
+becomes observation-only on files it does not own; **§M-3** splits
+frozen-window (physical `{bytes,sha256}` + a `bun:sqlite` import ban) from
+live-window (`store_meta.authority_id` + the `migration_completion` singleton,
+read through the owned connection). Branch:
+`docs/readonly-open-ownership-rule`._
 
-_Session addendum (2026-07-26, evening): **DESIGN 204 SHIPPED to main (PR
-#458, squash 514d6899) and burn-in STARTED on both hosts
-(1.9.1-dev+514d689).** Design `docs/design/204-delta-scoped-publish.md`
-ALIGNED r3 (2 codex + opus parallel wave → synthesis → codex serial gate →
-focused re-check; ledger `docs/design/REVIEW-204.md`). Parts: (A) preflight
-delta default-on — REVIEW-103 freeze DISCHARGED by a new enforce-mode server
-regression, green vs unmodified server; (B) manifest delta commits +
-RBOX_MDE_FAST_PULL default-on, mdeWritePolicy() both-seam lattice,
-base-integrity hash binding, evidence-fold→cold-walk fallback; (C) reduced
-lazy git-plan (journal-pair gating, scoped memos, C5 sub-phase buckets) —
-delta discovery + cross-repo fingerprint memo DEFERRED with banked evidence
-(REVIEW-204 §5.5 seed for the successor). Kill switches:
-RBOX_PREFLIGHT_DELTA/RBOX_MDE_DELTA/RBOX_MDE_SNAPSHOT(master)/
-RBOX_MDE_FAST_PULL/RBOX_GIT_PLAN_LAZY (=0 each). **Field results (warm):
-missing 4.1s→0.1s (77B up), commit 4.4s/12.5MB→2.7s/614B delta, FM pull
-manifest 0B (fold=evidence), FM pull wall 1.8s, Mac publish 15.6→11.3s,
-end-to-end Mac→FM 19.6→15.3s.** Dedup-shape regression check: fresh
-savvy-core clone (118M+36M git) Mac→FM files-usable 21.4s, git-complete
-25.7s; economic guard field-fired correctly (662KB delta chosen over 7.3MB
-snapshot on the 5k-file update). NEW top levers from C5 buckets: git-plan
-~2.5-3.1s (discover walk ~1-1.4s + other ~0.8s + fingerprint ~0.6s; journal
-preloop now 19ms) and ~4s unaccounted push wall (redeem/flush tails).
-Anomalies filed/open: #459 (mde non_delta cause= line — and seemingly ALL
-warningSink output — never reaches daemon.log; diagnostics-only), Mac `sp7`
-(7 repos re-spawn slow-path EVERY push — fingerprint never re-trusts;
-investigate during soak), two pre-existing main test failures
-(scripts/e2e/dev-backed-scenario.test.ts parsePairToken vs current `rbox
-pair` output — reproduced at 77329d9d). Soak sweep DONE same evening: rig
-FAST suite vs dev on the 204 build = 6/7 PASS (onboard 11.3s, two-device
-25.3s, mass-delete-guard 13.7s, type-flip 15.0s, idle-cpu 193.8s, join-ahead
-32.3s); git-entanglement's 7 failures bisected to PRE-EXISTING main drift
-(identical at f0bfb456) — #462 (ownership-hold/deferral-aging assertions,
-same rot class as #dev-backed parsePairToken). Deletion propagation ~4s via
-38.7KB delta BUT left 30M checkout residue on FM invisible to doctor — #460.
-`bun run test:parallel` SHIPPED (#461): local 6-shard suite ~126s vs 364s
-serial (8 shards WORSE at 141s, 16 faster-but-flaky at 100s — 6 is the
-sweet spot; zero flakes across three 6-shard runs so far). Late-evening
-additions: #466 merged (git-entanglement rewritten to the design-200
-deferral contract + aged-visibility step via 11-min state backdate —
-grammar-freeze marker preserved; rig FAST suite now fully green on the 204
-build); #468 merged (status shows email+plan via per-field account-profile
-fallback — field-verified on FM, fixes #467); fleet now runs DEV builds by
-standing founder rule (~/.rbox/bin/rbox → symlink to rbox-dev on all 3
-hosts, release parked as rbox-release; both daemons on 1.9.1-dev+bb419b6);
-FM parked pre-rebind daemon record removed (status noise). New issues from
-burn-in: #463 (RboxBar real transfer progress), #464 (202 trusted-pull
-stuck in scan after ignore-rules churn — top candidate for next cycle with
-the git-plan successor), #465 (rbox start over running daemon says
-'started/not witnessed' instead of 'already running'). NO 1.10.0 tag —
-bake first, fresh explicit go required._
+_**MAIN SINCE THE LAST RIDER — two flake fixes, no release.** **#584**: the
+design-178 B timer-coalescing test polled wall clock for ~200ms on a shard that
+stretched 5s of work to 236s; fixed by awaiting `scheduler.pumpRun`, a signal
+production already publishes — the poll loop is deleted, production untouched,
+red→green proven both ways. **#585**: the Workers-API fair-use scan test failed
+on cross-test leakage — the suite runs single-worker with no isolation, so
+every file in a shard shares one D1, and a leftover `acct-*` id (`-` < `_`) won
+`ORDER BY next_run_at,account_id` and stole the invocation; fixed by
+tombstoning leftover accounts in the file's own `beforeEach`. Both are in
+`docs/flaky-tests.md`. The generalizable half, worth knowing before writing any
+Workers test: **the API suite shares one D1 across every file in a shard
+(`maxWorkers: 1, isolate: false`), so a test whose subject reads a table
+globally must neutralize rows it did not create, not merely clean up its own**._
 
-_Prior addendum (2026-07-26, later): burn-in DONE on both hosts; #457 merged
-(refwatch crash fix — Linux fs.watch nameless-filename TypeError crash-looped
-FM's daemon; found because FM had never run a live watcher until its re-bind).
-FM re-bound as a FULL device (fresh credential — the 403-telemetry mystery
-device was FM; now zero 403s; old tree parked at
-~/Development.pre-rebind-2026-07-26; inotify raised via
-/etc/sysctl.d/60-rbox-inotify.conf). Measured after 202+203: Mac steady pull
-~5s (scan 0.0s, git-apply 0.2s/101 repos); FM notify→disk ~4.5s (trusted);
-end-to-end Mac→FM 19.6s (was ~29s). **Remaining bottleneck = Mac PUBLISH
-15.6s for a 40-byte change — the design-204 target**: (a) `missing` 4.1s =
-presence check for ALL 108,537 blobs (7.2MB hashes upstream) instead of
-delta-vs-proven-watermark; (b) `commit` 4.4s = full 12.5MB manifest snapshot
-upload (commit.delta AE family suggests delta machinery partially exists —
-find why snapshot path taken); (c) `git-plan` 2.7s = plan walk not yet
-203-treated. Open FM items: savvy-core git deferral ("artifact on checkout
-unavailable" — likely needs Mac-side ref movement to republish artifacts);
-watch for `git-ref-watch event error (degraded to dirty)` lines (would mean
-nameless events occur in practice). Issue #456: init --adopt displaces 90k
-files BEFORE validating workspace (adopt abort restored perfectly). NO 1.10.0
-tag yet — bake first, fresh explicit go required._
+_PRIOR SESSION 2026-07-28 (day + all-nighter): **v1.11.0 AND v1.11.1 SHIPPED; the
+163 backend track is DONE through U2 (B0, U0, U1a/U1b, U2 all merged); design
+163 is RATIFIED AT v12 and the U3 implementation design (222) reached GO; the
+2.0 branch is OPEN and U3 is under construction.** Everything below is the
+current state of that program — the per-PR narrative is compressed out._
 
-_Last updated: 2026-07-26 (**pull fast path merged — designs 202+203, targets
-v1.10.0 after fleet burn-in**). Origin: AE telemetry showed every pull paying
-O(workspace) fixed cost (fleet pull p50 64.5s; ~20s flat on the Mac's 108k-file
-workspace: scan 8-9.5s + git-apply ~7s + a telemetry-invisible post-pull scan).
-PR #455 (f393ef0e): design 202 (pull consumes the watcher-maintained manifest
-under trust predicate P1-P7, `unsettledPaths`, O(applied) post-pull patch,
-refuse-and-rescan-once mass-delete, `ManifestUpdate` partial/full-workspace
-provenance, kill switch RBOX_PULL_TRUST_WATCHER) + design 203 (lazy git-apply
-probes: zero steady-state git spawns, busy-eager-spawn-free, memoized identity,
-kill switch RBOX_GIT_APPLY_LAZY). Review: 2 codex(medium) + opus parallel wave
-→ synthesis → codex serial gate → focused re-check; /simplify 4-lane pass
-closed a push-path design-108 gap (installManifest seam) and made the patch
-truly O(applied). **Burn-in (in progress): Mac on 1.9.1-dev+f393ef0 — pull
-local=trusted, scan 0.0s, git-apply 0.2s/101 repos (was ~15s combined).**
-Blockers found on flat-meadow (both pre-existing): (1) watcher dead from
-inotify exhaustion (65536 watches < 77k files) → trusted path correctly
-refuses; fix = sysctl 60-rbox-inotify.conf + pull-only restart (needs Brian's
-sudo); (2) FM is the 403-telemetry device from the fleet digest (~60 rejected
-samples/hr; sync-state report failing) — needs device re-auth, restart does
-not clear it. Mac→FM propagation still ~29s until FM's watcher lives. NO tag
-until burn-in green + fresh explicit go.
+_**RELEASES.** **v1.11.0** (899c3568) = `rbox include` (the `rbox scope`
+rename + `rbox track --include`, #548) + the **B0 state-plane barrier** (#539,
+honesty pass #541, reserve-path fix #551) + `rbox git republish` (#536).
+**v1.11.1** (ee627099) = the **macOS ownership-spawn perf fix** (#570) + the
+**prerelease `next` channel** (#563 — `rbox upgrade --channel next`, prerelease
+tags publish beside `latest` and never over it; the review caught that
+dev-build semver precedence would have locked the whole fleet out of the first
+beta). NOTE for the next rider: the scheduler/memory fixes were v1.10.2, not
+1.11.0._
 
-Prior update (2026-07-25): (**v1.9.1 SHIPPED — design 200 implemented, field-validated,
-released fleet-wide in one day**). The whole arc: step 0 (#449 `deletion-pending`
-vocabulary, promoted to prod) → P2 (#450 ownership held-skip + no whole-repo
-escalation + doctor leftover-worktrees) → P3 (#451 content-equivalence cascade
-reduction) → P1+P1b (#452 witness → verify-only lock → exact-OID tombstone →
-ACK-only BASE retirement, + `ref-read-unreadable` vocabulary, promoted to prod)
-→ #453 witness-clause diagnostics → release `v1.9.1` (fd52389e), fleet upgraded
-(Mac, flat-meadow pull-only preserved, desktop). Implementation: codex
-(gpt-5.6-sol medium) from self-contained specs per worktree; review: 3 parallel
-opus adversarial lanes + codex serial merge gate — the wave found and fixed 3
-genuine blockers the full test suite missed (fail-open step-D guard, hidden-anchor
-suppression of new repos at removed paths with two acceptance tests codex had
-inverted to mask it, and §3.3b's packed-refs inode premise **falsified by
-measurement** — every packed-refs mutation is lock+rename ⇒ new inode; rebuilt
-as monotonic mtime-only baseline, design v13.3/v13.4 record both corrections).
-Rig `worktree-squash-lifecycle`: 10 red → 0 red (phase-1 carried-pending
-assertion relaxed per §9.6; design 201 reverses it). **Field validation on the
-Mac:** the machinery itself unwedged `savvy-core-v1` (witness passed, seq 483,
-BASE retired, flat-meadow pruned) after a one-time lineage-stale-receipt
-recovery (resurrect at remembered OID → no-op commit-tree advance → ACK
-re-stamps → delete; ACK origins only re-stamp when a ref MOVES), and a FRESH
-full agent lifecycle (worktree → commit through live hold → squash → teardown)
-ran clean end-to-end with zero recovery steps. `Personal/rbox-core` deferral
-cleared; its queued deletion completes when the founder's other agent's live
-worktree ends (designed per-ref hold). **24h zero-deferral soak started at the
-15:3x UTC release restart — the final "Mac unwedged" claim waits for it.**
-Standing-rule additions this session: prod promotions/release tags need a fresh
-per-action yes (one autonomous promotion got called out); cap arbitrage loops
-at 2-4 rounds; keep each dispatched agent's context small + self-contained
-(founder: "simplicity is key"); codex quota <10% until 07-29 → implementation
-routes to opus-5 medium subagents till then. NEXT: soak verification, then the
-parked queue (thermo-nuclear sweep of the git-sync subsystem post-landing,
-design 201 parked, SQLite 2.0 track, class-C degraded-workspace question, #447
-triage — the founder's other agent's PR). Previous update (2026-07-24
-refactor day — two ownership decompositions MERGED): #419 split `daemon-control.ts` (869 lines) into
-`daemon/runtime-state` + `daemon/process-control` + `daemon/log-reader` behind
-a 55-line explicit facade; #420 split `auth-cmd.ts` (2,171 lines) into ten
-`src/cli/auth/` workflow owners + `remote/auth-command-wire` (exact legacy
-wire) behind a 50-line barrel. Both reviewed here as move-fidelity audits
-(line-multiset + per-function body diffs against main — every body
-byte-identical modulo named-helper extraction; export surfaces locked by exact
-facade/surface tests). #420 needed fixes before merge: (1) design-number
-collision with #419 — both claimed 194; auth renumbered to
-**195-auth-command-decomposition.md** + REVIEW-195; (2) a latent CI landmine —
-`prompt-lazy.test.ts` asserted the Ink sentinel **in-process**, but CI shards
-run all files in ONE bun process, so any test-file addition can recolocate it
-with `prompt-ink.test.ts` and fail it deterministically (this PR did); fixed
-by running the whole assertion in a spawned child (codex, per spec).
-**Playbook lesson: an in-process global-state assertion is
-shard-partition-dependent — isolate such tests in a subprocess from day one.**
-Afternoon: **#421 MERGED** (design **196** sudo-upgrade home isolation —
-exe-scoped lock/release sidecars via the fenced lockfile primitive,
-pending/committed anti-rollback floor written around the rename, elevated
-runs never touch ~/.rbox; reviewed here, 3 nits fixed via codex: sudo hint
-on EACCES, honest pending-floor copy, no swallowed release warning) and
-**#418 MERGED** (design **197** privacy-safe onboarding funnel telemetry —
-ALIGNED after an opus round folded in the survivorship-bias fix:
-`firstFailure` now rides `onboarding_flow` so never-recovered initial-sync
-failures reach the funnel; REVIEW-197 logs the round). Evening: the codex `/thermo-nuclear-code-quality-review` roadmap (Mac
-session) drove two more decompositions — **#422 MERGED** (design **198**
-config.ts → workspace-config / sync-state-model / sync-state-store /
-reset-state; NOT pure-move: 3 helper renames + new fail-closed preconditions
-on the extracted `installGenesisResetStateUnderHeldLock`, all audited) and
-**#423 MERGED** (design **199** git-cmd → git/deferrals-command +
-git/resolve-command + git/resolve-presentation; opus-implemented, twice
-inventory-gated by the closed allowlist tests in base-composer-structure +
-reset-consent — those gates WORK). Design numbers: 194 daemon-control,
-195 auth-cmd, 196 sudo-upgrade, 197 onboarding-funnel, 198 config,
-199 git-cmd. **Standing flow change (AGENTS.md/CLAUDE.md/dev-cycle skill):**
-`/simplify` stays per-cycle; periodic codex thermo-nuclear review refreshes
-the ranked refactor roadmap and SUPERSEDES `/antislop-codebase`. Remaining
-roadmap (risk-ordered): key-delivery-fulfill (bake first), setup-cmd (couple
-to 197 impl), daemon.ts WS-subsystem-only, then apply/follow/push behind
-characterization harnesses. Telemetry read: Mac ws_e4abbfc6 (110 repos,
-2 deferrals ~24h) is single-handedly the 8-min pull p50 in client sync-phase
-— founder resolve pending; gc pipeline degraded (0 B purged 24h). Night:
-**8-reviewer thermo-nuclear sweep** → ranked roadmap at
-docs/design/notes/2026-07-24-thermo-nuclear-sweep.md (~40 verified findings,
-4 tiers, ~15 cleared-with-reasons; WS-extraction seam pinned for the
-daemon.ts cycle). Quick batch SHIPPED same night: **#424** (dead `heals`
-scaffolding), **#425** (canonical GIT_DEFERRAL_REASONS tuple + adopt
-emitJson + doctor preview dedupe), **#426** (auth-wire fetches now
-deadline-bounded — closed an unbounded-hang class on the pre-enrollment
-login path — + dead pairCreate lane deleted). CORRECTION folded into the
-roadmap: the journal.ts v1.7.24 legacy-recovery delete is gated on fleet
-adoption past 1.7.24 (Jethro still ON 1.7.24), not on a sweep.
-D1-D4 RULED (all as recommended) →
-**#427 MERGED** (shared executeOp between pump and recovery probe; recovery
-scans now clear watcher-degraded, recovery fullScan arms the quota probe,
-recovery pulls consume+record notify latency — the halt-inflated
-notify-latency telemetry corruption is FIXED; 8 characterization tests).
-**FLEET UPGRADED to 1.9.0** (all 3 hosts via managed rbox upgrade; FM
-pull-only preserved+witness-verified; Mac daemon skew 1.7.22→1.9.0 closed —
-its upgrade declined the restart "desired state changed" but autostart
-reconciled it back unaided). **Mac cleaned**: empty "test sync 2" workspace
-untracked (server-side ws_2f43377f still exists — dashboard delete is the
-founder's), 32 activity-litter dirs swept; the auth-failing agent_inN2
-daemon is NOT on the Mac — hunt it on another host via /observe-fleet.
-Desktop's 44 litter dirs unswept (permission classifier blocked the rm).
-**TIER 2 COMPLETE — #428-#431 all MERGED** (4 parallel batches, codex×3 +
-opus×1, each audited here): #428 API (platformSecretMatches + lease-liveness
-SQL fragment, bind orders preserved), #429 engine (fsutil errno predicates +
-canonical moveNoClobber with hook-threaded counters + device-secrets
-packaging), #430 remote+cmd (errorCode() + confirmDestructive with per-site
-policy fidelity; doctor deliberately unmigrated; one structural source-scan
-anchor updated in sync-mutex.test), #431 sync-git trio (present-witness in
-base-composer, throwing gitCommitAncestry with both fail-closed mappings
-preserved, default-partial hoist). Recurring codex tic: it minted an
-unrequested "design 200" doc in three separate batches — dropped each time;
-number 200 remains FREE. **LATE NIGHT — SWEEP #2 (8 opus reviewers, post-Tier-2)
-→ docs/design/notes/2026-07-24-thermo-nuclear-sweep-2.md.** Each lane got sweep
-#1's roadmap as an EXCLUSION list and was told to produce an executable plan or
-challenge the framing — so its value is 6 real defects + 4 corrected premises,
-not more cleanup ideas. **ALL 10 TIER-A ITEMS SHIPPED, #432-#438 MERGED**
-(7 parallel worktree opus agents, every fix proven red→green with the fix
-stashed, each diff audited here, main CI 18/18 green on the combined shard
-partition): **#432** viewer gate on workspace-KEK publish + stripe requeue into
-its batch + account-delete guard parity; **#436** multipart `retry_later` 503 no
-longer destroys the resume state (every file >90 MiB needed a full re-upload) +
-the first `staging/` R2 reclaimer; **#433** checkout lock probe fails CLOSED
-(an unreadable index.lock read as "no lock" → journal deleted while its lock
-lived → permanently stale-unattributed, doctor+human to recover); **#438**
-shutdown mutation gate no longer swallowed (a stop mid-pull was destroying
-held-attempt state for repos that never failed) + deferral precedence covered
-12/16 reasons with a fail-OPEN safe verdict, now compile-enforced; **#435**
-long-flag arity resolved per command (`rbox status --git <path>` silently ate
-both flag and path); **#434** `confirmDestructive` honours the interaction
-policy in all four modes (stderr-redirected runs threw instead of proceeding —
-and today's own test PINNED the bug); **#437** 14 command-layer fetches
-deadlined + a `bare-fetch` guard so the class cannot reopen. **Agent findings
-that beat the spec** (all verified here): `poolMap`'s docstring is WRONG — a
-throwing task stops only its own worker while siblings keep pulling, so the
-specified bare re-throw would have left ungated disk work racing the stop
-deadline (latch-and-drain instead); a strict per-command arity map would have
-broken `track --no-interactive` via HIDDEN_FLAGS (union base + per-command
-overlay instead); preserving multipart state alone turns the 404 into a 500
-(tolerate `NoSuchUpload` only when the prior staging object survives).
-**TWO OF MY OWN CLAIMS WERE WRONG:** notify.ts's idempotency_key is NOT dead
-weight — design 16 §4.4 says CF Email exposes no client idempotency key and the
-column is stored deliberately for a future one (correctly refused, not patched);
-and the confirmDestructive trigger is stderr-not-a-TTY, not `--no-interactive`
-(no call-site command even accepts that flag). **NEXT (Tier B, founder calls):**
-6 dark opt-in flags with zero setters — flip or delete, incl. RBOX_PUBLISH_PIPELINE
-(961 non-test lines whose field gate FAILED 2026-07-13) and RBOX_WATCHER_RETRUST
-(the Mac I/O duty-cycle fix, default-off against the default-on rule); delete the
-dead pre-E2EE plaintext transport still wired as the DEFAULT fallback. **Tier C
-roadmap corrections:** INVARIANTS.md has ZERO mechanical coupling (nothing reads
-it; every git-lane anchor stale) — tag+structure-test it BEFORE any queued split;
-daemon needs StatusSurfaceWriter + DriftAuditor on top of the queued four (155
-fields / 14 concerns); state-plane Tier 3 prescribes the wrong cut (the write
-funnel already exists — delete the double-compose, don't extract it); versions.ts
-is one of TWENTY unowned API modules (43% of the API is outside CODEMAP, so the
-CODEMAP amendment gates every API split) and roots/rootsInspect is a two-copy
-reachability oracle feeding GC deletion AND fair-use billing. Tier D: `src/wire/`
-shared contract (the CLI has two parsers for one 409; one mis-reads epoch_stale
-as `{head: undefined}`) — the only finding with external-user exposure.
-**LATE NIGHT PART 2 — codex adversarially reviewed the 8 merged commits and found
-2 SHIPPING REGRESSIONS we introduced; both fixed and merged.** (a) **#442** — #435's
-per-command flag arity broke the deprecated `link` alias: it declares no flags of
-its own, so `rbox link --git false <path>` fell to the union fallback (colliding
-names pinned valueless), tracked `./false`, ignored the real path and turned git
-sync ON. Fixed with one canonical `resolveCommandAlias` consulted by
-`longFlagArityFor`; found a 2nd alias (`daemon`→`start`) and pinned both in the
-registry guard. (b) **#441** — #432's requeue-inside-batch was correct but became
-UNCONDITIONAL, so a late `customer.subscription.deleted` for a deleted account
-inserted a `fairuse_account_queue` row with no FK; the scheduler (one account per
-invocation) acquired the ghost, failed `account_missing`, and requeued it +1h
-forever, permanently consuming capacity. Fixed by conditioning the insert in SQL
-on a live account matching `id` AND `stripe_customer_id` (the sibling UPDATE nulls
-`stripe_subscription_id` but not the customer id), plus draining on
-`account_missing` instead of requeuing — which also clears ghosts already in prod.
-Codex CLEARED #436 (tolerated `mpu.complete()` cannot publish partial bytes — the
-canonical `put` verifies full SHA-256) and independently re-verified #433's
-six no-op call sites. It also caught that #437's black-hole test **passes before
-the fix** (`fetchAccountSummary` already had a timeout) — that agent claimed
-red→green and was wrong. **PROD PROMOTED** (founder `main:production`, 20 commits,
-NO new migrations, dev-verified first): the >90 MiB multipart data-loss fix, viewer
-gate, account-delete guard, ghost fix, Tier 2 API refactor all live; deploy green,
-prod worker 401/200. **RETRUST FLIPPED DEFAULT-ON (#443).** Design 104's named
-bake condition was never run — nobody had executed that code against a real
-FSEvents stream (every test drives an injected seam). Soaked on the Mac and PASSED
-on the first real drop: classifier matched the REAL kernel string, `window=1/6
-wouldFuse=n`, re-trust in 70s, `confirmed=0` AND `unattributable=0` on both deep
-scans, and Layer A pruning restored (37 `dc:hit` vs 1 `dc:unpruned`). Kill switch
-is now `RBOX_WATCHER_RETRUST=0`; suite pins legacy via test-preload
-(`RBOX_FILES_FIRST` precedent) and the 3 OFF-path tests now spell OFF as `"0"`
-(under a kill switch `delete` means ON — `watcher-retrust.test.ts:154` would have
-hard-broken). **MAC**: `/usr/local/bin/rbox` (a Max-Howell-style experiment, 1.7.22,
-resurrected every boot by the launchd plist and un-upgradable) REMOVED, back on
-`~/.rbox/bin` + PATH; both artifacts archived in `~/Downloads`. Running
-`1.9.0-dev+4a96f0d`; revert at `~/.rbox/bin/rbox-1.9.0-release.bak`.
-**DESIGN 200 (PR #440) — worktree lifecycle resilience**, from two live wedges on
-the Mac: a spent worktree defers the whole repo (`sync-git/apply.ts:1447-1450`
-escalates ANY held ref, contradicting design 116 invariant #4) and squash-merge
-makes it unrecognizable (there is **no `--merged`, no patch-id, no cherry anywhere
-in `src/`**); and a published-then-deleted branch leaves BASE positive forever
-(`base-composer.ts:357` publisher-ack cannot remove a BASE member — by design)
-with no manual exit (`resolve-command.ts:658-665` refuses that shape by name).
-Founder RULED: publish the deletion fleet-wide; breaker defers at max(25, 25%);
-no pin CONDITIONAL on recoverability; double-proof not a settling window; **P4
-per-ref pending lane IN SCOPE** (overruled the doc's follow-up rec); doctor gains a
-worktree section, no absolute paths yet. v2 revision found the Q3 premise is true
-only via a SECOND constant (`TOMBSTONE_PIN_RETENTION_MS` keep-pins made by
-FOLLOWERS when they prune, not the tombstone itself) — and **FALSE for
-single-device workspaces**, kept open as **Q3a (needs a founder call)**. Also:
-`expireTombstoneKeepPins` has no production caller. Corrections logged: the
-breaker precedent is design **108** (`max(20%,1000)` push-side), not 44
-(`≥100 ∧ ≥50%` pull-side); `redactGitLogLines` is a grammar allowlist, NOT a path
-scrubber, with 2 holes. P4 stages default-OFF under the named-bake exception —
-not for cost but because a bad merged section publishes fleet-wide and
-`gitIncomingKey` moves, so revert is not free. Codex `/arbitrage` round running.
-Bonus find: the sync path still uses the UNBATCHED per-tip ownership proof
-(`reachability.ts:106-126`) while design 128's batched version is wired only to
-`rbox git resolve` — likely where much of the 9s (and 867s wedged) `ownershipMs`
-lives; follow-up to design 174.
-**STANDING RULE (founder, 2026-07-24): rbox-core + Dfinitiv/conductor-workspaces/*
-on the MacBook are the designated problem areas** — highest worktree/branch/
-squash/agent turnover, where wedges appear first. No git-sync fix is "done" at
-merge; it is done when deployed to the MacBook and the specific error is gone
-from the daemon log, and design 200's implementation gate is a full agent
-lifecycle (worktree → branch → squash-merge → delete) in those repos with ZERO
-surviving deferrals over 24h. ~8 prior "this unwedges the machine" claims were
-declared at merge time and were wrong — narrow, field-verified claims only.
-**DESIGN 200 ALIGNED AND MERGED (2026-07-25, #440 → f7845e8b) after 12 codex
-adversarial rounds / 13 revisions — the full /dev-cycle loop, and it earned it.**
-Final shape: deletion is an ORDINARY captured transition (witness → verify-only
-locked proof → exact-OID tombstone at capture → BASE retires only at the
-publisher-ACK, one-sentence design-130 amendment with fencing that survived
-review); the window is a per-ref hold; recovery is the per-ref keep-pin proven
-atomic with the delete. Killed en route, each with recorded evidence (11
-REVIEW-200-R*.md files on main): breaker math (founder: "some math is just not
-gonna prevent it"), pins (file-history contract), P4 (parked as design 201
-placeholder with landmines + AC), early BASE retirement (the primitive behind 5
-failed rounds — step-out-a-layer call), the C3 field (4 rounds of churn, then
-WITHDRAWN under founder principles; residual property-quantified instead).
-Accepted residual, stated at true width: lost-ACK + same-OID re-creation within
-one cycle consumes own tombstones once per window, per-ref keep-pinned;
-family-(ii) (degraded-unlocked overwrite) FLEET-MEASURED ABSENT (zero degraded
-workspaces; all hosts link()-capable) and the post-rename durability half FIXED
-IN CODE — **#448 merged**: state.json's parent was NEVER fsynced and the marker
-unlink was flushed first (one crash window could lose new state AND fallback
-baseline); + 3 more unpublished state.json renames fixed; pre-merge codex review
-zero blockers. CLASS-C QUESTION parked for founder (no urgency, state absent
-from fleet): should git publication fail closed on a degraded-unlocked
-workspace instead of accepting the widened residual? Loop mechanics lesson:
-harness kills orphaned codex mid-run twice (pipe-block zombies) → detached
-setsid + file-redirected output + Monitor on the verdict file is the reliable
-shape; codex resume of multi-agent v2 sub-agent sessions is NOT possible
-(-32600) — relaunch fresh instead.
-NEXT: implement 200 in landing order P2→P3→P1+P1b (each phase gated on
-`sg docker -c 'bun run rig run worktree-squash-lifecycle'` progress toward
-green — the merged expected-RED scenario is the acceptance gate) then the 24h
-zero-deferral MacBook soak per the standing rule before ANY "unwedged" claim;
-197; the 193 live smoke suite; sweep Tier 3. NEXT: Q3a founder call; implement 200 in landing order P2→P3→P1+P1b→P4; 197;
-the 193 live smoke suite; sweep Tier 3. Mac's 2 repo deferrals persist by design
-until 200 lands (rbox-core = the phantom `fix/coupon-slack-notification`, a real
-squash-merged-then-deleted branch; savvy-core-v1 = `prepared Git child incarnation
-unavailable`, `checkout-txn.ts:420` — three-state probe crammed into two, the
-mirror of #433). Unfixed from codex's review: #438's latch can lose the shutdown
-exception if a progress callback throws (its test forces concurrency=1 so does not
-prove multi-worker drain), and #439 can surface absolute paths in LOCAL logs._
+_**#570 — the macOS ownership-spawn fix (issue #569, design 219), the biggest
+field win of the session.** Root cause: the follow classifier proved every tip
+with one `git` subprocess **per ownership root** — savvy-core's 447 roots ≈
+3,270 spawns per follow, and a macOS spawn costs 20.3ms vs 1.78ms on Linux.
+The fix delegates to the pre-existing batched `partitionOwnedByIncoming`: **3
+subprocesses**. Field-validated on all three hosts: Mac savvy-core git-apply
+**106.8s → 3.0s, then 0.6s steady**, `ownershipMs` **69454 → ~258**; desktop
+20.6s → 6.5s; flat-meadow 13.0s → 4.7s. Residual filed as **#573** — steady
+state is ~1.7s and the 22s sample was one heavy pull, so it is much less
+urgent than first flagged._
+
+_**163 BACKEND TRACK — B0/U0/U1/U2 COMPLETE AND MERGED.** **U0** entry
+interning (#554, 5 codex rounds → ALIGNED) + its readonly-conversion tail
+(#561). **U1** in three slices: bun:sqlite contract suite + corpus-112k
+fixture (#549), store substrate U1a (#564), write seam U1b (#567 —
+**copy-while-hashing containment is the settled mechanism**, adopted after a
+step-out). **U2** reset/quarantine on DB artifacts (#566): migration compiles
+behind the `withMigrationImporter` capability, the crash rig drives production
+writers, and the legacy JSON reset is pinned **byte-identical to main**.
+Supporting merges: state-plane vertical (#553), API GC/version-history split
+(#547), roadmap docs (#546, #575)._
+
+_**THERMO SWEEP #4 (#571) — the deliberate pre-U3 gate — returned NO-GO, and
+all four Tier 0 fixes are merged.** T0.2–T0.4 (#572: typed wrong-stream
+refusal, scripts typecheck owner, TUI waiver) and **T0.1 (#574, seven review
+rounds — the base-proof authority arc)**: ordinary writes now name their own
+BASE authority and can no longer launder migration authority; observed-landing
+authority with a per-ref hold; `readAllRefsStrict` defers on unreadable.
+Tier 1 prep all merged: **T1.1** compat boundary — paths, legacy-JSON facade,
+lock→CAS-token bridge (#579); **T1.2** schema/genesis split (#577); **T1.4**
+git-section codec + the complete authority-row corruption taxonomy (#578);
+**T1.5** doctor descriptor split (#576). (Sweep #3 landed earlier the same day:
+#550.)_
+
+_**DESIGN 163 IS NOW v12 — FOUNDER-RATIFIED — AND 222 IS THE U3 IMPLEMENTATION
+DESIGN AT GO (both merged as #580).** 222 ran the full dev cycle: draft → 4
+adversarial rounds → **a step-out that pulled GENESIS out of the M0–M7 machine
+entirely** (genesis has no source document, so every phase invariant about
+retiring a source is vacuous) → independent security validation → founder
+ratification → final GO. The **v12 amendment** fixes two 163 M0 rows that were
+individually correct and **jointly unimplementable** (one authorizes genesis
+via "staged DB + Q"; the other halts on the only intermediate state genesis can
+produce). Mechanism: a durable **genesis intent** (`.rbox/state/genesis-v1.json`)
+binding fenced evidence + authority id + lineage id + the staged DB's
+`{dev,ino}`, published before SQLite opens it and retired last, with two new
+matrix rows keyed on it. The ambiguous/manual-damage row and "DB presence never
+elects authority" are **byte-unchanged**. An `origin_kind`-keyed draft was
+**WITHDRAWN** (a DB copied from another workspace would satisfy it). Validation
+caught a **dev/ino REUSE hazard** — a recycled inode could let a migrated DB
+holding real user data be finished as genesis leftovers, i.e. permanent
+corruption — closed by a conjunction over values already written by the merged
+`installGenesisLineage` from intent-published inputs._
+
+_**OTHER FIXES MERGED THIS SESSION:** #558 (closes #542 — barrier read
+classifies from one O_NOFOLLOW descriptor); **#559 FLAKE-006** — the real root
+cause was **filesystem inode reuse, not timing** (tmpfs never reuses: 200/200
+pass; ext4 always does: 200/200 fail), fixed as "a fence released mid-inspection
+is a retry, not a lost writer"; #557 AST structural gates + #568 the sweep retry
+runner and the #557×#558 interaction; #560 rig dual-binary plumbing for the U3
+differential gate (+ CI follow-up #565); #562 autostart-cmd facade split; #555
+(a scope edit can no longer durably switch background sync off); #552 (republish
+sidecar mutations require the workspace mutex)._
+
+_**FLEET CALIBRATION — daemon RSS is NOT a leak.** All three hosts sit at
+**4.3–4.7GB steady** on a 140k-file / 101-repo workspace: same band everywhere,
+sawtooth rather than monotonic, no leaked git children. This is exactly the
+whole-state materialization cost that **163/U4 exists to retire** (U5 kill
+criterion: RSS ≤1.5GB). Record it as the calibration data point, not a bug._
+
+_**OPEN / OWED.** Founder-owed, top of the list: **ratify #589 (163 v13) — U3
+lanes 3A/5B/5C are blocked on it**. Then the **frozen machine profile** (blocks
+U5's bake only); the **v2.0.0-beta.1 tag** when U3 lands; the **adoption drain** (1 user
+on 1.6, two on 1.9.x — watch rbox-admin's version view). Issues: **#573** macOS
+git-apply residual (low urgency, see above); **#556** a writer-less FIFO at the
+state path blocks the O_NOFOLLOW single-descriptor state reads in all three
+sidecar modules; **#535** echo-apply (the `.claude/worktrees` carve-out on the
+desktop stays until it lands); the FLAKE registry. Design 213 (pull-only live
+watch, #532) is still DRAFT/NOT ALIGNED with a 2nd codex round owed, and low
+urgency now the whole fleet is read-write. Parked founder question from the 200
+arc: should git publication fail closed on a degraded-unlocked workspace
+(class C) — no urgency, the state is absent from the fleet. Disk cleanup still
+owed on the fleet: `~/Development.pre-rejoin` + `~/Development.pre-rejoin-worktrees`
+(desktop), `~/Development.pre-rebind-2026-07-26` (FM),
+`~/rbox-recovery/savvy-core.git-stub-20260728` (FM), and the stray worktrees at
+`~/agent-work/526-republish` and `/home/via/rbox-worktrees/212-v1`._
+
+_**INFRA/OPS NOTE:** Codex/ChatGPT had an intermittent outage tonight (3 killed
+runs); founder confirmed it temporary. Policy: **retry codex per lane, reroute
+to opus on death, never silently downgrade the cross-model check.**_
+
+_**STANDING RULES (current, carried forward + new this session).**
+(1) **Worktrees**: always `git -C <primary-absolute-path> worktree add <absolute-path>` —
+a stale shell cwd nested worktrees inside worktrees three times this session.
+(2) **One writer per worktree**: review codex runs are `--sandbox read-only`;
+verify committed bytes with `git show HEAD:`, never by the review log.
+(3) **A design-doc review round is the cheapest place to step out a layer** —
+it deleted a whole subsystem from U3 (genesis out of the M0–M7 machine) for the
+price of rewriting prose. Round-3 non-alignment escalates: step out, founder
+tie-break, or kill switch — never round 4.
+(4) **MacBook problem areas (founder, 2026-07-24)**: rbox-core +
+Dfinitiv/conductor-workspaces/* on the MacBook have the highest worktree/branch/
+squash/agent turnover and are where wedges appear first. No git-sync fix is
+"done" at merge — it is done when it is deployed there and the specific error is
+gone from the daemon log. ~8 prior "this unwedges the machine" claims were
+declared at merge and were wrong; narrow, field-verified claims only.
+(5) **Prod promotions and release tags need a fresh per-action founder yes.**
+(6) **The fleet runs dev builds** (`~/.rbox/bin/rbox` → `rbox-dev` on all three
+hosts; `install.sh` reverses it). Rig FAST suite every ~3-4 merged sync-plane
+PRs and before any tag. Every PR closes with "did it help / did we make anything
+worse".
+(7) **Every perf flag's default is pinned in the defaults-ledger test** — that
+is the fix for the shipped-dark class.
+(8) **Duplicate declarations across parallel lanes merge cleanly — gate them.**
+Six found on `2.0` in one night; `git merge-tree` reported no conflict on any of
+them, and an `interface` duplicated across modules is invisible to `tsc`
+entirely (compatible shapes merge silently, and the owning lane's brand then
+does not apply to the private copy). #591's line-anchored gate
+(`src/cli/state-plane/duplicate-declarations.test.ts`, ~190ms, no AST) catches
+it and pins the exact allowlisted site *count*, not just the name. Its sweep
+found five further pre-existing duplicates, allowlisted "REAL DUPLICATE,
+pending removal": `HeadPin`, `DeferralDiscoveryAuthority`, `ResetConsentKind`,
+`PhysicalProof` (declared twice **in one file**), and `doctorCmd`
+(`hydrate-cmd.ts` exports an unrelated hydrate routine under the doctor
+command's name). Separately: the SQLite sidecar suffix list is duplicated
+**seven** times under three names plus four inline literals — that wants one
+shared exported constant, not a gate.
+(9) **Parallel agents collide on a shared scratchpad.** Agents told to run
+tests via a scratchpad script all chose the same path; one lane's runner
+overwrote another's and silently reported a different worktree's numbers.
+Runners must assert worktree path **and** branch before executing. The tell is
+a test count *larger* than the lane's own scope.
+(10) **"Green that measured the wrong thing" is a class, not a coincidence.**
+Three this session: a stale `.cache/tsbuildinfo`; a `git grep` gate that
+self-matched and whose local green depended on `git grep` skipping untracked
+files; and (9)'s scratchpad collision. One mitigation for all three — pin what
+you are measuring before believing it.
+(11) **No gate covers test-file types.** `tsconfig.json` excludes
+`**/*.test.ts`, so nothing typechecks tests at all; typechecking them against a
+temporary config found real errors a review would not have. Owner unassigned._
+
+_**BUN 1.4.0-canary POSTURE (2026-07-27, founder call — still current).**
+Canary is the MAIN bun on all three hosts (`bun upgrade --canary`); dev builds
+are canary-compiled; revert per host with `bun upgrade --stable` (1.3.14). CI
+and deploy-api run `bun-version: "canary"` **EXCEPT** the cross-compile legs:
+canary publishes NO cross-target compile blobs ("Target platform
+'bun-darwin-aarch64-v1.4.0' is not available for download"), so ci.yml's
+cross-build job and all three release.yml pins stay `"1.3.14"` (inline-
+commented), and the startup/size budget job is pinned stable because budgets
+measure the SHIPPED binary. **WATCH-ITEM for 1.4-going-stable**: canary-compiled
+`status-json` RSS is 48.6MB vs the 42.55MB budget (+14%) — repinning to a stable
+1.4 needs either a slimmer bun or a founder-approved budget re-baseline._
+
+_**REORG CAMPAIGN (closed 2026-07-27): 20 merges, 19/21 roadmap cycles**
+(#478-#496, #499). Every schedulable cycle is done. **Wave 6**
+(RecoverStateAuthorityAtDaemonBoundary + PublishDaemonRuntimeObservation,
+~380-490 daemon.ts lines) stays PARKED on the design-163 store port BY ROADMAP
+DESIGN — it opens with the 163 track, not before. Hotspots after: status-cmd
+922→103, push.ts 1144→946, apply.ts 2291→1502, daemon.ts 3790→3330 (→~2,300-2,450
+once wave 6 lands). Next-biggest agent-confusion surfaces, founder undecided:
+follow.ts 1784, plan.ts 1474._
+
+_**FLEET/PLATFORM STATE (as of 2026-07-28).** Three hosts — Mac, desktop
+(via-desktop-ubuntu), flat-meadow — **all read-write**, all on canary-compiled
+dev builds carrying #570. Git-sync has been clean on all three since the #526
+republish lever landed (first time since early July). The desktop's
+`.claude/worktrees` is carved out of sync via `.rboxignore` pending the #535
+echo-clobber fix. The `#501` adopt journal O(n²) defect has a batching stopgap
+in 1.10.0; the real fix belongs to the 163 SQLite store._
+
+_**MEMORY-INCIDENT MITIGATIONS (2026-07-27, still live).** The 21.3GiB OOM was
+a subagent's `bun test` hitting a retired-halt recoveryProbe spin (~21GiB in
+≤48s); no released build ever had it, and the structural fix shipped as #530 in
+v1.10.2. Live mitigations: desktop swap 2→32GiB + user-slice MemoryMax=32GiB,
+and a PreToolUse hook wrapping every agent `bun test` in a systemd 12G-capped
+scope (`~/.claude/hooks/`). Forensic method that cracked it, worth reusing:
+Claude session transcripts (`~/.claude/projects/…` + `subagents/`) survive
+reboots and tmpfs and reconstruct exact commands AND exact code versions from
+Write/Edit payloads._
+
+_**RELEASE LEDGER (compressed).** v1.11.1 (2026-07-28) macOS ownership-spawn
+fix + `next` channel · v1.11.0 (07-28) `rbox include` + B0 barrier + git
+republish · v1.10.2 (07-27) scheduler spin guard · v1.10.1 (07-27) a calmer
+help screen · v1.10.0 (07-27) plain-English doctor, machine-wide status,
+packs + fused crypto default-on, adopt at scale · v1.9.1 (07-25) design 200
+deletion-as-ordinary-transition, field-validated · v1.9.0 (07-24) design 189
+web-approved pairing, promoted to prod. Designs 200/202/203/204/206/208/209/211/
+212 all shipped and field-proven; their round-by-round history is in
+`docs/design/` and the REVIEW-*.md ledgers, not here._
 
 _Previous: 2026-07-24 (**189 SHIPPED — v1.9.0 released + promoted to prod;
 validated end-to-end on two real machines**). Design 189 (web-approved pairing)
@@ -818,39 +418,12 @@ relocated to docs/design/notes/ (#416); worktrees + merged branches pruned. NEXT
 gate); fix the first-device web button LABEL (still reads "send keys"); delete
 the throwaway dev test account._
 
-_Superseded — 189 core-aligned, pre-implementation (2026-07-23): **DESIGN 189 core-ALIGNED; PR #412
-shipped to prod; day = 3 releases + 5 PRs**): Design 189 (web-approved
-pairing — web approval -> an enrolled daemon auto-delivers keys so a new
-machine enrolls without pasting a token/phrase) driven from rough draft to
-v7 core-ALIGNED through 2 parallel codex rounds + 3 serial gates (all in
-worktree .claude/worktrees/189-web-pairing, branch
-design/189-web-approved-pairing, NOT merged). Mechanism (verified): the
-fulfilling daemon is a live admin — buildAdminRoster (roster.ts:124) signs
-a roster admitting the new device's exact pubkeys, wraps MK to the device
-enc pubkey ONCE under the persisted device context, commits that wrap's
-hash, and PUBLISHES the roster server-side atomically; the new CLI fetches
-+ verifies the full chain (signer authority) and stores the wrap as-is.
-Founder RULINGS: (Q1) epoch rotation NOT a prerequisite — accepted that a
-revoked device keeps already-synced plaintext + a ~5-min download-grant
-window (grants bypass bearer auth, grants.ts:22 / worker.test.ts:172);
-honest revoke copy required; rotation filed as design 191 (stub). Zero
-typed codes (fragment auto-binding; manual = device-auth only). 190
-(passkey escrow) DECOUPLED — browser-unwraps-RK violates the key-material
-law; needs its own redesign. **JUDGMENT CALL (mine, surfaced): stopped the
-design loop at core-aligned — the last 2 gates converged on ONE theme
-(handoff crash-recovery idempotency), now specified via the existing
-crash-safe-reuse discipline + an implementation crash-injection acceptance
-gate (189 §14), per the anti-treadmill rule. NOT a gate green-light.**
-NEXT: implement 189 (big multi-surface: apps/api device_auth+pubkeys +
-key_delivery table + migration 0033 + nudge + escrow; daemon fulfillment
-flight; CLI login FSM + staging journal; web approval step-up + fragment
-compare + route CSP; #412's fragment-preservation gap in cli-login/+page.ts
-still open). Decide: merge the 189 doc to main + start implementation, or
-one more confirmation gate on v7's §14 framing. **PR #412 (Clerk
-redirect_url fix) MERGED + PROMOTED TO PRODUCTION** (a36dbe2c; web-only,
-no apps/api/D1 change; app.rbox.to 200) — CLI-login deep links now survive
-the sign-in bounce. Founder memory: minimize-user-typing law recorded.
-Session totals below._
+_189 rulings still live (2026-07-23): epoch rotation is NOT a prerequisite —
+a revoked device keeps already-synced plaintext plus a ~5-min download-grant
+window (grants bypass bearer auth, `grants.ts:22`); honest revoke copy is
+required and rotation is filed as design **191** (stub). Design **190**
+(passkey escrow) stays DECOUPLED — browser-unwraps-RK violates the
+key-material law._
 
 _Telemetry read (minor, 2026-07-23): first 3 days of `client.sync_phase`
 AE data (since 07-21 midday) — **server plane is not the sync bottleneck;
