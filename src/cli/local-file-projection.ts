@@ -15,19 +15,21 @@ export function projectLocalManifest(
   base: Manifest,
   matcher: IgnoreMatcher,
   purgeIgnored = false,
-): { manifest: Manifest; caseCollisions: CaseFoldCollisionGroup[] } {
+): { manifest: Manifest; caseCollisions: CaseFoldCollisionGroup[]; strandedIgnored: number } {
+  const present = new Set(local.files.map((entry) => entry.path));
+  // Base entries the matcher ignores: the scanner never emits an ignored path, so
+  // this IS the stranded set (design 224 §2.3). Computed unconditionally so the
+  // return is total — the forward-carry still consumes it only when not purging.
+  const ignoredBase = base.files.filter((entry) => !present.has(entry.path) && matcher.ignores(entry.path));
+  const strandedIgnored = ignoredBase.length;
   let carried = local;
-  if (!purgeIgnored) {
-    const present = new Set(local.files.map((entry) => entry.path));
-    const ignoredBase = base.files.filter((entry) => !present.has(entry.path) && matcher.ignores(entry.path));
-    if (ignoredBase.length > 0) carried = {
-      ...local,
-      files: [...local.files, ...ignoredBase].sort(compareEntries),
-    };
-  }
+  if (!purgeIgnored && ignoredBase.length > 0) carried = {
+    ...local,
+    files: [...local.files, ...ignoredBase].sort(compareEntries),
+  };
 
   const caseCollisions = caseFoldCollisionGroups(carried.files);
-  if (caseCollisions.length === 0) return { manifest: carried, caseCollisions };
+  if (caseCollisions.length === 0) return { manifest: carried, caseCollisions, strandedIgnored };
 
   const ambiguousFolds = new Set(caseCollisions.map((group) => manifestPathCaseFold(group.paths[0]!)));
   const files = carried.files.filter((entry) => !ambiguousFolds.has(manifestPathCaseFold(entry.path)));
@@ -38,7 +40,7 @@ export function projectLocalManifest(
     if (ambiguousFolds.has(manifestPathCaseFold(entry.path))) files.push(entry);
   }
   files.sort(compareEntries);
-  return { manifest: { ...carried, files }, caseCollisions };
+  return { manifest: { ...carried, files }, caseCollisions, strandedIgnored };
 }
 
 function compareEntries(a: { path: string }, b: { path: string }): number {

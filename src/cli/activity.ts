@@ -60,6 +60,10 @@ export interface DaemonActivity {
     changed: number;
     deleted: number;
     settled: boolean;
+    /** Design 224 §2.3: already-synced base entries the matcher now ignores, as of
+     *  this daemon's last projection. Optional — an older daemon, or one that has
+     *  not pushed since start, omits it; `sourceVersion` stays 1. */
+    strandedIgnored?: number;
     sourceVersion: 1;
   };
   /** Workspace-DO WebSocket currency evidence. `at` is refreshed only by WS-layer
@@ -133,6 +137,7 @@ export async function loadActivity(root: string): Promise<DaemonActivity | undef
       uint(local.changed) &&
       uint(local.deleted) &&
       typeof local.settled === "boolean" &&
+      (local.strandedIgnored === undefined || uint(local.strandedIgnored)) &&
       local.sourceVersion === 1
     ) {
       a.local = {
@@ -144,6 +149,7 @@ export async function loadActivity(root: string): Promise<DaemonActivity | undef
         changed: local.changed,
         deleted: local.deleted,
         settled: local.settled,
+        ...(local.strandedIgnored === undefined ? {} : { strandedIgnored: local.strandedIgnored }),
         sourceVersion: 1,
       };
     }

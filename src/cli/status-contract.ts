@@ -212,6 +212,11 @@ export interface StatusDetailProjection extends StatusProjectionCommon {
   remote?: StatusRemoteHead;
   remoteLine?: string;
   counts: StatusLocalCounts;
+  /** Design 224 §2.3: already-synced base entries the matcher now ignores. Absent
+   * when no source could supply one (a daemon that has not projected since start).
+   * Deliberately top-level rather than inside `counts`, which is entangled with
+   * `counts.source`. */
+  strandedIgnored?: number;
   localChanges: number;
   health: "halt" | "outofstorage" | "active" | "pending" | "ok";
   populate?: PopulateStatusV1;

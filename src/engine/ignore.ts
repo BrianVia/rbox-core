@@ -315,7 +315,7 @@ export const isIgnoreRuleFile = (rel: string): boolean =>
  */
 function isHardExcluded(relPath: string): boolean {
   const p = relPath.replace(/\/+$/, ""); // tolerate a trailing slash (dir form)
-  if (p === ".rbox" || p.startsWith(".rbox/")) return true;
+  if (p === ".rbox" || p.startsWith(".rbox/") || p.endsWith("/.rbox") || p.includes("/.rbox/")) return true;
   return p === ".git" || p.startsWith(".git/") || p.endsWith("/.git") || p.includes("/.git/");
 }
 
@@ -666,20 +666,36 @@ function discoverGitReposSync(root: string, prunesForDir: (relPath: string) => b
   return out.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
 }
 
+/**
+ * Two outcomes, never one (design 224 §2.1). `indexUnreadable` keeps the historic
+ * fail-open (`available: false` ⇒ "possibly tracked" ⇒ un-ignored and unprunable).
+ * `indexAbsent` — a repo that git resolved, whose index is genuinely `ENOENT`, and
+ * which has NO commits — has an EMPTY tracked set, not an unknown one, so it must
+ * not un-ignore its own `node_modules`/`venv`/`.env`.
+ *
+ * All three signals are load-bearing. A repo that HAS commits but whose index was
+ * deleted also yields ∅ from `git ls-files --cached`, yet its true tracked set is
+ * non-empty; classifying it `indexAbsent` would let `rbox ignore --purge` delete
+ * committed files fleet-wide.
+ */
 function loadTrackedRepoSet(root: string, relPath: string, known: boolean): TrackedRepoSet {
   const repoDir = relPath === "." ? root : path.join(root, relPath);
-  const unavailable = (): TrackedRepoSet => ({ relPath, paths: new Set(), dirPrefixes: new Set(), known, available: false });
+  const indexUnreadable = (): TrackedRepoSet => ({ relPath, paths: new Set(), dirPrefixes: new Set(), known, available: false });
   const indexPath = gitOutput(repoDir, ["rev-parse", "--git-path", "index"]);
-  if (!indexPath) return unavailable();
+  if (!indexPath) return indexUnreadable();
   const resolvedIndex = path.resolve(repoDir, indexPath);
   const st = safeStat(resolvedIndex);
-  if (!st) return unavailable();
+  if (st.kind === "absent") {
+    const unbornHead = gitOutput(repoDir, ["rev-parse", "--quiet", "--verify", "HEAD"]) === undefined;
+    return unbornHead ? availableTrackedRepo(relPath, [], known) : indexUnreadable();
+  }
+  if (st.kind === "error") return indexUnreadable();
   const cacheFile = trackedCachePath(root, relPath, resolvedIndex);
   const cached = readTrackedCache(cacheFile, resolvedIndex, st.mtimeMs, st.size);
-  if (cached.kind === "corrupt") return unavailable();
+  if (cached.kind === "corrupt") return indexUnreadable();
   if (cached.kind === "hit") return availableTrackedRepo(relPath, cached.paths, known);
   const raw = gitOutput(repoDir, ["ls-files", "-z", "--cached"]);
-  if (raw === undefined) return unavailable();
+  if (raw === undefined) return indexUnreadable();
   const paths = raw.split("\0").filter(Boolean).map((p) => p.replace(/\\/g, "/"));
   writeTrackedCache(cacheFile, { version: 1, indexPath: resolvedIndex, mtimeMs: st.mtimeMs, size: st.size, paths });
   return availableTrackedRepo(relPath, paths, known);
@@ -701,11 +717,16 @@ function trackedDirPrefixes(repoRel: string, paths: string[]): Set<string> {
   return out;
 }
 
-function safeStat(filePath: string): fs.Stats | undefined {
+/** Errno-aware stat: `absent` is ENOENT SPECIFICALLY, and is the only stat outcome
+ *  that can positively classify a missing index. Every other failure is `error`. */
+type SafeStatResult = { kind: "ok"; mtimeMs: number; size: number } | { kind: "absent" } | { kind: "error" };
+
+function safeStat(filePath: string): SafeStatResult {
   try {
-    return fs.statSync(filePath);
-  } catch {
-    return undefined;
+    const st = fs.statSync(filePath);
+    return { kind: "ok", mtimeMs: st.mtimeMs, size: st.size };
+  } catch (e) {
+    return (e as NodeJS.ErrnoException)?.code === "ENOENT" ? { kind: "absent" } : { kind: "error" };
   }
 }
 

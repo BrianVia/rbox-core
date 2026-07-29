@@ -11,6 +11,7 @@ import { style } from "./style.js";
 import { savePathWarnings } from "./path-warnings.js";
 import { summarizeCaseCollisions } from "./sync-cmd.js";
 import { assertCommandAllowedOnScopedBinding } from "./scope/binding-scope.js";
+import { assertNoUnevaluatedPurgeDeletes } from "./sync/policy.js";
 
 const RBOXIGNORE = ".rboxignore";
 
@@ -103,7 +104,8 @@ export async function purgeIgnored(root: string, opts: { yes?: boolean; allowMas
       return;
     }
     deps.syncMutex = syncMutex;
-    deps.allowMassDeletePush = opts.allowMassDelete === true;
+    deps.allowMassDeletePush = opts.allowMassDelete === true || process.env.RBOX_ALLOW_MASS_DELETE === "1";
+    deps.massDeleteHint = "rbox ignore --purge --allow-mass-delete";
     deps.onCaseCollisionObservation = async (observation) => {
       if (observation.authority === "authoritative") await savePathWarnings(root, observation.caseCollisions);
     };
@@ -138,15 +140,7 @@ async function computePurgeCandidate(root: string, cfg: Awaited<ReturnType<typeo
   await cache.save(root);
   const present = new Set(local.files.map((f) => f.path));
   const deleted = state.lastSyncedManifest.files.filter((entry) => !present.has(entry.path)).map((entry) => entry.path);
-  const unsafe = deleted
-    .map((p) => ({ path: p, repo: matcher.unevaluatedGitRepoForPath?.(p) }))
-    .find((p): p is { path: string; repo: string } => p.repo !== undefined);
-  if (unsafe) {
-    throw new Error(
-      `refusing purge: cannot evaluate tracked files for git repo ${unsafe.repo} (first affected path ${unsafe.path}). ` +
-        `Fix that repo's .git/index and retry.`
-    );
-  }
+  assertNoUnevaluatedPurgeDeletes(matcher, deleted);
   const purged = deleted.filter((p) => matcher.ignores(p)).sort();
   return { local, purged, observationComplete: deferred.size === 0 };
 }

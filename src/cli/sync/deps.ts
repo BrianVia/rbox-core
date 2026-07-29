@@ -87,6 +87,10 @@ export interface SyncDeps {
     authority: "authoritative" | "preserve";
     caseCollisions: readonly CaseFoldCollisionGroup[];
   }) => void | Promise<void>;
+  /** Design 224 §2.3: base entries the matcher ignores, observed once per
+   * projection. Observability only — the daemon parks it in its activity snapshot
+   * so `rbox status` can report the strand without a scan. */
+  onStrandedIgnoredObserved?: (count: number) => void;
   /** Called immediately after a state save that may set/clear durable Git
    * deferrals. Observability-only: callers must not throw or mutate the state. */
   onGitDeferralsSaved?: (state: SyncState) => void;

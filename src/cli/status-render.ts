@@ -14,6 +14,7 @@ import {
   renderBriefStatus,
   renderGitDeferralCompanion,
   renderGitDeferralLine,
+  strandedIgnoredLine,
   trashLine,
   type BriefHaltReason,
   type BriefStatusSnapshot,
@@ -133,6 +134,9 @@ export function renderStatusJson(projection: DetailProjection<"json">): Record<s
       path: ".rbox/state/sync.lock",
     },
     remote: projection.remote ? { sequence: projection.remote.sequence, source: projection.remote.source } : null,
+    // Design 224 §2.3: deliberately OUTSIDE the `local` block, which is emitted
+    // only for a daemon snapshot — the count exists on both branches.
+    ...(projection.strandedIgnored === undefined ? {} : { strandedIgnored: projection.strandedIgnored }),
     ...(counts.source === "daemon"
       ? {
         local: {
@@ -254,6 +258,8 @@ export function renderStatusBrief(projection: DetailProjection<"brief" | "git">)
   if (counts.conflictSnapshots.prunable > 0) {
     lines.push(`  conflict snapshots: ${counts.conflictSnapshots.total} (${counts.conflictSnapshots.prunable} prunable)`);
   }
+  const strandedLine = strandedIgnoredLine(projection.strandedIgnored);
+  if (strandedLine) lines.push(`  ${strandedLine}`);
   if (gitDetail) {
     for (const deferral of git.humanProjectedRepos) {
       lines.push(`  ${renderGitDeferralLine({
@@ -297,6 +303,7 @@ export function renderStatusVerbose(projection: DetailProjection<"verbose">): st
     remote: projection.remote,
     activity,
     pathWarnings: projection.pathWarnings,
+    strandedIgnored: projection.strandedIgnored,
     populate: populate
       ? {
         phase: populate.operation.phase,

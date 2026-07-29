@@ -1692,6 +1692,12 @@ test("design 72: purge push refuses if a known repo becomes unevaluable after th
   await write(".gitignore", "hidden/\n");
   await fs.writeFile(path.join(repo, "tracked.txt"), "tracked");
   await exec("git", ["-C", repo, "add", "-f", "tracked.txt"]);
+  // Design 224 §2.1: the index must be UNREADABLE, not merely absent, for the
+  // refusal to fire. A commit makes HEAD resolvable, so deleting the index below
+  // leaves a repo whose real tracked set is non-empty and unknowable — exactly the
+  // shape the refusal exists for. Without a commit this is `indexAbsent`: an empty
+  // tracked set that no longer blocks purge.
+  await exec("git", ["-C", repo, "-c", "user.email=t@example.com", "-c", "user.name=T", "commit", "-qm", "tracked"]);
 
   const stale = await remote.seedEntry("hidden/drop.txt", "stale\n");
   await saveStateUnsafeLegacyOrTest(root, {

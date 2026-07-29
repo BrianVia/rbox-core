@@ -13,6 +13,7 @@ import {
   relTime,
   renderGitDeferralCompanion,
   renderGitDeferralLine,
+  strandedIgnoredLine,
   type StatusSnapshot,
 } from "./status-view.js";
 
@@ -615,4 +616,32 @@ test("lastSyncLines: single slot renders alone", () => {
 test("lastSyncLines: heartbeat only / no activity at all", () => {
   expect(lastSyncLines({ at: iso(30) }, NOW)).toEqual(["last checked: 30s ago"]);
   expect(lastSyncLines(undefined, NOW)).toEqual([]);
+});
+
+test("strandedIgnoredLine: nothing to act on means no line", () => {
+  expect(strandedIgnoredLine(0)).toBeUndefined();
+  expect(strandedIgnoredLine(undefined)).toBeUndefined();
+});
+
+test("strandedIgnoredLine: plain-language count, thousands separator, purge command", () => {
+  const line = strandedIgnoredLine(31828)!;
+  expect(line).toContain("31,828 files match your ignore rules but are still synced");
+  expect(line).toContain("rbox ignore --purge");
+  // Design 224 F2: counts only — a byte figure here would be a fabricated
+  // recovery claim, and the stored size is neither billed nor reclaimable.
+  expect(line).not.toMatch(/\bKB\b|\bMB\b|\bGB\b|bytes/);
+});
+
+test("strandedIgnoredLine: singular at one", () => {
+  expect(strandedIgnoredLine(1)).toContain("1 file matches your ignore rules but is still synced");
+});
+
+test("healthDetailLines surfaces the stranded line only when non-zero", () => {
+  const snapshot = {
+    added: 0, changed: 0, deleted: 0, trackedFiles: 10, daemonRunning: true, localSequence: 3, now: NOW,
+  };
+  expect(healthDetailLines({ ...snapshot, strandedIgnored: 0 }).join("\n")).not.toContain("ignore rules");
+  expect(healthDetailLines({ ...snapshot }).join("\n")).not.toContain("ignore rules");
+  expect(healthDetailLines({ ...snapshot, strandedIgnored: 4 }).join("\n"))
+    .toContain("4 files match your ignore rules but are still synced");
 });
