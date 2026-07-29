@@ -12,8 +12,8 @@ import path from "node:path";
 import { fsyncDirectory, writeFileAtomic } from "../../engine/fsutil.js";
 import { loadConfigIfPresent, syncStreamId } from "../workspace-config.js";
 import { AUTHORITY_MARKER_BYTES, authorityMarkerBytes, classifyStateFormat } from "./authority-marker.js";
-import { checkRecord, type Fields, type Refuse, type Spec } from "./closed-record.js";
 import { StateAuthorityCorruptError } from "./errors.js";
+import { readGenesisIntent, type FencedEvidence, type GenesisIntent } from "./genesis-intent.js";
 import type { HeldStatePlaneLocks } from "./locks.js";
 import { genesisPaths, migrationPaths, stateIncarnationPath, statePath, sqliteResetPaths } from "./paths.js";
 import { installGenesisLineage } from "./schema/application.js";
@@ -26,20 +26,10 @@ import {
   type ClaimedInode,
 } from "./store/open.js";
 
-export type FencedEvidence = {
-  root: string;
-  stream: string;
-  /** `.rbox/state/state-incarnation.json`; its absence is itself a bound fact. */
-  incarnation: { dev: number; ino: number; sha256: string } | "absent";
-};
-
-export interface GenesisIntent {
-  version: 1;
-  authorityId: string;
-  lineageId: string;
-  evidence: FencedEvidence;
-  staging: ClaimedInode;
-}
+/** The intent's shape, decode, and bounded reader live in `genesis-intent.ts`,
+ * which reaches no SQLite: the write fence reads the intent on every save and
+ * may not be able to open a database (163 v13). */
+export { readGenesisIntent, type FencedEvidence, type GenesisIntent };
 
 /** The two ids the intent publishes before the database exists. */
 export interface GenesisIds { authorityId: string; lineageId: string }
@@ -90,20 +80,6 @@ export async function establish(
   await publishIntent(root, intent);
   buildStagedStore(root, intent);
   return placeAndPublish(root, intent, faults);
-}
-
-/** Read-only; consumed by the coordinator's write fence. Synchronous because
- * that fence is. */
-export function readGenesisIntent(root: string): GenesisIntent | undefined {
-  const file = genesisPaths.intent(root);
-  let text: string;
-  try {
-    text = fs.readFileSync(file, "utf8");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-    throw error;
-  }
-  return decodeIntent(file, text);
 }
 
 /** Step 1. Nothing is mutated on any branch. */
@@ -411,23 +387,3 @@ function sameInode(found: ClaimedInode | undefined, expected: ClaimedInode): boo
   return found?.dev === expected.dev && found.ino === expected.ino;
 }
 
-const INODE: Fields = { dev: "int", ino: "int" };
-
-/** The shape on disk selects which closed spec must accept `incarnation`;
- * neither admits the other, so nothing is coerced into `"absent"`. */
-const intentSpec = (incarnation: unknown): Spec => ({ fields: {
-  version: { const: 1 }, authorityId: "hex32", lineageId: "hex32",
-  evidence: { fields: { root: "string", stream: "string",
-    incarnation: incarnation === "absent" ? { const: "absent" } : { fields: { ...INODE, sha256: "hex" } } } },
-  staging: { fields: INODE },
-} });
-
-/** Strict decode of a closed record: a future version halts, never reads. */
-function decodeIntent(file: string, text: string): GenesisIntent {
-  const bad: Refuse = (at, why) => { throw new StateAuthorityCorruptError(file, `${at} ${why}`); };
-  let record: unknown;
-  try { record = JSON.parse(text); } catch { return bad("the genesis intent", "is not JSON"); }
-  const incarnation = (record as { evidence?: { incarnation?: unknown } } | null)?.evidence?.incarnation;
-  checkRecord(record, intentSpec(incarnation), "the genesis intent", bad);
-  return record as GenesisIntent;
-}
