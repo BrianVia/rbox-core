@@ -625,7 +625,8 @@ test("§11 E2E: concurrent daemon/CLI process saves preserve newer-source atomic
       `while (!(await fs.stat(path.join(root, \`.release-\${role}\`)).then(() => true, () => false))) await Bun.sleep(2);\n` +
       `const fill = role === "daemon" ? "d" : "c";\n` +
       `const section = { bundleSha: fill.repeat(64), bundleEncSha: (role === "daemon" ? "e" : "f").repeat(64), bundleCipherSize: 1, head: "ref: refs/heads/main", refs: { "refs/heads/main": "1".repeat(40) }, refScope: "all", generatedAt: role };\n` +
-      `await saveStateSource(root, snapshot, { expectedStream: stream, sourceGlobalSeq: seq, globalManifest: { generatedAt: role, files: [], manifestSchema: 2, gitRepos: { repo: section } }, observedRepos: ["repo"], values: { bases: { repo: section } } });\n`
+      `const proof = { authority: { kind: "publisher-ack", lineageHash: "a".repeat(64), repositoryIdentityHash: "b".repeat(64), incomingKey: role, sourceSeq: seq, advertisedRefs: section.refs }, lockedProof: { repoKind: "dir", effectiveRefScope: "all", checkoutComplete: true, branches: {}, safeRefs: {} } } as const;\n` +
+      `await saveStateSource(root, snapshot, { expectedStream: stream, sourceGlobalSeq: seq, globalManifest: { generatedAt: role, files: [], manifestSchema: 2, gitRepos: { repo: section } }, observedRepos: ["repo"], values: { bases: { repo: section } }, repoProofs: { repo: proof } });\n`
   );
   const daemon = Bun.spawn([process.execPath, worker, rootA, stream, "daemon", "1"], { stdout: "pipe", stderr: "pipe" });
   const cli = Bun.spawn([process.execPath, worker, rootA, stream, "cli", "2"], { stdout: "pipe", stderr: "pipe" });

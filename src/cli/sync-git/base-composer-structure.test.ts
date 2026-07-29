@@ -201,6 +201,10 @@ test("design 130 persisted BASE and branch-origin writes are a closed allowlist"
     // shape; it has no authority-write call site.
     "src/cli/state-plane/codecs/coverage.ts": 2,
     "src/cli/state-plane/codecs/repo-record.ts": 2,
+    // Blanket migration authority and the legacy-manifest adoption it exists
+    // for. Confined here so no ordinary write path can default to it; the
+    // importer set is pinned by sync-git/base-proof-authority.test.ts.
+    "src/cli/state-plane/migration/base-proof.ts": 3,
     // U1b's unwired CAS recomposes BASE exactly like the JSON authority: one
     // composeRepoBase call per transition, driven by that transition's own
     // explicit RepoBaseProof. Step 2 lives in exactly one module, so there is no
@@ -218,7 +222,9 @@ test("design 130 persisted BASE and branch-origin writes are a closed allowlist"
     // Design 178 D.3 read-only publisher-ACK composer dry-run inputs/result.
     "src/cli/sync-git/pending-supersession.ts": 3,
     "src/cli/sync-git/plan.ts": 2,
-    "src/cli/sync-state-model.ts": 11,
+    // Three sites left with the legacy-manifest adoption they belonged to.
+    "src/cli/sync-state-model.ts": 8,
+    // T1.1 moved the JSON CAS here; the proof-selection hoist is count-neutral.
     "src/cli/state-plane/adapters/legacy-json-store.ts": 8,
     "src/cli/sync-state.ts": 14,
     "src/cli/sync/pull.ts": 2,

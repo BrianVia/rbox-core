@@ -79,7 +79,7 @@ import { gitIncomingKey, observePackedRefsIdentity, packedRefsMtimeRegressed, se
 import { checkTombstoneAttestation } from "./tombstone-attestation.js";
 import type { FollowerBranchProtocol } from "./follower-protocol.js";
 import { commitPlannedBranchTransition, planBranchTransition, planManualBranchTransition, type PlannedBranchTransition } from "./branch-transition.js";
-import { branchBaseOriginMatches, type BranchTransitionWitness, type LockedBranchProof, type RepoBaseProof, type SafeRefWitness } from "./base-composer.js";
+import { branchBaseOriginMatches, observedLandingRepoBaseProof, recordOriginLineage, type BranchTransitionWitness, type LockedBranchProof, type RepoBaseProof, type SafeRefWitness } from "./base-composer.js";
 import {
   breadcrumbGateForReason,
   highestBreadcrumbVetoGate,
@@ -346,7 +346,22 @@ export async function recoverAndLandFollowJournal(
 ): Promise<RecoverAndLandFollowJournalResult> {
   const recovery = await recoverFollowJournal(workspaceRoot, relPath, binding);
   if (recovery.status !== "keep" || opts.land === false) return { recovery, state };
-  const published = await savePublishedRepoIntent(workspaceRoot, state, relPath, recovery.intended);
+  // recoverJournal only returns "keep" after verifying the published checkout
+  // against the live repository, so recovery.observedRefs is the refs actually on
+  // disk. A journal written by this rbox already carries a witnessed proof; a
+  // legacy (pre-proof) journal carries none, and its authority to install comes
+  // from that verified observation — not from the missing proof — as an
+  // observed-landing proof that can only install what disk was seen to hold.
+  const intended = recovery.intended.baseProof !== undefined
+    ? recovery.intended
+    : {
+        ...recovery.intended,
+        baseProof: observedLandingRepoBaseProof(
+          recovery.observedRefs,
+          recordOriginLineage(recovery.intended.record.branchBaseOrigins) ?? "legacy-untrusted",
+        ),
+      };
+  const published = await savePublishedRepoIntent(workspaceRoot, state, relPath, intended);
   if (intentSettled(published.disposition)) await clearFollowJournal(workspaceRoot, relPath, opts.crashAt);
   return { recovery, state: published.state, disposition: published.disposition };
 }

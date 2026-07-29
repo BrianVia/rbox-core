@@ -227,8 +227,12 @@ async function persist(root: string, state: SyncState, outcome: Awaited<ReturnTy
     expectedStream: STREAM,
     sourceGlobalSeq: 2,
     observedRepos: [REL],
+    // Mirrors sync/pull.ts: the apply outcome's BASE authority and branch
+    // provenance ride the same packet as the sections they authorize.
+    repoProofs: outcome.repoProofs,
     values: {
       bases: outcome.gitRepos,
+      branchBaseOrigins: outcome.branchBaseOrigins,
       pending: outcome.gitPendingRemote,
       removals: outcome.gitReposRemoved,
       resolutions: outcome.gitNeedsResolution,
@@ -372,7 +376,9 @@ describe("design 116 generated disposition matrix", () => {
         const restarted = await loadState(root, STREAM);
         const record = repoRecordsForState(restarted)[REL]!;
         if (shouldFollow) {
-          expect(Object.keys(record).sort()).toEqual(["base", "idxProj", "repoGen", "sourceSeq"].sort());
+          // A followed BASE records the provenance its proof minted, exactly as
+          // a real pull does now that this harness carries repoProofs.
+          expect(Object.keys(record).sort()).toEqual(["base", "branchBaseOrigins", "idxProj", "repoGen", "sourceSeq"].sort());
           expect(record.base).toEqual(incoming);
           expect(record.pending).toBeUndefined();
           expect(record.partial).toBeUndefined();

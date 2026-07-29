@@ -1085,6 +1085,15 @@ test("R5 chronic git deferral keeps fold evidence through advanced and same-head
     const repoOnlySection = { ...section, generatedAt: "repo-only-transition" };
     state = await saveStateSource(root, await loadState(root, syncStreamId(cfg)), {
       expectedStream: syncStreamId(cfg), sourceGlobalSeq: 2, observedRepos: ["repo"], values: { bases: { repo: repoOnlySection } },
+      // Introducing this BASE is an authority claim, so the repo-only transition
+      // names the ACK lane that advertised exactly these refs.
+      repoProofs: { repo: {
+        authority: {
+          kind: "publisher-ack", lineageHash: "a".repeat(64), repositoryIdentityHash: "b".repeat(64),
+          incomingKey: "r5-repo-only", sourceSeq: 2, advertisedRefs: repoOnlySection.refs,
+        },
+        lockedProof: { repoKind: "dir", effectiveRefScope: "all", checkoutComplete: true, branches: {}, safeRefs: {} },
+      } },
     });
     expect(state.manifestMeta).toEqual(second.manifestMeta);
     const c2: Manifest = { ...c1, generatedAt: "r7-c2", files: c1.files.map((f, i) => i === 8 ? { ...f, mode: 0o700 } : f) };

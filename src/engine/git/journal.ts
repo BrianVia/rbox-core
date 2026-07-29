@@ -5,7 +5,7 @@ import { hashBytes, hashFile } from "../hash.js";
 import { ensureDirectoryChain, fsyncCreatedDirectoryAncestors, fsyncDirectory, writeFileAtomic } from "../fsutil.js";
 import type { GitSection } from "../types.js";
 import { exists, git, readRegularFileNoFollow } from "./shared.js";
-import { pruneEmptyOpStateDirs, readAllRefs } from "./refs.js";
+import { pruneEmptyOpStateDirs, readAllRefs, readAllRefsStrict } from "./refs.js";
 import { runUpdateRefTransaction } from "./keep-pins.js";
 import {
   acquireLock,
@@ -142,7 +142,10 @@ export type JournalRecoveryResult<TIntended = unknown> =
   | { status: "binding-mismatch"; quarantinePath: string }
   | { status: "fresh-quarantined"; quarantinePath: string }
   | { status: "defer"; reason: string; journalPath: string }
-  | { status: "keep"; intended: TIntended; incomingKey: string; journalPath: string };
+  | { status: "keep"; intended: TIntended; incomingKey: string; journalPath: string;
+      /** The refs read off the live repository when the published landing was
+       * verified — the witness a caller composes BASE from. */
+      observedRefs: Record<string, string> };
 
 const keyFor = (relPath: string) => hashBytes(Buffer.from(relPath));
 export const checkoutJournalDir = (workspaceRoot: string, relPath: string) => path.join(workspaceRoot, ".rbox", "state", "git-journal", keyFor(relPath));
@@ -822,9 +825,27 @@ export async function recoverJournal<T = unknown>(
   if (!journalBindingMatches) {
     return { status: "binding-mismatch", quarantinePath: await retireJournal(workspaceRoot, relPath) };
   }
+  const repoDir = relPath === "." ? workspaceRoot : path.join(workspaceRoot, ...relPath.split("/"));
   if (journal.phase === "published") {
     if (journalId !== undefined) await recoverOrigHeadLockFenced(journalId, binding, options.identity ?? systemLockIdentity);
-    return { status: "keep", intended: journal.intended, incomingKey: journal.incomingKey, journalPath: dir };
+    // Read the refs actually on the live repository and hand them back as the
+    // landing witness. A published journal's branch tips may have been mutated
+    // by legitimate local activity after the checkout landed (design 200: a
+    // published branch deleted locally), so this is deliberately NOT an
+    // exact-match gate — the caller composes BASE from these observed refs, and
+    // its observed-landing authority installs only a ref the repository was
+    // actually seen to hold. A journal claiming a ref that is not on disk can
+    // never install it; it is held, not fabricated.
+    //
+    // This MUST use the strict read: the observed refs become proven-null
+    // deletions for every key they omit, so an unreadable/corrupt ref database
+    // read as {} would authorize wiping BASE. A read failure is not a verified
+    // empty repository, so it defers the journal untouched instead.
+    const observed = await readAllRefsStrict(repoDir);
+    if (observed.status === "unreadable") {
+      return { status: "defer", reason: `published checkout ref database unreadable (${observed.marker})`, journalPath: dir };
+    }
+    return { status: "keep", intended: journal.intended, incomingKey: journal.incomingKey, observedRefs: observed.refs, journalPath: dir };
   }
 
   if (journal.createdFresh) {
@@ -837,7 +858,6 @@ export async function recoverJournal<T = unknown>(
     }
     // r4 F2: post-crash freshness is undecidable; never rm -rf. Preserve the
     // entire partial repository (including hooks/objects a human may have added).
-    const repoDir = relPath === "." ? workspaceRoot : path.join(workspaceRoot, ...relPath.split("/"));
     const gitEntry = path.join(repoDir, ".git");
     const quarantinePath = await uniqueRetirePath(workspaceRoot, "git-quarantine", keyFor(relPath));
     try {
@@ -849,7 +869,6 @@ export async function recoverJournal<T = unknown>(
     }
   }
 
-  const repoDir = relPath === "." ? workspaceRoot : path.join(workspaceRoot, ...relPath.split("/"));
   const recoveryIdentity = legacy ? binding.commonDirIdentity : journal.binding.commonDirIdentity;
   if (!await commonDirIdentityMatches(recoveryIdentity)) {
     return { status: "defer", reason: "checkout common-directory identity changed", journalPath: dir };

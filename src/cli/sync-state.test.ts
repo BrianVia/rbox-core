@@ -28,6 +28,7 @@ import {
   stampConfigAck,
   type StateSource,
 } from "./sync-state.js";
+import { carryRepoBaseProof } from "./sync-git/base-composer.js";
 import { acquireWorkspaceSyncMutex, releaseWorkspaceSyncMutex, workspaceSyncMutexDegraded } from "./sync-mutex.js";
 import { mintSetupExistingConsent } from "./reset-consent.js";
 
@@ -448,6 +449,9 @@ describe("design 93 §6 transactional unit", () => {
         relPath: "composed",
         expectedRepoGen: 0,
         newRecord: { sourceSeq: 1, base: invalidCandidate },
+        // The candidate drops a branch, so it must name its authority. Carry
+        // holds the drop, which is exactly what this fixture asserts about.
+        baseProof: carryRepoBaseProof(),
       }],
     }, { lock: lock() });
     expect(result.status).toBe("accepted");

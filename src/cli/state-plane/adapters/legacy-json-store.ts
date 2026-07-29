@@ -6,10 +6,8 @@ import { fsyncDirectory, writeFileAtomic } from "../../../engine/fsutil.js";
 import { acquireLock, type OwnedLock } from "../../../engine/git/lockfile.js";
 import { assertProtocolLockHeld } from "../../../engine/git/protocol-locks.js";
 import { sanitizeGitSectionForPersistence } from "../../../engine/git/config-sync.js";
-import {
-  composeRepoBase,
-  migrationRepoBaseProof,
-} from "../../sync-git/base-composer.js";
+import { composeRepoBase } from "../../sync-git/base-composer.js";
+import { requireRepoBaseProof } from "../../sync-git/base-proof-selection.js";
 import {
   acquireWorkspaceSyncMutex,
   assertSyncMutex,
@@ -154,14 +152,16 @@ export async function applyStateSavePacket(root: string, packet: StateSavePacket
     }
     for (const transition of packet.repos) {
       const previous = records[transition.relPath] ?? { repoGen: 0, sourceSeq: 0 };
-      const proof = transition.baseProof ?? migrationRepoBaseProof();
       const sanitizedPreviousBase = previous.base === undefined ? undefined : sanitizeGitSectionForPersistence(previous.base);
       const sanitizedCandidateBase = transition.newRecord.base === undefined
         ? undefined
         : sanitizeGitSectionForPersistence(transition.newRecord.base);
+      const previousValue = { base: sanitizedPreviousBase, branchBaseOrigins: previous.branchBaseOrigins };
+      const candidateValue = { base: sanitizedCandidateBase, branchBaseOrigins: transition.newRecord.branchBaseOrigins };
+      const proof = requireRepoBaseProof(transition.relPath, transition.baseProof, previousValue, candidateValue);
       const composed = composeRepoBase(
-        { base: sanitizedPreviousBase, branchBaseOrigins: previous.branchBaseOrigins },
-        { base: sanitizedCandidateBase, branchBaseOrigins: transition.newRecord.branchBaseOrigins },
+        previousValue,
+        candidateValue,
         proof.authority,
         proof.lockedProof,
       );
