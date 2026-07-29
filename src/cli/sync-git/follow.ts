@@ -1,3 +1,11 @@
+/** The follow pipeline's two irreducible engines.
+ *
+ * `publishRefPlane` (480 nonblank) and `followDivergedRepo` (598 nonblank) each
+ * exceed the module-size gate on their own, so they cannot be moved into a
+ * passing module — see docs/design/notes/sync-git-decompose.md. Everything that
+ * COULD move has: the vocabulary, journal lifecycle, staging, live read,
+ * classifier, and ref-plane witnesses are now separate domain modules, and this
+ * file re-exports the full public surface unchanged. */
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -12,27 +20,16 @@ import {
   noDropProof,
   ownershipProofContext,
   ORIG_HEAD_CHANGED_AT_CHECKOUT_BOUNDARY,
-  partitionOwnedByIncoming,
-  probeReceiverEquivalence,
-  receiverEquivalentCollisionNames,
-  receiverEquivalentPath,
-  recoverJournal,
   tipOwnedByIncoming,
   validateGitSection,
   updateCheckoutJournal,
   writeCheckoutJournal,
-  type AppliedManifestOracle,
-  type BlobStore,
-  type CheckoutCapabilityProbe,
+  receiverEquivalentCollisionNames,
   type CheckoutJournal,
-  type CheckoutJournalBinding,
   type CheckoutRefUpdate,
-  type GitChainTimings,
-  type GitSection,
   type OwnershipProofContext,
   basePresentKeepRef,
 } from "../../engine/index.js";
-import { captureCommonDirIdentity } from "../../engine/git/lockfile.js";
 import { branchesCheckedOutElsewhere, branchesCheckedOutElsewhereStrict } from "../../engine/git/apply.js";
 import {
   humanDisplacementOrigin,
@@ -41,34 +38,17 @@ import {
   readRefReflogFingerprint,
   runUpdateRefTransaction,
 } from "../../engine/git/keep-pins.js";
-import { hashFile } from "../../engine/hash.js";
-import type { MutationBoundary } from "../../engine/mutation-gate.js";
-import { pruneStaleScratchRefs } from "../../engine/git/pins.js";
-import { listRefs, readAllRefs, readAllRefsStrict, readOpState, readOpStateSnapshot } from "../../engine/git/refs.js";
-import { OP_STATE_CLASSIFICATION, OP_STATE_DIRS, OP_STATE_FILES, type OpStateRoot } from "../../engine/manifest-validate.js";
+import { readAllRefs, readAllRefsStrict } from "../../engine/git/refs.js";
 import {
-  clearIndexResolveUndo,
   addTimedMs,
-  getGitArtifact,
   git,
-  gitWithIndexFile,
   headBranchOf,
-  importGitPackChain,
   readHead,
   repoCtx,
   exists,
   warnOnce,
-  type RepoCtx,
 } from "../../engine/git/shared.js";
-import type {
-  GitDeferralReason,
-  GitPartialApply,
-  RepoRecord,
-  RepoRecordInput,
-  TypedBlocker,
-} from "../config.js";
-import { GIT_DEFERRAL_REASON_RANK } from "../sync-state-model.js";
-import { intentSettled, savePublishedRepoIntent, type PublishedRepoIntentDisposition } from "../sync-state.js";
+import type { GitDeferralReason, GitPartialApply, TypedBlocker } from "../config.js";
 import {
   origHeadPreservationFailureLine,
   preserveOrigHead,
@@ -77,670 +57,54 @@ import {
 } from "./orig-head.js";
 import { gitIncomingKey, observePackedRefsIdentity, packedRefsMtimeRegressed, sectionOpState } from "./shared.js";
 import { checkTombstoneAttestation } from "./tombstone-attestation.js";
-import type { FollowerBranchProtocol } from "./follower-protocol.js";
 import { commitPlannedBranchTransition, planBranchTransition, planManualBranchTransition, type PlannedBranchTransition } from "./branch-transition.js";
-import { branchBaseOriginMatches, observedLandingRepoBaseProof, recordOriginLineage, type BranchTransitionWitness, type LockedBranchProof, type RepoBaseProof, type SafeRefWitness } from "./base-composer.js";
-import {
-  breadcrumbGateForReason,
-  highestBreadcrumbVetoGate,
-  logVetoOnce,
-  type BreadcrumbVetoGate,
-} from "./breadcrumb-veto.js";
+import { branchBaseOriginMatches, type BranchTransitionWitness, type LockedBranchProof, type SafeRefWitness } from "./base-composer.js";
 import { gitFingerprint, gitFingerprintRun, type GitFingerprint } from "./fingerprint.js";
 import { loadContentEquivalenceCache } from "./content-equivalence-cache.js";
+import { checkoutJournalBinding } from "./follow-journal.js";
+import { candidateIndexCollision, deriveBaseIndexProjection, expectedHead, indexArtifact, stageIncoming } from "./follow-staging.js";
+import { readLive } from "./follow-live.js";
+import { classifyCheckout, firstReason } from "./follow-classify.js";
+import { appliedTerminalOid, effectiveRefs, ensureStashReflog, selectCheckoutSelfRootWitness } from "./follow-ref-witness.js";
+import {
+  blockerForReason,
+  boundedRefFailure,
+  deferResult,
+  progressWithBlocker,
+  WorktreeOwnershipUnreadableError,
+  type CheckoutClassification,
+  type FollowIntended,
+  type FollowOptions,
+  type FollowProgress,
+  type FollowResult,
+  type LiveMetadata,
+  type StagedIncoming,
+} from "./follow-types.js";
+
+export {
+  FollowCrashInjectedError,
+  opStateRootOf,
+  type FollowCrashPoint,
+  type FollowIntended,
+  type FollowProgress,
+  type FollowResult,
+} from "./follow-types.js";
+export {
+  checkoutJournalBinding,
+  clearFollowJournal,
+  quarantineUnboundFollowJournal,
+  recoverAndLandFollowJournal,
+  recoverFollowJournal,
+} from "./follow-journal.js";
+export { deriveBaseIndexProjection, indexArtifact, stageIncoming } from "./follow-staging.js";
+export {
+  classifyCheckoutOwnership,
+  firstReason,
+  type CheckoutOwnershipClassification,
+} from "./follow-classify.js";
+export { selectCheckoutSelfRootWitness, type CheckoutSelfRootWitness } from "./follow-ref-witness.js";
 
 const refEquivalenceWarnings = new Set<string>();
-const receiverEquivalenceByWorkspace = new Map<string, ReturnType<typeof probeReceiverEquivalence>>();
-
-class WorktreeOwnershipUnreadableError extends Error {
-  constructor(cause: unknown) {
-    super(`worktree ownership evidence could not be read: ${String((cause as Error)?.message ?? cause)}`);
-  }
-}
-
-function boundedRefFailure(error: unknown): string {
-  const clean = String((error as Error)?.message ?? error)
-    .replace(/[\p{Cc}\p{Cf}]+/gu, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  return [...clean].length <= 512 ? clean : `${[...clean].slice(0, 511).join("")}…`;
-}
-
-export type FollowCrashPoint =
-  | "after-safe-refs"
-  | "after-journal-write"
-  | "after-connectivity-proof"
-  | "after-prepare"
-  | "after-index-lock"
-  | "after-head-commit"
-  | "after-ref-commit"
-  | "before-index-publish"
-  | "after-index-publish"
-  | "mid-op-state"
-  | "after-published-flip"
-  | "before-journal-clear";
-
-/** Test-only process-death sentinel. Orchestration catches ordinary per-repo
- * errors, so this explicit type is the one exception allowed to escape. */
-export class FollowCrashInjectedError extends Error {
-  constructor(readonly point: FollowCrashPoint) { super(`injected follow crash at ${point}`); }
-}
-
-export interface FollowIntended {
-  record: RepoRecordInput;
-  expectedRepoGen: number;
-  relPath: string;
-  /** Pre-journal record used to merge a published recovery lane-by-lane. */
-  previousRecord?: RepoRecordInput;
-  baseProof?: RepoBaseProof;
-}
-
-export interface FollowProgress {
-  appliedRefs: GitPartialApply["appliedRefs"];
-  heldRefs: GitPartialApply["heldRefs"];
-  /** Complete classification seam; orchestration appends protocol/composer blockers. */
-  blockers: TypedBlocker[];
-  /** Exact reflog files consulted while reaching this outcome. */
-  consultedReflogPaths?: string[];
-  configApplied: boolean;
-  incomingIndexProjection?: string;
-  derivedBaseIndexProjection?: string;
-  branchWitnesses?: Record<string, BranchTransitionWitness>;
-  branchLockedProofs?: Record<string, LockedBranchProof>;
-  safeRefWitnesses?: Record<string, SafeRefWitness>;
-  /** Positive branch already at the confirmed candidate, with no ref mutation/P. */
-  manualBranchTerminals?: Record<string, { beforeBaseOid: string; afterOid: string }>;
-  tombstonePrunedThisCycle?: boolean;
-}
-
-export type FollowResult =
-  | ({ status: "followed" } & FollowProgress)
-  | ({ status: "defer"; reason: GitDeferralReason; detail: string } & FollowProgress)
-  | ({ status: "legacy"; reason: GitDeferralReason; detail: string } & FollowProgress);
-
-interface FollowOptions {
-  workspaceRoot: string;
-  relPath: string;
-  ctx: RepoCtx;
-  base?: GitSection;
-  incoming: GitSection;
-  store: BlobStore;
-  kek: Buffer;
-  oracle: AppliedManifestOracle;
-  record?: RepoRecord;
-  binding: CheckoutJournalBinding;
-  /** Exact false preserves the pre-follow conflict disposition. */
-  followEnabled: boolean;
-  runConfig?: () => Promise<boolean>;
-  makeIntended: (progress: FollowProgress) => FollowIntended | Promise<FollowIntended>;
-  chainTimings?: GitChainTimings;
-  capabilityProbe?: CheckoutCapabilityProbe;
-  crashAt?: (point: FollowCrashPoint) => void;
-  /** Loud receiver-ambiguity diagnostics supplied by pull orchestration. */
-  log?: (line: string) => void;
-  /** A D2 applied-ref marker failed exact revalidation; human movement wins. */
-  forcedHeldRefs?: GitPartialApply["heldRefs"];
-  /** Deterministic preservation-boundary race injection for §130 tests. */
-  afterBranchPinsPrepared?: (ref: string) => void | Promise<void>;
-  /** Structural P3 test seams; observations only, never policy inputs. */
-  onContentEquivalentWaiver?: (ref: string) => void;
-  onContentEquivalentDestructiveHold?: (ref: string) => void;
-  beforePlanBranchTransition?: (ref: string, afterOid: string | null) => void;
-  beforeManualAbsentTransition?: (ref: string) => void | Promise<void>;
-  beforeWorktreeOwnershipRead?: () => void | Promise<void>;
-  /** Tests only: fault injection at the two deliberately lossy readLive sites. */
-  beforeCheckoutSecondProof?: () => void | Promise<void>;
-  beforeFinalLive?: () => void | Promise<void>;
-  mutationBoundary?: MutationBoundary;
-  /** Runs after the exact initial classifier and before staged scratch refs are
-   * cleaned. The callback may persist an attempt only if its trusted edge still
-   * matches after all orchestration/composer inputs have been consumed. */
-  afterHeldClassification?: (input: {
-    phase: "defer" | "followed";
-    trustedFingerprint: GitFingerprint | undefined;
-    effectiveBaseIndexProjection: string | null | undefined;
-    effectiveIncomingIndexProjection: string | null | undefined;
-    blockers: readonly TypedBlocker[];
-    reflogPaths: readonly string[];
-    progress: FollowProgress;
-  }) => void | Promise<void>;
-  /** Prevalidated, incoming-key-bound §130 lineage/artifact authority. Without
-   * it branch mutation is forbidden; tags/stash retain their distinct lane. */
-  branchProtocol?: FollowerBranchProtocol;
-  /** D6's explicit, snapshot-confirmed authorization. Automatic follow keeps
-   * using the ordinary oracle gates; this narrow mode only waives the exact
-   * human divergences enumerated by show-me. Exact ref-plane progress authored
-   * by the normal pipeline is reported to the lock-bound snapshot verifier so
-   * it can normalize only those known changes and reject every other delta. */
-  manualResolution?: {
-    snapshotId: string;
-    waivedReasons: readonly Extract<GitDeferralReason,
-      "local-edits" | "local-index" | "local-operation" | "local-commits" | "local-stash">[];
-    protectedOids: readonly string[];
-    secondProof: (authoredRefChanges: readonly { ref: string; before?: string; after?: string }[]) => Promise<boolean>;
-  };
-}
-
-async function candidateIndexCollision(workspaceRoot: string, repoDir: string, indexPath: string): Promise<string | undefined> {
-  let pending = receiverEquivalenceByWorkspace.get(workspaceRoot);
-  if (!pending) {
-    pending = probeReceiverEquivalence(workspaceRoot);
-    receiverEquivalenceByWorkspace.set(workspaceRoot, pending);
-  }
-  const equivalence = await pending;
-  if (!equivalence.caseAliases && !equivalence.unicodeAliases) return undefined;
-  const raw = await gitWithIndexFile(repoDir, indexPath, ["ls-files", "-z", "--stage"]);
-  const names = new Set(raw.split("\0").filter(Boolean).map((record) => {
-    const tab = record.indexOf("\t");
-    if (tab < 0) throw new Error("candidate index ls-files record lacks pathname");
-    return record.slice(tab + 1);
-  }));
-  const collisions = receiverEquivalentCollisionNames(names, (name) => receiverEquivalentPath(name, equivalence));
-  return collisions.size > 0 ? [...collisions].sort().join(", ") : undefined;
-}
-
-interface StagedIncoming {
-  tmpDir: string;
-  incomingNs: string;
-  candidateIndex?: string;
-  incomingIndexProjection?: string;
-  opState: Array<{ rel: string; tmp: string }>;
-  opBytes: Record<string, Uint8Array>;
-  cleanupRefs(): Promise<void>;
-  cleanup(): Promise<void>;
-}
-
-type StageIncomingOptions = Pick<FollowOptions, "ctx" | "incoming" | "store" | "kek" | "chainTimings">;
-
-interface LiveMetadata {
-  headContent: string;
-  currentRef?: string;
-  currentTip?: string;
-  refs: Record<string, string>;
-  indexPresent: boolean;
-  indexProjection?: string;
-  opState: Record<string, string>;
-  opStateRootsPresent: readonly OpStateRoot[];
-}
-
-interface BreadcrumbMismatch {
-  rel: OpStateRoot;
-  live: string | null;
-  base: string | null;
-  incoming: string | null;
-}
-
-export function opStateRootOf(rel: string): OpStateRoot {
-  return rel.split("/")[0] as OpStateRoot;
-}
-
-interface CheckoutClassification {
-  safe: boolean;
-  reason?: GitDeferralReason;
-  detail?: string;
-  breadcrumbMismatches: BreadcrumbMismatch[];
-  breadcrumbWaived: boolean;
-  breadcrumbVetoGate?: BreadcrumbVetoGate;
-  blockers: TypedBlocker[];
-}
-
-function blockerForReason(
-  reason: GitDeferralReason,
-  provenance: "checkout" | "boundary",
-  detail?: string,
-): TypedBlocker {
-  return { provenance, reason, ...(detail ? { detail } : {}) };
-}
-
-function progressWithBlocker(
-  progress: FollowProgress,
-  reason: GitDeferralReason,
-  detail: string,
-  provenance: "checkout" | "boundary" = "checkout",
-): FollowProgress {
-  return { ...progress, blockers: [...progress.blockers, blockerForReason(reason, provenance, detail)] };
-}
-
-function deferResult(
-  progress: FollowProgress,
-  reason: GitDeferralReason,
-  detail: string,
-  provenance: "checkout" | "boundary" = "checkout",
-): FollowResult {
-  return { status: "defer", reason, detail, ...progressWithBlocker(progress, reason, detail, provenance) };
-}
-
-export async function checkoutJournalBinding(stream: string, stateNonce: string, ctx: RepoCtx): Promise<CheckoutJournalBinding> {
-  const commonDirReal = await fs.realpath(ctx.commonDir);
-  return {
-    stream,
-    stateNonce,
-    gitDirReal: await fs.realpath(ctx.gitDir),
-    commonDirReal,
-    commonDirIdentity: await captureCommonDirIdentity(commonDirReal),
-    worktreeId: await fs.realpath(ctx.repoDir).catch(() => path.resolve(ctx.repoDir)),
-  };
-}
-
-export async function recoverFollowJournal(
-  workspaceRoot: string,
-  relPath: string,
-  binding: CheckoutJournalBinding,
-) {
-  return recoverJournal<FollowIntended>(workspaceRoot, relPath, binding);
-}
-
-type RecoverAndLandFollowJournalResult = {
-  recovery: Awaited<ReturnType<typeof recoverFollowJournal>>;
-  state: import("../config.js").SyncState;
-  disposition?: PublishedRepoIntentDisposition;
-};
-
-/** Recover a checkout journal and, when permitted, land and retire its published intent. */
-export async function recoverAndLandFollowJournal(
-  workspaceRoot: string,
-  relPath: string,
-  binding: CheckoutJournalBinding,
-  state: import("../config.js").SyncState,
-  opts: { land?: boolean; crashAt?: FollowOptions["crashAt"] } = {},
-): Promise<RecoverAndLandFollowJournalResult> {
-  const recovery = await recoverFollowJournal(workspaceRoot, relPath, binding);
-  if (recovery.status !== "keep" || opts.land === false) return { recovery, state };
-  // recoverJournal only returns "keep" after verifying the published checkout
-  // against the live repository, so recovery.observedRefs is the refs actually on
-  // disk. A journal written by this rbox already carries a witnessed proof; a
-  // legacy (pre-proof) journal carries none, and its authority to install comes
-  // from that verified observation — not from the missing proof — as an
-  // observed-landing proof that can only install what disk was seen to hold.
-  const intended = recovery.intended.baseProof !== undefined
-    ? recovery.intended
-    : {
-        ...recovery.intended,
-        baseProof: observedLandingRepoBaseProof(
-          recovery.observedRefs,
-          recordOriginLineage(recovery.intended.record.branchBaseOrigins) ?? "legacy-untrusted",
-        ),
-      };
-  const published = await savePublishedRepoIntent(workspaceRoot, state, relPath, intended);
-  if (intentSettled(published.disposition)) await clearFollowJournal(workspaceRoot, relPath, opts.crashAt);
-  return { recovery, state: published.state, disposition: published.disposition };
-}
-
-/** No usable repo context means recovery must never touch Git. Supplying an
- * impossible path binding makes a valid journal retire through the engine's
- * ordinary binding-mismatch path; corrupt journals remain visible/deferred. */
-export async function quarantineUnboundFollowJournal(workspaceRoot: string, relPath: string, stream: string, stateNonce: string) {
-  return recoverJournal<FollowIntended>(workspaceRoot, relPath, {
-    stream,
-    stateNonce,
-    gitDirReal: "",
-    commonDirReal: "",
-    commonDirIdentity: { path: "", realpath: "", dev: "", ino: "", birthtimeNs: "" },
-    worktreeId: "",
-  });
-}
-
-export async function clearFollowJournal(workspaceRoot: string, relPath: string, crashAt?: FollowOptions["crashAt"]): Promise<void> {
-  crashAt?.("before-journal-clear");
-  await clearCheckoutJournal(workspaceRoot, relPath);
-}
-
-export function indexArtifact(section: GitSection | undefined, options: { strict?: boolean } = {}) {
-  if (!section) return undefined;
-  const fields = [section.indexSha, section.indexEncSha, section.indexCipherSize] as const;
-  if (fields.every((field) => field === undefined)) return undefined;
-  if (!section.indexSha || !section.indexEncSha || section.indexCipherSize === undefined) {
-    if (options.strict) throw new Error("incomplete index lane");
-    return undefined;
-  }
-  return {
-    sha: section.indexSha,
-    encSha: section.indexEncSha,
-    cipherSize: section.indexCipherSize,
-    ...(section.indexComp ? { comp: section.indexComp } : {}),
-    ...(section.indexPayloadSha ? { payloadSha: section.indexPayloadSha } : {}),
-  };
-}
-
-async function normalizedIndexProjection(repoDir: string, source: string, dest: string): Promise<string | undefined> {
-  await fs.copyFile(source, dest);
-  try {
-    await clearIndexResolveUndo(repoDir, dest);
-  } catch {
-    return undefined;
-  }
-  return indexIdentityV2(repoDir, dest);
-}
-
-export async function stageIncoming(opts: StageIncomingOptions): Promise<StagedIncoming> {
-  const { ctx, incoming, store, kek } = opts;
-  await fs.mkdir(path.join(ctx.repoDir, ".rbox"), { recursive: true });
-  const tmpDir = await fs.mkdtemp(path.join(ctx.repoDir, ".rbox", "git-follow-"));
-  const incomingNs = `refs/rbox-incoming/${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
-  const cleanupRefs = async () => {
-    for (const ref of await listRefs(ctx.repoDir, incomingNs).catch(() => [])) await git(ctx.repoDir, ["update-ref", "-d", ref]).catch(() => {});
-  };
-  const cleanup = async () => {
-    await cleanupRefs();
-    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
-  };
-  try {
-    let candidateIndex: string | undefined;
-    let incomingIndexProjection: string | undefined;
-    const artifact = indexArtifact(incoming);
-    if (artifact) {
-      const raw = path.join(tmpDir, "incoming-index.raw");
-      candidateIndex = path.join(tmpDir, "incoming-index");
-      await addTimedMs(opts.chainTimings, "indexOpStateMs", async () => {
-        await getGitArtifact(store, kek, artifact, raw, tmpDir);
-        incomingIndexProjection = await normalizedIndexProjection(ctx.repoDir, raw, candidateIndex!);
-      });
-    }
-    const opState: Array<{ rel: string; tmp: string }> = [];
-    const opBytes: Record<string, Uint8Array> = {};
-    for (const [rel, artifactRef] of Object.entries(incoming.opState ?? {})) {
-      const tmp = path.join(tmpDir, "op", rel);
-      await addTimedMs(opts.chainTimings, "indexOpStateMs", async () => {
-        await getGitArtifact(store, kek, artifactRef, tmp, tmpDir);
-        opState.push({ rel, tmp });
-        opBytes[rel] = await fs.readFile(tmp);
-      });
-    }
-    await pruneStaleScratchRefs(ctx.repoDir, "refs/rbox-incoming");
-    await importGitPackChain(ctx.repoDir, incoming, store, kek, tmpDir, incomingNs, opts.chainTimings);
-    return { tmpDir, incomingNs, candidateIndex, incomingIndexProjection, opState, opBytes, cleanupRefs, cleanup };
-  } catch (error) {
-    await cleanup();
-    throw error;
-  }
-}
-
-async function readLive(
-  ctx: RepoCtx,
-  chainTimings?: GitChainTimings,
-  /** Evidence-grade refs already read by the caller's strict pass. When given,
-   * the map consumed IS the map the strict read proved — no second lossy read. */
-  strictRefs?: Record<string, string>,
-): Promise<LiveMetadata | undefined> {
-  try {
-    const { headContent, currentRef, refs, currentTip } = await addTimedMs(chainTimings, "ownershipMs", async () => {
-      const headContent = await fs.readFile(path.join(ctx.gitDir, "HEAD"), "utf8");
-      const currentRef = /^ref:\s*(refs\/\S+)\s*$/.exec(headContent)?.[1];
-      const refs = strictRefs ?? await readAllRefs(ctx.repoDir);
-      const currentTip = currentRef
-        ? refs[currentRef] ?? await git(ctx.repoDir, ["rev-parse", "--verify", currentRef]).catch(() => undefined)
-        : await git(ctx.repoDir, ["rev-parse", "--verify", "HEAD"]).catch(() => undefined);
-      return { headContent, currentRef, refs, currentTip };
-    });
-    const { indexPresent, indexProjection, opState, opStateRootsPresent } = await addTimedMs(chainTimings, "indexOpStateMs", async () => {
-      const indexPath = path.join(ctx.gitDir, "index");
-      const indexPresent = await fs.lstat(indexPath).then((stat) => stat.isFile(), (error: NodeJS.ErrnoException) => {
-        if (error.code === "ENOENT") return false;
-        throw error;
-      });
-      const indexProjection = indexPresent ? await indexIdentityV2(ctx.repoDir, indexPath) : undefined;
-      const snapshot = await readOpStateSnapshot(ctx.gitDir, hashFile);
-      const opState = snapshot.files;
-      const opStateRootsPresent = snapshot.rootsPresent;
-      return { indexPresent, indexProjection, opState, opStateRootsPresent };
-    });
-    return { headContent, currentRef, currentTip, refs, indexPresent, indexProjection, opState, opStateRootsPresent };
-  } catch {
-    return undefined;
-  }
-}
-
-/** Highest-precedence member of `reasons`, or undefined for an EMPTY set only.
- * classifyCheckout's safe verdict is exactly that emptiness (a deferral reason
- * the local ranking happened to omit must never read as "safe to check out"), so
- * selection scans the set against the shared total rank table rather than
- * searching a locally written list. */
-export function firstReason(reasons: ReadonlySet<GitDeferralReason>): GitDeferralReason | undefined {
-  let selected: GitDeferralReason | undefined;
-  for (const reason of reasons) {
-    if (selected === undefined || GIT_DEFERRAL_REASON_RANK[reason] < GIT_DEFERRAL_REASON_RANK[selected]) selected = reason;
-  }
-  return selected;
-}
-
-export interface CheckoutOwnershipClassification {
-  reasons: GitDeferralReason[];
-  details: string[];
-}
-
-/**
- * Focused follow ownership seam: one current tip plus all stash-reflog tips
- * enter one partition while reflog-read failures remain independently mapped.
- */
-export async function classifyCheckoutOwnership(
-  repoDir: string,
-  currentTip: string | undefined,
-  roots: readonly string[],
-  context: OwnershipProofContext,
-  loadStashOids?: () => Promise<readonly string[]>,
-  prove: (tips: readonly string[]) => ReturnType<typeof partitionOwnedByIncoming> =
-    (tips) => partitionOwnedByIncoming(repoDir, tips, roots, context),
-): Promise<CheckoutOwnershipClassification> {
-  let stashOids: readonly string[] = [];
-  let stashUnreadable = false;
-  if (loadStashOids) {
-    try {
-      stashOids = await loadStashOids();
-    } catch {
-      stashUnreadable = true;
-    }
-  }
-
-  const tips = [...(currentTip ? [currentTip] : []), ...stashOids];
-  const partition = tips.length > 0 ? await prove(tips) : [];
-  const current = currentTip ? partition[0]?.proof : undefined;
-  const stash = partition.slice(currentTip ? 1 : 0);
-  const reasons: GitDeferralReason[] = [];
-  const details: string[] = [];
-
-  if (!currentTip) {
-    reasons.push("unreadable");
-    details.push("current checkout tip is unreadable");
-  } else if (current?.status === "unowned") {
-    reasons.push("local-commits");
-    details.push("current tip has receiver-only commits");
-  } else if (current?.status === "indeterminate") {
-    reasons.push(current.marker === "shallow-store" ? "unsupported" : "unreadable");
-    details.push(`current-tip reachability ${current.marker}`);
-  }
-
-  for (const entry of stash) {
-    if (entry.proof.status === "unowned") {
-      reasons.push("local-stash");
-      details.push("stash reflog contains receiver-only work");
-    } else if (entry.proof.status === "indeterminate") {
-      reasons.push("unreadable");
-      details.push(`stash reachability ${entry.proof.marker}`);
-    }
-  }
-  if (stashUnreadable) {
-    reasons.push("unreadable");
-    details.push("stash reflog could not be read");
-  }
-  return { reasons, details };
-}
-
-async function classifyCheckout(args: {
-  opts: FollowOptions;
-  live: LiveMetadata | undefined;
-  incomingProjection?: string;
-  baseProjection?: string;
-  roots: readonly string[];
-  boundary: boolean;
-  boundaryChanged?: boolean;
-  tombstonePrunedThisCycle?: boolean;
-  checkoutRefReason?: GitDeferralReason;
-  checkoutRefDetail?: string;
-  heldRefs: GitPartialApply["heldRefs"];
-  ownershipContext: OwnershipProofContext;
-}): Promise<CheckoutClassification> {
-  const reasons = new Set<GitDeferralReason>();
-  const details: string[] = [];
-  const breadcrumbMismatches: BreadcrumbMismatch[] = [];
-  const oracle = args.boundary ? await args.opts.oracle.reproveRepo(args.opts.relPath) : await args.opts.oracle.proveRepo(args.opts.relPath);
-  if (oracle.kind === "mismatch") { reasons.add("local-edits"); details.push("working tree differs from applied manifest"); }
-  else if (oracle.kind === "indeterminate") { reasons.add("unreadable"); details.push(oracle.why); }
-
-  const live = args.live;
-  if (!live) {
-    reasons.add("unreadable");
-    details.push("git metadata could not be read");
-  } else {
-    const baseHasIndex = indexArtifact(args.opts.base) !== undefined;
-    const incomingHasIndex = indexArtifact(args.opts.incoming) !== undefined;
-    const projectionFailed = (live.indexPresent && live.indexProjection === undefined)
-      || (baseHasIndex && args.baseProjection === undefined)
-      || (incomingHasIndex && args.incomingProjection === undefined);
-    if (projectionFailed) {
-      reasons.add("unreadable");
-      details.push("semantic index projection indeterminate");
-    } else {
-      const liveValue = live.indexPresent ? live.indexProjection : null;
-      const baseValue = baseHasIndex ? args.baseProjection : null;
-      const incomingValue = incomingHasIndex ? args.incomingProjection : null;
-      if (liveValue !== baseValue && liveValue !== incomingValue) {
-        reasons.add("local-index");
-        details.push("index differs from both base and incoming");
-      }
-    }
-
-    const baseOp = sectionOpState(args.opts.base);
-    const incomingOp = sectionOpState(args.opts.incoming);
-    for (const rel of new Set([...Object.keys(live.opState), ...Object.keys(baseOp), ...Object.keys(incomingOp)])) {
-      const value = live.opState[rel] ?? null;
-      if (value !== (baseOp[rel] ?? null) && value !== (incomingOp[rel] ?? null)) {
-        const root = opStateRootOf(rel);
-        if (OP_STATE_CLASSIFICATION[root] === "breadcrumb") {
-          breadcrumbMismatches.push({ rel: root, live: value, base: baseOp[rel] ?? null, incoming: incomingOp[rel] ?? null });
-        } else {
-          reasons.add("local-operation");
-          details.push(`operation state differs at ${rel}`);
-        }
-      }
-    }
-
-    const ownership = await classifyCheckoutOwnership(
-      args.opts.ctx.repoDir,
-      live.currentTip,
-      args.roots,
-      args.ownershipContext,
-      args.opts.ctx.kind === "dir"
-        ? () => addTimedMs(args.opts.chainTimings, "reflogMs", () => enumerateStashReflogOids(args.opts.ctx.repoDir))
-        : undefined,
-      (tips) => addTimedMs(args.opts.chainTimings, "ownershipMs", () =>
-        partitionOwnedByIncoming(args.opts.ctx.repoDir, tips, args.roots, args.ownershipContext)),
-    );
-    for (const reason of ownership.reasons) reasons.add(reason);
-    details.push(...ownership.details);
-  }
-  if (args.checkoutRefReason) {
-    reasons.add(args.checkoutRefReason);
-    details.push(args.checkoutRefDetail ?? "incoming checkout ref could not be published safely");
-  }
-  const liveInProgress = live !== undefined && (
-    Object.keys(live.opState).some((rel) => OP_STATE_CLASSIFICATION[opStateRootOf(rel)] === "in-progress")
-    || live.opStateRootsPresent.some((rel) => OP_STATE_CLASSIFICATION[rel] === "in-progress")
-  );
-  const vetoes: BreadcrumbVetoGate[] = [];
-  if (Object.keys(args.heldRefs).length > 0) vetoes.push("held-refs");
-  if (args.tombstonePrunedThisCycle) vetoes.push("tombstone-pruned-this-cycle");
-  if (liveInProgress) vetoes.push("in-progress-present");
-  for (const reason of reasons) vetoes.push(breadcrumbGateForReason(reason));
-  if (args.boundaryChanged) vetoes.push("boundary");
-  const breadcrumbVetoGate = highestBreadcrumbVetoGate(vetoes);
-  const breadcrumbWaived = !args.opts.manualResolution
-    && breadcrumbMismatches.length > 0
-    && breadcrumbVetoGate === undefined;
-  // Convert once before manual reason deletion so take-theirs can explicitly
-  // waive local-operation. Presence gates only the automatic waiver.
-  if (breadcrumbMismatches.length > 0 && !breadcrumbWaived) {
-    logVetoOnce(args.opts.workspaceRoot, args.opts.relPath, breadcrumbVetoGate ?? "indeterminate", args.opts.log);
-    reasons.add("local-operation");
-    for (const mismatch of breadcrumbMismatches) details.push(`operation state differs at ${mismatch.rel}`);
-  }
-  for (const reason of args.opts.manualResolution?.waivedReasons ?? []) reasons.delete(reason);
-  // Undefined here means the set is empty, never "no rank for this reason":
-  // safe is exactly "nothing blocked", and blockers below are always empty with it.
-  const reason = firstReason(reasons);
-  const provenance = args.boundary ? "boundary" as const : "checkout" as const;
-  const blockers = [...reasons].map((item) => blockerForReason(item, provenance, details.join("; ")));
-  return reason
-    ? { safe: false, reason, detail: details.join("; "), blockers, breadcrumbMismatches, breadcrumbWaived: false, ...(breadcrumbVetoGate ? { breadcrumbVetoGate } : {}) }
-    : { safe: true, blockers, breadcrumbMismatches, breadcrumbWaived, ...(breadcrumbVetoGate ? { breadcrumbVetoGate } : {}) };
-}
-
-async function ensureStashReflog(repoDir: string, oid: string): Promise<void> {
-  const ctx = await repoCtx(repoDir);
-  if (!ctx) throw new Error("repository unavailable while creating stash reflog");
-  const logPath = path.join(ctx.commonDir, "logs", "refs", "stash");
-  const stat = await fs.stat(logPath).catch(() => undefined);
-  if (stat && stat.size > 0) return;
-  await fs.mkdir(path.dirname(logPath), { recursive: true });
-  const subject = (await git(repoDir, ["log", "-1", "--format=%s", oid]).catch(() => "rbox: synced stash"))
-    .replace(/[\r\n\t]+/g, " ") || "rbox: synced stash";
-  const ident = (await git(repoDir, ["var", "GIT_COMMITTER_IDENT"])).replace(/[\r\n]+/g, " ");
-  const handle = await fs.open(logPath, "a");
-  try {
-    await handle.write(`${oid} ${oid} ${ident}\t${subject}\n`);
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-}
-
-function effectiveRefs(ctx: RepoCtx, incoming: GitSection): { refs: Record<string, string>; deleteAbsent: boolean } {
-  if (ctx.kind === "dir") return { refs: { ...incoming.refs }, deleteAbsent: incoming.refScope === "all" };
-  const refs: Record<string, string> = {};
-  for (const [ref, oid] of Object.entries(incoming.refs)) {
-    if (ref.startsWith("refs/heads/")) refs[ref] = oid;
-  }
-  return { refs, deleteAbsent: false };
-}
-
-export interface CheckoutSelfRootWitness {
-  ref: string;
-  oid: string;
-}
-
-/** Selects the exact branch ref that makes the live tip a durable self-root.
- * The caller supplies ref-plane exclusions because the current ref is skipped
- * by publication and therefore is not necessarily represented in heldRefs. */
-export function selectCheckoutSelfRootWitness(args: {
-  currentTip?: string;
-  effectiveIncomingRefs: Readonly<Record<string, string>>;
-  receiverRefs: Readonly<Record<string, string>>;
-  heldRefs?: ReadonlySet<string>;
-  forcedRefs?: ReadonlySet<string>;
-  ambiguousRefs?: ReadonlySet<string>;
-  /** Boundary proofs must revalidate the same initially selected ref. */
-  requiredRef?: string;
-}): CheckoutSelfRootWitness | undefined {
-  if (!args.currentTip) return undefined;
-  const refs = args.requiredRef ? [args.requiredRef] : Object.keys(args.effectiveIncomingRefs).sort();
-  for (const ref of refs) {
-    if (!ref.startsWith("refs/heads/")
-      || args.heldRefs?.has(ref)
-      || args.forcedRefs?.has(ref)
-      || args.ambiguousRefs?.has(ref)) continue;
-    const incomingOid = args.effectiveIncomingRefs[ref];
-    if (incomingOid === args.currentTip && args.receiverRefs[ref] === incomingOid) {
-      return { ref, oid: incomingOid };
-    }
-  }
-  return undefined;
-}
-
-function appliedTerminalOid(value: GitPartialApply["appliedRefs"][string]): string | null | undefined {
-  if (value.kind === "direct" || value.kind === "present") return value.oid;
-  if (value.kind === "absent") return null;
-  if (value.kind === "safe-ref") return value.afterOid;
-  return undefined;
-}
 
 async function publishRefPlane(
   opts: FollowOptions,
@@ -1228,31 +592,6 @@ async function publishRefPlane(
     checkoutWitnessDisposition,
     authoredRefChanges,
   };
-}
-
-export async function deriveBaseIndexProjection(
-  opts: Pick<FollowOptions, "ctx" | "base" | "store" | "kek" | "record">,
-  tmpDir: string,
-  ignoreCache = false,
-): Promise<string | undefined> {
-  if (!indexArtifact(opts.base)) return undefined;
-  if (!ignoreCache && opts.record?.idxProj) return opts.record.idxProj;
-  const artifact = indexArtifact(opts.base);
-  if (!artifact) return undefined;
-  const raw = path.join(opts.ctx.gitDir, `.rbox-base-index-${process.pid}-${crypto.randomBytes(6).toString("hex")}`);
-  try {
-    await getGitArtifact(opts.store, opts.kek, artifact, raw, tmpDir);
-    await clearIndexResolveUndo(opts.ctx.repoDir, raw);
-    // `return await`, not `return`: the finally's rm would otherwise race the
-    // projection's own read of `raw` (observed as a flaky false-indeterminate).
-    return await indexIdentityV2(opts.ctx.repoDir, raw);
-  } finally {
-    await fs.rm(raw, { force: true });
-  }
-}
-
-function expectedHead(section: GitSection): string {
-  return section.head.endsWith("\n") ? section.head : `${section.head}\n`;
 }
 
 export async function followDivergedRepo(opts: FollowOptions): Promise<FollowResult> {

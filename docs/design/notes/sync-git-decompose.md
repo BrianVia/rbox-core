@@ -40,18 +40,27 @@ move.
 
 ## Domain map — what a pure move CAN extract
 
-### `follow.ts` (1800 nb → facade + 6 modules, ~1078 nb irreducible)
+### `follow.ts` (1800 nb → facade + 6 modules) — **SHIPPED**
 
-| module | contents (source lines) | nonblank | KiB |
+Measured after the split, not estimated:
+
+| module | contents (original source lines) | nonblank | KiB |
 |---|---|---:|---:|
-| `follow-types.ts` | `FollowCrashPoint`, `FollowCrashInjectedError`, `FollowIntended`, `FollowProgress`, `FollowResult`, `FollowOptions`, `StagedIncoming`, `LiveMetadata`, `BreadcrumbMismatch`, `CheckoutClassification`, `opStateRootOf`, `blockerForReason`, `progressWithBlocker`, `deferResult`, `boundedRefFailure`, `WorktreeOwnershipUnreadableError` (92–311) | 202 | 8.5 |
-| `follow-journal.ts` | `checkoutJournalBinding`, `recoverFollowJournal`, `recoverAndLandFollowJournal`, `quarantineUnboundFollowJournal`, `clearFollowJournal` (313–386) | 69 | 3.3 |
-| `follow-staging.ts` | `indexArtifact`, `normalizedIndexProjection`, `stageIncoming`, `candidateIndexCollision`, `deriveBaseIndexProjection`, `expectedHead` (224–240, 388–456, 1233–1256) | ~113 | ~5.2 |
-| `follow-live.ts` | `readLive` (458–491) | 34 | 1.8 |
-| `follow-classify.ts` | `firstReason`, `classifyCheckoutOwnership`, `classifyCheckout` (493–675) | 174 | 8.3 |
-| `follow-ref-witness.ts` | `ensureStashReflog`, `effectiveRefs`, `selectCheckoutSelfRootWitness`, `appliedTerminalOid` (677–743) | 63 | 2.8 |
-| **stays over the gate** | `publishRefPlane` (745–1231) | **480** | **24.7** |
-| **stays over the gate** | `followDivergedRepo` (1258–1865) | **598** | **32.0** |
+| `follow-types.ts` | `FollowCrashPoint`, `FollowCrashInjectedError`, `FollowIntended`, `FollowProgress`, `FollowResult`, `FollowOptions`, `StagedIncoming`, `StageIncomingOptions`, `LiveMetadata`, `BreadcrumbMismatch`, `CheckoutClassification`, `opStateRootOf`, `blockerForReason`, `progressWithBlocker`, `deferResult`, `boundedRefFailure`, `WorktreeOwnershipUnreadableError` (95–222, 242–311) | 208 | 8.4 |
+| `follow-journal.ts` | `checkoutJournalBinding`, `recoverFollowJournal`, `recoverAndLandFollowJournal`, `quarantineUnboundFollowJournal`, `clearFollowJournal` (313–386) | 80 | 4.1 |
+| `follow-staging.ts` | `receiverEquivalenceByWorkspace`, `candidateIndexCollision`, `indexArtifact`, `normalizedIndexProjection`, `stageIncoming`, `deriveBaseIndexProjection`, `expectedHead` (93, 224–240, 388–456, 1233–1256) | 133 | 6.0 |
+| `follow-live.ts` | `readLive` (458–491) | 43 | 2.4 |
+| `follow-classify.ts` | `firstReason`, `CheckoutOwnershipClassification`, `classifyCheckoutOwnership`, `classifyCheckout` (493–675) | 208 | 9.7 |
+| `follow-ref-witness.ts` | `ensureStashReflog`, `effectiveRefs`, `CheckoutSelfRootWitness`, `selectCheckoutSelfRootWitness`, `appliedTerminalOid` (677–743) | 72 | 3.4 |
+| `follow.ts` (facade) | `refEquivalenceWarnings`, `publishRefPlane` (745–1231), `followDivergedRepo` (1258–1865), re-exports | **1183** | **60.5** |
+
+The facade keeps its allowlist entry, with the reason rewritten to name the two
+residual functions rather than the retired 1800-line figure.
+
+Module-level state stayed module-level: `refEquivalenceWarnings` (facade) and
+`receiverEquivalenceByWorkspace` (`follow-staging.ts`) are each still a single
+ESM module singleton evaluated once per process, so no memo is re-created and no
+probe re-runs.
 
 `partitionOwnedByIncoming` (the #570 95s→1s macOS batching fix) is called from
 exactly two sites, both of which land in `follow-classify.ts`:
@@ -76,59 +85,93 @@ moves as one unit inside one module and no call site changes.
 | `plan-format.ts` | `formatGitPushLine`, `formatGitPlanStats`, `gitBaseAfterCommit`, `gitForceForMissingBlobs` (1437–end) | ~45 |
 | **stays over the gate** | `planGitSections` (154–1431) | **1245** |
 
-## Outcome if the pure-move map is applied as-is
+## Outcome
 
 | file | before | after | allowlist entry |
 |---|---:|---:|---|
-| `follow.ts` | 1800 nb | ~1078 nb (2 functions) | **stays** |
-| `apply.ts` | 1470 nb | ~1217 nb (1 function) | **stays** |
-| `plan.ts` | 1447 nb | ~1245 nb (1 function) | **stays** |
+| `follow.ts` | 1800 nb | **1183 nb** (2 functions + 6 modules) | **stays** — reason rewritten |
+| `apply.ts` | 1470 nb | untouched | stays |
+| `plan.ts` | 1447 nb | untouched | stays |
 
-Three of three entries survive. The gate's `no allowlist entry outlives the file
-it excuses` test still passes (each file is still over), so the PR would be
-green — but it delivers none of the stated merge gate, and it churns the most
-safety-critical file in the product for a 40% reduction on one file and ~15% on
-the other two.
+`apply.ts` and `plan.ts` were deliberately left alone: a pure move buys them
+~15% each (253 nb and 202 nb of extractable prelude) at the cost of churning two
+more safety-critical files, and it retires neither entry. They wait for the real
+refactor.
 
-## The two honest paths
+## The queued refactors — measurements so the next lane doesn't re-derive them
 
-**A. Accept the giants and stop.** Land only the `follow.ts` pure-move split
-(the only one with a worthwhile ratio: 1800 → 1078), keep all three allowlist
-entries, and write down that the four giant functions are the real debt. Zero
-behavior risk; provable by multiset diff and byte-identical bodies.
+These are design-doc + adversarial-review + rig-validation projects, queued
+behind U3. Do NOT attempt them as move-fidelity refactors, and do not attempt
+more than one per cycle.
 
-**B. Authorize a real refactor, one function at a time.** Splitting
-`applyGitSections` / `planGitSections` / `followDivergedRepo` / `publishRefPlane`
-means introducing per-function context objects, boxing the reassigned `let state`
-in `applyGitSections`, and threading ~50 accumulators through stage boundaries in
-`planGitSections`. That is a design-doc-and-adversarial-review cycle per
-function, validated on the rig, not a move-fidelity audit. It should not ride in
-a PR titled "pure moves behind facades", and it should not be attempted for all
-four at once.
+**1. `publishRefPlane` — start here.** 480 nb / 24.7 KiB, `follow.ts:745–1231`.
+The smallest and most self-contained: a top-level function taking
+`(opts: FollowOptions, live: LiveMetadata, roots, ownershipContext, classifyOnly)`
+and returning a value. It captures nothing mutable from an enclosing scope — its
+only module-level reference is the `refEquivalenceWarnings` warn-once set. Its
+natural seams are the deletion-witness block, the hold classifier, the
+recompute-until-stable no-drop loop, and the per-ref publication loop.
 
-Recommendation: **B, scoped to one function per cycle**, starting with
-`publishRefPlane` (480 nb, the smallest and the most self-contained — it takes
-`FollowOptions` + `LiveMetadata` + roots + ownership context and returns a
-value; it captures nothing mutable from an enclosing scope). `applyGitSections`
-and `planGitSections` are each a multi-cycle project.
+**2. `followDivergedRepo`.** 598 nb / 32.0 KiB, `follow.ts:1258–1865`. Harder
+than its size suggests: `boundaryFailure`, `checkoutBranchPlan`,
+`checkoutBranchLockedProof`, and `checkoutBranchReflogFingerprint` are `let`
+bindings written from inside the `secondProof` / `postHeadSecondProof` closures
+that `commitCheckout` invokes. Any split must keep those closures and their
+writes in one scope or box them explicitly.
 
-The concurrent `src/cli/daemon/daemon.ts` lane (3215 nb) will hit the same wall
-if that file is also one-function-dominated — worth checking before that lane
-spends the effort.
+**3. `applyGitSections`.** 1217 nb / 63.1 KiB, `apply.ts:278–1519`. Multi-cycle.
+- Inner `processRepo` closure: **897 nonblank lines**, `apply.ts:509–1424`.
+- Inner `runRepo` closure: 64 nb, `apply.ts:1437–1500`.
+- `processRepo` captures roughly **50 outer locals** — the accumulators
+  (`applied`, `removedMem`, `needsRes`, `pending`, `records`, `configLane`,
+  `deferrals`, `partial`, `attempt`, `idxProj`, `repoProofs`,
+  `branchBaseOrigins`, `publishedJournals`), the closures (`setDeferral`,
+  `clearDeferral`, `clearAttempt`, `currentDeferral`, `currentPartial`,
+  `checkoutOf`, `runMutation`, `configExecutorFor`, `installRecoveredRecord`,
+  `commonDirGroupFor`, `laneLedger`), and the arguments.
+- **`state` is reassigned inside `processRepo`** (`apply.ts:555` after journal
+  recovery, `apply.ts:1052` after standing-proof settlement). Any extraction
+  must box it; passing it by value silently strips both updates.
 
-## Bugs / smells spotted while reading (unfixed, per the zero-behavior-change rule)
+**4. `planGitSections`.** 1245 nb / 59.2 KiB, `plan.ts:154–1431`. Multi-cycle.
+A sequential accumulator pipeline (journal pre-loop → admission → capture pool →
+absence capture → resolution/supersession → hygiene → cache refresh) whose
+`plan()` closure at `plan.ts:312–396` reads nearly all ~50 accumulators to build
+the returned `GitPushPlan`. Stage boundaries are real, but every stage writes
+into the same accumulator set, so the split needs one explicit carrier object
+rather than per-stage parameter lists.
 
-- `follow.ts:1102` — `tipOwnedByIncoming(..., [newOid], ...)` is reached only
-  when `newOid` is truthy per the guard's short-circuit, but the array literal
-  is typed `(string | undefined)[]` at that position; the guard's correctness
-  rests on `!newOid ||` ordering rather than on the type. Same shape at
-  `follow.ts:1439`.
-- `follow.ts:928` — the content-equivalence cache is loaded inside
-  `publishRefPlane` on every call including the `classifyOnly = true` final
-  pass (`follow.ts:1825`), and `save()` is called on both. The classify-only
-  pass can therefore write cache state for a run that published nothing.
-- `apply.ts:1004` / `apply.ts:1121` — `clearAttempt(rel)` is called
-  unconditionally before `recordAttempt` can reinstall; if `recordAttempt`
-  never runs (early return on artifact/capability/boundary exit) the prior
-  attempt is lost rather than preserved. The comment at 1118–1120 says this is
+### daemon.ts, for the concurrent lane
+
+`src/cli/daemon/daemon.ts` (3215 nb) is **one 2827-nonblank class,
+`RboxDaemon`, at `daemon.ts:323`**; its largest top-level function is 41 nb.
+Same wall, different shape — a class splits into collaborators more naturally
+than a closure does, but it is still not a pure move.
+
+## Bugs spotted while reading — ALL PRE-EXISTING AND UNFIXED
+
+None of these were introduced by the split, and none were fixed by it (the split
+is a pure move; fixing anything would have broken the byte-identity audit). Line
+numbers are against the pre-split `follow.ts` / current `apply.ts`.
+
+**FOLLOW-UP ISSUE WORTH FILING — classify-only cache write.**
+`follow.ts:928` (now `follow.ts` facade, inside `publishRefPlane`): the
+content-equivalence cache is loaded on *every* call to `publishRefPlane`,
+including the `classifyOnly = true` final observation pass invoked at
+`follow.ts:1825`, and `contentEquivalenceCache?.save()` runs on both arms. A
+pass whose entire purpose is observation — it publishes nothing and its result
+only feeds `afterHeldClassification` — can therefore mutate durable cache state.
+This is the one that looks like a genuine defect rather than a smell.
+
+Lesser smells:
+
+- `follow.ts:1102`, `follow.ts:1439` — `tipOwnedByIncoming(..., [newOid], ...)`
+  is only reached when `newOid` is truthy because of the `!newOid ||`
+  short-circuit ordering, but the array literal is typed
+  `(string | undefined)[]` at that position. Correctness rests on statement
+  order, not on the type.
+- `apply.ts:1004` / `apply.ts:1121` — `clearAttempt(rel)` runs unconditionally
+  before `recordAttempt` can reinstall. If `recordAttempt` never runs (early
+  return on an artifact/capability/boundary exit) the prior held attempt is
+  lost rather than preserved. The comment at `apply.ts:1118–1120` says this is
   deliberate, but it means a boundary flake costs a full re-follow next cycle.
