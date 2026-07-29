@@ -33,7 +33,7 @@ const allZero = (counts: WsPurgeCounts): boolean => Object.values(counts).every(
 
 /** The five public per-table counts plus the internal alert-state count, and
  *  (optionally, in the SAME one-subrequest batch) the ORDER BY'd pair page. */
-async function readWorkspaceState(db: D1Database, workspaceId: string, withPairs: boolean): Promise<{ counts: WsPurgeCounts; alertCount: number; pairs: PairRow[] }> {
+async function readWorkspaceState(db: D1Database, workspaceId: string, withPairs: boolean): Promise<{ counts: WsPurgeCounts; alertCount: number; fairuseCount: number; pairs: PairRow[] }> {
   const statements = [
     db.prepare("SELECT COUNT(*) AS n FROM commits WHERE workspace_id = ?").bind(workspaceId),
     db.prepare("SELECT COUNT(*) AS n FROM manifests WHERE workspace_id = ?").bind(workspaceId),
@@ -41,6 +41,13 @@ async function readWorkspaceState(db: D1Database, workspaceId: string, withPairs
     db.prepare("SELECT COUNT(*) AS n FROM workspace_keys WHERE workspace_id = ?").bind(workspaceId),
     db.prepare("SELECT COUNT(*) AS n FROM workspaces WHERE workspace_id = ?").bind(workspaceId),
     db.prepare("SELECT COUNT(*) AS n FROM alert_state WHERE workspace_id = ?").bind(workspaceId),
+    // Design 225: the fair-use group aggregate is keyed by workspace_id, so it
+    // outlives a workspace purge unless it is dropped here — leaving a purged
+    // workspace's bytes attributable to a still-live account.
+    db.prepare(
+      `SELECT (SELECT COUNT(*) FROM fairuse_workspace_group_totals WHERE workspace_id = ?)
+            + (SELECT COUNT(*) FROM fairuse_group_progress WHERE workspace_id = ?) AS n`,
+    ).bind(workspaceId, workspaceId),
   ];
   if (withPairs) {
     statements.push(
@@ -60,7 +67,8 @@ async function readWorkspaceState(db: D1Database, workspaceId: string, withPairs
   return {
     counts: { commits: count(0), manifests: count(1), device_sync_state: count(2), workspace_keys: count(3), workspaces: count(4) },
     alertCount: count(5),
-    pairs: withPairs ? ((results[6]?.results ?? []) as PairRow[]) : [],
+    fairuseCount: count(6),
+    pairs: withPairs ? ((results[7]?.results ?? []) as PairRow[]) : [],
   };
 }
 
@@ -93,8 +101,8 @@ export async function adminPurgeWorkspace(env: Env, workspaceId: string, opts: W
     .bind(workspaceId)
     .first<OwnerRow>();
   const db = dbFor(env, owner?.account_id ?? "");
-  const { counts, alertCount, pairs: page } = await readWorkspaceState(db, workspaceId, !opts.dryRun);
-  if (allZero(counts) && alertCount === 0) return json({ error: "not_found" }, 404);
+  const { counts, alertCount, fairuseCount, pairs: page } = await readWorkspaceState(db, workspaceId, !opts.dryRun);
+  if (allZero(counts) && alertCount === 0 && fairuseCount === 0) return json({ error: "not_found" }, 404);
   if (opts.dryRun) return json({ ok: true, workspaceId, dryRun: true, counts, done: false });
 
   // Fan the (idempotent) DO purges out in parallel — they hit distinct DOs, so there is
@@ -134,6 +142,13 @@ export async function adminPurgeWorkspace(env: Env, workspaceId: string, opts: W
   }
   statements.push(db.prepare("DELETE FROM workspace_keys WHERE rowid IN (SELECT rowid FROM workspace_keys WHERE workspace_id = ? LIMIT ?)").bind(workspaceId, rowCap));
   kinds.push("workspace_keys");
+  // Keyed by workspace_id only (the KEK scope), so one unconditional delete per pass
+  // is complete — no pair chunking and no row cap.
+  statements.push(
+    db.prepare("DELETE FROM fairuse_workspace_group_totals WHERE workspace_id = ?").bind(workspaceId),
+    db.prepare("DELETE FROM fairuse_group_progress WHERE workspace_id = ?").bind(workspaceId),
+  );
+  kinds.push(null, null);
   for (const { projects, ph } of pairChunks) {
     statements.push(db.prepare(`DELETE FROM workspaces WHERE workspace_id = ? AND project_id IN (${ph})
       AND NOT EXISTS (SELECT 1 FROM commits c WHERE c.workspace_id = workspaces.workspace_id AND c.project_id = workspaces.project_id)
@@ -147,6 +162,9 @@ export async function adminPurgeWorkspace(env: Env, workspaceId: string, opts: W
     if (kind) deleted[kind] += deletedRows[i]?.meta.changes ?? 0;
   }
 
-  const { counts: remaining, alertCount: remainingAlerts } = await readWorkspaceState(db, workspaceId, false);
-  return json({ ok: true, workspaceId, dryRun: false, deleted, remaining, done: allZero(remaining) && remainingAlerts === 0 });
+  const { counts: remaining, alertCount: remainingAlerts, fairuseCount: remainingFairuse } = await readWorkspaceState(db, workspaceId, false);
+  return json({
+    ok: true, workspaceId, dryRun: false, deleted, remaining,
+    done: allZero(remaining) && remainingAlerts === 0 && remainingFairuse === 0,
+  });
 }
