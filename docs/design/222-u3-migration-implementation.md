@@ -214,6 +214,62 @@ export function readCanonicalControl(root: string): MigrationControl | undefined
 Owns revision **arithmetic and validation** (safe integers, exact spacing, the
 monotone `r → r+2` gap as the only permitted one). Paths live in `paths.ts`.
 
+##### What wave 1A pinned (record, so later waves do not re-decide it)
+
+- **`FIRST_CONTROL_REVISION = 1`.** Neither document named the first published
+  revision. With `expect.revision === "absent"` the publisher admits exactly
+  `1`; `0` reads as "no control" and is refused. 3C's ledger arithmetic is
+  relative to `b`, so this only fixes the M0 origin.
+- **`r → r+2` is gated on the promoted record's phase.** It is the direct-M7
+  success transition alone (163:2919). A halt promotion is `r → r+1` and
+  doctor's retry promotion is `r+1 → r+2`; both are ordinary steps. The gap is
+  admitted only when the prepared record's witness phase is `M7`.
+- **M-1 and M-2 are synchronous.** The signatures above carry no `Promise`
+  while every other module's do, and §1.3's `assertAuthorityWritable(root): void`
+  is synchronous and consumes `readCanonicalControl`. **Lane 1C's
+  `readGenesisIntent` must be synchronous for the same reason** — the same
+  fence calls it on the SQLite save boundary.
+- **Three duplicated members are not stored**, each being one value written
+  twice whose only reachable disagreement is corruption: the control's
+  top-level `phase` (the witness union is discriminated by phase), the halt
+  record's own `phase` (halts are phase-preserving), and M6's `qAuthorityId`
+  (the control already carries `authorityId`).
+- **One path policy: every artifact the record names stores its own path.**
+  163 prints paths inside the retirement vector, the M6 preparation ledger, and
+  the M7 terminal sibling, and the record is not a delete-authorizing input the
+  way the genesis intent is (§2.3.1) — cleanup identity-brackets before every
+  unlink. The M6 ledger therefore keeps `version`, both slots' `kind`, and both
+  slots' `path`; its outer discriminant is named `stage` so it does not collide
+  with the slots' own `kind`.
+- **M6's `cleanup.order` is named `items`**, so the M6 cleanup cursor and the
+  C1 retirement cursor are one `Cursor` type over one vector shape. They are
+  the same one-target machine (163:2761, :2899) over different vectors.
+- **The halt record's reason member is named `code`**, not 163:3339's `reason`.
+  A rename only, matching `MigrationHaltCode`; no halt record is durable yet,
+  so nothing on disk changes.
+- **A crash between rendering a revision sibling and renaming it is resumable
+  ONLY when the record recurs byte-for-byte — the non-deterministic case is an
+  open decision, not a solved one.** Every phase after M0 pins both the
+  migration id and the revision, so blanket-refusing the occupied path would
+  wedge the migration permanently. The publisher therefore adopts the sibling
+  when every byte is that exact record at that exact revision, re-fsyncs it and
+  its parent, and treats anything else as foreign.
+
+  That covers only records whose content is a pure function of the phase.
+  **It does not cover M2, M3, or any halt**, whose bytes carry freshly created
+  inodes, a wall-clock `completedAt`, or live failure detail — a crash in their
+  render→rename window strands a sibling whose bytes will never recur, and that
+  revision is then permanently unpublishable. The state is fail-closed and
+  data-safe (JSON stays authority, the halt stays in memory) and unreachable in
+  1A, where nothing is wired. Later waves must not "fix" this by letting the
+  publisher overwrite any unpublished temp in its own namespace: **the M6
+  runway legitimately owns prepared siblings at `b+5`/`b+6` while control sits
+  at `b+4`**, so a blanket replace would destroy a live ledger-owned artifact.
+  The intended remover is doctor's inert-temp quarantine (163's designated sole
+  remover), which is a later wave; **the wave that wires the first post-M0
+  publication owns closing this**, either by making those records deterministic
+  or by landing quarantine alongside.
+
 ---
 
 #### M-3 `classifier.ts`
@@ -734,7 +790,9 @@ export async function establish(
  * and `lineageId`; no caller-supplied lineage reaches this path. */
 async function resume(root: string, intent: GenesisIntent, locks: HeldStatePlaneLocks): Promise<GenesisOutcome>;
 
-/** Read-only; consumed by A-2's write fence. */
+/** Read-only; consumed by A-2's write fence. SYNCHRONOUS, like M-2's
+ * `readCanonicalControl`: §1.3's `assertAuthorityWritable(root): void` calls
+ * both on the SQLite save boundary and is itself synchronous. */
 export function readGenesisIntent(root: string): GenesisIntent | undefined;
 ```
 
@@ -1233,6 +1291,22 @@ use the same copy shape through the same renderer.
 | `reserved-path` | "rbox found an unexpected file where it keeps its state and won't touch it." | "Nothing was deleted. Your state is unaffected." | `rbox doctor` (names the path) | `state-migration/reserved-path` · error |
 | `durability-indeterminate` | "rbox can't confirm the last write reached the disk, so it has paused writing to this workspace." | "No data was lost; rbox is being cautious." | `rbox doctor --retry-state-migration` | `state-migration/durability-indeterminate` · error |
 | `cleanup-deferred` | "The conversion finished; tidying up one leftover file didn't." | "Your workspace is fully working on the new format and syncing normally." | `rbox doctor --retry-state-migration` | `state-migration/cleanup-deferred` · warn |
+
+**Interpolation, and what wave 1A deferred.** 163:3300 requires the refusals to
+print what was *measured*, not merely that a limit was hit. `MigrationHaltCopy`
+therefore carries an optional `measured(halt)` renderer alongside the three
+fixed strings, and `source-oversize`, `memory-admission`, `disk-preflight`, and
+`filesystem-full` use it for the `required`/`available` pair the durable halt
+record carries. The remaining facts are **deferred to wave 5B**, which owns the
+renderer and the `--json` twin: `verification`'s backup path and
+`reserved-path`'s occupant come from the control witness, not the halt, and
+`memory-admission`'s exact `RBOX_RESET_PARSE_BUDGET_BYTES` value comes from the
+environment. The copy map is the merge gate, so the shape is pinned now and
+only the data sources are outstanding.
+
+Both commands above land with §3.2 (`rbox migrate`) and §5B
+(`rbox doctor --retry-state-migration`). Until they do, no halt is reachable;
+5B is the gate for "every command is real and non-interactively twinned".
 
 ### 6.4 Not halts, never offered a retry
 

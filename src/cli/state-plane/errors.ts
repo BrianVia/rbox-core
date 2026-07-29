@@ -42,7 +42,10 @@ export type StateWriteRefusalReason =
   /** The lease was stolen or expired between acquisition and publication. */
   | "state-lock-lease-lost"
   /** Unlockable filesystem, and the target is not recognizable legacy JSON. */
-  | "state-unlocked-foreign-target";
+  | "state-unlocked-foreign-target"
+  /** A migration control blocks writes, or an unretired genesis intent survives:
+   * authority recovery has not finished. One policy, one reason (design 222 §1.3). */
+  | "authority-recovery-pending";
 
 /** A state publication was refused rather than attempted unlocked or blind.
  * Every reason is a fail-closed decision, not a transient the caller may retry
@@ -60,7 +63,50 @@ const REFUSAL_MESSAGES: Record<StateWriteRefusalReason, string> = {
   "state-lock-error": "this folder's sync-record lock could not be checked; refusing to save without it",
   "state-lock-lease-lost": "this folder's sync-record lock was lost mid-save; refusing to publish",
   "state-unlocked-foreign-target": "this folder's sync records are not in a format this rbox wrote; refusing to replace them",
+  "authority-recovery-pending": "this folder's sync records are mid-recovery onto the new format; refusing to write until it finishes",
 };
+
+/**
+ * `.rbox/state.json` says SQLite is authority, but the database that claim
+ * names is absent, incomplete, foreign, or carries a different authority id.
+ *
+ * Deliberately not a `MigrationHaltCode`: a halt is a suspended protocol that
+ * doctor may retry, and this is contradictory durable state that rbox will not
+ * repair automatically at all. Zero repair writes, never retryable; the remedy
+ * is re-adoption (design 163 M0 matrix, design 222 §6.4).
+ */
+export class StateAuthorityCorruptError extends Error {
+  readonly name = "StateAuthorityCorruptError";
+  constructor(readonly file: string, readonly detail: string) {
+    super(
+      `${file} says this workspace uses the new state format, but its state database is missing or does not match (${detail}). ` +
+      "rbox has changed nothing and will not try to repair this automatically.",
+    );
+  }
+}
+
+export type MigrationControlErrorReason =
+  /** Unknown, extra, missing, mistyped, or noncanonical member bytes. */
+  | "schema"
+  /** A control path holds something rbox did not write: a symlink, a directory,
+   * an unreadable or over-cap file, or a sibling that is not this exact record. */
+  | "foreign"
+  /** The canonical control was not the exact record the publisher expected. */
+  | "cas"
+  /** A prepared sibling is not the exact inode/length/hash/bytes it recorded. */
+  | "prepared-foreign"
+  /** The published record did not read back as the exact bytes just renamed. */
+  | "reread";
+
+/** The durable migration control could not be read, trusted, or replaced. Every
+ * reason is a zero-write refusal: the caller classifies it as corruption, never
+ * as something to repair forward. */
+export class MigrationControlError extends Error {
+  readonly name = "MigrationControlError";
+  constructor(readonly reason: MigrationControlErrorReason, detail: string) {
+    super(`migration control ${reason}: ${detail}`);
+  }
+}
 
 export type StateStoreOpenReason =
   | "not-a-database"
