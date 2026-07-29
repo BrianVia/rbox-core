@@ -218,13 +218,18 @@ const identicalSource = (recorded: SourceWitness, live: SourceWitness): boolean 
  * `StateAuthorityCorruptError`, zero repair writes, never retryable.
  *
  * Which predicate proves the database is ours turns on ONE question: could the
- * bytes have changed since `witness.active` was recorded? That witness is fixed
- * at M5 and never refreshed, so the answer is "no" only before the flip.
+ * bytes have changed since `witness.active` was recorded? That witness is fixed at
+ * M5 and never refreshed, so the answer is "no" for exactly as long as the write
+ * fence has been up — which is every phase below M6, on BOTH sides of the rename.
  *
- * - **pre-flip, `M5` alone** — the frozen window. Nothing may write the store, so
- *   the control's physical `{bytes, sha256}` is exact and is stronger than the
- *   database's self-description. A sidecar here is itself an anomaly, because a
- *   `-wal` beside a byte-identical main can carry a different `authority_id`.
+ * - **`M5`, which on this branch is always post-rename** — the frozen window. `Q`
+ *   is live, so the flip's rename has landed; but the phase is still M5, so
+ *   `blocksSqliteWrites` has been TRUE since before it and nothing may have
+ *   written the store. The control's physical `{bytes, sha256}` is therefore exact
+ *   and is stronger than the database's self-description. A sidecar here is itself
+ *   an anomaly, because a `-wal` beside a byte-identical main can carry a
+ *   different `authority_id`. (The pre-rename side of the same window is under
+ *   legacy JSON authority and is handled by `underJsonAuthority` above.)
  * - **`M6` and `M7`, unconditionally** — the live window. The store has been in
  *   ordinary use since the flip and its bytes change on every save, so identity
  *   comes from the durable rows (`active-store-proof.ts`).

@@ -59,6 +59,22 @@ const sameSource = (recorded: SourceWitness, file: string, observed: Regular): b
   && recorded.bytes === observed.bytes && recorded.mtimeNs === observed.mtimeNs
   && recorded.sha256 === observed.sha256;
 
+/**
+ * ONE LENGTH POLICY, stated once for this file and `finalize.ts`.
+ *
+ * Where a WHOLE-file digest is compared, the recorded length is not compared: a
+ * file cannot reproduce a SHA-256 at a different length, so the conjunct can only
+ * ever agree, and a mutation sweep reports dropping it as equivalent.
+ * `classifier.ts`'s `matchesProof` reached the same conclusion first and deleted
+ * it, so every reader of these witnesses now means the same thing by "is it ours".
+ *
+ * Lengths ARE compared in exactly two places, because there the digest does not
+ * cover the file: the Q sibling's 58 bytes (its digest covers a fixed-length
+ * marker, and a longer file with that prefix is a different file), and the
+ * reserve's 128 header bytes (a prefix digest, whose read count must be checked
+ * or a short file digests padding).
+ */
+
 /** Both preserved copies, at the paths their own recorded facts derive to. The
  * history entry is content-addressed by the source digest, so neither path is
  * believed from the record alone. */
@@ -73,34 +89,32 @@ function revalidateBackups(root: string, control: MigrationControl, witness: M5S
     }
     const observed = observePath(derived, true);
     if (observed.state !== "regular" || observed.dev !== recorded.dev || observed.ino !== recorded.ino
-      || observed.bytes !== recorded.bytes || observed.sha256 !== recorded.sha256) {
+      || observed.sha256 !== recorded.sha256) {
       halt("verification", false, `${derived} is not the backup this migration published`);
     }
   }
 }
 
 /** The frozen window: the control is pre-flip `M5`, so nothing has written the
- * store and its recorded physical `{bytes, sha256}` is exact. The ROW decides
- * this, never `blocksSqliteWrites` — that fence is also true after the flip,
- * where the M5 witness is stale and this comparison would manufacture a
- * corruption verdict out of an ordinary save (#589's row list is normative). */
+ * store and its recorded physical digest is exact. The ROW decides this, never
+ * `blocksSqliteWrites` — that fence is also true after the flip, where the M5
+ * witness is stale and this comparison would manufacture a corruption verdict out
+ * of an ordinary save (#589's row list is normative). */
 function revalidateActive(root: string, witness: M5State): void {
   const file = sqliteResetPaths.active(root);
   if (observeSidecars(file).length > 0) {
     halt("verification", false, `${file} carries sidecars while writes are still fenced`);
   }
   const observed = observePath(file, true);
-  if (observed.state !== "regular" || observed.bytes !== witness.active.bytes
-    || observed.sha256 !== witness.active.sha256) {
+  if (observed.state !== "regular" || observed.sha256 !== witness.active.sha256) {
     halt("verification", false, `${file} is not the database this migration published`);
   }
 }
 
 /**
  * The reserve and the emergency candidate, proven through ONE descriptor: the
- * recorded identity, the recorded length, the recorded whole-file digest, and —
- * for the reserve only — the digest of exactly its first
- * {@link RESERVE_HEADER_BYTES}.
+ * recorded identity, the recorded whole-file digest, and — for the reserve only —
+ * the digest of exactly its first {@link RESERVE_HEADER_BYTES}.
  *
  * That header digest is what `cleanup.ts` re-matches before unlinking role 7. It
  * is deliberately NOT `haltResources.reserve.sha256`, which is a whole-file
@@ -108,13 +122,31 @@ function revalidateActive(root: string, witness: M5State): void {
  * file and nothing cross-checks them, so the two are computed here in one place,
  * from one descriptor, and never assigned to each other (222 §M-8's two hazards
  * for this builder).
+ *
+ * ABSENCE IS A TYPED REFUSAL, not an exception and not a shorter vector. A record
+ * can genuinely say `available` about a file that is gone:
+ * `publishMigrationHalt` releases the reserve and then the emergency candidate as
+ * runway, and if every publication attempt still fails it returns
+ * `{durable: false}` — both unlinked while the canonical control still records
+ * both `available`. Reached from the post-rename resume branch, a bare `ENOENT`
+ * out of this function would escape as an untyped error from a row 163:2988
+ * requires to be a typed halt, with no code, no `wrote`, and no classifier row.
+ * Dropping the item instead would be worse: a damaged record could silently
+ * shorten its own cleanup vector.
  */
 function proveResource(file: string, recorded: Available, header: boolean): string | null {
-  const fd = fs.openSync(file, O.O_RDONLY | O.O_NOFOLLOW | O.O_NONBLOCK);
+  let fd: number;
+  try {
+    fd = fs.openSync(file, O.O_RDONLY | O.O_NOFOLLOW | O.O_NONBLOCK);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return halt("reserved-path", false, code === "ENOENT"
+      ? `${file} is recorded available but is not there`
+      : `${file} could not be opened as the recorded resource (${String(code)})`);
+  }
   try {
     const stat = fs.fstatSync(fd);
-    if (!stat.isFile() || Number(stat.dev) !== recorded.dev || Number(stat.ino) !== recorded.ino
-      || Number(stat.size) !== recorded.bytes) {
+    if (!stat.isFile() || Number(stat.dev) !== recorded.dev || Number(stat.ino) !== recorded.ino) {
       halt("reserved-path", false, `${file} is not the resource this migration recorded`);
     }
     const whole = crypto.createHash("sha256");
@@ -219,11 +251,23 @@ export async function flipAuthority(
   const marker = markerBytes(control);
   const sibling = requireSibling(root, control, witness.qSibling, marker);
   const live = statePath(root);
+
+  // BEFORE the live document is even looked at, and covering both branches below.
+  // Only an `exact` sibling can be renamed, and therefore only an `exact` sibling
+  // can already HAVE been renamed — so a control recording `absent` or `building`
+  // over a live marker is not a resume, it is a marker this migration never
+  // published. Checked here rather than inside the pre-flip path because the
+  // resume path publishes M6 and lifts the fence: reached with a `building`
+  // record it would ratify a flip no durable revision ever authorized. The
+  // classifier refuses to mint such a receipt, but that is its invariant, not
+  // this function's.
+  if (witness.qSibling.disposition.state !== "exact") {
+    return halt("reserved-path", false, "the authority flip requires an exact Q sibling");
+  }
   const observed = observePath(live, true);
 
   // The resume row: the rename landed and the parent fsync or M6's publication
-  // did not (163:3325). Legacy JSON is gone, so nothing about the source is
-  // revalidated here — there is nothing left to compare it against.
+  // did not (163:3325).
   if (observed.state === "regular" && observed.sha256 === witness.qSibling.sha256) {
     if (observePath(sibling).state !== "absent") {
       return halt("reserved-path", false, "the Q sibling survived the authority rename");
@@ -233,10 +277,17 @@ export async function flipAuthority(
     // classifier proves this too before it hands out the receipt; proving it here
     // as well keeps the flip's correctness local to the flip.
     revalidateActive(root, witness);
+    // NOT revalidated here, and the asymmetry is deliberate: the source (gone —
+    // `Q` is what stands at its path) and the two legacy-JSON backups. 163's
+    // `M5 + exact Q` row admits exactly one action, "complete/retry the `.rbox`
+    // fsync, publish M6", and lists no backup precondition — and refusing would
+    // wedge the workspace at a fenced M5 forever, because the document the
+    // backups copy no longer exists to re-derive them from. The cost is that a
+    // backup deleted inside the rename -> publish window is never noticed. It
+    // cannot be recorded either: the control schema is closed and strict, so a
+    // "backups unchecked" note needs a codec member this lane does not own. Open
+    // question for 163/1A, raised in the PR rather than papered over here.
     return { kind: "flipped", control: completeFlip(root, control, witness, cleanupCursor(root, control), locks) };
-  }
-  if (witness.qSibling.disposition.state !== "exact") {
-    return halt("reserved-path", false, "the authority flip requires an exact Q sibling");
   }
   const image = observeQSibling(witness.qSibling);
   if (isForeign(image) || image.state !== "exact") {
@@ -265,6 +316,38 @@ export async function flipAuthority(
       },
     };
   }
-  fs.renameSync(sibling, live);
+  // THE RENAME, and its own failure — which is typed, because 163:2988's rule is
+  // stated for the rename's *aftermath* and says nothing about the syscall itself.
+  //
+  // `rename(2)` is atomic, so a failure here left either the old durable pair
+  // `{L, exact sibling}` or the new pair `{Q, sibling absent}`. Both are admitted
+  // resume rows (163:3325) and this function's own resume branch converges from
+  // the second, so no on-disk state is lost either way. What the caller cannot
+  // know is WHICH — this is the one refusal in the lane where `wrote` is
+  // genuinely unknowable at the instant it is raised.
+  //
+  // Both halves are therefore reported conservatively, and deliberately:
+  //
+  //  - `wrote: true`, because `phase-io.ts` defines `wrote` as the one fact the
+  //    driver cannot recompute, and the zero-write rows are assertions. An
+  //    unknown must not be published as a promise that nothing moved.
+  //  - `durability-indeterminate`, because the durability of the flip is
+  //    literally indeterminate. This does NOT contradict `completeFlip`'s
+  //    refusal to mislabel a CAS error the same way: that fence would block a
+  //    workspace whose writes were otherwise free, whereas here
+  //    `blocksSqliteWrites` is already TRUE for every phase below M6 — the
+  //    workspace was fenced before this call and stays fenced under either
+  //    outcome, so the code costs nothing and describes the situation honestly.
+  //
+  // Leaving it bare was the gap: a driver author holding an `EIO` with no code
+  // and no `wrote` flag has to guess, and guessing "indeterminate" for a rename
+  // that never happened is the stale-witness misclassification this module's
+  // header exists to warn about.
+  try {
+    fs.renameSync(sibling, live);
+  } catch (error) {
+    return halt("durability-indeterminate", true,
+      `the authority rename did not complete (${String((error as NodeJS.ErrnoException).code ?? error)})`);
+  }
   return { kind: "flipped", control: completeFlip(root, control, witness, cleanup, locks) };
 }

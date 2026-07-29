@@ -71,6 +71,22 @@ afterEach(() => {
 
 const enospc = (): NodeJS.ErrnoException => Object.assign(new Error("no space"), { code: "ENOSPC" });
 
+/** Run `plant` in the instant before `claimSibling`'s exclusive create — the only
+ * instant that reaches the descriptor-side re-proof rather than the observation
+ * one layer above it. */
+function plantOnCreate(fx: Fixture, plant: () => void): void {
+  const realOpen = fs.openSync as unknown as (...a: unknown[]) => number;
+  let planted = false;
+  inject("openSync", ((file: unknown, flags: unknown, ...rest: unknown[]) => {
+    if (!planted && file === fx.sibling && typeof flags === "number"
+      && (flags & fs.constants.O_CREAT) !== 0) {
+      planted = true;
+      plant();
+    }
+    return realOpen(file, flags, ...rest);
+  }) as unknown as typeof fs.openSync);
+}
+
 /** Every path under `.rbox` with its size, inode, and mtime — so a file that
  * appeared and was removed, or a pure `utimes` bump, still fails the zero-write
  * assertion. */
@@ -83,9 +99,12 @@ function snapshot(root: string): Record<string, string> {
     // has no such field, so the earlier spelling compared the string "undefined"
     // on every row and asserted nothing about modification times.
     const stat = fs.lstatSync(file, { bigint: true });
+    // Directories carry their mtime too: a refusal that created a file and then
+    // unlinked it leaves no trace in the file rows, but it moved the parent's
+    // mtime. No path in this lane does that today, and this is what would say so.
     out[entry] = stat.isFile()
       ? `${stat.size}:${inodeOf(file)}:${stat.mtimeNs}`
-      : `dir:${stat.mode}`;
+      : `dir:${stat.mode}:${stat.mtimeNs}`;
   }
   return out;
 }
@@ -263,6 +282,73 @@ async function readyToFlip(options: Overrides = {}): Promise<{ fx: Fixture; cont
   return { fx, control: await ladderToReady(fx, m5) };
 }
 
+/**
+ * Drive the flip so the authority rename LANDS and M6's publication does not,
+ * leaving 163's sole M6-artifact-ahead image: `Q` live, control still M5, sibling
+ * absent. Returns the durable control as a restarted process would read it.
+ */
+async function killAfterTheRename(fx: Fixture, control: MigrationControl): Promise<MigrationControl> {
+  const realRename = fs.renameSync as unknown as (a: unknown, b: unknown) => void;
+  let renames = 0;
+  inject("renameSync", ((from: unknown, to: unknown) => {
+    renames += 1;
+    if (renames === 2) throw enospc();
+    return realRename(from, to);
+  }) as unknown as typeof fs.renameSync);
+  try {
+    await flipAuthority(fx.root, receipt(control), locks);
+    throw new Error("the publication was expected to fail");
+  } catch (error) {
+    if (!(error instanceof MigrationPhaseHaltError)) throw error;
+  } finally {
+    spies.pop()!.restore();
+  }
+  const durable = readCanonicalControl(fx.root)!;
+  if (durable.witness.phase !== "M5") throw new Error("the fixture did not strand the flip at M5");
+  return durable;
+}
+
+/** Re-publish the control with the source witness the live document now has, for
+ * fixtures that need the document to be something other than what `fixture()`
+ * wrote. */
+function republishSource(fx: Fixture, bytes: Buffer): MigrationControl {
+  const stat = fs.lstatSync(statePath(fx.root), { bigint: true });
+  const sha256 = digest(bytes);
+  // The history entry is content-addressed by the source digest, so a different
+  // source means a different derived path — the backups have to move with it or the
+  // derivation check refuses before the test reaches what it is about.
+  const backupBytes = Buffer.concat([Buffer.from(`RBOX-LEGACY-STATE-BACKUP-v1 ${sha256}\n`), bytes]);
+  const rewrite = (file: string) => {
+    fs.rmSync(migrationPaths.backupHistory(fx.root, digest(LEGACY)), { force: true });
+    fs.writeFileSync(file, backupBytes);
+    const found = fs.lstatSync(file);
+    return {
+      path: file, dev: Number(found.dev), ino: Number(found.ino),
+      bytes: backupBytes.byteLength, sha256: digest(backupBytes),
+    };
+  };
+  const next: MigrationControl = {
+    ...fx.control,
+    controlRevision: fx.control.controlRevision + 1,
+    source: {
+      path: statePath(fx.root), dev: Number(stat.dev), ino: Number(stat.ino),
+      bytes: bytes.byteLength, sha256, mtimeNs: stat.mtimeNs.toString(),
+    },
+    witness: {
+      ...(fx.control.witness as object),
+      history: rewrite(migrationPaths.backupHistory(fx.root, sha256)),
+      fixedBackup: rewrite(migrationPaths.fixedBackup(fx.root)),
+      completion: {
+        ...(fx.control.witness as { completion: object }).completion,
+        sourceJsonSha256: sha256,
+      },
+    } as MigrationWitness,
+  };
+  return publishMigrationControl(
+    fx.root, { migrationId: ID, revision: fx.control.controlRevision }, next, locks,
+  );
+}
+
 /** Run M5 and publish its witness the way M-9 will. */
 async function publishNextPhase(fx: Fixture): Promise<MigrationControl> {
   const witness = await publishPreparedDatabase(fx.root, receipt(fx.control), locks);
@@ -290,6 +376,11 @@ describe("M5 — the prepared database takes the active name", () => {
     expect(witness.qSibling).toEqual({
       path: fx.sibling, bytes: AUTHORITY_MARKER_BYTES, sha256: MARKER_SHA, disposition: { state: "absent" },
     });
+    // 163:2748: the M5 witness records the staging name absent, because M5 is what
+    // emptied it. Keeping M3's `present` would not merely be stale — it makes C1
+    // retirement from M5 impossible, since `retirement.ts` reads this member,
+    // finds the staging name empty at a phase that is not M4, and refuses.
+    expect(witness.stagingMain).toEqual({ state: "absent" });
     // Deterministic: the witness is a pure function of the M4 proof and the
     // authority id, so a crash in the publisher's render -> rename window strands
     // exactly the record the next attempt renders.
@@ -545,28 +636,52 @@ describe("the Q ladder", () => {
     expect(openedForWriting, "a finish-ahead sibling is republished, not rewritten").toBe(false);
   });
 
-  test("re-proves the create-ahead shape on its own descriptor", async () => {
-    // The TOCTOU `claimSibling`'s second check closes: the path passes the
-    // observation and is replaced before the exclusive create runs. Without the
-    // descriptor-side check a foreign occupant is adopted and then written into.
+  /**
+   * `claimSibling`'s descriptor-side re-proof, one conjunct at a time.
+   *
+   * The occupant is planted ON THE EXCLUSIVE CREATE, because that is the only
+   * instant that reaches this code: `observeQSibling` refuses the same three
+   * shapes one layer earlier from the pathname, so a fixture that plants before
+   * the ladder starts asserts on that layer instead and proves nothing here. The
+   * two layers deliberately no longer share a message.
+   *
+   * Each fixture trips exactly ONE conjunct — an occupant that is both nonzero and
+   * world-readable would pass whichever check survived a mutation.
+   */
+  test.each([
+    ["a zero-byte occupant with the wrong mode", () => Buffer.alloc(0), 0o644, /its mode is 644/],
+    ["a 0600 occupant with the wrong length", () => Buffer.from("x"), 0o600, /it holds 1 bytes/],
+  ])("refuses %s planted on the exclusive create", async (_label, bytes, mode, match) => {
     const fx = fixture();
     const m5 = await publishNextPhase(fx);
-    const realOpen = fs.openSync as unknown as (...a: unknown[]) => number;
-    let planted = false;
-    inject("openSync", ((file: unknown, flags: unknown, ...rest: unknown[]) => {
-      // Only on the EXCLUSIVE CREATE, which is `claimSibling`'s own open. Planting
-      // on the ladder's earlier observation would be caught by `observeQSibling`
-      // instead, and would prove nothing about the descriptor-side check.
-      if (!planted && file === fx.sibling && typeof flags === "number"
-        && (flags & fs.constants.O_CREAT) !== 0) {
-        planted = true;
-        fs.writeFileSync(fx.sibling, Buffer.from("x"), { mode: 0o644 });
-      }
-      return realOpen(file, flags, ...rest);
-    }) as unknown as typeof fs.openSync);
+    plantOnCreate(fx, () => fs.writeFileSync(fx.sibling, bytes(), { mode }));
+    await expect(stepQSibling(fx.root, receipt(m5), locks)).rejects.toThrow(match);
+    expect(fs.lstatSync(fx.sibling).isFile(), "the occupant is left exactly as it was").toBe(true);
+    expect(fs.readFileSync(fx.sibling)).toEqual(bytes());
+  });
+
+  test("refuses a directory planted on the exclusive create", async () => {
+    const fx = fixture();
+    const m5 = await publishNextPhase(fx);
+    plantOnCreate(fx, () => fs.mkdirSync(fx.sibling));
     await expect(stepQSibling(fx.root, receipt(m5), locks))
-      .rejects.toThrow(/neither absent nor the sole zero-byte create-ahead/);
-    expect(fs.readFileSync(fx.sibling), "the occupant is not overwritten").toEqual(Buffer.from("x"));
+      .rejects.toThrow(/it is not a regular file/);
+    expect(fs.lstatSync(fx.sibling).isDirectory(), "and it is still a directory").toBe(true);
+  });
+
+  test("refuses a symlink planted on the exclusive create", async () => {
+    // O_NOFOLLOW's own test. The decoy is a legal create-ahead shape, so without
+    // `O_NOFOLLOW` the reopen would stat the TARGET, adopt its inode, and write the
+    // authority marker into a file this migration never claimed.
+    const fx = fixture();
+    const m5 = await publishNextPhase(fx);
+    const decoy = path.join(fx.stateDir, "sibling-decoy");
+    fs.writeFileSync(decoy, Buffer.alloc(0), { mode: 0o600 });
+    plantOnCreate(fx, () => fs.symlinkSync(decoy, fx.sibling));
+    await expect(stepQSibling(fx.root, receipt(m5), locks))
+      .rejects.toThrow(/is occupied by something this migration cannot claim \(ELOOP\)/);
+    expect(fs.lstatSync(fx.sibling).isSymbolicLink()).toBe(true);
+    expect(fs.lstatSync(decoy).size, "the decoy is never written").toBe(0);
   });
 
   test("re-proves the sibling's identity on the write descriptor itself", async () => {
@@ -654,6 +769,23 @@ describe("the Q ladder", () => {
     }) as unknown as typeof fs.writeSync);
     await expect(stepQSibling(fx.root, receipt(claimed.control), locks))
       .rejects.toThrow(/is not the marker just written/);
+  });
+
+  test.each([
+    ["claimed", 0],
+    ["written", 1],
+  ])("brackets the source on the %s rung, not just at M5", async (_label, rungs) => {
+    // M5's own `bracketSource` had a test; the ladder's did not. A rung that ran
+    // on a changed document would build the marker for a migration whose source
+    // has already moved on, which is C1's business and not the ladder's.
+    const fx = fixture();
+    let current = await publishNextPhase(fx);
+    for (let i = 0; i < rungs; i++) {
+      current = (await stepQSibling(fx.root, receipt(current), locks)).control;
+    }
+    replaceUnderNewInode(statePath(fx.root), LEGACY);
+    await expect(stepQSibling(fx.root, receipt(current), locks))
+      .rejects.toThrow(/the legacy document is no longer the one this migration recorded/);
   });
 
   test("refuses a building sibling that is no longer the recorded inode", async () => {
@@ -930,6 +1062,67 @@ describe("the authority flip", () => {
     expect(fs.existsSync(decoy), "and the named file is untouched").toBe(true);
   });
 
+  test("revalidates the active database on the resume path too", async () => {
+    // The guard was there; nothing reached it. `Q` is live and the phase is still
+    // M5, so the fence has been up since before the rename and the recorded digest
+    // is still exact — which is precisely why the comparison is legitimate here
+    // and why skipping it would ratify a swapped database as authority.
+    const { fx, control } = await readyToFlip();
+    const stranded = await killAfterTheRename(fx, control);
+    fs.writeFileSync(fx.active, "a different database entirely");
+    let caught: unknown;
+    try {
+      await flipAuthority(fx.root, receipt(stranded), locks);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(MigrationPhaseHaltError);
+    expect((caught as MigrationPhaseHaltError).message)
+      .toMatch(/is not the database this migration published/);
+    expect(readCanonicalControl(fx.root)!.witness.phase, "M6 is not published").toBe("M5");
+  });
+
+  test("refuses a backup whose inode moved even though its bytes did not", async () => {
+    // The reserve had this row; the backups did not, so their `dev`/`ino` conjunct
+    // was carried only by the digest.
+    const { fx, control } = await readyToFlip();
+    const backup = migrationPaths.fixedBackup(fx.root);
+    const bytes = fs.readFileSync(backup);
+    const recorded = inodeOf(backup);
+    expect(replaceUnderNewInode(backup, bytes)).not.toBe(recorded);
+    await refusesWithoutWriting(
+      fx, () => flipAuthority(fx.root, receipt(control), locks),
+      /is not the backup this migration published/,
+    );
+  });
+
+  test("detects the resume by the marker's digest, not by its length", async () => {
+    // A legacy document that is exactly 58 bytes is not `Q`. Read by length alone
+    // the flip would take the resume branch, skip every pre-rename check, and
+    // publish M6 over a live JSON document.
+    const fifty8 = Buffer.alloc(AUTHORITY_MARKER_BYTES, 0x7b);
+    const fx = fixture();
+    fs.writeFileSync(statePath(fx.root), fifty8);
+    const republished = republishSource(fx, fifty8);
+    const ready = await ladderToReady(fx, await publishNextPhase({ ...fx, control: republished }));
+    expect(fs.lstatSync(statePath(fx.root)).size).toBe(AUTHORITY_MARKER_BYTES);
+
+    const outcome = await flipAuthority(fx.root, receipt(ready), locks);
+    expect(outcome.kind, "the flip happens for real; it is not mistaken for a resume").toBe("flipped");
+    expect(fs.readFileSync(statePath(fx.root)), "and `Q` is the marker, not the decoy").toEqual(MARKER);
+  });
+
+  test.each([
+    ["the live document", (fx: Fixture) => statePath(fx.root), /is neither legacy sync records nor this authority's marker/],
+    ["the fixed backup", (fx: Fixture) => migrationPaths.fixedBackup(fx.root), /is not the backup this migration published/],
+  ])("refuses a non-regular occupant at %s", async (_label, at, match) => {
+    const { fx, control } = await readyToFlip();
+    const file = at(fx);
+    fs.unlinkSync(file);
+    fs.mkdirSync(file);
+    await refusesWithoutWriting(fx, () => flipAuthority(fx.root, receipt(control), locks), match);
+  });
+
   test("refuses a reserve whose inode moved even though its bytes did not", async () => {
     const { fx, control } = await readyToFlip();
     const bytes = fs.readFileSync(fx.reserve);
@@ -1032,32 +1225,83 @@ describe("the authority flip", () => {
     expect(synced, "the state document's own directory").toContain(path.join(fx.root, ".rbox"));
   });
 
-  test("nothing sits between the body re-read and the rename", async () => {
-    // The property 163:3311 states, asserted on the source rather than inferred:
-    // any statement inserted into that gap widens the lost-write window, and the
-    // gap is small enough to check exactly.
-    const source = fs.readFileSync(
-      path.join(import.meta.dir, "authority-flip.ts"), "utf8",
-    );
-    const guard = source.lastIndexOf("observedBodySha256: final.sha256,");
+  /**
+   * 163:3311's window, asserted by saying what IS in it.
+   *
+   * The first version of this test blacklisted callee names and guarded only the
+   * gap between the arm-C1 block and the rename. Both halves were wrong: an
+   * enumeration of forbidden names has holes (a `readFileSync`, a digest of
+   * another file, a second `stat`, and — worst — a bare `await`, which genuinely
+   * widens the exposure in an `async` function, all passed it), and the window has
+   * two sides, since a statement between the re-read and the comparison is in the
+   * same two instants as one between the comparison and the rename.
+   *
+   * So the whole window is normalized and matched against a golden. Any edit
+   * inside it fails here and has to be deliberate; nothing has to be predicted.
+   */
+  test("the window between the body re-read and the rename holds exactly two guards", () => {
+    const source = fs.readFileSync(path.join(import.meta.dir, "authority-flip.ts"), "utf8");
+    const start = source.lastIndexOf("const final = observePath(live, true);");
     const rename = source.indexOf("fs.renameSync(sibling, live);");
-    expect(guard, "the body-digest guard moved").toBeGreaterThan(0);
-    expect(rename, "the rename moved").toBeGreaterThan(guard);
-    const close = source.indexOf("\n  }\n", guard);
-    expect(close, "the guard's closing brace moved").toBeGreaterThan(0);
-    expect(
-      source.slice(close + "\n  }\n".length, rename).trim(),
-      "a statement was inserted between the body re-read and the rename",
-    ).toBe("");
-    // And the re-read is the LAST observation before it: everything the flip has
-    // to read — including the reserve the cleanup vector brackets — happens
-    // BEFORE it, or the window the ordering exists to shrink grows again.
-    const finalRead = source.lastIndexOf("const final = observePath(live, true);");
+    expect(start, "the body re-read moved").toBeGreaterThan(0);
+    expect(rename, "the rename moved").toBeGreaterThan(start);
+
+    // Comments are the one thing the window may carry freely: they compile to
+    // nothing. Everything else is code, and code in this window is the defect.
+    const window = source.slice(start, rename)
+      .replace(/\/\*[\s\S]*?\*\//g, " ")
+      .replace(/\/\/[^\n]*/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    expect(window, "a statement was added, removed, or reordered inside 163:3311's window").toBe(
+      'const final = observePath(live, true); '
+      + 'if (final.state !== "regular" || final.sha256 === null) { '
+      + 'return halt("reserved-path", false, `${live} stopped being a regular file`); } '
+      + 'if (final.sha256 !== witness.completion.sourceJsonSha256) { '
+      + 'return { kind: "arm-retirement", trigger: { disposition: "legacy-write-detected", '
+      + 'replacement: sourceOf(live, final), observedBodySha256: final.sha256, }, }; } try {',
+    );
+    // Named separately because it is the mutant that reads as harmless: the
+    // function is `async`, so one `await` in here suspends between the check and
+    // the rename and the golden above is the only thing that says so.
+    expect(window, "an await in this window widens the lost-write exposure").not.toContain("await");
+
+    // Everything the flip must read happens BEFORE the window — including the
+    // reserve that the cleanup vector identity-brackets.
     expect(source.indexOf("const cleanup = cleanupCursor(root, control);"),
-      "the cleanup vector must be built before the final read, not after")
-      .toBeLessThan(finalRead);
-    expect(source.slice(finalRead, rename))
-      .not.toMatch(/fsync|openSync|writeSync|publishMigrationControl|revalidate/);
+      "the cleanup vector must be built before the final read, not inside the window")
+      .toBeLessThan(start);
+  });
+
+  test("compares the LAST read of the live document, not the first", async () => {
+    // The single most load-bearing guard in the lane, and the only one the source
+    // assertion above was covering on its own: substituting the earlier `observed`
+    // for `final` reduces the flip to v8's ordering, where the body was hashed at
+    // the START of the step. Injected here for real — the document is rewritten in
+    // place, same inode and same length, between the two observations, so only the
+    // second read can see it.
+    const { fx, control } = await readyToFlip();
+    const live = statePath(fx.root);
+    const realOpen = fs.openSync as unknown as (...a: unknown[]) => number;
+    let reads = 0;
+    inject("openSync", ((file: unknown, ...rest: unknown[]) => {
+      if (file === live) {
+        reads += 1;
+        if (reads === 2) {
+          const fd = realOpen(live, "r+");
+          fs.writeSync(fd, Buffer.alloc(LEGACY.byteLength, 0x7b), 0, LEGACY.byteLength, 0);
+          fs.closeSync(fd);
+        }
+      }
+      return realOpen(file, ...rest);
+    }) as unknown as typeof fs.openSync);
+
+    const outcome = await flipAuthority(fx.root, receipt(control), locks);
+    expect(reads, "the flip must read the live document twice").toBeGreaterThanOrEqual(2);
+    expect(outcome.kind, "the write inside the window must arm C1, not rename").toBe("arm-retirement");
+    if (outcome.kind !== "arm-retirement") throw new Error("unreachable");
+    expect(outcome.trigger.disposition).toBe("legacy-write-detected");
+    expect(fs.existsSync(fx.sibling), "and the sibling is still the sibling").toBe(true);
   });
 
   test.each([
@@ -1199,6 +1443,77 @@ describe("the kill matrix", () => {
     if (resumed.kind !== "flipped") throw new Error("unreachable");
     expect(resumed.control.witness.phase).toBe("M6");
     expect(blocksSqliteWrites(resumed.control)).toBe(false);
+  });
+
+  test("the authority rename's own failure is a typed durability halt", async () => {
+    // BLOCKER FROM REVIEW ROUND 1. The rename that elects SQLite is the one
+    // operation whose failure 163:2988 does not cover by name — its rule is about
+    // the aftermath — and a bare `EIO` here would leave the driver to guess a halt
+    // code and a `wrote` flag for the most dangerous instant in the protocol.
+    const { fx, control } = await readyToFlip();
+    const realRename = fs.renameSync as unknown as (a: unknown, b: unknown) => void;
+    inject("renameSync", ((from: unknown, to: unknown) => {
+      if (from === fx.sibling) throw Object.assign(new Error("io error"), { code: "EIO" });
+      return realRename(from, to);
+    }) as unknown as typeof fs.renameSync);
+
+    let caught: unknown;
+    try {
+      await flipAuthority(fx.root, receipt(control), locks);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught, "not a bare ErrnoException").toBeInstanceOf(MigrationPhaseHaltError);
+    const halt = caught as MigrationPhaseHaltError;
+    expect(halt.halt.code).toBe("durability-indeterminate");
+    expect(halt.halt.underlyingCode ?? halt.message).toMatch(/EIO/);
+    // `wrote: true` because the caller cannot know which side of an atomic rename
+    // it is on, and a zero-write row is an assertion that must not be guessed.
+    expect(halt.wrote).toBe(true);
+    // The durable state is one of the two admitted images, and here it is the old
+    // one — so the fence that was already up is all that is needed.
+    expect(fs.readFileSync(statePath(fx.root))).toEqual(LEGACY);
+    expect(readCanonicalControl(fx.root)!.witness.phase).toBe("M5");
+    expect(blocksSqliteWrites(readCanonicalControl(fx.root)!)).toBe(true);
+    const observation = await classifyMigrationState(fx.root, locks);
+    expect(observation.row, "and the classifier still has a row for it").toBe("m5-resume");
+  });
+
+  test("a halt resource recorded available but absent is a typed refusal, on both paths", async () => {
+    // BLOCKER FROM REVIEW ROUND 2. `publishMigrationHalt` unlinks the reserve and
+    // then the emergency candidate as publication runway and, if every attempt
+    // still fails, returns `{durable: false}` — leaving both files gone while the
+    // canonical control still records both `available`. The vector builder must
+    // refuse that, typed, rather than throwing `ENOENT`; and it must NOT quietly
+    // shorten the vector, or a damaged record could drop one of its own items.
+    const { fx, control } = await readyToFlip();
+    fs.unlinkSync(fx.reserve);
+    await refusesWithoutWriting(
+      fx, () => flipAuthority(fx.root, receipt(control), locks),
+      /is recorded available but is not there/,
+    );
+  });
+
+  test("the same refusal on the post-rename resume path, where it would wedge", async () => {
+    // `Q` already elects SQLite here, so an untyped error out of the resume branch
+    // is unreachable by any doctor row and the workspace never leaves M5.
+    const { fx, control } = await readyToFlip();
+    const stranded = await killAfterTheRename(fx, control);
+    fs.unlinkSync(fx.emergency);
+
+    let caught: unknown;
+    try {
+      await flipAuthority(fx.root, receipt(stranded), locks);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught, "not a bare ENOENT").toBeInstanceOf(MigrationPhaseHaltError);
+    const halt = caught as MigrationPhaseHaltError;
+    expect(halt.halt.code).toBe("reserved-path");
+    expect(halt.message).toMatch(/is recorded available but is not there/);
+    // The vector is refused whole, never silently shortened to the one item that
+    // is still there.
+    expect(readCanonicalControl(fx.root)!.witness.phase).toBe("M5");
   });
 
   test("a Q sibling that survived the rename refuses the resume", async () => {

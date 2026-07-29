@@ -4,7 +4,9 @@
  * design 163 phases M5 and M6, :3289).
  *
  * M-6 ships as two files for the same reason M-8 did: 163:3994's ceiling is not
- * negotiable and the honest implementation is 475 lines. The seam is the flip
+ * negotiable and the honest single-file implementation measured 475 nonblank
+ * lines against a hard 400. §M-6's budget was 280; the two halves are recorded in
+ * 222 at their shipped sizes, as M-8's were. The seam is the flip
  * itself. Here, legacy JSON is authority from the first line to the last: M5
  * moves the proven database onto `state.db`, and the Q ladder walks the sibling
  * through `absent -> building -> exact`. `authority-flip.ts` owns the single
@@ -196,6 +198,14 @@ export async function publishPreparedDatabase(
   }
   await fsyncDbAndParent(active);
   return {
+    // 163:2748 lists `stagingMain:"absent"` as part of the M5 witness, and M5 is
+    // the phase that makes it absent, so M5 is what publishes the change — the
+    // codec's layered witness lets this phase's layer override M2's. Without it
+    // an M5 control keeps M3's `{state:"present"}` naming an inode that now lives
+    // at the active path, which is not merely stale: `retirement.ts`'s vector
+    // builder reads it, finds the staging name empty at a phase that is not M4,
+    // and refuses — making C1 retirement from M5 impossible.
+    stagingMain: { state: "absent" },
     active: proof,
     qSibling: {
       path: migrationPaths.qSibling(root, control.migrationId),
@@ -218,14 +228,43 @@ function claimSibling(file: string): Inode {
   try {
     fd = fs.openSync(file, O.O_CREAT | O.O_EXCL | O.O_WRONLY | O.O_NOFOLLOW, 0o600);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    fd = fs.openSync(file, O.O_RDONLY | O.O_NOFOLLOW | O.O_NONBLOCK);
+    const code = (error as NodeJS.ErrnoException).code;
+    // Only EEXIST is the adopt path. `ELOOP` (O_NOFOLLOW refusing a symlink),
+    // `EACCES`, `ENOTDIR` and the rest are occupants this cannot classify, and
+    // letting them escape untyped would hand the driver an error with no halt
+    // code from a phase whose every refusal is supposed to carry one.
+    if (code !== "EEXIST") {
+      return halt("reserved-path", false, `${file} could not be created exclusively (${String(code)})`);
+    }
+    try {
+      fd = fs.openSync(file, O.O_RDONLY | O.O_NOFOLLOW | O.O_NONBLOCK);
+    } catch (reopen) {
+      // The occupant exists but cannot be inspected under this descriptor's terms.
+      // A symlink is the case that matters: `O_NOFOLLOW` turns it into `ELOOP`
+      // here, and without the refusal it would escape untyped — while without
+      // `O_NOFOLLOW` the stat below would describe the TARGET, and a target that
+      // happens to be a legal create-ahead would be adopted and written into.
+      return halt("reserved-path", false,
+        `${file} is occupied by something this migration cannot claim (${String((reopen as NodeJS.ErrnoException).code)})`);
+    }
     created = false;
   }
   try {
     const found = fs.fstatSync(fd);
-    if (!created && (!found.isFile() || Number(found.size) !== 0 || (Number(found.mode) & 0o7777) !== 0o600)) {
-      halt("reserved-path", false, `${file} is neither absent nor the sole zero-byte create-ahead`);
+    if (!created) {
+      // Each conjunct names itself. The observation one layer up
+      // (`observeQSibling`) refuses the same three shapes with one message, so an
+      // identical message here would let a test assert on that layer and never
+      // reach this one — this is the descriptor-side re-proof, and it has to be
+      // distinguishable from the pathname-side one to be testable at all.
+      const mode = Number(found.mode) & 0o7777;
+      const why = !found.isFile() ? "it is not a regular file"
+        : Number(found.size) !== 0 ? `it holds ${Number(found.size)} bytes`
+          : mode !== 0o600 ? `its mode is ${mode.toString(8)}`
+            : undefined;
+      if (why !== undefined) {
+        halt("reserved-path", false, `${file} was occupied before this migration could claim it: ${why}`);
+      }
     }
     fs.fsyncSync(fd);
     fsyncDirectory(path.dirname(file));
