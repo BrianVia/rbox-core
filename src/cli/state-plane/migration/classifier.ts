@@ -269,10 +269,18 @@ function underAuthorityMarker(
   const receipt = receiptFor(control);
   if (control.halt) return { row: "halted", receipt, halt: control.halt };
   if (witness.phase === "M5") {
-    const sibling = observeQSibling(witness.qSibling);
-    return isForeign(sibling) || sibling.state !== "absent"
-      ? corruption("the Q sibling survived the authority rename")
-      : { row: "m5-artifact-ahead-q", receipt };
+    // The sibling BECAME `Q`: the flip renames it over `.rbox/state.json`, so the
+    // durable M5 witness still records it `exact` while the path is empty. This
+    // is a plain absence test, NOT `observeQSibling` — that reads the recorded
+    // `exact` inode against an absent path and calls the only crash image the
+    // flip can leave foreign, turning the whole `M5 + Q` row into corruption.
+    if (witness.qSibling.disposition.state !== "exact") {
+      return corruption(`the authority marker is published from a Q sibling recorded ${witness.qSibling.disposition.state}`);
+    }
+    if (observePath(witness.qSibling.path).state !== "absent") {
+      return corruption("the Q sibling survived the authority rename");
+    }
+    return { row: "m5-artifact-ahead-q", receipt };
   }
   return witness.phase === "M6"
     ? { row: "m6-cleanup", receipt, cursor: witness.cleanup }

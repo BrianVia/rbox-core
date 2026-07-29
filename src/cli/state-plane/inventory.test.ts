@@ -20,8 +20,12 @@ import { runAstSweep } from "../sync-git/ast-sweep-runner.js";
 
 const REPO = path.resolve(import.meta.dir, "../../..");
 const SWEEP = path.join(import.meta.dir, "..", "sync-git", "base-composer-ast-sweep.mjs");
-// 16,683 bytes when introduced; leave room for new guarded entry points.
-const AST_SWEEP_MAX_BYTES = 24 * 1024;
+// 16,683 bytes when introduced; leave room for new guarded entry points. Raised
+// to 28 KiB by U3 wave 4A, which enrolled `flipAuthority` — the one rename that
+// elects SQLite — as an order-tracked owner, adding roughly 1 KiB of records.
+// This is a transport bound on the sweep's stdout, not a policy on how many
+// entry points may exist.
+const AST_SWEEP_MAX_BYTES = 28 * 1024;
 
 /** Text that constructs or names `.rbox/state.json`. */
 const STATE_PATH_ARGUMENT = /\bstatePath\(|\bactiveStatePath\(|["']state\.json["']/;
@@ -98,6 +102,14 @@ const ENTRY_POINTS: readonly EntryPoint[] = [
   { file: "src/cli/state-plane/genesis.ts", symbol: "eligibility", kind: "read", sites: 1, guards: ["classifyStateFormat"] },
   { file: "src/cli/state-plane/genesis.ts", symbol: "resume", kind: "read", sites: 2, guards: ["classifyStateFormat", "holdsMarkerFor"] },
   { file: "src/cli/state-plane/genesis.ts", symbol: "finishWithQ", kind: "write", sites: 2, guards: ["classifyStateFormat", "fsp.rename"] },
+
+  // Design 163's authority flip (M-6): the one rename in the product that
+  // replaces a live legacy document with `Q`. Its barrier is deliberately not
+  // `assertStatePublishable` — that guards a binary about to write legacy JSON,
+  // and this is the writer publishing the marker that barrier exists to protect.
+  // Its obligations instead are the sibling fence, the exact-sibling image, and
+  // the re-read of the live body digest as the LAST thing before the rename.
+  { file: "src/cli/state-plane/migration/authority-flip.ts", symbol: "flipAuthority", kind: "write", sites: 0, guards: ["requireSibling", "observeQSibling", "revalidateBackups", "revalidateActive", "cleanupCursor", "renameSync"] },
 ];
 
 /** Access sites that neither read nor replace the document's contents. Each
@@ -109,6 +121,7 @@ const EXEMPT: ReadonlyMap<string, { sites: number; reason: string }> = new Map([
   ["src/cli/reset-journal.ts::beginResetJournal", { sites: 2, reason: "hashes the caller-supplied prepared bytes and names the candidate path; the live document is read by its guarded caller under the same lock" }],
   ["src/cli/sync-git/p-settlement.ts::settleExactPresentArtifact", { sites: 4, reason: "uses statePath only to name the protocol lock class; the save itself is applyStateSavePacket" }],
   ["src/cli/state-plane/locks.ts::withStatePlaneLocks", { sites: 2, reason: "uses statePath only as the repository fence's state identity; the document is read by the guarded inspectInventory" }],
+  ["src/cli/state-plane/migration/authority-flip.ts::completeFlip", { sites: 2, reason: "names `.rbox` only as the parent to fsync after the flip's rename; the document itself is replaced by flipAuthority, which is inventoried above" }],
   ["src/cli/scan-probe.ts::loadScanProbe", { sites: 2, reason: "a local statePath naming .rbox/state/scan-probe.json, not the state plane" }],
   ["src/cli/scan-probe.ts::saveScanProbe", { sites: 3, reason: "a local statePath naming .rbox/state/scan-probe.json, not the state plane" }],
 ]);

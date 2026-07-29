@@ -65,6 +65,11 @@ const STATE_ORDER_OWNERS = new Map([
     "saveThroughStore",
     "selectSqliteAuthority",
   ])],
+  // Design 163's authority flip. It reaches `.rbox/state.json` through a local
+  // binding rather than a `statePath(...)` argument, so without this entry its
+  // ordering — the sibling fence, the exact-sibling image, the revalidations,
+  // and the live-body re-read last — would be invisible to the inventory.
+  ["src/cli/state-plane/migration/authority-flip.ts", new Set(["flipAuthority"])],
 ]);
 const STATE_ORDER_CALLEES = new Set([
   "acquireLock",
@@ -85,6 +90,13 @@ const STATE_ORDER_CALLEES = new Set([
   "handle.stat",
   "isOwner",
   "isSymbolicLink",
+  // The authority flip's own obligations (design 163 M6).
+  "requireSibling",
+  "observeQSibling",
+  "revalidateBackups",
+  "revalidateActive",
+  "cleanupCursor",
+  "fs.renameSync",
   "loadRawLegacyJsonState",
   "loadRawState",
   "publishWholeState",

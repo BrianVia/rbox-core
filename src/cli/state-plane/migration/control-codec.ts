@@ -158,10 +158,11 @@ export interface M2Witness {
 }
 export interface M3Witness { readonly completion: CompletionTuple }
 export interface M4Witness { readonly staging: StagingProof }
+export interface M5Witness { readonly active: StagingProof; readonly qSibling: QSiblingWitness }
 type W2 = M2Witness;
 type W3 = M3Witness;
 type W4 = M4Witness;
-interface W5 { readonly active: StagingProof; readonly qSibling: QSiblingWitness }
+type W5 = M5Witness;
 interface W6 { readonly cleanup: Cursor; readonly futureControls: FutureControls }
 interface W7 { readonly terminalSibling: TerminalSibling }
 

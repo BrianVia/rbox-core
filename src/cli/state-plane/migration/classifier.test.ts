@@ -168,11 +168,22 @@ const retirementFor = (root: string, source: SourceWitness) => ({
   fromControlRevision: 1, originalSource: source, triggeringSource: source, cursor: cursorOf(root),
 });
 
-/** A flipped workspace at `phase` whose active path holds a real store. */
+/**
+ * A flipped workspace at `phase` whose active path holds a real store.
+ *
+ * At M5 the flip is performed rather than approximated: the Q sibling is built,
+ * recorded `exact`, and RENAMED over the legacy document. That is the only image
+ * the flip can leave — the witness still says `exact` while the sibling's own
+ * path is empty, because the sibling is now `Q` — and a fixture that wrote the
+ * marker beside an untouched sibling record would assert a state no crash
+ * produces. M6 and M7 have already republished the sibling as `absent`.
+ */
 function flipped(root: string, phase: "M5" | "M6" | "M7", over: Partial<MigrationControl> = {}): void {
   const source = writeLegacy(root);
-  writeControl(root, phase, { source, active: writeStore(root) }, over);
-  writeFile(statePath(root), MARKER);
+  const qDisposition = phase === "M5" ? sibling(root, MARKER, "exact") : undefined;
+  writeControl(root, phase, { source, active: writeStore(root), qDisposition }, over);
+  if (qDisposition) fs.renameSync(migrationPaths.qSibling(root, ID), statePath(root));
+  else writeFile(statePath(root), MARKER);
 }
 
 /**
@@ -552,6 +563,18 @@ const ROWS: readonly Row[] = [
     build: (root) => {
       flipped(root, "M5");
       writeFile(migrationPaths.qSibling(root, ID), MARKER);
+      return "corruption";
+    },
+  },
+  {
+    // The other half of the M5 + Q rule. Only an `exact` sibling can have become
+    // `Q`, so the marker standing over a witness that still records `absent` or
+    // `building` is a marker this migration never renamed into place.
+    name: "Q over a Q sibling still recorded absent is corruption",
+    build: (root) => {
+      const source = writeLegacy(root);
+      writeControl(root, "M5", { source, active: writeStore(root) });
+      writeFile(statePath(root), MARKER);
       return "corruption";
     },
   },
