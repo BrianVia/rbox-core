@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
 import { canonicalJson } from "../digest/codecs.js";
+import { genesisSourceShapeFlags, sourceShapeFlagsCjson } from "../digest/source-shape.js";
 import { SCHEMA_V1_DDL } from "./v1.js";
 
 export const STATE_STORE_APPLICATION_ID = "rbox-state-plane";
@@ -72,12 +73,10 @@ export function installGenesisLineage(db: Database, genesis: GenesisLineage): vo
       `genesis:${genesis.lineageId}`,
       genesis.createdBy,
       genesis.authorityId,
-      canonicalJson({
-        stream: true,
+      sourceShapeFlagsCjson(genesisSourceShapeFlags({
         stateNonce: genesis.stateNonce !== undefined,
         stateRevision: genesis.stateRevision !== undefined,
-        lastSyncedManifest: { manifestSchema: false, gitRepos: false },
-      }),
+      })),
       canonicalJson({ entry_values: 0, plane_entries: 0, repo_records: 0 }),
       new Date().toISOString(),
     );

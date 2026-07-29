@@ -45,6 +45,10 @@ export const migrationPaths = {
   fixedBackup: (root: string): string => path.join(stateRootPath(root), "pre-163-latest.json.bak"),
   backupHistory: (root: string, bodySha256: string): string =>
     path.join(stateRootPath(root), "legacy-json", `${bodySha256}.json`),
+  /** M2's own render temp, id-scoped so it is never a foreign path to anyone
+   * else and never collides with the content-addressed history beside it. */
+  backupTemp: (root: string, migrationId: string): string =>
+    path.join(stateRootPath(root), "legacy-json", `pre-163.${migrationId}.tmp`),
   quarantine: (root: string): string => path.join(stateRootPath(root), "quarantine"),
 };
 
