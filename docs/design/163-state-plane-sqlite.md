@@ -3087,7 +3087,37 @@ The halted-M6 bytes carry the two created path/revision/inode identities, the
 same final cleanup intent, and the deterministic semantic template of the M7
 record. Its `promotedHalt` member deliberately omits its own SHA-256 and its
 `preparedSuccess` member omits the M7 SHA-256; embedding either would create a
-self/cross-digest cycle. Once the halt bytes are exact, hashing those canonical
+self/cross-digest cycle.
+
+**Pinned by U3 wave 3C: `preparedSuccess` also omits the M7 byte LENGTH.** This
+document never printed the `promoted-halt` consumption shape — the block at
+§ "V5 future-control preparation" prints the **`preparing`** ledger, which is
+one-way and perfectly implementable. All this paragraph said about the consumed
+form was that `preparedSuccess` "omits the M7 SHA-256", and wave 1A reasonably
+read that as *carries `dev`/`ino`/`bytes`*. That reading is the thing that does
+not work, so the shape is pinned here rather than left to the next reader.
+
+Under it the halted-M6 record's canonical size depends on the decimal width of
+the M7 length it names, while the M7 record's canonical size depends on the
+decimal width of the halt length *it* names. Two failures, not one:
+
+- **The ordering above breaks first.** These sentences require the halt bytes to
+  be final before the M7 record can be derived from them — yet a halt record
+  carrying M7's length cannot be final until M7 is. The five-row table's `b+1`
+  action ("derive halt expected bytes") is unreachable.
+- **And the circle has no specified solution.** It closes only under a fixpoint
+  iteration whose convergence this document never states, so two conforming
+  implementations could settle on different canonical bytes for the same record.
+
+Omitting the length removes both: the halt record then depends only on the two
+inodes and the two prebound paths, and the M7 record depends only on the halt
+record. Nothing is lost, because the very next sentences already require the
+retry to *recompute and byte-check* the M7 record rather than trust anything the
+ledger says about it — a stored length could only ever disagree with the
+recomputation that has to happen anyway. This is the same rule that kept three
+other duplicated members out of the control record.
+
+Once the halt bytes are exact, hashing those canonical
 bytes plus the already-recorded M7 inode determines the one canonical M7 byte
 string. The M7 bytes in turn record the halt sibling's complete exact
 identity/hash from the ready M6 ledger. When halt is canonical, its inode must
