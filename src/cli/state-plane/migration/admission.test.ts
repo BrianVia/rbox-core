@@ -7,10 +7,17 @@ import { daemonPidPath } from "../../rbox-paths.js";
 import { saveStateUnsafeLegacyOrTest } from "../../sync-state-store.js";
 import {
   acquireWorkspaceSyncMutex,
+  lockingHealthPath,
   releaseWorkspaceSyncMutex,
+  syncMutexPath,
   type SyncMutexOptions,
 } from "../../sync-mutex.js";
-import { withStatePlaneLocks, type EntryProof, type HeldStatePlaneLocks } from "../locks.js";
+import {
+  withStatePlaneLocks,
+  type EntryProof,
+  type HeldStatePlaneLocks,
+  type StatePlaneLockStage,
+} from "../locks.js";
 import { migrationPaths, stateLockPath, statePath } from "../paths.js";
 import {
   admitMigration,
@@ -52,7 +59,12 @@ async function migratableWorkspace(prefix: string): Promise<string> {
 /** A real degraded-unlocked workspace: the production mutex degrades when lock
  * identity is unavailable, so break identity rather than forging a handle. */
 const DEGRADED: SyncMutexOptions = {
-  lock: { identity: { current: async () => { throw new Error("identity unavailable"); } } },
+  lock: {
+    identity: {
+      current: async () => { throw new Error("identity unavailable"); },
+      probe: async () => { throw new Error("identity unavailable"); },
+    },
+  },
   onDegraded: () => undefined,
 };
 
@@ -78,26 +90,37 @@ async function admitUnderLocks(
   return outcome.value;
 }
 
-/** Admission on a bundle the production path now refuses to mint. The cast is
- * the point: condition 1 is 163-mandated but unreachable through the entry
- * points, and this is the only way to prove it is not dead code. */
-async function admitWithDegradedMutex(
-  root: string,
-  without: AdmissionConditionName[] = [],
-): Promise<AdmissionVerdict> {
+interface BundleOptions {
+  readonly degraded?: boolean;
+  readonly without?: AdmissionConditionName[];
+  /** Runs with the bundle held, immediately before admission is evaluated. */
+  readonly mutate?: () => Promise<void>;
+}
+
+/**
+ * Admission on a bundle assembled by hand, which the production path refuses to
+ * mint. The cast is the point, and this is the file's only one: conditions 1
+ * and 5 guard states `withStatePlaneLocks` now prevents, so a forged bundle is
+ * the only way to prove they are not dead code. 222 §7.9 exempts tests, and
+ * `locks.test.ts` enforces that production has no second cast site.
+ */
+async function admitWithBundle(root: string, options: BundleOptions = {}): Promise<AdmissionVerdict> {
   const conditions: readonly AdmissionCondition[] = MIGRATION_ADMISSION_CONDITIONS
-    .filter((condition) => !without.includes(condition.name));
-  const mutex = await acquireWorkspaceSyncMutex(root, "cli", DEGRADED);
+    .filter((condition) => !(options.without ?? []).includes(condition.name));
+  const mutex = await acquireWorkspaceSyncMutex(root, "cli", options.degraded ? DEGRADED : undefined);
   const acquired = await acquireLock(stateLockPath(root));
   if (acquired.status !== "acquired") throw new Error("fixture could not take the state lock");
   try {
+    await options.mutate?.();
     const locks = { mutex, stateLock: acquired.lock, underRepositoryFence: true } as unknown as HeldStatePlaneLocks;
     return await evaluateAdmission(conditions, {
       root, entry: { entry: "foreground-migrate", locks }, sleep: async () => undefined,
     });
   } finally {
-    await acquired.lock.release();
-    await releaseWorkspaceSyncMutex(mutex);
+    // Tolerant: a fixture that takes the mutex marker away has, by
+    // construction, made an exact release impossible.
+    await acquired.lock.release().catch(() => undefined);
+    await releaseWorkspaceSyncMutex(mutex).catch(() => undefined);
   }
 }
 
@@ -190,13 +213,31 @@ test("condition 5 refuses an entry proof whose state lock names another workspac
   expect(verdict?.outcome === "refused" && verdict.refusal.code).toBe("migration-not-exclusive");
 });
 
+test("condition 5 refuses when mutex ownership is lost inside the window", async () => {
+  const root = await migratableWorkspace("rbox-admit-lease-");
+  // The window is a live property, not a fact cached at acquisition — which is
+  // why admission is re-called verbatim immediately before the M6 rename. Same
+  // bundle, same workspace; the only difference is the mutex marker going away.
+  expect(await admitWithBundle(root)).toEqual({ outcome: "admitted" });
+  expect(await admitWithBundle(root, { mutate: () => fs.rm(syncMutexPath(root)) }))
+    .toEqual({
+      outcome: "refused",
+      refusal: { code: "migration-not-exclusive", detail: "workspace sync mutex ownership was lost" },
+    });
+});
+
 // F1 — the degraded fence does what M0 says (163:2446).
 //
 // The fence lives at the mutex stage, ahead of everything `withStatePlaneLocks`
 // does, because standing-reset recovery COPIES, CREATES and RENAMES. A degraded
 // workspace must not reach that, so the assertion is on the stage trace, not
 // only on the refusal.
-test("F1: a degraded-unlocked workspace is refused before anything is locked or written", async () => {
+//
+// Not "no write occurs": acquiring the handle necessarily records the
+// degradation (`sync-mutex.ts:142` writes `locking-health.json`), because you
+// need the handle to judge its health. The property is no STATE-PLANE
+// mutation — one health marker, and nothing else.
+test("F1: a degraded-unlocked workspace is refused before any state-plane mutation", async () => {
   const root = await migratableWorkspace("rbox-f1-");
   const stages: StatePlaneLockStage[] = [];
   const outcome = await withStatePlaneLocks(root, async () => "body ran", {
@@ -207,6 +248,11 @@ test("F1: a degraded-unlocked workspace is refused before anything is locked or 
   // No inventory, no fence, no state lock, and above all no reset recovery.
   expect(stages).toEqual([]);
   await noMigrationArtifact(root);
+  // The one write the refusal does make, asserted rather than glossed: the
+  // mutex records the degradation it just observed.
+  expect(await fs.readFile(lockingHealthPath(root), "utf8")).toContain("degraded-unlocked");
+  // The state document is byte-identical to what the last writer published.
+  expect(JSON.parse(await fs.readFile(statePath(root), "utf8"))).toMatchObject({ lastSyncedSequence: 0 });
 });
 
 test("F1 negative control: the same call on a healthy workspace runs every stage", async () => {
@@ -222,14 +268,14 @@ test("F1 negative control: the same call on a healthy workspace runs every stage
 
 test("F1, the admission half: condition 1 refuses a degraded mutex on a forged bundle", async () => {
   const root = await migratableWorkspace("rbox-f1-condition-");
-  const verdict = await admitWithDegradedMutex(root);
+  const verdict = await admitWithBundle(root, { degraded: true });
   expect(verdict).toEqual({ outcome: "refused", refusal: { code: "degraded-fence", detail: "identity-unavailable" } });
 
   // Subtract condition 1 and the window check refuses independently; subtract
   // both and the fixture is admitted, so each is its own guard.
-  const behind = await admitWithDegradedMutex(root, ["locking-health"]);
+  const behind = await admitWithBundle(root, { degraded: true, without: ["locking-health"] });
   expect(behind.outcome === "refused" && behind.refusal.code).toBe("migration-not-exclusive");
-  expect(await admitWithDegradedMutex(root, ["locking-health", "exclusivity-window"]))
+  expect(await admitWithBundle(root, { degraded: true, without: ["locking-health", "exclusivity-window"] }))
     .toEqual({ outcome: "admitted" });
 });
 
@@ -255,7 +301,7 @@ test("F4: two concurrent degraded writers are refused, not resolved to a winner"
   const root = await migratableWorkspace("rbox-f4-");
   await Promise.all([degradedWrite(root, 11), degradedWrite(root, 22)]);
 
-  const verdict = await admitWithDegradedMutex(root);
+  const verdict = await admitWithBundle(root, { degraded: true });
   expect(verdict).toEqual({ outcome: "refused", refusal: { code: "degraded-fence", detail: "identity-unavailable" } });
   await noMigrationArtifact(root);
 
@@ -271,15 +317,15 @@ test("F4 negative control: the fence, the window, and the witness each refuse in
 
   // Neither racing writer maintained the witness, so the raced document is
   // refused on that axis too.
-  const behindFence = await admitWithDegradedMutex(root, ["locking-health"]);
+  const behindFence = await admitWithBundle(root, { degraded: true, without: ["locking-health"] });
   expect(behindFence.outcome === "refused" && behindFence.refusal.code).toBe("barrier-witness-missing");
 
-  const behindWitness = await admitWithDegradedMutex(root, ["locking-health", "barrier-witness"]);
+  const behindWitness = await admitWithBundle(root, { degraded: true, without: ["locking-health", "barrier-witness"] });
   expect(behindWitness.outcome === "refused" && behindWitness.refusal.code).toBe("migration-not-exclusive");
 
   // With all three subtracted the fixture is admitted, so each refusal above is
   // its own guard rather than an unrelated condition.
-  expect(await admitWithDegradedMutex(root, ["locking-health", "barrier-witness", "exclusivity-window"]))
+  expect(await admitWithBundle(root, { degraded: true, without: ["locking-health", "barrier-witness", "exclusivity-window"] }))
     .toEqual({ outcome: "admitted" });
 });
 
@@ -312,9 +358,13 @@ test("the budget refuses a reserve this workspace's barrier did not create", asy
 
 test("v11 deleted the live-writer sampling, and it stays deleted", async () => {
   // This file names the deleted mechanisms, so it must be excluded or the gate
-  // matches itself. `git grep` also skips untracked files, which is why the
-  // exclusion is a pathspec rather than a filter on the output: an unstaged new
-  // file must not be able to make this pass.
+  // matches itself. The exclusion covers EVERY test file, not just this one —
+  // acceptable, since 163 forbids the mechanisms in production code and a test
+  // naming them is how they stay forbidden.
+  //
+  // `git grep` reads only tracked files, so an uncommitted production file
+  // carrying either literal is invisible to this gate regardless of pathspec.
+  // CI always runs a committed tree, which is what makes that acceptable.
   const sweep = Bun.spawnSync([
     "git", "grep", "-lIE", "legacy-writer-live|paired-interval", "--", "src", ":!*.test.ts",
   ], { cwd: path.resolve(import.meta.dir, "../../../..") });

@@ -1210,13 +1210,30 @@ The repository fence is **callback-scoped**, so the bundle is a witness of what
 is held, not a set of handles:
 
 ```ts
+declare const heldStatePlaneLocks: unique symbol;   // not exported: the brand
+
 export interface HeldStatePlaneLocks {
-  readonly mutex: WorkspaceSyncMutex;      // healthy, live-owned
+  readonly mutex: WorkspaceSyncMutex;      // non-degraded, acquired for this root
   readonly stateLock: OwnedLock;           // held for this exact root
   readonly underRepositoryFence: true;
+  readonly [heldStatePlaneLocks]: true;    // mintable only in `locks.ts` (§7.9)
 }
-export async function withStatePlaneLocks<T>(root: string, fn: (l: HeldStatePlaneLocks) => Promise<T>): Promise<T>;
+
+/** Degradation is a typed outcome, not an exception: 163's `degraded-fence` is
+ * a refusal with plain-English copy, and it must be decided BEFORE the standing
+ * reset recovery below, which copies, creates, and renames. */
+export type StatePlaneLockOutcome<T> =
+  | { readonly held: true;  readonly value: T }
+  | { readonly held: false; readonly refusal: { code: "degraded-fence"; detail: string } };
+
+export async function withStatePlaneLocks<T>(
+  root: string, fn: (l: HeldStatePlaneLocks) => Promise<T>,
+): Promise<StatePlaneLockOutcome<T>>;
 ```
+
+Live mutex ownership is verified where the answer is consumed — admission's
+exclusivity-window condition, re-called immediately before the M6 rename —
+rather than at the moment the handle is made, where it is a tautology.
 
 Order inside it, adopted verbatim from the N1 ruling:
 
@@ -1555,8 +1572,10 @@ dated and re-checked before the 2.0 tag.
   `src/**`; test files are the enumerated exception, since adversarial
   construction is what they are for). The bundle is the proof object every
   mutator trusts without re-verifying — `control-publication.ts` takes it and
-  does `void locks` — so its unforgeability currently rests on the brand alone.
-  A cast anywhere else reaches an admitted migration with no lock held.
+  does `void locks` — so its unforgeability rests on the brand alone. A cast
+  anywhere else reaches an admitted migration with no lock held. **Executable**
+  in `locks.test.ts`, not prose: an unenforced structural claim is how the
+  brand quietly stops being load-bearing.
 - The canonical control file is written only by `control-publication.ts`,
   including both prepared-sibling promotions, which share one private primitive.
 - The genesis intent is written only by `genesis.ts`; `readGenesisIntent` is its

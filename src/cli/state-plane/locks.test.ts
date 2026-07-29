@@ -96,6 +96,22 @@ test("a post-Q workspace refuses the bundle rather than fencing an inventory it 
   await expect(withStatePlaneLocks(root, async () => "never")).rejects.toThrow(/newer version of rbox/);
 });
 
+// 222 §7.9. The bundle is the proof object every mutator trusts without
+// re-verifying — `control-publication.ts` takes it and does `void locks` — so
+// its unforgeability rests entirely on the brand. A cast anywhere else in
+// production reaches an admitted migration with no lock held.
+test("only locks.ts casts its way to a bundle in production code", () => {
+  // Deliberately loose: `as unknown as HeldStatePlaneLocks` is only the obvious
+  // spelling. A qualified reference (`as unknown as Mod.HeldStatePlaneLocks`)
+  // is the same forgery and slipped past a tighter pattern when probed.
+  const sweep = Bun.spawnSync([
+    "git", "grep", "-lIE", "\\bas\\b[^;]*HeldStatePlaneLocks", "--", "src", ":!*.test.ts",
+  ], { cwd: path.resolve(import.meta.dir, "../../..") });
+  expect(sweep.exitCode, "git grep failed to run").toBeLessThanOrEqual(1);
+  const files = new TextDecoder().decode(sweep.stdout).trim().split("\n").filter(Boolean);
+  expect(files).toEqual(["src/cli/state-plane/locks.ts"]);
+});
+
 test("a standing reset journal is recovered to completion before the body runs", async () => {
   const root = await workspace("rbox-locks-standing-reset-");
   await fs.writeFile(resetJournalPath(root), "{ not a journal");

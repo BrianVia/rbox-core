@@ -17,7 +17,6 @@ import { readResetJournal, recoverResetJournalUnderHeldFence } from "../reset-jo
 import { repoRecordsForState } from "../sync-state-model.js";
 import {
   acquireWorkspaceSyncMutex,
-  assertHealthyOwnedSyncMutex,
   releaseWorkspaceSyncMutex,
   workspaceSyncMutexDegraded,
   type SyncMutexOptions,
@@ -165,10 +164,15 @@ async function completeStandingReset(root: string, inventory: Inventory, stateLo
  * recovery fence, state lock, fenced recheck, standing reset recovery, body.
  *
  * A degraded workspace never reaches any of that. `completeStandingReset` below
- * copies, creates, and renames, so the health assertion has to precede it — a
+ * copies, creates, and renames, so the degraded check has to precede it — a
  * workspace whose locking is known unreliable is exactly the population
  * `degraded-fence` exists to keep away from state mutation. It is reported as a
  * refusal so the caller can print 163:2446's copy instead of a stack trace.
+ *
+ * The mutex's other two health axes are not rechecked here: it was acquired for
+ * this exact root one statement earlier, and ownership is verified where the
+ * answer is consumed rather than where the handle is made — admission's
+ * exclusivity-window condition, which is re-called before the M6 rename.
  */
 export async function withStatePlaneLocks<T>(
   root: string,
@@ -185,7 +189,6 @@ export async function withStatePlaneLocks<T>(
           refusal: { code: "degraded-fence", detail: mutex.degraded?.reason ?? "identity-unavailable" },
         };
       }
-      await assertHealthyOwnedSyncMutex(mutex, root);
       await options.onStage?.("mutex");
       const inventory = await inspectInventory(root);
       await options.onStage?.("inventory");
