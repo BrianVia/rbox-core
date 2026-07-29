@@ -5,6 +5,126 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_SESSION 2026-07-29 (day): **the quota investigation — two PRs merged (#602,
+#603), a live upload leak root-caused, and Phase 2 GC found dead since
+~07-20.** Triggered by the founder's dashboard showing 87.9 GB billed against a
+5.1 GB workspace. Accounting itself is CORRECT (`used_bytes` == `SUM` over
+`blob_refs ⋈ blobs`, exactly, every account) — every charged byte is a real
+entitled blob. What was wrong was WHICH blobs got entitled._
+
+_**FOUNDER RULING: bill on ACTIVE bytes only; history is never charged.**
+Storing history is acceptable (cost math penciled). That retires the
+`bound_bytes` 5× fair-use bound and the prune as requirements — see
+`bill-active-bytes-never-history` in session memory. Prod shape for the founder
+account: **120.96 GB charged vs 3.91 GB of live head content**; of 80,904 refs,
+51,262 are head, ~2,700 are real version history (3%), and **24,389 (30%) were
+charged but never appeared in any manifest** — upload orphans, not history.
+Version history was never the problem._
+
+_**MERGED: #603 (design 225) — active bytes at head, no root walk.** The
+fair-use scan had NEVER completed for the founder account (12 aborted, 0
+complete): it aborted on any head advance AND, independently, walked every
+retained sequence at one root per page (~1,400 h for one of four workspaces,
+growing faster than it could be walked). Now computed from each workspace's
+head at parity with `refSetAt` — `refs(head) ∪ chainRefs ∪ {encManifestSha} ∪
+{sidecarSha}` ∩ `blob_refs` — via a new read-only `/roots-inspect?head=1` DO
+mode. `fairuse.ts` 1152 → 836. Migration **0035**. `history_computed` defaults
+to **1** so pre-migration completions keep reporting real history. **The
+billing flip is NOT in it** and has an unsolved piece: `active_bytes` is
+epoch-lagged up to an hour, so it cannot be a synchronous admission gate
+alone. Inline mode was the trap — below `SIDECAR_THRESHOLD` there is no
+sidecar, and a sidecar-only reading returns ZERO for every small workspace._
+
+_**MERGED: #602 (design 224) — an index-less git repo defeated every ignore
+rule.** A repo with `.git/` but no `.git/index` (`git init`, nothing committed)
+made `loadTrackedRepoSet` report `available: false`, which made every path
+"possibly tracked", which UN-IGNORED the whole subtree. Field: 6 of 328
+subtrees on the Mac had that exact shape and held **31,828 stranded entries**;
+the other 319 held zero. `node_modules`, `venv`, `__pycache__` and 2 real
+`.env` files went up — the secrets patterns `BUILTIN_IGNORE` exists to enforce.
+Fix = taxonomy split: `indexAbsent` (rev-parse ok + stat ENOENT + **unborn
+HEAD**) → `available: true, paths: ∅`; everything else keeps fail-open. The
+third signal is load-bearing — a repo WITH commits that lost its index also
+yields an empty tracked set, and misclassifying it would let `ignore --purge`
+delete committed files fleet-wide. Also: a symlink is now ignored iff a
+same-named directory is (the trailing-slash builtins are directory-only in
+gitignore semantics), and `rbox status` surfaces the stranded count. **Recovers
+zero bytes** — stops accumulation, makes the strand visible and purgeable._
+
+_**OPEN — design 226: a deferred git repo uploads ~3 blobs per push tick and
+discards them.** Measured on the desktop: **9,982 push ticks → 9,983 receipts**
+in 13.5 h, one-to-one, none ever referenced. Chain: a stuck pending section
+forces `processRepoSlowPath(..., {forceCapture:true})` every tick
+(`plan.ts:891-903`) → capture UPLOADS before any decision
+(`engine/git/shared.ts:755-782`) → `provePendingSupersession` fails →
+`revertCapture` discards the section and the log prints `captured 0`, HIDING
+the upload → `push.ts:665-668` short-circuits on `no-op` so the receipt is
+never redeemed OR discarded → receipts accrete for the daemon's lifetime
+(`remote/context.ts:35`) → the next real commit drains and charges the lot.
+`store.has()` can NEVER hit for these (a receipts PUT writes the canonical key
+with no D1 row, `present=0`), so even byte-identical recapture re-uploads. Fix
+= move the upload AFTER the decision (encrypt/flush split; encryption is
+convergent so the ref is computable offline). Two review rounds done, both
+CHANGES-REQUIRED, round 3 pending. Reclamation is `gcMark` on the canonical
+prefix, NOT staging GC (which only lists `staging/`). Receipts expire server-
+side at 12 h (`receipts.ts:10`)._
+
+_**PHASE 2 GC HAS BEEN DEAD SINCE ~2026-07-20 — `roots_budget_exceeded`, and
+it is a SCALING WALL, not a tuning knob.** `maxW = floor((800-10-5-3-1)/90) =
+8` (`gc-policy.ts`, used `gc-purge.ts:223`) and prod has **12 workspaces**, so
+`workspaceSnapshot` returns null and `gcPurge` exits before the lease. Result:
+**1,337,881 condemned blobs / 375.8 GB of R2 unreclaimable and growing
+hourly**, 835 delete-intents frozen since 07-08. Raising the budget cannot
+work: 12 × 90 = 1,080 subrequests against Cloudflare's hard 1,000 ceiling. It
+also cannot shard workspaces across ticks, because Phase 2 needs the COMPLETE
+reachable set to delete safely — which is why design 151 chose to fail closed.
+**PARKED at founder instruction** (do not touch without a fresh ask). One probe
+worth running first: deletion is already gated on zero-refs, and 0 of 1.34M
+condemned blobs are referenced — so the global reachability re-check may be a
+redundant second belt that happens to cost the platform limit. Phase 1 is
+healthy and DOES reclaim `used_bytes`; only R2 deletion is blocked._
+
+_**NO DATA LOSS — the purge/re-grant hypothesis was KILLED with evidence.**
+Reconstructed the exact reachable set read-only (roots-inspect + head sidecar +
+refset codec): 0 of 51,262 head refs missing from `blob_refs`, 0 of 1,645
+marked candidates reachable, 0 of 1.34M `gc_candidates` referenced anywhere.
+Founder account sat bit-for-bit flat across 20 minutes of 2-min sampling.
+Reachability fails closed on every path — no truncating branch exists._
+
+_**Commit-time `active_bytes` was probed and KILLED (UNSOUND) — do not
+re-propose.** Three independent kills: prod runs delta admission
+(`RBOX_COMMIT_DELTA_ADMISSION: "enforce"`, `wrangler.jsonc:194`) so the commit
+path never sees the full ref set and `commitAccounting` only ever sees
+`newRefs`; head advances and accounting are not 1:1 in either direction
+(`repair` moves head with zero ref inspection); and cross-project dedup is
+unobtainable at commit time because a commit is scoped to one `(ws, proj)`.
+A scan self-heals from current state; an accumulator drifts silently forever._
+
+_**Fleet actions taken.** Deleted 6 empty `.git` skeletons on the Mac
+(`transaction-analyzer`, `dev-server-menubar-monitor`, `faceswap-video-api`,
+`LLM-brain`, `twitter-list-adder`, `proof-of-concepts`) — all had `index:
+MISSING` + no HEAD + `node_modules` on disk; projects untouched. Desktop and
+flat-meadow swept clean (`respectGitignore: false`, zero index-less repos).
+Desktop `main` fast-forwarded to origin._
+
+_**THIRD CYCLE NEEDED: `rbox git resolve` cannot resolve its own deferral
+states, and one message actively misleads.** Desktop `Personal/rbox-core`
+(`local-index`, since 07-27 19:08 — the rejoin) — `keep-mine` refuses BY DESIGN
+because the staging-area and operation-state lanes stay strict (1.7.18), and
+`take-theirs` points at the wrong host. Mac `Personal/home-dashboard`
+(`local-commits`, detached, since 07-27 15:19) has **ZERO local-only commits**
+and `take-theirs` STILL refuses with "local commits changed while the checkout
+was being confirmed" — which is `refusalMessage("local-commits")`
+(`git/resolve-presentation.ts:118`), a reason-keyed refusal, NOT a detected
+change. The token was identical across attempts. Both remain deferred; the
+1.9.1 worktree fixes (per-branch holds, squash-merge recognition, branch-
+deletion sync) are shipped and are NOT what these are hitting._
+
+_**HOST: linuxbrew `node` is BROKEN on the desktop.** `which node` →
+linuxbrew 26.5.0, which cannot load its own gcc libs (`GCC_13.0.0`,
+`GLIBCXX_3.4.31/32` missing). `/home/via/n/bin/node` v24.18.0 works. Blocks
+`bun run typecheck` and will bite wrangler and `apps/web`'s `npm ci`._
+
 _SESSION 2026-07-28→29 (overnight): **U3 waves 1A/1B/1C + 2B are merged on
 `2.0`; 222's read-only-preflight premise is FALSIFIED and the ownership rule
 (#589, 163 v13) AWAITS FOUNDER RATIFICATION — it blocks lanes 3A/5B/5C; two CI
