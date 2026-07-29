@@ -534,6 +534,53 @@ const ROWS: readonly Row[] = [
     },
   },
   {
+    // The highest-severity gap an independent sweep found: without the hash
+    // comparison the M5 mutator renames these arbitrary bytes over
+    // `.rbox/state.json` as the authority marker.
+    name: "a 58-byte Q sibling at the recorded inode is not the marker unless it hashes to it",
+    build: (root) => {
+      const source = writeLegacy(root);
+      const qDisposition = sibling(root, Buffer.alloc(58, 0x41), "exact");
+      writeControl(root, "M5", { source, active: writeOpaqueActive(root, "db-bytes"), qDisposition });
+      return "corruption";
+    },
+  },
+  {
+    name: "a Q sibling at an inode other than the recorded one is foreign",
+    build: (root) => {
+      const source = writeLegacy(root);
+      const qDisposition = sibling(root, MARKER, "exact");
+      const file = migrationPaths.qSibling(root, ID);
+      fs.unlinkSync(file);
+      writeFile(file, MARKER); // identical bytes, new inode
+      writeControl(root, "M5", { source, active: writeOpaqueActive(root, "db-bytes"), qDisposition });
+      return "corruption";
+    },
+  },
+  {
+    name: "a world-readable zero-byte Q sibling is not the create-ahead shape",
+    build: (root) => {
+      const source = writeLegacy(root);
+      writeFile(migrationPaths.qSibling(root, ID), "", 0o644);
+      writeControl(root, "M5", { source, active: writeOpaqueActive(root, "db-bytes") });
+      return "corruption";
+    },
+  },
+  {
+    name: "a staging main at an inode other than the recorded one is foreign",
+    build: (root) => {
+      const source = writeLegacy(root);
+      const staging = migrationPaths.staging(root, ID);
+      writeFile(staging, "partial");
+      const observed = observePath(staging);
+      if (observed.state !== "regular") throw new Error("fixture");
+      fs.unlinkSync(staging);
+      writeFile(staging, "partial"); // identical bytes, new inode
+      writeControl(root, "M2", { source, stagingMain: { state: "present", dev: observed.dev, ino: observed.ino } });
+      return "corruption";
+    },
+  },
+  {
     name: "a frozen Q window with a database sidecar is corruption",
     build: (root) => {
       flipped(root, "M5");
@@ -667,10 +714,21 @@ describe("migration classifier", () => {
   // working on the new format and syncing normally" (222:1293). A physical
   // `{bytes, sha256}` check goes stale on the first save and would raise a
   // never-retryable `StateAuthorityCorruptError` on a healthy workspace.
+  // The `durability-indeterminate` rows are the same defect one layer down: the
+  // write fence answers "may anything write now", but the classifier needs
+  // "could the bytes have changed since `witness.active` was recorded". Those
+  // diverge exactly on this halt, which is reachable at M6 (222:1329) and M7
+  // (222:1330) — flip, take one ordinary save in the live window, then publish
+  // the halt at the next revision. `witness.active` is fixed at M5 and a halt
+  // never advances the phase, so it is never refreshed. Routing that into the
+  // frozen branch converts a recoverable durability scare into a never-retryable
+  // corruption error, which is worse than the original brick.
   for (const [name, phase, over, expected] of [
     ["M6", "M6", {}, "m6-cleanup"],
     ["M6 + cleanup-deferred", "M6", { halt: DEFERRED }, "halted"],
+    ["M6 + durability-indeterminate", "M6", { halt: INDETERMINATE }, "halted"],
     ["M7", "M7", {}, "m7"],
+    ["M7 + durability-indeterminate", "M7", { halt: INDETERMINATE }, "halted"],
   ] as const) {
     test(`an ordinary save after ${name} does not brick the workspace`, async () => {
       const root = workspace();

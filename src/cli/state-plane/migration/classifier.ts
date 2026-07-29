@@ -6,12 +6,20 @@
  * the mutators a phase-bound receipt. It creates, renames, unlinks, and truncates
  * nothing, on every row including every corruption row.
  *
- * It reaches a database exactly one way. While the migration write fence holds,
- * the database is frozen and the control's physical witness settles its identity
+ * It reaches a database exactly one way, and which way turns on the flip. Before
+ * it, the database is frozen and the control's physical witness settles identity
  * without opening anything — a read-only SQLite open is not free, it creates
- * `-wal`/`-shm` and leaves them. Once the fence lifts the store is in ordinary
- * use, physical bytes go stale on the first save, and identity comes from the
- * durable rows through `active-store-proof.ts`, the one sanctioned opener.
+ * `-wal`/`-shm` and leaves them. After it, the store has been in ordinary use and
+ * that witness is stale, so identity comes from the durable rows through
+ * `active-store-proof.ts`, the one sanctioned opener.
+ *
+ * Two orderings inside `classifyMigrationState` are load-bearing and are not
+ * merely stylistic. The control is read BEFORE the switch on legacy authority, so
+ * any `ENOTDIR` under `.rbox/state` — a regular file where the directory must be
+ * — halts as a foreign control rather than reaching `authority-marker.ts`, whose
+ * `ENOTDIR` is still read as absence. And under JSON authority the artifact
+ * pairing is checked before the halt is reported, because a halt excuses no
+ * artifact mismatch (163:2622).
  *
  * No genesis rows. The coordinator rules genesis out before this module is
  * reached (design 222 §1.3, FINDING 5).
@@ -24,7 +32,6 @@ import {
   isForeign, observeLegacyAuthority, observePath, observeQSibling, observeSidecars, observeStagingMain,
   type PathObservation, type QSiblingObservation, type StagingMainObservation,
 } from "./artifact-observation.js";
-import { blocksSqliteWrites } from "./control-codec.js";
 import type {
   C1Trigger, Cursor, MigrationControl, MigrationPhase, SourceWitness, StagingProof,
 } from "./control-codec.js";
@@ -79,6 +86,10 @@ const receiptFor = (control: MigrationControl): PhaseReceipt => PhaseReceipt.obs
 const corruption = (detail: string): MigrationObservation =>
   ({ row: "corruption", halt: { code: "reserved-path", underlyingCode: detail, required: null, available: null } });
 
+/** `locks` is a compile-time witness that the complete lock set is held. It has
+ * no runtime use HERE — every observation is a single no-follow descriptor — but
+ * it is what makes the reads mutually consistent across paths, so a later wave's
+ * mutators can act on this row without re-observing. */
 export async function classifyMigrationState(
   root: string, locks: HeldStatePlaneLocks,
 ): Promise<MigrationObservation> {
@@ -206,17 +217,24 @@ const identicalSource = (recorded: SourceWitness, live: SourceWitness): boolean 
  * durable state rather than a suspended protocol: a hard
  * `StateAuthorityCorruptError`, zero repair writes, never retryable.
  *
- * Which predicate proves the database is ours depends on whether it is FROZEN,
- * and `blocksSqliteWrites` — the same ratified fence A-2 enforces — is exactly
- * that question, so the two cannot drift apart:
+ * Which predicate proves the database is ours turns on ONE question: could the
+ * bytes have changed since `witness.active` was recorded? That witness is fixed
+ * at M5 and never refreshed, so the answer is "no" only before the flip.
  *
- * - frozen (M5, or any write-blocking halt): nothing may write the store, so the
- *   control's physical `{bytes, sha256}` is exact and is stronger than the
+ * - **pre-flip, `M5` alone** — the frozen window. Nothing may write the store, so
+ *   the control's physical `{bytes, sha256}` is exact and is stronger than the
  *   database's self-description. A sidecar here is itself an anomaly, because a
  *   `-wal` beside a byte-identical main can carry a different `authority_id`.
- * - live (M6, M7, `cleanup-deferred`, and a retired control): the store is in
- *   ordinary use and its bytes change on every save, so identity must come from
- *   the durable rows — see `active-store-proof.ts`.
+ * - **`M6` and `M7`, unconditionally** — the live window. The store has been in
+ *   ordinary use since the flip and its bytes change on every save, so identity
+ *   comes from the durable rows (`active-store-proof.ts`).
+ *
+ * Not `blocksSqliteWrites`. That answers "may anything write *now*", which is a
+ * different question: a `durability-indeterminate` halt published after the live
+ * window has already taken a save makes the fence true again while the M5 witness
+ * stays stale, and comparing against it would turn a recoverable durability scare
+ * into a never-retryable corruption error. Design 163 v13 enumerates these
+ * windows by row, and the row list — not the fence — is what this follows.
  */
 function underAuthorityMarker(
   legacy: { readonly file: string; readonly authorityId: string },
@@ -238,7 +256,7 @@ function underAuthorityMarker(
   if (witness.phase !== "M5" && witness.phase !== "M6" && witness.phase !== "M7") {
     return corruption(`the authority marker is published but the migration control records ${witness.phase}`);
   }
-  if (blocksSqliteWrites(control)) {
+  if (witness.phase === "M5") {
     if (observeSidecars(active.file).length > 0) {
       throw new StateAuthorityCorruptError(legacy.file, "the state database has uncheckpointed sidecars while writes are fenced");
     }
