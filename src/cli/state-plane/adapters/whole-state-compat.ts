@@ -203,9 +203,10 @@ type LegacyRejectionReason = Extract<StateSaveResult, { status: "rejected" }>["r
  * live token rather than from the packet, so their rejections describe a store
  * that moved under the held state lock — a stale snapshot, which is what the
  * JSON vocabulary calls a nonce (identity) or global-sequence (base plane)
- * mismatch.
+ * mismatch. Exported so every row — including the four a test cannot reach
+ * through the CAS — is pinned rather than merely compiled.
  */
-const LEGACY_REJECTION_REASON: Record<CasRejectionReason, LegacyRejectionReason> = {
+export const LEGACY_REJECTION_REASON: Record<CasRejectionReason, LegacyRejectionReason> = {
   lineage: "nonce",
   stream: "stream",
   nonce: "nonce",

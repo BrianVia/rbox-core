@@ -71,6 +71,7 @@ const STATE_ORDER_CALLEES = new Set([
   "assertAuthorityWritable",
   "markResetLineageProvenance",
   "openAuthorityStore",
+  "recoverStandingResetJournal",
   "selectSqliteAuthority",
   "afterStatePublication",
   "assertStatePublishable",

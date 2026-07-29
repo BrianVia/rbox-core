@@ -9,7 +9,7 @@
  */
 import fs from "node:fs/promises";
 import path from "node:path";
-import { readResetJournal, recoverResetJournal } from "../reset-journal.js";
+import { recoverResetJournal } from "../reset-journal.js";
 import {
   acquireWorkspaceSyncMutex,
   assertSyncMutex,
@@ -18,19 +18,27 @@ import {
   type WorkspaceSyncMutex,
 } from "../sync-mutex.js";
 import type { SyncState } from "../sync-state-model.js";
+import { sqliteResetPaths } from "./paths.js";
 import { RBOX_DIR } from "../workspace-config.js";
 
 /**
  * Recover a standing reset journal before any state read. `recoverResetJournal`
  * dispatches to the SQLite reset plane itself once `Q` is authority, so this is
  * backend-neutral all the way down.
+ *
+ * The gate is the journal's PRESENCE, never its contents. Decoding it here
+ * would decide the format twice, and the legacy decoder throws outright on a
+ * `sqlite/v1` journal — the only kind a `Q` workspace can have — so a decode
+ * gate turns "recover this reset" into a hard read error on exactly the
+ * workspaces this recovery exists for. Format dispatch belongs to
+ * `recoverResetJournal`, which classifies the authority first.
  */
 export async function recoverStandingResetJournal(
   root: string,
   stream: string,
   heldMutex?: WorkspaceSyncMutex,
 ): Promise<void> {
-  if (!await readResetJournal(root)) return;
+  if (!await standingResetJournal(root)) return;
   let recoveryMutex = heldMutex;
   let releaseRecoveryMutex = false;
   if (!recoveryMutex) {
@@ -44,6 +52,16 @@ export async function recoverStandingResetJournal(
   } finally {
     if (releaseRecoveryMutex) await releaseWorkspaceSyncMutex(recoveryMutex);
   }
+}
+
+/** Presence only, and never through a symlink: whether this workspace has a
+ * reset journal at all, in either format. */
+async function standingResetJournal(root: string): Promise<boolean> {
+  const observed = await fs.lstat(sqliteResetPaths.journal(root)).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return undefined;
+    throw error;
+  });
+  return observed !== undefined;
 }
 
 const streamMismatchFreshStates = new WeakSet<SyncState>();

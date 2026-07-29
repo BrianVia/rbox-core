@@ -14,13 +14,15 @@ import os from "node:os";
 import path from "node:path";
 import type { FileEntry } from "../../../engine/index.js";
 import { acquireLock } from "../../../engine/git/lockfile.js";
+import { withProtocolLockClass } from "../../../engine/git/protocol-locks.js";
 import type { StateSavePacket, SyncState } from "../../sync-state-model.js";
 import { authorityMarkerBytes } from "../authority-marker.js";
 import { StateAuthorityCorruptError, StateWriteRefusedError, StreamMismatchError } from "../errors.js";
 import { genesisPaths, sqliteResetPaths, stateLockPath, statePath } from "../paths.js";
-import { createStateStore } from "../store/open.js";
+import { sqliteResetFacade } from "../reset/index.js";
+import { createStateStore, ownedStateStoreWriterForReset } from "../store/open.js";
 import {
-  applyStateSavePacket, loadRawState, loadState,
+  applyStateSavePacket, LEGACY_REJECTION_REASON, loadRawState, loadState,
 } from "./whole-state-compat.js";
 
 const STREAM = "https://api.test::ws_222::root";
@@ -137,22 +139,59 @@ test("a save on Q lands in the store and never republishes JSON", async () => {
   expect(await loadRawState(root)).toStrictEqual(result.state);
 });
 
+test("a standing SQLite reset is recovered by the read, not reported as corruption", async () => {
+  const root = await flipped("reset");
+  await sqliteResetFacade.begin(root, "next", [], {
+    version: 2, authorizedNextStream: "next", consentKind: "setup-rebind", mintedAtRevision: 0,
+  });
+  expect(fs.existsSync(sqliteResetPaths.journal(root))).toBe(true);
+  // Gating this recovery on the LEGACY journal decoder threw
+  // `ResetCorruptionError` here: a `Q` workspace's journal is `sqlite/v1`, the
+  // one format that decoder refuses. The read must recover instead.
+  const outcome = await loadState(root, STREAM).catch((error: unknown) => error);
+  expect(outcome, String(outcome)).toBeInstanceOf(StreamMismatchError); // the reset rebound the stream
+  expect(fs.existsSync(sqliteResetPaths.journal(root))).toBe(false);
+  expect((await loadState(root, "next")).stream).toBe("next");
+});
+
 // --- CasResult translation --------------------------------------------------
+
+/** Every row, including the four A-1 makes unreachable by binding them from the
+ * live token: an unreachable row is still a promise to the caller. */
+test("the rejection vocabulary is exactly the translation the JSON CAS speaks", () => {
+  expect(LEGACY_REJECTION_REASON).toEqual({
+    lineage: "nonce",
+    stream: "stream",
+    nonce: "nonce",
+    "state-revision": "nonce",
+    "base-generation": "global-sequence",
+    "local-revision": "nonce",
+    "repo-generation": "repo-generation",
+    "global-sequence": "global-sequence",
+    "owner-lost": "owner-lost",
+  });
+});
 
 test("raw CAS rejections translate into the JSON vocabulary against the retry view", async () => {
   const root = await flipped("reject");
+  expect((await applyStateSavePacket(root, packet({ sourceGlobalSeq: 9 }))).status).toBe("accepted");
   for (const [override, reason] of [
     [{ expectedNonce: "d".repeat(32) }, "nonce"],
     [{ expectedStream: "https://api.test::other::root" }, "stream"],
-    [{ repos: [{ relPath: "repo", expectedRepoGen: 7, newRecord: { sourceSeq: 5 } }] }, "repo-generation"],
+    [{ sourceGlobalSeq: 12, repos: [{ relPath: "repo", expectedRepoGen: 7, newRecord: { sourceSeq: 12 } }] }, "repo-generation"],
+    // A global behind the authority's own sequence: the reachable
+    // `global-sequence` row, which shares its translation with base-generation.
+    [{ sourceGlobalSeq: 2 }, "global-sequence"],
   ] as const) {
+    const authority = await loadRawState(root);
     const result = await applyStateSavePacket(root, packet(override));
     expect(result.status, JSON.stringify(override)).toBe("rejected");
     if (result.status !== "rejected") continue;
-    expect(result.reason).toBe(reason);
-    // The state handed back is the authority the rejection was decided against.
-    expect(result.state.stateRevision).toBe(0);
-    expect(result.state.lastSyncedSequence).toBe(0);
+    expect(result.reason, JSON.stringify(override)).toBe(reason);
+    // The state handed back is the authority the rejection was decided against,
+    // and the rejected packet moved nothing.
+    expect(result.state).toStrictEqual(authority!);
+    expect(await loadRawState(root)).toStrictEqual(authority!);
   }
   // The sealed retry view is closed on every rejection: a leaked one keeps its
   // stage artifact and its lock alive for the life of the process.
@@ -196,10 +235,60 @@ test("the fence is called exactly once per save, and never through a static impo
   const source = fs.readFileSync(COMPAT, "utf8");
   expect(source.split("assertAuthorityWritable(").length - 1).toBe(1);
   expect(source).toContain('await import("../authority-bootstrap.js")');
+  // Both read paths take a read-only handle; only the save path takes the
+  // writer. 163 v13 is specifically about what a READ is allowed to do.
+  expect(source.match(/openAuthorityStore\(authority, true\)/g) ?? []).toHaveLength(2);
+  expect(source.match(/openAuthorityStore\(authority, false\)/g) ?? []).toHaveLength(1);
+  expect(source).toContain("facade.openStateStore(authority.file, { readonly })");
+  // Four closes: the two read paths, the save, and the authority-id refusal
+  // that closes the handle it had to open to compare ids.
+  expect(source.match(/store\.close\(\);/g) ?? []).toHaveLength(4);
   // A static import of either the coordinator or the store would drag
   // `bun:sqlite` into the CLI's eager graph, which `schema/inventory.test.ts`
   // forbids — and would stop the adapter being inert before the flip.
   expect(source).not.toMatch(/^import .*(authority-bootstrap|store-facade)\.js/m);
+});
+
+/**
+ * A store handle that outlives its call is invisible to every other assertion
+ * here, and it is exactly what makes `checkpointStateStoreForReset` refuse a
+ * later reset as busy. The store keeps its own liveness registry, so ask that
+ * rather than counting descriptors — a leaked handle is unreferenced garbage,
+ * so its file descriptor disappears on the next GC and proves nothing.
+ */
+test("the save closes the writer it opened", async () => {
+  const root = await flipped("close");
+  const active = sqliteResetPaths.active(root);
+  expect(ownedStateStoreWriterForReset(active)).toBeUndefined();
+  expect((await applyStateSavePacket(root, packet())).status).toBe("accepted");
+  expect(ownedStateStoreWriterForReset(active), "the save left a live writer registered").toBeUndefined();
+});
+
+test("a held lock is reused when it is the state lock, and refused when it is not", async () => {
+  const root = await flipped("held-lock");
+  const identity = path.resolve(statePath(root));
+  const foreign = await acquireLock(path.join(root, "foreign.lock"));
+  expect(foreign.status).toBe("acquired");
+  if (foreign.status !== "acquired") return;
+  try {
+    await expect(withProtocolLockClass("state", identity, () =>
+      applyStateSavePacket(root, packet(), { heldLock: foreign.lock }))).rejects.toThrow(/held state lock does not match/);
+  } finally {
+    await foreign.lock.release();
+  }
+
+  const held = await acquireLock(stateLockPath(root));
+  expect(held.status).toBe("acquired");
+  if (held.status !== "acquired") return;
+  try {
+    // The state lock is already ours: the save must reuse it rather than
+    // re-acquire it and report itself busy.
+    const result = await withProtocolLockClass("state", identity, () =>
+      applyStateSavePacket(root, packet(), { heldLock: held.lock }));
+    expect(result.status).toBe("accepted");
+  } finally {
+    await held.lock.release();
+  }
 });
 
 // --- contradictory authority ------------------------------------------------

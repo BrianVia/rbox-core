@@ -58,7 +58,7 @@ const ENTRY_POINTS: readonly EntryPoint[] = [
   // it. The refusals are file-level, so nothing here opens a database first.
   { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "selectSqliteAuthority", kind: "read", sites: 2, guards: ["classifyStateFormat", "readAuthorityMarkerId"] },
   { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "loadRawState", kind: "read", sites: 0, guards: ["selectSqliteAuthority", "openAuthorityStore"] },
-  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "loadState", kind: "read", sites: 0, guards: ["selectSqliteAuthority", "openAuthorityStore", "markResetLineageProvenance"] },
+  { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "loadState", kind: "read", sites: 0, guards: ["selectSqliteAuthority", "recoverStandingResetJournal", "openAuthorityStore", "markResetLineageProvenance"] },
   { file: "src/cli/state-plane/locks.ts", symbol: "inspectInventory", kind: "read", sites: 1, guards: ["classifyStateFormat"] },
   { file: "src/cli/state-plane/migration/admission.ts", symbol: "barrierWitness", kind: "read", sites: 1, guards: ["verifyLastWriterWitness"] },
   // The migration classifier's sole reader of the document. It must handle the
