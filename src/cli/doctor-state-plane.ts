@@ -17,7 +17,12 @@
  * reaches back into orchestration or rendering.
  */
 import path from "node:path";
-import { loadRawState, syncStreamId, type WorkspaceConfig } from "./config.js";
+import { syncStreamId, type WorkspaceConfig } from "./config.js";
+// Deliberately the JSON reader, not the selecting whole-state seam: this check
+// and its triage copy speak the legacy document's vocabulary, so on `Q` it must
+// keep saying "written by a newer rbox" rather than reporting the store. Design
+// 163 §C4 owns making doctor authority-aware; it is not this adapter's lane.
+import { loadRawLegacyJsonState } from "./state-plane/adapters/legacy-json-store.js";
 import { ResetCorruptionError } from "./reset-io.js";
 import { inspectStateReserve, StateFormatTooNewError } from "./state-plane/index.js";
 import type { DoctorCheck } from "./doctor-cmd.js";
@@ -27,7 +32,7 @@ import type { MigrationHalt, MigrationHaltCode } from "./state-plane/migration/h
 export async function checkState(root: string, cfg: WorkspaceConfig): Promise<DoctorCheck> {
   const file = path.join(root, ".rbox", "state.json");
   try {
-    const parsed = await loadRawState(root);
+    const parsed = await loadRawLegacyJsonState(root);
     if (!parsed) return { ok: true, label: "state", message: "no sync state yet" };
     const expected = syncStreamId(cfg);
     if (parsed.stream !== undefined && parsed.stream !== expected) {

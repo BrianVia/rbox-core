@@ -21,6 +21,7 @@ export {
   loadRawStateFromStore,
   materializeManifestFromStore,
 } from "./adapters/read-only.js";
+export { applySavePacketToStore } from "./adapters/sqlite-state-save.js";
 export { publishStateBackup, type StateBackupOptions, type StateBackupResult } from "./backup/publish.js";
 export { beginGeneration, collectUnreferencedEntryValues, type GenerationBuilder } from "./store/generations.js";
 export {

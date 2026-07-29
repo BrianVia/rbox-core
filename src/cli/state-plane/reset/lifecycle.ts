@@ -1,5 +1,4 @@
 import crypto from "node:crypto";
-import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import {
@@ -11,10 +10,7 @@ import {
   ownedStateStoreWriterForReset,
   stateStoreDatabase,
 } from "../store-facade.js";
-import {
-  AUTHORITY_MARKER_BYTES,
-  isAuthorityMarkerBytes,
-} from "../authority-marker.js";
+import { readAuthorityMarkerId } from "../authority-marker.js";
 import { fsyncDirectory } from "../../../engine/fsutil.js";
 import {
   fsyncDbAndParent,
@@ -22,8 +18,6 @@ import {
   requireDbArtifactS0,
   sqliteResetPaths,
 } from "./artifacts.js";
-
-const AUTHORITY_BYTES = /^RBOX-SQLITE-AUTHORITY-v1\n([0-9a-f]{32})\n$/;
 
 export interface SqliteResetLineage {
   stream: string;
@@ -40,25 +34,9 @@ export interface PreparedResetDbSeed {
 }
 
 export async function readSqliteAuthorityId(root: string): Promise<string> {
-  const marker = sqliteResetPaths.authorityMarker(root);
-  const handle = await fs.open(marker, constants.O_RDONLY | constants.O_NOFOLLOW);
-  let bytes: Buffer;
-  try {
-    const stat = await handle.stat();
-    if (!stat.isFile() || stat.size !== AUTHORITY_MARKER_BYTES) {
-      throw new Error("SQLite reset requires the exact authority marker");
-    }
-    bytes = Buffer.alloc(AUTHORITY_MARKER_BYTES);
-    const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
-    if (bytesRead !== bytes.length || !isAuthorityMarkerBytes(bytes)) {
-      throw new Error("SQLite reset requires the exact authority marker");
-    }
-  } finally {
-    await handle.close();
-  }
-  const match = AUTHORITY_BYTES.exec(bytes.toString("latin1"));
-  if (!match) throw new Error("SQLite reset requires the exact authority marker");
-  return match[1]!;
+  const authorityId = await readAuthorityMarkerId(sqliteResetPaths.authorityMarker(root));
+  if (authorityId === undefined) throw new Error("SQLite reset requires the exact authority marker");
+  return authorityId;
 }
 
 export async function quiesceActiveDbForReset(root: string): Promise<SqliteResetLineage> {

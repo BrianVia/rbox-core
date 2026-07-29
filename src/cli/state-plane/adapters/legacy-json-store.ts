@@ -8,16 +8,10 @@ import { assertProtocolLockHeld } from "../../../engine/git/protocol-locks.js";
 import { sanitizeGitSectionForPersistence } from "../../../engine/git/config-sync.js";
 import { composeRepoBase } from "../../sync-git/base-composer.js";
 import { requireRepoBaseProof } from "../../sync-git/base-proof-selection.js";
-import {
-  acquireWorkspaceSyncMutex,
-  assertSyncMutex,
-  releaseWorkspaceSyncMutex,
-  workspaceSyncMutexDegraded,
-  type WorkspaceSyncMutex,
-} from "../../sync-mutex.js";
+import type { WorkspaceSyncMutex } from "../../sync-mutex.js";
 import { BINDING_ID_RE } from "../../telemetry/contract.js";
-import { readResetJournal, recoverResetJournal } from "../../reset-journal.js";
 import { boundedJsonRead } from "../../reset-io.js";
+import { markResetLineageProvenance, recoverStandingResetJournal } from "../reset-lineage.js";
 import {
   afterStatePublication,
   assertStatePublishable,
@@ -48,37 +42,11 @@ function isENOENT(e: unknown): boolean {
 const EMPTY_MANIFEST: Manifest = { generatedAt: "", files: [] };
 
 const freshState = (stream: string): SyncState => ({ stream, lastSyncedSequence: 0, lastSyncedManifest: EMPTY_MANIFEST });
-const streamMismatchFreshStates = new WeakSet<SyncState>();
-export const stateWasStreamMismatch = (state: SyncState): boolean => streamMismatchFreshStates.has(state);
 export { StreamMismatchError };
-
-/**
- * Read-path provenance is deliberately tolerant of unrelated legacy-directory
- * entries. Reset operations use the strict namespace inventory; ordinary
- * loadState has always ignored names it does not understand.
- */
-async function hasResetLineageArchive(root: string): Promise<boolean> {
-  const archiveRoot = path.join(root, RBOX_DIR, "state", "lineages");
-  const lineages = await fs.readdir(archiveRoot, { withFileTypes: true }).catch((error) => {
-    if (isENOENT(error)) return [];
-    throw error;
-  });
-  for (const lineage of lineages) {
-    if (!lineage.isDirectory() || !/^[0-9a-f]{32}$/.test(lineage.name)) continue;
-    const archives = await fs.readdir(path.join(archiveRoot, lineage.name), { withFileTypes: true }).catch((error) => {
-      if (isENOENT(error)) return [];
-      throw error;
-    });
-    if (archives.some((entry) =>
-      entry.isFile() && /^[0-9a-f]{64}\.(?:json|db)$/.test(entry.name)
-    )) return true;
-  }
-  return false;
-}
 
 /** Raw state load for the transactional writer. Unlike loadState, this never
  * hides a stream mismatch by manufacturing a fresh baseline. */
-export async function loadRawState(root: string): Promise<SyncState | undefined> {
+export async function loadRawLegacyJsonState(root: string): Promise<SyncState | undefined> {
   await assertStateReadable(statePath(root));
   const state = await boundedJsonRead<SyncState>(statePath(root));
   if (state) return stripObsoleteResolutionIntents(state);
@@ -110,7 +78,7 @@ export function stateLockBusyDetail(result: Exclude<Awaited<ReturnType<typeof ac
 
 /** Apply one generation-CAS packet under `<state>.lock`. Rejection is whole-packet:
  * no global or per-repo member lands unless every precondition succeeds. */
-export async function applyStateSavePacket(root: string, packet: StateSavePacket, options: StateSaveOptions = {}): Promise<StateSaveResult> {
+export async function applyLegacyJsonSavePacket(root: string, packet: StateSavePacket, options: StateSaveOptions = {}): Promise<StateSaveResult> {
   await fs.mkdir(path.join(root, RBOX_DIR), { recursive: true });
   let lock: OwnedLock;
   let releaseLock = false;
@@ -129,7 +97,7 @@ export async function applyStateSavePacket(root: string, packet: StateSavePacket
     releaseLock = true;
   }
   try {
-    const raw = await loadRawState(root);
+    const raw = await loadRawLegacyJsonState(root);
     const loaded = raw ?? freshState(packet.expectedStream);
     // A pre-stream legacy state is adopted by its first transactional save, just
     // as loadState has always adopted it in memory. The legacy nonce sentinel and
@@ -249,7 +217,7 @@ export async function applyStateSavePacket(root: string, packet: StateSavePacket
  */
 export async function ensureCapableStateLineage(root: string, state: SyncState): Promise<SyncState> {
   if (/^[0-9a-f]{32}$/.test(state.stateNonce ?? "")) return state;
-  const existing = await loadRawState(root);
+  const existing = await loadRawLegacyJsonState(root);
   if (existing) return state;
   const records = repoRecordsForState(state);
   const manifestGit = state.lastSyncedManifest.gitRepos;
@@ -259,7 +227,7 @@ export async function ensureCapableStateLineage(root: string, state: SyncState):
     || Object.keys(state.gitReposRemoved ?? {}).length !== 0) {
     throw new Error("refusing to manufacture a capable lineage over non-genesis sync state");
   }
-  const result = await applyStateSavePacket(root, {
+  const result = await applyLegacyJsonSavePacket(root, {
     expectedStream: state.stream ?? "",
     expectedNonce: "legacy",
     sourceGlobalSeq: 0,
@@ -267,7 +235,7 @@ export async function ensureCapableStateLineage(root: string, state: SyncState):
   });
   if (result.status === "accepted") return result.state;
   if (result.status === "rejected" && (result.reason === "nonce" || result.reason === "repo-generation")) {
-    const raced = await loadRawState(root);
+    const raced = await loadRawLegacyJsonState(root);
     if (raced && raced.stream === state.stream && /^[0-9a-f]{32}$/.test(raced.stateNonce ?? "")) return raced;
   }
   throw new Error(`capable state-lineage initialization failed (${result.status}${"reason" in result ? `:${result.reason}` : ""})`);
@@ -286,47 +254,26 @@ export async function ensureCapableStateLineage(root: string, state: SyncState):
  * legacy state file with no stamp is adopted as-is (it predates the stamp; every
  * save since writes one).
  */
-export async function loadState(
+export async function loadLegacyJsonState(
   root: string,
   stream: string,
   warningSink: (line: string) => void = console.error,
   heldMutex?: WorkspaceSyncMutex,
 ): Promise<SyncState> {
-  if (await readResetJournal(root)) {
-    let recoveryMutex = heldMutex;
-    let releaseRecoveryMutex = false;
-    if (!recoveryMutex) {
-      recoveryMutex = await acquireWorkspaceSyncMutex(root, "cli");
-      releaseRecoveryMutex = true;
-    }
-    assertSyncMutex(recoveryMutex, root);
-    if (workspaceSyncMutexDegraded(recoveryMutex)) throw new Error("reset journal recovery requires a non-degraded workspace fence");
-    try {
-      await recoverResetJournal(root, stream);
-    } finally {
-      if (releaseRecoveryMutex) await releaseWorkspaceSyncMutex(recoveryMutex);
-    }
-  }
+  await recoverStandingResetJournal(root, stream, heldMutex);
   const fresh = freshState(stream);
   const activePresent = await fs.lstat(statePath(root)).then(() => true, (error) => {
     if (isENOENT(error)) return false;
     throw error;
   });
-  const loaded = await loadRawState(root);
+  const loaded = await loadRawLegacyJsonState(root);
   if (!loaded) return fresh;
   const state = loaded;
   if (state.stream === undefined) return { ...state, stream }; // pre-stamp legacy: adopt
   if (state.stream !== stream) {
     throw new StreamMismatchError(root, stream, state.stream, activePresent ? "state" : "incarnation-marker");
   }
-  // reset-v1's hash-addressed old-lineage archive is durable evidence that a
-  // seq-0 state came from rebind/freshening rather than true genesis. Re-mark
-  // every load so daemon preflight and direct pushManifest callers cannot lose
-  // the provenance merely by reloading the atomically installed next state.
-  if (state.lastSyncedSequence === 0 && await hasResetLineageArchive(root)) {
-    streamMismatchFreshStates.add(state);
-  }
-  return state;
+  return markResetLineageProvenance(root, state);
 }
 
 function stateContainsGitPersistence(state: SyncState): boolean {
@@ -393,7 +340,7 @@ async function writeWholeStateUnsafe(root: string, state: SyncState): Promise<vo
 }
 
 /** Fresh, non-Git initialization only. Git BASE and every repository sidecar are
- * generation-CAS state and must be persisted with applyStateSavePacket(). */
+ * generation-CAS state and must be persisted with applyLegacyJsonSavePacket(). */
 export async function saveState(root: string, state: SyncState): Promise<void> {
   if (stateContainsGitPersistence(state)) {
     throw new Error("saveState refuses Git BASE or repository records; use the transactional state composer");
@@ -417,7 +364,7 @@ export async function ensureTelemetryBindingId(
   const acquired = await acquireLock(stateLockPath(root));
   if (acquired.status !== "acquired") throw new Error(`sync state telemetry lock unavailable (${stateLockBusyDetail(acquired)})`);
   try {
-    const raw = await loadRawState(root);
+    const raw = await loadRawLegacyJsonState(root);
     if (!raw) throw new Error("sync state is absent; refusing to manufacture a telemetry binding baseline");
     if (raw.stream !== undefined && raw.stream !== stream) {
       throw new Error(`sync state belongs to stream ${raw.stream}, not ${stream}; refusing to overwrite it`);
