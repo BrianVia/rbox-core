@@ -465,3 +465,27 @@ behind-origin count; loudly warn when behind.
   failing with bare exit-1 and no output. Cost ~20 minutes of misdiagnosis. Fix
   hint: anything staging workspace-sized data should default to `/var/tmp`
   (disk-backed) and never `os.tmpdir()` on this host.
+
+- **A test that pins a defect as "fixture territory" makes it unfindable
+  (2026-07-30, M4 tuple fix):** wave 5A's `authority-behavior.test.ts` header
+  documented "this harness's empty legacy state halts `verification` at M4" and
+  its driver test asserted `kind: "halted", durableHalt: true` as the expected
+  outcome. No corpus could ever have passed — M4 compared a JCS-round-tripped
+  tuple against a SELECT-order one with `JSON.stringify` — so the test was
+  encoding a total failure of the machine as a property of the fixture. Fixing
+  the defect turned 5 of that file's 18 tests red, which is the only reason the
+  premise was ever re-examined. Fix hint: when a test's comment explains WHY the
+  system refuses rather than asserting that it works, treat the explanation as an
+  unverified claim. A "the fixture is too small" excuse for a fail-closed gate is
+  cheap to falsify — build the fixture, or drive the real thing.
+
+- **Every migration test built its control in memory, so no test ever saw the
+  record's own bytes (2026-07-30):** `import-json.test.ts` says outright
+  "Nothing here encodes unless the test is about the bytes", and every M4 fixture
+  therefore handed `proveStaging` an object whose key order matched
+  `readCompletionTuple`'s. The one thing that differs on a real resume — the
+  control has been through `encodeMigrationControl`/`decodeMigrationControl` —
+  was the thing no fixture exercised. Fix hint: for any phase body that reads a
+  witness off a durable record, at least one test must feed it a control that
+  round-tripped through the real codec. In-memory fixtures cannot see key order,
+  number spelling, or anything else canonicalization normalizes.
