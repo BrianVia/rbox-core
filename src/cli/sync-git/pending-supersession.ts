@@ -8,12 +8,11 @@ import {
   indexIdentityV2,
   isGitBusy,
   validateGitSection,
-  type BlobStore,
   type GitSection,
   type JournalRecoveryResult,
 } from "../../engine/index.js";
 import { canonicalString } from "../../engine/e2ee/index.js";
-import { getGitArtifact, git, headBranchOf, type RepoCtx } from "../../engine/git/shared.js";
+import { getGitArtifact, git, headBranchOf, type GitArtifactReadStore, type RepoCtx } from "../../engine/git/shared.js";
 import { graphEnv } from "../../engine/git/reachability.js";
 import { validateCanonicalGitConfig } from "../../engine/git/config-sync.js";
 import { gitFingerprint, gitFingerprintRun } from "./fingerprint.js";
@@ -148,7 +147,7 @@ function exactCanonicalConfig(a: GitSection["config"], b: GitSection["config"]):
 async function pendingIndexIsCleanAndPlain(
   ctx: RepoCtx,
   section: GitSection,
-  store: BlobStore,
+  store: GitArtifactReadStore,
   kek: Buffer,
 ): Promise<boolean> {
   const artifact = indexArtifact(section, { strict: true });
@@ -194,7 +193,7 @@ export async function provePendingSupersession(input: {
   ctx: RepoCtx;
   pending: GitSection;
   candidate: GitSection;
-  store: BlobStore;
+  store: GitArtifactReadStore;
   kek: Buffer;
   base?: GitSection;
   absentBranchProofs?: Readonly<Record<string, { priorOid: string }>>;

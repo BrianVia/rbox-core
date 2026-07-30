@@ -7,14 +7,13 @@ import {
   readRepoIdentityV1,
   repositoryIdentityHash,
   type AppliedManifestOracle,
-  type BlobStore,
   type GitSection,
   type RepoCtx,
 } from "../../engine/index.js";
 import { canonicalString } from "../../engine/e2ee/index.js";
 import { enumerateRefReflogOids } from "../../engine/git/keep-pins.js";
 import { readAllRefs, readOpState } from "../../engine/git/refs.js";
-import { exists, getGitArtifact, git } from "../../engine/git/shared.js";
+import { exists, getGitArtifact, git, type GitArtifactReadStore } from "../../engine/git/shared.js";
 import { hashFile } from "../../engine/hash.js";
 import {
   expectedStateNonce,
@@ -139,7 +138,7 @@ async function equalOrDescendant(repoDir: string, pendingOid: string, candidateO
   }
 }
 
-async function pendingIndexProjection(ctx: RepoCtx, pending: GitSection, store: BlobStore, kek: Buffer): Promise<
+async function pendingIndexProjection(ctx: RepoCtx, pending: GitSection, store: GitArtifactReadStore, kek: Buffer): Promise<
   | { kind: "absent" }
   | { kind: "projected"; value: string; oids: string[] }
   | { kind: "indeterminate" }
@@ -166,7 +165,7 @@ async function pendingIndexProjection(ctx: RepoCtx, pending: GitSection, store: 
   }
 }
 
-async function pendingOpStateOids(ctx: RepoCtx, pending: GitSection, store: BlobStore, kek: Buffer): Promise<string[] | undefined> {
+async function pendingOpStateOids(ctx: RepoCtx, pending: GitSection, store: GitArtifactReadStore, kek: Buffer): Promise<string[] | undefined> {
   const entries = Object.entries(pending.opState ?? {});
   if (entries.length === 0) return [];
   const tmpDir = await fs.mkdtemp(path.join(ctx.gitDir, ".rbox-resolution-opstate-"));
@@ -250,7 +249,7 @@ export async function preliminaryResolutionReport(args: {
   ctx: RepoCtx;
   pending: GitSection;
   binding: GitResolutionBinding;
-  store: BlobStore;
+  store: GitArtifactReadStore;
   kek: Buffer;
 }): Promise<ResolutionDiscardReport> {
   const pendingIndex = await pendingIndexProjection(args.ctx, args.pending, args.store, args.kek);
@@ -290,7 +289,7 @@ export async function finalResolutionReport(args: {
   ctx: RepoCtx;
   pending: GitSection;
   candidate: GitSection;
-  store: BlobStore;
+  store: GitArtifactReadStore;
   kek: Buffer;
 }): Promise<ResolutionDiscardReport> {
   const [pendingIndex, candidateIndex, opStateOids] = await Promise.all([

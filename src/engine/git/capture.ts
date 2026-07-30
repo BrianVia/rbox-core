@@ -3,7 +3,7 @@ import path from "node:path";
 import type { BlobStore, ByteProgressCallback } from "../blobstore.js";
 import { validateGitSection } from "../manifest-validate.js";
 import type { GitArtifactRef, GitSection } from "../types.js";
-import { clearIndexResolveUndo, exists, git, gitOk, headBranchOf, listWorktrees, putGitArtifact, readHead, type RepoCtx, repoCtx } from "./shared.js";
+import { clearIndexResolveUndo, encryptGitArtifact, exists, git, gitOk, headBranchOf, listWorktrees, putGitArtifact, readHead, type PendingGitUpload, type RepoCtx, repoCtx } from "./shared.js";
 import { hasInProgressOpState, readAllRefsStrict, readOpStateSnapshot, readScopedRefs } from "./refs.js";
 import { type ScratchPins, WIP_NS, collectPinShas, createScratchPins, deleteScratchPins, pruneStaleScratchRefs } from "./pins.js";
 import { indexTreeOfPath } from "./identity.js";
@@ -67,6 +67,15 @@ export function decideDirBundleAllArgs(
   return { ok: true, args: ["--all"] };
 }
 
+/** Design 226: the caller-owned sink that defers this capture's uploads. */
+export interface GitCaptureUploadCollector {
+  /** Directory the ciphertext is retained in. Outlives the capture, so it must NOT be
+   *  the capture's own temp dir; mint it with `makeGitCaptureDir`. */
+  retainDir: string;
+  /** Pending uploads, appended in capture order. */
+  pending: PendingGitUpload[];
+}
+
 export interface GitCaptureOptions {
   /** Workspace root whose `.rbox/gitcap/` owns capture scratch. Defaults to `repoDir`
    *  for direct engine callers; sync-git passes the actual workspace root. */
@@ -84,6 +93,13 @@ export interface GitCaptureOptions {
   /** Cumulative ciphertext bytes uploaded during this capture. Engine-local:
    *  callers decide how to surface it. */
   onBytes?: ByteProgressCallback;
+  /** Design 226: when supplied, this capture ENCRYPTS its artifacts into
+   *  `uploads.retainDir` and appends the pending uploads to `uploads.pending`
+   *  INSTEAD of uploading them — the caller owns both the upload and the
+   *  reclamation of the retained ciphertext. Absent (the default, and every
+   *  caller but the push planner) the artifacts are uploaded inline exactly as
+   *  before, so a caller that reads them straight back out of `store` still can. */
+  uploads?: GitCaptureUploadCollector;
   /** Synchronous keep-mine hardening: pin the recorded snapshot and prove the
    * live repository still equals it before returning a publish candidate. */
   resolution?: boolean;
@@ -171,7 +187,12 @@ export async function sweepStaleGitCaptureDirs(workspaceRoot: string, now = Date
   );
 }
 
-async function makeGitCaptureDir(workspaceRoot: string): Promise<string> {
+/** Mint a capture-owned scratch dir under `<workspaceRoot>/.rbox/gitcap/`. The
+ *  mkdtemp-then-rename is load-bearing: the staging name `.rbox-gitcap-*` deliberately
+ *  misses the sweep's `rbox-gitcap-` prefix, so the window before `owner.pid` exists is
+ *  invisible to the concurrent crash reaper. Exported for design 226's plan-lifetime
+ *  artifact retention dir, which needs exactly these properties — never reimplement it. */
+export async function makeGitCaptureDir(workspaceRoot: string): Promise<string> {
   const scratch = gitCaptureScratchRoot(workspaceRoot);
   await fs.mkdir(scratch, { recursive: true, mode: 0o700 });
   await fs.chmod(scratch, 0o700).catch(() => {});
@@ -329,13 +350,24 @@ export async function captureGitState(repoDir: string, store: BlobStore, kek: Bu
         },
       };
     };
-    const bundle = await putGitArtifact(store, kek, bundlePath, tmpDir, uploadOpts());
+    //    Design 226: with an upload collector the CIPHERTEXT is retained for the caller
+    //    to flush after it has decided the section's fate; without one (every caller but
+    //    the push planner) it is uploaded inline, right here, as it always was.
+    const collector = opts.uploads;
+    const artifact = async (srcPath: string): Promise<GitArtifactRef> => {
+      const artifactOpts = uploadOpts();
+      if (!collector) return putGitArtifact(store, kek, srcPath, tmpDir, artifactOpts);
+      const { ref, pending } = await encryptGitArtifact(kek, srcPath, collector.retainDir, artifactOpts);
+      collector.pending.push(pending);
+      return ref;
+    };
+    const bundle = await artifact(bundlePath);
 
     let index: GitArtifactRef | undefined;
-    if (stagedIndex) index = await putGitArtifact(store, kek, stagedIndex, tmpDir, uploadOpts());
+    if (stagedIndex) index = await artifact(stagedIndex);
     const opState: Record<string, GitArtifactRef> = {};
     for (const { rel, staged } of stagedOp) {
-      opState[rel] = await putGitArtifact(store, kek, staged, tmpDir, uploadOpts());
+      opState[rel] = await artifact(staged);
     }
 
     const section: GitSection = {
