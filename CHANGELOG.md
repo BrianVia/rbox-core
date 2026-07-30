@@ -6,6 +6,17 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.11.3] - 2026-07-30
+
+### Fixed
+- **Resolving a paused Git repository now says which computer keeps what.**
+  The `keep-mine` / `take-theirs` explanations used to talk about "yours" and
+  "theirs" — confusing when every machine involved is yours. Every sentence now
+  names the machines: "keep this computer's version (Your-Hostname) and publish
+  it to your other computers" versus "use the version from your other computer
+  and set aside this computer's Git changes." The command names are unchanged.
+  Your hostname stays out of `--json` output and shareable reports.
+
 ## [1.11.2] - 2026-07-30
 
 ### Fixed

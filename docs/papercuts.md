@@ -373,3 +373,4 @@ behind-origin count; loudly warn when behind.
   release blocker. Fix hint: label each merged source section
   ("--- from daemon.log (legacy, last written <date>)") or drop legacy-file
   tails once dated logs exist.
+- 2026-07-30: interactive `rm -rf` cleanup (13 dirs, one at a time) aggregated into one 46k mass-delete halt; surfaced only in admin/CLI, founder discovered it an hour later. Friction: intentional local deletions need a visible propagate-or-not surface, not a silent halt.
