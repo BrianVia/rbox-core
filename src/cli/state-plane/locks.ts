@@ -24,9 +24,10 @@ import {
   type WorkspaceSyncMutex,
 } from "../sync-mutex.js";
 import { loadConfigIfPresent, syncStreamId } from "../workspace-config.js";
-import { loadRawLegacyJsonState } from "./adapters/legacy-json-store.js";
-import { classifyStateFormat } from "./authority-marker.js";
-import { StateFormatTooNewError } from "./errors.js";
+import { loadRawState } from "./adapters/whole-state-compat.js";
+import { classifyStateFormat, type StateFormat } from "./authority-marker.js";
+import { blocksSqliteWrites } from "./migration/control-codec.js";
+import { readCanonicalControl } from "./migration/control-publication.js";
 import { stateLockPath, statePath } from "./paths.js";
 
 declare const heldStatePlaneLocks: unique symbol;
@@ -115,22 +116,59 @@ const inventoryFingerprint = (inventory: Inventory): string => JSON.stringify([
 ]);
 
 /**
+ * Is the authority marker live AND the state-plane write fence up?
+ *
+ * This is the one window where reading the store is not free. The `M5 + Q` row
+ * requires the database to be **at rest** — M4 checkpoints and closes before M5
+ * is published — and the classifier reads a live `-wal`/`-shm` there as
+ * corruption. An inventory read that opened the store would create exactly those
+ * sidecars, so a legitimate crash between M5's rename and M6's publication would
+ * classify as a never-retryable `StateAuthorityCorruptError` instead of resuming.
+ * The re-entry fix introduced that window; this closes it.
+ *
+ * Naming no repositories is not a weaker fence here, it is the correct one: the
+ * fence is up precisely because nothing but the migration may act, and M5→M6
+ * touches no repository. Both readers are file-level and SQLite-free by
+ * construction — that is why `assertAuthorityWritable` is built out of them —
+ * so deciding this cannot itself deposit what it exists to avoid.
+ */
+function fencedUnderMarker(format: StateFormat, root: string): boolean {
+  if (format !== "authority-marker") return false;
+  try {
+    const control = readCanonicalControl(root);
+    return control !== undefined && blocksSqliteWrites(control);
+  } catch {
+    // An unreadable control is the classifier's verdict to make, not this
+    // function's. Fall through to the ordinary read.
+    return false;
+  }
+}
+
+/**
  * Read-only inventory of everything the fence must cover: the repositories the
  * current state names, plus any standing reset transaction's own repositories.
  * Derived before the fence and re-derived under it — a change between the two
  * restarts the acquisition rather than proceeding on a stale request set.
  */
 async function inspectInventory(root: string): Promise<Inventory> {
-  // Post-`Q` the repository records live in SQLite, so this legacy inventory
-  // cannot see them and the fence it derived would be incomplete. Refuse rather
-  // than lock less than the caller believes is locked. Design 222 §3.2's
-  // post-`Q` doctor retry needs the SQLite-backed inventory first.
-  if (await classifyStateFormat(statePath(root)) === "authority-marker") {
-    throw new StateFormatTooNewError(statePath(root));
-  }
+  // The whole-state SELECTOR, not the JSON reader (wave 5B).
+  //
+  // Post-`Q` the repository records live in SQLite. Reading them through the
+  // legacy document derived a fence that covered nothing, so this refused
+  // outright with `StateFormatTooNewError` — which made every lock bundle
+  // unobtainable on a workspace that had just been migrated, and therefore made
+  // `rbox migrate` unable to report success on its own work and
+  // `--retry-state-migration` unreachable on the two post-`Q` halts that exist
+  // precisely to be retried (222 §3.2's annotated debt).
+  //
+  // The selector answers both formats with one signature, so the fence covers
+  // the same repositories either way and there is no second inventory to keep in
+  // step.
   const config = await loadConfigIfPresent(root).catch(() => undefined);
   const stream = config ? syncStreamId(config) : undefined;
-  const state = await loadRawLegacyJsonState(root);
+  const state = fencedUnderMarker(await classifyStateFormat(statePath(root)), root)
+    ? undefined
+    : await loadRawState(root);
   const requests = new Map<string, RepositoryRequest>();
   for (const [relPath, record] of Object.entries(state ? repoRecordsForState(state) : {}).sort(([a], [b]) => a < b ? -1 : 1)) {
     const repoDir = relPath === "." ? root : path.join(root, ...relPath.split("/"));

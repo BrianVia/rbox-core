@@ -462,8 +462,27 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
       });
       break;
     }
+    case "migrate": {
+      // Entry point B of design 222 §3.2. Workspace-scoped like every other local
+      // verb, and refused outside a workspace rather than silently resolved to the
+      // machine-wide surface: there is no machine-wide meaning for converting one
+      // workspace's records.
+      const root = await findRoot(positional[0] ? path.resolve(positional[0]) : process.cwd());
+      if (!root) {
+        throw new Error("Not inside an rbox workspace. Run from the workspace, or pass the workspace path: rbox migrate <path>.");
+      }
+      const { migrateCmd } = await import("./state-plane-cmd.js");
+      const code = await migrateCmd(root, { json: jsonMode });
+      if (code !== 0) process.exitCode = code;
+      break;
+    }
     case "doctor": {
       const report = flags.report === "true";
+      const retryStateMigration = flags["retry-state-migration"] === "true";
+      const abortStateMigration = flags["abort-state-migration"] === "true";
+      if (retryStateMigration && abortStateMigration) {
+        throw new Error("choose one: --retry-state-migration resumes a paused conversion, --abort-state-migration abandons it");
+      }
       const diagnostics = flags.diagnostics === "true";
       const residueBytes = flags["residue-bytes"] === "true";
       if (diagnostics && !report) throw new Error("--diagnostics uploads the support report — combine it with --report: rbox doctor --report --diagnostics");
@@ -500,6 +519,19 @@ await withWorkspaceSyncMutex(root, async (syncMutex) => {
         break;
       }
       if (flags.quarantine === "true" || flags.restore !== undefined) throw new Error("--quarantine/--restore require `rbox doctor reset-journal`");
+      // The two authorized interventions on a suspended conversion (222 §7.3,
+      // §7.9). They MUTATE, so each is the whole command rather than an extra
+      // section under the read-only triage.
+      if (retryStateMigration || abortStateMigration) {
+        if (report || diagnostics || residueBytes) {
+          throw new Error("--retry-state-migration/--abort-state-migration act on the workspace; run `rbox doctor --report` separately");
+        }
+        const { abortStateMigrationCmd, retryStateMigrationCmd } = await import("./state-plane-cmd.js");
+        const act = retryStateMigration ? retryStateMigrationCmd : abortStateMigrationCmd;
+        const code = await act(root, { json: jsonMode });
+        if (code !== 0) process.exitCode = code;
+        break;
+      }
       const { doctorCmd } = await import("./doctor-cmd.js");
       await doctorCmd(root, { report, yes: flags.yes === "true", diagnostics, residueBytes, json: jsonMode, now: deps.now?.().getTime() });
       break;

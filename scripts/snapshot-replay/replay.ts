@@ -1,11 +1,10 @@
 /**
  * The replay child: drive the real 2.0 authority machine against the COPY.
  *
- * It mirrors what an entry site does — `withStatePlaneLocks` around
- * `establishStateAuthority` with `runMigration` injected and a progress sink
- * bound — so the harness exercises the shipped coordinator rather than a
- * hand-rolled phase sequence. Wave 5B has not landed an entry site yet, so this
- * is the first caller of that composition against real data.
+ * Since wave 5B it drives the REAL entry point: `migrateCmd`, exactly as
+ * `rbox migrate` does, capturing the lines a user would have read. It used to
+ * mirror the composition an entry site would perform; mirroring is what lets a
+ * harness pass while the shipped command is broken, and the command now exists.
  *
  * Isolation is the parent's job (env + strace), but this child refuses to run
  * at all unless `HOME`/`RBOX_HOME` and the workspace root are inside the
@@ -19,13 +18,12 @@ import type { SyncState } from "../../src/cli/sync-state-model.js";
 import { normalizeLegacyStateV1 } from "../../src/cli/state-plane/digest/legacy-state-plan.js";
 import { legacyStateSemanticDigest, stateSemanticDigest } from "../../src/cli/state-plane/digest/state-semantic-v1.js";
 import { classifyStateFormat } from "../../src/cli/state-plane/authority-marker.js";
-import { establishStateAuthority } from "../../src/cli/state-plane/authority-bootstrap.js";
+import { migrateCmd } from "../../src/cli/state-plane-cmd.js";
 import { withStatePlaneLocks, type HeldStatePlaneLocks } from "../../src/cli/state-plane/locks.js";
 import { sqliteResetPaths, statePath } from "../../src/cli/state-plane/paths.js";
 import { classifyMigrationState } from "../../src/cli/state-plane/migration/classifier.js";
 import { readCanonicalControl } from "../../src/cli/state-plane/migration/control-publication.js";
 import { readCompletionTuple } from "../../src/cli/state-plane/migration/import-install.js";
-import { runMigration, type MigrationProgress } from "../../src/cli/state-plane/migration/authority.js";
 import { openStateStore, stateStoreDatabase } from "../../src/cli/state-plane/store/open.js";
 import { sandboxLayout } from "./layout.js";
 
@@ -45,22 +43,24 @@ for (const [name, value] of [["HOME", process.env.HOME], ["RBOX_HOME", process.e
 if (!inside(layout.ws)) throw new Error("refusing to replay: the workspace root is outside the sandbox");
 
 const root = layout.ws;
-const progress: MigrationProgress[] = [];
 const startedAt = Date.now();
 
-const held = await withStatePlaneLocks(root, async (locks) =>
-  establishStateAuthority(root, { entry: "foreground-migrate", locks }, (r, entry) =>
-    runMigration(r, entry, (event) => progress.push(event))));
-
-const authority = held.held ? held.value : { domain: "locks-refused" as const, outcome: held.refusal };
+/** Everything the command printed, in order, plus its exit code — which is the
+ * whole contract a script or the rig has with it. */
+const migrateLines: string[] = [];
+const exitCode = await migrateCmd(root, { log: (line) => migrateLines.push(line) });
 const elapsedMs = Date.now() - startedAt;
 
+/** The same command again on the workspace it just converted. Before wave 5B
+ * this threw `StateFormatTooNewError` out of the lock bundle's inventory, so
+ * `rbox migrate` could not report success on its own work. */
+const secondLines: string[] = [];
+const secondExitCode = await migrateCmd(root, { log: (line) => secondLines.push(line) });
+
 /**
- * Post-Q re-entry, observed rather than assumed. `inspectInventory` refuses a
- * workspace whose `state.json` is an authority marker (design 222 §3.2's
- * SQLite-backed inventory is future work), so a second lock bundle is expected
- * to be unavailable after a successful migration — which is also why the
- * classifier below is called with a compile-time-only lock witness.
+ * Post-Q re-entry, observed rather than assumed. Wave 5B routed the inventory
+ * through the selecting whole-state seam, so a second bundle is now expected to
+ * be HELD after a successful migration. This probe is what says whether it is.
  */
 async function probeReentry(): Promise<string> {
   try {
@@ -226,9 +226,12 @@ if (format !== "authority-marker") {
 }
 const report = {
   root,
-  authority,
+  entryPoint: "rbox migrate (migrateCmd)",
+  exitCode,
+  migrateLines,
+  secondExitCode,
+  secondLines,
   elapsedMs,
-  progress,
   reentry,
   verdicts,
   fidelityError: fidelityError ?? null,
@@ -237,6 +240,9 @@ const report = {
    * evidence rather than only its code. */
   control: control ? { phase: control.witness.phase, revision: control.controlRevision, halt: control.halt } : null,
   fidelity: fidelityError === undefined && verdicts.every((v) => v.ok) ? "pass" : "fail",
+  /** The 5B acceptance condition: the real command converted the workspace AND
+   * reported cleanly when run again on the result. */
+  entryPointVerdict: exitCode === 0 && secondExitCode === 0 && reentry === "held" ? "pass" : "fail",
 };
 fs.writeFileSync(path.join(layout.probe, "replay.json"), `${JSON.stringify(report, null, 2)}\n`);
 console.log(JSON.stringify(report));

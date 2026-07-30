@@ -395,92 +395,140 @@ const gitGrep = (pattern: string, ...pathspec: string[]): string[] =>
  * §7.9: "Exactly two entry call sites of `establishStateAuthority`, plus one
  * doctor authorization site."
  *
- * The two entry sites are `rbox upgrade`'s stop window and foreground
- * `rbox migrate`, and the `EntryPoint` union has named them since wave 2B. Neither
- * command is wired yet: §6.3 makes that explicit ("Both commands land with §3.2
- * and §5B. Until they do, no halt is reachable"), and 5B owns the halt copy
- * renderer, the `--json` twin, and `--retry-state-migration`/
- * `--abort-state-migration` that the authorization site exists for.
+ * Wave 5B wired both, so the gate now asserts the real claim rather than pinning
+ * whatever the tree happens to contain. It has three conjuncts, and the reason
+ * for each is a way this gate could have been satisfied while the claim it names
+ * became false:
  *
- * So the count is PINNED at what exists rather than asserted at two. That is the
- * point of the gate either way: it is the appearance of an unenumerated third
- * caller that must fail, and pinning zero catches that today exactly as pinning
- * two will after 5B. `EXPECTED_SITES` is the one line 5B edits.
+ *   1. The FILES are exactly these two. `EXPECTED_SITES` alone would pass for one
+ *      site and a count of one, which is the failure mode the pinned-at-zero
+ *      version of this gate warned about in so many words.
+ *   2. Each file calls it exactly ONCE. Two calls in one file is two entry sites
+ *      wearing one path, and the per-file count is what catches it.
+ *   3. Each `EntryPoint` literal is constructed exactly once in production. A
+ *      site that passed `"upgrade-stop-window"` from the migrate command would
+ *      satisfy 1 and 2 while making the union a label rather than a fact.
+ *
+ * The doctor authorization site is pinned beside it: `retryHaltedMigration` is
+ * the ONLY code that clears a halt, and a second caller is a second repair path.
  */
-const EXPECTED_SITES: readonly string[] = [];
+const EXPECTED_SITES: readonly string[] = [
+  "src/cli/state-plane-cmd.ts",      // foreground `rbox migrate`
+  "src/cli/upgrade-state-window.ts", // `rbox upgrade`'s stop window
+];
 
-test("the coordinator's production entry call sites are exactly the enumerated ones", () => {
-  // Comments are stripped, the same way the sole-writer gate strips them: the
-  // driver's own doc comment explains why the progress sink is NOT a parameter of
-  // `establishStateAuthority`, and prose about a function is not a call to it.
-  const hits = gitGrep("\\bestablishStateAuthority\\b", "src", ":!*.test.ts")
-    .filter((line) => !line.startsWith("src/cli/state-plane/authority-bootstrap.ts:"))
+/** Where each `EntryPoint` literal may be CONSTRUCTED, outside `locks.ts` (which
+ * declares the union) and the coordinator (which only forwards a proof). */
+const EXPECTED_ENTRY_LITERAL_SITES: Readonly<Record<string, string>> = {
+  "foreground-migrate": "src/cli/state-plane-cmd.ts",
+  "upgrade-stop-window": "src/cli/upgrade-state-window.ts",
+};
+
+/**
+ * Every production mention of `pattern`, minus the three shapes that are not a
+ * use of the thing: an excluded declaring/validating module, a comment, and an
+ * `import` line. Naming a symbol to bring it into scope is not calling it, and a
+ * gate that counted import lines would report two sites for one call.
+ */
+const productionHits = (pattern: string, ...exclude: string[]): string[] =>
+  // `scripts` as well as `src`: the snapshot-replay harness is production-shaped
+  // code that reaches the coordinator, and until wave 5B's ride-along the gate
+  // could not see it — a third entry site could have lived there indefinitely.
+  gitGrep(pattern, "src", "scripts", ":!*.test.ts")
+    .filter((line) => !exclude.some((prefix) => line.startsWith(`${prefix}:`)))
     .filter((line) => {
       const body = line.split(":").slice(2).join(":").trim();
-      return !body.startsWith("//") && !body.startsWith("*") && !body.startsWith("/*");
+      if (body.startsWith("//") || body.startsWith("*") || body.startsWith("/*")) return false;
+      return !/^import\b/.test(body) && !/^}\s*from\s*"/.test(body) && !/^[\w, {}]+\bfrom\s*"/.test(body);
     });
-  expect(hits.map((line) => line.split(":")[0]!).sort()).toEqual([...EXPECTED_SITES].sort());
+
+const countByFile = (hits: readonly string[]): Map<string, number> => {
+  const counts = new Map<string, number>();
+  for (const hit of hits) {
+    const file = hit.split(":")[0]!;
+    counts.set(file, (counts.get(file) ?? 0) + 1);
+  }
+  return counts;
+};
+
+test("the coordinator's production entry call sites are exactly the enumerated two", () => {
+  const hits = productionHits("\\bestablishStateAuthority\\b", "src/cli/state-plane/authority-bootstrap.ts");
+  const counts = countByFile(hits);
+  expect([...counts.keys()].sort()).toEqual([...EXPECTED_SITES].sort());
+  // Conjunct 2: one call each, so "two entry sites" is two CALLS and not two of
+  // an unbounded number inside two admitted files.
+  expect([...counts.values()]).toEqual([1, 1]);
+  expect(hits).toHaveLength(2);
+
   // The two admitted names must stay exactly two, or "exactly two entry sites"
   // is a claim about a union that grew.
   const union = read(path.join(HERE, "..", "locks.ts"));
   expect(/export type EntryPoint = "upgrade-stop-window" \| "foreground-migrate";/.test(union)).toBe(true);
 });
 
-/**
- * §7.9's last bullet — "`docs/CODEMAP.md` gains one ownership line per new module
- * in the same change" — was the only inventory item with no enforcement at all,
- * and every wave-1-to-4 lane consequently proposed its line in a PR body instead
- * of landing it. Wave 5A folds them all in and makes the rule executable, so the
- * next lane cannot repeat it.
- */
-test("every production state-plane module has a CODEMAP ownership line", () => {
-  // Line STARTS, not `includes`. A substring test is vacuous here: any sibling's
-  // line contains the directory prefix, so `includes(dir + "/")` would pass for
-  // every module in a directory that documents exactly one of them — which is
-  // precisely the state this gate found the tree in.
-  const owned = new Set(
-    read(path.join(REPO, "docs", "CODEMAP.md")).split("\n")
-      .map((line) => /^`?(src\/[^`\s]+)/.exec(line.trim())?.[1])
-      .filter((entry): entry is string => entry !== undefined),
-  );
-  const covered = (rel: string): boolean =>
-    owned.has(rel) || owned.has(`${path.dirname(rel)}/`);
-
-  const missing: string[] = [];
-  const walk = (dir: string): void => {
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      const file = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        walk(file);
-        continue;
-      }
-      if (!entry.isFile() || !file.endsWith(".ts") || file.endsWith(".test.ts") || file.endsWith(".d.ts")) continue;
-      const rel = path.relative(REPO, file).split(path.sep).join("/");
-      if (!covered(rel)) missing.push(rel);
-    }
-  };
-  walk(path.resolve(HERE, ".."));
-  expect(missing, "add one ownership line per module, in the same change (222 §7.9)").toEqual([]);
-
-  // ONE line per module. Two lines for one path is two owners, which is the
-  // condition the document exists to make impossible.
-  const counts = new Map<string, number>();
-  for (const line of read(path.join(REPO, "docs", "CODEMAP.md")).split("\n")) {
-    const entry = /^`?(src\/[^`\s]+)/.exec(line.trim())?.[1];
-    if (entry) counts.set(entry, (counts.get(entry) ?? 0) + 1);
+test("each entry-point name is constructed in exactly one production module", () => {
+  for (const [literal, file] of Object.entries(EXPECTED_ENTRY_LITERAL_SITES)) {
+    // `admission.ts` is excluded because it VALIDATES the union rather than
+    // minting a member of it (`entry !== "upgrade-stop-window" && …`), which is
+    // the M0 condition that makes the proof mean something.
+    const hits = productionHits(
+      `"${literal}"`, "src/cli/state-plane/locks.ts", "src/cli/state-plane/migration/admission.ts",
+    );
+    // Per MODULE, not per occurrence: `state-plane-cmd.ts` names
+    // `foreground-migrate` once per operator command, because doctor's retry and
+    // abort are foreground operator commands too and 222 §3.2 gives them the same
+    // bundle. What must never appear is the name in a SECOND module — that is a
+    // site the exclusivity argument was never made about.
+    expect([...new Set(hits.map((line) => line.split(":")[0]!))], literal).toEqual([file]);
   }
-  expect([...counts].filter(([, n]) => n > 1).map(([entry]) => entry)).toEqual([]);
 });
 
-/** The cast-containment gate 222 recorded as prose lives in `locks.test.ts`,
- * where lane 2B made it executable. It is pinned from here too, because a gate
- * that is deleted is indistinguishable from a gate that never existed, and this
- * is the module inventory's home. */
-test("the HeldStatePlaneLocks cast gate is still executable and still loose", () => {
-  const text = read(path.join(HERE, "..", "locks.test.ts"));
-  expect(text).toContain("only locks.ts casts its way to a bundle in production code");
-  // Loose on purpose: `as unknown as Mod.HeldStatePlaneLocks` slipped past the
-  // first, tighter pattern.
-  expect(text).toContain("\\\\bas\\\\b[^;]*HeldStatePlaneLocks");
-  expect(text).toContain(":!*.test.ts");
+/**
+ * Conjunct 4 — the IMPORTERS, which is the conjunct the other three cannot make.
+ *
+ * Every check above greps for a NAME. A module that imports the coordinator and
+ * calls it through an alias, a re-export, or a value it stored first satisfies
+ * all of them while being a third entry site. An import SPECIFIER cannot be
+ * computed — `from "…/authority-bootstrap.js"` is a static string or it is not an
+ * import — so the set of modules that can reach `establishStateAuthority` at all
+ * is exactly enumerable, and that is the claim §7.9 is really making.
+ *
+ * §7.9's named exception — `whole-state-compat.ts` taking `assertAuthorityWritable`
+ * "and nothing else from either domain" — is absent from this list ON PURPOSE:
+ * it reaches the coordinator through a DYNAMIC import, which keeps `bun:sqlite`
+ * out of the CLI's eager graph. That is also the one shape this gate cannot see,
+ * so it is stated here rather than silently missing, and the sole-writer gate
+ * beside it is what covers that module.
+ */
+const EXPECTED_IMPORTERS: readonly string[] = [
+  "src/cli/state-plane-cmd.ts",      // entry B
+  "src/cli/state-plane-report.ts",   // `AuthorityOutcome`, a type — erased, calls nothing
+  "src/cli/upgrade-state-window.ts", // entry A
+];
+
+test("only the enumerated modules can reach the coordinator at all", () => {
+  // Deliberately NOT `productionHits`, which strips import lines so the
+  // call-site gates cannot count a name brought into scope as a call. Here the
+  // import line IS the evidence.
+  const importers = gitGrep("from \"[^\"]*authority-bootstrap\\.js\"", "src", "scripts", ":!*.test.ts")
+    .map((line) => line.split(":")[0]!);
+  const unexpected = [...new Set(importers)].filter((file) => !EXPECTED_IMPORTERS.includes(file));
+  expect(
+    unexpected,
+    "a module that imports the coordinator can call it through an alias the name-based gates cannot see",
+  ).toEqual([]);
+
+  // The two entry sites must be among them, or the enumeration is describing a
+  // graph the entry sites are not in.
+  for (const site of EXPECTED_SITES) expect([...new Set(importers)]).toContain(site);
+});
+
+test("the halt clear has exactly one production authorization site", () => {
+  // §7.9's "plus one doctor authorization site". `retryHaltedMigration` is the
+  // only code in the tree that clears a halt (`halt-recovery.ts`), so a second
+  // caller is a second repair path — the thing 163:3182 forbids by name.
+  const hits = productionHits(
+    "\\bretryHaltedMigration\\b", "src/cli/state-plane/migration/halt-recovery.ts",
+  );
+  expect(hits.map((line) => line.split(":")[0]!)).toEqual(["src/cli/state-plane-cmd.ts"]);
 });

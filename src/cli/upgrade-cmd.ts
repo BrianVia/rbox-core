@@ -140,26 +140,75 @@ export async function restartDaemonsAfterUpgrade(
       if (ambient.kind === "ok" && ambient.status.daemonVersion === RBOX_VERSION) continue;
     }
     attempted++;
-    try {
-      await stop(root);
-      if (row.desired.state === "stopped") {
-        log(`daemon ${key}: stopped (desired state is stopped)`);
-        continue;
-      }
-      const resumeMode = row.desired.pendingModeIntent ?? (row.desired.pullOnly === true ? "pull-only" : "read-write");
-      const resumed = await resumeDesiredDaemon(row.desired, { startDaemon: start });
-      if (!resumed) {
-        log(`daemon ${key}: not restarted (desired state changed)`);
-        continue;
-      }
-      log(`daemon ${key}: restarted${resumeMode === "pull-only" ? " (pull-only)" : ""}`);
-    } catch {
-      failed = true;
-      log(`daemon ${key}: restart failed; run rbox stop && rbox start in that workspace`);
-    }
+    if (!await cycleOneDaemon({ root, key, row, stop, start, log })) failed = true;
   }
   if (failed) throw new UpgradeDaemonRestartError(attempted);
   return attempted;
+}
+
+interface DaemonCycle {
+  readonly root: string;
+  readonly key: string;
+  readonly row: DesiredStateRow;
+  readonly stop: typeof stopDaemon;
+  readonly start: typeof startDaemon;
+  readonly log: (line: string) => void;
+}
+
+/**
+ * One workspace's stop → convert → restart, with design 222 §3.2's
+ * finally-level guarantee.
+ *
+ * The gap between the stop and the restart is entry point A of the state
+ * plane: the one moment a fleet workspace is provably idle with a person
+ * waiting. Nothing the conversion does may prevent the restart, so it runs
+ * inside a `try` whose `finally` restarts unconditionally — and
+ * `migrateStateInUpgradeWindow` additionally contracts never to throw, so the
+ * `catch` here is the second of two independent guarantees rather than the only
+ * one.
+ *
+ * Returns false for exactly what it returned false for before: a stop that
+ * failed and a restart that failed. A conversion that did not happen is REPORTED
+ * and never counted — the binary was upgraded and the background sync came back,
+ * so failing the command would misreport both. §3.2's `recordWorkspaceOutcome`
+ * is a line to print, not an exit code.
+ */
+async function cycleOneDaemon({ root, key, row, stop, start, log }: DaemonCycle): Promise<boolean> {
+  try {
+    await stop(root);
+  } catch {
+    log(`daemon ${key}: restart failed; run rbox stop && rbox start in that workspace`);
+    return false;
+  }
+  if (row.desired.state === "stopped") {
+    log(`daemon ${key}: stopped (desired state is stopped)`);
+    return true;
+  }
+  try {
+    const { migrateStateInUpgradeWindow } = await import("./upgrade-state-window.js");
+    for (const line of (await migrateStateInUpgradeWindow(root, key)).lines) log(line);
+  } catch (error) {
+    // The catch is total, which is what makes the restart below unconditional
+    // without a `finally`: no conversion outcome — verdict, refusal, or defect —
+    // can reach past this line, so nothing can skip the restart (§3.2).
+    log(`daemon ${key}: rbox could not convert this workspace's sync records (${error instanceof Error ? error.message : String(error)}); run rbox migrate in that workspace`);
+  }
+  return await restartDesiredDaemon({ root, key, row, stop, start, log });
+}
+
+async function restartDesiredDaemon({ key, row, start, log }: DaemonCycle): Promise<boolean> {
+  try {
+    const resumeMode = row.desired.pendingModeIntent ?? (row.desired.pullOnly === true ? "pull-only" : "read-write");
+    if (!await resumeDesiredDaemon(row.desired, { startDaemon: start })) {
+      log(`daemon ${key}: not restarted (desired state changed)`);
+      return true;
+    }
+    log(`daemon ${key}: restarted${resumeMode === "pull-only" ? " (pull-only)" : ""}`);
+    return true;
+  } catch {
+    log(`daemon ${key}: restart failed; run rbox stop && rbox start in that workspace`);
+    return false;
+  }
 }
 
 export async function restartStaleDaemonsIfAny(deps: UpgradeDaemonDeps = {}): Promise<void> {

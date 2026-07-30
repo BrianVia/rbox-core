@@ -187,13 +187,23 @@ const reportFile = path.join(outRoot, `report-${stamp}.json`);
 fs.writeFileSync(reportFile, `${JSON.stringify(results, null, 2)}\n`);
 
 for (const result of results) {
-  const replay = result.replay as { ok?: boolean; report?: { authority?: { outcome?: { kind?: string } }; fidelity?: string } } | undefined;
+  const replay = result.replay as {
+    ok?: boolean;
+    report?: {
+      exitCode?: number; secondExitCode?: number; migrateLines?: string[];
+      fidelity?: string; entryPointVerdict?: string;
+    };
+  } | undefined;
   const audit = (result.isolation as { replay?: AuditResult }).replay;
   console.log([
     `workspace ${String(result.workspace)}`,
     `  sandbox   ${String(result.sandbox)}`,
-    `  outcome   ${replay?.report?.authority?.outcome?.kind ?? (replay?.ok === false ? "child-failed" : "not-run")}`,
+    // The command's own verdict, in its own words — the harness drives
+    // `rbox migrate`, so the line a user would have read IS the outcome.
+    `  outcome   ${replay?.report?.migrateLines?.at(-2) ?? (replay?.ok === false ? "child-failed" : "not-run")}`,
+    `  exit      ${replay?.report?.exitCode ?? "n/a"} (re-run on the result: ${replay?.report?.secondExitCode ?? "n/a"})`,
     `  fidelity  ${replay?.report?.fidelity ?? "n/a"}`,
+    `  entry     ${replay?.report?.entryPointVerdict ?? "n/a"}`,
     `  isolation ${audit ? (audit.clean ? "clean" : "VIOLATIONS") : "unaudited"}`,
   ].join("\n"));
 }

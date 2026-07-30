@@ -1648,6 +1648,34 @@ try {
 **Entry B — foreground `rbox migrate`.** Refuses inside a daemon process, same
 bundle, same coordinator, progress rendering, `--json` twin the rig drives.
 
+**LANDED in wave 5B, with three amendments the implementation forced.**
+
+1. **Entry A lives in its own module** (`upgrade-state-window.ts`) rather than
+   inside `upgrade-cmd.ts`, which is already past the module-size law. The
+   §7.9 gate names it as one of the exactly-two, and it contracts *never to
+   throw* — the `finally` restart is then the second of two independent
+   guarantees rather than the only one.
+2. **A conversion that did not happen never fails `rbox upgrade`.** §3.2's
+   pseudocode says `recordWorkspaceOutcome(error)`; that is a line to print, not
+   an exit code. `UpgradeDaemonRestartError` keeps meaning exactly what it meant
+   — a stop or a restart failed. The window is also SILENT on every refusal: a
+   refusal published nothing and `.rbox` is byte-identical, and an upgrade that
+   printed a paragraph per not-yet-eligible workspace would bury the restart
+   lines that are the command's answer.
+3. **The post-`Q` inventory debt is CLOSED, here, not deferred.** The note below
+   used to say the SQLite-backed inventory was future work. It was not
+   separable: `inspectInventory` raised `StateFormatTooNewError` on an authority
+   marker, so **no lock bundle was obtainable on a migrated workspace at all** —
+   `rbox migrate` could not report success on its own work, and the two post-`Q`
+   halts (`durability-indeterminate`, `cleanup-deferred`) were unreachable by
+   the `--retry-state-migration` that exists for them. The fix is one line of
+   derivation rather than a second inventory: the read goes through the
+   **selecting whole-state seam** (`loadRawState`), which answers both formats
+   with one signature, so the fence covers the same repositories either way.
+   This is the ordinary post-`Q` read every other caller already performs; it is
+   not the byte-identical-refusal path, where opening the authority would itself
+   be the violation.
+
 ### 3.3 Proving the window
 
 M0 admits only when both hold: the caller presents an `EntryProof` whose mutex is
@@ -1800,6 +1828,45 @@ Both commands above land with §3.2 (`rbox migrate`) and §5B
 (`rbox doctor --retry-state-migration`). Until they do, no halt is reachable;
 5B is the gate for "every command is real and non-interactively twinned".
 
+**LANDED in wave 5B.** The tables moved to `state-plane-copy.ts` (the
+`satisfies` clauses, and therefore the merge gate, are unchanged) and
+`state-plane-report.ts` decides which one an outcome reaches. Five rows of the
+table above are AMENDED, each because the shipped wording was false rather than
+merely improvable:
+
+| Row | What was wrong | Amendment |
+|---|---|---|
+| `reserved-path` | "rbox found an unexpected file" is **factually inverted** for 163's authority-matrix row 17 (`absent`/`absent`/`absent` — no file at all), and for every corruption verdict `authority.ts`, `classifier.ts`, and `retirement.ts` raise through this code. It is the taxonomy's catch-all, not a statement about an occupant | "the files it keeps this workspace's sync records in weren't the ones it expected", which is true for every producer. Its `command` also stops being `rbox doctor` — the surface printing the message — and becomes an action |
+| `source-oversize` | `measured()` rendered it **backwards**: the record's `required` is the document's own size and `available` is the 512 MiB ceiling, so the generic "N available against M required" printed the cap as what was available | Its own line: "This workspace's state file is X; the most rbox can convert is Y" |
+| every `measured()` row | `?? "unknown"` leaked the literal word into user text where a number belongs | A row with no numbers renders **no measurement line at all**. Pinned by a test over every message |
+| `memory-admission` | §6.3 owed the exact `RBOX_RESET_PARSE_BUDGET_BYTES` value | Rendered from the live budget, beside the two measured figures |
+| `verification`, and the `underlyingCode` tokens generally | `verification` covers seven distinct refusals in `prove-staging.ts` and printed one sentence for all of them | `UNDERLYING_TOKEN_COPY` renders each stable token (`completion-tuple`, `semantic-digest`, `integrity-check`, …) in plain English. An errno reads as one; an unrecognised value is quoted rather than dropped |
+
+Two further 5B corrections outside the table:
+
+- **`nothing-to-abort`** (5A's outcome member) has its own message. Rendering it
+  as `already-migrated` told a user on a pristine workspace that their records
+  had been converted.
+- **The halted-retirement detail** in `retirement.ts` said "resumes only through
+  doctor", which reached the user as `rbox doctor` — a command that prints the
+  halt again and changes nothing. It now names
+  `rbox doctor --retry-state-migration`, which 163:3461 makes the only thing that
+  clears a halt.
+- **`source-unreadable`** is a NEW message, not a new halt code. 163's
+  "malformed JSON / unreadable legacy path" row halts before any database open,
+  and it escaped the operator commands as a raw `ResetCorruptionError` naming a
+  JSON parser. It is rendered as a refusal with a next step.
+
+**§6.4's `format-too-new` story is corrected (163 §C4).** `classifyStateFormat`
+returns `authority-marker` only for the marker THIS binary writes — a future one
+is `foreign` — so a healthy migrated workspace was reaching doctor's
+"written by a newer version of rbox / run `rbox upgrade`" copy, telling a user to
+upgrade a binary that is already the newest one there is. The `state` check now
+reads through the selecting seam: a migrated workspace is reported healthy, and a
+marker with no records behind it gets §6.4's re-adoption procedure spelled out
+under a new `authority-corrupt` status. The 2C review flagged this as blocking
+before any 2.0 tag; it lands here.
+
 ### 6.4 Not halts, never offered a retry
 
 `StateAuthorityCorruptError` — "This workspace says it uses the new format, but
@@ -1940,7 +2007,14 @@ dated and re-checked before the 2.0 tag.
   `whole-state-compat.ts` imports `assertAuthorityWritable` from the coordinator
   and nothing else from either domain.
 - Exactly two entry call sites of `establishStateAuthority`, plus one doctor
-  authorization site.
+  authorization site. **Executable and asserted at TWO since wave 5B**, with
+  three conjuncts rather than one, because a list of admitted files alone would
+  have passed for a single site and a count of one: the files are exactly
+  `state-plane-cmd.ts` and `upgrade-state-window.ts`; each calls it **once**; and
+  each `EntryPoint` literal is CONSTRUCTED in exactly one production module, so
+  the union stays a fact rather than a label. The doctor authorization site is
+  pinned the same way — `retryHaltedMigration` has exactly one production
+  caller, because a second one is a second repair path.
 - **`as`-casts to `HeldStatePlaneLocks` occur only in `locks.ts`** (production
   `src/**`; test files are the enumerated exception, since adversarial
   construction is what they are for). The bundle is the proof object every

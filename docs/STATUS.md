@@ -125,6 +125,70 @@ linuxbrew 26.5.0, which cannot load its own gcc libs (`GCC_13.0.0`,
 `GLIBCXX_3.4.31/32` missing). `/home/via/n/bin/node` v24.18.0 works. Blocks
 `bun run typecheck` and will bite wrangler and `apps/web`'s `npm ci`._
 
+_SESSION 2026-07-30: **U3 WAVE 5B IS OPEN — `rbox migrate` EXISTS AND THE
+MACHINE IS DRIVABLE BY A HUMAN.** Branch `u3/u3-5b-operator` off `origin/2.0`
+(`c19189c8`). Three commands landed on 222 §3.2/§7.3: foreground `rbox migrate`,
+`rbox doctor --retry-state-migration`, `rbox doctor --abort-state-migration`,
+plus doctor's own read-only `migration` check. The §7.9 "exactly two entry call
+sites" gate now ASSERTS TWO (`state-plane-cmd.ts`, `upgrade-state-window.ts`)
+with three conjuncts — file set, one call per file, one construction site per
+`EntryPoint` literal — because the file-list-only form it replaced would have
+passed for one site with the list edited in the same commit._
+
+_**THE ACCEPTANCE RUN: `rbox migrate` CONVERTED THIS HOST'S REAL 81 MB
+WORKSPACE THROUGH THE SHIPPED COMMAND.** `scripts/snapshot-replay` now drives
+`migrateCmd` rather than mirroring what an entry site would do. On a sandboxed
+copy of `/home/via/Development` (81,122,599 bytes, 145,913 entries, 101 repos):
+exit 0, 8 phases, 38 s; all 11 fidelity verdicts pass (integrity_check,
+foreign_key_check, source sha256, semantic digest store↔legacy and
+store↔completion, entry/repo counts, source bytes, store authority id); strace
+isolation clean. **A SECOND `rbox migrate` on the result exits 0 with "already
+in rbox's new format"** — which is the re-entry debt closed, see below._
+
+_**222 §3.2's ANNOTATED POST-`Q` DEBT IS CLOSED, NOT DEFERRED — it was never
+separable.** `inspectInventory` raised `StateFormatTooNewError` on an authority
+marker, so **no lock bundle was obtainable on a migrated workspace at all**:
+`rbox migrate` could not report success on its own work, and
+`durability-indeterminate`/`cleanup-deferred` — the only two halts expressible
+after the flip — were unreachable by the `--retry-state-migration` that exists
+for them. Fix is derivation, not a second inventory: the read goes through the
+selecting whole-state seam (`loadRawState`), which answers both formats with one
+signature._
+
+_**COPY DEBTS PAID (222 §6 amended with evidence).** `reserved-path`'s
+"rbox found an unexpected file" was **factually inverted** for 163's
+authority-matrix row 17 (no file at all) and for every corruption verdict routed
+through that code — it is the taxonomy's catch-all, and its `command` was
+`rbox doctor`, the surface printing the message. `measured()` rendered
+`source-oversize` **backwards** (the record's `required` is the document size and
+`available` is the 512 MiB cap) and leaked the literal word "unknown" into user
+text. `underlyingCode`'s stable tokens from #610 (`completion-tuple`,
+`semantic-digest`, `integrity-check`, …) are now rendered in plain English —
+`verification` alone covers seven distinct refusals and printed one sentence for
+all of them. `nothing-to-abort` renders distinctly instead of telling a pristine
+workspace its records were migrated. `retirement.ts`'s halted-retirement detail
+named `rbox doctor` where 163:3461 makes `--retry-state-migration` the only thing
+that clears a halt. New `source-unreadable` message: 163's malformed-JSON row was
+escaping the commands as a raw `ResetCorruptionError` naming a JSON parser._
+
+_**163 §C4's `format-too-new` DEFECT IS FIXED — the 2C review's pre-tag
+blocker.** `classifyStateFormat` returns `authority-marker` only for the marker
+THIS binary writes (a future one is `foreign`), so a healthy migrated workspace
+was reaching doctor's "written by a newer version of rbox / run `rbox upgrade`"
+copy — telling a user to upgrade the newest binary there is. Doctor's `state`
+check now reads through the selecting seam; a marker with no records behind it
+gets 222 §6.4's re-adoption procedure spelled out under a new `authority-corrupt`
+status. `docs/design/163`'s own test fixture had been encoding the wrong verdict._
+
+_**Verification:** typecheck clean; `bun test src/cli/` **3997 pass / 0 fail**;
+`src/engine/` + `scripts/` 9 fails, all pre-existing environmental (crypto
+prototype, dircache bench, corpus seeds, e2e scenario, storage-truth — the
+broken-linuxbrew-node set). **One real defect caught by the new tests and by the
+full-suite run:** a top-level `process.env.RBOX_HOME` override copied from
+`admission.test.ts` turned 56 tests red in `credentials.test.ts` /
+`auth-cmd.test.ts` while both passed in isolation — the existing in-tree copies of
+that pattern are latent versions of the same bug (papercut filed)._
+
 _SESSION 2026-07-28→29 (overnight): **U3 waves 1A/1B/1C + 2B are merged on
 `2.0`; 222's read-only-preflight premise is FALSIFIED and the ownership rule
 (#589, 163 v13) AWAITS FOUNDER RATIFICATION — it blocks lanes 3A/5B/5C; two CI

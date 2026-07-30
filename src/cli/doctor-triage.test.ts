@@ -620,20 +620,49 @@ test("malformed local state is honest that rbox cannot repair it, and never offe
   expect(finding?.safety).not.toMatch(/[^&] `rbox setup`/);
 });
 
-test("a state plane from a newer rbox is reported end to end and never advises deleting it", async () => {
+/**
+ * Rewritten by wave 5B (163 §C4).
+ *
+ * This fixture writes rbox's OWN authority marker with no database behind it, and
+ * the old code reported it as "written by a newer version of rbox — run `rbox
+ * upgrade`". That copy was wrong in both halves: `classifyStateFormat` returns
+ * `authority-marker` only for the marker THIS binary writes (a future one is
+ * `foreign`), so the workspace is not from a newer rbox, and the binary being
+ * told to upgrade is already current. The 2C review flagged it as blocking before
+ * any 2.0 tag.
+ *
+ * What the fixture actually is: 163's contradictory-authority row. 222 §6.4 gives
+ * it the one honest remedy — re-adoption, spelled out — and the never-advise-
+ * deleting property carries over unchanged.
+ */
+test("a marker with no records behind it is contradictory authority, not a too-new format", async () => {
   await fs.writeFile(path.join(root, ".rbox", "state.json"), `RBOX-SQLITE-AUTHORITY-v1\n${"a".repeat(32)}\n`);
   const ctx = await collectDoctorContext(root);
   expect(ctx.checks.state.ok).toBe(false);
-  expect(ctx.checks.state.status).toBe("format-too-new");
-  expect(ctx.checks.state.hint).not.toContain("delete it");
+  expect(ctx.checks.state.status).toBe("authority-corrupt");
+  // The one thing a doctor must never do: tell a current binary to upgrade itself.
+  expect(ctx.checks.state.hint).not.toContain("rbox upgrade");
+  expect(ctx.checks.state.hint).not.toContain("delete");
 
-  const finding = findingById(triageWorkspace(await readTriageInputs(root, ctx.checks, NOW)).findings, "state-format-too-new");
+  const finding = findingById(triageWorkspace(await readTriageInputs(root, ctx.checks, NOW)).findings, "state-authority-corrupt");
   expect(finding?.severity).toBe("blocked");
-  expect(finding?.problem).toContain("newer version of rbox");
-  expect(finding?.command).toBe("rbox upgrade");
-  // The only mention of deletion anywhere in the finding is the instruction NOT to.
-  expect(`${finding?.problem} ${finding?.safety} ${finding?.command}`.match(/delet/gi)?.length).toBe(1);
-  expect(finding?.safety).toContain("Do not delete");
+  expect(finding?.problem).toContain("missing or do not match");
+  expect(finding?.command).toContain("rbox adopt");
+  // 163: never advise deleting the marker, and never advise restoring a backup.
+  const whole = `${finding?.problem} ${finding?.safety} ${finding?.command}`;
+  expect(whole).not.toMatch(/delet/i);
+  expect(whole).not.toMatch(/restore/i);
+});
+
+/** A healthy migrated workspace is the case this must never regress into: the
+ * `state` check reports it as healthy, and no finding is produced at all. The
+ * store-backed positive is proved by the snapshot-replay harness against real
+ * data; what is pinned here is that "migrated" alone is not a fault. */
+test("a healthy legacy workspace still reports a healthy state check", async () => {
+  const ctx = await collectDoctorContext(root);
+  expect(ctx.checks.state.ok).toBe(true);
+  expect(ctx.checks.migration?.ok).toBe(true);
+  expect(ctx.checks.migration?.message).toBe("no conversion in progress");
 });
 
 test("a foreign occupant of the upgrade reserve is reported without threatening it", () => {

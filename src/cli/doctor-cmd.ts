@@ -19,7 +19,8 @@ import { pendingGenesisState } from "./genesis-enrollment.js";
 import { GENESIS_PENDING_MESSAGE } from "./genesis-durable.js";
 import type { E2eeRemote } from "./e2ee-remote.js";
 import { readLockingHealth } from "./sync-mutex.js";
-import { checkState, checkStateReserve } from "./doctor-state-plane.js";
+import { checkState, checkStateMigration, checkStateReserve } from "./doctor-state-plane.js";
+import type { TriageFinding } from "./doctor-triage.js";
 import { describeCheck, type DoctorCheckDescriptor, type DoctorCheckRunInput } from "./doctor-check.js";
 import { GIT_DEFERRAL_REASONS } from "./sync-state-model.js";
 import { fetchWithDeadline, transferTimeoutMs } from "./remote/resilient.js";
@@ -52,9 +53,21 @@ export interface DoctorCheck {
   current?: string;
   latest?: string;
   pid?: number;
+  /**
+   * A check that already speaks triage's vocabulary carries its own finding.
+   *
+   * Every other check has its `status` translated into a `TriageFinding` inside
+   * `doctor-triage.ts`. The state-plane checks cannot: their words come from
+   * `state-plane-copy.ts`, whose exhaustive `satisfies` clauses are the merge
+   * gate for U3's halt taxonomy, and re-deriving them from a status string would
+   * be a second copy of the table that could disagree with what `rbox migrate`
+   * printed about the same halt.
+   */
+  finding?: TriageFinding;
 }
 
-export type DoctorChecks = Record<CheckName, DoctorCheck> & { chain?: DoctorCheck; reserve?: DoctorCheck };
+export type DoctorChecks = Record<CheckName, DoctorCheck>
+  & { chain?: DoctorCheck; reserve?: DoctorCheck; migration?: DoctorCheck };
 
 export interface WorkspaceShape {
   fileCount: number;
@@ -687,6 +700,7 @@ const DOCTOR_CHECKS: readonly DoctorCheckDescriptor[] = [
   describeCheck("locking", ({ root }) => checkLocking(root)),
   describeCheck("git", ({ root }) => checkGitCapability(root)),
   describeCheck("reserve", ({ root, cfg }) => checkStateReserve(root, cfg)),
+  describeCheck("migration", ({ root }) => checkStateMigration(root)),
   describeCheck("chain", ({ root, loaded }) => buildAuthedRemote(root, Date.now, undefined, loaded)
     .then((built) => checkManifestChain(built.remote))
     .catch((error: unknown) => ({ ok: false, label: "manifest chain", message: error instanceof Error ? error.message : String(error) }))),
