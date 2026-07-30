@@ -145,18 +145,24 @@ export async function abortMigration(root: string, entry: EntryProof): Promise<M
   if ((SQLITE_LIVE_ROWS as readonly string[]).includes(observation.row)) {
     return corrupt(`a migration past the authority flip cannot be aborted (row ${observation.row})`);
   }
-  // No control means nothing to abort, which is the same end state an abort
-  // produces: nothing to do, zero mutation. That is exactly what
-  // `already-migrated` means on §5.3's terminal row, so it is reused rather than
-  // widening the union with a member every consumer would have to handle.
-  if (observation.row === "no-control-json") return { kind: "already-migrated" };
+  // No control means the workspace never left legacy JSON — nothing to abort, zero
+  // mutation. Reported distinctly from `already-migrated` (which means SQLite is
+  // authority) so 5B does not print "already migrated" over a pristine workspace.
+  if (observation.row === "no-control-json") return { kind: "nothing-to-abort" };
   if (observation.row === "corruption") {
     return { kind: "halted", halt: observation.halt, durableHalt: false };
   }
   if (!("receipt" in observation)) return corrupt(`row ${observation.row} carries no control to abort`);
   const control = observation.receipt.control;
   if (!control.retirement) {
-    const armed = armMigrationRetirement(root, observation.receipt, abortTrigger(control), entry.locks);
+    // `clearHalt` is what makes abort the path for "essentially every case"
+    // (163:2614): a halted pre-`Q` migration is the case the operator most wants
+    // to abandon, and `armRetirement` would otherwise refuse it. On a non-halted
+    // control it is a no-op. The arming publishes `halt: null` in the same
+    // revision, so there is no window where the record is armed-but-halted.
+    const armed = armMigrationRetirement(
+      root, observation.receipt, abortTrigger(control), entry.locks, { clearHalt: true },
+    );
     if (armed) return armed;
   }
   return await runMigration(root, entry);

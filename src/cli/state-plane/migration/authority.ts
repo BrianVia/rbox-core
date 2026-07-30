@@ -40,11 +40,15 @@ import { publishPreparedDatabase, stepQSibling } from "./finalize.js";
 import type { MigrationHalt } from "./health.js";
 import { claimStagingMain, importOwnedStaging, preserveSource } from "./import-json.js";
 import { proveStaging } from "./prove-staging.js";
-import { armRetirement, stepRetirement } from "./retirement.js";
+import { armRetirement, stepRetirement, type ArmOptions } from "./retirement.js";
 
 export type MigrationOutcome =
   | { readonly kind: "migrated"; readonly phases: readonly MigrationPhase[]; readonly elapsedMs: number }
   | { readonly kind: "already-migrated" }
+  /** Abort only: there was no migration to abort, and the workspace is unchanged
+   * on legacy JSON. Distinct from `already-migrated` (SQLite is authority) so 5B
+   * does not tell a user on a pristine workspace that their state was migrated. */
+  | { readonly kind: "nothing-to-abort" }
   | { readonly kind: "refused"; readonly refusal: AdmissionRefusal }
   /** §M-9 prints `trigger: C1Trigger`. A retirement resumed from a durable record
    * carries no trigger — the record stores the one durable `reason` both
@@ -140,7 +144,11 @@ export async function runMigration(
         : outcome;
     }
   }
-  throw new Error(`migration did not converge in ${MAX_ITERATIONS} observations`);
+  // Non-convergence is a bug, but the surface stays typed: a caller handles one
+  // union, never a mix of outcomes and thrown errors. `MAX_ITERATIONS` has wide
+  // margin over the longest legal trace, so reaching it means the classifier and
+  // a mutator disagree about whether a row advanced.
+  return { kind: "halted", halt: corruptionHalt(`migration did not converge in ${MAX_ITERATIONS} observations`), durableHalt: false };
 }
 
 /**
@@ -288,7 +296,15 @@ async function dispatch(
       return { kind: "halted", halt: observation.halt, durableHalt: true };
     case "corruption":
       return { kind: "halted", halt: observation.halt, durableHalt: false };
+    default:
+      // A new observation row is a compile error here, not a runtime `undefined`
+      // return that spins to `MAX_ITERATIONS`.
+      return assertNever(observation);
   }
+}
+
+function assertNever(value: never): never {
+  throw new Error(`unhandled observation row: ${JSON.stringify(value)}`);
 }
 
 const corrupt = (detail: string): MigrationOutcome =>
@@ -338,8 +354,9 @@ async function flip(
  * would be a second reading of what a corrupt arming means. */
 export function armMigrationRetirement(
   root: string, receipt: PhaseReceipt, trigger: C1Trigger, locks: HeldStatePlaneLocks,
+  options: ArmOptions = {},
 ): MigrationOutcome | undefined {
-  const armed = armRetirement(root, receipt, trigger, locks);
+  const armed = armRetirement(root, receipt, trigger, locks, options);
   return armed.kind === "corrupt" ? { kind: "halted", halt: armed.halt, durableHalt: false } : undefined;
 }
 

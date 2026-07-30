@@ -102,6 +102,25 @@ test("every dispatch entry names a real exported phase body", () => {
   }
 });
 
+test("dispatch is exhaustive over the observation union — a new row is a compile error", () => {
+  // The `default: return assertNever(observation)` arm is what makes a new
+  // classifier row fail `tsc` rather than fall off the end as `undefined` and spin
+  // to MAX_ITERATIONS. Pinned so the arm cannot be deleted silently.
+  const text = read(DRIVER);
+  expect(text).toContain("return assertNever(observation)");
+  expect(text).toMatch(/function assertNever\(value: never\)/);
+});
+
+test("runMigration keeps a typed surface on non-convergence instead of throwing", () => {
+  // The loop's fall-through returns a corruption halt, not a bare `throw`, so a
+  // caller handles one union.
+  const text = read(DRIVER);
+  const loopTail = text.slice(text.indexOf("for (let iteration"), text.indexOf("One iteration"));
+  expect(loopTail).toContain("did not converge");
+  expect(loopTail).toContain("corruptionHalt(");
+  expect(loopTail, "non-convergence must not throw a bare Error").not.toMatch(/throw new Error\([^)]*converge/);
+});
+
 // --- §M-6's stale-witness table, as the assertion nobody had ----------------
 
 /**
@@ -143,22 +162,40 @@ test("no body dispatched from a row where Q is live re-reads the deleted source"
  * top of the flip "for symmetry" and thereby bricks every workspace killed between
  * the rename and M6's publication — the same class of defect 4A found on this row,
  * on the one row where there is no going back to JSON.
+ *
+ * Window-scoped, not `indexOf` on a literal (rev1 M24 / 4A's blocker-2 class): the
+ * check reads the SLICE from the resume-branch entry to its return and asserts no
+ * stale-source token appears ANYWHERE inside it — including the aliasing forms
+ * (`const { source } = control`, `= control.source`) that would defeat a check
+ * that only looked for `control.source` after the return. The ultimate guard is
+ * behavioural: on `m5-artifact-ahead-q` the source document is already gone (`Q`
+ * stands at its path), so 4A's kill-matrix convergence test halts if this branch
+ * reads it at all; this static gate is the cheaper first line.
  */
-test("the flip's resume branch returns before every stale-source read", () => {
+test("the flip's resume branch reads no stale-source member", () => {
   const body = bodyOf("flipAuthority");
+  const resumeStart = body.indexOf("observed.sha256 === witness.qSibling.sha256");
   const resumeReturn = body.indexOf('return { kind: "flipped"');
-  expect(resumeReturn, "the resume branch must still be an early return").toBeGreaterThan(0);
+  expect(resumeStart, "the resume branch must still exist").toBeGreaterThan(0);
+  expect(resumeReturn, "the resume branch must still be an early return").toBeGreaterThan(resumeStart);
+  const window = body.slice(resumeStart, resumeReturn);
 
-  for (const stale of ["control.source", "witness.completion.sourceJsonSha256", "revalidateBackups("]) {
-    const at = body.indexOf(stale);
-    expect(at, `${stale} must appear in the flip at all, or this gate is vacuous`).toBeGreaterThan(0);
-    expect(at, `${stale} is stale on the resume branch and must come after its return`)
-      .toBeGreaterThan(resumeReturn);
+  // Every way the deleted source or its flip-stale companions could be read,
+  // literal and aliased. The window must contain none of them.
+  for (const stale of [
+    "control.source", ".completion", "revalidateBackups", "sameSource(", "sourceOf(",
+    "{ source }", "{source}",
+  ]) {
+    expect(window.includes(stale), `resume branch must not read ${stale}`).toBe(false);
   }
-  // And the resume branch itself reads only the member §M-6 marks "never stale".
-  const resume = body.slice(body.indexOf('observed.sha256 === witness.qSibling.sha256'), resumeReturn);
-  expect(resume).toContain("revalidateActive(");
-  expect(resume).not.toContain("control.source");
+  // And it reads the one member §M-6 marks "never stale".
+  expect(window).toContain("revalidateActive(");
+
+  // The gate is not vacuous: the pre-rename path DOES read these, so they exist in
+  // the function — they are simply after the resume return.
+  for (const stale of ["control.source", "revalidateBackups"]) {
+    expect(body.indexOf(stale), `${stale} must appear after the resume return`).toBeGreaterThan(resumeReturn);
+  }
 });
 
 /**

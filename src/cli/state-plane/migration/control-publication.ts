@@ -65,15 +65,15 @@ export type HaltResourceRole = "reserve" | "emergency";
  * sibling is the same case one phase later.
  */
 function ownedRevisionPaths(root: string): readonly string[] {
-  let canonical: MigrationControl | undefined;
-  try {
-    canonical = readCanonicalControl(root);
-  } catch {
-    // An unreadable canonical control cannot license a rewrite. Fail closed by
-    // claiming every path in the namespace is owned.
-    return [migrationPaths.control(root)];
-  }
-  const witness = canonical?.witness;
+  // An unreadable or foreign canonical control cannot license a strand rewrite,
+  // and it must NOT become the permissive branch. `readCanonicalControl` throws
+  // `MigrationControlError` on a corrupt record; that propagates as a zero-write
+  // corruption halt rather than being swallowed into a path list that can never
+  // match the caller's `controlRevision()` comparison — which would silently make
+  // the degraded state the one where any sibling may be overwritten. On a clean
+  // workspace with no control yet (M0's first publication) it returns undefined
+  // and there is nothing owned.
+  const witness = readCanonicalControl(root)?.witness;
   if (!witness) return [];
   if (witness.phase === "M7") return [witness.terminalSibling.path];
   if (witness.phase !== "M6" || !witness.futureControls) return [];

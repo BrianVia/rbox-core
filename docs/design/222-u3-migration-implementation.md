@@ -811,6 +811,48 @@ it does read both flip-stale members — so its own gate asserts source order: t
 resume branch's return precedes every stale read, and the resume branch itself
 reads only `active`, the member §M-6 marks never stale.
 
+**Round-3 fold — behavioral coverage and four blockers.** The first 5A submission's
+tests were entirely static (the sandbox's `bun test <path>` argv is heuristically
+refused; a pinned wrapper script runs it, which the first pass missed). The fold
+adds `authority-behavior.test.ts` — a real migratable workspace under a real
+`withStatePlaneLocks` bundle that drives M0→M3 organically (M4 needs an importable
+corpus, which is 3A/5C fixture territory), plus synthetic-control units — and every
+new guard is mutation-verified (15 named production mutants, all killed; baseline
+green). Four blockers the review found, all closed:
+
+- **B1** — `createEmergencyCandidate` had no strand repair, so a torn own write
+  (partial/zero-length, at this migration's own id-scoped path) wedged M1 forever
+  under exactly the `ENOSPC` this file exists to survive. It now repairs its own
+  torn write in place on the recorded inode (`rewriteEmergencyStrand`), the
+  `control-sibling.ts` shape, admitting only a strictly-shorter all-zero image.
+- **B2** — `ownedRevisionPaths`' fail-closed branch returned
+  `[migrationPaths.control(root)]`, which the caller compares against a
+  `controlRevision()` path, so it never matched: the degraded/unreadable-canonical
+  state became the *permissive* one. It now lets `readCanonicalControl`'s throw
+  propagate, so a corrupt canonical refuses the render rather than licensing a
+  sibling overwrite.
+- **B3** — `abortMigration` could not abort a *halted* pre-`Q` migration (163:2614's
+  "essentially every case"), because `armRetirement` refused on `control.halt`.
+  `armRetirement` gains an operator-only `clearHalt` that publishes `halt: null` in
+  the same revision that arms the retirement (bucket-1 discipline; no runway
+  restoration, since `haltRunway` is `[]` under a retirement and consumed resources
+  stay `consumed-for-halt`, which `retirementVector` skips). `abortMigration` passes
+  it.
+- **B4** — the post-flip data-loss fence (`SQLITE_LIVE_ROWS.includes(row)`) had zero
+  coverage; now behavioral (abort refuses/does-not-refuse by row) plus an
+  exact-members assertion.
+
+Ride-alongs taken: the flip stale-read gate is window-scoped (kills the aliasing
+evasion, rev1 M24); `dispatch` gains a `default: assertNever(observation)` so a new
+row is a compile error, not a spin; `runMigration` non-convergence returns a typed
+`corruptionHalt` rather than a bare `throw`; `abortMigration` on a pristine
+workspace returns a distinct `nothing-to-abort` (never `already-migrated`, so 5B
+cannot tell a pristine workspace it was migrated); the strand prefix branch is bound
+to the encoded id+revision, not merely "control-record-shaped"; `rewriteStrand`
+carries `O_NONBLOCK`. Noted for doctor, not blocking: a crashed M0 leaks one inert
+~1 KiB revision temp per crash (re-entry mints a fresh id), for the inert-temp
+quarantine sweep.
+
 ---
 
 ### 1.2 The two adapters

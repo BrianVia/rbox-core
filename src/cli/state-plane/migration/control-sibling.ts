@@ -208,15 +208,26 @@ export function renderControlSibling(
  *
  * - a complete record for this exact `migrationId` at this exact `revision` — a
  *   render that finished and was not renamed;
- * - a nonempty strict byte PREFIX of the record about to be written — `writeSync`
- *   fills from offset 0, so that is the only image a torn own write can leave.
+ * - a strict byte PREFIX of the record about to be written that is already long
+ *   enough to carry this migration's own encoded id and revision — `writeSync`
+ *   fills from offset 0, so a prefix is the only image a torn own write can leave.
+ *
+ * The prefix branch is bound to id+revision, not merely to "starts like a control
+ * record". Path scoping (`controlRevision(root, id, revision)`) plus
+ * `ownedRevisionPaths` running first are the primary defences, but a bare `{` or
+ * `{"authorityId":"` is a prefix of EVERY control record, so the branch also
+ * requires the torn write to have reached past both the `migrationId` and
+ * `controlRevision` fields of THIS exact record. A shorter torn image is not
+ * repaired — it is refused, and the workspace re-enters cleanly on the next M0
+ * (there is no canonical control yet at M0's revision, so a discarded strand
+ * strands nothing).
  *
  * A crafted occupant is refused exactly as before.
  */
 function isOwnStrand(next: MigrationControl, revision: number, found: Buffer, bytes: Buffer): boolean {
   if (found.byteLength > 0 && found.byteLength < bytes.byteLength
     && bytes.subarray(0, found.byteLength).equals(found)) {
-    return true;
+    return found.byteLength >= identityPrefixLength(bytes);
   }
   let decoded: MigrationControl;
   try {
@@ -227,6 +238,23 @@ function isOwnStrand(next: MigrationControl, revision: number, found: Buffer, by
   return decoded.migrationId === next.migrationId && decoded.controlRevision === revision;
 }
 
+/** The smallest prefix of the canonical record that already contains its encoded
+ * `migrationId` and `controlRevision` fields — the offset past which a torn write
+ * is recognizably THIS record and not merely control-record-shaped. Both fields
+ * are present in every canonical control (`control-codec.ts`), so both needles
+ * are found; if a codec change ever removed one, `indexOf` returns -1 and the
+ * `+ needle.length` still yields a positive bound the whole record clears, which
+ * fails closed toward requiring the complete record rather than admitting a short
+ * prefix. */
+function identityPrefixLength(bytes: Buffer): number {
+  const decoded = decodeMigrationControl(bytes);
+  const end = (needle: string): number => bytes.indexOf(Buffer.from(needle, "utf8")) + Buffer.byteLength(needle);
+  return Math.max(
+    end(JSON.stringify(decoded.migrationId)),
+    end(String(decoded.controlRevision)),
+  );
+}
+
 /**
  * Replace a strand IN PLACE, on its own inode — never unlink-and-recreate. Genesis
  * case 3 and wave 3A's M2 rebuild both established this repair for the same
@@ -234,7 +262,11 @@ function isOwnStrand(next: MigrationControl, revision: number, found: Buffer, by
  * is the one being rendered.
  */
 function rewriteStrand(file: string, bytes: Buffer, found: Inode): Inode {
-  const fd = fs.openSync(file, constants.O_WRONLY | constants.O_NOFOLLOW);
+  // O_NONBLOCK for the same reason `readExactFile` carries it: a FIFO swapped in
+  // at this path blocks `open(2)` forever, and the `isFile` check below is what
+  // refuses it. `O_NOFOLLOW` refuses a symlink; the inode bracket refuses a
+  // replaced regular file.
+  const fd = fs.openSync(file, constants.O_WRONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const observed = fs.fstatSync(fd);
     if (!observed.isFile() || Number(observed.dev) !== found.dev || Number(observed.ino) !== found.ino) {
