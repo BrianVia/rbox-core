@@ -492,7 +492,7 @@ should be: `finding` and severity translation, nothing else.
 | **Must never own** | Any halt code, any phase, any control record. It returns a discriminated result; callers map it to their own refusal channel |
 | **Interface** | `claimPath(...) → {ok: Inode} \| {occupied: Occupant} \| {errno: string}`; `rewriteRecorded(...)`; `fsyncFileAndParent`; `sameInode`; `sha256Hex`; `SQLITE_SIDECARS` |
 | **Absorbs** | 6 claim copies, 6 rewrite copies, 6 sha256 helpers, 4 sync `fsyncDirectory`, 3 `sameInode`, 5 `isOutOfSpace` sites, 8 sidecar lists |
-| **Evidence** | §3g; and three latent defects that exist *because* the copies drifted (§5) |
+| **Evidence** | §3g; and four latent defects that exist *because* the copies drifted (§5) |
 | **Validation** | Per-copy differential + the existing crash rig; the refusal channel must be a parameter, never a mode flag |
 
 **The 5A objection is answered, not overruled.** PR #607 declined to merge
@@ -582,7 +582,7 @@ Gives the `--json` twin three distinguishable `machine.id`s where it has one.
 a durable record schema and 5C owns the no-regression harness and the
 dual-binary differential that would prove the change safe.
 
-**Gate:** §8 C-1 (durable-record compat), D-1 (copy differential over every
+**Gate:** §8 C-1 (durable-record compat), DF-1 (copy differential over every
 producer), plus a new test asserting each producer class reaches its own remedy.
 
 ---
@@ -610,13 +610,13 @@ durable format and no phase body. But 5C authors doctor-surface fixtures, so the
 two lanes will collide in `doctor-state-plane.test.ts` — sequence it either
 before 5C starts or after it lands, not alongside.
 
-**Gate:** §8 D-2 (14-row × 3-surface matrix), plus an import-graph gate proving
+**Gate:** §8 DF-2 (14-row × 3-surface matrix), plus an import-graph gate proving
 the new query reaches no `bun:sqlite`, modeled on
 `authority-bootstrap.test.ts:434-450`.
 
 ---
 
-### Cycle 3 — One filesystem leaf (and the three defects it closes)
+### Cycle 3 — One filesystem leaf (and the four defects it closes)
 
 **Leverage: high, risk: low.** Six copies of one primitive, and every latent
 defect in this audit lives in the gaps between them.
@@ -645,10 +645,11 @@ and an explicit per-path decision.
 - **3a (concurrent):** sha256, `fsyncDirectory`, `sameInode`/`sameClaim`,
   `isOutOfSpace`, `SQLITE_SIDECARS`. Zero behavioral risk, purely mechanical,
   each is a byte-identical body today.
-- **3b (must wait):** the claim/rewrite leaf and D-1/D-2/D-3. These touch crash
-  semantics and the rig; 5C owns the crash-rig sweep.
+- **3b (must wait):** the claim/rewrite leaf and D-1/D-2/D-3/D-5. These touch
+  crash semantics, the rig, and the classifier's observation path; 5C owns the
+  crash-rig sweep.
 
-**Gate:** §8 D-3 + CR-1. 3b additionally needs the full crash-rig sweep, which
+**Gate:** §8 DF-3 + CR-1. 3b additionally needs the full crash-rig sweep, which
 is 5C's deliverable — which is why it waits.
 
 ---
@@ -673,7 +674,7 @@ explicit seam rather than an implicit per-body convention.
 type, which is exactly the surface 5C's F2/F3/F5/F6 fixtures and abort
 differential are written against.
 
-**Gate:** §8 D-4 (driver-level differential over all 14 rows) + CR-1.
+**Gate:** §8 DF-4 (driver-level differential over all 14 rows) + CR-1.
 
 ---
 
@@ -695,7 +696,7 @@ immediately, independent of the code change.
 change: **no**, it touches the durable witness accumulation and 5C owns the
 crash/resume matrix.
 
-**Gate:** §8 C-1 + D-5. The old and new witness must serialize identically —
+**Gate:** §8 C-1 + DF-5. The old and new witness must serialize identically —
 this is a type-level change with a one-line schema consequence, and the durable
 bytes must not move.
 
@@ -733,21 +734,21 @@ bytes must not move.
 
 ### Differential
 
-- **D-1 (Cycle 1).** For each of the ~69 `reserved-path` producers, assert the
+- **DF-1 (Cycle 1).** For each of the ~69 `reserved-path` producers, assert the
   rendered `OperatorReport` before and after. The *intent* is that ~67 of them
   change — so this gate is a reviewed change ledger, not a no-diff assertion.
-- **D-2 (Cycle 2).** 14 classifier rows × 3 surfaces (`rbox migrate`,
+- **DF-2 (Cycle 2).** 14 classifier rows × 3 surfaces (`rbox migrate`,
   `rbox doctor`, upgrade window). Every cell asserted for a consistent verdict.
   The post-flip and retirement-cursor cells are the two that fail today and are
   the regression tests for the fix.
-- **D-3 (Cycle 3).** Per-copy differential: each of the 6 claim and 6 rewrite
+- **DF-3 (Cycle 3).** Per-copy differential: each of the 6 claim and 6 rewrite
   sites, old vs new, over occupied / absent / wrong-inode / symlink / FIFO /
-  short-write / ENOSPC / EACCES / ELOOP inputs. The FIFO case is D-2's
+  short-write / ENOSPC / EACCES / ELOOP inputs. The FIFO case is defect D-2's
   regression test and must be *added*, not merely preserved.
-- **D-4 (Cycle 4).** Driver-level: every §5.2 row and every §5.3 non-phase row,
+- **DF-4 (Cycle 4).** Driver-level: every §5.2 row and every §5.3 non-phase row,
   asserting the identical `MigrationOutcome` before and after — including
   `durableHalt` on every path.
-- **D-5 (Cycle 5).** Byte-identical serialization of every witness phase before
+- **DF-5 (Cycle 5).** Byte-identical serialization of every witness phase before
   and after the type narrowing.
 
 ### Crash
