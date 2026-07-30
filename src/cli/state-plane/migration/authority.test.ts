@@ -373,8 +373,15 @@ const gitGrep = (pattern: string, ...pathspec: string[]): string[] =>
 const EXPECTED_SITES: readonly string[] = [];
 
 test("the coordinator's production entry call sites are exactly the enumerated ones", () => {
+  // Comments are stripped, the same way the sole-writer gate strips them: the
+  // driver's own doc comment explains why the progress sink is NOT a parameter of
+  // `establishStateAuthority`, and prose about a function is not a call to it.
   const hits = gitGrep("\\bestablishStateAuthority\\b", "src", ":!*.test.ts")
-    .filter((line) => !line.startsWith("src/cli/state-plane/authority-bootstrap.ts:"));
+    .filter((line) => !line.startsWith("src/cli/state-plane/authority-bootstrap.ts:"))
+    .filter((line) => {
+      const body = line.split(":").slice(2).join(":").trim();
+      return !body.startsWith("//") && !body.startsWith("*") && !body.startsWith("/*");
+    });
   expect(hits.map((line) => line.split(":")[0]!).sort()).toEqual([...EXPECTED_SITES].sort());
   // The two admitted names must stay exactly two, or "exactly two entry sites"
   // is a claim about a union that grew.
