@@ -2,7 +2,7 @@ import type { Env } from "./env.js";
 import { json } from "./util.js";
 import { dbFor } from "./db.js";
 import { reachableFromWorkspaces, workspaceSnapshot } from "./gc-roots.js";
-import { GC_BUDGET_SAFE, GC_FIXED_COST, GC_PER_EXECUTE, GC_P1_COST, INTENT_QUIESCENCE_MS, PER_WORKSPACE_ROOTS_COST, gcExecuteLimit } from "./gc-policy.js";
+import { INTENT_QUIESCENCE_MS, gcExecuteLimit, gcMaxWorkspaces } from "./gc-policy.js";
 
 interface Candidate {
   sha256: string;
@@ -13,7 +13,7 @@ interface Candidate {
 
 /** Read-only, paginated operator audit. It never acquires a lease or writes a cursor/intent. */
 export async function gcAudit(env: Env, graceMs: number, cursor: string | null, requestedLimit: number, nowMs: number = Date.now()): Promise<Response> {
-  const maxW = Math.floor((GC_BUDGET_SAFE - GC_FIXED_COST - GC_PER_EXECUTE - GC_P1_COST - 1) / PER_WORKSPACE_ROOTS_COST);
+  const maxW = gcMaxWorkspaces();
   const workspaces = await workspaceSnapshot(env, maxW);
   if (!workspaces) return json({ wouldIntent: 0, wouldDelete: 0, budgetExceeded: true, cursor: null });
   const pageMax = gcExecuteLimit(workspaces.length);

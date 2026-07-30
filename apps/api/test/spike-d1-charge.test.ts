@@ -1,6 +1,7 @@
 import { env, applyD1Migrations } from "cloudflare:test";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { commitAccounting } from "../src/commit-accounting.js";
+import { RECEIPT_TTL_MS } from "../src/receipts.js";
 
 // §23.6 D1 SPIKE — the load-bearing assumptions the whole §23 accounting rests on,
 // exercised against the real D1 binding (workerd SQLite) through `.batch()`:
@@ -163,7 +164,7 @@ describe("§23.6 spike (b): over-cap trigger aborts the WHOLE batch", () => {
 // rolling the whole commit back.
 describe("§30 large-ref multi-batch accounting (real commitAccounting)", () => {
   const refs = (n: number, size = 10, off = 0) =>
-    Array.from({ length: n }, (_, i) => ({ sha: `r${off + i}`, size }));
+    Array.from({ length: n }, (_, i) => ({ sha: `r${off + i}`, size, receiptExpiresAt: Date.now() + RECEIPT_TTL_MS }));
 
   it("charges/grants every ref across 3+ super-batches, exactly once", async () => {
     await mkAccount("acc", 10_000_000);

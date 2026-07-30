@@ -5,7 +5,7 @@ import { startOp } from "./metrics.js";
 import { GcRootsCapExceeded, MAX_UNIQUE_ROOTS, reachableFromWorkspaces, workspaceSnapshot, exactWorkspaceCount } from "./gc-roots.js";
 import { readState, writeState } from "./gc-state.js";
 import { metric, terminalObservation, writeGcObservation, type GcObservationStage, type GcObservationV1, type GcRootsSampleV1 } from "./gc-observability.js";
-import { GC_BUDGET_SAFE, GC_FIXED_COST, PER_WORKSPACE_ROOTS_COST } from "./gc-policy.js";
+import { gcMaxWorkspaces } from "./gc-policy.js";
 
 const shaOfKey = (key: string) => key.split("/").pop() ?? "";
 export const GC_INSERT_ROWS = 33;
@@ -18,7 +18,7 @@ interface MarkCursor {
 export async function gcMark(env: Env, graceMs: number, nowMs: number = Date.now()): Promise<Response> {
   const op = startOp(env, "gc.mark");
   const db = dbFor(op.env, "");
-  const maxW = Math.floor((GC_BUDGET_SAFE - GC_FIXED_COST - 3) / PER_WORKSPACE_ROOTS_COST); // workspace query + list + insert batch
+  const maxW = gcMaxWorkspaces();
   let stage: GcObservationStage = "snapshot";
   let rootsSample: GcRootsSampleV1 | null = null;
   let observation: GcObservationV1 | null = null;

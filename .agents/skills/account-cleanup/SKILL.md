@@ -39,7 +39,7 @@ automatic reaping exists — deletion is always owner-driven.**
 3. Immediate tombstone: all devices revoked, `deleted_at` stamped,
    `account_deletions` ledger row. Devices stop reporting instantly.
 4. After the 7-day grace (`DELETION_GRACE_MS`) the cron hard-purges:
-   blob_refs → orphans → Phase-2 R2 reclaim, uploads, workspace DOs, keys/
+   workspace DOs → blob_refs → orphans → Phase-2 R2 reclaim, uploads, keys/
    notifications/audit/fairuse, devices/memberships/users, the Clerk user,
    Stripe. (`apps/api/src/account-delete.ts`.)
 5. Bonus: `finishD1` also deletes `device_sync_state` + `alert_state` rows —

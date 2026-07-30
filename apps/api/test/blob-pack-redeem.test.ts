@@ -12,6 +12,7 @@ import {
 import { ACCOUNTING_INSERT_CHUNK, commitAccounting, isDeleteFenceAbort, validateCommitRefs } from "../src/commit-accounting.js";
 import { blobGet } from "../src/blobs.js";
 import { WorkspaceSync } from "../src/workspace-sync.js";
+import { RECEIPT_TTL_MS } from "../src/receipts.js";
 
 const BASE = "https://example.com";
 const RCPT = { "x-rbox-protocol": "upload-receipts-v1" };
@@ -234,6 +235,7 @@ describe("design 114 receipt placement accounting", () => {
     expect(await commitAccounting(db(), a.accountId, [{
       sha: entry.sha256,
       size: entry.length,
+      receiptExpiresAt: Date.now() + RECEIPT_TTL_MS,
       pack: { packId: packB.id, offset: entry.offset, length: entry.length, packSha256: packB.sha },
     }], Date.now())).toEqual({ ok: true });
 
@@ -286,6 +288,7 @@ describe("design 114 receipt placement accounting", () => {
     const refs = Array.from({ length: 2050 }, (_, i) => ({
       sha: hash(`json-placement-${i}`),
       size: 17 + (i % 29),
+      receiptExpiresAt: Date.now() + RECEIPT_TTL_MS,
     }));
     const firstPacks = [
       { id: nextId(), sha: hash("json-placement-pack-a") },
@@ -305,6 +308,7 @@ describe("design 114 receipt placement accounting", () => {
       return {
         sha: ref.sha,
         size: ref.size,
+        receiptExpiresAt: ref.receiptExpiresAt,
         pack: {
           packId: pack.id,
           offset: generation * 1_000_000 + index * 53 + 64,
@@ -397,6 +401,7 @@ describe("design 114 receipt placement accounting", () => {
       {
         sha: packedSha,
         size: sourceMember.length,
+        receiptExpiresAt: Date.now() + RECEIPT_TTL_MS,
         pack: {
           packId: sourcePack.id,
           offset: sourceMember.offset,
@@ -407,6 +412,7 @@ describe("design 114 receipt placement accounting", () => {
       {
         sha: canonicalSha,
         size: destinationMembers[1]!.length,
+        receiptExpiresAt: Date.now() + RECEIPT_TTL_MS,
         pack: {
           packId: destinationPack.id,
           offset: destinationMembers[1]!.offset,
@@ -420,6 +426,7 @@ describe("design 114 receipt placement accounting", () => {
       {
         sha: packedSha,
         size: destinationMembers[0]!.length,
+        receiptExpiresAt: Date.now() + RECEIPT_TTL_MS,
         pack: {
           packId: destinationPack.id,
           offset: destinationMembers[0]!.offset,
@@ -427,7 +434,7 @@ describe("design 114 receipt placement accounting", () => {
           packSha256: destinationPack.sha,
         },
       },
-      { sha: canonicalSha, size: destinationMembers[1]!.length },
+      { sha: canonicalSha, size: destinationMembers[1]!.length, receiptExpiresAt: Date.now() + RECEIPT_TTL_MS },
     ], 2_000_000_001)).toEqual({ ok: true });
 
     expect(await location(packedSha)).toEqual({
@@ -464,16 +471,16 @@ describe("design 114 receipt placement accounting", () => {
 
     // `leaving` starts as the pack's only placement, so removing it empties pack A.
     expect(await commitAccounting(db(), a.accountId, [
-      { sha: leaving, size: 10, pack: { packId: pack.id, offset: 64, length: 10, packSha256: pack.sha } },
+      { sha: leaving, size: 10, receiptExpiresAt: Date.now() + RECEIPT_TTL_MS, pack: { packId: pack.id, offset: 64, length: 10, packSha256: pack.sha } },
     ], 3_000_000_000)).toEqual({ ok: true });
     expect((await location(leaving))?.pack_id).toBe(pack.id);
 
     // ACCOUNTING_INSERT_CHUNK is 33: `leaving` plus 32 fillers fill chunk 0, so the
     // canonical delete lands a whole chunk before `arriving`'s placement insert.
     const refs = [
-      { sha: leaving, size: 10 },
-      ...Array.from({ length: ACCOUNTING_INSERT_CHUNK - 1 }, (_, i) => ({ sha: hash(`cross-chunk-filler-${i}`), size: 5 })),
-      { sha: arriving, size: 12, pack: { packId: pack.id, offset: 74, length: 12, packSha256: pack.sha } },
+      { sha: leaving, size: 10, receiptExpiresAt: Date.now() + RECEIPT_TTL_MS },
+      ...Array.from({ length: ACCOUNTING_INSERT_CHUNK - 1 }, (_, i) => ({ sha: hash(`cross-chunk-filler-${i}`), size: 5, receiptExpiresAt: Date.now() + RECEIPT_TTL_MS })),
+      { sha: arriving, size: 12, receiptExpiresAt: Date.now() + RECEIPT_TTL_MS, pack: { packId: pack.id, offset: 74, length: 12, packSha256: pack.sha } },
     ];
     expect(refs.length).toBe(ACCOUNTING_INSERT_CHUNK + 1);
     expect(await commitAccounting(db(), a.accountId, refs, 3_000_000_001)).toEqual({ ok: true });

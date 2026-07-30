@@ -2,7 +2,7 @@ import type { Env } from "./env.js";
 import { isEntitled } from "./authz.js";
 import { emit, emitBlobBatchGetSummary, startOp, type BlobBatchGetSummary, type Op } from "./metrics.js";
 import { uploadGrantsEnabled } from "./grants.js";
-import { directWriteVerified, mintFenceCheckedReceipts, ReceiptFenceError, usesReceipts } from "./blobs.js";
+import { directWriteVerified, mintFenceCheckedReceipts, preflightDeleteFence, ReceiptFenceError, usesReceipts } from "./blobs.js";
 import { blobKey, json, logErr, packKey, readBodyCapped, readBytesCapped, SHA256_HEX_RE, sha256Hex, toHex } from "./util.js";
 import { dbFor } from "./db.js";
 import { packedLocations, readPackedExtent, type PackedLocation } from "./blob-pack.js";
@@ -253,6 +253,7 @@ async function writeBatchPutRecords(op: Op, records: BatchPutRecord[], accountId
     unique.push(record);
   }
 
+  const preReadTime = await preflightDeleteFence(op.env, accountId, unique.map((record) => record.sha));
   const settled = await Promise.allSettled(unique.map((record) => putOneRecord(op, record, accountId)));
   const written: Array<{ sha: string; size: number }> = [];
   const preliminary = new Map<string, WrittenBatchPutResult>();
@@ -265,7 +266,7 @@ async function writeBatchPutRecords(op: Op, records: BatchPutRecord[], accountId
   }
   // One amortized fence point-read for the whole upload batch. If it fails or
   // finds any open intent, no receipt in this request is minted.
-  const receipts = await mintFenceCheckedReceipts(op.env, accountId, written);
+  const receipts = await mintFenceCheckedReceipts(op.env, accountId, written, preReadTime);
   const bySha = new Map<string, BatchPutResult>();
   for (const [sha, value] of preliminary) {
     bySha.set(sha, value.ok ? { ...value, ...receipts.get(sha)! } : value);

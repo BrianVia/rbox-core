@@ -5,6 +5,7 @@ import { audit, entitledSubset, isEntitled, type Principal } from "./authz.js";
 import { isOverCapAbort } from "./auth.js";
 import { dbFor } from "./db.js";
 import { fairUseQueueStatement } from "./fairuse.js";
+import { RECEIPT_TTL_MS } from "./receipts.js";
 
 /** Downgrade grace window (design 13): paid→locked preserves all version history
  *  for this long before locked-state retention resumes. */
@@ -105,6 +106,65 @@ export async function grantEntitlementWithQuota(env: Env, accountId: string, sha
   }
   // ONE post-batch accounts read is the authoritative used/cap (the cap-guard trigger, not an
   // upfront cap fetch, is the gate) — `cap` is derived locally from the same row, no second read.
+  const after = await account(env, accountId);
+  return { granted: true, used: after.used, cap: planFor(after.plan).storageBytes + after.extra };
+}
+
+/** Legacy upload publication authority: catalog + charge + grant land in one
+ * transaction only while D1's clock is inside the pre-write authority window. */
+export async function publishLegacyBlobWithQuota(
+  env: Env,
+  accountId: string,
+  sha: string,
+  size: number,
+  preReadTime: number,
+  nowMs: number = Date.now(),
+): Promise<{ granted: boolean; used: number; cap: number; reason?: "no_plan" }> {
+  const db = dbFor(env, accountId);
+  const a = await account(env, accountId);
+  const cap = planFor(a.plan).storageBytes + a.extra;
+  if (a.plan === "none") return { granted: false, used: a.used, cap, reason: "no_plan" };
+  const deadline = preReadTime + RECEIPT_TTL_MS;
+  try {
+    const results = await db.batch([
+      db
+        .prepare("SELECT CAST((julianday('now')-2440587.5)*86400000 AS INTEGER) < ? AS live")
+        .bind(deadline),
+      db
+        .prepare(`INSERT OR IGNORE INTO blobs (sha256, size_bytes, present)
+          SELECT ?, ?, 1 WHERE CAST((julianday('now')-2440587.5)*86400000 AS INTEGER) < ?`)
+        .bind(sha, size, deadline),
+      db
+        .prepare(
+          `UPDATE accounts SET used_bytes = used_bytes + (
+             CASE WHEN NOT EXISTS (SELECT 1 FROM blob_refs WHERE account_id = ? AND sha256 = ?) THEN ? ELSE 0 END)
+           WHERE id = ? AND CAST((julianday('now')-2440587.5)*86400000 AS INTEGER) < ?`,
+        )
+        .bind(accountId, sha, size, accountId, deadline),
+      db
+        .prepare(`INSERT INTO blob_refs (account_id, sha256, granted_at)
+          SELECT ?, ?, ? WHERE CAST((julianday('now')-2440587.5)*86400000 AS INTEGER) < ?
+          ON CONFLICT(account_id, sha256) DO UPDATE SET granted_at = excluded.granted_at`)
+        .bind(accountId, sha, nowMs, deadline),
+      db
+        .prepare(`DELETE FROM blob_ref_candidates WHERE account_id = ? AND sha256 = ?
+          AND CAST((julianday('now')-2440587.5)*86400000 AS INTEGER) < ?`)
+        .bind(accountId, sha, deadline),
+      db
+        .prepare(`DELETE FROM gc_candidates WHERE sha256 = ? AND deleting_at IS NULL
+          AND CAST((julianday('now')-2440587.5)*86400000 AS INTEGER) < ?`)
+        .bind(sha, deadline),
+    ]);
+    if (Number((results[0]?.results?.[0] as { live?: number } | undefined)?.live ?? 0) !== 1) {
+      throw new Error("rbox_delete_fence_deadline");
+    }
+  } catch (e) {
+    if (isOverCapAbort(e)) {
+      const latest = await account(env, accountId);
+      return { granted: false, used: latest.used, cap: planFor(latest.plan).storageBytes + latest.extra, ...(latest.plan === "none" ? { reason: "no_plan" as const } : {}) };
+    }
+    throw e;
+  }
   const after = await account(env, accountId);
   return { granted: true, used: after.used, cap: planFor(after.plan).storageBytes + after.extra };
 }

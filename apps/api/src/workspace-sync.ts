@@ -15,7 +15,7 @@ import { dbFor } from "./db.js";
 import { batchedInLookup } from "./d1-batch.js";
 import { refsetShas } from "../../../src/engine/refset.js";
 import { readManifestChain } from "../../../src/engine/manifest-chain.js";
-import { verifyReceipt } from "./receipts.js";
+import { verifyReceiptWithExpiry } from "./receipts.js";
 import {
   MAX_COMMIT_BODY,
   MAX_COMMIT_SPAN,
@@ -909,7 +909,7 @@ export class WorkspaceSync {
     const precheckStartedAt = performance.now();
     const have = await this.entitledPresent(db, entries.map(([sha]) => sha).filter((sha) => SHA_RE.test(sha)), accountId);
     const precheckMs = performance.now() - precheckStartedAt;
-    const verified: Array<{ sha: string; size: number; packId?: string }> = [];
+    const verified: Array<{ sha: string; size: number; expiresAt: number; packId?: string }> = [];
     let alreadyEntitled = 0;
     let rejected = 0;
     const verifyStartedAt = performance.now();
@@ -922,12 +922,12 @@ export class WorkspaceSync {
         alreadyEntitled++;
         continue;
       }
-      const v = await verifyReceipt(this.env, receipt, { accountId, encSha: sha, nowMs });
+      const v = await verifyReceiptWithExpiry(this.env, receipt, { accountId, encSha: sha, nowMs });
       if (!v.ok) {
         rejected++;
         continue;
       }
-      verified.push({ sha, size: v.size, ...(v.packId ? { packId: v.packId } : {}) });
+      verified.push({ sha, size: v.size, expiresAt: v.expiresAt, ...(v.packId ? { packId: v.packId } : {}) });
     }
     const { newRefs, unresolved } = await resolveVerifiedRefs(db, verified);
     rejected += unresolved.length;

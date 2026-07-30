@@ -9,7 +9,7 @@
 // AFTER this in workspace-sync (so a published head ⟹ canonical present).
 
 import type { Env } from "./env.js";
-import { verifyReceipt } from "./receipts.js";
+import { verifyReceiptWithExpiry } from "./receipts.js";
 import { isOverCapAbort } from "./auth.js";
 import { resolvePackPlacements, type PackPlacement } from "./blob-pack.js";
 
@@ -20,6 +20,7 @@ export function isDeleteFenceAbort(e: unknown): boolean {
 export interface RefWithSize {
   sha: string;
   size: number;
+  receiptExpiresAt: number;
   pack?: PackPlacement;
 }
 
@@ -74,7 +75,7 @@ export type ValidateResult =
 
 export async function resolveVerifiedRefs(
   db: D1Database,
-  verified: Array<{ sha: string; size: number; packId?: string }>,
+  verified: Array<{ sha: string; size: number; expiresAt: number; packId?: string }>,
 ): Promise<{ newRefs: RefWithSize[]; unresolved: string[] }> {
   const wanted = verified.flatMap((ref) => ref.packId ? [{ sha: ref.sha, packId: ref.packId }] : []);
   const placements = await resolvePackPlacements(db, wanted);
@@ -82,12 +83,12 @@ export async function resolveVerifiedRefs(
   const unresolved: string[] = [];
   for (const ref of verified) {
     if (!ref.packId) {
-      newRefs.push({ sha: ref.sha, size: ref.size });
+      newRefs.push({ sha: ref.sha, size: ref.size, receiptExpiresAt: ref.expiresAt });
       continue;
     }
     const pack = placements.get(ref.sha);
     if (!pack || pack.packId !== ref.packId) unresolved.push(ref.sha);
-    else newRefs.push({ sha: ref.sha, size: ref.size, pack });
+    else newRefs.push({ sha: ref.sha, size: ref.size, receiptExpiresAt: ref.expiresAt, pack });
   }
   return { newRefs, unresolved };
 }
@@ -130,7 +131,7 @@ export async function validateCommitRefs(
     for (const r of results) for (const row of r.results ?? []) have.add(row.sha256);
   }
 
-  const verified: Array<{ sha: string; size: number; packId?: string }> = [];
+  const verified: Array<{ sha: string; size: number; expiresAt: number; packId?: string }> = [];
   const needsUpload: string[] = [];
   for (const sha of shas) {
     if (have.has(sha)) continue;
@@ -139,9 +140,9 @@ export async function validateCommitRefs(
       needsUpload.push(sha);
       continue;
     }
-    const v = await verifyReceipt(env, r, { accountId, encSha: sha, nowMs });
+    const v = await verifyReceiptWithExpiry(env, r, { accountId, encSha: sha, nowMs });
     if (!v.ok) needsUpload.push(sha);
-    else verified.push({ sha, size: v.size, ...(v.packId ? { packId: v.packId } : {}) });
+    else verified.push({ sha, size: v.size, expiresAt: v.expiresAt, ...(v.packId ? { packId: v.packId } : {}) });
   }
   const { newRefs, unresolved } = await resolveVerifiedRefs(db, verified);
   needsUpload.push(...unresolved);
@@ -183,7 +184,12 @@ export async function commitAccounting(
   // batch ordering (catalog present=1 → charge NOT-EXISTS → grant → un-condemn) is unchanged,
   // so a later chunk's NOT-EXISTS still sees earlier chunks' grants (no double-charge).
   for (const superBatch of chunk(newRefs, MAX_REFS_PER_TXN)) {
-    const stmts: D1PreparedStatement[] = [];
+    const receiptDeadline = Math.min(...superBatch.map((ref) => ref.receiptExpiresAt));
+    const stmts: D1PreparedStatement[] = [
+      db
+        .prepare("SELECT CAST((julianday('now')-2440587.5)*86400000 AS INTEGER) < ? AS live")
+        .bind(receiptDeadline),
+    ];
     const canonicalDeletes: D1PreparedStatement[] = [];
     const packed = superBatch.filter((ref): ref is RefWithSize & { pack: PackPlacement } => ref.pack !== undefined);
     for (const c of chunk(superBatch, ACCOUNTING_INSERT_CHUNK)) {
@@ -193,8 +199,11 @@ export async function commitAccounting(
       // immediately — no promote, no present=0 window. Atomic with charge+grant in this batch.
       stmts.push(
         db
-          .prepare(`INSERT OR IGNORE INTO blobs(sha256, size_bytes, present) VALUES ${c.map(() => "(?,?,1)").join(",")}`)
-          .bind(...c.flatMap((r) => [r.sha, r.size])),
+          .prepare(`INSERT OR IGNORE INTO blobs(sha256, size_bytes, present)
+            SELECT j.value->>'$.sha', CAST(j.value->>'$.size' AS INTEGER), 1
+            FROM json_each(?) AS j
+            WHERE CAST((julianday('now')-2440587.5)*86400000 AS INTEGER) < ?`)
+          .bind(JSON.stringify(c.map((r) => ({ sha: r.sha, size: r.size }))), receiptDeadline),
       );
       stmts.push(
         db
@@ -203,32 +212,46 @@ export async function commitAccounting(
                SELECT COALESCE(SUM(b.size_bytes),0) FROM blobs b
                 WHERE b.sha256 IN (${inList})
                   AND NOT EXISTS (SELECT 1 FROM blob_refs r WHERE r.account_id=? AND r.sha256=b.sha256))
-             WHERE id = ?`,
+             WHERE id = ? AND CAST((julianday('now')-2440587.5)*86400000 AS INTEGER) < ?`,
           )
-          .bind(...shas, accountId, accountId),
+          .bind(...shas, accountId, accountId, receiptDeadline),
       );
       stmts.push(
         db
           .prepare(
-            `INSERT INTO blob_refs(account_id, sha256, granted_at) VALUES ${c.map(() => `(?,?,${nowMs})`).join(",")}
+            `INSERT INTO blob_refs(account_id, sha256, granted_at)
+             SELECT ?, j.value, ${nowMs}
+             FROM json_each(?) AS j
+             WHERE CAST((julianday('now')-2440587.5)*86400000 AS INTEGER) < ?
              ON CONFLICT(account_id, sha256) DO UPDATE SET granted_at = excluded.granted_at`,
           )
-          .bind(...c.flatMap((r) => [accountId, r.sha])),
+          .bind(accountId, JSON.stringify(shas), receiptDeadline),
       );
       // Un-condemn: a re-uploaded blob clears its GC candidacy (the canonical object is fresh).
-      stmts.push(db.prepare(`DELETE FROM gc_candidates WHERE deleting_at IS NULL AND sha256 IN (${inList})`).bind(...shas));
+      stmts.push(
+        db
+          .prepare(`DELETE FROM gc_candidates WHERE deleting_at IS NULL AND sha256 IN (${inList})
+            AND CAST((julianday('now')-2440587.5)*86400000 AS INTEGER) < ?`)
+          .bind(...shas, receiptDeadline),
+      );
       // §33: a (re-)grant clears this account's Phase-1 prune marker, atomically with the
       // grant — so a marked ref this commit re-establishes can NEVER be dropped by a later
       // purge (its candidate row is gone). The dedup path bumps `granted_at` here too via
       // the ON CONFLICT UPDATE above, but `granted_at` is NOT the barrier — the marker is.
-      stmts.push(db.prepare(`DELETE FROM blob_ref_candidates WHERE account_id = ? AND sha256 IN (${inList})`).bind(accountId, ...shas));
+      stmts.push(
+        db
+          .prepare(`DELETE FROM blob_ref_candidates WHERE account_id = ? AND sha256 IN (${inList})
+            AND CAST((julianday('now')-2440587.5)*86400000 AS INTEGER) < ?`)
+          .bind(accountId, ...shas, receiptDeadline),
+      );
 
       const canonical = c.filter((ref) => ref.pack === undefined).map((ref) => ref.sha);
       if (canonical.length > 0) {
         canonicalDeletes.push(
           db
-            .prepare(`DELETE FROM blob_locations WHERE sha256 IN (${canonical.map(() => "?").join(",")})`)
-            .bind(...canonical),
+            .prepare(`DELETE FROM blob_locations WHERE sha256 IN (${canonical.map(() => "?").join(",")})
+              AND CAST((julianday('now')-2440587.5)*86400000 AS INTEGER) < ?`)
+            .bind(...canonical, receiptDeadline),
         );
       }
     }
@@ -248,12 +271,12 @@ export async function commitAccounting(
                     CAST(j.value->>'$.offset' AS INTEGER), CAST(j.value->>'$.length' AS INTEGER),
                     j.value->>'$.pack_sha256', ${nowMs}
              FROM json_each(?) AS j
-             WHERE true
+             WHERE CAST((julianday('now')-2440587.5)*86400000 AS INTEGER) < ?
              ON CONFLICT(sha256) DO UPDATE SET
                pack_id=excluded.pack_id, offset=excluded.offset, length=excluded.length,
                pack_sha256=excluded.pack_sha256, installed_at=excluded.installed_at`,
           )
-          .bind(JSON.stringify(rows)),
+          .bind(JSON.stringify(rows), receiptDeadline),
       );
     }
     // Preserve placement-before-canonical trigger ordering: a destination pack
@@ -263,7 +286,10 @@ export async function commitAccounting(
     try {
       // `db` is the §25 span-wrapped binding — the Proxy times+counts batch() itself,
       // so we do NOT wrap in span.d1() (that would double-count).
-      await db.batch(stmts);
+      const results = await db.batch(stmts);
+      if (Number((results[0]?.results?.[0] as { live?: number } | undefined)?.live ?? 0) !== 1) {
+        return { needsUpload: superBatch.map((r) => r.sha) };
+      }
     } catch (e) {
       // The trigger has no sha payload. The immutable safe failure unit is this
       // whole caught super-batch; never shrink it with a post-hoc intent read.
