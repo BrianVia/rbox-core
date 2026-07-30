@@ -9,7 +9,7 @@
   "description": "rbox sync engine (Phase 1: locally-testable core)",
   "scripts": {
     "dev:install": "bun scripts/dev-install.ts",
-    "test": "bun test ./src/ ./scripts/gc-drain.test.ts ./scripts/mutation-gate.test.ts",
+    "test": "bun test ./src/ ./scripts/gc-drain.test.ts ./scripts/mutation-gate.test.ts ./scripts/bench/migration-baseline.test.ts",
     "test:api": "cd apps/api && vitest run",
     "test:affected": "bun scripts/test-affected.ts",
     "test:parallel": "bun scripts/test-parallel.ts",

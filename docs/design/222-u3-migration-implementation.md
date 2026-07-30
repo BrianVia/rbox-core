@@ -2171,6 +2171,65 @@ quarantine as the sole remover. The gap worth closing before that lands is
 **observation**: `checkStateMigration` reads only the canonical control and the
 genesis intent, so nothing today can see a dead-id strand at all.
 
+**Strand sizes, measured — two different artifacts.** The MIGRATION M0 strand
+(`migration-v1.json.<dead-id>.1.tmp`) is a complete canonical control record,
+~630 bytes modelled. The GENESIS step-2 strand is a different artifact and was
+measured empirically at **0 bytes with 0 allocated blocks** — five crashes
+produced exactly five strands, one per crash, and a healthy genesis completes
+over them and adopts none. Neither justifies building a quarantine sweep; both
+argue for the same thing, which is that doctor should be able to SEE them.
+
+### 7.14 Further findings from 5C's matrices
+
+**FINDING — `rbox status` falsely reports a healthy migrated workspace as
+halted. User-visible, and the most serious thing 5C found.** On an empty
+manifest with nothing wrong: one ordinary read-only load deposits `state.db-wal`
+and `state.db-shm`, which are never cleaned;
+`classifySqliteResetPredecode` reads that sidecar vector as row **W1**;
+`inspectResetJournal` converts W1 into a halt; and `status-view.ts` renders
+"sync halted to protect recovery state". 163's own decoder table treats W1 as an
+ordinary recoverable takeover, not an operator condition, and `recovery.ts` does
+take it over silently — only the read-only inspection surfaces it as a halt.
+**Doctor disagrees with status** on the same workspace (`checkState` reports
+`ok`/`sqlite`), which is the clearest evidence the halt is an artifact. It is
+also racy within one invocation, because `statusCmd` inspects the journal
+concurrently with its own store open. This is the read-only-open-still-writes
+hazard 163 already records, reaching the operator surface. Pinned
+delete-when-fixed in `no-regression.test.ts`.
+
+**FINDING — genesis is unreachable through the `node:fs` default export.**
+Genesis performs 28 of its 36 workspace calls through `node:fs/promises`,
+including the intent publication, both renames, and both parent fsyncs — every
+kill point §7.2 names for it. The fault rig originally patched only the default
+export and could not reach any of them. **It stayed findable only because an
+unreached point exits 65 rather than passing quietly**, which is the single
+design decision in 5C that paid for itself. The rig now takes a `surface`.
+
+**FINDING — §7.1's G2 case 4 is not SIGKILL-reachable.** Step 2 creates the
+staged file and fsyncs its parent BEFORE step 3 publishes the intent, so on an
+ordered filesystem an intent never survives without its staged file. The row is
+driven to the intent-published state by a real crash and then reduced by one
+removal, with the reachability argument (external reaper, partial restore,
+crash-consistency reordering) recorded at the fixture.
+
+**FINDING — r6's "byte-identical whole `.rbox` tree" is not literally
+satisfiable for genesis.** `installGenesisLineage` stamps
+`migration_completion.completed_at` with `new Date().toISOString()`, so no two
+genesis runs produce identical `state.db` bytes. `Q` and everything else are
+compared byte-for-byte; `state.db` is compared on the §2.5.1 tuple. §7.1's
+wording should say so rather than implying a comparison no run can pass.
+
+**FINDING — G6's doctor clause is unimplemented.** `checkStateMigration` reads
+only the canonical control and the genesis intent and never classifies
+artifacts, so an inert strand is invisible and doctor answers "no conversion in
+progress". Same gap as §7.13's strand item, reached from a second direction.
+
+**FINDING — M4 fidelity accepts a dropped manifest section.** A `RepoRecord`
+carrying `removedKey` on a repo that still has a live manifest section causes
+the migration to drop the section, and the fidelity check does not object. A
+correct read of a contradictory input, but the fidelity gate's silence on it is
+worth knowing.
+
 **FINDING — the CODEMAP gate does not exist.** §M-9 states the
 one-line-per-module rule is "now executable in `migration/authority.test.ts`".
 It is not: no test in the repository mentions CODEMAP (`grep -rin codemap src/

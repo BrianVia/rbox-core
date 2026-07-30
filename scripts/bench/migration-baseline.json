@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "designBoundSecondsOnCorpus112k": 60,
+  "toleranceRatio": 1.5,
+  "corpus": {
+    "name": "synthetic-20k",
+    "entries": 20000,
+    "repos": 40,
+    "seed": 222075
+  },
+  "measuredAt": "2026-07-30",
+  "host": "linux-x64",
+  "total": {
+    "p50Ms": 1518.8,
+    "p95Ms": 1544.8,
+    "samples": 7
+  },
+  "phases": {
+    "M0": {
+      "p50Ms": 8.6,
+      "p95Ms": 9.4,
+      "samples": 7
+    },
+    "M1": {
+      "p50Ms": 22.3,
+      "p95Ms": 23.8,
+      "samples": 7
+    },
+    "M2": {
+      "p50Ms": 657,
+      "p95Ms": 672.9,
+      "samples": 7
+    },
+    "M3": {
+      "p50Ms": 421.8,
+      "p95Ms": 429.8,
+      "samples": 7
+    },
+    "M4": {
+      "p50Ms": 18.7,
+      "p95Ms": 19.2,
+      "samples": 7
+    },
+    "M5": {
+      "p50Ms": 75.8,
+      "p95Ms": 81.8,
+      "samples": 7
+    },
+    "M6": {
+      "p50Ms": 12.3,
+      "p95Ms": 12.5,
+      "samples": 7
+    },
+    "M7": {
+      "p50Ms": 1.8,
+      "p95Ms": 2.9,
+      "samples": 7
+    },
+    "start": {
+      "p50Ms": 302.7,
+      "p95Ms": 306.6,
+      "samples": 7
+    }
+  },
+  "referenceCorpus": {
+    "label": "founder-fleet workspace, 81 MB legacy state.json",
+    "bytes": 84934656,
+    "entries": 145913,
+    "repos": 101,
+    "durationSeconds": 38,
+    "measuredAt": "2026-07-29",
+    "machineCheckable": false,
+    "note": "OUT-OF-REPO REFERENCE DATUM. Measured on a real founder-fleet workspace snapshot that cannot be checked in, so nothing in this repo reproduces or verifies it. It is the only real-corpus evidence for design 222 §7.5's <=60s M0-M7 bound (38s against a 60s bound, 145913 entries / 101 repos). Recorded observation, not a gate."
+  }
+}

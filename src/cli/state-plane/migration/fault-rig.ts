@@ -25,6 +25,7 @@
  */
 import crypto from "node:crypto";
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import path from "node:path";
 
 /** The errnos every phase's I/O row is written against (§5.2, `cleanup.ts:63`,
@@ -44,6 +45,18 @@ export type FaultErrno = "ENOSPC" | "EDQUOT" | "EIO";
  */
 export interface StatePlaneFaultPoint {
   readonly syscall: string;
+  /**
+   * Which module object to patch. Defaults to `node:fs`, which is what every
+   * migration module calls through.
+   *
+   * `promises` exists because genesis does NOT: it performs most of its work —
+   * including the intent publication, both renames, and both parent fsyncs —
+   * through `node:fs/promises`, so a rig that patched only the default export
+   * could not reach a single kill point 222 §7.2 names for genesis. That gap
+   * was found by wave 5C's own genesis matrix, and it stayed findable only
+   * because an unreached point exits 65 instead of passing quietly.
+   */
+  readonly surface?: "sync" | "promises";
   readonly match?: RegExp;
   readonly nth?: number;
   /** `after` lets the real syscall complete and interrupts before control
@@ -99,10 +112,11 @@ export function installStatePlaneFault(
   point: StatePlaneFaultPoint,
   action: StatePlaneFaultAction,
 ): InstalledFault {
-  const table = fs as unknown as Record<string, unknown>;
+  const surface = point.surface ?? "sync";
+  const table = (surface === "promises" ? fsp : fs) as unknown as Record<string, unknown>;
   const original = table[point.syscall];
   if (typeof original !== "function") {
-    throw new TypeError(`fault rig: node:fs has no callable ${point.syscall}`);
+    throw new TypeError(`fault rig: ${surface} surface has no callable ${point.syscall}`);
   }
   const call = original as (...args: unknown[]) => unknown;
   const target = point.nth ?? 1;

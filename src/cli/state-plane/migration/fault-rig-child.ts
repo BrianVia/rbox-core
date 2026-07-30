@@ -13,13 +13,18 @@
  * failure mode that let four earlier lanes ship fixtures for states the machine
  * cannot produce.
  *
- * usage: fault-rig-child migrate|genesis|abort ROOT SPEC_JSON
+ * Migration only. It deliberately does NOT drive genesis: §7.9 requires that
+ * `migration/**` import nothing from `genesis.ts` and that exactly one module
+ * (the coordinator) import both, and a harness is not exempt from a structural
+ * rule it can silently break. `genesis-crash-matrix.test.ts` owns its own
+ * in-process rig for the same reason, and because genesis performs most of its
+ * work through `node:fs/promises` rather than the default export.
+ *
+ * usage: fault-rig-child migrate|abort ROOT SPEC_JSON
  *   SPEC_JSON: { point: StatePlaneFaultPoint, action: StatePlaneFaultAction }
  */
-import { randomUUID } from "node:crypto";
 import { abortStateMigrationCmd } from "../../state-plane-cmd.js";
 import { withStatePlaneLocks } from "../locks.js";
-import { establish } from "../genesis.js";
 import { runMigration } from "./authority.js";
 import {
   installStatePlaneFault, type StatePlaneFaultAction, type StatePlaneFaultPoint,
@@ -27,7 +32,7 @@ import {
 
 const [command, root, specJson] = process.argv.slice(2);
 if (!command || !root || !specJson) {
-  console.error("usage: fault-rig-child migrate|genesis|abort ROOT SPEC_JSON");
+  console.error("usage: fault-rig-child migrate|abort ROOT SPEC_JSON");
   process.exit(64);
 }
 
@@ -52,9 +57,6 @@ let report: unknown;
 try {
   if (command === "migrate") {
     report = await held((locks) => runMigration(root, { entry: "foreground-migrate", locks }));
-  } else if (command === "genesis") {
-    report = await held((locks) =>
-      establish(root, () => ({ authorityId: randomUUID(), lineageId: randomUUID() }), locks));
   } else if (command === "abort") {
     report = { exitCode: await abortStateMigrationCmd(root, { log: () => undefined }) };
   } else {
