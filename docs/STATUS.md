@@ -5,6 +5,87 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_SESSION 2026-07-30: **v1.11.2 released and promoted; Phase 2 GC unwedged
+(#616, purge OFF); the 349 GB R2 reclaim ~30%+ done; the mint-after-delete ABA
+closed; two fleet incidents (flat-meadow OOM-refusal, a 46k mass-delete halt)
+resolved.** Continuation of the 07-29 quota arc._
+
+_**RELEASED + PROMOTED.** `v1.11.2` (84a045ab) tagged after rig 7/7 + regress
+all-PASS; published to stable; fleet rebuilt to `1.11.2-dev+*`. Production
+promoted TWICE with founder yes: 84a045ab (ships #602/#603 server-side;
+migration 0035 applied; verified via /version + pragma) and 3820a63f (#616).
+Max nudged to upgrade (was still 1.11.1 with a 172h `local-index` deferral —
+watcher armed for his version flip)._
+
+_**#616 (design 227) — Phase 2 GC unwedge, the premise-collapse story.** GC
+was dead since ~07-20: `GC_BUDGET_SAFE=800` sized for Cloudflare's OLD 1,000
+subrequest ceiling; paid plan has been 10,000 for months (design 112 already
+recorded it). An earlier 227 deleted the reachability belts to fit the phantom
+ceiling; 3 review lanes attacked it and codex falsified the premise instead.
+Shipped inversion: KEEP every belt, one exported budget owner (maxW 8→88),
+D1-transaction-evaluated time guards everywhere the delete-fence argument
+needs a clock (a Worker can stall between any two awaits — JS-side checks
+cannot guard later durable writes; closes a PRE-EXISTING mint-after-delete
+ABA), account-delete purges DOs before dropping refs, gc-health workspace warn
+deleted. **Purge ships DISABLED** (`RBOX_GC_PURGE_DISABLED="1"` — it was "0"
+and armed!). Re-enable = §4 sequence: drain done → audit dry-run → supervised
+execute → 48h soak → founder yes. Settled (do not re-litigate): no kind filter
+on openIntents; zero new time constants; time checks are D1-evaluated._
+
+_**R2 reclaim (founder-authorized).** Batched node worker (S3 creds DERIVED
+from the CF token — key=token id, secret=sha256(token); founder rule: run
+own-infra ops directly, see memory) deleting 1,180,875 aged candidates at
+~60-113/s after a 131M-row-read fix (blob_refs has NO sha256-only index — a
+correlated subquery per sha = full scan; rewrite to chunk-materialized
+non-correlated form = 900x. Future cheap migration: index on
+blob_refs(sha256)). All four safety proofs zero before start; live per-chunk
+D1 recheck; audit TSV. Pre-reboot runs deleted ~28k (NOT ~2.1k as first
+recorded). Excluded by policy: 151k too-young (Phase 2's own 8d gates), 40k
+packed. Monitor posts 50k milestones._
+
+_**Fleet incidents.** (1) flat-meadow dark 9h: crash-loop on
+`ResetMemoryAdmissionError` — 80MB state × 52 needs 4.2GB vs budget
+totalmem/4 minus own RSS; recurrence of the 07-19 class. Band-aid:
+`RBOX_RESET_PARSE_BUDGET_BYTES=6442450944` in ~/.profile + restart. Structural
+fix (budget shrinks as own heap grows) queued as design item. (2) Desktop
+`attention: halt`: founder's interactive `rm -rf` of 13 retired Dfinitiv
+worktrees = 46,735 deletes; push breaker refused correctly; founder chose
+propagate; released via `rbox sync --allow-mass-delete`; stale halt banner
+needed a daemon restart + one cycle to clear. Papercut logged: intentional
+deletions need a visible propagate-or-not surface (NOT a feature request —
+founder explicit). (3) Mac 3,949s "client-apply": ONE outlier sample, host CPU
+starvation (load 28/12 cores, runaway cmux+logd, rbox nice+10) — not an rbox
+bug; recovered alone. Dashboard note: p95 over 11 samples = max; and
+`residualMs` swallowed 19min inside one repo's git-apply (observability gap,
+queued)._
+
+_**rbox-admin #12 MERGED (founder: "do whatever you want in rbox-admin"):**
+accounts now show billed (`used_bytes`, still gates) AND "Active data" (latest
+completed fairuse scan) with "Pending first scan" fallback. Prod's first
+active-only scan watcher armed — expect founder ≈3.9GB vs 159GB billed.
+Billing-flip design is the remaining piece (precondition met once scans
+complete; admission stays on the live counter, display/cap comparisons move
+to active)._
+
+_**#617 OPEN — resolve copy names machines, never "theirs"** (Max, verbatim:
+"who is they? I am me. I am also me on the other computer."). Local hostname
+named; remote side directional ("your other computer") because the publisher
+deviceId is verified then DISCARDED in latest() — wire follow-up recorded.
+Hostname kept OUT of --json and the shareable brief (privacy guards)._
+
+_**Queued, in order:** billing flip (one design cycle) → GC supervised
+re-enable (founder yes) → `rbox git resolve` cycle (both machines hold
+CLI-unresolvable deferrals; `refusalMessage("local-commits")` LIES — it is a
+reason-keyed refusal, not a detected change; Mac/FM rbox-core git plane pinned
+at 3b685d5 by the desktop's 2.9d `local-index` deferral + config parse-error
+lane over the 512-key wire bound) → flat-meadow memory-admission structural
+fix → blob_refs(sha256) index → git-apply residualMs observability._
+
+_**Host notes:** desktop linuxbrew `node` BROKEN (GLIBCXX/GCC mismatch) — use
+`/home/via/n/bin/node`; already bit wrangler and typecheck. tmpfs /tmp hit
+ENOSPC once during parallel sorts (31G, transient). Reboots wipe /tmp
+scratchpads — reclaim tooling regenerates from D1 truth by design._
+
 _SESSION 2026-07-29 (day): **the quota investigation — two PRs merged (#602,
 #603), a live upload leak root-caused, and Phase 2 GC found dead since
 ~07-20.** Triggered by the founder's dashboard showing 87.9 GB billed against a
