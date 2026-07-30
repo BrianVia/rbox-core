@@ -1,5 +1,5 @@
 import { env, SELF, applyD1Migrations } from "cloudflare:test";
-import { beforeAll, describe, expect, test } from "vitest";
+import { beforeAll, describe, expect, test, vi } from "vitest";
 import { createHash } from "node:crypto";
 import { startOp } from "../src/metrics.js";
 import { validateCommitRefs, commitAccounting } from "../src/commit-accounting.js";
@@ -20,7 +20,9 @@ import { MAX_MISSING_SHAS_RESPONSE, orderChainFirst, unsatisfiedBlobsBody } from
 import { WorkspaceSync } from "../src/workspace-sync.js";
 import { blobKey } from "../src/util.js";
 import { multipartComplete } from "../src/blobs.js";
+import { mintReceipt, RECEIPT_TTL_MS } from "../src/receipts.js";
 import { serializeRefset } from "../../../src/engine/refset.js";
+import { publishLegacyBlobWithQuota } from "../src/billing.js";
 
 // §23.2 (staging PUT) + §23.4 (commit accounting) against real D1 + R2 (workerd).
 // The DO head-advance (transactionSync) isn't available in this runtime, so we drive
@@ -151,7 +153,7 @@ describe("§23.2 PUT → canonical + receipt (direct-write, zero D1 on the hot p
     });
     expect(blocked.status).toBe(503);
     expect(await blocked.json()).toEqual({ error: "retry_later" });
-    expect(await env.rbox_dev_blobs.get(blobKey(s))).toBeTruthy(); // bytes carry no authority
+    expect(await env.rbox_dev_blobs.get(blobKey(s))).toBeNull(); // pre-write fence blocks R2
     await db().prepare("DELETE FROM gc_candidates WHERE sha256=?").bind(s).run();
     expect((await SELF.fetch(`${BASE}/v1/blobs/${s}`, {
       method: "PUT",
@@ -206,6 +208,20 @@ describe("§23.2 PUT → canonical + receipt (direct-write, zero D1 on the hot p
     const ok = await multipartComplete(env, s, uploadId, a.accountId);
     expect(ok.status).toBe(200);
     expect(await db().prepare("SELECT 1 FROM blob_refs WHERE account_id=? AND sha256=?").bind(a.accountId, s).first()).not.toBeNull();
+  });
+
+  test("legacy publication deadline rejects after P2 removed the fence row", async () => {
+    const a = await bootstrap("legacy-publication-deadline");
+    const s = sha("legacy-deadline");
+    const preReadTime = Date.now() - RECEIPT_TTL_MS - 1;
+    await env.rbox_dev_blobs.put(blobKey(s), "legacy-deadline");
+    await db().prepare("INSERT INTO gc_candidates(sha256,kind,marked_at,deleting_at) VALUES (?,'blob',1,2)").bind(s).run();
+    await db().prepare("DELETE FROM gc_candidates WHERE sha256=?").bind(s).run();
+
+    await expect(publishLegacyBlobWithQuota(env, a.accountId, s, 15, preReadTime)).rejects.toThrow("rbox_delete_fence_deadline");
+    expect(await db().prepare("SELECT 1 FROM blobs WHERE sha256=?").bind(s).first()).toBeNull();
+    expect(await db().prepare("SELECT 1 FROM blob_refs WHERE account_id=? AND sha256=?").bind(a.accountId, s).first()).toBeNull();
+    expect(await used(a.accountId)).toBe(0);
   });
 });
 
@@ -278,6 +294,28 @@ describe("§23.4 commit accounting (direct-write: catalog present=1 + charge + g
     expect(v).toEqual({ ok: false, needsUpload: [orphan] });
   });
 
+  test("a receipt verified before expiry cannot publish after D1 observes its signed expiry", async () => {
+    const a = await bootstrap("rcpt-expired-at-publish");
+    const s = sha("expired-at-publish");
+    const anchor = Date.now() - RECEIPT_TTL_MS - 1_000;
+    const receipt = await mintReceipt(env, { accountId: a.accountId, encSha: s, size: 7, nowMs: anchor });
+    const validated = await validateCommitRefs(env, db(), a.accountId, [s], { [s]: receipt }, anchor + 1);
+    expect(validated.ok).toBe(true);
+    if (!validated.ok) return;
+    expect(await commitAccounting(db(), a.accountId, validated.newRefs, anchor + 1)).toEqual({ needsUpload: [s] });
+    expect(await db().prepare("SELECT 1 FROM blobs WHERE sha256=?").bind(s).first()).toBeNull();
+    expect(await db().prepare("SELECT 1 FROM blob_refs WHERE sha256=?").bind(s).first()).toBeNull();
+
+    const jsClock = vi.spyOn(Date, "now").mockReturnValue(anchor + 1);
+    try {
+      const response = await redeem(a.accountId, { [s]: receipt });
+      expect(response.status).toBe(422);
+      expect(await response.json()).toEqual({ error: "unsatisfied_blobs", missing: [s], missingTotal: 1 });
+    } finally {
+      jsClock.mockRestore();
+    }
+  });
+
   // §3.5.4 truncation on the FENCE path is structurally vacuous: a delete-fence
   // abort returns exactly the caught super-batch (≤ MAX_REFS_PER_TXN = 3,000
   // entries, commit-accounting.ts), which can never exceed
@@ -288,7 +326,10 @@ describe("§23.4 commit accounting (direct-write: catalog present=1 + charge + g
   // production composition instead.
   test("one fenced chain sha aborts a multi-sha accounting batch and chain-first handler formatting keeps it first", async () => {
     const a = await bootstrap("rcpt-fence-atomic");
-    const refs = [{ sha: sha("fence-data"), size: 7 }, { sha: sha("fence-chain"), size: 9 }];
+    const refs = [
+      { sha: sha("fence-data"), size: 7, receiptExpiresAt: Date.now() + RECEIPT_TTL_MS },
+      { sha: sha("fence-chain"), size: 9, receiptExpiresAt: Date.now() + RECEIPT_TTL_MS },
+    ];
     const chainShas = [refs[1]!.sha];
     await db().prepare("INSERT INTO gc_candidates(sha256, kind, marked_at, deleting_at) VALUES (?, 'blob', 1, 2)").bind(chainShas[0]).run();
     const acct = await commitAccounting(db(), a.accountId, refs, Date.now());
@@ -325,7 +366,7 @@ describe("§23.4 commit accounting (direct-write: catalog present=1 + charge + g
   test("validateCommitRefs steers an entitled open-intent sha to needsUpload", async () => {
     const a = await bootstrap("rcpt-fence-steer");
     const staged = await putStaged(a.token, "steering-content");
-    expect(await commitAccounting(db(), a.accountId, [{ sha: staged.sha, size: "steering-content".length }], Date.now())).toEqual({ ok: true });
+    expect(await commitAccounting(db(), a.accountId, [{ sha: staged.sha, size: "steering-content".length, receiptExpiresAt: Date.now() + RECEIPT_TTL_MS }], Date.now())).toEqual({ ok: true });
     await db().prepare("INSERT INTO gc_candidates(sha256, kind, marked_at, deleting_at) VALUES (?, 'blob', 1, 2)").bind(staged.sha).run();
     expect(await validateCommitRefs(env, db(), a.accountId, [staged.sha], {}, Date.now())).toEqual({ ok: false, needsUpload: [staged.sha] });
   });
@@ -333,7 +374,7 @@ describe("§23.4 commit accounting (direct-write: catalog present=1 + charge + g
   test("blobs/check reports open intents missing in receipts and legacy modes", async () => {
     const a = await bootstrap("blob-check-fence-steer");
     const staged = await putStaged(a.token, "check-steering-content");
-    expect(await commitAccounting(db(), a.accountId, [{ sha: staged.sha, size: "check-steering-content".length }], Date.now())).toEqual({ ok: true });
+    expect(await commitAccounting(db(), a.accountId, [{ sha: staged.sha, size: "check-steering-content".length, receiptExpiresAt: Date.now() + RECEIPT_TTL_MS }], Date.now())).toEqual({ ok: true });
     await db().prepare("INSERT INTO gc_candidates(sha256, kind, marked_at, deleting_at) VALUES (?, 'blob', 1, 2)").bind(staged.sha).run();
     for (const headers of [{}, RCPT]) {
       const res = await SELF.fetch(`${BASE}/v1/blobs/check`, {

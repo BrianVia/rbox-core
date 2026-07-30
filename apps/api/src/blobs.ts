@@ -1,9 +1,9 @@
 import type { Env } from "./env.js";
 import { blobKey, cappedJson, exactObject, json, logErr, SHA256_HEX_RE } from "./util.js";
 import { entitledSubset, isEntitled } from "./authz.js";
-import { grantEntitlementWithQuota, wouldExceedCap } from "./billing.js";
+import { publishLegacyBlobWithQuota, wouldExceedCap } from "./billing.js";
 import { emitCompletePhases, startOp } from "./metrics.js";
-import { mintReceipt } from "./receipts.js";
+import { mintReceipt, RECEIPT_TTL_MS } from "./receipts.js";
 import { mintUploadGrant, verifyGrant } from "./grants.js";
 import { dbFor } from "./db.js";
 import { batchedInLookup } from "./d1-batch.js";
@@ -53,33 +53,59 @@ export async function directWriteVerified(
   }
 }
 
-/** One fail-closed D1 fence read for all successfully-written objects, followed
- * by receipt minting anchored to the time captured before that read. */
-export async function mintFenceCheckedReceipts(
+/** Capture publication authority before any canonical write. The D1 read is
+ * fail-closed; its JS anchor is later bounded by D1's own clock. */
+export async function preflightDeleteFence(
   env: Env,
   accountId: string,
-  written: Array<{ sha: string; size: number }>,
-): Promise<Map<string, { sizeBytes: number; receipt: string }>> {
-  if (written.length === 0) return new Map();
-  const checkTime = Date.now();
-  const shas = [...new Set(written.map((r) => r.sha))];
+  shas: string[],
+): Promise<number> {
+  const preReadTime = Date.now();
   let fenced: { sha256: string } | null;
   try {
     fenced = await dbFor(env, accountId)
       .prepare("SELECT sha256 FROM gc_candidates WHERE deleting_at IS NOT NULL AND sha256 IN (SELECT value FROM json_each(?)) LIMIT 1")
-      .bind(JSON.stringify(shas))
+      .bind(JSON.stringify([...new Set(shas)]))
       .first<{ sha256: string }>();
+  } catch {
+    throw new ReceiptFenceError();
+  }
+  if (fenced) throw new ReceiptFenceError();
+  return preReadTime;
+}
+
+/** Keep the post-write fence belt, and let D1 reject both a newly-opened intent
+ * and an anchor whose authority window elapsed while the request was stalled. */
+export async function mintFenceCheckedReceipts(
+  env: Env,
+  accountId: string,
+  written: Array<{ sha: string; size: number }>,
+  preReadTime: number,
+): Promise<Map<string, { sizeBytes: number; receipt: string }>> {
+  if (written.length === 0) return new Map();
+  const shas = [...new Set(written.map((r) => r.sha))];
+  let blocked: { blocked: number } | null;
+  try {
+    blocked = await dbFor(env, accountId)
+      .prepare(`SELECT 1 AS blocked
+        WHERE CAST((julianday('now')-2440587.5)*86400000 AS INTEGER) >= ?
+          OR EXISTS (
+            SELECT 1 FROM gc_candidates
+            WHERE deleting_at IS NOT NULL AND sha256 IN (SELECT value FROM json_each(?))
+          )`)
+      .bind(preReadTime + RECEIPT_TTL_MS, JSON.stringify(shas))
+      .first<{ blocked: number }>();
   } catch {
     // Publication authority is fail-closed. The canonical bytes may remain as an
     // unpublished orphan and are safe for P2 to reap.
     throw new ReceiptFenceError();
   }
-  if (fenced) throw new ReceiptFenceError();
+  if (blocked) throw new ReceiptFenceError();
 
   const out = new Map<string, { sizeBytes: number; receipt: string }>();
   await Promise.all(
     written.map(async ({ sha, size }) => {
-      const receipt = await mintReceipt(env, { accountId, encSha: sha, size, nowMs: checkTime });
+      const receipt = await mintReceipt(env, { accountId, encSha: sha, size, nowMs: preReadTime });
       out.set(sha, { sizeBytes: size, receipt });
     }),
   );
@@ -93,8 +119,9 @@ export async function directWriteWithReceipt(
   body: DirectWriteBody,
   r2Span: R2Span,
 ): Promise<{ sizeBytes: number; receipt: string }> {
+  const preReadTime = await preflightDeleteFence(env, accountId, [sha]);
   const size = await directWriteVerified(env, sha, body, r2Span);
-  return (await mintFenceCheckedReceipts(env, accountId, [{ sha, size }])).get(sha)!;
+  return (await mintFenceCheckedReceipts(env, accountId, [{ sha, size }], preReadTime)).get(sha)!;
 }
 
 /**
@@ -261,6 +288,16 @@ export async function blobPut(req: Request, env: Env, sha: string, accountId: st
     return json({ ok: true, sha256: sha, ...written });
   }
 
+  let preReadTime: number;
+  try {
+    preReadTime = await preflightDeleteFence(op.env, accountId, [sha]);
+  } catch (e) {
+    if (e instanceof ReceiptFenceError) {
+      op.done("retry_later", { bytes: len });
+      return json({ error: "retry_later" }, 503);
+    }
+    throw e;
+  }
   let obj: R2Object;
   try {
     obj = await op.span.r2(() => env.rbox_dev_blobs.put(blobKey(sha), req.body!, { sha256: sha }));
@@ -268,18 +305,9 @@ export async function blobPut(req: Request, env: Env, sha: string, accountId: st
     op.done("sha_mismatch", { bytes: len });
     return json({ error: "sha_mismatch" }, 400); // no raw R2 message (privacy)
   }
+  let grant: Awaited<ReturnType<typeof publishLegacyBlobWithQuota>>;
   try {
-    await dbFor(op.env, accountId).prepare("INSERT OR IGNORE INTO blobs (sha256, size_bytes, present) VALUES (?, ?, 1)").bind(sha, obj.size).run();
-  } catch (e) {
-    if (isDeleteFenceAbort(e)) {
-      op.done("retry_later", { bytes: obj.size });
-      return json({ error: "retry_later" }, 503);
-    }
-    throw e;
-  }
-  let grant: Awaited<ReturnType<typeof grantEntitlementWithQuota>>;
-  try {
-    grant = await grantEntitlementWithQuota(op.env, accountId, sha, obj.size); // verified upload → quota-checked read access
+    grant = await publishLegacyBlobWithQuota(op.env, accountId, sha, obj.size, preReadTime);
   } catch (e) {
     if (isDeleteFenceAbort(e)) {
       op.done("retry_later", { bytes: obj.size });
@@ -513,6 +541,17 @@ export async function multipartComplete(env: Env, sha: string, uploadId: string,
       return json({ error: "staged_missing" }, 500);
     }
     bytes = staged.size; // charge/record the ACTUAL bytes, not the declared size (M7b)
+    let preReadTime: number;
+    try {
+      preReadTime = await preflightDeleteFence(op.env, accountId, [sha]);
+    } catch (e) {
+      if (e instanceof ReceiptFenceError) {
+        outcome = "retry_later";
+        resumable = true;
+        return json({ error: "retry_later" }, 503);
+      }
+      throw e;
+    }
     try {
       // Publish to canonical; R2 verifies the whole-object sha server-side.
       await op.span.r2(() => env.rbox_dev_blobs.put(blobKey(sha), staged.body!, { sha256: sha }));
@@ -522,19 +561,9 @@ export async function multipartComplete(env: Env, sha: string, uploadId: string,
       return json({ error: "sha_mismatch" }, 412); // no raw message (privacy)
     }
     const accountingStart = Date.now();
+    let grant: Awaited<ReturnType<typeof publishLegacyBlobWithQuota>>;
     try {
-      await dbFor(op.env, accountId).prepare("INSERT OR IGNORE INTO blobs (sha256, size_bytes, present) VALUES (?, ?, 1)").bind(sha, bytes).run();
-    } catch (e) {
-      if (isDeleteFenceAbort(e)) {
-        outcome = "retry_later";
-        resumable = true;
-        return json({ error: "retry_later" }, 503);
-      }
-      throw e;
-    }
-    let grant: Awaited<ReturnType<typeof grantEntitlementWithQuota>>;
-    try {
-      grant = await grantEntitlementWithQuota(op.env, accountId, sha, bytes);
+      grant = await publishLegacyBlobWithQuota(op.env, accountId, sha, bytes, preReadTime);
     } catch (e) {
       if (isDeleteFenceAbort(e)) {
         outcome = "retry_later";

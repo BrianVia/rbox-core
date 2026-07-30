@@ -7,12 +7,12 @@ import {
   GC_FIXED_COST,
   GC_P1_COST,
   GC_PER_EXECUTE,
-  PER_WORKSPACE_ROOTS_COST,
   INTENT_QUIESCENCE_MS,
   gcExecuteLimit,
+  gcMaxWorkspaces,
 } from "../src/gc-policy.js";
 import { GC_INSERT_ROWS, gcMark } from "../src/gc-mark.js";
-import { GC_MAX_WORKSPACE_ROWS, gcHealthData } from "../src/gc-health.js";
+import { gcHealthData } from "../src/gc-health.js";
 import { gcAudit } from "../src/gc-audit.js";
 import { STALE_INTENT_MS, gcPurge } from "../src/gc-purge.js";
 import {
@@ -176,12 +176,14 @@ describe("design 95 P1 intent protocol", () => {
     await candidate(guarded);
     expect((await body(await gcPurge(env, GRACE, { nowMs: NOW, owner: "p1-a" }))).opened).toBe(1);
     const first = await db().prepare("SELECT deleting_at FROM gc_candidates WHERE sha256=?").bind(guarded).first<{ deleting_at: number }>();
-    expect(first?.deleting_at).toBe(NOW);
+    expect(first?.deleting_at).toBeGreaterThan(Date.now() - 5_000);
+    const d1StampedAt = first!.deleting_at;
 
-    expect((await body(await gcPurge(env, GRACE, { nowMs: NOW + 1, owner: "p1-b" }))).opened).toBe(0);
-    expect((await db().prepare("SELECT deleting_at FROM gc_candidates WHERE sha256=?").bind(guarded).first<{ deleting_at: number }>())?.deleting_at).toBe(NOW);
+    expect((await body(await gcPurge(env, GRACE, { nowMs: d1StampedAt + INTENT_QUIESCENCE_MS, owner: "p1-b" }))).purged).toBe(0);
+    expect((await db().prepare("SELECT deleting_at FROM gc_candidates WHERE sha256=?").bind(guarded).first<{ deleting_at: number }>())?.deleting_at).toBe(d1StampedAt);
+    expect((await body(await gcPurge(env, GRACE, { nowMs: d1StampedAt + INTENT_QUIESCENCE_MS + 1, owner: "p1-boundary" }))).purged).toBe(1);
+    expect(await exists("SELECT 1 FROM gc_candidates WHERE sha256=?", guarded)).toBe(false);
 
-    await db().prepare("DELETE FROM gc_candidates").run();
     await db().prepare("INSERT INTO accounts(id, plan, created_at, used_bytes, extra_storage_bytes, cap_bytes) VALUES ('a','pro',?,0,0,1000)").bind(NOW).run();
     await catalog(hasRef);
     await db().prepare("INSERT INTO blob_refs(account_id, sha256, granted_at) VALUES ('a',?,?)").bind(hasRef, NOW).run();
@@ -207,6 +209,28 @@ describe("design 95 P1 intent protocol", () => {
     expect(result).toMatchObject({ purged: 0, unwound: 1, opened: 0 });
     expect(await exists("SELECT 1 FROM gc_candidates WHERE sha256=?", reappeared)).toBe(false);
     expect(await real.get(blobKey(reappeared))).not.toBeNull();
+  });
+
+  it("opens and drains both unopened and already-open canonical rows", async () => {
+    const unopened = sha("canonical-unopened");
+    const alreadyOpen = sha("canonical-open");
+    const now = Date.now();
+    await Promise.all([catalog(unopened), catalog(alreadyOpen), put(unopened), put(alreadyOpen)]);
+    await candidate(unopened, now - 10 * DAY, null, "canonical");
+    await candidate(alreadyOpen, now - 10 * DAY, now - INTENT_QUIESCENCE_MS - 1, "canonical");
+
+    const first = await body(await gcPurge(env, GRACE, { nowMs: now, owner: "canonical-first" }));
+    expect(first).toMatchObject({ purged: 1, opened: 1 });
+    expect(await exists("SELECT 1 FROM gc_candidates WHERE sha256=?", alreadyOpen)).toBe(false);
+    const opened = await db().prepare("SELECT deleting_at FROM gc_candidates WHERE sha256=?").bind(unopened).first<{ deleting_at: number }>();
+    expect(opened?.deleting_at).toBeTruthy();
+
+    const second = await body(await gcPurge(env, GRACE, {
+      nowMs: opened!.deleting_at + INTENT_QUIESCENCE_MS + 1,
+      owner: "canonical-second",
+    }));
+    expect(second.purged).toBe(1);
+    expect(await exists("SELECT 1 FROM gc_candidates WHERE sha256=?", unopened)).toBe(false);
   });
 
   it("publication before P1 is observed by P2 and activity-unwind deletes candidacy", async () => {
@@ -534,7 +558,7 @@ describe("design 95 bounded work and read-only audit", () => {
     ["state_read", "SELECT v FROM gc_state WHERE k = ?", "first"],
     ["state_write", "INSERT INTO gc_state (k, v) VALUES (?, ?)", "run"],
   ] as const)("gcMark records a thrown %s failure", async (stage, sql, method) => {
-    if (stage === "count") await workspaces(9);
+    if (stage === "count") await workspaces(gcMaxWorkspaces() + 1);
     const failing = failDbMethodOnce(sql, method);
     await expect(gcMark({ ...env, rbox_dev_db: failing } as Env, 0, NOW)).rejects.toThrow("injected");
     const stored = JSON.parse((await db().prepare("SELECT v FROM gc_state WHERE k='gc_obs_mark'").first<{ v: string }>())!.v) as GcObservationV1;
@@ -647,7 +671,7 @@ describe("design 95 bounded work and read-only audit", () => {
   });
 
   for (const phase of ["mark", "purge"] as const) {
-    for (const rowCount of [8, 9, 12]) {
+    for (const rowCount of [8, 12, gcMaxWorkspaces() + 1]) {
       it(`${phase} reports the exact workspace count at ${rowCount} rows`, async () => {
         await workspaces(rowCount);
         const rooted = emptyRootsEnv();
@@ -655,8 +679,8 @@ describe("design 95 bounded work and read-only audit", () => {
           ? await gcMark(rooted.value, GRACE, NOW)
           : await gcPurge(rooted.value, GRACE, { nowMs: NOW, owner: `${phase}-${rowCount}` });
         expect(response.status).toBe(200);
-        const result = await body(response, rowCount > GC_MAX_WORKSPACE_ROWS);
-        if (rowCount <= GC_MAX_WORKSPACE_ROWS) {
+        const result = await body(response, rowCount > gcMaxWorkspaces());
+        if (rowCount <= gcMaxWorkspaces()) {
           expect(result.budgetExceeded).not.toBe(true);
           expect(rooted.calls()).toBe(rowCount);
           const stored = JSON.parse((await db().prepare(`SELECT v FROM gc_state WHERE k='gc_obs_${phase}'`).first<{ v: string }>())!.v) as GcObservationV1;
@@ -673,7 +697,7 @@ describe("design 95 bounded work and read-only audit", () => {
             ok: false,
             reason: "roots_budget_exceeded",
             rows: rowCount,
-            maxRows: 8,
+            maxRows: gcMaxWorkspaces(),
             uniqueRoots: null,
             maxRoots: 750_000,
             ...(phase === "mark" ? { marked: 0 } : { purged: 0, opened: 0 }),
@@ -690,7 +714,7 @@ describe("design 95 bounded work and read-only audit", () => {
   }
 
   it("reports a post-breach COUNT that may drift from the sentinel snapshot", async () => {
-    await workspaces(9);
+    await workspaces(gcMaxWorkspaces() + 1);
     const realDb = db();
     let drifted = false;
     const racedDb = new Proxy(realDb, {
@@ -725,11 +749,13 @@ describe("design 95 bounded work and read-only audit", () => {
       },
     }) as D1Database;
     const result = await body(await gcPurge({ ...env, rbox_dev_db: racedDb } as Env, GRACE, { nowMs: NOW, owner: "drift" }), true);
-    expect(result).toMatchObject({ budgetExceeded: true, rows: 10, maxRows: 8, purged: 0, opened: 0 });
+    expect(result).toMatchObject({ budgetExceeded: true, rows: gcMaxWorkspaces() + 2, maxRows: gcMaxWorkspaces(), purged: 0, opened: 0 });
   });
 
   it("uses the combined P2+P1 budget arithmetic", async () => {
     const result = await body(await gcPurge(env, GRACE, { nowMs: NOW, owner: "math" }));
+    expect(gcMaxWorkspaces()).toBe(88);
+    expect(gcExecuteLimit(12)).toBe(200);
     expect(result.executeLimit).toBe(Math.min(200, Math.floor((GC_BUDGET_SAFE - 1 - GC_FIXED_COST - GC_P1_COST) / GC_PER_EXECUTE)));
   });
 
@@ -738,7 +764,7 @@ describe("design 95 bounded work and read-only audit", () => {
   });
 
   it("sentinel-W exits before any DO fan-out or GC mutation", async () => {
-    const maxW = Math.floor((GC_BUDGET_SAFE - GC_FIXED_COST - GC_PER_EXECUTE - GC_P1_COST - 1) / PER_WORKSPACE_ROOTS_COST);
+    const maxW = gcMaxWorkspaces();
     for (let base = 0; base < maxW + 1; base += 30) {
       const n = Math.min(30, maxW + 1 - base); // 30 rows × 3 binds = 90 < D1's ~100-param limit
       await db().prepare(`INSERT INTO workspaces(workspace_id,project_id,created_at) VALUES ${Array.from({ length: n }, () => "(?,?,?)").join(",")}`)
@@ -848,15 +874,28 @@ describe("design 95 bounded work and read-only audit", () => {
     expect(await gcHealthData(env)).toMatchObject({ uniqueRoots: { value: 1 }, warn: true });
   });
 
-  it("health uses exact row thresholds, stays read-only, and the platform GET is gated", async () => {
+  it("records the orphan-ref D1 integrity alarm once per purge sample", async () => {
+    expect((await body(await gcPurge(env, GRACE, { nowMs: NOW, owner: "orphan-healthy" }))).purged).toBe(0);
+    let purge = JSON.parse((await db().prepare("SELECT v FROM gc_state WHERE k='gc_obs_purge'").first<{ v: string }>())!.v) as GcObservationV1;
+    expect(purge.orphanRefs).toBe(0);
+    expect((await gcHealthData(env)).warn).toBe(false);
+
+    await db().batch([
+      db().prepare("INSERT INTO accounts(id, plan, created_at) VALUES ('orphan-account','pro',?)").bind(NOW),
+      db().prepare("INSERT INTO blob_refs(account_id,sha256,granted_at) VALUES ('orphan-account',?,?)").bind(sha("missing-blob"), NOW),
+      db().prepare("DELETE FROM gc_state"),
+    ]);
+    expect((await body(await gcPurge(env, GRACE, { nowMs: NOW, owner: "orphan-broken" }))).purged).toBe(0);
+    purge = JSON.parse((await db().prepare("SELECT v FROM gc_state WHERE k='gc_obs_purge'").first<{ v: string }>())!.v) as GcObservationV1;
+    expect(purge.orphanRefs).toBe(1);
+    expect((await gcHealthData(env)).warn).toBe(true);
+  });
+
+  it("health ignores workspace row thresholds, stays read-only, and the platform GET is gated", async () => {
     const rooted = emptyRootsEnv();
     await workspaces(5);
     expect((await gcHealthData(rooted.value)).warn).toBe(false);
-    await workspaces(1);
     const before = (await db().prepare("SELECT k,v FROM gc_state ORDER BY k").all()).results;
-    expect((await gcHealthData(rooted.value)).warn).toBe(true);
-    expect((await gcHealthData(rooted.value)).warn).toBe(true);
-    await db().prepare("DELETE FROM workspaces WHERE workspace_id=(SELECT workspace_id FROM workspaces ORDER BY workspace_id LIMIT 1)").run();
     expect((await gcHealthData(rooted.value)).warn).toBe(false);
     expect(rooted.calls()).toBe(0);
     expect((await db().prepare("SELECT k,v FROM gc_state ORDER BY k").all()).results).toEqual(before);
@@ -864,10 +903,12 @@ describe("design 95 bounded work and read-only audit", () => {
     expect((await SELF.fetch("https://example.com/v1/admin/gc?phase=health")).status).toBe(404);
     const response = await SELF.fetch("https://example.com/v1/admin/gc?phase=health", { headers: { "x-rbox-platform": "test-platform-secret" } });
     expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({ ok: true, rows: 5, maxRows: 8, maxRoots: 750_000, warn: false });
+    const healthBody = await response.json();
+    expect(healthBody).toMatchObject({ ok: true, rows: 5, maxRoots: 750_000, warn: false });
+    expect(healthBody).not.toHaveProperty("maxRows");
 
     await workspaces(20);
-    expect(await gcHealthData(rooted.value)).toMatchObject({ rows: 25, warn: true });
+    expect(await gcHealthData(rooted.value)).toMatchObject({ rows: 25, warn: false });
     expect(rooted.calls()).toBe(0);
   });
 
@@ -970,7 +1011,7 @@ describe("design 95 cron steering and rollout switch", () => {
     expect((await db().prepare("SELECT deleting_at FROM gc_candidates WHERE sha256=?").bind(cronEnabled).first<{ deleting_at: number | null }>())?.deleting_at).not.toBeNull();
   });
 
-  it("emits level-triggered health warnings at 5→6, repeated 6, and 6→5 rows", async () => {
+  it("does not emit health warnings from workspace row count alone", async () => {
     await workspaces(5);
     const rooted = emptyRootsEnv();
     const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -980,10 +1021,10 @@ describe("design 95 cron steering and rollout switch", () => {
       await workspaces(1);
       await worker.scheduled(eventAt(GC_MARK_UTC_HOUR), rooted.value);
       await worker.scheduled(eventAt(GC_MARK_UTC_HOUR), rooted.value);
-      expect(warning).toHaveBeenCalledTimes(2);
+      expect(warning).toHaveBeenCalledTimes(0);
       await db().prepare("DELETE FROM workspaces WHERE workspace_id=(SELECT workspace_id FROM workspaces ORDER BY workspace_id LIMIT 1)").run();
       await worker.scheduled(eventAt(GC_MARK_UTC_HOUR), rooted.value);
-      expect(warning).toHaveBeenCalledTimes(2);
+      expect(warning).toHaveBeenCalledTimes(0);
     } finally {
       warning.mockRestore();
     }

@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { PHASE1_MAX_ROWS, phase1Audit, phase1Mark, phase1Purge, reconcileUsage, perAccountReachable, runPhase1 } from "../src/gc-phase1.js";
 import { validateCommitRefs, commitAccounting } from "../src/commit-accounting.js";
 import { grantEntitlementWithQuota } from "../src/billing.js";
-import { mintReceipt } from "../src/receipts.js";
+import { mintReceipt, RECEIPT_TTL_MS } from "../src/receipts.js";
 
 // §33 Phase 1 — per-account entitlement GC, against real workerd D1 (mirrors
 // spike-d1-charge.test.ts). Reachability is injected as a Set (exactly what
@@ -384,10 +384,14 @@ describe("§33 candidate-aware commit barrier (the dedup-race fix)", () => {
     if (!unsat.ok) expect(unsat.needsUpload).toEqual(["x"]);
 
     // Client re-stages → fresh receipt → x is re-granted (enters newRefs).
-    const receipt = await mintReceipt(env, { accountId: "a", encSha: "x", size: 100, nowMs: NOW });
-    const v = await validateCommitRefs(env, db(), "a", ["x"], { x: receipt }, NOW);
+    const receiptNow = Date.now();
+    const receipt = await mintReceipt(env, { accountId: "a", encSha: "x", size: 100, nowMs: receiptNow });
+    const v = await validateCommitRefs(env, db(), "a", ["x"], { x: receipt }, receiptNow);
     expect(v.ok).toBe(true);
-    if (v.ok) expect(v.newRefs.map((r) => r.sha)).toEqual(["x"]);
+    if (v.ok) {
+      expect(v.newRefs.map((r) => r.sha)).toEqual(["x"]);
+      expect(v.newRefs[0]!.receiptExpiresAt).toBe(receiptNow + RECEIPT_TTL_MS);
+    }
 
     // commitAccounting re-grants: clears the marker + re-stamps granted_at, charges 0 (dedup).
     if (v.ok) {

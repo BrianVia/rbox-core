@@ -4,14 +4,11 @@ import { dbFor } from "./db.js";
 import { MAX_UNIQUE_ROOTS, exactWorkspaceCount } from "./gc-roots.js";
 import { readGcObservation, type GcObservationV1, type GcRootsSampleV1 } from "./gc-observability.js";
 
-export const GC_MAX_WORKSPACE_ROWS = 8;
-export const GC_WARN_WORKSPACE_ROWS = 6;
 export const GC_WARN_UNIQUE_ROOTS = 562_500;
 
 export interface GcHealthV1 {
   ok: true;
   rows: number;
-  maxRows: 8;
   uniqueRoots: (GcRootsSampleV1 & { stale: true }) | null;
   maxRoots: 750_000;
   mark: GcObservationV1 | null;
@@ -36,14 +33,13 @@ export async function gcHealthData(env: Env): Promise<GcHealthV1> {
   ]);
   const selected = newerRootsSample(mark?.rootsSample ?? null, purge?.rootsSample ?? null);
   const uniqueRoots = selected ? { ...selected, stale: true as const } : null;
-  const warn = rows >= GC_WARN_WORKSPACE_ROWS
-    || (selected?.value ?? 0) >= GC_WARN_UNIQUE_ROOTS
+  const warn = (selected?.value ?? 0) >= GC_WARN_UNIQUE_ROOTS
     || mark?.outcome === "roots_cap_exceeded"
-    || purge?.outcome === "roots_cap_exceeded";
+    || purge?.outcome === "roots_cap_exceeded"
+    || (purge?.orphanRefs ?? 0) > 0;
   return {
     ok: true,
     rows,
-    maxRows: GC_MAX_WORKSPACE_ROWS,
     uniqueRoots,
     maxRoots: MAX_UNIQUE_ROOTS,
     mark,
@@ -64,7 +60,6 @@ export async function emitGcHealthWarning(env: Env): Promise<void> {
     console.warn(JSON.stringify({
       event: "gc_health_warning",
       rows: health.rows,
-      maxRows: health.maxRows,
       uniqueRoots: health.uniqueRoots?.value ?? null,
       rootsLowerBound: health.uniqueRoots?.lowerBound === true,
       maxRoots: health.maxRoots,

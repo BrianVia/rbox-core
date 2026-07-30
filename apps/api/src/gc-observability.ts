@@ -42,6 +42,7 @@ export interface GcObservationV1 {
   marked?: number;
   purged?: number;
   opened?: number;
+  orphanRefs?: number;
   errorClass?: string;
   rootsSample: GcRootsSampleV1 | null;
 }
@@ -71,7 +72,7 @@ function parseGcObservation(value: unknown): GcObservationV1 | null {
   const o = value as Record<string, unknown>;
   if (o.v !== 1 || !isFixedIso(o.at) || !GC_OUTCOMES.has(o.outcome as GcObservationOutcome)) return null;
   if (o.stage !== undefined && !GC_STAGES.has(o.stage as GcObservationStage)) return null;
-  for (const field of ["status", "rows", "marked", "purged", "opened"] as const) {
+  for (const field of ["status", "rows", "marked", "purged", "opened", "orphanRefs"] as const) {
     if (o[field] !== undefined && (!Number.isFinite(o[field]) || Number(o[field]) < 0)) return null;
   }
   if (o.errorClass !== undefined && typeof o.errorClass !== "string") return null;

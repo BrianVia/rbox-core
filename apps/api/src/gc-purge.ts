@@ -3,7 +3,7 @@ import { blobKey, errClass, json, manifestKey } from "./util.js";
 import { dbFor } from "./db.js";
 import { startOp } from "./metrics.js";
 import { GcRootsCapExceeded, MAX_UNIQUE_ROOTS, reachableFromWorkspaces, workspaceSnapshot, exactWorkspaceCount } from "./gc-roots.js";
-import { GC_BUDGET_SAFE, GC_FIXED_COST, GC_PER_EXECUTE, GC_P1_COST, GC_P1_MAX_ROWS, INTENT_QUIESCENCE_MS, PER_WORKSPACE_ROOTS_COST, gcExecuteLimit } from "./gc-policy.js";
+import { GC_P1_MAX_ROWS, INTENT_QUIESCENCE_MS, gcExecuteLimit, gcMaxWorkspaces } from "./gc-policy.js";
 import { acquireLease, leaseGuard, readState, releaseLeaseWithRetry, renewLease, writeState, type PurgeLease } from "./gc-state.js";
 import { metric, terminalObservation, writeGcObservation, type GcObservationStage, type GcObservationV1, type GcRootsSampleV1 } from "./gc-observability.js";
 
@@ -181,8 +181,8 @@ async function openIntents(
         : {
             kind: "open" as const,
             stmt: db
-              .prepare("UPDATE gc_candidates SET deleting_at=? WHERE sha256=? AND deleting_at IS NULL AND NOT EXISTS (SELECT 1 FROM blob_refs WHERE sha256=?)")
-              .bind(nowMs, c.sha256, c.sha256),
+              .prepare("UPDATE gc_candidates SET deleting_at=CAST((julianday('now')-2440587.5)*86400000 AS INTEGER) WHERE sha256=? AND deleting_at IS NULL AND NOT EXISTS (SELECT 1 FROM blob_refs WHERE sha256=?)")
+              .bind(c.sha256, c.sha256),
           },
     );
   let opened = 0;
@@ -220,7 +220,7 @@ export async function gcPurge(env: Env, graceMs: number, options: GcPurgeOptions
   const clock = options.clock ?? Date.now;
   const startedAt = clock();
   const deadlineAt = startedAt + (options.deadlineMs ?? 15 * 60 * 1000);
-  const maxW = Math.floor((GC_BUDGET_SAFE - GC_FIXED_COST - GC_PER_EXECUTE - GC_P1_COST - 1) / PER_WORKSPACE_ROOTS_COST);
+  const maxW = gcMaxWorkspaces();
   let stage: GcObservationStage = "snapshot";
   let rows: number | undefined;
   let rootsSample: GcRootsSampleV1 | null = null;
@@ -296,11 +296,15 @@ export async function gcPurge(env: Env, graceMs: number, options: GcPurgeOptions
         .prepare("SELECT COUNT(*) AS n FROM gc_candidates WHERE deleting_at IS NOT NULL AND deleting_at < ?")
         .bind(nowMs - STALE_INTENT_MS)
         .first<{ n: number }>();
+      const orphanRefs = await db
+        .prepare("SELECT COUNT(*) AS n FROM blob_refs r WHERE NOT EXISTS (SELECT 1 FROM blobs b WHERE b.sha256 = r.sha256)")
+        .first<{ n: number }>();
       metric(env, "gc.intents.opened", intents.opened);
       metric(env, "gc.intents.unwound", executed.unwound);
       metric(env, "gc.objects.purged", executed.purged, executed.bytes);
       metric(env, "gc.pack.locations_retired", executed.packedRetired);
       metric(env, "gc.intents.stale", Number(stale?.n ?? 0));
+      metric(env, "gc.refs.orphaned", Number(orphanRefs?.n ?? 0));
       metric(env, "gc.purge.cursor", 1);
       op.done("ok", { count: executed.purged, bytes: executed.bytes });
       return {
@@ -309,6 +313,7 @@ export async function gcPurge(env: Env, graceMs: number, options: GcPurgeOptions
           rows,
           purged: executed.purged,
           opened: intents.opened,
+          orphanRefs: Number(orphanRefs?.n ?? 0),
         }),
         response: json({
           purged: executed.purged,

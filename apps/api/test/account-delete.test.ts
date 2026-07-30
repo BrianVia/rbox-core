@@ -139,6 +139,43 @@ describe("DELETE /v1/account — idempotency", () => {
 });
 
 describe("hard purge — enumeration + dedup safety + isolation", () => {
+  test("workspace purge completes before refs drop, so chunk boundaries cannot resurrect condemned blobs", async () => {
+    const a = await bootstrap("purge-order");
+    const now = Date.now();
+    const orphan = sha("purge-order-orphan");
+    await db().batch([
+      db().prepare("INSERT INTO blobs(sha256,size_bytes,present) VALUES (?,10,1)").bind(orphan),
+      db().prepare("INSERT INTO blob_refs(account_id,sha256,granted_at) VALUES (?,?,?)").bind(a.accountId, orphan, now),
+      db().prepare("INSERT INTO workspaces(workspace_id,project_id,account_id,created_at) VALUES ('purge-order-ws','root',?,?)").bind(a.accountId, now),
+    ]);
+    await env.rbox_dev_blobs.put(blobKey(orphan), "orphan");
+    await deleteAccount(env, ownerPrincipal(a.accountId, a.ownerUserId, a.deviceId), delReq(a.accountId), now);
+    await db().prepare("UPDATE account_deletions SET purge_after=? WHERE account_id=?").bind(now - 1, a.accountId).run();
+
+    let first = true;
+    const deps: PurgeDeps = {
+      ...OK_DEPS,
+      purgeWorkspace: async () => {
+        expect(await count("SELECT COUNT(*) AS n FROM blob_refs WHERE account_id=? AND sha256=?", a.accountId, orphan)).toBe(1);
+        if (first) {
+          first = false;
+          return false;
+        }
+        return true;
+      },
+    };
+    expect(await driveAccountDeletion(env, a.accountId, now, deps)).toBe("progress");
+    expect(await count("SELECT COUNT(*) AS n FROM blob_refs WHERE account_id=? AND sha256=?", a.accountId, orphan)).toBe(1);
+    expect(await count("SELECT COUNT(*) AS n FROM gc_candidates WHERE sha256=?", orphan)).toBe(0);
+
+    expect(await driveAccountDeletion(env, a.accountId, now, deps)).toBe("done");
+    expect(await count("SELECT COUNT(*) AS n FROM workspaces WHERE workspace_id='purge-order-ws'")).toBe(0);
+    expect(await count("SELECT COUNT(*) AS n FROM gc_candidates WHERE sha256=?", orphan)).toBe(1);
+    const purge = await gcPurge(env, 7 * 24 * 60 * 60 * 1000, { nowMs: now, owner: "purge-order" });
+    expect(purge.status).toBe(200);
+    expect(await count("SELECT COUNT(*) AS n FROM gc_candidates WHERE sha256=?", orphan)).toBe(1);
+  });
+
   test("erases every account-scoped row; keeps shared blobs; never touches another account", async () => {
     const A = await bootstrap("purge-A");
     const B = await bootstrap("purge-B"); // the bystander that must survive untouched

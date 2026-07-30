@@ -33,6 +33,9 @@ export type VerifyResult =
       ok: false;
       reason: "malformed" | "bad_version" | "bad_kid" | "bad_mac" | "expired" | "future" | "bad_ttl" | "mismatch";
     };
+export type VerifyResultWithExpiry =
+  | { ok: true; size: number; expiresAt: number; packId?: string }
+  | Exclude<VerifyResult, { ok: true }>;
 
 interface PayloadV1 {
   v: 1;
@@ -127,7 +130,7 @@ export async function mintReceipt(env: Env, claim: MintClaim): Promise<string> {
   return `${body}.${b64url(enc.encode(mac))}`;
 }
 
-export async function verifyReceipt(env: Env, receipt: string, claim: ReceiptClaim): Promise<VerifyResult> {
+export async function verifyReceiptWithExpiry(env: Env, receipt: string, claim: ReceiptClaim): Promise<VerifyResultWithExpiry> {
   const parts = receipt.split(".");
   if (parts.length !== 3) return { ok: false, reason: "malformed" };
   const [kid, payloadB64, macB64] = parts as [string, string, string];
@@ -166,5 +169,15 @@ export async function verifyReceipt(env: Env, receipt: string, claim: ReceiptCla
   // Claim binding: account + content must match; size only when the caller asserts one.
   if (payload.a !== claim.accountId || payload.s !== claim.encSha) return { ok: false, reason: "mismatch" };
   if (claim.size !== undefined && payload.n !== claim.size) return { ok: false, reason: "mismatch" };
-  return payload.v === 2 ? { ok: true, size: payload.n, packId: payload.p } : { ok: true, size: payload.n };
+  return payload.v === 2
+    ? { ok: true, size: payload.n, expiresAt: payload.e, packId: payload.p }
+    : { ok: true, size: payload.n, expiresAt: payload.e };
+}
+
+export async function verifyReceipt(env: Env, receipt: string, claim: ReceiptClaim): Promise<VerifyResult> {
+  const result = await verifyReceiptWithExpiry(env, receipt, claim);
+  if (!result.ok) return result;
+  return result.packId === undefined
+    ? { ok: true, size: result.size }
+    : { ok: true, size: result.size, packId: result.packId };
 }
