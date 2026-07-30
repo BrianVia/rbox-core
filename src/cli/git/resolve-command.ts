@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import {
   assertGitTargetWithinRoot,
@@ -64,7 +65,7 @@ import { settleExactPresentArtifact } from "../sync-git/p-settlement.js";
 import { createPRepairStatePort, createPRepairStatePortFromReceipt } from "../sync-git/p-repair-state.js";
 import { hasGitResolutionIncoming, sanitizeTerminalText } from "../status-view.js";
 import { preliminaryResolutionReport, resolutionBindingIdentity, type ResolutionDiscardReport } from "../sync-git/resolution-intent.js";
-import { printShow, printDiscardReport, keepMineConfirmCommand, safeResolveOutput, refusalMessage, type GitResolveShow } from "./resolve-presentation.js";
+import { printShow, printDiscardReport, keepMineConfirmCommand, safeResolveOutput, refusalMessage, thisComputer, thisComputersVersion, type GitResolveShow } from "./resolve-presentation.js";
 import { assertCommandAllowedOnScopedBinding, ScopedBindingRefusal, type ScopeHaltCondition } from "../scope/binding-scope.js";
 
 type GitResolveVerb = "show-me" | "take-theirs" | "keep-mine";
@@ -99,6 +100,8 @@ interface GitResolveDeps {
   /** Test seam around the ordinary in-process push pipeline. */
   confirmedPush?: (args: { cfg: WorkspaceConfig; deps: SyncDeps; resolution: import("../sync-git/resolution-intent.js").GitResolutionRider }) => Promise<PushResult>;
   now?: () => Date;
+  /** This machine's name for the human report only; never reaches --json. */
+  hostname?: () => string;
   stdout?: (line: string) => void;
   stderr?: (line: string) => void;
   /** Test seam for heartbeat scheduling; production remains ten seconds. */
@@ -339,13 +342,14 @@ function emit(output: ResolveOutput, json: boolean, deps: GitResolveDeps, root: 
   // future verbs cannot accidentally introduce a terminal-control sink.
   const safeOut = (line: string): void => out(sanitizeTerminalText(line));
   const safeErr = (line: string): void => err(sanitizeTerminalText(line));
-  if (safe.status === "show-me") { printShow(safe, safeOut); return; }
+  const machine = localMachine(deps);
+  if (safe.status === "show-me") { printShow(safe, safeOut, machine); return; }
   if (safe.status === "resolved") {
-    safeOut(`${safe.repo}: followed incoming checkout; local Git state quarantined at ${safe.quarantine}`);
+    safeOut(`${safe.repo}: now follows your other computer's checkout; ${thisComputer(machine)}'s Git state was set aside at ${safe.quarantine}`);
     return;
   }
   if (safe.status === "published") {
-    safeOut(`${safe.repo}: published; your repo is the synced truth now (sequence ${safe.sequence}).`);
+    safeOut(`${safe.repo}: published; ${thisComputersVersion(machine)} is the synced truth now (sequence ${safe.sequence}).`);
     return;
   }
   if (safe.status === "ack-uncertain") {
@@ -353,7 +357,7 @@ function emit(output: ResolveOutput, json: boolean, deps: GitResolveDeps, root: 
     return;
   }
   if (safe.status === "preview") {
-    printShow(safe.current, safeOut);
+    printShow(safe.current, safeOut, machine);
     printDiscardReport(safe.discardReport, safeOut);
     safeOut(safe.message);
     safeOut(`Confirm exactly this preview with: ${keepMineConfirmCommand(safe.repo, safe.confirm.snapshot, safe.confirm.forceDiscardIncoming)}`);
@@ -361,7 +365,20 @@ function emit(output: ResolveOutput, json: boolean, deps: GitResolveDeps, root: 
   }
   safeErr(`${safe.repo}: ${safe.message}`);
   if (safe.status === "snapshot-mismatch" && safe.discardReport) printDiscardReport(safe.discardReport, safeErr);
-  if (safe.current) printShow(safe.current, safeErr);
+  if (safe.current) printShow(safe.current, safeErr, machine);
+}
+
+/** Empty when the hostname is unreadable or useless, so the copy falls back to
+ *  the direction-only sentences instead of naming a placeholder machine. */
+function localMachine(deps: GitResolveDeps): string | undefined {
+  let raw: string;
+  try {
+    raw = (deps.hostname ?? os.hostname)();
+  } catch {
+    return undefined;
+  }
+  const name = sanitizeTerminalText(raw.replace(/[\r\n\p{Cc}]+/gu, " ")).trim();
+  return name && name !== "localhost" ? name : undefined;
 }
 
 async function defaultBuild(root: string): Promise<ResolveEnvironment> {

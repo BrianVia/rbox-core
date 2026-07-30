@@ -164,6 +164,7 @@ function deps(lines: string[], extra: Parameters<typeof gitResolveCmd>[4] = {}) 
     stdout: (line: string) => lines.push(line),
     stderr: (line: string) => lines.push(line),
     now: () => new Date("2026-07-13T01:00:00.000Z"),
+    hostname: () => "Test-Desktop",
     confirmedPush: async () => {
       const state = await loadState(root, syncStreamId(cfg));
       return {
@@ -235,6 +236,32 @@ test("show-me snapshot is stable and JSON exposes no commit OIDs", async () => {
   expect(withoutSnapshot).not.toMatch(/\b[0-9a-f]{40}\b/);
 });
 
+test("show-me names this machine in keep-mine's description and falls back to direction alone", async () => {
+  await fixture();
+  const named: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "show-me", {}, deps(named, {
+    hostname: () => "Brians-Desktop",
+    stdout: (line: string) => named.push(line),
+    stderr: () => {},
+  }))).toBe(0);
+  const keepMine = named.find((line) => line.startsWith("What to do:"))!;
+  expect(keepMine).toContain("keep this computer's version (Brians-Desktop) and publish it");
+  expect(keepMine).toContain("use the version from your other computer");
+  expect(keepMine).not.toContain("theirs and");
+  expect(named.find((line) => line.startsWith("What happened:"))).toContain("this computer (Brians-Desktop)");
+
+  const anonymous: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "show-me", {}, deps(anonymous, {
+    hostname: () => "localhost",
+    stdout: (line: string) => anonymous.push(line),
+    stderr: () => {},
+  }))).toBe(0);
+  const fallback = anonymous.find((line) => line.startsWith("What to do:"))!;
+  expect(fallback).toContain("keep this computer's version and publish it");
+  expect(fallback).toContain("use the version from your other computer");
+  expect(fallback).not.toContain("localhost");
+});
+
 test("show-me batches subjects and keeps progress exclusively on stderr", async () => {
   await fixture();
   const stdout: string[] = [];
@@ -248,11 +275,11 @@ test("show-me batches subjects and keeps progress exclusively on stderr", async 
   const snapshotLine = stdout.at(-1)!;
   expect(snapshotLine).toMatch(/^  Confirmation token: [0-9a-f]{64}$/);
   expect(stdout.slice(0, 3)).toEqual([
-    "What happened: rbox paused Git sync for repo because local work and the incoming branch main need a choice.",
+    "What happened: rbox paused Git sync for repo because this computer (Test-Desktop) and your other computer both changed Git state; the branch main from your other computer is waiting.",
     "What is safe: Your repository is healthy; rbox has not changed your local Git state.",
-    expect.stringMatching(/^What to do: preview publishing my work with 'rbox' 'git' 'resolve' 'repo' 'keep-mine'; or use 'rbox' 'git' 'resolve' 'repo' 'take-theirs' '--confirm' '[0-9a-f]{64}' to discard my local changes and follow incoming\.$/),
+    expect.stringMatching(/^What to do: to keep this computer's version \(Test-Desktop\) and publish it to your other computers, preview with 'rbox' 'git' 'resolve' 'repo' 'keep-mine'; to use the version from your other computer and set aside this computer's Git changes, run 'rbox' 'git' 'resolve' 'repo' 'take-theirs' '--confirm' '[0-9a-f]{64}'\.$/),
   ]);
-  expect(stdout).toContain("  branch local-topic, branch local-topic's reflog, branch main, branch main's reflog contain local-only history after the incoming snapshot: local-only");
+  expect(stdout).toContain("  branch local-topic, branch local-topic's reflog, branch main, branch main's reflog contain history that exists only on this computer: local-only");
   expect(stdout).toContain("  rbox paused the apply step because of local commits since 2026-07-13T00:00:00.000Z.");
   expect(stderr).toEqual([
     "show-me: staging incoming bundle…",
@@ -338,8 +365,8 @@ test("show-me JSON is exhaustive while only human local-only presentation is cap
   expect(await gitResolveCmd(root, receiver, "show-me", {}, deps(humanOut, {
     stdout: (line) => humanOut.push(line), stderr: () => {},
   }))).toBe(0);
-  expect(humanOut.filter((line) => line.includes("local-only history after the incoming snapshot:"))).toHaveLength(50);
-  expect(humanOut).toContain("  …and 2 more local-only commits.");
+  expect(humanOut.filter((line) => line.includes("history that exists only on this computer:"))).toHaveLength(50);
+  expect(humanOut).toContain("  …and 2 more commits only on this computer.");
 
   const hiddenSubject = full.localOnlyCommits.slice(50).map((entry) => entry.subject).find((subject) => subjectOids.has(subject));
   expect(hiddenSubject).toBeDefined();
@@ -466,8 +493,8 @@ test("git deferrals brief is deterministic, actionable, anchored, quoted, and ho
   expect(output).toContain("rbox version: 9.8.7-test");
   expect(output).toContain("Also deferred: capture");
   expect(output).toContain("Your repository is healthy; only rbox's bookkeeping is paused");
-  expect(output).toContain("`keep-mine` to publish my local work as truth");
-  expect(output).toContain("`take-theirs` to discard my local changes and follow incoming");
+  expect(output).toContain("`keep-mine` to keep this computer's version and publish it to your other computers");
+  expect(output).toContain("`take-theirs` to use the version from your other computer and set aside this computer's Git changes");
   const command = lines.find((line) => line.startsWith("cd "))!;
   expect(command).toContain(`cd '${root}' && 'rbox' 'git' 'resolve'`);
   expect(command).toContain("'\\''");
@@ -815,7 +842,7 @@ test("keep-mine confirmation executes synchronously from the confirmed preview",
     confirm: preview.current.snapshot,
   }, deps(confirmed));
   expect(confirmCode).toBe(0);
-  expect(confirmed.join("\n")).toContain("published; your repo is the synced truth now");
+  expect(confirmed.join("\n")).toContain("published; this computer's version (Test-Desktop) is the synced truth now");
   const after = repoRecordsForState(await loadState(root, syncStreamId(cfg))).repo!;
   expect(after).toEqual(before);
   expect(await git(receiver, "for-each-ref", "--format=%(refname) %(objectname)")).toBe(refsBefore);

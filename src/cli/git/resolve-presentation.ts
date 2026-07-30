@@ -38,31 +38,43 @@ function humanResolveCommand(show: GitResolveShow, verb: "keep-mine" | "take-the
   return argv.map(shQuote).join(" ");
 }
 
-export function printShow(show: GitResolveShow, write: (line: string) => void): void {
+/** This computer, named when the hostname is readable. Never enters `--json`
+ *  or the shareable `--brief`: it is a human aid on this terminal only. */
+export function thisComputer(machine?: string): string {
+  return machine ? `this computer (${machine})` : "this computer";
+}
+
+/** "this computer's version (Brians-Desktop)" — the possessive form, kept
+ *  separate so the machine name never lands inside an awkward genitive. */
+export function thisComputersVersion(machine?: string): string {
+  return machine ? `this computer's version (${machine})` : "this computer's version";
+}
+
+export function printShow(show: GitResolveShow, write: (line: string) => void, machine?: string): void {
   const checkout = show.incomingCheckout.kind === "branch" ? `branch ${show.incomingCheckout.label}` : "detached checkout";
-  write(`What happened: rbox paused Git sync for ${show.repo} because local work and the incoming ${checkout} need a choice.`);
+  write(`What happened: rbox paused Git sync for ${show.repo} because ${thisComputer(machine)} and your other computer both changed Git state; the ${checkout} from your other computer is waiting.`);
   write("What is safe: Your repository is healthy; rbox has not changed your local Git state.");
-  write(`What to do: preview publishing my work with ${humanResolveCommand(show, "keep-mine")}; or use ${humanResolveCommand(show, "take-theirs")} to discard my local changes and follow incoming.`);
-  write(`  Incoming checkout: ${checkout}`);
+  write(`What to do: to keep ${thisComputersVersion(machine)} and publish it to your other computers, preview with ${humanResolveCommand(show, "keep-mine")}; to use the version from your other computer and set aside this computer's Git changes, run ${humanResolveCommand(show, "take-theirs")}.`);
+  write(`  Waiting from your other computer: ${checkout}`);
   const workingFiles = show.oracle === "clean" ? "match the last applied snapshot"
-    : show.oracle === "dirty" ? "changed locally after the last applied snapshot"
+    : show.oracle === "dirty" ? "changed on this computer after the last applied snapshot"
     : "could not be compared safely";
-  const index = show.index === "matches-incoming" ? "matches incoming"
-    : show.index === "diverged" ? "differs from incoming"
-    : show.index === "absent" ? "is absent on both sides"
+  const index = show.index === "matches-incoming" ? "matches your other computer's version"
+    : show.index === "diverged" ? "differs from your other computer's version"
+    : show.index === "absent" ? "is absent on both computers"
     : "could not be compared safely";
-  const operation = show.operationState === "matches-incoming" ? "matches incoming" : "differs from incoming";
-  const stash = show.stash === "clean" ? "matches incoming"
-    : show.stash === "diverged" ? "contains local-only history"
+  const operation = show.operationState === "matches-incoming" ? "matches your other computer's version" : "differs from your other computer's version";
+  const stash = show.stash === "clean" ? "matches your other computer's version"
+    : show.stash === "diverged" ? "contains history only on this computer"
     : "is not owned by this checkout";
   write(`  Working files ${workingFiles}; the index ${index}; Git operation state ${operation}; the stash ${stash}.`);
-  if (show.localOnlyCommits.length === 0) write("  Local-only history: none.");
+  if (show.localOnlyCommits.length === 0) write("  History only on this computer: none.");
   else {
     for (const commit of show.localOnlyCommits.slice(0, HUMAN_LOCAL_ONLY_CAP)) {
       const refs = commit.labels.map(humanRefLabel);
-      write(`  ${refs.join(", ")} ${refs.length === 1 ? "contains" : "contain"} local-only history after the incoming snapshot: ${commit.subject}`);
+      write(`  ${refs.join(", ")} ${refs.length === 1 ? "contains" : "contain"} history that exists only on this computer: ${commit.subject}`);
     }
-    if (show.localOnlyCommits.length > HUMAN_LOCAL_ONLY_CAP) write(`  …and ${show.localOnlyCommits.length - HUMAN_LOCAL_ONLY_CAP} more local-only commits.`);
+    if (show.localOnlyCommits.length > HUMAN_LOCAL_ONLY_CAP) write(`  …and ${show.localOnlyCommits.length - HUMAN_LOCAL_ONLY_CAP} more commits only on this computer.`);
   }
   for (const d of show.deferrals) {
     const reason = gitDeferralReasonPresentation(d.reason).label;
@@ -79,9 +91,9 @@ function laneLabel(lane: string): string {
 }
 
 export function printDiscardReport(report: ResolutionDiscardReport, write: (line: string) => void): void {
-  write("What the old synced snapshot has that your repo doesn't (final check happens at publish):");
+  write("What your other computer's waiting version has that this computer doesn't (final check happens at publish):");
   for (const lane of report.lanes) write(`  ${laneLabel(lane.lane)}: ${lane.disposition === "subsumed" ? "nothing would be lost" : lane.disposition === "not-subsumed" ? "would be discarded" : "couldn't be checked"} — ${lane.detail}`);
-  if (report.forceRequired) write("  Some of the old snapshot would be discarded — confirming requires --force-discard-incoming. (Your local files, branches, and history are untouched either way.)");
+  if (report.forceRequired) write("  Some of your other computer's waiting version would be discarded — confirming requires --force-discard-incoming. (This computer's files, branches, and history are untouched either way.)");
 }
 
 export function keepMineConfirmCommand(repo: string, snapshot: string, force: boolean): string {

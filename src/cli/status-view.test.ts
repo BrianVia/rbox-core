@@ -88,7 +88,7 @@ test("status companion explains the hold without changing the shared deferred gr
   });
   expect(frozen).toBe("git deferred 1h: local commits on detached checkout (repo)");
   const actionable = renderGitDeferralCompanion({ reason: "local-commits", canResolve: true, canKeepMine: true });
-  expect(actionable).toBe("Your repository is healthy; only rbox's bookkeeping is paused (local commits). To publish my work, run `rbox git resolve <repo> keep-mine`; `take-theirs` discards my local changes and follows incoming.");
+  expect(actionable).toBe("Your repository is healthy; only rbox's bookkeeping is paused (local commits). To keep this computer's version and publish it, run `rbox git resolve <repo> keep-mine`; `take-theirs` uses the version from your other computer and sets aside this computer's Git changes.");
   expect(actionable).not.toMatch(/^git(?:-sync)? deferred/);
   expect(renderGitDeferralCompanion({ reason: "git-busy", canResolve: false, canKeepMine: false }))
     .toBe("Your repository is healthy; only rbox's bookkeeping is paused (git busy). Let the other Git process finish, then let sync retry.");
