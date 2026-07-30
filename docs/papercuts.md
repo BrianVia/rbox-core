@@ -447,3 +447,21 @@ behind-origin count; loudly warn when behind.
   inventory — one row of §5.2 per named owner — before dispatch. Rule: when every
   lane's fixtures construct the same precondition by hand, that precondition has
   no owner.
+
+- **A `verification` halt names no cause, and that cost wave 5A the M4 defect
+  (2026-07-30, snapshot-replay):** `prove-staging.ts` raises five distinct
+  `halt("verification", …)` refusals with a message each, but the message is
+  dropped — the durable record and the returned outcome both carry
+  `underlyingCode: null`. Wave 5A's own behavior test saw M4 refuse an empty
+  corpus and attributed it to "3A/5C fixture territory"; replaying a real 81 MiB
+  workspace showed every fidelity check passing and the refusal coming from M4's
+  `JSON.stringify` tuple comparison. Fix hint: `halt`'s detail string already
+  exists at every raise site — put it in `underlyingCode`, which the taxonomy
+  already uses for exactly this in `authority.ts`'s `corruptionHalt`.
+
+- **`os.tmpdir()` is a RAM-backed tmpfs on the Linux desktop (2026-07-30):** a
+  harness that staged copies of an 81 MiB legacy state under `/tmp` spent ~1 GiB
+  of MEMORY per run and pushed a 31 GiB tmpfs to 80% before commands started
+  failing with bare exit-1 and no output. Cost ~20 minutes of misdiagnosis. Fix
+  hint: anything staging workspace-sized data should default to `/var/tmp`
+  (disk-backed) and never `os.tmpdir()` on this host.
