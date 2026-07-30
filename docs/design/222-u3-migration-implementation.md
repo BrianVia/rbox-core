@@ -2034,6 +2034,100 @@ dated and re-checked before the 2.0 tag.
 - Every file ≤400 lines / 25 KiB; 301–399 carries a review note.
 - `docs/CODEMAP.md` gains one ownership line per new module in the same change.
 
+### 7.10 Wave 5C — the fault primitive, and what it changed (LANDED)
+
+**The rule 5C was created to enforce.** Across eight lanes the most-repeated
+defect class was a fixture encoding a state the machine cannot produce: 3A's M4
+halt written off as "fixture territory" when no corpus could pass it; 4A's row
+test passing only because its fixture recorded a Q-sibling disposition no crash
+produces; 5B's `format-too-new` fixture encoding the wrong verdict, and its
+post-flip abort test passing for the wrong reason. Each was self-consistent and
+wrong. **5C plants nothing.** Every state it asserts against is produced by
+driving the real machine to a real instant and ending it there.
+
+**The primitive** (`migration/fault-rig.ts`). Every migration and genesis module
+uses `import fs from "node:fs"` and calls through the namespace object, so the
+property is resolved at call time and one assignment reaches all of them. A
+fault point is `{syscall, match, nth, when}` and an action is `kill`, `errno`,
+`short-write`, or `side-effect`. It is not a fake filesystem: every untargeted
+call, and every `when: "after"` targeted call, performs the real syscall.
+`fault-rig-child.ts` is the spawnable half, because SIGKILL only means something
+in a process the test does not need back; **it exits 65 when its point is never
+reached**, so an unreachable kill point reads as a failure rather than a pass.
+
+**The matrix is derived, not authored.** `scripts/probe/u3-5c-trace.ts` makes the
+machine report its own `node:fs` mutations per phase. The kill points below are
+that output, not a reading of this document — which is the same discipline
+applied to the test design itself:
+
+| Window | The physical effect the machine actually performs |
+|---|---|
+| every phase | `rename migration-v1.json.<id>.<rev>.tmp -> migration-v1.json` |
+| M1 | the body-sha backup and the fixed `pre-163-latest.json.bak` renames |
+| M4 -> M5 | `rename state.db.migrate.<id> -> state.db` |
+| M5 -> M6 | `rename state.json.migrate.<id>.q -> state.json` — the flip |
+| M6 | `unlink reserve-1mib.bin`, `unlink migration-emergency.<id>.bin` |
+| M7 | `unlink` the prepared sibling, then `unlink` the control |
+
+The first thing the probe caught was one of 5C's own fixtures: a manifest built
+with `hash` instead of `sha256` and no `type` halted at `verification`, and the
+machine refused it rather than importing it. A hand-planted corpus would have
+encoded that halt as expected behaviour.
+
+### 7.11 FINDING — `filesystem-full` is unreachable for an ordinary control publication
+
+`isOutOfSpace` in `control-publication.ts` guards only the **halt** publication's
+runway, through `haltRunway`. An `ENOSPC`/`EDQUOT` during an **ordinary** control
+publication is classified by nothing: it unwinds past `step`'s two typed catches
+(`MigrationPhaseHaltError`, `MigrationControlError`), out of `runMigration`, and
+out of `state-plane-cmd.ts`'s `inWindow` — whose own comment says the "no bare
+throws to the CLI" rule exists to prevent exactly this. §5.2 lists
+`filesystem-full` as a reachable halt for M1–M5 and §6.3 writes copy for it, but
+no code path can produce that halt for the publication itself before M6 prepares
+a runway.
+
+**Severity: copy and typed-outcome, not corruption.** The behaviour is still
+fail-closed — the prepared sibling is removed, the canonical control is
+untouched, and re-entry re-classifies at the previous phase and converges. The
+user gets a stack trace instead of the sentence §6.3 already wrote. Pinned by
+`guard-coverage.test.ts`'s `FINDING:` test, which asserts the behaviour that
+EXISTS and must be **inverted, not deleted**, when the gap is closed.
+
+### 7.12 The standing mutation gate (§7.9, executable)
+
+Eight review rounds found "correct guard, no test that notices its deletion" one
+at a time, by hand. `scripts/mutation-gate.ts` makes it a gate: a **curated**
+table of load-bearing guards, each naming an exact source anchor and the one test
+that must fail when the guard is removed. Deliberately not exhaustive AST
+mutation — that costs minutes and yields mostly equivalent mutants, which is how
+mutation testing usually dies. Three properties make it a gate:
+
+1. **The anchor must match exactly once** — zero means the guard moved or was
+   deleted, two means the anchor is ambiguous. Same self-expiry as the duplicate
+   and file-size gates; a row cannot outlive what it excuses.
+2. **The baseline must pass before the mutant is judged.** A test that cannot run
+   in the sandbox would otherwise "fail" under mutation for the wrong reason and
+   report a healthy guard — the gate reproducing its own bug. Baseline failure is
+   a BROKEN row, never a surviving guard.
+3. **A surviving mutant fails loudly**, naming guard, file, and the test that was
+   supposed to notice.
+
+`src/` is copied once into `.cache/mutation-gate` and mutated there, so the
+working tree is never touched. Runs in ~4 s; wired as `bun run gate:mutation` in
+the `checks` CI leg.
+
+**On its first run, three of five guards SURVIVED** — `runway-enospc-predicate`,
+`phase-receipt-phase-match`, and `source-rebracket` were all deletable with the
+suite green. `guard-coverage.test.ts` was written to close them, and the gate is
+green at five of five. Two lessons are worth keeping: a mutation whose anchor
+covers only the first line of a multi-line condition does **not** remove the
+guard (`source-rebracket` first appeared covered for that reason), and a guard
+that is a second line of defence needs a test that reaches **its** window
+specifically — perturbing between driver iterations proves nothing about
+`bracketSource`, because the classifier catches it one layer earlier.
+
+---
+
 ---
 
 ## 8. Sequencing and dispatch
