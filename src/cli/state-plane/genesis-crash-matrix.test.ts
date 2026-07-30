@@ -8,18 +8,24 @@
  * the transitions named — with a comment — as unreachable from inside genesis,
  * and each of those still uses bytes a real crashed run produced.
  *
- * TWO RIG FINDINGS, recorded here because they shape everything below.
- * 1. `migration/fault-rig.ts` patches the `node:fs` DEFAULT EXPORT. Genesis
- *    performs 28 of its 36 workspace-touching calls through `node:fs/promises`
- *    — including the intent publication, BOTH renames and BOTH parent fsyncs,
- *    i.e. every kill point §7.2 names for genesis. So the shipped rig cannot
- *    reach any of them. In Bun `fs.promises === fsp` (measured), so the fix is
- *    one surface parameter on the rig; until it lands, this file patches that
- *    object itself, with the rig's exact semantics.
- * 2. `migration/fault-rig-child.ts`'s `genesis` command mints `randomUUID()`
- *    ids, and `installGenesisLineage` requires `^[0-9a-f]{32}$` — so that
- *    command throws at step 4 on every invocation and can never reach steps
- *    5–7. The child below takes its ids from argv instead.
+ * TWO RIG FINDINGS, recorded here because they shape everything below. Both
+ * were fixed in this same PR; the history is kept because it explains the file.
+ * 1. `migration/fault-rig.ts` originally patched only the `node:fs` DEFAULT
+ *    EXPORT. Genesis performs 28 of its 36 workspace-touching calls through
+ *    `node:fs/promises` — including the intent publication, BOTH renames and
+ *    BOTH parent fsyncs, i.e. every kill point §7.2 names for genesis — so the
+ *    rig could not reach a single one. The rig now takes a `surface`.
+ *    `patchPromise` below is NOT that gap surviving: it remains because its
+ *    predicates match on NON-STRING arguments (`typeof args[1] === "number"`,
+ *    to catch one `open` overload and not another), which the rig's
+ *    regex-over-joined-string-arguments deliberately cannot express. Where a
+ *    path regex suffices, use the rig.
+ * 2. `migration/fault-rig-child.ts` had a `genesis` command that minted
+ *    `randomUUID()` ids while `installGenesisLineage` requires `^[0-9a-f]{32}$`,
+ *    so it threw at step 4 on every invocation and could never reach steps 5–7.
+ *    That command is now deleted rather than fixed: §7.9 forbids `migration/**`
+ *    from importing `genesis.ts`, and a harness is not exempt from a structural
+ *    rule it can silently break. The child below is genesis's own.
  */
 import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
@@ -39,6 +45,13 @@ import { inodeOf as inodeKey, replaceUnderNewInode } from "./migration/inode-fix
 import { genesisPaths, sqliteResetPaths, statePath } from "./paths.js";
 import { openStateStore, stateStoreDatabase } from "./store/open.js";
 
+// The branded lock witness, constructed rather than acquired. This is §7.9's
+// enumerated test exception to the cast gate, and the repo convention at ten
+// other sites. It is sound HERE for one specific reason, not by habit:
+// `establish` takes the bundle as proof-of-exclusivity and never reads a member
+// of it, so a real bundle and this one are indistinguishable to the code under
+// test. The migration child takes the trouble to acquire a real bundle because
+// it drives a whole command that DOES pass locks onward.
 const LOCKS = {} as Parameters<typeof establish>[2];
 const SIDECARS = ["-wal", "-shm", "-journal"];
 const hex32 = (): string => randomBytes(16).toString("hex");

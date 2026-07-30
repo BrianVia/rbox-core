@@ -109,6 +109,15 @@ export const MUTATION_GUARDS: readonly MutationGuard[] = [
     reason:
       "222 §5.2's M6 row calls this the last operation before the rename with nothing between, and §6.2's legacy-write-detected disposition is reachable only here; without it an older rbox's write inside the check-to-rename microwindow is flipped over and silently lost.",
   },
+  {
+    id: "cleanup-m6-receipt",
+    file: "cli/state-plane/migration/cleanup.ts",
+    anchor: 'if (control.witness.phase !== "M6") return corruptCleanup(',
+    removed: "if (false) return corruptCleanup(",
+    test: "cli/state-plane/migration/guard-coverage.test.ts",
+    reason:
+      "The direct analogue of phase-receipt-phase-match, one phase later: it survived all six 5C matrices and all fourteen behavioural state-plane suites, including its own owning cleanup.test.ts, so the cleanup cursor could be driven from a non-M6 witness with nothing noticing.",
+  },
 ];
 
 const REPO = path.resolve(import.meta.dir, "..");
@@ -117,13 +126,15 @@ const SANDBOX = path.join(REPO, ".cache", "mutation-gate");
 export interface GuardVerdict {
   readonly id: string;
   /** `killed` = the guard is covered. Everything else fails the gate. */
-  readonly status: "killed" | "survived" | "stale-anchor" | "baseline-broken";
+  readonly status: "killed" | "survived" | "stale-anchor" | "baseline-broken" | "mutant-unbuildable";
   readonly detail: string;
 }
 
 /** Anchor health only — cheap, and the half of the gate worth running everywhere. */
-export function checkAnchors(root = REPO): GuardVerdict[] {
-  return MUTATION_GUARDS.map((guard) => {
+export function checkAnchors(
+  root = REPO, guards: readonly MutationGuard[] = MUTATION_GUARDS,
+): GuardVerdict[] {
+  return guards.map((guard) => {
     const file = path.join(root, "src", guard.file);
     if (!fs.existsSync(file)) {
       return { id: guard.id, status: "stale-anchor" as const, detail: `${guard.file} does not exist` };
@@ -148,18 +159,33 @@ function prepareSandbox(): string {
   return path.join(SANDBOX, "src");
 }
 
-function runTest(sandboxSrc: string, testFile: string): { ok: boolean; output: string } {
+/**
+ * `assertionsFailed` is the difference between a guard that is covered and a
+ * mutant that merely failed to compile. Any non-zero exit would otherwise read
+ * as "killed", so a row whose `removed` text does not parse or typecheck would
+ * report a HEALTHY guard — the gate quietly asserting nothing, which is the
+ * exact failure mode it exists to catch. Bun prints `(fail)` only for a test
+ * that ran and failed, so its presence is the proof that a test did the killing.
+ */
+function runTest(sandboxSrc: string, testFile: string): {
+  ok: boolean; assertionsFailed: boolean; output: string;
+} {
   const proc = Bun.spawnSync(
     [process.execPath, "test", path.join(sandboxSrc, testFile), "--bail"],
     { cwd: REPO, stdout: "pipe", stderr: "pipe", env: { ...process.env, RBOX_MUTATION_GATE: "1" } },
   );
   const output = new TextDecoder().decode(proc.stdout) + new TextDecoder().decode(proc.stderr);
-  return { ok: proc.exitCode === 0, output };
+  return { ok: proc.exitCode === 0, assertionsFailed: output.includes("(fail)"), output };
 }
 
-/** The full sweep: baseline every named test, then kill each guard in turn. */
-export function runMutationGate(): GuardVerdict[] {
-  const anchors = checkAnchors();
+/**
+ * The full sweep: baseline every named test, then kill each guard in turn.
+ *
+ * `guards` is injectable so the gate's own vacuity check can run the real sweep
+ * over a deliberately broken row instead of asserting its behaviour in prose.
+ */
+export function runMutationGate(guards: readonly MutationGuard[] = MUTATION_GUARDS): GuardVerdict[] {
+  const anchors = checkAnchors(REPO, guards);
   const stale = anchors.filter((v) => v.status !== "killed");
   if (stale.length > 0) return anchors;
 
@@ -169,11 +195,11 @@ export function runMutationGate(): GuardVerdict[] {
   // Baseline once per distinct test file. A test that cannot pass unmutated
   // cannot testify about a mutant.
   const baselines = new Map<string, boolean>();
-  for (const test of new Set(MUTATION_GUARDS.map((g) => g.test))) {
+  for (const test of new Set(guards.map((g) => g.test))) {
     baselines.set(test, runTest(sandboxSrc, test).ok);
   }
 
-  for (const guard of MUTATION_GUARDS) {
+  for (const guard of guards) {
     if (baselines.get(guard.test) !== true) {
       verdicts.push({
         id: guard.id,
@@ -187,15 +213,22 @@ export function runMutationGate(): GuardVerdict[] {
     fs.writeFileSync(target, original.replace(guard.anchor, guard.removed));
     const mutated = runTest(sandboxSrc, guard.test);
     fs.writeFileSync(target, original);
-    verdicts.push(
-      mutated.ok
-        ? {
-          id: guard.id,
-          status: "survived",
-          detail: `removing the guard in ${guard.file} left ${guard.test} passing — that guard has no test that notices its deletion`,
-        }
-        : { id: guard.id, status: "killed", detail: `${guard.test} fails without the guard` },
-    );
+    if (mutated.ok) {
+      verdicts.push({
+        id: guard.id,
+        status: "survived",
+        detail: `removing the guard in ${guard.file} left ${guard.test} passing — that guard has no test that notices its deletion`,
+      });
+    } else if (!mutated.assertionsFailed) {
+      verdicts.push({
+        id: guard.id,
+        status: "mutant-unbuildable",
+        detail: `${guard.test} exited non-zero with no failing assertion, so the mutant probably did not compile — `
+          + `rewrite this row's \`removed\` text so it produces valid code that a TEST rejects`,
+      });
+    } else {
+      verdicts.push({ id: guard.id, status: "killed", detail: `${guard.test} fails without the guard` });
+    }
   }
   fs.rmSync(SANDBOX, { recursive: true, force: true });
   return verdicts;

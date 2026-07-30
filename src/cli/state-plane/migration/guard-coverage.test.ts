@@ -32,6 +32,7 @@ import { migrationPaths, sqliteResetPaths, statePath } from "../paths.js";
 import { runMigration } from "./authority.js";
 import { classifyMigrationState, PhaseReceipt } from "./classifier.js";
 import { publishMigrationHalt, readCanonicalControl } from "./control-publication.js";
+import { stepCleanup } from "./cleanup.js";
 import { installStatePlaneFault, installStatePlaneFaults } from "./fault-rig.js";
 import { replaceUnderNewInode } from "./inode-fixtures.js";
 import { preserveSource } from "./import-json.js";
@@ -356,4 +357,38 @@ test("a legacy write inside M6's check-to-rename microwindow stops the flip", as
   // document — the writer's data — is intact.
   expect(outcome.kind, JSON.stringify(outcome)).not.toBe("migrated");
   expect(await fsp.readFile(live)).toEqual(perturbed);
+});
+
+// ---------------------------------------------------------------------------
+// GUARD `cleanup-m6-receipt` — `cleanup.ts`'s `m6`.
+//
+// The direct analogue of `phase-receipt-phase-match`, one phase later, and it
+// survived all six 5C matrices AND all fourteen behavioural state-plane suites
+// — including its own owning `cleanup.test.ts`. The driver never routes a
+// non-M6 receipt here, which is exactly what this guard makes true, so the only
+// way to test it is with a receipt the machine genuinely minted for an earlier
+// phase.
+
+test("the cleanup cursor refuses a receipt that is not M6", async () => {
+  const root = await legacyWorkspace("cleanup-m6");
+  const parked = await under(root, async (entry) => {
+    const fault = installStatePlaneFault(
+      { syscall: "renameSync", match: /migration-v1\.json$/, nth: 3, when: "before" },
+      { kind: "errno", code: "EIO" },
+    );
+    try {
+      await runMigration(root, entry);
+    } catch {
+      // parking only
+    } finally {
+      fault.restore();
+    }
+    const control = readCanonicalControl(root);
+    expect(control?.witness.phase, "the machine must actually be parked short of M6").toBe("M1");
+    return PhaseReceipt.observe(control!);
+  });
+
+  await expect(
+    under(root, (entry) => stepCleanup(root, parked, entry.locks)),
+  ).rejects.toThrow(/cleanup requires an M6 receipt, not M1/);
 });

@@ -2137,8 +2137,9 @@ the `checks` CI leg.
 
 **On its first run, three of five guards SURVIVED** — `runway-enospc-predicate`,
 `phase-receipt-phase-match`, and `source-rebracket` were all deletable with the
-suite green. `guard-coverage.test.ts` was written to close them, and the gate is
-green at five of five. Two lessons are worth keeping: a mutation whose anchor
+suite green. `guard-coverage.test.ts` was written to close them. Review added
+two more rows (`flip-last-instant-reverify`, `cleanup-m6-receipt`); the table
+now stands at **seven, all killed**. Two lessons are worth keeping: a mutation whose anchor
 covers only the first line of a multi-line condition does **not** remove the
 guard (`source-rebracket` first appeared covered for that reason), and a guard
 that is a second line of defence needs a test that reaches **its** window
@@ -2201,7 +2202,8 @@ argue for the same thing, which is that doctor should be able to SEE them.
 ### 7.14 Further findings from 5C's matrices
 
 **FINDING — `rbox status` falsely reports a healthy migrated workspace as
-halted. User-visible, and the most serious thing 5C found.** On an empty
+halted, and the daemon then gates sync off. User-visible, and the most serious
+thing 5C found.** On an empty
 manifest with nothing wrong: one ordinary read-only load deposits `state.db-wal`
 and `state.db-shm`, which are never cleaned;
 `classifySqliteResetPredecode` reads that sidecar vector as row **W1**;
@@ -2209,10 +2211,15 @@ and `state.db-shm`, which are never cleaned;
 "sync halted to protect recovery state". 163's own decoder table treats W1 as an
 ordinary recoverable takeover, not an operator condition, and `recovery.ts` does
 take it over silently — only the read-only inspection surfaces it as a halt.
-**Doctor disagrees with status** on the same workspace (`checkState` reports
-`ok`/`sqlite`), which is the clearest evidence the halt is an artifact. It is
-also racy within one invocation, because `statusCmd` inspects the journal
-concurrently with its own store open. This is the read-only-open-still-writes
+**SCOPE CORRECTED (review).** 5C's first characterization was wrong in two
+ways. "Doctor gets it right" is FALSE — doctor makes the same read-only load and
+simply never consults the reset journal, so the divergence is which surfaces
+ASK, not which are correct. And the blast radius is larger than a misleading
+line of copy: it reaches `daemon.ts`'s `resetOperationBoundary`, so the real
+sequence is migrate -> status -> start -> **sync gated off**, measured at 18/25.
+The violation is one line in `store/open.ts`. Not this wave's fix; the lane is
+redirected. It is also racy within one invocation, because `statusCmd` inspects
+the journal concurrently with its own store open. This is the read-only-open-still-writes
 hazard 163 already records, reaching the operator surface. Pinned
 delete-when-fixed in `no-regression.test.ts`.
 
@@ -2247,7 +2254,10 @@ progress". Same gap as §7.13's strand item, reached from a second direction.
 are still uncovered.** An ad-hoc mutation sweep was run against 5C's new
 matrices rather than trusting their test counts. **Three of three mutants
 initially SURVIVED**, including the M6 last-instant re-verify — F5's entire
-subject — against a 55-test crash matrix. The cause is the same shape twice
+subject — against a 55-test crash matrix. Review found a FOURTH,
+`cleanup.ts`'s M6 receipt gate, which survived all six 5C matrices AND all
+fourteen behavioural state-plane suites including its own owning
+`cleanup.test.ts`. The cause is the same shape twice
 over: every other path that notices a changed source catches it one layer
 earlier, so a second-line-of-defence guard's own window is never entered by a
 test that perturbs between driver iterations. `guard-coverage.test.ts` now
@@ -2260,11 +2270,27 @@ table. Two remain uncovered and are recorded rather than hidden:
 | `revalidateActive`'s Q-sibling exactness (`authority-flip.ts`) | Needs the active database to change between M5 and the flip. Reachable with the rig's `side-effect` action; not written. |
 | `begin.ts`'s ENOSPC refill halt | On the halt-runway REFILL path, reached only through `restoreHaltRunway` on a retry, which the I/O matrix does not drive. |
 
+Review also confirmed the complement, which matters for reading the numbers
+correctly: the crash matrix's 12/12 survival rate is the CORRECT result for a
+convergence matrix — a second-line guard's window is never entered by one — and
+re-running those same 12 against the pre-existing behavioural suites killed 11.
+The gate table, not the matrix, is where a guard's coverage is owed.
+
 The lesson generalizes past this wave: **a test count is not coverage, and a
 matrix that passes 55 cells can still notice nothing.** The gate table is the
 artifact that makes that measurable, and it should grow by exactly this
 procedure — mutate, observe the survivor, write the test that reaches its
 window.
+
+**FINDING — the plane's tests exhaust `/tmp`'s INODE table, not its bytes.**
+On the Linux fleet host `/tmp` is RAM-backed tmpfs with ~1M inodes. The
+state-plane suite leaks its `mkdtemp` workspaces, and repeated runs drove
+inodes to **100% at 47% byte capacity**, which surfaces as a flood of `ENOSPC`
+failures across unrelated suites — a failure that reads as a code defect and is
+not one. A retry loop multiplies the leak by its retry count, so 5C's FINDING
+loop removes every attempt it discards. The general leak predates this wave and
+is survivable only because CI runners are fresh containers; anyone running the
+plane's suites repeatedly on a fleet host should expect it.
 
 **FINDING — M4 fidelity accepts a dropped manifest section.** A `RepoRecord`
 carrying `removedKey` on a repo that still has a live manifest section causes

@@ -56,7 +56,26 @@ test("the table is not empty", () => {
   expect(MUTATION_GUARDS.length).toBeGreaterThan(4);
 });
 
-test(
+test("a mutant that cannot build is not reported as a covered guard", () => {
+  // The gate's own vacuity check. Any non-zero exit would otherwise read as
+  // "killed", so a row whose `removed` text does not parse would report a
+  // HEALTHY guard — the gate asserting nothing, which is the failure mode it
+  // exists to catch. Verified against the real sweep in `vacuity` mode rather
+  // than asserted in prose.
+  const guard = MUTATION_GUARDS[0]!;
+  const broken = [{ ...guard, removed: "if (((((( " }];
+  const verdicts = runMutationGate(broken);
+  expect(verdicts.map((v) => v.status)).toEqual(["mutant-unbuildable"]);
+}, { timeout: 300_000 });
+
+/**
+ * The expensive sweep has ONE authority: `bun run gate:mutation` in CI's checks
+ * leg. It is opt-in here so the same minutes are not spent twice — running it
+ * from both places was pure duplication, not defence in depth. Set
+ * `RBOX_MUTATION_GATE_SWEEP=1` to run it locally.
+ */
+const sweep = process.env.RBOX_MUTATION_GATE_SWEEP === "1" ? test : test.skip;
+sweep(
   "every named guard's removal breaks its named test",
   () => {
     const verdicts = runMutationGate();
