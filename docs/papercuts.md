@@ -410,3 +410,40 @@ behind-origin count; loudly warn when behind.
   and would have merged clean. Fix hint: one test beside
   `duplicate-declarations.test.ts` over `src/cli/state-plane/**`, with the
   301-399 review-note band as a warning list rather than a failure.
+
+- **A "one line per module in the same change" doc rule with no gate is a rule
+  nobody keeps (2026-07-29, wave 5A):** 222 §7.9 required `docs/CODEMAP.md` to
+  gain one ownership line per new module in the same change. Eleven merged lanes
+  instead *proposed* their line in the PR body, because 5A was named the CODEMAP
+  owner and nothing failed without it — leaving **29 production state-plane
+  modules undocumented** by the time the integration lane opened. Worse, the
+  obvious gate is vacuous: `codemap.includes("src/cli/state-plane/migration/")`
+  passes for every module in a directory that documents exactly one of them, so
+  the first version of the check reported zero missing. Fix hint: match at LINE
+  START, and pin that no path appears twice — two lines for one path is two
+  owners. Rule: a documentation obligation stated in a design doc is a decoration
+  until a test reads the document.
+
+- **"Import graph" and "imports" are not the same structural claim
+  (2026-07-29, wave 5A):** 222 §M-9 required "no `node:fs`, `node:crypto`, or
+  `bun:sqlite` in this module's **import graph**" for the migration driver, while
+  §7.9 wrote the same gate as "`authority.ts` **imports** no …". The transitive
+  reading is unimplementable for a module whose entire job is sequencing bodies
+  that open databases and rename files — the same shape as 163 v13's finding that
+  M4's specified verification could not be performed. Rule: when a structural gate
+  is stated twice in one document, implement it once and say which reading
+  survived; a gate nobody can satisfy gets quietly reinterpreted by whoever
+  implements it.
+
+- **Two phase bodies fell between two lanes' scopes and nobody noticed for four
+  waves (2026-07-29, wave 5A):** 222 §8 assigned M2/M3/M4 to lane 3A and
+  "admission, which publishes nothing" to 2B, and M0/M1 — mint the ids, publish
+  the first control, claim the reserve, create the emergency candidate — belonged
+  to neither. The tree therefore carried `publishMigrationControl`'s
+  `FIRST_CONTROL_REVISION` branch and `migrationPaths.emergency` with **zero
+  production callers** through eleven merged PRs, and every lane's tests
+  hand-planted the control records M0 was supposed to produce. Fix hint: a wave
+  plan derived from a module inventory should be cross-checked against the *phase*
+  inventory — one row of §5.2 per named owner — before dispatch. Rule: when every
+  lane's fixtures construct the same precondition by hand, that precondition has
+  no owner.

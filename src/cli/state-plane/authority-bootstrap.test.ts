@@ -14,6 +14,7 @@ import {
 import { StateAuthorityCorruptError, StateWriteRefusedError } from "./errors.js";
 import { readGenesisIntent } from "./genesis.js";
 import type { EntryProof, HeldStatePlaneLocks } from "./locks.js";
+import type { MigrationOutcome } from "./migration/authority.js";
 import {
   MIGRATION_PHASES, encodeMigrationControl,
   type ArtifactItem, type HaltResource, type MigrationControl,
@@ -35,12 +36,19 @@ async function workspace(): Promise<string> {
   return root;
 }
 
-/** Records every call so "exactly one migration run" is observable. */
-function driver(): MigrationDriver<string> & { calls: number } {
+/** Records every call so "exactly one migration run" is observable.
+ *
+ * Wave 5A collapsed 2D's generic, so the stub now returns the real
+ * `MigrationOutcome`. This was invisible to both gates before — `tsconfig.json`
+ * excludes `**\/*.test.ts` and Bun erases the annotation at runtime — which is the
+ * same blind spot that cost lane 2B a review round. */
+const STUB_OUTCOME: MigrationOutcome = { kind: "migrated", phases: ["M7"], elapsedMs: 0 };
+
+function driver(): MigrationDriver & { calls: number } {
   const run = (async () => {
     run.calls += 1;
-    return "migrated";
-  }) as MigrationDriver<string> & { calls: number };
+    return STUB_OUTCOME;
+  }) as MigrationDriver & { calls: number };
   run.calls = 0;
   return run;
 }
@@ -274,7 +282,7 @@ test("a workspace carrying a migration control dispatches to migration", async (
   const root = await workspace();
   plantControl(root, "M0");
   const run = driver();
-  expect(await establishStateAuthority(root, ENTRY, run)).toEqual({ domain: "migration", outcome: "migrated" });
+  expect(await establishStateAuthority(root, ENTRY, run)).toEqual({ domain: "migration", outcome: STUB_OUTCOME });
   expect(run.calls).toBe(1);
 });
 
@@ -282,7 +290,7 @@ test("legacy JSON dispatches to migration without genesis claiming it", async ()
   const root = await workspace();
   await fsp.writeFile(statePath(root), JSON.stringify({ version: 1, entries: {} }));
   const run = driver();
-  expect(await establishStateAuthority(root, ENTRY, run)).toEqual({ domain: "migration", outcome: "migrated" });
+  expect(await establishStateAuthority(root, ENTRY, run)).toEqual({ domain: "migration", outcome: STUB_OUTCOME });
   expect(run.calls).toBe(1);
 });
 
@@ -327,7 +335,7 @@ test("C8: a genesis intent that finds an L refuses, retires, and migration runs 
   expect(fs.lstatSync(genesisPaths.staged(root, "a".repeat(32)), { throwIfNoEntry: false })).toBeUndefined();
 
   const run = driver();
-  expect(await establishStateAuthority(root, ENTRY, run)).toEqual({ domain: "migration", outcome: "migrated" });
+  expect(await establishStateAuthority(root, ENTRY, run)).toEqual({ domain: "migration", outcome: STUB_OUTCOME });
   expect(run.calls).toBe(1);
   expect(readGenesisIntent(root)).toBeUndefined();
   // The re-inspect is bounded: writes flow again the moment the intent is gone.

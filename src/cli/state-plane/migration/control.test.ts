@@ -367,6 +367,12 @@ describe("sole-writer gate (design 222 §7.9)", () => {
     const siblingOnly = [
       "cli/state-plane/migration/cleanup.ts",
       "cli/state-plane/migration/cleanup-runway.ts",
+      // Wave 5A split the sibling namespace out of the publisher so the strand
+      // repair had somewhere to live under the 400-line law. It is now the module
+      // that OWNS `controlRevision`, and it deliberately cannot name the canonical
+      // control — which is what keeps the property above true rather than
+      // weakening it.
+      "cli/state-plane/migration/control-sibling.ts",
     ];
     // Genesis must observe the control's ABSENCE at 222 §2.4 step 1, and §7.9
     // forbids it importing anything from `migration/` — so it is the one module

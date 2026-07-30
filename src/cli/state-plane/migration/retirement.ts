@@ -128,12 +128,25 @@ function notDerived(root: string, migrationId: string, items: readonly ArtifactI
  * the barrier inventory's one reader of the legacy document, and retirement
  * never interprets it.
  */
+/** `clearHalt` is the operator-abort discipline (163:2614: pre-`Q` abort is the
+ * path for "essentially every case", halted included). It publishes `halt: null`
+ * in the SAME revision that arms the retirement — bucket-1 discipline, so a
+ * workspace is never observable as armed-but-still-halted. No runway restoration
+ * is needed: `haltRunway` returns `[]` once a retirement is armed, and a halt that
+ * consumed reserve/emergency left them `consumed-for-halt`, which
+ * `retirementVector` already skips. The C1 path leaves it `false`, so a halted
+ * migration still cannot auto-arm C1 from the driver. */
+export interface ArmOptions {
+  readonly clearHalt?: boolean;
+}
+
 export function armRetirement(
   root: string, receipt: PhaseReceipt, trigger: C1Trigger, locks: HeldStatePlaneLocks,
+  options: ArmOptions = {},
 ): RetirementArming {
   const { control } = receipt;
   if (control.retirement) return corrupt("a retirement is already armed");
-  if (control.halt) return corrupt("a halted migration arms no retirement");
+  if (control.halt && !options.clearHalt) return corrupt("a halted migration arms no retirement");
   const fromPhase = control.witness.phase;
   if (fromPhase === "M6" || fromPhase === "M7") {
     return corrupt(`${fromPhase} is past the authority flip, where C1 cannot arm`);
@@ -157,7 +170,10 @@ export function armRetirement(
     originalSource: control.source, triggeringSource: trigger.replacement,
     cursor: { items, durablePrefix: 0, currentIntent: null },
   };
-  const next: MigrationControl = { ...control, controlRevision: control.controlRevision + 1, retirement };
+  const next: MigrationControl = {
+    ...control, controlRevision: control.controlRevision + 1, retirement,
+    halt: options.clearHalt ? null : control.halt,
+  };
   return { kind: "armed", control: publishMigrationControl(root, expectationFor(control), next, locks) };
 }
 
