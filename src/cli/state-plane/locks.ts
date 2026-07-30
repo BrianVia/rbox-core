@@ -13,6 +13,7 @@ import { repoCtxFromDisk } from "../../engine/git-state.js";
 import { acquireLock, type OwnedLock } from "../../engine/git/lockfile.js";
 import { withRepositoryRecoveryFence, type RepositoryProtocolFenceRequest } from "../../engine/git/protocol-locks.js";
 import { repositoryIdentityForContext, repositoryIdentityHash } from "../../engine/git/repo-lineage.js";
+import { ResetMemoryAdmissionError } from "../reset-io.js";
 import { readResetJournal, recoverResetJournalUnderHeldFence } from "../reset-journal.js";
 import { repoRecordsForState } from "../sync-state-model.js";
 import {
@@ -53,12 +54,29 @@ export interface DegradedFenceRefusal {
   readonly detail: string;
 }
 
+/**
+ * The parse budget refused the legacy document, so the inventory this fence is
+ * derived from could not be read at all (163:3309's envelope, measured).
+ *
+ * It shares the `memory-admission` name with the halt code deliberately — one
+ * condition, one word of copy — but it is NEVER a halt: it is raised while
+ * deriving the read-only inventory, before a mutex is minted or any artifact is
+ * touched, so there is nothing durable for a halt to describe. A 16 GiB host
+ * with an 81 MB `state.json` reaches this on every attempt.
+ */
+export interface MemoryAdmissionRefusal {
+  readonly code: "memory-admission";
+  readonly detail: string;
+}
+
+export type StatePlaneLockRefusal = DegradedFenceRefusal | MemoryAdmissionRefusal;
+
 /** The bundle was held, or it was refused before anything was locked or
  * written. A degraded workspace is a refusal with user-facing copy, not an
  * exception — and not a body that runs anyway. */
 export type StatePlaneLockOutcome<T> =
   | { readonly held: true; readonly value: T }
-  | { readonly held: false; readonly refusal: DegradedFenceRefusal };
+  | { readonly held: false; readonly refusal: StatePlaneLockRefusal };
 
 export interface StatePlaneLockOptions {
   /** Bounded restarts when the fenced recheck sees a changed inventory. */
@@ -150,6 +168,30 @@ async function inspectInventory(root: string): Promise<Inventory> {
   };
 }
 
+/**
+ * The inventory read's own refusal, carried out of the fence by an exception
+ * because the two `inspectInventory` call sites sit at different depths. Minted
+ * here and nowhere else, so the single catch in `withStatePlaneLocks` cannot
+ * capture a refusal the body raised after writing something.
+ */
+class InventoryRefused extends Error {
+  constructor(readonly refusal: StatePlaneLockRefusal) {
+    super(refusal.detail);
+    this.name = "InventoryRefused";
+  }
+}
+
+async function readInventory(root: string): Promise<Inventory> {
+  try {
+    return await inspectInventory(root);
+  } catch (error) {
+    if (error instanceof ResetMemoryAdmissionError) {
+      throw new InventoryRefused({ code: "memory-admission", detail: error.message });
+    }
+    throw error;
+  }
+}
+
 /** Finish any standing reset transaction before the caller observes the
  * workspace: a migration may not begin on a half-completed reset. */
 async function completeStandingReset(root: string, inventory: Inventory, stateLock: OwnedLock): Promise<void> {
@@ -168,6 +210,12 @@ async function completeStandingReset(root: string, inventory: Inventory, stateLo
  * workspace whose locking is known unreliable is exactly the population
  * `degraded-fence` exists to keep away from state mutation. It is reported as a
  * refusal so the caller can print 163:2446's copy instead of a stack trace.
+ *
+ * The inventory read is the second refusal for the same reason. It parses the
+ * whole legacy document, so on a small-memory host it is the FIRST thing an
+ * oversized `state.json` stops — earlier than M0's own `memory-admission` halt
+ * can ever be consulted. This function promises a typed outcome, so that
+ * measurement arrives as one, not as a `RangeError` out of the fence.
  *
  * The mutex's other two health axes are not rechecked here: it was acquired for
  * this exact root one statement earlier, and ownership is verified where the
@@ -190,7 +238,7 @@ export async function withStatePlaneLocks<T>(
         };
       }
       await options.onStage?.("mutex");
-      const inventory = await inspectInventory(root);
+      const inventory = await readInventory(root);
       await options.onStage?.("inventory");
       const restart = await withRepositoryRecoveryFence(inventory.requests, path.resolve(statePath(root)), async () => {
         await options.onStage?.("fence");
@@ -201,7 +249,7 @@ export async function withStatePlaneLocks<T>(
         const stateLock = acquired.lock;
         try {
           await options.onStage?.("state-lock");
-          if (inventoryFingerprint(await inspectInventory(root)) !== inventoryFingerprint(inventory)) {
+          if (inventoryFingerprint(await readInventory(root)) !== inventoryFingerprint(inventory)) {
             return { restart: true as const };
           }
           await options.onStage?.("fenced-recheck");
@@ -218,6 +266,9 @@ export async function withStatePlaneLocks<T>(
         }
       });
       if (!restart.restart) return { held: true, value: restart.value };
+    } catch (error) {
+      if (error instanceof InventoryRefused) return { held: false, refusal: error.refusal };
+      throw error;
     } finally {
       await releaseWorkspaceSyncMutex(mutex);
     }

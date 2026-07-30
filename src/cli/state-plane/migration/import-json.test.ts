@@ -18,7 +18,7 @@ import {
 import { observePath, observeSidecars } from "./artifact-observation.js";
 import { PhaseReceipt } from "./classifier.js";
 import {
-  encodeMigrationControl,
+  decodeMigrationControl, encodeMigrationControl,
   type CompletionTuple, type MigrationControl, type MigrationWitness, type SourceWitness,
 } from "./control-codec.js";
 import { claimStagingMain, importOwnedStaging, preserveSource } from "./import-json.js";
@@ -742,6 +742,25 @@ test("M4 verifies on the owning connection and leaves the staging file at S0", a
   expect(observed).toMatchObject({ state: "regular", sha256: witness.staging.sha256, bytes: witness.staging.bytes });
 });
 
+test("M4 proves a control that has been through the record's own canonical bytes", async () => {
+  // Every fixture above hands M4 an in-memory control, so M4 has only ever
+  // compared two tuples built in the same key order. A real resume reads the
+  // control off disk: `completion` comes back with JCS-sorted keys while
+  // `readCompletionTuple` builds its object in SELECT order, and a stringify
+  // compare of the two equal tuples is unequal. That halted every migration on
+  // real data while every substantive check passed.
+  const imported = await importState("m4-canonical-control", fixtureState());
+  const roundTripped = decodeMigrationControl(encodeMigrationControl(m3Control(imported)));
+  const decoded = roundTripped.witness;
+  if (decoded.phase !== "M3") throw new Error("fixture control is not at M3");
+  expect(Object.keys(decoded.completion)).not.toEqual(Object.keys(imported.completion));
+  expect(decoded.completion).toEqual(imported.completion);
+
+  const witness = await proveStaging(imported.root, receiptFor(roundTripped), locks);
+  expect(witness.staging.semanticDigest).toBe(imported.completion.sourceSemanticDigest);
+  expect(observeSidecars(imported.stagingPath)).toEqual([]);
+});
+
 test("M4 is repeatable and its proof recurs byte-for-byte", async () => {
   const imported = await importState("m4-determinism", fixtureState());
   const receipt = receiptFor(m3Control(imported));
@@ -857,6 +876,7 @@ test("M4 halts on verification when the imported rows no longer reproduce the di
     .then(() => undefined, (error: unknown) => error);
   expect(failure).toBeInstanceOf(MigrationPhaseHaltError);
   expect((failure as MigrationPhaseHaltError).halt.code).toBe("verification");
+  expect((failure as MigrationPhaseHaltError).halt.underlyingCode).toBe("semantic-digest");
 });
 
 test("M4 halts when the committed completion row is not the one M3 published", async () => {
@@ -870,6 +890,9 @@ test("M4 halts when the committed completion row is not the one M3 published", a
     .then(() => undefined, (error: unknown) => error);
   expect(failure).toBeInstanceOf(MigrationPhaseHaltError);
   expect((failure as MigrationPhaseHaltError).halt.code).toBe("verification");
+  // Five M4 checks share the `verification` code and the durable record drops
+  // `detail`, so the discriminator is the only thing that says which refused.
+  expect((failure as MigrationPhaseHaltError).halt.underlyingCode).toBe("completion-tuple");
 });
 
 test("M4 refuses a staging database whose authority is not the one the control names", async () => {

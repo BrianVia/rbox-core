@@ -5,12 +5,13 @@
  * Two harnesses:
  *
  * - a REAL migratable workspace under a REAL `withStatePlaneLocks` bundle, which
- *   drives `beginMigration`, `provisionRunway`, the M2/M3 bodies, the interstitial
- *   publication, and `publishHalt` for real. A clean M0→M7 run additionally needs
- *   an importable corpus that passes M4 fidelity — that is 3A/5C fixture territory
- *   (this harness's empty legacy state halts `verification` at M4), so the driver
- *   loop is exercised M0→M3 organically and the post-M4 rows are covered by planted
- *   controls plus `finalize.test.ts`/`cleanup.test.ts`'s own body coverage.
+ *   drives the whole loop M0→M7 for real: every phase body, every publication,
+ *   and `publishHalt`. 5A read this harness's M4 stop as a fixture limitation
+ *   ("the empty corpus cannot pass M4 fidelity") and pinned it as expected. It
+ *   was not: M4 compared the two completion tuples with `JSON.stringify`, so a
+ *   control that had been through the record's own canonical bytes could never
+ *   match, and NO corpus could ever pass. A durable halt now has to be induced
+ *   (`haltedControl`) rather than being whatever the harness happened to hit.
  * - synthetic controls with a cast lock bundle (the enumerated test exception to
  *   §7.9's cast gate) for the strand-repair and halt-clearing units, which touch
  *   no lock at runtime.
@@ -26,6 +27,7 @@ import { saveConfig, syncStreamId, type WorkspaceConfig } from "../../workspace-
 import { MigrationControlError, MigrationPhaseHaltError } from "../errors.js";
 import { withStatePlaneLocks, type EntryProof, type HeldStatePlaneLocks } from "../locks.js";
 import { migrationPaths, sqliteResetPaths } from "../paths.js";
+import { openStateStoreForWalTakeover, stateStoreDatabase } from "../store/open.js";
 import { runMigration, SQLITE_LIVE_ROWS } from "./authority.js";
 import { abortMigration } from "./halt-recovery.js";
 import { beginMigration, EMERGENCY_CANDIDATE_BYTES, provisionRunway, restoreHaltRunway } from "./begin.js";
@@ -81,26 +83,34 @@ test("beginMigration publishes the first control at FIRST_CONTROL_REVISION", asy
   });
 });
 
-test("runMigration sequences M0→M3 with real publications, and the M4 halt is durable", async () => {
+test("runMigration sequences M0→M7 with real publications and migrates the workspace", async () => {
   const root = await migratable("rbox-u3-5a-loop-");
   const steps: string[] = [];
   const outcome = await under(root, (entry) => runMigration(root, entry, (p) => steps.push(`${p.phase}:${p.step}`)));
-  // The empty corpus cannot pass M4 fidelity; the point is that the loop drove
-  // four real phase bodies and their publications to get there.
-  expect(steps).toEqual(["start:observing", "M0:published", "M1:published", "M2:published", "M3:published"]);
-  expect(outcome).toMatchObject({ kind: "halted", durableHalt: true });
-  const control = readCanonicalControl(root);
-  expect(control?.witness.phase).toBe("M3");
-  expect(control?.halt?.code).toBe("verification");
-  // The halt was CAS'd against the interstitially-advanced control (rev > M0+1),
-  // which is exactly the stale-receipt regression `publishHalt`'s re-read fixes.
-  expect(control!.controlRevision).toBeGreaterThan(FIRST_CONTROL_REVISION + 1);
+  expect(steps).toEqual([
+    "start:observing", "M0:published", "M1:published", "M2:published", "M3:published",
+    "M4:published", "M5:published", "M6:published", "M7:published", "M7:finished",
+  ]);
+  expect(outcome).toMatchObject({ kind: "migrated" });
+  // M7 retires the control: SQLite is the authority and nothing blocks writes.
+  expect(readCanonicalControl(root)).toBeUndefined();
+  // A second pass is NOT asserted here: `inspectInventory` still has no
+  // SQLite-backed reading, so the post-`Q` workspace refuses the bundle before
+  // the driver is reached (222 §3.2's own annotated debt, unrelated to this fix).
+});
+
+test("a durable halt is CAS'd against the interstitially-advanced control", async () => {
+  const { root, control } = await haltedControl("rbox-u3-5a-halt-cas-");
+  expect(control.witness.phase).toBe("M3");
+  expect(control.halt?.code).toBe("verification");
+  expect(control.halt?.underlyingCode).toBe("semantic-digest");
+  // Rev > M0+1, which is exactly the stale-receipt regression `publishHalt`'s
+  // re-read fixes: the halt lands on the control M1..M3 advanced, not on M0's.
+  expect(control.controlRevision).toBeGreaterThan(FIRST_CONTROL_REVISION + 1);
 });
 
 test("a second run over the durable halt reports it, without re-clearing", async () => {
-  const root = await migratable("rbox-u3-5a-rehalt-");
-  await under(root, (entry) => runMigration(root, entry));
-  const before = readCanonicalControl(root)!;
+  const { root, control: before } = await haltedControl("rbox-u3-5a-rehalt-");
   const outcome = await under(root, (entry) => runMigration(root, entry));
   expect(outcome).toEqual({ kind: "halted", halt: before.halt!, durableHalt: true });
   // The driver never clears a halt; the record is byte-unchanged.
@@ -248,10 +258,28 @@ test("B2: a corrupt canonical control fails the render closed, not permissively"
 // ---------------------------------------------------------------------------
 // B3 — abort clears a halt in the same publication that arms retirement.
 
+/**
+ * A REAL durable halt, induced rather than stumbled into. The empty corpus now
+ * migrates cleanly, so the halt has to come from somewhere: a row tampered in
+ * the instant after M3 publishes is the shape a partial import leaves, and M4's
+ * semantic digest is what catches it. `state_lineage` is outside the completion
+ * tuple, so the tuple comparison passes and the digest check is the one that
+ * refuses — which is what `underlyingCode` is asserted on above.
+ */
 async function haltedControl(prefix: string): Promise<{ root: string; control: MigrationControl }> {
   const root = await migratable(prefix);
-  await under(root, (entry) => runMigration(root, entry));
-  return { root, control: readCanonicalControl(root)! };
+  await under(root, (entry) => runMigration(root, entry, (progress) => {
+    if (progress.phase !== "M3" || progress.step !== "published") return;
+    const store = openStateStoreForWalTakeover(readCanonicalControl(root)!.stagingPath);
+    try {
+      stateStoreDatabase(store).query("UPDATE state_lineage SET last_synced_sequence=last_synced_sequence+1").run();
+    } finally {
+      store.close();
+    }
+  }));
+  const control = readCanonicalControl(root)!;
+  if (control.halt === null) throw new Error("the fixture did not produce a durable halt");
+  return { root, control };
 }
 
 test("B3: armRetirement without clearHalt refuses a halted migration", async () => {

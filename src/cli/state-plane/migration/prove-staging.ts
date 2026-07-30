@@ -14,6 +14,7 @@
  * that opens one purely to interrogate it.
  */
 import type { Database } from "bun:sqlite";
+import { canonicalString } from "../../../engine/e2ee/jcs.js";
 import { stateSemanticDigest } from "../digest/state-semantic-v1.js";
 import type { HeldStatePlaneLocks } from "../locks.js";
 import { fsyncDbAndParent, requireDbArtifactS0, stableDbHash } from "../reset/artifacts.js";
@@ -46,19 +47,27 @@ function verifyOwnedStaging(file: string, completion: CompletionTuple): void {
     // `validateOpen` enforces are all verification facts about a database this
     // migration built. They arrive as a typed store error; M4 owes the driver a
     // halt, not someone else's exception class.
-    return halt("verification", true, `the staging database did not open as a valid store (${String(error)})`);
+    return halt("verification", true, `the staging database did not open as a valid store (${String(error)})`,
+      { underlyingCode: "staging-open" });
   }
   try {
     const db = stateStoreDatabase(store);
     if (store.header.authority_id !== completion.authorityId) {
-      halt("verification", false, "the staging database carries a different authority");
+      halt("verification", false, "the staging database carries a different authority",
+        { underlyingCode: "authority-mismatch" });
     }
+    // Through the record's OWN canonicalizer, not `JSON.stringify`. `completion`
+    // arrives from a decoded control and so carries JCS-sorted keys, while
+    // `readCompletionTuple` builds its object in SELECT order — a stringify
+    // compare of two equal tuples is unequal on every real migration.
     const committed = readCompletionTuple(db);
-    if (JSON.stringify(committed) !== JSON.stringify(completion)) {
-      halt("verification", false, "the staging completion row is not the one M3 published");
+    if (canonicalString(committed) !== canonicalString(completion)) {
+      halt("verification", false, "the staging completion row is not the one M3 published",
+        { underlyingCode: "completion-tuple" });
     }
     if (stateSemanticDigest(db) !== completion.sourceSemanticDigest) {
-      halt("verification", false, "the imported database does not reproduce the source semantic digest");
+      halt("verification", false, "the imported database does not reproduce the source semantic digest",
+        { underlyingCode: "semantic-digest" });
     }
     // Prepared and finalized, never `db.query` — see the digest module: past
     // five cached statements a connection stops closing, and closing is the one
@@ -70,10 +79,16 @@ function verifyOwnedStaging(file: string, completion: CompletionTuple): void {
     // orphaned `plane_entries` row is structurally perfect and semantically
     // dangling, which is exactly the shape a partial import produces.
     const violations = checkRows(db, "PRAGMA foreign_key_check");
-    if (violations.length > 0) halt("verification", false, `the imported database has ${violations.length} foreign key violations`);
+    if (violations.length > 0) {
+      halt("verification", false, `the imported database has ${violations.length} foreign key violations`,
+        { underlyingCode: "foreign-key-check" });
+    }
     const integrity = checkRows(db, "PRAGMA integrity_check");
     const verdict = integrity.length === 1 ? Object.values(integrity[0]!)[0] : undefined;
-    if (verdict !== "ok") halt("verification", false, "the imported database failed integrity_check");
+    if (verdict !== "ok") {
+      halt("verification", false, "the imported database failed integrity_check",
+        { underlyingCode: "integrity-check" });
+    }
     // Only after every check passes, and never before (163 v13).
     //
     // Honest note on what this does and does not buy, because it reads like
@@ -91,7 +106,8 @@ function verifyOwnedStaging(file: string, completion: CompletionTuple): void {
       checkpointStateStoreForReset(store);
     } catch (error) {
       return halt("durability-indeterminate", true,
-        `the staging database could not be checkpointed to rest (${String(error)})`);
+        `the staging database could not be checkpointed to rest (${String(error)})`,
+        { underlyingCode: "checkpoint" });
     }
   } finally {
     store.close();
@@ -110,10 +126,14 @@ export async function proveStaging(
   if (witness.phase !== "M3") throw new TypeError("an M3 receipt must carry an M3 witness");
   const file = control.stagingPath;
   const recorded = witness.stagingMain;
-  if (recorded.state !== "present") return halt("verification", false, "M3 records no staging identity to prove");
+  if (recorded.state !== "present") {
+    return halt("verification", false, "M3 records no staging identity to prove",
+      { underlyingCode: "staging-identity-absent" });
+  }
   const observed = observePath(file);
   if (observed.state !== "regular" || observed.dev !== recorded.dev || observed.ino !== recorded.ino) {
-    halt("reserved-path", false, `${file} is not the recorded staging inode`);
+    halt("reserved-path", false, `${file} is not the recorded staging inode`,
+      { underlyingCode: "staging-inode" });
   }
   verifyOwnedStaging(file, witness.completion);
   // `S0` once, through the reset plane's at-rest predicate rather than a second
@@ -125,12 +145,14 @@ export async function proveStaging(
     atRest = await requireDbArtifactS0(file);
   } catch (error) {
     return halt("durability-indeterminate", true,
-      `the staging database did not come to rest after its checkpoint (${String(error)})`);
+      `the staging database did not come to rest after its checkpoint (${String(error)})`,
+      { underlyingCode: "not-at-rest" });
   }
   await fsyncDbAndParent(file);
   const { sha256, identity } = await stableDbHash(file, atRest);
   if (Number(identity.dev) !== recorded.dev || Number(identity.ino) !== recorded.ino) {
-    halt("verification", true, `${file} changed identity while it was being proved`);
+    halt("verification", true, `${file} changed identity while it was being proved`,
+      { underlyingCode: "staging-identity-changed" });
   }
   const staging: StagingProof = {
     sha256, bytes: Number(identity.size),
