@@ -2,6 +2,46 @@
 look at AGENTS.md for your rules
 <!-- stripe-projects-cli managed:claude-md:end -->
 
+<!-- primitive-first-architecture:start -->
+## Primitive-first architecture (always)
+
+These rules apply to Claude, Codex, subagents, and every other coding agent:
+
+- Preserve supported behavior by default. Never remove a command, output,
+  protocol, safety property, compatibility path, performance fast path, or
+  active migration/readiness path without explicit product approval and
+  evidence.
+- Simplify by reducing concepts, authorities, branches, modes, Interfaces, and
+  cross-Module knowledge—not by spreading the same complexity across more
+  files. File splitting alone is not architecture.
+- Prefer the smallest coherent set of deep Modules with narrow, complete
+  Interfaces. Give every invariant, state transition, durable record, and
+  physical effect one explicit owner.
+- Keep CLI, daemon, HTTP, UI, and background-loop code as Adapters. They must
+  not independently rebuild domain orchestration.
+- Treat every new flag, mode, boolean, fallback, sidecar, queue identity, and
+  special-case branch as a requirement with an owner and deletion condition.
+- Keep feature retirement separate from dead-code deletion. Deletion requires
+  command/alias, import, export, build, package, generated-load, automation,
+  documentation, owner, and support-window evidence; static reachability alone
+  is not proof.
+- Challenge incidental or “dumb” requirements explicitly, with their
+  complexity cost and a product decision. Until that decision is made,
+  preserve the behavior behind a clear Interface.
+
+Before any non-trivial coding, design, refactor, architecture, or review task,
+you MUST read and apply `.agents/skills/simplify-codebase-primitives/SKILL.md`
+when present, otherwise
+`$HOME/.agents/skills/simplify-codebase-primitives/SKILL.md`. The work is not
+ready until it identifies protected functionality, ownership, safe deletion
+candidates, challenged requirements, and differential/crash/compatibility/
+performance validation.
+
+When running a thermo-nuclear review, apply both standards. Line count is a
+warning signal, not the goal: never split a cohesive deep Module into shallow
+pass-through files merely to stay below a threshold.
+<!-- primitive-first-architecture:end -->
+
 ## Development flow (anything non-trivial)
 
 Always in a worktree (`.claude/worktrees/<slug>`), never the primary checkout.
