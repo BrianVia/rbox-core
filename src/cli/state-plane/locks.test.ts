@@ -96,6 +96,34 @@ test("a post-Q workspace refuses the bundle rather than fencing an inventory it 
   await expect(withStatePlaneLocks(root, async () => "never")).rejects.toThrow(/newer version of rbox/);
 });
 
+test("a state.json the parse budget refuses is a typed refusal, not an escaping RangeError", async () => {
+  // The measured shape on a 16 GiB host: an 81 MB `state.json` needs 4.215 GiB
+  // of parse headroom against a 4 GiB floor budget. The inventory read is the
+  // FIRST thing that hits it — earlier than M0's own `memory-admission` halt —
+  // and it used to escape uncaught through the fence. The budget is injected
+  // here through the sanctioned override rather than by writing 81 MB of state.
+  const root = await workspace("rbox-locks-memory-");
+  const previous = process.env.RBOX_RESET_PARSE_BUDGET_BYTES;
+  process.env.RBOX_RESET_PARSE_BUDGET_BYTES = "1";
+  let bodies = 0;
+  try {
+    const outcome = await withStatePlaneLocks(root, async () => void (bodies += 1));
+    expect(outcome.held).toBeFalse();
+    if (outcome.held) throw new Error("the bundle was held on a refused parse budget");
+    expect(outcome.refusal.code).toBe("memory-admission");
+    // 163 §6.3: the refusal prints what was measured.
+    expect(outcome.refusal.detail).toMatch(/bytes of parse headroom/);
+    expect(outcome.refusal.detail).toMatch(/RBOX_RESET_PARSE_BUDGET_BYTES/);
+  } finally {
+    if (previous === undefined) delete process.env.RBOX_RESET_PARSE_BUDGET_BYTES;
+    else process.env.RBOX_RESET_PARSE_BUDGET_BYTES = previous;
+  }
+  expect(bodies).toBe(0);
+  // Nothing was admitted, so the workspace is left acquirable — a refusal, not a
+  // halt: the very next attempt on a machine with headroom must succeed.
+  expect(await withStatePlaneLocks(root, async () => "after")).toEqual({ held: true, value: "after" });
+});
+
 // 222 §7.9. The bundle is the proof object every mutator trusts without
 // re-verifying — `control-publication.ts` takes it and does `void locks` — so
 // its unforgeability rests entirely on the brand. A cast anywhere else in

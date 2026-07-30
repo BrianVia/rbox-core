@@ -20,13 +20,23 @@ import type { MigrationHaltCode } from "./health.js";
  * "a failed halt publication is the final mutation of the trace"), and `wrote`
  * is the one fact the driver cannot recompute — whether this refusal happened
  * before any artifact mutation, which is what the zero-write rows assert.
+ *
+ * `detail` reaches the exception message and nothing else, so a phase whose code
+ * covers several distinct checks names the one that refused in `underlyingCode`
+ * — the durable record's only free slot, already carrying that discriminator in
+ * `retirement.ts`, `classifier.ts`, and `authority.ts`. It must be a STABLE
+ * token, never the measured prose: `control-sibling.ts` explains why a halt
+ * record whose bytes will never recur strands its revision-scoped sibling.
  */
 export const halt = (
   code: MigrationHaltCode, wrote: boolean, detail: string,
-  bounds: { required?: number; available?: number } = {},
+  fields: { required?: number; available?: number; underlyingCode?: string } = {},
 ): never => {
   throw new MigrationPhaseHaltError(
-    { code, underlyingCode: null, required: bounds.required ?? null, available: bounds.available ?? null },
+    {
+      code, underlyingCode: fields.underlyingCode ?? null,
+      required: fields.required ?? null, available: fields.available ?? null,
+    },
     wrote, detail,
   );
 };
