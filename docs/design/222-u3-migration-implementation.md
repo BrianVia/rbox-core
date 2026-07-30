@@ -2034,6 +2034,282 @@ dated and re-checked before the 2.0 tag.
 - Every file ≤400 lines / 25 KiB; 301–399 carries a review note.
 - `docs/CODEMAP.md` gains one ownership line per new module in the same change.
 
+### 7.10 Wave 5C — the fault primitive, and what it changed (LANDED)
+
+**The rule 5C was created to enforce.** Across eight lanes the most-repeated
+defect class was a fixture encoding a state the machine cannot produce: 3A's M4
+halt written off as "fixture territory" when no corpus could pass it; 4A's row
+test passing only because its fixture recorded a Q-sibling disposition no crash
+produces; 5B's `format-too-new` fixture encoding the wrong verdict, and its
+post-flip abort test passing for the wrong reason. Each was self-consistent and
+wrong. **5C plants nothing.** Every state it asserts against is produced by
+driving the real machine to a real instant and ending it there.
+
+**The primitive** (`migration/fault-rig.ts`). Every migration and genesis module
+uses `import fs from "node:fs"` and calls through the namespace object, so the
+property is resolved at call time and one assignment reaches all of them. A
+fault point is `{syscall, match, nth, when}` and an action is `kill`, `errno`,
+`short-write`, or `side-effect`. It is not a fake filesystem: every untargeted
+call, and every `when: "after"` targeted call, performs the real syscall.
+`fault-rig-child.ts` is the spawnable half, because SIGKILL only means something
+in a process the test does not need back; **it exits 65 when its point is never
+reached**, so an unreachable kill point reads as a failure rather than a pass.
+
+**The matrix is derived, not authored.** `scripts/probe/u3-5c-trace.ts` makes the
+machine report its own `node:fs` mutations per phase. The kill points below are
+that output, not a reading of this document — which is the same discipline
+applied to the test design itself:
+
+| Window | The physical effect the machine actually performs |
+|---|---|
+| every phase | `rename migration-v1.json.<id>.<rev>.tmp -> migration-v1.json` |
+| M1 | the body-sha backup and the fixed `pre-163-latest.json.bak` renames |
+| M4 -> M5 | `rename state.db.migrate.<id> -> state.db` |
+| M5 -> M6 | `rename state.json.migrate.<id>.q -> state.json` — the flip |
+| M6 | `unlink reserve-1mib.bin`, `unlink migration-emergency.<id>.bin` |
+| M7 | `unlink` the prepared sibling, then `unlink` the control |
+
+The first thing the probe caught was one of 5C's own fixtures: a manifest built
+with `hash` instead of `sha256` and no `type` halted at `verification`, and the
+machine refused it rather than importing it. A hand-planted corpus would have
+encoded that halt as expected behaviour.
+
+### 7.11 FINDING — `filesystem-full` is unreachable for an ordinary control publication
+
+**Scope, measured by the crash and I/O matrices: nine sites, not one.** A real
+`ENOSPC` escapes `runMigration` as a raw `ErrnoException` — no typed halt, no
+`durableHalt`, not a member of `MigrationOutcome` at all — at M0's, M1's, M2's,
+M3's, and M5's control publications; at M2's backup temp create and both backup
+renames; at the M4→M5 staging rename; and at M7's control retirement.
+`filesystem-full` is reachable at **exactly one** site: `begin.ts`'s exclusive
+create of the emergency candidate.
+
+`isOutOfSpace` in `control-publication.ts` guards only the **halt** publication's
+runway, through `haltRunway`. An `ENOSPC`/`EDQUOT` during an **ordinary** control
+publication is classified by nothing: it unwinds past `step`'s two typed catches
+(`MigrationPhaseHaltError`, `MigrationControlError`), out of `runMigration`, and
+out of `state-plane-cmd.ts`'s `inWindow` — whose own comment says the "no bare
+throws to the CLI" rule exists to prevent exactly this. §5.2 lists
+`filesystem-full` as a reachable halt for M1–M5 and §6.3 writes copy for it, but
+no code path can produce that halt for the publication itself before M6 prepares
+a runway.
+
+**A second wrong diagnosis, same family.** `artifact-observation.ts` maps every
+non-`ENOENT` open failure to `foreign`, so an `ENOSPC` or `EIO` on the FIRST open
+of `reserve-1mib.bin` or `migration-emergency.*.bin` is reported as
+`reserve-foreign` — "a file rbox keeps as a safety reserve doesn't look like rbox
+wrote it" (§6.1). Fail-closed and retryable, but the user is told their reserve
+looks foreign when the real condition is a full disk or failing media.
+
+These are pinned by the `ESCAPING` table in `io-halt-matrix.test.ts`, which
+asserts the escape at each site, so a wave that closes the gap must edit that
+table deliberately rather than discovering the rows by surprise.
+
+**Severity: copy and typed-outcome, not corruption.** The behaviour is still
+fail-closed — the prepared sibling is removed, the canonical control is
+untouched, and re-entry re-classifies at the previous phase and converges. The
+user gets a stack trace instead of the sentence §6.3 already wrote. Pinned by
+`guard-coverage.test.ts`'s `FINDING:` test, which asserts the behaviour that
+EXISTS and must be **inverted, not deleted**, when the gap is closed.
+
+### 7.12 The standing mutation gate (§7.9, executable)
+
+Eight review rounds found "correct guard, no test that notices its deletion" one
+at a time, by hand. `scripts/mutation-gate.ts` makes it a gate: a **curated**
+table of load-bearing guards, each naming an exact source anchor and the one test
+that must fail when the guard is removed. Deliberately not exhaustive AST
+mutation — that costs minutes and yields mostly equivalent mutants, which is how
+mutation testing usually dies. Three properties make it a gate:
+
+1. **The anchor must match exactly once** — zero means the guard moved or was
+   deleted, two means the anchor is ambiguous. Same self-expiry as the duplicate
+   and file-size gates; a row cannot outlive what it excuses.
+2. **The baseline must pass before the mutant is judged.** A test that cannot run
+   in the sandbox would otherwise "fail" under mutation for the wrong reason and
+   report a healthy guard — the gate reproducing its own bug. Baseline failure is
+   a BROKEN row, never a surviving guard.
+3. **A surviving mutant fails loudly**, naming guard, file, and the test that was
+   supposed to notice.
+
+`src/` is copied once into `.cache/mutation-gate` and mutated there, so the
+working tree is never touched. Runs in ~4 s; wired as `bun run gate:mutation` in
+the `checks` CI leg.
+
+**On its first run, three of five guards SURVIVED** — `runway-enospc-predicate`,
+`phase-receipt-phase-match`, and `source-rebracket` were all deletable with the
+suite green. `guard-coverage.test.ts` was written to close them. Review added
+two more rows (`flip-last-instant-reverify`, `cleanup-m6-receipt`); the table
+now stands at **seven, all killed**. Two lessons are worth keeping: a mutation whose anchor
+covers only the first line of a multi-line condition does **not** remove the
+guard (`source-rebracket` first appeared covered for that reason), and a guard
+that is a second line of defence needs a test that reaches **its** window
+specifically — perturbing between driver iterations proves nothing about
+`bracketSource`, because the classifier catches it one layer earlier.
+
+---
+
+### 7.13 Open items settled by 5C
+
+**The flip/backup asymmetry — ANSWERED, standing. Do not "fix".** The resume
+branch's omission of `revalidateBackups` is correct and permanent, not a
+deferred repair. The two legacy-JSON backups have no consumer past the flip:
+their only production readers are M2 (the writer), the pre-rename check
+(`authority-flip.ts:302`), and the `verification` halt copy that names the path
+(`state-plane-report.ts:133`). Post-`Q` abort is refused (`ABORT_AFTER_FLIP` in
+`halt-recovery.ts`) and §5.2's M6 row forbids renaming back, so no rollback can
+ever read them. They are also undeletable by rbox — `retirement.ts`'s
+`derivedPath` has no backup role, per §5.4's ownership rule. Revalidating on
+resume could therefore only convert an out-of-band deletion into an
+**unclearable** `verification` halt on a workspace that is already
+`blocksSqliteWrites = TRUE` and whose source document no longer exists: strictly
+worse than not noticing. The residual is observability only, and its surface is
+doctor, never the flip.
+
+**Anchor correction.** The open item called the pinning test "5A's G2 gate".
+`G2` is the *genesis* crash-matrix row (§7.1); the test that actually pins this
+is `migration/authority.test.ts`'s **"the flip's resume branch reads no
+stale-source member"**, which lists `revalidateBackups` as a forbidden token
+inside the resume window and separately asserts it DOES appear after the resume
+return, so the gate is non-vacuous in both directions. It **must not be
+deleted**.
+
+**The M0 strand — ACCEPTED and documented; removal is doctor's, not U3's.** A
+SIGKILL between M0's control render and its rename leaves one inert
+revision-scoped sibling at `migration-v1.json.<dead-id>.1.tmp` — a canonical M0
+record, ~630 bytes (one filesystem block), not the 64 KiB emergency candidate,
+which is an M1 artifact and is adopted or repaired in place on resume rather
+than leaked. Re-entry mints a fresh id and `renderControlSibling`'s adoption is
+scoped to the live id, so the strand is never adopted, never read, and
+coordinates nothing. It is unbounded only in the sense that each crashed M0 adds
+one: the window is a few syscalls, every *caught* failure already calls
+`removeOwnSibling`, and M0 is reachable only from the two operator-driven
+`establishStateAuthority` entry sites, so ~250 kills inside that window are
+needed to reach 1 MiB. **No U3 code may delete it** — §5.4's ownership rule
+excludes it (no durable record names it) and §7.1's G6 precedent is
+report-don't-delete. 163:657 and 163:2909 designate doctor's inert-temp
+quarantine as the sole remover. The gap worth closing before that lands is
+**observation**: `checkStateMigration` reads only the canonical control and the
+genesis intent, so nothing today can see a dead-id strand at all.
+
+**Strand sizes, measured — two different artifacts.** The MIGRATION M0 strand
+(`migration-v1.json.<dead-id>.1.tmp`) is a complete canonical control record,
+~630 bytes modelled. The GENESIS step-2 strand is a different artifact and was
+measured empirically at **0 bytes with 0 allocated blocks** — five crashes
+produced exactly five strands, one per crash, and a healthy genesis completes
+over them and adopts none. Neither justifies building a quarantine sweep; both
+argue for the same thing, which is that doctor should be able to SEE them.
+
+### 7.14 Further findings from 5C's matrices
+
+**FINDING — `rbox status` falsely reports a healthy migrated workspace as
+halted, and the daemon then gates sync off. User-visible, and the most serious
+thing 5C found.** On an empty
+manifest with nothing wrong: one ordinary read-only load deposits `state.db-wal`
+and `state.db-shm`, which are never cleaned;
+`classifySqliteResetPredecode` reads that sidecar vector as row **W1**;
+`inspectResetJournal` converts W1 into a halt; and `status-view.ts` renders
+"sync halted to protect recovery state". 163's own decoder table treats W1 as an
+ordinary recoverable takeover, not an operator condition, and `recovery.ts` does
+take it over silently — only the read-only inspection surfaces it as a halt.
+**SCOPE CORRECTED (review).** 5C's first characterization was wrong in two
+ways. "Doctor gets it right" is FALSE — doctor makes the same read-only load and
+simply never consults the reset journal, so the divergence is which surfaces
+ASK, not which are correct. And the blast radius is larger than a misleading
+line of copy: it reaches `daemon.ts`'s `resetOperationBoundary`, so the real
+sequence is migrate -> status -> start -> **sync gated off**, measured at 18/25.
+The violation is one line in `store/open.ts`. Not this wave's fix; the lane is
+redirected. It is also racy within one invocation, because `statusCmd` inspects
+the journal concurrently with its own store open. This is the read-only-open-still-writes
+hazard 163 already records, reaching the operator surface. Pinned
+delete-when-fixed in `no-regression.test.ts`.
+
+**FINDING — genesis is unreachable through the `node:fs` default export.**
+Genesis performs 28 of its 36 workspace calls through `node:fs/promises`,
+including the intent publication, both renames, and both parent fsyncs — every
+kill point §7.2 names for it. The fault rig originally patched only the default
+export and could not reach any of them. **It stayed findable only because an
+unreached point exits 65 rather than passing quietly**, which is the single
+design decision in 5C that paid for itself. The rig now takes a `surface`.
+
+**FINDING — §7.1's G2 case 4 is not SIGKILL-reachable.** Step 2 creates the
+staged file and fsyncs its parent BEFORE step 3 publishes the intent, so on an
+ordered filesystem an intent never survives without its staged file. The row is
+driven to the intent-published state by a real crash and then reduced by one
+removal, with the reachability argument (external reaper, partial restore,
+crash-consistency reordering) recorded at the fixture.
+
+**FINDING — r6's "byte-identical whole `.rbox` tree" is not literally
+satisfiable for genesis.** `installGenesisLineage` stamps
+`migration_completion.completed_at` with `new Date().toISOString()`, so no two
+genesis runs produce identical `state.db` bytes. `Q` and everything else are
+compared byte-for-byte; `state.db` is compared on the §2.5.1 tuple. §7.1's
+wording should say so rather than implying a comparison no run can pass.
+
+**FINDING — G6's doctor clause is unimplemented.** `checkStateMigration` reads
+only the canonical control and the genesis intent and never classifies
+artifacts, so an inert strand is invisible and doctor answers "no conversion in
+progress". Same gap as §7.13's strand item, reached from a second direction.
+
+**SELF-REVIEW — the wave's own matrices were mutation-tested, and two guards
+are still uncovered.** An ad-hoc mutation sweep was run against 5C's new
+matrices rather than trusting their test counts. **Three of three mutants
+initially SURVIVED**, including the M6 last-instant re-verify — F5's entire
+subject — against a 55-test crash matrix. Review found a FOURTH,
+`cleanup.ts`'s M6 receipt gate, which survived all six 5C matrices AND all
+fourteen behavioural state-plane suites including its own owning
+`cleanup.test.ts`. The cause is the same shape twice
+over: every other path that notices a changed source catches it one layer
+earlier, so a second-line-of-defence guard's own window is never entered by a
+test that perturbs between driver iterations. `guard-coverage.test.ts` now
+drives F5's true `check -> rename` microwindow with the `side-effect` action —
+deterministic, no sleeping — and that mutant is killed and in the standing
+table. Two remain uncovered and are recorded rather than hidden:
+
+| Guard | Why it is still uncovered |
+|---|---|
+| `revalidateActive`'s Q-sibling exactness (`authority-flip.ts`) | Needs the active database to change between M5 and the flip. Reachable with the rig's `side-effect` action; not written. |
+| `begin.ts`'s ENOSPC refill halt | On the halt-runway REFILL path, reached only through `restoreHaltRunway` on a retry, which the I/O matrix does not drive. |
+
+Review also confirmed the complement, which matters for reading the numbers
+correctly: the crash matrix's 12/12 survival rate is the CORRECT result for a
+convergence matrix — a second-line guard's window is never entered by one — and
+re-running those same 12 against the pre-existing behavioural suites killed 11.
+The gate table, not the matrix, is where a guard's coverage is owed.
+
+The lesson generalizes past this wave: **a test count is not coverage, and a
+matrix that passes 55 cells can still notice nothing.** The gate table is the
+artifact that makes that measurable, and it should grow by exactly this
+procedure — mutate, observe the survivor, write the test that reaches its
+window.
+
+**FINDING — the plane's tests exhaust `/tmp`'s INODE table, not its bytes.**
+On the Linux fleet host `/tmp` is RAM-backed tmpfs with ~1M inodes. The
+state-plane suite leaks its `mkdtemp` workspaces, and repeated runs drove
+inodes to **100% at 47% byte capacity**, which surfaces as a flood of `ENOSPC`
+failures across unrelated suites — a failure that reads as a code defect and is
+not one. A retry loop multiplies the leak by its retry count, so 5C's FINDING
+loop removes every attempt it discards. The general leak predates this wave and
+is survivable only because CI runners are fresh containers; anyone running the
+plane's suites repeatedly on a fleet host should expect it.
+
+**FINDING — M4 fidelity accepts a dropped manifest section.** A `RepoRecord`
+carrying `removedKey` on a repo that still has a live manifest section causes
+the migration to drop the section, and the fidelity check does not object. A
+correct read of a contradictory input, but the fidelity gate's silence on it is
+worth knowing.
+
+**FINDING — the CODEMAP gate does not exist.** §M-9 states the
+one-line-per-module rule is "now executable in `migration/authority.test.ts`".
+It is not: no test in the repository mentions CODEMAP (`grep -rin codemap src/
+scripts/ --include='*.ts'` is empty). The content half did land — the state-plane
+block of `docs/CODEMAP.md` is populated — but nothing prevents the next module
+from regressing. When the gate is built it must match at LINE START on the
+module path and assert no path appears twice; a substring check on the directory
+prefix is vacuous, since it passes for every module in a directory that
+documents exactly one.
+
+---
+
 ---
 
 ## 8. Sequencing and dispatch
