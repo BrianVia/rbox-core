@@ -48,7 +48,9 @@ left to reconstruct.
 A third, cheaper drift: the filesystem leaf layer has no owner. One primitive —
 "create-exclusive-or-adopt this path, prove the inode, write in place, fsync" —
 exists in **six** copies with four occupant policies and four refusal channels,
-and three latent defects hide in the gaps between them.
+and four of this audit's five latent defects hide in the gaps between them. A
+traced run confirms the shape: `observePath` is well designed but competes with
+~29 raw `fs.open*` sites in the same directory (§3h).
 
 **What is NOT wrong**, and where earlier suspicions were falsified:
 
@@ -58,6 +60,11 @@ and three latent defects hide in the gaps between them.
 - The `-wal`/`-shm`/`-journal` sidecar list appears at 8 sites and **all eight
   are complete and consistent**. No correctness divergence. It is a tidiness
   item, not a bug.
+- Observation reuse was expected to be a cycle and is **not** one. A traced
+  M0→M7 run shows 11.7× read amplification, but ~5% of wall time, and the
+  duplication that matters is intra-phase rather than across the phase
+  boundaries where caching would delete a crash property (§3h). It folds into
+  Cycle 3 instead of earning its own.
 - Three of the five file splits examined (`genesis`/`genesis-intent`, lane 3A's
   four, `control-sibling`) are **real seams with executable gates**, not
   line-count artifacts. Re-merging any of them would delete a proved property.
@@ -272,51 +279,109 @@ The repo's own `duplicate-declarations.test.ts` cannot see any of this: its
 `DECLARATION` regex requires `export`, and five of the six sha256 helpers, the
 private `isOutOfSpace`, and `sameClaim` are file-private or renamed.
 
-### 3h. Observation reuse — hypothesis falsified
+### 3h. Observation reuse — MEASURED, and partly a finding
 
-The skill asks for "one observation reused by all consumers". This was expected
-to be a finding. **It is not.** Static evidence (labelled static — see the
-caveat at the end of this subsection):
+This is the one subsection backed by a real traced run rather than by greps.
 
-- The leaf primitive is well owned. `observePath`
-  (`artifact-observation.ts:45-67`) is one
-  `openSync(O_RDONLY|O_NOFOLLOW|O_NONBLOCK)` + `fstatSync` + optional
-  digest-on-the-same-descriptor, closed in a `finally`. It has **33 production
-  call sites** and is the funnel for essentially all of `migration/`.
-- Raw syscalls in `migration/` production code total **46**, and they are
-  `openSync` (27), `fstatSync` (16), `lstatSync` (3). **Zero** `existsSync`,
-  `readdirSync`, `statSync`, or `readFileSync` — no directory sweep exists in
-  the migration classifier at all. (The 70 `existsSync` and 6 `readdirSync`
-  hits an unfiltered grep reports are all in `*.test.ts`.)
-- The one place a double-observation existed was found and removed by its own
-  author, for exactly the reason the skill gives. `classifier.ts:196-202`:
+**Method.** `scripts/snapshot-replay/run.ts:93-96` already straces both children
+with `trace=%file`. The harness was run unmodified against a real 81,125,444-byte
+legacy `.rbox/state.json`: exit 0, 8 steps, 37 s, fidelity pass, isolation clean.
+Because `%file` omits `read`, a second unmodified run was traced with
+`strace -f -y -e trace=%file,read,pread64`. Resulting DB 261,824,512 B, 18 durable
+control revisions. Scratchpad only; nothing written to the repo.
 
-  > ONE descriptor, ONE comparison. An earlier draft observed twice — a cheap
-  > length check, then a digesting reopen — and had to re-compare `dev`/`ino`
-  > across the two to close the window it had just opened […] the window is
-  > removed rather than defended, and the hash is the whole test.
+**Measured amplification.** Product code streams in 64 KiB chunks
+(`artifact-observation.ts:23`) and SQLite in 4096 B, so passes are attributable
+by chunk size.
 
-- The re-observation that *does* happen every iteration —
-  `classifyMigrationState` at the top of `runMigration`'s loop
-  (`authority.ts:139`), plus per-mutator revalidation inside each body — is
-  **required, not waste.** It is the entire crash-resume model: the driver holds
-  no state across a durable transition, so a kill anywhere re-enters through
-  `classify` and converges. Caching an observation across a phase boundary would
-  delete a safety property, and 222 §8's lane-5A inheritance note ("per-mutator
-  revalidation runs many times per migration") records it as deliberate.
+| Path | Size | `openat` | Whole-file digest passes | Bytes read |
+|---|---:|---:|---:|---:|
+| `.rbox/state.json` | 81.1 MB | 61 | **26** | 2,109.5 MB |
+| `state/state.db` (active) | 261.8 MB | 32 | **4** | 1,047.2 MB |
+| `state.db.migrate.<id>` | 261.8 MB | 14 | **2** | 523.6 MB |
+| `legacy-json/<sha>.json` | 81.1 MB | 6 | **2** | 162.3 MB |
+| `legacy-json/pre-163-latest.json.bak` | 81.1 MB | 7 | **2** | 162.3 MB |
 
-**Verdict: no cycle here.** Recommending observation caching would be the
-"growing complexity at the wrong layer" mistake in reverse — trading a proved
-crash property for syscalls that do not dominate anything. If a duration budget
-ever does bite, the place to look is the M2 streaming copy and the M4 digest, not
-the classifier.
+**≈4.0 GB of product-level observation reads over 343 MB of distinct bytes —
+11.7× amplification.** The per-iteration motif, repeating after every control
+revision, is two back-to-back full 81 MB SHA-256 passes under one lock hold:
 
-**Caveat — this subsection is static.** `scripts/snapshot-replay/run.ts:93-96`
-already straces every child (`trace=%file`, per-label log), so a measured
-per-path open/stat count for one real M0→M7 run **is** obtainable and was not
-obtained here. That measurement is owed before any perf claim in either
-direction, and it belongs with 5C's duration budget (§8 P-2) rather than with a
-refactor cycle.
+```
+open state/migration-v1.json    readCanonicalControl
+open state.json                 classifyStateFormat     (classifier.ts:97)
+open state.json                 observeLegacyAuthority  → READ 81.1 MB
+open state/migration-v1.json
+open state.json                 bracketSource           → READ 81.1 MB
+```
+
+**Two prior hypotheses are falsified by the trace:**
+
+- **There is no directory sweep** anywhere in the migration lane. `readdir`
+  appears only in `reset-lineage.ts:101` and `sqlite-contract/helpers.ts:16`,
+  neither on this path. What the brief called a sweep is `observeSidecars`
+  (`artifact-observation.ts:80`), a fixed 3-name probe: 8 invocations, 24
+  `openat`, negligible.
+- **`observePath` is well *designed* but not well *owned*.** It has 31 production
+  call sites in `migration/`, but there are also **~29 raw `fs.openSync`/`fs.open`
+  sites across 13 files** in that directory (`control-sibling.ts` 5,
+  `cleanup-runway.ts` 4, `legacy-backup.ts`/`import-json.ts`/`finalize.ts` 3
+  each). An earlier static read of this audit claimed the primitive was the
+  funnel for essentially all of `migration/`; the trace shows otherwise. This
+  strengthens §4 P-4 rather than weakening it.
+
+**Required — do NOT cache across these.** The split the skill asks for:
+
+- `authority-flip.ts:306` → `renameSync` at `:347`. The last-instant re-read with
+  nothing between the comparison and the rename is the module's stated whole
+  point (header lines 10-15).
+- `begin.ts:78` `freshSource`. Documented at `:70-76`: admission deliberately
+  waits a bounded quiet interval, so the classifier's witness is exactly as old
+  as that wait. A real elapsed-time boundary.
+- The classifier proof vs the flip proof on the post-rename resume row —
+  separated by a durable publication and a possible restart.
+- Every per-iteration re-classification. That is the crash-resume model: the
+  driver holds no state across a durable transition, so a kill anywhere
+  re-enters through `classify` and converges (222 §8, lane 5A inheritance).
+
+**Waste within one phase, where nothing could have changed:**
+
+1. **~8 duplicate 81 MB digests ≈ 650 MB** — the classifier and `bracketSource`
+   (`phase-io.ts:64`, called from `begin.ts:166`, `import-json.ts:58`/`:182`,
+   `prove-staging.ts:124`, `finalize.ts:146`/`:324`), same iteration, same held
+   locks, zero intervening mutation. The classifier's own comment
+   (`classifier.ts:89-92`) says its reads are "mutually consistent … so a later
+   wave's mutators can act on this row without re-observing" — **the mutators
+   re-observe anyway.** The intended reuse was designed and then not taken.
+2. **4 full 262 MB DB digests ≈ 1.0 GB** (`classifier.ts:182`,
+   `finalize.ts:164`/`:170`, `authority-flip.ts:108`) inside the frozen window
+   whose frozenness is the stated reason the physical witness is trustworthy.
+3. `observeStagingMain` twice per M2 iteration with identical arguments
+   (`classifier.ts:152`, `import-json.ts:185`).
+4. `observeQSibling` up to three times per M5 iteration (`classifier.ts:158`,
+   `finalize.ts:327`, `authority-flip.ts:292`).
+5. `proveResource` (`authority-flip.ts:137`) hand-rolls `observePath`'s
+   open/fstat/digest instead of extending it — a seventh copy for §3g.
+6. `revalidateBackups` (`:90`) re-digests both 81 MB backups that
+   `preserveSource` already verified in the same lock hold.
+
+**Cost: a concept-count issue, not a perf issue at current sizes.** SHA-256
+measured at 2.25 GB/s on this host, so 4.0 GB of digesting is **≈1.8 s of CPU in
+a 37 s migration (~5%)**, page-cache-warm, once per workspace. Two caveats worth
+recording: on a cold cache or a network filesystem, 4 GB of re-reads at
+~100 MB/s is ~40 s of pure re-read; and amplification is linear in document size,
+so an 800 MB document turns 1.8 s into ~18 s of duplicate hashing.
+
+**Verdict: no dedicated cycle, but two items fold into existing ones.** The
+digest duplication is not worth a cycle of its own and must not be "fixed" by
+caching across a phase boundary. What it does justify: item 5 folds into Cycle 3
+(P-4's leaf), and the correctness smell below (D-5) folds into Cycle 3b. The
+measurement itself should become 5C's duration-budget baseline (§8 P-2).
+
+**Separate memory finding.** `parseAdmittedSource` (`import-json.ts:235`) and
+`sampleStateFile` (`last-writer-witness.ts:155-170`, via `handle.readFile()`)
+each pull the whole 81 MB document into a single Buffer, while `observePath`
+correctly streams. Peak RSS scales with document size in two places that need
+not — relevant because `memory-admission` is a halt code this machine raises.
 
 ### 3i. Adapter discipline
 
@@ -465,8 +530,13 @@ row states what proof is still missing.
 | D-3 | `assertNoSidecars` uses symlink-**following** `existsSync` where the two sibling predicates (`observeSidecars`, `inodeOf`) are no-follow — and it is the one guarding the `S0` seal that M4→M5→M6 resume depends on. | `artifact-proof.ts:60-64` vs `artifact-observation.ts:79-81`, `genesis.ts:249,260` |
 | D-4 | `witness.active` is stale at M6/M7, but 222 §M-6's containment table says it is "**never**" stale. The code handles it correctly (`classifier.ts:264-273` branches to `proveActiveStore`) — the *design record* is wrong, and none of 5A's four gates covers this member. | `classifier.ts:221-243` vs 222:554-561 |
 
-D-4 is the most important of the four: the containment table is the artifact a
-future author will trust, and it is wrong about one of its own rows.
+| D-5 | `observeLegacyAuthority` decides the format with `classifyStateFormat(statePath(root))` and then re-opens the **same pathname** with `observePath(statePath(root), true)` to digest it. Each open is individually `O_NOFOLLOW`, but the module's own header states the invariant the composition breaks: *"Every property of a path is decided from ONE no-follow descriptor […] a pathname lookup followed by a second one could be answered by a symlink swapped in between."* The composition violates the invariant its parts enforce — so the format verdict and the digest can, in principle, describe two different files. | `artifact-observation.ts:97-105` vs its header at `:5-7` |
+
+D-4 is the most important of the five: the containment table is the artifact a
+future author will trust, and it is wrong about one of its own rows. D-5 is the
+only one found by the traced run rather than by reading — it is a real
+double-pathname-lookup window, though reaching it requires an attacker able to
+swap a symlink inside `.rbox/state` while the migration holds its lock bundle.
 
 ---
 
@@ -552,8 +622,17 @@ the new query reaches no `bun:sqlite`, modeled on
 defect in this audit lives in the gaps between them.
 
 **Reduces:** 6 claim + 6 rewrite + 6 sha256 + 4 fsyncDir + 3 sameInode + 5
-`isOutOfSpace` + 8 sidecar lists → one leaf. Closes D-1, D-2, D-3. Gives "is
-this the recorded inode" an owner (currently ~16 inline comparisons).
+`isOutOfSpace` + 8 sidecar lists → one leaf. Closes D-1, D-2, D-3, **D-5**. Gives
+"is this the recorded inode" an owner (currently ~16 inline comparisons).
+
+**The trace sharpened this cycle's justification.** §3h found ~29 raw
+`fs.openSync`/`fs.open` sites across 13 files in `migration/` alongside
+`observePath`'s 31 — the primitive is well designed but not well owned, which is
+the precise condition P-4 exists to fix. Two extra items fold in here:
+`proveResource` (`authority-flip.ts:137`) hand-rolls `observePath`'s
+open/fstat/digest and should extend it instead; and D-5's double pathname lookup
+in `observeLegacyAuthority` is fixed by giving the leaf a "classify and digest
+from one descriptor" operation, which is what its own header already demands.
 
 **Answers 5A's #4 objection** by removing the parameter rather than adding one:
 the leaf returns a discriminated result and each caller maps it to its own
@@ -629,7 +708,7 @@ bytes must not move.
 | 1 | Halt taxonomy: `reserved-path` → four codes | Highest (concept count) | **No** — durable schema |
 | 2 | One workspace-state query; adapters stop re-deriving | Highest (correctness) | **Yes, sequenced** — collides in doctor fixtures |
 | 3a | Trivial leaf consolidation (sha256, fsync, sameInode, …) | High / zero risk | **Yes** |
-| 3b | The claim/rewrite leaf + D-1/D-2/D-3 | High | **No** — crash rig |
+| 3b | The claim/rewrite leaf + D-1/D-2/D-3/D-5 | High | **No** — crash rig |
 | 4 | One phase-outcome shape, one halt publisher | Medium-high | **No** — rewrites every body |
 | 5 | Narrow the witness type at the phase boundary | Medium, deletes a gate | Doc fix **yes, now**; type change **no** |
 
@@ -688,8 +767,12 @@ bytes must not move.
   Baseline it before and after; the new workspace-state query must not be
   reachable from that path. Enforce with an import-graph gate, not a benchmark.
 - **P-2 (Cycles 2, 3).** Migration duration budget (222 §5C) measured on the
-  snapshot-replay harness before and after — this is also the observation-reuse
-  baseline (§3h).
+  snapshot-replay harness before and after. **A baseline now exists** (§3h):
+  81.1 MB source → 261.8 MB DB, 8 steps, 37 s, ≈4.0 GB of product-level
+  observation reads over 343 MB of distinct bytes (11.7×), ≈1.8 s of SHA-256.
+  Check it in. Amplification is linear in document size, so the same run on an
+  800 MB document is the case to watch; a cold cache or network filesystem turns
+  the same 4 GB into ~40 s.
 
 ### Structural (all cycles)
 
