@@ -23,6 +23,7 @@
  */
 import { StateAuthorityCorruptError } from "../errors.js";
 import { openStateStoreForWalTakeover, stateStoreDatabase } from "../store/open.js";
+import { selectRow } from "../store/statements.js";
 
 export function proveActiveStore(
   markerFile: string,
@@ -44,9 +45,8 @@ export function proveActiveStore(
       refuse("the state database carries a different authority than the marker names");
     }
     if (migrationId !== undefined) {
-      const row = stateStoreDatabase(handle)
-        .query("SELECT migration_id FROM migration_completion WHERE singleton=1")
-        .get() as { migration_id?: string } | null;
+      const row = selectRow<{ migration_id?: string }>(
+        stateStoreDatabase(handle), "SELECT migration_id FROM migration_completion WHERE singleton=1");
       if (row?.migration_id !== migrationId) refuse("the state database was not published by this migration");
     }
   } finally {

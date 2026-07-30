@@ -10,6 +10,7 @@ import {
   type GenesisLineage,
 } from "../schema/application.js";
 import { validateOpen, type StoreHeader } from "../schema/validate-open.js";
+import { selectRow } from "./statements.js";
 
 export interface StorePragmas {
   pageSize: number;
@@ -34,7 +35,7 @@ export interface ClaimedInode {
 }
 
 function scalar(db: Database, pragma: string): number | string {
-  const row = db.query(`PRAGMA ${pragma}`).get() as Record<string, number | string> | null;
+  const row = selectRow<Record<string, number | string>>(db, `PRAGMA ${pragma}`);
   if (!row) throw new Error(`PRAGMA ${pragma} returned no row`);
   return Object.values(row)[0]!;
 }
@@ -181,9 +182,8 @@ export interface ResetCheckpointResult {
 export function checkpointStateStoreForReset(store: StateStoreHandle): ResetCheckpointResult {
   if (store.readonly) throw new Error("reset checkpoint requires the owning writer");
   const db = stateStoreDatabase(store);
-  const row = db.query("PRAGMA wal_checkpoint(TRUNCATE)").get() as
-    | { busy?: unknown; log?: unknown; checkpointed?: unknown }
-    | null;
+  const row = selectRow<{ busy?: unknown; log?: unknown; checkpointed?: unknown }>(
+    db, "PRAGMA wal_checkpoint(TRUNCATE)");
   const values = row ? Object.values(row) : [];
   const result = {
     busy: Number(row?.busy ?? values[0]),

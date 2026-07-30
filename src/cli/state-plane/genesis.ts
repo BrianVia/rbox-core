@@ -25,6 +25,7 @@ import {
   stateStoreDatabase,
   type ClaimedInode,
 } from "./store/open.js";
+import { selectRow } from "./store/statements.js";
 
 /** The intent's shape, decode, and bounded reader live in `genesis-intent.ts`,
  * which reaches no SQLite: the write fence reads the intent on every save and
@@ -224,9 +225,10 @@ function isFinishedGenesis(file: string, intent: GenesisIntent, live: FencedEvid
       return false;
     }
     try {
-      const row = stateStoreDatabase(store).query(
+      const row = selectRow<{ origin_kind: string; migration_id: string; entry_count: number; repo_count: number }>(
+        stateStoreDatabase(store),
         "SELECT origin_kind,migration_id,entry_count,repo_count FROM migration_completion WHERE singleton=1",
-      ).get() as { origin_kind: string; migration_id: string; entry_count: number; repo_count: number } | null;
+      );
       return store.header.authority_id === intent.authorityId
         && store.header.active_lineage_id === intent.lineageId
         && row?.origin_kind === "genesis"

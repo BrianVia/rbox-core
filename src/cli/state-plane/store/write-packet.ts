@@ -20,6 +20,7 @@ import {
 } from "./cas-steps.js";
 import { copyStageFilesIntoTemp, createStageFileTemp, dropStageFileTemp } from "./generations.js";
 import { stateStoreDatabase, type StateStoreHandle } from "./open.js";
+import { runStatement, selectRow } from "./statements.js";
 import { currentSnapshot } from "./read-snapshot.js";
 import { openSealedStage, verifySourceStageBinding, type SealedStageRef } from "./sealed-stages.js";
 import { StageLock, deleteSealedArtifact, type SealedArtifactRef } from "./stage-artifacts.js";
@@ -250,8 +251,8 @@ function runTransaction(
     applyTransitions(db, lineageId);
     const generation = frozen.expected.baseGeneration + (frozen.hasGlobal ? 1 : 0);
     rebuildManifestProjection(db, lineageId, generation);
-    db.query("UPDATE state_lineage SET state_nonce=COALESCE(state_nonce,?),state_revision=? WHERE lineage_id=?")
-      .run(crypto.randomBytes(16).toString("hex"), frozen.expected.stateRevision + 1, lineageId);
+    runStatement(db, "UPDATE state_lineage SET state_nonce=COALESCE(state_nonce,?),state_revision=? WHERE lineage_id=?",
+      crypto.randomBytes(16).toString("hex"), frozen.expected.stateRevision + 1, lineageId);
     // Step 5: the last thing before commit is the ownership recheck.
     if (!frozen.ownerToken.isOwner()) reject("owner-lost");
     db.exec("COMMIT");
@@ -302,15 +303,14 @@ export function ensureTelemetryBindingId(store: StateStoreHandle, expectedStream
   const db = stateStoreDatabase(store);
   db.exec("BEGIN IMMEDIATE");
   try {
-    const row = db.query(`SELECT l.lineage_id,l.stream,l.telemetry_binding_id FROM store_meta m
-      JOIN state_lineage l ON l.lineage_id=m.active_lineage_id WHERE m.singleton=1`).get() as {
-      lineage_id: string; stream: string; telemetry_binding_id: string | null;
-    } | null;
+    const row = selectRow<{ lineage_id: string; stream: string; telemetry_binding_id: string | null }>(
+      db, `SELECT l.lineage_id,l.stream,l.telemetry_binding_id FROM store_meta m
+      JOIN state_lineage l ON l.lineage_id=m.active_lineage_id WHERE m.singleton=1`);
     if (!row) throw new Error("state store singleton disappeared");
     if (row.stream !== expectedStream) throw new Error(`telemetry binding requested for stream ${expectedStream}, store holds ${row.stream}`);
     const binding = row.telemetry_binding_id ?? crypto.randomBytes(8).toString("hex");
     if (row.telemetry_binding_id === null) {
-      db.query("UPDATE state_lineage SET telemetry_binding_id=? WHERE lineage_id=?").run(binding, row.lineage_id);
+      runStatement(db, "UPDATE state_lineage SET telemetry_binding_id=? WHERE lineage_id=?", binding, row.lineage_id);
     }
     db.exec("COMMIT");
     return binding;

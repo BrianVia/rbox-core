@@ -11,6 +11,7 @@ import type {
   ReadSnapshot, RepositorySnapshot,
 } from "../ports.js";
 import { stateStoreDatabase, type StateStoreHandle } from "./open.js";
+import { selectRow, selectRows } from "./statements.js";
 
 const PAGE_BYTES = 4 * 1024 * 1024;
 
@@ -38,26 +39,26 @@ function header(row: HeadRow): ManifestHeader {
 }
 
 export function currentSnapshot(db: Database): LineageSnapshot {
-  const core = db.query(`SELECT m.authority_id,l.lineage_id,l.stream,l.state_nonce,l.state_revision,
+  const core = selectRow<TokenRows>(db, `SELECT m.authority_id,l.lineage_id,l.stream,l.state_nonce,l.state_revision,
     l.last_synced_sequence,l.active_base_generation,l.local_revision,l.telemetry_binding_id,
     l.extras_cjson,c.source_shape_flags_cjson
     FROM store_meta m JOIN state_lineage l ON l.lineage_id=m.active_lineage_id
     JOIN migration_completion c ON c.singleton=1
-    WHERE m.singleton=1`).get() as TokenRows | null;
+    WHERE m.singleton=1`);
   if (!core) throw new Error("state store singleton disappeared");
-  const heads = db.query(`SELECT plane,generation,generated_at,manifest_schema,source_sequence,
-    trust_epoch,complete,extras_cjson FROM plane_heads WHERE lineage_id=? ORDER BY plane`).all(core.lineage_id) as HeadRow[];
+  const heads = selectRows<HeadRow>(db, `SELECT plane,generation,generated_at,manifest_schema,source_sequence,
+    trust_epoch,complete,extras_cjson FROM plane_heads WHERE lineage_id=? ORDER BY plane`, core.lineage_id);
   const base = heads.find((row) => row.plane === "base");
   const local = heads.find((row) => row.plane === "local");
   if (!base || !local || base.generation !== core.active_base_generation || local.generation !== core.local_revision) {
     throw new Error("state store head invariant failed");
   }
-  const meta = db.query(`SELECT enc_manifest_sha,manifest_hash,account_epoch,key_epoch,chain_bytes,
-    snapshot_bytes,extras_cjson FROM global_manifest_meta WHERE lineage_id=? AND base_generation=?`
-  ).get(core.lineage_id, core.active_base_generation) as {
+  const meta = selectRow<{
     enc_manifest_sha: Uint8Array; manifest_hash: Uint8Array; account_epoch: number; key_epoch: number;
     chain_bytes: number; snapshot_bytes: number; extras_cjson: string | null;
-  } | null;
+  }>(db, `SELECT enc_manifest_sha,manifest_hash,account_epoch,key_epoch,chain_bytes,
+    snapshot_bytes,extras_cjson FROM global_manifest_meta WHERE lineage_id=? AND base_generation=?`,
+  core.lineage_id, core.active_base_generation);
   const generationKey = String(core.active_base_generation);
   const manifestMeta = meta
     ? decodeAuthorityRow("globalManifestMeta", generationKey, () => ({
@@ -150,13 +151,12 @@ class SqliteReadSnapshot implements ReadSnapshot {
   files(plane: Plane, afterPath: string | undefined, batchSize: number): CursorPage<FileEntry> {
     window("file", batchSize);
     return shortQuery(this.db, this.token, () => {
-      const rows = this.db.query(`SELECT e.path,e.sha256,e.size,e.mode,e.mtime_ms,e.kind,e.symlink_target,
+      const rows = selectRows<FileEntryRow>(this.db, `SELECT e.path,e.sha256,e.size,e.mode,e.mtime_ms,e.kind,e.symlink_target,
         e.enc_sha,e.comp,e.payload_sha,e.cipher_size,e.extras_cjson,e.canonical_bytes,e.retained_estimate
         FROM plane_entries p JOIN entry_values e ON e.entry_id=p.entry_id
         WHERE p.lineage_id=? AND p.plane=? AND p.path_order>?
-        ORDER BY p.path_order LIMIT ?`).all(
-        this.token.lineageId, plane, afterPath === undefined ? Buffer.alloc(0) : utf16beOrderKey(afterPath), batchSize,
-      ) as FileEntryRow[];
+        ORDER BY p.path_order LIMIT ?`,
+      this.token.lineageId, plane, afterPath === undefined ? Buffer.alloc(0) : utf16beOrderKey(afterPath), batchSize);
       const page = boundedPage(rows, batchSize, (row) => row.retained_estimate, (row) => row.path);
       return { ...page, rows: page.rows.map((row) => decodeAuthorityRow("fileEntry", row.path, () => decodeFileEntry(row))) };
     });
@@ -165,10 +165,9 @@ class SqliteReadSnapshot implements ReadSnapshot {
   repos(afterRelPath: string | undefined, batchSize: number): CursorPage<{ relPath: string; record: RepoRecord; token: RepositorySnapshot }> {
     window("repo", batchSize);
     return shortQuery(this.db, this.token, () => {
-      const rows = this.db.query(`SELECT * FROM repo_records WHERE lineage_id=? AND path_order>?
-        ORDER BY path_order LIMIT ?`).all(
-        this.token.lineageId, afterRelPath === undefined ? Buffer.alloc(0) : utf16beOrderKey(afterRelPath), batchSize,
-      ) as RepoRecordRow[];
+      const rows = selectRows<RepoRecordRow>(this.db, `SELECT * FROM repo_records WHERE lineage_id=? AND path_order>?
+        ORDER BY path_order LIMIT ?`,
+      this.token.lineageId, afterRelPath === undefined ? Buffer.alloc(0) : utf16beOrderKey(afterRelPath), batchSize);
       const page = boundedPage(rows, batchSize, (row) => row.retained_estimate, (row) => row.rel_path);
       return {
         ...page,
@@ -183,8 +182,8 @@ class SqliteReadSnapshot implements ReadSnapshot {
 
   repo(relPath: string): { record: RepoRecord; token: RepositorySnapshot } | undefined {
     return shortQuery(this.db, this.token, () => {
-      const row = this.db.query("SELECT * FROM repo_records WHERE lineage_id=? AND rel_path=?")
-        .get(this.token.lineageId, relPath) as RepoRecordRow | null;
+      const row = selectRow<RepoRecordRow>(this.db,
+        "SELECT * FROM repo_records WHERE lineage_id=? AND rel_path=?", this.token.lineageId, relPath);
       return row
         ? { record: decodeAuthorityRow("repoRecord", relPath, () => decodeRepoRecord(row)), token: { ...this.token, repoGen: row.repo_gen } }
         : undefined;
@@ -194,11 +193,10 @@ class SqliteReadSnapshot implements ReadSnapshot {
   manifestChainCursor(afterOrdinal: number | undefined, batchSize: number) {
     window("chain", batchSize);
     return shortQuery(this.db, this.token, () => {
-      const rows = this.db.query(`SELECT ordinal,enc_sha FROM manifest_chain
+      const rows = selectRows<{ ordinal: number; enc_sha: Uint8Array }>(this.db, `SELECT ordinal,enc_sha FROM manifest_chain
         WHERE lineage_id=? AND base_generation=? AND ordinal>?
-        ORDER BY ordinal LIMIT ?`).all(
-        this.token.lineageId, this.token.baseGeneration, afterOrdinal ?? -1, batchSize,
-      ) as Array<{ ordinal: number; enc_sha: Uint8Array }>;
+        ORDER BY ordinal LIMIT ?`,
+      this.token.lineageId, this.token.baseGeneration, afterOrdinal ?? -1, batchSize);
       return {
         rows: rows.map((row) => ({ ordinal: row.ordinal, encSha: Buffer.from(row.enc_sha).toString("hex") })),
         done: rows.length < batchSize,
@@ -210,12 +208,12 @@ class SqliteReadSnapshot implements ReadSnapshot {
   private git(role: GitSectionRole, afterRelPath: string | undefined, batchSize: number) {
     window("git", batchSize);
     return shortQuery(this.db, this.token, () => {
-      const rows = this.db.query(`SELECT rel_path,section_cjson FROM manifest_git_sections
+      const rows = selectRows<{ rel_path: string; section_cjson: string }>(this.db,
+        `SELECT rel_path,section_cjson FROM manifest_git_sections
         WHERE lineage_id=? AND base_generation=? AND role=? AND path_order>?
-        ORDER BY path_order LIMIT ?`).all(
+        ORDER BY path_order LIMIT ?`,
         this.token.lineageId, this.token.baseGeneration, role,
-        afterRelPath === undefined ? Buffer.alloc(0) : utf16beOrderKey(afterRelPath), batchSize,
-      ) as Array<{ rel_path: string; section_cjson: string }>;
+        afterRelPath === undefined ? Buffer.alloc(0) : utf16beOrderKey(afterRelPath), batchSize);
       const rowBytes = (row: { rel_path: string; section_cjson: string }) =>
         Buffer.byteLength(row.rel_path) + Buffer.byteLength(row.section_cjson);
       const oversize = rows.find((row) => rowBytes(row) > PAGE_BYTES);
