@@ -471,7 +471,7 @@ test("each entry-point name is constructed in exactly one production module", ()
     // `admission.ts` is excluded because it VALIDATES the union rather than
     // minting a member of it (`entry !== "upgrade-stop-window" && …`), which is
     // the M0 condition that makes the proof mean something.
-    // The two 5C fault-injection harnesses are excluded by name. Both DRIVE the
+    // The three 5C harnesses are excluded by name. Both DRIVE the
     // real entry point rather than adding one: `fault-rig-child.ts` is spawned,
     // never imported (SIGKILL only means something in a process the test does
     // not need back), and `u3-5c-trace.ts` is the probe that derived 5C's kill
@@ -483,6 +483,7 @@ test("each entry-point name is constructed in exactly one production module", ()
     const hits = productionHits(
       `"${literal}"`, "src/cli/state-plane/locks.ts", "src/cli/state-plane/migration/admission.ts",
       "src/cli/state-plane/migration/fault-rig-child.ts", "scripts/probe/u3-5c-trace.ts",
+      "scripts/bench/migration-baseline.ts",
     );
     // Per MODULE, not per occurrence: `state-plane-cmd.ts` names
     // `foreground-migrate` once per operator command, because doctor's retry and

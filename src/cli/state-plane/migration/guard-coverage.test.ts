@@ -298,3 +298,62 @@ test("a halt whose own publication runs out of space consumes the prepared runwa
   // The control is never advanced past the phase whose write failed.
   expect(["M0", "M1", "M2"]).toContain(control?.witness.phase ?? "M0");
 });
+
+// ---------------------------------------------------------------------------
+// GUARD `flip-last-instant-reverify` — `authority-flip.ts`, 222 §7.1's F5.
+//
+// Found by 5C's own self-review: an ad-hoc mutation of this guard SURVIVED the
+// 55-test crash matrix. The reason is the same shape as `source-rebracket`
+// above — every other path that notices a changed source catches it one layer
+// earlier, so the guard's own window was never entered. §5.2's M6 row calls this
+// re-verify "the last operation before the rename with nothing between", and
+// §6.2's `legacy-write-detected` disposition is reachable ONLY here.
+
+test("a legacy write inside M6's check-to-rename microwindow stops the flip", async () => {
+  const root = await legacyWorkspace("f5-microwindow");
+  const live = statePath(root);
+  const original = await fsp.readFile(live);
+  const perturbed = Buffer.from(
+    JSON.stringify({ ...JSON.parse(original.toString()), lastSyncedSequence: 777 }),
+  );
+
+  // Driven by a deterministic seam, never by sleeping (§7.1). The window opens
+  // after `sameSource` and closes at the final `observePath`; `revalidateBackups`
+  // runs between them, so its first legacy-json open is inside it. The arming
+  // fault fires on the M4->M5 staging rename so that the inner fault cannot be
+  // consumed by M1/M2's own backup writes.
+  let landed = false;
+  let inner: { restore: () => void } | undefined;
+  const arm = installStatePlaneFault(
+    { syscall: "renameSync", match: /state\.db\.migrate\./, when: "after" },
+    {
+      kind: "side-effect",
+      run: () => {
+        inner = installStatePlaneFault(
+          { syscall: "openSync", match: /legacy-json/, nth: 1, when: "after" },
+          {
+            kind: "side-effect",
+            run: () => {
+              replaceUnderNewInode(live, perturbed);
+              landed = true;
+            },
+          },
+        );
+      },
+    },
+  );
+
+  let outcome;
+  try {
+    outcome = await under(root, (entry) => runMigration(root, entry));
+  } finally {
+    inner?.restore();
+    arm.restore();
+  }
+
+  expect(landed, "the microwindow write must actually have landed").toBe(true);
+  // The flip must NOT have happened: JSON is still authority and the perturbed
+  // document — the writer's data — is intact.
+  expect(outcome.kind, JSON.stringify(outcome)).not.toBe("migrated");
+  expect(await fsp.readFile(live)).toEqual(perturbed);
+});

@@ -100,6 +100,15 @@ export const MUTATION_GUARDS: readonly MutationGuard[] = [
     reason:
       "Every mutator re-brackets the recorded source before acting; deleting the check lets a legacy document that changed mid-migration be imported as if it were the one the control recorded, which is the whole source-changed disposition.",
   },
+  {
+    id: "flip-last-instant-reverify",
+    file: "cli/state-plane/migration/authority-flip.ts",
+    anchor: "if (final.sha256 !== witness.completion.sourceJsonSha256) {",
+    removed: "if (false) {",
+    test: "cli/state-plane/migration/guard-coverage.test.ts",
+    reason:
+      "222 §5.2's M6 row calls this the last operation before the rename with nothing between, and §6.2's legacy-write-detected disposition is reachable only here; without it an older rbox's write inside the check-to-rename microwindow is flipped over and silently lost.",
+  },
 ];
 
 const REPO = path.resolve(import.meta.dir, "..");

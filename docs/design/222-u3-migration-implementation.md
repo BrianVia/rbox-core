@@ -2076,6 +2076,14 @@ encoded that halt as expected behaviour.
 
 ### 7.11 FINDING — `filesystem-full` is unreachable for an ordinary control publication
 
+**Scope, measured by the crash and I/O matrices: nine sites, not one.** A real
+`ENOSPC` escapes `runMigration` as a raw `ErrnoException` — no typed halt, no
+`durableHalt`, not a member of `MigrationOutcome` at all — at M0's, M1's, M2's,
+M3's, and M5's control publications; at M2's backup temp create and both backup
+renames; at the M4→M5 staging rename; and at M7's control retirement.
+`filesystem-full` is reachable at **exactly one** site: `begin.ts`'s exclusive
+create of the emergency candidate.
+
 `isOutOfSpace` in `control-publication.ts` guards only the **halt** publication's
 runway, through `haltRunway`. An `ENOSPC`/`EDQUOT` during an **ordinary** control
 publication is classified by nothing: it unwinds past `step`'s two typed catches
@@ -2085,6 +2093,17 @@ throws to the CLI" rule exists to prevent exactly this. §5.2 lists
 `filesystem-full` as a reachable halt for M1–M5 and §6.3 writes copy for it, but
 no code path can produce that halt for the publication itself before M6 prepares
 a runway.
+
+**A second wrong diagnosis, same family.** `artifact-observation.ts` maps every
+non-`ENOENT` open failure to `foreign`, so an `ENOSPC` or `EIO` on the FIRST open
+of `reserve-1mib.bin` or `migration-emergency.*.bin` is reported as
+`reserve-foreign` — "a file rbox keeps as a safety reserve doesn't look like rbox
+wrote it" (§6.1). Fail-closed and retryable, but the user is told their reserve
+looks foreign when the real condition is a full disk or failing media.
+
+These are pinned by the `ESCAPING` table in `io-halt-matrix.test.ts`, which
+asserts the escape at each site, so a wave that closes the gap must edit that
+table deliberately rather than discovering the rows by surprise.
 
 **Severity: copy and typed-outcome, not corruption.** The behaviour is still
 fail-closed — the prepared sibling is removed, the canonical control is
@@ -2223,6 +2242,29 @@ wording should say so rather than implying a comparison no run can pass.
 only the canonical control and the genesis intent and never classifies
 artifacts, so an inert strand is invisible and doctor answers "no conversion in
 progress". Same gap as §7.13's strand item, reached from a second direction.
+
+**SELF-REVIEW — the wave's own matrices were mutation-tested, and two guards
+are still uncovered.** An ad-hoc mutation sweep was run against 5C's new
+matrices rather than trusting their test counts. **Three of three mutants
+initially SURVIVED**, including the M6 last-instant re-verify — F5's entire
+subject — against a 55-test crash matrix. The cause is the same shape twice
+over: every other path that notices a changed source catches it one layer
+earlier, so a second-line-of-defence guard's own window is never entered by a
+test that perturbs between driver iterations. `guard-coverage.test.ts` now
+drives F5's true `check -> rename` microwindow with the `side-effect` action —
+deterministic, no sleeping — and that mutant is killed and in the standing
+table. Two remain uncovered and are recorded rather than hidden:
+
+| Guard | Why it is still uncovered |
+|---|---|
+| `revalidateActive`'s Q-sibling exactness (`authority-flip.ts`) | Needs the active database to change between M5 and the flip. Reachable with the rig's `side-effect` action; not written. |
+| `begin.ts`'s ENOSPC refill halt | On the halt-runway REFILL path, reached only through `restoreHaltRunway` on a retry, which the I/O matrix does not drive. |
+
+The lesson generalizes past this wave: **a test count is not coverage, and a
+matrix that passes 55 cells can still notice nothing.** The gate table is the
+artifact that makes that measurable, and it should grow by exactly this
+procedure — mutate, observe the survivor, write the test that reaches its
+window.
 
 **FINDING — M4 fidelity accepts a dropped manifest section.** A `RepoRecord`
 carrying `removedKey` on a repo that still has a live manifest section causes
