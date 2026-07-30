@@ -1,6 +1,6 @@
 import type { Env } from "./env.js";
 import { json } from "./util.js";
-import { PLANS, planFor } from "./plans.js";
+import { PLANS, billableBytes, forgivenBytes, planFor } from "./plans.js";
 import { audit, entitledSubset, isEntitled, type Principal } from "./authz.js";
 import { isOverCapAbort } from "./auth.js";
 import { dbFor } from "./db.js";
@@ -11,9 +11,34 @@ import { RECEIPT_TTL_MS } from "./receipts.js";
  *  for this long before locked-state retention resumes. */
 export const GRACE_PERIOD_MS = 30 * 24 * 60 * 60 * 1000;
 
-async function account(env: Env, accountId: string): Promise<{ plan: string; extra: number; used: number; graceUntil: number | null; billingInterval: string | null }> {
-  const r = await dbFor(env, accountId).prepare("SELECT plan, extra_storage_bytes, used_bytes, grace_until, billing_interval FROM accounts WHERE id = ?").bind(accountId).first<{ plan: string; extra_storage_bytes: number; used_bytes: number; grace_until: number | null; billing_interval: string | null }>();
-  return { plan: r?.plan ?? "none", extra: Number(r?.extra_storage_bytes ?? 0), used: Number(r?.used_bytes ?? 0), graceUntil: r?.grace_until ?? null, billingInterval: r?.billing_interval ?? null };
+/** ONE read of the account row. `used` is the live entitlement ledger (`used_bytes`);
+ *  `forgiven` is the measured history a paid plan does not charge for; `billable` is
+ *  the §228 number every display and every cap comparison uses. `measuredAt` is when
+ *  that forgiveness was measured — it lives on the same row, written by the same
+ *  statement, so the number and its timestamp can never be read torn (they used to
+ *  come from `fairuse_scans` in a second query, which on deploy day reported a real
+ *  measurement date against a completely unforgiven ledger).
+ *
+ *  Admitting `incoming` bytes must clamp the SUM — `MAX(0, used + incoming -
+ *  forgiven)` — not add to a pre-clamped `billable`; see plans.ts. */
+async function account(env: Env, accountId: string): Promise<{ plan: string; extra: number; used: number; forgiven: number; billable: number; measuredAt: number | null; graceUntil: number | null; billingInterval: string | null }> {
+  const r = await dbFor(env, accountId).prepare("SELECT plan, extra_storage_bytes, used_bytes, history_overhang_bytes, history_overhang_measured_at, grace_until, billing_interval FROM accounts WHERE id = ?").bind(accountId).first<{ plan: string; extra_storage_bytes: number; used_bytes: number; history_overhang_bytes: number; history_overhang_measured_at: number | null; grace_until: number | null; billing_interval: string | null }>();
+  const plan = r?.plan ?? "none";
+  return {
+    plan,
+    extra: Number(r?.extra_storage_bytes ?? 0),
+    used: Number(r?.used_bytes ?? 0),
+    forgiven: forgivenBytes(plan, r?.history_overhang_bytes),
+    billable: billableBytes(plan, r?.used_bytes, r?.history_overhang_bytes),
+    measuredAt: r?.history_overhang_measured_at ?? null,
+    graceUntil: r?.grace_until ?? null,
+    billingInterval: r?.billing_interval ?? null,
+  };
+}
+
+/** The admission predicate, in the exact shape the accounts_cap_guard trigger uses. */
+function wouldBreachCap(a: { used: number; forgiven: number }, incomingSize: number, cap: number): boolean {
+  return cap !== Infinity && Math.max(0, a.used + incomingSize - a.forgiven) > cap;
 }
 
 /** Fast-fail over-cap check BEFORE writing bytes to R2 (design 13 G4): true when
@@ -29,10 +54,10 @@ async function account(env: Env, accountId: string): Promise<{ plan: string; ext
 export async function wouldExceedCap(env: Env, accountId: string, sha: string, incomingSize: number): Promise<{ over: boolean; used: number; cap: number; reason?: "no_plan" }> {
   const a = await account(env, accountId);
   const cap = planFor(a.plan).storageBytes + a.extra;
-  if (a.plan === "none") return { over: true, used: a.used, cap, reason: "no_plan" };
-  if (await isEntitled(env, accountId, sha)) return { over: false, used: a.used, cap };
-  const over = cap !== Infinity && a.used + incomingSize > cap;
-  return { over, used: a.used, cap, ...(over && a.plan === "none" ? { reason: "no_plan" as const } : {}) };
+  if (a.plan === "none") return { over: true, used: a.billable, cap, reason: "no_plan" };
+  if (await isEntitled(env, accountId, sha)) return { over: false, used: a.billable, cap };
+  const over = wouldBreachCap(a, incomingSize, cap);
+  return { over, used: a.billable, cap, ...(over && a.plan === "none" ? { reason: "no_plan" as const } : {}) };
 }
 
 /** Design 114 pack-PUT fail-fast quota check. Already-entitled logical blobs
@@ -47,12 +72,12 @@ export async function wouldExceedCapAggregate(
     entitledSubset(env, accountId, members.map((member) => member.sha)),
   ]);
   const cap = planFor(a.plan).storageBytes + a.extra;
-  if (a.plan === "none") return { over: true, used: a.used, cap, reason: "no_plan" };
+  if (a.plan === "none") return { over: true, used: a.billable, cap, reason: "no_plan" };
   let incomingSize = 0;
   for (const member of members) if (!entitled.has(member.sha)) incomingSize += member.size;
   // Match wouldExceedCap's existing behavior: a wholly entitled retry costs
   // exactly zero and remains admissible even when the account is already at/over cap.
-  return { over: incomingSize > 0 && cap !== Infinity && a.used + incomingSize > cap, used: a.used, cap };
+  return { over: incomingSize > 0 && wouldBreachCap(a, incomingSize, cap), used: a.billable, cap };
 }
 
 /**
@@ -67,7 +92,7 @@ export async function grantEntitlementWithQuota(env: Env, accountId: string, sha
   const db = dbFor(env, accountId);
   const a = await account(env, accountId);
   const cap = planFor(a.plan).storageBytes + a.extra;
-  if (a.plan === "none") return { granted: false, used: a.used, cap, reason: "no_plan" };
+  if (a.plan === "none") return { granted: false, used: a.billable, cap, reason: "no_plan" };
   // §33: the grant is ONE atomic db.batch (one D1 transaction), mirroring commitAccounting —
   // NOT a split insert-then-charge. Statement order is charge → grant → un-mark/un-condemn:
   //   1. CHARGE iff newly entitled (NOT-EXISTS, evaluated BEFORE the grant insert so it sees
@@ -100,14 +125,14 @@ export async function grantEntitlementWithQuota(env: Env, accountId: string, sha
     // accounts_cap_guard RAISE(ABORT,'over_cap') rolled the whole batch back → nothing granted.
     if (isOverCapAbort(e)) {
       const latest = await account(env, accountId);
-      return { granted: false, used: latest.used, cap: planFor(latest.plan).storageBytes + latest.extra, ...(latest.plan === "none" ? { reason: "no_plan" as const } : {}) };
+      return { granted: false, used: latest.billable, cap: planFor(latest.plan).storageBytes + latest.extra, ...(latest.plan === "none" ? { reason: "no_plan" as const } : {}) };
     }
     throw e;
   }
   // ONE post-batch accounts read is the authoritative used/cap (the cap-guard trigger, not an
   // upfront cap fetch, is the gate) — `cap` is derived locally from the same row, no second read.
   const after = await account(env, accountId);
-  return { granted: true, used: after.used, cap: planFor(after.plan).storageBytes + after.extra };
+  return { granted: true, used: after.billable, cap: planFor(after.plan).storageBytes + after.extra };
 }
 
 /** Legacy upload publication authority: catalog + charge + grant land in one
@@ -123,7 +148,7 @@ export async function publishLegacyBlobWithQuota(
   const db = dbFor(env, accountId);
   const a = await account(env, accountId);
   const cap = planFor(a.plan).storageBytes + a.extra;
-  if (a.plan === "none") return { granted: false, used: a.used, cap, reason: "no_plan" };
+  if (a.plan === "none") return { granted: false, used: a.billable, cap, reason: "no_plan" };
   const deadline = preReadTime + RECEIPT_TTL_MS;
   try {
     const results = await db.batch([
@@ -161,12 +186,12 @@ export async function publishLegacyBlobWithQuota(
   } catch (e) {
     if (isOverCapAbort(e)) {
       const latest = await account(env, accountId);
-      return { granted: false, used: latest.used, cap: planFor(latest.plan).storageBytes + latest.extra, ...(latest.plan === "none" ? { reason: "no_plan" as const } : {}) };
+      return { granted: false, used: latest.billable, cap: planFor(latest.plan).storageBytes + latest.extra, ...(latest.plan === "none" ? { reason: "no_plan" as const } : {}) };
     }
     throw e;
   }
   const after = await account(env, accountId);
-  return { granted: true, used: after.used, cap: planFor(after.plan).storageBytes + after.extra };
+  return { granted: true, used: after.billable, cap: planFor(after.plan).storageBytes + after.extra };
 }
 
 /** Decrement an account's usage counter (called by GC purge per dropped entitlement). */
@@ -213,7 +238,16 @@ export async function usage(env: Env, p: Principal): Promise<Response> {
     // plan — pre-migration rows and non-Stripe admin-set plans). The dashboard
     // defaults to the monthly price display when null.
     interval: a.billingInterval,
-    usedBytes: a.used,
+    // §228: storage used is what we BILL — active bytes as of the last completed
+    // fair-use scan, plus whatever has been uploaded since. Retained history is
+    // stored but never billed, shown, or counted against the plan cap.
+    usedBytes: a.billable,
+    // When that number was measured (epoch ms), or null when nothing has been
+    // measured yet — in which case usedBytes falls back to the raw stored total.
+    // Read from the SAME accounts row as usedBytes, so the two always describe one
+    // instant. Scans tick hourly, so this can legitimately be up to an hour old;
+    // clients surface the age rather than hiding or gating on it.
+    measuredAt: a.measuredAt,
     storageCap: cap === Infinity ? null : cap,
     workspaces,
     workspaceCap: limits.workspaces === Infinity ? null : limits.workspaces,
@@ -222,7 +256,7 @@ export async function usage(env: Env, p: Principal): Promise<Response> {
     // it's in the future, history is preserved. readOnly = already at/over cap, so
     // any new upload is blocked (used+size<=cap is the grant predicate).
     graceUntil: a.graceUntil,
-    readOnly: cap !== Infinity && a.used >= cap,
+    readOnly: cap !== Infinity && a.billable >= cap,
     fairUse: {
       activeBytes: fairUseEpoch ? Number(fairUseEpoch.active_bytes) : null,
       historyBytes: withHistory ? Number(withHistory.history_bytes) : null,

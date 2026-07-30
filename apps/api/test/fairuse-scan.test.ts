@@ -3,6 +3,7 @@ import { beforeAll, beforeEach, describe, expect, test } from "vitest";
 import type { Env } from "../src/env.js";
 import {
   acquireFairUseLease,
+  completeScan,
   declaredRefCount,
   FAIRUSE_GROUP_REF_CAP,
   FAIRUSE_LEASE_QUIESCENCE_MS,
@@ -16,6 +17,7 @@ import {
   type FairUseTuning,
   type HeadEnvelope,
   type HeadRefMode,
+  type ScanRow,
 } from "../src/fairuse.js";
 import { usage } from "../src/billing.js";
 import { WorkspaceSync } from "../src/workspace-sync.js";
@@ -175,6 +177,13 @@ async function completedScan(accountId: string): Promise<Record<string, number |
     `SELECT status,active_bytes,history_bytes,bound_bytes,history_computed,entitlement_missing_count,completed_at
      FROM fairuse_scans WHERE account_id=? ORDER BY epoch DESC LIMIT 1`,
   ).bind(accountId).first<Record<string, number | string | null>>();
+}
+
+/** §228: the measured forgiveness and when it was measured — one row, one statement. */
+async function overhang(accountId: string): Promise<{ bytes: number; at: number | null }> {
+  const row = await db().prepare("SELECT history_overhang_bytes AS b,history_overhang_measured_at AS a FROM accounts WHERE id=?")
+    .bind(accountId).first<{ b: number; a: number | null }>();
+  return { bytes: Number(row?.b), at: row?.a ?? null };
 }
 
 async function groupTotals(accountId: string): Promise<Array<{ workspace_id: string; active_bytes: number }>> {
@@ -367,6 +376,69 @@ describe("design 225 active bytes at head", () => {
     expect((await legacy.json() as { fairUse: Record<string, unknown> }).fairUse).toMatchObject({
       activeBytes: 10, historyBytes: 40, bound: 100,
     });
+  });
+
+  test("design 228: completion records the ledger bytes we measured but do not bill", async () => {
+    const accountId = "acct_000_fairuse_overhang";
+    const ws = "ws_overhang";
+    const manifest = sha(0x900_100);
+    await seedAccount(accountId, [{ ws, proj: "root" }], [{ sha: manifest, size: 64 }]);
+    // The ledger says 500 bytes are entitled; only the 64-byte manifest is live at head.
+    await db().prepare("UPDATE accounts SET used_bytes=500 WHERE id=?").bind(accountId).run();
+    expect(await drive(scanningEnv({ [`${ws}/root`]: project({ encManifestSha: manifest }) }, log()), accountId)).toBe("complete");
+
+    expect(await completedScan(accountId)).toMatchObject({ active_bytes: 64 });
+    // used_bytes itself is untouched — the ledger is still the ledger and still the
+    // admission input; only the allowance moved.
+    expect(await db().prepare("SELECT used_bytes FROM accounts WHERE id=?").bind(accountId).first())
+      .toEqual({ used_bytes: 500 });
+    expect(await overhang(accountId)).toEqual({ bytes: 436, at: NOW });
+    const response = await usage(env, { accountId, deviceId: "dev", userId: "user", role: "owner", kind: "device" });
+    expect(await response.json()).toMatchObject({ usedBytes: 64, measuredAt: NOW });
+  });
+
+  test("design 228: a completion attempt that lost the lease does not rewrite the measurement", async () => {
+    const accountId = "acct_000_fairuse_overhang_lease";
+    const ws = "ws_overhang_lease";
+    const manifest = sha(0x900_102);
+    await seedAccount(accountId, [{ ws, proj: "root" }], [{ sha: manifest, size: 64 }]);
+    await db().prepare("UPDATE accounts SET used_bytes=500 WHERE id=?").bind(accountId).run();
+    expect(await drive(scanningEnv({ [`${ws}/root`]: project({ encManifestSha: manifest }) }, log()), accountId)).toBe("complete");
+    expect(await overhang(accountId)).toEqual({ bytes: 436, at: NOW });
+
+    // A second attempt sharing this epoch's completed_at — the injected clock makes that
+    // exact — but holding no live lease. Its own completion UPDATE changes nothing, and
+    // the overhang write must not sneak through against the newer ledger either.
+    await db().prepare("UPDATE accounts SET used_bytes=9000 WHERE id=?").bind(accountId).run();
+    const row = await db().prepare(
+      "SELECT * FROM fairuse_scans WHERE account_id=? ORDER BY epoch DESC LIMIT 1",
+    ).bind(accountId).first<ScanRow>();
+    // A well-formed lease value that is simply not the incumbent — what a losing
+    // attempt actually carries.
+    const loser = JSON.stringify({ owner: "loser", epoch: row!.epoch, acquired: NOW, expires: NOW + 60_000 });
+    expect(await completeScan(db(), row!, loser, NOW)).toBe("incomplete");
+    expect(await overhang(accountId)).toEqual({ bytes: 436, at: NOW });
+  });
+
+  test("design 228: an aborted epoch leaves the previous measurement standing", async () => {
+    const accountId = "acct_000_fairuse_overhang_abort";
+    const ws = "ws_overhang_abort";
+    const manifest = sha(0x900_101);
+    const refs = Array.from({ length: 12 }, (_, index) => ({ sha: sha(0x1f0 + index), size: 1 }));
+    await seedAccount(accountId, [{ ws, proj: "root" }], [...refs, { sha: manifest, size: 5 }]);
+    await db().prepare("UPDATE accounts SET used_bytes=500,history_overhang_bytes=400,history_overhang_measured_at=? WHERE id=?")
+      .bind(NOW - 1, accountId).run();
+    const state = project({ encManifestSha: manifest, refMode: { kind: "inline", refShas: refs.map((r) => r.sha) } });
+    const fakeEnv = scanningEnv({ [`${ws}/root`]: state }, log());
+    const tuning: FairUseTuning = { entitlementPage: 1, pagesPerTick: 1 };
+
+    await runFairUseObservation(fakeEnv, NOW, tuning);
+    await db().prepare("INSERT INTO workspaces(workspace_id,project_id,account_id,created_at) VALUES(?,'root',?,?)")
+      .bind("ws_overhang_abort_new", accountId, NOW + 1).run();
+    await runFairUseObservation(fakeEnv, NOW, tuning);
+
+    expect((await scan(accountId))?.status).toBe("aborted_pins");
+    expect(await overhang(accountId)).toEqual({ bytes: 400, at: NOW - 1 });
   });
 
   test("a MISSING sidecar is stale (retries against the re-read head); a corrupt one aborts", async () => {

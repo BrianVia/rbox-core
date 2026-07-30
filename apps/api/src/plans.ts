@@ -45,6 +45,54 @@ export function capBytesFor(plan: string | null | undefined, extraStorageBytes =
 }
 
 /**
+ * §228: THE bytes a plan cap forgives — the measured history an account stores but is
+ * never billed for, written by the fair-use scan's completion (`fairuse.ts`
+ * completeScan, the single writer of `history_overhang_bytes`).
+ *
+ * **Only a PAID plan forgives anything.** A locked (`none`) account has cap_bytes = 1,
+ * which makes accounts_cap_guard an airtight one-byte fence — the thing that stops a
+ * lapsed subscription writing more data. A standing overhang from the paid era would
+ * blunt that fence until the ledger climbed past it, so a paid→locked transition would
+ * leave a window where real bytes land durably. Forgiving on the plan rather than
+ * clearing the column on every plan-write path keeps this a property of the ONE
+ * authority instead of a duty spread across the Stripe webhook, admin set-plan, and any
+ * future writer; the stored measurement also survives a re-upgrade unharmed.
+ * Unknown/garbage plan strings forgive nothing, matching `planFor`'s fail-closed
+ * fallback to `none`.
+ */
+export function forgivenBytes(plan: string | null | undefined, historyOverhangBytes: number | null | undefined): number {
+  return isPaidPlan(plan) ? Number(historyOverhangBytes ?? 0) : 0;
+}
+
+/**
+ * THE number rbox bills, shows and compares against the plan cap.
+ *
+ * `accounts.used_bytes` is the live entitlement ledger — every ref the account has
+ * uploaded and not had pruned, including superseded history. The founder ruling is
+ * that history is stored but never billed, so:
+ *
+ *   billable = active_bytes(last completed scan) + net ledger delta since that scan
+ *
+ * Overhang 0 (the column default, i.e. no scan has ever completed) makes this the
+ * identity — the fallback is exactly today's behaviour, labelled as unmeasured by
+ * `usage()`'s `measuredAt: null`. Clamped at 0 because GC can prune the ledger below a
+ * standing overhang between hourly scans; a negative allowance is never meaningful.
+ *
+ * Callers admitting `incoming` bytes must clamp the SUM, not the current value —
+ * `MAX(0, used + incoming - overhang)`, exactly what the trigger evaluates. Clamping
+ * first (`MAX(0, used - overhang) + incoming`) is STRICTER than the fence in the pruned
+ * regime, so the advisory 402 would refuse an upload D1 would have admitted.
+ */
+export function billableBytes(plan: string | null | undefined, usedBytes: number | null | undefined, historyOverhangBytes: number | null | undefined): number {
+  return Math.max(0, Number(usedBytes ?? 0) - forgivenBytes(plan, historyOverhangBytes));
+}
+
+/** SQL form of `billableBytes` over an `accounts` row. Kept in lockstep with it AND
+ *  with the accounts_cap_guard trigger (migration 0036), which evaluates the same
+ *  expression — so the advisory checks and the hard fence can never disagree. */
+export const BILLABLE_BYTES_SQL = `MAX(0, used_bytes - CASE WHEN plan IN (${PAID_PLAN_NAMES.map((p) => `'${p}'`).join(",")}) THEN history_overhang_bytes ELSE 0 END)`;
+
+/**
  * Approximate list price per paid plan, in USD cents/month (from docs/pricing.md).
  * Used ONLY for the admin cockpit's D1-derived MRR ESTIMATE (subscription counts ×
  * list price). It is intentionally a rough number — the authoritative figure is the

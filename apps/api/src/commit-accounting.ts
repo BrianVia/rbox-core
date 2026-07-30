@@ -12,6 +12,7 @@ import type { Env } from "./env.js";
 import { verifyReceiptWithExpiry } from "./receipts.js";
 import { isOverCapAbort } from "./auth.js";
 import { resolvePackPlacements, type PackPlacement } from "./blob-pack.js";
+import { BILLABLE_BYTES_SQL } from "./plans.js";
 
 export function isDeleteFenceAbort(e: unknown): boolean {
   return e instanceof Error && e.message.includes("rbox_delete_fence");
@@ -168,13 +169,17 @@ export async function commitAccounting(
 ): Promise<AccountingResult> {
   if (newRefs.length === 0) return { ok: true };
 
-  const acc = await db.prepare("SELECT plan, used_bytes, cap_bytes FROM accounts WHERE id=?").bind(accountId).first<{
+  // §228: admission is unchanged — the charge below still moves the live `used_bytes`
+  // ledger and the accounts_cap_guard trigger is still the authority. Only the number
+  // REPORTED back to the client is billable bytes, so the 402 the user sees matches the
+  // number the dashboard shows them.
+  const acc = await db.prepare(`SELECT plan, ${BILLABLE_BYTES_SQL} AS billable_bytes, cap_bytes FROM accounts WHERE id=?`).bind(accountId).first<{
     plan: string;
-    used_bytes: number;
+    billable_bytes: number;
     cap_bytes: number;
   }>();
   if (acc?.plan === "none") {
-    return { overCap: { used: Number(acc.used_bytes ?? 0), cap: Number(acc.cap_bytes ?? 0), reason: "no_plan" } };
+    return { overCap: { used: Number(acc.billable_bytes ?? 0), cap: Number(acc.cap_bytes ?? 0), reason: "no_plan" } };
   }
 
   // §30: charge+grant in SEQUENTIAL atomic super-batches of ≤MAX_REFS_PER_TXN refs. Each
@@ -297,11 +302,11 @@ export async function commitAccounting(
       // accounts_cap_guard RAISE(ABORT,'over_cap') → THIS super-batch rolled back; earlier
       // ones stayed committed (design 30 §3). Report over-cap; the client gets a 402.
       if (isOverCapAbort(e)) {
-        const acc = await db.prepare("SELECT used_bytes, cap_bytes FROM accounts WHERE id=?").bind(accountId).first<{
-          used_bytes: number;
+        const acc = await db.prepare(`SELECT ${BILLABLE_BYTES_SQL} AS billable_bytes, cap_bytes FROM accounts WHERE id=?`).bind(accountId).first<{
+          billable_bytes: number;
           cap_bytes: number;
         }>();
-        return { overCap: { used: Number(acc?.used_bytes ?? 0), cap: Number(acc?.cap_bytes ?? 0) } };
+        return { overCap: { used: Number(acc?.billable_bytes ?? 0), cap: Number(acc?.cap_bytes ?? 0) } };
       }
       throw e;
     }
