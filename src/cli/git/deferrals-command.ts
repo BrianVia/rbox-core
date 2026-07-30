@@ -57,10 +57,10 @@ function remediationLines(repo: GitDeferralRepoProjection): string[] {
     lines.push("The resolver has no deferred incoming state. Let sync fetch or rebuild it; inspect `rbox status` and daemon logs if this persists.");
   }
   if (shouldOfferResolve(repo)) {
-    lines.push("Your repository is healthy; only rbox's bookkeeping is paused while incoming Git state waits.");
+    lines.push("Your repository is healthy; only rbox's bookkeeping is paused while Git state from your other computer waits.");
     lines.push(repo.canKeepMine
-      ? "Choose `keep-mine` to publish my local work as truth, or `take-theirs` to discard my local changes and follow incoming."
-      : "Nothing is waiting to publish with `keep-mine`; `take-theirs` discards my local changes and follows the available incoming snapshot.");
+      ? "Choose `keep-mine` to keep this computer's version and publish it to your other computers, or `take-theirs` to use the version from your other computer and set aside this computer's Git changes."
+      : "Nothing is waiting to publish with `keep-mine`; `take-theirs` uses the waiting version from your other computer and sets aside this computer's Git changes.");
     lines.push("First inspect the fresh snapshot, then substitute its token in the command that matches your choice:");
   }
   return lines;

@@ -549,7 +549,7 @@ test("full and --git status add one actionable companion while JSON and the shar
   });
 
   const frozen = "git deferred 1h: local commits on branch main (repo)";
-  const guidance = "To publish my work, run `rbox git resolve <repo> keep-mine`; `take-theirs` discards my local changes and follows incoming.";
+  const guidance = "To keep this computer's version and publish it, run `rbox git resolve <repo> keep-mine`; `take-theirs` uses the version from your other computer and sets aside this computer's Git changes.";
   for (const options of [{ verbose: true }, { git: true }]) {
     const human = await captureStatus(options);
     expect(human.split("\n").filter((line) => line.trim() === frozen)).toHaveLength(1);

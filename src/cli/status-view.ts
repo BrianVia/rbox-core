@@ -482,10 +482,10 @@ export function renderGitDeferralCompanion(input: {
   if (!input.canResolve) return `${reassurance} ${presentation.repair}`;
   if (!input.canKeepMine) {
     return `${reassurance} Nothing is waiting to publish with \`keep-mine\`; ` +
-      "`take-theirs` discards my local changes and follows the available incoming snapshot.";
+      "`take-theirs` uses the waiting version from your other computer and sets aside this computer's Git changes.";
   }
-  return `${reassurance} To publish my work, run \`rbox git resolve <repo> keep-mine\`; ` +
-    "`take-theirs` discards my local changes and follows incoming.";
+  return `${reassurance} To keep this computer's version and publish it, run \`rbox git resolve <repo> keep-mine\`; ` +
+    "`take-theirs` uses the version from your other computer and sets aside this computer's Git changes.";
 }
 
 const ageLabel = (ageMs: number | undefined): string => {

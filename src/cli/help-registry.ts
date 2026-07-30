@@ -233,11 +233,12 @@ export const COMMAND_HELP: CommandHelp[] = [
     flags: [
       { flag: "--json", desc: "print a typed JSON result (commit OIDs are omitted)" },
       { flag: "--confirm <token>", desc: "confirm the exact snapshot printed by show-me" },
-      { flag: "--force-discard-incoming", desc: "keep-mine only: acknowledge incoming artifacts cannot be retained" },
+      { flag: "--force-discard-incoming", desc: "keep-mine only: acknowledge your other computer's waiting Git artifacts cannot be retained" },
     ],
     notes: [
       "The default verb is show-me.",
-      "take-theirs quarantines and pins local Git work before following incoming metadata; working files are not rewritten.",
+      "keep-mine keeps this computer's version and publishes it to your other computers.",
+      "take-theirs uses the version published by your other computer; this computer's Git work is set aside in a quarantine first, and working files are not rewritten.",
     ],
   },
   {
