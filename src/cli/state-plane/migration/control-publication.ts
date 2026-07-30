@@ -15,18 +15,25 @@
  * `locks` is a compile-time witness that the complete lock set is held; it has
  * no runtime use and must not grow one.
  */
-import crypto from "node:crypto";
 import { constants } from "node:fs";
 import fs from "node:fs";
 import path from "node:path";
-import { MigrationControlError, type MigrationControlErrorReason } from "../errors.js";
 import type { HeldStatePlaneLocks } from "../locks.js";
 import { migrationPaths } from "../paths.js";
 import {
-  CONTROL_MAX_BYTES, decodeMigrationControl, encodeMigrationControl,
-  type Inode, type MigrationControl,
+  decodeMigrationControl, type Inode, type MigrationControl,
 } from "./control-codec.js";
+import {
+  controlFail as fail, digestBytes as digest, fsyncDirectorySync, readExactFile,
+  removeOwnSibling, renderControlSibling, type PreparedControlIdentity,
+} from "./control-sibling.js";
 import type { MigrationHalt } from "./health.js";
+
+/** The sibling namespace's own type lives with the module that renders it
+ * (163's 400-line law). Re-exported because every existing consumer names this
+ * module as the control's publication surface, and moving a file should not move
+ * an import. */
+export type { PreparedControlIdentity } from "./control-sibling.js";
 
 /** The revision of a migration's first published control. */
 export const FIRST_CONTROL_REVISION = 1;
@@ -38,15 +45,6 @@ export interface PublishExpectation {
   readonly revision: number | "absent";
 }
 
-/** A rendered, fsynced, revision-scoped sibling: exactly the bytes of one
- * control record, identified by inode as well as path. */
-export interface PreparedControlIdentity extends Inode {
-  readonly path: string;
-  readonly revision: number;
-  readonly bytes: number;
-  readonly sha256: string;
-}
-
 /** Discriminated so the nondurable branch carries NO next control: a caller
  * cannot keep publishing after a failed halt (163:3346). */
 export type HaltPublication =
@@ -55,63 +53,46 @@ export type HaltPublication =
 
 export type HaltResourceRole = "reserve" | "emergency";
 
-const digest = (bytes: Uint8Array): string => crypto.createHash("sha256").update(bytes).digest("hex");
-const fail: (reason: MigrationControlErrorReason, detail: string) => never = (reason, detail) => {
-  throw new MigrationControlError(reason, detail);
-};
-
-function fsyncDirectorySync(dir: string): void {
-  const fd = fs.openSync(dir, "r");
-  try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-}
-
-function fsyncFileAndParent(file: string): void {
-  const fd = fs.openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW);
-  try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-  fsyncDirectorySync(path.dirname(file));
-}
-
-/** One no-follow descriptor decides type, identity, and bytes: a second pathname
- * lookup could be answered by a symlink swapped in after the first. */
-function readExactFile(file: string): { bytes: Buffer; dev: number; ino: number } | undefined {
-  let fd: number;
+/**
+ * Which revision-scoped sibling paths a LIVE canonical record still owns as
+ * artifacts, and which the sibling renderer's strand repair must therefore refuse
+ * rather than rewrite (`control-sibling.ts`, wave 1A's wedge).
+ *
+ * Only the canonical record can answer this, which is why it is computed here and
+ * passed down. Wave 3C's negative control is the reason it exists: the M6 runway
+ * legitimately owns prepared siblings at `b+5`/`b+6` while the control sits at
+ * `b+4`, and overwriting one leaves the final item unremovable. M7's terminal
+ * sibling is the same case one phase later.
+ */
+function ownedRevisionPaths(root: string): readonly string[] {
+  let canonical: MigrationControl | undefined;
   try {
-    // O_NONBLOCK: `readCanonicalControl` is on the write fence's hot path, under
-    // the held state lock, and opening a FIFO without it blocks forever waiting
-    // for a writer. The `isFile` check below is what then refuses it.
-    fd = fs.openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    // Only ENOENT is absence. ENOTDIR means a path component is not a directory
-    // — `.rbox/state` replaced by a regular file — which is manual damage, and
-    // reading it as "no control" would restart a migration over a live one.
-    if (code === "ENOENT") return undefined;
-    return fail("foreign", `${file} could not be opened as a regular file (${code})`);
-  }
-  try {
-    const stat = fs.fstatSync(fd);
-    if (!stat.isFile()) return fail("foreign", `${file} is not a regular file`);
-    if (stat.size > CONTROL_MAX_BYTES) return fail("foreign", `${file} is ${stat.size} bytes, over the ${CONTROL_MAX_BYTES} cap`);
-    const bytes = Buffer.alloc(stat.size);
-    if (fs.readSync(fd, bytes, 0, bytes.byteLength, 0) !== bytes.byteLength) return fail("foreign", `${file} was truncated while reading`);
-    return { bytes, dev: Number(stat.dev), ino: Number(stat.ino) };
-  } finally {
-    fs.closeSync(fd);
-  }
-}
-
-/** Remove a sibling this process created, and only if the path still holds the
- * exact inode it recorded. Cleanup on a caught failure only: a crash leaves the
- * inert revision temp 163's `absent` crash row already admits. */
-function removeOwnSibling(sibling: { path: string } & Inode): void {
-  try {
-    const observed = fs.lstatSync(sibling.path);
-    if (!observed.isFile() || Number(observed.dev) !== sibling.dev || Number(observed.ino) !== sibling.ino) return;
-    fs.unlinkSync(sibling.path);
-    fsyncDirectorySync(path.dirname(sibling.path));
+    canonical = readCanonicalControl(root);
   } catch {
-    // Best effort: the sibling is inert either way.
+    // An unreadable canonical control cannot license a rewrite. Fail closed by
+    // claiming every path in the namespace is owned.
+    return [migrationPaths.control(root)];
   }
+  const witness = canonical?.witness;
+  if (!witness) return [];
+  if (witness.phase === "M7") return [witness.terminalSibling.path];
+  if (witness.phase !== "M6" || !witness.futureControls) return [];
+  const ledger = witness.futureControls;
+  return ledger.stage === "preparing"
+    ? [ledger.halt.path, ledger.success.path]
+    : [ledger.origin.path, ledger.preparedSuccess.path];
+}
+
+/**
+ * Render this migration's revision-scoped sibling, telling the renderer which
+ * paths a live record still owns. Kept as this module's exported name so no
+ * consumer moves an import, and so the ownership question is never answered by a
+ * module that cannot read the canonical record.
+ */
+export function renderPreparedControl(
+  root: string, revision: number, next: MigrationControl, locks: HeldStatePlaneLocks,
+): PreparedControlIdentity {
+  return renderControlSibling(root, revision, next, locks, ownedRevisionPaths(root));
 }
 
 /** The canonical control plus the inode it currently occupies. The M6 runway's
@@ -183,61 +164,6 @@ function replaceCanonicalControl(
   const published = readExactFile(file);
   if (!published || !published.bytes.equals(bytes)) fail("reread", `${file} is not the record just published`);
   return next;
-}
-
-/**
- * Render one exclusive revision-scoped sibling: create, write, fsync the file,
- * fsync `.rbox/state`, then reread it exactly. Used both for an ordinary
- * publication's own temp and for the M6 runway's prepared future controls —
- * they are the same namespace.
- *
- * A crash between rendering and renaming leaves the exact inert temp for this
- * record at this revision, and every phase after M0 pins both the migration id
- * and the revision, so refusing to resume it would wedge the migration forever.
- * The occupied path is therefore adopted — but only when every byte is this
- * exact record, and never for anything else.
- */
-export function renderPreparedControl(
-  root: string, revision: number, next: MigrationControl, locks: HeldStatePlaneLocks,
-): PreparedControlIdentity {
-  void locks;
-  if (next.controlRevision !== revision) fail("schema", `record revision ${next.controlRevision} may not be rendered at ${revision}`);
-  const bytes = encodeMigrationControl(next);
-  const file = migrationPaths.controlRevision(root, next.migrationId, revision);
-  const identity = (found: { dev: number; ino: number }): PreparedControlIdentity =>
-    ({ path: file, revision, dev: found.dev, ino: found.ino, bytes: bytes.byteLength, sha256: digest(bytes) });
-
-  let fd: number;
-  try {
-    fd = fs.openSync(file, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code !== "EEXIST") return fail("foreign", `${file} could not be created exclusively (${code})`);
-    const existing = readExactFile(file);
-    if (!existing || !existing.bytes.equals(bytes)) {
-      return fail("foreign", `${file} is occupied by something other than this exact record`);
-    }
-    fsyncFileAndParent(file);
-    return identity(existing);
-  }
-
-  const created = fs.fstatSync(fd);
-  const own = { path: file, dev: Number(created.dev), ino: Number(created.ino) };
-  try {
-    try {
-      fs.writeSync(fd, bytes, 0, bytes.byteLength, 0);
-      fs.fsyncSync(fd);
-    } finally {
-      fs.closeSync(fd);
-    }
-    fsyncDirectorySync(path.dirname(file));
-    const exact = readExactFile(file);
-    if (!exact || !exact.bytes.equals(bytes)) return fail("reread", `${file} is not the record just rendered`);
-    return identity(exact);
-  } catch (error) {
-    removeOwnSibling(own);
-    throw error;
-  }
 }
 
 export function publishMigrationControl(

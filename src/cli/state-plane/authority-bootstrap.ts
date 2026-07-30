@@ -18,21 +18,27 @@ import type { GenesisIds, GenesisInspection, GenesisOutcome } from "./genesis.js
 // Not from `genesis.js`: the fence's reachable graph must contain no SQLite.
 import { readGenesisIntent } from "./genesis-intent.js";
 import type { EntryProof } from "./locks.js";
+import type { MigrationOutcome } from "./migration/authority.js";
 import { blocksSqliteWrites } from "./migration/control-codec.js";
 import { readCanonicalControl } from "./migration/control-publication.js";
 import { statePath } from "./paths.js";
 
-/** M-9's `runMigration`, with its progress sink already bound by the entry site.
- * Injected rather than imported: 222 §8 lands `migration/authority.ts` in wave
- * 5A, and the coordinator's dispatch and fence are wave 2C's dependency now.
+/** M-9's `runMigration`, with its progress sink already bound by the entry site
+ * (lane 2D's amendment 2: genesis has no progress surface, so a sink on this
+ * module's signature would be a parameter only one branch reads).
  *
- * 5A: drop the generic. Import `runMigration` and pin `M = MigrationOutcome`. */
-export type MigrationDriver<M> = (root: string, entry: EntryProof) => Promise<M>;
+ * Wave 5A collapsed 2D's `MigrationDriver<M>`/`AuthorityOutcome<M>` generics onto
+ * the real `MigrationOutcome`, which `migration/authority.ts` now declares. It
+ * stays an INJECTED function rather than a direct call: binding the sink is the
+ * entry site's job, and injection is what lets the coordinator's own tests drive
+ * the dispatch and the C8 re-inspect without standing up a whole migration. The
+ * duplicate-declaration gate confirms `MigrationOutcome` is declared exactly
+ * once, in the module that owns the protocol. */
+export type MigrationDriver = (root: string, entry: EntryProof) => Promise<MigrationOutcome>;
 
-/** 5A: drop the generic (see `MigrationDriver`). */
-export type AuthorityOutcome<M> =
+export type AuthorityOutcome =
   | { readonly domain: "genesis"; readonly outcome: GenesisOutcome }
-  | { readonly domain: "migration"; readonly outcome: M };
+  | { readonly domain: "migration"; readonly outcome: MigrationOutcome };
 
 /**
  * The one thing both entry points call, under an already-held lock bundle
@@ -45,9 +51,9 @@ export type AuthorityOutcome<M> =
  * §6.1's "run `rbox migrate`" true. A second genesis claim is impossible once
  * the intent is gone, so it is corruption rather than a third pass.
  */
-export async function establishStateAuthority<M>(
-  root: string, entry: EntryProof, runMigration: MigrationDriver<M>,
-): Promise<AuthorityOutcome<M>> {
+export async function establishStateAuthority(
+  root: string, entry: EntryProof, runMigration: MigrationDriver,
+): Promise<AuthorityOutcome> {
   const first = await dispatch(root, entry, runMigration);
   if (!isLegacyPresent(first)) return first;
 
@@ -89,9 +95,9 @@ export function assertAuthorityWritable(root: string): void {
   if (intent) refuse(root, `genesis attempt ${intent.authorityId} has not been retired`);
 }
 
-async function dispatch<M>(
-  root: string, entry: EntryProof, runMigration: MigrationDriver<M>,
-): Promise<AuthorityOutcome<M>> {
+async function dispatch(
+  root: string, entry: EntryProof, runMigration: MigrationDriver,
+): Promise<AuthorityOutcome> {
   if (claimsGenesis(root, await genesis.inspect(root, entry.locks))) {
     return { domain: "genesis", outcome: await genesis.establish(root, mintIds, entry.locks) };
   }
@@ -117,7 +123,7 @@ function hex32(): string {
   return randomBytes(16).toString("hex");
 }
 
-function isLegacyPresent<M>(outcome: AuthorityOutcome<M>): boolean {
+function isLegacyPresent(outcome: AuthorityOutcome): boolean {
   return outcome.domain === "genesis"
     && outcome.outcome.kind === "refused"
     && outcome.outcome.reason === "legacy-present";

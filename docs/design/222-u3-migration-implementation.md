@@ -702,6 +702,115 @@ export async function abortMigration(root, locks): Promise<MigrationOutcome>;
 Structural test: no `node:fs`, `node:crypto`, or `bun:sqlite` in this module's
 import graph.
 
+**Shipped as four files (5A), and six amendments.** M-9's budget was 240; the
+honest driver measured 465 nonblank against 163:3994's hard 400, and two of the
+phases it must sequence did not exist. What shipped:
+
+| File | Nonblank | Owns |
+|---|---:|---|
+| `authority.ts` | 342 | `runMigration`, `ROW_DISPATCH`, and every publication a phase body does not make itself |
+| `halt-recovery.ts` | 158 | the four retry buckets and the pre-`Q` abort — the only code that clears a halt |
+| `begin.ts` | 255 | **M0 and M1**, which no wave built |
+| `control-sibling.ts` | 235 | split out of M-2 to carry the strand repair (below) |
+
+`authority.ts` sits in the 301–399 band; the review note is the one M-3/M-5/M-6/M-8
+already carry — the M0→M7 sequence is one correlated machine 163 specifies as a
+unit. The dependency runs strictly one way in both splits: recovery imports the
+driver, and the publisher imports the sibling primitives.
+
+1. **M0 and M1 had no owner.** §8's wave table gives 3A "M-5 (M2 / M3 / M4)" and
+   2B "admission, which publishes nothing", so nothing minted a migration id,
+   published a first control, claimed the reserve, or created the emergency
+   candidate: `publishMigrationControl` at `FIRST_CONTROL_REVISION` and
+   `migrationPaths.emergency` had **no production caller at all**. 5A builds both
+   as `begin.ts`, because a driver with no M0 is not a driver. The emergency
+   candidate's size is unstated in 163 and is derived rather than picked:
+   `CONTROL_MAX_BYTES`, zero-filled, which is exactly the one record it exists to
+   let a halt publish.
+
+2. **§M-9's "no `node:fs`/`node:crypto`/`bun:sqlite` in this module's import
+   graph" is unimplementable read transitively** — the driver's whole job is
+   sequencing bodies that open databases and rename files. It is implemented as
+   §7.9 states it: `authority.ts` (and `halt-recovery.ts`) import none of the
+   three *themselves*, which is what actually protects the property. Same class of
+   finding as 163 v13's M4.
+
+3. **`{kind: "retired"}` carries the durable reason, not a `C1Trigger`.** A
+   retirement resumed from a record has no trigger; the record keeps the one
+   durable `reason` plus `fromPhase`, and synthesizing a disposition from
+   `triggeringSource` would invent the fact §M-7 deliberately does not store.
+
+4. **`retryHaltedMigration`/`abortMigration` take an `EntryProof`, not bare
+   `locks`.** Both delegate to `runMigration` when the row is drivable again, and
+   admission's exclusivity condition reads the entry point.
+
+5. **2D's generics collapsed** onto the real `MigrationOutcome`.
+   `MigrationDriver` stays an *injected* function rather than a direct call:
+   binding the progress sink is the entry site's job, and injection is what lets
+   the coordinator's own tests drive the C8 re-inspect without a whole migration.
+   The stub in `authority-bootstrap.test.ts` returned a bare string, invisible to
+   both gates (`tsconfig` excludes tests, Bun erases annotations) — now typed.
+
+6. **§M-6's halt-clearing constraint needs neither escape.** Bucket 1 recreates
+   whatever the halt spent and republishes both dispositions `available` in the
+   *same* publication that clears, so a cleared M5 halt cannot reach the flip with
+   an empty cleanup vector. `emergency` stays in `haltRunway` and no
+   complete-prefix empty cursor reaches M7.
+
+**The halt-record wedge — closed, and by a third path.** 1A's pin assigned the
+render→rename wedge to the wave that first wires a post-M0 publication of a
+non-deterministic record; 3A closed M2/M3 by determinism and left halts here.
+Halts cannot be made deterministic — §6.3 requires them to print what was
+*measured*, and `memory-admission`/`disk-preflight` measure live RSS and `statfs`
+— and quarantine-later is not sufficient, because the wedge is worse than
+"un-haltable": a strand at `r+1` blocks the **successful** publication at `r+1`
+too, so a workspace that halts on low disk and then has disk freed can never
+migrate. `control-sibling.ts` therefore repairs its own strand, bounded by the
+*actual* ownership predicate rather than a phase proxy: the canonical record is
+asked which revision-scoped paths it still owns (the M6 runway's two prepared
+slots, M7's terminal sibling — 3C's negative control), those are refused, and at
+every other path in this migration's own id-and-revision-scoped namespace exactly
+two occupant shapes are admitted — a complete record for this exact id and
+revision, or a nonempty strict byte prefix of the record about to be written,
+which is the only image `writeSync` can tear. The repair is in place on the
+recorded inode, the precedent genesis case 3 and 3A's M2 rebuild both set. A
+crafted occupant is refused exactly as before.
+
+**`claimSibling`/`claimSlot`: NOT consolidated.** 4A recorded the mechanism as
+identical line-by-line with the refusal channel as the only difference. The
+mechanism is identical — `O_CREAT|O_EXCL` → EEXIST → no-follow reopen → validate
+the sole create-ahead shape → fsync — but the difference is **two** axes, not one:
+`claimSibling` converts a non-`EEXIST` open failure into a typed `reserved-path`
+halt because it runs where every refusal must carry a halt code, while `claimSlot`
+rethrows so `stepFutureControlPreparation`'s out-of-space catch can see it. A
+shared body parameterized over both the refusal channel and the propagation
+policy for non-`EEXIST` errors is a worse abstraction than two honest copies of
+twenty lines of `openSync` boilerplate, and both copies are separately
+mutation-pinned by their own lanes. The 5A consolidation note is withdrawn rather
+than deferred.
+
+**§7.9's prose-only items, now executable** in `migration/authority.test.ts`: the
+stale-witness routing gate (below), the CODEMAP one-line-per-module rule — which
+no wave-1-to-4 lane could satisfy because nothing enforced it — and the pinned
+count of `establishStateAuthority` entry call sites. That count is pinned at what
+exists (zero) rather than asserted at two: §6.3 already states both commands land
+with §3.2 and 5B, and the gate's purpose is identical either way — an unenumerated
+third caller fails it. `EXPECTED_SITES` is the one line 5B edits. The
+`HeldStatePlaneLocks` cast gate was already made executable by 2B and is pinned
+from the inventory's home so its deletion is visible.
+
+**The stale-witness containment, now asserted.** §M-6 recorded it as "no consumer
+reaches this from that row", with no row dispatcher in existence. The driver is
+that dispatcher, so `ROW_DISPATCH` is *data* and three gates cross it against what
+each body reads: no body dispatched from a row where `Q` is live calls
+`bracketSource`; the one unguarded reader of the stale M4 `staging` proof
+(`publishPreparedDatabase`) appears under exactly one row, and it is `m4-resume`;
+and `m5-resume`/`m5-artifact-ahead-q` stay disjoint on everything but
+`flipAuthority`. For the flip the containment is a *branch* rather than a row —
+it does read both flip-stale members — so its own gate asserts source order: the
+resume branch's return precedes every stale read, and the resume branch itself
+reads only `active`, the member §M-6 marks never stale.
+
 ---
 
 ### 1.2 The two adapters
