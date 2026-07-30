@@ -2,11 +2,15 @@
  * The control's revision-scoped sibling namespace, and the bounded descriptor
  * primitives every durable control transition is built from.
  *
- * `migration-v1.json.<migrationId>.<revision>.tmp` is ONE namespace with two
- * users: an ordinary publication's own render temp, and the M6 runway's prepared
- * future controls (163's "migration-id-bound canonical-publisher siblings"). This
- * module owns what may occupy a path in it and how one is brought into existence;
+ * `migrationPaths.controlRevision` is ONE namespace with two users: an ordinary
+ * publication's own render temp, and the M6 runway's prepared future controls
+ * (163's "migration-id-bound canonical-publisher siblings"). This module owns what
+ * may occupy a path in it and how one is brought into existence;
  * `control-publication.ts` owns the canonical file and every rename onto it.
+ *
+ * The name is deliberately not spelled out here, not even in prose:
+ * `control.test.ts`'s sole-writer gate strips nothing, and `paths.ts` is the one
+ * module that spells a durable filename.
  *
  * The split is the 400-line law's (163:3994), and the seam is real in both
  * directions: nothing here names the canonical control, so §7.9's sole-writer gate
