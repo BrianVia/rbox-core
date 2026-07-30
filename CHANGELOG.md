@@ -6,6 +6,32 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.11.2] - 2026-07-30
+
+### Fixed
+- **A brand-new git repository no longer drags its dependencies into sync.**
+  If you ran `git init` in a folder and had not committed anything yet, rbox
+  could not read that repository's index, assumed every file in it might be
+  tracked, and synced the whole folder — `node_modules`, `venv`,
+  `__pycache__`, even `.env` files that rbox normally never uploads. Your
+  ignore rules were correct; rbox was overriding them. It now recognises a
+  repository with no commits as having nothing tracked, and your ignore rules
+  apply normally.
+- **A paused repository no longer wastes upload bandwidth.** When rbox pauses
+  a repository's git bookkeeping (`rbox status --git` shows these), it was
+  still packaging up that repository's history and uploading it on every sync
+  cycle, then discarding it moments later — and the sync log said `captured 0`,
+  so nothing showed it was happening. On one machine that was roughly three
+  uploads every four seconds for two days. rbox now uploads only after it has
+  decided the work will actually be published.
+- **A symlinked build folder is ignored like a real one.** A symlink named
+  `node_modules`, `dist`, `cdk.out`, `target` or similar was synced even
+  though a real folder of that name would have been skipped.
+- **`rbox status` now tells you how much you are storing that your own ignore
+  rules exclude**, with the command to clean it up. Adding an ignore rule has
+  always been forward-only — it stops future syncing but keeps what was
+  already uploaded — and until now there was no way to see how much that was.
+
 ## [1.11.1] - 2026-07-28
 
 ### Fixed
