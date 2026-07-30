@@ -2128,6 +2128,61 @@ specifically — perturbing between driver iterations proves nothing about
 
 ---
 
+### 7.13 Open items settled by 5C
+
+**The flip/backup asymmetry — ANSWERED, standing. Do not "fix".** The resume
+branch's omission of `revalidateBackups` is correct and permanent, not a
+deferred repair. The two legacy-JSON backups have no consumer past the flip:
+their only production readers are M2 (the writer), the pre-rename check
+(`authority-flip.ts:302`), and the `verification` halt copy that names the path
+(`state-plane-report.ts:133`). Post-`Q` abort is refused (`ABORT_AFTER_FLIP` in
+`halt-recovery.ts`) and §5.2's M6 row forbids renaming back, so no rollback can
+ever read them. They are also undeletable by rbox — `retirement.ts`'s
+`derivedPath` has no backup role, per §5.4's ownership rule. Revalidating on
+resume could therefore only convert an out-of-band deletion into an
+**unclearable** `verification` halt on a workspace that is already
+`blocksSqliteWrites = TRUE` and whose source document no longer exists: strictly
+worse than not noticing. The residual is observability only, and its surface is
+doctor, never the flip.
+
+**Anchor correction.** The open item called the pinning test "5A's G2 gate".
+`G2` is the *genesis* crash-matrix row (§7.1); the test that actually pins this
+is `migration/authority.test.ts`'s **"the flip's resume branch reads no
+stale-source member"**, which lists `revalidateBackups` as a forbidden token
+inside the resume window and separately asserts it DOES appear after the resume
+return, so the gate is non-vacuous in both directions. It **must not be
+deleted**.
+
+**The M0 strand — ACCEPTED and documented; removal is doctor's, not U3's.** A
+SIGKILL between M0's control render and its rename leaves one inert
+revision-scoped sibling at `migration-v1.json.<dead-id>.1.tmp` — a canonical M0
+record, ~630 bytes (one filesystem block), not the 64 KiB emergency candidate,
+which is an M1 artifact and is adopted or repaired in place on resume rather
+than leaked. Re-entry mints a fresh id and `renderControlSibling`'s adoption is
+scoped to the live id, so the strand is never adopted, never read, and
+coordinates nothing. It is unbounded only in the sense that each crashed M0 adds
+one: the window is a few syscalls, every *caught* failure already calls
+`removeOwnSibling`, and M0 is reachable only from the two operator-driven
+`establishStateAuthority` entry sites, so ~250 kills inside that window are
+needed to reach 1 MiB. **No U3 code may delete it** — §5.4's ownership rule
+excludes it (no durable record names it) and §7.1's G6 precedent is
+report-don't-delete. 163:657 and 163:2909 designate doctor's inert-temp
+quarantine as the sole remover. The gap worth closing before that lands is
+**observation**: `checkStateMigration` reads only the canonical control and the
+genesis intent, so nothing today can see a dead-id strand at all.
+
+**FINDING — the CODEMAP gate does not exist.** §M-9 states the
+one-line-per-module rule is "now executable in `migration/authority.test.ts`".
+It is not: no test in the repository mentions CODEMAP (`grep -rin codemap src/
+scripts/ --include='*.ts'` is empty). The content half did land — the state-plane
+block of `docs/CODEMAP.md` is populated — but nothing prevents the next module
+from regressing. When the gate is built it must match at LINE START on the
+module path and assert no path appears twice; a substring check on the directory
+prefix is vacuous, since it passes for every module in a directory that
+documents exactly one.
+
+---
+
 ---
 
 ## 8. Sequencing and dispatch
