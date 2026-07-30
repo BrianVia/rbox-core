@@ -16,8 +16,9 @@ import type { CasRetryRepo, CasRetryView, CursorPage, LineageSnapshot } from "..
 import { PAGE_BYTES, boundedStream } from "./sealed-stages.js";
 import {
   PrivateStageDirectory, StageLock, abandonBuilder, configureStageBuilder, deleteSealedArtifact,
-  openSealedArtifact, sealAndPublish, sealedStagePath, streamRows,
+  openSealedArtifact, sealAndPublish, sealedStagePath,
 } from "./stage-artifacts.js";
+import { runStatement, selectRow, streamRows, withStatement } from "./statements.js";
 import { CAS_TRANSITION_TEMP } from "./cas-steps.js";
 
 const MAX_RETRY_BATCH = 16;
@@ -73,32 +74,34 @@ export function buildCasRetryView(
     db = new Database(privateDirectory.file(), { create: true, readwrite: true });
     configureStageBuilder(db);
     db.exec(RETRY_DDL);
-    db.query("INSERT INTO retry_meta(retry_id,state,token_cjson) VALUES (?,'building',?)")
-      .run(retryId, canonicalJson(token));
+    runStatement(db, "INSERT INTO retry_meta(retry_id,state,token_cjson) VALUES (?,'building',?)",
+      retryId, canonicalJson(token));
     const digest = domainHash("cas-retry-view-v1");
     digest.token(canonicalJson(token));
-    const lookup = authority.query(CURRENT_RECORD_SELECT);
-    const insert = db.query(`INSERT INTO retry_rows(retry_id,rel_path,path_order,expected_repo_gen,record_row_cjson,retained_estimate)
-      VALUES (?,?,?,?,?,?)`);
-    db.exec("BEGIN");
     let rowCount = 0;
-    streamRows<{ rel_path: string; path_order: Uint8Array; expected_repo_gen: number }>(
-      authority, `SELECT rel_path,path_order,expected_repo_gen FROM ${CAS_TRANSITION_TEMP} ORDER BY path_order`,
-      [], (row) => {
-        const current = lookup.get(token.lineageId, row.rel_path) as RepoRecordRow | null;
-        const frozen = current === null ? null : JSON.stringify(current);
-        digest.token(row.rel_path);
-        digest.token(String(row.expected_repo_gen));
-        digest.token(frozen ?? "");
-        insert.run(
-          retryId, row.rel_path, Buffer.from(row.path_order), row.expected_repo_gen,
-          frozen, current?.retained_estimate ?? 4096,
-        );
-        rowCount++;
+    withStatement(authority, CURRENT_RECORD_SELECT, (lookup) => {
+      withStatement(db!, `INSERT INTO retry_rows(retry_id,rel_path,path_order,expected_repo_gen,record_row_cjson,retained_estimate)
+        VALUES (?,?,?,?,?,?)`, (insert) => {
+        db!.exec("BEGIN");
+        streamRows<{ rel_path: string; path_order: Uint8Array; expected_repo_gen: number }>(
+          authority, `SELECT rel_path,path_order,expected_repo_gen FROM ${CAS_TRANSITION_TEMP} ORDER BY path_order`,
+          [], (row) => {
+            const current = lookup.get(token.lineageId, row.rel_path) as RepoRecordRow | null;
+            const frozen = current === null ? null : JSON.stringify(current);
+            digest.token(row.rel_path);
+            digest.token(String(row.expected_repo_gen));
+            digest.token(frozen ?? "");
+            insert.run(
+              retryId, row.rel_path, Buffer.from(row.path_order), row.expected_repo_gen,
+              frozen, current?.retained_estimate ?? 4096,
+            );
+            rowCount++;
+          });
       });
+    });
     const logicalDigest = digest.digest();
-    db.query("UPDATE retry_meta SET state='sealed',digest=?,row_count=? WHERE retry_id=?")
-      .run(logicalDigest, rowCount, retryId);
+    runStatement(db, "UPDATE retry_meta SET state='sealed',digest=?,row_count=? WHERE retry_id=?",
+      logicalDigest, rowCount, retryId);
     db.exec("COMMIT");
     const physical = sealAndPublish(
       db, privateDirectory.file(), sealedStagePath(directory, retryId, logicalDigest), retryId,
@@ -120,9 +123,8 @@ function openSealedRetryView(
 ): CasRetryView {
   const accessor = openSealedArtifact(directory, ref, lock);
   try {
-    const meta = accessor.db.query("SELECT retry_id,state,token_cjson,digest FROM retry_meta").get() as {
-      retry_id: string; state: string; token_cjson: string; digest: string;
-    } | null;
+    const meta = selectRow<{ retry_id: string; state: string; token_cjson: string; digest: string }>(
+      accessor.db, "SELECT retry_id,state,token_cjson,digest FROM retry_meta");
     if (!meta || meta.retry_id !== ref.stageId || meta.state !== "sealed"
       || meta.digest !== ref.logicalDigest || meta.token_cjson !== canonicalJson(token)) {
       throw new StageChangedError(ref.stageId, "sealed retry view does not match its ref");

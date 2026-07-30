@@ -6,6 +6,7 @@ import {
 } from "../../reset-quarantine.js";
 import crypto from "node:crypto";
 import { createStateStore, openStateStore, stateStoreDatabase } from "../store/open.js";
+import { runStatement } from "../store/statements.js";
 import { sqliteResetFacade } from "./index.js";
 import { sqliteResetPaths } from "./artifacts.js";
 import { stableDbHash } from "./artifacts.js";
@@ -90,7 +91,7 @@ if (command === "w1-prepare") {
     createdBy: "crash-rig",
   }).close();
   const writer = openStateStore(sqliteResetPaths.active(root));
-  stateStoreDatabase(writer).query("UPDATE state_lineage SET state_revision=2").run();
+  runStatement(stateStoreDatabase(writer), "UPDATE state_lineage SET state_revision=2");
   process.kill(process.pid, "SIGKILL");
 }
 

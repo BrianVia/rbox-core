@@ -8,6 +8,7 @@ import {
   openStateStore,
   openStateStoreForWalTakeover,
   ownedStateStoreWriterForReset,
+  selectRow,
   stateStoreDatabase,
 } from "../store-facade.js";
 import { readAuthorityMarkerId } from "../authority-marker.js";
@@ -47,14 +48,14 @@ export async function quiesceActiveDbForReset(root: string): Promise<SqliteReset
   let lineage: (SqliteResetLineage & { authorityId: string }) | undefined;
   try {
     const db = stateStoreDatabase(store);
-    const row = db.query(`SELECT
+    const row = selectRow<{
+      authorityId: string; stream: string; stateNonce: string | null;
+      stateRevision: number | null; telemetryBindingId: string | null;
+    }>(db, `SELECT
       m.authority_id AS authorityId,l.stream,l.state_nonce AS stateNonce,
       l.state_revision AS stateRevision,l.telemetry_binding_id AS telemetryBindingId
       FROM store_meta m JOIN state_lineage l ON l.lineage_id=m.active_lineage_id
-      WHERE m.singleton=1`).get() as {
-        authorityId: string; stream: string; stateNonce: string | null;
-        stateRevision: number | null; telemetryBindingId: string | null;
-      } | null;
+      WHERE m.singleton=1`);
     if (!row || !row.stateNonce || row.stateRevision === null) throw new Error("SQLite reset active lineage is incomplete");
     lineage = {
       authorityId: row.authorityId,
@@ -92,14 +93,14 @@ export async function recoverOrdinaryWalCrash(
   let observed: SqliteResetLineage & { authorityId: string };
   try {
     const db = stateStoreDatabase(store);
-    const row = db.query(`SELECT
+    const row = selectRow<{
+      authorityId: string; stream: string; stateNonce: string | null;
+      stateRevision: number | null; telemetryBindingId: string | null;
+    }>(db, `SELECT
       m.authority_id AS authorityId,l.stream,l.state_nonce AS stateNonce,
       l.state_revision AS stateRevision,l.telemetry_binding_id AS telemetryBindingId
       FROM store_meta m JOIN state_lineage l ON l.lineage_id=m.active_lineage_id
-      WHERE m.singleton=1`).get() as {
-        authorityId: string; stream: string; stateNonce: string | null;
-        stateRevision: number | null; telemetryBindingId: string | null;
-      } | null;
+      WHERE m.singleton=1`);
     if (!row || !row.stateNonce || row.stateRevision === null) throw new Error("W1 active lineage is incomplete");
     observed = {
       authorityId: row.authorityId,

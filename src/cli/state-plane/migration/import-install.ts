@@ -20,6 +20,7 @@ import type { NormalizedLegacyState } from "../digest/legacy-state-plan.js";
 import {
   STATE_STORE_APPLICATION_ID, STATE_STORE_DDL_FINGERPRINT, STATE_STORE_SCHEMA_VERSION,
 } from "../schema/application.js";
+import { withStatement } from "../store/statements.js";
 import type { CompletionTuple } from "./control-codec.js";
 
 /** What the import records about where it came from. `completedAt` is derived
@@ -39,23 +40,10 @@ export interface ImportProvenance {
 const REPO_VALUE_COLUMNS = Object.values(REPO_RECORD_COLUMN_BY_FIELD)
   .filter((column) => column !== "repo_gen" && column !== "source_seq");
 
-/**
- * Prepare, use, finalize — never `db.query`.
- *
- * `db.query` caches its statement on the connection and the cached statement
- * outlives the call. A connection that still holds one cannot let SQLite remove
- * `-wal`/`-shm` when it closes, so the database never reaches `S0` and M4's
- * at-rest proof fails on exactly the workspaces with the most rows. Empirically
- * confirmed against the fixture: the leak appeared only once the manifest-meta
- * and Git-section inserts existed to be cached.
- */
+/** The vertical's one prepare/use/finalize helper, narrowed to this module's
+ * insert loops. See `store/statements.ts` for why `db.query` is never used. */
 function statement<T>(db: Database, sql: string, use: (run: (...args: unknown[]) => void) => T): T {
-  const prepared = db.prepare(sql);
-  try {
-    return use((...args) => { prepared.run(...args as never[]); });
-  } finally {
-    prepared.finalize();
-  }
+  return withStatement(db, sql, (prepared) => use((...args) => { prepared.run(...args as never[]); }));
 }
 
 function installEntries(db: Database, plan: NormalizedLegacyState): void {

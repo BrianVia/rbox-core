@@ -16,6 +16,7 @@ export {
   type StorePragmas,
 } from "./store/open.js";
 export { openReadSnapshot } from "./store/read-snapshot.js";
+export { runStatement, selectRow, selectRows, streamRows, withStatement } from "./store/statements.js";
 export { stateSemanticDigest } from "./digest/state-semantic-v1.js";
 export {
   loadRawStateFromStore,
