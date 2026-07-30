@@ -89,11 +89,30 @@ test("a held state lock refuses the bundle rather than proceeding without it", a
   }
 });
 
-test("a post-Q workspace refuses the bundle rather than fencing an inventory it cannot see", async () => {
+/**
+ * Wave 5B replaces this test's former assertion.
+ *
+ * It used to pin the debt: post-`Q` the inventory read raised
+ * `StateFormatTooNewError`, so NO lock bundle was obtainable on a workspace rbox
+ * had just migrated — which left `rbox migrate` unable to report success on its
+ * own work and the two post-`Q` halts unreachable by the retry that exists for
+ * them. The inventory now goes through the selecting whole-state seam, so being
+ * migrated is not itself a refusal.
+ *
+ * A marker with NO database behind it is a different thing entirely, and it is
+ * what this fixture actually constructs: 163's contradictory-authority row, whose
+ * verdict is a hard corruption error with zero repair. The assertion is that the
+ * failure is THAT one and not "your rbox is too old" — a healthy current binary
+ * must never be told to upgrade itself.
+ */
+test("a post-Q workspace with no database behind its marker is corruption, not a too-new format", async () => {
   const root = await workspace("rbox-locks-post-q-");
   await fs.writeFile(statePath(root), `${AUTHORITY_MARKER_MAGIC}\n${"a".repeat(32)}\n`);
   expect(await classifyStateFormat(statePath(root))).toBe("authority-marker");
-  await expect(withStatePlaneLocks(root, async () => "never")).rejects.toThrow(/newer version of rbox/);
+  const raised = await withStatePlaneLocks(root, async () => "never").catch((error: unknown) => error);
+  expect(raised).toBeInstanceOf(Error);
+  expect((raised as Error).name).toBe("StateAuthorityCorruptError");
+  expect((raised as Error).message).not.toMatch(/newer version of rbox/);
 });
 
 test("a state.json the parse budget refuses is a typed refusal, not an escaping RangeError", async () => {

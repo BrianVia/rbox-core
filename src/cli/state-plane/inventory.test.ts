@@ -55,7 +55,11 @@ const ENTRY_POINTS: readonly EntryPoint[] = [
   // Reads — refuse a state plane written by a newer rbox instead of guessing.
   { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "loadRawLegacyJsonState", kind: "read", sites: 2, guards: ["assertStateReadable"] },
   { file: "src/cli/state-plane/adapters/legacy-json-store.ts", symbol: "loadLegacyJsonState", kind: "read", sites: 1, guards: ["loadRawLegacyJsonState"] },
-  { file: "src/cli/doctor-state-plane.ts", symbol: "checkState", kind: "read", sites: 1, guards: ["loadRawLegacyJsonState"] },
+  // 163 §C4, wave 5B: doctor is authority-aware. It classifies the document
+  // FIRST and then reads through the selecting seam, so a healthy migrated
+  // workspace is reported as healthy instead of being told to upgrade a binary
+  // that is already current.
+  { file: "src/cli/doctor-state-plane.ts", symbol: "checkState", kind: "read", sites: 2, guards: ["classifyStateFormat", "loadRawState"] },
 
   // The whole-state compatibility adapter (design 222 §1.2 A-2): one selection
   // from the document's bytes, and every backend-specific read or write behind
@@ -63,7 +67,11 @@ const ENTRY_POINTS: readonly EntryPoint[] = [
   { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "selectSqliteAuthority", kind: "read", sites: 2, guards: ["classifyStateFormat", "readAuthorityMarkerId"] },
   { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "loadRawState", kind: "read", sites: 0, guards: ["selectSqliteAuthority", "openAuthorityStore"] },
   { file: "src/cli/state-plane/adapters/whole-state-compat.ts", symbol: "loadState", kind: "read", sites: 0, guards: ["selectSqliteAuthority", "recoverStandingResetJournal", "openAuthorityStore", "markResetLineageProvenance"] },
-  { file: "src/cli/state-plane/locks.ts", symbol: "inspectInventory", kind: "read", sites: 1, guards: ["classifyStateFormat"] },
+  // Wave 5B: the fence's inventory reads through the SELECTOR rather than the
+  // legacy document, so the repositories it covers are the same set in either
+  // format. It used to classify and refuse instead, which made every lock bundle
+  // unobtainable on a workspace rbox had just migrated.
+  { file: "src/cli/state-plane/locks.ts", symbol: "inspectInventory", kind: "read", sites: 0, guards: ["loadRawState"] },
   { file: "src/cli/state-plane/migration/admission.ts", symbol: "barrierWitness", kind: "read", sites: 1, guards: ["verifyLastWriterWitness"] },
   // The migration classifier's sole reader of the document. It must handle the
   // marker rather than refuse it, so its guard is the classifier that decides

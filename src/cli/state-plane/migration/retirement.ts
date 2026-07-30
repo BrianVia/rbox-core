@@ -275,7 +275,11 @@ export function stepRetirement(
   const { control } = receipt;
   const retirement = control.retirement;
   if (!retirement) return corrupt("no retirement is armed");
-  if (control.halt) return corrupt("a halted retirement resumes only through doctor");
+  // Names the command, not the surface. 163:3461 makes `--retry-state-migration`
+  // the ONLY thing that clears a halt, so a detail that said "through doctor"
+  // reached the user as `rbox doctor` — which prints the halt again and changes
+  // nothing (wave 5B renders this string verbatim).
+  if (control.halt) return corrupt("a halted retirement resumes only through rbox doctor --retry-state-migration");
   const { items, durablePrefix, currentIntent } = retirement.cursor;
 
   const detail = notDerived(root, control.migrationId, items)

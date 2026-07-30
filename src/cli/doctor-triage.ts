@@ -239,6 +239,19 @@ function stateFinding(root: string, check: DoctorChecks["state"]): TriageFinding
       command: "rbox upgrade",
     };
   }
+  // 222 §6.4: the marker says rbox's current format and the records behind it
+  // are missing or do not match. Not a halt, never retryable, and never an
+  // upgrade — the remedy is spelled out because "re-adopt" is not an instruction
+  // a non-developer can follow.
+  if (check.status === "authority-corrupt") {
+    return {
+      id: "state-authority-corrupt",
+      severity: "blocked",
+      problem: "This folder says its sync records are in rbox's current format, but the records themselves are missing or do not match.",
+      safety: `${SAFE_LOCAL_FILES} rbox has changed nothing and will not try to repair this by itself.`,
+      command: scoped(root, "rbox stop") + `, move ${root}/.rbox aside, then ` + scoped(root, "rbox adopt"),
+    };
+  }
   const mismatch = check.status === "stream-mismatch";
   return {
     id: mismatch ? "state-belongs-elsewhere" : "state-unreadable",
@@ -305,6 +318,10 @@ function environmentFindings(input: TriageInputs): TriageFinding[] {
   }
   const locking = lockingFinding(root, checks.locking);
   if (locking) out.push(locking);
+  // The migration check carries its own finding (see `DoctorCheck.finding`):
+  // U3's halt copy has one home, and triage reports it rather than re-deriving a
+  // second wording from a status string.
+  if (checks.migration?.ok === false && checks.migration.finding) out.push(checks.migration.finding);
   if (checks.reserve && !checks.reserve.ok && checks.reserve.inconclusive !== true) {
     out.push({
       id: "state-reserve-foreign",

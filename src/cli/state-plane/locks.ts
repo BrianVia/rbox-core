@@ -24,9 +24,7 @@ import {
   type WorkspaceSyncMutex,
 } from "../sync-mutex.js";
 import { loadConfigIfPresent, syncStreamId } from "../workspace-config.js";
-import { loadRawLegacyJsonState } from "./adapters/legacy-json-store.js";
-import { classifyStateFormat } from "./authority-marker.js";
-import { StateFormatTooNewError } from "./errors.js";
+import { loadRawState } from "./adapters/whole-state-compat.js";
 import { stateLockPath, statePath } from "./paths.js";
 
 declare const heldStatePlaneLocks: unique symbol;
@@ -121,16 +119,25 @@ const inventoryFingerprint = (inventory: Inventory): string => JSON.stringify([
  * restarts the acquisition rather than proceeding on a stale request set.
  */
 async function inspectInventory(root: string): Promise<Inventory> {
-  // Post-`Q` the repository records live in SQLite, so this legacy inventory
-  // cannot see them and the fence it derived would be incomplete. Refuse rather
-  // than lock less than the caller believes is locked. Design 222 §3.2's
-  // post-`Q` doctor retry needs the SQLite-backed inventory first.
-  if (await classifyStateFormat(statePath(root)) === "authority-marker") {
-    throw new StateFormatTooNewError(statePath(root));
-  }
+  // The whole-state SELECTOR, not the JSON reader (wave 5B).
+  //
+  // Post-`Q` the repository records live in SQLite. Reading them through the
+  // legacy document derived a fence that covered nothing, so this refused
+  // outright with `StateFormatTooNewError` — which made every lock bundle
+  // unobtainable on a workspace that had just been migrated, and therefore made
+  // `rbox migrate` unable to report success on its own work and
+  // `--retry-state-migration` unreachable on the two post-`Q` halts that exist
+  // precisely to be retried (222 §3.2's annotated debt).
+  //
+  // The selector answers both formats with one signature, so the fence covers
+  // the same repositories either way and there is no second inventory to keep in
+  // step. It is the ordinary post-`Q` read every other caller already performs —
+  // this is not the byte-identical-refusal path, where opening the authority
+  // would be the violation; here the authority is live and its sidecars are
+  // expected.
   const config = await loadConfigIfPresent(root).catch(() => undefined);
   const stream = config ? syncStreamId(config) : undefined;
-  const state = await loadRawLegacyJsonState(root);
+  const state = await loadRawState(root);
   const requests = new Map<string, RepositoryRequest>();
   for (const [relPath, record] of Object.entries(state ? repoRecordsForState(state) : {}).sort(([a], [b]) => a < b ? -1 : 1)) {
     const repoDir = relPath === "." ? root : path.join(root, ...relPath.split("/"));

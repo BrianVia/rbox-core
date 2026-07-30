@@ -1,0 +1,152 @@
+/**
+ * The operator surface for the state plane (design 222 §3.2, §7.3, wave 5B).
+ *
+ * Three commands, one window:
+ *
+ * - `rbox migrate` — entry point B of §3.2. Foreground, with progress, and the
+ *   only place a user asks for a conversion by name.
+ * - `rbox doctor --retry-state-migration` — the ONE doctor authorization site
+ *   (§7.9). It clears a suspended migration's halt and hands execution back to
+ *   the same controller; it never implements a second repair path.
+ * - `rbox doctor --abort-state-migration` — §7.3's pre-`Q` abandon.
+ *
+ * All three take the identical lock bundle through the identical helper, so the
+ * exclusivity window, the refusal copy, the `--json` twin, and the exit code are
+ * decided once. `rbox migrate` is unreachable from the daemon process (its own
+ * dispatcher token is `__daemon-run`, which has no path here), and a daemon that
+ * is merely RUNNING is refused by M0's own `migration-not-exclusive` condition
+ * rather than by a second liveness check here.
+ */
+import { ResetCorruptionError } from "./reset-io.js";
+import { WorkspaceSyncBusyError, WorkspaceSyncTimeoutError } from "./sync-mutex.js";
+import { MIGRATION_STEP_COPY, PROGRESS_ANNOUNCE_AFTER_MS } from "./state-plane-copy.js";
+import {
+  describeAuthorityCorruption, describeAuthorityOutcome, describeLockRefusal,
+  describeMigrationOutcome, describeUnreadableState, describeWorkspaceBusy, operatorReportJson,
+  renderOperatorReport,
+  type OperatorReport,
+} from "./state-plane-report.js";
+import { establishStateAuthority } from "./state-plane/authority-bootstrap.js";
+import { StateAuthorityCorruptError } from "./state-plane/errors.js";
+import { withStatePlaneLocks, type EntryPoint, type EntryProof } from "./state-plane/locks.js";
+import { runMigration, type MigrationProgress } from "./state-plane/migration/authority.js";
+import { abortMigration, retryHaltedMigration } from "./state-plane/migration/halt-recovery.js";
+
+export interface StatePlaneCmdOptions {
+  readonly json?: boolean;
+  /** Test seam: where the human surface goes. */
+  readonly log?: (line: string) => void;
+  /** Test seam for the 5-second progress threshold. */
+  readonly now?: () => number;
+}
+
+/** Zero when rbox is done and nothing is owed; 1 when a person has to act. 222
+ * §6's "every command is real and non-interactively twinned" needs both halves:
+ * the words AND an exit code a script can branch on. */
+function emit(report: OperatorReport, options: StatePlaneCmdOptions): number {
+  const log = options.log ?? console.log;
+  if (options.json === true) log(JSON.stringify(operatorReportJson(report), null, 2));
+  else for (const line of renderOperatorReport(report)) log(line);
+  return report.ok ? 0 : 1;
+}
+
+/**
+ * The window every operator command shares.
+ *
+ * A refused bundle, a busy workspace, and a contradictory authority are all
+ * reported as typed outcomes with copy — never as a stack trace out of the
+ * fence, which is what a non-developer would otherwise see.
+ */
+async function inWindow(
+  root: string, entry: EntryPoint, options: StatePlaneCmdOptions,
+  body: (proof: EntryProof) => Promise<OperatorReport>,
+): Promise<number> {
+  try {
+    const outcome = await withStatePlaneLocks(root, (locks) => body({ entry, locks }));
+    if (outcome.held) return emit(outcome.value, options);
+    return emit(describeLockRefusal(outcome.refusal), options);
+  } catch (error) {
+    if (error instanceof StateAuthorityCorruptError) {
+      return emit(describeAuthorityCorruption(error.detail), options);
+    }
+    if (error instanceof WorkspaceSyncBusyError || error instanceof WorkspaceSyncTimeoutError) {
+      return emit(describeWorkspaceBusy(), options);
+    }
+    if (error instanceof ResetCorruptionError) {
+      return emit(describeUnreadableState(error.message), options);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Entry point B of §3.2 — foreground `rbox migrate`.
+ *
+ * It calls the coordinator, not the driver: a workspace with no records at all
+ * is genesis's business, and one entry point that dispatched only migration
+ * would leave that workspace with no command at all.
+ */
+export async function migrateCmd(root: string, options: StatePlaneCmdOptions = {}): Promise<number> {
+  const progress = startProgress(options);
+  try {
+    return await inWindow(root, "foreground-migrate", options, async (proof) =>
+      describeAuthorityOutcome(root, await establishStateAuthority(root, proof, (r, entry) =>
+        runMigration(r, entry, progress.observe))));
+  } finally {
+    progress.stop();
+  }
+}
+
+/** §7.9's one doctor authorization site. */
+export async function retryStateMigrationCmd(root: string, options: StatePlaneCmdOptions = {}): Promise<number> {
+  const progress = startProgress(options);
+  try {
+    return await inWindow(root, "foreground-migrate", options, async (proof) =>
+      describeMigrationOutcome(root, await retryHaltedMigration(root, proof, progress.observe)));
+  } finally {
+    progress.stop();
+  }
+}
+
+/** §7.3's abort: pre-`Q` only, and `halt-recovery.ts` is what refuses the rest. */
+export async function abortStateMigrationCmd(root: string, options: StatePlaneCmdOptions = {}): Promise<number> {
+  return await inWindow(root, "foreground-migrate", options, async (proof) =>
+    describeMigrationOutcome(root, await abortMigration(root, proof)));
+}
+
+/**
+ * 222 §6.4: "the `migrating` state renders in plain English past 5 s per phase".
+ *
+ * Silence under five seconds is the point — a conversion that takes 200 ms
+ * should print nothing but its verdict. So the sink records the current step and
+ * a timer, not the event, prints. `unref` keeps the timer from holding the
+ * process open past the verdict.
+ */
+function startProgress(options: StatePlaneCmdOptions): {
+  observe: (event: MigrationProgress) => void; stop: () => void;
+} {
+  if (options.json === true) return { observe: () => undefined, stop: () => undefined };
+  const log = options.log ?? console.log;
+  const now = options.now ?? Date.now;
+  let current: MigrationProgress | undefined;
+  let since = now();
+  let announced: string | undefined;
+  const timer = setInterval(() => {
+    if (!current || now() - since < PROGRESS_ANNOUNCE_AFTER_MS) return;
+    const text = MIGRATION_STEP_COPY[current.phase];
+    if (text === announced) return;
+    announced = text;
+    log(`still ${text}…`);
+  }, 1000);
+  timer.unref?.();
+  return {
+    observe: (event) => {
+      if (current?.phase !== event.phase) {
+        since = now();
+        announced = undefined;
+      }
+      current = event;
+    },
+    stop: () => clearInterval(timer),
+  };
+}
