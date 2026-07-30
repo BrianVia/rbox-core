@@ -5,11 +5,14 @@
   },
   "include": [
     "rig/**/*.ts",
+    "snapshot-replay/**/*.ts",
+    "../src/**/*.d.ts",
     "tui-compiled-smoke.ts",
     "tui-performance-budget.ts"
   ],
   "exclude": [
     "rig/**/*.test.ts",
+    "snapshot-replay/**/*.test.ts",
     "rig/runs/**",
     "rig/cache/**"
   ]
