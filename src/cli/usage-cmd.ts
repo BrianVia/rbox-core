@@ -20,8 +20,12 @@ export interface AccountUsageDTO {
 
 const BAR_WIDTH = 20;
 
-/** Plain-English age, for people who do not read "41m ago" as a duration. */
-function measuredNote(measuredAt: number | null | undefined, now: number): string {
+/** Plain-English age, for people who do not read "41m ago" as a duration. Returns ""
+ *  when the measurement is not worth mentioning: a locked account (no usable quota) or
+ *  an unlimited plan, where the number is not what anyone is looking at. */
+function measuredNote(u: AccountUsageDTO, now: number): string {
+  if (u.plan === "none" || u.storageCap === null) return "";
+  const measuredAt = u.measuredAt;
   if (typeof measuredAt !== "number") return "still being measured";
   const minutes = Math.max(0, Math.round((now - measuredAt) / 60_000));
   if (minutes < 1) return "measured just now";
@@ -64,9 +68,9 @@ export function renderUsage(u: AccountUsageDTO, now: number = Date.now()): strin
   const storage = `${formatBinaryBytes(u.usedBytes)} / ${u.storageCap === null ? "unlimited" : formatBinaryBytes(u.storageCap)}`;
   const storageNote = [
     u.storageCap === null ? "unlimited" : `${pct}%`,
-    measuredNote(u.measuredAt, now),
+    measuredNote(u, now),
     ...(u.readOnly ? ["read-only"] : []),
-  ].join(", ");
+  ].filter((part) => part !== "").join(", ");
   const workspaceCap = u.workspaceCap === null ? "unlimited" : u.workspaceCap.toLocaleString("en-US");
   const retention = u.retentionDays === 0 ? "0 days (current state only)" : `${u.retentionDays.toLocaleString("en-US")} day${u.retentionDays === 1 ? "" : "s"}`;
   const lines = [

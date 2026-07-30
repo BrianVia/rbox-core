@@ -1,6 +1,6 @@
 import type { Env } from "./env.js";
 import { json } from "./util.js";
-import { PLANS, billableBytes, planFor } from "./plans.js";
+import { PLANS, billableBytes, forgivenBytes, planFor } from "./plans.js";
 import { audit, entitledSubset, isEntitled, type Principal } from "./authz.js";
 import { isOverCapAbort } from "./auth.js";
 import { dbFor } from "./db.js";
@@ -11,19 +11,34 @@ import { RECEIPT_TTL_MS } from "./receipts.js";
  *  for this long before locked-state retention resumes. */
 export const GRACE_PERIOD_MS = 30 * 24 * 60 * 60 * 1000;
 
-/** `used` is the live entitlement ledger (`used_bytes`); `billable` is the §228 number
- *  every display and every cap comparison uses — the same expression the D1 cap-guard
- *  trigger evaluates, so the advisory checks and the hard fence can never disagree. */
-async function account(env: Env, accountId: string): Promise<{ plan: string; extra: number; used: number; billable: number; graceUntil: number | null; billingInterval: string | null }> {
-  const r = await dbFor(env, accountId).prepare("SELECT plan, extra_storage_bytes, used_bytes, history_overhang_bytes, grace_until, billing_interval FROM accounts WHERE id = ?").bind(accountId).first<{ plan: string; extra_storage_bytes: number; used_bytes: number; history_overhang_bytes: number; grace_until: number | null; billing_interval: string | null }>();
+/** ONE read of the account row. `used` is the live entitlement ledger (`used_bytes`);
+ *  `forgiven` is the measured history a paid plan does not charge for; `billable` is
+ *  the §228 number every display and every cap comparison uses. `measuredAt` is when
+ *  that forgiveness was measured — it lives on the same row, written by the same
+ *  statement, so the number and its timestamp can never be read torn (they used to
+ *  come from `fairuse_scans` in a second query, which on deploy day reported a real
+ *  measurement date against a completely unforgiven ledger).
+ *
+ *  Admitting `incoming` bytes must clamp the SUM — `MAX(0, used + incoming -
+ *  forgiven)` — not add to a pre-clamped `billable`; see plans.ts. */
+async function account(env: Env, accountId: string): Promise<{ plan: string; extra: number; used: number; forgiven: number; billable: number; measuredAt: number | null; graceUntil: number | null; billingInterval: string | null }> {
+  const r = await dbFor(env, accountId).prepare("SELECT plan, extra_storage_bytes, used_bytes, history_overhang_bytes, history_overhang_measured_at, grace_until, billing_interval FROM accounts WHERE id = ?").bind(accountId).first<{ plan: string; extra_storage_bytes: number; used_bytes: number; history_overhang_bytes: number; history_overhang_measured_at: number | null; grace_until: number | null; billing_interval: string | null }>();
+  const plan = r?.plan ?? "none";
   return {
-    plan: r?.plan ?? "none",
+    plan,
     extra: Number(r?.extra_storage_bytes ?? 0),
     used: Number(r?.used_bytes ?? 0),
-    billable: billableBytes(r?.used_bytes, r?.history_overhang_bytes),
+    forgiven: forgivenBytes(plan, r?.history_overhang_bytes),
+    billable: billableBytes(plan, r?.used_bytes, r?.history_overhang_bytes),
+    measuredAt: r?.history_overhang_measured_at ?? null,
     graceUntil: r?.grace_until ?? null,
     billingInterval: r?.billing_interval ?? null,
   };
+}
+
+/** The admission predicate, in the exact shape the accounts_cap_guard trigger uses. */
+function wouldBreachCap(a: { used: number; forgiven: number }, incomingSize: number, cap: number): boolean {
+  return cap !== Infinity && Math.max(0, a.used + incomingSize - a.forgiven) > cap;
 }
 
 /** Fast-fail over-cap check BEFORE writing bytes to R2 (design 13 G4): true when
@@ -41,7 +56,7 @@ export async function wouldExceedCap(env: Env, accountId: string, sha: string, i
   const cap = planFor(a.plan).storageBytes + a.extra;
   if (a.plan === "none") return { over: true, used: a.billable, cap, reason: "no_plan" };
   if (await isEntitled(env, accountId, sha)) return { over: false, used: a.billable, cap };
-  const over = cap !== Infinity && a.billable + incomingSize > cap;
+  const over = wouldBreachCap(a, incomingSize, cap);
   return { over, used: a.billable, cap, ...(over && a.plan === "none" ? { reason: "no_plan" as const } : {}) };
 }
 
@@ -62,7 +77,7 @@ export async function wouldExceedCapAggregate(
   for (const member of members) if (!entitled.has(member.sha)) incomingSize += member.size;
   // Match wouldExceedCap's existing behavior: a wholly entitled retry costs
   // exactly zero and remains admissible even when the account is already at/over cap.
-  return { over: incomingSize > 0 && cap !== Infinity && a.billable + incomingSize > cap, used: a.billable, cap };
+  return { over: incomingSize > 0 && wouldBreachCap(a, incomingSize, cap), used: a.billable, cap };
 }
 
 /**
@@ -227,11 +242,12 @@ export async function usage(env: Env, p: Principal): Promise<Response> {
     // fair-use scan, plus whatever has been uploaded since. Retained history is
     // stored but never billed, shown, or counted against the plan cap.
     usedBytes: a.billable,
-    // When that number was measured (epoch ms), or null when no scan has ever
-    // completed — in which case usedBytes falls back to the raw stored total.
-    // Scans tick hourly, so this can legitimately be up to an hour old; clients
-    // surface the age rather than hiding or gating on it.
-    measuredAt: fairUseEpoch ? Number(fairUseEpoch.completed_at) : null,
+    // When that number was measured (epoch ms), or null when nothing has been
+    // measured yet — in which case usedBytes falls back to the raw stored total.
+    // Read from the SAME accounts row as usedBytes, so the two always describe one
+    // instant. Scans tick hourly, so this can legitimately be up to an hour old;
+    // clients surface the age rather than hiding or gating on it.
+    measuredAt: a.measuredAt,
     storageCap: cap === Infinity ? null : cap,
     workspaces,
     workspaceCap: limits.workspaces === Infinity ? null : limits.workspaces,

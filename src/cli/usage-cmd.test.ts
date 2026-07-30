@@ -60,7 +60,9 @@ describe("rbox usage", () => {
     await usageCmd();
     const out = logs[0]!;
     expect(out).toContain("plan:       no active plan");
-    expect(out).toContain("storage:    ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  1 B / 1 B   (100%, still being measured, read-only)");
+    // A locked account has no usable quota; telling it the measurement is pending is
+    // noise, so the note is suppressed entirely.
+    expect(out).toContain("storage:    ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  1 B / 1 B   (100%, read-only)");
     expect(out).toContain("workspaces: 1 / 1");
     expect(out).toContain("retention:  0 days (current state only)");
     expect(out).not.toContain("grace:");
@@ -69,14 +71,27 @@ describe("rbox usage", () => {
 
   test("storage carries the age of the measurement it came from", async () => {
     const now = Date.now();
-    stub(JSON.stringify({ ...dto, measuredAt: now - 41 * 60_000, readOnly: false }));
+    const paid = { ...dto, plan: "solo", readOnly: false };
+    stub(JSON.stringify({ ...paid, measuredAt: now - 41 * 60_000 }));
     await usageCmd();
     expect(logs[0]!).toContain("(100%, measured 41 minutes ago)");
 
     logs.length = 0;
-    stub(JSON.stringify({ ...dto, measuredAt: now - 3 * 3600_000, readOnly: false }));
+    stub(JSON.stringify({ ...paid, measuredAt: now - 3 * 3600_000 }));
     await usageCmd();
     expect(logs[0]!).toContain("(100%, measured 3 hours ago)");
+
+    logs.length = 0;
+    stub(JSON.stringify(paid));
+    await usageCmd();
+    expect(logs[0]!).toContain("(100%, still being measured)");
+  });
+
+  test("an unlimited plan says nothing about measurement — there is no quota to read it against", async () => {
+    stub(JSON.stringify({ ...dto, plan: "pro", storageCap: null, readOnly: false, measuredAt: Date.now() }));
+    await usageCmd();
+    expect(logs[0]!).toContain("(unlimited)");
+    expect(logs[0]!).not.toContain("measured");
   });
 
   test("human render explains an active billing grace period", async () => {
