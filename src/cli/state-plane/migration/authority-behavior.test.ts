@@ -26,13 +26,13 @@ import { saveStateUnsafeLegacyOrTest } from "../../sync-state-store.js";
 import { saveConfig, syncStreamId, type WorkspaceConfig } from "../../workspace-config.js";
 import { MigrationControlError, MigrationPhaseHaltError } from "../errors.js";
 import { withStatePlaneLocks, type EntryProof, type HeldStatePlaneLocks } from "../locks.js";
-import { migrationPaths, sqliteResetPaths } from "../paths.js";
+import { migrationPaths, sqliteResetPaths, statePath } from "../paths.js";
 import { openStateStoreForWalTakeover, stateStoreDatabase } from "../store/open.js";
-import { runMigration, SQLITE_LIVE_ROWS } from "./authority.js";
-import { abortMigration } from "./halt-recovery.js";
+import { runMigration, SQLITE_LIVE_ROWS, type MigrationOutcome } from "./authority.js";
+import { ABORT_AFTER_FLIP, abortMigration } from "./halt-recovery.js";
 import { beginMigration, EMERGENCY_CANDIDATE_BYTES, provisionRunway, restoreHaltRunway } from "./begin.js";
 import { PhaseReceipt } from "./classifier.js";
-import { encodeMigrationControl, type C1Trigger, type MigrationControl } from "./control-codec.js";
+import { decodeMigrationControl, encodeMigrationControl, type C1Trigger, type MigrationControl } from "./control-codec.js";
 import { FIRST_CONTROL_REVISION, readCanonicalControl, renderPreparedControl } from "./control-publication.js";
 import { armRetirement } from "./retirement.js";
 
@@ -94,9 +94,11 @@ test("runMigration sequences M0→M7 with real publications and migrates the wor
   expect(outcome).toMatchObject({ kind: "migrated" });
   // M7 retires the control: SQLite is the authority and nothing blocks writes.
   expect(readCanonicalControl(root)).toBeUndefined();
-  // A second pass is NOT asserted here: `inspectInventory` still has no
-  // SQLite-backed reading, so the post-`Q` workspace refuses the bundle before
-  // the driver is reached (222 §3.2's own annotated debt, unrelated to this fix).
+  // The second pass IS asserted now. Wave 5B closed 222 §3.2's annotated debt —
+  // `inspectInventory` reads through the selecting seam — so a migrated workspace
+  // yields a bundle and the driver reports the row it is on rather than throwing
+  // `StateFormatTooNewError` at a user whose binary is the newest one there is.
+  expect(await under(root, (entry) => runMigration(root, entry))).toEqual({ kind: "already-migrated" });
 });
 
 test("a durable halt is CAS'd against the interstitially-advanced control", async () => {
@@ -315,6 +317,109 @@ test("B4: SQLITE_LIVE_ROWS is exactly its four members", () => {
     ["m5-artifact-ahead-q", "m6-cleanup", "m7", "terminal-sqlite"].sort(),
   );
 });
+
+/**
+ * B4's actual net (wave 5B ride-along).
+ *
+ * The guard at `halt-recovery.ts`'s `SQLITE_LIVE_ROWS` check is what prevents an
+ * abort from running the C1 retirement vector over a workspace whose authority
+ * has already flipped — the one path in U3 that could destroy live data. It was
+ * MUTATION-INVISIBLE: deleting the check left every test in the tree passing,
+ * because the only thing exercising it asserted a non-zero exit and the presence
+ * of a next step, both of which the fall-through also produces.
+ *
+ * All four rows, from REAL records. The migration is driven to completion once
+ * and the canonical control is snapshotted at each publication; restoring one of
+ * those snapshots over the finished workspace is not fabrication — it is exactly
+ * the crash image that phase leaves ("M6 published, killed before M7"), which is
+ * the population the guard exists for. `terminal-sqlite` is the finished
+ * workspace with no control at all.
+ */
+test("B4: every row past the authority flip refuses the abort, from real records", async () => {
+  const root = await migratable("rbox-u3-5b-b4-rows-");
+  const snapshots = new Map<string, Buffer>();
+  const outcome = await under(root, (entry) => runMigration(root, entry, () => {
+    const control = migrationPaths.control(root);
+    const record = readCanonicalControl(root);
+    if (record) snapshots.set(record.witness.phase, fs.readFileSync(control));
+  }));
+  expect(outcome.kind, "the fixture must reach SQLite authority for this test to mean anything").toBe("migrated");
+  expect(readCanonicalControl(root), "M7 unlinks the control").toBeUndefined();
+
+  // Row 4: the finished workspace, exactly as it stands.
+  const terminal = await under(root, (entry) => abortMigration(root, entry));
+  expectRefusedPastFlip(terminal);
+
+  // Rows 1-3: restore each phase's own durable record over the flipped artifacts.
+  // M6 is `m6-cleanup` and M7 is `m7` verbatim. `m5-artifact-ahead-q` needs the
+  // M5 control the LADDER published rather than the one M5 itself did: M5
+  // publishes the sibling `absent` and the ladder advances that one field to
+  // `exact` through same-phase revisions the driver's progress sink never sees.
+  // So it is reconstructed — same phase, same witness, that one field carrying
+  // the live marker's real identity, which is what the ladder would have written.
+  for (const phase of ["M5", "M6", "M7"] as const) {
+    const bytes = snapshots.get(phase);
+    expect(bytes, `the run published no ${phase} control`).toBeDefined();
+    // A faithful crash image has the database AT REST: M4 checkpoints and closes
+    // before M5 is published, and the classifier rightly calls a fenced M5 with
+    // live sidecars corruption. The sidecars here are debris from the reads this
+    // test just performed, so removing them is what makes the fixture the row it
+    // claims to be rather than a different fault.
+    for (const suffix of ["-wal", "-shm"]) {
+      fs.rmSync(`${sqliteResetPaths.active(root)}${suffix}`, { force: true });
+    }
+    fs.writeFileSync(migrationPaths.control(root), phase === "M5" ? ladderedM5(root, bytes!) : bytes!);
+    const refused = await under(root, (entry) => abortMigration(root, entry));
+    expectRefusedPastFlip(refused, phase);
+    if (phase === "M5") {
+      // The property `fencedUnderMarker` exists to protect, asserted where it
+      // bites. `M5 + Q` is the ONE row that reads a live `-wal`/`-shm` as
+      // corruption, and the lock bundle's own inventory read would deposit
+      // exactly those if it opened the store here — turning this recoverable
+      // crash image into a never-retryable `StateAuthorityCorruptError`. The
+      // refusal above proves classification reached the row; this proves the
+      // acquisition that got there left the database at rest.
+      for (const suffix of ["-wal", "-shm"]) {
+        expect(
+          fs.existsSync(`${sqliteResetPaths.active(root)}${suffix}`),
+          `the fenced inventory deposited a ${suffix} sidecar on the one row that cannot tolerate it`,
+        ).toBe(false);
+      }
+    }
+  }
+  fs.rmSync(migrationPaths.control(root), { force: true });
+
+  // The list this guard reads is the list the test covered.
+  expect([...SQLITE_LIVE_ROWS]).toHaveLength(4);
+});
+
+/** The M5 revision the `Q`-sibling ladder publishes: identical to M5's own
+ * except that the sibling it prebound is now `exact`, carrying the identity of
+ * the file the flip renamed over `state.json`. */
+function ladderedM5(root: string, bytes: Buffer): Buffer {
+  const control = decodeMigrationControl(bytes);
+  if (control.witness.phase !== "M5") throw new Error("the M5 snapshot is not an M5 witness");
+  const live = fs.statSync(statePath(root));
+  return Buffer.from(encodeMigrationControl({
+    ...control,
+    witness: {
+      ...control.witness,
+      qSibling: {
+        ...control.witness.qSibling,
+        disposition: { state: "exact", dev: Number(live.dev), ino: Number(live.ino) },
+      },
+    },
+  }));
+}
+
+/** The refusal, asserted on its STABLE token rather than on an exit code that a
+ * fall-through would also produce. */
+function expectRefusedPastFlip(outcome: MigrationOutcome, label = "terminal"): void {
+  expect(outcome.kind, label).toBe("halted");
+  if (outcome.kind !== "halted") throw new Error("expected a halt");
+  expect(outcome.durableHalt, label).toBe(false);
+  expect(outcome.halt.underlyingCode, label).toBe(ABORT_AFTER_FLIP);
+}
 
 test("B4: abortMigration on a pristine workspace reports nothing-to-abort, not migrated", async () => {
   const root = await migratable("rbox-u3-5a-abort-pristine-");

@@ -22,12 +22,12 @@ import { WorkspaceSyncBusyError, WorkspaceSyncTimeoutError } from "./sync-mutex.
 import { MIGRATION_STEP_COPY, PROGRESS_ANNOUNCE_AFTER_MS } from "./state-plane-copy.js";
 import {
   describeAuthorityCorruption, describeAuthorityOutcome, describeLockRefusal,
-  describeMigrationOutcome, describeUnreadableState, describeWorkspaceBusy, operatorReportJson,
-  renderOperatorReport,
+  describeFormatTooNew, describeMigrationOutcome, describeUnreadableState, describeWorkspaceBusy,
+  operatorReportJson, renderOperatorReport,
   type OperatorReport,
 } from "./state-plane-report.js";
 import { establishStateAuthority } from "./state-plane/authority-bootstrap.js";
-import { StateAuthorityCorruptError } from "./state-plane/errors.js";
+import { StateAuthorityCorruptError, StateFormatTooNewError } from "./state-plane/errors.js";
 import { withStatePlaneLocks, type EntryPoint, type EntryProof } from "./state-plane/locks.js";
 import { runMigration, type MigrationProgress } from "./state-plane/migration/authority.js";
 import { abortMigration, retryHaltedMigration } from "./state-plane/migration/halt-recovery.js";
@@ -68,6 +68,13 @@ async function inWindow(
   } catch (error) {
     if (error instanceof StateAuthorityCorruptError) {
       return emit(describeAuthorityCorruption(error.detail), options);
+    }
+    // Believed unreachable from here (the inventory reads through the selecting
+    // seam), and caught anyway: it is the one typed state-plane error with no
+    // other translation, so an unhandled one is exactly the stack trace the
+    // "no bare throws to the CLI" rule exists to prevent.
+    if (error instanceof StateFormatTooNewError) {
+      return emit(describeFormatTooNew(error.file), options);
     }
     if (error instanceof WorkspaceSyncBusyError || error instanceof WorkspaceSyncTimeoutError) {
       return emit(describeWorkspaceBusy(), options);
@@ -118,9 +125,18 @@ export async function abortStateMigrationCmd(root: string, options: StatePlaneCm
  * 222 §6.4: "the `migrating` state renders in plain English past 5 s per phase".
  *
  * Silence under five seconds is the point — a conversion that takes 200 ms
- * should print nothing but its verdict. So the sink records the current step and
- * a timer, not the event, prints. `unref` keeps the timer from holding the
- * process open past the verdict.
+ * should print nothing but its verdict — so the decision is a clock comparison,
+ * never "an event happened".
+ *
+ * It is checked from BOTH edges, and each covers what the other cannot. A phase
+ * that does slow work and reports nothing (M3's import is the real one) has no
+ * event to check on, so the timer is the only thing that can speak; a phase that
+ * emits while the interval happens not to have fired would otherwise stay silent
+ * past the threshold on a fast host. The earlier build had only the timer, which
+ * made the rule unobservable without real wall-clock time — the reason §6.4 went
+ * unverified through the whole wave.
+ *
+ * `unref` keeps the timer from holding the process open past the verdict.
  */
 function startProgress(options: StatePlaneCmdOptions): {
   observe: (event: MigrationProgress) => void; stop: () => void;
@@ -131,13 +147,14 @@ function startProgress(options: StatePlaneCmdOptions): {
   let current: MigrationProgress | undefined;
   let since = now();
   let announced: string | undefined;
-  const timer = setInterval(() => {
+  const announceIfSlow = (): void => {
     if (!current || now() - since < PROGRESS_ANNOUNCE_AFTER_MS) return;
     const text = MIGRATION_STEP_COPY[current.phase];
     if (text === announced) return;
     announced = text;
     log(`still ${text}…`);
-  }, 1000);
+  };
+  const timer = setInterval(announceIfSlow, 1000);
   timer.unref?.();
   return {
     observe: (event) => {
@@ -146,6 +163,7 @@ function startProgress(options: StatePlaneCmdOptions): {
         announced = undefined;
       }
       current = event;
+      announceIfSlow();
     },
     stop: () => clearInterval(timer),
   };

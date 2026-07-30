@@ -27,6 +27,11 @@ import { publishMigrationControl } from "./control-publication.js";
 const corrupt = (detail: string): MigrationOutcome =>
   ({ kind: "halted", halt: corruptionHalt(detail), durableHalt: false });
 
+/** §7.3's post-`Q` refusal, as a stable token the operator surface can give
+ * real copy to. Exported so the copy table and this module cannot drift into two
+ * spellings of one verdict. */
+export const ABORT_AFTER_FLIP = "abort-after-flip";
+
 const expectation = (control: MigrationControl) =>
   ({ migrationId: control.migrationId, revision: control.controlRevision });
 
@@ -143,7 +148,12 @@ const BUCKETS: Record<HaltBucket, BucketHandler> = {
 export async function abortMigration(root: string, entry: EntryProof): Promise<MigrationOutcome> {
   const observation = await classifyMigrationState(root, entry.locks);
   if ((SQLITE_LIVE_ROWS as readonly string[]).includes(observation.row)) {
-    return corrupt(`a migration past the authority flip cannot be aborted (row ${observation.row})`);
+    // A STABLE TOKEN, not the sentence it used to carry. This is the one B4
+    // refusal a user actually meets, and wave 5B renders `underlyingCode` — a
+    // developer sentence naming an internal row would have reached them raw,
+    // and a generic fallback would have lost §7.3's re-adoption remedy. The row
+    // is still recoverable from the control the record sits beside.
+    return corrupt(ABORT_AFTER_FLIP);
   }
   // No control means the workspace never left legacy JSON — nothing to abort, zero
   // mutation. Reported distinctly from `already-migrated` (which means SQLite is

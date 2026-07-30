@@ -22,9 +22,9 @@ import {
   MIGRATION_REFUSAL_COPY, MIGRATION_STEP_COPY, type OperatorCopy,
 } from "./state-plane-copy.js";
 import {
-  describeAdmissionRefusal, describeAuthorityCorruption, describeGenesisOutcome,
-  describeLockRefusal, describeMigrationHalt, describeMigrationOutcome, describeWorkspaceBusy,
-  operatorReportJson, renderOperatorReport, type OperatorReport,
+  describeAdmissionRefusal, describeAuthorityCorruption, describeFormatTooNew,
+  describeGenesisOutcome, describeLockRefusal, describeMigrationHalt, describeMigrationOutcome,
+  describeWorkspaceBusy, operatorReportJson, renderOperatorReport, type OperatorReport,
 } from "./state-plane-report.js";
 import { RESET_MATERIALIZED_BYTE_LIMIT } from "./reset-io.js";
 import type { MigrationHalt, MigrationHaltCode } from "./state-plane/migration/health.js";
@@ -55,6 +55,10 @@ function everyReport(): OperatorReport[] {
     describeGenesisOutcome(ROOT, { kind: "already-established" }),
     ...(["legacy-present", "artifact-present", "evidence-missing"] as const)
       .map((reason) => describeGenesisOutcome(ROOT, { kind: "refused", reason })),
+    describeMigrationHalt(ROOT, halt("reserved-path", { underlyingCode: "EIO" }), true),
+    describeMigrationHalt(ROOT, halt("reserved-path", { underlyingCode: "staging-inode" }), true),
+    describeMigrationHalt(ROOT, halt("reserved-path", { underlyingCode: "abort-after-flip" }), false),
+    describeFormatTooNew("/w/.rbox/state.json"),
     describeLockRefusal({ code: "degraded-fence", detail: "identity-unavailable" }),
     describeLockRefusal({ code: "memory-admission", detail: "needs 4 GB of parse headroom" }),
     describeWorkspaceBusy(),
@@ -76,18 +80,81 @@ test("reserved-path never claims a file was found, because most of its rows have
   expect(copy.human.command).toMatch(/rbox migrate/);
 });
 
-test("the underlyingCode tokens are rendered, and an unrecognised one is quoted rather than dropped", () => {
+test("the underlyingCode tokens are rendered, and a developer sentence never is", () => {
   const known = describeMigrationHalt(ROOT, halt("verification", { underlyingCode: "semantic-digest" }), true);
   expect(known.facts.join(" ")).toContain("content fingerprint");
-  // The retirement corruption detail, verbatim — this is the string wave 5B
-  // corrected from "through doctor" to name the real command.
-  const prose = describeMigrationHalt(
-    ROOT, halt("reserved-path", { underlyingCode: "a halted retirement resumes only through rbox doctor --retry-state-migration" }), true,
-  );
-  expect(prose.facts.join(" ")).toContain("rbox doctor --retry-state-migration");
-  // An errno is evidence too, and it reads as one.
+
+  // An errno is evidence a user can act on, and it reads as one.
   const errno = describeMigrationHalt(ROOT, halt("filesystem-full", { underlyingCode: "ENOSPC" }), true);
   expect(errno.facts.join(" ")).toContain("ENOSPC");
+
+  // A free-text corruption detail is a sentence rbox wrote for ITSELF. Two real
+  // ones from the tree, neither of which may reach the surface as itself.
+  for (const prose of [
+    "a halted retirement resumes only through rbox doctor --retry-state-migration",
+    "this workspace has no durable config stream to bind its reserve to",
+  ]) {
+    const report = describeMigrationHalt(ROOT, halt("reserved-path", { underlyingCode: prose }), true);
+    expect(report.facts.join(" ")).not.toContain(prose);
+    expect(report.facts.join(" ")).toContain("rbox doctor --report");
+  }
+});
+
+test("reserved-path's remedy splits by producer class, and only one class names a file", () => {
+  // ~40 producers across eight modules raise `reserved-path`, and one remedy was
+  // wrong for most of them. The classes are derived from `underlyingCode`.
+  const environment = describeMigrationHalt(ROOT, halt("reserved-path", { underlyingCode: "EIO" }), true);
+  expect(environment.finding.problem).toContain("system refused an operation");
+  expect(environment.finding.command).toBe("rbox doctor");
+  expect(environment.facts.join(" ")).not.toMatch(/state\.db|move .* aside/);
+
+  const internal = describeMigrationHalt(ROOT, halt("reserved-path"), true);
+  expect(internal.finding.problem).toContain("doesn't recognise");
+  expect(internal.finding.command).toContain("--report");
+  // THE HAZARD: the blanket file list this replaced named the live `state.db`
+  // under a command telling a non-developer to move things aside.
+  expect(internal.facts.join(" ")).not.toContain("state.db");
+  expect(internal.finding.command).not.toMatch(/aside/);
+
+  const occupied = describeMigrationHalt(ROOT, halt("reserved-path", { underlyingCode: "staging-inode" }), true);
+  expect(occupied.finding.problem).toContain("Something rbox didn't write");
+  expect(occupied.finding.command).toContain("aside");
+});
+
+test("the post-flip abort refuses with its own words and its own machine id", () => {
+  // 222 §7.3, and 5A's B4 guard: the one `reserved-path` producer a user really
+  // meets. Without its own token it would have read as the generic catch-all and
+  // lost the re-adoption remedy entirely.
+  const report = describeMigrationHalt(ROOT, halt("reserved-path", { underlyingCode: "abort-after-flip" }), false);
+  expect(report.outcome).toBe("halted:reserved-path:abort-after-flip");
+  expect(report.finding.id).toBe("state-migration/abort-after-flip");
+  expect(report.finding.problem).toContain("already been converted");
+  expect(report.finding.command).toContain("rbox adopt");
+});
+
+test("no message ever carries a path, an errno, or a stack frame out of an exception", () => {
+  // Exception messages compose: `StateAuthorityCorruptError`'s detail carries the
+  // store's open reason, which carries a Node `Error:` with an absolute path.
+  const corrupt = describeAuthorityCorruption(
+    "not-a-database: cannot open state store /tmp/ws/.rbox/state/state.db: Error: ENOENT: no such file or directory, open '/tmp/ws/.rbox/state/state.db'",
+  );
+  const whole = [corrupt.finding.problem, corrupt.finding.safety, ...corrupt.facts].join(" ");
+  expect(whole).not.toContain("ENOENT");
+  expect(whole).not.toContain("/tmp/ws");
+  expect(whole).not.toContain("Error:");
+  expect(corrupt.facts.join(" ")).toContain("rbox doctor --report");
+
+  // A SHORT authored detail is still worth showing — the guard is about shape,
+  // not about hiding everything.
+  const authored = describeAdmissionRefusal(ROOT, { code: "degraded-fence", detail: "identity-unavailable" });
+  expect(authored.facts.join(" ")).toContain("identity-unavailable");
+});
+
+test("the format-too-new barrier has copy, so it can never arrive as a stack trace", () => {
+  const report = describeFormatTooNew("/w/.rbox/state.json");
+  expect(report.ok).toBeFalse();
+  expect(report.finding.command).toBe("rbox upgrade");
+  expect(report.finding.safety).toContain("leave them alone");
 });
 
 test("source-oversize names the file's size against the cap, in that order", () => {

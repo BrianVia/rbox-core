@@ -21,7 +21,9 @@
  * gates in different files from each other, and the only thing a reader wants
  * from this module is to see every message rbox can print in one place. There is
  * no logic here to extract — the four `measured` renderers are the whole of it.
- * If it grows, the split to take is the glossary, not the tables.
+ * The glossary and `reserved-path`'s producer classes have since moved to
+ * `state-plane-detail-copy.ts` — the split this note named — which is why the
+ * remaining length is tables and nothing else.
  */
 import type { TriageFinding, TriageSeverity } from "./doctor-triage.js";
 import { formatDecimalBytes } from "./quota-format.js";
@@ -88,28 +90,6 @@ const diskMeasured = (halt: MigrationHalt): string | undefined => {
   return `This disk has ${have} free and the conversion needs about ${need}.`;
 };
 
-/**
- * The stable tokens the phase bodies put in `underlyingCode`, in plain English.
- *
- * They are a discriminator inside one halt code — `verification` alone covers
- * seven distinct refusals — so without this table a user is told "it didn't
- * match" and nothing more. Unknown values (an errno, a SQLite code, a detail
- * from a corruption halt) are rendered verbatim by the report module rather
- * than dropped: an unrecognised token is still evidence.
- */
-export const UNDERLYING_TOKEN_COPY: Readonly<Record<string, string>> = {
-  "staging-open": "the converted copy could not be opened for checking",
-  "authority-mismatch": "the converted copy was not stamped by this conversion",
-  "completion-tuple": "the converted copy's own record of what it imported did not match",
-  "semantic-digest": "a content fingerprint of the converted copy did not match the original",
-  "foreign-key-check": "the converted copy's internal links did not check out",
-  "integrity-check": "the converted copy failed its own database integrity check",
-  checkpoint: "the converted copy could not be settled onto the disk",
-  "not-at-rest": "the converted copy still had working files beside it",
-  "staging-inode": "the file being converted was not the one rbox recorded",
-  "staging-identity-absent": "the file being converted was gone",
-  "staging-identity-changed": "the file being converted was replaced while rbox was checking it",
-};
 
 /**
  * Exhaustive halt-code → copy map (design 222 §6.3).
@@ -337,6 +317,24 @@ export const STATE_UNREADABLE_COPY: OperatorCopy = {
     command: "rbox doctor",
   },
   machine: { id: "state-migration/source-unreadable", severity: "blocked" },
+};
+
+/**
+ * The one typed state-plane error with no other translation (wave 5B ride-along).
+ *
+ * `StateFormatTooNewError` is the 1.x fail-closed barrier: a binary that cannot
+ * read what is at the state path refuses rather than guessing. A 2.0 binary
+ * should never meet it — it understands the marker, and the operator commands
+ * read through the selecting seam — but "should never" is exactly the class of
+ * claim that reaches a user as a stack trace. Here it has copy, so it cannot.
+ */
+export const FORMAT_TOO_NEW_COPY: OperatorCopy = {
+  human: {
+    problem: "This workspace's sync records were written by a newer version of rbox than the one installed here.",
+    safety: "Nothing changed, and nothing was deleted. The newer rbox needs these records — leave them alone.",
+    command: "rbox upgrade",
+  },
+  machine: { id: "state-migration/format-too-new", severity: "blocked" },
 };
 
 /** 222 §6.4: never a halt, never offered a retry. The remedy is re-adoption, and

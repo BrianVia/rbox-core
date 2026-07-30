@@ -15,9 +15,13 @@
  */
 import {
   AUTHORITY_CORRUPT_COPY, GENESIS_REFUSAL_COPY, MIGRATION_DISPOSITION_COPY,
-  MIGRATION_HALT_COPY, MIGRATION_REFUSAL_COPY, STATE_UNREADABLE_COPY, UNDERLYING_TOKEN_COPY,
+  FORMAT_TOO_NEW_COPY, MIGRATION_HALT_COPY, MIGRATION_REFUSAL_COPY, STATE_UNREADABLE_COPY,
   type OperatorCopy, type OperatorFinding,
 } from "./state-plane-copy.js";
+import {
+  RESERVED_PATH_CLASS_COPY, RESERVED_PATH_TOKEN_COPY, UNDERLYING_TOKEN_COPY,
+  UNDERLYING_UNKNOWN_LINE, type ReservedPathClass,
+} from "./state-plane-detail-copy.js";
 import type { AuthorityOutcome } from "./state-plane/authority-bootstrap.js";
 import type { StatePlaneLockRefusal } from "./state-plane/locks.js";
 import type { GenesisOutcome } from "./state-plane/genesis.js";
@@ -53,25 +57,60 @@ const good = (id: string, outcome: string, problem: string, safety: string): Ope
   finding: { id, severity: "info", problem, safety },
 });
 
+/** An operating-system or SQLite error code, which reads as one. Anything else
+ * that is not a known token is a sentence rbox wrote for itself. */
+const looksLikeErrno = (raw: string): boolean => /^[A-Z][A-Z0-9_]{2,}$/.test(raw);
+
+/** `hasOwn`, not truthiness: `underlyingCode` comes off a durable record a
+ * tampered workspace controls, and a plain property lookup would resolve
+ * `constructor` or `toString` to something that is not copy at all. */
+const tokenCopy = (raw: string): string | undefined =>
+  Object.hasOwn(UNDERLYING_TOKEN_COPY, raw) ? UNDERLYING_TOKEN_COPY[raw] : undefined;
+
 /**
  * The condition inside a halt code, in plain English.
  *
- * `underlyingCode` is a stable token from the phase bodies, an errno, or — on
- * the corruption halts, which have no code of their own — a sentence. All three
- * are worth showing; only the first has a translation, and an unrecognised value
- * is quoted rather than dropped, because it is the only evidence of WHICH check
- * refused.
+ * `underlyingCode` is a stable token from the phase bodies, an errno, or — on the
+ * corruption halts, which have no code of their own — a sentence rbox wrote for
+ * itself. Only the first two are shown as themselves.
  */
 function underlyingFact(halt: MigrationHalt): string | undefined {
   const raw = halt.underlyingCode;
   if (raw === null || raw.trim() === "") return undefined;
-  // `hasOwn`, not truthiness: `underlyingCode` comes off a durable record a
-  // tampered workspace controls, and a plain property lookup would resolve
-  // `constructor` or `toString` to something that is not copy at all.
-  const known = Object.hasOwn(UNDERLYING_TOKEN_COPY, raw) ? UNDERLYING_TOKEN_COPY[raw] : undefined;
+  const known = tokenCopy(raw);
   if (known !== undefined) return `What rbox saw: ${known}.`;
-  if (/^[A-Z][A-Z0-9_]+$/.test(raw)) return `The system reported ${raw}.`;
-  return `What rbox saw: ${raw}${raw.endsWith(".") ? "" : "."}`;
+  if (looksLikeErrno(raw)) return `The system reported ${raw}.`;
+  // NEVER the raw string. It is a developer sentence — "no durable config stream
+  // to bind its reserve to" is what one producer stores — and the copy bar is
+  // four people, two of them non-technical. The detail stays in the record.
+  return UNDERLYING_UNKNOWN_LINE;
+}
+
+/**
+ * Which of `reserved-path`'s ~40 producers raised this one, to the resolution
+ * its remedy needs (see `RESERVED_PATH_CLASS_COPY`).
+ *
+ * Default `internal`, deliberately: a durable path-occupancy halt carries no
+ * discriminator, because the stable-token rule keeps prose out of the record. So
+ * an unclassified halt is told to send the report rather than pointed at a file
+ * list that, after the flip, includes the workspace's LIVE sync records.
+ */
+function reservedPathClass(halt: MigrationHalt): ReservedPathClass {
+  const raw = halt.underlyingCode;
+  if (raw === null || raw.trim() === "") return "internal";
+  if (looksLikeErrno(raw)) return "environment";
+  return tokenCopy(raw) === undefined ? "internal" : "path-occupied";
+}
+
+/** The copy one halt actually gets: the table row, unless `reserved-path`'s
+ * class or one of its named tokens has a truer one. */
+function haltCopy(halt: MigrationHalt): OperatorCopy {
+  if (halt.code !== "reserved-path") return MIGRATION_HALT_COPY[halt.code];
+  const token = halt.underlyingCode;
+  if (token !== null && Object.hasOwn(RESERVED_PATH_TOKEN_COPY, token)) {
+    return RESERVED_PATH_TOKEN_COPY[token]!;
+  }
+  return RESERVED_PATH_CLASS_COPY[reservedPathClass(halt)];
 }
 
 /**
@@ -81,6 +120,11 @@ function underlyingFact(halt: MigrationHalt): string | undefined {
  * second time — and taken from the live control only for the names that vary.
  * `verification` names the backup because that copy is the reassurance in its
  * safety line, and a reassurance the reader cannot locate is not one.
+ *
+ * `reserved-path` names a path ONLY in the `path-occupied` class. The blanket
+ * "rbox keeps this workspace's sync records in: …" list this replaced included
+ * the live `state.db` on every post-flip producer, under a command that told the
+ * reader to move things aside.
  */
 function namedPaths(root: string, halt: MigrationHalt, control: MigrationControl | undefined): string[] {
   if (halt.code === "verification") {
@@ -90,14 +134,9 @@ function namedPaths(root: string, halt: MigrationHalt, control: MigrationControl
       : migrationPaths.fixedBackup(root);
     return [`Your original records are saved at ${backup}`];
   }
-  if (halt.code !== "reserved-path") return [];
-  const files = [
-    sqliteResetPaths.authorityMarker(root),
-    sqliteResetPaths.active(root),
-    migrationPaths.reserve(root),
-    ...(control ? [control.stagingPath] : []),
-  ];
-  return [`rbox keeps this workspace's sync records in: ${[...new Set(files)].join(", ")}`];
+  if (halt.code !== "reserved-path" || reservedPathClass(halt) !== "path-occupied") return [];
+  // The one occupied path this class can name from the record it has.
+  return control ? [`The file is ${control.stagingPath}`] : [];
 }
 
 /** One halt, fully rendered. `durable` decides nothing about the words — a halt
@@ -107,7 +146,7 @@ export function describeMigrationHalt(
   root: string, halt: MigrationHalt, durableHalt: boolean,
   control: MigrationControl | undefined = readControl(root),
 ): OperatorReport {
-  const copy: OperatorCopy = MIGRATION_HALT_COPY[halt.code];
+  const copy: OperatorCopy = haltCopy(halt);
   const facts = [
     copy.human.measured?.(halt),
     underlyingFact(halt),
@@ -117,7 +156,18 @@ export function describeMigrationHalt(
   // `cleanup-deferred` is the one halt on a fully working workspace (222 §6.3,
   // ratified): the conversion is done and syncing normally, so it is not a
   // failure of the command that reported it.
-  return { ok: halt.code === "cleanup-deferred", outcome: `halted:${halt.code}`, finding: finding(copy), facts };
+  //
+  // The outcome carries the DISCRIMINATOR for the named `reserved-path` tokens,
+  // because `halted:reserved-path` is what forty different conditions would
+  // report and a script cannot branch on it.
+  const token = halt.underlyingCode;
+  const named = halt.code === "reserved-path" && token !== null && Object.hasOwn(RESERVED_PATH_TOKEN_COPY, token);
+  return {
+    ok: halt.code === "cleanup-deferred",
+    outcome: named ? `halted:${halt.code}:${token!}` : `halted:${halt.code}`,
+    finding: finding(copy),
+    facts,
+  };
 }
 
 function readControl(root: string): MigrationControl | undefined {
@@ -174,7 +224,7 @@ export function describeAdmissionRefusal(
     ? [`The file is ${migrationPaths.reserve(root)} (${refusal.detail}).`]
     : refusal.code === "barrier-witness-missing"
       ? []
-      : [`What rbox saw: ${refusal.detail}.`];
+      : [safeDetail(refusal.detail)];
   return { ok: false, outcome: `refused:${refusal.code}`, finding: finding(copy), facts };
 }
 
@@ -206,7 +256,7 @@ export function describeLockRefusal(refusal: StatePlaneLockRefusal): OperatorRep
     return {
       ok: false, outcome: "refused:degraded-fence",
       finding: finding(MIGRATION_REFUSAL_COPY["degraded-fence"]),
-      facts: [`What rbox saw: ${refusal.detail}.`],
+      facts: [safeDetail(refusal.detail)],
     };
   }
   const copy = MIGRATION_HALT_COPY["memory-admission"];
@@ -214,8 +264,9 @@ export function describeLockRefusal(refusal: StatePlaneLockRefusal): OperatorRep
     ok: false, outcome: "refused:memory-admission",
     finding: finding(copy),
     // Not a halt: this is measured while READING the workspace, before anything
-    // durable exists, so the numbers come from the refusal's own sentence.
-    facts: [`What rbox saw: ${refusal.detail}.`],
+    // durable exists, so the numbers come from the refusal's own sentence, which
+    // is authored copy naming its own limit rather than an exception message.
+    facts: [safeDetail(refusal.detail)],
   };
 }
 
@@ -253,7 +304,39 @@ export function describeUnreadableState(detail: string): OperatorReport {
   return {
     ok: false, outcome: "refused:source-unreadable",
     finding: finding(STATE_UNREADABLE_COPY),
-    facts: [`What rbox saw: ${detail}.`],
+    facts: [safeDetail(detail)],
+  };
+}
+
+/**
+ * A detail a user may read, from a string written for a developer.
+ *
+ * Exception messages compose: `StateAuthorityCorruptError`'s detail carries the
+ * store's open reason, which carries a Node `Error:` with an absolute path and an
+ * errno. Interpolating that into copy puts a stack-shaped string in front of the
+ * two non-technical users. A short, path-free, code-free detail is worth showing;
+ * anything else becomes the pointer at `rbox doctor --report`, where the whole
+ * thing is collected verbatim.
+ */
+function safeDetail(detail: string): string {
+  const trimmed = detail.trim();
+  const developerShaped = trimmed.length > 120
+    || /\bError\b|\bat \/|node_modules|[/\\](?:tmp|home|Users|var)[/\\]|\bE[A-Z]{3,}\b/.test(trimmed);
+  return developerShaped ? UNDERLYING_UNKNOWN_LINE : `What rbox saw: ${trimmed}${trimmed.endsWith(".") ? "" : "."}`;
+}
+
+/**
+ * The 1.x fail-closed barrier, met by a 2.0 binary that should never meet it.
+ *
+ * Believed unreachable from the operator commands — they read through the
+ * selecting seam — but "believed unreachable" is precisely how a stack trace
+ * reaches a non-developer, and this file exists to stop that.
+ */
+export function describeFormatTooNew(file: string): OperatorReport {
+  return {
+    ok: false, outcome: "refused:format-too-new",
+    finding: finding(FORMAT_TOO_NEW_COPY),
+    facts: [`The records are at ${file}.`],
   };
 }
 
@@ -262,7 +345,7 @@ export function describeAuthorityCorruption(detail: string): OperatorReport {
   return {
     ok: false, outcome: "authority-corrupt",
     finding: finding(AUTHORITY_CORRUPT_COPY),
-    facts: [`What rbox saw: ${detail}.`],
+    facts: [safeDetail(detail)],
   };
 }
 

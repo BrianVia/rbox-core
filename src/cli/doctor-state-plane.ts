@@ -24,7 +24,8 @@ import { loadRawState } from "./state-plane/adapters/whole-state-compat.js";
 import { readGenesisIntent } from "./state-plane/genesis-intent.js";
 import { readCanonicalControl } from "./state-plane/migration/control-publication.js";
 import { statePath } from "./state-plane/paths.js";
-import { describeMigrationHalt, renderOperatorReport } from "./state-plane-report.js";
+import { MIGRATION_STEP_COPY } from "./state-plane-copy.js";
+import { describeMigrationHalt } from "./state-plane-report.js";
 import {
   inspectStateReserve, StateAuthorityCorruptError, StateFormatTooNewError,
 } from "./state-plane/index.js";
@@ -131,16 +132,25 @@ export function checkStateMigration(root: string): DoctorCheck {
     };
   }
   if (control) {
+    // "Interrupted" would be a LIE while a conversion is running: doctor takes no
+    // lock, so an unhalted control is equally the record of a migration in
+    // progress in another process and one a crash abandoned. Doctor cannot tell
+    // them apart without the exclusivity it deliberately does not take, so it
+    // says what it observed — a conversion is part-way — and lets the remedy be
+    // safe in both readings. `rbox migrate` on a live one refuses
+    // `migration-not-exclusive`; on an abandoned one it resumes.
     return {
       ok: false,
       label: "migration",
-      status: "state-migration/interrupted",
-      message: "converting this workspace's sync records was interrupted partway through",
+      status: "state-migration/in-progress",
+      // The phase name is an internal noun; `MIGRATION_STEP_COPY` is the same
+      // fact in the words the progress renderer already uses.
+      message: `converting this workspace's sync records is part-way through — ${MIGRATION_STEP_COPY[control.witness.phase]}`,
       hint: "rbox migrate",
       finding: {
-        id: "state-migration/interrupted",
+        id: "state-migration/in-progress",
         severity: "attention",
-        problem: "rbox started converting this workspace's sync records to its current format and didn't finish.",
+        problem: "Converting this workspace's sync records to rbox's current format is part-way through. If nothing is running it, it stopped early.",
         safety: "Nothing was lost. The records rbox is using right now are the ones it was already using.",
         command: "rbox migrate",
       },

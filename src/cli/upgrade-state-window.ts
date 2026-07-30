@@ -17,10 +17,11 @@ import { ResetCorruptionError } from "./reset-io.js";
 import { WorkspaceSyncBusyError, WorkspaceSyncTimeoutError } from "./sync-mutex.js";
 import {
   describeAuthorityCorruption, describeAuthorityOutcome, describeLockRefusal,
-  describeUnreadableState, describeWorkspaceBusy, renderOperatorReport, type OperatorReport,
+  describeFormatTooNew, describeUnreadableState, describeWorkspaceBusy, renderOperatorReport,
+  type OperatorReport,
 } from "./state-plane-report.js";
 import { establishStateAuthority } from "./state-plane/authority-bootstrap.js";
-import { StateAuthorityCorruptError } from "./state-plane/errors.js";
+import { StateAuthorityCorruptError, StateFormatTooNewError } from "./state-plane/errors.js";
 import { withStatePlaneLocks } from "./state-plane/locks.js";
 import { runMigration } from "./state-plane/migration/authority.js";
 
@@ -50,12 +51,37 @@ const worthSaying = (outcome: string): boolean =>
   && outcome !== "genesis-already-established";
 
 /**
+ * The escape hatch out of that silence, and the reason `ok` is not a dead field.
+ *
+ * Suppressing every refusal outright means a workspace that is BLOCKED — the
+ * measured case is `memory-admission`, where a small-memory host cannot read the
+ * document at all — emits nothing from `rbox upgrade`, forever, on every
+ * upgrade. Doctor knows, but nobody runs doctor on a workspace they have no
+ * reason to suspect.
+ *
+ * So a blocked refusal gets ONE line, not its paragraph. `severity` is the
+ * discriminator rather than `ok`, because `ok` is also false for the routine
+ * pre-B0 states: `barrier-witness-missing` is `info` and describes every
+ * workspace on the fleet until it syncs once, and a line per workspace per
+ * upgrade for a self-clearing condition is the noise this policy exists to
+ * prevent.
+ */
+const quietSummary = (report: OperatorReport, key: string): string[] =>
+  // Genesis refusals are excluded on top of the severity test. `evidence-missing`
+  // is `blocked` and correctly so for `rbox migrate` — the user asked and got
+  // nothing — but during an upgrade it means "this directory is not a workspace
+  // rbox sets up", which is not a conversion that is stuck.
+  report.finding.severity === "blocked" && !report.outcome.startsWith("genesis-refused:")
+    ? [`daemon ${key}: sync records not converted — ${report.finding.problem} Run rbox doctor here.`]
+    : [];
+
+/**
  * Convert this workspace's sync records, if they need it, while its daemon is
  * stopped. Never throws.
  */
 export async function migrateStateInUpgradeWindow(root: string, key: string): Promise<StateWindowOutcome> {
   const report = await observe(root);
-  if (!worthSaying(report.outcome)) return { ok: report.ok, lines: [] };
+  if (!worthSaying(report.outcome)) return { ok: report.ok, lines: quietSummary(report, key) };
   return { ok: report.ok, lines: renderOperatorReport(report).map((line) => `daemon ${key}: ${line}`) };
 }
 
@@ -68,6 +94,7 @@ async function observe(root: string): Promise<OperatorReport> {
     return outcome.held ? outcome.value : describeLockRefusal(outcome.refusal);
   } catch (error) {
     if (error instanceof StateAuthorityCorruptError) return describeAuthorityCorruption(error.detail);
+    if (error instanceof StateFormatTooNewError) return describeFormatTooNew(error.file);
     if (error instanceof WorkspaceSyncBusyError || error instanceof WorkspaceSyncTimeoutError) {
       return describeWorkspaceBusy();
     }
@@ -83,7 +110,12 @@ function describeUnexpected(error: unknown): OperatorReport {
   return {
     ok: false,
     outcome: "unexpected",
-    facts: [`What rbox saw: ${error instanceof Error ? error.message : String(error)}.`],
+    // The MESSAGE is deliberately not interpolated. This branch exists for
+    // defects, so the string is whatever threw — a Node `Error:` with an
+    // absolute path and an errno is the likely shape, and that is not copy.
+    // `rbox doctor --report` collects it; `error` is named so the argument is
+    // not silently unused.
+    facts: [`rbox recorded what stopped it (${error instanceof Error ? error.name : "unknown failure"}); \`rbox doctor --report\` collects the details.`],
     finding: {
       id: "state-migration/unexpected",
       severity: "attention",

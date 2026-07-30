@@ -431,7 +431,10 @@ const EXPECTED_ENTRY_LITERAL_SITES: Readonly<Record<string, string>> = {
  * gate that counted import lines would report two sites for one call.
  */
 const productionHits = (pattern: string, ...exclude: string[]): string[] =>
-  gitGrep(pattern, "src", ":!*.test.ts")
+  // `scripts` as well as `src`: the snapshot-replay harness is production-shaped
+  // code that reaches the coordinator, and until wave 5B's ride-along the gate
+  // could not see it — a third entry site could have lived there indefinitely.
+  gitGrep(pattern, "src", "scripts", ":!*.test.ts")
     .filter((line) => !exclude.some((prefix) => line.startsWith(`${prefix}:`)))
     .filter((line) => {
       const body = line.split(":").slice(2).join(":").trim();
@@ -478,6 +481,46 @@ test("each entry-point name is constructed in exactly one production module", ()
     // site the exclusivity argument was never made about.
     expect([...new Set(hits.map((line) => line.split(":")[0]!))], literal).toEqual([file]);
   }
+});
+
+/**
+ * Conjunct 4 — the IMPORTERS, which is the conjunct the other three cannot make.
+ *
+ * Every check above greps for a NAME. A module that imports the coordinator and
+ * calls it through an alias, a re-export, or a value it stored first satisfies
+ * all of them while being a third entry site. An import SPECIFIER cannot be
+ * computed — `from "…/authority-bootstrap.js"` is a static string or it is not an
+ * import — so the set of modules that can reach `establishStateAuthority` at all
+ * is exactly enumerable, and that is the claim §7.9 is really making.
+ *
+ * §7.9's named exception — `whole-state-compat.ts` taking `assertAuthorityWritable`
+ * "and nothing else from either domain" — is absent from this list ON PURPOSE:
+ * it reaches the coordinator through a DYNAMIC import, which keeps `bun:sqlite`
+ * out of the CLI's eager graph. That is also the one shape this gate cannot see,
+ * so it is stated here rather than silently missing, and the sole-writer gate
+ * beside it is what covers that module.
+ */
+const EXPECTED_IMPORTERS: readonly string[] = [
+  "src/cli/state-plane-cmd.ts",      // entry B
+  "src/cli/state-plane-report.ts",   // `AuthorityOutcome`, a type — erased, calls nothing
+  "src/cli/upgrade-state-window.ts", // entry A
+];
+
+test("only the enumerated modules can reach the coordinator at all", () => {
+  // Deliberately NOT `productionHits`, which strips import lines so the
+  // call-site gates cannot count a name brought into scope as a call. Here the
+  // import line IS the evidence.
+  const importers = gitGrep("from \"[^\"]*authority-bootstrap\\.js\"", "src", "scripts", ":!*.test.ts")
+    .map((line) => line.split(":")[0]!);
+  const unexpected = [...new Set(importers)].filter((file) => !EXPECTED_IMPORTERS.includes(file));
+  expect(
+    unexpected,
+    "a module that imports the coordinator can call it through an alias the name-based gates cannot see",
+  ).toEqual([]);
+
+  // The two entry sites must be among them, or the enumeration is describing a
+  // graph the entry sites are not in.
+  for (const site of EXPECTED_SITES) expect([...new Set(importers)]).toContain(site);
 });
 
 test("the halt clear has exactly one production authorization site", () => {

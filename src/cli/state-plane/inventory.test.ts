@@ -71,7 +71,11 @@ const ENTRY_POINTS: readonly EntryPoint[] = [
   // legacy document, so the repositories it covers are the same set in either
   // format. It used to classify and refuse instead, which made every lock bundle
   // unobtainable on a workspace rbox had just migrated.
-  { file: "src/cli/state-plane/locks.ts", symbol: "inspectInventory", kind: "read", sites: 0, guards: ["loadRawState"] },
+  //
+  // It classifies FIRST and only then reads, because the `M5 + Q` row requires the
+  // database to be at rest and an open here would deposit the sidecars that row
+  // reads as corruption. The classify is the extra access site.
+  { file: "src/cli/state-plane/locks.ts", symbol: "inspectInventory", kind: "read", sites: 2, guards: ["classifyStateFormat", "loadRawState"] },
   { file: "src/cli/state-plane/migration/admission.ts", symbol: "barrierWitness", kind: "read", sites: 1, guards: ["verifyLastWriterWitness"] },
   // The migration classifier's sole reader of the document. It must handle the
   // marker rather than refuse it, so its guard is the classifier that decides

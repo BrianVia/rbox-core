@@ -126,16 +126,56 @@ test("migrate converts a workspace, then reports cleanly when run again on its o
   expect(again.lines.join(" ")).not.toMatch(/newer version of rbox|StateFormatTooNew/);
 });
 
-test("abort after the flip refuses rather than half-serving a downgrade", async () => {
+test("abort after the flip refuses on its own identity, not merely with a non-zero exit", async () => {
   // 222 §7.3: post-`Q` there is no abort, and `halt-recovery.ts` is what refuses.
-  // What 5B owns is that the refusal arrives as copy with a next step.
+  //
+  // The first version of this test asserted `code === 1` and the presence of a
+  // `Next:` line — both of which the FALL-THROUGH also produces, so deleting the
+  // guard left it green. It now asserts the machine identity, which only the
+  // guard can produce. The other three rows are covered against real records in
+  // `authority-behavior.test.ts`; this is the surface half.
   const root = await workspace("rbox-operator-post-q-abort-");
   expect((await run(migrateCmd, root)).code).toBe(0);
 
-  const { code, lines } = await run(abortStateMigrationCmd, root);
+  const { code, lines } = await run(abortStateMigrationCmd, root, true);
   expect(code).toBe(1);
-  expect(lines.some((line) => line.startsWith("Next: "))).toBeTrue();
-  expect(lines.join(" ")).not.toContain("Error:");
+  const parsed = JSON.parse(lines[0]!) as Record<string, unknown>;
+  expect(parsed.outcome).toBe("halted:reserved-path:abort-after-flip");
+  expect(parsed.id).toBe("state-migration/abort-after-flip");
+  // And it reads as what it is, not as the catch-all's generic sentence.
+  expect(String(parsed.problem)).toContain("already been converted");
+  expect(String(parsed.command)).toContain("rbox adopt");
+
+  const human = await run(abortStateMigrationCmd, root);
+  expect(human.lines.some((line) => line.startsWith("Next: "))).toBeTrue();
+  expect(human.lines.join(" ")).not.toMatch(/\bat \/|node_modules|Error:/);
+});
+
+test("the 5-second progress rule is real: silence under it, one plain-English line past it", async () => {
+  // 222 §6.4 — "the `migrating` state renders in plain English past 5 s per
+  // phase". The threshold seam existed for this and no test used it, so the rule
+  // was unverified in both directions: a build that printed on every event and one
+  // that never printed would both have passed.
+  const quiet = await workspace("rbox-operator-progress-quiet-");
+  const quietLines: string[] = [];
+  // A clock that never advances: no phase can exceed the threshold.
+  await migrateCmd(quiet, { log: (line) => quietLines.push(line), now: () => 0 });
+  expect(quietLines.filter((line) => line.startsWith("still "))).toEqual([]);
+
+  const slow = await workspace("rbox-operator-progress-slow-");
+  const slowLines: string[] = [];
+  let ticks = 0;
+  // A clock that jumps a minute per reading: every phase is over the threshold.
+  await migrateCmd(slow, { log: (line) => slowLines.push(line), now: () => (ticks += 60_000) });
+  const announced = slowLines.filter((line) => line.startsWith("still "));
+  expect(announced.length).toBeGreaterThan(0);
+  for (const line of announced) {
+    expect(line).not.toMatch(/\bM[0-7]\b/);      // never a phase name
+    expect(line.endsWith("…")).toBeTrue();
+  }
+  // Both runs still converted: progress rendering is not part of the outcome.
+  expect(quietLines.join(" ")).toContain("new format");
+  expect(slowLines.join(" ")).toContain("new format");
 });
 
 test("--json emits one parseable object with a stable id, and prints no prose beside it", async () => {
