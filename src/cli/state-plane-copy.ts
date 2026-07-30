@@ -14,6 +14,14 @@
  *
  * Two standing prohibitions from 163: never advise deleting the authority
  * marker, and never advise restoring a backup.
+ *
+ * REVIEW NOTE (163's 301–399 nonblank band). The length is table literals: four
+ * closed maps whose row count is fixed by the unions they satisfy, plus one
+ * glossary. Splitting them by domain would put the `satisfies Record<…>` merge
+ * gates in different files from each other, and the only thing a reader wants
+ * from this module is to see every message rbox can print in one place. There is
+ * no logic here to extract — the four `measured` renderers are the whole of it.
+ * If it grows, the split to take is the glossary, not the tables.
  */
 import type { TriageFinding, TriageSeverity } from "./doctor-triage.js";
 import { formatDecimalBytes } from "./quota-format.js";
@@ -180,7 +188,7 @@ export const MIGRATION_HALT_COPY = {
     human: {
       problem: "rbox stopped because the files it keeps this workspace's sync records in weren't the ones it expected.",
       safety: "Nothing was deleted, moved, or overwritten. Your files and your sync are unaffected.",
-      command: "check the file named below; move anything that isn't rbox's aside yourself, then run `rbox migrate`",
+      command: "look at the files listed above; move anything rbox didn't write aside yourself, then run `rbox migrate`",
     },
     machine: { id: "state-migration/reserved-path", severity: "blocked" },
   },
@@ -243,7 +251,7 @@ export const MIGRATION_REFUSAL_COPY = {
     human: {
       problem: "A file rbox keeps as spare room doesn't look like one rbox wrote, so it left the file alone.",
       safety: "Nothing was deleted, claimed, or changed.",
-      command: "check the file named below; move it aside yourself, then run `rbox migrate`",
+      command: "look at the file named above; move it aside yourself, then run `rbox migrate`",
     },
     machine: { id: "state-migration/reserve-foreign", severity: "attention" },
   },
@@ -263,7 +271,7 @@ export const GENESIS_REFUSAL_COPY = {
     human: {
       problem: "There's already something where rbox keeps this workspace's sync records, so rbox didn't start fresh.",
       safety: "Nothing was deleted or overwritten.",
-      command: "check the file named below; move it aside yourself, then run `rbox migrate`",
+      command: "look at the file named above; move it aside yourself, then run `rbox migrate`",
     },
     machine: { id: "state-genesis/artifact-present", severity: "blocked" },
   },

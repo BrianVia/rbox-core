@@ -121,7 +121,11 @@ export function checkStateMigration(root: string): DoctorCheck {
       ok: report.ok,
       label: "migration",
       status: report.finding.id,
-      message: renderOperatorReport(report).join(" "),
+      // The check LINE carries what happened plus the facts it names; the safety
+      // answer and the one command belong to the triage finding, which is the
+      // surface a non-developer actually reads. Duplicating them into a
+      // paragraph-long check line would push the other checks off the screen.
+      message: [report.finding.problem, ...report.facts].join(" "),
       ...(report.finding.command === undefined ? {} : { hint: report.finding.command }),
       finding: report.finding,
     };

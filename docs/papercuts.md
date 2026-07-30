@@ -489,3 +489,36 @@ behind-origin count; loudly warn when behind.
   witness off a durable record, at least one test must feed it a control that
   round-tripped through the real codec. In-memory fixtures cannot see key order,
   number spelling, or anything else canonicalization normalizes.
+
+- **A test that sets `process.env.RBOX_HOME` at module load poisons every other
+  suite in the process (2026-07-30, u3/5b):** `state-plane-cmd.test.ts` copied a
+  pattern from `migration/admission.test.ts` — a top-level
+  `process.env.RBOX_HOME = await fs.mkdtemp(...)` to keep daemon pid records out
+  of the real home — and turned **56 tests in `credentials.test.ts` and
+  `auth-cmd.test.ts` red** in the full-suite run while both files passed in
+  isolation. One of them is literally named "RBOX_HOME isolates the credential
+  store while HOME stays untouched (#505)". Cost ~15 minutes and one false
+  "56 pre-existing environmental failures" conclusion. Fix hints: (a) a suite
+  whose failures vanish when the file is run alone is cross-test state, never
+  environment — check env mutation before blaming the host; (b) don't override
+  an env var for a code path that only READS the location; (c) the existing
+  in-tree copies of this pattern are latent versions of the same bug.
+
+- **The gate that pinned "exactly two entry sites" at zero could have been
+  satisfied by one (2026-07-30, u3/5b):** `authority.test.ts` compared a list of
+  admitted FILES, so adding a single call site and updating the list to one entry
+  would have passed a gate whose stated claim is "exactly two". The wave's own
+  brief had to warn "don't be that", which is the tell: a gate that needs a prose
+  warning is under-specified. It now asserts three conjuncts — the file set, one
+  call per file, and one construction site per `EntryPoint` literal. Fix hint: a
+  structural gate over a numbered claim must assert the NUMBER, not a list whose
+  length the next author edits in the same commit as the violation.
+
+- **`git grep`-based structural gates silently pass for untracked new files
+  (2026-07-30, u3/5b):** the §7.9 entry-site gate reported zero call sites for
+  brand-new modules that plainly contained them, because `git grep` only searches
+  the index. A gate whose whole job is to catch a NEW caller is blind to exactly
+  the shape it exists to catch until someone runs `git add`. Fix hint: either
+  `git add -A` before trusting a `git grep` gate locally, or have the gate walk
+  the filesystem. CI never sees this because everything is committed there —
+  which is worse, not better: the gate is weakest in the loop where it is used.

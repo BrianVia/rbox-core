@@ -173,6 +173,35 @@ function advanceToIntent(root: string, from: MigrationControl, role: string): Mi
 const roles = (control: MigrationControl): string[] =>
   (control.retirement?.cursor.items ?? []).map((item: ArtifactItem) => item.role);
 
+/**
+ * The remedy a halted retirement hands the operator (wave 5B).
+ *
+ * `stepRetirement` refuses a halted cursor with a detail that rides in
+ * `underlyingCode`, and wave 5B renders that field VERBATIM to the user. It used
+ * to say "resumes only through doctor", which reached a non-developer as
+ * `rbox doctor` — a command that prints the halt again and changes nothing.
+ * 163:3461 makes `--retry-state-migration` the only thing that clears a halt, so
+ * the string has to name it.
+ */
+test("a halted retirement's refusal names the flag that actually clears a halt", () => {
+  const f = fixture("M5");
+  const armed = arm(f);
+  const halted = publishMigrationControl(
+    f.root, { migrationId: armed.migrationId, revision: armed.controlRevision },
+    {
+      ...armed, controlRevision: armed.controlRevision + 1,
+      halt: { code: "filesystem-full", underlyingCode: "ENOSPC", required: null, available: null },
+    },
+    locks,
+  );
+  const step = stepRetirement(f.root, receipt(halted), locks);
+  expect(step.kind).toBe("corrupt");
+  if (step.kind !== "corrupt") throw new Error("expected a corrupt step");
+  expect(step.halt.underlyingCode).toContain("--retry-state-migration");
+  // The bare surface is what the old string said, and it is not an action.
+  expect(step.halt.underlyingCode).not.toMatch(/through doctor$/);
+});
+
 describe("arming a source-change retirement", () => {
   test("M5 arms the fixed-role vector in 163's order and deletes nothing yet", () => {
     const f = fixture("M5");

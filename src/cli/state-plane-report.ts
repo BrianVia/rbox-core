@@ -65,8 +65,11 @@ const good = (id: string, outcome: string, problem: string, safety: string): Ope
 function underlyingFact(halt: MigrationHalt): string | undefined {
   const raw = halt.underlyingCode;
   if (raw === null || raw.trim() === "") return undefined;
-  const known = UNDERLYING_TOKEN_COPY[raw];
-  if (known) return `What rbox saw: ${known}.`;
+  // `hasOwn`, not truthiness: `underlyingCode` comes off a durable record a
+  // tampered workspace controls, and a plain property lookup would resolve
+  // `constructor` or `toString` to something that is not copy at all.
+  const known = Object.hasOwn(UNDERLYING_TOKEN_COPY, raw) ? UNDERLYING_TOKEN_COPY[raw] : undefined;
+  if (known !== undefined) return `What rbox saw: ${known}.`;
   if (/^[A-Z][A-Z0-9_]+$/.test(raw)) return `The system reported ${raw}.`;
   return `What rbox saw: ${raw}${raw.endsWith(".") ? "" : "."}`;
 }

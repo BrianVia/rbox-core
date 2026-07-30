@@ -18,8 +18,10 @@ import { checkState, checkStateMigration } from "./doctor-state-plane.js";
 import { saveStateUnsafeLegacyOrTest } from "./sync-state-store.js";
 import { abortStateMigrationCmd, migrateCmd, retryStateMigrationCmd } from "./state-plane-cmd.js";
 
-// Keep the daemon pid records this suite's admission reads out of the real home.
-process.env.RBOX_HOME = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-operator-home-"));
+// Deliberately no `RBOX_HOME` override: M0's liveness condition only READS the
+// daemon pid records under it, and mutating a process-wide env var at module load
+// leaks into every other suite in the same bun process — `credentials.test.ts`
+// asserts exactly that isolation.
 
 /** A bound workspace carrying legacy sync records, published WITHOUT the
  * last-writer witness M0 requires — which is the shape 222 §6.1's
