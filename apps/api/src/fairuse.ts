@@ -637,9 +637,17 @@ async function materializeGroupRefs(
  * never computes history, and a bound derived from an uncomputed history is fabricated
  * (it would also read the PRE-update active_bytes, since every SET in one UPDATE
  * evaluates against the old row).
+ *
+ * §228: it is also the SINGLE writer of `accounts.history_overhang_bytes` — the
+ * measured ledger bytes rbox stores but does not bill. The two statements run as one
+ * D1 batch (one transaction, applied in order), so the second sees the active_bytes
+ * the first just wrote, and its EXISTS makes it a no-op whenever the guarded
+ * completion did not apply (lost lease, stale epoch). `used_bytes` is read here at
+ * completion rather than at capture: that briefly forgives bytes uploaded during the
+ * pass, which errs toward not blocking a customer and self-corrects next epoch.
  */
 async function completeScan(db: D1Database, scan: ScanRow, leaseValue: string, nowMs: number): Promise<"incomplete" | "advanced"> {
-  const completed = await db.prepare(
+  const [completed] = await db.batch([db.prepare(
     `UPDATE fairuse_scans SET status='complete',completed_at=?,updated_at=?,bound_bytes=0,pruning_active=0,
        history_computed=0,
        active_bytes=(SELECT COALESCE(SUM(t.active_bytes),0) FROM fairuse_workspace_group_totals t
@@ -675,8 +683,16 @@ async function completeScan(db: D1Database, scan: ScanRow, leaseValue: string, n
            AND NOT EXISTS(
              SELECT 1 FROM fairuse_workspace_group_totals t WHERE t.account_id=ws.account_id
                AND t.epoch=ws.epoch AND t.workspace_id=ws.workspace_id))`,
-  ).bind(nowMs, nowMs, scan.account_id, scan.epoch, scan.status, scan.plan_snapshot, leaseValue).run();
-  return Number(completed.meta.changes ?? 0) === 1 ? "advanced" : "incomplete";
+  ).bind(nowMs, nowMs, scan.account_id, scan.epoch, scan.status, scan.plan_snapshot, leaseValue),
+  db.prepare(
+    `UPDATE accounts SET history_overhang_bytes=MAX(0, used_bytes - COALESCE(
+       (SELECT s.active_bytes FROM fairuse_scans s
+         WHERE s.account_id=? AND s.epoch=? AND s.status='complete' AND s.completed_at=?), used_bytes))
+     WHERE id=? AND EXISTS(
+       SELECT 1 FROM fairuse_scans s
+        WHERE s.account_id=? AND s.epoch=? AND s.status='complete' AND s.completed_at=?)`,
+  ).bind(scan.account_id, scan.epoch, nowMs, scan.account_id, scan.account_id, scan.epoch, nowMs)]);
+  return Number(completed?.meta.changes ?? 0) === 1 ? "advanced" : "incomplete";
 }
 
 /** Delete at most one 600-row relation page. The aborted scan row remains as audit evidence.

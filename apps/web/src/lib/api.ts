@@ -10,6 +10,10 @@ export interface Usage {
 	// rows, non-Stripe admin-set plans) — treat as monthly for display.
 	interval?: 'monthly' | 'annual' | null;
 	usedBytes: number;
+	// §228: when usedBytes was measured (epoch ms), or null when it has not been
+	// measured yet. Measurement runs about once an hour, so the number is normally a
+	// few minutes old; we show its age rather than hiding it.
+	measuredAt?: number | null;
 	storageCap: number | null; // null = unlimited
 	workspaces: number;
 	workspaceCap: number | null; // null = unlimited

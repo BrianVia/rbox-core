@@ -369,6 +369,46 @@ describe("design 225 active bytes at head", () => {
     });
   });
 
+  test("design 228: completion records the ledger bytes we measured but do not bill", async () => {
+    const accountId = "acct_000_fairuse_overhang";
+    const ws = "ws_overhang";
+    const manifest = sha(0x900_100);
+    await seedAccount(accountId, [{ ws, proj: "root" }], [{ sha: manifest, size: 64 }]);
+    // The ledger says 500 bytes are entitled; only the 64-byte manifest is live at head.
+    await db().prepare("UPDATE accounts SET used_bytes=500 WHERE id=?").bind(accountId).run();
+    expect(await drive(scanningEnv({ [`${ws}/root`]: project({ encManifestSha: manifest }) }, log()), accountId)).toBe("complete");
+
+    expect(await completedScan(accountId)).toMatchObject({ active_bytes: 64 });
+    // used_bytes itself is untouched — the ledger is still the ledger and still the
+    // admission input; only the allowance moved.
+    expect(await db().prepare("SELECT used_bytes,history_overhang_bytes FROM accounts WHERE id=?").bind(accountId)
+      .first<{ used_bytes: number; history_overhang_bytes: number }>())
+      .toEqual({ used_bytes: 500, history_overhang_bytes: 436 });
+    const response = await usage(env, { accountId, deviceId: "dev", userId: "user", role: "owner", kind: "device" });
+    expect(await response.json()).toMatchObject({ usedBytes: 64, measuredAt: NOW });
+  });
+
+  test("design 228: an aborted epoch leaves the previous measurement standing", async () => {
+    const accountId = "acct_000_fairuse_overhang_abort";
+    const ws = "ws_overhang_abort";
+    const manifest = sha(0x900_101);
+    const refs = Array.from({ length: 12 }, (_, index) => ({ sha: sha(0x1f0 + index), size: 1 }));
+    await seedAccount(accountId, [{ ws, proj: "root" }], [...refs, { sha: manifest, size: 5 }]);
+    await db().prepare("UPDATE accounts SET used_bytes=500,history_overhang_bytes=400 WHERE id=?").bind(accountId).run();
+    const state = project({ encManifestSha: manifest, refMode: { kind: "inline", refShas: refs.map((r) => r.sha) } });
+    const fakeEnv = scanningEnv({ [`${ws}/root`]: state }, log());
+    const tuning: FairUseTuning = { entitlementPage: 1, pagesPerTick: 1 };
+
+    await runFairUseObservation(fakeEnv, NOW, tuning);
+    await db().prepare("INSERT INTO workspaces(workspace_id,project_id,account_id,created_at) VALUES(?,'root',?,?)")
+      .bind("ws_overhang_abort_new", accountId, NOW + 1).run();
+    await runFairUseObservation(fakeEnv, NOW, tuning);
+
+    expect((await scan(accountId))?.status).toBe("aborted_pins");
+    expect(await db().prepare("SELECT history_overhang_bytes FROM accounts WHERE id=?").bind(accountId)
+      .first<{ history_overhang_bytes: number }>()).toEqual({ history_overhang_bytes: 400 });
+  });
+
   test("a MISSING sidecar is stale (retries against the re-read head); a corrupt one aborts", async () => {
     const accountId = "acct_000_fairuse_stale";
     const ws = "ws_stale";

@@ -144,6 +144,20 @@
 	const pct = $derived(
 		usage && usage.storageCap ? Math.min(100, (usage.usedBytes / usage.storageCap) * 100) : 0
 	);
+	// §228: storage is what we bill — the space your current files take up. Superseded
+	// history is kept but never counted. It is measured about once an hour, so we say
+	// how fresh the number is instead of implying it is live.
+	const measured = $derived.by(() => {
+		const at = usage?.measuredAt;
+		if (typeof at !== 'number') return 'Still being measured';
+		const minutes = Math.max(0, Math.round((Date.now() - at) / 60_000));
+		if (minutes < 1) return 'Measured just now';
+		if (minutes < 60) return `Measured ${minutes} minute${minutes === 1 ? '' : 's'} ago`;
+		const hours = Math.round(minutes / 60);
+		if (hours < 24) return `Measured ${hours} hour${hours === 1 ? '' : 's'} ago`;
+		const days = Math.round(hours / 24);
+		return `Measured ${days} day${days === 1 ? '' : 's'} ago`;
+	});
 </script>
 
 <PageHeader title="Overview" description="Your plan, usage, and account at a glance." />
@@ -193,6 +207,7 @@
 					{#if usage.storageCap !== null}
 						<Progress value={pct} class="mt-2.5 h-2" />
 					{/if}
+					<div class="mt-2 text-xs text-muted-foreground">{measured}</div>
 				</div>
 
 				<Separator class="my-5" />

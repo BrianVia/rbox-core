@@ -45,6 +45,31 @@ export function capBytesFor(plan: string | null | undefined, extraStorageBytes =
 }
 
 /**
+ * §228: THE number rbox bills, shows and compares against the plan cap.
+ *
+ * `accounts.used_bytes` is the live entitlement ledger — every ref the account has
+ * uploaded and not had pruned, including superseded history. The founder ruling is
+ * that history is stored but never billed, so the billable number subtracts the
+ * measured history overhang written by the fair-use scan's completion
+ * (`fairuse.ts` completeScan, the single writer of `history_overhang_bytes`):
+ *
+ *   billable = active_bytes(last completed scan) + net ledger delta since that scan
+ *
+ * Overhang 0 (the column default, i.e. no scan has ever completed) makes this the
+ * identity — the fallback is exactly today's behaviour, labelled as unmeasured by
+ * `usage()`'s `measuredAt: null`. Clamped at 0 because GC can prune the ledger
+ * below a standing overhang between hourly scans; a negative allowance is never
+ * meaningful. Kept in lockstep with BILLABLE_BYTES_SQL, which the D1 cap-guard
+ * trigger (migration 0036) evaluates on the same two columns.
+ */
+export function billableBytes(usedBytes: number | null | undefined, historyOverhangBytes: number | null | undefined): number {
+  return Math.max(0, Number(usedBytes ?? 0) - Number(historyOverhangBytes ?? 0));
+}
+
+/** SQL form of `billableBytes` over an `accounts` row. */
+export const BILLABLE_BYTES_SQL = "MAX(0, used_bytes - history_overhang_bytes)";
+
+/**
  * Approximate list price per paid plan, in USD cents/month (from docs/pricing.md).
  * Used ONLY for the admin cockpit's D1-derived MRR ESTIMATE (subscription counts ×
  * list price). It is intentionally a rough number — the authoritative figure is the

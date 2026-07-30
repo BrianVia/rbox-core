@@ -60,11 +60,23 @@ describe("rbox usage", () => {
     await usageCmd();
     const out = logs[0]!;
     expect(out).toContain("plan:       no active plan");
-    expect(out).toContain("storage:    ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  1 B / 1 B   (100%, read-only)");
+    expect(out).toContain("storage:    ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  1 B / 1 B   (100%, still being measured, read-only)");
     expect(out).toContain("workspaces: 1 / 1");
     expect(out).toContain("retention:  0 days (current state only)");
     expect(out).not.toContain("grace:");
     expect(out).toContain("read-only:  yes (over quota or subscription lapsed — pushes are blocked)");
+  });
+
+  test("storage carries the age of the measurement it came from", async () => {
+    const now = Date.now();
+    stub(JSON.stringify({ ...dto, measuredAt: now - 41 * 60_000, readOnly: false }));
+    await usageCmd();
+    expect(logs[0]!).toContain("(100%, measured 41 minutes ago)");
+
+    logs.length = 0;
+    stub(JSON.stringify({ ...dto, measuredAt: now - 3 * 3600_000, readOnly: false }));
+    await usageCmd();
+    expect(logs[0]!).toContain("(100%, measured 3 hours ago)");
   });
 
   test("human render explains an active billing grace period", async () => {
