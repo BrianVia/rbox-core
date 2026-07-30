@@ -179,7 +179,12 @@ async function makeDaemon(
   cfgOverrides: Partial<WorkspaceConfig> = {},
 ): Promise<DaemonInternals> {
   const cfg = testConfig(cfgOverrides);
-  const daemon = new RboxDaemon(root, cfg, { remote, backoff: async () => {} }, { bootId, keyDeliveryFlight: null, ...opts }) as unknown as DaemonInternals;
+  // A recorded push/pull failure re-queues its own operation and arms the standing
+  // recovery probe with a full-jitter delay whose floor is 0ms (design 178 B). On the
+  // real clock that timer can fire inside a test's own remaining awaits and land an
+  // extra probe before it asserts, so no test here gets one it did not ask for: a
+  // probe fires only when the test fires this clock or sets `recoveryDue`.
+  const daemon = new RboxDaemon(root, cfg, { remote, backoff: async () => {} }, { bootId, keyDeliveryFlight: null, recoveryClock: new ManualRecoveryClock(), ...opts }) as unknown as DaemonInternals;
   daemons.push(daemon);
   daemon.cache = await HashCache.load(root);
   daemon.local.head = await scanManifest(root);

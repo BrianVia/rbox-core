@@ -445,3 +445,49 @@ removed; the redacted result is retained at
 - **Generalizes to the whole Workers suite**: one D1 is shared across every
   file in a shard, so any test whose subject reads a table **globally** must
   neutralize rows it did not create, not merely clean up its own.
+
+## src/cli/daemon/daemon-activity.test.ts — "CommitRejectedError %s records a typed terminal push halt" (FIXED)
+
+- 2026-07-30: the `body_too_large` case failed on CI shard 1/6 (run
+  30509121641, job 90765211048, attempt 1) on PR #609, whose diff touched only
+  `scripts/snapshot-replay/` and one tsconfig line. The `too_many_refs` case of
+  the same `test.each` passed in the same process. Green on rerun and locally.
+- Attempt-1 evidence — `daemon-activity.test.ts:1271`
+  (`expect(remote.commitCalls).toBe(1)`) received `2`, with exactly one
+  `pump op blocked: commit request is too large for the server` log line: the
+  second commit was still in flight, not a second completed operation. The
+  failing case burned 49.41ms against the sibling's 33.03ms.
+- Root cause: the test drove the **real** recovery clock. `recordRecoveryFailure`
+  re-queues the failed operation (`scheduler.queue(op)`) and arms the standing
+  probe from `recoveryProbeDelayMs(1, Math.random)` — design 178 B full jitter,
+  `floor(random() * 5000)`, whose **floor is 0ms**. `makeDaemon` injected
+  neither `recoveryClock` nor `recoveryRandom`, so ~1 draw in 300 lands a delay
+  short enough to elapse inside the test's own remaining awaits (the activity
+  write, `loadActivity`, `readShellLine`). The timer callback calls `wake()` →
+  `pump()` → a recovery-probe push → a second `commit`. Nothing about the halt
+  classification was wrong, and CI load only widens the window.
+- Reproduced deterministically on the unfixed tree: `recoveryRandom: () => 0`
+  plus `await sleep(25)` before the assertion → `commitCalls` 6, both cases.
+- Fix: one option in the existing `makeDaemon` — default
+  `recoveryClock: new ManualRecoveryClock()` (the PR #403 / 178 B seam already
+  in this file), placed before `...opts` so the three tests that fire the clock
+  themselves still override it. A probe now runs only when a test fires the
+  clock or sets `recoveryDue`. No sleep, retry, widened timeout, skip,
+  assertion change, or production change. It closes the class for every sibling
+  here that asserts an exact commit count or `consecutiveFailures` after a
+  recorded failure, not just the two cases that failed.
+- Red→green proof (both halves of the test still bite, and the fix does not
+  mask them):
+  - `nextOperation()`'s `eligible[halt.op] = false` → `true` (a standing halt no
+    longer makes its own operation ineligible) → RED at line 1271,
+    `commitCalls` 5858 / 5987, both cases timing out at 15s;
+  - `classifyOperationFailure`'s `terminal: { fingerprint }` capture dropped →
+    RED at line 1272 on the `terminal` key, both cases;
+  - production restored → the widened-window probe (`await sleep(200)`, 4x the
+    25ms that produced 6 extra commits before the fix) holds `commitCalls` at 1;
+    20/20 green runs of the file (5.42s–6.52s), full `bun run test` green,
+    clean typecheck after `rm -rf .cache/tsbuildinfo`.
+- **Generalizes to every recovery-episode test**: a recorded pull/push failure
+  always arms a real timer that can fire with **zero** delay. Any test that
+  provokes one and then asserts must own the recovery clock; asserting under
+  `Math.random`'s 0ms floor is a coin flip, not a contract.
