@@ -5,6 +5,40 @@
 > PR history, and per-machine Claude session memory (does not travel — this doc
 > is the carrier).
 
+_SESSION 2026-07-31: **The quota arc CLOSED. Billing flip shipped to PROD
+(#618, design 228, migration 0036): rbox bills/shows/cap-gates on ACTIVE bytes
+— founder billed 4.16 GB (was 158 GiB), Max 0.13 GB (was 186 GiB). R2 reclaim
+COMPLETE: 1,138,143 objects deleted of 1,180,875, zero errors, 6h54m (42,732
+deliberate skips: 40,727 pack members, 2,005 no-candidate). v1.11.4 released:
+a concluded merge's MERGE_MSG/AUTO_MERGE fossil no longer blocks `rbox git
+resolve` (Max's 7-day supabase-cli wedge; classification now matches git's
+wt_status; REBASE_HEAD deliberately stays in-progress per design 126 gate).**_
+
+_**#618 mechanics (do not re-litigate):** billable = MAX(0, used_bytes −
+history_overhang_bytes), overhang forgiven ONLY on paid plans (locked 1-byte
+fence stays airtight); single writer = fairuse completeScan 2-stmt batch
+(lease-guarded) writing bytes + measured_at together; 0036 backfills both from
+each account's latest completed scan; advisory checks and the D1 cap-guard
+trigger evaluate the identical expression. Admission STAYS on the live
+used_bytes counter (commit-time active_bytes settled unsound). Known accepted
+gaps (design §7): cross-workspace double-count understates overhang
+(revenue-safe); >64-workspace accounts never scan; plan cap no longer bounds
+physical R2 (365d retention is the only bound — founder-accepted). Dev-verified
+with real trigger writes before promotion; 2-lane review (codex+opus, 4
+defects folded) + final serial._
+
+_**v1.11.4 (#620):** rig FAST 7/7 + new `git-stale-opstate` scenario (2-device,
+22 steps: fossil wedge → keep-mine publishes → converge; real MERGE_HEAD still
+refuses). Fossil-only repos self-heal in the follow lane; index-divergent
+repos still take ONE explicit keep-mine (founder decision). QUEUED next:
+**auto-resolve-with-recovery-shelf design cycle** (grace period + other-side
+idle + loud both-machine surfacing + one-command undo — design doc to founder
+before code). Max's remaining steps relayed: `rbox upgrade` → `keep-mine` on
+isotopes/supabase-cli → optional `rbox ignore --purge` for 33,168
+carried-forward ignored files (his 3-4 GB/h churn was Electron/AppImage build
+outputs; it stopped 07-30 ~17:00 UTC). Papercuts logged: resolve's 0.8s mutex
+wait (unconfirmed pass should get the 60s deadline), silent 7-day wedge._
+
 _SESSION 2026-07-30: **v1.11.2 released and promoted; Phase 2 GC unwedged
 (#616, purge OFF); the 349 GB R2 reclaim ~30%+ done; the mint-after-delete ABA
 closed; two fleet incidents (flat-meadow OOM-refusal, a 46k mass-delete halt)
