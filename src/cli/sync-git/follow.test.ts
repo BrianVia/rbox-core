@@ -650,8 +650,26 @@ for (const [label, expectedReason, dirty] of breadcrumbDirtyGuards) {
 const inProgressFiles = OP_STATE_FILES.filter((rel) => OP_STATE_CLASSIFICATION[rel] === "in-progress");
 test("design 126 classification map covers every op-state root exactly", () => {
   expect(Object.keys(OP_STATE_CLASSIFICATION).sort()).toEqual([...OP_STATE_FILES, ...OP_STATE_DIRS].sort());
-  expect(OP_STATE_CLASSIFICATION.ORIG_HEAD).toBe("breadcrumb");
-  expect(inProgressFiles).toHaveLength(OP_STATE_FILES.length - 1);
+  // Pinned by NAME, not by count: in-progress is exactly git's own wt_status set.
+  // MERGE_MSG/AUTO_MERGE are breadcrumbs (fossils of concluded operations) —
+  // classifying them in-progress stranded a customer repo for seven days.
+  expect(inProgressFiles).toEqual(["MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"]);
+  expect(OP_STATE_FILES.filter((rel) => OP_STATE_CLASSIFICATION[rel] === "breadcrumb"))
+    .toEqual(["ORIG_HEAD", "MERGE_MSG", "AUTO_MERGE"]);
+  expect(OP_STATE_DIRS.every((dir) => OP_STATE_CLASSIFICATION[dir] === "in-progress")).toBe(true);
+});
+
+// The ORIG_HEAD waiver's act preserves the discarded value as a recovery ref, so
+// it is ORIG_HEAD-only. Reclassifying MERGE_MSG/AUTO_MERGE as breadcrumbs changed
+// the in-progress PREDICATE, not this lane: a mismatch at either still defers, and
+// must say which root actually differs rather than blaming ORIG_HEAD.
+test("a MERGE_MSG mismatch still defers, with its own truthful detail", async () => {
+  const { state, incoming } = await breadcrumbBaseAndIncoming();
+  await fs.writeFile(path.join(receiver, ".git", "MERGE_MSG"), "receiver-only draft\n");
+  const applied = await applyIncoming(state, incoming, matchingOracle);
+  expect(applied.outcome.deferrals?.repo?.apply?.reason).toBe("local-operation");
+  expect(applied.logs.some((line) => line.includes("operation state differs at MERGE_MSG"))).toBe(true);
+  expect(applied.logs.some((line) => line.startsWith("git-sync: adopted stale ORIG_HEAD"))).toBe(false);
 });
 
 test("design 126 worktree discriminator is primary or a stable per-gitdir hash", async () => {

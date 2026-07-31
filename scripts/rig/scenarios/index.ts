@@ -14,6 +14,7 @@ import { gitFf } from "./git-ff.js";
 import { gitJoinAhead } from "./git-join-ahead.js";
 import { gitCommitPropagation } from "./git-commit-propagation.js";
 import { gitHeldLivelock } from "./git-held-livelock.js";
+import { gitStaleOpstate } from "./git-stale-opstate.js";
 import { worktreeSquashLifecycle } from "./worktree-squash-lifecycle.js";
 import { webPairing } from "./web-pairing.js";
 
@@ -31,6 +32,7 @@ export const SCENARIOS: Record<string, Scenario> = {
   "git-join-ahead": gitJoinAhead,
   "git-commit-propagation": gitCommitPropagation,
   "git-held-livelock": gitHeldLivelock,
+  "git-stale-opstate": gitStaleOpstate,
   "worktree-squash-lifecycle": worktreeSquashLifecycle,
   "conductor-initial-sync": conductorInitialSync,
   "chaos-restart": chaosRestart,
@@ -51,6 +53,10 @@ export const SCENARIOS: Record<string, Scenario> = {
  * every-PR gate. Run it explicitly to guard design 172. git-held-livelock is likewise
  * EXCLUDED (explicit/pre-merge): it stops/starts a live daemon mid-scenario and runs
  * several propagation rounds — the design-174 guard, run explicitly like its sibling.
+ * git-stale-opstate is EXCLUDED as well (explicit/pre-merge): it is the guard for the
+ * MERGE_MSG/AUTO_MERGE op-state reclassification, and it stages a multi-round divergence
+ * wedge plus a real in-progress merge on a live device — an explicit-only pre-merge run
+ * like its `git-*` siblings, never an every-PR gate.
  * web-pairing is EXCLUDED too (explicit/pre-merge): the design-189/192 auto-key-delivery
  * validation runs a real device-code `rbox login`, waits out the daemon fulfillment +
  * enroll window (~1-2 min), and drives the dev-only scriptable approve — too slow and

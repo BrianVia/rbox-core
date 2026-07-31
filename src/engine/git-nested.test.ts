@@ -262,6 +262,10 @@ test("mid-merge MERGE_HEAD from an UNBUNDLED branch survives a scoped round-trip
   const section = await captureGitState(W, store, KEK);
   expect(section).toBeDefined();
   expect(Object.keys(section!.opState ?? {})).toContain("MERGE_HEAD");
+  // MERGE_MSG is a BREADCRUMB for the in-progress predicate, but it still syncs
+  // as op-state: reclassification must never change what crosses the wire.
+  expect(Object.keys(section!.opState ?? {})).toContain("MERGE_MSG");
+  const mergeMsgBytes = await fs.readFile(path.join(wGitDir, "MERGE_MSG"));
   // §6.6 [v2, M3]: write-tree fails on the unmerged index → raw-index identity fallback
   expect(section!.indexTree?.startsWith("raw:")).toBe(true);
 
@@ -272,6 +276,7 @@ test("mid-merge MERGE_HEAD from an UNBUNDLED branch survives a scoped round-trip
   // codex repro'd `bundle create HEAD refs/heads/x` omitting a MERGE_HEAD commit)
   expect((await fs.readFile(path.join(D, ".git", "MERGE_HEAD"), "utf8")).trim()).toBe(otherSha);
   await expect(git(D, "cat-file", "-e", `${otherSha}^{commit}`)).resolves.toBeDefined();
+  expect(await fs.readFile(path.join(D, ".git", "MERGE_MSG"))).toEqual(mergeMsgBytes);
   // AUTO_MERGE (ort, git >= 2.38): the file restores AND its TREE object rides the pin —
   // without it `git diff AUTO_MERGE` on the receiver dies with "bad object" (codex repro)
   if (section!.opState && "AUTO_MERGE" in section!.opState) {
