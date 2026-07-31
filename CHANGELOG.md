@@ -6,6 +6,8 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.11.4] - 2026-07-31
+
 ### Fixed
 - **A leftover file from a finished merge no longer blocks
   `rbox git resolve`.** When Git finishes a merge it can leave a draft
