@@ -615,7 +615,15 @@ async function classifyCheckout(args: {
       const value = live.opState[rel] ?? null;
       if (value !== (baseOp[rel] ?? null) && value !== (incomingOp[rel] ?? null)) {
         const root = opStateRootOf(rel);
-        if (OP_STATE_CLASSIFICATION[root] === "breadcrumb") {
+        // The WAIVER is ORIG_HEAD-only: its act preserves the discarded value as a
+        // recovery ref (preserveOrigHead), which only makes sense for a commit-valued
+        // breadcrumb, and both the act and the boundary recheck already refuse any
+        // other shape. Classification governs the in-progress PREDICATE (does git
+        // consider an operation active); it does not by itself make a root waivable.
+        // Naming ORIG_HEAD here keeps a MERGE_MSG/AUTO_MERGE mismatch deferring with
+        // its own truthful detail instead of reaching the act and being reported as
+        // an ORIG_HEAD difference.
+        if (root === "ORIG_HEAD") {
           breadcrumbMismatches.push({ rel: root, live: value, base: baseOp[rel] ?? null, incoming: incomingOp[rel] ?? null });
         } else {
           reasons.add("local-operation");

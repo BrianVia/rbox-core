@@ -6,6 +6,19 @@ All notable changes to rbox are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- **A leftover file from a finished merge no longer blocks
+  `rbox git resolve`.** When Git finishes a merge it can leave a draft
+  commit-message file behind in the repository. rbox mistook that leftover for
+  a merge still in progress, so `rbox git resolve <repo> keep-mine` refused
+  with "a Git operation is in progress; finish or abort it, then run keep-mine
+  again" — on a repository where Git itself reported nothing in progress and
+  nothing to finish or abort. There was no way out, and one repository stayed
+  stuck for a week. rbox now uses Git's own definition of an operation in
+  progress, so these leftovers are ignored. A genuinely paused merge, rebase,
+  cherry-pick, or revert still stops resolution, exactly as before, and the
+  leftover files keep syncing between your computers.
+
 ## [1.11.3] - 2026-07-30
 
 ### Fixed

@@ -987,6 +987,65 @@ test("design 177 treats a bare rebase root as in-progress at both preview and co
   expect(JSON.parse(confirmRefusal.at(-1)!)).toMatchObject({ status: "refused", code: "local-operation" });
 });
 
+// Field: a paying customer's repo was unresolvable for seven days behind
+// "a Git operation is in progress" with a clean tree and no MERGE_HEAD — git had
+// nothing to finish or abort. MERGE_MSG (a commit-message draft) and AUTO_MERGE
+// (ort's scratch tree) are fossils of CONCLUDED operations, so they are
+// breadcrumbs, not operations.
+test("a concluded operation's leftover MERGE_MSG/AUTO_MERGE previews and publishes keep-mine", async () => {
+  await fixture();
+  await makeKeepMinePreviewable();
+  const gitDir = path.join(receiver, ".git");
+  await fs.writeFile(path.join(gitDir, "MERGE_MSG"), "Merge branch 'feature'\n");
+  await fs.writeFile(path.join(gitDir, "AUTO_MERGE"), `${await git(receiver, "rev-parse", "HEAD^{tree}")}\n`);
+  // The precondition git itself reports: nothing is in progress.
+  expect(await fs.exists(path.join(gitDir, "MERGE_HEAD"))).toBe(false);
+  expect(await git(receiver, "status", "--porcelain")).toBe("");
+
+  const previewLines: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "keep-mine", { json: true }, deps(previewLines))).toBe(1);
+  const preview = JSON.parse(previewLines.at(-1)!);
+  expect(preview).toMatchObject({ status: "preview", verb: "keep-mine" });
+
+  // Past the preview door is not enough — the confirm door re-checks live op-state.
+  const confirmed: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "keep-mine", {
+    confirm: preview.current.snapshot,
+    ...(preview.confirm.forceDiscardIncoming ? { forceDiscardIncoming: true } : {}),
+  }, deps(confirmed))).toBe(0);
+  expect(confirmed.join("\n")).toContain("published");
+  // Publication never touches the fossils; they keep syncing as op-state.
+  expect(await fs.readFile(path.join(gitDir, "MERGE_MSG"), "utf8")).toBe("Merge branch 'feature'\n");
+});
+
+// Negative controls for the reclassification. The confirm door's own refusal is
+// pinned by the design 177 bare-rebase-root test above (an empty directory is the
+// only in-progress marker that can appear without changing the preview snapshot).
+test("a real MERGE_HEAD alongside the fossils still refuses keep-mine", async () => {
+  await fixture();
+  await makeKeepMinePreviewable();
+  const gitDir = path.join(receiver, ".git");
+  const before = JSON.stringify(await loadState(root, syncStreamId(cfg)));
+  await fs.writeFile(path.join(gitDir, "MERGE_MSG"), "Merge branch 'feature'\n");
+  await fs.writeFile(path.join(gitDir, "MERGE_HEAD"), `${await git(receiver, "rev-parse", "HEAD")}\n`);
+  const refused: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "keep-mine", { json: true }, deps(refused))).toBe(1);
+  expect(JSON.parse(refused.at(-1)!)).toMatchObject({ status: "refused", code: "local-operation" });
+  expect(JSON.stringify(await loadState(root, syncStreamId(cfg)))).toBe(before);
+});
+
+test("an empty rebase-merge directory beside the fossils still refuses keep-mine", async () => {
+  await fixture();
+  await makeKeepMinePreviewable();
+  const gitDir = path.join(receiver, ".git");
+  await fs.writeFile(path.join(gitDir, "MERGE_MSG"), "Merge branch 'feature'\n");
+  // Directory PRESENCE is git's rebase evidence even with no files inside it.
+  await fs.mkdir(path.join(gitDir, "rebase-merge"));
+  const refused: string[] = [];
+  expect(await gitResolveCmd(root, receiver, "keep-mine", { json: true }, deps(refused))).toBe(1);
+  expect(JSON.parse(refused.at(-1)!)).toMatchObject({ status: "refused", code: "local-operation" });
+});
+
 test("design 177 preview drift returns a fresh token and the old token stays dead", async () => {
   await fixture();
   await makeKeepMinePreviewable();

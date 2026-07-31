@@ -264,15 +264,39 @@ export type OpStateClassification = "breadcrumb" | "in-progress";
 
 /** Explicit by design: a newly-added op-state root must not silently inherit a
  * safety classification. The `satisfies` constraint makes omission a typecheck
- * failure, while `as const` preserves the individually-reviewed literals. */
+ * failure, while `as const` preserves the individually-reviewed literals.
+ *
+ * `in-progress` means what GIT means by it (`wt_status_get_state`): MERGE_HEAD
+ * (merge), CHERRY_PICK_HEAD, REVERT_HEAD, a `rebase-merge/`/`rebase-apply/`
+ * directory (presence alone — see pruneEmptyOpStateDirs), or `sequencer/`.
+ * Everything else is a breadcrumb: a file git leaves behind that no `git
+ * --continue`/`--abort` consumes and `git status` does not report.
+ *
+ * MERGE_MSG and AUTO_MERGE were in-progress until a paying customer's repo sat
+ * unresolvable for seven days behind "a Git operation is in progress" with a
+ * clean tree, no MERGE_HEAD, and nothing for git to finish or abort. Both are
+ * routinely left behind by CONCLUDED operations — MERGE_MSG is a commit-message
+ * draft (git writes it before the merge/cherry-pick commit and does not always
+ * remove it after), AUTO_MERGE is ort's scratch tree — so treating either as an
+ * operation makes the refusal unactionable: the user cannot clear a state git
+ * does not believe it is in. Design 126 §"Design" picked in-progress for both on
+ * the theory that a false deferral is merely "a visible deferral, safe
+ * direction"; the field showed a false deferral is instead a permanent strand,
+ * and even foresaw the AUTO_MERGE-after-squash false-defer. Nothing is lost:
+ * every real operation that writes them also writes a marker above.
+ *
+ * REBASE_HEAD stays in-progress. Git does not consult it for status either, but
+ * unlike the two above it is not left by a concluded operation (git unlinks it
+ * on both finish and abort), so it is not a fossil class; design 126 gated its
+ * re-review on an actual field strand, and none has been observed. */
 export const OP_STATE_CLASSIFICATION = {
   MERGE_HEAD: "in-progress",
   REBASE_HEAD: "in-progress",
   CHERRY_PICK_HEAD: "in-progress",
   REVERT_HEAD: "in-progress",
   ORIG_HEAD: "breadcrumb",
-  MERGE_MSG: "in-progress",
-  AUTO_MERGE: "in-progress",
+  MERGE_MSG: "breadcrumb",
+  AUTO_MERGE: "breadcrumb",
   "rebase-merge": "in-progress",
   "rebase-apply": "in-progress",
   sequencer: "in-progress",
