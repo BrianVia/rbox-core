@@ -65,10 +65,9 @@ export interface CleanMaterializationInput {
   readonly degradedMutex: boolean;
   readonly chainTimings: GitChainTimings | undefined;
   readonly warningSink: ((message: string) => void) | undefined;
-  /** Design 93 §6/§9 phase, already decided by the received-config planner.
-   * This transition never re-derives the config predicate: `ApplyReceivedGitConfig`
-   * owns due/ownership/target eligibility, and a bound apply plan existing for the
-   * `after-materialization` phase IS the authorization. */
+  /** Design 93 §6/§9 window, already decided by the repository-bound config
+   * receiver. This transition never re-derives due/ownership/target eligibility;
+   * the receiver lends it only the after-materialization operation. */
   readonly config: CleanMaterializationConfigPhase;
   /** Config baseline an unapplied partial must carry forward. */
   readonly inheritedConfigBase: GitPartialApply["configBase"];

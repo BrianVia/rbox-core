@@ -3,8 +3,9 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { collectMachineTriage, renderMachineTriage } from "./doctor-machine.js";
-import { daemonPidPath, daemonRuntimeDir, daemonStatusPath } from "./rbox-paths.js";
+import { daemonBoundPath, daemonPidPath, daemonRuntimeDir, daemonStatusPath } from "./rbox-paths.js";
 import type { AmbientDaemonStatusV1 } from "./daemon/ambient-status.js";
+import { observeDaemon } from "./daemon/observation.js";
 
 const NOW = Date.parse("2026-07-27T12:00:00.000Z");
 const LIVE_PID = 4242;
@@ -60,6 +61,7 @@ async function seedWorkspace(name: string, opts: {
   }));
   if (opts.withPidfile !== false) {
     await fs.writeFile(daemonPidPath(root), `v2 ${LIVE_PID} ${opts.pidBootId ?? BOOT}\n`);
+    await fs.writeFile(daemonBoundPath(root), `v2 ${opts.boundWorkspaceId ?? workspaceId} ${opts.pidBootId ?? BOOT}\n`);
   }
   if (opts.status) {
     await fs.writeFile(daemonStatusPath(root), JSON.stringify({
@@ -78,7 +80,11 @@ async function seedWorkspace(name: string, opts: {
 }
 
 const collectWith = (alive: boolean) =>
-  collectMachineTriage({ now: () => NOW, isDaemonProcess: () => alive });
+  collectMachineTriage({
+    now: () => NOW,
+    observeDaemon: (root, workspaceId, now) =>
+      observeDaemon(root, workspaceId, now, { processMatches: () => alive }),
+  });
 
 test("no synced folders prints the setup pointer", async () => {
   const triage = await collectWith(false);

@@ -13,9 +13,16 @@ import { buildAuthedRemote } from "./e2ee-client.js";
 import { DEFAULT_REMOTE } from "./api-base.js";
 import { fail, setJsonErrorMode, style } from "./style.js";
 import { spinner } from "./spinner.js";
-import { resolveAlias } from "./deprecations.js";
-import { isKnownTopLevel } from "./command-catalog.js";
-import { commandSupportsFlag, helpFor, helpKeyFor, renderCommand, renderEssentialHelp, renderGroupedHelp } from "./help-registry.js";
+import {
+  commandSupportsFlag,
+  helpFor,
+  helpKeyFor,
+  isKnownTopLevel,
+  renderCommand,
+  renderEssentialHelp,
+  renderGroupedHelp,
+  resolveAlias,
+} from "./help-registry.js";
 import { recoveryKitOptionsFromFlags } from "./recovery-kit.js";
 import { maybeNudgeForUpdate } from "./update-check.js";
 import { parseFlags, unknownFlagError } from "./flags.js";
@@ -34,7 +41,7 @@ function printHelp(cmd: string | undefined, positional: string[], fullReference 
 
 // `rbox deps <sub>` group dispatch — commented out (design 51): the whole `deps`
 // CLI surface (install/list/check/drift/notify, plus the old hydrate/detect
-// aliases in deprecations.ts and their entries in help-registry.ts) is disabled
+// aliases and their entries in the command grammar) is disabled
 // for now. The underlying implementations (hydrate-cmd.ts, deps-drift.ts,
 // deps-notify.ts) are untouched, so re-enabling is: uncomment this function +
 // its `case "deps"` below + the registry/alias entries. `postSyncNudge` below is

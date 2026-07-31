@@ -92,8 +92,14 @@ function readPort<M extends StatusMode>(
     readCredentials: note("readCredentials", async () => ({ state: "absent" as const })),
     readPendingGenesis: note("readPendingGenesis", async () => false),
     readConfig: note("readConfig", async () => CFG),
-    readDaemonBinding: note("readDaemonBinding", () => ({ alive: { running: false }, stale: false })),
-    readAmbientDaemonStatus: note("readAmbientDaemonStatus", () => ({ kind: "absent" as const })),
+    readDaemonObservation: note("readDaemonObservation", () => ({
+      ownership: "stopped" as const,
+      running: false,
+      stale: false,
+      ownsWorkspace: false,
+      ambient: { kind: "absent" as const },
+      ambientTrust: "absent" as const,
+    })),
     inspectResetJournal: note("inspectResetJournal", async () => ({ status: "none" as const })),
     readResetHaltHealth: note("readResetHaltHealth", async () => undefined),
     readState: note("readState", async () => current),
@@ -144,9 +150,8 @@ test("one invocation performs one projection: every admitted read happens exactl
   for (const read of [
     "readCredentials",
     "readConfig",
-    "readDaemonBinding",
+    "readDaemonObservation",
     "readState",
-    "readActivity",
     "readPathWarnings",
     "readTrashStats",
     "readLockingHealth",
@@ -206,7 +211,11 @@ test("reset halt never dereferences state", async () => {
 
 test("trusted local observation skips the hashcache and the manifest scan", async () => {
   const { port, calls } = readPort("brief", {
-    readDaemonBinding: () => ({ alive: { running: true, pid: 9, bootId: "boot-1" }, bound: CFG.remoteWorkspaceId, stale: false }),
+    readDaemonObservation: () => ({
+      ownership: "owned", running: true, pid: 9, bootId: "boot-1",
+      boundWorkspaceId: CFG.remoteWorkspaceId, stale: false, ownsWorkspace: true,
+      ambient: { kind: "absent" }, ambientTrust: "absent",
+    }),
     readActivity: async () => trustedActivity(),
     loadHashCache: async () => {
       throw new Error("trusted local must not load the hashcache");
@@ -228,11 +237,44 @@ test("trusted local observation skips the hashcache and the manifest scan", asyn
   expect(calls).not.toContain("scanManifest");
 });
 
+test("an unowned mixed-format daemon cannot make activity readable or renderable", async () => {
+  const { port, calls } = readPort("brief", {
+    readDaemonObservation: () => ({
+      ownership: "record-format-mismatch",
+      running: true,
+      pid: 9,
+      bootId: "boot-1",
+      boundWorkspaceId: CFG.remoteWorkspaceId,
+      stale: false,
+      ownsWorkspace: false,
+      ambient: { kind: "absent" },
+      ambientTrust: "binding-untrusted",
+    }),
+    readActivity: async () => {
+      throw new Error("unowned activity must not be read");
+    },
+  });
+
+  const projection = await projectWorkspaceStatusDetail(ROOT, { mode: "brief" }, port, {
+    refresh: async (_cfg, next) => refreshed(next),
+  });
+
+  expect(projection.kind).toBe("detail");
+  if (projection.kind !== "detail") throw new Error("unreachable");
+  expect(calls).not.toContain("readActivity");
+  expect(projection.activity).toBeUndefined();
+  expect(projection.health).toBe("ok");
+});
+
 test("a local base mismatch re-reads state before falling back to the scan", async () => {
   const stale = trustedActivity();
   stale.local!.baseSequence = 6;
   const { port, calls, countOf } = readPort("brief", {
-    readDaemonBinding: () => ({ alive: { running: true, pid: 9, bootId: "boot-1" }, bound: CFG.remoteWorkspaceId, stale: false }),
+    readDaemonObservation: () => ({
+      ownership: "owned", running: true, pid: 9, bootId: "boot-1",
+      boundWorkspaceId: CFG.remoteWorkspaceId, stale: false, ownsWorkspace: true,
+      ambient: { kind: "absent" }, ambientTrust: "absent",
+    }),
     readActivity: async () => stale,
   });
   const refreshes: number[] = [];

@@ -469,9 +469,9 @@ describe("executeCleanMaterialization receipts", () => {
     });
   });
 
-  // The due/ownership/target predicate belongs to ApplyReceivedGitConfig; this
-  // transition only carries the settled phase through, so both settled outcomes
-  // must reach the receipt without ever touching the config lane.
+  // The due/ownership/target predicate belongs to the repository-bound config
+  // receiver; this transition only carries the settled window through, so both
+  // settled outcomes must reach the receipt without touching the config lane.
   test("a settled applied phase never runs the lane and leaves no unapplied partial", async () => {
     const plan = await bound({ config: { phase: "not-due", applied: true } });
     const { effects, calls } = harness();

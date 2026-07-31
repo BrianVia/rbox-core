@@ -17,6 +17,7 @@ import { RBOX_VERSION } from "./version.js";
 import { versionsCmd } from "./versions-cmd.js";
 import { fail, setJsonErrorMode } from "./style.js";
 import { renderKit, writeRecoveryKit } from "./recovery-kit.js";
+import type { DaemonObservation } from "./daemon/observation.js";
 
 const origFetch = globalThis.fetch;
 const origStdout = process.stdout.write.bind(process.stdout);
@@ -25,6 +26,31 @@ const origHome = process.env.HOME;
 
 let tmp: string;
 const STATUS_NOW = Date.parse("2026-07-04T12:00:00Z");
+
+function stoppedDaemon(): DaemonObservation {
+  return {
+    ownership: "stopped",
+    running: false,
+    stale: false,
+    ownsWorkspace: false,
+    ambient: { kind: "absent" },
+    ambientTrust: "absent",
+  };
+}
+
+function liveDaemon(bootId = "boot-live"): DaemonObservation {
+  return {
+    ownership: "owned",
+    running: true,
+    pid: 1234,
+    bootId,
+    boundWorkspaceId: "ws_status_fast",
+    stale: false,
+    ownsWorkspace: true,
+    ambient: { kind: "absent" },
+    ambientTrust: "absent",
+  };
+}
 
 async function captureStdout(fn: () => Promise<void> | void): Promise<string> {
   const out: string[] = [];
@@ -59,7 +85,7 @@ function statusDeps(overrides: Partial<StatusCmdDeps> = {}): StatusCmdDeps {
     scanManifest: async (): Promise<Manifest> => ({ generatedAt: new Date(STATUS_NOW).toISOString(), files: [] }),
     gitDivergenceCount: async () => 0,
     gitDivergenceFastRepoSource: async () => [],
-    daemonBindingStatus: () => ({ alive: { running: false }, stale: false }),
+    observeDaemon: () => stoppedDaemon(),
     readDaemonPidRecord: () => ({ present: false }),
     ...overrides,
   };
@@ -245,7 +271,7 @@ test("status --json trusts attributed fresh local and skips hashcache and manife
         tmp,
         { json: true },
         statusDeps({
-          daemonBindingStatus: () => ({ alive: { running: true, pid: 1234, bootId: "boot-live" }, bound: "ws_status_fast", stale: false }),
+          observeDaemon: () => liveDaemon(),
           loadHashCache: async () => {
             throw new Error("HashCache.load must not run on trusted local path");
           },
@@ -278,7 +304,7 @@ test("status local trust predicate falls back on stale boot, base mismatch, stal
           tmp,
           { json: true },
           statusDeps({
-            daemonBindingStatus: () => ({ alive: { running: true, pid: 1234, bootId: "boot-live" }, bound: "ws_status_fast", stale: false }),
+            observeDaemon: () => liveDaemon(),
             scanManifest: async () => {
               scanned = true;
               return { generatedAt: new Date(STATUS_NOW).toISOString(), files: [] };
@@ -296,7 +322,7 @@ test("status local trust predicate falls back on stale boot, base mismatch, stal
   await exerciseFallback(trustedActivity(61_000));
   await exerciseFallback(trustedActivity(1_000, { changed: -1 }));
   await exerciseFallback(trustedActivity(1_000, {}), {
-    daemonBindingStatus: () => ({ alive: { running: true, pid: 1234, bootId: "boot-new" }, bound: "ws_status_fast", stale: false }),
+    observeDaemon: () => liveDaemon("boot-new"),
   });
 });
 
@@ -312,7 +338,7 @@ test("status fallback re-reads state before scanning after local base mismatch",
         tmp,
         { json: true },
         statusDeps({
-          daemonBindingStatus: () => ({ alive: { running: true, pid: 1234, bootId: "boot-live" }, bound: "ws_status_fast", stale: false }),
+          observeDaemon: () => liveDaemon(),
           readLockingHealth: async () => {
             if (!rewroteState) {
               rewroteState = true;

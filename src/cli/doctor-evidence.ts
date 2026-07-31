@@ -21,28 +21,16 @@ import { loadActivity, type DaemonActivity } from "./activity.js";
 import { inspectAdoptFence, type AdoptFenceInspection } from "./adopt-journal.js";
 import { loadConfig, loadRawState, repoRecordsForState, syncStreamId } from "./config.js";
 import { currentWorkspaceId } from "./daemon-control.js";
-import { DAEMON_HEARTBEAT_FUTURE_SKEW_MS, daemonBindingStatus } from "./daemon/process-control.js";
-import { readAmbientDaemonStatusRecord, type AmbientDaemonStatusRecord, type AmbientDaemonStatusV1 } from "./daemon/ambient-status.js";
-import { AMBIENT_STATUS_STALE_MS } from "./populate-marker.js";
+import { type AmbientDaemonStatusRecord, type AmbientDaemonStatusV1 } from "./daemon/ambient-status.js";
+import {
+  observeDaemon as observeDaemonState,
+  type DaemonObservation,
+} from "./daemon/observation.js";
 import { projectGitDeferralRepos, type GitDeferralRepoProjection } from "./status-view.js";
 import type { DoctorCheck, DoctorChecks } from "./doctor-cmd.js";
 import { scopeProjectionFor } from "./scope/projection.js";
 
-/** One point-in-time answer to "is a daemon running for THIS workspace root?".
- * Liveness is root-scoped — the daemon's own command line must name this root —
- * so a recycled pid, or another workspace's daemon that inherited it, is never
- * mistaken for ours. */
-export interface DaemonObservation {
-  /** A live rbox daemon whose own command line names this root. */
-  running: boolean;
-  pid?: number;
-  bootId?: string;
-  /** Live, but its startup binding names a different workspace than this root. */
-  stale: boolean;
-  /** Live AND bound to this root: the only state in which the daemon's sidecars
-   * describe this workspace right now. */
-  ownsRoot: boolean;
-}
+export type { DaemonObservation } from "./daemon/observation.js";
 
 export interface TriageInputs {
   root: string;
@@ -57,26 +45,14 @@ export interface TriageInputs {
 }
 
 export interface TriageReadDeps {
-  /** The single liveness/binding seam. Tests either drive it or drive the real
-   * one by writing a pidfile — either way there is exactly one observation. */
-  daemonBindingStatus?: typeof daemonBindingStatus;
+  observeDaemon?: typeof observeDaemonState;
   currentWorkspaceId?: typeof currentWorkspaceId;
 }
 
 /** Take the ONE ownership observation triage is allowed to use. */
-export function observeDaemon(root: string, deps: TriageReadDeps = {}): DaemonObservation {
+export function observeDaemon(root: string, deps: TriageReadDeps = {}, now = Date.now()): DaemonObservation {
   const workspaceId = (deps.currentWorkspaceId ?? currentWorkspaceId)(root);
-  // An unreadable workspace binding cannot prove ownership of anything; the
-  // empty id makes any bound daemon read as stale, which is the safe answer.
-  const status = (deps.daemonBindingStatus ?? daemonBindingStatus)(root, workspaceId ?? "");
-  const running = status.alive.running;
-  return {
-    running,
-    ...(status.alive.pid === undefined ? {} : { pid: status.alive.pid }),
-    ...(status.alive.bootId === undefined ? {} : { bootId: status.alive.bootId }),
-    stale: status.stale,
-    ownsRoot: running && !status.stale && workspaceId !== undefined,
-  };
+  return (deps.observeDaemon ?? observeDaemonState)(root, workspaceId, now);
 }
 
 /** Read every triage input for `root`. Each read is best-effort: a diagnosis
@@ -95,14 +71,15 @@ export async function readTriageInputs(
       reason: error instanceof Error ? error.message : String(error),
     })),
   ]);
+  const daemon = observeDaemon(root, deps, now);
   return {
     root,
     checks,
     deferrals,
     activity,
     adopt,
-    ambient: readAmbientDaemonStatusRecord(root),
-    daemon: observeDaemon(root, deps),
+    ambient: daemon.ambient,
+    daemon,
     now,
   };
 }
@@ -162,7 +139,7 @@ export function unverifiedChecks(checks: DoctorChecks): string[] {
  * rebound elsewhere: a restart re-evaluates every halt and quota refusal, so
  * status drops it (status-view.ts) and diagnosis must drop it too. */
 export function daemonOwnsActivity(input: TriageInputs): boolean {
-  return input.daemon.ownsRoot;
+  return input.daemon.ownsWorkspace;
 }
 
 /** The status record describes ONE daemon incarnation, and is evidence only
@@ -171,10 +148,5 @@ export function daemonOwnsActivity(input: TriageInputs): boolean {
  * pidfile (design 178). A record failing any of those is not downgraded to a
  * weaker claim — it is not used at all. */
 export function liveAmbient(input: TriageInputs): AmbientDaemonStatusV1 | undefined {
-  if (input.ambient.kind !== "ok" || !daemonOwnsActivity(input)) return undefined;
-  const status = input.ambient.status;
-  const age = input.now - Date.parse(status.heartbeatAt);
-  if (!Number.isFinite(age) || age > AMBIENT_STATUS_STALE_MS || age < -DAEMON_HEARTBEAT_FUTURE_SKEW_MS) return undefined;
-  if (status.bootId === undefined || input.daemon.bootId === undefined || status.bootId !== input.daemon.bootId) return undefined;
-  return status;
+  return input.daemon.trustedAmbient;
 }

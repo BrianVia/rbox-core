@@ -5,8 +5,8 @@ import { fetchAccountSummary } from "./account-cmd.js";
 import { readAccountProfile } from "./account-profile.js";
 import { loadConfig, loadState, type SyncState, type WorkspaceConfig } from "./config.js";
 import { loadCredentials, type CredentialLoadResult, type Credentials } from "./credentials.js";
-import { daemonBindingStatus, readDaemonPidRecord } from "./daemon-control.js";
-import { readAmbientDaemonStatusRecord } from "./daemon/ambient-status.js";
+import { readDaemonPidRecord } from "./daemon-control.js";
+import { observeDaemon } from "./daemon/observation.js";
 import { loadMetrics } from "./metrics.js";
 import { readPathWarnings } from "./path-warnings.js";
 import { pendingGenesisState } from "./genesis-enrollment.js";
@@ -35,11 +35,11 @@ export interface StatusCmdDeps {
     baseGitRepos: SyncState["lastSyncedManifest"]["gitRepos"],
     matcher: IgnoreMatcher
   ) => Promise<GitDivergenceRepoHint[]>;
-  daemonBindingStatus: typeof daemonBindingStatus;
+  observeDaemon: typeof observeDaemon;
+  /** Independent ownership guard for status's best-effort hash-cache write. */
   readDaemonPidRecord: typeof readDaemonPidRecord;
   readLockingHealth?: (root: string) => Promise<LockingHealth>;
   checkoutTransactionCapability?: typeof checkoutTransactionCapability;
-  readAmbientDaemonStatusRecord?: typeof readAmbientDaemonStatusRecord;
   readBriefIdentity?: (accountId: string) => Promise<BriefIdentitySource | undefined>;
   promotePendingModeIntent?: typeof promotePendingModeIntent;
   reconcileGitDeferrals?: typeof reconcileGitDeferrals;
@@ -53,11 +53,10 @@ export const defaultStatusDeps: StatusCmdDeps = {
   gitDivergenceCount,
   gitDivergenceStatus,
   gitDivergenceFastRepoSource,
-  daemonBindingStatus,
+  observeDaemon,
   readDaemonPidRecord,
   readLockingHealth,
   checkoutTransactionCapability,
-  readAmbientDaemonStatusRecord,
   promotePendingModeIntent,
   reconcileGitDeferrals,
   readPathWarnings,
@@ -156,8 +155,7 @@ export function createStatusReadPort<M extends StatusMode>(mode: M, deps: Status
     readCredentials: deps.loadCredentials ?? loadCredentials,
     readPendingGenesis: async (accountId) => Boolean(await pendingGenesisState(accountId)),
     readConfig: loadConfig,
-    readDaemonBinding: deps.daemonBindingStatus,
-    readAmbientDaemonStatus: deps.readAmbientDaemonStatusRecord ?? readAmbientDaemonStatusRecord,
+    readDaemonObservation: deps.observeDaemon,
     inspectResetJournal: inspectResetJournalSafety,
     readResetHaltHealth,
     readState: loadState,

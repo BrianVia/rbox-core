@@ -3,7 +3,8 @@ import { diffManifests, type DiscoveredGitRepo, type IgnoreMatcher } from "../en
 import { shellStateOf, type DaemonActivity } from "./activity.js";
 import { DEFERRAL_LANES, repoRecordsForState, syncStreamId, type SyncState } from "./config.js";
 import { knownRepoKeys } from "./sync-state-model.js";
-import { validDaemonVersion, type DaemonMode } from "./daemon/ambient-status.js";
+import type { DaemonMode } from "./daemon/ambient-status.js";
+import type { DaemonObservation } from "./daemon/observation.js";
 import { buildPathWarnings, type PathWarningsV1 } from "./path-warnings.js";
 import { projectLocalManifest } from "./local-file-projection.js";
 import {
@@ -71,14 +72,10 @@ function trustedLocalSnapshot(input: {
   activity: DaemonActivity | undefined;
   state: SyncState;
   now: number;
-  daemonRunning: boolean;
-  boundWorkspaceId?: string;
-  currentWorkspaceId: string;
-  livePidfileBootId?: string;
+  daemon: Pick<DaemonObservation, "running" | "ownsWorkspace" | "bootId">;
 }): { local: NonNullable<DaemonActivity["local"]>; ageMs: number } | undefined {
-  if (!input.daemonRunning) return undefined;
-  if (input.boundWorkspaceId !== input.currentWorkspaceId) return undefined;
-  if (input.livePidfileBootId === undefined) return undefined;
+  if (!input.daemon.running || !input.daemon.ownsWorkspace) return undefined;
+  if (input.daemon.bootId === undefined) return undefined;
   const { activity, state, now } = input;
   if (!activity) return undefined;
   const local = activity.local;
@@ -158,22 +155,15 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
   const genesisPending = Boolean(creds?.accountId && await port.readPendingGenesis(creds.accountId));
   const rawCfg = await port.readConfig(root);
   const cfg = { ...rawCfg, remoteUrl: creds?.remoteUrl ?? rawCfg.remoteUrl };
-  const binding = port.readDaemonBinding(root, cfg.remoteWorkspaceId);
-  const alive = binding.alive;
-  const running = alive.running && !binding.stale;
-  let daemonVersion: string | undefined;
-  let daemonMode: DaemonMode | undefined;
-  if (running) {
-    const record = port.readAmbientDaemonStatus(root);
-    if (record.kind === "ok") {
-      if (validDaemonVersion(record.status.daemonVersion)) daemonVersion = record.status.daemonVersion;
-      if (alive.bootId !== undefined && record.status.bootId === alive.bootId) daemonMode = record.status.mode;
-    }
-  }
+  const observationNow = port.now();
+  const observedDaemon = port.readDaemonObservation(root, cfg.remoteWorkspaceId, observationNow);
+  const running = observedDaemon.running && !observedDaemon.stale;
+  const daemonVersion = observedDaemon.version;
+  const daemonMode: DaemonMode | undefined = observedDaemon.mode;
   const daemon: StatusDaemonProjection = {
     running,
-    ...(alive.pid === undefined ? {} : { pid: alive.pid }),
-    stale: binding.stale,
+    ...(observedDaemon.pid === undefined ? {} : { pid: observedDaemon.pid }),
+    stale: observedDaemon.stale,
     version: daemonVersion,
     mode: daemonMode,
     versionSkew: daemonVersion !== undefined && daemonVersion !== RBOX_VERSION,
@@ -221,7 +211,12 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
   };
   await runHygiene();
 
-  const activityP = binding.stale ? Promise.resolve(undefined) : port.readActivity(root);
+  // A stopped daemon's terminal halt/quota residue is durable recovery evidence.
+  // A live process that cannot prove workspace ownership is different: none of
+  // its activity sidecar may be attributed to this workspace.
+  const activityP = observedDaemon.ownsWorkspace || !observedDaemon.running
+    ? port.readActivity(root)
+    : Promise.resolve(undefined);
   const pathWarningsP = port.readPathWarnings(root);
   const trashP = port.readTrashStats(root);
   const lockingP = port.readLockingHealth(root);
@@ -232,10 +227,7 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
   const attributeActivity = (base: SyncState) =>
     attributeDaemonForStatus({
       activity: rawActivity,
-      daemonRunning: running,
-      boundWorkspaceId: binding.bound,
-      currentWorkspaceId: cfg.remoteWorkspaceId,
-      livePidfileBootId: alive.bootId,
+      daemon: observedDaemon,
       localSequence: base.lastSyncedSequence,
       now: attributionNow,
     });
@@ -259,10 +251,7 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
       activity,
       state,
       now: attributionNow,
-      daemonRunning: running,
-      boundWorkspaceId: binding.bound,
-      currentWorkspaceId: cfg.remoteWorkspaceId,
-      livePidfileBootId: alive.bootId,
+      daemon: observedDaemon,
     });
 
   const evaluateGit = async (

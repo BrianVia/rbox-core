@@ -5,7 +5,8 @@ import { buildIgnoreMatcher, checkoutTransactionCapability, cryptoPoolStatus, gi
 import { loadActivity, type DaemonActivity } from "./activity.js";
 import { loadConfig, loadState, repoRecordsForState, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { credentialFailureMessage, loadCredentials, type CredentialLoadResult, type Credentials } from "./credentials.js";
-import { currentWorkspaceId, daemonBindingStatus, readDaemonBindingRecord, readMergedDaemonLogTail } from "./daemon-control.js";
+import { currentWorkspaceId, readDaemonBindingRecord, readMergedDaemonLogTail } from "./daemon-control.js";
+import { observeDaemon } from "./daemon/observation.js";
 import { enrolledDeviceId, loadDevice } from "./e2ee-keystore.js";
 import { loadMetrics, type SyncMetrics } from "./metrics.js";
 import { promptConfirm } from "./prompt.js";
@@ -365,22 +366,22 @@ export async function checkDeviceIdentity(creds: Credentials | undefined, cfg: W
 }
 
 function checkDaemon(root: string, cfg: WorkspaceConfig): { check: DoctorCheck; stale: boolean } {
-  const binding = daemonBindingStatus(root, cfg.remoteWorkspaceId);
-  if (binding.stale) {
+  const daemon = observeDaemon(root, cfg.remoteWorkspaceId);
+  if (daemon.stale) {
     return {
       stale: true,
       check: {
         ok: false,
         label: "background sync",
-        message: `running but bound to a different workspace${binding.alive.pid ? ` (pid ${binding.alive.pid})` : ""}`,
+        message: `running but bound to a different workspace${daemon.pid ? ` (pid ${daemon.pid})` : ""}`,
         hint: "run `rbox start` to rebind",
         status: "stale",
-        ...(binding.alive.pid ? { pid: binding.alive.pid } : {}),
+        ...(daemon.pid ? { pid: daemon.pid } : {}),
       },
     };
   }
-  if (binding.alive.running) {
-    return { stale: false, check: { ok: true, label: "background sync", message: `running (pid ${binding.alive.pid})`, status: "running", ...(binding.alive.pid ? { pid: binding.alive.pid } : {}) } };
+  if (daemon.running) {
+    return { stale: false, check: { ok: true, label: "background sync", message: `running (pid ${daemon.pid})`, status: "running", ...(daemon.pid ? { pid: daemon.pid } : {}) } };
   }
   return { stale: false, check: { ok: false, label: "background sync", message: "stopped", hint: "run `rbox start`", status: "stopped" } };
 }

@@ -9,11 +9,11 @@ import { git, readHead, warnOnce } from "../../engine/git/shared.js";
 import { expectedStateNonce, loadRawState, repoRecordsForState, type GitDeferral, type GitDeferralReason, type GitHeldAttempt, type GitPartialApply, type RepoRecord, type RepoRecordInput, type SyncState, type TypedBlocker, type WorkspaceConfig } from "../config.js";
 import { configLaneState, inputRecord, type ConfigLaneState, type GitDeferralUpdates } from "../sync-state.js";
 import { checkoutJournalBinding, deriveBaseIndexProjection, followDivergedRepo, FollowCrashInjectedError, quarantineUnboundFollowJournal, recoverAndLandFollowJournal, type FollowCrashPoint, type FollowIntended, type FollowProgress } from "./follow.js";
-import { checkoutLabel, repoDirOf, localDivergedFromBase, narrowerScope, projectedKey, emptyToUndef, errMsg, chainLock, gitApplyMutationKey, nestedRepoChains, gitApplyConcurrency, gitFollowEnabled, gitIncomingKey, nextDeferral, repoEquivalenceWarningLogged, sectionOpState } from "./shared.js";
+import { checkoutLabel, repoDirOf, localDivergedFromBase, narrowerScope, projectedKey, emptyToUndef, errMsg, chainLock, gitApplyMutationKey, nestedRepoChains, gitApplyConcurrency, gitFollowEnabled, gitIncomingKey, nextDeferral, repoEquivalenceWarningLogged, sectionOpState, type HeldChainLock } from "./shared.js";
 import { executeRemoteRepositoryDeletion, planRemoteRepositoryDeletion, sweepRemovedRepoSkeleton, type RemoteRepositoryDeletionEffects, type RemoteRepositoryDeletionIdentity, type RepoSkeletonSweepOptions } from "./remote-repository-deletion.js";
 import type { ScopeProjection } from "../scope/projection.js";
 import { configReceiver } from "./config-lane.js";
-import { ConfigLaneLedger, applyReceivedGitConfig, classifyIncomingConfigSanitation, planReceivedGitConfigApply, planReceivedGitConfigBaseline, planReceivedGitConfigTarget, type GitConfigExecutor, type ReceivedGitConfigIdentity, type ReceivedGitConfigPlan } from "./received-git-config.js";
+import { createReceivedGitConfig } from "./received-git-config.js";
 import { prepareFollowerBranchProtocol } from "./follower-protocol.js";
 import { settleStandingBranchProof, type StandingProofPort, type StandingRepairAttempt } from "./standing-branch-proof.js";
 import { composeFollowAuthority, composeFollowRepoTransition, followHeldDeferralReason, mergeFollowDeferralLanes, type FollowRepoTransition, type FollowTransitionIdentity, type StandingBranchProofReceipt } from "./follow-repo-transition.js";
@@ -411,11 +411,6 @@ opts: {
     return group;
   };
 
-  const laneLedger = new ConfigLaneLedger({
-    lane: configLane,
-    sourceSeq: (rel) => records[rel]?.sourceSeq ?? state.lastSyncedSequence,
-    storedLane: (rel) => configLaneState(records[rel] ?? { repoGen: 0, sourceSeq: state.lastSyncedSequence }),
-  });
   const currentDeferral = (rel: string, lane: GitDeferral["lane"]): GitDeferral | undefined => {
     const transition = deferrals[rel];
     if (transition === null) return undefined;
@@ -465,38 +460,6 @@ opts: {
     }
   };
 
-  /** Bind the config effects to ONE phase. The phase — and, inside a follow
-   * lock, the serialized common dir — is what refuses a foreign plan; the
-   * executor never re-derives either from the plan it is handed. */
-  const configExecutorFor = (
-    identity: ReceivedGitConfigIdentity,
-    phase: GitConfigExecutor["phase"],
-    commonDirToken?: string,
-  ): GitConfigExecutor => ({
-    identity,
-    phase,
-    ...(commonDirToken === undefined ? {} : { commonDirToken }),
-    ledger: laneLedger,
-    materializeFresh: async (incoming) => {
-      await runMutation(identity.repoDir, () => (opts.materializeFreshConfig ?? materializeFreshGitConfig)(
-        identity.repoDir, incoming, path.join(identity.repoDir, ".git")));
-    },
-    inspectFreshInstall: async () => {
-      const ctx = await repoCtxFromDisk(identity.repoDir);
-      if (!ctx) throw new Error("fresh config apply lost repository context");
-      const owned = await configReceiver(root, ctx);
-      if (!owned.owned) throw new Error("fresh config target is not receiver-owned");
-      const installed = await readParsedConfigSnapshot(identity.repoDir, owned.configPath, "locked");
-      if (!installed.ok) throw new Error(`fresh config post-read: ${installed.fault.reason}`);
-      const post = canonicalizeGitConfig(installed.snapshot.entries);
-      if (!post.ok) throw new Error(`fresh config post-parse: ${post.reason}`);
-      return { shape: owned.shape, config: post.config, token: installed.snapshot.token };
-    },
-    applyExisting: (configPath, incoming, baseConfig) => runMutation(identity.repoDir, () =>
-      (opts.applyConfig ?? applyConfigTransaction)(identity.repoDir, configPath, incoming, { baseConfig })),
-    log: glog,
-  });
-
   const installRecoveredRecord = (rel: string, record: RepoRecord): void => {
     records[rel] = record;
     if (record.base) { baseRepos[rel] = record.base; applied[rel] = record.base; }
@@ -506,30 +469,57 @@ opts: {
     if (record.resolutionKey) needsRes[rel] = record.resolutionKey; else delete needsRes[rel];
   };
 
-  const processRepo = async (rel: string, chainTimings: GitChainTimings | undefined, lockKey: string): Promise<{ result: GitApplyRepoResult; commonDirGroup?: number }> => {
+  const processRepo = async (
+    rel: string,
+    chainTimings: GitChainTimings | undefined,
+    commonDirLock: HeldChainLock,
+  ): Promise<{ result: GitApplyRepoResult; commonDirGroup?: number }> => {
     const wireRemoteSec = remote.gitRepos?.[rel];
     const remoteSec = wireRemoteSec === undefined ? undefined : sanitizeGitSectionForPersistence(wireRemoteSec);
     const incomingKey = remoteSec === undefined ? undefined : gitIncomingKey(remoteSec);
     let baseSec = baseRepos[rel];
     let pend = pending[rel];
     const repoDir = repoDirOf(root, rel);
-    const configIdentity: ReceivedGitConfigIdentity = { root, relPath: rel, repoDir };
-    const sanitizedConfigReason = classifyIncomingConfigSanitation(configIdentity, wireRemoteSec, glog);
     let dotGit = await fs.lstat(path.join(repoDir, ".git")).catch(() => undefined);
     const getDiskCtx = asyncMemo(async () => dotGit ? await repoCtxFromDisk(repoDir).catch(() => undefined) : undefined);
     const commonDirGroup = commonDirGroupFor(await getDiskCtx());
-
-    const baselinePlan = await planReceivedGitConfigBaseline({
-      identity: configIdentity,
-      sanitizedReason: sanitizedConfigReason,
+    const receivedConfig = createReceivedGitConfig({
+      root,
+      relPath: rel,
+      repoDir,
       wireSection: wireRemoteSec,
+      incoming: remoteSec?.config,
       laneDisabled: opts.disableConfigLane === true,
-      leftoverPresent: dotGit !== undefined,
+      priorRecord: () => ({
+        sourceSeq: records[rel]?.sourceSeq ?? state.lastSyncedSequence,
+        ...configLaneState(records[rel] ?? {}),
+      }),
+      leftoverPresent: () => dotGit !== undefined,
       repoContext: getDiskCtx,
-      ledger: laneLedger,
+      commonDirLock,
+      materializeFresh: async (incoming) => {
+        await runMutation(repoDir, () => (opts.materializeFreshConfig ?? materializeFreshGitConfig)(
+          repoDir, incoming, path.join(repoDir, ".git")));
+      },
+      inspectFreshInstall: async () => {
+        const ctx = await repoCtxFromDisk(repoDir);
+        if (!ctx) throw new Error("fresh config apply lost repository context");
+        const owned = await configReceiver(root, ctx);
+        if (!owned.owned) throw new Error("fresh config target is not receiver-owned");
+        const installed = await readParsedConfigSnapshot(repoDir, owned.configPath, "locked");
+        if (!installed.ok) throw new Error(`fresh config post-read: ${installed.fault.reason}`);
+        const post = canonicalizeGitConfig(installed.snapshot.entries);
+        if (!post.ok) throw new Error(`fresh config post-parse: ${post.reason}`);
+        return { shape: owned.shape, config: post.config, token: installed.snapshot.token };
+      },
+      applyExisting: (configPath, incoming, baseConfig) => runMutation(repoDir, () =>
+        (opts.applyConfig ?? applyConfigTransaction)(repoDir, configPath, incoming, { baseConfig })),
       log: glog,
     });
-    if (baselinePlan) await applyReceivedGitConfig(baselinePlan, configExecutorFor(configIdentity, baselinePlan.phase));
+    const publishConfigTransition = (next: ConfigLaneState | undefined): void => {
+      if (next !== undefined) configLane[rel] = next;
+    };
+    publishConfigTransition(await receivedConfig.recordBaseline());
 
     // Design 116 recovery is the first per-repo operation in every arm. The
     // surrounding runRepo chain lock is already keyed by this common dir.
@@ -719,33 +709,19 @@ opts: {
       glog(`git-sync deferred ${rel}: ${reason}`);
     };
 
-    const configDisposition = await planReceivedGitConfigTarget({
-      identity: configIdentity,
-      laneDisabled: opts.disableConfigLane === true,
-      incoming: remoteSec.config,
-      leftoverPresent: dotGit !== undefined,
-      ledger: laneLedger,
-      log: glog,
-    });
+    const configDisposition = await receivedConfig.prepare(inheritedConfigBase);
+    publishConfigTransition(configDisposition.transition);
     const configDue = configDisposition.due;
-    const configTarget = configDisposition.target;
+    const configRequiresMaterialization = configDisposition.requiresMaterialization;
     if (!opts.disableConfigLane && !configDue) clearDeferral(rel, "config");
 
-    const configApplyPlan = (
-      phase: "config-only" | "after-materialization" | "inside-follow-lock",
-      commonDirToken?: string,
-    ): ReceivedGitConfigPlan | undefined => planReceivedGitConfigApply({
-      identity: configIdentity,
-      phase,
-      disposition: configDisposition,
-      incoming: remoteSec.config,
-      baseConfig: inheritedConfigBase,
-      ...(commonDirToken === undefined ? {} : { commonDirToken }),
-    });
-
-    const tryConfigApply = async (plan: ReceivedGitConfigPlan, executor: GitConfigExecutor): Promise<boolean> => {
+    const tryConfigApply = async (
+      operation: () => Promise<ConfigLaneState | undefined>,
+    ): Promise<boolean> => {
       try {
-        await applyReceivedGitConfig(plan, executor);
+        const next = await operation();
+        if (next === undefined) return false;
+        publishConfigTransition(next);
         clearDeferral(rel, "config");
         return true;
       } catch (error) {
@@ -780,9 +756,9 @@ opts: {
 
     let configFailed = false;
     const applyConfigOnly = async (): Promise<boolean> => {
-      const plan = configApplyPlan("config-only");
-      if (!plan) return !configDue;
-      if (await tryConfigApply(plan, configExecutorFor(configIdentity, "config-only"))) return true;
+      if (!configDue) return true;
+      if (configRequiresMaterialization) return false;
+      if (await tryConfigApply(receivedConfig.applyExisting)) return true;
       configFailed = true;
       partial[rel] = partialFrom({ appliedRefs: {}, heldRefs: {}, configApplied: false }, false);
       return true;
@@ -797,7 +773,7 @@ opts: {
     // would advance nothing and materialize nothing, so `include add` would report
     // CLEAN forever without ever putting the repository on disk (design 212 §3.2).
     const materializationOwed = opts.scope !== undefined && dotGit === undefined;
-    if (!materializationOwed && !remoteChanged && !pend && !resolutionChanged && !checkpointReproof && !(configDue && configTarget?.fresh)) {
+    if (!materializationOwed && !remoteChanged && !pend && !resolutionChanged && !checkpointReproof && !(configDue && configRequiresMaterialization)) {
       if (!(await applyConfigOnly())) return { result: "deferred", commonDirGroup };
       applied[rel] = remoteSec; // unchanged → base advances (possibly across scopes)
       clearAttempt(rel);
@@ -983,9 +959,9 @@ opts: {
       }
 
       const runFollowConfig = async (): Promise<boolean> => {
-        const plan = configApplyPlan("inside-follow-lock", lockKey);
-        if (!plan) return !configDue || configTarget === undefined;
-        return tryConfigApply(plan, configExecutorFor(configIdentity, "inside-follow-lock", lockKey));
+        if (!configDue) return true;
+        if (configRequiresMaterialization) return false;
+        return tryConfigApply(receivedConfig.applyWhileCommonDirLocked);
       };
 
       const binding = await checkoutJournalBinding(state.stream, expectedStateNonce(state), ctx);
@@ -1175,7 +1151,7 @@ opts: {
           const next = nextDeferral("apply", effectiveDeferrals.apply, heldReason, new Date().toISOString(), incomingKey, await checkoutOf(repoDir));
           effectiveDeferrals.apply = next;
         } else delete effectiveDeferrals.apply;
-        const lane = laneLedger.record(rel);
+        const lane = receivedConfig.transition() ?? configLaneState(records[rel] ?? {});
         const part = authority.held || !progress.configApplied ? partialFrom(progress, false) : undefined;
         const previous = records[rel];
         const previousRecord = previous === undefined ? undefined : inputRecord(previous);
@@ -1332,14 +1308,11 @@ opts: {
       return { result: "applied", commonDirGroup };
     }
 
-    // Clean apply — one bound plan, one identity-bound execution, one receipt.
+    // Clean apply — one repository-bound config operation.
     // Refusals and containment are decided BEFORE any mutation [v2, B5].
     // The ignore refusal deliberately short-circuits the containment probe: an
     // ignored target must not pay for a realpath walk it can never use.
     const ignoredTarget = rel !== "." && (matcher.ignores(rel) || matcher.ignores(`${rel}/`));
-    // The config phase is `ApplyReceivedGitConfig`'s decision, not this
-    // transition's: a bound after-materialization plan IS the authorization.
-    const materializedConfigPlan = configApplyPlan("after-materialization");
     const cleanPlan = await planCleanMaterialization({
       identity: { root, relPath: rel, repoDir, incomingKey: incomingKey! },
       incoming: remoteSec,
@@ -1354,9 +1327,9 @@ opts: {
       degradedMutex: opts.degradedMutex === true,
       chainTimings,
       warningSink: opts.warningSink,
-      config: materializedConfigPlan
+      config: configDue
         ? { phase: "apply-after-materialization" }
-        : { phase: "not-due", applied: !configDue || configTarget === undefined },
+        : { phase: "not-due", applied: !configDue },
       inheritedConfigBase,
       // Suppression deliberately removes the repo from the manifest projection,
       // but §130 retains the protected BASE anchor in RepoRecord for the later
@@ -1391,10 +1364,7 @@ opts: {
         return cleanProtocol.protocol;
       },
       repoContext: async () => (await repoCtxFromDisk(repoDir))!,
-      applyConfig: () => tryConfigApply(
-        materializedConfigPlan!,
-        configExecutorFor(configIdentity, "after-materialization"),
-      ),
+      applyConfig: () => tryConfigApply(receivedConfig.applyAfterMaterialization),
       log: glog,
     };
     const receipt = await executeCleanMaterialization(cleanPlan, cleanEffects);
@@ -1453,9 +1423,9 @@ opts: {
         return;
       }
       const lockKey = await gitApplyMutationKey(root, rel);
-      await chainLock(commonDirLocks, lockKey, async () => {
+      await chainLock(commonDirLocks, lockKey, async (commonDirLock) => {
         startedAt = Date.now();
-        const processed = await processRepo(rel, chainTimings, lockKey);
+        const processed = await processRepo(rel, chainTimings, commonDirLock);
         result = processed.result;
         commonDirGroup = processed.commonDirGroup;
       });
