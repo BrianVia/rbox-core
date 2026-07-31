@@ -4,13 +4,13 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { HashCache, type Manifest } from "../engine/index.js";
-import { saveConfig, saveStateUnsafeLegacyOrTest, syncStreamId, type WorkspaceConfig } from "./config.js";
+import { loadConfig, saveConfig, saveStateUnsafeLegacyOrTest, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { accountStatus } from "./account-cmd.js";
 import { flushAccountProfileWrites } from "./account-profile.js";
 import { listDevices, keyStatus } from "./auth-cmd.js";
 import { publishPrepublishMarker } from "./genesis-durable.js";
 import { daemonRuntimeDir } from "./daemon-control.js";
-import type { DaemonActivity } from "./activity.js";
+import { loadActivity, type DaemonActivity } from "./activity.js";
 import { statusCmd, statusCmdWithDeps, type StatusCmdDeps } from "./status-cmd.js";
 import { trashCmd } from "./trash-cmd.js";
 import { RBOX_VERSION } from "./version.js";
@@ -33,6 +33,7 @@ function stoppedDaemon(): DaemonObservation {
     running: false,
     stale: false,
     ownsWorkspace: false,
+    sidecarBinding: "absent",
     ambient: { kind: "absent" },
     ambientTrust: "absent",
   };
@@ -47,10 +48,32 @@ function liveDaemon(bootId = "boot-live"): DaemonObservation {
     boundWorkspaceId: "ws_status_fast",
     stale: false,
     ownsWorkspace: true,
+    sidecarBinding: "workspace",
     ambient: { kind: "absent" },
     ambientTrust: "absent",
   };
 }
+
+const observeWithDaemon = (
+  readDaemon: () => DaemonObservation,
+): StatusCmdDeps["observeWorkspace"] => async (root, request) => {
+  const config = await loadConfig(root);
+  const daemon = readDaemon();
+  return {
+    depth: "ambient",
+    root,
+    observedAt: request.now,
+    config,
+    daemon,
+    readActivity: async () => {
+      const before = readDaemon();
+      if (before.running && !before.ownsWorkspace) return undefined;
+      const activity = await loadActivity(root).catch(() => undefined);
+      const after = readDaemon();
+      return after.running && !after.ownsWorkspace ? undefined : activity;
+    },
+  };
+};
 
 async function captureStdout(fn: () => Promise<void> | void): Promise<string> {
   const out: string[] = [];
@@ -85,7 +108,7 @@ function statusDeps(overrides: Partial<StatusCmdDeps> = {}): StatusCmdDeps {
     scanManifest: async (): Promise<Manifest> => ({ generatedAt: new Date(STATUS_NOW).toISOString(), files: [] }),
     gitDivergenceCount: async () => 0,
     gitDivergenceFastRepoSource: async () => [],
-    observeDaemon: () => stoppedDaemon(),
+    observeWorkspace: observeWithDaemon(() => stoppedDaemon()),
     readDaemonPidRecord: () => ({ present: false }),
     ...overrides,
   };
@@ -271,7 +294,7 @@ test("status --json trusts attributed fresh local and skips hashcache and manife
         tmp,
         { json: true },
         statusDeps({
-          observeDaemon: () => liveDaemon(),
+          observeWorkspace: observeWithDaemon(() => liveDaemon()),
           loadHashCache: async () => {
             throw new Error("HashCache.load must not run on trusted local path");
           },
@@ -304,7 +327,7 @@ test("status local trust predicate falls back on stale boot, base mismatch, stal
           tmp,
           { json: true },
           statusDeps({
-            observeDaemon: () => liveDaemon(),
+            observeWorkspace: observeWithDaemon(() => liveDaemon()),
             scanManifest: async () => {
               scanned = true;
               return { generatedAt: new Date(STATUS_NOW).toISOString(), files: [] };
@@ -322,7 +345,7 @@ test("status local trust predicate falls back on stale boot, base mismatch, stal
   await exerciseFallback(trustedActivity(61_000));
   await exerciseFallback(trustedActivity(1_000, { changed: -1 }));
   await exerciseFallback(trustedActivity(1_000, {}), {
-    observeDaemon: () => liveDaemon("boot-new"),
+    observeWorkspace: observeWithDaemon(() => liveDaemon("boot-new")),
   });
 });
 
@@ -338,7 +361,7 @@ test("status fallback re-reads state before scanning after local base mismatch",
         tmp,
         { json: true },
         statusDeps({
-          observeDaemon: () => liveDaemon(),
+          observeWorkspace: observeWithDaemon(() => liveDaemon()),
           readLockingHealth: async () => {
             if (!rewroteState) {
               rewroteState = true;

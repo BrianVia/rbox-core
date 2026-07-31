@@ -161,7 +161,8 @@ describe("design 93 §6 complete caller disposition drift gate", () => {
       const source = await fs.readFile(path.join(cliDir, name), "utf8");
       contents.set(name, source);
       if (
-        /from\s+["']\.\.?\/sync\.js["']/.test(source)
+        (/from\s+["']\.\.?\/sync\.js["']/.test(source)
+          || /from\s+["']\.\/sync\/(?:pull|push|sync)\.js["']/.test(source))
         && (/\b(pull|pushManifest|push|sync)\s*\(/.test(source) || /\?\?\s*(pull|push)\)\s*\(/.test(source))
       ) importers.push(name);
     }
@@ -172,12 +173,11 @@ describe("design 93 §6 complete caller disposition drift gate", () => {
       "export-cmd.ts",
       "ignore-cmd.ts",
       "init-cmd.ts",
-      "main-dispatch.ts",
+      "local-runtime.ts",
       "recover-cmd.ts",
-      "sync-cmd.ts",
     ]);
 
-    for (const owner of ["chain-repair.ts", "daemon/daemon.ts", "ignore-cmd.ts", "init-cmd.ts", "main-dispatch.ts", "recover-cmd.ts", "sync-cmd.ts"]) {
+    for (const owner of ["chain-repair.ts", "daemon/daemon.ts", "ignore-cmd.ts", "init-cmd.ts", "local-runtime.ts", "recover-cmd.ts"]) {
       expect(contents.get(owner), owner).toMatch(/syncMutex|WorkspaceSyncMutex/);
     }
     expect(contents.get("export-cmd.ts")).toMatch(/explicit mutex exemption/);

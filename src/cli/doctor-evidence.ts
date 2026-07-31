@@ -1,9 +1,9 @@
 /**
  * What `rbox doctor`'s triage is ALLOWED to believe.
  *
- * This module owns the reads and the trust gates; `doctor-triage.ts` owns what
- * is said about them. Keeping the two apart is what stops a plausible-looking
- * record from becoming a confident sentence. Three rules are load-bearing:
+ * `workspace-observation.ts` owns the reads and daemon trust gates; this module
+ * adapts that closed observation to doctor's pure evidence vocabulary, while
+ * `doctor-triage.ts` owns what is said. Three rules are load-bearing:
  *
  * - Inconclusive evidence suppresses only ITS OWN check. A lookup that never
  *   got an answer can neither prove a fault nor excuse one that another check
@@ -14,45 +14,31 @@
  *   liveness verdict captured earlier with a pid read taken later can both
  *   suppress a live halt and resurrect dead residue.
  *
- * Every read here is non-mutating — `loadRawState` rather than `loadState`,
- * whose reset-journal recovery takes the workspace mutex and rewrites state.
+ * Every observation read is non-mutating. In particular local depth uses raw
+ * state rather than the recovering `loadState` path.
  */
-import { loadActivity, type DaemonActivity } from "./activity.js";
-import { inspectAdoptFence, type AdoptFenceInspection } from "./adopt-journal.js";
-import { loadConfig, loadRawState, repoRecordsForState, syncStreamId } from "./config.js";
-import { currentWorkspaceId } from "./daemon-control.js";
-import { type AmbientDaemonStatusRecord, type AmbientDaemonStatusV1 } from "./daemon/ambient-status.js";
-import {
-  observeDaemon as observeDaemonState,
-  type DaemonObservation,
-} from "./daemon/observation.js";
-import { projectGitDeferralRepos, type GitDeferralRepoProjection } from "./status-view.js";
+import type { AmbientDaemonStatusV1 } from "./daemon/ambient-status.js";
 import type { DoctorCheck, DoctorChecks } from "./doctor-cmd.js";
-import { scopeProjectionFor } from "./scope/projection.js";
+import {
+  observeWorkspace,
+  type LocalWorkspaceObservation,
+} from "./workspace-observation.js";
 
 export type { DaemonObservation } from "./daemon/observation.js";
 
-export interface TriageInputs {
-  root: string;
+export type TriageInputs = Pick<
+  LocalWorkspaceObservation,
+  "root" | "deferrals" | "activity" | "daemon" | "adopt" | "observedAt"
+> & {
   checks: DoctorChecks;
-  deferrals: GitDeferralRepoProjection[];
-  activity?: DaemonActivity;
-  ambient: AmbientDaemonStatusRecord;
-  daemon: DaemonObservation;
-  adopt: AdoptFenceInspection;
-  now: number;
   cliVersion?: string;
-}
+};
 
 export interface TriageReadDeps {
-  observeDaemon?: typeof observeDaemonState;
-  currentWorkspaceId?: typeof currentWorkspaceId;
-}
-
-/** Take the ONE ownership observation triage is allowed to use. */
-export function observeDaemon(root: string, deps: TriageReadDeps = {}, now = Date.now()): DaemonObservation {
-  const workspaceId = (deps.currentWorkspaceId ?? currentWorkspaceId)(root);
-  return (deps.observeDaemon ?? observeDaemonState)(root, workspaceId, now);
+  observeWorkspace?: (
+    root: string,
+    request: { depth: "local"; now?: number },
+  ) => Promise<LocalWorkspaceObservation>;
 }
 
 /** Read every triage input for `root`. Each read is best-effort: a diagnosis
@@ -63,49 +49,8 @@ export async function readTriageInputs(
   now = Date.now(),
   deps: TriageReadDeps = {},
 ): Promise<TriageInputs> {
-  const [deferrals, activity, adopt] = await Promise.all([
-    readDeferrals(root, now),
-    loadActivity(root).catch(() => undefined),
-    inspectAdoptFence(root).catch((error: unknown) => ({
-      status: "corrupt" as const,
-      reason: error instanceof Error ? error.message : String(error),
-    })),
-  ]);
-  const daemon = observeDaemon(root, deps, now);
-  return {
-    root,
-    checks,
-    deferrals,
-    activity,
-    adopt,
-    ambient: daemon.ambient,
-    daemon,
-    now,
-  };
-}
-
-/** Non-mutating deferral read. `loadState` would recover a standing reset
- * journal under the workspace mutex; a diagnosis must never do that. A state
- * file stamped for another stream describes another workspace and is ignored
- * rather than re-baselined. */
-async function readDeferrals(root: string, now: number): Promise<GitDeferralRepoProjection[]> {
-  try {
-    const cfg = await loadConfig(root);
-    const state = await loadRawState(root);
-    if (!state) return [];
-    if (state.stream !== undefined && state.stream !== syncStreamId(cfg)) return [];
-    const records = repoRecordsForState(state);
-    // Design 212 §3.2: doctor consumes the same projection. An out-of-scope repo's
-    // deferral is not this machine's problem to report.
-    const scope = await scopeProjectionFor(root, Object.keys(records));
-    return projectGitDeferralRepos(
-      Object.entries(records).filter(([repo]) => scope === undefined || scope.classifyRepo(repo) === "in").flatMap(([repo, record]) =>
-        Object.values(record.deferrals ?? {}).flatMap((deferral) => (deferral ? [{ repo, deferral, record }] : []))),
-      now,
-    );
-  } catch {
-    return [];
-  }
+  const observation = await (deps.observeWorkspace ?? observeWorkspace)(root, { depth: "local", now });
+  return { ...observation, checks };
 }
 
 /** This check failed, and the failure is evidence of a real fault. */

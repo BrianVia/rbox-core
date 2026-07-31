@@ -17,7 +17,7 @@ import { createReceivedGitConfig } from "./received-git-config.js";
 import { prepareFollowerBranchProtocol } from "./follower-protocol.js";
 import { settleStandingBranchProof, type StandingProofPort, type StandingRepairAttempt } from "./standing-branch-proof.js";
 import { composeFollowAuthority, composeFollowRepoTransition, followHeldDeferralReason, mergeFollowDeferralLanes, type FollowRepoTransition, type FollowTransitionIdentity, type StandingBranchProofReceipt } from "./follow-repo-transition.js";
-import { executeCleanMaterialization, planCleanMaterialization, type CleanMaterializationEffects } from "./clean-materialization.js";
+import { materializeCleanGit } from "./clean-materialization.js";
 import { createPRepairStatePort } from "./p-repair-state.js";
 import { settleExactPresentArtifact } from "./p-settlement.js";
 import { MutationGateClosedError, type MutationBoundary } from "../../engine/mutation-gate.js";
@@ -1313,13 +1313,21 @@ opts: {
     // The ignore refusal deliberately short-circuits the containment probe: an
     // ignored target must not pay for a realpath walk it can never use.
     const ignoredTarget = rel !== "." && (matcher.ignores(rel) || matcher.ignores(`${rel}/`));
-    const cleanPlan = await planCleanMaterialization({
-      identity: { root, relPath: rel, repoDir, incomingKey: incomingKey! },
+    // Suppression deliberately removes the repo from the manifest projection,
+    // but §130 retains the protected BASE anchor in RepoRecord for this
+    // operation. Never compose A/P from the suppressed projection.
+    const cleanBaseComposition = {
+      prior: { base: records[rel]?.base ?? baseSec, branchBaseOrigins: records[rel]?.branchBaseOrigins },
+      candidate: { base: remoteSec },
+    };
+    let cleanProtocol: Awaited<ReturnType<typeof prepareFollowerBranchProtocol>> | undefined;
+    const receipt = await materializeCleanGit({
+      root,
+      relPath: rel,
+      repoDir,
+      incomingKey: incomingKey!,
       incoming: remoteSec,
       ignoredTarget,
-      containmentRefusal: ignoredTarget
-        ? undefined
-        : await assertGitTargetWithinRoot(root, rel).then(() => undefined, (e) => errMsg(e)),
       cleanMaterialize,
       dotGit: dotGit && { isDirectory: dotGit.isDirectory() },
       stateNonce: state.stateNonce,
@@ -1327,26 +1335,11 @@ opts: {
       degradedMutex: opts.degradedMutex === true,
       chainTimings,
       warningSink: opts.warningSink,
-      config: configDue
-        ? { phase: "apply-after-materialization" }
-        : { phase: "not-due", applied: !configDue },
+      applyConfig: configDue
+        ? () => tryConfigApply(receivedConfig.applyAfterMaterialization)
+        : undefined,
       inheritedConfigBase,
-      // Suppression deliberately removes the repo from the manifest projection,
-      // but §130 retains the protected BASE anchor in RepoRecord for the later
-      // clean materialization transaction. Never plan A/P from the suppressed
-      // projection.
-      baseComposition: {
-        prior: { base: records[rel]?.base ?? baseSec, branchBaseOrigins: records[rel]?.branchBaseOrigins },
-        candidate: { base: remoteSec },
-      },
-    });
-    if (cleanPlan.status === "refused") {
-      await defer(cleanPlan.reason, cleanPlan.deferralReason);
-      return { result: "deferred", commonDirGroup };
-    }
-    let cleanProtocol: Awaited<ReturnType<typeof prepareFollowerBranchProtocol>> | undefined;
-    const cleanEffects: CleanMaterializationEffects = {
-      identity: cleanPlan.identity,
+      baseComposition: cleanBaseComposition,
       runMutation: (fn) => runMutation(repoDir, fn),
       applyState: (options) => applyGitState(repoDir, remoteSec, store, kek, options),
       branchProtocol: async (ctx) => {
@@ -1356,7 +1349,7 @@ opts: {
           state,
           ctx,
           record: records[rel],
-          base: cleanPlan.baseComposition.prior.base,
+          base: cleanBaseComposition.prior.base,
           incoming: remoteSec,
           liveRefs: await readAllRefs(repoDir),
         });
@@ -1364,10 +1357,8 @@ opts: {
         return cleanProtocol.protocol;
       },
       repoContext: async () => (await repoCtxFromDisk(repoDir))!,
-      applyConfig: () => tryConfigApply(receivedConfig.applyAfterMaterialization),
       log: glog,
-    };
-    const receipt = await executeCleanMaterialization(cleanPlan, cleanEffects);
+    });
     if (receipt.status === "deferred") {
       if (receipt.configLaneDeferred) {
         setDeferral(rel, "config", "config", incomingKey, await checkoutOf(repoDir));

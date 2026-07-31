@@ -1,12 +1,14 @@
 import { buildIgnoreMatcher, checkoutTransactionCapability, cryptoPoolStatus, HashCache, scanManifest, type IgnoreMatcher } from "../engine/index.js";
 import { trashStats } from "../engine/trash.js";
-import { loadActivity } from "./activity.js";
 import { fetchAccountSummary } from "./account-cmd.js";
 import { readAccountProfile } from "./account-profile.js";
-import { loadConfig, loadState, type SyncState, type WorkspaceConfig } from "./config.js";
+import { loadState, type SyncState, type WorkspaceConfig } from "./config.js";
 import { loadCredentials, type CredentialLoadResult, type Credentials } from "./credentials.js";
 import { readDaemonPidRecord } from "./daemon-control.js";
-import { observeDaemon } from "./daemon/observation.js";
+import {
+  observeWorkspace,
+  type AmbientWorkspaceObservation,
+} from "./workspace-observation.js";
 import { loadMetrics } from "./metrics.js";
 import { readPathWarnings } from "./path-warnings.js";
 import { pendingGenesisState } from "./genesis-enrollment.js";
@@ -35,7 +37,10 @@ export interface StatusCmdDeps {
     baseGitRepos: SyncState["lastSyncedManifest"]["gitRepos"],
     matcher: IgnoreMatcher
   ) => Promise<GitDivergenceRepoHint[]>;
-  observeDaemon: typeof observeDaemon;
+  observeWorkspace: (
+    root: string,
+    request: { depth: "ambient"; now: number },
+  ) => Promise<AmbientWorkspaceObservation>;
   /** Independent ownership guard for status's best-effort hash-cache write. */
   readDaemonPidRecord: typeof readDaemonPidRecord;
   readLockingHealth?: (root: string) => Promise<LockingHealth>;
@@ -53,7 +58,7 @@ export const defaultStatusDeps: StatusCmdDeps = {
   gitDivergenceCount,
   gitDivergenceStatus,
   gitDivergenceFastRepoSource,
-  observeDaemon,
+  observeWorkspace,
   readDaemonPidRecord,
   readLockingHealth,
   checkoutTransactionCapability,
@@ -154,12 +159,10 @@ export function createStatusReadPort<M extends StatusMode>(mode: M, deps: Status
     now: deps.now,
     readCredentials: deps.loadCredentials ?? loadCredentials,
     readPendingGenesis: async (accountId) => Boolean(await pendingGenesisState(accountId)),
-    readConfig: loadConfig,
-    readDaemonObservation: deps.observeDaemon,
+    readWorkspaceObservation: deps.observeWorkspace,
     inspectResetJournal: inspectResetJournalSafety,
     readResetHaltHealth,
     readState: loadState,
-    readActivity: loadActivity,
     readPathWarnings: deps.readPathWarnings ?? readPathWarnings,
     readTrashStats: (root) => trashStats(root).catch(() => undefined),
     readLockingHealth: deps.readLockingHealth ?? readLockingHealth,

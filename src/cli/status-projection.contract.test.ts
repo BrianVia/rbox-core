@@ -50,6 +50,39 @@ function trustedActivity(): DaemonActivity {
   };
 }
 
+const stoppedWorkspaceObservation = (readActivity: () => Promise<DaemonActivity | undefined> = async () => undefined) => ({
+  depth: "ambient" as const,
+  root: ROOT,
+  observedAt: NOW,
+  config: CFG,
+  daemon: {
+    ownership: "stopped" as const,
+    running: false,
+    stale: false,
+    ownsWorkspace: false,
+    sidecarBinding: "absent" as const,
+    ambient: { kind: "absent" as const },
+    ambientTrust: "absent" as const,
+  },
+  readActivity,
+});
+
+const ownedWorkspaceObservation = (activity: DaemonActivity) => ({
+  ...stoppedWorkspaceObservation(async () => activity),
+  daemon: {
+    ownership: "owned" as const,
+    running: true,
+    pid: 9,
+    bootId: "boot-1",
+    boundWorkspaceId: CFG.remoteWorkspaceId,
+    stale: false,
+    ownsWorkspace: true,
+    sidecarBinding: "workspace" as const,
+    ambient: { kind: "absent" as const },
+    ambientTrust: "absent" as const,
+  },
+});
+
 interface Recorder {
   calls: string[];
   countOf: (name: string) => number;
@@ -91,19 +124,12 @@ function readPort<M extends StatusMode>(
     now: () => NOW,
     readCredentials: note("readCredentials", async () => ({ state: "absent" as const })),
     readPendingGenesis: note("readPendingGenesis", async () => false),
-    readConfig: note("readConfig", async () => CFG),
-    readDaemonObservation: note("readDaemonObservation", () => ({
-      ownership: "stopped" as const,
-      running: false,
-      stale: false,
-      ownsWorkspace: false,
-      ambient: { kind: "absent" as const },
-      ambientTrust: "absent" as const,
-    })),
+    readWorkspaceObservation: note("readWorkspaceObservation", async () => stoppedWorkspaceObservation(
+      note("readWorkspaceActivity", async () => undefined),
+    )),
     inspectResetJournal: note("inspectResetJournal", async () => ({ status: "none" as const })),
     readResetHaltHealth: note("readResetHaltHealth", async () => undefined),
     readState: note("readState", async () => current),
-    readActivity: note("readActivity", async () => undefined),
     readPathWarnings: note("readPathWarnings", async () => undefined),
     readTrashStats: note("readTrashStats", async () => undefined),
     readLockingHealth: note("readLockingHealth", async () => ({ status: "ok" as const })),
@@ -149,8 +175,8 @@ test("one invocation performs one projection: every admitted read happens exactl
   expect(refreshes).toHaveLength(1);
   for (const read of [
     "readCredentials",
-    "readConfig",
-    "readDaemonObservation",
+    "readWorkspaceObservation",
+    "readWorkspaceActivity",
     "readState",
     "readPathWarnings",
     "readTrashStats",
@@ -205,18 +231,14 @@ test("reset halt never dereferences state", async () => {
   if (projection.kind !== "reset-halt") throw new Error("unreachable");
   expect(projection.reason).toBe("unreadable-journal");
   expect(calls).not.toContain("readState");
-  expect(calls).not.toContain("readActivity");
+  expect(calls.filter((call) => call === "readWorkspaceObservation")).toHaveLength(1);
+  expect(calls).not.toContain("readWorkspaceActivity");
   expect(calls).not.toContain("scanManifest");
 });
 
 test("trusted local observation skips the hashcache and the manifest scan", async () => {
   const { port, calls } = readPort("brief", {
-    readDaemonObservation: () => ({
-      ownership: "owned", running: true, pid: 9, bootId: "boot-1",
-      boundWorkspaceId: CFG.remoteWorkspaceId, stale: false, ownsWorkspace: true,
-      ambient: { kind: "absent" }, ambientTrust: "absent",
-    }),
-    readActivity: async () => trustedActivity(),
+    readWorkspaceObservation: async () => ownedWorkspaceObservation(trustedActivity()),
     loadHashCache: async () => {
       throw new Error("trusted local must not load the hashcache");
     },
@@ -237,22 +259,23 @@ test("trusted local observation skips the hashcache and the manifest scan", asyn
   expect(calls).not.toContain("scanManifest");
 });
 
-test("an unowned mixed-format daemon cannot make activity readable or renderable", async () => {
+test("an unowned mixed-format daemon cannot make rejected activity renderable", async () => {
   const { port, calls } = readPort("brief", {
-    readDaemonObservation: () => ({
-      ownership: "record-format-mismatch",
-      running: true,
-      pid: 9,
-      bootId: "boot-1",
-      boundWorkspaceId: CFG.remoteWorkspaceId,
-      stale: false,
-      ownsWorkspace: false,
-      ambient: { kind: "absent" },
-      ambientTrust: "binding-untrusted",
+    readWorkspaceObservation: async () => ({
+      ...stoppedWorkspaceObservation(),
+      daemon: {
+        ownership: "record-format-mismatch",
+        running: true,
+        pid: 9,
+        bootId: "boot-1",
+        boundWorkspaceId: CFG.remoteWorkspaceId,
+        stale: false,
+        ownsWorkspace: false,
+        sidecarBinding: "workspace",
+        ambient: { kind: "absent" },
+        ambientTrust: "binding-untrusted",
+      },
     }),
-    readActivity: async () => {
-      throw new Error("unowned activity must not be read");
-    },
   });
 
   const projection = await projectWorkspaceStatusDetail(ROOT, { mode: "brief" }, port, {
@@ -261,7 +284,7 @@ test("an unowned mixed-format daemon cannot make activity readable or renderable
 
   expect(projection.kind).toBe("detail");
   if (projection.kind !== "detail") throw new Error("unreachable");
-  expect(calls).not.toContain("readActivity");
+  expect(calls.filter((call) => call === "readWorkspaceObservation")).toHaveLength(0);
   expect(projection.activity).toBeUndefined();
   expect(projection.health).toBe("ok");
 });
@@ -270,12 +293,7 @@ test("a local base mismatch re-reads state before falling back to the scan", asy
   const stale = trustedActivity();
   stale.local!.baseSequence = 6;
   const { port, calls, countOf } = readPort("brief", {
-    readDaemonObservation: () => ({
-      ownership: "owned", running: true, pid: 9, bootId: "boot-1",
-      boundWorkspaceId: CFG.remoteWorkspaceId, stale: false, ownsWorkspace: true,
-      ambient: { kind: "absent" }, ambientTrust: "absent",
-    }),
-    readActivity: async () => stale,
+    readWorkspaceObservation: async () => ownedWorkspaceObservation(stale),
   });
   const refreshes: number[] = [];
 

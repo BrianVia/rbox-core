@@ -140,6 +140,20 @@ test("process and binding failures cannot lend trust to daemon sidecars", () => 
   }
 });
 
+test("sidecar binding attribution survives daemon exit without broadening trust", () => {
+  const rows = [
+    [{ present: false }, "absent"],
+    [{ present: true, workspaceId: "ws_live", version: "legacy" }, "workspace"],
+    [{ present: true, workspaceId: "ws_other", version: "legacy" }, "other-workspace"],
+    [{ present: true, unreadable: true }, "unreadable"],
+  ] as const;
+  for (const [binding, expected] of rows) {
+    const observed = observedDaemon({ pid: { present: false }, binding });
+    expect(observed.running).toBe(false);
+    expect(observed.sidecarBinding).toBe(expected);
+  }
+});
+
 test("ambient trust rejects every unsupported incarnation and clock state", () => {
   const rows: Array<[string, ObservationInput["ambient"]]> = [
     ["absent", { kind: "absent" }],

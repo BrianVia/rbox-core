@@ -2,7 +2,6 @@ import { afterEach, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import type { FileEntry, IgnoreMatcher, Manifest } from "../engine/index.js";
 import { listIgnoreRules } from "./ignore-cmd.js";
 import { assertNoUnevaluatedPurgeDeletes, MassDeleteGuardError } from "./sync/policy.js";
@@ -126,16 +125,22 @@ test("without a hint the guard still falls back to the push wording (unchanged f
   expect(err!.message).toContain("rbox push --allow-mass-delete");
 });
 
-test("purge honors RBOX_ALLOW_MASS_DELETE, exactly like every other consent site", async () => {
-  const dir = path.dirname(fileURLToPath(import.meta.url));
-  const consent = /allowMassDeletePush = [^;]*process\.env\.RBOX_ALLOW_MASS_DELETE === "1"/;
-  for (const file of ["ignore-cmd.ts", "sync-cmd.ts", "main-dispatch.ts", "recover-cmd.ts"]) {
-    const source = await fs.readFile(path.join(dir, file), "utf8");
-    expect([file, consent.test(source)]).toEqual([file, true]);
-  }
-  // …and the purge invocation is exactly the hint the guard prints.
-  const ignoreCmd = await fs.readFile(path.join(dir, "ignore-cmd.ts"), "utf8");
-  expect(ignoreCmd).toContain(`deps.massDeleteHint = "${PURGE_HINT}"`);
+test("purge honors explicit and RBOX_ALLOW_MASS_DELETE consent", async () => {
+  const child = Bun.spawn([
+    process.execPath,
+    new URL("./ignore-consent.fixture.js", import.meta.url).pathname,
+  ], { stdout: "pipe", stderr: "pipe" });
+  const [stdout, stderr, exit] = await Promise.all([
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+    child.exited,
+  ]);
+  expect(exit, stderr).toBe(0);
+  expect(JSON.parse(stdout)).toEqual([
+    { allow: false, hint: PURGE_HINT },
+    { allow: true, hint: PURGE_HINT },
+    { allow: true, hint: PURGE_HINT },
+  ]);
 });
 
 test("consent lets the same purge through, so the guard is the only thing refusing", async () => {

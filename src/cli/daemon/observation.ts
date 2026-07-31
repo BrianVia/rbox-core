@@ -37,6 +37,12 @@ export type DaemonAmbientTrust =
   | "stale"
   | "future";
 
+type DaemonSidecarBinding =
+  | "absent"
+  | "workspace"
+  | "other-workspace"
+  | "unreadable";
+
 /**
  * The single read-only answer about a workspace daemon.
  *
@@ -54,6 +60,9 @@ export interface DaemonObservation {
    * different workspace. Missing or boot-untrusted binding remains unknown. */
   stale: boolean;
   ownsWorkspace: boolean;
+  /** Binding-only attribution for daemon-owned sidecars such as logs and
+   * metrics. Unlike process ownership, this remains meaningful after exit. */
+  sidecarBinding: DaemonSidecarBinding;
   ambient: AmbientDaemonStatusRecord;
   ambientTrust: DaemonAmbientTrust;
   trustedAmbient?: AmbientDaemonStatusV1;
@@ -111,6 +120,15 @@ function ambientTrustOf(
   return { trust: "trusted", status: ambient.status };
 }
 
+function sidecarBindingOf(
+  binding: DaemonBindingRecord,
+  expectedWorkspaceId: string | undefined,
+): DaemonSidecarBinding {
+  if (!binding.present) return "absent";
+  if (binding.unreadable || binding.workspaceId === undefined || expectedWorkspaceId === undefined) return "unreadable";
+  return binding.workspaceId === expectedWorkspaceId ? "workspace" : "other-workspace";
+}
+
 /** Pure core kept private so adapters cannot assemble a parallel trust path. */
 function classifyDaemonObservation(snapshot: DaemonObservationSnapshot): DaemonObservation {
   const ownership = ownershipOf(snapshot);
@@ -128,6 +146,7 @@ function classifyDaemonObservation(snapshot: DaemonObservationSnapshot): DaemonO
       : {}),
     stale,
     ownsWorkspace: ownership === "owned",
+    sidecarBinding: sidecarBindingOf(snapshot.binding, snapshot.expectedWorkspaceId),
     ambient: snapshot.ambient,
     ambientTrust: ambient.trust,
     ...(trusted === undefined ? {} : { trustedAmbient: trusted }),

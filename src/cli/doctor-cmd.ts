@@ -2,13 +2,12 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { buildIgnoreMatcher, checkoutTransactionCapability, cryptoPoolStatus, gitIdentity, gitIdentityKey, ManifestChainError, MAX_MANIFEST_DELTA_CHAIN, type IgnoreMatcher } from "../engine/index.js";
-import { loadActivity, type DaemonActivity } from "./activity.js";
+import type { DaemonActivity } from "./activity.js";
 import { loadConfig, loadState, repoRecordsForState, syncStreamId, type WorkspaceConfig } from "./config.js";
 import { credentialFailureMessage, loadCredentials, type CredentialLoadResult, type Credentials } from "./credentials.js";
-import { currentWorkspaceId, readDaemonBindingRecord, readMergedDaemonLogTail } from "./daemon-control.js";
-import { observeDaemon } from "./daemon/observation.js";
+import type { DaemonObservation } from "./daemon/observation.js";
 import { enrolledDeviceId, loadDevice } from "./e2ee-keystore.js";
-import { loadMetrics, type SyncMetrics } from "./metrics.js";
+import type { SyncMetrics } from "./metrics.js";
 import { promptConfirm } from "./prompt.js";
 import { verifyAndParseManifest } from "./release-verify.js";
 import { RBOX_VERSION } from "./version.js";
@@ -28,9 +27,9 @@ import { fetchWithDeadline, transferTimeoutMs } from "./remote/resilient.js";
 import { listWorktrees } from "../engine/git/shared.js";
 import { formatBinaryBytes } from "./quota-format.js";
 import { emitJson } from "./json.js";
+import { observeWorkspace, type LocalWorkspaceObservation } from "./workspace-observation.js";
 
 const REPORT_CAP_BYTES = 512 * 1024;
-const DAEMON_LOG_TAIL_BYTES = 64 * 1024;
 const SECTION_STRING_CAP_BYTES = 2 * 1024;
 const FETCH_TIMEOUT_MS = 3500;
 const STALE_EXCLUDED = { excluded: "stale daemon binding" } as const;
@@ -161,7 +160,7 @@ export interface DoctorContext {
   credentialResult?: CredentialLoadResult;
   checks: DoctorChecks;
   workspaceShape: WorkspaceShape;
-  daemonStale: boolean;
+  observation: LocalWorkspaceObservation;
   localOnly: {
     leftoverWorktrees: LocalOnlyLeftoverWorktreeSection;
     repoResidue?: LocalOnlyRepoResidueSection;
@@ -365,25 +364,21 @@ export async function checkDeviceIdentity(creds: Credentials | undefined, cfg: W
   return { ok: true, label: "device", message: `device ${enrolled}` };
 }
 
-function checkDaemon(root: string, cfg: WorkspaceConfig): { check: DoctorCheck; stale: boolean } {
-  const daemon = observeDaemon(root, cfg.remoteWorkspaceId);
+function checkDaemon(daemon: DaemonObservation): DoctorCheck {
   if (daemon.stale) {
     return {
-      stale: true,
-      check: {
-        ok: false,
-        label: "background sync",
-        message: `running but bound to a different workspace${daemon.pid ? ` (pid ${daemon.pid})` : ""}`,
-        hint: "run `rbox start` to rebind",
-        status: "stale",
-        ...(daemon.pid ? { pid: daemon.pid } : {}),
-      },
+      ok: false,
+      label: "background sync",
+      message: `running but bound to a different workspace${daemon.pid ? ` (pid ${daemon.pid})` : ""}`,
+      hint: "run `rbox start` to rebind",
+      status: "stale",
+      ...(daemon.pid ? { pid: daemon.pid } : {}),
     };
   }
   if (daemon.running) {
-    return { stale: false, check: { ok: true, label: "background sync", message: `running (pid ${daemon.pid})`, status: "running", ...(daemon.pid ? { pid: daemon.pid } : {}) } };
+    return { ok: true, label: "background sync", message: `running (pid ${daemon.pid})`, status: "running", ...(daemon.pid ? { pid: daemon.pid } : {}) };
   }
-  return { stale: false, check: { ok: false, label: "background sync", message: "stopped", hint: "run `rbox start`", status: "stopped" } };
+  return { ok: false, label: "background sync", message: "stopped", hint: "run `rbox start`", status: "stopped" };
 }
 
 async function checkRemote(creds: Credentials | undefined, cfg: WorkspaceConfig): Promise<DoctorCheck> {
@@ -693,7 +688,7 @@ const DOCTOR_CHECKS: readonly DoctorCheckDescriptor[] = [
     : checkCredentials(creds)),
   describeCheck("enrollment", ({ creds }) => checkEnrollment(creds)),
   describeCheck("device", ({ creds, cfg }) => checkDeviceIdentity(creds, cfg)),
-  describeCheck("daemon", ({ root, cfg }) => checkDaemon(root, cfg).check),
+  describeCheck("daemon", ({ daemon }) => checkDaemon(daemon)),
   describeCheck("remote", ({ creds, cfg }) => checkRemote(creds, cfg)),
   describeCheck("version", ({ creds, cfg }) => checkVersion(creds, cfg)),
   describeCheck("state", ({ root, cfg }) => checkState(root, cfg)),
@@ -709,13 +704,17 @@ const DOCTOR_CHECKS: readonly DoctorCheckDescriptor[] = [
 
 export async function collectDoctorContext(
   root: string,
-  options: { residueBytes?: boolean } = {},
+  options: { residueBytes?: boolean; now?: number } = {},
 ): Promise<DoctorContext> {
-  const rawCfg = await loadConfig(root);
+  const observation = await observeWorkspace(root, {
+    depth: "local",
+    ...(options.now === undefined ? {} : { now: options.now }),
+  });
+  const rawCfg = observation.config;
   const loaded = await loadCredentials();
   const creds = loaded.state === "valid" ? loaded.credentials : undefined;
   const cfg = { ...rawCfg, remoteUrl: creds?.remoteUrl ?? rawCfg.remoteUrl };
-  const input: DoctorCheckRunInput = { root, cfg, creds, loaded };
+  const input: DoctorCheckRunInput = { root, cfg, daemon: observation.daemon, creds, loaded };
   const [checkEntries, shape, leftoverWorktrees, repoResidue] = await Promise.all([
     // Each descriptor carries its own key: a keyed record, not index-aligned.
     Promise.all(DOCTOR_CHECKS.map(async (descriptor) => [descriptor.id, await descriptor.run(input)] as const)),
@@ -748,8 +747,7 @@ export async function collectDoctorContext(
     cfg,
     creds,
     credentialResult: loaded,
-    // The daemon check's `stale` status is what `daemon.stale` carried before.
-    daemonStale: checks.daemon.status === "stale",
+    observation,
     workspaceShape: shape,
     checks,
     localOnly: {
@@ -761,10 +759,6 @@ export async function collectDoctorContext(
       repoResidue: repoResidue.diagnostics,
     },
   };
-}
-
-async function daemonLogTail(root: string): Promise<string> {
-  return readMergedDaemonLogTail(root, DAEMON_LOG_TAIL_BYTES);
 }
 
 function pickMetrics(m: SyncMetrics): MetricsSection {
@@ -815,12 +809,13 @@ function machineChecks(checks: DoctorChecks): DoctorChecks {
 }
 
 export async function buildDiagnosticsBundle(ctx: DoctorContext): Promise<DiagnosticsBundle> {
-  const sidecars = daemonOwnedSectionsExcluded(ctx)
+  const observedSidecars = await ctx.observation.readDaemonSidecars();
+  const sidecars = observedSidecars === undefined
     ? { daemonLogTail: STALE_EXCLUDED, metrics: STALE_EXCLUDED, activity: STALE_EXCLUDED }
     : {
-        daemonLogTail: redactGitLogLines(await daemonLogTail(ctx.root)),
-        metrics: pickMetrics(await loadMetrics(ctx.root)),
-        activity: pickActivity(await loadActivity(ctx.root)),
+        daemonLogTail: redactGitLogLines(observedSidecars.daemonLogTail),
+        metrics: pickMetrics(observedSidecars.metrics),
+        activity: pickActivity(observedSidecars.activity),
       };
   return fitBundle({
     version: RBOX_VERSION,
@@ -840,14 +835,6 @@ export async function buildDiagnosticsBundle(ctx: DoctorContext): Promise<Diagno
       quarantinePresent: 0,
     },
   });
-}
-
-function daemonOwnedSectionsExcluded(ctx: DoctorContext): boolean {
-  if (ctx.daemonStale) return true;
-  const binding = readDaemonBindingRecord(ctx.root);
-  if (!binding.present) return false;
-  const current = currentWorkspaceId(ctx.root) ?? ctx.cfg.remoteWorkspaceId;
-  return binding.unreadable === true || binding.workspaceId !== current;
 }
 
 function fitBundle(bundle: DiagnosticsBundle): DiagnosticsBundle {
@@ -982,10 +969,10 @@ export async function doctorCmd(root: string, opts: DoctorCmdOptions): Promise<v
   }
   const ctx = await collectDoctorContext(
     root,
-    opts.residueBytes ? { residueBytes: true } : {},
+    { ...(opts.residueBytes ? { residueBytes: true } : {}), ...(opts.now === undefined ? {} : { now: opts.now }) },
   );
-  const { readTriageInputs, renderWorkspaceTriage, triageWorkspace } = await import("./doctor-triage.js");
-  const triage = triageWorkspace(await readTriageInputs(root, ctx.checks, opts.now));
+  const { renderWorkspaceTriage, triageWorkspace } = await import("./doctor-triage.js");
+  const triage = triageWorkspace({ ...ctx.observation, checks: ctx.checks });
   if (opts.json === true) {
     emitJson(triage);
     if (Object.values(ctx.checks).some((c) => !c.ok)) process.exitCode = 1;

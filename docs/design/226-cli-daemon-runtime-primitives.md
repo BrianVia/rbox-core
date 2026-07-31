@@ -1,6 +1,6 @@
 # 226 — Behavior-preserving CLI and daemon runtime primitives
 
-**Status:** ALIGNED after round 3; Cycle 1 implemented and validated
+**Status:** ALIGNED after round 3; Cycles 1-2 and bounded Cycle 3/4/6 slices implemented and validated
 **Snapshot:** `690544a28` (`origin/2.0`, 2026-07-30)
 **Scope:** `src/cli/**` and CLI-owned orchestration in `src/engine/**`
 **Foundation:** the aligned, uncommitted design-223 audit from the older
@@ -551,3 +551,68 @@ Validation at the implementation snapshot:
   bootstrap/platform secrets.
 
 No feature or compatibility deletion is approved by this implementation.
+
+## 13. Runtime primitive wave outcome
+
+The second implementation wave landed three behavior-preserving ownership
+reductions without entering the U3 exclusion zone:
+
+1. `LocalRuntime` is the sole foreground composition owner for pull, push, and
+   pull-then-push sync. It holds one workspace lease across authenticated remote
+   construction, reporting, the complete mutation, presentation completion, and
+   the advisory drift check. `main-dispatch.ts` no longer imports sync engines,
+   remote construction, reports, progress projection, or the workspace mutex.
+   Only the ten reachable direct/sync mass-delete policies are representable.
+2. `WorkspaceObservation` owns bounded config/daemon attribution and the
+   explicitly ambient/local observations shared by status and doctor. Status
+   retains its reset-halt fast path and defers activity I/O until admitted.
+   Diagnostic sidecars are read through one exact operation that validates the
+   workspace binding both before and after the read, discarding bytes if a
+   daemon rebinds during collection. The observation is deliberately documented
+   as non-atomic; it does not claim a filesystem snapshot or hide maintenance.
+3. `materializeCleanGit` replaces the clean/fresh receive path's public
+   planner, bound/refused plans, config phase, effects port, physical receipt,
+   identity echo/mismatch error, and executor. Ignore-first containment,
+   capable-lineage admission, lazy local-ref reads, wipe authority, typed A/P/K
+   mutation, Git-before-config ordering, BASE/pending/partial composition, and
+   deferral precedence remain inside the one complete operation.
+
+The first adversarial implementation review rejected two drafts. The accepted
+code removes the proposed always-open foreground shutdown gate, keeps drift
+inspection under the lease, removes an impossible pull-consented/push-guarded
+state, keeps CLI remedy copy outside the runtime, closes the test-only services
+bypass, and hardens diagnostic attribution against a mid-read rebind. These are
+implementation corrections, not deferred findings.
+
+Protected functionality remains the ledger in section 2. No command, flag,
+output, wire/persisted shape, state-plane path, CAS order, daemon scheduling
+path, migration/readiness capability, Git lane, or fast path was retired. The
+only deletion candidates executed in this wave were internal protocols with a
+single immediate caller and no package/script/barrel consumer. All challenged
+product requirements in section 6 remain preserved pending their decisions.
+
+Validation at this wave snapshot:
+
+- TypeScript for root, API, and scripts passes; repository guards pass.
+- The integrated changed-surface run records 178 passes and 11 host failures.
+  The identical run at pre-wave commit `26316d066` records the same 178 passes
+  and the same 11 failures by name. They are the established `/var` symlink,
+  credential-safety, process-probe, and compatible-lock/deferral host baseline.
+- The new runtime policy/lease contracts, observation depth/attribution
+  contracts, received-config contracts, and clean-materialization contracts are
+  green. The wider config-pull suite remains at its exact 4-pass/8-failure
+  baseline; the shutdown suite remains at its exact 4-pass/1-failure baseline.
+- The mutation meta-gate covers 2/7 guards and refuses the other five because
+  their unmutated state-plane fixture cannot acquire a compatible lock on this
+  host (`degraded-fence`). This wave does not touch those sources.
+- The official host dev builder produces a Darwin arm64 binary. Compiled
+  version/help/zsh completion and the tmux TUI smoke pass.
+- Rig units retain their exact 152/153 baseline; dated-log harvest is the known
+  host-shell failure. Live rig preflight cannot proceed because the local Apple
+  container service is stopped and dev bootstrap/platform secrets are absent;
+  the dev API itself is reachable.
+
+This wave does not claim that all later cycles are complete. Daemon mutation
+cutover, complete state-snapshot consolidation, remaining Git operations,
+FileReplica, RemoteWorkspace, and gated compatibility retirement remain
+separate behavior-differential cycles.

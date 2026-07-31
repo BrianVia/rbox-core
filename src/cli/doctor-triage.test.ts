@@ -3,7 +3,6 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
-  observeDaemon,
   readTriageInputs,
   renderWorkspaceTriage,
   triageWorkspace,
@@ -11,6 +10,7 @@ import {
   type TriageInputs,
 } from "./doctor-triage.js";
 import { observeDaemon as observeDaemonState } from "./daemon/observation.js";
+import { observeWorkspace as observeWorkspaceState } from "./workspace-observation.js";
 import { checkManifestChain, collectDoctorContext, doctorCmd, type DoctorChecks } from "./doctor-cmd.js";
 import type { DaemonObservation } from "./doctor-evidence.js";
 import { saveStateUnsafeLegacyOrTest, syncStreamId } from "./config.js";
@@ -48,7 +48,7 @@ const STOPPED: DaemonObservation = {
   running: false,
   stale: false,
   ownsWorkspace: false,
-  ambient: { kind: "absent" },
+  sidecarBinding: "absent",
   ambientTrust: "absent",
 };
 
@@ -62,13 +62,14 @@ const inputs = (over: Partial<TriageInputs> = {}): TriageInputs => ({
     running: true,
     stale: false,
     ownsWorkspace: true,
+    sidecarBinding: "workspace",
     pid: LIVE_PID,
     bootId: BOOT,
     ambient: { kind: "absent" },
     ambientTrust: "absent",
   },
   adopt: { status: "none" },
-  now: NOW,
+  observedAt: NOW,
   cliVersion: "1.9.0",
   ...over,
 });
@@ -87,21 +88,28 @@ const workspaceConfig = () => ({
  * root's workspace id reproduces a daemon that rebound elsewhere. */
 function liveness(opts: { running: boolean; pid?: number; bootId?: string; boundTo?: string }) {
   return {
-    observeDaemon: (observedRoot: string, workspaceId: string | undefined, now: number) =>
-      observeDaemonState(observedRoot, workspaceId, now, {
+    observeWorkspace: async (observedRoot: string, request: { depth: "local"; now?: number }) => {
+      const observed = await observeWorkspaceState(observedRoot, request);
+      const daemon = observeDaemonState(observedRoot, observed.config.remoteWorkspaceId, request.now, {
         readPid: () => opts.running
           ? { present: true, pid: opts.pid ?? LIVE_PID, bootId: opts.bootId ?? BOOT, version: "v2" }
           : { present: false },
         readBinding: () => opts.running
           ? {
             present: true,
-            workspaceId: opts.boundTo ?? workspaceId,
+            workspaceId: opts.boundTo ?? observed.config.remoteWorkspaceId,
             bootId: opts.bootId ?? BOOT,
             version: "v2",
           }
           : { present: false },
         processMatches: () => opts.running,
-      }),
+      });
+      return {
+        ...observed,
+        daemon,
+        activity: daemon.running && !daemon.ownsWorkspace ? undefined : observed.activity,
+      };
+    },
   };
 }
 
@@ -355,9 +363,9 @@ test("a daemon bound to another workspace also drops halt residue", async () => 
   });
   await writeDaemonRecords({ statusBootId: BOOT, pidBootId: BOOT });
   const collected = await readTriageInputs(root, healthyChecks(), NOW, liveness({ running: true, boundTo: "ws_elsewhere" }));
-  // Producer proof: the halt IS on disk and the daemon IS alive — the binding
-  // mismatch alone is what makes the residue unowned.
-  expect(collected.activity?.halt).toBeDefined();
+  // WorkspaceObservation rejects the sidecar before the doctor adapter sees it:
+  // a live process without workspace ownership cannot lend this root activity.
+  expect(collected.activity).toBeUndefined();
   expect(collected.daemon.running).toBe(true);
   expect(collected.daemon.stale).toBe(true);
   expect(collected.daemon.ownsWorkspace).toBe(false);
@@ -425,9 +433,9 @@ test("a live daemon for a PREFIX SIBLING root does not claim this one", async ()
         typedReason: { kind: "mass-delete", op: "pull" },
       },
     });
-    expect(observeDaemon(root).ownsWorkspace).toBe(false);
+    expect(observeDaemonState(root, "ws_1").ownsWorkspace).toBe(false);
     // ...and the same process IS still recognized as the sibling's own daemon.
-    expect(observeDaemon(sibling).running).toBe(true);
+    expect(observeDaemonState(sibling, undefined).running).toBe(true);
 
     const collected = await readTriageInputs(root, healthyChecks(), NOW);
     expect(collected.activity?.halt).toBeDefined();
@@ -493,7 +501,7 @@ test("a pull-only claim requires the status record to match the live pidfile inc
   await writeDaemonRecords({ statusBootId: "boot-other", pidBootId: BOOT, status: { mode: "pull-only", daemonVersion: "1.9.0" } });
   const mismatched = await readTriageInputs(root, healthyChecks(), NOW, liveness({ running: true }));
   expect(mismatched.daemon.bootId).toBe(BOOT);
-  expect(mismatched.ambient.kind).toBe("ok");
+  expect(mismatched.daemon.ambient.kind).toBe("ok");
   expect(findingById(triageWorkspace(mismatched).findings, "pull-only")).toBeUndefined();
 
   await writeDaemonRecords({ statusBootId: BOOT, pidBootId: BOOT, status: { mode: "pull-only", daemonVersion: "1.9.0" } });
@@ -515,7 +523,7 @@ test("a record from a PREVIOUS boot yields no watcher and no version-skew findin
   const old = await readTriageInputs(root, healthyChecks(), NOW, liveness({ running: true }));
   // Producer proof: the record parsed, the daemon is live and owns this root —
   // the boot-id mismatch is the only thing standing between them.
-  expect(old.ambient.kind).toBe("ok");
+  expect(old.daemon.ambient.kind).toBe("ok");
   expect(old.daemon.ownsWorkspace).toBe(true);
   expect(old.daemon.bootId).toBe(BOOT);
 
@@ -532,7 +540,7 @@ test("a legacy record with no boot id at all is not trusted", async () => {
     status: { state: "attention", attentionReason: "watcher-degraded", daemonVersion: "1.0.0" },
   });
   const legacy = await readTriageInputs(root, healthyChecks(), NOW, liveness({ running: true }));
-  expect(legacy.ambient.kind).toBe("ok");
+  expect(legacy.daemon.ambient.kind).toBe("ok");
   expect(findingById(triageWorkspace(legacy).findings, "watcher-degraded")).toBeUndefined();
 });
 
@@ -543,7 +551,7 @@ test("a dead daemon's fresh record produces no watcher or version finding", asyn
     status: { state: "attention", attentionReason: "watcher-degraded", daemonVersion: "1.0.0" },
   });
   const dead = await readTriageInputs(root, healthyChecks(), NOW, liveness({ running: false }));
-  expect(dead.ambient.kind).toBe("ok");
+  expect(dead.daemon.ambient.kind).toBe("ok");
   const findings = triageWorkspace(dead).findings;
   expect(findingById(findings, "watcher-degraded")).toBeUndefined();
   expect(findingById(findings, "daemon-version-skew")).toBeUndefined();
@@ -556,7 +564,7 @@ test("a future-dated heartbeat is not trusted as live state", async () => {
     status: { state: "attention", attentionReason: "watcher-degraded", heartbeatAt: new Date(NOW + 3 * 3600_000).toISOString() },
   });
   const skewed = await readTriageInputs(root, healthyChecks(), NOW, liveness({ running: true }));
-  expect(skewed.ambient.kind).toBe("ok");
+  expect(skewed.daemon.ambient.kind).toBe("ok");
   expect(findingById(triageWorkspace(skewed).findings, "watcher-degraded")).toBeUndefined();
 });
 

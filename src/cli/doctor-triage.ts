@@ -21,7 +21,7 @@ import { style } from "./style.js";
 import { RBOX_VERSION } from "./version.js";
 import type { DoctorChecks } from "./doctor-cmd.js";
 
-export { observeDaemon, readTriageInputs, unverifiedChecks, type DaemonObservation, type TriageInputs, type TriageReadDeps } from "./doctor-evidence.js";
+export { readTriageInputs, unverifiedChecks, type DaemonObservation, type TriageInputs, type TriageReadDeps } from "./doctor-evidence.js";
 
 export type TriageSeverity = "blocked" | "attention" | "info";
 
@@ -461,7 +461,7 @@ export function triageWorkspace(input: TriageInputs): WorkspaceTriage {
   const halt = owned && input.activity?.halt ? haltFinding(input.root, input.activity.halt) : undefined;
   if (halt) findings.push(halt);
   findings.push(...environmentFindings(input));
-  for (const repo of input.deferrals) findings.push(deferralFinding(input.root, repo, input.now));
+  for (const repo of input.deferrals) findings.push(deferralFinding(input.root, repo, input.observedAt));
   findings.push(...daemonFindings(input));
 
   const ordered = findings

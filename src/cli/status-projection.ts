@@ -153,10 +153,11 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
   const loadedCredentials = await port.readCredentials();
   const creds = loadedCredentials.state === "valid" ? loadedCredentials.credentials : undefined;
   const genesisPending = Boolean(creds?.accountId && await port.readPendingGenesis(creds.accountId));
-  const rawCfg = await port.readConfig(root);
-  const cfg = { ...rawCfg, remoteUrl: creds?.remoteUrl ?? rawCfg.remoteUrl };
   const observationNow = port.now();
-  const observedDaemon = port.readDaemonObservation(root, cfg.remoteWorkspaceId, observationNow);
+  const workspaceObservation = await port.readWorkspaceObservation(root, { depth: "ambient", now: observationNow });
+  const rawCfg = workspaceObservation.config;
+  const cfg = { ...rawCfg, remoteUrl: creds?.remoteUrl ?? rawCfg.remoteUrl };
+  const observedDaemon = workspaceObservation.daemon;
   const running = observedDaemon.running && !observedDaemon.stale;
   const daemonVersion = observedDaemon.version;
   const daemonMode: DaemonMode | undefined = observedDaemon.mode;
@@ -200,6 +201,8 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
     return halt as WorkspaceStatusProjection<M>;
   }
 
+  const rawActivityP = workspaceObservation.readActivity();
+
   const accountSummaryP = probes.mode === "verbose" ? probes.readAccountSummary(loadedCredentials) : undefined;
   let state = await port.readState(root, syncStreamId(cfg));
   let hygieneDetails: StatusDeferralDisplayDetails = new Map();
@@ -211,17 +214,12 @@ export async function projectWorkspaceStatusDetail<M extends StatusMode>(
   };
   await runHygiene();
 
-  // A stopped daemon's terminal halt/quota residue is durable recovery evidence.
-  // A live process that cannot prove workspace ownership is different: none of
-  // its activity sidecar may be attributed to this workspace.
-  const activityP = observedDaemon.ownsWorkspace || !observedDaemon.running
-    ? port.readActivity(root)
-    : Promise.resolve(undefined);
   const pathWarningsP = port.readPathWarnings(root);
   const trashP = port.readTrashStats(root);
   const lockingP = port.readLockingHealth(root);
   const accountJsonP = probes.mode === "json" ? probes.readAccountUsage(loadedCredentials) : undefined;
-  const [rawActivity, durablePathWarnings] = await Promise.all([activityP, pathWarningsP]);
+  const rawActivity = await rawActivityP;
+  const durablePathWarnings = await pathWarningsP;
   let pathWarnings: PathWarningsV1 | undefined = durablePathWarnings;
   const attributionNow = port.now();
   const attributeActivity = (base: SyncState) =>
