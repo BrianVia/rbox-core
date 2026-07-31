@@ -374,3 +374,6 @@ behind-origin count; loudly warn when behind.
   ("--- from daemon.log (legacy, last written <date>)") or drop legacy-file
   tails once dated logs exist.
 - 2026-07-30: interactive `rm -rf` cleanup (13 dirs, one at a time) aggregated into one 46k mass-delete halt; surfaced only in admin/CLI, founder discovered it an hour later. Friction: intentional local deletions need a visible propagate-or-not surface, not a silent halt.
+- 2026-07-30: Max blocked for DAYS on `rbox git resolve keep-mine` → "daemon/CLI is syncing". The unconfirmed pass waits only ~0.8s for the sync mutex (16×50ms) while the confirmed pass gets 60s (resolve-command.ts acquisitionDeadlineMs); a busy daemon makes the 0.8s window unlandable. Fix hint: same 60s deadline + "waiting…" line on the unconfirmed pass.
+- 2026-07-31: a repo can sit wedged on a deferral for 7 DAYS with no escalation beyond a status line the user must ask for. Friction: long-lived deferrals need louder surfacing (menu-bar/notification), not silent parking. (Related backlog: RboxBar git-resolve shortcut.)
+- 2026-07-31: papercuts appended in the primary checkout were silently reverted (file-plane sync echo? #535-adjacent) before commit — append+commit papercuts in ONE step on synced checkouts.
