@@ -128,9 +128,6 @@ test("process and binding failures cannot lend trust to daemon sidecars", () => 
     ["legacy pid with v2 binding", {
       pid: { present: true, pid: 42, version: "legacy" },
     }, "record-format-mismatch", false],
-    ["binding from another boot", {
-      binding: { present: true, workspaceId: "ws_live", bootId: "boot-old", version: "v2" },
-    }, "binding-boot-mismatch", false],
   ];
   for (const [name, over, ownership, stale] of rows) {
     const observed = observedDaemon(over);
@@ -138,6 +135,18 @@ test("process and binding failures cannot lend trust to daemon sidecars", () => 
     expect(observed.ownsWorkspace).toBe(false);
     expect(observed.trustedAmbient).toBeUndefined();
   }
+});
+
+test("binding boot metadata cannot override the pidfile incarnation", () => {
+  const observed = observedDaemon({
+    binding: { present: true, workspaceId: "ws_live", bootId: "boot-loser", version: "v2" },
+  });
+
+  expect(observed.ownership).toBe("owned");
+  expect(observed.ownsWorkspace).toBe(true);
+  expect(observed.bootId).toBe("boot-live");
+  expect(observed.ambientTrust).toBe("trusted");
+  expect(observed.trustedAmbient?.bootId).toBe("boot-live");
 });
 
 test("sidecar binding attribution survives daemon exit without broadening trust", () => {

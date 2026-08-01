@@ -2201,28 +2201,6 @@ argue for the same thing, which is that doctor should be able to SEE them.
 
 ### 7.14 Further findings from 5C's matrices
 
-**FINDING — `rbox status` falsely reports a healthy migrated workspace as
-halted, and the daemon then gates sync off. User-visible, and the most serious
-thing 5C found.** On an empty
-manifest with nothing wrong: one ordinary read-only load deposits `state.db-wal`
-and `state.db-shm`, which are never cleaned;
-`classifySqliteResetPredecode` reads that sidecar vector as row **W1**;
-`inspectResetJournal` converts W1 into a halt; and `status-view.ts` renders
-"sync halted to protect recovery state". 163's own decoder table treats W1 as an
-ordinary recoverable takeover, not an operator condition, and `recovery.ts` does
-take it over silently — only the read-only inspection surfaces it as a halt.
-**SCOPE CORRECTED (review).** 5C's first characterization was wrong in two
-ways. "Doctor gets it right" is FALSE — doctor makes the same read-only load and
-simply never consults the reset journal, so the divergence is which surfaces
-ASK, not which are correct. And the blast radius is larger than a misleading
-line of copy: it reaches `daemon.ts`'s `resetOperationBoundary`, so the real
-sequence is migrate -> status -> start -> **sync gated off**, measured at 18/25.
-The violation is one line in `store/open.ts`. Not this wave's fix; the lane is
-redirected. It is also racy within one invocation, because `statusCmd` inspects
-the journal concurrently with its own store open. This is the read-only-open-still-writes
-hazard 163 already records, reaching the operator surface. Pinned
-delete-when-fixed in `no-regression.test.ts`.
-
 **FINDING — genesis is unreachable through the `node:fs` default export.**
 Genesis performs 28 of its 36 workspace calls through `node:fs/promises`,
 including the intent publication, both renames, and both parent fsyncs — every

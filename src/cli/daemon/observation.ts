@@ -21,7 +21,6 @@ export type DaemonOwnership =
   | "unbound"
   | "wrong-workspace"
   | "record-format-mismatch"
-  | "binding-boot-mismatch"
   | "owned";
 
 export type DaemonAmbientTrust =
@@ -92,10 +91,9 @@ function ownershipOf(snapshot: DaemonObservationSnapshot): DaemonOwnership {
   if (binding.workspaceId === undefined) return "unbound";
   if (expectedWorkspaceId === undefined || binding.workspaceId !== expectedWorkspaceId) return "wrong-workspace";
   if ((pid.version === "v2") !== (binding.version === "v2")) return "record-format-mismatch";
-  if (pid.version === "v2" && binding.version === "v2"
-    && (pid.bootId === undefined || binding.bootId === undefined || binding.bootId !== pid.bootId)) {
-    return "binding-boot-mismatch";
-  }
+  // The binding record establishes workspace identity, not live incarnation.
+  // Its boot metadata can lag a winning daemon write; pidfile + activity/status
+  // boot ids remain the compatibility authority for incarnation attribution.
   return "owned";
 }
 
