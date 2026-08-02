@@ -45,6 +45,7 @@ test("bare ignore collapses builtins while --list prints every rule", async () =
 // ---------------------------------------------------------------------------
 
 const PURGE_HINT = "rbox ignore --purge --allow-mass-delete";
+const SYNC_HINT = "rbox sync --allow-mass-delete";
 
 const entry = (p: string): FileEntry => ({ path: p, sha256: "a".repeat(64), size: 1, mode: 0o644, mtimeMs: 0, type: "file" });
 const manifest = (files: FileEntry[]): Manifest => ({ generatedAt: "2026-07-29T00:00:00.000Z", files });
@@ -126,9 +127,17 @@ test("without a hint the guard still falls back to the push wording (unchanged f
 });
 
 test("purge honors explicit and RBOX_ALLOW_MASS_DELETE consent", async () => {
+  expect(await fixtureJson("./ignore-consent.fixture.js")).toEqual([
+    { allow: false, hint: PURGE_HINT },
+    { allow: true, hint: PURGE_HINT },
+    { allow: true, hint: PURGE_HINT },
+  ]);
+});
+
+async function fixtureJson(name: string): Promise<unknown> {
   const child = Bun.spawn([
     process.execPath,
-    new URL("./ignore-consent.fixture.js", import.meta.url).pathname,
+    new URL(name, import.meta.url).pathname,
   ], { stdout: "pipe", stderr: "pipe" });
   const [stdout, stderr, exit] = await Promise.all([
     new Response(child.stdout).text(),
@@ -136,10 +145,25 @@ test("purge honors explicit and RBOX_ALLOW_MASS_DELETE consent", async () => {
     child.exited,
   ]);
   expect(exit, stderr).toBe(0);
-  expect(JSON.parse(stdout)).toEqual([
-    { allow: false, hint: PURGE_HINT },
-    { allow: true, hint: PURGE_HINT },
-    { allow: true, hint: PURGE_HINT },
+  return JSON.parse(stdout);
+}
+
+test("push and sync map explicit and RBOX_ALLOW_MASS_DELETE consent into LocalRuntime operations", async () => {
+  expect(await fixtureJson("./sync-consent.fixture.js")).toEqual([
+    { operation: { kind: "push", massDelete: "guarded" } },
+    { operation: { kind: "push", massDelete: "allow" } },
+    { operation: { kind: "push", massDelete: "allow" } },
+    { operation: { kind: "sync", mode: "pull-push", massDelete: "guard-both" }, hint: SYNC_HINT },
+    { operation: { kind: "sync", mode: "pull-push", massDelete: "allow-push" }, hint: SYNC_HINT },
+    { operation: { kind: "sync", mode: "pull-push", massDelete: "allow-both" }, hint: SYNC_HINT },
+  ]);
+});
+
+test("recover maps env consent to push only and explicit consent to both directions", async () => {
+  expect(await fixtureJson("./recover-consent.fixture.js")).toEqual([
+    { allow: false, allowPush: false },
+    { allow: false, allowPush: true },
+    { allow: true, allowPush: true },
   ]);
 });
 
