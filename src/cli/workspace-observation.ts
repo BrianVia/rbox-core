@@ -19,10 +19,14 @@ import {
   type WorkspaceConfig,
 } from "./config.js";
 import { observeDaemon, type DaemonObservation, type DaemonObservationDeps } from "./daemon/observation.js";
+import { daemonProcessMatches } from "./daemon/process-identity.js";
+import { currentWorkspaceId } from "./daemon/runtime-state.js";
 import { readMergedDaemonLogTail } from "./daemon-control.js";
 import { loadMetrics, type SyncMetrics } from "./metrics.js";
 import { scopeProjectionFor } from "./scope/projection.js";
 import { projectGitDeferralRepos, type GitDeferralRepoProjection } from "./status-view.js";
+
+const PROCESS_PROBE_TTL_MS = 1_000;
 
 interface WorkspaceObservationBase {
   root: string;
@@ -103,14 +107,39 @@ export async function observeWorkspace(
 ): Promise<WorkspaceObservation> {
   const observedAt = request.now ?? Date.now();
   const config = await loadConfig(root);
-  const daemonDeps = request.daemon ?? {};
-  const daemon = observeDaemon(root, config.remoteWorkspaceId, observedAt, daemonDeps);
-  const reobserveDaemon = () => observeDaemon(root, config.remoteWorkspaceId, Date.now(), daemonDeps);
-  const activityAuthorized = (current: DaemonObservation) => !current.running || current.ownsRoot;
+  const observedWorkspaceId = config.remoteWorkspaceId;
+  // The only cached read: `daemonProcessMatches` runs a blocking `ps`, and a
+  // doctor run revalidates up to ten times. Liveness cannot flip and flip back
+  // within the window; workspace identity and the daemon records are re-read
+  // every time, so nothing that decides attribution is cached.
+  let probe: { at: number; pid: number; root: string; alive: boolean } | undefined;
+  const probeProcess = request.daemon?.processMatches ?? daemonProcessMatches;
+  const daemonDeps: DaemonObservationDeps = {
+    ...request.daemon,
+    processMatches: (pid, probedRoot) => {
+      const at = Date.now();
+      if (probe?.pid === pid && probe.root === probedRoot && at - probe.at < PROCESS_PROBE_TTL_MS) return probe.alive;
+      const alive = probeProcess(pid, probedRoot);
+      probe = { at, pid, root: probedRoot, alive };
+      return alive;
+    },
+  };
+  const daemon = observeDaemon(root, observedWorkspaceId, observedAt, daemonDeps);
+  /** Re-observe against the workspace's identity AS IT IS NOW. `rbox init` can
+   * rebind this root mid-run, and every daemon-owned byte then belongs to the
+   * PREVIOUS workspace — a re-check against the captured id would admit it. */
+  const reobserveDaemon = (): DaemonObservation | undefined =>
+    currentWorkspaceId(root) === observedWorkspaceId
+      ? observeDaemon(root, observedWorkspaceId, Date.now(), daemonDeps)
+      : undefined;
+  const activityAuthorized = (current: DaemonObservation | undefined) =>
+    current !== undefined && (!current.running || current.ownsRoot);
   // Missing bindings are a supported legacy/stopped-residue case. Foreign and
   // unreadable bindings fail closed, both before and after the physical reads.
-  const sidecarsAuthorized = (current: DaemonObservation) =>
-    current.sidecarBinding !== "other-workspace" && current.sidecarBinding !== "unreadable";
+  const sidecarsAuthorized = (current: DaemonObservation | undefined) =>
+    current !== undefined
+    && current.sidecarBinding !== "other-workspace"
+    && current.sidecarBinding !== "unreadable";
   const readActivity = async (): Promise<DaemonActivity | undefined> => {
     if (!activityAuthorized(reobserveDaemon())) return undefined;
     const activity = await loadActivity(root).catch(() => undefined);

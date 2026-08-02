@@ -972,7 +972,20 @@ export async function doctorCmd(root: string, opts: DoctorCmdOptions): Promise<v
     { ...(opts.residueBytes ? { residueBytes: true } : {}), ...(opts.now === undefined ? {} : { now: opts.now }) },
   );
   const { renderWorkspaceTriage, triageWorkspace } = await import("./doctor-triage.js");
-  const triage = triageWorkspace({ ...ctx.observation, checks: ctx.checks });
+  // The checks above take seconds against the network, and triage recommends
+  // destructive recovery (`rbox pull --allow-mass-delete`). Re-observe locally
+  // so no finding — and no recommendation — describes a workspace this folder
+  // was re-bound away from while doctor was running.
+  const observation = await observeWorkspace(root, {
+    depth: "local",
+    ...(opts.now === undefined ? {} : { now: opts.now }),
+  });
+  if (observation.config.remoteWorkspaceId !== ctx.cfg.remoteWorkspaceId) {
+    console.log("this folder was re-bound to a different workspace while rbox doctor was running — nothing here describes it. Re-run: rbox doctor");
+    process.exitCode = 1;
+    return;
+  }
+  const triage = triageWorkspace({ ...observation, checks: ctx.checks });
   if (opts.json === true) {
     emitJson(triage);
     if (Object.values(ctx.checks).some((c) => !c.ok)) process.exitCode = 1;

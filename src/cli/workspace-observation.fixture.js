@@ -27,10 +27,12 @@ const owned = (overrides = {}) => ({
 });
 
 let current = owned();
+let currentId = CONFIG.remoteWorkspaceId;
 let rebindDuringSidecars = false;
 let counts;
 const reset = (daemon = owned()) => {
   current = daemon;
+  currentId = CONFIG.remoteWorkspaceId;
   rebindDuringSidecars = false;
   counts = { config: 0, daemon: 0, activity: 0, state: 0, adopt: 0, log: 0, metrics: 0 };
 };
@@ -49,6 +51,9 @@ mock.module("./activity.js", () => ({
 }));
 mock.module("./adopt-journal.js", () => ({
   inspectAdoptFence: async () => { counts.adopt++; return { status: "none" }; },
+}));
+mock.module("./daemon/runtime-state.js", () => ({
+  currentWorkspaceId: () => currentId,
 }));
 mock.module("./daemon/observation.js", () => ({
   observeDaemon: () => { counts.daemon++; return current; },
@@ -120,10 +125,22 @@ current = owned({ ownership: "wrong-workspace", ownsRoot: false, ownsWorkspace: 
 const reboundSidecars = await rebound.readDaemonSidecars();
 const reboundResult = { sidecars: reboundSidecars, counts: { ...counts } };
 
+// The workspace itself was re-bound between capture and read: the daemon
+// records still describe the PREVIOUS workspace's daemon, so nothing it owns
+// may be handed to a report about this one.
+reset();
+const identityRebound = await observeWorkspace(ROOT, { depth: "local", now: NOW });
+currentId = "ws_rebound";
+const identityResult = {
+  sidecars: await identityRebound.readDaemonSidecars(),
+  activity: await identityRebound.readActivity(),
+  counts: { ...counts },
+};
+
 reset();
 const racing = await observeWorkspace(ROOT, { depth: "local", now: NOW });
 rebindDuringSidecars = true;
 const racingSidecars = await racing.readDaemonSidecars();
 const raceResult = { sidecars: racingSidecars, counts: { ...counts } };
 
-process.stdout.write(JSON.stringify({ ambientResult, unownedResult, startingResult, localResult, reboundResult, raceResult }));
+process.stdout.write(JSON.stringify({ ambientResult, unownedResult, startingResult, localResult, reboundResult, identityResult, raceResult }));

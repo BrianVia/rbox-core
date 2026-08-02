@@ -36,6 +36,9 @@ test("WorkspaceObservation keeps its construction private and its capabilities d
   expect(result.reboundResult).toEqual({
     counts: { config: 1, daemon: 4, activity: 1, state: 1, adopt: 1, log: 0, metrics: 0 },
   });
+  expect(result.identityResult).toEqual({
+    counts: { config: 1, daemon: 3, activity: 1, state: 1, adopt: 1, log: 0, metrics: 0 },
+  });
   expect(result.raceResult).toEqual({
     counts: { config: 1, daemon: 5, activity: 2, state: 1, adopt: 1, log: 1, metrics: 1 },
   });

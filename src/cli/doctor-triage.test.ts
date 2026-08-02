@@ -395,6 +395,42 @@ test("a daemon that has not written its startup binding yet still reports its li
   expect(findingById(triageWorkspace(collected).findings, "halt:mass-delete")).toBeDefined();
 });
 
+test("a folder re-bound while doctor was running gets no findings from the previous workspace", async () => {
+  await writeActivity({
+    at: new Date(NOW).toISOString(),
+    halt: {
+      at: new Date(NOW).toISOString(),
+      reason: "pull would delete 900 of 1000 tracked files",
+      count: 1,
+      op: "pull",
+      typedReason: { kind: "mass-delete", op: "pull" },
+    },
+  });
+  // The remote, version and chain checks take seconds. `rbox init` rebinding
+  // this folder in that window makes every collected byte the OLD workspace's,
+  // and triage recommends destructive recovery (`--allow-mass-delete`).
+  globalThis.fetch = (async () => {
+    await fs.writeFile(
+      path.join(root, ".rbox", "workspace.json"),
+      JSON.stringify({ ...workspaceConfig(), remoteWorkspaceId: "ws_2" }),
+    );
+    throw new Error("getaddrinfo ENOTFOUND");
+  }) as typeof fetch;
+
+  const logs: string[] = [];
+  const origLog = console.log;
+  console.log = (...parts: unknown[]) => void logs.push(parts.map(String).join(" "));
+  try {
+    await doctorCmd(root, {});
+  } finally {
+    console.log = origLog;
+  }
+  const out = logs.join("\n");
+  expect(out).toContain("re-bound to a different workspace while rbox doctor was running");
+  expect(out).not.toContain("rbox doctor — ");
+  expect(out).not.toContain("--allow-mass-delete");
+});
+
 // ---- R2 HIGH 3: ownership is ONE fresh, root-aware observation ----
 
 test("a pid that is alive but is not this root's daemon leaves residue unowned", async () => {
