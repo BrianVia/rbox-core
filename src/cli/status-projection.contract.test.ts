@@ -146,7 +146,14 @@ function readPort<M extends StatusMode>(
     readConflictSnapshotStatus: note("readConflictSnapshotStatus", async () => ({ total: 0, prunable: 0 })),
     readCheckoutTransactionCapability: note("readCheckoutTransactionCapability", async () => ({}) as never),
     probes: probePort(mode, calls) as StatusReadPort<M>["probes"],
-    ...overrides,
+    // Overrides are recorded too. A raw spread replaced the recorder, which made
+    // every call-count assertion about an overridden read vacuously true.
+    ...Object.fromEntries(
+      Object.entries(overrides).map(([name, value]) => [
+        name,
+        typeof value === "function" ? note(name, value as (...args: unknown[]) => unknown) : value,
+      ]),
+    ) as Partial<StatusReadPort<M>>,
   };
   return { port, calls, countOf: (name) => calls.filter((entry) => entry === name).length };
 }
@@ -262,9 +269,9 @@ test("trusted local observation skips the hashcache and the manifest scan", asyn
 });
 
 test("an unowned mixed-format daemon cannot make rejected activity renderable", async () => {
-  const { port, calls } = readPort("brief", {
+  const { port, countOf } = readPort("brief", {
     readWorkspaceObservation: async () => ({
-      ...stoppedWorkspaceObservation(),
+      ...stoppedWorkspaceObservation(async () => trustedActivity()),
       daemon: {
         ownership: "record-format-mismatch",
         running: true,
@@ -287,8 +294,10 @@ test("an unowned mixed-format daemon cannot make rejected activity renderable", 
 
   expect(projection.kind).toBe("detail");
   if (projection.kind !== "detail") throw new Error("unreachable");
-  expect(calls.filter((call) => call === "readWorkspaceObservation")).toHaveLength(0);
-  expect(projection.activity).toBeUndefined();
+  // One observation, and its binding is not proven — so the daemon's own local
+  // snapshot cannot be quoted as the file counts.
+  expect(countOf("readWorkspaceObservation")).toBe(1);
+  expect(projection.counts.source).not.toBe("daemon");
   expect(projection.health).toBe("ok");
 });
 

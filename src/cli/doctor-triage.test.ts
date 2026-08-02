@@ -14,6 +14,7 @@ import { observeWorkspace as observeWorkspaceState } from "./workspace-observati
 import { checkManifestChain, collectDoctorContext, doctorCmd, type DoctorChecks } from "./doctor-cmd.js";
 import type { DaemonObservation } from "./doctor-evidence.js";
 import { saveStateUnsafeLegacyOrTest, syncStreamId } from "./config.js";
+import { loadActivity } from "./activity.js";
 import { daemonPidPath, daemonRuntimeDir, daemonStatusPath } from "./rbox-paths.js";
 import { lockingHealthPath } from "./sync-mutex.js";
 import { saveCredentials } from "./credentials.js";
@@ -362,8 +363,10 @@ test("a daemon bound to another workspace also drops halt residue", async () => 
   });
   await writeDaemonRecords({ statusBootId: BOOT, pidBootId: BOOT });
   const collected = await readTriageInputs(root, healthyChecks(), NOW, liveness({ running: true, boundTo: "ws_elsewhere" }));
-  // WorkspaceObservation rejects the sidecar before the doctor adapter sees it:
-  // a live process without workspace ownership cannot lend this root activity.
+  // Producer proof: the halt IS on disk and the daemon IS alive. Reading it
+  // unauthorized still finds it — the foreign binding alone is what makes the
+  // observation refuse to hand it over.
+  expect((await loadActivity(root))?.halt?.typedReason?.kind).toBe("mass-delete");
   expect(collected.activity).toBeUndefined();
   expect(collected.daemon.running).toBe(true);
   expect(collected.daemon.stale).toBe(true);
@@ -490,6 +493,7 @@ test("a live daemon for a PREFIX SIBLING root does not claim this one", async ()
         typedReason: { kind: "mass-delete", op: "pull" },
       },
     });
+    expect(observeDaemonState(root, "ws_1").ownsRoot).toBe(false);
     expect(observeDaemonState(root, "ws_1").ownsWorkspace).toBe(false);
     // ...and the same process IS still recognized as the sibling's own daemon.
     expect(observeDaemonState(sibling, undefined).running).toBe(true);

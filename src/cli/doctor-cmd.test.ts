@@ -27,7 +27,7 @@ import { GENESIS_PENDING_MESSAGE, publishPrepublishMarker } from "./genesis-dura
 import { loadActivity } from "./activity.js";
 import { loadMetrics } from "./metrics.js";
 import type { DaemonObservation } from "./daemon/observation.js";
-import type { LocalWorkspaceObservation } from "./workspace-observation.js";
+import { observeWorkspace, type LocalWorkspaceObservation } from "./workspace-observation.js";
 
 let home: string;
 let logs: string[];
@@ -303,13 +303,17 @@ async function expectReportReachesConsent(opts: { diagnostics?: boolean; env?: b
 }
 
 test("stale daemon binding excludes daemon log, metrics, and activity sections", async () => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "rbox-doctor-root-"));
+  const root = await makeWorkspace();
   try {
+    const runtime = daemonRuntimeDir(root);
+    await fs.mkdir(runtime, { recursive: true });
+    await fs.writeFile(path.join(runtime, "workspace.bound"), "ws_previous\n");
+    await fs.writeFile(path.join(runtime, "daemon.log"), "previous workspace path src/secret.ts\n");
     const ctx: DoctorContext = {
       root,
       cfg: {
         schema: "e2ee/v1",
-        remoteWorkspaceId: "ws_new",
+        remoteWorkspaceId: "ws_diag",
         projectId: "root",
         rootPath: root,
         remoteUrl: "https://api.test",
@@ -318,7 +322,7 @@ test("stale daemon binding excludes daemon log, metrics, and activity sections",
       },
       checks,
       workspaceShape: { fileCount: 2, totalBytes: 99 },
-      observation: contextObservation(root, "other-workspace"),
+      observation: await observeWorkspace(root, { depth: "local" }),
       ...emptyWorktrees,
     };
     const bundle = await buildDiagnosticsBundle(ctx);
@@ -607,9 +611,14 @@ test("stopped daemon bound to another workspace excludes daemon-owned diagnostic
       },
       checks: { ...checks, daemon: { ok: false, label: "background sync", message: "stopped", status: "stopped" } },
       workspaceShape: { fileCount: 1, totalBytes: 42 },
-      observation: contextObservation(root, "other-workspace"),
+      // The REAL observation, reading the real records written above: the
+      // exclusion has to come from production authorization, not a fixture.
+      observation: await observeWorkspace(root, { depth: "local" }),
       ...emptyWorktrees,
     };
+
+    expect(await readMergedDaemonLogTail(root, 64 * 1024)).toContain("src/secret.ts");
+    expect(ctx.observation.daemon.sidecarBinding).toBe("other-workspace");
 
     const bundle = await buildDiagnosticsBundle(ctx);
     expect(bundle.daemonLogTail).toEqual({ excluded: "stale daemon binding" });
