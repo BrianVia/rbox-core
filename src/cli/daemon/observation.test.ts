@@ -196,7 +196,31 @@ test("ambient trust rejects every unsupported incarnation and clock state", () =
     const observed = observedDaemon({ ambient });
     expect(observed.ambientTrust).toBe(trust);
     expect(observed.trustedAmbient).toBeUndefined();
-    expect(observed.version).toBeUndefined();
     expect(observed.mode).toBeUndefined();
   }
+});
+
+test("a live daemon's version survives every trust failure that is not about the version", () => {
+  // The upgrade nudge exists FOR old daemons: the states that lose boot-id or
+  // heartbeat trust are exactly the ones a pre-178 or wedged daemon is in.
+  const rows: Array<[string, Partial<ObservationInput>]> = [
+    ["boot-mismatch", { ambient: status({ bootId: "boot-old" }) }],
+    ["ambient-boot-unbound", { ambient: status({ bootId: undefined }) }],
+    ["pid-boot-unbound", {
+      pid: { present: true, pid: 42, version: "legacy" },
+      binding: { present: true, workspaceId: "ws_live", version: "legacy" },
+    }],
+    ["unbound", { binding: { present: false } }],
+    ["stale heartbeat", { ambient: status({ heartbeatAt: new Date(NOW - AMBIENT_STATUS_STALE_MS - 1).toISOString() }) }],
+  ];
+  for (const [name, over] of rows) {
+    const observed = observedDaemon(over);
+    expect(`${name}:${observed.version}`).toBe(`${name}:2.0.0`);
+  }
+
+  // A dead daemon, a foreign binding, and an unparsable version claim nothing.
+  expect(observedDaemon({ processMatches: false }).version).toBeUndefined();
+  expect(observedDaemon({ binding: { present: true, workspaceId: "ws_old", version: "legacy" } }).version).toBeUndefined();
+  expect(observedDaemon({ ambient: { kind: "corrupt" } }).version).toBeUndefined();
+  expect(observedDaemon({ ambient: status({ daemonVersion: "not a version" }) }).version).toBeUndefined();
 });

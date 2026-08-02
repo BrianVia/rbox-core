@@ -75,6 +75,12 @@ export interface DaemonObservation {
   ambient: AmbientDaemonStatusRecord;
   ambientTrust: DaemonAmbientTrust;
   trustedAmbient?: AmbientDaemonStatusV1;
+  /** The version the live daemon reports, on the WEAKER trust of `ownsRoot` plus
+   * a parsable claim. A boot-id or heartbeat failure says the record cannot
+   * describe the daemon's current work; it does not change which binary is
+   * running, and those are precisely the states the "restart to finish the
+   * upgrade" nudge exists for. Every state-dependent claim stays on
+   * `trustedAmbient`. */
   version?: string;
   mode?: DaemonMode;
 }
@@ -144,6 +150,10 @@ function classifyDaemonObservation(snapshot: DaemonObservationSnapshot): DaemonO
   const running = ownership !== "stopped";
   const stale = ownership === "wrong-workspace";
   const trusted = ambient.status;
+  const reportedVersion = !stale && running && snapshot.ambient.kind === "ok"
+    && validDaemonVersion(snapshot.ambient.status.daemonVersion)
+    ? snapshot.ambient.status.daemonVersion
+    : undefined;
   return {
     ownership,
     running,
@@ -159,9 +169,7 @@ function classifyDaemonObservation(snapshot: DaemonObservationSnapshot): DaemonO
     ambient: snapshot.ambient,
     ambientTrust: ambient.trust,
     ...(trusted === undefined ? {} : { trustedAmbient: trusted }),
-    ...(trusted !== undefined && validDaemonVersion(trusted.daemonVersion)
-      ? { version: trusted.daemonVersion }
-      : {}),
+    ...(reportedVersion === undefined ? {} : { version: reportedVersion }),
     ...(trusted?.mode === undefined ? {} : { mode: trusted.mode }),
   };
 }

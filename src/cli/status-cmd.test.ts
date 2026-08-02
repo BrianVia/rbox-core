@@ -15,7 +15,8 @@ import { RBOX_VERSION } from "./version.js";
 import { loadActivity, saveActivity } from "./activity.js";
 import { GENESIS_PENDING_MESSAGE, publishPrepublishMarker } from "./genesis-durable.js";
 import { flushAccountProfileWrites, scheduleAccountProfileWrite } from "./account-profile.js";
-import type { DaemonObservation } from "./daemon/observation.js";
+import { observeDaemon, type DaemonObservation } from "./daemon/observation.js";
+import type { AmbientDaemonStatusV1 } from "./daemon/ambient-status.js";
 
 const OLD_ENV = { ...process.env };
 const NOW = Date.parse("2026-07-08T12:00:00Z");
@@ -56,6 +57,33 @@ function liveDaemon(overrides: Partial<DaemonObservation> = {}): DaemonObservati
     ...overrides,
   };
 }
+
+/** A live root-scoped daemon whose ambient record is whatever the caller wrote,
+ * classified by the REAL observation — the version and skew claims below are the
+ * production rule, not a restatement of it. */
+const observedLiveDaemon = (
+  record: Partial<AmbientDaemonStatusV1> & Record<string, unknown>,
+  opts: { legacyRecords?: boolean } = {},
+): DaemonObservation => observeDaemon(root, cfg.remoteWorkspaceId, NOW, {
+  readPid: () => opts.legacyRecords
+    ? { present: true, pid: 1234, version: "legacy" }
+    : { present: true, pid: 1234, bootId: "boot_status", version: "v2" },
+  readBinding: () => opts.legacyRecords
+    ? { present: true, workspaceId: cfg.remoteWorkspaceId, version: "legacy" }
+    : { present: true, workspaceId: cfg.remoteWorkspaceId, bootId: "boot_status", version: "v2" },
+  readAmbient: () => ({
+    kind: "ok",
+    status: {
+      schemaVersion: 1,
+      state: "synced",
+      heartbeatAt: new Date(NOW).toISOString(),
+      sequence: 7,
+      lastSyncedAt: null,
+      ...record,
+    } as AmbientDaemonStatusV1,
+  }),
+  processMatches: () => true,
+});
 
 const observeWithDaemon = (
   readDaemon: () => DaemonObservation,
@@ -1028,15 +1056,11 @@ test("live daemon version is rendered and exact skew warning is closed in human 
     promotions++;
     return true;
   };
-  d.observeWorkspace = observeWithDaemon(() => liveDaemon());
   d.readDaemonPidRecord = () => ({ present: true });
-  const skewedStatus = { schemaVersion: 1 as const, daemonVersion: "1.7.17", mode: "pull-only" as const, bootId: "boot_status", state: "synced" as const, heartbeatAt: new Date(NOW).toISOString(), sequence: 7, lastSyncedAt: null };
-  d.observeWorkspace = observeWithDaemon(() => liveDaemon({
-    ambient: { kind: "ok", status: skewedStatus },
-    ambientTrust: "trusted",
-    trustedAmbient: skewedStatus,
-    version: "1.7.17",
+  d.observeWorkspace = observeWithDaemon(() => observedLiveDaemon({
+    daemonVersion: "1.7.17",
     mode: "pull-only",
+    bootId: "boot_status",
   }));
   const logs: string[] = [];
   const oldLog = console.log;
@@ -1052,33 +1076,47 @@ test("live daemon version is rendered and exact skew warning is closed in human 
     await statusCmdWithDeps(root, { json: true }, d);
     expect(promotions).toBe(2);
     expect(JSON.parse(stdout.at(-1)!)).toMatchObject({ daemon: { version: "1.7.17", mode: "pull-only", cliVersion: RBOX_VERSION, versionSkew: true } });
-    const currentStatus = { ...skewedStatus, daemonVersion: RBOX_VERSION, mode: "read-write" as const };
-    d.observeWorkspace = observeWithDaemon(() => liveDaemon({
-      ambient: { kind: "ok", status: currentStatus },
-      ambientTrust: "trusted",
-      trustedAmbient: currentStatus,
-      version: RBOX_VERSION,
+    d.observeWorkspace = observeWithDaemon(() => observedLiveDaemon({
+      daemonVersion: RBOX_VERSION,
       mode: "read-write",
+      bootId: "boot_status",
     }));
     logs.length = 0;
     await statusCmdWithDeps(root, { verbose: true }, d);
     expect(promotions).toBe(3);
     expect(logs.join("\n")).toContain(`(v${RBOX_VERSION}, read-write)`);
     expect(logs.join("\n")).not.toContain("restart to finish the upgrade");
-    const staleStatus = { ...skewedStatus, daemonVersion: RBOX_VERSION, mode: "pull-only" as const, bootId: "boot_stale" };
-    d.observeWorkspace = observeWithDaemon(() => liveDaemon({
-      ambient: { kind: "ok", status: staleStatus },
-      ambientTrust: "boot-mismatch",
+    // A record from a PREVIOUS boot cannot claim `mode`, but the version it
+    // reports is still the version of the daemon that is running right now —
+    // and the upgrade nudge exists for exactly these old daemons.
+    d.observeWorkspace = observeWithDaemon(() => observedLiveDaemon({
+      daemonVersion: "1.7.17",
+      mode: "pull-only",
+      bootId: "boot_stale",
     }));
     logs.length = 0;
     await statusCmdWithDeps(root, { verbose: true }, d);
     expect(promotions).toBe(4);
-    expect(logs.join("\n")).toContain("background sync: running (pid 1234)");
+    expect(logs.join("\n")).toContain("background sync: running (v1.7.17) (pid 1234)");
+    expect(logs.join("\n")).toContain(`daemon is running v1.7.17 but this CLI is v${RBOX_VERSION} — restart to finish the upgrade: rbox stop && rbox start`);
     expect(logs.join("\n")).not.toContain("pull-only");
+    // A wedged daemon stops heartbeating — the moment users reach for status.
+    d.observeWorkspace = observeWithDaemon(() => observedLiveDaemon({
+      daemonVersion: "1.7.17",
+      mode: "pull-only",
+      bootId: "boot_status",
+      heartbeatAt: new Date(NOW - 30 * 60_000).toISOString(),
+    }));
+    logs.length = 0;
+    await statusCmdWithDeps(root, { verbose: true }, d);
+    expect(logs.join("\n")).toContain("background sync: running (v1.7.17) (pid 1234)");
+    expect(logs.join("\n")).toContain(`daemon is running v1.7.17 but this CLI is v${RBOX_VERSION} — restart to finish the upgrade: rbox stop && rbox start`);
+    expect(logs.join("\n")).not.toContain("pull-only");
+    expect(promotions).toBe(5);
     d.observeWorkspace = observeWithDaemon(() => stoppedDaemon());
     stdout.length = 0;
     await statusCmdWithDeps(root, { json: true }, d);
-    expect(promotions).toBe(4);
+    expect(promotions).toBe(5);
     expect(JSON.parse(stdout.at(-1)!)).toMatchObject({ daemon: { version: null, mode: null, versionSkew: false } });
   } finally {
     console.log = oldLog;
@@ -1088,7 +1126,7 @@ test("live daemon version is rendered and exact skew warning is closed in human 
 
 test("live ambient record without daemonVersion is tolerated without display or warning", async () => {
   const d = cleanScanDeps();
-  d.observeWorkspace = observeWithDaemon(() => liveDaemon({ bootId: undefined }));
+  d.observeWorkspace = observeWithDaemon(() => observedLiveDaemon({ bootId: "boot_status" }));
   const logs: string[] = [];
   const oldLog = console.log;
   console.log = (...parts) => void logs.push(parts.join(" "));
