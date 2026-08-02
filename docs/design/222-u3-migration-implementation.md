@@ -2265,9 +2265,9 @@ On the Linux fleet host `/tmp` is RAM-backed tmpfs with ~1M inodes. The
 state-plane suite leaks its `mkdtemp` workspaces, and repeated runs drove
 inodes to **100% at 47% byte capacity**, which surfaces as a flood of `ENOSPC`
 failures across unrelated suites — a failure that reads as a code defect and is
-not one. A retry loop multiplies the leak by its retry count, so 5C's FINDING
-loop removes every attempt it discards. The general leak predates this wave and
-is survivable only because CI runners are fresh containers; anyone running the
+not one. Repeated local runs multiply the leak, so temporary workspaces must be
+removed after each attempt. The general leak predates this wave and is
+survivable only because CI runners are fresh containers; anyone running the
 plane's suites repeatedly on a fleet host should expect it.
 
 **FINDING — M4 fidelity accepts a dropped manifest section.** A `RepoRecord`
